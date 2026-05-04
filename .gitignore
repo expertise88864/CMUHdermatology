@@ -1,0 +1,35 @@
+# === 安全：絕對不能推到 Public repo ===
+settings/
+*.bak
+
+# === 開發中產出 ===
+__pycache__/
+*.py[cod]
+*$py.class
+.deps_cache
+*.log
+*.log.*
+.ruff_cache/
+.wdm/
+.pytest_cache/
+
+# === 部署相關 ===
+build/
+dist/
+*.spec.bak
+python_embed/
+
+# === 來源備份（給 Claude Code 看的，不上 repo）===
+_originals/
+安裝包/
+
+# === IDE / OS ===
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# === 其他 ===
+*.tmp
+chromedriver_cache/
+debug_dumps/
