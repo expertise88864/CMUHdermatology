@@ -2,14 +2,34 @@
 
 中國醫藥大學附設醫院皮膚科自動化套件，包含四支主程式：
 
-| 入口 | 說明 |
-|---|---|
-| `src/main.py` | 看診管理、掛號監控、F3/F4/F9/F10/F11 多解析度熱鍵自動化 |
-| `src/scheduler.py` | 排班視覺化、值班輪替演算法 |
-| `src/autoclock.py` | Selenium 自動打卡、托盤常駐、排程 |
-| `src/coord_detector.py` | F8 記錄座標/顏色（除錯工具） |
+| 啟動器（雙擊執行） | 對應程式 | 說明 |
+|---|---|---|
+| `中國醫皮膚科主程式.pyw` | `src/main.py` | 看診管理、掛號監控、F3/F4/F9/F10/F11 多解析度熱鍵 |
+| `中國醫皮膚科排班程式.pyw` | `src/scheduler.py` | 排班視覺化、值班輪替演算法 |
+| `中國醫皮膚科打卡程式.pyw` | `src/autoclock.py` | Selenium 自動打卡、托盤常駐 |
+| `中國醫皮膚科點座標偵測程式.pyw` | `src/coord_detector.py` | F8 記錄座標/顏色（除錯工具） |
 
-## 安裝（給其他電腦）
+## 啟動方式
+
+### 方法 A — 雙擊根目錄的 `.pyw`（最簡單）
+
+repo 根目錄有 4 個 `中國醫皮膚科*.pyw` 啟動器，雙擊即可。
+首次啟動會跳依賴安裝視窗，自動 pip install 缺少的套件。
+
+### 方法 B — 命令列
+
+```cmd
+cd C:\Dev\CMUHdermatology
+pythonw "中國醫皮膚科主程式.pyw"
+REM 或直接跑模組（兩者效果一樣）
+pythonw src\main.py
+```
+
+### 方法 C — 桌面捷徑
+
+跑一次 `deploy\installer.bat` 即可建立 4 個桌面捷徑（也可直接給其他電腦用）。
+
+## 部署到其他電腦
 
 下載 `deploy/installer.bat`，雙擊即可：
 

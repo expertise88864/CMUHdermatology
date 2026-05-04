@@ -123,10 +123,10 @@ REM ====== 5. 建桌面捷徑 ======
 echo [5/5] 建立桌面捷徑...
 set DESKTOP=%USERPROFILE%\Desktop
 
-call :make_shortcut "中國醫皮膚科主程式" "!PYTHONW!" "!INSTALL_DIR!\src\main.py"
-call :make_shortcut "中國醫皮膚科排班程式" "!PYTHONW!" "!INSTALL_DIR!\src\scheduler.py"
-call :make_shortcut "中國醫皮膚科打卡程式" "!PYTHONW!" "!INSTALL_DIR!\src\autoclock.py"
-call :make_shortcut "中國醫皮膚科點座標偵測程式" "!PYTHONW!" "!INSTALL_DIR!\src\coord_detector.py"
+call :make_shortcut "中國醫皮膚科主程式" "!PYTHONW!" "!INSTALL_DIR!\中國醫皮膚科主程式.pyw"
+call :make_shortcut "中國醫皮膚科排班程式" "!PYTHONW!" "!INSTALL_DIR!\中國醫皮膚科排班程式.pyw"
+call :make_shortcut "中國醫皮膚科打卡程式" "!PYTHONW!" "!INSTALL_DIR!\中國醫皮膚科打卡程式.pyw"
+call :make_shortcut "中國醫皮膚科點座標偵測程式" "!PYTHONW!" "!INSTALL_DIR!\中國醫皮膚科點座標偵測程式.pyw"
 
 echo.
 echo ============================================================
