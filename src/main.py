@@ -4355,6 +4355,15 @@ class AutomationApp:
         logging.info(f"UI font scale applied: {scale:.2f} → fonts {self.f_lg}/{self.f_md}/{self.f_sm}")
 
         self.style = ttk.Style()
+        # [UI 美化] 嘗試切到 'vista'（Win 原生最美）→ fallback 'clam'（跨平台一致）
+        try:
+            available = self.style.theme_names()
+            for preferred in ('vista', 'xpnative', 'clam', 'default'):
+                if preferred in available:
+                    self.style.theme_use(preferred)
+                    break
+        except Exception:
+            logging.debug("theme_use 失敗（沿用預設）", exc_info=True)
         # 使用動態字體變數
         self.style.configure("TLabel", font=("Microsoft JhengHei UI", self.f_lg), padding=2)
         self.style.configure("Header.TLabel", font=("Microsoft JhengHei UI", self.f_md, "bold"), anchor="center")
@@ -4382,6 +4391,98 @@ class AutomationApp:
         self.style.configure('TNotebook.Tab', font=('Microsoft JhengHei UI', self.f_lg + 1, 'bold'), padding=[10, 5])
         self.style.map('TNotebook.Tab', background=[('selected', 'SystemHighlight'), ('active', '#E1E1E1')])
         self.style.configure("LazyHint.TLabel", font=("Microsoft JhengHei UI", self.f_md), foreground="gray")
+
+        # =============================================================
+        # [UI 美化] 統一配色 + 互動效果（hover / pressed）
+        # =============================================================
+        # 主題色：中國醫深藍
+        BRAND_BLUE = "#005A9C"
+        BRAND_BLUE_LIGHT = "#1976D2"
+        BRAND_BLUE_PRESS = "#003F73"
+        ACCENT = "#00897B"        # 強調色（搶眼但不刺眼）
+        SURFACE = "#FAFAFA"
+        BORDER = "#DDDDDD"
+
+        # 一般按鈕 hover/active 高亮
+        try:
+            self.style.map("TButton",
+                           background=[("active", "#E3F2FD"), ("pressed", "#BBDEFB")])
+        except Exception:
+            pass
+
+        # 主要按鈕（重要動作）
+        self.style.configure("Primary.TButton",
+                             font=("Microsoft JhengHei UI", self.f_md, "bold"),
+                             padding=(10, 6))
+        try:
+            self.style.map("Primary.TButton",
+                           foreground=[("active", BRAND_BLUE_PRESS),
+                                       ("!active", BRAND_BLUE)])
+        except Exception:
+            pass
+
+        # 次要按鈕（用於大量按鈕排列）
+        self.style.configure("Secondary.TButton",
+                             font=("Microsoft JhengHei UI", self.f_md),
+                             padding=(8, 4))
+
+        # 危險按鈕（刪除/重啟等）
+        self.style.configure("Danger.TButton",
+                             font=("Microsoft JhengHei UI", self.f_md, "bold"),
+                             foreground="#C62828",
+                             padding=(10, 6))
+
+        # LabelFrame 邊框淡化、文字深藍 bold
+        self.style.configure("TLabelframe", borderwidth=1, relief="solid",
+                             bordercolor=BORDER)
+        self.style.configure("TLabelframe.Label",
+                             font=("Microsoft JhengHei UI", self.f_md, "bold"),
+                             foreground=BRAND_BLUE)
+
+        # Combobox 高度 / 字級統一
+        self.style.configure("TCombobox",
+                             font=("Microsoft JhengHei UI", self.f_md),
+                             padding=2)
+
+        # Entry 文字較深、padding 統一
+        self.style.configure("TEntry", padding=4)
+
+        # Notebook：選中分頁更明顯
+        try:
+            self.style.map('TNotebook.Tab',
+                           background=[('selected', BRAND_BLUE),
+                                       ('active', '#E3F2FD'),
+                                       ('!active', '#F0F0F0')],
+                           foreground=[('selected', 'white'),
+                                       ('active', BRAND_BLUE),
+                                       ('!active', '#333333')])
+        except Exception:
+            pass
+
+        # Treeview 行距加大、選中色加深
+        self.style.configure("Treeview",
+                             font=("Microsoft JhengHei UI", self.f_md),
+                             rowheight=max(22, self.f_md * 2))
+        self.style.configure("Treeview.Heading",
+                             font=("Microsoft JhengHei UI", self.f_md, "bold"),
+                             background=SURFACE,
+                             foreground=BRAND_BLUE,
+                             padding=(4, 4))
+
+        # Progressbar 顏色
+        self.style.configure("TProgressbar",
+                             troughcolor=SURFACE,
+                             background=BRAND_BLUE,
+                             bordercolor=BORDER,
+                             lightcolor=BRAND_BLUE,
+                             darkcolor=BRAND_BLUE)
+
+        # 儲存色票供後續使用（也可被別的方法引用）
+        self._brand_blue = BRAND_BLUE
+        self._brand_blue_light = BRAND_BLUE_LIGHT
+        self._accent = ACCENT
+        self._surface = SURFACE
+        self._border = BORDER
 
     def _init_ui(self):
         self.root.grid_rowconfigure(0, weight=1)
@@ -5125,7 +5226,16 @@ class AutomationApp:
     def _create_other_programs_tab(self, tools_tab):
         
         # --- 定義樣式 (Styles) ---
-        self.style.configure("Big.TButton", font=("Microsoft JhengHei UI", 14, "bold"), padding=(15, 10))
+        # [UI 美化] Big.TButton 縮小 padding，避免過於高大
+        self.style.configure("Big.TButton",
+                             font=("Microsoft JhengHei UI", 12, "bold"),
+                             padding=(10, 6))
+        try:
+            self.style.map("Big.TButton",
+                           background=[("active", "#E3F2FD"), ("pressed", "#BBDEFB")],
+                           foreground=[("active", "#003F73"), ("!active", "#005A9C")])
+        except Exception:
+            pass
         self.style.configure("Reset.TButton", font=("Microsoft JhengHei UI", 8), foreground="black", padding=1)
         self.style.configure("Card.TLabelframe", padding=0, borderwidth=1, relief="solid")
         
@@ -8617,17 +8727,18 @@ if __name__ == "__main__":
     _set_windows_dpi_awareness()
     _set_windows_app_user_model_id()
 
+    # 必須先建 main_root，splash 才能用 Toplevel（避免兩個 tk.Tk() 造成 ttk 樣式錯亂）
+    main_root = tk.Tk()
+    main_root.withdraw()  # 主視窗先隱藏，等初始化完成再顯示，避免閃爍
+
     # [O18] 啟動 splash：給使用者「程式正在開」的即時反饋
     try:
         from cmuh_common.splash import StartupSplash
-        _splash = StartupSplash("正在初始化…")
+        _splash = StartupSplash(main_root, "正在初始化…")
         _splash.show()
     except Exception:
         _splash = None
         logging.debug("splash 啟動失敗（忽略）", exc_info=True)
-
-    main_root = tk.Tk()
-    main_root.withdraw()  # 主視窗先隱藏，等初始化完成再顯示，避免閃爍
 
     # 綁定全域例外處理，避免背景執行緒崩潰導致閃退
     def handle_exception(exc_type, exc_value, exc_traceback):

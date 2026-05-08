@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "app_version": "2026.05.08.6",
+  "app_version": "2026.05.08.7",
   "min_supported_local_version": "2026.04.01.0",
   "release_url": "https://github.com/expertise88864/CMUHdermatology/releases/latest",
   "files": [
@@ -8,182 +8,182 @@
       "key": "autoclock",
       "remote_path": "src/autoclock.py",
       "local_filename": "src/autoclock.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "464facf063723e20b53c66a6eb276a623d713b6d406f487e89988e4f42dc213a"
     },
     {
       "key": "clock.__init__",
       "remote_path": "src/clock/__init__.py",
       "local_filename": "src/clock/__init__.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "08b9eb9d5fe94fd7fcf2954a03c0c1577bceea3b4147865199f943254fed296e"
     },
     {
       "key": "clock.webdriver_setup",
       "remote_path": "src/clock/webdriver_setup.py",
       "local_filename": "src/clock/webdriver_setup.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "30d649f3a2a94048daf2e83d27017416543f508e66e7d163be5878fad9022f45"
     },
     {
       "key": "cmuh_common.__init__",
       "remote_path": "src/cmuh_common/__init__.py",
       "local_filename": "src/cmuh_common/__init__.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "ef99ad0bf85918858d596f60d2275c3bff03c053049c270efba88ecebe53dbdb"
     },
     {
       "key": "cmuh_common.atomic_io",
       "remote_path": "src/cmuh_common/atomic_io.py",
       "local_filename": "src/cmuh_common/atomic_io.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "cc1f6dff780bd1b3d3d6517e0a5f57313c46edb94d54bed5aa8564496f257fd1"
     },
     {
       "key": "cmuh_common.cache_cleanup",
       "remote_path": "src/cmuh_common/cache_cleanup.py",
       "local_filename": "src/cmuh_common/cache_cleanup.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "35e8ee4e23690bf1cb5e3451c3873469f0bebcf8fbe49ce0aa696eb040c6133d"
     },
     {
       "key": "cmuh_common.deps_installer",
       "remote_path": "src/cmuh_common/deps_installer.py",
       "local_filename": "src/cmuh_common/deps_installer.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "38d86bc0b276ff6dc0d82823c45ac03297992490290d46aa4dc1dd2343d0a7c5"
     },
     {
       "key": "cmuh_common.deps_runtime",
       "remote_path": "src/cmuh_common/deps_runtime.py",
       "local_filename": "src/cmuh_common/deps_runtime.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "b24d7810b94a929dfe7fdedaa9ac721a30d315a5219bc865e364a6dfb733533b"
     },
     {
       "key": "cmuh_common.hotkey_viewer",
       "remote_path": "src/cmuh_common/hotkey_viewer.py",
       "local_filename": "src/cmuh_common/hotkey_viewer.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "1dadc819d58f34df149aaaa869d1a4d4b1035a938b6caed1ccfb3bb799fa64f0"
     },
     {
       "key": "cmuh_common.hotkey_viewer_ui",
       "remote_path": "src/cmuh_common/hotkey_viewer_ui.py",
       "local_filename": "src/cmuh_common/hotkey_viewer_ui.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "29a3bb937f81d656cd02e83f118cef2adbf72db6fe786d540dc03e063531e7c1"
     },
     {
       "key": "cmuh_common.http_client",
       "remote_path": "src/cmuh_common/http_client.py",
       "local_filename": "src/cmuh_common/http_client.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "b7c0fe4a24da2380dee064ba4e6c5401453a7ddbb3a332d997647e4c9663e32c"
     },
     {
       "key": "cmuh_common.icons",
       "remote_path": "src/cmuh_common/icons.py",
       "local_filename": "src/cmuh_common/icons.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "5b7d5e80077571ce83328c2be5b175fbe65579a3bb13e2d2f2397817038dcc2b"
     },
     {
       "key": "cmuh_common.logging_setup",
       "remote_path": "src/cmuh_common/logging_setup.py",
       "local_filename": "src/cmuh_common/logging_setup.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "3b51411e967a2f8f6c10288808ea379fcf3582b9ada88c4985a9ac706fb78bd7"
     },
     {
       "key": "cmuh_common.notifications",
       "remote_path": "src/cmuh_common/notifications.py",
       "local_filename": "src/cmuh_common/notifications.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "9803b3b413c270faf8e3440819edece9d96f2af7baa9d819b6dd3641b0246bb0"
     },
     {
       "key": "cmuh_common.paths",
       "remote_path": "src/cmuh_common/paths.py",
       "local_filename": "src/cmuh_common/paths.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "48c80cded565abafb0e945b9d6f278e52ad201311bc43f455cea18801b7404c0"
     },
     {
       "key": "cmuh_common.platform_win",
       "remote_path": "src/cmuh_common/platform_win.py",
       "local_filename": "src/cmuh_common/platform_win.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "e71f89e71035a495c3d9d93043bd0939c8fbdf9260988039051bb71b70441628"
     },
     {
       "key": "cmuh_common.single_instance",
       "remote_path": "src/cmuh_common/single_instance.py",
       "local_filename": "src/cmuh_common/single_instance.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "5ed661579406a3973d5467184084a9cb26d5fd060901c731e60779dbf01b3e4a"
     },
     {
       "key": "cmuh_common.splash",
       "remote_path": "src/cmuh_common/splash.py",
       "local_filename": "src/cmuh_common/splash.py",
-      "version": "2026.05.08.6",
-      "sha256": "c0bc7059e9349cad5faae4659b6feb40359b4516f11f6252df66102120f743ea"
+      "version": "2026.05.08.7",
+      "sha256": "531f33fab2c17abfe2afd4998db07e32ecfa4d4e9be520a3da18ea30a5574fb6"
     },
     {
       "key": "cmuh_common.sqlite_cache",
       "remote_path": "src/cmuh_common/sqlite_cache.py",
       "local_filename": "src/cmuh_common/sqlite_cache.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "720e39b677082a52ab706da84be7dd11f856f34c9b8edf54575da41778814b61"
     },
     {
       "key": "cmuh_common.ui_messages",
       "remote_path": "src/cmuh_common/ui_messages.py",
       "local_filename": "src/cmuh_common/ui_messages.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "5349a5fc94a5761a44b163013a9cfbde007890cf851c3252c7aec806bbe194e9"
     },
     {
       "key": "cmuh_common.updater",
       "remote_path": "src/cmuh_common/updater.py",
       "local_filename": "src/cmuh_common/updater.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "e6e332ff43c2806cfb486e3fe626538c2cafc099d955a6cc3d2814f3d7f1bad9"
     },
     {
       "key": "cmuh_common.version",
       "remote_path": "src/cmuh_common/version.py",
       "local_filename": "src/cmuh_common/version.py",
-      "version": "2026.05.08.6",
-      "sha256": "da3b890b0f4362bf5e44027057193a8a80a8a6c584737fe9bddf0a70ac739331"
+      "version": "2026.05.08.7",
+      "sha256": "da79b121fc99537427e5a573986830960b8f694302a1d6fe0b5b5e24eac75688"
     },
     {
       "key": "cmuh_common.window_icon",
       "remote_path": "src/cmuh_common/window_icon.py",
       "local_filename": "src/cmuh_common/window_icon.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "ae35320f342c6a2a6d5f7ff5867c8b254399560d43f1d1620469806e6d5ea687"
     },
     {
       "key": "coord",
       "remote_path": "src/coord_detector.py",
       "local_filename": "src/coord_detector.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "a09307810e2490a993f26626d6430155a205894f10c9262a54e900204017fa17"
     },
     {
       "key": "main",
       "remote_path": "src/main.py",
       "local_filename": "src/main.py",
-      "version": "2026.05.08.6",
-      "sha256": "47b55566aa096cf8a0872637d486ae85ec2ee83a1e3f2733c3b61b4b37b99a4e"
+      "version": "2026.05.08.7",
+      "sha256": "a07f691e8b11439fc7c9efd942e93081be9502e1ed4eb9c1d1c760bac97fd398"
     },
     {
       "key": "scheduler",
       "remote_path": "src/scheduler.py",
       "local_filename": "src/scheduler.py",
-      "version": "2026.05.08.6",
+      "version": "2026.05.08.7",
       "sha256": "0cd5dd9bb6affc632281cf6943cdc0a69a95baaae466a74be8035b1d89bfc958"
     }
   ]
