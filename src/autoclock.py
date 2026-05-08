@@ -110,6 +110,84 @@ log_queue: queue.Queue = queue.Queue(maxsize=5000)
 clock_lock = threading.Lock()
 
 # =============================================================================
+# [autoclock 常駐 Chrome 池]
+# 原本每個排程任務都新開 Chrome（~3 秒啟動）；改成跨任務重用同一 driver。
+# 60 分鐘 idle 自動 quit，避免常駐記憶體無止境吃。
+# 排程結束（程式關閉）時 atexit 確保 quit。
+# =============================================================================
+_persistent_driver_pool = {
+    "driver": None,
+    "last_used": 0.0,
+    "lock": threading.Lock(),
+}
+_PERSISTENT_DRIVER_IDLE_TIMEOUT = 60 * 60  # 60 分鐘無使用 → 主動 quit
+
+
+def _get_or_create_clock_driver():
+    """取得常駐 driver；若 idle 過久或健康檢查失敗則重建。"""
+    pool = _persistent_driver_pool
+    with pool["lock"]:
+        d = pool["driver"]
+        now = time_module.time()
+
+        # idle 過久 → quit 重建
+        if d is not None and (now - pool["last_used"]) > _PERSISTENT_DRIVER_IDLE_TIMEOUT:
+            logging.info("[autoclock] driver idle 超過 %d 分鐘，重建",
+                         _PERSISTENT_DRIVER_IDLE_TIMEOUT // 60)
+            try:
+                d.quit()
+            except Exception:
+                pass
+            d = None
+            pool["driver"] = None
+
+        # 健康檢查
+        if d is not None:
+            try:
+                _ = d.window_handles
+            except Exception:
+                logging.info("[autoclock] driver 已死，重建")
+                try:
+                    d.quit()
+                except Exception:
+                    pass
+                d = None
+                pool["driver"] = None
+
+        # 不存在或剛被清掉 → 重建
+        if d is None:
+            for attempt in range(4):
+                d = initialize_driver()
+                if d:
+                    break
+                logging.warning("[autoclock] WebDriver 初始化失敗 (%s/4)，退避重試", attempt + 1)
+                if attempt < 3:
+                    exponential_backoff_sleep(attempt, base_seconds=2.0, max_seconds=60.0)
+            if d:
+                d.set_script_timeout(30)
+                pool["driver"] = d
+
+        pool["last_used"] = now
+        return d
+
+
+def _release_persistent_clock_driver():
+    """關閉常駐 driver（程式退出時呼叫）。"""
+    pool = _persistent_driver_pool
+    with pool["lock"]:
+        d = pool["driver"]
+        if d is not None:
+            try:
+                d.quit()
+            except Exception:
+                pass
+            pool["driver"] = None
+
+
+import atexit as _atexit_clock
+_atexit_clock.register(_release_persistent_clock_driver)
+
+# =============================================================================
 # 業務常數
 # =============================================================================
 LOGIN_URL = "http://10.20.8.47/peoplesystem/electron_card/login.aspx"
@@ -600,27 +678,20 @@ def process_clock_task(schedule_key: str | None) -> None:
             "排程觸發: %s，驗證區間: %s-%s，共有 %s 個帳號需執行。",
             schedule_key, check_start, check_end, len(accs))
 
-        driver = None
-        try:
-            for init_attempt in range(4):
-                driver = initialize_driver()
-                if driver:
-                    break
-                logging.warning("WebDriver 初始化失敗 (%s/4)，指數退避後重試...", init_attempt + 1)
-                if init_attempt < 3:
-                    exponential_backoff_sleep(init_attempt, base_seconds=2.0, max_seconds=60.0)
-            if not driver:
-                notify_clock_failure(
-                    "瀏覽器啟動失敗",
-                    ["無法建立 Chrome / WebDriver",
-                     f"排程: {schedule_key}",
-                     "請查看 settings\\autoclock.log"],
-                    None,
-                )
-                return
-            driver.set_script_timeout(30)
-            wait = WebDriverWait(driver, 20)
+        # [autoclock 常駐 Chrome] 不再每次任務開新 driver；用常駐池
+        driver = _get_or_create_clock_driver()
+        if not driver:
+            notify_clock_failure(
+                "瀏覽器啟動失敗",
+                ["無法建立 Chrome / WebDriver",
+                 f"排程: {schedule_key}",
+                 "請查看 settings\\autoclock.log"],
+                None,
+            )
+            return
 
+        try:
+            wait = WebDriverWait(driver, 20)
             for acc in accs:
                 if not running.is_set():
                     break
@@ -634,13 +705,10 @@ def process_clock_task(schedule_key: str | None) -> None:
                 _handle_clock_failure(driver, "system", schedule_key, e, dry_run=False)
             except Exception:
                 pass
+            # 任務級錯誤不關 driver；下次任務若 driver 不健康會自動重建
         finally:
-            if driver:
-                try:
-                    driver.quit()
-                except WebDriverException:
-                    pass
-            logging.info("任務 %s 執行週期結束。", schedule_key)
+            # 注意：不再 driver.quit()！常駐池管理（idle 60min 才釋放）
+            logging.info("任務 %s 執行週期結束（driver 保留以待下次任務）。", schedule_key)
 
 
 def get_sched_key() -> str | None:
@@ -911,6 +979,11 @@ def exit_action(icon=None, item=None) -> None:
     running.clear()
     if tray_icon_object:
         tray_icon_object.stop()
+    # 關閉常駐 driver（避免殘留 chromedriver.exe）
+    try:
+        _release_persistent_clock_driver()
+    except Exception:
+        pass
     release_single_instance()
     # [修正] 改用 sys.exit 讓 atexit 跑完
     sys.exit(0)

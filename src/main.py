@@ -47,6 +47,7 @@ REQUIRED_LIBS = [
     ("Pillow", "PIL"),
     ("pystray", "pystray"),
     ("pywin32", "win32gui"),
+    ("sv-ttk", "sv_ttk"),  # [UI 美化] Sun Valley 主題：原生 Win11 風格
 ]
 _ensure_deps_runtime(REQUIRED_LIBS)
 
@@ -4355,15 +4356,25 @@ class AutomationApp:
         logging.info(f"UI font scale applied: {scale:.2f} → fonts {self.f_lg}/{self.f_md}/{self.f_sm}")
 
         self.style = ttk.Style()
-        # [UI 美化] 嘗試切到 'vista'（Win 原生最美）→ fallback 'clam'（跨平台一致）
+        # [UI 美化] 優先用 sv-ttk（Win11 風格，現代、漂亮）→ fallback vista → clam
+        # 注意：使用 sv_ttk.set_theme 後，自訂 .map() 對某些元件可能無效（它接管渲染）
+        sv_ttk_applied = False
         try:
-            available = self.style.theme_names()
-            for preferred in ('vista', 'xpnative', 'clam', 'default'):
-                if preferred in available:
-                    self.style.theme_use(preferred)
-                    break
+            import sv_ttk  # type: ignore[import-not-found]
+            sv_ttk.set_theme("light")  # 也可改 "dark"；醫療系統主流是 light
+            sv_ttk_applied = True
+            logging.info("[UI] 已套用 sv-ttk light 主題（Win11 風格）")
         except Exception:
-            logging.debug("theme_use 失敗（沿用預設）", exc_info=True)
+            logging.debug("sv-ttk 不可用，fallback 到 vista/clam", exc_info=True)
+            try:
+                available = self.style.theme_names()
+                for preferred in ('vista', 'xpnative', 'clam', 'default'):
+                    if preferred in available:
+                        self.style.theme_use(preferred)
+                        break
+            except Exception:
+                logging.debug("theme_use 失敗（沿用預設）", exc_info=True)
+        self._sv_ttk_applied = sv_ttk_applied
         # 使用動態字體變數
         self.style.configure("TLabel", font=("Microsoft JhengHei UI", self.f_lg), padding=2)
         self.style.configure("Header.TLabel", font=("Microsoft JhengHei UI", self.f_md, "bold"), anchor="center")
@@ -4448,16 +4459,23 @@ class AutomationApp:
         self.style.configure("TEntry", padding=4)
 
         # Notebook：選中分頁更明顯
+        # 注意：vista 主題用 OS 原生繪製，無法改背景；強制改 foreground 會造成「白底白字」
+        # 因此只在 sv-ttk 或 clam 主題下才覆寫；vista 沿用主題預設
         try:
-            self.style.map('TNotebook.Tab',
-                           background=[('selected', BRAND_BLUE),
-                                       ('active', '#E3F2FD'),
-                                       ('!active', '#F0F0F0')],
-                           foreground=[('selected', 'white'),
-                                       ('active', BRAND_BLUE),
-                                       ('!active', '#333333')])
+            current_theme = self.style.theme_use()
         except Exception:
-            pass
+            current_theme = ""
+        if current_theme in ("clam", "default") or self._sv_ttk_applied:
+            try:
+                self.style.map('TNotebook.Tab',
+                               background=[('selected', BRAND_BLUE),
+                                           ('active', '#E3F2FD'),
+                                           ('!active', '#F0F0F0')],
+                               foreground=[('selected', 'white'),
+                                           ('active', BRAND_BLUE),
+                                           ('!active', '#333333')])
+            except Exception:
+                pass
 
         # Treeview 行距加大、選中色加深
         self.style.configure("Treeview",
@@ -7056,6 +7074,27 @@ class AutomationApp:
         except Exception as e:
             messagebox.showerror("失敗", str(e))
 
+    def _show_hotkey_step_viewer(self):
+        """[人性化檢視] 開啟熱鍵步驟視窗，列出『第 N 步: 左鍵點擊...』等。"""
+        try:
+            from cmuh_common.hotkey_viewer_ui import HotkeyViewerWindow
+            base_ver = HOTKEY_ADAPTIVE_STATE.get("base_version") or "1280x1024"
+            main_path = os.path.abspath(__file__)
+            HotkeyViewerWindow(self.root, default_resolution=base_ver,
+                               main_py_path=main_path)
+        except Exception as e:
+            logging.error("開啟熱鍵檢視器失敗: %s", e, exc_info=True)
+            messagebox.showerror("失敗", f"無法開啟熱鍵步驟檢視器:\n{e}")
+
+    def _show_hotkey_step_editor(self):
+        """[圖形化編輯] 開啟熱鍵步驟編輯器（新增/刪除/編輯，存到 JSON）。"""
+        try:
+            from cmuh_common.hotkey_editor import HotkeyEditorWindow
+            HotkeyEditorWindow(self.root)
+        except Exception as e:
+            logging.error("開啟熱鍵編輯器失敗: %s", e, exc_info=True)
+            messagebox.showerror("失敗", f"無法開啟熱鍵步驟編輯器:\n{e}")
+
     def _copy_to_clipboard(self, text_widget):
         try:
             text_to_copy = text_widget.get("1.0", tk.END).strip()
@@ -7191,15 +7230,23 @@ class AutomationApp:
             foreground="#555",
             font=("Microsoft JhengHei UI", self.f_sm),
         ).pack(anchor="w", pady=(0, 4))
-        btn_row_hk = ttk.Frame(hotkey_edit_frame)
-        btn_row_hk.pack(fill=tk.X)
-        ttk.Button(btn_row_hk, text="① 開啟熱鍵腳本（main.py）",
-                   command=self._open_hotkey_script_in_editor).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(btn_row_hk, text="② 套用熱鍵變更（重啟）",
-                   command=self._apply_hotkey_changes_restart).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btn_row_hk, text="顯示目前熱鍵綁定",
+        # 兩排按鈕：第一排查看，第二排操作
+        btn_row_hk_1 = ttk.Frame(hotkey_edit_frame)
+        btn_row_hk_1.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(btn_row_hk_1, text="🔍 人性化檢視步驟",
+                   command=self._show_hotkey_step_viewer).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_row_hk_1, text="✏️ 圖形化編輯步驟",
+                   command=self._show_hotkey_step_editor).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btn_row_hk_1, text="顯示目前熱鍵綁定",
                    command=self._show_hotkey_bindings).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btn_row_hk, text="重製熱鍵（不重啟）",
+
+        btn_row_hk_2 = ttk.Frame(hotkey_edit_frame)
+        btn_row_hk_2.pack(fill=tk.X)
+        ttk.Button(btn_row_hk_2, text="① 開啟原始碼（main.py）",
+                   command=self._open_hotkey_script_in_editor).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_row_hk_2, text="② 套用變更（重啟）",
+                   command=self._apply_hotkey_changes_restart).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btn_row_hk_2, text="重製熱鍵（不重啟）",
                    command=self._trigger_rehook_hotkeys).pack(side=tk.LEFT, padx=6)
 
         # [修改] 建立容器，並定義三個直行
@@ -8772,6 +8819,10 @@ if __name__ == "__main__":
             pass
     try:
         main_root.deiconify()
+        # 顯式解除 topmost（修：splash 關閉後主視窗有時殘留 topmost，導致無法切到其他程式）
+        main_root.attributes("-topmost", False)
+        main_root.lift()
+        main_root.focus_force()
     except Exception:
         pass
 

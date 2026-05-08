@@ -23,11 +23,13 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 # === 解析用的 regex 模式 ===
-# px.match_rgb(932, 456, (255, 255, 225), 10)
+# 支援兩種寫法：
+#   px.match_rgb(932, 456, (255, 255, 225), 10)       — 1280x1024 風格
+#   px.match_rgb(932, 456, (255, 255, 225), tolerance=5) — 1920x1080 風格
 _RE_MATCH_RGB = re.compile(
-    r"px\.match_rgb\(\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)\s*,\s*(\d+)\s*\)"
+    r"px\.match_rgb\(\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)\s*,\s*(?:tolerance\s*=\s*)?(\d+)\s*\)"
 )
-# click_point_1280(754, 585, after_delay=0.1)
+# click_point_<res>(754, 585, after_delay=0.1)
 _RE_CLICK = re.compile(
     r"click_point_(\d+)\(\s*(-?\d+)\s*,\s*(-?\d+)\s*(?:,\s*after_delay\s*=\s*([\d.]+))?\s*\)"
 )
@@ -36,10 +38,19 @@ _RE_LOG = re.compile(r'logging\.info\(\s*[fr]?"([^"]*?)"')
 # # (註記:xxx) 中文註解
 _RE_NOTE = re.compile(r"#\s*\(?註記[:：]?\s*([^)）#]+)")
 # type_digits_1280(...) / type_text_1024(...) / wait_for_color_*
-_RE_TYPE = re.compile(r"type_(?:digits|text)_\d+\(\s*([^)]+)\)")
+_RE_TYPE = re.compile(r"type_(?:digits|text)_\d+\(\s*[\"']?([^,)\"']+)[\"']?")
+# wait_for_color_1024(854, 711, "(255,255,0)2") 或 wait_for_multiple_colors_1280(...)
 _RE_WAIT_COLOR = re.compile(
-    r"wait_for_(?:multiple_)?colors?_\d+\("
+    r"wait_for_(?:multiple_)?colors?_\d+\(\s*(-?\d+)\s*,\s*(-?\d+)"
 )
+# check_color_from_spec_1024(392, 363, "(0,0,0)240")
+_RE_CHECK_COLOR = re.compile(
+    r"check_color_from_spec_\d+\(\s*(-?\d+)\s*,\s*(-?\d+)"
+)
+# time.sleep(0.2)
+_RE_SLEEP = re.compile(r"time\.sleep\(\s*([\d.]+)\s*\)")
+# Step 編號 / steps_executed[N] / 註解中的 step
+_RE_STEP_GUARD = re.compile(r"not\s+(?:steps_executed|steps_done)\[")
 
 
 @dataclass
@@ -82,10 +93,32 @@ class TypeAction:
 
 @dataclass
 class WaitColorAction:
-    """像素等候（簡化顯示）。"""
+    """像素等候（顯示座標）。"""
+    x: int = 0
+    y: int = 0
 
     def to_human(self) -> str:
+        if self.x or self.y:
+            return f"等候像素 ({self.x:>4}, {self.y:>4}) 出現指定顏色"
         return "等候像素出現..."
+
+
+@dataclass
+class CheckColorAction:
+    """條件檢查像素顏色。"""
+    x: int
+    y: int
+
+    def to_human(self) -> str:
+        return f"檢查像素 ({self.x:>4}, {self.y:>4}) 顏色（條件成立才執行下一步）"
+
+
+@dataclass
+class SleepAction:
+    seconds: float
+
+    def to_human(self) -> str:
+        return f"等候 {self.seconds}s"
 
 
 @dataclass
@@ -105,6 +138,9 @@ class HotkeyScript:
     line_end: int
     init_action: Optional[ClickAction] = None
     steps: list[HotkeyStep] = field(default_factory=list)
+    # [新增] sequential_actions：給沒有 while 迴圈的順序腳本（1024x768 F9/F10、F3/F4）
+    sequential_actions: list = field(default_factory=list)
+    is_sequential: bool = False
 
 
 def _read_main_source() -> Optional[str]:
@@ -144,7 +180,13 @@ def _find_function_block(source: str, func_name: str) -> Optional[tuple[int, int
 
 
 def parse_hotkey_script(source: str, hotkey: str, resolution: str) -> Optional[HotkeyScript]:
-    """從 main.py 原始碼解析單一熱鍵腳本。"""
+    """從 main.py 原始碼解析單一熱鍵腳本。
+
+    支援三種腳本模式：
+      A. 「迴圈+match_rgb」 — 1280x1024 / 1920x1080 的 F11
+      B. 「順序動作」      — 1024x768 的 F9/F10、所有解析度的 F3/F4
+      C. 「混合」           — 順序前置 + 迴圈
+    """
     func_name = f"script_{hotkey}_{resolution}"
     block = _find_function_block(source, func_name)
     if not block:
@@ -161,12 +203,55 @@ def parse_hotkey_script(source: str, hotkey: str, resolution: str) -> Optional[H
 
     lines = body.split("\n")
 
-    # 把整個 body 視為一個流：
-    #   - while True: 出現之前的 click_point_<res>(...) → 起始動作
-    #   - while True: 之後的 if/elif px.match_rgb 區塊 → step
+    # 第一階段：判斷有沒有 while True 迴圈
+    has_while_loop = any(re.match(r"\s*while\s+True\s*:", ln) for ln in lines)
+
+    if not has_while_loop:
+        # === 模式 B：純順序動作 ===
+        script.is_sequential = True
+        for idx, raw_line in enumerate(lines):
+            line = raw_line.rstrip()
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith("#") or stripped.startswith("def "):
+                continue
+            # click_point
+            cm = _RE_CLICK.search(line)
+            if cm:
+                script.sequential_actions.append(ClickAction(
+                    x=int(cm.group(2)), y=int(cm.group(3)),
+                    delay=float(cm.group(4) or 0.0),
+                ))
+                continue
+            # wait_for_color
+            wm = _RE_WAIT_COLOR.search(line)
+            if wm:
+                script.sequential_actions.append(WaitColorAction(
+                    x=int(wm.group(1)), y=int(wm.group(2))))
+                continue
+            # check_color_from_spec
+            ccm = _RE_CHECK_COLOR.search(line)
+            if ccm:
+                script.sequential_actions.append(CheckColorAction(
+                    x=int(ccm.group(1)), y=int(ccm.group(2))))
+                continue
+            # time.sleep
+            sm = _RE_SLEEP.search(line)
+            if sm:
+                script.sequential_actions.append(SleepAction(
+                    seconds=float(sm.group(1))))
+                continue
+            # type_digits / type_text
+            tm = _RE_TYPE.search(line)
+            if tm:
+                script.sequential_actions.append(TypeAction(text=tm.group(1).strip()))
+                continue
+        return script
+
+    # === 模式 A/C：有 while 迴圈 ===
     in_loop = False
     current_step: Optional[HotkeyStep] = None
     init_done = False
+    last_step_idx = 0  # 用於 1920x1080 那種 steps_executed[N] 編號
 
     for idx, raw_line in enumerate(lines):
         line = raw_line.rstrip()
@@ -177,13 +262,26 @@ def parse_hotkey_script(source: str, hotkey: str, resolution: str) -> Optional[H
             in_loop = True
             continue
 
-        # 偵測「if/elif px.match_rgb」開新 step
-        if "px.match_rgb" in line and re.match(r"\s*(if|elif)\s+\(?\s*px\.match_rgb", line):
+        # 偵測「if/elif px.match_rgb」或「if/elif not steps_executed[N] and px.match_rgb」開新 step
+        is_step_open = (
+            "px.match_rgb" in line
+            and re.match(r"\s*(if|elif)\s+", line)
+        )
+        if is_step_open:
             # finalise previous
             if current_step:
                 script.steps.append(current_step)
             # 在此行往前看最近的 # 註記行作為步驟名稱
             step_name = _peek_back_for_note(lines, idx)
+            # 嘗試從 logging.info("Executing step N") 補強名稱（往下 5 行內找）
+            if step_name == "（未命名步驟）":
+                for j in range(1, 6):
+                    if idx + j >= len(lines):
+                        break
+                    log_m = _RE_LOG.search(lines[idx + j])
+                    if log_m:
+                        step_name = log_m.group(1).strip()
+                        break
             current_step = HotkeyStep(name=step_name, line_number=line_no)
             # 抓本行的所有 match_rgb
             for m in _RE_MATCH_RGB.finditer(line):
@@ -196,7 +294,7 @@ def parse_hotkey_script(source: str, hotkey: str, resolution: str) -> Optional[H
 
         # 後續行也可能含 match_rgb（多行 if 條件）
         if current_step is not None and "px.match_rgb" in line and not re.match(
-            r"\s*(if|elif|else|click|logging|action_taken|return|continue)", line
+            r"\s*(if|elif|else|click|logging|action_taken|return|continue|steps_executed|steps_done)", line
         ):
             for m in _RE_MATCH_RGB.finditer(line):
                 current_step.matches.append(MatchCondition(
@@ -229,8 +327,10 @@ def parse_hotkey_script(source: str, hotkey: str, resolution: str) -> Optional[H
             continue
 
         # wait_for_color
-        if _RE_WAIT_COLOR.search(line) and current_step is not None:
-            current_step.actions.append(WaitColorAction())
+        wcm = _RE_WAIT_COLOR.search(line)
+        if wcm and current_step is not None:
+            current_step.actions.append(WaitColorAction(
+                x=int(wcm.group(1)), y=int(wcm.group(2))))
             continue
 
         # 'return' / 'break' 表示 step 結束 + 整個 script 終止條件
@@ -274,6 +374,17 @@ def format_script_for_display(script: HotkeyScript) -> list[str]:
     lines.append(title)
     lines.append(f"  原始碼位置: main.py 第 {script.line_start}–{script.line_end} 行")
     lines.append("")
+
+    if script.is_sequential:
+        # 順序動作型腳本（1024x768 F9/F10、F3/F4 等）
+        if not script.sequential_actions:
+            lines.append("  (沒有可解析的動作)")
+            return lines
+        lines.append(f"順序動作（共 {len(script.sequential_actions)} 個，依序執行）:")
+        lines.append("")
+        for i, act in enumerate(script.sequential_actions, 1):
+            lines.append(f"  第 {i:>2} 步: {act.to_human()}")
+        return lines
 
     if script.init_action:
         lines.append(f"起始動作:  {script.init_action.to_human()}")

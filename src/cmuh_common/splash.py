@@ -95,7 +95,18 @@ class StartupSplash:
         if self._top is None:
             return
         try:
+            # 先解除 topmost，避免 Windows 把 topmost 旗標「傳染」給 parent root
+            self._top.attributes("-topmost", False)
+        except Exception:
+            pass
+        try:
             self._top.destroy()
         except Exception:
             logging.debug("splash close 失敗（忽略）", exc_info=True)
         self._top = None
+        # 確保 parent root 沒被殘留 topmost
+        try:
+            if self._parent is not None:
+                self._parent.attributes("-topmost", False)
+        except Exception:
+            pass

@@ -147,7 +147,30 @@ class HotkeyViewerWindow(tk.Toplevel):
                              "  3. 函式名稱不符合 script_F<N>_<res>x<res> 慣例")
             return
 
-        # 概覽
+        if script.is_sequential:
+            # 順序動作型腳本（1024x768 F9/F10、F3/F4 等）
+            n_acts = len(script.sequential_actions)
+            self.summary_var.set(
+                f"函式: {script.function_name}()    "
+                f"main.py 第 {script.line_start}–{script.line_end} 行\n"
+                f"類型: 順序動作腳本（依序執行，無條件判斷）\n"
+                f"動作數: 共 {n_acts} 個"
+            )
+            for i, act in enumerate(script.sequential_actions, 1):
+                desc = act.to_human()
+                # 截短顯示（避免列表太長）
+                short = desc if len(desc) < 36 else desc[:33] + "..."
+                self.steps_tree.insert("", "end", iid=str(i),
+                                       values=(f"第 {i:>2} 步: {short}",))
+            if n_acts > 0:
+                self.steps_tree.selection_set("1")
+                self.steps_tree.see("1")
+                self._on_step_selected()
+            else:
+                self._set_detail("此腳本沒有可解析的動作。")
+            return
+
+        # 迴圈+match_rgb 型腳本
         n_steps = len(script.steps)
         init_text = (f"起始動作: {script.init_action.to_human()}"
                      if script.init_action else "起始動作: (無)")
@@ -181,10 +204,35 @@ class HotkeyViewerWindow(tk.Toplevel):
             idx = int(sel[0])
         except ValueError:
             return
+        # 順序腳本走另一條 render path
+        if self._current_script.is_sequential:
+            if idx < 1 or idx > len(self._current_script.sequential_actions):
+                return
+            act = self._current_script.sequential_actions[idx - 1]
+            self._render_sequential_action(idx, act)
+            return
         if idx < 1 or idx > len(self._current_script.steps):
             return
         step = self._current_script.steps[idx - 1]
         self._render_step_detail(idx, step)
+
+    def _render_sequential_action(self, idx: int, act) -> None:
+        self.detail_text.configure(state="normal")
+        self.detail_text.delete("1.0", tk.END)
+        self.detail_text.insert(tk.END, f"第 {idx} 步\n", "title")
+        self.detail_text.insert(tk.END, "▸ 動作：\n", "section")
+        self.detail_text.insert(tk.END, f"     {act.to_human()}\n\n")
+        # 顯示原始類別名（讓使用者了解動作類型）
+        type_label = {
+            "ClickAction": "🖱  滑鼠左鍵點擊",
+            "TypeAction": "⌨  鍵盤輸入",
+            "WaitColorAction": "⏳ 等候像素變色",
+            "CheckColorAction": "🎨 檢查像素顏色",
+            "SleepAction": "💤 等候時間",
+        }.get(type(act).__name__, type(act).__name__)
+        self.detail_text.insert(tk.END, "▸ 動作類型：\n", "section")
+        self.detail_text.insert(tk.END, f"     {type_label}\n", "hint")
+        self.detail_text.configure(state="disabled")
 
     def _render_step_detail(self, idx: int, step) -> None:
         self.detail_text.configure(state="normal")
