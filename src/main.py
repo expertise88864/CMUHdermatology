@@ -142,6 +142,35 @@ _RE_COUNT_APPT  = re.compile(r'已掛號：(\d+)')   # 用於 check_appointment_
 _RE_PERSON      = re.compile(r'(\d+)\s*人')      # 用於 check_appointment_count 人數
 _RE_ROC_DATE    = re.compile(r'(\d{2,3})/(\d{2})/(\d{2})')
 
+# [O16] reg52 hot-path 預編譯：原本散落在函式內的 inline re.search/findall，集中宣告省 compile 開銷
+_RE_REG52_DATE_CNT_PAIRS = re.compile(r'(\d{2,3}/\d{2}/\d{2})\s*已掛號[：:]\s*(\d+)')
+_RE_CLINIC_DOCTOR        = re.compile(r"醫師[：:]\s*(\S+)")
+_RE_CLINIC_CLOSED        = re.compile(r"\(已關診\)|（已關診）")
+_RE_CLINIC_CLOSE_LINE    = re.compile(r"診間目前燈號\s*[：:]\s*\d+[^\n\r]*已關診")
+_RE_CLINIC_END_TIME      = re.compile(r"應診時間[：:]\s*[\d]+\s*~\s*(\d{4})")
+_RE_CLINIC_LIGHT_NUM     = re.compile(r"診間目前燈號\s*[：:]\s*(\d+)")
+_RE_DIGITS_ONLY          = re.compile(r"\D")
+
+# [O16] 預編譯 soupsieve CSS selector（hot path: _parse_main_hospital_schedule 每醫師呼叫 1 次）
+# 用 lazy-init 避免 import 順序問題（soupsieve 在 bs4 之後 import）
+_CSS_SELECTORS_CACHE: dict = {}
+
+
+def _css(selector: str):
+    """[O16] 取得已編譯的 soupsieve CSS selector（一次編譯，永久重用）。"""
+    cached = _CSS_SELECTORS_CACHE.get(selector)
+    if cached is not None:
+        return cached
+    try:
+        import soupsieve  # type: ignore[import-untyped]
+        compiled = soupsieve.compile(selector)
+        _CSS_SELECTORS_CACHE[selector] = compiled
+        return compiled
+    except Exception:
+        # soupsieve 不可用或編譯失敗 → fallback 回字串（呼叫 .select 時 bs4 會自己處理）
+        _CSS_SELECTORS_CACHE[selector] = selector
+        return selector
+
 # ---------------------------
 # --- [修改] Log 處理器：改為 Queue 模式 (防止 UI 卡死) ---
 # --- 2. 全域設定與日誌 ---
@@ -2499,7 +2528,7 @@ def _parse_auh_reg52_schedule(soup):
         else:
             continue
 
-        pairs = re.findall(r'(\d{2,3}/\d{2}/\d{2})\s*已掛號[：:]\s*(\d+)', txt_norm)
+        pairs = _RE_REG52_DATE_CNT_PAIRS.findall(txt_norm)  # [O16] precompiled
         for roc_date_str, count_str in pairs:
             try:
                 d = _safe_parse_roc_date(roc_date_str)
@@ -2964,30 +2993,63 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
         UiClinicDataMessage(doctor_name=doc_no, data={"error": f"查詢失敗 ({error_type})"}),
     )
 
-MASTER_SCHEDULE_DISK_TTL_SECONDS = 24 * 60 * 60  # [O4] 24 小時：排班一天通常變動 ≤1 次
+MASTER_SCHEDULE_DISK_TTL_SECONDS = 24 * 60 * 60  # [O4] 24 小時 hard limit
+MASTER_SCHEDULE_INCREMENTAL_FRESH_SECONDS = 30 * 60  # [O14] 30 分鐘內視為「絕對新鮮」，連背景抓都跳過
 
 
 def load_master_schedule_in_background(ui_queue: "Queue[UiMessage]", *, force: bool = False):
-    """[O4 優化] 啟動時先看 disk cache 新鮮度；若 < 24h 直接跳過網路抓取。
-
-    觸發網路抓取的場景：
-      - 首次啟動（cache 不存在）
-      - cache 超過 24h
-      - 使用者手動觸發 force=True
+    """[O14 增量更新] 啟動時若 cache 在 30 分鐘內絕對新鮮 → 完全跳過。
+    若在 30min ~ 24h 之間 → 背景抓取，hash 不同才套用（不阻塞 UI）。
+    若超過 24h 或不存在 → 同 [O4] 行為，正常抓取。
     """
     logging.info("Loading master schedule in background...")
     cache_path = get_conf_path('cache_master_schedule.json')
+
+    cache_age = None
     if not force and os.path.exists(cache_path):
         try:
-            age = time.time() - os.path.getmtime(cache_path)
-            if age < MASTER_SCHEDULE_DISK_TTL_SECONDS:
-                logging.info(
-                    "[O4] master_schedule disk cache 仍新鮮（%.1f 小時），跳過網路抓取",
-                    age / 3600.0,
-                )
-                return  # disk cache 已在 _load_caches() 載入到 self.master_schedule
+            cache_age = time.time() - os.path.getmtime(cache_path)
         except OSError:
-            pass
+            cache_age = None
+
+    # [O14] 30 分鐘內絕對新鮮 → 跳過
+    if cache_age is not None and cache_age < MASTER_SCHEDULE_INCREMENTAL_FRESH_SECONDS:
+        logging.info("[O14] master_schedule cache 絕對新鮮（%.1f 分鐘），跳過網路抓取",
+                     cache_age / 60.0)
+        return
+
+    # 30min ~ 24h：背景抓並比對 hash，僅在不同時才套用
+    if cache_age is not None and cache_age < MASTER_SCHEDULE_DISK_TTL_SECONDS:
+        logging.info("[O14] master_schedule cache 中度新鮮（%.1f 小時），背景增量抓取",
+                     cache_age / 3600.0)
+        try:
+            new_schedule = create_master_schedule_from_web()
+        except Exception as e:
+            logging.warning("[O14] 背景增量抓取失敗（沿用 cache）: %s", e)
+            return
+        # hash 比對：序列化後算 sha1
+        try:
+            import json as _json, hashlib as _hl
+            old_data = _json.load(open(cache_path, 'r', encoding='utf-8'))
+            new_data = {k: {str(d): v for d, v in days.items()}
+                        for k, days in (new_schedule or {}).items()}
+            old_hash = _hl.sha1(_json.dumps(old_data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            new_hash = _hl.sha1(_json.dumps(new_data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            if old_hash == new_hash:
+                logging.info("[O14] master_schedule 無變動，沿用本地 cache")
+                # 仍要 touch cache mtime 避免每次啟動都重抓
+                try:
+                    os.utime(cache_path, None)
+                except OSError:
+                    pass
+                return
+            logging.info("[O14] master_schedule 偵測到變動，套用新版")
+        except Exception:
+            logging.debug("[O14] hash 比對失敗，視為有變動", exc_info=True)
+        put_ui_message(ui_queue, UiMasterScheduleMessage(schedule=new_schedule))
+        return
+
+    # 超過 24h 或 cache 不存在：正常抓
     schedule = create_master_schedule_from_web()
     put_ui_message(ui_queue, UiMasterScheduleMessage(schedule=schedule))
 
@@ -3285,10 +3347,12 @@ CLINIC_DYNAMIC_STATE_FILENAME = "clinic_dynamic_state.json"
 NOTIFY_DO_NOT_DISTURB_START_HOUR = 0
 NOTIFY_DO_NOT_DISTURB_END_HOUR = 8
 
-REG52_MAIN_TTL_SECONDS = 120
-REG52_BRANCH_TTL_SECONDS = 180
-REG52_AUH_TTL_SECONDS = 180
-REG52_DAYOFF_TTL_SECONDS = 300
+# [O10] 拉長主院 cache TTL 120s → 300s（5 分鐘）；分院 180 → 600s（10 分鐘）
+# 院方主機自身慢（~3-7s），cache 命中時 UI 立即顯示，不必每 2 分鐘抓一次
+REG52_MAIN_TTL_SECONDS = 300
+REG52_BRANCH_TTL_SECONDS = 600
+REG52_AUH_TTL_SECONDS = 600
+REG52_DAYOFF_TTL_SECONDS = 600
 REG52_MAIN_TIMEOUT = (5, 10)
 REG52_DAYOFF_TIMEOUT = (3, 5)
 # [O2] 院外連線 timeout 從 (4,8) 縮為 (2,5)：AUH/惠盛/東區若不通，2 秒就失敗，避免拖慢首批
@@ -3648,7 +3712,8 @@ class AutomationApp:
         self._hotkey_editor_window = None
         self._log_backlog = []
 
-        self.ui_queue = Queue()
+        # [O15] Queue 加上界，避免極端狀況 OOM；UI 端用 get_nowait 批次拉取
+        self.ui_queue = Queue(maxsize=10000)
         self.all_doctors_data = {}
         self.master_schedule = master_schedule
         self._master_schedule_by_weekday = defaultdict(list)
@@ -5411,7 +5476,7 @@ class AutomationApp:
 
             doc_name = ""
             page_text = soup.get_text()
-            match = re.search(r"醫師[：:]\s*(\S+)", page_text)
+            match = _RE_CLINIC_DOCTOR.search(page_text)  # [O16]
             if match: doc_name = match.group(1).strip()
 
             if "查無此診間的資料" in page_html:
@@ -5419,20 +5484,20 @@ class AutomationApp:
 
             # 已關診：常見為「診間目前燈號：99 (已關診)」或全形括號
             is_closed = bool(
-                re.search(r"診間目前燈號\s*[：:]\s*\d+[^\n\r]*已關診", page_text)
-                or re.search(r"\(已關診\)|（已關診）", page_text)
+                _RE_CLINIC_CLOSE_LINE.search(page_text)  # [O16]
+                or _RE_CLINIC_CLOSED.search(page_text)
             )
             is_stopped = "(未開診)" in page_text
             
             close_time_str = ""
             if is_closed:
-                time_match = re.search(r"應診時間[：:]\s*[\d]+\s*~\s*(\d{4})", page_text)
+                time_match = _RE_CLINIC_END_TIME.search(page_text)  # [O16]
                 if time_match:
                     raw_time = time_match.group(1) 
                     close_time_str = f"{raw_time[:2]}:{raw_time[2:]}" if len(raw_time) == 4 else raw_time
 
             light_num = "0"
-            match_light = re.search(r"診間目前燈號\s*[：:]\s*(\d+)", page_text)
+            match_light = _RE_CLINIC_LIGHT_NUM.search(page_text)  # [O16]
             if match_light:
                 light_num = match_light.group(1)
             if is_closed and light_num == "0":
@@ -5780,7 +5845,7 @@ class AutomationApp:
                                                 hp, mp = ct.split(":", 1)
                                                 hh, mm = int(hp), int(mp[:2])
                                             else:
-                                                ctn = re.sub(r"\D", "", ct)
+                                                ctn = _RE_DIGITS_ONLY.sub("", ct)  # [O16]
                                                 if len(ctn) >= 4:
                                                     hh, mm = int(ctn[:2]), int(ctn[2:4])
                                                 else:
@@ -8252,6 +8317,29 @@ class AutomationApp:
 
         # 值班四筆在 _fetch_all_duty_info 內並行，每筆獨立 Session；啟動略提前以縮短首屏等待
         self.root.after(2500, lambda: self.bg_executor.submit(self._fetch_all_duty_info))
+
+        # [O13] 啟動後 6 秒背景暖機 Chrome：使用者第一次按打卡狀態時 Chrome 已就緒（省 ~3 秒）
+        # 條件：credentials.json 存在（使用者已設定過帳密）才暖機，避免無謂啟動
+        def _prewarm_chrome():
+            try:
+                cred_path = get_conf_path('credentials.json')
+                if not os.path.exists(cred_path):
+                    logging.debug("[O13] credentials.json 不存在，跳過 Chrome 暖機")
+                    return
+                logging.info("[O13] 背景暖機 Chrome ...")
+                d = _get_or_create_status_driver()
+                if d:
+                    logging.info("[O13] Chrome 暖機完成（下次打卡狀態查詢免等啟動）")
+            except Exception:
+                logging.debug("[O13] Chrome 暖機例外（忽略）", exc_info=True)
+        self.root.after(6000, lambda: self.bg_executor.submit(_prewarm_chrome))
+
+        # [O17] 啟動 30 秒後背景清理舊 cache、log 備份、tmp、過期 pyc
+        try:
+            from cmuh_common.cache_cleanup import schedule_cleanup_in_background
+            schedule_cleanup_in_background(self.bg_executor, delay_seconds=30)
+        except Exception:
+            logging.debug("[O17] schedule_cleanup_in_background 失敗", exc_info=True)
         
         def run_schedule():
             def run_named_job(job_tag, fn):
@@ -8442,12 +8530,23 @@ if __name__ == "__main__":
     # 避免在背景執行緒觸發 Variable.__del__ 導致崩潰
     import gc
     gc.collect()
-    
+
     run_as_admin()
     _set_windows_dpi_awareness()
     _set_windows_app_user_model_id()
+
+    # [O18] 啟動 splash：給使用者「程式正在開」的即時反饋
+    try:
+        from cmuh_common.splash import StartupSplash
+        _splash = StartupSplash("正在初始化…")
+        _splash.show()
+    except Exception:
+        _splash = None
+        logging.debug("splash 啟動失敗（忽略）", exc_info=True)
+
     main_root = tk.Tk()
-    
+    main_root.withdraw()  # 主視窗先隱藏，等初始化完成再顯示，避免閃爍
+
     # 綁定全域例外處理，避免背景執行緒崩潰導致閃退
     def handle_exception(exc_type, exc_value, exc_traceback):
         if issubclass(exc_type, KeyboardInterrupt):
@@ -8465,8 +8564,23 @@ if __name__ == "__main__":
             )
         threading.excepthook = _thread_excepthook
 
+    if _splash:
+        _splash.update_text("載入主視窗…")
+
     app = AutomationApp(main_root, {})
     DOCTORS = app.doctors_list
     DOCTOR_NAMES = [d["name"] for d in DOCTORS]
+
+    # [O18] splash 關閉後再顯示主視窗（避免主視窗閃爍）
+    if _splash:
+        try:
+            _splash.close()
+        except Exception:
+            pass
+    try:
+        main_root.deiconify()
+    except Exception:
+        pass
+
     main_root.mainloop()
     logging.info("--- Script Finished ---")

@@ -85,8 +85,14 @@ class DependencyInstaller(tk.Tk):
                     if os.name == 'nt':
                         startupinfo = subprocess.STARTUPINFO()
                         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    # [O19] pip 加速旗標：
+                    #   --no-input：不互動（避免 hang）
+                    #   --disable-pip-version-check：跳過 pip 自身版本檢查
+                    #   --prefer-binary：優先用 wheel（避免 source 編譯）
                     subprocess.check_call(
-                        [sys.executable, "-m", "pip", "install", pkg_name, "--upgrade", "--quiet"],
+                        [sys.executable, "-m", "pip", "install", pkg_name,
+                         "--upgrade", "--quiet", "--no-input",
+                         "--disable-pip-version-check", "--prefer-binary"],
                         startupinfo=startupinfo,
                     )
                     importlib.invalidate_caches()

@@ -87,4 +87,19 @@ UiMessage: TypeAlias = Union[
 
 
 def put_ui_message(ui_queue: "Queue[UiMessage]", msg: UiMessage) -> None:
-    ui_queue.put(msg)
+    """[O15] 改 put_nowait：滿了就丟最舊一筆，避免背景執行緒卡死。"""
+    import logging
+    try:
+        ui_queue.put_nowait(msg)
+        return
+    except Exception:
+        pass
+    # Queue 已滿（極端情況）：丟掉最舊一筆讓新訊息進來
+    try:
+        ui_queue.get_nowait()
+    except Exception:
+        logging.debug("ui_queue full and unable to drop oldest", exc_info=True)
+    try:
+        ui_queue.put_nowait(msg)
+    except Exception:
+        logging.debug("ui_queue still full after drop, message dropped", exc_info=True)
