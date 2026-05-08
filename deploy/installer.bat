@@ -119,6 +119,17 @@ if exist "!INSTALL_DIR!\requirements.txt" (
 )
 echo.
 
+REM ====== 4c. [O8] 預編譯 .pyc 加速首次啟動 ======
+if exist "!INSTALL_DIR!\src" (
+    echo     預編譯 .pyc ...
+    if !USE_SYSTEM_PY!==1 (
+        python -m compileall -q -j 0 "!INSTALL_DIR!\src" 2>nul
+    ) else (
+        "!PY_DIR!\python.exe" -m compileall -q -j 0 "!INSTALL_DIR!\src" 2>nul
+    )
+)
+echo.
+
 REM ====== 5. 建桌面捷徑 ======
 echo [5/5] 建立桌面捷徑...
 set DESKTOP=%USERPROFILE%\Desktop

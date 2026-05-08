@@ -644,7 +644,7 @@ def parse_roc_date_str(roc_date_str):
 
 def _initialize_status_driver():
     logging.info("Initializing headless WebDriver for status check...")
-    
+
     try:
         from selenium import webdriver
         from selenium.webdriver.chrome.options import Options
@@ -658,8 +658,15 @@ def _initialize_status_driver():
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920x1080")
     chrome_options.add_argument("--log-level=3")
+    # [O3] 常駐 Chrome 額外旗標：減少資源占用
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--disable-images")
+    chrome_options.add_argument("--blink-settings=imagesEnabled=false")
     chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
-    
+    chrome_options.page_load_strategy = "eager"
+
     try:
         # [優化] Selenium 4.6+ 將自動呼叫底層 Selenium Manager 載入驅動，秒開毫秒就緒
         driver = webdriver.Chrome(options=chrome_options)
@@ -669,13 +676,77 @@ def _initialize_status_driver():
         logging.error(f"Failed to initialize headless WebDriver: {e}")
         return None
 
+
+# =============================================================================
+# [O3] 常駐 Chrome 池：避免每次按打卡狀態都重新啟動 Chrome（省 ~3 秒）
+# 30 分鐘 idle 後自動 quit；程式退出時 atexit 確保 quit
+# =============================================================================
+_status_driver_pool = {
+    "driver": None,
+    "last_used": 0.0,
+    "lock": threading.Lock(),
+}
+_STATUS_DRIVER_IDLE_TIMEOUT = 30 * 60  # 30 分鐘無動作就關閉
+
+
+def _get_or_create_status_driver():
+    """取得常駐 status driver。若不存在或已 idle 超時就重建。"""
+    import time as _t
+    pool = _status_driver_pool
+    with pool["lock"]:
+        driver = pool["driver"]
+        now = _t.time()
+        # 若 idle 超時，先關閉
+        if driver is not None and (now - pool["last_used"]) > _STATUS_DRIVER_IDLE_TIMEOUT:
+            try:
+                driver.quit()
+            except Exception:
+                logging.debug("idle status driver quit 失敗", exc_info=True)
+            driver = None
+            pool["driver"] = None
+        # 健康檢查（驗證 driver 仍可用）
+        if driver is not None:
+            try:
+                _ = driver.window_handles  # 觸發一次 RPC 確認 driver 還活著
+            except Exception:
+                logging.info("既有 status driver 已死，重建")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                driver = None
+                pool["driver"] = None
+        if driver is None:
+            driver = _initialize_status_driver()
+            pool["driver"] = driver
+        pool["last_used"] = now
+        return driver
+
+
+def _release_status_driver():
+    """程式結束時 quit 常駐 driver。"""
+    pool = _status_driver_pool
+    with pool["lock"]:
+        d = pool["driver"]
+        if d is not None:
+            try:
+                d.quit()
+            except Exception:
+                pass
+            pool["driver"] = None
+
+
+import atexit as _atexit
+_atexit.register(_release_status_driver)
+
 # --- [修正] 打卡狀態抓取 (修正密碼錯誤Alert處理 + TAB優化) ---
+# [O3] 改用常駐 Chrome（_get_or_create_status_driver），首次後再按只要 1-2 秒
 def _get_swipe_status_from_web(username, password):
     # 定義檢查區間
     AM_START = dt_time(7, 30); AM_END = dt_time(8, 0)
     PM_START = dt_time(17, 0); PM_END = dt_time(17, 30)
 
-    driver = _initialize_status_driver()
+    driver = _get_or_create_status_driver()
     if not driver: return {"error": "Driver失敗"}
     
     from selenium.webdriver.common.by import By
@@ -819,8 +890,8 @@ def _get_swipe_status_from_web(username, password):
     except Exception as e:
         logging.error(f"打卡檢查發生錯誤: {e}")
         return {"error": str(e)[:20]}
-    finally:
-        driver.quit()
+    # [O3] 注意：不再 driver.quit()！常駐 Chrome 由 _get_or_create_status_driver
+    # 控管，30 分鐘 idle 自動 quit；程式結束時 atexit 也會清理。
 
 # =============================================================================
 # --- 6. 自動化腳本 ---
@@ -2828,8 +2899,30 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
         UiClinicDataMessage(doctor_name=doc_no, data={"error": f"查詢失敗 ({error_type})"}),
     )
 
-def load_master_schedule_in_background(ui_queue: "Queue[UiMessage]"):
+MASTER_SCHEDULE_DISK_TTL_SECONDS = 24 * 60 * 60  # [O4] 24 小時：排班一天通常變動 ≤1 次
+
+
+def load_master_schedule_in_background(ui_queue: "Queue[UiMessage]", *, force: bool = False):
+    """[O4 優化] 啟動時先看 disk cache 新鮮度；若 < 24h 直接跳過網路抓取。
+
+    觸發網路抓取的場景：
+      - 首次啟動（cache 不存在）
+      - cache 超過 24h
+      - 使用者手動觸發 force=True
+    """
     logging.info("Loading master schedule in background...")
+    cache_path = get_conf_path('cache_master_schedule.json')
+    if not force and os.path.exists(cache_path):
+        try:
+            age = time.time() - os.path.getmtime(cache_path)
+            if age < MASTER_SCHEDULE_DISK_TTL_SECONDS:
+                logging.info(
+                    "[O4] master_schedule disk cache 仍新鮮（%.1f 小時），跳過網路抓取",
+                    age / 3600.0,
+                )
+                return  # disk cache 已在 _load_caches() 載入到 self.master_schedule
+        except OSError:
+            pass
     schedule = create_master_schedule_from_web()
     put_ui_message(ui_queue, UiMasterScheduleMessage(schedule=schedule))
 
@@ -3133,8 +3226,9 @@ REG52_AUH_TTL_SECONDS = 180
 REG52_DAYOFF_TTL_SECONDS = 300
 REG52_MAIN_TIMEOUT = (5, 10)
 REG52_DAYOFF_TIMEOUT = (3, 5)
-REG52_BRANCH_TIMEOUT = (4, 8)
-REG52_AUH_TIMEOUT = (4, 8)
+# [O2] 院外連線 timeout 從 (4,8) 縮為 (2,5)：AUH/惠盛/東區若不通，2 秒就失敗，避免拖慢首批
+REG52_BRANCH_TIMEOUT = (2, 5)
+REG52_AUH_TIMEOUT = (2, 5)
 REG52_EXTERNAL_MAX_WORKERS = 2
 REG52_STALE_CACHE_SECONDS = 15 * 60
 REG52_DAYOFF_BACKGROUND_MIN_INTERVAL_SECONDS = 30 * 60
@@ -3147,8 +3241,10 @@ SOURCE_BACKOFF_BASE_SECONDS = 2
 SOURCE_BACKOFF_MAX_SECONDS = 90
 REG52_MAIN_BACKOFF_BASE_SECONDS = 30
 REG52_MAIN_BACKOFF_MAX_SECONDS = 5 * 60
-REG52_EXTERNAL_BACKOFF_BASE_SECONDS = 60
-REG52_EXTERNAL_BACKOFF_MAX_SECONDS = 15 * 60
+# [O2] 院外失敗 backoff 從 60s 拉長到 300s（5 分鐘）；上限 15 分鐘 → 30 分鐘
+# 院外（AUH/東區/惠盛）若不通通常 5 分鐘內也不會恢復，過短重試只是浪費時間
+REG52_EXTERNAL_BACKOFF_BASE_SECONDS = 300
+REG52_EXTERNAL_BACKOFF_MAX_SECONDS = 30 * 60
 REG64_BACKOFF_BASE_SECONDS = 60
 REG64_BACKOFF_MAX_SECONDS = 5 * 60
 GLOBAL_REFRESH_SNAPSHOT_TTL_SECONDS = 180
@@ -7964,17 +8060,30 @@ class AutomationApp:
                 logging.info(f"院外模式開啟中，跳過 {target_func.__name__}")
 
         def _startup_priority_refresh():
+            """[O5 優化] 拆兩波啟動：BATCH_1（主院多）500ms 立即跑、
+            BATCH_2（含院外 AUH/東區）1500ms 後再跑，讓首屏更快出現資料。"""
             if self._initial_priority_refresh_done:
                 return
             by_name = {d.get("name"): d for d in DOCTORS}
-            pri_names = list(REFRESH_QUERY_BATCH_1) + list(REFRESH_QUERY_BATCH_2)
-            pri_docs = [by_name[n] for n in pri_names if n in by_name]
-            if pri_docs:
-                logging.info(f"[STARTUP] priority refresh doctors={len(pri_docs)}")
+            batch_1 = [by_name[n] for n in REFRESH_QUERY_BATCH_1 if n in by_name]
+            batch_2 = [by_name[n] for n in REFRESH_QUERY_BATCH_2 if n in by_name]
+
+            if batch_1:
+                logging.info(f"[STARTUP] phase A refresh doctors={len(batch_1)} (主院優先)")
                 self._startup_defer_full_until_priority_done = True
-                self.bg_executor.submit(self._trigger_refresh, False, pri_docs)
-            else:
+                self.bg_executor.submit(self._trigger_refresh, False, batch_1)
+
+            if batch_2:
+                # 1.5 秒後跑第二波（含院外，timeout 已縮短為 2s 不會卡太久）
+                def _phase_b():
+                    logging.info(f"[STARTUP] phase B refresh doctors={len(batch_2)} (含院外)")
+                    self.bg_executor.submit(self._trigger_refresh, False, batch_2)
+                self.root.after(1500, _phase_b)
+
+            if not (batch_1 or batch_2):
+                # 無 priority 醫師則直接跑全部
                 self.bg_executor.submit(self._trigger_refresh, False)
+
             self._initial_priority_refresh_done = True
 
         self.root.after(500, _startup_priority_refresh)

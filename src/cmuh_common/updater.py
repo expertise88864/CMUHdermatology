@@ -78,8 +78,23 @@ def _sha256_text(content: str) -> str:
     return hashlib.sha256(content.encode('utf-8')).hexdigest()
 
 
+def _sha256_local_file(local_path: str) -> str:
+    """計算本地檔 SHA256（與 sync_manifest 一致的 LF normalize 演算法）。"""
+    try:
+        with open(local_path, 'rb') as f:
+            content = f.read()
+        content = content.replace(b'\r\n', b'\n')
+        return hashlib.sha256(content).hexdigest()
+    except Exception:
+        return ""
+
+
 def _download_one(file_entry: dict, app_dir: str) -> Optional[tuple]:
     """下載單一檔案；如本地已是最新或內容版本未較新則回 None。
+
+    【O1 優化】先做 SHA256 比對，若本地檔已等於 manifest 預期 hash 就跳過下載。
+    這修正了原本「子模組沒有 CURRENT_VERSION 字樣，永遠被誤判為 v0.0.0
+    需更新」的 bug — 原本每次啟動都重抓 21 個檔。
 
     回傳 (key, local_filename, new_version, content) 或 None。
     """
@@ -90,11 +105,22 @@ def _download_one(file_entry: dict, app_dir: str) -> Optional[tuple]:
     expected_sha = (file_entry.get("sha256") or "").lower().strip()
 
     local_path = os.path.join(app_dir, local_filename)
+
+    # [O1] SHA256 短路：本地內容已是 manifest 期望版 → 直接跳過（最常見路徑）
+    if expected_sha and os.path.exists(local_path):
+        local_sha = _sha256_local_file(local_path)
+        if local_sha == expected_sha:
+            return None
+
     local_ver = _read_local_version(local_path)
 
-    # 本地已是最新就跳過
+    # 版本比對（仍保留作為次要判斷；若本地檔含 CURRENT_VERSION 字樣才有意義）
     if parse_version(local_ver) >= parse_version(expected_version):
-        return None
+        # 此分支：本地版本足夠新，但 hash 不符（可能行尾差異或檔案被改過）→ 仍重下載
+        if expected_sha and os.path.exists(local_path):
+            logging.info("  [%s] 版本 v%s 已新但 SHA256 不符，重新下載", key, local_ver)
+        else:
+            return None
 
     url = f"{RAW_BASE}/{remote_path}?t={int(time.time())}"
     logging.info("  [%s] 偵測到新版（v%s -> v%s），下載中...", key, local_ver, expected_version)
@@ -204,16 +230,41 @@ def check_and_update(
         return result
 
     _progress("writing")
+    written_paths = []
     for key, local_filename, new_ver, content in pending_writes:
         target_path = os.path.join(app_dir, local_filename)
         if atomic_write_text(target_path, content):
             result.updated_files.append((local_filename, new_ver))
+            written_paths.append(target_path)
             logging.info("  ✅ 已更新 %s -> v%s", local_filename, new_ver)
         else:
             result.errors.append(f"[{key}] 寫入失敗")
 
+    # [O8] 預編譯 .pyc：剛覆寫的 .py 立即 compile，省下次 import 時的 byte-compile 開銷
+    if written_paths:
+        _precompile_files(written_paths)
+
     result.has_update = len(result.updated_files) > 0
     return result
+
+
+def _precompile_files(paths: list) -> None:
+    """[O8] 對剛覆寫的 .py 檔做 byte-compile，產生 __pycache__/*.pyc。"""
+    try:
+        import py_compile
+        compiled = 0
+        for p in paths:
+            if not p.endswith('.py'):
+                continue
+            try:
+                py_compile.compile(p, doraise=True, quiet=1)
+                compiled += 1
+            except Exception:
+                logging.debug("py_compile 失敗 [%s]", p, exc_info=True)
+        if compiled:
+            logging.info("[O8] 已預編譯 %d 個 .py 為 .pyc", compiled)
+    except Exception:
+        logging.debug("_precompile_files 例外", exc_info=True)
 
 
 def need_restart_after_update(result: UpdateResult) -> bool:
