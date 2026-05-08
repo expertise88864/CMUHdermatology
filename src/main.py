@@ -375,6 +375,71 @@ _source_throttle_state = {}
 _reg52_cmuh_fetch_sema = threading.Semaphore(2)
 
 
+# =============================================================================
+# [O9] IPv4-only 連線（只對院外醫療系統 host 生效）
+# 原因：Windows 預設 IPv4+IPv6 雙堆疊；院外（auh/east/huisheng）若 DNS 解析到
+# IPv6 但實際不通，會先試 IPv6 失敗後再試 IPv4，造成每次連線多 2 秒延遲。
+# 解法：對 IPV4_ONLY_HOSTS 內的 host 強制只用 IPv4。
+# 安全：GitHub、Wikipedia 等仍使用預設雙堆疊（不影響其它連線）。
+# =============================================================================
+import socket as _socket
+from urllib3.util import connection as _urllib3_conn  # type: ignore[import-untyped]
+
+# 院外醫療系統（IPv6 通常不通）
+IPV4_ONLY_HOSTS = {
+    "appointment.auh.org.tw",
+    "appointment.cmuh.org.tw",  # 主院（保險，雖然多半 IPv4-only）
+    "61.66.117.10",              # 惠盛 hs1
+}
+
+_orig_create_connection = _urllib3_conn.create_connection
+
+
+def _ipv4_aware_create_connection(address, *args, **kwargs):
+    """如果 host 在 IPV4_ONLY_HOSTS 列表，強制 AF_INET；否則使用原本實作。"""
+    try:
+        host = address[0] if isinstance(address, tuple) else None
+    except Exception:
+        host = None
+    if host and host in IPV4_ONLY_HOSTS:
+        return _create_ipv4_connection(address, *args, **kwargs)
+    return _orig_create_connection(address, *args, **kwargs)
+
+
+def _create_ipv4_connection(address, *args, **kwargs):
+    """socket 連線 wrapper：強制 AF_INET（IPv4 only）。"""
+    host, port = address
+    err = None
+    for af, socktype, proto, _canonname, sa in _socket.getaddrinfo(
+        host, port, _socket.AF_INET, _socket.SOCK_STREAM
+    ):
+        sock = None
+        try:
+            sock = _socket.socket(af, socktype, proto)
+            timeout = kwargs.get("timeout", _socket._GLOBAL_DEFAULT_TIMEOUT)
+            if timeout is not _socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            source_addr = kwargs.get("source_address")
+            if source_addr:
+                sock.bind(source_addr)
+            sock.connect(sa)
+            return sock
+        except OSError as e:
+            err = e
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+    if err is not None:
+        raise err
+    raise OSError("getaddrinfo returns an empty list")
+
+
+# 一次性 monkey-patch（只對特定 host 生效，其他主機行為不變）
+_urllib3_conn.create_connection = _ipv4_aware_create_connection
+
+
 def _cache_get(cache_key, ttl_seconds, evict_expired=True):
     now = time.time()
     with _ttl_cache_lock:
@@ -6659,6 +6724,81 @@ class AutomationApp:
             messagebox.showerror("失敗", f"重製熱鍵時發生錯誤: {e}")
             self.status_text.set("狀態: 熱鍵重製失敗")
 
+    # =========================================================================
+    # [熱鍵快速編輯] 提供三個快速操作：
+    #   1. 開啟熱鍵腳本所在的 main.py（記事本，自動跳到熱鍵區）
+    #   2. 套用變更（重啟程式）
+    #   3. 顯示目前熱鍵綁定
+    # 配合「修改 → 儲存 → 套用」3 步流程，快速迭代熱鍵行為。
+    # =========================================================================
+    def _open_hotkey_script_in_editor(self):
+        """以記事本開啟 main.py 並跳到熱鍵腳本區（line ~1010）。"""
+        try:
+            target = os.path.abspath(__file__)
+            if not os.path.isfile(target):
+                # 啟動器啟動時 __file__ 可能是 launcher，改取 sys.argv[0] 並補 src/main.py
+                target = os.path.join(get_app_dir(), "src", "main.py")
+            if not os.path.isfile(target):
+                messagebox.showerror("找不到檔案", f"找不到 main.py:\n{target}")
+                return
+            # 開記事本（Win11 起 notepad 支援命令列開啟）；副選 Notepad++ 若有
+            import shutil as _sh
+            editor = _sh.which("notepad++") or "notepad.exe"
+            import subprocess as _sp
+            _sp.Popen([editor, target], close_fds=True)
+            messagebox.showinfo(
+                "已開啟編輯器",
+                f"已用 {os.path.basename(editor)} 開啟：\n{target}\n\n"
+                "搜尋 'def script_F11_1280x1024' 跳到熱鍵區。\n"
+                "編輯完成後按【套用熱鍵變更（重啟程式）】生效。",
+            )
+            self.status_text.set("狀態: 已開啟 main.py")
+        except Exception as e:
+            logging.error("開啟編輯器失敗: %s", e, exc_info=True)
+            messagebox.showerror("失敗", f"無法開啟編輯器: {e}")
+
+    def _apply_hotkey_changes_restart(self):
+        """套用熱鍵變更：重啟程式（最可靠的方式）。"""
+        if not messagebox.askyesno(
+            "確認重啟",
+            "重啟程式以套用熱鍵腳本變更？\n（會關閉此視窗並重新啟動，未儲存資料會遺失）",
+        ):
+            return
+        try:
+            logging.info("[熱鍵] 使用者請求重啟以套用熱鍵變更")
+            restart_self()
+        except Exception as e:
+            messagebox.showerror("失敗", f"重啟失敗: {e}")
+
+    def _show_hotkey_bindings(self):
+        """顯示目前所有熱鍵的綁定狀態。"""
+        try:
+            res = HOTKEY_ADAPTIVE_STATE.get("base_version") or "未知"
+            target = HOTKEY_ADAPTIVE_STATE.get("target_size") or (0, 0)
+            scale_x = HOTKEY_ADAPTIVE_STATE.get("scale_x", 1.0)
+            scale_y = HOTKEY_ADAPTIVE_STATE.get("scale_y", 1.0)
+            lines = [
+                f"目前解析度方案: {res}",
+                f"實際螢幕尺寸: {target[0]}x{target[1]}",
+                f"座標縮放: x={scale_x:.3f}, y={scale_y:.3f}",
+                "",
+                "綁定的熱鍵：",
+                "  F3 → 快速跳轉到下一位病患",
+                "  F4 → 快速跳轉到上一位病患",
+                "  F9 → 開立檢驗",
+                "  F10 → 開立藥物",
+                "  F11 → 完成看診（多步驟自動化）",
+                "",
+                "腳本位置: src/main.py",
+                "搜尋關鍵字（依解析度）：",
+                "  def script_F11_1920x1080",
+                "  def script_F11_1280x1024",
+                "  def script_F11_1024x768",
+            ]
+            messagebox.showinfo("目前熱鍵綁定", "\n".join(lines))
+        except Exception as e:
+            messagebox.showerror("失敗", str(e))
+
     def _copy_to_clipboard(self, text_widget):
         try:
             text_to_copy = text_widget.get("1.0", tk.END).strip()
@@ -6784,6 +6924,26 @@ class AutomationApp:
         top_bar_frame.pack(fill=tk.X, pady=(0, 20))
         ttk.Label(top_bar_frame, text=f"目前版本: {CURRENT_VERSION}", foreground="gray", font=("Microsoft JhengHei UI", self.f_sm)).pack(side=tk.LEFT, anchor='w')
         ttk.Button(top_bar_frame, text="檢查線上更新", command=lambda: self.bg_executor.submit(self.check_and_update, True)).pack(side=tk.RIGHT)
+
+        # [熱鍵快速編輯] 三按鈕：編輯 / 套用 / 顯示綁定
+        hotkey_edit_frame = ttk.LabelFrame(scrollable_frame, text="熱鍵快速編輯（修改 F3/F4/F9/F10/F11 行為）", padding=8)
+        hotkey_edit_frame.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(
+            hotkey_edit_frame,
+            text="流程：① 開啟 main.py 編輯 → ② 儲存 → ③ 套用變更（重啟）",
+            foreground="#555",
+            font=("Microsoft JhengHei UI", self.f_sm),
+        ).pack(anchor="w", pady=(0, 4))
+        btn_row_hk = ttk.Frame(hotkey_edit_frame)
+        btn_row_hk.pack(fill=tk.X)
+        ttk.Button(btn_row_hk, text="① 開啟熱鍵腳本（main.py）",
+                   command=self._open_hotkey_script_in_editor).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_row_hk, text="② 套用熱鍵變更（重啟）",
+                   command=self._apply_hotkey_changes_restart).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btn_row_hk, text="顯示目前熱鍵綁定",
+                   command=self._show_hotkey_bindings).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btn_row_hk, text="重製熱鍵（不重啟）",
+                   command=self._trigger_rehook_hotkeys).pack(side=tk.LEFT, padx=6)
 
         # [修改] 建立容器，並定義三個直行
         columns_container = ttk.Frame(scrollable_frame)
