@@ -1087,6 +1087,200 @@ _runner_1920 = HotkeyRunner("1920x1080")
 _runner_1280 = HotkeyRunner("1280x1024")
 _runner_1024 = HotkeyRunner("1024x768")
 
+
+# =============================================================================
+# [hotkey override 執行引擎]
+# 載入 settings/hotkey_overrides.json，若某個 (resolution, hotkey) 有 override，
+# 用 JSON 驅動的 runner 執行而非原始 script 函式。
+# 支援兩種模式：
+#   - "sequential": 依序執行 actions 列表
+#   - "loop":       while 迴圈，逐 step 檢查 match_rgb，符合就執行 actions
+#
+# 安全性：
+#   - 任何例外 → fallback 到原始 hardcoded 函式
+#   - mtime cache：檔案改動後自動重載（無需重啟）
+#   - 結構驗證：缺欄位視為 invalid，跳過該 step
+# =============================================================================
+_HOTKEY_OVERRIDE_CACHE: dict | None = None
+_HOTKEY_OVERRIDE_MTIME: float = 0.0
+_HOTKEY_OVERRIDE_LOCK = threading.Lock()
+
+
+def _load_hotkey_overrides() -> dict:
+    """讀取（並 mtime cache） settings/hotkey_overrides.json。"""
+    global _HOTKEY_OVERRIDE_CACHE, _HOTKEY_OVERRIDE_MTIME
+    path = get_conf_path('hotkey_overrides.json')
+    if not os.path.exists(path):
+        with _HOTKEY_OVERRIDE_LOCK:
+            _HOTKEY_OVERRIDE_CACHE = None
+            _HOTKEY_OVERRIDE_MTIME = 0.0
+        return {}
+    try:
+        m = os.path.getmtime(path)
+    except OSError:
+        return _HOTKEY_OVERRIDE_CACHE or {}
+    with _HOTKEY_OVERRIDE_LOCK:
+        if _HOTKEY_OVERRIDE_CACHE is not None and m == _HOTKEY_OVERRIDE_MTIME:
+            return _HOTKEY_OVERRIDE_CACHE
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            _HOTKEY_OVERRIDE_CACHE = data if isinstance(data, dict) else {}
+            _HOTKEY_OVERRIDE_MTIME = m
+            logging.info("[hotkey override] 已載入 %d 組 override",
+                         sum(len(v) for v in _HOTKEY_OVERRIDE_CACHE.values()
+                             if isinstance(v, dict)))
+            return _HOTKEY_OVERRIDE_CACHE
+        except Exception as e:
+            logging.warning("[hotkey override] 載入失敗: %s", e)
+            _HOTKEY_OVERRIDE_CACHE = None
+            return {}
+
+
+def _get_hotkey_override(resolution: str, hotkey: str) -> dict | None:
+    overrides = _load_hotkey_overrides()
+    return overrides.get(resolution, {}).get(hotkey) if overrides else None
+
+
+def _resolve_runner(resolution: str) -> HotkeyRunner:
+    return {
+        "1920x1080": _runner_1920,
+        "1280x1024": _runner_1280,
+        "1024x768": _runner_1024,
+    }.get(resolution, _runner_1280)
+
+
+def _resolve_click_func(resolution: str):
+    return {
+        "1920x1080": click_point_1920,
+        "1280x1024": click_point_1280,
+        "1024x768": click_point_1024,
+    }.get(resolution, click_point_1280)
+
+
+def _execute_override_action(action: dict, resolution: str) -> None:
+    """執行單一 override action。"""
+    t = action.get("type", "")
+    if t == "click":
+        x, y = int(action.get("x", 0)), int(action.get("y", 0))
+        delay = float(action.get("delay", 0.05) or 0.05)
+        _resolve_click_func(resolution)(x, y, after_delay=delay)
+    elif t == "sleep":
+        time.sleep(float(action.get("seconds", 0)))
+    elif t == "type":
+        text = str(action.get("text", ""))
+        # 通用：用 keyboard 模組逐字輸入；若 keyboard 不可用則略過
+        try:
+            kb = hotkey_modules.keyboard
+            if kb is not None:
+                kb.write(text)
+        except Exception:
+            logging.debug("[override] type 失敗", exc_info=True)
+    elif t == "wait_color":
+        # 簡化：sleep 0.3s（無法精確等候原 wait_for_color_<res> 的協定字串）
+        time.sleep(0.3)
+    elif t == "check_color":
+        # 純條件檢查：略過（match_rgb 已在 step 條件處理過）
+        pass
+    else:
+        logging.debug("[override] 未知 action 類型: %s", t)
+
+
+def _execute_override(override: dict, resolution: str) -> None:
+    """執行整個 override 腳本。"""
+    runner = _resolve_runner(resolution)
+    runner.last_action_time = time.time()
+
+    mode = override.get("mode", "loop")
+
+    if mode == "sequential":
+        for act in override.get("actions", []):
+            check_stop()
+            _execute_override_action(act, resolution)
+        return
+
+    # loop 模式
+    init = override.get("init_action")
+    if init:
+        _execute_override_action(init, resolution)
+        runner.last_action_time = time.time()
+
+    steps = override.get("steps", [])
+    n_steps = len(steps)
+    steps_done = [False] * n_steps  # 已執行的 step 不再執行（與原 F11 邏輯一致）
+
+    while True:
+        check_stop()
+        if runner.idle_seconds > 40:
+            logging.warning("[override] %s/%s: idle 40 秒，停止", resolution, runner.profile)
+            return
+
+        # 用 F11PixelFrameCache 一次截圖快取，跟原 F11 相同效率
+        try:
+            px = F11PixelFrameCache()
+        except Exception:
+            time.sleep(0.05)
+            continue
+
+        any_done_this_iter = False
+        for i, step in enumerate(steps):
+            if steps_done[i]:
+                continue
+            matches = step.get("matches", [])
+            if not matches:
+                # 無條件 step → 直接執行（少見）
+                pass
+            else:
+                ok = True
+                for m in matches:
+                    try:
+                        if not px.match_rgb(int(m["x"]), int(m["y"]),
+                                            tuple(m["rgb"]),
+                                            int(m.get("tolerance", 10))):
+                            ok = False
+                            break
+                    except Exception:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+
+            # 條件成立 → 執行 actions
+            for act in step.get("actions", []):
+                _execute_override_action(act, resolution)
+            steps_done[i] = True
+            runner.last_action_time = time.time()
+            any_done_this_iter = True
+            break  # 重新截圖再判斷
+
+        if not any_done_this_iter:
+            # 全部 step 都不滿足 → 短暫 sleep 後重試
+            if all(steps_done):
+                logging.info("[override] %s/%s: 全部 step 完成", resolution, runner.profile)
+                return
+            time.sleep(0.05)
+
+
+def _maybe_run_override(resolution: str, hotkey: str) -> bool:
+    """檢查並執行 override；回傳 True 表示已執行，呼叫端應 return（不跑原始版）。"""
+    try:
+        ov = _get_hotkey_override(resolution, hotkey)
+    except Exception:
+        return False
+    if not ov:
+        return False
+    try:
+        logging.info("[override] 套用 %s / %s 的 JSON 步驟（共 %d 個）",
+                     resolution, hotkey,
+                     len(ov.get("actions") if ov.get("mode") == "sequential" else ov.get("steps", [])))
+        _execute_override(ov, resolution)
+        return True
+    except SubsystemInterrupted:
+        raise
+    except Exception as e:
+        logging.error("[override] 執行失敗，fallback 到原始版: %s", e, exc_info=True)
+        return False
+
 # -----------------------------------------------------------------------------
 # --- 6.1 熱鍵腳本 (1920x1080 版本) ---
 # -----------------------------------------------------------------------------
@@ -1103,6 +1297,7 @@ def wait_for_color_1920(x, y, target_color, timeout=40):
     return _runner_1920.wait_for_color(sx, sy, target_color, timeout)
 
 def script_F10_1920x1080():
+    if _maybe_run_override('1920x1080', 'F10'): return
     logging.info("--- Executing F10 Actions (1920x1080) ---")
     
     # 步驟 1: 初始化點擊
@@ -1137,6 +1332,7 @@ def script_F10_1920x1080():
     logging.info("F10 (1920x1080): Steps completed.")
 
 def script_F11_1920x1080():
+    if _maybe_run_override('1920x1080', 'F11'): return
     logging.info("--- Executing F11 Actions (1920x1080) ---")
     click_point_1920(1686, 974)
     _runner_1920.last_action_time = time.time()
@@ -1260,6 +1456,7 @@ def script_F11_1920x1080():
         time.sleep(0.05)
 
 def script_F3_1920x1080():
+    if _maybe_run_override('1920x1080', 'F3'): return
     logging.info("--- Executing F3 Actions (1920x1080) ---")
     click_point_1920(147, 43)
     click_point_1920(230, 808)
@@ -1268,6 +1465,7 @@ def script_F3_1920x1080():
     logging.info("F3 (1920x1080): Steps completed.")
 
 def script_F4_1920x1080():
+    if _maybe_run_override('1920x1080', 'F4'): return
     logging.info("--- Executing F4 Actions (1920x1080) ---")
     click_point_1920(147, 43)
     click_point_1920(230, 808)
@@ -1298,6 +1496,7 @@ def wait_for_color_1024(x, y, spec_string, timeout=15):
     return _runner_1024.wait_for_color_spec(sx, sy, spec_string, timeout)
 
 def script_F3_1024x768():
+    if _maybe_run_override('1024x768', 'F3'): return
     logging.info("--- Executing F3 Actions (1024x768) ---")
     click_point_1024(142, 34, after_delay=0.1)
     click_point_1024(228, 468)
@@ -1308,6 +1507,7 @@ def script_F3_1024x768():
     logging.info("F3 (1024x768): Steps completed.")
 
 def script_F4_1024x768():
+    if _maybe_run_override('1024x768', 'F4'): return
     logging.info("--- Executing F4 Actions (1024x768) ---")
     click_point_1024(142, 34, after_delay=0.1)
     click_point_1024(228, 468, after_delay=0.2)
@@ -1318,6 +1518,7 @@ def script_F4_1024x768():
     logging.info("F4 (1024x768): Steps completed.")
 
 def script_F9_1024x768():
+    if _maybe_run_override('1024x768', 'F9'): return
     logging.info("--- Executing F9 Actions (1024x768) ---")
     click_point_1024(498, 35)
     click_point_1024(572, 626)
@@ -1344,6 +1545,7 @@ def script_F9_1024x768():
     logging.info("F9 (1024x768): All steps completed.")
 
 def script_F10_1024x768():
+    if _maybe_run_override('1024x768', 'F10'): return
     logging.info("--- Executing F10 Actions (1024x768) ---")
     click_point_1024(498, 35)
     click_point_1024(572, 626)
@@ -1369,6 +1571,7 @@ def script_F10_1024x768():
     logging.info("F10 (1024x768): All steps completed.")
 
 def script_F11_1024x768():
+    if _maybe_run_override('1024x768', 'F11'): return
     logging.info("--- Executing F11 Actions (1024x768) ---")
     click_point_1024(925, 680)
     function_start_time = time.time()
@@ -1538,6 +1741,7 @@ def script_wait_for_F9_F10_cond_5_5():
     wait_for_multiple_colors_1280(conditions)
 
 def script_F11_1280x1024():
+    if _maybe_run_override('1280x1024', 'F11'): return
     logging.info("--- Executing F11 Actions (1280x1024) ---")
     click_point_1280(1144, 938, after_delay=0.1)
     _runner_1280.last_action_time = time.time()
@@ -1678,6 +1882,7 @@ def script_F11_1280x1024():
         time.sleep(0.05)
 
 def script_F3_1280x1024():
+    if _maybe_run_override('1280x1024', 'F3'): return
     logging.info("--- Executing F3 Actions (1280x1024) ---")
     click_point_1280(144, 35, after_delay=0.1)
     click_point_1280(222, 802, after_delay=0.1)
@@ -1688,6 +1893,7 @@ def script_F3_1280x1024():
     logging.info("F3 (1280x1024): Steps completed.")
 
 def script_F4_1280x1024():
+    if _maybe_run_override('1280x1024', 'F4'): return
     logging.info("--- Executing F4 Actions (1280x1024) ---")
     click_point_1280(144, 35, after_delay=0.1)
     click_point_1280(222, 802, after_delay=0.1)
@@ -1741,6 +1947,7 @@ def _ime_restore(was_open: bool) -> None:
         pass
 
 def script_F9_1280x1024():
+    if _maybe_run_override('1280x1024', 'F9'): return
     logging.info("--- Executing F9 Actions (1280x1024) ---")
     click_point_1280(494, 38, after_delay=0.1)    # 1
     click_point_1280(527, 644, after_delay=0.05)  # 2
@@ -1802,6 +2009,7 @@ def script_F9_1280x1024():
     logging.info("F9 (1280x1024): Steps completed.")
 
 def script_F10_1280x1024():
+    if _maybe_run_override('1280x1024', 'F10'): return
     logging.info("--- Executing F10 Actions (1280x1024) ---")
     click_point_1280(494, 38, after_delay=0.1)    # 1
     click_point_1280(527, 644, after_delay=0.05)  # 2
@@ -4344,6 +4552,56 @@ class AutomationApp:
             self._smart_widget_config(ui["status"], text="已載入上次快取，等待更新", fg="#607D8B")
             logging.info(f"[CACHE] restored clinic dynamic state: room={room_code}, session={session_cn}, doctor={tracker.get('doc_name', '')}")
         
+    # =========================================================================
+    # UI 主題（深淺色）切換
+    # =========================================================================
+    def _get_ui_theme_mode(self) -> str:
+        """從 clinic_settings.json 讀 ui_theme（light / dark），預設 light。
+
+        因 _init_styles 早於 clinic_settings 載入，這裡直接讀檔（成本可接受，啟動才呼叫一次）。
+        """
+        # 先看記憶體
+        cs = getattr(self, "clinic_settings", None)
+        if not cs:
+            cs = self._safe_load_clinic_settings()
+        try:
+            v = str((cs or {}).get("ui_theme", "light")).lower().strip()
+            return "dark" if v == "dark" else "light"
+        except Exception:
+            return "light"
+
+    def _toggle_ui_theme(self):
+        """[UI] 切換深/淺色主題並立即套用（不需重啟）。"""
+        try:
+            cur = self._get_ui_theme_mode()
+            new_mode = "dark" if cur == "light" else "light"
+            # 寫回設定
+            cs = self._safe_load_clinic_settings()
+            cs["ui_theme"] = new_mode
+            _atomic_write_json(get_conf_path('clinic_settings.json'), cs)
+            self.clinic_settings = cs
+            # 即時套用
+            try:
+                import sv_ttk  # type: ignore[import-not-found]
+                sv_ttk.set_theme(new_mode)
+            except Exception:
+                logging.debug("sv-ttk 即時切換失敗，請重啟生效", exc_info=True)
+                messagebox.showinfo("提示", f"主題已切換為 {new_mode}，請重啟程式生效。")
+                return
+            self.status_text.set(f"狀態: 主題已切換為 {new_mode}")
+            messagebox.showinfo("已切換", f"主題已立即切換為「{'深色' if new_mode == 'dark' else '淺色'}」。")
+        except Exception as e:
+            logging.error("切換主題失敗: %s", e, exc_info=True)
+            messagebox.showerror("失敗", f"切換主題失敗: {e}")
+
+    def _safe_load_clinic_settings(self) -> dict:
+        try:
+            with open(get_conf_path('clinic_settings.json'), 'r', encoding='utf-8') as f:
+                d = json.load(f)
+                return d if isinstance(d, dict) else {}
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+
     def _init_styles(self):
         try:
             scale = float(self.threshold_settings.get('ui_font_scale', 1.0))
@@ -4356,14 +4614,17 @@ class AutomationApp:
         logging.info(f"UI font scale applied: {scale:.2f} → fonts {self.f_lg}/{self.f_md}/{self.f_sm}")
 
         self.style = ttk.Style()
+        # 確認 _get_ui_theme_mode 可用（提前 stub 避免 _setup_styles 時還沒定義）
+
         # [UI 美化] 優先用 sv-ttk（Win11 風格，現代、漂亮）→ fallback vista → clam
-        # 注意：使用 sv_ttk.set_theme 後，自訂 .map() 對某些元件可能無效（它接管渲染）
+        # 主題模式由 settings/clinic_settings.json 的 'ui_theme' 控制（light / dark）
         sv_ttk_applied = False
         try:
             import sv_ttk  # type: ignore[import-not-found]
-            sv_ttk.set_theme("light")  # 也可改 "dark"；醫療系統主流是 light
+            theme_mode = self._get_ui_theme_mode()
+            sv_ttk.set_theme(theme_mode)
             sv_ttk_applied = True
-            logging.info("[UI] 已套用 sv-ttk light 主題（Win11 風格）")
+            logging.info("[UI] 已套用 sv-ttk %s 主題（Win11 風格）", theme_mode)
         except Exception:
             logging.debug("sv-ttk 不可用，fallback 到 vista/clam", exc_info=True)
             try:
@@ -4458,14 +4719,14 @@ class AutomationApp:
         # Entry 文字較深、padding 統一
         self.style.configure("TEntry", padding=4)
 
-        # Notebook：選中分頁更明顯
-        # 注意：vista 主題用 OS 原生繪製，無法改背景；強制改 foreground 會造成「白底白字」
-        # 因此只在 sv-ttk 或 clam 主題下才覆寫；vista 沿用主題預設
+        # Notebook：sv-ttk / vista 主題已有完善樣式，不要強制覆寫 foreground/background
+        # 否則會造成「白底白字」（如 sv-ttk light 選中分頁背景為白，被我們設成白字 → 看不到）
+        # 只在 clam / default 主題下才覆寫
         try:
             current_theme = self.style.theme_use()
         except Exception:
             current_theme = ""
-        if current_theme in ("clam", "default") or self._sv_ttk_applied:
+        if current_theme in ("clam", "default") and not self._sv_ttk_applied:
             try:
                 self.style.map('TNotebook.Tab',
                                background=[('selected', BRAND_BLUE),
@@ -7220,6 +7481,12 @@ class AutomationApp:
         top_bar_frame.pack(fill=tk.X, pady=(0, 20))
         ttk.Label(top_bar_frame, text=f"目前版本: {CURRENT_VERSION}", foreground="gray", font=("Microsoft JhengHei UI", self.f_sm)).pack(side=tk.LEFT, anchor='w')
         ttk.Button(top_bar_frame, text="檢查線上更新", command=lambda: self.bg_executor.submit(self.check_and_update, True)).pack(side=tk.RIGHT)
+        # [UI 美化] 主題切換按鈕（即時生效）
+        cur_theme = self._get_ui_theme_mode()
+        next_theme = "深色 🌙" if cur_theme == "light" else "淺色 ☀"
+        ttk.Button(top_bar_frame,
+                   text=f"切換主題（目前：{'淺色' if cur_theme == 'light' else '深色'}，按下變{next_theme}）",
+                   command=self._toggle_ui_theme).pack(side=tk.RIGHT, padx=(0, 8))
 
         # [熱鍵快速編輯] 三按鈕：編輯 / 套用 / 顯示綁定
         hotkey_edit_frame = ttk.LabelFrame(scrollable_frame, text="熱鍵快速編輯（修改 F3/F4/F9/F10/F11 行為）", padding=8)

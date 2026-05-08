@@ -671,10 +671,11 @@ class HotkeyEditorWindow(tk.Toplevel):
         self._overrides.setdefault(res, {})[hk] = deepcopy(self._current_data)
         if save_overrides(self._overrides):
             messagebox.showinfo(
-                "已儲存",
+                "已儲存並立即生效",
                 f"override 已存到 settings/{OVERRIDE_FILE}\n\n"
-                "⚠️ 主程式套用 override 的功能還在開發中；目前 override 僅作為紀錄與輔助 viewer 顯示。\n"
-                "如需立即套用，仍需手動修改 main.py 並重啟。",
+                "✅ 主程式會於下次按 F3/F4/F9/F10/F11 時自動讀取最新 override（mtime cache）。\n"
+                "→ 不需重啟，直接按熱鍵即可看到效果。\n\n"
+                "若要還原為原始 main.py 版本，按「還原為原始」即可。",
                 parent=self,
             )
             self._dirty = False
