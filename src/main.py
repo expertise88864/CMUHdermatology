@@ -415,11 +415,15 @@ _reg52_cmuh_fetch_sema = threading.Semaphore(2)
 import socket as _socket
 from urllib3.util import connection as _urllib3_conn  # type: ignore[import-untyped]
 
-# 院外醫療系統（IPv6 通常不通）
+# 院外醫療系統（IPv6 通常不通；強制 IPv4 + 只試前 1 個 IP，失敗 2s 內告終）
 IPV4_ONLY_HOSTS = {
     "appointment.auh.org.tw",
-    "appointment.cmuh.org.tw",  # 主院（保險，雖然多半 IPv4-only）
-    "61.66.117.10",              # 惠盛 hs1
+    "appointment.cmuh.org.tw",       # 主院
+    "forward01.cmuh.org.tw",         # 值班查詢
+    "administration.cmuh.org.tw",    # 院內行政
+    "10.20.8.47",                     # 內網打卡
+    "61.66.117.10",                   # 惠盛 hs1
+    "www.cmuh.cmu.edu.tw",           # 院方主站（master schedule）
 }
 
 _orig_create_connection = _urllib3_conn.create_connection
@@ -437,7 +441,37 @@ def _ipv4_aware_create_connection(address, *args, **kwargs):
 
 
 def _create_ipv4_connection(address, *args, **kwargs):
-    """socket 連線 wrapper：強制 AF_INET（IPv4 only）。"""
+    """socket 連線 wrapper：強制 AF_INET（IPv4 only）+ **只試前 1 個 IP**。
+
+    【關鍵修正】DNS 解析常回傳多個 IP（CDN 5-10 個）。原版逐個試 IP，
+    每個 timeout 2s × 10 個 = 20-40s 才失敗。改為只試前 1 個。
+    """
+    host, port = address
+    addrs = _socket.getaddrinfo(host, port, _socket.AF_INET, _socket.SOCK_STREAM)
+    if not addrs:
+        raise OSError("getaddrinfo returns an empty list")
+    # 只試第一個 IP（避免 N×timeout 累積）
+    af, socktype, proto, _canonname, sa = addrs[0]
+    sock = _socket.socket(af, socktype, proto)
+    try:
+        timeout = kwargs.get("timeout", _socket._GLOBAL_DEFAULT_TIMEOUT)
+        if timeout is not _socket._GLOBAL_DEFAULT_TIMEOUT:
+            sock.settimeout(timeout)
+        source_addr = kwargs.get("source_address")
+        if source_addr:
+            sock.bind(source_addr)
+        sock.connect(sa)
+        return sock
+    except OSError:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+
+
+def _create_ipv4_connection_OLD(address, *args, **kwargs):
+    """[棄用] 舊版逐個試 IP，留作 reference。"""
     host, port = address
     err = None
     for af, socktype, proto, _canonname, sa in _socket.getaddrinfo(
@@ -4065,29 +4099,19 @@ class AutomationApp:
                 except Exception as e:
                     logging.warning(f"Failed to close requests session ({_attr}): {e}")
 
-        # [O21] 等待 daemon thread 自願退出（最多 2 秒）；超時不強制 kill（thread daemon 自會隨進程結束）
+        # [O21 v2] 加速關閉：
+        # - 不再 join daemon thread（它們本來就會隨進程退出，join 拖慢關閉）
+        # - kill 殘留 chromedriver 改用 background thread（不阻塞主線）
+        # - 不調用 psutil.process_iter（在 daemon thread 跑）
+        def _bg_kill_chromedriver():
+            try:
+                self._kill_orphan_chromedriver()
+            except Exception:
+                pass
         try:
-            import threading as _th
-            cur = _th.current_thread()
-            for t in _th.enumerate():
-                if t is cur or t is _th.main_thread():
-                    continue
-                if not t.is_alive():
-                    continue
-                if not t.daemon:
-                    continue  # daemon thread 才管；非 daemon 由 mainloop 控
-                try:
-                    t.join(timeout=0.3)
-                except Exception:
-                    pass
+            threading.Thread(target=_bg_kill_chromedriver, daemon=True, name="ChromeKill").start()
         except Exception:
-            logging.debug("daemon thread join 失敗", exc_info=True)
-
-        # [O21] 最後再嘗試結束所有 chromedriver.exe 進程（保險）
-        try:
-            self._kill_orphan_chromedriver()
-        except Exception:
-            logging.debug("kill orphan chromedriver 失敗", exc_info=True)
+            pass
 
         logging.info("Cleanup done: hotkeys unhooked, Chrome released, executor released.")
 
@@ -4134,9 +4158,28 @@ class AutomationApp:
         restart_self()
 
     def shutdown_app(self):
-        """關閉時不可在主執行緒上 executor.shutdown(wait=True)，否則會卡到背景 HTTP／排程結束。"""
-        self._cleanup_for_exit()
-        self.root.destroy()
+        """關閉時不可在主執行緒上 executor.shutdown(wait=True)，否則會卡到背景 HTTP／排程結束。
+
+        [加速] cleanup 跑完立刻 destroy；不等待背景任何工作。Daemon thread/Chrome
+        會被 _kill_orphan_chromedriver 處理或隨進程結束。
+        """
+        try:
+            self._cleanup_for_exit()
+        except Exception:
+            logging.debug("cleanup 例外（忽略，繼續退出）", exc_info=True)
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        # 強制立刻終止進程（避免 daemon thread / 未完成 IO 拖累）
+        # 注意：此處用 os._exit(0) 不執行 atexit；Chrome / chromedriver 已被
+        # _release_status_driver / _kill_orphan_chromedriver 處理過
+        try:
+            os._exit(0)
+        except SystemExit:
+            raise
+        except Exception:
+            sys.exit(0)
 
 # --- [新增/修改] 確保 Key 為字串的輔助函式 ---
     def _convert_keys_to_str(self, data):
@@ -4556,43 +4599,86 @@ class AutomationApp:
     # UI 主題（深淺色）切換
     # =========================================================================
     def _get_ui_theme_mode(self) -> str:
-        """從 clinic_settings.json 讀 ui_theme（light / dark），預設 light。
-
-        因 _init_styles 早於 clinic_settings 載入，這裡直接讀檔（成本可接受，啟動才呼叫一次）。
-        """
-        # 先看記憶體
+        """從 clinic_settings.json 讀 ui_theme（light / dark / vista），預設 dark。"""
         cs = getattr(self, "clinic_settings", None)
         if not cs:
             cs = self._safe_load_clinic_settings()
         try:
-            v = str((cs or {}).get("ui_theme", "light")).lower().strip()
-            return "dark" if v == "dark" else "light"
+            v = str((cs or {}).get("ui_theme", "dark")).lower().strip()
+            if v in ("light", "dark", "vista"):
+                return v
+            return "dark"
         except Exception:
-            return "light"
+            return "dark"
 
     def _toggle_ui_theme(self):
-        """[UI] 切換深/淺色主題並立即套用（不需重啟）。"""
-        try:
-            cur = self._get_ui_theme_mode()
-            new_mode = "dark" if cur == "light" else "light"
-            # 寫回設定
+        """[UI] 主題切換選單：light / dark / vista（原生快）。"""
+        # 用 simpledialog choose
+        from tkinter import simpledialog
+        cur = self._get_ui_theme_mode()
+        # 簡化：3 選 1 對話框
+        dlg = tk.Toplevel(self.root)
+        dlg.title("選擇主題")
+        dlg.geometry("340x200")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        x = self.root.winfo_rootx() + 200
+        y = self.root.winfo_rooty() + 200
+        dlg.geometry(f"+{x}+{y}")
+
+        ttk.Label(dlg, text="選擇主題模式：",
+                  font=("Microsoft JhengHei UI", 11, "bold")).pack(pady=(15, 5), anchor="w", padx=20)
+
+        sel = tk.StringVar(value=cur)
+        opts = [
+            ("dark", "🌙 深色 (sv-ttk dark) — 護眼、夜班推薦"),
+            ("light", "☀ 淺色 (sv-ttk light) — 白天、亮環境推薦"),
+            ("vista", "💻 Windows 原生 — 切換最快、UI 樣式較簡單"),
+        ]
+        for val, label in opts:
+            ttk.Radiobutton(dlg, text=label, variable=sel, value=val).pack(
+                anchor="w", padx=30, pady=2)
+
+        def apply_and_close():
+            new_mode = sel.get()
             cs = self._safe_load_clinic_settings()
             cs["ui_theme"] = new_mode
-            _atomic_write_json(get_conf_path('clinic_settings.json'), cs)
-            self.clinic_settings = cs
-            # 即時套用
             try:
-                import sv_ttk  # type: ignore[import-not-found]
-                sv_ttk.set_theme(new_mode)
+                _atomic_write_json(get_conf_path('clinic_settings.json'), cs)
+                self.clinic_settings = cs
             except Exception:
-                logging.debug("sv-ttk 即時切換失敗，請重啟生效", exc_info=True)
-                messagebox.showinfo("提示", f"主題已切換為 {new_mode}，請重啟程式生效。")
-                return
-            self.status_text.set(f"狀態: 主題已切換為 {new_mode}")
-            messagebox.showinfo("已切換", f"主題已立即切換為「{'深色' if new_mode == 'dark' else '淺色'}」。")
-        except Exception as e:
-            logging.error("切換主題失敗: %s", e, exc_info=True)
-            messagebox.showerror("失敗", f"切換主題失敗: {e}")
+                logging.debug("儲存 ui_theme 失敗", exc_info=True)
+            # 套用
+            applied = False
+            if new_mode in ("dark", "light"):
+                try:
+                    import sv_ttk  # type: ignore[import-not-found]
+                    sv_ttk.set_theme(new_mode)
+                    applied = True
+                except Exception:
+                    logging.debug("sv-ttk 套用失敗", exc_info=True)
+            elif new_mode == "vista":
+                try:
+                    self.style.theme_use("vista")
+                    applied = True
+                except Exception:
+                    try:
+                        self.style.theme_use("clam")
+                        applied = True
+                    except Exception:
+                        pass
+            dlg.destroy()
+            if applied:
+                self.status_text.set(f"狀態: 主題已切換為 {new_mode}")
+                messagebox.showinfo("已切換", f"主題已切換為「{new_mode}」（即時生效）。")
+            else:
+                messagebox.showinfo("提示", f"主題切換需重啟程式才會生效（{new_mode}）。")
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(side=tk.BOTTOM, fill=tk.X, pady=10, padx=20)
+        ttk.Button(btn_row, text="套用", command=apply_and_close).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btn_row, text="取消", command=dlg.destroy).pack(side=tk.RIGHT)
 
     def _safe_load_clinic_settings(self) -> dict:
         try:
@@ -4614,27 +4700,37 @@ class AutomationApp:
         logging.info(f"UI font scale applied: {scale:.2f} → fonts {self.f_lg}/{self.f_md}/{self.f_sm}")
 
         self.style = ttk.Style()
-        # 確認 _get_ui_theme_mode 可用（提前 stub 避免 _setup_styles 時還沒定義）
 
-        # [UI 美化] 優先用 sv-ttk（Win11 風格，現代、漂亮）→ fallback vista → clam
-        # 主題模式由 settings/clinic_settings.json 的 'ui_theme' 控制（light / dark）
+        # [UI 主題] 依使用者設定套用：dark / light（sv-ttk）或 vista（原生最快）
+        theme_mode = self._get_ui_theme_mode()
         sv_ttk_applied = False
-        try:
-            import sv_ttk  # type: ignore[import-not-found]
-            theme_mode = self._get_ui_theme_mode()
-            sv_ttk.set_theme(theme_mode)
-            sv_ttk_applied = True
-            logging.info("[UI] 已套用 sv-ttk %s 主題（Win11 風格）", theme_mode)
-        except Exception:
-            logging.debug("sv-ttk 不可用，fallback 到 vista/clam", exc_info=True)
+        if theme_mode == "vista":
+            # 使用者選原生主題（切換最快）
             try:
-                available = self.style.theme_names()
-                for preferred in ('vista', 'xpnative', 'clam', 'default'):
-                    if preferred in available:
-                        self.style.theme_use(preferred)
-                        break
+                self.style.theme_use("vista")
+                logging.info("[UI] 套用 vista 原生主題")
             except Exception:
-                logging.debug("theme_use 失敗（沿用預設）", exc_info=True)
+                try:
+                    self.style.theme_use("clam")
+                except Exception:
+                    pass
+        else:
+            # sv-ttk light / dark
+            try:
+                import sv_ttk  # type: ignore[import-not-found]
+                sv_ttk.set_theme(theme_mode)
+                sv_ttk_applied = True
+                logging.info("[UI] 已套用 sv-ttk %s 主題（Win11 風格）", theme_mode)
+            except Exception:
+                logging.debug("sv-ttk 不可用，fallback vista/clam", exc_info=True)
+                try:
+                    available = self.style.theme_names()
+                    for preferred in ('vista', 'xpnative', 'clam', 'default'):
+                        if preferred in available:
+                            self.style.theme_use(preferred)
+                            break
+                except Exception:
+                    pass
         self._sv_ttk_applied = sv_ttk_applied
         # 使用動態字體變數
         self.style.configure("TLabel", font=("Microsoft JhengHei UI", self.f_lg), padding=2)
