@@ -3813,6 +3813,11 @@ class AutomationApp:
         self._shutting_down = True
         logging.info("Shutdown signal received.")
         stop_event_main.set()
+        # [O21] stop_event_automation 也設，讓所有業務迴圈即時退出
+        try:
+            stop_event_automation.set()
+        except Exception:
+            logging.debug("stop_event_automation.set 失敗", exc_info=True)
         safe_unhook_all_hotkeys()
         try:
             self._cancel_pending_refresh_tick_ui()
@@ -3831,6 +3836,13 @@ class AutomationApp:
         except Exception:
             pass
         self._ui_queue_poll_id = None
+
+        # [O21] 釋放常駐 status driver（Chrome）— 確認 Chrome 進程結束
+        try:
+            _release_status_driver()
+        except Exception:
+            logging.debug("status driver 釋放失敗", exc_info=True)
+
         if hasattr(self, 'bg_executor'):
             try:
                 self.bg_executor.shutdown(wait=False, cancel_futures=True)
@@ -3843,7 +3855,58 @@ class AutomationApp:
                     session.close()
                 except Exception as e:
                     logging.warning(f"Failed to close requests session ({_attr}): {e}")
-        logging.info("Hotkeys unhooked; executor released (non-blocking shutdown).")
+
+        # [O21] 等待 daemon thread 自願退出（最多 2 秒）；超時不強制 kill（thread daemon 自會隨進程結束）
+        try:
+            import threading as _th
+            cur = _th.current_thread()
+            for t in _th.enumerate():
+                if t is cur or t is _th.main_thread():
+                    continue
+                if not t.is_alive():
+                    continue
+                if not t.daemon:
+                    continue  # daemon thread 才管；非 daemon 由 mainloop 控
+                try:
+                    t.join(timeout=0.3)
+                except Exception:
+                    pass
+        except Exception:
+            logging.debug("daemon thread join 失敗", exc_info=True)
+
+        # [O21] 最後再嘗試結束所有 chromedriver.exe 進程（保險）
+        try:
+            self._kill_orphan_chromedriver()
+        except Exception:
+            logging.debug("kill orphan chromedriver 失敗", exc_info=True)
+
+        logging.info("Cleanup done: hotkeys unhooked, Chrome released, executor released.")
+
+    @staticmethod
+    def _kill_orphan_chromedriver() -> None:
+        """[O21] 結束殘留的 chromedriver.exe（防止上次崩潰留下的孤兒進程）。
+
+        只 kill「父進程是本程式或不存在」的 chromedriver，避免誤殺其他程式的 driver。
+        """
+        try:
+            import psutil
+        except ImportError:
+            return
+        try:
+            my_pid = os.getpid()
+            for p in psutil.process_iter(['pid', 'name', 'ppid']):
+                try:
+                    n = (p.info.get('name') or '').lower()
+                    if 'chromedriver' not in n:
+                        continue
+                    ppid = p.info.get('ppid', 0)
+                    # 父進程是自己 → 是我們開的；終結它
+                    if ppid == my_pid:
+                        p.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception:
+            logging.debug("[O21] iter chromedriver 失敗", exc_info=True)
 
     def _restart_app(self):
         if threading.current_thread() is not threading.main_thread():
@@ -3887,6 +3950,11 @@ class AutomationApp:
     # --- [修改] 儲存快取通用函式 (加入 Key 轉換) ---
     def _save_cache(self, filename, data):
         try:
+            # [O22] cache_clinic_counts 改用 SQLite 增量寫入；其他仍用 JSON
+            if filename == 'cache_clinic_counts.json':
+                from cmuh_common.sqlite_cache import save_clinic_counts
+                save_clinic_counts(data)
+                return
             safe_data = self._convert_keys_to_str(data)
             _atomic_write_json(get_conf_path(filename), safe_data, default=date_key_encoder)
         except Exception as e:
@@ -3919,22 +3987,36 @@ class AutomationApp:
 
     # --- [修改] 載入快取資料 (加入損壞自動刪除機制) ---
     def load_cached_data(self):
-        """啟動時先讀取本地 JSON，加快顯示速度"""
+        """啟動時先讀取本地 cache，加快顯示速度。
+        [O22] 門診人數改用 SQLite（自動從舊 JSON 一次性遷移）。
+        """
         try:
-            # 1. 載入 門診人數 (all_doctors_data)
-            cache_path = get_conf_path('cache_clinic_counts.json')
-            if os.path.exists(cache_path):
-                try:
-                    with open(cache_path, 'r', encoding='utf-8') as f:
-                        raw_data = json.load(f)
-                        for doc_no, doc_data in raw_data.items():
-                            if isinstance(doc_data, dict) and 'error' not in doc_data:
-                                with self._doctor_data_lock:
-                                    self.all_doctors_data[doc_no] = decode_date_keys(doc_data)
-                    logging.info("已載入門診人數快取。")
-                except json.JSONDecodeError:
-                    logging.warning("快取檔案損壞，正在刪除重置...")
-                    os.remove(cache_path)
+            # 1. [O22] 載入 門診人數 (all_doctors_data) — SQLite
+            try:
+                from cmuh_common.sqlite_cache import load_clinic_counts
+                raw_data = load_clinic_counts()
+                if raw_data:
+                    for doc_no, doc_data in raw_data.items():
+                        if isinstance(doc_data, dict) and 'error' not in doc_data:
+                            with self._doctor_data_lock:
+                                self.all_doctors_data[doc_no] = decode_date_keys(doc_data)
+                    logging.info("[O22] 已載入門診人數快取（SQLite，%d 醫師）", len(raw_data))
+            except Exception:
+                logging.warning("[O22] SQLite cache 載入失敗，fallback 到 JSON", exc_info=True)
+                # Fallback：舊 JSON 還在的話讀取
+                cache_path = get_conf_path('cache_clinic_counts.json')
+                if os.path.exists(cache_path):
+                    try:
+                        with open(cache_path, 'r', encoding='utf-8') as f:
+                            raw_data = json.load(f)
+                            for doc_no, doc_data in raw_data.items():
+                                if isinstance(doc_data, dict) and 'error' not in doc_data:
+                                    with self._doctor_data_lock:
+                                        self.all_doctors_data[doc_no] = decode_date_keys(doc_data)
+                        logging.info("已載入門診人數快取（JSON fallback）。")
+                    except json.JSONDecodeError:
+                        logging.warning("快取檔案損壞，正在刪除重置...")
+                        os.remove(cache_path)
 
             # 2. 載入 主門診表 (master_schedule)
             sched_path = get_conf_path('cache_master_schedule.json')
