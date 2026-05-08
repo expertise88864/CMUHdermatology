@@ -17,11 +17,17 @@ MANIFEST = REPO_ROOT / "manifest.json"
 GITHUB = "https://github.com/expertise88864/CMUHdermatology"
 
 def sha256_of(p: Path) -> str:
-    h = hashlib.sha256()
+    """計算檔案 SHA256（LF normalize）。
+
+    【重要】Windows git 預設 autocrlf=true，本機磁碟上是 CRLF，但 git 儲存與
+    GitHub raw 服務的都是 LF。若直接 hash 磁碟 bytes，會與 updater 從 GitHub
+    下載的 bytes 不符，導致 SHA256 校驗永遠失敗。
+    解法：讀 binary 後 normalize CRLF→LF 再 hash，與 GitHub raw 一致。
+    """
     with p.open("rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
+        content = f.read()
+    content = content.replace(b"\r\n", b"\n")
+    return hashlib.sha256(content).hexdigest()
 
 # 入口檔的 key 對應（其餘子模組以路徑當 key）
 ENTRY_KEYS = {

@@ -1,0 +1,34 @@
+# 強制所有文字檔以 LF 儲存，避免 Windows 機器 CRLF/LF 差異導致：
+#   1. SHA256 校驗失敗（manifest 算 disk CRLF，GitHub raw 服務 LF）
+#   2. 線上更新後 .py 寫入時的 newline 切換造成檔案 hash 變動
+#
+# 二進位檔（.png/.ico）保持二進位處理。
+
+* text=auto eol=lf
+
+# Python / 設定 / 文件 — 一律 LF
+*.py    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.spec  text eol=lf
+*.cfg   text eol=lf
+*.ini   text eol=lf
+
+# Windows 批次檔 / PowerShell — 維持 CRLF（Windows 慣例）
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# 二進位
+*.png   binary
+*.ico   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.exe   binary
+*.dll   binary
+*.zip   binary
+*.gz    binary
