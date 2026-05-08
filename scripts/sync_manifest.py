@@ -40,15 +40,27 @@ ENTRY_KEYS = {
 def collect_entries(version: str) -> list:
     entries = []
     for py in sorted(SRC_DIR.rglob("*.py")):
-        rel = py.relative_to(REPO_ROOT).as_posix()  # 例: src/cmuh_common/version.py
+        rel = py.relative_to(REPO_ROOT).as_posix()
         key = ENTRY_KEYS.get(rel) or rel.replace("src/", "").replace("/", ".").replace(".py", "")
         entries.append({
             "key": key,
-            "remote_path": rel,                    # GitHub 上的路徑
-            "local_filename": rel,                 # 本地相對 app_dir 的路徑
+            "remote_path": rel,
+            "local_filename": rel,
             "version": version,
             "sha256": sha256_of(py),
         })
+    # [O34] 也把 repo root 的 hotkey_overrides.json 納入（多台電腦自動同步）
+    extra_root_files = ["hotkey_overrides.json"]
+    for fn in extra_root_files:
+        p = REPO_ROOT / fn
+        if p.is_file():
+            entries.append({
+                "key": fn.replace(".json", "").replace(".", "_"),
+                "remote_path": fn,
+                "local_filename": fn,
+                "version": version,
+                "sha256": sha256_of(p),
+            })
     return entries
 
 def main() -> int:

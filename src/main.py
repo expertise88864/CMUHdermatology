@@ -1141,27 +1141,40 @@ _HOTKEY_OVERRIDE_LOCK = threading.Lock()
 
 
 def _load_hotkey_overrides() -> dict:
-    """讀取（並 mtime cache） settings/hotkey_overrides.json。"""
+    """讀取（並 mtime cache） hotkey_overrides.json。
+
+    [O34] 優先順序：
+      1. settings/hotkey_overrides.json （本機私有，gitignored）
+      2. <app_dir>/hotkey_overrides.json （repo root 共用版，會被 GitHub 同步）
+    """
     global _HOTKEY_OVERRIDE_CACHE, _HOTKEY_OVERRIDE_MTIME
-    path = get_conf_path('hotkey_overrides.json')
-    if not os.path.exists(path):
+    local_path = get_conf_path('hotkey_overrides.json')
+    shared_path = os.path.join(get_app_dir(), 'hotkey_overrides.json')
+    # 選優先級高且存在的那個
+    chosen = None
+    for p in (local_path, shared_path):
+        if os.path.isfile(p):
+            chosen = p
+            break
+    if not chosen:
         with _HOTKEY_OVERRIDE_LOCK:
             _HOTKEY_OVERRIDE_CACHE = None
             _HOTKEY_OVERRIDE_MTIME = 0.0
         return {}
     try:
-        m = os.path.getmtime(path)
+        m = os.path.getmtime(chosen)
     except OSError:
         return _HOTKEY_OVERRIDE_CACHE or {}
     with _HOTKEY_OVERRIDE_LOCK:
         if _HOTKEY_OVERRIDE_CACHE is not None and m == _HOTKEY_OVERRIDE_MTIME:
             return _HOTKEY_OVERRIDE_CACHE
         try:
-            with open(path, 'r', encoding='utf-8') as f:
+            with open(chosen, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             _HOTKEY_OVERRIDE_CACHE = data if isinstance(data, dict) else {}
             _HOTKEY_OVERRIDE_MTIME = m
-            logging.info("[hotkey override] 已載入 %d 組 override",
+            src = "本機 settings/" if chosen == local_path else "共用 (GitHub)"
+            logging.info("[hotkey override] 從 %s 載入 %d 組 override", src,
                          sum(len(v) for v in _HOTKEY_OVERRIDE_CACHE.values()
                              if isinstance(v, dict)))
             return _HOTKEY_OVERRIDE_CACHE
@@ -1211,8 +1224,39 @@ def _execute_override_action(action: dict, resolution: str) -> None:
         except Exception:
             logging.debug("[override] type 失敗", exc_info=True)
     elif t == "wait_color":
-        # 簡化：sleep 0.3s（無法精確等候原 wait_for_color_<res> 的協定字串）
-        time.sleep(0.3)
+        # [O33] 完整實作：等候像素變成目標 RGB（容差內）
+        x = int(action.get("x", 0))
+        y = int(action.get("y", 0))
+        target = action.get("target_rgb") or [0, 0, 0]
+        try:
+            tr, tg, tb = int(target[0]), int(target[1]), int(target[2])
+        except (TypeError, ValueError, IndexError):
+            tr = tg = tb = 0
+        tol = int(action.get("tolerance", 5))
+        timeout_s = float(action.get("timeout", 15))
+        try:
+            from PIL import ImageGrab
+            end = time.time() + timeout_s
+            while time.time() < end:
+                check_stop()
+                try:
+                    img = ImageGrab.grab(bbox=(x, y, x + 1, y + 1))
+                    px = img.getpixel((0, 0))
+                    if isinstance(px, int):
+                        r = g = b = px
+                    else:
+                        r, g, b = px[:3]
+                    if (abs(r - tr) <= tol
+                            and abs(g - tg) <= tol
+                            and abs(b - tb) <= tol):
+                        return  # 符合
+                except Exception:
+                    pass
+                time.sleep(0.05)
+            logging.warning("[override] wait_color timeout @ (%d,%d) target=(%d,%d,%d)",
+                            x, y, tr, tg, tb)
+        except ImportError:
+            time.sleep(0.5)  # 沒 PIL 退回固定 sleep
     elif t == "check_color":
         # 純條件檢查：略過（match_rgb 已在 step 條件處理過）
         pass
@@ -4599,17 +4643,17 @@ class AutomationApp:
     # UI 主題（深淺色）切換
     # =========================================================================
     def _get_ui_theme_mode(self) -> str:
-        """從 clinic_settings.json 讀 ui_theme（light / dark / vista），預設 dark。"""
+        """從 clinic_settings.json 讀 ui_theme（light / dark / vista），預設 vista（Windows 原生最快）。"""
         cs = getattr(self, "clinic_settings", None)
         if not cs:
             cs = self._safe_load_clinic_settings()
         try:
-            v = str((cs or {}).get("ui_theme", "dark")).lower().strip()
+            v = str((cs or {}).get("ui_theme", "vista")).lower().strip()
             if v in ("light", "dark", "vista"):
                 return v
-            return "dark"
+            return "vista"
         except Exception:
-            return "dark"
+            return "vista"
 
     def _toggle_ui_theme(self):
         """[UI] 主題切換選單：light / dark / vista（原生快）。"""

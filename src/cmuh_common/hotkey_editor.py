@@ -30,28 +30,47 @@ OVERRIDE_FILE = "hotkey_overrides.json"
 
 
 def _override_path() -> str:
+    """本機私有 override（settings/，gitignored）。"""
     return get_conf_path(OVERRIDE_FILE)
 
 
+def _shared_override_path() -> str:
+    """共用 override（repo root，會被 git 追蹤、推到 GitHub）。"""
+    from cmuh_common.paths import get_app_dir
+    return os.path.join(get_app_dir(), OVERRIDE_FILE)
+
+
 def load_overrides() -> dict:
-    p = _override_path()
-    if not os.path.isfile(p):
-        return {}
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        logging.warning("讀取 hotkey_overrides.json 失敗", exc_info=True)
-        return {}
+    """優先讀本機 settings/ 版本，沒有再讀 repo root 共用版本。"""
+    for p in (_override_path(), _shared_override_path()):
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                logging.warning("讀取 %s 失敗", p, exc_info=True)
+    return {}
 
 
 def save_overrides(data: dict) -> bool:
+    """儲存到本機（settings/）。"""
     try:
         from cmuh_common.atomic_io import atomic_write_json
         atomic_write_json(_override_path(), data)
         return True
     except Exception:
         logging.error("儲存 hotkey_overrides.json 失敗", exc_info=True)
+        return False
+
+
+def push_to_shared(data: dict) -> bool:
+    """[O34] 把 override 寫到 repo root（待 push.bat 推到 GitHub 後其他電腦會收到）。"""
+    try:
+        from cmuh_common.atomic_io import atomic_write_json
+        atomic_write_json(_shared_override_path(), data)
+        return True
+    except Exception:
+        logging.error("寫入共用 override 失敗", exc_info=True)
         return False
 
 
@@ -149,6 +168,9 @@ class HotkeyEditorWindow(tk.Toplevel):
 
         ttk.Button(top, text="還原為原始（清除 override）",
                    command=self._revert_current).pack(side=tk.RIGHT, padx=4)
+        # [O34] 推送共用：把當前 override 推到 GitHub，其他電腦自動同步
+        ttk.Button(top, text="📤 推送共用 (GitHub)",
+                   command=self._push_shared).pack(side=tk.RIGHT, padx=4)
         ttk.Button(top, text="儲存全部",
                    command=self._save_all,
                    style="Primary.TButton" if "Primary.TButton" in self.tk.call("ttk::style", "element", "names")
@@ -325,13 +347,26 @@ class HotkeyEditorWindow(tk.Toplevel):
     def _populate_conditions(self, conds: list) -> None:
         for iid in self.cond_tree.get_children():
             self.cond_tree.delete(iid)
+        # 為了顯示色塊，動態加入 tag 並 configure
         for i, c in enumerate(conds):
             rgb = c.get("rgb", [0, 0, 0])
             hex_c = f"#{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}"
-            self.cond_tree.insert("", "end", iid=str(i),
-                                  values=(c.get("x", 0), c.get("y", 0),
-                                          f"({rgb[0]},{rgb[1]},{rgb[2]}) {hex_c}",
-                                          c.get("tolerance", 10)))
+            tag_name = f"swatch_{i}"
+            try:
+                # [O30] 用 row tag 染整列背景近似的方式不可行（ttk 限制）；
+                # 改用「□ 」前綴 + RGB 文字。完整色塊預覽留在編輯對話框。
+                self.cond_tree.insert("", "end", iid=str(i),
+                                      values=(c.get("x", 0), c.get("y", 0),
+                                              f"■ {hex_c}  ({rgb[0]},{rgb[1]},{rgb[2]})",
+                                              c.get("tolerance", 10)),
+                                      tags=(tag_name,))
+                # 設定 tag 前景色為該 RGB → 讓「■」顯示為色塊
+                self.cond_tree.tag_configure(tag_name, foreground=hex_c)
+            except Exception:
+                self.cond_tree.insert("", "end", iid=str(i),
+                                      values=(c.get("x", 0), c.get("y", 0),
+                                              f"({rgb[0]},{rgb[1]},{rgb[2]}) {hex_c}",
+                                              c.get("tolerance", 10)))
 
     def _populate_actions(self, acts: list) -> None:
         for iid in self.act_tree.get_children():
@@ -478,7 +513,7 @@ class HotkeyEditorWindow(tk.Toplevel):
     def _prompt_condition(self, defaults: dict) -> Optional[dict]:
         dlg = tk.Toplevel(self)
         dlg.title("編輯條件")
-        dlg.geometry("360x220")
+        dlg.geometry("420x300")
         dlg.transient(self)
         dlg.grab_set()
         result = {}
@@ -486,8 +521,8 @@ class HotkeyEditorWindow(tk.Toplevel):
         def add_row(row, label, default):
             ttk.Label(dlg, text=label).grid(row=row, column=0, padx=6, pady=4, sticky="e")
             v = tk.StringVar(value=str(default))
-            e = ttk.Entry(dlg, textvariable=v, width=24)
-            e.grid(row=row, column=1, padx=6, pady=4, sticky="ew")
+            e = ttk.Entry(dlg, textvariable=v, width=14)
+            e.grid(row=row, column=1, padx=6, pady=4, sticky="w")
             return v
 
         rgb = defaults.get("rgb", [255, 255, 255])
@@ -497,6 +532,41 @@ class HotkeyEditorWindow(tk.Toplevel):
         g_var = add_row(3, "G (0-255):", rgb[1])
         b_var = add_row(4, "B (0-255):", rgb[2])
         tol_var = add_row(5, "容差 (推薦 10):", defaults.get("tolerance", 10))
+
+        # [O30] 色塊預覽（即時跟著 RGB 欄位變動）
+        swatch = tk.Label(dlg, text="  ", bg="#FFFFFF", relief="ridge", bd=2,
+                          width=10, height=4)
+        swatch.grid(row=2, column=2, rowspan=3, padx=10, pady=4, sticky="ns")
+
+        def update_swatch(*_a):
+            try:
+                r = int(r_var.get())
+                g = int(g_var.get())
+                b = int(b_var.get())
+                r = max(0, min(255, r))
+                g = max(0, min(255, g))
+                b = max(0, min(255, b))
+                swatch.configure(bg=f"#{r:02X}{g:02X}{b:02X}")
+            except (ValueError, tk.TclError):
+                pass
+
+        for v in (r_var, g_var, b_var):
+            v.trace_add("write", update_swatch)
+        update_swatch()
+
+        # [O29] 視覺取座標按鈕
+        def pick_visually():
+            from cmuh_common.pixel_picker import pick_pixel_with_accurate_color
+            def on_picked(x, y, r, g, b):
+                x_var.set(str(x))
+                y_var.set(str(y))
+                r_var.set(str(r))
+                g_var.set(str(g))
+                b_var.set(str(b))
+            pick_pixel_with_accurate_color(dlg, on_picked)
+
+        ttk.Button(dlg, text="🎯 視覺取座標 / 顏色", command=pick_visually).grid(
+            row=6, column=0, columnspan=3, pady=8, padx=6, sticky="ew")
 
         def ok():
             try:
@@ -511,10 +581,9 @@ class HotkeyEditorWindow(tk.Toplevel):
                 messagebox.showerror("格式錯誤", "X/Y/RGB/容差 須為整數", parent=dlg)
 
         btn_row = ttk.Frame(dlg)
-        btn_row.grid(row=6, column=0, columnspan=2, pady=8)
+        btn_row.grid(row=7, column=0, columnspan=3, pady=8)
         ttk.Button(btn_row, text="確定", command=ok).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_row, text="取消", command=dlg.destroy).pack(side=tk.LEFT)
-        dlg.columnconfigure(1, weight=1)
 
         self.wait_window(dlg)
         return result if result else None
@@ -617,8 +686,8 @@ class HotkeyEditorWindow(tk.Toplevel):
                 nonlocal row
                 ttk.Label(fields_frame, text=label).grid(row=row, column=0, padx=2, pady=4, sticky="e")
                 v = tk.StringVar(value=str(default))
-                ttk.Entry(fields_frame, textvariable=v, width=24).grid(
-                    row=row, column=1, padx=2, pady=4, sticky="ew")
+                ttk.Entry(fields_frame, textvariable=v, width=18).grid(
+                    row=row, column=1, padx=2, pady=4, sticky="w")
                 fields_frame.columnconfigure(1, weight=1)
                 field_vars[key] = v
                 row += 1
@@ -627,6 +696,44 @@ class HotkeyEditorWindow(tk.Toplevel):
                 add("Y 座標:", "y", defaults.get("y", 0))
                 if t == "click":
                     add("延遲 (秒):", "delay", defaults.get("delay", 0.0))
+                elif t == "wait_color":
+                    # [O33] wait_color 完整：加目標 RGB + 容差 + timeout
+                    target_rgb = defaults.get("target_rgb", [255, 255, 0])
+                    add("目標 R:", "tr", target_rgb[0] if len(target_rgb) > 0 else 255)
+                    add("目標 G:", "tg", target_rgb[1] if len(target_rgb) > 1 else 255)
+                    add("目標 B:", "tb", target_rgb[2] if len(target_rgb) > 2 else 0)
+                    add("容差:", "tolerance", defaults.get("tolerance", 5))
+                    add("逾時 (秒):", "timeout", defaults.get("timeout", 15))
+                    # 色塊預覽
+                    pv = tk.Label(fields_frame, text="  ", bg="#FFFFFF",
+                                  relief="ridge", bd=2, width=8, height=2)
+                    pv.grid(row=2, column=2, rowspan=3, padx=8, sticky="ns")
+                    def upd_pv(*_a):
+                        try:
+                            r = max(0, min(255, int(field_vars["tr"].get())))
+                            g = max(0, min(255, int(field_vars["tg"].get())))
+                            b = max(0, min(255, int(field_vars["tb"].get())))
+                            pv.configure(bg=f"#{r:02X}{g:02X}{b:02X}")
+                        except (ValueError, tk.TclError):
+                            pass
+                    for k in ("tr", "tg", "tb"):
+                        field_vars[k].trace_add("write", upd_pv)
+                    upd_pv()
+                # [O29] 視覺取座標按鈕（適用於 click / wait_color / check_color）
+                def pick_visually():
+                    from cmuh_common.pixel_picker import pick_pixel_with_accurate_color
+                    def on_picked(x, y, r, g, b):
+                        if "x" in field_vars: field_vars["x"].set(str(x))
+                        if "y" in field_vars: field_vars["y"].set(str(y))
+                        # 對 wait_color 也順便填目標 RGB
+                        if "tr" in field_vars: field_vars["tr"].set(str(r))
+                        if "tg" in field_vars: field_vars["tg"].set(str(g))
+                        if "tb" in field_vars: field_vars["tb"].set(str(b))
+                    pick_pixel_with_accurate_color(dlg, on_picked)
+                ttk.Button(fields_frame, text="🎯 視覺取座標",
+                           command=pick_visually).grid(
+                    row=row, column=0, columnspan=2, pady=6, padx=2, sticky="ew")
+                row += 1
             elif t == "sleep":
                 add("秒數:", "seconds", defaults.get("seconds", 0.5))
             elif t == "type":
@@ -644,6 +751,15 @@ class HotkeyEditorWindow(tk.Toplevel):
                     d["y"] = int(field_vars["y"].get())
                     if t == "click":
                         d["delay"] = float(field_vars["delay"].get())
+                    elif t == "wait_color":
+                        # [O33] 完整 wait_color 欄位
+                        d["target_rgb"] = [
+                            int(field_vars["tr"].get()),
+                            int(field_vars["tg"].get()),
+                            int(field_vars["tb"].get()),
+                        ]
+                        d["tolerance"] = int(field_vars["tolerance"].get())
+                        d["timeout"] = float(field_vars["timeout"].get())
                 elif t == "sleep":
                     d["seconds"] = float(field_vars["seconds"].get())
                 elif t == "type":
@@ -681,6 +797,60 @@ class HotkeyEditorWindow(tk.Toplevel):
             self._dirty = False
         else:
             messagebox.showerror("儲存失敗", "無法寫入 override 檔。", parent=self)
+
+    def _push_shared(self) -> None:
+        """[O34] 把目前所有 override 推到 GitHub 共用區。"""
+        if self._current_data is None:
+            messagebox.showinfo("提示", "目前沒有可推送的 override", parent=self)
+            return
+        # 確保本機已存
+        res = self.res_var.get()
+        hk = self.hk_var.get()
+        self._overrides.setdefault(res, {})[hk] = deepcopy(self._current_data)
+        save_overrides(self._overrides)
+
+        if not messagebox.askyesno(
+            "推送共用 override",
+            "把目前所有 override 推送到 GitHub，所有使用本程式的電腦都會收到（自動更新時）。\n\n"
+            "確定推送？",
+            parent=self,
+        ):
+            return
+
+        # 寫到 repo root 並呼叫 push.bat
+        if not push_to_shared(self._overrides):
+            messagebox.showerror("失敗", "寫入 repo root 失敗。", parent=self)
+            return
+
+        # 嘗試呼叫 push.bat（背景）
+        from cmuh_common.paths import get_app_dir
+        push_bat = os.path.join(get_app_dir(), "push.bat")
+        if not os.path.isfile(push_bat):
+            messagebox.showinfo(
+                "已寫入 repo root",
+                "已將 override 寫入 repo 根目錄的 hotkey_overrides.json。\n\n"
+                "找不到 push.bat，請手動執行 push.bat 推到 GitHub。",
+                parent=self,
+            )
+            return
+
+        import subprocess
+        try:
+            subprocess.Popen([push_bat, f'sync hotkey_overrides ({res}/{hk})'],
+                             cwd=get_app_dir(), shell=True)
+            messagebox.showinfo(
+                "已啟動推送",
+                "已啟動 push.bat 在背景推送到 GitHub。\n\n"
+                "其他電腦下次啟動會自動收到更新（manifest cache ~5 分鐘）。",
+                parent=self,
+            )
+        except Exception as e:
+            logging.error("啟動 push.bat 失敗", exc_info=True)
+            messagebox.showerror(
+                "啟動推送失敗",
+                f"無法執行 push.bat:\n{e}\n\n請手動執行 push.bat。",
+                parent=self,
+            )
 
     def _revert_current(self) -> None:
         res = self.res_var.get()
