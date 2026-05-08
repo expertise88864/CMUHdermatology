@@ -427,10 +427,68 @@ IPV4_ONLY_HOSTS = {
 }
 
 _orig_create_connection = _urllib3_conn.create_connection
+_orig_getaddrinfo = _socket.getaddrinfo
+
+# =============================================================================
+# [O36] Session 級熔斷器（Circuit Breaker）
+# 同個來源（east/auh/huisheng）連續失敗 N 次後，本 session 內完全停止嘗試。
+# 即使 backoff 過期也不再試。下次重啟程式才會重置。
+# 這避免「每 5 分鐘重複等 2 秒 timeout」的累積消耗。
+# =============================================================================
+_CIRCUIT_BREAKER_STATE: dict[str, int] = {}  # source_key → consecutive_fail_count
+_CIRCUIT_BREAKER_LOCK = threading.Lock()
+_CIRCUIT_BREAKER_THRESHOLD = 3  # 連續 3 次失敗 → tripped
+
+
+def _circuit_record_fail(source: str) -> bool:
+    """記錄失敗，回傳是否剛跳過閾值。"""
+    with _CIRCUIT_BREAKER_LOCK:
+        n = _CIRCUIT_BREAKER_STATE.get(source, 0) + 1
+        _CIRCUIT_BREAKER_STATE[source] = n
+        if n == _CIRCUIT_BREAKER_THRESHOLD:
+            return True  # 剛跳閾
+        return False
+
+
+def _circuit_record_success(source: str) -> None:
+    """成功 → 重置計數。"""
+    with _CIRCUIT_BREAKER_LOCK:
+        if source in _CIRCUIT_BREAKER_STATE:
+            del _CIRCUIT_BREAKER_STATE[source]
+
+
+def _circuit_is_tripped(source: str) -> bool:
+    """是否已達閾值（本 session 不再試）。"""
+    with _CIRCUIT_BREAKER_LOCK:
+        return _CIRCUIT_BREAKER_STATE.get(source, 0) >= _CIRCUIT_BREAKER_THRESHOLD
+
+
+def _ipv4_first_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    """[O35 關鍵修正] 對 IPV4_ONLY_HOSTS 的 host 限制 DNS 結果為「IPv4 + 只 1 個 IP」。
+
+    為何要 patch socket.getaddrinfo（而非只 patch urllib3）：
+      urllib3.connection.HTTPConnection 在 module load 時就 import 了
+      create_connection，後來在 urllib3.util.connection 上的 monkey-patch 對它無效。
+      但 socket.getaddrinfo 是底層函式，所有 DNS 解析最終都走它，patch 它最可靠。
+
+    效果：當 host 在 IPV4_ONLY_HOSTS：
+      - 只回 IPv4 結果（跳過 IPv6 嘗試）
+      - 只回第 1 個 IP（避免 N IP × timeout 累積）
+      → AUH/east 不通時 2 秒 fail，不再 21-42s
+    """
+    try:
+        if isinstance(host, str) and host in IPV4_ONLY_HOSTS:
+            results = _orig_getaddrinfo(host, port, _socket.AF_INET, type, proto, flags)
+            if results:
+                return [results[0]]
+            return results
+    except Exception:
+        pass
+    return _orig_getaddrinfo(host, port, family, type, proto, flags)
 
 
 def _ipv4_aware_create_connection(address, *args, **kwargs):
-    """如果 host 在 IPV4_ONLY_HOSTS 列表，強制 AF_INET；否則使用原本實作。"""
+    """[原方案，保留] 對 IPV4_ONLY_HOSTS 強制 AF_INET。"""
     try:
         host = address[0] if isinstance(address, tuple) else None
     except Exception:
@@ -500,8 +558,18 @@ def _create_ipv4_connection_OLD(address, *args, **kwargs):
     raise OSError("getaddrinfo returns an empty list")
 
 
-# 一次性 monkey-patch（只對特定 host 生效，其他主機行為不變）
+# [O35] 主要 patch：socket.getaddrinfo（所有 DNS 都走這個，最可靠）
+_socket.getaddrinfo = _ipv4_first_only_getaddrinfo
+
+# [備援] 也 patch urllib3.util.connection.create_connection（雙保險）
 _urllib3_conn.create_connection = _ipv4_aware_create_connection
+# 同時 patch urllib3.connection（HTTPConnection 在 module load 時 import 了 reference）
+try:
+    import urllib3.connection as _u3_conn_mod  # type: ignore[import-untyped]
+    if hasattr(_u3_conn_mod, "create_connection"):
+        _u3_conn_mod.create_connection = _ipv4_aware_create_connection
+except Exception:
+    pass
 
 
 def _cache_get(cache_key, ttl_seconds, evict_expired=True):
@@ -2290,6 +2358,9 @@ def _fetch_east_district_reg52_html(session, doc_no: str, doctor_name: str):
     variants.append(quote(doctor_name, safe=""))
     seen_urls = set()
     source_key = f"east:{doc_no}"
+    # [O36] Circuit breaker：本 session 連續失敗已達閾值 → 完全跳過
+    if _circuit_is_tripped("east"):
+        return None
     ok, remain = _source_backoff_allow(source_key)
     if not ok:
         logging.info(f"[BACKOFF] skip east fetch {doctor_name} {doc_no}, remaining={remain:.1f}s")
@@ -2312,6 +2383,7 @@ def _fetch_east_district_reg52_html(session, doc_no: str, doctor_name: str):
             if probe.select_one("div.visitDate") or probe.select_one("table#dayoff"):
                 logging.info(f"已自東區主機取得掛號表: {doctor_name} ({dparam})")
                 _source_backoff_success(source_key)
+                _circuit_record_success("east")
                 return text
         except requests.exceptions.RequestException as e:
             logging.debug(f"東區 reg52 請求失敗 ({url[:64]}…): {e}")
@@ -2324,6 +2396,10 @@ def _fetch_east_district_reg52_html(session, doc_no: str, doctor_name: str):
             REG52_EXTERNAL_BACKOFF_MAX_SECONDS,
         )
         logging.warning(f"[BACKOFF] east fetch fail {doctor_name} {doc_no}, fail={cnt}, delay={delay:.1f}s")
+        # [O36] 紀錄 session 級失敗
+        if _circuit_record_fail("east"):
+            logging.warning("[O36] 東區主機連續失敗 %d 次，本 session 不再嘗試（重啟程式才會重試）",
+                            _CIRCUIT_BREAKER_THRESHOLD)
     logging.warning(f"無法自東區主機取得掛號表: {doctor_name} ({dparam})")
     return None
 
@@ -2392,6 +2468,8 @@ def _fetch_huisheng_reg52_html(session, doc_no: str, doctor_name: str):
     variants.append(quote(doctor_name, safe=""))
     seen_urls = set()
     source_key = f"huisheng:{doc_no}"
+    if _circuit_is_tripped("huisheng"):  # [O36]
+        return None
     ok, remain = _source_backoff_allow(source_key)
     if not ok:
         logging.info(f"[BACKOFF] skip huisheng fetch {doctor_name} {doc_no}, remaining={remain:.1f}s")
@@ -2414,6 +2492,7 @@ def _fetch_huisheng_reg52_html(session, doc_no: str, doctor_name: str):
             if probe.select_one("div.visitDate") or probe.select_one("table#dayoff"):
                 logging.info(f"已自惠盛 hs1 取得掛號表: {doctor_name} ({dparam})")
                 _source_backoff_success(source_key)
+                _circuit_record_success("huisheng")
                 return text
         except requests.exceptions.RequestException as e:
             logging.debug(f"惠盛 reg52 請求失敗 ({url[:64]}…): {e}")
@@ -2426,6 +2505,9 @@ def _fetch_huisheng_reg52_html(session, doc_no: str, doctor_name: str):
             REG52_EXTERNAL_BACKOFF_MAX_SECONDS,
         )
         logging.warning(f"[BACKOFF] huisheng fetch fail {doctor_name} {doc_no}, fail={cnt}, delay={delay:.1f}s")
+        if _circuit_record_fail("huisheng"):  # [O36]
+            logging.warning("[O36] 惠盛主機連續失敗 %d 次，本 session 不再嘗試",
+                            _CIRCUIT_BREAKER_THRESHOLD)
     logging.warning(f"無法自惠盛取得掛號表: {doctor_name} ({dparam})")
     return None
 
@@ -2761,6 +2843,8 @@ def _fetch_auh_reg52_html(session, doctor_name):
     if hit is not None:
         return hit
     source_key = f"auh:{doc_no}"
+    if _circuit_is_tripped("auh"):  # [O36]
+        return _cache_get(cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False) or ""
     ok, remain = _source_backoff_allow(source_key)
     if not ok:
         logging.info(f"[BACKOFF] skip auh fetch {doctor_name} {doc_no}, remaining={remain:.1f}s")
@@ -2777,6 +2861,7 @@ def _fetch_auh_reg52_html(session, doctor_name):
             logging.warning(f"亞大附醫頁面未含掛號數欄位: {doctor_name} ({doc_no})")
         _cache_set(cache_key, text)
         _source_backoff_success(source_key)
+        _circuit_record_success("auh")
         return text
     except requests.exceptions.RequestException as e:
         logging.warning(f"亞大附醫資料抓取失敗 ({doctor_name} {doc_no}): {e}")
@@ -2786,6 +2871,9 @@ def _fetch_auh_reg52_html(session, doctor_name):
             REG52_EXTERNAL_BACKOFF_MAX_SECONDS,
         )
         logging.warning(f"[BACKOFF] auh fetch fail {doctor_name} {doc_no}, fail={cnt}, delay={delay:.1f}s")
+        if _circuit_record_fail("auh"):  # [O36]
+            logging.warning("[O36] AUH 連續失敗 %d 次，本 session 不再嘗試（重啟才會重試）",
+                            _CIRCUIT_BREAKER_THRESHOLD)
         return _cache_get(cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False) or ""
 
 def _parse_auh_reg52_schedule(soup):
