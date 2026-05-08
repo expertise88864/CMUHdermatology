@@ -2,9 +2,16 @@
 """路徑與重啟工具。同時支援 .pyw（Python 直跑）與 .exe（PyInstaller 打包）兩種模式。
 
 關鍵概念：
-- get_app_dir()：回傳「使用者看得到的程式目錄」（即 .exe 或主 .py 所在目錄），
-  不是 PyInstaller 解壓後的 _MEIPASS 暫存目錄。
-- restart_self()：雙軌重啟邏輯，取代原主程式 line 4161 的 os.execv 用法。
+- get_app_dir()：回傳「使用者看得到的程式目錄」（即 settings/、assets/、log 的父層）。
+- restart_self()：雙軌重啟邏輯。
+
+【修正 2026.05.04】get_app_dir 智能化偵測，避免 settings/ 分裂：
+  原本若使用 `pythonw src/main.py` 啟動，sys.argv[0] = src/main.py，
+  app_dir 會回 src/，settings/ 跑去 src/settings/，與雙擊 root launcher 的
+  app_dir = repo root 不一致，造成 settings/ 分裂。
+
+  本版改為：若 sys.argv[0] 落在「含有 cmuh_common 的目錄」內，
+  自動往上一層（取 src/ 的父層即 repo root），保證 settings/ 永遠在 repo root。
 """
 import os
 import sys
@@ -15,20 +22,39 @@ def is_frozen() -> bool:
     return getattr(sys, 'frozen', False)
 
 
-def get_app_dir() -> str:
-    """回傳程式所在目錄（settings/、assets/、線上更新檔的父層）。
+def _looks_like_src_dir(d: str) -> bool:
+    """判斷目錄 d 是否為 src/（即包含 cmuh_common/ 子套件的目錄）。"""
+    try:
+        return os.path.isdir(os.path.join(d, 'cmuh_common')) and \
+               os.path.isfile(os.path.join(d, 'cmuh_common', 'version.py'))
+    except OSError:
+        return False
 
-    - .pyw 模式：sys.argv[0] 所在目錄（即 main.py / scheduler.py / autoclock.py / coord_detector.py）
+
+def get_app_dir() -> str:
+    """回傳程式所在目錄（settings/、assets/、log 的父層）。
+
     - .exe 模式：sys.executable 所在目錄
+    - .pyw 模式：
+        * 若 sys.argv[0] 在 src/ 內（直接跑 src/main.py 等）→ 回 src/ 的父層
+        * 否則（雙擊 root launcher）→ 回 launcher 所在目錄
     """
     if is_frozen():
         return os.path.dirname(os.path.abspath(sys.executable))
+
     main_script = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else __file__
-    return os.path.dirname(main_script)
+    script_dir = os.path.dirname(main_script)
+
+    # 智能偵測：若 script_dir 看起來是 src/，回上一層 repo root
+    if _looks_like_src_dir(script_dir):
+        parent = os.path.dirname(script_dir)
+        if parent and parent != script_dir:
+            return parent
+    return script_dir
 
 
 def get_settings_dir() -> str:
-    """設定/快取目錄（自動建立）。對應原主程式 SETTINGS_DIR (line 386)。"""
+    """設定/快取目錄（自動建立）。對應原主程式 SETTINGS_DIR。"""
     d = os.path.join(get_app_dir(), 'settings')
     try:
         os.makedirs(d, exist_ok=True)
@@ -38,7 +64,7 @@ def get_settings_dir() -> str:
 
 
 def get_conf_path(filename: str) -> str:
-    """回傳設定檔完整路徑。對應原主程式 get_conf_path (line 395)。"""
+    """回傳設定檔完整路徑。"""
     return os.path.join(get_settings_dir(), filename)
 
 
@@ -57,7 +83,7 @@ def get_bundled_asset(relative_path: str) -> str:
 
 
 def get_log_path(filename: str = 'app.log') -> str:
-    """log 檔路徑，預設放在 app_dir 直接層（與原主程式 LOG_FILE 一致）。"""
+    """log 檔路徑，預設放在 app_dir 直接層。"""
     return os.path.join(get_app_dir(), filename)
 
 
@@ -66,8 +92,6 @@ def restart_self(extra_args=None) -> None:
 
     .pyw 模式：os.execv(python.exe, [python.exe, sys.argv[0], ...])
     .exe 模式：os.execv(sys.executable, [sys.executable, ...])
-              （sys.executable 即 .exe 自己，不可再傳 main.py 路徑）
-    搬自原主程式 line 4161，加入雙軌相容。
     """
     args = list(extra_args) if extra_args else []
     if is_frozen():
