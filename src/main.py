@@ -4020,6 +4020,52 @@ class HotkeyScriptEditorWindow(tk.Toplevel):
         messagebox.showinfo("完成", "已刪除覆寫檔並重註冊熱鍵。", parent=self)
 
 
+# =============================================================================
+# 止掛提醒寄信（Outlook COM，在獨立執行緒+逾時，避免卡到主迴圈）
+# =============================================================================
+def _send_alert_email_via_outlook(subject: str, body: str,
+                                  recipients: list, timeout: float = 60.0) -> bool:
+    """達到門檻時透過 Outlook 寄信給設定的收件人；獨立執行緒+逾時防卡。
+    回傳是否成功（失敗只記 log，不影響主程式運作）。"""
+    if not recipients:
+        return False
+    result: dict = {}
+
+    def _worker() -> None:
+        import pythoncom
+        import win32com.client
+        pythoncom.CoInitialize()
+        try:
+            try:
+                outlook = win32com.client.GetActiveObject("Outlook.Application")
+            except Exception:
+                outlook = win32com.client.DispatchEx("Outlook.Application")
+            mail = outlook.CreateItem(0)  # olMailItem
+            mail.To = "; ".join(recipients)
+            mail.Subject = subject
+            mail.Body = body
+            mail.Send()
+            result["ok"] = True
+        except Exception as e:  # noqa: BLE001
+            result["error"] = e
+        finally:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_worker, name="AlertMailSender", daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        logging.warning("止掛提醒寄信逾時（>%ss），放棄", int(timeout))
+        return False
+    if result.get("error"):
+        logging.warning("止掛提醒寄信失敗：%s", result["error"])
+        return False
+    return bool(result.get("ok"))
+
+
 # --- 9. UI 與應用程式主體 ---
 class AutomationApp:
     def __init__(self, root: tk.Tk, master_schedule: dict):
@@ -4126,6 +4172,9 @@ class AutomationApp:
         self.ui_font_scale_var = tk.DoubleVar(value=max(0.85, min(1.45, _ufs)))
         self.alert_chang_enabled = tk.BooleanVar(value=self.threshold_settings.get("alert_chang_enabled", True))
         self.alert_chen_enabled = tk.BooleanVar(value=self.threshold_settings.get("alert_chen_enabled", False))
+        # 止掛達門檻時要寄信通知的收件人（可多人，預設一位）
+        self.alert_email_recipients = list(self.threshold_settings.get(
+            "alert_email_recipients", ["expertise88864@gmail.com"]))
         self.out_of_hospital_var = tk.BooleanVar(value=self.threshold_settings.get("out_of_hospital_mode", False))
         self.show_external_clinics = tk.BooleanVar(value=self.threshold_settings.get("show_external_clinics", True))
 
@@ -5396,6 +5445,16 @@ class AutomationApp:
         self.notify_dnd_end_time_var.set(dnd_end)
         self.threshold_settings['notify_dnd_start_time'] = dnd_start
         self.threshold_settings['notify_dnd_end_time'] = dnd_end
+        # 從 Listbox 同步止掛提醒收件人（若 UI 已建立）
+        if hasattr(self, 'alert_mail_listbox') and self.alert_mail_listbox is not None:
+            try:
+                self.alert_email_recipients = [
+                    a for a in self.alert_mail_listbox.get(0, tk.END)
+                    if str(a).strip()
+                ]
+            except Exception:
+                logging.debug("讀取止掛提醒收件人 Listbox 失敗", exc_info=True)
+        self.threshold_settings['alert_email_recipients'] = list(self.alert_email_recipients)
 
         _atomic_write_json(get_conf_path('threshold_settings.json'), self.threshold_settings)
         
@@ -7874,6 +7933,29 @@ class AutomationApp:
             ttk.Entry(chen_frame, textvariable=var, width=4).pack(side=tk.LEFT, padx=0)
             self.threshold_entries[key] = var
 
+        # 止掛達門檻時 → 用 Outlook 寄信通知（可多位收件人，留空=不寄）
+        ttk.Separator(threshold_main_frame, orient='horizontal').pack(fill='x', pady=8)
+        mail_block = ttk.Frame(threshold_main_frame); mail_block.pack(fill=tk.X, pady=2)
+        ttk.Label(mail_block, text="止掛達門檻寄信通知（收件人 Email，可多人）:",
+                  font=("Microsoft JhengHei UI", self.f_sm, "bold")
+                  ).pack(anchor="w")
+        mail_row = ttk.Frame(mail_block); mail_row.pack(fill=tk.X, pady=(2, 0))
+        self.alert_mail_listbox = tk.Listbox(mail_row, height=3, font=("Consolas", 10))
+        self.alert_mail_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        for r in self.alert_email_recipients:
+            self.alert_mail_listbox.insert(tk.END, r)
+        mail_btns = ttk.Frame(mail_row); mail_btns.pack(side=tk.LEFT, padx=4)
+        self.alert_mail_entry = ttk.Entry(mail_btns, width=22, font=("Consolas", 10))
+        self.alert_mail_entry.pack(pady=1)
+        ttk.Button(mail_btns, text="新增", width=8,
+                   command=self._add_alert_mail).pack(fill=tk.X, pady=1)
+        ttk.Button(mail_btns, text="刪除選定", width=8,
+                   command=self._del_alert_mail).pack(fill=tk.X, pady=1)
+        ttk.Label(mail_block,
+                  text="（透過本機 Outlook 寄出；留空則只跳 Windows 通知不寄信。記得按下方「儲存所有設定」）",
+                  foreground="#666", font=("Microsoft JhengHei UI", self.f_sm)
+                  ).pack(anchor="w", pady=(2, 0))
+
         reboot_frame = ttk.LabelFrame(left_column, text="自動重開機設定 (閒置偵測)", padding=10)
         reboot_frame.pack(fill=tk.X, pady=(0, 15))
 
@@ -7979,6 +8061,20 @@ class AutomationApp:
         if not selected_items: messagebox.showwarning("操作錯誤", "請先在列表中選擇要刪除的醫師！"); return
         if messagebox.askyesno("確認刪除", "您確定要刪除選定的醫師嗎？"):
             for item in selected_items: self.doctors_tree.delete(item)
+
+    def _add_alert_mail(self):
+        addr = self.alert_mail_entry.get().strip()
+        if not addr:
+            return
+        if addr in self.alert_mail_listbox.get(0, tk.END):
+            return
+        self.alert_mail_listbox.insert(tk.END, addr)
+        self.alert_mail_entry.delete(0, tk.END)
+
+    def _del_alert_mail(self):
+        sel = self.alert_mail_listbox.curselection()
+        if sel:
+            self.alert_mail_listbox.delete(sel[0])
 
     def ensure_settings_promo_loaded(self):
         if self._settings_promo_loaded or self._settings_promo_loading:
@@ -8331,9 +8427,21 @@ class AutomationApp:
                                                                 self.status_text.set(f"狀態: 勿擾時段，已抑制提醒（{doc_name}{session_name}，{diff_text}）")
                                                                 logging.info(f"[ALERT SUPPRESSED][DND] {doc_name} {session_name} count={count} threshold={full_threshold} {diff_text}")
                                                                 continue
-                                                            def _notify_worker(nk=notify_key, m=msg):
+                                                            def _notify_worker(nk=notify_key, m=msg, dn=doc_name, sn=session_name,
+                                                                                fth=full_threshold, cnt=count):
                                                                 try:
                                                                     show_windows_notification("止掛提醒", m)
+                                                                    # 同步用 Outlook 寄信給設定的收件人（失敗只記 log 不影響原通知）
+                                                                    rcpts = list(self.alert_email_recipients)
+                                                                    if rcpts:
+                                                                        try:
+                                                                            today = date.today()
+                                                                            subj = (f"【止掛提醒】{dn} {sn}診 "
+                                                                                    f"({today.year}/{today.month}/{today.day}) "
+                                                                                    f"已達 {cnt}/{fth}")
+                                                                            _send_alert_email_via_outlook(subj, m, rcpts)
+                                                                        except Exception:
+                                                                            logging.warning("止掛提醒寄信例外", exc_info=True)
                                                                 finally:
                                                                     with self._alert_state_lock:
                                                                         self._alert_popup_active[nk] = False

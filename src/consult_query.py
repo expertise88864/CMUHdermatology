@@ -63,6 +63,20 @@ import win32gui  # noqa: E402
 import win32process  # noqa: E402
 import win32ui  # noqa: E402
 
+# Win32 函式簽章（CreateDesktop/SetThreadDesktop 的指標型別在 64 位元下要用 c_void_p）
+_user32 = ctypes.windll.user32
+_user32.OpenDesktopW.restype = ctypes.c_void_p
+_user32.OpenDesktopW.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong,
+                                  ctypes.c_bool, ctypes.c_ulong]
+_user32.CreateDesktopW.restype = ctypes.c_void_p
+_user32.CreateDesktopW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p,
+                                    ctypes.c_void_p, ctypes.c_ulong,
+                                    ctypes.c_ulong, ctypes.c_void_p]
+_user32.SetThreadDesktop.restype = ctypes.c_bool
+_user32.SetThreadDesktop.argtypes = [ctypes.c_void_p]
+_user32.CloseDesktop.restype = ctypes.c_bool
+_user32.CloseDesktop.argtypes = [ctypes.c_void_p]
+
 from cmuh_common.atomic_io import atomic_write_json  # noqa: E402
 from cmuh_common.logging_setup import QueueHandler, setup_logging  # noqa: E402
 from cmuh_common.paths import get_app_dir, get_settings_dir  # noqa: E402
@@ -104,6 +118,11 @@ DEFAULT_CONFIG = {
     "subject_template": "{date} {time} 皮膚科會診通知單",
     "body_template": "附件為 {date} {time} 皮膚科會診通知單截圖，由系統自動擷取寄送。",
     "enabled": True,
+    # 信件觸發：從任何地方寄一封信到你的 Outlook 信箱，主旨包含關鍵字 →
+    # 程式輪詢 60 秒一次，看到就把信標為已讀並立即執行一次。
+    # 院內網路擋外部連入，但 Outlook 收信是「往外連」抓郵件，所以可正常運作。
+    "email_trigger_enabled": False,
+    "email_trigger_subject_keyword": "[皮膚科會診觸發]",
 }
 
 # Win32 視窗特徵（由探測 spike 實測得到，非寫死座標）
@@ -123,6 +142,10 @@ GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
 OFFSCREEN_X, OFFSCREEN_Y = -32000, -32000  # 把視窗藏到虛擬桌面外（使用者看不到）
+
+# 隱藏桌面名稱：systemftp 整個在這個虛擬桌面上跑，使用者畫面完全不會出現
+HIDDEN_DESKTOP_NAME = "CMUHConsultHidden_v1"
+_DESKTOP_GENERIC_ALL = 0x10000000
 
 running = threading.Event()
 running.set()
@@ -508,19 +531,208 @@ def close_pids(pids: set, grace: float = 2.5) -> None:
 
 
 # =============================================================================
+# 隱藏桌面（systemftp 完全在使用者看不到的虛擬桌面上跑，零干擾）
+# =============================================================================
+def _ensure_hidden_desktop():
+    """建立或開啟隱藏桌面；回傳 HDESK（整數位址）或 None 表失敗。"""
+    try:
+        h = _user32.OpenDesktopW(HIDDEN_DESKTOP_NAME, 0, False,
+                                  _DESKTOP_GENERIC_ALL)
+        if h:
+            return h
+    except Exception:
+        logging.debug("OpenDesktop 失敗", exc_info=True)
+    try:
+        h = _user32.CreateDesktopW(HIDDEN_DESKTOP_NAME, None, None, 0,
+                                    _DESKTOP_GENERIC_ALL, None)
+        return h or None
+    except Exception:
+        logging.warning("CreateDesktop 失敗", exc_info=True)
+        return None
+
+
+def _set_thread_desktop(hdesk) -> bool:
+    """把目前執行緒切到指定桌面。回傳是否成功。"""
+    try:
+        return bool(_user32.SetThreadDesktop(hdesk))
+    except Exception:
+        return False
+
+
+# =============================================================================
 # 自動化主流程
 # =============================================================================
 def run_consult_flow(trigger_label: str = "") -> Path:
-    """執行完整會診查詢流程，回傳截圖路徑。失敗會 raise。"""
+    """執行完整會診查詢流程，回傳截圖路徑。失敗會 raise。
+
+    優先用「隱藏桌面」執行 systemftp——它的所有視窗都在使用者看不到的
+    虛擬桌面，永遠不會出現在使用者畫面、不會搶前景、滑鼠也不會動。
+    若無法建立隱藏桌面（群組原則限制等），退回 SW_HIDE 後備模式。
+    """
     cfg = load_config()
+    logging.info("=== 開始會診查詢流程（觸發：%s）===", trigger_label or "手動")
+
+    hdesk = _ensure_hidden_desktop()
+    if hdesk:
+        logging.info("使用隱藏桌面執行（systemftp 不會出現在你的畫面）")
+        result: dict = {}
+
+        def worker() -> None:
+            try:
+                if not _set_thread_desktop(hdesk):
+                    raise RuntimeError("SetThreadDesktop 失敗")
+                result["shot"] = _automation_on_hidden(cfg)
+            except Exception as e:  # noqa: BLE001
+                result["error"] = e
+
+        t = threading.Thread(target=worker, name="ConsultAutomationHidden",
+                              daemon=True)
+        t.start()
+        t.join(timeout=240)  # 4 分鐘硬上限
+        if t.is_alive():
+            raise RuntimeError("自動化執行超過 4 分鐘，已放棄（可能網路異常）")
+        if result.get("error"):
+            raise result["error"]
+        return result["shot"]
+
+    logging.warning("無法建立隱藏桌面，改用 SW_HIDE 後備模式（可能短暫看到視窗）")
+    return _run_with_sw_hide(cfg)
+
+
+def _automation_on_hidden(cfg: dict) -> Path:
+    """在隱藏桌面執行完整流程（呼叫者需已 SetThreadDesktop）。
+
+    因為隱藏桌面上 systemftp 是唯一前景應用，不需要 stealth thread、不需要
+    show_offscreen、不會與使用者畫面衝突——程式碼相對單純。
+    """
     username = cfg["username"]
     password = cfg["password"]
 
-    logging.info("=== 開始會診查詢流程（觸發：%s）===", trigger_label or "手動")
+    before = _systemftp_pids()
+    si = win32process.STARTUPINFO()
+    si.dwFlags = win32con.STARTF_USESHOWWINDOW
+    si.wShowWindow = win32con.SW_SHOW  # 隱藏桌面上正常顯示，使用者看不到
+    si.lpDesktop = HIDDEN_DESKTOP_NAME
+    try:
+        win32process.CreateProcess(SYSTEMFTP_PATH, None, None, None,
+                                    False, 0, None, None, si)
+    except Exception as e:
+        raise RuntimeError(f"在隱藏桌面啟動 systemftp.exe 失敗：{e}")
+    logging.info("已在隱藏桌面啟動 systemftp.exe")
+
+    our_pids: set = set()
+    try:
+        # 等登入視窗（期間關多開提示）。隱藏桌面上 find_windows 自動列舉
+        # 該桌面的視窗（因為本執行緒已 SetThreadDesktop 過去）。
+        login = None
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            if not running.is_set():
+                raise RuntimeError("流程已被中止")
+            for ph in find_windows(MULTI_INSTANCE_CLASS, MULTI_INSTANCE_TITLE):
+                ok_btn = find_child(ph, "TButton", "OK")
+                if ok_btn:
+                    click_button(ok_btn)
+                    logging.info("已關閉多開提示視窗")
+                    time.sleep(0.6)
+            cands = find_windows(LOGIN_CLASS, LOGIN_TITLE_PREFIX)
+            fresh = [h for h in cands if _window_pid(h) not in before]
+            pick = fresh or cands
+            if pick:
+                login = pick[0]
+                break
+            time.sleep(0.5)
+        if not login:
+            raise RuntimeError("等不到登入視窗")
+        our_pid = _window_pid(login)
+        our_pids = (_systemftp_pids() - before) | {our_pid}
+        logging.info("登入視窗 hwnd=%s pid=%s", login, sorted(our_pids))
+
+        # 登入：隱藏桌面上 systemftp 是唯一前景應用，直接 SetForegroundWindow
+        # + SetFocus 完全不會干擾使用者（使用者畫面在另一個桌面）。
+        force_foreground(login)
+        edits = sorted(
+            (c for c in enum_children(login) if c[1] == "TEditExt"),
+            key=lambda c: c[3][1])
+        if len(edits) < 2:
+            raise RuntimeError(f"登入視窗只找到 {len(edits)} 個輸入框")
+        type_via_focus(edits[0][0], login, username)
+        type_via_focus(edits[1][0], login, password)
+        confirm = find_child(login, "TButton", "確認")
+        if not confirm:
+            raise RuntimeError("找不到「確認」鈕")
+        click_button(confirm)
+        logging.info("已送出登入")
+
+        # 等主視窗（期間關訊息通知）
+        main_hwnd = None
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            if not running.is_set():
+                raise RuntimeError("流程已被中止")
+            notice = find_windows(NOTICE_CLASS, pids=our_pids)
+            if notice:
+                btn = find_child(notice[0], "TButton", "確認")
+                if btn:
+                    click_button(btn)
+                    logging.info("已關閉訊息通知主畫面")
+                    time.sleep(0.6)
+                    continue
+            mains = find_windows(MAIN_CLASS, pids=our_pids)
+            if mains and not notice:
+                main_hwnd = mains[0]
+                break
+            time.sleep(0.4)
+        if not main_hwnd:
+            raise RuntimeError("等不到主畫面")
+        logging.info("已進入主畫面")
+
+        # 送選單命令：我的會診清單
+        cmd_id = resolve_menu_command_id(main_hwnd)
+        win32gui.PostMessage(main_hwnd, win32con.WM_COMMAND, cmd_id, 0)
+        logging.info("已送出選單命令（id=%s）", cmd_id)
+
+        # 等會診單
+        consult = None
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if not running.is_set():
+                raise RuntimeError("流程已被中止")
+            hits = find_windows(CONSULT_CLASS, pids=our_pids)
+            if hits:
+                consult = hits[0]
+                break
+            time.sleep(0.3)
+        if not consult:
+            raise RuntimeError("等不到會診單視窗")
+        time.sleep(1.8)
+        logging.info("會診單視窗已開啟，準備擷取")
+
+        # 截圖
+        SHOTS_DIR.mkdir(parents=True, exist_ok=True)
+        _prune_old_shots()
+        img = capture_window_image(consult)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        shot_path = SHOTS_DIR / f"consult_{stamp}.png"
+        img.save(shot_path)
+        logging.info("已存檔截圖：%s", shot_path)
+        return shot_path
+
+    finally:
+        cleanup_pids = our_pids or (_systemftp_pids() - before)
+        try:
+            close_pids(cleanup_pids)
+            logging.info("已關閉本次開啟的 systemftp 實例")
+        except Exception:
+            logging.warning("關閉 systemftp 失敗", exc_info=True)
+
+
+def _run_with_sw_hide(cfg: dict) -> Path:
+    """後備模式：使用者桌面上跑，配合 SW_HIDE 隱形執行緒（可能有短暫閃爍）。"""
+    username = cfg["username"]
+    password = cfg["password"]
 
     before = _systemftp_pids()
-
-    # 用 STARTUPINFO SW_HIDE 啟動，盡量讓 systemftp 的讀取進度條不顯示。
     startup = subprocess.STARTUPINFO()
     startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startup.wShowWindow = 0  # SW_HIDE
@@ -528,13 +740,8 @@ def run_consult_flow(trigger_label: str = "") -> Path:
         subprocess.Popen([SYSTEMFTP_PATH], startupinfo=startup)
     except FileNotFoundError:
         raise RuntimeError(f"找不到住院醫囑系統程式：{SYSTEMFTP_PATH}")
-    logging.info("已啟動 systemftp.exe（背景隱形模式）")
+    logging.info("已啟動 systemftp.exe（SW_HIDE 後備模式）")
 
-    # 隱形執行緒：持續把本實例的所有視窗 SW_HIDE（systemftp 視窗都是最大化的，
-    # SetWindowPos 移位對最大化視窗無效，必須用 SW_HIDE），使用者完全看不到
-    # 讀取進度條、登入視窗、住院系統主畫面，工作列也不會出現按鈕。
-    # 登入視窗與會診單視窗由主執行緒專責（要切前景／要 PrintWindow），
-    # 主執行緒會把它們的 hwnd 加進 stealth_skip，隱形執行緒就不去動它們。
     stealth_stop = threading.Event()
     stealth_skip: set = set()
 
@@ -550,7 +757,7 @@ def run_consult_flow(trigger_label: str = "") -> Path:
             time.sleep(0.08)
 
     threading.Thread(target=_stealth, name="ConsultStealth", daemon=True).start()
-    fg_before = win32gui.GetForegroundWindow()  # 流程結束後把前景還給使用者
+    fg_before = win32gui.GetForegroundWindow()
     our_pids: set = set()
 
     try:
@@ -695,6 +902,62 @@ def _prune_old_shots() -> None:
 # =============================================================================
 # 寄信（Outlook COM）
 # =============================================================================
+def _check_outlook_trigger(keyword: str, timeout: float = 30.0) -> bool:
+    """掃描 Outlook 收件匣未讀郵件，主旨包含 keyword 的就標為已讀並回傳 True。
+    給 email-triggered run 用：使用者從任何地方寄信到自己的 Outlook 信箱，主旨
+    含關鍵字即可遠端觸發本程式執行一次（院內擋外部連入，但 Outlook 抓信是
+    往外連，所以這條路走得通）。"""
+    if not keyword:
+        return False
+    result: dict = {}
+
+    def w() -> None:
+        import pythoncom
+        pythoncom.CoInitialize()
+        try:
+            outlook = _connect_outlook()
+            ns = outlook.GetNamespace("MAPI")
+            inbox = ns.GetDefaultFolder(6)  # olFolderInbox
+            try:
+                unread = inbox.Items.Restrict("[Unread] = True")
+            except Exception:
+                unread = inbox.Items
+            triggered = False
+            # 反向走訪：標已讀後 collection 會位移，由後往前較安全
+            for i in range(unread.Count, 0, -1):
+                try:
+                    m = unread.Item(i)
+                    subj = m.Subject or ""
+                    if keyword in subj:
+                        m.UnRead = False
+                        try:
+                            m.Save()
+                        except Exception:
+                            pass
+                        triggered = True
+                except Exception:
+                    pass
+            result["triggered"] = triggered
+        except Exception as e:  # noqa: BLE001
+            result["error"] = e
+        finally:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=w, name="OutlookTriggerCheck", daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        logging.warning("Outlook 觸發信檢查逾時")
+        return False
+    if result.get("error"):
+        logging.debug("Outlook 觸發信檢查例外：%s", result["error"])
+        return False
+    return bool(result.get("triggered"))
+
+
 def _outlook_send_worker(image_path, subject, body, recipients, result) -> None:
     """實際的 Outlook COM 寄信動作，在獨立執行緒執行（自己 CoInitialize）。"""
     import pythoncom
@@ -834,6 +1097,7 @@ def _rebuild_schedule() -> None:
 def scheduler_loop() -> None:
     logging.info("=== 會診查詢排程器啟動 v%s ===", CURRENT_VERSION)
     _rebuild_schedule()
+    last_email_check = 0.0
     while running.is_set():
         try:
             schedule.run_pending()
@@ -853,6 +1117,16 @@ def scheduler_loop() -> None:
                     pass
                 logging.info("偵測到設定變更，重新建立排程")
                 _rebuild_schedule()
+            # 信件觸發：每 60 秒輪詢 Outlook 收件匣一次（啟用時）
+            cfg = load_config()
+            if cfg.get("email_trigger_enabled"):
+                if time.time() - last_email_check >= 60.0:
+                    last_email_check = time.time()
+                    kw = cfg.get("email_trigger_subject_keyword",
+                                 DEFAULT_CONFIG["email_trigger_subject_keyword"])
+                    if _check_outlook_trigger(kw):
+                        logging.info("收到觸發信（主旨含 %r），立即執行", kw)
+                        trigger_job_async("email")
         except Exception:
             logging.error("排程迴圈例外", exc_info=True)
         time.sleep(1)
@@ -926,6 +1200,27 @@ class ConfigApp(tk.Tk):
         ttk.Checkbutton(sched, text="啟用自動排程", variable=self.enabled_var
                         ).grid(row=2, column=0, columnspan=2, sticky="w", **pad)
 
+        trig = ttk.LabelFrame(root, text="信件遠端觸發（從手機/任何信箱寄一封信來即可遠端觸發）",
+                              padding=8)
+        trig.pack(fill=tk.X, pady=(0, 8))
+        self.email_trigger_var = tk.BooleanVar(
+            value=self.cfg.get("email_trigger_enabled", False))
+        ttk.Checkbutton(trig, text="啟用信件觸發",
+                        variable=self.email_trigger_var
+                        ).grid(row=0, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Label(trig, text="觸發主旨關鍵字:").grid(
+            row=1, column=0, sticky="w", **pad)
+        self.email_trigger_kw_var = tk.StringVar(
+            value=self.cfg.get("email_trigger_subject_keyword",
+                               "[皮膚科會診觸發]"))
+        ttk.Entry(trig, textvariable=self.email_trigger_kw_var, width=30,
+                  font=("Consolas", 11)).grid(row=1, column=1, sticky="w", **pad)
+        ttk.Label(
+            trig,
+            text="用法：從任何信箱寄信到你 Outlook 接收的信箱，主旨含上方關鍵字 → 60 秒內自動觸發一次。",
+            foreground="#666", font=("Microsoft JhengHei UI", 9), wraplength=600,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", **pad)
+
         btns = ttk.Frame(root)
         btns.pack(fill=tk.X, pady=4)
         ttk.Button(btns, text="儲存設定",
@@ -967,6 +1262,9 @@ class ConfigApp(tk.Tk):
         cfg["weekend_times"] = [t.strip() for t in self.weekend_var.get().split(",")
                                 if t.strip()]
         cfg["enabled"] = self.enabled_var.get()
+        cfg["email_trigger_enabled"] = self.email_trigger_var.get()
+        cfg["email_trigger_subject_keyword"] = self.email_trigger_kw_var.get().strip() \
+            or DEFAULT_CONFIG["email_trigger_subject_keyword"]
         return cfg
 
     def _save_and_close(self) -> None:
@@ -1092,6 +1390,16 @@ def main() -> None:
         if "--configure" in args:
             ConfigApp().mainloop()
             return
+
+        # 第一次啟動：設定檔不存在 → 強制開設定視窗讓使用者填帳密／收件人；
+        # 設定視窗關閉後才繼續走常駐流程（這樣別人裝在他自己的電腦上就不會
+        # 用到預設帳密誤登入別人的身份）。
+        if not CONFIG_FILE.exists():
+            logging.info("首次啟動，未偵測到設定檔，先開啟設定視窗")
+            ConfigApp().mainloop()
+            if not CONFIG_FILE.exists():
+                logging.info("設定視窗關閉但未儲存任何設定，結束")
+                return
 
         first_instance = ensure_single_instance(MUTEX_NAME)
 
