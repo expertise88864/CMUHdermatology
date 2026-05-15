@@ -138,10 +138,11 @@ call :make_shortcut "中國醫皮膚科主程式" "!PYTHONW!" "!INSTALL_DIR!\中
 call :make_shortcut "中國醫皮膚科排班程式" "!PYTHONW!" "!INSTALL_DIR!\中國醫皮膚科排班程式.pyw"
 call :make_shortcut "中國醫皮膚科打卡程式" "!PYTHONW!" "!INSTALL_DIR!\中國醫皮膚科打卡程式.pyw"
 call :make_shortcut "中國醫皮膚科點座標偵測程式" "!PYTHONW!" "!INSTALL_DIR!\中國醫皮膚科點座標偵測程式.pyw"
+call :make_shortcut "中國醫皮膚科會診查詢程式" "!PYTHONW!" "!INSTALL_DIR!\中國醫皮膚科會診查詢程式.pyw"
 
 echo.
 echo ============================================================
-echo   安裝完成！桌面已建立 4 個捷徑
+echo   安裝完成！桌面已建立 5 個捷徑
 echo   每次啟動會自動檢查 GitHub 上的更新
 echo   手動更新：在 !INSTALL_DIR! 執行 pull_update.bat
 echo ============================================================

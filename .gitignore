@@ -28,6 +28,7 @@ _originals/
 .idea/
 .DS_Store
 Thumbs.db
+.claude/
 
 # === 其他 ===
 *.tmp

@@ -5730,6 +5730,13 @@ class AutomationApp:
         except FileNotFoundError: messagebox.showerror("啟動失敗", f"找不到座標偵測程式檔案: {script_name}\n\n請確認主程式與該程式在同一個資料夾中。"); logging.error(f"Coordinate detector script not found: {script_name}")
         except Exception as e: messagebox.showerror("啟動失敗", f"無法啟動座標偵測程式:\n{e}"); logging.error(f"Failed to launch coordinate detector program: {e}")
 
+    def _launch_consult_query_program(self):
+        # 帶 --run-now：首次啟動會常駐系統列並立刻跑一次；已常駐則通知它再跑一次
+        script_name = "中國醫皮膚科會診查詢程式.pyw"
+        try: logging.info(f"Launching consult query program: {script_name}"); subprocess.Popen([sys.executable, script_name, "--run-now"])
+        except FileNotFoundError: messagebox.showerror("啟動失敗", f"找不到會診查詢程式檔案: {script_name}\n\n請確認主程式與該程式在同一個資料夾中。"); logging.error(f"Consult query script not found: {script_name}")
+        except Exception as e: messagebox.showerror("啟動失敗", f"無法啟動會診查詢程式:\n{e}"); logging.error(f"Failed to launch consult query program: {e}")
+
     def _create_other_programs_tab(self, tools_tab):
         
         # --- 定義樣式 (Styles) ---
@@ -5755,7 +5762,8 @@ class AutomationApp:
         programs = [
             ("排班程式", self._launch_scheduler_program),
             ("打卡程式", self._launch_autoclock_program),
-            ("偵測點座標", self._launch_coordinate_detector_program)
+            ("偵測點座標", self._launch_coordinate_detector_program),
+            ("會診查詢", self._launch_consult_query_program)
         ]
 
         for idx, (name, cmd) in enumerate(programs):
