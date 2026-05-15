@@ -4172,9 +4172,10 @@ class AutomationApp:
         self.ui_font_scale_var = tk.DoubleVar(value=max(0.85, min(1.45, _ufs)))
         self.alert_chang_enabled = tk.BooleanVar(value=self.threshold_settings.get("alert_chang_enabled", True))
         self.alert_chen_enabled = tk.BooleanVar(value=self.threshold_settings.get("alert_chen_enabled", False))
-        # 止掛達門檻時要寄信通知的收件人（可多人，預設一位）
+        # 止掛達門檻時要寄信通知的收件人（可多人）
         self.alert_email_recipients = list(self.threshold_settings.get(
-            "alert_email_recipients", ["expertise88864@gmail.com"]))
+            "alert_email_recipients",
+            ["expertise88864@gmail.com", "mbpushowo@gmail.com"]))
         self.out_of_hospital_var = tk.BooleanVar(value=self.threshold_settings.get("out_of_hospital_mode", False))
         self.show_external_clinics = tk.BooleanVar(value=self.threshold_settings.get("show_external_clinics", True))
 
@@ -8429,20 +8430,21 @@ class AutomationApp:
                                                                 logging.info(f"[ALERT SUPPRESSED][DND] {doc_name} {session_name} count={count} threshold={full_threshold} {diff_text}")
                                                                 continue
                                                             def _notify_worker(nk=notify_key, m=msg, dn=doc_name, sn=session_name,
-                                                                                fth=full_threshold, cnt=count):
+                                                                                fth=full_threshold, cnt=count, lvl=notify_level):
                                                                 try:
                                                                     show_windows_notification("止掛提醒", m)
-                                                                    # 同步用 Outlook 寄信給設定的收件人（失敗只記 log 不影響原通知）
-                                                                    rcpts = list(self.alert_email_recipients)
-                                                                    if rcpts:
-                                                                        try:
-                                                                            today = date.today()
-                                                                            subj = (f"【止掛提醒】{dn} {sn}診 "
-                                                                                    f"({today.year}/{today.month}/{today.day}) "
-                                                                                    f"已達 {cnt}/{fth}")
-                                                                            _send_alert_email_via_outlook(subj, m, rcpts)
-                                                                        except Exception:
-                                                                            logging.warning("止掛提醒寄信例外", exc_info=True)
+                                                                    # 只在「第一次提醒」寄信（第二次加強提醒只跳 Windows 通知，避免一筆狀況收到兩封）
+                                                                    if lvl == 1:
+                                                                        rcpts = list(self.alert_email_recipients)
+                                                                        if rcpts:
+                                                                            try:
+                                                                                today = date.today()
+                                                                                subj = (f"【止掛提醒】{dn} {sn}診 "
+                                                                                        f"({today.year}/{today.month}/{today.day}) "
+                                                                                        f"已達 {cnt}/{fth}")
+                                                                                _send_alert_email_via_outlook(subj, m, rcpts)
+                                                                            except Exception:
+                                                                                logging.warning("止掛提醒寄信例外", exc_info=True)
                                                                 finally:
                                                                     with self._alert_state_lock:
                                                                         self._alert_popup_active[nk] = False

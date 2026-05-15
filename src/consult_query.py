@@ -395,9 +395,13 @@ def settext_safe(hwnd: int, text: str) -> None:
 def type_via_focus(edit_hwnd: int, top_hwnd: int, text: str) -> None:
     """讓 Delphi TEditExt 真正取得鍵盤焦點，再逐字 PostMessage WM_CHAR。
 
-    隱藏桌面上有時 SetForegroundWindow 沒立即生效、SetFocus 跟著失敗，造成
-    帳密實際沒打進去（登入失敗 → 等不到主畫面）。本版改成「SetForeground +
-    SetFocus + 驗證 GetFocus」最多重試 5 次，每次中間插 0.1 秒。"""
+    隱藏桌面上 SetForegroundWindow 經常失敗、SetFocus 跟著失敗 → 帳密沒打進去
+    → 登入失敗 → 等不到主畫面。本版採三層保險：
+      (1) PostMessage WM_LBUTTONDOWN/UP 給欄位 → Delphi 的 OnClick 會自動把
+          焦點搶到該欄位（不動真實滑鼠，因為是直接送訊息給控制項，不經過
+          系統 cursor）。對 Delphi 自訂編輯框最可靠。
+      (2) SetForegroundWindow + SetFocus 最多重試 5 次並驗證 GetFocus。
+      (3) WM_CHAR 逐字輸入。"""
     cur = ctypes.windll.kernel32.GetCurrentThreadId()
     tgt = win32process.GetWindowThreadProcessId(top_hwnd)[0]
     attached = False
@@ -408,6 +412,21 @@ def type_via_focus(edit_hwnd: int, top_hwnd: int, text: str) -> None:
         except Exception:
             pass
     try:
+        # (1) 模擬點擊欄位 → 讓 Delphi 自己把焦點搶過去（不動真實滑鼠）
+        try:
+            l, t_, r, b = win32gui.GetWindowRect(edit_hwnd)
+            cw = max(2, (r - l) // 2)
+            ch = max(2, (b - t_) // 2)
+            lparam = (ch << 16) | cw  # client 座標：點欄位中央
+            win32gui.PostMessage(edit_hwnd, win32con.WM_LBUTTONDOWN,
+                                 win32con.MK_LBUTTON, lparam)
+            time.sleep(0.03)
+            win32gui.PostMessage(edit_hwnd, win32con.WM_LBUTTONUP, 0, lparam)
+            time.sleep(0.08)
+        except Exception:
+            logging.debug("模擬點擊欄位失敗", exc_info=True)
+
+        # (2) 雙保險：再用 SetForeground + SetFocus 重試
         focus_ok = False
         for attempt in range(5):
             try:
@@ -419,7 +438,7 @@ def type_via_focus(edit_hwnd: int, top_hwnd: int, text: str) -> None:
                 win32gui.SetFocus(edit_hwnd)
             except Exception:
                 logging.debug("SetFocus attempt %d 失敗", attempt, exc_info=True)
-            time.sleep(0.1)
+            time.sleep(0.08)
             try:
                 if win32gui.GetFocus() == edit_hwnd:
                     focus_ok = True
@@ -427,8 +446,11 @@ def type_via_focus(edit_hwnd: int, top_hwnd: int, text: str) -> None:
             except Exception:
                 pass
         if not focus_ok:
-            logging.warning("無法把焦點設到目標欄位（hwnd=%s），仍嘗試輸入", edit_hwnd)
-        settext_safe(edit_hwnd, "")  # 先清空（待機重登畫面可能預填代碼）
+            logging.warning("GetFocus 未確認落在 hwnd=%s（仍嘗試輸入；模擬點擊可能已搶到焦點）",
+                            edit_hwnd)
+
+        # (3) 清空 + 逐字輸入
+        settext_safe(edit_hwnd, "")
         for ch in text:
             win32gui.PostMessage(edit_hwnd, win32con.WM_CHAR, ord(ch), 0)
             time.sleep(0.03)
