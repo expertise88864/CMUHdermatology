@@ -112,7 +112,12 @@ MUTEX_NAME = "Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1"
 DEFAULT_CONFIG = {
     "username": "101358",
     "password": "101aa358",
-    "recipients": ["expertise88864@gmail.com"],
+    "recipients": [
+        "expertise88864@gmail.com",
+        "chilly840724@gmail.com",
+        "wesjefflee1111@gmail.com",
+        "mbpushowo@gmail.com",
+    ],
     "weekday_times": ["12:30", "17:00"],  # 週一～週五
     "weekend_times": ["17:00"],           # 週六、週日
     "subject_template": "{date} {time} 皮膚科會診通知單",
@@ -978,14 +983,19 @@ def _outlook_available(timeout: float = 5.0) -> bool:
     return bool(result.get("ok"))
 
 
-def _check_outlook_trigger(keyword: str, timeout: float = 30.0) -> bool:
-    """掃描 Outlook 收件匣未讀郵件，主旨包含 keyword 的就標為已讀並回傳 True。
+def _check_outlook_trigger(keyword: str, timeout: float = 30.0) -> tuple:
+    """掃描 Outlook 收件匣未讀郵件，主旨包含 keyword 的就標為已讀。
+    回傳 (triggered, scanned, matched, inbox_path, samples, error)。
+
     給 email-triggered run 用：使用者從任何地方寄信到自己的 Outlook 信箱，主旨
-    含關鍵字即可遠端觸發本程式執行一次（院內擋外部連入，但 Outlook 抓信是
-    往外連，所以這條路走得通）。"""
+    含關鍵字即可遠端觸發本程式執行一次。
+
+    為了效率：用 DASL Restrict 直接在 MAPI 層篩「主旨 LIKE %keyword% 且未讀」，
+    對幾千封信的信箱比逐筆 iterate 快幾十倍。沒匹配時取最近 3 封未讀主旨當
+    診斷樣本（讓使用者看得到 Outlook 實際收到什麼）。"""
     if not keyword:
-        return False
-    result: dict = {}
+        return (False, 0, 0, "", [], "未設定關鍵字")
+    result: dict = {"samples": []}
 
     def w() -> None:
         import pythoncom
@@ -995,27 +1005,84 @@ def _check_outlook_trigger(keyword: str, timeout: float = 30.0) -> bool:
             ns = outlook.GetNamespace("MAPI")
             inbox = ns.GetDefaultFolder(6)  # olFolderInbox
             try:
-                unread = inbox.Items.Restrict("[Unread] = True")
+                result["inbox_path"] = f"{inbox.Parent.Name}\\{inbox.Name}"
             except Exception:
-                unread = inbox.Items
-            triggered = False
-            # 反向走訪：標已讀後 collection 會位移，由後往前較安全
-            for i in range(unread.Count, 0, -1):
+                result["inbox_path"] = "?"
+
+            kw_esc = keyword.replace("'", "''")
+            # DASL：主旨含 keyword 且未讀（MAPI 層篩，快）
+            dasl = (
+                f'@SQL="urn:schemas:httpmail:subject" LIKE \'%{kw_esc}%\' '
+                f'AND "urn:schemas:httpmail:read" = 0'
+            )
+            use_dasl = True
+            try:
+                items = inbox.Items.Restrict(dasl)
+                # 觸發一次 Count 確認 DASL 有效（無效會在這裡丟）
+                _ = items.Count
+            except Exception:
+                use_dasl = False
                 try:
-                    m = unread.Item(i)
-                    subj = m.Subject or ""
-                    if keyword in subj:
+                    items = inbox.Items.Restrict("[Unread] = True")
+                except Exception:
+                    items = inbox.Items
+
+            scanned = 0
+            matched = 0
+            try:
+                scanned = int(items.Count)
+            except Exception:
+                pass
+
+            if use_dasl:
+                # 預過濾後逐筆標已讀
+                for i in range(scanned, 0, -1):
+                    try:
+                        m = items.Item(i)
                         m.UnRead = False
                         try:
                             m.Save()
                         except Exception:
                             pass
-                        triggered = True
+                        matched += 1
+                    except Exception:
+                        pass
+            else:
+                # 後備：逐筆檢查 Subject（含關鍵字才標已讀）
+                for i in range(scanned, 0, -1):
+                    try:
+                        m = items.Item(i)
+                        subj = m.Subject or ""
+                        if keyword in subj:
+                            m.UnRead = False
+                            try:
+                                m.Save()
+                            except Exception:
+                                pass
+                            matched += 1
+                    except Exception:
+                        pass
+
+            # 若沒匹配，撈最近 3 封未讀的主旨當診斷樣本
+            if matched == 0:
+                try:
+                    unread = inbox.Items.Restrict("[Unread] = True")
+                    unread.Sort("[ReceivedTime]", True)  # 最新優先
+                    total = int(unread.Count)
+                    samples = []
+                    for i in range(1, min(4, total + 1)):
+                        try:
+                            samples.append((unread.Item(i).Subject or "")[:60])
+                        except Exception:
+                            pass
+                    result["samples"] = samples
                 except Exception:
                     pass
-            result["triggered"] = triggered
+
+            result["scanned"] = scanned
+            result["matched"] = matched
         except Exception as e:  # noqa: BLE001
-            result["error"] = e
+            result["error"] = str(e)
         finally:
             try:
                 pythoncom.CoUninitialize()
@@ -1026,21 +1093,45 @@ def _check_outlook_trigger(keyword: str, timeout: float = 30.0) -> bool:
     t.start()
     t.join(timeout)
     if t.is_alive():
-        logging.warning("Outlook 觸發信檢查逾時")
-        return False
-    if result.get("error"):
-        logging.debug("Outlook 觸發信檢查例外：%s", result["error"])
-        return False
-    return bool(result.get("triggered"))
+        return (False, 0, 0, "", [], "查詢逾時")
+    return (
+        result.get("matched", 0) > 0,
+        result.get("scanned", 0),
+        result.get("matched", 0),
+        result.get("inbox_path", "?"),
+        result.get("samples", []),
+        result.get("error"),
+    )
+
+
+def _connect_outlook():
+    """連到本機 Outlook：先試 GetActiveObject（接已開啟的最穩），失敗再試
+    DispatchEx（強制 CoCreateInstance）。各試三輪、每輪間 sleep 2 秒——
+    對應 com_error '伺服器執行失敗' / '操作無法使用' 等偶發狀況。"""
+    import win32com.client
+    last_err = None
+    for attempt in range(3):
+        try:
+            return win32com.client.GetActiveObject("Outlook.Application")
+        except Exception as e:
+            last_err = e
+        try:
+            return win32com.client.DispatchEx("Outlook.Application")
+        except Exception as e:
+            last_err = e
+        if attempt < 2:
+            time.sleep(2)
+    raise RuntimeError(
+        f"無法連到 Outlook：{last_err}\n"
+        "請手動開啟 Outlook 並確認它可正常收發信，然後再試一次。")
 
 
 def _outlook_send_worker(image_path, subject, body, recipients, result) -> None:
     """實際的 Outlook COM 寄信動作，在獨立執行緒執行（自己 CoInitialize）。"""
     import pythoncom
-    import win32com.client
     pythoncom.CoInitialize()
     try:
-        outlook = win32com.client.Dispatch("Outlook.Application")
+        outlook = _connect_outlook()
         mail = outlook.CreateItem(0)  # olMailItem
         mail.To = "; ".join(recipients)
         mail.Subject = subject
@@ -1197,8 +1288,20 @@ def scheduler_loop() -> None:
                     last_email_check = time.time()
                     kw = cfg.get("email_trigger_subject_keyword",
                                  DEFAULT_CONFIG["email_trigger_subject_keyword"])
-                    if _check_outlook_trigger(kw):
-                        logging.info("收到觸發信（主旨含 %r），立即執行", kw)
+                    triggered, scanned, matched, inbox_path, samples, err = \
+                        _check_outlook_trigger(kw)
+                    if err:
+                        logging.warning("檢查觸發信失敗: %s", err)
+                    else:
+                        logging.info(
+                            "檢查觸發信 [%s]：篩到 %s 封主旨含 %r",
+                            inbox_path, matched, kw)
+                        if matched == 0 and samples:
+                            logging.info(
+                                "（最近未讀主旨樣本，用來確認你的觸發信是否真的進收件匣）：%s",
+                                " | ".join(repr(s) for s in samples))
+                    if triggered:
+                        logging.info("收到觸發信，立即執行")
                         trigger_job_async("email")
         except Exception:
             logging.error("排程迴圈例外", exc_info=True)
