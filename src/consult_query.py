@@ -393,9 +393,11 @@ def settext_safe(hwnd: int, text: str) -> None:
 
 
 def type_via_focus(edit_hwnd: int, top_hwnd: int, text: str) -> None:
-    """在「視窗已是前景」的前提下輸入文字：AttachThreadInput + SetFocus
-    讓 Delphi TEditExt 真正取得鍵盤焦點，再逐字 PostMessage WM_CHAR。
-    全程不動滑鼠、不需視窗可見（視窗在螢幕外也行）。"""
+    """讓 Delphi TEditExt 真正取得鍵盤焦點，再逐字 PostMessage WM_CHAR。
+
+    隱藏桌面上有時 SetForegroundWindow 沒立即生效、SetFocus 跟著失敗，造成
+    帳密實際沒打進去（登入失敗 → 等不到主畫面）。本版改成「SetForeground +
+    SetFocus + 驗證 GetFocus」最多重試 5 次，每次中間插 0.1 秒。"""
     cur = ctypes.windll.kernel32.GetCurrentThreadId()
     tgt = win32process.GetWindowThreadProcessId(top_hwnd)[0]
     attached = False
@@ -406,10 +408,26 @@ def type_via_focus(edit_hwnd: int, top_hwnd: int, text: str) -> None:
         except Exception:
             pass
     try:
-        try:
-            win32gui.SetFocus(edit_hwnd)
-        except Exception:
-            logging.debug("SetFocus 失敗（視窗可能未在前景）", exc_info=True)
+        focus_ok = False
+        for attempt in range(5):
+            try:
+                win32gui.BringWindowToTop(top_hwnd)
+                win32gui.SetForegroundWindow(top_hwnd)
+            except Exception:
+                pass
+            try:
+                win32gui.SetFocus(edit_hwnd)
+            except Exception:
+                logging.debug("SetFocus attempt %d 失敗", attempt, exc_info=True)
+            time.sleep(0.1)
+            try:
+                if win32gui.GetFocus() == edit_hwnd:
+                    focus_ok = True
+                    break
+            except Exception:
+                pass
+        if not focus_ok:
+            logging.warning("無法把焦點設到目標欄位（hwnd=%s），仍嘗試輸入", edit_hwnd)
         settext_safe(edit_hwnd, "")  # 先清空（待機重登畫面可能預填代碼）
         for ch in text:
             win32gui.PostMessage(edit_hwnd, win32con.WM_CHAR, ord(ch), 0)
@@ -902,6 +920,42 @@ def _prune_old_shots() -> None:
 # =============================================================================
 # 寄信（Outlook COM）
 # =============================================================================
+def _outlook_available(timeout: float = 5.0) -> bool:
+    """快速檢查本機 Outlook 是否可用：能 GetActiveObject 或 DispatchEx 成功就回 True。
+    用於「多台電腦只有一台登入 Outlook」情境——沒 Outlook 的機就靜默跳過排程，
+    不再啟動 systemftp、不寄信、不跳任何提示。"""
+    result: dict = {}
+
+    def w() -> None:
+        import pythoncom
+        pythoncom.CoInitialize()
+        try:
+            import win32com.client
+            try:
+                win32com.client.GetActiveObject("Outlook.Application")
+                result["ok"] = True
+                return
+            except Exception:
+                pass
+            try:
+                win32com.client.DispatchEx("Outlook.Application")
+                result["ok"] = True
+            except Exception:
+                result["ok"] = False
+        finally:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=w, name="OutlookAvailCheck", daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return False
+    return bool(result.get("ok"))
+
+
 def _check_outlook_trigger(keyword: str, timeout: float = 30.0) -> bool:
     """掃描 Outlook 收件匣未讀郵件，主旨包含 keyword 的就標為已讀並回傳 True。
     給 email-triggered run 用：使用者從任何地方寄信到自己的 Outlook 信箱，主旨
@@ -1009,13 +1063,21 @@ def send_via_outlook(image_path: Path, subject: str, body: str,
 
 
 def _do_full_job(trigger_label: str) -> None:
-    """完整一次任務：跑流程 → 寄信。供排程／手動共用，整體互斥。"""
+    """完整一次任務：跑流程 → 寄信。供排程／手動共用，整體互斥。
+
+    多機共存策略：先檢查本機 Outlook 是否可用，不可用就直接靜默跳過——
+    省得多台電腦同時跑 systemftp 又同時嘗試寄信。全程不跳任何視窗提示
+    （成功與失敗都只記 log，不打擾使用者）。"""
     if not _flow_lock.acquire(blocking=False):
-        logging.warning("已有一個會診查詢任務進行中，本次（%s）略過", trigger_label)
+        logging.info("已有一個會診查詢任務進行中，本次（%s）略過", trigger_label)
         return
     import pythoncom
     pythoncom.CoInitialize()
     try:
+        if not _outlook_available():
+            logging.info("本機無可用 Outlook（多機部署：只有設定 Outlook 的那台會寄信），"
+                          "本次（%s）整個流程靜默跳過", trigger_label)
+            return
         cfg = load_config()
         now = datetime.now()
         date_str = f"{now.year}/{now.month}/{now.day}"
@@ -1027,20 +1089,9 @@ def _do_full_job(trigger_label: str) -> None:
             subject = cfg["subject_template"].format(date=date_str, time=time_str)
             body = cfg["body_template"].format(date=date_str, time=time_str)
             send_via_outlook(shot, subject, body, cfg["recipients"])
-            _notify("會診查詢完成", f"已寄出 {date_str} {time_str} 會診通知單")
         except Exception as e:
+            # 失敗只記 log；不跳通知、不寄失敗信（多機部署下會干擾）
             logging.error("會診查詢任務失敗：%s", e, exc_info=True)
-            _notify("會診查詢失敗", str(e))
-            # 盡量寄一封失敗通知信
-            try:
-                send_via_outlook(
-                    None,
-                    f"[失敗] {date_str} {time_str} 皮膚科會診通知單",
-                    f"自動會診查詢於 {date_str} {time_str} 執行失敗：\n{e}",
-                    cfg["recipients"],
-                )
-            except Exception:
-                logging.debug("寄送失敗通知信也失敗", exc_info=True)
     finally:
         try:
             pythoncom.CoUninitialize()
@@ -1339,7 +1390,10 @@ def _tray_configure(icon=None, item=None) -> None:
 
 
 def _send_test_email() -> None:
-    """只測 Outlook 寄信（不做擷取流程），用來確認收件人／Outlook 設定正常。"""
+    """只測 Outlook 寄信。本機無 Outlook 直接靜默跳過；成功失敗都不跳提示。"""
+    if not _outlook_available():
+        logging.info("本機無可用 Outlook，測試寄信靜默跳過")
+        return
     import pythoncom
     pythoncom.CoInitialize()
     try:
@@ -1352,10 +1406,8 @@ def _send_test_email() -> None:
             f"若收到此信，代表 Outlook 寄信與收件人設定正常。",
             cfg["recipients"],
         )
-        _notify("測試寄信完成", "已寄出測試信，請至收件匣確認")
     except Exception as e:
         logging.error("測試寄信失敗：%s", e, exc_info=True)
-        _notify("測試寄信失敗", str(e))
     finally:
         try:
             pythoncom.CoUninitialize()
@@ -1404,9 +1456,8 @@ def main() -> None:
         first_instance = ensure_single_instance(MUTEX_NAME)
 
         if not first_instance:
-            # 已有常駐實例
+            # 已有常駐實例：靜默處理（shell:startup 重開機都會撞到這裡，不能跳視窗）
             if "--run-now" in args:
-                # 通知常駐實例執行一次
                 try:
                     RUNNOW_FLAG.write_text(datetime.now().isoformat(),
                                            encoding="utf-8")
@@ -1414,9 +1465,7 @@ def main() -> None:
                 except Exception:
                     logging.error("寫入立即執行旗標失敗", exc_info=True)
             else:
-                ctypes.windll.user32.MessageBoxW(
-                    0, "會診查詢程式已在執行中（系統列圖示）。",
-                    "皮膚科會診查詢", 0x40 | 0x1000)
+                logging.info("會診查詢程式已在執行中（系統列），本次啟動靜默結束")
             sys.exit(0)
 
         logging.info("=== 會診查詢程式啟動 v%s ===", CURRENT_VERSION)

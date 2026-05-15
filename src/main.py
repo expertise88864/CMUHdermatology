@@ -5790,9 +5790,10 @@ class AutomationApp:
         except Exception as e: messagebox.showerror("啟動失敗", f"無法啟動座標偵測程式:\n{e}"); logging.error(f"Failed to launch coordinate detector program: {e}")
 
     def _launch_consult_query_program(self):
-        # 帶 --run-now：首次啟動會常駐系統列並立刻跑一次；已常駐則通知它再跑一次
+        # 只啟動常駐托盤（不帶 --run-now），讓使用者由托盤選單或排程觸發；
+        # 已啟動則靜默結束（不彈視窗）。需要立即執行可右鍵托盤「立即執行一次」。
         script_name = "中國醫皮膚科會診查詢程式.pyw"
-        try: logging.info(f"Launching consult query program: {script_name}"); subprocess.Popen([sys.executable, script_name, "--run-now"])
+        try: logging.info(f"Launching consult query program: {script_name}"); subprocess.Popen([sys.executable, script_name])
         except FileNotFoundError: messagebox.showerror("啟動失敗", f"找不到會診查詢程式檔案: {script_name}\n\n請確認主程式與該程式在同一個資料夾中。"); logging.error(f"Consult query script not found: {script_name}")
         except Exception as e: messagebox.showerror("啟動失敗", f"無法啟動會診查詢程式:\n{e}"); logging.error(f"Failed to launch consult query program: {e}")
 
@@ -8785,21 +8786,20 @@ class AutomationApp:
                 username = base64.b64decode(cred.get('u', '')).decode('utf-8')
                 password = base64.b64decode(cred.get('p', '')).decode('utf-8')
             else:
-                # 首次使用：提示使用者輸入並存檔
-                import tkinter.simpledialog as sd
-                username = sd.askstring("打卡帳號設定", "請輸入打卡帳號 (將加密儲存):", parent=self.root) or ""
-                password = sd.askstring("打卡密碼設定", "請輸入打卡密碼 (將加密儲存):", parent=self.root, show='*') or ""
-                if username and password:
-                    import base64
+                # 首次使用：直接寫入預設帳密（不再彈對話框打擾使用者）；
+                # 若要改別人的帳號，刪掉 settings/credentials.json 再啟動，或手動編輯。
+                import base64
+                username = "101358"
+                password = "101AA358"
+                try:
                     with open(cred_path, 'w', encoding='utf-8') as f:
                         json.dump({
                             'u': base64.b64encode(username.encode()).decode(),
                             'p': base64.b64encode(password.encode()).decode()
                         }, f)
-                    logging.info("打卡帳號已加密儲存至 credentials.json")
-                else:
-                    put_ui_message(self.ui_queue, UiClockStatusMessage(status_data={'error': '帳號未設定'}))
-                    return
+                    logging.info("已寫入預設打卡帳號（%s）到 credentials.json", username)
+                except Exception:
+                    logging.warning("寫入預設打卡帳號失敗", exc_info=True)
         except Exception as e:
             logging.error(f"讀取打卡帳號失敗: {e}")
             put_ui_message(self.ui_queue, UiClockStatusMessage(status_data={'error': '帳號讀取失敗'}))

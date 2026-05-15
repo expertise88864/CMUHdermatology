@@ -4031,9 +4031,10 @@ class AutomationApp:
         except Exception as e: messagebox.showerror("啟動失敗", f"無法啟動座標偵測程式:\n{e}"); logging.error(f"Failed to launch coordinate detector program: {e}")
 
     def _launch_consult_query_program(self):
-        # 帶 --run-now：首次啟動會常駐系統列並立刻跑一次；已常駐則通知它再跑一次
+        # 只啟動常駐托盤（不帶 --run-now），讓使用者由托盤選單或排程觸發；
+        # 已啟動則靜默結束（不彈視窗）。需要立即執行可右鍵托盤「立即執行一次」。
         script_name = "中國醫皮膚科會診查詢程式.pyw"
-        try: logging.info(f"Launching consult query program: {script_name}"); subprocess.Popen([sys.executable, script_name, "--run-now"])
+        try: logging.info(f"Launching consult query program: {script_name}"); subprocess.Popen([sys.executable, script_name])
         except FileNotFoundError: messagebox.showerror("啟動失敗", f"找不到會診查詢程式檔案: {script_name}\n\n請確認主程式與該程式在同一個資料夾中。"); logging.error(f"Consult query script not found: {script_name}")
         except Exception as e: messagebox.showerror("啟動失敗", f"無法啟動會診查詢程式:\n{e}"); logging.error(f"Failed to launch consult query program: {e}")
 
