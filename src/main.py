@@ -2619,6 +2619,128 @@ def _click_radio_by_text(parent_hwnd: int, text_keyword: str) -> bool:
     return _click_control_center(radio)
 
 
+# =============================================================================
+# F9/F10 Round 2 — popup 視窗 (Tfm_agree) 內操作
+# =============================================================================
+# Popup class = "Tfm_agree", title 含 "列印同意"
+# 結構（snapshot 2026-05-18）：
+#   3 個 TEdit 直系子（top-to-bottom 排序）：
+#     [0] 所患疾病     popup-rel y=53  (要清空)
+#     [1] 實施手術名稱  popup-rel y=109 (read-only，不動)
+#     [2] 手術原因     popup-rel y=170 (要清空)
+#   3 個 TGroupButton 在麻醉方式 group y=694 (popup-rel 526):
+#     leftmost  = 全麻
+#     middle    = 半麻
+#     rightmost = 局麻  (F9/F10 都要勾)
+#   popup 內 開立電子 TButton text="開立電子"
+#
+# Round 2 只做「清空 + 勾局麻」，不點 片語 也不按 開立電子（保留給 user 手動
+# 操作 + 後續 Round 3/4 加自動化）。
+
+
+def _enum_class_in_window(parent_hwnd: int, target_class: str) -> list:
+    """EnumChildWindows 抓全部 class=X 的子孫，按 (top, left) 排序。
+    回傳 list of (hwnd, rect_top, rect_left)。"""
+    out = []
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def cb(child, lparam):
+        try:
+            cls_buf = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(child, cls_buf, 64)
+            if cls_buf.value == target_class:
+                r = wintypes.RECT()
+                if ctypes.windll.user32.GetWindowRect(child, ctypes.byref(r)):
+                    out.append((child, r.top, r.left))
+        except Exception:
+            pass
+        return True
+
+    ctypes.windll.user32.EnumChildWindows(parent_hwnd, cb, 0)
+    out.sort(key=lambda x: (x[1], x[2]))
+    # 去重複（hwnd 可能在 EnumChildWindows 出現多次）
+    seen = set()
+    uniq = []
+    for h, t, l in out:
+        if h not in seen:
+            seen.add(h)
+            uniq.append((h, t, l))
+    return uniq
+
+
+def _clear_edit_text(edit_hwnd: int) -> bool:
+    """把 TEdit 內容設為空字串。用 WM_SETTEXT 空字串。
+
+    對 Delphi TEdit，Text property 讀取走 GetWindowText，所以 WM_SETTEXT 空
+    立刻反映在 Text 上，server 送單時拿到空字串。
+
+    比 「click + Ctrl+A + Delete」乾淨：不會動到 IME 跟焦點。"""
+    if not edit_hwnd:
+        return False
+    WM_SETTEXT = 0x000C
+    # SendMessage with empty string lParam
+    empty = ctypes.c_wchar_p("")
+    ctypes.windll.user32.SendMessageW(edit_hwnd, WM_SETTEXT, 0, empty)
+    return True
+
+
+def _f9_f10_round2_popup_actions(popup_hwnd: int, label: str = "") -> bool:
+    """popup 開啟後執行：清空 所患疾病 + 清空 手術原因 + 勾 局麻。
+
+    依 (top, left) 排序的 enumeration 找控制項位置，跟解析度無關。"""
+    edits = _enum_class_in_window(popup_hwnd, "TEdit")
+    logging.info("[%s] popup TEdit count=%d", label, len(edits))
+    if len(edits) < 3:
+        logging.warning("[%s] popup 找到 TEdit 不足 3 個 (預期 所患疾病/實施/手術原因)",
+                         label)
+        return False
+    # 由上到下：[0] 所患疾病, [1] 實施手術名稱, [2] 手術原因
+    edit_所患疾病 = edits[0][0]
+    edit_手術原因 = edits[2][0]
+    logging.info("[%s] 所患疾病 hwnd=%s, 手術原因 hwnd=%s", label,
+                  edit_所患疾病, edit_手術原因)
+
+    # 清空 所患疾病
+    _clear_edit_text(edit_所患疾病)
+    logging.info("[%s] 已清空 所患疾病", label)
+    # 清空 手術原因（即使已是空白，也保險再清一次）
+    _clear_edit_text(edit_手術原因)
+    logging.info("[%s] 已清空 手術原因", label)
+
+    # 找 麻醉方式 group 內 3 個 TGroupButton（在 popup 下半部 y > popup top + 400）
+    popup_r = wintypes.RECT()
+    ctypes.windll.user32.GetWindowRect(popup_hwnd, ctypes.byref(popup_r))
+    all_gb = _enum_class_in_window(popup_hwnd, "TGroupButton")
+    # 過濾 popup 下半部（麻醉 group 在 popup-rel y ≈ 526），排除頂部其他 group
+    bottom_half = [g for g in all_gb if (g[1] - popup_r.top) > 400]
+    # 排序：取 y 範圍接近的 3 個（同一 row）
+    if len(bottom_half) < 3:
+        logging.warning("[%s] popup 下半 TGroupButton 數不足 3 (麻醉 group)", label)
+        return False
+    # 找最右邊（局麻）— 同一 row（top 接近）中 left 最大的
+    first_row_top = bottom_half[0][1]
+    same_row = [g for g in bottom_half if abs(g[1] - first_row_top) <= 5]
+    same_row.sort(key=lambda g: g[2])  # 由左至右
+    if len(same_row) < 3:
+        # 退而求其次：取整批 bottom_half 最右邊
+        same_row = sorted(bottom_half, key=lambda g: g[2])
+    radio_局麻 = same_row[-1][0]  # 最右邊
+    logging.info("[%s] 局麻 radio hwnd=%s (左到右 row 共 %d 個)",
+                  label, radio_局麻, len(same_row))
+
+    # 勾 局麻 — 用 BM_CLICK 觸發 Delphi onClick (radio group 會自動 uncheck 其他)
+    BM_CLICK = 0x00F5
+    ctypes.windll.user32.SendMessageW(radio_局麻, BM_CLICK, 0, 0)
+    # 補：PostMessage click 作備援（某些 TGroupButton BM_CLICK 不一定觸發）
+    _post_click_to_control(radio_局麻)
+    logging.info("[%s] 已勾 局麻 (BM_CLICK + LBUTTON)", label)
+
+    return True
+
+
 def script_F9_F10_consent_form_adaptive(form_code: str, label: str = "") -> bool:
     """Round 1：從主程式 → 開同意書視窗 → 選 tab → 選 radio → 開立電子。
 
@@ -2663,11 +2785,24 @@ def script_F9_F10_consent_form_adaptive(form_code: str, label: str = "") -> bool
     time.sleep(0.2)
     check_stop()
 
-    # Step 5: 點 開立電子 按鈕
+    # Step 5: 點 同意書視窗的 開立電子 按鈕
     if not _click_button_by_text(or_hwnd, "開立電子"):
         logging.warning("[%s] 找不到 開立電子 按鈕", label)
         return False
-    logging.info("[%s] 已點 開立電子，等候 popup（Round 2+ 才會處理）", label)
+    logging.info("[%s] 已點 開立電子，等 popup 跳出", label)
+
+    # Step 6 (Round 2): 等 popup (Tfm_agree) 出現
+    popup = _wait_for_window("Tfm_agree", title_kw="列印同意", timeout=10)
+    if not popup:
+        logging.warning("[%s] 等不到 popup (Tfm_agree)", label)
+        return False
+    logging.info("[%s] popup hwnd=%s 已開啟", label, popup)
+    time.sleep(0.5)  # 等 popup paint 完成
+    check_stop()
+
+    # Step 7 (Round 2): 清空 2 個 edit + 勾 局麻
+    _f9_f10_round2_popup_actions(popup, label=label)
+    logging.info("[%s] Round 2 完成。Round 3+ 會做：點 片語/選項/帶回/開立電子/確認", label)
     return True
 
 
