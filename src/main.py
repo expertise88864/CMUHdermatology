@@ -2525,16 +2525,36 @@ def _find_page_control_by_tab_set(or_hwnd: int, expected_tabs: list) -> int:
     return 0
 
 
+def _send_message_timeout(hwnd: int, msg: int, wparam: int, lparam: int,
+                           timeout_ms: int = 2000) -> int:
+    """SendMessage with timeout — 防止對方視窗 hang 住卡死我們的 thread。
+    SMTO_ABORTIFHUNG=0x0002 | SMTO_NORMAL=0x0000."""
+    result = ctypes.c_long(0)
+    SMTO_ABORTIFHUNG = 0x0002
+    SendMessageTimeoutW = ctypes.windll.user32.SendMessageTimeoutW
+    ret = SendMessageTimeoutW(hwnd, msg, wparam, lparam,
+                                SMTO_ABORTIFHUNG, timeout_ms,
+                                ctypes.byref(result))
+    if ret == 0:
+        logging.debug("SendMessageTimeout 失敗或超時 hwnd=%s msg=0x%X", hwnd, msg)
+    return result.value
+
+
 def _switch_tab_by_text(or_hwnd: int, tab_text: str) -> bool:
     """切到指定 text 的 TTabSheet。
 
-    策略：
-      1. 找『有 手術/手術及治療/檢查 三個直系 tab』的 TPageControl（避開
-         nested 同名 TabSheet）
+    策略 (2026-05-18 修)：
+      1. 找『有 手術/手術及治療/檢查 三個直系 tab』的 TPageControl
       2. 算出目標 tab 的 index
-      3. 用 TCM_GETITEMRECT 拿到 tab header 的精確螢幕位置 → click
-         （TCM_SETCURFOCUS 對 Delphi TPageControl 不一定觸發切換，click 最穩）
-      4. 同時送 TCM_SETCURSEL + TCM_SETCURFOCUS 作 fallback
+      3. 【不用 TCM_GETITEMRECT】— 該訊息要求 RECT buffer 在目標行程位址
+         空間，cross-process SendMessage 會 hang 死。改用估算 client 位置
+         click：
+           tab 0 (手術)         client_x ≈ 30
+           tab 1 (手術及治療)    client_x ≈ 105
+           tab 2 (檢查)         client_x ≈ 195
+         tab header y ≈ 12（Delphi 預設 tab 高度 21）
+         位置算錯也沒關係——後面有 TCM_SETCURSEL+SETCURFOCUS 雙保險
+      4. 所有 SendMessage 都加 2 秒 timeout 避免再 hang
     """
     EXPECTED_TABS = ["手術", "手術及治療", "檢查"]
     pc = _find_page_control_by_tab_set(or_hwnd, EXPECTED_TABS)
@@ -2552,35 +2572,30 @@ def _switch_tab_by_text(or_hwnd: int, tab_text: str) -> bool:
         return False
     logging.info("_switch_tab: pc=%s target_idx=%d (tab=%s)", pc, target_idx, tab_text)
 
-    # Approach 1: TCM_GETITEMRECT → click tab header (最可靠)
-    TCM_GETITEMRECT = 0x130A
-    rect = wintypes.RECT()
-    if ctypes.windll.user32.SendMessageW(pc, TCM_GETITEMRECT, target_idx,
-                                          ctypes.byref(rect)):
-        # rect 是 PageControl client 座標
-        pt = wintypes.POINT()
-        pt.x = (rect.left + rect.right) // 2
-        pt.y = (rect.top + rect.bottom) // 2
-        # 轉螢幕座標
-        ctypes.windll.user32.ClientToScreen(pc, ctypes.byref(pt))
-        logging.info("_switch_tab: tab header rect (client) %s,%s-%s,%s → screen (%d,%d)",
-                      rect.left, rect.top, rect.right, rect.bottom, pt.x, pt.y)
-        # 暫存/還原滑鼠
-        saved = wintypes.POINT()
-        ctypes.windll.user32.GetCursorPos(ctypes.byref(saved))
-        hotkey_modules.pyautogui.click(pt.x, pt.y)
-        try:
-            ctypes.windll.user32.SetCursorPos(saved.x, saved.y)
-        except Exception:
-            pass
-    else:
-        logging.warning("_switch_tab: TCM_GETITEMRECT 失敗，僅送 message")
+    # Approach 1: click 估算的 tab header 位置（不用 GetItemRect 避免 cross-process hang）
+    # Delphi TPageControl 預設 tab 高度約 21px、tab 上 padding 4px → y=12 為中心
+    # 估算 client_x（基於常見中文 tab 寬度）：
+    est_x = {0: 30, 1: 105, 2: 195}.get(target_idx, 30 + target_idx * 75)
+    est_y = 12
+    pt = wintypes.POINT()
+    pt.x = est_x
+    pt.y = est_y
+    ctypes.windll.user32.ClientToScreen(pc, ctypes.byref(pt))
+    logging.info("_switch_tab: estimated tab header client=(%d,%d) → screen=(%d,%d)",
+                  est_x, est_y, pt.x, pt.y)
+    saved = wintypes.POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(saved))
+    hotkey_modules.pyautogui.click(pt.x, pt.y)
+    try:
+        ctypes.windll.user32.SetCursorPos(saved.x, saved.y)
+    except Exception:
+        pass
 
-    # Approach 2 (補強): TCM_SETCURSEL + TCM_SETCURFOCUS
+    # Approach 2 (雙保險): TCM_SETCURSEL + TCM_SETCURFOCUS，加 timeout
     TCM_SETCURSEL = 0x130C
     TCM_SETCURFOCUS = 0x1330
-    ctypes.windll.user32.SendMessageW(pc, TCM_SETCURSEL, target_idx, 0)
-    ctypes.windll.user32.SendMessageW(pc, TCM_SETCURFOCUS, target_idx, 0)
+    _send_message_timeout(pc, TCM_SETCURSEL, target_idx, 0, timeout_ms=1000)
+    _send_message_timeout(pc, TCM_SETCURFOCUS, target_idx, 0, timeout_ms=1000)
     return True
 
 
