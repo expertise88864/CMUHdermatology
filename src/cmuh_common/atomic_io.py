@@ -49,3 +49,31 @@ def atomic_write_text(file_path: str, content: str, encoding: str = 'utf-8') -> 
             except OSError:
                 logging.debug("移除 tmp 失敗", exc_info=True)
         return False
+
+
+def atomic_write_bytes(file_path: str, content: bytes) -> bool:
+    """二進位檔原子寫入（含 .bak 備份）。用於 .ico / .png 等資源檔的線上更新。
+
+    跟 atomic_write_text 一樣的 .bak + .tmp + os.replace 流程，差別是
+    open(..., 'wb') 寫 bytes 不做 encoding 處理。"""
+    import shutil
+
+    backup = file_path + '.bak'
+    tmp = file_path + '.tmp'
+    try:
+        if os.path.exists(file_path):
+            shutil.copy2(file_path, backup)
+        target_dir = os.path.dirname(file_path) or '.'
+        os.makedirs(target_dir, exist_ok=True)
+        with open(tmp, 'wb') as f:
+            f.write(content)
+        os.replace(tmp, file_path)
+        return True
+    except Exception as e:
+        logging.error("atomic_write_bytes 失敗 [%s]: %s", file_path, e)
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                logging.debug("移除 tmp 失敗", exc_info=True)
+        return False

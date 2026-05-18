@@ -16,17 +16,33 @@ SRC_DIR = REPO_ROOT / "src"
 MANIFEST = REPO_ROOT / "manifest.json"
 GITHUB = "https://github.com/expertise88864/CMUHdermatology"
 
+_BINARY_EXTS = {
+    ".ico", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
+    ".ttf", ".otf", ".pdf", ".exe", ".dll", ".zip", ".bin",
+}
+
+
+def is_binary_file(filename: str) -> bool:
+    import os
+    return os.path.splitext(filename.lower())[1] in _BINARY_EXTS
+
+
 def sha256_of(p: Path) -> str:
-    """計算檔案 SHA256（LF normalize）。
+    """計算檔案 SHA256。
+
+    text 檔（.py/.cmd/.ps1/.txt/.json…）：LF normalize 再 hash（因為 GitHub
+    raw 服務的是 LF，updater 端會把下載的內容當 text 處理）。
+    binary 檔（.ico/.png 等）：直接 hash raw bytes（updater 走 binary 路徑
+    不會做 LF normalize）。
 
     【重要】Windows git 預設 autocrlf=true，本機磁碟上是 CRLF，但 git 儲存與
     GitHub raw 服務的都是 LF。若直接 hash 磁碟 bytes，會與 updater 從 GitHub
     下載的 bytes 不符，導致 SHA256 校驗永遠失敗。
-    解法：讀 binary 後 normalize CRLF→LF 再 hash，與 GitHub raw 一致。
     """
     with p.open("rb") as f:
         content = f.read()
-    content = content.replace(b"\r\n", b"\n")
+    if not is_binary_file(p.name):
+        content = content.replace(b"\r\n", b"\n")
     return hashlib.sha256(content).hexdigest()
 
 # 入口檔的 key 對應（其餘子模組以路徑當 key）
@@ -49,24 +65,44 @@ def collect_entries(version: str) -> list:
             "version": version,
             "sha256": sha256_of(py),
         })
-    # [O34] 也把 repo root 的 hotkey_overrides.json 納入（多台電腦自動同步）
-    # 開機自動啟動相關腳本也納入，方便多台電腦同步取得最新版（layout 修正等）
-    extra_root_files = [
-        "hotkey_overrides.json",
+    # 自動同步到所有電腦的 extras：
+    # - .pyw 啟動 shim（萬一啟動邏輯改了，舊版會壞）
+    # - 開機自動啟動相關腳本
+    # - requirements.txt（pip 依賴清單）
+    # - assets 圖示（binary，updater 會自動走 binary 路徑）
+    # - hotkey_overrides.json（[O34] 多台電腦同步熱鍵覆寫）
+    extra_files = [
+        # 啟動 shim（5 個 .pyw）
+        "中國醫皮膚科主程式.pyw",
+        "中國醫皮膚科打卡程式.pyw",
+        "中國醫皮膚科排班程式.pyw",
+        "中國醫皮膚科會診查詢程式.pyw",
+        "中國醫皮膚科點座標偵測程式.pyw",
+        # 自動啟動排程相關
         "安裝開機自動啟動.cmd",
         "安裝開機自動啟動.ps1",
         "移除開機自動啟動.cmd",
         "移除開機自動啟動.ps1",
-        # 啟動會診查詢程式.cmd 已刪除（2026-05-18）：用途被 ONLOGON 排程
-        # cover，需要手動觸發時用 schtasks /Run /TN "CMUH皮膚科會診查詢自動啟動"
-        # 一行即可。
+        # 設定/資源檔
+        "hotkey_overrides.json",
+        "requirements.txt",
+        # 圖示 (binary — updater 會走 atomic_write_bytes)
+        "assets/cmuh_app.ico",
+        "assets/AutoClockIcon.png",
+        "assets/cmuh_icon_version.txt",
     ]
-    for fn in extra_root_files:
+    for fn in extra_files:
         p = REPO_ROOT / fn
         if p.is_file():
-            key = (fn.replace(".json", "")
+            # key：dot/slash 改底線，特殊副檔名加後綴避免衝突
+            key = (fn.replace("/", "_")
+                     .replace(".json", "")
                      .replace(".cmd", "_cmd")
                      .replace(".ps1", "_ps1")
+                     .replace(".pyw", "_pyw")
+                     .replace(".txt", "_txt")
+                     .replace(".ico", "_ico")
+                     .replace(".png", "_png")
                      .replace(".", "_"))
             entries.append({
                 "key": key,
