@@ -24,20 +24,9 @@ from typing import Callable, Optional
 
 import requests
 
-from cmuh_common.atomic_io import atomic_write_bytes, atomic_write_text
+from cmuh_common.atomic_io import atomic_write_text
 from cmuh_common.paths import get_app_dir, is_frozen, restart_self
 from cmuh_common.version import CURRENT_VERSION, parse_version
-
-# 二進位副檔名（這些檔走 binary 路徑：resp.content + atomic_write_bytes，
-# SHA256 直接 hash raw bytes 不做 LF normalize）。其餘走 text 路徑。
-_BINARY_EXTS = {
-    ".ico", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
-    ".ttf", ".otf", ".pdf", ".exe", ".dll", ".zip", ".bin",
-}
-
-
-def _is_binary_file(filename: str) -> bool:
-    return os.path.splitext(filename.lower())[1] in _BINARY_EXTS
 
 # === GitHub repo 設定 ===
 GITHUB_OWNER = "expertise88864"
@@ -89,17 +78,12 @@ def _sha256_text(content: str) -> str:
     return hashlib.sha256(content.encode('utf-8')).hexdigest()
 
 
-def _sha256_local_file(local_path: str, is_binary: bool = False) -> str:
-    """計算本地檔 SHA256（與 sync_manifest 一致的演算法）。
-
-    text 檔：先 CRLF → LF normalize 再 hash（因為 GitHub raw 服務的是 LF）
-    binary 檔：直接 hash raw bytes
-    """
+def _sha256_local_file(local_path: str) -> str:
+    """計算本地檔 SHA256（與 sync_manifest 一致的 LF normalize 演算法）。"""
     try:
         with open(local_path, 'rb') as f:
             content = f.read()
-        if not is_binary:
-            content = content.replace(b'\r\n', b'\n')
+        content = content.replace(b'\r\n', b'\n')
         return hashlib.sha256(content).hexdigest()
     except Exception:
         return ""
@@ -119,20 +103,19 @@ def _download_one(file_entry: dict, app_dir: str) -> Optional[tuple]:
     local_filename = file_entry["local_filename"]
     expected_version = file_entry.get("version", "0.0.0")
     expected_sha = (file_entry.get("sha256") or "").lower().strip()
-    is_binary = _is_binary_file(local_filename)
 
     local_path = os.path.join(app_dir, local_filename)
 
     # [O1] SHA256 短路：本地內容已是 manifest 期望版 → 直接跳過（最常見路徑）
     if expected_sha and os.path.exists(local_path):
-        local_sha = _sha256_local_file(local_path, is_binary=is_binary)
+        local_sha = _sha256_local_file(local_path)
         if local_sha == expected_sha:
             return None
 
-    local_ver = _read_local_version(local_path) if not is_binary else "0.0.0"
+    local_ver = _read_local_version(local_path)
 
     # 版本比對（仍保留作為次要判斷；若本地檔含 CURRENT_VERSION 字樣才有意義）
-    if not is_binary and parse_version(local_ver) >= parse_version(expected_version):
+    if parse_version(local_ver) >= parse_version(expected_version):
         # 此分支：本地版本足夠新，但 hash 不符（可能行尾差異或檔案被改過）→ 仍重下載
         if expected_sha and os.path.exists(local_path):
             logging.info("  [%s] 版本 v%s 已新但 SHA256 不符，重新下載", key, local_ver)
@@ -140,38 +123,28 @@ def _download_one(file_entry: dict, app_dir: str) -> Optional[tuple]:
             return None
 
     url = f"{RAW_BASE}/{remote_path}?t={int(time.time())}"
-    logging.info("  [%s] 偵測到新版（v%s -> v%s, %s），下載中...",
-                  key, local_ver, expected_version,
-                  "binary" if is_binary else "text")
+    logging.info("  [%s] 偵測到新版（v%s -> v%s），下載中...", key, local_ver, expected_version)
 
     resp = requests.get(url, timeout=UPDATE_TIMEOUT)
     resp.raise_for_status()
+    resp.encoding = 'utf-8'
+    content = resp.text
 
-    if is_binary:
-        content = resp.content  # bytes，不做 encoding
-        if expected_sha:
-            actual_sha = hashlib.sha256(content).hexdigest()
-            if actual_sha != expected_sha:
-                raise ValueError(
-                    f"[{key}] SHA256 不符（預期 {expected_sha[:12]}.. 實際 {actual_sha[:12]}..）")
-        actual_version = expected_version
+    # SHA256 校驗（manifest 有指定才驗）
+    if expected_sha:
+        actual_sha = _sha256_text(content)
+        if actual_sha != expected_sha:
+            raise ValueError(f"[{key}] SHA256 不符（預期 {expected_sha[:12]}.. 實際 {actual_sha[:12]}..）")
+
+    # 雙重驗證：檔案內 CURRENT_VERSION 必須符合 manifest（避免 raw cache 拿到舊版）
+    m = re.search(r'CURRENT_VERSION\s*=\s*["\']([\d.]+)["\']', content)
+    if m:
+        actual_version = m.group(1)
+        if parse_version(actual_version) <= parse_version(local_ver):
+            logging.info("  [%s] 下載內容版本 v%s 並未較新，跳過", key, actual_version)
+            return None
     else:
-        resp.encoding = 'utf-8'
-        content = resp.text  # str
-        if expected_sha:
-            actual_sha = _sha256_text(content)
-            if actual_sha != expected_sha:
-                raise ValueError(
-                    f"[{key}] SHA256 不符（預期 {expected_sha[:12]}.. 實際 {actual_sha[:12]}..）")
-        # 雙重驗證：檔案內 CURRENT_VERSION 必須符合 manifest（避免 raw cache 拿到舊版）
-        m = re.search(r'CURRENT_VERSION\s*=\s*["\']([\d.]+)["\']', content)
-        if m:
-            actual_version = m.group(1)
-            if parse_version(actual_version) <= parse_version(local_ver):
-                logging.info("  [%s] 下載內容版本 v%s 並未較新，跳過", key, actual_version)
-                return None
-        else:
-            actual_version = expected_version  # 子模組可能沒有頂層宣告，採 manifest 版本
+        actual_version = expected_version  # 子模組可能沒有頂層宣告，採 manifest 版本
 
     return (key, local_filename, actual_version, content)
 
@@ -260,12 +233,7 @@ def check_and_update(
     written_paths = []
     for key, local_filename, new_ver, content in pending_writes:
         target_path = os.path.join(app_dir, local_filename)
-        # 依檔案類型挑寫法：binary 走 atomic_write_bytes、text 走 atomic_write_text
-        if _is_binary_file(local_filename):
-            ok = atomic_write_bytes(target_path, content)
-        else:
-            ok = atomic_write_text(target_path, content)
-        if ok:
+        if atomic_write_text(target_path, content):
             result.updated_files.append((local_filename, new_ver))
             written_paths.append(target_path)
             logging.info("  ✅ 已更新 %s -> v%s", local_filename, new_ver)

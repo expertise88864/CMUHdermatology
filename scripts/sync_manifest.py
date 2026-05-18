@@ -16,33 +16,21 @@ SRC_DIR = REPO_ROOT / "src"
 MANIFEST = REPO_ROOT / "manifest.json"
 GITHUB = "https://github.com/expertise88864/CMUHdermatology"
 
-_BINARY_EXTS = {
-    ".ico", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
-    ".ttf", ".otf", ".pdf", ".exe", ".dll", ".zip", ".bin",
-}
-
-
-def is_binary_file(filename: str) -> bool:
-    import os
-    return os.path.splitext(filename.lower())[1] in _BINARY_EXTS
-
-
 def sha256_of(p: Path) -> str:
-    """計算檔案 SHA256。
-
-    text 檔（.py/.cmd/.ps1/.txt/.json…）：LF normalize 再 hash（因為 GitHub
-    raw 服務的是 LF，updater 端會把下載的內容當 text 處理）。
-    binary 檔（.ico/.png 等）：直接 hash raw bytes（updater 走 binary 路徑
-    不會做 LF normalize）。
+    """計算檔案 SHA256（LF normalize）。
 
     【重要】Windows git 預設 autocrlf=true，本機磁碟上是 CRLF，但 git 儲存與
     GitHub raw 服務的都是 LF。若直接 hash 磁碟 bytes，會與 updater 從 GitHub
     下載的 bytes 不符，導致 SHA256 校驗永遠失敗。
+    解法：讀 binary 後 normalize CRLF→LF 再 hash，與 GitHub raw 一致。
+
+    【註】2026-05-18：取消 binary 檔（.ico/.png）的 manifest 涵蓋。圖示等
+    binary 資源很少改、且 updater 走純 text 路徑（resp.text）會 UTF-8
+    decode 失敗。要更新圖示請手動 git pull。
     """
     with p.open("rb") as f:
         content = f.read()
-    if not is_binary_file(p.name):
-        content = content.replace(b"\r\n", b"\n")
+    content = content.replace(b"\r\n", b"\n")
     return hashlib.sha256(content).hexdigest()
 
 # 入口檔的 key 對應（其餘子模組以路徑當 key）
@@ -71,6 +59,8 @@ def collect_entries(version: str) -> list:
     # - requirements.txt（pip 依賴清單）
     # - assets 圖示（binary，updater 會自動走 binary 路徑）
     # - hotkey_overrides.json（[O34] 多台電腦同步熱鍵覆寫）
+    # 只列「純文字」可被 updater 處理的檔案。binary 圖示 (.ico/.png) 不放這
+    # 裡（updater 走 text 路徑會 UTF-8 decode 失敗）。
     extra_files = [
         # 啟動 shim（5 個 .pyw）
         "中國醫皮膚科主程式.pyw",
@@ -86,10 +76,6 @@ def collect_entries(version: str) -> list:
         # 設定/資源檔
         "hotkey_overrides.json",
         "requirements.txt",
-        # 圖示 (binary — updater 會走 atomic_write_bytes)
-        "assets/cmuh_app.ico",
-        "assets/AutoClockIcon.png",
-        "assets/cmuh_icon_version.txt",
     ]
     for fn in extra_files:
         p = REPO_ROOT / fn
@@ -101,8 +87,6 @@ def collect_entries(version: str) -> list:
                      .replace(".ps1", "_ps1")
                      .replace(".pyw", "_pyw")
                      .replace(".txt", "_txt")
-                     .replace(".ico", "_ico")
-                     .replace(".png", "_png")
                      .replace(".", "_"))
             entries.append({
                 "key": key,
