@@ -78,6 +78,7 @@ from tkinter import messagebox, scrolledtext, ttk
 # [開機前導] 自動依賴安裝與進度條介面 (Dependency Installer UI)
 # =============================================================================
 import ctypes
+from ctypes import wintypes
 import json
 import logging
 import random
@@ -2053,6 +2054,142 @@ def script_F4_1280x1024():
     _runner_1280.last_action_time = time.time()
     logging.info("F4 (1280x1024): Steps completed.")
 
+# =============================================================================
+# 解析度無關熱鍵 (adaptive) — 不依賴座標，直接 Win32 SendMessage 觸發選單
+# =============================================================================
+# 設計：主程式 (TFopdmain) 在任何解析度／DPI 下，「醫令」選單第三段的 menu
+# command ID 都是 215=類別字首 / 217=代碼字首 / 218=代碼輸入 / 219=名稱輸入
+# / ... 連續 ID。透過 SendMessage(WM_COMMAND, 218) 就能觸發代碼輸入，焦點
+# 自動跳到醫令代碼欄；之後用 pyautogui 模擬鍵盤打代碼 + Enter。
+#
+# 對比舊版 (script_F3_1920x1080 / 1280x1024 / 1024x768)：
+#   舊版 = pyautogui.click(x, y) 點選單 + 點代碼輸入 — 三個解析度三份 code
+#   adaptive = Win32 SendMessage — 一份 code 跨所有解析度
+#
+# 需要本程式以 admin 執行（UIPI 限制：非 admin 無法對 admin TFopdmain 送
+# WM_COMMAND）。主程式本來就 admin，所以 OK。
+
+_HOSPITAL_WIN_CLASS = "TFopdmain"
+_HOSPITAL_WIN_TITLE_KW = "西醫門診醫師作業"
+
+# 醫令 子選單 command ID (probe + user 確認 2026-05-18)
+MENU_ID_類別字首 = 215
+MENU_ID_代碼字首 = 217
+MENU_ID_代碼輸入 = 218
+MENU_ID_名稱輸入 = 219
+
+
+def _find_hospital_main_window() -> int:
+    """找主程式視窗 (class=TFopdmain, title 含「西醫門診醫師作業」)。
+    回傳 hwnd；找不到回 0。"""
+    found = [0]
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def cb(hwnd, lparam):
+        try:
+            if not ctypes.windll.user32.IsWindowVisible(hwnd):
+                return True
+            cls_buf = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(hwnd, cls_buf, 64)
+            if cls_buf.value != _HOSPITAL_WIN_CLASS:
+                return True
+            n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+            if n > 0:
+                t_buf = ctypes.create_unicode_buffer(n + 1)
+                ctypes.windll.user32.GetWindowTextW(hwnd, t_buf, n + 1)
+                if _HOSPITAL_WIN_TITLE_KW in t_buf.value:
+                    found[0] = hwnd
+                    return False  # 停止枚舉
+        except Exception:
+            pass
+        return True
+
+    ctypes.windll.user32.EnumWindows(cb, 0)
+    return found[0]
+
+
+def _send_yiling_menu_command(hwnd: int, menu_id: int) -> None:
+    """對主程式視窗送 WM_COMMAND 觸發「醫令」子選單項目。
+
+    用 SendMessage (同步) 而非 PostMessage — Delphi VCL action 派發需要等
+    handler 回應才完成。HIWORD(wParam)=0 表示來源是 menu (不是 accelerator
+    或 control)。"""
+    WM_COMMAND = 0x0111
+    ctypes.windll.user32.SendMessageW(hwnd, WM_COMMAND, menu_id, 0)
+
+
+def _ensure_hospital_foreground(hwnd: int) -> None:
+    """確保主程式視窗在前景，這樣後續 pyautogui.typewrite 才會打進去。
+    SetForegroundWindow 在 admin 行程通常能成功。"""
+    try:
+        # 若已 minimize 先還原
+        SW_RESTORE = 9
+        if ctypes.windll.user32.IsIconic(hwnd):
+            ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
+    except Exception:
+        logging.debug("_ensure_hospital_foreground 失敗", exc_info=True)
+
+
+def _script_code_input_adaptive(code: str, label: str = "") -> bool:
+    """共通流程：找視窗 → SendMessage 觸發代碼輸入 → 等焦點 → 打代碼 → Enter。
+
+    回傳 True 表示流程跑完；False 表示找不到主程式視窗。"""
+    hwnd = _find_hospital_main_window()
+    if not hwnd:
+        logging.warning("[%s adaptive] 找不到主程式視窗 (class=%s, title 含 %s)",
+                        label or "code-input", _HOSPITAL_WIN_CLASS,
+                        _HOSPITAL_WIN_TITLE_KW)
+        return False
+    _ensure_hospital_foreground(hwnd)
+    time.sleep(0.05)
+    _send_yiling_menu_command(hwnd, MENU_ID_代碼輸入)
+    # 等焦點移到醫令代碼欄
+    time.sleep(0.15)
+    check_stop()
+    # 打代碼 — 焦點此時在 grid 內的 inplace edit，pyautogui 直接送到前景視窗
+    hotkey_modules.pyautogui.typewrite(code, interval=0.02)
+    time.sleep(0.05)
+    check_stop()
+    hotkey_modules.pyautogui.press("enter")
+    return True
+
+
+def script_F3_adaptive():
+    """F3 (解析度無關)：醫令 → 代碼輸入 → 51017 (冷凍) → Enter。"""
+    if _maybe_run_override('adaptive', 'F3'): return
+    logging.info("--- Executing F3 (adaptive / Win32) ---")
+    ok = _script_code_input_adaptive("51017", label="F3")
+    logging.info("F3 (adaptive): %s", "done" if ok else "skipped (no hospital window)")
+
+
+def script_F4_adaptive():
+    """F4 (解析度無關)：醫令 → 代碼輸入 → 51019 (照光) → Enter → 數量「1」。
+
+    舊版有額外的 click 數量欄 + type "1" 步驟。adaptive 版先做 51019+Enter，
+    然後直接 typewrite("1")——如果 Delphi grid 在 Enter 後焦點自動跳到下一
+    欄（常見行為），直接打 "1" 就會填到數量欄。若 Delphi 沒自動跳，需要先
+    送 Tab 鍵：把下面那行的註解打開即可。"""
+    if _maybe_run_override('adaptive', 'F4'): return
+    logging.info("--- Executing F4 (adaptive / Win32) ---")
+    ok = _script_code_input_adaptive("51019", label="F4")
+    if not ok:
+        logging.info("F4 (adaptive): skipped")
+        return
+    time.sleep(0.1)
+    check_stop()
+    # 若 Enter 後焦點沒自動跳到數量欄，改成 send Tab：
+    # hotkey_modules.pyautogui.press("tab")
+    # time.sleep(0.05)
+    hotkey_modules.pyautogui.typewrite("1")
+    if hasattr(_runner_1280, "last_action_time"):
+        _runner_1280.last_action_time = time.time()
+    logging.info("F4 (adaptive): done")
+
+
 def _get_ime_focus_hwnd():
     """取得前景應用程式真正有焦點的控制項 handle（需 AttachThreadInput）。"""
     try:
@@ -3828,26 +3965,30 @@ def _canonical_clinic_session_str(s) -> str:
 
 
 def _hotkey_builtin_map_for_profile(profile: str) -> dict:
-    """profile → 熱鍵鍵名 → 內建函式（覆寫載入失敗時回退）。"""
+    """profile → 熱鍵鍵名 → 內建函式（覆寫載入失敗時回退）。
+
+    F3 / F4 已改為 adaptive (Win32 SendMessage)，跨解析度共用一份程式碼，
+    不再依賴座標。舊的 per-resolution F3/F4 函式保留但已不被 dispatch 引用，
+    待 F9-F11 也改完後可清理。"""
     if profile == "1920x1080":
         return {
-            "F3": script_F3_1920x1080,
-            "F4": script_F4_1920x1080,
+            "F3": script_F3_adaptive,
+            "F4": script_F4_adaptive,
             "F10": script_F10_1920x1080,
             "F11": script_F11_1920x1080,
         }
     if profile == "1280x1024":
         return {
-            "F3": script_F3_1280x1024,
-            "F4": script_F4_1280x1024,
+            "F3": script_F3_adaptive,
+            "F4": script_F4_adaptive,
             "F9": script_F9_1280x1024,
             "F10": script_F10_1280x1024,
             "F11": script_F11_1280x1024,
         }
     if profile == "1024x768":
         return {
-            "F3": script_F3_1024x768,
-            "F4": script_F4_1024x768,
+            "F3": script_F3_adaptive,
+            "F4": script_F4_adaptive,
             "F9": script_F9_1024x768,
             "F10": script_F10_1024x768,
             "F11": script_F11_1024x768,
@@ -9079,16 +9220,17 @@ class AutomationApp:
             hotkey_info_text = ""
             if profile == '1920x1080':
                 hotkeys_to_register = {
-                    'F3': (script_F3_1920x1080, "F3: 冷凍 (1920x1080)"),
-                    'F4': (script_F4_1920x1080, "F4: 照光 (1920x1080)"),
+                    # F3/F4 改用 adaptive (Win32 SendMessage)，跨解析度共用
+                    'F3': (script_F3_adaptive, "F3: 冷凍 51017 (Win32)"),
+                    'F4': (script_F4_adaptive, "F4: 照光 51019 (Win32)"),
                     'F10': (script_F10_1920x1080, "F10: 皮膚切片同意書 (1920x1080)"),
                     'F11': (script_F11_1920x1080, "F11: 快速完成 (1920x1080)")
                 }
                 hotkey_info_text = "F3:冷凍 F4:照光 F10:切片同意書\nF11:快速完成 F12:終止"
             elif profile == '1280x1024':
                 hotkeys_to_register = {
-                    'F3': (script_F3_1280x1024, "F3: 51017 (1280x1024)"),
-                    'F4': (script_F4_1280x1024, "F4: 51019 (1280x1024)"),
+                    'F3': (script_F3_adaptive, "F3: 51017 (Win32)"),
+                    'F4': (script_F4_adaptive, "F4: 51019 (Win32)"),
                     'F9': (script_F9_1280x1024, "F9: 腫瘤同意書 (1280x1024)"),
                     'F10': (script_F10_1280x1024, "F10: 切片同意書 (1280x1024)"),
                     'F11': (script_F11_1280x1024, "F11: 快速完成 (1280x1024)")
@@ -9096,8 +9238,8 @@ class AutomationApp:
                 hotkey_info_text = "F3:51017 F4:51019 F9:腫瘤 F10:切片\nF11:快速完成 F12:終止"
             elif profile == '1024x768':
                 hotkeys_to_register = {
-                    'F3': (script_F3_1024x768, "F3: 冷凍51017"),
-                    'F4': (script_F4_1024x768, "F4: 照光"),
+                    'F3': (script_F3_adaptive, "F3: 冷凍 51017 (Win32)"),
+                    'F4': (script_F4_adaptive, "F4: 照光 51019 (Win32)"),
                     'F9': (script_F9_1024x768, "F9: 皮膚腫瘤同意書"),
                     'F10': (script_F10_1024x768, "F10: 皮膚切片同意書"),
                     'F11': (script_F11_1024x768, "F11: 快速完成")
