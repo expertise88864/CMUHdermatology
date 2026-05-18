@@ -2486,6 +2486,85 @@ def _click_button_by_text(parent_hwnd: int, text: str) -> bool:
     return _post_click_to_control(btn)
 
 
+# =============================================================================
+# F9/F10 Round 4 — popup 開立電子 + 警告對話框 (是)
+# =============================================================================
+# snapshot (settings/snapshot_20260518_130851.txt) 證實確認對話框是標準
+# Windows MessageBox：
+#   class = "#32770" (Windows DialogBoxClass)
+#   title = "警告"
+#   children = 3:
+#     Button "是(&Y)" hwnd=??? at (571, 547) ← 要按這個
+#     Button "否(&N)" hwnd=??? at (669, 547)
+#     Static  "確定沒有病人問題答覆..." at (523, 495)
+#
+# 對 #32770 標準對話框，PostMessage WM_COMMAND IDYES (=6) 等同按下「是」。
+# 比找 Button hwnd 再 click 更乾淨。
+
+IDYES = 6
+IDOK = 1
+IDCANCEL = 2
+
+
+def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
+    """點 popup 內 開立電子 → 等警告對話框 → 點 是 → 等對話框關。
+
+    若另跳「未滿 18」對話框（同樣是 #32770 但 title 可能不同），也按 是/確定。
+    若沒跳對話框（罕見情況），靜默繼續。"""
+    # Step A: 點 popup 內的 開立電子 button (async)
+    if not _click_button_by_text(popup_hwnd, "開立電子"):
+        logging.warning("[%s] popup 找不到 開立電子 button", label)
+        return False
+    logging.info("[%s] 已點 popup 開立電子，等警告對話框", label)
+
+    # Step B: 等警告對話框出現 (class #32770)
+    # title 可能是 "警告" 或其他變體，用 class 即可
+    dlg = _wait_for_window("#32770", title_kw="", timeout=10,
+                            exclude_hwnd=popup_hwnd)
+    if not dlg:
+        logging.info("[%s] 沒等到警告對話框 (可能直接送出)", label)
+        return True
+    logging.info("[%s] 警告對話框 hwnd=%s", label, dlg)
+    time.sleep(0.3)
+    check_stop()
+
+    # Step C: 對對話框 PostMessage WM_COMMAND IDYES
+    # 也可以 _post_click_to_control 找 "是(&Y)" button，但對標準 #32770
+    # 對話框 WM_COMMAND IDYES 是最乾淨的方式。
+    WM_COMMAND = 0x0111
+    ctypes.windll.user32.PostMessageW(dlg, WM_COMMAND, IDYES, 0)
+    logging.info("[%s] 已 PostMessage WM_COMMAND IDYES (=是) 給對話框", label)
+
+    # 等對話框關
+    end_t = time.time() + 5
+    while time.time() < end_t:
+        if not ctypes.windll.user32.IsWindow(dlg):
+            break
+        time.sleep(0.1)
+        check_stop()
+    logging.info("[%s] 警告對話框已關", label)
+
+    # Step D: 等等看是否還有「未滿 18」之類的後續對話框
+    # 給 2 秒讓 Delphi 進入下個 prompt（若有）
+    time.sleep(1.0)
+    check_stop()
+    dlg2 = _find_window_by_class_title("#32770", "", exclude_hwnd=popup_hwnd)
+    if dlg2:
+        logging.info("[%s] 偵測到第二個對話框 hwnd=%s (可能是未滿 18)", label, dlg2)
+        # 同樣送 IDYES（IDOK=1 也試）
+        ctypes.windll.user32.PostMessageW(dlg2, WM_COMMAND, IDYES, 0)
+        time.sleep(0.2)
+        # IDOK 備援（某些對話框「確定」是 IDOK 不是 IDYES）
+        ctypes.windll.user32.PostMessageW(dlg2, WM_COMMAND, IDOK, 0)
+        end_t = time.time() + 5
+        while time.time() < end_t:
+            if not ctypes.windll.user32.IsWindow(dlg2):
+                break
+            time.sleep(0.1)
+        logging.info("[%s] 第二個對話框處理完", label)
+    return True
+
+
 def _enum_direct_children(parent_hwnd: int,
                            target_class: str = "") -> list:
     """列出 parent_hwnd 的直系子視窗（不遞迴）；可選 class 過濾。"""
@@ -2719,6 +2798,43 @@ def _select_phrase_and_return(片語_btn_hwnd: int, row_idx: int,
     return True  # 還是回 True 讓主流程繼續
 
 
+def _find_descendants_by_exact_text(parent_hwnd: int, target_class: str,
+                                       target_text: str) -> list:
+    """找所有 class+text 精確匹配的子孫；按 (top, left) 排序去重。
+
+    跟 _find_descendant_by_class_text 不同：這個比對【完整 strip 後相等】，
+    用來精確區分 '片語' vs '單張片語'（同 class、文字含子字串會混淆）。"""
+    out = []
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def cb(child, lparam):
+        try:
+            cls_buf = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(child, cls_buf, 64)
+            if cls_buf.value != target_class:
+                return True
+            n = ctypes.windll.user32.GetWindowTextLengthW(child)
+            if n > 0:
+                t_buf = ctypes.create_unicode_buffer(n + 1)
+                ctypes.windll.user32.GetWindowTextW(child, t_buf, n + 1)
+                if t_buf.value.strip() == target_text:
+                    r = wintypes.RECT()
+                    if ctypes.windll.user32.GetWindowRect(child, ctypes.byref(r)):
+                        out.append((child, r.top, r.left))
+        except Exception:
+            pass
+        return True
+
+    ctypes.windll.user32.EnumChildWindows(parent_hwnd, cb, 0)
+    seen = set()
+    uniq = [x for x in out if not (x[0] in seen or seen.add(x[0]))]
+    uniq.sort(key=lambda x: (x[1], x[2]))
+    return uniq
+
+
 def _f9_f10_round3_phrases(popup_hwnd: int, row_所患: int, row_手術: int,
                               label: str = "") -> bool:
     """對 popup 內 2 個片語欄位依序執行選擇流程。
@@ -2726,18 +2842,19 @@ def _f9_f10_round3_phrases(popup_hwnd: int, row_所患: int, row_手術: int,
     row_所患: 所患疾病 popup 內目標 row (從 0 開始)
     row_手術: 手術原因 popup 內目標 row (從 0 開始)
     """
-    # 找 3 個 「片語」 TButton (位置在 x≈464, y=200/252/317)
-    all_buttons = _enum_class_in_window(popup_hwnd, "TButton")
-    pien = [b for b in all_buttons if 460 <= b[2] <= 470]
-    pien.sort(key=lambda b: b[1])  # by top
+    # 用 EXACT text="片語" 過濾，避免抓到 "單張片語"（同 class TButton、x 差
+    # 1 px、sort 順序不穩，曾誤抓 row2 單張片語當成 row3 片語，導致誤填
+    # 實施手術名稱）
+    pien = _find_descendants_by_exact_text(popup_hwnd, "TButton", "片語")
     if len(pien) < 3:
-        logging.warning("[%s] 找不到 3 個 片語 button (找到 %d 個)",
+        logging.warning("[%s] 找不到 3 個 text='片語' 的 button (找到 %d 個)",
                          label, len(pien))
         return False
-    btn_所患 = pien[0][0]
+    btn_所患 = pien[0][0]    # row 1 (y 最小)
     # pien[1] = 實施手術名稱旁邊 (不用)
-    btn_手術 = pien[2][0]
-    logging.info("[%s] 片語 buttons: 所患=%s 手術=%s", label, btn_所患, btn_手術)
+    btn_手術 = pien[2][0]    # row 3 (y 最大)
+    logging.info("[%s] 片語 buttons (text='片語'): 所患=%s 手術=%s",
+                  label, btn_所患, btn_手術)
 
     # Step A: 所患疾病 片語
     if not _select_phrase_and_return(btn_所患, row_所患,
@@ -2949,7 +3066,13 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
     # Step 8 (Round 3): 對 2 個片語欄位執行 click 片語→選 row→帶回
     check_stop()
     _f9_f10_round3_phrases(popup, phrase_row_所患, phrase_row_手術, label=label)
-    logging.info("[%s] Round 3 完成 (片語)。Round 4 會做：開立電子+確認對話框", label)
+    logging.info("[%s] Round 3 完成 (片語)", label)
+
+    # Step 9 (Round 4): 點 popup 開立電子 + 警告對話框「是」+ (未滿 18 對話框)
+    check_stop()
+    time.sleep(0.3)
+    _f9_f10_round4_submit_and_confirm(popup, label=label)
+    logging.info("[%s] Round 4 完成 (整段 F9/F10 流程完成)", label)
     return True
 
 
