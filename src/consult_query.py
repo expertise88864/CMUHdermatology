@@ -161,6 +161,10 @@ DEFAULT_CONFIG = {
     # 用同一個 Gmail App Password (settings/smtp_credentials.json)。
     "email_trigger_enabled": True,
     "email_trigger_subject_keyword": "皮膚科會診觸發",
+    # IMAP 輪詢週期（秒）。預設 20 秒（從原本 60 秒縮短，加速觸發回應 ~40 秒）。
+    # Gmail rate limit 對 IMAP 寬鬆，10-20 秒都很安全；想要更即時可降至 10
+    # 秒；想要省連線可調回 60 秒。
+    "email_trigger_poll_seconds": 20,
 }
 
 # Win32 視窗特徵（由探測 spike 實測得到，非寫死座標）
@@ -237,6 +241,14 @@ def load_config() -> dict:
             cfg["retry_count"] = max(1, int(cfg.get("retry_count", 3) or 3))
         except (TypeError, ValueError):
             cfg["retry_count"] = DEFAULT_CONFIG["retry_count"]
+        # 觸發輪詢週期：限制 5-300 秒，超出範圍退回預設
+        try:
+            v = float(cfg.get("email_trigger_poll_seconds",
+                               DEFAULT_CONFIG["email_trigger_poll_seconds"]))
+            cfg["email_trigger_poll_seconds"] = max(5.0, min(300.0, v))
+        except (TypeError, ValueError):
+            cfg["email_trigger_poll_seconds"] = \
+                DEFAULT_CONFIG["email_trigger_poll_seconds"]
         return cfg
 
 
@@ -1473,12 +1485,15 @@ def scheduler_loop() -> None:
                     pass
                 logging.info("偵測到設定變更，重新建立排程")
                 _rebuild_schedule()
-            # 信件觸發：每 60 秒輪詢一次收件匣（啟用時）。改用 IMAP 直連
+            # 信件觸發：每 N 秒輪詢一次收件匣（啟用時）。改用 IMAP 直連
             # Gmail（imap.gmail.com:993），不再依賴 Outlook COM——後者在 admin
             # 行程下會起一個沒設定郵件帳號的 admin Outlook，永遠收不到信。
+            # 輪詢週期可由 cfg.email_trigger_poll_seconds 調整（預設 20 秒，
+            # 與 Gmail rate limit 完全相容；想更即時可降至 10 秒）。
             cfg = load_config()
             if cfg.get("email_trigger_enabled"):
-                if time.time() - last_email_check >= 60.0:
+                poll_sec = float(cfg.get("email_trigger_poll_seconds", 20))
+                if time.time() - last_email_check >= poll_sec:
                     last_email_check = time.time()
                     kw = cfg.get("email_trigger_subject_keyword",
                                  DEFAULT_CONFIG["email_trigger_subject_keyword"])
