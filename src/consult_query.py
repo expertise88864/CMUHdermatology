@@ -113,17 +113,32 @@ MUTEX_NAME = "Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1"
 DEFAULT_CONFIG = {
     "username": "101358",
     "password": "101aa358",
+    # 一般排程（每日 12:30 / 17:00）收件人
     "recipients": [
         "expertise88864@gmail.com",
         "chilly840724@gmail.com",
         "wesjefflee1111@gmail.com",
         "mbpushowo@gmail.com",
     ],
-    "weekday_times": ["12:30", "17:00"],  # 週一～週五
-    "weekend_times": ["17:00"],           # 週六、週日
+    # 系統匣「測試寄信」用的收件人（只給一個人，免打擾）
+    "test_recipients": [
+        "expertise88864@gmail.com",
+    ],
+    # 信件觸發功能執行時的收件人（手動觸發 → 只回給觸發者）
+    "email_trigger_recipients": [
+        "expertise88864@gmail.com",
+    ],
+    # 每天 12:30 + 17:00 都跑（不分平假日）
+    "weekday_times": ["12:30", "17:00"],   # 週一～週五
+    "weekend_times": ["12:30", "17:00"],   # 週六、週日（與平日相同）
     "subject_template": "{date} {time} 皮膚科會診通知單",
     "body_template": "附件為 {date} {time} 皮膚科會診通知單截圖，由系統自動擷取寄送。",
     "enabled": True,
+    # 強制寄件人帳號（必須先在 Outlook 設定好此帳號；找不到時退回 Outlook
+    # 預設帳號）。換寄件人只要改這欄。
+    "sender_account": "cmuhdermatology@gmail.com",
+    # 失敗自動重試：每次重試前 taskkill systemftp.exe 確保乾淨環境
+    "retry_count": 3,
     # 信件觸發：從任何地方寄一封信到你的 Outlook 信箱，主旨包含關鍵字 →
     # 程式輪詢 60 秒一次，看到就把信標為已讀並立即執行一次。
     # 院內網路擋外部連入，但 Outlook 收信是「往外連」抓郵件，所以可正常運作。
@@ -186,14 +201,21 @@ def load_config() -> dict:
                     cfg.update(saved)
         except Exception:
             logging.warning("讀取設定檔失敗，使用預設值", exc_info=True)
-        # 正規化
-        if not isinstance(cfg.get("recipients"), list):
-            cfg["recipients"] = list(DEFAULT_CONFIG["recipients"])
-        cfg["recipients"] = [r.strip() for r in cfg["recipients"] if str(r).strip()]
+        # 正規化（每個 list 欄位都防呆：缺欄位/型別錯 → 退回 default；strip 空白；
+        # 過濾空字串）
+        for key in ("recipients", "test_recipients", "email_trigger_recipients"):
+            if not isinstance(cfg.get(key), list):
+                cfg[key] = list(DEFAULT_CONFIG[key])
+            cfg[key] = [r.strip() for r in cfg[key] if str(r).strip()]
         for key in ("weekday_times", "weekend_times"):
             if not isinstance(cfg.get(key), list):
                 cfg[key] = list(DEFAULT_CONFIG[key])
             cfg[key] = [str(t).strip() for t in cfg[key] if str(t).strip()]
+        # 數值欄位防呆
+        try:
+            cfg["retry_count"] = max(1, int(cfg.get("retry_count", 3) or 3))
+        except (TypeError, ValueError):
+            cfg["retry_count"] = DEFAULT_CONFIG["retry_count"]
         return cfg
 
 
@@ -1127,8 +1149,33 @@ def _connect_outlook():
         "請手動開啟 Outlook 並確認它可正常收發信，然後再試一次。")
 
 
-def _outlook_send_worker(image_path, subject, body, recipients, result) -> None:
-    """實際的 Outlook COM 寄信動作，在獨立執行緒執行（自己 CoInitialize）。"""
+def _pick_outlook_account(outlook, sender_account: str):
+    """從 outlook.Session.Accounts 找出 SmtpAddress 等於 sender_account 的帳號。
+    找不到就回 None；呼叫端決定回退到預設帳號或 raise。比對大小寫無關。"""
+    if not sender_account:
+        return None
+    target = sender_account.strip().lower()
+    try:
+        accounts = outlook.Session.Accounts
+        for i in range(1, accounts.Count + 1):  # Outlook COM accounts 是 1-based
+            acc = accounts.Item(i)
+            try:
+                smtp = (acc.SmtpAddress or "").strip().lower()
+            except Exception:
+                smtp = ""
+            if smtp == target:
+                return acc
+    except Exception:
+        logging.warning("列舉 Outlook accounts 失敗", exc_info=True)
+    return None
+
+
+def _outlook_send_worker(image_path, subject, body, recipients, result,
+                          sender_account: str = "") -> None:
+    """實際的 Outlook COM 寄信動作，在獨立執行緒執行（自己 CoInitialize）。
+
+    sender_account：指定要用哪個 Outlook 帳號寄（SMTP 地址）。找不到時退回
+    Outlook 預設帳號，並在 log 留 warning。"""
     import pythoncom
     pythoncom.CoInitialize()
     try:
@@ -1139,6 +1186,27 @@ def _outlook_send_worker(image_path, subject, body, recipients, result) -> None:
         mail.Body = body
         if image_path and Path(image_path).exists():
             mail.Attachments.Add(str(Path(image_path).resolve()))
+        # 強制寄件人帳號（SendUsingAccount）—— Outlook 必須已設定此帳號
+        if sender_account:
+            acc = _pick_outlook_account(outlook, sender_account)
+            if acc is not None:
+                # SendUsingAccount 是 property，要用底層 _oleobj_ 設定（直接賦值在某些
+                # Outlook 版本會失敗 "Member not found"），下式對所有版本都有效。
+                try:
+                    mail._oleobj_.Invoke(*(0xF01C, 0, 8, 0, acc))  # PR_SENT_REPRESENTING
+                except Exception:
+                    # 退回直接賦值
+                    try:
+                        mail.SendUsingAccount = acc
+                    except Exception:
+                        logging.warning(
+                            "無法套用 SendUsingAccount（將以 Outlook 預設帳號寄）",
+                            exc_info=True)
+            else:
+                logging.warning(
+                    "Outlook 找不到帳號 %r，將以預設帳號寄信。"
+                    "請先在 Outlook 加入此帳號或修改 sender_account 設定。",
+                    sender_account)
         mail.Send()
         result["ok"] = True
     except Exception as e:  # noqa: BLE001
@@ -1151,16 +1219,20 @@ def _outlook_send_worker(image_path, subject, body, recipients, result) -> None:
 
 
 def send_via_outlook(image_path: Path, subject: str, body: str,
-                     recipients: list, timeout: float = 120.0) -> None:
+                     recipients: list, timeout: float = 120.0,
+                     sender_account: str = "") -> None:
     """用本機 Outlook 寄出。COM 動作在獨立執行緒執行並設逾時——若 Outlook 跳出
     安全提示或忙線卡住，最多等 timeout 秒就放棄，不會無限阻塞整個排程
-    （先前第二次寄信卡死、整個任務不結束就是這個原因）。逾時或失敗會 raise。"""
+    （先前第二次寄信卡死、整個任務不結束就是這個原因）。逾時或失敗會 raise。
+
+    sender_account：強制用此 SMTP 地址對應的 Outlook 帳號寄信。空字串/None 則
+    用 Outlook 預設帳號。"""
     if not recipients:
         raise RuntimeError("沒有設定收件人")
     result: dict = {}
     worker = threading.Thread(
         target=_outlook_send_worker,
-        args=(image_path, subject, body, recipients, result),
+        args=(image_path, subject, body, recipients, result, sender_account),
         name="OutlookSend", daemon=True,
     )
     worker.start()
@@ -1173,7 +1245,22 @@ def send_via_outlook(image_path: Path, subject: str, body: str,
         raise result["error"]
     if not result.get("ok"):
         raise RuntimeError("Outlook 寄信未完成（原因不明）")
-    logging.info("已透過 Outlook 寄出給：%s", ", ".join(recipients))
+    sender_note = f"（寄件人 {sender_account}）" if sender_account else ""
+    logging.info("已透過 Outlook 寄出給：%s%s", ", ".join(recipients), sender_note)
+
+
+def _kill_systemftp() -> None:
+    """taskkill /F /IM systemftp.exe — 強制清理殘留實例。
+
+    用於重試前的環境清理。失敗時靜默（可能是「沒有 process 可殺」也算正常）。"""
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "systemftp.exe"],
+            capture_output=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        logging.debug("taskkill systemftp.exe 失敗（可能本來就沒在跑）", exc_info=True)
 
 
 def _do_full_job(trigger_label: str) -> None:
@@ -1181,7 +1268,18 @@ def _do_full_job(trigger_label: str) -> None:
 
     多機共存策略：先檢查本機 Outlook 是否可用，不可用就直接靜默跳過——
     省得多台電腦同時跑 systemftp 又同時嘗試寄信。全程不跳任何視窗提示
-    （成功與失敗都只記 log，不打擾使用者）。"""
+    （成功與失敗都只記 log，不打擾使用者）。
+
+    重試策略：
+      - 任一步驟失敗（systemftp 啟動失敗、登入失敗、截圖失敗、寄信失敗）→
+        taskkill /F /IM systemftp.exe 清環境，sleep 3 秒，重試整個流程
+      - 預設最多 3 次，由 cfg.retry_count 控制
+      - 三次都掛才放棄並記 log（不再彈視窗）
+
+    收件人路由：
+      - trigger_label == "email"（信件遠端觸發）→ 用 email_trigger_recipients
+        （預設只給觸發者一個人）
+      - 其他（排程／手動）→ 用 recipients（一般四人名單）"""
     if not _flow_lock.acquire(blocking=False):
         logging.info("已有一個會診查詢任務進行中，本次（%s）略過", trigger_label)
         return
@@ -1198,14 +1296,41 @@ def _do_full_job(trigger_label: str) -> None:
         time_str = (trigger_label.replace(":", "")
                     if trigger_label and ":" in trigger_label
                     else now.strftime("%H%M"))
-        try:
-            shot = run_consult_flow(trigger_label)
-            subject = cfg["subject_template"].format(date=date_str, time=time_str)
-            body = cfg["body_template"].format(date=date_str, time=time_str)
-            send_via_outlook(shot, subject, body, cfg["recipients"])
-        except Exception as e:
-            # 失敗只記 log；不跳通知、不寄失敗信（多機部署下會干擾）
-            logging.error("會診查詢任務失敗：%s", e, exc_info=True)
+
+        # 收件人路由：email 觸發 → 只回給觸發者；其餘 → 一般名單
+        if trigger_label == "email":
+            recipients = cfg.get("email_trigger_recipients") or cfg["recipients"]
+            recipients_label = "email_trigger_recipients"
+        else:
+            recipients = cfg["recipients"]
+            recipients_label = "recipients"
+        sender = cfg.get("sender_account", "") or ""
+        retry_count = max(1, int(cfg.get("retry_count", 3) or 3))
+
+        subject = cfg["subject_template"].format(date=date_str, time=time_str)
+        body = cfg["body_template"].format(date=date_str, time=time_str)
+
+        last_err = None  # 最後一次的失敗例外，用於三次都失敗的 log
+        for attempt in range(1, retry_count + 1):
+            try:
+                logging.info("會診查詢任務 第 %d/%d 次嘗試（trigger=%s, 收件人組=%s）",
+                             attempt, retry_count, trigger_label, recipients_label)
+                shot = run_consult_flow(trigger_label)
+                send_via_outlook(shot, subject, body, recipients,
+                                  sender_account=sender)
+                logging.info("會診查詢任務成功（第 %d 次嘗試）", attempt)
+                return  # 成功就跳出
+            except Exception as e:
+                last_err = e
+                logging.error("會診查詢任務第 %d/%d 次失敗：%s",
+                              attempt, retry_count, e, exc_info=True)
+                if attempt < retry_count:
+                    logging.info("殺 systemftp.exe 後重試（sleep 3 秒）")
+                    _kill_systemftp()
+                    time.sleep(3)
+                else:
+                    logging.error("會診查詢任務已重試 %d 次仍失敗，放棄。最後錯誤：%s",
+                                  retry_count, last_err)
     finally:
         try:
             pythoncom.CoUninitialize()
@@ -1516,7 +1641,10 @@ def _tray_configure(icon=None, item=None) -> None:
 
 
 def _send_test_email() -> None:
-    """只測 Outlook 寄信。本機無 Outlook 直接靜默跳過；成功失敗都不跳提示。"""
+    """只測 Outlook 寄信。本機無 Outlook 直接靜默跳過；成功失敗都不跳提示。
+
+    用 test_recipients（預設只給 expertise88864@gmail.com 一個人，免擾其他收件人）
+    與 sender_account（預設 cmuhdermatology@gmail.com）。"""
     if not _outlook_available():
         logging.info("本機無可用 Outlook，測試寄信靜默跳過")
         return
@@ -1525,12 +1653,16 @@ def _send_test_email() -> None:
     try:
         cfg = load_config()
         now = datetime.now()
+        recipients = cfg.get("test_recipients") or cfg["recipients"]
+        sender = cfg.get("sender_account", "") or ""
         send_via_outlook(
             None,
             "皮膚科會診查詢 — 測試信",
             f"這是一封測試信，寄送時間 {now:%Y-%m-%d %H:%M:%S}。\n"
-            f"若收到此信，代表 Outlook 寄信與收件人設定正常。",
-            cfg["recipients"],
+            f"若收到此信，代表 Outlook 寄信與收件人設定正常。\n"
+            f"（寄件人：{sender or 'Outlook 預設帳號'}）",
+            recipients,
+            sender_account=sender,
         )
     except Exception as e:
         logging.error("測試寄信失敗：%s", e, exc_info=True)

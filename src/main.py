@@ -4024,8 +4024,13 @@ class HotkeyScriptEditorWindow(tk.Toplevel):
 # 止掛提醒寄信（Outlook COM，在獨立執行緒+逾時，避免卡到主迴圈）
 # =============================================================================
 def _send_alert_email_via_outlook(subject: str, body: str,
-                                  recipients: list, timeout: float = 60.0) -> bool:
+                                  recipients: list, timeout: float = 60.0,
+                                  sender_account: str = "") -> bool:
     """達到門檻時透過 Outlook 寄信給設定的收件人；獨立執行緒+逾時防卡。
+
+    sender_account：強制用此 SMTP 地址對應的 Outlook 帳號寄。找不到時退回
+    預設帳號，並在 log 留 warning。空字串則直接用 Outlook 預設帳號。
+
     回傳是否成功（失敗只記 log，不影響主程式運作）。"""
     if not recipients:
         return False
@@ -4044,6 +4049,37 @@ def _send_alert_email_via_outlook(subject: str, body: str,
             mail.To = "; ".join(recipients)
             mail.Subject = subject
             mail.Body = body
+            # 強制寄件人帳號（SendUsingAccount）
+            if sender_account:
+                target = sender_account.strip().lower()
+                picked = None
+                try:
+                    accounts = outlook.Session.Accounts
+                    for i in range(1, accounts.Count + 1):
+                        acc = accounts.Item(i)
+                        try:
+                            smtp = (acc.SmtpAddress or "").strip().lower()
+                        except Exception:
+                            smtp = ""
+                        if smtp == target:
+                            picked = acc
+                            break
+                except Exception:
+                    logging.warning("列舉 Outlook accounts 失敗", exc_info=True)
+                if picked is not None:
+                    try:
+                        # SendUsingAccount 在某些 Outlook 版本要走 _oleobj_ Invoke
+                        mail._oleobj_.Invoke(*(0xF01C, 0, 8, 0, picked))
+                    except Exception:
+                        try:
+                            mail.SendUsingAccount = picked
+                        except Exception:
+                            logging.warning("無法套用 SendUsingAccount，將以預設帳號寄",
+                                            exc_info=True)
+                else:
+                    logging.warning(
+                        "Outlook 找不到帳號 %r，將以預設帳號寄止掛提醒信",
+                        sender_account)
             mail.Send()
             result["ok"] = True
         except Exception as e:  # noqa: BLE001
@@ -4175,7 +4211,12 @@ class AutomationApp:
         # 止掛達門檻時要寄信通知的收件人（可多人）
         self.alert_email_recipients = list(self.threshold_settings.get(
             "alert_email_recipients",
-            ["expertise88864@gmail.com", "mbpushowo@gmail.com"]))
+            ["expertise88864@gmail.com",
+             "chilly840724@gmail.com",
+             "mbpushowo@gmail.com"]))
+        # 止掛提醒信的寄件人帳號（必須先在 Outlook 設定此 SMTP 帳號）
+        self.alert_email_sender = str(self.threshold_settings.get(
+            "alert_email_sender", "cmuhdermatology@gmail.com"))
         self.out_of_hospital_var = tk.BooleanVar(value=self.threshold_settings.get("out_of_hospital_mode", False))
         self.show_external_clinics = tk.BooleanVar(value=self.threshold_settings.get("show_external_clinics", True))
 
@@ -8442,7 +8483,9 @@ class AutomationApp:
                                                                                 subj = (f"【止掛提醒】{dn} {sn}診 "
                                                                                         f"({today.year}/{today.month}/{today.day}) "
                                                                                         f"已達 {cnt}/{fth}")
-                                                                                _send_alert_email_via_outlook(subj, m, rcpts)
+                                                                                _send_alert_email_via_outlook(
+                                                                                    subj, m, rcpts,
+                                                                                    sender_account=self.alert_email_sender)
                                                                             except Exception:
                                                                                 logging.warning("止掛提醒寄信例外", exc_info=True)
                                                                 finally:
@@ -9125,10 +9168,34 @@ class AutomationApp:
 # --- [修正] 背景任務啟動 (修正重開機邏輯) ---
     def start_background_tasks(self):
         logging.info("Starting background tasks loop via ThreadPoolExecutor...")
-        self.startup_phase_text.set("任務排程")
 
-        # [核心修正] 統一派發至 ThreadPoolExecutor 避免 Thread Leak
-        self.bg_executor.submit(self.check_and_update, False)
+        # ===== 同步下載所有子程式 (manifest.json 列出的全部檔案) =====
+        # 改自原本的 fire-and-forget (`bg_executor.submit(check_and_update, False)`)：
+        # 改成阻塞此 method 直到下載/驗證完成，目的是避免「主程式打開後使用者立刻按
+        # 熱鍵但子程式仍是舊版」的時間窗。
+        #
+        # 注意：此 method 由 deferred_initialization 在 UI thread 透過 root.after(50)
+        # 觸發，所以阻塞會短暫凍結 UI。但：
+        #   - SHA256 短路：本地檔案已是 manifest 期望版時，幾乎瞬間返回（< 1 秒）
+        #   - 真有檔案要下載：平行 ThreadPoolExecutor 8 workers，通常 < 10 秒
+        #   - 180 秒安全 timeout：網路掛掉時最多卡 3 分鐘就放手
+        # 啟動畫面會顯示 "同步下載所有子程式..." 讓使用者知道在做什麼。
+        import concurrent.futures as _cf
+        self.startup_phase_text.set("同步下載所有子程式更新...")
+        try:
+            self.root.update_idletasks()  # 強制繪製 splash 訊息再阻塞
+        except Exception:
+            pass
+        try:
+            update_future = self.bg_executor.submit(self.check_and_update, False)
+            update_future.result(timeout=180)
+            logging.info("[STARTUP] sync update of all sub-programs done")
+        except _cf.TimeoutError:
+            logging.warning("[STARTUP] sync update timeout (>180s), continuing anyway")
+        except Exception:
+            logging.exception("[STARTUP] sync update failed (continuing)")
+
+        self.startup_phase_text.set("任務排程")
 
         def safe_fetch_duty(target_func, *args):
             if not self.val_out_of_hospital:
