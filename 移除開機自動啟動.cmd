@@ -1,5 +1,6 @@
 @echo off
-REM ASCII-only wrapper. See sibling 安裝會診查詢自動啟動.cmd for full explanation.
+REM ASCII-only wrapper for 移除開機自動啟動.ps1
+REM 移除所有 3 個程式的自動啟動排程（主程式 / 打卡 / 會診查詢）。
 
 net session >nul 2>nul
 if not errorlevel 1 goto :elevated

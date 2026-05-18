@@ -8463,24 +8463,31 @@ class AutomationApp:
                                                                 diff_text = f"距離門檻差 {-diff} 人"
                                                             level_prefix = "【第一次提醒】" if notify_level == 1 else "【第二次加強提醒】"
                                                             msg = f"{level_prefix}\n{doc_name} {session_name}診\n掛號人數 {count} 人\n設定閾值 {full_threshold} 人\n{diff_text}"
-                                                            if self._is_notification_suppressed_now():
-                                                                with self._alert_state_lock:
-                                                                    self._alert_popup_active[notify_key] = False
+                                                            # DND 邏輯改動 (2026-05-18)：
+                                                            # 原本 DND 時直接 continue → toast 跟 email 都被擋掉，導致使用者
+                                                            # 醒來完全不知道半夜門檻爆掉。改成：DND 只抑制 toast (避免半夜
+                                                            # 跳訊息打擾)，email 仍然寄 (醒來就能在信箱看到)。
+                                                            is_dnd = self._is_notification_suppressed_now()
+                                                            if is_dnd:
                                                                 self._dnd_suppressed_count += 1
-                                                                self.status_text.set(f"狀態: 勿擾時段，已抑制提醒（{doc_name}{session_name}，{diff_text}）")
-                                                                logging.info(f"[ALERT SUPPRESSED][DND] {doc_name} {session_name} count={count} threshold={full_threshold} {diff_text}")
-                                                                continue
+                                                                self.status_text.set(f"狀態: 勿擾時段，僅寄 email（{doc_name}{session_name}，{diff_text}）")
+                                                                logging.info(f"[ALERT DND] toast 抑制但 email 仍寄 {doc_name} {session_name} count={count} threshold={full_threshold} {diff_text}")
                                                             def _notify_worker(nk=notify_key, m=msg, dn=doc_name, sn=session_name,
-                                                                                fth=full_threshold, cnt=count, lvl=notify_level):
+                                                                                fth=full_threshold, cnt=count, lvl=notify_level,
+                                                                                dnd=is_dnd):
                                                                 try:
-                                                                    show_windows_notification("止掛提醒", m)
-                                                                    # 只在「第一次提醒」寄信（第二次加強提醒只跳 Windows 通知，避免一筆狀況收到兩封）
+                                                                    # toast 只在非 DND 時跳
+                                                                    if not dnd:
+                                                                        show_windows_notification("止掛提醒", m)
+                                                                    # email：DND 也寄（第一次提醒）。第二次加強提醒只跳 Windows
+                                                                    # 通知，避免一筆狀況收到兩封信。
                                                                     if lvl == 1:
                                                                         rcpts = list(self.alert_email_recipients)
                                                                         if rcpts:
                                                                             try:
                                                                                 today = date.today()
-                                                                                subj = (f"【止掛提醒】{dn} {sn}診 "
+                                                                                dnd_tag = "【夜間勿擾】" if dnd else ""
+                                                                                subj = (f"【止掛提醒】{dnd_tag}{dn} {sn}診 "
                                                                                         f"({today.year}/{today.month}/{today.day}) "
                                                                                         f"已達 {cnt}/{fth}")
                                                                                 _send_alert_email_via_outlook(
