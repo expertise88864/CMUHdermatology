@@ -1,33 +1,62 @@
 @echo off
-REM 雙擊執行 → 探測「中國醫藥大學附設醫院西醫門診醫師作業」的視窗 + 選單結構。
-REM 使用前：先開啟主程式並切到有患者掛入、看得到「醫令」選單列的畫面。
+REM ============================================================================
+REM ASCII-only wrapper for probe_main_app_menu.py.
+REM
+REM Why ASCII only:
+REM   cmd.exe on Traditional-Chinese Windows (CP950) reads .cmd file content
+REM   using the active code page BEFORE any chcp 65001 line takes effect.
+REM   UTF-8 Chinese bytes in .cmd content become garbage. Keep this wrapper
+REM   pure ASCII; the real work is in the .py script (Python handles UTF-8).
+REM
+REM Usage:
+REM   1. Open the hospital main program first
+REM      (Title contains "中國醫藥大學附設醫院西醫門診醫師作業")
+REM   2. Have a patient loaded (so the "醫令" menu is visible)
+REM   3. Double-click this file
+REM   4. After it finishes, the output text file is at:
+REM      settings\main_app_menu_probe.txt
+REM      Paste its content to Claude.
+REM ============================================================================
 
-chcp 65001 >nul
 cd /d "%~dp0"
 
 echo.
 echo ============================================================
-echo   探測主程式視窗結構
+echo   Probing main hospital app window + menu
 echo ============================================================
 echo.
-echo 使用前確認：
-echo   1. 「中國醫藥大學附設醫院西醫門診醫師作業」視窗已開啟
-echo   2. 已掛入患者（畫面顯示像截圖那樣，能看到「醫令」選單）
+echo Make sure:
+echo   1. The hospital program window is open and visible.
+echo   2. A patient is loaded (so the "Yi Ling" menu shows up).
 echo.
-pause
+echo Press any key to continue...
+pause >nul
 
 where python >nul 2>nul
 if errorlevel 1 (
-    echo [錯誤] 找不到 python，請先安裝。
+    echo.
+    echo [ERROR] python.exe not found in PATH.
+    echo Please install Python 3.10+ first.
+    echo.
     pause
     exit /b 1
 )
 
+REM Force UTF-8 console output for the python child process so Chinese
+REM characters print correctly to the screen (the .txt file is always UTF-8).
+chcp 65001 >nul
+set PYTHONIOENCODING=utf-8
+
 python scripts\probe_main_app_menu.py
+set RC=%errorlevel%
 
 echo.
 echo ============================================================
-echo   結束。輸出已存到 settings\main_app_menu_probe.txt
-echo   請把該檔內容貼給 Claude。
+echo   Done.
+echo   Output saved to:
+echo     settings\main_app_menu_probe.txt
+echo   Paste its content to Claude.
 echo ============================================================
+echo.
 pause
+exit /b %RC%

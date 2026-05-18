@@ -11,7 +11,7 @@
   1. 打開「中國醫藥大學附設醫院西醫門診醫師作業」(systemftp 或同類)
   2. 切到有患者掛入、醫令代碼欄位看得到的狀態（如本探測使用的螢幕截圖）
   3. 跑這個 script：
-       python scripts\probe_main_app_menu.py
+       python scripts/probe_main_app_menu.py
   4. 輸出會印到 console，也會寫到 settings/main_app_menu_probe.txt
   5. 把該 .txt 內容貼給 Claude，他會根據結構寫對應的 SendMessage 程式碼
 
