@@ -2463,29 +2463,50 @@ def _click_button_by_text(parent_hwnd: int, text: str) -> bool:
     return True
 
 
-def _click_tab_by_text(or_hwnd: int, tab_text: str) -> bool:
-    """切到指定 TabSheet。先找 TTabSheet hwnd 拿到 rect，再 click 該 tab
-    上方的 header 區（y 在 tabsheet rect 之上約 12 px 處）。"""
+def _enum_direct_children(parent_hwnd: int,
+                           target_class: str = "") -> list:
+    """列出 parent_hwnd 的直系子視窗（不遞迴）；可選 class 過濾。"""
+    GW_CHILD = 5
+    GW_HWNDNEXT = 2
+    children = []
+    h = ctypes.windll.user32.GetWindow(parent_hwnd, GW_CHILD)
+    while h:
+        if not target_class:
+            children.append(h)
+        else:
+            cls_buf = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(h, cls_buf, 64)
+            if cls_buf.value == target_class:
+                children.append(h)
+        h = ctypes.windll.user32.GetWindow(h, GW_HWNDNEXT)
+    return children
+
+
+def _switch_tab_by_text(or_hwnd: int, tab_text: str) -> bool:
+    """切到指定 text 的 TTabSheet。用 TCM_SETCURFOCUS 直接命令 parent
+    TPageControl 切 tab，避開「click 位置算錯」的問題（tab header 通常
+    左對齊，centered click 會落在空白區）。"""
     sheet = _find_descendant_by_class_text(or_hwnd, "TTabSheet", tab_text)
     if not sheet:
         return False
-    try:
-        r = wintypes.RECT()
-        if not ctypes.windll.user32.GetWindowRect(sheet, ctypes.byref(r)):
-            return False
-        cx = (r.left + r.right) // 2
-        cy = r.top - 12  # tab header 通常比 tab area 上方
-        pt = wintypes.POINT()
-        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-        sx, sy = pt.x, pt.y
-        hotkey_modules.pyautogui.click(cx, cy)
-        try:
-            ctypes.windll.user32.SetCursorPos(sx, sy)
-        except Exception:
-            pass
-        return True
-    except Exception:
+    page_ctrl = ctypes.windll.user32.GetParent(sheet)
+    if not page_ctrl:
         return False
+    # 列 PageControl 的直系子 TTabSheet 找 index
+    tabs = _enum_direct_children(page_ctrl, "TTabSheet")
+    if sheet not in tabs:
+        return False
+    idx = tabs.index(sheet)
+    # TCM_SETCURFOCUS = TCM_FIRST(0x1300) + 48 = 0x1330。
+    # 對標準 TabCtrl/TPageControl 會同時改 focus + 觸發 OnChange。
+    TCM_SETCURFOCUS = 0x1330
+    ctypes.windll.user32.SendMessageW(page_ctrl, TCM_SETCURFOCUS, idx, 0)
+    # 備援：再送 TCM_SETCURSEL + WM_NOTIFY TCN_SELCHANGE
+    TCM_SETCURSEL = 0x130C
+    ctypes.windll.user32.SendMessageW(page_ctrl, TCM_SETCURSEL, idx, 0)
+    logging.info("_switch_tab_by_text: page_ctrl=%s, sheet=%s, idx=%d",
+                  page_ctrl, sheet, idx)
+    return True
 
 
 def _click_radio_by_text(parent_hwnd: int, text_keyword: str) -> bool:
@@ -2526,12 +2547,12 @@ def script_F9_F10_consent_form_adaptive(form_code: str, label: str = "") -> bool
     time.sleep(0.3)  # 等視窗 paint 完成
     check_stop()
 
-    # Step 3: 切到「手術及治療」tab
-    if not _click_tab_by_text(or_hwnd, "手術及治療"):
+    # Step 3: 切到「手術及治療」tab (用 TCM_SETCURFOCUS, 不靠 click)
+    if not _switch_tab_by_text(or_hwnd, "手術及治療"):
         logging.warning("[%s] 找不到/切換 手術及治療 tab 失敗", label)
         return False
-    logging.info("[%s] 已切到 手術及治療 tab", label)
-    time.sleep(0.3)
+    logging.info("[%s] 已切到 手術及治療 tab (TCM_SETCURFOCUS)", label)
+    time.sleep(0.5)   # 等 tab 切完 + radio 重繪
     check_stop()
 
     # Step 4: 點 form_code 對應的 radio (MO04 / MU02)
