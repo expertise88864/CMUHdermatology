@@ -2473,13 +2473,17 @@ def _click_control_center(hwnd: int) -> bool:
 
 
 def _click_button_by_text(parent_hwnd: int, text: str) -> bool:
-    """找 TButton text 完全等於 text → BM_CLICK 觸發（最乾淨，不動滑鼠）。"""
+    """找 TButton text 完全等於 text → 用 PostMessage WM_LBUTTONDOWN/UP 觸發。
+
+    不用 SendMessage BM_CLICK：對開啟 modal popup 的 button，BM_CLICK 是
+    synchronous，會卡在 popup 的 modal message loop 直到 user 關閉。
+    PostMessage 非同步立刻返回，popup 由 Delphi 後續處理，呼叫端用
+    _wait_for_window poll 偵測。
+    （實測 2026-05-18：SendMessage BM_CLICK 在「開立電子」卡了 73 秒）"""
     btn = _find_descendant_by_class_text(parent_hwnd, "TButton", text)
     if not btn:
         return False
-    BM_CLICK = 0x00F5
-    ctypes.windll.user32.SendMessageW(btn, BM_CLICK, 0, 0)
-    return True
+    return _post_click_to_control(btn)
 
 
 def _enum_direct_children(parent_hwnd: int,
@@ -2792,12 +2796,17 @@ def script_F9_F10_consent_form_adaptive(form_code: str, label: str = "") -> bool
     logging.info("[%s] 已點 開立電子，等 popup 跳出", label)
 
     # Step 6 (Round 2): 等 popup (Tfm_agree) 出現
-    popup = _wait_for_window("Tfm_agree", title_kw="列印同意", timeout=10)
+    # popup 可能要等 hospital app 從 server load 病歷資料、塞 TEdit、render UI，
+    # 約 5-30 秒。timeout 60s 留充裕空間，poll 100ms 一次。
+    popup = _wait_for_window("Tfm_agree", title_kw="列印同意", timeout=60)
     if not popup:
         logging.warning("[%s] 等不到 popup (Tfm_agree)", label)
         return False
     logging.info("[%s] popup hwnd=%s 已開啟", label, popup)
-    time.sleep(0.5)  # 等 popup paint 完成
+    # popup 視窗出現 ≠ 資料 load 完。Delphi 通常 popup 先 paint 空白 → 再從病歷
+    # 帶入欄位資料。若太早 clear，後續 load 會覆蓋掉我們清空的字。
+    # 給 2 秒讓 OnShow 完成 + server roundtrip + UI fill。
+    time.sleep(2.0)
     check_stop()
 
     # Step 7 (Round 2): 清空 2 個 edit + 勾 局麻
