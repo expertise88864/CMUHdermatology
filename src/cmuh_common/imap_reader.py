@@ -76,12 +76,14 @@ def _decode_subject(raw_subject: bytes) -> str:
 def check_trigger(keyword: str, mark_read: bool = True,
                    timeout: float = 30.0,
                    sample_count: int = 3) -> dict:
-    """掃描 IMAP 收件匣未讀信，主旨含 keyword 的就回報並標為已讀。
+    """掃描 IMAP 收件匣未讀信，主旨含 keyword 的就回報、抓 From 地址、並標為已讀。
 
     回傳 dict：
       triggered (bool)：有比對到至少一封 → True
       scanned (int)：本次掃了多少封未讀
       matched (int)：主旨含 keyword 的未讀數
+      matched_senders (list[str])：比對到的信件 From 地址（去重小寫，可能空）。
+                       呼叫端可用來判斷「誰觸發的」並把結果回寄給他。
       samples (list[str])：若 matched=0，回 sample_count 個最近未讀主旨給 debug
       error (str|None)：例外訊息（連線/認證失敗等），有錯時其他欄位無意義
 
@@ -91,6 +93,7 @@ def check_trigger(keyword: str, mark_read: bool = True,
         "triggered": False,
         "scanned": 0,
         "matched": 0,
+        "matched_senders": [],
         "samples": [],
         "error": None,
     }
@@ -137,28 +140,40 @@ def check_trigger(keyword: str, mark_read: bool = True,
         ids = data[0].split() if data[0] else []
         result["scanned"] = len(ids)
 
+        from email.utils import parseaddr
+
         matched_ids = []
+        senders_seen = set()
         for uid in ids:
             try:
-                typ, fetch = conn.fetch(uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+                typ, fetch = conn.fetch(uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])")
                 if typ != "OK" or not fetch:
                     continue
-                # fetch 結構：[(b'1 (BODY...', b'Subject: xxx\r\n'), b')']
-                subj_raw = b""
+                # fetch 結構：[(b'1 (BODY...', b'Subject: ...\r\nFrom: ...\r\n'), b')']
+                header_raw = b""
                 for part in fetch:
                     if isinstance(part, tuple) and len(part) >= 2:
-                        subj_raw = part[1]
+                        header_raw = part[1]
                         break
                 subj_str = ""
-                if subj_raw:
-                    # 取 Subject: 後面的內容
-                    for line in subj_raw.splitlines():
-                        if line.lower().startswith(b"subject:"):
+                from_str = ""
+                if header_raw:
+                    for line in header_raw.splitlines():
+                        low = line.lower()
+                        if low.startswith(b"subject:"):
                             subj_str = _decode_subject(
                                 line.split(b":", 1)[1].strip())
-                            break
+                        elif low.startswith(b"from:"):
+                            from_str = _decode_subject(
+                                line.split(b":", 1)[1].strip())
                 if keyword in subj_str:
                     matched_ids.append(uid)
+                    # parseaddr 解 "Name <foo@bar.com>" → ("Name", "foo@bar.com")
+                    _, addr = parseaddr(from_str)
+                    addr = (addr or "").strip().lower()
+                    if addr and addr not in senders_seen:
+                        senders_seen.add(addr)
+                        result["matched_senders"].append(addr)
                 elif len(result["samples"]) < sample_count:
                     result["samples"].append(subj_str or "(空主旨)")
             except Exception:

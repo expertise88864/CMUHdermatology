@@ -124,9 +124,20 @@ DEFAULT_CONFIG = {
     "test_recipients": [
         "expertise88864@gmail.com",
     ],
-    # 信件觸發功能執行時的收件人（手動觸發 → 只回給觸發者）
+    # 【舊欄位，留作 fallback】信件觸發但白名單比對不到寄件人時用的收件人。
+    # 新邏輯：觸發信會被 IMAP 抓到，自動把結果寄回給「寄信來觸發的那個人」，
+    # 前提是該寄件人 email 在 allowed_trigger_senders 白名單內。
     "email_trigger_recipients": [
         "expertise88864@gmail.com",
+    ],
+    # 觸發白名單：只有這些 email 寄來的觸發信會生效（避免任何人猜到信箱就
+    # 能拉醫療截圖）。預設等於 recipients 名單（合理：能收排程信的人就能
+    # 自己觸發）。比對時不分大小寫。
+    "allowed_trigger_senders": [
+        "expertise88864@gmail.com",
+        "chilly840724@gmail.com",
+        "wesjefflee1111@gmail.com",
+        "mbpushowo@gmail.com",
     ],
     # 每天 12:30 + 17:00 都跑（不分平假日）
     "weekday_times": ["12:30", "17:00"],   # 週一～週五
@@ -209,10 +220,14 @@ def load_config() -> dict:
             logging.warning("讀取設定檔失敗，使用預設值", exc_info=True)
         # 正規化（每個 list 欄位都防呆：缺欄位/型別錯 → 退回 default；strip 空白；
         # 過濾空字串）
-        for key in ("recipients", "test_recipients", "email_trigger_recipients"):
+        for key in ("recipients", "test_recipients", "email_trigger_recipients",
+                     "allowed_trigger_senders"):
             if not isinstance(cfg.get(key), list):
                 cfg[key] = list(DEFAULT_CONFIG[key])
             cfg[key] = [r.strip() for r in cfg[key] if str(r).strip()]
+        # 白名單比對全小寫，避免大小寫差異漏判
+        cfg["allowed_trigger_senders"] = [a.lower() for a in
+                                            cfg["allowed_trigger_senders"]]
         for key in ("weekday_times", "weekend_times"):
             if not isinstance(cfg.get(key), list):
                 cfg[key] = list(DEFAULT_CONFIG[key])
@@ -1289,7 +1304,7 @@ def _kill_systemftp() -> None:
         logging.debug("taskkill systemftp.exe 失敗（可能本來就沒在跑）", exc_info=True)
 
 
-def _do_full_job(trigger_label: str) -> None:
+def _do_full_job(trigger_label: str, override_recipients=None) -> None:
     """完整一次任務：跑流程 → 寄信。供排程／手動共用，整體互斥。
 
     多機共存策略：先檢查本機 Outlook 是否可用，不可用就直接靜默跳過——
@@ -1303,8 +1318,9 @@ def _do_full_job(trigger_label: str) -> None:
       - 三次都掛才放棄並記 log（不再彈視窗）
 
     收件人路由：
-      - trigger_label == "email"（信件遠端觸發）→ 用 email_trigger_recipients
-        （預設只給觸發者一個人）
+      - override_recipients（IMAP 觸發傳入：實際觸發信的寄件人 email）→ 用它
+      - trigger_label == "email" 且無 override → 用 email_trigger_recipients
+        （fallback，例如手動觸發或寄件人解析失敗）
       - 其他（排程／手動）→ 用 recipients（一般四人名單）"""
     if not _flow_lock.acquire(blocking=False):
         logging.info("已有一個會診查詢任務進行中，本次（%s）略過", trigger_label)
@@ -1333,10 +1349,18 @@ def _do_full_job(trigger_label: str) -> None:
                     if trigger_label and ":" in trigger_label
                     else now.strftime("%H%M"))
 
-        # 收件人路由：email 觸發 → 只回給觸發者；其餘 → 一般名單
-        if trigger_label == "email":
+        # 收件人路由：
+        #   1. override_recipients 有值（IMAP 觸發傳入觸發信寄件人）→ 用它，
+        #      標籤 email_trigger_sender
+        #   2. trigger_label == "email" 但無 override（解析失敗或手動觸發）→
+        #      退回 email_trigger_recipients
+        #   3. 其他（排程／手動）→ 一般 recipients
+        if override_recipients:
+            recipients = list(override_recipients)
+            recipients_label = "email_trigger_sender"
+        elif trigger_label == "email":
             recipients = cfg.get("email_trigger_recipients") or cfg["recipients"]
-            recipients_label = "email_trigger_recipients"
+            recipients_label = "email_trigger_recipients(fallback)"
         else:
             recipients = cfg["recipients"]
             recipients_label = "recipients"
@@ -1388,8 +1412,10 @@ def _notify(title: str, msg: str) -> None:
         logging.debug("winotify 通知失敗（不影響流程）", exc_info=True)
 
 
-def trigger_job_async(trigger_label: str) -> None:
-    threading.Thread(target=_do_full_job, args=(trigger_label,),
+def trigger_job_async(trigger_label: str, override_recipients=None) -> None:
+    threading.Thread(target=_do_full_job,
+                     args=(trigger_label,),
+                     kwargs={"override_recipients": override_recipients},
                      name="ConsultJob", daemon=True).start()
 
 
@@ -1475,8 +1501,28 @@ def scheduler_loop() -> None:
                                 "（最近未讀主旨樣本，用來確認你的觸發信是否真的進收件匣）：%s",
                                 " | ".join(repr(s) for s in r["samples"]))
                     if r.get("triggered"):
-                        logging.info("收到觸發信（IMAP），立即執行 consult flow")
-                        trigger_job_async("email")
+                        # 寄件人白名單過濾：只有授權的 email 寄來的觸發信才生效
+                        senders = r.get("matched_senders") or []
+                        allow = set(cfg.get("allowed_trigger_senders") or [])
+                        allowed = [s for s in senders if s.lower() in allow]
+                        blocked = [s for s in senders if s.lower() not in allow]
+                        if blocked:
+                            logging.warning(
+                                "收到觸發信但寄件人不在白名單，已忽略：%s",
+                                ", ".join(blocked))
+                        if allowed:
+                            logging.info(
+                                "收到觸發信（IMAP），立即執行 consult flow；"
+                                "結果將回寄給觸發者：%s",
+                                ", ".join(allowed))
+                            trigger_job_async("email",
+                                              override_recipients=allowed)
+                        elif not blocked:
+                            # 比對到主旨但完全沒抓到 From → fallback 用設定的 recipients
+                            logging.info(
+                                "收到觸發信但無法解析 From，fallback 用 "
+                                "email_trigger_recipients")
+                            trigger_job_async("email")
         except Exception:
             logging.error("排程迴圈例外", exc_info=True)
         time.sleep(1)
