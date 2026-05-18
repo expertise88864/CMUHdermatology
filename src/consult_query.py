@@ -80,6 +80,7 @@ _user32.CloseDesktop.argtypes = [ctypes.c_void_p]
 from cmuh_common.atomic_io import atomic_write_json  # noqa: E402
 from cmuh_common.logging_setup import QueueHandler, setup_logging  # noqa: E402
 from cmuh_common.paths import get_app_dir, get_settings_dir  # noqa: E402
+from cmuh_common.platform_win import is_admin, run_as_admin  # noqa: E402
 from cmuh_common.single_instance import (  # noqa: E402
     ensure_single_instance, release_single_instance,
 )
@@ -1560,6 +1561,14 @@ def _check_update_in_background() -> None:
 # =============================================================================
 def main() -> None:
     try:
+        # 強制以系統管理員身份執行：systemftp.exe manifest 標記 requireAdministrator，
+        # 非 admin 行程呼叫 CreateProcess 會直接得到 ERROR_ELEVATION_REQUIRED (740)，
+        # 排程到點就會失敗（見 2026-05-16/17 log）。非 admin 一律走 UAC 重啟，
+        # run_as_admin() 內部會 sys.exit(0) 結束本進程，admin 重啟後才會繼續往下。
+        if not is_admin():
+            run_as_admin()
+            return  # 保險：理論上 run_as_admin 已 sys.exit
+
         _setup_logging()
         args = sys.argv[1:]
 
@@ -1594,6 +1603,9 @@ def main() -> None:
             sys.exit(0)
 
         logging.info("=== 會診查詢程式啟動 v%s ===", CURRENT_VERSION)
+        # 啟動權限狀態（給「自動提權有沒有真的生效」一個白紙黑字證據）
+        logging.info("執行權限：%s",
+                     "admin ✓" if is_admin() else "一般使用者 ✗（systemftp 會 740 失敗）")
         threading.Thread(target=_check_update_in_background,
                          name="ConsultUpdateChecker", daemon=True).start()
 
@@ -1638,6 +1650,12 @@ def main() -> None:
 
     except Exception:
         err = f"會診查詢程式發生嚴重錯誤：\n{traceback.format_exc()}"
+        # 先寫 log（如果 logging 已 setup）——之前只有 MessageBox，排程模式下
+        # 對話框被關掉就沒任何證據，事後完全沒法追。
+        try:
+            logging.exception("main() 攔截到未處理例外")
+        except Exception:
+            pass
         try:
             ctypes.windll.user32.MessageBoxW(0, err, "會診查詢程式錯誤", 0x10)
         except Exception:

@@ -183,8 +183,8 @@
       "key": "consult_query",
       "remote_path": "src/consult_query.py",
       "local_filename": "src/consult_query.py",
-      "version": "2026.05.15.6",
-      "sha256": "98d110f36de2ac69888abb6cb2a22f145d54730258c4b780ca1fc33925ff8e09"
+      "version": "2026.05.18.1",
+      "sha256": "8209624b72fa351d49dc16e14f631cc4bc3a9f15b0996107aafce53a5398cada"
     },
     {
       "key": "coord",
