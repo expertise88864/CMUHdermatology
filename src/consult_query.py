@@ -143,11 +143,13 @@ DEFAULT_CONFIG = {
     "sender_account": "cmuhdermatology@gmail.com",
     # 失敗自動重試：每次重試前 taskkill systemftp.exe 確保乾淨環境
     "retry_count": 3,
-    # 信件觸發：從任何地方寄一封信到你的 Outlook 信箱，主旨包含關鍵字 →
-    # 程式輪詢 60 秒一次，看到就把信標為已讀並立即執行一次。
-    # 院內網路擋外部連入，但 Outlook 收信是「往外連」抓郵件，所以可正常運作。
-    "email_trigger_enabled": False,
-    "email_trigger_subject_keyword": "[皮膚科會診觸發]",
+    # 信件觸發：從任何地方（手機 / 任何信箱）寄一封信到
+    # cmuhdermatology@gmail.com，主旨包含關鍵字 → 程式每 60 秒透過 IMAP 連
+    # imap.gmail.com:993 檢查一次，看到就把信標為已讀並立即跑一次 consult
+    # flow（截圖會診單 → 寄給 email_trigger_recipients，預設只給觸發者一人）。
+    # 用同一個 Gmail App Password (settings/smtp_credentials.json)。
+    "email_trigger_enabled": True,
+    "email_trigger_subject_keyword": "皮膚科會診觸發",
 }
 
 # Win32 視窗特徵（由探測 spike 實測得到，非寫死座標）
@@ -1445,27 +1447,35 @@ def scheduler_loop() -> None:
                     pass
                 logging.info("偵測到設定變更，重新建立排程")
                 _rebuild_schedule()
-            # 信件觸發：每 60 秒輪詢 Outlook 收件匣一次（啟用時）
+            # 信件觸發：每 60 秒輪詢一次收件匣（啟用時）。改用 IMAP 直連
+            # Gmail（imap.gmail.com:993），不再依賴 Outlook COM——後者在 admin
+            # 行程下會起一個沒設定郵件帳號的 admin Outlook，永遠收不到信。
             cfg = load_config()
             if cfg.get("email_trigger_enabled"):
                 if time.time() - last_email_check >= 60.0:
                     last_email_check = time.time()
                     kw = cfg.get("email_trigger_subject_keyword",
                                  DEFAULT_CONFIG["email_trigger_subject_keyword"])
-                    triggered, scanned, matched, inbox_path, samples, err = \
-                        _check_outlook_trigger(kw)
-                    if err:
-                        logging.warning("檢查觸發信失敗: %s", err)
+                    try:
+                        from cmuh_common.imap_reader import check_trigger as _imap_check
+                        r = _imap_check(kw)
+                    except Exception:
+                        logging.error("IMAP 觸發檢查模組例外", exc_info=True)
+                        r = {"triggered": False, "scanned": 0, "matched": 0,
+                              "samples": [], "error": "imap module exception"}
+                    if r.get("error"):
+                        logging.warning("檢查觸發信失敗: %s", r["error"])
                     else:
                         logging.info(
-                            "檢查觸發信 [%s]：篩到 %s 封主旨含 %r",
-                            inbox_path, matched, kw)
-                        if matched == 0 and samples:
+                            "檢查觸發信 [IMAP/%s]：未讀 %d 封，主旨含 %r 的 %d 封",
+                            cfg.get("sender_account", "?"),
+                            r["scanned"], kw, r["matched"])
+                        if r["matched"] == 0 and r["samples"]:
                             logging.info(
                                 "（最近未讀主旨樣本，用來確認你的觸發信是否真的進收件匣）：%s",
-                                " | ".join(repr(s) for s in samples))
-                    if triggered:
-                        logging.info("收到觸發信，立即執行")
+                                " | ".join(repr(s) for s in r["samples"]))
+                    if r.get("triggered"):
+                        logging.info("收到觸發信（IMAP），立即執行 consult flow")
                         trigger_job_async("email")
         except Exception:
             logging.error("排程迴圈例外", exc_info=True)
