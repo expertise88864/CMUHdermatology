@@ -2194,23 +2194,140 @@ def script_F3_adaptive():
     logging.info("F3 (adaptive): %s", "done" if ok else "skipped (no hospital window)")
 
 
-def script_F4_adaptive():
-    """F4 (解析度無關)：醫令 → 代碼輸入 → 51019 (照光) → Enter。
+def _find_療程_edit_hwnd(main_hwnd: int) -> int:
+    """動態找頂部 header「療程」輸入欄的 hwnd。
 
-    使用者澄清 (2026-05-18)：F4 的「1」要寫到頂部 header 區的「療程」欄位
-    （目前值常是 3，需改為 1）。舊版用座標 click_point(585, 117) 點 療程
-    欄。adaptive 版要找到該 Edit 的 hwnd 才能精準寫入——目前還沒有 probe
-    結果，暫時只做 51019+Enter，療程欄請手動填，待 probe_main_app_edits.py
-    跑完拿到 hwnd 再加邏輯。"""
+    probe (2026-05-18) 在 1280x1024 觀察到 療程 = TEditExt at (554, 104)
+    width 40。其他解析度欄位的相對位置可能略有差異，所以用「相對於 main
+    視窗的 y 介於 95-115、x 介於 500-620、寬度 < 60」的範圍找；命中多個取
+    最接近 x=554 的。
+
+    hwnd 每次開程式不同，但 child window 的 class 跟相對位置很穩定。"""
+    candidates = []
+
+    main_r = wintypes.RECT()
+    if not ctypes.windll.user32.GetWindowRect(main_hwnd, ctypes.byref(main_r)):
+        return 0
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def cb(child, lparam):
+        try:
+            cls_buf = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(child, cls_buf, 64)
+            if cls_buf.value != "TEditExt":
+                return True
+            r = wintypes.RECT()
+            if not ctypes.windll.user32.GetWindowRect(child, ctypes.byref(r)):
+                return True
+            rel_x = r.left - main_r.left
+            rel_y = r.top - main_r.top
+            w = r.right - r.left
+            if 95 <= rel_y <= 115 and 500 <= rel_x <= 620 and w < 60:
+                candidates.append((child, rel_x, rel_y, w))
+        except Exception:
+            pass
+        return True
+
+    ctypes.windll.user32.EnumChildWindows(main_hwnd, cb, 0)
+    if not candidates:
+        return 0
+    # 取最接近 x=554 的（probe 觀察值）
+    candidates.sort(key=lambda c: abs(c[1] - 554))
+    logging.debug("療程 候選欄位：%s, 選 hwnd=%s",
+                  candidates, candidates[0][0])
+    return candidates[0][0]
+
+
+def _replace_edit_text(field_hwnd: int, new_text: str,
+                       main_hwnd: int = 0) -> bool:
+    """把 field_hwnd 那個 Edit 的內容換成 new_text。
+
+    策略：click 該欄位中心 → 全選 (Ctrl+A) → typewrite 新值。比 SendMessage
+    WM_SETTEXT 更可靠（後者可能不會觸發 Delphi onChange 事件，server 端
+    submit 時拿到舊值）。
+
+    位置是 runtime 從 GetWindowRect 抓的，跟解析度無關。"""
+    try:
+        r = wintypes.RECT()
+        if not ctypes.windll.user32.GetWindowRect(field_hwnd, ctypes.byref(r)):
+            return False
+        cx = (r.left + r.right) // 2
+        cy = (r.top + r.bottom) // 2
+
+        # 暫存滑鼠位置 (操作完還原)
+        pt = wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        saved_x, saved_y = pt.x, pt.y
+
+        # 切英文 IME
+        if main_hwnd:
+            _force_ime_english(main_hwnd)
+        else:
+            _force_ime_english(field_hwnd)
+
+        # Click 進欄位 → 全選 → 換值
+        hotkey_modules.pyautogui.click(cx, cy)
+        time.sleep(0.05)
+        if main_hwnd:
+            _force_ime_english(main_hwnd)
+        hotkey_modules.pyautogui.hotkey("ctrl", "a")
+        time.sleep(0.02)
+        hotkey_modules.pyautogui.typewrite(new_text, interval=0.02)
+
+        # 還原滑鼠
+        try:
+            ctypes.windll.user32.SetCursorPos(saved_x, saved_y)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        logging.error("_replace_edit_text 失敗", exc_info=True)
+        return False
+
+
+def script_F4_adaptive():
+    """F4 (解析度無關)：醫令 → 代碼輸入 → 51019 (照光) → Enter → 療程改 1。
+
+    1. 觸發「醫令 → 代碼輸入」(SendMessage WM_COMMAND id=218)
+    2. 切英文 IME 後打 51019 + Enter（51019 加進醫令清單）
+    3. 動態找頂部 header「療程」TEditExt 的 hwnd
+    4. Click 進該欄位 + 全選 + 輸入「1」（無論原值是 0/3/任何值都改成 1）
+
+    使用者澄清 (2026-05-18)：F4 的「1」是要寫到頂部「療程」欄，
+    不是 grid 內某欄。舊版用座標 click_point(585, 117) 點，
+    adaptive 版用動態 GetWindowRect 找位置，跟解析度無關。"""
     if _maybe_run_override('adaptive', 'F4'): return
     logging.info("--- Executing F4 (adaptive / Win32) ---")
+    main_hwnd = _find_hospital_main_window()
+    if not main_hwnd:
+        logging.warning("F4 (adaptive): 找不到主程式視窗")
+        return
+    # Step 1+2: 代碼輸入 51019
     ok = _script_code_input_adaptive("51019", label="F4")
     if not ok:
-        logging.info("F4 (adaptive): skipped")
+        logging.info("F4 (adaptive): code input 失敗")
         return
+    time.sleep(0.15)
+    check_stop()
+    # Step 3: 找 療程 欄位
+    liaocheng_hwnd = _find_療程_edit_hwnd(main_hwnd)
+    if not liaocheng_hwnd:
+        logging.warning("F4 (adaptive): 找不到 療程 欄位，"
+                         "請手動填 1。可能版面有變動，需重新探測。")
+    else:
+        # Step 4: 改成 1
+        ok2 = _replace_edit_text(liaocheng_hwnd, "1", main_hwnd=main_hwnd)
+        if ok2:
+            logging.info("F4 (adaptive): 療程 欄位 (hwnd=%s) 已設為 1",
+                         liaocheng_hwnd)
+        else:
+            logging.warning("F4 (adaptive): 寫入 療程 失敗")
     if hasattr(_runner_1280, "last_action_time"):
         _runner_1280.last_action_time = time.time()
-    logging.info("F4 (adaptive): 51019 done. 療程欄請手動填 1（待 probe 完成後自動化）")
+    logging.info("F4 (adaptive): done")
 
 
 def _get_ime_focus_hwnd():
