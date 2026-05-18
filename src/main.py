@@ -4023,10 +4023,40 @@ class HotkeyScriptEditorWindow(tk.Toplevel):
 # =============================================================================
 # 止掛提醒寄信（Outlook COM，在獨立執行緒+逾時，避免卡到主迴圈）
 # =============================================================================
+def _send_alert_email_via_smtp(subject: str, body: str,
+                                recipients: list, timeout: float = 60.0) -> bool:
+    """達到門檻時透過 SMTP (Gmail) 寄信。回傳是否成功（失敗只 log，不影響主程式）。
+
+    為何用 SMTP 不用 Outlook：admin 行程的 Outlook COM 會起一個 admin Outlook
+    實例，用 administrator 的 MAPI profile（通常沒設定郵件帳號），mail.Send()
+    成功但信永遠卡在隱形 Outbox 寄不出。SMTP 跳過整個 UAC 跟 Outlook profile
+    地獄，admin/user 任何權限都能寄。設定見 settings/smtp_credentials.json。"""
+    if not recipients:
+        return False
+    try:
+        from cmuh_common.smtp_mail import (
+            SmtpNotConfiguredError, send_mail,
+        )
+    except Exception:
+        logging.warning("smtp_mail 模組載入失敗，止掛信跳過", exc_info=True)
+        return False
+    try:
+        send_mail(recipients=recipients, subject=subject, body=body,
+                  attachment_path=None, timeout=timeout)
+        return True
+    except SmtpNotConfiguredError as e:
+        logging.warning("止掛提醒寄信跳過（SMTP 尚未設定）：%s", e)
+        return False
+    except Exception as e:
+        logging.warning("止掛提醒 SMTP 寄信失敗：%s", e)
+        return False
+
+
 def _send_alert_email_via_outlook(subject: str, body: str,
                                   recipients: list, timeout: float = 60.0,
                                   sender_account: str = "") -> bool:
-    """達到門檻時透過 Outlook 寄信給設定的收件人；獨立執行緒+逾時防卡。
+    """【已淘汰，保留作為備援】透過 Outlook 寄信。
+    主流請用 _send_alert_email_via_smtp（直接走 Gmail SMTP，不會卡 Outbox）。
 
     sender_account：強制用此 SMTP 地址對應的 Outlook 帳號寄。找不到時退回
     預設帳號，並在 log 留 warning。空字串則直接用 Outlook 預設帳號。
@@ -8490,9 +8520,8 @@ class AutomationApp:
                                                                                 subj = (f"【止掛提醒】{dnd_tag}{dn} {sn}診 "
                                                                                         f"({today.year}/{today.month}/{today.day}) "
                                                                                         f"已達 {cnt}/{fth}")
-                                                                                _send_alert_email_via_outlook(
-                                                                                    subj, m, rcpts,
-                                                                                    sender_account=self.alert_email_sender)
+                                                                                _send_alert_email_via_smtp(
+                                                                                    subj, m, rcpts)
                                                                             except Exception:
                                                                                 logging.warning("止掛提醒寄信例外", exc_info=True)
                                                                 finally:

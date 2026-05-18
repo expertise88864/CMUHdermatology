@@ -134,8 +134,12 @@ DEFAULT_CONFIG = {
     "subject_template": "{date} {time} 皮膚科會診通知單",
     "body_template": "附件為 {date} {time} 皮膚科會診通知單截圖，由系統自動擷取寄送。",
     "enabled": True,
-    # 強制寄件人帳號（必須先在 Outlook 設定好此帳號；找不到時退回 Outlook
-    # 預設帳號）。換寄件人只要改這欄。
+    # 寄信方式："smtp"（推薦，預設，直接連 Gmail SMTP）或 "outlook"（透過
+    # Outlook COM；admin 行程跟 user-level Outlook profile 不同會卡在 Outbox，
+    # 不建議）。SMTP 設定見 settings/smtp_credentials.json。
+    "mail_method": "smtp",
+    # （Outlook 模式才用）強制寄件人帳號。SMTP 模式忽略此欄，用 smtp_credentials
+    # 的 from_address。
     "sender_account": "cmuhdermatology@gmail.com",
     # 失敗自動重試：每次重試前 taskkill systemftp.exe 確保乾淨環境
     "retry_count": 3,
@@ -1226,7 +1230,10 @@ def send_via_outlook(image_path: Path, subject: str, body: str,
     （先前第二次寄信卡死、整個任務不結束就是這個原因）。逾時或失敗會 raise。
 
     sender_account：強制用此 SMTP 地址對應的 Outlook 帳號寄信。空字串/None 則
-    用 Outlook 預設帳號。"""
+    用 Outlook 預設帳號。
+
+    【註】2026-05-18 改用 SMTP 為主（見 send_via_smtp）。本函式保留作為備援，
+    僅 mail_method="outlook" 時才會走到。"""
     if not recipients:
         raise RuntimeError("沒有設定收件人")
     result: dict = {}
@@ -1247,6 +1254,23 @@ def send_via_outlook(image_path: Path, subject: str, body: str,
         raise RuntimeError("Outlook 寄信未完成（原因不明）")
     sender_note = f"（寄件人 {sender_account}）" if sender_account else ""
     logging.info("已透過 Outlook 寄出給：%s%s", ", ".join(recipients), sender_note)
+
+
+def send_via_smtp(image_path: Path, subject: str, body: str,
+                  recipients: list, timeout: float = 60.0) -> None:
+    """用 SMTP 直接寄（Gmail / smtp.gmail.com）。
+
+    為何不用 Outlook：admin 行程的 Outlook COM 會起一個 admin Outlook 實例，
+    用 administrator 的 MAPI profile（通常沒設定任何郵件帳號），mail.Send()
+    成功但信永遠卡在隱形 Outbox 寄不出。SMTP 跳過整個 UAC + Outlook profile
+    地獄，任何權限都能寄。
+
+    使用 settings/smtp_credentials.json 的 cmuhdermatology@gmail.com + App
+    Password。檔案不存在會自動建立範本，password 為空會 raise
+    SmtpNotConfiguredError。"""
+    from cmuh_common.smtp_mail import send_mail
+    send_mail(recipients=recipients, subject=subject, body=body,
+              attachment_path=image_path, timeout=timeout)
 
 
 def _kill_systemftp() -> None:
@@ -1286,11 +1310,21 @@ def _do_full_job(trigger_label: str) -> None:
     import pythoncom
     pythoncom.CoInitialize()
     try:
-        if not _outlook_available():
-            logging.info("本機無可用 Outlook（多機部署：只有設定 Outlook 的那台會寄信），"
-                          "本次（%s）整個流程靜默跳過", trigger_label)
-            return
         cfg = load_config()
+        mail_method = str(cfg.get("mail_method", "smtp")).lower()
+        # SMTP 模式：檢查 password 是否已填，沒填則靜默跳過（多機部署：只有有
+        # 設 SMTP 的那台才寄）
+        if mail_method == "smtp":
+            from cmuh_common.smtp_mail import is_configured as _smtp_ready
+            if not _smtp_ready():
+                logging.info("SMTP 尚未設定（settings/smtp_credentials.json 缺 "
+                              "password），本次（%s）整個流程靜默跳過", trigger_label)
+                return
+        elif mail_method == "outlook":
+            if not _outlook_available():
+                logging.info("本機無可用 Outlook，本次（%s）整個流程靜默跳過",
+                              trigger_label)
+                return
         now = datetime.now()
         date_str = f"{now.year}/{now.month}/{now.day}"
         time_str = (trigger_label.replace(":", "")
@@ -1313,11 +1347,15 @@ def _do_full_job(trigger_label: str) -> None:
         last_err = None  # 最後一次的失敗例外，用於三次都失敗的 log
         for attempt in range(1, retry_count + 1):
             try:
-                logging.info("會診查詢任務 第 %d/%d 次嘗試（trigger=%s, 收件人組=%s）",
-                             attempt, retry_count, trigger_label, recipients_label)
+                logging.info("會診查詢任務 第 %d/%d 次嘗試（trigger=%s, 收件人組=%s, mail=%s）",
+                             attempt, retry_count, trigger_label,
+                             recipients_label, mail_method)
                 shot = run_consult_flow(trigger_label)
-                send_via_outlook(shot, subject, body, recipients,
-                                  sender_account=sender)
+                if mail_method == "smtp":
+                    send_via_smtp(shot, subject, body, recipients)
+                else:
+                    send_via_outlook(shot, subject, body, recipients,
+                                      sender_account=sender)
                 logging.info("會診查詢任務成功（第 %d 次嘗試）", attempt)
                 return  # 成功就跳出
             except Exception as e:
@@ -1641,31 +1679,69 @@ def _tray_configure(icon=None, item=None) -> None:
 
 
 def _send_test_email() -> None:
-    """只測 Outlook 寄信。本機無 Outlook 直接靜默跳過；成功失敗都不跳提示。
+    """測試寄信。依 cfg.mail_method 選 SMTP 或 Outlook。失敗會在 log 詳細記錄
+    並用 winotify 跳通知（讓使用者知道測試結果）。
 
-    用 test_recipients（預設只給 expertise88864@gmail.com 一個人，免擾其他收件人）
-    與 sender_account（預設 cmuhdermatology@gmail.com）。"""
+    用 test_recipients（預設只給 expertise88864@gmail.com 一個人，免擾其他收
+    件人）。SMTP 模式直接連 Gmail；Outlook 模式才需要 sender_account。"""
+    cfg = load_config()
+    mail_method = str(cfg.get("mail_method", "smtp")).lower()
+    recipients = cfg.get("test_recipients") or cfg["recipients"]
+    now = datetime.now()
+
+    if mail_method == "smtp":
+        from cmuh_common.smtp_mail import (
+            SmtpNotConfiguredError, is_configured, load_credentials, send_mail,
+        )
+        if not is_configured():
+            cred = load_credentials()
+            msg = (f"SMTP 尚未設定。請編輯 {Path(get_settings_dir()) / 'smtp_credentials.json'} "
+                    f"填入 password（cmuhdermatology@gmail.com 的 App Password）。\n"
+                    f"目前 host={cred['host']}, username={cred['username']}, "
+                    f"password={'已設定' if cred['password'] else '空字串'}")
+            logging.warning("測試寄信跳過：%s", msg)
+            _notify("測試寄信失敗", "SMTP password 未設定，請看 log")
+            return
+        try:
+            send_mail(
+                recipients=recipients,
+                subject="皮膚科會診查詢 — 測試信 (SMTP)",
+                body=(f"這是一封測試信，寄送時間 {now:%Y-%m-%d %H:%M:%S}。\n"
+                      f"若收到此信，代表 SMTP 寄信與收件人設定正常。\n"
+                      f"（寄件人：{load_credentials()['from_address']}, "
+                      f"方式：SMTP / smtp.gmail.com）"),
+                attachment_path=None,
+            )
+            _notify("測試寄信成功", f"已寄給 {recipients[0]}（SMTP）")
+        except SmtpNotConfiguredError as e:
+            logging.warning("測試寄信跳過：%s", e)
+            _notify("測試寄信失敗", "SMTP 未設定完整，請看 log")
+        except Exception as e:
+            logging.error("測試寄信失敗：%s", e, exc_info=True)
+            _notify("測試寄信失敗", f"{type(e).__name__}: {e}")
+        return
+
+    # Outlook fallback path
     if not _outlook_available():
         logging.info("本機無可用 Outlook，測試寄信靜默跳過")
         return
     import pythoncom
     pythoncom.CoInitialize()
     try:
-        cfg = load_config()
-        now = datetime.now()
-        recipients = cfg.get("test_recipients") or cfg["recipients"]
         sender = cfg.get("sender_account", "") or ""
         send_via_outlook(
             None,
-            "皮膚科會診查詢 — 測試信",
+            "皮膚科會診查詢 — 測試信 (Outlook)",
             f"這是一封測試信，寄送時間 {now:%Y-%m-%d %H:%M:%S}。\n"
             f"若收到此信，代表 Outlook 寄信與收件人設定正常。\n"
             f"（寄件人：{sender or 'Outlook 預設帳號'}）",
             recipients,
             sender_account=sender,
         )
+        _notify("測試寄信成功", f"已寄給 {recipients[0]}（Outlook）")
     except Exception as e:
         logging.error("測試寄信失敗：%s", e, exc_info=True)
+        _notify("測試寄信失敗", f"{type(e).__name__}: {e}")
     finally:
         try:
             pythoncom.CoUninitialize()
