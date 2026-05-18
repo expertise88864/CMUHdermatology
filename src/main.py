@@ -2330,6 +2330,244 @@ def script_F4_adaptive():
     logging.info("F4 (adaptive): done")
 
 
+# =============================================================================
+# F9/F10 (同意書) — 通用 Win32 helpers
+# =============================================================================
+# 同意書開立作業 視窗 class = TOrMain（snapshot 2026-05-18 證實）。
+# 「其他 → 同意書」menu id = 668（user 測試確認）。
+# 流程：
+#   1. SendMessage(TFopdmain, WM_COMMAND, 668)  → 打開 TOrMain 視窗
+#   2. 等 TOrMain 出現 (FindWindow loop)
+#   3. 切到「手術及治療」TTabSheet（點 tab header）
+#   4. 點 MO04 (F9) / MU02 (F10) radio (TGroupButton text 含 code)
+#   5. 點「開立電子」TButton
+#   6+ 後續 popup 操作（Round 2 之後加）
+
+MENU_ID_同意書 = 668
+
+
+def _find_window_by_class_title(class_name: str, title_kw: str = "",
+                                  exclude_hwnd: int = 0) -> int:
+    """全域找 class=X 且 title 含 keyword 的可見視窗。"""
+    found = [0]
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def cb(hwnd, lparam):
+        try:
+            if hwnd == exclude_hwnd:
+                return True
+            if not ctypes.windll.user32.IsWindowVisible(hwnd):
+                return True
+            cls_buf = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(hwnd, cls_buf, 64)
+            if cls_buf.value != class_name:
+                return True
+            if title_kw:
+                n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                if n > 0:
+                    t_buf = ctypes.create_unicode_buffer(n + 1)
+                    ctypes.windll.user32.GetWindowTextW(hwnd, t_buf, n + 1)
+                    if title_kw not in t_buf.value:
+                        return True
+                else:
+                    return True
+            found[0] = hwnd
+            return False
+        except Exception:
+            pass
+        return True
+
+    ctypes.windll.user32.EnumWindows(cb, 0)
+    return found[0]
+
+
+def _wait_for_window(class_name: str, title_kw: str = "",
+                       timeout: float = 10.0,
+                       exclude_hwnd: int = 0) -> int:
+    """每 100ms 找一次，最多等 timeout 秒。回傳 hwnd 或 0。"""
+    end = time.time() + timeout
+    while time.time() < end:
+        hwnd = _find_window_by_class_title(class_name, title_kw, exclude_hwnd)
+        if hwnd:
+            return hwnd
+        check_stop()
+        time.sleep(0.1)
+    return 0
+
+
+def _find_descendant_by_class_text(parent_hwnd: int,
+                                     target_class: str,
+                                     text_keyword: str) -> int:
+    """EnumChildWindows 找 class=X 且 text 含 keyword 的子視窗（遞迴）。"""
+    found = [0]
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def cb(child, lparam):
+        try:
+            cls_buf = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(child, cls_buf, 64)
+            if cls_buf.value == target_class:
+                n = ctypes.windll.user32.GetWindowTextLengthW(child)
+                if n > 0:
+                    t_buf = ctypes.create_unicode_buffer(n + 1)
+                    ctypes.windll.user32.GetWindowTextW(child, t_buf, n + 1)
+                    if text_keyword in t_buf.value:
+                        found[0] = child
+                        return False
+        except Exception:
+            pass
+        return True
+
+    ctypes.windll.user32.EnumChildWindows(parent_hwnd, cb, 0)
+    return found[0]
+
+
+def _click_control_center(hwnd: int) -> bool:
+    """Click 該控制項在螢幕上的中心。位置由 runtime GetWindowRect 取，
+    跟解析度無關。會暫存/還原滑鼠位置避免干擾使用者。"""
+    if not hwnd:
+        return False
+    try:
+        r = wintypes.RECT()
+        if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r)):
+            return False
+        cx = (r.left + r.right) // 2
+        cy = (r.top + r.bottom) // 2
+        pt = wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        saved_x, saved_y = pt.x, pt.y
+        hotkey_modules.pyautogui.click(cx, cy)
+        try:
+            ctypes.windll.user32.SetCursorPos(saved_x, saved_y)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        logging.error("_click_control_center 失敗", exc_info=True)
+        return False
+
+
+def _click_button_by_text(parent_hwnd: int, text: str) -> bool:
+    """找 TButton text 完全等於 text → BM_CLICK 觸發（最乾淨，不動滑鼠）。"""
+    btn = _find_descendant_by_class_text(parent_hwnd, "TButton", text)
+    if not btn:
+        return False
+    BM_CLICK = 0x00F5
+    ctypes.windll.user32.SendMessageW(btn, BM_CLICK, 0, 0)
+    return True
+
+
+def _click_tab_by_text(or_hwnd: int, tab_text: str) -> bool:
+    """切到指定 TabSheet。先找 TTabSheet hwnd 拿到 rect，再 click 該 tab
+    上方的 header 區（y 在 tabsheet rect 之上約 12 px 處）。"""
+    sheet = _find_descendant_by_class_text(or_hwnd, "TTabSheet", tab_text)
+    if not sheet:
+        return False
+    try:
+        r = wintypes.RECT()
+        if not ctypes.windll.user32.GetWindowRect(sheet, ctypes.byref(r)):
+            return False
+        cx = (r.left + r.right) // 2
+        cy = r.top - 12  # tab header 通常比 tab area 上方
+        pt = wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        sx, sy = pt.x, pt.y
+        hotkey_modules.pyautogui.click(cx, cy)
+        try:
+            ctypes.windll.user32.SetCursorPos(sx, sy)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _click_radio_by_text(parent_hwnd: int, text_keyword: str) -> bool:
+    """找 TGroupButton text 含 keyword → click 中心。TGroupButton 在
+    Delphi 是 RadioGroup 的內部 child；BM_CLICK 對 TGroupButton 不可靠，
+    用 mouse click 較穩。"""
+    radio = _find_descendant_by_class_text(parent_hwnd, "TGroupButton",
+                                             text_keyword)
+    if not radio:
+        return False
+    return _click_control_center(radio)
+
+
+def script_F9_F10_consent_form_adaptive(form_code: str, label: str = "") -> bool:
+    """Round 1：從主程式 → 開同意書視窗 → 選 tab → 選 radio → 開立電子。
+
+    form_code：'MO04' (F9) 或 'MU02' (F10)，會在 手術及治療 tab 找對應 radio
+    回傳 True = 跑到 開立電子 那步；False = 中間某步失敗。
+
+    Round 2+ 還要做：popup 內 所患疾病/手術原因/片語/麻醉 + 開立電子 + 確認"""
+    # Step 1: 找主程式 → 觸發 其他→同意書
+    main_hwnd = _find_hospital_main_window()
+    if not main_hwnd:
+        logging.warning("[%s] 找不到主程式視窗", label)
+        return False
+    WM_COMMAND = 0x0111
+    ctypes.windll.user32.SendMessageW(main_hwnd, WM_COMMAND,
+                                        MENU_ID_同意書, 0)
+    logging.info("[%s] 已觸發 其他→同意書 (id=%s)", label, MENU_ID_同意書)
+
+    # Step 2: 等 TOrMain 視窗出現
+    or_hwnd = _wait_for_window("TOrMain", title_kw="同意書開立作業",
+                                 timeout=8)
+    if not or_hwnd:
+        logging.warning("[%s] 等不到 TOrMain 視窗", label)
+        return False
+    logging.info("[%s] TOrMain hwnd=%s 已開啟", label, or_hwnd)
+    time.sleep(0.3)  # 等視窗 paint 完成
+    check_stop()
+
+    # Step 3: 切到「手術及治療」tab
+    if not _click_tab_by_text(or_hwnd, "手術及治療"):
+        logging.warning("[%s] 找不到/切換 手術及治療 tab 失敗", label)
+        return False
+    logging.info("[%s] 已切到 手術及治療 tab", label)
+    time.sleep(0.3)
+    check_stop()
+
+    # Step 4: 點 form_code 對應的 radio (MO04 / MU02)
+    if not _click_radio_by_text(or_hwnd, form_code):
+        logging.warning("[%s] 找不到 radio (text 含 %s)", label, form_code)
+        return False
+    logging.info("[%s] 已選 radio %s", label, form_code)
+    time.sleep(0.2)
+    check_stop()
+
+    # Step 5: 點 開立電子 按鈕
+    if not _click_button_by_text(or_hwnd, "開立電子"):
+        logging.warning("[%s] 找不到 開立電子 按鈕", label)
+        return False
+    logging.info("[%s] 已點 開立電子，等候 popup（Round 2+ 才會處理）", label)
+    return True
+
+
+def script_F9_adaptive():
+    """F9 (解析度無關)：其他→同意書 → 手術及治療 → MO04 皮膚腫瘤手術 → 開立電子。
+    Round 1 限定：到開立電子停。popup 內後續步驟待 Round 2+ 完成。"""
+    if _maybe_run_override('adaptive', 'F9'): return
+    logging.info("--- Executing F9 (adaptive Round 1) ---")
+    ok = script_F9_F10_consent_form_adaptive("MO04", label="F9")
+    logging.info("F9 (adaptive): %s", "step1-5 done" if ok else "中斷")
+
+
+def script_F10_adaptive():
+    """F10 (解析度無關)：其他→同意書 → 手術及治療 → MU02 皮膚切片處置 → 開立電子。
+    Round 1 限定：到開立電子停。popup 內後續步驟待 Round 2+ 完成。"""
+    if _maybe_run_override('adaptive', 'F10'): return
+    logging.info("--- Executing F10 (adaptive Round 1) ---")
+    ok = script_F9_F10_consent_form_adaptive("MU02", label="F10")
+    logging.info("F10 (adaptive): %s", "step1-5 done" if ok else "中斷")
+
+
 def _get_ime_focus_hwnd():
     """取得前景應用程式真正有焦點的控制項 handle（需 AttachThreadInput）。"""
     try:
@@ -4107,30 +4345,32 @@ def _canonical_clinic_session_str(s) -> str:
 def _hotkey_builtin_map_for_profile(profile: str) -> dict:
     """profile → 熱鍵鍵名 → 內建函式（覆寫載入失敗時回退）。
 
-    F3 / F4 已改為 adaptive (Win32 SendMessage)，跨解析度共用一份程式碼，
-    不再依賴座標。舊的 per-resolution F3/F4 函式保留但已不被 dispatch 引用，
-    待 F9-F11 也改完後可清理。"""
+    F3 / F4 / F9 / F10 已改為 adaptive (Win32 SendMessage + EnumChildWindows
+    + click 動態找到的 hwnd 中心)，跨解析度共用一份程式碼。F9/F10 目前是
+    Round 1：到「開立電子」按鈕停，popup 內操作下回合再加。
+    F11 仍是 per-resolution（後續再改）。"""
     if profile == "1920x1080":
         return {
             "F3": script_F3_adaptive,
             "F4": script_F4_adaptive,
-            "F10": script_F10_1920x1080,
+            "F9": script_F9_adaptive,
+            "F10": script_F10_adaptive,
             "F11": script_F11_1920x1080,
         }
     if profile == "1280x1024":
         return {
             "F3": script_F3_adaptive,
             "F4": script_F4_adaptive,
-            "F9": script_F9_1280x1024,
-            "F10": script_F10_1280x1024,
+            "F9": script_F9_adaptive,
+            "F10": script_F10_adaptive,
             "F11": script_F11_1280x1024,
         }
     if profile == "1024x768":
         return {
             "F3": script_F3_adaptive,
             "F4": script_F4_adaptive,
-            "F9": script_F9_1024x768,
-            "F10": script_F10_1024x768,
+            "F9": script_F9_adaptive,
+            "F10": script_F10_adaptive,
             "F11": script_F11_1024x768,
         }
     return {}
@@ -9360,28 +9600,28 @@ class AutomationApp:
             hotkey_info_text = ""
             if profile == '1920x1080':
                 hotkeys_to_register = {
-                    # F3/F4 改用 adaptive (Win32 SendMessage)，跨解析度共用
                     'F3': (script_F3_adaptive, "F3: 冷凍 51017 (Win32)"),
                     'F4': (script_F4_adaptive, "F4: 照光 51019 (Win32)"),
-                    'F10': (script_F10_1920x1080, "F10: 皮膚切片同意書 (1920x1080)"),
+                    'F9': (script_F9_adaptive, "F9: 腫瘤同意書 (Win32 R1)"),
+                    'F10': (script_F10_adaptive, "F10: 切片同意書 (Win32 R1)"),
                     'F11': (script_F11_1920x1080, "F11: 快速完成 (1920x1080)")
                 }
-                hotkey_info_text = "F3:冷凍 F4:照光 F10:切片同意書\nF11:快速完成 F12:終止"
+                hotkey_info_text = "F3:冷凍 F4:照光 F9:腫瘤 F10:切片\nF11:快速完成 F12:終止"
             elif profile == '1280x1024':
                 hotkeys_to_register = {
                     'F3': (script_F3_adaptive, "F3: 51017 (Win32)"),
                     'F4': (script_F4_adaptive, "F4: 51019 (Win32)"),
-                    'F9': (script_F9_1280x1024, "F9: 腫瘤同意書 (1280x1024)"),
-                    'F10': (script_F10_1280x1024, "F10: 切片同意書 (1280x1024)"),
+                    'F9': (script_F9_adaptive, "F9: 腫瘤同意書 (Win32 R1)"),
+                    'F10': (script_F10_adaptive, "F10: 切片同意書 (Win32 R1)"),
                     'F11': (script_F11_1280x1024, "F11: 快速完成 (1280x1024)")
                 }
                 hotkey_info_text = "F3:51017 F4:51019 F9:腫瘤 F10:切片\nF11:快速完成 F12:終止"
             elif profile == '1024x768':
                 hotkeys_to_register = {
                     'F3': (script_F3_adaptive, "F3: 冷凍 51017 (Win32)"),
-                    'F4': (script_F4_adaptive, "F4: 照光 51019 (Win32)"),
-                    'F9': (script_F9_1024x768, "F9: 皮膚腫瘤同意書"),
-                    'F10': (script_F10_1024x768, "F10: 皮膚切片同意書"),
+                    'F4': (script_F4_adaptive, "F4: 51019 (Win32)"),
+                    'F9': (script_F9_adaptive, "F9: 腫瘤同意書 (Win32 R1)"),
+                    'F10': (script_F10_adaptive, "F10: 切片同意書 (Win32 R1)"),
                     'F11': (script_F11_1024x768, "F11: 快速完成")
                 }
                 hotkey_info_text = "F3:冷凍 F4:照光 F9:腫瘤同意書\nF10:切片同意書 F11:快速完成 F12:終止"
