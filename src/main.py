@@ -2482,30 +2482,105 @@ def _enum_direct_children(parent_hwnd: int,
     return children
 
 
+def _get_window_text(hwnd: int) -> str:
+    n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+    if n <= 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(n + 1)
+    ctypes.windll.user32.GetWindowTextW(hwnd, buf, n + 1)
+    return buf.value
+
+
+def _find_page_control_by_tab_set(or_hwnd: int, expected_tabs: list) -> int:
+    """找 TPageControl 的直系 TTabSheet text 集合『包含』所有 expected_tabs
+    的那個。視窗裡可能有很多 nested PageControl（snapshot 顯示 29 個），
+    用這個判斷篩出『正確那個』，不會誤觸隱藏的 nested tab。"""
+    page_controls = []
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def cb(child, lparam):
+        try:
+            cls_buf = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(child, cls_buf, 64)
+            if cls_buf.value == "TPageControl":
+                page_controls.append(child)
+        except Exception:
+            pass
+        return True
+
+    ctypes.windll.user32.EnumChildWindows(or_hwnd, cb, 0)
+
+    expected_set = set(expected_tabs)
+    for pc in page_controls:
+        sheets = _enum_direct_children(pc, "TTabSheet")
+        texts = {_get_window_text(s) for s in sheets}
+        # 必須【完整包含】所有 expected_tabs（允許多）
+        if expected_set.issubset(texts):
+            logging.info("_find_page_control: pc=%s sheets_texts=%s",
+                          pc, sorted(texts))
+            return pc
+    return 0
+
+
 def _switch_tab_by_text(or_hwnd: int, tab_text: str) -> bool:
-    """切到指定 text 的 TTabSheet。用 TCM_SETCURFOCUS 直接命令 parent
-    TPageControl 切 tab，避開「click 位置算錯」的問題（tab header 通常
-    左對齊，centered click 會落在空白區）。"""
-    sheet = _find_descendant_by_class_text(or_hwnd, "TTabSheet", tab_text)
-    if not sheet:
+    """切到指定 text 的 TTabSheet。
+
+    策略：
+      1. 找『有 手術/手術及治療/檢查 三個直系 tab』的 TPageControl（避開
+         nested 同名 TabSheet）
+      2. 算出目標 tab 的 index
+      3. 用 TCM_GETITEMRECT 拿到 tab header 的精確螢幕位置 → click
+         （TCM_SETCURFOCUS 對 Delphi TPageControl 不一定觸發切換，click 最穩）
+      4. 同時送 TCM_SETCURSEL + TCM_SETCURFOCUS 作 fallback
+    """
+    EXPECTED_TABS = ["手術", "手術及治療", "檢查"]
+    pc = _find_page_control_by_tab_set(or_hwnd, EXPECTED_TABS)
+    if not pc:
+        logging.warning("_switch_tab: 找不到 包含 3 個 tab 的 PageControl")
         return False
-    page_ctrl = ctypes.windll.user32.GetParent(sheet)
-    if not page_ctrl:
+    sheets = _enum_direct_children(pc, "TTabSheet")
+    target_idx = -1
+    for i, s in enumerate(sheets):
+        if _get_window_text(s) == tab_text:
+            target_idx = i
+            break
+    if target_idx < 0:
+        logging.warning("_switch_tab: PageControl 內找不到 text='%s' 的 tab", tab_text)
         return False
-    # 列 PageControl 的直系子 TTabSheet 找 index
-    tabs = _enum_direct_children(page_ctrl, "TTabSheet")
-    if sheet not in tabs:
-        return False
-    idx = tabs.index(sheet)
-    # TCM_SETCURFOCUS = TCM_FIRST(0x1300) + 48 = 0x1330。
-    # 對標準 TabCtrl/TPageControl 會同時改 focus + 觸發 OnChange。
-    TCM_SETCURFOCUS = 0x1330
-    ctypes.windll.user32.SendMessageW(page_ctrl, TCM_SETCURFOCUS, idx, 0)
-    # 備援：再送 TCM_SETCURSEL + WM_NOTIFY TCN_SELCHANGE
+    logging.info("_switch_tab: pc=%s target_idx=%d (tab=%s)", pc, target_idx, tab_text)
+
+    # Approach 1: TCM_GETITEMRECT → click tab header (最可靠)
+    TCM_GETITEMRECT = 0x130A
+    rect = wintypes.RECT()
+    if ctypes.windll.user32.SendMessageW(pc, TCM_GETITEMRECT, target_idx,
+                                          ctypes.byref(rect)):
+        # rect 是 PageControl client 座標
+        pt = wintypes.POINT()
+        pt.x = (rect.left + rect.right) // 2
+        pt.y = (rect.top + rect.bottom) // 2
+        # 轉螢幕座標
+        ctypes.windll.user32.ClientToScreen(pc, ctypes.byref(pt))
+        logging.info("_switch_tab: tab header rect (client) %s,%s-%s,%s → screen (%d,%d)",
+                      rect.left, rect.top, rect.right, rect.bottom, pt.x, pt.y)
+        # 暫存/還原滑鼠
+        saved = wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(saved))
+        hotkey_modules.pyautogui.click(pt.x, pt.y)
+        try:
+            ctypes.windll.user32.SetCursorPos(saved.x, saved.y)
+        except Exception:
+            pass
+    else:
+        logging.warning("_switch_tab: TCM_GETITEMRECT 失敗，僅送 message")
+
+    # Approach 2 (補強): TCM_SETCURSEL + TCM_SETCURFOCUS
     TCM_SETCURSEL = 0x130C
-    ctypes.windll.user32.SendMessageW(page_ctrl, TCM_SETCURSEL, idx, 0)
-    logging.info("_switch_tab_by_text: page_ctrl=%s, sheet=%s, idx=%d",
-                  page_ctrl, sheet, idx)
+    TCM_SETCURFOCUS = 0x1330
+    ctypes.windll.user32.SendMessageW(pc, TCM_SETCURSEL, target_idx, 0)
+    ctypes.windll.user32.SendMessageW(pc, TCM_SETCURFOCUS, target_idx, 0)
     return True
 
 
