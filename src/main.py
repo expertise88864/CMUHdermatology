@@ -92,7 +92,7 @@ from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, as_completed, 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, time as dt_time
 from queue import Empty, Queue
-from typing import Any, NotRequired, TypedDict, TypeAlias, Union
+from typing import Any, NotRequired, Optional, TypedDict, TypeAlias, Union
 
 class DoctorConfig(TypedDict):
     name: str
@@ -2433,29 +2433,43 @@ def _find_descendant_by_class_text(parent_hwnd: int,
     return found[0]
 
 
-def _click_control_center(hwnd: int) -> bool:
-    """Click 該控制項在螢幕上的中心。位置由 runtime GetWindowRect 取，
-    跟解析度無關。會暫存/還原滑鼠位置避免干擾使用者。"""
+def _post_click_to_control(hwnd: int, client_x: Optional[int] = None,
+                             client_y: Optional[int] = None) -> bool:
+    """送 WM_LBUTTONDOWN + WM_LBUTTONUP 到目標 control，完全不動實體滑鼠。
+
+    位置用 client 座標（相對於該 control 左上角）；不指定就用該 control 的
+    client 中心。比 pyautogui.click 好處：
+      1. 不會移動實體滑鼠（不會干擾使用者）
+      2. 不會被 SetCursorPos 競賽條件影響
+      3. 訊息直接到目標 control，不會被別人攔截
+
+    對 Delphi VCL 大部分控制項都生效（TButton/TBitBtn/TGroupButton/TabCtrl
+    等都處理 WM_LBUTTONDOWN 來觸發 click event）。"""
     if not hwnd:
         return False
     try:
-        r = wintypes.RECT()
-        if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r)):
-            return False
-        cx = (r.left + r.right) // 2
-        cy = (r.top + r.bottom) // 2
-        pt = wintypes.POINT()
-        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-        saved_x, saved_y = pt.x, pt.y
-        hotkey_modules.pyautogui.click(cx, cy)
-        try:
-            ctypes.windll.user32.SetCursorPos(saved_x, saved_y)
-        except Exception:
-            pass
+        if client_x is None or client_y is None:
+            r = wintypes.RECT()
+            if not ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(r)):
+                return False
+            client_x = (r.right - r.left) // 2 if client_x is None else client_x
+            client_y = (r.bottom - r.top) // 2 if client_y is None else client_y
+        lparam = ((client_y & 0xFFFF) << 16) | (client_x & 0xFFFF)
+        MK_LBUTTON = 0x0001
+        WM_LBUTTONDOWN = 0x0201
+        WM_LBUTTONUP = 0x0202
+        ctypes.windll.user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+        ctypes.windll.user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lparam)
         return True
     except Exception:
-        logging.error("_click_control_center 失敗", exc_info=True)
+        logging.error("_post_click_to_control 失敗", exc_info=True)
         return False
+
+
+def _click_control_center(hwnd: int) -> bool:
+    """【相容介面】等同 _post_click_to_control(hwnd) — 不動滑鼠，送訊息點擊
+    control 的 client center。原本用 pyautogui.click 會閃動滑鼠，已改成訊息。"""
+    return _post_click_to_control(hwnd)
 
 
 def _click_button_by_text(parent_hwnd: int, text: str) -> bool:
@@ -2577,24 +2591,14 @@ def _switch_tab_by_text(or_hwnd: int, tab_text: str) -> bool:
         return False
     logging.info("_switch_tab: pc=%s target_idx=%d (tab=%s)", pc, target_idx, tab_text)
 
-    # Approach 1: click 估算的 tab header 位置（不用 GetItemRect 避免 cross-process hang）
-    # Delphi TPageControl 預設 tab 高度約 21px、tab 上 padding 4px → y=12 為中心
-    # 估算 client_x（基於常見中文 tab 寬度）：
+    # Approach 1: PostMessage WM_LBUTTONDOWN/UP 到 PageControl 的 tab header
+    # 內部 client 位置（不動實體滑鼠，比 pyautogui.click 不會閃）
+    # Delphi TPageControl tab 高度 ~21px、上 padding 4px → y=12 為中心
     est_x = {0: 30, 1: 105, 2: 195}.get(target_idx, 30 + target_idx * 75)
     est_y = 12
-    pt = wintypes.POINT()
-    pt.x = est_x
-    pt.y = est_y
-    ctypes.windll.user32.ClientToScreen(pc, ctypes.byref(pt))
-    logging.info("_switch_tab: estimated tab header client=(%d,%d) → screen=(%d,%d)",
-                  est_x, est_y, pt.x, pt.y)
-    saved = wintypes.POINT()
-    ctypes.windll.user32.GetCursorPos(ctypes.byref(saved))
-    hotkey_modules.pyautogui.click(pt.x, pt.y)
-    try:
-        ctypes.windll.user32.SetCursorPos(saved.x, saved.y)
-    except Exception:
-        pass
+    logging.info("_switch_tab: post WM_LBUTTONDOWN to pc client=(%d,%d)",
+                  est_x, est_y)
+    _post_click_to_control(pc, client_x=est_x, client_y=est_y)
 
     # Approach 2 (雙保險): TCM_SETCURSEL + TCM_SETCURFOCUS，加 timeout
     TCM_SETCURSEL = 0x130C
