@@ -2134,6 +2134,30 @@ def _ensure_hospital_foreground(hwnd: int) -> None:
         logging.debug("_ensure_hospital_foreground 失敗", exc_info=True)
 
 
+def _force_ime_english(hwnd: int = 0) -> None:
+    """把當前前景視窗（或指定 hwnd）的 IME 切到英文模式（關閉 IME 轉換）。
+
+    用 ImmSetOpenStatus(himc, False) 對 IME context 設「不開」=「直接送
+    英文字」。對 Delphi VCL 應用通常立刻生效，不會像 Ctrl+Space 那樣依賴
+    使用者 IME 設定。
+    為什麼必要：使用者中文輸入法（注音/新酷音/微軟拼音）打開時，
+    pyautogui.typewrite("51017") 的 "5" 會被 IME 攔截當作組字輸入，
+    結果什麼都沒寫進輸入欄。強制切英文徹底避免這個問題。"""
+    try:
+        imm32 = ctypes.windll.imm32
+        target = hwnd or ctypes.windll.user32.GetForegroundWindow()
+        if not target:
+            return
+        himc = imm32.ImmGetContext(target)
+        if himc:
+            try:
+                imm32.ImmSetOpenStatus(himc, False)
+            finally:
+                imm32.ImmReleaseContext(target, himc)
+    except Exception:
+        logging.debug("_force_ime_english 失敗（IME 模組不可用？忽略）", exc_info=True)
+
+
 def _script_code_input_adaptive(code: str, label: str = "") -> bool:
     """共通流程：找視窗 → SendMessage 觸發代碼輸入 → 等焦點 → 打代碼 → Enter。
 
@@ -2146,9 +2170,13 @@ def _script_code_input_adaptive(code: str, label: str = "") -> bool:
         return False
     _ensure_hospital_foreground(hwnd)
     time.sleep(0.05)
+    # 先切英文 IME (避免中文 IME 攔截 typewrite，"5" 被當組字結果什麼都沒寫進去)
+    _force_ime_english(hwnd)
     _send_yiling_menu_command(hwnd, MENU_ID_代碼輸入)
     # 等焦點移到醫令代碼欄
     time.sleep(0.15)
+    # 焦點換到 grid 後 IME 可能又被切回中文，再切一次
+    _force_ime_english(hwnd)
     check_stop()
     # 打代碼 — 焦點此時在 grid 內的 inplace edit，pyautogui 直接送到前景視窗
     hotkey_modules.pyautogui.typewrite(code, interval=0.02)
@@ -2167,27 +2195,22 @@ def script_F3_adaptive():
 
 
 def script_F4_adaptive():
-    """F4 (解析度無關)：醫令 → 代碼輸入 → 51019 (照光) → Enter → 數量「1」。
+    """F4 (解析度無關)：醫令 → 代碼輸入 → 51019 (照光) → Enter。
 
-    舊版有額外的 click 數量欄 + type "1" 步驟。adaptive 版先做 51019+Enter，
-    然後直接 typewrite("1")——如果 Delphi grid 在 Enter 後焦點自動跳到下一
-    欄（常見行為），直接打 "1" 就會填到數量欄。若 Delphi 沒自動跳，需要先
-    送 Tab 鍵：把下面那行的註解打開即可。"""
+    使用者澄清 (2026-05-18)：F4 的「1」要寫到頂部 header 區的「療程」欄位
+    （目前值常是 3，需改為 1）。舊版用座標 click_point(585, 117) 點 療程
+    欄。adaptive 版要找到該 Edit 的 hwnd 才能精準寫入——目前還沒有 probe
+    結果，暫時只做 51019+Enter，療程欄請手動填，待 probe_main_app_edits.py
+    跑完拿到 hwnd 再加邏輯。"""
     if _maybe_run_override('adaptive', 'F4'): return
     logging.info("--- Executing F4 (adaptive / Win32) ---")
     ok = _script_code_input_adaptive("51019", label="F4")
     if not ok:
         logging.info("F4 (adaptive): skipped")
         return
-    time.sleep(0.1)
-    check_stop()
-    # 若 Enter 後焦點沒自動跳到數量欄，改成 send Tab：
-    # hotkey_modules.pyautogui.press("tab")
-    # time.sleep(0.05)
-    hotkey_modules.pyautogui.typewrite("1")
     if hasattr(_runner_1280, "last_action_time"):
         _runner_1280.last_action_time = time.time()
-    logging.info("F4 (adaptive): done")
+    logging.info("F4 (adaptive): 51019 done. 療程欄請手動填 1（待 probe 完成後自動化）")
 
 
 def _get_ime_focus_hwnd():
