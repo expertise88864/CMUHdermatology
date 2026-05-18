@@ -2202,17 +2202,25 @@ def script_F3_adaptive():
 def _find_療程_edit_hwnd(main_hwnd: int) -> int:
     """動態找頂部 header「療程」輸入欄的 hwnd。
 
-    probe (2026-05-18) 在 1280x1024 觀察到 療程 = TEditExt at (554, 104)
-    width 40。其他解析度欄位的相對位置可能略有差異，所以用「相對於 main
-    視窗的 y 介於 95-115、x 介於 500-620、寬度 < 60」的範圍找；命中多個取
-    最接近 x=554 的。
+    策略：抓 main_hwnd 內所有「頂部 row 的 TEditExt」（相對 y < 130），依
+    left 排序，取第 5 個（idx=4）= 療程。
 
-    hwnd 每次開程式不同，但 child window 的 class 跟相對位置很穩定。"""
-    candidates = []
+    probe (2026-05-18 在 1280x1024) 顯示頂部 row 7 個 TEditExt 從左到右：
+      [0] (66, 104)  身份/診斷
+      [1] (137, 104) (副)
+      [2] (278, 104) 負擔   'A12'
+      [3] (412, 104) 卡號   'IC49'
+      [4] (554, 104) 療程 ✓ '1'
+      [5] (666, 104) 類別
+      [6] (777, 104) 體重
 
+    用「第 5 個」比 hardcode x 範圍更穩 — 不同解析度／DPI／sub-form 位置
+    可能不同，但「左到右第 5 個」是 Delphi 設計上固定的順序。"""
     main_r = wintypes.RECT()
     if not ctypes.windll.user32.GetWindowRect(main_hwnd, ctypes.byref(main_r)):
         return 0
+
+    edits = []
 
     EnumWindowsProc = ctypes.WINFUNCTYPE(
         wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -2227,23 +2235,28 @@ def _find_療程_edit_hwnd(main_hwnd: int) -> int:
             r = wintypes.RECT()
             if not ctypes.windll.user32.GetWindowRect(child, ctypes.byref(r)):
                 return True
-            rel_x = r.left - main_r.left
             rel_y = r.top - main_r.top
-            w = r.right - r.left
-            if 95 <= rel_y <= 115 and 500 <= rel_x <= 620 and w < 60:
-                candidates.append((child, rel_x, rel_y, w))
+            # 頂部 row：相對 y < 130（容許 1280→1920 寬鬆 padding）
+            if 80 <= rel_y <= 135:
+                edits.append((child, r.left, r.top, r.right - r.left))
         except Exception:
             pass
         return True
 
     ctypes.windll.user32.EnumChildWindows(main_hwnd, cb, 0)
-    if not candidates:
+    # 去重 (EnumChildWindows 可能重複)
+    seen = set()
+    uniq = [e for e in edits if not (e[0] in seen or seen.add(e[0]))]
+    # 依 left 由左至右排序
+    uniq.sort(key=lambda e: e[1])
+    logging.info("頂部 row TEditExt 從左至右 (%d 個): %s",
+                  len(uniq), [(e[0], e[1] - main_r.left, e[3]) for e in uniq])
+    if len(uniq) < 5:
+        logging.warning("頂部 row TEditExt 數 %d < 5 無法定位 療程", len(uniq))
         return 0
-    # 取最接近 x=554 的（probe 觀察值）
-    candidates.sort(key=lambda c: abs(c[1] - 554))
-    logging.debug("療程 候選欄位：%s, 選 hwnd=%s",
-                  candidates, candidates[0][0])
-    return candidates[0][0]
+    療程_hwnd = uniq[4][0]
+    logging.info("療程 = 第 5 個 TEditExt hwnd=%s", 療程_hwnd)
+    return 療程_hwnd
 
 
 def _replace_edit_text(field_hwnd: int, new_text: str,
@@ -2403,6 +2416,92 @@ def _wait_for_window(class_name: str, title_kw: str = "",
     return 0
 
 
+# =============================================================================
+# Smart Foreground Protector — F9/F10 背景執行時保護使用者焦點
+# =============================================================================
+# 設計：背景 thread 監看 foreground。
+#   - 預設不動：使用者在醫院視窗，新 popup 開了就讓它開（正常前景）
+#   - 偵測到使用者切到「非醫院視窗」(Chrome / Notepad / ...) → 記住該視窗
+#   - 此後若有醫院視窗搶 foreground → 立刻 SetForegroundWindow 回到使用者視窗
+#
+# 這樣 UX：
+#   - 「不切走」= 使用者看著流程跑（popup 正常顯示，可監視）
+#   - 「切走」= popup 全在背景，使用者不受打擾
+# 比硬 HWND_BOTTOM 好太多（後者把 popup 推到底層使用者看不到、且每次都搶
+# 一下 focus 跳回主視窗）
+
+HOSPITAL_WINDOW_CLASSES = {
+    "TFopdmain",         # 主程式 (西醫門診醫師作業)
+    "TOrMain",           # 同意書開立作業
+    "Tfm_agree",         # 列印同意/說明書 popup
+    "TfrmOrrSentence",   # 請選擇片語 popup
+    "#32770",            # Windows 標準警告對話框
+}
+
+
+class _ForegroundProtector:
+    """背景 thread 保護使用者非醫院視窗的 focus。"""
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = None
+        self.tracked_user_hwnd = 0
+        self._restore_count = 0
+
+    def start(self):
+        # 初始：若 foreground 是非醫院視窗，先記下來（保護它）
+        cur = ctypes.windll.user32.GetForegroundWindow()
+        if cur and _get_class_name_of(cur) not in HOSPITAL_WINDOW_CLASSES:
+            self.tracked_user_hwnd = cur
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="F9_F10_ForegroundProtector", daemon=True)
+        self._thread.start()
+        logging.info("ForegroundProtector started, tracked=%s",
+                     self.tracked_user_hwnd)
+
+    def stop(self):
+        self._stop.set()
+        logging.info("ForegroundProtector stopped (restored %d times)",
+                     self._restore_count)
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                cur = ctypes.windll.user32.GetForegroundWindow()
+                if not cur:
+                    time.sleep(0.1)
+                    continue
+                cur_cls = _get_class_name_of(cur)
+                is_hospital = cur_cls in HOSPITAL_WINDOW_CLASSES
+                if is_hospital:
+                    # 醫院視窗成為 foreground。如果使用者有追蹤的非醫院視窗，
+                    # 就 restore 它。否則 (使用者本來就在醫院視窗) 不動。
+                    if (self.tracked_user_hwnd
+                            and ctypes.windll.user32.IsWindow(self.tracked_user_hwnd)):
+                        ctypes.windll.user32.SetForegroundWindow(self.tracked_user_hwnd)
+                        self._restore_count += 1
+                else:
+                    # 非醫院視窗 = 使用者「真的」想用的視窗，記下來
+                    if cur != self.tracked_user_hwnd:
+                        self.tracked_user_hwnd = cur
+                        logging.debug("ForegroundProtector tracked=%s (%s)",
+                                       cur, cur_cls)
+            except Exception:
+                pass
+            time.sleep(0.1)
+
+
+def _get_class_name_of(hwnd: int) -> str:
+    """便捷 wrapper, 取 hwnd 的 class name。"""
+    try:
+        buf = ctypes.create_unicode_buffer(64)
+        ctypes.windll.user32.GetClassNameW(hwnd, buf, 64)
+        return buf.value
+    except Exception:
+        return ""
+
+
 def _send_window_to_back(hwnd: int) -> bool:
     """把視窗推到 z-order 最底層（不活化、不搶 focus）。
 
@@ -2551,7 +2650,6 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
         logging.info("[%s] 沒等到警告對話框 (可能直接送出)", label)
         return True
     logging.info("[%s] 警告對話框 hwnd=%s", label, dlg)
-    _send_window_to_back(dlg)
     time.sleep(0.3)
     check_stop()
 
@@ -2786,7 +2884,6 @@ def _select_phrase_and_return(片語_btn_hwnd: int, row_idx: int,
         logging.warning("[%s] 等不到 TfrmOrrSentence popup", label)
         return False
     logging.info("[%s] 片語 popup hwnd=%s", label, phrase_popup)
-    _send_window_to_back(phrase_popup)
     time.sleep(0.4)  # 等 popup 完全 paint
     check_stop()
 
@@ -3020,6 +3117,16 @@ def _f9_f10_round2_popup_actions(popup_hwnd: int, label: str = "") -> bool:
     return True
 
 
+def _run_with_foreground_protector(fn, *args, **kwargs):
+    """跑 fn 時啟動 ForegroundProtector 保護使用者非醫院視窗 focus。"""
+    protector = _ForegroundProtector()
+    protector.start()
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        protector.stop()
+
+
 def script_F9_F10_consent_form_adaptive(form_code: str,
                                           phrase_row_所患: int = 0,
                                           phrase_row_手術: int = 0,
@@ -3048,8 +3155,7 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
         logging.warning("[%s] 等不到 TOrMain 視窗", label)
         return False
     logging.info("[%s] TOrMain hwnd=%s 已開啟", label, or_hwnd)
-    # 推到底層，不搶 foreground (使用者可在其他視窗作業)
-    _send_window_to_back(or_hwnd)
+    # 不主動推到底層 — ForegroundProtector 會在使用者切走時才保護
     time.sleep(0.3)  # 等視窗 paint 完成
     check_stop()
 
@@ -3083,7 +3189,6 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
         logging.warning("[%s] 等不到 popup (Tfm_agree)", label)
         return False
     logging.info("[%s] popup hwnd=%s 已開啟", label, popup)
-    _send_window_to_back(popup)
     # popup 視窗出現 ≠ 資料 load 完。Delphi 通常 popup 先 paint 空白 → 再從病歷
     # 帶入欄位資料。若太早 clear，後續 load 會覆蓋掉我們清空的字。
     # 給 2 秒讓 OnShow 完成 + server roundtrip + UI fill。
@@ -3108,29 +3213,32 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
 
 
 def script_F9_adaptive():
-    """F9 (解析度無關)：腫瘤手術同意書全自動流程。
-    Round 1+2+3 完成：開同意書 → 手術及治療 → MO04 → 開立電子 → popup 清空
-    + 局麻 → 兩個片語自動選 (皮膚腫瘤 / 治療)。
-    Round 4+ 待加：popup 開立電子 + 確認對話框。"""
+    """F9 (解析度無關)：腫瘤手術同意書全自動流程 R1-R4。
+    流程：開同意書 → 手術及治療 → MO04 → 開立電子 → popup 清空+局麻
+         → 兩片語自動選 (皮膚腫瘤 / 治療) → popup 開立電子 → 警告對話框「是」
+    全程不主動推到背景；ForegroundProtector 只在使用者切到非醫院視窗時
+    才保護其 focus（讓使用者可選擇看或不看）。"""
     if _maybe_run_override('adaptive', 'F9'): return
-    logging.info("--- Executing F9 (adaptive R1+2+3) ---")
+    logging.info("--- Executing F9 (adaptive R1-R4) ---")
     # F9 row index: 所患疾病=3 (皮膚腫瘤), 手術原因=0 (治療)
-    ok = script_F9_F10_consent_form_adaptive(
+    ok = _run_with_foreground_protector(
+        script_F9_F10_consent_form_adaptive,
         "MO04", phrase_row_所患=3, phrase_row_手術=0, label="F9")
-    logging.info("F9 (adaptive): %s", "R1-3 done" if ok else "中斷")
+    logging.info("F9 (adaptive): %s", "R1-R4 done" if ok else "中斷")
 
 
 def script_F10_adaptive():
-    """F10 (解析度無關)：切片同意書全自動流程。
-    Round 1+2+3 完成：開同意書 → 手術及治療 → MU02 → 開立電子 → popup 清空
-    + 局麻 → 兩個片語自動選 (皮膚疾患 / 確診)。
-    Round 4+ 待加：popup 開立電子 + 確認對話框。"""
+    """F10 (解析度無關)：切片同意書全自動流程 R1-R4。
+    流程：開同意書 → 手術及治療 → MU02 → 開立電子 → popup 清空+局麻
+         → 兩片語自動選 (皮膚疾患 / 確診) → popup 開立電子 → 警告對話框「是」
+    背景保護同 F9。"""
     if _maybe_run_override('adaptive', 'F10'): return
-    logging.info("--- Executing F10 (adaptive R1+2+3) ---")
+    logging.info("--- Executing F10 (adaptive R1-R4) ---")
     # F10 row index: 所患疾病=0 (皮膚疾患), 手術原因=1 (確診)
-    ok = script_F9_F10_consent_form_adaptive(
+    ok = _run_with_foreground_protector(
+        script_F9_F10_consent_form_adaptive,
         "MU02", phrase_row_所患=0, phrase_row_手術=1, label="F10")
-    logging.info("F10 (adaptive): %s", "R1-3 done" if ok else "中斷")
+    logging.info("F10 (adaptive): %s", "R1-R4 done" if ok else "中斷")
 
 
 def _get_ime_focus_hwnd():
