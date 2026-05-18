@@ -2624,6 +2624,136 @@ def _click_radio_by_text(parent_hwnd: int, text_keyword: str) -> bool:
 
 
 # =============================================================================
+# F9/F10 Round 3 — 片語選擇 popup (TfrmOrrSentence)
+# =============================================================================
+# user 觀察 (2026-05-18) row index 對應：
+#   所患疾病 popup 列表 (固定順序所有電腦一致)：
+#     [0] 皮膚疾患       ← F10 用這個
+#     [1] 指甲內生
+#     [2] 皮膚角化症
+#     [3] 皮膚腫瘤       ← F9 用這個
+#     [4] 血管瘤
+#     ...
+#   手術原因 popup 列表：
+#     [0] 治療           ← F9 用這個
+#     [1] 確診           ← F10 用這個
+#     [2] 改善
+#     [3] 外觀改善
+#
+# popup 結構：
+#   TfrmOrrSentence (popup, 850x600)
+#     ├── TPanel (top toolbar)
+#     │   ├── TButton "帶回" ← 確認選擇 + 關閉 popup
+#     │   └── TButton "離開"
+#     └── TPageControl → TTabSheet → TStringAlignGrid ← phrase 列表
+
+
+def _send_key_to_window(hwnd: int, vk: int, count: int = 1,
+                         interval: float = 0.05) -> None:
+    """對指定 hwnd 送 N 次 VK 鍵 (WM_KEYDOWN + WM_KEYUP)。用 PostMessage
+    非同步，不需要 foreground，也不會被 IME 攔截。"""
+    WM_KEYDOWN = 0x0100
+    WM_KEYUP = 0x0101
+    for _ in range(count):
+        ctypes.windll.user32.PostMessageW(hwnd, WM_KEYDOWN, vk, 0)
+        ctypes.windll.user32.PostMessageW(hwnd, WM_KEYUP, vk, 0)
+        time.sleep(interval)
+
+
+def _select_phrase_and_return(片語_btn_hwnd: int, row_idx: int,
+                                label: str = "") -> bool:
+    """單一片語欄位流程：點片語按鈕 → 等 popup → grid VK_DOWN N 次 →
+    點帶回 → 等 popup 關。
+
+    Default 高亮列 = row 0（user 觀察）。若 row_idx > 0 就 VK_DOWN row_idx 次。
+    """
+    # 點 片語 button (async, opens TfrmOrrSentence popup)
+    if not _post_click_to_control(片語_btn_hwnd):
+        logging.warning("[%s] 點 片語 button 失敗", label)
+        return False
+    logging.info("[%s] 已點 片語 button hwnd=%s", label, 片語_btn_hwnd)
+
+    # Wait for 片語 popup (timeout 8s)
+    phrase_popup = _wait_for_window("TfrmOrrSentence",
+                                      title_kw="請選擇片語", timeout=8)
+    if not phrase_popup:
+        logging.warning("[%s] 等不到 TfrmOrrSentence popup", label)
+        return False
+    logging.info("[%s] 片語 popup hwnd=%s", label, phrase_popup)
+    time.sleep(0.4)  # 等 popup 完全 paint
+    check_stop()
+
+    # Find grid (only 1 in popup)
+    grids = _enum_class_in_window(phrase_popup, "TStringAlignGrid")
+    if not grids:
+        logging.warning("[%s] popup 內找不到 TStringAlignGrid", label)
+        return False
+    grid = grids[0][0]
+    logging.info("[%s] grid hwnd=%s", label, grid)
+
+    # Navigate to row_idx by sending VK_DOWN (default selected = row 0)
+    VK_DOWN = 0x28
+    if row_idx > 0:
+        _send_key_to_window(grid, VK_DOWN, count=row_idx, interval=0.05)
+        logging.info("[%s] grid 已 VK_DOWN %d 次 → row %d", label, row_idx, row_idx)
+        time.sleep(0.2)
+    else:
+        logging.info("[%s] row=0 (default highlight)，無需 VK_DOWN", label)
+    check_stop()
+
+    # 點 帶回 button (async)
+    if not _click_button_by_text(phrase_popup, "帶回"):
+        logging.warning("[%s] popup 內找不到 帶回 button", label)
+        return False
+    logging.info("[%s] 已點 帶回", label)
+
+    # 等 popup 關閉（class TfrmOrrSentence 消失）
+    end_t = time.time() + 5
+    while time.time() < end_t:
+        if not _find_window_by_class_title("TfrmOrrSentence", "請選擇片語"):
+            logging.info("[%s] 片語 popup 已關閉", label)
+            return True
+        time.sleep(0.1)
+        check_stop()
+    logging.warning("[%s] 片語 popup 未在 5 秒內關閉（可能仍卡）", label)
+    return True  # 還是回 True 讓主流程繼續
+
+
+def _f9_f10_round3_phrases(popup_hwnd: int, row_所患: int, row_手術: int,
+                              label: str = "") -> bool:
+    """對 popup 內 2 個片語欄位依序執行選擇流程。
+
+    row_所患: 所患疾病 popup 內目標 row (從 0 開始)
+    row_手術: 手術原因 popup 內目標 row (從 0 開始)
+    """
+    # 找 3 個 「片語」 TButton (位置在 x≈464, y=200/252/317)
+    all_buttons = _enum_class_in_window(popup_hwnd, "TButton")
+    pien = [b for b in all_buttons if 460 <= b[2] <= 470]
+    pien.sort(key=lambda b: b[1])  # by top
+    if len(pien) < 3:
+        logging.warning("[%s] 找不到 3 個 片語 button (找到 %d 個)",
+                         label, len(pien))
+        return False
+    btn_所患 = pien[0][0]
+    # pien[1] = 實施手術名稱旁邊 (不用)
+    btn_手術 = pien[2][0]
+    logging.info("[%s] 片語 buttons: 所患=%s 手術=%s", label, btn_所患, btn_手術)
+
+    # Step A: 所患疾病 片語
+    if not _select_phrase_and_return(btn_所患, row_所患,
+                                       label=label + "/所患疾病片語"):
+        return False
+    time.sleep(0.3)  # 等 Tfm_agree popup 重 paint 新值
+
+    # Step B: 手術原因 片語
+    if not _select_phrase_and_return(btn_手術, row_手術,
+                                       label=label + "/手術原因片語"):
+        return False
+    time.sleep(0.3)
+    return True
+
+
+# =============================================================================
 # F9/F10 Round 2 — popup 視窗 (Tfm_agree) 內操作
 # =============================================================================
 # Popup class = "Tfm_agree", title 含 "列印同意"
@@ -2745,7 +2875,10 @@ def _f9_f10_round2_popup_actions(popup_hwnd: int, label: str = "") -> bool:
     return True
 
 
-def script_F9_F10_consent_form_adaptive(form_code: str, label: str = "") -> bool:
+def script_F9_F10_consent_form_adaptive(form_code: str,
+                                          phrase_row_所患: int = 0,
+                                          phrase_row_手術: int = 0,
+                                          label: str = "") -> bool:
     """Round 1：從主程式 → 開同意書視窗 → 選 tab → 選 radio → 開立電子。
 
     form_code：'MO04' (F9) 或 'MU02' (F10)，會在 手術及治療 tab 找對應 radio
@@ -2811,26 +2944,39 @@ def script_F9_F10_consent_form_adaptive(form_code: str, label: str = "") -> bool
 
     # Step 7 (Round 2): 清空 2 個 edit + 勾 局麻
     _f9_f10_round2_popup_actions(popup, label=label)
-    logging.info("[%s] Round 2 完成。Round 3+ 會做：點 片語/選項/帶回/開立電子/確認", label)
+    logging.info("[%s] Round 2 完成 (清空+局麻)", label)
+
+    # Step 8 (Round 3): 對 2 個片語欄位執行 click 片語→選 row→帶回
+    check_stop()
+    _f9_f10_round3_phrases(popup, phrase_row_所患, phrase_row_手術, label=label)
+    logging.info("[%s] Round 3 完成 (片語)。Round 4 會做：開立電子+確認對話框", label)
     return True
 
 
 def script_F9_adaptive():
-    """F9 (解析度無關)：其他→同意書 → 手術及治療 → MO04 皮膚腫瘤手術 → 開立電子。
-    Round 1 限定：到開立電子停。popup 內後續步驟待 Round 2+ 完成。"""
+    """F9 (解析度無關)：腫瘤手術同意書全自動流程。
+    Round 1+2+3 完成：開同意書 → 手術及治療 → MO04 → 開立電子 → popup 清空
+    + 局麻 → 兩個片語自動選 (皮膚腫瘤 / 治療)。
+    Round 4+ 待加：popup 開立電子 + 確認對話框。"""
     if _maybe_run_override('adaptive', 'F9'): return
-    logging.info("--- Executing F9 (adaptive Round 1) ---")
-    ok = script_F9_F10_consent_form_adaptive("MO04", label="F9")
-    logging.info("F9 (adaptive): %s", "step1-5 done" if ok else "中斷")
+    logging.info("--- Executing F9 (adaptive R1+2+3) ---")
+    # F9 row index: 所患疾病=3 (皮膚腫瘤), 手術原因=0 (治療)
+    ok = script_F9_F10_consent_form_adaptive(
+        "MO04", phrase_row_所患=3, phrase_row_手術=0, label="F9")
+    logging.info("F9 (adaptive): %s", "R1-3 done" if ok else "中斷")
 
 
 def script_F10_adaptive():
-    """F10 (解析度無關)：其他→同意書 → 手術及治療 → MU02 皮膚切片處置 → 開立電子。
-    Round 1 限定：到開立電子停。popup 內後續步驟待 Round 2+ 完成。"""
+    """F10 (解析度無關)：切片同意書全自動流程。
+    Round 1+2+3 完成：開同意書 → 手術及治療 → MU02 → 開立電子 → popup 清空
+    + 局麻 → 兩個片語自動選 (皮膚疾患 / 確診)。
+    Round 4+ 待加：popup 開立電子 + 確認對話框。"""
     if _maybe_run_override('adaptive', 'F10'): return
-    logging.info("--- Executing F10 (adaptive Round 1) ---")
-    ok = script_F9_F10_consent_form_adaptive("MU02", label="F10")
-    logging.info("F10 (adaptive): %s", "step1-5 done" if ok else "中斷")
+    logging.info("--- Executing F10 (adaptive R1+2+3) ---")
+    # F10 row index: 所患疾病=0 (皮膚疾患), 手術原因=1 (確診)
+    ok = script_F9_F10_consent_form_adaptive(
+        "MU02", phrase_row_所患=0, phrase_row_手術=1, label="F10")
+    logging.info("F10 (adaptive): %s", "R1-3 done" if ok else "中斷")
 
 
 def _get_ime_focus_hwnd():
