@@ -2403,6 +2403,32 @@ def _wait_for_window(class_name: str, title_kw: str = "",
     return 0
 
 
+def _send_window_to_back(hwnd: int) -> bool:
+    """把視窗推到 z-order 最底層（不活化、不搶 focus）。
+
+    用於 F9/F10 流程：醫院系統開新視窗時預設會搶 foreground 打斷使用者，
+    用這個推到底層 → 使用者保持當前視窗。我們所有的訊息都用 PostMessage，
+    不需要視窗是 foreground 就能跑。
+
+    SWP_NOACTIVATE：不要把 hwnd 變 active
+    SWP_NOMOVE/SWP_NOSIZE：保持位置 / 大小
+    HWND_BOTTOM (=1)：z-order 最底"""
+    if not hwnd:
+        return False
+    try:
+        SWP_NOACTIVATE = 0x0010
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        HWND_BOTTOM = 1
+        ctypes.windll.user32.SetWindowPos(
+            hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE)
+        return True
+    except Exception:
+        logging.debug("_send_window_to_back 失敗", exc_info=True)
+        return False
+
+
 def _find_descendant_by_class_text(parent_hwnd: int,
                                      target_class: str,
                                      text_keyword: str) -> int:
@@ -2525,6 +2551,7 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
         logging.info("[%s] 沒等到警告對話框 (可能直接送出)", label)
         return True
     logging.info("[%s] 警告對話框 hwnd=%s", label, dlg)
+    _send_window_to_back(dlg)
     time.sleep(0.3)
     check_stop()
 
@@ -2759,6 +2786,7 @@ def _select_phrase_and_return(片語_btn_hwnd: int, row_idx: int,
         logging.warning("[%s] 等不到 TfrmOrrSentence popup", label)
         return False
     logging.info("[%s] 片語 popup hwnd=%s", label, phrase_popup)
+    _send_window_to_back(phrase_popup)
     time.sleep(0.4)  # 等 popup 完全 paint
     check_stop()
 
@@ -3020,6 +3048,8 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
         logging.warning("[%s] 等不到 TOrMain 視窗", label)
         return False
     logging.info("[%s] TOrMain hwnd=%s 已開啟", label, or_hwnd)
+    # 推到底層，不搶 foreground (使用者可在其他視窗作業)
+    _send_window_to_back(or_hwnd)
     time.sleep(0.3)  # 等視窗 paint 完成
     check_stop()
 
@@ -3053,6 +3083,7 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
         logging.warning("[%s] 等不到 popup (Tfm_agree)", label)
         return False
     logging.info("[%s] popup hwnd=%s 已開啟", label, popup)
+    _send_window_to_back(popup)
     # popup 視窗出現 ≠ 資料 load 完。Delphi 通常 popup 先 paint 空白 → 再從病歷
     # 帶入欄位資料。若太早 clear，後續 load 會覆蓋掉我們清空的字。
     # 給 2 秒讓 OnShow 完成 + server roundtrip + UI fill。
