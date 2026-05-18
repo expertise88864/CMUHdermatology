@@ -57,7 +57,9 @@ def collect_entries(version: str) -> list:
         "安裝開機自動啟動.ps1",
         "移除開機自動啟動.cmd",
         "移除開機自動啟動.ps1",
-        "啟動會診查詢程式.cmd",
+        # 啟動會診查詢程式.cmd 已刪除（2026-05-18）：用途被 ONLOGON 排程
+        # cover，需要手動觸發時用 schtasks /Run /TN "CMUH皮膚科會診查詢自動啟動"
+        # 一行即可。
     ]
     for fn in extra_root_files:
         p = REPO_ROOT / fn
