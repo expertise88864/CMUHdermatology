@@ -2112,13 +2112,18 @@ def _find_hospital_main_window() -> int:
 
 
 def _send_yiling_menu_command(hwnd: int, menu_id: int) -> None:
-    """對主程式視窗送 WM_COMMAND 觸發「醫令」子選單項目。
+    """對主程式視窗送 WM_COMMAND 觸發 menu 項目。
 
-    用 SendMessage (同步) 而非 PostMessage — Delphi VCL action 派發需要等
-    handler 回應才完成。HIWORD(wParam)=0 表示來源是 menu (不是 accelerator
-    或 control)。"""
+    用 PostMessage (非同步)：實測 (2026-05-18 12:43 F9) 用 SendMessage 會卡 11+ 秒
+    沒回應——當 hospital app 處理 WM_COMMAND 開新 modal 視窗時，handler
+    可能 block。Post 不會 hang，主程式有空就會處理。後續用 _wait_for_window
+    poll 視窗出現。
+
+    HIWORD(wParam)=0 表示來源是 menu (不是 accelerator/control)。
+    F3/F4 觸發代碼輸入 (id=218) 用 Send 跑得通，是因為代碼輸入是輕量 UI
+    操作（focus 跳到 grid）；開 modal 同意書視窗 (id=668) 重量級。"""
     WM_COMMAND = 0x0111
-    ctypes.windll.user32.SendMessageW(hwnd, WM_COMMAND, menu_id, 0)
+    ctypes.windll.user32.PostMessageW(hwnd, WM_COMMAND, menu_id, 0)
 
 
 def _ensure_hospital_foreground(hwnd: int) -> None:
@@ -2623,9 +2628,10 @@ def script_F9_F10_consent_form_adaptive(form_code: str, label: str = "") -> bool
         logging.warning("[%s] 找不到主程式視窗", label)
         return False
     WM_COMMAND = 0x0111
-    ctypes.windll.user32.SendMessageW(main_hwnd, WM_COMMAND,
+    # 用 Post (非同步) 避免 SendMessage 卡住 (實測 2026-05-18 12:43)
+    ctypes.windll.user32.PostMessageW(main_hwnd, WM_COMMAND,
                                         MENU_ID_同意書, 0)
-    logging.info("[%s] 已觸發 其他→同意書 (id=%s)", label, MENU_ID_同意書)
+    logging.info("[%s] 已觸發 其他→同意書 (id=%s, Post)", label, MENU_ID_同意書)
 
     # Step 2: 等 TOrMain 視窗出現
     or_hwnd = _wait_for_window("TOrMain", title_kw="同意書開立作業",
