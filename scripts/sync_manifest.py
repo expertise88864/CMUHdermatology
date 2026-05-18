@@ -50,12 +50,24 @@ def collect_entries(version: str) -> list:
             "sha256": sha256_of(py),
         })
     # [O34] 也把 repo root 的 hotkey_overrides.json 納入（多台電腦自動同步）
-    extra_root_files = ["hotkey_overrides.json"]
+    # 開機自動啟動相關腳本也納入，方便多台電腦同步取得最新版（layout 修正等）
+    extra_root_files = [
+        "hotkey_overrides.json",
+        "安裝開機自動啟動.cmd",
+        "安裝開機自動啟動.ps1",
+        "移除開機自動啟動.cmd",
+        "移除開機自動啟動.ps1",
+        "啟動會診查詢程式.cmd",
+    ]
     for fn in extra_root_files:
         p = REPO_ROOT / fn
         if p.is_file():
+            key = (fn.replace(".json", "")
+                     .replace(".cmd", "_cmd")
+                     .replace(".ps1", "_ps1")
+                     .replace(".", "_"))
             entries.append({
-                "key": fn.replace(".json", "").replace(".", "_"),
+                "key": key,
                 "remote_path": fn,
                 "local_filename": fn,
                 "version": version,

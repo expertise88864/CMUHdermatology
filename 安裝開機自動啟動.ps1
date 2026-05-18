@@ -70,9 +70,13 @@ foreach ($p in $programs) {
 }
 
 # === 建立 GUI ===
+# 注意：之前 Size=560x420 在某些 DPI / Chinese font 下會把按鈕擠出可視範圍
+# （bug 報告：2026-05-18 1280x1024 + admin cmd 視窗下，套用設定按鈕看不到）。
+# 改用 AutoSize=false 但給足空間（580x560）+ 按鈕 anchor bottom-right，
+# 並用 Padding 而不是手算 y 座標。
 $form = New-Object System.Windows.Forms.Form
 $form.Text = '中國醫皮膚科 — 開機自動啟動設定'
-$form.Size = New-Object System.Drawing.Size(560, 420)
+$form.ClientSize = New-Object System.Drawing.Size(580, 540)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
@@ -134,23 +138,31 @@ $lblNote.Text = (
     "`n  • 取消勾選 → 移除排程（不再自動啟動）" +
     "`n  • 大部分電腦只需要勾【主程式】；打卡/會診查詢全皮膚科只需一台電腦執行")
 $lblNote.Location = New-Object System.Drawing.Point(15, ($y + 5))
-$lblNote.Size = New-Object System.Drawing.Size(520, 75)
+$lblNote.Size = New-Object System.Drawing.Size(550, 90)
 $lblNote.ForeColor = [System.Drawing.Color]::DarkSlateGray
 $form.Controls.Add($lblNote)
 
-# OK / Cancel 按鈕
+# OK / Cancel 按鈕（anchor 到右下角，無論 form 多高都看得到）
+$formH = $form.ClientSize.Height
+$formW = $form.ClientSize.Width
+
 $btnOk = New-Object System.Windows.Forms.Button
 $btnOk.Text = '套用設定'
-$btnOk.Location = New-Object System.Drawing.Point(335, 340)
-$btnOk.Size = New-Object System.Drawing.Size(100, 30)
+$btnOk.Location = New-Object System.Drawing.Point(($formW - 230), ($formH - 50))
+$btnOk.Size = New-Object System.Drawing.Size(105, 36)
+$btnOk.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
 $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
+$btnOk.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+$btnOk.ForeColor = [System.Drawing.Color]::White
+$btnOk.FlatStyle = 'Flat'
 $form.Controls.Add($btnOk)
 $form.AcceptButton = $btnOk
 
 $btnCancel = New-Object System.Windows.Forms.Button
 $btnCancel.Text = '取消'
-$btnCancel.Location = New-Object System.Drawing.Point(445, 340)
-$btnCancel.Size = New-Object System.Drawing.Size(100, 30)
+$btnCancel.Location = New-Object System.Drawing.Point(($formW - 120), ($formH - 50))
+$btnCancel.Size = New-Object System.Drawing.Size(105, 36)
+$btnCancel.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
 $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
 $form.Controls.Add($btnCancel)
 $form.CancelButton = $btnCancel
