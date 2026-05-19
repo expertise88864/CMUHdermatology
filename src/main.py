@@ -2240,14 +2240,11 @@ def script_F3_adaptive():
 
 
 def script_F5_adaptive():
-    """F5: KOH — 開 醫令→代碼輸入 dialog；不打代碼也不送 Enter，
-    游標停在 醫令代碼 cell 等使用者手動輸入 KOH 代碼後按 Enter。"""
+    """F5: KOH — 醫令→代碼輸入 → 13017 → Enter (不改療程)。"""
     if _maybe_run_override('adaptive', 'F5'): return
-    logging.info("--- Executing F5 (KOH 開啟代碼輸入欄位) ---")
-    # code="" → 跳過 typewrite + Enter；只觸發 menu 讓 cursor 進到 cell
-    ok = _script_code_input_adaptive("", label="F5", set_療程=None)
-    logging.info("F5 (KOH): %s",
-                  "ready (請手動輸入 KOH 代碼+Enter)" if ok else "skipped")
+    logging.info("--- Executing F5 (KOH 13017) ---")
+    ok = _script_code_input_adaptive("13017", label="F5", set_療程=None)
+    logging.info("F5 (KOH): %s", "done" if ok else "skipped")
 
 
 def _find_療程_edit_hwnd(main_hwnd: int) -> int:
