@@ -1980,6 +1980,22 @@ def _f11_popup_watcher(label: str = "F11",
 
     while time.time() - start < total_timeout:
         check_stop()
+        # [快結束信號] 病患選擇畫面 (TFOpdselpt) 變成 foreground →
+        # 整個 patient checkout 流程已完成，可以提早結束 watcher。
+        # 不再傻傻等 idle timeout (省 5-45 秒)。
+        try:
+            fg = ctypes.windll.user32.GetForegroundWindow()
+            if fg:
+                fg_cls_buf = ctypes.create_unicode_buffer(64)
+                ctypes.windll.user32.GetClassNameW(fg, fg_cls_buf, 64)
+                if fg_cls_buf.value == "TFOpdselpt":
+                    logging.info(
+                        "[%s] 偵測到病患選擇畫面 (TFOpdselpt) 為前景 → "
+                        "F11 流程完成，watcher 提早結束 (處理 %d 個 popup)",
+                        label, handled_count)
+                    return handled_count
+        except Exception:
+            pass
         # 依「是否已處理過 popup」用不同 idle timeout
         idle_limit = (idle_timeout_after_popup if handled_count > 0
                        else idle_timeout_initial)
@@ -2256,6 +2272,7 @@ HOSPITAL_WINDOW_CLASSES = {
     "Tfm_agree",         # 列印同意/說明書 popup
     "TfrmOrrSentence",   # 請選擇片語 popup
     "#32770",            # Windows 標準警告對話框
+    "TFOpdselpt",        # 門診診間選擇病人 (F11 結束、回到病患列表)
 }
 
 
