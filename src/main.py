@@ -10942,12 +10942,32 @@ class AutomationApp:
             self.hotkey_text_label.config(text=hotkey_info_text)
             put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: 熱鍵註冊成功 ({profile})，等待指令...'))
             logging.info(f"Hotkeys registered successfully for {profile}.")
+            # [穩定性] 註冊成功 → 重置 retry 計數
+            self._hotkey_register_retry_count = 0
         except Exception as e:
             logging.error(f"Failed to register hotkeys: {e}", exc_info=True)
             put_ui_message(self.ui_queue, UiStatusMessage(text='狀態: 熱鍵註冊失敗! 請檢查權限'))
             self.hotkey_text_label.config(text="熱鍵註冊失敗!")
             es = str(e)
             self.hotkey_display_note.set(f"熱鍵註冊失敗 · {es[:42]}…" if len(es) > 42 else f"熱鍵註冊失敗 · {es}")
+            # [穩定性] 失敗自動 retry：30 秒後重試，最多 5 次 (給管理員授權 / 鍵盤
+            # hook 隊伍清空時間)。超過 5 次就放棄，使用者要手動重啟主程式。
+            try:
+                self._hotkey_register_retry_count = getattr(
+                    self, '_hotkey_register_retry_count', 0) + 1
+                if self._hotkey_register_retry_count <= 5:
+                    delay_ms = 30 * 1000
+                    logging.warning(
+                        "熱鍵註冊失敗，第 %d 次重試將在 30s 後 (最多 5 次)",
+                        self._hotkey_register_retry_count)
+                    if not getattr(self, '_shutting_down', False):
+                        self.root.after(delay_ms, self.setup_hotkeys)
+                else:
+                    logging.error(
+                        "熱鍵註冊已連續失敗 %d 次，放棄自動 retry — 請手動重啟主程式",
+                        self._hotkey_register_retry_count)
+            except Exception:
+                logging.debug("hotkey retry 排程失敗", exc_info=True)
 
     def run_hotkey_guardian(self):
         def rehook():
@@ -11346,12 +11366,33 @@ if __name__ == "__main__":
             )
         threading.excepthook = _thread_excepthook
 
+    # [穩定性] Tk callback (.after() / 事件 binding) 未捕獲例外處理：
+    # Tk 預設只 print 到 stderr (pythonw 看不到)。override 後寫進 logging，
+    # 任何 callback 拋例外都能在 automation_ui.log 看到完整 traceback。
+    def _tk_report_callback_exception(exc, val, tb):
+        logging.error("Uncaught Tk callback exception", exc_info=(exc, val, tb))
+    try:
+        main_root.report_callback_exception = _tk_report_callback_exception
+        # 同時 patch 類別本身，給後續 Toplevel 用
+        tk.Tk.report_callback_exception = _tk_report_callback_exception
+    except Exception:
+        logging.debug("Tk callback exception hook 失敗", exc_info=True)
+
     if _splash:
         _splash.update_text("載入主視窗…")
 
     app = AutomationApp(main_root, {})
     DOCTORS = app.doctors_list
     DOCTOR_NAMES = [d["name"] for d in DOCTORS]
+
+    # [穩定性] health monitor — RAM 警告 (主程式吃多容易卡掛號刷新)
+    # 主程式 + Chrome (status driver) 正常 ~200-400MB；warn 500、crit 900
+    try:
+        from cmuh_common.health import start_health_monitor
+        start_health_monitor("main", ram_warn_mb=500, ram_crit_mb=900,
+                              interval_sec=300, network_check=False)
+    except Exception:
+        logging.debug("health monitor 啟動失敗", exc_info=True)
 
     # ─── 內層 watchdog (B)：daemon thread，每 30s 巡邏 ─────────────────
     # 目的：自動 kill+重啟 卡死的 consult_query / 被誤關的打卡

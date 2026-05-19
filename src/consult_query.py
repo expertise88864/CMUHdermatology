@@ -2005,6 +2005,14 @@ def main() -> None:
 
         _setup_logging()
 
+        # [穩定性] health monitor — RAM 警告 + 網路 reachable check
+        try:
+            from cmuh_common.health import start_health_monitor
+            start_health_monitor("consult", ram_warn_mb=200, ram_crit_mb=500,
+                                  interval_sec=300, network_check=True)
+        except Exception:
+            logging.debug("health monitor 啟動失敗", exc_info=True)
+
         # [穩定性] 全域 thread/sys excepthook：未捕獲例外寫 log。
         # 沒這個的話 daemon thread 死了完全沒紀錄，事後 debug 困難。
         def _sys_excepthook(exc_type, exc_value, exc_tb):

@@ -1072,6 +1072,15 @@ def main() -> None:
         _setup_clock_logging()
         logging.info("=== autoclock v%s 啟動 ===", CURRENT_VERSION)
 
+        # [穩定性] health monitor — RAM 警告 (Chrome 拖累時可知)
+        try:
+            from cmuh_common.health import start_health_monitor
+            # 打卡 Chrome 啟動後正常 RSS ~300MB；warn 500、crit 800
+            start_health_monitor("autoclock", ram_warn_mb=500, ram_crit_mb=800,
+                                  interval_sec=300, network_check=False)
+        except Exception:
+            logging.debug("health monitor 啟動失敗", exc_info=True)
+
         # [穩定性] 全域 thread/sys excepthook：未捕獲例外寫 log。
         # 沒這個的話 daemon thread 死了完全沒紀錄，事後 debug 困難。
         def _sys_excepthook(exc_type, exc_value, exc_tb):
