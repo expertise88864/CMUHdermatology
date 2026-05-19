@@ -39,10 +39,13 @@ LOCK_DIR = SETTINGS_DIR / ".watchdog_locks"
 # 【required_config_file】v4 新增：本機沒這檔 → 不啟動 (per-machine opt-in)
 # 打卡 / 會診查詢 全皮膚科只需「一台」電腦執行，靠對應 config 檔存在與否
 # 自動判斷本機是否該跑。沒設定過該功能的電腦不會被打擾。
-CONFIG_SCHEMA_VERSION = 4
+CONFIG_SCHEMA_VERSION = 5
 
 DEFAULT_CONFIG = {
     "schema_version": CONFIG_SCHEMA_VERSION,
+    # 【總開關 v5】預設關閉 — 新裝機/沒設定過任何背景程式的電腦完全不會
+    # 跑 watchdog。主程式設定頁有勾選 UI 可開啟。
+    "master_enabled": False,
     "check_interval_sec": 30,
     "heartbeat_log_sec": 300,
     "outer_threshold_multiplier": 1.5,  # outer C 的 max_stale_sec 乘這個倍率
@@ -132,6 +135,18 @@ def _migrate_config(cfg: dict) -> tuple:
             name = prog.get("name", "")
             req = _V3_TO_V4_REQUIRED_CONFIG.get(name, "")
             prog.setdefault("required_config_file", req)
+    # v4 → v5: 加 master_enabled 總開關
+    # 智慧 default：本機若有 autoclock_config.json 或 consult_query_config.json
+    # → 表示本機是「設定過的主機」→ master_enabled=True (保留現行行為)
+    # → 沒有任何相關 config → master_enabled=False (新裝機/不該跑 watchdog)
+    if cur_v < 5:
+        auto_default = False
+        for chk in ("settings/autoclock_config.json",
+                     "settings/consult_query_config.json"):
+            if (_ROOT / chk).exists():
+                auto_default = True
+                break
+        cfg.setdefault("master_enabled", auto_default)
     cfg["schema_version"] = CONFIG_SCHEMA_VERSION
     return cfg, True
 
@@ -390,6 +405,9 @@ def run_one_tick(mode: str, log_fn=None) -> list:
     回傳：[msg, msg, ...]
     """
     cfg = load_config()
+    # [v5] 總開關：master_enabled=False → watchdog 整個不動 (預設情況)
+    if not cfg.get("master_enabled", False):
+        return ["○ watchdog: master_enabled=False (已停用，主程式設定頁可開啟)"]
     pythonw = find_pythonw()
     if not pythonw:
         msg = "[watchdog] 找不到 pythonw.exe，跳過這輪"

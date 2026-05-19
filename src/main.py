@@ -8372,6 +8372,29 @@ class AutomationApp:
             messagebox.showerror("失敗", f"重製熱鍵時發生錯誤: {e}")
             self.status_text.set("狀態: 熱鍵重製失敗")
 
+    def _on_watchdog_toggle(self):
+        """切換 watchdog master_enabled 並寫回 settings/watchdog_config.json。"""
+        try:
+            from cmuh_common.watchdog_core import (
+                load_config as _wd_load,
+                CONFIG_PATH as _wd_cfg_path,
+            )
+            import json as _json
+            new_val = bool(self.watchdog_enabled_var.get())
+            cfg = _wd_load()
+            cfg["master_enabled"] = new_val
+            _wd_cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            _wd_cfg_path.write_text(
+                _json.dumps(cfg, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+            state = "啟用" if new_val else "停用"
+            logging.info("[watchdog] master_enabled 改為 %s (由設定 UI 切換)", new_val)
+            self.status_text.set(
+                f"狀態: watchdog 已{state}（下次 30s 內生效；不需重啟主程式）")
+        except Exception as e:
+            logging.error("watchdog 切換失敗: %s", e, exc_info=True)
+            messagebox.showerror("失敗", f"切換 watchdog 失敗: {e}")
+
     def _copy_to_clipboard(self, text_widget):
         try:
             text_to_copy = text_widget.get("1.0", tk.END).strip()
@@ -8569,6 +8592,34 @@ class AutomationApp:
             name_var = tk.StringVar(value=self.r_doctor_map.get(r_key, {}).get('name', ''))
             name_entry = ttk.Entry(r_doctor_frame, textvariable=name_var, width=12); name_entry.grid(row=i, column=1, padx=5, pady=5, sticky='w')
             self.r_doctor_entries[r_key] = {'name_var': name_var}
+
+        # ─── 程式監看 (watchdog) 總開關 ─────────────────────────────────
+        # 預設關閉：沒設定過 會診查詢/打卡 的電腦完全不會啟動 watchdog，
+        # 不會跳出莫名的 ClockApp 設定視窗。要在本機跑 watchdog 就勾起來。
+        watchdog_frame = ttk.LabelFrame(left_column, text="背景監看 (watchdog)", padding=10)
+        watchdog_frame.pack(fill=tk.X, pady=(0, 15))
+        try:
+            from cmuh_common.watchdog_core import load_config as _wd_load
+            _wd_cfg = _wd_load()
+            self.watchdog_enabled_var = tk.BooleanVar(
+                value=bool(_wd_cfg.get("master_enabled", False)))
+        except Exception:
+            self.watchdog_enabled_var = tk.BooleanVar(value=False)
+        ttk.Label(
+            watchdog_frame,
+            text=(
+                "勾選後，主程式會在背景每 30 秒檢查【會診查詢】/【打卡】是否卡死，"
+                "卡住自動 kill+重啟。沒設定過該功能的電腦不會被打擾 (per-machine opt-in)。"
+            ),
+            wraplength=420,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 4))
+        ttk.Checkbutton(
+            watchdog_frame,
+            text="啟用 watchdog 監看背景程式",
+            variable=self.watchdog_enabled_var,
+            command=self._on_watchdog_toggle,
+        ).pack(anchor="w")
 
         threshold_main_frame = ttk.LabelFrame(left_column, text="個別醫師止掛人數提醒設定", padding=10)
         threshold_main_frame.pack(fill=tk.X, pady=(0, 15))
