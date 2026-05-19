@@ -2708,16 +2708,20 @@ _F11_POPUP_HANDLERS = [
 
 
 def _f11_popup_watcher(label: str = "F11",
-                        total_timeout: float = 90.0,
+                        total_timeout: float = 240.0,
                         idle_timeout_initial: float = 8.0,
-                        idle_timeout_after_popup: float = 15.0) -> int:
+                        idle_timeout_after_popup: float = 45.0) -> int:
     """輪詢已知 popup → 依現身順序執行對應 handler。
 
-    - total_timeout：整個輪詢最久跑這麼久 (90s)
+    - total_timeout：整個輪詢最久跑這麼久 (240s = 4 分鐘)
     - idle_timeout_initial：還沒處理任何 popup 時，連續沒看到 popup 多久就放棄 (8s)
       → 給「全部完成」按下後 popup 出現的時間
-    - idle_timeout_after_popup：已處理過 ≥1 個 popup 後的等待 (15s)
-      → 給 chain 中下一個慢慢出現的 popup 較長時間 (預約掛號常 delay 5-10s)
+    - idle_timeout_after_popup：已處理過 ≥1 個 popup 後的等待 (45s)
+      → 給 chain 中下一個慢慢出現的 popup 充裕時間
+      (實測 2026-05-19 12:04-12:06：預約掛號 在「健保藥費確認」處理後可能要
+       > 1 分鐘才出現，先前 15s 來不及抓到 → 拉長到 45s 安全)
+
+    F12 仍可隨時中止；4 分鐘 total 是安全上限，正常 chain 不會跑這麼久。
 
     回傳：處理過的 popup 數量
     """
