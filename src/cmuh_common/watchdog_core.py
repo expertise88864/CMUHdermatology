@@ -35,7 +35,7 @@ LOCK_DIR = SETTINGS_DIR / ".watchdog_locks"
 # runpy.run_path("src/foo.py") 動態載入 src/*.py，cmdline 上只有 .pyw 路徑，
 # 沒有 src/foo.py 字串。所以 process_match 必須是 .pyw 中文檔名 (cmdline 一定含)。
 # psutil 在 Windows 用 UTF-16 取 cmdline，Chinese keyword 安全可比對。
-CONFIG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 3
 
 DEFAULT_CONFIG = {
     "schema_version": CONFIG_SCHEMA_VERSION,
@@ -67,9 +67,12 @@ DEFAULT_CONFIG = {
             "log_path": "automation_ui.log",
             "pyw": "中國醫皮膚科主程式.pyw",
             "process_match": "中國醫皮膚科主程式",
-            "max_stale_sec": 0,    # 主程式不一定每分鐘寫 log，只看 process
-            "enabled": True,
-            "outer_only": True,    # 只有 C 檢查（B 在主程式內，不能監看自己）
+            "max_stale_sec": 0,
+            # 【v3 預設關閉】主程式有 GUI，崩潰使用者立刻看到 (熱鍵失效)，
+            # 不需要自動重啟。且外層 C 若誤判沒在跑就 Popen，子程式 single_instance
+            # 會拒絕並跳「已在啟動中」對話框，徒增困擾。要重開請手動雙擊 .pyw。
+            "enabled": False,
+            "outer_only": True,
         },
     ],
 }
@@ -88,14 +91,25 @@ _V1_TO_V2_PROCESS_MATCH = {
 
 
 def _migrate_config(cfg: dict) -> tuple:
-    """回傳 (migrated_cfg, changed)。把舊版 process_match 改成新版 keyword。"""
-    if int(cfg.get("schema_version", 1)) >= CONFIG_SCHEMA_VERSION:
+    """回傳 (migrated_cfg, changed)。
+    v1→v2：把舊 process_match 改成新版 keyword。
+    v2→v3：把主程式 enabled 設成 False (使用者反映外層 C 一直誤判沒在跑就重啟)。
+    """
+    cur_v = int(cfg.get("schema_version", 1))
+    if cur_v >= CONFIG_SCHEMA_VERSION:
         return cfg, False
-    for prog in cfg.get("programs", []):
-        old = prog.get("process_match", "")
-        new = _V1_TO_V2_PROCESS_MATCH.get(old)
-        if new and old != new:
-            prog["process_match"] = new
+    # v1 → v2
+    if cur_v < 2:
+        for prog in cfg.get("programs", []):
+            old = prog.get("process_match", "")
+            new = _V1_TO_V2_PROCESS_MATCH.get(old)
+            if new and old != new:
+                prog["process_match"] = new
+    # v2 → v3: 主程式 enabled=false
+    if cur_v < 3:
+        for prog in cfg.get("programs", []):
+            if prog.get("name") == "主程式":
+                prog["enabled"] = False
     cfg["schema_version"] = CONFIG_SCHEMA_VERSION
     return cfg, True
 

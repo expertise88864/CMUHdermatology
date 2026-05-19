@@ -36,9 +36,9 @@ $programs = @(
     [pscustomobject]@{
         Key='watchdog'; TaskName='CMUH皮膚科守護程式_每2分鐘';
         Pyw='中國醫皮膚科守護程式.pyw';
-        Display='中國醫皮膚科守護程式 (外層備援，每 2 分鐘)';
-        Hint='主程式內已有內層 watchdog 每 30s 巡邏；外層備援 schtasks 每 2 分鐘觸發跑一次 (RAM ≈ 0)，主程式掛了會接手';
-        DefaultChecked=$true;
+        Display='中國醫皮膚科守護程式 (外層備援，每 2 分鐘) — 測試中，建議不勾';
+        Hint='主程式裡已內建監看 thread (內層 B) 自動重啟 卡死的 consult / 打卡。外層 C 是備援，目前發現可能誤判主程式沒在跑導致重複跳對話框，正在改善中，建議先別勾。';
+        DefaultChecked=$false;
         Periodic=$true;
         ScriptRelPath='src\watchdog_runner.py';
         ScriptArgs='--once' }
