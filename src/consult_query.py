@@ -1509,18 +1509,65 @@ def _run_imap_check_with_timeout(kw: str, timeout: float = 60.0) -> dict:
     return box.get("r", _empty_imap_result("imap result missing"))
 
 
+# [穩定性] scheduler liveness — 給 self-watchdog thread 用
+_SCHEDULER_LIVENESS = {"last_tick": 0.0}
+
+
+def _scheduler_self_watchdog() -> None:
+    """獨立 daemon thread — 每 60s 看 scheduler_loop 是否還活著。
+
+    如果 scheduler 卡住 (last_tick 超過 5 分鐘沒更新)，寫 CRITICAL log 並
+    嘗試 force-close 當前活動的 IMAP socket (希望讓卡住的 thread 解套)。
+
+    不會自己重啟 scheduler — 那是外層 watchdog (process-level) 的事。
+    """
+    DEAD_THRESHOLD = 300  # 5 分鐘
+    CHECK_INTERVAL = 60
+    while running.is_set():
+        try:
+            time.sleep(CHECK_INTERVAL)
+            last = _SCHEDULER_LIVENESS.get("last_tick", 0.0)
+            if last == 0.0:
+                continue  # 還沒第一次 tick，給它時間 init
+            age = time.time() - last
+            if age > DEAD_THRESHOLD:
+                logging.critical(
+                    "[self-watchdog] scheduler 已 %.0f 秒沒 tick (>%.0fs 視為死亡)！"
+                    " 強制關閉 IMAP socket 嘗試解套",
+                    age, DEAD_THRESHOLD)
+                try:
+                    from cmuh_common.imap_reader import force_close_active
+                    force_close_active()
+                except Exception:
+                    logging.exception("[self-watchdog] force_close 例外")
+        except Exception:
+            logging.exception("[self-watchdog] tick 例外")
+
+
 def scheduler_loop() -> None:
     logging.info("=== 會診查詢排程器啟動 v%s ===", CURRENT_VERSION)
     _rebuild_schedule()
+
+    # [穩定性] 啟動 self-watchdog 子 thread (獨立監看 scheduler 是否還活著)
+    threading.Thread(target=_scheduler_self_watchdog,
+                      name="SchedulerSelfWatchdog", daemon=True).start()
+
     last_email_check = 0.0
     last_heartbeat = time.time()
     HEARTBEAT_INTERVAL = 60.0  # 至少每 60s 寫一筆 log，方便看出 thread 死了
     IMAP_HARD_TIMEOUT = 60.0   # 單次 IMAP check 上限，過了就放棄
+    # [穩定性] IMAP 連續失敗 backoff — 避免持續每 20s 撞牆 (網路斷時不停 log)
+    IMAP_FAIL_THRESHOLD = 3       # 連續 N 次 error
+    IMAP_COOLDOWN_SEC = 300       # 之後暫停 5 分鐘
+    consecutive_imap_errors = 0
+    imap_cooldown_until = 0.0
     # [優化] cfg 快取：原本每秒 load_config → 86400 reads/day。改快取 + 60s
     # 過期重讀。設定變更走 RELOAD_FLAG 強制重讀，所以使用者改設定也即時生效。
     cfg = None
     cfg_loaded_at = 0.0
     while running.is_set():
+        # [穩定性] 每次迴圈頂端打卡 — self-watchdog 用這個判斷 scheduler 活著
+        _SCHEDULER_LIVENESS["last_tick"] = time.time()
         try:
             schedule.run_pending()
             # 「立即執行」旗標檔（由 --run-now 的第二個實例、或設定視窗寫入）
@@ -1551,15 +1598,40 @@ def scheduler_loop() -> None:
                 cfg_loaded_at = time.time()
             if cfg.get("email_trigger_enabled"):
                 poll_sec = float(cfg.get("email_trigger_poll_seconds", 20))
-                if time.time() - last_email_check >= poll_sec:
+                # [穩定性] 如果在 cooldown 期間，跳過 IMAP poll (5 分鐘內不再撞)
+                in_cooldown = time.time() < imap_cooldown_until
+                if in_cooldown and time.time() - last_email_check >= poll_sec:
+                    # cooldown 期間：仍要把 last_email_check 推進避免一直 spam
+                    # 但實際上不要 IMAP poll，等 cooldown 結束
+                    remaining = imap_cooldown_until - time.time()
+                    if int(remaining) % 60 == 0:  # 每分鐘提醒一次
+                        logging.info("[IMAP cooldown] 連續失敗中，剩 %.0fs 後恢復",
+                                      remaining)
+                    last_email_check = time.time()
+                if not in_cooldown and time.time() - last_email_check >= poll_sec:
                     last_email_check = time.time()
                     kw = cfg.get("email_trigger_subject_keyword",
                                  DEFAULT_CONFIG["email_trigger_subject_keyword"])
                     # ★ 用 thread + 60s timeout 包起來，避免 imaplib socket 卡死整個 scheduler
                     r = _run_imap_check_with_timeout(kw, timeout=IMAP_HARD_TIMEOUT)
                     if r.get("error"):
-                        logging.warning("檢查觸發信失敗: %s", r["error"])
+                        consecutive_imap_errors += 1
+                        logging.warning("檢查觸發信失敗 (%d/%d): %s",
+                                          consecutive_imap_errors,
+                                          IMAP_FAIL_THRESHOLD, r["error"])
+                        if consecutive_imap_errors >= IMAP_FAIL_THRESHOLD:
+                            imap_cooldown_until = time.time() + IMAP_COOLDOWN_SEC
+                            logging.warning(
+                                "[IMAP cooldown] 連續 %d 次失敗，暫停 IMAP 輪詢 "
+                                "%.0f 秒；網路恢復後自動回 normal poll",
+                                consecutive_imap_errors, IMAP_COOLDOWN_SEC)
+                            consecutive_imap_errors = 0  # 重置避免 cooldown 結束又馬上 trigger
                     else:
+                        # 成功 → 重置連續失敗計數
+                        if consecutive_imap_errors > 0:
+                            logging.info("[IMAP] 連續失敗已恢復 (之前 %d 次)",
+                                          consecutive_imap_errors)
+                        consecutive_imap_errors = 0
                         logging.info(
                             "檢查觸發信 [IMAP/%s]：未讀 %d 封，主旨含 %r 的 %d 封",
                             cfg.get("sender_account", "?"),
@@ -1932,6 +2004,22 @@ def main() -> None:
             return  # 保險：理論上 run_as_admin 已 sys.exit
 
         _setup_logging()
+
+        # [穩定性] 全域 thread/sys excepthook：未捕獲例外寫 log。
+        # 沒這個的話 daemon thread 死了完全沒紀錄，事後 debug 困難。
+        def _sys_excepthook(exc_type, exc_value, exc_tb):
+            logging.critical("Uncaught main exception",
+                              exc_info=(exc_type, exc_value, exc_tb))
+        sys.excepthook = _sys_excepthook
+        if hasattr(threading, "excepthook"):
+            def _thread_excepthook(args):
+                logging.critical(
+                    "Uncaught thread exception in %s",
+                    getattr(args.thread, "name", "?"),
+                    exc_info=(args.exc_type, args.exc_value, args.exc_traceback)
+                )
+            threading.excepthook = _thread_excepthook
+
         args = sys.argv[1:]
 
         # 設定模式：不搶單例，直接開設定視窗

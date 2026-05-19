@@ -1072,6 +1072,21 @@ def main() -> None:
         _setup_clock_logging()
         logging.info("=== autoclock v%s 啟動 ===", CURRENT_VERSION)
 
+        # [穩定性] 全域 thread/sys excepthook：未捕獲例外寫 log。
+        # 沒這個的話 daemon thread 死了完全沒紀錄，事後 debug 困難。
+        def _sys_excepthook(exc_type, exc_value, exc_tb):
+            logging.critical("Uncaught main exception",
+                              exc_info=(exc_type, exc_value, exc_tb))
+        sys.excepthook = _sys_excepthook
+        if hasattr(threading, "excepthook"):
+            def _thread_excepthook(args):
+                logging.critical(
+                    "Uncaught thread exception in %s",
+                    getattr(args.thread, "name", "?"),
+                    exc_info=(args.exc_type, args.exc_value, args.exc_traceback)
+                )
+            threading.excepthook = _thread_excepthook
+
         # Mutex 單例
         if not ensure_single_instance("Local\\CMUH_Skin_AutoClock_SingleInstance_v1"):
             ctypes.windll.user32.MessageBoxW(

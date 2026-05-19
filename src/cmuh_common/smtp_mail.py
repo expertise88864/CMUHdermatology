@@ -129,15 +129,42 @@ def _build_message(sender_address: str, sender_name: str,
     return msg
 
 
+def _send_once(cred: dict, msg, timeout: float) -> None:
+    """單次 SMTP 寄送嘗試 — 失敗會 raise 給 caller 判斷是否重試。"""
+    host, port = cred["host"], cred["port"]
+    use_tls = cred["use_tls"]
+    if port == 465:
+        # 純 SSL（少數人用）
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(host, port, timeout=timeout,
+                               context=context) as server:
+            server.login(cred["username"], cred["password"])
+            server.send_message(msg)
+    else:
+        # 587 STARTTLS（Gmail 推薦）或 25 明文（不建議）
+        with smtplib.SMTP(host, port, timeout=timeout) as server:
+            server.ehlo()
+            if use_tls:
+                server.starttls(context=ssl.create_default_context())
+                server.ehlo()
+            server.login(cred["username"], cred["password"])
+            server.send_message(msg)
+
+
 def send_mail(recipients: list, subject: str, body: str,
               attachment_path: Optional[Path] = None,
               timeout: float = 60.0,
-              override_credentials: Optional[dict] = None) -> None:
+              override_credentials: Optional[dict] = None,
+              max_retries: int = 2) -> None:
     """同步寄一封信。失敗 raise；成功 log info。
 
     recipients: list of "x@y.z"
     attachment_path: None 或 Path（會自動判斷 image / generic）
     override_credentials: 測試用，覆蓋 settings/smtp_credentials.json
+    max_retries: 暫時性錯誤 (timeout / 網路) 最多重試次數 (預設 2 → 共最多
+                  跑 3 次)。認證錯誤這類「不會自己好」的不會重試。
+
+    Retry strategy：exponential backoff 2s → 5s → 10s (上限)。
     """
     if not recipients:
         raise RuntimeError("沒有設定收件人")
@@ -159,38 +186,38 @@ def send_mail(recipients: list, subject: str, body: str,
         attachment_path=attachment_path,
     )
 
-    # 連線 + 認證 + 寄送
-    host, port = cred["host"], cred["port"]
-    use_tls = cred["use_tls"]
-    try:
-        if port == 465:
-            # 純 SSL（少數人用）
-            context = ssl.create_default_context()
-            with smtplib.SMTP_SSL(host, port, timeout=timeout,
-                                   context=context) as server:
-                server.login(cred["username"], cred["password"])
-                server.send_message(msg)
-        else:
-            # 587 STARTTLS（Gmail 推薦）或 25 明文（不建議）
-            with smtplib.SMTP(host, port, timeout=timeout) as server:
-                server.ehlo()
-                if use_tls:
-                    server.starttls(context=ssl.create_default_context())
-                    server.ehlo()
-                server.login(cred["username"], cred["password"])
-                server.send_message(msg)
-    except smtplib.SMTPAuthenticationError as e:
-        raise RuntimeError(
-            f"SMTP 認證失敗：{e}。\n"
-            f"請確認 settings/smtp_credentials.json 的 password 是 Gmail "
-            f"App Password（16 字元），不是您日常登入的密碼。") from e
-    except smtplib.SMTPException as e:
-        raise RuntimeError(f"SMTP 寄信失敗：{type(e).__name__}: {e}") from e
-    except socket.timeout as e:
-        raise RuntimeError(
-            f"SMTP 連線/送信逾時（{int(timeout)}s）：{e}") from e
-    except OSError as e:
-        raise RuntimeError(f"SMTP 網路錯誤：{e}") from e
+    import time as _time
+    last_err: Optional[Exception] = None
+    for attempt in range(max_retries + 1):
+        try:
+            _send_once(cred, msg, timeout)
+            if attempt > 0:
+                logging.info("SMTP 第 %d 次重試成功", attempt)
+            break  # success
+        except smtplib.SMTPAuthenticationError as e:
+            # 認證錯不會自己好 → 不重試
+            raise RuntimeError(
+                f"SMTP 認證失敗：{e}。\n"
+                f"請確認 settings/smtp_credentials.json 的 password 是 Gmail "
+                f"App Password（16 字元），不是您日常登入的密碼。") from e
+        except (socket.timeout, smtplib.SMTPException, OSError) as e:
+            last_err = e
+            if attempt < max_retries:
+                backoff = min(10, 2 * (2 ** attempt))  # 2s, 4s, 8s, 10s (capped)
+                logging.warning(
+                    "SMTP 第 %d 次嘗試失敗 (%s: %s)，%.0fs 後重試…",
+                    attempt + 1, type(e).__name__, e, backoff)
+                _time.sleep(backoff)
+                continue
+            # 用完重試次數
+            if isinstance(e, socket.timeout):
+                raise RuntimeError(
+                    f"SMTP 連線/送信逾時 ({int(timeout)}s)，已重試 {max_retries} 次：{e}") from e
+            if isinstance(e, OSError):
+                raise RuntimeError(
+                    f"SMTP 網路錯誤，已重試 {max_retries} 次：{e}") from e
+            raise RuntimeError(
+                f"SMTP 寄信失敗，已重試 {max_retries} 次：{type(e).__name__}: {e}") from e
 
     logging.info("SMTP 已寄出（%s → %s）：%s",
                  cred["from_address"], ", ".join(recipients), subject)
