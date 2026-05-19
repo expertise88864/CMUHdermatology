@@ -3720,11 +3720,23 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
     logging.info("[%s] 已觸發 其他→同意書 (id=%s, Post)", label, MENU_ID_同意書)
 
     # Step 2: 等 TOrMain 視窗出現
+    # [穩定性] 25s timeout + 失敗 retry 1 次。實測 2026-05-19 11:47 醫院後端慢
+    # (reg52.cgi 500 error 同期間) 導致 8s 不夠 → TOrMain 沒開出來。25s 給
+    # server slow 時段充裕時間。retry 一次防偶發 message lost。
     or_hwnd = _wait_for_window("TOrMain", title_kw="同意書開立作業",
-                                 timeout=8)
+                                 timeout=25)
     if not or_hwnd:
-        logging.warning("[%s] 等不到 TOrMain 視窗", label)
-        return False
+        logging.warning("[%s] 等 TOrMain 25s 超時，重 Post WM_COMMAND 再試 1 次", label)
+        ctypes.windll.user32.PostMessageW(main_hwnd, WM_COMMAND,
+                                            MENU_ID_同意書, 0)
+        or_hwnd = _wait_for_window("TOrMain", title_kw="同意書開立作業",
+                                     timeout=15)
+        if not or_hwnd:
+            logging.warning(
+                "[%s] 重試後仍等不到 TOrMain — 可能醫院後端慢/同意書系統未啟動",
+                label)
+            return False
+        logging.info("[%s] 重試成功", label)
     logging.info("[%s] TOrMain hwnd=%s 已開啟", label, or_hwnd)
     # 不主動推到底層 — ForegroundProtector 會在使用者切走時才保護
     time.sleep(0.3)  # 等視窗 paint 完成
