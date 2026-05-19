@@ -8744,102 +8744,6 @@ class AutomationApp:
             messagebox.showerror("失敗", f"重製熱鍵時發生錯誤: {e}")
             self.status_text.set("狀態: 熱鍵重製失敗")
 
-    # =========================================================================
-    # [熱鍵快速編輯] 提供三個快速操作：
-    #   1. 開啟熱鍵腳本所在的 main.py（記事本，自動跳到熱鍵區）
-    #   2. 套用變更（重啟程式）
-    #   3. 顯示目前熱鍵綁定
-    # 配合「修改 → 儲存 → 套用」3 步流程，快速迭代熱鍵行為。
-    # =========================================================================
-    def _open_hotkey_script_in_editor(self):
-        """以記事本開啟 main.py 並跳到熱鍵腳本區（line ~1010）。"""
-        try:
-            target = os.path.abspath(__file__)
-            if not os.path.isfile(target):
-                # 啟動器啟動時 __file__ 可能是 launcher，改取 sys.argv[0] 並補 src/main.py
-                target = os.path.join(get_app_dir(), "src", "main.py")
-            if not os.path.isfile(target):
-                messagebox.showerror("找不到檔案", f"找不到 main.py:\n{target}")
-                return
-            # 開記事本（Win11 起 notepad 支援命令列開啟）；副選 Notepad++ 若有
-            import shutil as _sh
-            editor = _sh.which("notepad++") or "notepad.exe"
-            import subprocess as _sp
-            _sp.Popen([editor, target], close_fds=True)
-            messagebox.showinfo(
-                "已開啟編輯器",
-                f"已用 {os.path.basename(editor)} 開啟：\n{target}\n\n"
-                "搜尋 'def script_F11_adaptive' 跳到熱鍵區 (F1-F11 都 adaptive)。\n"
-                "編輯完成後按【套用熱鍵變更（重啟程式）】生效。",
-            )
-            self.status_text.set("狀態: 已開啟 main.py")
-        except Exception as e:
-            logging.error("開啟編輯器失敗: %s", e, exc_info=True)
-            messagebox.showerror("失敗", f"無法開啟編輯器: {e}")
-
-    def _apply_hotkey_changes_restart(self):
-        """套用熱鍵變更：重啟程式（最可靠的方式）。"""
-        if not messagebox.askyesno(
-            "確認重啟",
-            "重啟程式以套用熱鍵腳本變更？\n（會關閉此視窗並重新啟動，未儲存資料會遺失）",
-        ):
-            return
-        try:
-            logging.info("[熱鍵] 使用者請求重啟以套用熱鍵變更")
-            restart_self()
-        except Exception as e:
-            messagebox.showerror("失敗", f"重啟失敗: {e}")
-
-    def _show_hotkey_bindings(self):
-        """顯示目前所有熱鍵的綁定狀態。"""
-        try:
-            res = getattr(self, 'hotkey_profile', None) or getattr(
-                self, 'hotkey_version', None) or '未知'
-            sw = getattr(self, 'screen_width', 0)
-            sh = getattr(self, 'screen_height', 0)
-            lines = [
-                f"目前解析度方案: {res}",
-                f"實際螢幕尺寸: {sw}x{sh}",
-                "(F1-F11 全部已改 adaptive — Win32 訊息直接操作 hospital app",
-                " 控制項，跨解析度自動運作，不再依賴像素座標縮放)",
-                "",
-                "綁定的熱鍵：",
-                "  F1/F2/F3 → 照光 (51019) + 療程 1/2/3",
-                "  F4       → 冷凍 (51017)",
-                "  F5       → KOH (13017)",
-                "  F9       → 腫瘤同意書 (完整 R1-R4 流程)",
-                "  F10      → 切片同意書 (完整 R1-R4 流程)",
-                "  F11      → 快速完成 (全部完成 + 處理一連串 popup)",
-                "  F12      → 中止當前自動化",
-                "",
-                "腳本位置: src/main.py",
-                "搜尋關鍵字: def script_F11_adaptive",
-            ]
-            messagebox.showinfo("目前熱鍵綁定", "\n".join(lines))
-        except Exception as e:
-            messagebox.showerror("失敗", str(e))
-
-    def _show_hotkey_step_viewer(self):
-        """[人性化檢視] 開啟熱鍵步驟視窗，列出『第 N 步: 左鍵點擊...』等。"""
-        try:
-            from cmuh_common.hotkey_viewer_ui import HotkeyViewerWindow
-            base_ver = HOTKEY_ADAPTIVE_STATE.get("base_version") or "1280x1024"
-            main_path = os.path.abspath(__file__)
-            HotkeyViewerWindow(self.root, default_resolution=base_ver,
-                               main_py_path=main_path)
-        except Exception as e:
-            logging.error("開啟熱鍵檢視器失敗: %s", e, exc_info=True)
-            messagebox.showerror("失敗", f"無法開啟熱鍵步驟檢視器:\n{e}")
-
-    def _show_hotkey_step_editor(self):
-        """[圖形化編輯] 開啟熱鍵步驟編輯器（新增/刪除/編輯，存到 JSON）。"""
-        try:
-            from cmuh_common.hotkey_editor import HotkeyEditorWindow
-            HotkeyEditorWindow(self.root)
-        except Exception as e:
-            logging.error("開啟熱鍵編輯器失敗: %s", e, exc_info=True)
-            messagebox.showerror("失敗", f"無法開啟熱鍵步驟編輯器:\n{e}")
-
     def _copy_to_clipboard(self, text_widget):
         try:
             text_to_copy = text_widget.get("1.0", tk.END).strip()
@@ -8971,34 +8875,6 @@ class AutomationApp:
         ttk.Button(top_bar_frame,
                    text=f"切換主題（目前：{'淺色' if cur_theme == 'light' else '深色'}，按下變{next_theme}）",
                    command=self._toggle_ui_theme).pack(side=tk.RIGHT, padx=(0, 8))
-
-        # [熱鍵快速編輯] 三按鈕：編輯 / 套用 / 顯示綁定
-        hotkey_edit_frame = ttk.LabelFrame(scrollable_frame, text="熱鍵快速編輯（修改 F3/F4/F9/F10/F11 行為）", padding=8)
-        hotkey_edit_frame.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(
-            hotkey_edit_frame,
-            text="流程：① 開啟 main.py 編輯 → ② 儲存 → ③ 套用變更（重啟）",
-            foreground="#555",
-            font=("Microsoft JhengHei UI", self.f_sm),
-        ).pack(anchor="w", pady=(0, 4))
-        # 兩排按鈕：第一排查看，第二排操作
-        btn_row_hk_1 = ttk.Frame(hotkey_edit_frame)
-        btn_row_hk_1.pack(fill=tk.X, pady=(0, 4))
-        ttk.Button(btn_row_hk_1, text="🔍 人性化檢視步驟",
-                   command=self._show_hotkey_step_viewer).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(btn_row_hk_1, text="✏️ 圖形化編輯步驟",
-                   command=self._show_hotkey_step_editor).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btn_row_hk_1, text="顯示目前熱鍵綁定",
-                   command=self._show_hotkey_bindings).pack(side=tk.LEFT, padx=6)
-
-        btn_row_hk_2 = ttk.Frame(hotkey_edit_frame)
-        btn_row_hk_2.pack(fill=tk.X)
-        ttk.Button(btn_row_hk_2, text="① 開啟原始碼（main.py）",
-                   command=self._open_hotkey_script_in_editor).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(btn_row_hk_2, text="② 套用變更（重啟）",
-                   command=self._apply_hotkey_changes_restart).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btn_row_hk_2, text="重製熱鍵（不重啟）",
-                   command=self._trigger_rehook_hotkeys).pack(side=tk.LEFT, padx=6)
 
         # [修改] 建立容器，並定義三個直行
         columns_container = ttk.Frame(scrollable_frame)

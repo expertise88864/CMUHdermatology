@@ -311,8 +311,20 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
     pids = find_matching_pids(procs, keyword, exclude_pid=my_pid)
     action_lock_sec = int(cfg.get("action_lock_seconds", 90))
 
-    # Case 1: 沒在跑 → 啟動
+    # Case 1: 沒找到 PID → 可能真的沒在跑 OR psutil 看不到 cmdline (Windows 偶發)
     if not pids:
+        # [穩定性] Fallback：log 還新鮮 → 程式幾乎肯定健在，psutil 找不到只是
+        # cmdline access 失敗。誤啟動會被 single_instance 擋下、但徒增 log 噪音
+        # 跟 CPU 浪費。實測 2026-05-19：consult_query 一直健在但 psutil 抓不到
+        # cmdline，watchdog 每 90s 誤啟動一次。
+        if log_path is not None and max_stale > 0 and log_path.exists():
+            try:
+                age = time.time() - log_path.stat().st_mtime
+                if age < max_stale:
+                    return (f"~ {name}: psutil 找不到 PID 但 log {age:.0f}s "
+                            f"前剛更新 (<{max_stale}s)，視為健在 [{mode}]")
+            except Exception:
+                pass
         if not claim_action_lock(name, action_lock_sec):
             return f"⏭ {name}: 沒在跑，但 lock 還新（別人剛動過手），這輪先跳過"
         new_pid = start_program(pyw_path, pythonw)
