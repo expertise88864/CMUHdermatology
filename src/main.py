@@ -2325,20 +2325,17 @@ def script_F5_adaptive():
 def _find_療程_edit_hwnd(main_hwnd: int) -> int:
     """動態找頂部 header「療程」輸入欄的 hwnd。
 
-    策略：抓 main_hwnd 內所有「頂部 row 的 TEditExt」（相對 y < 130），依
-    left 排序，取第 5 個（idx=4）= 療程。
+    策略 (2026-05-19 修)：用 width 過濾。療程跟類別在所有解析度上都是
+    窄數字欄位 (width 35-50)，比其他長文字欄位 (width 60+) 明顯小。
+    依 left 排序後第一個窄欄位 = 療程，第二個 = 類別。
 
-    probe (2026-05-18 在 1280x1024) 顯示頂部 row 7 個 TEditExt 從左到右：
-      [0] (66, 104)  身份/診斷
-      [1] (137, 104) (副)
-      [2] (278, 104) 負擔   'A12'
-      [3] (412, 104) 卡號   'IC49'
-      [4] (554, 104) 療程 ✓ '1'
-      [5] (666, 104) 類別
-      [6] (777, 104) 體重
+    probe 觀察：
+      1280x1024: 7 個 TEditExt，療程=(554,104,40)、類別=(666,104,38)
+      1920x1080: 19 個 TEditExt (多了 ICD 等欄位)，療程=(557,?,40)、
+                  類別=(669,?,38) — 寬度依舊 40/38
 
-    用「第 5 個」比 hardcode x 範圍更穩 — 不同解析度／DPI／sub-form 位置
-    可能不同，但「左到右第 5 個」是 Delphi 設計上固定的順序。"""
+    舊版用「第 5 個」算法在 1280x1024 work，但 1920x1080 上多了 5 個欄位
+    所以 idx=4 變成錯的欄位 (log 2026-05-19 08:53 證實)。"""
     main_r = wintypes.RECT()
     if not ctypes.windll.user32.GetWindowRect(main_hwnd, ctypes.byref(main_r)):
         return 0
@@ -2359,7 +2356,7 @@ def _find_療程_edit_hwnd(main_hwnd: int) -> int:
             if not ctypes.windll.user32.GetWindowRect(child, ctypes.byref(r)):
                 return True
             rel_y = r.top - main_r.top
-            # 頂部 row：相對 y < 130（容許 1280→1920 寬鬆 padding）
+            # 頂部 row：相對 y 80-135
             if 80 <= rel_y <= 135:
                 edits.append((child, r.left, r.top, r.right - r.left))
         except Exception:
@@ -2367,18 +2364,23 @@ def _find_療程_edit_hwnd(main_hwnd: int) -> int:
         return True
 
     ctypes.windll.user32.EnumChildWindows(main_hwnd, cb, 0)
-    # 去重 (EnumChildWindows 可能重複)
+    # 去重
     seen = set()
     uniq = [e for e in edits if not (e[0] in seen or seen.add(e[0]))]
-    # 依 left 由左至右排序
-    uniq.sort(key=lambda e: e[1])
+    uniq.sort(key=lambda e: e[1])  # by left
     logging.info("頂部 row TEditExt 從左至右 (%d 個): %s",
                   len(uniq), [(e[0], e[1] - main_r.left, e[3]) for e in uniq])
-    if len(uniq) < 5:
-        logging.warning("頂部 row TEditExt 數 %d < 5 無法定位 療程", len(uniq))
+
+    # 找 width 在 35-50 之間的（療程跟類別都在這範圍）
+    narrow = [e for e in uniq if 35 <= e[3] <= 50]
+    logging.info("窄欄位 (w 35-50): %d 個 → %s", len(narrow),
+                  [(e[0], e[1] - main_r.left, e[3]) for e in narrow])
+    if not narrow:
+        logging.warning("頂部 row 找不到窄欄位 (療程)，回 0")
         return 0
-    療程_hwnd = uniq[4][0]
-    logging.info("療程 = 第 5 個 TEditExt hwnd=%s", 療程_hwnd)
+    # 左到右第一個窄欄位 = 療程 (第二個 = 類別)
+    療程_hwnd = narrow[0][0]
+    logging.info("療程 hwnd=%s (頂部 row 第 1 個窄欄位 w<50)", 療程_hwnd)
     return 療程_hwnd
 
 
