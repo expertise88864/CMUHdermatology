@@ -31,7 +31,14 @@ LOCK_DIR = SETTINGS_DIR / ".watchdog_locks"
 
 
 # ─── 預設設定 ────────────────────────────────────────────────────────────
+# 【重要】process_match 必須能在 pythonw.exe 的 cmdline 找到。.pyw shim 用
+# runpy.run_path("src/foo.py") 動態載入 src/*.py，cmdline 上只有 .pyw 路徑，
+# 沒有 src/foo.py 字串。所以 process_match 必須是 .pyw 中文檔名 (cmdline 一定含)。
+# psutil 在 Windows 用 UTF-16 取 cmdline，Chinese keyword 安全可比對。
+CONFIG_SCHEMA_VERSION = 2
+
 DEFAULT_CONFIG = {
+    "schema_version": CONFIG_SCHEMA_VERSION,
     "check_interval_sec": 30,
     "heartbeat_log_sec": 300,
     "outer_threshold_multiplier": 1.5,  # outer C 的 max_stale_sec 乘這個倍率
@@ -41,7 +48,7 @@ DEFAULT_CONFIG = {
             "name": "會診查詢",
             "log_path": "settings/consult_query.log",
             "pyw": "中國醫皮膚科會診查詢程式.pyw",
-            "process_match": "consult_query",
+            "process_match": "中國醫皮膚科會診查詢程式",
             "max_stale_sec": 180,  # 新版每 60s 一定有 heartbeat
             "enabled": True,
             "outer_only": False,
@@ -50,7 +57,7 @@ DEFAULT_CONFIG = {
             "name": "打卡",
             "log_path": "settings/autoclock.log",
             "pyw": "中國醫皮膚科打卡程式.pyw",
-            "process_match": "autoclock",
+            "process_match": "中國醫皮膚科打卡程式",
             "max_stale_sec": 0,    # 打卡 idle 沒 log，只看 process
             "enabled": True,
             "outer_only": False,
@@ -59,13 +66,38 @@ DEFAULT_CONFIG = {
             "name": "主程式",
             "log_path": "automation_ui.log",
             "pyw": "中國醫皮膚科主程式.pyw",
-            "process_match": "src\\main.py",  # 用路徑 keyword 避免誤抓
+            "process_match": "中國醫皮膚科主程式",
             "max_stale_sec": 0,    # 主程式不一定每分鐘寫 log，只看 process
             "enabled": True,
             "outer_only": True,    # 只有 C 檢查（B 在主程式內，不能監看自己）
         },
     ],
 }
+
+
+# ─── Schema migration ───────────────────────────────────────────────────
+# v1 → v2 (2026-05-19)：process_match 從 "consult_query"/"autoclock"/
+# "src\\main.py" 改成 .pyw 中文名稱（cmdline 沒前者，watchdog 永遠找不到 →
+# 一直想重啟 → 子程式 single_instance 跳「已在啟動中」對話框）。
+_V1_TO_V2_PROCESS_MATCH = {
+    "consult_query": "中國醫皮膚科會診查詢程式",
+    "autoclock": "中國醫皮膚科打卡程式",
+    "src\\main.py": "中國醫皮膚科主程式",
+    "src/main.py": "中國醫皮膚科主程式",
+}
+
+
+def _migrate_config(cfg: dict) -> tuple:
+    """回傳 (migrated_cfg, changed)。把舊版 process_match 改成新版 keyword。"""
+    if int(cfg.get("schema_version", 1)) >= CONFIG_SCHEMA_VERSION:
+        return cfg, False
+    for prog in cfg.get("programs", []):
+        old = prog.get("process_match", "")
+        new = _V1_TO_V2_PROCESS_MATCH.get(old)
+        if new and old != new:
+            prog["process_match"] = new
+    cfg["schema_version"] = CONFIG_SCHEMA_VERSION
+    return cfg, True
 
 
 def get_root() -> Path:
@@ -104,6 +136,19 @@ def load_config() -> dict:
 
     for k, v in DEFAULT_CONFIG.items():
         cfg.setdefault(k, v)
+
+    # Schema migration (v1 → v2 修 process_match)
+    cfg, migrated = _migrate_config(cfg)
+    if migrated:
+        try:
+            CONFIG_PATH.write_text(
+                json.dumps(cfg, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+            logging.info("[watchdog] config 升級至 schema v%d",
+                          CONFIG_SCHEMA_VERSION)
+        except Exception:
+            logging.exception("[watchdog] 寫回升級後 config 失敗 (本次仍用新版記憶體)")
     return cfg
 
 
