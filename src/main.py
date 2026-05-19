@@ -2425,11 +2425,121 @@ def _f11_handle_appt(hwnd: int, label: str = "") -> bool:
     return False
 
 
+class _ScrollInfo(ctypes.Structure):
+    """SCROLLINFO 結構 (給 GetScrollInfo 用，跨 process 安全)。"""
+    _fields_ = [
+        ("cbSize", ctypes.c_uint),
+        ("fMask", ctypes.c_uint),
+        ("nMin", ctypes.c_int),
+        ("nMax", ctypes.c_int),
+        ("nPage", ctypes.c_uint),
+        ("nPos", ctypes.c_int),
+        ("nTrackPos", ctypes.c_int),
+    ]
+
+
+def _grid_has_rows(grid_hwnd: int) -> bool:
+    """用 GetScrollInfo(SB_VERT) 推斷 TXStringGrid 是否有資料列。
+    有 scroll range > 1 → 多列；否則可能空或只 1 列。"""
+    try:
+        si = _ScrollInfo()
+        si.cbSize = ctypes.sizeof(si)
+        si.fMask = 0x07  # SIF_RANGE | SIF_PAGE | SIF_POS
+        SB_VERT = 1
+        if ctypes.windll.user32.GetScrollInfo(grid_hwnd, SB_VERT,
+                                                ctypes.byref(si)):
+            return (si.nMax - si.nMin) > 1
+    except Exception:
+        logging.debug("[grid] GetScrollInfo 失敗", exc_info=True)
+    return False
+
+
+def _f11_detect_allergy_state(hwnd: int, label: str = "") -> str:
+    """判別 TFrmAllergyM01 popup 是 state A 還是 state B。
+
+    state A：病人有過敏記錄 → 該按「回」(dismiss)
+    state B：病人無過敏記錄、下方 4 個 radio 顯示 → 該按 radio + 處理
+
+    判別策略：
+      1. 找「藥物過敏訊息不確定」TRadioButton
+      2. 若 IsWindowVisible+IsWindowEnabled → 表示「過敏訊息不確定」tab 是當前
+         active tab，是 state B
+      3. 若同時 TXStringGrid 有多列 scroll → state A (即使 radio 在某個 tab，但
+         grid 有資料優先按回)
+      4. 偵測失敗或不確定 → fallback state A (安全，不會誤改病歷)
+    """
+    radios = _find_descendants_by_exact_text(
+        hwnd, "TRadioButton", "藥物過敏訊息不確定")
+    visible_radio = 0
+    for rh, _, _ in radios:
+        try:
+            if (ctypes.windll.user32.IsWindowVisible(rh)
+                    and ctypes.windll.user32.IsWindowEnabled(rh)):
+                visible_radio = rh
+                break
+        except Exception:
+            continue
+
+    # 查 TXStringGrid 有沒有多筆資料
+    grid_has_data = False
+    try:
+        grids = _enum_class_in_window(hwnd, "TXStringGrid")
+        for gh, _, _ in grids:
+            if _grid_has_rows(gh):
+                grid_has_data = True
+                break
+    except Exception:
+        logging.debug("[%s] grid 偵測失敗", label, exc_info=True)
+
+    logging.info(
+        "[%s] 過敏 popup 狀態偵測：visible_radio=%s, grid_has_data=%s",
+        label, visible_radio, grid_has_data)
+
+    if visible_radio and not grid_has_data:
+        return "B"  # 有可見 radio 且 grid 沒多筆 → 無過敏案例
+    return "A"  # 否則保守處理
+
+
 def _f11_handle_allergy_m01(hwnd: int, label: str = "") -> bool:
-    """過敏記錄維護-醫師端 popup：點「回」。"""
-    logging.info("[%s] 過敏記錄維護 popup hwnd=%s → 回", label, hwnd)
+    """過敏記錄維護-醫師端 popup：依狀態決定行為。
+
+    state A (有過敏記錄)：點「回」dismiss，不動病歷
+    state B (無過敏記錄)：勾「藥物過敏訊息不確定」+ 點「處理」
+    """
+    logging.info("[%s] 過敏記錄維護 popup hwnd=%s", label, hwnd)
     time.sleep(0.4)
     check_stop()
+
+    state = _f11_detect_allergy_state(hwnd, label=label)
+
+    if state == "B":
+        logging.info("[%s]   state=B → 勾「藥物過敏訊息不確定」+ 點「處理」", label)
+        radios = _find_descendants_by_exact_text(
+            hwnd, "TRadioButton", "藥物過敏訊息不確定")
+        target_radio = 0
+        for rh, _, _ in radios:
+            try:
+                if (ctypes.windll.user32.IsWindowVisible(rh)
+                        and ctypes.windll.user32.IsWindowEnabled(rh)):
+                    target_radio = rh
+                    break
+            except Exception:
+                continue
+        if not target_radio:
+            logging.warning("[%s]   找不到可點的 radio，fallback 點「回」", label)
+        else:
+            _post_click_to_control(target_radio)
+            logging.info("[%s]   已勾 radio (hwnd=%s)", label, target_radio)
+            time.sleep(0.3)
+            check_stop()
+            if _click_button_normalized_text(hwnd, "處理"):
+                logging.info("[%s]   已點 處理", label)
+                _wait_window_closed(hwnd, timeout=5)
+                return True
+            logging.warning("[%s]   找不到 處理 button，fallback 點「回」", label)
+
+    # state A 或 state B fallback → 點「回」(安全 dismiss，不改病歷)
+    logging.info("[%s]   state=A → 點「回」dismiss", label)
     if _click_button_normalized_text(hwnd, "回"):
         logging.info("[%s]   已點 回", label)
         _wait_window_closed(hwnd, timeout=5)
