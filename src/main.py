@@ -2591,6 +2591,76 @@ def _f11_handle_breast_screening(hwnd: int, label: str = "") -> bool:
     return False
 
 
+def _f11_handle_transfer_msg(hwnd: int, label: str = "") -> bool:
+    """病人轉診提示畫面 popup (class=TFTunMsg) — 兩個 state 同一個 hwnd：
+      state A：顯示「轉診病人就診動向追蹤」tab
+        → 勾 TGroupButton「轉回原診所繼續治療」+ 點 TButton「處理/離開」
+        → popup 轉到 state B
+      state B：顯示確認 tab
+        → 點 TButton「印轉回單後離開」(注意：實際 text 是「印轉回單」)
+        → popup 關
+
+    偵測：找對應 control 是否 IsWindowVisible+Enabled，決定當前 state。
+    """
+    logging.info("[%s] 轉診提示 popup hwnd=%s", label, hwnd)
+    time.sleep(0.3)
+    check_stop()
+
+    # Step A: 如果還在 state A，勾 radio + 點 處理/離開
+    radios = _find_descendants_by_exact_text(
+        hwnd, "TGroupButton", "轉回原診所繼續治療")
+    visible_radio = 0
+    for rh, _, _ in radios:
+        try:
+            if (ctypes.windll.user32.IsWindowVisible(rh)
+                    and ctypes.windll.user32.IsWindowEnabled(rh)):
+                visible_radio = rh
+                break
+        except Exception:
+            continue
+
+    if visible_radio:
+        _post_click_to_control(visible_radio)
+        logging.info("[%s]   state A: 已勾「轉回原診所繼續治療」radio", label)
+        time.sleep(0.3)
+        check_stop()
+        if _click_button_normalized_text(hwnd, "處理/離開"):
+            logging.info("[%s]   state A: 已點「處理/離開」", label)
+        else:
+            logging.warning("[%s]   state A: 找不到「處理/離開」", label)
+            return False
+        # 等 state B 出現 (印轉回單 button 可見)
+        time.sleep(0.5)
+        check_stop()
+
+    # Step B：找「印轉回單後離開」(可見+enabled) 並點。
+    # 即使 state A 跳過 (popup 一開始就是 state B)，這邊也會正常處理。
+    end_t = time.time() + 6
+    while time.time() < end_t:
+        check_stop()
+        btns = _find_descendants_by_exact_text(
+            hwnd, "TButton", "印轉回單後離開")
+        target = 0
+        for bh, _, _ in btns:
+            try:
+                if (ctypes.windll.user32.IsWindowVisible(bh)
+                        and ctypes.windll.user32.IsWindowEnabled(bh)):
+                    target = bh
+                    break
+            except Exception:
+                continue
+        if target:
+            _post_click_to_control(target)
+            logging.info("[%s]   state B: 已點「印轉回單後離開」(hwnd=%s)",
+                          label, target)
+            _wait_window_closed(hwnd, timeout=5)
+            return True
+        time.sleep(0.15)
+
+    logging.warning("[%s]   等不到 state B「印轉回單後離開」(6s)", label)
+    return False
+
+
 def _f11_handle_message_ok(hwnd: int, label: str = "") -> bool:
     """西醫門診系統 OK 對話框 (class=TMessageForm, title 含 '西醫門診系統')：點 OK。
 
@@ -2633,6 +2703,7 @@ _F11_POPUP_HANDLERS = [
     ("TFOPDPreg",       "",              _f11_handle_appt),
     ("TfAskDlg",        "乳房篩檢",       _f11_handle_breast_screening),
     ("TMessageForm",    "西醫門診系統",   _f11_handle_message_ok),
+    ("TFTunMsg",        "病人轉診",       _f11_handle_transfer_msg),
 ]
 
 
@@ -2902,15 +2973,17 @@ def _find_window_by_class_title(class_name: str, title_kw: str = "",
 
 def _wait_for_window(class_name: str, title_kw: str = "",
                        timeout: float = 10.0,
-                       exclude_hwnd: int = 0) -> int:
-    """每 100ms 找一次，最多等 timeout 秒。回傳 hwnd 或 0。"""
+                       exclude_hwnd: int = 0,
+                       poll_sec: float = 0.03) -> int:
+    """每 poll_sec 找一次，最多等 timeout 秒。回傳 hwnd 或 0。
+    poll_sec 預設 30ms (比早期 100ms 快 — 對 F9/F10 警告 dialog 反應更即時)。"""
     end = time.time() + timeout
     while time.time() < end:
         hwnd = _find_window_by_class_title(class_name, title_kw, exclude_hwnd)
         if hwnd:
             return hwnd
         check_stop()
-        time.sleep(0.1)
+        time.sleep(poll_sec)
     return 0
 
 
@@ -3148,7 +3221,7 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
         logging.info("[%s] 沒等到警告對話框 (可能直接送出)", label)
         return True
     logging.info("[%s] 警告對話框 hwnd=%s", label, dlg)
-    time.sleep(0.3)
+    time.sleep(0.05)  # 30ms+50ms ≈ 80ms 總 latency；舊版 100ms+300ms = 400ms
     check_stop()
 
     # Step C: 對對話框 PostMessage WM_COMMAND IDYES
@@ -3158,18 +3231,18 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
     ctypes.windll.user32.PostMessageW(dlg, WM_COMMAND, IDYES, 0)
     logging.info("[%s] 已 PostMessage WM_COMMAND IDYES (=是) 給對話框", label)
 
-    # 等對話框關
+    # 等對話框關 (30ms poll → 對話框關閉延遲最多 30ms)
     end_t = time.time() + 5
     while time.time() < end_t:
         if not ctypes.windll.user32.IsWindow(dlg):
             break
-        time.sleep(0.1)
+        time.sleep(0.03)
         check_stop()
     logging.info("[%s] 警告對話框已關", label)
 
     # Step D: 等等看是否還有「未滿 18」之類的後續對話框
-    # 給 2 秒讓 Delphi 進入下個 prompt（若有）
-    time.sleep(1.0)
+    # 給 0.4 秒讓 Delphi 進入下個 prompt（若有）— 從 1.0s 縮短
+    time.sleep(0.4)
     check_stop()
     dlg2 = _find_window_by_class_title("#32770", "", exclude_hwnd=popup_hwnd)
     if dlg2:
@@ -10774,11 +10847,33 @@ class AutomationApp:
             if profile in ('1920x1080', '1280x1024', '1024x768'):
                 hotkeys_to_register = dict(_adaptive_descs)
 
-            # ─── 熱鍵守門：只在 TFopdmain 是前景時才執行 ─────────────────
-            # 使用者反映 F5 在 Chrome 會卡到瀏覽器刷新功能。改 suppress=False
-            # (讓 keypress 過去給其他程式) + guard (foreground != TFopdmain 就
-            # 靜默 skip，不執行我們的 automation)。
-            def _hotkey_guard(action_fn, key_name):
+            # ─── 熱鍵守門：F1-F5 嚴格 (僅 TFopdmain)；F9-F12 寬鬆 (含醫院子視窗) ────
+            # 使用者反映：
+            #   1. F5 在 Chrome 會卡到瀏覽器刷新 → suppress=False (放過 keypress)
+            #   2. F1-F5 在 TfrmOpdCS (排檢) 不能執行 → 必須嚴格 (only TFopdmain)
+            #   3. F11/F9/F10/F12 在醫院子視窗 (popup/同意書/警告 dialog) 點要
+            #      還能觸發 → 寬鬆，允許所有已知醫院 class
+            HOTKEY_STRICT_CLASSES = {"TFopdmain"}
+            HOTKEY_LENIENT_CLASSES = {
+                "TFopdmain",       # 主視窗
+                "TOrMain",         # 同意書視窗
+                "Tfm_agree",       # 列印同意 popup
+                "TfrmOrrSentence", # 片語 popup
+                "#32770",          # Windows 標準對話框 (警告/確認等)
+                "TFOpdMsg1",       # 疼痛指數
+                "TFOPDPreg",       # 預約掛號
+                "TfAskDlg",        # 乳房篩檢 / 一般 ask
+                "TfAskDlg2",       # 健保藥費管控
+                "TMessageForm",    # Delphi 通用 message box
+                "TFTunMsg",        # 轉診提示
+                "TFAllergyB",      # 藥物過敏記錄
+                "TFrmAllergyM01",  # 過敏記錄維護-醫師端
+            }
+            STRICT_HOTKEYS = {'F1', 'F2', 'F3', 'F4', 'F5'}
+
+            def _hotkey_guard(action_fn, key_name, strict):
+                allow = HOTKEY_STRICT_CLASSES if strict else HOTKEY_LENIENT_CLASSES
+                tag = "(嚴格)" if strict else "(寬鬆)"
                 def _wrapped():
                     try:
                         fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
@@ -10786,10 +10881,10 @@ class AutomationApp:
                             return
                         cls_buf = ctypes.create_unicode_buffer(64)
                         ctypes.windll.user32.GetClassNameW(fg_hwnd, cls_buf, 64)
-                        if cls_buf.value != "TFopdmain":
+                        if cls_buf.value not in allow:
                             logging.debug(
-                                "[hotkey] %s 觸發但前景=%r 非 TFopdmain → skip",
-                                key_name, cls_buf.value)
+                                "[hotkey] %s 觸發但前景=%r 不在 allow list %s → skip",
+                                key_name, cls_buf.value, tag)
                             return
                     except Exception:
                         logging.debug("[hotkey] 前景偵測失敗，保險 skip",
@@ -10802,19 +10897,20 @@ class AutomationApp:
             for key, (func, name) in hotkeys_to_register.items():
                 resolved_fn, _, _ = _hotkey_resolve_callable(profile, key)
                 f_use = resolved_fn if resolved_fn is not None else func
-                # suppress=False → 在其他 app 中按 F1-F11 鍵會正常傳給該 app；
-                # 只有當 TFopdmain 是前景時 guard 才放行 action 觸發
+                strict = key in STRICT_HOTKEYS
                 hotkey_modules.keyboard.add_hotkey(
                     key,
                     _hotkey_guard(
                         lambda f=f_use, n=name: self.run_subsystem_in_thread(f, n),
                         key,
+                        strict,
                     ),
                     suppress=False,
                 )
+            # F12 (中止) 用寬鬆 — 任一醫院視窗都能 abort
             hotkey_modules.keyboard.add_hotkey(
                 'F12',
-                _hotkey_guard(self.interrupt_automation, 'F12'),
+                _hotkey_guard(self.interrupt_automation, 'F12', strict=False),
                 suppress=False,
             )
             

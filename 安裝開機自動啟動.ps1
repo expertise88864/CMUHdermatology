@@ -36,8 +36,8 @@ $programs = @(
     [pscustomobject]@{
         Key='watchdog'; TaskName='CMUH皮膚科守護程式_每2分鐘';
         Pyw='中國醫皮膚科守護程式.pyw';
-        Display='中國醫皮膚科守護程式 (外層備援，每 2 分鐘) — 測試中，建議不勾';
-        Hint='主程式裡已內建監看 thread (內層 B) 自動重啟 卡死的 consult / 打卡。外層 C 是備援，目前發現可能誤判主程式沒在跑導致重複跳對話框，正在改善中，建議先別勾。';
+        Display='中國醫皮膚科守護程式 (外層備援) — 建議不勾';
+        Hint='主程式內已有 thread 自動重啟卡死的 consult/打卡 (內層 B)；此為外層備援，目前測試中、建議先別勾';
         DefaultChecked=$false;
         Periodic=$true;
         ScriptRelPath='src\watchdog_runner.py';
@@ -85,7 +85,7 @@ foreach ($p in $programs) {
 # 並用 Padding 而不是手算 y 座標。
 $form = New-Object System.Windows.Forms.Form
 $form.Text = '中國醫皮膚科 — 開機自動啟動設定'
-$form.ClientSize = New-Object System.Drawing.Size(580, 610)
+$form.ClientSize = New-Object System.Drawing.Size(740, 620)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
@@ -95,14 +95,14 @@ $form.Font = New-Object System.Drawing.Font('Segoe UI', 10)
 $lblHeader = New-Object System.Windows.Forms.Label
 $lblHeader.Text = "勾選要在此使用者登入時【自動啟動】的程式：`n（會以 admin 身份啟動，不跳 UAC）"
 $lblHeader.Location = New-Object System.Drawing.Point(15, 12)
-$lblHeader.Size = New-Object System.Drawing.Size(520, 40)
+$lblHeader.Size = New-Object System.Drawing.Size(680, 40)
 $lblHeader.ForeColor = [System.Drawing.Color]::DarkSlateGray
 $form.Controls.Add($lblHeader)
 
 $lblPython = New-Object System.Windows.Forms.Label
 $lblPython.Text = "pythonw：$pythonw"
 $lblPython.Location = New-Object System.Drawing.Point(15, 55)
-$lblPython.Size = New-Object System.Drawing.Size(520, 18)
+$lblPython.Size = New-Object System.Drawing.Size(700, 18)
 $lblPython.ForeColor = [System.Drawing.Color]::Gray
 $lblPython.Font = New-Object System.Drawing.Font('Consolas', 8)
 $form.Controls.Add($lblPython)
@@ -110,7 +110,7 @@ $form.Controls.Add($lblPython)
 $lblUser = New-Object System.Windows.Forms.Label
 $lblUser.Text = "使用者：$user"
 $lblUser.Location = New-Object System.Drawing.Point(15, 73)
-$lblUser.Size = New-Object System.Drawing.Size(520, 18)
+$lblUser.Size = New-Object System.Drawing.Size(700, 18)
 $lblUser.ForeColor = [System.Drawing.Color]::Gray
 $lblUser.Font = New-Object System.Drawing.Font('Consolas', 8)
 $form.Controls.Add($lblUser)
@@ -122,7 +122,7 @@ foreach ($p in $programs) {
     $cb = New-Object System.Windows.Forms.CheckBox
     $cb.Text = $p.Display + $(if ($p.ExistingTask) { '  (目前已設定)' } else { '' })
     $cb.Location = New-Object System.Drawing.Point(25, $y)
-    $cb.Size = New-Object System.Drawing.Size(500, 22)
+    $cb.Size = New-Object System.Drawing.Size(680, 22)
     $cb.Checked = $p.InitialChecked
     $cb.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
     $form.Controls.Add($cb)
@@ -131,7 +131,7 @@ foreach ($p in $programs) {
     $hint = New-Object System.Windows.Forms.Label
     $hint.Text = "    $($p.Hint)"
     $hint.Location = New-Object System.Drawing.Point(45, ($y + 22))
-    $hint.Size = New-Object System.Drawing.Size(490, 18)
+    $hint.Size = New-Object System.Drawing.Size(670, 18)
     $hint.ForeColor = [System.Drawing.Color]::DimGray
     $hint.Font = New-Object System.Drawing.Font('Microsoft JhengHei UI', 9)
     $form.Controls.Add($hint)
@@ -147,7 +147,7 @@ $lblNote.Text = (
     "`n  • 取消勾選 → 移除排程（不再自動啟動）" +
     "`n  • 大部分電腦只需要勾【主程式】；打卡/會診查詢全皮膚科只需一台電腦執行")
 $lblNote.Location = New-Object System.Drawing.Point(15, ($y + 5))
-$lblNote.Size = New-Object System.Drawing.Size(550, 90)
+$lblNote.Size = New-Object System.Drawing.Size(700, 90)
 $lblNote.ForeColor = [System.Drawing.Color]::DarkSlateGray
 $form.Controls.Add($lblNote)
 
