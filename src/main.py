@@ -2327,89 +2327,200 @@ def script_F5_adaptive():
 # =============================================================================
 # 流程：
 #   1. 主程式 TFopdmain 點「全部完成」TButton
-#   2. 等 疼痛指數 popup (class=TFOpdMsg1)
-#      - 11 個 TGroupButton 同一 row = 0-10 量表，最左 = 0
-#      - 勾「0」radio + 點「處理」TButton
-#   3. 等 預約掛號 popup (class=TFOPDPreg)
-#      - 直接點「處理」TButton
-#   (使用者描述只有這 2 個 popup，後續若有再加)
+#   2. 進入「popup 任意順序輪詢」迴圈 — 以下 popup 可能任意出現、可能跳過：
+#      a. 疼痛指數 TFOpdMsg1 → 勾 0 radio (最左) → 點「處理」
+#      b. 過敏記錄維護-醫師端 TFrmAllergyM01 → 點「回」
+#      c. 藥物過敏記錄 TFAllergyB → 點「完  成」(空白寬鬆比對)
+#      d. 健保藥費 TfAskDlg2 → 點「確認」
+#      e. 診間預約掛號 TFOPDPreg → 點「處理」
+#   迴圈條件：總時間上限 45s；連續 5s 沒看到任何 popup 視為完成
 # 全程 PostMessage 不動滑鼠；ForegroundProtector 支援使用者切走後背景完成。
 
-def _f11_handle_pain_popup(label: str = "") -> bool:
-    """處理 疼痛指數 popup：等視窗 → 勾 0 radio → 點 處理 button。"""
-    pain = _wait_for_window("TFOpdMsg1", title_kw="", timeout=15)
-    if not pain:
-        logging.info("[%s] 沒等到 疼痛指數 popup (或已關)", label)
-        return False
-    logging.info("[%s] 疼痛指數 popup hwnd=%s", label, pain)
-    time.sleep(0.5)
+def _click_button_normalized_text(parent_hwnd: int, target_text: str) -> int:
+    """找 TButton：把 text 去除「所有」空白後 == 去除空白的 target → PostMessage 點擊。
+    解決 Delphi 按鈕常見「完  成」「確  認」這種額外空格。
+    回傳：點到的 hwnd (失敗 0)。"""
+    target_norm = "".join(target_text.split())
+    out = [0]
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def cb(child, lparam):
+        try:
+            cls_buf = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(child, cls_buf, 64)
+            if cls_buf.value != "TButton":
+                return True
+            n = ctypes.windll.user32.GetWindowTextLengthW(child)
+            if n <= 0:
+                return True
+            t_buf = ctypes.create_unicode_buffer(n + 1)
+            ctypes.windll.user32.GetWindowTextW(child, t_buf, n + 1)
+            if "".join(t_buf.value.split()) == target_norm:
+                out[0] = child
+                return False
+        except Exception:
+            pass
+        return True
+
+    ctypes.windll.user32.EnumChildWindows(parent_hwnd, cb, 0)
+    if out[0]:
+        _post_click_to_control(out[0])
+    return out[0]
+
+
+def _wait_window_closed(hwnd: int, timeout: float = 5.0) -> bool:
+    """等視窗關閉，最多 timeout 秒。回傳 True 表示已關。"""
+    end_t = time.time() + timeout
+    while time.time() < end_t:
+        if not ctypes.windll.user32.IsWindow(hwnd):
+            return True
+        time.sleep(0.1)
+        check_stop()
+    return False
+
+
+def _f11_handle_pain(hwnd: int, label: str = "") -> bool:
+    """疼痛指數 popup：勾 0 radio + 點「處理」。hwnd 由 caller 找到後傳入。"""
+    logging.info("[%s] 疼痛指數 popup hwnd=%s → 勾 0 + 處理", label, hwnd)
+    time.sleep(0.4)
     check_stop()
 
-    # 找 0-10 量表 row (11 個 TGroupButton 同一 y)
-    radios = _enum_class_in_window(pain, "TGroupButton")
+    radios = _enum_class_in_window(hwnd, "TGroupButton")
     if radios:
         from collections import Counter
-        # snapshot 顯示 11 個 radios 同一 top (y=449)，每個 width 91
-        tops = Counter(r[1] for r in radios)  # r=(hwnd, top, left)
-        # 取出現最多次的 top (該 row 至少 11 個 radios)
+        tops = Counter(r[1] for r in radios)
         target_top, count = tops.most_common(1)[0]
         same_row = sorted([r for r in radios if r[1] == target_top],
                            key=lambda r: r[2])
-        logging.info("[%s] 量表 row (y=%d): %d 個 radios", label, target_top, len(same_row))
-        if len(same_row) >= 6:  # 至少 6 個視為量表
-            zero_radio = same_row[0][0]  # 最左 = "0"
-            _post_click_to_control(zero_radio)
-            logging.info("[%s] 已勾 0 radio (hwnd=%s)", label, zero_radio)
+        if len(same_row) >= 6:
+            _post_click_to_control(same_row[0][0])
+            logging.info("[%s]   已勾 0 radio (hwnd=%s)", label, same_row[0][0])
             time.sleep(0.2)
         else:
-            logging.warning("[%s] 量表 row 只有 %d 個 radios，不勾 (預設可能是 0)",
+            logging.warning("[%s]   量表 row 只 %d 個 radios，跳過勾選",
                               label, len(same_row))
     check_stop()
 
-    # 點 處理 button
-    if _click_button_by_text(pain, "處理"):
-        logging.info("[%s] 已點 處理 (疼痛指數)", label)
-    else:
-        logging.warning("[%s] 找不到 處理 button (疼痛指數)", label)
-        return False
-
-    # 等 popup 關
-    end_t = time.time() + 5
-    while time.time() < end_t:
-        if not ctypes.windll.user32.IsWindow(pain):
-            break
-        time.sleep(0.1)
-        check_stop()
-    return True
+    if _click_button_normalized_text(hwnd, "處理"):
+        logging.info("[%s]   已點 處理", label)
+        _wait_window_closed(hwnd, timeout=5)
+        return True
+    logging.warning("[%s]   找不到 處理 button", label)
+    return False
 
 
-def _f11_handle_appt_popup(label: str = "") -> bool:
-    """處理 預約掛號 popup：等視窗 → 點 處理 button (不勾任何項)。"""
-    preg = _wait_for_window("TFOPDPreg", title_kw="", timeout=15)
-    if not preg:
-        logging.info("[%s] 沒等到 預約掛號 popup (或無須預約)", label)
-        return False
-    logging.info("[%s] 預約掛號 popup hwnd=%s", label, preg)
-    time.sleep(0.5)
+def _f11_handle_appt(hwnd: int, label: str = "") -> bool:
+    """診間預約掛號 popup：直接點「處理」(不勾任何項)。"""
+    logging.info("[%s] 預約掛號 popup hwnd=%s → 處理", label, hwnd)
+    time.sleep(0.4)
     check_stop()
+    if _click_button_normalized_text(hwnd, "處理"):
+        logging.info("[%s]   已點 處理", label)
+        _wait_window_closed(hwnd, timeout=5)
+        return True
+    logging.warning("[%s]   找不到 處理 button", label)
+    return False
 
-    if _click_button_by_text(preg, "處理"):
-        logging.info("[%s] 已點 處理 (預約掛號)", label)
-    else:
-        logging.warning("[%s] 找不到 處理 button (預約掛號)", label)
-        return False
 
-    end_t = time.time() + 5
-    while time.time() < end_t:
-        if not ctypes.windll.user32.IsWindow(preg):
-            break
-        time.sleep(0.1)
+def _f11_handle_allergy_m01(hwnd: int, label: str = "") -> bool:
+    """過敏記錄維護-醫師端 popup：點「回」。"""
+    logging.info("[%s] 過敏記錄維護 popup hwnd=%s → 回", label, hwnd)
+    time.sleep(0.4)
+    check_stop()
+    if _click_button_normalized_text(hwnd, "回"):
+        logging.info("[%s]   已點 回", label)
+        _wait_window_closed(hwnd, timeout=5)
+        return True
+    logging.warning("[%s]   找不到 回 button", label)
+    return False
+
+
+def _f11_handle_allergy_b(hwnd: int, label: str = "") -> bool:
+    """藥物過敏記錄 popup：點「完成」(實際 text 是「完  成」)。"""
+    logging.info("[%s] 藥物過敏記錄 popup hwnd=%s → 完成", label, hwnd)
+    time.sleep(0.4)
+    check_stop()
+    if _click_button_normalized_text(hwnd, "完成"):
+        logging.info("[%s]   已點 完成", label)
+        _wait_window_closed(hwnd, timeout=5)
+        return True
+    logging.warning("[%s]   找不到 完成 button", label)
+    return False
+
+
+def _f11_handle_ask_dlg(hwnd: int, label: str = "") -> bool:
+    """健保藥費/品項管控目標確認 popup：點「確認」。"""
+    logging.info("[%s] 健保藥費確認 popup hwnd=%s → 確認", label, hwnd)
+    time.sleep(0.4)
+    check_stop()
+    if _click_button_normalized_text(hwnd, "確認"):
+        logging.info("[%s]   已點 確認", label)
+        _wait_window_closed(hwnd, timeout=5)
+        return True
+    logging.warning("[%s]   找不到 確認 button", label)
+    return False
+
+
+# (class_name, handler_fn) — 順序不重要 (任意順序輪詢)
+_F11_POPUP_HANDLERS = [
+    ("TFOpdMsg1",       _f11_handle_pain),
+    ("TFrmAllergyM01",  _f11_handle_allergy_m01),
+    ("TFAllergyB",      _f11_handle_allergy_b),
+    ("TfAskDlg2",       _f11_handle_ask_dlg),
+    ("TFOPDPreg",       _f11_handle_appt),
+]
+
+
+def _f11_popup_watcher(label: str = "F11",
+                        total_timeout: float = 45.0,
+                        idle_timeout: float = 5.0) -> int:
+    """輪詢已知 popup → 依現身順序執行對應 handler。
+
+    - total_timeout：整個輪詢最久跑這麼久
+    - idle_timeout：連續這麼久沒看到任何已知 popup → 視為完成、提早結束
+    回傳：處理過的 popup 數量
+    """
+    start = time.time()
+    last_seen = time.time()
+    handled = set()  # 已處理過的 hwnd，避免重複
+    handled_count = 0
+
+    while time.time() - start < total_timeout:
         check_stop()
-    return True
+        if time.time() - last_seen > idle_timeout:
+            logging.info("[%s] 連續 %.0fs 沒新 popup，watcher 結束 (處理 %d 個)",
+                          label, idle_timeout, handled_count)
+            return handled_count
+
+        found_one = False
+        for cls_name, handler in _F11_POPUP_HANDLERS:
+            hwnd = _find_window_by_class_title(cls_name, "")
+            if hwnd and hwnd not in handled:
+                try:
+                    handler(hwnd, label=label)
+                except Exception:
+                    logging.error("[%s] handler %s 例外", label, cls_name,
+                                    exc_info=True)
+                handled.add(hwnd)
+                handled_count += 1
+                last_seen = time.time()
+                found_one = True
+                time.sleep(0.3)
+                break  # 從頭再掃一輪 (這次處理完可能觸發下個 popup)
+
+        if not found_one:
+            time.sleep(0.3)
+
+    logging.info("[%s] watcher 達總時限 %.0fs (處理 %d 個)",
+                  label, total_timeout, handled_count)
+    return handled_count
 
 
 def _f11_快速完成_main(label: str = "F11") -> bool:
-    """F11 主流程：點 全部完成 → 處理 疼痛 + 預約 popup。"""
+    """F11 主流程：點 全部完成 → 輪詢任意順序 popup。"""
     main_hwnd = _find_hospital_main_window()
     if not main_hwnd:
         logging.warning("[%s] 找不到主程式視窗", label)
@@ -2421,21 +2532,15 @@ def _f11_快速完成_main(label: str = "F11") -> bool:
         logging.warning("[%s] 找不到 全部完成 button", label)
         return False
     _post_click_to_control(btns[0][0])
-    logging.info("[%s] 已點 全部完成 (hwnd=%s)", label, btns[0][0])
+    logging.info("[%s] 已點 全部完成 (hwnd=%s)，進入 popup 輪詢", label, btns[0][0])
 
-    # Step 2: 處理 疼痛 popup
-    _f11_handle_pain_popup(label=label)
-    time.sleep(0.3)
-    check_stop()
-
-    # Step 3: 處理 預約 popup
-    _f11_handle_appt_popup(label=label)
-
+    # Step 2: 輪詢已知 popup (任意順序、可能跳過)
+    _f11_popup_watcher(label=label)
     return True
 
 
 def script_F11_adaptive():
-    """F11 (解析度無關)：快速完成 — 全部完成 + 疼痛 + 預約。
+    """F11 (解析度無關)：快速完成 — 全部完成 + 任意順序 popup 處理。
     背景保護同 F9/F10：使用者切走後 popup 不會搶回 focus。"""
     if _maybe_run_override('adaptive', 'F11'): return
     logging.info("--- Executing F11 (快速完成 adaptive) ---")
