@@ -10774,14 +10774,49 @@ class AutomationApp:
             if profile in ('1920x1080', '1280x1024', '1024x768'):
                 hotkeys_to_register = dict(_adaptive_descs)
 
+            # ─── 熱鍵守門：只在 TFopdmain 是前景時才執行 ─────────────────
+            # 使用者反映 F5 在 Chrome 會卡到瀏覽器刷新功能。改 suppress=False
+            # (讓 keypress 過去給其他程式) + guard (foreground != TFopdmain 就
+            # 靜默 skip，不執行我們的 automation)。
+            def _hotkey_guard(action_fn, key_name):
+                def _wrapped():
+                    try:
+                        fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
+                        if not fg_hwnd:
+                            return
+                        cls_buf = ctypes.create_unicode_buffer(64)
+                        ctypes.windll.user32.GetClassNameW(fg_hwnd, cls_buf, 64)
+                        if cls_buf.value != "TFopdmain":
+                            logging.debug(
+                                "[hotkey] %s 觸發但前景=%r 非 TFopdmain → skip",
+                                key_name, cls_buf.value)
+                            return
+                    except Exception:
+                        logging.debug("[hotkey] 前景偵測失敗，保險 skip",
+                                       exc_info=True)
+                        return
+                    action_fn()
+                return _wrapped
+
             safe_unhook_all_hotkeys()
             for key, (func, name) in hotkeys_to_register.items():
                 resolved_fn, _, _ = _hotkey_resolve_callable(profile, key)
                 f_use = resolved_fn if resolved_fn is not None else func
+                # suppress=False → 在其他 app 中按 F1-F11 鍵會正常傳給該 app；
+                # 只有當 TFopdmain 是前景時 guard 才放行 action 觸發
                 hotkey_modules.keyboard.add_hotkey(
-                    key, lambda f=f_use, n=name: self.run_subsystem_in_thread(f, n), suppress=True
+                    key,
+                    _hotkey_guard(
+                        lambda f=f_use, n=name: self.run_subsystem_in_thread(f, n),
+                        key,
+                    ),
+                    suppress=False,
                 )
-            hotkey_modules.keyboard.add_hotkey('F12', self.interrupt_automation, suppress=True)
+            hotkey_modules.keyboard.add_hotkey(
+                'F12',
+                _hotkey_guard(self.interrupt_automation, 'F12'),
+                suppress=False,
+            )
             
             self.hotkey_text_label.config(text=hotkey_info_text)
             put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: 熱鍵註冊成功 ({profile})，等待指令...'))
