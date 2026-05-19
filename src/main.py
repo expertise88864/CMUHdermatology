@@ -2322,6 +2322,127 @@ def script_F5_adaptive():
     logging.info("F5 (KOH): %s", "done" if ok else "skipped")
 
 
+# =============================================================================
+# F11 — 快速完成 (adaptive)
+# =============================================================================
+# 流程：
+#   1. 主程式 TFopdmain 點「全部完成」TButton
+#   2. 等 疼痛指數 popup (class=TFOpdMsg1)
+#      - 11 個 TGroupButton 同一 row = 0-10 量表，最左 = 0
+#      - 勾「0」radio + 點「處理」TButton
+#   3. 等 預約掛號 popup (class=TFOPDPreg)
+#      - 直接點「處理」TButton
+#   (使用者描述只有這 2 個 popup，後續若有再加)
+# 全程 PostMessage 不動滑鼠；ForegroundProtector 支援使用者切走後背景完成。
+
+def _f11_handle_pain_popup(label: str = "") -> bool:
+    """處理 疼痛指數 popup：等視窗 → 勾 0 radio → 點 處理 button。"""
+    pain = _wait_for_window("TFOpdMsg1", title_kw="", timeout=15)
+    if not pain:
+        logging.info("[%s] 沒等到 疼痛指數 popup (或已關)", label)
+        return False
+    logging.info("[%s] 疼痛指數 popup hwnd=%s", label, pain)
+    time.sleep(0.5)
+    check_stop()
+
+    # 找 0-10 量表 row (11 個 TGroupButton 同一 y)
+    radios = _enum_class_in_window(pain, "TGroupButton")
+    if radios:
+        from collections import Counter
+        # snapshot 顯示 11 個 radios 同一 top (y=449)，每個 width 91
+        tops = Counter(r[1] for r in radios)  # r=(hwnd, top, left)
+        # 取出現最多次的 top (該 row 至少 11 個 radios)
+        target_top, count = tops.most_common(1)[0]
+        same_row = sorted([r for r in radios if r[1] == target_top],
+                           key=lambda r: r[2])
+        logging.info("[%s] 量表 row (y=%d): %d 個 radios", label, target_top, len(same_row))
+        if len(same_row) >= 6:  # 至少 6 個視為量表
+            zero_radio = same_row[0][0]  # 最左 = "0"
+            _post_click_to_control(zero_radio)
+            logging.info("[%s] 已勾 0 radio (hwnd=%s)", label, zero_radio)
+            time.sleep(0.2)
+        else:
+            logging.warning("[%s] 量表 row 只有 %d 個 radios，不勾 (預設可能是 0)",
+                              label, len(same_row))
+    check_stop()
+
+    # 點 處理 button
+    if _click_button_by_text(pain, "處理"):
+        logging.info("[%s] 已點 處理 (疼痛指數)", label)
+    else:
+        logging.warning("[%s] 找不到 處理 button (疼痛指數)", label)
+        return False
+
+    # 等 popup 關
+    end_t = time.time() + 5
+    while time.time() < end_t:
+        if not ctypes.windll.user32.IsWindow(pain):
+            break
+        time.sleep(0.1)
+        check_stop()
+    return True
+
+
+def _f11_handle_appt_popup(label: str = "") -> bool:
+    """處理 預約掛號 popup：等視窗 → 點 處理 button (不勾任何項)。"""
+    preg = _wait_for_window("TFOPDPreg", title_kw="", timeout=15)
+    if not preg:
+        logging.info("[%s] 沒等到 預約掛號 popup (或無須預約)", label)
+        return False
+    logging.info("[%s] 預約掛號 popup hwnd=%s", label, preg)
+    time.sleep(0.5)
+    check_stop()
+
+    if _click_button_by_text(preg, "處理"):
+        logging.info("[%s] 已點 處理 (預約掛號)", label)
+    else:
+        logging.warning("[%s] 找不到 處理 button (預約掛號)", label)
+        return False
+
+    end_t = time.time() + 5
+    while time.time() < end_t:
+        if not ctypes.windll.user32.IsWindow(preg):
+            break
+        time.sleep(0.1)
+        check_stop()
+    return True
+
+
+def _f11_快速完成_main(label: str = "F11") -> bool:
+    """F11 主流程：點 全部完成 → 處理 疼痛 + 預約 popup。"""
+    main_hwnd = _find_hospital_main_window()
+    if not main_hwnd:
+        logging.warning("[%s] 找不到主程式視窗", label)
+        return False
+
+    # Step 1: 點「全部完成」TButton
+    btns = _find_descendants_by_exact_text(main_hwnd, "TButton", "全部完成")
+    if not btns:
+        logging.warning("[%s] 找不到 全部完成 button", label)
+        return False
+    _post_click_to_control(btns[0][0])
+    logging.info("[%s] 已點 全部完成 (hwnd=%s)", label, btns[0][0])
+
+    # Step 2: 處理 疼痛 popup
+    _f11_handle_pain_popup(label=label)
+    time.sleep(0.3)
+    check_stop()
+
+    # Step 3: 處理 預約 popup
+    _f11_handle_appt_popup(label=label)
+
+    return True
+
+
+def script_F11_adaptive():
+    """F11 (解析度無關)：快速完成 — 全部完成 + 疼痛 + 預約。
+    背景保護同 F9/F10：使用者切走後 popup 不會搶回 focus。"""
+    if _maybe_run_override('adaptive', 'F11'): return
+    logging.info("--- Executing F11 (快速完成 adaptive) ---")
+    ok = _run_with_foreground_protector(_f11_快速完成_main, label="F11")
+    logging.info("F11: %s", "done" if ok else "中斷")
+
+
 def _find_療程_edit_hwnd(main_hwnd: int) -> int:
     """動態找頂部 header「療程」輸入欄的 hwnd。
 
@@ -5109,12 +5230,11 @@ def _canonical_clinic_session_str(s) -> str:
 def _hotkey_builtin_map_for_profile(profile: str) -> dict:
     """profile → 熱鍵鍵名 → 內建函式（覆寫載入失敗時回退）。
 
-    新熱鍵配置 (2026-05-18 重排)：
-      F1=照光1, F2=照光2, F3=照光3, F4=冷凍, F5=KOH(手動輸入),
-      F9=腫瘤同意書, F10=切片同意書, F11=快速完成 (per-resolution),
+    新熱鍵配置 (2026-05-18 重排, F11 adaptive 2026-05-19)：
+      F1=照光1, F2=照光2, F3=照光3, F4=冷凍, F5=KOH(13017),
+      F9=腫瘤同意書, F10=切片同意書, F11=快速完成 (adaptive),
       F12=中止 (special key)
-    F1-F5 + F9 + F10 全部 adaptive (Win32, 跨解析度)。
-    F11 仍是 per-resolution（後續再改）。"""
+    F1-F5 + F9 + F10 + F11 全部 adaptive (Win32, 跨解析度)。"""
     common_adaptive = {
         "F1": script_F1_adaptive,
         "F2": script_F2_adaptive,
@@ -5123,13 +5243,10 @@ def _hotkey_builtin_map_for_profile(profile: str) -> dict:
         "F5": script_F5_adaptive,
         "F9": script_F9_adaptive,
         "F10": script_F10_adaptive,
+        "F11": script_F11_adaptive,
     }
-    if profile == "1920x1080":
-        return {**common_adaptive, "F11": script_F11_1920x1080}
-    if profile == "1280x1024":
-        return {**common_adaptive, "F11": script_F11_1280x1024}
-    if profile == "1024x768":
-        return {**common_adaptive, "F11": script_F11_1024x768}
+    if profile in ("1920x1080", "1280x1024", "1024x768"):
+        return dict(common_adaptive)
     return {}
 
 
@@ -10355,31 +10472,21 @@ class AutomationApp:
         try:
             hotkeys_to_register = {}
             hotkey_info_text = ""
-            # 統一熱鍵 (F1-F5 + F9 + F10 全 adaptive; F11 仍 per-resolution)
+            # 統一熱鍵 (F1-F5 + F9 + F10 + F11 全 adaptive, 跨解析度)
             _adaptive_descs = {
                 'F1':  (script_F1_adaptive,  "F1: 照光(1) — 51019+療程1"),
                 'F2':  (script_F2_adaptive,  "F2: 照光(2) — 51019+療程2"),
                 'F3':  (script_F3_adaptive,  "F3: 照光(3) — 51019+療程3"),
                 'F4':  (script_F4_adaptive,  "F4: 冷凍 — 51017"),
-                'F5':  (script_F5_adaptive,  "F5: KOH — 開代碼輸入"),
+                'F5':  (script_F5_adaptive,  "F5: KOH — 13017"),
                 'F9':  (script_F9_adaptive,  "F9: 腫瘤同意書"),
                 'F10': (script_F10_adaptive, "F10: 切片同意書"),
+                'F11': (script_F11_adaptive, "F11: 快速完成 (全部完成→疼痛→預約)"),
             }
             hotkey_info_text = ("F1:照光(1) F2:照光(2) F3:照光(3) F4:冷凍 F5:KOH\n"
                                 "F9:腫瘤 F10:切片 F11:快速完成 F12:中止")
-            if profile == '1920x1080':
+            if profile in ('1920x1080', '1280x1024', '1024x768'):
                 hotkeys_to_register = dict(_adaptive_descs)
-                hotkeys_to_register['F11'] = (script_F11_1920x1080,
-                                                "F11: 快速完成 (1920x1080)")
-            elif profile == '1280x1024':
-                hotkeys_to_register = dict(_adaptive_descs)
-                hotkeys_to_register['F11'] = (script_F11_1280x1024,
-                                                "F11: 快速完成 (1280x1024)")
-            elif profile == '1024x768':
-                hotkeys_to_register = dict(_adaptive_descs)
-                hotkeys_to_register['F11'] = (script_F11_1024x768,
-                                                "F11: 快速完成 (1024x768)")
-                hotkey_info_text = "F3:冷凍 F4:照光 F9:腫瘤同意書\nF10:切片同意書 F11:快速完成 F12:終止"
 
             safe_unhook_all_hotkeys()
             for key, (func, name) in hotkeys_to_register.items():
