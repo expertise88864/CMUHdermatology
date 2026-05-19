@@ -1838,6 +1838,44 @@ def _f11_handle_breast_screening(hwnd: int, label: str = "") -> bool:
     return False
 
 
+def _f11_handle_primary_care_refer(hwnd: int, label: str = "") -> bool:
+    """健保初級照護轉診訊息 (class=TfChkSpecList)：
+    勾「99.本院療程尚未結束，本次不轉院」TGroupButton → 點「確認」TButton。"""
+    logging.info("[%s] 健保初級照護轉診 popup hwnd=%s → 勾 99.本院療程尚未結束 + 確認",
+                  label, hwnd)
+    time.sleep(0.3)
+    check_stop()
+
+    # 找 radio「99.本院療程尚未結束，本次不轉院」
+    radios = _find_descendants_by_exact_text(
+        hwnd, "TGroupButton", "99.本院療程尚未結束，本次不轉院")
+    target_radio = 0
+    for rh, _, _ in radios:
+        try:
+            if (ctypes.windll.user32.IsWindowVisible(rh)
+                    and ctypes.windll.user32.IsWindowEnabled(rh)):
+                target_radio = rh
+                break
+        except Exception:
+            continue
+
+    if not target_radio:
+        logging.warning("[%s]   找不到 99.本院療程尚未結束 radio", label)
+        return False
+
+    _post_click_to_control(target_radio)
+    logging.info("[%s]   已勾 radio (hwnd=%s)", label, target_radio)
+    time.sleep(0.3)
+    check_stop()
+
+    if _click_button_normalized_text(hwnd, "確認"):
+        logging.info("[%s]   已點 確認", label)
+        _wait_window_closed(hwnd, timeout=5)
+        return True
+    logging.warning("[%s]   找不到 確認 button", label)
+    return False
+
+
 def _f11_handle_transfer_msg(hwnd: int, label: str = "") -> bool:
     """病人轉診提示畫面 popup (class=TFTunMsg) — 兩個 state 同一個 hwnd：
       state A：顯示「轉診病人就診動向追蹤」tab
@@ -1951,6 +1989,7 @@ _F11_POPUP_HANDLERS = [
     ("TfAskDlg",        "乳房篩檢",       _f11_handle_breast_screening),
     ("TMessageForm",    "西醫門診系統",   _f11_handle_message_ok),
     ("TFTunMsg",        "病人轉診",       _f11_handle_transfer_msg),
+    ("TfChkSpecList",   "健保初級照護",   _f11_handle_primary_care_refer),
 ]
 
 
