@@ -337,41 +337,6 @@ _HOTKEY_BASE_SIZE = {
     "1280x1024": (1280, 1024),
     "1024x768": (1024, 768),
 }
-HOTKEY_ADAPTIVE_STATE = {
-    "enabled": False,
-    "base_version": None,
-    "base_size": (0, 0),
-    "target_size": (0, 0),
-    "scale_x": 1.0,
-    "scale_y": 1.0,
-}
-
-def configure_hotkey_scaling(enabled, base_version=None, target_size=None):
-    HOTKEY_ADAPTIVE_STATE["enabled"] = bool(enabled)
-    HOTKEY_ADAPTIVE_STATE["base_version"] = base_version
-    if not enabled or base_version not in _HOTKEY_BASE_SIZE or not target_size:
-        HOTKEY_ADAPTIVE_STATE["base_size"] = (0, 0)
-        HOTKEY_ADAPTIVE_STATE["target_size"] = (0, 0)
-        HOTKEY_ADAPTIVE_STATE["scale_x"] = 1.0
-        HOTKEY_ADAPTIVE_STATE["scale_y"] = 1.0
-        return
-    base_w, base_h = _HOTKEY_BASE_SIZE[base_version]
-    target_w, target_h = int(target_size[0]), int(target_size[1])
-    HOTKEY_ADAPTIVE_STATE["base_size"] = (base_w, base_h)
-    HOTKEY_ADAPTIVE_STATE["target_size"] = (target_w, target_h)
-    HOTKEY_ADAPTIVE_STATE["scale_x"] = target_w / float(base_w)
-    HOTKEY_ADAPTIVE_STATE["scale_y"] = target_h / float(base_h)
-
-def _scaled_xy(x, y, base_version_hint=None):
-    state = HOTKEY_ADAPTIVE_STATE
-    if not state["enabled"]:
-        return int(x), int(y)
-    if base_version_hint and state.get("base_version") not in (None, base_version_hint):
-        return int(x), int(y)
-    sx = state.get("scale_x", 1.0)
-    sy = state.get("scale_y", 1.0)
-    return int(round(x * sx)), int(round(y * sy))
-
 # --- 4. 全域執行緒控制事件 ---
 stop_event_automation = threading.Event()
 stop_event_main = threading.Event()
@@ -1191,73 +1156,6 @@ _runner_1280 = HotkeyRunner("1280x1024")
 _runner_1024 = HotkeyRunner("1024x768")
 
 
-# =============================================================================
-# [hotkey override 執行引擎]
-# 載入 settings/hotkey_overrides.json，若某個 (resolution, hotkey) 有 override，
-# 用 JSON 驅動的 runner 執行而非原始 script 函式。
-# 支援兩種模式：
-#   - "sequential": 依序執行 actions 列表
-#   - "loop":       while 迴圈，逐 step 檢查 match_rgb，符合就執行 actions
-#
-# 安全性：
-#   - 任何例外 → fallback 到原始 hardcoded 函式
-#   - mtime cache：檔案改動後自動重載（無需重啟）
-#   - 結構驗證：缺欄位視為 invalid，跳過該 step
-# =============================================================================
-_HOTKEY_OVERRIDE_CACHE: dict | None = None
-_HOTKEY_OVERRIDE_MTIME: float = 0.0
-_HOTKEY_OVERRIDE_LOCK = threading.Lock()
-
-
-def _load_hotkey_overrides() -> dict:
-    """讀取（並 mtime cache） hotkey_overrides.json。
-
-    [O34] 優先順序：
-      1. settings/hotkey_overrides.json （本機私有，gitignored）
-      2. <app_dir>/hotkey_overrides.json （repo root 共用版，會被 GitHub 同步）
-    """
-    global _HOTKEY_OVERRIDE_CACHE, _HOTKEY_OVERRIDE_MTIME
-    local_path = get_conf_path('hotkey_overrides.json')
-    shared_path = os.path.join(get_app_dir(), 'hotkey_overrides.json')
-    # 選優先級高且存在的那個
-    chosen = None
-    for p in (local_path, shared_path):
-        if os.path.isfile(p):
-            chosen = p
-            break
-    if not chosen:
-        with _HOTKEY_OVERRIDE_LOCK:
-            _HOTKEY_OVERRIDE_CACHE = None
-            _HOTKEY_OVERRIDE_MTIME = 0.0
-        return {}
-    try:
-        m = os.path.getmtime(chosen)
-    except OSError:
-        return _HOTKEY_OVERRIDE_CACHE or {}
-    with _HOTKEY_OVERRIDE_LOCK:
-        if _HOTKEY_OVERRIDE_CACHE is not None and m == _HOTKEY_OVERRIDE_MTIME:
-            return _HOTKEY_OVERRIDE_CACHE
-        try:
-            with open(chosen, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            _HOTKEY_OVERRIDE_CACHE = data if isinstance(data, dict) else {}
-            _HOTKEY_OVERRIDE_MTIME = m
-            src = "本機 settings/" if chosen == local_path else "共用 (GitHub)"
-            logging.info("[hotkey override] 從 %s 載入 %d 組 override", src,
-                         sum(len(v) for v in _HOTKEY_OVERRIDE_CACHE.values()
-                             if isinstance(v, dict)))
-            return _HOTKEY_OVERRIDE_CACHE
-        except Exception as e:
-            logging.warning("[hotkey override] 載入失敗: %s", e)
-            _HOTKEY_OVERRIDE_CACHE = None
-            return {}
-
-
-def _get_hotkey_override(resolution: str, hotkey: str) -> dict | None:
-    overrides = _load_hotkey_overrides()
-    return overrides.get(resolution, {}).get(hotkey) if overrides else None
-
-
 def _resolve_runner(resolution: str) -> HotkeyRunner:
     return {
         "1920x1080": _runner_1920,
@@ -1332,101 +1230,6 @@ def _execute_override_action(action: dict, resolution: str) -> None:
     else:
         logging.debug("[override] 未知 action 類型: %s", t)
 
-
-def _execute_override(override: dict, resolution: str) -> None:
-    """執行整個 override 腳本。"""
-    runner = _resolve_runner(resolution)
-    runner.last_action_time = time.time()
-
-    mode = override.get("mode", "loop")
-
-    if mode == "sequential":
-        for act in override.get("actions", []):
-            check_stop()
-            _execute_override_action(act, resolution)
-        return
-
-    # loop 模式
-    init = override.get("init_action")
-    if init:
-        _execute_override_action(init, resolution)
-        runner.last_action_time = time.time()
-
-    steps = override.get("steps", [])
-    n_steps = len(steps)
-    steps_done = [False] * n_steps  # 已執行的 step 不再執行（與原 F11 邏輯一致）
-
-    while True:
-        check_stop()
-        if runner.idle_seconds > 40:
-            logging.warning("[override] %s/%s: idle 40 秒，停止", resolution, runner.profile)
-            return
-
-        # 用 F11PixelFrameCache 一次截圖快取，跟原 F11 相同效率
-        try:
-            px = F11PixelFrameCache()
-        except Exception:
-            time.sleep(0.05)
-            continue
-
-        any_done_this_iter = False
-        for i, step in enumerate(steps):
-            if steps_done[i]:
-                continue
-            matches = step.get("matches", [])
-            if not matches:
-                # 無條件 step → 直接執行（少見）
-                pass
-            else:
-                ok = True
-                for m in matches:
-                    try:
-                        if not px.match_rgb(int(m["x"]), int(m["y"]),
-                                            tuple(m["rgb"]),
-                                            int(m.get("tolerance", 10))):
-                            ok = False
-                            break
-                    except Exception:
-                        ok = False
-                        break
-                if not ok:
-                    continue
-
-            # 條件成立 → 執行 actions
-            for act in step.get("actions", []):
-                _execute_override_action(act, resolution)
-            steps_done[i] = True
-            runner.last_action_time = time.time()
-            any_done_this_iter = True
-            break  # 重新截圖再判斷
-
-        if not any_done_this_iter:
-            # 全部 step 都不滿足 → 短暫 sleep 後重試
-            if all(steps_done):
-                logging.info("[override] %s/%s: 全部 step 完成", resolution, runner.profile)
-                return
-            time.sleep(0.05)
-
-
-def _maybe_run_override(resolution: str, hotkey: str) -> bool:
-    """檢查並執行 override；回傳 True 表示已執行，呼叫端應 return（不跑原始版）。"""
-    try:
-        ov = _get_hotkey_override(resolution, hotkey)
-    except Exception:
-        return False
-    if not ov:
-        return False
-    try:
-        logging.info("[override] 套用 %s / %s 的 JSON 步驟（共 %d 個）",
-                     resolution, hotkey,
-                     len(ov.get("actions") if ov.get("mode") == "sequential" else ov.get("steps", [])))
-        _execute_override(ov, resolution)
-        return True
-    except SubsystemInterrupted:
-        raise
-    except Exception as e:
-        logging.error("[override] 執行失敗，fallback 到原始版: %s", e, exc_info=True)
-        return False
 
 # -----------------------------------------------------------------------------
 # --- 6.1 熱鍵腳本 (1920x1080 版本) ---
@@ -1740,7 +1543,6 @@ def _script_code_input_adaptive(code: str, label: str = "",
 
 def script_F1_adaptive():
     """F1: 照光 (1) — 51019 + 療程 1。"""
-    if _maybe_run_override('adaptive', 'F1'): return
     logging.info("--- Executing F1 (照光 1) ---")
     ok = _script_code_input_adaptive("51019", label="F1", set_療程=1)
     logging.info("F1 (照光 1): %s", "done" if ok else "skipped")
@@ -1748,7 +1550,6 @@ def script_F1_adaptive():
 
 def script_F2_adaptive():
     """F2: 照光 (2) — 51019 + 療程 2。"""
-    if _maybe_run_override('adaptive', 'F2'): return
     logging.info("--- Executing F2 (照光 2) ---")
     ok = _script_code_input_adaptive("51019", label="F2", set_療程=2)
     logging.info("F2 (照光 2): %s", "done" if ok else "skipped")
@@ -1756,7 +1557,6 @@ def script_F2_adaptive():
 
 def script_F3_adaptive():
     """F3: 照光 (3) — 51019 + 療程 3。"""
-    if _maybe_run_override('adaptive', 'F3'): return
     logging.info("--- Executing F3 (照光 3) ---")
     ok = _script_code_input_adaptive("51019", label="F3", set_療程=3)
     logging.info("F3 (照光 3): %s", "done" if ok else "skipped")
@@ -1764,7 +1564,6 @@ def script_F3_adaptive():
 
 def script_F5_adaptive():
     """F5: KOH — 醫令→代碼輸入 → 13017 → Enter (不改療程)。"""
-    if _maybe_run_override('adaptive', 'F5'): return
     logging.info("--- Executing F5 (KOH 13017) ---")
     ok = _script_code_input_adaptive("13017", label="F5", set_療程=None)
     logging.info("F5 (KOH): %s", "done" if ok else "skipped")
@@ -2246,7 +2045,6 @@ def _f11_快速完成_main(label: str = "F11") -> bool:
 def script_F11_adaptive():
     """F11 (解析度無關)：快速完成 — 全部完成 + 任意順序 popup 處理。
     背景保護同 F9/F10：使用者切走後 popup 不會搶回 focus。"""
-    if _maybe_run_override('adaptive', 'F11'): return
     logging.info("--- Executing F11 (快速完成 adaptive) ---")
     ok = _run_with_foreground_protector(_f11_快速完成_main, label="F11")
     logging.info("F11: %s", "done" if ok else "中斷")
@@ -2363,7 +2161,6 @@ def _replace_edit_text(field_hwnd: int, new_text: str,
 
 def script_F4_adaptive():
     """F4: 冷凍 — 51017 (no 療程)。"""
-    if _maybe_run_override('adaptive', 'F4'): return
     logging.info("--- Executing F4 (冷凍 51017) ---")
     ok = _script_code_input_adaptive("51017", label="F4", set_療程=None)
     logging.info("F4 (冷凍): %s", "done" if ok else "skipped")
@@ -3253,7 +3050,6 @@ def script_F9_adaptive():
          → 兩片語自動選 (皮膚腫瘤 / 治療) → popup 開立電子 → 警告對話框「是」
     全程不主動推到背景；ForegroundProtector 只在使用者切到非醫院視窗時
     才保護其 focus（讓使用者可選擇看或不看）。"""
-    if _maybe_run_override('adaptive', 'F9'): return
     logging.info("--- Executing F9 (adaptive R1-R4) ---")
     # F9 row index: 所患疾病=3 (皮膚腫瘤), 手術原因=0 (治療)
     ok = _run_with_foreground_protector(
@@ -3267,7 +3063,6 @@ def script_F10_adaptive():
     流程：開同意書 → 手術及治療 → MU02 → 開立電子 → popup 清空+局麻
          → 兩片語自動選 (皮膚疾患 / 確診) → popup 開立電子 → 警告對話框「是」
     背景保護同 F9。"""
-    if _maybe_run_override('adaptive', 'F10'): return
     logging.info("--- Executing F10 (adaptive R1-R4) ---")
     # F10 row index: 所患疾病=0 (皮膚疾患), 手術原因=1 (確診)
     ok = _run_with_foreground_protector(
@@ -4958,171 +4753,6 @@ def _hotkey_builtin_map_for_profile(profile: str) -> dict:
     return {}
 
 
-def _hotkey_user_script_path(func_name: str) -> str:
-    d = os.path.join(SETTINGS_DIR, "hotkey_user")
-    os.makedirs(d, exist_ok=True)
-    return os.path.join(d, f"{func_name}.py")
-
-
-def _hotkey_resolve_callable(profile: str, key: str):
-    """回傳 (可呼叫函式, 函式名, 覆寫檔路徑)；無對應 profile/鍵則 (None, '', '')。"""
-    if not profile:
-        return None, "", ""
-    mp = _hotkey_builtin_map_for_profile(profile)
-    base = mp.get(key)
-    if base is None:
-        return None, "", ""
-    fn_name = f"script_{key}_{profile}"
-    path = _hotkey_user_script_path(fn_name)
-    if not os.path.isfile(path):
-        return base, fn_name, path
-    try:
-        import __main__ as _m
-
-        ns = dict(vars(_m))
-        with open(path, encoding="utf-8") as f:
-            code = f.read()
-        if not code.strip():
-            return base, fn_name, path
-        exec(compile(code, path, "exec"), ns)
-        fn = ns.get(fn_name)
-        if callable(fn):
-            return fn, fn_name, path
-        logging.warning("熱鍵覆寫檔未定義可呼叫的 %s：%s", fn_name, path)
-    except Exception as e:
-        logging.warning("載入熱鍵覆寫失敗 %s：%s", path, e, exc_info=True)
-    return base, fn_name, path
-
-
-class HotkeyScriptEditorWindow(tk.Toplevel):
-    """設定頁內嵌熱鍵腳本編輯器：儲存至 settings/hotkey_user/*.py 並重註冊熱鍵。"""
-
-    def __init__(self, master, app: "AutomationApp", key: str, profile: str, builtin_fn, func_name: str, path: str):
-        super().__init__(master)
-        self._app = app
-        self._key = key
-        self._profile = profile
-        self._builtin_fn = builtin_fn
-        self._func_name = func_name
-        self._path = path
-        self.title(f"編輯熱鍵 {key} · {profile}")
-        self.geometry("900x640")
-        try:
-            self.transient(master)
-        except tk.TclError:
-            pass
-
-        top = ttk.Frame(self, padding=8)
-        top.pack(fill=tk.BOTH, expand=True)
-
-        src_hint = (
-            "在此直接編輯 Python 原始碼（與主程式相同環境：click、PyAutoGUI、logging 等皆可用）。\n"
-            f"儲存後寫入：{path}\n"
-            "檔案須定義與內建相同名稱的函式：def "
-            + func_name
-            + "(...): …\n"
-            "「還原內建」會刪除覆寫檔並載入程式內建版本。院外模式時儲存後仍須切回院內才會註冊熱鍵。"
-        )
-        ttk.Label(top, text=src_hint, wraplength=860, justify="left").pack(anchor="w", pady=(0, 6))
-
-        self._status = tk.StringVar(value="就緒")
-        ttk.Label(top, textvariable=self._status, foreground="gray").pack(anchor="w")
-
-        body = ttk.Frame(top)
-        body.pack(fill=tk.BOTH, expand=True, pady=6)
-        self._txt = scrolledtext.ScrolledText(body, wrap=tk.NONE, font=("Consolas", 10), undo=True)
-        self._txt.pack(fill=tk.BOTH, expand=True)
-
-        if os.path.isfile(path):
-            try:
-                with open(path, encoding="utf-8") as f:
-                    self._txt.insert("1.0", f.read())
-                self._status.set("已載入使用者覆寫檔")
-            except OSError as e:
-                self._txt.insert("1.0", inspect.getsource(builtin_fn))
-                self._status.set(f"覆寫檔讀取失敗，改顯示內建：{e}")
-        else:
-            try:
-                self._txt.insert("1.0", inspect.getsource(builtin_fn))
-                self._status.set("顯示內建腳本（尚未有覆寫檔）")
-            except (OSError, TypeError):
-                self._txt.insert("1.0", f"# 無法讀取內建原始碼，請手動撰寫 def {func_name}():\n    pass\n")
-                self._status.set("無法取得內建原始碼")
-
-        btn_row = ttk.Frame(top)
-        btn_row.pack(fill=tk.X, pady=(6, 0))
-        ttk.Button(btn_row, text="儲存並套用", command=self._on_save).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(btn_row, text="還原內建", command=self._on_revert).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(btn_row, text="關閉", command=self.destroy).pack(side=tk.RIGHT)
-
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
-        try:
-            self._app._hotkey_editor_window = self
-        except Exception:
-            pass
-
-    def destroy(self, *args, **kwargs):
-        try:
-            if getattr(self._app, "_hotkey_editor_window", None) is self:
-                self._app._hotkey_editor_window = None
-        except Exception:
-            pass
-        return super().destroy(*args, **kwargs)
-
-    def _on_save(self):
-        code = self._txt.get("1.0", tk.END)
-        try:
-            compile(code, self._path, "exec")
-        except SyntaxError as e:
-            messagebox.showerror("語法錯誤", f"無法儲存：{e}", parent=self)
-            return
-        try:
-            import __main__ as _m
-
-            test_ns = dict(vars(_m))
-            exec(compile(code, self._path, "exec"), test_ns)
-            fn = test_ns.get(self._func_name)
-            if not callable(fn):
-                messagebox.showerror(
-                    "定義錯誤",
-                    f"執行後找不到可呼叫的「{self._func_name}」函式，請檢查 def 名稱是否與 profile 一致。",
-                    parent=self,
-                )
-                return
-        except Exception as e:
-            messagebox.showerror("執行檢查失敗", f"無法儲存：{e}", parent=self)
-            return
-        try:
-            with open(self._path, "w", encoding="utf-8") as f:
-                f.write(code)
-        except OSError as e:
-            messagebox.showerror("寫入失敗", str(e), parent=self)
-            return
-        self._status.set("已儲存，正在重註冊熱鍵…")
-        self._app.root.after(0, self._app.setup_hotkeys)
-        messagebox.showinfo("完成", "已儲存覆寫腳本並觸發熱鍵重註冊（院內模式時生效）。", parent=self)
-
-    def _on_revert(self):
-        if not os.path.isfile(self._path):
-            messagebox.showinfo("提示", "目前沒有覆寫檔可還原。", parent=self)
-            return
-        if not messagebox.askyesno("確認", "確定刪除覆寫檔並還原為內建腳本？", parent=self):
-            return
-        try:
-            os.remove(self._path)
-        except OSError as e:
-            messagebox.showerror("刪除失敗", str(e), parent=self)
-            return
-        try:
-            self._txt.delete("1.0", tk.END)
-            self._txt.insert("1.0", inspect.getsource(self._builtin_fn))
-        except (OSError, TypeError):
-            self._txt.delete("1.0", tk.END)
-        self._status.set("已還原內建")
-        self._app.root.after(0, self._app.setup_hotkeys)
-        messagebox.showinfo("完成", "已刪除覆寫檔並重註冊熱鍵。", parent=self)
-
-
 # =============================================================================
 # 止掛提醒寄信（Outlook COM，在獨立執行緒+逾時，避免卡到主迴圈）
 # =============================================================================
@@ -5254,7 +4884,6 @@ class AutomationApp:
         elif self.screen_width == 1024 and self.screen_height == 768:
             self.hotkey_version = '1024x768'
         self.hotkey_profile = self.hotkey_version or self._select_adaptive_hotkey_profile()
-        self.hotkey_adaptive_enabled = (self.hotkey_version is None and self.hotkey_profile is not None)
 
         self.f_lg = 10
         self.f_md = 9
@@ -5299,7 +4928,6 @@ class AutomationApp:
         self.app_version_text = tk.StringVar(value=f"v{CURRENT_VERSION}")
         self.last_refresh_text = tk.StringVar(value="更新: --")
         self.hotkey_display_note = tk.StringVar(value="")
-        self._hotkey_editor_window = None
         self._log_backlog = []
 
         # [O15] Queue 加上界，避免極端狀況 OOM；UI 端用 get_nowait 批次拉取
@@ -8942,30 +8570,6 @@ class AutomationApp:
             name_entry = ttk.Entry(r_doctor_frame, textvariable=name_var, width=12); name_entry.grid(row=i, column=1, padx=5, pady=5, sticky='w')
             self.r_doctor_entries[r_key] = {'name_var': name_var}
 
-        hk_edit = ttk.LabelFrame(left_column, text="熱鍵腳本編輯", padding=10)
-        hk_edit.pack(fill=tk.X, pady=(0, 15))
-        prof = getattr(self, "hotkey_profile", None) or getattr(self, "hotkey_version", None) or "（尚未偵測）"
-        ttk.Label(
-            hk_edit,
-            text=(
-                f"目前解析度 profile：{prof}\n"
-                "按下「編輯」開啟本程式內建視窗，可直接改 Python（左鍵、座標等與內建腳本寫法相同）。"
-                "儲存後寫入 settings/hotkey_user/ 並自動重註冊熱鍵；「還原內建」可刪除覆寫檔。"
-            ),
-            wraplength=420,
-            justify="left",
-            style="Small.TLabel",
-        ).pack(anchor="w", pady=(0, 6))
-        hk_btn_row = ttk.Frame(hk_edit)
-        hk_btn_row.pack(fill=tk.X)
-        for k in ("F3", "F4", "F9", "F10", "F11"):
-            ttk.Button(
-                hk_btn_row,
-                text=f"編輯 {k}",
-                width=8,
-                command=lambda key=k: self._open_hotkey_script_editor_ui(key),
-            ).pack(side=tk.LEFT, padx=(0, 4), pady=2)
-
         threshold_main_frame = ttk.LabelFrame(left_column, text="個別醫師止掛人數提醒設定", padding=10)
         threshold_main_frame.pack(fill=tk.X, pady=(0, 15))
         self.threshold_entries = {}
@@ -9980,11 +9584,6 @@ class AutomationApp:
         stop_event_automation.set()
         put_ui_message(self.ui_queue, UiStatusMessage(text="狀態: F12 終止 - 正在中斷目前操作..."))
 
-    def _get_hotkey_script_function(self, key: str):
-        """依目前螢幕 profile 回傳實際使用之腳本（含 settings/hotkey_user 覆寫）。"""
-        profile = getattr(self, "hotkey_profile", None) or getattr(self, "hotkey_version", None)
-        fn, _, _ = _hotkey_resolve_callable(profile, key)
-        return fn
 
     def _open_main_script_at_line(self, line_no: int):
         """以外部編輯器開啟主檔（勿用 os.startfile(.pyw) 以免又啟動一個程式）。"""
@@ -10014,23 +9613,6 @@ class AutomationApp:
         except Exception as e:
             messagebox.showerror("無法開啟", f"無法開啟主程式檔案供編輯：\n{e}\n\n{path}")
 
-    def _open_hotkey_script_editor_ui(self, key: str):
-        profile = getattr(self, "hotkey_profile", None) or getattr(self, "hotkey_version", None)
-        builtin_fn, fn_name, path = _hotkey_resolve_callable(profile, key)
-        if builtin_fn is None or not fn_name:
-            prof = profile or "（未知）"
-            messagebox.showinfo(
-                "無對應腳本",
-                f"目前熱鍵 profile：{prof}\n此解析度未註冊 {key}（例如 1920×1080 無 F9）。\n請確認院內模式與螢幕解析度。",
-            )
-            return
-        prev = getattr(self, "_hotkey_editor_window", None)
-        try:
-            if prev is not None and prev.winfo_exists():
-                prev.destroy()
-        except Exception:
-            pass
-        HotkeyScriptEditorWindow(self.root, self, key, profile, builtin_fn, fn_name, path)
 
     def setup_hotkeys(self):
         if threading.current_thread() is not threading.main_thread():
@@ -10057,14 +9639,9 @@ class AutomationApp:
             self.hotkey_text_label.config(text="熱鍵已停用 (解析度不符)")
             return
 
-        if getattr(self, 'hotkey_adaptive_enabled', False) and profile:
-            configure_hotkey_scaling(True, profile, (self.screen_width, self.screen_height))
-            self.hotkey_display_note.set(
-                f"熱鍵近似縮放 · {profile} ({self.screen_width}×{self.screen_height})"
-            )
-        else:
-            configure_hotkey_scaling(False, None, None)
-            self.hotkey_display_note.set("")
+        # [清理 2026-05-19] 移除 configure_hotkey_scaling 呼叫 — F1-F11 已全
+        # adaptive (Win32 訊息，跨解析度 hwnd-based)，座標縮放邏輯已死。
+        self.hotkey_display_note.set("")
 
         try:
             hotkeys_to_register = {}
@@ -10133,8 +9710,7 @@ class AutomationApp:
 
             safe_unhook_all_hotkeys()
             for key, (func, name) in hotkeys_to_register.items():
-                resolved_fn, _, _ = _hotkey_resolve_callable(profile, key)
-                f_use = resolved_fn if resolved_fn is not None else func
+                f_use = func
                 strict = key in STRICT_HOTKEYS
                 hotkey_modules.keyboard.add_hotkey(
                     key,
