@@ -35,7 +35,11 @@ LOCK_DIR = SETTINGS_DIR / ".watchdog_locks"
 # runpy.run_path("src/foo.py") 動態載入 src/*.py，cmdline 上只有 .pyw 路徑，
 # 沒有 src/foo.py 字串。所以 process_match 必須是 .pyw 中文檔名 (cmdline 一定含)。
 # psutil 在 Windows 用 UTF-16 取 cmdline，Chinese keyword 安全可比對。
-CONFIG_SCHEMA_VERSION = 3
+#
+# 【required_config_file】v4 新增：本機沒這檔 → 不啟動 (per-machine opt-in)
+# 打卡 / 會診查詢 全皮膚科只需「一台」電腦執行，靠對應 config 檔存在與否
+# 自動判斷本機是否該跑。沒設定過該功能的電腦不會被打擾。
+CONFIG_SCHEMA_VERSION = 4
 
 DEFAULT_CONFIG = {
     "schema_version": CONFIG_SCHEMA_VERSION,
@@ -52,6 +56,7 @@ DEFAULT_CONFIG = {
             "max_stale_sec": 180,  # 新版每 60s 一定有 heartbeat
             "enabled": True,
             "outer_only": False,
+            "required_config_file": "settings/consult_query_config.json",
         },
         {
             "name": "打卡",
@@ -61,6 +66,7 @@ DEFAULT_CONFIG = {
             "max_stale_sec": 0,    # 打卡 idle 沒 log，只看 process
             "enabled": True,
             "outer_only": False,
+            "required_config_file": "settings/autoclock_config.json",
         },
         {
             "name": "主程式",
@@ -73,6 +79,7 @@ DEFAULT_CONFIG = {
             # 會拒絕並跳「已在啟動中」對話框，徒增困擾。要重開請手動雙擊 .pyw。
             "enabled": False,
             "outer_only": True,
+            "required_config_file": "",  # 主程式不需 config gate
         },
     ],
 }
@@ -90,10 +97,19 @@ _V1_TO_V2_PROCESS_MATCH = {
 }
 
 
+_V3_TO_V4_REQUIRED_CONFIG = {
+    "會診查詢": "settings/consult_query_config.json",
+    "打卡": "settings/autoclock_config.json",
+    "主程式": "",
+}
+
+
 def _migrate_config(cfg: dict) -> tuple:
     """回傳 (migrated_cfg, changed)。
     v1→v2：把舊 process_match 改成新版 keyword。
     v2→v3：把主程式 enabled 設成 False (使用者反映外層 C 一直誤判沒在跑就重啟)。
+    v3→v4：加 required_config_file 欄位，打卡/會診查詢 per-machine opt-in
+           (本機沒對應 config → watchdog 跳過、不啟動)。
     """
     cur_v = int(cfg.get("schema_version", 1))
     if cur_v >= CONFIG_SCHEMA_VERSION:
@@ -110,6 +126,12 @@ def _migrate_config(cfg: dict) -> tuple:
         for prog in cfg.get("programs", []):
             if prog.get("name") == "主程式":
                 prog["enabled"] = False
+    # v3 → v4: 加 required_config_file 欄位
+    if cur_v < 4:
+        for prog in cfg.get("programs", []):
+            name = prog.get("name", "")
+            req = _V3_TO_V4_REQUIRED_CONFIG.get(name, "")
+            prog.setdefault("required_config_file", req)
     cfg["schema_version"] = CONFIG_SCHEMA_VERSION
     return cfg, True
 
@@ -288,6 +310,15 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
         return f"○ {name}: disabled"
     if mode == "inner" and prog.get("outer_only", False):
         return f"○ {name}: outer_only (跳過)"
+
+    # [v4] per-machine opt-in：required_config_file 不存在 → 本機不該跑這支
+    # 程式 (e.g. 沒設定過打卡的電腦，autoclock_config.json 不會存在；其他電腦
+    # 跑主程式時不該被打卡 popup 騷擾)。
+    req_cfg = prog.get("required_config_file", "")
+    if req_cfg:
+        req_path = _ROOT / req_cfg
+        if not req_path.exists():
+            return f"○ {name}: 跳過 (本機無 {req_cfg} → 此功能未在本機設定)"
 
     keyword = prog.get("process_match", "")
     pyw_rel = prog.get("pyw", "")
