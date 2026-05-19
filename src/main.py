@@ -2574,13 +2574,65 @@ def _f11_handle_ask_dlg(hwnd: int, label: str = "") -> bool:
     return False
 
 
-# (class_name, handler_fn) — 順序不重要 (任意順序輪詢)
+def _f11_handle_breast_screening(hwnd: int, label: str = "") -> bool:
+    """乳房篩檢訊息 popup (class=TfAskDlg, title 含 '乳房篩檢')：點「自訴未懷孕」。
+
+    安全考量：TfAskDlg 是通用 ask-dialog class，watcher 已用 title_kw='乳房篩檢'
+    精確過濾，這裡 handler 再確認一次「自訴未懷孕」TButton 存在才點，避免誤觸。
+    """
+    logging.info("[%s] 乳房篩檢 popup hwnd=%s → 自訴未懷孕", label, hwnd)
+    time.sleep(0.4)
+    check_stop()
+    if _click_button_normalized_text(hwnd, "自訴未懷孕"):
+        logging.info("[%s]   已點 自訴未懷孕", label)
+        _wait_window_closed(hwnd, timeout=5)
+        return True
+    logging.warning("[%s]   找不到 自訴未懷孕 button", label)
+    return False
+
+
+def _f11_handle_message_ok(hwnd: int, label: str = "") -> bool:
+    """西醫門診系統 OK 對話框 (class=TMessageForm, title 含 '西醫門診系統')：點 OK。
+
+    例：「請確認IC卡必須插好!! 在讀卡機橙色燈停止閃爍後再按【OK】，寫入 IC 卡
+    預防保健註記!!」這類 routine 提示。
+
+    TMessageForm 是 Delphi 通用 message box class，超多東西用它。watcher 用
+    title_kw='西醫門診系統' 過濾；這裡 handler 再驗：必須剛好只有 1 個 TButton
+    且 text='OK' (避免誤觸 Yes/No / OK/Cancel 型對話框)。
+    """
+    logging.info("[%s] 西醫門診系統 message popup hwnd=%s", label, hwnd)
+    time.sleep(0.4)
+    check_stop()
+    # 安全檢查：必須有「OK」button 且只有這一顆 button (避免誤觸選項型對話框)
+    ok_btns = _find_descendants_by_exact_text(hwnd, "TButton", "OK")
+    if not ok_btns:
+        logging.info("[%s]   沒「OK」button，跳過 (不是 routine 提示)", label)
+        return False
+    all_btns = _enum_class_in_window(hwnd, "TButton")
+    if len(all_btns) != 1:
+        logging.info("[%s]   有 %d 顆 TButton (非單 OK)，跳過避免誤觸",
+                      label, len(all_btns))
+        return False
+    if _click_button_normalized_text(hwnd, "OK"):
+        logging.info("[%s]   已點 OK", label)
+        _wait_window_closed(hwnd, timeout=5)
+        return True
+    logging.warning("[%s]   點 OK 失敗", label)
+    return False
+
+
+# (class_name, title_kw, handler_fn) — 順序不重要 (任意順序輪詢)
+# title_kw='' 表示任何 title 都 match (純靠 class 即可唯一識別)；
+# title_kw 非空 表示 class 是通用的，必須加 title 過濾
 _F11_POPUP_HANDLERS = [
-    ("TFOpdMsg1",       _f11_handle_pain),
-    ("TFrmAllergyM01",  _f11_handle_allergy_m01),
-    ("TFAllergyB",      _f11_handle_allergy_b),
-    ("TfAskDlg2",       _f11_handle_ask_dlg),
-    ("TFOPDPreg",       _f11_handle_appt),
+    ("TFOpdMsg1",       "",              _f11_handle_pain),
+    ("TFrmAllergyM01",  "",              _f11_handle_allergy_m01),
+    ("TFAllergyB",      "",              _f11_handle_allergy_b),
+    ("TfAskDlg2",       "",              _f11_handle_ask_dlg),
+    ("TFOPDPreg",       "",              _f11_handle_appt),
+    ("TfAskDlg",        "乳房篩檢",       _f11_handle_breast_screening),
+    ("TMessageForm",    "西醫門診系統",   _f11_handle_message_ok),
 ]
 
 
@@ -2617,8 +2669,8 @@ def _f11_popup_watcher(label: str = "F11",
             return handled_count
 
         found_one = False
-        for cls_name, handler in _F11_POPUP_HANDLERS:
-            hwnd = _find_window_by_class_title(cls_name, "")
+        for cls_name, title_kw, handler in _F11_POPUP_HANDLERS:
+            hwnd = _find_window_by_class_title(cls_name, title_kw)
             if hwnd and hwnd not in handled:
                 try:
                     handler(hwnd, label=label)
