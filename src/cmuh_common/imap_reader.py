@@ -27,12 +27,71 @@ import imaplib
 import logging
 import socket
 import ssl
+import threading
 from typing import Optional
 
 from cmuh_common.smtp_mail import load_credentials
 
 DEFAULT_IMAP_HOST = "imap.gmail.com"
 DEFAULT_IMAP_PORT = 993
+
+# ─── Watchdog 支援：暴露當前活動的 IMAP 連線給外部 force-close ────────────
+# 用途：如果 check_trigger 在 socket 上卡住 > N 秒，呼叫端可從另一個 thread
+# 呼叫 force_close_active() 強制砍 socket，讓卡住的 thread 立刻 unblock。
+_active_conn_lock = threading.Lock()
+_active_conn: Optional[imaplib.IMAP4_SSL] = None
+
+
+def _set_active(conn: Optional[imaplib.IMAP4_SSL]) -> None:
+    global _active_conn
+    with _active_conn_lock:
+        _active_conn = conn
+
+
+def _clear_active(conn: Optional[imaplib.IMAP4_SSL]) -> None:
+    global _active_conn
+    with _active_conn_lock:
+        if _active_conn is conn:
+            _active_conn = None
+
+
+def force_close_active() -> bool:
+    """從另一個 thread 緊急砍掉目前活動的 IMAP socket，讓 hang 的 recv 立即拋例外。
+    回傳 True 表示有試著關（不保證 socket 確實已斷）；False 表示沒有 active 連線。
+    """
+    with _active_conn_lock:
+        conn = _active_conn
+    if conn is None:
+        return False
+    sock = getattr(conn, "sock", None)
+    if sock is None:
+        return True
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        sock.close()
+    except Exception:
+        pass
+    return True
+
+
+def _force_close_conn(conn: Optional[imaplib.IMAP4_SSL]) -> None:
+    """正常 cleanup：不送 LOGOUT/CLOSE（它們本身也可能卡 socket），直接砍底層 socket。"""
+    if conn is None:
+        return
+    sock = getattr(conn, "sock", None)
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        sock.close()
+    except Exception:
+        pass
 
 
 def _load_imap_settings() -> dict:
@@ -113,6 +172,7 @@ def check_trigger(keyword: str, mark_read: bool = True,
         context = ssl.create_default_context()
         conn = imaplib.IMAP4_SSL(s["host"], s["port"], ssl_context=context,
                                   timeout=timeout)
+        _set_active(conn)
         conn.login(s["username"], s["password"])
         conn.select("INBOX")
 
@@ -191,10 +251,8 @@ def check_trigger(keyword: str, mark_read: bool = True,
             except Exception:
                 logging.warning("標已讀失敗（不影響觸發）", exc_info=True)
 
-        try:
-            conn.close()
-        except Exception:
-            pass
+        # 不用 conn.close() (要 SELECT 後 EXPUNGE，可能 hang)，
+        # 直接砍 socket 由 finally 處理。
 
     except imaplib.IMAP4.error as e:
         msg = str(e)
@@ -210,11 +268,10 @@ def check_trigger(keyword: str, mark_read: bool = True,
     except Exception as e:  # noqa: BLE001
         result["error"] = f"IMAP 未知錯誤：{type(e).__name__}: {e}"
     finally:
-        try:
-            if conn is not None:
-                conn.logout()
-        except Exception:
-            pass
+        # 重要：不呼叫 conn.logout()，它內部 send LOGOUT + 等回應，
+        # socket 死了會 hang 整個 finally。直接砍底層 socket 就好。
+        _clear_active(conn)
+        _force_close_conn(conn)
         socket.setdefaulttimeout(None)
 
     return result

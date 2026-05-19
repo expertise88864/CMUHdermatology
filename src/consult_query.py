@@ -1462,10 +1462,60 @@ def _rebuild_schedule() -> None:
     _add(weekend_days, cfg["weekend_times"], "假日(六、日)")
 
 
+def _empty_imap_result(err: str) -> dict:
+    return {"triggered": False, "scanned": 0, "matched": 0,
+            "matched_senders": [], "samples": [], "error": err}
+
+
+def _run_imap_check_with_timeout(kw: str, timeout: float = 60.0) -> dict:
+    """跑 check_trigger 在 daemon thread；超過 timeout 就 force-close socket 並回 error。
+
+    為什麼要這層保護：imaplib 內部 socket recv 在某些情境（網路斷、Gmail TLS
+    死握、Windows hibernate 喚醒後 socket 半死）不吃 socket timeout，會永遠
+    blocking。一旦 scheduler 卡在 _imap_check 整個 thread 就凍住，外層 except
+    抓不到（因為沒拋例外，只是在等）。
+
+    這個 wrapper：
+      1. 在 daemon thread 跑 check_trigger
+      2. main thread 用 join(timeout) 等
+      3. 超時就 force_close_active() 砍 socket → 被卡的 recv 立刻拋 OSError
+         → daemon thread finally 收尾
+      4. 不管 thread 有沒有收尾完，這個 call 都回 error result 給 main thread
+         繼續輪詢（worst case daemon thread leak 一次，但會自殺）
+    """
+    from cmuh_common.imap_reader import check_trigger, force_close_active
+    box: dict = {}
+
+    def _worker():
+        try:
+            box["r"] = check_trigger(kw)
+        except Exception as e:  # noqa: BLE001
+            box["r"] = _empty_imap_result(f"imap thread exception: {e!r}")
+
+    t = threading.Thread(target=_worker, name="IMAPCheck", daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        logging.warning(
+            "[watchdog] IMAP check 超過 %.0fs 無回應，強制砍 socket", timeout)
+        force_close_active()
+        # 再給 2 秒讓 daemon thread 收尾（finally 會跑）
+        t.join(timeout=2.0)
+        if t.is_alive():
+            logging.warning(
+                "[watchdog] daemon thread 仍未結束，已放棄；繼續下一輪")
+        return _empty_imap_result(
+            f"IMAP check timeout > {timeout:.0f}s (socket 已強制關閉)")
+    return box.get("r", _empty_imap_result("imap result missing"))
+
+
 def scheduler_loop() -> None:
     logging.info("=== 會診查詢排程器啟動 v%s ===", CURRENT_VERSION)
     _rebuild_schedule()
     last_email_check = 0.0
+    last_heartbeat = time.time()
+    HEARTBEAT_INTERVAL = 60.0  # 至少每 60s 寫一筆 log，方便看出 thread 死了
+    IMAP_HARD_TIMEOUT = 60.0   # 單次 IMAP check 上限，過了就放棄
     while running.is_set():
         try:
             schedule.run_pending()
@@ -1497,13 +1547,8 @@ def scheduler_loop() -> None:
                     last_email_check = time.time()
                     kw = cfg.get("email_trigger_subject_keyword",
                                  DEFAULT_CONFIG["email_trigger_subject_keyword"])
-                    try:
-                        from cmuh_common.imap_reader import check_trigger as _imap_check
-                        r = _imap_check(kw)
-                    except Exception:
-                        logging.error("IMAP 觸發檢查模組例外", exc_info=True)
-                        r = {"triggered": False, "scanned": 0, "matched": 0,
-                              "samples": [], "error": "imap module exception"}
+                    # ★ 用 thread + 60s timeout 包起來，避免 imaplib socket 卡死整個 scheduler
+                    r = _run_imap_check_with_timeout(kw, timeout=IMAP_HARD_TIMEOUT)
                     if r.get("error"):
                         logging.warning("檢查觸發信失敗: %s", r["error"])
                     else:
@@ -1515,6 +1560,8 @@ def scheduler_loop() -> None:
                             logging.info(
                                 "（最近未讀主旨樣本，用來確認你的觸發信是否真的進收件匣）：%s",
                                 " | ".join(repr(s) for s in r["samples"]))
+                    # 任何一筆 log 都重置 heartbeat（避免重複記）
+                    last_heartbeat = time.time()
                     if r.get("triggered"):
                         # 寄件人白名單過濾：只有授權的 email 寄來的觸發信才生效
                         senders = r.get("matched_senders") or []
@@ -1538,6 +1585,18 @@ def scheduler_loop() -> None:
                                 "收到觸發信但無法解析 From，fallback 用 "
                                 "email_trigger_recipients")
                             trigger_job_async("email")
+            # ★ Heartbeat：每 60s 一定寫一筆 log。下次再卡住 1 分鐘內就能發現。
+            if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL:
+                next_poll_in = "-"
+                if cfg.get("email_trigger_enabled"):
+                    try:
+                        ps = float(cfg.get("email_trigger_poll_seconds", 20))
+                        next_poll_in = f"{max(0, ps - (time.time() - last_email_check)):.0f}s"
+                    except (TypeError, ValueError):
+                        pass
+                logging.info("[heartbeat] scheduler alive (下次 IMAP 輪詢: %s)",
+                              next_poll_in)
+                last_heartbeat = time.time()
         except Exception:
             logging.error("排程迴圈例外", exc_info=True)
         time.sleep(1)
