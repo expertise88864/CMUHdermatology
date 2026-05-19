@@ -195,31 +195,42 @@ foreach ($p in $programs) {
     $shouldEnable = $cb.Checked
     if ($shouldEnable) {
         try {
-            $principal = New-ScheduledTaskPrincipal `
-                -UserId $user `
-                -LogonType Interactive `
-                -RunLevel Highest
-            # Periodic 程式 (watchdog 外層 C) 用「每 2 分鐘」觸發跑 --once
-            # 其餘程式用 ONLOGON 常駐
+            # Periodic 程式 (watchdog 外層 C) 用 schtasks.exe /SC MINUTE 改最穩
+            # （PS 5.1 的 New-ScheduledTaskTrigger -Once -At 回傳 trigger 物件的
+            # .Repetition 是 $null，直接設 .Repetition.Interval 會炸 — 已實測過。
+            # 而傳 -RepetitionInterval/-RepetitionDuration 給 cmdlet 在某些版本不
+            # 會真的寫進註冊的 task。所以對 Periodic 走 schtasks.exe CLI；
+            # ONLOGON 維持原本 PowerShell cmdlet 即可。）
             if ($p.PSObject.Properties.Name -contains 'Periodic' -and $p.Periodic) {
                 $scriptFullPath = Join-Path $scriptDir $p.ScriptRelPath
-                $action = New-ScheduledTaskAction `
-                    -Execute $pythonw `
-                    -Argument ('"' + $scriptFullPath + '" ' + $p.ScriptArgs) `
-                    -WorkingDirectory $scriptDir
-                # -Once + RepetitionInterval 是「每 N 分鐘觸發一次跑一遍」
-                # RepetitionDuration 空字串 = 無限重複
-                $startTime = (Get-Date).AddMinutes(1)
-                $trigger = New-ScheduledTaskTrigger -Once -At $startTime
-                $trigger.Repetition.Interval = 'PT2M'
-                $trigger.Repetition.Duration = ''
-                $settings = New-ScheduledTaskSettingsSet `
-                    -AllowStartIfOnBatteries `
-                    -DontStopIfGoingOnBatteries `
-                    -StartWhenAvailable `
-                    -MultipleInstances IgnoreNew `
-                    -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+                $tr = '"' + $pythonw + '" "' + $scriptFullPath + '" ' + $p.ScriptArgs
+                # 先清掉同名舊 task (允許 trigger 類型整個換新)
+                $existing = Get-ScheduledTask -TaskName $p.TaskName -ErrorAction SilentlyContinue
+                if ($existing) {
+                    Unregister-ScheduledTask -TaskName $p.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                }
+                # schtasks /SC MINUTE /MO 2 = 每 2 分鐘
+                # /RL HIGHEST = admin (繼承當前 admin token，不跳 UAC)
+                # /RU = 跑在哪個帳號 (預設當前帳號；指定避免歧義)
+                # /F = 強制覆寫同名 task
+                $schtasksOut = & schtasks.exe /Create /F `
+                    /TN $p.TaskName `
+                    /TR $tr `
+                    /SC MINUTE /MO 2 `
+                    /RL HIGHEST `
+                    /RU $user 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    throw "schtasks /Create 失敗 (exit=$LASTEXITCODE): $schtasksOut"
+                }
+                Write-Host "  ✓ 已啟用：$($p.Display)" -ForegroundColor Green
+                Write-Host "    排程名稱：$($p.TaskName)  (每 2 分鐘觸發跑 --once)"
+                $summary += [pscustomobject]@{Program=$p.Display; Action='啟用 (Periodic)'; Status='OK'}
             } else {
+                # ONLOGON 常駐：保留原本 PowerShell cmdlet (這個情境穩定)
+                $principal = New-ScheduledTaskPrincipal `
+                    -UserId $user `
+                    -LogonType Interactive `
+                    -RunLevel Highest
                 $action = New-ScheduledTaskAction `
                     -Execute $pythonw `
                     -Argument ('"' + $p.PywPath + '"') `
@@ -231,17 +242,17 @@ foreach ($p in $programs) {
                     -StartWhenAvailable `
                     -MultipleInstances IgnoreNew `
                     -ExecutionTimeLimit ([TimeSpan]::Zero)
+                Register-ScheduledTask `
+                    -TaskName $p.TaskName `
+                    -Action $action `
+                    -Trigger $trigger `
+                    -Principal $principal `
+                    -Settings $settings `
+                    -Force | Out-Null
+                Write-Host "  ✓ 已啟用：$($p.Display)" -ForegroundColor Green
+                Write-Host "    排程名稱：$($p.TaskName)"
+                $summary += [pscustomobject]@{Program=$p.Display; Action='啟用'; Status='OK'}
             }
-            Register-ScheduledTask `
-                -TaskName $p.TaskName `
-                -Action $action `
-                -Trigger $trigger `
-                -Principal $principal `
-                -Settings $settings `
-                -Force | Out-Null
-            Write-Host "  ✓ 已啟用：$($p.Display)" -ForegroundColor Green
-            Write-Host "    排程名稱：$($p.TaskName)"
-            $summary += [pscustomobject]@{Program=$p.Display; Action='啟用'; Status='OK'}
         } catch {
             Write-Host "  ✗ 啟用失敗：$($p.Display) → $_" -ForegroundColor Red
             $summary += [pscustomobject]@{Program=$p.Display; Action='啟用'; Status="失敗 $_"}
