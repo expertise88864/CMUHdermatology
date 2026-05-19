@@ -261,11 +261,32 @@ def _ensure_program(prog: dict, pythonw: str, procs: list, my_pid: int) -> str:
     return f"✓ {name}: PID {pids}"
 
 
+# ─── --once 模式：跑一輪檢查就 exit，給 schtasks 每 2 分鐘觸發用 ─────────
+def _run_once_via_core() -> int:
+    """schtasks 每 2 分鐘呼叫 `python watchdog_runner.py --once`。
+    委派給 cmuh_common.watchdog_core (跟主程式內層 B 共用 lock + outer 倍率)，
+    跑完一輪即 exit。RAM 佔用 ≈ 0（只在執行那 1-3 秒）。"""
+    _setup_logging()
+    logging.info("=== watchdog --once v%s ===", CURRENT_VERSION)
+    try:
+        from cmuh_common import watchdog_core
+        actions = watchdog_core.run_one_tick(mode="outer")
+        logging.info("[outer once] %s", " | ".join(actions))
+        return 0
+    except Exception:
+        logging.exception("[outer once] 例外")
+        return 1
+
+
 # ─── Main loop ───────────────────────────────────────────────────────────
 def main() -> int:
+    # --once：給 schtasks 觸發；跑一輪即 exit
+    if "--once" in sys.argv:
+        return _run_once_via_core()
+
     _setup_logging()
     logging.info("=" * 60)
-    logging.info("=== 守護程式啟動 v%s ===", CURRENT_VERSION)
+    logging.info("=== 守護程式啟動 v%s (daemon mode) ===", CURRENT_VERSION)
 
     pythonw = _find_pythonw()
     if not pythonw:

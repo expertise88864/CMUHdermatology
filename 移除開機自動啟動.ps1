@@ -10,7 +10,8 @@ $tasks = @(
     @{TaskName='CMUH皮膚科主程式自動啟動';     Display='中國醫皮膚科主程式'},
     @{TaskName='CMUH皮膚科打卡自動啟動';       Display='中國醫皮膚科打卡程式'},
     @{TaskName='CMUH皮膚科會診查詢自動啟動';   Display='中國醫皮膚科會診查詢程式'},
-    @{TaskName='CMUH皮膚科守護程式自動啟動';   Display='中國醫皮膚科守護程式'}
+    @{TaskName='CMUH皮膚科守護程式自動啟動';   Display='中國醫皮膚科守護程式 (舊版 ONLOGON)'},
+    @{TaskName='CMUH皮膚科守護程式_每2分鐘';   Display='中國醫皮膚科守護程式 (新版每 2 分鐘)'}
 )
 
 Write-Host ''

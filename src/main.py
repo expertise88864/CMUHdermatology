@@ -11035,6 +11035,44 @@ if __name__ == "__main__":
     DOCTORS = app.doctors_list
     DOCTOR_NAMES = [d["name"] for d in DOCTORS]
 
+    # ─── 內層 watchdog (B)：daemon thread，每 30s 巡邏 ─────────────────
+    # 目的：自動 kill+重啟 卡死的 consult_query / 被誤關的打卡
+    # 配合 schtasks 每 2 分鐘觸發 watchdog_runner.py --once 為外層 C
+    # B+C 之間用 settings/.watchdog_locks/ 互斥（同程式 90s 內不會被雙方
+    # 同時 kill+restart）。即使 B 隨主程式 crash，C 在 2 分鐘內接手。
+    def _inner_watchdog_loop():
+        try:
+            from cmuh_common import watchdog_core
+        except Exception:
+            logging.exception("[watchdog/inner] 載入 watchdog_core 失敗，停用")
+            return
+        logging.info("[watchdog/inner] 啟動 — 監看 consult_query/打卡")
+        last_heartbeat = 0.0
+        while True:
+            try:
+                cfg = watchdog_core.load_config()
+                actions = watchdog_core.run_one_tick(mode="inner")
+                heartbeat = int(cfg.get("heartbeat_log_sec", 300))
+                if time.time() - last_heartbeat >= heartbeat:
+                    logging.info("[watchdog/inner heartbeat] %s",
+                                  " | ".join(actions) if actions else "-")
+                    last_heartbeat = time.time()
+                interval = max(5, int(cfg.get("check_interval_sec", 30)))
+            except Exception:
+                logging.exception("[watchdog/inner] tick 例外")
+                interval = 30
+            time.sleep(interval)
+
+    try:
+        _wd_thread = threading.Thread(
+            target=_inner_watchdog_loop,
+            name="InnerWatchdog",
+            daemon=True,
+        )
+        _wd_thread.start()
+    except Exception:
+        logging.exception("[watchdog/inner] thread 啟動失敗")
+
     # [O18] splash 關閉後再顯示主視窗（避免主視窗閃爍）
     if _splash:
         try:

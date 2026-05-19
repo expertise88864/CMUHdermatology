@@ -34,11 +34,14 @@ $programs = @(
         Hint='每日 12:30 / 17:00 擷取會診單寄信（只需要一台電腦執行）';
         DefaultChecked=$false },
     [pscustomobject]@{
-        Key='watchdog'; TaskName='CMUH皮膚科守護程式自動啟動';
+        Key='watchdog'; TaskName='CMUH皮膚科守護程式_每2分鐘';
         Pyw='中國醫皮膚科守護程式.pyw';
-        Display='中國醫皮膚科守護程式';
-        Hint='監看 會診查詢/打卡 卡死或被誤關，自動 kill+重啟（強烈建議跟會診查詢/打卡同台勾選）';
-        DefaultChecked=$true }
+        Display='中國醫皮膚科守護程式 (外層備援，每 2 分鐘)';
+        Hint='主程式內已有內層 watchdog 每 30s 巡邏；外層備援 schtasks 每 2 分鐘觸發跑一次 (RAM ≈ 0)，主程式掛了會接手';
+        DefaultChecked=$true;
+        Periodic=$true;
+        ScriptRelPath='src\watchdog_runner.py';
+        ScriptArgs='--once' }
 )
 
 # === 檢查 .pyw 存在 ===
@@ -192,21 +195,43 @@ foreach ($p in $programs) {
     $shouldEnable = $cb.Checked
     if ($shouldEnable) {
         try {
-            $action = New-ScheduledTaskAction `
-                -Execute $pythonw `
-                -Argument ('"' + $p.PywPath + '"') `
-                -WorkingDirectory $scriptDir
-            $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
             $principal = New-ScheduledTaskPrincipal `
                 -UserId $user `
                 -LogonType Interactive `
                 -RunLevel Highest
-            $settings = New-ScheduledTaskSettingsSet `
-                -AllowStartIfOnBatteries `
-                -DontStopIfGoingOnBatteries `
-                -StartWhenAvailable `
-                -MultipleInstances IgnoreNew `
-                -ExecutionTimeLimit ([TimeSpan]::Zero)
+            # Periodic 程式 (watchdog 外層 C) 用「每 2 分鐘」觸發跑 --once
+            # 其餘程式用 ONLOGON 常駐
+            if ($p.PSObject.Properties.Name -contains 'Periodic' -and $p.Periodic) {
+                $scriptFullPath = Join-Path $scriptDir $p.ScriptRelPath
+                $action = New-ScheduledTaskAction `
+                    -Execute $pythonw `
+                    -Argument ('"' + $scriptFullPath + '" ' + $p.ScriptArgs) `
+                    -WorkingDirectory $scriptDir
+                # -Once + RepetitionInterval 是「每 N 分鐘觸發一次跑一遍」
+                # RepetitionDuration 空字串 = 無限重複
+                $startTime = (Get-Date).AddMinutes(1)
+                $trigger = New-ScheduledTaskTrigger -Once -At $startTime
+                $trigger.Repetition.Interval = 'PT2M'
+                $trigger.Repetition.Duration = ''
+                $settings = New-ScheduledTaskSettingsSet `
+                    -AllowStartIfOnBatteries `
+                    -DontStopIfGoingOnBatteries `
+                    -StartWhenAvailable `
+                    -MultipleInstances IgnoreNew `
+                    -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+            } else {
+                $action = New-ScheduledTaskAction `
+                    -Execute $pythonw `
+                    -Argument ('"' + $p.PywPath + '"') `
+                    -WorkingDirectory $scriptDir
+                $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+                $settings = New-ScheduledTaskSettingsSet `
+                    -AllowStartIfOnBatteries `
+                    -DontStopIfGoingOnBatteries `
+                    -StartWhenAvailable `
+                    -MultipleInstances IgnoreNew `
+                    -ExecutionTimeLimit ([TimeSpan]::Zero)
+            }
             Register-ScheduledTask `
                 -TaskName $p.TaskName `
                 -Action $action `
