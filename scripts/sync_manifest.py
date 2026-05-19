@@ -74,6 +74,9 @@ def collect_entries(version: str) -> list:
         "安裝開機自動啟動.ps1",
         "移除開機自動啟動.cmd",
         "移除開機自動啟動.ps1",
+        # 一鍵清除全部皮膚科排程 (含舊版命名 / 殘留 task)
+        "清除所有皮膚科排程.cmd",
+        "清除所有皮膚科排程.ps1",
         # 設定/資源檔
         "hotkey_overrides.json",
         "requirements.txt",
