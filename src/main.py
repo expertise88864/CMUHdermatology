@@ -2139,6 +2139,64 @@ def _ensure_hospital_foreground(hwnd: int) -> None:
         logging.debug("_ensure_hospital_foreground 失敗", exc_info=True)
 
 
+def _get_thread_focus(target_hwnd: int) -> int:
+    """取得 target_hwnd 那個 thread 內目前焦點的 control hwnd。
+
+    cross-thread 的 GetFocus 預設回 0；要用 AttachThreadInput 把當前 thread
+    跟 target thread 連起來才能讀。用於知道「使用者鍵盤輸入會送到哪個 control」。"""
+    if not target_hwnd:
+        return 0
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        target_tid = user32.GetWindowThreadProcessId(target_hwnd, None)
+        cur_tid = kernel32.GetCurrentThreadId()
+        if target_tid == cur_tid:
+            return user32.GetFocus()
+        user32.AttachThreadInput(cur_tid, target_tid, True)
+        try:
+            return user32.GetFocus()
+        finally:
+            user32.AttachThreadInput(cur_tid, target_tid, False)
+    except Exception:
+        return 0
+
+
+def _send_chars_to_window(hwnd: int, text: str) -> bool:
+    """送 WM_CHAR 一字一字到目標 control。完全繞過 IME。
+
+    pyautogui.typewrite 走 OS keyboard input → IME 攔截（中文模式下「5」被當組
+    字輸入）。WM_CHAR 直接到 control，IME 沒機會攔截。"""
+    if not hwnd or not text:
+        return False
+    WM_CHAR = 0x0102
+    try:
+        for ch in text:
+            ctypes.windll.user32.SendMessageW(hwnd, WM_CHAR, ord(ch), 0)
+        return True
+    except Exception:
+        logging.error("_send_chars_to_window 失敗", exc_info=True)
+        return False
+
+
+def _send_enter_to_window(hwnd: int) -> bool:
+    """送 VK_RETURN keydown+up 到指定 control。"""
+    if not hwnd:
+        return False
+    try:
+        WM_KEYDOWN = 0x0100
+        WM_KEYUP = 0x0101
+        VK_RETURN = 0x0D
+        ctypes.windll.user32.SendMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0x1C0001)
+        ctypes.windll.user32.SendMessageW(hwnd, WM_KEYUP, VK_RETURN, 0xC01C0001)
+        # 額外送一個 WM_CHAR \r 確保 Delphi 認得（部分 Delphi grid 走 WM_CHAR Enter）
+        WM_CHAR = 0x0102
+        ctypes.windll.user32.SendMessageW(hwnd, WM_CHAR, 0x0D, 0)
+        return True
+    except Exception:
+        return False
+
+
 def _force_ime_english(hwnd: int = 0) -> None:
     """把當前前景視窗（或指定 hwnd）的 IME 切到英文模式（關閉 IME 轉換）。
 
@@ -2183,31 +2241,48 @@ def _script_code_input_adaptive(code: str, label: str = "",
         return False
     _ensure_hospital_foreground(hwnd)
     time.sleep(0.05)
-    # 先切英文 IME (避免中文 IME 攔截 typewrite，"5" 被當組字結果什麼都沒寫進去)
+    # 雖然我們用 WM_CHAR 不經 IME，但 _force_ime_english 留著保險（萬一某
+    # 控制項對 IME 狀態敏感）
     _force_ime_english(hwnd)
     _send_yiling_menu_command(hwnd, MENU_ID_代碼輸入)
     # 等焦點移到醫令代碼欄
     time.sleep(0.15)
-    # 焦點換到 grid 後 IME 可能又被切回中文，再切一次
     _force_ime_english(hwnd)
     check_stop()
-    # code 非空才打字 + Enter；F5 (KOH) 給空 code 表示只開 dialog 讓使用者手動輸入
+    # code 非空才打字 + Enter
     if code:
-        hotkey_modules.pyautogui.typewrite(code, interval=0.02)
-        time.sleep(0.05)
-        check_stop()
-        hotkey_modules.pyautogui.press("enter")
-    # 可選：改 療程 欄位
+        # 找當前焦點 control (代碼輸入觸發後 = grid 內的 inplace edit)
+        focused = _get_thread_focus(hwnd)
+        if focused:
+            logging.info("[%s] 焦點 hwnd=%s (cls=%s)，用 WM_CHAR 送 %r",
+                          label, focused, _get_class_name_of(focused), code)
+            _send_chars_to_window(focused, code)
+            time.sleep(0.05)
+            check_stop()
+            _send_enter_to_window(focused)
+        else:
+            # fallback: 沒拿到焦點就用 pyautogui (IME 可能會攔)
+            logging.warning("[%s] 拿不到焦點 hwnd，退回 pyautogui.typewrite", label)
+            hotkey_modules.pyautogui.typewrite(code, interval=0.02)
+            time.sleep(0.05)
+            hotkey_modules.pyautogui.press("enter")
+    # 可選：改 療程 欄位 — 用 WM_SETTEXT 直接設值（繞 IME、不動滑鼠）
     if set_療程 is not None:
         time.sleep(0.15)
         check_stop()
         liaocheng_hwnd = _find_療程_edit_hwnd(hwnd)
         if liaocheng_hwnd:
-            if _replace_edit_text(liaocheng_hwnd, str(set_療程), main_hwnd=hwnd):
-                logging.info("[%s] 療程欄位 (hwnd=%s) 已設為 %s",
+            WM_SETTEXT = 0x000C
+            text_buf = ctypes.c_wchar_p(str(set_療程))
+            try:
+                ctypes.windll.user32.SendMessageW(
+                    liaocheng_hwnd, WM_SETTEXT, 0, text_buf)
+                logging.info("[%s] 療程欄位 (hwnd=%s) WM_SETTEXT='%s'",
                               label, liaocheng_hwnd, set_療程)
-            else:
-                logging.warning("[%s] 寫入 療程 失敗", label)
+            except Exception:
+                logging.warning("[%s] WM_SETTEXT 療程 失敗，fallback click",
+                                 label, exc_info=True)
+                _replace_edit_text(liaocheng_hwnd, str(set_療程), main_hwnd=hwnd)
         else:
             logging.warning("[%s] 找不到 療程 欄位（請手動填）", label)
     if hasattr(_runner_1280, "last_action_time"):
