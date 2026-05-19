@@ -2163,8 +2163,16 @@ def _force_ime_english(hwnd: int = 0) -> None:
         logging.debug("_force_ime_english 失敗（IME 模組不可用？忽略）", exc_info=True)
 
 
-def _script_code_input_adaptive(code: str, label: str = "") -> bool:
+def _script_code_input_adaptive(code: str, label: str = "",
+                                  set_療程=None) -> bool:
     """共通流程：找視窗 → SendMessage 觸發代碼輸入 → 等焦點 → 打代碼 → Enter。
+    可選 set_療程：完成代碼輸入後動態找頂部「療程」欄並改成該值。
+
+    code="" 時跳過 typewrite + Enter（只開啟代碼輸入 dialog，由使用者手動
+    輸入代碼+Enter）。用於 F5 KOH 場景。
+
+    set_療程=None 表示不改 療程（F4 冷凍 / F5 KOH 用）。
+    set_療程=1/2/3 用於 F1/F2/F3 照光不同療程次數。
 
     回傳 True 表示流程跑完；False 表示找不到主程式視窗。"""
     hwnd = _find_hospital_main_window()
@@ -2183,20 +2191,63 @@ def _script_code_input_adaptive(code: str, label: str = "") -> bool:
     # 焦點換到 grid 後 IME 可能又被切回中文，再切一次
     _force_ime_english(hwnd)
     check_stop()
-    # 打代碼 — 焦點此時在 grid 內的 inplace edit，pyautogui 直接送到前景視窗
-    hotkey_modules.pyautogui.typewrite(code, interval=0.02)
-    time.sleep(0.05)
-    check_stop()
-    hotkey_modules.pyautogui.press("enter")
+    # code 非空才打字 + Enter；F5 (KOH) 給空 code 表示只開 dialog 讓使用者手動輸入
+    if code:
+        hotkey_modules.pyautogui.typewrite(code, interval=0.02)
+        time.sleep(0.05)
+        check_stop()
+        hotkey_modules.pyautogui.press("enter")
+    # 可選：改 療程 欄位
+    if set_療程 is not None:
+        time.sleep(0.15)
+        check_stop()
+        liaocheng_hwnd = _find_療程_edit_hwnd(hwnd)
+        if liaocheng_hwnd:
+            if _replace_edit_text(liaocheng_hwnd, str(set_療程), main_hwnd=hwnd):
+                logging.info("[%s] 療程欄位 (hwnd=%s) 已設為 %s",
+                              label, liaocheng_hwnd, set_療程)
+            else:
+                logging.warning("[%s] 寫入 療程 失敗", label)
+        else:
+            logging.warning("[%s] 找不到 療程 欄位（請手動填）", label)
+    if hasattr(_runner_1280, "last_action_time"):
+        _runner_1280.last_action_time = time.time()
     return True
 
 
+def script_F1_adaptive():
+    """F1: 照光 (1) — 51019 + 療程 1。"""
+    if _maybe_run_override('adaptive', 'F1'): return
+    logging.info("--- Executing F1 (照光 1) ---")
+    ok = _script_code_input_adaptive("51019", label="F1", set_療程=1)
+    logging.info("F1 (照光 1): %s", "done" if ok else "skipped")
+
+
+def script_F2_adaptive():
+    """F2: 照光 (2) — 51019 + 療程 2。"""
+    if _maybe_run_override('adaptive', 'F2'): return
+    logging.info("--- Executing F2 (照光 2) ---")
+    ok = _script_code_input_adaptive("51019", label="F2", set_療程=2)
+    logging.info("F2 (照光 2): %s", "done" if ok else "skipped")
+
+
 def script_F3_adaptive():
-    """F3 (解析度無關)：醫令 → 代碼輸入 → 51017 (冷凍) → Enter。"""
+    """F3: 照光 (3) — 51019 + 療程 3。"""
     if _maybe_run_override('adaptive', 'F3'): return
-    logging.info("--- Executing F3 (adaptive / Win32) ---")
-    ok = _script_code_input_adaptive("51017", label="F3")
-    logging.info("F3 (adaptive): %s", "done" if ok else "skipped (no hospital window)")
+    logging.info("--- Executing F3 (照光 3) ---")
+    ok = _script_code_input_adaptive("51019", label="F3", set_療程=3)
+    logging.info("F3 (照光 3): %s", "done" if ok else "skipped")
+
+
+def script_F5_adaptive():
+    """F5: KOH — 開 醫令→代碼輸入 dialog；不打代碼也不送 Enter，
+    游標停在 醫令代碼 cell 等使用者手動輸入 KOH 代碼後按 Enter。"""
+    if _maybe_run_override('adaptive', 'F5'): return
+    logging.info("--- Executing F5 (KOH 開啟代碼輸入欄位) ---")
+    # code="" → 跳過 typewrite + Enter；只觸發 menu 讓 cursor 進到 cell
+    ok = _script_code_input_adaptive("", label="F5", set_療程=None)
+    logging.info("F5 (KOH): %s",
+                  "ready (請手動輸入 KOH 代碼+Enter)" if ok else "skipped")
 
 
 def _find_療程_edit_hwnd(main_hwnd: int) -> int:
@@ -2307,45 +2358,11 @@ def _replace_edit_text(field_hwnd: int, new_text: str,
 
 
 def script_F4_adaptive():
-    """F4 (解析度無關)：醫令 → 代碼輸入 → 51019 (照光) → Enter → 療程改 1。
-
-    1. 觸發「醫令 → 代碼輸入」(SendMessage WM_COMMAND id=218)
-    2. 切英文 IME 後打 51019 + Enter（51019 加進醫令清單）
-    3. 動態找頂部 header「療程」TEditExt 的 hwnd
-    4. Click 進該欄位 + 全選 + 輸入「1」（無論原值是 0/3/任何值都改成 1）
-
-    使用者澄清 (2026-05-18)：F4 的「1」是要寫到頂部「療程」欄，
-    不是 grid 內某欄。舊版用座標 click_point(585, 117) 點，
-    adaptive 版用動態 GetWindowRect 找位置，跟解析度無關。"""
+    """F4: 冷凍 — 51017 (no 療程)。"""
     if _maybe_run_override('adaptive', 'F4'): return
-    logging.info("--- Executing F4 (adaptive / Win32) ---")
-    main_hwnd = _find_hospital_main_window()
-    if not main_hwnd:
-        logging.warning("F4 (adaptive): 找不到主程式視窗")
-        return
-    # Step 1+2: 代碼輸入 51019
-    ok = _script_code_input_adaptive("51019", label="F4")
-    if not ok:
-        logging.info("F4 (adaptive): code input 失敗")
-        return
-    time.sleep(0.15)
-    check_stop()
-    # Step 3: 找 療程 欄位
-    liaocheng_hwnd = _find_療程_edit_hwnd(main_hwnd)
-    if not liaocheng_hwnd:
-        logging.warning("F4 (adaptive): 找不到 療程 欄位，"
-                         "請手動填 1。可能版面有變動，需重新探測。")
-    else:
-        # Step 4: 改成 1
-        ok2 = _replace_edit_text(liaocheng_hwnd, "1", main_hwnd=main_hwnd)
-        if ok2:
-            logging.info("F4 (adaptive): 療程 欄位 (hwnd=%s) 已設為 1",
-                         liaocheng_hwnd)
-        else:
-            logging.warning("F4 (adaptive): 寫入 療程 失敗")
-    if hasattr(_runner_1280, "last_action_time"):
-        _runner_1280.last_action_time = time.time()
-    logging.info("F4 (adaptive): done")
+    logging.info("--- Executing F4 (冷凍 51017) ---")
+    ok = _script_code_input_adaptive("51017", label="F4", set_療程=None)
+    logging.info("F4 (冷凍): %s", "done" if ok else "skipped")
 
 
 # =============================================================================
@@ -5018,34 +5035,27 @@ def _canonical_clinic_session_str(s) -> str:
 def _hotkey_builtin_map_for_profile(profile: str) -> dict:
     """profile → 熱鍵鍵名 → 內建函式（覆寫載入失敗時回退）。
 
-    F3 / F4 / F9 / F10 已改為 adaptive (Win32 SendMessage + EnumChildWindows
-    + click 動態找到的 hwnd 中心)，跨解析度共用一份程式碼。F9/F10 目前是
-    Round 1：到「開立電子」按鈕停，popup 內操作下回合再加。
+    新熱鍵配置 (2026-05-18 重排)：
+      F1=照光1, F2=照光2, F3=照光3, F4=冷凍, F5=KOH(手動輸入),
+      F9=腫瘤同意書, F10=切片同意書, F11=快速完成 (per-resolution),
+      F12=中止 (special key)
+    F1-F5 + F9 + F10 全部 adaptive (Win32, 跨解析度)。
     F11 仍是 per-resolution（後續再改）。"""
+    common_adaptive = {
+        "F1": script_F1_adaptive,
+        "F2": script_F2_adaptive,
+        "F3": script_F3_adaptive,
+        "F4": script_F4_adaptive,
+        "F5": script_F5_adaptive,
+        "F9": script_F9_adaptive,
+        "F10": script_F10_adaptive,
+    }
     if profile == "1920x1080":
-        return {
-            "F3": script_F3_adaptive,
-            "F4": script_F4_adaptive,
-            "F9": script_F9_adaptive,
-            "F10": script_F10_adaptive,
-            "F11": script_F11_1920x1080,
-        }
+        return {**common_adaptive, "F11": script_F11_1920x1080}
     if profile == "1280x1024":
-        return {
-            "F3": script_F3_adaptive,
-            "F4": script_F4_adaptive,
-            "F9": script_F9_adaptive,
-            "F10": script_F10_adaptive,
-            "F11": script_F11_1280x1024,
-        }
+        return {**common_adaptive, "F11": script_F11_1280x1024}
     if profile == "1024x768":
-        return {
-            "F3": script_F3_adaptive,
-            "F4": script_F4_adaptive,
-            "F9": script_F9_adaptive,
-            "F10": script_F10_adaptive,
-            "F11": script_F11_1024x768,
-        }
+        return {**common_adaptive, "F11": script_F11_1024x768}
     return {}
 
 
@@ -10271,32 +10281,30 @@ class AutomationApp:
         try:
             hotkeys_to_register = {}
             hotkey_info_text = ""
+            # 統一熱鍵 (F1-F5 + F9 + F10 全 adaptive; F11 仍 per-resolution)
+            _adaptive_descs = {
+                'F1':  (script_F1_adaptive,  "F1: 照光(1) — 51019+療程1"),
+                'F2':  (script_F2_adaptive,  "F2: 照光(2) — 51019+療程2"),
+                'F3':  (script_F3_adaptive,  "F3: 照光(3) — 51019+療程3"),
+                'F4':  (script_F4_adaptive,  "F4: 冷凍 — 51017"),
+                'F5':  (script_F5_adaptive,  "F5: KOH — 開代碼輸入"),
+                'F9':  (script_F9_adaptive,  "F9: 腫瘤同意書"),
+                'F10': (script_F10_adaptive, "F10: 切片同意書"),
+            }
+            hotkey_info_text = ("F1:照光(1) F2:照光(2) F3:照光(3) F4:冷凍 F5:KOH\n"
+                                "F9:腫瘤 F10:切片 F11:快速完成 F12:中止")
             if profile == '1920x1080':
-                hotkeys_to_register = {
-                    'F3': (script_F3_adaptive, "F3: 冷凍 51017 (Win32)"),
-                    'F4': (script_F4_adaptive, "F4: 照光 51019 (Win32)"),
-                    'F9': (script_F9_adaptive, "F9: 腫瘤同意書 (Win32 R1)"),
-                    'F10': (script_F10_adaptive, "F10: 切片同意書 (Win32 R1)"),
-                    'F11': (script_F11_1920x1080, "F11: 快速完成 (1920x1080)")
-                }
-                hotkey_info_text = "F3:冷凍 F4:照光 F9:腫瘤 F10:切片\nF11:快速完成 F12:終止"
+                hotkeys_to_register = dict(_adaptive_descs)
+                hotkeys_to_register['F11'] = (script_F11_1920x1080,
+                                                "F11: 快速完成 (1920x1080)")
             elif profile == '1280x1024':
-                hotkeys_to_register = {
-                    'F3': (script_F3_adaptive, "F3: 51017 (Win32)"),
-                    'F4': (script_F4_adaptive, "F4: 51019 (Win32)"),
-                    'F9': (script_F9_adaptive, "F9: 腫瘤同意書 (Win32 R1)"),
-                    'F10': (script_F10_adaptive, "F10: 切片同意書 (Win32 R1)"),
-                    'F11': (script_F11_1280x1024, "F11: 快速完成 (1280x1024)")
-                }
-                hotkey_info_text = "F3:51017 F4:51019 F9:腫瘤 F10:切片\nF11:快速完成 F12:終止"
+                hotkeys_to_register = dict(_adaptive_descs)
+                hotkeys_to_register['F11'] = (script_F11_1280x1024,
+                                                "F11: 快速完成 (1280x1024)")
             elif profile == '1024x768':
-                hotkeys_to_register = {
-                    'F3': (script_F3_adaptive, "F3: 冷凍 51017 (Win32)"),
-                    'F4': (script_F4_adaptive, "F4: 51019 (Win32)"),
-                    'F9': (script_F9_adaptive, "F9: 腫瘤同意書 (Win32 R1)"),
-                    'F10': (script_F10_adaptive, "F10: 切片同意書 (Win32 R1)"),
-                    'F11': (script_F11_1024x768, "F11: 快速完成")
-                }
+                hotkeys_to_register = dict(_adaptive_descs)
+                hotkeys_to_register['F11'] = (script_F11_1024x768,
+                                                "F11: 快速完成 (1024x768)")
                 hotkey_info_text = "F3:冷凍 F4:照光 F9:腫瘤同意書\nF10:切片同意書 F11:快速完成 F12:終止"
 
             safe_unhook_all_hotkeys()
