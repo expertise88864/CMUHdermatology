@@ -6099,11 +6099,15 @@ class AutomationApp:
             pass
         self._ui_queue_poll_id = None
 
-        # [O21] 釋放常駐 status driver（Chrome）— 確認 Chrome 進程結束
+        # [O21 v3] 加速關閉：跳過慢的 driver.quit() (~1-2s 等 Chrome graceful
+        # shutdown)，直接 taskkill chromedriver+chrome 子進程 (~100ms)。
+        # 先 nullify pool 引用避免別人重用死 driver，再快速砍 process。
         try:
-            _release_status_driver()
+            pool = _status_driver_pool
+            with pool["lock"]:
+                pool["driver"] = None
         except Exception:
-            logging.debug("status driver 釋放失敗", exc_info=True)
+            logging.debug("status driver pool reset 失敗", exc_info=True)
 
         if hasattr(self, 'bg_executor'):
             try:
@@ -6118,27 +6122,25 @@ class AutomationApp:
                 except Exception as e:
                     logging.warning(f"Failed to close requests session ({_attr}): {e}")
 
-        # [O21 v2] 加速關閉：
-        # - 不再 join daemon thread（它們本來就會隨進程退出，join 拖慢關閉）
-        # - kill 殘留 chromedriver 改用 background thread（不阻塞主線）
-        # - 不調用 psutil.process_iter（在 daemon thread 跑）
-        def _bg_kill_chromedriver():
-            try:
-                self._kill_orphan_chromedriver()
-            except Exception:
-                pass
+        # [O21 v3] 同步 (而非 background) taskkill chromedriver/chrome：
+        # 用 psutil 直接 SIGKILL 比 selenium driver.quit() 快 10x。同步跑是因為
+        # 主流程立刻會 os._exit(0)，background thread 沒機會收尾。100ms 內完成。
         try:
-            threading.Thread(target=_bg_kill_chromedriver, daemon=True, name="ChromeKill").start()
+            self._kill_orphan_chromedriver()
         except Exception:
-            pass
+            logging.debug("taskkill chromedriver 失敗", exc_info=True)
 
         logging.info("Cleanup done: hotkeys unhooked, Chrome released, executor released.")
 
     @staticmethod
     def _kill_orphan_chromedriver() -> None:
-        """[O21] 結束殘留的 chromedriver.exe（防止上次崩潰留下的孤兒進程）。
+        """[O21] 結束殘留的 chromedriver.exe + 其子 chrome.exe（防止崩潰留下的孤兒）。
 
-        只 kill「父進程是本程式或不存在」的 chromedriver，避免誤殺其他程式的 driver。
+        策略：找父進程為本程式的 chromedriver → 連帶遞迴 kill 它的所有子 chrome
+              .exe / chrome_native_messaging_host 等。比 driver.quit() 快 10x
+              (taskkill 100ms vs Chrome graceful shutdown 1-2s)。
+
+        只 kill「父進程是本程式」的，避免誤殺其他 Chrome。
         """
         try:
             import psutil
@@ -6146,15 +6148,26 @@ class AutomationApp:
             return
         try:
             my_pid = os.getpid()
+            to_kill = []
             for p in psutil.process_iter(['pid', 'name', 'ppid']):
                 try:
                     n = (p.info.get('name') or '').lower()
                     if 'chromedriver' not in n:
                         continue
                     ppid = p.info.get('ppid', 0)
-                    # 父進程是自己 → 是我們開的；終結它
                     if ppid == my_pid:
-                        p.terminate()
+                        to_kill.append(p)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            # 對每個 chromedriver，連帶遞迴 kill 子孫 (chrome.exe / 渲染器等)
+            for cd in to_kill:
+                try:
+                    for child in cd.children(recursive=True):
+                        try:
+                            child.kill()  # kill 比 terminate 快 (immediate)
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            continue
+                    cd.kill()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
         except Exception:
