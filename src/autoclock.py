@@ -120,7 +120,11 @@ _persistent_driver_pool = {
     "last_used": 0.0,
     "lock": threading.Lock(),
 }
-_PERSISTENT_DRIVER_IDLE_TIMEOUT = 60 * 60  # 60 分鐘無使用 → 主動 quit
+_PERSISTENT_DRIVER_IDLE_TIMEOUT = 15 * 60  # 15 分鐘無使用 → 主動 quit
+# 註：原本 60 分鐘但 idle 期間沒有人 wake 起來檢查，driver 等於永遠不釋放。
+# 改 15 分鐘 + scheduler_loop 每分鐘主動檢查 → 兩批打卡之間 (08:00/12:00/12:30/
+# 17:30/18:00) 中間 4 小時都會被釋放，省 ~150-250MB Chrome 記憶體。下次任務
+# 重新 spin up 3-5 秒。
 
 
 def _get_or_create_clock_driver():
@@ -739,12 +743,39 @@ def _scheduler_tick() -> None:
         threading.Thread(target=process_clock_task, args=(key,), daemon=True).start()
 
 
+def _idle_driver_janitor() -> None:
+    """檢查 idle driver 是否該主動 quit (省記憶體)。
+
+    讓使用者在沒打卡的空檔不會多佔 ~150-250MB Chrome 進程。
+    跟 _get_or_create_clock_driver 的 idle-check 邏輯一致，但這邊主動觸發。
+    """
+    pool = _persistent_driver_pool
+    with pool["lock"]:
+        d = pool["driver"]
+        if d is None:
+            return
+        now = time_module.time()
+        idle_for = now - pool["last_used"]
+        if idle_for > _PERSISTENT_DRIVER_IDLE_TIMEOUT:
+            logging.info("[autoclock] driver idle %.0f 分鐘 (>%.0f 分)，主動 quit 省 RAM",
+                         idle_for / 60, _PERSISTENT_DRIVER_IDLE_TIMEOUT / 60)
+            try:
+                d.quit()
+            except Exception:
+                logging.debug("idle driver quit 例外（忽略）", exc_info=True)
+            pool["driver"] = None
+
+
 def scheduler_loop() -> None:
     logging.info("背景排程器已啟動...")
     schedule.every(1).minute.at(":01").do(_scheduler_tick)
+    # [優化] 每 2 分鐘主動檢查 idle driver，過期就 quit (省 ~150-250MB Chrome)
+    schedule.every(2).minutes.do(_idle_driver_janitor)
     while running.is_set():
         schedule.run_pending()
-        time_module.sleep(1)
+        # [優化] 改 5s sleep — schedule 套件本身有 :01 精度，5s 內仍會準時觸發
+        # 每分鐘任務。早期 1s 太密；對打卡 job 觀感無差，CPU 用量降 5 倍。
+        time_module.sleep(5)
 
 
 # =============================================================================

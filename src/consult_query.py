@@ -1516,6 +1516,10 @@ def scheduler_loop() -> None:
     last_heartbeat = time.time()
     HEARTBEAT_INTERVAL = 60.0  # 至少每 60s 寫一筆 log，方便看出 thread 死了
     IMAP_HARD_TIMEOUT = 60.0   # 單次 IMAP check 上限，過了就放棄
+    # [優化] cfg 快取：原本每秒 load_config → 86400 reads/day。改快取 + 60s
+    # 過期重讀。設定變更走 RELOAD_FLAG 強制重讀，所以使用者改設定也即時生效。
+    cfg = None
+    cfg_loaded_at = 0.0
     while running.is_set():
         try:
             schedule.run_pending()
@@ -1527,7 +1531,7 @@ def scheduler_loop() -> None:
                     pass
                 logging.info("收到立即執行要求")
                 trigger_job_async("手動")
-            # 「設定已變更」旗標檔（由設定視窗存檔後寫入）→ 重建排程
+            # 「設定已變更」旗標檔（由設定視窗存檔後寫入）→ 重建排程 + 重 load cfg
             if RELOAD_FLAG.exists():
                 try:
                     RELOAD_FLAG.unlink()
@@ -1535,12 +1539,16 @@ def scheduler_loop() -> None:
                     pass
                 logging.info("偵測到設定變更，重新建立排程")
                 _rebuild_schedule()
+                cfg = load_config()  # RELOAD_FLAG 觸發時重讀
             # 信件觸發：每 N 秒輪詢一次收件匣（啟用時）。改用 IMAP 直連
             # Gmail（imap.gmail.com:993），不再依賴 Outlook COM——後者在 admin
             # 行程下會起一個沒設定郵件帳號的 admin Outlook，永遠收不到信。
             # 輪詢週期可由 cfg.email_trigger_poll_seconds 調整（預設 20 秒，
             # 與 Gmail rate limit 完全相容；想更即時可降至 10 秒）。
-            cfg = load_config()
+            # [優化] 不再每秒 load_config — 改快取 + RELOAD_FLAG / 60s 過期重讀
+            if cfg is None or time.time() - cfg_loaded_at > 60:
+                cfg = load_config()
+                cfg_loaded_at = time.time()
             if cfg.get("email_trigger_enabled"):
                 poll_sec = float(cfg.get("email_trigger_poll_seconds", 20))
                 if time.time() - last_email_check >= poll_sec:
@@ -1599,7 +1607,23 @@ def scheduler_loop() -> None:
                 last_heartbeat = time.time()
         except Exception:
             logging.error("排程迴圈例外", exc_info=True)
-        time.sleep(1)
+        # [優化] 自適應 sleep — 算下次「真的有事要做」之前的時間，最久 5s。
+        # 早期固定 sleep(1)，每秒醒來幾乎都沒事。改 0.5-5s 範圍對使用者觀感
+        # 沒差：schedule 套件 12:30/17:00 在 5s 內仍會準時觸發；email 觸發信
+        # 本來內建 20s 容差；CPU 用量降 5 倍。
+        now = time.time()
+        next_imap_due = 5.0  # 預設上限 5s
+        try:
+            if cfg and cfg.get("email_trigger_enabled"):
+                ps = float(cfg.get("email_trigger_poll_seconds", 20))
+                next_imap_due = (last_email_check + ps) - now
+        except Exception:
+            pass
+        next_hb_due = (last_heartbeat + HEARTBEAT_INTERVAL) - now
+        sleep_for = min(5.0, next_imap_due, next_hb_due)
+        if sleep_for < 0.5:
+            sleep_for = 0.5
+        time.sleep(sleep_for)
 
 
 # =============================================================================
