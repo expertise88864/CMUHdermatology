@@ -32,7 +32,13 @@ $programs = @(
         Pyw='中國醫皮膚科會診查詢程式.pyw';
         Display='中國醫皮膚科會診查詢程式';
         Hint='每日 12:30 / 17:00 擷取會診單寄信（只需要一台電腦執行）';
-        DefaultChecked=$false }
+        DefaultChecked=$false },
+    [pscustomobject]@{
+        Key='watchdog'; TaskName='CMUH皮膚科守護程式自動啟動';
+        Pyw='中國醫皮膚科守護程式.pyw';
+        Display='中國醫皮膚科守護程式';
+        Hint='監看 會診查詢/打卡 卡死或被誤關，自動 kill+重啟（強烈建議跟會診查詢/打卡同台勾選）';
+        DefaultChecked=$true }
 )
 
 # === 檢查 .pyw 存在 ===
@@ -76,7 +82,7 @@ foreach ($p in $programs) {
 # 並用 Padding 而不是手算 y 座標。
 $form = New-Object System.Windows.Forms.Form
 $form.Text = '中國醫皮膚科 — 開機自動啟動設定'
-$form.ClientSize = New-Object System.Drawing.Size(580, 540)
+$form.ClientSize = New-Object System.Drawing.Size(580, 610)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false

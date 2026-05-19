@@ -62,12 +62,13 @@ def collect_entries(version: str) -> list:
     # 只列「純文字」可被 updater 處理的檔案。binary 圖示 (.ico/.png) 不放這
     # 裡（updater 走 text 路徑會 UTF-8 decode 失敗）。
     extra_files = [
-        # 啟動 shim（5 個 .pyw）
+        # 啟動 shim（6 個 .pyw — 含守護程式）
         "中國醫皮膚科主程式.pyw",
         "中國醫皮膚科打卡程式.pyw",
         "中國醫皮膚科排班程式.pyw",
         "中國醫皮膚科會診查詢程式.pyw",
         "中國醫皮膚科點座標偵測程式.pyw",
+        "中國醫皮膚科守護程式.pyw",
         # 自動啟動排程相關
         "安裝開機自動啟動.cmd",
         "安裝開機自動啟動.ps1",
@@ -76,6 +77,8 @@ def collect_entries(version: str) -> list:
         # 設定/資源檔
         "hotkey_overrides.json",
         "requirements.txt",
+        # 注意：settings/watchdog_config.json 不放這（settings/ 被 gitignore，
+        # GitHub 沒檔；watchdog_runner.py 第一次啟動會自動寫 default）
     ]
     for fn in extra_files:
         p = REPO_ROOT / fn

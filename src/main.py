@@ -2475,24 +2475,35 @@ _F11_POPUP_HANDLERS = [
 
 
 def _f11_popup_watcher(label: str = "F11",
-                        total_timeout: float = 45.0,
-                        idle_timeout: float = 5.0) -> int:
+                        total_timeout: float = 90.0,
+                        idle_timeout_initial: float = 8.0,
+                        idle_timeout_after_popup: float = 15.0) -> int:
     """輪詢已知 popup → 依現身順序執行對應 handler。
 
-    - total_timeout：整個輪詢最久跑這麼久
-    - idle_timeout：連續這麼久沒看到任何已知 popup → 視為完成、提早結束
+    - total_timeout：整個輪詢最久跑這麼久 (90s)
+    - idle_timeout_initial：還沒處理任何 popup 時，連續沒看到 popup 多久就放棄 (8s)
+      → 給「全部完成」按下後 popup 出現的時間
+    - idle_timeout_after_popup：已處理過 ≥1 個 popup 後的等待 (15s)
+      → 給 chain 中下一個慢慢出現的 popup 較長時間 (預約掛號常 delay 5-10s)
+
     回傳：處理過的 popup 數量
     """
     start = time.time()
     last_seen = time.time()
     handled = set()  # 已處理過的 hwnd，避免重複
     handled_count = 0
+    last_progress_log = time.time()
 
     while time.time() - start < total_timeout:
         check_stop()
-        if time.time() - last_seen > idle_timeout:
-            logging.info("[%s] 連續 %.0fs 沒新 popup，watcher 結束 (處理 %d 個)",
-                          label, idle_timeout, handled_count)
+        # 依「是否已處理過 popup」用不同 idle timeout
+        idle_limit = (idle_timeout_after_popup if handled_count > 0
+                       else idle_timeout_initial)
+        idle_for = time.time() - last_seen
+        if idle_for > idle_limit:
+            logging.info("[%s] 連續 %.1fs 沒新 popup (limit=%.0fs)，watcher 結束 "
+                          "(處理 %d 個)",
+                          label, idle_for, idle_limit, handled_count)
             return handled_count
 
         found_one = False
@@ -2507,11 +2518,19 @@ def _f11_popup_watcher(label: str = "F11",
                 handled.add(hwnd)
                 handled_count += 1
                 last_seen = time.time()
+                last_progress_log = time.time()
                 found_one = True
                 time.sleep(0.3)
                 break  # 從頭再掃一輪 (這次處理完可能觸發下個 popup)
 
         if not found_one:
+            # 每 5s 印一次「仍在等」log 方便 debug
+            if time.time() - last_progress_log >= 5.0:
+                logging.info(
+                    "[%s] watcher 等候中... 已處理 %d 個 popup，"
+                    "已 idle %.1fs (limit=%.0fs)",
+                    label, handled_count, idle_for, idle_limit)
+                last_progress_log = time.time()
             time.sleep(0.3)
 
     logging.info("[%s] watcher 達總時限 %.0fs (處理 %d 個)",
