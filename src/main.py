@@ -838,15 +838,8 @@ class F11PixelFrameCache:
         return all(abs(px[i] - rgb[i]) <= effective for i in range(3))
 
 
-def manage_scrollbar(scrollbar_widget, text_widget):
-    text_widget.update_idletasks()
-    if float(text_widget.index('end-1c').split('.')[0]) <= text_widget.cget('height'):
-        scrollbar_widget.pack_forget()
-    else:
-        scrollbar_widget.pack(side="right", fill="y")
-
-def format_vertical_text(text):
-    return "\n".join(list(text))
+# 【重構 2026-05-21】抽到 cmuh_common.ui_utils（與 scheduler.py 共用）
+from cmuh_common.ui_utils import manage_scrollbar, format_vertical_text  # noqa: E402
 
 # --- 打卡狀態檢查 ---
 LOGIN_URL = "http://10.20.8.47/peoplesystem/electron_card/login.aspx"
