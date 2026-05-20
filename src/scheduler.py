@@ -307,6 +307,12 @@ from cmuh_common.hotkey_scaling import (  # noqa: E402
     configure_hotkey_scaling,
     _scaled_xy,
 )
+# 【重構 2026-05-21】門診預約純函式（與 main.py 共用）
+from cmuh_common.appt_utils import (  # noqa: E402
+    _appt_dict_ext_branch,
+    _calendar_branch_sort_rank,
+    _strip_ext_appointments,
+)
 
 # --- 4. 全域執行緒控制事件 ---
 stop_event_automation = threading.Event()
@@ -1574,25 +1580,7 @@ def _reg52_docno_for_dayoff_table(doc_no):
     return f"D{s}"
 
 
-def _appt_dict_ext_branch(item):
-    """掛號 dict 的院區：None=主院, 'east'=東區, 'auh'=亞大, 'huihe'=惠和, 'huisheng'=惠盛（僅 is_ext 之舊資料視為東區）。"""
-    if not isinstance(item, dict):
-        return None
-    eb = item.get("ext_branch")
-    if eb in ("east", "auh", "huihe", "huisheng"):
-        return eb
-    if item.get("is_ext"):
-        return "east"
-    return None
-
-
-def _calendar_branch_sort_rank(ext_branch):
-    """總覽同一時段內分院列順序：東區→亞大→惠和→惠盛→其他分院。"""
-    if not ext_branch:
-        return 0
-    return {"east": 0, "auh": 1, "huihe": 2, "huisheng": 3}.get(ext_branch, 4)
-
-
+# _appt_dict_ext_branch / _calendar_branch_sort_rank: 抽到 cmuh_common.appt_utils
 _EXT_BRANCH_DISPLAY_SUFFIX = {
     "east": "(東區分院)",
     "auh": "(亞大)",
@@ -1640,14 +1628,7 @@ def _should_fetch_huisheng_reg52(doctor_name):
     return doctor_name in HUISHENG_DOCTOR_NAMES
 
 
-def _strip_ext_appointments(appointments_by_date):
-    """移除主院週表中內嵌之東區列（改以東區主機資料為準）；惠和僅來自 wh1，不在此處剔除。"""
-    for date_key in list(appointments_by_date.keys()):
-        bucket = appointments_by_date[date_key]
-        appointments_by_date[date_key] = [
-            x for x in bucket
-            if not (isinstance(x, dict) and _appt_dict_ext_branch(x) == "east")
-        ]
+# _strip_ext_appointments: 抽到 cmuh_common.appt_utils
 
 
 def _fetch_east_district_reg52_html(session, doc_no: str, doctor_name: str):
