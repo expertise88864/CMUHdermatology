@@ -10,6 +10,7 @@ psutil>=5.9.0
 Pillow>=10.0.0
 pystray>=0.19.5
 pywin32>=306
+sv-ttk>=2.6.0  # Win11 風格 ttk 主題（main.py 用）
 
 # ===== 打卡程式 =====
 webdriver-manager>=4.0.0
