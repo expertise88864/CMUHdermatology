@@ -5023,7 +5023,9 @@ class AutomationApp:
         except (TypeError, ValueError):
             _ufs = 1.0
         self.ui_font_scale_var = tk.DoubleVar(value=max(0.85, min(1.45, _ufs)))
-        self.alert_chang_enabled = tk.BooleanVar(value=self.threshold_settings.get("alert_chang_enabled", True))
+        # [預設關閉] 多台電腦同時跑時，若有人達到止掛門檻會重複寄信 → 預設關。
+        # 想開啟止掛提醒/寄信的電腦，到設定頁勾選對應醫師即可。
+        self.alert_chang_enabled = tk.BooleanVar(value=self.threshold_settings.get("alert_chang_enabled", False))
         self.alert_chen_enabled = tk.BooleanVar(value=self.threshold_settings.get("alert_chen_enabled", False))
         # 止掛達門檻時要寄信通知的收件人（可多人）
         self.alert_email_recipients = list(self.threshold_settings.get(
@@ -6400,7 +6402,7 @@ class AutomationApp:
             self.r_doctor_map = self.load_r_doctor_settings()
             self.doctors_list = self.load_doctors_settings()
             self.auto_reboot_settings = self.load_auto_reboot_settings()
-            self.alert_chang_enabled.set(self.threshold_settings.get("alert_chang_enabled", True))
+            self.alert_chang_enabled.set(self.threshold_settings.get("alert_chang_enabled", False))
             self.alert_chen_enabled.set(self.threshold_settings.get("alert_chen_enabled", False))
             self.out_of_hospital_var.set(self.threshold_settings.get("out_of_hospital_mode", False))
             self.show_external_clinics.set(self.threshold_settings.get("show_external_clinics", True))
