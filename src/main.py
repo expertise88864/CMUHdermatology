@@ -1491,13 +1491,13 @@ def _script_code_input_adaptive(code: str, label: str = "",
                         _HOSPITAL_WIN_TITLE_KW)
         return False
     _ensure_hospital_foreground(hwnd)
-    time.sleep(0.05)
+    time.sleep(0.03)
     # 雖然我們用 WM_CHAR 不經 IME，但 _force_ime_english 留著保險（萬一某
     # 控制項對 IME 狀態敏感）
     _force_ime_english(hwnd)
     _send_yiling_menu_command(hwnd, MENU_ID_代碼輸入)
-    # 等焦點移到醫令代碼欄
-    time.sleep(0.15)
+    # 等焦點移到醫令代碼欄 — 從 0.15s 降到 0.08s (PostMessage 反應快)
+    time.sleep(0.08)
     _force_ime_english(hwnd)
     check_stop()
     # code 非空才打字 + Enter
@@ -1519,7 +1519,7 @@ def _script_code_input_adaptive(code: str, label: str = "",
             hotkey_modules.pyautogui.press("enter")
     # 可選：改 療程 欄位 — 用 WM_SETTEXT 直接設值（繞 IME、不動滑鼠）
     if set_療程 is not None:
-        time.sleep(0.15)
+        time.sleep(0.08)  # 從 0.15s 降到 0.08s
         check_stop()
         liaocheng_hwnd = _find_療程_edit_hwnd(hwnd)
         if liaocheng_hwnd:
@@ -1632,7 +1632,7 @@ def _wait_window_closed(hwnd: int, timeout: float = 5.0) -> bool:
 def _f11_handle_pain(hwnd: int, label: str = "") -> bool:
     """疼痛指數 popup：勾 0 radio + 點「處理」。hwnd 由 caller 找到後傳入。"""
     logging.info("[%s] 疼痛指數 popup hwnd=%s → 勾 0 + 處理", label, hwnd)
-    time.sleep(0.4)
+    time.sleep(0.15)
     check_stop()
 
     radios = _enum_class_in_window(hwnd, "TGroupButton")
@@ -1645,7 +1645,7 @@ def _f11_handle_pain(hwnd: int, label: str = "") -> bool:
         if len(same_row) >= 6:
             _post_click_to_control(same_row[0][0])
             logging.info("[%s]   已勾 0 radio (hwnd=%s)", label, same_row[0][0])
-            time.sleep(0.2)
+            time.sleep(0.08)
         else:
             logging.warning("[%s]   量表 row 只 %d 個 radios，跳過勾選",
                               label, len(same_row))
@@ -1662,7 +1662,7 @@ def _f11_handle_pain(hwnd: int, label: str = "") -> bool:
 def _f11_handle_appt(hwnd: int, label: str = "") -> bool:
     """診間預約掛號 popup：直接點「處理」(不勾任何項)。"""
     logging.info("[%s] 預約掛號 popup hwnd=%s → 處理", label, hwnd)
-    time.sleep(0.4)
+    time.sleep(0.15)
     check_stop()
     if _click_button_normalized_text(hwnd, "處理"):
         logging.info("[%s]   已點 處理", label)
@@ -1754,7 +1754,7 @@ def _f11_handle_allergy_m01(hwnd: int, label: str = "") -> bool:
     state B (無過敏記錄)：勾「藥物過敏訊息不確定」+ 點「處理」
     """
     logging.info("[%s] 過敏記錄維護 popup hwnd=%s", label, hwnd)
-    time.sleep(0.4)
+    time.sleep(0.15)
     check_stop()
 
     state = _f11_detect_allergy_state(hwnd, label=label)
@@ -1777,7 +1777,7 @@ def _f11_handle_allergy_m01(hwnd: int, label: str = "") -> bool:
         else:
             _post_click_to_control(target_radio)
             logging.info("[%s]   已勾 radio (hwnd=%s)", label, target_radio)
-            time.sleep(0.3)
+            time.sleep(0.12)
             check_stop()
             if _click_button_normalized_text(hwnd, "處理"):
                 logging.info("[%s]   已點 處理", label)
@@ -1798,7 +1798,7 @@ def _f11_handle_allergy_m01(hwnd: int, label: str = "") -> bool:
 def _f11_handle_allergy_b(hwnd: int, label: str = "") -> bool:
     """藥物過敏記錄 popup：點「完成」(實際 text 是「完  成」)。"""
     logging.info("[%s] 藥物過敏記錄 popup hwnd=%s → 完成", label, hwnd)
-    time.sleep(0.4)
+    time.sleep(0.15)
     check_stop()
     if _click_button_normalized_text(hwnd, "完成"):
         logging.info("[%s]   已點 完成", label)
@@ -1811,7 +1811,7 @@ def _f11_handle_allergy_b(hwnd: int, label: str = "") -> bool:
 def _f11_handle_ask_dlg(hwnd: int, label: str = "") -> bool:
     """健保藥費/品項管控目標確認 popup：點「確認」。"""
     logging.info("[%s] 健保藥費確認 popup hwnd=%s → 確認", label, hwnd)
-    time.sleep(0.4)
+    time.sleep(0.15)
     check_stop()
     if _click_button_normalized_text(hwnd, "確認"):
         logging.info("[%s]   已點 確認", label)
@@ -1828,7 +1828,7 @@ def _f11_handle_breast_screening(hwnd: int, label: str = "") -> bool:
     精確過濾，這裡 handler 再確認一次「自訴未懷孕」TButton 存在才點，避免誤觸。
     """
     logging.info("[%s] 乳房篩檢 popup hwnd=%s → 自訴未懷孕", label, hwnd)
-    time.sleep(0.4)
+    time.sleep(0.15)
     check_stop()
     if _click_button_normalized_text(hwnd, "自訴未懷孕"):
         logging.info("[%s]   已點 自訴未懷孕", label)
@@ -1843,7 +1843,7 @@ def _f11_handle_primary_care_refer(hwnd: int, label: str = "") -> bool:
     勾「99.本院療程尚未結束，本次不轉院」TGroupButton → 點「確認」TButton。"""
     logging.info("[%s] 健保初級照護轉診 popup hwnd=%s → 勾 99.本院療程尚未結束 + 確認",
                   label, hwnd)
-    time.sleep(0.3)
+    time.sleep(0.12)
     check_stop()
 
     # 找 radio「99.本院療程尚未結束，本次不轉院」
@@ -1865,7 +1865,7 @@ def _f11_handle_primary_care_refer(hwnd: int, label: str = "") -> bool:
 
     _post_click_to_control(target_radio)
     logging.info("[%s]   已勾 radio (hwnd=%s)", label, target_radio)
-    time.sleep(0.3)
+    time.sleep(0.12)
     check_stop()
 
     if _click_button_normalized_text(hwnd, "確認"):
@@ -1888,7 +1888,7 @@ def _f11_handle_transfer_msg(hwnd: int, label: str = "") -> bool:
     偵測：找對應 control 是否 IsWindowVisible+Enabled，決定當前 state。
     """
     logging.info("[%s] 轉診提示 popup hwnd=%s", label, hwnd)
-    time.sleep(0.3)
+    time.sleep(0.12)
     check_stop()
 
     # Step A: 如果還在 state A，勾 radio + 點 處理/離開
@@ -1907,7 +1907,7 @@ def _f11_handle_transfer_msg(hwnd: int, label: str = "") -> bool:
     if visible_radio:
         _post_click_to_control(visible_radio)
         logging.info("[%s]   state A: 已勾「轉回原診所繼續治療」radio", label)
-        time.sleep(0.3)
+        time.sleep(0.12)
         check_stop()
         if _click_button_normalized_text(hwnd, "處理/離開"):
             logging.info("[%s]   state A: 已點「處理/離開」", label)
@@ -1915,7 +1915,7 @@ def _f11_handle_transfer_msg(hwnd: int, label: str = "") -> bool:
             logging.warning("[%s]   state A: 找不到「處理/離開」", label)
             return False
         # 等 state B 出現 (印轉回單 button 可見)
-        time.sleep(0.5)
+        time.sleep(0.2)
         check_stop()
 
     # Step B：找「印轉回單後離開」(可見+enabled) 並點。
@@ -1957,7 +1957,7 @@ def _f11_handle_message_ok(hwnd: int, label: str = "") -> bool:
     且 text='OK' (避免誤觸 Yes/No / OK/Cancel 型對話框)。
     """
     logging.info("[%s] 西醫門診系統 message popup hwnd=%s", label, hwnd)
-    time.sleep(0.4)
+    time.sleep(0.15)
     check_stop()
     # 安全檢查：必須有「OK」button 且只有這一顆 button (避免誤觸選項型對話框)
     ok_btns = _find_descendants_by_exact_text(hwnd, "TButton", "OK")
@@ -2059,7 +2059,7 @@ def _f11_popup_watcher(label: str = "F11",
                 last_seen = time.time()
                 last_progress_log = time.time()
                 found_one = True
-                time.sleep(0.3)
+                time.sleep(0.12)
                 break  # 從頭再掃一輪 (這次處理完可能觸發下個 popup)
 
         if not found_one:
@@ -2070,7 +2070,7 @@ def _f11_popup_watcher(label: str = "F11",
                     "已 idle %.1fs (limit=%.0fs)",
                     label, handled_count, idle_for, idle_limit)
                 last_progress_log = time.time()
-            time.sleep(0.3)
+            time.sleep(0.12)
 
     logging.info("[%s] watcher 達總時限 %.0fs (處理 %d 個)",
                   label, total_timeout, handled_count)
