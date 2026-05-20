@@ -1510,7 +1510,27 @@ def _run_imap_check_with_timeout(kw: str, timeout: float = 60.0) -> dict:
 
 
 # [穩定性] scheduler liveness — 給 self-watchdog thread 用
-_SCHEDULER_LIVENESS = {"last_tick": 0.0}
+_SCHEDULER_LIVENESS = {"last_tick": 0.0, "last_imap_success": 0.0}
+
+# [B] 觸發信去重 — 同一寄件人 + 最近 5 分鐘 → 視為重複，跳過
+# 防 mark-read 失敗導致重複處理
+_TRIGGER_DEDUP_WINDOW_SEC = 300
+_recent_trigger_senders: dict = {}  # sender_email → last_processed_ts
+
+
+def _trigger_is_duplicate(sender: str) -> bool:
+    """同 sender 5 分鐘內處理過 → True (應跳過)。"""
+    now = time.time()
+    last = _recent_trigger_senders.get(sender.lower(), 0.0)
+    if now - last < _TRIGGER_DEDUP_WINDOW_SEC:
+        return True
+    _recent_trigger_senders[sender.lower()] = now
+    # 順便清過期項
+    cutoff = now - _TRIGGER_DEDUP_WINDOW_SEC * 4
+    expired = [k for k, v in _recent_trigger_senders.items() if v < cutoff]
+    for k in expired:
+        _recent_trigger_senders.pop(k, None)
+    return False
 
 
 def _scheduler_self_watchdog() -> None:
@@ -1532,6 +1552,9 @@ def _scheduler_self_watchdog() -> None:
     KILL_THRESHOLD = 30        # force_close 後再 30s 沒救 → os._exit
     CHECK_INTERVAL = 60
     force_closed_at = 0.0      # 記錄上次 force_close 時間，避免重複
+    # [I] scheduler 半死偵測：tick 還在跑但沒有成功 IMAP poll > 10 分鐘
+    HALF_DEAD_THRESHOLD = 600
+    last_half_dead_log = 0.0
     while running.is_set():
         try:
             time.sleep(CHECK_INTERVAL)
@@ -1553,6 +1576,19 @@ def _scheduler_self_watchdog() -> None:
                     logging.exception("[self-watchdog] force_close 例外")
                 force_closed_at = time.time()
                 continue
+
+            # [I] scheduler 半死：tick 正常但 IMAP 一直失敗
+            #   (e.g. cooldown 中, 或網路斷)
+            last_ok = _SCHEDULER_LIVENESS.get("last_imap_success", 0.0)
+            if last_ok > 0:
+                imap_age = time.time() - last_ok
+                if imap_age > HALF_DEAD_THRESHOLD:
+                    if time.time() - last_half_dead_log > 600:
+                        logging.warning(
+                            "[half-dead] scheduler tick 正常但 IMAP 已 %.0f 秒"
+                            "沒成功 poll (>%.0fs)。網路問題或 IMAP 認證失效？",
+                            imap_age, HALF_DEAD_THRESHOLD)
+                        last_half_dead_log = time.time()
 
             # Stage 2：force_close 沒救活 → os._exit 強制重啟
             if force_closed_at > 0:
@@ -1663,11 +1699,12 @@ def scheduler_loop() -> None:
                                 consecutive_imap_errors, IMAP_COOLDOWN_SEC)
                             consecutive_imap_errors = 0  # 重置避免 cooldown 結束又馬上 trigger
                     else:
-                        # 成功 → 重置連續失敗計數
+                        # 成功 → 重置連續失敗計數 + [I] 更新 last_imap_success
                         if consecutive_imap_errors > 0:
                             logging.info("[IMAP] 連續失敗已恢復 (之前 %d 次)",
                                           consecutive_imap_errors)
                         consecutive_imap_errors = 0
+                        _SCHEDULER_LIVENESS["last_imap_success"] = time.time()
                         logging.info(
                             "檢查觸發信 [IMAP/%s]：未讀 %d 封，主旨含 %r 的 %d 封",
                             cfg.get("sender_account", "?"),
@@ -1689,12 +1726,23 @@ def scheduler_loop() -> None:
                                 "收到觸發信但寄件人不在白名單，已忽略：%s",
                                 ", ".join(blocked))
                         if allowed:
-                            logging.info(
-                                "收到觸發信（IMAP），立即執行 consult flow；"
-                                "結果將回寄給觸發者：%s",
-                                ", ".join(allowed))
-                            trigger_job_async("email",
-                                              override_recipients=allowed)
+                            # [B] Dedup：同一 sender 5 分鐘內重複觸發 → 跳過
+                            dedup_skipped = [s for s in allowed
+                                              if _trigger_is_duplicate(s)]
+                            dedup_proceed = [s for s in allowed
+                                              if s not in dedup_skipped]
+                            if dedup_skipped:
+                                logging.warning(
+                                    "[dedup] %s 在 %ds 內已處理過 → 略過避免重複寄信",
+                                    ", ".join(dedup_skipped),
+                                    _TRIGGER_DEDUP_WINDOW_SEC)
+                            if dedup_proceed:
+                                logging.info(
+                                    "收到觸發信（IMAP），立即執行 consult flow；"
+                                    "結果將回寄給觸發者：%s",
+                                    ", ".join(dedup_proceed))
+                                trigger_job_async("email",
+                                                  override_recipients=dedup_proceed)
                         elif not blocked:
                             # 比對到主旨但完全沒抓到 From → fallback 用設定的 recipients
                             logging.info(
@@ -2067,11 +2115,13 @@ def main() -> None:
         # ↓ 以下只有 first_instance 才會跑 ↓
         _setup_logging()
 
-        # [穩定性] health monitor — RAM 警告 + 網路 reachable check
+        # [穩定性] health monitor — RAM/網路/時鐘/硬碟 + 記憶體 leak 自動重啟 (A/E/F)
         try:
             from cmuh_common.health import start_health_monitor
             start_health_monitor("consult", ram_warn_mb=200, ram_crit_mb=500,
-                                  interval_sec=300, network_check=True)
+                                  interval_sec=300, network_check=True,
+                                  auto_restart_on_crit=True,  # [A] 連續 6 次 (~30 分) RAM 超 crit → os._exit
+                                  crit_persistence_ticks=6)
         except Exception:
             logging.debug("health monitor 啟動失敗", exc_info=True)
 

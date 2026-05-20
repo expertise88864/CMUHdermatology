@@ -35,6 +35,7 @@ import os
 import smtplib
 import socket
 import ssl
+import time
 from email.mime.application import MIMEApplication
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
@@ -46,6 +47,37 @@ from typing import Optional
 from cmuh_common.paths import get_settings_dir
 
 CREDENTIALS_FILE = Path(get_settings_dir()) / "smtp_credentials.json"
+
+# [C] Rate limit：保護機制防 bug 觸發無窮迴圈狂寄信
+# 用 deque 追蹤過去 60 分鐘內每封信的時間戳；超過 RATE_LIMIT_MAX 就拒絕
+import collections as _collections
+import threading as _threading
+RATE_LIMIT_WINDOW_SEC = 3600   # 統計區間 1 小時
+RATE_LIMIT_MAX = 30            # 1 小時內最多 30 封
+_rate_limit_lock = _threading.Lock()
+_recent_send_ts: "collections.deque" = _collections.deque(maxlen=RATE_LIMIT_MAX * 4)
+
+
+class SmtpRateLimitExceeded(RuntimeError):
+    """寄信頻率超過 RATE_LIMIT_MAX/小時的保護性錯誤。"""
+
+
+def _rate_limit_check_and_record() -> None:
+    """檢查並紀錄這次寄信時間戳。超過上限 raise SmtpRateLimitExceeded。"""
+    now = time.time()
+    cutoff = now - RATE_LIMIT_WINDOW_SEC
+    with _rate_limit_lock:
+        # 清掉視窗外的舊紀錄
+        while _recent_send_ts and _recent_send_ts[0] < cutoff:
+            _recent_send_ts.popleft()
+        if len(_recent_send_ts) >= RATE_LIMIT_MAX:
+            oldest_ago = now - _recent_send_ts[0]
+            raise SmtpRateLimitExceeded(
+                f"SMTP rate limit：過去 {RATE_LIMIT_WINDOW_SEC // 60} 分鐘已寄 "
+                f"{len(_recent_send_ts)} 封 (上限 {RATE_LIMIT_MAX})，"
+                f"請 {int((RATE_LIMIT_WINDOW_SEC - oldest_ago) // 60)} 分鐘後再試"
+            )
+        _recent_send_ts.append(now)
 
 DEFAULT_CREDENTIALS = {
     "host": "smtp.gmail.com",
@@ -177,6 +209,9 @@ def send_mail(recipients: list, subject: str, body: str,
     if not cred["host"] or not cred["username"]:
         raise SmtpNotConfiguredError(
             f"SMTP host/username 未設定。請編輯 {CREDENTIALS_FILE}")
+
+    # [C] Rate limit 檢查：防 bug 觸發無窮迴圈狂寄信
+    _rate_limit_check_and_record()
 
     msg = _build_message(
         sender_address=cred["from_address"],

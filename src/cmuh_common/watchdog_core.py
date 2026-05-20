@@ -106,6 +106,59 @@ _V3_TO_V4_REQUIRED_CONFIG = {
     "主程式": "",
 }
 
+# [D] Crash loop 偵測：per-program 啟動歷史 (timestamp list)
+# 若 10 分鐘內超過 5 次啟動 → 暫停該 program 30 分鐘
+_RESTART_HISTORY: dict = {}    # name → [timestamps]
+_SUSPENDED_UNTIL: dict = {}    # name → suspend_until_timestamp
+_CRASH_LOOP_LOCK = threading.Lock()
+CRASH_LOOP_WINDOW_SEC = 600       # 10 分鐘
+CRASH_LOOP_MAX_RESTARTS = 5       # 內 5 次以上 → 視為 crash loop
+CRASH_LOOP_SUSPEND_SEC = 1800     # 暫停 30 分鐘
+AUTO_UPDATE_SUSPEND_FLAG = SETTINGS_DIR / ".auto_update_suspended_until"
+
+
+def _record_restart_and_check_crash_loop(name: str) -> bool:
+    """紀錄一次啟動。回傳 True = 沒進入 crash loop, 可以繼續啟動。
+    回傳 False = 已經 crash loop 中，呼叫端應跳過啟動。"""
+    now = time.time()
+    with _CRASH_LOOP_LOCK:
+        # 檢查是否仍在 suspend 期間
+        until = _SUSPENDED_UNTIL.get(name, 0.0)
+        if now < until:
+            return False
+        # 取出歷史，砍掉視窗外的
+        hist = _RESTART_HISTORY.setdefault(name, [])
+        cutoff = now - CRASH_LOOP_WINDOW_SEC
+        hist[:] = [t for t in hist if t >= cutoff]
+        hist.append(now)
+        if len(hist) > CRASH_LOOP_MAX_RESTARTS:
+            # 觸發 crash loop！
+            _SUSPENDED_UNTIL[name] = now + CRASH_LOOP_SUSPEND_SEC
+            logging.critical(
+                "[watchdog] %s crash loop! %d 次啟動在 %d 秒內 → 暫停 %d 分鐘 "
+                "(直到 %s)。如為新版 bug 請降版或修復後手動清除 settings/"
+                ".auto_update_suspended_until",
+                name, len(hist), CRASH_LOOP_WINDOW_SEC,
+                CRASH_LOOP_SUSPEND_SEC // 60,
+                time.strftime("%H:%M:%S",
+                                time.localtime(now + CRASH_LOOP_SUSPEND_SEC)))
+            # [H] 同時暫停 auto-update 1 小時 (避免又拉到同個爛版本)
+            try:
+                AUTO_UPDATE_SUSPEND_FLAG.parent.mkdir(parents=True, exist_ok=True)
+                AUTO_UPDATE_SUSPEND_FLAG.write_text(
+                    f"{int(now) + 3600}\n"
+                    f"reason: {name} crash loop at {time.strftime('%Y-%m-%d %H:%M:%S')}\n",
+                    encoding="utf-8")
+                logging.critical(
+                    "[watchdog] 已寫 %s 暫停 auto-update 1 小時",
+                    AUTO_UPDATE_SUSPEND_FLAG)
+            except Exception:
+                logging.exception("[watchdog] 寫 auto-update suspend flag 失敗")
+            # 清歷史避免後續又連續觸發
+            hist.clear()
+            return False
+        return True
+
 
 def _migrate_config(cfg: dict) -> tuple:
     """回傳 (migrated_cfg, changed)。
@@ -360,9 +413,7 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
     # Case 1: 沒找到 PID → 可能真的沒在跑 OR psutil 看不到 cmdline (Windows 偶發)
     if not pids:
         # [穩定性] Fallback：log 還新鮮 → 程式幾乎肯定健在，psutil 找不到只是
-        # cmdline access 失敗。誤啟動會被 single_instance 擋下、但徒增 log 噪音
-        # 跟 CPU 浪費。實測 2026-05-19：consult_query 一直健在但 psutil 抓不到
-        # cmdline，watchdog 每 90s 誤啟動一次。
+        # cmdline access 失敗。
         if log_path is not None and max_stale > 0 and log_path.exists():
             try:
                 age = time.time() - log_path.stat().st_mtime
@@ -373,6 +424,11 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
                 pass
         if not claim_action_lock(name, action_lock_sec):
             return f"⏭ {name}: 沒在跑，但 lock 還新（別人剛動過手），這輪先跳過"
+        # [D] Crash loop 偵測 — 短時間內反覆啟動 → 暫停
+        if not _record_restart_and_check_crash_loop(name):
+            until = _SUSPENDED_UNTIL.get(name, 0.0)
+            remain = max(0, int(until - time.time()))
+            return f"⛔ {name}: crash loop 中，暫停 {remain // 60} 分鐘 [{mode}]"
         new_pid = start_program(pyw_path, pythonw)
         if new_pid:
             return f"▶ {name}: 沒在跑，已啟動 (PID {new_pid}) [{mode}]"

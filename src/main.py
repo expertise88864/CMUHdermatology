@@ -201,6 +201,54 @@ logging.basicConfig(
     handlers=[_rotating_handler]  # .pyw 無 console 視窗，StreamHandler 無作用且浪費資源
 )
 
+
+# [G] urllib3 「Connection pool is full」聚合：原本每次都印一筆 → 改每小時聚合
+# urllib3.connectionpool 日誌等級 WARNING 印 "Connection pool is full, discarding..."
+# 訊息。它意味著連線洩漏或 worker 太多。聚合避免洗 log，且每小時提示計數。
+class _ConnPoolFullAggregator(logging.Filter):
+    """攔截 urllib3.connectionpool 的 "Connection pool is full" 訊息。
+    第 1 筆讓它過 (使用者看得到問題)，後續 1 小時內全部 swallow + 計數，
+    過 1 小時印一筆 summary。
+    """
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self._first_seen = 0.0
+        self._count_since_summary = 0
+        self._last_summary = 0.0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if "Connection pool is full" not in msg:
+            return True
+        now = time.time()
+        with self._lock:
+            self._count_since_summary += 1
+            if self._first_seen == 0.0:
+                self._first_seen = now
+                return True  # 第一筆讓使用者看見
+            if now - self._last_summary > 3600:
+                # 過 1 小時，印一筆 summary
+                logging.warning(
+                    "[urllib3 pool] 過去 1 小時共 %d 筆「Connection pool is full」"
+                    "已聚合 (原本每筆都會 print)。如果頻率過高 (>100/小時) "
+                    "代表 worker 太多或連線洩漏",
+                    self._count_since_summary)
+                self._count_since_summary = 0
+                self._last_summary = now
+            return False  # swallow 重複的
+
+
+try:
+    import threading as _threading_for_filter  # noqa: F401  (確保 threading 可用)
+    _cp_filter = _ConnPoolFullAggregator()
+    logging.getLogger("urllib3.connectionpool").addFilter(_cp_filter)
+except Exception:
+    pass
+
 try:
     # 嘗試匯入外部函式庫 (只保留輕量級與必要的)
     import requests
@@ -10283,12 +10331,18 @@ if __name__ == "__main__":
     DOCTORS = app.doctors_list
     DOCTOR_NAMES = [d["name"] for d in DOCTORS]
 
-    # [穩定性] health monitor — RAM 警告 (主程式吃多容易卡掛號刷新)
+    # [穩定性] health monitor — RAM/時鐘/硬碟 + 記憶體 leak 自動重啟 (A/E/F)
     # 主程式 + Chrome (status driver) 正常 ~200-400MB；warn 500、crit 900
+    # 注意：主程式是有 GUI 的，os._exit 會把 UI 直接殺掉 → 但這是 RAM > 900MB
+    # 持續 30 分鐘的極端情況，本來就該 restart。外層 watchdog 不會自動重啟主程式
+    # (master_enabled 即使開了主程式也是 outer_only/disabled)，所以 os._exit 後
+    # 使用者要手動重啟。寧可資料潛在掉一點也比 RAM 失控好。
     try:
         from cmuh_common.health import start_health_monitor
         start_health_monitor("main", ram_warn_mb=500, ram_crit_mb=900,
-                              interval_sec=300, network_check=False)
+                              interval_sec=300, network_check=False,
+                              auto_restart_on_crit=True,
+                              crit_persistence_ticks=6)
     except Exception:
         logging.debug("health monitor 啟動失敗", exc_info=True)
 

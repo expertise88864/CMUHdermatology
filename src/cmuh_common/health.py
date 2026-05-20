@@ -2,24 +2,21 @@
 """共用 health monitor — 給 main / consult_query / autoclock 用。
 
 功能：
-  1. **記憶體監看**：每 N 分鐘記錄 process RSS；超過警告閾值就 WARNING (持
-     續超過 critical 閾值會 log CRITICAL，由外層 watchdog 決定要不要重啟)
-  2. **基本網路 reachable 檢查**：socket connect 一個已知主機 (gmail.com:443)
-     用 5s timeout，網路斷了 30s 內可知
-
-設計：純 stdlib + psutil，不引入新依賴。所有 check 都在獨立 daemon thread
-跑，不阻塞呼叫端。多次 import 也只啟一個 thread (singleton guard)。
-
-使用：
-    from cmuh_common.health import start_health_monitor
-    start_health_monitor("main", ram_warn_mb=400, ram_crit_mb=800)
+  1. **記憶體監看**：每 N 分鐘記錄 process RSS；超過警告/critical 閾值警告
+     + (可選) 持續 N 次 → os._exit(1) 讓 watchdog 重啟 (防 slow memory leak)
+  2. **網路 reachable 檢查**：socket connect smtp.gmail.com:587 看是否通
+  3. **時鐘漂移偵測**：time.time vs time.monotonic 比對，系統時鐘大幅跳動 → WARN
+  4. **硬碟空間監看**：log 目錄 free space <500MB WARN，<100MB CRITICAL
 """
 from __future__ import annotations
 
 import logging
+import os
+import shutil as _shutil
 import socket
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 _started_lock = threading.Lock()
@@ -37,9 +34,7 @@ def _get_rss_mb() -> Optional[float]:
 
 def _network_reachable(host: str = "smtp.gmail.com", port: int = 587,
                        timeout: float = 5.0) -> bool:
-    """TCP connect 看 host:port 是否通；用來判斷網路是否 down。
-    不送任何 protocol，只看 TCP 三次握手 → 對 SMTP/IMAP server 都安全 (Gmail
-    不會把連到 :587 但不 STARTTLS 的 client 列為 abuse)。"""
+    """TCP connect 看 host:port 是否通；用來判斷網路是否 down。"""
     try:
         sock = socket.create_connection((host, port), timeout=timeout)
         try:
@@ -51,28 +46,60 @@ def _network_reachable(host: str = "smtp.gmail.com", port: int = 587,
         return False
 
 
+def _disk_free_mb(path: str) -> Optional[float]:
+    """回傳 path 所在磁碟的 free space (MB)；失敗回 None。"""
+    try:
+        return _shutil.disk_usage(path).free / (1024 * 1024)
+    except Exception:
+        return None
+
+
 def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
-                  interval_sec: int, network_check: bool) -> None:
+                  interval_sec: int, network_check: bool,
+                  auto_restart_on_crit: bool,
+                  crit_persistence_ticks: int,
+                  disk_check_path: str) -> None:
     """背景監看迴圈。"""
-    logging.info("[health/%s] monitor 啟動 — RAM warn=%dMB crit=%dMB interval=%ds "
-                  "network_check=%s",
-                  tag, ram_warn_mb, ram_crit_mb, interval_sec, network_check)
+    logging.info(
+        "[health/%s] monitor 啟動 — RAM warn=%dMB crit=%dMB interval=%ds "
+        "network_check=%s auto_restart_on_crit=%s",
+        tag, ram_warn_mb, ram_crit_mb, interval_sec, network_check,
+        auto_restart_on_crit)
+
     consecutive_high_ram = 0
     last_network_down_log = 0.0
+    last_disk_warn = 0.0
+    # 時鐘漂移：紀錄 (time.time, time.monotonic) 配對，每 tick 比較 delta
+    last_wall = time.time()
+    last_mono = time.monotonic()
+
     while True:
         try:
+            # ─── RAM ───────────────────────────────────────────────
             rss_mb = _get_rss_mb()
             if rss_mb is None:
-                # psutil 不可用 — 沒得監測，sleep 久一點
                 time.sleep(interval_sec * 6)
                 continue
 
-            # RAM 警告分層
             if rss_mb >= ram_crit_mb:
                 consecutive_high_ram += 1
                 logging.critical(
-                    "[health/%s] RAM=%.0fMB ≥ critical %dMB (連續 %d 次)；考慮重啟",
+                    "[health/%s] RAM=%.0fMB ≥ critical %dMB (連續 %d 次)；"
+                    "考慮重啟",
                     tag, rss_mb, ram_crit_mb, consecutive_high_ram)
+                # [A] 若連續超過 critical 達 N 次 → 自動重啟 (記憶體 leak 防護)
+                if (auto_restart_on_crit
+                        and consecutive_high_ram >= crit_persistence_ticks):
+                    logging.critical(
+                        "[health/%s] RAM 連續 %d 次 (~%d 分鐘) 都 ≥ critical → "
+                        "os._exit(1) 強制重啟 process (外層 watchdog 會接手)",
+                        tag, consecutive_high_ram,
+                        consecutive_high_ram * interval_sec // 60)
+                    try:
+                        logging.shutdown()
+                    except Exception:
+                        pass
+                    os._exit(1)
             elif rss_mb >= ram_warn_mb:
                 consecutive_high_ram += 1
                 logging.warning(
@@ -81,14 +108,12 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
             else:
                 if consecutive_high_ram > 0:
                     logging.info(
-                        "[health/%s] RAM=%.0fMB 已降回安全範圍 (之前連續 %d 次警告)",
+                        "[health/%s] RAM=%.0fMB 已降回安全範圍 (之前連續 %d 次)",
                         tag, rss_mb, consecutive_high_ram)
                 consecutive_high_ram = 0
-                # 健康時 INFO log；節制不每 5 分鐘一次，每 30 分鐘一次就好
-                # 但仍寫 debug 方便 grep
                 logging.debug("[health/%s] RAM=%.0fMB OK", tag, rss_mb)
 
-            # 網路檢查 (可選)
+            # ─── 網路 ──────────────────────────────────────────────
             if network_check:
                 now = time.time()
                 if not _network_reachable():
@@ -98,6 +123,39 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
                             "(smtp.gmail.com:587 連不上) — 影響 SMTP/IMAP",
                             tag)
                         last_network_down_log = now
+
+            # ─── 時鐘漂移 (E) ─────────────────────────────────────
+            # 正常情況下，每 interval_sec 跑一次，兩個時鐘各自 +interval_sec
+            # 如果系統時鐘 wall 跳了 (NTP / 手動改 / 休眠醒)，delta 會差很多
+            cur_wall = time.time()
+            cur_mono = time.monotonic()
+            wall_delta = cur_wall - last_wall
+            mono_delta = cur_mono - last_mono
+            drift = abs(wall_delta - mono_delta)
+            if drift > 10.0:  # > 10 秒漂移 (一般 NTP 微調是 <1 秒)
+                logging.warning(
+                    "[health/%s] 時鐘漂移偵測：實際 %.1fs 但 monotonic %.1fs "
+                    "(差 %.1fs)。可能 NTP 校正或睡眠喚醒。",
+                    tag, wall_delta, mono_delta, drift)
+            last_wall = cur_wall
+            last_mono = cur_mono
+
+            # ─── 硬碟空間 (F) ─────────────────────────────────────
+            free_mb = _disk_free_mb(disk_check_path)
+            if free_mb is not None:
+                now = time.time()
+                if free_mb < 100:
+                    if now - last_disk_warn > 300:  # 每 5 分鐘最多一筆
+                        logging.critical(
+                            "[health/%s] 硬碟剩 %.0fMB < 100MB CRITICAL "
+                            "→ log/cache 可能寫不進去！",
+                            tag, free_mb)
+                        last_disk_warn = now
+                elif free_mb < 500:
+                    if now - last_disk_warn > 600:  # 每 10 分鐘
+                        logging.warning(
+                            "[health/%s] 硬碟剩 %.0fMB < 500MB", tag, free_mb)
+                        last_disk_warn = now
 
         except Exception:
             logging.exception("[health/%s] tick 例外", tag)
@@ -109,24 +167,33 @@ def start_health_monitor(tag: str,
                           ram_warn_mb: float = 400.0,
                           ram_crit_mb: float = 800.0,
                           interval_sec: int = 300,
-                          network_check: bool = False) -> bool:
+                          network_check: bool = False,
+                          auto_restart_on_crit: bool = False,
+                          crit_persistence_ticks: int = 6,
+                          disk_check_path: Optional[str] = None) -> bool:
     """啟動 daemon thread 監看本 process 的健康度。
 
-    tag: 用來識別此監看器在 log 裡的標籤 (e.g. "main", "consult", "autoclock")
-    ram_warn_mb: RSS 達此值寫 WARNING log
-    ram_crit_mb: RSS 達此值寫 CRITICAL log
-    interval_sec: 多久檢查一次 (預設 300s = 5 分鐘)
-    network_check: 是否做 TCP reachable 檢查 (適用 consult_query 等需要 SMTP 的)
+    tag: log 標籤 (e.g. "main", "consult", "autoclock")
+    ram_warn_mb / ram_crit_mb: WARN / CRITICAL 閾值 (MB)
+    interval_sec: 多久檢查一次 (預設 300s)
+    network_check: 是否做 smtp.gmail.com:587 reachable test
+    auto_restart_on_crit: [A] 連續 crit_persistence_ticks 次都 ≥ crit_mb →
+        主動 os._exit(1) 讓外層 watchdog 重啟 (防 slow memory leak 拖垮系統)
+    crit_persistence_ticks: 連續幾 tick 都超 crit 才觸發自殺 (預設 6 = ~30 分鐘)
+    disk_check_path: 硬碟空間檢查路徑 (None → 用本 process cwd)
 
-    回傳 True = 已啟動；False = 已啟動過 (同 tag 不會重複啟)。
+    回傳 True = 已啟動；False = 已啟動過 (同 tag 不重複啟)。
     """
     with _started_lock:
         if tag in _started_for:
             return False
         _started_for.add(tag)
+    if disk_check_path is None:
+        disk_check_path = os.getcwd()
     t = threading.Thread(
         target=_health_loop,
-        args=(tag, ram_warn_mb, ram_crit_mb, interval_sec, network_check),
+        args=(tag, ram_warn_mb, ram_crit_mb, interval_sec, network_check,
+               auto_restart_on_crit, crit_persistence_ticks, disk_check_path),
         name=f"HealthMonitor-{tag}",
         daemon=True,
     )

@@ -1072,12 +1072,14 @@ def main() -> None:
         _setup_clock_logging()
         logging.info("=== autoclock v%s 啟動 ===", CURRENT_VERSION)
 
-        # [穩定性] health monitor — RAM 警告 (Chrome 拖累時可知)
+        # [穩定性] health monitor — RAM/時鐘/硬碟 + 記憶體 leak 自動重啟 (A/E/F)
         try:
             from cmuh_common.health import start_health_monitor
             # 打卡 Chrome 啟動後正常 RSS ~300MB；warn 500、crit 800
             start_health_monitor("autoclock", ram_warn_mb=500, ram_crit_mb=800,
-                                  interval_sec=300, network_check=False)
+                                  interval_sec=300, network_check=False,
+                                  auto_restart_on_crit=True,
+                                  crit_persistence_ticks=6)
         except Exception:
             logging.debug("health monitor 啟動失敗", exc_info=True)
 
