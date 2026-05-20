@@ -80,12 +80,11 @@ _set_windows_app_user_model_id = set_app_user_model_id
 from cmuh_common import updater as _updater_mod  # noqa: E402
 
 
-import sys
+# 【清理 2026-05-21】sys / os 已於檔首 import（line 7-8 為 sys.path 操作需要），這裡不重覆
 import subprocess
 import importlib
 import inspect
 import shutil
-import os
 import threading
 import time
 import tkinter as tk
