@@ -85,6 +85,13 @@ class DependencyInstaller(tk.Tk):
                     if os.name == 'nt':
                         startupinfo = subprocess.STARTUPINFO()
                         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    # 【守門 2026.05.20】.exe 模式絕不跑 pip：sys.executable 是 app exe，
+                    # 會無限 spawn 自己 → fork bomb。deps_runtime 已 early-return，這是第二道防線。
+                    if getattr(sys, 'frozen', False):
+                        raise RuntimeError(
+                            f"[.exe mode] 缺漏依賴 {pkg_name} 應由 PyInstaller spec 補齊，"
+                            f"runtime 不執行 pip"
+                        )
                     # [O19] pip 加速旗標：
                     #   --no-input：不互動（避免 hang）
                     #   --disable-pip-version-check：跳過 pip 自身版本檢查

@@ -33,6 +33,7 @@ from cmuh_common.ui_messages import (
     UiClockStatusMessage, UiAlertInfoMessage, UiAlertErrorMessage, UiMessage, put_ui_message,
 )
 from cmuh_common.deps_runtime import ensure_dependencies as _ensure_deps_runtime
+from cmuh_common.single_instance import ensure_single_instance, release_single_instance
 
 # === 依賴清單（與原檔一致；指紋由 deps_runtime 處理）===
 REQUIRED_LIBS = [
@@ -709,7 +710,8 @@ def _get_thread_local_duty_session():
     s = getattr(_duty_tls, "session", None)
     if s is None:
         s = requests.Session()
-        rtry = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+        # 【效能 2026.05.20】retry total 2→1，避免 backoff 把首屏拖到 5-15s
+        rtry = Retry(total=1, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
         s.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=rtry))
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
@@ -4436,7 +4438,9 @@ def load_master_schedule_in_background(ui_queue: "Queue[UiMessage]", *, force: b
     put_ui_message(ui_queue, UiMasterScheduleMessage(schedule=schedule))
 
 # --- 8. 值班醫師查詢 ---
-_DUTY_HTTP_TIMEOUT = 40
+# 【效能 2026.05.20】duty timeout 從 40 降為 (connect=3, read=8)。內網應該快，
+# 慢就是壞掉 — 等 40 秒只會把首屏拖垮。
+_DUTY_HTTP_TIMEOUT = (3, 8)
 
 def _perform_duty_query(session, roc_date_str):
     """forward01 值班查詢（GET 表單 + POST）。專用 session + 重試，避免與掛號搶鎖或單次逾時即失敗。"""
@@ -5111,7 +5115,8 @@ class AutomationApp:
         self._refresh_tick_after_id = None
         self._pending_refresh_tick_ui = None
 
-        retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        # 【效能 2026.05.20】retry total 3→1：內網慢就是壞，3 次 backoff 把首屏拖到 10s+
+        retries = Retry(total=1, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
         self.session = requests.Session()
         self.session.mount('https://', HTTPAdapter(max_retries=retries))
         self.session.headers.update({
@@ -5265,6 +5270,8 @@ class AutomationApp:
 
         [加速] cleanup 跑完立刻 destroy；不等待背景任何工作。Daemon thread/Chrome
         會被 _kill_orphan_chromedriver 處理或隨進程結束。
+
+        【穩定性 2026.05.20】os._exit(0) 跳過 atexit，但 mutex / log handler 需顯式釋放。
         """
         try:
             self._cleanup_for_exit()
@@ -5274,9 +5281,18 @@ class AutomationApp:
             self.root.destroy()
         except Exception:
             pass
-        # 強制立刻終止進程（避免 daemon thread / 未完成 IO 拖累）
-        # 注意：此處用 os._exit(0) 不執行 atexit；Chrome / chromedriver 已被
-        # _release_status_driver / _kill_orphan_chromedriver 處理過
+
+        # 顯式 cleanup（os._exit 會跳過 atexit）
+        try:
+            release_single_instance()
+        except Exception:
+            pass
+        try:
+            logging.shutdown()  # flush + close 所有 handler
+        except Exception:
+            pass
+
+        # 強制立刻終止進程
         try:
             os._exit(0)
         except SystemExit:
@@ -9521,7 +9537,9 @@ class AutomationApp:
                         duty_cache['duty_doctor'] = txt
                         self._refresh_duty_summary_text()
                         self._duty_cache_mem = duty_cache
-                        self._save_cache('cache_duty_info.json', duty_cache)
+                        # 【效能 2026.05.20】debounce — 4 個 duty future 完成順序不一，
+                        # 同步寫 4 次同一檔會凍 UI 150-300ms。
+                        self._schedule_save_cache('cache_duty_info.json', duty_cache)
                     case UiSaturdayDutyDoctorMessage(saturday_date=saturday_date, doctor_name=sdn):
                         duty_cache = self._duty_cache_mem_ensure()
                         duty_cache['date'] = date.today().strftime("%Y-%m-%d")
@@ -9531,7 +9549,9 @@ class AutomationApp:
                         duty_cache['saturday_duty'] = txt
                         self._refresh_duty_summary_text()
                         self._duty_cache_mem = duty_cache
-                        self._save_cache('cache_duty_info.json', duty_cache)
+                        # 【效能 2026.05.20】debounce — 4 個 duty future 完成順序不一，
+                        # 同步寫 4 次同一檔會凍 UI 150-300ms。
+                        self._schedule_save_cache('cache_duty_info.json', duty_cache)
                     case UiTodayVsMessage(doctor_name=vsn):
                         duty_cache = self._duty_cache_mem_ensure()
                         duty_cache['date'] = date.today().strftime("%Y-%m-%d")
@@ -9540,7 +9560,9 @@ class AutomationApp:
                         duty_cache['today_vs'] = txt
                         self._refresh_duty_summary_text()
                         self._duty_cache_mem = duty_cache
-                        self._save_cache('cache_duty_info.json', duty_cache)
+                        # 【效能 2026.05.20】debounce — 4 個 duty future 完成順序不一，
+                        # 同步寫 4 次同一檔會凍 UI 150-300ms。
+                        self._schedule_save_cache('cache_duty_info.json', duty_cache)
                     case UiSaturdayVsMessage(doctor_name=svn):
                         duty_cache = self._duty_cache_mem_ensure()
                         duty_cache['date'] = date.today().strftime("%Y-%m-%d")
@@ -9549,7 +9571,9 @@ class AutomationApp:
                         duty_cache['saturday_vs'] = txt
                         self._refresh_duty_summary_text()
                         self._duty_cache_mem = duty_cache
-                        self._save_cache('cache_duty_info.json', duty_cache)
+                        # 【效能 2026.05.20】debounce — 4 個 duty future 完成順序不一，
+                        # 同步寫 4 次同一檔會凍 UI 150-300ms。
+                        self._schedule_save_cache('cache_duty_info.json', duty_cache)
                     case UiClockStatusMessage(status_data=payload):
                         self._update_clock_status_ui(payload)
                     case _:
@@ -9997,31 +10021,11 @@ class AutomationApp:
     def start_background_tasks(self):
         logging.info("Starting background tasks loop via ThreadPoolExecutor...")
 
-        # ===== 同步下載所有子程式 (manifest.json 列出的全部檔案) =====
-        # 改自原本的 fire-and-forget (`bg_executor.submit(check_and_update, False)`)：
-        # 改成阻塞此 method 直到下載/驗證完成，目的是避免「主程式打開後使用者立刻按
-        # 熱鍵但子程式仍是舊版」的時間窗。
-        #
-        # 注意：此 method 由 deferred_initialization 在 UI thread 透過 root.after(50)
-        # 觸發，所以阻塞會短暫凍結 UI。但：
-        #   - SHA256 短路：本地檔案已是 manifest 期望版時，幾乎瞬間返回（< 1 秒）
-        #   - 真有檔案要下載：平行 ThreadPoolExecutor 8 workers，通常 < 10 秒
-        #   - 180 秒安全 timeout：網路掛掉時最多卡 3 分鐘就放手
-        # 啟動畫面會顯示 "同步下載所有子程式..." 讓使用者知道在做什麼。
-        import concurrent.futures as _cf
-        self.startup_phase_text.set("同步下載所有子程式更新...")
-        try:
-            self.root.update_idletasks()  # 強制繪製 splash 訊息再阻塞
-        except Exception:
-            pass
-        try:
-            update_future = self.bg_executor.submit(self.check_and_update, False)
-            update_future.result(timeout=180)
-            logging.info("[STARTUP] sync update of all sub-programs done")
-        except _cf.TimeoutError:
-            logging.warning("[STARTUP] sync update timeout (>180s), continuing anyway")
-        except Exception:
-            logging.exception("[STARTUP] sync update failed (continuing)")
+        # ===== 背景下載所有子程式 (manifest.json 列出的全部檔案) =====
+        # 【穩定性 2026.05.20】改回 fire-and-forget。.result(timeout=180) 會阻塞
+        # UI thread 等 GitHub raw，院內網路慢時 splash 卡 8-180s。子程式自己也會
+        # 做 check_and_update，不必由主程式同步保證。
+        self.bg_executor.submit(self.check_and_update, False)
 
         self.startup_phase_text.set("任務排程")
 
@@ -10282,6 +10286,14 @@ if __name__ == "__main__":
     _set_windows_dpi_awareness()
     _set_windows_app_user_model_id()
 
+    # 【穩定性 2026.05.20】Mutex 單例 — 防雙開搶 keyboard hook / 兩個 Chrome / log rotate 撞檔
+    if not ensure_single_instance("Local\\CMUH_Skin_Main_SingleInstance_v1"):
+        ctypes.windll.user32.MessageBoxW(
+            0, "主程式已在執行中。", "中國醫皮膚科主程式", 0x40 | 0x1000)
+        sys.exit(0)
+    import atexit as _atexit_mtx
+    _atexit_mtx.register(release_single_instance)
+
     # 必須先建 main_root，splash 才能用 Toplevel（避免兩個 tk.Tk() 造成 ttk 樣式錯亂）
     main_root = tk.Tk()
     main_root.withdraw()  # 主視窗先隱藏，等初始化完成再顯示，避免閃爍
@@ -10359,7 +10371,9 @@ if __name__ == "__main__":
             return
         logging.info("[watchdog/inner] 啟動 — 監看 consult_query/打卡")
         last_heartbeat = 0.0
-        while True:
+        # 【穩定性 2026.05.20】用 stop_event_main.wait 取代 time.sleep — shutdown
+        # 時立即返回，避免 daemon 在 sleep 中被 Python interpreter 腰斬留下殭屍 chromedriver。
+        while not stop_event_main.is_set():
             try:
                 cfg = watchdog_core.load_config()
                 actions = watchdog_core.run_one_tick(mode="inner")
@@ -10372,7 +10386,9 @@ if __name__ == "__main__":
             except Exception:
                 logging.exception("[watchdog/inner] tick 例外")
                 interval = 30
-            time.sleep(interval)
+            if stop_event_main.wait(interval):
+                break
+        logging.info("[watchdog/inner] 收到 stop_event，退出")
 
     try:
         _wd_thread = threading.Thread(

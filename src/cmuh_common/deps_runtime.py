@@ -12,7 +12,7 @@ import os
 import sys
 from typing import Iterable
 
-from cmuh_common.paths import get_app_dir
+from cmuh_common.paths import get_app_dir, is_frozen
 
 
 def _build_fingerprint(required_libs: Iterable[tuple]) -> str:
@@ -28,7 +28,13 @@ def ensure_dependencies(
     """檢查並（必要時）安裝 required_libs。
 
     required_libs: [(pip_name, import_name), ...]
+
+    【防禦性 2026.05.20】.exe 模式（PyInstaller frozen）下完全跳過：sys.executable
+    在 frozen 時是 app exe 本身，呼叫 -m pip install 會無限 spawn 自己 → fork bomb。
     """
+    if is_frozen():
+        return
+
     fingerprint = _build_fingerprint(required_libs)
     deps_cache_file = os.path.join(get_app_dir(), deps_cache_filename)
 

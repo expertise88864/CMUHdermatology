@@ -33,6 +33,7 @@ from cmuh_common.ui_messages import (
     UiClockStatusMessage, UiAlertInfoMessage, UiAlertErrorMessage, UiMessage, put_ui_message,
 )
 from cmuh_common.deps_runtime import ensure_dependencies as _ensure_deps_runtime
+from cmuh_common.single_instance import ensure_single_instance, release_single_instance
 
 # === 依賴清單（與原檔一致；指紋由 deps_runtime 處理）===
 REQUIRED_LIBS = [
@@ -7063,6 +7064,15 @@ if __name__ == "__main__":
     run_as_admin()
     _set_windows_dpi_awareness()
     _set_windows_app_user_model_id()
+
+    # 【穩定性 2026.05.20】Mutex 單例 — 防雙開搶 keyboard hook / log rotate 撞檔
+    if not ensure_single_instance("Local\\CMUH_Skin_Scheduler_SingleInstance_v1"):
+        ctypes.windll.user32.MessageBoxW(
+            0, "排班程式已在執行中。", "中國醫皮膚科排班程式", 0x40 | 0x1000)
+        sys.exit(0)
+    import atexit as _atexit_mtx
+    _atexit_mtx.register(release_single_instance)
+
     main_root = tk.Tk()
     
     # 綁定全域例外處理，避免背景執行緒崩潰導致閃退

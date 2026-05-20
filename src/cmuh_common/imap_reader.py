@@ -166,7 +166,8 @@ def check_trigger(keyword: str, mark_read: bool = True,
                             "settings/smtp_credentials.json）")
         return result
 
-    socket.setdefaulttimeout(timeout)
+    # 【穩定性 2026.05.20】不用 socket.setdefaulttimeout — 那是 process-global，
+    # 會污染同 process 的 SMTP / selenium / requests。IMAP4_SSL(timeout=...) 已夠。
     conn: Optional[imaplib.IMAP4_SSL] = None
     try:
         context = ssl.create_default_context()
@@ -272,6 +273,5 @@ def check_trigger(keyword: str, mark_read: bool = True,
         # socket 死了會 hang 整個 finally。直接砍底層 socket 就好。
         _clear_active(conn)
         _force_close_conn(conn)
-        socket.setdefaulttimeout(None)
 
     return result
