@@ -2903,6 +2903,8 @@ class AutomationApp:
         self._init_ui()
 
         self.load_cached_data()
+        # 【UX 2026-05-21】立刻觸發 UI refresh 顯示已載入的快取資料（與 main.py 一致）
+        self._schedule_refresh()
         self.startup_phase_text.set("快取完成")
 
         self.root.after(50, self.deferred_initialization)

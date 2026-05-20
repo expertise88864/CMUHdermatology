@@ -5075,6 +5075,11 @@ class AutomationApp:
         self._init_ui()
 
         self.load_cached_data()
+        # 【UX 2026-05-21】立刻觸發 UI refresh 顯示已載入的快取資料
+        # 原本 _init_ui 建空白 widgets → load_cached_data 填 self.all_doctors_data
+        # → 但沒人通知 UI refresh → 使用者看到「窗開了內容空白」直到第一次網路
+        # 結果回來才觸發 _schedule_refresh。新增此行讓 160ms debounce 後立刻畫快取。
+        self._schedule_refresh()
         self.startup_phase_text.set("快取完成")
 
         self.root.after(50, self.deferred_initialization)
