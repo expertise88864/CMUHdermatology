@@ -1516,13 +1516,22 @@ _SCHEDULER_LIVENESS = {"last_tick": 0.0}
 def _scheduler_self_watchdog() -> None:
     """獨立 daemon thread — 每 60s 看 scheduler_loop 是否還活著。
 
-    如果 scheduler 卡住 (last_tick 超過 5 分鐘沒更新)，寫 CRITICAL log 並
-    嘗試 force-close 當前活動的 IMAP socket (希望讓卡住的 thread 解套)。
+    階梯式處理：
+      1. last_tick 超過 5 分鐘 → log CRITICAL + force_close IMAP socket
+         (希望讓卡在 socket recv 的 thread 解套)
+      2. 再過 30 秒 last_tick 仍沒更新 → force_close 沒救活，直接 os._exit(1)
+         讓 process 死亡 → 外層 watchdog 偵測沒在跑 → 重啟新 instance
+         (這是 last resort — 但比死循環好太多)
 
-    不會自己重啟 scheduler — 那是外層 watchdog (process-level) 的事。
+    為什麼直接 os._exit(1)：
+      - sys.exit() 只結束 main thread，daemon 用無效
+      - threading 沒有 thread.kill()
+      - 唯一方式是讓整個 process 死，新 process 才能拿到 mutex
     """
-    DEAD_THRESHOLD = 300  # 5 分鐘
+    DEAD_THRESHOLD = 300       # 5 分鐘無 tick → 嘗試 force_close
+    KILL_THRESHOLD = 30        # force_close 後再 30s 沒救 → os._exit
     CHECK_INTERVAL = 60
+    force_closed_at = 0.0      # 記錄上次 force_close 時間，避免重複
     while running.is_set():
         try:
             time.sleep(CHECK_INTERVAL)
@@ -1530,7 +1539,9 @@ def _scheduler_self_watchdog() -> None:
             if last == 0.0:
                 continue  # 還沒第一次 tick，給它時間 init
             age = time.time() - last
-            if age > DEAD_THRESHOLD:
+
+            # Stage 1：偵測卡死 → force_close socket
+            if age > DEAD_THRESHOLD and force_closed_at == 0.0:
                 logging.critical(
                     "[self-watchdog] scheduler 已 %.0f 秒沒 tick (>%.0fs 視為死亡)！"
                     " 強制關閉 IMAP socket 嘗試解套",
@@ -1540,6 +1551,31 @@ def _scheduler_self_watchdog() -> None:
                     force_close_active()
                 except Exception:
                     logging.exception("[self-watchdog] force_close 例外")
+                force_closed_at = time.time()
+                continue
+
+            # Stage 2：force_close 沒救活 → os._exit 強制重啟
+            if force_closed_at > 0:
+                since_force = time.time() - force_closed_at
+                if last > force_closed_at:
+                    # scheduler 復活了，重置
+                    logging.info(
+                        "[self-watchdog] scheduler 已恢復 tick，取消重啟")
+                    force_closed_at = 0.0
+                elif since_force > KILL_THRESHOLD:
+                    logging.critical(
+                        "[self-watchdog] force_close 後 %.0fs scheduler 仍卡死 "
+                        "→ os._exit(1) 強制重啟整個 process (外層 watchdog 會接手)",
+                        since_force)
+                    # 不能 sys.exit (只殺 main thread, daemon 無效)
+                    # 必須 os._exit 強制終止整個 process
+                    import os as _os
+                    _os.flush_io = lambda: None
+                    try:
+                        logging.shutdown()  # 刷 log handler 確保訊息寫完
+                    except Exception:
+                        pass
+                    _os._exit(1)
         except Exception:
             logging.exception("[self-watchdog] tick 例外")
 
@@ -2003,6 +2039,32 @@ def main() -> None:
             run_as_admin()
             return  # 保險：理論上 run_as_admin 已 sys.exit
 
+        args = sys.argv[1:]
+
+        # [關鍵 fix 2026-05-20] mutex 擋退時 *完全不能寫 log*！否則：
+        #   舊 scheduler thread 卡死 → watchdog 偵測 log mtime 過期 → 啟動新 process
+        #   → 新 process 被 mutex 擋退但寫了一筆「已在執行中」log
+        #   → log mtime 被更新 → watchdog 下次以為 consult 還活著 → 不 kill 舊的
+        #   → 舊的 mutex 仍 hold → 新 instance 永遠被擋 → 死循環 N 小時
+        # 修法：mutex check 放在 _setup_logging 之前。被擋退的 process 完全沉默
+        # exit (沒 file handler 被建立 → log mtime 不會被新 process 污染)。
+        # --configure 例外 (設定模式不搶 mutex，要寫 log 可)。
+        if "--configure" not in args:
+            # 先做 mutex 試探 — 不是 first_instance 就靜默退出
+            # ensure_single_instance 內部只用 winapi，不依賴 logging
+            first_instance = ensure_single_instance(MUTEX_NAME)
+            if not first_instance:
+                # --run-now 仍要寫 RUNNOW_FLAG 給常駐實例
+                if "--run-now" in args:
+                    try:
+                        RUNNOW_FLAG.write_text(datetime.now().isoformat(),
+                                               encoding="utf-8")
+                    except Exception:
+                        pass  # 不能 logging.error — 會污染 log mtime
+                # 退出時不寫任何 log，避免污染 mtime 干擾 watchdog 判斷
+                sys.exit(0)
+
+        # ↓ 以下只有 first_instance 才會跑 ↓
         _setup_logging()
 
         # [穩定性] health monitor — RAM 警告 + 網路 reachable check
@@ -2014,7 +2076,6 @@ def main() -> None:
             logging.debug("health monitor 啟動失敗", exc_info=True)
 
         # [穩定性] 全域 thread/sys excepthook：未捕獲例外寫 log。
-        # 沒這個的話 daemon thread 死了完全沒紀錄，事後 debug 困難。
         def _sys_excepthook(exc_type, exc_value, exc_tb):
             logging.critical("Uncaught main exception",
                               exc_info=(exc_type, exc_value, exc_tb))
@@ -2028,37 +2089,18 @@ def main() -> None:
                 )
             threading.excepthook = _thread_excepthook
 
-        args = sys.argv[1:]
-
         # 設定模式：不搶單例，直接開設定視窗
         if "--configure" in args:
             ConfigApp().mainloop()
             return
 
-        # 第一次啟動：設定檔不存在 → 強制開設定視窗讓使用者填帳密／收件人；
-        # 設定視窗關閉後才繼續走常駐流程（這樣別人裝在他自己的電腦上就不會
-        # 用到預設帳密誤登入別人的身份）。
+        # 第一次啟動：設定檔不存在 → 強制開設定視窗
         if not CONFIG_FILE.exists():
             logging.info("首次啟動，未偵測到設定檔，先開啟設定視窗")
             ConfigApp().mainloop()
             if not CONFIG_FILE.exists():
                 logging.info("設定視窗關閉但未儲存任何設定，結束")
                 return
-
-        first_instance = ensure_single_instance(MUTEX_NAME)
-
-        if not first_instance:
-            # 已有常駐實例：靜默處理（shell:startup 重開機都會撞到這裡，不能跳視窗）
-            if "--run-now" in args:
-                try:
-                    RUNNOW_FLAG.write_text(datetime.now().isoformat(),
-                                           encoding="utf-8")
-                    logging.info("已通知常駐實例立即執行")
-                except Exception:
-                    logging.error("寫入立即執行旗標失敗", exc_info=True)
-            else:
-                logging.info("會診查詢程式已在執行中（系統列），本次啟動靜默結束")
-            sys.exit(0)
 
         logging.info("=== 會診查詢程式啟動 v%s ===", CURRENT_VERSION)
         # 啟動權限狀態（給「自動提權有沒有真的生效」一個白紙黑字證據）
