@@ -2214,6 +2214,18 @@ def _parse_auh_reg52_schedule(soup):
     return out
 
 def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorConfig):
+    # [Jitter] 多 doctor 批次抓取時，每個 worker thread 進入後先隨機 sleep 0-400ms，
+    # 把 HTTP requests 岔開。理由：
+    #   1. partition_doctors_for_refresh_batches 同 batch 內所有 future 幾乎同 ms
+    #      submit 給 bg_executor，沒 jitter 就會「burst hit」reg52.cgi → 醫院後端
+    #      偶發 500 error / connect timeout 機率提高
+    #   2. 即使本機沒被擋下，跟其他電腦的主程式（也在同 batch 抓掛號）撞同 t0
+    #      的機率也下降
+    # 0-400ms 範圍：對使用者觀感無感（總刷新時間從 ~2s 變 ~2.4s），但 burst 大幅
+    # 緩解 (n=8 doctor → 平均間隔 50ms)。靈感 thomas-chu123/medical_tracker。
+    import random as _r
+    time.sleep(_r.uniform(0, 0.4))
+
     session = _get_thread_local_reg52_session()
     doctor_name = doctor_config["name"]
     doc_no = str(doctor_config["doc_no"])
