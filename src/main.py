@@ -4659,64 +4659,18 @@ def fetch_duty_vs(ui_queue: "Queue[UiMessage]", session: requests.Session, vs_ty
         put_ui_message(ui_queue, UiTodayVsMessage(doctor_name=doctor_name))
 
 # --- 門診動態 reg64.cgi TimeCode（與 appointment.cmuh.org.tw/cgi-bin/reg64.cgi 參數一致）---
-def reg64_time_code_from_local_clock(when=None) -> str:
-    """依本機時鐘：00:00–13:29→1，13:30–17:59→2，18:00–23:59→3。"""
-    if when is None:
-        when = datetime.now()
-    cur = when.time()
-    if cur <= dt_time(13, 29, 59):
-        return "1"
-    if cur <= dt_time(17, 59, 59):
-        return "2"
-    return "3"
-
-
-def reg64_slot_cn(time_code: str) -> str:
-    """TimeCode → 早上／下午／晚上（與門診統計 session 用語一致）。"""
-    return {"1": "早上", "2": "下午", "3": "晚上"}.get(str(time_code), "")
-
-
-def reg64_slot_label_color(time_code: str) -> str:
-    """診間代號後方時段字色：早綠、午藍、晚深藍。"""
-    return {"1": "#2E7D32", "2": "#1565C0", "3": "#0D47A1"}.get(str(time_code), "#78909C")
-
-
-# 門診動態「顯示時段」選項（UI 僅中文，不顯示 Code 數字）
-CLINIC_DISPLAY_MODE_OPTIONS = (
-    ("auto", "自動（依電腦時間）"),
-    ("1", "早上"),
-    ("2", "下午"),
-    ("3", "晚上"),
+# 【重構 2026-05-21】reg64 / clinic display mode 函式 + CLINIC_DISPLAY_MODE_OPTIONS
+# 抽到 cmuh_common.reg64_utils（與 scheduler.py 共用）
+from cmuh_common.reg64_utils import (  # noqa: E402
+    reg64_time_code_from_local_clock,
+    reg64_slot_cn,
+    reg64_slot_label_color,
+    CLINIC_DISPLAY_MODE_OPTIONS,
+    _normalize_clinic_display_mode,
+    _clinic_display_mode_label,
+    _clinic_display_mode_from_label,
+    resolve_clinic_reg64_time_code,
 )
-
-
-def _normalize_clinic_display_mode(val) -> str:
-    v = str(val).strip().lower() if val is not None else "auto"
-    if v in ("1", "2", "3", "auto"):
-        return v
-    return "auto"
-
-
-def _clinic_display_mode_label(mode_key: str) -> str:
-    for k, lab in CLINIC_DISPLAY_MODE_OPTIONS:
-        if k == mode_key:
-            return lab
-    return CLINIC_DISPLAY_MODE_OPTIONS[0][1]
-
-
-def _clinic_display_mode_from_label(label: str) -> str:
-    for k, lab in CLINIC_DISPLAY_MODE_OPTIONS:
-        if lab == label:
-            return k
-    return "auto"
-
-
-def resolve_clinic_reg64_time_code(mode: str, when=None) -> str:
-    """自動 → 依本機時鐘；早上/下午/晚上 → 固定對應 reg64 TimeCode。"""
-    m = _normalize_clinic_display_mode(mode)
-    if m in ("1", "2", "3"):
-        return m
-    return reg64_time_code_from_local_clock(when)
 
 
 # 門診動態燈號／候診輪詢間隔（秒）；實際間距 60-90 秒隨機，00:00-08:00 完全靜默
@@ -4819,8 +4773,7 @@ def _prev_session_cn(session_cn: str):
     return None
 
 
-def _reg64_tc_to_session_cn(time_code: str) -> str:
-    return {"1": "上午", "2": "下午", "3": "晚上"}.get(str(time_code), "")
+from cmuh_common.reg64_utils import _reg64_tc_to_session_cn  # noqa: E402
 
 
 def _canonical_clinic_session_str(s) -> str:
