@@ -258,12 +258,9 @@ class _ConnPoolFullAggregator(logging.Filter):
             return False  # swallow 重複的
 
 
-try:
-    import threading as _threading_for_filter  # noqa: F401  (確保 threading 可用)
-    _cp_filter = _ConnPoolFullAggregator()
-    logging.getLogger("urllib3.connectionpool").addFilter(_cp_filter)
-except Exception:
-    pass
+# 【清理 2026-05-21】threading 已在檔首 import；try/except 是死分支
+_cp_filter = _ConnPoolFullAggregator()
+logging.getLogger("urllib3.connectionpool").addFilter(_cp_filter)
 
 try:
     # 嘗試匯入外部函式庫 (只保留輕量級與必要的)

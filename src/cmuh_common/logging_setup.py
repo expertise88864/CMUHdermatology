@@ -33,14 +33,11 @@ def setup_logging(
     注意：本函式只 basicConfig 一次；多次呼叫第二次會被忽略。
     .pyw 無 console，因此不附加 StreamHandler。
     """
-    try:
-        handler = RotatingFileHandler(
-            log_file, maxBytes=max_bytes, backupCount=backup_count,
-            encoding='utf-8', delay=True,
-        )
-    except TypeError:
-        handler = RotatingFileHandler(
-            log_file, maxBytes=max_bytes, backupCount=backup_count, encoding='utf-8')
+    # 【清理 2026-05-21】delay 參數自 Python 3.9 已存在（README 要 Py 3.10+），TypeError fallback 死分支
+    handler = RotatingFileHandler(
+        log_file, maxBytes=max_bytes, backupCount=backup_count,
+        encoding='utf-8', delay=True,
+    )
     logging.basicConfig(level=level, format=fmt, handlers=[handler])
     return handler
 
