@@ -6789,8 +6789,10 @@ class AutomationApp:
                 except Exception as e:
                     logging.error(f"Error in auto reboot check: {e}")
 
-                time.sleep(1)
-        
+                # 【穩定性 2026-05-21】stop_event.wait 取代 time.sleep — shutdown 立即返回
+                if stop_event_main.wait(1.0):
+                    break
+
         self.bg_executor.submit(run_schedule)
         self.run_hotkey_guardian()
 

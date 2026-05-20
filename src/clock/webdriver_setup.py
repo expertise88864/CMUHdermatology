@@ -136,8 +136,25 @@ def build_chrome_options(headless: bool = True):
     return opts
 
 
+def _invalidate_chromedriver_cache() -> None:
+    """【穩定性 2026-05-21】清掉記憶體 + 磁碟快取。
+    用於 webdriver.Chrome() 失敗時（例：AV 隔離了 chromedriver.exe），
+    下次 get_chromedriver_path() 會走 ChromeDriverManager 重抓最新版。"""
+    global _memory_cache
+    with _path_cache_lock:
+        _memory_cache = None
+        try:
+            if _path_cache_file.exists():
+                _path_cache_file.unlink()
+        except Exception:
+            logging.debug("刪 chromedriver 磁碟快取失敗", exc_info=True)
+
+
 def initialize_driver(headless: bool = True):
-    """初始化 selenium Chrome WebDriver。失敗回 None（呼叫端自行處理）。"""
+    """初始化 selenium Chrome WebDriver。失敗回 None（呼叫端自行處理）。
+
+    【穩定性 2026-05-21】失敗時清快取，避免 AV 隔離 chromedriver 後永久 fail。
+    """
     try:
         from selenium import webdriver  # type: ignore[import-not-found]
         from selenium.webdriver.chrome.service import Service  # type: ignore[import-not-found]
@@ -149,4 +166,5 @@ def initialize_driver(headless: bool = True):
         )
     except Exception as e:
         logging.exception("初始化 WebDriver 失敗: %s", e)
+        _invalidate_chromedriver_cache()
         return None

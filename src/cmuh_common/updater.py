@@ -39,6 +39,11 @@ RELEASE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 UPDATE_TIMEOUT = 15
 MANIFEST_TIMEOUT = 8
 
+# 【穩定性 2026-05-21】SHA256 mismatch backoff：CDN 拿到舊版時，本機記憶體
+# 標記該 key 在 N 秒內不再重抓，避免每次 check 都死循環打 GitHub。
+_SHA_MISMATCH_BACKOFF_SEC = 3600  # 1 小時
+_sha_mismatch_until: dict = {}    # key -> next allowed timestamp
+
 
 @dataclass
 class UpdateResult:
@@ -53,8 +58,9 @@ class UpdateResult:
 
 
 def _fetch_manifest(timeout: float = MANIFEST_TIMEOUT) -> dict:
-    """取 manifest.json，加 cache-buster。"""
-    url = f"{MANIFEST_URL}?t={int(time.time())}"
+    """取 manifest.json，加 cache-buster（每小時換一次，享受 GitHub CDN edge cache）。"""
+    # 【效能 2026-05-21】每小時 bucket：同一小時內所有人共用 CDN cache（省 100-300ms）
+    url = f"{MANIFEST_URL}?t={int(time.time() // 3600)}"
     resp = requests.get(url, timeout=timeout)
     resp.raise_for_status()
     resp.encoding = 'utf-8'
@@ -112,6 +118,13 @@ def _download_one(file_entry: dict, app_dir: str) -> Optional[tuple]:
         if local_sha == expected_sha:
             return None
 
+    # 【穩定性 2026-05-21】SHA mismatch backoff：先前該 key hash 對不上，且還在 backoff 中 → skip
+    now_ts = time.time()
+    until = _sha_mismatch_until.get(key, 0.0)
+    if now_ts < until:
+        logging.debug("[%s] SHA mismatch backoff 中（剩 %.0fs），跳過", key, until - now_ts)
+        return None
+
     local_ver = _read_local_version(local_path)
 
     # 版本比對（仍保留作為次要判斷；若本地檔含 CURRENT_VERSION 字樣才有意義）
@@ -122,7 +135,8 @@ def _download_one(file_entry: dict, app_dir: str) -> Optional[tuple]:
         else:
             return None
 
-    url = f"{RAW_BASE}/{remote_path}?t={int(time.time())}"
+    # cache-buster 也改每小時，享受 CDN
+    url = f"{RAW_BASE}/{remote_path}?t={int(time.time() // 3600)}"
     logging.info("  [%s] 偵測到新版（v%s -> v%s），下載中...", key, local_ver, expected_version)
 
     resp = requests.get(url, timeout=UPDATE_TIMEOUT)
@@ -134,7 +148,12 @@ def _download_one(file_entry: dict, app_dir: str) -> Optional[tuple]:
     if expected_sha:
         actual_sha = _sha256_text(content)
         if actual_sha != expected_sha:
-            raise ValueError(f"[{key}] SHA256 不符（預期 {expected_sha[:12]}.. 實際 {actual_sha[:12]}..）")
+            # 【穩定性 2026-05-21】記下 backoff，避免下次 check 又重抓爛 CDN
+            _sha_mismatch_until[key] = now_ts + _SHA_MISMATCH_BACKOFF_SEC
+            raise ValueError(
+                f"[{key}] SHA256 不符（預期 {expected_sha[:12]}.. 實際 {actual_sha[:12]}..）"
+                f" — 暫停 1 小時"
+            )
 
     # 雙重驗證：檔案內 CURRENT_VERSION 必須符合 manifest（避免 raw cache 拿到舊版）
     m = re.search(r'CURRENT_VERSION\s*=\s*["\']([\d.]+)["\']', content)

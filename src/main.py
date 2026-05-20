@@ -5067,13 +5067,20 @@ class AutomationApp:
                 self.bg_executor.shutdown(wait=False, cancel_futures=True)
             except TypeError:
                 self.bg_executor.shutdown(wait=False)
+        # 【穩定性 2026-05-21】不要呼叫 session.close()，會等所有未完成 request；
+        # 卡 read 就 hang 0.5-2s。改 clear poolmanager 強制斷所有連線、立刻返回。
         for _attr in ('duty_session', 'session'):
             session = getattr(self, _attr, None)
-            if session is not None:
-                try:
-                    session.close()
-                except Exception as e:
-                    logging.warning(f"Failed to close requests session ({_attr}): {e}")
+            if session is None:
+                continue
+            try:
+                for adapter in session.adapters.values():
+                    try:
+                        adapter.poolmanager.clear()
+                    except Exception:
+                        pass
+            except Exception as e:
+                logging.warning(f"Failed to clear requests session pool ({_attr}): {e}")
 
         # [O21 v3] 同步 (而非 background) taskkill chromedriver/chrome：
         # 用 psutil 直接 SIGKILL 比 selenium driver.quit() 快 10x。同步跑是因為
@@ -10052,8 +10059,10 @@ class AutomationApp:
                 except Exception as e:
                     logging.error(f"Error in auto reboot check: {e}")
 
-                time.sleep(1)
-        
+                # 【穩定性 2026-05-21】stop_event.wait 取代 time.sleep — shutdown 立即返回
+                if stop_event_main.wait(1.0):
+                    break
+
         self.bg_executor.submit(run_schedule)
         self.run_hotkey_guardian()
 

@@ -107,7 +107,7 @@ running.set()
 background_thread: threading.Thread | None = None
 tray_icon_object = None
 log_queue: queue.Queue = queue.Queue(maxsize=5000)
-clock_lock = threading.Lock()
+clock_lock = threading.RLock()  # 【穩定性 2026-05-21】RLock 避免 janitor 與 process_clock_task 重入時 deadlock
 
 # =============================================================================
 # [autoclock 常駐 Chrome 池]
