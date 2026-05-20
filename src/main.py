@@ -34,6 +34,13 @@ from cmuh_common.ui_messages import (
 )
 from cmuh_common.deps_runtime import ensure_dependencies as _ensure_deps_runtime
 from cmuh_common.single_instance import ensure_single_instance, release_single_instance
+# 【重構 2026-05-21】熱鍵座標縮放（原本 main.py 用 _scaled_xy 卻沒定義 — 潛在 NameError）
+from cmuh_common.hotkey_scaling import (  # noqa: E402
+    HOTKEY_SUPPORTED_RESOLUTIONS,
+    HOTKEY_ADAPTIVE_STATE,
+    configure_hotkey_scaling,
+    _scaled_xy,
+)
 
 # === 依賴清單（與原檔一致；指紋由 deps_runtime 處理）===
 REQUIRED_LIBS = [
@@ -844,16 +851,9 @@ LOCATORS = {
     "login_error_message": ("id", 'lblErrorMessage'), 
 }
 
-def roc_to_gregorian_year(roc_year_str):
-    try: return int(roc_year_str) + 1911
-    except (ValueError, TypeError): return None
-
-def parse_roc_date_str(roc_date_str):
-    if not roc_date_str or len(roc_date_str) != 7: return None
-    try:
-        greg_year = roc_to_gregorian_year(roc_date_str[:3])
-        return date(greg_year, int(roc_date_str[3:5]), int(roc_date_str[5:7])) if greg_year else None
-    except Exception: return None
+# 【重構 2026-05-21】roc_to_gregorian_year / parse_roc_date_str 三支入口共用版抽到
+# cmuh_common.date_utils（main/scheduler/autoclock 原本各有一份功能相同但寫法略異）
+from cmuh_common.date_utils import roc_to_gregorian_year, parse_roc_date_str  # noqa: E402
 
 def _initialize_status_driver():
     logging.info("Initializing headless WebDriver for status check...")

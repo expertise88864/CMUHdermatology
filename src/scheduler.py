@@ -299,46 +299,14 @@ def partition_doctors_for_refresh_batches(doctors):
     b3 = [d for d in doctors if d.get("name") not in fixed]
     return [batch for batch in (b1, b2, b3) if batch]
 
-HOTKEY_SUPPORTED_RESOLUTIONS = ((1920, 1080), (1280, 1024), (1024, 768))
-_HOTKEY_BASE_SIZE = {
-    "1920x1080": (1920, 1080),
-    "1280x1024": (1280, 1024),
-    "1024x768": (1024, 768),
-}
-HOTKEY_ADAPTIVE_STATE = {
-    "enabled": False,
-    "base_version": None,
-    "base_size": (0, 0),
-    "target_size": (0, 0),
-    "scale_x": 1.0,
-    "scale_y": 1.0,
-}
-
-def configure_hotkey_scaling(enabled, base_version=None, target_size=None):
-    HOTKEY_ADAPTIVE_STATE["enabled"] = bool(enabled)
-    HOTKEY_ADAPTIVE_STATE["base_version"] = base_version
-    if not enabled or base_version not in _HOTKEY_BASE_SIZE or not target_size:
-        HOTKEY_ADAPTIVE_STATE["base_size"] = (0, 0)
-        HOTKEY_ADAPTIVE_STATE["target_size"] = (0, 0)
-        HOTKEY_ADAPTIVE_STATE["scale_x"] = 1.0
-        HOTKEY_ADAPTIVE_STATE["scale_y"] = 1.0
-        return
-    base_w, base_h = _HOTKEY_BASE_SIZE[base_version]
-    target_w, target_h = int(target_size[0]), int(target_size[1])
-    HOTKEY_ADAPTIVE_STATE["base_size"] = (base_w, base_h)
-    HOTKEY_ADAPTIVE_STATE["target_size"] = (target_w, target_h)
-    HOTKEY_ADAPTIVE_STATE["scale_x"] = target_w / float(base_w)
-    HOTKEY_ADAPTIVE_STATE["scale_y"] = target_h / float(base_h)
-
-def _scaled_xy(x, y, base_version_hint=None):
-    state = HOTKEY_ADAPTIVE_STATE
-    if not state["enabled"]:
-        return int(x), int(y)
-    if base_version_hint and state.get("base_version") not in (None, base_version_hint):
-        return int(x), int(y)
-    sx = state.get("scale_x", 1.0)
-    sy = state.get("scale_y", 1.0)
-    return int(round(x * sx)), int(round(y * sy))
+# 【重構 2026-05-21】抽到 cmuh_common.hotkey_scaling（main.py 也 import 同一份；
+# 原本 main.py 用 _scaled_xy 卻沒定義是 dangling reference / 潛在 NameError）
+from cmuh_common.hotkey_scaling import (  # noqa: E402
+    HOTKEY_SUPPORTED_RESOLUTIONS,
+    HOTKEY_ADAPTIVE_STATE,
+    configure_hotkey_scaling,
+    _scaled_xy,
+)
 
 # --- 4. 全域執行緒控制事件 ---
 stop_event_automation = threading.Event()
@@ -457,7 +425,8 @@ def _get_thread_local_duty_session():
     s = getattr(_duty_tls, "session", None)
     if s is None:
         s = requests.Session()
-        rtry = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+        # 【效能 2026-05-21】retry total 2→1，與 main.py 對齊（P1.4）
+        rtry = Retry(total=1, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
         s.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=rtry))
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
@@ -590,16 +559,8 @@ LOCATORS = {
     "login_error_message": ("id", 'lblErrorMessage'), 
 }
 
-def roc_to_gregorian_year(roc_year_str):
-    try: return int(roc_year_str) + 1911
-    except (ValueError, TypeError): return None
-
-def parse_roc_date_str(roc_date_str):
-    if not roc_date_str or len(roc_date_str) != 7: return None
-    try:
-        greg_year = roc_to_gregorian_year(roc_date_str[:3])
-        return date(greg_year, int(roc_date_str[3:5]), int(roc_date_str[5:7])) if greg_year else None
-    except Exception: return None
+# 【重構 2026-05-21】抽到 cmuh_common.date_utils（與 main/autoclock 共用）
+from cmuh_common.date_utils import roc_to_gregorian_year, parse_roc_date_str  # noqa: E402
 
 def _initialize_status_driver():
     logging.info("Initializing headless WebDriver for status check...")
@@ -2534,7 +2495,8 @@ def load_master_schedule_in_background(ui_queue: "Queue[UiMessage]"):
     put_ui_message(ui_queue, UiMasterScheduleMessage(schedule=schedule))
 
 # --- 8. 值班醫師查詢 ---
-_DUTY_HTTP_TIMEOUT = 40
+# 【效能 2026-05-21】duty timeout 從 40 降為 (connect=3, read=8)，與 main.py 對齊（P1.4）
+_DUTY_HTTP_TIMEOUT = (3, 8)
 
 def _perform_duty_query(session, roc_date_str):
     """forward01 值班查詢（GET 表單 + POST）。專用 session + 重試，避免與掛號搶鎖或單次逾時即失敗。"""

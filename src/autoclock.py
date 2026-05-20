@@ -264,25 +264,8 @@ def exponential_backoff_sleep(attempt_zero_based: int, *,
     time_module.sleep(raw + jitter)
 
 
-def roc_to_gregorian_year(roc_year_str: str):
-    try:
-        y = int(roc_year_str)
-        return y + 1911 if y > 0 else None
-    except (ValueError, TypeError):
-        return None
-
-
-def parse_roc_date_str(roc_date_str: str):
-    try:
-        if len(roc_date_str) != 7:
-            return None
-        y, m, d = int(roc_date_str[:3]), int(roc_date_str[3:5]), int(roc_date_str[5:7])
-        gy = roc_to_gregorian_year(str(y))
-        if gy is None:
-            return None
-        return date(gy, m, d)
-    except (ValueError, TypeError):
-        return None
+# 【重構 2026-05-21】抽到 cmuh_common.date_utils（與 main/scheduler 共用）
+from cmuh_common.date_utils import roc_to_gregorian_year, parse_roc_date_str  # noqa: E402
 
 
 def save_debug_artifacts(driver, filename_prefix: str, error_hint: str = "") -> list:
