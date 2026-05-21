@@ -2691,53 +2691,199 @@ def _send_message_timeout(hwnd: int, msg: int, wparam: int, lparam: int,
     return result.value
 
 
-def _switch_tab_by_text(or_hwnd: int, tab_text: str) -> bool:
-    """切到指定 text 的 TTabSheet。
+# Kernel32 argtypes 顯式設定 — 64-bit Python ctypes 預設把指標當 c_int (4 bytes)
+# 會截斷高位址，VirtualFreeEx 拿錯 address → 漏 4KB。設成 c_void_p (8 bytes) 才對。
+_kernel32 = ctypes.windll.kernel32
+try:
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.VirtualAllocEx.argtypes = [wintypes.HANDLE, wintypes.LPVOID,
+                                          ctypes.c_size_t, wintypes.DWORD,
+                                          wintypes.DWORD]
+    _kernel32.VirtualAllocEx.restype = wintypes.LPVOID
+    _kernel32.VirtualFreeEx.argtypes = [wintypes.HANDLE, wintypes.LPVOID,
+                                         ctypes.c_size_t, wintypes.DWORD]
+    _kernel32.VirtualFreeEx.restype = wintypes.BOOL
+    _kernel32.ReadProcessMemory.argtypes = [wintypes.HANDLE, wintypes.LPVOID,
+                                              wintypes.LPVOID, ctypes.c_size_t,
+                                              ctypes.POINTER(ctypes.c_size_t)]
+    _kernel32.ReadProcessMemory.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+except Exception:
+    logging.debug("kernel32 argtypes 設定失敗", exc_info=True)
 
-    策略 (2026-05-18 修)：
-      1. 找『有 手術/手術及治療/檢查 三個直系 tab』的 TPageControl
-      2. 算出目標 tab 的 index
-      3. 【不用 TCM_GETITEMRECT】— 該訊息要求 RECT buffer 在目標行程位址
-         空間，cross-process SendMessage 會 hang 死。改用估算 client 位置
-         click：
-           tab 0 (手術)         client_x ≈ 30
-           tab 1 (手術及治療)    client_x ≈ 105
-           tab 2 (檢查)         client_x ≈ 195
-         tab header y ≈ 12（Delphi 預設 tab 高度 21）
-         位置算錯也沒關係——後面有 TCM_SETCURSEL+SETCURFOCUS 雙保險
-      4. 所有 SendMessage 都加 2 秒 timeout 避免再 hang
+
+def _get_tab_item_rect_cross_process(tab_hwnd: int, item_index: int):
+    """[2026-05-22 任務 B] Cross-process TCM_GETITEMRECT — 抓 tab N 的精準
+    client rect。回傳 (left, top, right, bottom) 或 None。
+
+    TCM_GETITEMRECT 的 lParam 是「目標 process 位址空間」的 RECT pointer。
+    本 process 直接傳本地 pointer 會段錯誤。正規做法：
+      1. OpenProcess (VM_OPERATION|VM_READ|VM_WRITE)
+      2. VirtualAllocEx 在目標 process 配 16 bytes (RECT)
+      3. SendMessageTimeoutW 用 remote_addr 當 lParam (帶 timeout 防 hang)
+      4. ReadProcessMemory 從 remote 讀 RECT 回本地
+      5. VirtualFreeEx + CloseHandle
+
+    任一步失敗 → None，呼叫端 fallback 估算座標。
+
+    為何要這個：估算座標 (105, 12) 在不同 DPI / 字體 / Delphi 設計下會落空，
+    特別是 1920x1080。精準 rect 才能保證 click 落在正確 tab header。
     """
-    EXPECTED_TABS = ["手術", "手術及治療", "檢查"]
-    pc = _find_page_control_by_tab_set(or_hwnd, EXPECTED_TABS)
+    PROCESS_VM_OPERATION = 0x0008
+    PROCESS_VM_READ = 0x0010
+    PROCESS_VM_WRITE = 0x0020
+    MEM_COMMIT = 0x1000
+    MEM_RELEASE = 0x8000
+    PAGE_READWRITE = 0x04
+    TCM_GETITEMRECT = 0x130A
+
+    pid = wintypes.DWORD()
+    try:
+        ctypes.windll.user32.GetWindowThreadProcessId(
+            tab_hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return None
+        process = _kernel32.OpenProcess(
+            PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
+            False, pid.value)
+        if not process:
+            return None
+        remote_addr = None
+        try:
+            rect_size = ctypes.sizeof(wintypes.RECT)
+            remote_addr = _kernel32.VirtualAllocEx(
+                process, None, rect_size, MEM_COMMIT, PAGE_READWRITE)
+            if not remote_addr:
+                return None
+            # 用 timeout 版避免 cross-process call hang
+            result = ctypes.c_long(0)
+            SMTO_ABORTIFHUNG = 0x0002
+            ret = ctypes.windll.user32.SendMessageTimeoutW(
+                tab_hwnd, TCM_GETITEMRECT, item_index, remote_addr,
+                SMTO_ABORTIFHUNG, 1500, ctypes.byref(result))
+            if ret == 0 or not result.value:
+                return None
+            local_rect = wintypes.RECT()
+            bytes_read = ctypes.c_size_t()
+            ok = _kernel32.ReadProcessMemory(
+                process, remote_addr, ctypes.byref(local_rect),
+                rect_size, ctypes.byref(bytes_read))
+            if not ok:
+                return None
+            return (local_rect.left, local_rect.top,
+                     local_rect.right, local_rect.bottom)
+        finally:
+            if remote_addr:
+                try:
+                    _kernel32.VirtualFreeEx(process, remote_addr, 0, MEM_RELEASE)
+                except Exception:
+                    pass
+            try:
+                _kernel32.CloseHandle(process)
+            except Exception:
+                pass
+    except Exception:
+        logging.debug("_get_tab_item_rect_cross_process 例外", exc_info=True)
+        return None
+
+
+def _switch_tab_by_text(or_hwnd: int, tab_text: str) -> tuple[bool, int]:
+    """切到指定 text 的 TTabSheet。回傳 (success, target_sheet_hwnd)。
+
+    [2026-05-22 任務 B 重寫]
+    解決原本 1920x1080 / 部分 1280x1024 情境下 click 落在錯誤 tab 的問題。
+
+    關鍵設計：
+      1. target_idx 用「顯示順序」(TAB_DISPLAY_ORDER list 的 index)，**不是**
+         sheets array 的 index — `_enum_direct_children` 用 GetWindow(GW_HWNDNEXT)
+         返回 Z-order 順序，跟 TabCtrl 內部 idx 不同步 (Delphi VCL TPageControl
+         ActivePage 通常 Z-order 最上 → sheets[0] = ActivePage)
+      2. target_sheet (回傳給 caller scope radio search) 用 text **比對**從
+         sheets 找出對應 hwnd — 不依賴 array index
+      3. Click 位置用 cross-process TCM_GETITEMRECT 拿精準 rect (不靠估算座標)
+         失敗才 fallback 估算
+      4. 驗證用 TCM_GETCURSEL (TabCtrl 標準訊息，回真實 active idx) 而非
+         IsWindowVisible(sheets[i]) (前者跟 target_idx 同個 idx space)
+      5. 不對 retry 1 次
+
+    回傳 (True, target_sheet_hwnd) 即使視覺切換失敗 — caller 仍可用
+    target_sheet 做 scope radio search，即使 ActivePage 沒對齊也能點對 radio。
+    """
+    TAB_DISPLAY_ORDER = ["手術", "手術及治療", "檢查"]
+    pc = _find_page_control_by_tab_set(or_hwnd, TAB_DISPLAY_ORDER)
     if not pc:
         logging.warning("_switch_tab: 找不到 包含 3 個 tab 的 PageControl")
-        return False
+        return False, 0
     sheets = _enum_direct_children(pc, "TTabSheet")
-    target_idx = -1
-    for i, s in enumerate(sheets):
-        if _get_window_text(s) == tab_text:
-            target_idx = i
-            break
-    if target_idx < 0:
-        logging.warning("_switch_tab: PageControl 內找不到 text='%s' 的 tab", tab_text)
-        return False
-    logging.info("_switch_tab: pc=%s target_idx=%d (tab=%s)", pc, target_idx, tab_text)
+    # target_sheet: 用 text 比對找 hwnd (給 caller scope)
+    target_sheet = 0
+    for s in sheets:
+        try:
+            if _get_window_text(s) == tab_text:
+                target_sheet = s
+                break
+        except Exception:
+            continue
+    if not target_sheet:
+        logging.warning("_switch_tab: PageControl 內找不到 text='%s' 的 sheet", tab_text)
+        return False, 0
+    # target_idx: 顯示位置 (= TabCtrl 內部 idx)
+    try:
+        target_idx = TAB_DISPLAY_ORDER.index(tab_text)
+    except ValueError:
+        logging.warning("_switch_tab: tab_text='%s' 不在 TAB_DISPLAY_ORDER", tab_text)
+        return False, 0
+    logging.info("_switch_tab: pc=%s 顯示位置 idx=%d (tab=%s) target_sheet=%s",
+                  pc, target_idx, tab_text, target_sheet)
 
-    # Approach 1: PostMessage WM_LBUTTONDOWN/UP 到 PageControl 的 tab header
-    # 內部 client 位置（不動實體滑鼠，比 pyautogui.click 不會閃）
-    # Delphi TPageControl tab 高度 ~21px、上 padding 4px → y=12 為中心
-    est_x = {0: 30, 1: 105, 2: 195}.get(target_idx, 30 + target_idx * 75)
-    est_y = 12
-    logging.info("_switch_tab: post WM_LBUTTONDOWN to pc client=(%d,%d)",
-                  est_x, est_y)
-    _post_click_to_control(pc, client_x=est_x, client_y=est_y)
+    def _do_click():
+        item_rect = _get_tab_item_rect_cross_process(pc, target_idx)
+        if item_rect:
+            cx = (item_rect[0] + item_rect[2]) // 2
+            cy = (item_rect[1] + item_rect[3]) // 2
+            logging.info("_switch_tab: TCM_GETITEMRECT 精準 rect=%s 中心=(%d,%d)",
+                          item_rect, cx, cy)
+            _post_click_to_control(pc, client_x=cx, client_y=cy)
+            return cx, cy
+        # Fallback: 估算 (1280x1024 經驗值)
+        est_x = {0: 30, 1: 105, 2: 195}.get(target_idx, 30 + target_idx * 75)
+        est_y = 12
+        logging.info("_switch_tab: 估算 click client=(%d,%d) [fallback]",
+                      est_x, est_y)
+        _post_click_to_control(pc, client_x=est_x, client_y=est_y)
+        return est_x, est_y
 
-    # Approach 2 (雙保險): TCM_SETCURSEL + TCM_SETCURFOCUS，加 timeout
+    _do_click()
+
+    # 雙保險：TCM_SETCURSEL + TCM_SETCURFOCUS
     TCM_SETCURSEL = 0x130C
     TCM_SETCURFOCUS = 0x1330
+    TCM_GETCURSEL = 0x130B
     _send_message_timeout(pc, TCM_SETCURSEL, target_idx, 0, timeout_ms=1000)
     _send_message_timeout(pc, TCM_SETCURFOCUS, target_idx, 0, timeout_ms=1000)
-    return True
+
+    # 驗證：TCM_GETCURSEL 回的就是當前 active tab 內部 idx
+    time.sleep(0.1)
+    current_idx = _send_message_timeout(pc, TCM_GETCURSEL, 0, 0, timeout_ms=1000)
+    if current_idx != target_idx:
+        logging.warning("_switch_tab: TCM_GETCURSEL=%s != target=%s，retry 1 次",
+                         current_idx, target_idx)
+        _do_click()
+        _send_message_timeout(pc, TCM_SETCURSEL, target_idx, 0, timeout_ms=1000)
+        _send_message_timeout(pc, TCM_SETCURFOCUS, target_idx, 0, timeout_ms=1000)
+        time.sleep(0.15)
+        current_idx2 = _send_message_timeout(pc, TCM_GETCURSEL, 0, 0, timeout_ms=1000)
+        if current_idx2 != target_idx:
+            logging.warning("_switch_tab: retry 後 TCM_GETCURSEL=%s 仍 != %s — "
+                              "視覺切換失敗，但 target_sheet hwnd 仍可用於 caller scope",
+                              current_idx2, target_idx)
+        else:
+            logging.info("_switch_tab: retry 後 TCM_GETCURSEL 對齊 idx=%d", target_idx)
+    else:
+        logging.info("_switch_tab: TCM_GETCURSEL 已對齊 idx=%d", target_idx)
+    return True, target_sheet
 
 
 def _click_radio_by_text(parent_hwnd: int, text_keyword: str) -> bool:
@@ -3095,26 +3241,39 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
     time.sleep(0.3)  # 等視窗 paint 完成
     check_stop()
 
-    # Step 3: 切到「手術及治療」tab (用 TCM_SETCURFOCUS, 不靠 click)
-    if not _switch_tab_by_text(or_hwnd, "手術及治療"):
+    # Step 3: 切到「手術及治療」tab
+    tab_ok, target_sheet = _switch_tab_by_text(or_hwnd, "手術及治療")
+    if not tab_ok:
         logging.warning("[%s] 找不到/切換 手術及治療 tab 失敗", label)
         return False
-    logging.info("[%s] 已切到 手術及治療 tab (TCM_SETCURFOCUS)", label)
+    logging.info("[%s] 已切到 手術及治療 tab (sheet=%s)", label, target_sheet)
     time.sleep(0.5)   # 等 tab 切完 + radio 重繪
     check_stop()
 
     # Step 4: 點 form_code 對應的 radio (MO04 / MU02)
-    if not _click_radio_by_text(or_hwnd, form_code):
-        logging.warning("[%s] 找不到 radio (text 含 %s)", label, form_code)
-        return False
-    logging.info("[%s] 已選 radio %s", label, form_code)
+    # [2026-05-22 任務 B] scope 在 target_sheet 而非 or_hwnd — 確保 click 到
+    # 「手術及治療」分頁的 radio (即使視覺切換失敗也對)。F9 (MO04) 在「手術」
+    # tab 也有相似代號 radio，搜整個 or_hwnd 會抓到隱藏 tab 的同名 radio。
+    if not _click_radio_by_text(target_sheet, form_code):
+        logging.warning("[%s] target_sheet 下找不到 radio %s，fallback or_hwnd 全域搜",
+                         label, form_code)
+        if not _click_radio_by_text(or_hwnd, form_code):
+            logging.warning("[%s] or_hwnd 全域也找不到 radio %s", label, form_code)
+            return False
+        logging.warning("[%s] 已用 or_hwnd fallback 點到 %s — 可能誤點分頁",
+                         label, form_code)
+    else:
+        logging.info("[%s] 已選 radio %s (scope=target_sheet)", label, form_code)
     time.sleep(0.2)
     check_stop()
 
     # Step 5: 點 同意書視窗的 開立電子 按鈕
-    if not _click_button_by_text(or_hwnd, "開立電子"):
-        logging.warning("[%s] 找不到 開立電子 按鈕", label)
-        return False
+    # 先試 target_sheet (若按鈕在分頁內)，找不到再用 or_hwnd (按鈕通常在
+    # TOrMain 底層 panel 不在 tab 頁內)
+    if not _click_button_by_text(target_sheet, "開立電子"):
+        if not _click_button_by_text(or_hwnd, "開立電子"):
+            logging.warning("[%s] 找不到 開立電子 按鈕", label)
+            return False
     logging.info("[%s] 已點 開立電子，等 popup 跳出", label)
 
     # Step 6 (Round 2): 等 popup (Tfm_agree) 出現
