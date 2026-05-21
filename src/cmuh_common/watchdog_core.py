@@ -40,7 +40,11 @@ LOCK_DIR = SETTINGS_DIR / ".watchdog_locks"
 # 【required_config_file】v4 新增：本機沒這檔 → 不啟動 (per-machine opt-in)
 # 打卡 / 會診查詢 全皮膚科只需「一台」電腦執行，靠對應 config 檔存在與否
 # 自動判斷本機是否該跑。沒設定過該功能的電腦不會被打擾。
-CONFIG_SCHEMA_VERSION = 5
+#
+# 【mutex_name】v6 新增 (2026-05-22)：當 psutil 抓不到 admin process 的 cmdline
+# (Windows 偶發 access denied) 時，用 named mutex 偵測該程式是否還活著。
+# 沒這個的話 watchdog 會每 30s 啟新 instance → 撞 mutex 跳「已在執行中」對話框。
+CONFIG_SCHEMA_VERSION = 6
 
 DEFAULT_CONFIG = {
     "schema_version": CONFIG_SCHEMA_VERSION,
@@ -57,6 +61,7 @@ DEFAULT_CONFIG = {
             "log_path": "settings/consult_query.log",
             "pyw": "中國醫皮膚科會診查詢程式.pyw",
             "process_match": "中國醫皮膚科會診查詢程式",
+            "mutex_name": "Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1",
             "max_stale_sec": 180,  # 新版每 60s 一定有 heartbeat
             "enabled": True,
             "outer_only": False,
@@ -67,7 +72,8 @@ DEFAULT_CONFIG = {
             "log_path": "settings/autoclock.log",
             "pyw": "中國醫皮膚科打卡程式.pyw",
             "process_match": "中國醫皮膚科打卡程式",
-            "max_stale_sec": 0,    # 打卡 idle 沒 log，只看 process
+            "mutex_name": "Local\\CMUH_Skin_AutoClock_SingleInstance_v1",
+            "max_stale_sec": 0,    # 打卡 idle 沒 log，只看 process / mutex
             "enabled": True,
             "outer_only": False,
             "required_config_file": "settings/autoclock_config.json",
@@ -77,6 +83,7 @@ DEFAULT_CONFIG = {
             "log_path": "automation_ui.log",
             "pyw": "中國醫皮膚科主程式.pyw",
             "process_match": "中國醫皮膚科主程式",
+            "mutex_name": "Local\\CMUH_Skin_Main_SingleInstance_v1",
             "max_stale_sec": 0,
             # 【v3 預設關閉】主程式有 GUI，崩潰使用者立刻看到 (熱鍵失效)，
             # 不需要自動重啟。且外層 C 若誤判沒在跑就 Popen，子程式 single_instance
@@ -105,6 +112,14 @@ _V3_TO_V4_REQUIRED_CONFIG = {
     "會診查詢": "settings/consult_query_config.json",
     "打卡": "settings/autoclock_config.json",
     "主程式": "",
+}
+
+# v5 → v6 (2026-05-22)：補 mutex_name 欄位 — admin process 長 uptime 後 psutil
+# 偶發拿不到 cmdline，watchdog 改用 mutex 偵測 fallback 才不會誤判要重啟。
+_V5_TO_V6_MUTEX_NAME = {
+    "會診查詢": "Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1",
+    "打卡": "Local\\CMUH_Skin_AutoClock_SingleInstance_v1",
+    "主程式": "Local\\CMUH_Skin_Main_SingleInstance_v1",
 }
 
 # [D] Crash loop 偵測：per-program 啟動歷史 (timestamp list)
@@ -201,6 +216,13 @@ def _migrate_config(cfg: dict) -> tuple:
                 auto_default = True
                 break
         cfg.setdefault("master_enabled", auto_default)
+    # v5 → v6: 加 mutex_name 欄位 (psutil cmdline 不可靠時的可靠 fallback)
+    if cur_v < 6:
+        for prog in cfg.get("programs", []):
+            name = prog.get("name", "")
+            mutex = _V5_TO_V6_MUTEX_NAME.get(name, "")
+            if mutex:
+                prog.setdefault("mutex_name", mutex)
     cfg["schema_version"] = CONFIG_SCHEMA_VERSION
     return cfg, True
 
@@ -413,7 +435,21 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
 
     # Case 1: 沒找到 PID → 可能真的沒在跑 OR psutil 看不到 cmdline (Windows 偶發)
     if not pids:
-        # [穩定性] Fallback：log 還新鮮 → 程式幾乎肯定健在，psutil 找不到只是
+        # [v6 Fallback 1 — 最可靠 2026-05-22] Mutex 偵測。
+        # admin process 長 uptime 後 psutil 偶發抓不到 cmdline，但 named
+        # mutex 偵測完全跳過 cmdline。對打卡 (max_stale_sec=0 沒 log 新鮮度
+        # 可查) 而言這是唯一可靠的存活訊號 — 沒這個就會每 30s 啟新 instance
+        # → 撞 mutex 跳「已在執行中」對話框。
+        mutex_name = prog.get("mutex_name", "")
+        if mutex_name:
+            try:
+                from cmuh_common.single_instance import is_instance_running
+                if is_instance_running(mutex_name):
+                    return (f"~ {name}: psutil 找不到 PID 但 mutex 仍 hold "
+                            f"({mutex_name.rsplit(chr(92), 1)[-1]})，視為健在 [{mode}]")
+            except Exception:
+                logging.debug("[watchdog] mutex 偵測例外", exc_info=True)
+        # [Fallback 2] log 還新鮮 → 程式幾乎肯定健在，psutil 找不到只是
         # cmdline access 失敗。
         if log_path is not None and max_stale > 0 and log_path.exists():
             try:
