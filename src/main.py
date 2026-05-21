@@ -2864,25 +2864,49 @@ def _switch_tab_by_text(or_hwnd: int, tab_text: str) -> tuple[bool, int]:
     _send_message_timeout(pc, TCM_SETCURSEL, target_idx, 0, timeout_ms=1000)
     _send_message_timeout(pc, TCM_SETCURFOCUS, target_idx, 0, timeout_ms=1000)
 
-    # 驗證：TCM_GETCURSEL 回的就是當前 active tab 內部 idx
-    time.sleep(0.1)
-    current_idx = _send_message_timeout(pc, TCM_GETCURSEL, 0, 0, timeout_ms=1000)
-    if current_idx != target_idx:
-        logging.warning("_switch_tab: TCM_GETCURSEL=%s != target=%s，retry 1 次",
-                         current_idx, target_idx)
+    # [2026-05-22 修] 用「IsWindowVisible(target_sheet)」當 ground truth 驗證
+    # ActivePage 真的切換了 — 不只 TCM_GETCURSEL (tab strip 視覺) 對齊。
+    # 原因：Delphi VCL TPageControl 內 TabCtrl strip 跟 ActivePage 是兩件事，
+    # cross-process TCM_SETCURSEL 可能改了 tab strip 但 ActivePage 沒 swap
+    # → 下方 radio 區還在舊 tab → 開立電子 submit 錯誤 radio。
+    # IsWindowVisible(target_sheet) == True 才代表 page 真的切過去。
+    def _is_target_active() -> bool:
+        try:
+            cur = _send_message_timeout(pc, TCM_GETCURSEL, 0, 0, timeout_ms=500)
+            if cur != target_idx:
+                return False
+            return bool(ctypes.windll.user32.IsWindowVisible(target_sheet))
+        except Exception:
+            return False
+
+    # Poll up to 800ms (Delphi paint cycle 通常 < 300ms)
+    end_t = time.time() + 0.8
+    success = False
+    while time.time() < end_t:
+        if _is_target_active():
+            success = True
+            break
+        time.sleep(0.05)
+
+    if not success:
+        # 第一輪 click 沒讓 ActivePage 切過去 → retry 一次
+        logging.warning("_switch_tab: ActivePage 800ms 內沒切到 target_sheet，retry click")
         _do_click()
         _send_message_timeout(pc, TCM_SETCURSEL, target_idx, 0, timeout_ms=1000)
         _send_message_timeout(pc, TCM_SETCURFOCUS, target_idx, 0, timeout_ms=1000)
-        time.sleep(0.15)
-        current_idx2 = _send_message_timeout(pc, TCM_GETCURSEL, 0, 0, timeout_ms=1000)
-        if current_idx2 != target_idx:
-            logging.warning("_switch_tab: retry 後 TCM_GETCURSEL=%s 仍 != %s — "
-                              "視覺切換失敗，但 target_sheet hwnd 仍可用於 caller scope",
-                              current_idx2, target_idx)
-        else:
-            logging.info("_switch_tab: retry 後 TCM_GETCURSEL 對齊 idx=%d", target_idx)
+        end_t = time.time() + 0.8
+        while time.time() < end_t:
+            if _is_target_active():
+                success = True
+                break
+            time.sleep(0.05)
+
+    if success:
+        logging.info("_switch_tab: ActivePage 已切到 target_sheet (TCM_GETCURSEL + IsWindowVisible 都通過)")
     else:
-        logging.info("_switch_tab: TCM_GETCURSEL 已對齊 idx=%d", target_idx)
+        logging.warning("_switch_tab: ActivePage 切換失敗 — 視覺仍可能在錯 tab。"
+                          "caller 應該用 target_sheet scope radio click + 注意開立電子"
+                          "可能 submit 錯誤頁面的 radio")
     return True, target_sheet
 
 
@@ -5500,6 +5524,10 @@ class AutomationApp:
             'had_any_activity': False,
             'stable_since_ts': None,
             'last_monitor_pair': None,
+            # [2026-05-22] 記錄最後一次 completed/waiting 有變動的時刻 — 用來
+            # 推算「真實關診時間」(網頁 is_closed 後抓的是應診時間結束，常跟
+            # 實際關診時刻差 10-30 分鐘)。每次 is_closed 觸發時 prefer 這個。
+            'last_activity_ts': None,
         }
 
     def _load_clinic_dynamic_state_cache(self):
@@ -7494,12 +7522,17 @@ class AutomationApp:
                         tracker['doc_name'] = curr_doc
                         
                         current_completed_set = data.get('completed_set', set())
-                        current_waiting_set = data.get('waiting_set', set()) 
-                        
+                        current_waiting_set = data.get('waiting_set', set())
+
                         waiting_count_ui = _clinic_int_count(data.get('waiting'), 0)
                         completed_count_ui = _clinic_int_count(data.get('completed'), 0)
                         if completed_count_ui > 0 or waiting_count_ui > 0:
                             tracker['had_any_activity'] = True
+
+                        # [2026-05-22] 記 last_activity_ts — completed/waiting set 有變化才更新
+                        if (current_completed_set != tracker.get('last_completed_set', set())
+                                or current_waiting_set != tracker.get('last_waiting_set', set())):
+                            tracker['last_activity_ts'] = current_timestamp
 
                         if tracker['is_first_run']:
                             tracker['last_completed_set'] = current_completed_set
@@ -7598,7 +7631,27 @@ class AutomationApp:
                                             parsed_dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
                                         except Exception:
                                             parsed_dt = None
-                                    # 僅在能從網頁解析到關診時刻時記錄；否則維持 None，UI 顯示「已關診」不附時間
+                                    # [2026-05-22 修] 用 last_activity_ts 取代網頁抓的應診時間結束。
+                                    # 網頁 close_time 抓的是「應診時間：1700~2100」的 2100，
+                                    # 是預定關診時間 (= 排班結束)，不是醫師實際關診時刻。
+                                    # 若 tracker 有記到最後活動時間 (last completed/waiting 變化)，
+                                    # 那更貼近真實關診時刻 (= 最後一位病人完成 ± 數秒)。
+                                    activity_ts = tracker.get('last_activity_ts')
+                                    if activity_ts:
+                                        try:
+                                            activity_dt = datetime.fromtimestamp(activity_ts)
+                                            # 用兩者中較早的 (真實關診 < 排班結束 是常態)
+                                            if parsed_dt and activity_dt < parsed_dt:
+                                                logging.info(
+                                                    "[close_time] 採用 last_activity_ts=%s (網頁 close_time=%s 較晚)",
+                                                    activity_dt.strftime("%H:%M"),
+                                                    parsed_dt.strftime("%H:%M"))
+                                                parsed_dt = activity_dt
+                                            elif not parsed_dt:
+                                                parsed_dt = activity_dt
+                                        except Exception:
+                                            logging.debug("last_activity_ts 轉換失敗", exc_info=True)
+                                    # 僅在能解析到關診時刻時記錄；否則維持 None，UI 顯示「已關診」不附時間
                                     tracker['actual_closing_dt'] = parsed_dt
                             elif not skip_plateau and tracker.get('had_any_activity'):
                                 boundary = _session_boundary_datetime(curr_session_i, now)
@@ -10184,6 +10237,13 @@ class AutomationApp:
             schedule.every().day.at("08:00").do(
                 lambda: run_named_job("check-update-0800", lambda: self.bg_executor.submit(self.check_and_update, False))
             ).tag("update-check", "daily")
+            # [2026-05-22] 每小時也 check 一次更新，偵測到新版自動下載 + restart_self()。
+            # 流量：每小時 1 次 GitHub raw manifest.json fetch + 若有新版才下載檔案，
+            # 對 GitHub 公開 API 無壓力。原本只「啟動 + 每日 08:00」 → 中間時段
+            # push 新版 user 要手動重啟才能拉到，造成 v26→v27 user 沒拉到問題。
+            schedule.every(1).hours.do(
+                lambda: run_named_job("check-update-hourly", lambda: self.bg_executor.submit(self.check_and_update, False))
+            ).tag("update-check", "hourly")
 
             while not stop_event_main.is_set():
                 schedule.run_pending()
