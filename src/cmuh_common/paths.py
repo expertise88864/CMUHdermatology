@@ -90,14 +90,41 @@ def get_log_path(filename: str = 'app.log') -> str:
 def restart_self(extra_args=None) -> None:
     """雙軌重啟。
 
-    .pyw 模式：os.execv(python.exe, [python.exe, sys.argv[0], ...])
-    .exe 模式：os.execv(sys.executable, [sys.executable, ...])
+    .pyw 模式：subprocess.Popen(pythonw, sys.argv[0], ...) + sys.exit
+    .exe 模式：subprocess.Popen(sys.executable, ...) + sys.exit
+
+    [2026-05-22 v29] 從 os.execv 改 subprocess.Popen + sys.exit。
+    原因：Windows os.execv 是 spawn-and-exit 而非真正 exec — 並且實測在
+    pythonw / 管理員提權 / 中文路徑 情境下偶發新 process 起不來。
+    subprocess.Popen 顯式啟動新進程 → 確認 spawn 成功 → 我們才 exit。
+    DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP：讓新 process 完全獨立，
+    舊 process 退出時不會帶走新的。
     """
+    import subprocess
+    import logging
+
     args = list(extra_args) if extra_args else []
     if is_frozen():
-        os.execv(sys.executable, [sys.executable] + args)
+        cmd = [sys.executable] + args
     else:
-        os.execv(
-            sys.executable,
-            [sys.executable, os.path.abspath(sys.argv[0])] + args,
-        )
+        cmd = [sys.executable, os.path.abspath(sys.argv[0])] + args
+
+    # Windows: DETACHED_PROCESS=0x08, CREATE_NEW_PROCESS_GROUP=0x200
+    # 讓新進程完全脫離父 console / process group，舊 process 退出不影響。
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = 0x00000008 | 0x00000200
+
+    try:
+        subprocess.Popen(cmd, creationflags=creationflags, close_fds=True,
+                          cwd=get_app_dir())
+        logging.info("[restart_self] spawned new process: %s", cmd)
+    except Exception as e:
+        logging.error("[restart_self] subprocess.Popen 失敗: %s — fallback os.execv", e)
+        try:
+            os.execv(cmd[0], cmd)
+        except Exception:
+            logging.error("[restart_self] os.execv fallback 也失敗", exc_info=True)
+            return
+    # spawn 成功就退出本 process
+    sys.exit(0)

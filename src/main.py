@@ -2708,6 +2708,10 @@ try:
                                               wintypes.LPVOID, ctypes.c_size_t,
                                               ctypes.POINTER(ctypes.c_size_t)]
     _kernel32.ReadProcessMemory.restype = wintypes.BOOL
+    _kernel32.WriteProcessMemory.argtypes = [wintypes.HANDLE, wintypes.LPVOID,
+                                               wintypes.LPVOID, ctypes.c_size_t,
+                                               ctypes.POINTER(ctypes.c_size_t)]
+    _kernel32.WriteProcessMemory.restype = wintypes.BOOL
     _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     _kernel32.CloseHandle.restype = wintypes.BOOL
 except Exception:
@@ -2789,27 +2793,117 @@ def _get_tab_item_rect_cross_process(tab_hwnd: int, item_index: int):
         return None
 
 
+def _send_wm_notify_tcn_selchange(tabctrl_hwnd: int) -> bool:
+    """[2026-05-22 v29] 跨 process 對 TabCtrl 的 parent 發 WM_NOTIFY TCN_SELCHANGE
+    強制 Delphi VCL TPageControl swap ActivePage。
+
+    為何要這個：cross-process PostMessage WM_LBUTTONDOWN 到 TabCtrl 雖然視覺
+    切到 target tab，但有時 Delphi VCL 的 CNNotify 沒收到對應 TCN_SELCHANGE
+    (timing / message order / reflect 問題) → ActivePage 不 swap → 下方 radio
+    區還是舊 tab → 開立電子 submit 錯 radio。
+
+    機制：
+      1. TabCtrl 子控制項，發 WM_NOTIFY 必須給「parent」(form)，由 form 的
+         WndProc reflect 回 TabCtrl 自己的 CN_NOTIFY → TPageControl.CNNotify
+         處理 → SetActivePage。
+      2. NMHDR struct = {hwndFrom, idFrom, code}。64-bit: 8 + 8 + 4 padded
+         to 16 (struct alignment) = 24 bytes 安全。
+      3. NMHDR pointer 必須是 target process 的位址 → VirtualAllocEx +
+         WriteProcessMemory。
+    """
+    WM_NOTIFY = 0x004E
+    TCN_FIRST = 0xFFFFFDDA  # -550 unsigned
+    TCN_SELCHANGE = (TCN_FIRST - 1) & 0xFFFFFFFF  # -551 unsigned = 0xFFFFFDD9
+    PROCESS_VM_OPERATION = 0x0008
+    PROCESS_VM_READ = 0x0010
+    PROCESS_VM_WRITE = 0x0020
+    MEM_COMMIT = 0x1000
+    MEM_RELEASE = 0x8000
+    PAGE_READWRITE = 0x04
+
+    try:
+        parent = ctypes.windll.user32.GetParent(tabctrl_hwnd)
+        if not parent:
+            logging.debug("_send_wm_notify_tcn_selchange: 找不到 TabCtrl parent")
+            return False
+        ctrl_id = ctypes.windll.user32.GetDlgCtrlID(tabctrl_hwnd)
+        pid = wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(tabctrl_hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return False
+        process = _kernel32.OpenProcess(
+            PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
+            False, pid.value)
+        if not process:
+            return False
+        remote_addr = None
+        try:
+            # NMHDR 在 x64 是 24 bytes (HWND=8, UINT_PTR=8, UINT=4+pad=8)
+            class NMHDR(ctypes.Structure):
+                _fields_ = [("hwndFrom", wintypes.HWND),
+                             ("idFrom", ctypes.c_void_p),  # UINT_PTR
+                             ("code", ctypes.c_uint)]
+            nmhdr = NMHDR()
+            nmhdr.hwndFrom = tabctrl_hwnd
+            nmhdr.idFrom = ctrl_id
+            nmhdr.code = TCN_SELCHANGE
+            sz = ctypes.sizeof(NMHDR)
+            remote_addr = _kernel32.VirtualAllocEx(
+                process, None, sz, MEM_COMMIT, PAGE_READWRITE)
+            if not remote_addr:
+                return False
+            written = ctypes.c_size_t()
+            ok = _kernel32.WriteProcessMemory(
+                process, remote_addr, ctypes.byref(nmhdr), sz,
+                ctypes.byref(written))
+            if not ok:
+                return False
+            # 發給 parent (form)，form 收到後 reflect CN_NOTIFY 給 TabCtrl，
+            # TPageControl.CNNotify 看到 TCN_SELCHANGE → SetActivePage
+            _send_message_timeout(parent, WM_NOTIFY, ctrl_id, remote_addr,
+                                    timeout_ms=1500)
+            return True
+        finally:
+            if remote_addr:
+                try:
+                    _kernel32.VirtualFreeEx(process, remote_addr, 0, MEM_RELEASE)
+                except Exception:
+                    pass
+            try:
+                _kernel32.CloseHandle(process)
+            except Exception:
+                pass
+    except Exception:
+        logging.debug("_send_wm_notify_tcn_selchange 例外", exc_info=True)
+        return False
+
+
 def _switch_tab_by_text(or_hwnd: int, tab_text: str) -> tuple[bool, int]:
     """切到指定 text 的 TTabSheet。回傳 (success, target_sheet_hwnd)。
 
-    [2026-05-22 任務 B 重寫]
-    解決原本 1920x1080 / 部分 1280x1024 情境下 click 落在錯誤 tab 的問題。
+    [2026-05-22 v29 重寫] 解決 v27/v28「上方 tab strip 切了但 ActivePage 不 swap」
+    bug — F9/F10 開立電子產出錯誤同意書 (微小皮膚移植 而非 預期類型)。
 
-    關鍵設計：
-      1. target_idx 用「顯示順序」(TAB_DISPLAY_ORDER list 的 index)，**不是**
-         sheets array 的 index — `_enum_direct_children` 用 GetWindow(GW_HWNDNEXT)
-         返回 Z-order 順序，跟 TabCtrl 內部 idx 不同步 (Delphi VCL TPageControl
-         ActivePage 通常 Z-order 最上 → sheets[0] = ActivePage)
-      2. target_sheet (回傳給 caller scope radio search) 用 text **比對**從
-         sheets 找出對應 hwnd — 不依賴 array index
-      3. Click 位置用 cross-process TCM_GETITEMRECT 拿精準 rect (不靠估算座標)
-         失敗才 fallback 估算
-      4. 驗證用 TCM_GETCURSEL (TabCtrl 標準訊息，回真實 active idx) 而非
-         IsWindowVisible(sheets[i]) (前者跟 target_idx 同個 idx space)
-      5. 不對 retry 1 次
+    Root cause v28：
+      v28 在 PostMessage mouse click 之後立刻 SendMessage TCM_SETCURSEL。
+      SendMessage 同步先抵達 → tab strip idx 已是 target_idx。然後 mouse
+      click 才被 TabCtrl 處理 → HitTest 看到 idx 沒變 → 不發 TCN_SELCHANGE
+      → TPageControl.CNNotify 沒被叫 → ActivePage 不 swap。
 
-    回傳 (True, target_sheet_hwnd) 即使視覺切換失敗 — caller 仍可用
-    target_sheet 做 scope radio search，即使 ActivePage 沒對齊也能點對 radio。
+    v29 修法：
+      1. 只送 mouse click，不再事後 TCM_SETCURSEL 蓋掉 SELCHANGE。
+      2. 驗證用 z-order — Delphi VCL TPageControl 切 ActivePage 時把 active
+         TTabSheet 拉到 Z-order 最上。_enum_direct_children 用 GW_HWNDNEXT
+         走 Z-order → sheets[0] 就是 active sheet。實測 snapshot 證實。
+         不再用 IsWindowVisible (3 個 sheet 可能都 VISIBLE，不分 active)。
+      3. 失敗 fallback：跨 process VirtualAllocEx 配 NMHDR + SendMessage
+         WM_NOTIFY TCN_SELCHANGE 給 TabCtrl 的 parent，強制觸發
+         TPageControl.CNNotify → SetActivePage。
+      4. target_sheet hwnd 用 text 比對 (不靠 array index，避免 Z-order 亂)
+
+    回傳 (True, target_sheet_hwnd) 表示 sheet 找到；success 是否 ActivePage
+    真的 swap 寫在 log。即使 swap 失敗，caller 仍可用 target_sheet 做 scope
+    search — 但 開立電子 行為依視覺 ActivePage 決定 → 失敗會送錯同意書。
     """
     TAB_DISPLAY_ORDER = ["手術", "手術及治療", "檢查"]
     pc = _find_page_control_by_tab_set(or_hwnd, TAB_DISPLAY_ORDER)
@@ -2838,7 +2932,7 @@ def _switch_tab_by_text(or_hwnd: int, tab_text: str) -> tuple[bool, int]:
     logging.info("_switch_tab: pc=%s 顯示位置 idx=%d (tab=%s) target_sheet=%s",
                   pc, target_idx, tab_text, target_sheet)
 
-    def _do_click():
+    def _do_mouse_click():
         item_rect = _get_tab_item_rect_cross_process(pc, target_idx)
         if item_rect:
             cx = (item_rect[0] + item_rect[2]) // 2
@@ -2846,40 +2940,26 @@ def _switch_tab_by_text(or_hwnd: int, tab_text: str) -> tuple[bool, int]:
             logging.info("_switch_tab: TCM_GETITEMRECT 精準 rect=%s 中心=(%d,%d)",
                           item_rect, cx, cy)
             _post_click_to_control(pc, client_x=cx, client_y=cy)
-            return cx, cy
+            return
         # Fallback: 估算 (1280x1024 經驗值)
         est_x = {0: 30, 1: 105, 2: 195}.get(target_idx, 30 + target_idx * 75)
         est_y = 12
         logging.info("_switch_tab: 估算 click client=(%d,%d) [fallback]",
                       est_x, est_y)
         _post_click_to_control(pc, client_x=est_x, client_y=est_y)
-        return est_x, est_y
 
-    _do_click()
-
-    # 雙保險：TCM_SETCURSEL + TCM_SETCURFOCUS
-    TCM_SETCURSEL = 0x130C
-    TCM_SETCURFOCUS = 0x1330
-    TCM_GETCURSEL = 0x130B
-    _send_message_timeout(pc, TCM_SETCURSEL, target_idx, 0, timeout_ms=1000)
-    _send_message_timeout(pc, TCM_SETCURFOCUS, target_idx, 0, timeout_ms=1000)
-
-    # [2026-05-22 修] 用「IsWindowVisible(target_sheet)」當 ground truth 驗證
-    # ActivePage 真的切換了 — 不只 TCM_GETCURSEL (tab strip 視覺) 對齊。
-    # 原因：Delphi VCL TPageControl 內 TabCtrl strip 跟 ActivePage 是兩件事，
-    # cross-process TCM_SETCURSEL 可能改了 tab strip 但 ActivePage 沒 swap
-    # → 下方 radio 區還在舊 tab → 開立電子 submit 錯誤 radio。
-    # IsWindowVisible(target_sheet) == True 才代表 page 真的切過去。
     def _is_target_active() -> bool:
+        """ActivePage 真切到 target 的可靠判定：z-order 最上 sheet == target_sheet。
+        Delphi VCL TPageControl.SetActivePage 會 BringWindowToTop(新 page)
+        → EnumChildWindows(GW_HWNDNEXT) 走 Z-order → sheets[0] 就是 active。"""
         try:
-            cur = _send_message_timeout(pc, TCM_GETCURSEL, 0, 0, timeout_ms=500)
-            if cur != target_idx:
-                return False
-            return bool(ctypes.windll.user32.IsWindowVisible(target_sheet))
+            cur_sheets = _enum_direct_children(pc, "TTabSheet")
+            return bool(cur_sheets) and cur_sheets[0] == target_sheet
         except Exception:
             return False
 
-    # Poll up to 800ms (Delphi paint cycle 通常 < 300ms)
+    # 第一輪：純 mouse click，不要事後 TCM_SETCURSEL 蓋掉 SELCHANGE
+    _do_mouse_click()
     end_t = time.time() + 0.8
     success = False
     while time.time() < end_t:
@@ -2889,11 +2969,15 @@ def _switch_tab_by_text(or_hwnd: int, tab_text: str) -> tuple[bool, int]:
         time.sleep(0.05)
 
     if not success:
-        # 第一輪 click 沒讓 ActivePage 切過去 → retry 一次
-        logging.warning("_switch_tab: ActivePage 800ms 內沒切到 target_sheet，retry click")
-        _do_click()
+        # 第二輪 fallback：跨 process WM_NOTIFY TCN_SELCHANGE 強制 swap ActivePage
+        logging.warning("_switch_tab: mouse click 後 800ms 內 ActivePage 沒切，"
+                          "fallback 用 WM_NOTIFY TCN_SELCHANGE")
+        TCM_SETCURSEL = 0x130C
+        # 先把 tab strip 對齊 (純視覺，無 SELCHANGE)，再強制發 SELCHANGE
         _send_message_timeout(pc, TCM_SETCURSEL, target_idx, 0, timeout_ms=1000)
-        _send_message_timeout(pc, TCM_SETCURFOCUS, target_idx, 0, timeout_ms=1000)
+        sent = _send_wm_notify_tcn_selchange(pc)
+        logging.info("_switch_tab: WM_NOTIFY TCN_SELCHANGE %s",
+                      "已送出" if sent else "送出失敗")
         end_t = time.time() + 0.8
         while time.time() < end_t:
             if _is_target_active():
@@ -2902,11 +2986,10 @@ def _switch_tab_by_text(or_hwnd: int, tab_text: str) -> tuple[bool, int]:
             time.sleep(0.05)
 
     if success:
-        logging.info("_switch_tab: ActivePage 已切到 target_sheet (TCM_GETCURSEL + IsWindowVisible 都通過)")
+        logging.info("_switch_tab: ActivePage 已切到 target_sheet (z-order 驗證通過)")
     else:
-        logging.warning("_switch_tab: ActivePage 切換失敗 — 視覺仍可能在錯 tab。"
-                          "caller 應該用 target_sheet scope radio click + 注意開立電子"
-                          "可能 submit 錯誤頁面的 radio")
+        logging.warning("_switch_tab: ActivePage 切換失敗 — 視覺仍可能在錯 tab，"
+                          "開立電子可能 submit 錯誤頁面。caller 需注意")
     return True, target_sheet
 
 
@@ -5327,6 +5410,17 @@ class AutomationApp:
             self.root.destroy()
         except Exception:
             logging.debug("root.destroy during restart failed.", exc_info=True)
+        # [2026-05-22 v29] 必須在 restart_self() 之前 release mutex，否則新 process
+        # 起來時 mutex 還被舊 process 持有 → ensure_single_instance() 看到 mutex
+        # 存在 → 跳「已在執行中」MessageBox → exit → user 看到「自動更新沒重啟」。
+        # atexit handler 在 os.execv / subprocess+sys.exit 路徑可能不保證會跑，
+        # 必須顯式釋放。
+        try:
+            release_single_instance()
+            logging.info("[restart] mutex released before respawn")
+        except Exception:
+            logging.debug("release_single_instance during restart failed.",
+                           exc_info=True)
         restart_self()
 
     def shutdown_app(self):
@@ -10237,13 +10331,6 @@ class AutomationApp:
             schedule.every().day.at("08:00").do(
                 lambda: run_named_job("check-update-0800", lambda: self.bg_executor.submit(self.check_and_update, False))
             ).tag("update-check", "daily")
-            # [2026-05-22] 每小時也 check 一次更新，偵測到新版自動下載 + restart_self()。
-            # 流量：每小時 1 次 GitHub raw manifest.json fetch + 若有新版才下載檔案，
-            # 對 GitHub 公開 API 無壓力。原本只「啟動 + 每日 08:00」 → 中間時段
-            # push 新版 user 要手動重啟才能拉到，造成 v26→v27 user 沒拉到問題。
-            schedule.every(1).hours.do(
-                lambda: run_named_job("check-update-hourly", lambda: self.bg_executor.submit(self.check_and_update, False))
-            ).tag("update-check", "hourly")
 
             while not stop_event_main.is_set():
                 schedule.run_pending()
