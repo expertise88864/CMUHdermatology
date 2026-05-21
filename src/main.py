@@ -3393,8 +3393,27 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
     logging.info("[%s] popup hwnd=%s 已開啟", label, popup)
     # popup 視窗出現 ≠ 資料 load 完。Delphi 通常 popup 先 paint 空白 → 再從病歷
     # 帶入欄位資料。若太早 clear，後續 load 會覆蓋掉我們清空的字。
-    # 給 2 秒讓 OnShow 完成 + server roundtrip + UI fill。
-    time.sleep(2.0)
+    # [2026-05-22 v30] 改成 event-driven poll — 等 所患疾病 TEdit 有內容才視為
+    # server fill 完成。原本硬 sleep 2.0s 不論快慢一律等滿；poll 50ms 一次，
+    # 通常 200-600ms 就回，省 1.4-1.8s。Cap 3.0s 防 server 異常時無限等。
+    fill_deadline = time.time() + 3.0
+    filled = False
+    while time.time() < fill_deadline:
+        try:
+            edits_now = _enum_class_in_window(popup, "TEdit")
+            if len(edits_now) >= 3 and _get_window_text(edits_now[0][0]):
+                # 所患疾病 已被 server 帶入內容 → 可以清空了
+                filled = True
+                break
+        except Exception:
+            logging.debug("[%s] poll TEdit fill 例外", label, exc_info=True)
+        time.sleep(0.05)
+        check_stop()
+    if filled:
+        logging.info("[%s] popup TEdit fill 偵測完成 (%.2fs)", label,
+                      3.0 - (fill_deadline - time.time()))
+    else:
+        logging.warning("[%s] popup 3.0s 內未偵測到 server fill，仍繼續清空", label)
     check_stop()
 
     # Step 7 (Round 2): 清空 2 個 edit + 勾 局麻
