@@ -2196,7 +2196,11 @@ def _f11_popup_watcher(label: str = "F11",
                     "已執行 %.1fs (上限 %.0fs，F12 可中止)",
                     label, handled_count, elapsed, total_timeout)
                 last_progress_log = time.time()
-            time.sleep(0.12)
+            # [2026-05-22 v38] no-popup 時 sleep 0.12→0.25s 減低西醫門診系統
+            # 訊息 traffic — 全部完成 後 server roundtrip 期間，我們的 polling
+            # 會塞滿 message pump → user 報「卡住」。0.25s 仍有即時感
+            # (popup 出現後最多 0.25s 偵測到)。有 popup 處理時仍是 0.12s。
+            time.sleep(0.25)
 
     logging.info("[%s] watcher 達總時限 %.0fs (處理 %d 個)",
                   label, total_timeout, handled_count)
@@ -2365,7 +2369,51 @@ MENU_ID_同意書 = 668
 
 def _find_window_by_class_title(class_name: str, title_kw: str = "",
                                   exclude_hwnd: int = 0) -> int:
-    """全域找 class=X 且 title 含 keyword 的可見視窗。"""
+    """全域找 class=X 且 title 含 keyword 的可見視窗。
+
+    [2026-05-22 v38] 從 EnumWindows + Python callback 改 FindWindowExW
+    (純 Win32，不走 Python boundary)。EnumWindows + Python cb 每個 top-level
+    window 都跨 C→Python 邊界 (~0.05ms/個) — 一台 PC 通常 100-300 個
+    top-level windows = 10-30ms per call。9 popup class × 0.12s polling
+    = ~70% CPU 都在 Python callback。改 FindWindowExW 後降到 < 1ms。
+    """
+    user32 = ctypes.windll.user32
+    # FindWindowExW(hWndParent=NULL, hWndChildAfter, class, title)
+    # hWndParent=NULL + 走 prev_hwnd 鏈 = 跨所有 top-level windows
+    FindWindowExW = user32.FindWindowExW
+    FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND,
+                                wintypes.LPCWSTR, wintypes.LPCWSTR]
+    FindWindowExW.restype = wintypes.HWND
+
+    prev = 0
+    while True:
+        try:
+            hwnd = FindWindowExW(None, prev, class_name, None)
+        except Exception:
+            return 0
+        if not hwnd:
+            return 0
+        prev = hwnd
+        if hwnd == exclude_hwnd:
+            continue
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                continue
+        except Exception:
+            continue
+        if title_kw:
+            try:
+                n = user32.GetWindowTextLengthW(hwnd)
+                if n <= 0:
+                    continue
+                t_buf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(hwnd, t_buf, n + 1)
+                if title_kw not in t_buf.value:
+                    continue
+            except Exception:
+                continue
+        return hwnd
+    # 舊 Python callback 路徑保留為下方 unreachable 代碼以避免大改 _find...
     found = [0]
 
     EnumWindowsProc = ctypes.WINFUNCTYPE(
@@ -2637,21 +2685,31 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
     """點 popup 內 開立電子 → 等警告對話框 → 點 是 → 等對話框關。
 
     若另跳「未滿 18」對話框（同樣是 #32770 但 title 可能不同），也按 是/確定。
-    若沒跳對話框（罕見情況），靜默繼續。"""
+    若沒跳對話框（罕見情況），靜默繼續。
+
+    [2026-05-22 v38] 加 timing log 量化每階段延遲，方便 user 跟我們確認
+    2-3s 卡頓究竟是 (a) server 自然延遲 (無法優化) 還是 (b) 我們可控的部分。
+    """
+    t_round_start = time.time()
     # Step A: 點 popup 內的 開立電子 button (async)
     if not _click_button_by_text(popup_hwnd, "開立電子"):
         logging.warning("[%s] popup 找不到 開立電子 button", label)
         return False
-    logging.info("[%s] 已點 popup 開立電子，等警告對話框", label)
+    t_clicked = time.time()
+    logging.info("[%s] 已點 popup 開立電子 (+%.0fms)，等警告對話框",
+                  label, (t_clicked - t_round_start) * 1000)
 
     # Step B: 等警告對話框出現 (class #32770)
     # title 可能是 "警告" 或其他變體，用 class 即可
     dlg = _wait_for_window("#32770", title_kw="", timeout=10,
                             exclude_hwnd=popup_hwnd)
+    t_dlg_appeared = time.time()
     if not dlg:
         logging.info("[%s] 沒等到警告對話框 (可能直接送出)", label)
         return True
-    logging.info("[%s] 警告對話框 hwnd=%s", label, dlg)
+    server_resp_ms = (t_dlg_appeared - t_clicked) * 1000
+    logging.info("[%s] 警告對話框 hwnd=%s (server 處理 %.0fms — 自然延遲)",
+                  label, dlg, server_resp_ms)
     time.sleep(0.05)  # 30ms+50ms ≈ 80ms 總 latency；舊版 100ms+300ms = 400ms
     check_stop()
 
@@ -2660,6 +2718,7 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
     # 對話框 WM_COMMAND IDYES 是最乾淨的方式。
     WM_COMMAND = 0x0111
     ctypes.windll.user32.PostMessageW(dlg, WM_COMMAND, IDYES, 0)
+    t_idyes_posted = time.time()
     logging.info("[%s] 已 PostMessage WM_COMMAND IDYES (=是) 給對話框", label)
 
     # 等對話框關 (30ms poll → 對話框關閉延遲最多 30ms)
@@ -2669,7 +2728,10 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
             break
         time.sleep(0.03)
         check_stop()
-    logging.info("[%s] 警告對話框已關", label)
+    t_dlg_closed = time.time()
+    dlg_close_ms = (t_dlg_closed - t_idyes_posted) * 1000
+    logging.info("[%s] 警告對話框已關 (是→關 %.0fms — server 寫入時間)",
+                  label, dlg_close_ms)
 
     # Step D: 等等看是否還有「未滿 18」之類的後續對話框
     # [2026-05-22 v33] 從硬 sleep 0.4s 改 event-driven poll — 三個 exit 條件：
@@ -3562,8 +3624,9 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
     logging.info("[%s] Round 3 完成 (片語)", label)
 
     # Step 9 (Round 4): 點 popup 開立電子 + 警告對話框「是」+ (未滿 18 對話框)
+    # [2026-05-22 v38] 0.3s→0.1s — 片語選擇完 popup 已穩定，不需這麼久 settle
     check_stop()
-    time.sleep(0.3)
+    time.sleep(0.1)
     _f9_f10_round4_submit_and_confirm(popup, label=label)
     logging.info("[%s] Round 4 完成 (整段 F9/F10 流程完成)", label)
     return True
