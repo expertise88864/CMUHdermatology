@@ -1512,6 +1512,10 @@ def _run_imap_check_with_timeout(kw: str, timeout: float = 60.0) -> dict:
 # [穩定性] scheduler liveness — 給 self-watchdog thread 用
 _SCHEDULER_LIVENESS = {"last_tick": 0.0, "last_imap_success": 0.0}
 
+# [2026-05-22 v34] scheduler thread 引用 — self-watchdog 用 is_alive() 直接偵測
+# thread 死亡 (比 last_tick 訊號更可靠：thread 真死了 last_tick 永遠不會更新)
+_scheduler_thread_ref = None
+
 # [B] 觸發信去重 — 同一寄件人 + 最近 5 分鐘 → 視為重複，跳過
 # 防 mark-read 失敗導致重複處理
 _TRIGGER_DEDUP_WINDOW_SEC = 300
@@ -1533,24 +1537,57 @@ def _trigger_is_duplicate(sender: str) -> bool:
     return False
 
 
+def _hard_exit(reason: str, code: int = 1) -> None:
+    """[2026-05-22 v34] 強制終止 process，不走 logging.shutdown (會 deadlock)。
+
+    背景：原本 self-watchdog 的 os._exit 路徑會 call logging.shutdown()，但
+    若另一 thread 正持有 handler lock (e.g. scheduler 卡在 logging.info)，
+    我們的 thread 在 close() 時無限等 → kill path 完全失效 → process 永遠
+    不會死 → 外層 watchdog 也救不回來 (因為 process 還活著)。
+
+    這個 helper：
+      1. 直接 try handler.flush(timeout=1) (不 close，不取 lock)
+      2. 不論成功與否 → 立刻 os._exit(code)
+    """
+    import os as _os
+    # 嘗試 flush 但不卡死
+    try:
+        # 只 flush，不 close，不持有 lock
+        root_logger = logging.getLogger()
+        for h in list(root_logger.handlers):
+            try:
+                h.flush()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    _os._exit(code)
+
+
 def _scheduler_self_watchdog() -> None:
-    """獨立 daemon thread — 每 60s 看 scheduler_loop 是否還活著。
+    """獨立 daemon thread — 每 30s 看 scheduler_loop 是否還活著。
+
+    [2026-05-22 v34 重寫] 修兩個關鍵問題：
+      A. 原本 kill path call logging.shutdown 會 deadlock — 改 _hard_exit
+         (只 flush 不 close handlers，直接 os._exit)
+      B. 加 thread is_alive() 檢查 — last_tick 訊號可能 race，但 thread
+         物件 is_alive() 是 Python 直接判讀 thread state，最可靠
 
     階梯式處理：
-      1. last_tick 超過 5 分鐘 → log CRITICAL + force_close IMAP socket
+      1. scheduler thread is_alive()==False → 立刻 _hard_exit (thread 真死了)
+      2. last_tick 超過 3 分鐘 → log CRITICAL + force_close IMAP socket
          (希望讓卡在 socket recv 的 thread 解套)
-      2. 再過 30 秒 last_tick 仍沒更新 → force_close 沒救活，直接 os._exit(1)
+      3. 再過 20 秒 last_tick 仍沒更新 → force_close 沒救活，_hard_exit
          讓 process 死亡 → 外層 watchdog 偵測沒在跑 → 重啟新 instance
-         (這是 last resort — 但比死循環好太多)
 
-    為什麼直接 os._exit(1)：
+    為什麼必須 _hard_exit：
       - sys.exit() 只結束 main thread，daemon 用無效
       - threading 沒有 thread.kill()
-      - 唯一方式是讓整個 process 死，新 process 才能拿到 mutex
+      - logging.shutdown() 在死 handler lock 情境下會 deadlock
     """
-    DEAD_THRESHOLD = 300       # 5 分鐘無 tick → 嘗試 force_close
-    KILL_THRESHOLD = 30        # force_close 後再 30s 沒救 → os._exit
-    CHECK_INTERVAL = 60
+    DEAD_THRESHOLD = 180       # 3 分鐘無 tick → 嘗試 force_close (原 300s 太鬆)
+    KILL_THRESHOLD = 20        # force_close 後再 20s 沒救 → _hard_exit
+    CHECK_INTERVAL = 30        # 縮短為 30s 巡邏一次 (原 60s)
     force_closed_at = 0.0      # 記錄上次 force_close 時間，避免重複
     # [I] scheduler 半死偵測：tick 還在跑但沒有成功 IMAP poll > 10 分鐘
     HALF_DEAD_THRESHOLD = 600
@@ -1558,6 +1595,15 @@ def _scheduler_self_watchdog() -> None:
     while running.is_set():
         try:
             time.sleep(CHECK_INTERVAL)
+
+            # [2026-05-22 v34] Stage 0：scheduler thread 直接死了 → 立刻退場
+            global _scheduler_thread_ref
+            if _scheduler_thread_ref is not None and not _scheduler_thread_ref.is_alive():
+                logging.critical(
+                    "[self-watchdog] scheduler thread is_alive()=False (thread 真死了) "
+                    "→ _hard_exit(1) 強制重啟整個 process (外層 watchdog 會接手)")
+                _hard_exit("scheduler thread dead", code=1)
+
             last = _SCHEDULER_LIVENESS.get("last_tick", 0.0)
             if last == 0.0:
                 continue  # 還沒第一次 tick，給它時間 init
@@ -1590,7 +1636,7 @@ def _scheduler_self_watchdog() -> None:
                             imap_age, HALF_DEAD_THRESHOLD)
                         last_half_dead_log = time.time()
 
-            # Stage 2：force_close 沒救活 → os._exit 強制重啟
+            # Stage 2：force_close 沒救活 → _hard_exit 強制重啟
             if force_closed_at > 0:
                 since_force = time.time() - force_closed_at
                 if last > force_closed_at:
@@ -1601,17 +1647,9 @@ def _scheduler_self_watchdog() -> None:
                 elif since_force > KILL_THRESHOLD:
                     logging.critical(
                         "[self-watchdog] force_close 後 %.0fs scheduler 仍卡死 "
-                        "→ os._exit(1) 強制重啟整個 process (外層 watchdog 會接手)",
+                        "→ _hard_exit(1) 強制重啟整個 process (外層 watchdog 會接手)",
                         since_force)
-                    # 不能 sys.exit (只殺 main thread, daemon 無效)
-                    # 必須 os._exit 強制終止整個 process
-                    import os as _os
-                    _os.flush_io = lambda: None
-                    try:
-                        logging.shutdown()  # 刷 log handler 確保訊息寫完
-                    except Exception:
-                        pass
-                    _os._exit(1)
+                    _hard_exit("scheduler stuck after force_close", code=1)
         except Exception:
             logging.exception("[self-watchdog] tick 例外")
 
@@ -2159,9 +2197,11 @@ def main() -> None:
         threading.Thread(target=_check_update_in_background,
                          name="ConsultUpdateChecker", daemon=True).start()
 
-        # 排程器執行緒
-        threading.Thread(target=scheduler_loop,
-                         name="ConsultScheduler", daemon=True).start()
+        # 排程器執行緒 — [2026-05-22 v34] 保存 thread 引用給 self-watchdog 檢查 is_alive()
+        global _scheduler_thread_ref
+        _scheduler_thread_ref = threading.Thread(target=scheduler_loop,
+                         name="ConsultScheduler", daemon=True)
+        _scheduler_thread_ref.start()
 
         # 啟動即帶 --run-now → 立刻先跑一次
         if "--run-now" in args:
