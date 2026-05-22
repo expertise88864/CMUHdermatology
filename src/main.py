@@ -1834,12 +1834,25 @@ def _f11_handle_allergy_m01(hwnd: int, label: str = "") -> bool:
             logging.warning("[%s]   找不到 處理 button，fallback 點「回」", label)
 
     # state A 或 state B fallback → 點「回」(安全 dismiss，不改病歷)
+    # [2026-05-22 v31] 加 retry — 實測 user 報告 popup 開啟後第一次 PostMessage
+    # WM_LBUTTONDOWN 偶爾沒生效 (可能 Delphi OnShow 還在跑、button 還沒 enable)，
+    # 第二次按 F11 才work。Handler 內 retry 一次 → 不必 user 手動 F11 第二次。
     logging.info("[%s]   state=A → 點「回」dismiss", label)
-    if _click_button_normalized_text(hwnd, "回"):
-        logging.info("[%s]   已點 回", label)
-        _wait_window_closed(hwnd, timeout=5)
-        return True
-    logging.warning("[%s]   找不到 回 button", label)
+    for attempt in range(2):
+        if _click_button_normalized_text(hwnd, "回"):
+            logging.info("[%s]   已點 回 (attempt %d)", label, attempt + 1)
+            if _wait_window_closed(hwnd, timeout=2.5):
+                return True
+            logging.warning("[%s]   點 回 後 popup 未關 (attempt %d/2)",
+                              label, attempt + 1)
+        else:
+            logging.warning("[%s]   找不到 回 button (attempt %d/2)",
+                              label, attempt + 1)
+        # 第一次失敗：給 popup 多點時間 settle 後再 retry
+        if attempt == 0:
+            time.sleep(0.3)
+            check_stop()
+    logging.warning("[%s]   點 回 retry 2 次仍失敗 — popup 可能卡住", label)
     return False
 
 
@@ -3061,23 +3074,30 @@ def _select_phrase_and_return(片語_btn_hwnd: int, row_idx: int,
         logging.warning("[%s] 等不到 TfrmOrrSentence popup", label)
         return False
     logging.info("[%s] 片語 popup hwnd=%s", label, phrase_popup)
-    time.sleep(0.4)  # 等 popup 完全 paint
-    check_stop()
-
-    # Find grid (only 1 in popup)
-    grids = _enum_class_in_window(phrase_popup, "TStringAlignGrid")
-    if not grids:
-        logging.warning("[%s] popup 內找不到 TStringAlignGrid", label)
+    # [2026-05-22 v31] 從硬 sleep 0.4s 改成 event-driven poll — 等 grid 出現代表
+    # popup 已 paint。實測通常 50-150ms 就有 grid，省 250-350ms。
+    grid = 0
+    paint_deadline = time.time() + 1.0
+    while time.time() < paint_deadline:
+        grids = _enum_class_in_window(phrase_popup, "TStringAlignGrid")
+        if grids:
+            grid = grids[0][0]
+            break
+        time.sleep(0.03)
+        check_stop()
+    if not grid:
+        logging.warning("[%s] popup 內 1.0s 內找不到 TStringAlignGrid", label)
         return False
-    grid = grids[0][0]
     logging.info("[%s] grid hwnd=%s", label, grid)
 
     # Navigate to row_idx by sending VK_DOWN (default selected = row 0)
+    # [2026-05-22 v31] interval 0.05→0.03 (省 ~40-90ms 每次)；post-VK_DOWN
+    # 0.2→0.08 (省 120ms)。Delphi TStringAlignGrid 對 VK_DOWN 即時反應。
     VK_DOWN = 0x28
     if row_idx > 0:
-        _send_key_to_window(grid, VK_DOWN, count=row_idx, interval=0.05)
+        _send_key_to_window(grid, VK_DOWN, count=row_idx, interval=0.03)
         logging.info("[%s] grid 已 VK_DOWN %d 次 → row %d", label, row_idx, row_idx)
-        time.sleep(0.2)
+        time.sleep(0.08)
     else:
         logging.info("[%s] row=0 (default highlight)，無需 VK_DOWN", label)
     check_stop()
@@ -3162,13 +3182,15 @@ def _f9_f10_round3_phrases(popup_hwnd: int, row_所患: int, row_手術: int,
     if not _select_phrase_and_return(btn_所患, row_所患,
                                        label=label + "/所患疾病片語"):
         return False
-    time.sleep(0.3)  # 等 Tfm_agree popup 重 paint 新值
+    # [2026-05-22 v31] 0.3→0.12s — Tfm_agree popup 重 paint 新值通常 < 100ms
+    time.sleep(0.12)
 
     # Step B: 手術原因 片語
     if not _select_phrase_and_return(btn_手術, row_手術,
                                        label=label + "/手術原因片語"):
         return False
-    time.sleep(0.3)
+    # [2026-05-22 v31] 0.3→0.08s — Round 4 接著 _f9_f10_round4 也有自己的等待
+    time.sleep(0.08)
     return True
 
 
