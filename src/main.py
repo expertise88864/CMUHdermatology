@@ -2184,7 +2184,11 @@ def _f11_popup_watcher(label: str = "F11",
                         "第 %d 次後 retry", label, cls_name, attempts + 1)
                 last_progress_log = time.time()
                 found_one = True
-                time.sleep(0.12)
+                # [2026-05-22 v39] 處理完 popup 後 sleep 0.12→0.8s — 給 app 處理
+                # 我們的 click + 可能觸發下個 popup 的 server roundtrip 完成。
+                # 原本立刻下一輪 polling，app 還在處理我們的 click 就被打擾。
+                # User 明確指示「不一定要秒按」，慢一點換穩定。
+                time.sleep(0.8)
                 break  # 從頭再掃一輪 (這次處理完可能觸發下個 popup)
 
         if not found_one:
@@ -2196,11 +2200,9 @@ def _f11_popup_watcher(label: str = "F11",
                     "已執行 %.1fs (上限 %.0fs，F12 可中止)",
                     label, handled_count, elapsed, total_timeout)
                 last_progress_log = time.time()
-            # [2026-05-22 v38] no-popup 時 sleep 0.12→0.25s 減低西醫門診系統
-            # 訊息 traffic — 全部完成 後 server roundtrip 期間，我們的 polling
-            # 會塞滿 message pump → user 報「卡住」。0.25s 仍有即時感
-            # (popup 出現後最多 0.25s 偵測到)。有 popup 處理時仍是 0.12s。
-            time.sleep(0.25)
+            # [2026-05-22 v39] no-popup 時 sleep 0.25→0.4s 更輕對 app message
+            # pump。popup 出現到偵測延遲最多 0.4s — user 「不一定要秒按」
+            time.sleep(0.4)
 
     logging.info("[%s] watcher 達總時限 %.0fs (處理 %d 個)",
                   label, total_timeout, handled_count)
@@ -2220,7 +2222,16 @@ def _f11_快速完成_main(label: str = "F11") -> bool:
         logging.warning("[%s] 找不到 全部完成 button", label)
         return False
     _post_click_to_control(btns[0][0])
-    logging.info("[%s] 已點 全部完成 (hwnd=%s)，進入 popup 輪詢", label, btns[0][0])
+    logging.info("[%s] 已點 全部完成 (hwnd=%s)，sleep 2s 給 app 跑 server roundtrip",
+                  label, btns[0][0])
+
+    # [2026-05-22 v39] 全部完成 click 後給 2s 完全不打擾 app。
+    # 原本立刻進入 watcher polling → 每秒 ~36 次 Win32 call 灌進已塞滿的
+    # message pump → user 看到「卡住」。改成「先讓 app 跑完初始 server
+    # roundcheck (allergy / 健保 / 結算 / 轉診觸發)」，第一波 popup 自然會
+    # 出現在 2s 內。我們等 2s 後再開始 polling，犧牲 2s 體感速度換穩定。
+    time.sleep(2.0)
+    check_stop()
 
     # Step 2: 輪詢已知 popup (任意順序、可能跳過)
     _f11_popup_watcher(label=label)
