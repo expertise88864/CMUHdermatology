@@ -2648,22 +2648,35 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
     logging.info("[%s] 警告對話框已關", label)
 
     # Step D: 等等看是否還有「未滿 18」之類的後續對話框
-    # 給 0.4 秒讓 Delphi 進入下個 prompt（若有）— 從 1.0s 縮短
-    time.sleep(0.4)
-    check_stop()
-    dlg2 = _find_window_by_class_title("#32770", "", exclude_hwnd=popup_hwnd)
+    # [2026-05-22 v33] 從硬 sleep 0.4s 改 event-driven poll — 三個 exit 條件：
+    #   (a) popup_hwnd 已消失 → 同意書送出完成，無第二 dialog → 立刻 return
+    #   (b) 偵測到 dlg2 出現 → 跳出 poll 進入處理
+    #   (c) 0.5s 超時 → 認定沒有第二 dialog
+    # 常見情況 (無第二 dialog) 通常 50-200ms popup 就消失 → 省 200-350ms。
+    dlg2 = 0
+    poll_deadline = time.time() + 0.5
+    while time.time() < poll_deadline:
+        if not ctypes.windll.user32.IsWindow(popup_hwnd):
+            logging.info("[%s] popup 已關 → 無第二 dialog 需處理", label)
+            return True
+        dlg2 = _find_window_by_class_title("#32770", "", exclude_hwnd=popup_hwnd)
+        if dlg2:
+            break
+        time.sleep(0.05)
+        check_stop()
+
     if dlg2:
         logging.info("[%s] 偵測到第二個對話框 hwnd=%s (可能是未滿 18)", label, dlg2)
         # 同樣送 IDYES（IDOK=1 也試）
         ctypes.windll.user32.PostMessageW(dlg2, WM_COMMAND, IDYES, 0)
-        time.sleep(0.2)
+        time.sleep(0.15)
         # IDOK 備援（某些對話框「確定」是 IDOK 不是 IDYES）
         ctypes.windll.user32.PostMessageW(dlg2, WM_COMMAND, IDOK, 0)
         end_t = time.time() + 5
         while time.time() < end_t:
             if not ctypes.windll.user32.IsWindow(dlg2):
                 break
-            time.sleep(0.1)
+            time.sleep(0.05)
         logging.info("[%s] 第二個對話框處理完", label)
     return True
 
