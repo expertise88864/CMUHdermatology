@@ -1618,6 +1618,46 @@ def script_F5_adaptive():
 
 
 # =============================================================================
+# F8 — 快速輸入文字 (可在設定頁修改，預設 dtderm25)
+# =============================================================================
+
+F8_QUICK_TEXT_DEFAULT = "dtderm25"
+
+
+def _load_f8_quick_text() -> str:
+    """從 threshold_settings.json 讀 quick_text_f8，失敗回預設 dtderm25。
+    每次按 F8 都重讀 → 設定頁改完不用重啟即時生效。"""
+    try:
+        with open(get_conf_path('threshold_settings.json'),
+                  'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+        t = cfg.get('quick_text_f8', F8_QUICK_TEXT_DEFAULT)
+        return str(t) if t else F8_QUICK_TEXT_DEFAULT
+    except Exception:
+        return F8_QUICK_TEXT_DEFAULT
+
+
+def script_F8_quick_text():
+    """F8: 快速輸入文字到目前 focused 控件。
+    文字從 settings (quick_text_f8) 讀，預設 dtderm25。
+    用 keyboard.write() — 走 OS 鍵盤事件，支援所有 unicode。"""
+    text = _load_f8_quick_text()
+    if not text:
+        logging.info("F8: quick_text 為空，跳過")
+        return
+    logging.info("--- Executing F8 (快速輸入 %r) ---", text)
+    kb = getattr(hotkey_modules, 'keyboard', None)
+    if kb is None:
+        logging.warning("F8: keyboard 模組未就緒，跳過")
+        return
+    try:
+        kb.write(text)
+        logging.info("F8: 已輸入 %d 字", len(text))
+    except Exception:
+        logging.error("F8: keyboard.write 失敗", exc_info=True)
+
+
+# =============================================================================
 # F11 — 快速完成 (adaptive)
 # =============================================================================
 # 流程：
@@ -2076,29 +2116,24 @@ _F11_POPUP_HANDLERS = [
 
 
 def _f11_popup_watcher(label: str = "F11",
-                        total_timeout: float = 240.0,
-                        idle_timeout_initial: float = 8.0,
-                        idle_timeout_after_popup: float = 90.0) -> int:
+                        total_timeout: float = 60.0) -> int:
     """輪詢已知 popup → 依現身順序執行對應 handler。
 
-    - total_timeout：整個輪詢最久跑這麼久 (240s = 4 分鐘)
-    - idle_timeout_initial：還沒處理任何 popup 時，連續沒看到 popup 多久就放棄 (8s)
-      → 給「全部完成」按下後 popup 出現的時間
-    - idle_timeout_after_popup：已處理過 ≥1 個 popup 後的等待 (90s)
-      → 給 chain 中下一個慢慢出現的 popup 充裕時間
-      [2026-05-22 v32] 45s→90s — user 報告「健保初級照護轉診」(chain 末端)
-        偶爾在 > 45s 才出現，watcher 已 idle out 退出 → user 必須手動處理 +
-        再按 F11。90s 給更充裕緩衝，total_timeout 240s 仍是安全上限。
+    退出條件 (任一即退出)：
+      1. F12 中止 (check_stop 拋例外)
+      2. 病患選擇畫面 TFOpdselpt 變成 foreground (整個 checkout 流程完成)
+      3. total_timeout 60s 安全上限到期
 
-    F12 仍可隨時中止；4 分鐘 total 是安全上限，正常 chain 不會跑這麼久。
+    [2026-05-22 v35] 移除 idle timeout — user 報告若任一 popup 卡住、user 手動
+      點掉之後 watcher 已 idle out 退出，後續 popup 不會繼續按。改成持續輪詢
+      直到回到病患清單 / F12 / 60s 安全上限。
 
     回傳：處理過的 popup 數量
     """
     start = time.time()
-    last_seen = time.time()
     handled = set()  # 已處理過的 hwnd，避免重複
-    # [2026-05-22 v32] 每個 hwnd 的 retry 次數 — 若 handler 回 False 但 popup
-    # 還在 (race 沒按到 / radio 還沒 enable)，給最多 3 次機會，超過就放棄不再卡
+    # 每個 hwnd 的 retry 次數 — 若 handler 回 False 但 popup 還在 (race 沒按到 /
+    # radio 還沒 enable)，給最多 3 次機會，超過就放棄不再卡
     retry_counter: dict = {}
     handled_count = 0
     last_progress_log = time.time()
@@ -2107,7 +2142,6 @@ def _f11_popup_watcher(label: str = "F11",
         check_stop()
         # [快結束信號] 病患選擇畫面 (TFOpdselpt) 變成 foreground →
         # 整個 patient checkout 流程已完成，可以提早結束 watcher。
-        # 不再傻傻等 idle timeout (省 5-45 秒)。
         try:
             fg = ctypes.windll.user32.GetForegroundWindow()
             if fg:
@@ -2116,26 +2150,16 @@ def _f11_popup_watcher(label: str = "F11",
                 if fg_cls_buf.value == "TFOpdselpt":
                     logging.info(
                         "[%s] 偵測到病患選擇畫面 (TFOpdselpt) 為前景 → "
-                        "F11 流程完成，watcher 提早結束 (處理 %d 個 popup)",
+                        "F11 流程完成，watcher 結束 (處理 %d 個 popup)",
                         label, handled_count)
                     return handled_count
         except Exception:
             pass
-        # 依「是否已處理過 popup」用不同 idle timeout
-        idle_limit = (idle_timeout_after_popup if handled_count > 0
-                       else idle_timeout_initial)
-        idle_for = time.time() - last_seen
-        if idle_for > idle_limit:
-            logging.info("[%s] 連續 %.1fs 沒新 popup (limit=%.0fs)，watcher 結束 "
-                          "(處理 %d 個)",
-                          label, idle_for, idle_limit, handled_count)
-            return handled_count
 
         found_one = False
         for cls_name, title_kw, handler in _F11_POPUP_HANDLERS:
             hwnd = _find_window_by_class_title(cls_name, title_kw)
             if hwnd and hwnd not in handled:
-                # [2026-05-22 v32] 追蹤每個 hwnd 的 retry 次數，避免無限迴圈
                 attempts = retry_counter.get(hwnd, 0)
                 ok = False
                 try:
@@ -2158,7 +2182,6 @@ def _f11_popup_watcher(label: str = "F11",
                     logging.warning(
                         "[%s] %s handler 回 False 且 popup 仍存在 → "
                         "第 %d 次後 retry", label, cls_name, attempts + 1)
-                last_seen = time.time()
                 last_progress_log = time.time()
                 found_one = True
                 time.sleep(0.12)
@@ -2167,10 +2190,11 @@ def _f11_popup_watcher(label: str = "F11",
         if not found_one:
             # 每 5s 印一次「仍在等」log 方便 debug
             if time.time() - last_progress_log >= 5.0:
+                elapsed = time.time() - start
                 logging.info(
                     "[%s] watcher 等候中... 已處理 %d 個 popup，"
-                    "已 idle %.1fs (limit=%.0fs)",
-                    label, handled_count, idle_for, idle_limit)
+                    "已執行 %.1fs (上限 %.0fs，F12 可中止)",
+                    label, handled_count, elapsed, total_timeout)
                 last_progress_log = time.time()
             time.sleep(0.12)
 
@@ -5337,6 +5361,8 @@ class AutomationApp:
         self._dnd_suppressed_count = 0
         self.notify_dnd_start_time_var = tk.StringVar(value=str(self.threshold_settings.get("notify_dnd_start_time", "00:00")))
         self.notify_dnd_end_time_var = tk.StringVar(value=str(self.threshold_settings.get("notify_dnd_end_time", "08:00")))
+        # F8 快速輸入文字 (預設 dtderm25，可在設定頁修改)
+        self.quick_text_f8_var = tk.StringVar(value=str(self.threshold_settings.get("quick_text_f8", F8_QUICK_TEXT_DEFAULT)))
         self._live_count_samples = defaultdict(lambda: deque(maxlen=12))
 
         self.cl_check_interval = 30
@@ -6640,6 +6666,12 @@ class AutomationApp:
         self.notify_dnd_end_time_var.set(dnd_end)
         self.threshold_settings['notify_dnd_start_time'] = dnd_start
         self.threshold_settings['notify_dnd_end_time'] = dnd_end
+        # F8 快速輸入文字 — 空字串不存（讓 _load_f8_quick_text 回 default）
+        try:
+            qt = str(self.quick_text_f8_var.get())
+        except Exception:
+            qt = F8_QUICK_TEXT_DEFAULT
+        self.threshold_settings['quick_text_f8'] = qt if qt else F8_QUICK_TEXT_DEFAULT
         # 從 Listbox 同步止掛提醒收件人（若 UI 已建立）
         if hasattr(self, 'alert_mail_listbox') and self.alert_mail_listbox is not None:
             try:
@@ -6729,6 +6761,7 @@ class AutomationApp:
             self.show_external_clinics.set(self.threshold_settings.get("show_external_clinics", True))
             self.notify_dnd_start_time_var.set(str(self.threshold_settings.get("notify_dnd_start_time", "00:00")))
             self.notify_dnd_end_time_var.set(str(self.threshold_settings.get("notify_dnd_end_time", "08:00")))
+            self.quick_text_f8_var.set(str(self.threshold_settings.get("quick_text_f8", F8_QUICK_TEXT_DEFAULT)))
             self.auto_reboot_enabled.set(self.auto_reboot_settings.get("enabled", False))
             self.auto_reboot_time.set(self.auto_reboot_settings.get("time", "07:01"))
             if hasattr(self, "threshold_entries"):
@@ -9105,6 +9138,17 @@ class AutomationApp:
         ttk.Entry(reboot_frame, textvariable=self.auto_reboot_time, width=5, justify='center').pack(side=tk.LEFT, padx=2)
         ttk.Label(reboot_frame, text="(前1分閒置才執行)", style="Small.TLabel", foreground="gray").pack(side=tk.LEFT, padx=5)
 
+        # F8 快速輸入文字設定 — 按 F8 → 輸入此欄位文字到目前 focused 控件
+        f8_frame = ttk.LabelFrame(left_column, text="F8 快速輸入文字", padding=10)
+        f8_frame.pack(fill=tk.X, pady=(0, 15))
+        f8_row = ttk.Frame(f8_frame)
+        f8_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(f8_row, text="輸入內容:").pack(side=tk.LEFT)
+        ttk.Entry(f8_row, textvariable=self.quick_text_f8_var, width=24).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(f8_frame,
+                  text=f"按 F8 會在目前游標位置輸入此文字 (預設 {F8_QUICK_TEXT_DEFAULT})。儲存後即時生效，不需重啟。",
+                  foreground="gray", style="Small.TLabel", wraplength=420, justify="left").pack(anchor="w", pady=(2, 0))
+
         # --- 中欄 (原本的右欄 - 醫師列表) ---
         doctors_frame = ttk.LabelFrame(right_column, text="門診醫師代號設定", padding=(12, 12, 12, 10))
         doctors_frame.pack(fill=tk.BOTH, expand=True)
@@ -10116,12 +10160,13 @@ class AutomationApp:
                 'F3':  (script_F3_adaptive,  "F3: 照光(3) — 51019+療程3"),
                 'F4':  (script_F4_adaptive,  "F4: 冷凍 — 51017"),
                 'F5':  (script_F5_adaptive,  "F5: KOH — 13017"),
+                'F8':  (script_F8_quick_text, "F8: 快速輸入文字 (設定頁可改)"),
                 'F9':  (script_F9_adaptive,  "F9: 腫瘤同意書"),
                 'F10': (script_F10_adaptive, "F10: 切片同意書"),
                 'F11': (script_F11_adaptive, "F11: 快速完成 (全部完成→疼痛→預約)"),
             }
             hotkey_info_text = ("F1:照光(1) F2:照光(2) F3:照光(3) F4:冷凍 F5:KOH\n"
-                                "F9:腫瘤 F10:切片 F11:快速完成 F12:中止")
+                                "F8:快速輸入 F9:腫瘤 F10:切片 F11:快速完成 F12:中止")
             if profile in ('1920x1080', '1280x1024', '1024x768'):
                 hotkeys_to_register = dict(_adaptive_descs)
 
@@ -10131,6 +10176,8 @@ class AutomationApp:
             #   2. F1-F5 在 TfrmOpdCS (排檢) 不能執行 → 必須嚴格 (only TFopdmain)
             #   3. F11/F9/F10/F12 在醫院子視窗 (popup/同意書/警告 dialog) 點要
             #      還能觸發 → 寬鬆，允許所有已知醫院 class
+            #   4. F8 (快速輸入文字) 要在「任何 app」都能觸發 (含瀏覽器登入欄位)
+            #      → 完全不檢查 class
             HOTKEY_STRICT_CLASSES = {"TFopdmain"}
             HOTKEY_LENIENT_CLASSES = {
                 "TFopdmain",       # 主視窗
@@ -10148,6 +10195,7 @@ class AutomationApp:
                 "TFrmAllergyM01",  # 過敏記錄維護-醫師端
             }
             STRICT_HOTKEYS = {'F1', 'F2', 'F3', 'F4', 'F5'}
+            NO_GUARD_HOTKEYS = {'F8'}  # 跳過 class 檢查，任何 app 都能觸發
 
             def _hotkey_guard(action_fn, key_name, strict):
                 allow = HOTKEY_STRICT_CLASSES if strict else HOTKEY_LENIENT_CLASSES
@@ -10174,14 +10222,16 @@ class AutomationApp:
             safe_unhook_all_hotkeys()
             for key, (func, name) in hotkeys_to_register.items():
                 f_use = func
-                strict = key in STRICT_HOTKEYS
+                action = lambda f=f_use, n=name: self.run_subsystem_in_thread(f, n)
+                if key in NO_GUARD_HOTKEYS:
+                    # 完全跳過 class guard — 任何 app 都觸發 (e.g. F8 在瀏覽器)
+                    callback = action
+                else:
+                    strict = key in STRICT_HOTKEYS
+                    callback = _hotkey_guard(action, key, strict)
                 hotkey_modules.keyboard.add_hotkey(
                     key,
-                    _hotkey_guard(
-                        lambda f=f_use, n=name: self.run_subsystem_in_thread(f, n),
-                        key,
-                        strict,
-                    ),
+                    callback,
                     suppress=False,
                 )
             # F12 (中止) 用寬鬆 — 任一醫院視窗都能 abort
