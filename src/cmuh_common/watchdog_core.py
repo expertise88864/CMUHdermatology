@@ -318,6 +318,67 @@ def find_matching_pids(procs: list, keyword: str, exclude_pid: int = 0) -> list:
             if kw in p.get("cmdline", "").lower() and p["pid"] != exclude_pid]
 
 
+def _find_pids_holding_mutex(process_keyword: str, mutex_name: str = "") -> list:
+    """[2026-05-22 v36] 當 psutil 抓不到 cmdline 但已知 mutex 被持有時，
+    用 WMIC 突破 psutil 的 admin cmdline 限制。
+
+    psutil 在 admin process 上偶發 NtQueryInformationProcess access denied
+    → cmdline 抓不到 → 找不到要 kill 的 PID。WMIC 的權限模型不同，admin
+    執行 wmic process 通常能拿到 admin process 的 cmdline。
+
+    策略：
+      1. WMIC 列出所有 pythonw.exe + cmdline
+      2. cmdline 含 process_keyword 的 PID 回傳
+      3. WMIC 也失敗 → fallback：psutil 找所有 pythonw.exe (給 caller 自行
+         判斷要不要 kill — 通常只剩 1-2 個 pythonw 候選)
+    """
+    pids = []
+    my_pid = os.getpid()
+    # 嘗試 WMIC (突破 admin cmdline 限制)
+    try:
+        r = subprocess.run(
+            ["wmic", "process", "where", "name='pythonw.exe'",
+             "get", "ProcessId,CommandLine", "/FORMAT:CSV"],
+            capture_output=True, text=True, timeout=10,
+            encoding="utf-8", errors="replace",
+        )
+        if r.returncode == 0 and r.stdout:
+            kw_lower = (process_keyword or "").lower()
+            for line in r.stdout.splitlines():
+                if "," not in line:
+                    continue
+                # CSV: Node,CommandLine,ProcessId
+                parts = line.split(",")
+                if len(parts) < 3:
+                    continue
+                cmdline = parts[1].strip()
+                pid_str = parts[-1].strip()
+                if not pid_str.isdigit():
+                    continue
+                pid = int(pid_str)
+                if pid == my_pid:
+                    continue
+                if kw_lower and kw_lower in cmdline.lower():
+                    pids.append(pid)
+            if pids:
+                return pids
+    except Exception:
+        logging.debug("[watchdog] wmic fallback 例外", exc_info=True)
+
+    # WMIC 也失敗 → 退而求其次列所有 pythonw.exe (caller 自行決定)
+    psutil = _get_psutil()
+    if psutil is None:
+        return []
+    for p in psutil.process_iter(["pid", "name"]):
+        try:
+            n = (p.info.get("name") or "").lower()
+            if n == "pythonw.exe" and p.info["pid"] != my_pid:
+                pids.append(p.info["pid"])
+        except Exception:
+            continue
+    return pids
+
+
 # ─── Kill + start ───────────────────────────────────────────────────────
 def kill_pid(pid: int) -> bool:
     """taskkill /F /PID — 需 admin 才砍得了 admin process。"""
@@ -440,17 +501,59 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
         # mutex 偵測完全跳過 cmdline。對打卡 (max_stale_sec=0 沒 log 新鮮度
         # 可查) 而言這是唯一可靠的存活訊號 — 沒這個就會每 30s 啟新 instance
         # → 撞 mutex 跳「已在執行中」對話框。
+        #
+        # [2026-05-22 v36] 但 mutex held ≠ scheduler thread alive！
+        # 進程還在 (mutex 持有) 但 thread 凍住 (log 不更新) → 半死狀態。
+        # 必須同時檢查 log 新鮮度，凍住的 process 要 kill+restart。
+        # 今天 (5-22 12:15-13:40) 就是這個 bug 害會診沒寄信 — watchdog
+        # heartbeat 每 5 分鐘正常但每次都「mutex 仍 hold 視為健在」直接 return。
         mutex_name = prog.get("mutex_name", "")
+        mutex_held = False
         if mutex_name:
             try:
                 from cmuh_common.single_instance import is_instance_running
-                if is_instance_running(mutex_name):
-                    return (f"~ {name}: psutil 找不到 PID 但 mutex 仍 hold "
-                            f"({mutex_name.rsplit(chr(92), 1)[-1]})，視為健在 [{mode}]")
+                mutex_held = is_instance_running(mutex_name)
             except Exception:
                 logging.debug("[watchdog] mutex 偵測例外", exc_info=True)
+
+        # mutex 持有 + log 新鮮 → 真的健在
+        if mutex_held:
+            if log_path is not None and max_stale > 0 and log_path.exists():
+                try:
+                    age = time.time() - log_path.stat().st_mtime
+                    if age < max_stale:
+                        return (f"~ {name}: psutil 找不到 PID 但 mutex 仍 hold "
+                                f"+ log {age:.0f}s 前剛更新，視為健在 [{mode}]")
+                    # mutex 仍持有但 log stale → 半死狀態，需要 kill+restart
+                    # 但 psutil 找不到 PID，怎麼 kill？用 mutex name 找對應 process
+                    logging.warning(
+                        "[watchdog] %s: mutex 持有但 log %.0fs 沒更新 (>%ds) — "
+                        "process 半死，嘗試找 PID 強制 kill", name, age, max_stale)
+                    half_dead_pids = _find_pids_holding_mutex(keyword, mutex_name)
+                    if half_dead_pids:
+                        if not claim_action_lock(name, action_lock_sec):
+                            return (f"⏭ {name}: 半死狀態但 lock 還新，"
+                                    f"這輪先跳過 [{mode}]")
+                        killed = [pid for pid in half_dead_pids if kill_pid(pid)]
+                        time.sleep(2)
+                        if not _record_restart_and_check_crash_loop(name):
+                            until = _SUSPENDED_UNTIL.get(name, 0.0)
+                            remain = max(0, int(until - time.time()))
+                            return (f"⛔ {name}: 半死且 crash loop，"
+                                    f"暫停 {remain // 60} 分鐘 [{mode}]")
+                        new_pid = start_program(pyw_path, pythonw)
+                        return (f"⟳ {name}: mutex 持有但 log {age:.0f}s 沒更新，"
+                                f"killed {killed} → 重啟 PID {new_pid} [{mode}]")
+                    return (f"⚠ {name}: mutex 持有但 log stale，"
+                            f"找不到 PID 無法 kill (建議手動重啟) [{mode}]")
+                except Exception:
+                    logging.debug("[watchdog] mutex+log 檢查例外", exc_info=True)
+            # max_stale=0 (打卡)：沒 log 新鮮度可查，仍視為健在 (原本邏輯)
+            return (f"~ {name}: psutil 找不到 PID 但 mutex 仍 hold "
+                    f"({mutex_name.rsplit(chr(92), 1)[-1]})，視為健在 [{mode}]")
+
         # [Fallback 2] log 還新鮮 → 程式幾乎肯定健在，psutil 找不到只是
-        # cmdline access 失敗。
+        # cmdline access 失敗。(mutex 沒持有 → 不會誤判)
         if log_path is not None and max_stale > 0 and log_path.exists():
             try:
                 age = time.time() - log_path.stat().st_mtime
