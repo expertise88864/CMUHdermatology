@@ -2340,18 +2340,19 @@ def _f11_快速完成_main(label: str = "F11") -> bool:
 def script_F11_adaptive():
     """F11 (解析度無關)：快速完成 — 全部完成 + 任意順序 popup 處理。
 
-    [2026-05-22 v40] 移除 ForegroundProtector — F11 流程短 (5-10s)，user 通常
-    停在 西醫門診系統 不會切走。protector 每 0.1s GetForegroundWindow 對
-    可能正在 server roundtrip 的 app 是不必要的負擔，且若 tracked_user_hwnd
-    被設到別的視窗會 SetForegroundWindow 反而打亂 popup 的正常 focus 鏈。
-    F9/F10 因為流程長 (30s+) 才需要 protector，F11 不需要。
+    [2026-05-22 v44] 重新加回 ForegroundProtector — user 確認需要這個保護：
+    切到 Chrome / 其他視窗看資料時，popup 不要搶回 focus 打斷工作。
+
+    Protector 機制：背景 thread 每 0.1s 偵測 foreground，user 切到非醫院視窗
+    時記下；popup 搶 foreground 時 SetForegroundWindow 回 user 視窗。
+    我們的 click 走 PostMessage 不需 foreground → popup 在背景一樣會被點掉。
+
+    對醫院 app 額外送的訊息：GetForegroundWindow 是 kernel-only (零訊息)，
+    SetForegroundWindow 只在 user 切走時偶發呼叫 (1-2 個 system 訊息)，
+    不會塞爆 app message pump。
     """
     logging.info("--- Executing F11 (快速完成 adaptive) ---")
-    try:
-        ok = _f11_快速完成_main(label="F11")
-    except SubsystemInterrupted:
-        ok = False
-        raise
+    ok = _run_with_foreground_protector(_f11_快速完成_main, label="F11")
     logging.info("F11: %s", "done" if ok else "中斷")
 
 
