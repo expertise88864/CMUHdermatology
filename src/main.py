@@ -1901,39 +1901,60 @@ def _f11_handle_breast_screening(hwnd: int, label: str = "") -> bool:
 
 def _f11_handle_primary_care_refer(hwnd: int, label: str = "") -> bool:
     """健保初級照護轉診訊息 (class=TfChkSpecList)：
-    勾「99.本院療程尚未結束，本次不轉院」TGroupButton → 點「確認」TButton。"""
+    勾「99.本院療程尚未結束，本次不轉院」TGroupButton → 點「確認」TButton。
+
+    [2026-05-22 v32] 加 readiness poll + retry — 實測 popup 開後 radio 不一定
+    立刻 Enabled，硬 sleep 0.12s 偶爾不夠 → 找不到 target_radio → handler 失敗
+    → user 看到 popup 沒被處理。修法：poll 等 radio Enabled (up to 1.5s)
+    + click 失敗 retry 一次。
+    """
     logging.info("[%s] 健保初級照護轉診 popup hwnd=%s → 勾 99.本院療程尚未結束 + 確認",
                   label, hwnd)
-    time.sleep(0.12)
-    check_stop()
 
-    # 找 radio「99.本院療程尚未結束，本次不轉院」
-    radios = _find_descendants_by_exact_text(
-        hwnd, "TGroupButton", "99.本院療程尚未結束，本次不轉院")
+    # Poll 等 radio 變 Enabled (Delphi popup OnShow 後可能還在 init)
     target_radio = 0
-    for rh, _, _ in radios:
-        try:
-            if (ctypes.windll.user32.IsWindowVisible(rh)
-                    and ctypes.windll.user32.IsWindowEnabled(rh)):
-                target_radio = rh
-                break
-        except Exception:
-            continue
+    ready_deadline = time.time() + 1.5
+    while time.time() < ready_deadline:
+        radios = _find_descendants_by_exact_text(
+            hwnd, "TGroupButton", "99.本院療程尚未結束，本次不轉院")
+        for rh, _, _ in radios:
+            try:
+                if (ctypes.windll.user32.IsWindowVisible(rh)
+                        and ctypes.windll.user32.IsWindowEnabled(rh)):
+                    target_radio = rh
+                    break
+            except Exception:
+                continue
+        if target_radio:
+            break
+        time.sleep(0.05)
+        check_stop()
 
     if not target_radio:
-        logging.warning("[%s]   找不到 99.本院療程尚未結束 radio", label)
+        logging.warning("[%s]   1.5s 內找不到可點的 99.本院療程尚未結束 radio", label)
         return False
 
-    _post_click_to_control(target_radio)
-    logging.info("[%s]   已勾 radio (hwnd=%s)", label, target_radio)
-    time.sleep(0.12)
-    check_stop()
+    # Try radio click + 確認 click, retry once if popup didn't close
+    for attempt in range(2):
+        _post_click_to_control(target_radio)
+        logging.info("[%s]   已勾 radio (hwnd=%s, attempt %d)",
+                      label, target_radio, attempt + 1)
+        time.sleep(0.12)
+        check_stop()
 
-    if _click_button_normalized_text(hwnd, "確認"):
-        logging.info("[%s]   已點 確認", label)
-        _wait_window_closed(hwnd, timeout=5)
-        return True
-    logging.warning("[%s]   找不到 確認 button", label)
+        if _click_button_normalized_text(hwnd, "確認"):
+            logging.info("[%s]   已點 確認 (attempt %d)", label, attempt + 1)
+            if _wait_window_closed(hwnd, timeout=3):
+                return True
+            logging.warning("[%s]   點 確認 後 popup 未關 (attempt %d/2)",
+                              label, attempt + 1)
+        else:
+            logging.warning("[%s]   找不到 確認 button (attempt %d/2)",
+                              label, attempt + 1)
+        if attempt == 0:
+            time.sleep(0.3)
+            check_stop()
+    logging.warning("[%s]   retry 2 次仍失敗", label)
     return False
 
 
@@ -2057,16 +2078,17 @@ _F11_POPUP_HANDLERS = [
 def _f11_popup_watcher(label: str = "F11",
                         total_timeout: float = 240.0,
                         idle_timeout_initial: float = 8.0,
-                        idle_timeout_after_popup: float = 45.0) -> int:
+                        idle_timeout_after_popup: float = 90.0) -> int:
     """輪詢已知 popup → 依現身順序執行對應 handler。
 
     - total_timeout：整個輪詢最久跑這麼久 (240s = 4 分鐘)
     - idle_timeout_initial：還沒處理任何 popup 時，連續沒看到 popup 多久就放棄 (8s)
       → 給「全部完成」按下後 popup 出現的時間
-    - idle_timeout_after_popup：已處理過 ≥1 個 popup 後的等待 (45s)
+    - idle_timeout_after_popup：已處理過 ≥1 個 popup 後的等待 (90s)
       → 給 chain 中下一個慢慢出現的 popup 充裕時間
-      (實測 2026-05-19 12:04-12:06：預約掛號 在「健保藥費確認」處理後可能要
-       > 1 分鐘才出現，先前 15s 來不及抓到 → 拉長到 45s 安全)
+      [2026-05-22 v32] 45s→90s — user 報告「健保初級照護轉診」(chain 末端)
+        偶爾在 > 45s 才出現，watcher 已 idle out 退出 → user 必須手動處理 +
+        再按 F11。90s 給更充裕緩衝，total_timeout 240s 仍是安全上限。
 
     F12 仍可隨時中止；4 分鐘 total 是安全上限，正常 chain 不會跑這麼久。
 
@@ -2075,6 +2097,9 @@ def _f11_popup_watcher(label: str = "F11",
     start = time.time()
     last_seen = time.time()
     handled = set()  # 已處理過的 hwnd，避免重複
+    # [2026-05-22 v32] 每個 hwnd 的 retry 次數 — 若 handler 回 False 但 popup
+    # 還在 (race 沒按到 / radio 還沒 enable)，給最多 3 次機會，超過就放棄不再卡
+    retry_counter: dict = {}
     handled_count = 0
     last_progress_log = time.time()
 
@@ -2110,13 +2135,29 @@ def _f11_popup_watcher(label: str = "F11",
         for cls_name, title_kw, handler in _F11_POPUP_HANDLERS:
             hwnd = _find_window_by_class_title(cls_name, title_kw)
             if hwnd and hwnd not in handled:
+                # [2026-05-22 v32] 追蹤每個 hwnd 的 retry 次數，避免無限迴圈
+                attempts = retry_counter.get(hwnd, 0)
+                ok = False
                 try:
-                    handler(hwnd, label=label)
+                    ok = bool(handler(hwnd, label=label))
                 except Exception:
                     logging.error("[%s] handler %s 例外", label, cls_name,
                                     exc_info=True)
-                handled.add(hwnd)
-                handled_count += 1
+                # 若 handler 成功 OR popup 已關 (user 可能手動關了) OR 已試 3 次
+                # → 標記 handled，不再 retry
+                popup_still_open = bool(
+                    ctypes.windll.user32.IsWindow(hwnd))
+                if ok or not popup_still_open or attempts >= 2:
+                    handled.add(hwnd)
+                    handled_count += 1
+                    if not ok and not popup_still_open:
+                        logging.info("[%s] %s popup 已關 (可能 user 手動)，"
+                                       "標記 handled", label, cls_name)
+                else:
+                    retry_counter[hwnd] = attempts + 1
+                    logging.warning(
+                        "[%s] %s handler 回 False 且 popup 仍存在 → "
+                        "第 %d 次後 retry", label, cls_name, attempts + 1)
                 last_seen = time.time()
                 last_progress_log = time.time()
                 found_one = True
