@@ -2115,6 +2115,55 @@ _F11_POPUP_HANDLERS = [
 ]
 
 
+def _scan_unknown_popups(known_classes: set, seen: dict, label: str) -> None:
+    """[2026-05-22 v41] F11 watcher 期間掃所有 visible top-level windows，
+    若 class 不在已知清單就記下來。User 看 log 就知道有哪些 popup 我們不認識。
+
+    seen dict: {hwnd: (class, title, first_ts)} — 持續累積，第一次見才 log
+    """
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def cb(hwnd, lparam):
+        try:
+            if not ctypes.windll.user32.IsWindowVisible(hwnd):
+                return True
+            if hwnd in seen:
+                return True
+            cls_buf = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(hwnd, cls_buf, 64)
+            cls = cls_buf.value
+            if cls in known_classes:
+                return True
+            # 過濾零尺寸 / 太小的視窗 (tooltip / hint)
+            r = wintypes.RECT()
+            if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r)):
+                return True
+            w, h = r.right - r.left, r.bottom - r.top
+            if w < 100 or h < 40:
+                return True
+            n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+            title = ""
+            if n > 0:
+                t_buf = ctypes.create_unicode_buffer(n + 1)
+                ctypes.windll.user32.GetWindowTextW(hwnd, t_buf, n + 1)
+                title = t_buf.value
+            seen[hwnd] = (cls, title, time.time())
+            logging.warning(
+                "[%s][unknown-popup] 偵測到未知 visible 視窗: class='%s' "
+                "title='%s' hwnd=%s rect=(%dx%d at %d,%d) — 若這擋住流程請告訴開發者",
+                label, cls, title[:60], hwnd, w, h, r.left, r.top)
+        except Exception:
+            pass
+        return True
+
+    try:
+        ctypes.windll.user32.EnumWindows(cb, 0)
+    except Exception:
+        pass
+
+
 def _f11_popup_watcher(label: str = "F11",
                         total_timeout: float = 60.0) -> int:
     """輪詢已知 popup → 依現身順序執行對應 handler。
@@ -2137,6 +2186,18 @@ def _f11_popup_watcher(label: str = "F11",
     retry_counter: dict = {}
     handled_count = 0
     last_progress_log = time.time()
+    # [2026-05-22 v41] 未知 popup 偵測 — 列出所有 visible top-level windows
+    # 跟已知 9 個 class 比對，找出我們不認識的視窗 (這是 user 報「F11 卡死」
+    # 但 watcher 0 個 popup 的根因 — 真的有 popup，只是我們不知道它的 class)。
+    known_classes = {c for c, _, _ in _F11_POPUP_HANDLERS}
+    known_classes.update({
+        "TFopdmain", "TFOpdselpt",  # 主程式 + 病患選擇
+        "Button", "Static", "Edit", "msctls_statusbar32",  # Windows 標準
+        "Shell_TrayWnd", "Progman", "WorkerW",  # Windows shell
+        "MSCTFIME UI", "IME", "Default IME",  # IME
+        "tooltips_class32", "TToolBar95",  # tooltips/toolbar
+    })
+    unknown_seen: dict = {}  # hwnd → (class, title, first_seen_ts)
 
     while time.time() - start < total_timeout:
         check_stop()
@@ -2148,6 +2209,15 @@ def _f11_popup_watcher(label: str = "F11",
                 fg_cls_buf = ctypes.create_unicode_buffer(64)
                 ctypes.windll.user32.GetClassNameW(fg, fg_cls_buf, 64)
                 if fg_cls_buf.value == "TFOpdselpt":
+                    if unknown_seen:
+                        logging.warning(
+                            "[%s] 未知 popup 統計 (F11 期間觀察到 %d 個 unknown "
+                            "視窗 — 若有 popup 卡住沒處理可能就是這些):",
+                            label, len(unknown_seen))
+                        for h, (c, t, _) in unknown_seen.items():
+                            logging.warning(
+                                "[%s]   unknown hwnd=%s class='%s' title='%s'",
+                                label, h, c, t[:60])
                     logging.info(
                         "[%s] 偵測到病患選擇畫面 (TFOpdselpt) 為前景 → "
                         "F11 流程完成，watcher 結束 (處理 %d 個 popup)",
@@ -2155,6 +2225,12 @@ def _f11_popup_watcher(label: str = "F11",
                     return handled_count
         except Exception:
             pass
+
+        # [v41] 偵測 unknown popup — 列舉所有 visible top-level windows
+        try:
+            _scan_unknown_popups(known_classes, unknown_seen, label)
+        except Exception:
+            logging.debug("[%s] unknown popup scan 例外", label, exc_info=True)
 
         found_one = False
         for cls_name, title_kw, handler in _F11_POPUP_HANDLERS:
