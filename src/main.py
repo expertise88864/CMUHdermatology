@@ -2161,12 +2161,22 @@ def _f11_popup_watcher(label: str = "F11",
             hwnd = _find_window_by_class_title(cls_name, title_kw)
             if hwnd and hwnd not in handled:
                 attempts = retry_counter.get(hwnd, 0)
+                # [2026-05-22 v40] 每 popup 處理前後打 timestamp，定位卡死
+                t_handler_start = time.time()
+                logging.info("[%s][timeline] 偵測到 popup %s hwnd=%s "
+                              "(+%.1fs since F11 start)，呼叫 handler",
+                              label, cls_name, hwnd,
+                              time.time() - start)
                 ok = False
                 try:
                     ok = bool(handler(hwnd, label=label))
                 except Exception:
                     logging.error("[%s] handler %s 例外", label, cls_name,
                                     exc_info=True)
+                t_handler_end = time.time()
+                logging.info("[%s][timeline] handler %s 完成 (ok=%s, 耗時 %.0fms)",
+                              label, cls_name, ok,
+                              (t_handler_end - t_handler_start) * 1000)
                 # 若 handler 成功 OR popup 已關 (user 可能手動關了) OR 已試 3 次
                 # → 標記 handled，不再 retry
                 popup_still_open = bool(
@@ -2184,11 +2194,10 @@ def _f11_popup_watcher(label: str = "F11",
                         "第 %d 次後 retry", label, cls_name, attempts + 1)
                 last_progress_log = time.time()
                 found_one = True
-                # [2026-05-22 v39] 處理完 popup 後 sleep 0.12→0.8s — 給 app 處理
-                # 我們的 click + 可能觸發下個 popup 的 server roundtrip 完成。
-                # 原本立刻下一輪 polling，app 還在處理我們的 click 就被打擾。
-                # User 明確指示「不一定要秒按」，慢一點換穩定。
-                time.sleep(0.8)
+                # [2026-05-22 v40] v39 的 0.8s 沒解決卡死 (卡死是醫院 app 自己
+                # 處理 server roundtrip)，反而拖慢偵測。回到 0.3s — 給 app
+                # 處理我們 click 跟可能下個 popup 開啟的時間，但不過度。
+                time.sleep(0.3)
                 break  # 從頭再掃一輪 (這次處理完可能觸發下個 popup)
 
         if not found_one:
@@ -2200,8 +2209,7 @@ def _f11_popup_watcher(label: str = "F11",
                     "已執行 %.1fs (上限 %.0fs，F12 可中止)",
                     label, handled_count, elapsed, total_timeout)
                 last_progress_log = time.time()
-            # [2026-05-22 v39] no-popup 時 sleep 0.25→0.4s 更輕對 app message
-            # pump。popup 出現到偵測延遲最多 0.4s — user 「不一定要秒按」
+            # 沒 popup 時 0.4s polling — 體感即時 + 對 message pump 負擔輕
             time.sleep(0.4)
 
     logging.info("[%s] watcher 達總時限 %.0fs (處理 %d 個)",
@@ -2210,39 +2218,63 @@ def _f11_popup_watcher(label: str = "F11",
 
 
 def _f11_快速完成_main(label: str = "F11") -> bool:
-    """F11 主流程：點 全部完成 → 輪詢任意順序 popup。"""
+    """F11 主流程：點 全部完成 → 輪詢任意順序 popup。
+
+    [2026-05-22 v40] 加 timing log 全程診斷 user 報告的「西醫門診系統當機卡死」。
+    每個關鍵點都打 timestamp，跑一次後查 log 看是哪一步觸發 freeze。
+    """
+    t_f11_start = time.time()
     main_hwnd = _find_hospital_main_window()
     if not main_hwnd:
         logging.warning("[%s] 找不到主程式視窗", label)
         return False
+    logging.info("[%s][timeline] 找到 main_hwnd=%s (+%.0fms)",
+                  label, main_hwnd, (time.time() - t_f11_start) * 1000)
 
     # Step 1: 點「全部完成」TButton
     btns = _find_descendants_by_exact_text(main_hwnd, "TButton", "全部完成")
+    t_after_enum = time.time()
+    logging.info("[%s][timeline] EnumChildWindows 找 全部完成 button: %d 個 (+%.0fms total)",
+                  label, len(btns), (t_after_enum - t_f11_start) * 1000)
     if not btns:
         logging.warning("[%s] 找不到 全部完成 button", label)
         return False
     _post_click_to_control(btns[0][0])
-    logging.info("[%s] 已點 全部完成 (hwnd=%s)，sleep 2s 給 app 跑 server roundtrip",
-                  label, btns[0][0])
+    t_clicked = time.time()
+    logging.info("[%s][timeline] PostMessage 全部完成 click 完成 (hwnd=%s, +%.0fms)，"
+                  "sleep 0.5s 給 app 起始 settle",
+                  label, btns[0][0], (t_clicked - t_after_enum) * 1000)
 
-    # [2026-05-22 v39] 全部完成 click 後給 2s 完全不打擾 app。
-    # 原本立刻進入 watcher polling → 每秒 ~36 次 Win32 call 灌進已塞滿的
-    # message pump → user 看到「卡住」。改成「先讓 app 跑完初始 server
-    # roundcheck (allergy / 健保 / 結算 / 轉診觸發)」，第一波 popup 自然會
-    # 出現在 2s 內。我們等 2s 後再開始 polling，犧牲 2s 體感速度換穩定。
-    time.sleep(2.0)
+    # [2026-05-22 v40] 退回 v39 的 2s → 0.5s。實測 2s 沒解決「卡死」(因為卡死是
+    # 醫院 app 自己在處理 server roundtrip，跟我們 polling 無關)，反而拖慢
+    # popup 偵測。0.5s 給 app 進入 OnAllComplete 把 first popup 開出來。
+    time.sleep(0.5)
     check_stop()
+    logging.info("[%s][timeline] 0.5s 後開始 watcher polling (+%.0fs total)",
+                  label, time.time() - t_f11_start)
 
     # Step 2: 輪詢已知 popup (任意順序、可能跳過)
     _f11_popup_watcher(label=label)
+    logging.info("[%s][timeline] F11 完整結束，總執行時間 %.1fs",
+                  label, time.time() - t_f11_start)
     return True
 
 
 def script_F11_adaptive():
     """F11 (解析度無關)：快速完成 — 全部完成 + 任意順序 popup 處理。
-    背景保護同 F9/F10：使用者切走後 popup 不會搶回 focus。"""
+
+    [2026-05-22 v40] 移除 ForegroundProtector — F11 流程短 (5-10s)，user 通常
+    停在 西醫門診系統 不會切走。protector 每 0.1s GetForegroundWindow 對
+    可能正在 server roundtrip 的 app 是不必要的負擔，且若 tracked_user_hwnd
+    被設到別的視窗會 SetForegroundWindow 反而打亂 popup 的正常 focus 鏈。
+    F9/F10 因為流程長 (30s+) 才需要 protector，F11 不需要。
+    """
     logging.info("--- Executing F11 (快速完成 adaptive) ---")
-    ok = _run_with_foreground_protector(_f11_快速完成_main, label="F11")
+    try:
+        ok = _f11_快速完成_main(label="F11")
+    except SubsystemInterrupted:
+        ok = False
+        raise
     logging.info("F11: %s", "done" if ok else "中斷")
 
 
