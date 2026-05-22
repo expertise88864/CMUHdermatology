@@ -644,10 +644,19 @@ def perform_clock_action(driver, wait, acc, is_in: bool,
 def process_clock_task(schedule_key: str | None) -> None:
     if schedule_key is None:
         return
-    if clock_lock.locked():
-        logging.warning("任務 %s 觸發，但上一個任務尚未結束，正在等待...", schedule_key)
-
+    # [2026-05-22 v43] 修致命 bug — clock_lock 是 RLock (task #68 從 Lock 改的，
+    # 因 janitor + process_clock_task 重入會 deadlock)，但 RLock **沒有**
+    # .locked() method (只有 threading.Lock 有)。原本這行每次排程觸發都
+    # AttributeError → process_clock_task crash → 打卡完全失效。
+    # 純 informational warning，移除即可 (actual locking 仍由 with clock_lock 處理)。
+    # 若真的有重入會在下面 with clock_lock 直接阻塞。
+    t_wait_start = time.time()
     with clock_lock:
+        wait_ms = (time.time() - t_wait_start) * 1000
+        if wait_ms > 100:
+            logging.warning(
+                "任務 %s 取得 clock_lock 等了 %.0fms (上一個任務還沒結束)",
+                schedule_key, wait_ms)
         is_in = "_in" in schedule_key
         try:
             task_type = schedule_key.split("_", 1)[1]
