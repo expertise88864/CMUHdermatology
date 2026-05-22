@@ -2116,10 +2116,16 @@ _F11_POPUP_HANDLERS = [
 
 
 def _scan_unknown_popups(known_classes: set, seen: dict, label: str) -> None:
-    """[2026-05-22 v41] F11 watcher 期間掃所有 visible top-level windows，
-    若 class 不在已知清單就記下來。User 看 log 就知道有哪些 popup 我們不認識。
+    """[2026-05-22 v41/v42] F11 watcher 期間掃所有 visible top-level windows，
+    若 class 不在已知清單就記下來。
 
-    seen dict: {hwnd: (class, title, first_ts)} — 持續累積，第一次見才 log
+    [v42] 為了不對醫院 app 送任何跨 process 訊息，全程只用 kernel-only API：
+      - IsWindowVisible: kernel-only ✓
+      - GetClassName: kernel-only ✓ (Windows 維護 class atom table)
+      - GetWindowRect: kernel-only ✓
+      - GetWindowText: 跨 process WM_GETTEXT ✗ (移除，title 不取)
+    這樣 unknown scan 對醫院 app 是 **完全零訊息**。
+    User 看到 log 中的 unknown class 後可用 抓取當前視窗結構.cmd 取得詳細資訊。
     """
     EnumWindowsProc = ctypes.WINFUNCTYPE(
         wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -2136,24 +2142,19 @@ def _scan_unknown_popups(known_classes: set, seen: dict, label: str) -> None:
             cls = cls_buf.value
             if cls in known_classes:
                 return True
-            # 過濾零尺寸 / 太小的視窗 (tooltip / hint)
             r = wintypes.RECT()
             if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r)):
                 return True
             w, h = r.right - r.left, r.bottom - r.top
             if w < 100 or h < 40:
                 return True
-            n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-            title = ""
-            if n > 0:
-                t_buf = ctypes.create_unicode_buffer(n + 1)
-                ctypes.windll.user32.GetWindowTextW(hwnd, t_buf, n + 1)
-                title = t_buf.value
-            seen[hwnd] = (cls, title, time.time())
+            # [v42] 不再 GetWindowText — class + rect 已足夠識別 unknown popup
+            seen[hwnd] = (cls, "", time.time())
             logging.warning(
                 "[%s][unknown-popup] 偵測到未知 visible 視窗: class='%s' "
-                "title='%s' hwnd=%s rect=(%dx%d at %d,%d) — 若這擋住流程請告訴開發者",
-                label, cls, title[:60], hwnd, w, h, r.left, r.top)
+                "hwnd=%s rect=(%dx%d at %d,%d) — 若這擋住 F11 流程，請開 "
+                "抓取當前視窗結構.cmd 拍 snapshot 給開發者",
+                label, cls, hwnd, w, h, r.left, r.top)
         except Exception:
             pass
         return True
