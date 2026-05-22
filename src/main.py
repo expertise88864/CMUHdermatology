@@ -3385,8 +3385,12 @@ def _f9_f10_round2_popup_actions(popup_hwnd: int, label: str = "") -> bool:
                   label, radio_局麻, len(same_row))
 
     # 勾 局麻 — 用 BM_CLICK 觸發 Delphi onClick (radio group 會自動 uncheck 其他)
+    # [2026-05-22 v33/重新套用] 從 SendMessageW 改 SendMessageTimeoutW 100ms —
+    # 原本 SendMessage 同步等 Delphi onClick handler 跑完 (re-render radio group +
+    # 觸發 paint cycle)，user 報 1-2s 卡頓 stall。SendMessageTimeout 100ms
+    # 內不回就 abort 等待 (Delphi 仍會處理該訊息，只是我們不卡)。
     BM_CLICK = 0x00F5
-    ctypes.windll.user32.SendMessageW(radio_局麻, BM_CLICK, 0, 0)
+    _send_message_timeout(radio_局麻, BM_CLICK, 0, 0, timeout_ms=100)
     # 補：PostMessage click 作備援（某些 TGroupButton BM_CLICK 不一定觸發）
     _post_click_to_control(radio_局麻)
     logging.info("[%s] 已勾 局麻 (BM_CLICK + LBUTTON)", label)
@@ -3486,11 +3490,43 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
     # Step 6 (Round 2): 等 popup (Tfm_agree) 出現
     # popup 可能要等 hospital app 從 server load 病歷資料、塞 TEdit、render UI，
     # 約 5-30 秒。timeout 60s 留充裕空間，poll 100ms 一次。
-    popup = _wait_for_window("Tfm_agree", title_kw="列印同意", timeout=60)
+    # [2026-05-22 v37] 若病患未滿 18 歲，Delphi 會先跳一個 TMessageForm
+    # title=Information 的 modal dialog (只有 &Yes button) 擋住 popup。
+    # 必須先點 Yes 才會繼續開 Tfm_agree。所以這個 loop 也 poll 該 dialog
+    # 並自動 click Yes。
+    popup = None
+    age_dlg_handled = False
+    popup_deadline = time.time() + 60
+    while time.time() < popup_deadline:
+        # 先檢查目標 popup
+        candidate = _find_window_by_class_title("Tfm_agree",
+                                                  title_kw="列印同意")
+        if candidate:
+            popup = candidate
+            break
+        # 同時檢查 未滿18歲 Information dialog (TMessageForm + title=Information)
+        if not age_dlg_handled:
+            info_dlg = _find_window_by_class_title("TMessageForm",
+                                                     title_kw="Information")
+            if info_dlg:
+                # dialog 只有 1 個 TButton (&Yes)，直接 enum + click
+                buttons = _enum_class_in_window(info_dlg, "TButton")
+                if buttons:
+                    _post_click_to_control(buttons[0][0])
+                    logging.info(
+                        "[%s] 偵測到未滿18歲 Information dialog (hwnd=%s)，"
+                        "已自動點 Yes (button hwnd=%s)",
+                        label, info_dlg, buttons[0][0])
+                    age_dlg_handled = True
+                    time.sleep(0.3)  # 給 Delphi 處理 dismiss + 開 popup
+                    continue
+        time.sleep(0.1)
+        check_stop()
     if not popup:
-        logging.warning("[%s] 等不到 popup (Tfm_agree)", label)
+        logging.warning("[%s] 等不到 popup (Tfm_agree) 60s 超時", label)
         return False
-    logging.info("[%s] popup hwnd=%s 已開啟", label, popup)
+    logging.info("[%s] popup hwnd=%s 已開啟 (年齡 dialog 處理=%s)",
+                  label, popup, age_dlg_handled)
     # popup 視窗出現 ≠ 資料 load 完。Delphi 通常 popup 先 paint 空白 → 再從病歷
     # 帶入欄位資料。若太早 clear，後續 load 會覆蓋掉我們清空的字。
     # [2026-05-22 v30] 改成 event-driven poll — 等 所患疾病 TEdit 有內容才視為
