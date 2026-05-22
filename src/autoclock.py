@@ -109,6 +109,12 @@ tray_icon_object = None
 log_queue: queue.Queue = queue.Queue(maxsize=5000)
 clock_lock = threading.RLock()  # 【穩定性 2026-05-21】RLock 避免 janitor 與 process_clock_task 重入時 deadlock
 
+# [2026-05-22 v45 P0-1] scheduler liveness — 給 self-watchdog 用，跟 consult_query
+# 同一套 pattern。每次 scheduler_loop iteration 更新 last_tick；watchdog 偵測
+# > 180s 沒 tick 視為 thread 卡死，> 20s 沒解套就 os._exit(1) 讓 process 重啟。
+_AUTOCLOCK_LIVENESS = {"last_tick": 0.0}
+_scheduler_thread_ref: threading.Thread | None = None
+
 # =============================================================================
 # [autoclock 常駐 Chrome 池]
 # 原本每個排程任務都新開 Chrome（~3 秒啟動）；改成跨任務重用同一 driver。
@@ -128,20 +134,24 @@ _PERSISTENT_DRIVER_IDLE_TIMEOUT = 15 * 60  # 15 分鐘無使用 → 主動 quit
 
 
 def _get_or_create_clock_driver():
-    """取得常駐 driver；若 idle 過久或健康檢查失敗則重建。"""
+    """取得常駐 driver；若 idle 過久或健康檢查失敗則重建。
+
+    [2026-05-22 v45 P0-2 修補] driver.quit() 移到 lock 外 — 原本持鎖 quit
+    若 quit hang (chromedriver 沒回應，最多 30s) → 所有等 lock 的 caller 全卡。
+    task #68 標 completed 但只改了部分 path，此處 idle/health-check 仍持鎖 quit。
+    """
     pool = _persistent_driver_pool
+    old_driver_to_quit = None  # 鎖外才能 quit 的 driver
+
     with pool["lock"]:
         d = pool["driver"]
         now = time_module.time()
 
-        # idle 過久 → quit 重建
+        # idle 過久 → 標記重建 (quit 鎖外做)
         if d is not None and (now - pool["last_used"]) > _PERSISTENT_DRIVER_IDLE_TIMEOUT:
             logging.info("[autoclock] driver idle 超過 %d 分鐘，重建",
                          _PERSISTENT_DRIVER_IDLE_TIMEOUT // 60)
-            try:
-                d.quit()
-            except Exception:
-                pass
+            old_driver_to_quit = d
             d = None
             pool["driver"] = None
 
@@ -151,41 +161,75 @@ def _get_or_create_clock_driver():
                 _ = d.window_handles
             except Exception:
                 logging.info("[autoclock] driver 已死，重建")
-                try:
-                    d.quit()
-                except Exception:
-                    pass
+                old_driver_to_quit = d
                 d = None
                 pool["driver"] = None
 
-        # 不存在或剛被清掉 → 重建
-        if d is None:
-            for attempt in range(4):
-                d = initialize_driver()
-                if d:
-                    break
-                logging.warning("[autoclock] WebDriver 初始化失敗 (%s/4)，退避重試", attempt + 1)
-                if attempt < 3:
-                    exponential_backoff_sleep(attempt, base_seconds=2.0, max_seconds=60.0)
-            if d:
-                d.set_script_timeout(30)
-                pool["driver"] = d
+    # 鎖外 quit 舊 driver — 即使 hang 也不影響其他 thread 取得 pool lock
+    if old_driver_to_quit is not None:
+        try:
+            old_driver_to_quit.quit()
+        except Exception:
+            logging.debug("[autoclock] 舊 driver quit 例外", exc_info=True)
 
-        pool["last_used"] = now
+    # 不存在或剛被清掉 → 重建 (initialize 走網路，務必鎖外)
+    if d is None:
+        for attempt in range(4):
+            d = initialize_driver()
+            if d:
+                break
+            logging.warning("[autoclock] WebDriver 初始化失敗 (%s/4)，退避重試", attempt + 1)
+            if attempt < 3:
+                exponential_backoff_sleep(attempt, base_seconds=2.0, max_seconds=60.0)
+        if d:
+            d.set_script_timeout(30)
+            # 鎖內最後 set 回 pool
+            with pool["lock"]:
+                pool["driver"] = d
+                pool["last_used"] = time_module.time()
         return d
+
+    # 走原路徑（既有 driver 仍健康）— 鎖內更新 last_used
+    with pool["lock"]:
+        pool["last_used"] = time_module.time()
+    return d
 
 
 def _release_persistent_clock_driver():
-    """關閉常駐 driver（程式退出時呼叫）。"""
+    """關閉常駐 driver（程式退出時呼叫）。
+
+    [2026-05-22 v45 P1-5 修補] 改 taskkill 不走 driver.quit()。
+    atexit 路徑可能被卡死的 thread 持有 pool lock；driver.quit() 走 HTTP 到
+    chromedriver 也可能 hang 30s。process 退出時應立刻砍掉 chromedriver
+    子進程，不等 graceful shutdown。
+    """
     pool = _persistent_driver_pool
+    # 鎖內只 nullify，鎖外 kill
     with pool["lock"]:
-        d = pool["driver"]
-        if d is not None:
+        pool["driver"] = None
+    # 直接 taskkill chromedriver / chrome (本 process 啟動的)
+    try:
+        import psutil as _psutil
+        my_pid = os.getpid()
+        for p in _psutil.process_iter(["pid", "name", "ppid"]):
             try:
-                d.quit()
-            except Exception:
-                pass
-            pool["driver"] = None
+                n = (p.info.get("name") or "").lower()
+                if "chromedriver" not in n:
+                    continue
+                if p.info.get("ppid") != my_pid:
+                    continue
+                # 連帶 kill 子 chrome
+                for ch in p.children(recursive=True):
+                    try:
+                        ch.kill()
+                    except (_psutil.NoSuchProcess, _psutil.AccessDenied):
+                        pass
+                p.kill()
+            except (_psutil.NoSuchProcess, _psutil.AccessDenied, Exception):
+                continue
+    except Exception:
+        logging.debug("[autoclock] release 時 taskkill chromedriver 例外",
+                       exc_info=True)
 
 
 import atexit as _atexit_clock
@@ -740,31 +784,136 @@ def _idle_driver_janitor() -> None:
 
     讓使用者在沒打卡的空檔不會多佔 ~150-250MB Chrome 進程。
     跟 _get_or_create_clock_driver 的 idle-check 邏輯一致，但這邊主動觸發。
+
+    [2026-05-22 v45 P0-2/P1-7 修補]
+    (1) quit() 移到鎖外 — 原本持鎖 quit 若 hang 30s+ 會卡所有 driver 取得者
+    (2) 整個 body 包 try/except logging.exception — schedule lib 不會 catch
+        user job exception，若這裡丟例外整個 scheduler thread 會死
     """
-    pool = _persistent_driver_pool
-    with pool["lock"]:
-        d = pool["driver"]
-        if d is None:
-            return
-        now = time_module.time()
-        idle_for = now - pool["last_used"]
-        if idle_for > _PERSISTENT_DRIVER_IDLE_TIMEOUT:
-            logging.info("[autoclock] driver idle %.0f 分鐘 (>%.0f 分)，主動 quit 省 RAM",
-                         idle_for / 60, _PERSISTENT_DRIVER_IDLE_TIMEOUT / 60)
+    try:
+        pool = _persistent_driver_pool
+        old_driver_to_quit = None
+
+        with pool["lock"]:
+            d = pool["driver"]
+            if d is None:
+                return
+            now = time_module.time()
+            idle_for = now - pool["last_used"]
+            if idle_for > _PERSISTENT_DRIVER_IDLE_TIMEOUT:
+                logging.info("[autoclock] driver idle %.0f 分鐘 (>%.0f 分)，主動 quit 省 RAM",
+                             idle_for / 60, _PERSISTENT_DRIVER_IDLE_TIMEOUT / 60)
+                old_driver_to_quit = d
+                pool["driver"] = None
+
+        # 鎖外 quit
+        if old_driver_to_quit is not None:
             try:
-                d.quit()
+                old_driver_to_quit.quit()
             except Exception:
                 logging.debug("idle driver quit 例外（忽略）", exc_info=True)
-            pool["driver"] = None
+    except Exception:
+        # schedule lib 不會 catch user job exception，若這裡冒泡會殺整個 scheduler thread
+        logging.exception("[autoclock] _idle_driver_janitor 未預期例外（已吞掉避免殺 thread）")
+
+
+def _autoclock_hard_exit(reason: str, code: int = 1) -> None:
+    """[2026-05-22 v45 P0-1] 強制終止 process，不走 logging.shutdown (會 deadlock)。
+
+    照 consult_query._hard_exit 那套 pattern。
+    """
+    import os as _os
+    try:
+        root_logger = logging.getLogger()
+        for h in list(root_logger.handlers):
+            try:
+                h.flush()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    _os._exit(code)
+
+
+def _autoclock_self_watchdog() -> None:
+    """[2026-05-22 v45 P0-1] autoclock scheduler self-watchdog daemon。
+
+    照 consult_query._scheduler_self_watchdog 那套 pattern：
+      1. scheduler_thread.is_alive()==False → 立刻 _hard_exit (thread 真死)
+      2. last_tick > 180s 沒更新 → log CRITICAL (沒 IMAP socket 可砍，autoclock
+         是 Chrome WebDriver，砍它要走 process kill — 直接走 stage 2)
+      3. > 200s 沒 tick → _hard_exit(1) 強制重啟整個 process
+
+    為什麼 autoclock 需要這個：consult_query 死過、加了 self-watchdog；今天
+    autoclock 死了一整下午 (RLock.locked() AttributeError + 沒 watchdog 救)
+    才被發現。autoclock max_stale_sec=0 配上 mutex 仍持有 → 外層 watchdog 也
+    救不回。沒這個 in-process watchdog 等於沒人看。
+    """
+    DEAD_THRESHOLD = 180
+    KILL_THRESHOLD = 20
+    CHECK_INTERVAL = 30
+    dead_detected_at = 0.0
+    while running.is_set():
+        try:
+            time_module.sleep(CHECK_INTERVAL)
+            # Stage 0: thread 真死了 → 立刻退場
+            global _scheduler_thread_ref
+            if _scheduler_thread_ref is not None and not _scheduler_thread_ref.is_alive():
+                logging.critical(
+                    "[autoclock/self-watchdog] scheduler thread is_alive()=False "
+                    "→ _hard_exit(1) 強制重啟 (外層 watchdog 會接手)")
+                _autoclock_hard_exit("scheduler thread dead", code=1)
+            last = _AUTOCLOCK_LIVENESS.get("last_tick", 0.0)
+            if last == 0.0:
+                continue
+            age = time_module.time() - last
+            if age > DEAD_THRESHOLD and dead_detected_at == 0.0:
+                logging.critical(
+                    "[autoclock/self-watchdog] scheduler 已 %.0f 秒沒 tick "
+                    "(>%.0fs 視為死亡)，準備 hard_exit",
+                    age, DEAD_THRESHOLD)
+                dead_detected_at = time_module.time()
+                continue
+            if dead_detected_at > 0:
+                if last > dead_detected_at:
+                    logging.info("[autoclock/self-watchdog] scheduler 已恢復 tick，取消重啟")
+                    dead_detected_at = 0.0
+                elif time_module.time() - dead_detected_at > KILL_THRESHOLD:
+                    logging.critical(
+                        "[autoclock/self-watchdog] dead 偵測後 %.0fs 仍沒 tick "
+                        "→ _hard_exit(1) 強制重啟 (外層 watchdog 會接手)",
+                        time_module.time() - dead_detected_at)
+                    _autoclock_hard_exit("scheduler stuck", code=1)
+        except Exception:
+            logging.exception("[autoclock/self-watchdog] tick 例外")
 
 
 def scheduler_loop() -> None:
+    """背景排程主迴圈。
+
+    [2026-05-22 v45 P0-1/P1-7 修補]
+    (1) schedule.run_pending() 包 try/except — schedule lib 不會 catch user job
+        例外，會冒泡到此 (今天的 RLock.locked() bug 就是這樣讓 process_clock_task
+        crash 但 scheduler loop 本身倖存，因為它本來就 catch)；保險仍要包。
+    (2) 每 iter 更新 _AUTOCLOCK_LIVENESS["last_tick"] 給 self-watchdog 用
+    (3) 啟動 self-watchdog daemon thread 監看 scheduler thread is_alive + tick
+    """
     logging.info("背景排程器已啟動...")
     schedule.every(1).minute.at(":01").do(_scheduler_tick)
     # [優化] 每 2 分鐘主動檢查 idle driver，過期就 quit (省 ~150-250MB Chrome)
     schedule.every(2).minutes.do(_idle_driver_janitor)
+
+    # [P0-1] 啟動 self-watchdog 子 thread
+    threading.Thread(target=_autoclock_self_watchdog,
+                      name="AutoclockSelfWatchdog", daemon=True).start()
+
     while running.is_set():
-        schedule.run_pending()
+        # [P0-1] heartbeat — 給 self-watchdog 偵測
+        _AUTOCLOCK_LIVENESS["last_tick"] = time_module.time()
+        try:
+            schedule.run_pending()
+        except Exception:
+            logging.exception("[autoclock] scheduler.run_pending 例外 (已吞掉，scheduler 繼續跑)")
         # [優化] 改 5s sleep — schedule 套件本身有 :01 精度，5s 內仍會準時觸發
         # 每分鐘任務。早期 1s 太密；對打卡 job 觀感無差，CPU 用量降 5 倍。
         time_module.sleep(5)
@@ -1124,7 +1273,11 @@ def main() -> None:
             except Exception:
                 pass
 
-        background_thread = threading.Thread(target=scheduler_loop, daemon=True)
+        background_thread = threading.Thread(target=scheduler_loop, daemon=True,
+                                              name="AutoclockScheduler")
+        # [2026-05-22 v45 P0-1] 保存 thread 引用給 self-watchdog 的 is_alive() check
+        global _scheduler_thread_ref
+        _scheduler_thread_ref = background_thread
         background_thread.start()
 
         try:

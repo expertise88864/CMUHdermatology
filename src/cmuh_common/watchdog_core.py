@@ -44,7 +44,7 @@ LOCK_DIR = SETTINGS_DIR / ".watchdog_locks"
 # 【mutex_name】v6 新增 (2026-05-22)：當 psutil 抓不到 admin process 的 cmdline
 # (Windows 偶發 access denied) 時，用 named mutex 偵測該程式是否還活著。
 # 沒這個的話 watchdog 會每 30s 啟新 instance → 撞 mutex 跳「已在執行中」對話框。
-CONFIG_SCHEMA_VERSION = 6
+CONFIG_SCHEMA_VERSION = 7
 
 DEFAULT_CONFIG = {
     "schema_version": CONFIG_SCHEMA_VERSION,
@@ -73,7 +73,11 @@ DEFAULT_CONFIG = {
             "pyw": "中國醫皮膚科打卡程式.pyw",
             "process_match": "中國醫皮膚科打卡程式",
             "mutex_name": "Local\\CMUH_Skin_AutoClock_SingleInstance_v1",
-            "max_stale_sec": 0,    # 打卡 idle 沒 log，只看 process / mutex
+            # [v7 2026-05-22 P1-4] 0→300s — autoclock v45 起每 5s 一定有
+            # scheduler_loop heartbeat (last_tick) + scheduler_tick 每分鐘
+            # 印 log，180s 內沒 log 就視為半死。原本 0 等於不檢查 log，
+            # mutex 仍持有就「視為健在」，跟今天 consult_query 卡死同樣 pattern。
+            "max_stale_sec": 300,
             "enabled": True,
             "outer_only": False,
             "required_config_file": "settings/autoclock_config.json",
@@ -120,6 +124,13 @@ _V5_TO_V6_MUTEX_NAME = {
     "會診查詢": "Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1",
     "打卡": "Local\\CMUH_Skin_AutoClock_SingleInstance_v1",
     "主程式": "Local\\CMUH_Skin_Main_SingleInstance_v1",
+}
+
+# v6 → v7 (2026-05-22)：打卡 max_stale_sec 從 0 改 300 — autoclock v45 起每 5s
+# 有 heartbeat，180-300s 沒 log 就是半死狀態。今天 autoclock RLock bug + mutex
+# 還在 → 外層 watchdog 永遠回「視為健在」沒救起來。
+_V6_TO_V7_MAX_STALE = {
+    "打卡": 300,
 }
 
 # [D] Crash loop 偵測：per-program 啟動歷史 (timestamp list)
@@ -223,6 +234,15 @@ def _migrate_config(cfg: dict) -> tuple:
             mutex = _V5_TO_V6_MUTEX_NAME.get(name, "")
             if mutex:
                 prog.setdefault("mutex_name", mutex)
+    # v6 → v7: 打卡 max_stale_sec 0→300 — autoclock v45 起有 heartbeat，
+    # 外層 watchdog 終於能偵測「process 在但 thread 凍」的半死狀態
+    if cur_v < 7:
+        for prog in cfg.get("programs", []):
+            name = prog.get("name", "")
+            new_stale = _V6_TO_V7_MAX_STALE.get(name)
+            if new_stale is not None:
+                # 強制覆寫 (而非 setdefault) — 舊值 0 是個 bug
+                prog["max_stale_sec"] = new_stale
     cfg["schema_version"] = CONFIG_SCHEMA_VERSION
     return cfg, True
 

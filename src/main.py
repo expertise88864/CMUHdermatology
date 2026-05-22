@@ -901,18 +901,23 @@ _STATUS_DRIVER_IDLE_TIMEOUT = 30 * 60  # 30 分鐘無動作就關閉
 
 
 def _get_or_create_status_driver():
-    """取得常駐 status driver。若不存在或已 idle 超時就重建。"""
+    """取得常駐 status driver。若不存在或已 idle 超時就重建。
+
+    [2026-05-22 v45 P0-2 修補] driver.quit() 移到鎖外。原本持鎖 quit
+    若 chromedriver hang 會卡 30s+，期間所有等 lock 的 caller (掛號狀態
+    refresh、UI thread) 全部排隊。task #69 標 completed 但實際上沒改完。
+    """
     import time as _t
     pool = _status_driver_pool
+    old_driver_to_quit = None
+    need_init = False
+
     with pool["lock"]:
         driver = pool["driver"]
         now = _t.time()
-        # 若 idle 超時，先關閉
+        # 若 idle 超時，先標記重建
         if driver is not None and (now - pool["last_used"]) > _STATUS_DRIVER_IDLE_TIMEOUT:
-            try:
-                driver.quit()
-            except Exception:
-                logging.debug("idle status driver quit 失敗", exc_info=True)
+            old_driver_to_quit = driver
             driver = None
             pool["driver"] = None
         # 健康檢查（驗證 driver 仍可用）
@@ -921,30 +926,64 @@ def _get_or_create_status_driver():
                 _ = driver.window_handles  # 觸發一次 RPC 確認 driver 還活著
             except Exception:
                 logging.info("既有 status driver 已死，重建")
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
+                old_driver_to_quit = driver
                 driver = None
                 pool["driver"] = None
         if driver is None:
-            driver = _initialize_status_driver()
+            need_init = True
+
+    # 鎖外 quit 舊 driver
+    if old_driver_to_quit is not None:
+        try:
+            old_driver_to_quit.quit()
+        except Exception:
+            logging.debug("status driver quit 失敗", exc_info=True)
+
+    if need_init:
+        # initialize 走網路，鎖外做
+        driver = _initialize_status_driver()
+        with pool["lock"]:
             pool["driver"] = driver
-        pool["last_used"] = now
+            pool["last_used"] = _t.time()
         return driver
+
+    with pool["lock"]:
+        pool["last_used"] = _t.time()
+    return driver
 
 
 def _release_status_driver():
-    """程式結束時 quit 常駐 driver。"""
+    """程式結束時 quit 常駐 driver。
+
+    [2026-05-22 v45 P1-5 修補] 改 taskkill 不走 driver.quit()。
+    atexit 路徑可能跟卡死的 thread 互相等鎖；taskkill chromedriver
+    直接砍進程，不等 graceful shutdown，永遠不會 hang。
+    """
     pool = _status_driver_pool
+    # 鎖內只 nullify (不 quit)
     with pool["lock"]:
-        d = pool["driver"]
-        if d is not None:
+        pool["driver"] = None
+    # 鎖外 taskkill chromedriver 子進程
+    try:
+        import psutil as _psutil
+        my_pid = os.getpid()
+        for p in _psutil.process_iter(["pid", "name", "ppid"]):
             try:
-                d.quit()
-            except Exception:
-                pass
-            pool["driver"] = None
+                n = (p.info.get("name") or "").lower()
+                if "chromedriver" not in n:
+                    continue
+                if p.info.get("ppid") != my_pid:
+                    continue
+                for ch in p.children(recursive=True):
+                    try:
+                        ch.kill()
+                    except (_psutil.NoSuchProcess, _psutil.AccessDenied):
+                        pass
+                p.kill()
+            except (_psutil.NoSuchProcess, _psutil.AccessDenied, Exception):
+                continue
+    except Exception:
+        logging.debug("status driver release taskkill 例外", exc_info=True)
 
 
 import atexit as _atexit
