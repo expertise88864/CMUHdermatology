@@ -27,6 +27,15 @@ from cmuh_common.cache_state import (
     decode_date_keys as _decode_cache_date_keys,
     save_json_cache,
 )
+from cmuh_common.clinic_history import (
+    all_time_average_text,
+    historical_duration_totals,
+    last_closing_time as _history_last_closing_time,
+    monthly_slot_metric_avgs as _history_monthly_slot_metric_avgs,
+    prev_session_closing_clock as _history_prev_session_closing_clock,
+    remove_doctor_history,
+    upsert_session_stat,
+)
 from cmuh_common.platform_win import (
     is_admin, run_as_admin, set_dpi_awareness, set_app_user_model_id, get_idle_duration,
 )
@@ -4793,107 +4802,29 @@ class AutomationApp:
             self._smart_widget_config(ui['waiting'], text=str(result.get('waiting', '-')))
 
     def _get_last_closing_time(self, doc_name, weekday_int, session_str):
-        if not doc_name: return None
-        
-        matches = []
-        # [核心修正] 保護讀取
         with self._history_lock:
-            for r in self.history_cache:
-                if (r.get('doctor') == doc_name and 
-                    r.get('session') == session_str and 
-                    r.get('closing_time')): 
-                    
-                    try:
-                        d_obj = datetime.strptime(r['date'], "%Y/%m/%d")
-                        if d_obj.weekday() == weekday_int:
-                            matches.append(r)
-                    except Exception:
-                        pass
-        
-        if matches:
-            matches.sort(key=lambda x: x['date'], reverse=True)
-            return matches[0].get('closing_time')
-            
-        return None
+            rows = list(self.history_cache)
+        return _history_last_closing_time(rows, doc_name, weekday_int, session_str)
 
     def _get_prev_session_closing_clock(self, room_code, doc_name, curr_session_cn):
         """今日、同診間、同醫師之「上一時段」關診時間 (HH:MM)。"""
         prev_s = _prev_session_cn(curr_session_cn)
-        if not prev_s or not doc_name or not room_code:
-            return "—"
         today_s = date.today().strftime("%Y/%m/%d")
-        best = ""
         with self._history_lock:
-            for r in self.history_cache:
-                if r.get("doctor") != doc_name:
-                    continue
-                if str(r.get("room", "")) != str(room_code):
-                    continue
-                if r.get("session") != prev_s:
-                    continue
-                if r.get("date") != today_s:
-                    continue
-                ct = r.get("closing_time") or ""
-                if ct:
-                    best = ct
-        return best if best else "—"
+            rows = list(self.history_cache)
+        return _history_prev_session_closing_clock(
+            rows, room_code, doc_name, prev_s, today_s)
 
     def _monthly_slot_metric_avgs(self, doc_name, room_code, session_cn):
         """近 CLINIC_METRIC_HISTORY_DAYS 日、同診間／時段／醫師之掛號、完成、照光平均。"""
-        if not doc_name or not room_code:
-            return ("-", "-", "-")
         cutoff = date.today() - timedelta(days=CLINIC_METRIC_HISTORY_DAYS)
-        totals, comps, photos = [], [], []
         with self._history_lock:
-            for r in self.history_cache:
-                if r.get("doctor") != doc_name:
-                    continue
-                if str(r.get("room", "")) != str(room_code):
-                    continue
-                if r.get("session") != session_cn:
-                    continue
-                try:
-                    rd = datetime.strptime(r["date"], "%Y/%m/%d").date()
-                except Exception:
-                    continue
-                if rd < cutoff:
-                    continue
-                tr = r.get("total_reg")
-                if tr is not None and tr != "":
-                    try:
-                        totals.append(float(tr))
-                    except (TypeError, ValueError):
-                        pass
-                try:
-                    comps.append(float(r.get("completed_count", 0)))
-                except (TypeError, ValueError):
-                    pass
-                ph = r.get("phototherapy")
-                if ph is not None and ph != "":
-                    try:
-                        photos.append(float(ph))
-                    except (TypeError, ValueError):
-                        pass
-
-        def _fmt(a):
-            if not a:
-                return "-"
-            return str(int(round(sum(a) / len(a))))
-
-        return (_fmt(totals), _fmt(comps), _fmt(photos))
+            rows = list(self.history_cache)
+        return _history_monthly_slot_metric_avgs(
+            rows, doc_name, room_code, session_cn, cutoff)
 
 # --- [新增] 計算統計數據並存檔 ---
     def _save_clinic_session_stat(self, room_code, doc_name, completed_count, durations, closing_time_str="", session_str=None, total_reg=None, phototherapy=0):
-        if not doc_name or not durations: return
-        if len(durations) == 0: return
-
-        avg_raw = sum(durations) / len(durations)
-        valid_data = [x for x in durations if (avg_raw * 0.5) <= x <= (avg_raw * 2.0)]
-        if not valid_data: valid_data = durations
-            
-        final_avg_sec = sum(valid_data) / len(valid_data)
-        final_avg_min = round(final_avg_sec / 60, 1)
-
         today_str = date.today().strftime("%Y/%m/%d")
         session = session_str or reg64_slot_cn(reg64_time_code_from_local_clock()) or "晚上"
         
@@ -4901,42 +4832,23 @@ class AutomationApp:
 
         with self._history_lock:
             history_data = load_json_list(file_path, [])
-            
-            record_found = False
-            for record in history_data:
-                if (record.get('date') == today_str and 
-                    record.get('session') == session and 
-                    record.get('doctor') == doc_name):
-                    
-                    record['completed_count'] = completed_count
-                    record['avg_time_min'] = final_avg_min
-                    record['raw_sample_count'] = len(durations)
-                    record['valid_sample_count'] = len(valid_data)
-                    record['room'] = room_code 
-                    if closing_time_str:
-                        record['closing_time'] = closing_time_str
-                    if total_reg is not None:
-                        record['total_reg'] = total_reg
-                    record['phototherapy'] = phototherapy
-                    record_found = True
-                    break
-            
-            if not record_found:
-                new_record = {
-                    "date": today_str,
-                    "week": date.today().strftime("%W"),
-                    "room": room_code,
-                    "session": session,
-                    "doctor": doc_name,
-                    "completed_count": completed_count,
-                    "avg_time_min": final_avg_min,
-                    "raw_sample_count": len(durations),
-                    "valid_sample_count": len(valid_data),
-                    "closing_time": closing_time_str,
-                    "total_reg": total_reg if total_reg is not None else None,
-                    "phototherapy": phototherapy,
-                }
-                history_data.append(new_record)
+            history_data, changed = upsert_session_stat(
+                history_data,
+                today_str=today_str,
+                week_str=date.today().strftime("%W"),
+                room_code=room_code,
+                doc_name=doc_name,
+                completed_count=completed_count,
+                durations=durations,
+                session=session,
+                closing_time=closing_time_str,
+                total_reg=total_reg,
+                phototherapy=phototherapy,
+                match_room=False,
+                allow_empty_sample=False,
+            )
+            if not changed:
+                return
             
             try:
                 _atomic_write_json(file_path, history_data)
@@ -4988,10 +4900,7 @@ class AutomationApp:
             file_path = get_conf_path('clinic_stats_history.json')
             try:
                 history = load_json_list(file_path, [])
-
-                # 過濾掉該位醫師的紀錄 (保留其他醫師的，刪除當前醫師的)
-                new_history = [record for record in history
-                               if isinstance(record, dict) and record.get('doctor') != doc_name]
+                new_history = remove_doctor_history(history, doc_name)
 
                 # 寫回檔案 (使用原子寫入防止中途崩潰損壞)
                 _atomic_write_json(file_path, new_history)
@@ -5038,40 +4947,11 @@ class AutomationApp:
         # [優化] 先查快取；近一月範圍變更時以 cutoff 區分
         with self._history_lock:
             if cache_key not in self._avg_history_cache:
-                hist_min = 0.0
-                hist_count = 0
-                for record in self.history_cache:
-                    if record.get('doctor') != doc_name:
-                        continue
-                    try:
-                        rd = datetime.strptime(record.get('date', ''), "%Y/%m/%d").date()
-                    except Exception:
-                        continue
-                    if rd < cutoff:
-                        continue
-                    avg_min = record.get('avg_time_min', 0)
-                    count = record.get('valid_sample_count', 0)
-                    if count > 0:
-                        hist_min += (avg_min * count)
-                        hist_count += count
-                self._avg_history_cache[cache_key] = (hist_min, hist_count)
-            total_minutes, total_count = self._avg_history_cache[cache_key]
+                self._avg_history_cache[cache_key] = historical_duration_totals(
+                    self.history_cache, doc_name, cutoff)
+            totals = self._avg_history_cache[cache_key]
 
-        if current_durations:
-            valid_current = [x for x in current_durations if x > 0]
-            if valid_current:
-                curr_sum_sec = sum(valid_current)
-                curr_count = len(valid_current)
-                curr_sum_min = curr_sum_sec / 60.0
-                
-                total_minutes += curr_sum_min
-                total_count += curr_count
-
-        if total_count > 0:
-            final_avg = total_minutes / total_count
-            return f"{final_avg:.1f}"
-        else:
-            return "-"
+        return all_time_average_text(totals, current_durations)
 
 # --- [新增] 讀取門診動態設定 ---
     # --- [新增] 讀取門診動態設定 ---
