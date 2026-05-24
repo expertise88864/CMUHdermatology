@@ -13,6 +13,17 @@ from __future__ import annotations
 from typing import Optional
 
 
+def appointment_data_count(data) -> int:
+    """Count appointment records in a cached doctor data payload."""
+    if not isinstance(data, dict) or "error" in data:
+        return 0
+    total = 0
+    for rows in data.values():
+        if isinstance(rows, list):
+            total += len(rows)
+    return total
+
+
 def _appt_dict_ext_branch(item) -> Optional[str]:
     """掛號 dict 的院區：None=主院, 'east'=東區, 'auh'=亞大, 'huihe'=惠和, 'huisheng'=惠盛
     （僅 is_ext 之舊資料視為東區）。"""

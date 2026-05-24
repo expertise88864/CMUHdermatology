@@ -27,6 +27,10 @@ from cmuh_common.cache_state import (
     decode_date_keys as _decode_cache_date_keys,
     save_json_cache,
 )
+from cmuh_common.master_schedule_cache import (
+    load_master_schedule_cache,
+    refresh_master_schedule_if_needed,
+)
 from cmuh_common.refresh_policy import (
     partition_doctors_for_refresh_batches as _partition_refresh_batches,
 )
@@ -77,6 +81,7 @@ from cmuh_common.hotkey_scaling import (  # noqa: E402
 )
 # 【重構 2026-05-21】門診預約合併純函式（與 scheduler.py 共用）
 from cmuh_common.appt_utils import (  # noqa: E402
+    appointment_data_count as _appointments_data_count,
     _appt_dict_ext_branch,
     _calendar_branch_sort_rank,
     _strip_ext_appointments,
@@ -4510,16 +4515,6 @@ class Reg52BackoffActive(Exception):
     pass
 
 
-def _appointments_data_count(data):
-    if not isinstance(data, dict) or "error" in data:
-        return 0
-    total = 0
-    for rows in data.values():
-        if isinstance(rows, list):
-            total += len(rows)
-    return total
-
-
 def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorConfig):
     session = _get_thread_local_reg52_session()
     doctor_name = doctor_config["name"]
@@ -4954,65 +4949,14 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
         UiClinicDataMessage(doctor_name=doc_no, data={"error": f"查詢失敗 ({error_type})"}),
     )
 
-MASTER_SCHEDULE_DISK_TTL_SECONDS = 24 * 60 * 60  # [O4] 24 小時 hard limit
-MASTER_SCHEDULE_INCREMENTAL_FRESH_SECONDS = 30 * 60  # [O14] 30 分鐘內視為「絕對新鮮」，連背景抓都跳過
-
-
 def load_master_schedule_in_background(ui_queue: "Queue[UiMessage]", *, force: bool = False):
-    """[O14 增量更新] 啟動時若 cache 在 30 分鐘內絕對新鮮 → 完全跳過。
-    若在 30min ~ 24h 之間 → 背景抓取，hash 不同才套用（不阻塞 UI）。
-    若超過 24h 或不存在 → 同 [O4] 行為，正常抓取。
-    """
     logging.info("Loading master schedule in background...")
-    cache_path = get_conf_path('cache_master_schedule.json')
-
-    cache_age = None
-    if not force and os.path.exists(cache_path):
-        try:
-            cache_age = time.time() - os.path.getmtime(cache_path)
-        except OSError:
-            cache_age = None
-
-    # [O14] 30 分鐘內絕對新鮮 → 跳過
-    if cache_age is not None and cache_age < MASTER_SCHEDULE_INCREMENTAL_FRESH_SECONDS:
-        logging.info("[O14] master_schedule cache 絕對新鮮（%.1f 分鐘），跳過網路抓取",
-                     cache_age / 60.0)
-        return
-
-    # 30min ~ 24h：背景抓並比對 hash，僅在不同時才套用
-    if cache_age is not None and cache_age < MASTER_SCHEDULE_DISK_TTL_SECONDS:
-        logging.info("[O14] master_schedule cache 中度新鮮（%.1f 小時），背景增量抓取",
-                     cache_age / 3600.0)
-        try:
-            new_schedule = create_master_schedule_from_web()
-        except Exception as e:
-            logging.warning("[O14] 背景增量抓取失敗（沿用 cache）: %s", e)
-            return
-        # hash 比對：序列化後算 sha1
-        try:
-            import json as _json, hashlib as _hl
-            old_data = load_json_dict(cache_path, {}, merge_defaults=False)
-            new_data = {k: {str(d): v for d, v in days.items()}
-                        for k, days in (new_schedule or {}).items()}
-            old_hash = _hl.sha1(_json.dumps(old_data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-            new_hash = _hl.sha1(_json.dumps(new_data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-            if old_hash == new_hash:
-                logging.info("[O14] master_schedule 無變動，沿用本地 cache")
-                # 仍要 touch cache mtime 避免每次啟動都重抓
-                try:
-                    os.utime(cache_path, None)
-                except OSError:
-                    pass
-                return
-            logging.info("[O14] master_schedule 偵測到變動，套用新版")
-        except Exception:
-            logging.debug("[O14] hash 比對失敗，視為有變動", exc_info=True)
-        put_ui_message(ui_queue, UiMasterScheduleMessage(schedule=new_schedule))
-        return
-
-    # 超過 24h 或 cache 不存在：正常抓
-    schedule = create_master_schedule_from_web()
-    put_ui_message(ui_queue, UiMasterScheduleMessage(schedule=schedule))
+    refresh_master_schedule_if_needed(
+        ui_queue,
+        create_master_schedule_from_web,
+        get_conf_path('cache_master_schedule.json'),
+        force=force,
+    )
 
 # --- 8. 值班醫師查詢 ---
 # 【效能 2026.05.20】duty timeout 從 40 降為 (connect=3, read=8)。內網應該快，
@@ -5544,6 +5488,7 @@ class AutomationApp:
         self._ui_queue_poll_id = None
         self._refresh_pending = False
         self._save_cache_pending = {}
+        self._save_cache_latest = {}
         self._avg_history_cache = {}  # [優化] 快取歷史平均，避免每次重算
         self._refresh_worker_running = False
         self._queued_refresh_requests = deque()
@@ -5557,6 +5502,7 @@ class AutomationApp:
         self._settings_promo_loaded = False
         self._settings_promo_loading = False
         self._clinic_duplicate_rooms_notice = ()
+        self._clinic_lights_worker_running = False
         self._future_tab_grid_stale = True  # 未來週次分頁需在資料更新後重繪；切回時若未過期可跳過以減少卡頓
         self._bottom_links_hidden = False  # 與 links_frame 顯示狀態同步，避免重複 grid 觸發版面重算
         self._subsystem_running = False
@@ -5901,13 +5847,9 @@ class AutomationApp:
 
             # 2. 載入 主門診表 (master_schedule)
             sched_path = get_conf_path('cache_master_schedule.json')
-            raw_sched = load_json_dict(sched_path, {}, merge_defaults=False)
-            if raw_sched:
-                self.master_schedule = {}
-                for doc, days in raw_sched.items():
-                    if not isinstance(days, dict):
-                        continue
-                    self.master_schedule[doc] = {int(k): v for k, v in days.items()}
+            cached_schedule = load_master_schedule_cache(sched_path)
+            if cached_schedule:
+                self.master_schedule = cached_schedule
                 self._rebuild_master_schedule_index()
                 logging.info("已載入主門診表快取。")
 
@@ -7592,6 +7534,10 @@ class AutomationApp:
             delay_ms = max(int((nxt - datetime.now()).total_seconds() * 1000), 5_000)
             self.clinic_loop_id = self.root.after(delay_ms, self._update_clinic_lights_loop)
             return
+        if getattr(self, "_clinic_lights_worker_running", False):
+            logging.info("診間燈號上一輪仍在執行，延後下一次輪詢")
+            self.clinic_loop_id = self.root.after(5_000, self._update_clinic_lights_loop)
+            return
 
         rooms_to_check = []
         for i in range(2):
@@ -8068,8 +8014,15 @@ class AutomationApp:
                         f"[SOURCE_TIMING][reg64] {source_timing}, abnormal_rooms={abnormal_rooms}"
                     )
 
+        def guarded_run_update(rooms):
+            try:
+                run_update(rooms)
+            finally:
+                self._clinic_lights_worker_running = False
+
         # [核心修正] 投遞至執行緒池
-        self.bg_executor.submit(run_update, rooms_to_check)
+        self._clinic_lights_worker_running = True
+        self.bg_executor.submit(guarded_run_update, rooms_to_check)
         
         seconds = getattr(self, '_clinic_dynamic_refresh_seconds', 60)
         if seconds < 60:
@@ -9600,16 +9553,20 @@ class AutomationApp:
         self.refresh_all_calendars()
 
     def _schedule_save_cache(self, filename, data):
-        """節流 (Debounce)：500ms 內多次資料到達只觸發一次磁碟寫入，避免平行查詢觸發多次寫入"""
+        """節流 (Debounce)：500ms 內多次資料到達只寫最後一份資料。"""
         if getattr(self, '_shutting_down', False):
             return
+        self._save_cache_latest[filename] = data
         if not self._save_cache_pending.get(filename):
             self._save_cache_pending[filename] = True
-            self.root.after(500, lambda: self._do_deferred_save_cache(filename, data))
+            self.root.after(500, lambda: self._do_deferred_save_cache(filename))
 
-    def _do_deferred_save_cache(self, filename, data):
+    def _do_deferred_save_cache(self, filename):
         self._save_cache_pending[filename] = False
+        data = self._save_cache_latest.pop(filename, None)
         if getattr(self, '_shutting_down', False):
+            return
+        if data is None:
             return
         self._save_cache(filename, data)
 

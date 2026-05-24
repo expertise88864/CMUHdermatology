@@ -27,6 +27,10 @@ from cmuh_common.cache_state import (
     decode_date_keys as _decode_cache_date_keys,
     save_json_cache,
 )
+from cmuh_common.master_schedule_cache import (
+    load_master_schedule_cache,
+    refresh_master_schedule_if_needed,
+)
 from cmuh_common.refresh_policy import (
     partition_doctors_for_refresh_batches as _partition_refresh_batches,
 )
@@ -306,6 +310,7 @@ from cmuh_common.hotkey_scaling import (  # noqa: E402
 )
 # 【重構 2026-05-21】門診預約純函式（與 main.py 共用）
 from cmuh_common.appt_utils import (  # noqa: E402
+    appointment_data_count as _appointments_data_count,
     _appt_dict_ext_branch,
     _calendar_branch_sort_rank,
     _strip_ext_appointments,
@@ -2406,10 +2411,14 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
         UiClinicDataMessage(doctor_name=doc_no, data={"error": f"查詢失敗 ({error_type})"}),
     )
 
-def load_master_schedule_in_background(ui_queue: "Queue[UiMessage]"):
+def load_master_schedule_in_background(ui_queue: "Queue[UiMessage]", *, force: bool = False):
     logging.info("Loading master schedule in background...")
-    schedule = create_master_schedule_from_web()
-    put_ui_message(ui_queue, UiMasterScheduleMessage(schedule=schedule))
+    refresh_master_schedule_if_needed(
+        ui_queue,
+        create_master_schedule_from_web,
+        get_conf_path('cache_master_schedule.json'),
+        force=force,
+    )
 
 # --- 8. 值班醫師查詢 ---
 # 【效能 2026-05-21】duty timeout 從 40 降為 (connect=3, read=8)，與 main.py 對齊（P1.4）
@@ -2730,6 +2739,7 @@ class AutomationApp:
         self._ui_queue_poll_id = None
         self._refresh_pending = False
         self._save_cache_pending = {}
+        self._save_cache_latest = {}
         self._avg_history_cache = {}  # [優化] 快取歷史平均，避免每次重算
         self._refresh_worker_running = False
         self._queued_refresh_requests = deque()
@@ -2742,6 +2752,7 @@ class AutomationApp:
         self._heavy_modules_loading = False
         self._settings_promo_loaded = False
         self._settings_promo_loading = False
+        self._clinic_lights_worker_running = False
         self._future_tab_grid_stale = True  # 未來週次分頁需在資料更新後重繪；切回時若未過期可跳過以減少卡頓
         self._bottom_links_hidden = False  # 與 links_frame 顯示狀態同步，避免重複 grid 觸發版面重算
         self._subsystem_running = False
@@ -2887,6 +2898,10 @@ class AutomationApp:
     # --- [修改] 儲存快取通用函式 (加入 Key 轉換) ---
     def _save_cache(self, filename, data):
         try:
+            if filename == 'cache_clinic_counts.json':
+                from cmuh_common.sqlite_cache import save_clinic_counts
+                save_clinic_counts(data)
+                return
             save_json_cache(get_conf_path(filename), data)
         except Exception as e:
             logging.error(f"儲存快取 {filename} 失敗: {e}")
@@ -2897,27 +2912,34 @@ class AutomationApp:
 
     # --- [修改] 載入快取資料 (加入損壞自動刪除機制) ---
     def load_cached_data(self):
-        """啟動時先讀取本地 JSON，加快顯示速度"""
+        """啟動時先讀取本地 cache，加快顯示速度。"""
         try:
-            # 1. 載入 門診人數 (all_doctors_data)
-            cache_path = get_conf_path('cache_clinic_counts.json')
-            raw_data = load_json_dict(cache_path, {}, merge_defaults=False)
-            if raw_data:
-                for doc_no, doc_data in raw_data.items():
-                    if isinstance(doc_data, dict) and 'error' not in doc_data:
-                        with self._doctor_data_lock:
-                            self.all_doctors_data[doc_no] = _decode_cache_date_keys(doc_data)
-                logging.info("已載入門診人數快取。")
+            # 1. [O22] 載入 門診人數 (all_doctors_data) — SQLite
+            try:
+                from cmuh_common.sqlite_cache import load_clinic_counts
+                raw_data = load_clinic_counts()
+                if raw_data:
+                    for doc_no, doc_data in raw_data.items():
+                        if isinstance(doc_data, dict) and 'error' not in doc_data:
+                            with self._doctor_data_lock:
+                                self.all_doctors_data[doc_no] = _decode_cache_date_keys(doc_data)
+                    logging.info("[O22] 已載入門診人數快取（SQLite，%d 醫師）", len(raw_data))
+            except Exception:
+                logging.warning("[O22] SQLite cache 載入失敗，fallback 到 JSON", exc_info=True)
+                cache_path = get_conf_path('cache_clinic_counts.json')
+                raw_data = load_json_dict(cache_path, {}, merge_defaults=False)
+                if raw_data:
+                    for doc_no, doc_data in raw_data.items():
+                        if isinstance(doc_data, dict) and 'error' not in doc_data:
+                            with self._doctor_data_lock:
+                                self.all_doctors_data[doc_no] = _decode_cache_date_keys(doc_data)
+                    logging.info("已載入門診人數快取（JSON fallback）。")
 
             # 2. 載入 主門診表 (master_schedule)
             sched_path = get_conf_path('cache_master_schedule.json')
-            raw_sched = load_json_dict(sched_path, {}, merge_defaults=False)
-            if raw_sched:
-                self.master_schedule = {}
-                for doc, days in raw_sched.items():
-                    if not isinstance(days, dict):
-                        continue
-                    self.master_schedule[doc] = {int(k): v for k, v in days.items()}
+            cached_schedule = load_master_schedule_cache(sched_path)
+            if cached_schedule:
+                self.master_schedule = cached_schedule
                 self._rebuild_master_schedule_index()
                 logging.info("已載入主門診表快取。")
 
@@ -4310,6 +4332,10 @@ class AutomationApp:
             self.clinic_trackers = {}
         if not hasattr(self, '_clinic_dynamic_refresh_seconds'):
             self._clinic_dynamic_refresh_seconds = CLINIC_LIGHT_REFRESH_SECONDS
+        if getattr(self, "_clinic_lights_worker_running", False):
+            logging.info("診間燈號上一輪仍在執行，延後下一次輪詢")
+            self.clinic_loop_id = self.root.after(5_000, self._update_clinic_lights_loop)
+            return
 
         rooms_to_check = []
         for i in range(2):
@@ -4671,8 +4697,15 @@ class AutomationApp:
                     f"[SOURCE_TIMING][reg64] {source_timing}, abnormal_rooms={abnormal_rooms}"
                 )
 
+        def guarded_run_update(rooms):
+            try:
+                run_update(rooms)
+            finally:
+                self._clinic_lights_worker_running = False
+
         # [核心修正] 投遞至執行緒池
-        self.bg_executor.submit(run_update, rooms_to_check)
+        self._clinic_lights_worker_running = True
+        self.bg_executor.submit(guarded_run_update, rooms_to_check)
         
         seconds = getattr(self, '_clinic_dynamic_refresh_seconds', CLINIC_LIGHT_REFRESH_SECONDS)
         if seconds < 10:
@@ -5978,16 +6011,20 @@ class AutomationApp:
         self.refresh_all_calendars()
 
     def _schedule_save_cache(self, filename, data):
-        """節流 (Debounce)：500ms 內多次資料到達只觸發一次磁碟寫入，避免平行查詢觸發多次寫入"""
+        """節流 (Debounce)：500ms 內多次資料到達只寫最後一份資料。"""
         if getattr(self, '_shutting_down', False):
             return
+        self._save_cache_latest[filename] = data
         if not self._save_cache_pending.get(filename):
             self._save_cache_pending[filename] = True
-            self.root.after(500, lambda: self._do_deferred_save_cache(filename, data))
+            self.root.after(500, lambda: self._do_deferred_save_cache(filename))
 
-    def _do_deferred_save_cache(self, filename, data):
+    def _do_deferred_save_cache(self, filename):
         self._save_cache_pending[filename] = False
+        data = self._save_cache_latest.pop(filename, None)
         if getattr(self, '_shutting_down', False):
+            return
+        if data is None:
             return
         self._save_cache(filename, data)
 
@@ -6032,6 +6069,13 @@ class AutomationApp:
                     case UiClinicDataMessage(doctor_name=doctor_name, data=appointment_data):
                         if doctor_name and appointment_data is not None:
                             with self._doctor_data_lock:
+                                if (
+                                    isinstance(appointment_data, dict)
+                                    and "error" in appointment_data
+                                    and _appointments_data_count(self.all_doctors_data.get(doctor_name)) > 0
+                                ):
+                                    logging.warning(f"[CACHE_PROTECT] 保留 {doctor_name} 既有門診人數快取，略過錯誤覆蓋。")
+                                    continue
                                 self.all_doctors_data[doctor_name] = appointment_data
                             self._schedule_refresh()
                             self._schedule_save_cache('cache_clinic_counts.json', self._get_all_doctors_data_snapshot())
@@ -6053,7 +6097,7 @@ class AutomationApp:
                         duty_cache['duty_doctor'] = txt
                         self._refresh_duty_summary_text()
                         self._duty_cache_mem = duty_cache
-                        self._save_cache('cache_duty_info.json', duty_cache)
+                        self._schedule_save_cache('cache_duty_info.json', duty_cache)
                     case UiSaturdayDutyDoctorMessage(saturday_date=saturday_date, doctor_name=sdn):
                         duty_cache = self._duty_cache_mem_ensure()
                         duty_cache['date'] = date.today().strftime("%Y-%m-%d")
@@ -6063,7 +6107,7 @@ class AutomationApp:
                         duty_cache['saturday_duty'] = txt
                         self._refresh_duty_summary_text()
                         self._duty_cache_mem = duty_cache
-                        self._save_cache('cache_duty_info.json', duty_cache)
+                        self._schedule_save_cache('cache_duty_info.json', duty_cache)
                     case UiTodayVsMessage(doctor_name=vsn):
                         duty_cache = self._duty_cache_mem_ensure()
                         duty_cache['date'] = date.today().strftime("%Y-%m-%d")
@@ -6072,7 +6116,7 @@ class AutomationApp:
                         duty_cache['today_vs'] = txt
                         self._refresh_duty_summary_text()
                         self._duty_cache_mem = duty_cache
-                        self._save_cache('cache_duty_info.json', duty_cache)
+                        self._schedule_save_cache('cache_duty_info.json', duty_cache)
                     case UiSaturdayVsMessage(doctor_name=svn):
                         duty_cache = self._duty_cache_mem_ensure()
                         duty_cache['date'] = date.today().strftime("%Y-%m-%d")
@@ -6081,7 +6125,7 @@ class AutomationApp:
                         duty_cache['saturday_vs'] = txt
                         self._refresh_duty_summary_text()
                         self._duty_cache_mem = duty_cache
-                        self._save_cache('cache_duty_info.json', duty_cache)
+                        self._schedule_save_cache('cache_duty_info.json', duty_cache)
                     case UiClockStatusMessage(status_data=payload):
                         self._update_clock_status_ui(payload)
                     case _:
