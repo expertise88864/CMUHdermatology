@@ -78,7 +78,6 @@ from tkinter import messagebox, scrolledtext, ttk
 # [開機前導] 自動依賴安裝與進度條介面 (Dependency Installer UI)
 # =============================================================================
 import ctypes
-import json
 import logging
 import re
 import schedule
@@ -2946,50 +2945,39 @@ class AutomationApp:
         try:
             # 1. 載入 門診人數 (all_doctors_data)
             cache_path = get_conf_path('cache_clinic_counts.json')
-            if os.path.exists(cache_path):
-                try:
-                    with open(cache_path, 'r', encoding='utf-8') as f:
-                        raw_data = json.load(f)
-                        for doc_no, doc_data in raw_data.items():
-                            if isinstance(doc_data, dict) and 'error' not in doc_data:
-                                with self._doctor_data_lock:
-                                    self.all_doctors_data[doc_no] = decode_date_keys(doc_data)
-                    logging.info("已載入門診人數快取。")
-                except json.JSONDecodeError:
-                    logging.warning("快取檔案損壞，正在刪除重置...")
-                    os.remove(cache_path)
+            raw_data = load_json_dict(cache_path, {}, merge_defaults=False)
+            if raw_data:
+                for doc_no, doc_data in raw_data.items():
+                    if isinstance(doc_data, dict) and 'error' not in doc_data:
+                        with self._doctor_data_lock:
+                            self.all_doctors_data[doc_no] = decode_date_keys(doc_data)
+                logging.info("已載入門診人數快取。")
 
             # 2. 載入 主門診表 (master_schedule)
             sched_path = get_conf_path('cache_master_schedule.json')
-            if os.path.exists(sched_path):
-                try:
-                    with open(sched_path, 'r', encoding='utf-8') as f:
-                        raw_sched = json.load(f)
-                        self.master_schedule = {}
-                        for doc, days in raw_sched.items():
-                            self.master_schedule[doc] = {int(k): v for k, v in days.items()}
-                        self._rebuild_master_schedule_index()
-                    logging.info("已載入主門診表快取。")
-                except json.JSONDecodeError:
-                    os.remove(sched_path)
+            raw_sched = load_json_dict(sched_path, {}, merge_defaults=False)
+            if raw_sched:
+                self.master_schedule = {}
+                for doc, days in raw_sched.items():
+                    if not isinstance(days, dict):
+                        continue
+                    self.master_schedule[doc] = {int(k): v for k, v in days.items()}
+                self._rebuild_master_schedule_index()
+                logging.info("已載入主門診表快取。")
 
             # 3. 載入 值班資訊 (Duty Info)
             duty_path = get_conf_path('cache_duty_info.json')
-            if os.path.exists(duty_path):
-                try:
-                    with open(duty_path, 'r', encoding='utf-8') as f:
-                        duty_info = json.load(f)
-                        today_str = date.today().strftime("%Y-%m-%d")
-                        if duty_info.get('date') == today_str:
-                            if 'duty_doctor' in duty_info: self.duty_doctor_var.set(duty_info['duty_doctor'])
-                        if 'today_vs' in duty_info: self.duty_vs_var.set(duty_info['today_vs'])
-                        
-                        if 'saturday_duty' in duty_info: self.saturday_duty_doctor_var.set(duty_info['saturday_duty'])
-                        if 'saturday_vs' in duty_info: self.saturday_duty_vs_var.set(duty_info['saturday_vs'])
-                        self._refresh_duty_summary_text()
-                    logging.info("已載入值班資訊快取。")
-                except json.JSONDecodeError:
-                    os.remove(duty_path)
+            duty_info = load_json_dict(duty_path, {}, merge_defaults=False)
+            if duty_info:
+                today_str = date.today().strftime("%Y-%m-%d")
+                if duty_info.get('date') == today_str:
+                    if 'duty_doctor' in duty_info: self.duty_doctor_var.set(duty_info['duty_doctor'])
+                if 'today_vs' in duty_info: self.duty_vs_var.set(duty_info['today_vs'])
+
+                if 'saturday_duty' in duty_info: self.saturday_duty_doctor_var.set(duty_info['saturday_duty'])
+                if 'saturday_vs' in duty_info: self.saturday_duty_vs_var.set(duty_info['saturday_vs'])
+                self._refresh_duty_summary_text()
+                logging.info("已載入值班資訊快取。")
 
         except Exception as e:
             logging.error(f"載入快取失敗: {e}")
@@ -2997,13 +2985,7 @@ class AutomationApp:
 # [新增] 載入歷史緩存
     def _load_history_cache(self):
         file_path = get_conf_path('clinic_stats_history.json')
-        if os.path.exists(file_path):
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    self.history_cache = json.load(f)
-            except Exception as e:
-                logging.error(f"Failed to load history cache: {e}")
-                self.history_cache = []
+        self.history_cache = load_json_list(file_path, [])
         self._avg_history_cache = {}  # [優化] 歷史資料更新，清除計算快取
         
     def _init_styles(self):
@@ -4933,14 +4915,9 @@ class AutomationApp:
         session = session_str or reg64_slot_cn(reg64_time_code_from_local_clock()) or "晚上"
         
         file_path = get_conf_path('clinic_stats_history.json')
-        
+
         with self._history_lock:
-            history_data = []
-            try:
-                if os.path.exists(file_path):
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        history_data = json.load(f)
-            except Exception: pass
+            history_data = load_json_list(file_path, [])
             
             record_found = False
             for record in history_data:
@@ -5026,25 +5003,24 @@ class AutomationApp:
 
             # --- 2. 重置長期紀錄 (檔案) ---
             file_path = get_conf_path('clinic_stats_history.json')
-            if os.path.exists(file_path):
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        history = json.load(f)
-                    
-                    # 過濾掉該位醫師的紀錄 (保留其他醫師的，刪除當前醫師的)
-                    new_history = [record for record in history if record.get('doctor') != doc_name]
-                    
-                    # 寫回檔案 (使用原子寫入防止中途崩潰損壞)
-                    _atomic_write_json(file_path, new_history)
-                    self.history_cache = new_history
-                    self._avg_history_cache = {}  # [優化] 清除計算快取
+            try:
+                history = load_json_list(file_path, [])
 
-                    logging.info(f"[{doc_name}] 歷史統計資料已從檔案中移除。")
-                    
-                except Exception as e:
-                    logging.error(f"重置歷史檔案失敗: {e}")
-                    messagebox.showerror("錯誤", f"重置歷史檔案失敗:\n{e}")
-                    return
+                # 過濾掉該位醫師的紀錄 (保留其他醫師的，刪除當前醫師的)
+                new_history = [record for record in history
+                               if isinstance(record, dict) and record.get('doctor') != doc_name]
+
+                # 寫回檔案 (使用原子寫入防止中途崩潰損壞)
+                _atomic_write_json(file_path, new_history)
+                self.history_cache = new_history
+                self._avg_history_cache = {}  # [優化] 清除計算快取
+
+                logging.info(f"[{doc_name}] 歷史統計資料已從檔案中移除。")
+
+            except Exception as e:
+                logging.error(f"重置歷史檔案失敗: {e}")
+                messagebox.showerror("錯誤", f"重置歷史檔案失敗:\n{e}")
+                return
 
             # 強制刷新 UI 以顯示歸零後的狀態
             self.force_refresh_clinic_lights()
@@ -6191,14 +6167,8 @@ class AutomationApp:
     def _duty_cache_mem_ensure(self) -> dict[str, Any]:
         """值班資訊 UI 用記憶體快取（啟動時自檔案載入一次）。"""
         if not hasattr(self, "_duty_cache_mem"):
-            self._duty_cache_mem = {}
-            try:
-                p = get_conf_path("cache_duty_info.json")
-                if os.path.exists(p):
-                    with open(p, "r", encoding="utf-8") as f:
-                        self._duty_cache_mem = json.load(f)
-            except Exception:
-                logging.debug("讀取值班資訊快取失敗", exc_info=True)
+            self._duty_cache_mem = load_json_dict(
+                get_conf_path("cache_duty_info.json"), {}, merge_defaults=False)
         return self._duty_cache_mem
 
     def process_ui_queue(self):
