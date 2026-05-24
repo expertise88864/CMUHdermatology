@@ -1546,19 +1546,35 @@ def _hard_exit(reason: str, code: int = 1) -> None:
     不會死 → 外層 watchdog 也救不回來 (因為 process 還活著)。
 
     這個 helper：
-      1. 直接 try handler.flush(timeout=1) (不 close，不取 lock)
+      1. 只做非阻塞 flush；handler lock 拿不到就跳過 (不 close、不等待)
       2. 不論成功與否 → 立刻 os._exit(code)
     """
     import os as _os
     # 嘗試 flush 但不卡死
     try:
-        # 只 flush，不 close，不持有 lock
+        # 只 flush，不 close；handler lock 拿不到就跳過，避免 hard-exit 自己卡死。
         root_logger = logging.getLogger()
         for h in list(root_logger.handlers):
+            lock = getattr(h, "lock", None)
+            acquired = False
             try:
-                h.flush()
+                if lock is not None:
+                    acquired = lock.acquire(blocking=False)
+                    if not acquired:
+                        continue
+                stream = getattr(h, "stream", None)
+                if stream is not None and hasattr(stream, "flush"):
+                    stream.flush()
+                else:
+                    h.flush()
             except Exception:
                 pass
+            finally:
+                if lock is not None and acquired:
+                    try:
+                        lock.release()
+                    except Exception:
+                        pass
     except Exception:
         pass
     _os._exit(code)

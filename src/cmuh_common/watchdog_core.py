@@ -13,7 +13,9 @@
 """
 from __future__ import annotations
 
+import csv
 import json
+import locale
 import logging
 import os
 import subprocess
@@ -360,18 +362,17 @@ def _find_pids_holding_mutex(process_keyword: str, mutex_name: str = "") -> list
             ["wmic", "process", "where", "name='pythonw.exe'",
              "get", "ProcessId,CommandLine", "/FORMAT:CSV"],
             capture_output=True, text=True, timeout=10,
-            encoding="utf-8", errors="replace",
+            encoding=locale.getpreferredencoding(False), errors="replace",
         )
         if r.returncode == 0 and r.stdout:
             kw_lower = (process_keyword or "").lower()
-            for line in r.stdout.splitlines():
-                if "," not in line:
-                    continue
+            for parts in csv.reader(r.stdout.splitlines()):
                 # CSV: Node,CommandLine,ProcessId
-                parts = line.split(",")
                 if len(parts) < 3:
                     continue
-                cmdline = parts[1].strip()
+                if parts[0].strip().lower() == "node":
+                    continue
+                cmdline = ",".join(parts[1:-1]).strip()
                 pid_str = parts[-1].strip()
                 if not pid_str.isdigit():
                     continue
@@ -385,18 +386,14 @@ def _find_pids_holding_mutex(process_keyword: str, mutex_name: str = "") -> list
     except Exception:
         logging.debug("[watchdog] wmic fallback 例外", exc_info=True)
 
-    # WMIC 也失敗 → 退而求其次列所有 pythonw.exe (caller 自行決定)
-    psutil = _get_psutil()
-    if psutil is None:
-        return []
-    for p in psutil.process_iter(["pid", "name"]):
-        try:
-            n = (p.info.get("name") or "").lower()
-            if n == "pythonw.exe" and p.info["pid"] != my_pid:
-                pids.append(p.info["pid"])
-        except Exception:
-            continue
-    return pids
+    # 不做「所有 pythonw.exe」fallback。這裡若抓不到 cmdline，就無法確認 PID
+    # 是否真屬於目標程式；直接 kill 全部 pythonw 風險太高，寧可讓 caller 回報
+    # 找不到 PID，交給下一輪或人工處理。
+    logging.warning(
+        "[watchdog] 無法用 WMIC 找到 %s 的 PID；為避免誤殺其他 pythonw.exe，"
+        "本輪不執行 broad fallback kill",
+        process_keyword)
+    return []
 
 
 # ─── Kill + start ───────────────────────────────────────────────────────
@@ -555,6 +552,9 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
                             return (f"⏭ {name}: 半死狀態但 lock 還新，"
                                     f"這輪先跳過 [{mode}]")
                         killed = [pid for pid in half_dead_pids if kill_pid(pid)]
+                        if not killed:
+                            return (f"⚠ {name}: 半死狀態 PID {half_dead_pids} "
+                                    f"kill 失敗，未啟動新 instance 以避免重複 [{mode}]")
                         time.sleep(2)
                         if not _record_restart_and_check_crash_loop(name):
                             until = _SUSPENDED_UNTIL.get(name, 0.0)
@@ -602,7 +602,14 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
                 return (f"⏭ {name}: log {age:.0f}s 沒更新但 lock 還新，"
                         f"這輪先跳過 [{mode}]")
             killed = [pid for pid in pids if kill_pid(pid)]
+            if not killed:
+                return (f"⚠ {name}: log {age:.0f}s 沒更新但 PID {pids} "
+                        f"kill 失敗，未啟動新 instance 以避免重複 [{mode}]")
             time.sleep(2)
+            if not _record_restart_and_check_crash_loop(name):
+                until = _SUSPENDED_UNTIL.get(name, 0.0)
+                remain = max(0, int(until - time.time()))
+                return f"⛔ {name}: stale 且 crash loop 中，暫停 {remain // 60} 分鐘 [{mode}]"
             new_pid = start_program(pyw_path, pythonw)
             return (f"⟳ {name}: log {age:.0f}s 沒更新 (>{max_stale}s)，"
                     f"killed PID {killed} → 重啟 PID {new_pid} [{mode}]")

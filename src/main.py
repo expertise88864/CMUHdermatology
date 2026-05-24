@@ -896,6 +896,7 @@ _status_driver_pool = {
     "driver": None,
     "last_used": 0.0,
     "lock": threading.Lock(),
+    "init_lock": threading.Lock(),
 }
 _STATUS_DRIVER_IDLE_TIMEOUT = 30 * 60  # 30 分鐘無動作就關閉
 
@@ -940,11 +941,19 @@ def _get_or_create_status_driver():
             logging.debug("status driver quit 失敗", exc_info=True)
 
     if need_init:
-        # initialize 走網路，鎖外做
-        driver = _initialize_status_driver()
-        with pool["lock"]:
-            pool["driver"] = driver
-            pool["last_used"] = _t.time()
+        # initialize 走網路，不能持 pool lock；但要防止多個 refresh 同時
+        # 看到 None 而各自開一個 Chrome，造成被覆蓋的 driver 殘留。
+        with pool["init_lock"]:
+            with pool["lock"]:
+                driver = pool["driver"]
+                if driver is not None:
+                    pool["last_used"] = _t.time()
+                    return driver
+
+            driver = _initialize_status_driver()
+            with pool["lock"]:
+                pool["driver"] = driver
+                pool["last_used"] = _t.time()
         return driver
 
     with pool["lock"]:

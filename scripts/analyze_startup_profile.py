@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""把 `python -X importtime` 的 stderr 解析，列出最慢的 20 個 import。
+r"""把 `python -X importtime` 的 stderr 解析，列出最慢的 20 個 import。
 
 用法：python scripts\analyze_startup_profile.py settings\startup_profile.txt
 """

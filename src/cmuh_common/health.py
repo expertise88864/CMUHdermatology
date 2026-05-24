@@ -54,6 +54,35 @@ def _disk_free_mb(path: str) -> Optional[float]:
         return None
 
 
+def _flush_logging_handlers_nonblocking() -> None:
+    """os._exit 前盡量 flush log，但不可卡在 logging handler lock。"""
+    try:
+        root_logger = logging.getLogger()
+        for h in list(root_logger.handlers):
+            lock = getattr(h, "lock", None)
+            acquired = False
+            try:
+                if lock is not None:
+                    acquired = lock.acquire(blocking=False)
+                    if not acquired:
+                        continue
+                stream = getattr(h, "stream", None)
+                if stream is not None and hasattr(stream, "flush"):
+                    stream.flush()
+                else:
+                    h.flush()
+            except Exception:
+                pass
+            finally:
+                if lock is not None and acquired:
+                    try:
+                        lock.release()
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
 def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
                   interval_sec: int, network_check: bool,
                   auto_restart_on_crit: bool,
@@ -95,10 +124,7 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
                         "os._exit(1) 強制重啟 process (外層 watchdog 會接手)",
                         tag, consecutive_high_ram,
                         consecutive_high_ram * interval_sec // 60)
-                    try:
-                        logging.shutdown()
-                    except Exception:
-                        pass
+                    _flush_logging_handlers_nonblocking()
                     os._exit(1)
             elif rss_mb >= ram_warn_mb:
                 consecutive_high_ram += 1

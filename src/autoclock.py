@@ -125,6 +125,7 @@ _persistent_driver_pool = {
     "driver": None,
     "last_used": 0.0,
     "lock": threading.Lock(),
+    "init_lock": threading.Lock(),
 }
 _PERSISTENT_DRIVER_IDLE_TIMEOUT = 15 * 60  # 15 分鐘無使用 → 主動 quit
 # 註：原本 60 分鐘但 idle 期間沒有人 wake 起來檢查，driver 等於永遠不釋放。
@@ -174,19 +175,28 @@ def _get_or_create_clock_driver():
 
     # 不存在或剛被清掉 → 重建 (initialize 走網路，務必鎖外)
     if d is None:
-        for attempt in range(4):
-            d = initialize_driver()
-            if d:
-                break
-            logging.warning("[autoclock] WebDriver 初始化失敗 (%s/4)，退避重試", attempt + 1)
-            if attempt < 3:
-                exponential_backoff_sleep(attempt, base_seconds=2.0, max_seconds=60.0)
-        if d:
-            d.set_script_timeout(30)
-            # 鎖內最後 set 回 pool
+        # initialize 不持 pool lock，但仍要確保同時間只有一個 thread 建 driver。
+        # 否則兩個 caller 同時看到 None 會各開一個 Chrome，後者覆蓋 pool、前者殘留。
+        with pool["init_lock"]:
             with pool["lock"]:
-                pool["driver"] = d
-                pool["last_used"] = time_module.time()
+                d = pool["driver"]
+                if d is not None:
+                    pool["last_used"] = time_module.time()
+                    return d
+
+            for attempt in range(4):
+                d = initialize_driver()
+                if d:
+                    break
+                logging.warning("[autoclock] WebDriver 初始化失敗 (%s/4)，退避重試", attempt + 1)
+                if attempt < 3:
+                    exponential_backoff_sleep(attempt, base_seconds=2.0, max_seconds=60.0)
+            if d:
+                d.set_script_timeout(30)
+                # 鎖內最後 set 回 pool
+                with pool["lock"]:
+                    pool["driver"] = d
+                    pool["last_used"] = time_module.time()
         return d
 
     # 走原路徑（既有 driver 仍健康）— 鎖內更新 last_used
@@ -826,10 +836,26 @@ def _autoclock_hard_exit(reason: str, code: int = 1) -> None:
     try:
         root_logger = logging.getLogger()
         for h in list(root_logger.handlers):
+            lock = getattr(h, "lock", None)
+            acquired = False
             try:
-                h.flush()
+                if lock is not None:
+                    acquired = lock.acquire(blocking=False)
+                    if not acquired:
+                        continue
+                stream = getattr(h, "stream", None)
+                if stream is not None and hasattr(stream, "flush"):
+                    stream.flush()
+                else:
+                    h.flush()
             except Exception:
                 pass
+            finally:
+                if lock is not None and acquired:
+                    try:
+                        lock.release()
+                    except Exception:
+                        pass
     except Exception:
         pass
     _os._exit(code)
