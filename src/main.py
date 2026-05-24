@@ -19,6 +19,9 @@ from cmuh_common.paths import (
 )
 from cmuh_common.atomic_io import atomic_write_json as _atomic_write_json
 from cmuh_common.atomic_io import atomic_write_text
+from cmuh_common.config_io import (
+    clone_default, load_json_dict, load_json_list, normalize_doctor_rows,
+)
 from cmuh_common.platform_win import (
     is_admin, run_as_admin, set_dpi_awareness, set_app_user_model_id, get_idle_duration,
 )
@@ -6806,31 +6809,17 @@ class AutomationApp:
     # 1. 讀取 R1-R3 設定
     def load_r_doctor_settings(self):
         defaults = {"R1": {"name": "林于喬"}, "R2": {"name": "陳翊嘉"}, "R3": {"name": "蔡明洋"}}
-        try:
-            with open(get_conf_path('r_doctor_settings.json'), 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            out = {k: dict(v) for k, v in defaults.items()}
-            if isinstance(data, dict):
-                for k in out:
-                    if k in data and isinstance(data[k], dict):
-                        out[k] = {"name": str(data[k].get("name", "")).strip()}
-            return out
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {k: dict(v) for k, v in defaults.items()}
+        data = load_json_dict(get_conf_path('r_doctor_settings.json'), defaults)
+        out = clone_default(defaults)
+        for k in out:
+            if isinstance(data.get(k), dict):
+                out[k] = {"name": str(data[k].get("name", "")).strip()}
+        return out
 
     # 2. 讀取 止掛人數 設定
     def load_threshold_settings(self):
-        try:
-            with open(get_conf_path('threshold_settings.json'), 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                data = DEFAULT_THRESHOLDS.copy()
-            else:
-                merged = DEFAULT_THRESHOLDS.copy()
-                merged.update(data)
-                data = merged
-        except (FileNotFoundError, json.JSONDecodeError):
-            data = DEFAULT_THRESHOLDS.copy()
+        data = load_json_dict(get_conf_path('threshold_settings.json'),
+                              DEFAULT_THRESHOLDS)
         if 'ui_font_scale' not in data:
             data['ui_font_scale'] = 1.0
         if 'notify_dnd_start_hour' not in data:
@@ -6858,40 +6847,16 @@ class AutomationApp:
             {"name": "李威儒", "doc_no": "D35819", "notifications": False},
             {"name": "蔡李澄", "doc_no": "D31352", "notifications": False}
         ]
-        try:
-            with open(get_conf_path('doctors.json'), 'r', encoding='utf-8') as f: 
-                data = json.load(f)
-                # [新增] 自動修復邏輯：檢查是否欄位錯置
-                fixed = False
-                for d in data:
-                    # 如果 "doc_no" (代號) 含有中文，或 "name" (姓名) 像是代號 (D開頭+數字)
-                    # 就把它們換回來
-                    if (any('\u4e00' <= char <= '\u9fff' for char in str(d['doc_no']))) or \
-                       (str(d['name']).startswith('D') and str(d['name'])[1:].isdigit()):
-                        logging.warning(f"Data corruption detected for {d['name']}/{d['doc_no']}. Swapping back.")
-                        real_name = d['doc_no']
-                        real_doc_no = d['name']
-                        d['name'] = real_name
-                        d['doc_no'] = real_doc_no
-                        fixed = True
-                
-                # 如果有修復，順便寫回檔案
-                if fixed:
-                    with open(get_conf_path('doctors.json'), 'w', encoding='utf-8') as fw:
-                        json.dump(data, fw, ensure_ascii=False, indent=4)
-                
-                return data
-        except (FileNotFoundError, json.JSONDecodeError):
-            return default_list
+        data = load_json_list(get_conf_path('doctors.json'), default_list)
+        normalized, fixed = normalize_doctor_rows(data, default_list)
+        if fixed:
+            _atomic_write_json(get_conf_path('doctors.json'), normalized)
+        return normalized
 
     # 4. 讀取 自動重開機 設定
     def load_auto_reboot_settings(self):
-        try:
-            # [修改] 使用 get_conf_path
-            with open(get_conf_path('auto_reboot_settings.json'), 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {"enabled": False, "time": "07:01"}
+        return load_json_dict(get_conf_path('auto_reboot_settings.json'),
+                              {"enabled": False, "time": "07:01"})
 
     # 1. 儲存 所有設定 (包含 R醫師, 止掛, 醫師列表, 重開機)
     def save_all_settings(self):
@@ -8828,11 +8793,8 @@ class AutomationApp:
     def load_clinic_settings(self):
         # [修改] 預設更新頻率改為 60 秒 (符合您的需求)
         default_settings = {"rooms": ["181", "182"], "time_modes": ["auto", "auto"]}
-        try:
-            with open(get_conf_path('clinic_settings.json'), 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return default_settings
+        return load_json_dict(get_conf_path('clinic_settings.json'),
+                              default_settings)
 
     # --- [新增] 儲存門診動態設定 ---
     def save_clinic_settings(self):
@@ -9110,12 +9072,9 @@ class AutomationApp:
         content_frame.columnconfigure(1, weight=1)
         content_frame.rowconfigure(0, weight=1)
         content_frame.rowconfigure(1, weight=1)
-        try:
-            with open(get_conf_path('certificate_templates.json'), 'r', encoding='utf-8') as f:
-                cert_data = json.load(f)
-                if not isinstance(cert_data, list) or len(cert_data) != 4:
-                    cert_data = self._get_default_cert_data()
-        except (FileNotFoundError, json.JSONDecodeError):
+        cert_data = load_json_list(get_conf_path('certificate_templates.json'),
+                                   self._get_default_cert_data())
+        if len(cert_data) != 4:
             cert_data = self._get_default_cert_data()
 
         self.cert_widgets_list = []
@@ -10228,8 +10187,7 @@ class AutomationApp:
         cred_path = get_conf_path('credentials.json')
         try:
             if os.path.exists(cred_path):
-                with open(cred_path, 'r', encoding='utf-8') as f:
-                    cred = json.load(f)
+                cred = load_json_dict(cred_path, {}, merge_defaults=False)
                 import base64
                 username = base64.b64decode(cred.get('u', '')).decode('utf-8')
                 password = base64.b64decode(cred.get('p', '')).decode('utf-8')
