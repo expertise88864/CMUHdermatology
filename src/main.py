@@ -27,6 +27,16 @@ from cmuh_common.cache_state import (
     decode_date_keys as _decode_cache_date_keys,
     save_json_cache,
 )
+from cmuh_common.clinic_state import (
+    build_dynamic_state,
+    clinic_dynamic_state_key,
+    clinic_dynamic_today_str,
+    matching_state_keys,
+    new_clinic_tracker,
+    prune_states_for_today,
+    restore_tracker_from_state,
+    state_matches,
+)
 from cmuh_common.platform_win import (
     is_admin, run_as_admin, set_dpi_awareness, set_app_user_model_id, get_idle_duration,
 )
@@ -5948,34 +5958,13 @@ class AutomationApp:
         self._avg_history_cache = {}  # [優化] 歷史資料更新，清除計算快取
 
     def _clinic_dynamic_today_str(self):
-        return date.today().strftime("%Y/%m/%d")
+        return clinic_dynamic_today_str()
 
     def _clinic_dynamic_state_key(self, room_code, time_code):
-        return f"{str(room_code).strip()}/{str(time_code).strip()}"
+        return clinic_dynamic_state_key(room_code, time_code)
 
     def _new_clinic_tracker(self, curr_session_i, current_timestamp):
-        return {
-            'last_completed_set': set(),
-            'last_waiting_set': set(),
-            'last_valid_completion_time': current_timestamp,
-            'durations': [],
-            'waiting_durations': [],
-            'is_saved': False,
-            'doc_name': '',
-            'actual_closing_dt': None,
-            'phototherapy_count': 0,
-            'patient_checkin_times': {},
-            'session_period': curr_session_i,
-            'is_first_run': True,
-            'first_valid_skipped': False,
-            'had_any_activity': False,
-            'stable_since_ts': None,
-            'last_monitor_pair': None,
-            # [2026-05-22] 記錄最後一次 completed/waiting 有變動的時刻 — 用來
-            # 推算「真實關診時間」(網頁 is_closed 後抓的是應診時間結束，常跟
-            # 實際關診時刻差 10-30 分鐘)。每次 is_closed 觸發時 prefer 這個。
-            'last_activity_ts': None,
-        }
+        return new_clinic_tracker(curr_session_i, current_timestamp)
 
     def _load_clinic_dynamic_state_cache(self):
         file_path = get_conf_path(CLINIC_DYNAMIC_STATE_FILENAME)
@@ -5993,98 +5982,15 @@ class AutomationApp:
         }
         _atomic_write_json(get_conf_path(CLINIC_DYNAMIC_STATE_FILENAME), payload)
 
-    @staticmethod
-    def _clinic_state_int_set(value):
-        out = set()
-        for item in value or []:
-            try:
-                out.add(int(item))
-            except (TypeError, ValueError):
-                pass
-        return out
-
-    @staticmethod
-    def _clinic_state_float_list(value):
-        out = []
-        for item in value or []:
-            try:
-                out.append(float(item))
-            except (TypeError, ValueError):
-                pass
-        return out
-
     def _clinic_dynamic_state_matches(self, state, room_code, time_code, doc_name=None, session_cn=None):
-        if not isinstance(state, dict):
-            return False
-        if state.get("date") != self._clinic_dynamic_today_str():
-            return False
-        if str(state.get("room", "")).strip() != str(room_code).strip():
-            return False
-        if str(state.get("time_code", "")).strip() != str(time_code).strip():
-            return False
-        if session_cn and _canonical_clinic_session_str(state.get("session")) != _canonical_clinic_session_str(session_cn):
-            return False
-        cached_doc = (state.get("doctor") or "").strip()
-        if doc_name and cached_doc and cached_doc != str(doc_name).strip():
-            return False
-        return True
+        return state_matches(
+            state, room_code, time_code, self._clinic_dynamic_today_str(),
+            _canonical_clinic_session_str, doc_name, session_cn)
 
     def _restore_clinic_tracker_from_state(self, state, curr_session_i, current_timestamp):
-        tracker = self._new_clinic_tracker(curr_session_i, current_timestamp)
-        if not isinstance(state, dict):
-            return tracker
-        tracker["doc_name"] = (state.get("doctor") or "").strip()
-        tracker["session_period"] = _canonical_clinic_session_str(state.get("session")) or curr_session_i
-        tracker["last_completed_set"] = self._clinic_state_int_set(state.get("last_completed_set"))
-        tracker["last_waiting_set"] = self._clinic_state_int_set(state.get("last_waiting_set"))
-        tracker["durations"] = self._clinic_state_float_list(state.get("durations"))
-        tracker["waiting_durations"] = self._clinic_state_float_list(state.get("waiting_durations"))
-        try:
-            tracker["phototherapy_count"] = int(state.get("phototherapy_count", 0))
-        except (TypeError, ValueError):
-            tracker["phototherapy_count"] = 0
-        try:
-            tracker["last_valid_completion_time"] = float(state.get("last_valid_completion_time", current_timestamp))
-        except (TypeError, ValueError):
-            tracker["last_valid_completion_time"] = current_timestamp
-        tracker["is_saved"] = bool(state.get("is_saved", False))
-        tracker["first_valid_skipped"] = bool(state.get("first_valid_skipped", bool(tracker["durations"])))
-        tracker["had_any_activity"] = bool(
-            state.get("had_any_activity")
-            or tracker["last_completed_set"]
-            or tracker["last_waiting_set"]
-            or tracker["durations"]
-        )
-        tracker["is_first_run"] = bool(state.get("is_first_run", False)) and not tracker["had_any_activity"]
-
-        patient_times = {}
-        for k, v in (state.get("patient_checkin_times") or {}).items():
-            try:
-                patient_times[int(k)] = float(v)
-            except (TypeError, ValueError):
-                pass
-        tracker["patient_checkin_times"] = patient_times
-
-        for key in ("stable_since_ts",):
-            try:
-                tracker[key] = float(state[key]) if state.get(key) is not None else None
-            except (TypeError, ValueError):
-                tracker[key] = None
-
-        pair = state.get("last_monitor_pair")
-        if isinstance(pair, (list, tuple)) and len(pair) == 2:
-            try:
-                tracker["last_monitor_pair"] = (int(pair[0]), int(pair[1]))
-            except (TypeError, ValueError):
-                tracker["last_monitor_pair"] = None
-
-        close_iso = state.get("actual_closing_dt") or ""
-        if close_iso:
-            try:
-                tracker["actual_closing_dt"] = datetime.fromisoformat(close_iso)
-            except (TypeError, ValueError):
-                tracker["actual_closing_dt"] = None
-        return tracker
+        return restore_tracker_from_state(
+            state, curr_session_i, current_timestamp,
+            _canonical_clinic_session_str)
 
     def _get_clinic_dynamic_state(self, room_code, time_code, doc_name=None, session_cn=None):
         key = self._clinic_dynamic_state_key(room_code, time_code)
@@ -6098,63 +6004,27 @@ class AutomationApp:
         session_cn = _canonical_clinic_session_str(tracker.get("session_period")) or reg64_slot_cn(time_code)
         if not room_code or not time_code or not doc_name or not session_cn:
             return
-        actual_dt = tracker.get("actual_closing_dt")
-        if isinstance(actual_dt, datetime):
-            actual_dt = actual_dt.isoformat(timespec="seconds")
-        else:
-            actual_dt = ""
-        state = {
-            "date": self._clinic_dynamic_today_str(),
-            "saved_at": datetime.now().isoformat(timespec="seconds"),
-            "room": str(room_code),
-            "time_code": str(time_code),
-            "session": session_cn,
-            "doctor": doc_name,
-            "last_completed_set": sorted(int(x) for x in tracker.get("last_completed_set", set())),
-            "last_waiting_set": sorted(int(x) for x in tracker.get("last_waiting_set", set())),
-            "last_valid_completion_time": float(tracker.get("last_valid_completion_time", time.time())),
-            "durations": [float(x) for x in tracker.get("durations", [])],
-            "waiting_durations": [float(x) for x in tracker.get("waiting_durations", [])],
-            "is_saved": bool(tracker.get("is_saved", False)),
-            "actual_closing_dt": actual_dt,
-            "phototherapy_count": int(tracker.get("phototherapy_count", 0)),
-            "patient_checkin_times": {
-                str(int(k)): float(v)
-                for k, v in (tracker.get("patient_checkin_times") or {}).items()
-            },
-            "session_period": session_cn,
-            "is_first_run": bool(tracker.get("is_first_run", False)),
-            "first_valid_skipped": bool(tracker.get("first_valid_skipped", False)),
-            "had_any_activity": bool(tracker.get("had_any_activity", False)),
-            "stable_since_ts": tracker.get("stable_since_ts"),
-            "last_monitor_pair": list(tracker.get("last_monitor_pair")) if tracker.get("last_monitor_pair") else None,
-            "last_result": {
-                "doc_name": doc_name,
-                "reg64_time_code": str(time_code),
-                "light": result.get("light", "--"),
-                "total": result.get("total", "-"),
-                "waiting": result.get("waiting", "-"),
-                "completed": result.get("completed", 0),
-                "status": result.get("status", ""),
-                "is_closed": bool(result.get("is_closed", False)),
-                "is_stopped": bool(result.get("is_stopped", False)),
-                "close_time": result.get("close_time", ""),
-            },
-            "last_display": {
-                "curr_avg": curr_avg,
-                "est_remain": est_remain if est_remain and est_remain != "-" else "—",
-                "hist_light": hist_light,
-                "prev_close": prev_close,
-            },
-        }
+        today_s = self._clinic_dynamic_today_str()
+        state = build_dynamic_state(
+            today_s,
+            datetime.now().isoformat(timespec="seconds"),
+            room_code,
+            time_code,
+            session_cn,
+            doc_name,
+            tracker,
+            result,
+            current_timestamp=time.time(),
+            curr_avg=curr_avg,
+            est_remain=est_remain,
+            hist_light=hist_light,
+            prev_close=prev_close,
+        )
         key = self._clinic_dynamic_state_key(room_code, time_code)
         try:
             with self._clinic_dynamic_state_lock:
-                today_s = self._clinic_dynamic_today_str()
-                self._clinic_dynamic_state_cache = {
-                    k: v for k, v in self._clinic_dynamic_state_cache.items()
-                    if isinstance(v, dict) and v.get("date") == today_s
-                }
+                self._clinic_dynamic_state_cache = prune_states_for_today(
+                    self._clinic_dynamic_state_cache, today_s)
                 self._clinic_dynamic_state_cache[key] = state
                 self._write_clinic_dynamic_state_cache()
         except Exception as e:
@@ -6163,17 +6033,8 @@ class AutomationApp:
     def _clear_clinic_dynamic_state(self, room_code, time_code=None, doc_name=None):
         try:
             with self._clinic_dynamic_state_lock:
-                keys_to_delete = []
-                for key, state in self._clinic_dynamic_state_cache.items():
-                    if not isinstance(state, dict):
-                        continue
-                    if str(state.get("room", "")) != str(room_code):
-                        continue
-                    if time_code is not None and str(state.get("time_code", "")) != str(time_code):
-                        continue
-                    if doc_name and state.get("doctor") != doc_name:
-                        continue
-                    keys_to_delete.append(key)
+                keys_to_delete = matching_state_keys(
+                    self._clinic_dynamic_state_cache, room_code, time_code, doc_name)
                 for key in keys_to_delete:
                     self._clinic_dynamic_state_cache.pop(key, None)
                 if keys_to_delete:
