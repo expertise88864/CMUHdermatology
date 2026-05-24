@@ -27,6 +27,9 @@ from cmuh_common.cache_state import (
     decode_date_keys as _decode_cache_date_keys,
     save_json_cache,
 )
+from cmuh_common.refresh_policy import (
+    partition_doctors_for_refresh_batches as _partition_refresh_batches,
+)
 from cmuh_common.clinic_history import (
     all_time_average_text,
     historical_duration_totals,
@@ -305,14 +308,11 @@ REFRESH_QUERY_BATCH_1 = ("張廖年峰", "吳伯元", "陳駿升")
 REFRESH_QUERY_BATCH_2 = ("謝佳陵", "方心禹", "沈冠宇")
 
 def partition_doctors_for_refresh_batches(doctors):
-    if not doctors:
-        return []
-    by_name = {d["name"]: d for d in doctors}
-    b1 = [by_name[n] for n in REFRESH_QUERY_BATCH_1 if n in by_name]
-    b2 = [by_name[n] for n in REFRESH_QUERY_BATCH_2 if n in by_name]
-    fixed = set(REFRESH_QUERY_BATCH_1) | set(REFRESH_QUERY_BATCH_2)
-    b3 = [d for d in doctors if d.get("name") not in fixed]
-    return [batch for batch in (b1, b2, b3) if batch]
+    return _partition_refresh_batches(
+        doctors,
+        first_batch_names=REFRESH_QUERY_BATCH_1,
+        second_batch_names=REFRESH_QUERY_BATCH_2,
+    )
 
 # 【重構 2026-05-21】抽到 cmuh_common.hotkey_scaling（main.py 也 import 同一份；
 # 原本 main.py 用 _scaled_xy 卻沒定義是 dangling reference / 潛在 NameError）
