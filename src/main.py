@@ -149,24 +149,6 @@ class DoctorConfig(TypedDict):
     notifications: NotRequired[bool]
 
 
-def date_key_encoder(obj):
-    """將 date 物件轉為 ISO 字串，以便存入 JSON"""
-    if isinstance(obj, (date, datetime)):
-        return obj.isoformat()
-    raise TypeError(f"Type {type(obj)} not serializable")
-
-
-def decode_date_keys(dct):
-    """讀取 JSON 時，將 ISO 日期字串轉回 date 物件（字典鍵）"""
-    new_dct = {}
-    for k, v in dct.items():
-        try:
-            new_k = date.fromisoformat(k)
-        except ValueError:
-            new_k = k
-        new_dct[new_k] = v
-    return new_dct
-
 # --- 延遲載入 pyautogui / keyboard（啟動後由 AutomationApp.load_heavy_modules 填入）---
 class HotkeyModules:
     __slots__ = ("pyautogui", "keyboard")
@@ -5872,24 +5854,6 @@ class AutomationApp:
             raise
         except Exception:
             sys.exit(0)
-
-# --- [新增/修改] 確保 Key 為字串的輔助函式 ---
-    def _convert_keys_to_str(self, data):
-        """遞迴將字典中所有的 Key 轉為字串 (針對 datetime.date)"""
-        if isinstance(data, dict):
-            new_dict = {}
-            for k, v in data.items():
-                # 如果 Key 是日期或時間，轉為 ISO 格式字串
-                if isinstance(k, (date, datetime)):
-                    k_str = k.isoformat()
-                else:
-                    k_str = str(k)
-                new_dict[k_str] = self._convert_keys_to_str(v)
-            return new_dict
-        elif isinstance(data, list):
-            return [self._convert_keys_to_str(i) for i in data]
-        else:
-            return data
 
     # --- [修改] 儲存快取通用函式 (加入 Key 轉換) ---
     def _save_cache(self, filename, data):
