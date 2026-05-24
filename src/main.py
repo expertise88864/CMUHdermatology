@@ -22,6 +22,11 @@ from cmuh_common.atomic_io import atomic_write_text
 from cmuh_common.config_io import (
     clone_default, load_json_dict, load_json_list, normalize_doctor_rows,
 )
+from cmuh_common.cache_state import (
+    build_master_schedule_index,
+    decode_date_keys as _decode_cache_date_keys,
+    save_json_cache,
+)
 from cmuh_common.platform_win import (
     is_admin, run_as_admin, set_dpi_awareness, set_app_user_model_id, get_idle_duration,
 )
@@ -5871,35 +5876,13 @@ class AutomationApp:
                 from cmuh_common.sqlite_cache import save_clinic_counts
                 save_clinic_counts(data)
                 return
-            safe_data = self._convert_keys_to_str(data)
-            _atomic_write_json(get_conf_path(filename), safe_data, default=date_key_encoder)
+            save_json_cache(get_conf_path(filename), data)
         except Exception as e:
             logging.error(f"儲存快取 {filename} 失敗: {e}")
 
     def _rebuild_master_schedule_index(self):
-        by_weekday = defaultdict(list)
-        self_paid_map = {}
-        for doctor_name, weekday_map in self.master_schedule.items():
-            if not isinstance(weekday_map, dict):
-                continue
-            for weekday_idx, sessions in weekday_map.items():
-                try:
-                    normalized_weekday = int(weekday_idx)
-                except (TypeError, ValueError):
-                    continue
-                if not isinstance(sessions, list):
-                    continue
-                for session_info in sessions:
-                    if not isinstance(session_info, dict):
-                        continue
-                    session_name = session_info.get('session')
-                    if not session_name:
-                        continue
-                    is_self_paid = bool(session_info.get('is_self_paid'))
-                    by_weekday[normalized_weekday].append((doctor_name, session_name, is_self_paid))
-                    self_paid_map[(doctor_name, normalized_weekday, session_name)] = is_self_paid
-        self._master_schedule_by_weekday = by_weekday
-        self._master_schedule_self_paid = self_paid_map
+        indexes = build_master_schedule_index(self.master_schedule)
+        self._master_schedule_by_weekday, self._master_schedule_self_paid = indexes
 
     # --- [修改] 載入快取資料 (加入損壞自動刪除機制) ---
     def load_cached_data(self):
@@ -5915,7 +5898,7 @@ class AutomationApp:
                     for doc_no, doc_data in raw_data.items():
                         if isinstance(doc_data, dict) and 'error' not in doc_data:
                             with self._doctor_data_lock:
-                                self.all_doctors_data[doc_no] = decode_date_keys(doc_data)
+                                self.all_doctors_data[doc_no] = _decode_cache_date_keys(doc_data)
                     logging.info("[O22] 已載入門診人數快取（SQLite，%d 醫師）", len(raw_data))
             except Exception:
                 logging.warning("[O22] SQLite cache 載入失敗，fallback 到 JSON", exc_info=True)
@@ -5926,7 +5909,7 @@ class AutomationApp:
                     for doc_no, doc_data in raw_data.items():
                         if isinstance(doc_data, dict) and 'error' not in doc_data:
                             with self._doctor_data_lock:
-                                self.all_doctors_data[doc_no] = decode_date_keys(doc_data)
+                                self.all_doctors_data[doc_no] = _decode_cache_date_keys(doc_data)
                     logging.info("已載入門診人數快取（JSON fallback）。")
 
             # 2. 載入 主門診表 (master_schedule)
