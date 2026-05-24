@@ -34,6 +34,11 @@ from cmuh_common.master_schedule_cache import (
 from cmuh_common.refresh_policy import (
     partition_doctors_for_refresh_batches as _partition_refresh_batches,
 )
+from cmuh_common.threshold_policy import (
+    DEFAULT_THRESHOLDS,
+    build_doctor_threshold_map,
+    is_near_alert_threshold,
+)
 from cmuh_common.clinic_state import (
     build_dynamic_state,
     clinic_dynamic_state_key,
@@ -298,7 +303,7 @@ try:
     from bs4 import BeautifulSoup
 
     # --- [修改] 移除這裡的 Selenium 相關 import，移到下方函式內 ---
-    # refresh_policy_utils 並非公開 PyPI 套件；門檻邏輯內嵌於本檔 DEFAULT_THRESHOLDS 下方。
+    # refresh_policy_utils 並非公開 PyPI 套件；門檻邏輯改由 cmuh_common.threshold_policy 提供。
 except ImportError as e:
     missing_module = str(e).split("'")[1]
     error_message = f"缺少必要的模組: {missing_module}\n\n請打開命令提示字元(cmd)並執行:\npip install {missing_module}"
@@ -310,93 +315,7 @@ except ImportError as e:
 DOCTORS = []
 DOCTOR_NAMES = []
 
-# [修改] 更新預設門檻值 (區分醫師)
-DEFAULT_THRESHOLDS = {
-    # 張廖年峰
-    'chang_mon_night': 129, 'chang_thu_morning': 109, 'chang_thu_night': 129, 'chang_fri_afternoon': 89,
-    # 陳駿升 (預設: 週一午69, 週二晚59, 周四早54, 週四午69)
-    'chen_mon_afternoon': 69, 'chen_tue_night': 59, 'chen_thu_morning': 54, 'chen_thu_afternoon': 69
-}
 GENERAL_ALERT_THRESHOLD = 60
-
-
-def build_doctor_threshold_map(doctor_name, threshold_settings):
-    """依醫師與 threshold_settings.json 內容，建立 (weekday, 上午|下午|晚上) -> 止掛門檻。"""
-    ts = threshold_settings if isinstance(threshold_settings, dict) else {}
-
-    def _int_setting(key):
-        v = ts.get(key, DEFAULT_THRESHOLDS.get(key))
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return None
-
-    if doctor_name == "張廖年峰":
-        pairs = (
-            ((0, "晚上"), "chang_mon_night"),
-            ((3, "上午"), "chang_thu_morning"),
-            ((3, "晚上"), "chang_thu_night"),
-            ((4, "下午"), "chang_fri_afternoon"),
-        )
-    elif doctor_name == "陳駿升":
-        pairs = (
-            ((0, "下午"), "chen_mon_afternoon"),
-            ((1, "晚上"), "chen_tue_night"),
-            ((3, "上午"), "chen_thu_morning"),
-            ((3, "下午"), "chen_thu_afternoon"),
-        )
-    else:
-        return {}
-
-    out = {}
-    for session_key, cfg_key in pairs:
-        iv = _int_setting(cfg_key)
-        if iv is not None:
-            out[session_key] = iv
-    return out
-
-
-def _appt_item_session_and_count_text(appt_item):
-    """與月曆 _update_grid_data 相同來源結構，取出診別與可供擷取人數的狀態字串。"""
-    if isinstance(appt_item, dict):
-        session_name = appt_item.get("session", "")
-        raw_count = appt_item.get("count", 0)
-        status_text = str(raw_count)
-        if isinstance(raw_count, int):
-            status_text += "人"
-        return session_name, status_text
-    parts = appt_item.split("|")
-    status_part = parts[0]
-    session_name = status_part.split(":")[0]
-    status_text = status_part.split(":", 1)[1].strip()
-    return session_name, status_text
-
-
-def is_near_alert_threshold(sessions, weekday_idx, threshold_map, margin=10):
-    """當日任一診別掛號人數 >= 門檻 - margin 時為 True（供 priority refresh 加頻）。"""
-    if not sessions or not threshold_map:
-        return False
-    try:
-        m = int(margin)
-    except (TypeError, ValueError):
-        m = 10
-    for appt_item in sessions:
-        session_name, status_text = _appt_item_session_and_count_text(appt_item)
-        if "休診" in status_text or "停診" in status_text:
-            continue
-        match = _RE_COUNT_DIGIT.search(status_text)
-        if not match:
-            continue
-        try:
-            count = int(match.group(1))
-        except ValueError:
-            continue
-        thr = threshold_map.get((weekday_idx, session_name))
-        if not isinstance(thr, int):
-            continue
-        if count >= thr - m:
-            return True
-    return False
 
 
 REFRESH_QUERY_BATCH_1 = ("張廖年峰", "吳伯元", "陳駿升")
