@@ -77,6 +77,7 @@ from cmuh_common.ui_messages import (
 )
 from cmuh_common.deps_runtime import ensure_dependencies as _ensure_deps_runtime
 from cmuh_common.single_instance import ensure_single_instance, release_single_instance
+from cmuh_common.duty_summary import build_duty_summary_parts
 # 【重構 2026-05-21】熱鍵座標縮放（原本 main.py 用 _scaled_xy 卻沒定義 — 潛在 NameError）
 from cmuh_common.hotkey_scaling import (  # noqa: E402
     HOTKEY_SUPPORTED_RESOLUTIONS,
@@ -6171,38 +6172,23 @@ class AutomationApp:
         else:
             self.root.after(0, callback)
 
-    @staticmethod
-    def _split_duty_prefix_name(full, sep=" 值班:"):
-        if sep in full:
-            i = full.index(sep)
-            return full[: i + len(sep)], full[i + len(sep) :].strip()
-        return full, ""
-
-    @staticmethod
-    def _split_duty_vs_label_name(full):
-        for lab in ("當日值班VS:", "當週值班VS:"):
-            if full.startswith(lab):
-                return lab, full[len(lab) :].strip()
-        if ":" in full:
-            a, b = full.split(":", 1)
-            return a.strip() + ":", b.strip()
-        return full, ""
-
     def _refresh_duty_summary_text(self):
         if not hasattr(self, "duty_row1_prefix_var"):
             return
-        p1, n1 = self._split_duty_prefix_name(self.duty_doctor_var.get())
-        vl1, vn1 = self._split_duty_vs_label_name(self.duty_vs_var.get())
-        p2, n2 = self._split_duty_prefix_name(self.saturday_duty_doctor_var.get())
-        vl2, vn2 = self._split_duty_vs_label_name(self.saturday_duty_vs_var.get())
-        self.duty_row1_prefix_var.set(p1)
-        self.duty_row1_name_var.set(n1)
-        self.duty_row1_vs_lbl_var.set(vl1)
-        self.duty_row1_vs_name_var.set(vn1)
-        self.duty_row2_prefix_var.set(p2)
-        self.duty_row2_name_var.set(n2)
-        self.duty_row2_vs_lbl_var.set(vl2)
-        self.duty_row2_vs_name_var.set(vn2)
+        parts = build_duty_summary_parts(
+            self.duty_doctor_var.get(),
+            self.duty_vs_var.get(),
+            self.saturday_duty_doctor_var.get(),
+            self.saturday_duty_vs_var.get(),
+        )
+        self.duty_row1_prefix_var.set(parts["row1_prefix"])
+        self.duty_row1_name_var.set(parts["row1_name"])
+        self.duty_row1_vs_lbl_var.set(parts["row1_vs_label"])
+        self.duty_row1_vs_name_var.set(parts["row1_vs_name"])
+        self.duty_row2_prefix_var.set(parts["row2_prefix"])
+        self.duty_row2_name_var.set(parts["row2_name"])
+        self.duty_row2_vs_lbl_var.set(parts["row2_vs_label"])
+        self.duty_row2_vs_name_var.set(parts["row2_vs_name"])
 
     def _show_notice(self, title, message, level="info", auto_close_ms=4000):
         def render_notice():
