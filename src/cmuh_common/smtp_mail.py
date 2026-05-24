@@ -29,9 +29,7 @@ App Password 取得（一次性）：
 """
 from __future__ import annotations
 
-import json
 import logging
-import os
 import smtplib
 import socket
 import ssl
@@ -45,6 +43,7 @@ from pathlib import Path
 from typing import Optional
 
 from cmuh_common.paths import get_settings_dir
+from cmuh_common.atomic_io import atomic_write_json, safe_load_json
 
 CREDENTIALS_FILE = Path(get_settings_dir()) / "smtp_credentials.json"
 
@@ -99,15 +98,12 @@ def load_credentials() -> dict:
     cred = dict(DEFAULT_CREDENTIALS)
     try:
         if CREDENTIALS_FILE.exists():
-            with open(CREDENTIALS_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f)
+            saved = safe_load_json(str(CREDENTIALS_FILE), default={})
             if isinstance(saved, dict):
                 cred.update(saved)
         else:
             # 建範本檔，使用者編輯填入 password
-            os.makedirs(CREDENTIALS_FILE.parent, exist_ok=True)
-            with open(CREDENTIALS_FILE, "w", encoding="utf-8") as f:
-                json.dump(DEFAULT_CREDENTIALS, f, ensure_ascii=False, indent=2)
+            atomic_write_json(str(CREDENTIALS_FILE), DEFAULT_CREDENTIALS, indent=2)
             logging.info("已建立 SMTP 設定範本：%s（請填入 App Password 後再寄信）",
                          CREDENTIALS_FILE)
     except Exception:

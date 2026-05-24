@@ -77,7 +77,7 @@ _user32.SetThreadDesktop.argtypes = [ctypes.c_void_p]
 _user32.CloseDesktop.restype = ctypes.c_bool
 _user32.CloseDesktop.argtypes = [ctypes.c_void_p]
 
-from cmuh_common.atomic_io import atomic_write_json  # noqa: E402
+from cmuh_common.atomic_io import atomic_write_json, safe_load_json  # noqa: E402
 from cmuh_common.logging_setup import QueueHandler, setup_logging  # noqa: E402
 from cmuh_common.paths import get_app_dir, get_settings_dir  # noqa: E402
 from cmuh_common.platform_win import is_admin, run_as_admin  # noqa: E402
@@ -215,9 +215,7 @@ def load_config() -> dict:
         cfg = dict(DEFAULT_CONFIG)
         try:
             if CONFIG_FILE.exists():
-                import json
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    saved = json.load(f)
+                saved = safe_load_json(str(CONFIG_FILE), default={})
                 if isinstance(saved, dict):
                     cfg.update(saved)
         except Exception:

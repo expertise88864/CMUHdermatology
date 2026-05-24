@@ -24,6 +24,8 @@ import threading
 import time
 from pathlib import Path
 
+from cmuh_common.atomic_io import atomic_write_json, atomic_write_text, safe_load_json
+
 # ─── 路徑 ────────────────────────────────────────────────────────────────
 _HERE = Path(__file__).resolve().parent
 # repo root：src/cmuh_common/.. = src，..再上一層 = root
@@ -102,6 +104,10 @@ DEFAULT_CONFIG = {
 }
 
 
+def _default_config_copy() -> dict:
+    return json.loads(json.dumps(DEFAULT_CONFIG))
+
+
 # ─── Schema migration ───────────────────────────────────────────────────
 # v1 → v2 (2026-05-19)：process_match 從 "consult_query"/"autoclock"/
 # "src\\main.py" 改成 .pyw 中文名稱（cmdline 沒前者，watchdog 永遠找不到 →
@@ -173,8 +179,8 @@ def _record_restart_and_check_crash_loop(name: str) -> bool:
                                 time.localtime(now + CRASH_LOOP_SUSPEND_SEC)))
             # [H] 同時暫停 auto-update 1 小時 (避免又拉到同個爛版本)
             try:
-                AUTO_UPDATE_SUSPEND_FLAG.parent.mkdir(parents=True, exist_ok=True)
-                AUTO_UPDATE_SUSPEND_FLAG.write_text(
+                atomic_write_text(
+                    str(AUTO_UPDATE_SUSPEND_FLAG),
                     f"{int(now) + 3600}\n"
                     f"reason: {name} crash loop at {time.strftime('%Y-%m-%d %H:%M:%S')}\n",
                     encoding="utf-8")
@@ -269,31 +275,24 @@ def load_config() -> dict:
     if not CONFIG_PATH.exists():
         try:
             CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            CONFIG_PATH.write_text(
-                json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2),
-                encoding="utf-8"
-            )
+            atomic_write_json(str(CONFIG_PATH), DEFAULT_CONFIG, indent=2)
         except Exception:
             logging.exception("[watchdog] 寫預設 config 失敗")
-        return json.loads(json.dumps(DEFAULT_CONFIG))
+        return _default_config_copy()
 
-    try:
-        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        logging.exception("[watchdog] 讀 config 失敗，用記憶體 default")
-        return json.loads(json.dumps(DEFAULT_CONFIG))
+    cfg = safe_load_json(str(CONFIG_PATH), default=None)
+    if not isinstance(cfg, dict):
+        logging.warning("[watchdog] config 不可用或格式錯誤，用記憶體 default")
+        return _default_config_copy()
 
     for k, v in DEFAULT_CONFIG.items():
-        cfg.setdefault(k, v)
+        cfg.setdefault(k, json.loads(json.dumps(v)))
 
     # Schema migration (v1 → v2 修 process_match)
     cfg, migrated = _migrate_config(cfg)
     if migrated:
         try:
-            CONFIG_PATH.write_text(
-                json.dumps(cfg, ensure_ascii=False, indent=2),
-                encoding="utf-8"
-            )
+            atomic_write_json(str(CONFIG_PATH), cfg, indent=2)
             logging.info("[watchdog] config 升級至 schema v%d",
                           CONFIG_SCHEMA_VERSION)
         except Exception:

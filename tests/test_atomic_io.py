@@ -7,7 +7,11 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from cmuh_common.atomic_io import atomic_write_json, atomic_write_text  # noqa: E402
+from cmuh_common.atomic_io import (  # noqa: E402
+    atomic_write_json,
+    atomic_write_text,
+    safe_load_json,
+)
 
 
 def test_atomic_write_json_roundtrip():
@@ -17,6 +21,17 @@ def test_atomic_write_json_roundtrip():
         with open(p, encoding="utf-8") as f:
             data = json.load(f)
         assert data == {"a": 1, "中文": "OK"}
+
+
+def test_atomic_write_json_creates_parent_dir_and_cleans_tmp():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "nested", "data.json")
+        atomic_write_json(p, {"ok": True}, indent=2)
+        with open(p, encoding="utf-8") as f:
+            assert json.load(f) == {"ok": True}
+        leftovers = [n for n in os.listdir(os.path.dirname(p))
+                     if n.endswith(".tmp")]
+        assert leftovers == []
 
 
 def test_atomic_write_text_creates_bak():
@@ -33,7 +48,34 @@ def test_atomic_write_text_creates_bak():
             assert f.read() == "v1"
 
 
+def test_atomic_write_text_creates_parent_dir_and_cleans_tmp():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "nested", "code.py")
+        assert atomic_write_text(p, "print('ok')\n") is True
+        with open(p, encoding="utf-8") as f:
+            assert f.read() == "print('ok')\n"
+        leftovers = [n for n in os.listdir(os.path.dirname(p))
+                     if n.endswith(".tmp")]
+        assert leftovers == []
+
+
+def test_safe_load_json_backs_up_corrupt_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "broken.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{not valid json")
+
+        assert safe_load_json(p, default={"fallback": True}) == {"fallback": True}
+        assert not os.path.exists(p)
+        backups = [n for n in os.listdir(tmp)
+                   if n.startswith("broken.json.corrupt-")]
+        assert len(backups) == 1
+
+
 if __name__ == "__main__":
     test_atomic_write_json_roundtrip()
+    test_atomic_write_json_creates_parent_dir_and_cleans_tmp()
     test_atomic_write_text_creates_bak()
+    test_atomic_write_text_creates_parent_dir_and_cleans_tmp()
+    test_safe_load_json_backs_up_corrupt_file()
     print("[OK] atomic_io tests passed")

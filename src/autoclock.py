@@ -33,11 +33,9 @@ ensure_dependencies(REQUIRED_LIBS)
 
 # === 主要 import ===
 import ctypes  # noqa: E402
-import json  # noqa: E402
 import logging  # noqa: E402
 import queue  # noqa: E402
 import random  # noqa: E402
-import tempfile  # noqa: E402
 import threading  # noqa: E402
 import time as time_module  # noqa: E402
 import tkinter as tk  # noqa: E402
@@ -56,6 +54,7 @@ from selenium.webdriver.support import expected_conditions as EC  # noqa: E402
 from selenium.webdriver.support.ui import WebDriverWait  # noqa: E402
 
 from clock.webdriver_setup import initialize_driver  # noqa: E402
+from cmuh_common.atomic_io import atomic_write_json, safe_load_json  # noqa: E402
 from cmuh_common.logging_setup import QueueHandler, setup_logging  # noqa: E402
 from cmuh_common.paths import get_app_dir, get_settings_dir, restart_self  # noqa: E402
 from cmuh_common.single_instance import ensure_single_instance, release_single_instance  # noqa: E402
@@ -420,16 +419,8 @@ def _handle_clock_failure(driver, username: str, task_label: str, exc, dry_run: 
 def load_config() -> list:
     global accounts_data
     with _config_lock:
-        try:
-            if CONFIG_FILE.exists():
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                accounts_data = data if isinstance(data, list) else []
-            else:
-                accounts_data = []
-        except (json.JSONDecodeError, OSError) as e:
-            logging.error("讀取設定失敗: %s", e)
-            accounts_data = []
+        data = safe_load_json(str(CONFIG_FILE), default=[])
+        accounts_data = data if isinstance(data, list) else []
     return accounts_data
 
 
@@ -438,18 +429,7 @@ def save_config() -> bool:
     with _config_lock:
         try:
             accounts_data.sort(key=lambda x: x.get("username", ""))
-            fd, temp_path = tempfile.mkstemp(
-                suffix=".tmp", prefix="autoclock_", dir=str(SETTINGS_DIR))
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(accounts_data, f, indent=4, ensure_ascii=False)
-                os.replace(temp_path, CONFIG_FILE)
-            except Exception:
-                try:
-                    os.unlink(temp_path)
-                except OSError:
-                    pass
-                raise
+            atomic_write_json(str(CONFIG_FILE), accounts_data)
             return True
         except Exception as e:
             logging.error("儲存失敗: %s", e)

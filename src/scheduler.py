@@ -3489,8 +3489,7 @@ class AutomationApp:
                 
                 # 如果有修復，順便寫回檔案
                 if fixed:
-                    with open(get_conf_path('doctors.json'), 'w', encoding='utf-8') as fw:
-                        json.dump(data, fw, ensure_ascii=False, indent=4)
+                    _atomic_write_json(get_conf_path('doctors.json'), data)
                 
                 return data
         except (FileNotFoundError, json.JSONDecodeError):
@@ -6402,11 +6401,10 @@ class AutomationApp:
                 password = sd.askstring("打卡密碼設定", "請輸入打卡密碼 (將加密儲存):", parent=self.root, show='*') or ""
                 if username and password:
                     import base64
-                    with open(cred_path, 'w', encoding='utf-8') as f:
-                        json.dump({
-                            'u': base64.b64encode(username.encode()).decode(),
-                            'p': base64.b64encode(password.encode()).decode()
-                        }, f)
+                    _atomic_write_json(cred_path, {
+                        'u': base64.b64encode(username.encode()).decode(),
+                        'p': base64.b64encode(password.encode()).decode()
+                    })
                     logging.info("打卡帳號已加密儲存至 credentials.json")
                 else:
                     put_ui_message(self.ui_queue, UiClockStatusMessage(status_data={'error': '帳號未設定'}))

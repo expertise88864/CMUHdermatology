@@ -8,18 +8,43 @@
 import json
 import logging
 import os
+import tempfile
 import time
+
+
+def _flush_and_fsync(f) -> None:
+    """Flush file content to disk before os.replace."""
+    f.flush()
+    os.fsync(f.fileno())
+
+
+def _make_temp_path(target_path: str) -> tuple[int, str]:
+    target_dir = os.path.dirname(os.path.abspath(target_path)) or "."
+    os.makedirs(target_dir, exist_ok=True)
+    base = os.path.basename(target_path)
+    return tempfile.mkstemp(prefix=f".{base}.", suffix=".tmp", dir=target_dir)
 
 
 def atomic_write_json(file_path: str, data, **kwargs) -> None:
     """JSON 原子寫入。kwargs 會傳給 json.dump（如 default=...）。"""
-    tmp_path = file_path + ".tmp"
+    fd = -1
+    tmp_path = ""
     try:
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=4, **kwargs)
+        fd, tmp_path = _make_temp_path(file_path)
+        dump_kwargs = {"ensure_ascii": False, "indent": 4}
+        dump_kwargs.update(kwargs)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            fd = -1
+            json.dump(data, f, **dump_kwargs)
+            _flush_and_fsync(f)
         os.replace(tmp_path, file_path)
     except Exception:
-        if os.path.exists(tmp_path):
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
             except Exception:
@@ -76,19 +101,28 @@ def atomic_write_text(file_path: str, content: str, encoding: str = 'utf-8') -> 
     import shutil
 
     backup = file_path + '.bak'
-    tmp = file_path + '.tmp'
+    fd = -1
+    tmp = ""
     try:
-        if os.path.exists(file_path):
-            shutil.copy2(file_path, backup)
         target_dir = os.path.dirname(file_path) or '.'
         os.makedirs(target_dir, exist_ok=True)
-        with open(tmp, 'w', encoding=encoding) as f:
+        if os.path.exists(file_path):
+            shutil.copy2(file_path, backup)
+        fd, tmp = _make_temp_path(file_path)
+        with os.fdopen(fd, 'w', encoding=encoding) as f:
+            fd = -1
             f.write(content)
+            _flush_and_fsync(f)
         os.replace(tmp, file_path)
         return True
     except Exception as e:
         logging.error("atomic_write_text 失敗 [%s]: %s", file_path, e)
-        if os.path.exists(tmp):
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        if tmp and os.path.exists(tmp):
             try:
                 os.remove(tmp)
             except OSError:

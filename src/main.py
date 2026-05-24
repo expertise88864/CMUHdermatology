@@ -9084,14 +9084,10 @@ class AutomationApp:
                 load_config as _wd_load,
                 CONFIG_PATH as _wd_cfg_path,
             )
-            import json as _json
             new_val = bool(self.watchdog_enabled_var.get())
             cfg = _wd_load()
             cfg["master_enabled"] = new_val
-            _wd_cfg_path.parent.mkdir(parents=True, exist_ok=True)
-            _wd_cfg_path.write_text(
-                _json.dumps(cfg, ensure_ascii=False, indent=2),
-                encoding="utf-8")
+            _atomic_write_json(str(_wd_cfg_path), cfg, indent=2)
             state = "啟用" if new_val else "停用"
             logging.info("[watchdog] master_enabled 改為 %s (由設定 UI 切換)", new_val)
             self.status_text.set(
@@ -10244,11 +10240,10 @@ class AutomationApp:
                 username = "101358"
                 password = "101AA358"
                 try:
-                    with open(cred_path, 'w', encoding='utf-8') as f:
-                        json.dump({
-                            'u': base64.b64encode(username.encode()).decode(),
-                            'p': base64.b64encode(password.encode()).decode()
-                        }, f)
+                    _atomic_write_json(cred_path, {
+                        'u': base64.b64encode(username.encode()).decode(),
+                        'p': base64.b64encode(password.encode()).decode()
+                    })
                     logging.info("已寫入預設打卡帳號（%s）到 credentials.json", username)
                 except Exception:
                     logging.warning("寫入預設打卡帳號失敗", exc_info=True)
