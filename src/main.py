@@ -78,6 +78,13 @@ from cmuh_common.ui_messages import (
 from cmuh_common.deps_runtime import ensure_dependencies as _ensure_deps_runtime
 from cmuh_common.single_instance import ensure_single_instance, release_single_instance
 from cmuh_common.duty_summary import build_duty_summary_parts
+from cmuh_common.settings_backup import (
+    DEFAULT_SETTINGS_BACKUP_FILES,
+    create_settings_snapshot,
+    find_latest_snapshot_for_date,
+    normalize_hhmm,
+    restore_settings_snapshot,
+)
 # 【重構 2026-05-21】熱鍵座標縮放（原本 main.py 用 _scaled_xy 卻沒定義 — 潛在 NameError）
 from cmuh_common.hotkey_scaling import (  # noqa: E402
     HOTKEY_SUPPORTED_RESOLUTIONS,
@@ -6453,21 +6460,8 @@ class AutomationApp:
         self.threshold_settings['alert_chen_enabled'] = self.alert_chen_enabled.get()
         self.threshold_settings['out_of_hospital_mode'] = self.out_of_hospital_var.get()
         self.threshold_settings['show_external_clinics'] = self.show_external_clinics.get()
-        def _normalize_hhmm(text, fallback):
-            s = str(text).strip()
-            if ":" not in s:
-                return fallback
-            hh, mm = s.split(":", 1)
-            try:
-                h = max(0, min(24, int(hh)))
-                m = max(0, min(59, int(mm)))
-                if h == 24:
-                    m = 0
-                return f"{h:02d}:{m:02d}"
-            except (TypeError, ValueError):
-                return fallback
-        dnd_start = _normalize_hhmm(self.notify_dnd_start_time_var.get(), "00:00")
-        dnd_end = _normalize_hhmm(self.notify_dnd_end_time_var.get(), "08:00")
+        dnd_start = normalize_hhmm(self.notify_dnd_start_time_var.get(), "00:00")
+        dnd_end = normalize_hhmm(self.notify_dnd_end_time_var.get(), "08:00")
         self.notify_dnd_start_time_var.set(dnd_start)
         self.notify_dnd_end_time_var.set(dnd_end)
         self.threshold_settings['notify_dnd_start_time'] = dnd_start
@@ -6513,27 +6507,14 @@ class AutomationApp:
         self._trigger_refresh(is_manual=True)
 
     def _settings_files_for_backup(self):
-        return [
-            "r_doctor_settings.json",
-            "threshold_settings.json",
-            "doctors.json",
-            "auto_reboot_settings.json",
-            "clinic_light_settings.json",
-        ]
+        return list(DEFAULT_SETTINGS_BACKUP_FILES)
 
     def _backup_settings_snapshot(self):
         try:
-            base_dir = get_conf_path("versions")
-            os.makedirs(base_dir, exist_ok=True)
-            snap_name = datetime.now().strftime("%Y%m%d_%H%M%S")
-            snap_dir = os.path.join(base_dir, snap_name)
-            os.makedirs(snap_dir, exist_ok=True)
-            copied = 0
-            for fn in self._settings_files_for_backup():
-                src = get_conf_path(fn)
-                if os.path.exists(src):
-                    shutil.copy2(src, os.path.join(snap_dir, fn))
-                    copied += 1
+            snap_name, copied = create_settings_snapshot(
+                get_settings_dir(),
+                files=self._settings_files_for_backup(),
+            )
             logging.info(f"設定快照完成: {snap_name}, files={copied}")
         except Exception as e:
             logging.error(f"設定快照失敗: {e}", exc_info=True)
@@ -6544,19 +6525,18 @@ class AutomationApp:
             if not os.path.isdir(base_dir):
                 self._show_notice("回復失敗", "尚未找到任何設定快照。", level="warn", auto_close_ms=3500)
                 return
-            ymd = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
-            candidates = [n for n in os.listdir(base_dir) if n.startswith(ymd)]
-            if not candidates:
+            snap_name = find_latest_snapshot_for_date(
+                get_settings_dir(),
+                date.today() - timedelta(days=1),
+            )
+            if not snap_name:
                 self._show_notice("回復失敗", "找不到昨天的設定快照。", level="warn", auto_close_ms=3500)
                 return
-            snap_name = sorted(candidates)[-1]
-            snap_dir = os.path.join(base_dir, snap_name)
-            restored = 0
-            for fn in self._settings_files_for_backup():
-                src = os.path.join(snap_dir, fn)
-                if os.path.exists(src):
-                    shutil.copy2(src, get_conf_path(fn))
-                    restored += 1
+            restored = restore_settings_snapshot(
+                get_settings_dir(),
+                snap_name,
+                files=self._settings_files_for_backup(),
+            )
             self.threshold_settings = self.load_threshold_settings()
             self.r_doctor_map = self.load_r_doctor_settings()
             self.doctors_list = self.load_doctors_settings()
