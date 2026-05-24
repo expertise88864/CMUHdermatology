@@ -12,6 +12,7 @@ import os
 import sys
 from typing import Iterable
 
+from cmuh_common.atomic_io import atomic_write_text
 from cmuh_common.paths import get_app_dir, is_frozen
 
 
@@ -78,7 +79,6 @@ def ensure_dependencies(
 
     # 寫快取
     try:
-        with open(deps_cache_file, 'w', encoding='utf-8') as f:
-            f.write(fingerprint + "\n")
+        atomic_write_text(deps_cache_file, fingerprint + "\n")
     except Exception:
         logging.debug("寫依賴快取失敗", exc_info=True)

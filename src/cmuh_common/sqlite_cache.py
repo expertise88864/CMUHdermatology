@@ -21,6 +21,7 @@ import time
 from datetime import date, datetime
 from typing import Any, Optional
 
+from cmuh_common.atomic_io import safe_load_json
 from cmuh_common.paths import get_settings_dir
 
 DB_FILE_NAME = "clinic_counts.sqlite"
@@ -93,20 +94,15 @@ def _migrate_legacy_json_if_present(conn: sqlite3.Connection) -> bool:
     legacy = _legacy_json_path()
     if not os.path.isfile(legacy):
         return False
-    try:
-        with open(legacy, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except Exception:
-        logging.warning("[O22] 舊 JSON 損壞，刪除")
-        try:
-            os.remove(legacy)
-        except OSError:
-            pass
+    raw = safe_load_json(legacy, default=None)
+    if raw is None:
+        logging.warning("[O22] 舊 JSON 損壞或讀取失敗，已由 safe_load_json 備份或略過")
         return False
 
     if not isinstance(raw, dict):
+        ts = time.strftime("%Y%m%d_%H%M%S")
         try:
-            os.remove(legacy)
+            os.replace(legacy, f"{legacy}.invalid-{ts}")
         except OSError:
             pass
         return False

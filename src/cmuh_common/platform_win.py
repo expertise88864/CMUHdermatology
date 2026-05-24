@@ -3,6 +3,7 @@
 import ctypes
 import logging
 import os
+import subprocess
 import sys
 
 
@@ -19,12 +20,17 @@ def run_as_admin() -> None:
         return
     try:
         ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, " ".join(sys.argv), None, 1
+            None, "runas", sys.executable, _admin_relaunch_params(sys.argv), None, 1
         )
     except Exception as e:
         logging.error("run_as_admin 失敗: %s", e)
         return
     sys.exit(0)
+
+
+def _admin_relaunch_params(argv=None) -> str:
+    """Build ShellExecuteW params with Windows-safe quoting."""
+    return subprocess.list2cmdline(list(argv if argv is not None else sys.argv))
 
 
 def set_dpi_awareness() -> None:
