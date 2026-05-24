@@ -46,6 +46,10 @@ from cmuh_common.clinic_history import (
     remove_doctor_history,
     upsert_session_stat,
 )
+from cmuh_common.clinic_light_history import (
+    historical_light_average,
+    record_light_sample,
+)
 from cmuh_common.platform_win import (
     is_admin, run_as_admin, set_dpi_awareness, set_app_user_model_id, get_idle_duration,
 )
@@ -8229,28 +8233,22 @@ class AutomationApp:
 # --- [新增] 歷史燈號樣本（三分鐘桶）---
     def _save_clinic_light_sample(self, room_code, doc_name, session_cn, light_val, now=None):
         """將目前燈號記錄到歷史檔案（每3分鐘一個時間桶）。"""
-        if not room_code or not doc_name or not light_val:
-            return
-        try:
-            int(light_val)
-        except (ValueError, TypeError):
-            return
         if now is None:
             now = datetime.now()
-        bucket_min = (now.hour * 60 + now.minute) // 3 * 3
-        bucket_str = f"{bucket_min // 60:02d}:{bucket_min % 60:02d}"
         session_key = _canonical_clinic_session_str(session_cn)
-        key = f"{doc_name}|{room_code}|{session_key}|{bucket_str}"
         file_path = get_conf_path('clinic_light_history.json')
-        cutoff_date = (now.date() - timedelta(days=max(60, CLINIC_LIGHT_HISTORY_DAYS + 7))).strftime("%Y/%m/%d")
-        today_str = now.strftime("%Y/%m/%d")
         data = load_json_dict(file_path, {}, merge_defaults=False)
-        if key not in data:
-            data[key] = []
-        entry = {"date": today_str, "light": int(light_val)}
-        # 去重今日同桶：只保留最新一筆，同時剔除超過60天的資料
-        data[key] = [e for e in data[key] if e.get("date") != today_str and e.get("date", "") >= cutoff_date]
-        data[key].append(entry)
+        data, changed = record_light_sample(
+            data,
+            room_code=room_code,
+            doc_name=doc_name,
+            session_key=session_key,
+            light_val=light_val,
+            when=now,
+            retain_days=max(60, CLINIC_LIGHT_HISTORY_DAYS + 7),
+        )
+        if not changed:
+            return
         try:
             _atomic_write_json(file_path, data)
         except Exception:
@@ -8262,45 +8260,18 @@ class AutomationApp:
             return "—"
         if now is None:
             now = datetime.now()
-        target_min = now.hour * 60 + now.minute
         session_key = _canonical_clinic_session_str(session_cn)
         file_path = get_conf_path('clinic_light_history.json')
         data = load_json_dict(file_path, {}, merge_defaults=False)
-        if not data:
-            return "—"
-        try:
-            cutoff = now.date() - timedelta(days=CLINIC_LIGHT_HISTORY_DAYS)
-            today = now.date()
-            all_values = []
-            same_weekday_values = []
-            window = int(CLINIC_LIGHT_HISTORY_WINDOW_MINUTES)
-            bucket_starts = range(max(0, target_min - window), min(24 * 60 - 1, target_min + window) + 1, 3)
-            for bucket_min in bucket_starts:
-                bucket_min = (bucket_min // 3) * 3
-                bucket_str = f"{bucket_min // 60:02d}:{bucket_min % 60:02d}"
-                key = f"{doc_name}|{room_code}|{session_key}|{bucket_str}"
-                for r in data.get(key, []):
-                    try:
-                        d_obj = datetime.strptime(r.get("date", ""), "%Y/%m/%d").date()
-                        if d_obj < cutoff or d_obj >= today:
-                            continue
-                        light_num = int(r["light"])
-                    except (KeyError, ValueError, TypeError):
-                        continue
-                    all_values.append(light_num)
-                    if d_obj.weekday() == now.weekday():
-                        same_weekday_values.append(light_num)
-            values = same_weekday_values if len(same_weekday_values) >= 3 else all_values
-            if not values:
-                return "—"
-            sorted_vals = sorted(values)
-            trim = max(0, int(len(sorted_vals) * 0.1))
-            if trim and len(sorted_vals) >= 10:
-                sorted_vals = sorted_vals[trim:-trim]
-            avg_val = sum(sorted_vals) / len(sorted_vals)
-            return f"~{int(round(avg_val))}"
-        except Exception:
-            return "—"
+        return historical_light_average(
+            data,
+            room_code=room_code,
+            doc_name=doc_name,
+            session_key=session_key,
+            when=now,
+            history_days=CLINIC_LIGHT_HISTORY_DAYS,
+            window_minutes=CLINIC_LIGHT_HISTORY_WINDOW_MINUTES,
+        )
 
 # --- [新增] 計算統計數據並存檔 ---
     def _save_clinic_session_stat(self, room_code, doc_name, completed_count, durations, closing_time_str="", session_str=None, total_reg=None, phototherapy=0):
