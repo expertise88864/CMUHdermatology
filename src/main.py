@@ -5102,9 +5102,15 @@ def fetch_duty_vs(ui_queue: "Queue[UiMessage]", session: requests.Session, vs_ty
 # 【重構 2026-05-21】reg64 / clinic display mode 函式 + CLINIC_DISPLAY_MODE_OPTIONS
 # 抽到 cmuh_common.reg64_utils（與 scheduler.py 共用）
 from cmuh_common.reg64_utils import (  # noqa: E402
+    canonical_clinic_session_str as _canonical_clinic_session_str,
+    clinic_int_count as _clinic_int_count,
+    prev_session_cn as _prev_session_cn,
+    reg64_clinic_quiet_hours as _reg64_clinic_quiet_hours,
+    reg64_next_allowed_fetch_time as _reg64_next_allowed_fetch_time,
     reg64_time_code_from_local_clock,
     reg64_slot_cn,
     reg64_slot_label_color,
+    session_boundary_datetime as _session_boundary_datetime,
     CLINIC_DISPLAY_MODE_OPTIONS,
     _normalize_clinic_display_mode,
     _clinic_display_mode_label,
@@ -5160,75 +5166,7 @@ GLOBAL_REFRESH_SNAPSHOT_TTL_SECONDS = 180
 CLINIC_CLOSE_PLATEAU_SECONDS = 30 * 60
 
 
-def _reg64_clinic_quiet_hours(when=None) -> bool:
-    """00:00～08:00（含 00:00～06:30 與 06:30～08:00）不對 reg64 發任何 HTTP。"""
-    w = when or datetime.now()
-    return w.hour < 8
-
-
-def _reg64_next_allowed_fetch_time(when=None) -> datetime:
-    """靜默結束後第一次允許查詢：當日 08:00（若呼叫時已過 08:00 則回傳 when）。"""
-    w = when or datetime.now()
-    start = w.replace(hour=8, minute=0, second=0, microsecond=0)
-    if w < start:
-        return start
-    return w
-
-
-def _clinic_int_count(val, default=0):
-    """門診動態 reg64 回傳的 waiting/completed 可能為字串，與 int 比較會洗版報錯。"""
-    if val is None or val == "" or val == "-":
-        return default
-    if isinstance(val, bool):
-        return default
-    if isinstance(val, int):
-        return val
-    if isinstance(val, float):
-        return int(val) if val == int(val) else default
-    try:
-        s = str(val).strip()
-        if s in ("-", "--", ""):
-            return default
-        return int(s)
-    except (TypeError, ValueError):
-        return default
-
-
-def _session_boundary_datetime(session_cn: str, now_dt: datetime) -> datetime:
-    """該診別「關診時間計算」最早可開始偵測的時刻（當日）。"""
-    if session_cn in ("上午", "早上"):
-        h, m = 12, 0
-    elif session_cn == "下午":
-        h, m = 17, 0
-    else:
-        h, m = 21, 0
-    return now_dt.replace(hour=h, minute=m, second=0, microsecond=0)
-
-
-def _prev_session_cn(session_cn: str):
-    if session_cn == "下午":
-        return "早上"
-    if session_cn == "晚上":
-        return "下午"
-    return None
-
-
 from cmuh_common.reg64_utils import _reg64_tc_to_session_cn  # noqa: E402
-
-
-def _canonical_clinic_session_str(s) -> str:
-    """門診動態／歷史 JSON 用語統一為 早上|下午|晚上（與 reg64_slot_cn 一致）。"""
-    if s is None:
-        return ""
-    t = str(s).strip()
-    if not t:
-        return ""
-    m = {
-        "上午": "早上", "早診": "早上", "早": "早上",
-        "下午": "下午", "午診": "下午",
-        "晚上": "晚上", "晚診": "晚上",
-    }
-    return m.get(t, t)
 
 
 def _hotkey_builtin_map_for_profile(profile: str) -> dict:

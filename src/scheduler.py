@@ -2562,9 +2562,11 @@ def fetch_duty_vs(ui_queue: "Queue[UiMessage]", session: requests.Session, vs_ty
 # --- 門診動態 reg64.cgi TimeCode（與 appointment.cmuh.org.tw/cgi-bin/reg64.cgi 參數一致）---
 # 【重構 2026-05-21】抽到 cmuh_common.reg64_utils（與 main.py 共用）
 from cmuh_common.reg64_utils import (  # noqa: E402
+    prev_session_cn as _prev_session_cn,
     reg64_time_code_from_local_clock,
     reg64_slot_cn,
     reg64_slot_label_color,
+    session_boundary_datetime as _session_boundary_datetime,
     CLINIC_DISPLAY_MODE_OPTIONS,
     _normalize_clinic_display_mode,
     _clinic_display_mode_label,
@@ -2593,25 +2595,6 @@ SOURCE_BACKOFF_BASE_SECONDS = 2
 SOURCE_BACKOFF_MAX_SECONDS = 90
 GLOBAL_REFRESH_SNAPSHOT_TTL_SECONDS = 180
 CLINIC_CLOSE_PLATEAU_SECONDS = 30 * 60
-
-
-def _session_boundary_datetime(session_cn: str, now_dt: datetime) -> datetime:
-    """該診別「關診時間計算」最早可開始偵測的時刻（當日）。"""
-    if session_cn == "上午":
-        h, m = 12, 0
-    elif session_cn == "下午":
-        h, m = 17, 0
-    else:
-        h, m = 21, 0
-    return now_dt.replace(hour=h, minute=m, second=0, microsecond=0)
-
-
-def _prev_session_cn(session_cn: str):
-    if session_cn == "下午":
-        return "上午"
-    if session_cn == "晚上":
-        return "下午"
-    return None
 
 
 from cmuh_common.reg64_utils import _reg64_tc_to_session_cn  # noqa: E402

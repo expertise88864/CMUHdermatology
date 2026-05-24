@@ -82,3 +82,81 @@ def _reg64_tc_to_session_cn(time_code) -> str:
     """TimeCode → 上午／下午／晚上（注意：與 reg64_slot_cn 的「早上」略異，
     這個用「上午」是因為門診 metadata 內部就用這套字串）。"""
     return {"1": "上午", "2": "下午", "3": "晚上"}.get(str(time_code), "")
+
+
+def canonical_clinic_session_str(value) -> str:
+    """Normalize clinic session labels to 早上|下午|晚上."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    aliases = {
+        "上午": "早上",
+        "早診": "早上",
+        "早": "早上",
+        "早上": "早上",
+        "下午": "下午",
+        "午診": "下午",
+        "午": "下午",
+        "晚上": "晚上",
+        "晚診": "晚上",
+        "晚": "晚上",
+    }
+    return aliases.get(text, text)
+
+
+def session_boundary_datetime(session_cn: str, now_dt: datetime) -> datetime:
+    """Earliest same-day time when close detection should start for a session."""
+    session = canonical_clinic_session_str(session_cn)
+    if session == "早上":
+        hour, minute = 12, 0
+    elif session == "下午":
+        hour, minute = 17, 0
+    else:
+        hour, minute = 21, 0
+    return now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def prev_session_cn(session_cn: str) -> str | None:
+    """Return the previous clinic session label using canonical terms."""
+    session = canonical_clinic_session_str(session_cn)
+    if session == "下午":
+        return "早上"
+    if session == "晚上":
+        return "下午"
+    return None
+
+
+def clinic_int_count(value, default: int = 0) -> int:
+    """Coerce reg64 numeric counts while rejecting blanks, booleans and fractions."""
+    if value is None or value == "" or value == "-":
+        return default
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value == int(value) else default
+    try:
+        text = str(value).strip()
+        if text in ("-", "--", ""):
+            return default
+        return int(text)
+    except (TypeError, ValueError):
+        return default
+
+
+def reg64_clinic_quiet_hours(when: Optional[datetime] = None) -> bool:
+    """Return true when reg64 HTTP polling should stay quiet."""
+    current = when or datetime.now()
+    return current.hour < 8
+
+
+def reg64_next_allowed_fetch_time(when: Optional[datetime] = None) -> datetime:
+    """Return the next 08:00 boundary, or when if polling is already allowed."""
+    current = when or datetime.now()
+    start = current.replace(hour=8, minute=0, second=0, microsecond=0)
+    if current < start:
+        return start
+    return current
