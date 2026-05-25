@@ -115,25 +115,10 @@ def get_chromedriver_path() -> str:
 
 
 def build_chrome_options(headless: bool = True):
-    """回傳 selenium Options。集中所有效能與隱私旗標。"""
-    from selenium.webdriver.chrome.options import Options  # type: ignore[import-not-found]
-
-    opts = Options()
-    if headless:
-        opts.add_argument("--headless=new")
-    for arg in (
-        "--disable-gpu", "--window-size=1280,800", "--no-sandbox",
-        "--disable-dev-shm-usage", "--disable-extensions",
-        "--dns-prefetch-disable", "--log-level=3",
-        "--disable-images", "--blink-settings=imagesEnabled=false",
-        "--disable-notifications", "--disable-popup-blocking",
-        "--disable-infobars", "--disable-background-networking",
-        "--disable-sync",
-    ):
-        opts.add_argument(arg)
-    opts.add_experimental_option("excludeSwitches", ["enable-logging"])
-    opts.page_load_strategy = "eager"
-    return opts
+    """回傳 selenium Options。[v15] 改 delegate 給 cmuh_common.chrome_options，
+    讓主程式 status_driver 跟 autoclock clock_driver 共用同一份 flag 配置。"""
+    from cmuh_common.chrome_options import build_chrome_options as _build
+    return _build(headless=headless)
 
 
 def _invalidate_chromedriver_cache() -> None:

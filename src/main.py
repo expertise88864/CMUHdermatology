@@ -802,33 +802,23 @@ LOCATORS = {
 from cmuh_common.date_utils import roc_to_gregorian_year, parse_roc_date_str  # noqa: E402
 
 def _initialize_status_driver():
+    """[2026-05-25 v15] 改用 cmuh_common.chrome_options.build_chrome_options
+    共用版 — 跟 autoclock 用同一份 flag (含 mute-audio / renderer-process-limit /
+    js-flags max-old-space-size 等省 RAM flag)。
+    預期 headless Chrome RSS 從 ~250MB 降到 ~150MB。
+    """
     logging.info("Initializing headless WebDriver for status check...")
 
     try:
         from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-        # [優化] 已徹底拔除 webdriver_manager 冗餘依賴
+        from cmuh_common.chrome_options import build_chrome_options
     except ImportError:
         logging.error("Selenium modules not found during runtime import.")
         return None
 
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1920x1080")
-    chrome_options.add_argument("--log-level=3")
-    # [O3] 常駐 Chrome 額外旗標：減少資源占用
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-extensions")
-    chrome_options.add_argument("--disable-images")
-    chrome_options.add_argument("--blink-settings=imagesEnabled=false")
-    chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
-    chrome_options.page_load_strategy = "eager"
-
     try:
-        # [優化] Selenium 4.6+ 將自動呼叫底層 Selenium Manager 載入驅動，秒開毫秒就緒
-        driver = webdriver.Chrome(options=chrome_options)
+        # [優化] Selenium 4.6+ 自動呼叫底層 Selenium Manager 載入驅動，秒開毫秒就緒
+        driver = webdriver.Chrome(options=build_chrome_options(headless=True))
         logging.info("Headless WebDriver initialized successfully.")
         return driver
     except Exception as e:
@@ -846,7 +836,10 @@ _status_driver_pool = {
     "lock": threading.Lock(),
     "init_lock": threading.Lock(),
 }
-_STATUS_DRIVER_IDLE_TIMEOUT = 30 * 60  # 30 分鐘無動作就關閉
+# [2026-05-25 v15 RAM 優化] 30 分鐘 → 10 分鐘。打卡狀態查詢一天最多 3-4 次
+# (08:00 / 17:03 daily + 手動觸發)，30 分鐘太久。10 分鐘 idle 釋放，
+# 下次重新 spin up 約 1-2 秒對使用者觀感無差，省 ~150-250MB Chrome RAM。
+_STATUS_DRIVER_IDLE_TIMEOUT = 10 * 60
 
 
 def _get_or_create_status_driver():
