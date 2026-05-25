@@ -23,6 +23,31 @@ _started_lock = threading.Lock()
 _started_for: set = set()  # already-started identifiers
 
 
+def _coerce_float(value, default: float, *, min_value: float) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        out = default
+    return max(min_value, out)
+
+
+def _coerce_int(value, default: int, *, min_value: int) -> int:
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        out = default
+    return max(min_value, out)
+
+
+def _normalize_health_monitor_args(ram_warn_mb, ram_crit_mb, interval_sec,
+                                   crit_persistence_ticks):
+    warn_mb = _coerce_float(ram_warn_mb, 400.0, min_value=1.0)
+    crit_mb = _coerce_float(ram_crit_mb, 800.0, min_value=warn_mb)
+    interval = _coerce_int(interval_sec, 300, min_value=5)
+    persistence_ticks = _coerce_int(crit_persistence_ticks, 6, min_value=1)
+    return warn_mb, crit_mb, interval, persistence_ticks
+
+
 def _get_rss_mb() -> Optional[float]:
     """回傳本 process 的 Resident Set Size (MB)；psutil 不可用就回 None。"""
     try:
@@ -245,6 +270,10 @@ def start_health_monitor(tag: str,
 
     回傳 True = 已啟動；False = 已啟動過 (同 tag 不重複啟)。
     """
+    ram_warn_mb, ram_crit_mb, interval_sec, crit_persistence_ticks = (
+        _normalize_health_monitor_args(ram_warn_mb, ram_crit_mb, interval_sec,
+                                       crit_persistence_ticks)
+    )
     with _started_lock:
         if tag in _started_for:
             return False
