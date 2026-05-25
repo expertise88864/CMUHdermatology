@@ -135,6 +135,28 @@ def test_get_loop_timing_enforces_minimums():
     assert interval == 5
 
 
+def test_run_one_tick_logs_crash_loop_suspend_message(monkeypatch):
+    messages = []
+
+    monkeypatch.setattr(
+        wc,
+        "load_config",
+        lambda: {"master_enabled": True, "programs": [{"name": "打卡"}]},
+    )
+    monkeypatch.setattr(wc, "find_pythonw", lambda: "pythonw.exe")
+    monkeypatch.setattr(wc, "list_python_processes", lambda: [])
+    monkeypatch.setattr(
+        wc,
+        "ensure_program",
+        lambda *args, **kwargs: "⛔ 打卡: crash loop 中，暫停 30 分鐘 [inner]",
+    )
+
+    actions = wc.run_one_tick("inner", log_fn=messages.append)
+
+    assert actions == ["⛔ 打卡: crash loop 中，暫停 30 分鐘 [inner]"]
+    assert messages == actions
+
+
 # ─── log-freshness regression tests (2026-05-25) ─────────────────────────
 # 防今天踩的坑：v45 把 autoclock max_stale_sec 0→300 但 autoclock idle 時段
 # 不印 log → 被 InnerWatchdog 當死的 kill+restart → 整夜 crash loop 沒打到卡。

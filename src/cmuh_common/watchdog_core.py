@@ -467,6 +467,11 @@ def get_loop_timing(cfg: dict) -> tuple[int, int]:
     return heartbeat, interval
 
 
+def _should_log_action_message(msg: str) -> bool:
+    """Return True for watchdog messages worth persisting to logs."""
+    return msg.startswith(("▶", "⟳", "✗", "⚠", "⛔"))
+
+
 def _lock_path_for(prog_name: str) -> Path:
     safe = "".join(c if c.isalnum() else "_" for c in prog_name)
     return LOCK_DIR / f"{safe}.lock"
@@ -677,6 +682,6 @@ def run_one_tick(mode: str, log_fn=None) -> list:
             msg = f"✗ {prog.get('name','?')}: tick 例外 [{mode}]"
         actions.append(msg)
         # 預設只寫「action / warning」進 log，✓ / ○ / ⏭ 不洗版
-        if msg.startswith(("▶", "⟳", "✗", "⚠")):
+        if _should_log_action_message(msg):
             (log_fn or logging.info)(msg)
     return actions
