@@ -343,7 +343,7 @@ def find_matching_pids(procs: list, keyword: str, exclude_pid: int = 0) -> list:
 
 
 def _wmic_find_pids(process_keyword: str, *, log_on_empty: bool = True) -> list:
-    """WMIC fallback：列舉 pythonw.exe + cmdline，回 cmdline 含 keyword 的 PID。
+    """WMIC fallback：列舉 Python launchers + cmdline，回 cmdline 含 keyword 的 PID。
 
     psutil 在 admin process 上偶發 NtQueryInformationProcess access denied →
     cmdline 抓不到 → 找不到 PID。WMIC 的權限模型不同，admin 執行
@@ -360,7 +360,8 @@ def _wmic_find_pids(process_keyword: str, *, log_on_empty: bool = True) -> list:
     _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         r = subprocess.run(
-            ["wmic", "process", "where", "name='pythonw.exe'",
+            ["wmic", "process", "where",
+             "(name='pythonw.exe' or name='python.exe')",
              "get", "ProcessId,CommandLine", "/FORMAT:CSV"],
             capture_output=True, text=True, timeout=10,
             encoding=locale.getpreferredencoding(False), errors="replace",
@@ -389,11 +390,11 @@ def _wmic_find_pids(process_keyword: str, *, log_on_empty: bool = True) -> list:
         logging.debug("[watchdog] wmic fallback 例外", exc_info=True)
 
     if log_on_empty:
-        # 不做「所有 pythonw.exe」fallback。這裡若抓不到 cmdline，就無法確認
+        # 不做「所有 pythonw/python.exe」fallback。這裡若抓不到 cmdline，就無法確認
         # PID 是否真屬於目標程式；直接 kill 全部 pythonw 風險太高，寧可讓
         # caller 回報找不到 PID，交給下一輪或人工處理。
         logging.warning(
-            "[watchdog] 無法用 WMIC 找到 %s 的 PID；為避免誤殺其他 pythonw.exe，"
+            "[watchdog] 無法用 WMIC 找到 %s 的 PID；為避免誤殺其他 Python 程序，"
             "本輪不執行 broad fallback kill",
             process_keyword)
     return []
