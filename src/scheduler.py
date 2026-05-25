@@ -6155,8 +6155,11 @@ class AutomationApp:
         put_ui_message(self.ui_queue, UiStatusMessage(text="狀態: F12 終止 - 正在中斷目前操作..."))
 
     def setup_hotkeys(self):
+        if getattr(self, '_shutting_down', False) or stop_event_main.is_set():
+            return
         if threading.current_thread() is not threading.main_thread():
-            self.root.after(0, self.setup_hotkeys)
+            if not getattr(self, '_shutting_down', False):
+                self.root.after(0, self.setup_hotkeys)
             return
         if not self._heavy_modules_ready or hotkey_modules.keyboard is None:
             self.hotkey_text_label.config(text="熱鍵模組載入中...")
@@ -6250,7 +6253,8 @@ class AutomationApp:
                         delay_ms / 1000,
                         self._hotkey_register_retry_count,
                     )
-                    self.root.after(delay_ms, self.setup_hotkeys)
+                    if not getattr(self, '_shutting_down', False):
+                        self.root.after(delay_ms, self.setup_hotkeys)
                 else:
                     logging.warning(
                         "Hotkey registration retry limit reached (%s failures)",
@@ -6262,11 +6266,13 @@ class AutomationApp:
     def run_hotkey_guardian(self):
         def rehook():
             while not stop_event_main.is_set():
-                time.sleep(600)
+                if stop_event_main.wait(600):
+                    break
                 try:
                     if getattr(self, 'hotkey_profile', None) or self.hotkey_version:
-                        self.root.after(0, self.setup_hotkeys)
-                        logging.info("Hotkeys re-hooked by guardian.")
+                        if not getattr(self, '_shutting_down', False):
+                            self.root.after(0, self.setup_hotkeys)
+                            logging.info("Hotkeys re-hooked by guardian.")
                 except Exception as e:
                     logging.error(f"Error re-hooking hotkeys: {e}")
         # [核心修正] 依賴統一池
