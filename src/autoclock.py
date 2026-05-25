@@ -938,7 +938,6 @@ def scheduler_loop() -> None:
     # → InnerWatchdog 看 log >300s 沒動 → kill+restart → 整夜 crash loop →
     # 早上 7:30 打卡時間 autoclock 剛重啟還沒就緒 → 沒打到卡。
     # 修法：每 60s 印一行 INFO 級 heartbeat 強制更新 log mtime。
-    HEARTBEAT_INTERVAL = 60.0
     last_heartbeat_log = 0.0
 
     while running.is_set():
@@ -947,9 +946,7 @@ def scheduler_loop() -> None:
         _AUTOCLOCK_LIVENESS["last_tick"] = now
 
         # [P0 emergency] 每 60s 印一行 log 讓 InnerWatchdog 看到 process 活著
-        if now - last_heartbeat_log >= HEARTBEAT_INTERVAL:
-            logging.info("[autoclock][heartbeat] scheduler alive (idle 等待下個打卡時段)")
-            last_heartbeat_log = now
+        last_heartbeat_log = _maybe_emit_heartbeat(now, last_heartbeat_log)
 
         try:
             schedule.run_pending()
@@ -958,6 +955,25 @@ def scheduler_loop() -> None:
         # [優化] 改 5s sleep — schedule 套件本身有 :01 精度，5s 內仍會準時觸發
         # 每分鐘任務。早期 1s 太密；對打卡 job 觀感無差，CPU 用量降 5 倍。
         time_module.sleep(5)
+
+
+HEARTBEAT_INTERVAL_SEC = 60.0
+HEARTBEAT_MSG = "[autoclock][heartbeat] scheduler alive (idle 等待下個打卡時段)"
+
+
+def _maybe_emit_heartbeat(now: float, last_log_ts: float,
+                          interval: float = HEARTBEAT_INTERVAL_SEC) -> float:
+    """[2026-05-25] 每 `interval` 秒印一行 heartbeat log — 確保 idle 時段
+    log mtime 還是會被更新，外層 InnerWatchdog 不會誤判 autoclock 卡死。
+
+    回傳「下次比較用的 last_log_ts」（若這次有印就是 now，沒印就維持原值）。
+    抽 helper 讓 tests/test_autoclock_heartbeat.py 能不跑 scheduler 主迴圈
+    直接驗證 (a) 過 interval 一定要 emit (b) 沒過不能 emit。
+    """
+    if now - last_log_ts >= interval:
+        logging.info(HEARTBEAT_MSG)
+        return now
+    return last_log_ts
 
 
 # =============================================================================
