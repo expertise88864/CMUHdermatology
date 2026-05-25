@@ -21,6 +21,8 @@ from typing import Optional
 
 _started_lock = threading.Lock()
 _started_for: set = set()  # already-started identifiers
+_self_process_lock = threading.Lock()
+_self_process = None
 
 
 def _coerce_float(value, default: float, *, min_value: float) -> float:
@@ -48,11 +50,32 @@ def _normalize_health_monitor_args(ram_warn_mb, ram_crit_mb, interval_sec,
     return warn_mb, crit_mb, interval, persistence_ticks
 
 
+def _get_self_process():
+    global _self_process
+    if _self_process is not None:
+        return _self_process
+    with _self_process_lock:
+        if _self_process is not None:
+            return _self_process
+        try:
+            import psutil
+            _self_process = psutil.Process()
+            try:
+                _self_process.cpu_percent(interval=None)
+            except Exception:
+                pass
+            return _self_process
+        except Exception:
+            return None
+
+
 def _get_rss_mb() -> Optional[float]:
     """回傳本 process 的 Resident Set Size (MB)；psutil 不可用就回 None。"""
     try:
-        import psutil
-        return psutil.Process().memory_info().rss / (1024 * 1024)
+        p = _get_self_process()
+        if p is None:
+            return None
+        return p.memory_info().rss / (1024 * 1024)
     except Exception:
         return None
 
@@ -63,8 +86,9 @@ def _get_self_stats() -> Optional[dict]:
     cpu_percent(interval=None) 用上次呼叫到現在的累積樣本，第一次呼叫會回 0.0。
     """
     try:
-        import psutil
-        p = psutil.Process()
+        p = _get_self_process()
+        if p is None:
+            return None
         with p.oneshot():
             return {
                 "rss_mb": p.memory_info().rss / (1024 * 1024),
