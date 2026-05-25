@@ -22,3 +22,16 @@ def should_rehook_hotkeys(
 def should_bypass_foreground_guard(key_name: str, *, subsystem_running: bool) -> bool:
     """Return True for rescue hotkeys that must work while automation is active."""
     return key_name.upper() == "F12" and bool(subsystem_running)
+
+
+def should_show_busy_notice(
+    now: float,
+    last_notice_at: float,
+    *,
+    min_interval_sec: float = 2.5,
+) -> bool:
+    """Throttle repeated busy notices while users hold or re-press hotkeys."""
+    try:
+        return float(now) - float(last_notice_at) >= float(min_interval_sec)
+    except (TypeError, ValueError):
+        return True

@@ -99,6 +99,7 @@ from cmuh_common.hotkey_scaling import (  # noqa: E402
 from cmuh_common.hotkey_guardian import (
     should_bypass_foreground_guard,
     should_rehook_hotkeys,
+    should_show_busy_notice,
 )
 # 【重構 2026-05-21】門診預約合併純函式（與 scheduler.py 共用）
 from cmuh_common.appt_utils import (  # noqa: E402
@@ -5377,6 +5378,7 @@ class AutomationApp:
         self._bottom_links_hidden = False  # 與 links_frame 顯示狀態同步，避免重複 grid 觸發版面重算
         self._subsystem_running = False
         self._subsystem_lock = threading.Lock()
+        self._last_hotkey_busy_notice_at = 0.0
         self._active_notices = []
         self.startup_phase_text = tk.StringVar(value="啟動中")
         self.app_version_text = tk.StringVar(value=f"v{CURRENT_VERSION}")
@@ -9667,7 +9669,12 @@ class AutomationApp:
         with self._subsystem_lock:
             if self._subsystem_running:
                 put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 前一個熱鍵流程尚未完成'))
-                self._show_notice("熱鍵忙碌中", f"{hotkey_name} 已略過，請等待目前自動化完成。", level="warn", auto_close_ms=2500)
+                now = time.monotonic()
+                if should_show_busy_notice(
+                    now, getattr(self, '_last_hotkey_busy_notice_at', 0.0),
+                ):
+                    self._last_hotkey_busy_notice_at = now
+                    self._show_notice("熱鍵忙碌中", f"{hotkey_name} 已略過，請等待目前自動化完成。", level="warn", auto_close_ms=2500)
                 return
             self._subsystem_running = True
 
