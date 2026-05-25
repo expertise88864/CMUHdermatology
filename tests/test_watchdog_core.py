@@ -115,6 +115,26 @@ def test_ensure_program_tolerates_bad_numeric_config(tmp_path, monkeypatch):
     assert len(started) == 1
 
 
+def test_get_loop_timing_tolerates_bad_numeric_config():
+    heartbeat, interval = wc.get_loop_timing({
+        "heartbeat_log_sec": "bad",
+        "check_interval_sec": "bad",
+    })
+
+    assert heartbeat == 300
+    assert interval == 30
+
+
+def test_get_loop_timing_enforces_minimums():
+    heartbeat, interval = wc.get_loop_timing({
+        "heartbeat_log_sec": -10,
+        "check_interval_sec": 1,
+    })
+
+    assert heartbeat == 1
+    assert interval == 5
+
+
 # ─── log-freshness regression tests (2026-05-25) ─────────────────────────
 # 防今天踩的坑：v45 把 autoclock max_stale_sec 0→300 但 autoclock idle 時段
 # 不印 log → 被 InnerWatchdog 當死的 kill+restart → 整夜 crash loop 沒打到卡。

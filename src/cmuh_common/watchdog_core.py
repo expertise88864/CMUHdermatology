@@ -460,6 +460,13 @@ def _coerce_float(value, default: float, *, min_value: float | None = None) -> f
     return out
 
 
+def get_loop_timing(cfg: dict) -> tuple[int, int]:
+    """Return (heartbeat_log_sec, check_interval_sec) with safe bounds."""
+    heartbeat = _coerce_int(cfg.get("heartbeat_log_sec", 300), 300, min_value=1)
+    interval = _coerce_int(cfg.get("check_interval_sec", 30), 30, min_value=5)
+    return heartbeat, interval
+
+
 def _lock_path_for(prog_name: str) -> Path:
     safe = "".join(c if c.isalnum() else "_" for c in prog_name)
     return LOCK_DIR / f"{safe}.lock"

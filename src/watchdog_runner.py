@@ -106,12 +106,11 @@ def main() -> int:
         try:
             cfg = watchdog_core.load_config()
             actions = watchdog_core.run_one_tick(mode="outer")
-            heartbeat = int(cfg.get("heartbeat_log_sec", 300))
+            heartbeat, interval = watchdog_core.get_loop_timing(cfg)
             if time.time() - last_heartbeat >= heartbeat:
                 logging.info("[daemon heartbeat] %s",
                              " | ".join(actions) if actions else "-")
                 last_heartbeat = time.time()
-            interval = max(5, int(cfg.get("check_interval_sec", 30)))
         except Exception:
             logging.exception("[daemon] tick 例外")
             interval = 30
