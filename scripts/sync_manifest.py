@@ -77,6 +77,8 @@ def collect_entries(version: str) -> list:
         # 一鍵清除全部皮膚科排程 (含舊版命名 / 殘留 task)
         "清除所有皮膚科排程.cmd",
         "清除所有皮膚科排程.ps1",
+        "診斷打卡重複執行.cmd",
+        "診斷打卡重複執行.ps1",
         # 設定/資源檔
         "hotkey_overrides.json",
         "requirements.txt",

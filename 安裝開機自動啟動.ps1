@@ -222,6 +222,18 @@ foreach ($p in $programs) {
                 if ($LASTEXITCODE -ne 0) {
                     throw "schtasks /Create 失敗 (exit=$LASTEXITCODE): $schtasksOut"
                 }
+                try {
+                    $periodicTask = Get-ScheduledTask -TaskName $p.TaskName -ErrorAction Stop
+                    $periodicSettings = New-ScheduledTaskSettingsSet `
+                        -AllowStartIfOnBatteries `
+                        -DontStopIfGoingOnBatteries `
+                        -StartWhenAvailable `
+                        -MultipleInstances IgnoreNew `
+                        -ExecutionTimeLimit ([TimeSpan]::FromMinutes(5))
+                    Set-ScheduledTask -InputObject $periodicTask -Settings $periodicSettings | Out-Null
+                } catch {
+                    Write-Host "    ⚠ 無法套用防重複設定：$_" -ForegroundColor Yellow
+                }
                 Write-Host "  ✓ 已啟用：$($p.Display)" -ForegroundColor Green
                 Write-Host "    排程名稱：$($p.TaskName)  (每 2 分鐘觸發跑 --once)"
                 $summary += [pscustomobject]@{Program=$p.Display; Action='啟用 (Periodic)'; Status='OK'}
