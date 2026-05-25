@@ -932,9 +932,25 @@ def scheduler_loop() -> None:
     threading.Thread(target=_autoclock_self_watchdog,
                       name="AutoclockSelfWatchdog", daemon=True).start()
 
+    # [2026-05-25 P0 emergency 修補] heartbeat log — 給外層 InnerWatchdog 看
+    # log mtime 用。原本 v45 把 max_stale_sec 0→300 但忽略 autoclock idle 時段
+    # _scheduler_tick 沒 sched_key 會直接 return 不印 log → log mtime 整夜不更新
+    # → InnerWatchdog 看 log >300s 沒動 → kill+restart → 整夜 crash loop →
+    # 早上 7:30 打卡時間 autoclock 剛重啟還沒就緒 → 沒打到卡。
+    # 修法：每 60s 印一行 INFO 級 heartbeat 強制更新 log mtime。
+    HEARTBEAT_INTERVAL = 60.0
+    last_heartbeat_log = 0.0
+
     while running.is_set():
         # [P0-1] heartbeat — 給 self-watchdog 偵測
-        _AUTOCLOCK_LIVENESS["last_tick"] = time_module.time()
+        now = time_module.time()
+        _AUTOCLOCK_LIVENESS["last_tick"] = now
+
+        # [P0 emergency] 每 60s 印一行 log 讓 InnerWatchdog 看到 process 活著
+        if now - last_heartbeat_log >= HEARTBEAT_INTERVAL:
+            logging.info("[autoclock][heartbeat] scheduler alive (idle 等待下個打卡時段)")
+            last_heartbeat_log = now
+
         try:
             schedule.run_pending()
         except Exception:
