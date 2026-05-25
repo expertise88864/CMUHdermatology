@@ -66,7 +66,9 @@ from cmuh_common.ui_messages import (
     UiClockStatusMessage, UiAlertInfoMessage, UiAlertErrorMessage, UiMessage, put_ui_message,
 )
 from cmuh_common.deps_runtime import ensure_dependencies as _ensure_deps_runtime
-from cmuh_common.single_instance import ensure_single_instance, release_single_instance
+from cmuh_common.single_instance import (
+    ensure_single_instance, is_instance_running, release_single_instance,
+)
 from cmuh_common.duty_summary import build_duty_summary_parts
 from cmuh_common.settings_backup import (
     DEFAULT_SETTINGS_BACKUP_FILES,
@@ -3631,6 +3633,9 @@ class AutomationApp:
             
     def _launch_autoclock_program(self):
         autoclock_script_name = "中國醫皮膚科打卡程式.pyw"
+        if is_instance_running("Local\\CMUH_Skin_AutoClock_SingleInstance_v1"):
+            logging.info("Autoclock program is already running; skip launch")
+            return
         try: logging.info(f"Launching autoclock program: {autoclock_script_name}"); subprocess.Popen([sys.executable, autoclock_script_name])
         except FileNotFoundError: messagebox.showerror("啟動失敗", f"找不到打卡程式檔案: {autoclock_script_name}\n\n請確認主程式與打卡程式在同一個資料夾中。"); logging.error(f"Autoclock script not found: {autoclock_script_name}")
         except Exception as e: messagebox.showerror("啟動失敗", f"無法啟動打卡程式:\n{e}"); logging.error(f"Failed to launch autoclock program: {e}")
@@ -3645,6 +3650,9 @@ class AutomationApp:
         # 只啟動常駐托盤（不帶 --run-now），讓使用者由托盤選單或排程觸發；
         # 已啟動則靜默結束（不彈視窗）。需要立即執行可右鍵托盤「立即執行一次」。
         script_name = "中國醫皮膚科會診查詢程式.pyw"
+        if is_instance_running("Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1"):
+            logging.info("Consult query program is already running; skip launch")
+            return
         try: logging.info(f"Launching consult query program: {script_name}"); subprocess.Popen([sys.executable, script_name])
         except FileNotFoundError: messagebox.showerror("啟動失敗", f"找不到會診查詢程式檔案: {script_name}\n\n請確認主程式與該程式在同一個資料夾中。"); logging.error(f"Consult query script not found: {script_name}")
         except Exception as e: messagebox.showerror("啟動失敗", f"無法啟動會診查詢程式:\n{e}"); logging.error(f"Failed to launch consult query program: {e}")
