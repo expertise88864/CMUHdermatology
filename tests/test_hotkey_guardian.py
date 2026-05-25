@@ -4,7 +4,10 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from cmuh_common.hotkey_guardian import should_rehook_hotkeys  # noqa: E402
+from cmuh_common.hotkey_guardian import (  # noqa: E402
+    should_bypass_foreground_guard,
+    should_rehook_hotkeys,
+)
 
 
 def test_hotkey_guardian_rehooks_when_ready_and_idle():
@@ -40,4 +43,16 @@ def test_hotkey_guardian_skips_unsafe_states():
         shutting_down=False,
         subsystem_running=False,
         modules_ready=False,
+    ) is False
+
+
+def test_f12_bypasses_foreground_guard_only_while_automation_runs():
+    assert should_bypass_foreground_guard(
+        "F12", subsystem_running=True,
+    ) is True
+    assert should_bypass_foreground_guard(
+        "F12", subsystem_running=False,
+    ) is False
+    assert should_bypass_foreground_guard(
+        "F11", subsystem_running=True,
     ) is False

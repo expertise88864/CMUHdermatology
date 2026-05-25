@@ -17,3 +17,8 @@ def should_rehook_hotkeys(
         and not subsystem_running
         and bool(modules_ready)
     )
+
+
+def should_bypass_foreground_guard(key_name: str, *, subsystem_running: bool) -> bool:
+    """Return True for rescue hotkeys that must work while automation is active."""
+    return key_name.upper() == "F12" and bool(subsystem_running)

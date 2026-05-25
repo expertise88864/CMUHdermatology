@@ -96,7 +96,10 @@ from cmuh_common.hotkey_scaling import (  # noqa: E402
     configure_hotkey_scaling,
     _scaled_xy,
 )
-from cmuh_common.hotkey_guardian import should_rehook_hotkeys
+from cmuh_common.hotkey_guardian import (
+    should_bypass_foreground_guard,
+    should_rehook_hotkeys,
+)
 # 【重構 2026-05-21】門診預約合併純函式（與 scheduler.py 共用）
 from cmuh_common.appt_utils import (  # noqa: E402
     appointment_data_count as _appointments_data_count,
@@ -9844,10 +9847,22 @@ class AutomationApp:
                     callback,
                     suppress=False,
                 )
-            # F12 (中止) 用寬鬆 — 任一醫院視窗都能 abort
+            # F12 (中止) 是救援鍵：自動化執行中不做前景限制；平常仍用寬鬆 guard。
+            f12_guarded = _hotkey_guard(
+                self.interrupt_automation, 'F12', strict=False)
+
+            def _f12_callback():
+                if should_bypass_foreground_guard(
+                    'F12',
+                    subsystem_running=getattr(self, '_subsystem_running', False),
+                ):
+                    self.interrupt_automation()
+                    return
+                f12_guarded()
+
             hotkey_modules.keyboard.add_hotkey(
                 'F12',
-                _hotkey_guard(self.interrupt_automation, 'F12', strict=False),
+                _f12_callback,
                 suppress=False,
             )
             
