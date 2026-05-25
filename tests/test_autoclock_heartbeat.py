@@ -97,3 +97,21 @@ def test_heartbeat_interval_constant_is_safe_for_max_stale_300(caplog):
         f"watchdog max_stale={AUTOCLOCK_DEFAULT_MAX_STALE_SEC}s 會誤殺 autoclock。"
         f"請把 heartbeat 設 ≤ {AUTOCLOCK_DEFAULT_MAX_STALE_SEC // 2}s。"
     )
+
+
+def test_clock_driver_timeouts_are_configured():
+    calls = []
+
+    class FakeDriver:
+        def set_page_load_timeout(self, value):
+            calls.append(("page", value))
+
+        def set_script_timeout(self, value):
+            calls.append(("script", value))
+
+    autoclock._configure_clock_driver_timeouts(FakeDriver())
+
+    assert calls == [
+        ("page", autoclock._CLOCK_DRIVER_PAGE_LOAD_TIMEOUT),
+        ("script", autoclock._CLOCK_DRIVER_SCRIPT_TIMEOUT),
+    ]

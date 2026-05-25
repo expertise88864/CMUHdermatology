@@ -147,6 +147,20 @@ _PERSISTENT_DRIVER_IDLE_TIMEOUT = 15 * 60  # 15 分鐘無使用 → 主動 quit
 # 改 15 分鐘 + scheduler_loop 每分鐘主動檢查 → 兩批打卡之間 (08:00/12:00/12:30/
 # 17:30/18:00) 中間 4 小時都會被釋放，省 ~150-250MB Chrome 記憶體。下次任務
 # 重新 spin up 3-5 秒。
+_CLOCK_DRIVER_PAGE_LOAD_TIMEOUT = 30
+_CLOCK_DRIVER_SCRIPT_TIMEOUT = 30
+
+
+def _configure_clock_driver_timeouts(driver) -> None:
+    for method_name, timeout_sec in (
+        ("set_page_load_timeout", _CLOCK_DRIVER_PAGE_LOAD_TIMEOUT),
+        ("set_script_timeout", _CLOCK_DRIVER_SCRIPT_TIMEOUT),
+    ):
+        try:
+            getattr(driver, method_name)(timeout_sec)
+        except Exception:
+            logging.debug("[autoclock] 設定 WebDriver timeout 失敗: %s",
+                          method_name, exc_info=True)
 
 
 def _get_or_create_clock_driver():
@@ -207,7 +221,7 @@ def _get_or_create_clock_driver():
                 if attempt < 3:
                     exponential_backoff_sleep(attempt, base_seconds=2.0, max_seconds=60.0)
             if d:
-                d.set_script_timeout(30)
+                _configure_clock_driver_timeouts(d)
                 # 鎖內最後 set 回 pool
                 with pool["lock"]:
                     pool["driver"] = d
