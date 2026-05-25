@@ -25,6 +25,7 @@ def test_load_config_normalizes_non_string_list_values(tmp_path, monkeypatch):
         "test_recipients": "bad",
         "email_trigger_recipients": [" b@example.com "],
         "allowed_trigger_senders": [" USER@EXAMPLE.COM ", 456],
+        "retry_count": 999,
     }), encoding="utf-8")
     monkeypatch.setattr(consult_query, "CONFIG_FILE", cfg_path)
 
@@ -34,6 +35,16 @@ def test_load_config_normalizes_non_string_list_values(tmp_path, monkeypatch):
     assert cfg["test_recipients"] == consult_query.DEFAULT_CONFIG["test_recipients"]
     assert cfg["email_trigger_recipients"] == ["b@example.com"]
     assert cfg["allowed_trigger_senders"] == ["user@example.com", "456"]
+    assert cfg["retry_count"] == consult_query.MAX_RETRY_COUNT
+
+
+def test_retry_count_normalization_bounds_bad_and_large_values():
+    assert consult_query._normalize_retry_count("bad") == \
+        consult_query.DEFAULT_CONFIG["retry_count"]
+    assert consult_query._normalize_retry_count(0) == 3
+    assert consult_query._normalize_retry_count(-5) == 1
+    assert consult_query._normalize_retry_count(999) == \
+        consult_query.MAX_RETRY_COUNT
 
 
 def test_pending_retrigger_enqueue_and_drain(monkeypatch):

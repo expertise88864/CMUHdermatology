@@ -168,6 +168,8 @@ DEFAULT_CONFIG = {
     "email_trigger_poll_seconds": 20,
 }
 
+MAX_RETRY_COUNT = 10
+
 # Win32 視窗特徵（由探測 spike 實測得到，非寫死座標）
 LOGIN_CLASS = "TFrmLogin"
 LOGIN_TITLE_PREFIX = "中國醫藥大學附設醫院住院系統---簽入系統"
@@ -197,6 +199,14 @@ _consult_job_gate = ActiveTaskGate(stale_after_sec=45 * 60)
 tray_icon_object = None
 log_queue: "queue.Queue" = queue.Queue(maxsize=5000)
 _config_lock = threading.Lock()
+
+
+def _normalize_retry_count(value) -> int:
+    try:
+        raw = int(value or DEFAULT_CONFIG["retry_count"])
+        return max(1, min(MAX_RETRY_COUNT, raw))
+    except (TypeError, ValueError):
+        return DEFAULT_CONFIG["retry_count"]
 
 
 def _sleep_while_running(seconds: float, step: float = 0.5) -> bool:
@@ -250,10 +260,7 @@ def load_config() -> dict:
                 cfg[key] = list(DEFAULT_CONFIG[key])
             cfg[key] = [str(t).strip() for t in cfg[key] if str(t).strip()]
         # 數值欄位防呆
-        try:
-            cfg["retry_count"] = max(1, int(cfg.get("retry_count", 3) or 3))
-        except (TypeError, ValueError):
-            cfg["retry_count"] = DEFAULT_CONFIG["retry_count"]
+        cfg["retry_count"] = _normalize_retry_count(cfg.get("retry_count", 3))
         # 觸發輪詢週期：限制 5-300 秒，超出範圍退回預設
         try:
             v = float(cfg.get("email_trigger_poll_seconds",
@@ -1390,7 +1397,7 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
             recipients = cfg["recipients"]
             recipients_label = "recipients"
         sender = cfg.get("sender_account", "") or ""
-        retry_count = max(1, int(cfg.get("retry_count", 3) or 3))
+        retry_count = _normalize_retry_count(cfg.get("retry_count", 3))
 
         subject = cfg["subject_template"].format(date=date_str, time=time_str)
         body = cfg["body_template"].format(date=date_str, time=time_str)
