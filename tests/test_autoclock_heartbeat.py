@@ -115,3 +115,20 @@ def test_clock_driver_timeouts_are_configured():
         ("page", autoclock._CLOCK_DRIVER_PAGE_LOAD_TIMEOUT),
         ("script", autoclock._CLOCK_DRIVER_SCRIPT_TIMEOUT),
     ]
+
+
+def test_restart_program_releases_mutex_before_respawn(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(autoclock, "tray_icon_object", None)
+    monkeypatch.setattr(autoclock, "release_single_instance",
+                        lambda: calls.append("release"))
+    monkeypatch.setattr(autoclock, "restart_self",
+                        lambda extra: calls.append(("restart", extra)))
+    monkeypatch.setattr(sys, "argv", ["autoclock.py", "--configure"])
+    autoclock.running.set()
+
+    autoclock.restart_program()
+
+    assert calls == ["release", ("restart", [])]
+    assert not autoclock.running.is_set()

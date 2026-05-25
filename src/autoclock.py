@@ -1228,6 +1228,12 @@ def restart_program(args_add=None) -> None:
     running.clear()
     if tray_icon_object:
         tray_icon_object.stop()
+    try:
+        release_single_instance()
+        logging.info("[autoclock restart] mutex released before respawn")
+    except Exception:
+        logging.debug("[autoclock restart] release_single_instance failed",
+                      exc_info=True)
     extra: list = []
     for a in sys.argv[1:]:
         if a not in ("--configure", "--test-login"):
