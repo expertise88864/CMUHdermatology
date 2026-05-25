@@ -9669,19 +9669,27 @@ class AutomationApp:
                 self._future_tab_grid_stale = True
 
     def run_subsystem_in_thread(self, func, hotkey_name):
+        is_busy = False
+        show_busy_notice = False
         with self._subsystem_lock:
             if self._subsystem_running:
-                put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 前一個熱鍵流程尚未完成'))
+                is_busy = True
                 now = time.monotonic()
                 if should_show_busy_notice(
                     now, getattr(self, '_last_hotkey_busy_notice_at', 0.0),
                 ):
                     self._last_hotkey_busy_notice_at = now
-                    self._show_notice("熱鍵忙碌中", f"{hotkey_name} 已略過，請等待目前自動化完成。", level="warn", auto_close_ms=2500)
-                return
-            self._subsystem_running = True
-            self._subsystem_token += 1
-            subsystem_token = self._subsystem_token
+                    show_busy_notice = True
+            else:
+                self._subsystem_running = True
+                self._subsystem_token += 1
+                subsystem_token = self._subsystem_token
+
+        if is_busy:
+            put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 前一個熱鍵流程尚未完成'))
+            if show_busy_notice:
+                self._show_notice("熱鍵忙碌中", f"{hotkey_name} 已略過，請等待目前自動化完成。", level="warn", auto_close_ms=2500)
+            return
 
         stop_event_automation.clear()
         def wrapper():
