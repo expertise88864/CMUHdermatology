@@ -1395,6 +1395,13 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
         body = cfg["body_template"].format(date=date_str, time=time_str)
 
         last_err = None  # 最後一次的失敗例外，用於三次都失敗的 log
+        # [v17 2026-05-25] Exponential backoff — 原本 retry 間固定 sleep 3s，
+        # 三次重試集中在 5-6 分鐘窗口內，醫院 systemftp 後端 transient 慢時
+        # 三次都撞在同個 server 卡死期。今天 16:54 IMAP 觸發 → 三次「等不到
+        # 登入視窗」全部失敗 (6 分鐘) → 17:00 排程被擋 → user 沒收信。
+        # 改 [3, 30, 90] 秒：給 server 越來越長的恢復時間。
+        # 第 3 次撞上恢復視窗的機率變大。三次總時長 6→8 分鐘 (僅多 2 分鐘)。
+        BACKOFF_SCHEDULE = [3, 30, 90]
         for attempt in range(1, retry_count + 1):
             try:
                 logging.info("會診查詢任務 第 %d/%d 次嘗試（trigger=%s, 收件人組=%s, mail=%s）",
@@ -1413,9 +1420,15 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                 logging.error("會診查詢任務第 %d/%d 次失敗：%s",
                               attempt, retry_count, e, exc_info=True)
                 if attempt < retry_count:
-                    logging.info("殺 systemftp.exe 後重試（sleep 3 秒）")
+                    # exponential backoff (3s, 30s, 90s)；attempt 從 1 開始
+                    backoff = (BACKOFF_SCHEDULE[attempt - 1]
+                               if attempt - 1 < len(BACKOFF_SCHEDULE)
+                               else BACKOFF_SCHEDULE[-1])
+                    logging.info(
+                        "殺 systemftp.exe 後重試（sleep %d 秒，exponential backoff）",
+                        backoff)
                     _kill_systemftp()
-                    time.sleep(3)
+                    time.sleep(backoff)
                 else:
                     logging.error("會診查詢任務已重試 %d 次仍失敗，放棄。最後錯誤：%s",
                                   retry_count, last_err)
@@ -1436,16 +1449,57 @@ def _notify(title: str, msg: str) -> None:
         logging.debug("winotify 通知失敗（不影響流程）", exc_info=True)
 
 
+# [v17 2026-05-25] Pending re-trigger queue — 排程被 task_gate 擋掉時記下來，
+# 當前 job 結束 release lease 後自動補跑。
+# 防今天 17:00 排程被 16:54 IMAP retry 擋掉就「掉地上」 user 沒收信。
+# 同一個 trigger_label 只記一個 (defer dict by label)，避免無限堆積。
+_pending_retriggers: dict = {}  # trigger_label -> override_recipients
+_pending_retriggers_lock = threading.Lock()
+_RETRIGGER_DELAY_SEC = 5.0  # release 後等 5s 讓 systemftp/網路喘息再重觸發
+
+
+def _enqueue_pending_retrigger(trigger_label: str, override_recipients) -> None:
+    """記下一筆 pending re-trigger；同 label 後者覆蓋前者（不堆積）。"""
+    with _pending_retriggers_lock:
+        _pending_retriggers[trigger_label] = override_recipients
+
+
+def _drain_pending_retriggers() -> None:
+    """release 後跑這個 — 把擋下的觸發補上。等 _RETRIGGER_DELAY_SEC 後執行。
+    在背景 thread 跑，避免拖長 release 路徑。"""
+    with _pending_retriggers_lock:
+        if not _pending_retriggers:
+            return
+        pending = dict(_pending_retriggers)
+        _pending_retriggers.clear()
+
+    def _delayed():
+        time.sleep(_RETRIGGER_DELAY_SEC)
+        for label, override in pending.items():
+            logging.info(
+                "[re-trigger] 補跑被 task_gate 擋下的觸發：%s", label)
+            try:
+                trigger_job_async(label, override_recipients=override)
+            except Exception:
+                logging.exception("[re-trigger] 補跑 %s 失敗", label)
+
+    threading.Thread(target=_delayed,
+                     name="ConsultRetrigger", daemon=True).start()
+
+
 def trigger_job_async(trigger_label: str, override_recipients=None) -> None:
     key = "consult"
     lease = _consult_job_gate.acquire_lease(key)
     if lease is None:
         age = _consult_job_gate.active_age_sec(key)
         logging.warning(
-            "Consult query job is still running (age=%ss), skip trigger: %s",
+            "Consult query job is still running (age=%ss), skip trigger: %s "
+            "(will re-trigger after current job finishes)",
             "?" if age is None else f"{age:.0f}",
             trigger_label,
         )
+        # [v17] 排隊：當前 job release 後補跑這個 trigger
+        _enqueue_pending_retrigger(trigger_label, override_recipients)
         return
 
     def _worker():
@@ -1453,6 +1507,8 @@ def trigger_job_async(trigger_label: str, override_recipients=None) -> None:
             _do_full_job(trigger_label, override_recipients=override_recipients)
         finally:
             _consult_job_gate.release(key, lease)
+            # [v17] release 後檢查有沒有 pending re-trigger 需要補跑
+            _drain_pending_retriggers()
 
     threading.Thread(target=_worker, name="ConsultJob", daemon=True).start()
 
