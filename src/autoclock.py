@@ -1320,6 +1320,8 @@ def main() -> None:
             ctypes.windll.user32.MessageBoxW(0, error_msg, "自動打卡程式錯誤", 0x10)
         except Exception:
             print(error_msg, file=sys.stderr)
+    finally:
+        release_single_instance()
 
 
 if __name__ == "__main__":
