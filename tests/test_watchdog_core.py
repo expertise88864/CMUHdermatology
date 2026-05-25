@@ -280,3 +280,91 @@ def test_ensure_program_skips_log_check_when_max_stale_zero(tmp_path, monkeypatc
     assert killed == [], "max_stale_sec=0 不該因為 log 老就 kill"
     assert started == [], "max_stale_sec=0 不該因為 log 老就 restart"
     assert "✓" in msg or "PID" in msg
+
+
+# ─── WMIC PID fallback regression test (2026-05-25 v14) ──────────────────
+# 防將來有人拆掉 ensure_program 裡的 WMIC fallback。背景：consult_query 用
+# admin 跑，psutil NtQueryInformationProcess access denied → cmdline 拿不到，
+# 害 watchdog 每次心跳都印「psutil 找不到 PID 但 mutex 仍 hold」雜訊。
+# WMIC 用不同 API 拿 admin process cmdline，應該被當作 found-PID 路徑走。
+
+
+def test_ensure_program_uses_wmic_fallback_when_psutil_blind(tmp_path, monkeypatch):
+    """psutil 沒看到 admin process PID 時，WMIC fallback 應該補回 PID
+    並走正常 Case 2 (PID found + log fresh)，回 ✓ 而不是「找不到 PID 但
+    mutex 仍 hold」半死訊息。
+    """
+    pyw = tmp_path / "consult.pyw"
+    log = tmp_path / "consult.log"
+    pyw.write_text("# shim\n", encoding="utf-8")
+    log.write_text("fresh\n", encoding="utf-8")
+    fresh_ts = time.time()
+    os.utime(log, (fresh_ts, fresh_ts))
+
+    killed: list = []
+    started: list = []
+    monkeypatch.setattr(wc, "kill_pid",
+                        lambda pid: killed.append(pid) or True)
+    monkeypatch.setattr(wc, "start_program",
+                        lambda *args, **kwargs: started.append(args) or 5555)
+
+    # 模擬 psutil blind: list_python_processes 回空，WMIC 回 [4321]
+    monkeypatch.setattr(wc, "_wmic_find_pids",
+                        lambda kw, log_on_empty=True: [4321])
+
+    msg = wc.ensure_program(
+        {
+            "name": "會診查詢",
+            "enabled": True,
+            "pyw": str(pyw),
+            "process_match": "中國醫皮膚科會診查詢程式",
+            "log_path": str(log),
+            "max_stale_sec": 180,
+        },
+        pythonw="pythonw.exe",
+        procs=[],  # psutil 看不到 → empty
+        my_pid=9999,
+        mode="inner",
+        cfg={"action_lock_seconds": 90},
+    )
+
+    assert killed == [], f"WMIC fallback 找到 PID 不該 kill, killed={killed}"
+    assert started == [], f"WMIC fallback 找到 PID 不該 start, started={started}"
+    assert "4321" in msg, f"訊息應該含 WMIC 找到的 PID 4321, 實際: {msg!r}"
+    assert "✓" in msg, f"應該走 Case 2 健在分支, 實際: {msg!r}"
+    # 確認不是走「mutex 仍 hold」半死分支
+    assert "mutex 仍 hold" not in msg, \
+        f"WMIC 補到 PID 後不該再走半死分支, 實際: {msg!r}"
+
+
+def test_ensure_program_falls_through_when_wmic_also_blind(tmp_path, monkeypatch):
+    """WMIC 也找不到 PID → 維持原本「沒找到 PID」路徑 (mutex+log 救回 / 啟動新 instance)。"""
+    pyw = tmp_path / "consult.pyw"
+    log = tmp_path / "consult.log"
+    pyw.write_text("# shim\n", encoding="utf-8")
+    log.write_text("fresh\n", encoding="utf-8")
+    fresh_ts = time.time()
+    os.utime(log, (fresh_ts, fresh_ts))
+
+    monkeypatch.setattr(wc, "_wmic_find_pids",
+                        lambda kw, log_on_empty=True: [])  # WMIC 也 blind
+    # 沒設 mutex_name → 不會走 mutex held 分支，會走 log freshness fallback
+    msg = wc.ensure_program(
+        {
+            "name": "會診查詢",
+            "enabled": True,
+            "pyw": str(pyw),
+            "process_match": "中國醫皮膚科會診查詢程式",
+            "log_path": str(log),
+            "max_stale_sec": 180,
+        },
+        pythonw="pythonw.exe",
+        procs=[],
+        my_pid=9999,
+        mode="inner",
+        cfg={"action_lock_seconds": 90},
+    )
+
+    # 沒 PID + log 還新鮮 → 應該回「視為健在」(Fallback 2)
+    assert "視為健在" in msg or "找不到 PID 但 log" in msg, \
+        f"WMIC 也 blind 時應走 log 新鮮度 fallback, 實際: {msg!r}"

@@ -339,23 +339,18 @@ def find_matching_pids(procs: list, keyword: str, exclude_pid: int = 0) -> list:
             if kw in p.get("cmdline", "").lower() and p["pid"] != exclude_pid]
 
 
-def _find_pids_holding_mutex(process_keyword: str, mutex_name: str = "") -> list:
-    """[2026-05-22 v36] 當 psutil 抓不到 cmdline 但已知 mutex 被持有時，
-    用 WMIC 突破 psutil 的 admin cmdline 限制。
+def _wmic_find_pids(process_keyword: str, *, log_on_empty: bool = True) -> list:
+    """WMIC fallback：列舉 pythonw.exe + cmdline，回 cmdline 含 keyword 的 PID。
 
-    psutil 在 admin process 上偶發 NtQueryInformationProcess access denied
-    → cmdline 抓不到 → 找不到要 kill 的 PID。WMIC 的權限模型不同，admin
-    執行 wmic process 通常能拿到 admin process 的 cmdline。
+    psutil 在 admin process 上偶發 NtQueryInformationProcess access denied →
+    cmdline 抓不到 → 找不到 PID。WMIC 的權限模型不同，admin 執行
+    wmic process 通常能拿到 admin process 的 cmdline。
 
-    策略：
-      1. WMIC 列出所有 pythonw.exe + cmdline
-      2. cmdline 含 process_keyword 的 PID 回傳
-      3. WMIC 也失敗 → fallback：psutil 找所有 pythonw.exe (給 caller 自行
-         判斷要不要 kill — 通常只剩 1-2 個 pythonw 候選)
+    log_on_empty=False：cmdline 真的找不到時不印 WARNING (給日常心跳呼叫用，
+    避免每 30s 印一行誤導訊息)。kill 路徑用 True (預期一定要找到 PID 才能 kill)。
     """
     pids = []
     my_pid = os.getpid()
-    # 嘗試 WMIC (突破 admin cmdline 限制)
     try:
         r = subprocess.run(
             ["wmic", "process", "where", "name='pythonw.exe'",
@@ -385,14 +380,26 @@ def _find_pids_holding_mutex(process_keyword: str, mutex_name: str = "") -> list
     except Exception:
         logging.debug("[watchdog] wmic fallback 例外", exc_info=True)
 
-    # 不做「所有 pythonw.exe」fallback。這裡若抓不到 cmdline，就無法確認 PID
-    # 是否真屬於目標程式；直接 kill 全部 pythonw 風險太高，寧可讓 caller 回報
-    # 找不到 PID，交給下一輪或人工處理。
-    logging.warning(
-        "[watchdog] 無法用 WMIC 找到 %s 的 PID；為避免誤殺其他 pythonw.exe，"
-        "本輪不執行 broad fallback kill",
-        process_keyword)
+    if log_on_empty:
+        # 不做「所有 pythonw.exe」fallback。這裡若抓不到 cmdline，就無法確認
+        # PID 是否真屬於目標程式；直接 kill 全部 pythonw 風險太高，寧可讓
+        # caller 回報找不到 PID，交給下一輪或人工處理。
+        logging.warning(
+            "[watchdog] 無法用 WMIC 找到 %s 的 PID；為避免誤殺其他 pythonw.exe，"
+            "本輪不執行 broad fallback kill",
+            process_keyword)
     return []
+
+
+def _find_pids_holding_mutex(process_keyword: str, mutex_name: str = "") -> list:
+    """[2026-05-22 v36] 當 psutil 抓不到 cmdline 但已知 mutex 被持有時，
+    用 WMIC 突破 psutil 的 admin cmdline 限制。
+
+    保留 backward-compat 簽章 (mutex_name 參數雖未使用，外部 caller 跟 test
+    都已綁定)。實際工作委派給 _wmic_find_pids，log_on_empty=True 因為這條
+    路徑是 kill 前的 PID 查詢，找不到要警告。
+    """
+    return _wmic_find_pids(process_keyword, log_on_empty=True)
 
 
 # ─── Kill + start ───────────────────────────────────────────────────────
@@ -543,6 +550,17 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
     pids = find_matching_pids(procs, keyword, exclude_pid=my_pid)
     action_lock_sec = _coerce_int(cfg.get("action_lock_seconds", 90), 90,
                                   min_value=1)
+
+    # [v8 2026-05-25] psutil 沒找到 → 先試 WMIC fallback。
+    # admin process (consult_query / autoclock) 在主程式 admin watchdog thread
+    # 用 psutil 經常 NtQueryInformationProcess access denied → cmdline 拿不到，
+    # 害 watchdog 每次心跳都走「半死狀態」分支印雜訊，雖然 mutex+log 還能救起來
+    # 但訊息誤導 (user 看以為真半死)。WMIC 用不同 API 可拿到 admin process
+    # cmdline，把 PID 從這裡補回就走正常 found-PID 路徑。
+    if not pids:
+        wmic_pids = _wmic_find_pids(keyword, log_on_empty=False)
+        if wmic_pids:
+            pids = wmic_pids
 
     # Case 1: 沒找到 PID → 可能真的沒在跑 OR psutil 看不到 cmdline (Windows 偶發)
     if not pids:

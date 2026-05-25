@@ -2211,6 +2211,16 @@ def _f11_popup_watcher(label: str = "F11",
         "Shell_TrayWnd", "Progman", "WorkerW",  # Windows shell
         "MSCTFIME UI", "IME", "Default IME",  # IME
         "tooltips_class32", "TToolBar95",  # tooltips/toolbar
+        # [2026-05-25 v14] 補白名單 — user log 顯示每次 F11 都把這些印成
+        # WARNING unknown popup 把真正問題淹沒。實測都不會擋 F11：
+        "TFormMain",                  # 主程式另一個 Form (不是 TFopdmain)
+        "Tformupdate", "Tformm1100s", # 主程式更新/診間切換 form
+        "TkTopLevel",                 # 我們自己 Tk UI (主程式視窗)
+        "Chrome_WidgetWin_1",         # Chrome window (背景開的)
+        "ApplicationFrameWindow",     # Windows UWP frame
+        "Windows.UI.Core.CoreWindow", # Windows UWP core
+        "TfGaugeAPI_SimpleProgress",  # 醫院 app 進度條 (F11 流程中會閃出)
+        "TfIspTakMark",               # 醫院 app 簽核相關 (F11 流程內視窗)
     })
     unknown_seen: dict = {}  # hwnd → (class, title, first_seen_ts)
 
