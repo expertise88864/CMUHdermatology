@@ -199,6 +199,18 @@ log_queue: "queue.Queue" = queue.Queue(maxsize=5000)
 _config_lock = threading.Lock()
 
 
+def _sleep_while_running(seconds: float, step: float = 0.5) -> bool:
+    """Sleep up to seconds, but return quickly after running.clear()."""
+    deadline = time.time() + max(0.0, float(seconds))
+    step = max(0.05, float(step))
+    while running.is_set():
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return True
+        time.sleep(min(step, remaining))
+    return False
+
+
 # =============================================================================
 # Logging
 # =============================================================================
@@ -1624,7 +1636,8 @@ def _scheduler_self_watchdog() -> None:
     last_half_dead_log = 0.0
     while running.is_set():
         try:
-            time.sleep(CHECK_INTERVAL)
+            if not _sleep_while_running(CHECK_INTERVAL):
+                break
 
             # [2026-05-22 v34] Stage 0：scheduler thread 直接死了 → 立刻退場
             global _scheduler_thread_ref
@@ -1847,7 +1860,8 @@ def scheduler_loop() -> None:
         sleep_for = min(5.0, next_imap_due, next_hb_due)
         if sleep_for < 0.5:
             sleep_for = 0.5
-        time.sleep(sleep_for)
+        if not _sleep_while_running(sleep_for):
+            break
 
 
 # =============================================================================
@@ -2266,7 +2280,8 @@ def main() -> None:
             tray_icon_object.run()
         except ImportError:
             while running.is_set():
-                time.sleep(1)
+                if not _sleep_while_running(1):
+                    break
 
     except Exception:
         err = f"會診查詢程式發生嚴重錯誤：\n{traceback.format_exc()}"

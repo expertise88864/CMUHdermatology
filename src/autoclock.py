@@ -117,6 +117,19 @@ _clock_task_gate = ActiveTaskGate(stale_after_sec=90 * 60)
 _AUTOCLOCK_LIVENESS = {"last_tick": 0.0}
 _scheduler_thread_ref: threading.Thread | None = None
 
+
+def _sleep_while_running(seconds: float, step: float = 0.5) -> bool:
+    """Sleep up to seconds, but return quickly after running.clear()."""
+    deadline = time_module.time() + max(0.0, float(seconds))
+    step = max(0.05, float(step))
+    while running.is_set():
+        remaining = deadline - time_module.time()
+        if remaining <= 0:
+            return True
+        time_module.sleep(min(step, remaining))
+    return False
+
+
 # =============================================================================
 # [autoclock 常駐 Chrome 池]
 # 原本每個排程任務都新開 Chrome（~3 秒啟動）；改成跨任務重用同一 driver。
@@ -881,7 +894,8 @@ def _autoclock_self_watchdog() -> None:
     dead_detected_at = 0.0
     while running.is_set():
         try:
-            time_module.sleep(CHECK_INTERVAL)
+            if not _sleep_while_running(CHECK_INTERVAL):
+                break
             # Stage 0: thread 真死了 → 立刻退場
             global _scheduler_thread_ref
             if _scheduler_thread_ref is not None and not _scheduler_thread_ref.is_alive():
@@ -955,7 +969,8 @@ def scheduler_loop() -> None:
             logging.exception("[autoclock] scheduler.run_pending 例外 (已吞掉，scheduler 繼續跑)")
         # [優化] 改 5s sleep — schedule 套件本身有 :01 精度，5s 內仍會準時觸發
         # 每分鐘任務。早期 1s 太密；對打卡 job 觀感無差，CPU 用量降 5 倍。
-        time_module.sleep(5)
+        if not _sleep_while_running(5):
+            break
 
 
 HEARTBEAT_INTERVAL_SEC = 60.0
