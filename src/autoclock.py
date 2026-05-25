@@ -770,7 +770,8 @@ def _scheduler_tick() -> None:
     key = get_sched_key()
     if not key:
         return
-    if not _clock_task_gate.acquire(key):
+    lease = _clock_task_gate.acquire_lease(key)
+    if lease is None:
         age = _clock_task_gate.active_age_sec(key)
         logging.info(
             "[autoclock] %s task is still running (age=%ss), skip this tick",
@@ -783,7 +784,7 @@ def _scheduler_tick() -> None:
         try:
             process_clock_task(key)
         finally:
-            _clock_task_gate.release(key)
+            _clock_task_gate.release(key, lease)
 
     threading.Thread(target=_worker, name=f"AutoClockTask-{key}", daemon=True).start()
 

@@ -1426,7 +1426,8 @@ def _notify(title: str, msg: str) -> None:
 
 def trigger_job_async(trigger_label: str, override_recipients=None) -> None:
     key = "consult"
-    if not _consult_job_gate.acquire(key):
+    lease = _consult_job_gate.acquire_lease(key)
+    if lease is None:
         age = _consult_job_gate.active_age_sec(key)
         logging.warning(
             "Consult query job is still running (age=%ss), skip trigger: %s",
@@ -1439,7 +1440,7 @@ def trigger_job_async(trigger_label: str, override_recipients=None) -> None:
         try:
             _do_full_job(trigger_label, override_recipients=override_recipients)
         finally:
-            _consult_job_gate.release(key)
+            _consult_job_gate.release(key, lease)
 
     threading.Thread(target=_worker, name="ConsultJob", daemon=True).start()
 
