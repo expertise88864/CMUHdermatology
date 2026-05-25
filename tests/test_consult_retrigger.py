@@ -79,6 +79,18 @@ def test_pending_retrigger_merges_email_recipients_without_duplicates():
             "a@example.com", "B@example.com", "c@example.com"]
 
 
+def test_pending_retrigger_does_not_overwrite_recipients_with_none():
+    """A later fallback email trigger must not erase already parsed senders."""
+    with consult_query._pending_retriggers_lock:
+        consult_query._pending_retriggers.clear()
+
+    consult_query._enqueue_pending_retrigger("email", ["a@example.com"])
+    consult_query._enqueue_pending_retrigger("email", None)
+
+    with consult_query._pending_retriggers_lock:
+        assert consult_query._pending_retriggers["email"] == ["a@example.com"]
+
+
 def test_drain_with_empty_queue_does_nothing(monkeypatch):
     """queue 是空的 → drain 不啟動 thread / 不呼叫 trigger_job_async。"""
     with consult_query._pending_retriggers_lock:

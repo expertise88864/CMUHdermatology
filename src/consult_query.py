@@ -1460,7 +1460,9 @@ _RETRIGGER_DELAY_SEC = 5.0  # release 後等 5s 讓 systemftp/網路喘息再重
 
 def _merge_retrigger_recipients(existing, incoming):
     """Merge same-label email recipients without losing earlier trigger senders."""
-    if existing is None or incoming is None:
+    if incoming is None:
+        return existing
+    if existing is None:
         return incoming
     merged = []
     seen = set()
@@ -1477,11 +1479,8 @@ def _enqueue_pending_retrigger(trigger_label: str, override_recipients) -> None:
     """記下一筆 pending re-trigger；同 label 合併 email 收件人，不無限堆積。"""
     with _pending_retriggers_lock:
         existing = _pending_retriggers.get(trigger_label)
-        if existing is not None and override_recipients is not None:
-            _pending_retriggers[trigger_label] = _merge_retrigger_recipients(
-                existing, override_recipients)
-        else:
-            _pending_retriggers[trigger_label] = override_recipients
+        _pending_retriggers[trigger_label] = _merge_retrigger_recipients(
+            existing, override_recipients)
 
 
 def _drain_pending_retriggers() -> None:
