@@ -109,7 +109,7 @@ background_thread: threading.Thread | None = None
 tray_icon_object = None
 log_queue: queue.Queue = queue.Queue(maxsize=5000)
 clock_lock = threading.RLock()  # 【穩定性 2026-05-21】RLock 避免 janitor 與 process_clock_task 重入時 deadlock
-_clock_task_gate = ActiveTaskGate()
+_clock_task_gate = ActiveTaskGate(stale_after_sec=90 * 60)
 
 # [2026-05-22 v45 P0-1] scheduler liveness — 給 self-watchdog 用，跟 consult_query
 # 同一套 pattern。每次 scheduler_loop iteration 更新 last_tick；watchdog 偵測
@@ -771,7 +771,12 @@ def _scheduler_tick() -> None:
     if not key:
         return
     if not _clock_task_gate.acquire(key):
-        logging.info("[autoclock] %s 任務仍在執行，略過本輪 tick", key)
+        age = _clock_task_gate.active_age_sec(key)
+        logging.info(
+            "[autoclock] %s task is still running (age=%ss), skip this tick",
+            key,
+            "?" if age is None else f"{age:.0f}",
+        )
         return
 
     def _worker():

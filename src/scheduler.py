@@ -6165,6 +6165,8 @@ class AutomationApp:
         # [新增] 院外模式檢查
         if hasattr(self, 'out_of_hospital_var') and self.out_of_hospital_var.get():
             logging.info("院外模式啟用中，跳過熱鍵註冊。")
+            safe_unhook_all_hotkeys()
+            configure_hotkey_scaling(False, None, None)
             self.hotkey_text_label.config(text="熱鍵已停用 (院外模式)")
             self.hotkey_display_note.set("")
             return
@@ -6175,6 +6177,8 @@ class AutomationApp:
             self.hotkey_display_note.set(
                 f"熱鍵停用 · 解析度 {self.screen_width}×{self.screen_height} 無對應腳本"
             )
+            safe_unhook_all_hotkeys()
+            configure_hotkey_scaling(False, None, None)
             put_ui_message(self.ui_queue, UiStatusMessage(text='狀態: 解析度不符，熱鍵已停用'))
             self.hotkey_text_label.config(text="熱鍵已停用 (解析度不符)")
             return
@@ -6226,12 +6230,34 @@ class AutomationApp:
             self.hotkey_text_label.config(text=hotkey_info_text)
             put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: 熱鍵註冊成功 ({profile})，等待指令...'))
             logging.info(f"Hotkeys registered successfully for {profile}.")
+            self._hotkey_register_retry_count = 0
         except Exception as e:
             logging.error(f"Failed to register hotkeys: {e}", exc_info=True)
             put_ui_message(self.ui_queue, UiStatusMessage(text='狀態: 熱鍵註冊失敗! 請檢查權限'))
             self.hotkey_text_label.config(text="熱鍵註冊失敗!")
             es = str(e)
             self.hotkey_display_note.set(f"熱鍵註冊失敗 · {es[:42]}…" if len(es) > 42 else f"熱鍵註冊失敗 · {es}")
+            try:
+                self._hotkey_register_retry_count = getattr(
+                    self, '_hotkey_register_retry_count', 0) + 1
+                if self._hotkey_register_retry_count <= 5:
+                    delay_ms = min(
+                        30000,
+                        1000 * (2 ** (self._hotkey_register_retry_count - 1)),
+                    )
+                    logging.info(
+                        "Retrying hotkey registration in %.1fs (attempt %s/5)",
+                        delay_ms / 1000,
+                        self._hotkey_register_retry_count,
+                    )
+                    self.root.after(delay_ms, self.setup_hotkeys)
+                else:
+                    logging.warning(
+                        "Hotkey registration retry limit reached (%s failures)",
+                        self._hotkey_register_retry_count,
+                    )
+            except Exception:
+                logging.debug("hotkey retry scheduling failed", exc_info=True)
 
     def run_hotkey_guardian(self):
         def rehook():

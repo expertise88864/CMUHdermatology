@@ -9700,6 +9700,8 @@ class AutomationApp:
         # [新增] 院外模式檢查
         if hasattr(self, 'out_of_hospital_var') and self.out_of_hospital_var.get():
             logging.info("院外模式啟用中，跳過熱鍵註冊。")
+            safe_unhook_all_hotkeys()
+            configure_hotkey_scaling(False, None, None)
             self.hotkey_text_label.config(text="熱鍵已停用 (院外模式)")
             self.hotkey_display_note.set("")
             return
@@ -9710,6 +9712,8 @@ class AutomationApp:
             self.hotkey_display_note.set(
                 f"熱鍵停用 · 解析度 {self.screen_width}×{self.screen_height} 無對應腳本"
             )
+            safe_unhook_all_hotkeys()
+            configure_hotkey_scaling(False, None, None)
             put_ui_message(self.ui_queue, UiStatusMessage(text='狀態: 解析度不符，熱鍵已停用'))
             self.hotkey_text_label.config(text="熱鍵已停用 (解析度不符)")
             return

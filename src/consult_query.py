@@ -193,7 +193,7 @@ _DESKTOP_GENERIC_ALL = 0x10000000
 running = threading.Event()
 running.set()
 _flow_lock = threading.Lock()
-_consult_job_gate = ActiveTaskGate()
+_consult_job_gate = ActiveTaskGate(stale_after_sec=45 * 60)
 tray_icon_object = None
 log_queue: "queue.Queue" = queue.Queue(maxsize=5000)
 _config_lock = threading.Lock()
@@ -1427,7 +1427,12 @@ def _notify(title: str, msg: str) -> None:
 def trigger_job_async(trigger_label: str, override_recipients=None) -> None:
     key = "consult"
     if not _consult_job_gate.acquire(key):
-        logging.warning("會診查詢任務仍在執行中，略過本次觸發: %s", trigger_label)
+        age = _consult_job_gate.active_age_sec(key)
+        logging.warning(
+            "Consult query job is still running (age=%ss), skip trigger: %s",
+            "?" if age is None else f"{age:.0f}",
+            trigger_label,
+        )
         return
 
     def _worker():
