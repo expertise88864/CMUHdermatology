@@ -19,8 +19,12 @@ from cmuh_common.paths import (
 )
 from cmuh_common.atomic_io import atomic_write_json as _atomic_write_json
 from cmuh_common.atomic_io import atomic_write_text
-from cmuh_common.config_io import (
-    clone_default, load_json_dict, load_json_list, normalize_doctor_rows,
+from cmuh_common.config_io import load_json_dict, load_json_list
+from cmuh_common.app_settings import (
+    load_auto_reboot_settings as _load_auto_reboot_settings,
+    load_doctors_settings as _load_doctors_settings,
+    load_r_doctor_settings as _load_r_doctor_settings,
+    load_threshold_settings as _load_threshold_settings,
 )
 from cmuh_common.cache_state import (
     build_master_schedule_index,
@@ -3274,55 +3278,22 @@ class AutomationApp:
 
     # 1. 讀取 R1-R3 設定
     def load_r_doctor_settings(self):
-        defaults = {"R1": {"name": "林于喬"}, "R2": {"name": "陳翊嘉"}, "R3": {"name": "蔡明洋"}}
-        data = load_json_dict(get_conf_path('r_doctor_settings.json'), defaults)
-        out = clone_default(defaults)
-        for k in out:
-            if isinstance(data.get(k), dict):
-                out[k] = {"name": str(data[k].get("name", "")).strip()}
-        return out
+        return _load_r_doctor_settings()
 
     # 2. 讀取 止掛人數 設定
     def load_threshold_settings(self):
-        data = load_json_dict(get_conf_path('threshold_settings.json'),
-                              DEFAULT_THRESHOLDS)
-        if 'ui_font_scale' not in data:
-            data['ui_font_scale'] = 1.0
-        if 'notify_dnd_start_hour' not in data:
-            data['notify_dnd_start_hour'] = NOTIFY_DO_NOT_DISTURB_START_HOUR
-        if 'notify_dnd_end_hour' not in data:
-            data['notify_dnd_end_hour'] = NOTIFY_DO_NOT_DISTURB_END_HOUR
-        if 'notify_dnd_start_time' not in data:
-            data['notify_dnd_start_time'] = f"{int(data.get('notify_dnd_start_hour', NOTIFY_DO_NOT_DISTURB_START_HOUR)):02d}:00"
-        if 'notify_dnd_end_time' not in data:
-            data['notify_dnd_end_time'] = f"{int(data.get('notify_dnd_end_hour', NOTIFY_DO_NOT_DISTURB_END_HOUR)):02d}:00"
-        return data
+        return _load_threshold_settings(
+            dnd_start_hour=NOTIFY_DO_NOT_DISTURB_START_HOUR,
+            dnd_end_hour=NOTIFY_DO_NOT_DISTURB_END_HOUR,
+        )
 
     # 3. 讀取 醫師代號 設定
     def load_doctors_settings(self):
-        default_list = [
-            {"name": "張廖年峰", "doc_no": "D15728", "notifications": True}, 
-            {"name": "吳伯元", "doc_no": "D15645", "notifications": False},
-            {"name": "陳駿升", "doc_no": "D34899", "notifications": False}, 
-            {"name": "沈冠宇", "doc_no": "D28592", "notifications": False},
-            {"name": "許致榮", "doc_no": "D20191", "notifications": False}, 
-            {"name": "謝佳陵", "doc_no": "101823", "notifications": False},
-            {"name": "方心禹", "doc_no": "D14355", "notifications": False}, 
-            {"name": "黃建仁", "doc_no": "D6175", "notifications": False},
-            {"name": "邵湘德", "doc_no": "D30915", "notifications": False}, 
-            {"name": "李威儒", "doc_no": "D35819", "notifications": False},
-            {"name": "蔡李澄", "doc_no": "D31352", "notifications": False}
-        ]
-        data = load_json_list(get_conf_path('doctors.json'), default_list)
-        normalized, fixed = normalize_doctor_rows(data, default_list)
-        if fixed:
-            _atomic_write_json(get_conf_path('doctors.json'), normalized)
-        return normalized
+        return _load_doctors_settings()
 
     # 4. 讀取 自動重開機 設定
     def load_auto_reboot_settings(self):
-        return load_json_dict(get_conf_path('auto_reboot_settings.json'),
-                              {"enabled": False, "time": "07:01"})
+        return _load_auto_reboot_settings()
 
     # 1. 儲存 所有設定 (包含 R醫師, 止掛, 醫師列表, 重開機)
     def save_all_settings(self):
