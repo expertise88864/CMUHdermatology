@@ -96,6 +96,7 @@ from cmuh_common.hotkey_scaling import (  # noqa: E402
     configure_hotkey_scaling,
     _scaled_xy,
 )
+from cmuh_common.hotkey_guardian import should_rehook_hotkeys
 # 【重構 2026-05-21】門診預約合併純函式（與 scheduler.py 共用）
 from cmuh_common.appt_utils import (  # noqa: E402
     appointment_data_count as _appointments_data_count,
@@ -9886,10 +9887,20 @@ class AutomationApp:
                 if stop_event_main.wait(600):
                     break
                 try:
-                    if getattr(self, 'hotkey_profile', None) or self.hotkey_version:
-                        if not getattr(self, '_shutting_down', False):
-                            self.root.after(0, self.setup_hotkeys)
-                            logging.info("Hotkeys re-hooked by guardian.")
+                    has_profile = bool(
+                        getattr(self, 'hotkey_profile', None)
+                        or getattr(self, 'hotkey_version', None))
+                    if should_rehook_hotkeys(
+                        has_profile,
+                        shutting_down=getattr(self, '_shutting_down', False),
+                        subsystem_running=getattr(self, '_subsystem_running', False),
+                        modules_ready=getattr(self, '_heavy_modules_ready', False),
+                    ):
+                        self.root.after(0, self.setup_hotkeys)
+                        logging.info("Hotkeys re-hooked by guardian.")
+                    elif getattr(self, '_subsystem_running', False):
+                        logging.debug(
+                            "Hotkey guardian skipped re-hook while automation is running.")
                 except Exception as e:
                     logging.error(f"Error re-hooking hotkeys: {e}")
         # [核心修正] 依賴統一池
