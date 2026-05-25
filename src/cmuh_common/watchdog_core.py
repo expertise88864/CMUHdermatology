@@ -317,7 +317,15 @@ def find_pythonw() -> str:
 _WMIC_CACHE_TTL_SEC = 2.0
 _wmic_cache_until = 0.0
 _wmic_cache_stdout = ""
-_wmic_cache_run_id = 0
+_wmic_cache_run = None
+
+
+def _remember_wmic_process_csv(stdout: str, run_fn, now: float) -> str:
+    global _wmic_cache_until, _wmic_cache_stdout, _wmic_cache_run
+    _wmic_cache_stdout = stdout or ""
+    _wmic_cache_until = now + _WMIC_CACHE_TTL_SEC
+    _wmic_cache_run = run_fn
+    return _wmic_cache_stdout
 
 
 def list_python_processes() -> list:
@@ -349,11 +357,10 @@ def find_matching_pids(procs: list, keyword: str, exclude_pid: int = 0) -> list:
 
 
 def _read_wmic_python_process_csv() -> str:
-    global _wmic_cache_until, _wmic_cache_stdout, _wmic_cache_run_id
+    global _wmic_cache_until, _wmic_cache_stdout, _wmic_cache_run
     now = time.monotonic()
-    run_id = id(subprocess.run)
-    if (_wmic_cache_stdout and now < _wmic_cache_until
-            and _wmic_cache_run_id == run_id):
+    run_fn = subprocess.run
+    if now < _wmic_cache_until and _wmic_cache_run is run_fn:
         return _wmic_cache_stdout
 
     # [v16 2026-05-25] CREATE_NO_WINDOW — admin watchdog tick 每 60s 走 WMIC fallback
@@ -371,14 +378,11 @@ def _read_wmic_python_process_csv() -> str:
         )
     except Exception:
         logging.debug("[watchdog] wmic fallback 例外", exc_info=True)
-        return ""
+        return _remember_wmic_process_csv("", run_fn, now)
 
-    if r.returncode == 0 and r.stdout:
-        _wmic_cache_stdout = r.stdout
-        _wmic_cache_until = now + _WMIC_CACHE_TTL_SEC
-        _wmic_cache_run_id = run_id
-        return r.stdout
-    return ""
+    if r.returncode == 0:
+        return _remember_wmic_process_csv(r.stdout or "", run_fn, now)
+    return _remember_wmic_process_csv("", run_fn, now)
 
 
 def _wmic_find_pids(process_keyword: str, *, log_on_empty: bool = True) -> list:

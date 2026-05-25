@@ -85,12 +85,34 @@ def test_wmic_fallback_reuses_short_lived_process_snapshot(monkeypatch):
     monkeypatch.setattr(wc.subprocess, "run", fake_run)
     monkeypatch.setattr(wc, "_wmic_cache_until", 0.0)
     monkeypatch.setattr(wc, "_wmic_cache_stdout", "")
-    monkeypatch.setattr(wc, "_wmic_cache_run_id", 0)
+    monkeypatch.setattr(wc, "_wmic_cache_run", None)
 
     assert wc._wmic_find_pids("中國醫皮膚科打卡程式") == [1111]
     assert wc._wmic_find_pids("中國醫皮膚科會診查詢程式") == [2222]
     assert len(calls) == 1
     assert calls[0][1]["timeout"] == 10
+
+
+def test_wmic_fallback_reuses_short_lived_empty_snapshot(monkeypatch):
+    """Avoid repeated WMIC launches when the command fails or returns nothing."""
+    calls = []
+
+    class Result:
+        returncode = 1
+        stdout = ""
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append((cmd, kwargs))
+        return Result()
+
+    monkeypatch.setattr(wc.subprocess, "run", fake_run)
+    monkeypatch.setattr(wc, "_wmic_cache_until", 0.0)
+    monkeypatch.setattr(wc, "_wmic_cache_stdout", "")
+    monkeypatch.setattr(wc, "_wmic_cache_run", None)
+
+    assert wc._wmic_find_pids("中國醫皮膚科打卡程式", log_on_empty=False) == []
+    assert wc._wmic_find_pids("中國醫皮膚科會診查詢程式", log_on_empty=False) == []
+    assert len(calls) == 1
 
 
 def test_ensure_program_stale_kill_failure_does_not_start_duplicate(tmp_path, monkeypatch):
