@@ -189,6 +189,25 @@ def test_ensure_program_tolerates_bad_numeric_config(tmp_path, monkeypatch):
     assert len(started) == 1
 
 
+def test_claim_action_lock_allows_only_first_fresh_claim(tmp_path, monkeypatch):
+    monkeypatch.setattr(wc, "LOCK_DIR", tmp_path)
+
+    assert wc.claim_action_lock("打卡", 90) is True
+    assert wc.claim_action_lock("打卡", 90) is False
+
+
+def test_claim_action_lock_replaces_stale_lock_atomically(tmp_path, monkeypatch):
+    monkeypatch.setattr(wc, "LOCK_DIR", tmp_path)
+    lock = wc._lock_path_for("會診查詢")
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    lock.write_text("old", encoding="utf-8")
+    stale_ts = time.time() - 120
+    os.utime(lock, (stale_ts, stale_ts))
+
+    assert wc.claim_action_lock("會診查詢", 90) is True
+    assert wc.claim_action_lock("會診查詢", 90) is False
+
+
 def test_get_loop_timing_tolerates_bad_numeric_config():
     heartbeat, interval = wc.get_loop_timing({
         "heartbeat_log_sec": "bad",

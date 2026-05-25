@@ -536,12 +536,35 @@ def claim_action_lock(prog_name: str, max_age_sec: int) -> bool:
     try:
         LOCK_DIR.mkdir(parents=True, exist_ok=True)
         lock = _lock_path_for(prog_name)
-        if lock.exists():
-            age = time.time() - lock.stat().st_mtime
-            if age < max_age_sec:
-                return False
-        lock.write_text(f"{os.getpid()} {time.time():.0f}", encoding="utf-8")
-        return True
+        payload = f"{os.getpid()} {time.time():.0f}".encode("utf-8")
+
+        for _ in range(3):
+            try:
+                fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:
+                    age = time.time() - lock.stat().st_mtime
+                except FileNotFoundError:
+                    continue
+                if age < max_age_sec:
+                    return False
+                try:
+                    lock.unlink()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    logging.warning(
+                        "[watchdog] stale lock 移除失敗，跳過本輪動作 (%s)",
+                        prog_name,
+                        exc_info=True,
+                    )
+                    return False
+                continue
+            else:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(payload)
+                return True
+        return False
     except Exception:
         logging.exception("[watchdog] lock 操作失敗 (%s)", prog_name)
         return True  # 失敗時保險選「允許動手」
