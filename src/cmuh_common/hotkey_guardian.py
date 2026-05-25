@@ -35,3 +35,8 @@ def should_show_busy_notice(
         return float(now) - float(last_notice_at) >= float(min_interval_sec)
     except (TypeError, ValueError):
         return True
+
+
+def should_emit_interrupt(subsystem_running: bool) -> bool:
+    """Return True when F12 has an active automation flow to interrupt."""
+    return bool(subsystem_running)

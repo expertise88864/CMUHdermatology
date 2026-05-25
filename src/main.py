@@ -98,6 +98,7 @@ from cmuh_common.hotkey_scaling import (  # noqa: E402
 )
 from cmuh_common.hotkey_guardian import (
     should_bypass_foreground_guard,
+    should_emit_interrupt,
     should_rehook_hotkeys,
     should_show_busy_notice,
 )
@@ -9700,6 +9701,9 @@ class AutomationApp:
         thread.start()
 
     def interrupt_automation(self):
+        if not should_emit_interrupt(getattr(self, '_subsystem_running', False)):
+            logging.debug("Received F12 but no automation is running; ignored.")
+            return
         logging.warning("Received F12: Interrupting...")
         stop_event_automation.set()
         put_ui_message(self.ui_queue, UiStatusMessage(text="狀態: F12 終止 - 正在中斷目前操作..."))

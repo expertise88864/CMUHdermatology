@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from cmuh_common.hotkey_guardian import (  # noqa: E402
     should_bypass_foreground_guard,
+    should_emit_interrupt,
     should_rehook_hotkeys,
     should_show_busy_notice,
 )
@@ -67,3 +68,8 @@ def test_busy_notice_is_throttled():
 
 def test_busy_notice_tolerates_bad_timestamps():
     assert should_show_busy_notice("bad", 100.0) is True
+
+
+def test_interrupt_emits_only_when_automation_is_running():
+    assert should_emit_interrupt(True) is True
+    assert should_emit_interrupt(False) is False
