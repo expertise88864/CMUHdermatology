@@ -99,6 +99,7 @@ if not ICON_FILE.exists():  # 兼容舊路徑
 TOAST_APP_ID = "CMUH.SkinDept.AutoClock"
 ADD_NEW_ACCOUNT_TEXT = "+ 新增帳號"
 SCRIPT_NAME = os.path.basename(__file__)
+AUTOCLOCK_MUTEX_NAME = "Local\\CMUH_Skin_AutoClock_SingleInstance_v1"
 
 accounts_data: list = []
 _config_lock = threading.Lock()
@@ -1228,6 +1229,8 @@ def _run_test_ui() -> None:
 # 主入口
 # =============================================================================
 def main() -> None:
+    if not ensure_single_instance(AUTOCLOCK_MUTEX_NAME):
+        return
     try:
         _setup_clock_logging()
         logging.info("=== autoclock v%s 啟動 ===", CURRENT_VERSION)
@@ -1257,12 +1260,6 @@ def main() -> None:
                     exc_info=(args.exc_type, args.exc_value, args.exc_traceback)
                 )
             threading.excepthook = _thread_excepthook
-
-        # Mutex 單例
-        if not ensure_single_instance("Local\\CMUH_Skin_AutoClock_SingleInstance_v1"):
-            ctypes.windll.user32.MessageBoxW(
-                0, "自動打卡程式已在執行中。", "自動打卡", 0x40 | 0x1000)
-            sys.exit(0)
 
         # 背景檢查更新（不阻塞）
         threading.Thread(target=_check_update_in_background,
