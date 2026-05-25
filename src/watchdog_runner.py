@@ -40,9 +40,15 @@ try:
 except Exception:
     CURRENT_VERSION = "?.?.?.?"
 
+from cmuh_common.single_instance import (  # noqa: E402
+    ensure_single_instance,
+    release_single_instance,
+)
+
 # ─── Logging ─────────────────────────────────────────────────────────────
 SETTINGS_DIR = _ROOT / "settings"
 LOG_PATH = SETTINGS_DIR / "watchdog.log"
+WATCHDOG_DAEMON_MUTEX_NAME = "Local\\CMUH_Skin_Watchdog_Daemon_v1"
 
 
 def _setup_logging() -> None:
@@ -92,6 +98,10 @@ def main() -> int:
         return _run_once_via_core()
 
     _setup_logging()
+    if not ensure_single_instance(WATCHDOG_DAEMON_MUTEX_NAME):
+        logging.info("watchdog daemon already running; exit this duplicate")
+        return 0
+
     logging.info("=" * 60)
     logging.info("=== 守護程式啟動 v%s (daemon mode) ===", CURRENT_VERSION)
 
@@ -101,20 +111,23 @@ def main() -> int:
         logging.exception("載入 watchdog_core 失敗，無法啟動 daemon")
         return 1
 
-    last_heartbeat = 0.0
-    while True:
-        try:
-            cfg = watchdog_core.load_config()
-            actions = watchdog_core.run_one_tick(mode="outer")
-            heartbeat, interval = watchdog_core.get_loop_timing(cfg)
-            if time.time() - last_heartbeat >= heartbeat:
-                logging.info("[daemon heartbeat] %s",
-                             " | ".join(actions) if actions else "-")
-                last_heartbeat = time.time()
-        except Exception:
-            logging.exception("[daemon] tick 例外")
-            interval = 30
-        time.sleep(interval)
+    try:
+        last_heartbeat = 0.0
+        while True:
+            try:
+                cfg = watchdog_core.load_config()
+                actions = watchdog_core.run_one_tick(mode="outer")
+                heartbeat, interval = watchdog_core.get_loop_timing(cfg)
+                if time.time() - last_heartbeat >= heartbeat:
+                    logging.info("[daemon heartbeat] %s",
+                                 " | ".join(actions) if actions else "-")
+                    last_heartbeat = time.time()
+            except Exception:
+                logging.exception("[daemon] tick 例外")
+                interval = 30
+            time.sleep(interval)
+    finally:
+        release_single_instance()
 
 
 if __name__ == "__main__":
