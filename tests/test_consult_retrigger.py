@@ -51,7 +51,7 @@ def test_pending_retrigger_enqueue_and_drain(monkeypatch):
 
 
 def test_pending_retrigger_same_label_overrides_not_stacks(monkeypatch):
-    """同個 trigger_label 進 queue 兩次只保留最後一個 (避免堆積)。"""
+    """同個 trigger_label 進 queue 兩次只保留一筆 (避免堆積)。"""
     with consult_query._pending_retriggers_lock:
         consult_query._pending_retriggers.clear()
 
@@ -60,7 +60,23 @@ def test_pending_retrigger_same_label_overrides_not_stacks(monkeypatch):
 
     with consult_query._pending_retriggers_lock:
         assert len(consult_query._pending_retriggers) == 1
-        assert consult_query._pending_retriggers["17:00"] == ["b@example.com"]
+        assert consult_query._pending_retriggers["17:00"] == [
+            "a@example.com", "b@example.com"]
+
+
+def test_pending_retrigger_merges_email_recipients_without_duplicates():
+    """多封 email 觸發被 gate 擋住時，不可讓後一封覆蓋前一封寄件人。"""
+    with consult_query._pending_retriggers_lock:
+        consult_query._pending_retriggers.clear()
+
+    consult_query._enqueue_pending_retrigger(
+        "email", ["a@example.com", "B@example.com"])
+    consult_query._enqueue_pending_retrigger(
+        "email", ["b@example.com", "c@example.com"])
+
+    with consult_query._pending_retriggers_lock:
+        assert consult_query._pending_retriggers["email"] == [
+            "a@example.com", "B@example.com", "c@example.com"]
 
 
 def test_drain_with_empty_queue_does_nothing(monkeypatch):
