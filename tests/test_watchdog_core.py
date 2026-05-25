@@ -122,7 +122,7 @@ def test_get_loop_timing_tolerates_bad_numeric_config():
     })
 
     assert heartbeat == 300
-    assert interval == 30
+    assert interval == 60  # [2026-05-25 v15] default 30→60 (CPU 優化)
 
 
 def test_get_loop_timing_enforces_minimums():

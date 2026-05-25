@@ -2558,40 +2558,8 @@ def _find_window_by_class_title(class_name: str, title_kw: str = "",
             except Exception:
                 continue
         return hwnd
-    # 舊 Python callback 路徑保留為下方 unreachable 代碼以避免大改 _find...
-    found = [0]
-
-    EnumWindowsProc = ctypes.WINFUNCTYPE(
-        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-    @EnumWindowsProc
-    def cb(hwnd, lparam):
-        try:
-            if hwnd == exclude_hwnd:
-                return True
-            if not ctypes.windll.user32.IsWindowVisible(hwnd):
-                return True
-            cls_buf = ctypes.create_unicode_buffer(64)
-            ctypes.windll.user32.GetClassNameW(hwnd, cls_buf, 64)
-            if cls_buf.value != class_name:
-                return True
-            if title_kw:
-                n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-                if n > 0:
-                    t_buf = ctypes.create_unicode_buffer(n + 1)
-                    ctypes.windll.user32.GetWindowTextW(hwnd, t_buf, n + 1)
-                    if title_kw not in t_buf.value:
-                        return True
-                else:
-                    return True
-            found[0] = hwnd
-            return False
-        except Exception:
-            pass
-        return True
-
-    ctypes.windll.user32.EnumWindows(cb, 0)
-    return found[0]
+    # [2026-05-25 v15 死碼清除] 移除舊 Python callback 路徑 (~50 行) — 上方
+    # while True FindWindowExW loop 一定 return (hwnd or 0)，下面永遠到不了。
 
 
 def _wait_for_window(class_name: str, title_kw: str = "",
@@ -2661,11 +2629,15 @@ class _ForegroundProtector:
                      self._restore_count)
 
     def _run(self):
+        # [2026-05-25 v15 CPU 優化] 0.1s → 0.3s polling — F11 期間 (10-60s) 跑
+        # GetForegroundWindow + GetClassName 每 100ms 沒必要；300ms 仍體感即時
+        # 且 restore foreground 不需秒級精度，CPU 用量降 3x。
+        POLL_SEC = 0.3
         while not self._stop.is_set():
             try:
                 cur = ctypes.windll.user32.GetForegroundWindow()
                 if not cur:
-                    time.sleep(0.1)
+                    time.sleep(POLL_SEC)
                     continue
                 cur_cls = _get_class_name_of(cur)
                 is_hospital = cur_cls in HOSPITAL_WINDOW_CLASSES
@@ -2684,7 +2656,7 @@ class _ForegroundProtector:
                                        cur, cur_cls)
             except Exception:
                 pass
-            time.sleep(0.1)
+            time.sleep(POLL_SEC)
 
 
 def _get_class_name_of(hwnd: int) -> str:
@@ -10103,21 +10075,28 @@ class AutomationApp:
 
                         current_date_str = now.strftime("%Y-%m-%d")
 
-                        if current_time_str == target_time_str and now.second < 5 and self.last_reboot_check_date != current_date_str:
+                        # [2026-05-25 v15 CPU 優化] master loop sleep 1s → 5s
+                        # 後，second < 5 窗口可能整段被跳過。改 < 10 確保即使
+                        # sleep 在 0:59→1:04 跨過 0-5s 也能在 1:04 觸發到。
+                        # 同一分鐘多次觸發由 last_reboot_check_date != date 擋掉。
+                        if current_time_str == target_time_str and now.second < 10 and self.last_reboot_check_date != current_date_str:
                             idle_seconds = get_idle_duration()
-                            
+
                             if idle_seconds >= 60:
                                 logging.info(f"系統閒置 {idle_seconds:.0f}秒，執行自動重開機...")
                                 self.last_reboot_check_date = current_date_str
                                 self.root.after_idle(self.show_reboot_countdown)
                             else:
-                                if now.second == 0:
+                                if now.second < 5:
                                     logging.info(f"時間 ({current_time_str}) 符合，但系統非閒置 (閒置 {idle_seconds:.0f}秒 < 60秒)，跳過。")
                 except Exception as e:
                     logging.error(f"Error in auto reboot check: {e}")
 
-                # 【穩定性 2026-05-21】stop_event.wait 取代 time.sleep — shutdown 立即返回
-                if stop_event_main.wait(1.0):
+                # [2026-05-25 v15 CPU 優化] 1s wait → 5s wait — master loop 是常駐
+                # 背景 thread，1s 太密 (每分鐘醒 60 次但 schedule jobs 都是 2 分鐘
+                # 以上精度)。改 5s 後 CPU 用量降 5x，shutdown 仍 ≤5s 內返回。
+                # auto-reboot 秒數窗口已配套放寬 (見上 second<10)。
+                if stop_event_main.wait(5.0):
                     break
 
         self.bg_executor.submit(run_schedule)

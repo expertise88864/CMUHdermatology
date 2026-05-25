@@ -55,7 +55,10 @@ DEFAULT_CONFIG = {
     # 【總開關 v5】預設關閉 — 新裝機/沒設定過任何背景程式的電腦完全不會
     # 跑 watchdog。主程式設定頁有勾選 UI 可開啟。
     "master_enabled": False,
-    "check_interval_sec": 30,
+    # [v8 2026-05-25 CPU 優化] 30s → 60s — 每次 tick 跑 psutil.process_iter()
+    # + WMIC fallback 蠻吃 (200-500ms 跨 process)。consult_query/打卡 max_stale
+    # 都 300s，60s tick 仍有 5 次機會偵測卡死，足夠及時 kill+restart。
+    "check_interval_sec": 60,
     "heartbeat_log_sec": 300,
     "outer_threshold_multiplier": 1.5,  # outer C 的 max_stale_sec 乘這個倍率
     "action_lock_seconds": 90,          # 任一程式被 kill+restart 後 90s 內不允許再動
@@ -470,7 +473,8 @@ def _coerce_float(value, default: float, *, min_value: float | None = None) -> f
 def get_loop_timing(cfg: dict) -> tuple[int, int]:
     """Return (heartbeat_log_sec, check_interval_sec) with safe bounds."""
     heartbeat = _coerce_int(cfg.get("heartbeat_log_sec", 300), 300, min_value=1)
-    interval = _coerce_int(cfg.get("check_interval_sec", 30), 30, min_value=5)
+    # [v8 2026-05-25] default 30→60 (見 DEFAULT_CONFIG 註解)
+    interval = _coerce_int(cfg.get("check_interval_sec", 60), 60, min_value=5)
     return heartbeat, interval
 
 

@@ -32,6 +32,24 @@ def _get_rss_mb() -> Optional[float]:
         return None
 
 
+def _get_self_stats() -> Optional[dict]:
+    """[2026-05-25 v15] 取本 process 的 RSS/CPU%/thread 數，用來印 [stats] 心跳。
+    psutil 不可用就回 None — caller 自行跳過 stats log。
+    cpu_percent(interval=None) 用上次呼叫到現在的累積樣本，第一次呼叫會回 0.0。
+    """
+    try:
+        import psutil
+        p = psutil.Process()
+        with p.oneshot():
+            return {
+                "rss_mb": p.memory_info().rss / (1024 * 1024),
+                "cpu_pct": p.cpu_percent(interval=None),
+                "threads": p.num_threads(),
+            }
+    except Exception:
+        return None
+
+
 def _network_reachable(host: str = "smtp.gmail.com", port: int = 587,
                        timeout: float = 5.0) -> bool:
     """TCP connect 看 host:port 是否通；用來判斷網路是否 down。"""
@@ -101,9 +119,26 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
     # 時鐘漂移：紀錄 (time.time, time.monotonic) 配對，每 tick 比較 delta
     last_wall = time.time()
     last_mono = time.monotonic()
+    # [v15 2026-05-25] stats heartbeat：每 600s 印一行 rss/cpu/threads
+    # 供長期觀察優化效果用 (對比改動前後)
+    last_stats_log = 0.0
+    STATS_INTERVAL_SEC = 600.0
 
     while True:
         try:
+            # ─── stats heartbeat (rss/cpu/threads) ─────────────────
+            # [v15 2026-05-25] 即使 RAM 沒超標也每 10 分鐘 log 一筆，方便長期
+            # 觀察 (對照 CPU 優化前後變化、抓 thread leak、看 RSS 漸增)
+            now_stats = time.time()
+            if now_stats - last_stats_log >= STATS_INTERVAL_SEC:
+                stats = _get_self_stats()
+                if stats is not None:
+                    logging.info(
+                        "[health/%s][stats] rss=%.0fMB cpu=%.1f%% threads=%d",
+                        tag, stats["rss_mb"], stats["cpu_pct"],
+                        stats["threads"])
+                last_stats_log = now_stats
+
             # ─── RAM ───────────────────────────────────────────────
             rss_mb = _get_rss_mb()
             if rss_mb is None:
