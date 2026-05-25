@@ -700,9 +700,13 @@ def process_clock_task(schedule_key: str | None) -> None:
     # AttributeError → process_clock_task crash → 打卡完全失效。
     # 純 informational warning，移除即可 (actual locking 仍由 with clock_lock 處理)。
     # 若真的有重入會在下面 with clock_lock 直接阻塞。
-    t_wait_start = time.time()
+    # [v17 2026-05-25 P0 HOTFIX] 改用 time_module — autoclock.py 用 `import time
+    # as time_module` 別名 (line 40)，「time」名稱根本不存在。原本 v43 修
+    # RLock.locked() bug 時加這段 timing log，沒注意別名 → 每次中午/早上打卡
+    # 觸發 process_clock_task 立刻 NameError crash → user 中午沒打到卡。
+    t_wait_start = time_module.time()
     with clock_lock:
-        wait_ms = (time.time() - t_wait_start) * 1000
+        wait_ms = (time_module.time() - t_wait_start) * 1000
         if wait_ms > 100:
             logging.warning(
                 "任務 %s 取得 clock_lock 等了 %.0fms (上一個任務還沒結束)",

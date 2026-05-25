@@ -55,6 +55,33 @@ def test_heartbeat_emits_on_first_tick_when_last_log_zero(caplog):
     )
 
 
+def test_process_clock_task_uses_time_module_not_time(caplog):
+    """[v17 P0 regression] autoclock.py 用 `import time as time_module` 別名，
+    所以 process_clock_task 內必須用 time_module.time()，不能用 time.time()。
+
+    背景：2026-05-25 中午 user 打卡失敗 — 12:38-12:50 持續 NameError:
+    'time is not defined'。原因是 #102 修 RLock bug 時加 timing log，
+    寫成 `time.time()` 但 autoclock 沒 import 純 time，每次中午打卡觸發
+    process_clock_task 立刻 crash → 中午沒打到下班卡。
+
+    這 test 解析 process_clock_task source code，確認沒任何 `time.time()`
+    或 `time.sleep()` 純名稱呼叫 (必須是 time_module.xxx)。
+    """
+    import inspect
+    import re
+
+    src = inspect.getsource(autoclock.process_clock_task)
+    # 找「不是字母或底線」的 word boundary 後接 "time." 的呼叫
+    # 排除 time_module / time.something_else / datetime / strftime
+    matches = re.findall(r"(?<![\w_])time\.(time|sleep|monotonic|localtime|strftime)\(",
+                         src)
+    assert not matches, (
+        f"process_clock_task 內有純 `time.xxx(` 呼叫 {matches}，autoclock 用 "
+        f"`import time as time_module` 別名，會 NameError 害打卡 crash。"
+        f"請改 time_module.xxx()。"
+    )
+
+
 def test_heartbeat_interval_constant_is_safe_for_max_stale_300(caplog):
     """[regression] HEARTBEAT_INTERVAL_SEC 必須 << watchdog max_stale_sec。
 
