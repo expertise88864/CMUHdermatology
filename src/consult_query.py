@@ -196,6 +196,7 @@ running = threading.Event()
 running.set()
 _flow_lock = threading.Lock()
 _consult_job_gate = ActiveTaskGate(stale_after_sec=45 * 60)
+_test_email_gate = ActiveTaskGate(stale_after_sec=10 * 60)
 tray_icon_object = None
 log_queue: "queue.Queue" = queue.Queue(maxsize=5000)
 _config_lock = threading.Lock()
@@ -2225,7 +2226,19 @@ def _send_test_email() -> None:
 
 
 def _tray_test_email(icon=None, item=None) -> None:
-    threading.Thread(target=_send_test_email, name="ConsultTestMail",
+    lease = _test_email_gate.acquire_lease("test-email")
+    if lease is None:
+        logging.info("測試寄信仍在執行中，本次點擊略過")
+        _notify("測試寄信執行中", "請等待目前測試完成")
+        return
+
+    def _worker():
+        try:
+            _send_test_email()
+        finally:
+            _test_email_gate.release("test-email", lease)
+
+    threading.Thread(target=_worker, name="ConsultTestMail",
                      daemon=True).start()
 
 

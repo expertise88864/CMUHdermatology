@@ -136,6 +136,42 @@ def test_drain_with_empty_queue_does_nothing(monkeypatch):
     assert triggered == []
 
 
+def test_tray_test_email_skips_duplicate_until_worker_finishes(monkeypatch):
+    targets = []
+    sent = []
+    notices = []
+
+    class FakeThread:
+        def __init__(self, *, target, name=None, daemon=None):
+            targets.append(target)
+            self.name = name
+            self.daemon = daemon
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(consult_query, "_test_email_gate",
+                        consult_query.ActiveTaskGate(stale_after_sec=600))
+    monkeypatch.setattr(consult_query, "_send_test_email",
+                        lambda: sent.append("sent"))
+    monkeypatch.setattr(consult_query, "_notify",
+                        lambda title, message: notices.append((title, message)))
+    monkeypatch.setattr(consult_query.threading, "Thread", FakeThread)
+
+    consult_query._tray_test_email()
+    consult_query._tray_test_email()
+
+    assert len(targets) == 1
+    assert notices == [("測試寄信執行中", "請等待目前測試完成")]
+    assert sent == []
+
+    targets[0]()
+    consult_query._tray_test_email()
+
+    assert sent == ["sent"]
+    assert len(targets) == 2
+
+
 def test_backoff_schedule_is_exponential():
     """[v17 regression] retry sleep 必須是 exponential backoff (3s, 30s, 90s)，
     不能改回固定 3s — 那樣會撞在同個 server 卡死期。"""
