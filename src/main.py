@@ -99,6 +99,7 @@ from cmuh_common.hotkey_scaling import (  # noqa: E402
 from cmuh_common.hotkey_guardian import (
     should_bypass_foreground_guard,
     should_emit_interrupt,
+    should_emit_idle_status,
     should_rehook_hotkeys,
     should_show_busy_notice,
 )
@@ -5379,6 +5380,7 @@ class AutomationApp:
         self._bottom_links_hidden = False  # 與 links_frame 顯示狀態同步，避免重複 grid 觸發版面重算
         self._subsystem_running = False
         self._subsystem_lock = threading.Lock()
+        self._subsystem_token = 0
         self._last_hotkey_busy_notice_at = 0.0
         self._active_notices = []
         self.startup_phase_text = tk.StringVar(value="啟動中")
@@ -9678,6 +9680,8 @@ class AutomationApp:
                     self._show_notice("熱鍵忙碌中", f"{hotkey_name} 已略過，請等待目前自動化完成。", level="warn", auto_close_ms=2500)
                 return
             self._subsystem_running = True
+            self._subsystem_token += 1
+            subsystem_token = self._subsystem_token
 
         stop_event_automation.clear()
         def wrapper():
@@ -9696,7 +9700,14 @@ class AutomationApp:
                 with self._subsystem_lock:
                     self._subsystem_running = False
                 time.sleep(2)
-                put_ui_message(self.ui_queue, UiStatusMessage(text='狀態: 閒置'))
+                with self._subsystem_lock:
+                    emit_idle = should_emit_idle_status(
+                        self._subsystem_token,
+                        subsystem_token,
+                        subsystem_running=self._subsystem_running,
+                    )
+                if emit_idle:
+                    put_ui_message(self.ui_queue, UiStatusMessage(text='狀態: 閒置'))
         thread = threading.Thread(target=wrapper, name=f"{hotkey_name}_Thread", daemon=True)
         thread.start()
 

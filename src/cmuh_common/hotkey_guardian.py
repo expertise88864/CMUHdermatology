@@ -40,3 +40,13 @@ def should_show_busy_notice(
 def should_emit_interrupt(subsystem_running: bool) -> bool:
     """Return True when F12 has an active automation flow to interrupt."""
     return bool(subsystem_running)
+
+
+def should_emit_idle_status(
+    current_token: int,
+    completed_token: int,
+    *,
+    subsystem_running: bool,
+) -> bool:
+    """Return True if a finished worker may publish the final idle status."""
+    return current_token == completed_token and not subsystem_running
