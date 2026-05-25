@@ -1931,6 +1931,27 @@ def _f11_handle_breast_screening(hwnd: int, label: str = "") -> bool:
     return False
 
 
+def _f11_handle_oral_screening(hwnd: int, label: str = "") -> bool:
+    """口腔黏膜篩檢提示 popup (class=TfAskDlg, title 含 '口腔黏膜篩檢')：
+    點「暫不需要」(皮膚科病人不需要做口腔篩檢)。
+
+    [2026-05-25] snapshot_20260525_090405 證實 popup 結構：
+      - class=TfAskDlg, title=口腔黏膜篩檢提示
+      - 2 個 TButton: 「執行」/「暫不需要」
+    跟 _f11_handle_breast_screening 共用 class，靠 watcher 的 title_kw 過濾分流。
+    這裡 handler 再驗證「暫不需要」button 存在才點，避免誤觸其他 TfAskDlg。
+    """
+    logging.info("[%s] 口腔黏膜篩檢 popup hwnd=%s → 暫不需要", label, hwnd)
+    time.sleep(0.15)
+    check_stop()
+    if _click_button_normalized_text(hwnd, "暫不需要"):
+        logging.info("[%s]   已點 暫不需要", label)
+        _wait_window_closed(hwnd, timeout=5)
+        return True
+    logging.warning("[%s]   找不到 暫不需要 button", label)
+    return False
+
+
 def _f11_handle_primary_care_refer(hwnd: int, label: str = "") -> bool:
     """健保初級照護轉診訊息 (class=TfChkSpecList)：
     勾「99.本院療程尚未結束，本次不轉院」TGroupButton → 點「確認」TButton。
@@ -2101,6 +2122,7 @@ _F11_POPUP_HANDLERS = [
     ("TfAskDlg2",       "",              _f11_handle_ask_dlg),
     ("TFOPDPreg",       "",              _f11_handle_appt),
     ("TfAskDlg",        "乳房篩檢",       _f11_handle_breast_screening),
+    ("TfAskDlg",        "口腔黏膜篩檢",    _f11_handle_oral_screening),
     ("TMessageForm",    "西醫門診系統",   _f11_handle_message_ok),
     ("TFTunMsg",        "病人轉診",       _f11_handle_transfer_msg),
     ("TfChkSpecList",   "健保初級照護",   _f11_handle_primary_care_refer),
