@@ -314,6 +314,12 @@ def find_pythonw() -> str:
 
 
 # ─── Process 列舉 ────────────────────────────────────────────────────────
+_WMIC_CACHE_TTL_SEC = 2.0
+_wmic_cache_until = 0.0
+_wmic_cache_stdout = ""
+_wmic_cache_run_id = 0
+
+
 def list_python_processes() -> list:
     """[{pid, cmdline}, ...] — 抓 pythonw.exe / python.exe（admin 才看得到 admin 的 cmdline）。"""
     psutil = _get_psutil()
@@ -342,18 +348,14 @@ def find_matching_pids(procs: list, keyword: str, exclude_pid: int = 0) -> list:
             if kw in p.get("cmdline", "").lower() and p["pid"] != exclude_pid]
 
 
-def _wmic_find_pids(process_keyword: str, *, log_on_empty: bool = True) -> list:
-    """WMIC fallback：列舉 Python launchers + cmdline，回 cmdline 含 keyword 的 PID。
+def _read_wmic_python_process_csv() -> str:
+    global _wmic_cache_until, _wmic_cache_stdout, _wmic_cache_run_id
+    now = time.monotonic()
+    run_id = id(subprocess.run)
+    if (_wmic_cache_stdout and now < _wmic_cache_until
+            and _wmic_cache_run_id == run_id):
+        return _wmic_cache_stdout
 
-    psutil 在 admin process 上偶發 NtQueryInformationProcess access denied →
-    cmdline 抓不到 → 找不到 PID。WMIC 的權限模型不同，admin 執行
-    wmic process 通常能拿到 admin process 的 cmdline。
-
-    log_on_empty=False：cmdline 真的找不到時不印 WARNING (給日常心跳呼叫用，
-    避免每 30s 印一行誤導訊息)。kill 路徑用 True (預期一定要找到 PID 才能 kill)。
-    """
-    pids = []
-    my_pid = os.getpid()
     # [v16 2026-05-25] CREATE_NO_WINDOW — admin watchdog tick 每 60s 走 WMIC fallback
     # (因為 admin process 用 psutil 看不到 cmdline)，原本沒設 creationflags 會閃
     # 黑色 console 視窗。Windows-only flag，os.name=='nt' 才有意義。
@@ -367,9 +369,35 @@ def _wmic_find_pids(process_keyword: str, *, log_on_empty: bool = True) -> list:
             encoding=locale.getpreferredencoding(False), errors="replace",
             creationflags=_CREATE_NO_WINDOW,
         )
-        if r.returncode == 0 and r.stdout:
+    except Exception:
+        logging.debug("[watchdog] wmic fallback 例外", exc_info=True)
+        return ""
+
+    if r.returncode == 0 and r.stdout:
+        _wmic_cache_stdout = r.stdout
+        _wmic_cache_until = now + _WMIC_CACHE_TTL_SEC
+        _wmic_cache_run_id = run_id
+        return r.stdout
+    return ""
+
+
+def _wmic_find_pids(process_keyword: str, *, log_on_empty: bool = True) -> list:
+    """WMIC fallback：列舉 Python launchers + cmdline，回 cmdline 含 keyword 的 PID。
+
+    psutil 在 admin process 上偶發 NtQueryInformationProcess access denied →
+    cmdline 抓不到 → 找不到 PID。WMIC 的權限模型不同，admin 執行
+    wmic process 通常能拿到 admin process 的 cmdline。
+
+    log_on_empty=False：cmdline 真的找不到時不印 WARNING (給日常心跳呼叫用，
+    避免每 30s 印一行誤導訊息)。kill 路徑用 True (預期一定要找到 PID 才能 kill)。
+    """
+    pids = []
+    my_pid = os.getpid()
+    try:
+        stdout = _read_wmic_python_process_csv()
+        if stdout:
             kw_lower = (process_keyword or "").lower()
-            for parts in csv.reader(r.stdout.splitlines()):
+            for parts in csv.reader(stdout.splitlines()):
                 # CSV: Node,CommandLine,ProcessId
                 if len(parts) < 3:
                     continue

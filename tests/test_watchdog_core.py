@@ -66,6 +66,33 @@ def test_wmic_fallback_also_matches_python_console_launcher(monkeypatch):
     assert "python.exe" in " ".join(seen_cmds[0])
 
 
+def test_wmic_fallback_reuses_short_lived_process_snapshot(monkeypatch):
+    """One watchdog tick may check multiple apps; reuse the same WMIC snapshot."""
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = (
+            "Node,CommandLine,ProcessId\n"
+            'PC,"pythonw.exe C:\\app\\中國醫皮膚科打卡程式.pyw",1111\n'
+            'PC,"pythonw.exe C:\\app\\中國醫皮膚科會診查詢程式.pyw",2222\n'
+        )
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append((cmd, kwargs))
+        return Result()
+
+    monkeypatch.setattr(wc.subprocess, "run", fake_run)
+    monkeypatch.setattr(wc, "_wmic_cache_until", 0.0)
+    monkeypatch.setattr(wc, "_wmic_cache_stdout", "")
+    monkeypatch.setattr(wc, "_wmic_cache_run_id", 0)
+
+    assert wc._wmic_find_pids("中國醫皮膚科打卡程式") == [1111]
+    assert wc._wmic_find_pids("中國醫皮膚科會診查詢程式") == [2222]
+    assert len(calls) == 1
+    assert calls[0][1]["timeout"] == 10
+
+
 def test_ensure_program_stale_kill_failure_does_not_start_duplicate(tmp_path, monkeypatch):
     """既有 PID kill 失敗時，不應再啟動第二個 instance。"""
     pyw = tmp_path / "target.pyw"
