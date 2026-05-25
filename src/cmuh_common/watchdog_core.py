@@ -601,8 +601,12 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
                 try:
                     age = time.time() - log_path.stat().st_mtime
                     if age < max_stale:
-                        return (f"~ {name}: psutil 找不到 PID 但 mutex 仍 hold "
-                                f"+ log {age:.0f}s 前剛更新，視為健在 [{mode}]")
+                        # [v16 2026-05-25] 文案改友善 — Windows WMI 對含中文路徑的
+                        # cmdline 有 codepage bug (測試確認 WMI BSTR→string 階段就
+                        # 已亂碼，PowerShell 也救不回)。每次 fallback 不是錯，
+                        # 不該用「psutil 找不到 PID」這種嚇人字眼。
+                        return (f"✓ {name}: log {age:.0f}s 前更新，"
+                                f"mutex+log 確認健在 [{mode}]")
                     # mutex 仍持有但 log stale → 半死狀態，需要 kill+restart
                     # 但 psutil 找不到 PID，怎麼 kill？用 mutex name 找對應 process
                     logging.warning(
@@ -630,9 +634,10 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
                             f"找不到 PID 無法 kill (建議手動重啟) [{mode}]")
                 except Exception:
                     logging.debug("[watchdog] mutex+log 檢查例外", exc_info=True)
-            # max_stale=0 (打卡)：沒 log 新鮮度可查，仍視為健在 (原本邏輯)
-            return (f"~ {name}: psutil 找不到 PID 但 mutex 仍 hold "
-                    f"({mutex_name.rsplit(chr(92), 1)[-1]})，視為健在 [{mode}]")
+            # max_stale=0：沒 log 新鮮度可查，仍視為健在 (原本邏輯)
+            # [v16] 文案改友善
+            return (f"✓ {name}: mutex 確認健在 "
+                    f"({mutex_name.rsplit(chr(92), 1)[-1]}) [{mode}]")
 
         # [Fallback 2] log 還新鮮 → 程式幾乎肯定健在，psutil 找不到只是
         # cmdline access 失敗。(mutex 沒持有 → 不會誤判)
@@ -640,8 +645,8 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
             try:
                 age = time.time() - log_path.stat().st_mtime
                 if age < max_stale:
-                    return (f"~ {name}: psutil 找不到 PID 但 log {age:.0f}s "
-                            f"前剛更新 (<{max_stale}s)，視為健在 [{mode}]")
+                    # [v16] 文案改友善
+                    return (f"✓ {name}: log {age:.0f}s 前更新，視為健在 [{mode}]")
             except Exception:
                 pass
         if not claim_action_lock(name, action_lock_sec):

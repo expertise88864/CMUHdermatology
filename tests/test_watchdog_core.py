@@ -89,6 +89,9 @@ def test_ensure_program_tolerates_bad_numeric_config(tmp_path, monkeypatch):
     started = []
 
     monkeypatch.setattr(wc, "claim_action_lock", lambda *args, **kwargs: True)
+    # [v16 test isolation] 鎖住 WMIC fallback 不要碰到實機跑的 pythonw process
+    monkeypatch.setattr(wc, "_wmic_find_pids",
+                        lambda kw, log_on_empty=True: [])
     monkeypatch.setattr(
         wc,
         "start_program",
