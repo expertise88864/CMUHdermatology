@@ -62,3 +62,32 @@ def test_self_process_is_cached_for_rss_and_stats(monkeypatch):
     }
     assert FakeProcess.created == 1
     assert health._self_process.cpu_calls == 2
+
+
+def test_self_process_cache_recovers_after_read_failure(monkeypatch):
+    class FakeMem:
+        rss = 21 * 1024 * 1024
+
+    class FakeProcess:
+        created = 0
+
+        def __init__(self):
+            FakeProcess.created += 1
+            self.sequence = FakeProcess.created
+
+        def cpu_percent(self, interval=None):
+            return 0.0
+
+        def memory_info(self):
+            if self.sequence == 1:
+                raise RuntimeError("stale psutil process handle")
+            return FakeMem()
+
+    monkeypatch.setattr(health, "_self_process", None)
+    monkeypatch.setitem(sys.modules, "psutil",
+                        SimpleNamespace(Process=FakeProcess))
+
+    assert health._get_rss_mb() is None
+    assert health._self_process is None
+    assert health._get_rss_mb() == 21
+    assert FakeProcess.created == 2

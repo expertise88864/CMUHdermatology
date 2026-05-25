@@ -69,14 +69,23 @@ def _get_self_process():
             return None
 
 
+def _clear_self_process(process) -> None:
+    global _self_process
+    with _self_process_lock:
+        if _self_process is process:
+            _self_process = None
+
+
 def _get_rss_mb() -> Optional[float]:
     """回傳本 process 的 Resident Set Size (MB)；psutil 不可用就回 None。"""
+    p = None
     try:
         p = _get_self_process()
         if p is None:
             return None
         return p.memory_info().rss / (1024 * 1024)
     except Exception:
+        _clear_self_process(p)
         return None
 
 
@@ -85,6 +94,7 @@ def _get_self_stats() -> Optional[dict]:
     psutil 不可用就回 None — caller 自行跳過 stats log。
     cpu_percent(interval=None) 用上次呼叫到現在的累積樣本，第一次呼叫會回 0.0。
     """
+    p = None
     try:
         p = _get_self_process()
         if p is None:
@@ -96,6 +106,7 @@ def _get_self_stats() -> Optional[dict]:
                 "threads": p.num_threads(),
             }
     except Exception:
+        _clear_self_process(p)
         return None
 
 
