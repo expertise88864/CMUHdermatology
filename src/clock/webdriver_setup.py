@@ -46,6 +46,7 @@ def _detect_chrome_major_version() -> str | None:
             ["powershell", "-NoProfile", "-Command",
              "(Get-Item (Get-Command chrome -ErrorAction SilentlyContinue).Source).VersionInfo.FileVersion"],
             stderr=subprocess.DEVNULL, timeout=5, text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         m = re.match(r"(\d+)", out.strip())
         if m:

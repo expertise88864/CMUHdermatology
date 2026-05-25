@@ -5,7 +5,7 @@
 push.bat 內的 scripts/bump_version.py 會自動 bump 此處版本。
 """
 
-CURRENT_VERSION = "2026.05.25.25"  # 格式 YYYY.MM.DD.serial
+CURRENT_VERSION = "2026.05.25.26"  # 格式 YYYY.MM.DD.serial
 
 
 def parse_version(s: str) -> tuple:
