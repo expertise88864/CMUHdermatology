@@ -6754,30 +6754,67 @@ class AutomationApp:
             right_frame_container.grid_columnconfigure(c, weight=0 if c < 5 else 1)
 
     def _launch_scheduler_program(self):
+        # [v16 2026-05-25] 改多行 + 加 creationflags=CREATE_NO_WINDOW 避免黑框閃
         scheduler_script_name = "中國醫皮膚科排班程式.pyw"
-        try: logging.info(f"Launching scheduler program: {scheduler_script_name}"); subprocess.Popen([sys.executable, scheduler_script_name])
-        except FileNotFoundError: messagebox.showerror("啟動失敗", f"找不到排班程式檔案: {scheduler_script_name}\n\n請確認主程式與排班程式在同一個資料夾中。"); logging.error(f"Scheduler script not found: {scheduler_script_name}")
-        except Exception as e: messagebox.showerror("啟動失敗", f"無法啟動排班程式:\n{e}"); logging.error(f"Failed to launch scheduler: {e}")
-            
+        try:
+            logging.info(f"Launching scheduler program: {scheduler_script_name}")
+            subprocess.Popen(
+                [sys.executable, scheduler_script_name],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except FileNotFoundError:
+            messagebox.showerror("啟動失敗", f"找不到排班程式檔案: {scheduler_script_name}\n\n請確認主程式與排班程式在同一個資料夾中。")
+            logging.error(f"Scheduler script not found: {scheduler_script_name}")
+        except Exception as e:
+            messagebox.showerror("啟動失敗", f"無法啟動排班程式:\n{e}")
+            logging.error(f"Failed to launch scheduler: {e}")
+
     def _launch_autoclock_program(self):
         autoclock_script_name = "中國醫皮膚科打卡程式.pyw"
-        try: logging.info(f"Launching autoclock program: {autoclock_script_name}"); subprocess.Popen([sys.executable, autoclock_script_name])
-        except FileNotFoundError: messagebox.showerror("啟動失敗", f"找不到打卡程式檔案: {autoclock_script_name}\n\n請確認主程式與打卡程式在同一個資料夾中。"); logging.error(f"Autoclock script not found: {autoclock_script_name}")
-        except Exception as e: messagebox.showerror("啟動失敗", f"無法啟動打卡程式:\n{e}"); logging.error(f"Failed to launch autoclock program: {e}")
+        try:
+            logging.info(f"Launching autoclock program: {autoclock_script_name}")
+            subprocess.Popen(
+                [sys.executable, autoclock_script_name],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except FileNotFoundError:
+            messagebox.showerror("啟動失敗", f"找不到打卡程式檔案: {autoclock_script_name}\n\n請確認主程式與打卡程式在同一個資料夾中。")
+            logging.error(f"Autoclock script not found: {autoclock_script_name}")
+        except Exception as e:
+            messagebox.showerror("啟動失敗", f"無法啟動打卡程式:\n{e}")
+            logging.error(f"Failed to launch autoclock program: {e}")
 
     def _launch_coordinate_detector_program(self):
         script_name = "中國醫皮膚科點座標偵測程式.pyw"
-        try: logging.info(f"Launching coordinate detector program: {script_name}"); subprocess.Popen([sys.executable, script_name])
-        except FileNotFoundError: messagebox.showerror("啟動失敗", f"找不到座標偵測程式檔案: {script_name}\n\n請確認主程式與該程式在同一個資料夾中。"); logging.error(f"Coordinate detector script not found: {script_name}")
-        except Exception as e: messagebox.showerror("啟動失敗", f"無法啟動座標偵測程式:\n{e}"); logging.error(f"Failed to launch coordinate detector program: {e}")
+        try:
+            logging.info(f"Launching coordinate detector program: {script_name}")
+            subprocess.Popen(
+                [sys.executable, script_name],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except FileNotFoundError:
+            messagebox.showerror("啟動失敗", f"找不到座標偵測程式檔案: {script_name}\n\n請確認主程式與該程式在同一個資料夾中。")
+            logging.error(f"Coordinate detector script not found: {script_name}")
+        except Exception as e:
+            messagebox.showerror("啟動失敗", f"無法啟動座標偵測程式:\n{e}")
+            logging.error(f"Failed to launch coordinate detector program: {e}")
 
     def _launch_consult_query_program(self):
         # 只啟動常駐托盤（不帶 --run-now），讓使用者由托盤選單或排程觸發；
         # 已啟動則靜默結束（不彈視窗）。需要立即執行可右鍵托盤「立即執行一次」。
         script_name = "中國醫皮膚科會診查詢程式.pyw"
-        try: logging.info(f"Launching consult query program: {script_name}"); subprocess.Popen([sys.executable, script_name])
-        except FileNotFoundError: messagebox.showerror("啟動失敗", f"找不到會診查詢程式檔案: {script_name}\n\n請確認主程式與該程式在同一個資料夾中。"); logging.error(f"Consult query script not found: {script_name}")
-        except Exception as e: messagebox.showerror("啟動失敗", f"無法啟動會診查詢程式:\n{e}"); logging.error(f"Failed to launch consult query program: {e}")
+        try:
+            logging.info(f"Launching consult query program: {script_name}")
+            subprocess.Popen(
+                [sys.executable, script_name],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except FileNotFoundError:
+            messagebox.showerror("啟動失敗", f"找不到會診查詢程式檔案: {script_name}\n\n請確認主程式與該程式在同一個資料夾中。")
+            logging.error(f"Consult query script not found: {script_name}")
+        except Exception as e:
+            messagebox.showerror("啟動失敗", f"無法啟動會診查詢程式:\n{e}")
+            logging.error(f"Failed to launch consult query program: {e}")
 
     def _create_other_programs_tab(self, tools_tab):
         

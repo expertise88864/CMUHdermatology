@@ -96,12 +96,40 @@ class DependencyInstaller(tk.Tk):
                     #   --no-input：不互動（避免 hang）
                     #   --disable-pip-version-check：跳過 pip 自身版本檢查
                     #   --prefer-binary：優先用 wheel（避免 source 編譯）
-                    subprocess.check_call(
-                        [sys.executable, "-m", "pip", "install", pkg_name,
-                         "--upgrade", "--quiet", "--no-input",
-                         "--disable-pip-version-check", "--prefer-binary"],
-                        startupinfo=startupinfo,
-                    )
+                    # [v16 2026-05-25 P0] 加 timeout=240s + retry 1 次。原本
+                    # check_call 沒 timeout，網路慢/PyPI mirror 斷時整支程式在
+                    # import 階段 hang 死 (GUI 還沒出來)。240s 對 pywin32 (~50MB)
+                    # 等大包剛好夠用；retry 1 次以防偶發 connection reset。
+                    cmd = [
+                        sys.executable, "-m", "pip", "install", pkg_name,
+                        "--upgrade", "--quiet", "--no-input",
+                        "--disable-pip-version-check", "--prefer-binary",
+                    ]
+                    last_err: Exception | None = None
+                    for attempt in (1, 2):
+                        try:
+                            subprocess.run(
+                                cmd, check=True, timeout=240,
+                                startupinfo=startupinfo,
+                            )
+                            last_err = None
+                            break
+                        except subprocess.TimeoutExpired as e:
+                            last_err = e
+                            logging.warning(
+                                "[deps] pip install %s timeout (240s)，"
+                                "第 %d 次嘗試", pkg_name, attempt)
+                            if attempt == 1:
+                                time.sleep(3)
+                        except subprocess.CalledProcessError as e:
+                            last_err = e
+                            logging.warning(
+                                "[deps] pip install %s 失敗 (rc=%s)，第 %d 次嘗試",
+                                pkg_name, e.returncode, attempt)
+                            if attempt == 1:
+                                time.sleep(3)
+                    if last_err is not None:
+                        raise last_err
                     importlib.invalidate_caches()
                 except Exception as e:
                     self._run_on_ui_thread(

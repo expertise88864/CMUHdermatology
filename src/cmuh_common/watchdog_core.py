@@ -354,12 +354,17 @@ def _wmic_find_pids(process_keyword: str, *, log_on_empty: bool = True) -> list:
     """
     pids = []
     my_pid = os.getpid()
+    # [v16 2026-05-25] CREATE_NO_WINDOW — admin watchdog tick 每 60s 走 WMIC fallback
+    # (因為 admin process 用 psutil 看不到 cmdline)，原本沒設 creationflags 會閃
+    # 黑色 console 視窗。Windows-only flag，os.name=='nt' 才有意義。
+    _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         r = subprocess.run(
             ["wmic", "process", "where", "name='pythonw.exe'",
              "get", "ProcessId,CommandLine", "/FORMAT:CSV"],
             capture_output=True, text=True, timeout=10,
             encoding=locale.getpreferredencoding(False), errors="replace",
+            creationflags=_CREATE_NO_WINDOW,
         )
         if r.returncode == 0 and r.stdout:
             kw_lower = (process_keyword or "").lower()
@@ -407,11 +412,13 @@ def _find_pids_holding_mutex(process_keyword: str, mutex_name: str = "") -> list
 
 # ─── Kill + start ───────────────────────────────────────────────────────
 def kill_pid(pid: int) -> bool:
-    """taskkill /F /PID — 需 admin 才砍得了 admin process。"""
+    """taskkill /F /PID — 需 admin 才砍得了 admin process。
+    [v16 2026-05-25] 加 CREATE_NO_WINDOW 避免閃 console。"""
     try:
         r = subprocess.run(
             ["taskkill", "/F", "/PID", str(pid)],
             capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return r.returncode == 0
     except Exception:
