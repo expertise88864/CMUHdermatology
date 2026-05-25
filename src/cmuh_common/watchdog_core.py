@@ -440,6 +440,26 @@ def is_log_stale(log_path: Path, max_stale_sec: int) -> tuple:
 
 
 # ─── Action lock：避免 B+C 同時 kill+restart 同一個程式 ─────────────────
+def _coerce_int(value, default: int, *, min_value: int | None = None) -> int:
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        out = default
+    if min_value is not None:
+        out = max(min_value, out)
+    return out
+
+
+def _coerce_float(value, default: float, *, min_value: float | None = None) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        out = default
+    if min_value is not None:
+        out = max(min_value, out)
+    return out
+
+
 def _lock_path_for(prog_name: str) -> Path:
     safe = "".join(c if c.isalnum() else "_" for c in prog_name)
     return LOCK_DIR / f"{safe}.lock"
@@ -491,11 +511,12 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
     keyword = prog.get("process_match", "")
     pyw_rel = prog.get("pyw", "")
     log_rel = prog.get("log_path", "")
-    max_stale = int(prog.get("max_stale_sec", 0))
+    max_stale = _coerce_int(prog.get("max_stale_sec", 0), 0, min_value=0)
 
     # outer 對 non-主程式 拉長 staleness threshold，避免跟 inner 搶
     if mode == "outer" and not prog.get("outer_only", False) and max_stale > 0:
-        mult = float(cfg.get("outer_threshold_multiplier", 1.5))
+        mult = _coerce_float(cfg.get("outer_threshold_multiplier", 1.5), 1.5,
+                             min_value=1.0)
         max_stale = int(max_stale * mult)
 
     if not keyword or not pyw_rel:
@@ -508,7 +529,8 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
         return f"⚠ {name}: 找不到 {pyw_path}"
 
     pids = find_matching_pids(procs, keyword, exclude_pid=my_pid)
-    action_lock_sec = int(cfg.get("action_lock_seconds", 90))
+    action_lock_sec = _coerce_int(cfg.get("action_lock_seconds", 90), 90,
+                                  min_value=1)
 
     # Case 1: 沒找到 PID → 可能真的沒在跑 OR psutil 看不到 cmdline (Windows 偶發)
     if not pids:

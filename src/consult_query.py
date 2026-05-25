@@ -84,6 +84,7 @@ from cmuh_common.platform_win import is_admin, run_as_admin  # noqa: E402
 from cmuh_common.single_instance import (  # noqa: E402
     ensure_single_instance, release_single_instance,
 )
+from cmuh_common.task_gate import ActiveTaskGate  # noqa: E402
 from cmuh_common.version import CURRENT_VERSION  # noqa: E402
 
 # DPI 感知：讓 GetWindowRect 回實體像素，跨機/跨縮放比例一致
@@ -192,6 +193,7 @@ _DESKTOP_GENERIC_ALL = 0x10000000
 running = threading.Event()
 running.set()
 _flow_lock = threading.Lock()
+_consult_job_gate = ActiveTaskGate()
 tray_icon_object = None
 log_queue: "queue.Queue" = queue.Queue(maxsize=5000)
 _config_lock = threading.Lock()
@@ -1423,10 +1425,18 @@ def _notify(title: str, msg: str) -> None:
 
 
 def trigger_job_async(trigger_label: str, override_recipients=None) -> None:
-    threading.Thread(target=_do_full_job,
-                     args=(trigger_label,),
-                     kwargs={"override_recipients": override_recipients},
-                     name="ConsultJob", daemon=True).start()
+    key = "consult"
+    if not _consult_job_gate.acquire(key):
+        logging.warning("會診查詢任務仍在執行中，略過本次觸發: %s", trigger_label)
+        return
+
+    def _worker():
+        try:
+            _do_full_job(trigger_label, override_recipients=override_recipients)
+        finally:
+            _consult_job_gate.release(key)
+
+    threading.Thread(target=_worker, name="ConsultJob", daemon=True).start()
 
 
 # =============================================================================

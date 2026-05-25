@@ -80,3 +80,36 @@ def test_ensure_program_stale_kill_failure_does_not_start_duplicate(tmp_path, mo
 
     assert "kill 失敗" in msg
     assert started == []
+
+
+def test_ensure_program_tolerates_bad_numeric_config(tmp_path, monkeypatch):
+    """Bad numeric watchdog config should fall back instead of failing a tick."""
+    pyw = tmp_path / "target.pyw"
+    pyw.write_text("# shim\n", encoding="utf-8")
+    started = []
+
+    monkeypatch.setattr(wc, "claim_action_lock", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        wc,
+        "start_program",
+        lambda *args, **kwargs: started.append(args) or 123,
+    )
+
+    msg = wc.ensure_program(
+        {
+            "name": "clock",
+            "enabled": True,
+            "pyw": str(pyw),
+            "process_match": "autoclock",
+            "log_path": "",
+            "max_stale_sec": "bad",
+        },
+        pythonw="pythonw.exe",
+        procs=[],
+        my_pid=9999,
+        mode="outer",
+        cfg={"action_lock_seconds": "bad", "outer_threshold_multiplier": "bad"},
+    )
+
+    assert "123" in msg
+    assert len(started) == 1

@@ -58,6 +58,7 @@ from cmuh_common.atomic_io import atomic_write_json, safe_load_json  # noqa: E40
 from cmuh_common.logging_setup import QueueHandler, setup_logging  # noqa: E402
 from cmuh_common.paths import get_app_dir, get_settings_dir, restart_self  # noqa: E402
 from cmuh_common.single_instance import ensure_single_instance, release_single_instance  # noqa: E402
+from cmuh_common.task_gate import ActiveTaskGate  # noqa: E402
 from cmuh_common.version import CURRENT_VERSION  # noqa: E402
 
 try:
@@ -107,6 +108,7 @@ background_thread: threading.Thread | None = None
 tray_icon_object = None
 log_queue: queue.Queue = queue.Queue(maxsize=5000)
 clock_lock = threading.RLock()  # 【穩定性 2026-05-21】RLock 避免 janitor 與 process_clock_task 重入時 deadlock
+_clock_task_gate = ActiveTaskGate()
 
 # [2026-05-22 v45 P0-1] scheduler liveness — 給 self-watchdog 用，跟 consult_query
 # 同一套 pattern。每次 scheduler_loop iteration 更新 last_tick；watchdog 偵測
@@ -765,8 +767,19 @@ def get_sched_key() -> str | None:
 def _scheduler_tick() -> None:
     """每分鐘觸發一次：只呼叫一次 get_sched_key，避免邊界競態。"""
     key = get_sched_key()
-    if key:
-        threading.Thread(target=process_clock_task, args=(key,), daemon=True).start()
+    if not key:
+        return
+    if not _clock_task_gate.acquire(key):
+        logging.info("[autoclock] %s 任務仍在執行，略過本輪 tick", key)
+        return
+
+    def _worker():
+        try:
+            process_clock_task(key)
+        finally:
+            _clock_task_gate.release(key)
+
+    threading.Thread(target=_worker, name=f"AutoClockTask-{key}", daemon=True).start()
 
 
 def _idle_driver_janitor() -> None:
