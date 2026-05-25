@@ -11,10 +11,29 @@ import os
 import sys
 import threading
 import time
+import json
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import consult_query  # noqa: E402
+
+
+def test_load_config_normalizes_non_string_list_values(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "consult_query_config.json"
+    cfg_path.write_text(json.dumps({
+        "recipients": [" a@example.com ", 123, None, ""],
+        "test_recipients": "bad",
+        "email_trigger_recipients": [" b@example.com "],
+        "allowed_trigger_senders": [" USER@EXAMPLE.COM ", 456],
+    }), encoding="utf-8")
+    monkeypatch.setattr(consult_query, "CONFIG_FILE", cfg_path)
+
+    cfg = consult_query.load_config()
+
+    assert cfg["recipients"] == ["a@example.com", "123"]
+    assert cfg["test_recipients"] == consult_query.DEFAULT_CONFIG["test_recipients"]
+    assert cfg["email_trigger_recipients"] == ["b@example.com"]
+    assert cfg["allowed_trigger_senders"] == ["user@example.com", "456"]
 
 
 def test_pending_retrigger_enqueue_and_drain(monkeypatch):

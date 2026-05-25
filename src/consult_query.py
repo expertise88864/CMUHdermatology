@@ -240,7 +240,8 @@ def load_config() -> dict:
                      "allowed_trigger_senders"):
             if not isinstance(cfg.get(key), list):
                 cfg[key] = list(DEFAULT_CONFIG[key])
-            cfg[key] = [r.strip() for r in cfg[key] if str(r).strip()]
+            cfg[key] = [str(r).strip() for r in cfg[key]
+                        if r is not None and str(r).strip()]
         # 白名單比對全小寫，避免大小寫差異漏判
         cfg["allowed_trigger_senders"] = [a.lower() for a in
                                             cfg["allowed_trigger_senders"]]
