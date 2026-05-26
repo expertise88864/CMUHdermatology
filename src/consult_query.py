@@ -110,6 +110,7 @@ MAX_SHOT_FILES = 60
 
 SYSTEMFTP_PATH = r"C:\admc\systemftp.exe"
 MUTEX_NAME = "Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1"
+CONFIG_MUTEX_NAME = "Local\\CMUH_Skin_ConsultQuery_Config_v1"
 
 DEFAULT_CONFIG = {
     "username": "101358",
@@ -2317,9 +2318,15 @@ def main() -> None:
                 )
             threading.excepthook = _thread_excepthook
 
-        # 設定模式：不搶單例，直接開設定視窗
+        # 設定模式：不搶常駐單例，但設定視窗本身仍需防重複開啟，
+        # 避免多個設定視窗同時儲存互相覆蓋。
         if "--configure" in args:
-            ConfigApp().mainloop()
+            if not ensure_single_instance(CONFIG_MUTEX_NAME):
+                return
+            try:
+                ConfigApp().mainloop()
+            finally:
+                release_single_instance()
             return
 
         # 第一次啟動：設定檔不存在 → 強制開設定視窗

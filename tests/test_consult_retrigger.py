@@ -172,6 +172,17 @@ def test_tray_test_email_skips_duplicate_until_worker_finishes(monkeypatch):
     assert len(targets) == 2
 
 
+def test_configure_mode_has_dedicated_single_instance_guard():
+    import inspect
+
+    src = inspect.getsource(consult_query.main)
+
+    assert "CONFIG_MUTEX_NAME" in src
+    assert "ensure_single_instance(CONFIG_MUTEX_NAME)" in src
+    assert "release_single_instance()" in src
+    assert "ConfigApp().mainloop()" in src
+
+
 def test_backoff_schedule_is_exponential():
     """[v17 regression] retry sleep 必須是 exponential backoff (3s, 30s, 90s)，
     不能改回固定 3s — 那樣會撞在同個 server 卡死期。"""
