@@ -166,6 +166,44 @@ def test_run_subsystem_reports_incomplete_return_status():
     assert src.index("if result is False:") < src.index("操作完成")
 
 
+def test_scheduler_run_subsystem_uses_guardian_policies():
+    source_path = ROOT / "src" / "scheduler.py"
+    src = _function_source(source_path, "run_subsystem_in_thread")
+
+    assert "should_show_busy_notice" in src
+    assert "result = func()" in src
+    assert "if result is False:" in src
+    assert "操作未完成" in src
+    assert "should_emit_idle_status" in src
+    assert "subsystem_token" in src
+
+
+def test_scheduler_interrupt_automation_is_deduplicated():
+    source_path = ROOT / "src" / "scheduler.py"
+    src = _function_source(source_path, "interrupt_automation")
+
+    assert "should_emit_interrupt" in src
+    assert "stop_already_requested=stop_event_automation.is_set()" in src
+    assert "Received F12 but no automation is running; ignored." in src
+
+
+def test_main_and_scheduler_log_queues_are_bounded():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = (ROOT / rel_path).read_text(encoding="utf-8")
+
+        assert "self.log_queue = Queue(maxsize=5000)" in src
+        assert "self.log_queue = Queue()" not in src
+
+
+def test_main_and_scheduler_ui_queue_polling_is_bounded():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "process_ui_queue")
+
+        assert "for _ in range(250):" in src
+        assert "while True:" not in src
+        assert "next_delay = 80 if had_work else 320" in src
+
+
 def test_f9_f10_consent_menu_post_is_checked():
     source_path = ROOT / "src" / "main.py"
     src = _function_source(source_path, "script_F9_F10_consent_form_adaptive")

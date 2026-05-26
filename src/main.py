@@ -6813,7 +6813,7 @@ class AutomationApp:
         self._register_lazy_tab("系統日誌", lambda frame: self._create_log_tab(frame))
 
         # 建立 Queue 與 Handler
-        self.log_queue = Queue()
+        self.log_queue = Queue(maxsize=5000)
         queue_handler = QueueHandler(self.log_queue)
         formatter = logging.Formatter('%(asctime)s [%(levelname)s]: %(message)s', datefmt='%H:%M:%S')
         queue_handler.setFormatter(formatter)
@@ -10079,7 +10079,7 @@ class AutomationApp:
             return
         had_work = False
         try:
-            while True:
+            for _ in range(250):
                 try:
                     msg = self.ui_queue.get_nowait()
                 except Empty:

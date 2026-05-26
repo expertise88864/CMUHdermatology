@@ -59,6 +59,11 @@ from cmuh_common.notifications import show_windows_notification
 from cmuh_common.icons import ensure_cmuh_app_icon_path as _ensure_cmuh_app_icon_path
 from cmuh_common.window_icon import apply_tk_window_icon as _apply_tk_window_icon
 from cmuh_common.logging_setup import QueueHandler
+from cmuh_common.hotkey_guardian import (
+    should_emit_idle_status,
+    should_emit_interrupt,
+    should_show_busy_notice,
+)
 from cmuh_common.http_client import INTERNAL_HOSTS, is_internal as _is_internal
 from cmuh_common.ui_messages import (
     UiStatusMessage, UiRefreshTickMessage, UiClinicDataMessage, UiMasterScheduleMessage,
@@ -2672,6 +2677,8 @@ class AutomationApp:
         self._bottom_links_hidden = False  # 與 links_frame 顯示狀態同步，避免重複 grid 觸發版面重算
         self._subsystem_running = False
         self._subsystem_lock = threading.Lock()
+        self._subsystem_token = 0
+        self._last_hotkey_busy_notice_at = 0.0
         self._active_notices = []
         self.startup_phase_text = tk.StringVar(value="啟動中")
         self.app_version_text = tk.StringVar(value=f"v{CURRENT_VERSION}")
@@ -2944,7 +2951,7 @@ class AutomationApp:
         self._register_lazy_tab("系統日誌", lambda frame: self._create_log_tab(frame))
 
         # 建立 Queue 與 Handler
-        self.log_queue = Queue()
+        self.log_queue = Queue(maxsize=5000)
         queue_handler = QueueHandler(self.log_queue)
         formatter = logging.Formatter('%(asctime)s [%(levelname)s]: %(message)s', datefmt='%H:%M:%S')
         queue_handler.setFormatter(formatter)
@@ -5887,7 +5894,7 @@ class AutomationApp:
             return
         had_work = False
         try:
-            while True:
+            for _ in range(250):
                 try:
                     msg = self.ui_queue.get_nowait()
                 except Empty:
@@ -6129,20 +6136,39 @@ class AutomationApp:
                 self._future_tab_grid_stale = True
 
     def run_subsystem_in_thread(self, func, hotkey_name):
+        is_busy = False
+        show_busy_notice = False
         with self._subsystem_lock:
             if self._subsystem_running:
-                put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 前一個熱鍵流程尚未完成'))
+                is_busy = True
+                now = time.monotonic()
+                if should_show_busy_notice(
+                    now, getattr(self, '_last_hotkey_busy_notice_at', 0.0),
+                ):
+                    self._last_hotkey_busy_notice_at = now
+                    show_busy_notice = True
+            else:
+                self._subsystem_running = True
+                self._subsystem_token += 1
+                subsystem_token = self._subsystem_token
+
+        if is_busy:
+            put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 前一個熱鍵流程尚未完成'))
+            if show_busy_notice:
                 self._show_notice("熱鍵忙碌中", f"{hotkey_name} 已略過，請等待目前自動化完成。", level="warn", auto_close_ms=2500)
-                return
-            self._subsystem_running = True
+            return
 
         stop_event_automation.clear()
         def wrapper():
             logging.info(f"Starting subsystem from {hotkey_name}...")
             put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 執行中...'))
             try:
-                func()
-                put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 操作完成'))
+                result = func()
+                if result is False:
+                    logging.warning("Subsystem from %s returned incomplete status", hotkey_name)
+                    put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 操作未完成，請檢查畫面'))
+                else:
+                    put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 操作完成'))
             except SubsystemInterrupted as e:
                 logging.warning(f"Subsystem stopped: {e}")
                 put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 已由F12手動終止'))
@@ -6153,11 +6179,24 @@ class AutomationApp:
                 with self._subsystem_lock:
                     self._subsystem_running = False
                 time.sleep(2)
-                put_ui_message(self.ui_queue, UiStatusMessage(text='狀態: 閒置'))
+                with self._subsystem_lock:
+                    emit_idle = should_emit_idle_status(
+                        self._subsystem_token,
+                        subsystem_token,
+                        subsystem_running=self._subsystem_running,
+                    )
+                if emit_idle:
+                    put_ui_message(self.ui_queue, UiStatusMessage(text='狀態: 閒置'))
         thread = threading.Thread(target=wrapper, name=f"{hotkey_name}_Thread", daemon=True)
         thread.start()
 
     def interrupt_automation(self):
+        if not should_emit_interrupt(
+            getattr(self, '_subsystem_running', False),
+            stop_already_requested=stop_event_automation.is_set(),
+        ):
+            logging.debug("Received F12 but no automation is running; ignored.")
+            return
         logging.warning("Received F12: Interrupting...")
         stop_event_automation.set()
         put_ui_message(self.ui_queue, UiStatusMessage(text="狀態: F12 終止 - 正在中斷目前操作..."))
