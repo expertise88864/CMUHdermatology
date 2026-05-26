@@ -240,6 +240,26 @@ def test_parse_max_at_phrase():
     assert "MAX at 1000" in r.new_text
 
 
+def test_parse_full_width_parentheses_preserves_shape():
+    text = "UVB：970mj/cm2 （197） on （2026/05/24）, 每次加：50mj/cm2 if no erythema, 固定：1000, W2"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1000
+    assert r.new_count == 198
+    assert "UVB：1000mj/cm2" in r.new_text
+    assert "（198）" in r.new_text
+    assert "（2026/05/26）" in r.new_text
+
+
+def test_parse_fix_with_colon_phrase():
+    text = "UVB: 970mj/cm2 (197) on (2026/05/24), add 50mj/cm2 if no erythema, fixed: 1000, W2"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1000
+    assert r.new_count == 198
+    assert "fixed: 1000" in r.new_text
+
+
 def test_parse_increased_past_tense():
     """[v20.4 regression] 'increased 40' (有 d) 也要 parse 成功。
     User 5/26 11:38 real-world: 'UVB: 1100mj/cm2(87) on (2026/5/24), 已打8折,
@@ -1108,6 +1128,21 @@ def test_apply_uncertain_updates_writes_count_and_date():
     assert "(37) (2026/5/22)" not in final
     # 原 UVB 行不受 apply_uncertain 影響 — 日期還是今天
     assert "on (2026/05/26)" in final
+
+
+def test_full_width_uncertain_triplet_can_be_confirmed():
+    text = (
+        "re- excimer 800 upper back （37） （2026/5/22） add 10mJ each time\n"
+        "局部 手 UVB: 800 mj/cm2（8） on （2026/5/24） add 50 each time, "
+        "fixed: 1000"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert r.uncertain_other_triplets
+    final = apply_uncertain_updates(r.new_text, r.uncertain_other_triplets)
+    assert "（38） （2026/05/26）" in final
+    assert "（37） （2026/5/22）" not in final
+    assert "on （2026/05/26）" in final
 
 
 def test_no_uncertain_when_only_same_date_triplets():

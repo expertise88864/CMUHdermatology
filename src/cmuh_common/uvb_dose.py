@@ -110,7 +110,7 @@ _UVB_DOSE_RE = re.compile(r"UVB\s*[:：]?\s*(\d+)", re.IGNORECASE)
 #   (2026/05/24) — group 1-3
 #    2026/05/24  — group 4-6
 _UVB_DATE_RE = re.compile(
-    r"\(\s*(\d{4})/(\d{1,2})/(\d{1,2})\s*\)"
+    r"[\(（]\s*(\d{4})/(\d{1,2})/(\d{1,2})\s*[\)）]"
     r"|"
     r"\b(\d{4})/(\d{1,2})/(\d{1,2})\b"
 )
@@ -118,7 +118,7 @@ _UVB_DATE_RE = re.compile(
 # 為了不抓到日期 (年是 4 位)，caller 會先 mask date span 再 search。
 # 大於 MAX_COUNT 的會在 sanity check 時擋下，這裡先放寬接受任意位數。
 # [v20.7] 也排除「年」可能性 — 4 位數字當 count 機率極低，先排除避免誤抓
-_UVB_COUNT_RE = re.compile(r"\(\s*(\d+)\s*\)")
+_UVB_COUNT_RE = re.compile(r"[\(（]\s*(\d+)\s*[\)）]")
 # increase / increased / add / 每次加 / 增加 (case-insensitive)
 _UVB_INCREASE_RE = re.compile(
     r"(?:(?:increase[d]?|add)(?:\s+by)?|每次增加|每次加|增加|加)"
@@ -128,7 +128,7 @@ _UVB_INCREASE_RE = re.compile(
 #   MAX:N / MAX N / MAX at N / fix N / fixed at N / fixed to N / 固定 N
 # \bfix(?:ed)? 確保 word boundary 避免抓到 "prefix"/"fixing" 等
 _UVB_MAX_RE = re.compile(
-    r"(?:MAX(?:\s+(?:at|to))?\s*[:：]?\s*|\bfix(?:ed)?(?:\s+(?:at|to))?\s+|固定(?:在|為)?\s*[:：]?\s*)(\d+)",
+    r"(?:MAX(?:\s+(?:at|to))?\s*[:：]?\s*|\bfix(?:ed)?(?:\s+(?:at|to))?\s*[:：]?\s*|固定(?:在|為)?\s*[:：]?\s*)(\d+)",
     re.IGNORECASE,
 )
 
@@ -139,9 +139,9 @@ _UVB_MAX_RE = re.compile(
 #   1500mj/cm2 (44) on (2026/5/25) add 50 each time, fixed at 1500
 # 中間限制無括號避免跨越獨立 segment。
 _TRIPLET_RE = re.compile(
-    r"\(\s*(\d{1,3})\s*\)"                         # (count)
-    r"([^()]{0,120}?)"                              # 中間 (no parens)
-    r"\(\s*(\d{4})/(\d{1,2})/(\d{1,2})\s*\)"        # (YYYY/MM/DD)
+    r"[\(（]\s*(\d{1,3})\s*[\)）]"                  # (count)
+    r"([^()（）]{0,120}?)"                           # 中間 (no parens)
+    r"[\(（]\s*(\d{4})/(\d{1,2})/(\d{1,2})\s*[\)）]" # (YYYY/MM/DD)
 )
 # Triplet 周圍需要的 UVB-相關標記 (避免誤動其他內容如「(10) days for ...」)
 # 「\d\s*mj」要求數字接 mJ/mj (劑量單位)，比單純 "mj" 更安全
@@ -297,8 +297,8 @@ def format_uvb_line(original: UvbLineInfo, *, new_dose: int,
     # 2. 替換 count: (N) → (N+1) — 僅當原本有 count 且傳入 new_count
     if original.count is not None and new_count is not None:
         src = re.sub(
-            r"\(\s*" + str(original.count) + r"\s*\)",
-            f"({new_count})",
+            r"([\(\uFF08]\s*)" + str(original.count) + r"(\s*[\)\uFF09])",
+            lambda mo: f"{mo.group(1)}{new_count}{mo.group(2)}",
             src,
             count=1,
         )
@@ -309,10 +309,15 @@ def format_uvb_line(original: UvbLineInfo, *, new_dose: int,
     old_y = original.last_date.year
     old_m = original.last_date.month
     old_d = original.last_date.day
-    with_paren_re = rf"\(\s*{old_y}/0?{old_m}/0?{old_d}\s*\)"
+    with_paren_re = rf"([\(\uFF08]\s*){old_y}/0?{old_m}/0?{old_d}(\s*[\)\uFF09])"
     if re.search(with_paren_re, src):
-        # 帶 paren: (2026/5/24) → (2026/05/26)
-        src = re.sub(with_paren_re, f"({today_str})", src, count=1)
+        # 帶 paren: (2026/5/24) → (2026/05/26)，保留半形/全形括號
+        src = re.sub(
+            with_paren_re,
+            lambda mo: f"{mo.group(1)}{today_str}{mo.group(2)}",
+            src,
+            count=1,
+        )
     else:
         # 不帶 paren: 2026/5/24 → 2026/05/26 (注意 word boundary 避免誤改其他數字)
         bare_re = rf"\b{old_y}/0?{old_m}/0?{old_d}\b"
@@ -395,11 +400,17 @@ def _detect_uncertain_triplets(text: str, today: date,
         # 構造 "Yes 時" 套用的新 segment: count+1, date→today
         rep = m.group(0)
         rep = re.sub(
-            r"\(\s*" + str(old_count) + r"\s*\)",
-            f"({old_count + 1})", rep, count=1)
+            r"([\(\uFF08]\s*)" + str(old_count) + r"(\s*[\)\uFF09])",
+            lambda mo: f"{mo.group(1)}{old_count + 1}{mo.group(2)}",
+            rep,
+            count=1,
+        )
         rep = re.sub(
-            rf"\(\s*{seg_date.year}/0?{seg_date.month}/0?{seg_date.day}\s*\)",
-            f"({today_str})", rep, count=1)
+            rf"([\(\uFF08]\s*){seg_date.year}/0?{seg_date.month}/0?{seg_date.day}(\s*[\)\uFF09])",
+            lambda mo: f"{mo.group(1)}{today_str}{mo.group(2)}",
+            rep,
+            count=1,
+        )
         out.append({
             'line': line_text.strip(),
             'count': old_count,
@@ -639,12 +650,16 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         # 構造該 triplet 替換內容: count→count+1, date→today
         seg_text = m.group(0)
         seg_text = re.sub(
-            r"\(\s*" + str(old_count) + r"\s*\)",
-            f"({old_count + 1})", seg_text, count=1,
+            r"([\(\uFF08]\s*)" + str(old_count) + r"(\s*[\)\uFF09])",
+            lambda mo: f"{mo.group(1)}{old_count + 1}{mo.group(2)}",
+            seg_text,
+            count=1,
         )
         seg_text = re.sub(
-            rf"\(\s*{seg_date.year}/0?{seg_date.month}/0?{seg_date.day}\s*\)",
-            f"({today_str})", seg_text, count=1,
+            rf"([\(\uFF08]\s*){seg_date.year}/0?{seg_date.month}/0?{seg_date.day}(\s*[\)\uFF09])",
+            lambda mo: f"{mo.group(1)}{today_str}{mo.group(2)}",
+            seg_text,
+            count=1,
         )
         triplet_edits.append((m.span(), seg_text))
 
