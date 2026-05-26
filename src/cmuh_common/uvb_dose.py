@@ -68,10 +68,14 @@ class UvbAction:
 # ─── Parse result ───────────────────────────────────────────────────────
 @dataclass
 class UvbLineInfo:
-    """parse 出來的單行 UVB 結構。"""
+    """parse 出來的單行 UVB 結構。
+
+    [v20.7] count 變 Optional — 處置可能沒寫 (N) 次數欄位 (醫師選擇不記)。
+    沒 count → 不更新 count，dose/date 仍要更新。
+    """
     full_match: str       # 完整原始行內容 (含 line ending 之前的文字)
     dose: int             # 原劑量
-    count: int            # 原 (N) 次數
+    count: Optional[int]  # 原 (N) 次數，None=處置沒寫
     last_date: date       # 原日期
     increase: int         # increase 後的數字
     max_dose: int         # MAX 後的數字
@@ -94,11 +98,14 @@ _UVB_DATE_RE = re.compile(r"\(\s*(\d{4})/(\d{1,2})/(\d{1,2})\s*\)")
 # count: \(\s*\d+\s*\) — 任何 paren 內純數字。
 # 為了不抓到日期 (年是 4 位)，caller 會先 mask date span 再 search。
 # 大於 MAX_COUNT 的會在 sanity check 時擋下，這裡先放寬接受任意位數。
+# [v20.7] 也排除「年」可能性 — 4 位數字當 count 機率極低，先排除避免誤抓
 _UVB_COUNT_RE = re.compile(r"\(\s*(\d+)\s*\)")
 # increase / increased / add (case-insensitive)
 _UVB_INCREASE_RE = re.compile(
     r"(?:increase[d]?|add)\s*(\d+)", re.IGNORECASE)
-_UVB_MAX_RE = re.compile(r"MAX\s*:?\s*(\d+)", re.IGNORECASE)
+# [v20.7] MAX 接受多種同義表達：MAX:N / MAX N / fixed at N
+_UVB_MAX_RE = re.compile(
+    r"(?:MAX\s*:?\s*|fixed\s+at\s+)(\d+)", re.IGNORECASE)
 
 
 def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
@@ -156,19 +163,20 @@ def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
     except ValueError:
         return None
 
-    # 4. Count (segment 內第一個 1-3 位數字 paren，排除 date 範圍)
+    # 4. Count (segment 內第一個數字 paren，排除 date 範圍)
+    # [v20.7] count 變 Optional — 沒 (N) 處置仍可更新 dose/date
     seg_masked = (
         segment[:date_m.start()]
         + " " * (date_m.end() - date_m.start())
         + segment[date_m.end():]
     )
     count_m = _UVB_COUNT_RE.search(seg_masked)
-    if not count_m:
-        return None
-    try:
-        count = int(count_m.group(1))
-    except ValueError:
-        return None
+    count: Optional[int] = None
+    if count_m:
+        try:
+            count = int(count_m.group(1))
+        except ValueError:
+            count = None
 
     # 5. Increase / add
     inc_m = _UVB_INCREASE_RE.search(segment)
@@ -211,12 +219,14 @@ def compute_new_dose(*, dose: int, increase: int, max_dose: int,
 
 
 # ─── 寫回行內容 ──────────────────────────────────────────────────────────
-def format_uvb_line(original: UvbLineInfo, *, new_dose: int, new_count: int,
-                    today: date) -> str:
+def format_uvb_line(original: UvbLineInfo, *, new_dose: int,
+                    new_count: Optional[int], today: date) -> str:
     """產生新的 UVB 行內容，shape 維持跟 original 一樣。
 
     替換 dose / count / date 三個值，其餘 (mj/cm2 / on / increase X / MAX:Y /
     W2 / W5M 等後綴) 全部保留。
+
+    [v20.7] new_count=None → 不替換 count (處置原本就沒寫 (N))。
     """
     # 從 original.full_match 抓出原本的 3 個欄位字串位置 → 用 str.replace 替換
     # 不用 regex 替換是因為要保持其他空白格式
@@ -233,21 +243,18 @@ def format_uvb_line(original: UvbLineInfo, *, new_dose: int, new_count: int,
         flags=re.IGNORECASE,
     )
 
-    # 2. 替換 count: (N) → (N+1)
-    src = re.sub(
-        r"\(\s*" + str(original.count) + r"\s*\)",
-        f"({new_count})",
-        src,
-        count=1,
-    )
+    # 2. 替換 count: (N) → (N+1) — 僅當原本有 count 且傳入 new_count
+    if original.count is not None and new_count is not None:
+        src = re.sub(
+            r"\(\s*" + str(original.count) + r"\s*\)",
+            f"({new_count})",
+            src,
+            count=1,
+        )
 
     # 3. 替換日期 — 用零填充格式 YYYY/MM/DD
     today_str = f"{today.year}/{today.month:02d}/{today.day:02d}"
     # 原日期可能 (2026/5/26) 或 (2026/05/26)，都改成 zero-padded
-    old_date_re = (rf"\(\s*{original.last_date.year}/"
-                   rf"{original.last_date.month:01d}\D?{original.last_date.month:02d}*/"
-                   rf"{original.last_date.day:01d}\D?{original.last_date.day:02d}*\s*\)")
-    # 簡化版：直接 match (YYYY/m/d) 或 (YYYY/mm/dd) 都接受
     simple_re = (rf"\(\s*{original.last_date.year}"
                  rf"/0?{original.last_date.month}"
                  rf"/0?{original.last_date.day}\s*\)")
@@ -315,7 +322,9 @@ def update_uvb_in_text(text: str, today: Optional[date] = None) -> UvbUpdateResu
                           f"[{MIN_DOSE}-{MAX_DOSE}]"),
             parsed=parsed, uvb_line_count=uvb_lines,
         )
-    if parsed.count <= 0 or parsed.count > MAX_COUNT:
+    # count sanity (count 可能 None — 處置沒寫，跳過 sanity)
+    if parsed.count is not None and (
+            parsed.count <= 0 or parsed.count > MAX_COUNT):
         return UvbUpdateResult(
             action=UvbAction.SANITY_FAIL,
             sanity_reason=f"次數 ({parsed.count}) 異常 [1-{MAX_COUNT}]",
@@ -370,7 +379,10 @@ def update_uvb_in_text(text: str, today: Optional[date] = None) -> UvbUpdateResu
             parsed=parsed, days_diff=days_diff, uvb_line_count=uvb_lines,
         )
 
-    new_count = parsed.count + 1
+    # [v20.7] count optional — 處置沒寫 (N) 就不更新 count，dose/date 仍更新
+    new_count: Optional[int] = None
+    if parsed.count is not None:
+        new_count = parsed.count + 1
     new_line = format_uvb_line(parsed, new_dose=new_dose, new_count=new_count,
                                today=today)
     new_text = text[:parsed.span[0]] + new_line + text[parsed.span[1]:]
@@ -384,7 +396,11 @@ def update_uvb_in_text(text: str, today: Optional[date] = None) -> UvbUpdateResu
             sanity_reason="寫回後重新 parse 失敗 (格式可能損毀)",
             parsed=parsed, days_diff=days_diff, uvb_line_count=uvb_lines,
         )
-    if verify.dose != new_dose or verify.count != new_count or verify.last_date != today:
+    # dose / date 一定要對；count 若有更新也要對 (none → none, 有 → 數字符)
+    dose_ok = verify.dose == new_dose
+    date_ok = verify.last_date == today
+    count_ok = verify.count == new_count  # 若兩邊都 None 也算 ok
+    if not (dose_ok and date_ok and count_ok):
         return UvbUpdateResult(
             action=UvbAction.SANITY_FAIL,
             sanity_reason=(f"寫回後 round-trip verify 失敗: "

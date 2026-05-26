@@ -1896,11 +1896,18 @@ def _f23_update_uvb_dose(label: str = "F2") -> bool:
         logging.info("[%s][UVB] 處置含 %d 行 UVB (只改第一行)",
                      label, result.uvb_line_count)
 
-    logging.info(
-        "[%s][UVB] 劑量 %d→%d, 次數 %d→%d, 日期 %s→今天 (差 %d 天)",
-        label, result.parsed.dose, result.new_dose,
-        result.parsed.count, result.new_count,
-        result.last_date.strftime("%m/%d"), result.days_diff)
+    # [v20.7] count 可能 None (處置沒寫)，log 適配
+    if result.new_count is None:
+        logging.info(
+            "[%s][UVB] 劑量 %d→%d, 次數 (處置沒寫 N 跳過), 日期 %s→今天 (差 %d 天)",
+            label, result.parsed.dose, result.new_dose,
+            result.last_date.strftime("%m/%d"), result.days_diff)
+    else:
+        logging.info(
+            "[%s][UVB] 劑量 %d→%d, 次數 %d→%d, 日期 %s→今天 (差 %d 天)",
+            label, result.parsed.dose, result.new_dose,
+            result.parsed.count, result.new_count,
+            result.last_date.strftime("%m/%d"), result.days_diff)
     return True
 
 
