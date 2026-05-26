@@ -352,6 +352,67 @@ def test_update_count_increments_correctly():
         assert r.new_count == new_count
 
 
+def test_sanity_fail_dose_too_low():
+    """[v20.5] 原劑量 < MIN_DOSE (50) → SANITY_FAIL"""
+    text = "UVB 30 (5) on (2026/05/20), increase 30, MAX:800"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.SANITY_FAIL
+    assert "30" in r.sanity_reason
+    assert "範圍" in r.sanity_reason
+
+
+def test_sanity_fail_dose_too_high():
+    """原劑量 > MAX_DOSE (1500) → SANITY_FAIL"""
+    text = "UVB 2000 (5) on (2026/05/20), increase 30, MAX:2500"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.SANITY_FAIL
+
+
+def test_sanity_fail_count_too_high():
+    """次數 > MAX_COUNT (999) → SANITY_FAIL"""
+    text = "UVB 500 (1500) on (2026/05/20), increase 30, MAX:800"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.SANITY_FAIL
+    assert "1500" in r.sanity_reason or "次數" in r.sanity_reason
+
+
+def test_sanity_fail_date_in_future():
+    """last_date 在未來 → SANITY_FAIL"""
+    text = "UVB 500 (5) on (2027/01/01), increase 30, MAX:800"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.SANITY_FAIL
+    assert "未來" in r.sanity_reason
+
+
+def test_sanity_fail_gap_over_2_years():
+    """距上次 > 730 天 → SANITY_FAIL"""
+    text = "UVB 500 (5) on (2020/01/01), increase 30, MAX:800"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.SANITY_FAIL
+    assert "730" in r.sanity_reason or "2 年" in r.sanity_reason or "異常" in r.sanity_reason
+
+
+def test_sanity_fail_increase_too_high():
+    """increase > 200 → SANITY_FAIL"""
+    text = "UVB 500 (5) on (2026/05/20), increase 500, MAX:800"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.SANITY_FAIL
+    assert "500" in r.sanity_reason or "increase" in r.sanity_reason
+
+
+def test_uvb_line_count_reported():
+    """UPDATED 結果含 uvb_line_count，用於提示多行 UVB。"""
+    text_one = "UVB 520 (11) on (2026/05/20), increase 30, MAX:800"
+    text_two = (
+        "UVB 580 (12) on (2026/05/20), increase 30, MAX:800\n"
+        "UVB 520 (11) on (2026/05/13), increase 30, MAX:800"
+    )
+    r1 = update_uvb_in_text(text_one, today=date(2026, 5, 26))
+    assert r1.uvb_line_count == 1
+    r2 = update_uvb_in_text(text_two, today=date(2026, 5, 26))
+    assert r2.uvb_line_count == 2
+
+
 def test_update_preserves_extra_text_after_uvb_line():
     """UVB 行後面還有文字（W2 / W5M / 其他歷史）要保留。"""
     text = (

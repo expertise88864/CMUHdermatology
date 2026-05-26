@@ -1725,74 +1725,19 @@ def _write_tmemo_text(hwnd: int, new_text: str) -> bool:
         return False
 
 
-def _f23_update_uvb_dose(label: str = "F2") -> bool:
-    """[v20 2026-05-26] F2/F3 UVB 自動劑量更新。
-
-    回 True → 繼續走原 51019+療程 邏輯
-    回 False → 跳警告終止 (距上次照光太近 < 2 天)
-
-    流程：
-      1. 找處置 TMemo (heuristic: class=TMemo 且 text 含 'UVB')
-      2. WM_GETTEXT 讀全文 → cmuh_common.uvb_dose.update_uvb_in_text() 算
-      3. UPDATED → WM_SETTEXT 寫回，繼續 51019
-      4. TOO_CLOSE → 彈警告 MessageBox + return False (整個 F2/F3 終止)
-      5. NO_UVB_LINE / PARSE_FAIL → log + 繼續 51019 (fallback 給醫師手動處理)
+def _show_uvb_warning(main_hwnd: int, title: str, msg: str) -> None:
+    """[v20.5 2026-05-26] 統一的 UVB 警告 MessageBox — 三管齊下強制曝光:
+      1. owner = 醫院程式 main_hwnd → modal 到醫院程式之上
+      2. flags: MB_ICONWARNING + MB_TOPMOST + MB_SETFOREGROUND
+      3. winsound beep + FlashWindowEx 醫院視窗 5 次
     """
-    main_hwnd = _find_hospital_main_window()
-    if not main_hwnd:
-        logging.info("[%s][UVB] 找不到主程式視窗 → fallback 走 51019", label)
-        return True
-
-    # 找處置 TMemo — 用「文字含 UVB」當定位 (徵候/病史欄不會有 UVB)
-    # [v20.1] 改用寬鬆 class 比對 (TMemo / TMemoExt / TDBMemo / TRichEdit ...)
-    memo_hwnd = _find_disposition_memo(main_hwnd, keyword="UVB")
-    if not memo_hwnd:
-        logging.info("[%s][UVB] 處置內無 UVB 行 (見上方 [UVB][find] candidates) "
-                     "→ fallback 走 51019", label)
-        return True
-
-    text = _read_tmemo_text(memo_hwnd)
-    if not text:
-        logging.warning("[%s][UVB] TMemo hwnd=%s 讀文字為空 → fallback",
-                        label, memo_hwnd)
-        return True
-
     try:
-        from cmuh_common.uvb_dose import update_uvb_in_text, UvbAction
+        import winsound
+        winsound.MessageBeep(0x30)  # MB_ICONWARNING beep
     except Exception:
-        logging.exception("[%s][UVB] import cmuh_common.uvb_dose 失敗", label)
-        return True
-
-    result = update_uvb_in_text(text)
-
-    if result.action == UvbAction.NO_UVB_LINE:
-        logging.info("[%s][UVB] update_uvb_in_text 回 NO_UVB_LINE (異常)", label)
-        return True
-
-    if result.action == UvbAction.PARSE_FAIL:
-        logging.warning(
-            "[%s][UVB] 處置有 UVB 但 parse 失敗 → fallback 走 51019 "
-            "(請醫師手動更新劑量)", label)
-        return True
-
-    if result.action == UvbAction.TOO_CLOSE:
-        last_str = result.last_date.strftime("%Y/%m/%d")
-        msg = (f"病人 {last_str} 已照光 (距今僅 {result.days_diff} 天)\n\n"
-               f"間隔不足 ≥ 2 天 — 已停止 {label} 自動處理。\n"
-               f"若仍要照光，請醫師確認後手動處理。")
-        # [v20.3 2026-05-26] MessageBox 強制曝光 — user 反映原本被縮到下面看不到。
-        # 多管齊下：
-        #   1. owner = 醫院程式 main hwnd → MB 強制 modal 到醫院程式之上
-        #   2. MB_ICONWARNING (0x30) + MB_TOPMOST (0x40000) + MB_SETFOREGROUND (0x10000)
-        #   3. MessageBeep 蜂鳴聲 — user 不看畫面也能聽到
-        #   4. FlashWindowEx 醫院程式 taskbar 圖示閃爍
+        pass
+    if main_hwnd:
         try:
-            import winsound
-            winsound.MessageBeep(0x30)  # MB_ICONWARNING beep
-        except Exception:
-            pass
-        try:
-            # Flash 醫院程式視窗 — 即使 MB 被遮住，taskbar 也會閃
             class FLASHWINFO(ctypes.Structure):
                 _fields_ = [
                     ("cbSize", ctypes.c_uint),
@@ -1811,23 +1756,145 @@ def _f23_update_uvb_dose(label: str = "F2") -> bool:
             ctypes.windll.user32.FlashWindowEx(ctypes.byref(fi))
         except Exception:
             logging.debug("FlashWindowEx 例外", exc_info=True)
-        try:
-            # owner=main_hwnd 強制 modal 到醫院程式上方
-            # MB_ICONWARNING(0x30) | MB_TOPMOST(0x40000) | MB_SETFOREGROUND(0x10000)
-            flags = 0x30 | 0x40000 | 0x10000
-            ctypes.windll.user32.MessageBoxW(
-                main_hwnd, msg, "UVB 照光間隔太短", flags)
-        except Exception:
-            logging.debug("MessageBox 例外", exc_info=True)
-        logging.warning("[%s][UVB] 距上次 %s 僅 %d 天 → 終止 F2/F3",
+    try:
+        # MB_ICONWARNING(0x30) | MB_TOPMOST(0x40000) | MB_SETFOREGROUND(0x10000)
+        flags = 0x30 | 0x40000 | 0x10000
+        ctypes.windll.user32.MessageBoxW(main_hwnd, msg, title, flags)
+    except Exception:
+        logging.debug("MessageBox 例外", exc_info=True)
+
+
+def _f23_update_uvb_dose(label: str = "F2") -> bool:
+    """[v20.5 2026-05-26] F2/F3 UVB 自動劑量更新 — strict mode。
+
+    「確保資訊正確，不確定就停下來」— 任何 uncertain case 都警告 + 終止
+    (不再 fallback 跑 51019)。只有 UPDATED 才繼續走 51019+療程。
+
+    回 True → 繼續走 51019+療程 (僅 UPDATED 才回)
+    回 False → 警告 + 終止 F2/F3
+
+    Stop conditions (各自跳警告):
+      - 找不到主視窗 / 處置 TMemo / TMemo 文字
+      - NO_UVB_LINE: F2/F3 沒看到 UVB → 異常
+      - PARSE_FAIL: UVB 行格式不認得
+      - TOO_CLOSE: 0-1 天間隔
+      - SANITY_FAIL: 劑量/次數/日期超出合理範圍 / 寫回 round-trip 失敗
+      - WM_SETTEXT 寫回失敗
+      - 寫回後實機 read 結果跟預期不一致
+    """
+    main_hwnd = _find_hospital_main_window()
+    if not main_hwnd:
+        logging.warning("[%s][UVB] 找不到主程式視窗 → 終止", label)
+        _show_uvb_warning(
+            0, "UVB 自動更新失敗",
+            f"找不到西醫門診主視窗\n\n{label} 已停止，請檢查主程式狀態。")
+        return False
+
+    memo_hwnd = _find_disposition_memo(main_hwnd, keyword="UVB")
+    if not memo_hwnd:
+        logging.warning("[%s][UVB] 處置內無 UVB 行 (見 [UVB][find] candidates) "
+                        "→ 終止", label)
+        _show_uvb_warning(
+            main_hwnd, "UVB 自動更新失敗",
+            f"處置欄找不到含 UVB 的內容\n\n"
+            f"{label} 已停止 — 請確認:\n"
+            f"  • 病人是否真的有照光療程?\n"
+            f"  • 處置欄是否需要先填 UVB 行 (用 DITTO/醫師上次帶入)?\n\n"
+            f"確認後請手動處理。")
+        return False
+
+    text = _read_tmemo_text(memo_hwnd)
+    if not text:
+        logging.warning("[%s][UVB] TMemo hwnd=%s 讀文字為空 → 終止",
+                        label, memo_hwnd)
+        _show_uvb_warning(
+            main_hwnd, "UVB 自動更新失敗",
+            f"處置 TMemo 讀取為空\n\n{label} 已停止。")
+        return False
+
+    try:
+        from cmuh_common.uvb_dose import update_uvb_in_text, UvbAction
+    except Exception:
+        logging.exception("[%s][UVB] import cmuh_common.uvb_dose 失敗", label)
+        _show_uvb_warning(
+            main_hwnd, "UVB 自動更新失敗",
+            f"UVB 邏輯模組載入失敗\n\n{label} 已停止，請聯絡開發者。")
+        return False
+
+    result = update_uvb_in_text(text)
+
+    if result.action == UvbAction.NO_UVB_LINE:
+        logging.warning("[%s][UVB] NO_UVB_LINE → 終止", label)
+        _show_uvb_warning(
+            main_hwnd, "UVB 自動更新失敗",
+            f"處置內找不到可解析的 UVB 行\n\n{label} 已停止。")
+        return False
+
+    if result.action == UvbAction.PARSE_FAIL:
+        logging.warning(
+            "[%s][UVB] 處置有 UVB 但 parse 失敗 → 終止 "
+            "(處置前 200 字: %r)", label, text[:200])
+        _show_uvb_warning(
+            main_hwnd, "UVB parse 失敗",
+            f"處置含 UVB 字串但無法解析格式\n\n"
+            f"預期: UVB 劑量mj/cm2 (次數) on (日期), increase N, MAX:N\n\n"
+            f"{label} 已停止，請醫師確認處置欄 UVB 行格式後手動處理。")
+        return False
+
+    if result.action == UvbAction.SANITY_FAIL:
+        logging.warning("[%s][UVB] sanity check 失敗: %s → 終止",
+                        label, result.sanity_reason)
+        _show_uvb_warning(
+            main_hwnd, "UVB 數值異常",
+            f"處置 UVB 行的數值看起來不對:\n\n"
+            f"{result.sanity_reason}\n\n"
+            f"{label} 已停止，請醫師確認後手動處理。")
+        return False
+
+    if result.action == UvbAction.TOO_CLOSE:
+        last_str = result.last_date.strftime("%Y/%m/%d")
+        logging.warning("[%s][UVB] 距上次 %s 僅 %d 天 → 終止",
                         label, last_str, result.days_diff)
+        _show_uvb_warning(
+            main_hwnd, "UVB 照光間隔太短",
+            f"病人 {last_str} 已照光 (距今僅 {result.days_diff} 天)\n\n"
+            f"間隔不足 ≥ 2 天 — 已停止 {label} 自動處理。\n"
+            f"若仍要照光，請醫師確認後手動處理。")
         return False
 
     # UPDATED: 寫回 TMemo
     if not _write_tmemo_text(memo_hwnd, result.new_text):
-        logging.warning(
-            "[%s][UVB] WM_SETTEXT 寫回處置失敗 → fallback 走 51019", label)
-        return True
+        logging.warning("[%s][UVB] WM_SETTEXT 寫回處置失敗 → 終止", label)
+        _show_uvb_warning(
+            main_hwnd, "UVB 寫回失敗",
+            f"寫回處置欄失敗 (WM_SETTEXT)\n\n"
+            f"{label} 已停止 — 處置欄未更新，請醫師確認後手動處理。")
+        return False
+
+    # 寫回後實機 read 驗證 — Delphi onChange 可能 reformat 過
+    actual_text = _read_tmemo_text(memo_hwnd)
+    if actual_text:
+        from cmuh_common.uvb_dose import parse_uvb_line
+        verify = parse_uvb_line(actual_text)
+        if (verify is None
+                or verify.dose != result.new_dose
+                or verify.count != result.new_count):
+            logging.warning(
+                "[%s][UVB] 寫回後實機 verify 失敗 — 預期 dose=%s count=%s, "
+                "實際=%r → 終止", label, result.new_dose, result.new_count,
+                verify)
+            _show_uvb_warning(
+                main_hwnd, "UVB 寫回驗證失敗",
+                f"寫回處置欄後驗證不通過\n\n"
+                f"預期: dose={result.new_dose} count={result.new_count}\n"
+                f"實際讀回: dose={getattr(verify, 'dose', '?')} "
+                f"count={getattr(verify, 'count', '?')}\n\n"
+                f"{label} 已停止，請醫師手動確認處置內容。")
+            return False
+
+    if result.uvb_line_count >= 2:
+        logging.info("[%s][UVB] 處置含 %d 行 UVB (只改第一行)",
+                     label, result.uvb_line_count)
 
     logging.info(
         "[%s][UVB] 劑量 %d→%d, 次數 %d→%d, 日期 %s→今天 (差 %d 天)",
