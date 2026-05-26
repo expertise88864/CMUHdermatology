@@ -92,10 +92,15 @@ class UvbLineInfo:
     full_match: str       # 完整原始行內容 (含 line ending 之前的文字)
     dose: int             # 原劑量
     count: Optional[int]  # 原 (N) 次數，None=處置沒寫
-    last_date: date       # 原日期
+    last_date: date       # 原日期 (一律存 AD 格式，民國年已轉換)
     increase: int         # increase 後的數字
     max_dose: int         # MAX 後的數字
     span: tuple[int, int] # 在 source text 中的 (start, end) char offset
+    # [v20.15] 原始 date 字串 (e.g. "(115/05/24)" / "(1150524)" / "2026/5/24")
+    # — format_uvb_line 寫回時用同樣 format 取代
+    date_text: str = ""
+    # [v20.15] keyword 文字 ("UVB" 或 "Phototherapy") — format_uvb_line 用
+    keyword_text: str = "UVB"
 
 
 # [v20.6 2026-05-26] 從「整段 regex」改成「獨立 field 解析」
@@ -109,14 +114,24 @@ class UvbLineInfo:
 #   2. 在 segment 內**各別**找 dose / date / count / increase
 #   3. 各 field 順序不限，缺任一 field → parse_fail
 
-_UVB_DOSE_RE = re.compile(r"UVB\s*[:：]?\s*(\d+)", re.IGNORECASE)
+# [v20.15 2026-05-26] 也接受 "Phototherapy" 當 keyword (劉香君實機 case)
+_UVB_DOSE_RE = re.compile(
+    r"(UVB|Phototherapy)\s*[:：]?\s*(\d+)", re.IGNORECASE)
 # [v20.11] 接受帶 paren 跟不帶 paren 兩種:
 #   (2026/05/24) — group 1-3
 #    2026/05/24  — group 4-6
+# [v20.15] 新增民國年支援:
+#   (115/05/24)   — group 7-9   (ROC 3-digit year + slash/dash)
+#   (1150524)     — group 10-12 (ROC 7-digit concatenated YYYMMDD)
+# year 100-150 視為民國年 (對應 AD 2011-2061)
 _UVB_DATE_RE = re.compile(
-    r"[\(（]\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s*[\)）]"
+    r"[\(（]\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s*[\)）]"     # AD paren
     r"|"
-    r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b"
+    r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b"                    # AD bare
+    r"|"
+    r"[\(（]\s*(\d{3})[-/](\d{1,2})[-/](\d{1,2})\s*[\)）]"     # ROC paren slash
+    r"|"
+    r"[\(（]\s*(\d{3})(\d{2})(\d{2})\s*[\)）]"                  # ROC concat
 )
 # count: \(\s*\d+\s*\) — 任何 paren 內純數字。
 # 為了不抓到日期 (年是 4 位)，caller 會先 mask date span 再 search。
@@ -129,10 +144,13 @@ _UVB_INCREASE_RE = re.compile(
     r"\s*[:：]?\s*(\d+)",
     re.IGNORECASE)
 # [v20.8] MAX 接受多種同義表達:
-#   MAX:N / MAX N / MAX at N / fix N / fixed at N / fixed to N / 固定 N
+#   MAX:N / MAX N / MAX at N / MAX dose: N / fix N / fixed at N / fixed to N / 固定 N
 # \bfix(?:ed)? 確保 word boundary 避免抓到 "prefix"/"fixing" 等
+# [v20.15] 新增 "MAX dose" 寫法 (鄧仲強實機 case: "MAX dose: 1200mj/cm2")
 _UVB_MAX_RE = re.compile(
-    r"(?:MAX(?:\s+(?:at|to))?\s*[:：]?\s*|\bfix(?:ed)?(?:\s+(?:at|to))?\s*[:：]?\s*|固定(?:在|為)?\s*[:：]?\s*)(\d+)",
+    r"(?:MAX(?:\s+dose)?(?:\s+(?:at|to))?\s*[:：]?\s*"
+    r"|\bfix(?:ed)?(?:\s+(?:at|to))?\s*[:：]?\s*"
+    r"|固定(?:在|為)?\s*[:：]?\s*)(\d+)",
     re.IGNORECASE,
 )
 
@@ -161,60 +179,100 @@ def _date_text(dt: date, sep: str = "/") -> str:
     return f"{dt.year}{sep}{dt.month:02d}{sep}{dt.day:02d}"
 
 
+def _resolve_date_match(date_m) -> Optional[tuple]:
+    """[v20.15] _UVB_DATE_RE 有 4 個 alternative，回 (year_ad, month, day) 或 None。
+
+    Group layout:
+        1-3:  AD paren  (\\d{4}/\\d{1,2}/\\d{1,2})
+        4-6:  AD bare    \\d{4}/\\d{1,2}/\\d{1,2}
+        7-9:  ROC paren slash  (\\d{3}/\\d{1,2}/\\d{1,2})    民國年 + 1911
+        10-12: ROC concat       (\\d{3}\\d{2}\\d{2})         民國年 + 1911
+    """
+    g = date_m.groups()
+    # AD slashed (paren or bare)
+    if g[0]:    # AD paren
+        y, m, d = int(g[0]), int(g[1]), int(g[2])
+    elif g[3]:  # AD bare
+        y, m, d = int(g[3]), int(g[4]), int(g[5])
+    elif g[6]:  # ROC paren slash (3-digit)
+        roc_y = int(g[6])
+        if not (60 <= roc_y <= 200):  # 民國 60-200 = AD 1971-2111
+            return None
+        y, m, d = roc_y + 1911, int(g[7]), int(g[8])
+    elif g[9]:  # ROC concat 7-digit
+        roc_y = int(g[9])
+        if not (60 <= roc_y <= 200):
+            return None
+        y, m, d = roc_y + 1911, int(g[10]), int(g[11])
+    else:
+        return None
+    return y, m, d
+
+
 def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
     """從 text 中找第一個 UVB 行，回 UvbLineInfo 或 None。
 
     [v20.6] 獨立 field 解析 — 順序不限、容忍中文夾雜、increase/add 等同義。
 
     解析步驟：
-      1. UVB 起點: `UVB\\s*:?\\s*(\\d+)` 找到 dose
-      2. MAX 終點: `MAX\\s*:?\\s*(\\d+)` 找到 max_dose (UVB 後第一個 MAX)
-      3. segment = text[uvb_start:max_end]
+      1. UVB 起點 (或 Phototherapy): `(UVB|Phototherapy)\\s*:?\\s*(\\d+)`
+      2. MAX 終點 (or fixed/固定): UVB 之後第一個 MAX/fix 找到 max_dose
+      3. segment = text[line_start:max_end]   ← [v20.15] 擴到行首吸收日期可能
+         在 UVB 前的 case (e.g. "(2026/05/24) UVB 850 ...")
       4. 在 segment 內各別找:
-         - date: `\\(\\s*\\d{4}/\\d{1,2}/\\d{1,2}\\s*\\)`
-         - count: 不重疊 date 的 `\\(\\s*\\d{1,3}\\s*\\)`
-         - increase: `(increase[d]?|add)\\s*\\d+`
+         - date: AD or 民國年 (paren / slashed / concat)
+         - count: 不重疊 date 的 `[\\(（]\\s*\\d+\\s*[\\)）]`
+         - increase: `(increase[d]?|add|每次加|增加|加)\\s*\\d+`
       5. 任一 field 缺 → 回 None (parse_fail)
+
+    [v20.15] 新增:
+      - keyword 接受 "Phototherapy" (劉香君實機 case)
+      - 民國年 date format (115/05/24, 1150524 — 詹晟凱/陳文海實機 case)
+      - segment 擴到行首吸收 date 在 UVB 前的 case (楊亮筠實機 case)
+      - "MAX dose: N" 寫法 (鄧仲強實機 case)
     """
-    if "uvb" not in text.lower():
+    lower = text.lower()
+    if "uvb" not in lower and "phototherapy" not in lower:
         return None
 
-    # 1. UVB dose
+    # 1. UVB / Phototherapy dose
     dose_m = _UVB_DOSE_RE.search(text)
     if not dose_m:
         return None
     try:
-        dose = int(dose_m.group(1))
+        dose = int(dose_m.group(2))
     except ValueError:
         return None
-    start = dose_m.start()
+    keyword_text = dose_m.group(1)  # "UVB" or "Phototherapy"
+    dose_start = dose_m.start()
 
     # 2. MAX (從 UVB 之後找)
-    max_m = _UVB_MAX_RE.search(text, start)
+    max_m = _UVB_MAX_RE.search(text, dose_start)
     if not max_m:
         return None
     try:
         max_dose = int(max_m.group(1))
     except ValueError:
         return None
-    end = max_m.end()
-    segment = text[start:end]
-    # 相對 segment 的 span
-    rel_start = 0
-    rel_end = end - start
+    max_end = max_m.end()
 
-    # 3. Date (segment 內第一個 YYYY/MM/DD，paren 可省)
+    # [v20.15] segment 擴到 line_start (UVB 所在行的開頭) — 日期可能寫在
+    # UVB 之前 (e.g. "(2026/05/24) UVB 850 ...")
+    line_start = text.rfind("\n", 0, dose_start) + 1  # 0 if not found
+    segment = text[line_start:max_end]
+
+    # 3. Date (segment 內第一個 YYYY/MM/DD or 民國 YYY/MM/DD or YYYMMDD)
     date_m = _UVB_DATE_RE.search(segment)
     if not date_m:
         return None
-    # [v20.11] regex 有兩組: 1-3 (帶 paren) / 4-6 (不帶 paren)
-    y = date_m.group(1) or date_m.group(4)
-    m = date_m.group(2) or date_m.group(5)
-    d = date_m.group(3) or date_m.group(6)
+    ymd = _resolve_date_match(date_m)
+    if ymd is None:
+        return None
     try:
-        last_date = date(int(y), int(m), int(d))
+        last_date = date(*ymd)
     except (ValueError, TypeError):
         return None
+    date_text = date_m.group(0)
 
     # 4. Count (segment 內第一個數字 paren，排除 date 範圍)
     # [v20.7] count 變 Optional — 沒 (N) 處置仍可更新 dose/date
@@ -247,7 +305,9 @@ def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
         last_date=last_date,
         increase=increase,
         max_dose=max_dose,
-        span=(start, end),
+        span=(line_start, max_end),
+        date_text=date_text,
+        keyword_text=keyword_text,
     )
 
 
@@ -280,6 +340,46 @@ def compute_new_dose(*, dose: int, increase: int, max_dose: int,
 
 
 # ─── 寫回行內容 ──────────────────────────────────────────────────────────
+def _today_in_format(today: date, sample_text: str) -> str:
+    """[v20.15] 把 today 格式化成跟 sample_text 一樣的 format。
+
+    sample_text 是 _UVB_DATE_RE 的原 match (e.g. "(115/05/24)" / "(1150524)" /
+    "(2026/05/24)" / "2026/5/24")。
+
+    支援格式:
+      - AD slashed: 2026/5/24 → 2026/05/26
+      - AD paren: (2026/5/24) → (2026/05/26)
+      - ROC slashed: (115/05/24) → (115/05/26)
+      - ROC concat 7-digit: (1150524) → (1150526)
+      - 全形 paren: （115/05/24）→（115/05/26）
+    """
+    stripped = sample_text.strip()
+    has_paren_full = stripped.startswith("（")
+    has_paren_half = stripped.startswith("(")
+    inner = stripped.strip("()（）").strip()
+    sep = "-" if "-" in inner else "/"
+
+    if "-" not in inner and "/" not in inner:
+        # ROC concat 7-digit YYYMMDD
+        roc_y = today.year - 1911
+        body = f"{roc_y:03d}{today.month:02d}{today.day:02d}"
+    else:
+        year_part = inner.split(sep)[0]
+        if len(year_part) == 3:
+            # ROC slashed (3-digit year)
+            roc_y = today.year - 1911
+            body = f"{roc_y:03d}{sep}{today.month:02d}{sep}{today.day:02d}"
+        else:
+            # AD slashed (4-digit year)
+            body = f"{today.year}{sep}{today.month:02d}{sep}{today.day:02d}"
+
+    if has_paren_full:
+        return f"（{body}）"
+    if has_paren_half:
+        return f"({body})"
+    return body
+
+
 def format_uvb_line(original: UvbLineInfo, *, new_dose: int,
                     new_count: Optional[int], today: date) -> str:
     """產生新的 UVB 行內容，shape 維持跟 original 一樣。
@@ -288,6 +388,8 @@ def format_uvb_line(original: UvbLineInfo, *, new_dose: int,
     W2 / W5M 等後綴) 全部保留。
 
     [v20.7] new_count=None → 不替換 count (處置原本就沒寫 (N))。
+    [v20.15] 支援 Phototherapy keyword + ROC 民國日期格式 (slashed/concat)
+    + date 可能在 UVB 之前 (full_match 已擴到 line_start)。
     """
     # 從 original.full_match 抓出原本的 3 個欄位字串位置 → 用 str.replace 替換
     # 不用 regex 替換是因為要保持其他空白格式
@@ -297,7 +399,8 @@ def format_uvb_line(original: UvbLineInfo, *, new_dose: int,
     #    使用 regex 因為要對齊「UVB 520」這個 pattern，不能誤改 "(11)" 的 11
     #    [v20.2] 允許「UVB:」冒號 — 跟 parse regex 一致
     src = re.sub(
-        r"(UVB\s*[:：]?\s*)" + str(original.dose) + r"(\s*(?:mj/cm2)?)",
+        r"((?:UVB|Phototherapy)\s*[:：]?\s*)" + str(original.dose)
+        + r"(\s*(?:mj/cm2)?)",
         lambda mo: f"{mo.group(1)}{new_dose}{mo.group(2)}",
         src,
         count=1,
@@ -313,26 +416,37 @@ def format_uvb_line(original: UvbLineInfo, *, new_dose: int,
             count=1,
         )
 
-    # 3. 替換日期 — 用零填充格式 YYYY/MM/DD
-    # [v20.11] 原日期可能帶或不帶 paren — 偵測原本格式 → 同樣格式寫回
+    # 3. 替換日期 — [v20.15] 用 original.date_text 找原樣字串，對應同 format
+    # 寫回 (支援 AD slashed / ROC slashed / ROC concat 三種格式)
+    if original.date_text:
+        new_date_text = _today_in_format(today, original.date_text)
+        idx = src.find(original.date_text)
+        if idx >= 0:
+            src = (src[:idx] + new_date_text
+                   + src[idx + len(original.date_text):])
+        else:
+            src = src.replace(original.date_text, new_date_text, 1)
+        return src
+
+    # Fallback (老舊 caller 沒填 date_text) — 用零填充 AD format
     old_y = original.last_date.year
     old_m = original.last_date.month
     old_d = original.last_date.day
     with_paren_re = (
-        rf"([\(\uFF08]\s*){old_y}([/-])0?{old_m}([/-])0?{old_d}"
-        rf"(\s*[\)\uFF09])"
+        rf"([\(（]\s*){old_y}([/-])0?{old_m}([/-])0?{old_d}"
+        rf"(\s*[\)）])"
     )
     if re.search(with_paren_re, src):
-        # 帶 paren: (2026/5/24) → (2026/05/26)，保留半形/全形括號
         src = re.sub(
             with_paren_re,
-            lambda mo: f"{mo.group(1)}{_date_text(today, mo.group(2))}{mo.group(4)}",
+            lambda mo: (f"{mo.group(1)}"
+                        f"{_date_text(today, mo.group(2))}"
+                        f"{mo.group(4)}"),
             src,
             count=1,
         )
     else:
-        # 不帶 paren: 2026/5/24 → 2026/05/26 (注意 word boundary 避免誤改其他數字)
-        bare_re = rf"\b{old_y}([/-])0?{old_m}([/-])0?{old_d}\b"
+        bare_re = rf"{old_y}([/-])0?{old_m}([/-])0?{old_d}"
         src = re.sub(
             bare_re,
             lambda mo: _date_text(today, mo.group(1)),
@@ -581,6 +695,11 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         max_dose=parsed.max_dose, days_diff=days_diff,
     )
     assert new_dose is not None  # days_diff >= 2 已過 too-close 檢查
+
+    # [v20.15] 處置含 "maintain" 字眼 → 醫師意圖維持原劑量，覆蓋 compute 結果
+    # 只動 count + date，dose 保持 parsed.dose 不增不減
+    if re.search(r"maintain", parsed.full_match, re.IGNORECASE):
+        new_dose = parsed.dose
 
     # 新 dose sanity 再檢一次 (理論上 compute_new_dose 不會吐出怪值，這層保險)
     if new_dose < MIN_DOSE:

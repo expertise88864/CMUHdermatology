@@ -1348,3 +1348,136 @@ def test_max_gap_days_still_sanity_fail_over_2_years():
     r = update_uvb_in_text(text, today=date(2026, 5, 26))
     assert r.action == UvbAction.SANITY_FAIL
     assert ">730" in (r.sanity_reason or "") or "730" in (r.sanity_reason or "")
+
+
+# ─── v20.15 5 張 screenshot 的 parse 擴充 ──────────────────────────────
+
+def test_image1_liu_phototherapy_keyword():
+    """[v20.15] image 1 (劉香君): 用 Phototherapy 而非 UVB 當 keyword，
+    沒有 (count)，含 'maintain the dose' → 應 update dose/date 但保留 dose。
+    """
+    text = ("new Phototherapy 550mj/cm2 on (2026/5/24) , add 50 each time, "
+            "maintain the dose, Max:1000")
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED, (
+        f"unexpected {r.action} reason={r.sanity_reason}")
+    # 'maintain the dose' → 維持原劑量 (不變 550)
+    assert r.new_dose == 550
+    # 沒 count → new_count None
+    assert r.new_count is None
+    # date 5/24 → 5/26
+    assert "(2026/05/26)" in r.new_text
+    # Phototherapy keyword 保留
+    assert "Phototherapy" in r.new_text
+
+
+def test_image2_deng_max_dose_phrase():
+    """[v20.15] image 2 (鄧仲強): MAX dose: 1200mj/cm2 (中間多了 'dose')，
+    也含 '已打7折' 中文 (但是在 (count) on (date) 後)，應該照樣 parse 通過。
+    """
+    text = ("new UVB: 1200 mj/cm2(156) on   (2026/05/24) 已打7折    , "
+            "increase 40mj/cm2 if no erythema, MAX dose: 1200mj/cm2, W2M, W6")
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1200  # 1200+40 cap 1200
+    assert r.new_count == 157
+    assert "(2026/05/26)" in r.new_text
+    assert "MAX dose:" in r.new_text  # 後綴保留
+
+
+def test_image3_zhan_roc_concat_date():
+    """[v20.15] image 3 (詹晟凱): (1150524) 民國年 7-digit concat YYYMMDD,
+    寫回也要用同樣 ROC concat format。"""
+    text = ("UVB: 250mj/cm2 (4) on (1150524), add 50 each time, "
+            "fixed at 1500,")
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 300  # 250+50
+    assert r.new_count == 5
+    # ROC 民國 115/05/26 concat = 1150526
+    assert "(1150526)" in r.new_text
+    # AD 不該出現
+    assert "2026/" not in r.new_text
+
+
+def test_image4_yang_date_before_uvb():
+    """[v20.15] image 4 (楊亮筠): date 在 UVB 之前 - "(2026/05/24) UVB 850..."
+    segment 必須擴到行首才能 parse 到 date。"""
+    text = "(2026/05/24) UVB 850 mj/cm2 increase 50 each time max 1200"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 900  # 850+50
+    assert r.new_count is None  # 沒 (count)
+    # date 5/24 → 5/26 在行首
+    assert r.new_text.startswith("(2026/05/26) UVB 900")
+
+
+def test_image5_chen_roc_slashed_date():
+    """[v20.15] image 5 (陳文海): (115/05/24) 民國年 slashed，寫回要保留
+    民國年格式 → (115/05/26)。"""
+    text = ("UVB: 660 mj/cm2 (14) on (115/05/24), , add 30 each time, "
+            "fixed at 1000")
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 690  # 660+30
+    assert r.new_count == 15
+    # ROC 民國 115/05/26 slashed
+    assert "(115/05/26)" in r.new_text
+    # AD 不該出現
+    assert "2026/" not in r.new_text
+
+
+def test_max_dose_phrase_alone():
+    """[v20.15] 純粹測 "MAX dose: N" 寫法 (與其他變體)。"""
+    text = "UVB: 800 (10) on (2026/05/24), add 50, MAX dose: 1000"
+    info = parse_uvb_line(text)
+    assert info is not None
+    assert info.max_dose == 1000
+
+
+def test_roc_year_115_converts_to_2026():
+    """[v20.15] 民國 115 = AD 2026 — slashed format。"""
+    text = "UVB: 800 (10) on (115/05/24), add 50, fixed at 1000"
+    info = parse_uvb_line(text)
+    assert info is not None
+    assert info.last_date == date(2026, 5, 24)
+    assert info.date_text == "(115/05/24)"
+
+
+def test_roc_year_7digit_concat():
+    """[v20.15] 民國 7-digit concat 1150524 = AD 2026/05/24。"""
+    text = "UVB: 800 (10) on (1150524), add 50, fixed at 1000"
+    info = parse_uvb_line(text)
+    assert info is not None
+    assert info.last_date == date(2026, 5, 24)
+    assert info.date_text == "(1150524)"
+
+
+def test_phototherapy_keyword_recognized():
+    """[v20.15] Phototherapy 也能當 keyword (劉香君實機 case)。"""
+    text = "Phototherapy 550 mj/cm2 on (2026/5/24), add 50, fixed at 1000"
+    info = parse_uvb_line(text)
+    assert info is not None
+    assert info.dose == 550
+    assert info.keyword_text.lower() == "phototherapy"
+
+
+def test_maintain_dose_keeps_original_dose():
+    """[v20.15] 處置含 'maintain the dose' → 維持原劑量不增 increase。"""
+    text = ("UVB: 800 mj/cm2 (10) on (2026/5/24), add 50, "
+            "maintain the dose, MAX:1500")
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    # 沒 maintain 應該 850 (800+50), 有 maintain 維持 800
+    assert r.new_dose == 800
+    assert r.new_count == 11
+
+
+def test_date_before_uvb_on_same_line():
+    """[v20.15] date 在 UVB 同行之前 (楊亮筠 case) — parse 仍要成功。"""
+    text = "(2026/05/24) UVB 500 mj/cm2 increase 30, max 800"
+    info = parse_uvb_line(text)
+    assert info is not None
+    assert info.dose == 500
+    assert info.last_date == date(2026, 5, 24)
+    assert info.max_dose == 800
