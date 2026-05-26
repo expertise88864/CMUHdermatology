@@ -6,7 +6,7 @@
 """
 from dataclasses import dataclass
 from datetime import date
-from queue import Queue
+from queue import Empty, Full, Queue
 from typing import Any, TypeAlias, Union
 
 
@@ -92,14 +92,22 @@ def put_ui_message(ui_queue: "Queue[UiMessage]", msg: UiMessage) -> None:
     try:
         ui_queue.put_nowait(msg)
         return
-    except Exception:
+    except Full:
         pass
+    except Exception:
+        logging.debug("ui_queue put_nowait failed", exc_info=True)
+        return
     # Queue 已滿（極端情況）：丟掉最舊一筆讓新訊息進來
     try:
         ui_queue.get_nowait()
+    except Empty:
+        pass
     except Exception:
         logging.debug("ui_queue full and unable to drop oldest", exc_info=True)
+        return
     try:
         ui_queue.put_nowait(msg)
+    except Full:
+        pass
     except Exception:
         logging.debug("ui_queue still full after drop, message dropped", exc_info=True)

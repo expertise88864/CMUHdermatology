@@ -187,6 +187,18 @@ def test_scheduler_interrupt_automation_is_deduplicated():
     assert "Received F12 but no automation is running; ignored." in src
 
 
+def test_scheduler_shutdown_is_idempotent_and_stops_automation():
+    source_path = ROOT / "src" / "scheduler.py"
+    src = _function_source(source_path, "shutdown_app")
+    full_src = source_path.read_text(encoding="utf-8")
+
+    assert "self._exit_cleanup_done = False" in full_src
+    assert "if getattr(self, '_exit_cleanup_done', False):" in src
+    assert "self._exit_cleanup_done = True" in src
+    assert "stop_event_automation.set()" in src
+    assert src.index("stop_event_automation.set()") < src.index("self.bg_executor.shutdown")
+
+
 def test_main_and_scheduler_log_queues_are_bounded():
     for rel_path in ("src/main.py", "src/scheduler.py"):
         src = (ROOT / rel_path).read_text(encoding="utf-8")

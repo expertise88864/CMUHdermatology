@@ -2657,6 +2657,7 @@ class AutomationApp:
         self._load_history_cache()
 
         self._shutting_down = False
+        self._exit_cleanup_done = False
         self._ui_queue_poll_id = None
         self._refresh_pending = False
         self._save_cache_pending = {}
@@ -2787,9 +2788,17 @@ class AutomationApp:
 
     def shutdown_app(self):
         """關閉時不可在主執行緒上 executor.shutdown(wait=True)，否則會卡到背景 HTTP／排程結束。"""
+        if getattr(self, '_exit_cleanup_done', False):
+            return
+        self._exit_cleanup_done = True
         self._shutting_down = True
         logging.info("Shutdown signal received.")
         stop_event_main.set()
+        try:
+            stop_event_automation.set()
+        except Exception:
+            logging.debug("stop_event_automation.set failed during shutdown",
+                          exc_info=True)
         safe_unhook_all_hotkeys()
         try:
             self._cancel_pending_refresh_tick_ui()
@@ -2821,7 +2830,10 @@ class AutomationApp:
                 except Exception as e:
                     logging.warning(f"Failed to close requests session ({_attr}): {e}")
         logging.info("Hotkeys unhooked; executor released (non-blocking shutdown).")
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     # --- [修改] 儲存快取通用函式 (加入 Key 轉換) ---
     def _save_cache(self, filename, data):
