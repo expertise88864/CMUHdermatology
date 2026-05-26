@@ -1626,6 +1626,113 @@ def _script_code_input_adaptive(code: str, label: str = "",
     return True
 
 
+def _read_tmemo_text(hwnd: int) -> str:
+    """讀 TMemo 全文 (WM_GETTEXTLENGTH + WM_GETTEXT)。"""
+    WM_GETTEXTLENGTH = 0x000E
+    WM_GETTEXT = 0x000D
+    try:
+        n = ctypes.windll.user32.SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0)
+        if n <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(n + 1)
+        ctypes.windll.user32.SendMessageW(
+            hwnd, WM_GETTEXT, n + 1, ctypes.byref(buf))
+        return buf.value
+    except Exception:
+        logging.debug("_read_tmemo_text 例外 hwnd=%s", hwnd, exc_info=True)
+        return ""
+
+
+def _write_tmemo_text(hwnd: int, new_text: str) -> bool:
+    """寫 TMemo 全文 (WM_SETTEXT)。"""
+    WM_SETTEXT = 0x000C
+    try:
+        text_buf = ctypes.c_wchar_p(new_text)
+        ret = ctypes.windll.user32.SendMessageW(
+            hwnd, WM_SETTEXT, 0, text_buf)
+        return bool(ret)
+    except Exception:
+        logging.debug("_write_tmemo_text 例外 hwnd=%s", hwnd, exc_info=True)
+        return False
+
+
+def _f23_update_uvb_dose(label: str = "F2") -> bool:
+    """[v20 2026-05-26] F2/F3 UVB 自動劑量更新。
+
+    回 True → 繼續走原 51019+療程 邏輯
+    回 False → 跳警告終止 (距上次照光太近 < 2 天)
+
+    流程：
+      1. 找處置 TMemo (heuristic: class=TMemo 且 text 含 'UVB')
+      2. WM_GETTEXT 讀全文 → cmuh_common.uvb_dose.update_uvb_in_text() 算
+      3. UPDATED → WM_SETTEXT 寫回，繼續 51019
+      4. TOO_CLOSE → 彈警告 MessageBox + return False (整個 F2/F3 終止)
+      5. NO_UVB_LINE / PARSE_FAIL → log + 繼續 51019 (fallback 給醫師手動處理)
+    """
+    main_hwnd = _find_hospital_main_window()
+    if not main_hwnd:
+        logging.info("[%s][UVB] 找不到主程式視窗 → fallback 走 51019", label)
+        return True
+
+    # 找處置 TMemo — 用「文字含 UVB」當定位 (徵候/病史欄不會有 UVB)
+    memo_hwnd = _find_descendant_by_class_text(main_hwnd, "TMemo", "UVB")
+    if not memo_hwnd:
+        logging.info("[%s][UVB] 處置內無 UVB 行 → fallback 走 51019", label)
+        return True
+
+    text = _read_tmemo_text(memo_hwnd)
+    if not text:
+        logging.warning("[%s][UVB] TMemo hwnd=%s 讀文字為空 → fallback",
+                        label, memo_hwnd)
+        return True
+
+    try:
+        from cmuh_common.uvb_dose import update_uvb_in_text, UvbAction
+    except Exception:
+        logging.exception("[%s][UVB] import cmuh_common.uvb_dose 失敗", label)
+        return True
+
+    result = update_uvb_in_text(text)
+
+    if result.action == UvbAction.NO_UVB_LINE:
+        logging.info("[%s][UVB] update_uvb_in_text 回 NO_UVB_LINE (異常)", label)
+        return True
+
+    if result.action == UvbAction.PARSE_FAIL:
+        logging.warning(
+            "[%s][UVB] 處置有 UVB 但 parse 失敗 → fallback 走 51019 "
+            "(請醫師手動更新劑量)", label)
+        return True
+
+    if result.action == UvbAction.TOO_CLOSE:
+        last_str = result.last_date.strftime("%Y/%m/%d")
+        msg = (f"病人 {last_str} 已照光 (距今僅 {result.days_diff} 天)\n\n"
+               f"間隔不足 ≥ 2 天 — 已停止 {label} 自動處理。\n"
+               f"若仍要照光，請醫師確認後手動處理。")
+        try:
+            # MB_ICONWARNING (0x30) | MB_TOPMOST (0x40000) | MB_OK
+            ctypes.windll.user32.MessageBoxW(0, msg, "UVB 照光間隔太短",
+                                              0x10 | 0x40000)
+        except Exception:
+            logging.debug("MessageBox 例外", exc_info=True)
+        logging.warning("[%s][UVB] 距上次 %s 僅 %d 天 → 終止 F2/F3",
+                        label, last_str, result.days_diff)
+        return False
+
+    # UPDATED: 寫回 TMemo
+    if not _write_tmemo_text(memo_hwnd, result.new_text):
+        logging.warning(
+            "[%s][UVB] WM_SETTEXT 寫回處置失敗 → fallback 走 51019", label)
+        return True
+
+    logging.info(
+        "[%s][UVB] 劑量 %d→%d, 次數 %d→%d, 日期 %s→今天 (差 %d 天)",
+        label, result.parsed.dose, result.new_dose,
+        result.parsed.count, result.new_count,
+        result.last_date.strftime("%m/%d"), result.days_diff)
+    return True
+
+
 def script_F1_adaptive():
     """F1: 照光 (1) — 51019 + 療程 1。"""
     logging.info("--- Executing F1 (照光 1) ---")
@@ -1634,15 +1741,27 @@ def script_F1_adaptive():
 
 
 def script_F2_adaptive():
-    """F2: 照光 (2) — 51019 + 療程 2。"""
+    """F2: 照光 (2) — UVB 劑量更新 (若有) + 51019 + 療程 2。
+
+    [v20 2026-05-26] 新增 UVB 自動劑量更新前處理。
+    """
     logging.info("--- Executing F2 (照光 2) ---")
+    if not _f23_update_uvb_dose(label="F2"):
+        logging.info("F2: UVB 間隔太短，已終止 (跳過 51019)")
+        return
     ok = _script_code_input_adaptive("51019", label="F2", set_療程=2)
     logging.info("F2 (照光 2): %s", "done" if ok else "skipped")
 
 
 def script_F3_adaptive():
-    """F3: 照光 (3) — 51019 + 療程 3。"""
+    """F3: 照光 (3) — UVB 劑量更新 (若有) + 51019 + 療程 3。
+
+    [v20 2026-05-26] 新增 UVB 自動劑量更新前處理。
+    """
     logging.info("--- Executing F3 (照光 3) ---")
+    if not _f23_update_uvb_dose(label="F3"):
+        logging.info("F3: UVB 間隔太短，已終止 (跳過 51019)")
+        return
     ok = _script_code_input_adaptive("51019", label="F3", set_療程=3)
     logging.info("F3 (照光 3): %s", "done" if ok else "skipped")
 
