@@ -1575,6 +1575,7 @@ def _script_code_input_adaptive(code: str, label: str = "",
                         label or "code-input", _HOSPITAL_WIN_CLASS,
                         _HOSPITAL_WIN_TITLE_KW)
         return False
+    workflow_ok = True
     _ensure_hospital_foreground(hwnd)
     time.sleep(0.03)
     # 雖然我們用 WM_CHAR 不經 IME，但 _force_ime_english 留著保險（萬一某
@@ -1592,16 +1593,25 @@ def _script_code_input_adaptive(code: str, label: str = "",
         if focused:
             logging.info("[%s] 焦點 hwnd=%s (cls=%s)，用 WM_CHAR 送 %r",
                           label, focused, _get_class_name_of(focused), code)
-            _send_chars_to_window(focused, code)
+            chars_ok = _send_chars_to_window(focused, code)
             time.sleep(0.05)
             check_stop()
-            _send_enter_to_window(focused)
+            enter_ok = _send_enter_to_window(focused)
+            if not (chars_ok and enter_ok):
+                logging.warning("[%s] 代碼輸入訊息送出不完整 chars=%s enter=%s",
+                                label, chars_ok, enter_ok)
+                workflow_ok = False
         else:
             # fallback: 沒拿到焦點就用 pyautogui (IME 可能會攔)
             logging.warning("[%s] 拿不到焦點 hwnd，退回 pyautogui.typewrite", label)
-            hotkey_modules.pyautogui.typewrite(code, interval=0.02)
-            time.sleep(0.05)
-            hotkey_modules.pyautogui.press("enter")
+            try:
+                hotkey_modules.pyautogui.typewrite(code, interval=0.02)
+                time.sleep(0.05)
+                hotkey_modules.pyautogui.press("enter")
+            except Exception:
+                logging.warning("[%s] pyautogui fallback 代碼輸入失敗", label,
+                                exc_info=True)
+                workflow_ok = False
     # 可選：改 療程 欄位 — 用 WM_SETTEXT 直接設值（繞 IME、不動滑鼠）
     if set_療程 is not None:
         time.sleep(0.08)  # 從 0.15s 降到 0.08s
@@ -1618,12 +1628,22 @@ def _script_code_input_adaptive(code: str, label: str = "",
             except Exception:
                 logging.warning("[%s] WM_SETTEXT 療程 失敗，fallback click",
                                  label, exc_info=True)
-                _replace_edit_text(liaocheng_hwnd, str(set_療程), main_hwnd=hwnd)
+                if not _replace_edit_text(liaocheng_hwnd, str(set_療程), main_hwnd=hwnd):
+                    workflow_ok = False
+            try:
+                actual_療程 = _read_tmemo_text(liaocheng_hwnd).strip()
+                if actual_療程 != str(set_療程):
+                    logging.warning("[%s] 療程欄位驗證失敗，預期=%s 實際=%r",
+                                    label, set_療程, actual_療程)
+                    workflow_ok = False
+            except Exception:
+                logging.debug("[%s] 療程欄位驗證例外", label, exc_info=True)
         else:
             logging.warning("[%s] 找不到 療程 欄位（請手動填）", label)
+            workflow_ok = False
     if hasattr(_runner_1280, "last_action_time"):
         _runner_1280.last_action_time = time.time()
-    return True
+    return workflow_ok
 
 
 def _read_tmemo_text(hwnd: int) -> str:
@@ -1762,6 +1782,24 @@ def _show_uvb_warning(main_hwnd: int, title: str, msg: str) -> None:
         ctypes.windll.user32.MessageBoxW(main_hwnd, msg, title, flags)
     except Exception:
         logging.debug("MessageBox 例外", exc_info=True)
+
+
+def _show_light_code_incomplete_warning(label: str, set_療程: int,
+                                        *, uvb_already_updated: bool) -> None:
+    """照光代碼/療程未確認完成時，用前景警告避免半套狀態被忽略。"""
+    main_hwnd = _find_hospital_main_window()
+    if uvb_already_updated:
+        msg = (
+            f"{label} 的 UVB 處置已更新成功，\n"
+            f"但 51019 或療程 {set_療程} 沒有確認完成。\n\n"
+            f"請立刻檢查醫令是否已有 51019，且療程欄位是否為 {set_療程}。"
+        )
+    else:
+        msg = (
+            f"{label} 的 51019 或療程 {set_療程} 沒有確認完成。\n\n"
+            f"UVB 尚未更新；請檢查醫令與療程欄位後手動處理。"
+        )
+    _show_uvb_warning(main_hwnd, "照光代碼輸入未完成", msg)
 
 
 def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
@@ -2068,6 +2106,8 @@ def script_F1_adaptive():
     logging.info("F1 (照光 1) 51019+療程: %s", "done" if ok else "skipped")
     if not ok:
         logging.warning("F1: 51019/療程未完成，跳過 UVB 更新以避免半套寫入")
+        _show_light_code_incomplete_warning(
+            "F1", 1, uvb_already_updated=False)
         return
     # 接著 UVB 更新 (best-effort, 沒 UVB 不警告也不終止)
     _f1_update_uvb_dose_if_present(label="F1")
@@ -2084,6 +2124,10 @@ def script_F2_adaptive():
         return
     ok = _script_code_input_adaptive("51019", label="F2", set_療程=2)
     logging.info("F2 (照光 2): %s", "done" if ok else "skipped")
+    if not ok:
+        logging.warning("F2: UVB 已更新，但 51019/療程2 未確認完成")
+        _show_light_code_incomplete_warning(
+            "F2", 2, uvb_already_updated=True)
 
 
 def script_F3_adaptive():
@@ -2097,6 +2141,10 @@ def script_F3_adaptive():
         return
     ok = _script_code_input_adaptive("51019", label="F3", set_療程=3)
     logging.info("F3 (照光 3): %s", "done" if ok else "skipped")
+    if not ok:
+        logging.warning("F3: UVB 已更新，但 51019/療程3 未確認完成")
+        _show_light_code_incomplete_warning(
+            "F3", 3, uvb_already_updated=True)
 
 
 def script_F5_adaptive():

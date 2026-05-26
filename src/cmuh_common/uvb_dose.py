@@ -119,14 +119,14 @@ _UVB_DATE_RE = re.compile(
 # 大於 MAX_COUNT 的會在 sanity check 時擋下，這裡先放寬接受任意位數。
 # [v20.7] 也排除「年」可能性 — 4 位數字當 count 機率極低，先排除避免誤抓
 _UVB_COUNT_RE = re.compile(r"\(\s*(\d+)\s*\)")
-# increase / increased / add (case-insensitive)
+# increase / increased / add / 每次加 / 增加 (case-insensitive)
 _UVB_INCREASE_RE = re.compile(
-    r"(?:increase[d]?|add)\s*(\d+)", re.IGNORECASE)
+    r"(?:increase[d]?|add|每次增加|每次加|增加|加)\s*(\d+)", re.IGNORECASE)
 # [v20.8] MAX 接受多種同義表達:
-#   MAX:N / MAX N / fix N / fixed N / fix at N / fixed at N
+#   MAX:N / MAX N / fix N / fixed N / fix at N / fixed at N / 固定 N
 # \bfix(?:ed)? 確保 word boundary 避免抓到 "prefix"/"fixing" 等
 _UVB_MAX_RE = re.compile(
-    r"(?:MAX\s*[:：]?\s*|\bfix(?:ed)?(?:\s+at)?\s+)(\d+)",
+    r"(?:MAX\s*[:：]?\s*|\bfix(?:ed)?(?:\s+at)?\s+|固定(?:在|為)?\s*)(\d+)",
     re.IGNORECASE,
 )
 
