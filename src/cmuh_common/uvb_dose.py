@@ -335,11 +335,95 @@ class UvbUpdateResult:
     uvb_line_count: int = 0              # 處置內有幾行 UVB (≥2 給 info log)
     additional_lines_updated: int = 0    # [v20.11] 同日期額外更新的 UVB 行數
     additional_triplets_updated: int = 0 # [v20.12] 同日期非 UVB 關鍵字 triplet 額外更新數
+    # [v20.13] 偵測到的「不確定 / 需要醫師確認」其他 triplet (e.g. line 1 是
+    # excimer 但日期跟第一行 UVB 不同)。caller 應該跳 Yes/No 詢問是否套用。
+    uncertain_other_triplets: Optional[list] = None
 
 
 def _count_uvb_lines(text: str) -> int:
     """數處置 text 內有幾行 UVB (粗略 — 每行算一次)。"""
     return sum(1 for ln in text.splitlines() if "uvb" in ln.lower())
+
+
+def _detect_uncertain_triplets(text: str, today: date,
+                                max_days_ago: int = 365) -> list:
+    """[v20.13] 偵測 text 中「看起來像 UVB/excimer 但日期不同於今天」的 triplet。
+
+    使用情境：update_uvb_in_text 第一行 UVB 已更新，同日期 triplet 也更新後，
+    剩下的 (count) ... (date) 若有 UVB-marker 又日期合理 (近 1 年內)，
+    視為「不確定該不該更新」，caller 應該跳 Yes/No 詢問醫師。
+
+    Returns list of dicts:
+        [{'line': str, 'count': int, 'date': date, 'days_ago': int,
+          'span': (start, end), 'original_seg': str, 'replacement': str}, ...]
+        replacement 內含 count+1, date→today (供 caller Yes 時 apply)。
+    """
+    out = []
+    today_str = f"{today.year}/{today.month:02d}/{today.day:02d}"
+    for m in _TRIPLET_RE.finditer(text):
+        try:
+            seg_date = date(int(m.group(3)), int(m.group(4)),
+                            int(m.group(5)))
+        except (ValueError, TypeError):
+            continue
+        # 今天的 date (已經被 step A/B/C 更新) 跳過
+        if seg_date == today:
+            continue
+        # 未來日期跳過 (異常)
+        if seg_date > today:
+            continue
+        # 太舊跳過 (> 1 年 — 歷史紀錄)
+        days_ago = (today - seg_date).days
+        if days_ago > max_days_ago:
+            continue
+        # marker 必須同行 (不跨 newline) — 避免誤抓不相關內容
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        line_end = text.find("\n", m.end())
+        if line_end == -1:
+            line_end = len(text)
+        line_text = text[line_start:line_end]
+        if not _UVB_MARKER_RE.search(line_text):
+            continue
+        try:
+            old_count = int(m.group(1))
+        except ValueError:
+            continue
+        if not (1 <= old_count <= MAX_COUNT):
+            continue
+        # 構造 "Yes 時" 套用的新 segment: count+1, date→today
+        rep = m.group(0)
+        rep = re.sub(
+            r"\(\s*" + str(old_count) + r"\s*\)",
+            f"({old_count + 1})", rep, count=1)
+        rep = re.sub(
+            rf"\(\s*{seg_date.year}/0?{seg_date.month}/0?{seg_date.day}\s*\)",
+            f"({today_str})", rep, count=1)
+        out.append({
+            'line': line_text.strip(),
+            'count': old_count,
+            'date': seg_date,
+            'days_ago': days_ago,
+            'span': m.span(),
+            'original_seg': m.group(0),
+            'replacement': rep,
+        })
+    return out
+
+
+def apply_uncertain_updates(text: str, triplets: list) -> str:
+    """[v20.13] 將 _detect_uncertain_triplets 偵測到的 triplet 套用 (count+1,
+    date→today)，回新 text。
+
+    end-to-start 套用避免 offset 失效。
+    """
+    if not triplets:
+        return text
+    out = text
+    # span 從後往前套
+    for t in sorted(triplets, key=lambda x: x['span'][0], reverse=True):
+        s, e = t['span']
+        out = out[:s] + t['replacement'] + out[e:]
+    return out
 
 
 def update_uvb_in_text(text: str, today: Optional[date] = None,
@@ -592,6 +676,12 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
             parsed=parsed, days_diff=days_diff, uvb_line_count=uvb_lines,
         )
 
+    # ─── v20.13 偵測「不確定其他 triplet」(日期不同) ─────────────────────
+    # 例：line 1 是 excimer (37) (2026/5/22), line 2 是 UVB ... (2026/5/24)
+    # Step A 處理 line 2 (UVB)，Step C 因日期不同沒動 line 1。
+    # 但醫師可能希望 line 1 也一起更新 — 跳 Yes/No 給醫師決定。
+    uncertain_others = _detect_uncertain_triplets(new_text, today)
+
     return UvbUpdateResult(
         action=UvbAction.UPDATED,
         new_text=new_text,
@@ -603,4 +693,5 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         uvb_line_count=uvb_lines,
         additional_lines_updated=uvb_additional,
         additional_triplets_updated=triplet_count,
+        uncertain_other_triplets=uncertain_others if uncertain_others else None,
     )

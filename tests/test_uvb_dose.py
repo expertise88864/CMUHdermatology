@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from cmuh_common.uvb_dose import (  # noqa: E402
     UvbAction,
     UvbLineInfo,
+    apply_uncertain_updates,
     compute_new_dose,
     format_uvb_line,
     parse_uvb_line,
@@ -1008,3 +1009,113 @@ def test_skip_dose_sanity_still_blocks_too_close():
     r = update_uvb_in_text(text, today=date(2026, 5, 26),
                            skip_dose_sanity=True)
     assert r.action == UvbAction.TOO_CLOSE
+
+
+# ─── v20.13 不確定 triplet 偵測 (image 2 case fix) ───────────────────────
+
+def test_image2_excimer_different_date_detected_as_uncertain():
+    """[v20.13] image 2 實機 case: line 1 是 excimer 日期不同於第一行 UVB，
+    應該被偵測為 uncertain 給醫師決定。"""
+    text = (
+        "re- excimer 800 upper back (37) (2026/5/22) add 10mJ each time, "
+        "total 3 shot, father prefer fixed 700mJ,\n"
+        "局部 手 UVB: 800 mj/cm2(8) on (2026/5/24) add 50 each time, "
+        "prefer fixed 1000mJ"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    # 第一行 UVB 應該更新
+    assert "(9)" in r.new_text
+    assert "(2026/05/26)" in r.new_text
+    # Line 1 (excimer) 日期不同 → 不自動更新但要被偵測
+    assert r.uncertain_other_triplets is not None
+    assert len(r.uncertain_other_triplets) == 1
+    u = r.uncertain_other_triplets[0]
+    assert u['count'] == 37
+    assert u['date'] == date(2026, 5, 22)
+    # 預備好的 replacement 是 (count+1, date→today)
+    assert "(38)" in u['replacement']
+    assert "(2026/05/26)" in u['replacement']
+
+
+def test_apply_uncertain_updates_writes_count_and_date():
+    """[v20.13] apply_uncertain_updates 套用 detect 出來的 triplet 到 text。"""
+    text = (
+        "re- excimer 800 upper back (37) (2026/5/22) add 10mJ each time\n"
+        "局部 手 UVB: 800 mj/cm2(8) on (2026/5/24) add 50 each time, "
+        "prefer fixed 1000mJ"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.uncertain_other_triplets
+    # Apply uncertain updates → line 1 (37) → (38), (2026/5/22) → (2026/05/26)
+    final = apply_uncertain_updates(r.new_text, r.uncertain_other_triplets)
+    assert "(38) (2026/05/26)" in final
+    assert "(37) (2026/5/22)" not in final
+    # 原 UVB 行不受 apply_uncertain 影響 — 日期還是今天
+    assert "on (2026/05/26)" in final
+
+
+def test_no_uncertain_when_only_same_date_triplets():
+    """[v20.13] 沒「不確定」case 時 uncertain_other_triplets 是 None/空。"""
+    text = (
+        "UVB: 800 mj/cm2 (10) on (2026/5/22) add 50, fixed 1000\n"
+        "excimer (5) 800mJ on (2026/5/22) add 30, fixed 800"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    # 兩行都同日期 → step C triplet 全部處理掉
+    assert not r.uncertain_other_triplets
+
+
+def test_no_uncertain_when_no_other_triplets():
+    """[v20.13] 處置只有單一 UVB 行 → 沒 uncertain。"""
+    text = "UVB: 800 mj/cm2 (10) on (2026/5/22) add 50, fixed 1000"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert not r.uncertain_other_triplets
+
+
+def test_uncertain_skips_old_history():
+    """[v20.13] >365 天的歷史紀錄不算 uncertain (避免噪音)。"""
+    text = (
+        "old uvb (5) 500mJ on (2023/1/1) record\n"
+        "UVB: 800 mj/cm2 (10) on (2026/5/22) add 50, fixed 1000"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    # (5) (2023/1/1) 太舊 → 不算 uncertain
+    assert not r.uncertain_other_triplets
+
+
+def test_uncertain_skips_non_uvb_marker_lines():
+    """[v20.13] 沒 UVB/excimer/mj/photo 標記的行不算 uncertain。"""
+    text = (
+        "follow up (3) days ago (2026/5/22) for biopsy review\n"
+        "UVB: 800 mj/cm2 (10) on (2026/5/24) add 50, fixed 1000"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    # 第一行沒 UVB-marker → 不算 uncertain
+    assert not r.uncertain_other_triplets
+
+
+def test_image1_real_world_text_should_update_cleanly():
+    """[v20.13] image 1 實機 text — 應該正常 update (沒 uncertain)。
+
+    這個 test 文件確認: parse_uvb_line + update_uvb_in_text 對 image 1 文字本身
+    沒有邏輯 bug。實機沒更新可能是 TMemo 找錯或寫回失敗 (從 log 才能診斷)。"""
+    text = ("局部 右腳 UVB: 200 mj/cm2(4) on 2026/5/24, "
+            "add 50 each time, fixed 1500, "
+            "take picture on 2026/5/14, W1+4N")
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED, (
+        f"unexpected: {r.action}, sanity={r.sanity_reason}")
+    assert r.new_dose == 250
+    assert r.new_count == 5
+    assert "UVB: 250" in r.new_text
+    assert "(5)" in r.new_text
+    assert "2026/05/26" in r.new_text
+    # take picture 2026/5/14 不該被誤改 (bare date, count 太遠)
+    assert "2026/5/14" in r.new_text
+    # 沒 uncertain (take picture 行雖然有 date 但沒 (count) 在前面)
+    assert not r.uncertain_other_triplets

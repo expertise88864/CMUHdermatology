@@ -1819,6 +1819,11 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
         logging.info("[%s][UVB] TMemo 讀文字為空 — 跳過", label)
         return True
 
+    # [v20.13 2026-05-26] 留紀錄 — repr() 把不可見字元/控制字元都印出來，
+    # 方便事後 debug「為什麼 parse 失敗」之類問題 (前 500 字夠看 UVB 行)
+    logging.info("[%s][UVB] memo hwnd=%s len=%d text=%r",
+                 label, memo_hwnd, len(text), text[:500])
+
     try:
         from cmuh_common.uvb_dose import update_uvb_in_text, UvbAction
     except Exception:
@@ -1908,8 +1913,69 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
             f"若仍要照光，請醫師確認後手動處理。")
         return False
 
+    # [v20.13 2026-05-26] UPDATED 但偵測到「不確定的其他 triplet」(日期不同
+    # 於第一行 UVB) — 跳 Yes/No 給醫師確認:
+    #   Yes = 套用全部 (含這些 triplet 的 count+1, date→今天) + 繼續執行
+    #   No  = 取消，不寫入處置、不執行 51019 (避免半套更新)
+    uncertain = getattr(result, 'uncertain_other_triplets', None) or []
+    final_text = result.new_text
+    if uncertain:
+        lines_show = "\n".join(
+            f"  • [{u['date'].strftime('%m/%d')} ({u['days_ago']}天前) "
+            f"次數 {u['count']}]\n      {u['line'][:100]}"
+            for u in uncertain
+        )
+        update_summary = (
+            f"  • UVB: {result.parsed.dose}→{result.new_dose} mj/cm2\n"
+            f"  • 次數: {result.parsed.count}→{result.new_count}\n"
+            f"  • 日期: {result.last_date.strftime('%Y/%m/%d')}→今天"
+        )
+        msg = (
+            f"處置內偵測到 {len(uncertain)} 行 (count) ... (日期) 看起來像光療"
+            f"紀錄，\n但日期不同於第一行 UVB ({result.last_date.strftime('%Y/%m/%d')})\n\n"
+            f"=== 不確定的行 ===\n{lines_show}\n\n"
+            f"=== 程式預計更新 (確定) ===\n{update_summary}\n\n"
+            f"是 = 套用上述更新 + 上面不確定的行也 count+1, 日期→今天，"
+            f"並繼續執行 {label}\n"
+            f"否 = 全部取消，不更新處置、不執行 {label}"
+        )
+        logging.info("[%s][UVB] uncertain others detected (%d) — 跳 Yes/No",
+                     label, len(uncertain))
+        for u in uncertain:
+            logging.info("[%s][UVB]   uncertain: count=%d date=%s line=%r",
+                         label, u['count'], u['date'], u['line'][:200])
+        try:
+            import winsound
+            winsound.MessageBeep(0x30)
+        except Exception:
+            pass
+        # MB_ICONQUESTION(0x20) | MB_YESNO(0x4) | MB_TOPMOST(0x40000)
+        # | MB_SETFOREGROUND(0x10000) | MB_DEFBUTTON2(0x100) — 預設「否」
+        flags = 0x20 | 0x4 | 0x40000 | 0x10000 | 0x100
+        try:
+            ans = ctypes.windll.user32.MessageBoxW(
+                main_hwnd, msg,
+                f"UVB 偵測到不確定的其他行 - {label}", flags,
+            )
+        except Exception:
+            logging.exception("[%s][UVB] uncertain MessageBoxW 失敗", label)
+            return False if strict else True
+        if ans != 6:  # not IDYES
+            logging.info("[%s][UVB] uncertain user 按否 → 終止 (不寫處置)",
+                         label)
+            return False if strict else True
+        # Yes — 套用 uncertain triplets 到 new_text
+        try:
+            from cmuh_common.uvb_dose import apply_uncertain_updates
+            final_text = apply_uncertain_updates(result.new_text, uncertain)
+            logging.info("[%s][UVB] uncertain user 按是 → 套用 %d 個額外行",
+                         label, len(uncertain))
+        except Exception:
+            logging.exception("[%s][UVB] apply_uncertain_updates 失敗", label)
+            final_text = result.new_text
+
     # UPDATED: 寫回 TMemo
-    if not _write_tmemo_text(memo_hwnd, result.new_text):
+    if not _write_tmemo_text(memo_hwnd, final_text):
         logging.warning("[%s][UVB] WM_SETTEXT 寫回處置失敗 → 終止", label)
         _show_uvb_warning(
             main_hwnd, "UVB 寫回失敗",
