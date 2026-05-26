@@ -1621,16 +1621,9 @@ def _script_code_input_adaptive(code: str, label: str = "",
                                 label, chars_ok, enter_ok)
                 workflow_ok = False
         else:
-            # fallback: 沒拿到焦點就用 pyautogui (IME 可能會攔)
-            logging.warning("[%s] 等不到代碼輸入焦點，退回 pyautogui.typewrite", label)
-            try:
-                hotkey_modules.pyautogui.typewrite(code, interval=0.02)
-                time.sleep(0.05)
-                hotkey_modules.pyautogui.press("enter")
-            except Exception:
-                logging.warning("[%s] pyautogui fallback 代碼輸入失敗", label,
-                                exc_info=True)
-                workflow_ok = False
+            logging.warning("[%s] 等不到可信的代碼輸入焦點，停止送出 %r",
+                            label, code)
+            workflow_ok = False
     # 可選：改 療程 欄位 — 用 WM_SETTEXT 直接設值（繞 IME、不動滑鼠）
     if set_療程 is not None:
         time.sleep(0.08)  # 從 0.15s 降到 0.08s

@@ -157,3 +157,7 @@ def test_code_input_waits_for_focus_after_menu_command():
     wait_src = _function_source(source_path, "_wait_for_code_input_focus")
     assert "is_input_like and (focus != previous_focus or not previous_focus)" in wait_src
     assert "return 0" in wait_src
+
+    code_input_src = _function_source(source_path, "_script_code_input_adaptive")
+    assert "hotkey_modules.pyautogui.typewrite(code" not in code_input_src
+    assert "workflow_ok = False" in code_input_src
