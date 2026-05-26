@@ -128,3 +128,22 @@ def test_f2_f3_warn_when_code_input_fails_after_uvb_update():
             < _first_call_line(func, "_show_light_code_incomplete_warning")
         )
         assert len(_call_lines(func, "_show_light_code_incomplete_warning")) == 1
+
+
+def test_code_input_waits_for_focus_after_menu_command():
+    source_path = ROOT / "src" / "main.py"
+    func = _function_node(source_path, "_script_code_input_adaptive")
+
+    assert (
+        _first_call_line(func, "_send_yiling_menu_command")
+        < _first_call_line(func, "_wait_for_code_input_focus")
+        < _first_call_line(func, "_send_chars_to_window")
+    )
+
+    wait_func = _function_node(source_path, "_wait_for_code_input_focus")
+    constants = {
+        node.value
+        for node in ast.walk(wait_func)
+        if isinstance(node, ast.Constant)
+    }
+    assert 0.6 in constants

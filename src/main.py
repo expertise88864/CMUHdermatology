@@ -1498,6 +1498,28 @@ def _get_thread_focus(target_hwnd: int) -> int:
         return 0
 
 
+def _wait_for_code_input_focus(target_hwnd: int, *,
+                               previous_focus: int = 0,
+                               timeout: float = 0.6,
+                               poll: float = 0.03) -> int:
+    """等代碼輸入 menu 讓焦點移到可輸入控件，避免固定 sleep 抓到舊焦點。"""
+    end_t = time.time() + timeout
+    input_like_focus = 0
+    while time.time() < end_t:
+        focus = _get_thread_focus(target_hwnd)
+        if focus and focus != target_hwnd:
+            cls = _get_class_name_of(focus).lower()
+            is_input_like = any(
+                s in cls for s in ("edit", "memo", "rich", "grid"))
+            if is_input_like:
+                input_like_focus = focus
+            if focus != previous_focus or is_input_like:
+                return focus
+        time.sleep(poll)
+        check_stop()
+    return input_like_focus
+
+
 def _send_chars_to_window(hwnd: int, text: str) -> bool:
     """送 WM_CHAR 一字一字到目標 control。完全繞過 IME。
 
@@ -1581,15 +1603,15 @@ def _script_code_input_adaptive(code: str, label: str = "",
     # 雖然我們用 WM_CHAR 不經 IME，但 _force_ime_english 留著保險（萬一某
     # 控制項對 IME 狀態敏感）
     _force_ime_english(hwnd)
+    previous_focus = _get_thread_focus(hwnd)
     _send_yiling_menu_command(hwnd, MENU_ID_代碼輸入)
-    # 等焦點移到醫令代碼欄 — 從 0.15s 降到 0.08s (PostMessage 反應快)
-    time.sleep(0.08)
+    # 等焦點移到醫令代碼欄；快時立即通過，慢時最多等 0.6 秒。
+    focused = _wait_for_code_input_focus(hwnd, previous_focus=previous_focus)
     _force_ime_english(hwnd)
     check_stop()
     # code 非空才打字 + Enter
     if code:
-        # 找當前焦點 control (代碼輸入觸發後 = grid 內的 inplace edit)
-        focused = _get_thread_focus(hwnd)
+        # 代碼輸入觸發後，焦點應在 grid 內的 inplace edit。
         if focused:
             logging.info("[%s] 焦點 hwnd=%s (cls=%s)，用 WM_CHAR 送 %r",
                           label, focused, _get_class_name_of(focused), code)
