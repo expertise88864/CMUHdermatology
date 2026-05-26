@@ -35,14 +35,14 @@ from typing import Optional
 
 
 # ─── Constants ──────────────────────────────────────────────────────────
-# [v20.8 2026-05-26] 劑量規則更新 — user 確認新規範:
-#   days_diff = 0 (同日)        → 警告終止 (太密集)
-#   days_diff = 1-6 (不含7)     → +increase (cap MAX) ← 1 天也可加 (舊版警告)
-#   days_diff = 7 (剛好)         → 保持 dose
-#   days_diff = 8-14 (含14)     → × 0.75, floor 10, 最低 250
-#   days_diff = 15-21 (含21)    → × 0.5, floor 10, 最低 250  ← 新 bucket
-#   days_diff > 21              → 固定 250
-TOO_CLOSE_DAYS = 1            # days_diff < 此值 → 警告終止 (即 0 同日)
+# [v20.10 2026-05-26] 劑量規則修正 (user 確認 1 天差也要警告):
+#   days_diff = 0 (同日) / 1 (昨日)  → 警告終止 (至少要間隔 1 天 = ≥ 2 天)
+#   days_diff = 2-6                   → +increase (cap MAX)
+#   days_diff = 7 (剛好)               → 保持 dose
+#   days_diff = 8-14 (含14)           → × 0.75, floor 10, 最低 250
+#   days_diff = 15-21 (含21)          → × 0.5, floor 10, 最低 250
+#   days_diff > 21                    → 固定 250
+TOO_CLOSE_DAYS = 2            # days_diff < 此值 → 警告終止 (即 0 或 1 天)
 SAME_DOSE_DAYS = 7            # = 此值 → 保持
 DECAY_75_UPPER = 14           # 8-14 → ×0.75
 DECAY_50_UPPER = 21           # 15-21 → ×0.5
@@ -221,14 +221,14 @@ def _floor_to_10(value: float) -> int:
 
 def compute_new_dose(*, dose: int, increase: int, max_dose: int,
                      days_diff: int) -> Optional[int]:
-    """[v20.8] 依天數差算新劑量。
+    """[v20.10] 依天數差算新劑量。
 
-    days_diff < 1 (即 0 同日) → 回 None (caller 跳警告)
+    days_diff < 2 (即 0 同日 或 1 昨日) → 回 None (caller 跳警告)
     其他天數差一定有 int 回值。所有 decay 結果不低於 MIN_DECAY_DOSE (250)。
     """
-    if days_diff < TOO_CLOSE_DAYS:                  # 0 天同日
+    if days_diff < TOO_CLOSE_DAYS:                  # 0 或 1 天 → 太密集
         return None
-    if days_diff < SAME_DOSE_DAYS:                  # 1-6 天 → +increase, cap MAX
+    if days_diff < SAME_DOSE_DAYS:                  # 2-6 天 → +increase, cap MAX
         return min(dose + increase, max_dose)
     if days_diff == SAME_DOSE_DAYS:                 # 7 天剛好 → 保持
         return dose

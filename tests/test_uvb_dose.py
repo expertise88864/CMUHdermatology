@@ -24,23 +24,23 @@ from cmuh_common.uvb_dose import (  # noqa: E402
 
 # ─── compute_new_dose: 各 day-bucket ────────────────────────────────────
 
-def test_compute_returns_none_when_same_day():
-    """[v20.8] 同日 (days_diff=0) → None (太密集，須警告)。"""
+@pytest.mark.parametrize("days_diff", [0, 1])
+def test_compute_returns_none_when_too_close(days_diff):
+    """[v20.10] 同日 (0) 或昨日 (1) → None (太密集，須警告 ≥ 2 天)。"""
     assert compute_new_dose(
-        dose=520, increase=30, max_dose=800, days_diff=0
+        dose=520, increase=30, max_dose=800, days_diff=days_diff
     ) is None
 
 
 @pytest.mark.parametrize("days_diff,expected", [
-    (1, 550),   # [v20.8] 1 天現在可加 (舊版警告)
     (2, 550),
     (3, 550),
     (4, 550),
     (5, 550),
     (6, 550),
 ])
-def test_compute_increases_when_1_to_6_days(days_diff, expected):
-    """[v20.8] 1-6 天 → +increase (1 天從警告改可加)。"""
+def test_compute_increases_when_2_to_6_days(days_diff, expected):
+    """[v20.10] 2-6 天 → +increase (1 天不准，要至少 ≥ 2 天)。"""
     assert compute_new_dose(
         dose=520, increase=30, max_dose=800, days_diff=days_diff
     ) == expected
@@ -332,16 +332,22 @@ def test_update_normal_case_2_to_6_days_increases():
 
 
 def test_update_too_close_returns_warning_no_text_change():
-    """[v20.8] 只有同日 (days_diff=0) → TOO_CLOSE。1 天差現在可加劑量。"""
+    """[v20.10] 同日 (0) 或昨日 (1) → TOO_CLOSE，不改 text。2 天以上才能加劑量。"""
     text = "UVB 520 (11) on (2026/05/26), increase 30, MAX:800"
-    # 1 天差現在 → UPDATED (不再 TOO_CLOSE)
-    r1 = update_uvb_in_text(text, today=date(2026, 5, 27))
-    assert r1.action == UvbAction.UPDATED
-    assert r1.new_dose == 550  # 520+30
     # 同日 → TOO_CLOSE
     r0 = update_uvb_in_text(text, today=date(2026, 5, 26))
     assert r0.action == UvbAction.TOO_CLOSE
     assert r0.days_diff == 0
+    assert r0.new_text is None
+    # 昨天 (1 天差) → TOO_CLOSE (改回 v20.10 規則)
+    r1 = update_uvb_in_text(text, today=date(2026, 5, 27))
+    assert r1.action == UvbAction.TOO_CLOSE
+    assert r1.days_diff == 1
+    assert r1.new_text is None
+    # 前天 (2 天差) → UPDATED
+    r2 = update_uvb_in_text(text, today=date(2026, 5, 28))
+    assert r2.action == UvbAction.UPDATED
+    assert r2.new_dose == 550  # 520+30
 
 
 def test_update_same_day_is_too_close():
