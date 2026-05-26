@@ -1905,9 +1905,15 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
                 f"{label} 已停止，請醫師手動確認處置內容。")
             return False
 
-    if result.uvb_line_count >= 2:
-        logging.info("[%s][UVB] 處置含 %d 行 UVB (只改第一行)",
-                     label, result.uvb_line_count)
+    if result.additional_lines_updated > 0:
+        logging.info(
+            "[%s][UVB] 同日期 UVB 行共 %d 筆都已更新 (第一行 + %d 行)",
+            label, 1 + result.additional_lines_updated,
+            result.additional_lines_updated)
+    elif result.uvb_line_count >= 2:
+        logging.info(
+            "[%s][UVB] 處置含 %d 行 UVB (只改第一行，其他日期不同不動)",
+            label, result.uvb_line_count)
 
     # [v20.7] count 可能 None (處置沒寫)，log 適配
     if result.new_count is None:

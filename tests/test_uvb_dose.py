@@ -570,6 +570,102 @@ def test_parse_max_word_boundary_not_matching_prefix():
     assert info is None, "prefix/fixing 不該被當 MAX 抓"
 
 
+def test_parse_date_without_parens():
+    """[v20.11] 日期沒帶 paren — 'on 2026/5/24' 也要 parse 成功。
+    User 5/26 case 1 (劉苔菁) + case 2 (羅紫綺) 都用這格式。
+    """
+    text = "局部 手/ 腳 UVB: 2000 mj/cm2(34) on 2026/5/24 add 100 each time, fixed 2000, take picture on 2026/1/15, W1+4N"
+    info = parse_uvb_line(text)
+    assert info is not None, "date 沒 paren 該也能 parse"
+    assert info.dose == 2000
+    assert info.count == 34
+    assert info.last_date == date(2026, 5, 24)
+    assert info.increase == 100
+    assert info.max_dose == 2000
+
+
+def test_update_real_world_case1_dose_2000_no_paren_date():
+    """[v20.11] case 1 完整 — dose 2000 (sanity 上限提高), no-paren date, fixed 2000"""
+    text = "局部 手/ 腳 UVB: 2000 mj/cm2(34) on 2026/5/24 add 100 each time, fixed 2000, take picture on 2026/1/15, W1+4N\nacitretin + MTX 3# on (2026/3/5)"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))  # 2 天差
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 2000  # 2000+100=2100 cap MAX 2000
+    assert r.new_count == 35
+    # 不帶 paren 寫回也不帶 paren
+    assert "on 2026/05/26" in r.new_text
+    # 後面歷史紀錄 (2026/3/5) 不該被誤改
+    assert "(2026/3/5)" in r.new_text
+
+
+def test_update_real_world_case2_no_paren_date():
+    """[v20.11] case 2 — UVB: 200 (低劑量) no-paren date, fixed at 1100"""
+    text = "UVB: 200 mj/cm2(2) on 2026/5/24, add 50 each time, fixed at 1100, take picture on 2026/5/21, W1+4N"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))  # 2 天差
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 250  # 200+50
+    assert r.new_count == 3
+    assert "on 2026/05/26" in r.new_text
+    assert "fixed at 1100" in r.new_text
+
+
+def test_update_real_world_case3_multi_line_same_date():
+    """[v20.11] case 3 — 兩行 UVB 同日期都要更新 (用各自的 dose/MAX)。
+    第一行 dose 900 increase 50 max 900 → 維持 900 (cap)
+    第二行 dose 1200 increase 50 max 1200 → 維持 1200 (cap)
+    """
+    text = (
+        "UVB: 900 mj/cm (126) on (2026/5/24) add 50 each time, keep max: 900. W4N\n"
+        "局部 手背 UVB: 1200mj/cm (107) on (2026/5/24) add 50 each time, keep max: 1200. 4\n"
+        "OMP W12 on (2025/5/14) -> AZA 0.5# W2 on (2026/1/15)"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))  # 2 天差
+    assert r.action == UvbAction.UPDATED
+    # 第一行
+    assert r.new_dose == 900  # 900+50 cap 900
+    assert r.new_count == 127  # 126+1
+    assert "UVB: 900" in r.new_text
+    assert "(127)" in r.new_text
+    # 第二行也要更新
+    assert r.additional_lines_updated == 1
+    assert "UVB: 1200" in r.new_text
+    assert "(108)" in r.new_text   # 107+1
+    # 兩行日期都改 2026/05/26
+    assert r.new_text.count("(2026/05/26)") == 2
+    # 第二行的 keep max: 1200 保留
+    assert "keep max: 1200" in r.new_text
+    # 後面更舊的 OMP 日期不該動
+    assert "(2025/5/14)" in r.new_text
+    assert "(2026/1/15)" in r.new_text
+
+
+def test_update_multi_line_different_date_no_extra_update():
+    """[v20.11] 多行 UVB 但第二行日期不同 → 只改第一行，第二行不動。"""
+    text = (
+        "UVB: 900 (126) on (2026/5/24) add 50 each time, max 900. W4N\n"
+        "UVB: 800 (100) on (2026/5/17) add 50 each time, max 900. W4N"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert r.additional_lines_updated == 0
+    # 第二行不變
+    assert "UVB: 800 (100) on (2026/5/17)" in r.new_text
+
+
+def test_sanity_dose_2000_now_allowed():
+    """[v20.11] MAX_DOSE 上限 1500→2000 — dose 2000 不該觸發 SANITY_FAIL。"""
+    text = "UVB 2000 (5) on (2026/05/20), increase 100, MAX:2000"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 2000
+
+
+def test_sanity_dose_2001_still_rejected():
+    """[v20.11] dose 超過 2000 (新上限) 仍應 SANITY_FAIL。"""
+    text = "UVB 2001 (5) on (2026/05/20), increase 100, MAX:2500"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.SANITY_FAIL
+
+
 def test_parse_real_world_case_a_fixed_at():
     """[v20.7 regression] User 5/26 12:17 case A:
     用 `fixed at 1500` 取代 `MAX:1500` (李璟樂)

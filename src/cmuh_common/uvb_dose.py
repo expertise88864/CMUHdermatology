@@ -56,7 +56,7 @@ DECAY_50_FACTOR = 0.5
 # [v20.5 2026-05-26] 為了「確保資訊正確」，parse 出來的值若超出合理範圍 →
 # 直接 sanity_fail，給 caller 跳警告終止，不嘗試自動計算。
 MIN_DOSE = 50              # UVB 劑量正常 200-1500 mj/cm2，給寬點 50 為下限
-MAX_DOSE = 1500            # 上限 1500 (常見 MAX 800-1000)
+MAX_DOSE = 2000            # [v20.11] 上限 1500 → 2000 (user 確認某些病人到 2000)
 MAX_COUNT = 999            # 治療次數不該超過 999 (~5 年週週照)
 MAX_GAP_DAYS = 730         # 距上次照光超過 2 年 → 異常 (病歷可能跑掉)
 
@@ -105,7 +105,14 @@ class UvbLineInfo:
 #   3. 各 field 順序不限，缺任一 field → parse_fail
 
 _UVB_DOSE_RE = re.compile(r"UVB\s*:?\s*(\d+)", re.IGNORECASE)
-_UVB_DATE_RE = re.compile(r"\(\s*(\d{4})/(\d{1,2})/(\d{1,2})\s*\)")
+# [v20.11] 接受帶 paren 跟不帶 paren 兩種:
+#   (2026/05/24) — group 1-3
+#    2026/05/24  — group 4-6
+_UVB_DATE_RE = re.compile(
+    r"\(\s*(\d{4})/(\d{1,2})/(\d{1,2})\s*\)"
+    r"|"
+    r"\b(\d{4})/(\d{1,2})/(\d{1,2})\b"
+)
 # count: \(\s*\d+\s*\) — 任何 paren 內純數字。
 # 為了不抓到日期 (年是 4 位)，caller 會先 mask date span 再 search。
 # 大於 MAX_COUNT 的會在 sanity check 時擋下，這裡先放寬接受任意位數。
@@ -165,17 +172,17 @@ def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
     rel_start = 0
     rel_end = end - start
 
-    # 3. Date (segment 內第一個 YYYY/MM/DD)
+    # 3. Date (segment 內第一個 YYYY/MM/DD，paren 可省)
     date_m = _UVB_DATE_RE.search(segment)
     if not date_m:
         return None
+    # [v20.11] regex 有兩組: 1-3 (帶 paren) / 4-6 (不帶 paren)
+    y = date_m.group(1) or date_m.group(4)
+    m = date_m.group(2) or date_m.group(5)
+    d = date_m.group(3) or date_m.group(6)
     try:
-        last_date = date(
-            int(date_m.group(1)),
-            int(date_m.group(2)),
-            int(date_m.group(3)),
-        )
-    except ValueError:
+        last_date = date(int(y), int(m), int(d))
+    except (ValueError, TypeError):
         return None
 
     # 4. Count (segment 內第一個數字 paren，排除 date 範圍)
@@ -276,12 +283,19 @@ def format_uvb_line(original: UvbLineInfo, *, new_dose: int,
         )
 
     # 3. 替換日期 — 用零填充格式 YYYY/MM/DD
+    # [v20.11] 原日期可能帶或不帶 paren — 偵測原本格式 → 同樣格式寫回
     today_str = f"{today.year}/{today.month:02d}/{today.day:02d}"
-    # 原日期可能 (2026/5/26) 或 (2026/05/26)，都改成 zero-padded
-    simple_re = (rf"\(\s*{original.last_date.year}"
-                 rf"/0?{original.last_date.month}"
-                 rf"/0?{original.last_date.day}\s*\)")
-    src = re.sub(simple_re, f"({today_str})", src, count=1)
+    old_y = original.last_date.year
+    old_m = original.last_date.month
+    old_d = original.last_date.day
+    with_paren_re = rf"\(\s*{old_y}/0?{old_m}/0?{old_d}\s*\)"
+    if re.search(with_paren_re, src):
+        # 帶 paren: (2026/5/24) → (2026/05/26)
+        src = re.sub(with_paren_re, f"({today_str})", src, count=1)
+    else:
+        # 不帶 paren: 2026/5/24 → 2026/05/26 (注意 word boundary 避免誤改其他數字)
+        bare_re = rf"\b{old_y}/0?{old_m}/0?{old_d}\b"
+        src = re.sub(bare_re, today_str, src, count=1)
 
     return src
 
@@ -299,6 +313,7 @@ class UvbUpdateResult:
     parsed: Optional[UvbLineInfo] = None # 原 parse 結果 (debug 用)
     sanity_reason: Optional[str] = None  # action=SANITY_FAIL 時的失敗原因 (給警告顯示)
     uvb_line_count: int = 0              # 處置內有幾行 UVB (≥2 給 info log)
+    additional_lines_updated: int = 0    # [v20.11] 同日期額外更新的 UVB 行數
 
 
 def _count_uvb_lines(text: str) -> int:
@@ -408,7 +423,44 @@ def update_uvb_in_text(text: str, today: Optional[date] = None) -> UvbUpdateResu
         new_count = parsed.count + 1
     new_line = format_uvb_line(parsed, new_dose=new_dose, new_count=new_count,
                                today=today)
-    new_text = text[:parsed.span[0]] + new_line + text[parsed.span[1]:]
+
+    # [v20.11] 多行 UVB 同日期都要更新 — 找後續行 last_date 跟第一行相同就一起更新
+    # (不同 dose/MAX 各自獨立計算)
+    additional_updates: list = []  # [(abs_span, new_line_text)]
+    cursor_in_text = parsed.span[1]
+    while True:
+        rest = text[cursor_in_text:]
+        next_uvb = parse_uvb_line(rest)
+        if next_uvb is None:
+            break
+        if next_uvb.last_date != parsed.last_date:
+            # 不同日期 (通常是更早的歷史紀錄) → 不動，停止
+            break
+        # 同日期 — 用該行自己的 dose/increase/MAX 算
+        next_new_dose = compute_new_dose(
+            dose=next_uvb.dose, increase=next_uvb.increase,
+            max_dose=next_uvb.max_dose, days_diff=days_diff,
+        )
+        if next_new_dose is None:
+            # 不該發生 (days_diff 已過 too_close 檢查)
+            break
+        next_new_count = (next_uvb.count + 1
+                          if next_uvb.count is not None else None)
+        next_new_line = format_uvb_line(
+            next_uvb, new_dose=next_new_dose, new_count=next_new_count,
+            today=today)
+        abs_span = (cursor_in_text + next_uvb.span[0],
+                    cursor_in_text + next_uvb.span[1])
+        additional_updates.append((abs_span, next_new_line))
+        cursor_in_text += next_uvb.span[1]
+
+    # 套用所有 update — 從後到前避免 offset 失效
+    new_text = text
+    for span, line in reversed(additional_updates):
+        new_text = new_text[:span[0]] + line + new_text[span[1]:]
+    # 最後套第一行 (offset 最前面)
+    new_text = (new_text[:parsed.span[0]] + new_line
+                + new_text[parsed.span[1]:])
 
     # ─── Round-trip verify: 重新 parse 新 text 確認結果一致 ─────────────
     # 防 format_uvb_line 因為奇怪格式沒替換成功，dose/count/date 跟預期不符
@@ -442,4 +494,5 @@ def update_uvb_in_text(text: str, today: Optional[date] = None) -> UvbUpdateResu
         days_diff=days_diff,
         parsed=parsed,
         uvb_line_count=uvb_lines,
+        additional_lines_updated=len(additional_updates),
     )
