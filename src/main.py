@@ -1764,71 +1764,84 @@ def _show_uvb_warning(main_hwnd: int, title: str, msg: str) -> None:
         logging.debug("MessageBox 例外", exc_info=True)
 
 
-def _f23_update_uvb_dose(label: str = "F2") -> bool:
-    """[v20.5 2026-05-26] F2/F3 UVB 自動劑量更新 — strict mode。
+def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
+    """[v20.9 2026-05-26] F1 / F2/F3 共用核心邏輯。
 
-    「確保資訊正確，不確定就停下來」— 任何 uncertain case 都警告 + 終止
-    (不再 fallback 跑 51019)。只有 UPDATED 才繼續走 51019+療程。
+    strict=True (F2/F3): 沒 UVB / TMemo 空 / 找不到主視窗 → 警告 + return False
+        (call site: F2/F3 — 第 2/3 次照光，處置一定要有 UVB 行)
 
-    回 True → 繼續走 51019+療程 (僅 UPDATED 才回)
-    回 False → 警告 + 終止 F2/F3
+    strict=False (F1): 上述情境 → 跳過 + return True
+        (call site: F1 — 第一次照光，沒 UVB 是正常情況不警告)
 
-    Stop conditions (各自跳警告):
-      - 找不到主視窗 / 處置 TMemo / TMemo 文字
-      - NO_UVB_LINE: F2/F3 沒看到 UVB → 異常
-      - PARSE_FAIL: UVB 行格式不認得
-      - TOO_CLOSE: 0-1 天間隔
-      - SANITY_FAIL: 劑量/次數/日期超出合理範圍 / 寫回 round-trip 失敗
-      - WM_SETTEXT 寫回失敗
-      - 寫回後實機 read 結果跟預期不一致
+    其他 uncertain (PARSE_FAIL / SANITY_FAIL / TOO_CLOSE / 寫回失敗) 兩個 mode
+    都會跳警告 — 這些是真實異常，user 都該知道。
+
+    回 True → caller 可繼續 (UPDATED / strict=False 路徑下的 best-effort skip)
+    回 False → caller 應終止 (僅 strict=True 路徑會回此值)
     """
     main_hwnd = _find_hospital_main_window()
     if not main_hwnd:
-        logging.warning("[%s][UVB] 找不到主程式視窗 → 終止", label)
-        _show_uvb_warning(
-            0, "UVB 自動更新失敗",
-            f"找不到西醫門診主視窗\n\n{label} 已停止，請檢查主程式狀態。")
-        return False
+        if strict:
+            logging.warning("[%s][UVB] 找不到主程式視窗 → 終止", label)
+            _show_uvb_warning(
+                0, "UVB 自動更新失敗",
+                f"找不到西醫門診主視窗\n\n{label} 已停止，請檢查主程式狀態。")
+            return False
+        logging.info("[%s][UVB] 找不到主程式視窗 — 跳過 (best-effort)", label)
+        return True
 
     memo_hwnd = _find_disposition_memo(main_hwnd, keyword="UVB")
     if not memo_hwnd:
-        logging.warning("[%s][UVB] 處置內無 UVB 行 (見 [UVB][find] candidates) "
-                        "→ 終止", label)
-        _show_uvb_warning(
-            main_hwnd, "UVB 自動更新失敗",
-            f"處置欄找不到含 UVB 的內容\n\n"
-            f"{label} 已停止 — 請確認:\n"
-            f"  • 病人是否真的有照光療程?\n"
-            f"  • 處置欄是否需要先填 UVB 行 (用 DITTO/醫師上次帶入)?\n\n"
-            f"確認後請手動處理。")
-        return False
+        if strict:
+            logging.warning(
+                "[%s][UVB] 處置內無 UVB 行 (見 [UVB][find] candidates) "
+                "→ 終止", label)
+            _show_uvb_warning(
+                main_hwnd, "UVB 自動更新失敗",
+                f"處置欄找不到含 UVB 的內容\n\n"
+                f"{label} 已停止 — 請確認:\n"
+                f"  • 病人是否真的有照光療程?\n"
+                f"  • 處置欄是否需要先填 UVB 行 (用 DITTO/醫師上次帶入)?\n\n"
+                f"確認後請手動處理。")
+            return False
+        logging.info("[%s][UVB] 處置內無 UVB 行 — 跳過 (新病人正常情況)", label)
+        return True
 
     text = _read_tmemo_text(memo_hwnd)
     if not text:
-        logging.warning("[%s][UVB] TMemo hwnd=%s 讀文字為空 → 終止",
-                        label, memo_hwnd)
-        _show_uvb_warning(
-            main_hwnd, "UVB 自動更新失敗",
-            f"處置 TMemo 讀取為空\n\n{label} 已停止。")
-        return False
+        if strict:
+            logging.warning("[%s][UVB] TMemo hwnd=%s 讀文字為空 → 終止",
+                            label, memo_hwnd)
+            _show_uvb_warning(
+                main_hwnd, "UVB 自動更新失敗",
+                f"處置 TMemo 讀取為空\n\n{label} 已停止。")
+            return False
+        logging.info("[%s][UVB] TMemo 讀文字為空 — 跳過", label)
+        return True
 
     try:
         from cmuh_common.uvb_dose import update_uvb_in_text, UvbAction
     except Exception:
         logging.exception("[%s][UVB] import cmuh_common.uvb_dose 失敗", label)
-        _show_uvb_warning(
-            main_hwnd, "UVB 自動更新失敗",
-            f"UVB 邏輯模組載入失敗\n\n{label} 已停止，請聯絡開發者。")
-        return False
+        if strict:
+            _show_uvb_warning(
+                main_hwnd, "UVB 自動更新失敗",
+                f"UVB 邏輯模組載入失敗\n\n{label} 已停止，請聯絡開發者。")
+            return False
+        return True
 
     result = update_uvb_in_text(text)
 
     if result.action == UvbAction.NO_UVB_LINE:
-        logging.warning("[%s][UVB] NO_UVB_LINE → 終止", label)
-        _show_uvb_warning(
-            main_hwnd, "UVB 自動更新失敗",
-            f"處置內找不到可解析的 UVB 行\n\n{label} 已停止。")
-        return False
+        # parse_uvb_line 找不到 — 對 F1 是正常情況、F2/F3 是異常
+        if strict:
+            logging.warning("[%s][UVB] NO_UVB_LINE → 終止", label)
+            _show_uvb_warning(
+                main_hwnd, "UVB 自動更新失敗",
+                f"處置內找不到可解析的 UVB 行\n\n{label} 已停止。")
+            return False
+        logging.info("[%s][UVB] NO_UVB_LINE — 跳過 (新病人正常)", label)
+        return True
 
     if result.action == UvbAction.PARSE_FAIL:
         logging.warning(
@@ -1911,11 +1924,39 @@ def _f23_update_uvb_dose(label: str = "F2") -> bool:
     return True
 
 
+def _f23_update_uvb_dose(label: str = "F2") -> bool:
+    """F2/F3 UVB 自動更新 — strict mode。
+    回 False → caller (script_F2/F3_adaptive) 應終止 (不跑 51019)。
+    """
+    return _update_uvb_dose_core(label, strict=True)
+
+
+def _f1_update_uvb_dose_if_present(label: str = "F1") -> None:
+    """[v20.9] F1 UVB 自動更新 — 寬鬆 mode。
+
+    F1 = 第一次照光，處置可能沒寫 UVB → NO_UVB_LINE 是正常情境不警告。
+    其他真實異常 (parse fail / sanity fail / too close / 寫回失敗) 仍警告。
+
+    F1 流程是先 51019 後 UVB，所以這個函數沒有 abort 51019 的意義 —
+    不論 return 值都不影響 51019 (已執行完)。caller 不需要看 return。
+    """
+    _update_uvb_dose_core(label, strict=False)
+
+
 def script_F1_adaptive():
-    """F1: 照光 (1) — 51019 + 療程 1。"""
+    """F1: 照光 (1) — 51019 + 療程 1，之後若有 UVB 行則更新 (寬鬆 mode)。
+
+    [v20.9 2026-05-26] 加 UVB 更新 (best-effort)。
+    流程跟 F2/F3 相反: F1 是先 51019 後 UVB。
+      - 沒 UVB → 跳過、不警告 (新病人正常情況)
+      - 有 UVB → 套同樣劑量規則更新
+      - PARSE_FAIL/SANITY_FAIL/TOO_CLOSE/寫回失敗 仍警告 (跟 F2/F3 同)
+    """
     logging.info("--- Executing F1 (照光 1) ---")
     ok = _script_code_input_adaptive("51019", label="F1", set_療程=1)
-    logging.info("F1 (照光 1): %s", "done" if ok else "skipped")
+    logging.info("F1 (照光 1) 51019+療程: %s", "done" if ok else "skipped")
+    # 接著 UVB 更新 (best-effort, 沒 UVB 不警告也不終止)
+    _f1_update_uvb_dose_if_present(label="F1")
 
 
 def script_F2_adaptive():
