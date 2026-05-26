@@ -63,6 +63,10 @@ def _returns_inside_not_ok_guard(func: ast.FunctionDef) -> bool:
     return False
 
 
+def _has_return(func: ast.FunctionDef) -> bool:
+    return any(isinstance(node, ast.Return) for node in ast.walk(func))
+
+
 def _constant_strings(func: ast.FunctionDef) -> set[str]:
     return {
         node.value
@@ -134,6 +138,41 @@ def test_f2_f3_warn_when_code_input_fails_after_uvb_update():
             < _first_call_line(func, "_show_light_code_incomplete_warning")
         )
         assert len(_call_lines(func, "_show_light_code_incomplete_warning")) == 1
+
+
+def test_hotkey_scripts_return_completion_status():
+    source_path = ROOT / "src" / "main.py"
+
+    for name in (
+        "script_F1_adaptive",
+        "script_F2_adaptive",
+        "script_F3_adaptive",
+        "script_F4_adaptive",
+        "script_F5_adaptive",
+        "script_F9_adaptive",
+        "script_F10_adaptive",
+        "script_F11_adaptive",
+    ):
+        assert _has_return(_function_node(source_path, name)), name
+
+
+def test_run_subsystem_reports_incomplete_return_status():
+    source_path = ROOT / "src" / "main.py"
+    src = _function_source(source_path, "run_subsystem_in_thread")
+
+    assert "result = func()" in src
+    assert "if result is False:" in src
+    assert "操作未完成" in src
+    assert src.index("if result is False:") < src.index("操作完成")
+
+
+def test_f9_f10_consent_menu_post_is_checked():
+    source_path = ROOT / "src" / "main.py"
+    src = _function_source(source_path, "script_F9_F10_consent_form_adaptive")
+
+    assert "_send_yiling_menu_command(main_hwnd, MENU_ID_同意書)" in src
+    assert src.count("_send_yiling_menu_command(main_hwnd, MENU_ID_同意書)") >= 2
+    assert "PostMessageW(main_hwnd, WM_COMMAND" not in src
 
 
 def test_code_input_waits_for_focus_after_menu_command():

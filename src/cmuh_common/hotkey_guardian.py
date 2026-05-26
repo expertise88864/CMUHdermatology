@@ -37,9 +37,13 @@ def should_show_busy_notice(
         return True
 
 
-def should_emit_interrupt(subsystem_running: bool) -> bool:
+def should_emit_interrupt(
+    subsystem_running: bool,
+    *,
+    stop_already_requested: bool = False,
+) -> bool:
     """Return True when F12 has an active automation flow to interrupt."""
-    return bool(subsystem_running)
+    return bool(subsystem_running) and not bool(stop_already_requested)
 
 
 def should_emit_idle_status(

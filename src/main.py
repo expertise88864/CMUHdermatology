@@ -2167,9 +2167,10 @@ def script_F1_adaptive():
         logging.warning("F1: 51019/療程未完成，跳過 UVB 更新以避免半套寫入")
         _show_light_code_incomplete_warning(
             "F1", 1, uvb_already_updated=False)
-        return
+        return False
     # 接著 UVB 更新 (best-effort, 沒 UVB 不警告也不終止)
     _f1_update_uvb_dose_if_present(label="F1")
+    return True
 
 
 def script_F2_adaptive():
@@ -2180,13 +2181,15 @@ def script_F2_adaptive():
     logging.info("--- Executing F2 (照光 2) ---")
     if not _f23_update_uvb_dose(label="F2"):
         logging.info("F2: UVB 前置檢查/更新未完成，已終止 (跳過 51019)")
-        return
+        return False
     ok = _script_code_input_adaptive("51019", label="F2", set_療程=2)
     logging.info("F2 (照光 2): %s", "done" if ok else "skipped")
     if not ok:
         logging.warning("F2: UVB 已更新，但 51019/療程2 未確認完成")
         _show_light_code_incomplete_warning(
             "F2", 2, uvb_already_updated=True)
+        return False
+    return True
 
 
 def script_F3_adaptive():
@@ -2197,13 +2200,15 @@ def script_F3_adaptive():
     logging.info("--- Executing F3 (照光 3) ---")
     if not _f23_update_uvb_dose(label="F3"):
         logging.info("F3: UVB 前置檢查/更新未完成，已終止 (跳過 51019)")
-        return
+        return False
     ok = _script_code_input_adaptive("51019", label="F3", set_療程=3)
     logging.info("F3 (照光 3): %s", "done" if ok else "skipped")
     if not ok:
         logging.warning("F3: UVB 已更新，但 51019/療程3 未確認完成")
         _show_light_code_incomplete_warning(
             "F3", 3, uvb_already_updated=True)
+        return False
+    return True
 
 
 def script_F5_adaptive():
@@ -2211,6 +2216,7 @@ def script_F5_adaptive():
     logging.info("--- Executing F5 (KOH 13017) ---")
     ok = _script_code_input_adaptive("13017", label="F5", set_療程=None)
     logging.info("F5 (KOH): %s", "done" if ok else "skipped")
+    return bool(ok)
 
 
 # =============================================================================
@@ -3001,6 +3007,7 @@ def script_F11_adaptive():
     logging.info("--- Executing F11 (快速完成 adaptive) ---")
     ok = _run_with_foreground_protector(_f11_快速完成_main, label="F11")
     logging.info("F11: %s", "done" if ok else "中斷")
+    return bool(ok)
 
 
 def _find_療程_edit_hwnd(main_hwnd: int) -> int:
@@ -3117,6 +3124,7 @@ def script_F4_adaptive():
     logging.info("--- Executing F4 (冷凍 51017) ---")
     ok = _script_code_input_adaptive("51017", label="F4", set_療程=None)
     logging.info("F4 (冷凍): %s", "done" if ok else "skipped")
+    return bool(ok)
 
 
 # =============================================================================
@@ -4225,10 +4233,10 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
     if not main_hwnd:
         logging.warning("[%s] 找不到主程式視窗", label)
         return False
-    WM_COMMAND = 0x0111
     # 用 Post (非同步) 避免 SendMessage 卡住 (實測 2026-05-18 12:43)
-    ctypes.windll.user32.PostMessageW(main_hwnd, WM_COMMAND,
-                                        MENU_ID_同意書, 0)
+    if not _send_yiling_menu_command(main_hwnd, MENU_ID_同意書):
+        logging.warning("[%s] 同意書 WM_COMMAND 送出失敗", label)
+        return False
     logging.info("[%s] 已觸發 其他→同意書 (id=%s, Post)", label, MENU_ID_同意書)
 
     # Step 2: 等 TOrMain 視窗出現
@@ -4239,8 +4247,9 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
                                  timeout=25)
     if not or_hwnd:
         logging.warning("[%s] 等 TOrMain 25s 超時，重 Post WM_COMMAND 再試 1 次", label)
-        ctypes.windll.user32.PostMessageW(main_hwnd, WM_COMMAND,
-                                            MENU_ID_同意書, 0)
+        if not _send_yiling_menu_command(main_hwnd, MENU_ID_同意書):
+            logging.warning("[%s] 同意書 retry WM_COMMAND 送出失敗", label)
+            return False
         or_hwnd = _wait_for_window("TOrMain", title_kw="同意書開立作業",
                                      timeout=15)
         if not or_hwnd:
@@ -4384,6 +4393,7 @@ def script_F9_adaptive():
         script_F9_F10_consent_form_adaptive,
         "MO04", phrase_row_所患=3, phrase_row_手術=0, label="F9")
     logging.info("F9 (adaptive): %s", "R1-R4 done" if ok else "中斷")
+    return bool(ok)
 
 
 def script_F10_adaptive():
@@ -4397,6 +4407,7 @@ def script_F10_adaptive():
         script_F9_F10_consent_form_adaptive,
         "MU02", phrase_row_所患=0, phrase_row_手術=1, label="F10")
     logging.info("F10 (adaptive): %s", "R1-R4 done" if ok else "中斷")
+    return bool(ok)
 
 
 def _get_ime_focus_hwnd():
@@ -10342,8 +10353,12 @@ class AutomationApp:
             logging.info(f"Starting subsystem from {hotkey_name}...")
             put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 執行中...'))
             try:
-                func()
-                put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 操作完成'))
+                result = func()
+                if result is False:
+                    logging.warning("Subsystem from %s returned incomplete status", hotkey_name)
+                    put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 操作未完成，請檢查畫面'))
+                else:
+                    put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 操作完成'))
             except SubsystemInterrupted as e:
                 logging.warning(f"Subsystem stopped: {e}")
                 put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 已由F12手動終止'))
@@ -10366,7 +10381,10 @@ class AutomationApp:
         thread.start()
 
     def interrupt_automation(self):
-        if not should_emit_interrupt(getattr(self, '_subsystem_running', False)):
+        if not should_emit_interrupt(
+            getattr(self, '_subsystem_running', False),
+            stop_already_requested=stop_event_automation.is_set(),
+        ):
             logging.debug("Received F12 but no automation is running; ignored.")
             return
         logging.warning("Received F12: Interrupting...")

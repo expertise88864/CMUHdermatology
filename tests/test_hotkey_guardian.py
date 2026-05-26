@@ -74,6 +74,7 @@ def test_busy_notice_tolerates_bad_timestamps():
 def test_interrupt_emits_only_when_automation_is_running():
     assert should_emit_interrupt(True) is True
     assert should_emit_interrupt(False) is False
+    assert should_emit_interrupt(True, stop_already_requested=True) is False
 
 
 def test_idle_status_emits_only_for_latest_finished_worker():
