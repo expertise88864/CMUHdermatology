@@ -1503,7 +1503,9 @@ def _drain_pending_retriggers() -> None:
         _pending_retriggers.clear()
 
     def _delayed():
-        time.sleep(_RETRIGGER_DELAY_SEC)
+        if not _sleep_while_running(_RETRIGGER_DELAY_SEC):
+            logging.info("[re-trigger] 程式正在關閉，略過 pending 補跑")
+            return
         for label, override in pending.items():
             logging.info(
                 "[re-trigger] 補跑被 task_gate 擋下的觸發：%s", label)

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import sys
+import inspect
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -91,3 +92,10 @@ def test_self_process_cache_recovers_after_read_failure(monkeypatch):
     assert health._self_process is None
     assert health._get_rss_mb() == 21
     assert FakeProcess.created == 2
+
+
+def test_health_loop_continues_checks_when_rss_unavailable():
+    src = inspect.getsource(health._health_loop)
+
+    assert "continuing network/disk checks" in src
+    assert "time.sleep(interval_sec * 6)" not in src

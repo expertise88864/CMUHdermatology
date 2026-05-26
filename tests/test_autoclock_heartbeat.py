@@ -168,3 +168,54 @@ def test_run_immediate_test_skips_duplicate_until_worker_finishes(monkeypatch):
 
     assert ran == ["test"]
     assert len(targets) == 2
+
+
+def test_scheduler_tick_skips_duplicate_clock_task_until_worker_finishes(monkeypatch):
+    targets = []
+    ran = []
+
+    class FakeThread:
+        def __init__(self, *, target, name=None, daemon=None):
+            targets.append(target)
+            self.name = name
+            self.daemon = daemon
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(autoclock, "_clock_task_gate",
+                        autoclock.ActiveTaskGate(stale_after_sec=600))
+    monkeypatch.setattr(autoclock, "get_sched_key", lambda: "mon_am_in")
+    monkeypatch.setattr(autoclock, "process_clock_task",
+                        lambda key: ran.append(key))
+    monkeypatch.setattr(autoclock.threading, "Thread", FakeThread)
+
+    autoclock._scheduler_tick()
+    autoclock._scheduler_tick()
+
+    assert len(targets) == 1
+    assert ran == []
+
+    targets[0]()
+    autoclock._scheduler_tick()
+
+    assert ran == ["mon_am_in"]
+    assert len(targets) == 2
+
+
+def test_scheduler_tick_does_not_start_worker_outside_clock_window(monkeypatch):
+    targets = []
+
+    class FakeThread:
+        def __init__(self, *, target, name=None, daemon=None):
+            targets.append(target)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(autoclock, "get_sched_key", lambda: None)
+    monkeypatch.setattr(autoclock.threading, "Thread", FakeThread)
+
+    autoclock._scheduler_tick()
+
+    assert targets == []

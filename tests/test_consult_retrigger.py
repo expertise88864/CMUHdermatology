@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import json
+import inspect
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
@@ -134,6 +135,45 @@ def test_drain_with_empty_queue_does_nothing(monkeypatch):
     consult_query._drain_pending_retriggers()
     time.sleep(0.1)
     assert triggered == []
+
+
+def test_pending_retrigger_drain_skips_when_app_is_stopping(monkeypatch):
+    with consult_query._pending_retriggers_lock:
+        consult_query._pending_retriggers.clear()
+
+    triggered = []
+
+    class ImmediateThread:
+        def __init__(self, *, target, name=None, daemon=None):
+            self.target = target
+            self.name = name
+            self.daemon = daemon
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(consult_query.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(consult_query, "trigger_job_async",
+                        lambda label, override_recipients=None:
+                            triggered.append((label, override_recipients)))
+
+    consult_query._enqueue_pending_retrigger("email", ["a@example.com"])
+    consult_query.running.clear()
+    try:
+        consult_query._drain_pending_retriggers()
+    finally:
+        consult_query.running.set()
+
+    assert triggered == []
+    with consult_query._pending_retriggers_lock:
+        assert consult_query._pending_retriggers == {}
+
+
+def test_pending_retrigger_delay_is_cancelable():
+    src = inspect.getsource(consult_query._drain_pending_retriggers)
+
+    assert "_sleep_while_running(_RETRIGGER_DELAY_SEC)" in src
+    assert "time.sleep(_RETRIGGER_DELAY_SEC)" not in src
 
 
 def test_tray_test_email_skips_duplicate_until_worker_finishes(monkeypatch):
