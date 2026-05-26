@@ -1993,6 +1993,28 @@ def _f11_handle_oral_screening(hwnd: int, label: str = "") -> bool:
     return False
 
 
+def _f11_handle_history_ditto_confirm(hwnd: int, label: str = "") -> bool:
+    """門診病史徵候確認事項 popup (class=TfAskDlg, title 含 '門診病史徵候確認')：
+    點「本次看診不修改」(Ditto 病歷異動超過 10% 提醒，皮膚科 F11 跳過修改)。
+
+    [2026-05-26] snapshot_20260526_101708 證實 popup 結構：
+      - class=TfAskDlg, title=門診病史徵候確認事項
+      - 2 個 TButton: 「回主畫面」/「本次看診不修改」
+      - 內容: 「病委會決議 Ditto 資料後病歷，需異動超過 10%，目前尚需異動 N 個字」
+    跟其他 TfAskDlg handlers 共用 class，靠 watcher 的 title_kw 過濾分流。
+    """
+    logging.info("[%s] 門診病史徵候確認 popup hwnd=%s → 本次看診不修改",
+                 label, hwnd)
+    time.sleep(0.15)
+    check_stop()
+    if _click_button_normalized_text(hwnd, "本次看診不修改"):
+        logging.info("[%s]   已點 本次看診不修改", label)
+        _wait_window_closed(hwnd, timeout=5)
+        return True
+    logging.warning("[%s]   找不到 本次看診不修改 button", label)
+    return False
+
+
 def _f11_handle_primary_care_refer(hwnd: int, label: str = "") -> bool:
     """健保初級照護轉診訊息 (class=TfChkSpecList)：
     勾「99.本院療程尚未結束，本次不轉院」TGroupButton → 點「確認」TButton。
@@ -2164,6 +2186,7 @@ _F11_POPUP_HANDLERS = [
     ("TFOPDPreg",       "",              _f11_handle_appt),
     ("TfAskDlg",        "乳房篩檢",       _f11_handle_breast_screening),
     ("TfAskDlg",        "口腔黏膜篩檢",    _f11_handle_oral_screening),
+    ("TfAskDlg",        "門診病史徵候確認", _f11_handle_history_ditto_confirm),
     ("TMessageForm",    "西醫門診系統",   _f11_handle_message_ok),
     ("TFTunMsg",        "病人轉診",       _f11_handle_transfer_msg),
     ("TfChkSpecList",   "健保初級照護",   _f11_handle_primary_care_refer),
