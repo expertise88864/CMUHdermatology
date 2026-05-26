@@ -1621,10 +1621,16 @@ def _script_code_input_adaptive(code: str, label: str = "",
             WM_SETTEXT = 0x000C
             text_buf = ctypes.c_wchar_p(str(set_療程))
             try:
-                ctypes.windll.user32.SendMessageW(
+                ret = ctypes.windll.user32.SendMessageW(
                     liaocheng_hwnd, WM_SETTEXT, 0, text_buf)
                 logging.info("[%s] 療程欄位 (hwnd=%s) WM_SETTEXT='%s'",
                               label, liaocheng_hwnd, set_療程)
+                if not ret:
+                    logging.warning("[%s] WM_SETTEXT 療程 回傳失敗，fallback click",
+                                    label)
+                    if not _replace_edit_text(liaocheng_hwnd, str(set_療程),
+                                              main_hwnd=hwnd):
+                        workflow_ok = False
             except Exception:
                 logging.warning("[%s] WM_SETTEXT 療程 失敗，fallback click",
                                  label, exc_info=True)

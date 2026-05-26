@@ -29,6 +29,34 @@ def _first_call_line(func: ast.FunctionDef, dotted_name: str) -> int:
     raise AssertionError(f"call not found in {func.name}: {dotted_name}")
 
 
+def _call_lines(func: ast.FunctionDef, dotted_name: str) -> list[int]:
+    out = []
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        if isinstance(target, ast.Name) and target.id == dotted_name:
+            out.append(node.lineno)
+        elif isinstance(target, ast.Attribute):
+            base = target.value
+            if isinstance(base, ast.Name) and f"{base.id}.{target.attr}" == dotted_name:
+                out.append(node.lineno)
+    if not out:
+        raise AssertionError(f"call not found in {func.name}: {dotted_name}")
+    return sorted(out)
+
+
+def _returns_inside_not_ok_guard(func: ast.FunctionDef) -> bool:
+    for node in ast.walk(func):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            if isinstance(test.operand, ast.Name) and test.operand.id == "ok":
+                return any(isinstance(child, ast.Return) for child in ast.walk(node))
+    return False
+
+
 def _constant_strings(func: ast.FunctionDef) -> set[str]:
     return {
         node.value
@@ -69,3 +97,34 @@ def test_scheduler_background_launches_check_mutex_before_spawn():
 
     _assert_autoclock_launch_guard(source_path)
     _assert_consult_launch_guard(source_path)
+
+
+def test_f1_does_not_update_uvb_when_code_input_fails():
+    source_path = ROOT / "src" / "main.py"
+    func = _function_node(source_path, "script_F1_adaptive")
+
+    assert (
+        _first_call_line(func, "_script_code_input_adaptive")
+        < _first_call_line(func, "_f1_update_uvb_dose_if_present")
+    )
+    assert _returns_inside_not_ok_guard(func)
+    assert (
+        _first_call_line(func, "_show_light_code_incomplete_warning")
+        < _first_call_line(func, "_f1_update_uvb_dose_if_present")
+    )
+
+
+def test_f2_f3_warn_when_code_input_fails_after_uvb_update():
+    source_path = ROOT / "src" / "main.py"
+
+    for name in ("script_F2_adaptive", "script_F3_adaptive"):
+        func = _function_node(source_path, name)
+        assert (
+            _first_call_line(func, "_f23_update_uvb_dose")
+            < _first_call_line(func, "_script_code_input_adaptive")
+        )
+        assert (
+            _first_call_line(func, "_script_code_input_adaptive")
+            < _first_call_line(func, "_show_light_code_incomplete_warning")
+        )
+        assert len(_call_lines(func, "_show_light_code_incomplete_warning")) == 1
