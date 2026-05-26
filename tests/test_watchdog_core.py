@@ -228,6 +228,16 @@ def test_get_loop_timing_enforces_minimums():
     assert interval == 5
 
 
+def test_get_loop_timing_enforces_maximums():
+    heartbeat, interval = wc.get_loop_timing({
+        "heartbeat_log_sec": 999999,
+        "check_interval_sec": 999999,
+    })
+
+    assert heartbeat == 3600
+    assert interval == 300
+
+
 def test_run_one_tick_logs_crash_loop_suspend_message(monkeypatch):
     messages = []
 

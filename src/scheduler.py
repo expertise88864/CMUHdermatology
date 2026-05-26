@@ -2686,7 +2686,7 @@ class AutomationApp:
         self.hotkey_display_note = tk.StringVar(value="")
         self._log_backlog = []
 
-        self.ui_queue = Queue()
+        self.ui_queue = Queue(maxsize=10000)
         self.all_doctors_data = {}
         self.master_schedule = master_schedule
         self._master_schedule_by_weekday = defaultdict(list)

@@ -512,9 +512,15 @@ def _coerce_float(value, default: float, *, min_value: float | None = None) -> f
 
 def get_loop_timing(cfg: dict) -> tuple[int, int]:
     """Return (heartbeat_log_sec, check_interval_sec) with safe bounds."""
-    heartbeat = _coerce_int(cfg.get("heartbeat_log_sec", 300), 300, min_value=1)
+    heartbeat = min(
+        3600,
+        _coerce_int(cfg.get("heartbeat_log_sec", 300), 300, min_value=1),
+    )
     # [v8 2026-05-25] default 30→60 (見 DEFAULT_CONFIG 註解)
-    interval = _coerce_int(cfg.get("check_interval_sec", 60), 60, min_value=5)
+    interval = min(
+        300,
+        _coerce_int(cfg.get("check_interval_sec", 60), 60, min_value=5),
+    )
     return heartbeat, interval
 
 

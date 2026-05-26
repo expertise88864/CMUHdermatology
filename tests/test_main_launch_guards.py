@@ -195,6 +195,14 @@ def test_main_and_scheduler_log_queues_are_bounded():
         assert "self.log_queue = Queue()" not in src
 
 
+def test_main_and_scheduler_ui_queues_are_bounded():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = (ROOT / rel_path).read_text(encoding="utf-8")
+
+        assert "self.ui_queue = Queue(maxsize=10000)" in src
+        assert "self.ui_queue = Queue()" not in src
+
+
 def test_main_and_scheduler_ui_queue_polling_is_bounded():
     for rel_path in ("src/main.py", "src/scheduler.py"):
         src = _function_source(ROOT / rel_path, "process_ui_queue")
