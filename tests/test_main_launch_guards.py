@@ -15,6 +15,12 @@ def _function_node(source_path: Path, name: str) -> ast.FunctionDef:
     raise AssertionError(f"function not found in {source_path.name}: {name}")
 
 
+def _function_source(source_path: Path, name: str) -> str:
+    source = source_path.read_text(encoding="utf-8")
+    node = _function_node(source_path, name)
+    return ast.get_source_segment(source, node) or ""
+
+
 def _first_call_line(func: ast.FunctionDef, dotted_name: str) -> int:
     for node in ast.walk(func):
         if not isinstance(node, ast.Call):
@@ -147,3 +153,7 @@ def test_code_input_waits_for_focus_after_menu_command():
         if isinstance(node, ast.Constant)
     }
     assert 0.6 in constants
+
+    wait_src = _function_source(source_path, "_wait_for_code_input_focus")
+    assert "is_input_like and (focus != previous_focus or not previous_focus)" in wait_src
+    assert "return 0" in wait_src
