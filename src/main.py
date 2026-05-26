@@ -1832,6 +1832,39 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
 
     result = update_uvb_in_text(text)
 
+    # [v20.12 2026-05-26] CONFIRM_NEEDED — dose / MAX 超過建議上限 (1500 mj/cm2)
+    # 跳 Yes/No dialog，按 Yes 重 call 帶 skip_dose_sanity=True 跳過上限檢查。
+    if result.action == UvbAction.CONFIRM_NEEDED:
+        confirm_reason = result.confirm_reason or "原劑量或 MAX 超過建議上限"
+        logging.info("[%s][UVB] CONFIRM_NEEDED: %s — 跳 Yes/No 確認",
+                     label, confirm_reason)
+        try:
+            import winsound
+            winsound.MessageBeep(0x30)
+        except Exception:
+            pass
+        # MB_ICONQUESTION(0x20) | MB_YESNO(0x4) | MB_TOPMOST(0x40000)
+        # | MB_SETFOREGROUND(0x10000) | MB_DEFBUTTON2(0x100) — 預設「否」
+        # (避免 user 隨手 Enter 就 yes 通過異常劑量)
+        flags = 0x20 | 0x4 | 0x40000 | 0x10000 | 0x100
+        try:
+            ans = ctypes.windll.user32.MessageBoxW(
+                main_hwnd,
+                f"請確認劑量\n\n{confirm_reason}\n\n要繼續執行變更嗎?",
+                f"UVB 劑量超過建議上限 - {label}",
+                flags,
+            )
+        except Exception:
+            logging.exception("[%s][UVB] CONFIRM_NEEDED MessageBoxW 失敗", label)
+            return False if strict else True
+        # IDYES = 6, IDNO = 7
+        if ans != 6:
+            logging.info("[%s][UVB] CONFIRM_NEEDED user 按否/取消 → 停止", label)
+            return False if strict else True
+        logging.info("[%s][UVB] CONFIRM_NEEDED user 按是 → "
+                     "重 call skip_dose_sanity=True", label)
+        result = update_uvb_in_text(text, skip_dose_sanity=True)
+
     if result.action == UvbAction.NO_UVB_LINE:
         # parse_uvb_line 找不到 — 對 F1 是正常情況、F2/F3 是異常
         if strict:
@@ -1914,6 +1947,12 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
         logging.info(
             "[%s][UVB] 處置含 %d 行 UVB (只改第一行，其他日期不同不動)",
             label, result.uvb_line_count)
+    if getattr(result, 'additional_triplets_updated', 0) > 0:
+        # [v20.12] 同日期 triplet (e.g. excimer light、同行繼續) 額外更新
+        logging.info(
+            "[%s][UVB] 同日期 triplet 額外更新 %d 個 "
+            "(e.g. excimer light、同行繼續 UVB segment)",
+            label, result.additional_triplets_updated)
 
     # [v20.7] count 可能 None (處置沒寫)，log 適配
     if result.new_count is None:

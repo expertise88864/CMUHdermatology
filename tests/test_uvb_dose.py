@@ -413,14 +413,15 @@ def test_sanity_fail_dose_too_low():
     r = update_uvb_in_text(text, today=date(2026, 5, 26))
     assert r.action == UvbAction.SANITY_FAIL
     assert "30" in r.sanity_reason
-    assert "範圍" in r.sanity_reason
+    # [v20.12] 改為「低於下限」(過去是「超出合理範圍」)
+    assert "下限" in r.sanity_reason or "範圍" in r.sanity_reason
 
 
-def test_sanity_fail_dose_too_high():
-    """原劑量 > MAX_DOSE (1500) → SANITY_FAIL"""
+def test_sanity_fail_dose_too_high_returns_confirm_needed():
+    """[v20.12] 原劑量 > MAX_DOSE (1500) → CONFIRM_NEEDED (改自 SANITY_FAIL)"""
     text = "UVB 2000 (5) on (2026/05/20), increase 30, MAX:2500"
     r = update_uvb_in_text(text, today=date(2026, 5, 26))
-    assert r.action == UvbAction.SANITY_FAIL
+    assert r.action == UvbAction.CONFIRM_NEEDED
 
 
 def test_sanity_fail_count_too_high():
@@ -585,9 +586,15 @@ def test_parse_date_without_parens():
 
 
 def test_update_real_world_case1_dose_2000_no_paren_date():
-    """[v20.11] case 1 完整 — dose 2000 (sanity 上限提高), no-paren date, fixed 2000"""
+    """[v20.12] case 1 — dose 2000 改為 CONFIRM_NEEDED (上限改回 1500)。
+    skip_dose_sanity=True 才能繼續更新。"""
     text = "局部 手/ 腳 UVB: 2000 mj/cm2(34) on 2026/5/24 add 100 each time, fixed 2000, take picture on 2026/1/15, W1+4N\nacitretin + MTX 3# on (2026/3/5)"
-    r = update_uvb_in_text(text, today=date(2026, 5, 26))  # 2 天差
+    # 第一次 — CONFIRM_NEEDED (dose 2000 > 1500)
+    r1 = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r1.action == UvbAction.CONFIRM_NEEDED
+    # 第二次 — skip_dose_sanity=True
+    r = update_uvb_in_text(text, today=date(2026, 5, 26),
+                           skip_dose_sanity=True)
     assert r.action == UvbAction.UPDATED
     assert r.new_dose == 2000  # 2000+100=2100 cap MAX 2000
     assert r.new_count == 35
@@ -651,19 +658,23 @@ def test_update_multi_line_different_date_no_extra_update():
     assert "UVB: 800 (100) on (2026/5/17)" in r.new_text
 
 
-def test_sanity_dose_2000_now_allowed():
-    """[v20.11] MAX_DOSE 上限 1500→2000 — dose 2000 不該觸發 SANITY_FAIL。"""
+def test_sanity_dose_2000_requires_confirm():
+    """[v20.12] MAX_DOSE 上限改回 1500 — dose 2000 → CONFIRM_NEEDED。"""
     text = "UVB 2000 (5) on (2026/05/20), increase 100, MAX:2000"
     r = update_uvb_in_text(text, today=date(2026, 5, 26))
-    assert r.action == UvbAction.UPDATED
-    assert r.new_dose == 2000
+    assert r.action == UvbAction.CONFIRM_NEEDED
+    # skip 後可以繼續
+    r2 = update_uvb_in_text(text, today=date(2026, 5, 26),
+                            skip_dose_sanity=True)
+    assert r2.action == UvbAction.UPDATED
+    assert r2.new_dose == 2000
 
 
-def test_sanity_dose_2001_still_rejected():
-    """[v20.11] dose 超過 2000 (新上限) 仍應 SANITY_FAIL。"""
+def test_sanity_dose_2001_requires_confirm():
+    """[v20.12] dose 2001 也是 CONFIRM_NEEDED (跟 2000 同類處理)。"""
     text = "UVB 2001 (5) on (2026/05/20), increase 100, MAX:2500"
     r = update_uvb_in_text(text, today=date(2026, 5, 26))
-    assert r.action == UvbAction.SANITY_FAIL
+    assert r.action == UvbAction.CONFIRM_NEEDED
 
 
 def test_parse_real_world_case_a_fixed_at():
@@ -767,3 +778,233 @@ def test_update_preserves_extra_text_after_uvb_line():
     assert r.action == UvbAction.UPDATED
     assert "W2, W5M" in r.new_text
     assert "(2025/01/15) certificate" in r.new_text
+
+
+# ─── v20.12 CONFIRM_NEEDED (dose > 1500) ────────────────────────────────
+
+def test_dose_over_1500_returns_confirm_needed():
+    """[v20.12] 原劑量 > MAX_DOSE (1500) → CONFIRM_NEEDED 而非 SANITY_FAIL。"""
+    text = (
+        "UVB: 1600 mj/cm2 (50) on (2026/5/20) add 50 each time, fixed at 1600"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.CONFIRM_NEEDED
+    assert r.confirm_reason is not None
+    assert "1600" in r.confirm_reason
+    # 不該有 new_text — 等 caller 按 Yes 才會產生
+    assert r.new_text is None
+
+
+def test_max_over_1500_returns_confirm_needed():
+    """[v20.12] dose 沒超過但 MAX > 1500 也要 CONFIRM。"""
+    text = (
+        "UVB: 1400 mj/cm2 (50) on (2026/5/20) add 50 each time, fixed at 1800"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.CONFIRM_NEEDED
+    assert "1800" in (r.confirm_reason or "")
+
+
+def test_dose_exactly_1500_no_confirm():
+    """[v20.12] dose 剛好 1500 (= MAX_DOSE) 不該 CONFIRM。"""
+    text = (
+        "UVB: 1500 mj/cm2 (50) on (2026/5/20) add 50 each time, fixed at 1500"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+
+
+def test_skip_dose_sanity_bypasses_confirm():
+    """[v20.12] skip_dose_sanity=True 跳過 dose 上限檢查，繼續執行。"""
+    text = (
+        "UVB: 1600 mj/cm2 (50) on (2026/5/20) add 50 each time, fixed at 1600"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26),
+                           skip_dose_sanity=True)
+    assert r.action == UvbAction.UPDATED
+    # +50 capped at 1600
+    assert r.new_dose == 1600
+    assert r.new_count == 51
+    assert "(51)" in r.new_text
+    assert "(2026/05/26)" in r.new_text
+
+
+def test_skip_dose_sanity_still_checks_lower_bound():
+    """[v20.12] skip_dose_sanity=True 只跳過上限，下限/其他 sanity 仍檢查。"""
+    text = (
+        "UVB: 30 mj/cm2 (50) on (2026/5/20) add 50 each time, fixed at 1600"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26),
+                           skip_dose_sanity=True)
+    assert r.action == UvbAction.SANITY_FAIL
+
+
+# ─── v20.12 多 triplet 同日期更新 ────────────────────────────────────────
+
+def test_multi_triplet_same_line_continuation():
+    """[v20.12] 同一行有兩個 UVB segments (用 / new for ... 接續)，date 一樣，
+    兩個 count 都要 +1, 兩個 date 都要 → today。"""
+    text = (
+        "局部 手+頸部 + 右前臂 UVB: 1500 mj/cm2 (136) on (2026/5/25) "
+        "/ new for left lower back 1500mj/cm2 (44) on (2026/5/25) "
+        "add 50 each time, fixed at 1500, W2, W5M"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 28))
+    assert r.action == UvbAction.UPDATED
+    # 第一個 triplet (format_uvb_line 處理)
+    assert "(137)" in r.new_text
+    # 第二個 triplet (v20.12 triplet scan 處理)
+    assert "(45)" in r.new_text
+    # 兩個日期都應為 today
+    assert r.new_text.count("(2026/05/28)") == 2
+    # 原日期應該不剩 — 兩個都被替換
+    assert "(2026/5/25)" not in r.new_text
+    assert "(2026/05/25)" not in r.new_text
+    assert r.additional_triplets_updated >= 1
+
+
+def test_excimer_light_same_date_update():
+    """[v20.12] 另一行的 excimer light 共用同一個 date，count+1 / date→today。"""
+    text = (
+        "局部 手+頸部 + 右前臂 UVB: 1500 mj/cm2 (136) on (2026/5/25) "
+        "/ new for left lower back 1500mj/cm2 (44) on (2026/5/25) "
+        "add 50 each time, fixed at 1500\n"
+        "excimer light (25) 1000mJ for nape on (2026/5/25) 2 shot, "
+        "add 30 each time, fixed at 1000"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 28))
+    assert r.action == UvbAction.UPDATED
+    # 三個 triplet 都更新: (136)→(137), (44)→(45), (25)→(26)
+    assert "(137)" in r.new_text
+    assert "(45)" in r.new_text
+    assert "(26)" in r.new_text
+    # 全部日期變 today
+    assert r.new_text.count("(2026/05/28)") == 3
+    assert "(2026/5/25)" not in r.new_text
+    assert r.additional_triplets_updated >= 2
+
+
+def test_triplet_skips_date_mismatch():
+    """[v20.12] triplet 日期跟第一行 UVB 不同的不能動。"""
+    text = (
+        "UVB: 800 mj/cm2 (50) on (2026/5/20) add 30 each time, fixed at 1000\n"
+        "excimer light (10) 500mJ on (2025/01/15) 2 shot, "
+        "add 30 each time, fixed at 800"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    # 第一行 UVB count 應該 +1
+    assert "(51)" in r.new_text
+    # excimer 日期不同 → 不動
+    assert "(10) 500mJ on (2025/01/15)" in r.new_text
+    assert r.additional_triplets_updated == 0
+
+
+def test_triplet_skips_non_uvb_context():
+    """[v20.12] (N) ... (date) 在非 UVB 相關 context 不要動 (marker 要求)。"""
+    text = (
+        "UVB: 800 mj/cm2 (50) on (2026/5/20) add 30 each time, fixed at 1000\n"
+        "歷史備註 (5) days post op on (2026/5/20) for follow up"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    # 第一行 UVB count 應該 +1
+    assert "(51)" in r.new_text
+    # 「(5) days post op」沒 UVB / excimer / mJ marker → 不動
+    assert "(5) days post op on (2026/5/20)" in r.new_text
+
+
+def test_three_places_same_date_full_pipeline():
+    """[v20.12] user 完整 case: 3 個 triplet 同日期 (UVB + 同行繼續 + excimer)。"""
+    text = (
+        "局部 手+頸部 + 右前臂 UVB: 1500 mj/cm2 (136) on (2026/5/25) "
+        "/ new for left lower back 1500mj/cm2 (44) on (2026/5/25) "
+        "add 50 each time, fixed at 1500, W2, W5M\n"
+        "excimer light (25) 1000mJ for nape on (2026/5/25) 2 shot, "
+        "add 30 each time, fixed at 1000"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 28))
+    assert r.action == UvbAction.UPDATED
+    # 主行 dose 從 1500 +50 cap 1500 → 1500 不變
+    assert r.new_dose == 1500
+    assert r.new_count == 137
+    # 確認三個 count 都 +1
+    for expected in ("(137)", "(45)", "(26)"):
+        assert expected in r.new_text, f"missing {expected} in:\n{r.new_text}"
+    # 三個日期都更新
+    assert r.new_text.count("(2026/05/28)") == 3
+    # additional_triplets_updated 至少 2 (第一個 triplet 由 format_uvb_line 處理)
+    assert r.additional_triplets_updated >= 2
+    # W2, W5M 後綴保留
+    assert "W2, W5M" in r.new_text
+    # add/fixed/each time 句子保留
+    assert "add 50 each time" in r.new_text
+    assert "add 30 each time" in r.new_text
+    assert "fixed at 1000" in r.new_text
+
+
+def test_triplet_with_zero_padding_in_original_date():
+    """[v20.12] 原日期 (2026/05/25) 帶零填充也要替換 — 不只 (2026/5/25)。"""
+    text = (
+        "UVB: 1000 mj/cm2 (50) on (2026/05/25) add 30 each time, "
+        "fixed at 1200\n"
+        "excimer light (10) 800mJ on (2026/05/25) add 30 each time, "
+        "fixed at 1000"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 28))
+    assert r.action == UvbAction.UPDATED
+    assert "(11)" in r.new_text
+    assert r.new_text.count("(2026/05/28)") == 2
+    assert "(2026/05/25)" not in r.new_text
+
+
+# ─── v20.12 CONFIRM_NEEDED + 多 triplet 互動 ────────────────────────────
+
+def test_confirm_needed_yes_then_multi_triplet_works():
+    """[v20.12] 第一次 call 跳 CONFIRM_NEEDED, 第二次 skip_dose_sanity=True
+    仍要正確處理多 triplet 同日期更新。"""
+    text = (
+        "UVB: 1700 mj/cm2 (100) on (2026/5/25) "
+        "/ new for back 1700mj/cm2 (50) on (2026/5/25) "
+        "add 50 each time, fixed at 1700\n"
+        "excimer light (20) 1100mJ for nape on (2026/5/25) "
+        "add 30 each time, fixed at 1100"
+    )
+    # 第一次 — CONFIRM_NEEDED
+    r1 = update_uvb_in_text(text, today=date(2026, 5, 28))
+    assert r1.action == UvbAction.CONFIRM_NEEDED
+    # 第二次 — skip_dose_sanity 後通過
+    r2 = update_uvb_in_text(text, today=date(2026, 5, 28),
+                            skip_dose_sanity=True)
+    assert r2.action == UvbAction.UPDATED
+    assert "(101)" in r2.new_text
+    assert "(51)" in r2.new_text
+    assert "(21)" in r2.new_text
+    assert r2.new_text.count("(2026/05/28)") == 3
+
+
+def test_confirm_needed_at_too_close_priority():
+    """[v20.12] 1 天差 priority 在 CONFIRM_NEEDED 之前 — 仍然 CONFIRM_NEEDED 先
+    (因為超過上限是更嚴重的問題，醫師應先確認)。
+
+    實際上 CONFIRM_NEEDED 在 parse 完立刻檢查，days_diff 還沒算。所以順序是
+    parse → confirm → sanity → too_close → compute。
+    """
+    text = (
+        "UVB: 1600 mj/cm2 (50) on (2026/5/25) add 50 each time, fixed at 1600"
+    )
+    # today = 5/26, days_diff = 1 (too close)
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    # 預期 CONFIRM_NEEDED 先 (因為 dose 上限是設計上 caller 該先決定)
+    assert r.action == UvbAction.CONFIRM_NEEDED
+
+
+def test_skip_dose_sanity_still_blocks_too_close():
+    """[v20.12] CONFIRM 通過後 (skip_dose_sanity=True) 但 days_diff < 2 → 仍要
+    TOO_CLOSE 警告。"""
+    text = (
+        "UVB: 1600 mj/cm2 (50) on (2026/5/25) add 50 each time, fixed at 1600"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26),
+                           skip_dose_sanity=True)
+    assert r.action == UvbAction.TOO_CLOSE
