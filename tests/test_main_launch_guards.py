@@ -203,6 +203,15 @@ def test_main_and_scheduler_ui_queues_are_bounded():
         assert "self.ui_queue = Queue()" not in src
 
 
+def test_main_and_scheduler_background_executors_are_bounded():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = (ROOT / rel_path).read_text(encoding="utf-8")
+
+        assert "BoundedThreadPoolExecutor(" in src
+        assert "self.bg_executor = ThreadPoolExecutor(" not in src
+        assert "max_pending=60" in src
+
+
 def test_main_and_scheduler_ui_queue_polling_is_bounded():
     for rel_path in ("src/main.py", "src/scheduler.py"):
         src = _function_source(ROOT / rel_path, "process_ui_queue")

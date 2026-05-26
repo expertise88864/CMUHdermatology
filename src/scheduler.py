@@ -59,6 +59,7 @@ from cmuh_common.notifications import show_windows_notification
 from cmuh_common.icons import ensure_cmuh_app_icon_path as _ensure_cmuh_app_icon_path
 from cmuh_common.window_icon import apply_tk_window_icon as _apply_tk_window_icon
 from cmuh_common.logging_setup import attach_queue_handler
+from cmuh_common.bounded_executor import BoundedThreadPoolExecutor
 from cmuh_common.hotkey_guardian import (
     should_emit_idle_status,
     should_emit_interrupt,
@@ -2694,7 +2695,12 @@ class AutomationApp:
         self._rebuild_master_schedule_index()
 
         # [核心修正]：全域執行緒任務池與互斥鎖，阻絕無限制的 Thread spawning 與字典寫入衝突
-        self.bg_executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="AppBgTask")
+        self.bg_executor = BoundedThreadPoolExecutor(
+            max_workers=10,
+            max_pending=60,
+            thread_name_prefix="AppBgTask",
+            reject_message="scheduler background task backlog is full",
+        )
         self._tracker_lock = threading.Lock()
         self._history_lock = threading.Lock()
         self._doctor_data_lock = threading.Lock()
