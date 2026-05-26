@@ -381,6 +381,12 @@ _reg52_tls = threading.local()
 _reg52_external_tls = threading.local()
 _duty_tls = threading.local()
 _reg64_tls = threading.local()
+# [v18 2026-05-25] 追蹤所有 thread-local sessions 給 atexit poolmanager.clear()
+# 用。threading.local 本身不暴露跨 thread 的 session 給 main thread，所以額外
+# 維護一個 set；建 session 時 add，atexit 時 clear adapter pool 強制斷連線。
+# (不 call session.close() 避免等待未完成 request — 跟 _kill_orphan handler 同 pattern)
+_all_reg_sessions: set = set()
+_all_reg_sessions_lock = threading.Lock()
 _ttl_cache_lock = threading.Lock()
 _ttl_cache_store = {}
 _parse_cache_store = {}
@@ -635,6 +641,35 @@ def _source_throttle_allow(source_key, interval_seconds):
         return True, 0.0
 
 
+def _register_reg_session(s):
+    """新建 thread-local session 時呼叫，給 atexit cleanup 用。"""
+    with _all_reg_sessions_lock:
+        _all_reg_sessions.add(s)
+
+
+def _atexit_clear_thread_local_sessions() -> None:
+    """[v18] 程式退出時清所有 thread-local session 的 poolmanager，
+    避免 dangling connection。跟 _kill_orphan_chromedriver 路徑同 spirit:
+    強制斷連、不等未完成 request、立刻返回。
+    """
+    with _all_reg_sessions_lock:
+        sessions = list(_all_reg_sessions)
+        _all_reg_sessions.clear()
+    for s in sessions:
+        try:
+            for adapter in s.adapters.values():
+                try:
+                    adapter.poolmanager.clear()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+import atexit as _atexit_for_sessions
+_atexit_for_sessions.register(_atexit_clear_thread_local_sessions)
+
+
 def _get_thread_local_reg52_session():
     """ThreadPool 每個工作執行緒獨立 Session：掛號 reg52 可並行，且不再與 forward01 值班查詢搶同一連線鎖。"""
     s = getattr(_reg52_tls, "session", None)
@@ -656,6 +691,7 @@ def _get_thread_local_reg52_session():
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Connection": "keep-alive",
         })
+        _register_reg_session(s)  # [v18] atexit cleanup
         _reg52_tls.session = s
     return s
 
@@ -671,6 +707,7 @@ def _get_thread_local_reg52_external_session():
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Connection": "keep-alive",
         })
+        _register_reg_session(s)  # [v18] atexit cleanup
         _reg52_external_tls.session = s
     return s
 
@@ -687,6 +724,7 @@ def _get_thread_local_duty_session():
             "Referer": "https://forward01.cmuh.org.tw/peoplesystem/Duty/DutyQuery.aspx",
             "Connection": "keep-alive",
         })
+        _register_reg_session(s)  # [v18] atexit cleanup
         _duty_tls.session = s
     return s
 
@@ -702,6 +740,7 @@ def _get_thread_local_reg64_session():
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Connection": "keep-alive",
         })
+        _register_reg_session(s)  # [v18] atexit cleanup
         _reg64_tls.session = s
     return s
 
@@ -9582,27 +9621,44 @@ class AutomationApp:
         put_ui_message(self.ui_queue, UiClockStatusMessage(status_data='querying'))
 
         # [修正] 從設定檔讀取，不把帳密寫死在程式碼裡
+        # [v18 2026-05-25] base64 decode 加保護 — credentials.json 部分損壞 /
+        # user 手動編輯成非 base64 → 原本 binascii.Error 冒泡，整個打卡查詢功能掛掉。
+        # 改成 decode 失敗 fallback 寫回預設帳號 (跟首次使用同流程)。
+        import base64
         cred_path = get_conf_path('credentials.json')
+        DEFAULT_USERNAME = "101358"
+        DEFAULT_PASSWORD = "101AA358"
+
+        def _write_default_credentials() -> None:
+            try:
+                _atomic_write_json(cred_path, {
+                    'u': base64.b64encode(DEFAULT_USERNAME.encode()).decode(),
+                    'p': base64.b64encode(DEFAULT_PASSWORD.encode()).decode()
+                })
+                logging.info("已寫入預設打卡帳號（%s）到 credentials.json",
+                             DEFAULT_USERNAME)
+            except Exception:
+                logging.warning("寫入預設打卡帳號失敗", exc_info=True)
+
         try:
             if os.path.exists(cred_path):
                 cred = load_json_dict(cred_path, {}, merge_defaults=False)
-                import base64
-                username = base64.b64decode(cred.get('u', '')).decode('utf-8')
-                password = base64.b64decode(cred.get('p', '')).decode('utf-8')
-            else:
-                # 首次使用：直接寫入預設帳密（不再彈對話框打擾使用者）；
-                # 若要改別人的帳號，刪掉 settings/credentials.json 再啟動，或手動編輯。
-                import base64
-                username = "101358"
-                password = "101AA358"
                 try:
-                    _atomic_write_json(cred_path, {
-                        'u': base64.b64encode(username.encode()).decode(),
-                        'p': base64.b64encode(password.encode()).decode()
-                    })
-                    logging.info("已寫入預設打卡帳號（%s）到 credentials.json", username)
-                except Exception:
-                    logging.warning("寫入預設打卡帳號失敗", exc_info=True)
+                    username = base64.b64decode(cred.get('u', '')).decode('utf-8')
+                    password = base64.b64decode(cred.get('p', '')).decode('utf-8')
+                except (ValueError, TypeError, UnicodeDecodeError) as decode_err:
+                    # binascii.Error / padding 錯 / 非 utf-8 都進這條路
+                    logging.warning(
+                        "credentials.json base64 decode 失敗 (%s)，"
+                        "fallback 寫回預設帳號", decode_err)
+                    username = DEFAULT_USERNAME
+                    password = DEFAULT_PASSWORD
+                    _write_default_credentials()
+            else:
+                # 首次使用：直接寫入預設帳密
+                username = DEFAULT_USERNAME
+                password = DEFAULT_PASSWORD
+                _write_default_credentials()
         except Exception as e:
             logging.error(f"讀取打卡帳號失敗: {e}")
             put_ui_message(self.ui_queue, UiClockStatusMessage(status_data={'error': '帳號讀取失敗'}))
@@ -10343,12 +10399,11 @@ if __name__ == "__main__":
     # [穩定性] Tk callback (.after() / 事件 binding) 未捕獲例外處理：
     # Tk 預設只 print 到 stderr (pythonw 看不到)。override 後寫進 logging，
     # 任何 callback 拋例外都能在 automation_ui.log 看到完整 traceback。
-    def _tk_report_callback_exception(exc, val, tb):
-        logging.error("Uncaught Tk callback exception", exc_info=(exc, val, tb))
+    # [v18 2026-05-25] 抽到 cmuh_common.tk_exception 共用，讓 scheduler /
+    # consult_query / autoclock 三支也用同一份 handler。
     try:
-        main_root.report_callback_exception = _tk_report_callback_exception
-        # 同時 patch 類別本身，給後續 Toplevel 用
-        tk.Tk.report_callback_exception = _tk_report_callback_exception
+        from cmuh_common.tk_exception import install_tk_exception_handler
+        install_tk_exception_handler(main_root)
     except Exception:
         logging.debug("Tk callback exception hook 失敗", exc_info=True)
 

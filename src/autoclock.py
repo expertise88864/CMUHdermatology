@@ -1033,6 +1033,12 @@ class ClockApp(tk.Tk):
         super().__init__()
         self.title(f"自動打卡設定 (v{CURRENT_VERSION})")
         self.geometry("1000x650")
+        # [v18 2026-05-25] 攔截 Tk callback 例外進 log (原本進 stderr 黑洞)
+        try:
+            from cmuh_common.tk_exception import install_tk_exception_handler
+            install_tk_exception_handler(self)
+        except Exception:
+            logging.debug("Tk callback exception hook 失敗", exc_info=True)
         self.accounts = loaded_data
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.setup_styles()

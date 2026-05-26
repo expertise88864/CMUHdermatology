@@ -6605,6 +6605,14 @@ if __name__ == "__main__":
             )
         threading.excepthook = _thread_excepthook
 
+    # [v18 2026-05-25] Tk callback 例外進 log (原本進 stderr 黑洞，scheduler
+    # 跟 main 共用同一份 AutomationApp，先前漏裝這個 hook)
+    try:
+        from cmuh_common.tk_exception import install_tk_exception_handler
+        install_tk_exception_handler(main_root)
+    except Exception:
+        logging.debug("Tk callback exception hook 失敗", exc_info=True)
+
     app = AutomationApp(main_root, {})
     DOCTORS = app.doctors_list
     DOCTOR_NAMES = [d["name"] for d in DOCTORS]

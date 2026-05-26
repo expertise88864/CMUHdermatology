@@ -1957,6 +1957,12 @@ class ConfigApp(tk.Tk):
         super().__init__()
         self.title(f"皮膚科會診查詢設定 (v{CURRENT_VERSION})")
         self.geometry("760x620")
+        # [v18 2026-05-25] 攔截 Tk callback 例外進 log (原本進 stderr 黑洞)
+        try:
+            from cmuh_common.tk_exception import install_tk_exception_handler
+            install_tk_exception_handler(self)
+        except Exception:
+            logging.debug("Tk callback exception hook 失敗", exc_info=True)
         self.cfg = load_config()
         try:
             from cmuh_common.window_icon import apply_tk_window_icon
