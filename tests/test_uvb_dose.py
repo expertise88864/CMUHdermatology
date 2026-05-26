@@ -134,6 +134,40 @@ def test_parse_max_without_colon():
     assert info.max_dose == 800
 
 
+def test_parse_uvb_with_colon():
+    """[v20.2 regression] UVB: (含冒號) 也要 parse 成功。
+    User 5/26 實機 data: 'UVB: 970mj/cm2 (197) on (2026/05/24), increase 50, MAX: 1000'
+    """
+    text = "已打8折medication and follow up, UVB: 970mj/cm2 (197) on   (2026/05/24)         , increase 50mj/cm2 if no erythema  , MAX: 1000, W2, , 8 weeks (2025/3/4) tar shampoo"
+    info = parse_uvb_line(text)
+    assert info is not None, f"UVB: 冒號 parse 失敗，real-world text 無法處理"
+    assert info.dose == 970
+    assert info.count == 197
+    assert info.last_date == date(2026, 5, 24)
+    assert info.increase == 50
+    assert info.max_dose == 1000
+
+
+def test_update_real_world_with_colon():
+    """[v20.2 regression] 完整 end-to-end 帶冒號 + 上下文亂七八糟字元。"""
+    text = "已打8折medication and follow up, UVB: 970mj/cm2 (197) on   (2026/05/24)         , increase 50mj/cm2 if no erythema  , MAX: 1000, W2, , 8 weeks (2025/3/4) tar shampoo"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))  # 2 天差
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1000  # 970+50=1020 cap MAX 1000
+    assert r.new_count == 198
+    assert r.days_diff == 2
+    assert "UVB: 1000" in r.new_text or "UVB:1000" in r.new_text
+    assert "(198)" in r.new_text
+    assert "(2026/05/26)" in r.new_text
+    # 保留其餘
+    assert "已打8折medication" in r.new_text
+    assert "MAX: 1000" in r.new_text
+    assert "8 weeks (2025/3/4) tar shampoo" in r.new_text
+    # 舊值不應殘留
+    assert "(197)" not in r.new_text
+    assert "(2026/05/24)" not in r.new_text
+
+
 def test_parse_with_extra_whitespace():
     """多餘空白都要忽略。"""
     text = "UVB    520    mj/cm2   (  11  )  on   (  2026/05/26  )  , increase    30    mj/cm2 if no erythema , MAX  :  800"

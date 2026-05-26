@@ -65,9 +65,12 @@ class UvbLineInfo:
 
 
 # 主要 regex — 寬鬆: 忽略空白、大小寫、月日零填充
-# 範例: "UVB 520mj/cm2 (11) on (2026/05/26), increase 30mj/cm2 if no erythema, MAX:800 mj/cm2, W2, W5M"
+# 範例:
+#   "UVB 520mj/cm2 (11) on (2026/05/26), increase 30mj/cm2 if no erythema, MAX:800 mj/cm2, W2, W5M"
+#   "UVB: 970mj/cm2 (197) on (2026/05/24), increase 50mj/cm2 if no erythema, MAX: 1000, W2, , 8 weeks"
+#                                              ^ 冒號 (v20.2 補)
 _UVB_LINE_RE = re.compile(
-    r"UVB\s*"
+    r"UVB\s*:?\s*"                             # UVB 後可有 ":"，可有空白
     r"(?P<dose>\d+)\s*(?:mj/cm2)?\s*"          # 劑量 (可省 mj/cm2)
     r"\(\s*(?P<count>\d+)\s*\)\s*"             # (count)
     r"on\s*"
@@ -141,8 +144,9 @@ def format_uvb_line(original: UvbLineInfo, *, new_dose: int, new_count: int,
 
     # 1. 替換 dose：找原 dose 數字第一次出現 (在 UVB 之後)
     #    使用 regex 因為要對齊「UVB 520」這個 pattern，不能誤改 "(11)" 的 11
+    #    [v20.2] 允許「UVB:」冒號 — 跟 parse regex 一致
     src = re.sub(
-        r"(UVB\s*)" + str(original.dose) + r"(\s*(?:mj/cm2)?)",
+        r"(UVB\s*:?\s*)" + str(original.dose) + r"(\s*(?:mj/cm2)?)",
         lambda mo: f"{mo.group(1)}{new_dose}{mo.group(2)}",
         src,
         count=1,
