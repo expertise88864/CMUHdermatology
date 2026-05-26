@@ -1242,3 +1242,109 @@ def test_image1_real_world_text_should_update_cleanly():
     assert "2026/5/14" in r.new_text
     # 沒 uncertain (take picture 行雖然有 date 但沒 (count) 在前面)
     assert not r.uncertain_other_triplets
+
+
+# ─── v20.14 STALE_DAYS 30 天確認 + 兩張 screenshot 病人不修改 ────────────
+
+def test_image1_zhao_no_uvb_date_or_count_parse_fail():
+    """[v20.14] image 1 (趙子勳): UVB 行沒 date 也沒 count，只有 dose+MAX →
+    應該回 PARSE_FAIL (不能猜舊紀錄，不該修改)。
+    """
+    text = ("UVB: 300 mj/cm2 add 50 every time MAX: 1200 mj/cm2,\n"
+            "start MTX 3# w3-4    6# QW  w10-12 (2023/6/22),\n"
+            "actretin 20mg  M3 30mg on (2025/5/29)")
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.PARSE_FAIL, (
+        f"image 1 UVB 沒 date → 必須 PARSE_FAIL，不能拿其他行的 date 套用")
+
+
+def test_image2_liao_chinese_chars_between_colon_and_dose_parse_fail():
+    """[v20.14] image 2 (廖三發): `UVB:已打折 1000...` 冒號跟劑量中間有
+    中文 → PARSE_FAIL (我們不確定要不要更新，安全為先不動)。
+    """
+    text = ("UVB:已打折 1000mj/cm2 (132) on  (2026/05/24)   ,"
+            "increase 50 mj/cm 2 if no erythema . photo on  (2022/10/11) "
+            "MAX:1000,  1 month come back No41., (2025/2/4) normal blood test\n"
+            "start acitretin 1# on (2020/2/11), sign permit. "
+            "告知不可捐血、不可把藥給人、女性不可懷孕 ->** "
+            "re-Acitreitin 1# QD on (2022/3/1)")
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.PARSE_FAIL, (
+        f"image 2 中文夾 UVB 跟劑量 → 必須 PARSE_FAIL，不該硬修改")
+
+
+def test_stale_record_31_days_returns_confirm_needed():
+    """[v20.14] 距上次 31 天 (剛超過 30) → CONFIRM_NEEDED 跳 Yes/No。"""
+    text = "UVB: 500 mj/cm2 (10) on (2026/04/25) add 50, MAX:1000"
+    # 2026/04/25 → 2026/05/26 = 31 天
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.CONFIRM_NEEDED
+    assert "距今" in (r.confirm_reason or "")
+    assert "31" in (r.confirm_reason or "")
+    assert r.last_date == date(2026, 4, 25)
+    assert r.days_diff == 31
+
+
+def test_stale_record_30_days_no_confirm_just_update():
+    """[v20.14] 距上次 30 天 (邊界) → 不算 stale，照原本邏輯 (>21 天 → 250)。"""
+    text = "UVB: 500 mj/cm2 (10) on (2026/04/26) add 50, MAX:1000"
+    # 2026/04/26 → 2026/05/26 = 30 天 (剛好)
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 250  # > 21 天 → 固定 250
+    assert r.new_count == 11
+
+
+def test_stale_record_skip_check_then_updates():
+    """[v20.14] CONFIRM_NEEDED stale 之後，caller 按 Yes 重 call 帶
+    skip_stale_check=True → 繼續按 decay 規則更新 (60 天 → 250)。"""
+    text = "UVB: 500 mj/cm2 (10) on (2026/03/27) add 50, MAX:1000"
+    # 2026/03/27 → 2026/05/26 = 60 天
+    r1 = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r1.action == UvbAction.CONFIRM_NEEDED
+    assert "60" in (r1.confirm_reason or "")
+
+    r2 = update_uvb_in_text(text, today=date(2026, 5, 26),
+                            skip_stale_check=True)
+    assert r2.action == UvbAction.UPDATED
+    assert r2.new_dose == 250  # > 21 天 → 固定 250
+
+
+def test_stale_check_independent_of_dose_skip():
+    """[v20.14] dose 沒超過 1500 但 days 超過 30 → CONFIRM_NEEDED stale
+    (不是 dose confirm)。"""
+    text = "UVB: 1000 mj/cm2 (10) on (2026/04/01) add 50, MAX:1200"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))  # 55 天
+    assert r.action == UvbAction.CONFIRM_NEEDED
+    assert "距今" in (r.confirm_reason or "")
+    assert "55" in (r.confirm_reason or "")
+
+
+def test_stale_check_and_dose_check_both_trigger_stale_first_or_dose():
+    """[v20.14] dose 超過 1500 + days 超過 30 → 兩個 confirm 都該觸發。
+    當前實作: dose check 在 stale check 之前 → 先吐 dose CONFIRM_NEEDED。
+    skip dose 後再 call → 才吐 stale CONFIRM_NEEDED。skip 兩個後正常 update。
+    """
+    text = "UVB: 1700 mj/cm2 (10) on (2026/04/01) add 50, MAX:1700"
+    r1 = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r1.action == UvbAction.CONFIRM_NEEDED
+    assert "上限" in (r1.confirm_reason or "")  # dose-confirm 先
+
+    r2 = update_uvb_in_text(text, today=date(2026, 5, 26),
+                            skip_dose_sanity=True)
+    assert r2.action == UvbAction.CONFIRM_NEEDED
+    assert "距今" in (r2.confirm_reason or "")  # 才換 stale-confirm
+
+    r3 = update_uvb_in_text(text, today=date(2026, 5, 26),
+                            skip_dose_sanity=True, skip_stale_check=True)
+    assert r3.action == UvbAction.UPDATED
+
+
+def test_max_gap_days_still_sanity_fail_over_2_years():
+    """[v20.14] 距上次 > 730 天 → 仍是 SANITY_FAIL (病歷可能跑掉)，不是
+    CONFIRM_NEEDED (太久遠的紀錄不該給醫師 override)。"""
+    text = "UVB: 500 mj/cm2 (10) on (2023/01/01) add 50, MAX:1000"
+    # 2023/01/01 → 2026/05/26 = 1241 天
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.SANITY_FAIL
+    assert ">730" in (r.sanity_reason or "") or "730" in (r.sanity_reason or "")

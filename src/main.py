@@ -1919,10 +1919,23 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
 
     # [v20.12 2026-05-26] CONFIRM_NEEDED — dose / MAX 超過建議上限 (1500 mj/cm2)
     # 跳 Yes/No dialog，按 Yes 重 call 帶 skip_dose_sanity=True 跳過上限檢查。
+    # [v20.14 2026-05-26] 也用於 stale check (距上次 > 30 天) — confirm_reason
+    # 文字會包含「天」字眼，title 也跟著改。Yes → 同時帶 skip_stale_check=True
     if result.action == UvbAction.CONFIRM_NEEDED:
         confirm_reason = result.confirm_reason or "原劑量或 MAX 超過建議上限"
-        logging.info("[%s][UVB] CONFIRM_NEEDED: %s — 跳 Yes/No 確認",
-                     label, confirm_reason)
+        # 區分 dose vs stale 兩種 confirm 用不同 title
+        is_stale = "距今" in confirm_reason and "天" in confirm_reason
+        dialog_title = (
+            f"UVB 距上次照光時間過長 - {label}" if is_stale
+            else f"UVB 劑量超過建議上限 - {label}"
+        )
+        dialog_intro = (
+            "請確認是否要按舊紀錄繼續更新" if is_stale
+            else "請確認劑量"
+        )
+        logging.info("[%s][UVB] CONFIRM_NEEDED (%s): %s — 跳 Yes/No 確認",
+                     label, "stale" if is_stale else "dose",
+                     confirm_reason)
         try:
             import winsound
             winsound.MessageBeep(0x30)
@@ -1935,8 +1948,8 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
         try:
             ans = ctypes.windll.user32.MessageBoxW(
                 main_hwnd,
-                f"請確認劑量\n\n{confirm_reason}\n\n要繼續執行變更嗎?",
-                f"UVB 劑量超過建議上限 - {label}",
+                f"{dialog_intro}\n\n{confirm_reason}\n\n要繼續執行變更嗎?",
+                dialog_title,
                 flags,
             )
         except Exception:
@@ -1947,8 +1960,12 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
             logging.info("[%s][UVB] CONFIRM_NEEDED user 按否/取消 → 停止", label)
             return False if strict else True
         logging.info("[%s][UVB] CONFIRM_NEEDED user 按是 → "
-                     "重 call skip_dose_sanity=True", label)
-        result = update_uvb_in_text(text, skip_dose_sanity=True)
+                     "重 call skip_dose_sanity=True + skip_stale_check=True",
+                     label)
+        # [v20.14] 同時帶兩個 skip flag，無論本次是 dose 還是 stale confirm，
+        # 第二次 call 都不會再卡同樣的 confirm。
+        result = update_uvb_in_text(
+            text, skip_dose_sanity=True, skip_stale_check=True)
 
     if result.action == UvbAction.NO_UVB_LINE:
         # parse_uvb_line 找不到 — 對 F1 是正常情況、F2/F3 是異常

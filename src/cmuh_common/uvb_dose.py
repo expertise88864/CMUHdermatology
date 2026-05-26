@@ -59,6 +59,10 @@ MIN_DOSE = 50              # UVB 劑量正常 200-1500 mj/cm2，給寬點 50 為
 MAX_DOSE = 1500            # [v20.12] 上限改回 1500，超過跳 Yes/No 確認
 MAX_COUNT = 999            # 治療次數不該超過 999 (~5 年週週照)
 MAX_GAP_DAYS = 730         # 距上次照光超過 2 年 → 異常 (病歷可能跑掉)
+# [v20.14 2026-05-26] 病歷可能有好幾個月前甚至好幾年前的照光紀錄，user 不希望
+# 程式直接拿舊紀錄套日期/decay 自動更新。距上次 > 此值 → CONFIRM_NEEDED 跳
+# Yes/No 給醫師決定是否要按舊紀錄繼續更新。
+STALE_DAYS = 30            # 超過 30 天 → 跳 Yes/No 確認
 
 
 # ─── Action enum ────────────────────────────────────────────────────────
@@ -452,7 +456,8 @@ def apply_uncertain_updates(text: str, triplets: list) -> str:
 
 
 def update_uvb_in_text(text: str, today: Optional[date] = None,
-                       skip_dose_sanity: bool = False) -> UvbUpdateResult:
+                       skip_dose_sanity: bool = False,
+                       skip_stale_check: bool = False) -> UvbUpdateResult:
     """主入口：給整段「處置」text，回更新後 text + 動作類型。
 
     today=None 用今天日期；測試時傳 fixed date 方便 reproducible。
@@ -467,6 +472,11 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
     重 call 跳過上限檢查繼續執行。
     新增同日期 triplet 偵測 — 處置內非 UVB-關鍵字 (如 excimer light) 但 (count)
     on (date) 日期跟第一行 UVB 相同的，count+1, date→today 一併更新。
+
+    [v20.14 2026-05-26] 病歷可能有舊紀錄 (好幾個月/年前)，user 不希望直接
+    用舊紀錄套日期/decay 更新。distance > STALE_DAYS (30) 不在 skip 模式 →
+    回 CONFIRM_NEEDED 給 caller 跳 Yes/No: Yes 重 call 帶 skip_stale_check=True
+    才繼續更新；No 直接終止不修改處置。
     """
     if today is None:
         today = date.today()
@@ -541,6 +551,19 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
             action=UvbAction.SANITY_FAIL,
             sanity_reason=(f"距上次照光 {days_diff} 天 (>{MAX_GAP_DAYS}天)，"
                           f"異常請確認"),
+            last_date=parsed.last_date, days_diff=days_diff,
+            parsed=parsed, uvb_line_count=uvb_lines,
+        )
+
+    # [v20.14 2026-05-26] 距上次 > 30 天 → 病歷可能是舊紀錄，跳 Yes/No 確認
+    # caller 按 Yes 後以 skip_stale_check=True 重 call 繼續走 decay 計算
+    if days_diff > STALE_DAYS and not skip_stale_check:
+        return UvbUpdateResult(
+            action=UvbAction.CONFIRM_NEEDED,
+            confirm_reason=(
+                f"上次照光日期 {parsed.last_date.strftime('%Y/%m/%d')} "
+                f"距今 {days_diff} 天 (超過 {STALE_DAYS} 天) — "
+                f"病歷可能是舊紀錄，請確認是否真要按舊紀錄繼續更新"),
             last_date=parsed.last_date, days_diff=days_diff,
             parsed=parsed, uvb_line_count=uvb_lines,
         )
