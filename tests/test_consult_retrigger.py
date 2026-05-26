@@ -176,6 +176,14 @@ def test_pending_retrigger_delay_is_cancelable():
     assert "time.sleep(_RETRIGGER_DELAY_SEC)" not in src
 
 
+def test_config_app_log_polling_is_bounded():
+    src = inspect.getsource(consult_query.ConfigApp._poll_log)
+
+    assert "LOG_POLL_MAX_RECORDS" in src
+    assert "while not log_queue.empty()" not in src
+    assert consult_query.LOG_POLL_MAX_RECORDS <= 500
+
+
 def test_tray_test_email_skips_duplicate_until_worker_finishes(monkeypatch):
     targets = []
     sent = []

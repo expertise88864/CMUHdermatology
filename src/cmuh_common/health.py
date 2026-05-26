@@ -204,9 +204,7 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
             if rss_mb is None:
                 logging.debug("[health/%s] RAM stats unavailable; "
                               "continuing network/disk checks", tag)
-                rss_mb = 0.0
-
-            if rss_mb >= ram_crit_mb:
+            elif rss_mb >= ram_crit_mb:
                 consecutive_high_ram += 1
                 logging.critical(
                     "[health/%s] RAM=%.0fMB ≥ critical %dMB (連續 %d 次)；"

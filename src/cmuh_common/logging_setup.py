@@ -7,7 +7,7 @@
 """
 import logging
 from logging.handlers import RotatingFileHandler
-from queue import Queue
+from queue import Empty, Full, Queue
 
 
 class QueueHandler(logging.Handler):
@@ -18,7 +18,29 @@ class QueueHandler(logging.Handler):
         self.log_queue = log_queue
 
     def emit(self, record: logging.LogRecord) -> None:
-        self.log_queue.put(record)
+        try:
+            self.log_queue.put_nowait(record)
+            return
+        except Full:
+            pass
+        except Exception:
+            self.handleError(record)
+            return
+
+        try:
+            self.log_queue.get_nowait()
+        except Empty:
+            pass
+        except Exception:
+            self.handleError(record)
+            return
+
+        try:
+            self.log_queue.put_nowait(record)
+        except Full:
+            pass
+        except Exception:
+            self.handleError(record)
 
 
 def setup_logging(

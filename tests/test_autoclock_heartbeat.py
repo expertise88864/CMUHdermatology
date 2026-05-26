@@ -12,6 +12,7 @@ mtime 不更新 → InnerWatchdog 看 log >300s 沒動 → kill+restart → cras
 import logging
 import os
 import sys
+import inspect
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
@@ -219,3 +220,11 @@ def test_scheduler_tick_does_not_start_worker_outside_clock_window(monkeypatch):
     autoclock._scheduler_tick()
 
     assert targets == []
+
+
+def test_config_app_log_polling_is_bounded():
+    src = inspect.getsource(autoclock.ClockApp.poll_log_queue)
+
+    assert "LOG_POLL_MAX_RECORDS" in src
+    assert "while not log_queue.empty()" not in src
+    assert autoclock.LOG_POLL_MAX_RECORDS <= 500

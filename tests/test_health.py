@@ -98,4 +98,5 @@ def test_health_loop_continues_checks_when_rss_unavailable():
     src = inspect.getsource(health._health_loop)
 
     assert "continuing network/disk checks" in src
+    assert "rss_mb = 0.0" not in src
     assert "time.sleep(interval_sec * 6)" not in src

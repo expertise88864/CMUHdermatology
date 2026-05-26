@@ -200,6 +200,7 @@ _consult_job_gate = ActiveTaskGate(stale_after_sec=45 * 60)
 _test_email_gate = ActiveTaskGate(stale_after_sec=10 * 60)
 tray_icon_object = None
 log_queue: "queue.Queue" = queue.Queue(maxsize=5000)
+LOG_POLL_MAX_RECORDS = 200
 _config_lock = threading.Lock()
 
 
@@ -2116,7 +2117,7 @@ class ConfigApp(tk.Tk):
 
     def _poll_log(self) -> None:
         lines = []
-        while not log_queue.empty():
+        for _ in range(LOG_POLL_MAX_RECORDS):
             try:
                 rec = log_queue.get_nowait()
                 lines.append(

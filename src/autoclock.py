@@ -108,6 +108,7 @@ running.set()
 background_thread: threading.Thread | None = None
 tray_icon_object = None
 log_queue: queue.Queue = queue.Queue(maxsize=5000)
+LOG_POLL_MAX_RECORDS = 200
 clock_lock = threading.RLock()  # 【穩定性 2026-05-21】RLock 避免 janitor 與 process_clock_task 重入時 deadlock
 _clock_task_gate = ActiveTaskGate(stale_after_sec=90 * 60)
 _test_login_gate = ActiveTaskGate(stale_after_sec=10 * 60)
@@ -1132,7 +1133,7 @@ class ClockApp(tk.Tk):
 
     def poll_log_queue(self):
         lines = []
-        while not log_queue.empty():
+        for _ in range(LOG_POLL_MAX_RECORDS):
             try:
                 record = log_queue.get_nowait()
                 msg = (
