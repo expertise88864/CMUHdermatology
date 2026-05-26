@@ -72,7 +72,7 @@ from cmuh_common.platform_win import (
 from cmuh_common.notifications import show_windows_notification
 from cmuh_common.icons import ensure_cmuh_app_icon_path as _ensure_cmuh_app_icon_path
 from cmuh_common.window_icon import apply_tk_window_icon as _apply_tk_window_icon
-from cmuh_common.logging_setup import QueueHandler
+from cmuh_common.logging_setup import attach_queue_handler
 from cmuh_common.http_client import INTERNAL_HOSTS, is_internal as _is_internal
 from cmuh_common.ui_messages import (
     UiStatusMessage, UiRefreshTickMessage, UiClinicDataMessage, UiMasterScheduleMessage,
@@ -6814,10 +6814,9 @@ class AutomationApp:
 
         # 建立 Queue 與 Handler
         self.log_queue = Queue(maxsize=5000)
-        queue_handler = QueueHandler(self.log_queue)
+        queue_handler = attach_queue_handler(self.log_queue, replace_existing=True)
         formatter = logging.Formatter('%(asctime)s [%(levelname)s]: %(message)s', datefmt='%H:%M:%S')
         queue_handler.setFormatter(formatter)
-        logging.getLogger().addHandler(queue_handler)
         # Log 輪詢已合併至 process_ui_queue，不需要額外排程
         # -------------------------------------------
 

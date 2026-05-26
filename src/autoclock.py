@@ -55,7 +55,11 @@ from selenium.webdriver.support.ui import WebDriverWait  # noqa: E402
 
 from clock.webdriver_setup import initialize_driver  # noqa: E402
 from cmuh_common.atomic_io import atomic_write_json, safe_load_json  # noqa: E402
-from cmuh_common.logging_setup import QueueHandler, setup_logging  # noqa: E402
+from cmuh_common.logging_setup import (  # noqa: E402
+    attach_queue_handler,
+    attach_stream_handler,
+    setup_logging,
+)
 from cmuh_common.paths import get_app_dir, get_settings_dir, restart_self  # noqa: E402
 from cmuh_common.single_instance import ensure_single_instance, release_single_instance  # noqa: E402
 from cmuh_common.task_gate import ActiveTaskGate  # noqa: E402
@@ -322,13 +326,11 @@ def _setup_clock_logging() -> None:
     """打卡程式的特化 logging：RotatingFile + Stream + Queue."""
     setup_logging(str(LOG_FILE), max_bytes=5 * 1024 * 1024, backup_count=2)
     # 加上 stream（保留原行為）
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-    logging.getLogger().addHandler(stream_handler)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    attach_stream_handler(formatter, replace_existing=True)
     # 加上 queue handler 給 UI 顯示
-    qh = QueueHandler(log_queue)
-    qh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-    logging.getLogger().addHandler(qh)
+    qh = attach_queue_handler(log_queue, replace_existing=True)
+    qh.setFormatter(formatter)
 
 
 # =============================================================================

@@ -6,6 +6,7 @@
 - setup_logging：RotatingFileHandler，上限 5MB × 3 份備份
 """
 import logging
+import sys
 from logging.handlers import RotatingFileHandler
 from queue import Empty, Full, Queue
 
@@ -64,9 +65,54 @@ def setup_logging(
     return handler
 
 
-def attach_queue_handler(log_queue: Queue, level: int = logging.INFO) -> QueueHandler:
+def attach_queue_handler(
+    log_queue: Queue,
+    level: int = logging.INFO,
+    *,
+    replace_existing: bool = False,
+) -> QueueHandler:
     """加上 QueueHandler 把 log 也送到 UI Queue。"""
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        if (
+            isinstance(handler, QueueHandler)
+            and getattr(handler, "log_queue", None) is log_queue
+        ):
+            handler.setLevel(level)
+            return handler
+        if replace_existing and isinstance(handler, QueueHandler):
+            root.removeHandler(handler)
+            handler.close()
+
     qh = QueueHandler(log_queue)
     qh.setLevel(level)
-    logging.getLogger().addHandler(qh)
+    root.addHandler(qh)
     return qh
+
+
+def attach_stream_handler(
+    formatter: logging.Formatter | None = None,
+    level: int = logging.INFO,
+    *,
+    stream=None,
+    replace_existing: bool = False,
+) -> logging.StreamHandler:
+    """Add a StreamHandler without stacking duplicates on repeated setup."""
+    root = logging.getLogger()
+    target_stream = stream if stream is not None else sys.stderr
+    for handler in list(root.handlers):
+        if type(handler) is logging.StreamHandler and handler.stream is target_stream:
+            handler.setLevel(level)
+            if formatter is not None:
+                handler.setFormatter(formatter)
+            return handler
+        if replace_existing and type(handler) is logging.StreamHandler:
+            root.removeHandler(handler)
+            handler.close()
+
+    handler = logging.StreamHandler(stream)
+    handler.setLevel(level)
+    if formatter is not None:
+        handler.setFormatter(formatter)
+    root.addHandler(handler)
+    return handler

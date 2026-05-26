@@ -78,7 +78,7 @@ _user32.CloseDesktop.restype = ctypes.c_bool
 _user32.CloseDesktop.argtypes = [ctypes.c_void_p]
 
 from cmuh_common.atomic_io import atomic_write_json, safe_load_json  # noqa: E402
-from cmuh_common.logging_setup import QueueHandler, setup_logging  # noqa: E402
+from cmuh_common.logging_setup import attach_queue_handler, setup_logging  # noqa: E402
 from cmuh_common.paths import get_app_dir, get_settings_dir  # noqa: E402
 from cmuh_common.platform_win import is_admin, run_as_admin  # noqa: E402
 from cmuh_common.single_instance import (  # noqa: E402
@@ -229,9 +229,8 @@ def _sleep_while_running(seconds: float, step: float = 0.5) -> bool:
 # =============================================================================
 def _setup_logging() -> None:
     setup_logging(str(LOG_FILE), max_bytes=3 * 1024 * 1024, backup_count=2)
-    qh = QueueHandler(log_queue)
+    qh = attach_queue_handler(log_queue, replace_existing=True)
     qh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    logging.getLogger().addHandler(qh)
 
 
 # =============================================================================
