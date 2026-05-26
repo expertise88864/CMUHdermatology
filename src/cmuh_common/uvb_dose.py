@@ -110,9 +110,9 @@ _UVB_DOSE_RE = re.compile(r"UVB\s*[:：]?\s*(\d+)", re.IGNORECASE)
 #   (2026/05/24) — group 1-3
 #    2026/05/24  — group 4-6
 _UVB_DATE_RE = re.compile(
-    r"[\(（]\s*(\d{4})/(\d{1,2})/(\d{1,2})\s*[\)）]"
+    r"[\(（]\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s*[\)）]"
     r"|"
-    r"\b(\d{4})/(\d{1,2})/(\d{1,2})\b"
+    r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b"
 )
 # count: \(\s*\d+\s*\) — 任何 paren 內純數字。
 # 為了不抓到日期 (年是 4 位)，caller 會先 mask date span 再 search。
@@ -141,7 +141,7 @@ _UVB_MAX_RE = re.compile(
 _TRIPLET_RE = re.compile(
     r"[\(（]\s*(\d{1,3})\s*[\)）]"                  # (count)
     r"([^()（）]{0,120}?)"                           # 中間 (no parens)
-    r"[\(（]\s*(\d{4})/(\d{1,2})/(\d{1,2})\s*[\)）]" # (YYYY/MM/DD)
+    r"[\(（]\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s*[\)）]" # (YYYY/MM/DD)
 )
 # Triplet 周圍需要的 UVB-相關標記 (避免誤動其他內容如「(10) days for ...」)
 # 「\d\s*mj」要求數字接 mJ/mj (劑量單位)，比單純 "mj" 更安全
@@ -149,6 +149,12 @@ _UVB_MARKER_RE = re.compile(
     r"(?:uvb|excimer|\d\s*mj|phototherapy|photo\s*therapy)",
     re.IGNORECASE,
 )
+
+
+def _date_text(dt: date, sep: str = "/") -> str:
+    """格式化日期並保留原本分隔符，sep 非 '-' 時預設用 '/'。"""
+    sep = "-" if sep == "-" else "/"
+    return f"{dt.year}{sep}{dt.month:02d}{sep}{dt.day:02d}"
 
 
 def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
@@ -305,23 +311,30 @@ def format_uvb_line(original: UvbLineInfo, *, new_dose: int,
 
     # 3. 替換日期 — 用零填充格式 YYYY/MM/DD
     # [v20.11] 原日期可能帶或不帶 paren — 偵測原本格式 → 同樣格式寫回
-    today_str = f"{today.year}/{today.month:02d}/{today.day:02d}"
     old_y = original.last_date.year
     old_m = original.last_date.month
     old_d = original.last_date.day
-    with_paren_re = rf"([\(\uFF08]\s*){old_y}/0?{old_m}/0?{old_d}(\s*[\)\uFF09])"
+    with_paren_re = (
+        rf"([\(\uFF08]\s*){old_y}([/-])0?{old_m}([/-])0?{old_d}"
+        rf"(\s*[\)\uFF09])"
+    )
     if re.search(with_paren_re, src):
         # 帶 paren: (2026/5/24) → (2026/05/26)，保留半形/全形括號
         src = re.sub(
             with_paren_re,
-            lambda mo: f"{mo.group(1)}{today_str}{mo.group(2)}",
+            lambda mo: f"{mo.group(1)}{_date_text(today, mo.group(2))}{mo.group(4)}",
             src,
             count=1,
         )
     else:
         # 不帶 paren: 2026/5/24 → 2026/05/26 (注意 word boundary 避免誤改其他數字)
-        bare_re = rf"\b{old_y}/0?{old_m}/0?{old_d}\b"
-        src = re.sub(bare_re, today_str, src, count=1)
+        bare_re = rf"\b{old_y}([/-])0?{old_m}([/-])0?{old_d}\b"
+        src = re.sub(
+            bare_re,
+            lambda mo: _date_text(today, mo.group(1)),
+            src,
+            count=1,
+        )
 
     return src
 
@@ -366,7 +379,6 @@ def _detect_uncertain_triplets(text: str, today: date,
         replacement 內含 count+1, date→today (供 caller Yes 時 apply)。
     """
     out = []
-    today_str = f"{today.year}/{today.month:02d}/{today.day:02d}"
     for m in _TRIPLET_RE.finditer(text):
         try:
             seg_date = date(int(m.group(3)), int(m.group(4)),
@@ -406,8 +418,8 @@ def _detect_uncertain_triplets(text: str, today: date,
             count=1,
         )
         rep = re.sub(
-            rf"([\(\uFF08]\s*){seg_date.year}/0?{seg_date.month}/0?{seg_date.day}(\s*[\)\uFF09])",
-            lambda mo: f"{mo.group(1)}{today_str}{mo.group(2)}",
+            rf"([\(\uFF08]\s*){seg_date.year}([/-])0?{seg_date.month}([/-])0?{seg_date.day}(\s*[\)\uFF09])",
+            lambda mo: f"{mo.group(1)}{_date_text(today, mo.group(2))}{mo.group(4)}",
             rep,
             count=1,
         )
@@ -622,7 +634,6 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
     # 時，第一行的 triplet 不會匹配 parsed.last_date，自動跳過。
     # 只更新 count + date，不動 segment 內 dose (continuation 通常 fixed at MAX
     # 不會變；若要 dose decay，後續再加)。
-    today_str = f"{today.year}/{today.month:02d}/{today.day:02d}"
     triplet_edits = []
     for m in _TRIPLET_RE.finditer(working):
         try:
@@ -656,8 +667,8 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
             count=1,
         )
         seg_text = re.sub(
-            rf"([\(\uFF08]\s*){seg_date.year}/0?{seg_date.month}/0?{seg_date.day}(\s*[\)\uFF09])",
-            lambda mo: f"{mo.group(1)}{today_str}{mo.group(2)}",
+            rf"([\(\uFF08]\s*){seg_date.year}([/-])0?{seg_date.month}([/-])0?{seg_date.day}(\s*[\)\uFF09])",
+            lambda mo: f"{mo.group(1)}{_date_text(today, mo.group(2))}{mo.group(4)}",
             seg_text,
             count=1,
         )

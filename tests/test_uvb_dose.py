@@ -251,6 +251,24 @@ def test_parse_full_width_parentheses_preserves_shape():
     assert "（2026/05/26）" in r.new_text
 
 
+def test_parse_hyphen_dates_preserves_separator():
+    text = "UVB: 970mj/cm2 (197) on (2026-05-24), increase by 50, fixed: 1000, W2"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1000
+    assert r.new_count == 198
+    assert "(2026-05-26)" in r.new_text
+    assert "(2026/05/26)" not in r.new_text
+
+
+def test_parse_bare_hyphen_date_preserves_separator():
+    text = "UVB: 970mj/cm2 (197) on 2026-05-24, increase by 50, fixed: 1000, W2"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1000
+    assert "on 2026-05-26" in r.new_text
+
+
 def test_parse_fix_with_colon_phrase():
     text = "UVB: 970mj/cm2 (197) on (2026/05/24), add 50mj/cm2 if no erythema, fixed: 1000, W2"
     r = update_uvb_in_text(text, today=date(2026, 5, 26))
@@ -1143,6 +1161,21 @@ def test_full_width_uncertain_triplet_can_be_confirmed():
     assert "（38） （2026/05/26）" in final
     assert "（37） （2026/5/22）" not in final
     assert "on （2026/05/26）" in final
+
+
+def test_hyphen_uncertain_triplet_preserves_separator():
+    text = (
+        "re- excimer 800 upper back (37) (2026-5-22) add 10mJ each time\n"
+        "局部 手 UVB: 800 mj/cm2(8) on (2026-5-24) add 50 each time, "
+        "fixed: 1000"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert r.uncertain_other_triplets
+    final = apply_uncertain_updates(r.new_text, r.uncertain_other_triplets)
+    assert "(38) (2026-05-26)" in final
+    assert "(37) (2026-5-22)" not in final
+    assert "on (2026-05-26)" in final
 
 
 def test_no_uncertain_when_only_same_date_triplets():
