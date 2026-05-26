@@ -110,6 +110,7 @@ tray_icon_object = None
 log_queue: queue.Queue = queue.Queue(maxsize=5000)
 clock_lock = threading.RLock()  # 【穩定性 2026-05-21】RLock 避免 janitor 與 process_clock_task 重入時 deadlock
 _clock_task_gate = ActiveTaskGate(stale_after_sec=90 * 60)
+_test_login_gate = ActiveTaskGate(stale_after_sec=10 * 60)
 
 # [2026-05-22 v45 P0-1] scheduler liveness — 給 self-watchdog 用，跟 consult_query
 # 同一套 pattern。每次 scheduler_loop iteration 更新 last_tick；watchdog 偵測
@@ -1259,7 +1260,20 @@ def exit_action(icon=None, item=None) -> None:
 
 
 def run_immediate_test(icon=None) -> None:
-    threading.Thread(target=_run_test_ui, daemon=True).start()
+    lease = _test_login_gate.acquire_lease("test-login")
+    if lease is None:
+        logging.info("測試登入仍在執行中，本次點擊略過")
+        notify_clock_failure("測試登入執行中", ["請等待目前測試完成"])
+        return
+
+    def _worker():
+        try:
+            _run_test_ui()
+        finally:
+            _test_login_gate.release("test-login", lease)
+
+    threading.Thread(target=_worker, name="AutoClockTestLogin",
+                     daemon=True).start()
 
 
 def _run_test_ui() -> None:
@@ -1349,7 +1363,7 @@ def main() -> None:
                 ClockApp(accounts_data).mainloop()
                 return
             if sys.argv[1] == "--test-login":
-                run_immediate_test()
+                _run_test_ui()
                 return
 
         if not accounts_data:

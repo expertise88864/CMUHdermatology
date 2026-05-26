@@ -132,3 +132,39 @@ def test_restart_program_releases_mutex_before_respawn(monkeypatch):
 
     assert calls == ["release", ("restart", [])]
     assert not autoclock.running.is_set()
+
+
+def test_run_immediate_test_skips_duplicate_until_worker_finishes(monkeypatch):
+    targets = []
+    ran = []
+    notices = []
+
+    class FakeThread:
+        def __init__(self, *, target, name=None, daemon=None):
+            targets.append(target)
+            self.name = name
+            self.daemon = daemon
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(autoclock, "_test_login_gate",
+                        autoclock.ActiveTaskGate(stale_after_sec=600))
+    monkeypatch.setattr(autoclock, "_run_test_ui",
+                        lambda: ran.append("test"))
+    monkeypatch.setattr(autoclock, "notify_clock_failure",
+                        lambda title, lines: notices.append((title, lines)))
+    monkeypatch.setattr(autoclock.threading, "Thread", FakeThread)
+
+    autoclock.run_immediate_test()
+    autoclock.run_immediate_test()
+
+    assert len(targets) == 1
+    assert notices == [("測試登入執行中", ["請等待目前測試完成"])]
+    assert ran == []
+
+    targets[0]()
+    autoclock.run_immediate_test()
+
+    assert ran == ["test"]
+    assert len(targets) == 2
