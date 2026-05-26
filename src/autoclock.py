@@ -1251,18 +1251,51 @@ def restart_program(args_add=None) -> None:
 
 
 def exit_action(icon=None, item=None) -> None:
+    """[v19 2026-05-26] 修 tray 退出關不掉 bug。
+
+    原本流程：running.clear() → tray.stop() → cleanup → sys.exit(0)。
+    問題：sys.exit(0) 在 pystray menu callback context raise SystemExit，
+    pystray._dispatcher try/except 把 SystemExit 當一般例外吞掉，main thread
+    Windows message pump 沒退 → process 永遠不結束。User 觀察到「常常關不掉」
+    就是這個 — log 印「使用者要求退出程式」之後 callback ERROR `SystemExit: 0`
+    然後就無聲。
+
+    新流程：
+      1. tray icon 先 visible=False 立刻從系統列消失 (給 user 視覺反饋)
+      2. cleanup + os._exit() 移到 daemon thread (callback 乾淨返回，pystray
+         dispatcher 不會吞 SystemExit)
+      3. 0.5s 給 message pump 收尾，然後 os._exit(0) 強制退 — 跳過 atexit
+         (本來 atexit 也只是 taskkill chromedriver 不需 graceful)
+    """
     logging.info("使用者要求退出程式...")
     running.clear()
     if tray_icon_object:
-        tray_icon_object.stop()
-    # 關閉常駐 driver（避免殘留 chromedriver.exe）
-    try:
-        _release_persistent_clock_driver()
-    except Exception:
-        pass
-    release_single_instance()
-    # [修正] 改用 sys.exit 讓 atexit 跑完
-    sys.exit(0)
+        try:
+            tray_icon_object.visible = False  # 系統列圖示立刻消失
+        except Exception:
+            pass
+        try:
+            tray_icon_object.stop()
+        except Exception:
+            pass
+
+    def _shutdown() -> None:
+        try:
+            _release_persistent_clock_driver()
+        except Exception:
+            pass
+        try:
+            release_single_instance()
+        except Exception:
+            pass
+        try:
+            time_module.sleep(0.5)  # 給 message pump 收尾
+        except Exception:
+            pass
+        os._exit(0)
+
+    threading.Thread(target=_shutdown, daemon=True,
+                     name="AutoclockShutdown").start()
 
 
 def run_immediate_test(icon=None) -> None:

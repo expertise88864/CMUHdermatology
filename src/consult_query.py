@@ -2135,15 +2135,37 @@ class ConfigApp(tk.Tk):
 # 托盤
 # =============================================================================
 def exit_action(icon=None, item=None) -> None:
+    """[v19 2026-05-26] 修 tray 退出關不掉 bug — 跟 autoclock.exit_action 同 pattern。
+
+    原本 sys.exit(0) 被 pystray._dispatcher 吞掉，main thread message pump
+    沒退 → process 永遠不結束。改成把 cleanup + os._exit 移到 daemon thread，
+    callback 乾淨返回，0.5s 後強制 os._exit。
+    """
     logging.info("使用者要求退出會診查詢程式")
     running.clear()
     if tray_icon_object:
         try:
+            tray_icon_object.visible = False
+        except Exception:
+            pass
+        try:
             tray_icon_object.stop()
         except Exception:
             pass
-    release_single_instance()
-    sys.exit(0)
+
+    def _shutdown() -> None:
+        try:
+            release_single_instance()
+        except Exception:
+            pass
+        try:
+            time.sleep(0.5)
+        except Exception:
+            pass
+        os._exit(0)
+
+    threading.Thread(target=_shutdown, daemon=True,
+                     name="ConsultShutdown").start()
 
 
 def _tray_run_now(icon=None, item=None) -> None:
