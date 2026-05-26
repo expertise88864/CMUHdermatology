@@ -1599,7 +1599,7 @@ def _script_code_input_adaptive(code: str, label: str = "",
     set_療程=None 表示不改 療程（F4 冷凍 / F5 KOH 用）。
     set_療程=1/2/3 用於 F1/F2/F3 照光不同療程次數。
 
-    回傳 True 表示流程跑完；False 表示找不到主程式視窗。"""
+    回傳 True 表示代碼輸入與可選療程修改皆確認完成；False 表示任一步驟失敗。"""
     hwnd = _find_hospital_main_window()
     if not hwnd:
         logging.warning("[%s adaptive] 找不到主程式視窗 (class=%s, title 含 %s)",
@@ -1615,6 +1615,8 @@ def _script_code_input_adaptive(code: str, label: str = "",
     previous_focus = _get_thread_focus(hwnd)
     if not _send_yiling_menu_command(hwnd, MENU_ID_代碼輸入):
         logging.warning("[%s] 代碼輸入 menu command 送出失敗", label)
+        if hasattr(_runner_1280, "last_action_time"):
+            _runner_1280.last_action_time = time.time()
         return False
     # 等焦點移到醫令代碼欄；快時立即通過，慢時最多等 0.6 秒。
     focused = _wait_for_code_input_focus(hwnd, previous_focus=previous_focus)

@@ -160,6 +160,10 @@ def test_code_input_waits_for_focus_after_menu_command():
 
     code_input_src = _function_source(source_path, "_script_code_input_adaptive")
     assert "if not _send_yiling_menu_command" in code_input_src
+    menu_fail_idx = code_input_src.index("if not _send_yiling_menu_command")
+    menu_fail_block = code_input_src[menu_fail_idx:code_input_src.index(
+        "# 等焦點移到醫令代碼欄")]
+    assert "last_action_time" in menu_fail_block
     assert "hotkey_modules.pyautogui.typewrite(code" not in code_input_src
     assert "workflow_ok = False" in code_input_src
     assert "if code and not workflow_ok:" in code_input_src
