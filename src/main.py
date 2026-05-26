@@ -1624,6 +1624,11 @@ def _script_code_input_adaptive(code: str, label: str = "",
             logging.warning("[%s] 等不到可信的代碼輸入焦點，停止送出 %r",
                             label, code)
             workflow_ok = False
+    if code and not workflow_ok:
+        logging.warning("[%s] 代碼輸入未完成，跳過療程欄位修改", label)
+        if hasattr(_runner_1280, "last_action_time"):
+            _runner_1280.last_action_time = time.time()
+        return False
     # 可選：改 療程 欄位 — 用 WM_SETTEXT 直接設值（繞 IME、不動滑鼠）
     if set_療程 is not None:
         time.sleep(0.08)  # 從 0.15s 降到 0.08s

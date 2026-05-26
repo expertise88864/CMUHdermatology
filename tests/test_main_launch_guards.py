@@ -161,3 +161,8 @@ def test_code_input_waits_for_focus_after_menu_command():
     code_input_src = _function_source(source_path, "_script_code_input_adaptive")
     assert "hotkey_modules.pyautogui.typewrite(code" not in code_input_src
     assert "workflow_ok = False" in code_input_src
+    assert "if code and not workflow_ok:" in code_input_src
+    assert (
+        code_input_src.index("if code and not workflow_ok:")
+        < code_input_src.index("_find_療程_edit_hwnd")
+    )
