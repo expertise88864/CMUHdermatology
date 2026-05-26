@@ -1249,6 +1249,12 @@ def _resolve_runner(resolution: str) -> HotkeyRunner:
     }.get(resolution, _runner_1280)
 
 
+def _mark_hotkey_action_time() -> None:
+    """更新熱鍵自動化節流時間；集中處理避免失敗路徑漏更新。"""
+    if hasattr(_runner_1280, "last_action_time"):
+        _runner_1280.last_action_time = time.time()
+
+
 def _resolve_click_func(resolution: str):
     return {
         "1920x1080": click_point_1920,
@@ -1615,8 +1621,7 @@ def _script_code_input_adaptive(code: str, label: str = "",
     previous_focus = _get_thread_focus(hwnd)
     if not _send_yiling_menu_command(hwnd, MENU_ID_代碼輸入):
         logging.warning("[%s] 代碼輸入 menu command 送出失敗", label)
-        if hasattr(_runner_1280, "last_action_time"):
-            _runner_1280.last_action_time = time.time()
+        _mark_hotkey_action_time()
         return False
     # 等焦點移到醫令代碼欄；快時立即通過，慢時最多等 0.6 秒。
     focused = _wait_for_code_input_focus(hwnd, previous_focus=previous_focus)
@@ -1642,8 +1647,7 @@ def _script_code_input_adaptive(code: str, label: str = "",
             workflow_ok = False
     if code and not workflow_ok:
         logging.warning("[%s] 代碼輸入未完成，跳過療程欄位修改", label)
-        if hasattr(_runner_1280, "last_action_time"):
-            _runner_1280.last_action_time = time.time()
+        _mark_hotkey_action_time()
         return False
     # 可選：改 療程 欄位 — 用 WM_SETTEXT 直接設值（繞 IME、不動滑鼠）
     if set_療程 is not None:
@@ -1680,8 +1684,7 @@ def _script_code_input_adaptive(code: str, label: str = "",
         else:
             logging.warning("[%s] 找不到 療程 欄位（請手動填）", label)
             workflow_ok = False
-    if hasattr(_runner_1280, "last_action_time"):
-        _runner_1280.last_action_time = time.time()
+    _mark_hotkey_action_time()
     return workflow_ok
 
 
