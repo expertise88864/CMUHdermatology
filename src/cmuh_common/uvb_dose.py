@@ -121,12 +121,13 @@ _UVB_DATE_RE = re.compile(
 _UVB_COUNT_RE = re.compile(r"\(\s*(\d+)\s*\)")
 # increase / increased / add / 每次加 / 增加 (case-insensitive)
 _UVB_INCREASE_RE = re.compile(
-    r"(?:increase[d]?|add|每次增加|每次加|增加|加)\s*(\d+)", re.IGNORECASE)
+    r"(?:increase[d]?|add|每次增加|每次加|增加|加)\s*[:：]?\s*(\d+)",
+    re.IGNORECASE)
 # [v20.8] MAX 接受多種同義表達:
 #   MAX:N / MAX N / fix N / fixed N / fix at N / fixed at N / 固定 N
 # \bfix(?:ed)? 確保 word boundary 避免抓到 "prefix"/"fixing" 等
 _UVB_MAX_RE = re.compile(
-    r"(?:MAX\s*[:：]?\s*|\bfix(?:ed)?(?:\s+at)?\s+|固定(?:在|為)?\s*)(\d+)",
+    r"(?:MAX\s*[:：]?\s*|\bfix(?:ed)?(?:\s+at)?\s+|固定(?:在|為)?\s*[:：]?\s*)(\d+)",
     re.IGNORECASE,
 )
 
