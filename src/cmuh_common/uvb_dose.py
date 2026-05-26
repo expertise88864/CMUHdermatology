@@ -105,7 +105,7 @@ class UvbLineInfo:
 #   2. 在 segment 內**各別**找 dose / date / count / increase
 #   3. 各 field 順序不限，缺任一 field → parse_fail
 
-_UVB_DOSE_RE = re.compile(r"UVB\s*:?\s*(\d+)", re.IGNORECASE)
+_UVB_DOSE_RE = re.compile(r"UVB\s*[:：]?\s*(\d+)", re.IGNORECASE)
 # [v20.11] 接受帶 paren 跟不帶 paren 兩種:
 #   (2026/05/24) — group 1-3
 #    2026/05/24  — group 4-6
@@ -126,7 +126,7 @@ _UVB_INCREASE_RE = re.compile(
 #   MAX:N / MAX N / fix N / fixed N / fix at N / fixed at N
 # \bfix(?:ed)? 確保 word boundary 避免抓到 "prefix"/"fixing" 等
 _UVB_MAX_RE = re.compile(
-    r"(?:MAX\s*:?\s*|\bfix(?:ed)?(?:\s+at)?\s+)(\d+)",
+    r"(?:MAX\s*[:：]?\s*|\bfix(?:ed)?(?:\s+at)?\s+)(\d+)",
     re.IGNORECASE,
 )
 
@@ -285,7 +285,7 @@ def format_uvb_line(original: UvbLineInfo, *, new_dose: int,
     #    使用 regex 因為要對齊「UVB 520」這個 pattern，不能誤改 "(11)" 的 11
     #    [v20.2] 允許「UVB:」冒號 — 跟 parse regex 一致
     src = re.sub(
-        r"(UVB\s*:?\s*)" + str(original.dose) + r"(\s*(?:mj/cm2)?)",
+        r"(UVB\s*[:：]?\s*)" + str(original.dose) + r"(\s*(?:mj/cm2)?)",
         lambda mo: f"{mo.group(1)}{new_dose}{mo.group(2)}",
         src,
         count=1,

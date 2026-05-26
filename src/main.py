@@ -2066,6 +2066,9 @@ def script_F1_adaptive():
     logging.info("--- Executing F1 (照光 1) ---")
     ok = _script_code_input_adaptive("51019", label="F1", set_療程=1)
     logging.info("F1 (照光 1) 51019+療程: %s", "done" if ok else "skipped")
+    if not ok:
+        logging.warning("F1: 51019/療程未完成，跳過 UVB 更新以避免半套寫入")
+        return
     # 接著 UVB 更新 (best-effort, 沒 UVB 不警告也不終止)
     _f1_update_uvb_dose_if_present(label="F1")
 
@@ -2077,7 +2080,7 @@ def script_F2_adaptive():
     """
     logging.info("--- Executing F2 (照光 2) ---")
     if not _f23_update_uvb_dose(label="F2"):
-        logging.info("F2: UVB 間隔太短，已終止 (跳過 51019)")
+        logging.info("F2: UVB 前置檢查/更新未完成，已終止 (跳過 51019)")
         return
     ok = _script_code_input_adaptive("51019", label="F2", set_療程=2)
     logging.info("F2 (照光 2): %s", "done" if ok else "skipped")
@@ -2090,7 +2093,7 @@ def script_F3_adaptive():
     """
     logging.info("--- Executing F3 (照光 3) ---")
     if not _f23_update_uvb_dose(label="F3"):
-        logging.info("F3: UVB 間隔太短，已終止 (跳過 51019)")
+        logging.info("F3: UVB 前置檢查/更新未完成，已終止 (跳過 51019)")
         return
     ok = _script_code_input_adaptive("51019", label="F3", set_療程=3)
     logging.info("F3 (照光 3): %s", "done" if ok else "skipped")
