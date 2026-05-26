@@ -1447,7 +1447,7 @@ def _find_hospital_main_window() -> int:
     return found[0]
 
 
-def _send_yiling_menu_command(hwnd: int, menu_id: int) -> None:
+def _send_yiling_menu_command(hwnd: int, menu_id: int) -> bool:
     """對主程式視窗送 WM_COMMAND 觸發 menu 項目。
 
     用 PostMessage (非同步)：實測 (2026-05-18 12:43 F9) 用 SendMessage 會卡 11+ 秒
@@ -1458,8 +1458,20 @@ def _send_yiling_menu_command(hwnd: int, menu_id: int) -> None:
     HIWORD(wParam)=0 表示來源是 menu (不是 accelerator/control)。
     F3/F4 觸發代碼輸入 (id=218) 用 Send 跑得通，是因為代碼輸入是輕量 UI
     操作（focus 跳到 grid）；開 modal 同意書視窗 (id=668) 重量級。"""
+    if not hwnd:
+        return False
     WM_COMMAND = 0x0111
-    ctypes.windll.user32.PostMessageW(hwnd, WM_COMMAND, menu_id, 0)
+    try:
+        ok = ctypes.windll.user32.PostMessageW(hwnd, WM_COMMAND, menu_id, 0)
+        if not ok:
+            logging.warning("PostMessageW WM_COMMAND menu_id=%s 失敗 hwnd=%s",
+                            menu_id, hwnd)
+            return False
+        return True
+    except Exception:
+        logging.warning("PostMessageW WM_COMMAND menu_id=%s 例外 hwnd=%s",
+                        menu_id, hwnd, exc_info=True)
+        return False
 
 
 def _ensure_hospital_foreground(hwnd: int) -> None:
@@ -1601,7 +1613,9 @@ def _script_code_input_adaptive(code: str, label: str = "",
     # 控制項對 IME 狀態敏感）
     _force_ime_english(hwnd)
     previous_focus = _get_thread_focus(hwnd)
-    _send_yiling_menu_command(hwnd, MENU_ID_代碼輸入)
+    if not _send_yiling_menu_command(hwnd, MENU_ID_代碼輸入):
+        logging.warning("[%s] 代碼輸入 menu command 送出失敗", label)
+        return False
     # 等焦點移到醫令代碼欄；快時立即通過，慢時最多等 0.6 秒。
     focused = _wait_for_code_input_focus(hwnd, previous_focus=previous_focus)
     _force_ime_english(hwnd)
