@@ -125,10 +125,10 @@ _UVB_INCREASE_RE = re.compile(
     r"\s*[:：]?\s*(\d+)",
     re.IGNORECASE)
 # [v20.8] MAX 接受多種同義表達:
-#   MAX:N / MAX N / fix N / fixed N / fix at N / fixed at N / 固定 N
+#   MAX:N / MAX N / MAX at N / fix N / fixed at N / fixed to N / 固定 N
 # \bfix(?:ed)? 確保 word boundary 避免抓到 "prefix"/"fixing" 等
 _UVB_MAX_RE = re.compile(
-    r"(?:MAX\s*[:：]?\s*|\bfix(?:ed)?(?:\s+(?:at|to))?\s+|固定(?:在|為)?\s*[:：]?\s*)(\d+)",
+    r"(?:MAX(?:\s+(?:at|to))?\s*[:：]?\s*|\bfix(?:ed)?(?:\s+(?:at|to))?\s+|固定(?:在|為)?\s*[:：]?\s*)(\d+)",
     re.IGNORECASE,
 )
 
