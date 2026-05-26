@@ -1643,6 +1643,75 @@ def _read_tmemo_text(hwnd: int) -> str:
         return ""
 
 
+def _find_disposition_memo(main_hwnd: int, keyword: str = "UVB") -> int:
+    """[v20.1 2026-05-26] 找處置 TMemo — 寬鬆 class 比對 + 內容過濾。
+
+    原本只試 class="TMemo"，但醫院程式的處置欄可能是 TMemoExt / TDBMemo /
+    TRichEdit / TRichEdit95 等 Delphi 變體。改成：
+      1. 列舉所有 descendant
+      2. class 名稱含 "Memo" 或 "Edit" 或 "Rich" (case-insensitive)
+      3. text 含 keyword (UVB)
+      4. 回第一個 match
+
+    同時 log 出所有候選 (class + hwnd + text 前 80 字) 給 debug 用。
+    """
+    found = [0]
+    candidates: list[tuple[int, str, str]] = []  # (hwnd, class, text_preview)
+    keyword_lower = keyword.lower()
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def cb(child, lparam):
+        try:
+            cls_buf = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(child, cls_buf, 64)
+            cls = cls_buf.value
+            cls_lower = cls.lower()
+            # 寬鬆比對：class 含 memo / edit / rich
+            if not any(s in cls_lower for s in ("memo", "edit", "rich")):
+                return True
+            text = _read_tmemo_text(child)
+            if not text:
+                return True
+            preview = text[:80].replace("\n", " ").replace("\r", "")
+            candidates.append((child, cls, preview))
+            if keyword_lower in text.lower():
+                found[0] = child
+                return False  # stop enumeration
+        except Exception:
+            pass
+        return True
+
+    try:
+        ctypes.windll.user32.EnumChildWindows(main_hwnd, cb, 0)
+    except Exception:
+        logging.debug("EnumChildWindows 例外", exc_info=True)
+
+    if found[0]:
+        # 找到了：log 命中的那個
+        for h, c, p in candidates:
+            if h == found[0]:
+                logging.info("[UVB][find] 命中處置 hwnd=%s class='%s' "
+                              "text='%s...'", h, c, p)
+                break
+    else:
+        # 沒找到：log 所有候選給 user debug
+        if candidates:
+            logging.warning(
+                "[UVB][find] 找不到含 '%s' 的 Memo/Edit 控件。所有候選 "
+                "(%d 個):", keyword, len(candidates))
+            for h, c, p in candidates[:10]:  # 最多印 10 個避免洗 log
+                logging.warning("[UVB][find]   hwnd=%s class='%s' "
+                                "text='%s...'", h, c, p)
+        else:
+            logging.warning(
+                "[UVB][find] 主視窗下完全沒抓到任何 Memo/Edit 控件 — "
+                "可能 class 命名跟想的不同，請拍 snapshot")
+    return found[0]
+
+
 def _write_tmemo_text(hwnd: int, new_text: str) -> bool:
     """寫 TMemo 全文 (WM_SETTEXT)。"""
     WM_SETTEXT = 0x000C
@@ -1675,9 +1744,11 @@ def _f23_update_uvb_dose(label: str = "F2") -> bool:
         return True
 
     # 找處置 TMemo — 用「文字含 UVB」當定位 (徵候/病史欄不會有 UVB)
-    memo_hwnd = _find_descendant_by_class_text(main_hwnd, "TMemo", "UVB")
+    # [v20.1] 改用寬鬆 class 比對 (TMemo / TMemoExt / TDBMemo / TRichEdit ...)
+    memo_hwnd = _find_disposition_memo(main_hwnd, keyword="UVB")
     if not memo_hwnd:
-        logging.info("[%s][UVB] 處置內無 UVB 行 → fallback 走 51019", label)
+        logging.info("[%s][UVB] 處置內無 UVB 行 (見上方 [UVB][find] candidates) "
+                     "→ fallback 走 51019", label)
         return True
 
     text = _read_tmemo_text(memo_hwnd)
