@@ -1780,10 +1780,43 @@ def _f23_update_uvb_dose(label: str = "F2") -> bool:
         msg = (f"病人 {last_str} 已照光 (距今僅 {result.days_diff} 天)\n\n"
                f"間隔不足 ≥ 2 天 — 已停止 {label} 自動處理。\n"
                f"若仍要照光，請醫師確認後手動處理。")
+        # [v20.3 2026-05-26] MessageBox 強制曝光 — user 反映原本被縮到下面看不到。
+        # 多管齊下：
+        #   1. owner = 醫院程式 main hwnd → MB 強制 modal 到醫院程式之上
+        #   2. MB_ICONWARNING (0x30) + MB_TOPMOST (0x40000) + MB_SETFOREGROUND (0x10000)
+        #   3. MessageBeep 蜂鳴聲 — user 不看畫面也能聽到
+        #   4. FlashWindowEx 醫院程式 taskbar 圖示閃爍
         try:
-            # MB_ICONWARNING (0x30) | MB_TOPMOST (0x40000) | MB_OK
-            ctypes.windll.user32.MessageBoxW(0, msg, "UVB 照光間隔太短",
-                                              0x10 | 0x40000)
+            import winsound
+            winsound.MessageBeep(0x30)  # MB_ICONWARNING beep
+        except Exception:
+            pass
+        try:
+            # Flash 醫院程式視窗 — 即使 MB 被遮住，taskbar 也會閃
+            class FLASHWINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", ctypes.c_uint),
+                    ("hwnd", wintypes.HWND),
+                    ("dwFlags", ctypes.c_uint),
+                    ("uCount", ctypes.c_uint),
+                    ("dwTimeout", ctypes.c_uint),
+                ]
+            fi = FLASHWINFO(
+                cbSize=ctypes.sizeof(FLASHWINFO),
+                hwnd=main_hwnd,
+                dwFlags=0x03,  # FLASHW_ALL (caption + taskbar)
+                uCount=5,
+                dwTimeout=0,
+            )
+            ctypes.windll.user32.FlashWindowEx(ctypes.byref(fi))
+        except Exception:
+            logging.debug("FlashWindowEx 例外", exc_info=True)
+        try:
+            # owner=main_hwnd 強制 modal 到醫院程式上方
+            # MB_ICONWARNING(0x30) | MB_TOPMOST(0x40000) | MB_SETFOREGROUND(0x10000)
+            flags = 0x30 | 0x40000 | 0x10000
+            ctypes.windll.user32.MessageBoxW(
+                main_hwnd, msg, "UVB 照光間隔太短", flags)
         except Exception:
             logging.debug("MessageBox 例外", exc_info=True)
         logging.warning("[%s][UVB] 距上次 %s 僅 %d 天 → 終止 F2/F3",
