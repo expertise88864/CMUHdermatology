@@ -24,23 +24,23 @@ from cmuh_common.uvb_dose import (  # noqa: E402
 
 # ─── compute_new_dose: 各 day-bucket ────────────────────────────────────
 
-@pytest.mark.parametrize("days_diff", [0, 1])
-def test_compute_returns_none_when_too_close(days_diff):
-    """0-1 天 → None (太密集，須警告)。"""
+def test_compute_returns_none_when_same_day():
+    """[v20.8] 同日 (days_diff=0) → None (太密集，須警告)。"""
     assert compute_new_dose(
-        dose=520, increase=30, max_dose=800, days_diff=days_diff
+        dose=520, increase=30, max_dose=800, days_diff=0
     ) is None
 
 
 @pytest.mark.parametrize("days_diff,expected", [
-    (2, 550),   # 520 + 30
+    (1, 550),   # [v20.8] 1 天現在可加 (舊版警告)
+    (2, 550),
     (3, 550),
     (4, 550),
     (5, 550),
     (6, 550),
 ])
-def test_compute_increases_when_2_to_6_days(days_diff, expected):
-    """2-6 天 → +increase。"""
+def test_compute_increases_when_1_to_6_days(days_diff, expected):
+    """[v20.8] 1-6 天 → +increase (1 天從警告改可加)。"""
     assert compute_new_dose(
         dose=520, increase=30, max_dose=800, days_diff=days_diff
     ) == expected
@@ -84,15 +84,51 @@ def test_compute_decays_75pct_floor_10_when_8_to_14_days(days_diff):
     ) == 320
 
 
-@pytest.mark.parametrize("days_diff", [15, 16, 30, 100, 365])
-def test_compute_fixes_to_250_when_over_14_days(days_diff):
-    """> 14 天 → 固定 250。"""
+@pytest.mark.parametrize("days_diff", range(15, 22))
+def test_compute_decays_50pct_when_15_to_21_days(days_diff):
+    """[v20.8] 15-21 天 → ×0.5 floor 10，最低 250。"""
+    # 800 × 0.5 = 400 → floor 10 = 400
+    assert compute_new_dose(
+        dose=800, increase=30, max_dose=800, days_diff=days_diff
+    ) == 400
+    # 600 × 0.5 = 300 → 300
+    assert compute_new_dose(
+        dose=600, increase=30, max_dose=800, days_diff=days_diff
+    ) == 300
+    # 500 × 0.5 = 250 → 250 (剛好)
+    assert compute_new_dose(
+        dose=500, increase=30, max_dose=800, days_diff=days_diff
+    ) == 250
+    # 480 × 0.5 = 240 → floor 10 = 240 → max(240, 250) = 250
+    assert compute_new_dose(
+        dose=480, increase=30, max_dose=800, days_diff=days_diff
+    ) == 250
+
+
+@pytest.mark.parametrize("days_diff", [22, 30, 100, 365])
+def test_compute_fixes_to_250_when_over_21_days(days_diff):
+    """[v20.8] > 21 天 → 固定 250 (任何 dose)。"""
     assert compute_new_dose(
         dose=520, increase=30, max_dose=800, days_diff=days_diff
     ) == 250
-    # 不論原 dose 多少都 250
     assert compute_new_dose(
         dose=800, increase=30, max_dose=800, days_diff=days_diff
+    ) == 250
+    assert compute_new_dose(
+        dose=1500, increase=50, max_dose=1500, days_diff=days_diff
+    ) == 250
+
+
+@pytest.mark.parametrize("days_diff", [8, 14])
+def test_compute_75pct_floor_at_min_250(days_diff):
+    """[v20.8] 8-14 天 ×0.75 結果低於 250 → 使用 250 floor。"""
+    # 320 × 0.75 = 240 → floor 10 = 240 → max(240, 250) = 250
+    assert compute_new_dose(
+        dose=320, increase=30, max_dose=800, days_diff=days_diff
+    ) == 250
+    # 280 × 0.75 = 210 → 250
+    assert compute_new_dose(
+        dose=280, increase=30, max_dose=800, days_diff=days_diff
     ) == 250
 
 
@@ -296,13 +332,16 @@ def test_update_normal_case_2_to_6_days_increases():
 
 
 def test_update_too_close_returns_warning_no_text_change():
-    """0-1 天 → TOO_CLOSE，不改 text。"""
+    """[v20.8] 只有同日 (days_diff=0) → TOO_CLOSE。1 天差現在可加劑量。"""
     text = "UVB 520 (11) on (2026/05/26), increase 30, MAX:800"
-    r = update_uvb_in_text(text, today=date(2026, 5, 27))  # 1 天差
-    assert r.action == UvbAction.TOO_CLOSE
-    assert r.days_diff == 1
-    assert r.new_text is None
-    assert r.last_date == date(2026, 5, 26)
+    # 1 天差現在 → UPDATED (不再 TOO_CLOSE)
+    r1 = update_uvb_in_text(text, today=date(2026, 5, 27))
+    assert r1.action == UvbAction.UPDATED
+    assert r1.new_dose == 550  # 520+30
+    # 同日 → TOO_CLOSE
+    r0 = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r0.action == UvbAction.TOO_CLOSE
+    assert r0.days_diff == 0
 
 
 def test_update_same_day_is_too_close():
@@ -328,10 +367,20 @@ def test_update_8_days_decay():
     assert r.new_dose == 390  # 520 × 0.75 = 390
 
 
-def test_update_15_days_drops_to_250():
-    """15 天 → 固定 250。"""
+def test_update_15_days_decays_50pct():
+    """[v20.8] 15 天 → ×0.5 (改規則: 不再直接 250)。
+    520 × 0.5 = 260 → floor 10 = 260 → max(260, 250) = 260
+    """
     text = "UVB 520 (11) on (2026/05/26), increase 30, MAX:800"
     r = update_uvb_in_text(text, today=date(2026, 6, 10))  # 15 天差
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 260
+
+
+def test_update_22_days_drops_to_250():
+    """[v20.8] 22 天 → 固定 250。"""
+    text = "UVB 520 (11) on (2026/05/26), increase 30, MAX:800"
+    r = update_uvb_in_text(text, today=date(2026, 6, 17))  # 22 天差
     assert r.action == UvbAction.UPDATED
     assert r.new_dose == 250
 
@@ -485,6 +534,34 @@ def test_update_real_world_case3_end_to_end():
     assert "(2026/05/26)" in r.new_text
     # add 動詞保留
     assert "add" in r.new_text or "Max:" in r.new_text.lower()
+
+
+@pytest.mark.parametrize("max_phrase,expected_max", [
+    ("MAX:800", 800),
+    ("MAX 800", 800),
+    ("MAX : 800", 800),
+    ("max:800", 800),                  # 小寫
+    ("Max: 800", 800),
+    ("fixed at 1500", 1500),
+    ("fixed 1500", 1500),
+    ("fix at 1500", 1500),
+    ("fix 1500", 1500),
+    ("Fixed At 1500", 1500),          # 大小寫混合
+])
+def test_parse_max_variants(max_phrase, expected_max):
+    """[v20.8] MAX 同義詞: MAX/Max/max/fix/fixed/fix at/fixed at"""
+    text = f"UVB 500 (10) on (2026/05/20), increase 30, {max_phrase}, W2"
+    info = parse_uvb_line(text)
+    assert info is not None, f"max phrase '{max_phrase}' parse 失敗"
+    assert info.max_dose == expected_max
+
+
+def test_parse_max_word_boundary_not_matching_prefix():
+    """[v20.8 safety] 'prefix' / 'fixing' 內含 'fix' 不該被誤抓"""
+    # No MAX/fix synonym → 應該整個 parse fail (回 None)
+    text = "UVB 500 (10) on (2026/05/20), increase 30, prefix 999, fixing 888"
+    info = parse_uvb_line(text)
+    assert info is None, "prefix/fixing 不該被當 MAX 抓"
 
 
 def test_parse_real_world_case_a_fixed_at():
