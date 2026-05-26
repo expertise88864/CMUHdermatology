@@ -75,7 +75,7 @@ _UVB_LINE_RE = re.compile(
     r"\(\s*(?P<count>\d+)\s*\)\s*"             # (count)
     r"on\s*"
     r"\(\s*(?P<y>\d{4})/(?P<m>\d{1,2})/(?P<d>\d{1,2})\s*\)"  # (yyyy/mm/dd)
-    r"[^A-Za-z]*increase\s*"                   # 跳過任意非字母字元到 increase
+    r"[^A-Za-z]*increase[d]?\s*"               # 跳過任意非字母字元到 increase/increased
     r"(?P<increase>\d+)"                       # increase 後數字
     r".*?"                                      # 跳到 MAX (non-greedy)
     r"MAX\s*:?\s*"                             # MAX 可有可無 ":"

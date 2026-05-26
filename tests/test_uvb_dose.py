@@ -148,6 +148,38 @@ def test_parse_uvb_with_colon():
     assert info.max_dose == 1000
 
 
+def test_parse_increased_past_tense():
+    """[v20.4 regression] 'increased 40' (有 d) 也要 parse 成功。
+    User 5/26 11:38 real-world: 'UVB: 1100mj/cm2(87) on (2026/5/24), 已打8折,
+    increased 40 mj/cm2 if no erythema, MAX: 1100 mj/cm2, W2,W5'
+    """
+    text = "UVB: 1100mj/cm2(87) on  (2026/5/24), 已打8折, increased 40 mj/cm2 if no erythema, MAX: 1100 mj/cm2, W2,W5 ( 2weeks,) than W5 , , 12weeks appointment"
+    info = parse_uvb_line(text)
+    assert info is not None, "increased (past tense) parse 失敗"
+    assert info.dose == 1100
+    assert info.count == 87
+    assert info.last_date == date(2026, 5, 24)
+    assert info.increase == 40
+    assert info.max_dose == 1100
+
+
+def test_update_real_world_increased_at_max():
+    """[v20.4 regression] dose 已達 MAX 仍要更新 count + date。
+    User 5/26 病人: dose 1100 == MAX 1100, 預期 dose 不變但 count 87→88,
+    date 5/24→5/26。
+    """
+    text = "UVB: 1100mj/cm2(87) on  (2026/5/24), 已打8折, increased 40 mj/cm2 if no erythema, MAX: 1100 mj/cm2, W2,W5"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))  # 2 天差
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1100  # 1100+40=1140 cap MAX 1100 → 維持 1100
+    assert r.new_count == 88
+    assert r.days_diff == 2
+    assert "(88)" in r.new_text
+    assert "(2026/05/26)" in r.new_text
+    # 1100 不變不該被誤改 — 確認 UVB: 1100 仍在
+    assert "UVB: 1100" in r.new_text or "UVB:1100" in r.new_text
+
+
 def test_update_real_world_with_colon():
     """[v20.2 regression] 完整 end-to-end 帶冒號 + 上下文亂七八糟字元。"""
     text = "已打8折medication and follow up, UVB: 970mj/cm2 (197) on   (2026/05/24)         , increase 50mj/cm2 if no erythema  , MAX: 1000, W2, , 8 weeks (2025/3/4) tar shampoo"
