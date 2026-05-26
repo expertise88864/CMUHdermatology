@@ -219,6 +219,17 @@ def test_parse_chinese_increase_and_fixed_with_full_width_colons():
     assert "固定：1000" in r.new_text
 
 
+def test_parse_english_by_and_fixed_to_phrases():
+    text = "UVB: 970mj/cm2 (197) on (2026/05/24), increase by 50mj/cm2 if no erythema, fixed to 1000, W2"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1000
+    assert r.new_count == 198
+    assert "UVB: 1000mj/cm2" in r.new_text
+    assert "increase by 50" in r.new_text
+    assert "fixed to 1000" in r.new_text
+
+
 def test_parse_increased_past_tense():
     """[v20.4 regression] 'increased 40' (有 d) 也要 parse 成功。
     User 5/26 11:38 real-world: 'UVB: 1100mj/cm2(87) on (2026/5/24), 已打8折,
