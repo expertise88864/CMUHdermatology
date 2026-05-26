@@ -78,50 +78,116 @@ class UvbLineInfo:
     span: tuple[int, int] # 在 source text 中的 (start, end) char offset
 
 
-# 主要 regex — 寬鬆: 忽略空白、大小寫、月日零填充
-# 範例:
-#   "UVB 520mj/cm2 (11) on (2026/05/26), increase 30mj/cm2 if no erythema, MAX:800 mj/cm2, W2, W5M"
-#   "UVB: 970mj/cm2 (197) on (2026/05/24), increase 50mj/cm2 if no erythema, MAX: 1000, W2, , 8 weeks"
-#                                              ^ 冒號 (v20.2 補)
-_UVB_LINE_RE = re.compile(
-    r"UVB\s*:?\s*"                             # UVB 後可有 ":"，可有空白
-    r"(?P<dose>\d+)\s*(?:mj/cm2)?\s*"          # 劑量 (可省 mj/cm2)
-    r"\(\s*(?P<count>\d+)\s*\)\s*"             # (count)
-    r"on\s*"
-    r"\(\s*(?P<y>\d{4})/(?P<m>\d{1,2})/(?P<d>\d{1,2})\s*\)"  # (yyyy/mm/dd)
-    r"[^A-Za-z]*increase[d]?\s*"               # 跳過任意非字母字元到 increase/increased
-    r"(?P<increase>\d+)"                       # increase 後數字
-    r".*?"                                      # 跳到 MAX (non-greedy)
-    r"MAX\s*:?\s*"                             # MAX 可有可無 ":"
-    r"(?P<max>\d+)",                           # MAX 後數字
-    flags=re.IGNORECASE | re.DOTALL,
-)
+# [v20.6 2026-05-26] 從「整段 regex」改成「獨立 field 解析」
+# 原本 _UVB_LINE_RE 一條 regex 要求 dose/count/on(date)/increase/MAX 順序固定，
+# 但實機 data 順序千變萬化:
+#   Case 1: "UVB 1000 on (date), (count), increase N"  ← date 先於 count
+#   Case 2: "UVB: 1200 mj/cm2已打折(137) on (date)"   ← 數字後夾中文再 (count)
+#   Case 3: "UVB: 950 (39) on (date) add 50 each"     ← 用 add 取代 increase
+# 一條 regex 撐不下這些變異，改成：
+#   1. 找 UVB 起點 → 找 MAX:N 終點 → segment 範圍
+#   2. 在 segment 內**各別**找 dose / date / count / increase
+#   3. 各 field 順序不限，缺任一 field → parse_fail
+
+_UVB_DOSE_RE = re.compile(r"UVB\s*:?\s*(\d+)", re.IGNORECASE)
+_UVB_DATE_RE = re.compile(r"\(\s*(\d{4})/(\d{1,2})/(\d{1,2})\s*\)")
+# count: \(\s*\d+\s*\) — 任何 paren 內純數字。
+# 為了不抓到日期 (年是 4 位)，caller 會先 mask date span 再 search。
+# 大於 MAX_COUNT 的會在 sanity check 時擋下，這裡先放寬接受任意位數。
+_UVB_COUNT_RE = re.compile(r"\(\s*(\d+)\s*\)")
+# increase / increased / add (case-insensitive)
+_UVB_INCREASE_RE = re.compile(
+    r"(?:increase[d]?|add)\s*(\d+)", re.IGNORECASE)
+_UVB_MAX_RE = re.compile(r"MAX\s*:?\s*(\d+)", re.IGNORECASE)
 
 
 def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
     """從 text 中找第一個 UVB 行，回 UvbLineInfo 或 None。
 
-    回 None 的情況：
-      - text 沒含 UVB 字串
-      - 含 UVB 但 format 不對 (parse_fail)
+    [v20.6] 獨立 field 解析 — 順序不限、容忍中文夾雜、increase/add 等同義。
+
+    解析步驟：
+      1. UVB 起點: `UVB\\s*:?\\s*(\\d+)` 找到 dose
+      2. MAX 終點: `MAX\\s*:?\\s*(\\d+)` 找到 max_dose (UVB 後第一個 MAX)
+      3. segment = text[uvb_start:max_end]
+      4. 在 segment 內各別找:
+         - date: `\\(\\s*\\d{4}/\\d{1,2}/\\d{1,2}\\s*\\)`
+         - count: 不重疊 date 的 `\\(\\s*\\d{1,3}\\s*\\)`
+         - increase: `(increase[d]?|add)\\s*\\d+`
+      5. 任一 field 缺 → 回 None (parse_fail)
     """
-    if "UVB" not in text and "uvb" not in text.lower():
+    if "uvb" not in text.lower():
         return None
-    m = _UVB_LINE_RE.search(text)
-    if not m:
+
+    # 1. UVB dose
+    dose_m = _UVB_DOSE_RE.search(text)
+    if not dose_m:
         return None
     try:
-        return UvbLineInfo(
-            full_match=m.group(0),
-            dose=int(m.group("dose")),
-            count=int(m.group("count")),
-            last_date=date(int(m.group("y")), int(m.group("m")), int(m.group("d"))),
-            increase=int(m.group("increase")),
-            max_dose=int(m.group("max")),
-            span=(m.start(), m.end()),
-        )
-    except (ValueError, KeyError):
+        dose = int(dose_m.group(1))
+    except ValueError:
         return None
+    start = dose_m.start()
+
+    # 2. MAX (從 UVB 之後找)
+    max_m = _UVB_MAX_RE.search(text, start)
+    if not max_m:
+        return None
+    try:
+        max_dose = int(max_m.group(1))
+    except ValueError:
+        return None
+    end = max_m.end()
+    segment = text[start:end]
+    # 相對 segment 的 span
+    rel_start = 0
+    rel_end = end - start
+
+    # 3. Date (segment 內第一個 YYYY/MM/DD)
+    date_m = _UVB_DATE_RE.search(segment)
+    if not date_m:
+        return None
+    try:
+        last_date = date(
+            int(date_m.group(1)),
+            int(date_m.group(2)),
+            int(date_m.group(3)),
+        )
+    except ValueError:
+        return None
+
+    # 4. Count (segment 內第一個 1-3 位數字 paren，排除 date 範圍)
+    seg_masked = (
+        segment[:date_m.start()]
+        + " " * (date_m.end() - date_m.start())
+        + segment[date_m.end():]
+    )
+    count_m = _UVB_COUNT_RE.search(seg_masked)
+    if not count_m:
+        return None
+    try:
+        count = int(count_m.group(1))
+    except ValueError:
+        return None
+
+    # 5. Increase / add
+    inc_m = _UVB_INCREASE_RE.search(segment)
+    if not inc_m:
+        return None
+    try:
+        increase = int(inc_m.group(1))
+    except ValueError:
+        return None
+
+    return UvbLineInfo(
+        full_match=segment,
+        dose=dose,
+        count=count,
+        last_date=last_date,
+        increase=increase,
+        max_dose=max_dose,
+        span=(start, end),
+    )
 
 
 # ─── 劑量計算 ────────────────────────────────────────────────────────────

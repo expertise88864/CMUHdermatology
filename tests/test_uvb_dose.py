@@ -400,6 +400,93 @@ def test_sanity_fail_increase_too_high():
     assert "500" in r.sanity_reason or "increase" in r.sanity_reason
 
 
+def test_parse_real_world_case1_date_before_count():
+    """[v20.6 regression] User 5/26 12:01 case1:
+    日期出現在 count 之前 — `UVB 1000 on (date), (count), increase N`
+    """
+    text = "decrease UVB 1000mj/cm2 on(2026/05/24), (31), increase 20mj/cm2 if no erythema , MAX:1000 mj/cm2, W2, W5.9 weeks appointment , acitretin w4-6 on (2026/03/17)"
+    info = parse_uvb_line(text)
+    assert info is not None, "date-before-count 順序 parse 失敗"
+    assert info.dose == 1000
+    assert info.count == 31
+    assert info.last_date == date(2026, 5, 24)
+    assert info.increase == 20
+    assert info.max_dose == 1000
+
+
+def test_parse_real_world_case2_chinese_between():
+    """[v20.6 regression] User 5/26 12:04 case2:
+    數字後夾中文「已打折」再 (count) — `UVB: 1200 mj/cm2已打折(137) on (date)`
+    """
+    text = "UVB: 1200 mj/cm2已打折(137) on  (2026/05/24)  , increased 40 mj/cm2 if no erythema, MAX: 1200 mj/cm2 , W2, W5M,  12 weeks appointment"
+    info = parse_uvb_line(text)
+    assert info is not None, "中文夾雜 parse 失敗"
+    assert info.dose == 1200
+    assert info.count == 137
+    assert info.last_date == date(2026, 5, 24)
+    assert info.increase == 40
+    assert info.max_dose == 1200
+
+
+def test_parse_real_world_case3_add_instead_of_increase():
+    """[v20.6 regression] User 5/26 12:06 case3:
+    用 `add 50 mj/cm2 each time` 取代 `increase 50`，Max 小寫
+    """
+    text = "UVB: 950 mj/cm2 (39) on (2026/5/24) add 50 mj/cm2 each time, Max: 1100 mj/cm2,  w4m, take picture on 2025/12/15"
+    info = parse_uvb_line(text)
+    assert info is not None, "add 取代 increase parse 失敗"
+    assert info.dose == 950
+    assert info.count == 39
+    assert info.last_date == date(2026, 5, 24)
+    assert info.increase == 50
+    assert info.max_dose == 1100
+
+
+def test_update_real_world_case1_end_to_end():
+    """[v20.6] case1 完整 end-to-end: dose 1000 已達 MAX 不變, count 31→32,
+    date 5/24→5/26 (2 天差)。
+    """
+    text = "decrease UVB 1000mj/cm2 on(2026/05/24), (31), increase 20mj/cm2 if no erythema , MAX:1000 mj/cm2, W2, W5"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1000  # 1000+20=1020 cap MAX 1000
+    assert r.new_count == 32
+    assert r.days_diff == 2
+    assert "(32)" in r.new_text
+    assert "(2026/05/26)" in r.new_text
+    # 上下文保留
+    assert "decrease" in r.new_text
+    assert "MAX:1000" in r.new_text
+
+
+def test_update_real_world_case2_end_to_end():
+    """[v20.6] case2 完整: dose 1200 已達 MAX 不變, count 137→138, date→今天"""
+    text = "UVB: 1200 mj/cm2已打折(137) on  (2026/05/24)  , increased 40 mj/cm2 if no erythema, MAX: 1200 mj/cm2 , W2, W5M"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1200
+    assert r.new_count == 138
+    assert "(138)" in r.new_text
+    assert "(2026/05/26)" in r.new_text
+    # 中文要保留
+    assert "已打折" in r.new_text
+
+
+def test_update_real_world_case3_end_to_end():
+    """[v20.6] case3 完整: dose 950+50=1000 (cap 1100 OK), count 39→40, add 保留"""
+    text = "UVB: 950 mj/cm2 (39) on (2026/5/24) add 50 mj/cm2 each time, Max: 1100 mj/cm2,  w4m"
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1000  # 950+50
+    assert r.new_count == 40
+    assert r.days_diff == 2
+    assert "UVB: 1000" in r.new_text or "UVB:1000" in r.new_text
+    assert "(40)" in r.new_text
+    assert "(2026/05/26)" in r.new_text
+    # add 動詞保留
+    assert "add" in r.new_text or "Max:" in r.new_text.lower()
+
+
 def test_uvb_line_count_reported():
     """UPDATED 結果含 uvb_line_count，用於提示多行 UVB。"""
     text_one = "UVB 520 (11) on (2026/05/20), increase 30, MAX:800"
