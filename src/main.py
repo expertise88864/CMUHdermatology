@@ -761,6 +761,25 @@ def _make_forward01_duty_session():
 def check_stop():
     if stop_event_automation.is_set(): raise SubsystemInterrupted("by F12 key press")
 
+
+def _sleep_interruptible(seconds: float, *,
+                         max_slice: float = 0.05) -> None:
+    """Sleep in short slices so F12 can stop hotkey automation promptly."""
+    try:
+        remaining = max(0.0, float(seconds))
+        slice_s = max(0.01, float(max_slice))
+    except (TypeError, ValueError):
+        remaining = 0.0
+        slice_s = 0.05
+    end_t = time.monotonic() + remaining
+    while True:
+        check_stop()
+        left = end_t - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(slice_s, left))
+
+
 def parse_color_spec(spec_string):
     spec = spec_string.replace(" ", "")
     rgb_match = re.search(r'\((\d+),(\d+),(\d+)\)', spec)
@@ -1271,7 +1290,7 @@ def _execute_override_action(action: dict, resolution: str) -> None:
         delay = float(action.get("delay", 0.05) or 0.05)
         _resolve_click_func(resolution)(x, y, after_delay=delay)
     elif t == "sleep":
-        time.sleep(float(action.get("seconds", 0)))
+        _sleep_interruptible(float(action.get("seconds", 0)))
     elif t == "type":
         text = str(action.get("text", ""))
         # 通用：用 keyboard 模組逐字輸入；若 keyboard 不可用則略過
@@ -1530,8 +1549,7 @@ def _wait_for_code_input_focus(target_hwnd: int, *,
                 s in cls for s in ("edit", "memo", "rich", "grid"))
             if is_input_like and (focus != previous_focus or not previous_focus):
                 return focus
-        time.sleep(poll)
-        check_stop()
+        _sleep_interruptible(poll)
     return 0
 
 
@@ -2927,7 +2945,7 @@ def _f11_popup_watcher(label: str = "F11",
                 # [2026-05-22 v40] v39 的 0.8s 沒解決卡死 (卡死是醫院 app 自己
                 # 處理 server roundtrip)，反而拖慢偵測。回到 0.3s — 給 app
                 # 處理我們 click 跟可能下個 popup 開啟的時間，但不過度。
-                time.sleep(0.3)
+                _sleep_interruptible(0.3)
                 break  # 從頭再掃一輪 (這次處理完可能觸發下個 popup)
 
         if not found_one:
@@ -2940,7 +2958,7 @@ def _f11_popup_watcher(label: str = "F11",
                     label, handled_count, elapsed, total_timeout)
                 last_progress_log = time.time()
             # 沒 popup 時 0.4s polling — 體感即時 + 對 message pump 負擔輕
-            time.sleep(0.4)
+            _sleep_interruptible(0.4)
 
     logging.info("[%s] watcher 達總時限 %.0fs (處理 %d 個)",
                   label, total_timeout, handled_count)
@@ -2978,8 +2996,7 @@ def _f11_快速完成_main(label: str = "F11") -> bool:
     # [2026-05-22 v40] 退回 v39 的 2s → 0.5s。實測 2s 沒解決「卡死」(因為卡死是
     # 醫院 app 自己在處理 server roundtrip，跟我們 polling 無關)，反而拖慢
     # popup 偵測。0.5s 給 app 進入 OnAllComplete 把 first popup 開出來。
-    time.sleep(0.5)
-    check_stop()
+    _sleep_interruptible(0.5)
     logging.info("[%s][timeline] 0.5s 後開始 watcher polling (+%.0fs total)",
                   label, time.time() - t_f11_start)
 
@@ -3204,8 +3221,7 @@ def _wait_for_window(class_name: str, title_kw: str = "",
         hwnd = _find_window_by_class_title(class_name, title_kw, exclude_hwnd)
         if hwnd:
             return hwnd
-        check_stop()
-        time.sleep(poll_sec)
+        _sleep_interruptible(min(poll_sec, max(0.0, end - time.time())))
     return 0
 
 
@@ -3381,8 +3397,15 @@ def _post_click_to_control(hwnd: int, client_x: Optional[int] = None,
         MK_LBUTTON = 0x0001
         WM_LBUTTONDOWN = 0x0201
         WM_LBUTTONUP = 0x0202
-        ctypes.windll.user32.PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
-        ctypes.windll.user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lparam)
+        down_ok = bool(ctypes.windll.user32.PostMessageW(
+            hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam))
+        up_ok = bool(ctypes.windll.user32.PostMessageW(
+            hwnd, WM_LBUTTONUP, 0, lparam))
+        if not (down_ok and up_ok):
+            logging.warning("_post_click_to_control PostMessage failed: "
+                            "hwnd=%s down=%s up=%s",
+                            hwnd, down_ok, up_ok)
+            return False
         return True
     except Exception:
         logging.error("_post_click_to_control 失敗", exc_info=True)
@@ -4260,8 +4283,7 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
         logging.info("[%s] 重試成功", label)
     logging.info("[%s] TOrMain hwnd=%s 已開啟", label, or_hwnd)
     # 不主動推到底層 — ForegroundProtector 會在使用者切走時才保護
-    time.sleep(0.3)  # 等視窗 paint 完成
-    check_stop()
+    _sleep_interruptible(0.3)  # 等視窗 paint 完成
 
     # Step 3: 切到「手術及治療」tab
     tab_ok, target_sheet = _switch_tab_by_text(or_hwnd, "手術及治療")
@@ -4269,8 +4291,7 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
         logging.warning("[%s] 找不到/切換 手術及治療 tab 失敗", label)
         return False
     logging.info("[%s] 已切到 手術及治療 tab (sheet=%s)", label, target_sheet)
-    time.sleep(0.5)   # 等 tab 切完 + radio 重繪
-    check_stop()
+    _sleep_interruptible(0.5)   # 等 tab 切完 + radio 重繪
 
     # Step 4: 點 form_code 對應的 radio (MO04 / MU02)
     # [2026-05-22 任務 B] scope 在 target_sheet 而非 or_hwnd — 確保 click 到
@@ -4286,8 +4307,7 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
                          label, form_code)
     else:
         logging.info("[%s] 已選 radio %s (scope=target_sheet)", label, form_code)
-    time.sleep(0.2)
-    check_stop()
+    _sleep_interruptible(0.2)
 
     # Step 5: 點 同意書視窗的 開立電子 按鈕
     # 先試 target_sheet (若按鈕在分頁內)，找不到再用 or_hwnd (按鈕通常在
@@ -4329,10 +4349,9 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
                         "已自動點 Yes (button hwnd=%s)",
                         label, info_dlg, buttons[0][0])
                     age_dlg_handled = True
-                    time.sleep(0.3)  # 給 Delphi 處理 dismiss + 開 popup
+                    _sleep_interruptible(0.3)  # 給 Delphi 處理 dismiss + 開 popup
                     continue
-        time.sleep(0.1)
-        check_stop()
+        _sleep_interruptible(0.1)
     if not popup:
         logging.warning("[%s] 等不到 popup (Tfm_agree) 60s 超時", label)
         return False

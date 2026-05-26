@@ -175,6 +175,55 @@ def test_f9_f10_consent_menu_post_is_checked():
     assert "PostMessageW(main_hwnd, WM_COMMAND" not in src
 
 
+def test_hotkey_waits_are_interruptible():
+    source_path = ROOT / "src" / "main.py"
+
+    sleep_src = _function_source(source_path, "_sleep_interruptible")
+    assert "check_stop()" in sleep_src
+    assert "time.sleep(min(slice_s, left))" in sleep_src
+
+    wait_focus_src = _function_source(source_path, "_wait_for_code_input_focus")
+    assert "_sleep_interruptible(poll)" in wait_focus_src
+    assert "time.sleep(poll)" not in wait_focus_src
+
+    wait_window_src = _function_source(source_path, "_wait_for_window")
+    assert "_sleep_interruptible(" in wait_window_src
+    assert "time.sleep(poll_sec)" not in wait_window_src
+
+    f11_watcher_src = _function_source(source_path, "_f11_popup_watcher")
+    assert "_sleep_interruptible(0.3)" in f11_watcher_src
+    assert "_sleep_interruptible(0.4)" in f11_watcher_src
+
+    f11_main_src = _function_source(source_path, "_f11_快速完成_main")
+    assert "_sleep_interruptible(0.5)" in f11_main_src
+    assert "time.sleep(0.5)" not in f11_main_src
+
+
+def test_f9_f10_fixed_waits_are_interruptible():
+    source_path = ROOT / "src" / "main.py"
+    src = _function_source(source_path, "script_F9_F10_consent_form_adaptive")
+
+    for expected in (
+        "_sleep_interruptible(0.3)",
+        "_sleep_interruptible(0.5)",
+        "_sleep_interruptible(0.2)",
+        "_sleep_interruptible(0.1)",
+    ):
+        assert expected in src
+    assert "time.sleep(0.5)" not in src
+    assert "time.sleep(0.3)" not in src
+
+
+def test_post_click_reports_postmessage_failure():
+    source_path = ROOT / "src" / "main.py"
+    src = _function_source(source_path, "_post_click_to_control")
+
+    assert "down_ok = bool(" in src
+    assert "up_ok = bool(" in src
+    assert "if not (down_ok and up_ok):" in src
+    assert "return False" in src
+
+
 def test_code_input_waits_for_focus_after_menu_command():
     source_path = ROOT / "src" / "main.py"
     func = _function_node(source_path, "_script_code_input_adaptive")
