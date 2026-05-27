@@ -1691,3 +1691,22 @@ def test_silent_first_time_when_increase_missing_keeps_dose():
     assert r.action == UvbAction.UPDATED
     assert r.new_dose == 500  # 沒 increase → 保持
     assert r.new_count == 1
+
+
+def test_image1_hu_max_equals_dose_then_keep_silent_update():
+    """[v20.17] 胡寶昌實機 case: UVB dose 1500 = max 1500，含 "then keep 1500"
+    後綴，沒 date。silent first-time update: dose+increase cap max → 維持
+    1500 (因為 1500+100 cap 1500)。確認其他行的舊日期 (2025/12/10) 不被誤改。"""
+    text = ("cyclosporine 100mg since 0106 3M\n"
+            "MTX 6# QW since 0116 12w 4# qw -> taper to 3#  "
+            "on (2025/12/10) for elevated ALT 1.5M\n"
+            "UVB 1500 mj/cm2 increase 100 each time, max 1500 then keep 1500")
+    r = update_uvb_in_text(text, today=date(2026, 5, 27))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1500   # 1500+100=1600 cap max 1500 → 1500
+    assert r.new_count == 1
+    assert "(1) on (2026/05/27)" in r.new_text
+    # MTX 行的舊日期不該被誤改
+    assert "(2025/12/10)" in r.new_text
+    # "then keep 1500" 後綴保留
+    assert "then keep 1500" in r.new_text
