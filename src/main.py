@@ -1942,15 +1942,10 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
     # 文字會包含「天」字眼，title 也跟著改。Yes → 同時帶 skip_stale_check=True
     if result.action == UvbAction.CONFIRM_NEEDED:
         confirm_reason = result.confirm_reason or "原劑量或 MAX 超過建議上限"
-        # [v20.16] 區分 dose / stale / first-time 三種 confirm
+        # [v20.17] 沒日期已改成 silent first-time update，不會再跳到這裡。
+        # 這個 path 只剩 dose-over-limit / stale-record 兩種。
         is_stale = "距今" in confirm_reason and "天" in confirm_reason
-        is_first_time = ("沒有日期" in confirm_reason
-                         or "第一次照光" in confirm_reason)
-        if is_first_time:
-            dialog_title = f"UVB 第一次照光確認 - {label}"
-            dialog_intro = "處置 UVB 行沒有日期，請確認是否當作第一次照光記錄"
-            kind = "first_time"
-        elif is_stale:
+        if is_stale:
             dialog_title = f"UVB 距上次照光時間過長 - {label}"
             dialog_intro = "請確認是否要按舊紀錄繼續更新"
             kind = "stale"
@@ -1985,11 +1980,17 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
             return False if strict else True
         logging.info("[%s][UVB] CONFIRM_NEEDED user 按是 → 重 call 帶 skip flags",
                      label)
-        # [v20.14/v20.16] 同時帶三個 flag，無論本次是 dose / stale / first_time
-        # 哪種 confirm，第二次 call 都不會再卡同樣的 confirm。
+        # [v20.14] 同時帶兩個 skip flag，無論本次是 dose 還是 stale confirm，
+        # 第二次 call 都不會再卡同樣的 confirm。
         result = update_uvb_in_text(
-            text, skip_dose_sanity=True, skip_stale_check=True,
-            treat_as_first_time=True)
+            text, skip_dose_sanity=True, skip_stale_check=True)
+
+    # [v20.17] SILENT_SKIP — 處置有 UVB+dose 但缺 MAX/increase (e.g. 梁雯琳
+    # "keep UVB 850 mj/cm2") → 不修改處置但繼續執行 51019+療程
+    if result.action == UvbAction.SILENT_SKIP:
+        logging.info("[%s][UVB] SILENT_SKIP — 處置 UVB 行結構不完整 "
+                     "(只有 dose 沒 MAX)，不修改但繼續執行", label)
+        return True
 
     if result.action == UvbAction.NO_UVB_LINE:
         # parse_uvb_line 找不到 — 對 F1 是正常情況、F2/F3 是異常

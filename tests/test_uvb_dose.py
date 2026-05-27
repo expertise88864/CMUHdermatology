@@ -1246,28 +1246,21 @@ def test_image1_real_world_text_should_update_cleanly():
 
 # ─── v20.14 STALE_DAYS 30 天確認 + 兩張 screenshot 病人不修改 ────────────
 
-def test_image1_zhao_no_uvb_date_or_count_first_time_confirm():
-    """[v20.16] image 1 (趙子勳): UVB 行沒 date 也沒 count，只有 dose+MAX →
-    改為 CONFIRM_NEEDED「第一次照光」(舊 v20.14 是 PARSE_FAIL)。
-    醫師按否 → 不修改 (保留原 v20.14 安全行為)。
-    醫師按是 → 插入 (1) on (today)。
-    """
+def test_image1_zhao_no_uvb_date_silent_first_time_update():
+    """[v20.17] image 1 (趙子勳): UVB 沒 date — 改為 silent first-time
+    update (不跳 CONFIRM dialog)。dose 套用 +increase (300+50=350)，
+    count=1, date=今天。"""
     text = ("UVB: 300 mj/cm2 add 50 every time MAX: 1200 mj/cm2,\n"
             "start MTX 3# w3-4    6# QW  w10-12 (2023/6/22),\n"
             "actretin 20mg  M3 30mg on (2025/5/29)")
     r = update_uvb_in_text(text, today=date(2026, 5, 26))
-    assert r.action == UvbAction.CONFIRM_NEEDED, (
-        f"沒 date → CONFIRM_NEEDED 跳 Yes/No 給醫師決定")
-    assert "沒有日期" in (r.confirm_reason or "")
-    # 不能拿其他行 (2023/6/22) (2025/5/29) 的 date 自動套
-    # 按否時 caller 不寫入 (main.py 邏輯)
-    # 按是 → 第一次照光
-    r2 = update_uvb_in_text(text, today=date(2026, 5, 26),
-                            treat_as_first_time=True)
-    assert r2.action == UvbAction.UPDATED
-    assert r2.new_dose == 300
-    assert r2.new_count == 1
-    assert "(1) on (2026/05/26)" in r2.new_text
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 350   # 300 + 50
+    assert r.new_count == 1
+    assert "(1) on (2026/05/26)" in r.new_text
+    # 其他行 (2023/6/22) (2025/5/29) 不該被誤改
+    assert "(2023/6/22)" in r.new_text
+    assert "(2025/5/29)" in r.new_text
 
 
 def test_image2_liao_chinese_chars_between_colon_and_dose_parse_fail():
@@ -1497,51 +1490,34 @@ def test_date_before_uvb_on_same_line():
 
 # ─── v20.16 沒日期 第一次照光 + 拼錯 typo ───────────────────────────────
 
-def test_image1_chen_no_date_first_time_confirm():
-    """[v20.16] image 1 (陳佳徵): UVB 有 dose+MAX 但沒 (count)/沒 date →
-    CONFIRM_NEEDED「第一次照光」。"""
+def test_image1_chen_no_date_silent_first_time():
+    """[v20.17] image 1 (陳佳徵): UVB 有 dose+MAX 但沒 (count)/沒 date →
+    silent first-time update (不跳對話框)。dose 780+30=810。"""
     text = ("IL 10mg (2) , no hematologic transmitted disease such as "
             "HBV/ HCV/, HIV\n"
             "局部頭皮UVB: 780 mj/cm2, .add 30 mj/cm2 eacht time, "
             "MAx: 1000 mj/cm2")
     r = update_uvb_in_text(text, today=date(2026, 5, 26))
-    assert r.action == UvbAction.CONFIRM_NEEDED
-    assert "沒有日期" in (r.confirm_reason or "")
-
-    # 醫師按是 → 插入 (1) on (today)
-    r2 = update_uvb_in_text(text, today=date(2026, 5, 26),
-                            treat_as_first_time=True)
-    assert r2.action == UvbAction.UPDATED
-    assert r2.new_dose == 780
-    assert r2.new_count == 1
-    assert "(1) on (2026/05/26)" in r2.new_text
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 810  # 780 + 30
+    assert r.new_count == 1
+    assert "(1) on (2026/05/26)" in r.new_text
     # 上面那行 "IL 10mg (2)" 不該被誤改
-    assert "IL 10mg (2)" in r2.new_text
+    assert "IL 10mg (2)" in r.new_text
 
 
-def test_image2_zhang_no_date_typo_incrase_first_time():
-    """[v20.16] image 2 (張耀銘): UVB 有 dose+MAX 但沒 date 且 increase
-    拼錯為 'incrase' → typo 偵測過 + first-time CONFIRM。"""
+def test_image2_zhang_no_date_typo_incrase_silent_update():
+    """[v20.17] image 2 (張耀銘): UVB 有 dose+MAX 沒 date + typo 'incrase' →
+    silent first-time update (no dialog)。dose 1200+100 cap 1500 = 1300。"""
     text = ("UVB 1200 mj/cm2 incrase 100 each time max 1500\n"
             "dupi start on 0606 taper to 4w hold on 0819, restart on 1119")
     r = update_uvb_in_text(text, today=date(2026, 5, 26))
-    assert r.action == UvbAction.CONFIRM_NEEDED
-    assert "沒有日期" in (r.confirm_reason or "")
-    # partial 仍能 parse 出 dose/max/increase (typo 接受)
-    assert r.parsed is not None
-    assert r.parsed.dose == 1200
-    assert r.parsed.max_dose == 1500
-    assert r.parsed.increase == 100  # typo "incrase" 也認
-
-    # 按是 → first time update
-    r2 = update_uvb_in_text(text, today=date(2026, 5, 26),
-                            treat_as_first_time=True)
-    assert r2.action == UvbAction.UPDATED
-    assert r2.new_dose == 1200
-    assert r2.new_count == 1
-    assert "(1) on (2026/05/26)" in r2.new_text
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1300  # 1200 + 100, cap 1500
+    assert r.new_count == 1
+    assert "(1) on (2026/05/26)" in r.new_text
     # incrase 保留 (不修拼字)
-    assert "incrase 100" in r2.new_text
+    assert "incrase 100" in r.new_text
 
 
 def test_typo_incrase_accepted_by_increase_regex():
@@ -1584,23 +1560,134 @@ def test_uvb_with_colon_but_chinese_in_between_parse_fail():
     assert r.action == UvbAction.PARSE_FAIL
 
 
-def test_first_time_dose_unchanged_no_increase_applied():
-    """[v20.16] 第一次照光時，dose 維持 parsed.dose 不依公式 +increase。"""
+def test_first_time_applies_increase_formula():
+    """[v20.17] 第一次照光 (沒 date) dose 套用 +increase 公式 cap MAX
+    (改自 v20.16 的「維持原 dose」)。"""
     text = "UVB: 500 mj/cm2, increase 50, MAX: 1000"
-    r = update_uvb_in_text(text, today=date(2026, 5, 26),
-                           treat_as_first_time=True)
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
     assert r.action == UvbAction.UPDATED
-    # 不是 550 (500+50), 應該維持 500
-    assert r.new_dose == 500
+    assert r.new_dose == 550   # 500 + 50
     assert r.new_count == 1
 
 
 def test_first_time_with_existing_count_increments():
-    """[v20.16] 第一次照光但處置已有 (N) — 沒 date 仍當第一次，count → N+1。"""
+    """[v20.17] 第一次照光但處置已有 (N) — 沒 date 仍當第一次，
+    count → N+1, dose → +increase, 不重複插入 count。"""
     text = "UVB: 800 mj/cm2 (3), add 50, MAX: 1000"
-    r = update_uvb_in_text(text, today=date(2026, 5, 26),
-                           treat_as_first_time=True)
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
     assert r.action == UvbAction.UPDATED
-    assert r.new_dose == 800
-    assert r.new_count == 4   # 3 + 1
-    assert "(1)" not in r.new_text or "(4)" in r.new_text
+    assert r.new_dose == 850   # 800 + 50
+    assert r.new_count == 4    # 3 + 1
+    # 原 (3) 被替換成 (4), 後面接 " on (today)"
+    assert "(4) on (2026/05/26)" in r.new_text
+    # 不能有 (1) 之類的多餘 count
+    assert r.new_text.count("(4)") == 1
+    # 也不能有重複的 count 或 on (today)
+    assert r.new_text.count("on (2026/05/26)") == 1
+
+
+# ─── v20.17 5 個新實機 case (沒日期改 silent first-time) ─────────────────
+
+def test_image1_lai_uvb_no_date_silent_update():
+    """[v20.17] image 1 (賴佑昌): UVB 930 mj/cm2 increase 100 each time max 1500
+    沒 (count) 沒 date → silent update, dose 930+100=1030, count=1, date=今天。"""
+    text = ("UVB 930 mj/cm2 increase 100 each time max 1500\n"
+            "MTX 6# QW  12w 抗微生物製劑: CEPHRA\n"
+            "cyclosporine 125mg 3M")
+    r = update_uvb_in_text(text, today=date(2026, 5, 27))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1030
+    assert r.new_count == 1
+    assert "UVB 1030 mj/cm2 (1) on (2026/05/27)" in r.new_text
+
+
+def test_image2_yang_uvb_no_unit_space_silent_update():
+    """[v20.17] image 2 (楊安臻): UVB 150mj/cm2 increase 30 each time, max 1000
+    沒 date → dose 150+30=180, count=1。"""
+    text = "UVB 150mj/cm2 increase 30 each time, max 1000"
+    r = update_uvb_in_text(text, today=date(2026, 5, 27))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 180
+    assert r.new_count == 1
+    assert "(1) on (2026/05/27)" in r.new_text
+
+
+def test_image3_liang_keep_uvb_no_max_silent_skip():
+    """[v20.17] image 3 (梁雯琳): keep UVB 850 mj/cm2 (只有 dose 沒 MAX) →
+    SILENT_SKIP — 不修改處置，但 caller 應該繼續執行 51019+療程。"""
+    text = "keep UVB 850 mj/cm2"
+    r = update_uvb_in_text(text, today=date(2026, 5, 27))
+    assert r.action == UvbAction.SILENT_SKIP
+
+
+def test_image4_zhang_in_crease_typo_silent_update():
+    """[v20.17] image 4 (張智宇): UVB 950 mj/cm2 in crease 50 each time, max 1200
+    'in crease' 中間有空格的 typo → 認 increase 50。silent update。"""
+    text = ("MTX 3# QW 2w  6# QW 12W\n"
+            "acitretin 20mg 12w\n"
+            "UVB 950 mj/cm2 in crease 50 each time, max 1200")
+    r = update_uvb_in_text(text, today=date(2026, 5, 27))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1000  # 950 + 50
+    assert r.new_count == 1
+    assert "UVB 1000 mj/cm2 (1) on (2026/05/27)" in r.new_text
+    # 其他治療行不該被誤改
+    assert "MTX 3# QW 2w" in r.new_text
+    assert "acitretin 20mg 12w" in r.new_text
+
+
+def test_image5_huang_max_uvb_phrase_silent_update():
+    """[v20.17] image 5 (黃冠輝): UVB 1530 mj/cm2, increase 30 each time,
+    max UVB 1800 mj/cm2 — "max UVB N" 新寫法 + dose 1530 (> 1500 但醫師 max
+    自訂 1800)。silent first-time update, dose 1530+30=1560。"""
+    text = ("UVB 1530 mj/cm2, increase 30 each time, max UVB 1800 mj/cm2\n"
+            "Ruxo")
+    r = update_uvb_in_text(text, today=date(2026, 5, 27))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1560  # 1530 + 30, cap 1800
+    assert r.new_count == 1
+    assert "UVB 1560 mj/cm2 (1) on (2026/05/27)" in r.new_text
+    # max UVB 1800 保留
+    assert "max UVB 1800" in r.new_text
+
+
+def test_max_uvb_phrase_parses():
+    """[v20.17] "max UVB N" 寫法被 MAX regex 認可。"""
+    text = "UVB 500 mj/cm2 (5) on (2026/5/24) increase 30, max UVB 1000"
+    info = parse_uvb_line(text)
+    assert info is not None
+    assert info.max_dose == 1000
+
+
+def test_in_crease_typo_with_space_parses():
+    """[v20.17] "in crease N" 中間有空格的 typo 被 increase regex 認可。"""
+    text = "UVB 500 (5) on (2026/5/24) in crease 50, max 1000"
+    info = parse_uvb_line(text)
+    assert info is not None
+    assert info.increase == 50
+
+
+def test_silent_skip_for_uvb_dose_only_no_max():
+    """[v20.17] 只有 UVB+dose 沒 MAX/increase → SILENT_SKIP (新 action)。"""
+    text = "keep UVB 600 mj/cm2 BIW"
+    r = update_uvb_in_text(text, today=date(2026, 5, 27))
+    assert r.action == UvbAction.SILENT_SKIP
+
+
+def test_silent_first_time_dose_capped_at_local_max():
+    """[v20.17] silent first-time update 套用 +increase 後 cap 醫師自訂 MAX
+    (而非全域 MAX_DOSE=1500)。"""
+    text = "UVB 1750 mj/cm2 increase 50 each time max 1800"
+    r = update_uvb_in_text(text, today=date(2026, 5, 27))
+    # dose 1750+50=1800 (= local max), 不被 global MAX_DOSE 1500 卡住
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1800
+
+
+def test_silent_first_time_when_increase_missing_keeps_dose():
+    """[v20.17] 沒 increase 但有 dose+max → first-time dose 保持不變 (沒法 +N)。"""
+    text = "UVB 500 mj/cm2 fixed at 1000"
+    r = update_uvb_in_text(text, today=date(2026, 5, 27))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 500  # 沒 increase → 保持
+    assert r.new_count == 1

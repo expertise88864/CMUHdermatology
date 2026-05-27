@@ -78,7 +78,10 @@ class UvbAction:
     TOO_CLOSE = "too_close"              # 0-1 天 → 警告
     SANITY_FAIL = "sanity_fail"          # parse 出來的值超出合理範圍 → 警告
     CONFIRM_NEEDED = "confirm_needed"    # [v20.12] dose 超過 MAX_DOSE → Yes/No 確認
-    UPDATED = "updated"                   # 正常更新 (唯一繼續走 51019 的 case)
+    UPDATED = "updated"                  # 正常更新 (唯一繼續走 51019 的 case)
+    # [v20.17] 處置有 UVB+dose 但缺 MAX/increase (e.g. "keep UVB 850 mj/cm2") —
+    # 不修改處置但繼續執行 51019+療程 (像 F1 lenient mode 的 NO_UVB_LINE 行為)
+    SILENT_SKIP = "silent_skip"
 
 
 # ─── Parse result ───────────────────────────────────────────────────────
@@ -143,16 +146,19 @@ _UVB_DATE_RE = re.compile(
 _UVB_COUNT_RE = re.compile(r"[\(（]\s*(\d+)\s*[\)）]")
 # increase / increased / add / 每次加 / 增加 (case-insensitive)
 # [v20.16] 也接受常見打字錯誤 "incrase" / "incraese" (張耀銘實機 case)
+# [v20.17] 接受 "in crease" 中間有空格 (張智宇實機 case)
 _UVB_INCREASE_RE = re.compile(
-    r"(?:(?:incr(?:e?a?|a?e?)se[d]?|add)(?:\s+by)?|每次增加|每次加|增加|加)"
+    r"(?:(?:in\s*cr(?:e?a?|a?e?)se[d]?|add)(?:\s+by)?|每次增加|每次加|增加|加)"
     r"\s*[:：]?\s*(\d+)",
     re.IGNORECASE)
 # [v20.8] MAX 接受多種同義表達:
 #   MAX:N / MAX N / MAX at N / MAX dose: N / fix N / fixed at N / fixed to N / 固定 N
 # \bfix(?:ed)? 確保 word boundary 避免抓到 "prefix"/"fixing" 等
 # [v20.15] 新增 "MAX dose" 寫法 (鄧仲強實機 case: "MAX dose: 1200mj/cm2")
+# [v20.17] 新增 "MAX UVB / MAX Phototherapy" 寫法 (黃冠輝實機 case:
+#   "max UVB 1800 mj/cm2")
 _UVB_MAX_RE = re.compile(
-    r"(?:MAX(?:\s+dose)?(?:\s+(?:at|to))?\s*[:：]?\s*"
+    r"(?:MAX(?:\s+(?:dose|UVB|Phototherapy))?(?:\s+(?:at|to))?\s*[:：]?\s*"
     r"|\bfix(?:ed)?(?:\s+(?:at|to))?\s*[:：]?\s*"
     r"|固定(?:在|為)?\s*[:：]?\s*)(\d+)",
     re.IGNORECASE,
@@ -660,28 +666,49 @@ def apply_uncertain_updates(text: str, triplets: list) -> str:
 def _first_time_update(parsed: UvbLineInfo, today: date,
                         uvb_lines: int) -> UvbUpdateResult:
     """[v20.16] 處置 UVB 行沒日期 → 當作第一次照光記錄:
-      - dose 保持 parsed.dose (不依公式 +increase / decay)
+      - [v20.17] dose 套用 +increase 公式 (treat as 2-6 days, min cap MAX)
       - count = 1 (沒原 count) 或 parsed.count + 1 (有原 count)
       - 在原 dose+unit 之後插入 "(count) on (today_str)"
 
-    Caller 一定已在跳 Yes/No 對話框後拿到醫師同意才會調用。
+    v20.17 起此 path 是 silent — 不再需要 Yes/No 確認。
     """
     today_str = f"{today.year}/{today.month:02d}/{today.day:02d}"
-    new_dose = parsed.dose
+    # 若有 increase → 套用 +increase 公式 (尊重原 MAX); 否則保持原 dose
+    if parsed.increase is not None and parsed.max_dose:
+        new_dose = min(parsed.dose + parsed.increase, parsed.max_dose)
+    else:
+        new_dose = parsed.dose
     new_count = 1 if parsed.count is None else parsed.count + 1
-    # 在原 dose+unit 之後插入 " (count) on (today_str)"，把 parsed.full_match
-    # 寫回 segment
     src = parsed.full_match
-    new_seg = re.sub(
-        r"((?:UVB|Phototherapy)\s*[:：]?\s*\d+\s*(?:mj/cm2)?)",
-        lambda mo: f"{mo.group(1)} ({new_count}) on ({today_str})",
+
+    # 1. 替換 dose: UVB:OLD → UVB:NEW
+    src = re.sub(
+        r"((?:UVB|Phototherapy)\s*[:：]?\s*)" + str(parsed.dose) +
+        r"(\s*(?:mj/cm2)?)",
+        lambda mo: f"{mo.group(1)}{new_dose}{mo.group(2)}",
         src, count=1, flags=re.IGNORECASE,
     )
-    # 在主 text 用 parsed.span 套回
-    # (caller 傳的 parsed.full_match 應等同 text[parsed.span[0]:parsed.span[1]])
+
+    # 2. count + date 插入
+    if parsed.count is None:
+        # 沒原 count → 在 dose+unit 之後插入 " (new_count) on (today_str)"
+        src = re.sub(
+            r"((?:UVB|Phototherapy)\s*[:：]?\s*\d+\s*(?:mj/cm2)?)",
+            lambda mo: f"{mo.group(1)} ({new_count}) on ({today_str})",
+            src, count=1, flags=re.IGNORECASE,
+        )
+    else:
+        # 有原 count → 替換 count 並在後面插入 " on (today_str)"
+        src = re.sub(
+            r"([\(（]\s*)" + str(parsed.count) + r"(\s*[\)）])",
+            lambda mo: (f"{mo.group(1)}{new_count}{mo.group(2)} "
+                        f"on ({today_str})"),
+            src, count=1,
+        )
+
     return UvbUpdateResult(
         action=UvbAction.UPDATED,
-        new_text=new_seg,  # caller 會把 segment 接回完整 text
+        new_text=src,  # caller 會把 segment 接回完整 text
         new_dose=new_dose,
         new_count=new_count,
         last_date=None,
@@ -731,9 +758,11 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         partial = parse_uvb_partial(text)
         if partial is None:
             # 連結構化 dose+max 都找不到。再細分:
-            # - 有「UVB:」或「UVB：」/「Phototherapy:」結構 → PARSE_FAIL
+            # - 有「UVB:」或「UVB：」結構 (with garbage 中文 etc.) → PARSE_FAIL
             #   (e.g. 廖三發「UVB:已打折 1000」中文夾在冒號後)
-            # - 有 UVB/Phototherapy + 數字 但缺 MAX → PARSE_FAIL
+            # - [v20.17] 有 UVB/Phototherapy + 數字 但缺 MAX (e.g. 圖三梁雯琳
+            #   `keep UVB 850 mj/cm2`) → SILENT_SKIP (不修改處置但繼續執行
+            #   51019+療程)
             # - 連 UVB/Phototherapy + 數字 結構都沒有 → NO_UVB_LINE
             #   (例如「keep phototherapy on both lower limbs to 680」這種
             #   一般描述語句，不是結構化處置)
@@ -742,30 +771,22 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
                 return UvbUpdateResult(action=UvbAction.PARSE_FAIL,
                                        uvb_line_count=uvb_lines)
             if _UVB_DOSE_RE.search(text):
-                return UvbUpdateResult(action=UvbAction.PARSE_FAIL,
+                # 有 UVB+數字但結構不完整 (缺 MAX) → silent skip
+                return UvbUpdateResult(action=UvbAction.SILENT_SKIP,
                                        uvb_line_count=uvb_lines)
             return UvbUpdateResult(action=UvbAction.NO_UVB_LINE,
                                    uvb_line_count=uvb_lines)
         # Partial 抓到 dose+max
         if partial.last_date is None:
-            # 沒 date → 第一次照光 confirm
-            if treat_as_first_time:
-                result = _first_time_update(partial, today, uvb_lines)
-                # 接回原文
-                full_new = (text[:partial.span[0]]
-                            + result.new_text
-                            + text[partial.span[1]:])
-                result.new_text = full_new
-                return result
-            return UvbUpdateResult(
-                action=UvbAction.CONFIRM_NEEDED,
-                confirm_reason=(
-                    f"處置 UVB 行沒有日期 (on YYYY/MM/DD) — "
-                    f"當作第一次照光? 將插入 (1) on ({today.year}/"
-                    f"{today.month:02d}/{today.day:02d})"),
-                parsed=partial,
-                uvb_line_count=uvb_lines,
-            )
+            # [v20.17] 沒 date → 直接 silent first-time 更新，不跳對話框
+            # (user request: "不用跳出是否新增日期 直接修改劑量")
+            result = _first_time_update(partial, today, uvb_lines)
+            # 接回原文
+            full_new = (text[:partial.span[0]]
+                        + result.new_text
+                        + text[partial.span[1]:])
+            result.new_text = full_new
+            return result
         # partial 有 date 但少 increase 之類 — fall through to PARSE_FAIL
         # (theoretically 應該被 strict parse_uvb_line 抓到才對)
         return UvbUpdateResult(action=UvbAction.PARSE_FAIL,
