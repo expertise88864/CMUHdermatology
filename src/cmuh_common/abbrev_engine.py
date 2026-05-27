@@ -53,20 +53,20 @@ DEFAULT_ITEMS: list[dict[str, str]] = [
     {
         "abbrev": "cert1",
         "expansion": (
-            "患者因上述皮膚疾病，於2026年5月28日至本院皮膚科門診就醫治療，"
+            "患者因上述皮膚疾病，於da_zh至本院皮膚科門診就醫治療，"
             "後續接受局部麻醉下皮膚腫瘤切除手術及縫合，"
             "術後病理檢查結果合乎上述疾患。"
-            "患者於da返回本院皮膚科門診接受術後照護並拆除手術縫線。"
+            "患者於da_zh返回本院皮膚科門診接受術後照護並拆除手術縫線。"
         ),
     },
     {
         "abbrev": "cert2",
         "expansion": (
-            "患者因上述皮膚疾病，曾於da-21至本院皮膚科門診就醫，"
-            "後續於da-17接受局部麻醉下之皮膚腫瘤切除及縫合手術，"
+            "患者因上述皮膚疾病，曾於da_zh-21至本院皮膚科門診就醫，"
+            "後續於da_zh-17接受局部麻醉下之皮膚腫瘤切除及縫合手術，"
             "術後病理檢查結果符合上述疾患。"
-            "患者於術後之da-14返回本院皮膚科門診接受照護，"
-            "並分別於da-7及da分次拆除手術縫線。"
+            "患者於術後之da_zh-14返回本院皮膚科門診接受照護，"
+            "並分別於da_zh-7及da_zh分次拆除手術縫線。"
         ),
     },
 ]
@@ -77,6 +77,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "skip_when_ime_active": True,
     "preserve_trailing_space": True,
     "items": DEFAULT_ITEMS,
+}
+
+
+# 舊版內建預設的逐字版本（用於偵測 user 是否還沿用舊預設，自動升級）。
+# 升級規則：若 user 的 cert1/cert2 expansion 完全等於下面字串 → 視為「沒改過」
+# → 替換為 DEFAULT_ITEMS 內的新版（含 da_zh token）。
+_LEGACY_DEFAULTS_TO_MIGRATE: dict[str, str] = {
+    "cert1": (
+        "患者因上述皮膚疾病，於2026年5月28日至本院皮膚科門診就醫治療，"
+        "後續接受局部麻醉下皮膚腫瘤切除手術及縫合，"
+        "術後病理檢查結果合乎上述疾患。"
+        "患者於da返回本院皮膚科門診接受術後照護並拆除手術縫線。"
+    ),
+    "cert2": (
+        "患者因上述皮膚疾病，曾於da-21至本院皮膚科門診就醫，"
+        "後續於da-17接受局部麻醉下之皮膚腫瘤切除及縫合手術，"
+        "術後病理檢查結果符合上述疾患。"
+        "患者於術後之da-14返回本院皮膚科門診接受照護，"
+        "並分別於da-7及da分次拆除手術縫線。"
+    ),
 }
 
 
@@ -104,8 +124,34 @@ class AbbrevConfig:
         }
 
 
+def _maybe_migrate_legacy(items: list[dict[str, str]]) -> bool:
+    """偵測 user 的 cert1/cert2 是否還是舊版預設（字面 2026/5/28、da-N 斜線）。
+    若是，升級為新版（da_zh token）。User 手動編輯過的內容不會被動。
+    回傳 True 表示有修改。
+    """
+    changed = False
+    new_default_by_abbrev = {
+        str(d["abbrev"]).lower(): d["expansion"] for d in DEFAULT_ITEMS
+    }
+    for it in items:
+        ab = str(it.get("abbrev", "")).lower()
+        legacy = _LEGACY_DEFAULTS_TO_MIGRATE.get(ab)
+        if legacy is None:
+            continue
+        if str(it.get("expansion", "")) == legacy:
+            new_exp = new_default_by_abbrev.get(ab)
+            if new_exp and new_exp != legacy:
+                it["expansion"] = new_exp
+                changed = True
+                logging.info(
+                    "[abbrev] 自動升級舊版預設 '%s' → 新版含 da_zh token", ab)
+    return changed
+
+
 def load_config(path: str) -> AbbrevConfig:
-    """讀取設定，缺檔/壞檔自動回 defaults。"""
+    """讀取設定，缺檔/壞檔自動回 defaults。
+    若偵測到舊版內建 cert1/cert2 字面預設，會自動升級為動態 da_zh 版本。
+    """
     raw = load_json_dict(path, DEFAULT_CONFIG, merge_defaults=True)
     items = raw.get("items")
     if not isinstance(items, list):
@@ -123,12 +169,22 @@ def load_config(path: str) -> AbbrevConfig:
             continue
         seen_abbrevs.add(key)
         cleaned.append({"abbrev": abbrev, "expansion": str(it.get("expansion", ""))})
-    return AbbrevConfig(
+
+    cfg = AbbrevConfig(
         enabled=bool(raw.get("enabled", False)),
         skip_when_ime_active=bool(raw.get("skip_when_ime_active", True)),
         preserve_trailing_space=bool(raw.get("preserve_trailing_space", True)),
         items=cleaned,
     )
+
+    # 偵測 + 自動升級舊版預設；若有改 → 寫回磁碟
+    if _maybe_migrate_legacy(cfg.items):
+        try:
+            save_config(path, cfg)
+        except Exception:
+            logging.debug("[abbrev] migrate 後存檔失敗", exc_info=True)
+
+    return cfg
 
 
 def save_config(path: str, cfg: AbbrevConfig) -> None:
@@ -151,14 +207,23 @@ def ensure_config_file(path: str) -> AbbrevConfig:
 # -----------------------------------------------------------------------------
 # Token 渲染
 # -----------------------------------------------------------------------------
-# 比對：da+N、da-N、da1、da2、da。前後皆非 ASCII alnum。
-# 注意：較長的 alternative 寫在前面，re 才會 greedy 抓到 da+N / da[12] 而不是只抓 da。
-_TOKEN_RE = re.compile(r'(?<![A-Za-z0-9])(da[+-]\d+|da[12]|da)(?![A-Za-z0-9])')
+# 比對順序很重要：長的（含 _zh / 含 ±N）寫在前，re alternation 從左到右匹配第一個成立的。
+# 邊界：前後皆非 [A-Za-z0-9_]（含底線，避免 da_zh 被誤切成 da + _zh）。
+_TOKEN_RE = re.compile(
+    r'(?<![A-Za-z0-9_])'
+    r'(da_zh[+-]\d+|da_zh|da[+-]\d+|da[12]|da)'
+    r'(?![A-Za-z0-9_])'
+)
 
 
 def _fmt_date_slash(d: datetime) -> str:
-    """2026/5/27（無 zero-pad）"""
+    """2026/5/27（無 zero-pad，斜線）"""
     return f"{d.year}/{d.month}/{d.day}"
+
+
+def _fmt_date_zh(d: datetime) -> str:
+    """2026年5月27日（中文年月日，無 zero-pad）"""
+    return f"{d.year}年{d.month}月{d.day}日"
 
 
 def _fmt_time_hhmm(d: datetime) -> str:
@@ -167,32 +232,45 @@ def _fmt_time_hhmm(d: datetime) -> str:
 
 
 def render_expansion(template: str, now: Optional[datetime] = None) -> str:
-    """把 template 內的 da / da1 / da2 / da±N tokens 替換為實際日期/時間字串。
+    """把 template 內的日期/時間 token 替換為實際字串。
 
-    - da    → (2026/5/27)
-    - da1   → 23:34
-    - da2   → (2026/5/27) 23:34
-    - da+N  → (2026/M/D) 今日+N 天
-    - da-N  → (2026/M/D) 今日-N 天
+    斜線格式（西式，含括弧）：
+      - da     → (2026/5/27)
+      - da1    → 23:34
+      - da2    → (2026/5/27) 23:34
+      - da+N   → (2026/M/D) 今日 + N 天
+      - da-N   → (2026/M/D) 今日 - N 天
+
+    中文格式（年月日）：
+      - da_zh    → 2026年5月27日
+      - da_zh+N  → 2026年M月D日 今日 + N 天
+      - da_zh-N  → 2026年M月D日 今日 - N 天
     """
     if now is None:
         now = datetime.now()
-    today = now.date()
 
     def repl(m: re.Match) -> str:
         tok = m.group(1)
+        # da_zh 系列（中文格式）
+        if tok == "da_zh":
+            return _fmt_date_zh(now)
+        m2 = re.match(r"da_zh([+-])(\d+)", tok)
+        if m2:
+            sign, n = m2.group(1), int(m2.group(2))
+            delta = n if sign == "+" else -n
+            return _fmt_date_zh(now + timedelta(days=delta))
+        # da / da1 / da2 / da±N（斜線格式）
         if tok == "da":
             return f"({_fmt_date_slash(now)})"
         if tok == "da1":
             return _fmt_time_hhmm(now)
         if tok == "da2":
             return f"({_fmt_date_slash(now)}) {_fmt_time_hhmm(now)}"
-        m2 = re.match(r"da([+-])(\d+)", tok)
-        if m2:
-            sign, n = m2.group(1), int(m2.group(2))
+        m3 = re.match(r"da([+-])(\d+)", tok)
+        if m3:
+            sign, n = m3.group(1), int(m3.group(2))
             delta = n if sign == "+" else -n
-            target = now + timedelta(days=delta)
-            return f"({_fmt_date_slash(target)})"
+            return f"({_fmt_date_slash(now + timedelta(days=delta))})"
         return tok
 
     return _TOKEN_RE.sub(repl, template)
@@ -209,13 +287,16 @@ _GCS_COMPSTR = 0x0008         # composition string
 def should_skip_for_input_method() -> bool:
     """前景視窗目前是「中文/組字輸入狀態」就回 True。
 
-    用三重檢查（任一條件成立就視為中文輸入中）：
-      1. ImmGetOpenStatus：IME 開啟旗標
-      2. ImmGetCompositionString：是否有 composition string in progress
-      3. ImmGetConversionStatus：conversion mode 是否含 IME_CMODE_NATIVE
+    用四重檢查（任一條件成立就視為中文輸入中）：
+      1. 鍵盤布局主語非英文（最強信號；新注音/微軟拼音 IME 都在中文布局上）
+      2. ImmGetOpenStatus：IME 開啟旗標（舊 IMM IME 可靠）
+      3. ImmGetCompositionString：是否有 composition string in progress
+      4. ImmGetConversionStatus：conversion mode 是否含 IME_CMODE_NATIVE
 
-    舊 IMM IME（傳統注音）走 1；新 TSF IME（新注音、Google 注音）
-    對 1 可能不更新，但 2/3 通常還能反映。失敗則回 False（fail-open）。
+    為何要 layout check：新版 TSF-based IME（微軟新注音、Google 注音 IME）
+    對 2/3/4 不一定更新，但只要 user 用中文布局，layout langid 一定是中文。
+    Trade-off：若 user 只裝中文布局，便沒有英文觸發環境；要使用縮寫
+    請另裝 en-US 布局，或關閉本分頁的「中文輸入法組字中暫停展開」選項。
     """
     try:
         user32 = ctypes.windll.user32
@@ -223,24 +304,37 @@ def should_skip_for_input_method() -> bool:
         hwnd = user32.GetForegroundWindow()
         if not hwnd:
             return False
+
+        # 1. 鍵盤布局主語檢查（最強信號）
+        try:
+            pid = ctypes.c_ulong(0)
+            tid = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            hkl = user32.GetKeyboardLayout(tid)
+            # hkl low 16 bits = LANGID；primary language 在 low 10 bits
+            langid = hkl & 0xFFFF
+            primary_lang = langid & 0x3FF
+            _LANG_ENGLISH = 0x09
+            if primary_lang and primary_lang != _LANG_ENGLISH:
+                return True
+        except Exception:
+            logging.debug("[abbrev] layout 檢查失敗", exc_info=True)
+
+        # 2-4. IMM 系列檢查（傳統 IME 用）
         himc = imm32.ImmGetContext(hwnd)
         if not himc:
             return False
         try:
-            # 1. IME 開啟旗標
             try:
                 if imm32.ImmGetOpenStatus(himc):
                     return True
             except Exception:
                 pass
-            # 2. 有 composition string 在組字
             try:
                 size = imm32.ImmGetCompositionStringW(himc, _GCS_COMPSTR, None, 0)
                 if isinstance(size, int) and size > 0:
                     return True
             except Exception:
                 pass
-            # 3. conversion mode 含 NATIVE (中文模式)
             try:
                 conversion = ctypes.c_uint(0)
                 sentence = ctypes.c_uint(0)
@@ -373,6 +467,91 @@ def _clipboard_set_text(text: str) -> bool:
 
 
 # -----------------------------------------------------------------------------
+# 原子 SendInput（避免 race condition：一次 call 內所有 events 連續 dispatch，
+# 中間不會被 user 真實 keystroke 插隊）
+# -----------------------------------------------------------------------------
+_INPUT_KEYBOARD = 1
+_KEYEVENTF_KEYUP = 0x0002
+
+# Virtual-Key codes 需要
+_VK_BACK = 0x08
+_VK_CONTROL = 0x11
+_VK_V = 0x56
+
+# 64-bit safe pointer-sized integer for dwExtraInfo
+_ULONG_PTR = ctypes.c_size_t
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", _ULONG_PTR),
+    ]
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", _ULONG_PTR),
+    ]
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [
+        ("mi", _MOUSEINPUT),
+        ("ki", _KEYBDINPUT),
+        ("hi", _HARDWAREINPUT),
+    ]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("i", _INPUT_UNION),
+    ]
+
+
+def _send_atomic_keystrokes(vk_events: list) -> bool:
+    """一次 SendInput call 送多個鍵盤事件，OS 保證連續、不被插隊。
+
+    vk_events = [(vk_code, is_keydown_bool), ...]
+    """
+    n = len(vk_events)
+    if n == 0:
+        return True
+    try:
+        arr = (_INPUT * n)()
+        for idx, (vk, is_down) in enumerate(vk_events):
+            arr[idx].type = _INPUT_KEYBOARD
+            arr[idx].i.ki.wVk = vk
+            arr[idx].i.ki.wScan = 0
+            arr[idx].i.ki.dwFlags = 0 if is_down else _KEYEVENTF_KEYUP
+            arr[idx].i.ki.time = 0
+            arr[idx].i.ki.dwExtraInfo = 0
+        user32 = ctypes.windll.user32
+        sent = user32.SendInput(n, ctypes.byref(arr), ctypes.sizeof(_INPUT))
+        return sent == n
+    except Exception:
+        logging.exception("[abbrev] SendInput 失敗")
+        return False
+
+
+# -----------------------------------------------------------------------------
 # 引擎主體
 # -----------------------------------------------------------------------------
 # `keyboard` event.name 對 printable 鍵會是單字元（'a'、'1'、','...）
@@ -393,8 +572,9 @@ class AbbrevEngine:
     MAX_BACKSPACE = 64
 
     # 展開後的冷卻時間（s）— 期間 buffer 暫停累積，避免 user 連打第二組
-    # 縮寫時，後續 keystroke 跟我們的 paste 競態，造成串接型亂碼。
-    COOLDOWN_SEC = 0.40
+    # 縮寫時後續 keystroke 跟我們的 paste 競態。配合 BlockInput + 原子
+    # SendInput，0.55 秒已足夠涵蓋 paste 完成 + clipboard 還原。
+    COOLDOWN_SEC = 0.55
 
     def __init__(self, kb_module: Any) -> None:
         """kb_module = `keyboard` PyPI 套件物件（已 import 完成）。"""
@@ -543,42 +723,85 @@ class AbbrevEngine:
         self._do_replace(delete_count, rendered, matched_key)
 
     def _do_replace(self, backspace_count: int, text: str, abbrev_key: str) -> None:
-        """送 N 個 backspace + 用剪貼簿 paste（Ctrl+V）寫出展開內容。
+        """原子 SendInput：backspace × N + Ctrl+V 一次發送，期間 BlockInput
+        凍結 user 真實輸入避免 race。
 
-        為何用 paste：原本逐字 `keyboard.write(text)` 對長字串會送出幾十個
-        OS keystroke，user 在這段期間若繼續打下個縮寫（連打 nev1 nev1 ），
-        OS event queue 會把 user 的 keystroke 跟我們的 backspace/write
-        交錯，造成輸出字串混亂。改 paste 後只送 ~3 個 OS event
-        （Ctrl 下、V 下、Ctrl V 放開），race window 從 100-200ms 縮到 ~20ms。
+        為何需要 BlockInput：keyboard 模組 callback 在 worker thread 跑，
+        user 連打下個縮寫的字元會在我們 SendInput 之前到達 focused window，
+        造成「d00:27 」這種少刪 1-2 個 char 的 race condition。
+        BlockInput 需要 admin 權限；非 admin 環境下退而只靠 cool-down。
         """
         kb = self._kb
         if kb is None:
             return
+
         self._suppressing = True
         # 進入「冷卻期」— 這段時間 buffer 暫停累積，避免 user 連打污染。
         self._cooldown_until = time.monotonic() + self.COOLDOWN_SEC
-        try:
-            # 1. 刪掉「縮寫 + trigger char」
-            for _ in range(backspace_count):
-                try:
-                    kb.send("backspace")
-                except Exception:
-                    logging.debug("[abbrev] send backspace 失敗", exc_info=True)
-                    break
 
-            # 2. paste 寫出展開內容（fallback 到 keyboard.write）
-            paste_ok = self._paste_via_clipboard(text)
-            if not paste_ok:
-                logging.warning("[abbrev] paste 失敗，fallback 用 keystroke")
+        old_clip: Optional[str] = None
+        used_paste = False
+        used_keystroke = False
+        try:
+            # 1. 備份 + 設剪貼簿（paste mode 首選）
+            old_clip = _clipboard_get_text()
+            clip_ok = _clipboard_set_text(text)
+
+            if clip_ok:
+                # 2a. 組原子事件序列：backspace × N + Ctrl + V + Ctrl up + V up
+                events: list = []
+                for _ in range(backspace_count):
+                    events.append((_VK_BACK, True))
+                    events.append((_VK_BACK, False))
+                events.append((_VK_CONTROL, True))
+                events.append((_VK_V, True))
+                events.append((_VK_V, False))
+                events.append((_VK_CONTROL, False))
+
+                # 3a. BlockInput 凍結 user 輸入 → 原子 SendInput → 解凍
+                user32 = ctypes.windll.user32
+                blocked = False
+                try:
+                    blocked = bool(user32.BlockInput(True))
+                except Exception:
+                    logging.debug("[abbrev] BlockInput 不可用", exc_info=True)
+                try:
+                    used_paste = _send_atomic_keystrokes(events)
+                finally:
+                    if blocked:
+                        try:
+                            user32.BlockInput(False)
+                        except Exception:
+                            pass
+                # 4a. 等 OS dispatch + target app 處理 paste 完成
+                time.sleep(0.12)
+            else:
+                # 2b. fallback: 剪貼簿寫入失敗 → 用 keyboard.send/write 老路
+                logging.warning("[abbrev] 剪貼簿寫入失敗，fallback 用 keystroke")
+                for _ in range(backspace_count):
+                    try:
+                        kb.send("backspace")
+                    except Exception:
+                        break
                 try:
                     kb.write(text)
+                    used_keystroke = True
                 except Exception:
-                    logging.exception("[abbrev] keyboard.write fallback 也失敗")
-
-            logging.info("[abbrev] 展開 '%s' → %d 字 (%s)",
-                         abbrev_key, len(text),
-                         "paste" if paste_ok else "keystroke")
+                    logging.exception("[abbrev] keyboard.write fallback 失敗")
+        except Exception:
+            logging.exception("[abbrev] _do_replace 失敗 abbrev=%s", abbrev_key)
         finally:
+            # 還原剪貼簿（即使失敗也試）
+            if old_clip is not None:
+                try:
+                    _clipboard_set_text(old_clip)
+                except Exception:
+                    logging.debug("[abbrev] 還原剪貼簿失敗", exc_info=True)
+
+            mode = "atomic-paste" if used_paste else ("keystroke" if used_keystroke else "FAIL")
+            logging.info("[abbrev] 展開 '%s' → %d 字 (%s)",
+                         abbrev_key, len(text), mode)
+
             # cool-down 期滿後才清 suppress 旗標 + buffer
             def _clear():
                 self._suppressing = False
@@ -587,34 +810,3 @@ class AbbrevEngine:
             t = threading.Timer(self.COOLDOWN_SEC, _clear)
             t.daemon = True
             t.start()
-
-    def _paste_via_clipboard(self, text: str) -> bool:
-        """備份 → 設 clip → Ctrl+V → 等待 → 還原 clip。任何步驟失敗回 False。"""
-        kb = self._kb
-        if kb is None:
-            return False
-        old_clip: Optional[str] = None
-        try:
-            old_clip = _clipboard_get_text()
-            if not _clipboard_set_text(text):
-                return False
-            # 等剪貼簿落地（避免 Ctrl+V 拿到舊內容）
-            time.sleep(0.04)
-            try:
-                kb.send("ctrl+v")
-            except Exception:
-                logging.debug("[abbrev] send ctrl+v 失敗", exc_info=True)
-                return False
-            # 等 OS paste 完成（時間取決於 focused window）
-            time.sleep(0.10)
-            return True
-        except Exception:
-            logging.exception("[abbrev] paste 流程例外")
-            return False
-        finally:
-            # 不論成功失敗都試圖還原剪貼簿
-            if old_clip is not None:
-                try:
-                    _clipboard_set_text(old_clip)
-                except Exception:
-                    logging.debug("[abbrev] 還原剪貼簿失敗", exc_info=True)
