@@ -285,18 +285,19 @@ _GCS_COMPSTR = 0x0008         # composition string
 
 
 def should_skip_for_input_method() -> bool:
-    """前景視窗目前是「中文/組字輸入狀態」就回 True。
+    """前景視窗目前是 IME 組字 / 中文模式 → 回 True。Best-effort 而已。
 
-    用四重檢查（任一條件成立就視為中文輸入中）：
-      1. 鍵盤布局主語非英文（最強信號；新注音/微軟拼音 IME 都在中文布局上）
-      2. ImmGetOpenStatus：IME 開啟旗標（舊 IMM IME 可靠）
-      3. ImmGetCompositionString：是否有 composition string in progress
-      4. ImmGetConversionStatus：conversion mode 是否含 IME_CMODE_NATIVE
+    三重 IMM 檢查（任一成立就視為中文輸入中）：
+      1. ImmGetOpenStatus：IME 開啟旗標（舊 IMM IME 可靠）
+      2. ImmGetCompositionString：是否有 composition string in progress
+      3. ImmGetConversionStatus：conversion mode 是否含 IME_CMODE_NATIVE
 
-    為何要 layout check：新版 TSF-based IME（微軟新注音、Google 注音 IME）
-    對 2/3/4 不一定更新，但只要 user 用中文布局，layout langid 一定是中文。
-    Trade-off：若 user 只裝中文布局，便沒有英文觸發環境；要使用縮寫
-    請另裝 en-US 布局，或關閉本分頁的「中文輸入法組字中暫停展開」選項。
+    新版 TSF-based IME（微軟新注音、Google 注音）對 1-3 不一定更新，所以
+    本函式只是「best-effort」。AbbrevEngine 另以 Shift-only-tap 追蹤
+    使用者手動切換的 IME 中/英狀態作為補充。
+
+    特意「不查鍵盤布局語言」：在中文布局 + 注音 IME 切到英文模式時，
+    layout 仍是中文台灣，但 user 期望可觸發 — 不能用 layout 一刀切。
     """
     try:
         user32 = ctypes.windll.user32
@@ -304,22 +305,6 @@ def should_skip_for_input_method() -> bool:
         hwnd = user32.GetForegroundWindow()
         if not hwnd:
             return False
-
-        # 1. 鍵盤布局主語檢查（最強信號）
-        try:
-            pid = ctypes.c_ulong(0)
-            tid = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            hkl = user32.GetKeyboardLayout(tid)
-            # hkl low 16 bits = LANGID；primary language 在 low 10 bits
-            langid = hkl & 0xFFFF
-            primary_lang = langid & 0x3FF
-            _LANG_ENGLISH = 0x09
-            if primary_lang and primary_lang != _LANG_ENGLISH:
-                return True
-        except Exception:
-            logging.debug("[abbrev] layout 檢查失敗", exc_info=True)
-
-        # 2-4. IMM 系列檢查（傳統 IME 用）
         himc = imm32.ImmGetContext(hwnd)
         if not himc:
             return False
@@ -563,6 +548,8 @@ _RESET_KEY_NAMES = {
     "home", "end", "page up", "page down",
     "delete", "backspace",
 }
+# 注音 IME 用 Shift 切換中/英 模式；不同 keyboard 版本可能用不同 name
+_SHIFT_KEY_NAMES = {"shift", "left shift", "right shift"}
 
 
 class AbbrevEngine:
@@ -575,6 +562,8 @@ class AbbrevEngine:
     # 縮寫時後續 keystroke 跟我們的 paste 競態。配合 BlockInput + 原子
     # SendInput，0.55 秒已足夠涵蓋 paste 完成 + clipboard 還原。
     COOLDOWN_SEC = 0.55
+    # Shift-only-tap 判定上限（s）— 注音 IME 切換中/英模式的常見手勢
+    SHIFT_TAP_MAX_SEC = 0.7
 
     def __init__(self, kb_module: Any) -> None:
         """kb_module = `keyboard` PyPI 套件物件（已 import 完成）。"""
@@ -585,30 +574,42 @@ class AbbrevEngine:
         self._lookup: dict[str, str] = {}
         self._max_abbrev_len: int = 0
         self._buffer: str = ""
-        self._hook_handle: Any = None
+        self._press_hook: Any = None
+        self._release_hook: Any = None
         self._suppressing = False
         # 展開後的冷卻截止時間（monotonic）
         self._cooldown_until: float = 0.0
+        # 注音 IME 中/英 模式追蹤（Shift-only-tap 偵測 → toggle）
+        # 預設 True（中文）— 注音 IME 開啟時通常是中文模式
+        self._ime_chinese_mode: bool = True
+        self._shift_down_ts: float = 0.0
+        self._other_key_since_shift: bool = False
+        # UI 端可註冊 listener 來同步顯示目前 IME 模式狀態
+        self._state_listener: Optional[Callable[[bool], None]] = None
 
     # ------------------------------------------------------------------ 公開 API
     def install(self, cfg: AbbrevConfig) -> None:
-        """套用設定並掛上 keyboard hook。重複呼叫會先 uninstall 再裝。"""
+        """套用設定並掛上 keyboard hook（press + release）。重複呼叫會先 uninstall 再裝。"""
         with self._lock:
             self._cfg = cfg
             self._rebuild_lookup_locked()
             self._buffer = ""
+            self._shift_down_ts = 0.0
+            self._other_key_since_shift = False
             self._uninstall_locked()
             if not cfg.enabled or not self._lookup:
                 logging.info("[abbrev] hook 未掛載（enabled=%s, items=%d）",
                              cfg.enabled, len(self._lookup))
                 return
             try:
-                self._hook_handle = self._kb.on_press(self._on_press)
+                self._press_hook = self._kb.on_press(self._on_press)
+                self._release_hook = self._kb.on_release(self._on_release)
                 logging.info("[abbrev] hook 已掛載，%d 筆縮寫（最長 %d 字）",
                              len(self._lookup), self._max_abbrev_len)
             except Exception:
-                logging.exception("[abbrev] keyboard.on_press 掛載失敗")
-                self._hook_handle = None
+                logging.exception("[abbrev] keyboard hook 掛載失敗")
+                self._press_hook = None
+                self._release_hook = None
 
     def uninstall(self) -> None:
         with self._lock:
@@ -616,17 +617,40 @@ class AbbrevEngine:
 
     def is_installed(self) -> bool:
         with self._lock:
-            return self._hook_handle is not None
+            return self._press_hook is not None
+
+    def set_state_listener(self, callback: Optional[Callable[[bool], None]]) -> None:
+        """UI 註冊 listener 來收 IME 中/英模式變化（callback(new_chinese_mode)）。
+        Callback 會在 keyboard worker thread 跑，UI 端必須 root.after(0, ...)
+        切回 Tk main thread 才能更新 widget。
+        """
+        self._state_listener = callback
+
+    def get_ime_chinese_mode(self) -> bool:
+        return self._ime_chinese_mode
+
+    def set_ime_chinese_mode(self, value: bool) -> None:
+        """UI 端手動覆寫 IME 模式（萬一 Shift 追蹤偏掉）。"""
+        new_val = bool(value)
+        with self._lock:
+            if self._ime_chinese_mode == new_val:
+                return
+            self._ime_chinese_mode = new_val
+        logging.info("[abbrev] IME 模式（手動）→ %s",
+                     "中文" if new_val else "英文")
+        # 不呼叫 listener（防 UI ↔ engine 互呼）— UI 端 command 自己已知新值
 
     # ----------------------------------------------------------------- 內部工具
     def _uninstall_locked(self) -> None:
-        if self._hook_handle is None:
-            return
-        try:
-            self._kb.unhook(self._hook_handle)
-        except Exception:
-            logging.debug("[abbrev] unhook 失敗", exc_info=True)
-        self._hook_handle = None
+        for attr in ("_press_hook", "_release_hook"):
+            h = getattr(self, attr, None)
+            if h is None:
+                continue
+            try:
+                self._kb.unhook(h)
+            except Exception:
+                logging.debug("[abbrev] unhook %s 失敗", attr, exc_info=True)
+            setattr(self, attr, None)
 
     def _rebuild_lookup_locked(self) -> None:
         self._lookup = {}
@@ -649,18 +673,35 @@ class AbbrevEngine:
         except Exception:
             logging.exception("[abbrev] _on_press 處理失敗")
 
+    def _on_release(self, event: Any) -> None:
+        """keyboard 模組 on_release callback（主要為了偵測 Shift-only-tap）。"""
+        try:
+            self._handle_release(event)
+        except Exception:
+            logging.exception("[abbrev] _on_release 處理失敗")
+
     def _handle_event(self, event: Any) -> None:
         # 自己 send/write 期間，所有按鍵忽略
         if self._suppressing:
             return
 
-        # cool-down 期間（展開剛完成）— 不更新 buffer、不觸發
-        # 這能擋掉 paste 完成前 user 連打的後續 keystroke 進入 buffer 造成亂碼。
-        if time.monotonic() < self._cooldown_until:
-            return
-
         name = getattr(event, "name", None)
         if not name:
+            return
+
+        # Shift 追蹤：press 時記時間戳，期間如有其他鍵就標記 → release 時不算 toggle。
+        # 注意：Shift 追蹤要在 cool-down 之前處理，讓 user 能在 cool-down 期間
+        # 預先切換 IME 模式準備下一個縮寫。
+        if name in _SHIFT_KEY_NAMES:
+            self._shift_down_ts = time.monotonic()
+            self._other_key_since_shift = False
+            return  # Shift 自己不進 buffer、不觸發
+        # 任何非 Shift 按鍵 → 取消 Shift-only-tap 候選
+        if self._shift_down_ts > 0:
+            self._other_key_since_shift = True
+
+        # cool-down 期間（展開剛完成）— 不更新 buffer、不觸發
+        if time.monotonic() < self._cooldown_until:
             return
 
         # trigger 鍵（空白）：嘗試展開
@@ -686,8 +727,35 @@ class AbbrevEngine:
                 self._buffer = (self._buffer + ch)[-self._max_abbrev_len:] if self._max_abbrev_len else ""
             return
 
-        # 其他特殊鍵（shift / ctrl / alt / caps lock 等）—不影響 buffer
+        # 其他特殊鍵（ctrl / alt / caps lock 等）—不影響 buffer
         return
+
+    def _handle_release(self, event: Any) -> None:
+        if self._suppressing:
+            return
+        name = getattr(event, "name", None)
+        if name not in _SHIFT_KEY_NAMES:
+            return
+        if self._shift_down_ts == 0.0:
+            return
+        duration = time.monotonic() - self._shift_down_ts
+        had_other = self._other_key_since_shift
+        self._shift_down_ts = 0.0
+        self._other_key_since_shift = False
+        if had_other or duration > self.SHIFT_TAP_MAX_SEC:
+            return  # 不算 Shift-only-tap
+        # Shift-only-tap → 切換 IME 假定模式
+        with self._lock:
+            self._ime_chinese_mode = not self._ime_chinese_mode
+            new_val = self._ime_chinese_mode
+        logging.info("[abbrev] Shift-only-tap 偵測 → IME 模式現為 %s",
+                     "中文" if new_val else "英文")
+        # 通知 UI（worker thread → UI 端必須自己切回 Tk main thread）
+        if self._state_listener is not None:
+            try:
+                self._state_listener(new_val)
+            except Exception:
+                logging.debug("[abbrev] state_listener 例外", exc_info=True)
 
     def _try_expand(self, buffer_snapshot: str, trigger_char: str) -> None:
         if not buffer_snapshot or not self._lookup:
@@ -703,10 +771,17 @@ class AbbrevEngine:
         if matched_key is None:
             return
 
-        # IME / 中文輸入狀態 → 跳過（多重檢查：開啟旗標 / composition / conversion mode）
-        if self._cfg.skip_when_ime_active and should_skip_for_input_method():
-            logging.debug("[abbrev] 中文/IME 輸入中，跳過 '%s' 展開", matched_key)
-            return
+        # IME / 中文輸入狀態 → 跳過。檢查兩條路徑：
+        # 1. IMM API（傳統 IME；新 TSF IME 上不一定 work）
+        # 2. 我們自己追蹤的 Shift-tap 模式（注音切 中/英 用 Shift）
+        # 任一說「中文中」就 skip。
+        if self._cfg.skip_when_ime_active:
+            if should_skip_for_input_method():
+                logging.debug("[abbrev] IMM 顯示中文/組字中，跳過 '%s'", matched_key)
+                return
+            if self._ime_chinese_mode:
+                logging.debug("[abbrev] 假定 IME 中文模式（Shift 追蹤），跳過 '%s'", matched_key)
+                return
 
         raw_expansion = self._lookup[matched_key]
         try:
