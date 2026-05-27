@@ -135,7 +135,18 @@ def schedule_cleanup_in_background(executor, *, delay_seconds: int = 30) -> None
 
     def _later():
         try:
-            executor.submit(_run)
+            future = executor.submit(_run)
+            if getattr(future, "done", lambda: False)():
+                try:
+                    exc = future.exception()
+                except Exception as err:
+                    exc = err
+                if exc is not None:
+                    logging.warning(
+                        "[O17] cleanup executor rejected task; fallback thread: %s",
+                        exc,
+                    )
+                    threading.Thread(target=_run, daemon=True).start()
         except Exception:
             threading.Thread(target=_run, daemon=True).start()
 

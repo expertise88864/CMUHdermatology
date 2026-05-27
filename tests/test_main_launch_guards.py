@@ -224,6 +224,18 @@ def test_main_and_scheduler_background_executors_are_bounded():
         assert "max_pending=60" in src
 
 
+def test_main_and_scheduler_background_tasks_start_once_and_clear_schedule():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        full_src = (ROOT / rel_path).read_text(encoding="utf-8")
+        func_src = _function_source(ROOT / rel_path, "start_background_tasks")
+
+        assert "self._background_tasks_started = False" in full_src
+        assert "if self._background_tasks_started:" in func_src
+        assert "self._background_tasks_started = True" in func_src
+        assert "schedule.clear()" in func_src
+        assert func_src.index("schedule.clear()") < func_src.index("schedule.every")
+
+
 def test_main_and_scheduler_ui_queue_polling_is_bounded():
     for rel_path in ("src/main.py", "src/scheduler.py"):
         src = _function_source(ROOT / rel_path, "process_ui_queue")

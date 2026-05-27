@@ -6071,6 +6071,7 @@ class AutomationApp:
         self._last_full_refresh_snapshot = None
         self._last_full_refresh_ts = 0.0
         self._initial_priority_refresh_done = False
+        self._background_tasks_started = False
         # 啟動時優先批次完成後再跑全體刷新，避免與固定延遲重疊造成「Refresh already running; queued」
         self._startup_defer_full_until_priority_done = False
 
@@ -10706,6 +10707,10 @@ class AutomationApp:
 
 # --- [修正] 背景任務啟動 (修正重開機邏輯) ---
     def start_background_tasks(self):
+        if self._background_tasks_started:
+            logging.warning("Background tasks already started; duplicate start ignored.")
+            return
+        self._background_tasks_started = True
         logging.info("Starting background tasks loop via ThreadPoolExecutor...")
 
         # ===== 背景下載所有子程式 (manifest.json 列出的全部檔案) =====
@@ -10818,6 +10823,7 @@ class AutomationApp:
                     logging.error(f"[SCHEDULE:priority-check-2m] failed: {e}", exc_info=True)
 
             # 鄰近門檻檢查：改為每 2 分鐘喚醒（內部仍至少 15 分才觸發實際 refresh），減少無謂排程
+            schedule.clear()
             schedule.every(2).minutes.do(dynamic_cl_checker).tag("priority-check", "2m")
             schedule.every(3).hours.do(
                 lambda: run_named_job("refresh-all-3h", lambda: self.bg_executor.submit(self._trigger_refresh, False, DOCTORS))
