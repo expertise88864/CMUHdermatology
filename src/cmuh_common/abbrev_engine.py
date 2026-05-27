@@ -27,6 +27,8 @@ import logging
 import os
 import re
 import threading
+import time
+from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
@@ -197,10 +199,24 @@ def render_expansion(template: str, now: Optional[datetime] = None) -> str:
 
 
 # -----------------------------------------------------------------------------
-# IME 偵測（Win32 ImmGetContext + ImmGetOpenStatus）
+# IME 偵測 — 多重檢查（新版注音/微軟 IME 不一定回 ImmGetOpenStatus）
 # -----------------------------------------------------------------------------
-def is_ime_active_for_foreground() -> bool:
-    """回傳前景視窗的 IME 是否「開啟」（組字模式）。失敗則保守回 False。"""
+# Win32 conversion mode flags
+_IME_CMODE_NATIVE = 0x0001    # 中文/日文/韓文模式（false = 英文模式）
+_GCS_COMPSTR = 0x0008         # composition string
+
+
+def should_skip_for_input_method() -> bool:
+    """前景視窗目前是「中文/組字輸入狀態」就回 True。
+
+    用三重檢查（任一條件成立就視為中文輸入中）：
+      1. ImmGetOpenStatus：IME 開啟旗標
+      2. ImmGetCompositionString：是否有 composition string in progress
+      3. ImmGetConversionStatus：conversion mode 是否含 IME_CMODE_NATIVE
+
+    舊 IMM IME（傳統注音）走 1；新 TSF IME（新注音、Google 注音）
+    對 1 可能不更新，但 2/3 通常還能反映。失敗則回 False（fail-open）。
+    """
     try:
         user32 = ctypes.windll.user32
         imm32 = ctypes.windll.imm32
@@ -211,12 +227,148 @@ def is_ime_active_for_foreground() -> bool:
         if not himc:
             return False
         try:
-            status = imm32.ImmGetOpenStatus(himc)
+            # 1. IME 開啟旗標
+            try:
+                if imm32.ImmGetOpenStatus(himc):
+                    return True
+            except Exception:
+                pass
+            # 2. 有 composition string 在組字
+            try:
+                size = imm32.ImmGetCompositionStringW(himc, _GCS_COMPSTR, None, 0)
+                if isinstance(size, int) and size > 0:
+                    return True
+            except Exception:
+                pass
+            # 3. conversion mode 含 NATIVE (中文模式)
+            try:
+                conversion = ctypes.c_uint(0)
+                sentence = ctypes.c_uint(0)
+                ok = imm32.ImmGetConversionStatus(
+                    himc,
+                    ctypes.byref(conversion),
+                    ctypes.byref(sentence),
+                )
+                if ok and (conversion.value & _IME_CMODE_NATIVE):
+                    return True
+            except Exception:
+                pass
         finally:
             imm32.ImmReleaseContext(hwnd, himc)
-        return bool(status)
+        return False
     except Exception:
         logging.debug("[abbrev] IME 偵測失敗", exc_info=True)
+        return False
+
+
+# 舊名稱相容（外部不應再用，但保留 import 不爆）
+def is_ime_active_for_foreground() -> bool:
+    return should_skip_for_input_method()
+
+
+# -----------------------------------------------------------------------------
+# Win32 剪貼簿（paste mode 用，避免逐字 keystroke race condition）
+# -----------------------------------------------------------------------------
+_CF_UNICODETEXT = 13
+_GMEM_MOVEABLE = 0x0002
+
+
+def _configure_win32_signatures() -> None:
+    """把要用的 Win32 函式 argtypes/restype 設好。
+
+    若不設，64-bit Windows 上 HANDLE/LPVOID 會被當成 32-bit int 截斷，
+    GlobalAlloc/GlobalLock 看似回 0 → 寫剪貼簿全失敗。
+    """
+    u = ctypes.windll.user32
+    k = ctypes.windll.kernel32
+    u.OpenClipboard.argtypes = [wintypes.HWND]
+    u.OpenClipboard.restype = wintypes.BOOL
+    u.CloseClipboard.argtypes = []
+    u.CloseClipboard.restype = wintypes.BOOL
+    u.EmptyClipboard.argtypes = []
+    u.EmptyClipboard.restype = wintypes.BOOL
+    u.GetClipboardData.argtypes = [wintypes.UINT]
+    u.GetClipboardData.restype = wintypes.HANDLE
+    u.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    u.SetClipboardData.restype = wintypes.HANDLE
+    k.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    k.GlobalAlloc.restype = wintypes.HANDLE
+    k.GlobalLock.argtypes = [wintypes.HANDLE]
+    k.GlobalLock.restype = wintypes.LPVOID
+    k.GlobalUnlock.argtypes = [wintypes.HANDLE]
+    k.GlobalUnlock.restype = wintypes.BOOL
+
+
+_WIN32_CONFIGURED = False
+
+
+def _ensure_win32_configured() -> None:
+    global _WIN32_CONFIGURED
+    if _WIN32_CONFIGURED:
+        return
+    try:
+        _configure_win32_signatures()
+        _WIN32_CONFIGURED = True
+    except Exception:
+        logging.debug("[abbrev] Win32 signatures 設定失敗", exc_info=True)
+
+
+def _clipboard_get_text() -> Optional[str]:
+    """讀剪貼簿 unicode 文字；非文字 / 無資料 / 失敗則回 None。"""
+    try:
+        _ensure_win32_configured()
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        if not user32.OpenClipboard(None):
+            return None
+        try:
+            h = user32.GetClipboardData(_CF_UNICODETEXT)
+            if not h:
+                return None
+            p = kernel32.GlobalLock(h)
+            if not p:
+                return None
+            try:
+                return ctypes.wstring_at(p)
+            finally:
+                kernel32.GlobalUnlock(h)
+        finally:
+            user32.CloseClipboard()
+    except Exception:
+        logging.debug("[abbrev] clipboard read 失敗", exc_info=True)
+        return None
+
+
+def _clipboard_set_text(text: str) -> bool:
+    """寫 unicode 文字到剪貼簿；成功 True。"""
+    try:
+        _ensure_win32_configured()
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        # 字串 + null terminator
+        data = (text + "\x00").encode("utf-16-le")
+        if not user32.OpenClipboard(None):
+            return False
+        try:
+            user32.EmptyClipboard()
+            h_mem = kernel32.GlobalAlloc(_GMEM_MOVEABLE, len(data))
+            if not h_mem:
+                return False
+            p = kernel32.GlobalLock(h_mem)
+            if not p:
+                return False
+            try:
+                ctypes.memmove(p, data, len(data))
+            finally:
+                kernel32.GlobalUnlock(h_mem)
+            # 注意：SetClipboardData 接管 h_mem 所有權；成功後勿 GlobalFree
+            if not user32.SetClipboardData(_CF_UNICODETEXT, h_mem):
+                return False
+            return True
+        finally:
+            user32.CloseClipboard()
+    except Exception:
+        logging.debug("[abbrev] clipboard write 失敗", exc_info=True)
         return False
 
 
@@ -240,6 +392,10 @@ class AbbrevEngine:
     # 觸發後一次連送的 backspace 上限，純防呆。
     MAX_BACKSPACE = 64
 
+    # 展開後的冷卻時間（s）— 期間 buffer 暫停累積，避免 user 連打第二組
+    # 縮寫時，後續 keystroke 跟我們的 paste 競態，造成串接型亂碼。
+    COOLDOWN_SEC = 0.40
+
     def __init__(self, kb_module: Any) -> None:
         """kb_module = `keyboard` PyPI 套件物件（已 import 完成）。"""
         self._kb = kb_module
@@ -251,8 +407,8 @@ class AbbrevEngine:
         self._buffer: str = ""
         self._hook_handle: Any = None
         self._suppressing = False
-        # 自我觸發防範用：寫出去後的「預期看到的字」counter
-        self._expected_self_keys: int = 0
+        # 展開後的冷卻截止時間（monotonic）
+        self._cooldown_until: float = 0.0
 
     # ------------------------------------------------------------------ 公開 API
     def install(self, cfg: AbbrevConfig) -> None:
@@ -318,6 +474,11 @@ class AbbrevEngine:
         if self._suppressing:
             return
 
+        # cool-down 期間（展開剛完成）— 不更新 buffer、不觸發
+        # 這能擋掉 paste 完成前 user 連打的後續 keystroke 進入 buffer 造成亂碼。
+        if time.monotonic() < self._cooldown_until:
+            return
+
         name = getattr(event, "name", None)
         if not name:
             return
@@ -362,9 +523,9 @@ class AbbrevEngine:
         if matched_key is None:
             return
 
-        # IME 組字中 → 跳過（中文輸入法保險）
-        if self._cfg.skip_when_ime_active and is_ime_active_for_foreground():
-            logging.debug("[abbrev] IME 開啟，跳過 '%s' 展開", matched_key)
+        # IME / 中文輸入狀態 → 跳過（多重檢查：開啟旗標 / composition / conversion mode）
+        if self._cfg.skip_when_ime_active and should_skip_for_input_method():
+            logging.debug("[abbrev] 中文/IME 輸入中，跳過 '%s' 展開", matched_key)
             return
 
         raw_expansion = self._lookup[matched_key]
@@ -382,31 +543,78 @@ class AbbrevEngine:
         self._do_replace(delete_count, rendered, matched_key)
 
     def _do_replace(self, backspace_count: int, text: str, abbrev_key: str) -> None:
-        """送 N 個 backspace + write(text)。期間設 _suppressing 防遞迴。"""
+        """送 N 個 backspace + 用剪貼簿 paste（Ctrl+V）寫出展開內容。
+
+        為何用 paste：原本逐字 `keyboard.write(text)` 對長字串會送出幾十個
+        OS keystroke，user 在這段期間若繼續打下個縮寫（連打 nev1 nev1 ），
+        OS event queue 會把 user 的 keystroke 跟我們的 backspace/write
+        交錯，造成輸出字串混亂。改 paste 後只送 ~3 個 OS event
+        （Ctrl 下、V 下、Ctrl V 放開），race window 從 100-200ms 縮到 ~20ms。
+        """
         kb = self._kb
         if kb is None:
             return
         self._suppressing = True
+        # 進入「冷卻期」— 這段時間 buffer 暫停累積，避免 user 連打污染。
+        self._cooldown_until = time.monotonic() + self.COOLDOWN_SEC
         try:
+            # 1. 刪掉「縮寫 + trigger char」
             for _ in range(backspace_count):
                 try:
                     kb.send("backspace")
                 except Exception:
                     logging.debug("[abbrev] send backspace 失敗", exc_info=True)
                     break
-            try:
-                kb.write(text)
-                logging.info("[abbrev] 展開 '%s' → %d 字", abbrev_key, len(text))
-            except Exception:
-                logging.exception("[abbrev] keyboard.write 失敗 abbrev=%s", abbrev_key)
+
+            # 2. paste 寫出展開內容（fallback 到 keyboard.write）
+            paste_ok = self._paste_via_clipboard(text)
+            if not paste_ok:
+                logging.warning("[abbrev] paste 失敗，fallback 用 keystroke")
+                try:
+                    kb.write(text)
+                except Exception:
+                    logging.exception("[abbrev] keyboard.write fallback 也失敗")
+
+            logging.info("[abbrev] 展開 '%s' → %d 字 (%s)",
+                         abbrev_key, len(text),
+                         "paste" if paste_ok else "keystroke")
         finally:
-            # 寫完後再清旗標。keyboard.write 是同步呼叫，但 OS event 是 async
-            # 送達 hook—預留一個短延遲讓自身觸發的事件先「沖過去」。
+            # cool-down 期滿後才清 suppress 旗標 + buffer
             def _clear():
                 self._suppressing = False
                 with self._lock:
                     self._buffer = ""
-            # 用 Timer 異步清旗標（避免阻塞 hook thread）
-            t = threading.Timer(0.15, _clear)
+            t = threading.Timer(self.COOLDOWN_SEC, _clear)
             t.daemon = True
             t.start()
+
+    def _paste_via_clipboard(self, text: str) -> bool:
+        """備份 → 設 clip → Ctrl+V → 等待 → 還原 clip。任何步驟失敗回 False。"""
+        kb = self._kb
+        if kb is None:
+            return False
+        old_clip: Optional[str] = None
+        try:
+            old_clip = _clipboard_get_text()
+            if not _clipboard_set_text(text):
+                return False
+            # 等剪貼簿落地（避免 Ctrl+V 拿到舊內容）
+            time.sleep(0.04)
+            try:
+                kb.send("ctrl+v")
+            except Exception:
+                logging.debug("[abbrev] send ctrl+v 失敗", exc_info=True)
+                return False
+            # 等 OS paste 完成（時間取決於 focused window）
+            time.sleep(0.10)
+            return True
+        except Exception:
+            logging.exception("[abbrev] paste 流程例外")
+            return False
+        finally:
+            # 不論成功失敗都試圖還原剪貼簿
+            if old_clip is not None:
+                try:
+                    _clipboard_set_text(old_clip)
+                except Exception:
+                    logging.debug("[abbrev] 還原剪貼簿失敗", exc_info=True)
