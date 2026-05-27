@@ -73,7 +73,7 @@ from cmuh_common.notifications import show_windows_notification
 from cmuh_common.icons import ensure_cmuh_app_icon_path as _ensure_cmuh_app_icon_path
 from cmuh_common.window_icon import apply_tk_window_icon as _apply_tk_window_icon
 from cmuh_common.logging_setup import attach_queue_handler
-from cmuh_common.bounded_executor import BoundedThreadPoolExecutor
+from cmuh_common.bounded_executor import BoundedThreadPoolExecutor, RejectedExecutionError
 from cmuh_common.http_client import INTERNAL_HOSTS, is_internal as _is_internal
 from cmuh_common.ui_messages import (
     UiStatusMessage, UiRefreshTickMessage, UiClinicDataMessage, UiMasterScheduleMessage,
@@ -8522,9 +8522,22 @@ class AutomationApp:
             finally:
                 self._clinic_lights_worker_running = False
 
+        def _handle_clinic_submit_rejected(fut):
+            if fut.cancelled():
+                rejected = True
+            else:
+                try:
+                    rejected = isinstance(fut.exception(), RejectedExecutionError)
+                except Exception:
+                    rejected = False
+            if rejected:
+                logging.warning("診間燈號背景工作未啟動：背景佇列已滿")
+                self._clinic_lights_worker_running = False
+
         # [核心修正] 投遞至執行緒池
         self._clinic_lights_worker_running = True
-        self.bg_executor.submit(guarded_run_update, rooms_to_check)
+        clinic_future = self.bg_executor.submit(guarded_run_update, rooms_to_check)
+        clinic_future.add_done_callback(_handle_clinic_submit_rejected)
         
         seconds = getattr(self, '_clinic_dynamic_refresh_seconds', 60)
         if seconds < 60:
@@ -9083,7 +9096,38 @@ class AutomationApp:
 
                 self.root.after(0, _on_refresh_worker_done)
 
-        self.bg_executor.submit(run_parallel_checks)
+        def _handle_refresh_submit_rejected(fut):
+            if fut.cancelled():
+                rejected = True
+            else:
+                try:
+                    rejected = isinstance(fut.exception(), RejectedExecutionError)
+                except Exception:
+                    rejected = False
+            if not rejected:
+                return
+            logging.warning("掛號刷新背景工作未啟動：背景佇列已滿")
+
+            def _reset_rejected_refresh():
+                with self._refresh_queue_lock:
+                    self._active_refresh_signature = None
+                    queued_request = self._queued_refresh_requests.popleft() if self._queued_refresh_requests else None
+                    if queued_request is not None:
+                        self._queued_refresh_signatures.discard(queued_request[2])
+                self._refresh_worker_running = False
+                self._cancel_pending_refresh_tick_ui()
+                self.refresh_button.config(state="normal")
+                self.status_text.set("狀態: 背景佇列忙碌，刷新稍後重試")
+                if queued_request is not None:
+                    self._trigger_refresh(queued_request[0], queued_request[1])
+
+            if threading.current_thread() is threading.main_thread():
+                _reset_rejected_refresh()
+            elif not getattr(self, "_shutting_down", False):
+                self.root.after(0, _reset_rejected_refresh)
+
+        refresh_future = self.bg_executor.submit(run_parallel_checks)
+        refresh_future.add_done_callback(_handle_refresh_submit_rejected)
 
     def _trigger_rehook_hotkeys(self):
         logging.info("--- Manually re-hooking all hotkeys ---")

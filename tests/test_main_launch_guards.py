@@ -242,6 +242,28 @@ def test_duty_info_uses_local_executor_instead_of_bg_queue():
         assert "self.bg_executor.submit(self._run_single_duty_query" not in src
 
 
+def test_refresh_submit_rejection_restores_ui_state():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "_trigger_refresh")
+
+        assert "RejectedExecutionError" in src
+        assert "refresh_future = self.bg_executor.submit(run_parallel_checks)" in src
+        assert "refresh_future.add_done_callback(_handle_refresh_submit_rejected)" in src
+        assert "self._active_refresh_signature = None" in src
+        assert 'self.status_text.set("狀態: 背景佇列忙碌，刷新稍後重試")' in src
+        assert 'self.refresh_button.config(state="normal")' in src
+
+
+def test_clinic_worker_submit_rejection_clears_running_flag():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "_update_clinic_lights_loop")
+
+        assert "RejectedExecutionError" in src
+        assert "clinic_future = self.bg_executor.submit(guarded_run_update, rooms_to_check)" in src
+        assert "clinic_future.add_done_callback(_handle_clinic_submit_rejected)" in src
+        assert "self._clinic_lights_worker_running = False" in src
+
+
 def test_main_and_scheduler_background_tasks_start_once_and_clear_schedule():
     for rel_path in ("src/main.py", "src/scheduler.py"):
         full_src = (ROOT / rel_path).read_text(encoding="utf-8")
