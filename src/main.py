@@ -92,6 +92,15 @@ from cmuh_common.settings_backup import (
     normalize_hhmm,
     restore_settings_snapshot,
 )
+from cmuh_common.abbrev_engine import (
+    AbbrevEngine,
+    AbbrevConfig,
+    DEFAULT_ITEMS as ABBREV_DEFAULT_ITEMS,
+    ensure_config_file as ensure_abbrev_config_file,
+    load_config as load_abbrev_config,
+    save_config as save_abbrev_config,
+    render_expansion as render_abbrev_expansion,
+)
 # 【重構 2026-05-21】熱鍵座標縮放（原本 main.py 用 _scaled_xy 卻沒定義 — 潛在 NameError）
 from cmuh_common.hotkey_scaling import (  # noqa: E402
     HOTKEY_SUPPORTED_RESOLUTIONS,
@@ -6822,6 +6831,7 @@ class AutomationApp:
         self._register_lazy_tab("未來週次查詢", lambda frame: self._create_future_weeks_tab(frame))
         self._register_lazy_tab("診斷書", lambda frame: self._create_certificate_tab(frame))
         self._register_lazy_tab("小工具", lambda frame: self._create_other_programs_tab(frame))
+        self._register_lazy_tab("縮寫速寫", lambda frame: self._create_abbrev_tab(frame))
         self._register_lazy_tab("設定", lambda frame: self._create_settings_tab(frame))
         self._register_lazy_tab("系統日誌", lambda frame: self._create_log_tab(frame))
 
@@ -7042,7 +7052,7 @@ class AutomationApp:
 
         # 2. [修正] 用 grid_remove()/grid() 取代 pack_forget()/pack()
         #    僅在狀態改變時呼叫，減少不必要的版面重算
-        hide_links = selected_tab_text in ("診斷書", "小工具", "設定")
+        hide_links = selected_tab_text in ("診斷書", "小工具", "縮寫速寫", "設定")
         if hide_links != self._bottom_links_hidden:
             self._bottom_links_hidden = hide_links
             if hide_links:
@@ -9298,6 +9308,360 @@ class AutomationApp:
             if i < len(week_names): label.config(text=format_vertical_text(week_names[i]))
         self._future_tab_grid_stale = False
         
+    # =================================================================
+    # 縮寫速寫（PhraseExpress-like text expansion）
+    # =================================================================
+    def _abbrev_settings_path(self):
+        return get_conf_path('abbrev_settings.json')
+
+    def _ensure_abbrev_engine(self):
+        """確保 abbrev_engine 物件存在；keyboard 模組未就緒時回 None。"""
+        if not getattr(self, '_heavy_modules_ready', False):
+            return None
+        if hotkey_modules.keyboard is None:
+            return None
+        eng = getattr(self, 'abbrev_engine', None)
+        if eng is None:
+            eng = AbbrevEngine(hotkey_modules.keyboard)
+            self.abbrev_engine = eng
+        return eng
+
+    def _install_abbrev_listeners(self):
+        """依目前 cfg 掛上 hook。keyboard 未就緒會自動 noop。"""
+        eng = self._ensure_abbrev_engine()
+        if eng is None:
+            return
+        cfg = getattr(self, '_abbrev_config_cache', None)
+        if cfg is None:
+            try:
+                cfg = load_abbrev_config(self._abbrev_settings_path())
+            except Exception:
+                logging.exception("[abbrev] 載入設定失敗，使用空 cfg")
+                cfg = AbbrevConfig()
+            self._abbrev_config_cache = cfg
+        try:
+            eng.install(cfg)
+        except Exception:
+            logging.exception("[abbrev] install 失敗")
+
+    def _uninstall_abbrev_listeners(self):
+        eng = getattr(self, 'abbrev_engine', None)
+        if eng is None:
+            return
+        try:
+            eng.uninstall()
+        except Exception:
+            logging.debug("[abbrev] uninstall 失敗", exc_info=True)
+
+    def _abbrev_save_and_reload(self):
+        """把 self._abbrev_config_cache 寫回檔，再重新 install。"""
+        cfg = getattr(self, '_abbrev_config_cache', None)
+        if cfg is None:
+            return
+        try:
+            save_abbrev_config(self._abbrev_settings_path(), cfg)
+        except Exception:
+            logging.exception("[abbrev] 存檔失敗")
+            messagebox.showerror("縮寫速寫", "設定存檔失敗，請查看系統日誌。")
+            return
+        self._install_abbrev_listeners()
+
+    def _abbrev_refresh_tree(self):
+        tree = getattr(self, '_abbrev_tree', None)
+        if tree is None:
+            return
+        for iid in tree.get_children():
+            tree.delete(iid)
+        cfg = getattr(self, '_abbrev_config_cache', None)
+        if cfg is None:
+            return
+        # 排序：縮寫長度短的在前、再按字母
+        items = sorted(cfg.items, key=lambda it: (len(str(it.get('abbrev', ''))), str(it.get('abbrev', '')).lower()))
+        for idx, it in enumerate(items):
+            abbrev = str(it.get('abbrev', ''))
+            expansion = str(it.get('expansion', ''))
+            display = expansion if len(expansion) <= 80 else expansion[:77] + '...'
+            tree.insert('', 'end', iid=f"row_{idx}", values=(abbrev, display))
+        # 更新計數
+        lbl = getattr(self, '_abbrev_count_label', None)
+        if lbl is not None:
+            try:
+                lbl.config(text=f"共 {len(cfg.items)} 筆")
+            except Exception:
+                pass
+
+    def _abbrev_on_toggle(self):
+        """啟用 / IME / 補空白 checkbox 變動時即時存檔 + reload。"""
+        cfg = getattr(self, '_abbrev_config_cache', None)
+        if cfg is None:
+            return
+        cfg.enabled = bool(self.abbrev_enabled_var.get())
+        cfg.skip_when_ime_active = bool(self.abbrev_ime_skip_var.get())
+        cfg.preserve_trailing_space = bool(self.abbrev_trailing_space_var.get())
+        self._abbrev_save_and_reload()
+
+    def _abbrev_validate_input(self, abbrev_text, expansion_text, *, ignore_dup=None):
+        """回傳 (abbrev_clean, error_msg)。error_msg=None 表示通過。"""
+        abbrev = (abbrev_text or '').strip()
+        if not abbrev:
+            return abbrev, "縮寫不可為空"
+        # 限制：只能英數，避免和 token regex 衝突
+        if not re.fullmatch(r"[A-Za-z0-9]+", abbrev):
+            return abbrev, "縮寫只能用英數字（不可有空白或符號）"
+        if (expansion_text or '') == '':
+            return abbrev, "展開內文不可為空"
+        cfg = getattr(self, '_abbrev_config_cache', None)
+        if cfg is not None:
+            key = abbrev.lower()
+            for it in cfg.items:
+                if str(it.get('abbrev', '')).lower() == key and key != (ignore_dup or '').lower():
+                    return abbrev, f"縮寫 '{abbrev}' 已存在"
+        return abbrev, None
+
+    def _abbrev_add_item(self):
+        abbrev = self.abbrev_new_abbrev_var.get()
+        expansion = self.abbrev_new_expansion_text.get("1.0", "end-1c")
+        abbrev_clean, err = self._abbrev_validate_input(abbrev, expansion)
+        if err:
+            messagebox.showwarning("縮寫速寫", err)
+            return
+        cfg = self._abbrev_config_cache
+        cfg.items.append({"abbrev": abbrev_clean, "expansion": expansion})
+        self._abbrev_save_and_reload()
+        self._abbrev_refresh_tree()
+        self.abbrev_new_abbrev_var.set("")
+        self.abbrev_new_expansion_text.delete("1.0", "end")
+
+    def _abbrev_delete_selected(self):
+        tree = self._abbrev_tree
+        sel = tree.selection()
+        if not sel:
+            messagebox.showinfo("縮寫速寫", "請先選擇要刪除的縮寫")
+            return
+        cfg = self._abbrev_config_cache
+        to_delete: set[str] = set()
+        for iid in sel:
+            try:
+                abbrev = tree.item(iid, 'values')[0]
+                to_delete.add(str(abbrev).lower())
+            except Exception:
+                continue
+        if not to_delete:
+            return
+        if not messagebox.askyesno("縮寫速寫", f"確定刪除 {len(to_delete)} 筆縮寫？"):
+            return
+        cfg.items = [it for it in cfg.items
+                     if str(it.get('abbrev', '')).lower() not in to_delete]
+        self._abbrev_save_and_reload()
+        self._abbrev_refresh_tree()
+
+    def _abbrev_edit_selected(self, event=None):
+        tree = self._abbrev_tree
+        sel = tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        try:
+            abbrev = tree.item(iid, 'values')[0]
+        except Exception:
+            return
+        cfg = self._abbrev_config_cache
+        target = None
+        for it in cfg.items:
+            if str(it.get('abbrev', '')).lower() == str(abbrev).lower():
+                target = it
+                break
+        if target is None:
+            return
+        self._open_abbrev_editor(target)
+
+    def _open_abbrev_editor(self, item_ref):
+        """彈出編輯視窗。item_ref 是 cfg.items 中的 dict（原地修改）。"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("編輯縮寫")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        try:
+            _apply_tk_window_icon(dlg)
+        except Exception:
+            pass
+        dlg.resizable(True, True)
+        dlg.geometry("560x360")
+
+        frm = ttk.Frame(dlg, padding=12)
+        frm.pack(fill='both', expand=True)
+        frm.columnconfigure(1, weight=1)
+        frm.rowconfigure(1, weight=1)
+
+        ttk.Label(frm, text="縮寫:", font=("Microsoft JhengHei UI", 10)).grid(row=0, column=0, sticky='w', padx=(0, 6), pady=(0, 6))
+        abbrev_var = tk.StringVar(value=str(item_ref.get('abbrev', '')))
+        abbrev_entry = ttk.Entry(frm, textvariable=abbrev_var, font=("Consolas", 12), width=18)
+        abbrev_entry.grid(row=0, column=1, sticky='ew', pady=(0, 6))
+
+        ttk.Label(frm, text="展開內文:", font=("Microsoft JhengHei UI", 10)).grid(row=1, column=0, sticky='nw', padx=(0, 6))
+        text_widget = tk.Text(frm, wrap='word', font=("Microsoft JhengHei UI", 11), height=8)
+        text_widget.grid(row=1, column=1, sticky='nsew')
+        text_widget.insert("1.0", str(item_ref.get('expansion', '')))
+
+        scrollbar = ttk.Scrollbar(frm, orient='vertical', command=text_widget.yview)
+        scrollbar.grid(row=1, column=2, sticky='ns')
+        text_widget.configure(yscrollcommand=scrollbar.set)
+
+        btn_frame = ttk.Frame(frm)
+        btn_frame.grid(row=2, column=0, columnspan=3, sticky='ew', pady=(10, 0))
+
+        def on_save():
+            new_abbrev = abbrev_var.get()
+            new_expansion = text_widget.get("1.0", "end-1c")
+            cleaned, err = self._abbrev_validate_input(
+                new_abbrev, new_expansion,
+                ignore_dup=str(item_ref.get('abbrev', '')))
+            if err:
+                messagebox.showwarning("縮寫速寫", err, parent=dlg)
+                return
+            item_ref['abbrev'] = cleaned
+            item_ref['expansion'] = new_expansion
+            self._abbrev_save_and_reload()
+            self._abbrev_refresh_tree()
+            dlg.destroy()
+
+        def on_cancel():
+            dlg.destroy()
+
+        ttk.Button(btn_frame, text="儲存", command=on_save).pack(side='right', padx=(6, 0))
+        ttk.Button(btn_frame, text="取消", command=on_cancel).pack(side='right')
+
+        abbrev_entry.focus_set()
+
+    def _abbrev_reset_defaults(self):
+        if not messagebox.askyesno(
+            "縮寫速寫",
+            "確定要把所有縮寫還原成內建預設？（你目前自訂的全部會被覆蓋）"
+        ):
+            return
+        cfg = self._abbrev_config_cache
+        cfg.items = [dict(it) for it in ABBREV_DEFAULT_ITEMS]
+        self._abbrev_save_and_reload()
+        self._abbrev_refresh_tree()
+
+    def _create_abbrev_tab(self, abbrev_tab):
+        # 載入設定（首次啟動會自動寫入預設檔）
+        try:
+            cfg = ensure_abbrev_config_file(self._abbrev_settings_path())
+        except Exception:
+            logging.exception("[abbrev] 建立設定檔失敗，改用記憶體預設值")
+            cfg = AbbrevConfig(
+                enabled=False,
+                skip_when_ime_active=True,
+                preserve_trailing_space=True,
+                items=[dict(it) for it in ABBREV_DEFAULT_ITEMS],
+            )
+        self._abbrev_config_cache = cfg
+
+        # 控制變數
+        self.abbrev_enabled_var = tk.BooleanVar(value=cfg.enabled)
+        self.abbrev_ime_skip_var = tk.BooleanVar(value=cfg.skip_when_ime_active)
+        self.abbrev_trailing_space_var = tk.BooleanVar(value=cfg.preserve_trailing_space)
+        self.abbrev_new_abbrev_var = tk.StringVar()
+
+        # 上方控制列
+        ctrl_frame = ttk.LabelFrame(abbrev_tab, text="總開關")
+        ctrl_frame.pack(fill='x', pady=(0, 8))
+        row1 = ttk.Frame(ctrl_frame)
+        row1.pack(fill='x', padx=10, pady=(6, 2))
+        ttk.Checkbutton(
+            row1, text="啟用縮寫速寫（打縮寫 + 空白鍵自動展開）",
+            variable=self.abbrev_enabled_var,
+            command=self._abbrev_on_toggle,
+        ).pack(side='left')
+        self._abbrev_count_label = ttk.Label(
+            row1, text=f"共 {len(cfg.items)} 筆", foreground="#607D8B")
+        self._abbrev_count_label.pack(side='right')
+
+        row2 = ttk.Frame(ctrl_frame)
+        row2.pack(fill='x', padx=10, pady=(0, 6))
+        ttk.Checkbutton(
+            row2, text="中文輸入法組字中暫停展開（建議勾選）",
+            variable=self.abbrev_ime_skip_var,
+            command=self._abbrev_on_toggle,
+        ).pack(side='left')
+        ttk.Checkbutton(
+            row2, text="展開後保留結尾空白",
+            variable=self.abbrev_trailing_space_var,
+            command=self._abbrev_on_toggle,
+        ).pack(side='left', padx=(18, 0))
+
+        # 縮寫列表
+        list_frame = ttk.LabelFrame(abbrev_tab, text="縮寫清單（雙擊可編輯）")
+        list_frame.pack(fill='both', expand=True, pady=(0, 8))
+
+        tree_container = ttk.Frame(list_frame)
+        tree_container.pack(fill='both', expand=True, padx=8, pady=(6, 6))
+
+        columns = ("abbrev", "expansion")
+        tree = ttk.Treeview(tree_container, columns=columns, show='headings', height=12)
+        tree.heading("abbrev", text="縮寫")
+        tree.heading("expansion", text="展開內文")
+        tree.column("abbrev", width=110, anchor='w', stretch=False)
+        tree.column("expansion", width=560, anchor='w', stretch=True)
+        ysb = ttk.Scrollbar(tree_container, orient='vertical', command=tree.yview)
+        tree.configure(yscrollcommand=ysb.set)
+        tree.pack(side='left', fill='both', expand=True)
+        ysb.pack(side='right', fill='y')
+        tree.bind("<Double-1>", self._abbrev_edit_selected)
+        self._abbrev_tree = tree
+
+        btn_row = ttk.Frame(list_frame)
+        btn_row.pack(fill='x', padx=8, pady=(0, 6))
+        ttk.Button(btn_row, text="編輯選取", command=self._abbrev_edit_selected).pack(side='left')
+        ttk.Button(btn_row, text="刪除選取", command=self._abbrev_delete_selected).pack(side='left', padx=(6, 0))
+        ttk.Button(btn_row, text="重設為預設清單", command=self._abbrev_reset_defaults).pack(side='right')
+
+        # 新增區塊
+        add_frame = ttk.LabelFrame(abbrev_tab, text="新增縮寫")
+        add_frame.pack(fill='x', pady=(0, 8))
+        add_inner = ttk.Frame(add_frame)
+        add_inner.pack(fill='x', padx=10, pady=8)
+        add_inner.columnconfigure(1, weight=1)
+
+        ttk.Label(add_inner, text="縮寫:", font=("Microsoft JhengHei UI", 10)).grid(
+            row=0, column=0, sticky='w', padx=(0, 6))
+        abbrev_entry = ttk.Entry(
+            add_inner, textvariable=self.abbrev_new_abbrev_var,
+            font=("Consolas", 12), width=14)
+        abbrev_entry.grid(row=0, column=1, sticky='w', pady=(0, 4))
+
+        ttk.Label(add_inner, text="展開內文:", font=("Microsoft JhengHei UI", 10)).grid(
+            row=1, column=0, sticky='nw', padx=(0, 6), pady=(4, 0))
+        expansion_text = tk.Text(
+            add_inner, wrap='word', height=4,
+            font=("Microsoft JhengHei UI", 11))
+        expansion_text.grid(row=1, column=1, sticky='ew', pady=(4, 4))
+        self.abbrev_new_expansion_text = expansion_text
+
+        ttk.Button(add_inner, text="加入清單", command=self._abbrev_add_item).grid(
+            row=2, column=1, sticky='e', pady=(4, 0))
+
+        # token 說明區
+        hint_frame = ttk.LabelFrame(abbrev_tab, text="動態日期 token（可寫在「展開內文」裡）")
+        hint_frame.pack(fill='x')
+        hint_text = (
+            "  da       → 今日日期，含括弧，例：(2026/5/27)\n"
+            "  da1      → 現在時間，例：23:34\n"
+            "  da2      → 今日日期 + 現在時間，例：(2026/5/27) 23:34\n"
+            "  da+N     → 今日 + N 天，含括弧，例：da+7 → (2026/6/3)\n"
+            "  da-N     → 今日 - N 天，含括弧，例：da-21 → (2026/5/6)\n"
+            "\n"
+            "  - 觸發方式：打縮寫後直接按「空白鍵」自動展開。\n"
+            "  - 大小寫不敏感（DA / Da / dA / da 都可以）。\n"
+            "  - 中文輸入法組字中時，本功能會自動暫停以避免誤刪字。"
+        )
+        ttk.Label(hint_frame, text=hint_text, justify='left', foreground="#37474F",
+                  font=("Consolas", 10)).pack(anchor='w', padx=10, pady=8)
+
+        # 列表填資料
+        self._abbrev_refresh_tree()
+
     def _create_settings_tab(self, settings_tab):
         canvas = tk.Canvas(settings_tab)
         scrollbar = ttk.Scrollbar(settings_tab, orient="vertical", command=canvas.yview)
@@ -9365,6 +9729,11 @@ class AutomationApp:
             if self.out_of_hospital_var.get():
                 logging.info("切換至 [醫院外模式]")
                 safe_unhook_all_hotkeys()
+                # 縮寫速寫獨立於 HIS 模式：unhook_all 後重掛
+                try:
+                    self._install_abbrev_listeners()
+                except Exception:
+                    logging.exception("[abbrev] 院外模式切換後 install 失敗")
                 self.status_text.set("狀態: 院外模式 (功能已停用)")
                 # 打卡燈號設為灰色表示停用
                 put_ui_message(self.ui_queue, UiClockStatusMessage(status_data={'error': '院外模式停用'}))
@@ -10547,6 +10916,11 @@ class AutomationApp:
         if hasattr(self, 'out_of_hospital_var') and self.out_of_hospital_var.get():
             logging.info("院外模式啟用中，跳過熱鍵註冊。")
             safe_unhook_all_hotkeys()
+            # 縮寫速寫獨立於 HIS 模式：unhook_all 後重掛
+            try:
+                self._install_abbrev_listeners()
+            except Exception:
+                logging.exception("[abbrev] 院外模式 setup 路徑 install 失敗")
             configure_hotkey_scaling(False, None, None)
             self.hotkey_text_label.config(text="熱鍵已停用 (院外模式)")
             self.hotkey_display_note.set("")
@@ -10559,6 +10933,11 @@ class AutomationApp:
                 f"熱鍵停用 · 解析度 {self.screen_width}×{self.screen_height} 無對應腳本"
             )
             safe_unhook_all_hotkeys()
+            # 縮寫速寫獨立於熱鍵解析度：unhook_all 後重掛
+            try:
+                self._install_abbrev_listeners()
+            except Exception:
+                logging.exception("[abbrev] 解析度不符路徑 install 失敗")
             configure_hotkey_scaling(False, None, None)
             put_ui_message(self.ui_queue, UiStatusMessage(text='狀態: 解析度不符，熱鍵已停用'))
             self.hotkey_text_label.config(text="熱鍵已停用 (解析度不符)")
@@ -10676,6 +11055,11 @@ class AutomationApp:
             logging.info(f"Hotkeys registered successfully for {profile}.")
             # [穩定性] 註冊成功 → 重置 retry 計數
             self._hotkey_register_retry_count = 0
+            # 縮寫速寫：F1-F12 註冊完成後重掛 abbrev hook（unhook_all 會清掉）
+            try:
+                self._install_abbrev_listeners()
+            except Exception:
+                logging.exception("[abbrev] setup_hotkeys 結尾 install 失敗")
         except Exception as e:
             logging.error(f"Failed to register hotkeys: {e}", exc_info=True)
             put_ui_message(self.ui_queue, UiStatusMessage(text='狀態: 熱鍵註冊失敗! 請檢查權限'))
