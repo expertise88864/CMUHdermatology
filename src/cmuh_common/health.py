@@ -189,7 +189,7 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
             # ─── stats heartbeat (rss/cpu/threads) ─────────────────
             # [v15 2026-05-25] 即使 RAM 沒超標也每 10 分鐘 log 一筆，方便長期
             # 觀察 (對照 CPU 優化前後變化、抓 thread leak、看 RSS 漸增)
-            now_stats = time.time()
+            now_stats = time.monotonic()
             if now_stats - last_stats_log >= STATS_INTERVAL_SEC:
                 stats = _get_self_stats()
                 if stats is not None:

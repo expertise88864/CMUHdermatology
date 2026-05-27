@@ -193,6 +193,13 @@ def test_consult_scheduler_uses_single_self_watchdog_guard():
     assert "_self_watchdog_thread_ref.is_alive()" in guard_src
 
 
+def test_consult_sleep_uses_monotonic_clock():
+    src = inspect.getsource(consult_query._sleep_while_running)
+
+    assert "time.monotonic()" in src
+    assert "time.time()" not in src
+
+
 def test_tray_test_email_skips_duplicate_until_worker_finishes(monkeypatch):
     targets = []
     sent = []

@@ -233,6 +233,13 @@ def test_main_and_scheduler_ui_queue_polling_is_bounded():
         assert "next_delay = 80 if had_work else 320" in src
 
 
+def test_inner_watchdog_heartbeat_uses_monotonic_clock():
+    src = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
+
+    assert "now_monotonic = time.monotonic()" in src
+    assert "time.time() - last_heartbeat" not in src
+
+
 def test_f9_f10_consent_menu_post_is_checked():
     source_path = ROOT / "src" / "main.py"
     src = _function_source(source_path, "script_F9_F10_consent_form_adaptive")

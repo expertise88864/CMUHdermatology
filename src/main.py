@@ -11073,10 +11073,11 @@ if __name__ == "__main__":
                 cfg = watchdog_core.load_config()
                 actions = watchdog_core.run_one_tick(mode="inner")
                 heartbeat, interval = watchdog_core.get_loop_timing(cfg)
-                if time.time() - last_heartbeat >= heartbeat:
+                now_monotonic = time.monotonic()
+                if now_monotonic - last_heartbeat >= heartbeat:
                     logging.info("[watchdog/inner heartbeat] %s",
                                   " | ".join(actions) if actions else "-")
-                    last_heartbeat = time.time()
+                    last_heartbeat = now_monotonic
             except Exception:
                 logging.exception("[watchdog/inner] tick 例外")
                 interval = 30

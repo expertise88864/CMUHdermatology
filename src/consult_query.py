@@ -216,10 +216,10 @@ def _normalize_retry_count(value) -> int:
 
 def _sleep_while_running(seconds: float, step: float = 0.5) -> bool:
     """Sleep up to seconds, but return quickly after running.clear()."""
-    deadline = time.time() + max(0.0, float(seconds))
+    deadline = time.monotonic() + max(0.0, float(seconds))
     step = max(0.05, float(step))
     while running.is_set():
-        remaining = deadline - time.time()
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             return True
         time.sleep(min(step, remaining))

@@ -244,3 +244,10 @@ def test_autoclock_scheduler_uses_single_self_watchdog_guard():
     assert "_ensure_autoclock_self_watchdog()" in scheduler_src
     assert "threading.Thread(target=_autoclock_self_watchdog" not in scheduler_src
     assert "_self_watchdog_thread_ref.is_alive()" in guard_src
+
+
+def test_autoclock_sleep_uses_monotonic_clock():
+    src = inspect.getsource(autoclock._sleep_while_running)
+
+    assert "time_module.monotonic()" in src
+    assert "time_module.time()" not in src

@@ -76,3 +76,12 @@ def test_daemon_releases_mutex_when_loop_exits(monkeypatch):
         ("tick", "outer"),
         "release",
     ]
+
+
+def test_daemon_heartbeat_uses_monotonic_clock():
+    import inspect
+
+    src = inspect.getsource(watchdog_runner.main)
+
+    assert "time.monotonic()" in src
+    assert "time.time() - last_heartbeat" not in src

@@ -128,10 +128,10 @@ _self_watchdog_lock = threading.Lock()
 
 def _sleep_while_running(seconds: float, step: float = 0.5) -> bool:
     """Sleep up to seconds, but return quickly after running.clear()."""
-    deadline = time_module.time() + max(0.0, float(seconds))
+    deadline = time_module.monotonic() + max(0.0, float(seconds))
     step = max(0.05, float(step))
     while running.is_set():
-        remaining = deadline - time_module.time()
+        remaining = deadline - time_module.monotonic()
         if remaining <= 0:
             return True
         time_module.sleep(min(step, remaining))

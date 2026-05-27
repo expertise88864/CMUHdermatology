@@ -100,3 +100,10 @@ def test_health_loop_continues_checks_when_rss_unavailable():
     assert "continuing network/disk checks" in src
     assert "rss_mb = 0.0" not in src
     assert "time.sleep(interval_sec * 6)" not in src
+
+
+def test_health_stats_interval_uses_monotonic_clock():
+    src = inspect.getsource(health._health_loop)
+
+    assert "now_stats = time.monotonic()" in src
+    assert "now_stats = time.time()" not in src
