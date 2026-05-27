@@ -3473,13 +3473,11 @@ class AutomationApp:
         self.status_text.set("狀態: 熱鍵模組載入失敗，請檢查環境")
         logging.error(f"Hotkey module initialization failed: {error}")
 
-    def deferred_initialization(self):
-        """在 UI 渲染完成後才執行的初始化任務"""
-        self.startup_phase_text.set("背景任務")
-        self.start_background_tasks()
-
+    def _start_hotkey_module_loading(self):
         if self._heavy_modules_ready:
             self._finalize_hotkey_setup()
+            return
+        if self._heavy_modules_loading:
             return
 
         self._heavy_modules_loading = True
@@ -3488,7 +3486,41 @@ class AutomationApp:
         if hasattr(self, 'rehook_button'):
             self.rehook_button.config(state="disabled")
         self.startup_phase_text.set("載入熱鍵")
-        self.bg_executor.submit(self._prepare_hotkeys_background)
+
+        def _handle_hotkey_loader_rejected(fut):
+            if fut.cancelled():
+                rejected = True
+            else:
+                try:
+                    rejected = isinstance(fut.exception(), RejectedExecutionError)
+                except Exception:
+                    rejected = False
+            if not rejected:
+                return
+            logging.warning("熱鍵模組背景載入未啟動：背景佇列已滿")
+
+            def _retry_hotkey_loader():
+                self._heavy_modules_loading = False
+                self.hotkey_text_label.config(text="熱鍵模組等待重試...")
+                self.status_text.set("狀態: 背景佇列忙碌，熱鍵模組稍後重試")
+                self.startup_phase_text.set("熱鍵待重試")
+                if not getattr(self, '_shutting_down', False):
+                    self.root.after(5000, self._start_hotkey_module_loading)
+
+            if threading.current_thread() is threading.main_thread():
+                _retry_hotkey_loader()
+            elif not getattr(self, '_shutting_down', False):
+                self.root.after(0, _retry_hotkey_loader)
+
+        hotkey_future = self.bg_executor.submit(self._prepare_hotkeys_background)
+        hotkey_future.add_done_callback(_handle_hotkey_loader_rejected)
+
+    def deferred_initialization(self):
+        """在 UI 渲染完成後才執行的初始化任務"""
+        self.startup_phase_text.set("背景任務")
+        self.start_background_tasks()
+
+        self._start_hotkey_module_loading()
 
     def _create_summary_tab_content(self, summary_tab):
         # 值班資訊改置於底部「院內系統捷徑」網頁列最右側，總覽僅保留月曆以加大門診區
@@ -6378,6 +6410,11 @@ class AutomationApp:
                 logging.debug("hotkey retry scheduling failed", exc_info=True)
 
     def run_hotkey_guardian(self):
+        existing = getattr(self, "_hotkey_guardian_thread", None)
+        if existing is not None and existing.is_alive():
+            logging.debug("Hotkey guardian already running; duplicate start ignored.")
+            return
+
         def rehook():
             while not stop_event_main.is_set():
                 if stop_event_main.wait(600):
@@ -6399,8 +6436,13 @@ class AutomationApp:
                             "Hotkey guardian skipped re-hook while automation is running.")
                 except Exception as e:
                     logging.error(f"Error re-hooking hotkeys: {e}")
-        # [核心修正] 依賴統一池
-        self.bg_executor.submit(rehook)
+
+        self._hotkey_guardian_thread = threading.Thread(
+            target=rehook,
+            name="HotkeyGuardian",
+            daemon=True,
+        )
+        self._hotkey_guardian_thread.start()
     
     def _run_single_duty_query(self, fn, third_arg):
         s = _get_thread_local_duty_session()
@@ -6616,7 +6658,12 @@ class AutomationApp:
                 if stop_event_main.wait(5.0):
                     break
 
-        self.bg_executor.submit(run_schedule)
+        self._schedule_thread = threading.Thread(
+            target=run_schedule,
+            name="ScheduleLoop",
+            daemon=True,
+        )
+        self._schedule_thread.start()
         self.run_hotkey_guardian()
 
     def check_and_update(self, is_manual=False):

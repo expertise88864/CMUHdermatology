@@ -290,6 +290,33 @@ def test_hotkey_guardian_uses_safe_rehook_policy():
         assert "Hotkey guardian skipped re-hook while automation is running." in src
 
 
+def test_hotkey_module_loader_recovers_from_rejected_submit():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        loader_src = _function_source(ROOT / rel_path, "_start_hotkey_module_loading")
+        deferred_src = _function_source(ROOT / rel_path, "deferred_initialization")
+
+        assert "hotkey_future = self.bg_executor.submit(self._prepare_hotkeys_background)" in loader_src
+        assert "hotkey_future.add_done_callback(_handle_hotkey_loader_rejected)" in loader_src
+        assert "RejectedExecutionError" in loader_src
+        assert "self._heavy_modules_loading = False" in loader_src
+        assert "self.root.after(5000, self._start_hotkey_module_loading)" in loader_src
+        assert "self._start_hotkey_module_loading()" in deferred_src
+
+
+def test_permanent_background_loops_do_not_consume_executor_workers():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        start_src = _function_source(ROOT / rel_path, "start_background_tasks")
+        guardian_src = _function_source(ROOT / rel_path, "run_hotkey_guardian")
+
+        assert "target=run_schedule" in start_src
+        assert 'name="ScheduleLoop"' in start_src
+        assert "self.bg_executor.submit(run_schedule)" not in start_src
+        assert "target=rehook" in guardian_src
+        assert 'name="HotkeyGuardian"' in guardian_src
+        assert "self.bg_executor.submit(rehook)" not in guardian_src
+        assert "duplicate start ignored" in guardian_src
+
+
 def test_background_schedule_loop_uses_low_frequency_wait():
     for rel_path in ("src/main.py", "src/scheduler.py"):
         src = _function_source(ROOT / rel_path, "start_background_tasks")
