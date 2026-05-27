@@ -53,8 +53,9 @@ class BoundedThreadPoolExecutor(ThreadPoolExecutor):
             logging.warning("%s; dropping task %s", self._reject_message, _callable_name(fn))
             return future
 
+        task_name = _callable_name(fn)
         try:
-            future = super().submit(fn, *args, **kwargs)
+            future = super().submit(_run_with_exception_logging, task_name, fn, args, kwargs)
         except Exception:
             self._pending_slots.release()
             raise
@@ -65,3 +66,16 @@ class BoundedThreadPoolExecutor(ThreadPoolExecutor):
 
 def _callable_name(fn: Callable[..., Any]) -> str:
     return getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn)))
+
+
+def _run_with_exception_logging(
+    task_name: str,
+    fn: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> Any:
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        logging.exception("background task failed: %s", task_name)
+        raise

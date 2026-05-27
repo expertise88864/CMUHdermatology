@@ -122,6 +122,8 @@ _test_login_gate = ActiveTaskGate(stale_after_sec=10 * 60)
 # > 180s 沒 tick 視為 thread 卡死，> 20s 沒解套就 os._exit(1) 讓 process 重啟。
 _AUTOCLOCK_LIVENESS = {"last_tick": 0.0}
 _scheduler_thread_ref: threading.Thread | None = None
+_self_watchdog_thread_ref: threading.Thread | None = None
+_self_watchdog_lock = threading.Lock()
 
 
 def _sleep_while_running(seconds: float, step: float = 0.5) -> bool:
@@ -950,6 +952,20 @@ def _autoclock_self_watchdog() -> None:
             logging.exception("[autoclock/self-watchdog] tick 例外")
 
 
+def _ensure_autoclock_self_watchdog() -> None:
+    global _self_watchdog_thread_ref
+    with _self_watchdog_lock:
+        if (_self_watchdog_thread_ref is not None
+                and _self_watchdog_thread_ref.is_alive()):
+            return
+        _self_watchdog_thread_ref = threading.Thread(
+            target=_autoclock_self_watchdog,
+            name="AutoclockSelfWatchdog",
+            daemon=True,
+        )
+        _self_watchdog_thread_ref.start()
+
+
 def scheduler_loop() -> None:
     """背景排程主迴圈。
 
@@ -961,13 +977,13 @@ def scheduler_loop() -> None:
     (3) 啟動 self-watchdog daemon thread 監看 scheduler thread is_alive + tick
     """
     logging.info("背景排程器已啟動...")
+    schedule.clear()
     schedule.every(1).minute.at(":01").do(_scheduler_tick)
     # [優化] 每 2 分鐘主動檢查 idle driver，過期就 quit (省 ~150-250MB Chrome)
     schedule.every(2).minutes.do(_idle_driver_janitor)
 
     # [P0-1] 啟動 self-watchdog 子 thread
-    threading.Thread(target=_autoclock_self_watchdog,
-                      name="AutoclockSelfWatchdog", daemon=True).start()
+    _ensure_autoclock_self_watchdog()
 
     # [2026-05-25 P0 emergency 修補] heartbeat log — 給外層 InnerWatchdog 看
     # log mtime 用。原本 v45 把 max_stale_sec 0→300 但忽略 autoclock idle 時段

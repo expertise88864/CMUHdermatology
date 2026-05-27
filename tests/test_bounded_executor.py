@@ -43,3 +43,21 @@ def test_bounded_executor_releases_budget_after_task_finishes():
         assert executor.submit(lambda: "two").result(timeout=1) == "two"
     finally:
         executor.shutdown(wait=True)
+
+
+def test_bounded_executor_logs_background_task_exceptions(caplog):
+    def fail_task():
+        raise ValueError("boom")
+
+    executor = BoundedThreadPoolExecutor(max_workers=1, max_pending=1)
+    try:
+        future = executor.submit(fail_task)
+
+        with pytest.raises(ValueError):
+            future.result(timeout=1)
+    finally:
+        executor.shutdown(wait=True)
+
+    assert "background task failed:" in caplog.text
+    assert "fail_task" in caplog.text
+    assert "boom" in caplog.text

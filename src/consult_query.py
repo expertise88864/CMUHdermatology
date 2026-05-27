@@ -202,6 +202,8 @@ tray_icon_object = None
 log_queue: "queue.Queue" = queue.Queue(maxsize=5000)
 LOG_POLL_MAX_RECORDS = 200
 _config_lock = threading.Lock()
+_self_watchdog_thread_ref: threading.Thread | None = None
+_self_watchdog_lock = threading.Lock()
 
 
 def _normalize_retry_count(value) -> int:
@@ -1784,13 +1786,26 @@ def _scheduler_self_watchdog() -> None:
             logging.exception("[self-watchdog] tick 例外")
 
 
+def _ensure_scheduler_self_watchdog() -> None:
+    global _self_watchdog_thread_ref
+    with _self_watchdog_lock:
+        if (_self_watchdog_thread_ref is not None
+                and _self_watchdog_thread_ref.is_alive()):
+            return
+        _self_watchdog_thread_ref = threading.Thread(
+            target=_scheduler_self_watchdog,
+            name="SchedulerSelfWatchdog",
+            daemon=True,
+        )
+        _self_watchdog_thread_ref.start()
+
+
 def scheduler_loop() -> None:
     logging.info("=== 會診查詢排程器啟動 v%s ===", CURRENT_VERSION)
     _rebuild_schedule()
 
     # [穩定性] 啟動 self-watchdog 子 thread (獨立監看 scheduler 是否還活著)
-    threading.Thread(target=_scheduler_self_watchdog,
-                      name="SchedulerSelfWatchdog", daemon=True).start()
+    _ensure_scheduler_self_watchdog()
 
     last_email_check = 0.0
     last_heartbeat = time.time()

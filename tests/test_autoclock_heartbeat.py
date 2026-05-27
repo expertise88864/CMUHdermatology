@@ -228,3 +228,19 @@ def test_config_app_log_polling_is_bounded():
     assert "LOG_POLL_MAX_RECORDS" in src
     assert "while not log_queue.empty()" not in src
     assert autoclock.LOG_POLL_MAX_RECORDS <= 500
+
+
+def test_autoclock_scheduler_clears_old_jobs_before_registering():
+    src = inspect.getsource(autoclock.scheduler_loop)
+
+    assert "schedule.clear()" in src
+    assert src.index("schedule.clear()") < src.index("schedule.every(1).minute")
+
+
+def test_autoclock_scheduler_uses_single_self_watchdog_guard():
+    scheduler_src = inspect.getsource(autoclock.scheduler_loop)
+    guard_src = inspect.getsource(autoclock._ensure_autoclock_self_watchdog)
+
+    assert "_ensure_autoclock_self_watchdog()" in scheduler_src
+    assert "threading.Thread(target=_autoclock_self_watchdog" not in scheduler_src
+    assert "_self_watchdog_thread_ref.is_alive()" in guard_src

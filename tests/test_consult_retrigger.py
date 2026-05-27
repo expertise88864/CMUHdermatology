@@ -184,6 +184,15 @@ def test_config_app_log_polling_is_bounded():
     assert consult_query.LOG_POLL_MAX_RECORDS <= 500
 
 
+def test_consult_scheduler_uses_single_self_watchdog_guard():
+    scheduler_src = inspect.getsource(consult_query.scheduler_loop)
+    guard_src = inspect.getsource(consult_query._ensure_scheduler_self_watchdog)
+
+    assert "_ensure_scheduler_self_watchdog()" in scheduler_src
+    assert "threading.Thread(target=_scheduler_self_watchdog" not in scheduler_src
+    assert "_self_watchdog_thread_ref.is_alive()" in guard_src
+
+
 def test_tray_test_email_skips_duplicate_until_worker_finishes(monkeypatch):
     targets = []
     sent = []
