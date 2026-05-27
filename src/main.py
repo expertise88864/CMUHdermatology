@@ -9031,24 +9031,28 @@ class AutomationApp:
                 batches = partition_doctors_for_refresh_batches(doctors_to_check)
                 for bi, batch in enumerate(batches):
                     futures = []
-                    for doctor_config in batch:
-                        worker_config = dict(doctor_config)
-                        doc_no = str(worker_config.get("doc_no", ""))
-                        doc_name = str(worker_config.get("name", ""))
-                        with self._doctor_data_lock:
-                            cached_data = self.all_doctors_data.get(doc_no) or self.all_doctors_data.get(doc_name)
-                            if _appointments_data_count(cached_data) > 0:
-                                worker_config["_cached_appointments"] = deepcopy(cached_data)
-                        worker_config["_is_manual_refresh"] = bool(is_manual)
-                        future = self.bg_executor.submit(check_appointment_count, self.ui_queue, worker_config)
-                        futures.append(future)
-                    if futures:
+                    batch_workers = max(1, min(len(batch), 6))
+                    with ThreadPoolExecutor(
+                        max_workers=batch_workers,
+                        thread_name_prefix="RefreshBatch",
+                    ) as refresh_pool:
+                        for doctor_config in batch:
+                            worker_config = dict(doctor_config)
+                            doc_no = str(worker_config.get("doc_no", ""))
+                            doc_name = str(worker_config.get("name", ""))
+                            with self._doctor_data_lock:
+                                cached_data = self.all_doctors_data.get(doc_no) or self.all_doctors_data.get(doc_name)
+                                if _appointments_data_count(cached_data) > 0:
+                                    worker_config["_cached_appointments"] = deepcopy(cached_data)
+                            worker_config["_is_manual_refresh"] = bool(is_manual)
+                            future = refresh_pool.submit(check_appointment_count, self.ui_queue, worker_config)
+                            futures.append(future)
                         wait(futures, return_when=ALL_COMPLETED)
-                        for fut in futures:
-                            try:
-                                fut.result()
-                            except Exception:
-                                logging.exception("掛號資料擷取背景工作失敗（單一醫師工作緒）")
+                    for fut in futures:
+                        try:
+                            fut.result()
+                        except Exception:
+                            logging.exception("掛號資料擷取背景工作失敗（單一醫師工作緒）")
                     if bi < len(batches) - 1:
                         time.sleep(0.18)
             finally:
@@ -10659,17 +10663,25 @@ class AutomationApp:
             logging.info("值班資訊今日已查詢，略過重抓（跨日才強制更新）")
             return
 
-        futures = [
-            self.bg_executor.submit(self._run_single_duty_query, fetch_duty_doctor, self.r_doctor_map),
-            self.bg_executor.submit(self._run_single_duty_query, fetch_saturday_duty_doctor, self.r_doctor_map),
-            self.bg_executor.submit(self._run_single_duty_query, fetch_duty_vs, "today_vs"),
-            self.bg_executor.submit(self._run_single_duty_query, fetch_duty_vs, "saturday_vs"),
+        duty_jobs = [
+            (fetch_duty_doctor, self.r_doctor_map),
+            (fetch_saturday_duty_doctor, self.r_doctor_map),
+            (fetch_duty_vs, "today_vs"),
+            (fetch_duty_vs, "saturday_vs"),
         ]
-        for f in as_completed(futures):
-            try:
-                f.result()
-            except Exception as e:
-                logging.error(f"_fetch_all_duty_info future: {e}", exc_info=True)
+        with ThreadPoolExecutor(
+            max_workers=len(duty_jobs),
+            thread_name_prefix="DutyInfo",
+        ) as duty_pool:
+            futures = [
+                duty_pool.submit(self._run_single_duty_query, fetch_func, third_arg)
+                for fetch_func, third_arg in duty_jobs
+            ]
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception as e:
+                    logging.error(f"_fetch_all_duty_info future: {e}", exc_info=True)
         self._duty_last_fetch_date = today_str
 
     def _get_doctor_threshold_map(self, doctor_name):

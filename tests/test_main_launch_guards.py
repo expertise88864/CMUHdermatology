@@ -224,6 +224,24 @@ def test_main_and_scheduler_background_executors_are_bounded():
         assert "max_pending=60" in src
 
 
+def test_refresh_batches_use_local_executor_instead_of_bg_queue():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "_trigger_refresh")
+
+        assert 'thread_name_prefix="RefreshBatch"' in src
+        assert "refresh_pool.submit(check_appointment_count" in src
+        assert "self.bg_executor.submit(check_appointment_count" not in src
+
+
+def test_duty_info_uses_local_executor_instead_of_bg_queue():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "_fetch_all_duty_info")
+
+        assert 'thread_name_prefix="DutyInfo"' in src
+        assert "duty_pool.submit(self._run_single_duty_query" in src
+        assert "self.bg_executor.submit(self._run_single_duty_query" not in src
+
+
 def test_main_and_scheduler_background_tasks_start_once_and_clear_schedule():
     for rel_path in ("src/main.py", "src/scheduler.py"):
         full_src = (ROOT / rel_path).read_text(encoding="utf-8")
