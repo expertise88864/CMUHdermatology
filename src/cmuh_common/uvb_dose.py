@@ -121,8 +121,10 @@ class UvbLineInfo:
 #   3. 各 field 順序不限，缺任一 field → parse_fail
 
 # [v20.15 2026-05-26] 也接受 "Phototherapy" 當 keyword (劉香君實機 case)
+# [v20.18 2026-05-27] 也接受 "UV" 簡寫當 keyword (陳冠廷實機 case "uv 1150mj")
+# 注意 alternation 順序: UVB|UV 必須長的先 — 否則 "UVB" 會被 UV 部分匹配
 _UVB_DOSE_RE = re.compile(
-    r"(UVB|Phototherapy)\s*[:：]?\s*(\d+)", re.IGNORECASE)
+    r"(UVB|Phototherapy|UV)\s*[:：]?\s*(\d+)", re.IGNORECASE)
 # [v20.11] 接受帶 paren 跟不帶 paren 兩種:
 #   (2026/05/24) — group 1-3
 #    2026/05/24  — group 4-6
@@ -242,7 +244,9 @@ def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
       - "MAX dose: N" 寫法 (鄧仲強實機 case)
     """
     lower = text.lower()
-    if "uvb" not in lower and "phototherapy" not in lower:
+    # [v20.18] 也接受 "uv" 簡寫 (但需 word boundary 避免誤抓 uveitis/UVA 等)
+    if ("uvb" not in lower and "phototherapy" not in lower
+            and not re.search(r"\buv\b", lower)):
         return None
 
     # 1. UVB / Phototherapy dose
@@ -329,7 +333,9 @@ def parse_uvb_partial(text: str) -> Optional[UvbLineInfo]:
     回 UvbLineInfo 時 last_date/increase 可能是 None。
     """
     lower = text.lower()
-    if "uvb" not in lower and "phototherapy" not in lower:
+    # [v20.18] 也接受 "uv" 簡寫 (但需 word boundary 避免誤抓 uveitis/UVA 等)
+    if ("uvb" not in lower and "phototherapy" not in lower
+            and not re.search(r"\buv\b", lower)):
         return None
 
     dose_m = _UVB_DOSE_RE.search(text)
@@ -492,8 +498,9 @@ def format_uvb_line(original: UvbLineInfo, *, new_dose: int,
     # 1. 替換 dose：找原 dose 數字第一次出現 (在 UVB 之後)
     #    使用 regex 因為要對齊「UVB 520」這個 pattern，不能誤改 "(11)" 的 11
     #    [v20.2] 允許「UVB:」冒號 — 跟 parse regex 一致
+    #    [v20.18] 接受 "UV" 簡寫 — 跟 _UVB_DOSE_RE 一致
     src = re.sub(
-        r"((?:UVB|Phototherapy)\s*[:：]?\s*)" + str(original.dose)
+        r"((?:UVB|Phototherapy|UV)\s*[:：]?\s*)" + str(original.dose)
         + r"(\s*(?:mj/cm2)?)",
         lambda mo: f"{mo.group(1)}{new_dose}{mo.group(2)}",
         src,
@@ -682,8 +689,9 @@ def _first_time_update(parsed: UvbLineInfo, today: date,
     src = parsed.full_match
 
     # 1. 替換 dose: UVB:OLD → UVB:NEW
+    # [v20.18] 接受 "UV" 簡寫 keyword
     src = re.sub(
-        r"((?:UVB|Phototherapy)\s*[:：]?\s*)" + str(parsed.dose) +
+        r"((?:UVB|Phototherapy|UV)\s*[:：]?\s*)" + str(parsed.dose) +
         r"(\s*(?:mj/cm2)?)",
         lambda mo: f"{mo.group(1)}{new_dose}{mo.group(2)}",
         src, count=1, flags=re.IGNORECASE,
@@ -692,8 +700,9 @@ def _first_time_update(parsed: UvbLineInfo, today: date,
     # 2. count + date 插入
     if parsed.count is None:
         # 沒原 count → 在 dose+unit 之後插入 " (new_count) on (today_str)"
+        # [v20.18] 接受 "UV" 簡寫 keyword
         src = re.sub(
-            r"((?:UVB|Phototherapy)\s*[:：]?\s*\d+\s*(?:mj/cm2)?)",
+            r"((?:UVB|Phototherapy|UV)\s*[:：]?\s*\d+\s*(?:mj/cm2)?)",
             lambda mo: f"{mo.group(1)} ({new_count}) on ({today_str})",
             src, count=1, flags=re.IGNORECASE,
         )
@@ -766,7 +775,8 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
             # - 連 UVB/Phototherapy + 數字 結構都沒有 → NO_UVB_LINE
             #   (例如「keep phototherapy on both lower limbs to 680」這種
             #   一般描述語句，不是結構化處置)
-            if re.search(r"(?:UVB|Phototherapy)\s*[:：]",
+            # [v20.18] 加 UV 同樣判斷 (但 UV: 較罕見)
+            if re.search(r"(?:UVB|Phototherapy|UV)\s*[:：]",
                          text, re.IGNORECASE):
                 return UvbUpdateResult(action=UvbAction.PARSE_FAIL,
                                        uvb_line_count=uvb_lines)

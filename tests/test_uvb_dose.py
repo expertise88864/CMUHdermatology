@@ -1710,3 +1710,61 @@ def test_image1_hu_max_equals_dose_then_keep_silent_update():
     assert "(2025/12/10)" in r.new_text
     # "then keep 1500" 後綴保留
     assert "then keep 1500" in r.new_text
+
+
+def test_image1_chen_lowercase_uv_shorthand():
+    """[v20.18] 陳冠廷實機 case: doctor 用 "uv" 簡寫 (沒 b) 當 keyword。
+    "uv 1150mj (34) on (2026/5/21) add 30 each, MAX 1200, 3w appoint"
+    days_diff = 6 (5/21→5/27) → 套 +increase 公式 dose 1150+30=1180。"""
+    text = ("uv 1150mj (34) on (2026/5/21) add 30 each, MAX 1200, "
+            "3w appoint\n"
+            "IgE: 1815 * IU/mL (<87)  explain MAST\n"
+            "LN for right palm on (2026/3/5) (2026/3/26) and complete")
+    r = update_uvb_in_text(text, today=date(2026, 5, 27))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 1180   # 1150 + 30
+    assert r.new_count == 35    # 34 + 1
+    assert r.days_diff == 6
+    # date 5/21 → 5/27 (帶 paren AD format)
+    assert "(2026/05/27)" in r.new_text
+    # uv keyword 保留 (不轉成 UVB)
+    assert "uv 1180mj" in r.new_text
+    # 其他行的歷史日期不該被誤改
+    assert "(2026/3/5)" in r.new_text
+    assert "(2026/3/26)" in r.new_text
+
+
+def test_uv_shorthand_parses():
+    """[v20.18] "uv" 簡寫 keyword 被 dose regex 認可。"""
+    text = "uv 800 (5) on (2026/5/24) add 30, max 1000"
+    info = parse_uvb_line(text)
+    assert info is not None
+    assert info.dose == 800
+    assert info.keyword_text.lower() == "uv"
+
+
+def test_uv_shorthand_word_boundary():
+    """[v20.18] "uv" 簡寫需 word boundary 才認 — 避免誤抓 UVA / uveitis 等。"""
+    # UVA 後面有 800 但前綴不是 "uv" word boundary → 不認 (但其實 "uv" 字串
+    # 是在 UVA 內部 開頭 — 沒有後 word boundary 所以 不認)
+    text_uva = "UVA 800 each session"  # UVA - "A" 是 word char 連 V 後沒 boundary
+    info = parse_uvb_line(text_uva)
+    # UVA 不該被當成 UVB/UV — dose regex 雖然找 UV 開頭可能誤抓
+    # 但 lower keyword 檢查用 uv — UVA 沒這個 word boundary 所以早 return
+    assert info is None
+
+
+def test_uveitis_not_matched_as_uv():
+    """[v20.18] "uveitis" 不該被誤判為 UV — word boundary 排除。"""
+    text = "patient has uveitis episode, no skin lesions"
+    info = parse_uvb_line(text)
+    assert info is None
+
+
+def test_uv_keyword_preserved_in_output():
+    """[v20.18] 用 "uv" 簡寫的處置寫回時 keyword 應保留原樣 (不變大寫不加 b)。"""
+    text = "uv 500 (3) on (2026/5/22) add 50, max 1000"
+    r = update_uvb_in_text(text, today=date(2026, 5, 27))
+    assert r.action == UvbAction.UPDATED
+    # 不該變成 "UVB ..." or "UV: ..."
+    assert "uv 550" in r.new_text or "uv 1000" in r.new_text
