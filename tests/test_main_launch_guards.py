@@ -264,6 +264,41 @@ def test_clinic_worker_submit_rejection_clears_running_flag():
         assert "self._clinic_lights_worker_running = False" in src
 
 
+def test_scheduled_background_submits_detect_rejected_futures():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "start_background_tasks")
+
+        assert "def _future_was_rejected(future):" in src
+        assert "isinstance(future.exception(), RejectedExecutionError)" in src
+        assert "result = fn()" in src
+        assert "_future_was_rejected(result)" in src
+        assert "background queue full" in src
+        assert "future = self.bg_executor.submit(self._trigger_refresh, False, [doc])" in src
+        assert "_future_was_rejected(future)" in src
+        assert src.index("_future_was_rejected(future)") < src.index(
+            "self._priority_refresh_last_check_time[doc_name] = now_ts"
+        )
+
+
+def test_hotkey_guardian_uses_safe_rehook_policy():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "run_hotkey_guardian")
+
+        assert "should_rehook_hotkeys(" in src
+        assert "subsystem_running=getattr(self, '_subsystem_running', False)" in src
+        assert "modules_ready=getattr(self, '_heavy_modules_ready', False)" in src
+        assert "Hotkey guardian skipped re-hook while automation is running." in src
+
+
+def test_background_schedule_loop_uses_low_frequency_wait():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "start_background_tasks")
+
+        assert "now.second < 10" in src
+        assert "stop_event_main.wait(5.0)" in src
+        assert "stop_event_main.wait(1.0)" not in src
+
+
 def test_main_and_scheduler_background_tasks_start_once_and_clear_schedule():
     for rel_path in ("src/main.py", "src/scheduler.py"):
         full_src = (ROOT / rel_path).read_text(encoding="utf-8")

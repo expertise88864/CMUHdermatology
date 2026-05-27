@@ -10841,12 +10841,25 @@ class AutomationApp:
             logging.debug("[O17] schedule_cleanup_in_background 失敗", exc_info=True)
         
         def run_schedule():
+            def _future_was_rejected(future):
+                if future is None or not hasattr(future, "done") or not future.done():
+                    return False
+                try:
+                    return isinstance(future.exception(), RejectedExecutionError)
+                except Exception:
+                    return False
+
             def run_named_job(job_tag, fn):
                 t0 = time.perf_counter()
                 logging.info(f"[SCHEDULE:{job_tag}] started")
                 try:
-                    fn()
+                    result = fn()
                     elapsed = time.perf_counter() - t0
+                    if _future_was_rejected(result):
+                        logging.warning(
+                            f"[SCHEDULE:{job_tag}] skipped in {elapsed:.2f}s: background queue full"
+                        )
+                        return
                     logging.info(f"[SCHEDULE:{job_tag}] finished in {elapsed:.2f}s")
                 except Exception as e:
                     elapsed = time.perf_counter() - t0
@@ -10873,7 +10886,12 @@ class AutomationApp:
                             logging.info(
                                 f"[SCHEDULE:priority-check-2m] 觸發優先刷新：{doc_name}（鄰近門檻且距上次≥30分）"
                             )
-                            self.bg_executor.submit(self._trigger_refresh, False, [doc])
+                            future = self.bg_executor.submit(self._trigger_refresh, False, [doc])
+                            if _future_was_rejected(future):
+                                logging.warning(
+                                    f"[SCHEDULE:priority-check-2m] 略過優先刷新：{doc_name}，背景佇列已滿"
+                                )
+                                continue
                             self._priority_refresh_last_check_time[doc_name] = now_ts
                 except Exception as e:
                     logging.error(f"[SCHEDULE:priority-check-2m] failed: {e}", exc_info=True)

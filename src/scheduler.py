@@ -63,6 +63,7 @@ from cmuh_common.bounded_executor import BoundedThreadPoolExecutor, RejectedExec
 from cmuh_common.hotkey_guardian import (
     should_emit_idle_status,
     should_emit_interrupt,
+    should_rehook_hotkeys,
     should_show_busy_notice,
 )
 from cmuh_common.http_client import INTERNAL_HOSTS, is_internal as _is_internal
@@ -6382,10 +6383,20 @@ class AutomationApp:
                 if stop_event_main.wait(600):
                     break
                 try:
-                    if getattr(self, 'hotkey_profile', None) or self.hotkey_version:
-                        if not getattr(self, '_shutting_down', False):
-                            self.root.after(0, self.setup_hotkeys)
-                            logging.info("Hotkeys re-hooked by guardian.")
+                    has_profile = bool(
+                        getattr(self, 'hotkey_profile', None)
+                        or getattr(self, 'hotkey_version', None))
+                    if should_rehook_hotkeys(
+                        has_profile,
+                        shutting_down=getattr(self, '_shutting_down', False),
+                        subsystem_running=getattr(self, '_subsystem_running', False),
+                        modules_ready=getattr(self, '_heavy_modules_ready', False),
+                    ):
+                        self.root.after(0, self.setup_hotkeys)
+                        logging.info("Hotkeys re-hooked by guardian.")
+                    elif getattr(self, '_subsystem_running', False):
+                        logging.debug(
+                            "Hotkey guardian skipped re-hook while automation is running.")
                 except Exception as e:
                     logging.error(f"Error re-hooking hotkeys: {e}")
         # [核心修正] 依賴統一池
@@ -6493,12 +6504,25 @@ class AutomationApp:
         self.root.after(2500, lambda: self.bg_executor.submit(self._fetch_all_duty_info))
         
         def run_schedule():
+            def _future_was_rejected(future):
+                if future is None or not hasattr(future, "done") or not future.done():
+                    return False
+                try:
+                    return isinstance(future.exception(), RejectedExecutionError)
+                except Exception:
+                    return False
+
             def run_named_job(job_tag, fn):
                 t0 = time.perf_counter()
                 logging.info(f"[SCHEDULE:{job_tag}] started")
                 try:
-                    fn()
+                    result = fn()
                     elapsed = time.perf_counter() - t0
+                    if _future_was_rejected(result):
+                        logging.warning(
+                            f"[SCHEDULE:{job_tag}] skipped in {elapsed:.2f}s: background queue full"
+                        )
+                        return
                     logging.info(f"[SCHEDULE:{job_tag}] finished in {elapsed:.2f}s")
                 except Exception as e:
                     elapsed = time.perf_counter() - t0
@@ -6533,7 +6557,12 @@ class AutomationApp:
                             logging.info(
                                 f"[SCHEDULE:priority-check-1m] 觸發優先刷新：{doc_name}（鄰近門檻且距上次≥15分）"
                             )
-                            self.bg_executor.submit(self._trigger_refresh, False, [doc])
+                            future = self.bg_executor.submit(self._trigger_refresh, False, [doc])
+                            if _future_was_rejected(future):
+                                logging.warning(
+                                    f"[SCHEDULE:priority-check-1m] 略過優先刷新：{doc_name}，背景佇列已滿"
+                                )
+                                continue
                             self._priority_refresh_last_check_time[doc_name] = now_ts
                 except Exception as e:
                     logging.error(f"[SCHEDULE:priority-check-1m] failed: {e}", exc_info=True)
@@ -6570,7 +6599,7 @@ class AutomationApp:
 
                         current_date_str = now.strftime("%Y-%m-%d")
 
-                        if current_time_str == target_time_str and now.second < 5 and self.last_reboot_check_date != current_date_str:
+                        if current_time_str == target_time_str and now.second < 10 and self.last_reboot_check_date != current_date_str:
                             idle_seconds = get_idle_duration()
                             
                             if idle_seconds >= 60:
@@ -6583,8 +6612,8 @@ class AutomationApp:
                 except Exception as e:
                     logging.error(f"Error in auto reboot check: {e}")
 
-                # 【穩定性 2026-05-21】stop_event.wait 取代 time.sleep — shutdown 立即返回
-                if stop_event_main.wait(1.0):
+                # master loop 精度只需分鐘等級；5s wait 降低 idle CPU，shutdown 仍會在數秒內返回。
+                if stop_event_main.wait(5.0):
                     break
 
         self.bg_executor.submit(run_schedule)
