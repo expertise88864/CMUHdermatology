@@ -14,8 +14,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import cmuh_common.abbrev_engine as ae  # noqa: E402
 from cmuh_common.abbrev_engine import (  # noqa: E402
+    DEFAULT_ITEMS,
     AbbrevConfig,
     AbbrevEngine,
+    _maybe_migrate_legacy,
     detect_external_expander,
     render_expansion,
 )
@@ -172,3 +174,42 @@ def test_install_rehooks_after_external_disappears(monkeypatch):
     eng.install(cfg)
     assert eng.is_installed() is True
     assert eng._external_expander is None
+
+
+# ─── ef 預設展開 + 舊版自動升級 ───────────────────────────────────────────
+
+def test_ef_default_expansion_has_follow_up():
+    """[v7] ef 預設展開應為含 'and follow up' 的新版。"""
+    ef = next(d for d in DEFAULT_ITEMS if d["abbrev"] == "ef")
+    assert ef["expansion"] == (
+        "excisional biopsy and follow up, inform post-op 3x scar formation")
+
+
+def test_migrate_legacy_ef_to_new():
+    """[v7] user 沿用舊版 ef 預設 → 自動升級為新版。"""
+    items = [{"abbrev": "ef",
+              "expansion": "excisional biopsy, inform post-op 3x scar formation"}]
+    changed = _maybe_migrate_legacy(items)
+    assert changed is True
+    assert items[0]["expansion"] == (
+        "excisional biopsy and follow up, inform post-op 3x scar formation")
+
+
+def test_migrate_legacy_ef_preserves_user_custom():
+    """[v7] user 手動改過的 ef → 不該被升級覆蓋。"""
+    items = [{"abbrev": "ef", "expansion": "my own ef text"}]
+    changed = _maybe_migrate_legacy(items)
+    assert changed is False
+    assert items[0]["expansion"] == "my own ef text"
+
+
+def test_replace_timing_constants_ordered():
+    """[v7] 寧慢求對：確認延遲常數有被拉長 (deletion 正確性)。"""
+    assert AbbrevEngine.PRE_BACKSPACE_DELAY_SEC >= 0.10
+    assert AbbrevEngine.POST_BACKSPACE_DELAY_SEC >= 0.03
+    assert AbbrevEngine.POST_PASTE_DELAY_SEC >= 0.25
+    # COOLDOWN 必須 >= 整個替換流程時間，避免冷卻太早結束被重觸
+    total = (AbbrevEngine.PRE_BACKSPACE_DELAY_SEC
+             + AbbrevEngine.POST_BACKSPACE_DELAY_SEC
+             + AbbrevEngine.POST_PASTE_DELAY_SEC)
+    assert AbbrevEngine.COOLDOWN_SEC >= total

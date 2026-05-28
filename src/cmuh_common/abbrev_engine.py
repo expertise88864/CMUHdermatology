@@ -48,7 +48,7 @@ DEFAULT_ITEMS: list[dict[str, str]] = [
     {"abbrev": "sk",   "expansion": "seborrheic keratosis"},
     {"abbrev": "sk1",  "expansion": "r/o seborrheic keratosis, r/o malignancy"},
     {"abbrev": "nev1", "expansion": "r/o dysplastic nevus, r/o malignancy"},
-    {"abbrev": "ef",   "expansion": "excisional biopsy, inform post-op 3x scar formation"},
+    {"abbrev": "ef",   "expansion": "excisional biopsy and follow up, inform post-op 3x scar formation"},
     {"abbrev": "uvb",  "expansion": "UVB: 250 mj/cm2 (1) on da, increased 30 mj/cm2 if no erythema, MAX: 800 mj/cm2"},
     {
         "abbrev": "cert1",
@@ -81,9 +81,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 
 # 舊版內建預設的逐字版本（用於偵測 user 是否還沿用舊預設，自動升級）。
-# 升級規則：若 user 的 cert1/cert2 expansion 完全等於下面字串 → 視為「沒改過」
-# → 替換為 DEFAULT_ITEMS 內的新版（含 da_zh token）。
+# 升級規則：若 user 的 cert1/cert2/ef expansion 完全等於下面字串 → 視為「沒改過」
+# → 替換為 DEFAULT_ITEMS 內的新版。User 手動編輯過的內容不會被動。
 _LEGACY_DEFAULTS_TO_MIGRATE: dict[str, str] = {
+    # [v7 2026-05-28] ef 預設改為含 "and follow up"
+    "ef": "excisional biopsy, inform post-op 3x scar formation",
     "cert1": (
         "患者因上述皮膚疾病，於2026年5月28日至本院皮膚科門診就醫治療，"
         "後續接受局部麻醉下皮膚腫瘤切除手術及縫合，"
@@ -125,9 +127,9 @@ class AbbrevConfig:
 
 
 def _maybe_migrate_legacy(items: list[dict[str, str]]) -> bool:
-    """偵測 user 的 cert1/cert2 是否還是舊版預設（字面 2026/5/28、da-N 斜線）。
-    若是，升級為新版（da_zh token）。User 手動編輯過的內容不會被動。
-    回傳 True 表示有修改。
+    """偵測 user 的 cert1/cert2/ef 是否還是舊版預設字面。
+    若是（= 沒手動改過），升級為 DEFAULT_ITEMS 內的新版。User 手動編輯過的
+    內容（不等於舊預設）不會被動。回傳 True 表示有修改。
     """
     changed = False
     new_default_by_abbrev = {
@@ -144,7 +146,7 @@ def _maybe_migrate_legacy(items: list[dict[str, str]]) -> bool:
                 it["expansion"] = new_exp
                 changed = True
                 logging.info(
-                    "[abbrev] 自動升級舊版預設 '%s' → 新版含 da_zh token", ab)
+                    "[abbrev] 自動升級舊版預設 '%s' → 新版", ab)
     return changed
 
 
@@ -669,13 +671,21 @@ class AbbrevEngine:
     # 觸發後一次連送的 backspace 上限，純防呆。
     MAX_BACKSPACE = 64
 
+    # [v7 2026-05-28] 為了「寧慢求對」全面拉長各延遲，確保刪除/展開正確：
     # 展開後的冷卻時間（s）— 期間 buffer 暫停累積，避免 user 連打第二組
-    # 縮寫時後續 keystroke 跟我們的 paste 競態。
-    COOLDOWN_SEC = 0.55
+    # 縮寫時後續 keystroke 跟我們的 paste 競態。需 >= 整個替換流程時間。
+    COOLDOWN_SEC = 0.9
     # 送 backspace 前的延遲（s）— 確保「縮寫 + 觸發空白」已先抵達目標視窗。
-    # keyboard 模組 hook callback 同步跑在 hook thread，若不延遲就送 backspace，
+    # keyboard 模組 hook callback 跑在 hook thread，若不夠延遲就送 backspace，
     # 觸發空白還沒被 dispatch → backspace 跑到空白前面 → 刪錯/沒刪到。
-    PRE_BACKSPACE_DELAY_SEC = 0.045
+    # 0.045 → 0.12（系統忙時 0.045 不夠 → 偶發刪錯）
+    PRE_BACKSPACE_DELAY_SEC = 0.12
+    # [v7] backspace 送完到送 Ctrl+V 之間的延遲（s）— 讓目標 app 先處理完
+    # 刪除，再貼上，避免「刪除還沒生效就貼上」導致殘留縮寫。
+    POST_BACKSPACE_DELAY_SEC = 0.05
+    # [v7] Ctrl+V 送完到「還原剪貼簿」之間的延遲（s）— 目標 app 是非同步
+    # 讀剪貼簿，太早還原會貼到舊內容（展開錯字）。0.12 → 0.30。
+    POST_PASTE_DELAY_SEC = 0.30
 
     def __init__(self, kb_module: Any) -> None:
         """kb_module = `keyboard` PyPI 套件物件（已 import 完成）。"""
@@ -848,9 +858,11 @@ class AbbrevEngine:
         worker.start()
 
     def _do_replace(self, backspace_count: int, text: str, abbrev_key: str) -> None:
-        """在獨立 thread 執行：先等「縮寫 + 觸發空白」抵達目標視窗，再原子
-        SendInput 送 backspace × N + Ctrl+V。期間 BlockInput 凍結 user
-        真實輸入避免 race（需 admin；非 admin 退而靠 cool-down）。
+        """在獨立 thread 執行：先等「縮寫 + 觸發空白」抵達目標視窗，再分兩段
+        SendInput：(1) backspace × N → 等目標處理完刪除 → (2) Ctrl+V 貼上。
+        期間 BlockInput 凍結 user 真實輸入避免 race（需 admin；非 admin 退而
+        靠 cool-down）。[v7] 為「寧慢求對」，刪除與貼上拆開且各加足夠延遲，
+        並延後還原剪貼簿至 app 確實讀完。
 
         _suppressing 與 cool-down 已在呼叫端 (_try_expand) 同步設好。
         """
@@ -872,17 +884,20 @@ class AbbrevEngine:
             clip_ok = _clipboard_set_text(text)
 
             if clip_ok:
-                # 2a. 組原子事件序列：backspace × N + Ctrl + V + Ctrl up + V up
-                events: list = []
+                # [v7] 拆成「先刪除、再貼上」兩段原子 SendInput，中間留時間
+                # 給目標 app 處理刪除，避免「刪除還沒生效就貼上」殘留縮寫。
+                bs_events: list = []
                 for _ in range(backspace_count):
-                    events.append((_VK_BACK, True))
-                    events.append((_VK_BACK, False))
-                events.append((_VK_CONTROL, True))
-                events.append((_VK_V, True))
-                events.append((_VK_V, False))
-                events.append((_VK_CONTROL, False))
+                    bs_events.append((_VK_BACK, True))
+                    bs_events.append((_VK_BACK, False))
+                paste_events: list = [
+                    (_VK_CONTROL, True),
+                    (_VK_V, True),
+                    (_VK_V, False),
+                    (_VK_CONTROL, False),
+                ]
 
-                # 3a. BlockInput 凍結 user 輸入 → 原子 SendInput → 解凍
+                # BlockInput 凍結 user 輸入 → 兩段 SendInput → 解凍
                 user32 = ctypes.windll.user32
                 blocked = False
                 try:
@@ -890,15 +905,22 @@ class AbbrevEngine:
                 except Exception:
                     logging.debug("[abbrev] BlockInput 不可用", exc_info=True)
                 try:
-                    used_paste = _send_atomic_keystrokes(events)
+                    # 2a-1. 先送 backspace 刪除「縮寫 + 觸發空白」
+                    bs_ok = _send_atomic_keystrokes(bs_events)
+                    # 2a-2. 等目標 app 確實處理完刪除，再貼上
+                    time.sleep(self.POST_BACKSPACE_DELAY_SEC)
+                    # 2a-3. 送 Ctrl+V 貼上展開內容
+                    paste_ok = _send_atomic_keystrokes(paste_events)
+                    used_paste = bool(bs_ok and paste_ok)
                 finally:
                     if blocked:
                         try:
                             user32.BlockInput(False)
                         except Exception:
                             pass
-                # 4a. 等 OS dispatch + target app 處理 paste 完成
-                time.sleep(0.12)
+                # 4a. 等 target app 非同步讀剪貼簿 + 處理 paste 完成，
+                #     才在 finally 還原剪貼簿（太早還原會貼到舊內容）。
+                time.sleep(self.POST_PASTE_DELAY_SEC)
             else:
                 # 2b. fallback: 剪貼簿寫入失敗 → 用 keyboard.send/write 老路
                 logging.warning("[abbrev] 剪貼簿寫入失敗，fallback 用 keystroke")
