@@ -9339,13 +9339,6 @@ class AutomationApp:
                 logging.exception("[abbrev] 載入設定失敗，使用空 cfg")
                 cfg = AbbrevConfig()
             self._abbrev_config_cache = cfg
-        # 重灌 hook 前若 UI 已建好，重新註冊 state listener（uninstall 不清掉
-        # listener，但保險再 set 一次）
-        if hasattr(self, '_abbrev_on_engine_ime_state_change'):
-            try:
-                eng.set_state_listener(self._abbrev_on_engine_ime_state_change)
-            except Exception:
-                logging.debug("[abbrev] 註冊 state listener 失敗", exc_info=True)
         try:
             eng.install(cfg)
         except Exception:
@@ -9540,40 +9533,6 @@ class AutomationApp:
 
         abbrev_entry.focus_set()
 
-    def _abbrev_format_ime_state_text(self, chinese: bool) -> str:
-        return "🇨🇳 中文（不觸發）" if chinese else "🇬🇧 英文（可觸發）"
-
-    def _abbrev_toggle_ime_mode(self):
-        """使用者手動切換 IME 模式（萬一 Shift 追蹤偏掉時校正）。"""
-        eng = self._ensure_abbrev_engine()
-        if eng is None:
-            return
-        new_val = not eng.get_ime_chinese_mode()
-        eng.set_ime_chinese_mode(new_val)
-        self._abbrev_apply_ime_state_to_ui(new_val)
-
-    def _abbrev_apply_ime_state_to_ui(self, chinese: bool):
-        """同步 IME 模式狀態到 UI label / var（必須在 Tk main thread 執行）。"""
-        try:
-            if hasattr(self, 'abbrev_ime_chinese_var'):
-                if self.abbrev_ime_chinese_var.get() != chinese:
-                    self.abbrev_ime_chinese_var.set(chinese)
-            lbl = getattr(self, '_abbrev_ime_state_label', None)
-            if lbl is not None:
-                lbl.config(
-                    text=self._abbrev_format_ime_state_text(chinese),
-                    foreground="#C62828" if chinese else "#2E7D32",
-                )
-        except Exception:
-            logging.debug("[abbrev] 更新 IME state UI 失敗", exc_info=True)
-
-    def _abbrev_on_engine_ime_state_change(self, new_chinese: bool):
-        """engine 端 Shift-tap 偵測到模式變化 → 跨 thread 安全更新 UI。"""
-        try:
-            self.root.after(0, lambda v=new_chinese: self._abbrev_apply_ime_state_to_ui(v))
-        except Exception:
-            logging.debug("[abbrev] root.after 失敗", exc_info=True)
-
     def _abbrev_reset_defaults(self):
         if not messagebox.askyesno(
             "縮寫速寫",
@@ -9631,33 +9590,6 @@ class AutomationApp:
             variable=self.abbrev_trailing_space_var,
             command=self._abbrev_on_toggle,
         ).pack(side='left', padx=(18, 0))
-
-        # IME 中/英模式追蹤（注音 IME 用 Shift 切換時自動偵測）
-        row3 = ttk.Frame(ctrl_frame)
-        row3.pack(fill='x', padx=10, pady=(0, 6))
-        ttk.Label(row3, text="目前判定 IME 模式:",
-                  font=("Microsoft JhengHei UI", 9)).pack(side='left')
-        # 跟 engine 共用同一個 BooleanVar；True = 中文模式（不觸發）
-        eng = self._ensure_abbrev_engine()
-        initial_chinese = eng.get_ime_chinese_mode() if eng is not None else True
-        self.abbrev_ime_chinese_var = tk.BooleanVar(value=initial_chinese)
-        self._abbrev_ime_state_label = ttk.Label(
-            row3, text=self._abbrev_format_ime_state_text(initial_chinese),
-            font=("Microsoft JhengHei UI", 9, "bold"),
-            foreground="#C62828" if initial_chinese else "#2E7D32",
-        )
-        self._abbrev_ime_state_label.pack(side='left', padx=(6, 8))
-        ttk.Button(row3, text="手動切換",
-                   command=self._abbrev_toggle_ime_mode).pack(side='left')
-        ttk.Label(
-            row3,
-            text="（注音 IME 按 Shift 自動切；偵測偏掉時手動修正）",
-            foreground="gray", font=("Microsoft JhengHei UI", 9),
-        ).pack(side='left', padx=(8, 0))
-
-        # 註冊 engine 狀態變化 listener → 跨 thread 更新 UI label
-        if eng is not None:
-            eng.set_state_listener(self._abbrev_on_engine_ime_state_change)
 
         # 縮寫列表
         list_frame = ttk.LabelFrame(abbrev_tab, text="縮寫清單（雙擊可編輯）")
@@ -9725,8 +9657,8 @@ class AutomationApp:
             "\n"
             "  - 觸發方式：打縮寫後直接按「空白鍵」自動展開。\n"
             "  - 大小寫不敏感（DA / Da / dA / da 都可以）。\n"
-            "  - 注音 IME：本程式自動偵測「單按 Shift 切換」，當切到英文模式\n"
-            "    時才會觸發；中文模式自動暫停。若偵測偏掉請按上方「手動切換」。"
+            "  - 中文輸入法組字中會盡量自動暫停；若仍誤觸，可暫時取消上方\n"
+            "    「啟用縮寫速寫」即可。"
         )
         ttk.Label(hint_frame, text=hint_text, justify='left', foreground="#37474F",
                   font=("Consolas", 10)).pack(anchor='w', padx=10, pady=8)

@@ -293,8 +293,8 @@ def should_skip_for_input_method() -> bool:
       3. ImmGetConversionStatus：conversion mode 是否含 IME_CMODE_NATIVE
 
     新版 TSF-based IME（微軟新注音、Google 注音）對 1-3 不一定更新，所以
-    本函式只是「best-effort」。AbbrevEngine 另以 Shift-only-tap 追蹤
-    使用者手動切換的 IME 中/英狀態作為補充。
+    本函式只是「best-effort」；偵測不到時就讓它照常展開（寧可展開也不要把
+    整個功能卡死）。若中文模式仍誤觸，使用者可暫時取消「啟用縮寫速寫」。
 
     特意「不查鍵盤布局語言」：在中文布局 + 注音 IME 切到英文模式時，
     layout 仍是中文台灣，但 user 期望可觸發 — 不能用 layout 一刀切。
@@ -548,8 +548,6 @@ _RESET_KEY_NAMES = {
     "home", "end", "page up", "page down",
     "delete", "backspace",
 }
-# 注音 IME 用 Shift 切換中/英 模式；不同 keyboard 版本可能用不同 name
-_SHIFT_KEY_NAMES = {"shift", "left shift", "right shift"}
 
 
 class AbbrevEngine:
@@ -559,11 +557,12 @@ class AbbrevEngine:
     MAX_BACKSPACE = 64
 
     # 展開後的冷卻時間（s）— 期間 buffer 暫停累積，避免 user 連打第二組
-    # 縮寫時後續 keystroke 跟我們的 paste 競態。配合 BlockInput + 原子
-    # SendInput，0.55 秒已足夠涵蓋 paste 完成 + clipboard 還原。
+    # 縮寫時後續 keystroke 跟我們的 paste 競態。
     COOLDOWN_SEC = 0.55
-    # Shift-only-tap 判定上限（s）— 注音 IME 切換中/英模式的常見手勢
-    SHIFT_TAP_MAX_SEC = 0.7
+    # 送 backspace 前的延遲（s）— 確保「縮寫 + 觸發空白」已先抵達目標視窗。
+    # keyboard 模組 hook callback 同步跑在 hook thread，若不延遲就送 backspace，
+    # 觸發空白還沒被 dispatch → backspace 跑到空白前面 → 刪錯/沒刪到。
+    PRE_BACKSPACE_DELAY_SEC = 0.045
 
     def __init__(self, kb_module: Any) -> None:
         """kb_module = `keyboard` PyPI 套件物件（已 import 完成）。"""
@@ -575,27 +574,17 @@ class AbbrevEngine:
         self._max_abbrev_len: int = 0
         self._buffer: str = ""
         self._press_hook: Any = None
-        self._release_hook: Any = None
         self._suppressing = False
         # 展開後的冷卻截止時間（monotonic）
         self._cooldown_until: float = 0.0
-        # 注音 IME 中/英 模式追蹤（Shift-only-tap 偵測 → toggle）
-        # 預設 True（中文）— 注音 IME 開啟時通常是中文模式
-        self._ime_chinese_mode: bool = True
-        self._shift_down_ts: float = 0.0
-        self._other_key_since_shift: bool = False
-        # UI 端可註冊 listener 來同步顯示目前 IME 模式狀態
-        self._state_listener: Optional[Callable[[bool], None]] = None
 
     # ------------------------------------------------------------------ 公開 API
     def install(self, cfg: AbbrevConfig) -> None:
-        """套用設定並掛上 keyboard hook（press + release）。重複呼叫會先 uninstall 再裝。"""
+        """套用設定並掛上 keyboard hook。重複呼叫會先 uninstall 再裝。"""
         with self._lock:
             self._cfg = cfg
             self._rebuild_lookup_locked()
             self._buffer = ""
-            self._shift_down_ts = 0.0
-            self._other_key_since_shift = False
             self._uninstall_locked()
             if not cfg.enabled or not self._lookup:
                 logging.info("[abbrev] hook 未掛載（enabled=%s, items=%d）",
@@ -603,13 +592,11 @@ class AbbrevEngine:
                 return
             try:
                 self._press_hook = self._kb.on_press(self._on_press)
-                self._release_hook = self._kb.on_release(self._on_release)
                 logging.info("[abbrev] hook 已掛載，%d 筆縮寫（最長 %d 字）",
                              len(self._lookup), self._max_abbrev_len)
             except Exception:
                 logging.exception("[abbrev] keyboard hook 掛載失敗")
                 self._press_hook = None
-                self._release_hook = None
 
     def uninstall(self) -> None:
         with self._lock:
@@ -619,38 +606,15 @@ class AbbrevEngine:
         with self._lock:
             return self._press_hook is not None
 
-    def set_state_listener(self, callback: Optional[Callable[[bool], None]]) -> None:
-        """UI 註冊 listener 來收 IME 中/英模式變化（callback(new_chinese_mode)）。
-        Callback 會在 keyboard worker thread 跑，UI 端必須 root.after(0, ...)
-        切回 Tk main thread 才能更新 widget。
-        """
-        self._state_listener = callback
-
-    def get_ime_chinese_mode(self) -> bool:
-        return self._ime_chinese_mode
-
-    def set_ime_chinese_mode(self, value: bool) -> None:
-        """UI 端手動覆寫 IME 模式（萬一 Shift 追蹤偏掉）。"""
-        new_val = bool(value)
-        with self._lock:
-            if self._ime_chinese_mode == new_val:
-                return
-            self._ime_chinese_mode = new_val
-        logging.info("[abbrev] IME 模式（手動）→ %s",
-                     "中文" if new_val else "英文")
-        # 不呼叫 listener（防 UI ↔ engine 互呼）— UI 端 command 自己已知新值
-
     # ----------------------------------------------------------------- 內部工具
     def _uninstall_locked(self) -> None:
-        for attr in ("_press_hook", "_release_hook"):
-            h = getattr(self, attr, None)
-            if h is None:
-                continue
+        h = self._press_hook
+        if h is not None:
             try:
                 self._kb.unhook(h)
             except Exception:
-                logging.debug("[abbrev] unhook %s 失敗", attr, exc_info=True)
-            setattr(self, attr, None)
+                logging.debug("[abbrev] unhook 失敗", exc_info=True)
+            self._press_hook = None
 
     def _rebuild_lookup_locked(self) -> None:
         self._lookup = {}
@@ -673,45 +637,26 @@ class AbbrevEngine:
         except Exception:
             logging.exception("[abbrev] _on_press 處理失敗")
 
-    def _on_release(self, event: Any) -> None:
-        """keyboard 模組 on_release callback（主要為了偵測 Shift-only-tap）。"""
-        try:
-            self._handle_release(event)
-        except Exception:
-            logging.exception("[abbrev] _on_release 處理失敗")
-
     def _handle_event(self, event: Any) -> None:
         # 自己 send/write 期間，所有按鍵忽略
         if self._suppressing:
+            return
+
+        # cool-down 期間（展開剛完成）— 不更新 buffer、不觸發
+        if time.monotonic() < self._cooldown_until:
             return
 
         name = getattr(event, "name", None)
         if not name:
             return
 
-        # Shift 追蹤：press 時記時間戳，期間如有其他鍵就標記 → release 時不算 toggle。
-        # 注意：Shift 追蹤要在 cool-down 之前處理，讓 user 能在 cool-down 期間
-        # 預先切換 IME 模式準備下一個縮寫。
-        if name in _SHIFT_KEY_NAMES:
-            self._shift_down_ts = time.monotonic()
-            self._other_key_since_shift = False
-            return  # Shift 自己不進 buffer、不觸發
-        # 任何非 Shift 按鍵 → 取消 Shift-only-tap 候選
-        if self._shift_down_ts > 0:
-            self._other_key_since_shift = True
-
-        # cool-down 期間（展開剛完成）— 不更新 buffer、不觸發
-        if time.monotonic() < self._cooldown_until:
-            return
-
         # trigger 鍵（空白）：嘗試展開
         if name in _TRIGGER_KEY_NAMES:
-            trigger_char = " "
             buffer_snapshot = ""
             with self._lock:
                 buffer_snapshot = self._buffer
                 self._buffer = ""
-            self._try_expand(buffer_snapshot, trigger_char)
+            self._try_expand(buffer_snapshot, " ")
             return
 
         # 重置 buffer 的鍵
@@ -727,35 +672,8 @@ class AbbrevEngine:
                 self._buffer = (self._buffer + ch)[-self._max_abbrev_len:] if self._max_abbrev_len else ""
             return
 
-        # 其他特殊鍵（ctrl / alt / caps lock 等）—不影響 buffer
+        # 其他特殊鍵（shift / ctrl / alt / caps lock 等）—不影響 buffer
         return
-
-    def _handle_release(self, event: Any) -> None:
-        if self._suppressing:
-            return
-        name = getattr(event, "name", None)
-        if name not in _SHIFT_KEY_NAMES:
-            return
-        if self._shift_down_ts == 0.0:
-            return
-        duration = time.monotonic() - self._shift_down_ts
-        had_other = self._other_key_since_shift
-        self._shift_down_ts = 0.0
-        self._other_key_since_shift = False
-        if had_other or duration > self.SHIFT_TAP_MAX_SEC:
-            return  # 不算 Shift-only-tap
-        # Shift-only-tap → 切換 IME 假定模式
-        with self._lock:
-            self._ime_chinese_mode = not self._ime_chinese_mode
-            new_val = self._ime_chinese_mode
-        logging.info("[abbrev] Shift-only-tap 偵測 → IME 模式現為 %s",
-                     "中文" if new_val else "英文")
-        # 通知 UI（worker thread → UI 端必須自己切回 Tk main thread）
-        if self._state_listener is not None:
-            try:
-                self._state_listener(new_val)
-            except Exception:
-                logging.debug("[abbrev] state_listener 例外", exc_info=True)
 
     def _try_expand(self, buffer_snapshot: str, trigger_char: str) -> None:
         if not buffer_snapshot or not self._lookup:
@@ -771,17 +689,11 @@ class AbbrevEngine:
         if matched_key is None:
             return
 
-        # IME / 中文輸入狀態 → 跳過。檢查兩條路徑：
-        # 1. IMM API（傳統 IME；新 TSF IME 上不一定 work）
-        # 2. 我們自己追蹤的 Shift-tap 模式（注音切 中/英 用 Shift）
-        # 任一說「中文中」就 skip。
-        if self._cfg.skip_when_ime_active:
-            if should_skip_for_input_method():
-                logging.debug("[abbrev] IMM 顯示中文/組字中，跳過 '%s'", matched_key)
-                return
-            if self._ime_chinese_mode:
-                logging.debug("[abbrev] 假定 IME 中文模式（Shift 追蹤），跳過 '%s'", matched_key)
-                return
+        # IME 組字中 → 跳過（best-effort；新 TSF IME 上 IMM API 可能無效，
+        # 偵測不到時就照常展開 — 寧可展開也不要整個功能卡死）
+        if self._cfg.skip_when_ime_active and should_skip_for_input_method():
+            logging.debug("[abbrev] IMM 顯示組字中，跳過 '%s'", matched_key)
+            return
 
         raw_expansion = self._lookup[matched_key]
         try:
@@ -795,24 +707,38 @@ class AbbrevEngine:
 
         # 刪掉「縮寫 + 觸發字元」共 len(matched_key)+1 個字元
         delete_count = min(len(matched_key) + len(trigger_char), self.MAX_BACKSPACE)
-        self._do_replace(delete_count, rendered, matched_key)
+
+        # 立即進入 suppress + cool-down（同步，在 hook thread 內），這樣
+        # 後續按鍵會被忽略，避免重複觸發。
+        self._suppressing = True
+        self._cooldown_until = time.monotonic() + self.COOLDOWN_SEC
+
+        # 實際送鍵延後到獨立 thread：讓本 hook callback 先 return → keyboard
+        # 模組把「縮寫 + 觸發空白」完整 dispatch 到目標視窗後，我們再送 backspace。
+        # （hook callback 同步跑在 hook thread；若在這裡直接送 backspace，
+        #  觸發空白還沒到目標視窗 → 順序錯亂 → 沒刪到 / 刪錯字。）
+        worker = threading.Thread(
+            target=self._do_replace,
+            args=(delete_count, rendered, matched_key),
+            daemon=True,
+        )
+        worker.start()
 
     def _do_replace(self, backspace_count: int, text: str, abbrev_key: str) -> None:
-        """原子 SendInput：backspace × N + Ctrl+V 一次發送，期間 BlockInput
-        凍結 user 真實輸入避免 race。
+        """在獨立 thread 執行：先等「縮寫 + 觸發空白」抵達目標視窗，再原子
+        SendInput 送 backspace × N + Ctrl+V。期間 BlockInput 凍結 user
+        真實輸入避免 race（需 admin；非 admin 退而靠 cool-down）。
 
-        為何需要 BlockInput：keyboard 模組 callback 在 worker thread 跑，
-        user 連打下個縮寫的字元會在我們 SendInput 之前到達 focused window，
-        造成「d00:27 」這種少刪 1-2 個 char 的 race condition。
-        BlockInput 需要 admin 權限；非 admin 環境下退而只靠 cool-down。
+        _suppressing 與 cool-down 已在呼叫端 (_try_expand) 同步設好。
         """
         kb = self._kb
         if kb is None:
+            self._suppressing = False
             return
 
-        self._suppressing = True
-        # 進入「冷卻期」— 這段時間 buffer 暫停累積，避免 user 連打污染。
-        self._cooldown_until = time.monotonic() + self.COOLDOWN_SEC
+        # 關鍵：等 hook callback 已 return、keyboard 模組把觸發空白 dispatch
+        # 到目標視窗之後，再送 backspace。否則 backspace 會跑到空白前面。
+        time.sleep(self.PRE_BACKSPACE_DELAY_SEC)
 
         old_clip: Optional[str] = None
         used_paste = False
