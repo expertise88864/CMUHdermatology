@@ -277,29 +277,60 @@ def render_expansion(template: str, now: Optional[datetime] = None) -> str:
 
 
 # -----------------------------------------------------------------------------
-# IME 偵測 — 多重檢查（新版注音/微軟 IME 不一定回 ImmGetOpenStatus）
+# IME 偵測 — conversion mode (NATIVE flag) 為主，OpenStatus 僅 fallback
 # -----------------------------------------------------------------------------
 # Win32 conversion mode flags
 _IME_CMODE_NATIVE = 0x0001    # 中文/日文/韓文模式（false = 英文模式）
 _GCS_COMPSTR = 0x0008         # composition string
 
+_IMM_CONFIGURED = False
+
+
+def _ensure_imm_configured() -> None:
+    """設定 imm32 函式 argtypes/restype — 64-bit 上 HANDLE 不設會被截斷成
+    32-bit int，ImmGetContext 回的 himc 失效 → 所有 IME 檢查失準。"""
+    global _IMM_CONFIGURED
+    if _IMM_CONFIGURED:
+        return
+    try:
+        imm = ctypes.windll.imm32
+        imm.ImmGetContext.argtypes = [wintypes.HWND]
+        imm.ImmGetContext.restype = wintypes.HANDLE
+        imm.ImmReleaseContext.argtypes = [wintypes.HWND, wintypes.HANDLE]
+        imm.ImmReleaseContext.restype = wintypes.BOOL
+        imm.ImmGetOpenStatus.argtypes = [wintypes.HANDLE]
+        imm.ImmGetOpenStatus.restype = wintypes.BOOL
+        imm.ImmGetConversionStatus.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        imm.ImmGetConversionStatus.restype = wintypes.BOOL
+        imm.ImmGetCompositionStringW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+        ]
+        imm.ImmGetCompositionStringW.restype = wintypes.LONG
+        _IMM_CONFIGURED = True
+    except Exception:
+        logging.debug("[abbrev] IMM signatures 設定失敗", exc_info=True)
+
 
 def should_skip_for_input_method() -> bool:
-    """前景視窗目前是 IME 組字 / 中文模式 → 回 True。Best-effort 而已。
+    """前景視窗正在「中文輸入」→ 回 True (跳過展開)。Best-effort。
 
-    三重 IMM 檢查（任一成立就視為中文輸入中）：
-      1. ImmGetOpenStatus：IME 開啟旗標（舊 IMM IME 可靠）
-      2. ImmGetCompositionString：是否有 composition string in progress
-      3. ImmGetConversionStatus：conversion mode 是否含 IME_CMODE_NATIVE
+    [v6 2026-05-28] 重點修正「英文模式被誤擋」bug：
+      注音/微軟 IME 即使切到英文模式，ImmGetOpenStatus 仍回 True (IME 仍開啟)。
+      舊版第一個就 check OpenStatus → return True → 英文模式也被擋 → 縮寫
+      永遠無法觸發。改成以 conversion mode 的 NATIVE flag 為準：
+        1. 正在組字 (composition string) → 一定跳過 (打到一半)
+        2. conversion mode 可讀 → 只在 NATIVE(中文模式) 才跳；英文模式允許展開
+        3. conversion mode 不可讀 (舊 IMM IME) → fallback 看 OpenStatus
 
-    新版 TSF-based IME（微軟新注音、Google 注音）對 1-3 不一定更新，所以
-    本函式只是「best-effort」；偵測不到時就讓它照常展開（寧可展開也不要把
-    整個功能卡死）。若中文模式仍誤觸，使用者可暫時取消「啟用縮寫速寫」。
-
-    特意「不查鍵盤布局語言」：在中文布局 + 注音 IME 切到英文模式時，
-    layout 仍是中文台灣，但 user 期望可觸發 — 不能用 layout 一刀切。
+    特意「不查鍵盤布局語言」：中文布局 + 注音切英文模式時 layout 仍是中文
+    台灣，但 user 期望可觸發 — 不能用 layout 一刀切。
     """
     try:
+        _ensure_imm_configured()
         user32 = ctypes.windll.user32
         imm32 = ctypes.windll.imm32
         hwnd = user32.GetForegroundWindow()
@@ -309,26 +340,31 @@ def should_skip_for_input_method() -> bool:
         if not himc:
             return False
         try:
+            # 1. 正在組字 → 一定跳過 (打到一半的注音/拼音)
             try:
-                if imm32.ImmGetOpenStatus(himc):
-                    return True
-            except Exception:
-                pass
-            try:
-                size = imm32.ImmGetCompositionStringW(himc, _GCS_COMPSTR, None, 0)
+                size = imm32.ImmGetCompositionStringW(
+                    himc, _GCS_COMPSTR, None, 0)
                 if isinstance(size, int) and size > 0:
                     return True
             except Exception:
                 pass
+            # 2. conversion mode：用 NATIVE flag 判斷中/英 (authoritative)
             try:
-                conversion = ctypes.c_uint(0)
-                sentence = ctypes.c_uint(0)
+                conversion = wintypes.DWORD(0)
+                sentence = wintypes.DWORD(0)
                 ok = imm32.ImmGetConversionStatus(
                     himc,
                     ctypes.byref(conversion),
                     ctypes.byref(sentence),
                 )
-                if ok and (conversion.value & _IME_CMODE_NATIVE):
+                if ok:
+                    # 中文模式 → 跳過；英文模式 (NATIVE off) → 允許展開
+                    return bool(conversion.value & _IME_CMODE_NATIVE)
+            except Exception:
+                pass
+            # 3. conversion 不可讀 → fallback OpenStatus (舊 IMM IME)
+            try:
+                if imm32.ImmGetOpenStatus(himc):
                     return True
             except Exception:
                 pass
@@ -343,6 +379,83 @@ def should_skip_for_input_method() -> bool:
 # 舊名稱相容（外部不應再用，但保留 import 不爆）
 def is_ime_active_for_foreground() -> bool:
     return should_skip_for_input_method()
+
+
+# -----------------------------------------------------------------------------
+# 外部文字展開程式偵測 (PhraseExpress 等) — 避免雙重展開衝突
+# -----------------------------------------------------------------------------
+# 已知的文字展開 / 巨集程式 exe 名稱 (小寫)。執行中就暫停本程式縮寫。
+_KNOWN_EXPANDER_EXES: frozenset = frozenset({
+    "phraseexpress.exe",       # PhraseExpress
+    "breevy.exe",              # Breevy
+    "textexpander.exe",        # TextExpander
+    "beeftext.exe",            # Beeftext
+    "espanso.exe",             # espanso
+    "espansod.exe",            # espanso daemon
+    "atext.exe",               # aText
+    "fastkeys.exe",            # FastKeys
+    "activewords.exe",         # ActiveWords
+    "phrase express.exe",      # 舊版 PhraseExpress 帶空格
+    "autohotkey.exe",          # AutoHotkey (常被用來做文字展開)
+    "autohotkeyu64.exe",
+    "autohotkeyu32.exe",
+    "autohotkey64.exe",
+    "autohotkey32.exe",
+})
+
+
+def _list_process_names() -> set:
+    """列出目前執行中所有 process 的 exe 名稱 (小寫)。psutil 優先，
+    fallback tasklist (帶 CREATE_NO_WINDOW 不閃黑框)。"""
+    # 1. psutil (快、不開子程序)
+    try:
+        import psutil  # type: ignore
+        names = set()
+        for p in psutil.process_iter(['name']):
+            try:
+                nm = (p.info.get('name') or '').lower()
+            except Exception:
+                nm = ''
+            if nm:
+                names.add(nm)
+        if names:
+            return names
+    except Exception:
+        pass
+    # 2. fallback: tasklist CSV
+    try:
+        import subprocess
+        CREATE_NO_WINDOW = 0x08000000
+        out = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        names = set()
+        for line in (out.stdout or "").splitlines():
+            line = line.strip()
+            if line.startswith('"'):
+                # CSV: "image.exe","pid","session",...
+                name = line.split('","', 1)[0].strip('"').lower()
+                if name:
+                    names.add(name)
+        return names
+    except Exception:
+        logging.debug("[abbrev] tasklist 取得 process 失敗", exc_info=True)
+        return set()
+
+
+def detect_external_expander() -> Optional[str]:
+    """偵測是否有已知文字展開程式 (PhraseExpress 等) 執行中。
+    回傳第一個命中的 exe 名稱 (小寫)，否則 None。"""
+    try:
+        names = _list_process_names()
+    except Exception:
+        return None
+    for exe in _KNOWN_EXPANDER_EXES:
+        if exe in names:
+            return exe
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -577,6 +690,8 @@ class AbbrevEngine:
         self._suppressing = False
         # 展開後的冷卻截止時間（monotonic）
         self._cooldown_until: float = 0.0
+        # [v6] 偵測到的外部文字展開程式名稱 (None=沒有)；有的話暫停本程式縮寫
+        self._external_expander: Optional[str] = None
 
     # ------------------------------------------------------------------ 公開 API
     def install(self, cfg: AbbrevConfig) -> None:
@@ -589,6 +704,14 @@ class AbbrevEngine:
             if not cfg.enabled or not self._lookup:
                 logging.info("[abbrev] hook 未掛載（enabled=%s, items=%d）",
                              cfg.enabled, len(self._lookup))
+                return
+            # [v6] 偵測外部文字展開程式 (PhraseExpress 等) → 暫停避免雙重展開
+            ext = detect_external_expander()
+            self._external_expander = ext
+            if ext:
+                logging.warning(
+                    "[abbrev] 偵測到外部文字展開程式 '%s' 執行中 → "
+                    "暫停本程式縮寫避免衝突 (關閉該程式後會自動恢復)", ext)
                 return
             try:
                 self._press_hook = self._kb.on_press(self._on_press)

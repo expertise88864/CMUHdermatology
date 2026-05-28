@@ -9324,7 +9324,51 @@ class AutomationApp:
         if eng is None:
             eng = AbbrevEngine(hotkey_modules.keyboard)
             self.abbrev_engine = eng
+            # [v6] 啟動週期監看：外部文字展開程式 (PhraseExpress 等) 出現/消失
+            # 時自動暫停/恢復本程式縮寫
+            if not getattr(self, '_abbrev_monitor_started', False):
+                self._abbrev_monitor_started = True
+                try:
+                    self.root.after(20000, self._abbrev_monitor_external)
+                except Exception:
+                    logging.debug("[abbrev] 啟動 external monitor 失敗",
+                                  exc_info=True)
         return eng
+
+    def _abbrev_monitor_external(self):
+        """[v6] 週期檢查外部文字展開程式 (PhraseExpress 等)。
+        狀態改變 (出現/消失) → 重新 install (install 內部會依偵測結果決定
+        掛 hook 或暫停)，避免雙重展開衝突。每 ~20s 跑一次。
+        """
+        try:
+            eng = getattr(self, 'abbrev_engine', None)
+            cfg = getattr(self, '_abbrev_config_cache', None)
+            if (eng is not None and cfg is not None and cfg.enabled
+                    and not getattr(self, '_shutting_down', False)):
+                from cmuh_common.abbrev_engine import detect_external_expander
+                ext = detect_external_expander()
+                last = getattr(self, '_abbrev_last_external', None)
+                if ext != last:
+                    self._abbrev_last_external = ext
+                    # 狀態改變 → 重 install (install 偵測 ext 決定掛/不掛)
+                    self._install_abbrev_listeners()
+                    if ext:
+                        logging.warning(
+                            "[abbrev] 外部展開程式 '%s' 出現 → 暫停本程式縮寫",
+                            ext)
+                    else:
+                        logging.info(
+                            "[abbrev] 外部展開程式已關閉 → 恢復本程式縮寫")
+        except Exception:
+            logging.debug("[abbrev] external monitor 例外", exc_info=True)
+        finally:
+            # reschedule (即使這次例外也要繼續監看)
+            if not getattr(self, '_shutting_down', False):
+                try:
+                    self.root.after(20000, self._abbrev_monitor_external)
+                except Exception:
+                    logging.debug("[abbrev] reschedule monitor 失敗",
+                                  exc_info=True)
 
     def _install_abbrev_listeners(self):
         """依目前 cfg 掛上 hook。keyboard 未就緒會自動 noop。"""
