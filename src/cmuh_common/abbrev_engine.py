@@ -686,6 +686,9 @@ class AbbrevEngine:
     # [v7] Ctrl+V 送完到「還原剪貼簿」之間的延遲（s）— 目標 app 是非同步
     # 讀剪貼簿，太早還原會貼到舊內容（展開錯字）。0.12 → 0.30。
     POST_PASTE_DELAY_SEC = 0.30
+    # [v8] 外部文字展開程式（PhraseExpress 等）輪詢間隔（s）。雙向：
+    # 偵測到 → 暫停 hook；偵測到關閉 → 自動恢復 hook。
+    EXPANDER_POLL_SEC = 30.0
 
     def __init__(self, kb_module: Any) -> None:
         """kb_module = `keyboard` PyPI 套件物件（已 import 完成）。"""
@@ -702,10 +705,16 @@ class AbbrevEngine:
         self._cooldown_until: float = 0.0
         # [v6] 偵測到的外部文字展開程式名稱 (None=沒有)；有的話暫停本程式縮寫
         self._external_expander: Optional[str] = None
+        # [v8] 外部展開程式輪詢 timer（每 EXPANDER_POLL_SEC 秒重評估一次）
+        self._expander_timer: Optional[threading.Timer] = None
 
     # ------------------------------------------------------------------ 公開 API
     def install(self, cfg: AbbrevConfig) -> None:
-        """套用設定並掛上 keyboard hook。重複呼叫會先 uninstall 再裝。"""
+        """套用設定並掛上 keyboard hook。重複呼叫會先 uninstall 再裝。
+
+        [v8] 外部展開程式（PhraseExpress 等）改為「持續輪詢」：install 時先
+        評估一次，之後每 EXPANDER_POLL_SEC 秒重評估，雙向自動暫停/恢復。
+        """
         with self._lock:
             self._cfg = cfg
             self._rebuild_lookup_locked()
@@ -715,21 +724,9 @@ class AbbrevEngine:
                 logging.info("[abbrev] hook 未掛載（enabled=%s, items=%d）",
                              cfg.enabled, len(self._lookup))
                 return
-            # [v6] 偵測外部文字展開程式 (PhraseExpress 等) → 暫停避免雙重展開
-            ext = detect_external_expander()
-            self._external_expander = ext
-            if ext:
-                logging.warning(
-                    "[abbrev] 偵測到外部文字展開程式 '%s' 執行中 → "
-                    "暫停本程式縮寫避免衝突 (關閉該程式後會自動恢復)", ext)
-                return
-            try:
-                self._press_hook = self._kb.on_press(self._on_press)
-                logging.info("[abbrev] hook 已掛載，%d 筆縮寫（最長 %d 字）",
-                             len(self._lookup), self._max_abbrev_len)
-            except Exception:
-                logging.exception("[abbrev] keyboard hook 掛載失敗")
-                self._press_hook = None
+            # 依外部展開程式狀態決定要 hook 還是暫停，並啟動持續輪詢
+            self._apply_hook_state_locked(initial=True)
+            self._schedule_expander_poll_locked()
 
     def uninstall(self) -> None:
         with self._lock:
@@ -740,7 +737,78 @@ class AbbrevEngine:
             return self._press_hook is not None
 
     # ----------------------------------------------------------------- 內部工具
+    def _apply_hook_state_locked(self, initial: bool = False) -> None:
+        """依「外部展開程式是否執行中」決定 hook / 暫停。須在持有 self._lock 時呼叫。
+        - 偵測到外部展開程式 → 確保未 hook（暫停，避免雙重展開）
+        - 沒有外部展開程式 → 確保已 hook
+        """
+        ext = detect_external_expander()
+        prev = self._external_expander
+        self._external_expander = ext
+
+        if ext:
+            if self._press_hook is not None:
+                # 原本有 hook，現在偵測到外部程式 → 暫停
+                try:
+                    self._kb.unhook(self._press_hook)
+                except Exception:
+                    logging.debug("[abbrev] 暫停 unhook 失敗", exc_info=True)
+                self._press_hook = None
+            if initial or prev != ext:
+                logging.warning(
+                    "[abbrev] 偵測到外部文字展開程式 '%s' 執行中 → 暫停本程式縮寫"
+                    "避免衝突（關閉該程式後約 %.0f 秒內自動恢復）",
+                    ext, self.EXPANDER_POLL_SEC)
+            return
+
+        # 沒有外部展開程式 → 確保 hook 上
+        if self._press_hook is None:
+            try:
+                self._press_hook = self._kb.on_press(self._on_press)
+                if initial:
+                    logging.info("[abbrev] hook 已掛載，%d 筆縮寫（最長 %d 字）",
+                                 len(self._lookup), self._max_abbrev_len)
+                else:
+                    logging.info("[abbrev] 外部展開程式已關閉 → 自動恢復縮寫 hook")
+            except Exception:
+                logging.exception("[abbrev] keyboard hook 掛載失敗")
+                self._press_hook = None
+
+    def _schedule_expander_poll_locked(self) -> None:
+        """排程下一次外部展開程式輪詢。須在持有 self._lock 時呼叫。"""
+        if self._expander_timer is not None:
+            try:
+                self._expander_timer.cancel()
+            except Exception:
+                pass
+            self._expander_timer = None
+        if not self._cfg.enabled or not self._lookup:
+            return
+        t = threading.Timer(self.EXPANDER_POLL_SEC, self._expander_poll)
+        t.daemon = True
+        self._expander_timer = t
+        t.start()
+
+    def _expander_poll(self) -> None:
+        """Timer callback：重評估外部展開程式狀態並重排下一次輪詢。"""
+        with self._lock:
+            if not self._cfg.enabled or not self._lookup:
+                self._expander_timer = None
+                return
+            try:
+                self._apply_hook_state_locked(initial=False)
+            except Exception:
+                logging.exception("[abbrev] expander poll 重評估失敗")
+            self._schedule_expander_poll_locked()
+
     def _uninstall_locked(self) -> None:
+        # 先取消外部展開程式輪詢 timer
+        if self._expander_timer is not None:
+            try:
+                self._expander_timer.cancel()
+            except Exception:
+                pass
+            self._expander_timer = None
         h = self._press_hook
         if h is not None:
             try:

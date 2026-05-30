@@ -213,3 +213,54 @@ def test_replace_timing_constants_ordered():
              + AbbrevEngine.POST_BACKSPACE_DELAY_SEC
              + AbbrevEngine.POST_PASTE_DELAY_SEC)
     assert AbbrevEngine.COOLDOWN_SEC >= total
+
+
+# ─── [v8] 外部展開程式持續輪詢：雙向自動暫停/恢復 ─────────────────────────
+
+def test_expander_poll_pauses_when_appears(monkeypatch):
+    """install 後外部程式才出現 → 輪詢應自動暫停 (unhook)。"""
+    # 1. 一開始沒有外部程式 → hook 上
+    monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
+    eng = _make_engine()
+    cfg = AbbrevConfig(enabled=True,
+                       items=[{"abbrev": "da", "expansion": "test"}])
+    eng.install(cfg)
+    assert eng.is_installed() is True
+    # 2. 外部程式出現 → 手動觸發一次輪詢評估 (不等真實 timer)
+    monkeypatch.setattr(ae, "_list_process_names",
+                        lambda: {"phraseexpress.exe"})
+    eng._expander_poll()
+    assert eng.is_installed() is False
+    assert eng._external_expander == "phraseexpress.exe"
+    eng.uninstall()  # 取消重排的 timer
+
+
+def test_expander_poll_resumes_when_disappears(monkeypatch):
+    """外部程式關閉 → 輪詢應自動恢復 (re-hook)，不需手動重 install。"""
+    # 1. 一開始有外部程式 → 暫停
+    monkeypatch.setattr(ae, "_list_process_names",
+                        lambda: {"phraseexpress.exe"})
+    eng = _make_engine()
+    cfg = AbbrevConfig(enabled=True,
+                       items=[{"abbrev": "da", "expansion": "test"}])
+    eng.install(cfg)
+    assert eng.is_installed() is False
+    # 2. 外部程式消失 → 輪詢自動恢復
+    monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
+    eng._expander_poll()
+    assert eng.is_installed() is True
+    assert eng._external_expander is None
+    eng.uninstall()
+
+
+def test_uninstall_cancels_expander_timer(monkeypatch):
+    """uninstall 後 timer 應被取消 (不殘留背景輪詢)。"""
+    monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
+    eng = _make_engine()
+    cfg = AbbrevConfig(enabled=True,
+                       items=[{"abbrev": "da", "expansion": "test"}])
+    eng.install(cfg)
+    assert eng._expander_timer is not None
+    eng.uninstall()
+    assert eng._expander_timer is None
+    assert eng.is_installed() is False
