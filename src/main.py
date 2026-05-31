@@ -5822,6 +5822,7 @@ class AutomationApp:
         self._heavy_modules_loading = False
         self._settings_promo_loaded = False
         self._settings_promo_loading = False
+        self._clock_status_worker_running = False
         self._clinic_duplicate_rooms_notice = ()
         self._clinic_lights_worker_running = False
         self._future_tab_grid_stale = True  # 未來週次分頁需在資料更新後重繪；切回時若未過期可跳過以減少卡頓
@@ -7871,7 +7872,12 @@ class AutomationApp:
         rooms_to_check = []
         for i in range(2):
             code = self.clinic_room_vars[i].get().strip()
-            rooms_to_check.append(code)
+            mode = (
+                self.clinic_display_mode_vars[i].get()
+                if hasattr(self, "clinic_display_mode_vars") and i < len(self.clinic_display_mode_vars)
+                else "auto"
+            )
+            rooms_to_check.append((code, mode))
 
         def run_update(rooms):
             source_timing = {"cache_hit_html": 0, "cache_hit_parse": 0, "cache_hit_reg64": 0, "backoff_skip": 0}
@@ -7888,14 +7894,10 @@ class AutomationApp:
             specs = []
             seen_spec_keys = set()
             duplicate_specs = set()
-            for i, room_code in enumerate(rooms):
+            for i, (room_code, configured_mode) in enumerate(rooms):
                 if not room_code:
                     continue
-                mode = (
-                    self.clinic_display_mode_vars[i].get()
-                    if hasattr(self, "clinic_display_mode_vars") and i < len(self.clinic_display_mode_vars)
-                    else "auto"
-                )
+                mode = configured_mode
                 if reg64_segment_just_changed:
                     mode = "auto"
                 tc_effective = resolve_clinic_reg64_time_code(mode, now)
@@ -8736,7 +8738,24 @@ class AutomationApp:
         self.url_output_var.set("") # 清空舊結果
         
         # 使用既有執行緒池避免額外 thread 開銷
-        self.bg_executor.submit(self._run_url_shortener, long_url)
+        shorten_future = self.bg_executor.submit(self._run_url_shortener, long_url)
+
+        def _handle_shorten_submit_rejected(fut):
+            try:
+                rejected = fut.cancelled() or isinstance(fut.exception(), RejectedExecutionError)
+            except Exception:
+                rejected = False
+            if not rejected or getattr(self, '_shutting_down', False):
+                return
+            logging.warning("縮網址背景工作未啟動：背景佇列已滿")
+
+            def _reset_shorten_ui():
+                self.shorten_btn.config(state="normal")
+                self.url_status_label.config(text="背景忙碌，請稍後再試", foreground="red")
+
+            self._run_on_ui_thread(_reset_shorten_ui)
+
+        shorten_future.add_done_callback(_handle_shorten_submit_rejected)
 
     def _run_url_shortener(self, long_url):
         try:
@@ -9819,7 +9838,26 @@ class AutomationApp:
         self._settings_promo_loading = True
         if hasattr(self, 'promo_placeholder_label'):
             self.promo_placeholder_label.config(text="圖片載入中...")
-        self.bg_executor.submit(self._load_settings_promo_image)
+        promo_future = self.bg_executor.submit(self._load_settings_promo_image)
+
+        def _handle_promo_submit_rejected(fut):
+            try:
+                rejected = fut.cancelled() or isinstance(fut.exception(), RejectedExecutionError)
+            except Exception:
+                rejected = False
+            if not rejected or getattr(self, '_shutting_down', False):
+                return
+            logging.warning("設定頁圖片背景載入未啟動：背景佇列已滿")
+
+            def _reset_promo_loading():
+                self._settings_promo_loading = False
+                if hasattr(self, 'promo_placeholder_label'):
+                    self.promo_placeholder_label.config(text="圖片稍後重試")
+                self.root.after(5000, self.ensure_settings_promo_loaded)
+
+            self._run_on_ui_thread(_reset_promo_loading)
+
+        promo_future.add_done_callback(_handle_promo_submit_rejected)
 
     def _load_settings_promo_image(self):
         try:
@@ -10542,6 +10580,9 @@ class AutomationApp:
             logging.info("院外模式開啟中，跳過打卡狀態查詢 (需內網)")
             put_ui_message(self.ui_queue, UiClockStatusMessage(status_data={'error': '院外模式停用'}))
             return
+        if self._clock_status_worker_running:
+            logging.info("打卡狀態上一輪仍在查詢，略過重複請求")
+            return
 
         put_ui_message(self.ui_queue, UiClockStatusMessage(status_data='querying'))
 
@@ -10592,10 +10633,29 @@ class AutomationApp:
         logging.info(f"Starting background clock status check for {username}...")
 
         def run_check():
-            status_result = _get_swipe_status_from_web(username, password)
-            put_ui_message(self.ui_queue, UiClockStatusMessage(status_data=status_result))
+            try:
+                status_result = _get_swipe_status_from_web(username, password)
+                put_ui_message(self.ui_queue, UiClockStatusMessage(status_data=status_result))
+            except Exception:
+                logging.exception("打卡狀態背景查詢失敗")
+                put_ui_message(self.ui_queue, UiClockStatusMessage(status_data={'error': '查詢失敗'}))
+            finally:
+                self._clock_status_worker_running = False
 
-        self.bg_executor.submit(run_check)
+        self._clock_status_worker_running = True
+        clock_future = self.bg_executor.submit(run_check)
+
+        def _handle_clock_submit_rejected(fut):
+            try:
+                rejected = fut.cancelled() or isinstance(fut.exception(), RejectedExecutionError)
+            except Exception:
+                rejected = False
+            if rejected:
+                self._clock_status_worker_running = False
+                logging.warning("打卡狀態背景查詢未啟動：背景佇列已滿")
+                put_ui_message(self.ui_queue, UiClockStatusMessage(status_data={'error': '背景忙碌'}))
+
+        clock_future.add_done_callback(_handle_clock_submit_rejected)
 
     # --- [修正] 更新打卡狀態 UI (加入型別檢查) ---
     def _update_clock_status_ui(self, status_data):

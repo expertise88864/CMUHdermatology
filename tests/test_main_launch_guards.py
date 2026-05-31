@@ -264,6 +264,26 @@ def test_clinic_worker_submit_rejection_clears_running_flag():
         assert "self._clinic_lights_worker_running = False" in src
 
 
+def test_refresh_entrypoint_reroutes_to_tk_thread():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "_trigger_refresh")
+
+        assert "threading.current_thread() is not threading.main_thread()" in src
+        assert "queued_doctors = list(specific_doctors) if specific_doctors is not None else None" in src
+        assert "self.root.after(0, lambda: self._trigger_refresh(" in src
+
+
+def test_clinic_polling_snapshots_tk_modes_before_background_work():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "_update_clinic_lights_loop")
+        mode_read = "self.clinic_display_mode_vars[i].get()"
+
+        assert src.count(mode_read) == 1
+        assert src.index(mode_read) < src.index("def run_update(rooms):")
+        assert "for i, (room_code, configured_mode) in enumerate(rooms):" in src
+        assert "mode = configured_mode" in src
+
+
 def test_scheduled_background_submits_detect_rejected_futures():
     for rel_path in ("src/main.py", "src/scheduler.py"):
         src = _function_source(ROOT / rel_path, "start_background_tasks")
@@ -301,6 +321,43 @@ def test_hotkey_module_loader_recovers_from_rejected_submit():
         assert "self._heavy_modules_loading = False" in loader_src
         assert "self.root.after(5000, self._start_hotkey_module_loading)" in loader_src
         assert "self._start_hotkey_module_loading()" in deferred_src
+
+
+def test_url_shortener_recovers_from_rejected_submit():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "_start_shorten_url")
+
+        assert "shorten_future = self.bg_executor.submit(self._run_url_shortener, long_url)" in src
+        assert "shorten_future.add_done_callback(_handle_shorten_submit_rejected)" in src
+        assert "RejectedExecutionError" in src
+        assert 'self.shorten_btn.config(state="normal")' in src
+        assert "self._run_on_ui_thread(_reset_shorten_ui)" in src
+
+
+def test_settings_promo_recovers_from_rejected_submit():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "ensure_settings_promo_loaded")
+
+        assert "promo_future = self.bg_executor.submit(self._load_settings_promo_image)" in src
+        assert "promo_future.add_done_callback(_handle_promo_submit_rejected)" in src
+        assert "RejectedExecutionError" in src
+        assert "self._settings_promo_loading = False" in src
+        assert "self.root.after(5000, self.ensure_settings_promo_loaded)" in src
+
+
+def test_clock_status_query_is_single_flight_and_recovers_from_rejection():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        full_src = (ROOT / rel_path).read_text(encoding="utf-8")
+        src = _function_source(ROOT / rel_path, "update_clock_status_from_web")
+
+        assert "self._clock_status_worker_running = False" in full_src
+        assert "if self._clock_status_worker_running:" in src
+        assert "self._clock_status_worker_running = True" in src
+        assert "clock_future = self.bg_executor.submit(run_check)" in src
+        assert "clock_future.add_done_callback(_handle_clock_submit_rejected)" in src
+        assert "RejectedExecutionError" in src
+        assert src.count("self._clock_status_worker_running = False") >= 2
+        assert "UiClockStatusMessage(status_data={'error': '背景忙碌'})" in src
 
 
 def test_permanent_background_loops_do_not_consume_executor_workers():
