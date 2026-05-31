@@ -360,6 +360,35 @@ def test_clock_status_query_is_single_flight_and_recovers_from_rejection():
         assert "UiClockStatusMessage(status_data={'error': '背景忙碌'})" in src
 
 
+def test_startup_background_submits_retry_when_queue_is_full():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "start_background_tasks")
+
+        assert "def _submit_startup_background(task_name, fn, *args, attempt=1):" in src
+        assert "isinstance(fut.exception(), RejectedExecutionError)" in src
+        assert "if attempt >= 3:" in src
+        assert "attempt=attempt + 1" in src
+        assert "future.add_done_callback(_retry_if_rejected)" in src
+        assert '"master-schedule"' in src
+        assert '"duty-info"' in src
+
+
+def test_startup_refresh_avoids_unnecessary_executor_hop():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "_startup_priority_refresh")
+
+        assert "self._trigger_refresh(False" in src
+        assert "self.bg_executor.submit(self._trigger_refresh" not in src
+
+
+def test_chained_startup_refresh_avoids_unnecessary_executor_hop():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "_trigger_refresh")
+
+        assert "self._trigger_refresh(False)" in src
+        assert "self.bg_executor.submit(self._trigger_refresh, False)" not in src
+
+
 def test_permanent_background_loops_do_not_consume_executor_workers():
     for rel_path in ("src/main.py", "src/scheduler.py"):
         start_src = _function_source(ROOT / rel_path, "start_background_tasks")

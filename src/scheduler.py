@@ -5104,7 +5104,7 @@ class AutomationApp:
                         self._trigger_refresh(qr[0], qr[1])
                     elif chain_startup_full:
                         self._startup_defer_full_until_priority_done = False
-                        self.bg_executor.submit(self._trigger_refresh, False)
+                        self._trigger_refresh(False)
 
                 self.root.after(0, _on_refresh_worker_done)
 
@@ -6610,14 +6610,37 @@ class AutomationApp:
         logging.info("Starting background tasks loop via ThreadPoolExecutor...")
         self.startup_phase_text.set("任務排程")
 
-        # [核心修正] 統一派發至 ThreadPoolExecutor 避免 Thread Leak
-        self.bg_executor.submit(self.check_and_update, False)
+        def _submit_startup_background(task_name, fn, *args, attempt=1):
+            future = self.bg_executor.submit(fn, *args)
 
-        def safe_fetch_duty(target_func, *args):
-            if not self.val_out_of_hospital:
-                target_func(*args)
-            else:
-                logging.info(f"院外模式開啟中，跳過 {target_func.__name__}")
+            def _retry_if_rejected(fut):
+                try:
+                    rejected = fut.cancelled() or isinstance(fut.exception(), RejectedExecutionError)
+                except Exception:
+                    rejected = False
+                if not rejected or getattr(self, '_shutting_down', False):
+                    return
+                if attempt >= 3:
+                    logging.error("[STARTUP] %s 放棄：背景佇列持續滿載", task_name)
+                    return
+                logging.warning("[STARTUP] %s 延後重試 (%d/3)：背景佇列已滿", task_name, attempt + 1)
+                self._run_on_ui_thread(
+                    lambda: self.root.after(
+                        2000,
+                        lambda: _submit_startup_background(
+                            task_name,
+                            fn,
+                            *args,
+                            attempt=attempt + 1,
+                        ),
+                    )
+                )
+
+            future.add_done_callback(_retry_if_rejected)
+            return future
+
+        # [核心修正] 統一派發至 ThreadPoolExecutor 避免 Thread Leak
+        _submit_startup_background("update-check", self.check_and_update, False)
 
         def _startup_priority_refresh():
             if self._initial_priority_refresh_done:
@@ -6628,17 +6651,19 @@ class AutomationApp:
             if pri_docs:
                 logging.info(f"[STARTUP] priority refresh doctors={len(pri_docs)}")
                 self._startup_defer_full_until_priority_done = True
-                self.bg_executor.submit(self._trigger_refresh, False, pri_docs)
+                self._trigger_refresh(False, pri_docs)
             else:
-                self.bg_executor.submit(self._trigger_refresh, False)
+                self._trigger_refresh(False)
             self._initial_priority_refresh_done = True
 
         self.root.after(500, _startup_priority_refresh)
-        self.root.after(1500, lambda: self.bg_executor.submit(load_master_schedule_in_background, self.ui_queue))
+        self.root.after(1500, lambda: _submit_startup_background(
+            "master-schedule", load_master_schedule_in_background, self.ui_queue))
         self.root.after(3500, self.update_clock_status_from_web)
 
         # 值班四筆在 _fetch_all_duty_info 內並行，每筆獨立 Session；啟動略提前以縮短首屏等待
-        self.root.after(2500, lambda: self.bg_executor.submit(self._fetch_all_duty_info))
+        self.root.after(2500, lambda: _submit_startup_background(
+            "duty-info", self._fetch_all_duty_info))
         
         def run_schedule():
             def _future_was_rejected(future):

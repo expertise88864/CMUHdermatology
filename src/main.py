@@ -8938,7 +8938,7 @@ class AutomationApp:
                         self._trigger_refresh(qr[0], qr[1])
                     elif chain_startup_full:
                         self._startup_defer_full_until_priority_done = False
-                        self.bg_executor.submit(self._trigger_refresh, False)
+                        self._trigger_refresh(False)
 
                 self.root.after(0, _on_refresh_worker_done)
 
@@ -11113,19 +11113,42 @@ class AutomationApp:
         self._background_tasks_started = True
         logging.info("Starting background tasks loop via ThreadPoolExecutor...")
 
+        def _submit_startup_background(task_name, fn, *args, attempt=1):
+            future = self.bg_executor.submit(fn, *args)
+
+            def _retry_if_rejected(fut):
+                try:
+                    rejected = fut.cancelled() or isinstance(fut.exception(), RejectedExecutionError)
+                except Exception:
+                    rejected = False
+                if not rejected or getattr(self, '_shutting_down', False):
+                    return
+                if attempt >= 3:
+                    logging.error("[STARTUP] %s 放棄：背景佇列持續滿載", task_name)
+                    return
+                logging.warning("[STARTUP] %s 延後重試 (%d/3)：背景佇列已滿", task_name, attempt + 1)
+                self._run_on_ui_thread(
+                    lambda: self.root.after(
+                        2000,
+                        lambda: _submit_startup_background(
+                            task_name,
+                            fn,
+                            *args,
+                            attempt=attempt + 1,
+                        ),
+                    )
+                )
+
+            future.add_done_callback(_retry_if_rejected)
+            return future
+
         # ===== 背景下載所有子程式 (manifest.json 列出的全部檔案) =====
         # 【穩定性 2026.05.20】改回 fire-and-forget。.result(timeout=180) 會阻塞
         # UI thread 等 GitHub raw，院內網路慢時 splash 卡 8-180s。子程式自己也會
         # 做 check_and_update，不必由主程式同步保證。
-        self.bg_executor.submit(self.check_and_update, False)
+        _submit_startup_background("update-check", self.check_and_update, False)
 
         self.startup_phase_text.set("任務排程")
-
-        def safe_fetch_duty(target_func, *args):
-            if not self.val_out_of_hospital:
-                target_func(*args)
-            else:
-                logging.info(f"院外模式開啟中，跳過 {target_func.__name__}")
 
         def _startup_priority_refresh():
             """[O5 優化] 拆兩波啟動：BATCH_1（主院多）500ms 立即跑、
@@ -11139,27 +11162,29 @@ class AutomationApp:
             if batch_1:
                 logging.info(f"[STARTUP] phase A refresh doctors={len(batch_1)} (主院優先)")
                 self._startup_defer_full_until_priority_done = True
-                self.bg_executor.submit(self._trigger_refresh, False, batch_1)
+                self._trigger_refresh(False, batch_1)
 
             if batch_2:
                 # 1.5 秒後跑第二波（含院外，timeout 已縮短為 2s 不會卡太久）
                 def _phase_b():
                     logging.info(f"[STARTUP] phase B refresh doctors={len(batch_2)} (含院外)")
-                    self.bg_executor.submit(self._trigger_refresh, False, batch_2)
+                    self._trigger_refresh(False, batch_2)
                 self.root.after(1500, _phase_b)
 
             if not (batch_1 or batch_2):
                 # 無 priority 醫師則直接跑全部
-                self.bg_executor.submit(self._trigger_refresh, False)
+                self._trigger_refresh(False)
 
             self._initial_priority_refresh_done = True
 
         self.root.after(500, _startup_priority_refresh)
-        self.root.after(1500, lambda: self.bg_executor.submit(load_master_schedule_in_background, self.ui_queue))
+        self.root.after(1500, lambda: _submit_startup_background(
+            "master-schedule", load_master_schedule_in_background, self.ui_queue))
         self.root.after(3500, self.update_clock_status_from_web)
 
         # 值班四筆在 _fetch_all_duty_info 內並行，每筆獨立 Session；啟動略提前以縮短首屏等待
-        self.root.after(2500, lambda: self.bg_executor.submit(self._fetch_all_duty_info))
+        self.root.after(2500, lambda: _submit_startup_background(
+            "duty-info", self._fetch_all_duty_info))
 
         # [O13] 啟動後 6 秒背景暖機 Chrome：使用者第一次按打卡狀態時 Chrome 已就緒（省 ~3 秒）
         # 條件：credentials.json 存在（使用者已設定過帳密）才暖機，避免無謂啟動
@@ -11175,7 +11200,8 @@ class AutomationApp:
                     logging.info("[O13] Chrome 暖機完成（下次打卡狀態查詢免等啟動）")
             except Exception:
                 logging.debug("[O13] Chrome 暖機例外（忽略）", exc_info=True)
-        self.root.after(6000, lambda: self.bg_executor.submit(_prewarm_chrome))
+        self.root.after(6000, lambda: _submit_startup_background(
+            "chrome-prewarm", _prewarm_chrome))
 
         # [O17] 啟動 30 秒後背景清理舊 cache、log 備份、tmp、過期 pyc
         try:
