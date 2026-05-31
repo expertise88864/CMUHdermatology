@@ -10366,6 +10366,16 @@ class AutomationApp:
             return
         if data is None:
             return
+        # [效能] data 可為 thunk(callable)：把昂貴的快照(deepcopy 整份門診資料)延後到
+        # 真正寫檔這一刻才做一次，避免 500ms debounce 視窗內每則訊息都先 deepcopy 又被丟棄。
+        if callable(data):
+            try:
+                data = data()
+            except Exception:
+                logging.exception("[save_cache] 快照 thunk 失敗: %s", filename)
+                return
+            if data is None:
+                return
         self._save_cache(filename, data)
 
     def _duty_cache_mem_ensure(self) -> dict[str, Any]:
@@ -10418,7 +10428,8 @@ class AutomationApp:
                                     continue
                                 self.all_doctors_data[doctor_name] = appointment_data
                             self._schedule_refresh()
-                            self._schedule_save_cache('cache_clinic_counts.json', self._get_all_doctors_data_snapshot())
+                            # [效能] 傳 bound method(thunk)而非預先 deepcopy：deepcopy 延到寫檔時做一次
+                            self._schedule_save_cache('cache_clinic_counts.json', self._get_all_doctors_data_snapshot)
                     case UiMasterScheduleMessage(schedule=sched):
                         self.master_schedule = sched
                         self._rebuild_master_schedule_index()
