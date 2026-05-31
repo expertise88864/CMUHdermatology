@@ -76,3 +76,19 @@ def test_load_requirement_specs_missing_file(tmp_path, monkeypatch):
     assert specs == {}
     # 缺檔時仍回裸套件名，不爆
     assert di._resolve_pip_spec("requests") == "requests"
+
+
+def test_pip_python_executable_prefers_console_sibling_for_pythonw(tmp_path):
+    pythonw = tmp_path / "pythonw.exe"
+    python = tmp_path / "python.exe"
+    pythonw.write_bytes(b"")
+    python.write_bytes(b"")
+
+    assert di._pip_python_executable(str(pythonw)) == str(python)
+
+
+def test_pip_python_executable_keeps_original_without_console_sibling(tmp_path):
+    pythonw = tmp_path / "pythonw.exe"
+    pythonw.write_bytes(b"")
+
+    assert di._pip_python_executable(str(pythonw)) == str(pythonw)

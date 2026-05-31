@@ -44,6 +44,7 @@ from cmuh_common.threshold_policy import (
     is_near_alert_threshold,
 )
 from cmuh_common.clinic_state import (
+    DEFAULT_CLINIC_ROOMS,
     build_dynamic_state,
     clinic_dynamic_state_key,
     clinic_dynamic_today_str,
@@ -7651,9 +7652,9 @@ class AutomationApp:
         if getattr(self, "clinic_room_vars", None):
             return
         saved_settings = self.load_clinic_settings()
-        saved_rooms = saved_settings.get("rooms", ["181", "182"])
+        saved_rooms = saved_settings.get("rooms", list(DEFAULT_CLINIC_ROOMS))
         if not isinstance(saved_rooms, list):
-            saved_rooms = ["181", "182"]
+            saved_rooms = list(DEFAULT_CLINIC_ROOMS)
         saved_modes = saved_settings.get("time_modes")
         if not isinstance(saved_modes, list):
             saved_modes = []
@@ -8753,7 +8754,7 @@ class AutomationApp:
     # --- [新增] 讀取門診動態設定 ---
     def load_clinic_settings(self):
         # [修改] 預設更新頻率改為 60 秒 (符合您的需求)
-        default_settings = {"rooms": ["181", "182"], "time_modes": ["auto", "auto"]}
+        default_settings = {"rooms": list(DEFAULT_CLINIC_ROOMS), "time_modes": ["auto", "auto"]}
         return load_json_dict(get_conf_path('clinic_settings.json'),
                               default_settings)
 

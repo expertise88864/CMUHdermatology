@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from cmuh_common.clinic_state import (  # noqa: E402
+    DEFAULT_CLINIC_ROOMS,
     build_dynamic_state,
     clinic_dynamic_state_key,
     int_set,
@@ -16,6 +17,10 @@ from cmuh_common.clinic_state import (  # noqa: E402
     restore_tracker_from_state,
     state_matches,
 )
+
+
+def test_default_clinic_rooms_are_101_and_102():
+    assert DEFAULT_CLINIC_ROOMS == ("101", "102")
 
 
 def _canon(value):

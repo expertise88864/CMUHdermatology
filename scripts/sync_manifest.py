@@ -81,6 +81,10 @@ def collect_entries(version: str) -> list:
         "診斷打卡重複執行.ps1",
         "清理重複打卡程式.cmd",
         "清理重複打卡程式.ps1",
+        # Python / dependency bootstrap
+        "安裝Python.bat",
+        "deploy/installer.bat",
+        "scripts/verify_dependencies.py",
         # 設定/資源檔
         "hotkey_overrides.json",
         "requirements.txt",

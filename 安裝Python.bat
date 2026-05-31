@@ -95,9 +95,26 @@ REM ---- [3/3] install requirements -------------------------------------------
 echo.
 echo [3/3] Installing Python packages from requirements.txt ...
 echo       (this takes 1-3 minutes on first run)
-"%PYEXE%" -m pip install --upgrade --no-warn-script-location -r "%~dp0requirements.txt"
+echo       interpreter:
+"%PYEXE%" -c "import sys; print('      ' + sys.executable)"
+if not exist "%~dp0settings" mkdir "%~dp0settings"
+set "SETUP_LOG=%~dp0settings\python_setup.log"
+> "%SETUP_LOG%" echo [setup] interpreter=%PYEXE%
+"%PYEXE%" -m pip install --upgrade --no-input --disable-pip-version-check --prefer-binary --no-warn-script-location -r "%~dp0requirements.txt" >> "%SETUP_LOG%" 2>&1
 if errorlevel 1 (
     echo       [error] pip install failed
+    echo       Details: %SETUP_LOG%
+    type "%SETUP_LOG%"
+    pause
+    exit /b 1
+)
+
+echo       verifying imports ...
+"%PYEXE%" "%~dp0scripts\verify_dependencies.py"
+if errorlevel 1 (
+    echo       [error] package verification failed
+    echo       The Python used above may differ from the Python associated with .pyw files.
+    echo       Details: %SETUP_LOG%
     pause
     exit /b 1
 )
@@ -115,6 +132,7 @@ echo   - scheduler         ^(pai ban^)
 echo.
 echo Python is now available system-wide for this user account.
 echo You can also run other .pyw / .py files on this machine.
+echo Setup log: %SETUP_LOG%
 echo.
 pause
 endlocal

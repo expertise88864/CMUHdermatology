@@ -6,6 +6,9 @@ from datetime import date, datetime
 from typing import Any, Callable
 
 
+DEFAULT_CLINIC_ROOMS = ("101", "102")
+
+
 def clinic_dynamic_today_str() -> str:
     return date.today().strftime("%Y/%m/%d")
 

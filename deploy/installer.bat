@@ -83,7 +83,7 @@ REM ====== 4. Embedded Python（如需要）======
 echo [4/5] 設定 Python 環境...
 if !USE_SYSTEM_PY!==1 (
     set PYTHONW=pythonw
-    set PIP_CMD=python -m pip
+    set PYTHON_EXE=python
     echo     使用系統 Python
 ) else (
     set PY_DIR=!INSTALL_DIR!\python_embed
@@ -107,7 +107,7 @@ if !USE_SYSTEM_PY!==1 (
         del /f /q "%TEMP%\get-pip.py"
     )
     set PYTHONW=!PY_DIR!\pythonw.exe
-    set PIP_CMD="!PY_DIR!\python.exe" -m pip
+    set PYTHON_EXE=!PY_DIR!\python.exe
     echo     使用 Embedded Python: !PY_DIR!
 )
 echo.
@@ -115,7 +115,23 @@ echo.
 REM ====== 4b. 安裝 requirements ======
 if exist "!INSTALL_DIR!\requirements.txt" (
     echo     安裝依賴套件 ...
-    !PIP_CMD! install --upgrade -r "!INSTALL_DIR!\requirements.txt"
+    if not exist "!INSTALL_DIR!\settings" mkdir "!INSTALL_DIR!\settings"
+    set SETUP_LOG=!INSTALL_DIR!\settings\python_setup.log
+    > "!SETUP_LOG!" echo [setup] interpreter=!PYTHON_EXE!
+    "!PYTHON_EXE!" -m pip install --upgrade --no-input --disable-pip-version-check --prefer-binary --no-warn-script-location -r "!INSTALL_DIR!\requirements.txt" >> "!SETUP_LOG!" 2>&1
+    if errorlevel 1 (
+        echo     [錯誤] pip 安裝失敗，詳細紀錄: !SETUP_LOG!
+        type "!SETUP_LOG!"
+        pause
+        exit /b 1
+    )
+    echo     驗證依賴套件 ...
+    "!PYTHON_EXE!" "!INSTALL_DIR!\scripts\verify_dependencies.py"
+    if errorlevel 1 (
+        echo     [錯誤] 套件驗證失敗，詳細紀錄: !SETUP_LOG!
+        pause
+        exit /b 1
+    )
 )
 echo.
 

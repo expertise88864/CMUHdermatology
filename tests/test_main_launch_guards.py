@@ -341,6 +341,16 @@ def test_clinic_polling_snapshots_tk_modes_before_background_work():
         assert "mode = configured_mode" in src
 
 
+def test_clinic_room_defaults_use_shared_101_102_constant():
+    main_src = (ROOT / "src/main.py").read_text(encoding="utf-8")
+    scheduler_src = (ROOT / "src/scheduler.py").read_text(encoding="utf-8")
+
+    assert "DEFAULT_CLINIC_ROOMS" in main_src
+    assert "DEFAULT_CLINIC_ROOMS" in scheduler_src
+    assert '["181", "182"]' not in main_src
+    assert '["181", "182"]' not in scheduler_src
+
+
 def test_scheduled_background_submits_detect_rejected_futures():
     for rel_path in ("src/main.py", "src/scheduler.py"):
         src = _function_source(ROOT / rel_path, "start_background_tasks")

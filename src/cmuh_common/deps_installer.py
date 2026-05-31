@@ -19,7 +19,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from cmuh_common.paths import get_app_dir
+from cmuh_common.paths import get_app_dir, get_settings_dir
 
 
 # requirements.txt 解析快取（每進程讀一次）
@@ -64,6 +64,22 @@ def _resolve_pip_spec(pkg_name: str) -> str:
     （含版本上限 pin），找不到就回裸套件名。"""
     specs = _load_requirement_specs()
     return specs.get(_normalize_pkg(pkg_name), pkg_name)
+
+
+def _pip_python_executable(executable: str | None = None) -> str:
+    """用 console python 跑 pip，避免 pythonw 吞掉安裝錯誤輸出。"""
+    current = os.path.abspath(executable or sys.executable)
+    base_name = os.path.basename(current).lower()
+    if base_name in {"pythonw.exe", "pythonw"}:
+        console_name = "python.exe" if base_name.endswith(".exe") else "python"
+        console_exe = os.path.join(os.path.dirname(current), console_name)
+        if os.path.isfile(console_exe):
+            return console_exe
+    return current
+
+
+def _dependency_install_log_path() -> str:
+    return os.path.join(get_settings_dir(), "dependency_install.log")
 
 
 class DependencyInstaller(tk.Tk):
@@ -130,7 +146,7 @@ class DependencyInstaller(tk.Tk):
             self.update_ui(current_progress, f"檢查元件: {pkg_name}...")
             try:
                 importlib.import_module(import_name)
-            except ImportError:
+            except Exception:
                 self.update_ui(current_progress, f"正在下載並安裝: {pkg_name}...")
                 self._run_on_ui_thread(lambda: self.detail_var.set("這可能需要一些時間，請勿關閉視窗..."))
                 try:
@@ -156,18 +172,28 @@ class DependencyInstaller(tk.Tk):
                     # 用 requirements.txt 的版本 spec（含上限 pin），避免抓到
                     # 破壞性新版；找不到 spec 時 fallback 裸套件名。
                     install_target = _resolve_pip_spec(pkg_name)
+                    pip_python = _pip_python_executable()
                     cmd = [
-                        sys.executable, "-m", "pip", "install", install_target,
+                        pip_python, "-m", "pip", "install", install_target,
                         "--upgrade", "--quiet", "--no-input",
                         "--disable-pip-version-check", "--prefer-binary",
                     ]
+                    install_log_path = _dependency_install_log_path()
                     last_err: Exception | None = None
                     for attempt in (1, 2):
                         try:
-                            subprocess.run(
-                                cmd, check=True, timeout=240,
-                                startupinfo=startupinfo,
-                            )
+                            with open(install_log_path, "a", encoding="utf-8") as log_file:
+                                log_file.write(
+                                    f"\n[deps] install={pkg_name} attempt={attempt} "
+                                    f"python={pip_python}\n"
+                                )
+                                log_file.flush()
+                                subprocess.run(
+                                    cmd, check=True, timeout=240,
+                                    startupinfo=startupinfo,
+                                    stdout=log_file,
+                                    stderr=subprocess.STDOUT,
+                                )
                             last_err = None
                             break
                         except subprocess.TimeoutExpired as e:
@@ -187,6 +213,13 @@ class DependencyInstaller(tk.Tk):
                     if last_err is not None:
                         raise last_err
                     importlib.invalidate_caches()
+                    try:
+                        importlib.import_module(import_name)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"pip install {pkg_name} 完成，但 import {import_name} "
+                            f"仍失敗；詳見 {install_log_path}"
+                        ) from e
                 except Exception as e:
                     self.failed_libs.append(pkg_name)
                     self._run_on_ui_thread(
@@ -222,7 +255,8 @@ class DependencyInstaller(tk.Tk):
                 f"  {names}\n\n"
                 "可能原因：無網路連線、防火牆阻擋、或 PyPI 暫時無法連線。\n\n"
                 "請確認可連上網路後重新啟動本程式，\n"
-                "或先執行資料夾內的「安裝Python.bat」一次性安裝所有元件。",
+                "或先執行資料夾內的「安裝Python.bat」一次性安裝所有元件。\n\n"
+                "詳細紀錄：settings/dependency_install.log",
                 parent=self,
             )
         except Exception:

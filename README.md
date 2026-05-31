@@ -14,7 +14,7 @@
 
 ### 方法 A — 雙擊根目錄的 `.pyw`（最簡單）
 
-repo 根目錄有 4 個 `中國醫皮膚科*.pyw` 啟動器，雙擊即可。
+repo 根目錄有 6 個 `中國醫皮膚科*.pyw` 啟動器，雙擊即可。
 首次啟動會跳依賴安裝視窗，自動 pip install 缺少的套件。
 
 ### 方法 B — 命令列
@@ -32,6 +32,9 @@ pythonw src\main.py
 
 ## 部署到其他電腦
 
+已經下載完整資料夾時，先雙擊根目錄的 `安裝Python.bat`。它會安裝套件後
+實際 import 驗證所有必要模組，並印出真正使用的 Python 路徑。
+
 下載 `deploy/installer.bat`，雙擊即可：
 
 ```cmd
@@ -42,6 +45,11 @@ powershell -Command "Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/e
 - 有 Python 3.10+ → 直接用系統 Python
 - 沒 Python → 自動下載 Embedded Python 3.12
 - 兩種情況都可線上自動更新（程式碼始終是純 .py）
+
+安裝異常時可查看：
+
+- `settings/python_setup.log`：批次安裝 pip 輸出
+- `settings/dependency_install.log`：主程式啟動時自動補裝套件的輸出
 
 ## 開發者：日常推送
 
