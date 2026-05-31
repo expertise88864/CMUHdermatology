@@ -9,7 +9,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from cmuh_common import cache_cleanup  # noqa: E402
 
 
+def _reset_cleanup_state():
+    with cache_cleanup._cleanup_state_lock:
+        cache_cleanup._cleanup_scheduled = False
+        cache_cleanup._cleanup_running = False
+
+
 def test_schedule_cleanup_falls_back_when_executor_returns_failed_future(monkeypatch):
+    _reset_cleanup_state()
     ran = threading.Event()
 
     def fake_cleanup_old_files():
@@ -27,3 +34,23 @@ def test_schedule_cleanup_falls_back_when_executor_returns_failed_future(monkeyp
     cache_cleanup.schedule_cleanup_in_background(RejectingExecutor(), delay_seconds=0)
 
     assert ran.wait(timeout=1)
+
+
+def test_schedule_cleanup_skips_duplicate_timer(monkeypatch):
+    _reset_cleanup_state()
+    timers = []
+
+    class FakeTimer:
+        def __init__(self, delay_seconds, callback):
+            timers.append((delay_seconds, callback))
+            self.daemon = False
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(cache_cleanup.threading, "Timer", FakeTimer)
+
+    assert cache_cleanup.schedule_cleanup_in_background(object(), delay_seconds=30) is True
+    assert cache_cleanup.schedule_cleanup_in_background(object(), delay_seconds=30) is False
+    assert len(timers) == 1
+    _reset_cleanup_state()

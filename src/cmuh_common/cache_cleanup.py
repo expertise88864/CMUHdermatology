@@ -13,12 +13,16 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 
 from cmuh_common.paths import get_app_dir, get_settings_dir
 
 DAY = 86400
+_cleanup_state_lock = threading.Lock()
+_cleanup_scheduled = False
+_cleanup_running = False
 
 
 def _safe_remove(p: Path) -> bool:
@@ -120,11 +124,28 @@ def cleanup_old_files() -> dict:
     return stats
 
 
-def schedule_cleanup_in_background(executor, *, delay_seconds: int = 30) -> None:
+def _release_cleanup_state() -> None:
+    global _cleanup_scheduled, _cleanup_running
+    with _cleanup_state_lock:
+        _cleanup_scheduled = False
+        _cleanup_running = False
+
+
+def schedule_cleanup_in_background(executor, *, delay_seconds: int = 30) -> bool:
     """[O17] 啟動 N 秒後在背景執行緒池跑一次清理（不阻塞 UI）。"""
-    import threading
+    global _cleanup_scheduled, _cleanup_running
+    with _cleanup_state_lock:
+        if _cleanup_scheduled or _cleanup_running:
+            logging.debug("[O17] cleanup already scheduled or running; skip duplicate")
+            return False
+        _cleanup_scheduled = True
 
     def _run():
+        global _cleanup_running
+        with _cleanup_state_lock:
+            if _cleanup_running:
+                return
+            _cleanup_running = True
         try:
             stats = cleanup_old_files()
             total = sum(stats.values())
@@ -132,6 +153,19 @@ def schedule_cleanup_in_background(executor, *, delay_seconds: int = 30) -> None
                 logging.info("[O17] 清理完成，共移除 %d 個檔: %s", total, stats)
         except Exception:
             logging.debug("[O17] cleanup 例外", exc_info=True)
+        finally:
+            _release_cleanup_state()
+
+    def _start_fallback_thread():
+        try:
+            threading.Thread(
+                target=_run,
+                name="CacheCleanupFallback",
+                daemon=True,
+            ).start()
+        except Exception:
+            _release_cleanup_state()
+            logging.debug("[O17] cleanup fallback thread 啟動失敗", exc_info=True)
 
     def _later():
         try:
@@ -146,10 +180,15 @@ def schedule_cleanup_in_background(executor, *, delay_seconds: int = 30) -> None
                         "[O17] cleanup executor rejected task; fallback thread: %s",
                         exc,
                     )
-                    threading.Thread(target=_run, daemon=True).start()
+                    _start_fallback_thread()
         except Exception:
-            threading.Thread(target=_run, daemon=True).start()
+            _start_fallback_thread()
 
     timer = threading.Timer(delay_seconds, _later)
     timer.daemon = True
-    timer.start()
+    try:
+        timer.start()
+    except Exception:
+        _release_cleanup_state()
+        raise
+    return True

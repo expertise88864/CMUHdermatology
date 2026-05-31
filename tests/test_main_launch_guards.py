@@ -80,7 +80,7 @@ def _assert_autoclock_launch_guard(source_path: Path) -> None:
 
     assert (
         _first_call_line(func, "is_instance_running")
-        < _first_call_line(func, "subprocess.Popen")
+        < _first_call_line(func, "launch_app_script")
     )
     assert "Local\\CMUH_Skin_AutoClock_SingleInstance_v1" in _constant_strings(func)
 
@@ -90,7 +90,7 @@ def _assert_consult_launch_guard(source_path: Path) -> None:
 
     assert (
         _first_call_line(func, "is_instance_running")
-        < _first_call_line(func, "subprocess.Popen")
+        < _first_call_line(func, "launch_app_script")
     )
     assert "Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1" in _constant_strings(func)
 
@@ -107,6 +107,20 @@ def test_scheduler_background_launches_check_mutex_before_spawn():
 
     _assert_autoclock_launch_guard(source_path)
     _assert_consult_launch_guard(source_path)
+
+
+def test_main_and_scheduler_helper_launches_use_shared_launcher():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        source_path = ROOT / rel_path
+        for func_name in (
+            "_launch_scheduler_program",
+            "_launch_autoclock_program",
+            "_launch_coordinate_detector_program",
+            "_launch_consult_query_program",
+        ):
+            src = _function_source(source_path, func_name)
+            assert "launch_app_script(" in src
+            assert "subprocess.Popen(" not in src
 
 
 def test_f1_does_not_update_uvb_when_code_input_fails():
@@ -197,6 +211,20 @@ def test_scheduler_shutdown_is_idempotent_and_stops_automation():
     assert "self._exit_cleanup_done = True" in src
     assert "stop_event_automation.set()" in src
     assert src.index("stop_event_automation.set()") < src.index("self.bg_executor.shutdown")
+
+
+def test_scheduler_shutdown_clears_http_pools_without_blocking_close():
+    src = _function_source(ROOT / "src/scheduler.py", "shutdown_app")
+
+    assert "adapter.poolmanager.clear()" in src
+    assert "session.close()" not in src
+
+
+def test_main_and_scheduler_schedule_cache_cleanup_for_standalone_launches():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "start_background_tasks")
+
+        assert "schedule_cleanup_in_background(self.bg_executor, delay_seconds=30)" in src
 
 
 def test_main_and_scheduler_log_queues_are_bounded():

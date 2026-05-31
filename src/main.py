@@ -17,6 +17,7 @@ from cmuh_common.version import CURRENT_VERSION, parse_version
 from cmuh_common.paths import (
     get_app_dir, get_settings_dir, get_conf_path, restart_self, is_frozen,
 )
+from cmuh_common.process_launch import launch_app_script
 from cmuh_common.atomic_io import atomic_write_json as _atomic_write_json
 from cmuh_common.atomic_io import atomic_write_text
 from cmuh_common.config_io import load_json_dict, load_json_list
@@ -7275,10 +7276,7 @@ class AutomationApp:
         scheduler_script_name = "中國醫皮膚科排班程式.pyw"
         try:
             logging.info(f"Launching scheduler program: {scheduler_script_name}")
-            subprocess.Popen(
-                [sys.executable, scheduler_script_name],
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
+            launch_app_script(scheduler_script_name)
         except FileNotFoundError:
             messagebox.showerror("啟動失敗", f"找不到排班程式檔案: {scheduler_script_name}\n\n請確認主程式與排班程式在同一個資料夾中。")
             logging.error(f"Scheduler script not found: {scheduler_script_name}")
@@ -7293,10 +7291,7 @@ class AutomationApp:
             return
         try:
             logging.info(f"Launching autoclock program: {autoclock_script_name}")
-            subprocess.Popen(
-                [sys.executable, autoclock_script_name],
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
+            launch_app_script(autoclock_script_name)
         except FileNotFoundError:
             messagebox.showerror("啟動失敗", f"找不到打卡程式檔案: {autoclock_script_name}\n\n請確認主程式與打卡程式在同一個資料夾中。")
             logging.error(f"Autoclock script not found: {autoclock_script_name}")
@@ -7308,10 +7303,7 @@ class AutomationApp:
         script_name = "中國醫皮膚科點座標偵測程式.pyw"
         try:
             logging.info(f"Launching coordinate detector program: {script_name}")
-            subprocess.Popen(
-                [sys.executable, script_name],
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
+            launch_app_script(script_name)
         except FileNotFoundError:
             messagebox.showerror("啟動失敗", f"找不到座標偵測程式檔案: {script_name}\n\n請確認主程式與該程式在同一個資料夾中。")
             logging.error(f"Coordinate detector script not found: {script_name}")
@@ -7328,10 +7320,7 @@ class AutomationApp:
             return
         try:
             logging.info(f"Launching consult query program: {script_name}")
-            subprocess.Popen(
-                [sys.executable, script_name],
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
+            launch_app_script(script_name)
         except FileNotFoundError:
             messagebox.showerror("啟動失敗", f"找不到會診查詢程式檔案: {script_name}\n\n請確認主程式與該程式在同一個資料夾中。")
             logging.error(f"Consult query script not found: {script_name}")

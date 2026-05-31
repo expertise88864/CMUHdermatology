@@ -17,6 +17,7 @@ from cmuh_common.version import CURRENT_VERSION, parse_version
 from cmuh_common.paths import (
     get_app_dir, get_settings_dir, get_conf_path, restart_self, is_frozen,
 )
+from cmuh_common.process_launch import launch_app_script
 from cmuh_common.atomic_io import atomic_write_json as _atomic_write_json
 from cmuh_common.atomic_io import atomic_write_text
 from cmuh_common.config_io import load_json_dict, load_json_list
@@ -2841,11 +2842,16 @@ class AutomationApp:
                 self.bg_executor.shutdown(wait=False)
         for _attr in ('duty_session', 'session'):
             session = getattr(self, _attr, None)
-            if session is not None:
-                try:
-                    session.close()
-                except Exception as e:
-                    logging.warning(f"Failed to close requests session ({_attr}): {e}")
+            if session is None:
+                continue
+            try:
+                for adapter in session.adapters.values():
+                    try:
+                        adapter.poolmanager.clear()
+                    except Exception:
+                        pass
+            except Exception as e:
+                logging.warning(f"Failed to clear requests session pool ({_attr}): {e}")
         logging.info("Hotkeys unhooked; executor released (non-blocking shutdown).")
         try:
             self.root.destroy()
@@ -3708,7 +3714,7 @@ class AutomationApp:
 
     def _launch_scheduler_program(self):
         scheduler_script_name = "中國醫皮膚科排班程式.pyw"
-        try: logging.info(f"Launching scheduler program: {scheduler_script_name}"); subprocess.Popen([sys.executable, scheduler_script_name])
+        try: logging.info(f"Launching scheduler program: {scheduler_script_name}"); launch_app_script(scheduler_script_name)
         except FileNotFoundError: messagebox.showerror("啟動失敗", f"找不到排班程式檔案: {scheduler_script_name}\n\n請確認主程式與排班程式在同一個資料夾中。"); logging.error(f"Scheduler script not found: {scheduler_script_name}")
         except Exception as e: messagebox.showerror("啟動失敗", f"無法啟動排班程式:\n{e}"); logging.error(f"Failed to launch scheduler: {e}")
             
@@ -3717,13 +3723,13 @@ class AutomationApp:
         if is_instance_running("Local\\CMUH_Skin_AutoClock_SingleInstance_v1"):
             logging.info("Autoclock program is already running; skip launch")
             return
-        try: logging.info(f"Launching autoclock program: {autoclock_script_name}"); subprocess.Popen([sys.executable, autoclock_script_name])
+        try: logging.info(f"Launching autoclock program: {autoclock_script_name}"); launch_app_script(autoclock_script_name)
         except FileNotFoundError: messagebox.showerror("啟動失敗", f"找不到打卡程式檔案: {autoclock_script_name}\n\n請確認主程式與打卡程式在同一個資料夾中。"); logging.error(f"Autoclock script not found: {autoclock_script_name}")
         except Exception as e: messagebox.showerror("啟動失敗", f"無法啟動打卡程式:\n{e}"); logging.error(f"Failed to launch autoclock program: {e}")
 
     def _launch_coordinate_detector_program(self):
         script_name = "中國醫皮膚科點座標偵測程式.pyw"
-        try: logging.info(f"Launching coordinate detector program: {script_name}"); subprocess.Popen([sys.executable, script_name])
+        try: logging.info(f"Launching coordinate detector program: {script_name}"); launch_app_script(script_name)
         except FileNotFoundError: messagebox.showerror("啟動失敗", f"找不到座標偵測程式檔案: {script_name}\n\n請確認主程式與該程式在同一個資料夾中。"); logging.error(f"Coordinate detector script not found: {script_name}")
         except Exception as e: messagebox.showerror("啟動失敗", f"無法啟動座標偵測程式:\n{e}"); logging.error(f"Failed to launch coordinate detector program: {e}")
 
@@ -3734,7 +3740,7 @@ class AutomationApp:
         if is_instance_running("Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1"):
             logging.info("Consult query program is already running; skip launch")
             return
-        try: logging.info(f"Launching consult query program: {script_name}"); subprocess.Popen([sys.executable, script_name])
+        try: logging.info(f"Launching consult query program: {script_name}"); launch_app_script(script_name)
         except FileNotFoundError: messagebox.showerror("啟動失敗", f"找不到會診查詢程式檔案: {script_name}\n\n請確認主程式與該程式在同一個資料夾中。"); logging.error(f"Consult query script not found: {script_name}")
         except Exception as e: messagebox.showerror("啟動失敗", f"無法啟動會診查詢程式:\n{e}"); logging.error(f"Failed to launch consult query program: {e}")
 
@@ -6753,6 +6759,13 @@ class AutomationApp:
         # 值班四筆在 _fetch_all_duty_info 內並行，每筆獨立 Session；啟動略提前以縮短首屏等待
         self.root.after(2500, lambda: _submit_startup_background(
             "duty-info", self._fetch_all_duty_info))
+
+        # Standalone scheduler launches should also prune old backups and temp files.
+        try:
+            from cmuh_common.cache_cleanup import schedule_cleanup_in_background
+            schedule_cleanup_in_background(self.bg_executor, delay_seconds=30)
+        except Exception:
+            logging.debug("[O17] schedule_cleanup_in_background 失敗", exc_info=True)
         
         def run_schedule():
             def _future_was_rejected(future):
