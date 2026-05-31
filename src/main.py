@@ -9329,7 +9329,7 @@ class AutomationApp:
             if not getattr(self, '_abbrev_monitor_started', False):
                 self._abbrev_monitor_started = True
                 try:
-                    self.root.after(20000, self._abbrev_monitor_external)
+                    self.root.after(60000, self._abbrev_monitor_external)
                 except Exception:
                     logging.debug("[abbrev] 啟動 external monitor 失敗",
                                   exc_info=True)
@@ -9338,7 +9338,8 @@ class AutomationApp:
     def _abbrev_monitor_external(self):
         """[v6] 週期檢查外部文字展開程式 (PhraseExpress 等)。
         狀態改變 (出現/消失) → 重新 install (install 內部會依偵測結果決定
-        掛 hook 或暫停)，避免雙重展開衝突。每 ~20s 跑一次。
+        掛 hook 或暫停)，避免雙重展開衝突。每 ~60s 跑一次（v9 由 20s 拉長，
+        降低 process 全掃描頻率；使用者極少在 session 中途開關 PhraseExpress）。
         """
         try:
             eng = getattr(self, 'abbrev_engine', None)
@@ -9365,7 +9366,7 @@ class AutomationApp:
             # reschedule (即使這次例外也要繼續監看)
             if not getattr(self, '_shutting_down', False):
                 try:
-                    self.root.after(20000, self._abbrev_monitor_external)
+                    self.root.after(60000, self._abbrev_monitor_external)
                 except Exception:
                     logging.debug("[abbrev] reschedule monitor 失敗",
                                   exc_info=True)
@@ -9755,8 +9756,14 @@ class AutomationApp:
         right_column.grid(row=0, column=1, sticky="nw", padx=(0, 20))
         
         # 3. [新增] 右欄 (最右邊 - 放置圖片)
+        # [v9] 1024×768 等窄螢幕：設定頁 canvas 只縱向捲動，三欄並排會讓第三欄
+        # (250px 海報) 被右緣裁切。低解析度時改把第三欄堆疊到下方 (row=1)，
+        # 跨兩欄寬，確保不裁切。
         third_column = ttk.Frame(columns_container)
-        third_column.grid(row=0, column=2, sticky="nw", padx=(0, 0))
+        if getattr(self, 'screen_width', 1920) <= 1024:
+            third_column.grid(row=1, column=0, columnspan=2, sticky="nw", pady=(15, 0))
+        else:
+            third_column.grid(row=0, column=2, sticky="nw", padx=(0, 0))
 
         # --- 左欄內容 (保持不變) ---
         mode_frame = ttk.LabelFrame(left_column, text="模式與顯示設定", padding=10)

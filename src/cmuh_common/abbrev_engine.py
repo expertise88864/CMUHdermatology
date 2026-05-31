@@ -686,9 +686,9 @@ class AbbrevEngine:
     # [v7] Ctrl+V 送完到「還原剪貼簿」之間的延遲（s）— 目標 app 是非同步
     # 讀剪貼簿，太早還原會貼到舊內容（展開錯字）。0.12 → 0.30。
     POST_PASTE_DELAY_SEC = 0.30
-    # [v8] 外部文字展開程式（PhraseExpress 等）輪詢間隔（s）。雙向：
-    # 偵測到 → 暫停 hook；偵測到關閉 → 自動恢復 hook。
-    EXPANDER_POLL_SEC = 30.0
+    # [v9] _suppressing 自癒餘裕（s）：若旗標卡住超過 cooldown + 此餘裕仍未清，
+    # 視為 worker thread 異常未 reset → 強制重置，避免縮寫永久失效要重啟。
+    SUPPRESS_SELFHEAL_MARGIN_SEC = 2.0
 
     def __init__(self, kb_module: Any) -> None:
         """kb_module = `keyboard` PyPI 套件物件（已 import 完成）。"""
@@ -703,17 +703,18 @@ class AbbrevEngine:
         self._suppressing = False
         # 展開後的冷卻截止時間（monotonic）
         self._cooldown_until: float = 0.0
-        # [v6] 偵測到的外部文字展開程式名稱 (None=沒有)；有的話暫停本程式縮寫
+        # [v6] 偵測到的外部文字展開程式名稱 (None=沒有)；有的話暫停本程式縮寫。
+        # 注意：外部程式的「持續監看/重評估」由 main.py 的 _abbrev_monitor_external
+        # （UI thread, root.after）驅動，本引擎不另起 timer，避免重複輪詢。
         self._external_expander: Optional[str] = None
-        # [v8] 外部展開程式輪詢 timer（每 EXPANDER_POLL_SEC 秒重評估一次）
-        self._expander_timer: Optional[threading.Timer] = None
 
     # ------------------------------------------------------------------ 公開 API
     def install(self, cfg: AbbrevConfig) -> None:
         """套用設定並掛上 keyboard hook。重複呼叫會先 uninstall 再裝。
 
-        [v8] 外部展開程式（PhraseExpress 等）改為「持續輪詢」：install 時先
-        評估一次，之後每 EXPANDER_POLL_SEC 秒重評估，雙向自動暫停/恢復。
+        外部展開程式（PhraseExpress 等）的偵測：install 時評估一次，依結果
+        決定掛 hook 或暫停。出現/消失的持續監看由 main.py 的
+        _abbrev_monitor_external（UI thread）週期重 install 來驅動。
         """
         with self._lock:
             self._cfg = cfg
@@ -724,9 +725,21 @@ class AbbrevEngine:
                 logging.info("[abbrev] hook 未掛載（enabled=%s, items=%d）",
                              cfg.enabled, len(self._lookup))
                 return
-            # 依外部展開程式狀態決定要 hook 還是暫停，並啟動持續輪詢
-            self._apply_hook_state_locked(initial=True)
-            self._schedule_expander_poll_locked()
+            # 偵測外部文字展開程式 → 有的話暫停，避免雙重展開
+            ext = detect_external_expander()
+            self._external_expander = ext
+            if ext:
+                logging.warning(
+                    "[abbrev] 偵測到外部文字展開程式 '%s' 執行中 → 暫停本程式縮寫"
+                    "避免衝突（關閉該程式後會自動恢復）", ext)
+                return
+            try:
+                self._press_hook = self._kb.on_press(self._on_press)
+                logging.info("[abbrev] hook 已掛載，%d 筆縮寫（最長 %d 字）",
+                             len(self._lookup), self._max_abbrev_len)
+            except Exception:
+                logging.exception("[abbrev] keyboard hook 掛載失敗")
+                self._press_hook = None
 
     def uninstall(self) -> None:
         with self._lock:
@@ -737,78 +750,7 @@ class AbbrevEngine:
             return self._press_hook is not None
 
     # ----------------------------------------------------------------- 內部工具
-    def _apply_hook_state_locked(self, initial: bool = False) -> None:
-        """依「外部展開程式是否執行中」決定 hook / 暫停。須在持有 self._lock 時呼叫。
-        - 偵測到外部展開程式 → 確保未 hook（暫停，避免雙重展開）
-        - 沒有外部展開程式 → 確保已 hook
-        """
-        ext = detect_external_expander()
-        prev = self._external_expander
-        self._external_expander = ext
-
-        if ext:
-            if self._press_hook is not None:
-                # 原本有 hook，現在偵測到外部程式 → 暫停
-                try:
-                    self._kb.unhook(self._press_hook)
-                except Exception:
-                    logging.debug("[abbrev] 暫停 unhook 失敗", exc_info=True)
-                self._press_hook = None
-            if initial or prev != ext:
-                logging.warning(
-                    "[abbrev] 偵測到外部文字展開程式 '%s' 執行中 → 暫停本程式縮寫"
-                    "避免衝突（關閉該程式後約 %.0f 秒內自動恢復）",
-                    ext, self.EXPANDER_POLL_SEC)
-            return
-
-        # 沒有外部展開程式 → 確保 hook 上
-        if self._press_hook is None:
-            try:
-                self._press_hook = self._kb.on_press(self._on_press)
-                if initial:
-                    logging.info("[abbrev] hook 已掛載，%d 筆縮寫（最長 %d 字）",
-                                 len(self._lookup), self._max_abbrev_len)
-                else:
-                    logging.info("[abbrev] 外部展開程式已關閉 → 自動恢復縮寫 hook")
-            except Exception:
-                logging.exception("[abbrev] keyboard hook 掛載失敗")
-                self._press_hook = None
-
-    def _schedule_expander_poll_locked(self) -> None:
-        """排程下一次外部展開程式輪詢。須在持有 self._lock 時呼叫。"""
-        if self._expander_timer is not None:
-            try:
-                self._expander_timer.cancel()
-            except Exception:
-                pass
-            self._expander_timer = None
-        if not self._cfg.enabled or not self._lookup:
-            return
-        t = threading.Timer(self.EXPANDER_POLL_SEC, self._expander_poll)
-        t.daemon = True
-        self._expander_timer = t
-        t.start()
-
-    def _expander_poll(self) -> None:
-        """Timer callback：重評估外部展開程式狀態並重排下一次輪詢。"""
-        with self._lock:
-            if not self._cfg.enabled or not self._lookup:
-                self._expander_timer = None
-                return
-            try:
-                self._apply_hook_state_locked(initial=False)
-            except Exception:
-                logging.exception("[abbrev] expander poll 重評估失敗")
-            self._schedule_expander_poll_locked()
-
     def _uninstall_locked(self) -> None:
-        # 先取消外部展開程式輪詢 timer
-        if self._expander_timer is not None:
-            try:
-                self._expander_timer.cancel()
-            except Exception:
-                pass
-            self._expander_timer = None
         h = self._press_hook
         if h is not None:
             try:
@@ -839,9 +781,18 @@ class AbbrevEngine:
             logging.exception("[abbrev] _on_press 處理失敗")
 
     def _handle_event(self, event: Any) -> None:
-        # 自己 send/write 期間，所有按鍵忽略
+        # 自己 send/write 期間，所有按鍵忽略。
+        # [v9] 自癒：若 _suppressing 卡在 True 但已遠超過 cooldown 期限
+        # （worker thread 異常未 reset / start 失敗），強制重置，避免縮寫
+        # 永久失效需重啟程式。
         if self._suppressing:
-            return
+            if time.monotonic() > self._cooldown_until + self.SUPPRESS_SELFHEAL_MARGIN_SEC:
+                logging.warning("[abbrev] _suppressing 逾時未清除，自癒強制重置")
+                self._suppressing = False
+                with self._lock:
+                    self._buffer = ""
+            else:
+                return
 
         # cool-down 期間（展開剛完成）— 不更新 buffer、不觸發
         if time.monotonic() < self._cooldown_until:
@@ -918,12 +869,19 @@ class AbbrevEngine:
         # 模組把「縮寫 + 觸發空白」完整 dispatch 到目標視窗後，我們再送 backspace。
         # （hook callback 同步跑在 hook thread；若在這裡直接送 backspace，
         #  觸發空白還沒到目標視窗 → 順序錯亂 → 沒刪到 / 刪錯字。）
-        worker = threading.Thread(
-            target=self._do_replace,
-            args=(delete_count, rendered, matched_key),
-            daemon=True,
-        )
-        worker.start()
+        # [v9] start() 失敗時必須 reset _suppressing，否則旗標永久卡 True →
+        # 縮寫全失效（自癒機制是第二道防線，這裡是第一道）。
+        try:
+            worker = threading.Thread(
+                target=self._do_replace,
+                args=(delete_count, rendered, matched_key),
+                daemon=True,
+            )
+            worker.start()
+        except Exception:
+            logging.exception("[abbrev] 啟動展開 worker thread 失敗，重置 suppress")
+            self._suppressing = False
+            self._cooldown_until = 0.0
 
     def _do_replace(self, backspace_count: int, text: str, abbrev_key: str) -> None:
         """在獨立 thread 執行：先等「縮寫 + 觸發空白」抵達目標視窗，再分兩段
