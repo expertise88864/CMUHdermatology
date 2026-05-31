@@ -11186,8 +11186,14 @@ class AutomationApp:
             ).tag("update-check", "daily")
 
             while not stop_event_main.is_set():
-                schedule.run_pending()
-                
+                # [穩定性] run_pending 包 try/except：schedule 預設會把工作的例外往外拋，
+                # 若任一工作(尤其直接註冊、未經 run_named_job 的 dynamic_cl_checker)拋例外，
+                # 會中斷此常駐迴圈 → 當天所有定時刷新/自動重開機停擺。包起來保住心跳。
+                try:
+                    schedule.run_pending()
+                except Exception:
+                    logging.error("schedule.run_pending 例外（已忽略，保住排程迴圈）", exc_info=True)
+
                 try:
                     if self.val_auto_reboot_enabled:
                         now = datetime.now()
