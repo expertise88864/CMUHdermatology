@@ -2630,7 +2630,7 @@ from cmuh_common.reg64_utils import _reg64_tc_to_session_cn  # noqa: E402
 class AutomationApp:
     def __init__(self, root: tk.Tk, master_schedule: dict):
         self.root = root
-        self.root.title("中國醫皮膚科常用程式")
+        self.root.title("中國醫皮膚科排班程式")
         try: self.root.state('zoomed')
         except tk.TclError: self.root.geometry("1280x720")
         _apply_tk_window_icon(self.root)

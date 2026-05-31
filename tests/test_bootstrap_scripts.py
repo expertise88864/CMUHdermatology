@@ -17,6 +17,9 @@ def test_root_python_setup_stays_ascii_and_verifies_imports():
     assert "--prefer-binary" in setup_text
     assert "2>&1" in setup_text
     assert 'python -c "import sys; print(sys.executable)"' in setup_text
+    assert r"HKCU\Software\Classes\.pyw" in setup_text
+    assert r"HKCU\Software\Classes\Python.NoConFile\shell\open\command" in setup_text
+    assert "repairing .pyw file association" in setup_text
 
 
 def test_deploy_installer_verifies_imports_and_fails_closed():

@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from cmuh_common.platform_win import (  # noqa: E402
     _admin_relaunch_params,
+    _shell_execute_succeeded,
     foreground_window_on_primary,
     get_monitor_count,
     get_primary_monitor_size,
@@ -24,6 +25,13 @@ def test_admin_relaunch_params_quotes_paths_with_spaces():
     assert '"C:\\Program Files\\CMUH App\\main.pyw"' in params
     assert '--mode' in params
     assert '"clock config"' in params
+
+
+def test_shell_execute_requires_success_code_above_32():
+    assert _shell_execute_succeeded(33) is True
+    assert _shell_execute_succeeded(32) is False
+    assert _shell_execute_succeeded(5) is False
+    assert _shell_execute_succeeded(None) is False
 
 
 def test_get_monitor_count_is_positive_int():

@@ -93,6 +93,23 @@ echo       PATH updated (effective in NEW cmd sessions).
 REM ---- [3/3] install requirements -------------------------------------------
 :install_deps
 echo.
+echo       repairing .pyw file association for this user ...
+set "PYWEXE=%LOCALAPPDATA%\Programs\Python\Launcher\pyw.exe"
+if exist "%PYWEXE%" goto :register_pyw_assoc
+for %%p in ("%PYEXE%") do set "PYWEXE=%%~dppythonw.exe"
+
+:register_pyw_assoc
+if not exist "%PYWEXE%" goto :skip_pyw_assoc
+reg add "HKCU\Software\Classes\.pyw" /ve /t REG_SZ /d "Python.NoConFile" /f >nul
+reg add "HKCU\Software\Classes\Python.NoConFile\shell\open\command" /ve /t REG_SZ /d "\"%PYWEXE%\" \"%%L\" %%*" /f >nul
+echo       .pyw association points to: %PYWEXE%
+goto :install_requirements
+
+:skip_pyw_assoc
+echo       [warning] pythonw launcher not found; .pyw association was not repaired.
+
+:install_requirements
+echo.
 echo [3/3] Installing Python packages from requirements.txt ...
 echo       (this takes 1-3 minutes on first run)
 echo       interpreter:

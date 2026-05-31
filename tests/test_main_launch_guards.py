@@ -123,6 +123,12 @@ def test_main_and_scheduler_helper_launches_use_shared_launcher():
             assert "subprocess.Popen(" not in src
 
 
+def test_scheduler_window_has_distinct_title():
+    source = (ROOT / "src" / "scheduler.py").read_text(encoding="utf-8")
+
+    assert 'self.root.title("中國醫皮膚科排班程式")' in source
+
+
 def test_f1_does_not_update_uvb_when_code_input_fails():
     source_path = ROOT / "src" / "main.py"
     func = _function_node(source_path, "script_F1_adaptive")
