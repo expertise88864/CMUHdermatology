@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Abbreviation default migration, sorting, and length guard tests."""
+import ctypes
 import json
 import os
 import sys
@@ -136,3 +137,171 @@ def test_replace_clears_suppress_when_cooldown_timer_cannot_start(monkeypatch):
     engine._do_replace(2, "expanded", "ok")
 
     assert engine._suppressing is False
+
+
+def test_focused_window_handle_prefers_child_edit_control(monkeypatch):
+    class FakeUser32:
+        @staticmethod
+        def GetForegroundWindow():
+            return 100
+
+        @staticmethod
+        def GetWindowThreadProcessId(_hwnd, _process_id):
+            return 7
+
+        @staticmethod
+        def GetGUIThreadInfo(_thread_id, info_pointer):
+            info = ctypes.cast(
+                info_pointer, ctypes.POINTER(ae._GUITHREADINFO)).contents
+            info.hwndFocus = 200
+            return 1
+
+    class FakeWindll:
+        user32 = FakeUser32()
+
+    monkeypatch.setattr(ae.ctypes, "windll", FakeWindll())
+
+    assert ae._get_focused_window_handle() == 200
+
+
+def test_native_edit_replacement_verifies_suffix_before_replacing(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ae, "_get_focused_window_handle", lambda: 123)
+    monkeypatch.setattr(ae, "_is_native_edit_control", lambda _hwnd: True)
+    monkeypatch.setattr(ae, "_get_edit_selection", lambda _hwnd: (5, 5))
+    monkeypatch.setattr(ae, "_read_window_text", lambda _hwnd: "xxst ")
+    monkeypatch.setattr(
+        ae,
+        "_replace_edit_selection",
+        lambda hwnd, start, end, text: calls.append(
+            (hwnd, start, end, text)) or True,
+    )
+
+    assert ae._replace_native_edit_suffix("st ", "keep stable ", 0)
+    assert calls == [(123, 2, 5, "keep stable ")]
+
+
+def test_native_edit_replacement_rejects_changed_focus(monkeypatch):
+    focused_handles = iter((123, 456))
+    monkeypatch.setattr(
+        ae, "_get_focused_window_handle", lambda: next(focused_handles))
+    monkeypatch.setattr(ae, "_is_native_edit_control", lambda _hwnd: True)
+    monkeypatch.setattr(ae, "_get_edit_selection", lambda _hwnd: (3, 3))
+    monkeypatch.setattr(ae, "_read_window_text", lambda _hwnd: "st ")
+    monkeypatch.setattr(
+        ae,
+        "_replace_edit_selection",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("must not replace text after focus changed")),
+    )
+
+    assert not ae._replace_native_edit_suffix("st ", "keep stable ", 0)
+
+
+def test_replace_uses_native_edit_path_without_clipboard(monkeypatch):
+    monkeypatch.setattr(ae, "_replace_native_edit_suffix", lambda *_args: True)
+    monkeypatch.setattr(
+        ae,
+        "_clipboard_get_text",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("native edit replacement must not read clipboard")),
+    )
+    engine = ae.AbbrevEngine(object())
+    engine._suppressing = True
+
+    engine._do_replace(3, "keep stable ", "st", "st ")
+
+    assert engine._suppressing is False
+
+
+def test_clipboard_open_retries_short_contention(monkeypatch):
+    class FakeUser32:
+        def __init__(self):
+            self.calls = 0
+
+        def OpenClipboard(self, _owner):
+            self.calls += 1
+            return self.calls == 3
+
+    user32 = FakeUser32()
+    monkeypatch.setattr(ae.time, "sleep", lambda _seconds: None)
+
+    assert ae._open_clipboard_with_retry(user32)
+    assert user32.calls == 3
+
+
+def test_ime_detection_allows_alphanumeric_mode_inside_chinese_ime(monkeypatch):
+    class FakeImm32:
+        @staticmethod
+        def ImmGetContext(_hwnd):
+            return 99
+
+        @staticmethod
+        def ImmGetCompositionStringW(*_args):
+            return 0
+
+        @staticmethod
+        def ImmGetConversionStatus(_himc, _conversion, _sentence):
+            return True
+
+        @staticmethod
+        def ImmGetOpenStatus(_himc):
+            return True
+
+        @staticmethod
+        def ImmReleaseContext(_hwnd, _himc):
+            return True
+
+    class FakeWindll:
+        imm32 = FakeImm32()
+
+    monkeypatch.setattr(ae, "_ensure_imm_configured", lambda: None)
+    monkeypatch.setattr(ae, "_get_focused_window_handle", lambda: 200)
+    monkeypatch.setattr(ae.ctypes, "windll", FakeWindll())
+
+    assert not ae.should_skip_for_input_method()
+
+
+def test_ime_detection_falls_back_to_foreground_context(monkeypatch):
+    seen_handles = []
+
+    class FakeImm32:
+        @staticmethod
+        def ImmGetContext(hwnd):
+            seen_handles.append(hwnd)
+            return 99 if hwnd == 100 else 0
+
+        @staticmethod
+        def ImmGetCompositionStringW(*_args):
+            return 0
+
+        @staticmethod
+        def ImmGetConversionStatus(_himc, conversion_pointer, _sentence):
+            conversion = ctypes.cast(
+                conversion_pointer, ctypes.POINTER(ae.wintypes.DWORD)).contents
+            conversion.value = ae._IME_CMODE_NATIVE
+            return True
+
+        @staticmethod
+        def ImmGetOpenStatus(_himc):
+            return False
+
+        @staticmethod
+        def ImmReleaseContext(_hwnd, _himc):
+            return True
+
+    class FakeUser32:
+        @staticmethod
+        def GetForegroundWindow():
+            return 100
+
+    class FakeWindll:
+        imm32 = FakeImm32()
+        user32 = FakeUser32()
+
+    monkeypatch.setattr(ae, "_ensure_imm_configured", lambda: None)
+    monkeypatch.setattr(ae, "_get_focused_window_handle", lambda: 200)
+    monkeypatch.setattr(ae.ctypes, "windll", FakeWindll())
+
+    assert ae.should_skip_for_input_method()
+    assert seen_handles == [200, 100]
