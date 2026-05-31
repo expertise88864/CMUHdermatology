@@ -99,7 +99,6 @@ from cmuh_common.abbrev_engine import (
     ensure_config_file as ensure_abbrev_config_file,
     load_config as load_abbrev_config,
     save_config as save_abbrev_config,
-    render_expansion as render_abbrev_expansion,
 )
 # 【重構 2026-05-21】熱鍵座標縮放（原本 main.py 用 _scaled_xy 卻沒定義 — 潛在 NameError）
 from cmuh_common.hotkey_scaling import (  # noqa: E402
@@ -2259,14 +2258,27 @@ def script_F5_adaptive():
 
 F8_QUICK_TEXT_DEFAULT = "dtderm25"
 
+# [v10] F8 quick text mtime-guarded 快取：避免每次按 F8 都重讀+parse JSON，
+# 但檔案被改 (mtime 變) 時自動重讀 → 維持「設定頁改完不用重啟即時生效」。
+_F8_QUICK_TEXT_CACHE = {"mtime": None, "value": F8_QUICK_TEXT_DEFAULT}
+
 
 def _load_f8_quick_text() -> str:
     """從 threshold_settings.json 讀 quick_text_f8，失敗回預設 dtderm25。
-    每次按 F8 都重讀 → 設定頁改完不用重啟即時生效。"""
-    cfg = load_json_dict(get_conf_path('threshold_settings.json'), {},
-                         merge_defaults=False)
+    mtime 沒變就回快取；變了 (設定頁存檔) 才重讀，兼顧效率與即時生效。"""
+    path = get_conf_path('threshold_settings.json')
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = None
+    if mtime is not None and mtime == _F8_QUICK_TEXT_CACHE["mtime"]:
+        return _F8_QUICK_TEXT_CACHE["value"]
+    cfg = load_json_dict(path, {}, merge_defaults=False)
     t = cfg.get('quick_text_f8', F8_QUICK_TEXT_DEFAULT)
-    return str(t) if t else F8_QUICK_TEXT_DEFAULT
+    value = str(t) if t else F8_QUICK_TEXT_DEFAULT
+    _F8_QUICK_TEXT_CACHE["mtime"] = mtime
+    _F8_QUICK_TEXT_CACHE["value"] = value
+    return value
 
 
 def script_F8_quick_text():
@@ -10412,7 +10424,14 @@ class AutomationApp:
                                                                 finally:
                                                                     with self._alert_state_lock:
                                                                         self._alert_popup_active[nk] = False
-                                                            threading.Thread(target=_notify_worker, name="NotifyThread", daemon=True).start()
+                                                            # [v10] 防 latch：start() 失敗（thread 耗盡等）會讓 gate
+                                                            # 永久卡 True → 該診次當天不再提醒。失敗即重置 gate。
+                                                            try:
+                                                                threading.Thread(target=_notify_worker, name="NotifyThread", daemon=True).start()
+                                                            except Exception:
+                                                                logging.exception("[ALERT] NotifyThread 啟動失敗，重置 gate 避免永久卡死")
+                                                                with self._alert_state_lock:
+                                                                    self._alert_popup_active[notify_key] = False
                                         except Exception as e: 
                                             logging.error(f"Error checking threshold: {e}")
                                 

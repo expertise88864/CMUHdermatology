@@ -378,11 +378,6 @@ def should_skip_for_input_method() -> bool:
         return False
 
 
-# 舊名稱相容（外部不應再用，但保留 import 不爆）
-def is_ime_active_for_foreground() -> bool:
-    return should_skip_for_input_method()
-
-
 # -----------------------------------------------------------------------------
 # 外部文字展開程式偵測 (PhraseExpress 等) — 避免雙重展開衝突
 # -----------------------------------------------------------------------------
