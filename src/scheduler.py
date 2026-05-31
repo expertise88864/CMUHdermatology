@@ -2482,6 +2482,7 @@ def fetch_duty_doctor(ui_queue: "Queue[UiMessage]", session: requests.Session, r
         doctor_name = "查詢錯誤"
     
     put_ui_message(ui_queue, UiDutyDoctorMessage(doctor_name=doctor_name))
+    return doctor_name not in {"查詢失敗", "網路錯誤", "查詢錯誤"}
 
 def fetch_saturday_duty_doctor(ui_queue: "Queue[UiMessage]", session: requests.Session, r_doctor_map: dict[str, Any]):
     logging.info("Attempting to fetch this week's Saturday duty doctor...")
@@ -2520,6 +2521,7 @@ def fetch_saturday_duty_doctor(ui_queue: "Queue[UiMessage]", session: requests.S
         ui_queue,
         UiSaturdayDutyDoctorMessage(saturday_date=saturday_date, doctor_name=doctor_name),
     )
+    return doctor_name not in {"查詢失敗", "網路錯誤", "查詢錯誤"}
 
 def fetch_duty_vs(ui_queue: "Queue[UiMessage]", session: requests.Session, vs_type: str):
     is_saturday = (vs_type == 'saturday_vs')
@@ -2579,6 +2581,7 @@ def fetch_duty_vs(ui_queue: "Queue[UiMessage]", session: requests.Session, vs_ty
         put_ui_message(ui_queue, UiSaturdayVsMessage(doctor_name=doctor_name))
     else:
         put_ui_message(ui_queue, UiTodayVsMessage(doctor_name=doctor_name))
+    return doctor_name not in {"查詢失敗", "網路錯誤", "查詢錯誤"}
 
 # --- 門診動態 reg64.cgi TimeCode（與 appointment.cmuh.org.tw/cgi-bin/reg64.cgi 參數一致）---
 # 【重構 2026-05-21】抽到 cmuh_common.reg64_utils（與 main.py 共用）
@@ -2716,6 +2719,10 @@ class AutomationApp:
         self._reg64_last_good_total = {}
         self._reg64_dynamic_ttl_seconds = REG64_MICRO_CACHE_SECONDS
         self._duty_last_fetch_date = None
+        self._duty_fetch_worker_running = False
+        self._duty_fetch_lock = threading.Lock()
+        self._update_check_running = False
+        self._update_check_lock = threading.Lock()
         self._last_full_refresh_snapshot = None
         self._last_full_refresh_ts = 0.0
         self._initial_priority_refresh_done = False
@@ -5277,7 +5284,7 @@ class AutomationApp:
         top_bar_frame = ttk.Frame(scrollable_frame)
         top_bar_frame.pack(fill=tk.X, pady=(0, 20))
         ttk.Label(top_bar_frame, text=f"目前版本: {CURRENT_VERSION}", foreground="gray", font=("Microsoft JhengHei UI", self.f_sm)).pack(side=tk.LEFT, anchor='w')
-        ttk.Button(top_bar_frame, text="檢查線上更新", command=lambda: self.bg_executor.submit(self.check_and_update, True)).pack(side=tk.RIGHT)
+        ttk.Button(top_bar_frame, text="檢查線上更新", command=lambda: self._submit_update_check(True)).pack(side=tk.RIGHT)
 
         # [修改] 建立容器，並定義三個直行
         columns_container = ttk.Frame(scrollable_frame)
@@ -6542,9 +6549,10 @@ class AutomationApp:
     def _run_single_duty_query(self, fn, third_arg):
         s = _get_thread_local_duty_session()
         try:
-            fn(self.ui_queue, s, third_arg)
+            return bool(fn(self.ui_queue, s, third_arg))
         except Exception as e:
             logging.error(f"_fetch_all_duty_info: {fn.__name__} error: {e}", exc_info=True)
+            return False
 
     def _fetch_all_duty_info(self, force=False):
         """並行查詢值班（forward01）。每筆獨立 Session，總耗時約為最慢一筆，而非四筆相加。
@@ -6552,32 +6560,48 @@ class AutomationApp:
         """
         if self.val_out_of_hospital:
             logging.info("院外模式開啟中，跳過所有值班查詢")
-            return
+            return False
         today_str = date.today().isoformat()
-        if (not force) and self._duty_last_fetch_date == today_str:
-            logging.info("值班資訊今日已查詢，略過重抓（跨日才強制更新）")
-            return
+        with self._duty_fetch_lock:
+            if self._duty_fetch_worker_running:
+                logging.info("值班資訊上一輪仍在查詢，略過重複請求")
+                return False
+            if (not force) and self._duty_last_fetch_date == today_str:
+                logging.info("值班資訊今日已查詢，略過重抓（跨日才強制更新）")
+                return True
+            self._duty_fetch_worker_running = True
 
-        duty_jobs = [
-            (fetch_duty_doctor, self.r_doctor_map),
-            (fetch_saturday_duty_doctor, self.r_doctor_map),
-            (fetch_duty_vs, "today_vs"),
-            (fetch_duty_vs, "saturday_vs"),
-        ]
-        with ThreadPoolExecutor(
-            max_workers=len(duty_jobs),
-            thread_name_prefix="DutyInfo",
-        ) as duty_pool:
-            futures = [
-                duty_pool.submit(self._run_single_duty_query, fetch_func, third_arg)
-                for fetch_func, third_arg in duty_jobs
+        try:
+            duty_jobs = [
+                (fetch_duty_doctor, self.r_doctor_map),
+                (fetch_saturday_duty_doctor, self.r_doctor_map),
+                (fetch_duty_vs, "today_vs"),
+                (fetch_duty_vs, "saturday_vs"),
             ]
-            for f in as_completed(futures):
-                try:
-                    f.result()
-                except Exception as e:
-                    logging.error(f"_fetch_all_duty_info future: {e}", exc_info=True)
-        self._duty_last_fetch_date = today_str
+            all_succeeded = True
+            with ThreadPoolExecutor(
+                max_workers=len(duty_jobs),
+                thread_name_prefix="DutyInfo",
+            ) as duty_pool:
+                futures = [
+                    duty_pool.submit(self._run_single_duty_query, fetch_func, third_arg)
+                    for fetch_func, third_arg in duty_jobs
+                ]
+                for f in as_completed(futures):
+                    try:
+                        if not f.result():
+                            all_succeeded = False
+                    except Exception as e:
+                        all_succeeded = False
+                        logging.error(f"_fetch_all_duty_info future: {e}", exc_info=True)
+            if all_succeeded:
+                self._duty_last_fetch_date = today_str
+            else:
+                logging.warning("值班資訊部分查詢失敗，不寫入今日完成快取")
+            return all_succeeded
+        finally:
+            with self._duty_fetch_lock:
+                self._duty_fetch_worker_running = False
 
     def _get_doctor_threshold_map(self, doctor_name):
         return build_doctor_threshold_map(doctor_name, self.threshold_settings)
@@ -6741,7 +6765,7 @@ class AutomationApp:
             schedule.every().day.at("08:00").do(lambda: run_named_job("clock-status-0800", self.update_clock_status_from_web)).tag("clock", "daily")
             schedule.every().day.at("17:03").do(lambda: run_named_job("clock-status-1703", self.update_clock_status_from_web)).tag("clock", "daily")
             schedule.every().day.at("08:00").do(
-                lambda: run_named_job("check-update-0800", lambda: self.bg_executor.submit(self.check_and_update, False))
+                lambda: run_named_job("check-update-0800", lambda: self._submit_update_check(False))
             ).tag("update-check", "daily")
 
             while not stop_event_main.is_set():
@@ -6792,7 +6816,43 @@ class AutomationApp:
         self._schedule_thread.start()
         self.run_hotkey_guardian()
 
+    def _submit_update_check(self, is_manual=False):
+        future = self.bg_executor.submit(self.check_and_update, is_manual)
+
+        def _handle_update_submit_rejected(fut):
+            try:
+                rejected = fut.cancelled() or isinstance(fut.exception(), RejectedExecutionError)
+            except Exception:
+                rejected = False
+            if not rejected:
+                return
+            logging.warning("更新檢查背景工作未啟動：背景佇列已滿")
+            if is_manual:
+                put_ui_message(self.ui_queue, UiStatusMessage(text="狀態: 背景忙碌，請稍後再檢查更新"))
+                put_ui_message(self.ui_queue, UiAlertErrorMessage(
+                    title="更新檢查忙碌",
+                    msg="目前背景工作較多，請稍後再試。",
+                ))
+
+        future.add_done_callback(_handle_update_submit_rejected)
+        return future
+
     def check_and_update(self, is_manual=False):
+        with self._update_check_lock:
+            if self._update_check_running:
+                logging.info("更新檢查上一輪仍在執行，略過重複請求")
+                if is_manual:
+                    put_ui_message(self.ui_queue, UiStatusMessage(text="狀態: 更新檢查仍在執行中"))
+                return False
+            self._update_check_running = True
+
+        try:
+            return self._run_update_check(is_manual)
+        finally:
+            with self._update_check_lock:
+                self._update_check_running = False
+
+    def _run_update_check(self, is_manual=False):
         """檢查並更新所有相關程式（改寫自原 check_and_update）。
 
         【保留】平行下載、tuple 版本比較、原子寫入 + .bak 備份、失敗保留本地舊版。

@@ -242,6 +242,33 @@ def test_duty_info_uses_local_executor_instead_of_bg_queue():
         assert "self.bg_executor.submit(self._run_single_duty_query" not in src
 
 
+def test_duty_info_is_single_flight_and_only_caches_complete_success():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        full_src = (ROOT / rel_path).read_text(encoding="utf-8")
+        fetch_src = _function_source(ROOT / rel_path, "_fetch_all_duty_info")
+        single_src = _function_source(ROOT / rel_path, "_run_single_duty_query")
+
+        assert "self._duty_fetch_worker_running = False" in full_src
+        assert "self._duty_fetch_lock = threading.Lock()" in full_src
+        assert "with self._duty_fetch_lock:" in fetch_src
+        assert "if self._duty_fetch_worker_running:" in fetch_src
+        assert "self._duty_fetch_worker_running = True" in fetch_src
+        assert "all_succeeded = True" in fetch_src
+        assert "if all_succeeded:" in fetch_src
+        assert "self._duty_last_fetch_date = today_str" in fetch_src
+        assert "finally:" in fetch_src
+        assert "self._duty_fetch_worker_running = False" in fetch_src
+        assert "return bool(fn(self.ui_queue, s, third_arg))" in single_src
+
+
+def test_duty_queries_report_success_for_daily_cache_decision():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        for name in ("fetch_duty_doctor", "fetch_saturday_duty_doctor", "fetch_duty_vs"):
+            src = _function_source(ROOT / rel_path, name)
+
+            assert 'return doctor_name not in {"查詢失敗", "網路錯誤", "查詢錯誤"}' in src
+
+
 def test_refresh_submit_rejection_restores_ui_state():
     for rel_path in ("src/main.py", "src/scheduler.py"):
         src = _function_source(ROOT / rel_path, "_trigger_refresh")
@@ -371,6 +398,26 @@ def test_startup_background_submits_retry_when_queue_is_full():
         assert "future.add_done_callback(_retry_if_rejected)" in src
         assert '"master-schedule"' in src
         assert '"duty-info"' in src
+
+
+def test_update_check_is_single_flight_and_manual_submit_reports_rejection():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        full_src = (ROOT / rel_path).read_text(encoding="utf-8")
+        submit_src = _function_source(ROOT / rel_path, "_submit_update_check")
+        check_src = _function_source(ROOT / rel_path, "check_and_update")
+        start_src = _function_source(ROOT / rel_path, "start_background_tasks")
+
+        assert "self._update_check_running = False" in full_src
+        assert "self._update_check_lock = threading.Lock()" in full_src
+        assert "future = self.bg_executor.submit(self.check_and_update, is_manual)" in submit_src
+        assert "future.add_done_callback(_handle_update_submit_rejected)" in submit_src
+        assert "RejectedExecutionError" in submit_src
+        assert "with self._update_check_lock:" in check_src
+        assert "if self._update_check_running:" in check_src
+        assert "self._update_check_running = True" in check_src
+        assert "self._update_check_running = False" in check_src
+        assert "self._submit_update_check(False)" in start_src
+        assert "command=lambda: self._submit_update_check(True)" in full_src
 
 
 def test_startup_refresh_avoids_unnecessary_executor_hop():
