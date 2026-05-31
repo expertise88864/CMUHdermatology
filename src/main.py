@@ -5828,6 +5828,8 @@ class AutomationApp:
         self._clock_status_worker_running = False
         self._clinic_duplicate_rooms_notice = ()
         self._clinic_lights_worker_running = False
+        self._clinic_stat_pending_keys = set()
+        self._clinic_stat_pending_lock = threading.Lock()
         self._future_tab_grid_stale = True  # 未來週次分頁需在資料更新後重繪；切回時若未過期可跳過以減少卡頓
         self._bottom_links_hidden = False  # 與 links_frame 顯示狀態同步，避免重複 grid 觸發版面重算
         self._subsystem_running = False
@@ -6646,10 +6648,18 @@ class AutomationApp:
         return f"{time_str} [{record.levelname}]: {record.getMessage()}"
 
     def _run_on_ui_thread(self, callback):
+        if getattr(self, "_shutting_down", False) or stop_event_main.is_set():
+            return False
         if threading.current_thread() is threading.main_thread():
             callback()
+            return True
         else:
-            self.root.after(0, callback)
+            try:
+                self.root.after(0, callback)
+            except (tk.TclError, RuntimeError):
+                logging.debug("略過已關閉 UI 的 callback", exc_info=True)
+                return False
+            return True
 
     def _refresh_duty_summary_text(self):
         if not hasattr(self, "duty_row1_prefix_var"):
@@ -8222,8 +8232,7 @@ class AutomationApp:
                             want_metrics = bool(save_durations) and completed_count_ui > 0
                             want_closing = bool(is_ended and close_time_save)
                             if should_save and tracker['doc_name'] and (want_metrics or want_closing):
-                                self.bg_executor.submit(
-                                    self._save_clinic_session_stat,
+                                stat_submitted = self._submit_clinic_session_stat(
                                     room_code,
                                     tracker['doc_name'],
                                     completed_count_ui,
@@ -8233,7 +8242,7 @@ class AutomationApp:
                                     total_reg_save,
                                     int(tracker.get('phototherapy_count', 0)),
                                 )
-                                if is_ended:
+                                if is_ended and stat_submitted:
                                     tracker['is_saved'] = True
                                 
                     except Exception as e: 
@@ -8542,6 +8551,52 @@ class AutomationApp:
         )
 
 # --- [新增] 計算統計數據並存檔 ---
+    def _submit_clinic_session_stat(self, room_code, doc_name, completed_count, durations, closing_time_str="", session_str=None, total_reg=None, phototherapy=0):
+        """同診間、醫師、時段僅保留一筆待寫入工作，避免輪詢期間重複堆積。"""
+        pending_key = (str(room_code), str(doc_name), str(session_str or ""))
+        with self._clinic_stat_pending_lock:
+            if pending_key in self._clinic_stat_pending_keys:
+                logging.debug("診間統計仍在寫入，略過重複提交: %s", pending_key)
+                return False
+            self._clinic_stat_pending_keys.add(pending_key)
+
+        try:
+            future = self.bg_executor.submit(
+                self._save_clinic_session_stat,
+                room_code,
+                doc_name,
+                completed_count,
+                durations,
+                closing_time_str,
+                session_str,
+                total_reg,
+                phototherapy,
+            )
+        except RuntimeError:
+            with self._clinic_stat_pending_lock:
+                self._clinic_stat_pending_keys.discard(pending_key)
+            logging.warning("診間統計背景工作未啟動：executor 已關閉")
+            return False
+
+        def _release_pending_key(fut):
+            with self._clinic_stat_pending_lock:
+                self._clinic_stat_pending_keys.discard(pending_key)
+            try:
+                rejected = fut.cancelled() or isinstance(fut.exception(), RejectedExecutionError)
+            except Exception:
+                rejected = False
+            if rejected:
+                logging.warning("診間統計背景工作未啟動：背景佇列已滿")
+
+        future.add_done_callback(_release_pending_key)
+        try:
+            return not (
+                future.cancelled()
+                or (future.done() and isinstance(future.exception(), RejectedExecutionError))
+            )
+        except Exception:
+            return True
+
     def _save_clinic_session_stat(self, room_code, doc_name, completed_count, durations, closing_time_str="", session_str=None, total_reg=None, phototherapy=0):
         today_str = date.today().strftime("%Y/%m/%d")
         session = _canonical_clinic_session_str(

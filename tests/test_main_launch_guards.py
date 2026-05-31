@@ -291,6 +291,36 @@ def test_clinic_worker_submit_rejection_clears_running_flag():
         assert "self._clinic_lights_worker_running = False" in src
 
 
+def test_clinic_stat_submit_is_deduplicated_and_retries_rejected_closing_save():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        full_src = (ROOT / rel_path).read_text(encoding="utf-8")
+        loop_src = _function_source(ROOT / rel_path, "_update_clinic_lights_loop")
+        submit_src = _function_source(ROOT / rel_path, "_submit_clinic_session_stat")
+
+        assert "self._clinic_stat_pending_keys = set()" in full_src
+        assert "self._clinic_stat_pending_lock = threading.Lock()" in full_src
+        assert "if pending_key in self._clinic_stat_pending_keys:" in submit_src
+        assert "self._clinic_stat_pending_keys.add(pending_key)" in submit_src
+        assert "self._clinic_stat_pending_keys.discard(pending_key)" in submit_src
+        assert "future = self.bg_executor.submit(" in submit_src
+        assert "except RuntimeError:" in submit_src
+        assert "RejectedExecutionError" in submit_src
+        assert "future.add_done_callback(_release_pending_key)" in submit_src
+        assert "stat_submitted = self._submit_clinic_session_stat(" in loop_src
+        assert "if is_ended and stat_submitted:" in loop_src
+
+
+def test_ui_thread_dispatch_skips_callbacks_during_shutdown():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "_run_on_ui_thread")
+
+        assert 'getattr(self, "_shutting_down", False)' in src
+        assert "stop_event_main.is_set()" in src
+        assert "except (tk.TclError, RuntimeError):" in src
+        assert src.count("return False") >= 2
+        assert src.count("return True") >= 2
+
+
 def test_refresh_entrypoint_reroutes_to_tk_thread():
     for rel_path in ("src/main.py", "src/scheduler.py"):
         src = _function_source(ROOT / rel_path, "_trigger_refresh")
