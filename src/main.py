@@ -68,6 +68,7 @@ from cmuh_common.clinic_light_history import (
 )
 from cmuh_common.platform_win import (
     is_admin, run_as_admin, set_dpi_awareness, set_app_user_model_id, get_idle_duration,
+    get_virtual_screen_rect, get_primary_monitor_size,
 )
 from cmuh_common.notifications import show_windows_notification
 from cmuh_common.icons import ensure_cmuh_app_icon_path as _ensure_cmuh_app_icon_path
@@ -5772,8 +5773,12 @@ class AutomationApp:
         except tk.TclError: self.root.geometry("1280x720")
         _apply_tk_window_icon(self.root)
         
-        self.screen_width = self.root.winfo_screenwidth()
-        self.screen_height = self.root.winfo_screenheight()
+        # [雙螢幕] 解析度偵測一律以「主螢幕」為準(GetSystemMetrics)，而非虛擬桌面。
+        # winfo_screenwidth() 在 Windows 雖然也回主螢幕，但用 GetSystemMetrics 可確保
+        # 「精準命中 1920×1080 → 不縮放」的行為，不受 Tk 版本差異影響(避免誤觸座標縮放)。
+        _prim_w, _prim_h = get_primary_monitor_size()
+        self.screen_width = _prim_w or self.root.winfo_screenwidth()
+        self.screen_height = _prim_h or self.root.winfo_screenheight()
         self.hotkey_version = None
         if self.screen_width == 1920 and self.screen_height == 1080:
             self.hotkey_version = '1920x1080'
@@ -11283,18 +11288,35 @@ class AutomationApp:
                     title="更新錯誤", msg=f"檢查更新時發生錯誤: {e}"))
 
     def show_reboot_countdown(self, timeout=30):
-        """顯示全螢幕置頂倒數視窗"""
+        """顯示置頂倒數視窗（橫跨所有螢幕，內容置於主螢幕中央）"""
         top = tk.Toplevel(self.root)
         top.title("系統即將重開機")
-        top.attributes('-topmost', True) # 置頂
-        top.attributes('-fullscreen', True) # 全螢幕
-        top.configure(bg="#B71C1C") # 紅色背景警示
+        top.overrideredirect(True)  # 無邊框 overlay
+        top.attributes('-topmost', True)  # 置頂
+        top.configure(bg="#B71C1C")  # 紅色背景警示
+        # [雙螢幕] 橫跨整個虛擬桌面，避免警示只蓋住其中一個螢幕而被忽略
+        vx, vy, vw, vh = get_virtual_screen_rect()
+        try:
+            top.geometry(f"{vw}x{vh}+{vx}+{vy}")
+        except tk.TclError:
+            top.attributes('-fullscreen', True)
+        try:
+            top.focus_force()  # overrideredirect 視窗需主動搶焦點，<Key> 取消才有效
+        except tk.TclError:
+            pass
 
-        label = tk.Label(top, text=f"系統偵測閒置，將自動重開機維護\n\n{timeout} 秒後執行...", 
+        # 內容置於「主螢幕」中央（而非跨螢幕中央，避免文字落在兩螢幕接縫）
+        prim_w, prim_h = get_primary_monitor_size()
+        if prim_w <= 0 or prim_h <= 0:
+            prim_w, prim_h = vw, vh
+        content = tk.Frame(top, bg="#B71C1C")
+        content.place(x=(prim_w // 2) - vx, y=(prim_h // 2) - vy, anchor="center")
+
+        label = tk.Label(content, text=f"系統偵測閒置，將自動重開機維護\n\n{timeout} 秒後執行...",
                          font=("Microsoft JhengHei UI", 48, "bold"), fg="white", bg="#B71C1C")
         label.pack(expand=True)
 
-        cancel_btn = tk.Button(top, text="取消重開機 (Cancel)", font=("Microsoft JhengHei UI", 24), 
+        cancel_btn = tk.Button(content, text="取消重開機 (Cancel)", font=("Microsoft JhengHei UI", 24),
                                command=top.destroy, bg="white", fg="black", padx=50, pady=20)
         cancel_btn.pack(pady=50)
 

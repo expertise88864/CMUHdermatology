@@ -45,7 +45,13 @@ from PIL import ImageGrab  # noqa: E402
 
 from cmuh_common.logging_setup import setup_logging  # noqa: E402
 from cmuh_common.paths import get_log_path  # noqa: E402
+from cmuh_common.platform_win import set_dpi_awareness  # noqa: E402
 from cmuh_common.version import CURRENT_VERSION  # noqa: E402
+
+# DPI 感知必須在任何視窗/座標讀取前設定，且要與 main.py / scheduler.py 一致
+# （都用 per-monitor v2），否則本工具記錄的座標(邏輯像素)會與自動化執行時
+# 使用的座標(實體像素)在縮放螢幕上對不上。
+set_dpi_awareness()
 
 setup_logging(get_log_path("coord_detector.log"))
 logging.info("=== coord_detector v%s 啟動 ===", CURRENT_VERSION)
@@ -152,7 +158,9 @@ class CoordinateDetectorApp:
 
             if (x, y) != self._last_pos:
                 try:
-                    img = ImageGrab.grab(bbox=(x, y, x + 1, y + 1))
+                    # all_screens=True：才能讀到副螢幕(座標可能為負)的像素，
+                    # 否則 ImageGrab 只截主螢幕，副螢幕一律回 (0,0,0)。
+                    img = ImageGrab.grab(bbox=(x, y, x + 1, y + 1), all_screens=True)
                     r, g, b = img.getpixel((0, 0))[:3]
                 except Exception:
                     r, g, b = self._last_color

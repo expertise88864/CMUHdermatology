@@ -13,6 +13,41 @@ import logging
 import tkinter as tk
 from typing import Callable, Optional
 
+from cmuh_common.platform_win import get_primary_monitor_size, get_virtual_screen_rect
+
+
+def _span_overlay_on_all_screens(overlay: tk.Toplevel) -> tuple:
+    """讓 overlay 覆蓋整個虛擬桌面(所有螢幕)，而非只蓋主螢幕。
+
+    回傳 (vx, vy, prim_w, prim_h)：
+      vx/vy = 虛擬桌面原點(副螢幕在左/上時為負)，供把內容換算到 overlay 內座標；
+      prim_w/prim_h = 主螢幕大小，供提示文字置於「主螢幕中央」(避免落在螢幕接縫)。
+    """
+    vx, vy, vw, vh = get_virtual_screen_rect()
+    try:
+        overlay.overrideredirect(True)
+    except tk.TclError:
+        pass
+    try:
+        overlay.geometry(f"{vw}x{vh}+{vx}+{vy}")
+    except tk.TclError:
+        try:
+            overlay.attributes('-fullscreen', True)
+        except tk.TclError:
+            pass
+    prim_w, prim_h = get_primary_monitor_size()
+    if prim_w <= 0 or prim_h <= 0:
+        prim_w, prim_h = vw, vh
+    return vx, vy, prim_w, prim_h
+
+
+def _place_on_primary(widget: tk.Widget, vx: int, vy: int,
+                      prim_w: int, prim_h: int, rely: float) -> None:
+    """把 widget 放在「主螢幕」的水平中央、垂直 rely 比例處(換算成 overlay 內座標)。"""
+    widget.place(x=(prim_w // 2) - vx,
+                 y=int(prim_h * rely) - vy,
+                 anchor="center")
+
 
 def pick_pixel(parent: tk.Misc, on_done: Callable[[int, int, int, int, int], None]) -> None:
     """進入像素拾取模式。
@@ -50,22 +85,15 @@ def pick_pixel(parent: tk.Misc, on_done: Callable[[int, int, int, int, int], Non
             pass
 
     overlay = tk.Toplevel()
-    try:
-        overlay.attributes('-fullscreen', True)
-    except Exception:
-        sw = overlay.winfo_screenwidth()
-        sh = overlay.winfo_screenheight()
-        overlay.geometry(f"{sw}x{sh}+0+0")
+    # [雙螢幕] overlay 覆蓋整個虛擬桌面，使用者才能在「任一螢幕」上點選座標
+    vx, vy, prim_w, prim_h = _span_overlay_on_all_screens(overlay)
     overlay.attributes('-topmost', True)
     overlay.attributes('-alpha', 0.30)  # 30% 不透明（讓使用者看得到背景）
     overlay.configure(bg="#000000")
     overlay.config(cursor='cross')
     overlay.focus_force()
 
-    sw = overlay.winfo_screenwidth()
-    sh = overlay.winfo_screenheight()
-
-    # 中央提示文字
+    # 中央提示文字（置於主螢幕中央，避免落在兩螢幕接縫）
     info_label = tk.Label(
         overlay,
         text="🎯 移動滑鼠到目標位置後左鍵點擊\nESC 或右鍵 = 取消",
@@ -73,9 +101,9 @@ def pick_pixel(parent: tk.Misc, on_done: Callable[[int, int, int, int, int], Non
         fg="#FFFFFF",
         bg="#000000",
     )
-    info_label.place(relx=0.5, rely=0.45, anchor="center")
+    _place_on_primary(info_label, vx, vy, prim_w, prim_h, 0.45)
 
-    # 角落顯示即時座標
+    # 即時座標顯示
     coord_label = tk.Label(
         overlay,
         text="(?, ?)  rgb=?",
@@ -83,7 +111,7 @@ def pick_pixel(parent: tk.Misc, on_done: Callable[[int, int, int, int, int], Non
         fg="#00E676",
         bg="#000000",
     )
-    coord_label.place(relx=0.5, rely=0.55, anchor="center")
+    _place_on_primary(coord_label, vx, vy, prim_w, prim_h, 0.55)
 
     state = {"done": False, "last_pos": (-1, -1), "last_rgb": (0, 0, 0)}
 
@@ -114,7 +142,8 @@ def pick_pixel(parent: tk.Misc, on_done: Callable[[int, int, int, int, int], Non
                 # 抓該點的 RGB（透過 overlay 30% alpha，但 ImageGrab 抓的是螢幕 framebuffer）
                 try:
                     from PIL import ImageGrab
-                    img = ImageGrab.grab(bbox=(x, y, x + 1, y + 1))
+                    # all_screens=True：才能讀到副螢幕(座標可能為負)的像素
+                    img = ImageGrab.grab(bbox=(x, y, x + 1, y + 1), all_screens=True)
                     px = img.getpixel((0, 0))
                     if isinstance(px, int):
                         r = g = b = px
@@ -193,10 +222,8 @@ def pick_pixel_with_accurate_color(parent: tk.Misc,
 
 def _show_picker_overlay(parent, windows_to_hide, on_done):
     overlay = tk.Toplevel()
-    try:
-        overlay.attributes('-fullscreen', True)
-    except Exception:
-        pass
+    # [雙螢幕] overlay 覆蓋整個虛擬桌面，使用者才能在「任一螢幕」上點選座標
+    vx, vy, prim_w, prim_h = _span_overlay_on_all_screens(overlay)
     overlay.attributes('-topmost', True)
     overlay.attributes('-alpha', 0.10)  # 接近透明（10%）
     overlay.configure(bg="#000000")
@@ -210,7 +237,7 @@ def _show_picker_overlay(parent, windows_to_hide, on_done):
         fg="#FFEB3B",
         bg="#000000",
     )
-    info_label.place(relx=0.5, rely=0.05, anchor="n")
+    _place_on_primary(info_label, vx, vy, prim_w, prim_h, 0.05)
 
     coord_label = tk.Label(
         overlay,
@@ -219,7 +246,7 @@ def _show_picker_overlay(parent, windows_to_hide, on_done):
         fg="#00E676",
         bg="#000000",
     )
-    coord_label.place(relx=0.5, rely=0.10, anchor="n")
+    _place_on_primary(coord_label, vx, vy, prim_w, prim_h, 0.10)
 
     state = {"done": False, "x": 0, "y": 0}
 
@@ -234,7 +261,8 @@ def _show_picker_overlay(parent, windows_to_hide, on_done):
             def grab_after():
                 try:
                     from PIL import ImageGrab
-                    img = ImageGrab.grab(bbox=(x, y, x + 1, y + 1))
+                    # all_screens=True：才能讀到副螢幕(座標可能為負)的像素
+                    img = ImageGrab.grab(bbox=(x, y, x + 1, y + 1), all_screens=True)
                     px = img.getpixel((0, 0))
                     if isinstance(px, int):
                         r = g = b = px

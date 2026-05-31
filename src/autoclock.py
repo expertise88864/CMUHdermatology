@@ -61,6 +61,7 @@ from cmuh_common.logging_setup import (  # noqa: E402
     setup_logging,
 )
 from cmuh_common.paths import get_app_dir, get_settings_dir, restart_self  # noqa: E402
+from cmuh_common.platform_win import set_dpi_awareness  # noqa: E402
 from cmuh_common.single_instance import ensure_single_instance, release_single_instance  # noqa: E402
 from cmuh_common.task_gate import ActiveTaskGate  # noqa: E402
 from cmuh_common.version import CURRENT_VERSION  # noqa: E402
@@ -1380,6 +1381,8 @@ def _run_test_ui() -> None:
 def main() -> None:
     if not ensure_single_instance(AUTOCLOCK_MUTEX_NAME):
         return
+    # DPI 感知：設定視窗在高 DPI/縮放螢幕上才不會模糊，並與其他程式一致
+    set_dpi_awareness()
     try:
         _setup_clock_logging()
         logging.info("=== autoclock v%s 啟動 ===", CURRENT_VERSION)
