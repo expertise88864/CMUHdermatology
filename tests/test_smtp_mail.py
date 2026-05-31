@@ -53,6 +53,35 @@ def test_successful_send_keeps_rate_limit_slot(monkeypatch):
     smtp_mail._recent_send_reservations.clear()
 
 
+def test_negative_retry_count_still_sends_once(monkeypatch):
+    smtp_mail._recent_send_reservations.clear()
+    sent = []
+    monkeypatch.setattr(
+        smtp_mail,
+        "_send_once",
+        lambda *_args, **_kwargs: sent.append("sent"),
+    )
+
+    smtp_mail.send_mail(
+        ["recipient@example.com"], "subject", "body",
+        override_credentials=_credentials(), max_retries=-1,
+    )
+
+    assert sent == ["sent"]
+    smtp_mail._recent_send_reservations.clear()
+
+
+@pytest.mark.parametrize("value", [True, None, "bad"])
+def test_bad_retry_count_uses_default(value):
+    assert smtp_mail._normalize_max_retries(value) == \
+        smtp_mail.DEFAULT_MAX_RETRIES
+
+
+def test_retry_count_is_clamped():
+    assert smtp_mail._normalize_max_retries(-5) == 0
+    assert smtp_mail._normalize_max_retries(999) == smtp_mail.MAX_RETRIES
+
+
 @pytest.mark.parametrize("bad_port", [True, -1, 0, 65536, "bad"])
 def test_load_credentials_replaces_invalid_smtp_port(tmp_path, monkeypatch,
                                                      bad_port):

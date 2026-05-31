@@ -15,6 +15,7 @@ import subprocess
 import threading
 from pathlib import Path
 
+from cmuh_common.atomic_io import atomic_write_json
 from cmuh_common.paths import get_settings_dir
 
 _path_cache_lock = threading.Lock()
@@ -73,13 +74,11 @@ def _read_disk_cache() -> tuple[str, str] | None:
 
 def _write_disk_cache(path: str, chrome_major: str | None) -> None:
     try:
-        _path_cache_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _path_cache_file.with_suffix('.json.tmp')
-        tmp.write_text(
-            json.dumps({"path": path, "chrome_major": chrome_major or ""}, ensure_ascii=False),
-            encoding='utf-8',
+        atomic_write_json(
+            str(_path_cache_file),
+            {"path": path, "chrome_major": chrome_major or ""},
+            indent=2,
         )
-        os.replace(tmp, _path_cache_file)
     except Exception:
         logging.debug("寫 chromedriver 磁碟快取失敗", exc_info=True)
 

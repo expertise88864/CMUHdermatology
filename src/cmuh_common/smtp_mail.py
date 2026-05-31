@@ -53,6 +53,8 @@ import collections as _collections
 import threading as _threading
 RATE_LIMIT_WINDOW_SEC = 3600   # 統計區間 1 小時
 RATE_LIMIT_MAX = 30            # 1 小時內最多 30 封
+DEFAULT_MAX_RETRIES = 2
+MAX_RETRIES = 5
 _rate_limit_lock = _threading.Lock()
 _recent_send_reservations: "collections.deque" = _collections.deque(
     maxlen=RATE_LIMIT_MAX * 4)
@@ -60,6 +62,17 @@ _recent_send_reservations: "collections.deque" = _collections.deque(
 
 class SmtpRateLimitExceeded(RuntimeError):
     """寄信頻率超過 RATE_LIMIT_MAX/小時的保護性錯誤。"""
+
+
+def _normalize_max_retries(value) -> int:
+    """Clamp retry counts so bad config cannot skip sending or retry forever."""
+    if isinstance(value, bool):
+        return DEFAULT_MAX_RETRIES
+    try:
+        retries = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_RETRIES
+    return max(0, min(MAX_RETRIES, retries))
 
 
 def _reserve_rate_limit_slot() -> tuple[float, object]:
@@ -200,7 +213,7 @@ def send_mail(recipients: list, subject: str, body: str,
               attachment_path: Optional[Path] = None,
               timeout: float = 60.0,
               override_credentials: Optional[dict] = None,
-              max_retries: int = 2) -> None:
+              max_retries: int = DEFAULT_MAX_RETRIES) -> None:
     """同步寄一封信。失敗 raise；成功 log info。
 
     recipients: list of "x@y.z"
@@ -209,7 +222,7 @@ def send_mail(recipients: list, subject: str, body: str,
     max_retries: 暫時性錯誤 (timeout / 網路) 最多重試次數 (預設 2 → 共最多
                   跑 3 次)。認證錯誤這類「不會自己好」的不會重試。
 
-    Retry strategy：exponential backoff 2s → 5s → 10s (上限)。
+    Retry strategy：exponential backoff 2s → 4s → 8s → 10s (上限)。
     """
     if not recipients:
         raise RuntimeError("沒有設定收件人")
@@ -230,6 +243,7 @@ def send_mail(recipients: list, subject: str, body: str,
         subject=subject, body=body,
         attachment_path=attachment_path,
     )
+    max_retries = _normalize_max_retries(max_retries)
     reservation = _reserve_rate_limit_slot()
 
     import time as _time

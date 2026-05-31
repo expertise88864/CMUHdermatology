@@ -44,3 +44,75 @@ def test_migrate_legacy_json_imports_rows_and_renames_backup(monkeypatch):
         assert rows == [("D123", "2026-05-24", "[1, 2, 3]")]
         assert not os.path.exists(legacy)
         assert os.path.exists(legacy + ".migrated.bak")
+
+
+def test_save_selected_doctor_empty_result_removes_stale_rows(monkeypatch):
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    sc._ensure_schema(conn)
+    conn.execute(
+        "INSERT INTO clinic_counts(doc_no, date_iso, payload, updated_at) "
+        "VALUES (?, ?, ?, ?)",
+        ("D123", "2026-05-24", "[1]", 1.0),
+    )
+    conn.execute(
+        "INSERT INTO clinic_counts(doc_no, date_iso, payload, updated_at) "
+        "VALUES (?, ?, ?, ?)",
+        ("D456", "2026-05-24", "[2]", 1.0),
+    )
+    monkeypatch.setattr(sc, "_initialized", True)
+    monkeypatch.setattr(sc, "_get_conn", lambda: conn)
+
+    sc.save_clinic_counts({"D123": {}}, only_doctor_no="D123")
+
+    assert conn.execute(
+        "SELECT doc_no FROM clinic_counts ORDER BY doc_no"
+    ).fetchall() == [("D456",)]
+
+
+def test_save_selected_doctor_error_preserves_stale_rows(monkeypatch):
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    sc._ensure_schema(conn)
+    conn.execute(
+        "INSERT INTO clinic_counts(doc_no, date_iso, payload, updated_at) "
+        "VALUES (?, ?, ?, ?)",
+        ("D123", "2026-05-24", "[1]", 1.0),
+    )
+    monkeypatch.setattr(sc, "_initialized", True)
+    monkeypatch.setattr(sc, "_get_conn", lambda: conn)
+
+    sc.save_clinic_counts(
+        {"D123": {"error": "network unavailable"}},
+        only_doctor_no="D123",
+    )
+
+    assert conn.execute(
+        "SELECT doc_no FROM clinic_counts"
+    ).fetchall() == [("D123",)]
+
+
+def test_initialize_failure_closes_partial_connection_and_allows_retry(monkeypatch):
+    closed = []
+    monkeypatch.setattr(sc, "_initialized", False)
+    monkeypatch.setattr(sc, "_get_conn", lambda: object())
+    monkeypatch.setattr(
+        sc,
+        "_ensure_schema",
+        lambda _conn: (_ for _ in ()).throw(RuntimeError("disk unavailable")),
+    )
+    monkeypatch.setattr(sc, "_close_cached_conn", lambda: closed.append(True))
+
+    assert sc._ensure_initialized() is False
+    assert closed == [True]
+    assert sc._initialized is False
+
+
+def test_load_returns_empty_without_query_when_initialize_fails(monkeypatch):
+    monkeypatch.setattr(sc, "_ensure_initialized", lambda: False)
+    monkeypatch.setattr(
+        sc,
+        "_get_conn",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("must not query a partially initialized database")),
+    )
+
+    assert sc.load_clinic_counts() == {}

@@ -616,6 +616,8 @@ def _configure_win32_signatures() -> None:
     k.GlobalLock.restype = wintypes.LPVOID
     k.GlobalUnlock.argtypes = [wintypes.HANDLE]
     k.GlobalUnlock.restype = wintypes.BOOL
+    k.GlobalFree.argtypes = [wintypes.HANDLE]
+    k.GlobalFree.restype = wintypes.HANDLE
 
 
 _WIN32_CONFIGURED = False
@@ -660,35 +662,46 @@ def _clipboard_get_text() -> Optional[str]:
 
 def _clipboard_set_text(text: str) -> bool:
     """寫 unicode 文字到剪貼簿；成功 True。"""
+    h_mem = None
     try:
         _ensure_win32_configured()
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
         # 字串 + null terminator
         data = (text + "\x00").encode("utf-16-le")
+        # 先配置並填好記憶體，再碰剪貼簿。配置失敗時保留使用者原內容。
+        h_mem = kernel32.GlobalAlloc(_GMEM_MOVEABLE, len(data))
+        if not h_mem:
+            return False
+        p = kernel32.GlobalLock(h_mem)
+        if not p:
+            return False
+        try:
+            ctypes.memmove(p, data, len(data))
+        finally:
+            kernel32.GlobalUnlock(h_mem)
+
         if not _open_clipboard_with_retry(user32):
             return False
         try:
-            user32.EmptyClipboard()
-            h_mem = kernel32.GlobalAlloc(_GMEM_MOVEABLE, len(data))
-            if not h_mem:
+            if not user32.EmptyClipboard():
                 return False
-            p = kernel32.GlobalLock(h_mem)
-            if not p:
-                return False
-            try:
-                ctypes.memmove(p, data, len(data))
-            finally:
-                kernel32.GlobalUnlock(h_mem)
             # 注意：SetClipboardData 接管 h_mem 所有權；成功後勿 GlobalFree
             if not user32.SetClipboardData(_CF_UNICODETEXT, h_mem):
                 return False
+            h_mem = None
             return True
         finally:
             user32.CloseClipboard()
     except Exception:
         logging.debug("[abbrev] clipboard write 失敗", exc_info=True)
         return False
+    finally:
+        if h_mem:
+            try:
+                ctypes.windll.kernel32.GlobalFree(h_mem)
+            except Exception:
+                logging.debug("[abbrev] clipboard memory free 失敗", exc_info=True)
 
 
 # -----------------------------------------------------------------------------

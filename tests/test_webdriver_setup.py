@@ -31,3 +31,24 @@ def test_detect_chrome_version_powershell_uses_no_window(monkeypatch):
     assert ws._detect_chrome_major_version() == "123"
     assert calls
     assert calls[0][1]["creationflags"] == 0x08000000
+
+
+def test_write_disk_cache_uses_shared_atomic_json_writer(monkeypatch, tmp_path):
+    calls = []
+    cache_path = tmp_path / "chromedriver_path.json"
+    monkeypatch.setattr(ws, "_path_cache_file", cache_path)
+    monkeypatch.setattr(
+        ws,
+        "atomic_write_json",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    ws._write_disk_cache("C:/driver/chromedriver.exe", "123")
+
+    assert calls == [(
+        (str(cache_path), {
+            "path": "C:/driver/chromedriver.exe",
+            "chrome_major": "123",
+        }),
+        {"indent": 2},
+    )]

@@ -230,6 +230,59 @@ def test_clipboard_open_retries_short_contention(monkeypatch):
     assert user32.calls == 3
 
 
+def test_clipboard_write_does_not_clear_existing_data_when_allocation_fails(monkeypatch):
+    events = []
+
+    class FakeKernel32:
+        @staticmethod
+        def GlobalAlloc(_flags, _size):
+            events.append("alloc")
+            return 0
+
+    class FakeUser32:
+        @staticmethod
+        def EmptyClipboard():
+            events.append("empty")
+            return True
+
+    class FakeWindll:
+        kernel32 = FakeKernel32()
+        user32 = FakeUser32()
+
+    monkeypatch.setattr(ae, "_ensure_win32_configured", lambda: None)
+    monkeypatch.setattr(ae.ctypes, "windll", FakeWindll())
+
+    assert not ae._clipboard_set_text("new text")
+    assert events == ["alloc"]
+
+
+def test_clipboard_write_frees_memory_when_lock_fails(monkeypatch):
+    freed = []
+
+    class FakeKernel32:
+        @staticmethod
+        def GlobalAlloc(_flags, _size):
+            return 777
+
+        @staticmethod
+        def GlobalLock(_handle):
+            return 0
+
+        @staticmethod
+        def GlobalFree(handle):
+            freed.append(handle)
+
+    class FakeWindll:
+        kernel32 = FakeKernel32()
+        user32 = object()
+
+    monkeypatch.setattr(ae, "_ensure_win32_configured", lambda: None)
+    monkeypatch.setattr(ae.ctypes, "windll", FakeWindll())
+
+    assert not ae._clipboard_set_text("new text")
+    assert freed == [777]
+
+
 def test_ime_detection_allows_alphanumeric_mode_inside_chinese_ime(monkeypatch):
     class FakeImm32:
         @staticmethod

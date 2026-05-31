@@ -8,7 +8,7 @@
 
 API（與原 _save_cache/load_cached_data 介面相容）：
   - load_clinic_counts() -> dict[doc_no, dict[date, list]]
-  - save_clinic_counts(all_doctors_data, *, only_changed_doctors=None)
+  - save_clinic_counts(all_doctors_data, *, only_doctor_no=None)
 """
 from __future__ import annotations
 
@@ -145,20 +145,23 @@ def _json_default(o: Any):
     raise TypeError(f"Type {type(o)} not JSON serializable")
 
 
-def _ensure_initialized() -> None:
+def _ensure_initialized() -> bool:
     global _initialized
     if _initialized:
-        return
+        return True
     with _db_lock:
         if _initialized:
-            return
+            return True
         try:
             conn = _get_conn()
             _ensure_schema(conn)
             _migrate_legacy_json_if_present(conn)
             _initialized = True
+            return True
         except Exception:
             logging.error("[O22] SQLite 初始化失敗", exc_info=True)
+            _close_cached_conn()
+            return False
 
 
 def _normalize_date_key(k) -> Optional[str]:
@@ -183,8 +186,9 @@ def load_clinic_counts(*, since_date: Optional[str] = None) -> dict:
         since_date: ISO date string (YYYY-MM-DD)；只載 date_iso >= since_date 的 row。
                     None = 載全部。冷啟動建議傳今天的日期，省 100-300ms。
     """
-    _ensure_initialized()
     out: dict[str, dict[str, Any]] = {}
+    if not _ensure_initialized():
+        return out
     try:
         with _db_lock:
             conn = _get_conn()
@@ -211,18 +215,27 @@ def save_clinic_counts(all_doctors_data: dict,
 
     Args:
         all_doctors_data: {doc_no: {date_or_str: appointments}}
-        only_doctor_no: 若指定，僅更新該醫師的所有日期 row（其他醫師原 row 保留）
+        only_doctor_no: 若指定，僅更新該醫師的所有日期 row（其他醫師原 row 保留）。
+                        明確傳入空 dict 代表查詢成功但無門診，會清掉該醫師舊 row。
     """
-    _ensure_initialized()
+    if not _ensure_initialized():
+        return
     if not isinstance(all_doctors_data, dict):
         return
     now = time.time()
     rows = []
+    selected_doctor_no = (
+        str(only_doctor_no) if only_doctor_no is not None else None
+    )
+    selected_doctor_has_valid_data = False
     for doc_no, doc_data in all_doctors_data.items():
-        if only_doctor_no and doc_no != only_doctor_no:
+        normalized_doc_no = str(doc_no)
+        if selected_doctor_no is not None and normalized_doc_no != selected_doctor_no:
             continue
         if not isinstance(doc_data, dict) or "error" in doc_data:
             continue
+        if selected_doctor_no is not None:
+            selected_doctor_has_valid_data = True
         for k, payload in doc_data.items():
             date_iso = _normalize_date_key(k)
             if date_iso is None:
@@ -232,17 +245,23 @@ def save_clinic_counts(all_doctors_data: dict,
             except Exception:
                 logging.debug("[O22] 跳過無法序列化的 payload", exc_info=True)
                 continue
-            rows.append((str(doc_no), str(date_iso), payload_str, now))
+            rows.append((normalized_doc_no, str(date_iso), payload_str, now))
 
-    if not rows:
+    should_clear_selected_doctor = (
+        selected_doctor_no is not None and selected_doctor_has_valid_data
+    )
+    if not rows and not should_clear_selected_doctor:
         return
     try:
         with _db_lock:
             conn = _get_conn()
             conn.execute("BEGIN")
             try:
-                if only_doctor_no:
-                    conn.execute("DELETE FROM clinic_counts WHERE doc_no = ?", (only_doctor_no,))
+                if should_clear_selected_doctor:
+                    conn.execute(
+                        "DELETE FROM clinic_counts WHERE doc_no = ?",
+                        (selected_doctor_no,),
+                    )
                 # 全量寫入時不 DELETE 全部（保留歷史 row 以避免 race condition），用 UPSERT
                 conn.executemany(
                     "INSERT OR REPLACE INTO clinic_counts(doc_no, date_iso, payload, updated_at) "
@@ -259,7 +278,8 @@ def save_clinic_counts(all_doctors_data: dict,
 
 def vacuum_old_entries(*, older_than_days: int = 30) -> int:
     """清掉超過 N 天的 row（看更老的 date_iso）。回傳刪除筆數。"""
-    _ensure_initialized()
+    if not _ensure_initialized():
+        return 0
     cutoff = (datetime.now().date() - _date_offset(older_than_days)).isoformat()
     try:
         with _db_lock:
