@@ -7,6 +7,19 @@ from typing import Any, Callable
 
 
 DEFAULT_CLINIC_ROOMS = ("101", "102")
+LEGACY_DEFAULT_CLINIC_ROOMS = ("181", "182")
+
+
+def normalize_clinic_rooms(value: Any) -> tuple[list[str], bool]:
+    """Normalize two clinic rooms and migrate the historical 181/182 default."""
+    if not isinstance(value, list):
+        return list(DEFAULT_CLINIC_ROOMS), True
+    rooms = [str(room or "").strip() for room in value[:2]]
+    while len(rooms) < 2:
+        rooms.append("")
+    if tuple(rooms) == LEGACY_DEFAULT_CLINIC_ROOMS:
+        return list(DEFAULT_CLINIC_ROOMS), True
+    return rooms, rooms != value
 
 
 def clinic_dynamic_today_str() -> str:

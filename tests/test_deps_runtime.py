@@ -32,3 +32,22 @@ def test_find_missing_libs_reports_transitive_import_failure(monkeypatch):
         ("psutil", "psutil"),
         ("pyautogui", "pyautogui"),
     ]) == [("pyautogui", "pyautogui")]
+
+
+def test_all_modules_discoverable_detects_removed_cached_dependency(monkeypatch):
+    monkeypatch.setattr(
+        dr.importlib.util,
+        "find_spec",
+        lambda name: None if name == "pyautogui" else object(),
+    )
+
+    assert dr._all_modules_discoverable([
+        ("psutil", "psutil"),
+        ("pyautogui", "pyautogui"),
+    ]) is False
+
+
+def test_all_modules_discoverable_accepts_present_dependencies(monkeypatch):
+    monkeypatch.setattr(dr.importlib.util, "find_spec", lambda _name: object())
+
+    assert dr._all_modules_discoverable([("psutil", "psutil")]) is True

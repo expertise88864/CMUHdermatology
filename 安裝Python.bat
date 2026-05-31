@@ -42,7 +42,7 @@ set "PY_OK=0"
 for /f "usebackq delims=" %%v in (`python -c "import sys; print(1 if sys.version_info >= (3,10) else 0)" 2^>nul`) do set "PY_OK=%%v"
 if not "%PY_OK%"=="1" goto :check_per_user
 
-for /f "usebackq delims=" %%p in (`where python 2^>nul`) do if not defined PYEXE set "PYEXE=%%p"
+for /f "usebackq delims=" %%p in (`python -c "import sys; print(sys.executable)" 2^>nul`) do set "PYEXE=%%p"
 echo       found in PATH: %PYEXE%
 goto :install_deps
 

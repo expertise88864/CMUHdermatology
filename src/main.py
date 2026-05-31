@@ -50,6 +50,7 @@ from cmuh_common.clinic_state import (
     clinic_dynamic_today_str,
     matching_state_keys,
     new_clinic_tracker,
+    normalize_clinic_rooms,
     prune_states_for_today,
     restore_tracker_from_state,
     state_matches,
@@ -6428,8 +6429,10 @@ class AutomationApp:
         ttk.Button(btn_row, text="取消", command=dlg.destroy).pack(side=tk.RIGHT)
 
     def _safe_load_clinic_settings(self) -> dict:
-        return load_json_dict(get_conf_path('clinic_settings.json'), {},
-                              merge_defaults=False)
+        settings = load_json_dict(get_conf_path('clinic_settings.json'), {},
+                                  merge_defaults=False)
+        settings["rooms"], _changed = normalize_clinic_rooms(settings.get("rooms"))
+        return settings
 
     def _init_styles(self):
         try:
@@ -7652,9 +7655,7 @@ class AutomationApp:
         if getattr(self, "clinic_room_vars", None):
             return
         saved_settings = self.load_clinic_settings()
-        saved_rooms = saved_settings.get("rooms", list(DEFAULT_CLINIC_ROOMS))
-        if not isinstance(saved_rooms, list):
-            saved_rooms = list(DEFAULT_CLINIC_ROOMS)
+        saved_rooms, _changed = normalize_clinic_rooms(saved_settings.get("rooms"))
         saved_modes = saved_settings.get("time_modes")
         if not isinstance(saved_modes, list):
             saved_modes = []
@@ -8755,8 +8756,17 @@ class AutomationApp:
     def load_clinic_settings(self):
         # [修改] 預設更新頻率改為 60 秒 (符合您的需求)
         default_settings = {"rooms": list(DEFAULT_CLINIC_ROOMS), "time_modes": ["auto", "auto"]}
-        return load_json_dict(get_conf_path('clinic_settings.json'),
-                              default_settings)
+        file_path = get_conf_path('clinic_settings.json')
+        settings = load_json_dict(file_path, default_settings)
+        rooms, changed = normalize_clinic_rooms(settings.get("rooms"))
+        settings["rooms"] = rooms
+        if changed:
+            try:
+                _atomic_write_json(file_path, settings)
+                logging.info("門診動態診間設定已遷移為: %s", rooms)
+            except Exception:
+                logging.warning("門診動態診間設定遷移寫回失敗", exc_info=True)
+        return settings
 
     # --- [新增] 儲存門診動態設定 ---
     def save_clinic_settings(self):

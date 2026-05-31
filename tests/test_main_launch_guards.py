@@ -351,6 +351,15 @@ def test_clinic_room_defaults_use_shared_101_102_constant():
     assert '["181", "182"]' not in scheduler_src
 
 
+def test_clinic_room_settings_migrate_legacy_defaults_on_load():
+    for rel_path in ("src/main.py", "src/scheduler.py"):
+        src = _function_source(ROOT / rel_path, "load_clinic_settings")
+
+        assert "normalize_clinic_rooms(settings.get(\"rooms\"))" in src
+        assert "_atomic_write_json(file_path, settings)" in src
+        assert "門診動態診間設定已遷移為" in src
+
+
 def test_scheduled_background_submits_detect_rejected_futures():
     for rel_path in ("src/main.py", "src/scheduler.py"):
         src = _function_source(ROOT / rel_path, "start_background_tasks")

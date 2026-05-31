@@ -31,7 +31,7 @@ from cmuh_common.cache_state import (
     decode_date_keys as _decode_cache_date_keys,
     save_json_cache,
 )
-from cmuh_common.clinic_state import DEFAULT_CLINIC_ROOMS
+from cmuh_common.clinic_state import DEFAULT_CLINIC_ROOMS, normalize_clinic_rooms
 from cmuh_common.master_schedule_cache import (
     load_master_schedule_cache,
     refresh_master_schedule_if_needed,
@@ -3797,9 +3797,7 @@ class AutomationApp:
         clinic_status_frame.pack(fill='both', expand=True, pady=0, anchor='n')
 
         saved_settings = self.load_clinic_settings()
-        saved_rooms = saved_settings.get("rooms", list(DEFAULT_CLINIC_ROOMS))
-        if not isinstance(saved_rooms, list):
-            saved_rooms = list(DEFAULT_CLINIC_ROOMS)
+        saved_rooms, _changed = normalize_clinic_rooms(saved_settings.get("rooms"))
         saved_modes = saved_settings.get("time_modes")
         if not isinstance(saved_modes, list):
             saved_modes = []
@@ -4943,8 +4941,17 @@ class AutomationApp:
     def load_clinic_settings(self):
         # [修改] 預設更新頻率改為 60 秒 (符合您的需求)
         default_settings = {"rooms": list(DEFAULT_CLINIC_ROOMS), "time_modes": ["auto", "auto"]}
-        return load_json_dict(get_conf_path('clinic_settings.json'),
-                              default_settings)
+        file_path = get_conf_path('clinic_settings.json')
+        settings = load_json_dict(file_path, default_settings)
+        rooms, changed = normalize_clinic_rooms(settings.get("rooms"))
+        settings["rooms"] = rooms
+        if changed:
+            try:
+                _atomic_write_json(file_path, settings)
+                logging.info("門診動態診間設定已遷移為: %s", rooms)
+            except Exception:
+                logging.warning("門診動態診間設定遷移寫回失敗", exc_info=True)
+        return settings
 
     # --- [新增] 儲存門診動態設定 ---
     def save_clinic_settings(self):

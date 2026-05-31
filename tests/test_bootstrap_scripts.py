@@ -16,6 +16,7 @@ def test_root_python_setup_stays_ascii_and_verifies_imports():
     assert "settings\\python_setup.log" in setup_text
     assert "--prefer-binary" in setup_text
     assert "2>&1" in setup_text
+    assert 'python -c "import sys; print(sys.executable)"' in setup_text
 
 
 def test_deploy_installer_verifies_imports_and_fails_closed():
@@ -25,6 +26,14 @@ def test_deploy_installer_verifies_imports_and_fails_closed():
     assert "settings\\python_setup.log" in src
     assert "--prefer-binary" in src
     assert "if errorlevel 1" in src
+    assert 'python -c "import sys; print(sys.executable)"' in src
+    assert 'for %%p in ("!PYTHON_EXE!") do set PYTHONW=%%~dppythonw.exe' in src
+    assert '"!PYTHON_EXE!" -m compileall' in src
+    assert "if errorlevel 1 ( echo [錯誤] 解壓縮失敗" in src
+    assert "if errorlevel 1 ( popd & echo [錯誤] git pull 失敗" in src
+    assert "if errorlevel 1 ( echo [錯誤] git clone 失敗" in src
+    assert "if errorlevel 1 ( echo [錯誤] 下載 pip 安裝器失敗" in src
+    assert "if errorlevel 1 ( echo [錯誤] 安裝 pip 失敗" in src
 
 
 def test_manifest_sync_includes_dependency_bootstrap_files():

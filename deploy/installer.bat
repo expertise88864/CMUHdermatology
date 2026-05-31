@@ -60,20 +60,27 @@ if errorlevel 1 (
     set ZIP_FILE=%TEMP%\cmuh_src.zip
     powershell -NoProfile -Command "Invoke-WebRequest -Uri '!ZIP_URL!' -OutFile '!ZIP_FILE!' -UseBasicParsing"
     if errorlevel 1 ( echo [錯誤] 下載失敗 & pause & exit /b 1 )
+    if exist "%TEMP%\cmuh_extract" rmdir /s /q "%TEMP%\cmuh_extract"
     powershell -NoProfile -Command "Expand-Archive -Path '!ZIP_FILE!' -DestinationPath '%TEMP%\cmuh_extract' -Force"
+    if errorlevel 1 ( echo [錯誤] 解壓縮失敗 & pause & exit /b 1 )
     xcopy /e /i /y "%TEMP%\cmuh_extract\%GITHUB_REPO%-%GITHUB_BRANCH%\*" "!INSTALL_DIR!\" >nul
+    if errorlevel 1 ( echo [錯誤] 複製原始碼失敗 & pause & exit /b 1 )
     del /f /q "!ZIP_FILE!"
     rmdir /s /q "%TEMP%\cmuh_extract"
 ) else (
     if exist "!INSTALL_DIR!\.git" (
         echo     已存在 .git，執行 git pull
-        pushd "!INSTALL_DIR!" & git pull origin %GITHUB_BRANCH% & popd
+        pushd "!INSTALL_DIR!"
+        git pull origin %GITHUB_BRANCH%
+        if errorlevel 1 ( popd & echo [錯誤] git pull 失敗 & pause & exit /b 1 )
+        popd
     ) else (
         if exist "!INSTALL_DIR!\src" (
             echo     [警告] 目錄非空但不是 git repo，先清空
             rmdir /s /q "!INSTALL_DIR!" & mkdir "!INSTALL_DIR!"
         )
         git clone --depth 1 --branch %GITHUB_BRANCH% "https://github.com/%GITHUB_OWNER%/%GITHUB_REPO%.git" "!INSTALL_DIR!"
+        if errorlevel 1 ( echo [錯誤] git clone 失敗 & pause & exit /b 1 )
     )
 )
 echo     原始碼就緒
@@ -82,9 +89,10 @@ echo.
 REM ====== 4. Embedded Python（如需要）======
 echo [4/5] 設定 Python 環境...
 if !USE_SYSTEM_PY!==1 (
-    set PYTHONW=pythonw
-    set PYTHON_EXE=python
-    echo     使用系統 Python
+    for /f "usebackq delims=" %%p in (`python -c "import sys; print(sys.executable)"`) do set PYTHON_EXE=%%p
+    for %%p in ("!PYTHON_EXE!") do set PYTHONW=%%~dppythonw.exe
+    if not exist "!PYTHONW!" set PYTHONW=!PYTHON_EXE!
+    echo     使用系統 Python: !PYTHON_EXE!
 ) else (
     set PY_DIR=!INSTALL_DIR!\python_embed
     if not exist "!PY_DIR!\python.exe" (
@@ -103,7 +111,9 @@ if !USE_SYSTEM_PY!==1 (
 
         echo     安裝 pip ...
         powershell -NoProfile -Command "Invoke-WebRequest -Uri '%GET_PIP_URL%' -OutFile '%TEMP%\get-pip.py' -UseBasicParsing"
+        if errorlevel 1 ( echo [錯誤] 下載 pip 安裝器失敗 & pause & exit /b 1 )
         "!PY_DIR!\python.exe" "%TEMP%\get-pip.py" --no-warn-script-location
+        if errorlevel 1 ( echo [錯誤] 安裝 pip 失敗 & pause & exit /b 1 )
         del /f /q "%TEMP%\get-pip.py"
     )
     set PYTHONW=!PY_DIR!\pythonw.exe
@@ -139,7 +149,7 @@ REM ====== 4c. [O8] 預編譯 .pyc 加速首次啟動 ======
 if exist "!INSTALL_DIR!\src" (
     echo     預編譯 .pyc ...
     if !USE_SYSTEM_PY!==1 (
-        python -m compileall -q -j 0 "!INSTALL_DIR!\src" 2>nul
+        "!PYTHON_EXE!" -m compileall -q -j 0 "!INSTALL_DIR!\src" 2>nul
     ) else (
         "!PY_DIR!\python.exe" -m compileall -q -j 0 "!INSTALL_DIR!\src" 2>nul
     )

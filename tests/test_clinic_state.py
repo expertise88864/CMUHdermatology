@@ -13,6 +13,7 @@ from cmuh_common.clinic_state import (  # noqa: E402
     int_set,
     matching_state_keys,
     new_clinic_tracker,
+    normalize_clinic_rooms,
     prune_states_for_today,
     restore_tracker_from_state,
     state_matches,
@@ -21,6 +22,16 @@ from cmuh_common.clinic_state import (  # noqa: E402
 
 def test_default_clinic_rooms_are_101_and_102():
     assert DEFAULT_CLINIC_ROOMS == ("101", "102")
+
+
+def test_normalize_clinic_rooms_migrates_legacy_defaults():
+    assert normalize_clinic_rooms(["181", "182"]) == (["101", "102"], True)
+
+
+def test_normalize_clinic_rooms_preserves_custom_rooms_and_repairs_bad_values():
+    assert normalize_clinic_rooms([" 201 ", "202"]) == (["201", "202"], True)
+    assert normalize_clinic_rooms(["201", "202"]) == (["201", "202"], False)
+    assert normalize_clinic_rooms("bad") == (["101", "102"], True)
 
 
 def _canon(value):
