@@ -306,12 +306,21 @@ def load_config() -> dict:
 
 # ─── pythonw 路徑 ────────────────────────────────────────────────────────
 def find_pythonw() -> str:
-    """1) python_embed/pythonw.exe  2) PATH 上的 pythonw  3) 找不到 → ''"""
+    """Find a Python launcher suitable for detached watchdog restarts."""
     embed = _ROOT / "python_embed" / "pythonw.exe"
     if embed.exists():
         return str(embed)
+    current_exe = Path(sys.executable).resolve()
+    sibling = current_exe.with_name("pythonw.exe")
+    if sibling.exists():
+        return str(sibling)
     import shutil
-    return shutil.which("pythonw.exe") or shutil.which("pythonw") or ""
+    from_path = shutil.which("pythonw.exe") or shutil.which("pythonw")
+    if from_path:
+        return from_path
+    if current_exe.exists():
+        return str(current_exe)
+    return ""
 
 
 # ─── Process 列舉 ────────────────────────────────────────────────────────
@@ -572,7 +581,7 @@ def claim_action_lock(prog_name: str, max_age_sec: int) -> bool:
         return False
     except Exception:
         logging.exception("[watchdog] lock 操作失敗 (%s)", prog_name)
-        return True  # 失敗時保險選「允許動手」
+        return False  # Fail closed: wait for the next tick instead of risking duplicate restarts.
 
 
 # ─── 單一程式 tick ──────────────────────────────────────────────────────

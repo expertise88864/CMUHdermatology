@@ -112,6 +112,8 @@ running = threading.Event()
 running.set()
 background_thread: threading.Thread | None = None
 tray_icon_object = None
+_exit_lock = threading.Lock()
+_exit_started = False
 log_queue: queue.Queue = queue.Queue(maxsize=5000)
 LOG_POLL_MAX_RECORDS = 200
 clock_lock = threading.RLock()  # 【穩定性 2026-05-21】RLock 避免 janitor 與 process_clock_task 重入時 deadlock
@@ -1287,6 +1289,11 @@ def exit_action(icon=None, item=None) -> None:
       3. 0.5s 給 message pump 收尾，然後 os._exit(0) 強制退 — 跳過 atexit
          (本來 atexit 也只是 taskkill chromedriver 不需 graceful)
     """
+    global _exit_started
+    with _exit_lock:
+        if _exit_started:
+            return
+        _exit_started = True
     logging.info("使用者要求退出程式...")
     running.clear()
     if tray_icon_object:

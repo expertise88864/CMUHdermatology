@@ -107,3 +107,62 @@ def test_health_stats_interval_uses_monotonic_clock():
 
     assert "now_stats = time.monotonic()" in src
     assert "now_stats = time.time()" not in src
+
+
+def test_ram_warning_streak_does_not_count_as_critical_streak():
+    high, critical = health._next_ram_streaks(450, 400, 800, 0, 0)
+    high, critical = health._next_ram_streaks(500, 400, 800, high, critical)
+    high, critical = health._next_ram_streaks(900, 400, 800, high, critical)
+
+    assert high == 3
+    assert critical == 1
+
+
+def test_ram_warning_resets_critical_streak():
+    high, critical = health._next_ram_streaks(900, 400, 800, 0, 0)
+    high, critical = health._next_ram_streaks(500, 400, 800, high, critical)
+
+    assert high == 2
+    assert critical == 0
+
+
+def test_health_monitor_start_failure_allows_retry(monkeypatch):
+    tag = "test-start-failure"
+    health._started_for.discard(tag)
+
+    class FailingThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(health.threading, "Thread", FailingThread)
+
+    try:
+        health.start_health_monitor(tag)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("thread start failure should propagate")
+
+    assert tag not in health._started_for
+
+
+def test_health_monitor_constructor_failure_allows_retry(monkeypatch):
+    tag = "test-constructor-failure"
+    health._started_for.discard(tag)
+
+    def fail_thread(**_kwargs):
+        raise RuntimeError("thread constructor unavailable")
+
+    monkeypatch.setattr(health.threading, "Thread", fail_thread)
+
+    try:
+        health.start_health_monitor(tag)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("thread constructor failure should propagate")
+
+    assert tag not in health._started_for

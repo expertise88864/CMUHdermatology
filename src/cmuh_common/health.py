@@ -132,6 +132,21 @@ def _disk_free_mb(path: str) -> Optional[float]:
         return None
 
 
+def _next_ram_streaks(
+    rss_mb: float,
+    ram_warn_mb: float,
+    ram_crit_mb: float,
+    high_streak: int,
+    critical_streak: int,
+) -> tuple[int, int]:
+    """Track warning and critical RAM streaks independently."""
+    if rss_mb >= ram_crit_mb:
+        return high_streak + 1, critical_streak + 1
+    if rss_mb >= ram_warn_mb:
+        return high_streak + 1, 0
+    return 0, 0
+
+
 def _flush_logging_handlers_nonblocking() -> None:
     """os._exit 前盡量 flush log，但不可卡在 logging handler lock。"""
     try:
@@ -174,6 +189,7 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
         auto_restart_on_crit)
 
     consecutive_high_ram = 0
+    consecutive_critical_ram = 0
     last_network_down_log = 0.0
     last_disk_warn = 0.0
     # 時鐘漂移：紀錄 (time.time, time.monotonic) 配對，每 tick 比較 delta
@@ -205,23 +221,29 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
                 logging.debug("[health/%s] RAM stats unavailable; "
                               "continuing network/disk checks", tag)
             elif rss_mb >= ram_crit_mb:
-                consecutive_high_ram += 1
+                consecutive_high_ram, consecutive_critical_ram = _next_ram_streaks(
+                    rss_mb, ram_warn_mb, ram_crit_mb,
+                    consecutive_high_ram, consecutive_critical_ram,
+                )
                 logging.critical(
-                    "[health/%s] RAM=%.0fMB ≥ critical %dMB (連續 %d 次)；"
+                    "[health/%s] RAM=%.0fMB ≥ critical %dMB (連續 critical %d 次)；"
                     "考慮重啟",
-                    tag, rss_mb, ram_crit_mb, consecutive_high_ram)
+                    tag, rss_mb, ram_crit_mb, consecutive_critical_ram)
                 # [A] 若連續超過 critical 達 N 次 → 自動重啟 (記憶體 leak 防護)
                 if (auto_restart_on_crit
-                        and consecutive_high_ram >= crit_persistence_ticks):
+                        and consecutive_critical_ram >= crit_persistence_ticks):
                     logging.critical(
                         "[health/%s] RAM 連續 %d 次 (~%d 分鐘) 都 ≥ critical → "
                         "os._exit(1) 強制重啟 process (外層 watchdog 會接手)",
-                        tag, consecutive_high_ram,
-                        consecutive_high_ram * interval_sec // 60)
+                        tag, consecutive_critical_ram,
+                        consecutive_critical_ram * interval_sec // 60)
                     _flush_logging_handlers_nonblocking()
                     os._exit(1)
             elif rss_mb >= ram_warn_mb:
-                consecutive_high_ram += 1
+                consecutive_high_ram, consecutive_critical_ram = _next_ram_streaks(
+                    rss_mb, ram_warn_mb, ram_crit_mb,
+                    consecutive_high_ram, consecutive_critical_ram,
+                )
                 logging.warning(
                     "[health/%s] RAM=%.0fMB ≥ warn %dMB (連續 %d 次)",
                     tag, rss_mb, ram_warn_mb, consecutive_high_ram)
@@ -230,7 +252,10 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
                     logging.info(
                         "[health/%s] RAM=%.0fMB 已降回安全範圍 (之前連續 %d 次)",
                         tag, rss_mb, consecutive_high_ram)
-                consecutive_high_ram = 0
+                consecutive_high_ram, consecutive_critical_ram = _next_ram_streaks(
+                    rss_mb, ram_warn_mb, ram_crit_mb,
+                    consecutive_high_ram, consecutive_critical_ram,
+                )
                 logging.debug("[health/%s] RAM=%.0fMB OK", tag, rss_mb)
 
             # ─── 網路 ──────────────────────────────────────────────
@@ -314,12 +339,17 @@ def start_health_monitor(tag: str,
         _started_for.add(tag)
     if disk_check_path is None:
         disk_check_path = os.getcwd()
-    t = threading.Thread(
-        target=_health_loop,
-        args=(tag, ram_warn_mb, ram_crit_mb, interval_sec, network_check,
-               auto_restart_on_crit, crit_persistence_ticks, disk_check_path),
-        name=f"HealthMonitor-{tag}",
-        daemon=True,
-    )
-    t.start()
+    try:
+        t = threading.Thread(
+            target=_health_loop,
+            args=(tag, ram_warn_mb, ram_crit_mb, interval_sec, network_check,
+                  auto_restart_on_crit, crit_persistence_ticks, disk_check_path),
+            name=f"HealthMonitor-{tag}",
+            daemon=True,
+        )
+        t.start()
+    except Exception:
+        with _started_lock:
+            _started_for.discard(tag)
+        raise
     return True

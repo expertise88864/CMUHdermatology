@@ -236,6 +236,29 @@ def test_tray_test_email_skips_duplicate_until_worker_finishes(monkeypatch):
     assert len(targets) == 2
 
 
+def test_exit_action_starts_only_one_shutdown_thread(monkeypatch):
+    targets = []
+
+    class FakeThread:
+        def __init__(self, *, target, name=None, daemon=None):
+            targets.append(target)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(consult_query, "_exit_started", False)
+    monkeypatch.setattr(consult_query, "tray_icon_object", None)
+    monkeypatch.setattr(consult_query.threading, "Thread", FakeThread)
+    consult_query.running.set()
+
+    consult_query.exit_action()
+    consult_query.exit_action()
+
+    assert len(targets) == 1
+    assert not consult_query.running.is_set()
+    consult_query.running.set()
+
+
 def test_configure_mode_has_dedicated_single_instance_guard():
     import inspect
 

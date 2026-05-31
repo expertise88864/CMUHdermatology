@@ -171,6 +171,29 @@ def test_run_immediate_test_skips_duplicate_until_worker_finishes(monkeypatch):
     assert len(targets) == 2
 
 
+def test_exit_action_starts_only_one_shutdown_thread(monkeypatch):
+    targets = []
+
+    class FakeThread:
+        def __init__(self, *, target, name=None, daemon=None):
+            targets.append(target)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(autoclock, "_exit_started", False)
+    monkeypatch.setattr(autoclock, "tray_icon_object", None)
+    monkeypatch.setattr(autoclock.threading, "Thread", FakeThread)
+    autoclock.running.set()
+
+    autoclock.exit_action()
+    autoclock.exit_action()
+
+    assert len(targets) == 1
+    assert not autoclock.running.is_set()
+    autoclock.running.set()
+
+
 def test_scheduler_tick_skips_duplicate_clock_task_until_worker_finishes(monkeypatch):
     targets = []
     ran = []

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """watchdog_core 安全行為測試。"""
 import os
+import shutil
 import sys
 import time
 
@@ -231,6 +232,39 @@ def test_claim_action_lock_replaces_stale_lock_atomically(tmp_path, monkeypatch)
 
     assert wc.claim_action_lock("會診查詢", 90) is True
     assert wc.claim_action_lock("會診查詢", 90) is False
+
+
+def test_claim_action_lock_fails_closed_on_io_error(monkeypatch):
+    class BrokenLockDir:
+        def mkdir(self, **_kwargs):
+            raise OSError("disk unavailable")
+
+    monkeypatch.setattr(wc, "LOCK_DIR", BrokenLockDir())
+
+    assert wc.claim_action_lock("打卡", 90) is False
+
+
+def test_find_pythonw_prefers_current_interpreter_sibling(tmp_path, monkeypatch):
+    python = tmp_path / "python.exe"
+    pythonw = tmp_path / "pythonw.exe"
+    python.write_bytes(b"")
+    pythonw.write_bytes(b"")
+
+    monkeypatch.setattr(wc, "_ROOT", tmp_path / "app")
+    monkeypatch.setattr(wc.sys, "executable", str(python))
+
+    assert wc.find_pythonw() == str(pythonw)
+
+
+def test_find_pythonw_falls_back_to_current_interpreter(tmp_path, monkeypatch):
+    python = tmp_path / "python.exe"
+    python.write_bytes(b"")
+
+    monkeypatch.setattr(wc, "_ROOT", tmp_path / "app")
+    monkeypatch.setattr(wc.sys, "executable", str(python))
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+    assert wc.find_pythonw() == str(python)
 
 
 def test_get_loop_timing_tolerates_bad_numeric_config():

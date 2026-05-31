@@ -200,6 +200,8 @@ _flow_lock = threading.Lock()
 _consult_job_gate = ActiveTaskGate(stale_after_sec=45 * 60)
 _test_email_gate = ActiveTaskGate(stale_after_sec=10 * 60)
 tray_icon_object = None
+_exit_lock = threading.Lock()
+_exit_started = False
 log_queue: "queue.Queue" = queue.Queue(maxsize=5000)
 LOG_POLL_MAX_RECORDS = 200
 _config_lock = threading.Lock()
@@ -2159,6 +2161,11 @@ def exit_action(icon=None, item=None) -> None:
     沒退 → process 永遠不結束。改成把 cleanup + os._exit 移到 daemon thread，
     callback 乾淨返回，0.5s 後強制 os._exit。
     """
+    global _exit_started
+    with _exit_lock:
+        if _exit_started:
+            return
+        _exit_started = True
     logging.info("使用者要求退出會診查詢程式")
     running.clear()
     if tray_icon_object:
