@@ -93,9 +93,15 @@ def ensure_dependencies(
     if missing_libs:
         from cmuh_common.deps_installer import DependencyInstaller
         app = DependencyInstaller(required_libs, missing_libs)
-        app.mainloop()
-        is_finished = app.is_finished
-        app.destroy()
+        is_finished = False
+        try:
+            app.mainloop()
+            is_finished = app.is_finished
+        finally:
+            try:
+                app.destroy()
+            except Exception:
+                logging.debug("關閉依賴安裝視窗失敗", exc_info=True)
         del app
         gc.collect()  # [核心修正] 清除 Tkinter 變數，避免背景執行緒 Variable.__del__ 崩潰
         if not is_finished:
@@ -109,6 +115,7 @@ def ensure_dependencies(
 
     # 寫快取
     try:
-        atomic_write_text(deps_cache_file, fingerprint + "\n")
+        if not atomic_write_text(deps_cache_file, fingerprint + "\n"):
+            logging.warning("寫入依賴快取失敗: %s", deps_cache_file)
     except Exception:
         logging.debug("寫依賴快取失敗", exc_info=True)

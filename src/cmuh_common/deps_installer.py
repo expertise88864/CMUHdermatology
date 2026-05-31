@@ -24,6 +24,7 @@ from cmuh_common.paths import get_app_dir, get_settings_dir
 
 # requirements.txt 解析快取（每進程讀一次）
 _REQ_SPECS_CACHE: dict | None = None
+_DEPENDENCY_INSTALL_LOG_MAX_BYTES = 2 * 1024 * 1024
 
 
 def _normalize_pkg(name: str) -> str:
@@ -82,6 +83,23 @@ def _dependency_install_log_path() -> str:
     return os.path.join(get_settings_dir(), "dependency_install.log")
 
 
+def _rotate_dependency_install_log(
+    log_path: str,
+    max_bytes: int = _DEPENDENCY_INSTALL_LOG_MAX_BYTES,
+) -> bool:
+    """Rotate a large pip log before appending another installation attempt."""
+    try:
+        if os.path.getsize(log_path) <= max_bytes:
+            return False
+        os.replace(log_path, log_path + ".bak")
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        logging.debug("[deps] rotate install log failed", exc_info=True)
+        return False
+
+
 class DependencyInstaller(tk.Tk):
     """[修正] missing_libs 用以判斷顯示「首次執行」或「例行驗證」文案。"""
 
@@ -91,6 +109,7 @@ class DependencyInstaller(tk.Tk):
         self.total_libs = len(self.libs) or 1
         self.is_finished = False
         self.failed_libs: list = []  # 安裝失敗的套件 pip 名稱
+        self._closing = False
 
         is_first_run = len(missing_libs) > 0
 
@@ -130,19 +149,36 @@ class DependencyInstaller(tk.Tk):
         ttk.Label(main_frame, textvariable=self.detail_var,
                   font=("Consolas", 8), foreground="gray").pack(anchor="e")
 
+        self.protocol("WM_DELETE_WINDOW", self._request_close)
         threading.Thread(target=self.run_installation, name="DepInstallThread", daemon=True).start()
 
-    def _run_on_ui_thread(self, callback):
-        if threading.current_thread() is threading.main_thread():
-            callback()
-        else:
-            self.after(0, callback)
+    def _request_close(self) -> None:
+        self._closing = True
+        try:
+            self.quit()
+        except tk.TclError:
+            logging.debug("[deps] installer window already closed", exc_info=True)
+
+    def _run_on_ui_thread(self, callback) -> bool:
+        if self._closing:
+            return False
+        try:
+            if threading.current_thread() is threading.main_thread():
+                callback()
+            else:
+                self.after(0, lambda: None if self._closing else callback())
+            return True
+        except (tk.TclError, RuntimeError):
+            logging.debug("[deps] skip UI callback after close", exc_info=True)
+            return False
 
     def run_installation(self):
         step_value = 100 / self.total_libs
         current_progress = 0
 
         for pkg_name, import_name in self.libs:
+            if self._closing:
+                return
             self.update_ui(current_progress, f"檢查元件: {pkg_name}...")
             try:
                 importlib.import_module(import_name)
@@ -181,7 +217,10 @@ class DependencyInstaller(tk.Tk):
                     install_log_path = _dependency_install_log_path()
                     last_err: Exception | None = None
                     for attempt in (1, 2):
+                        if self._closing:
+                            return
                         try:
+                            _rotate_dependency_install_log(install_log_path)
                             with open(install_log_path, "a", encoding="utf-8") as log_file:
                                 log_file.write(
                                     f"\n[deps] install={pkg_name} attempt={attempt} "
@@ -212,6 +251,8 @@ class DependencyInstaller(tk.Tk):
                                 time.sleep(3)
                     if last_err is not None:
                         raise last_err
+                    if self._closing:
+                        return
                     importlib.invalidate_caches()
                     try:
                         importlib.import_module(import_name)
@@ -238,8 +279,11 @@ class DependencyInstaller(tk.Tk):
             return
 
         self.update_ui(100, "環境驗證完成，正在啟動...")
+        self._run_on_ui_thread(self._finish_success)
+
+    def _finish_success(self) -> None:
         self.is_finished = True
-        self.quit()
+        self._request_close()
 
     def _show_failure_and_quit(self) -> None:
         """安裝失敗時顯示明確錯誤對話框，使用者按確定後關閉（is_finished=False）。"""
@@ -262,7 +306,7 @@ class DependencyInstaller(tk.Tk):
         except Exception:
             logging.debug("[deps] 顯示失敗對話框失敗", exc_info=True)
         # is_finished 保持 False → deps_runtime sys.exit(0)
-        self.quit()
+        self._request_close()
 
     def update_ui(self, progress: float, status_text: str) -> None:
         def apply_update():

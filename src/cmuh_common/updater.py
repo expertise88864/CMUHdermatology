@@ -57,6 +57,50 @@ class UpdateResult:
     release_url: str = RELEASE_URL
 
 
+@dataclass(frozen=True)
+class _WrittenFile:
+    target_path: str
+    existed_before: bool
+
+
+def _resolve_target_path(app_dir: str, local_filename: str) -> str:
+    """Resolve a manifest target while keeping writes inside the app directory."""
+    if not isinstance(local_filename, str) or not local_filename.strip():
+        raise ValueError("更新路徑不得為空")
+    if os.path.isabs(local_filename):
+        raise ValueError(f"更新路徑必須為相對路徑: {local_filename}")
+    app_root = os.path.realpath(os.path.abspath(app_dir))
+    target_path = os.path.abspath(os.path.join(app_root, local_filename))
+    target_real_path = os.path.realpath(target_path)
+    try:
+        common_path = os.path.commonpath([app_root, target_real_path])
+    except ValueError as e:
+        raise ValueError(f"更新路徑無效: {local_filename}") from e
+    if os.path.normcase(target_real_path) == os.path.normcase(app_root):
+        raise ValueError(f"更新路徑不得指向程式目錄: {local_filename}")
+    if os.path.normcase(common_path) != os.path.normcase(app_root):
+        raise ValueError(f"更新路徑超出程式目錄: {local_filename}")
+    return target_path
+
+
+def _rollback_written_files(written_files: list[_WrittenFile]) -> list[str]:
+    """Restore files already replaced when a later write in the batch fails."""
+    errors = []
+    for written in reversed(written_files):
+        try:
+            if written.existed_before:
+                backup_path = written.target_path + ".bak"
+                if not os.path.exists(backup_path):
+                    raise FileNotFoundError(f"找不到備份: {backup_path}")
+                os.replace(backup_path, written.target_path)
+            elif os.path.exists(written.target_path):
+                os.remove(written.target_path)
+        except Exception as e:
+            logging.error("更新回滾失敗 [%s]: %s", written.target_path, e)
+            errors.append(f"[rollback] {written.target_path}: {e}")
+    return errors
+
+
 def _fetch_manifest(timeout: float = MANIFEST_TIMEOUT) -> dict:
     """取 manifest.json，加 cache-buster（每小時換一次，享受 GitHub CDN edge cache）。"""
     # 【效能 2026-05-21】每小時 bucket：同一小時內所有人共用 CDN cache（省 100-300ms）
@@ -110,7 +154,7 @@ def _download_one(file_entry: dict, app_dir: str) -> Optional[tuple]:
     expected_version = file_entry.get("version", "0.0.0")
     expected_sha = (file_entry.get("sha256") or "").lower().strip()
 
-    local_path = os.path.join(app_dir, local_filename)
+    local_path = _resolve_target_path(app_dir, local_filename)
 
     # [O1] SHA256 短路：本地內容已是 manifest 期望版 → 直接跳過（最常見路徑）
     if expected_sha and os.path.exists(local_path):
@@ -249,19 +293,48 @@ def check_and_update(
         return result
 
     _progress("writing")
-    written_paths = []
-    for key, local_filename, new_ver, content in pending_writes:
-        target_path = os.path.join(app_dir, local_filename)
+    prepared_writes = []
+    seen_targets = set()
+    for key, local_filename, new_ver, content in sorted(
+        pending_writes, key=lambda item: item[1]
+    ):
+        try:
+            target_path = _resolve_target_path(app_dir, local_filename)
+        except ValueError as e:
+            result.errors.append(f"[{key}] {e}")
+            continue
+        normalized_target = os.path.normcase(target_path)
+        if normalized_target in seen_targets:
+            result.errors.append(f"[{key}] 更新清單重複目標: {local_filename}")
+            continue
+        seen_targets.add(normalized_target)
+        prepared_writes.append((key, local_filename, new_ver, content, target_path))
+
+    if result.errors:
+        logging.warning("更新清單驗證失敗，取消整批寫入")
+        return result
+
+    written_files: list[_WrittenFile] = []
+    for key, local_filename, new_ver, content, target_path in prepared_writes:
+        existed_before = os.path.exists(target_path)
         if atomic_write_text(target_path, content):
             result.updated_files.append((local_filename, new_ver))
-            written_paths.append(target_path)
+            written_files.append(_WrittenFile(target_path, existed_before))
             logging.info("  ✅ 已更新 %s -> v%s", local_filename, new_ver)
         else:
             result.errors.append(f"[{key}] 寫入失敗")
+            break
+
+    if result.errors:
+        rollback_errors = _rollback_written_files(written_files)
+        result.errors.extend(rollback_errors)
+        result.updated_files.clear()
+        logging.warning("更新寫入失敗，已回滾 %d 個檔案", len(written_files))
+        return result
 
     # [O8] 預編譯 .pyc：剛覆寫的 .py 立即 compile，省下次 import 時的 byte-compile 開銷
-    if written_paths:
-        _precompile_files(written_paths)
+    if written_files:
+        _precompile_files([written.target_path for written in written_files])
 
     result.has_update = len(result.updated_files) > 0
     return result

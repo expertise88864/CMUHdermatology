@@ -92,3 +92,40 @@ def test_pip_python_executable_keeps_original_without_console_sibling(tmp_path):
     pythonw.write_bytes(b"")
 
     assert di._pip_python_executable(str(pythonw)) == str(pythonw)
+
+
+def test_rotate_dependency_install_log_keeps_small_log(tmp_path):
+    log_path = tmp_path / "dependency_install.log"
+    log_path.write_text("small", encoding="utf-8")
+
+    assert di._rotate_dependency_install_log(str(log_path), max_bytes=10) is False
+    assert log_path.read_text(encoding="utf-8") == "small"
+    assert not (tmp_path / "dependency_install.log.bak").exists()
+
+
+def test_rotate_dependency_install_log_moves_large_log(tmp_path):
+    log_path = tmp_path / "dependency_install.log"
+    log_path.write_text("long log content", encoding="utf-8")
+
+    assert di._rotate_dependency_install_log(str(log_path), max_bytes=5) is True
+    assert not log_path.exists()
+    assert (tmp_path / "dependency_install.log.bak").read_text(
+        encoding="utf-8"
+    ) == "long log content"
+
+
+def test_run_on_ui_thread_ignores_callback_after_close(monkeypatch):
+    installer = object.__new__(di.DependencyInstaller)
+    installer._closing = False
+    callbacks = []
+    installer.after = lambda _delay, callback: callbacks.append(callback)
+
+    monkeypatch.setattr(di.threading, "current_thread", lambda: object())
+    monkeypatch.setattr(di.threading, "main_thread", lambda: object())
+
+    called = []
+    assert installer._run_on_ui_thread(lambda: called.append(True)) is True
+    installer._closing = True
+    callbacks[0]()
+
+    assert called == []
