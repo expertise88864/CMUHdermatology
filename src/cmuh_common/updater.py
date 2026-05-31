@@ -26,6 +26,7 @@ import requests
 
 from cmuh_common.atomic_io import atomic_write_text
 from cmuh_common.paths import get_app_dir, is_frozen, restart_self
+from cmuh_common.update_policy import get_auto_update_suspend_until
 from cmuh_common.version import CURRENT_VERSION, parse_version
 
 # === GitHub repo 設定 ===
@@ -55,6 +56,7 @@ class UpdateResult:
     manifest_app_version: str = ""
     is_frozen: bool = False
     release_url: str = RELEASE_URL
+    suspended_until: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -231,6 +233,20 @@ def check_and_update(
             except Exception:
                 logging.debug("progress_callback 例外", exc_info=True)
 
+    # Crash-loop protection applies only to deployments that write in place.
+    # Frozen builds may still perform a read-only version check.
+    if write_files is None:
+        write_files = not result.is_frozen
+    if write_files:
+        result.suspended_until = get_auto_update_suspend_until()
+        if result.suspended_until:
+            logging.warning(
+                "[update-policy] auto-update suspended until %s",
+                time.strftime("%Y-%m-%d %H:%M:%S",
+                              time.localtime(result.suspended_until)),
+            )
+            return result
+
     _progress("fetching_manifest")
     try:
         manifest = _fetch_manifest()
@@ -241,10 +257,6 @@ def check_and_update(
 
     result.checked = True
     result.manifest_app_version = manifest.get("app_version", "")
-
-    # 預設：.exe 不寫；.pyw 寫
-    if write_files is None:
-        write_files = not is_frozen()
 
     # === .exe 模式（或被指定為唯讀檢查）===
     if not write_files:

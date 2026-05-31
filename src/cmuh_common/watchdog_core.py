@@ -24,8 +24,9 @@ import threading
 import time
 from pathlib import Path
 
-from cmuh_common.atomic_io import atomic_write_json, atomic_write_text, safe_load_json
+from cmuh_common.atomic_io import atomic_write_json, safe_load_json
 from cmuh_common.process_launch import launch_python_script
+from cmuh_common.update_policy import suspend_auto_updates
 
 # ─── 路徑 ────────────────────────────────────────────────────────────────
 _HERE = Path(__file__).resolve().parent
@@ -153,7 +154,6 @@ _CRASH_LOOP_LOCK = threading.Lock()
 CRASH_LOOP_WINDOW_SEC = 600       # 10 分鐘
 CRASH_LOOP_MAX_RESTARTS = 5       # 內 5 次以上 → 視為 crash loop
 CRASH_LOOP_SUSPEND_SEC = 1800     # 暫停 30 分鐘
-AUTO_UPDATE_SUSPEND_FLAG = SETTINGS_DIR / ".auto_update_suspended_until"
 
 
 def _record_restart_and_check_crash_loop(name: str) -> bool:
@@ -183,14 +183,15 @@ def _record_restart_and_check_crash_loop(name: str) -> bool:
                                 time.localtime(now + CRASH_LOOP_SUSPEND_SEC)))
             # [H] 同時暫停 auto-update 1 小時 (避免又拉到同個爛版本)
             try:
-                atomic_write_text(
-                    str(AUTO_UPDATE_SUSPEND_FLAG),
-                    f"{int(now) + 3600}\n"
-                    f"reason: {name} crash loop at {time.strftime('%Y-%m-%d %H:%M:%S')}\n",
-                    encoding="utf-8")
+                suspend_path = suspend_auto_updates(
+                    f"{name} crash loop at "
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')}",
+                    duration_sec=3600,
+                    now=now,
+                )
                 logging.critical(
                     "[watchdog] 已寫 %s 暫停 auto-update 1 小時",
-                    AUTO_UPDATE_SUSPEND_FLAG)
+                    suspend_path)
             except Exception:
                 logging.exception("[watchdog] 寫 auto-update suspend flag 失敗")
             # 清歷史避免後續又連續觸發

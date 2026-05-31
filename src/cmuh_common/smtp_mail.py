@@ -54,29 +54,41 @@ import threading as _threading
 RATE_LIMIT_WINDOW_SEC = 3600   # 統計區間 1 小時
 RATE_LIMIT_MAX = 30            # 1 小時內最多 30 封
 _rate_limit_lock = _threading.Lock()
-_recent_send_ts: "collections.deque" = _collections.deque(maxlen=RATE_LIMIT_MAX * 4)
+_recent_send_reservations: "collections.deque" = _collections.deque(
+    maxlen=RATE_LIMIT_MAX * 4)
 
 
 class SmtpRateLimitExceeded(RuntimeError):
     """寄信頻率超過 RATE_LIMIT_MAX/小時的保護性錯誤。"""
 
 
-def _rate_limit_check_and_record() -> None:
-    """檢查並紀錄這次寄信時間戳。超過上限 raise SmtpRateLimitExceeded。"""
+def _reserve_rate_limit_slot() -> tuple[float, object]:
+    """Reserve one logical send slot. Roll it back if delivery fails."""
     now = time.time()
     cutoff = now - RATE_LIMIT_WINDOW_SEC
     with _rate_limit_lock:
         # 清掉視窗外的舊紀錄
-        while _recent_send_ts and _recent_send_ts[0] < cutoff:
-            _recent_send_ts.popleft()
-        if len(_recent_send_ts) >= RATE_LIMIT_MAX:
-            oldest_ago = now - _recent_send_ts[0]
+        while (_recent_send_reservations
+               and _recent_send_reservations[0][0] < cutoff):
+            _recent_send_reservations.popleft()
+        if len(_recent_send_reservations) >= RATE_LIMIT_MAX:
+            oldest_ago = now - _recent_send_reservations[0][0]
             raise SmtpRateLimitExceeded(
                 f"SMTP rate limit：過去 {RATE_LIMIT_WINDOW_SEC // 60} 分鐘已寄 "
-                f"{len(_recent_send_ts)} 封 (上限 {RATE_LIMIT_MAX})，"
+                f"{len(_recent_send_reservations)} 封 (上限 {RATE_LIMIT_MAX})，"
                 f"請 {int((RATE_LIMIT_WINDOW_SEC - oldest_ago) // 60)} 分鐘後再試"
             )
-        _recent_send_ts.append(now)
+        reservation = (now, object())
+        _recent_send_reservations.append(reservation)
+        return reservation
+
+
+def _rollback_rate_limit_slot(reservation: tuple[float, object]) -> None:
+    with _rate_limit_lock:
+        try:
+            _recent_send_reservations.remove(reservation)
+        except ValueError:
+            pass
 
 DEFAULT_CREDENTIALS = {
     "host": "smtp.gmail.com",
@@ -111,7 +123,12 @@ def load_credentials() -> dict:
     # 正規化
     cred["host"] = str(cred.get("host") or DEFAULT_CREDENTIALS["host"]).strip()
     try:
-        cred["port"] = int(cred.get("port") or DEFAULT_CREDENTIALS["port"])
+        raw_port = cred.get("port") or DEFAULT_CREDENTIALS["port"]
+        if isinstance(raw_port, bool):
+            raise ValueError
+        cred["port"] = int(raw_port)
+        if not 1 <= cred["port"] <= 65535:
+            raise ValueError
     except (TypeError, ValueError):
         cred["port"] = DEFAULT_CREDENTIALS["port"]
     cred["username"] = str(cred.get("username") or "").strip()
@@ -206,9 +223,6 @@ def send_mail(recipients: list, subject: str, body: str,
         raise SmtpNotConfiguredError(
             f"SMTP host/username 未設定。請編輯 {CREDENTIALS_FILE}")
 
-    # [C] Rate limit 檢查：防 bug 觸發無窮迴圈狂寄信
-    _rate_limit_check_and_record()
-
     msg = _build_message(
         sender_address=cred["from_address"],
         sender_name=cred["from_name"],
@@ -216,9 +230,9 @@ def send_mail(recipients: list, subject: str, body: str,
         subject=subject, body=body,
         attachment_path=attachment_path,
     )
+    reservation = _reserve_rate_limit_slot()
 
     import time as _time
-    last_err: Optional[Exception] = None
     for attempt in range(max_retries + 1):
         try:
             _send_once(cred, msg, timeout)
@@ -227,12 +241,12 @@ def send_mail(recipients: list, subject: str, body: str,
             break  # success
         except smtplib.SMTPAuthenticationError as e:
             # 認證錯不會自己好 → 不重試
+            _rollback_rate_limit_slot(reservation)
             raise RuntimeError(
                 f"SMTP 認證失敗：{e}。\n"
                 f"請確認 settings/smtp_credentials.json 的 password 是 Gmail "
                 f"App Password（16 字元），不是您日常登入的密碼。") from e
         except (socket.timeout, smtplib.SMTPException, OSError) as e:
-            last_err = e
             if attempt < max_retries:
                 backoff = min(10, 2 * (2 ** attempt))  # 2s, 4s, 8s, 10s (capped)
                 logging.warning(
@@ -241,6 +255,7 @@ def send_mail(recipients: list, subject: str, body: str,
                 _time.sleep(backoff)
                 continue
             # 用完重試次數
+            _rollback_rate_limit_slot(reservation)
             if isinstance(e, socket.timeout):
                 raise RuntimeError(
                     f"SMTP 連線/送信逾時 ({int(timeout)}s)，已重試 {max_retries} 次：{e}") from e
@@ -249,6 +264,9 @@ def send_mail(recipients: list, subject: str, body: str,
                     f"SMTP 網路錯誤，已重試 {max_retries} 次：{e}") from e
             raise RuntimeError(
                 f"SMTP 寄信失敗，已重試 {max_retries} 次：{type(e).__name__}: {e}") from e
+        except Exception:
+            _rollback_rate_limit_slot(reservation)
+            raise
 
     logging.info("SMTP 已寄出（%s → %s）：%s",
                  cred["from_address"], ", ".join(recipients), subject)

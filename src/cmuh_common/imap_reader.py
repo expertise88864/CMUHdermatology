@@ -39,20 +39,21 @@ DEFAULT_IMAP_PORT = 993
 # 用途：如果 check_trigger 在 socket 上卡住 > N 秒，呼叫端可從另一個 thread
 # 呼叫 force_close_active() 強制砍 socket，讓卡住的 thread 立刻 unblock。
 _active_conn_lock = threading.Lock()
-_active_conn: Optional[imaplib.IMAP4_SSL] = None
+_active_conns: set[imaplib.IMAP4_SSL] = set()
 
 
 def _set_active(conn: Optional[imaplib.IMAP4_SSL]) -> None:
-    global _active_conn
+    if conn is None:
+        return
     with _active_conn_lock:
-        _active_conn = conn
+        _active_conns.add(conn)
 
 
 def _clear_active(conn: Optional[imaplib.IMAP4_SSL]) -> None:
-    global _active_conn
+    if conn is None:
+        return
     with _active_conn_lock:
-        if _active_conn is conn:
-            _active_conn = None
+        _active_conns.discard(conn)
 
 
 def force_close_active() -> bool:
@@ -60,20 +61,11 @@ def force_close_active() -> bool:
     回傳 True 表示有試著關（不保證 socket 確實已斷）；False 表示沒有 active 連線。
     """
     with _active_conn_lock:
-        conn = _active_conn
-    if conn is None:
+        conns = list(_active_conns)
+    if not conns:
         return False
-    sock = getattr(conn, "sock", None)
-    if sock is None:
-        return True
-    try:
-        sock.shutdown(socket.SHUT_RDWR)
-    except Exception:
-        pass
-    try:
-        sock.close()
-    except Exception:
-        pass
+    for conn in conns:
+        _force_close_conn(conn)
     return True
 
 
@@ -99,7 +91,12 @@ def _load_imap_settings() -> dict:
     c = load_credentials()
     host = str(c.get("imap_host") or DEFAULT_IMAP_HOST).strip()
     try:
-        port = int(c.get("imap_port") or DEFAULT_IMAP_PORT)
+        raw_port = c.get("imap_port") or DEFAULT_IMAP_PORT
+        if isinstance(raw_port, bool):
+            raise ValueError
+        port = int(raw_port)
+        if not 1 <= port <= 65535:
+            raise ValueError
     except (TypeError, ValueError):
         port = DEFAULT_IMAP_PORT
     return {
@@ -146,7 +143,7 @@ def check_trigger(keyword: str, mark_read: bool = True,
       samples (list[str])：若 matched=0，回 sample_count 個最近未讀主旨給 debug
       error (str|None)：例外訊息（連線/認證失敗等），有錯時其他欄位無意義
 
-    side effect：matched > 0 時把那些信標為 Read（\Seen flag），避免重複觸發。
+    side effect：matched > 0 時把那些信標為 Read（\\Seen flag），避免重複觸發。
     """
     result = {
         "triggered": False,

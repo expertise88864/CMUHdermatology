@@ -1470,6 +1470,7 @@ def _notify(title: str, msg: str) -> None:
 # 同一個 trigger_label 只記一個 (defer dict by label)，避免無限堆積。
 _pending_retriggers: dict = {}  # trigger_label -> override_recipients
 _pending_retriggers_lock = threading.Lock()
+_pending_retrigger_drain_running = False
 _RETRIGGER_DELAY_SEC = 5.0  # release 後等 5s 讓 systemftp/網路喘息再重觸發
 
 
@@ -1501,26 +1502,44 @@ def _enqueue_pending_retrigger(trigger_label: str, override_recipients) -> None:
 def _drain_pending_retriggers() -> None:
     """release 後跑這個 — 把擋下的觸發補上。等 _RETRIGGER_DELAY_SEC 後執行。
     在背景 thread 跑，避免拖長 release 路徑。"""
+    global _pending_retrigger_drain_running
     with _pending_retriggers_lock:
-        if not _pending_retriggers:
+        if _pending_retrigger_drain_running or not _pending_retriggers:
             return
-        pending = dict(_pending_retriggers)
-        _pending_retriggers.clear()
+        _pending_retrigger_drain_running = True
 
     def _delayed():
-        if not _sleep_while_running(_RETRIGGER_DELAY_SEC):
-            logging.info("[re-trigger] 程式正在關閉，略過 pending 補跑")
-            return
-        for label, override in pending.items():
-            logging.info(
-                "[re-trigger] 補跑被 task_gate 擋下的觸發：%s", label)
-            try:
-                trigger_job_async(label, override_recipients=override)
-            except Exception:
-                logging.exception("[re-trigger] 補跑 %s 失敗", label)
+        global _pending_retrigger_drain_running
+        try:
+            if not _sleep_while_running(_RETRIGGER_DELAY_SEC):
+                logging.info("[re-trigger] 程式正在關閉，略過 pending 補跑")
+                with _pending_retriggers_lock:
+                    _pending_retriggers.clear()
+                return
+            with _pending_retriggers_lock:
+                pending = dict(_pending_retriggers)
+                _pending_retriggers.clear()
+            for label, override in pending.items():
+                logging.info(
+                    "[re-trigger] 補跑被 task_gate 擋下的觸發：%s", label)
+                try:
+                    trigger_job_async(label, override_recipients=override)
+                except Exception:
+                    logging.exception("[re-trigger] 補跑 %s 失敗", label)
+        finally:
+            with _pending_retriggers_lock:
+                _pending_retrigger_drain_running = False
+                has_pending = bool(_pending_retriggers)
+            if has_pending and running.is_set():
+                _drain_pending_retriggers()
 
-    threading.Thread(target=_delayed,
-                     name="ConsultRetrigger", daemon=True).start()
+    try:
+        threading.Thread(target=_delayed,
+                         name="ConsultRetrigger", daemon=True).start()
+    except Exception:
+        with _pending_retriggers_lock:
+            _pending_retrigger_drain_running = False
+        logging.exception("[re-trigger] 啟動補跑 thread 失敗")
 
 
 def trigger_job_async(trigger_label: str, override_recipients=None) -> None:
