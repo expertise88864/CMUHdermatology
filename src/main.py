@@ -102,8 +102,6 @@ from cmuh_common.abbrev_engine import (
 )
 # 【重構 2026-05-21】熱鍵座標縮放（原本 main.py 用 _scaled_xy 卻沒定義 — 潛在 NameError）
 from cmuh_common.hotkey_scaling import (  # noqa: E402
-    HOTKEY_SUPPORTED_RESOLUTIONS,
-    HOTKEY_ADAPTIVE_STATE,
     configure_hotkey_scaling,
     _scaled_xy,
 )
@@ -803,14 +801,6 @@ def parse_color_spec(spec_string):
         return rgb_tuple, tolerance
     except ValueError: return None, None
 
-def check_color(x, y, expected_rgb, tolerance=10):
-    check_stop()
-    try:
-        sx, sy = _scaled_xy(x, y)
-        return hotkey_modules.pyautogui.pixelMatchesColor(sx, sy, expected_rgb, tolerance=tolerance)
-    except Exception:
-        return False
-
 
 class F11PixelFrameCache:
     """F11 while 單次迴圈內重複讀同一像素時快取，減少螢幕取樣次數。"""
@@ -1175,253 +1165,25 @@ def _get_swipe_status_from_web(username, password):
 
 # =============================================================================
 # --- [重構] 統一的熱鍵執行器 (HotkeyRunner) ---
-# 取代原本三份幾乎相同的 click_point_1920 / click_point_1280 / click_point_1024
-# 所有解析度共用同一套邏輯，減少重複程式碼並消除 globals() 競態條件
+# 現行 F1-F12 走 Win32 SendMessage（解析度無關），HotkeyRunner 僅保留
+# _runner_1280.last_action_time 作為熱鍵自動化節流計時。
 # =============================================================================
 class HotkeyRunner:
-    """解析度無關的點擊/輸入執行器，取代 globals() 共享狀態"""
+    """熱鍵自動化節流計時用的輕量執行器（last_action_time）。"""
 
     def __init__(self, name: str):
         self.name = name
         self.last_action_time: float = 0.0
 
-    def click(self, x: int, y: int, after_delay: float = 0.05) -> None:
-        check_stop()
-        hotkey_modules.pyautogui.moveTo(x, y, duration=0.01)
-        check_stop()
-        hotkey_modules.pyautogui.click()
-        self.last_action_time = time.time()
-        time.sleep(after_delay)
 
-    def type_digits(self, digits: str, interval: float = 0.01) -> None:
-        for d in digits:
-            check_stop()
-            hotkey_modules.pyautogui.typewrite(d)
-            self.last_action_time = time.time()
-            time.sleep(interval)
-
-    def type_text(self, text: str, delay: float = 0.01) -> None:
-        for char in text:
-            check_stop()
-            hotkey_modules.pyautogui.press(char)
-            self.last_action_time = time.time()
-            time.sleep(delay)
-
-    def wait_for_color(self, x: int, y: int, target_color: tuple, timeout: float = 40) -> bool:
-        start = time.time()
-        while True:
-            check_stop()
-            try:
-                if hotkey_modules.pyautogui.pixel(x, y) == target_color:
-                    self.last_action_time = time.time()
-                    return True
-            except Exception:
-                pass
-            if time.time() - start > timeout:
-                logging.warning(f"[{self.name}] Timeout waiting for color {target_color} at ({x},{y})")
-                return False
-            time.sleep(0.05)
-
-    def wait_for_color_spec(self, x: int, y: int, spec_string: str, timeout: float = 15) -> bool:
-        rgb, tol = parse_color_spec(spec_string)
-        if rgb is None:
-            raise SubsystemInterrupted(f"Invalid color spec '{spec_string}'")
-        effective_tol = tol if tol is not None else 10
-        start = time.time()
-        while time.time() - start < timeout:
-            check_stop()
-            if check_color(x, y, rgb, tolerance=effective_tol):
-                self.last_action_time = time.time()
-                return True
-            time.sleep(0.2)
-        raise SubsystemInterrupted(f"[{self.name}] Idle timeout after {timeout}s waiting for color spec")
-
-    def check_color_spec(self, x: int, y: int, spec_string: str) -> bool:
-        rgb, tol = parse_color_spec(spec_string)
-        if rgb is None:
-            return False
-        return check_color(x, y, rgb, tolerance=tol if tol is not None else 10)
-
-    def wait_for_multiple_colors(self, conditions: list, timeout: float = 40) -> bool:
-        """等待多個顏色條件同時成立"""
-        start = time.time()
-        while True:
-            check_stop()
-            if time.time() - start > timeout:
-                logging.warning(f"[{self.name}] Timeout waiting for multiple color conditions")
-                raise SubsystemInterrupted("Timeout waiting for color conditions")
-            try:
-                if all(check_color(x, y, col, tolerance=10) for x, y, col in conditions):
-                    self.last_action_time = time.time()
-                    return True
-            except Exception:
-                pass
-            time.sleep(0.25)
-
-    @property
-    def idle_seconds(self) -> float:
-        return time.time() - self.last_action_time
-
-
-# 各解析度對應的執行器實例 (取代全域變數 last_action_time_1920 等)
-_runner_1920 = HotkeyRunner("1920x1080")
+# 熱鍵自動化節流計時用的執行器實例（僅 _runner_1280 供 last_action_time 節流用）
 _runner_1280 = HotkeyRunner("1280x1024")
-_runner_1024 = HotkeyRunner("1024x768")
-
-
-def _resolve_runner(resolution: str) -> HotkeyRunner:
-    return {
-        "1920x1080": _runner_1920,
-        "1280x1024": _runner_1280,
-        "1024x768": _runner_1024,
-    }.get(resolution, _runner_1280)
 
 
 def _mark_hotkey_action_time() -> None:
     """更新熱鍵自動化節流時間；集中處理避免失敗路徑漏更新。"""
     if hasattr(_runner_1280, "last_action_time"):
         _runner_1280.last_action_time = time.time()
-
-
-def _resolve_click_func(resolution: str):
-    return {
-        "1920x1080": click_point_1920,
-        "1280x1024": click_point_1280,
-        "1024x768": click_point_1024,
-    }.get(resolution, click_point_1280)
-
-
-def _execute_override_action(action: dict, resolution: str) -> None:
-    """執行單一 override action。"""
-    t = action.get("type", "")
-    if t == "click":
-        x, y = int(action.get("x", 0)), int(action.get("y", 0))
-        delay = float(action.get("delay", 0.05) or 0.05)
-        _resolve_click_func(resolution)(x, y, after_delay=delay)
-    elif t == "sleep":
-        _sleep_interruptible(float(action.get("seconds", 0)))
-    elif t == "type":
-        text = str(action.get("text", ""))
-        # 通用：用 keyboard 模組逐字輸入；若 keyboard 不可用則略過
-        try:
-            kb = hotkey_modules.keyboard
-            if kb is not None:
-                kb.write(text)
-        except Exception:
-            logging.debug("[override] type 失敗", exc_info=True)
-    elif t == "wait_color":
-        # [O33] 完整實作：等候像素變成目標 RGB（容差內）
-        x = int(action.get("x", 0))
-        y = int(action.get("y", 0))
-        target = action.get("target_rgb") or [0, 0, 0]
-        try:
-            tr, tg, tb = int(target[0]), int(target[1]), int(target[2])
-        except (TypeError, ValueError, IndexError):
-            tr = tg = tb = 0
-        tol = int(action.get("tolerance", 5))
-        timeout_s = float(action.get("timeout", 15))
-        try:
-            from PIL import ImageGrab
-            end = time.time() + timeout_s
-            while time.time() < end:
-                check_stop()
-                try:
-                    img = ImageGrab.grab(bbox=(x, y, x + 1, y + 1))
-                    px = img.getpixel((0, 0))
-                    if isinstance(px, int):
-                        r = g = b = px
-                    else:
-                        r, g, b = px[:3]
-                    if (abs(r - tr) <= tol
-                            and abs(g - tg) <= tol
-                            and abs(b - tb) <= tol):
-                        return  # 符合
-                except Exception:
-                    pass
-                time.sleep(0.05)
-            logging.warning("[override] wait_color timeout @ (%d,%d) target=(%d,%d,%d)",
-                            x, y, tr, tg, tb)
-        except ImportError:
-            time.sleep(0.5)  # 沒 PIL 退回固定 sleep
-    elif t == "check_color":
-        # 純條件檢查：略過（match_rgb 已在 step 條件處理過）
-        pass
-    else:
-        logging.debug("[override] 未知 action 類型: %s", t)
-
-
-# -----------------------------------------------------------------------------
-# --- 6.1 熱鍵腳本 (1920x1080 版本) ---
-# -----------------------------------------------------------------------------
-
-def click_point_1920(x, y, after_delay=0.05):
-    sx, sy = _scaled_xy(x, y, "1920x1080")
-    _runner_1920.click(sx, sy, after_delay)
-
-def type_digits_1920(digits):
-    _runner_1920.type_digits(digits, interval=0.01)
-
-def wait_for_color_1920(x, y, target_color, timeout=40):
-    sx, sy = _scaled_xy(x, y, "1920x1080")
-    return _runner_1920.wait_for_color(sx, sy, target_color, timeout)
-
-
-# -----------------------------------------------------------------------------
-# --- 6.2 熱鍵腳本 (1024x768 版本) ---
-# -----------------------------------------------------------------------------
-def click_point_1024(x, y, after_delay=0.05):
-    sx, sy = _scaled_xy(x, y, "1024x768")
-    _runner_1024.click(sx, sy, after_delay)
-
-def type_text_1024(text_to_type, delay=0.01):
-    _runner_1024.type_text(text_to_type, delay)
-
-def check_color_from_spec_1024(x, y, spec_string):
-    sx, sy = _scaled_xy(x, y, "1024x768")
-    return _runner_1024.check_color_spec(sx, sy, spec_string)
-
-def wait_for_color_1024(x, y, spec_string, timeout=15):
-    sx, sy = _scaled_xy(x, y, "1024x768")
-    return _runner_1024.wait_for_color_spec(sx, sy, spec_string, timeout)
-
-
-# -----------------------------------------------------------------------------
-# --- 6.3 熱鍵腳本 (1280x1024 版本) ---
-# -----------------------------------------------------------------------------
-
-def click_point_1280(x, y, after_delay=0.05):
-    sx, sy = _scaled_xy(x, y, "1280x1024")
-    _runner_1280.click(sx, sy, after_delay)
-
-def type_digits_1280(digits, interval=0.1):
-    _runner_1280.type_digits(digits, interval=interval)
-
-def wait_for_multiple_colors_1280(conditions, timeout=40):
-    scaled = []
-    for x, y, color in conditions:
-        sx, sy = _scaled_xy(x, y, "1280x1024")
-        scaled.append((sx, sy, color))
-    return _runner_1280.wait_for_multiple_colors(scaled, timeout)
-
-def script_wait_for_F9_F10_cond_2_5():
-    """(1280x1024) F9/F10 的 2.5 步驟等待"""
-    logging.info("Waiting for F9/F10 condition 2.5 (1280x1024)...")
-    conditions = [
-        (759, 134, (255, 255, 0)),
-        (1260, 60, (192, 220, 192)),
-        (769, 266, (246, 246, 217))
-    ]
-    wait_for_multiple_colors_1280(conditions)
-
-def script_wait_for_F9_F10_cond_5_5():
-    """(1280x1024) F9/F10 的 5.5 步驟等待"""
-    logging.info("Waiting for F9/F10 condition 5.5 (1280x1024)...")
-    conditions = [
-        (194, 738, (255, 255, 255)),
-        (1061, 741, (179, 255, 255)),
-        (687, 818, (166, 77, 255))
-    ]
-    wait_for_multiple_colors_1280(conditions)
 
 
 # =============================================================================
