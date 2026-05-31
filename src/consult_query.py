@@ -81,6 +81,7 @@ from cmuh_common.atomic_io import atomic_write_json, safe_load_json  # noqa: E40
 from cmuh_common.logging_setup import attach_queue_handler, setup_logging  # noqa: E402
 from cmuh_common.paths import get_app_dir, get_settings_dir  # noqa: E402
 from cmuh_common.platform_win import is_admin, run_as_admin  # noqa: E402
+from cmuh_common.process_launch import launch_python_script  # noqa: E402
 from cmuh_common.single_instance import (  # noqa: E402
     ensure_single_instance, release_single_instance,
 )
@@ -2193,8 +2194,11 @@ def _tray_configure(icon=None, item=None) -> None:
     """用獨立行程開啟設定視窗，常駐的托盤程式不中斷（先前用 restart 重啟，
     在某些情況下重啟後設定視窗沒出現，且托盤也消失了）。"""
     try:
-        subprocess.Popen([sys.executable, os.path.abspath(sys.argv[0]),
-                          "--configure"])
+        launch_python_script(
+            os.path.abspath(sys.argv[0]),
+            args=["--configure"],
+            cwd=get_app_dir(),
+        )
     except Exception:
         logging.error("開啟設定視窗失敗", exc_info=True)
         _notify("開啟設定失敗", "請改用雙擊會診查詢程式 + --configure")

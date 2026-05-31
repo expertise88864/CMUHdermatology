@@ -247,6 +247,15 @@ def test_configure_mode_has_dedicated_single_instance_guard():
     assert "ConfigApp().mainloop()" in src
 
 
+def test_tray_configure_uses_shared_python_launcher():
+    src = inspect.getsource(consult_query._tray_configure)
+
+    assert "launch_python_script(" in src
+    assert 'args=["--configure"]' in src
+    assert "cwd=get_app_dir()" in src
+    assert "subprocess.Popen(" not in src
+
+
 def test_backoff_schedule_is_exponential():
     """[v17 regression] retry sleep 必須是 exponential backoff (3s, 30s, 90s)，
     不能改回固定 3s — 那樣會撞在同個 server 卡死期。"""

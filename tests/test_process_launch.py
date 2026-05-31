@@ -51,3 +51,37 @@ def test_launch_app_script_uses_absolute_path_and_stable_cwd(tmp_path, monkeypat
             "close_fds": True,
         },
     )]
+
+
+def test_launch_python_script_adds_args_and_detached_flags(tmp_path, monkeypatch):
+    launcher = tmp_path / "helper.pyw"
+    launcher.write_text("# launcher\n", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(
+        process_launch.subprocess,
+        "Popen",
+        lambda cmd, **kwargs: calls.append((cmd, kwargs)) or object(),
+    )
+    monkeypatch.setattr(process_launch.os, "name", "nt")
+    monkeypatch.setattr(process_launch.subprocess, "DETACHED_PROCESS", 0x08, raising=False)
+    monkeypatch.setattr(
+        process_launch.subprocess,
+        "CREATE_NEW_PROCESS_GROUP",
+        0x200,
+        raising=False,
+    )
+
+    process_launch.launch_python_script(
+        str(launcher),
+        args=["--configure"],
+        executable="pythonw.exe",
+        cwd=str(tmp_path),
+        detached=True,
+    )
+
+    assert calls[0][0] == ["pythonw.exe", str(launcher.resolve()), "--configure"]
+    assert calls[0][1]["cwd"] == str(tmp_path.resolve())
+    assert calls[0][1]["creationflags"] & 0x08
+    assert calls[0][1]["creationflags"] & 0x200
+    assert calls[0][1]["close_fds"] is True

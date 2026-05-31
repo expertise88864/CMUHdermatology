@@ -72,3 +72,23 @@ def test_is_instance_running_treats_access_denied_as_running(monkeypatch):
 
     assert si.is_instance_running("Local\\TestMutex") is True
     assert fake.closed == []
+
+
+def test_mutex_handle_state_is_guarded_for_ensure_and_release(monkeypatch):
+    fake = _patch_mutex(monkeypatch, handle=200, last_error=0)
+    enters = []
+
+    class RecordingLock:
+        def __enter__(self):
+            enters.append("enter")
+
+        def __exit__(self, *_args):
+            enters.append("exit")
+
+    monkeypatch.setattr(si, "_instance_mutex_lock", RecordingLock())
+
+    assert si.ensure_single_instance("Local\\TestMutex") is True
+    si.release_single_instance()
+
+    assert fake.closed == [200]
+    assert enters == ["enter", "exit", "enter", "exit"]

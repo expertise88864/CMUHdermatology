@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 
 from cmuh_common.atomic_io import atomic_write_json, atomic_write_text, safe_load_json
+from cmuh_common.process_launch import launch_python_script
 
 # ─── 路徑 ────────────────────────────────────────────────────────────────
 _HERE = Path(__file__).resolve().parent
@@ -462,13 +463,11 @@ def kill_pid(pid: int) -> bool:
 def start_program(pyw_path: Path, pythonw: str) -> int:
     """以 admin 子行程啟動 .pyw（繼承父 process 的 admin token，無 UAC）。"""
     try:
-        DETACHED_PROCESS = 0x00000008
-        CREATE_NO_WINDOW = 0x08000000
-        p = subprocess.Popen(
-            [pythonw, str(pyw_path)],
+        p = launch_python_script(
+            str(pyw_path),
+            executable=pythonw,
             cwd=str(_ROOT),
-            creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
-            close_fds=True,
+            detached=True,
         )
         return p.pid
     except Exception:
@@ -690,6 +689,9 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
                             return (f"⛔ {name}: 半死且 crash loop，"
                                     f"暫停 {remain // 60} 分鐘 [{mode}]")
                         new_pid = start_program(pyw_path, pythonw)
+                        if not new_pid:
+                            return (f"✗ {name}: 半死狀態已 kill {killed}，"
+                                    f"但重新啟動失敗 [{mode}]")
                         return (f"⟳ {name}: mutex 持有但 log {age:.0f}s 沒更新，"
                                 f"killed {killed} → 重啟 PID {new_pid} [{mode}]")
                     return (f"⚠ {name}: mutex 持有但 log stale，"
@@ -740,6 +742,9 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
                 remain = max(0, int(until - time.time()))
                 return f"⛔ {name}: stale 且 crash loop 中，暫停 {remain // 60} 分鐘 [{mode}]"
             new_pid = start_program(pyw_path, pythonw)
+            if not new_pid:
+                return (f"✗ {name}: log {age:.0f}s 沒更新，已 kill PID {killed}，"
+                        f"但重新啟動失敗 [{mode}]")
             return (f"⟳ {name}: log {age:.0f}s 沒更新 (>{max_stale}s)，"
                     f"killed PID {killed} → 重啟 PID {new_pid} [{mode}]")
 

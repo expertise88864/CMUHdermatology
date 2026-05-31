@@ -153,6 +153,31 @@ def test_ensure_program_stale_kill_failure_does_not_start_duplicate(tmp_path, mo
     assert started == []
 
 
+def test_start_program_uses_shared_detached_launcher(tmp_path, monkeypatch):
+    pyw = tmp_path / "target.pyw"
+    pyw.write_text("# shim\n", encoding="utf-8")
+    calls = []
+
+    class Result:
+        pid = 4321
+
+    monkeypatch.setattr(
+        wc,
+        "launch_python_script",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or Result(),
+    )
+
+    assert wc.start_program(pyw, "pythonw.exe") == 4321
+    assert calls == [(
+        (str(pyw),),
+        {
+            "executable": "pythonw.exe",
+            "cwd": str(wc._ROOT),
+            "detached": True,
+        },
+    )]
+
+
 def test_ensure_program_tolerates_bad_numeric_config(tmp_path, monkeypatch):
     """Bad numeric watchdog config should fall back instead of failing a tick."""
     pyw = tmp_path / "target.pyw"
@@ -341,6 +366,38 @@ def test_ensure_program_kills_when_log_stale_beyond_threshold(tmp_path, monkeypa
     assert killed == [1234], f"log stale 應該 kill 1234, 實際 killed={killed}"
     assert len(started) == 1, f"log stale 應該 start 新 instance, 實際 started={started}"
     assert "⟳" in msg or "killed" in msg
+
+
+def test_ensure_program_reports_restart_failure_after_stale_kill(tmp_path, monkeypatch):
+    pyw = tmp_path / "target.pyw"
+    log = tmp_path / "target.log"
+    pyw.write_text("# shim\n", encoding="utf-8")
+    log.write_text("ancient heartbeat\n", encoding="utf-8")
+    stale_ts = time.time() - 600
+    os.utime(log, (stale_ts, stale_ts))
+
+    monkeypatch.setattr(wc, "claim_action_lock", lambda *args, **kwargs: True)
+    monkeypatch.setattr(wc, "kill_pid", lambda _pid: True)
+    monkeypatch.setattr(wc, "start_program", lambda *_args, **_kwargs: 0)
+
+    msg = wc.ensure_program(
+        {
+            "name": "打卡",
+            "enabled": True,
+            "pyw": str(pyw),
+            "process_match": "中國醫皮膚科打卡程式",
+            "log_path": str(log),
+            "max_stale_sec": 300,
+        },
+        pythonw="pythonw.exe",
+        procs=[{"pid": 1234, "cmdline": "pythonw.exe 中國醫皮膚科打卡程式.pyw"}],
+        my_pid=9999,
+        mode="inner",
+        cfg={"action_lock_seconds": 90},
+    )
+
+    assert "重新啟動失敗" in msg
+    assert "PID 0" not in msg
 
 
 def test_ensure_program_skips_log_check_when_max_stale_zero(tmp_path, monkeypatch):
