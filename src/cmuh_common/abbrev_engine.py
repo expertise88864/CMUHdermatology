@@ -40,13 +40,20 @@ from cmuh_common.config_io import load_json_dict
 # -----------------------------------------------------------------------------
 # 預設 snippets（首次啟動自動寫入；不含 if，避免英文 "if " 誤觸）
 # -----------------------------------------------------------------------------
+ABBREV_CONFIG_SCHEMA_VERSION = 2
+MAX_ABBREV_LENGTH = 63
+
 DEFAULT_ITEMS: list[dict[str, str]] = [
+    {"abbrev": "cert", "expansion": "患者因上述皮膚疾病，曾於da至本院皮膚科門診就醫治療，建議持續追蹤。"},
     {"abbrev": "da",   "expansion": "da"},
     {"abbrev": "da1",  "expansion": "da1"},
     {"abbrev": "da2",  "expansion": "da2"},
     {"abbrev": "ec",   "expansion": "epidermoid cyst"},
+    {"abbrev": "mf",   "expansion": "medication and follow up"},
+    {"abbrev": "sd",   "expansion": "seborrheic dermatitis"},
     {"abbrev": "sk",   "expansion": "seborrheic keratosis"},
     {"abbrev": "sk1",  "expansion": "r/o seborrheic keratosis, r/o malignancy"},
+    {"abbrev": "st",   "expansion": "keep stable"},
     {"abbrev": "nev1", "expansion": "r/o dysplastic nevus, r/o malignancy"},
     {"abbrev": "ef",   "expansion": "excisional biopsy and follow up, inform post-op 3x scar formation"},
     {"abbrev": "uvb",  "expansion": "UVB: 250 mj/cm2 (1) on da, increased 30 mj/cm2 if no erythema, MAX: 800 mj/cm2"},
@@ -73,6 +80,7 @@ DEFAULT_ITEMS: list[dict[str, str]] = [
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "schema_version": ABBREV_CONFIG_SCHEMA_VERSION,
     "enabled": False,
     "skip_when_ime_active": True,
     "preserve_trailing_space": True,
@@ -107,6 +115,7 @@ _LEGACY_DEFAULTS_TO_MIGRATE: dict[str, str] = {
 # -----------------------------------------------------------------------------
 @dataclass
 class AbbrevConfig:
+    schema_version: int = ABBREV_CONFIG_SCHEMA_VERSION
     enabled: bool = False
     skip_when_ime_active: bool = True
     preserve_trailing_space: bool = True
@@ -114,16 +123,43 @@ class AbbrevConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "schema_version": int(self.schema_version),
             "enabled": bool(self.enabled),
             "skip_when_ime_active": bool(self.skip_when_ime_active),
             "preserve_trailing_space": bool(self.preserve_trailing_space),
             "items": [
                 {"abbrev": str(it.get("abbrev", "")).strip(),
                  "expansion": str(it.get("expansion", ""))}
-                for it in self.items
+                for it in sort_abbrev_items(self.items)
                 if str(it.get("abbrev", "")).strip()
             ],
         }
+
+
+def sort_abbrev_items(items: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Return abbreviations in case-insensitive A-to-Z order."""
+    return sorted(
+        items,
+        key=lambda it: str(it.get("abbrev", "")).strip().casefold(),
+    )
+
+
+def _add_missing_default_items(items: list[dict[str, str]]) -> bool:
+    """Append newly introduced defaults without overwriting user custom text."""
+    known = {
+        str(it.get("abbrev", "")).strip().casefold()
+        for it in items
+    }
+    changed = False
+    for default in DEFAULT_ITEMS:
+        key = str(default["abbrev"]).casefold()
+        if key in known:
+            continue
+        items.append(dict(default))
+        known.add(key)
+        changed = True
+        logging.info("[abbrev] added new default '%s'", default["abbrev"])
+    return changed
 
 
 def _maybe_migrate_legacy(items: list[dict[str, str]]) -> bool:
@@ -154,33 +190,51 @@ def load_config(path: str) -> AbbrevConfig:
     """讀取設定，缺檔/壞檔自動回 defaults。
     若偵測到舊版內建 cert1/cert2 字面預設，會自動升級為動態 da_zh 版本。
     """
-    raw = load_json_dict(path, DEFAULT_CONFIG, merge_defaults=True)
+    loaded = load_json_dict(path, {}, merge_defaults=False)
+    raw = dict(DEFAULT_CONFIG)
+    raw.update(loaded)
+    try:
+        loaded_schema_version = int(loaded.get("schema_version", 1))
+    except (TypeError, ValueError):
+        loaded_schema_version = 1
+    loaded_schema_version = max(1, loaded_schema_version)
     items = raw.get("items")
+    needs_save = not isinstance(items, list)
     if not isinstance(items, list):
-        items = list(DEFAULT_ITEMS)
+        items = [dict(it) for it in DEFAULT_ITEMS]
     cleaned: list[dict[str, str]] = []
     seen_abbrevs: set[str] = set()
     for it in items:
         if not isinstance(it, dict):
+            needs_save = True
             continue
         abbrev = str(it.get("abbrev", "")).strip()
         if not abbrev:
+            needs_save = True
             continue
         key = abbrev.lower()
         if key in seen_abbrevs:
+            needs_save = True
             continue
         seen_abbrevs.add(key)
         cleaned.append({"abbrev": abbrev, "expansion": str(it.get("expansion", ""))})
 
     cfg = AbbrevConfig(
+        schema_version=max(
+            ABBREV_CONFIG_SCHEMA_VERSION, loaded_schema_version),
         enabled=bool(raw.get("enabled", False)),
         skip_when_ime_active=bool(raw.get("skip_when_ime_active", True)),
         preserve_trailing_space=bool(raw.get("preserve_trailing_space", True)),
-        items=cleaned,
+        items=sort_abbrev_items(cleaned),
     )
 
     # 偵測 + 自動升級舊版預設；若有改 → 寫回磁碟
-    if _maybe_migrate_legacy(cfg.items):
+    if loaded_schema_version < ABBREV_CONFIG_SCHEMA_VERSION:
+        needs_save = _add_missing_default_items(cfg.items) or needs_save
+        needs_save = True
+    needs_save = _maybe_migrate_legacy(cfg.items) or needs_save
+    cfg.items = sort_abbrev_items(cfg.items)
+    if needs_save:
         try:
             save_config(path, cfg)
         except Exception:
@@ -198,10 +252,11 @@ def ensure_config_file(path: str) -> AbbrevConfig:
     """檔不存在時寫入預設；存在則直接讀。"""
     if not os.path.exists(path):
         save_config(path, AbbrevConfig(**{
+            "schema_version": ABBREV_CONFIG_SCHEMA_VERSION,
             "enabled": False,
             "skip_when_ime_active": True,
             "preserve_trailing_space": True,
-            "items": list(DEFAULT_ITEMS),
+            "items": [dict(it) for it in DEFAULT_ITEMS],
         }))
     return load_config(path)
 
@@ -664,7 +719,7 @@ class AbbrevEngine:
     """縮寫展開引擎。Thread-safe（hook callback 來自 keyboard 模組獨立 thread）。"""
 
     # 觸發後一次連送的 backspace 上限，純防呆。
-    MAX_BACKSPACE = 64
+    MAX_BACKSPACE = MAX_ABBREV_LENGTH + 1
 
     # [v7 2026-05-28] 為了「寧慢求對」全面拉長各延遲，確保刪除/展開正確：
     # 展開後的冷卻時間（s）— 期間 buffer 暫停累積，避免 user 連打第二組
@@ -762,6 +817,11 @@ class AbbrevEngine:
             if not abbrev:
                 continue
             key = abbrev.lower()
+            if len(key) > MAX_ABBREV_LENGTH:
+                logging.warning(
+                    "[abbrev] skip overlong abbreviation '%s' (%d > %d)",
+                    key, len(key), MAX_ABBREV_LENGTH)
+                continue
             self._lookup[key] = str(it.get("expansion", ""))
             if len(key) > max_len:
                 max_len = len(key)
@@ -974,6 +1034,15 @@ class AbbrevEngine:
                 self._suppressing = False
                 with self._lock:
                     self._buffer = ""
-            t = threading.Timer(self.COOLDOWN_SEC, _clear)
-            t.daemon = True
-            t.start()
+            remaining = max(0.0, self._cooldown_until - time.monotonic())
+            if remaining:
+                t = threading.Timer(remaining, _clear)
+                t.daemon = True
+                try:
+                    t.start()
+                except Exception:
+                    logging.exception(
+                        "[abbrev] cooldown timer start failed; clear now")
+                    _clear()
+            else:
+                _clear()

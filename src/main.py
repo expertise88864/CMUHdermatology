@@ -100,9 +100,11 @@ from cmuh_common.abbrev_engine import (
     AbbrevEngine,
     AbbrevConfig,
     DEFAULT_ITEMS as ABBREV_DEFAULT_ITEMS,
+    MAX_ABBREV_LENGTH,
     ensure_config_file as ensure_abbrev_config_file,
     load_config as load_abbrev_config,
     save_config as save_abbrev_config,
+    sort_abbrev_items,
 )
 # 【重構 2026-05-21】熱鍵座標縮放（原本 main.py 用 _scaled_xy 卻沒定義 — 潛在 NameError）
 from cmuh_common.hotkey_scaling import (  # noqa: E402
@@ -9280,8 +9282,8 @@ class AutomationApp:
         cfg = getattr(self, '_abbrev_config_cache', None)
         if cfg is None:
             return
-        # 排序：縮寫長度短的在前、再按字母
-        items = sorted(cfg.items, key=lambda it: (len(str(it.get('abbrev', ''))), str(it.get('abbrev', '')).lower()))
+        # 排序：縮寫字首 A -> Z，方便編輯時快速定位。
+        items = sort_abbrev_items(cfg.items)
         for idx, it in enumerate(items):
             abbrev = str(it.get('abbrev', ''))
             expansion = str(it.get('expansion', ''))
@@ -9313,6 +9315,8 @@ class AutomationApp:
         # 限制：只能英數，避免和 token regex 衝突
         if not re.fullmatch(r"[A-Za-z0-9]+", abbrev):
             return abbrev, "縮寫只能用英數字（不可有空白或符號）"
+        if len(abbrev) > MAX_ABBREV_LENGTH:
+            return abbrev, f"縮寫不可超過 {MAX_ABBREV_LENGTH} 個字元"
         if (expansion_text or '') == '':
             return abbrev, "展開內文不可為空"
         cfg = getattr(self, '_abbrev_config_cache', None)
