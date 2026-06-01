@@ -1418,11 +1418,14 @@ def _send_enter_to_window(hwnd: int) -> bool:
         WM_KEYDOWN = 0x0100
         WM_KEYUP = 0x0101
         VK_RETURN = 0x0D
+        # 只送 keydown+keyup（等同真人按「一次」Enter）。Delphi VCL 的訊息迴圈會自行
+        # TranslateMessage 把 WM_KEYDOWN(VK_RETURN) 轉成對應的 WM_CHAR(\r)，控制項
+        # 因而收到「剛好一次」Enter。
+        # [修正 2026-06-01] 原本在 keydown/keyup 之後又額外 PostMessage 一個 WM_CHAR \r，
+        # 等於控制項收到兩個 Enter 字元（keydown 被翻譯出的 \r + 這個多餘的 \r）→
+        # 醫令代碼被送出兩次 → F1/F2/F3/F4/F5 跳「資料重複確認」。移除多餘的 WM_CHAR。
         ctypes.windll.user32.PostMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0x1C0001)
         ctypes.windll.user32.PostMessageW(hwnd, WM_KEYUP, VK_RETURN, 0xC01C0001)
-        # 額外送一個 WM_CHAR \r 確保 Delphi 認得（部分 Delphi grid 走 WM_CHAR Enter）
-        WM_CHAR = 0x0102
-        ctypes.windll.user32.PostMessageW(hwnd, WM_CHAR, 0x0D, 0)
         return True
     except Exception:
         return False
