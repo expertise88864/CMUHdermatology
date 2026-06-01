@@ -2775,6 +2775,105 @@ def _f11_popup_watcher(label: str = "F11",
     return handled_count
 
 
+_WM_CHAR = 0x0102
+
+
+def _read_edit_text(hwnd: int) -> str:
+    """跨行程讀控制項文字。Delphi TEditExt 會把內容同步到 WindowText，故
+    GetWindowText 能讀到即時值（與 snapshot 工具同法，實測可讀到 A12/IC49 等）。
+    失敗回 ""。"""
+    try:
+        n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+        if not n or n <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(n + 1)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, n + 1)
+        return buf.value or ""
+    except Exception:
+        return ""
+
+
+def _find_卡號_edit_hwnd(main_hwnd: int) -> int:
+    """找頂部 header「卡號」輸入欄（解析度無關）。
+
+    使用者確認：卡號 = 療程欄左邊那一格。頂部 row(rel_y 80-135) 的 TEditExt 由左
+    到右排列；療程是第一個「窄欄」(w 35-50)，卡號 = 療程左邊緊鄰那一格。
+    找不到（無窄欄 / 其左邊沒欄位）回 0。"""
+    main_r = wintypes.RECT()
+    if not ctypes.windll.user32.GetWindowRect(main_hwnd, ctypes.byref(main_r)):
+        return 0
+    edits = []
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def cb(child, lparam):
+        try:
+            cls_buf = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(child, cls_buf, 64)
+            if cls_buf.value != "TEditExt":
+                return True
+            r = wintypes.RECT()
+            if not ctypes.windll.user32.GetWindowRect(child, ctypes.byref(r)):
+                return True
+            rel_y = r.top - main_r.top
+            if 80 <= rel_y <= 135:
+                edits.append((child, r.left, r.right - r.left))
+        except Exception:
+            pass
+        return True
+
+    ctypes.windll.user32.EnumChildWindows(main_hwnd, cb, 0)
+    seen = set()
+    uniq = [e for e in edits if not (e[0] in seen or seen.add(e[0]))]
+    uniq.sort(key=lambda e: e[1])  # by left
+    療程_idx = next((i for i, e in enumerate(uniq) if 35 <= e[2] <= 50), -1)
+    if 療程_idx <= 0:
+        logging.warning(
+            "[F11] 頂部 row 找不到療程窄欄或其左邊無欄位，無法定位卡號欄 "
+            "(共 %d 個 TEditExt)", len(uniq))
+        return 0
+    卡號 = uniq[療程_idx - 1][0]
+    logging.info("[F11] 卡號欄 hwnd=%s（療程左邊；頂部 row 第 %d 格）",
+                  卡號, 療程_idx)
+    return 卡號
+
+
+def _f11_ensure_ic_card(main_hwnd: int, label: str = "F11") -> None:
+    """[全部完成前] 卡號欄空白 → 自動輸入 'IC'（不按 Enter）；按下「全部完成」後
+    系統會自動讀健保卡並填入就醫序號。卡號欄已有值(數字 / IC.. 等) → 不動。
+
+    全程 best-effort：找不到欄位 / 讀不到 / 任何例外 → 直接跳過，不阻擋全部完成。
+    安全紅線：只有『讀到確定空白』才輸入 IC，避免把 IC 打進已有號碼的欄位。"""
+    try:
+        ka = _find_卡號_edit_hwnd(main_hwnd)
+        if not ka:
+            return
+        cur = _read_edit_text(ka).strip()
+        if cur:
+            logging.info("[%s] 卡號欄已有值 %r → 不補 IC，直接完成", label, cur)
+            return
+        logging.info("[%s] 卡號欄空白 → 自動輸入 IC（全部完成後系統讀卡）", label)
+        # 模擬點擊讓 Delphi 聚焦該欄(不動實體滑鼠)，再逐字 WM_CHAR 輸入 'I','C'。
+        _post_click_to_control(ka)
+        time.sleep(0.12)
+        for ch in "IC":
+            ctypes.windll.user32.PostMessageW(ka, _WM_CHAR, ord(ch), 0)
+            time.sleep(0.05)
+        time.sleep(0.2)
+        after = _read_edit_text(ka).strip().upper()
+        if after == "IC":
+            logging.info("[%s] 卡號欄已輸入 IC（驗證通過）", label)
+        else:
+            logging.warning(
+                "[%s] 補 IC 後卡號欄=%r（預期 IC）→ 仍照常按全部完成，請醫師留意卡號",
+                label, after)
+    except Exception:
+        logging.warning("[%s] 自動補 IC 例外，跳過（不影響全部完成）", label,
+                        exc_info=True)
+
+
 def _f11_快速完成_main(label: str = "F11") -> bool:
     """F11 主流程：點 全部完成 → 輪詢任意順序 popup。
 
@@ -2788,6 +2887,10 @@ def _f11_快速完成_main(label: str = "F11") -> bool:
         return False
     logging.info("[%s][timeline] 找到 main_hwnd=%s (+%.0fms)",
                   label, main_hwnd, (time.time() - t_f11_start) * 1000)
+
+    # Step 0: 卡號欄空白 → 自動補 IC（按下全部完成後系統會自動讀健保卡）。
+    # best-effort：任何不確定都跳過、照常往下按全部完成。
+    _f11_ensure_ic_card(main_hwnd, label=label)
 
     # Step 1: 點「全部完成」TButton
     btns = _find_descendants_by_exact_text(main_hwnd, "TButton", "全部完成")
