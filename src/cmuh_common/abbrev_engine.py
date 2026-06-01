@@ -40,7 +40,7 @@ from cmuh_common.config_io import load_json_dict
 # -----------------------------------------------------------------------------
 # 預設 snippets（首次啟動自動寫入；不含 if，避免英文 "if " 誤觸）
 # -----------------------------------------------------------------------------
-ABBREV_CONFIG_SCHEMA_VERSION = 3  # [v3 2026-06-01] 新增預設 'rs'；bump 觸發現有使用者補上缺少的預設
+ABBREV_CONFIG_SCHEMA_VERSION = 4  # [v4 2026-06-01] 新增預設 'cbt'；bump 觸發現有使用者補上缺少的預設
 MAX_ABBREV_LENGTH = 63
 
 DEFAULT_ITEMS: list[dict[str, str]] = [
@@ -48,6 +48,7 @@ DEFAULT_ITEMS: list[dict[str, str]] = [
     {"abbrev": "da",   "expansion": "da"},
     {"abbrev": "da1",  "expansion": "da1"},
     {"abbrev": "da2",  "expansion": "da2"},
+    {"abbrev": "cbt",  "expansion": "check blood test"},
     {"abbrev": "ec",   "expansion": "epidermoid cyst"},
     {"abbrev": "mf",   "expansion": "medication and follow up"},
     {"abbrev": "rs",   "expansion": "remove stitches and follow up"},
