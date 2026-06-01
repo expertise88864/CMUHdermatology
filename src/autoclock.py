@@ -772,6 +772,12 @@ def process_clock_task(schedule_key: str | None) -> None:
                     driver, wait, acc, is_in, check_start, check_end,
                     dry_run=False, task_label=schedule_key,
                 )
+                # [stability] 每處理完一個帳號就刷新 last_used。否則帳號多 + 院內網
+                # 慢 + 重試 backoff 使整個任務 >15 分鐘時，idle 回收器（每 2 分跑）
+                # 會依「任務開始時」的 last_used 誤判 driver 閒置而 quit 掉「使用中」
+                # 的 driver，導致後續帳號 InvalidSessionId 失敗。
+                with _persistent_driver_pool["lock"]:
+                    _persistent_driver_pool["last_used"] = time_module.time()
         except Exception as e:
             logging.error("任務 %s 執行期間發生錯誤: %s", schedule_key, e)
             try:

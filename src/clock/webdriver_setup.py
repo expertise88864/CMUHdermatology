@@ -145,10 +145,20 @@ def initialize_driver(headless: bool = True):
         from selenium.webdriver.chrome.service import Service  # type: ignore[import-not-found]
 
         logging.info("初始化 WebDriver (Headless=%s)...", headless)
-        return webdriver.Chrome(
-            service=Service(get_chromedriver_path()),
-            options=build_chrome_options(headless),
-        )
+        service = Service(get_chromedriver_path())
+        try:
+            return webdriver.Chrome(
+                service=service,
+                options=build_chrome_options(headless),
+            )
+        except Exception:
+            # webdriver.Chrome() 失敗時 Service 可能已把 chromedriver.exe 拉起來，
+            # 顯式 stop() 收掉，避免殘留 chromedriver/Chrome 進程洩漏。
+            try:
+                service.stop()
+            except Exception:
+                pass
+            raise
     except Exception as e:
         logging.exception("初始化 WebDriver 失敗: %s", e)
         _invalidate_chromedriver_cache()

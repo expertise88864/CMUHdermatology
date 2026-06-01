@@ -600,13 +600,17 @@ def capture_window_image(hwnd: int):
     if width <= 0 or height <= 0:
         raise RuntimeError(f"視窗尺寸異常: {width}x{height}")
 
-    hwnd_dc = win32gui.GetWindowDC(hwnd)
-    mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
-    save_dc = mfc_dc.CreateCompatibleDC()
-    bmp = win32ui.CreateBitmap()
-    bmp.CreateCompatibleBitmap(mfc_dc, width, height)
-    save_dc.SelectObject(bmp)
+    # 全部 GDI handle 先設 None：即使在「建立階段」就拋例外（GDI handle 耗盡、
+    # 視窗剛好被關等），finally 也能逐一釋放已建立的物件，避免長駐程式反覆失敗
+    # 時穩定洩漏 DC/bitmap，最終整個 process 再也擷取不到。
+    hwnd_dc = mfc_dc = save_dc = bmp = None
     try:
+        hwnd_dc = win32gui.GetWindowDC(hwnd)
+        mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+        save_dc = mfc_dc.CreateCompatibleDC()
+        bmp = win32ui.CreateBitmap()
+        bmp.CreateCompatibleBitmap(mfc_dc, width, height)
+        save_dc.SelectObject(bmp)
         # PW_RENDERFULLCONTENT=2：抓得到 Delphi/DirectComposition 內容
         result = ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
         bmpinfo = bmp.GetInfo()
@@ -616,16 +620,26 @@ def capture_window_image(hwnd: int):
             bmpstr, "raw", "BGRX", 0, 1,
         )
     finally:
-        try:
-            win32gui.DeleteObject(bmp.GetHandle())
-        except Exception:
-            pass
-        try:
-            save_dc.DeleteDC()
-            mfc_dc.DeleteDC()
-            win32gui.ReleaseDC(hwnd, hwnd_dc)
-        except Exception:
-            pass
+        if bmp is not None:
+            try:
+                win32gui.DeleteObject(bmp.GetHandle())
+            except Exception:
+                pass
+        if save_dc is not None:
+            try:
+                save_dc.DeleteDC()
+            except Exception:
+                pass
+        if mfc_dc is not None:
+            try:
+                mfc_dc.DeleteDC()
+            except Exception:
+                pass
+        if hwnd_dc is not None:
+            try:
+                win32gui.ReleaseDC(hwnd, hwnd_dc)
+            except Exception:
+                pass
 
     if result != 1:
         # PrintWindow 對 Delphi 視窗即使回傳非 1 通常仍產出有效影像；

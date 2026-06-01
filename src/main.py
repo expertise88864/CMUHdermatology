@@ -3459,6 +3459,23 @@ except Exception:
     logging.debug("kernel32 argtypes 設定失敗", exc_info=True)
 
 
+# user32.SendMessageTimeoutW 權威簽章 — ctypes.windll.user32 是 process 全域共用
+# 物件，cmuh_common.abbrev_engine 也會（lazy）設定同一個函式的 argtypes。這裡在
+# main.py 匯入時就設成「與 abbrev_engine 完全相同」的簽章，讓 _send_message_timeout
+# 與跨行程 TCM_GETITEMRECT 不論縮寫功能有沒有先跑過都行為一致。
+#   第 7 參數 = POINTER(c_size_t)，配 byref(c_size_t) 結果（見 _send_message_timeout）。
+#   lParam = c_ssize_t：才容得下 >2^31 的跨行程位址（remote_addr）；若沒設 argtypes
+#   ctypes 預設把它當 c_int → OverflowError → 同意書(F9/F10)分頁矩形抓不到、靜默退回估算。
+try:
+    ctypes.windll.user32.SendMessageTimeoutW.argtypes = [
+        wintypes.HWND, wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t,
+        wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t),
+    ]
+    ctypes.windll.user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
+except Exception:
+    logging.debug("user32 SendMessageTimeoutW argtypes 設定失敗", exc_info=True)
+
+
 def _get_tab_item_rect_cross_process(tab_hwnd: int, item_index: int):
     """[2026-05-22 任務 B] Cross-process TCM_GETITEMRECT — 抓 tab N 的精準
     client rect。回傳 (left, top, right, bottom) 或 None。
