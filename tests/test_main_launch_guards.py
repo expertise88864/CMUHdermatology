@@ -129,6 +129,20 @@ def test_scheduler_window_has_distinct_title():
     assert 'self.root.title("中國醫皮膚科排班程式")' in source
 
 
+def test_main_places_window_on_preferred_monitor_before_and_after_deiconify():
+    source = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
+
+    assert "place_tk_window_on_preferred_monitor(self.root)" in source
+    assert "main_root.deiconify()\n        place_tk_window_on_preferred_monitor(main_root)" in source
+
+
+def test_startup_splash_uses_same_preferred_monitor_as_main_window():
+    source = (ROOT / "src" / "cmuh_common" / "splash.py").read_text(encoding="utf-8")
+
+    assert "monitor = get_preferred_monitor_rect()" in source
+    assert "move_tk_window_to_monitor(top, MonitorRect(x, y, w, h))" in source
+
+
 def test_f1_does_not_update_uvb_when_code_input_fails():
     source_path = ROOT / "src" / "main.py"
     func = _function_node(source_path, "script_F1_adaptive")

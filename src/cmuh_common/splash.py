@@ -11,6 +11,12 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
+from cmuh_common.platform_win import (
+    MonitorRect,
+    get_preferred_monitor_rect,
+    move_tk_window_to_monitor,
+)
+
 
 class StartupSplash:
     """啟動 splash 視窗。需要 parent root。
@@ -46,11 +52,16 @@ class StartupSplash:
 
             # 置中
             w, h = 400, 130
-            sw = top.winfo_screenwidth()
-            sh = top.winfo_screenheight()
-            x = (sw - w) // 2
-            y = (sh - h) // 2
-            top.geometry(f"{w}x{h}+{x}+{y}")
+            monitor = get_preferred_monitor_rect()
+            if monitor is not None:
+                x = monitor.left + (monitor.width - w) // 2
+                y = monitor.top + (monitor.height - h) // 2
+            else:
+                sw = top.winfo_screenwidth()
+                sh = top.winfo_screenheight()
+                x = (sw - w) // 2
+                y = (sh - h) // 2
+            move_tk_window_to_monitor(top, MonitorRect(x, y, w, h))
 
             # 邊框 + 主題色 frame
             outer = tk.Frame(top, bg="#005A9C")

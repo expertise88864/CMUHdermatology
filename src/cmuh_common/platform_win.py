@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from ctypes import wintypes
+from dataclasses import dataclass
 
 # GetSystemMetrics 索引（multi-monitor 用）
 _SM_CXSCREEN = 0          # 主螢幕寬（實體像素）
@@ -16,6 +17,44 @@ _SM_YVIRTUALSCREEN = 77   # 虛擬桌面左上角 Y
 _SM_CXVIRTUALSCREEN = 78  # 虛擬桌面總寬（含所有螢幕）
 _SM_CYVIRTUALSCREEN = 79  # 虛擬桌面總高
 _SHELL_EXECUTE_SUCCESS_MIN = 32
+_MONITORINFOF_PRIMARY = 0x00000001
+_DISPLAY_DEVICE_MIRRORING_DRIVER = 0x00000008
+_SWP_NOZORDER = 0x0004
+_SWP_NOACTIVATE = 0x0010
+
+
+@dataclass(frozen=True, slots=True)
+class MonitorRect:
+    left: int
+    top: int
+    width: int
+    height: int
+    is_primary: bool = False
+
+    @property
+    def area(self) -> int:
+        return self.width * self.height
+
+
+class _MONITORINFOEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+        ("szDevice", wintypes.WCHAR * 32),
+    ]
+
+
+class _DISPLAY_DEVICEW(ctypes.Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("DeviceName", wintypes.WCHAR * 32),
+        ("DeviceString", wintypes.WCHAR * 128),
+        ("StateFlags", wintypes.DWORD),
+        ("DeviceID", wintypes.WCHAR * 128),
+        ("DeviceKey", wintypes.WCHAR * 128),
+    ]
 
 
 def is_admin() -> bool:
@@ -81,10 +120,177 @@ def set_dpi_awareness() -> None:
             pass
 
 
+def _display_device_is_mirror_driver(user32, device_name: str) -> bool:
+    """Return true only when Windows explicitly marks a display as mirrored."""
+    enum_devices = getattr(user32, "EnumDisplayDevicesW", None)
+    if not callable(enum_devices):
+        return False
+    try:
+        device = _DISPLAY_DEVICEW()
+        device.cb = ctypes.sizeof(device)
+        if not enum_devices(device_name, 0, ctypes.byref(device), 0):
+            return False
+        return bool(int(device.StateFlags) & _DISPLAY_DEVICE_MIRRORING_DRIVER)
+    except Exception:
+        return False
+
+
+def _display_device_has_physical_monitor_id(user32, device_name: str) -> bool | None:
+    """Return physical PnP status when the driver exposes a child monitor ID."""
+    enum_devices = getattr(user32, "EnumDisplayDevicesW", None)
+    if not callable(enum_devices):
+        return None
+    try:
+        device = _DISPLAY_DEVICEW()
+        device.cb = ctypes.sizeof(device)
+        if not enum_devices(device_name, 0, ctypes.byref(device), 0):
+            return None
+        device_id = str(device.DeviceID or "").upper()
+        if not device_id:
+            return None
+        return device_id.startswith("MONITOR\\")
+    except Exception:
+        return None
+
+
+def get_active_physical_monitors() -> list[MonitorRect]:
+    """Enumerate active desktop monitors, excluding mirror display drivers."""
+    if os.name != "nt":
+        return []
+    try:
+        user32 = ctypes.windll.user32
+        callback_type = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(
+            wintypes.BOOL,
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.RECT),
+            wintypes.LPARAM,
+        )
+        monitors = []
+
+        def _collect(hmonitor, _hdc, _rect, _data):
+            info = _MONITORINFOEXW()
+            info.cbSize = ctypes.sizeof(info)
+            if not user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+                return True
+            if _display_device_is_mirror_driver(user32, info.szDevice):
+                return True
+            if _display_device_has_physical_monitor_id(user32, info.szDevice) is False:
+                return True
+            rect = info.rcMonitor
+            width = int(rect.right - rect.left)
+            height = int(rect.bottom - rect.top)
+            if width > 0 and height > 0:
+                monitors.append(MonitorRect(
+                    left=int(rect.left),
+                    top=int(rect.top),
+                    width=width,
+                    height=height,
+                    is_primary=bool(int(info.dwFlags) & _MONITORINFOF_PRIMARY),
+                ))
+            return True
+
+        callback = callback_type(_collect)
+        if not user32.EnumDisplayMonitors(None, None, callback, 0):
+            return []
+        return sorted(
+            monitors,
+            key=lambda item: (not item.is_primary, item.left, item.top),
+        )
+    except Exception:
+        logging.debug("Unable to enumerate active physical monitors", exc_info=True)
+        return []
+
+
+def choose_preferred_monitor(monitors) -> MonitorRect | None:
+    """Prefer the largest real secondary monitor; otherwise use primary."""
+    rows = [m for m in monitors if isinstance(m, MonitorRect) and m.area > 0]
+    if not rows:
+        return None
+    secondary = [m for m in rows if not m.is_primary]
+    candidates = secondary or [m for m in rows if m.is_primary] or rows
+    return sorted(candidates, key=lambda m: (-m.area, m.left, m.top))[0]
+
+
+def get_preferred_monitor_rect() -> MonitorRect | None:
+    """Return the preferred monitor for opening the main desktop window."""
+    return choose_preferred_monitor(get_active_physical_monitors())
+
+
+def _tk_toplevel_hwnd(root) -> int:
+    """Return Tk's outermost HWND so SetWindowPos moves the framed window."""
+    hwnd = int(root.winfo_id())
+    if os.name != "nt":
+        return hwnd
+    try:
+        user32 = ctypes.windll.user32
+        for _ in range(8):
+            parent = int(user32.GetParent(hwnd) or 0)
+            if not parent:
+                break
+            hwnd = parent
+    except Exception:
+        logging.debug("Unable to resolve Tk top-level HWND", exc_info=True)
+    return hwnd
+
+
+def move_tk_window_to_monitor(root, monitor: MonitorRect) -> bool:
+    """Move a Tk window to exact virtual-desktop coordinates."""
+    try:
+        root.update_idletasks()
+        if os.name == "nt":
+            hwnd = _tk_toplevel_hwnd(root)
+            if hwnd and ctypes.windll.user32.SetWindowPos(
+                hwnd,
+                0,
+                monitor.left,
+                monitor.top,
+                monitor.width,
+                monitor.height,
+                _SWP_NOZORDER | _SWP_NOACTIVATE,
+            ):
+                return True
+    except Exception:
+        logging.debug("Unable to position Tk window with SetWindowPos", exc_info=True)
+    try:
+        root.geometry(
+            f"{monitor.width}x{monitor.height}"
+            f"{monitor.left:+d}{monitor.top:+d}"
+        )
+        return True
+    except Exception:
+        logging.debug("Unable to position Tk window with geometry", exc_info=True)
+        return False
+
+
+def place_tk_window_on_preferred_monitor(
+    root,
+    *,
+    fallback_geometry: str = "1280x720",
+) -> MonitorRect | None:
+    """Move a Tk window to a real secondary display when available and maximize."""
+    monitor = get_preferred_monitor_rect()
+    moved = monitor is not None and move_tk_window_to_monitor(root, monitor)
+    if not moved:
+        try:
+            root.geometry(fallback_geometry)
+        except Exception:
+            logging.debug("Unable to apply fallback Tk geometry", exc_info=True)
+    try:
+        if root.state() != "withdrawn":
+            root.state("zoomed")
+    except Exception:
+        logging.debug("Unable to maximize Tk window", exc_info=True)
+    return monitor
+
+
 def get_monitor_count() -> int:
     """螢幕數量（偵測不到時回 1）。"""
     if os.name != 'nt':
         return 1
+    monitors = get_active_physical_monitors()
+    if monitors:
+        return len(monitors)
     try:
         return max(1, int(ctypes.windll.user32.GetSystemMetrics(_SM_CMONITORS)))
     except Exception:

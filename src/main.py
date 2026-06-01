@@ -72,6 +72,7 @@ from cmuh_common.clinic_light_history import (
 from cmuh_common.platform_win import (
     is_admin, run_as_admin, set_dpi_awareness, set_app_user_model_id, get_idle_duration,
     get_virtual_screen_rect, get_primary_monitor_size,
+    place_tk_window_on_preferred_monitor,
 )
 from cmuh_common.notifications import show_windows_notification
 from cmuh_common.icons import ensure_cmuh_app_icon_path as _ensure_cmuh_app_icon_path
@@ -5790,8 +5791,7 @@ class AutomationApp:
     def __init__(self, root: tk.Tk, master_schedule: dict):
         self.root = root
         self.root.title("中國醫皮膚科常用程式")
-        try: self.root.state('zoomed')
-        except tk.TclError: self.root.geometry("1280x720")
+        place_tk_window_on_preferred_monitor(self.root)
         _apply_tk_window_icon(self.root)
         
         # [雙螢幕] 解析度偵測一律以「主螢幕」為準(GetSystemMetrics)，而非虛擬桌面。
@@ -11713,6 +11713,7 @@ if __name__ == "__main__":
             pass
     try:
         main_root.deiconify()
+        place_tk_window_on_preferred_monitor(main_root)
         # 顯式解除 topmost（修：splash 關閉後主視窗有時殘留 topmost，導致無法切到其他程式）
         main_root.attributes("-topmost", False)
         main_root.lift()
