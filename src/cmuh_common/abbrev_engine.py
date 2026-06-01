@@ -44,7 +44,7 @@ ABBREV_CONFIG_SCHEMA_VERSION = 2
 MAX_ABBREV_LENGTH = 63
 
 DEFAULT_ITEMS: list[dict[str, str]] = [
-    {"abbrev": "cert", "expansion": "患者因上述皮膚疾病，曾於da至本院皮膚科門診就醫治療，建議持續追蹤。"},
+    {"abbrev": "cert", "expansion": "患者因上述皮膚疾病，曾於da_zh至本院皮膚科門診就醫治療，建議持續追蹤。"},
     {"abbrev": "da",   "expansion": "da"},
     {"abbrev": "da1",  "expansion": "da1"},
     {"abbrev": "da2",  "expansion": "da2"},
@@ -94,6 +94,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
 _LEGACY_DEFAULTS_TO_MIGRATE: dict[str, str] = {
     # [v7 2026-05-28] ef 預設改為含 "and follow up"
     "ef": "excisional biopsy, inform post-op 3x scar formation",
+    # cert 預設日期由西式 da（(2026/6/1)）改為中文 da_zh（2026年6月1日）
+    "cert": "患者因上述皮膚疾病，曾於da至本院皮膚科門診就醫治療，建議持續追蹤。",
     "cert1": (
         "患者因上述皮膚疾病，於2026年5月28日至本院皮膚科門診就醫治療，"
         "後續接受局部麻醉下皮膚腫瘤切除手術及縫合，"

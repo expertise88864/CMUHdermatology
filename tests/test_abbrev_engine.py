@@ -203,6 +203,24 @@ def test_migrate_legacy_ef_preserves_user_custom():
     assert items[0]["expansion"] == "my own ef text"
 
 
+def test_migrate_legacy_cert_to_zh_date():
+    """user 沿用舊版 cert（西式 da 日期）→ 自動升級為中文 da_zh 版本。"""
+    items = [{"abbrev": "cert",
+              "expansion": "患者因上述皮膚疾病，曾於da至本院皮膚科門診就醫治療，建議持續追蹤。"}]
+    changed = _maybe_migrate_legacy(items)
+    assert changed is True
+    assert items[0]["expansion"] == (
+        "患者因上述皮膚疾病，曾於da_zh至本院皮膚科門診就醫治療，建議持續追蹤。")
+
+
+def test_migrate_legacy_cert_preserves_user_custom():
+    """user 手動改過的 cert → 不該被升級覆蓋。"""
+    items = [{"abbrev": "cert", "expansion": "我自己的診斷書文字 da"}]
+    changed = _maybe_migrate_legacy(items)
+    assert changed is False
+    assert items[0]["expansion"] == "我自己的診斷書文字 da"
+
+
 def test_replace_timing_constants_ordered():
     """[v7] 寧慢求對：確認延遲常數有被拉長 (deletion 正確性)。"""
     assert AbbrevEngine.PRE_BACKSPACE_DELAY_SEC >= 0.10

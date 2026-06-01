@@ -22,14 +22,14 @@ def test_requested_default_abbreviations_are_present():
     assert defaults["sd"] == "seborrheic dermatitis"
     assert defaults["mf"] == "medication and follow up"
     assert defaults["cert"] == \
-        "患者因上述皮膚疾病，曾於da至本院皮膚科門診就醫治療，建議持續追蹤。"
+        "患者因上述皮膚疾病，曾於da_zh至本院皮膚科門診就醫治療，建議持續追蹤。"
 
 
 def test_cert_default_renders_dynamic_visit_date():
     template = _default_map()["cert"]
 
     assert ae.render_expansion(template, datetime(2026, 5, 31)) == \
-        "患者因上述皮膚疾病，曾於(2026/5/31)至本院皮膚科門診就醫治療，建議持續追蹤。"
+        "患者因上述皮膚疾病，曾於2026年5月31日至本院皮膚科門診就醫治療，建議持續追蹤。"
 
 
 def test_old_config_adds_new_defaults_once_and_preserves_custom_text(tmp_path):
