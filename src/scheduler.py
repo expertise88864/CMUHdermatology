@@ -6866,9 +6866,15 @@ class AutomationApp:
                         
                         if ':' in raw_time:
                             parts = raw_time.split(':')
-                            target_time_str = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+                            try:
+                                target_time_str = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+                            except (ValueError, IndexError):
+                                # [stability] 時間格式異常時不要每 5 秒拋例外洗 log
+                                # (且自動重開永遠 silent 不觸發)；退回原字串比對
+                                # (不會 match 合法 HH:MM → 安全地不重開，但無例外)。
+                                target_time_str = raw_time
                         else:
-                            target_time_str = raw_time 
+                            target_time_str = raw_time
 
                         current_date_str = now.strftime("%Y-%m-%d")
 

@@ -11838,7 +11838,25 @@ if __name__ == "__main__":
     if _splash:
         _splash.update_text("載入主視窗…")
 
-    app = AutomationApp(main_root, {})
+    try:
+        app = AutomationApp(main_root, {})
+    except Exception:
+        # [stability] 主程式初始化若拋例外，原本 splash 會卡在畫面、process 靜默
+        # 死掉只留 log，使用者一頭霧水(以為當機)。改為：關掉 splash、記完整
+        # traceback、跳一個可見的錯誤框提示使用者去看 log，再乾淨退出。
+        logging.exception("主程式初始化失敗 (AutomationApp 建構)")
+        try:
+            if _splash:
+                _splash.close()
+        except Exception:
+            pass
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                0, "主程式初始化失敗，請查看 automation_ui.log 後重新啟動。",
+                "中國醫皮膚科主程式", 0x10)  # MB_ICONERROR
+        except Exception:
+            pass
+        sys.exit(1)
     DOCTORS = app.doctors_list
     DOCTOR_NAMES = [d["name"] for d in DOCTORS]
 

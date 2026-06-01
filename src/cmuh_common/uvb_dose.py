@@ -430,13 +430,17 @@ def compute_new_dose(*, dose: int, increase: int, max_dose: int,
         return min(dose + increase, max_dose)
     if days_diff == SAME_DOSE_DAYS:                 # 7 天剛好 → 保持
         return dose
+    # [safety] decay/long-gap 結果一律夾在 [.., dose, max_dose]：MIN_DECAY_DOSE(250)
+    # 下限在 dose 或 max_dose 低於 250 時，會讓「衰退」反而回傳高於當前劑量/超過
+    # 上限的值（照光過量風險）。min(.., dose, max_dose) 確保衰退永遠不增量、不超
+    # 上限。正常情況(max_dose=800、dose≥250)此夾值不改變結果。
     if days_diff <= DECAY_75_UPPER:                 # 8-14 天 → ×0.75
         decayed = _floor_to_10(dose * DECAY_75_FACTOR)
-        return max(decayed, MIN_DECAY_DOSE)
+        return min(max(decayed, MIN_DECAY_DOSE), dose, max_dose)
     if days_diff <= DECAY_50_UPPER:                 # 15-21 天 → ×0.5
         decayed = _floor_to_10(dose * DECAY_50_FACTOR)
-        return max(decayed, MIN_DECAY_DOSE)
-    return LONG_GAP_DOSE                            # > 21 天 → 250
+        return min(max(decayed, MIN_DECAY_DOSE), dose, max_dose)
+    return min(LONG_GAP_DOSE, dose, max_dose)       # > 21 天 → 250(夾上限/當前)
 
 
 # ─── 寫回行內容 ──────────────────────────────────────────────────────────
@@ -790,6 +794,9 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         if partial.last_date is None:
             # [v20.17] 沒 date → 直接 silent first-time 更新，不跳對話框
             # (user request: "不用跳出是否新增日期 直接修改劑量")
+            # 註：first-time 刻意只受 phrase 內「本地 max」約束(_first_time_update
+            # 已 min(dose+increase, 本地max) 夾住)，不套用全域 MAX_DOSE 上限確認
+            # ——醫師當下親手寫的 dose+max 視為可信(見 test_silent_first_time_*)。
             result = _first_time_update(partial, today, uvb_lines)
             # 接回原文
             full_new = (text[:partial.span[0]]

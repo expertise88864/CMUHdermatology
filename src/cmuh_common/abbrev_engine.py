@@ -706,6 +706,25 @@ def _clipboard_set_text(text: str) -> bool:
                 logging.debug("[abbrev] clipboard memory free 失敗", exc_info=True)
 
 
+def _clipboard_has_nontext_data() -> bool:
+    """剪貼簿目前是否含「非文字」內容（圖片/檔案/HTML 等）。
+
+    用來避免破壞使用者剛複製的非文字資料：_clipboard_get_text 只讀 CF_UNICODETEXT，
+    對圖片/檔案會回 None，若仍走 paste 路徑(會 EmptyClipboard)就會把它清掉且無法
+    還原(備份是 None)。有 Unicode 文字 → False(我們能備份還原)；沒文字但剪貼簿
+    非空 → True(視為非文字內容，應避免覆寫)。不需開啟剪貼簿，不會卡。"""
+    try:
+        u = ctypes.windll.user32
+        if u.IsClipboardFormatAvailable(_CF_UNICODETEXT):
+            return False
+        try:
+            return int(u.CountClipboardFormats()) > 0
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
 # -----------------------------------------------------------------------------
 # 原子 SendInput（避免 race condition：一次 call 內所有 events 連續 dispatch，
 # 中間不會被 user 真實 keystroke 插隊）
@@ -1195,6 +1214,7 @@ class AbbrevEngine:
 
         replace_started = time.monotonic()
         old_clip: Optional[str] = None
+        clip_ok = False
         used_native_edit = False
         used_paste = False
         used_keystroke = False
@@ -1217,7 +1237,11 @@ class AbbrevEngine:
 
             # 1. 備份 + 設剪貼簿（paste mode 首選）
             old_clip = _clipboard_get_text()
-            clip_ok = _clipboard_set_text(text)
+            # [safety] 剪貼簿存著非文字內容(圖片/檔案/HTML)時 old_clip 為 None；走
+            # paste 路徑會 EmptyClipboard 清掉它且無法還原 → 改走 keystroke fallback
+            # 完全不碰剪貼簿，保住使用者剛複製的資料。
+            force_keystroke = (old_clip is None and _clipboard_has_nontext_data())
+            clip_ok = (not force_keystroke) and _clipboard_set_text(text)
 
             if clip_ok:
                 # [v7] 拆成「先刪除、再貼上」兩段原子 SendInput，中間留時間
@@ -1258,8 +1282,12 @@ class AbbrevEngine:
                 #     才在 finally 還原剪貼簿（太早還原會貼到舊內容）。
                 time.sleep(self.POST_PASTE_DELAY_SEC)
             else:
-                # 2b. fallback: 剪貼簿寫入失敗 → 用 keyboard.send/write 老路
-                logging.warning("[abbrev] 剪貼簿寫入失敗，fallback 用 keystroke")
+                # 2b. fallback: 剪貼簿寫入失敗 / 剪貼簿含非文字內容 → keystroke 老路
+                if force_keystroke:
+                    logging.info("[abbrev] 剪貼簿含非文字內容(圖片/檔案)，改用 "
+                                 "keystroke 展開以免破壞使用者剪貼簿")
+                else:
+                    logging.warning("[abbrev] 剪貼簿寫入失敗，fallback 用 keystroke")
                 for _ in range(backspace_count):
                     try:
                         kb.send("backspace")
@@ -1273,10 +1301,15 @@ class AbbrevEngine:
         except Exception:
             logging.exception("[abbrev] _do_replace 失敗 abbrev=%s", abbrev_key)
         finally:
-            # 還原剪貼簿（即使失敗也試）
-            if old_clip is not None:
+            # 還原剪貼簿。[safety] 僅在「確實寫過剪貼簿(clip_ok)且剪貼簿現在仍是我們
+            # 貼上的展開內容」時才還原：BlockInput 在 POST_PASTE 等待前就解凍，那
+            # 0.3s 內使用者可能已 Ctrl+C 複製新東西，無條件還原會蓋掉它。
+            if old_clip is not None and clip_ok:
                 try:
-                    _clipboard_set_text(old_clip)
+                    if _clipboard_get_text() == text:
+                        _clipboard_set_text(old_clip)
+                    else:
+                        logging.debug("[abbrev] 剪貼簿已被使用者更新，保留不還原")
                 except Exception:
                     logging.debug("[abbrev] 還原剪貼簿失敗", exc_info=True)
 
