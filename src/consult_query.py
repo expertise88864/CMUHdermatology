@@ -726,6 +726,17 @@ def run_consult_flow(trigger_label: str = "") -> Path:
                 result["shot"] = _automation_on_hidden(cfg)
             except Exception as e:  # noqa: BLE001
                 result["error"] = e
+            finally:
+                # [stability] 由 worker(已 SetThreadDesktop 到此 hdesk)結束時關閉
+                # HDESK handle，修正 _ensure_hidden_desktop 的 OpenDesktopW/
+                # CreateDesktopW 從不 CloseDesktop 的永久 USER object 洩漏：常駐程式
+                # 每次排程/IMAP 觸發/重試都洩一個，數天不重啟會逼近 per-process 上限
+                # → 之後建立隱藏桌面失敗、退化成 SW_HIDE。逾時孤兒 worker 最終走到
+                # 自身迴圈 deadline 結束時也會在此釋放(故洩漏被收斂、不再單調累積)。
+                try:
+                    _user32.CloseDesktop(hdesk)
+                except Exception:
+                    logging.debug("CloseDesktop 失敗", exc_info=True)
 
         t = threading.Thread(target=worker, name="ConsultAutomationHidden",
                               daemon=True)
@@ -1461,6 +1472,14 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                 else:
                     logging.error("會診查詢任務已重試 %d 次仍失敗，放棄。最後錯誤：%s",
                                   retry_count, last_err)
+                    # [stability] email 觸發整個失敗(沒寄出結果) → 把觸發者從去重
+                    # 名單移除，讓使用者可立即重發觸發信重試，不必等 5 分鐘去重窗
+                    # 過期才生效。
+                    if trigger_label == "email" and override_recipients:
+                        _release_trigger_dedup(override_recipients)
+                        logging.info(
+                            "[dedup] 已釋放失敗的 email 觸發者，可立即重試：%s",
+                            ", ".join(str(x) for x in override_recipients))
     finally:
         try:
             pythoncom.CoUninitialize()
@@ -1671,21 +1690,39 @@ _scheduler_thread_ref = None
 # 防 mark-read 失敗導致重複處理
 _TRIGGER_DEDUP_WINDOW_SEC = 300
 _recent_trigger_senders: dict = {}  # sender_email → last_processed_ts
+# [stability] 保護 _recent_trigger_senders：scheduler thread(去重判斷)與 job
+# thread(失敗時釋放觸發者)會併發存取此 dict，無鎖時 job thread 的 pop 可能撞上
+# scheduler thread 的 .items() 迭代 → RuntimeError(dict changed size)。
+_trigger_dedup_lock = threading.Lock()
 
 
 def _trigger_is_duplicate(sender: str) -> bool:
     """同 sender 5 分鐘內處理過 → True (應跳過)。"""
     now = time.time()
-    last = _recent_trigger_senders.get(sender.lower(), 0.0)
-    if now - last < _TRIGGER_DEDUP_WINDOW_SEC:
-        return True
-    _recent_trigger_senders[sender.lower()] = now
-    # 順便清過期項
-    cutoff = now - _TRIGGER_DEDUP_WINDOW_SEC * 4
-    expired = [k for k, v in _recent_trigger_senders.items() if v < cutoff]
-    for k in expired:
-        _recent_trigger_senders.pop(k, None)
-    return False
+    with _trigger_dedup_lock:
+        last = _recent_trigger_senders.get(sender.lower(), 0.0)
+        if now - last < _TRIGGER_DEDUP_WINDOW_SEC:
+            return True
+        _recent_trigger_senders[sender.lower()] = now
+        # 順便清過期項
+        cutoff = now - _TRIGGER_DEDUP_WINDOW_SEC * 4
+        expired = [k for k, v in _recent_trigger_senders.items() if v < cutoff]
+        for k in expired:
+            _recent_trigger_senders.pop(k, None)
+        return False
+
+
+def _release_trigger_dedup(senders) -> None:
+    """把指定觸發者從去重名單移除，讓其可立即重發觸發信。用於 job 整個失敗
+    (沒寄出結果)時：否則觸發者在 5 分鐘去重窗內重發都會被當重複而吞掉。"""
+    if not senders:
+        return
+    with _trigger_dedup_lock:
+        for s in senders:
+            try:
+                _recent_trigger_senders.pop(str(s).strip().lower(), None)
+            except Exception:
+                pass
 
 
 def _hard_exit(reason: str, code: int = 1) -> None:
