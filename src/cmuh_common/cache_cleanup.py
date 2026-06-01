@@ -170,9 +170,10 @@ def schedule_cleanup_in_background(executor, *, delay_seconds: int = 30) -> bool
     def _later():
         try:
             future = executor.submit(_run)
-            if getattr(future, "done", lambda: False)():
+
+            def _fallback_if_submit_failed(done_future):
                 try:
-                    exc = future.exception()
+                    exc = done_future.exception()
                 except Exception as err:
                     exc = err
                 if exc is not None:
@@ -181,6 +182,12 @@ def schedule_cleanup_in_background(executor, *, delay_seconds: int = 30) -> bool
                         exc,
                     )
                     _start_fallback_thread()
+
+            add_done_callback = getattr(future, "add_done_callback", None)
+            if callable(add_done_callback):
+                add_done_callback(_fallback_if_submit_failed)
+            elif getattr(future, "done", lambda: False)():
+                _fallback_if_submit_failed(future)
         except Exception:
             _start_fallback_thread()
 

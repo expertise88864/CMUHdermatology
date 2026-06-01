@@ -128,6 +128,7 @@ from cmuh_common.appt_utils import (  # noqa: E402
     _merge_appointments_by_date,
     _merge_dayoff_overrides,
 )
+from cmuh_common.memory_cache import trim_oldest_entries
 
 # === 依賴清單（與原檔一致；指紋由 deps_runtime 處理）===
 REQUIRED_LIBS = [
@@ -166,6 +167,7 @@ import shutil
 import threading
 import time
 import tkinter as tk
+from weakref import WeakSet
 from tkinter import messagebox, scrolledtext, ttk
 
 # =============================================================================
@@ -398,7 +400,7 @@ _reg64_tls = threading.local()
 # 用。threading.local 本身不暴露跨 thread 的 session 給 main thread，所以額外
 # 維護一個 set；建 session 時 add，atexit 時 clear adapter pool 強制斷連線。
 # (不 call session.close() 避免等待未完成 request — 跟 _kill_orphan handler 同 pattern)
-_all_reg_sessions: set = set()
+_all_reg_sessions: WeakSet = WeakSet()
 _all_reg_sessions_lock = threading.Lock()
 _ttl_cache_lock = threading.Lock()
 _ttl_cache_store = {}
@@ -406,6 +408,9 @@ _parse_cache_store = {}
 _source_backoff_state = {}
 _source_throttle_state = {}
 _reg52_cmuh_fetch_sema = threading.Semaphore(2)
+_TTL_CACHE_MAX_ENTRIES = 512
+_PARSE_CACHE_MAX_ENTRIES = 256
+_SOURCE_STATE_MAX_ENTRIES = 128
 
 
 # =============================================================================
@@ -592,6 +597,7 @@ def _cache_get(cache_key, ttl_seconds, evict_expired=True):
 def _cache_set(cache_key, value):
     with _ttl_cache_lock:
         _ttl_cache_store[cache_key] = (time.time(), value)
+        trim_oldest_entries(_ttl_cache_store, _TTL_CACHE_MAX_ENTRIES)
 
 
 def _parse_cache_get(parser_key, html_text):
@@ -614,6 +620,7 @@ def _parse_cache_set(parser_key, html_text, parsed):
     key = (parser_key, h)
     with _ttl_cache_lock:
         _parse_cache_store[key] = (time.time(), parsed)
+        trim_oldest_entries(_parse_cache_store, _PARSE_CACHE_MAX_ENTRIES)
 
 
 def _source_backoff_allow(source_key):
@@ -636,6 +643,7 @@ def _source_backoff_fail(source_key, base_seconds=None, max_seconds=None):
         fail_count = (row[1] + 1) if row else 1
         delay = min(base * (2 ** (fail_count - 1)), max_delay)
         _source_backoff_state[source_key] = (now + delay, fail_count)
+        trim_oldest_entries(_source_backoff_state, _SOURCE_STATE_MAX_ENTRIES)
         return delay, fail_count
 
 
@@ -651,6 +659,11 @@ def _source_throttle_allow(source_key, interval_seconds):
         if now - last_ts < interval_seconds:
             return False, max(0.0, interval_seconds - (now - last_ts))
         _source_throttle_state[source_key] = now
+        trim_oldest_entries(
+            _source_throttle_state,
+            _SOURCE_STATE_MAX_ENTRIES,
+            timestamp_of=lambda stamp: stamp,
+        )
         return True, 0.0
 
 

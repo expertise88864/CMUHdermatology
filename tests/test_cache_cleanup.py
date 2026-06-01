@@ -54,3 +54,26 @@ def test_schedule_cleanup_skips_duplicate_timer(monkeypatch):
     assert cache_cleanup.schedule_cleanup_in_background(object(), delay_seconds=30) is False
     assert len(timers) == 1
     _reset_cleanup_state()
+
+
+def test_schedule_cleanup_falls_back_when_executor_future_fails_later(monkeypatch):
+    _reset_cleanup_state()
+    ran = threading.Event()
+    pending = Future()
+
+    def fake_cleanup_old_files():
+        ran.set()
+        return {}
+
+    class AsyncRejectingExecutor:
+        def submit(self, _fn):
+            return pending
+
+    monkeypatch.setattr(cache_cleanup, "cleanup_old_files", fake_cleanup_old_files)
+
+    cache_cleanup.schedule_cleanup_in_background(
+        AsyncRejectingExecutor(), delay_seconds=0,
+    )
+    pending.set_exception(RuntimeError("executor shut down"))
+
+    assert ran.wait(timeout=1)

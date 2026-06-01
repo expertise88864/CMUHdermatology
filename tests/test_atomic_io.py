@@ -72,6 +72,25 @@ def test_safe_load_json_backs_up_corrupt_file():
         assert len(backups) == 1
 
 
+def test_safe_load_json_keeps_existing_same_second_corrupt_backup(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "broken.json")
+        first_backup = p + ".corrupt-20260601_010203"
+        with open(first_backup, "w", encoding="utf-8") as f:
+            f.write("older evidence")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{new broken json")
+
+        monkeypatch.setattr("cmuh_common.atomic_io.time.strftime",
+                            lambda _fmt: "20260601_010203")
+
+        assert safe_load_json(p, default={}) == {}
+        with open(first_backup, encoding="utf-8") as f:
+            assert f.read() == "older evidence"
+        with open(first_backup + "-1", encoding="utf-8") as f:
+            assert f.read() == "{new broken json"
+
+
 if __name__ == "__main__":
     test_atomic_write_json_roundtrip()
     test_atomic_write_json_creates_parent_dir_and_cleans_tmp()

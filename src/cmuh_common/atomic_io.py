@@ -25,6 +25,16 @@ def _make_temp_path(target_path: str) -> tuple[int, str]:
     return tempfile.mkstemp(prefix=f".{base}.", suffix=".tmp", dir=target_dir)
 
 
+def _next_corrupt_backup_path(file_path: str, timestamp: str) -> str:
+    """Return a non-conflicting corrupt backup path."""
+    candidate = f"{file_path}.corrupt-{timestamp}"
+    suffix = 1
+    while os.path.exists(candidate):
+        candidate = f"{file_path}.corrupt-{timestamp}-{suffix}"
+        suffix += 1
+    return candidate
+
+
 def atomic_write_json(file_path: str, data, **kwargs) -> None:
     """JSON 原子寫入。kwargs 會傳給 json.dump（如 default=...）。"""
     fd = -1
@@ -80,7 +90,7 @@ def safe_load_json(file_path: str, default=None, *,
         if backup_on_corrupt:
             try:
                 ts = time.strftime("%Y%m%d_%H%M%S")
-                bak = f"{file_path}.corrupt-{ts}"
+                bak = _next_corrupt_backup_path(file_path, ts)
                 os.replace(file_path, bak)
                 logging.warning("[safe_load_json] 已 backup 壞檔到 %s", bak)
             except Exception:

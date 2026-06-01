@@ -233,6 +233,15 @@ def test_main_and_scheduler_schedule_cache_cleanup_for_standalone_launches():
         assert "schedule_cleanup_in_background(self.bg_executor, delay_seconds=30)" in src
 
 
+def test_main_uses_weak_http_session_registry_and_bounded_memory_caches():
+    src = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
+
+    assert "_all_reg_sessions: WeakSet = WeakSet()" in src
+    assert "trim_oldest_entries(_ttl_cache_store, _TTL_CACHE_MAX_ENTRIES)" in src
+    assert "trim_oldest_entries(_parse_cache_store, _PARSE_CACHE_MAX_ENTRIES)" in src
+    assert "trim_oldest_entries(_source_backoff_state, _SOURCE_STATE_MAX_ENTRIES)" in src
+
+
 def test_main_and_scheduler_log_queues_are_bounded():
     for rel_path in ("src/main.py", "src/scheduler.py"):
         src = (ROOT / rel_path).read_text(encoding="utf-8")
