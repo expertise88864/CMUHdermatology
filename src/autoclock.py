@@ -292,14 +292,14 @@ LOGIN_URL = "http://10.20.8.47/peoplesystem/electron_card/login.aspx"
 
 CLOCK_IN_START_TIME = dt_time(7, 31, 0)
 CLOCK_IN_END_TIME = dt_time(7, 59, 59)
-CLOCK_MIDDAY_IN_START_TIME = dt_time(12, 30, 0)
+CLOCK_MIDDAY_IN_START_TIME = dt_time(12, 31, 0)  # [2026-06-01] 比窗起(12:30)晚 1 分觸發，確保打卡落在 1230-1300 內
 CLOCK_MIDDAY_IN_END_TIME = dt_time(12, 59, 59)
 CLOCK_MIDDAY_OUT_START_TIME = dt_time(12, 0, 0)
 CLOCK_MIDDAY_OUT_END_TIME = dt_time(12, 30, 59)
 CLOCK_PM_OUT_START_TIME = dt_time(17, 0, 0)
 CLOCK_PM_OUT_END_TIME = dt_time(17, 30, 59)
 TRIGGER_PM_OUT_START_TIME = dt_time(17, 1, 0)
-CLOCK_EVE_OUT_START_TIME = dt_time(21, 0, 0)
+CLOCK_EVE_OUT_START_TIME = dt_time(21, 1, 0)  # [2026-06-01] 比窗起(21:00)晚 1 分觸發，確保打卡落在 2100-2130 內
 CLOCK_EVE_OUT_END_TIME = dt_time(21, 30, 59)
 
 VALIDATION_WINDOWS = {
@@ -617,28 +617,21 @@ def get_current_swipe_info(driver, wait, get_loc):
     return sys_date, swipes, last_swipe
 
 
-# [2026-06-01] 本機與 HR 伺服器時鐘可能差 1-2 分鐘 → 打卡瞬間被記成窗外(實例:12:30:47
-# 打卡被 HR 記成 12:29，落在 midday_in 窗 12:30-13:00 之外)，使下一輪輪詢誤判「窗內未
-# 打卡」而「重複打卡」。判定「是否已打過卡」時左右各放寬數分鐘吸收此偏差。
-# 安全性:各驗證窗相距 4+ 小時，且 _check_swipes 已依「上班/下班」類型過濾，放寬幾分鐘
-# 不會把別的時段或別種類型的打卡誤認。
-_SWIPE_WINDOW_TOLERANCE_MIN = 5
+def _check_swipes(type_str: str, start: dt_time, end: dt_time, swipes) -> bool:
+    """檢查是否有「特定類型」紀錄『嚴格』落在 [start, end] 官方打卡區間內。
 
-
-def _check_swipes(type_str: str, start: dt_time, end: dt_time, swipes,
-                  tolerance_min: int = _SWIPE_WINDOW_TOLERANCE_MIN) -> bool:
-    """檢查是否有「特定類型」紀錄落在 [start, end] 區間(左右放寬 tolerance_min 分鐘吸收時鐘偏差)內。"""
-    start_min = start.hour * 60 + start.minute - tolerance_min
-    end_min = end.hour * 60 + end.minute + tolerance_min
+    [2026-06-01] 不放寬區間(不吸收時鐘偏差)。改以「比窗起晚 1 分鐘才觸發打卡」
+    (am_in 7:31、midday_in 12:31、pm_out 17:01、eve_out 21:01)確保打卡時間穩穩
+    落在官方區間(0730-0800 / 1230-1300 / 1700-1730 / 2100-2130)內。
+    """
     for t, typ in swipes:
-        if typ != type_str:
-            continue
-        try:
-            swipe_min = int(t[:2]) * 60 + int(t[2:])
-        except (ValueError, IndexError):
-            continue
-        if start_min <= swipe_min <= end_min:
-            return True
+        if typ == type_str:
+            try:
+                swipe_time = dt_time(int(t[:2]), int(t[2:]))
+                if start <= swipe_time <= end:
+                    return True
+            except (ValueError, IndexError):
+                continue
     return False
 
 

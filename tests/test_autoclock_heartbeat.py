@@ -276,41 +276,43 @@ def test_autoclock_sleep_uses_monotonic_clock():
     assert "time_module.time()" not in src
 
 
-# ─── [2026-06-01] _check_swipes 時鐘偏差容忍：防重複打卡 ──────────────────────
-# 真實事故：N24367 12:30:47 打卡被 HR 記成 12:29(窗 12:30-13:00 之外) → 下一輪誤判
-# 「窗內未打卡」又打一次 → 重複上班。判定「已打過」時左右放寬數分鐘吸收時鐘偏差。
+# ─── [2026-06-01] _check_swipes 嚴格區間：不放寬，打卡須落在官方窗內 ──────────
+# 設計：不吸收時鐘偏差(不放寬窗)，改以「比窗起晚 1 分觸發打卡」確保落在官方窗內。
+# 對應打卡觸發時間：am_in 7:31 / midday_in 12:31 / pm_out 17:01 / eve_out 21:01。
 
 from datetime import time as _dt_time  # noqa: E402
 
 
-def test_check_swipes_tolerates_skew_just_before_window():
-    """打卡被記成窗起前 1 分鐘(時鐘偏差) → 仍判定已打卡，不重複。"""
+def test_check_swipes_hits_inside_official_window():
+    """打卡落在官方窗內(12:31 於 1230-1300) → 判定已打卡。"""
     assert autoclock._check_swipes(
         "上班", _dt_time(12, 30, 0), _dt_time(13, 0, 0),
-        [("1229", "上班")]) is True
+        [("1231", "上班")]) is True
 
 
-def test_check_swipes_tolerates_skew_just_after_window():
+def test_check_swipes_strict_excludes_before_window():
+    """嚴格：窗起前(12:29 於 1230-1300 之外)不算(不放寬)。"""
+    assert autoclock._check_swipes(
+        "上班", _dt_time(12, 30, 0), _dt_time(13, 0, 0),
+        [("1229", "上班")]) is False
+
+
+def test_check_swipes_strict_excludes_after_window():
     assert autoclock._check_swipes(
         "下班", _dt_time(17, 0, 0), _dt_time(17, 30, 0),
-        [("1732", "下班")]) is True
-
-
-def test_check_swipes_in_window_still_hits():
-    assert autoclock._check_swipes(
-        "上班", _dt_time(12, 30, 0), _dt_time(13, 0, 0),
-        [("1245", "上班")]) is True
+        [("1731", "下班")]) is False
 
 
 def test_check_swipes_ignores_wrong_type():
     # 下班紀錄不該被當成上班已打卡
     assert autoclock._check_swipes(
         "上班", _dt_time(12, 30, 0), _dt_time(13, 0, 0),
-        [("1229", "下班")]) is False
+        [("1245", "下班")]) is False
 
 
-def test_check_swipes_rejects_far_outside_tolerance():
-    # 距窗 10 分鐘(> 5 分容忍) → 不算，仍會打卡
-    assert autoclock._check_swipes(
-        "上班", _dt_time(12, 30, 0), _dt_time(13, 0, 0),
-        [("1220", "上班")]) is False
+def test_clock_trigger_times_are_one_minute_into_window():
+    """打卡觸發時間應比官方窗起晚 1 分(確保落在窗內)。"""
+    assert autoclock.CLOCK_IN_START_TIME == _dt_time(7, 31, 0)
+    assert autoclock.CLOCK_MIDDAY_IN_START_TIME == _dt_time(12, 31, 0)
+    assert autoclock.TRIGGER_PM_OUT_START_TIME == _dt_time(17, 1, 0)
+    assert autoclock.CLOCK_EVE_OUT_START_TIME == _dt_time(21, 1, 0)
