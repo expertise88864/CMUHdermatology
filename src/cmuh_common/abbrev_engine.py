@@ -1131,7 +1131,10 @@ class AbbrevEngine:
         if len(name) == 1:
             ch = name.lower()
             with self._lock:
-                self._buffer = (self._buffer + ch)[-self._max_abbrev_len:] if self._max_abbrev_len else ""
+                # 多保留 1 個字元(max_abbrev_len + 1)：供 _try_expand 判斷縮寫前是否為
+                # 字邊界(要看得到「縮寫的前一個字元」，才能擋掉字尾誤觸，如 persist→st)。
+                keep = self._max_abbrev_len + 1 if self._max_abbrev_len else 0
+                self._buffer = (self._buffer + ch)[-keep:] if keep else ""
             return
 
         # 其他特殊鍵（shift / ctrl / alt / caps lock 等）—不影響 buffer
@@ -1150,6 +1153,18 @@ class AbbrevEngine:
                 break
         if matched_key is None:
             return
+
+        # [修正] 只在縮寫是「完整的字」時才展開。若它剛好是某個更長單字的字尾
+        # (例如打 "persist"，結尾是 "st")，其前一個字元若為 ASCII 英數，代表縮寫
+        # 只是字的一部分 → 不觸發。前面是空白/標點/中文/或位於字首 → 視為完整字 → 展開。
+        prefix = buffer_snapshot[:len(buffer_snapshot) - len(matched_key)]
+        if prefix:
+            prev_ch = prefix[-1]
+            if prev_ch.isascii() and prev_ch.isalnum():
+                logging.debug(
+                    "[abbrev] '%s' 在字尾(前一字元=%r)，非完整字，略過展開",
+                    matched_key, prev_ch)
+                return
 
         # IME 中文模式或組字中 → 跳過（best-effort；新 TSF IME 上 IMM API 可能無效，
         # 偵測不到時就照常展開 — 寧可展開也不要整個功能卡死）

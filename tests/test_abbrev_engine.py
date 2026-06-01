@@ -269,3 +269,47 @@ def test_suppressing_blocks_within_cooldown(monkeypatch):
         name = "a"
     eng._handle_event(_E())
     assert eng._suppressing is True, "cooldown 內不該誤清 _suppressing"
+
+
+# ─── 縮寫必須是「完整的字」才觸發（不可在字尾誤觸，如 persist→st）───────────────
+
+def test_abbrev_triggers_only_on_whole_word(monkeypatch):
+    monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
+    monkeypatch.setattr(ae, "should_skip_for_input_method", lambda: False)
+    eng = _make_engine()
+    eng.install(AbbrevConfig(enabled=True, items=[
+        {"abbrev": "st", "expansion": "keep stable"}]))
+    # 攔截實際展開（避免真的送鍵）；_try_expand 命中且通過邊界檢查時會設 _suppressing=True
+    monkeypatch.setattr(eng, "_do_replace", lambda *a, **k: None)
+
+    def did_trigger(buf: str) -> bool:
+        eng._suppressing = False
+        eng._cooldown_until = 0.0
+        eng._try_expand(buf, " ")
+        return eng._suppressing
+
+    assert did_trigger("st") is True          # 完整字 → 展開
+    assert did_trigger("persist") is False    # 出現在字尾(persi+st) → 不展開
+    assert did_trigger("test") is False       # te+st → 不展開
+    assert did_trigger("1st") is False        # 數字開頭 1st → 不展開
+    assert did_trigger("(st") is True         # 標點後 → 視為完整字 → 展開
+    assert did_trigger("拆st") is True         # 中文後(非 ASCII 英數) → 視為邊界 → 展開
+
+
+def test_handle_event_typing_word_then_space_does_not_misfire(monkeypatch):
+    """整合：逐字打 'persist' 再按空白，不應觸發展開（_suppressing 保持 False）。"""
+    monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
+    monkeypatch.setattr(ae, "should_skip_for_input_method", lambda: False)
+    eng = _make_engine()
+    eng.install(AbbrevConfig(enabled=True, items=[
+        {"abbrev": "st", "expansion": "keep stable"}]))
+    monkeypatch.setattr(eng, "_do_replace", lambda *a, **k: None)
+
+    class _K:
+        def __init__(self, n):
+            self.name = n
+
+    for chh in "persist":
+        eng._handle_event(_K(chh))
+    eng._handle_event(_K("space"))
+    assert eng._suppressing is False, "persist 結尾的 st 不該誤觸展開"
