@@ -92,6 +92,7 @@ def get_chromedriver_path() -> str:
     優先順序：記憶體快取 → 磁碟快取（chrome 版本相符）→ ChromeDriverManager().install()。
     """
     global _memory_cache
+    # 先在鎖內查快取（命中是最常見路徑，快）。
     with _path_cache_lock:
         if _memory_cache and os.path.isfile(_memory_cache):
             return _memory_cache
@@ -106,9 +107,13 @@ def get_chromedriver_path() -> str:
             logging.info("Chrome 版本由 v%s 變為 v%s，重抓 chromedriver",
                          cached_major, chrome_major)
 
-        # 真正下載
-        from webdriver_manager.chrome import ChromeDriverManager  # type: ignore[import-not-found]
-        path = ChromeDriverManager().install()
+    # 真正下載：移到鎖外執行。ChromeDriverManager().install() 會做網路下載且無
+    # timeout，若持鎖時網路卡住，會卡死所有同時要取得 driver 的呼叫者（主程式
+    # status_driver + 打卡 clock_driver）。鎖外下載最壞情況只是兩條 thread 各下
+    # 載一次（webdriver-manager 自身有快取，第二次很快），不會互相卡死。
+    from webdriver_manager.chrome import ChromeDriverManager  # type: ignore[import-not-found]
+    path = ChromeDriverManager().install()
+    with _path_cache_lock:
         _memory_cache = path
         _write_disk_cache(path, chrome_major)
         return path

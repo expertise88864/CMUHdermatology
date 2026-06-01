@@ -87,8 +87,13 @@ def get_log_path(filename: str = 'app.log') -> str:
     return os.path.join(get_app_dir(), filename)
 
 
-def restart_self(extra_args=None) -> None:
+def restart_self(extra_args=None, hard_exit_code=None) -> None:
     """雙軌重啟。
+
+    hard_exit_code：None（預設）→ 成功 spawn 後以 sys.exit(0) 結束（給 main thread
+    用，能跑 atexit/finally）。給整數 → 改用 os._exit(code)。供「非 main thread」
+    呼叫者使用（例如 health 監看 daemon）：sys.exit 在子 thread 只會結束該 thread、
+    process 不會退 → 會變成新舊兩個 instance；os._exit 才能強制整個 process 結束。
 
     .pyw 模式：subprocess.Popen(pythonw, sys.argv[0], ...) + sys.exit
     .exe 模式：subprocess.Popen(sys.executable, ...) + sys.exit
@@ -116,9 +121,23 @@ def restart_self(extra_args=None) -> None:
         creationflags = 0x00000008 | 0x00000200
 
     try:
-        subprocess.Popen(cmd, creationflags=creationflags, close_fds=True,
-                          cwd=get_app_dir())
-        logging.info("[restart_self] spawned new process: %s", cmd)
+        proc = subprocess.Popen(cmd, creationflags=creationflags, close_fds=True,
+                                 cwd=get_app_dir())
+        logging.info("[restart_self] spawned new process pid=%s: %s", proc.pid, cmd)
+        # [stability] 確認新行程沒有「起來就馬上死」再退出舊行程。主程式沒有外層
+        # watchdog 接手，若新行程秒退（crash / 撞單例 mutex）又把舊的關掉 → 整個
+        # 程式消失、要人工重開。短暫輪詢確認存活；早夭就保留舊行程不退出，至少
+        # 還有一個能用。（單例 mutex 重啟競態已由 ensure_single_instance 重試處理，
+        # 故正常情況新行程會穩定存活。）
+        import time as _time
+        for _ in range(6):  # 最多約 0.6 秒
+            _time.sleep(0.1)
+            rc = proc.poll()
+            if rc is not None:
+                logging.error(
+                    "[restart_self] 新行程啟動後立即結束 (exit=%s)，保留舊行程不退出",
+                    rc)
+                return
     except Exception as e:
         logging.error("[restart_self] subprocess.Popen 失敗: %s — fallback os.execv", e)
         try:
@@ -126,5 +145,7 @@ def restart_self(extra_args=None) -> None:
         except Exception:
             logging.error("[restart_self] os.execv fallback 也失敗", exc_info=True)
             return
-    # spawn 成功就退出本 process
+    # spawn 成功且新行程存活 → 退出本 process
+    if hard_exit_code is not None:
+        os._exit(hard_exit_code)
     sys.exit(0)

@@ -688,16 +688,20 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
                         if not claim_action_lock(name, action_lock_sec):
                             return (f"⏭ {name}: 半死狀態但 lock 還新，"
                                     f"這輪先跳過 [{mode}]")
+                        # [stability] crash-loop 檢查移到 kill 之前：若已在暫停期
+                        # 就不要 kill。否則「殺了又拒絕重啟」會讓半死 process 被
+                        # 殺死、整段暫停期都沒程式在跑；保留現有(半死)process 至少
+                        # 還在，暫停結束後的下一輪才 kill+重啟。
+                        if not _record_restart_and_check_crash_loop(name):
+                            until = _SUSPENDED_UNTIL.get(name, 0.0)
+                            remain = max(0, int(until - time.time()))
+                            return (f"⛔ {name}: 半死且 crash loop，暫停 {remain // 60} "
+                                    f"分鐘（保留現有 process、不 kill）[{mode}]")
                         killed = [pid for pid in half_dead_pids if kill_pid(pid)]
                         if not killed:
                             return (f"⚠ {name}: 半死狀態 PID {half_dead_pids} "
                                     f"kill 失敗，未啟動新 instance 以避免重複 [{mode}]")
                         time.sleep(2)
-                        if not _record_restart_and_check_crash_loop(name):
-                            until = _SUSPENDED_UNTIL.get(name, 0.0)
-                            remain = max(0, int(until - time.time()))
-                            return (f"⛔ {name}: 半死且 crash loop，"
-                                    f"暫停 {remain // 60} 分鐘 [{mode}]")
                         new_pid = start_program(pyw_path, pythonw)
                         if not new_pid:
                             return (f"✗ {name}: 半死狀態已 kill {killed}，"
@@ -742,15 +746,18 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
             if not claim_action_lock(name, action_lock_sec):
                 return (f"⏭ {name}: log {age:.0f}s 沒更新但 lock 還新，"
                         f"這輪先跳過 [{mode}]")
+            # [stability] crash-loop 檢查移到 kill 之前（理由同半死路徑）：暫停期
+            # 不 kill，避免殺了又不重啟、留下空窗。
+            if not _record_restart_and_check_crash_loop(name):
+                until = _SUSPENDED_UNTIL.get(name, 0.0)
+                remain = max(0, int(until - time.time()))
+                return (f"⛔ {name}: stale 且 crash loop 中，暫停 {remain // 60} "
+                        f"分鐘（保留現有 process、不 kill）[{mode}]")
             killed = [pid for pid in pids if kill_pid(pid)]
             if not killed:
                 return (f"⚠ {name}: log {age:.0f}s 沒更新但 PID {pids} "
                         f"kill 失敗，未啟動新 instance 以避免重複 [{mode}]")
             time.sleep(2)
-            if not _record_restart_and_check_crash_loop(name):
-                until = _SUSPENDED_UNTIL.get(name, 0.0)
-                remain = max(0, int(until - time.time()))
-                return f"⛔ {name}: stale 且 crash loop 中，暫停 {remain // 60} 分鐘 [{mode}]"
             new_pid = start_program(pyw_path, pythonw)
             if not new_pid:
                 return (f"✗ {name}: log {age:.0f}s 沒更新，已 kill PID {killed}，"

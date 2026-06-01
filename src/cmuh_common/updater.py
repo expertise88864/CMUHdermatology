@@ -24,7 +24,6 @@ from typing import Callable, Optional
 
 import requests
 
-from cmuh_common.atomic_io import atomic_write_text
 from cmuh_common.paths import get_app_dir, is_frozen, restart_self
 from cmuh_common.update_policy import get_auto_update_suspend_until
 from cmuh_common.version import CURRENT_VERSION, parse_version
@@ -326,21 +325,72 @@ def check_and_update(
         logging.warning("更新清單驗證失敗，取消整批寫入")
         return result
 
-    written_files: list[_WrittenFile] = []
+    # [stability] 兩階段批次寫入，盡量逼近「全有或全無」，避免部分檔新、部分檔
+    # 舊的版本錯亂(version skew，例如 version.py 已新但它 import 的模組還舊 →
+    # 下次啟動 ImportError 又因 SHA 短路不再重抓 → 程式 brick)：
+    #   Phase 1：每個檔的新內容先寫到各自的 .upd.tmp（含 fsync）。任一失敗 → 清掉
+    #            所有 .upd.tmp、整批放棄（此時磁碟上的正式檔完全沒被動過）。
+    #   Phase 2：逐檔 backup(.bak)→os.replace（同磁碟 rename，幾乎不會失敗）。萬一
+    #            中途失敗，從 .bak 回滾已替換的檔。
+    # 比原本逐檔 atomic_write_text 更安全：把最可能失敗的「寫內容/fsync」(磁碟滿、
+    # AV 鎖檔)全部擋在任何 os.replace 之前。
+    import tempfile
+    import shutil
+
+    staged: list = []  # (tmp, target, existed_before, key, local_filename, new_ver)
     for key, local_filename, new_ver, content, target_path in prepared_writes:
-        existed_before = os.path.exists(target_path)
-        if atomic_write_text(target_path, content):
+        try:
+            target_dir = os.path.dirname(target_path) or "."
+            os.makedirs(target_dir, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=f".{os.path.basename(target_path)}.",
+                suffix=".upd.tmp", dir=target_dir)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            staged.append((tmp_path, target_path, os.path.exists(target_path),
+                           key, local_filename, new_ver))
+        except Exception as e:
+            result.errors.append(f"[{key}] 暫存寫入失敗: {e}")
+            break
+
+    if result.errors:
+        # Phase 1 失敗：清掉所有 .upd.tmp，正式檔一個都沒動
+        for entry in staged:
+            try:
+                if os.path.exists(entry[0]):
+                    os.remove(entry[0])
+            except OSError:
+                logging.debug("移除暫存檔失敗 [%s]", entry[0], exc_info=True)
+        logging.warning("更新暫存階段失敗，整批不寫入（正式檔未變動）")
+        return result
+
+    # Phase 2：逐檔 backup→replace（同磁碟 rename，幾乎不會失敗）
+    written_files: list[_WrittenFile] = []
+    for tmp_path, target_path, existed_before, key, local_filename, new_ver in staged:
+        try:
+            if existed_before:
+                shutil.copy2(target_path, target_path + ".bak")
+            os.replace(tmp_path, target_path)
             result.updated_files.append((local_filename, new_ver))
             written_files.append(_WrittenFile(target_path, existed_before))
             logging.info("  ✅ 已更新 %s -> v%s", local_filename, new_ver)
-        else:
-            result.errors.append(f"[{key}] 寫入失敗")
+        except Exception as e:
+            result.errors.append(f"[{key}] 寫入失敗: {e}")
             break
 
     if result.errors:
         rollback_errors = _rollback_written_files(written_files)
         result.errors.extend(rollback_errors)
         result.updated_files.clear()
+        # 清掉任何殘留、尚未 replace 的 .upd.tmp
+        for entry in staged:
+            try:
+                if os.path.exists(entry[0]):
+                    os.remove(entry[0])
+            except OSError:
+                pass
         logging.warning("更新寫入失敗，已回滾 %d 個檔案", len(written_files))
         return result
 

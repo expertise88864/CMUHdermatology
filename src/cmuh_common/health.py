@@ -180,7 +180,8 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
                   interval_sec: int, network_check: bool,
                   auto_restart_on_crit: bool,
                   crit_persistence_ticks: int,
-                  disk_check_path: str) -> None:
+                  disk_check_path: str,
+                  restart_callback=None) -> None:
     """背景監看迴圈。"""
     logging.info(
         "[health/%s] monitor 啟動 — RAM warn=%dMB crit=%dMB interval=%ds "
@@ -233,11 +234,22 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
                 if (auto_restart_on_crit
                         and consecutive_critical_ram >= crit_persistence_ticks):
                     logging.critical(
-                        "[health/%s] RAM 連續 %d 次 (~%d 分鐘) 都 ≥ critical → "
-                        "os._exit(1) 強制重啟 process (外層 watchdog 會接手)",
+                        "[health/%s] RAM 連續 %d 次 (~%d 分鐘) 都 ≥ critical → 重啟本 process",
                         tag, consecutive_critical_ram,
                         consecutive_critical_ram * interval_sec // 60)
                     _flush_logging_handlers_nonblocking()
+                    # 有 restart_callback（如主程式：本身沒有外層 watchdog 接手）→
+                    # 先 spawn 新 instance 再結束本 process（callback 內部會 os._exit）。
+                    # 沒 callback（會診/打卡：有外層 watchdog）→ 直接 os._exit(1) 由外層
+                    # watchdog 重啟。callback 沒成功 spawn 而返回 → 退回 os._exit(1)
+                    # （與舊行為相同，不會更糟）。
+                    if restart_callback is not None:
+                        try:
+                            restart_callback()
+                        except Exception:
+                            logging.exception(
+                                "[health/%s] restart_callback 失敗，改用 os._exit(1)",
+                                tag)
                     os._exit(1)
             elif rss_mb >= ram_warn_mb:
                 consecutive_high_ram, consecutive_critical_ram = _next_ram_streaks(
@@ -315,7 +327,8 @@ def start_health_monitor(tag: str,
                           network_check: bool = False,
                           auto_restart_on_crit: bool = False,
                           crit_persistence_ticks: int = 6,
-                          disk_check_path: Optional[str] = None) -> bool:
+                          disk_check_path: Optional[str] = None,
+                          restart_callback=None) -> bool:
     """啟動 daemon thread 監看本 process 的健康度。
 
     tag: log 標籤 (e.g. "main", "consult", "autoclock")
@@ -343,7 +356,8 @@ def start_health_monitor(tag: str,
         t = threading.Thread(
             target=_health_loop,
             args=(tag, ram_warn_mb, ram_crit_mb, interval_sec, network_check,
-                  auto_restart_on_crit, crit_persistence_ticks, disk_check_path),
+                  auto_restart_on_crit, crit_persistence_ticks, disk_check_path,
+                  restart_callback),
             name=f"HealthMonitor-{tag}",
             daemon=True,
         )

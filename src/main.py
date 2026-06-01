@@ -11681,10 +11681,16 @@ if __name__ == "__main__":
     # 使用者要手動重啟。寧可資料潛在掉一點也比 RAM 失控好。
     try:
         from cmuh_common.health import start_health_monitor
+        # 主程式沒有外層 watchdog 會接手，所以給 restart_callback：RAM 連續爆表時
+        # 先 spawn 一個新 instance 再 os._exit 本 process（單例 mutex 重啟競態由
+        # ensure_single_instance 的重試處理），而不是只 os._exit 後就再也不回來。
+        # hard_exit_code=1：health 監看跑在 daemon thread，sys.exit 殺不掉 process，
+        # 必須 os._exit。
         start_health_monitor("main", ram_warn_mb=500, ram_crit_mb=900,
                               interval_sec=300, network_check=False,
                               auto_restart_on_crit=True,
-                              crit_persistence_ticks=6)
+                              crit_persistence_ticks=6,
+                              restart_callback=lambda: restart_self(hard_exit_code=1))
     except Exception:
         logging.debug("health monitor 啟動失敗", exc_info=True)
 

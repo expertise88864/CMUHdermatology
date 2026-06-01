@@ -69,21 +69,28 @@ def test_check_and_update_rolls_back_batch_when_later_write_fails(
     )
     monkeypatch.setattr(updater, "_precompile_files", precompiled.extend)
 
-    def fail_second_write(path, content):
-        if path.endswith("b.py"):
-            return False
-        return real_atomic_write_text(path, content)
+    # 兩階段寫入：Phase 1 全部寫到 .upd.tmp（成功），Phase 2 逐檔 os.replace。
+    # 模擬「b.py 的 os.replace 失敗」→ 應回滾已 replace 的 a.py（從 .bak 還原），
+    # 整批視為失敗。這正是測新版「先全寫 tmp、再全 replace」的回滾路徑。
+    real_replace = os.replace
 
-    monkeypatch.setattr(updater, "atomic_write_text", fail_second_write)
+    def fail_replace_b(src, dst):
+        if str(dst).endswith("b.py"):
+            raise OSError("simulated replace failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(updater.os, "replace", fail_replace_b)
 
     result = updater.check_and_update(write_files=True)
 
-    assert first.read_text(encoding="utf-8") == "old-a"
+    assert first.read_text(encoding="utf-8") == "old-a"  # a.py 已從 .bak 回滾
     assert not (tmp_path / "b.py").exists()
     assert result.updated_files == []
     assert result.has_update is False
     assert any("[b] 寫入失敗" in error for error in result.errors)
     assert precompiled == []
+    # 失敗後不留下 .upd.tmp 暫存殘檔
+    assert not list(tmp_path.glob("*.upd.tmp"))
 
 
 def test_check_and_update_rejects_duplicate_manifest_targets(tmp_path, monkeypatch):
@@ -94,8 +101,6 @@ def test_check_and_update_rejects_duplicate_manifest_targets(tmp_path, monkeypat
             {"key": "b", "local_filename": "same.py"},
         ],
     }
-    writes = []
-
     monkeypatch.setattr(updater, "_fetch_manifest", lambda: manifest)
     monkeypatch.setattr(updater, "get_app_dir", lambda: str(tmp_path))
     monkeypatch.setattr(updater, "is_frozen", lambda: False)
@@ -109,14 +114,10 @@ def test_check_and_update_rejects_duplicate_manifest_targets(tmp_path, monkeypat
             entry["key"],
         ),
     )
-    monkeypatch.setattr(
-        updater,
-        "atomic_write_text",
-        lambda path, content: writes.append((path, content)) or True,
-    )
 
     result = updater.check_and_update(write_files=True)
 
-    assert writes == []
+    # 重複目標在「寫入前」的清單驗證就被擋下 → 一個檔都不該被建立
+    assert not (tmp_path / "same.py").exists()
     assert result.updated_files == []
     assert any("更新清單重複目標" in error for error in result.errors)
