@@ -21,6 +21,7 @@ def test_requested_default_abbreviations_are_present():
     assert defaults["st"] == "keep stable"
     assert defaults["sd"] == "seborrheic dermatitis"
     assert defaults["mf"] == "medication and follow up"
+    assert defaults["pred"] == "no DM/HBV/HCV"
     assert defaults["cert"] == \
         "患者因上述皮膚疾病，曾於da_zh至本院皮膚科門診就醫治療，建議持續追蹤。"
 
@@ -50,6 +51,7 @@ def test_old_config_adds_new_defaults_once_and_preserves_custom_text(tmp_path):
     assert values["st"] == "my custom stable text"
     assert values["sd"] == "seborrheic dermatitis"
     assert values["mf"] == "medication and follow up"
+    assert values["pred"] == "no DM/HBV/HCV"
     assert values["cert"].startswith("患者因上述皮膚疾病")
     assert saved["schema_version"] == ae.ABBREV_CONFIG_SCHEMA_VERSION
     assert [item["abbrev"] for item in saved["items"]] == sorted(
