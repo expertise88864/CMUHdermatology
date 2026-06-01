@@ -158,6 +158,38 @@ def _ensure_initialized() -> bool:
             _migrate_legacy_json_if_present(conn)
             _initialized = True
             return True
+        except sqlite3.DatabaseError as e:
+            # [stability] DB 檔損壞(斷電/磁碟壞軌/被外部程式截斷)時，原本每次啟動都
+            # 在此 except 失敗 → clinic-counts 快取永久壞掉、永不恢復。改為：隔離損壞
+            # 檔(連同 -wal/-shm sidecar)成 .corrupt-<ts>，重建一個空 DB，讓快取自我
+            # 修復(僅丟失歷史樣本，會重新累積)。
+            logging.error("[O22] SQLite 疑似損壞(%s)，隔離舊檔並重建空 DB", e,
+                          exc_info=True)
+            _close_cached_conn()
+            try:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                base = _db_path()
+                for suffix in ("", "-wal", "-shm"):
+                    p = base + suffix
+                    if os.path.exists(p):
+                        try:
+                            os.replace(p, f"{p}.corrupt-{ts}")
+                        except OSError:
+                            try:
+                                os.remove(p)
+                            except OSError:
+                                logging.debug("[O22] 移除損壞檔失敗 %s", p,
+                                              exc_info=True)
+                conn = _get_conn()
+                _ensure_schema(conn)
+                _initialized = True
+                logging.warning(
+                    "[O22] 已重建空 clinic_counts DB（歷史快取丟失，將重新累積）")
+                return True
+            except Exception:
+                logging.error("[O22] SQLite 損壞後重建失敗", exc_info=True)
+                _close_cached_conn()
+                return False
         except Exception:
             logging.error("[O22] SQLite 初始化失敗", exc_info=True)
             _close_cached_conn()

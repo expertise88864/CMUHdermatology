@@ -4888,13 +4888,16 @@ class AutomationApp:
             # --- 2. 重置長期紀錄 (檔案) ---
             file_path = get_conf_path('clinic_stats_history.json')
             try:
-                history = load_json_list(file_path, [])
-                new_history = remove_doctor_history(history, doc_name)
+                # [stability] 讀-改-寫 + 更新快取整段包進 _history_lock，與背景的
+                # _save_clinic_session_stat(同樣持 _history_lock)序列化，避免 lost-update。
+                with self._history_lock:
+                    history = load_json_list(file_path, [])
+                    new_history = remove_doctor_history(history, doc_name)
 
-                # 寫回檔案 (使用原子寫入防止中途崩潰損壞)
-                _atomic_write_json(file_path, new_history)
-                self.history_cache = new_history
-                self._avg_history_cache = {}  # [優化] 清除計算快取
+                    # 寫回檔案 (使用原子寫入防止中途崩潰損壞)
+                    _atomic_write_json(file_path, new_history)
+                    self.history_cache = new_history
+                    self._avg_history_cache = {}  # [優化] 清除計算快取
 
                 logging.info(f"[{doc_name}] 歷史統計資料已從檔案中移除。")
 

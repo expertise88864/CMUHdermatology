@@ -1344,17 +1344,63 @@ def _wait_for_code_input_focus(target_hwnd: int, *,
     return 0
 
 
+def _wm_settext_timeout(hwnd: int, text: str, timeout_ms: int = 2500) -> int:
+    """WM_SETTEXT，但走 SendMessageTimeout(SMTO_ABORTIFHUNG)。
+
+    [stability] 原本裸 SendMessageW(WM_SETTEXT) 對跨行程視窗是同步阻塞：醫院
+    Delphi app 的 GUI 緒卡住(server roundtrip freeze / modal)時會無限期卡住
+    hotkey 工作緒 → run_subsystem 的 finally 跑不到 → _subsystem_running 永遠
+    True → 之後所有熱鍵失效。改走帶逾時的版本，最多等 timeout_ms 就放棄。
+    透過 _send_message_timeout 傳「字串緩衝位址」(OS 會跨行程 marshal WM_SETTEXT)。
+    回傳 LRESULT（成功為非 0）。"""
+    try:
+        buf = ctypes.create_unicode_buffer(text or "")
+        addr = ctypes.cast(buf, ctypes.c_void_p).value or 0
+        return int(_send_message_timeout(hwnd, 0x000C, 0, addr,
+                                         timeout_ms=timeout_ms))  # WM_SETTEXT
+    except Exception:
+        logging.debug("_wm_settext_timeout 失敗 hwnd=%s", hwnd, exc_info=True)
+        return 0
+
+
+def _wm_gettext_timeout(hwnd: int, timeout_ms: int = 2500) -> str:
+    """WM_GETTEXTLENGTH + WM_GETTEXT，走 SendMessageTimeout(SMTO_ABORTIFHUNG)。
+    理由同 _wm_settext_timeout（避免讀文字時被凍住的醫院 app 永久阻塞）。"""
+    try:
+        n = _send_message_timeout(hwnd, 0x000E, 0, 0,
+                                  timeout_ms=timeout_ms)  # WM_GETTEXTLENGTH
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            n = 0
+        if n <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(n + 1)
+        addr = ctypes.cast(buf, ctypes.c_void_p).value or 0
+        _send_message_timeout(hwnd, 0x000D, n + 1, addr,
+                              timeout_ms=timeout_ms)  # WM_GETTEXT
+        return buf.value or ""
+    except Exception:
+        logging.debug("_wm_gettext_timeout 失敗 hwnd=%s", hwnd, exc_info=True)
+        return ""
+
+
 def _send_chars_to_window(hwnd: int, text: str) -> bool:
     """送 WM_CHAR 一字一字到目標 control。完全繞過 IME。
 
     pyautogui.typewrite 走 OS keyboard input → IME 攔截（中文模式下「5」被當組
-    字輸入）。WM_CHAR 直接到 control，IME 沒機會攔截。"""
+    字輸入）。WM_CHAR 直接到 control，IME 沒機會攔截。
+
+    [stability] 改用 PostMessageW（非同步）取代 SendMessageW：後者對跨行程視窗
+    是同步阻塞，醫院 app 凍住時會無限期卡住 hotkey 工作緒並永久鎖死全部熱鍵。
+    PostMessage 立即返回、訊息照 FIFO 入該 control 佇列由 Delphi 依序處理。"""
     if not hwnd or not text:
         return False
     WM_CHAR = 0x0102
     try:
         for ch in text:
-            ctypes.windll.user32.SendMessageW(hwnd, WM_CHAR, ord(ch), 0)
+            ctypes.windll.user32.PostMessageW(hwnd, WM_CHAR, ord(ch), 0)
+            time.sleep(0.02)  # 給 Delphi 依序處理（非同步下保險）
         return True
     except Exception:
         logging.error("_send_chars_to_window 失敗", exc_info=True)
@@ -1362,18 +1408,21 @@ def _send_chars_to_window(hwnd: int, text: str) -> bool:
 
 
 def _send_enter_to_window(hwnd: int) -> bool:
-    """送 VK_RETURN keydown+up 到指定 control。"""
+    """送 VK_RETURN keydown+up 到指定 control。
+
+    [stability] 同 _send_chars_to_window：改用 PostMessageW 非同步送，避免被
+    凍住的醫院 app 同步阻塞 hotkey 工作緒。"""
     if not hwnd:
         return False
     try:
         WM_KEYDOWN = 0x0100
         WM_KEYUP = 0x0101
         VK_RETURN = 0x0D
-        ctypes.windll.user32.SendMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0x1C0001)
-        ctypes.windll.user32.SendMessageW(hwnd, WM_KEYUP, VK_RETURN, 0xC01C0001)
+        ctypes.windll.user32.PostMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0x1C0001)
+        ctypes.windll.user32.PostMessageW(hwnd, WM_KEYUP, VK_RETURN, 0xC01C0001)
         # 額外送一個 WM_CHAR \r 確保 Delphi 認得（部分 Delphi grid 走 WM_CHAR Enter）
         WM_CHAR = 0x0102
-        ctypes.windll.user32.SendMessageW(hwnd, WM_CHAR, 0x0D, 0)
+        ctypes.windll.user32.PostMessageW(hwnd, WM_CHAR, 0x0D, 0)
         return True
     except Exception:
         return False
@@ -1464,11 +1513,8 @@ def _script_code_input_adaptive(code: str, label: str = "",
         check_stop()
         liaocheng_hwnd = _find_療程_edit_hwnd(hwnd)
         if liaocheng_hwnd:
-            WM_SETTEXT = 0x000C
-            text_buf = ctypes.c_wchar_p(str(set_療程))
             try:
-                ret = ctypes.windll.user32.SendMessageW(
-                    liaocheng_hwnd, WM_SETTEXT, 0, text_buf)
+                ret = _wm_settext_timeout(liaocheng_hwnd, str(set_療程))
                 logging.info("[%s] 療程欄位 (hwnd=%s) WM_SETTEXT='%s'",
                               label, liaocheng_hwnd, set_療程)
                 if not ret:
@@ -1498,20 +1544,9 @@ def _script_code_input_adaptive(code: str, label: str = "",
 
 
 def _read_tmemo_text(hwnd: int) -> str:
-    """讀 TMemo 全文 (WM_GETTEXTLENGTH + WM_GETTEXT)。"""
-    WM_GETTEXTLENGTH = 0x000E
-    WM_GETTEXT = 0x000D
-    try:
-        n = ctypes.windll.user32.SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0)
-        if n <= 0:
-            return ""
-        buf = ctypes.create_unicode_buffer(n + 1)
-        ctypes.windll.user32.SendMessageW(
-            hwnd, WM_GETTEXT, n + 1, ctypes.byref(buf))
-        return buf.value
-    except Exception:
-        logging.debug("_read_tmemo_text 例外 hwnd=%s", hwnd, exc_info=True)
-        return ""
+    """讀 TMemo 全文。[stability] 走帶逾時的 WM_GETTEXT(SMTO_ABORTIFHUNG)，避免
+    被凍住的醫院 app 同步阻塞 hotkey 工作緒（原裸 SendMessageW 會無限期卡住）。"""
+    return _wm_gettext_timeout(hwnd)
 
 
 def _find_disposition_memo(main_hwnd: int, keyword: str = "UVB") -> int:
@@ -1584,16 +1619,9 @@ def _find_disposition_memo(main_hwnd: int, keyword: str = "UVB") -> int:
 
 
 def _write_tmemo_text(hwnd: int, new_text: str) -> bool:
-    """寫 TMemo 全文 (WM_SETTEXT)。"""
-    WM_SETTEXT = 0x000C
-    try:
-        text_buf = ctypes.c_wchar_p(new_text)
-        ret = ctypes.windll.user32.SendMessageW(
-            hwnd, WM_SETTEXT, 0, text_buf)
-        return bool(ret)
-    except Exception:
-        logging.debug("_write_tmemo_text 例外 hwnd=%s", hwnd, exc_info=True)
-        return False
+    """寫 TMemo 全文。[stability] 走帶逾時的 WM_SETTEXT(SMTO_ABORTIFHUNG)，避免
+    被凍住的醫院 app 同步阻塞 hotkey 工作緒。"""
+    return bool(_wm_settext_timeout(hwnd, new_text))
 
 
 def _show_uvb_warning(main_hwnd: int, title: str, msg: str) -> None:
@@ -4104,10 +4132,10 @@ def _clear_edit_text(edit_hwnd: int) -> bool:
     比 「click + Ctrl+A + Delete」乾淨：不會動到 IME 跟焦點。"""
     if not edit_hwnd:
         return False
-    WM_SETTEXT = 0x000C
-    # SendMessage with empty string lParam
-    empty = ctypes.c_wchar_p("")
-    ctypes.windll.user32.SendMessageW(edit_hwnd, WM_SETTEXT, 0, empty)
+    # [stability] 走帶逾時的 WM_SETTEXT(SMTO_ABORTIFHUNG)：F9/F10 round2 清空欄位
+    # 在 hotkey 工作緒上，原裸 SendMessageW 遇醫院 app 凍住會無限期阻塞 → 永久
+    # 鎖死全部熱鍵。
+    _wm_settext_timeout(edit_hwnd, "")
     return True
 
 
@@ -8829,13 +8857,17 @@ class AutomationApp:
             # --- 2. 重置長期紀錄 (檔案) ---
             file_path = get_conf_path('clinic_stats_history.json')
             try:
-                history = load_json_list(file_path, [])
-                new_history = remove_doctor_history(history, doc_name)
+                # [stability] 讀-改-寫 + 更新快取整段包進 _history_lock，與背景的
+                # _save_clinic_session_stat(同樣持 _history_lock)序列化，避免兩者
+                # 交錯造成 lost-update / history 資料回退。
+                with self._history_lock:
+                    history = load_json_list(file_path, [])
+                    new_history = remove_doctor_history(history, doc_name)
 
-                # 寫回檔案 (使用原子寫入防止中途崩潰損壞)
-                _atomic_write_json(file_path, new_history)
-                self.history_cache = new_history
-                self._avg_history_cache = {}  # [優化] 清除計算快取
+                    # 寫回檔案 (使用原子寫入防止中途崩潰損壞)
+                    _atomic_write_json(file_path, new_history)
+                    self.history_cache = new_history
+                    self._avg_history_cache = {}  # [優化] 清除計算快取
 
                 logging.info(f"[{doc_name}] 歷史統計資料已從檔案中移除。")
 
@@ -10966,7 +10998,11 @@ class AutomationApp:
                 put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 發生未預期錯誤'))
             finally:
                 with self._subsystem_lock:
-                    self._subsystem_running = False
+                    # [stability] 只在「仍是本流程 token」時才復位，避免本 thread 若
+                    # 曾卡死、被硬上限看門狗強制復位、之後又有新熱鍵啟動(token 前進)
+                    # 時，這個遲來的 finally 誤清掉新流程的 running 旗標。
+                    if self._subsystem_token == subsystem_token:
+                        self._subsystem_running = False
                 time.sleep(2)
                 with self._subsystem_lock:
                     emit_idle = should_emit_idle_status(
@@ -10978,6 +11014,36 @@ class AutomationApp:
                     put_ui_message(self.ui_queue, UiStatusMessage(text='狀態: 閒置'))
         thread = threading.Thread(target=wrapper, name=f"{hotkey_name}_Thread", daemon=True)
         thread.start()
+
+        # [stability] 硬上限看門狗：若此流程因「無逾時的跨行程呼叫(醫院 app 凍住)」
+        # 或任何原因卡住超過 HOTKEY_HARD_TIMEOUT_SEC，wrapper 的 finally 永遠跑不到
+        # → _subsystem_running 永遠 True → 之後每個熱鍵都被擋「前一個流程尚未完成」、
+        # F12 也救不回(thread 卡在 kernel 內無法觀察 stop_event)、連 hotkey guardian
+        # 自動重掛也被封死。獨立計時器在逾時後強制復位 _subsystem_running(僅當仍是
+        # 本 token 且 thread 還活著)，讓後續熱鍵恢復。卡住的 thread 無法 kill，但不
+        # 再永久封鎖全部熱鍵。timeout 取較寬(180s)以免誤砍合法的慢流程(F9/F10 重試)。
+        HOTKEY_HARD_TIMEOUT_SEC = 180
+
+        def _hotkey_hard_timeout_watch():
+            time.sleep(HOTKEY_HARD_TIMEOUT_SEC)
+            unlocked = False
+            with self._subsystem_lock:
+                if (self._subsystem_running
+                        and self._subsystem_token == subsystem_token
+                        and thread.is_alive()):
+                    self._subsystem_running = False
+                    unlocked = True
+            if unlocked:
+                logging.critical(
+                    "[hotkey-watchdog] %s 執行超過 %ds 仍未結束(疑似卡在無逾時的跨"
+                    "行程呼叫/醫院 app freeze) → 已強制解除熱鍵鎖定以恢復其他熱鍵"
+                    "(卡住的工作緒無法 kill，請留意畫面)",
+                    hotkey_name, HOTKEY_HARD_TIMEOUT_SEC)
+                put_ui_message(self.ui_queue, UiStatusMessage(
+                    text=f'狀態: {hotkey_name} 疑似卡死，已解除熱鍵鎖定（請檢查畫面）'))
+
+        threading.Thread(target=_hotkey_hard_timeout_watch,
+                         name=f"{hotkey_name}_HardTimeout", daemon=True).start()
 
     def interrupt_automation(self):
         if not should_emit_interrupt(

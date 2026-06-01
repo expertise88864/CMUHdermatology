@@ -1269,6 +1269,14 @@ def restart_program(args_add=None) -> None:
     except Exception:
         logging.debug("[autoclock restart] release_single_instance failed",
                       exc_info=True)
+    # [stability] respawn 前先收掉本 process 的常駐 chromedriver/Chrome：否則重啟後
+    # 新 instance 會再開一份，舊的若因 pystray 吞掉 callback 內的 SystemExit /
+    # main thread 收尾延遲而沒退，chromedriver/Chrome 進程會累積。不依賴 atexit/race。
+    try:
+        _release_persistent_clock_driver()
+    except Exception:
+        logging.debug("[autoclock restart] release persistent driver failed",
+                      exc_info=True)
     extra: list = []
     for a in sys.argv[1:]:
         if a not in ("--configure", "--test-login"):
