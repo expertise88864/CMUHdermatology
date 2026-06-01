@@ -1768,3 +1768,41 @@ def test_uv_keyword_preserved_in_output():
     assert r.action == UvbAction.UPDATED
     # 不該變成 "UVB ..." or "UV: ..."
     assert "uv 550" in r.new_text or "uv 1000" in r.new_text
+
+
+# ─── [2026-06-01] phototherapy 自由文字格式 (曾大鈞實機 case) ──────────────────
+# 處置寫 "Start phototherapy, 950mj on (date), Add 50mj each time, upper limit: 950mj"
+# (關鍵字與劑量間夾逗號、MAX 用 "upper limit"、無次數)。F2/F3 原本解不出而中止。
+
+def test_parse_phototherapy_comma_and_upper_limit():
+    note = ("Start phototherapy, 950mj on (2026/6/01), "
+            "Add 50mj each time, upper limit: 950mj")
+    info = parse_uvb_line(note)
+    assert info is not None
+    assert info.dose == 950
+    assert info.increase == 50
+    assert info.max_dose == 950
+    assert info.last_date == date(2026, 6, 1)
+
+
+def test_parse_upper_limit_synonym_for_max():
+    info = parse_uvb_line(
+        "UVB 600 (3) on (2026/6/01), increase 40, upper limit 1200")
+    assert info is not None and info.max_dose == 1200
+
+
+def test_parse_dose_keyword_comma_separated():
+    """關鍵字與劑量數字間夾逗號也要解得出。"""
+    info = parse_uvb_line(
+        "Phototherapy, 800mj (2) on (2026/6/01), add 50, MAX 1500")
+    assert info is not None and info.dose == 800
+
+
+def test_phototherapy_format_caps_at_upper_limit():
+    """已達上限的 phototherapy 處置:2-6 天回診遞增後仍不可超過 upper limit(950)。"""
+    note = ("Start phototherapy, 950mj on (2026/5/27), "
+            "Add 50mj each time, upper limit: 950mj")
+    r = update_uvb_in_text(note, today=date(2026, 6, 1))  # 5 天後 → 2-6 天桶
+    assert r.action == UvbAction.UPDATED
+    assert "1000" not in r.new_text  # 不可超過上限 950
+    assert "950" in r.new_text

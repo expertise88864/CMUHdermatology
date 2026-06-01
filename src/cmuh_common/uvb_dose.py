@@ -123,8 +123,10 @@ class UvbLineInfo:
 # [v20.15 2026-05-26] 也接受 "Phototherapy" 當 keyword (劉香君實機 case)
 # [v20.18 2026-05-27] 也接受 "UV" 簡寫當 keyword (陳冠廷實機 case "uv 1150mj")
 # 注意 alternation 順序: UVB|UV 必須長的先 — 否則 "UVB" 會被 UV 部分匹配
+# [2026-06-01] 分隔符也接受逗號:「phototherapy, 950mj」這類關鍵字與劑量數字間
+# 夾逗號的自由寫法(曾大鈞實機 case)。原本只允許冒號/空白,逗號會讓 dose 解析失敗。
 _UVB_DOSE_RE = re.compile(
-    r"(UVB|Phototherapy|UV)\s*[:：]?\s*(\d+)", re.IGNORECASE)
+    r"(UVB|Phototherapy|UV)\s*[:：,，]?\s*(\d+)", re.IGNORECASE)
 # [v20.11] 接受帶 paren 跟不帶 paren 兩種:
 #   (2026/05/24) — group 1-3
 #    2026/05/24  — group 4-6
@@ -159,9 +161,13 @@ _UVB_INCREASE_RE = re.compile(
 # [v20.15] 新增 "MAX dose" 寫法 (鄧仲強實機 case: "MAX dose: 1200mj/cm2")
 # [v20.17] 新增 "MAX UVB / MAX Phototherapy" 寫法 (黃冠輝實機 case:
 #   "max UVB 1800 mj/cm2")
+# [2026-06-01] 新增 "upper limit" / "上限" 同義(曾大鈞實機 case:
+#   "...Add 50mj each time, upper limit: 950mj")。
 _UVB_MAX_RE = re.compile(
     r"(?:MAX(?:\s+(?:dose|UVB|Phototherapy))?(?:\s+(?:at|to))?\s*[:：]?\s*"
     r"|\bfix(?:ed)?(?:\s+(?:at|to))?\s*[:：]?\s*"
+    r"|upper\s*limit(?:\s+(?:at|to))?\s*[:：]?\s*"
+    r"|上限(?:在|為)?\s*[:：]?\s*"
     r"|固定(?:在|為)?\s*[:：]?\s*)(\d+)",
     re.IGNORECASE,
 )

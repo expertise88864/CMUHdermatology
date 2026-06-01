@@ -1552,21 +1552,24 @@ def _read_tmemo_text(hwnd: int) -> str:
     return _wm_gettext_timeout(hwnd)
 
 
-def _find_disposition_memo(main_hwnd: int, keyword: str = "UVB") -> int:
+def _find_disposition_memo(main_hwnd: int, keywords: tuple = ("UVB",)) -> int:
     """[v20.1 2026-05-26] 找處置 TMemo — 寬鬆 class 比對 + 內容過濾。
 
     原本只試 class="TMemo"，但醫院程式的處置欄可能是 TMemoExt / TDBMemo /
     TRichEdit / TRichEdit95 等 Delphi 變體。改成：
       1. 列舉所有 descendant
       2. class 名稱含 "Memo" 或 "Edit" 或 "Rich" (case-insensitive)
-      3. text 含 keyword (UVB)
+      3. text 含 keywords 任一 (UVB / Phototherapy / 光療…)
       4. 回第一個 match
+
+    [2026-06-01] keyword 改 keywords(tuple)：處置行可能寫 "phototherapy"/"光療"
+    而非 "UVB"(曾大鈞實機 case)，需多關鍵字才找得到。
 
     同時 log 出所有候選 (class + hwnd + text 前 80 字) 給 debug 用。
     """
     found = [0]
     candidates: list[tuple[int, str, str]] = []  # (hwnd, class, text_preview)
-    keyword_lower = keyword.lower()
+    keywords_lower = tuple(str(k).lower() for k in keywords)
 
     EnumWindowsProc = ctypes.WINFUNCTYPE(
         wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -1586,7 +1589,8 @@ def _find_disposition_memo(main_hwnd: int, keyword: str = "UVB") -> int:
                 return True
             preview = text[:80].replace("\n", " ").replace("\r", "")
             candidates.append((child, cls, preview))
-            if keyword_lower in text.lower():
+            text_lower = text.lower()
+            if any(k in text_lower for k in keywords_lower):
                 found[0] = child
                 return False  # stop enumeration
         except Exception:
@@ -1610,7 +1614,7 @@ def _find_disposition_memo(main_hwnd: int, keyword: str = "UVB") -> int:
         if candidates:
             logging.warning(
                 "[UVB][find] 找不到含 '%s' 的 Memo/Edit 控件。所有候選 "
-                "(%d 個):", keyword, len(candidates))
+                "(%d 個):", "/".join(keywords_lower), len(candidates))
             for h, c, p in candidates[:10]:  # 最多印 10 個避免洗 log
                 logging.warning("[UVB][find]   hwnd=%s class='%s' "
                                 "text='%s...'", h, c, p)
@@ -1710,7 +1714,8 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
         logging.info("[%s][UVB] 找不到主程式視窗 — 跳過 (best-effort)", label)
         return True
 
-    memo_hwnd = _find_disposition_memo(main_hwnd, keyword="UVB")
+    # [2026-06-01] 多關鍵字：處置行可能寫 phototherapy/光療 而非 UVB
+    memo_hwnd = _find_disposition_memo(main_hwnd, keywords=("UVB", "Phototherapy", "光療"))
     if not memo_hwnd:
         if strict:
             logging.warning(
