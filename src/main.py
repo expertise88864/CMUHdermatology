@@ -4842,7 +4842,13 @@ def _parse_doctor_info_dayoff(soup, assume_east_branch=False, assume_huihe_branc
         else:
             ext_branch = "east" if ("東區" in row_joined or "東區分院" in row_joined) else None
 
-        date_key = _safe_parse_roc_date(roc_date_str)
+        # [stability] 單列日期解析失敗只跳過該列，不要讓整個醫師的休診表解析中斷
+        # (某列 cells[0] 可能是子標題/合併格/格式異動 → _safe_parse_roc_date raise)。
+        try:
+            date_key = _safe_parse_roc_date(roc_date_str)
+        except ValueError:
+            logging.debug("停診表略過無法解析日期之列: %r", roc_date_str)
+            continue
         appointments_by_date.setdefault(date_key, []).append({
             'session': session_name,
             'count': replacement_text,
