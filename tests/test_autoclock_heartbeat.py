@@ -274,3 +274,43 @@ def test_autoclock_sleep_uses_monotonic_clock():
 
     assert "time_module.monotonic()" in src
     assert "time_module.time()" not in src
+
+
+# ─── [2026-06-01] _check_swipes 時鐘偏差容忍：防重複打卡 ──────────────────────
+# 真實事故：N24367 12:30:47 打卡被 HR 記成 12:29(窗 12:30-13:00 之外) → 下一輪誤判
+# 「窗內未打卡」又打一次 → 重複上班。判定「已打過」時左右放寬數分鐘吸收時鐘偏差。
+
+from datetime import time as _dt_time  # noqa: E402
+
+
+def test_check_swipes_tolerates_skew_just_before_window():
+    """打卡被記成窗起前 1 分鐘(時鐘偏差) → 仍判定已打卡，不重複。"""
+    assert autoclock._check_swipes(
+        "上班", _dt_time(12, 30, 0), _dt_time(13, 0, 0),
+        [("1229", "上班")]) is True
+
+
+def test_check_swipes_tolerates_skew_just_after_window():
+    assert autoclock._check_swipes(
+        "下班", _dt_time(17, 0, 0), _dt_time(17, 30, 0),
+        [("1732", "下班")]) is True
+
+
+def test_check_swipes_in_window_still_hits():
+    assert autoclock._check_swipes(
+        "上班", _dt_time(12, 30, 0), _dt_time(13, 0, 0),
+        [("1245", "上班")]) is True
+
+
+def test_check_swipes_ignores_wrong_type():
+    # 下班紀錄不該被當成上班已打卡
+    assert autoclock._check_swipes(
+        "上班", _dt_time(12, 30, 0), _dt_time(13, 0, 0),
+        [("1229", "下班")]) is False
+
+
+def test_check_swipes_rejects_far_outside_tolerance():
+    # 距窗 10 分鐘(> 5 分容忍) → 不算，仍會打卡
+    assert autoclock._check_swipes(
+        "上班", _dt_time(12, 30, 0), _dt_time(13, 0, 0),
+        [("1220", "上班")]) is False

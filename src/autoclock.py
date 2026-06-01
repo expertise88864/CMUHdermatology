@@ -617,16 +617,28 @@ def get_current_swipe_info(driver, wait, get_loc):
     return sys_date, swipes, last_swipe
 
 
-def _check_swipes(type_str: str, start: dt_time, end: dt_time, swipes) -> bool:
-    """檢查是否有「特定類型」紀錄落在 [start, end] 區間內。"""
+# [2026-06-01] 本機與 HR 伺服器時鐘可能差 1-2 分鐘 → 打卡瞬間被記成窗外(實例:12:30:47
+# 打卡被 HR 記成 12:29，落在 midday_in 窗 12:30-13:00 之外)，使下一輪輪詢誤判「窗內未
+# 打卡」而「重複打卡」。判定「是否已打過卡」時左右各放寬數分鐘吸收此偏差。
+# 安全性:各驗證窗相距 4+ 小時，且 _check_swipes 已依「上班/下班」類型過濾，放寬幾分鐘
+# 不會把別的時段或別種類型的打卡誤認。
+_SWIPE_WINDOW_TOLERANCE_MIN = 5
+
+
+def _check_swipes(type_str: str, start: dt_time, end: dt_time, swipes,
+                  tolerance_min: int = _SWIPE_WINDOW_TOLERANCE_MIN) -> bool:
+    """檢查是否有「特定類型」紀錄落在 [start, end] 區間(左右放寬 tolerance_min 分鐘吸收時鐘偏差)內。"""
+    start_min = start.hour * 60 + start.minute - tolerance_min
+    end_min = end.hour * 60 + end.minute + tolerance_min
     for t, typ in swipes:
-        if typ == type_str:
-            try:
-                swipe_time = dt_time(int(t[:2]), int(t[2:]))
-                if start <= swipe_time <= end:
-                    return True
-            except (ValueError, IndexError):
-                continue
+        if typ != type_str:
+            continue
+        try:
+            swipe_min = int(t[:2]) * 60 + int(t[2:])
+        except (ValueError, IndexError):
+            continue
+        if start_min <= swipe_min <= end_min:
+            return True
     return False
 
 
