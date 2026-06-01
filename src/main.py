@@ -6528,86 +6528,11 @@ class AutomationApp:
     # UI 主題（深淺色）切換
     # =========================================================================
     def _get_ui_theme_mode(self) -> str:
-        """從 clinic_settings.json 讀 ui_theme（light / dark / vista），預設 vista（Windows 原生最快）。"""
-        cs = getattr(self, "clinic_settings", None)
-        if not cs:
-            cs = self._safe_load_clinic_settings()
-        try:
-            v = str((cs or {}).get("ui_theme", "vista")).lower().strip()
-            if v in ("light", "dark", "vista"):
-                return v
-            return "vista"
-        except Exception:
-            return "vista"
+        """[2026-06-01] 主題切換功能已移除：一律使用 Windows 原生主題 (vista)，維持原本外觀。
+        （不再讀 clinic_settings 的 ui_theme，避免有人之前切到深色而卡住。）"""
+        return "vista"
 
-    def _toggle_ui_theme(self):
-        """[UI] 主題切換選單：light / dark / vista（原生快）。"""
-        # 用 simpledialog choose
-        from tkinter import simpledialog
-        cur = self._get_ui_theme_mode()
-        # 簡化：3 選 1 對話框
-        dlg = tk.Toplevel(self.root)
-        dlg.title("選擇主題")
-        dlg.geometry("340x200")
-        dlg.transient(self.root)
-        dlg.grab_set()
-        dlg.resizable(False, False)
-        x = self.root.winfo_rootx() + 200
-        y = self.root.winfo_rooty() + 200
-        dlg.geometry(f"+{x}+{y}")
-
-        ttk.Label(dlg, text="選擇主題模式：",
-                  font=("Microsoft JhengHei UI", 11, "bold")).pack(pady=(15, 5), anchor="w", padx=20)
-
-        sel = tk.StringVar(value=cur)
-        opts = [
-            ("dark", "🌙 深色 (sv-ttk dark) — 護眼、夜班推薦"),
-            ("light", "☀ 淺色 (sv-ttk light) — 白天、亮環境推薦"),
-            ("vista", "💻 Windows 原生 — 切換最快、UI 樣式較簡單"),
-        ]
-        for val, label in opts:
-            ttk.Radiobutton(dlg, text=label, variable=sel, value=val).pack(
-                anchor="w", padx=30, pady=2)
-
-        def apply_and_close():
-            new_mode = sel.get()
-            cs = self._safe_load_clinic_settings()
-            cs["ui_theme"] = new_mode
-            try:
-                _atomic_write_json(get_conf_path('clinic_settings.json'), cs)
-                self.clinic_settings = cs
-            except Exception:
-                logging.debug("儲存 ui_theme 失敗", exc_info=True)
-            # 套用
-            applied = False
-            if new_mode in ("dark", "light"):
-                try:
-                    import sv_ttk  # type: ignore[import-not-found]
-                    sv_ttk.set_theme(new_mode)
-                    applied = True
-                except Exception:
-                    logging.debug("sv-ttk 套用失敗", exc_info=True)
-            elif new_mode == "vista":
-                try:
-                    self.style.theme_use("vista")
-                    applied = True
-                except Exception:
-                    try:
-                        self.style.theme_use("clam")
-                        applied = True
-                    except Exception:
-                        pass
-            dlg.destroy()
-            if applied:
-                self.status_text.set(f"狀態: 主題已切換為 {new_mode}")
-                messagebox.showinfo("已切換", f"主題已切換為「{new_mode}」（即時生效）。")
-            else:
-                messagebox.showinfo("提示", f"主題切換需重啟程式才會生效（{new_mode}）。")
-
-        btn_row = ttk.Frame(dlg)
-        btn_row.pack(side=tk.BOTTOM, fill=tk.X, pady=10, padx=20)
-        ttk.Button(btn_row, text="套用", command=apply_and_close).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(btn_row, text="取消", command=dlg.destroy).pack(side=tk.RIGHT)
+    # [2026-06-01] _toggle_ui_theme 已移除：主題切換(深/淺色)功能取消，固定 Windows 原生主題。
 
     def _safe_load_clinic_settings(self) -> dict:
         settings = load_json_dict(get_conf_path('clinic_settings.json'), {},
@@ -9782,12 +9707,7 @@ class AutomationApp:
         top_bar_frame.pack(fill=tk.X, pady=(0, 20))
         ttk.Label(top_bar_frame, text=f"目前版本: {CURRENT_VERSION}", foreground="gray", font=("Microsoft JhengHei UI", self.f_sm)).pack(side=tk.LEFT, anchor='w')
         ttk.Button(top_bar_frame, text="檢查線上更新", command=lambda: self._submit_update_check(True)).pack(side=tk.RIGHT)
-        # [UI 美化] 主題切換按鈕（即時生效）
-        cur_theme = self._get_ui_theme_mode()
-        next_theme = "深色 🌙" if cur_theme == "light" else "淺色 ☀"
-        ttk.Button(top_bar_frame,
-                   text=f"切換主題（目前：{'淺色' if cur_theme == 'light' else '深色'}，按下變{next_theme}）",
-                   command=self._toggle_ui_theme).pack(side=tk.RIGHT, padx=(0, 8))
+        # [2026-06-01] 主題切換按鈕已移除（固定 Windows 原生主題，維持原本外觀）。
 
         # [修改] 建立容器，並定義三個直行
         columns_container = ttk.Frame(scrollable_frame)
