@@ -3413,8 +3413,15 @@ def _find_page_control_by_tab_set(or_hwnd: int, expected_tabs: list) -> int:
 def _send_message_timeout(hwnd: int, msg: int, wparam: int, lparam: int,
                            timeout_ms: int = 2000) -> int:
     """SendMessage with timeout — 防止對方視窗 hang 住卡死我們的 thread。
-    SMTO_ABORTIFHUNG=0x0002 | SMTO_NORMAL=0x0000."""
-    result = ctypes.c_long(0)
+    SMTO_ABORTIFHUNG=0x0002 | SMTO_NORMAL=0x0000.
+
+    [fix] 結果用 c_size_t（=DWORD_PTR，64 位元下 8 bytes）。原因：
+    ctypes.windll.user32 是 process 全域共用物件，cmuh_common.abbrev_engine 的
+    原生欄位取代會把 SendMessageTimeoutW.argtypes[6] 設成 POINTER(c_size_t)。
+    一旦縮寫功能（使用者多半開著）碰過原生欄位，這裡若用 c_long → byref 型別
+    不符 → ctypes.ArgumentError（症狀：F9/F10 點「局麻」radio 時整個流程當掉，
+    且與螢幕解析度無關）。用 c_size_t 對「有設/沒設 argtypes」兩種情況都正確。"""
+    result = ctypes.c_size_t(0)
     SMTO_ABORTIFHUNG = 0x0002
     SendMessageTimeoutW = ctypes.windll.user32.SendMessageTimeoutW
     ret = SendMessageTimeoutW(hwnd, msg, wparam, lparam,
@@ -3496,7 +3503,8 @@ def _get_tab_item_rect_cross_process(tab_hwnd: int, item_index: int):
             if not remote_addr:
                 return None
             # 用 timeout 版避免 cross-process call hang
-            result = ctypes.c_long(0)
+            # c_size_t（DWORD_PTR）：見 _send_message_timeout 說明（全域 argtypes 污染）
+            result = ctypes.c_size_t(0)
             SMTO_ABORTIFHUNG = 0x0002
             ret = ctypes.windll.user32.SendMessageTimeoutW(
                 tab_hwnd, TCM_GETITEMRECT, item_index, remote_addr,
