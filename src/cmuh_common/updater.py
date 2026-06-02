@@ -34,6 +34,10 @@ GITHUB_REPO = "CMUHdermatology"
 GITHUB_BRANCH = "main"
 RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{GITHUB_BRANCH}"
 MANIFEST_URL = f"{RAW_BASE}/manifest.json"
+API_REF_URL = (
+    f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
+    f"/git/ref/heads/{GITHUB_BRANCH}"
+)
 RELEASE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 
 UPDATE_TIMEOUT = 15
@@ -103,12 +107,35 @@ def _rollback_written_files(written_files: list[_WrittenFile]) -> list[str]:
 
 
 def _fetch_manifest(timeout: float = MANIFEST_TIMEOUT) -> dict:
-    """取 manifest.json；每次檢查使用唯一網址，避免 CDN 回傳舊版清單。"""
-    url = f"{MANIFEST_URL}?t={time.time_ns()}"
+    """取最新 commit 的 manifest，避免 Raw 分支路徑短暫回傳舊版清單。"""
+    commit_sha = ""
+    try:
+        ref_url = f"{API_REF_URL}?t={time.time_ns()}"
+        ref_resp = requests.get(
+            ref_url,
+            timeout=timeout,
+            headers={"User-Agent": "CMUH-Dermatology-Updater"},
+        )
+        ref_resp.raise_for_status()
+        commit_sha = str(ref_resp.json()["object"]["sha"]).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
+            raise ValueError("GitHub ref API 回傳非預期 commit SHA")
+    except Exception as e:
+        # API rate limit 或短暫連線失敗時仍保留原本 Raw branch fallback。
+        logging.warning("取得 GitHub main commit SHA 失敗，改用 branch fallback: %s", e)
+
+    remote_ref = commit_sha or GITHUB_BRANCH
+    url = (
+        f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}"
+        f"/{remote_ref}/manifest.json?v={remote_ref}&t={time.time_ns()}"
+    )
     resp = requests.get(url, timeout=timeout)
     resp.raise_for_status()
     resp.encoding = 'utf-8'
-    return resp.json()
+    manifest = resp.json()
+    if commit_sha:
+        manifest["_remote_commit_sha"] = commit_sha
+    return manifest
 
 
 def _read_local_version(local_path: str) -> str:
@@ -181,7 +208,12 @@ def _download_one(file_entry: dict, app_dir: str) -> Optional[tuple]:
 
     # 內容 hash 改變時網址也會改變；相同內容仍可共用 CDN cache。
     cache_key = expected_sha or expected_version
-    url = f"{RAW_BASE}/{remote_path}?v={cache_key}"
+    remote_ref = file_entry.get("_remote_commit_sha") or GITHUB_BRANCH
+    remote_base = (
+        f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}"
+        f"/{remote_ref}"
+    )
+    url = f"{remote_base}/{remote_path}?v={cache_key}"
     logging.info("  [%s] 偵測到新版（v%s -> v%s），下載中...", key, local_ver, expected_version)
 
     resp = requests.get(url, timeout=UPDATE_TIMEOUT)
@@ -257,6 +289,15 @@ def check_and_update(
     result.checked = True
     result.manifest_app_version = manifest.get("app_version", "")
 
+    if (write_files
+            and parse_version(result.manifest_app_version)
+            < parse_version(CURRENT_VERSION)):
+        logging.warning(
+            "[更新檢查] 遠端 manifest v%s 低於本機 v%s，拒絕降版",
+            result.manifest_app_version, CURRENT_VERSION,
+        )
+        return result
+
     # === .exe 模式（或被指定為唯讀檢查）===
     if not write_files:
         local_app_ver = CURRENT_VERSION
@@ -272,7 +313,11 @@ def check_and_update(
 
     # === .pyw 模式：實際下載 ===
     app_dir = get_app_dir()
-    file_entries = manifest.get("files", [])
+    remote_commit_sha = manifest.get("_remote_commit_sha", "")
+    file_entries = [
+        {**entry, "_remote_commit_sha": remote_commit_sha}
+        for entry in manifest.get("files", [])
+    ]
     if not file_entries:
         logging.warning("manifest.json 沒有 files 欄位")
         return result

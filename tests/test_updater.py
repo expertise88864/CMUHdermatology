@@ -26,17 +26,30 @@ class _FakeResponse:
 
 def test_fetch_manifest_uses_unique_cache_buster(monkeypatch):
     urls = []
+    commit_sha = "a" * 40
+    responses = iter([
+        _FakeResponse(json_data={"object": {"sha": commit_sha}}),
+        _FakeResponse(json_data={"files": []}),
+    ])
     monkeypatch.setattr(updater.time, "time_ns", lambda: 123456789)
     monkeypatch.setattr(
         updater.requests,
         "get",
-        lambda url, timeout: (
-            urls.append(url) or _FakeResponse(json_data={"files": []})
-        ),
+        lambda url, timeout, **_kwargs: (urls.append(url) or next(responses)),
     )
 
-    assert updater._fetch_manifest() == {"files": []}
-    assert urls == [f"{updater.MANIFEST_URL}?t=123456789"]
+    assert updater._fetch_manifest() == {
+        "files": [],
+        "_remote_commit_sha": commit_sha,
+    }
+    assert urls == [
+        f"{updater.API_REF_URL}?t=123456789",
+        (
+            "https://raw.githubusercontent.com/"
+            f"{updater.GITHUB_OWNER}/{updater.GITHUB_REPO}/{commit_sha}"
+            f"/manifest.json?v={commit_sha}&t=123456789"
+        ),
+    ]
 
 
 def test_download_one_uses_expected_sha_as_cache_key(tmp_path, monkeypatch):
@@ -62,6 +75,55 @@ def test_download_one_uses_expected_sha_as_cache_key(tmp_path, monkeypatch):
     assert urls == [
         f"{updater.RAW_BASE}/src/sample.py?v={expected_sha}"
     ]
+
+
+def test_download_one_uses_manifest_commit_sha(tmp_path, monkeypatch):
+    content = "print('pinned')\n"
+    expected_sha = updater._sha256_text(content)
+    commit_sha = "b" * 40
+    urls = []
+    monkeypatch.setattr(
+        updater.requests,
+        "get",
+        lambda url, timeout: (urls.append(url) or _FakeResponse(text=content)),
+    )
+    entry = {
+        "key": "sample",
+        "remote_path": "src/sample.py",
+        "local_filename": "src/sample.py",
+        "version": "2099.01.01.1",
+        "sha256": expected_sha,
+        "_remote_commit_sha": commit_sha,
+    }
+
+    assert updater._download_one(entry, str(tmp_path)) is not None
+    assert urls == [
+        (
+            "https://raw.githubusercontent.com/"
+            f"{updater.GITHUB_OWNER}/{updater.GITHUB_REPO}/{commit_sha}"
+            f"/src/sample.py?v={expected_sha}"
+        )
+    ]
+
+
+def test_check_and_update_rejects_stale_manifest_before_download(monkeypatch):
+    monkeypatch.setattr(updater, "is_frozen", lambda: False)
+    monkeypatch.setattr(
+        updater,
+        "_fetch_manifest",
+        lambda: {"app_version": "2000.01.01.1", "files": [{"key": "old"}]},
+    )
+    monkeypatch.setattr(
+        updater,
+        "_download_one",
+        lambda *_args: pytest.fail("stale manifest must not download files"),
+    )
+
+    result = updater.check_and_update(write_files=True)
+
+    assert result.checked is True
+    assert result.has_update is False
+    assert result.updated_files == []
 
 
 def test_resolve_target_path_rejects_parent_escape(tmp_path):
