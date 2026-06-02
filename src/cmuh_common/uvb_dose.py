@@ -9,8 +9,8 @@ F2/F3 熱鍵觸發時：
   5. 覆蓋寫回該行 (count+1, date→today, dose 依規則)
 
 【規則】依「今天 − last_date」天數差：
-    0-1 天 → 太密集，跳警告終止 (F2/F3 不繼續跑 51019)
-    2-6 天 → dose + increase, cap MAX
+    0 天 → 太密集，跳警告終止 (F2/F3 不繼續跑 51019)
+    1-6 天 → dose + increase, cap MAX
     = 7 天 → 保持 dose 不變
     8-14 天 → dose × 0.75, floor 到 10 的倍數 (435→430, 432→430)
     > 14 天 → 固定 250
@@ -35,14 +35,14 @@ from typing import Optional
 
 
 # ─── Constants ──────────────────────────────────────────────────────────
-# [v20.10 2026-05-26] 劑量規則修正 (user 確認 1 天差也要警告):
-#   days_diff = 0 (同日) / 1 (昨日)  → 警告終止 (至少要間隔 1 天 = ≥ 2 天)
-#   days_diff = 2-6                   → +increase (cap MAX)
+# [2026-06-02] 同日重複照光才警告；隔天起可依原規則更新:
+#   days_diff = 0                     → 警告終止
+#   days_diff = 1-6                   → +increase (cap MAX)
 #   days_diff = 7 (剛好)               → 保持 dose
 #   days_diff = 8-14 (含14)           → × 0.75, floor 10, 最低 250
 #   days_diff = 15-21 (含21)          → × 0.5, floor 10, 最低 250
 #   days_diff > 21                    → 固定 250
-TOO_CLOSE_DAYS = 2            # days_diff < 此值 → 警告終止 (即 0 或 1 天)
+TOO_CLOSE_DAYS = 1            # days_diff < 此值 → 警告終止 (僅同一天)
 SAME_DOSE_DAYS = 7            # = 此值 → 保持
 DECAY_75_UPPER = 14           # 8-14 → ×0.75
 DECAY_50_UPPER = 21           # 15-21 → ×0.5
@@ -75,7 +75,7 @@ class UvbAction:
     """
     NO_UVB_LINE = "no_uvb_line"          # 處置內沒 UVB 行 → 警告 (F2/F3 不該沒 UVB)
     PARSE_FAIL = "parse_fail"            # 有 UVB 但格式怪 → 警告
-    TOO_CLOSE = "too_close"              # 0-1 天 → 警告
+    TOO_CLOSE = "too_close"              # 同日重複照光 → 警告
     SANITY_FAIL = "sanity_fail"          # parse 出來的值超出合理範圍 → 警告
     CONFIRM_NEEDED = "confirm_needed"    # [v20.12] dose 超過 MAX_DOSE → Yes/No 確認
     UPDATED = "updated"                  # 正常更新 (唯一繼續走 51019 的 case)
@@ -126,7 +126,9 @@ class UvbLineInfo:
 # [2026-06-01] 分隔符也接受逗號:「phototherapy, 950mj」這類關鍵字與劑量數字間
 # 夾逗號的自由寫法(曾大鈞實機 case)。原本只允許冒號/空白,逗號會讓 dose 解析失敗。
 _UVB_DOSE_RE = re.compile(
-    r"(UVB|Phototherapy|UV)\s*[:：,，]?\s*(\d+)", re.IGNORECASE)
+    r"(UVB|Phototherapy|UV)(?:\s*[:：,，]?\s*"
+    r"|\s+[^\r\n,，]{0,40}?\bdose\s*[:：]?\s*)(\d+)",
+    re.IGNORECASE)
 # [v20.11] 接受帶 paren 跟不帶 paren 兩種:
 #   (2026/05/24) — group 1-3
 #    2026/05/24  — group 4-6
@@ -176,6 +178,7 @@ _UVB_MAX_RE = re.compile(
     r"(?:MAX(?:\s+(?:dose|UVB|Phototherapy))?(?:\s+(?:at|to))?\s*[:：]?\s*"
     r"|\bfix(?:ed)?(?:\s+(?:at|to))?\s*[:：]?\s*"
     r"|upper\s*limit(?:\s+(?:at|to))?\s*[:：]?\s*"
+    r"|最大(?:劑量|剂量)?\s*[:：]?\s*"
     r"|上限(?:在|為)?\s*[:：]?\s*"
     r"|固定(?:在|為)?\s*[:：]?\s*)(\d+)",
     re.IGNORECASE,
@@ -198,12 +201,32 @@ _UVB_MARKER_RE = re.compile(
     r"(?:uvb|excimer|\d\s*mj|phototherapy|photo\s*therapy)",
     re.IGNORECASE,
 )
+_EXCIMER_MARKER_RE = re.compile(r"\bexcimer(?:\s+light)?\b", re.IGNORECASE)
+_EXCIMER_DOSE_RE = re.compile(r"(\d+)\s*(mj(?:/cm2)?)", re.IGNORECASE)
 
 
 def _date_text(dt: date, sep: str = "/") -> str:
     """格式化日期並保留原本分隔符，sep 非 '-' 時預設用 '/'。"""
     sep = "-" if sep == "-" else "/"
     return f"{dt.year}{sep}{dt.month:02d}{sep}{dt.day:02d}"
+
+
+def _has_maintain_dose(text: str) -> bool:
+    return bool(re.search(r"\bmaintain(?:\s+the)?\s+dose\b", text,
+                          re.IGNORECASE))
+
+
+def _replace_uvb_dose(src: str, old_dose: int, new_dose: int) -> str:
+    """Replace a structured UVB dose while preserving its original prefix."""
+    match = _UVB_DOSE_RE.search(src)
+    if match is None:
+        return src
+    try:
+        if int(match.group(2)) != old_dose:
+            return src
+    except (TypeError, ValueError):
+        return src
+    return src[:match.start(2)] + str(new_dose) + src[match.end(2):]
 
 
 def _resolve_date_match(date_m) -> Optional[tuple]:
@@ -321,12 +344,16 @@ def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
     # 5. Increase / add
     inc_m = _UVB_INCREASE_RE.search(segment)
     if not inc_m:
-        return None
-    try:
-        # group(1)=關鍵字在前的數字；group(2)="N each time" 數字在前的數字
-        increase = int(inc_m.group(1) or inc_m.group(2))
-    except (ValueError, TypeError):
-        return None
+        if _has_maintain_dose(segment):
+            increase = 0
+        else:
+            return None
+    else:
+        try:
+            # group(1)=關鍵字在前的數字；group(2)="N each time" 數字在前的數字
+            increase = int(inc_m.group(1) or inc_m.group(2))
+        except (ValueError, TypeError):
+            return None
 
     return UvbLineInfo(
         full_match=segment,
@@ -437,12 +464,12 @@ def compute_new_dose(*, dose: int, increase: int, max_dose: int,
                      days_diff: int) -> Optional[int]:
     """[v20.10] 依天數差算新劑量。
 
-    days_diff < 2 (即 0 同日 或 1 昨日) → 回 None (caller 跳警告)
+    days_diff < 1 (即同日) → 回 None (caller 跳警告)
     其他天數差一定有 int 回值。所有 decay 結果不低於 MIN_DECAY_DOSE (250)。
     """
-    if days_diff < TOO_CLOSE_DAYS:                  # 0 或 1 天 → 太密集
+    if days_diff < TOO_CLOSE_DAYS:                  # 同一天 → 太密集
         return None
-    if days_diff < SAME_DOSE_DAYS:                  # 2-6 天 → +increase, cap MAX
+    if days_diff < SAME_DOSE_DAYS:                  # 1-6 天 → +increase, cap MAX
         return min(dose + increase, max_dose)
     if days_diff == SAME_DOSE_DAYS:                 # 7 天剛好 → 保持
         return dose
@@ -519,14 +546,7 @@ def format_uvb_line(original: UvbLineInfo, *, new_dose: int,
     #    使用 regex 因為要對齊「UVB 520」這個 pattern，不能誤改 "(11)" 的 11
     #    [v20.2] 允許「UVB:」冒號 — 跟 parse regex 一致
     #    [v20.18] 接受 "UV" 簡寫 — 跟 _UVB_DOSE_RE 一致
-    src = re.sub(
-        r"((?:UVB|Phototherapy|UV)\s*[:：]?\s*)" + str(original.dose)
-        + r"(\s*(?:mj/cm2)?)",
-        lambda mo: f"{mo.group(1)}{new_dose}{mo.group(2)}",
-        src,
-        count=1,
-        flags=re.IGNORECASE,
-    )
+    src = _replace_uvb_dose(src, original.dose, new_dose)
 
     # 2. 替換 count: (N) → (N+1) — 僅當原本有 count 且傳入 new_count
     if original.count is not None and new_count is not None:
@@ -597,6 +617,80 @@ class UvbUpdateResult:
     # [v20.13] 偵測到的「不確定 / 需要醫師確認」其他 triplet (e.g. line 1 是
     # excimer 但日期跟第一行 UVB 不同)。caller 應該跳 Yes/No 詢問是否套用。
     uncertain_other_triplets: Optional[list] = None
+
+
+def _update_excimer_lines(text: str, today: date) -> tuple[str, int, Optional[dict]]:
+    """Update structured excimer lines independently from UVB lines."""
+    lines = text.splitlines(keepends=True)
+    updated = 0
+    first_update: Optional[dict] = None
+
+    for index, line in enumerate(lines):
+        marker = _EXCIMER_MARKER_RE.search(line)
+        if marker is None:
+            continue
+        date_m = _UVB_DATE_RE.search(line, marker.end())
+        max_m = _UVB_MAX_RE.search(line, marker.end())
+        dose_m = _EXCIMER_DOSE_RE.search(line, marker.end())
+        inc_m = _UVB_INCREASE_RE.search(line, marker.end())
+        if (date_m is None or max_m is None or dose_m is None
+                or dose_m.start() > date_m.start()):
+            continue
+
+        ymd = _resolve_date_match(date_m)
+        if ymd is None:
+            continue
+        try:
+            last_date = date(*ymd)
+            dose = int(dose_m.group(1))
+            max_dose = int(max_m.group(1))
+            increase = int(inc_m.group(1) or inc_m.group(2)) if inc_m else 0
+        except (TypeError, ValueError):
+            continue
+
+        masked = (line[:date_m.start()]
+                  + " " * (date_m.end() - date_m.start())
+                  + line[date_m.end():])
+        count_m = _UVB_COUNT_RE.search(masked, marker.end(), date_m.start())
+        count = int(count_m.group(1)) if count_m else None
+        days_diff = (today - last_date).days
+
+        if (dose < MIN_DOSE or max_dose < MIN_DOSE
+                or increase < 0 or increase > 200
+                or (count is not None and not (1 <= count <= MAX_COUNT))
+                or days_diff < TOO_CLOSE_DAYS or days_diff > STALE_DAYS):
+            continue
+
+        new_dose = compute_new_dose(
+            dose=dose, increase=increase, max_dose=max_dose,
+            days_diff=days_diff)
+        if new_dose is None:
+            continue
+        if _has_maintain_dose(line):
+            new_dose = dose
+        new_count = count + 1 if count is not None else None
+
+        edits = [
+            (dose_m.span(1), str(new_dose)),
+            (date_m.span(), _today_in_format(today, date_m.group(0))),
+        ]
+        if count_m is not None and new_count is not None:
+            edits.append((count_m.span(1), str(new_count)))
+        new_line = line
+        for (start, end), replacement in sorted(edits, reverse=True):
+            new_line = new_line[:start] + replacement + new_line[end:]
+
+        lines[index] = new_line
+        updated += 1
+        if first_update is None:
+            first_update = {
+                "dose": new_dose,
+                "count": new_count,
+                "last_date": last_date,
+                "days_diff": days_diff,
+            }
+
+    return "".join(lines), updated, first_update
 
 
 def _count_uvb_lines(text: str) -> int:
@@ -693,7 +787,7 @@ def apply_uncertain_updates(text: str, triplets: list) -> str:
 def _first_time_update(parsed: UvbLineInfo, today: date,
                         uvb_lines: int) -> UvbUpdateResult:
     """[v20.16] 處置 UVB 行沒日期 → 當作第一次照光記錄:
-      - [v20.17] dose 套用 +increase 公式 (treat as 2-6 days, min cap MAX)
+      - [v20.17] dose 套用 +increase 公式 (treat as 1-6 days, min cap MAX)
       - 只更新原句已經存在的欄位
       - 原本沒有 count 或 date 時，不自行補寫
 
@@ -709,12 +803,7 @@ def _first_time_update(parsed: UvbLineInfo, today: date,
 
     # 1. 替換 dose: UVB:OLD → UVB:NEW
     # [v20.18] 接受 "UV" 簡寫 keyword
-    src = re.sub(
-        r"((?:UVB|Phototherapy|UV)\s*[:：]?\s*)" + str(parsed.dose) +
-        r"(\s*(?:mj/cm2)?)",
-        lambda mo: f"{mo.group(1)}{new_dose}{mo.group(2)}",
-        src, count=1, flags=re.IGNORECASE,
-    )
+    src = _replace_uvb_dose(src, parsed.dose, new_dose)
 
     # 2. 原句有 count 才更新 count；沒有 date 就保持沒有 date。
     if parsed.count is not None and new_count is not None:
@@ -763,7 +852,7 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
     [v20.16 2026-05-26] 處置 UVB 行可能沒日期 (第一次照光紀錄)，strict
     parse_uvb_line 會 fail。改成: strict fail 後試 parse_uvb_partial，若有
     dose+max 但沒 date → CONFIRM_NEEDED「第一次照光」。Yes 重 call 帶
-    treat_as_first_time=True，跳過 days_diff/decay 邏輯直接插入 (1) on (today)。
+    treat_as_first_time=True，跳過 days_diff/decay 邏輯，只更新原句已有欄位。
     """
     if today is None:
         today = date.today()
@@ -772,6 +861,22 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
 
     parsed = parse_uvb_line(text)
     if parsed is None:
+        # excimer / excimer light 本身也是照光，不要求同時出現 UVB。
+        if not re.search(r"(?:UVB|Phototherapy|\bUV\b)", text,
+                         re.IGNORECASE):
+            excimer_text, excimer_count, excimer_first = _update_excimer_lines(
+                text, today)
+            if excimer_count and excimer_first:
+                return UvbUpdateResult(
+                    action=UvbAction.UPDATED,
+                    new_text=excimer_text,
+                    new_dose=excimer_first["dose"],
+                    new_count=excimer_first["count"],
+                    last_date=excimer_first["last_date"],
+                    days_diff=excimer_first["days_diff"],
+                    uvb_line_count=excimer_count,
+                    additional_triplets_updated=max(0, excimer_count - 1),
+                )
         # Strict parse 失敗 — 試 partial parse 看是不是「沒日期」case
         partial = parse_uvb_partial(text)
         if partial is None:
@@ -850,7 +955,8 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
             sanity_reason=f"次數 ({parsed.count}) 異常 [1-{MAX_COUNT}]",
             parsed=parsed, uvb_line_count=uvb_lines,
         )
-    if parsed.increase <= 0 or parsed.increase > 200:
+    if ((parsed.increase <= 0 and not _has_maintain_dose(parsed.full_match))
+            or parsed.increase > 200):
         return UvbUpdateResult(
             action=UvbAction.SANITY_FAIL,
             sanity_reason=f"increase ({parsed.increase}) 異常 [1-200]",
@@ -902,11 +1008,11 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         dose=parsed.dose, increase=parsed.increase,
         max_dose=parsed.max_dose, days_diff=days_diff,
     )
-    assert new_dose is not None  # days_diff >= 2 已過 too-close 檢查
+    assert new_dose is not None  # 已通過 too-close 檢查
 
     # [v20.15] 處置含 "maintain" 字眼 → 醫師意圖維持原劑量，覆蓋 compute 結果
     # 只動 count + date，dose 保持 parsed.dose 不增不減
-    if re.search(r"maintain", parsed.full_match, re.IGNORECASE):
+    if _has_maintain_dose(parsed.full_match):
         new_dose = parsed.dose
 
     # 新 dose sanity 再檢一次 (理論上 compute_new_dose 不會吐出怪值，這層保險)
@@ -954,7 +1060,9 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         if not skip_dose_sanity and (next_uvb.dose > MAX_DOSE
                                      or next_uvb.max_dose > MAX_DOSE):
             break
-        if next_uvb.increase <= 0 or next_uvb.increase > 200:
+        if ((next_uvb.increase <= 0
+             and not _has_maintain_dose(next_uvb.full_match))
+                or next_uvb.increase > 200):
             break
         # 同日期 — 用該行自己的 dose/increase/MAX 算
         next_new_dose = compute_new_dose(
@@ -976,10 +1084,10 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         uvb_additional += 1
         cursor = abs_start + len(next_new_line)
 
-    # ─── Step C: v20.12 同日期 triplet 更新 ──────────────────────────────
-    # 找剩下沒被 step A/B 更新的 (count) ... (parsed.last_date) 三元組:
+    # ─── Step C: 同行照光 continuation triplet 更新 ─────────────────────
+    # 找剩下沒被 step A/B 更新的同行 (count) ... (date) 三元組:
     #   - 同行繼續的 UVB segment (e.g. `/ new for ... 1500mj/cm2 (44) on (date)`)
-    #   - 不同光照設備 (e.g. `excimer light (25) 1000mJ ... on (date)`)
+    #   - excimer / excimer light 由 Step D 依自己的欄位獨立更新
     # Step A 已經把第一行 triplet 的 date 改成 today，所以這裡掃描 working text
     # 時，第一行的 triplet 不會匹配 parsed.last_date，自動跳過。
     # 只更新 count + date，不動 segment 內 dose (continuation 通常 fixed at MAX
@@ -990,8 +1098,6 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
             seg_date = date(int(m.group(3)), int(m.group(4)),
                             int(m.group(5)))
         except (ValueError, TypeError):
-            continue
-        if seg_date != parsed.last_date:
             continue
         try:
             old_count = int(m.group(1))
@@ -1006,7 +1112,27 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         line_end = working.find("\n", m.end())
         if line_end == -1:
             line_end = len(working)
-        if not _UVB_MARKER_RE.search(working[line_start:line_end]):
+        line_text = working[line_start:line_end]
+        excimer_marker = _EXCIMER_MARKER_RE.search(line_text)
+        if (excimer_marker is not None
+                and line_start + excimer_marker.start() < m.start()):
+            continue
+        if not _UVB_MARKER_RE.search(line_text):
+            continue
+        # Same-line continuation segments are phototherapy too. They may carry
+        # their own date, so update them independently when a dose precedes
+        # the triplet. Other different-date triplets remain uncertain.
+        dose_prefix = working[max(line_start, m.start() - 32):m.start()]
+        continuation_m = re.search(
+            r"(\d+)\s*mj(?:/cm2)?\s*$", dose_prefix, re.IGNORECASE)
+        if seg_date != parsed.last_date:
+            # Cross-date continuation updates are safe without recalculating
+            # dose only when that segment is already capped at this line's MAX.
+            if (continuation_m is None
+                    or int(continuation_m.group(1)) != parsed.max_dose):
+                continue
+        seg_days_diff = (today - seg_date).days
+        if seg_days_diff < TOO_CLOSE_DAYS or seg_days_diff > MAX_GAP_DAYS:
             continue
         # 構造該 triplet 替換內容: count→count+1, date→today
         seg_text = m.group(0)
@@ -1028,6 +1154,10 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
     for span, replacement in reversed(triplet_edits):
         working = working[:span[0]] + replacement + working[span[1]:]
         triplet_count += 1
+
+    # ─── Step D: excimer / excimer light 各自依自己的欄位更新 ───────────
+    working, excimer_count, _ = _update_excimer_lines(working, today)
+    triplet_count += excimer_count
 
     new_text = working
 
