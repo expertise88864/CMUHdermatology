@@ -103,9 +103,8 @@ def _rollback_written_files(written_files: list[_WrittenFile]) -> list[str]:
 
 
 def _fetch_manifest(timeout: float = MANIFEST_TIMEOUT) -> dict:
-    """取 manifest.json，加 cache-buster（每小時換一次，享受 GitHub CDN edge cache）。"""
-    # 【效能 2026-05-21】每小時 bucket：同一小時內所有人共用 CDN cache（省 100-300ms）
-    url = f"{MANIFEST_URL}?t={int(time.time() // 3600)}"
+    """取 manifest.json；每次檢查使用唯一網址，避免 CDN 回傳舊版清單。"""
+    url = f"{MANIFEST_URL}?t={time.time_ns()}"
     resp = requests.get(url, timeout=timeout)
     resp.raise_for_status()
     resp.encoding = 'utf-8'
@@ -180,8 +179,9 @@ def _download_one(file_entry: dict, app_dir: str) -> Optional[tuple]:
         else:
             return None
 
-    # cache-buster 也改每小時，享受 CDN
-    url = f"{RAW_BASE}/{remote_path}?t={int(time.time() // 3600)}"
+    # 內容 hash 改變時網址也會改變；相同內容仍可共用 CDN cache。
+    cache_key = expected_sha or expected_version
+    url = f"{RAW_BASE}/{remote_path}?v={cache_key}"
     logging.info("  [%s] 偵測到新版（v%s -> v%s），下載中...", key, local_ver, expected_version)
 
     resp = requests.get(url, timeout=UPDATE_TIMEOUT)

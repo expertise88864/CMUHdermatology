@@ -11,6 +11,59 @@ from cmuh_common import updater  # noqa: E402
 from cmuh_common.atomic_io import atomic_write_text as real_atomic_write_text  # noqa: E402
 
 
+class _FakeResponse:
+    def __init__(self, *, text="", json_data=None):
+        self.text = text
+        self.encoding = None
+        self._json_data = json_data
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._json_data
+
+
+def test_fetch_manifest_uses_unique_cache_buster(monkeypatch):
+    urls = []
+    monkeypatch.setattr(updater.time, "time_ns", lambda: 123456789)
+    monkeypatch.setattr(
+        updater.requests,
+        "get",
+        lambda url, timeout: (
+            urls.append(url) or _FakeResponse(json_data={"files": []})
+        ),
+    )
+
+    assert updater._fetch_manifest() == {"files": []}
+    assert urls == [f"{updater.MANIFEST_URL}?t=123456789"]
+
+
+def test_download_one_uses_expected_sha_as_cache_key(tmp_path, monkeypatch):
+    content = "print('new')\n"
+    expected_sha = updater._sha256_text(content)
+    urls = []
+    monkeypatch.setattr(
+        updater.requests,
+        "get",
+        lambda url, timeout: (urls.append(url) or _FakeResponse(text=content)),
+    )
+    entry = {
+        "key": "sample",
+        "remote_path": "src/sample.py",
+        "local_filename": "src/sample.py",
+        "version": "2099.01.01.1",
+        "sha256": expected_sha,
+    }
+
+    result = updater._download_one(entry, str(tmp_path))
+
+    assert result == ("sample", "src/sample.py", "2099.01.01.1", content)
+    assert urls == [
+        f"{updater.RAW_BASE}/src/sample.py?v={expected_sha}"
+    ]
+
+
 def test_resolve_target_path_rejects_parent_escape(tmp_path):
     with pytest.raises(ValueError, match="超出程式目錄"):
         updater._resolve_target_path(str(tmp_path), "../outside.py")
