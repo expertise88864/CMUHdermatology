@@ -293,7 +293,31 @@ def test_abbrev_triggers_only_on_whole_word(monkeypatch):
     assert did_trigger("test") is False       # te+st → 不展開
     assert did_trigger("1st") is False        # 數字開頭 1st → 不展開
     assert did_trigger("(st") is True         # 標點後 → 視為完整字 → 展開
-    assert did_trigger("拆st") is True         # 中文後(非 ASCII 英數) → 視為邊界 → 展開
+    assert did_trigger("，st") is True         # 全形標點後 → 視為邊界 → 展開
+    assert did_trigger("拆st") is False        # 中文字在前(黏在字裡) → 不展開
+
+
+def test_da_abbrev_boundary_english_and_chinese(monkeypatch):
+    """user 回報案例：'da' 日期縮寫只能在「空白/標點/字首」後觸發。
+    英文字母在前 (clida) 或中文字在前 (病灶da) 都是黏在別的字裡 → 不展開。"""
+    monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
+    monkeypatch.setattr(ae, "should_skip_for_input_method", lambda: False)
+    eng = _make_engine()
+    eng.install(AbbrevConfig(enabled=True, items=[
+        {"abbrev": "da", "expansion": "da"}]))
+    monkeypatch.setattr(eng, "_do_replace", lambda *a, **k: None)
+
+    def did_trigger(buf: str) -> bool:
+        eng._suppressing = False
+        eng._cooldown_until = 0.0
+        eng._try_expand(buf, " ")
+        return eng._suppressing
+
+    assert did_trigger("da") is True          # 字首 → 展開日期
+    assert did_trigger("(da") is True         # 標點後 → 展開
+    assert did_trigger("clida") is False      # 英文字母在前 → 不展開(回報案例)
+    assert did_trigger("agenda") is False     # 英文單字字尾 → 不展開
+    assert did_trigger("病灶da") is False      # 中文字在前 → 不展開
 
 
 def test_handle_event_typing_word_then_space_does_not_misfire(monkeypatch):

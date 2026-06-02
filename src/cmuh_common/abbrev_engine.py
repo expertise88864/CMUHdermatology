@@ -1156,16 +1156,19 @@ class AbbrevEngine:
         if matched_key is None:
             return
 
-        # [修正] 只在縮寫是「完整的字」時才展開。若它剛好是某個更長單字的字尾
-        # (例如打 "persist"，結尾是 "st")，其前一個字元若為 ASCII 英數，代表縮寫
-        # 只是字的一部分 → 不觸發。前面是空白/標點/中文/或位於字首 → 視為完整字 → 展開。
+        # [修正] 只在縮寫是「完整的字」時才展開。縮寫的「前一個字元」必須是邊界
+        # ——空白 / 標點 / 符號，或位於字首——才算完整字。若前一字元是「字母或數字」
+        # 就代表縮寫只是某個更長 token 的字尾、黏在別的字裡，不該展開，例如：
+        #   persist 的 st、clida 的 da（英文字母在前）、病灶da 的 da（中文字在前）。
+        # str.isalnum() 對中文等 CJK 字也回 True，所以單一條件即可同時擋掉
+        # 「英文字母在前」與「中文在前」；空白 / 全形或半形標點則回 False → 視為邊界 → 展開。
         prefix = buffer_snapshot[:len(buffer_snapshot) - len(matched_key)]
         if prefix:
             prev_ch = prefix[-1]
-            if prev_ch.isascii() and prev_ch.isalnum():
+            if prev_ch.isalnum():
                 logging.debug(
-                    "[abbrev] '%s' 在字尾(前一字元=%r)，非完整字，略過展開",
-                    matched_key, prev_ch)
+                    "[abbrev] '%s' 前一字元=%r 為字母/數字/中文(非邊界)，"
+                    "非完整字，略過展開", matched_key, prev_ch)
                 return
 
         # IME 中文模式或組字中 → 跳過（best-effort；新 TSF IME 上 IMM API 可能無效，
