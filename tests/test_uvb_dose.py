@@ -25,9 +25,9 @@ from cmuh_common.uvb_dose import (  # noqa: E402
 
 # ─── compute_new_dose: 各 day-bucket ────────────────────────────────────
 
-@pytest.mark.parametrize("days_diff", [0])
+@pytest.mark.parametrize("days_diff", [0, 1])
 def test_compute_returns_none_when_too_close(days_diff):
-    """同日 (0) → None；隔天開始允許更新。"""
+    """同日 (0) 或隔天 (1) → None；至少間隔一天才允許更新。"""
     assert compute_new_dose(
         dose=520, increase=30, max_dose=800, days_diff=days_diff
     ) is None
@@ -426,18 +426,18 @@ def test_update_normal_case_2_to_6_days_increases():
 
 
 def test_update_too_close_returns_warning_no_text_change():
-    """同日 (0) → TOO_CLOSE；隔天開始允許更新。"""
+    """同日 (0) 或隔天 (1) → TOO_CLOSE；至少間隔一天才允許更新。"""
     text = "UVB 520 (11) on (2026/05/26), increase 30, MAX:800"
     # 同日 → TOO_CLOSE
     r0 = update_uvb_in_text(text, today=date(2026, 5, 26))
     assert r0.action == UvbAction.TOO_CLOSE
     assert r0.days_diff == 0
     assert r0.new_text is None
-    # 昨天 (1 天差) → UPDATED
+    # 昨天 (1 天差) → TOO_CLOSE
     r1 = update_uvb_in_text(text, today=date(2026, 5, 27))
-    assert r1.action == UvbAction.UPDATED
+    assert r1.action == UvbAction.TOO_CLOSE
     assert r1.days_diff == 1
-    assert r1.new_dose == 550
+    assert r1.new_text is None
     # 前天 (2 天差) → UPDATED
     r2 = update_uvb_in_text(text, today=date(2026, 5, 28))
     assert r2.action == UvbAction.UPDATED
@@ -1109,13 +1109,13 @@ def test_confirm_needed_at_too_close_priority():
     assert r.action == UvbAction.CONFIRM_NEEDED
 
 
-def test_skip_dose_sanity_still_blocks_same_day():
-    """CONFIRM 通過後 (skip_dose_sanity=True) 但 days_diff == 0 → 仍要
+def test_skip_dose_sanity_still_blocks_next_day():
+    """CONFIRM 通過後 (skip_dose_sanity=True) 但 days_diff == 1 → 仍要
     TOO_CLOSE 警告。"""
     text = (
         "UVB: 1600 mj/cm2 (50) on (2026/5/25) add 50 each time, fixed at 1600"
     )
-    r = update_uvb_in_text(text, today=date(2026, 5, 25),
+    r = update_uvb_in_text(text, today=date(2026, 5, 26),
                            skip_dose_sanity=True)
     assert r.action == UvbAction.TOO_CLOSE
 
@@ -1913,17 +1913,16 @@ def test_screenshot_nb_uvb_dose_prefix_and_chinese_fields():
     assert "try MTX 3# on (2024/2/15)" in r.new_text
 
 
-def test_screenshot_next_day_uvb_updates_and_leaves_mtx_line_unchanged():
+def test_screenshot_next_day_uvb_is_blocked():
     text = (
         "UVB: 300 mj/cm2(4) on 2026/6/01, add 50 each time, fixed at 1100, "
         "take picture on 2026/5/21, W1+4N\n"
         "try MTX 3# on (2026/5/21)"
     )
     r = update_uvb_in_text(text, today=date(2026, 6, 2))
-    assert r.action == UvbAction.UPDATED
-    assert "UVB: 350 mj/cm2(5) on 2026/06/02" in r.new_text
-    assert "try MTX 3# on (2026/5/21)" in r.new_text
-    assert not r.uncertain_other_triplets
+    assert r.action == UvbAction.TOO_CLOSE
+    assert r.days_diff == 1
+    assert r.new_text is None
 
 
 def test_screenshot_unrelated_medication_second_line_is_not_uncertain():
@@ -1937,6 +1936,36 @@ def test_screenshot_unrelated_medication_second_line_is_not_uncertain():
     assert "UVB: 350 mj/cm2(5) on 2026/06/02" in r.new_text
     assert "oral predonin since (2026/5/13)" in r.new_text
     assert not r.uncertain_other_triplets
+
+
+def test_screenshot_each_time_till_is_treated_as_max_dose():
+    text = (
+        "UVB 1000 mj/cm2 on (2026/5/31) (383), add 100 mj/cm2 each time. "
+        "each time till 1000 mj/cm2 self, take picture (1) on 2021/10/7 "
+        "-> due to chest reddiness\n"
+        "(stop increasing dose if discomfort after phototherapy), not regular, "
+        "suggest emollient.\n"
+        "suggest hold soap/ encourage emollient\n"
+        "self taper qod on (2023/5/19) -> fail"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 6, 2))
+    assert r.action == UvbAction.UPDATED
+    assert "UVB 1000 mj/cm2 on (2026/06/02) (384)" in r.new_text
+    assert "take picture (1) on 2021/10/7" in r.new_text
+
+
+def test_screenshot_maintain_dose_at_is_treated_as_max_not_hold():
+    text = (
+        "UVB: 750 mj/cm2 (36) on (2026/5/31) add 50 mj/cm2 each time, "
+        "maintain dose at 1250\n"
+        "MTX 3# on (2025/8/13), ->6# M2-3 ON (2025/9/24) -> "
+        "acitretin 10 mg on (2025/11/19)"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 6, 2))
+    assert r.action == UvbAction.UPDATED
+    assert "UVB: 800 mj/cm2 (37) on (2026/06/02)" in r.new_text
+    assert "maintain dose at 1250" in r.new_text
+    assert "MTX 3# on (2025/8/13)" in r.new_text
 
 
 def test_screenshot_uvb_continuation_and_excimer_each_update_independently():

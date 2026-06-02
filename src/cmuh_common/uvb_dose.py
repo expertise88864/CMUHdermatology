@@ -9,8 +9,8 @@ F2/F3 熱鍵觸發時：
   5. 覆蓋寫回該行 (count+1, date→today, dose 依規則)
 
 【規則】依「今天 − last_date」天數差：
-    0 天 → 太密集，跳警告終止 (F2/F3 不繼續跑 51019)
-    1-6 天 → dose + increase, cap MAX
+    0-1 天 → 太密集，跳警告終止 (F2/F3 不繼續跑 51019)
+    2-6 天 → dose + increase, cap MAX
     = 7 天 → 保持 dose 不變
     8-14 天 → dose × 0.75, floor 到 10 的倍數 (435→430, 432→430)
     > 14 天 → 固定 250
@@ -35,14 +35,14 @@ from typing import Optional
 
 
 # ─── Constants ──────────────────────────────────────────────────────────
-# [2026-06-02] 同日重複照光才警告；隔天起可依原規則更新:
-#   days_diff = 0                     → 警告終止
-#   days_diff = 1-6                   → +increase (cap MAX)
+# [2026-06-02] 至少間隔一天；同日或隔天重複照光都警告:
+#   days_diff = 0-1                   → 警告終止
+#   days_diff = 2-6                   → +increase (cap MAX)
 #   days_diff = 7 (剛好)               → 保持 dose
 #   days_diff = 8-14 (含14)           → × 0.75, floor 10, 最低 250
 #   days_diff = 15-21 (含21)          → × 0.5, floor 10, 最低 250
 #   days_diff > 21                    → 固定 250
-TOO_CLOSE_DAYS = 1            # days_diff < 此值 → 警告終止 (僅同一天)
+TOO_CLOSE_DAYS = 2            # days_diff < 此值 → 警告終止 (同日或隔天)
 SAME_DOSE_DAYS = 7            # = 此值 → 保持
 DECAY_75_UPPER = 14           # 8-14 → ×0.75
 DECAY_50_UPPER = 21           # 15-21 → ×0.5
@@ -75,7 +75,7 @@ class UvbAction:
     """
     NO_UVB_LINE = "no_uvb_line"          # 處置內沒 UVB 行 → 警告 (F2/F3 不該沒 UVB)
     PARSE_FAIL = "parse_fail"            # 有 UVB 但格式怪 → 警告
-    TOO_CLOSE = "too_close"              # 同日重複照光 → 警告
+    TOO_CLOSE = "too_close"              # 同日或隔天重複照光 → 警告
     SANITY_FAIL = "sanity_fail"          # parse 出來的值超出合理範圍 → 警告
     CONFIRM_NEEDED = "confirm_needed"    # [v20.12] dose 超過 MAX_DOSE → Yes/No 確認
     UPDATED = "updated"                  # 正常更新 (唯一繼續走 51019 的 case)
@@ -178,6 +178,8 @@ _UVB_MAX_RE = re.compile(
     r"(?:MAX(?:\s+(?:dose|UVB|Phototherapy))?(?:\s+(?:at|to))?\s*[:：]?\s*"
     r"|\bfix(?:ed)?(?:\s+(?:at|to))?\s*[:：]?\s*"
     r"|upper\s*limit(?:\s+(?:at|to))?\s*[:：]?\s*"
+    r"|(?:each\s+time\s+)?(?:till|until)\s*[:：]?\s*"
+    r"|maintain\s+dose\s+at\s*[:：]?\s*"
     r"|最大(?:劑量|剂量)?\s*[:：]?\s*"
     r"|上限(?:在|為)?\s*[:：]?\s*"
     r"|固定(?:在|為)?\s*[:：]?\s*)(\d+)",
@@ -212,7 +214,7 @@ def _date_text(dt: date, sep: str = "/") -> str:
 
 
 def _has_maintain_dose(text: str) -> bool:
-    return bool(re.search(r"\bmaintain(?:\s+the)?\s+dose\b", text,
+    return bool(re.search(r"\bmaintain(?:\s+the)?\s+dose\b(?!\s+at\s*\d)", text,
                           re.IGNORECASE))
 
 
@@ -464,12 +466,12 @@ def compute_new_dose(*, dose: int, increase: int, max_dose: int,
                      days_diff: int) -> Optional[int]:
     """[v20.10] 依天數差算新劑量。
 
-    days_diff < 1 (即同日) → 回 None (caller 跳警告)
+    days_diff < 2 (即同日或隔天) → 回 None (caller 跳警告)
     其他天數差一定有 int 回值。所有 decay 結果不低於 MIN_DECAY_DOSE (250)。
     """
-    if days_diff < TOO_CLOSE_DAYS:                  # 同一天 → 太密集
+    if days_diff < TOO_CLOSE_DAYS:                  # 同日或隔天 → 太密集
         return None
-    if days_diff < SAME_DOSE_DAYS:                  # 1-6 天 → +increase, cap MAX
+    if days_diff < SAME_DOSE_DAYS:                  # 2-6 天 → +increase, cap MAX
         return min(dose + increase, max_dose)
     if days_diff == SAME_DOSE_DAYS:                 # 7 天剛好 → 保持
         return dose
@@ -787,7 +789,7 @@ def apply_uncertain_updates(text: str, triplets: list) -> str:
 def _first_time_update(parsed: UvbLineInfo, today: date,
                         uvb_lines: int) -> UvbUpdateResult:
     """[v20.16] 處置 UVB 行沒日期 → 當作第一次照光記錄:
-      - [v20.17] dose 套用 +increase 公式 (treat as 1-6 days, min cap MAX)
+      - [v20.17] dose 套用 +increase 公式 (treat as 2-6 days, min cap MAX)
       - 只更新原句已經存在的欄位
       - 原本沒有 count 或 date 時，不自行補寫
 
