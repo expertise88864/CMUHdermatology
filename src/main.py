@@ -158,6 +158,7 @@ _set_windows_app_user_model_id = set_app_user_model_id
 
 # === 線上更新（取代原 UPDATE_MANIFEST + check_and_update）===
 from cmuh_common import updater as _updater_mod  # noqa: E402
+from cmuh_common.update_policy import AUTO_UPDATE_CHECK_TIMES  # noqa: E402
 
 
 # 【清理 2026-05-21】sys / os 已於檔首 import（line 7-8 為 sys.path 操作需要），這裡不重覆
@@ -11511,9 +11512,13 @@ class AutomationApp:
             
             schedule.every().day.at("08:00").do(lambda: run_named_job("clock-status-0800", self.update_clock_status_from_web)).tag("clock", "daily")
             schedule.every().day.at("17:03").do(lambda: run_named_job("clock-status-1703", self.update_clock_status_from_web)).tag("clock", "daily")
-            schedule.every().day.at("08:00").do(
-                lambda: run_named_job("check-update-0800", lambda: self._submit_update_check(False))
-            ).tag("update-check", "daily")
+            for update_time in AUTO_UPDATE_CHECK_TIMES:
+                schedule.every().day.at(update_time).do(
+                    lambda scheduled_at=update_time: run_named_job(
+                        f"check-update-{scheduled_at.replace(':', '')}",
+                        lambda: self._submit_update_check(False),
+                    )
+                ).tag("update-check", "daytime-15m")
 
             while not stop_event_main.is_set():
                 # [穩定性] run_pending 包 try/except：schedule 預設會把工作的例外往外拋，

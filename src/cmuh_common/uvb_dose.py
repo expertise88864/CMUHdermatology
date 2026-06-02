@@ -189,7 +189,7 @@ _UVB_MAX_RE = re.compile(
 # 中間限制無括號避免跨越獨立 segment。
 _TRIPLET_RE = re.compile(
     r"[\(（]\s*(\d{1,3})\s*[\)）]"                  # (count)
-    r"([^()（）]{0,120}?)"                           # 中間 (no parens)
+    r"([^()（）\r\n]{0,120}?)"                       # 中間 (same line only)
     r"[\(（]\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s*[\)）]" # (YYYY/MM/DD)
 )
 # Triplet 周圍需要的 UVB-相關標記 (避免誤動其他內容如「(10) days for ...」)
@@ -694,18 +694,17 @@ def _first_time_update(parsed: UvbLineInfo, today: date,
                         uvb_lines: int) -> UvbUpdateResult:
     """[v20.16] 處置 UVB 行沒日期 → 當作第一次照光記錄:
       - [v20.17] dose 套用 +increase 公式 (treat as 2-6 days, min cap MAX)
-      - count = 1 (沒原 count) 或 parsed.count + 1 (有原 count)
-      - 在原 dose+unit 之後插入 "(count) on (today_str)"
+      - 只更新原句已經存在的欄位
+      - 原本沒有 count 或 date 時，不自行補寫
 
     v20.17 起此 path 是 silent — 不再需要 Yes/No 確認。
     """
-    today_str = f"{today.year}/{today.month:02d}/{today.day:02d}"
     # 若有 increase → 套用 +increase 公式 (尊重原 MAX); 否則保持原 dose
     if parsed.increase is not None and parsed.max_dose:
         new_dose = min(parsed.dose + parsed.increase, parsed.max_dose)
     else:
         new_dose = parsed.dose
-    new_count = 1 if parsed.count is None else parsed.count + 1
+    new_count = parsed.count + 1 if parsed.count is not None else None
     src = parsed.full_match
 
     # 1. 替換 dose: UVB:OLD → UVB:NEW
@@ -717,21 +716,11 @@ def _first_time_update(parsed: UvbLineInfo, today: date,
         src, count=1, flags=re.IGNORECASE,
     )
 
-    # 2. count + date 插入
-    if parsed.count is None:
-        # 沒原 count → 在 dose+unit 之後插入 " (new_count) on (today_str)"
-        # [v20.18] 接受 "UV" 簡寫 keyword
-        src = re.sub(
-            r"((?:UVB|Phototherapy|UV)\s*[:：]?\s*\d+\s*(?:mj/cm2)?)",
-            lambda mo: f"{mo.group(1)} ({new_count}) on ({today_str})",
-            src, count=1, flags=re.IGNORECASE,
-        )
-    else:
-        # 有原 count → 替換 count 並在後面插入 " on (today_str)"
+    # 2. 原句有 count 才更新 count；沒有 date 就保持沒有 date。
+    if parsed.count is not None and new_count is not None:
         src = re.sub(
             r"([\(（]\s*)" + str(parsed.count) + r"(\s*[\)）])",
-            lambda mo: (f"{mo.group(1)}{new_count}{mo.group(2)} "
-                        f"on ({today_str})"),
+            lambda mo: f"{mo.group(1)}{new_count}{mo.group(2)}",
             src, count=1,
         )
 
