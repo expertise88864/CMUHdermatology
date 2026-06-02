@@ -585,7 +585,7 @@ def test_main_and_scheduler_schedule_daytime_update_checks_every_15_minutes():
         assert "from cmuh_common.update_policy import AUTO_UPDATE_CHECK_TIMES" in full_src
         assert "for update_time in AUTO_UPDATE_CHECK_TIMES:" in start_src
         assert 'f"check-update-{scheduled_at.replace(\':\', \'\')}"' in start_src
-        assert '.tag("update-check", "daytime-15m")' in start_src
+        assert '.tag("update-check", "daytime-30m")' in start_src
 
 
 def test_main_and_scheduler_ui_queue_polling_is_bounded():

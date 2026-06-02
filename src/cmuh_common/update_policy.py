@@ -12,7 +12,7 @@ from cmuh_common.paths import get_settings_dir
 AUTO_UPDATE_SUSPEND_FILENAME = ".auto_update_suspended_until"
 AUTO_UPDATE_CHECK_TIMES = tuple(
     f"{minute // 60:02d}:{minute % 60:02d}"
-    for minute in range(8 * 60, 17 * 60 + 1, 15)
+    for minute in range(8 * 60, 17 * 60 + 1, 30)
 )
 
 

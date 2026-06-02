@@ -9,13 +9,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from cmuh_common import update_policy  # noqa: E402
 
 
-def test_daytime_auto_update_checks_run_every_15_minutes_from_0800_to_1700():
+def test_daytime_auto_update_checks_run_every_30_minutes_from_0800_to_1700():
     times = update_policy.AUTO_UPDATE_CHECK_TIMES
 
     assert times[0] == "08:00"
     assert times[-1] == "17:00"
-    assert len(times) == 37
-    assert times[1:5] == ("08:15", "08:30", "08:45", "09:00")
+    assert len(times) == 19
+    assert times[1:5] == ("08:30", "09:00", "09:30", "10:00")
 
 
 def test_suspend_auto_updates_round_trips_active_flag(tmp_path, monkeypatch):
