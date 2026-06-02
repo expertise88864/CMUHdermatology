@@ -2,12 +2,27 @@
 """Updater integration tests for the shared write-suspension policy."""
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from cmuh_common import updater  # noqa: E402
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_background_helpers_restart_immediately_after_update():
+    autoclock_src = (ROOT / "src" / "autoclock.py").read_text(encoding="utf-8")
+    consult_src = (ROOT / "src" / "consult_query.py").read_text(encoding="utf-8")
+
+    assert "打卡程式偵測到新版，立即重新啟動" in autoclock_src
+    assert "restart_program()" in autoclock_src
+    assert "會診查詢程式偵測到新版，立即重新啟動" in consult_src
+    assert "release_single_instance()" in consult_src
+    assert "perform_restart()" in consult_src
 
 
 def test_check_and_update_honors_active_write_suspension(monkeypatch):

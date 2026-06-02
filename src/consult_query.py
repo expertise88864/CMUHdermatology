@@ -2371,10 +2371,16 @@ def _tray_test_email(icon=None, item=None) -> None:
 
 def _check_update_in_background() -> None:
     try:
-        from cmuh_common.updater import check_and_update, need_restart_after_update
+        from cmuh_common.updater import (
+            check_and_update,
+            need_restart_after_update,
+            perform_restart,
+        )
         result = check_and_update()
         if need_restart_after_update(result):
-            logging.info("偵測到新版，下次重啟生效")
+            logging.info("會診查詢程式偵測到新版，立即重新啟動")
+            release_single_instance()
+            perform_restart()
     except Exception:
         logging.debug("背景更新檢查失敗", exc_info=True)
 

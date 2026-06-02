@@ -1052,8 +1052,8 @@ def _check_update_in_background() -> None:
         from cmuh_common.updater import check_and_update, need_restart_after_update
         result = check_and_update()
         if need_restart_after_update(result):
-            logging.info("打卡程式偵測到新版，下次重啟生效")
-            # 打卡背景常駐：不立即重啟（避免打斷正在進行的打卡），下次手動重啟生效
+            logging.info("打卡程式偵測到新版，立即重新啟動")
+            restart_program()
     except Exception:
         logging.debug("打卡程式背景更新檢查失敗", exc_info=True)
 
