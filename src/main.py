@@ -1969,7 +1969,16 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
             label, result.additional_triplets_updated)
 
     # [v20.7] count 可能 None (處置沒寫)，log 適配
-    if result.new_count is None:
+    # [2026-06-02 修正] first-time 路徑(處置沒日期)的 result.last_date / days_diff
+    # 為 None；原本 else 分支呼叫 result.last_date.strftime() → AttributeError →
+    # F2/F3 在「UVB 已寫回成功、verify 已通過」之後崩潰 → 例外冒泡 → 51019 沒進、
+    # 療程也沒設(簡碧實機 case，log 連續多次 'NoneType has no strftime')。先處理
+    # last_date is None，避免在這個收尾 log 把整個流程帶崩。
+    if result.last_date is None:
+        logging.info(
+            "[%s][UVB] (第一次照光/處置無日期) 劑量 %s→%s, 次數 →%s, 已加上今天日期",
+            label, result.parsed.dose, result.new_dose, result.new_count)
+    elif result.new_count is None:
         logging.info(
             "[%s][UVB] 劑量 %d→%d, 次數 (處置沒寫 N 跳過), 日期 %s→今天 (差 %d 天)",
             label, result.parsed.dose, result.new_dose,
