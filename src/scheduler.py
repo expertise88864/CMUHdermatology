@@ -64,10 +64,15 @@ from cmuh_common.window_icon import apply_tk_window_icon as _apply_tk_window_ico
 from cmuh_common.logging_setup import attach_queue_handler
 from cmuh_common.bounded_executor import BoundedThreadPoolExecutor, RejectedExecutionError
 from cmuh_common.hotkey_guardian import (
+    GUARDIAN_INTERVAL_SEC,
+    PROBE_VK,
+    is_hook_probe_failure_confirmed,
+    should_auto_restart_for_dead_hook,
     should_emit_idle_status,
     should_emit_interrupt,
-    should_rehook_hotkeys,
+    should_probe_hook_health,
     should_show_busy_notice,
+    system_idle_seconds,
 )
 from cmuh_common.http_client import INTERNAL_HOSTS, is_internal as _is_internal
 from cmuh_common.ui_messages import (
@@ -2638,8 +2643,15 @@ class AutomationApp:
     def __init__(self, root: tk.Tk, master_schedule: dict):
         self.root = root
         self.root.title("中國醫皮膚科排班程式")
-        try: self.root.state('zoomed')
-        except tk.TclError: self.root.geometry("1280x720")
+        # 注意：對 withdrawn 視窗呼叫 state('zoomed') 會把它重新 map(造成背景啟動閃一下)，
+        # 故 withdrawn(背景啟動)時只設還原大小、不 zoom；待使用者還原時再最大化。
+        try:
+            if self.root.state() != 'withdrawn':
+                self.root.state('zoomed')
+            else:
+                self.root.geometry("1280x720")
+        except tk.TclError:
+            self.root.geometry("1280x720")
         _apply_tk_window_icon(self.root)
         
         # [雙螢幕] 解析度偵測一律以「主螢幕」為準(GetSystemMetrics)，而非虛擬桌面。
@@ -2701,6 +2713,12 @@ class AutomationApp:
         self._subsystem_lock = threading.Lock()
         self._subsystem_token = 0
         self._last_hotkey_busy_notice_at = 0.0
+        # === 熱鍵健康監看狀態（與主程式一致）===
+        self._hk_last_event_monotonic = time.monotonic()
+        self._hk_heartbeat_handle = None
+        self._hk_dead_strikes = 0
+        self._hk_auto_restart_count = 0
+        self._hk_last_auto_restart_monotonic = 0.0
         self._active_notices = []
         self.startup_phase_text = tk.StringVar(value="啟動中")
         self.app_version_text = tk.StringVar(value=f"v{CURRENT_VERSION}")
@@ -3494,16 +3512,12 @@ class AutomationApp:
     def _finalize_hotkey_setup(self):
         self._heavy_modules_loading = False
         self._heavy_modules_ready = True
-        if hasattr(self, 'rehook_button'):
-            self.rehook_button.config(state="normal")
         self.startup_phase_text.set("熱鍵就緒")
         self.setup_hotkeys()
 
     def _handle_hotkey_setup_failure(self, error):
         self._heavy_modules_loading = False
         self._heavy_modules_ready = False
-        if hasattr(self, 'rehook_button'):
-            self.rehook_button.config(state="disabled")
         self.startup_phase_text.set("熱鍵失敗")
         self.hotkey_text_label.config(text="熱鍵模組載入失敗")
         self.status_text.set("狀態: 熱鍵模組載入失敗，請檢查環境")
@@ -3519,8 +3533,6 @@ class AutomationApp:
         self._heavy_modules_loading = True
         self.hotkey_text_label.config(text="熱鍵模組載入中...")
         self.status_text.set("狀態: 啟動中，正在背景載入熱鍵模組...")
-        if hasattr(self, 'rehook_button'):
-            self.rehook_button.config(state="disabled")
         self.startup_phase_text.set("載入熱鍵")
 
         def _handle_hotkey_loader_rejected(fut):
@@ -3659,8 +3671,7 @@ class AutomationApp:
         self.hotkey_text_label.pack(padx=4, pady=0, anchor='w')
         manual_ops_frame = ttk.LabelFrame(self.controls_frame, text="手動操作", style="Small.TLabelframe")
         manual_ops_frame.grid(row=0, column=3, padx=(4, 0), sticky="e")
-        self.refresh_button = ttk.Button(manual_ops_frame, text="整理人數", style="Small.TButton", command=lambda: self._trigger_refresh(is_manual=True)); self.refresh_button.pack(side="left", pady=1, padx=(4,2))
-        self.rehook_button = ttk.Button(manual_ops_frame, text="重製熱鍵", style="Small.TButton", command=self._trigger_rehook_hotkeys); self.rehook_button.pack(side="left", pady=1, padx=(2,4))
+        self.refresh_button = ttk.Button(manual_ops_frame, text="整理人數", style="Small.TButton", command=lambda: self._trigger_refresh(is_manual=True)); self.refresh_button.pack(side="left", pady=1, padx=(4,4))
 
     def _launch_program(self, path):
         try: logging.info(f"Attempting to launch program at: {path}"); os.startfile(path)
@@ -5229,21 +5240,6 @@ class AutomationApp:
         refresh_future = self.bg_executor.submit(run_parallel_checks)
         refresh_future.add_done_callback(_handle_refresh_submit_rejected)
 
-    def _trigger_rehook_hotkeys(self):
-        logging.info("--- Manually re-hooking all hotkeys ---")
-        if not self._heavy_modules_ready:
-            messagebox.showwarning("請稍候", "熱鍵模組尚在載入中，請稍後再試。")
-            return
-        try:
-            safe_unhook_all_hotkeys()
-            self.setup_hotkeys()
-            messagebox.showinfo("成功", "所有熱鍵功能已成功重製。")
-            self.status_text.set("狀態: 熱鍵已重製")
-        except Exception as e:
-            logging.error(f"Failed to re-hook hotkeys manually: {e}")
-            messagebox.showerror("失敗", f"重製熱鍵時發生錯誤: {e}")
-            self.status_text.set("狀態: 熱鍵重製失敗")
-
     def _copy_to_clipboard(self, text_widget):
         try:
             text_to_copy = text_widget.get("1.0", tk.END).strip()
@@ -5402,6 +5398,7 @@ class AutomationApp:
             if self.out_of_hospital_var.get():
                 logging.info("切換至 [醫院外模式]")
                 safe_unhook_all_hotkeys()
+                self._install_hotkey_heartbeat()  # unhook_all 後重掛健康監看
                 self.status_text.set("狀態: 院外模式 (功能已停用)")
                 # 打卡燈號設為灰色表示停用
                 put_ui_message(self.ui_queue, UiClockStatusMessage(status_data={'error': '院外模式停用'}))
@@ -6162,7 +6159,8 @@ class AutomationApp:
                     case UiAlertInfoMessage(title=title, msg=amsg, need_restart=need_restart):
                         self._show_notice(title, amsg, level="info", auto_close_ms=5000 if not need_restart else 2000)
                         if need_restart:
-                            self.root.after(2000, lambda: restart_self())
+                            # 帶 --background：重啟後靜默啟動（最小化進工作列），不打斷操作
+                            self.root.after(2000, lambda: restart_self(["--background"]))
                     case UiAlertErrorMessage(title=title, msg=emsg):
                         self._show_notice(title, emsg, level="error", auto_close_ms=7000)
                     case UiClinicDataMessage(doctor_name=doctor_name, data=appointment_data):
@@ -6498,6 +6496,7 @@ class AutomationApp:
         if hasattr(self, 'out_of_hospital_var') and self.out_of_hospital_var.get():
             logging.info("院外模式啟用中，跳過熱鍵註冊。")
             safe_unhook_all_hotkeys()
+            self._install_hotkey_heartbeat()  # unhook_all 後重掛健康監看
             configure_hotkey_scaling(False, None, None)
             self.hotkey_text_label.config(text="熱鍵已停用 (院外模式)")
             self.hotkey_display_note.set("")
@@ -6510,6 +6509,7 @@ class AutomationApp:
                 f"熱鍵停用 · 解析度 {self.screen_width}×{self.screen_height} 無對應腳本"
             )
             safe_unhook_all_hotkeys()
+            self._install_hotkey_heartbeat()  # unhook_all 後重掛健康監看
             configure_hotkey_scaling(False, None, None)
             put_ui_message(self.ui_queue, UiStatusMessage(text='狀態: 解析度不符，熱鍵已停用'))
             self.hotkey_text_label.config(text="熱鍵已停用 (解析度不符)")
@@ -6558,7 +6558,8 @@ class AutomationApp:
             for key, (func, name) in hotkeys_to_register.items():
                 hotkey_modules.keyboard.add_hotkey(key, lambda f=func, n=name: self.run_subsystem_in_thread(f, n), suppress=True)
             hotkey_modules.keyboard.add_hotkey('F12', self.interrupt_automation, suppress=True)
-            
+            self._install_hotkey_heartbeat()  # F鍵註冊完成後重掛健康監看 heartbeat
+
             self.hotkey_text_label.config(text=hotkey_info_text)
             put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: 熱鍵註冊成功 ({profile})，等待指令...'))
             logging.info(f"Hotkeys registered successfully for {profile}.")
@@ -6592,36 +6593,128 @@ class AutomationApp:
             except Exception:
                 logging.debug("hotkey retry scheduling failed", exc_info=True)
 
+    def _on_hotkey_heartbeat_event(self, _event=None):
+        """heartbeat hook callback：每個按鍵事件觸發，必須極快（跑在 keyboard
+        listener thread）。只記時間戳。"""
+        self._hk_last_event_monotonic = time.monotonic()
+
+    def _install_hotkey_heartbeat(self):
+        """(重)掛一個輕量全域鍵盤 hook，對每個按鍵事件蓋時間戳，供守護程式偵測
+        「Windows 已靜默移除我們的 hook」。任何 unhook_all() 後都要重掛；可重複
+        呼叫（先移除舊把手再掛，不累積）。"""
+        kb = hotkey_modules.keyboard
+        if kb is None:
+            return
+        old = getattr(self, '_hk_heartbeat_handle', None)
+        if old is not None:
+            try:
+                kb.unhook(old)
+            except Exception:
+                pass
+            self._hk_heartbeat_handle = None
+        try:
+            self._hk_heartbeat_handle = kb.hook(self._on_hotkey_heartbeat_event)
+            self._hk_last_event_monotonic = time.monotonic()
+            self._hk_dead_strikes = 0
+        except Exception:
+            logging.exception("[hotkey] heartbeat hook 安裝失敗")
+            self._hk_heartbeat_handle = None
+
+    def _probe_hotkey_hook_alive(self, timeout_sec: float = 0.6) -> bool:
+        """主動探針：注入無副作用的 F24，看 heartbeat hook 是否在 timeout 內捕捉到。
+        無法注入 / keyboard 未就緒時回 True（無從判定就不誤殺）。"""
+        kb = hotkey_modules.keyboard
+        if kb is None:
+            return True
+        before = getattr(self, '_hk_last_event_monotonic', 0.0)
+        try:
+            from cmuh_common.abbrev_engine import inject_vk_tap
+            if not inject_vk_tap(PROBE_VK):
+                return True
+        except Exception:
+            logging.debug("[hotkey] 探針注入失敗", exc_info=True)
+            return True
+        deadline = time.monotonic() + max(0.1, timeout_sec)
+        while time.monotonic() < deadline:
+            if getattr(self, '_hk_last_event_monotonic', 0.0) != before:
+                return True
+            time.sleep(0.03)
+        return False
+
+    def _hotkey_health_tick(self):
+        """守護程式每輪：偵測全域熱鍵 hook 是否失效；確認失效且閒置時自動重啟
+        （透過既有的 UiAlertInfoMessage need_restart 路徑 → restart_self）。"""
+        # 自動化執行中跳過：此時熱鍵剛觸發過、hook 必然活著，且不在流程中途注入探針。
+        if (getattr(self, '_shutting_down', False)
+                or getattr(self, '_subsystem_running', False)
+                or not getattr(self, '_heavy_modules_ready', False)
+                or hotkey_modules.keyboard is None):
+            return
+        has_profile = bool(getattr(self, 'hotkey_profile', None)
+                           or getattr(self, 'hotkey_version', None))
+        if not has_profile:
+            return
+
+        now = time.monotonic()
+        hook_silent = now - getattr(self, '_hk_last_event_monotonic', now)
+        if not should_probe_hook_health(hook_silent):
+            self._hk_dead_strikes = 0
+            return
+
+        if self._probe_hotkey_hook_alive():
+            self._hk_dead_strikes = 0
+            return
+
+        self._hk_dead_strikes = getattr(self, '_hk_dead_strikes', 0) + 1
+        logging.warning("[hotkey] 健康探針未回應（連續 %d 次）", self._hk_dead_strikes)
+        if not is_hook_probe_failure_confirmed(self._hk_dead_strikes):
+            return
+
+        idle = system_idle_seconds()
+        last_restart = getattr(self, '_hk_last_auto_restart_monotonic', 0.0)
+        secs_since_restart = (now - last_restart) if last_restart else 1e9
+        if should_auto_restart_for_dead_hook(
+            hook_dead=True,
+            shutting_down=getattr(self, '_shutting_down', False),
+            subsystem_running=getattr(self, '_subsystem_running', False),
+            modules_ready=getattr(self, '_heavy_modules_ready', False),
+            system_idle_sec=idle,
+            seconds_since_last_restart=secs_since_restart,
+            restarts_this_session=getattr(self, '_hk_auto_restart_count', 0),
+        ):
+            self._hk_last_auto_restart_monotonic = now
+            self._hk_auto_restart_count = getattr(self, '_hk_auto_restart_count', 0) + 1
+            logging.error(
+                "[hotkey] 全域熱鍵 hook 已確認失效且使用者閒置 → 自動重啟程式以恢復"
+                "（本 session 第 %d 次）", self._hk_auto_restart_count)
+            put_ui_message(self.ui_queue, UiAlertInfoMessage(
+                title="熱鍵自動恢復",
+                msg="偵測到全域熱鍵已失效，將自動重新啟動程式以恢復功能。",
+                need_restart=True))
+        else:
+            logging.warning(
+                "[hotkey] hook 已失效但暫不重啟（idle=%.1fs, automation=%s, "
+                "已重啟=%d 次）— 待安全時機再處理",
+                idle, getattr(self, '_subsystem_running', False),
+                getattr(self, '_hk_auto_restart_count', 0))
+
     def run_hotkey_guardian(self):
         existing = getattr(self, "_hotkey_guardian_thread", None)
         if existing is not None and existing.is_alive():
             logging.debug("Hotkey guardian already running; duplicate start ignored.")
             return
 
-        def rehook():
+        def guardian_loop():
             while not stop_event_main.is_set():
-                if stop_event_main.wait(600):
+                if stop_event_main.wait(GUARDIAN_INTERVAL_SEC):
                     break
                 try:
-                    has_profile = bool(
-                        getattr(self, 'hotkey_profile', None)
-                        or getattr(self, 'hotkey_version', None))
-                    if should_rehook_hotkeys(
-                        has_profile,
-                        shutting_down=getattr(self, '_shutting_down', False),
-                        subsystem_running=getattr(self, '_subsystem_running', False),
-                        modules_ready=getattr(self, '_heavy_modules_ready', False),
-                    ):
-                        self.root.after(0, self.setup_hotkeys)
-                        logging.info("Hotkeys re-hooked by guardian.")
-                    elif getattr(self, '_subsystem_running', False):
-                        logging.debug(
-                            "Hotkey guardian skipped re-hook while automation is running.")
-                except Exception as e:
-                    logging.error(f"Error re-hooking hotkeys: {e}")
+                    self._hotkey_health_tick()
+                except Exception:
+                    logging.exception("[hotkey] guardian tick 例外")
 
         self._hotkey_guardian_thread = threading.Thread(
-            target=rehook,
+            target=guardian_loop,
             name="HotkeyGuardian",
             daemon=True,
         )
@@ -7082,7 +7175,14 @@ if __name__ == "__main__":
     _atexit_mtx.register(release_single_instance)
 
     main_root = tk.Tk()
-    
+
+    # [背景啟動] 由「閒置自動重啟 / 自動更新重啟」帶 --background 旗標重啟時，全程靜默：
+    # 建構期間先 withdraw（避免 __init__ 的 state('zoomed') 把視窗 map 出來閃一下），
+    # 最後再以最小化進工作列，不打斷使用者操作。手動開啟（無旗標）維持原本正常顯示。
+    _start_background = ("--background" in sys.argv)
+    if _start_background:
+        main_root.withdraw()
+
     # 綁定全域例外處理，避免背景執行緒崩潰導致閃退
     def handle_exception(exc_type, exc_value, exc_traceback):
         if issubclass(exc_type, KeyboardInterrupt):
@@ -7111,5 +7211,27 @@ if __name__ == "__main__":
     app = AutomationApp(main_root, {})
     DOCTORS = app.doctors_list
     DOCTOR_NAMES = [d["name"] for d in DOCTORS]
+
+    if _start_background:
+        # 背景重啟：以最小化進工作列；使用者第一次從工作列還原(<Map>, state=normal)時才最大化。
+        main_root.attributes("-topmost", False)
+
+        def _maximize_on_first_restore(event=None):
+            if event is not None and getattr(event, "widget", None) is not main_root:
+                return
+            if main_root.state() != "normal":
+                return
+            try:
+                main_root.unbind("<Map>", _first_map_bind_id)
+            except Exception:
+                pass
+            try:
+                main_root.state("zoomed")
+            except Exception:
+                logging.debug("還原後最大化失敗", exc_info=True)
+
+        _first_map_bind_id = main_root.bind("<Map>", _maximize_on_first_restore, add="+")
+        main_root.iconify()
+
     main_root.mainloop()
     logging.info("--- Script Finished ---")

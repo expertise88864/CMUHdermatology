@@ -113,11 +113,16 @@ from cmuh_common.hotkey_scaling import (  # noqa: E402
     _scaled_xy,
 )
 from cmuh_common.hotkey_guardian import (
+    GUARDIAN_INTERVAL_SEC,
+    PROBE_VK,
+    is_hook_probe_failure_confirmed,
+    should_auto_restart_for_dead_hook,
     should_bypass_foreground_guard,
     should_emit_interrupt,
     should_emit_idle_status,
-    should_rehook_hotkeys,
+    should_probe_hook_health,
     should_show_busy_notice,
+    system_idle_seconds,
 )
 # 【重構 2026-05-21】門診預約合併純函式（與 scheduler.py 共用）
 from cmuh_common.appt_utils import (  # noqa: E402
@@ -6034,6 +6039,13 @@ class AutomationApp:
         self._subsystem_lock = threading.Lock()
         self._subsystem_token = 0
         self._last_hotkey_busy_notice_at = 0.0
+        # === 熱鍵健康監看狀態 ===
+        # heartbeat hook 最近一次看到任何按鍵事件的時間（monotonic）。
+        self._hk_last_event_monotonic = time.monotonic()
+        self._hk_heartbeat_handle = None        # keyboard.hook() 回傳的移除把手
+        self._hk_dead_strikes = 0               # 連續探針未回應次數
+        self._hk_auto_restart_count = 0         # 本 session 已自動重啟次數
+        self._hk_last_auto_restart_monotonic = 0.0
         self._active_notices = []
         self.startup_phase_text = tk.StringVar(value="啟動中")
         self.app_version_text = tk.StringVar(value=f"v{CURRENT_VERSION}")
@@ -6301,7 +6313,9 @@ class AutomationApp:
         except Exception:
             logging.debug("release_single_instance during restart failed.",
                            exc_info=True)
-        restart_self()
+        # 帶 --background：重啟後的新行程靜默啟動（不開 splash、最小化進工作列），
+        # 不打斷使用者當下操作。此方法是所有 app 端重啟（自動更新 / 閒置熱鍵恢復）的匯流點。
+        restart_self(["--background"])
 
     def shutdown_app(self):
         """關閉時不可在主執行緒上 executor.shutdown(wait=True)，否則會卡到背景 HTTP／排程結束。
@@ -7164,16 +7178,12 @@ class AutomationApp:
     def _finalize_hotkey_setup(self):
         self._heavy_modules_loading = False
         self._heavy_modules_ready = True
-        if hasattr(self, 'rehook_button'):
-            self.rehook_button.config(state="normal")
         self.startup_phase_text.set("熱鍵就緒")
         self.setup_hotkeys()
 
     def _handle_hotkey_setup_failure(self, error):
         self._heavy_modules_loading = False
         self._heavy_modules_ready = False
-        if hasattr(self, 'rehook_button'):
-            self.rehook_button.config(state="disabled")
         self.startup_phase_text.set("熱鍵失敗")
         self.hotkey_text_label.config(text="熱鍵模組載入失敗")
         self.status_text.set("狀態: 熱鍵模組載入失敗，請檢查環境")
@@ -7189,8 +7199,6 @@ class AutomationApp:
         self._heavy_modules_loading = True
         self.hotkey_text_label.config(text="熱鍵模組載入中...")
         self.status_text.set("狀態: 啟動中，正在背景載入熱鍵模組...")
-        if hasattr(self, 'rehook_button'):
-            self.rehook_button.config(state="disabled")
         self.startup_phase_text.set("載入熱鍵")
 
         def _handle_hotkey_loader_rejected(fut):
@@ -7331,8 +7339,7 @@ class AutomationApp:
         self.hotkey_text_label.pack(padx=4, pady=0, anchor='w')
         manual_ops_frame = ttk.LabelFrame(self.controls_frame, text="手動操作", style="Small.TLabelframe")
         manual_ops_frame.grid(row=0, column=3, padx=(4, 0), sticky="e")
-        self.refresh_button = ttk.Button(manual_ops_frame, text="整理人數", style="Small.TButton", command=lambda: self._trigger_refresh(is_manual=True)); self.refresh_button.pack(side="left", pady=1, padx=(4,2))
-        self.rehook_button = ttk.Button(manual_ops_frame, text="重製熱鍵", style="Small.TButton", command=self._trigger_rehook_hotkeys); self.rehook_button.pack(side="left", pady=1, padx=(2,4))
+        self.refresh_button = ttk.Button(manual_ops_frame, text="整理人數", style="Small.TButton", command=lambda: self._trigger_refresh(is_manual=True)); self.refresh_button.pack(side="left", pady=1, padx=(4,4))
 
     def _launch_program(self, path):
         try: logging.info(f"Attempting to launch program at: {path}"); os.startfile(path)
@@ -9161,21 +9168,6 @@ class AutomationApp:
         refresh_future = self.bg_executor.submit(run_parallel_checks)
         refresh_future.add_done_callback(_handle_refresh_submit_rejected)
 
-    def _trigger_rehook_hotkeys(self):
-        logging.info("--- Manually re-hooking all hotkeys ---")
-        if not self._heavy_modules_ready:
-            messagebox.showwarning("請稍候", "熱鍵模組尚在載入中，請稍後再試。")
-            return
-        try:
-            safe_unhook_all_hotkeys()
-            self.setup_hotkeys()
-            messagebox.showinfo("成功", "所有熱鍵功能已成功重製。")
-            self.status_text.set("狀態: 熱鍵已重製")
-        except Exception as e:
-            logging.error(f"Failed to re-hook hotkeys manually: {e}")
-            messagebox.showerror("失敗", f"重製熱鍵時發生錯誤: {e}")
-            self.status_text.set("狀態: 熱鍵重製失敗")
-
     def _on_watchdog_toggle(self):
         """切換 watchdog master_enabled 並寫回 settings/watchdog_config.json。"""
         try:
@@ -9360,6 +9352,10 @@ class AutomationApp:
         eng = self._ensure_abbrev_engine()
         if eng is None:
             return
+        # 此處是「unhook_all 後重新掛載」的共同匯流點（所有解除全域 hook 的路徑
+        # 之後都會呼叫到這）。順手重掛健康監看 heartbeat，確保它不會在 unhook_all
+        # 後永久消失。heartbeat 與縮寫無關，獨立於 abbrev enabled 狀態。
+        self._install_hotkey_heartbeat()
         cfg = getattr(self, '_abbrev_config_cache', None)
         if cfg is None:
             try:
@@ -11214,36 +11210,133 @@ class AutomationApp:
             except Exception:
                 logging.debug("hotkey retry 排程失敗", exc_info=True)
 
+    def _on_hotkey_heartbeat_event(self, _event=None):
+        """heartbeat hook callback：每個按鍵事件都會觸發。必須極快（跑在 keyboard
+        listener thread，太慢會害 LL hook 被 Windows timeout 移除——正是我們要防的）。
+        只記一個時間戳，不做任何其他事。"""
+        self._hk_last_event_monotonic = time.monotonic()
+
+    def _install_hotkey_heartbeat(self):
+        """(重)掛一個輕量全域鍵盤 hook，對每個按鍵事件蓋時間戳。守護程式用它跟
+        OS 層級的輸入時間比對，偵測「Windows 已靜默移除我們的 hook」。任何
+        unhook_all() 之後都要重掛。本方法可重複呼叫（先移除舊把手再掛，不累積）。"""
+        kb = hotkey_modules.keyboard
+        if kb is None:
+            return
+        old = getattr(self, '_hk_heartbeat_handle', None)
+        if old is not None:
+            try:
+                kb.unhook(old)
+            except Exception:
+                pass  # unhook_all 可能已清掉它，把手失效屬正常
+            self._hk_heartbeat_handle = None
+        try:
+            self._hk_heartbeat_handle = kb.hook(self._on_hotkey_heartbeat_event)
+            # 剛掛好視為「剛確認存活」，避免裝好瞬間就被誤判為安靜
+            self._hk_last_event_monotonic = time.monotonic()
+            self._hk_dead_strikes = 0
+        except Exception:
+            logging.exception("[hotkey] heartbeat hook 安裝失敗")
+            self._hk_heartbeat_handle = None
+
+    def _probe_hotkey_hook_alive(self, timeout_sec: float = 0.6) -> bool:
+        """主動探針：注入一個無副作用的 F24，看 heartbeat hook 有沒有在
+        timeout 內捕捉到（hook 活著一定攔得到自己注入的鍵；被 Windows 移除則攔不到）。
+        判定方式不依賴鍵名解析，只看 heartbeat 時間戳有沒有前進，較穩健。
+        無法注入/keyboard 未就緒時回 True（無從判定就不誤殺）。"""
+        kb = hotkey_modules.keyboard
+        if kb is None:
+            return True
+        before = getattr(self, '_hk_last_event_monotonic', 0.0)
+        try:
+            from cmuh_common.abbrev_engine import inject_vk_tap
+            if not inject_vk_tap(PROBE_VK):
+                return True  # SendInput 沒送出，無從判定，不誤殺
+        except Exception:
+            logging.debug("[hotkey] 探針注入失敗", exc_info=True)
+            return True
+        deadline = time.monotonic() + max(0.1, timeout_sec)
+        while time.monotonic() < deadline:
+            if getattr(self, '_hk_last_event_monotonic', 0.0) != before:
+                return True  # heartbeat 前進 → hook 活著（攔到了注入的鍵）
+            time.sleep(0.03)
+        return False
+
+    def _hotkey_health_tick(self):
+        """守護程式每輪：偵測全域熱鍵 hook 是否已失效；確認失效且閒置時自動重啟。"""
+        # 自動化執行中跳過：(1) 此時熱鍵剛觸發過、hook 必然活著；(2) 不在自動化
+        # 流程中途注入 F24 探針，避免干擾。
+        if (getattr(self, '_shutting_down', False)
+                or getattr(self, '_subsystem_running', False)
+                or not getattr(self, '_heavy_modules_ready', False)
+                or hotkey_modules.keyboard is None):
+            return
+        has_profile = bool(getattr(self, 'hotkey_profile', None)
+                           or getattr(self, 'hotkey_version', None))
+        if not has_profile:
+            return  # 院外模式/解析度不符：沒掛 F 鍵熱鍵，不需監看
+
+        now = time.monotonic()
+        hook_silent = now - getattr(self, '_hk_last_event_monotonic', now)
+        # 近期看過真實按鍵 → hook 確定活著，連 strike 歸零、不浪費注入探針
+        if not should_probe_hook_health(hook_silent):
+            self._hk_dead_strikes = 0
+            return
+
+        # hook 安靜一段時間（可能只是沒人打字，也可能 hook 死了）→ 主動探針確認
+        if self._probe_hotkey_hook_alive():
+            self._hk_dead_strikes = 0
+            return
+
+        self._hk_dead_strikes = getattr(self, '_hk_dead_strikes', 0) + 1
+        logging.warning("[hotkey] 健康探針未回應（連續 %d 次）", self._hk_dead_strikes)
+        if not is_hook_probe_failure_confirmed(self._hk_dead_strikes):
+            return  # 單次可能是暫態 race，等下一輪再確認
+
+        idle = system_idle_seconds()
+        last_restart = getattr(self, '_hk_last_auto_restart_monotonic', 0.0)
+        secs_since_restart = (now - last_restart) if last_restart else 1e9
+        if should_auto_restart_for_dead_hook(
+            hook_dead=True,
+            shutting_down=getattr(self, '_shutting_down', False),
+            subsystem_running=getattr(self, '_subsystem_running', False),
+            modules_ready=getattr(self, '_heavy_modules_ready', False),
+            system_idle_sec=idle,
+            seconds_since_last_restart=secs_since_restart,
+            restarts_this_session=getattr(self, '_hk_auto_restart_count', 0),
+        ):
+            self._hk_last_auto_restart_monotonic = now
+            self._hk_auto_restart_count = getattr(self, '_hk_auto_restart_count', 0) + 1
+            logging.error(
+                "[hotkey] 全域熱鍵 hook 已確認失效且使用者閒置 → 自動重啟程式以恢復"
+                "（本 session 第 %d 次）", self._hk_auto_restart_count)
+            put_ui_message(self.ui_queue, UiStatusMessage(
+                text="狀態: 熱鍵失效，正在自動重啟以恢復…"))
+            self.root.after(0, self._restart_app)
+        else:
+            logging.warning(
+                "[hotkey] hook 已失效但暫不重啟（idle=%.1fs, automation=%s, "
+                "已重啟=%d 次）— 待安全時機再處理",
+                idle, getattr(self, '_subsystem_running', False),
+                getattr(self, '_hk_auto_restart_count', 0))
+
     def run_hotkey_guardian(self):
         existing = getattr(self, "_hotkey_guardian_thread", None)
         if existing is not None and existing.is_alive():
             logging.debug("Hotkey guardian already running; duplicate start ignored.")
             return
 
-        def rehook():
+        def guardian_loop():
             while not stop_event_main.is_set():
-                if stop_event_main.wait(600):
+                if stop_event_main.wait(GUARDIAN_INTERVAL_SEC):
                     break
                 try:
-                    has_profile = bool(
-                        getattr(self, 'hotkey_profile', None)
-                        or getattr(self, 'hotkey_version', None))
-                    if should_rehook_hotkeys(
-                        has_profile,
-                        shutting_down=getattr(self, '_shutting_down', False),
-                        subsystem_running=getattr(self, '_subsystem_running', False),
-                        modules_ready=getattr(self, '_heavy_modules_ready', False),
-                    ):
-                        self.root.after(0, self.setup_hotkeys)
-                        logging.info("Hotkeys re-hooked by guardian.")
-                    elif getattr(self, '_subsystem_running', False):
-                        logging.debug(
-                            "Hotkey guardian skipped re-hook while automation is running.")
-                except Exception as e:
-                    logging.error(f"Error re-hooking hotkeys: {e}")
+                    self._hotkey_health_tick()
+                except Exception:
+                    logging.exception("[hotkey] guardian tick 例外")
 
         self._hotkey_guardian_thread = threading.Thread(
-            target=rehook,
+            target=guardian_loop,
             name="HotkeyGuardian",
             daemon=True,
         )
@@ -11746,14 +11839,21 @@ if __name__ == "__main__":
     main_root = tk.Tk()
     main_root.withdraw()  # 主視窗先隱藏，等初始化完成再顯示，避免閃爍
 
-    # [O18] 啟動 splash：給使用者「程式正在開」的即時反饋
-    try:
-        from cmuh_common.splash import StartupSplash
-        _splash = StartupSplash(main_root, "正在初始化…")
-        _splash.show()
-    except Exception:
-        _splash = None
-        logging.debug("splash 啟動失敗（忽略）", exc_info=True)
+    # [背景啟動] 由「閒置自動重啟 / 自動更新重啟 / watchdog 重啟」帶 --background 旗標
+    # 重啟時，全程靜默：不開 splash、視窗以最小化進工作列，不跳到最上層也不搶焦點，
+    # 避免打斷使用者當下操作。使用者手動雙擊開啟（無旗標）維持原本正常最大化顯示。
+    _start_background = ("--background" in sys.argv)
+
+    # [O18] 啟動 splash：給使用者「程式正在開」的即時反饋（背景重啟時不顯示）
+    _splash = None
+    if not _start_background:
+        try:
+            from cmuh_common.splash import StartupSplash
+            _splash = StartupSplash(main_root, "正在初始化…")
+            _splash.show()
+        except Exception:
+            _splash = None
+            logging.debug("splash 啟動失敗（忽略）", exc_info=True)
 
     # 綁定全域例外處理，避免背景執行緒崩潰導致閃退
     def handle_exception(exc_type, exc_value, exc_traceback):
@@ -11825,7 +11925,7 @@ if __name__ == "__main__":
                               interval_sec=300, network_check=False,
                               auto_restart_on_crit=True,
                               crit_persistence_ticks=6,
-                              restart_callback=lambda: restart_self(hard_exit_code=1))
+                              restart_callback=lambda: restart_self(["--background"], hard_exit_code=1))
     except Exception:
         logging.debug("health monitor 啟動失敗", exc_info=True)
 
@@ -11878,12 +11978,36 @@ if __name__ == "__main__":
         except Exception:
             pass
     try:
-        main_root.deiconify()
-        place_tk_window_on_preferred_monitor(main_root)
-        # 顯式解除 topmost（修：splash 關閉後主視窗有時殘留 topmost，導致無法切到其他程式）
-        main_root.attributes("-topmost", False)
-        main_root.lift()
-        main_root.focus_force()
+        if _start_background:
+            # 背景重啟：直接從 withdrawn 進 iconify（實測不會 map、不閃、不搶焦點），
+            # 視窗縮在工作列。使用者第一次從工作列還原(<Map>, state=normal)時，才放到
+            # 偏好螢幕並最大化，兼顧「重啟不干擾」與「打開後仍是熟悉的最大化視窗」。
+            main_root.attributes("-topmost", False)
+
+            def _maximize_on_first_restore(event=None):
+                if event is not None and getattr(event, "widget", None) is not main_root:
+                    return
+                if main_root.state() != "normal":
+                    return
+                try:
+                    main_root.unbind("<Map>", _first_map_bind_id)
+                except Exception:
+                    pass
+                try:
+                    place_tk_window_on_preferred_monitor(main_root)
+                except Exception:
+                    logging.debug("還原後定位/最大化失敗", exc_info=True)
+
+            _first_map_bind_id = main_root.bind(
+                "<Map>", _maximize_on_first_restore, add="+")
+            main_root.iconify()
+        else:
+            main_root.deiconify()
+            place_tk_window_on_preferred_monitor(main_root)
+            # 顯式解除 topmost（修：splash 關閉後主視窗有時殘留 topmost，導致無法切到其他程式）
+            main_root.attributes("-topmost", False)
+            main_root.lift()
+            main_root.focus_force()
     except Exception:
         pass
 

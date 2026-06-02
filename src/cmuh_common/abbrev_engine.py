@@ -813,6 +813,16 @@ def _send_atomic_keystrokes(vk_events: list) -> bool:
         return False
 
 
+def inject_vk_tap(vk: int) -> bool:
+    """注入單一 virtual-key 的 down+up（一次原子 SendInput）。
+
+    供主程式的「熱鍵健康探針」使用：注入一個無副作用的鍵（例如 VK_F24），
+    若全域鍵盤 hook 還活著就會被攔截到，藉此判斷 hook 是否已被 Windows
+    （LowLevelHooks timeout）靜默移除。回傳 True 代表 SendInput 成功送出。
+    """
+    return _send_atomic_keystrokes([(int(vk), True), (int(vk), False)])
+
+
 _WM_GETTEXT = 0x000D
 _WM_GETTEXTLENGTH = 0x000E
 _EM_GETSEL = 0x00B0

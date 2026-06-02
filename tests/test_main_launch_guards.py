@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Regression checks for guarded launches in desktop app entry points."""
 import ast
+import re
 from pathlib import Path
 
 
@@ -133,7 +134,37 @@ def test_main_places_window_on_preferred_monitor_before_and_after_deiconify():
     source = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
 
     assert "place_tk_window_on_preferred_monitor(self.root)" in source
-    assert "main_root.deiconify()\n        place_tk_window_on_preferred_monitor(main_root)" in source
+    # 手動啟動路徑：deiconify 後立即定位到偏好螢幕（縮排無關，可包在 else 分支內）
+    assert re.search(
+        r"main_root\.deiconify\(\)\s*\n\s*place_tk_window_on_preferred_monitor\(main_root\)",
+        source,
+    )
+
+
+def test_main_background_restart_starts_minimized_silently():
+    """背景重啟（--background）必須靜默：不開 splash、視窗最小化進工作列、
+    不搶焦點；第一次還原時才定位/最大化。手動啟動則維持正常顯示。"""
+    source = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
+
+    assert '_start_background = ("--background" in sys.argv)' in source
+    # splash 只在非背景啟動時顯示
+    assert "if not _start_background:" in source
+    # 背景啟動以最小化進工作列、第一次 <Map> 還原時才最大化
+    assert "main_root.iconify()" in source
+    assert 'main_root.bind(\n                "<Map>"' in source or 'main_root.bind("<Map>"' in source
+    # app 端重啟匯流點帶 --background
+    assert 'restart_self(["--background"])' in source
+
+
+def test_scheduler_background_restart_starts_minimized_silently():
+    source = (ROOT / "src" / "scheduler.py").read_text(encoding="utf-8")
+
+    assert '_start_background = ("--background" in sys.argv)' in source
+    assert "main_root.iconify()" in source
+    # __init__ 的 zoom 對 withdrawn 視窗要跳過（避免背景啟動被 re-map 閃一下）
+    assert "if self.root.state() != 'withdrawn':" in source
+    # 自動重啟帶 --background
+    assert 'restart_self(["--background"])' in source
 
 
 def test_startup_splash_uses_same_preferred_monitor_as_main_window():
@@ -434,13 +465,24 @@ def test_scheduled_background_submits_detect_rejected_futures():
 
 
 def test_hotkey_guardian_uses_safe_rehook_policy():
+    """守護程式偵測到全域 hook 失效時，只能在安全狀態下自動重啟：非自動化執行中、
+    模組就緒、且使用者閒置（system idle 達門檻），避免打斷醫令流程。健康判定邏輯
+    已從 run_hotkey_guardian 移到 _hotkey_health_tick。"""
     for rel_path in ("src/main.py", "src/scheduler.py"):
-        src = _function_source(ROOT / rel_path, "run_hotkey_guardian")
+        guardian = _function_source(ROOT / rel_path, "run_hotkey_guardian")
+        assert "GUARDIAN_INTERVAL_SEC" in guardian
+        assert "self._hotkey_health_tick()" in guardian
+        # 守護程式不再「無腦每 N 秒重掛」（對 LowLevelHooks timeout 無效）
+        assert "should_rehook_hotkeys(" not in guardian
 
-        assert "should_rehook_hotkeys(" in src
-        assert "subsystem_running=getattr(self, '_subsystem_running', False)" in src
-        assert "modules_ready=getattr(self, '_heavy_modules_ready', False)" in src
-        assert "Hotkey guardian skipped re-hook while automation is running." in src
+        tick = _function_source(ROOT / rel_path, "_hotkey_health_tick")
+        assert "should_auto_restart_for_dead_hook(" in tick
+        assert "subsystem_running=getattr(self, '_subsystem_running', False)" in tick
+        assert "modules_ready=getattr(self, '_heavy_modules_ready', False)" in tick
+        assert "system_idle_sec=idle" in tick
+        # 確認失效需連續多次探針未回應，且重啟前先主動探針
+        assert "is_hook_probe_failure_confirmed(" in tick
+        assert "self._probe_hotkey_hook_alive()" in tick
 
 
 def test_hotkey_module_loader_recovers_from_rejected_submit():
@@ -550,9 +592,9 @@ def test_permanent_background_loops_do_not_consume_executor_workers():
         assert "target=run_schedule" in start_src
         assert 'name="ScheduleLoop"' in start_src
         assert "self.bg_executor.submit(run_schedule)" not in start_src
-        assert "target=rehook" in guardian_src
+        assert "target=guardian_loop" in guardian_src
         assert 'name="HotkeyGuardian"' in guardian_src
-        assert "self.bg_executor.submit(rehook)" not in guardian_src
+        assert "self.bg_executor.submit(guardian_loop)" not in guardian_src
         assert "duplicate start ignored" in guardian_src
 
 
