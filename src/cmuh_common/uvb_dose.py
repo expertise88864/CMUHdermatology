@@ -151,9 +151,18 @@ _UVB_COUNT_RE = re.compile(r"[\(（]\s*(\d+)\s*[\)）]")
 # increase / increased / add / 每次加 / 增加 (case-insensitive)
 # [v20.16] 也接受常見打字錯誤 "incrase" / "incraese" (張耀銘實機 case)
 # [v20.17] 接受 "in crease" 中間有空格 (張智宇實機 case)
+# [2026-06-02] 兩種寫法都接受：
+#   (a) 關鍵字在前、數字在後：increase/add/adding/added/每次加 … N
+#       add 改 add(?:ing|ed|s)? 以接受「adding 100」(陳珮淇實機 case，原本
+#       "add" 後接 "ing" 就比不到數字 → inc=None → parse_fail)。
+#   (b) 數字在前、"each (time)"/"每次" 在後的自由寫法、無 add/increase 關鍵字：
+#       「50 each time」「100 mj each」「30 每次」(周宗翰實機 case)。
+#       數字落在 group(2)，caller 用 group(1) or group(2) 取值。
 _UVB_INCREASE_RE = re.compile(
-    r"(?:(?:in\s*cr(?:e?a?|a?e?)se[d]?|add)(?:\s+by)?|每次增加|每次加|增加|加)"
-    r"\s*[:：]?\s*(\d+)",
+    r"(?:(?:in\s*cr(?:e?a?|a?e?)se[d]?|add(?:ing|ed|s)?)(?:\s+by)?"
+    r"|每次增加|每次加|增加|加)\s*[:：]?\s*(\d+)"
+    r"|"
+    r"(\d+)\s*(?:mj(?:/cm2)?)?\s*(?:each(?:\s+time)?|每次)",
     re.IGNORECASE)
 # [v20.8] MAX 接受多種同義表達:
 #   MAX:N / MAX N / MAX at N / MAX dose: N / fix N / fixed at N / fixed to N / 固定 N
@@ -314,8 +323,9 @@ def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
     if not inc_m:
         return None
     try:
-        increase = int(inc_m.group(1))
-    except ValueError:
+        # group(1)=關鍵字在前的數字；group(2)="N each time" 數字在前的數字
+        increase = int(inc_m.group(1) or inc_m.group(2))
+    except (ValueError, TypeError):
         return None
 
     return UvbLineInfo(
@@ -400,8 +410,8 @@ def parse_uvb_partial(text: str) -> Optional[UvbLineInfo]:
     increase: Optional[int] = None
     if inc_m:
         try:
-            increase = int(inc_m.group(1))
-        except ValueError:
+            increase = int(inc_m.group(1) or inc_m.group(2))
+        except (ValueError, TypeError):
             increase = None
 
     return UvbLineInfo(

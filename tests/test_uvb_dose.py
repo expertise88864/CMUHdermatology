@@ -1806,3 +1806,41 @@ def test_phototherapy_format_caps_at_upper_limit():
     assert r.action == UvbAction.UPDATED
     assert "1000" not in r.new_text  # 不可超過上限 950
     assert "950" in r.new_text
+
+
+# ─── [2026-06-02] increase 自由寫法: "adding N" / "N each time" ──────────
+
+def test_parse_increase_adding_suffix():
+    """add 字尾 ing/ed/s 也要認:「adding 100 each time」(陳珮淇實機 case)。
+    原本 "add" 後接 "ing" 比不到數字 → inc=None → parse_fail。"""
+    info = parse_uvb_line(
+        "UVB: 380 mj/cm2(48) on (2026/5/2) adding 100 each time, MAX:1000")
+    assert info is not None
+    assert info.increase == 100
+    assert info.dose == 380 and info.count == 48 and info.max_dose == 1000
+
+
+def test_parse_increase_n_each_time_no_keyword():
+    """無 add/increase 關鍵字,只寫「N each time」也要認(周宗翰實機 case)。"""
+    info = parse_uvb_line(
+        "UVB: 1500 mj/cm2 (170) on (2026/5/2) 50 each time, fixed at 1500")
+    assert info is not None
+    assert info.increase == 50
+    assert info.dose == 1500 and info.count == 170 and info.max_dose == 1500
+
+
+def test_parse_increase_n_each_no_time_word():
+    """「100 mj each」(無 time 字)也要認。"""
+    info = parse_uvb_line(
+        "UVB 600 (5) on (2026/5/2), 100 mj each, MAX 1200")
+    assert info is not None
+    assert info.increase == 100
+
+
+def test_increase_adding_full_update_dose_math():
+    """[2026-06-02] "adding N" 解析後套用既有 2-6 天遞增規則,劑量數學正確。"""
+    r = update_uvb_in_text(
+        "UVB 380 (48) on (2026/5/28) adding 100 each time, MAX:1000",
+        today=date(2026, 6, 2))  # 5 天 → 2-6 天桶 → +100
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 480  # 380 + 100, < MAX 1000
