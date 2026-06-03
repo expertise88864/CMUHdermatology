@@ -79,7 +79,7 @@ _user32.CloseDesktop.argtypes = [ctypes.c_void_p]
 
 from cmuh_common.atomic_io import atomic_write_json, safe_load_json  # noqa: E402
 from cmuh_common.logging_setup import attach_queue_handler, setup_logging  # noqa: E402
-from cmuh_common.paths import get_app_dir, get_settings_dir  # noqa: E402
+from cmuh_common.paths import get_app_dir, get_settings_dir, restart_self  # noqa: E402
 from cmuh_common.platform_win import is_admin, run_as_admin  # noqa: E402
 from cmuh_common.process_launch import launch_python_script  # noqa: E402
 from cmuh_common.single_instance import (  # noqa: E402
@@ -202,6 +202,9 @@ _test_email_gate = ActiveTaskGate(stale_after_sec=10 * 60)
 tray_icon_object = None
 _exit_lock = threading.Lock()
 _exit_started = False
+# 背景更新檢查（daemon thread）偵測到新版時設 True；實際重啟由 main thread 在
+# tray run() 返回後執行（見 _request_restart_for_update / main 尾端）。
+_restart_after_run = False
 log_queue: "queue.Queue" = queue.Queue(maxsize=5000)
 LOG_POLL_MAX_RECORDS = 200
 _config_lock = threading.Lock()
@@ -2369,18 +2372,46 @@ def _tray_test_email(icon=None, item=None) -> None:
                      daemon=True).start()
 
 
+def _request_restart_for_update() -> None:
+    """背景 thread 偵測到新版 → 收掉托盤圖示並標記重啟，讓 main thread 在 run()
+    返回後乾淨重啟。
+
+    【2026-06-03 修「系統列出現兩個圖示」】絕不可在此 daemon thread 直接
+    restart_self()：預設走 sys.exit(0) 在子 thread 只會結束「本 thread」、整個
+    process 不會退 → 舊 process（main thread 仍卡在 tray run()）持續存活，新
+    process 又起來 → 系統列同時出現新舊兩個圖示。
+    正解：在這裡 stop() 托盤（NIM_DELETE 移除舊圖示 + 解除 main thread 的 run()），
+    main thread 返回後由它自己 restart_self()（sys.exit 在 main thread 才會真正
+    結束整個 process）。釋放單例 mutex 也延到 main thread 重啟前一刻才做。
+    """
+    global _restart_after_run, _exit_started
+    with _exit_lock:
+        if _exit_started:
+            return  # 使用者已按退出，或已在收尾 → 不重複觸發
+        _exit_started = True
+        _restart_after_run = True
+    running.clear()  # 中止 ImportError fallback 的 while running 迴圈
+    if tray_icon_object:
+        try:
+            tray_icon_object.visible = False
+        except Exception:
+            pass
+        try:
+            tray_icon_object.stop()
+        except Exception:
+            pass
+
+
 def _check_update_in_background() -> None:
     try:
         from cmuh_common.updater import (
             check_and_update,
             need_restart_after_update,
-            perform_restart,
         )
         result = check_and_update()
         if need_restart_after_update(result):
-            logging.info("會診查詢程式偵測到新版，立即重新啟動")
-            release_single_instance()
-            perform_restart()
+            logging.info("會診查詢程式偵測到新版，準備重新啟動")
+            _request_restart_for_update()
     except Exception:
         logging.debug("背景更新檢查失敗", exc_info=True)
 
@@ -2530,6 +2561,17 @@ def main() -> None:
             ctypes.windll.user32.MessageBoxW(0, err, "會診查詢程式錯誤", 0x10)
         except Exception:
             print(err, file=sys.stderr)
+
+    # [2026-06-03] 背景更新檢查要求重啟 → 一律由 main thread 在此處理。
+    # 此時 tray run() 已返回（舊圖示已 NIM_DELETE 移除），釋放單例後 restart_self
+    # （main thread 走 sys.exit，能真正結束整個 process）→ 系統列只會有一個圖示。
+    if _restart_after_run:
+        logging.info("會診查詢程式：套用更新後重新啟動")
+        try:
+            release_single_instance()
+        except Exception:
+            pass
+        restart_self()
 
 
 if __name__ == "__main__":

@@ -20,9 +20,15 @@ def test_background_helpers_restart_immediately_after_update():
 
     assert "打卡程式偵測到新版，立即重新啟動" in autoclock_src
     assert "restart_program()" in autoclock_src
-    assert "會診查詢程式偵測到新版，立即重新啟動" in consult_src
+
+    # [2026-06-03] 會診查詢：背景 daemon thread 偵測到新版後只「標記重啟 + 收掉托盤」，
+    # 實際 restart_self 由 main thread 在 tray run() 返回後執行。若回到舊版「在 daemon
+    # thread 直接 perform_restart()」會因 sys.exit 只結束本 thread → 舊 process 不退 →
+    # 系統列同時出現新舊兩個圖示。這幾條斷言把正確設計鎖住、防回歸。
+    assert "會診查詢程式偵測到新版，準備重新啟動" in consult_src
+    assert "_request_restart_for_update()" in consult_src
+    assert "_restart_after_run" in consult_src
     assert "release_single_instance()" in consult_src
-    assert "perform_restart()" in consult_src
 
 
 def test_check_and_update_honors_active_write_suspension(monkeypatch):
