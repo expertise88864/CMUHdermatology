@@ -619,7 +619,7 @@ def test_main_and_scheduler_background_tasks_start_once_and_clear_schedule():
         assert func_src.index("schedule.clear()") < func_src.index("schedule.every")
 
 
-def test_main_and_scheduler_schedule_daytime_update_checks_every_15_minutes():
+def test_main_and_scheduler_schedule_update_checks_from_shared_policy():
     for rel_path in ("src/main.py", "src/scheduler.py"):
         full_src = (ROOT / rel_path).read_text(encoding="utf-8")
         start_src = _function_source(ROOT / rel_path, "start_background_tasks")
@@ -627,7 +627,7 @@ def test_main_and_scheduler_schedule_daytime_update_checks_every_15_minutes():
         assert "from cmuh_common.update_policy import AUTO_UPDATE_CHECK_TIMES" in full_src
         assert "for update_time in AUTO_UPDATE_CHECK_TIMES:" in start_src
         assert 'f"check-update-{scheduled_at.replace(\':\', \'\')}"' in start_src
-        assert '.tag("update-check", "daytime-30m")' in start_src
+        assert '.tag("update-check", "daily-3x")' in start_src
 
 
 def test_main_and_scheduler_ui_queue_polling_is_bounded():

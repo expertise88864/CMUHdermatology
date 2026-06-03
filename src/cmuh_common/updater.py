@@ -17,6 +17,7 @@ import hashlib
 import logging
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -43,10 +44,24 @@ RELEASE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 UPDATE_TIMEOUT = 15
 MANIFEST_TIMEOUT = 8
 
-# 【穩定性 2026-05-21】SHA256 mismatch backoff：CDN 拿到舊版時，本機記憶體
-# 標記該 key 在 N 秒內不再重抓，避免每次 check 都死循環打 GitHub。
-_SHA_MISMATCH_BACKOFF_SEC = 3600  # 1 小時
-_sha_mismatch_until: dict = {}    # key -> next allowed timestamp
+# 【穩定性 2026-06-03 fix①】單檔下載失敗（連線中斷 / SHA 不符）時，先對「同一個檔」
+# 重試數次（CDN 舊版通常幾分鐘內就同步好），連續多次才真的判失敗。釘 commit SHA 後
+# SHA 幾乎不會再不符；保留重試是為了擋短暫網路 / CDN 抖動。
+_DOWNLOAD_ATTEMPTS = 3            # 單一檔最多嘗試次數
+_DOWNLOAD_RETRY_DELAY_SEC = 2.0   # 每次重試間隔（秒）
+# 連續重試仍失敗才進 backoff，且只鎖較短時間（取代舊版「一次 SHA 不符就鎖 1 小時」）。
+_DOWNLOAD_FAIL_BACKOFF_SEC = 600  # 10 分鐘
+_sha_mismatch_until: dict = {}    # key -> next allowed timestamp（記憶體，重啟即清）
+
+# 【穩定性 2026-06-03 fix②】commit SHA 快取。
+# GitHub ref API 未授權限流為每 IP 60 次/時；醫院多台電腦共用對外 NAT IP 很容易撞 403。
+# 一旦 403 退回 branch 路徑（/main/file）會抓到 CDN 舊版 → SHA 對不上 → 下載失敗。
+# 解法：把上次「成功」解析到的 commit SHA 快取在記憶體 + 磁碟，403 時沿用它釘住下載
+#（釘 commit = 內容不可變、不會拿到舊版）。代價只是該輪可能看不到更新的版本，不會壞，
+# 下次 API 通了就會拿到新 SHA。
+_COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+_commit_sha_lock = threading.Lock()
+_commit_sha_cache = ""            # 本 process 記憶體快取（最近一次成功解析到的 commit）
 
 
 @dataclass
@@ -106,9 +121,54 @@ def _rollback_written_files(written_files: list[_WrittenFile]) -> list[str]:
     return errors
 
 
-def _fetch_manifest(timeout: float = MANIFEST_TIMEOUT) -> dict:
-    """取最新 commit 的 manifest，避免 Raw 分支路徑短暫回傳舊版清單。"""
-    commit_sha = ""
+def _commit_sha_cache_path() -> str:
+    from cmuh_common.paths import get_settings_dir
+    return os.path.join(get_settings_dir(), "last_commit_sha.txt")
+
+
+def _load_cached_commit_sha() -> str:
+    """回上次成功解析的 commit SHA（記憶體優先，否則讀磁碟）。沒有則回 ''。"""
+    global _commit_sha_cache
+    with _commit_sha_lock:
+        if _commit_sha_cache:
+            return _commit_sha_cache
+    try:
+        with open(_commit_sha_cache_path(), "r", encoding="utf-8") as f:
+            sha = f.read(64).strip().lower()
+    except Exception:
+        return ""
+    if _COMMIT_SHA_RE.fullmatch(sha):
+        with _commit_sha_lock:
+            if not _commit_sha_cache:
+                _commit_sha_cache = sha
+        return sha
+    return ""
+
+
+def _save_cached_commit_sha(sha: str) -> None:
+    """成功解析 commit 後寫回快取（記憶體 + 磁碟）。SHA 沒變則不寫磁碟。"""
+    global _commit_sha_cache
+    sha = (sha or "").strip().lower()
+    if not _COMMIT_SHA_RE.fullmatch(sha):
+        return
+    with _commit_sha_lock:
+        if sha == _commit_sha_cache:
+            return
+        _commit_sha_cache = sha
+    try:
+        from cmuh_common.atomic_io import atomic_write_text
+        atomic_write_text(_commit_sha_cache_path(), sha + "\n")
+    except Exception:
+        logging.debug("[update] 寫入 commit SHA 快取失敗", exc_info=True)
+
+
+def _resolve_commit_sha(timeout: float) -> str:
+    """解析 main 最新 commit SHA。
+
+    - 成功 → 更新快取並回新 SHA。
+    - 失敗（403 限流 / 連線中斷）→ 沿用上次成功的快取 SHA（釘住下載、避免 branch 舊版）。
+    - 連快取都沒有 → 回 ''（呼叫端最後才退回 branch 路徑）。
+    """
     try:
         ref_url = f"{API_REF_URL}?t={time.time_ns()}"
         ref_resp = requests.get(
@@ -117,13 +177,28 @@ def _fetch_manifest(timeout: float = MANIFEST_TIMEOUT) -> dict:
             headers={"User-Agent": "CMUH-Dermatology-Updater"},
         )
         ref_resp.raise_for_status()
-        commit_sha = str(ref_resp.json()["object"]["sha"]).strip().lower()
-        if not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
+        sha = str(ref_resp.json()["object"]["sha"]).strip().lower()
+        if not _COMMIT_SHA_RE.fullmatch(sha):
             raise ValueError("GitHub ref API 回傳非預期 commit SHA")
+        _save_cached_commit_sha(sha)
+        return sha
     except Exception as e:
-        # API rate limit 或短暫連線失敗時仍保留原本 Raw branch fallback。
-        logging.warning("取得 GitHub main commit SHA 失敗，改用 branch fallback: %s", e)
+        cached = _load_cached_commit_sha()
+        if cached:
+            logging.warning(
+                "取得 GitHub commit SHA 失敗（%s），沿用上次成功的 commit %s.. 釘住下載",
+                e, cached[:12],
+            )
+            return cached
+        logging.warning(
+            "取得 GitHub commit SHA 失敗且無快取，改用 branch fallback: %s", e
+        )
+        return ""
 
+
+def _fetch_manifest(timeout: float = MANIFEST_TIMEOUT) -> dict:
+    """取最新 commit 的 manifest，避免 Raw 分支路徑短暫回傳舊版清單。"""
+    commit_sha = _resolve_commit_sha(timeout)
     remote_ref = commit_sha or GITHUB_BRANCH
     url = (
         f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}"
@@ -153,6 +228,44 @@ def _read_local_version(local_path: str) -> str:
 
 def _sha256_text(content: str) -> str:
     return hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+
+def _download_verified(key: str, base_url: str, expected_sha: str) -> Optional[str]:
+    """下載並驗 SHA256；遇連線錯誤或 SHA 不符（多半是 CDN 舊版）時對「同一個檔」重試。
+
+    第一次用乾淨網址（保留多台電腦共用 CDN 快取的好處）；重試時才加 nanotime
+    旁路掉可能的舊快取。成功回 content；嘗試 _DOWNLOAD_ATTEMPTS 次仍失敗回 None。
+    """
+    last_err = ""
+    for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+        # 第一次保持原網址讓多台電腦共用 CDN 快取；重試才打 nanotime 防快取
+        url = base_url if attempt == 1 else f"{base_url}&t={time.time_ns()}"
+        try:
+            resp = requests.get(url, timeout=UPDATE_TIMEOUT)
+            resp.raise_for_status()
+            resp.encoding = 'utf-8'
+            content = resp.text
+        except Exception as e:
+            last_err = f"連線錯誤: {e}"
+        else:
+            if not expected_sha:
+                return content
+            actual_sha = _sha256_text(content)
+            if actual_sha == expected_sha:
+                return content
+            last_err = (
+                f"SHA256 不符（預期 {expected_sha[:12]}.. 實際 {actual_sha[:12]}..）"
+            )
+        if attempt < _DOWNLOAD_ATTEMPTS:
+            logging.info(
+                "  [%s] 下載第 %d/%d 次失敗（%s），%.0fs 後重試",
+                key, attempt, _DOWNLOAD_ATTEMPTS, last_err, _DOWNLOAD_RETRY_DELAY_SEC,
+            )
+            time.sleep(_DOWNLOAD_RETRY_DELAY_SEC)
+    logging.warning(
+        "  [%s] 下載重試 %d 次仍失敗：%s", key, _DOWNLOAD_ATTEMPTS, last_err
+    )
+    return None
 
 
 def _sha256_local_file(local_path: str) -> str:
@@ -213,24 +326,21 @@ def _download_one(file_entry: dict, app_dir: str) -> Optional[tuple]:
         f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}"
         f"/{remote_ref}"
     )
-    url = f"{remote_base}/{remote_path}?v={cache_key}"
+    base_url = f"{remote_base}/{remote_path}?v={cache_key}"
     logging.info("  [%s] 偵測到新版（v%s -> v%s），下載中...", key, local_ver, expected_version)
 
-    resp = requests.get(url, timeout=UPDATE_TIMEOUT)
-    resp.raise_for_status()
-    resp.encoding = 'utf-8'
-    content = resp.text
-
-    # SHA256 校驗（manifest 有指定才驗）
-    if expected_sha:
-        actual_sha = _sha256_text(content)
-        if actual_sha != expected_sha:
-            # 【穩定性 2026-05-21】記下 backoff，避免下次 check 又重抓爛 CDN
-            _sha_mismatch_until[key] = now_ts + _SHA_MISMATCH_BACKOFF_SEC
-            raise ValueError(
-                f"[{key}] SHA256 不符（預期 {expected_sha[:12]}.. 實際 {actual_sha[:12]}..）"
-                f" — 暫停 1 小時"
-            )
+    # 【fix①】單檔重試：CDN 舊版 / 短暫連線抖動通常幾分鐘內自癒，連續多次才判失敗。
+    content = _download_verified(key, base_url, expected_sha)
+    if content is None:
+        # 重試多次仍失敗 → 短期 backoff（取代舊版「一次就鎖 1 小時」），
+        # 避免狂打 GitHub；CDN 同步好後很快就能再抓。
+        _sha_mismatch_until[key] = now_ts + _DOWNLOAD_FAIL_BACKOFF_SEC
+        raise ValueError(
+            f"[{key}] 下載重試 {_DOWNLOAD_ATTEMPTS} 次仍失敗"
+            f"（連線錯誤或 SHA256 不符）— 暫停 {int(_DOWNLOAD_FAIL_BACKOFF_SEC // 60)} 分鐘"
+        )
+    # 下載成功 → 清掉先前可能殘留的 backoff 標記
+    _sha_mismatch_until.pop(key, None)
 
     # 雙重驗證：檔案內 CURRENT_VERSION 必須符合 manifest（避免 raw cache 拿到舊版）
     m = re.search(r'CURRENT_VERSION\s*=\s*["\']([\d.]+)["\']', content)

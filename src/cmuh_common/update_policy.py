@@ -10,10 +10,10 @@ from cmuh_common.atomic_io import atomic_write_text
 from cmuh_common.paths import get_settings_dir
 
 AUTO_UPDATE_SUSPEND_FILENAME = ".auto_update_suspended_until"
-AUTO_UPDATE_CHECK_TIMES = tuple(
-    f"{minute // 60:02d}:{minute % 60:02d}"
-    for minute in range(8 * 60, 17 * 60 + 1, 30)
-)
+# 【2026-06-03】每天只在固定 3 個時間點檢查更新（早上 07:00 / 中午 13:00 / 下午 18:00），
+# 不再 08:00–17:00 每 30 分鐘檢查一次。醫院多台電腦共用對外 NAT IP，密集檢查容易撞
+# GitHub API 限流（60 次/時/IP），少打才不會 403 → 退回 branch 拿到舊版 → 下載失敗。
+AUTO_UPDATE_CHECK_TIMES = ("07:00", "13:00", "18:00")
 
 
 def get_auto_update_suspend_path() -> str:

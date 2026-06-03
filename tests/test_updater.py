@@ -24,6 +24,20 @@ class _FakeResponse:
         return self._json_data
 
 
+@pytest.fixture(autouse=True)
+def _isolate_updater_state(tmp_path, monkeypatch):
+    """每個測試獨立的 commit SHA 快取檔 + 乾淨的記憶體狀態。
+
+    fix② 新增了 commit SHA 磁碟快取；測試時導向 tmp，避免污染使用者 settings。
+    """
+    monkeypatch.setattr(updater, "_commit_sha_cache", "")
+    updater._sha_mismatch_until.clear()
+    cache_file = tmp_path / "last_commit_sha.txt"
+    monkeypatch.setattr(updater, "_commit_sha_cache_path", lambda: str(cache_file))
+    yield
+    updater._sha_mismatch_until.clear()
+
+
 def test_fetch_manifest_uses_unique_cache_buster(monkeypatch):
     urls = []
     commit_sha = "a" * 40
@@ -104,6 +118,117 @@ def test_download_one_uses_manifest_commit_sha(tmp_path, monkeypatch):
             f"/src/sample.py?v={expected_sha}"
         )
     ]
+
+
+# ---- fix②：commit SHA 快取，403 限流時沿用上次成功的 commit ----
+
+def test_resolve_commit_sha_reuses_cache_when_api_fails(monkeypatch):
+    good_sha = "c" * 40
+    # 第一次：API 成功 → 回 SHA 並寫入快取（記憶體 + 磁碟）
+    monkeypatch.setattr(
+        updater.requests, "get",
+        lambda url, timeout, **_k: _FakeResponse(json_data={"object": {"sha": good_sha}}),
+    )
+    assert updater._resolve_commit_sha(5) == good_sha
+    assert updater._load_cached_commit_sha() == good_sha
+
+    # 第二次：API 403 / 連線中斷 → 沿用快取，不退回 branch（不回 ""）
+    def boom(url, timeout, **_k):
+        raise RuntimeError("403 rate limit exceeded")
+
+    monkeypatch.setattr(updater.requests, "get", boom)
+    assert updater._resolve_commit_sha(5) == good_sha
+
+
+def test_resolve_commit_sha_returns_empty_without_cache(monkeypatch):
+    # 無快取 + API 失敗 → 回 ''（呼叫端最後才退回 branch 路徑）
+    monkeypatch.setattr(
+        updater.requests, "get",
+        lambda url, timeout, **_k: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+    assert updater._resolve_commit_sha(5) == ""
+
+
+def test_fetch_manifest_pins_to_cached_sha_on_api_failure(monkeypatch):
+    cached_sha = "d" * 40
+    monkeypatch.setattr(updater, "_commit_sha_cache", cached_sha)
+    monkeypatch.setattr(updater.time, "time_ns", lambda: 42)
+    urls = []
+
+    def fake_get(url, timeout, **_k):
+        urls.append(url)
+        if url.startswith(updater.API_REF_URL):
+            raise RuntimeError("403 rate limit exceeded")
+        return _FakeResponse(json_data={"files": []})
+
+    monkeypatch.setattr(updater.requests, "get", fake_get)
+
+    manifest = updater._fetch_manifest()
+
+    # API 失敗仍把 manifest 釘在 cached commit（不是 branch /main/ 舊版路徑）
+    assert manifest["_remote_commit_sha"] == cached_sha
+    assert urls[-1] == (
+        "https://raw.githubusercontent.com/"
+        f"{updater.GITHUB_OWNER}/{updater.GITHUB_REPO}/{cached_sha}"
+        f"/manifest.json?v={cached_sha}&t=42"
+    )
+
+
+# ---- fix①：單檔重試，不要一次就鎖 1 小時 ----
+
+def test_download_verified_retries_then_succeeds_with_cache_buster(monkeypatch):
+    content = "ok\n"
+    sha = updater._sha256_text(content)
+    seq = iter(["WRONG", content])  # 第一次 SHA 不符，第二次正確
+    calls = []
+
+    def fake_get(url, timeout):
+        calls.append(url)
+        return _FakeResponse(text=next(seq))
+
+    monkeypatch.setattr(updater.requests, "get", fake_get)
+    monkeypatch.setattr(updater.time, "sleep", lambda *_a: None)
+    monkeypatch.setattr(updater.time, "time_ns", lambda: 999)
+
+    base = f"{updater.RAW_BASE}/x.py?v={sha}"
+    assert updater._download_verified("x", base, sha) == content
+    # 第一次乾淨網址（共用 CDN 快取）；重試才加 nanotime 防快取
+    assert calls == [base, f"{base}&t=999"]
+
+
+def test_download_verified_returns_none_after_attempts(monkeypatch):
+    monkeypatch.setattr(
+        updater.requests, "get",
+        lambda url, timeout: _FakeResponse(text="bad"),
+    )
+    monkeypatch.setattr(updater.time, "sleep", lambda *_a: None)
+
+    base = f"{updater.RAW_BASE}/x.py?v=deadbeef"
+    assert updater._download_verified("x", base, "f" * 64) is None
+
+
+def test_download_one_uses_short_backoff_after_retries(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        updater.requests, "get",
+        lambda url, timeout: _FakeResponse(text="bad"),
+    )
+    monkeypatch.setattr(updater.time, "sleep", lambda *_a: None)
+    entry = {
+        "key": "z",
+        "remote_path": "src/z.py",
+        "local_filename": "src/z.py",
+        "version": "2099.01.01.1",
+        "sha256": "a" * 64,
+    }
+
+    with pytest.raises(ValueError, match="分鐘"):
+        updater._download_one(entry, str(tmp_path))
+
+    # backoff 鎖較短時間（10 分鐘），絕不是舊版的 1 小時
+    until = updater._sha_mismatch_until.get("z", 0.0)
+    remaining = until - updater.time.time()
+    assert 0 < remaining <= updater._DOWNLOAD_FAIL_BACKOFF_SEC + 1
+    assert updater._DOWNLOAD_FAIL_BACKOFF_SEC < 3600
 
 
 def test_check_and_update_rejects_stale_manifest_before_download(monkeypatch):

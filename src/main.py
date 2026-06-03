@@ -11611,7 +11611,7 @@ class AutomationApp:
                         f"check-update-{scheduled_at.replace(':', '')}",
                         lambda: self._submit_update_check(False),
                     )
-                ).tag("update-check", "daytime-30m")
+                ).tag("update-check", "daily-3x")
 
             while not stop_event_main.is_set():
                 # [穩定性] run_pending 包 try/except：schedule 預設會把工作的例外往外拋，

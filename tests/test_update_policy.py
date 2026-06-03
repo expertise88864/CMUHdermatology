@@ -9,13 +9,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from cmuh_common import update_policy  # noqa: E402
 
 
-def test_daytime_auto_update_checks_run_every_30_minutes_from_0800_to_1700():
+def test_auto_update_checks_run_three_fixed_times_per_day():
+    # 【2026-06-03】改為每天固定 3 次（07:00 / 13:00 / 18:00），少打 GitHub 避免限流。
     times = update_policy.AUTO_UPDATE_CHECK_TIMES
 
-    assert times[0] == "08:00"
-    assert times[-1] == "17:00"
-    assert len(times) == 19
-    assert times[1:5] == ("08:30", "09:00", "09:30", "10:00")
+    assert times == ("07:00", "13:00", "18:00")
+    assert len(times) == 3
 
 
 def test_suspend_auto_updates_round_trips_active_flag(tmp_path, monkeypatch):
