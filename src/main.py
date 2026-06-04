@@ -2929,6 +2929,43 @@ def _f11_ensure_ic_card(main_hwnd: int, label: str = "F11") -> None:
                         exc_info=True)
 
 
+def _find_menu_command_id_by_text(main_hwnd: int, target_text: str) -> int:
+    """走主視窗 menu bar → 各子選單，找文字含 target_text 的項目，回其 WM_COMMAND id。
+
+    [2026-06-04] 用 Win32 menu API 依「文字」動態解析(不寫死 id)，比 hardcode 穩。
+    找不到回 0。掃描時 log 各子選單項目，方便 owner-draw menu 抓不到文字時 debug。
+    """
+    user32 = ctypes.windll.user32
+    target = target_text.replace(" ", "")
+    MF_BYPOSITION = 0x400
+    try:
+        hmenu = user32.GetMenu(main_hwnd)
+        if not hmenu:
+            logging.warning("[menu] GetMenu 回 0 — 主視窗無 menu bar?")
+            return 0
+        for i in range(user32.GetMenuItemCount(hmenu)):
+            submenu = user32.GetSubMenu(hmenu, i)
+            if not submenu:
+                continue
+            for j in range(user32.GetMenuItemCount(submenu)):
+                buf = ctypes.create_unicode_buffer(256)
+                n = user32.GetMenuStringW(submenu, j, buf, 256, MF_BYPOSITION)
+                if n <= 0:
+                    continue
+                txt = buf.value
+                if target and target in txt.replace(" ", ""):
+                    cmd_id = int(user32.GetMenuItemID(submenu, j))
+                    if cmd_id not in (0, -1, 0xFFFFFFFF):
+                        logging.info("[menu] 找到 '%s' → command id=%s",
+                                     txt.strip(), cmd_id)
+                        return cmd_id
+        logging.warning("[menu] 選單中找不到含 '%s' 的項目", target_text)
+        return 0
+    except Exception:
+        logging.debug("[menu] _find_menu_command_id_by_text 例外", exc_info=True)
+        return 0
+
+
 def _f11_快速完成_main(label: str = "F11") -> bool:
     """F11 主流程：點 全部完成 → 輪詢任意順序 popup。
 
@@ -2947,19 +2984,41 @@ def _f11_快速完成_main(label: str = "F11") -> bool:
     # best-effort：任何不確定都跳過、照常往下按全部完成。
     _f11_ensure_ic_card(main_hwnd, label=label)
 
-    # Step 1: 點「全部完成」TButton
-    btns = _find_descendants_by_exact_text(main_hwnd, "TButton", "全部完成")
-    t_after_enum = time.time()
-    logging.info("[%s][timeline] EnumChildWindows 找 全部完成 button: %d 個 (+%.0fms total)",
-                  label, len(btns), (t_after_enum - t_f11_start) * 1000)
-    if not btns:
-        logging.warning("[%s] 找不到 全部完成 button", label)
-        return False
-    _post_click_to_control(btns[0][0])
-    t_clicked = time.time()
-    logging.info("[%s][timeline] PostMessage 全部完成 click 完成 (hwnd=%s, +%.0fms)，"
-                  "sleep 0.5s 給 app 起始 settle",
-                  label, btns[0][0], (t_clicked - t_after_enum) * 1000)
+    # Step 1: 完成。[2026-06-04] 照光病人(療程=2 或 3) → 改用「完成不印」menu
+    # (不印繳費單)；其餘照舊點「全部完成」TButton。讀療程或找 menu 任一失敗 →
+    # 一律 fallback 全部完成，確保 F11 永遠能完成看診。
+    療程_val = ""
+    try:
+        _lc_hwnd = _find_療程_edit_hwnd(main_hwnd)
+        if _lc_hwnd:
+            療程_val = (_read_tmemo_text(_lc_hwnd) or "").strip()
+    except Exception:
+        logging.debug("[%s] 讀療程欄失敗，照常全部完成", label, exc_info=True)
+
+    completed = False
+    if 療程_val in ("2", "3"):
+        cmd_id = _find_menu_command_id_by_text(main_hwnd, "完成不印")
+        if cmd_id and _send_yiling_menu_command(main_hwnd, cmd_id):
+            logging.info("[%s][timeline] 療程=%s(照光) → 已送「完成不印」menu "
+                          "(id=%s，不印繳費單) (+%.0fms total)",
+                          label, 療程_val, cmd_id,
+                          (time.time() - t_f11_start) * 1000)
+            completed = True
+        else:
+            logging.warning("[%s] 療程=%s 但「完成不印」menu 找不到/送出失敗 → "
+                            "fallback 全部完成", label, 療程_val)
+
+    if not completed:
+        btns = _find_descendants_by_exact_text(main_hwnd, "TButton", "全部完成")
+        logging.info("[%s][timeline] 找 全部完成 button: %d 個 (+%.0fms total)%s",
+                      label, len(btns), (time.time() - t_f11_start) * 1000,
+                      f"（療程={療程_val}）" if 療程_val else "")
+        if not btns:
+            logging.warning("[%s] 找不到 全部完成 button", label)
+            return False
+        _post_click_to_control(btns[0][0])
+        logging.info("[%s][timeline] PostMessage 全部完成 click 完成 (hwnd=%s)，"
+                      "sleep 0.5s 給 app settle", label, btns[0][0])
 
     # [2026-05-22 v40] 退回 v39 的 2s → 0.5s。實測 2s 沒解決「卡死」(因為卡死是
     # 醫院 app 自己在處理 server roundtrip，跟我們 polling 無關)，反而拖慢
