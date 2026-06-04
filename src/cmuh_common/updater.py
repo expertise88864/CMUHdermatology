@@ -62,6 +62,7 @@ _sha_mismatch_until: dict = {}    # key -> next allowed timestamp（記憶體，
 _COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 _commit_sha_lock = threading.Lock()
 _commit_sha_cache = ""            # 本 process 記憶體快取（最近一次成功解析到的 commit）
+_commit_sha_from_cache = False    # 最近一次 _resolve_commit_sha 是否沿用舊快取
 
 
 @dataclass
@@ -169,6 +170,8 @@ def _resolve_commit_sha(timeout: float) -> str:
     - 失敗（403 限流 / 連線中斷）→ 沿用上次成功的快取 SHA（釘住下載、避免 branch 舊版）。
     - 連快取都沒有 → 回 ''（呼叫端最後才退回 branch 路徑）。
     """
+    global _commit_sha_from_cache
+    _commit_sha_from_cache = False
     try:
         ref_url = f"{API_REF_URL}?t={time.time_ns()}"
         ref_resp = requests.get(
@@ -185,6 +188,7 @@ def _resolve_commit_sha(timeout: float) -> str:
     except Exception as e:
         cached = _load_cached_commit_sha()
         if cached:
+            _commit_sha_from_cache = True
             logging.warning(
                 "取得 GitHub commit SHA 失敗（%s），沿用上次成功的 commit %s.. 釘住下載",
                 e, cached[:12],
@@ -210,6 +214,7 @@ def _fetch_manifest(timeout: float = MANIFEST_TIMEOUT) -> dict:
     manifest = resp.json()
     if commit_sha:
         manifest["_remote_commit_sha"] = commit_sha
+        manifest["_remote_commit_sha_from_cache"] = bool(_commit_sha_from_cache)
     return manifest
 
 
@@ -404,6 +409,18 @@ def check_and_update(
             < parse_version(CURRENT_VERSION)):
         logging.warning(
             "[更新檢查] 遠端 manifest v%s 低於本機 v%s，拒絕降版",
+            result.manifest_app_version, CURRENT_VERSION,
+        )
+        return result
+
+    if (write_files
+            and manifest.get("_remote_commit_sha_from_cache")
+            and parse_version(result.manifest_app_version)
+            <= parse_version(CURRENT_VERSION)):
+        logging.warning(
+            "[更新檢查] GitHub API 失敗且只取得 cached commit %s..；"
+            "manifest v%s 未高於本機 v%s，拒絕寫檔以避免舊快取覆蓋新版",
+            str(manifest.get("_remote_commit_sha", ""))[:12],
             result.manifest_app_version, CURRENT_VERSION,
         )
         return result

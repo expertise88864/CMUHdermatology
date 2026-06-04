@@ -55,6 +55,7 @@ def test_fetch_manifest_uses_unique_cache_buster(monkeypatch):
     assert updater._fetch_manifest() == {
         "files": [],
         "_remote_commit_sha": commit_sha,
+        "_remote_commit_sha_from_cache": False,
     }
     assert urls == [
         f"{updater.API_REF_URL}?t=123456789",
@@ -167,6 +168,7 @@ def test_fetch_manifest_pins_to_cached_sha_on_api_failure(monkeypatch):
 
     # API 失敗仍把 manifest 釘在 cached commit（不是 branch /main/ 舊版路徑）
     assert manifest["_remote_commit_sha"] == cached_sha
+    assert manifest["_remote_commit_sha_from_cache"] is True
     assert urls[-1] == (
         "https://raw.githubusercontent.com/"
         f"{updater.GITHUB_OWNER}/{updater.GITHUB_REPO}/{cached_sha}"
@@ -242,6 +244,33 @@ def test_check_and_update_rejects_stale_manifest_before_download(monkeypatch):
         updater,
         "_download_one",
         lambda *_args: pytest.fail("stale manifest must not download files"),
+    )
+
+    result = updater.check_and_update(write_files=True)
+
+    assert result.checked is True
+    assert result.has_update is False
+    assert result.updated_files == []
+
+
+def test_check_and_update_rejects_same_version_cached_manifest_before_download(
+    monkeypatch,
+):
+    monkeypatch.setattr(updater, "is_frozen", lambda: False)
+    monkeypatch.setattr(
+        updater,
+        "_fetch_manifest",
+        lambda: {
+            "app_version": updater.CURRENT_VERSION,
+            "_remote_commit_sha": "a" * 40,
+            "_remote_commit_sha_from_cache": True,
+            "files": [{"key": "stale-cache"}],
+        },
+    )
+    monkeypatch.setattr(
+        updater,
+        "_download_one",
+        lambda *_args: pytest.fail("same-version cached manifest must not download files"),
     )
 
     result = updater.check_and_update(write_files=True)
