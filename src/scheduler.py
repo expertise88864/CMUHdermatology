@@ -253,6 +253,7 @@ def partition_doctors_for_refresh_batches(doctors):
 from cmuh_common.hotkey_scaling import (  # noqa: E402
     HOTKEY_SUPPORTED_RESOLUTIONS,
     HOTKEY_ADAPTIVE_STATE,
+    _HOTKEY_BASE_SIZE,
     configure_hotkey_scaling,
     _scaled_xy,
 )

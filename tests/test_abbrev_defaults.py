@@ -24,19 +24,12 @@ def test_requested_default_abbreviations_are_present():
     assert defaults["mf"] == "medication and follow up"
     assert defaults["nt"] == "next time:"
     assert defaults["pred"] == "no DM/HBV/HCV"
-    assert defaults["D15645"] == "FEX7DL"
-    assert defaults["D15728"] == "feng0930"
-    assert defaults["D6175"] == "Aa383838"
-    assert defaults["D20191"] == "dtderm25"
-    assert defaults["D28592"] == "A10101010"
-    assert defaults["D34899"] == "s1993127"
-    assert defaults["101823"] == "L6464646"
-    assert defaults["D31352"] == "bb52313"
-    assert defaults["101358"] == "101aa358"
-    assert defaults["D14355"] == "a383838"
-    assert defaults["D35819"] == "B12282"
     assert defaults["cert"] == \
         "患者因上述皮膚疾病，曾於da_zh至本院皮膚科門診就醫治療，建議持續追蹤。"
+    # [v8] 已退役的醫師代碼縮寫不再出現在預設清單
+    for code in ("D15645", "D15728", "D6175", "D20191", "D28592", "D34899",
+                 "101823", "D31352", "101358", "D14355", "D35819"):
+        assert code not in defaults
 
 
 def test_cert_default_renders_dynamic_visit_date():
@@ -97,11 +90,38 @@ def test_v5_config_restores_requested_defaults_only(tmp_path):
 
     assert values["nt"] == "next time:"
     assert values["se"] == "subacute eczema"
-    assert values["D15645"] == "FEX7DL"
-    assert values["101823"] == "L6464646"
-    assert values["D35819"] == "B12282"
     assert values["zz"] == "custom"
     assert "mf" not in values
+    # [v8] 退役醫師代碼不再被還原
+    for code in ("D15645", "101823", "D35819"):
+        assert code not in values
+
+
+def test_v7_config_removes_retired_doctor_defaults(tmp_path):
+    path = tmp_path / "abbrev_settings.json"
+    path.write_text(json.dumps({
+        "schema_version": 7,
+        "enabled": True,
+        "items": [
+            {"abbrev": "D15645", "expansion": "FEX7DL"},
+            {"abbrev": "101823", "expansion": "L6464646"},
+            # 即使 user 改過 expansion 也要移除
+            {"abbrev": "D28592", "expansion": "my-changed-password"},
+            {"abbrev": "zz", "expansion": "custom"},
+            {"abbrev": "st", "expansion": "keep stable"},
+        ],
+    }), encoding="utf-8")
+
+    cfg = ae.load_config(str(path))
+    values = {item["abbrev"]: item["expansion"] for item in cfg.items}
+    saved = json.loads(path.read_text(encoding="utf-8"))
+
+    assert cfg.schema_version == ae.ABBREV_CONFIG_SCHEMA_VERSION
+    assert saved["schema_version"] == ae.ABBREV_CONFIG_SCHEMA_VERSION
+    for code in ("D15645", "101823", "D28592"):
+        assert code not in values
+    assert values["zz"] == "custom"
+    assert values["st"] == "keep stable"
 
 
 def test_to_dict_sorts_abbreviations_case_insensitively():

@@ -40,7 +40,7 @@ from cmuh_common.config_io import load_json_dict
 # -----------------------------------------------------------------------------
 # 預設 snippets（首次啟動自動寫入；不含 if，避免英文 "if " 誤觸）
 # -----------------------------------------------------------------------------
-ABBREV_CONFIG_SCHEMA_VERSION = 7  # [v7 2026-06-04] 補回指定醫師代碼預設縮寫；bump 觸發現有使用者自動修復
+ABBREV_CONFIG_SCHEMA_VERSION = 8  # [v8 2026-06-04] 移除指定醫師代碼預設縮寫（撤回 v7 推送）；bump 觸發現有使用者自動清除
 MAX_ABBREV_LENGTH = 63
 
 DEFAULT_ITEMS: list[dict[str, str]] = [
@@ -48,17 +48,6 @@ DEFAULT_ITEMS: list[dict[str, str]] = [
     {"abbrev": "da",   "expansion": "da"},
     {"abbrev": "da1",  "expansion": "da1"},
     {"abbrev": "da2",  "expansion": "da2"},
-    {"abbrev": "D15645", "expansion": "FEX7DL"},
-    {"abbrev": "D15728", "expansion": "feng0930"},
-    {"abbrev": "D6175",  "expansion": "Aa383838"},
-    {"abbrev": "D20191", "expansion": "dtderm25"},
-    {"abbrev": "D28592", "expansion": "A10101010"},
-    {"abbrev": "D34899", "expansion": "s1993127"},
-    {"abbrev": "101823", "expansion": "L6464646"},
-    {"abbrev": "D31352", "expansion": "bb52313"},
-    {"abbrev": "101358", "expansion": "101aa358"},
-    {"abbrev": "D14355", "expansion": "a383838"},
-    {"abbrev": "D35819", "expansion": "B12282"},
     {"abbrev": "cbt",  "expansion": "check blood test"},
     {"abbrev": "ec",   "expansion": "epidermoid cyst"},
     {"abbrev": "mf",   "expansion": "medication and follow up"},
@@ -189,9 +178,6 @@ def _restore_requested_defaults(items: list[dict[str, str]]) -> bool:
     """
     restore_abbrevs = {
         "nt", "se",
-        "101358", "101823",
-        "d14355", "d15645", "d15728", "d20191", "d28592",
-        "d31352", "d34899", "d35819", "d6175",
     }
     known = {
         str(it.get("abbrev", "")).strip().casefold()
@@ -213,6 +199,31 @@ def _restore_requested_defaults(items: list[dict[str, str]]) -> bool:
         changed = True
         logging.info("[abbrev] restored requested default '%s'", abbrev)
     return changed
+
+
+# [v8 2026-06-04] 已退役的醫師代碼預設縮寫（撤回 v7 推送）。schema < 8 升級時主動清除，
+# 依 abbrev 比對，不論 user 是否改過該筆 expansion。
+_RETIRED_DEFAULT_ABBREVS: set[str] = {
+    "101358", "101823",
+    "d14355", "d15645", "d15728", "d20191", "d28592",
+    "d31352", "d34899", "d35819", "d6175",
+}
+
+
+def _remove_retired_defaults(items: list[dict[str, str]]) -> bool:
+    """移除 v7 推送、現已退役的醫師代碼預設縮寫（依 abbrev 比對，忽略 expansion）。"""
+    kept: list[dict[str, str]] = []
+    removed = False
+    for it in items:
+        key = str(it.get("abbrev", "")).strip().casefold()
+        if key in _RETIRED_DEFAULT_ABBREVS:
+            removed = True
+            logging.info("[abbrev] removed retired default '%s'", it.get("abbrev"))
+            continue
+        kept.append(it)
+    if removed:
+        items[:] = kept
+    return removed
 
 
 def _maybe_migrate_legacy(items: list[dict[str, str]]) -> bool:
@@ -287,6 +298,8 @@ def load_config(path: str) -> AbbrevConfig:
             needs_save = _restore_requested_defaults(cfg.items) or needs_save
         else:
             needs_save = _add_missing_default_items(cfg.items) or needs_save
+        # [v8] 撤回 v7 推送的醫師代碼預設縮寫（含 user 改過 expansion 的）
+        needs_save = _remove_retired_defaults(cfg.items) or needs_save
         needs_save = True
     needs_save = _maybe_migrate_legacy(cfg.items) or needs_save
     cfg.items = sort_abbrev_items(cfg.items)
