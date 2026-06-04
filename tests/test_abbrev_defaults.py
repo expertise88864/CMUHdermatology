@@ -73,6 +73,23 @@ def test_current_schema_does_not_restore_manually_deleted_default(tmp_path):
     assert cfg.items == [{"abbrev": "zz", "expansion": "custom"}]
 
 
+def test_v5_config_restores_nt_and_se_only(tmp_path):
+    path = tmp_path / "abbrev_settings.json"
+    path.write_text(json.dumps({
+        "schema_version": 5,
+        "enabled": True,
+        "items": [{"abbrev": "zz", "expansion": "custom"}],
+    }), encoding="utf-8")
+
+    cfg = ae.load_config(str(path))
+    values = {item["abbrev"]: item["expansion"] for item in cfg.items}
+
+    assert values["nt"] == "next time:"
+    assert values["se"] == "subacute eczema"
+    assert values["zz"] == "custom"
+    assert "mf" not in values
+
+
 def test_to_dict_sorts_abbreviations_case_insensitively():
     cfg = ae.AbbrevConfig(items=[
         {"abbrev": "zz", "expansion": "3"},

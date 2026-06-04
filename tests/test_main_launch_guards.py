@@ -679,6 +679,20 @@ def test_hotkey_waits_are_interruptible():
     assert "time.sleep(0.5)" not in f11_main_src
 
 
+def test_f11_phototherapy_uses_finish_no_print_without_print_fallback():
+    source_path = ROOT / "src" / "main.py"
+
+    f11_main_src = _function_source(source_path, "_f11_快速完成_main")
+    finish_no_print_src = _function_source(
+        source_path, "_find_finish_no_print_command_id")
+
+    assert "_find_finish_no_print_command_id(main_hwnd)" in f11_main_src
+    assert "照光病人不改按 全部完成" in f11_main_src
+    assert "fallback 全部完成" not in f11_main_src
+    assert "top_index=4" in finish_no_print_src
+    assert "sub_index=1" in finish_no_print_src
+
+
 def test_f9_f10_fixed_waits_are_interruptible():
     source_path = ROOT / "src" / "main.py"
     src = _function_source(source_path, "script_F9_F10_consent_form_adaptive")

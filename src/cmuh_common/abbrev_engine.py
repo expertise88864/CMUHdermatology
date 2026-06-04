@@ -40,7 +40,7 @@ from cmuh_common.config_io import load_json_dict
 # -----------------------------------------------------------------------------
 # 預設 snippets（首次啟動自動寫入；不含 if，避免英文 "if " 誤觸）
 # -----------------------------------------------------------------------------
-ABBREV_CONFIG_SCHEMA_VERSION = 5  # [v5 2026-06-01] 新增預設 'pred'；bump 觸發現有使用者補上缺少的預設
+ABBREV_CONFIG_SCHEMA_VERSION = 6  # [v6 2026-06-04] 補回 nt/se 預設；bump 觸發現有使用者自動修復
 MAX_ABBREV_LENGTH = 63
 
 DEFAULT_ITEMS: list[dict[str, str]] = [
@@ -169,6 +169,36 @@ def _add_missing_default_items(items: list[dict[str, str]]) -> bool:
     return changed
 
 
+def _restore_requested_defaults(items: list[dict[str, str]]) -> bool:
+    """Restore specific built-in abbreviations that disappeared from v5 configs.
+
+    This is intentionally narrower than _add_missing_default_items: it fixes the
+    requested nt/se regression without bringing back every default a user may
+    have deliberately removed.
+    """
+    restore_abbrevs = {"nt", "se"}
+    known = {
+        str(it.get("abbrev", "")).strip().casefold()
+        for it in items
+    }
+    defaults = {
+        str(it["abbrev"]).casefold(): dict(it)
+        for it in DEFAULT_ITEMS
+    }
+    changed = False
+    for abbrev in sorted(restore_abbrevs):
+        if abbrev in known:
+            continue
+        default = defaults.get(abbrev)
+        if not default:
+            continue
+        items.append(default)
+        known.add(abbrev)
+        changed = True
+        logging.info("[abbrev] restored requested default '%s'", abbrev)
+    return changed
+
+
 def _maybe_migrate_legacy(items: list[dict[str, str]]) -> bool:
     """偵測 user 的 cert1/cert2/ef 是否還是舊版預設字面。
     若是（= 沒手動改過），升級為 DEFAULT_ITEMS 內的新版。User 手動編輯過的
@@ -237,7 +267,10 @@ def load_config(path: str) -> AbbrevConfig:
 
     # 偵測 + 自動升級舊版預設；若有改 → 寫回磁碟
     if loaded_schema_version < ABBREV_CONFIG_SCHEMA_VERSION:
-        needs_save = _add_missing_default_items(cfg.items) or needs_save
+        if loaded_schema_version >= 5:
+            needs_save = _restore_requested_defaults(cfg.items) or needs_save
+        else:
+            needs_save = _add_missing_default_items(cfg.items) or needs_save
         needs_save = True
     needs_save = _maybe_migrate_legacy(cfg.items) or needs_save
     cfg.items = sort_abbrev_items(cfg.items)
