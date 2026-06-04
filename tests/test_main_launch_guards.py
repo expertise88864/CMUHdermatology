@@ -683,14 +683,12 @@ def test_f11_phototherapy_uses_finish_no_print_without_print_fallback():
     source_path = ROOT / "src" / "main.py"
 
     f11_main_src = _function_source(source_path, "_f11_快速完成_main")
-    finish_no_print_src = _function_source(
-        source_path, "_find_finish_no_print_command_id")
+    main_src = source_path.read_text(encoding="utf-8")
 
-    assert "_find_finish_no_print_command_id(main_hwnd)" in f11_main_src
+    assert "MENU_ID_FINISH_NO_PRINT = 276" in main_src
+    assert "cmd_id = MENU_ID_FINISH_NO_PRINT" in f11_main_src
     assert "照光病人不改按 全部完成" in f11_main_src
     assert "fallback 全部完成" not in f11_main_src
-    assert "top_index=4" in finish_no_print_src
-    assert "sub_index=1" in finish_no_print_src
 
 
 def test_f9_f10_fixed_waits_are_interruptible():

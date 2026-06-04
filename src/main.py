@@ -2999,56 +2999,7 @@ def _find_menu_command_id_by_text(main_hwnd: int, target_text: str) -> int:
         return 0
 
 
-def _find_menu_command_id_by_position(
-        main_hwnd: int, top_index: int, sub_index: int, label: str) -> int:
-    """Use menu position for Delphi owner-draw items whose text reads as blank."""
-    user32 = ctypes.windll.user32
-    try:
-        hmenu = user32.GetMenu(main_hwnd)
-        if not hmenu:
-            logging.warning("[menu] %s by position failed: main menu missing", label)
-            return 0
-        top_count = int(user32.GetMenuItemCount(hmenu))
-        if top_index < 0 or top_index >= top_count:
-            logging.warning("[menu] %s by position failed: top[%d] out of range/%d",
-                            label, top_index, top_count)
-            return 0
-        submenu = user32.GetSubMenu(hmenu, top_index)
-        if not submenu:
-            logging.warning("[menu] %s by position failed: top[%d] has no submenu",
-                            label, top_index)
-            return 0
-        sub_count = int(user32.GetMenuItemCount(submenu))
-        if sub_index < 0 or sub_index >= sub_count:
-            logging.warning("[menu] %s by position failed: top[%d].sub[%d] "
-                            "out of range/%d", label, top_index, sub_index, sub_count)
-            return 0
-        cmd_id = int(user32.GetMenuItemID(submenu, sub_index))
-        if cmd_id in (0, -1, 0xFFFFFFFF):
-            logging.warning("[menu] %s by position got invalid id=%s at "
-                            "top[%d].sub[%d]", label, cmd_id, top_index, sub_index)
-            _dump_menu_tree(main_hwnd)
-            return 0
-        logging.info("[menu] %s by position top[%d].sub[%d] → command id=%s",
-                     label, top_index, sub_index, cmd_id)
-        return cmd_id
-    except Exception:
-        logging.debug("[menu] _find_menu_command_id_by_position 例外", exc_info=True)
-        return 0
-
-
-def _find_finish_no_print_command_id(main_hwnd: int) -> int:
-    """Find 完成不印 command id.
-
-    HIS menu captions are Delphi owner-draw on the user's machine, so text
-    lookup can return blank. From the 2026-06-04 automation_ui.log and screen
-    capture: top menu index 4 is「完成」and sub index 1 is「完成不印」.
-    """
-    cmd_id = _find_menu_command_id_by_text(main_hwnd, "完成不印")
-    if cmd_id:
-        return cmd_id
-    return _find_menu_command_id_by_position(
-        main_hwnd, top_index=4, sub_index=1, label="完成不印")
+MENU_ID_FINISH_NO_PRINT = 276  # 完成 > 完成不印；automation_ui.log 2026-06-04 top[4].sub[1]
 
 
 def _f11_快速完成_main(label: str = "F11") -> bool:
@@ -3082,7 +3033,7 @@ def _f11_快速完成_main(label: str = "F11") -> bool:
 
     completed = False
     if 療程_val in ("2", "3"):
-        cmd_id = _find_finish_no_print_command_id(main_hwnd)
+        cmd_id = MENU_ID_FINISH_NO_PRINT
         if cmd_id and _send_yiling_menu_command(main_hwnd, cmd_id):
             logging.info("[%s][timeline] 療程=%s(照光) → 已送「完成不印」menu "
                           "(id=%s，不印繳費單) (+%.0fms total)",
