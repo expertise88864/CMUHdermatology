@@ -24,6 +24,17 @@ def test_requested_default_abbreviations_are_present():
     assert defaults["mf"] == "medication and follow up"
     assert defaults["nt"] == "next time:"
     assert defaults["pred"] == "no DM/HBV/HCV"
+    assert defaults["D15645"] == "FEX7DL"
+    assert defaults["D15728"] == "feng0930"
+    assert defaults["D6175"] == "Aa383838"
+    assert defaults["D20191"] == "dtderm25"
+    assert defaults["D28592"] == "A10101010"
+    assert defaults["D34899"] == "s1993127"
+    assert defaults["101823"] == "L6464646"
+    assert defaults["D31352"] == "bb52313"
+    assert defaults["101358"] == "101aa358"
+    assert defaults["D14355"] == "a383838"
+    assert defaults["D35819"] == "B12282"
     assert defaults["cert"] == \
         "患者因上述皮膚疾病，曾於da_zh至本院皮膚科門診就醫治療，建議持續追蹤。"
 
@@ -57,7 +68,7 @@ def test_old_config_adds_new_defaults_once_and_preserves_custom_text(tmp_path):
     assert values["cert"].startswith("患者因上述皮膚疾病")
     assert saved["schema_version"] == ae.ABBREV_CONFIG_SCHEMA_VERSION
     assert [item["abbrev"] for item in saved["items"]] == sorted(
-        item["abbrev"] for item in saved["items"])
+        (item["abbrev"] for item in saved["items"]), key=str.casefold)
 
 
 def test_current_schema_does_not_restore_manually_deleted_default(tmp_path):
@@ -73,7 +84,7 @@ def test_current_schema_does_not_restore_manually_deleted_default(tmp_path):
     assert cfg.items == [{"abbrev": "zz", "expansion": "custom"}]
 
 
-def test_v5_config_restores_nt_and_se_only(tmp_path):
+def test_v5_config_restores_requested_defaults_only(tmp_path):
     path = tmp_path / "abbrev_settings.json"
     path.write_text(json.dumps({
         "schema_version": 5,
@@ -86,6 +97,9 @@ def test_v5_config_restores_nt_and_se_only(tmp_path):
 
     assert values["nt"] == "next time:"
     assert values["se"] == "subacute eczema"
+    assert values["D15645"] == "FEX7DL"
+    assert values["101823"] == "L6464646"
+    assert values["D35819"] == "B12282"
     assert values["zz"] == "custom"
     assert "mf" not in values
 

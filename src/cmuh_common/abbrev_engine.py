@@ -40,7 +40,7 @@ from cmuh_common.config_io import load_json_dict
 # -----------------------------------------------------------------------------
 # 預設 snippets（首次啟動自動寫入；不含 if，避免英文 "if " 誤觸）
 # -----------------------------------------------------------------------------
-ABBREV_CONFIG_SCHEMA_VERSION = 6  # [v6 2026-06-04] 補回 nt/se 預設；bump 觸發現有使用者自動修復
+ABBREV_CONFIG_SCHEMA_VERSION = 7  # [v7 2026-06-04] 補回指定醫師代碼預設縮寫；bump 觸發現有使用者自動修復
 MAX_ABBREV_LENGTH = 63
 
 DEFAULT_ITEMS: list[dict[str, str]] = [
@@ -48,6 +48,17 @@ DEFAULT_ITEMS: list[dict[str, str]] = [
     {"abbrev": "da",   "expansion": "da"},
     {"abbrev": "da1",  "expansion": "da1"},
     {"abbrev": "da2",  "expansion": "da2"},
+    {"abbrev": "D15645", "expansion": "FEX7DL"},
+    {"abbrev": "D15728", "expansion": "feng0930"},
+    {"abbrev": "D6175",  "expansion": "Aa383838"},
+    {"abbrev": "D20191", "expansion": "dtderm25"},
+    {"abbrev": "D28592", "expansion": "A10101010"},
+    {"abbrev": "D34899", "expansion": "s1993127"},
+    {"abbrev": "101823", "expansion": "L6464646"},
+    {"abbrev": "D31352", "expansion": "bb52313"},
+    {"abbrev": "101358", "expansion": "101aa358"},
+    {"abbrev": "D14355", "expansion": "a383838"},
+    {"abbrev": "D35819", "expansion": "B12282"},
     {"abbrev": "cbt",  "expansion": "check blood test"},
     {"abbrev": "ec",   "expansion": "epidermoid cyst"},
     {"abbrev": "mf",   "expansion": "medication and follow up"},
@@ -173,10 +184,15 @@ def _restore_requested_defaults(items: list[dict[str, str]]) -> bool:
     """Restore specific built-in abbreviations that disappeared from v5 configs.
 
     This is intentionally narrower than _add_missing_default_items: it fixes the
-    requested nt/se regression without bringing back every default a user may
-    have deliberately removed.
+    requested regressions/new defaults without bringing back every default a
+    user may have deliberately removed.
     """
-    restore_abbrevs = {"nt", "se"}
+    restore_abbrevs = {
+        "nt", "se",
+        "101358", "101823",
+        "d14355", "d15645", "d15728", "d20191", "d28592",
+        "d31352", "d34899", "d35819", "d6175",
+    }
     known = {
         str(it.get("abbrev", "")).strip().casefold()
         for it in items
