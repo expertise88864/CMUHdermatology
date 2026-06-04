@@ -1940,8 +1940,12 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
     # 寫回後實機 read 驗證 — Delphi onChange 可能 reformat 過
     actual_text = _read_tmemo_text(memo_hwnd)
     if actual_text:
-        from cmuh_common.uvb_dose import parse_uvb_line
-        verify = parse_uvb_line(actual_text)
+        from cmuh_common.uvb_dose import parse_uvb_line, parse_uvb_partial
+        # [2026-06-04] 處置「無日期」時 parse_uvb_line 會回 None(它要求 on (日期))，
+        # 但 update_uvb_in_text 是用 parse_uvb_partial 處理無日期 → 寫回後也無日期。
+        # verify 必須同樣容忍無日期(partial fallback)，否則「劑量其實已改」卻被誤判
+        # verify 失敗而中止、跳過 51019(沈冠宇實機 case: "UVB: 950 mj/cm2 (10)" 無日期)。
+        verify = parse_uvb_line(actual_text) or parse_uvb_partial(actual_text)
         if (verify is None
                 or verify.dose != result.new_dose
                 or verify.count != result.new_count):

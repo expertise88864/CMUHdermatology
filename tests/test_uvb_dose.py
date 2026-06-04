@@ -19,6 +19,7 @@ from cmuh_common.uvb_dose import (  # noqa: E402
     compute_new_dose,
     format_uvb_line,
     parse_uvb_line,
+    parse_uvb_partial,
     update_uvb_in_text,
 )
 
@@ -2007,3 +2008,27 @@ def test_excimer_on_same_line_as_uvb_updates_its_own_triplet():
     assert r.action == UvbAction.UPDATED
     assert "UVB: 550 mj/cm2 (5) on (2026/06/02)" in r.new_text
     assert "excimer light (28) 1000mJ for nape on (2026/06/02)" in r.new_text
+
+
+# ─── [2026-06-04] 無日期處置 寫回 verify round-trip (沈冠宇實機 case) ──────────
+# 處置 "UVB: 950 mj/cm2 (10) , add 50 each time, fixed at 1500" 無 "on (日期)"。
+# F2/F3 寫回後用 parse_uvb_line 驗證會回 None(它要求日期)→ 誤判 verify 失敗、中止、
+# 跳過 51019。修正:verify 改 parse_uvb_line(...) or parse_uvb_partial(...)。
+
+def test_dateless_note_updates_and_roundtrip_verifies():
+    note = "UVB: 900 mj/cm2 (9) , add 50 each time, fixed at 1500"
+    r = update_uvb_in_text(note, today=date(2026, 6, 4))
+    assert r.action == UvbAction.UPDATED
+    # 模擬 F2/F3 寫回後的 verify:必須能驗出新 dose/count(line 失敗時用 partial)
+    verify = parse_uvb_line(r.new_text) or parse_uvb_partial(r.new_text)
+    assert verify is not None, "無日期處置寫回後仍須能被解析(verify 才不會誤判失敗)"
+    assert verify.dose == r.new_dose
+    assert verify.count == r.new_count
+
+
+def test_dateless_note_parse_line_is_none_but_partial_ok():
+    """釐清:無日期時 parse_uvb_line 回 None,但 parse_uvb_partial 仍解得出。"""
+    note = "UVB: 950 mj/cm2 (10) , add 50 each time, fixed at 1500"
+    assert parse_uvb_line(note) is None
+    p = parse_uvb_partial(note)
+    assert p is not None and p.dose == 950 and p.count == 10
