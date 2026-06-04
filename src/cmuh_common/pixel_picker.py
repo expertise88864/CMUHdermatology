@@ -166,7 +166,6 @@ def pick_pixel(parent: tk.Misc, on_done: Callable[[int, int, int, int, int], Non
         y = event.y_root
         # 抓 RGB
         try:
-            from PIL import ImageGrab
             # 注意：在 destroy overlay 後再抓，否則會抓到 overlay 的暗色
             r, g, b = state["last_rgb"]
         except Exception:

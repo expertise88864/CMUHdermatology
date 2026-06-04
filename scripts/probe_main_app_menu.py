@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import ctypes
 import json
-import os
 import sys
 from ctypes import wintypes
 from pathlib import Path

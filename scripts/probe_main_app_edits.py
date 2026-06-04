@@ -138,7 +138,7 @@ def main() -> int:
             edits.append(it)
 
     print(f"=== Edit-like 控制項 ({len(edits)} 個) ===")
-    print(f"格式：hwnd | class | text | (left, top, w x h)")
+    print("格式：hwnd | class | text | (left, top, w x h)")
     print("-" * 90)
 
     # 依 y, x 排序（由上至下、由左至右）
@@ -155,7 +155,7 @@ def main() -> int:
 
     # 特別標出 text=="3" 的（療程欄目前值）
     print()
-    print(f"=== text == '3' 的（療程目前值）===")
+    print("=== text == '3' 的（療程目前值）===")
     threes = [it for it in edits if (it["text"] or "").strip() == "3"]
     if not threes:
         print("  找不到 text='3' 的欄位（療程可能不是 3 了？或不在 Edit-class 集合裡）")

@@ -15,7 +15,6 @@
 """
 from __future__ import annotations
 
-import os
 import shutil
 import sys
 from pathlib import Path
@@ -131,7 +130,7 @@ def step3_copy_repo(dst: Path) -> None:
                 shutil.rmtree(old_git, ignore_errors=True)
             shutil.move(str(dst_git), str(old_git))
         shutil.copytree(src_git, dst_git)
-        print(f"  [複製] .git/")
+        print("  [複製] .git/")
 
     print(f"  [統計] 複製 {copied} 個檔，跳過 {skipped} 個（受保護）")
 
@@ -151,10 +150,10 @@ def main(argv: list) -> int:
             return 0
         dst.mkdir(parents=True, exist_ok=True)
     else:
-        print(f"\n目標已存在；本工具會：")
-        print(f"  - 備份舊 .pyw 為 .pyw.OLD（保留你原本的程式碼以防萬一）")
-        print(f"  - 搬移 root config（doctors.json 等）到 settings/")
-        print(f"  - 複製本 repo 所有檔（保護 settings/ 不覆蓋）")
+        print("\n目標已存在；本工具會：")
+        print("  - 備份舊 .pyw 為 .pyw.OLD（保留你原本的程式碼以防萬一）")
+        print("  - 搬移 root config（doctors.json 等）到 settings/")
+        print("  - 複製本 repo 所有檔（保護 settings/ 不覆蓋）")
         if not confirm("\n繼續？"):
             print("[取消]")
             return 0
@@ -167,8 +166,8 @@ def main(argv: list) -> int:
     print("  搬移完成！")
     print("=" * 60)
     print(f"  下一步：cd \"{dst}\"")
-    print(f"          雙擊 中國醫皮膚科主程式.pyw 確認可正常啟動")
-    print(f"          確認 OK 後，C:\\Dev\\CMUHdermatology 就可以刪除了")
+    print("          雙擊 中國醫皮膚科主程式.pyw 確認可正常啟動")
+    print("          確認 OK 後，C:\\Dev\\CMUHdermatology 就可以刪除了")
     return 0
 
 

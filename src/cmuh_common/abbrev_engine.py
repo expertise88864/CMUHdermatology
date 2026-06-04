@@ -31,7 +31,7 @@ import time
 from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from cmuh_common.atomic_io import atomic_write_json
 from cmuh_common.config_io import load_json_dict

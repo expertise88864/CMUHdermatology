@@ -13,13 +13,12 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 # === cmuh_common 共用基底 ===
-from cmuh_common.version import CURRENT_VERSION, parse_version
+from cmuh_common.version import CURRENT_VERSION
 from cmuh_common.paths import (
-    get_app_dir, get_settings_dir, get_conf_path, restart_self, is_frozen,
+    get_app_dir, get_settings_dir, get_conf_path, restart_self,
 )
 from cmuh_common.process_launch import launch_app_script
 from cmuh_common.atomic_io import atomic_write_json as _atomic_write_json
-from cmuh_common.atomic_io import atomic_write_text
 from cmuh_common.config_io import load_json_dict, load_json_list
 from cmuh_common.app_settings import (
     load_auto_reboot_settings as _load_auto_reboot_settings,
@@ -55,11 +54,10 @@ from cmuh_common.clinic_history import (
     upsert_session_stat,
 )
 from cmuh_common.platform_win import (
-    is_admin, run_as_admin, set_dpi_awareness, set_app_user_model_id, get_idle_duration,
+    run_as_admin, set_dpi_awareness, set_app_user_model_id, get_idle_duration,
     get_virtual_screen_rect, get_primary_monitor_size, foreground_window_on_primary,
 )
 from cmuh_common.notifications import show_windows_notification
-from cmuh_common.icons import ensure_cmuh_app_icon_path as _ensure_cmuh_app_icon_path
 from cmuh_common.window_icon import apply_tk_window_icon as _apply_tk_window_icon
 from cmuh_common.logging_setup import attach_queue_handler
 from cmuh_common.bounded_executor import BoundedThreadPoolExecutor, RejectedExecutionError
@@ -74,7 +72,7 @@ from cmuh_common.hotkey_guardian import (
     should_show_busy_notice,
     system_idle_seconds,
 )
-from cmuh_common.http_client import INTERNAL_HOSTS, is_internal as _is_internal
+from cmuh_common.http_client import is_internal as _is_internal
 from cmuh_common.ui_messages import (
     UiStatusMessage, UiRefreshTickMessage, UiClinicDataMessage, UiMasterScheduleMessage,
     UiDutyDoctorMessage, UiSaturdayDutyDoctorMessage, UiTodayVsMessage, UiSaturdayVsMessage,
@@ -123,8 +121,6 @@ from cmuh_common.update_policy import AUTO_UPDATE_CHECK_TIMES  # noqa: E402
 
 
 # 【清理 2026-05-21】sys / os 已於檔首 import（line 7-8 為 sys.path 操作需要），這裡不重覆
-import subprocess
-import importlib
 import threading
 import time
 import tkinter as tk
@@ -142,10 +138,9 @@ from collections import defaultdict, deque
 from copy import deepcopy
 import hashlib
 from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, as_completed, wait
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta, time as dt_time
 from queue import Empty, Queue
-from typing import Any, NotRequired, TypedDict, TypeAlias, Union
+from typing import Any, NotRequired, TypedDict
 
 class DoctorConfig(TypedDict):
     name: str
@@ -251,8 +246,6 @@ def partition_doctors_for_refresh_batches(doctors):
 # 【重構 2026-05-21】抽到 cmuh_common.hotkey_scaling（main.py 也 import 同一份；
 # 原本 main.py 用 _scaled_xy 卻沒定義是 dangling reference / 潛在 NameError）
 from cmuh_common.hotkey_scaling import (  # noqa: E402
-    HOTKEY_SUPPORTED_RESOLUTIONS,
-    HOTKEY_ADAPTIVE_STATE,
     _HOTKEY_BASE_SIZE,
     configure_hotkey_scaling,
     _scaled_xy,
@@ -498,7 +491,7 @@ class F11PixelFrameCache:
 
 
 # 【重構 2026-05-21】抽到 cmuh_common.ui_utils（與 main.py 共用）
-from cmuh_common.ui_utils import manage_scrollbar, format_vertical_text  # noqa: E402
+from cmuh_common.ui_utils import format_vertical_text  # noqa: E402
 
 # --- 打卡狀態檢查 ---
 LOGIN_URL = "http://10.20.8.47/peoplesystem/electron_card/login.aspx"
@@ -513,7 +506,6 @@ LOCATORS = {
 }
 
 # 【重構 2026-05-21】抽到 cmuh_common.date_utils（與 main/autoclock 共用）
-from cmuh_common.date_utils import roc_to_gregorian_year, parse_roc_date_str  # noqa: E402
 
 def _initialize_status_driver():
     logging.info("Initializing headless WebDriver for status check...")

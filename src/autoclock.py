@@ -45,7 +45,6 @@ from pathlib import Path  # noqa: E402
 from tkinter import messagebox, scrolledtext, simpledialog, ttk  # noqa: E402
 
 import schedule  # noqa: E402
-from selenium import webdriver  # noqa: E402
 from selenium.common.exceptions import (  # noqa: E402
     StaleElementReferenceException, TimeoutException, WebDriverException,
 )

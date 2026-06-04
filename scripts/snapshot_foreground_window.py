@@ -148,7 +148,7 @@ def main() -> int:
     hmenu = user32.GetMenu(hwnd)
     menu_items = _dump_menu(hmenu) if hmenu else []
 
-    print(f"Enumerating descendants...")
+    print("Enumerating descendants...")
     descendants = _enum_descendants(hwnd)
     print(f"  Found {len(descendants)} descendants")
     print()
@@ -189,7 +189,7 @@ def main() -> int:
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print()
     print(f"✓ Snapshot saved to: {out_path}")
-    print(f"  Send this file content to Claude.")
+    print("  Send this file content to Claude.")
     return 0
 
 
