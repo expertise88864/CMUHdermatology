@@ -7,6 +7,7 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
+from cmuh_common import atomic_io as aio  # noqa: E402
 from cmuh_common.atomic_io import (  # noqa: E402
     atomic_write_json,
     atomic_write_text,
@@ -32,6 +33,30 @@ def test_atomic_write_json_creates_parent_dir_and_cleans_tmp():
         leftovers = [n for n in os.listdir(os.path.dirname(p))
                      if n.endswith(".tmp")]
         assert leftovers == []
+
+
+def test_atomic_write_json_retries_transient_replace_failure(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "data.json")
+        real_replace = aio.os.replace
+        calls = []
+        sleeps = []
+
+        def flaky_replace(src, dst):
+            calls.append((src, dst))
+            if len(calls) < 3:
+                raise PermissionError(5, "Access is denied", dst)
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(aio.os, "replace", flaky_replace)
+        monkeypatch.setattr(aio.time, "sleep", sleeps.append)
+
+        atomic_write_json(p, {"ok": True})
+
+        with open(p, encoding="utf-8") as f:
+            assert json.load(f) == {"ok": True}
+        assert len(calls) == 3
+        assert sleeps == list(aio._FILE_OP_RETRY_DELAYS_SEC[:2])
 
 
 def test_atomic_write_text_creates_bak():

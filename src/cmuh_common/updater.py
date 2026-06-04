@@ -84,6 +84,42 @@ class _WrittenFile:
     existed_before: bool
 
 
+_FILE_OP_RETRY_DELAYS_SEC = (0.05, 0.15, 0.35)
+
+
+def _file_op_with_retry(label: str, func, *args):
+    """Retry short-lived Windows file locks during update writes/rollback."""
+    last_exc = None
+    total_attempts = len(_FILE_OP_RETRY_DELAYS_SEC) + 1
+    for attempt in range(total_attempts):
+        try:
+            return func(*args)
+        except OSError as e:
+            last_exc = e
+            if attempt >= len(_FILE_OP_RETRY_DELAYS_SEC):
+                break
+            delay = _FILE_OP_RETRY_DELAYS_SEC[attempt]
+            logging.debug(
+                "[update] %s failed (%s), retry %d/%d in %.2fs",
+                label, e, attempt + 2, total_attempts, delay,
+            )
+            time.sleep(delay)
+    raise last_exc
+
+
+def _replace_file_with_retry(src: str, dst: str) -> None:
+    _file_op_with_retry(f"replace {src} -> {dst}", os.replace, src, dst)
+
+
+def _copy_file_with_retry(src: str, dst: str) -> None:
+    import shutil
+    _file_op_with_retry(f"copy {src} -> {dst}", shutil.copy2, src, dst)
+
+
+def _remove_file_with_retry(path: str) -> None:
+    _file_op_with_retry(f"remove {path}", os.remove, path)
+
+
 def _resolve_target_path(app_dir: str, local_filename: str) -> str:
     """Resolve a manifest target while keeping writes inside the app directory."""
     if not isinstance(local_filename, str) or not local_filename.strip():
@@ -113,9 +149,9 @@ def _rollback_written_files(written_files: list[_WrittenFile]) -> list[str]:
                 backup_path = written.target_path + ".bak"
                 if not os.path.exists(backup_path):
                     raise FileNotFoundError(f"找不到備份: {backup_path}")
-                os.replace(backup_path, written.target_path)
+                _replace_file_with_retry(backup_path, written.target_path)
             elif os.path.exists(written.target_path):
-                os.remove(written.target_path)
+                _remove_file_with_retry(written.target_path)
         except Exception as e:
             logging.error("更新回滾失敗 [%s]: %s", written.target_path, e)
             errors.append(f"[rollback] {written.target_path}: {e}")
@@ -507,7 +543,6 @@ def check_and_update(
     # 比原本逐檔 atomic_write_text 更安全：把最可能失敗的「寫內容/fsync」(磁碟滿、
     # AV 鎖檔)全部擋在任何 os.replace 之前。
     import tempfile
-    import shutil
 
     staged: list = []  # (tmp, target, existed_before, key, local_filename, new_ver)
     for key, local_filename, new_ver, content, target_path in prepared_writes:
@@ -543,8 +578,8 @@ def check_and_update(
     for tmp_path, target_path, existed_before, key, local_filename, new_ver in staged:
         try:
             if existed_before:
-                shutil.copy2(target_path, target_path + ".bak")
-            os.replace(tmp_path, target_path)
+                _copy_file_with_retry(target_path, target_path + ".bak")
+            _replace_file_with_retry(tmp_path, target_path)
             result.updated_files.append((local_filename, new_ver))
             written_files.append(_WrittenFile(target_path, existed_before))
             logging.info("  ✅ 已更新 %s -> v%s", local_filename, new_ver)

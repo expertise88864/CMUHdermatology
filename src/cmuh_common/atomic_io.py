@@ -12,6 +12,42 @@ import tempfile
 import time
 
 
+_FILE_OP_RETRY_DELAYS_SEC = (0.05, 0.15, 0.35)
+
+
+def _file_op_with_retry(label: str, func, *args):
+    """Retry transient Windows file locks for small atomic file operations."""
+    last_exc = None
+    total_attempts = len(_FILE_OP_RETRY_DELAYS_SEC) + 1
+    for attempt in range(total_attempts):
+        try:
+            return func(*args)
+        except OSError as e:
+            last_exc = e
+            if attempt >= len(_FILE_OP_RETRY_DELAYS_SEC):
+                break
+            delay = _FILE_OP_RETRY_DELAYS_SEC[attempt]
+            logging.debug(
+                "[atomic_io] %s failed (%s), retry %d/%d in %.2fs",
+                label, e, attempt + 2, total_attempts, delay,
+            )
+            time.sleep(delay)
+    raise last_exc
+
+
+def _replace_with_retry(src: str, dst: str) -> None:
+    _file_op_with_retry(f"replace {src} -> {dst}", os.replace, src, dst)
+
+
+def _copy2_with_retry(src: str, dst: str) -> None:
+    import shutil
+    _file_op_with_retry(f"copy {src} -> {dst}", shutil.copy2, src, dst)
+
+
+def _remove_with_retry(path: str) -> None:
+    _file_op_with_retry(f"remove {path}", os.remove, path)
+
+
 def _flush_and_fsync(f) -> None:
     """Flush file content to disk before os.replace."""
     f.flush()
@@ -47,7 +83,7 @@ def atomic_write_json(file_path: str, data, **kwargs) -> None:
             fd = -1
             json.dump(data, f, **dump_kwargs)
             _flush_and_fsync(f)
-        os.replace(tmp_path, file_path)
+        _replace_with_retry(tmp_path, file_path)
     except Exception:
         if fd >= 0:
             try:
@@ -56,7 +92,7 @@ def atomic_write_json(file_path: str, data, **kwargs) -> None:
                 pass
         if tmp_path and os.path.exists(tmp_path):
             try:
-                os.remove(tmp_path)
+                _remove_with_retry(tmp_path)
             except Exception:
                 logging.debug("atomic_write_json: 移除 tmp 失敗", exc_info=True)
         raise
@@ -91,7 +127,7 @@ def safe_load_json(file_path: str, default=None, *,
             try:
                 ts = time.strftime("%Y%m%d_%H%M%S")
                 bak = _next_corrupt_backup_path(file_path, ts)
-                os.replace(file_path, bak)
+                _replace_with_retry(file_path, bak)
                 logging.warning("[safe_load_json] 已 backup 壞檔到 %s", bak)
             except Exception:
                 logging.debug("[safe_load_json] backup 壞檔失敗", exc_info=True)
@@ -108,8 +144,6 @@ def atomic_write_text(file_path: str, content: str, encoding: str = 'utf-8') -> 
     """文字檔原子寫入（含 .bak 備份）。
     搬自原主程式 _safe_write (line 8650-8670)，用於線上更新覆寫程式碼檔。
     """
-    import shutil
-
     backup = file_path + '.bak'
     fd = -1
     tmp = ""
@@ -117,13 +151,13 @@ def atomic_write_text(file_path: str, content: str, encoding: str = 'utf-8') -> 
         target_dir = os.path.dirname(file_path) or '.'
         os.makedirs(target_dir, exist_ok=True)
         if os.path.exists(file_path):
-            shutil.copy2(file_path, backup)
+            _copy2_with_retry(file_path, backup)
         fd, tmp = _make_temp_path(file_path)
         with os.fdopen(fd, 'w', encoding=encoding) as f:
             fd = -1
             f.write(content)
             _flush_and_fsync(f)
-        os.replace(tmp, file_path)
+        _replace_with_retry(tmp, file_path)
         return True
     except Exception as e:
         logging.error("atomic_write_text 失敗 [%s]: %s", file_path, e)
@@ -134,7 +168,7 @@ def atomic_write_text(file_path: str, content: str, encoding: str = 'utf-8') -> 
                 pass
         if tmp and os.path.exists(tmp):
             try:
-                os.remove(tmp)
+                _remove_with_retry(tmp)
             except OSError:
                 logging.debug("移除 tmp 失敗", exc_info=True)
         return False

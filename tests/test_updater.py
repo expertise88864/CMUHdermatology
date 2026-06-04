@@ -309,6 +309,33 @@ def test_rollback_written_files_restores_existing_and_removes_new(tmp_path):
     assert not created.exists()
 
 
+def test_replace_file_with_retry_survives_transient_access_denied(
+    tmp_path, monkeypatch
+):
+    src = tmp_path / "new.py"
+    dst = tmp_path / "target.py"
+    src.write_text("new", encoding="utf-8")
+    dst.write_text("old", encoding="utf-8")
+    real_replace = updater.os.replace
+    calls = []
+    sleeps = []
+
+    def flaky_replace(src_arg, dst_arg):
+        calls.append((src_arg, dst_arg))
+        if len(calls) < 3:
+            raise PermissionError(5, "Access is denied", str(dst_arg))
+        return real_replace(src_arg, dst_arg)
+
+    monkeypatch.setattr(updater.os, "replace", flaky_replace)
+    monkeypatch.setattr(updater.time, "sleep", sleeps.append)
+
+    updater._replace_file_with_retry(str(src), str(dst))
+
+    assert dst.read_text(encoding="utf-8") == "new"
+    assert len(calls) == 3
+    assert sleeps == list(updater._FILE_OP_RETRY_DELAYS_SEC[:2])
+
+
 def test_check_and_update_rolls_back_batch_when_later_write_fails(
     tmp_path, monkeypatch
 ):
