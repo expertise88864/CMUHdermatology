@@ -60,11 +60,12 @@ logging.info("=== coord_detector v%s 啟動 ===", CURRENT_VERSION)
 def _check_update_in_background() -> None:
     """非阻塞檢查線上更新（失敗時不影響主流程）。"""
     try:
-        from cmuh_common.updater import check_and_update, need_restart_after_update, perform_restart
+        from cmuh_common.paths import restart_self
+        from cmuh_common.updater import check_and_update, need_restart_after_update
         result = check_and_update()
         if need_restart_after_update(result):
             logging.info("座標偵測程式偵測到新版，將重啟…")
-            perform_restart()
+            restart_self(hard_exit_code=1)
     except Exception:
         logging.debug("背景更新檢查失敗（不影響主流程）", exc_info=True)
 

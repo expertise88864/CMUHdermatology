@@ -404,6 +404,20 @@ def test_format_normalizes_date_to_zero_padded():
     assert "(2026/07/04)" in new_line
 
 
+def test_format_fallback_replaces_bare_date_without_date_text():
+    """Fallback path uses real word boundaries, not a backspace control char."""
+    info = UvbLineInfo(
+        full_match="UVB 520 (11) on 2026/5/6, increase 30, MAX:800",
+        dose=520, count=11, last_date=date(2026, 5, 6),
+        increase=30, max_dose=800,
+        span=(0, 0),
+    )
+    new_line = format_uvb_line(info, new_dose=550, new_count=12,
+                               today=date(2026, 7, 4))
+    assert "2026/07/04" in new_line
+    assert "2026/5/6" not in new_line
+
+
 # ─── update_uvb_in_text: 端對端 ──────────────────────────────────────────
 
 def test_update_normal_case_2_to_6_days_increases():
@@ -1784,7 +1798,7 @@ def test_uv_shorthand_word_boundary():
     text_uva = "UVA 800 each session"  # UVA - "A" 是 word char 連 V 後沒 boundary
     info = parse_uvb_line(text_uva)
     # UVA 不該被當成 UVB/UV — dose regex 雖然找 UV 開頭可能誤抓
-    # 但 lower keyword 檢查用 uv — UVA 沒這個 word boundary 所以早 return
+    # 但 lower keyword 檢查用 \buv\b — UVA 沒這個 word boundary 所以早 return
     assert info is None
 
 

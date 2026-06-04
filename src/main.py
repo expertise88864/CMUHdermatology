@@ -2895,20 +2895,34 @@ def _find_卡號_edit_hwnd(main_hwnd: int) -> int:
     return 卡號
 
 
-def _f11_ensure_ic_card(main_hwnd: int, label: str = "F11") -> None:
+def _f11_normalize_card_value(raw_value: str) -> str:
+    value = str(raw_value or "").strip().upper()
+    if not value:
+        return ""
+    return value.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+
+
+def _f11_card_allows_finish_all(card_value: str) -> bool:
+    value = _f11_normalize_card_value(card_value)
+    return bool(value) and (any(ch.isdigit() for ch in value)
+                            or value.startswith(("V", "Ｖ"))
+                            or value == "IC")
+
+
+def _f11_ensure_ic_card(main_hwnd: int, label: str = "F11") -> str:
     """[全部完成前] 卡號欄空白 → 自動輸入 'IC'（不按 Enter）；按下「全部完成」後
     系統會自動讀健保卡並填入就醫序號。卡號欄已有值(數字 / IC.. 等) → 不動。
 
-    全程 best-effort：找不到欄位 / 讀不到 / 任何例外 → 直接跳過，不阻擋全部完成。
+    回傳目前卡號欄值；找不到欄位 / 讀不到 / 任何例外 → 回傳空字串。
     安全紅線：只有『讀到確定空白』才輸入 IC，避免把 IC 打進已有號碼的欄位。"""
     try:
         ka = _find_卡號_edit_hwnd(main_hwnd)
         if not ka:
-            return
-        cur = _read_edit_text(ka).strip()
+            return ""
+        cur = _f11_normalize_card_value(_read_edit_text(ka))
         if cur:
-            logging.info("[%s] 卡號欄已有值 %r → 不補 IC，直接完成", label, cur)
-            return
+            logging.info("[%s] 卡號欄已有值 %r → 不補 IC", label, cur)
+            return cur
         logging.info("[%s] 卡號欄空白 → 自動輸入 IC（全部完成後系統讀卡）", label)
         # 模擬點擊讓 Delphi 聚焦該欄(不動實體滑鼠)，再逐字 WM_CHAR 輸入 'I','C'。
         _post_click_to_control(ka)
@@ -2917,16 +2931,18 @@ def _f11_ensure_ic_card(main_hwnd: int, label: str = "F11") -> None:
             ctypes.windll.user32.PostMessageW(ka, _WM_CHAR, ord(ch), 0)
             time.sleep(0.05)
         time.sleep(0.2)
-        after = _read_edit_text(ka).strip().upper()
+        after = _f11_normalize_card_value(_read_edit_text(ka))
         if after == "IC":
             logging.info("[%s] 卡號欄已輸入 IC（驗證通過）", label)
         else:
             logging.warning(
-                "[%s] 補 IC 後卡號欄=%r（預期 IC）→ 仍照常按全部完成，請醫師留意卡號",
+                "[%s] 補 IC 後卡號欄=%r（預期 IC），請醫師留意卡號",
                 label, after)
+        return after
     except Exception:
-        logging.warning("[%s] 自動補 IC 例外，跳過（不影響全部完成）", label,
+        logging.warning("[%s] 自動補 IC / 讀卡號例外", label,
                         exc_info=True)
+        return ""
 
 
 def _dump_menu_tree(main_hwnd: int) -> None:
@@ -3002,8 +3018,76 @@ def _find_menu_command_id_by_text(main_hwnd: int, target_text: str) -> int:
 MENU_ID_FINISH_NO_PRINT = 276  # 完成 > 完成不印；automation_ui.log 2026-06-04 top[4].sub[1]
 
 
+def _f11_normalize_course_value(raw_value: str) -> str:
+    """Return the normalized 療程 value used by F11 route selection."""
+    value = str(raw_value or "").strip()
+    if not value:
+        return ""
+    return value.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+
+
+def _f11_read_course_value(main_hwnd: int, label: str = "F11") -> str:
+    try:
+        course_hwnd = _find_療程_edit_hwnd(main_hwnd)
+        if not course_hwnd:
+            logging.info("[%s] 找不到療程欄，F11 走「全部完成」路徑", label)
+            return ""
+        course_value = _f11_normalize_course_value(_read_tmemo_text(course_hwnd))
+        logging.info("[%s] 讀到療程=%r", label, course_value or "(空白)")
+        return course_value
+    except Exception:
+        logging.debug("[%s] 讀療程欄失敗，F11 走「全部完成」路徑", label, exc_info=True)
+        return ""
+
+
+def _f11_send_finish_no_print(main_hwnd: int, course_value: str,
+                              label: str, started_at: float) -> bool:
+    """F11 route A: phototherapy course 2/3 -> 完成不印, then same popup flow."""
+    cmd_id = MENU_ID_FINISH_NO_PRINT
+    sent = _send_yiling_menu_command(main_hwnd, cmd_id)
+    if not sent:
+        dynamic_id = _find_menu_command_id_by_text(main_hwnd, "完成不印")
+        if dynamic_id and dynamic_id != cmd_id:
+            logging.warning("[%s] 完成不印 hardcoded id=%s 送出失敗，改用動態 id=%s",
+                            label, cmd_id, dynamic_id)
+            cmd_id = dynamic_id
+            sent = _send_yiling_menu_command(main_hwnd, cmd_id)
+    if sent:
+        logging.info("[%s][timeline] route=完成不印 療程=%s → 已送 menu id=%s "
+                     "(+%.0fms total)",
+                     label, course_value, cmd_id, (time.time() - started_at) * 1000)
+        return True
+    logging.error("[%s] 療程=%s 但「完成不印」menu 找不到/送出失敗；"
+                  "照光病人不改按 全部完成，以免印出繳費單",
+                  label, course_value)
+    return False
+
+
+def _f11_click_finish_all(main_hwnd: int, course_value: str,
+                          label: str, started_at: float) -> bool:
+    """F11 route B: non-phototherapy course -> verify 卡號, then 全部完成."""
+    card_value = _f11_ensure_ic_card(main_hwnd, label=label)
+    if not _f11_card_allows_finish_all(card_value):
+        logging.warning("[%s] 療程=%s 但卡號=%r，不按 全部完成",
+                        label, course_value or "(空白/未知)", card_value)
+        return False
+
+    btns = _find_descendants_by_exact_text(main_hwnd, "TButton", "全部完成")
+    logging.info("[%s][timeline] route=全部完成 療程=%s 卡號=%s，找到 button: %d 個 "
+                 "(+%.0fms total)",
+                 label, course_value or "(空白/未知)", card_value, len(btns),
+                 (time.time() - started_at) * 1000)
+    if not btns:
+        logging.warning("[%s] 找不到 全部完成 button", label)
+        return False
+    _post_click_to_control(btns[0][0])
+    logging.info("[%s][timeline] PostMessage 全部完成 click 完成 (hwnd=%s)，"
+                 "sleep 0.5s 給 app settle", label, btns[0][0])
+    return True
+
+
 def _f11_快速完成_main(label: str = "F11") -> bool:
-    """F11 主流程：點 全部完成 → 輪詢任意順序 popup。
+    """F11 主流程：依療程選擇完成路徑 → 輪詢任意順序 popup。
 
     [2026-05-22 v40] 加 timing log 全程診斷 user 報告的「西醫門診系統當機卡死」。
     每個關鍵點都打 timestamp，跑一次後查 log 看是哪一步觸發 freeze。
@@ -3016,47 +3100,17 @@ def _f11_快速完成_main(label: str = "F11") -> bool:
     logging.info("[%s][timeline] 找到 main_hwnd=%s (+%.0fms)",
                   label, main_hwnd, (time.time() - t_f11_start) * 1000)
 
-    # Step 0: 卡號欄空白 → 自動補 IC（按下全部完成後系統會自動讀健保卡）。
-    # best-effort：任何不確定都跳過、照常往下按全部完成。
-    _f11_ensure_ic_card(main_hwnd, label=label)
-
-    # Step 1: 完成。[2026-06-04] 照光病人(療程=2 或 3) → 改用「完成不印」menu
-    # (不印繳費單)；其餘照舊點「全部完成」TButton。若照光病人找不到「完成不印」，
-    # 直接停止，避免 fallback 成會印繳費單的「全部完成」。
-    療程_val = ""
-    try:
-        _lc_hwnd = _find_療程_edit_hwnd(main_hwnd)
-        if _lc_hwnd:
-            療程_val = (_read_tmemo_text(_lc_hwnd) or "").strip()
-    except Exception:
-        logging.debug("[%s] 讀療程欄失敗，照常全部完成", label, exc_info=True)
-
-    completed = False
-    if 療程_val in ("2", "3"):
-        cmd_id = MENU_ID_FINISH_NO_PRINT
-        if cmd_id and _send_yiling_menu_command(main_hwnd, cmd_id):
-            logging.info("[%s][timeline] 療程=%s(照光) → 已送「完成不印」menu "
-                          "(id=%s，不印繳費單) (+%.0fms total)",
-                          label, 療程_val, cmd_id,
-                          (time.time() - t_f11_start) * 1000)
-            completed = True
-        else:
-            logging.error("[%s] 療程=%s 但「完成不印」menu 找不到/送出失敗；"
-                          "照光病人不改按 全部完成，以免印出繳費單",
-                          label, 療程_val)
+    # Step 1: 完成路徑分流。
+    #   Route A: 療程=2/3（照光）→ 完成不印，不按「全部完成」。
+    #   Route B: 療程不是 2/3 或讀不到 → 讀卡號；空白補 IC；可完成才按全部完成。
+    # 兩條路徑送出完成動作後，都進同一套 popup watcher。
+    course_value = _f11_read_course_value(main_hwnd, label=label)
+    if course_value in ("2", "3"):
+        if not _f11_send_finish_no_print(main_hwnd, course_value, label, t_f11_start):
             return False
-
-    if not completed:
-        btns = _find_descendants_by_exact_text(main_hwnd, "TButton", "全部完成")
-        logging.info("[%s][timeline] 找 全部完成 button: %d 個 (+%.0fms total)%s",
-                      label, len(btns), (time.time() - t_f11_start) * 1000,
-                      f"（療程={療程_val}）" if 療程_val else "")
-        if not btns:
-            logging.warning("[%s] 找不到 全部完成 button", label)
+    else:
+        if not _f11_click_finish_all(main_hwnd, course_value, label, t_f11_start):
             return False
-        _post_click_to_control(btns[0][0])
-        logging.info("[%s][timeline] PostMessage 全部完成 click 完成 (hwnd=%s)，"
-                      "sleep 0.5s 給 app settle", label, btns[0][0])
 
     # [2026-05-22 v40] 退回 v39 的 2s → 0.5s。實測 2s 沒解決「卡死」(因為卡死是
     # 醫院 app 自己在處理 server roundtrip，跟我們 polling 無關)，反而拖慢

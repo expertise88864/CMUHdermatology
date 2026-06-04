@@ -589,7 +589,7 @@ def format_uvb_line(original: UvbLineInfo, *, new_dose: int,
             count=1,
         )
     else:
-        bare_re = rf"{old_y}([/-])0?{old_m}([/-])0?{old_d}"
+        bare_re = rf"\b{old_y}([/-])0?{old_m}([/-])0?{old_d}\b"
         src = re.sub(
             bare_re,
             lambda mo: _date_text(today, mo.group(1)),

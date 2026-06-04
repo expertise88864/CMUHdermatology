@@ -124,14 +124,39 @@ def test_restart_program_releases_mutex_before_respawn(monkeypatch):
     monkeypatch.setattr(autoclock, "tray_icon_object", None)
     monkeypatch.setattr(autoclock, "release_single_instance",
                         lambda: calls.append("release"))
-    monkeypatch.setattr(autoclock, "restart_self",
-                        lambda extra: calls.append(("restart", extra)))
+    monkeypatch.setattr(
+        autoclock,
+        "restart_self",
+        lambda extra, hard_exit_code=None:
+            calls.append(("restart", extra, hard_exit_code)),
+    )
     monkeypatch.setattr(sys, "argv", ["autoclock.py", "--configure"])
     autoclock.running.set()
 
     autoclock.restart_program()
 
-    assert calls == ["release", ("restart", [])]
+    assert calls == ["release", ("restart", [], None)]
+    assert not autoclock.running.is_set()
+
+
+def test_restart_program_passes_hard_exit_code_for_background_restart(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(autoclock, "tray_icon_object", None)
+    monkeypatch.setattr(autoclock, "release_single_instance",
+                        lambda: calls.append("release"))
+    monkeypatch.setattr(
+        autoclock,
+        "restart_self",
+        lambda extra, hard_exit_code=None:
+            calls.append(("restart", extra, hard_exit_code)),
+    )
+    monkeypatch.setattr(sys, "argv", ["autoclock.py"])
+    autoclock.running.set()
+
+    autoclock.restart_program(hard_exit_code=1)
+
+    assert calls == ["release", ("restart", [], 1)]
     assert not autoclock.running.is_set()
 
 

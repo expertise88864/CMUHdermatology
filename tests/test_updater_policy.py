@@ -17,9 +17,15 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_background_helpers_restart_immediately_after_update():
     autoclock_src = (ROOT / "src" / "autoclock.py").read_text(encoding="utf-8")
     consult_src = (ROOT / "src" / "consult_query.py").read_text(encoding="utf-8")
+    coord_src = (ROOT / "src" / "coord_detector.py").read_text(encoding="utf-8")
 
     assert "打卡程式偵測到新版，立即重新啟動" in autoclock_src
-    assert "restart_program()" in autoclock_src
+    assert "restart_program(hard_exit_code=1)" in autoclock_src
+
+    # 背景 thread 不能走 restart_self() 的預設 sys.exit 路徑，否則只會結束
+    # 該 thread；要明確傳 hard_exit_code 讓整個 process 結束。
+    assert "座標偵測程式偵測到新版，將重啟" in coord_src
+    assert "restart_self(hard_exit_code=1)" in coord_src
 
     # [2026-06-03] 會診查詢：背景 daemon thread 偵測到新版後只「標記重啟 + 收掉托盤」，
     # 實際 restart_self 由 main thread 在 tray run() 返回後執行。若回到舊版「在 daemon

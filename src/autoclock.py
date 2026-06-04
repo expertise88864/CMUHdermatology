@@ -1053,7 +1053,7 @@ def _check_update_in_background() -> None:
         result = check_and_update()
         if need_restart_after_update(result):
             logging.info("打卡程式偵測到新版，立即重新啟動")
-            restart_program()
+            restart_program(hard_exit_code=1)
     except Exception:
         logging.debug("打卡程式背景更新檢查失敗", exc_info=True)
 
@@ -1262,7 +1262,7 @@ def toggle_console(icon=None, item=None):
             win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
 
 
-def restart_program(args_add=None) -> None:
+def restart_program(args_add=None, hard_exit_code=None) -> None:
     """[修正] 改用 cmuh_common.paths.restart_self 雙軌相容。"""
     global tray_icon_object
     running.clear()
@@ -1288,7 +1288,7 @@ def restart_program(args_add=None) -> None:
             extra.append(a)
     if args_add:
         extra.append(args_add)
-    restart_self(extra)
+    restart_self(extra, hard_exit_code=hard_exit_code)
 
 
 def exit_action(icon=None, item=None) -> None:
