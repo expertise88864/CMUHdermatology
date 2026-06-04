@@ -2929,11 +2929,42 @@ def _f11_ensure_ic_card(main_hwnd: int, label: str = "F11") -> None:
                         exc_info=True)
 
 
+def _dump_menu_tree(main_hwnd: int) -> None:
+    """[diagnostic] 把主視窗 menu bar 各子選單項目(text + command id + ownerdraw)印到
+    log。HIS 選單是 Delphi owner-drawn 時 GetMenuStringW 抓不到文字，需靠 id+位置對照。"""
+    user32 = ctypes.windll.user32
+    MF_BYPOSITION = 0x400
+    MF_OWNERDRAW = 0x100
+    try:
+        hmenu = user32.GetMenu(main_hwnd)
+        if not hmenu:
+            logging.warning("[menu][dump] GetMenu 回 0 — 主視窗無 menu bar?")
+            return
+        top_n = user32.GetMenuItemCount(hmenu)
+        logging.info("[menu][dump] menu bar 共 %d 個頂層項目 (hmenu=%s)", top_n, hmenu)
+        for i in range(top_n):
+            tbuf = ctypes.create_unicode_buffer(256)
+            user32.GetMenuStringW(hmenu, i, tbuf, 256, MF_BYPOSITION)
+            sub = user32.GetSubMenu(hmenu, i)
+            logging.info("[menu][dump] top[%d] text=%r 有子選單=%s", i, tbuf.value, bool(sub))
+            if not sub:
+                continue
+            for j in range(user32.GetMenuItemCount(sub)):
+                sbuf = ctypes.create_unicode_buffer(256)
+                slen = user32.GetMenuStringW(sub, j, sbuf, 256, MF_BYPOSITION)
+                cid = int(user32.GetMenuItemID(sub, j))
+                od = bool(int(user32.GetMenuState(sub, j, MF_BYPOSITION)) & MF_OWNERDRAW)
+                logging.info("[menu][dump]    top[%d].sub[%d] id=%s ownerdraw=%s "
+                             "textlen=%d text=%r", i, j, cid, od, slen, sbuf.value)
+    except Exception:
+        logging.debug("[menu][dump] 例外", exc_info=True)
+
+
 def _find_menu_command_id_by_text(main_hwnd: int, target_text: str) -> int:
     """走主視窗 menu bar → 各子選單，找文字含 target_text 的項目，回其 WM_COMMAND id。
 
     [2026-06-04] 用 Win32 menu API 依「文字」動態解析(不寫死 id)，比 hardcode 穩。
-    找不到回 0。掃描時 log 各子選單項目，方便 owner-draw menu 抓不到文字時 debug。
+    找不到回 0，並 dump 整個選單樹到 log(owner-draw menu 抓不到文字時靠這對照 id)。
     """
     user32 = ctypes.windll.user32
     target = target_text.replace(" ", "")
@@ -2959,7 +2990,9 @@ def _find_menu_command_id_by_text(main_hwnd: int, target_text: str) -> int:
                         logging.info("[menu] 找到 '%s' → command id=%s",
                                      txt.strip(), cmd_id)
                         return cmd_id
-        logging.warning("[menu] 選單中找不到含 '%s' 的項目", target_text)
+        logging.warning("[menu] 選單中找不到含 '%s' 的項目 → dump 選單樹供對照",
+                        target_text)
+        _dump_menu_tree(main_hwnd)
         return 0
     except Exception:
         logging.debug("[menu] _find_menu_command_id_by_text 例外", exc_info=True)
