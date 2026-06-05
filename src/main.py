@@ -11048,6 +11048,9 @@ class AutomationApp:
     def run_subsystem_in_thread(self, func, hotkey_name):
         is_busy = False
         show_busy_notice = False
+        # 僅在 else 分支(非忙碌)會被覆寫；忙碌時提前 return 不會用到。
+        # 預先綁定以消除靜態分析的 possibly-unbound 雜訊（行為不變）。
+        subsystem_token = 0
         with self._subsystem_lock:
             if self._subsystem_running:
                 is_busy = True

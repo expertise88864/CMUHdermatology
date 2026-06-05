@@ -78,6 +78,10 @@ try:
     import win32gui  # type: ignore[import-not-found]  # noqa: E402
     WINDOWS_API_AVAILABLE = True
 except ImportError:
+    # 綁成 None（而非完全不綁）：所有使用處都有 WINDOWS_API_AVAILABLE 守衛，不會真的
+    # 用到；但讓名稱無條件 bound，未來若有人漏加守衛也是清楚的 AttributeError 而非
+    # NameError，且消除靜態分析的 possibly-unbound 雜訊。
+    win32con = win32console = win32gui = None  # type: ignore[assignment]
     WINDOWS_API_AVAILABLE = False
 
 # =============================================================================
