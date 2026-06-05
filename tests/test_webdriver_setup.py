@@ -52,3 +52,74 @@ def test_write_disk_cache_uses_shared_atomic_json_writer(monkeypatch, tmp_path):
         }),
         {"indent": 2},
     )]
+
+
+def test_initialize_driver_retries_once_after_failure(monkeypatch):
+    """第 1 次建立失敗（如 Chrome 更新後版本不合）→ 清快取 → 第 2 次重抓重試成功。"""
+    import selenium.webdriver as real_webdriver
+    import selenium.webdriver.chrome.service as svc_mod
+
+    get_path_calls = []
+    invalidated = []
+    monkeypatch.setattr(
+        ws, "get_chromedriver_path",
+        lambda: get_path_calls.append(1) or "C:/cd/chromedriver.exe")
+    monkeypatch.setattr(ws, "build_chrome_options", lambda headless=True: object())
+    monkeypatch.setattr(
+        ws, "_invalidate_chromedriver_cache", lambda: invalidated.append(1))
+
+    class _FakeService:
+        def __init__(self, path):
+            self.path = path
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(svc_mod, "Service", _FakeService)
+
+    sentinel_driver = object()
+    chrome_calls = []
+
+    def _fake_chrome(service, options):
+        chrome_calls.append(1)
+        if len(chrome_calls) == 1:
+            raise RuntimeError("SessionNotCreated: chromedriver/chrome version mismatch")
+        return sentinel_driver
+
+    monkeypatch.setattr(real_webdriver, "Chrome", _fake_chrome)
+
+    result = ws.initialize_driver(headless=True)
+
+    assert result is sentinel_driver          # 第 2 次成功
+    assert len(chrome_calls) == 2             # 重試了一次
+    assert len(invalidated) == 1             # 第 1 次失敗清了快取
+    assert len(get_path_calls) == 2          # 第 2 次重抓 driver 路徑
+
+
+def test_initialize_driver_returns_none_after_two_failures(monkeypatch):
+    """連兩次都失敗 → 回 None（不無限重試），且兩次都清快取。"""
+    import selenium.webdriver as real_webdriver
+    import selenium.webdriver.chrome.service as svc_mod
+
+    invalidated = []
+    monkeypatch.setattr(ws, "get_chromedriver_path", lambda: "C:/cd/chromedriver.exe")
+    monkeypatch.setattr(ws, "build_chrome_options", lambda headless=True: object())
+    monkeypatch.setattr(
+        ws, "_invalidate_chromedriver_cache", lambda: invalidated.append(1))
+
+    class _FakeService:
+        def __init__(self, path):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(svc_mod, "Service", _FakeService)
+
+    def _always_fail(service, options):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(real_webdriver, "Chrome", _always_fail)
+
+    assert ws.initialize_driver(headless=True) is None
+    assert len(invalidated) == 2

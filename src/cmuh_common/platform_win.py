@@ -110,12 +110,20 @@ def _admin_relaunch_params(argv=None) -> str:
 
 
 def set_dpi_awareness() -> None:
-    """讓視窗在高 DPI 螢幕上不模糊。"""
+    """設定 DPI 感知為「系統層級」(System-DPI-aware)。
+
+    [2026-06-05] 由 per-monitor(2) 改為 system(1)。原因:本套件 UI 走 Tkinter,而 Tk
+    不會處理 WM_DPICHANGED —— 在 per-monitor 模式下,視窗被搬到「與主螢幕不同 DPI」的
+    副螢幕時不會重新縮放,版面就會跑掉(家用 4K 主 + HD 副最明顯)。改成 system-aware
+    後,Windows 會自動 bitmap 縮放整個視窗到副螢幕的 DPI(略軟但版面正確不破)。
+    主螢幕的實體像素座標在兩種模式下相同,故 F 鍵座標式自動化不受影響;診間若是兩個
+    同解析度 HD 螢幕則完全無差異。
+    """
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         try:
-            ctypes.windll.user32.SetProcessDPIAware()
+            ctypes.windll.user32.SetProcessDPIAware()  # 舊 API,等效 system-aware
         except Exception:
             pass
 

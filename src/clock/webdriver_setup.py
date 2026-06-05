@@ -144,27 +144,43 @@ def initialize_driver(headless: bool = True):
     """初始化 selenium Chrome WebDriver。失敗回 None（呼叫端自行處理）。
 
     【穩定性 2026-05-21】失敗時清快取，避免 AV 隔離 chromedriver 後永久 fail。
+    【韌性 2026-06-05】同一次呼叫內最多試 2 次：Chrome 自動更新導致 chromedriver
+    版本不合（SessionNotCreated）時，第 1 次失敗會清快取，第 2 次 get_chromedriver_path()
+    自動重新偵測 Chrome 版本並重抓相符的 driver 再試 → 多數「版本不合 / driver 被 AV
+    隔離」可在同一次呼叫內自我修復，不必等下一次呼叫才好。
     """
     try:
         from selenium import webdriver  # type: ignore[import-not-found]
         from selenium.webdriver.chrome.service import Service  # type: ignore[import-not-found]
+    except Exception as e:
+        logging.exception("初始化 WebDriver 失敗（import selenium）: %s", e)
+        return None
 
-        logging.info("初始化 WebDriver (Headless=%s)...", headless)
-        service = Service(get_chromedriver_path())
+    last_error: Exception | None = None
+    for attempt in range(2):
+        service = None
         try:
+            logging.info("初始化 WebDriver (Headless=%s, 第 %d 次)...",
+                         headless, attempt + 1)
+            service = Service(get_chromedriver_path())
             return webdriver.Chrome(
                 service=service,
                 options=build_chrome_options(headless),
             )
-        except Exception:
-            # webdriver.Chrome() 失敗時 Service 可能已把 chromedriver.exe 拉起來，
-            # 顯式 stop() 收掉，避免殘留 chromedriver/Chrome 進程洩漏。
-            try:
-                service.stop()
-            except Exception:
-                pass
-            raise
-    except Exception as e:
-        logging.exception("初始化 WebDriver 失敗: %s", e)
-        _invalidate_chromedriver_cache()
-        return None
+        except Exception as e:
+            last_error = e
+            # 失敗時 Service 可能已把 chromedriver.exe 拉起來，顯式 stop() 收掉，
+            # 避免殘留 chromedriver/Chrome 進程洩漏。
+            if service is not None:
+                try:
+                    service.stop()
+                except Exception:
+                    pass
+            # 清快取：下一輪 get_chromedriver_path() 會重新偵測 Chrome 版本並重抓
+            # 相符的 chromedriver（涵蓋版本不合 / driver 被 AV 隔離等情況）。
+            logging.warning("初始化 WebDriver 第 %d 次失敗，清快取後重試: %s",
+                            attempt + 1, e)
+            _invalidate_chromedriver_cache()
+
+    logging.error("初始化 WebDriver 最終失敗（已試 2 次）", exc_info=last_error)
+    return None
