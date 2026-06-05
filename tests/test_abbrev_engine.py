@@ -398,3 +398,62 @@ def test_handle_event_navigation_key_still_resets_buffer(monkeypatch):
     assert eng._buffer == "cer"
     eng._handle_event(_K("left"))
     assert eng._buffer == "", "方向鍵應清空 buffer"
+
+
+# ─── [2026-06-05] 空白觸發沒展開時保留 buffer,讓 backspace 改字仍能觸發 ──────
+
+class _SyncThread:
+    """讓 _try_expand 的展開 worker 同步執行,測試可確定性斷言(不靠 sleep)。"""
+    def __init__(self, target=None, args=(), daemon=None, **_kwargs):
+        self._target, self._args = target, args
+
+    def start(self):
+        self._target(*self._args)
+
+
+def _make_event_engine(monkeypatch, items):
+    monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
+    monkeypatch.setattr(ae, "should_skip_for_input_method", lambda: False)
+    monkeypatch.setattr(ae.threading, "Thread", _SyncThread)
+    eng = _make_engine()
+    started = []
+    # 攔截實際送鍵:只記錄被觸發的縮寫 key(a[2]),不送真鍵盤
+    monkeypatch.setattr(eng, "_do_replace",
+                        lambda *a, **_k: started.append(a[2]))
+    eng.install(AbbrevConfig(enabled=True, items=items))
+
+    class _K:
+        def __init__(self, n):
+            self.name = n
+
+    def feed(keys):
+        for k in keys:
+            eng._handle_event(_K(k))
+
+    return eng, started, feed
+
+
+def test_space_no_match_keeps_buffer_for_backspace_edit(monkeypatch):
+    """「nev 」(沒中縮寫)→backspace 刪空白→「1」→空白 ⇒ 應觸發 nev1。
+    原本空白觸發無條件清空 buffer,使用者改字後只剩改的那幾字 → 抓不到完整縮寫。"""
+    eng, started, feed = _make_event_engine(
+        monkeypatch, [{"abbrev": "nev1", "expansion": "x"}])
+
+    feed(["n", "e", "v", "space"])
+    assert started == []             # "nev" 不是縮寫,沒展開
+    assert eng._buffer == "nev "     # buffer 保留「候選 + 觸發空白」
+    feed(["backspace"])
+    assert eng._buffer == "nev"      # backspace 刪掉空白
+    feed(["1"])
+    assert eng._buffer == "nev1"     # 改字後 buffer 重建成完整縮寫
+    feed(["space"])
+    assert started == ["nev1"]       # 觸發展開!
+
+
+def test_space_success_clears_buffer(monkeypatch):
+    """成功展開後 buffer 不保留(已替換、重新開始);只有沒展開才保留。"""
+    eng, started, feed = _make_event_engine(
+        monkeypatch, [{"abbrev": "nev1", "expansion": "x"}])
+    feed(["n", "e", "v", "1", "space"])
+    assert started == ["nev1"]
+    assert eng._buffer == ""

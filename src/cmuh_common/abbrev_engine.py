@@ -1198,11 +1198,19 @@ class AbbrevEngine:
 
         # trigger 鍵（空白）：嘗試展開
         if name in _TRIGGER_KEY_NAMES:
-            buffer_snapshot = ""
             with self._lock:
                 buffer_snapshot = self._buffer
                 self._buffer = ""
-            self._try_expand(buffer_snapshot, " ")
+            expanded = self._try_expand(buffer_snapshot, " ")
+            if not expanded:
+                # [優化] 沒展開 → 把「候選 + 觸發空白」留回 buffer。讓使用者發現打錯、
+                # 用 backspace 刪掉空白再改字(例:「nev 」→⌫→「nev1」)時 buffer 仍能
+                # 重建成「nev1」而非只剩改的那幾字,下個空白才正確觸發。原本無條件清空
+                # 會把前面打過的字丟失。成功展開時不保留(已替換、重新開始)。
+                keep = self._max_abbrev_len + 1 if self._max_abbrev_len else 0
+                with self._lock:
+                    if keep and not self._buffer:  # 期間無新輸入才覆寫(防 race)
+                        self._buffer = (buffer_snapshot + " ")[-keep:]
             return
 
         # backspace：刪掉 buffer 最後一個字元（鏡像使用者刪字），而非整段清空。
@@ -1231,9 +1239,11 @@ class AbbrevEngine:
         # 其他特殊鍵（shift / ctrl / alt / caps lock 等）—不影響 buffer
         return
 
-    def _try_expand(self, buffer_snapshot: str, trigger_char: str) -> None:
+    def _try_expand(self, buffer_snapshot: str, trigger_char: str) -> bool:
+        """回傳 True=有啟動展開；False=沒展開(無匹配/非完整字/IME/render 失敗/
+        worker 啟動失敗)。空白觸發端用此決定沒展開時是否保留 buffer 供後續編輯。"""
         if not buffer_snapshot or not self._lookup:
-            return
+            return False
 
         # longest match from the right end of buffer
         matched_key: Optional[str] = None
@@ -1243,7 +1253,7 @@ class AbbrevEngine:
                 matched_key = candidate
                 break
         if matched_key is None:
-            return
+            return False
 
         # [修正] 只在縮寫是「完整的字」時才展開。縮寫的「前一個字元」必須是邊界
         # ——空白 / 標點 / 符號，或位於字首——才算完整字。若前一字元是「字母或數字」
@@ -1258,20 +1268,20 @@ class AbbrevEngine:
                 logging.debug(
                     "[abbrev] '%s' 前一字元=%r 為字母/數字/中文(非邊界)，"
                     "非完整字，略過展開", matched_key, prev_ch)
-                return
+                return False
 
         # IME 中文模式或組字中 → 跳過（best-effort；新 TSF IME 上 IMM API 可能無效，
         # 偵測不到時就照常展開 — 寧可展開也不要整個功能卡死）
         if self._cfg.skip_when_ime_active and should_skip_for_input_method():
             logging.debug("[abbrev] IME 中文模式或組字中，跳過 '%s'", matched_key)
-            return
+            return False
 
         raw_expansion = self._lookup[matched_key]
         try:
             rendered = render_expansion(raw_expansion, datetime.now())
         except Exception:
             logging.exception("[abbrev] render_expansion 失敗 abbrev=%s", matched_key)
-            return
+            return False
 
         if self._cfg.preserve_trailing_space:
             rendered = rendered + " "
@@ -1297,10 +1307,12 @@ class AbbrevEngine:
                 daemon=True,
             )
             worker.start()
+            return True
         except Exception:
             logging.exception("[abbrev] 啟動展開 worker thread 失敗，重置 suppress")
             self._suppressing = False
             self._cooldown_until = 0.0
+            return False
 
     def _do_replace(
         self,
