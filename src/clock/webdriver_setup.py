@@ -156,7 +156,7 @@ def initialize_driver(headless: bool = True):
         logging.exception("初始化 WebDriver 失敗（import selenium）: %s", e)
         return None
 
-    last_error: Exception | None = None
+    last_error_info = None
     for attempt in range(2):
         service = None
         try:
@@ -168,7 +168,7 @@ def initialize_driver(headless: bool = True):
                 options=build_chrome_options(headless),
             )
         except Exception as e:
-            last_error = e
+            last_error_info = (type(e), e, e.__traceback__)
             # 失敗時 Service 可能已把 chromedriver.exe 拉起來，顯式 stop() 收掉，
             # 避免殘留 chromedriver/Chrome 進程洩漏。
             if service is not None:
@@ -182,5 +182,6 @@ def initialize_driver(headless: bool = True):
                             attempt + 1, e)
             _invalidate_chromedriver_cache()
 
-    logging.error("初始化 WebDriver 最終失敗（已試 2 次）", exc_info=last_error)
+    logging.error("初始化 WebDriver 最終失敗（已試 2 次）",
+                  exc_info=last_error_info)
     return None

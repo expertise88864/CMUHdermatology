@@ -787,7 +787,11 @@ def _make_forward01_duty_session():
 
 
 def check_stop():
-    if stop_event_automation.is_set(): raise SubsystemInterrupted("by F12 key press")
+    if stop_event_automation.is_set():
+        raise SubsystemInterrupted("by F12 key press")
+    with _hotkey_cancelled_threads_lock:
+        if threading.get_ident() in _hotkey_cancelled_threads:
+            raise SubsystemInterrupted("by F12 key press")
 
 
 def _sleep_interruptible(seconds: float, *,
@@ -1696,6 +1700,8 @@ def _show_light_code_incomplete_warning(label: str, set_療程: int,
 # 看門狗辨識「正在等使用者」狀態而不強制解鎖(同一時間只有一個熱鍵流程在跑，旗標無並發歧義)。
 # 讀寫單一 bool 在 CPython GIL 下為原子，看門狗只讀、context manager 以 try/finally 保證還原。
 _hotkey_awaiting_user = False
+_hotkey_cancelled_threads = set()
+_hotkey_cancelled_threads_lock = threading.Lock()
 
 
 @contextlib.contextmanager
@@ -1824,6 +1830,7 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
         except Exception:
             logging.exception("[%s][UVB] CONFIRM_NEEDED MessageBoxW 失敗", label)
             return False if strict else True
+        check_stop()
         # IDYES = 6, IDNO = 7
         if ans != 6:
             logging.info("[%s][UVB] CONFIRM_NEEDED user 按否/取消 → 停止", label)
@@ -1933,6 +1940,7 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
         except Exception:
             logging.exception("[%s][UVB] uncertain MessageBoxW 失敗", label)
             return False if strict else True
+        check_stop()
         if ans != 6:  # not IDYES
             logging.info("[%s][UVB] uncertain user 按否 → 終止 (不寫處置)",
                          label)
@@ -2947,20 +2955,28 @@ def _f11_read_course_value(main_hwnd: int, label: str = "F11") -> str:
 def _f11_send_finish_no_print(main_hwnd: int, course_value: str,
                               label: str, started_at: float) -> bool:
     """F11 route A: phototherapy course 2/3 -> 完成不印, then same popup flow."""
-    cmd_id = MENU_ID_FINISH_NO_PRINT
-    sent = _send_yiling_menu_command(main_hwnd, cmd_id)
-    if not sent:
-        dynamic_id = _find_menu_command_id_by_text(main_hwnd, "完成不印")
-        if dynamic_id and dynamic_id != cmd_id:
-            logging.warning("[%s] 完成不印 hardcoded id=%s 送出失敗，改用動態 id=%s",
-                            label, cmd_id, dynamic_id)
-            cmd_id = dynamic_id
-            sent = _send_yiling_menu_command(main_hwnd, cmd_id)
-    if sent:
-        logging.info("[%s][timeline] route=完成不印 療程=%s → 已送 menu id=%s "
-                     "(+%.0fms total)",
-                     label, course_value, cmd_id, (time.time() - started_at) * 1000)
-        return True
+    dynamic_id = _find_menu_command_id_by_text(main_hwnd, "完成不印")
+    candidate_ids = []
+    if dynamic_id:
+        candidate_ids.append(dynamic_id)
+        if dynamic_id != MENU_ID_FINISH_NO_PRINT:
+            logging.info("[%s] 完成不印動態 id=%s（既有備援 id=%s）",
+                         label, dynamic_id, MENU_ID_FINISH_NO_PRINT)
+    else:
+        logging.warning("[%s] 完成不印動態解析失敗，改用既有備援 id=%s",
+                        label, MENU_ID_FINISH_NO_PRINT)
+    if MENU_ID_FINISH_NO_PRINT not in candidate_ids:
+        candidate_ids.append(MENU_ID_FINISH_NO_PRINT)
+
+    for cmd_id in candidate_ids:
+        if _send_yiling_menu_command(main_hwnd, cmd_id):
+            logging.info("[%s][timeline] route=完成不印 療程=%s → 已送 menu id=%s "
+                         "(+%.0fms total)",
+                         label, course_value, cmd_id,
+                         (time.time() - started_at) * 1000)
+            return True
+        logging.warning("[%s] 完成不印 menu id=%s 送出失敗，嘗試下一個候選",
+                        label, cmd_id)
     logging.error("[%s] 療程=%s 但「完成不印」menu 找不到/送出失敗；"
                   "照光病人不改按 全部完成，以免印出繳費單",
                   label, course_value)
@@ -11006,7 +11022,11 @@ class AutomationApp:
                 logging.exception(f"Error in '{hotkey_name}'")
                 put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 發生未預期錯誤'))
             finally:
+                with _hotkey_cancelled_threads_lock:
+                    _hotkey_cancelled_threads.discard(threading.get_ident())
                 with self._subsystem_lock:
+                    if getattr(self, '_subsystem_thread_ident', None) == threading.get_ident():
+                        self._subsystem_thread_ident = None
                     # [stability] 只在「仍是本流程 token」時才復位，避免本 thread 若
                     # 曾卡死、被硬上限看門狗強制復位、之後又有新熱鍵啟動(token 前進)
                     # 時，這個遲來的 finally 誤清掉新流程的 running 旗標。
@@ -11023,6 +11043,9 @@ class AutomationApp:
                     put_ui_message(self.ui_queue, UiStatusMessage(text='狀態: 閒置'))
         thread = threading.Thread(target=wrapper, name=f"{hotkey_name}_Thread", daemon=True)
         thread.start()
+        with self._subsystem_lock:
+            if self._subsystem_token == subsystem_token:
+                self._subsystem_thread_ident = thread.ident
 
         # [stability] 硬上限看門狗：若此流程因「無逾時的跨行程呼叫(醫院 app 凍住)」
         # 或任何原因卡住超過 HOTKEY_HARD_TIMEOUT_SEC，wrapper 的 finally 永遠跑不到
@@ -11051,6 +11074,8 @@ class AutomationApp:
                 if not active:
                     return  # 流程已正常結束或被後續熱鍵取代
                 if awaiting:
+                    put_ui_message(self.ui_queue, UiStatusMessage(
+                        text=f'狀態: {hotkey_name} 等待醫師回應中，按 F12 可取消等待'))
                     time.sleep(HOTKEY_HARD_TIMEOUT_SEC)  # 仍在等使用者，再給一個週期
                     continue
                 if unlocked:
@@ -11075,7 +11100,19 @@ class AutomationApp:
             return
         logging.warning("Received F12: Interrupting...")
         stop_event_automation.set()
-        put_ui_message(self.ui_queue, UiStatusMessage(text="狀態: F12 終止 - 正在中斷目前操作..."))
+        if _hotkey_awaiting_user:
+            with self._subsystem_lock:
+                thread_ident = getattr(self, '_subsystem_thread_ident', None)
+                if thread_ident is not None:
+                    with _hotkey_cancelled_threads_lock:
+                        _hotkey_cancelled_threads.add(thread_ident)
+                if self._subsystem_running:
+                    self._subsystem_running = False
+                    self._subsystem_token += 1
+            put_ui_message(self.ui_queue, UiStatusMessage(
+                text="狀態: F12 終止 - 已解除等待醫師回應，請關閉確認視窗"))
+        else:
+            put_ui_message(self.ui_queue, UiStatusMessage(text="狀態: F12 終止 - 正在中斷目前操作..."))
 
 
     def _open_main_script_at_line(self, line_no: int):

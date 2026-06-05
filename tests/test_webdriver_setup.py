@@ -102,10 +102,14 @@ def test_initialize_driver_returns_none_after_two_failures(monkeypatch):
     import selenium.webdriver.chrome.service as svc_mod
 
     invalidated = []
+    error_calls = []
     monkeypatch.setattr(ws, "get_chromedriver_path", lambda: "C:/cd/chromedriver.exe")
     monkeypatch.setattr(ws, "build_chrome_options", lambda headless=True: object())
     monkeypatch.setattr(
         ws, "_invalidate_chromedriver_cache", lambda: invalidated.append(1))
+    monkeypatch.setattr(
+        ws.logging, "error",
+        lambda *args, **kwargs: error_calls.append((args, kwargs)))
 
     class _FakeService:
         def __init__(self, path):
@@ -123,3 +127,7 @@ def test_initialize_driver_returns_none_after_two_failures(monkeypatch):
 
     assert ws.initialize_driver(headless=True) is None
     assert len(invalidated) == 2
+    assert error_calls
+    exc_info = error_calls[-1][1]["exc_info"]
+    assert isinstance(exc_info, tuple)
+    assert exc_info[0] is RuntimeError

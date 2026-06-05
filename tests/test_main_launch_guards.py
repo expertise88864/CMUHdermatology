@@ -624,7 +624,12 @@ def test_f11_phototherapy_uses_finish_no_print_without_print_fallback():
     assert 'if course_value in ("2", "3"):' in f11_main_src
     assert "_f11_send_finish_no_print" in f11_main_src
     assert "_f11_click_finish_all" in f11_main_src
-    assert "cmd_id = MENU_ID_FINISH_NO_PRINT" in no_print_src
+    assert (
+        no_print_src.index('_find_menu_command_id_by_text(main_hwnd, "完成不印")')
+        < no_print_src.index("_send_yiling_menu_command(main_hwnd, cmd_id)")
+    )
+    assert "candidate_ids" in no_print_src
+    assert "MENU_ID_FINISH_NO_PRINT not in candidate_ids" in no_print_src
     assert "照光病人不改按 全部完成" in no_print_src
     assert '"全部完成"' in all_finish_src
     assert "fallback 全部完成" not in no_print_src
@@ -724,6 +729,18 @@ def test_uvb_messagebox_marks_awaiting_user_for_hotkey_watchdog():
     watch_src = _function_source(source_path, "_hotkey_hard_timeout_watch")
     assert "_hotkey_awaiting_user" in watch_src
     assert "awaiting" in watch_src  # awaiting 狀態下不強制解鎖、再等一個週期
+    assert "等待醫師回應中，按 F12 可取消等待" in watch_src
+
+    interrupt_src = _function_source(source_path, "interrupt_automation")
+    assert "if _hotkey_awaiting_user:" in interrupt_src
+    assert "_hotkey_cancelled_threads.add(thread_ident)" in interrupt_src
+    assert "self._subsystem_running = False" in interrupt_src
+    assert "self._subsystem_token += 1" in interrupt_src
+
+    check_stop_src = _function_source(source_path, "check_stop")
+    assert "threading.get_ident() in _hotkey_cancelled_threads" in check_stop_src
+
+    assert core_src.count("check_stop()") >= 2
 
 
 def test_refresh_single_flight_flag_set_on_main_thread():
