@@ -1090,6 +1090,9 @@ class AbbrevEngine:
         self._buffer: str = ""
         self._press_hook: Any = None
         self._suppressing = False
+        # [2026-06-05] 上次打字時的鍵盤焦點控制項 HWND。焦點(欄位/視窗)改變就清空
+        # buffer，避免在 A 欄打"ne"、點到 B 欄打"v1 "被拼成假縮寫 nev1 而誤觸發。
+        self._last_focus_hwnd: int = 0
         # 展開後的冷卻截止時間（monotonic）
         self._cooldown_until: float = 0.0
         # [v6] 偵測到的外部文字展開程式名稱 (None=沒有)；有的話暫停本程式縮寫。
@@ -1174,6 +1177,26 @@ class AbbrevEngine:
         except Exception:
             logging.exception("[abbrev] _on_press 處理失敗")
 
+    def _reset_buffer_if_focus_changed(self) -> None:
+        """[2026-06-05] 鍵盤焦點(欄位/視窗)改變 → 清空 buffer。
+
+        防「跨欄位殘留拼成假縮寫」：在 A 欄打"ne"、滑鼠點到 B 欄再打"v1 "，原本
+        buffer 會是"nev1"而誤觸發。每次打字前比對焦點控制項 HWND，變了就清空。
+        best-effort：查焦點失敗(回 0)就不動作，避免誤清；只有 buffer 非空且焦點
+        確實改變才清。注意:瀏覽器同頁多個輸入框常共用同一 render HWND → 偵測不到
+        (限制)；醫院 Delphi 主程式每欄獨立 HWND → 可正確偵測(主要使用情境)。"""
+        try:
+            cur = _get_focused_window_handle()
+        except Exception:
+            return
+        if not cur:
+            return  # 查不到焦點 → 不動作(避免把正常打字的 buffer 誤清)
+        with self._lock:
+            if (self._buffer and self._last_focus_hwnd
+                    and cur != self._last_focus_hwnd):
+                self._buffer = ""
+            self._last_focus_hwnd = cur
+
     def _handle_event(self, event: Any) -> None:
         # 自己 send/write 期間，所有按鍵忽略。
         # [v9] 自癒：若 _suppressing 卡在 True 但已遠超過 cooldown 期限
@@ -1198,6 +1221,8 @@ class AbbrevEngine:
 
         # trigger 鍵（空白）：嘗試展開
         if name in _TRIGGER_KEY_NAMES:
+            # 焦點換了 → 先清空,避免在新欄位展開舊欄位殘留的縮寫
+            self._reset_buffer_if_focus_changed()
             with self._lock:
                 buffer_snapshot = self._buffer
                 self._buffer = ""
@@ -1228,6 +1253,8 @@ class AbbrevEngine:
 
         # printable 單字元（'a' 'B' '1' '/' '-' '_' 等）
         if len(name) == 1:
+            # 焦點(欄位/視窗)換了 → 先清空舊欄位殘留,再開始累積本欄位的字
+            self._reset_buffer_if_focus_changed()
             ch = name.lower()
             with self._lock:
                 # 多保留 1 個字元(max_abbrev_len + 1)：供 _try_expand 判斷縮寫前是否為

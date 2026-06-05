@@ -415,6 +415,10 @@ def _make_event_engine(monkeypatch, items):
     monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
     monkeypatch.setattr(ae, "should_skip_for_input_method", lambda: False)
     monkeypatch.setattr(ae.threading, "Thread", _SyncThread)
+    # 焦點控制項 HWND 固定回 focus_ref["h"](預設 100、穩定 → 不會誤清 buffer);
+    # 焦點測試可改 focus_ref["h"] 模擬「滑鼠點到別的欄位」。
+    focus_ref = {"h": 100}
+    monkeypatch.setattr(ae, "_get_focused_window_handle", lambda: focus_ref["h"])
     eng = _make_engine()
     started = []
     # 攔截實際送鍵:只記錄被觸發的縮寫 key(a[2]),不送真鍵盤
@@ -430,13 +434,13 @@ def _make_event_engine(monkeypatch, items):
         for k in keys:
             eng._handle_event(_K(k))
 
-    return eng, started, feed
+    return eng, started, feed, focus_ref
 
 
 def test_space_no_match_keeps_buffer_for_backspace_edit(monkeypatch):
     """「nev 」(沒中縮寫)→backspace 刪空白→「1」→空白 ⇒ 應觸發 nev1。
     原本空白觸發無條件清空 buffer,使用者改字後只剩改的那幾字 → 抓不到完整縮寫。"""
-    eng, started, feed = _make_event_engine(
+    eng, started, feed, _focus = _make_event_engine(
         monkeypatch, [{"abbrev": "nev1", "expansion": "x"}])
 
     feed(["n", "e", "v", "space"])
@@ -452,8 +456,42 @@ def test_space_no_match_keeps_buffer_for_backspace_edit(monkeypatch):
 
 def test_space_success_clears_buffer(monkeypatch):
     """成功展開後 buffer 不保留(已替換、重新開始);只有沒展開才保留。"""
-    eng, started, feed = _make_event_engine(
+    eng, started, feed, _focus = _make_event_engine(
         monkeypatch, [{"abbrev": "nev1", "expansion": "x"}])
     feed(["n", "e", "v", "1", "space"])
     assert started == ["nev1"]
     assert eng._buffer == ""
+
+
+# ─── [2026-06-05] 切換欄位/視窗 → 清空 buffer,避免跨位置拼成假縮寫 ──────────
+
+def test_focus_change_resets_buffer_no_false_trigger(monkeypatch):
+    """A 欄打"ne"→滑鼠點到 B 欄(焦點 HWND 改變)→打"v1 "⇒ 不該誤觸發 nev1。
+    舊欄位殘留的"ne"被清掉,B 欄只累積"v1"。"""
+    eng, started, feed, focus = _make_event_engine(
+        monkeypatch, [{"abbrev": "nev1", "expansion": "x"}])
+    feed(["n", "e"])                  # 在 A 欄(focus=100)
+    assert eng._buffer == "ne"
+    focus["h"] = 200                  # 滑鼠點到 B 欄
+    feed(["v", "1", "space"])
+    assert started == []              # 不該觸發(ne 已被清掉)
+    assert eng._buffer == "v1 "       # buffer 只剩 B 欄打的
+
+
+def test_focus_change_before_trigger_blocks_expansion(monkeypatch):
+    """在 A 欄打完整"nev1"→點到別處(焦點變)→按空白 ⇒ 不在新位置展開舊縮寫。"""
+    eng, started, feed, focus = _make_event_engine(
+        monkeypatch, [{"abbrev": "nev1", "expansion": "x"}])
+    feed(["n", "e", "v", "1"])
+    assert eng._buffer == "nev1"
+    focus["h"] = 300
+    feed(["space"])
+    assert started == []              # 焦點變了 → 觸發前已清空,不展開
+
+
+def test_same_focus_still_triggers(monkeypatch):
+    """焦點不變(同一欄位)→正常觸發,確認焦點檢查沒誤傷正常流程。"""
+    eng, started, feed, _focus = _make_event_engine(
+        monkeypatch, [{"abbrev": "nev1", "expansion": "x"}])
+    feed(["n", "e", "v", "1", "space"])  # focus 全程 100
+    assert started == ["nev1"]
