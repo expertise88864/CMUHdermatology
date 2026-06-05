@@ -1457,12 +1457,16 @@ class AbbrevEngine:
             logging.exception("[abbrev] _do_replace 失敗 abbrev=%s", abbrev_key)
         finally:
             # 還原剪貼簿。[safety] 僅在「確實寫過剪貼簿(clip_ok)且剪貼簿現在仍是我們
-            # 貼上的展開內容」時才還原：BlockInput 在 POST_PASTE 等待前就解凍，那
+            # 貼上的展開內容」時才動作：BlockInput 在 POST_PASTE 等待前就解凍，那
             # 0.3s 內使用者可能已 Ctrl+C 複製新東西，無條件還原會蓋掉它。
-            if old_clip is not None and clip_ok:
+            # [stability r4] 條件由「old_clip is not None and clip_ok」改為「clip_ok」：
+            # 原本剪貼簿為空時 old_clip 為 None → 舊條件跳過還原 → 我們寫入的整段展開
+            # 內文(可能上百字病歷)會永久殘留在系統剪貼簿，使用者下次 Ctrl+V 貼到展開內容。
+            # 現在 old_clip 為 None 時改清空剪貼簿(寫入空字串)，把我們的展開內文清掉。
+            if clip_ok:
                 try:
                     if _clipboard_get_text() == text:
-                        _clipboard_set_text(old_clip)
+                        _clipboard_set_text(old_clip if old_clip is not None else "")
                     else:
                         logging.debug("[abbrev] 剪貼簿已被使用者更新，保留不還原")
                 except Exception:

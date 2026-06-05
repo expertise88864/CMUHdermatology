@@ -42,3 +42,46 @@ def test_pending_retrigger_drain_uses_single_delayed_worker(monkeypatch):
         ("email", ["a@example.com"]),
     ]
     assert consult_query._pending_retrigger_drain_running is False
+
+
+# === [stability r4] IMAP 逾時 thread 不疊加 ===
+
+def test_imap_check_skips_when_previous_thread_still_alive(monkeypatch):
+    """上一條被放生的 IMAPCheck thread 仍 alive 時(force_close 砍不到連線建立前的
+    卡死)，本輪不再疊加新 thread，直接回 error；避免長期半死網路下累積 daemon thread。"""
+    import threading
+
+    release = threading.Event()
+    prev = threading.Thread(target=lambda: release.wait(5), daemon=True)
+    prev.start()
+    try:
+        monkeypatch.setattr(consult_query, "_last_imap_thread", prev)
+
+        res = consult_query._run_imap_check_with_timeout("kw", timeout=0.5)
+
+        # 被跳過 → 沒有新生 thread(引用仍是 prev)、回 error result 帶 skip 訊息
+        assert consult_query._last_imap_thread is prev
+        assert res.get("triggered") is False
+        assert "skip" in res.get("error", "").lower()
+    finally:
+        release.set()
+        prev.join(timeout=1)
+
+
+def test_imap_check_runs_when_no_previous_thread(monkeypatch):
+    """沒有殘留 thread 時正常執行 check_trigger，並在成功後清掉引用。"""
+    import cmuh_common.imap_reader as imap_reader
+
+    monkeypatch.setattr(consult_query, "_last_imap_thread", None)
+    monkeypatch.setattr(
+        imap_reader, "check_trigger",
+        lambda kw: {"triggered": False, "scanned": 1, "matched": 0,
+                    "matched_senders": [], "samples": [], "error": ""},
+    )
+
+    res = consult_query._run_imap_check_with_timeout("kw", timeout=5.0)
+
+    assert res.get("scanned") == 1
+    assert res.get("error") == ""
+    # 正常結束後清掉引用，不擋下一輪 poll
+    assert consult_query._last_imap_thread is None

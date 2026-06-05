@@ -1640,6 +1640,13 @@ def _empty_imap_result(err: str) -> dict:
             "matched_senders": [], "samples": [], "error": err}
 
 
+# [stability r4] 上一條被放生的 IMAPCheck thread 引用：force_close 對「socket 尚未建立」
+# 的卡死階段(DNS getaddrinfo / TCP connect / TLS handshake)無效，逾時放生的 thread 可能
+# 仍卡著。記住它，下一輪若仍 alive 就跳過不再疊加新 thread，避免長期半死網路下緩慢累積。
+# 只由單一 scheduler thread 讀寫，無並發、不需鎖。
+_last_imap_thread = None
+
+
 def _run_imap_check_with_timeout(kw: str, timeout: float = 60.0) -> dict:
     """跑 check_trigger 在 daemon thread；超過 timeout 就 force-close socket 並回 error。
 
@@ -1657,6 +1664,17 @@ def _run_imap_check_with_timeout(kw: str, timeout: float = 60.0) -> dict:
          繼續輪詢（worst case daemon thread leak 一次，但會自殺）
     """
     from cmuh_common.imap_reader import check_trigger, force_close_active
+    global _last_imap_thread
+
+    # [stability r4] 上一條放生的 IMAPCheck 仍卡著 → 本輪不疊加新 thread，直接回 error
+    # (走既有 consecutive_imap_errors / cooldown 路徑)，等它自己(DNS/connect 逾時)結束。
+    prev = _last_imap_thread
+    if prev is not None and prev.is_alive():
+        logging.warning(
+            "[watchdog] 上一條 IMAPCheck thread 仍未結束，本輪跳過以免累積 daemon thread")
+        return _empty_imap_result(
+            "previous IMAP check still running (skipped to avoid thread pile-up)")
+
     box: dict = {}
 
     def _worker():
@@ -1666,6 +1684,7 @@ def _run_imap_check_with_timeout(kw: str, timeout: float = 60.0) -> dict:
             box["r"] = _empty_imap_result(f"imap thread exception: {e!r}")
 
     t = threading.Thread(target=_worker, name="IMAPCheck", daemon=True)
+    _last_imap_thread = t
     t.start()
     t.join(timeout=timeout)
     if t.is_alive():
@@ -1676,9 +1695,12 @@ def _run_imap_check_with_timeout(kw: str, timeout: float = 60.0) -> dict:
         t.join(timeout=2.0)
         if t.is_alive():
             logging.warning(
-                "[watchdog] daemon thread 仍未結束，已放棄；繼續下一輪")
+                "[watchdog] daemon thread 仍未結束，已放棄；保留引用，下一輪不疊加新 thread")
+        # 維持 _last_imap_thread = t（仍 alive），下一輪會看到並跳過直到它自己結束
         return _empty_imap_result(
             f"IMAP check timeout > {timeout:.0f}s (socket 已強制關閉)")
+    # 正常結束(thread 已 not alive) → 清掉引用，不擋下一輪正常 poll
+    _last_imap_thread = None
     return box.get("r", _empty_imap_result("imap result missing"))
 
 

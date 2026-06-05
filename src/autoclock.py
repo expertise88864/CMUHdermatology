@@ -153,6 +153,7 @@ def _sleep_while_running(seconds: float, step: float = 0.5) -> bool:
 _persistent_driver_pool = {
     "driver": None,
     "last_used": 0.0,
+    "in_use": False,  # [stability r4] 任務使用中旗標：True 時 idle 回收器不得 quit driver
     "lock": threading.Lock(),
     "init_lock": threading.Lock(),
 }
@@ -771,6 +772,11 @@ def process_clock_task(schedule_key: str | None) -> None:
             )
             return
 
+        # [stability r4] 標記 driver「使用中」，整個任務期間 idle 回收器都不得 quit。
+        # 這比單靠每帳號刷新 last_used 更穩健：即使單一帳號內部(login 多次重試+backoff)
+        # 連續耗時 >15 分鐘，使用中 driver 也不會被回收器砍掉造成 InvalidSessionId。
+        with _persistent_driver_pool["lock"]:
+            _persistent_driver_pool["in_use"] = True
         try:
             wait = WebDriverWait(driver, 20)
             for acc in accs:
@@ -780,10 +786,8 @@ def process_clock_task(schedule_key: str | None) -> None:
                     driver, wait, acc, is_in, check_start, check_end,
                     dry_run=False, task_label=schedule_key,
                 )
-                # [stability] 每處理完一個帳號就刷新 last_used。否則帳號多 + 院內網
-                # 慢 + 重試 backoff 使整個任務 >15 分鐘時，idle 回收器（每 2 分跑）
-                # 會依「任務開始時」的 last_used 誤判 driver 閒置而 quit 掉「使用中」
-                # 的 driver，導致後續帳號 InvalidSessionId 失敗。
+                # 每處理完一個帳號就刷新 last_used，讓任務結束後 idle 倒數從「最後一個
+                # 帳號完成」起算（in_use 旗標負責任務進行中的保護，此處負責任務後計時）。
                 with _persistent_driver_pool["lock"]:
                     _persistent_driver_pool["last_used"] = time_module.time()
         except Exception as e:
@@ -794,7 +798,11 @@ def process_clock_task(schedule_key: str | None) -> None:
                 pass
             # 任務級錯誤不關 driver；下次任務若 driver 不健康會自動重建
         finally:
-            # 注意：不再 driver.quit()！常駐池管理（idle 60min 才釋放）
+            # 注意：不再 driver.quit()！常駐池管理（idle 才釋放）。務必清 in_use，
+            # 否則回收器永遠不敢 quit → driver 永不釋放(RAM 漏)。
+            with _persistent_driver_pool["lock"]:
+                _persistent_driver_pool["last_used"] = time_module.time()
+                _persistent_driver_pool["in_use"] = False
             logging.info("任務 %s 執行週期結束（driver 保留以待下次任務）。", schedule_key)
 
 
@@ -861,6 +869,10 @@ def _idle_driver_janitor() -> None:
         with pool["lock"]:
             d = pool["driver"]
             if d is None:
+                return
+            if pool.get("in_use"):
+                # [stability r4] 任務正在使用此 driver，絕不回收(避免砍使用中 driver
+                # 造成後續帳號 InvalidSessionId)。任務 finally 會清 in_use 後才可回收。
                 return
             now = time_module.time()
             idle_for = now - pool["last_used"]

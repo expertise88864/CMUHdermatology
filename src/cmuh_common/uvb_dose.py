@@ -829,8 +829,7 @@ def _first_time_update(parsed: UvbLineInfo, today: date,
 
 def update_uvb_in_text(text: str, today: Optional[date] = None,
                        skip_dose_sanity: bool = False,
-                       skip_stale_check: bool = False,
-                       treat_as_first_time: bool = False) -> UvbUpdateResult:
+                       skip_stale_check: bool = False) -> UvbUpdateResult:
     """主入口：給整段「處置」text，回更新後 text + 動作類型。
 
     today=None 用今天日期；測試時傳 fixed date 方便 reproducible。
@@ -851,10 +850,12 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
     回 CONFIRM_NEEDED 給 caller 跳 Yes/No: Yes 重 call 帶 skip_stale_check=True
     才繼續更新；No 直接終止不修改處置。
 
-    [v20.16 2026-05-26] 處置 UVB 行可能沒日期 (第一次照光紀錄)，strict
-    parse_uvb_line 會 fail。改成: strict fail 後試 parse_uvb_partial，若有
-    dose+max 但沒 date → CONFIRM_NEEDED「第一次照光」。Yes 重 call 帶
-    treat_as_first_time=True，跳過 days_diff/decay 邏輯，只更新原句已有欄位。
+    [v20.16→v20.17 2026-05-26] 處置 UVB 行可能沒日期 (第一次照光紀錄)，strict
+    parse_uvb_line 會 fail。strict fail 後試 parse_uvb_partial，若 last_date is None
+    (無日期) → 直接走 silent first-time (_first_time_update)：跳過 days_diff/decay，
+    只更新原句已有欄位、不跳對話框。
+    (註：v20.16 曾用 CONFIRM_NEEDED + treat_as_first_time 參數重 call，v20.17 改為
+    silent first-time 後該參數已無作用，[stability r4] 已移除以免誤導未來 caller。)
     """
     if today is None:
         today = date.today()

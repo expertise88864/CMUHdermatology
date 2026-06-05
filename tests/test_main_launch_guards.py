@@ -705,3 +705,45 @@ def test_code_input_waits_for_focus_after_menu_command():
     assert "-> bool" in send_src
     assert "PostMessageW" in send_src
     assert "return False" in send_src
+
+
+# === [stability r4] 對抗式審查確認發現的回歸保護 ===
+
+def test_uvb_messagebox_marks_awaiting_user_for_hotkey_watchdog():
+    """F2/F3 等醫師回應的 MessageBoxW 期間標記 awaiting-user；硬上限看門狗在此狀態
+    不得強制解鎖(否則醫師回應前第二支熱鍵重入、與卡在對話框的第一流程並行操作 HIS)。"""
+    source_path = ROOT / "src" / "main.py"
+    full = source_path.read_text(encoding="utf-8")
+    assert "def _hotkey_awaiting_user_scope(" in full
+
+    core_src = _function_source(source_path, "_update_uvb_dose_core")
+    # 兩處 MessageBoxW(劑量確認 + uncertain 行)都要被 awaiting-user scope 包住
+    assert core_src.count("with _hotkey_awaiting_user_scope():") >= 2
+    assert "MessageBoxW" in core_src
+
+    watch_src = _function_source(source_path, "_hotkey_hard_timeout_watch")
+    assert "_hotkey_awaiting_user" in watch_src
+    assert "awaiting" in watch_src  # awaiting 狀態下不強制解鎖、再等一個週期
+
+
+def test_refresh_single_flight_flag_set_on_main_thread():
+    """單飛旗標必須在 main thread 同步設(submit 前、同一鎖區塊內)，不能只在 worker 內
+    非同步才設，否則 submit↔worker 啟動空窗會讓下一個 trigger 重複 submit 同一刷新。"""
+    source_path = ROOT / "src" / "main.py"
+    full = source_path.read_text(encoding="utf-8")
+    idx_sig = full.find("self._active_refresh_signature = req_signature")
+    assert idx_sig != -1
+    # 緊接著(同鎖區塊內)就同步設旗標
+    snippet = full[idx_sig:idx_sig + 500]
+    assert "self._refresh_worker_running = True" in snippet
+
+
+def test_reg64_calendar_cache_guarded_by_lock():
+    """reg64 月曆快取：背景燈號 worker 寫、main thread 月曆讀，需同一把鎖保護。"""
+    source_path = ROOT / "src" / "main.py"
+    full = source_path.read_text(encoding="utf-8")
+    assert "self._reg64_cache_lock = threading.Lock()" in full
+    write_src = _function_source(source_path, "_update_reg64_public_cache")
+    assert "with self._reg64_cache_lock:" in write_src
+    read_src = _function_source(source_path, "_reg64_total_for_calendar_cell")
+    assert "with self._reg64_cache_lock:" in read_src

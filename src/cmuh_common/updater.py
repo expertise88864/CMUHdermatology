@@ -19,6 +19,7 @@ import os
 import re
 import threading
 import time
+import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -49,6 +50,11 @@ MANIFEST_TIMEOUT = 8
 # SHA 幾乎不會再不符；保留重試是為了擋短暫網路 / CDN 抖動。
 _DOWNLOAD_ATTEMPTS = 3            # 單一檔最多嘗試次數
 _DOWNLOAD_RETRY_DELAY_SEC = 2.0   # 每次重試間隔（秒）
+# [stability r4] 整批下載的牆鐘總時限：UPDATE_TIMEOUT 只限「單次連線」，整批沒有封頂。
+# 持續網路劣化下，77 個檔 × 單檔最壞 ~49s ÷ 8 worker ≈ 數百秒會卡住背景 worker。設一個
+# 寬鬆上限把最壞情況封頂，又不致誤殺「慢但會成功」的首次完整下載(整批超時即整批不寫，
+# 與既有『任一失敗則整批不寫』不變量一致，不會造成半套寫入)。
+_DOWNLOAD_BATCH_DEADLINE_SEC = 300  # 5 分鐘
 # 連續重試仍失敗才進 backoff，且只鎖較短時間（取代舊版「一次 SHA 不符就鎖 1 小時」）。
 _DOWNLOAD_FAIL_BACKOFF_SEC = 600  # 10 分鐘
 _sha_mismatch_until: dict = {}    # key -> next allowed timestamp（記憶體，重啟即清）
@@ -499,18 +505,31 @@ def check_and_update(
     pending_writes = []
 
     max_workers = max(1, min(8, len(file_entries)))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    # [stability r4] 不用 `with ThreadPoolExecutor`：其 __exit__ 會 shutdown(wait=True)
+    # join 全部 worker，會讓下面 as_completed 的總時限失效(殘留 worker 仍各自跑到 request
+    # 逾時)。改為手動管理，超時時 shutdown(wait=False, cancel_futures=True) 立即返回。
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    try:
         futures = {executor.submit(_download_one, fe, app_dir): fe for fe in file_entries}
-        for fut in as_completed(futures):
-            fe = futures[fut]
-            try:
-                ret = fut.result()
-                if ret is not None:
-                    pending_writes.append(ret)
-            except Exception as e:
-                err_msg = f"[{fe.get('key', '?')}] {e}"
-                logging.error(err_msg)
-                result.errors.append(err_msg)
+        try:
+            for fut in as_completed(futures, timeout=_DOWNLOAD_BATCH_DEADLINE_SEC):
+                fe = futures[fut]
+                try:
+                    ret = fut.result()
+                    if ret is not None:
+                        pending_writes.append(ret)
+                except Exception as e:
+                    err_msg = f"[{fe.get('key', '?')}] {e}"
+                    logging.error(err_msg)
+                    result.errors.append(err_msg)
+        except concurrent.futures.TimeoutError:
+            err_msg = (f"下載批次超過 {_DOWNLOAD_BATCH_DEADLINE_SEC:.0f}s 總時限，"
+                       f"放棄本次更新（不寫入任何檔）")
+            logging.warning(err_msg)
+            result.errors.append(err_msg)
+    finally:
+        # wait=False：不等殘留 worker(否則總時限失效)；它們各自帶 request timeout 會自行結束。
+        executor.shutdown(wait=False, cancel_futures=True)
 
     # 任一失敗則整批不寫
     if result.errors:
@@ -610,6 +629,19 @@ def check_and_update(
                 pass
         logging.warning("更新寫入失敗，已回滾 %d 個檔案", len(written_files))
         return result
+
+    # [stability r4] 整批已成功 commit、不再需要回滾 → 清掉本批建立的 .bak 備份，
+    # 避免無人值守長跑下程式目錄持續堆積過時的 .py.bak。務必放在上面的 rollback
+    # early-return 之後(走到這裡代表已 commit)，否則會破壞失敗路徑的回滾能力。
+    for written in written_files:
+        if not written.existed_before:
+            continue  # 新建檔沒有對應 .bak
+        bak_path = written.target_path + ".bak"
+        try:
+            if os.path.exists(bak_path):
+                os.remove(bak_path)
+        except OSError:
+            logging.debug("清除更新備份檔失敗 [%s]", bak_path, exc_info=True)
 
     # [O8] 預編譯 .pyc：剛覆寫的 .py 立即 compile，省下次 import 時的 byte-compile 開銷
     if written_files:

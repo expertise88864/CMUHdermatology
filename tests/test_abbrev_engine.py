@@ -495,3 +495,19 @@ def test_same_focus_still_triggers(monkeypatch):
         monkeypatch, [{"abbrev": "nev1", "expansion": "x"}])
     feed(["n", "e", "v", "1", "space"])  # focus 全程 100
     assert started == ["nev1"]
+
+
+# ─── [stability r4] 剪貼簿原本為空時也要清掉展開內文 ───────────────────────
+
+def test_clipboard_restore_handles_originally_empty_clipboard():
+    """paste 路徑：剪貼簿原本為空(old_clip is None)時，仍要把我們寫入的展開內文
+    清掉(寫空字串)，不能殘留 — 否則使用者下次 Ctrl+V 會貼到整段病歷展開內文。
+    (_do_replace 需 Win32 視窗環境無法在 CI 跑，故以原始碼守門防回歸/被自動更新覆蓋)"""
+    import pathlib
+    src = pathlib.Path(ae.__file__).read_text(encoding="utf-8")
+    # 還原守門條件改為只看 clip_ok（不再要求 old_clip is not None）
+    assert "if clip_ok:" in src
+    # old_clip 為 None 時改寫入空字串清掉我們的展開內文
+    assert 'old_clip if old_clip is not None else ""' in src
+    # 舊的會漏掉「空剪貼簿」的還原條件不應再存在
+    assert "if old_clip is not None and clip_ok:" not in src

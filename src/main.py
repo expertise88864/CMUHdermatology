@@ -1688,6 +1688,29 @@ def _show_light_code_incomplete_warning(label: str, set_療程: int,
     _show_uvb_warning(main_hwnd, "照光代碼輸入未完成", msg)
 
 
+# [stability r4] F2/F3 UVB 會用阻塞式 MessageBoxW 同步等醫師按 Yes/No(劑量異常確認、
+# uncertain 行確認)。期間熱鍵工作緒「阻塞但不是卡死」，若醫師離開讓對話框開著超過
+# HOTKEY_HARD_TIMEOUT_SEC(180s)，run_subsystem_in_thread 的硬上限看門狗會把它誤判成卡死
+# 強制解除 _subsystem_running → 醫師回應前第二支熱鍵(F9/F10/F11 lenient)可重入、與仍卡在
+# 對話框的第一流程並行操作同一 HIS 視窗 → 醫令重複 / 療程欄被覆寫。下面的 module 級旗標讓
+# 看門狗辨識「正在等使用者」狀態而不強制解鎖(同一時間只有一個熱鍵流程在跑，旗標無並發歧義)。
+# 讀寫單一 bool 在 CPython GIL 下為原子，看門狗只讀、context manager 以 try/finally 保證還原。
+_hotkey_awaiting_user = False
+
+
+@contextlib.contextmanager
+def _hotkey_awaiting_user_scope():
+    """標記目前熱鍵流程正阻塞等待使用者回應(MessageBoxW)。離開時還原為先前狀態
+    (支援巢狀)，即使對話框呼叫拋例外也保證清除，不會讓旗標永久卡 True。"""
+    global _hotkey_awaiting_user
+    prev = _hotkey_awaiting_user
+    _hotkey_awaiting_user = True
+    try:
+        yield
+    finally:
+        _hotkey_awaiting_user = prev
+
+
 def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
     """[v20.9 2026-05-26] F1 / F2/F3 共用核心邏輯。
 
@@ -1791,12 +1814,13 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
         # (避免 user 隨手 Enter 就 yes 通過異常劑量)
         flags = 0x20 | 0x4 | 0x40000 | 0x10000 | 0x100
         try:
-            ans = ctypes.windll.user32.MessageBoxW(
-                main_hwnd,
-                f"{dialog_intro}\n\n{confirm_reason}\n\n要繼續執行變更嗎?",
-                dialog_title,
-                flags,
-            )
+            with _hotkey_awaiting_user_scope():
+                ans = ctypes.windll.user32.MessageBoxW(
+                    main_hwnd,
+                    f"{dialog_intro}\n\n{confirm_reason}\n\n要繼續執行變更嗎?",
+                    dialog_title,
+                    flags,
+                )
         except Exception:
             logging.exception("[%s][UVB] CONFIRM_NEEDED MessageBoxW 失敗", label)
             return False if strict else True
@@ -1901,10 +1925,11 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
         # | MB_SETFOREGROUND(0x10000) | MB_DEFBUTTON2(0x100) — 預設「否」
         flags = 0x20 | 0x4 | 0x40000 | 0x10000 | 0x100
         try:
-            ans = ctypes.windll.user32.MessageBoxW(
-                main_hwnd, msg,
-                f"UVB 偵測到不確定的其他行 - {label}", flags,
-            )
+            with _hotkey_awaiting_user_scope():
+                ans = ctypes.windll.user32.MessageBoxW(
+                    main_hwnd, msg,
+                    f"UVB 偵測到不確定的其他行 - {label}", flags,
+                )
         except Exception:
             logging.exception("[%s][UVB] uncertain MessageBoxW 失敗", label)
             return False if strict else True
@@ -6107,6 +6132,9 @@ class AutomationApp:
         # 門診動態 reg64 → 總覽月曆「逾時後補掛號人數」用：(醫師, 上午|下午|晚上)
         self._reg64_public_snapshot = {}
         self._reg64_last_good_total = {}
+        # [stability r4] 背景燈號 worker 寫、main thread 月曆繪製讀，加一把專屬輕量鎖
+        # (不複用 _tracker_lock 以免無謂耦合)。臨界區只做小 dict 讀寫、不含阻塞 I/O。
+        self._reg64_cache_lock = threading.Lock()
         self._reg64_dynamic_ttl_seconds = REG64_MICRO_CACHE_SECONDS
         self._duty_last_fetch_date = None
         self._duty_fetch_worker_running = False
@@ -7737,12 +7765,13 @@ class AutomationApp:
             return
         if not isinstance(tot, int) or tot < 0:
             return
-        self._reg64_public_snapshot[(dn, sn)] = {
-            "total": tot,
-            "room": str(room_code),
-            "ts": time.time(),
-        }
-        self._reg64_last_good_total[(dn, sn)] = tot
+        with self._reg64_cache_lock:
+            self._reg64_public_snapshot[(dn, sn)] = {
+                "total": tot,
+                "room": str(room_code),
+                "ts": time.time(),
+            }
+            self._reg64_last_good_total[(dn, sn)] = tot
 
     def _appointment_today_shows_dayoff(self, doc_name, session_cn):
         """主程式快取中，今日該醫師該診別是否明確為休診／停診。"""
@@ -7849,11 +7878,12 @@ class AutomationApp:
         """回傳 (掛號總數字串含「人」, tag)；無則 None。供今日逾時列優先顯示門診動態人數。"""
         if not doc_name:
             return None
-        snap = self._reg64_public_snapshot.get((doc_name, session_name))
+        with self._reg64_cache_lock:
+            snap = self._reg64_public_snapshot.get((doc_name, session_name))
+            lastg = self._reg64_last_good_total.get((doc_name, session_name))
         now_ts = time.time()
         if snap and (now_ts - snap.get("ts", 0)) <= 3 * 3600:
             return f"{snap['total']}人", "session_past"
-        lastg = self._reg64_last_good_total.get((doc_name, session_name))
         if lastg is not None:
             return f"{lastg}人", "session_past"
         return None
@@ -9086,6 +9116,11 @@ class AutomationApp:
             return
         with self._refresh_queue_lock:
             self._active_refresh_signature = req_signature
+            # [stability r4] 在 main thread 同步搶下單飛旗標(原本只在 worker 內 9137 才設，
+            # 而 worker 是 bg_executor 非同步才跑到那行)。否則 submit 後、worker 設旗標前的
+            # 空窗內，下一個 _trigger_refresh 讀到 False→跳過去重→重複 submit 同一刷新，
+            # 對掛號站送雙倍請求、惡化 backoff。同步設定後同 signature 會被 9073 去重正確攔下。
+            self._refresh_worker_running = True
 
         if specific_doctors is None:
             now_ts = time.time()
@@ -9109,7 +9144,7 @@ class AutomationApp:
                 getattr(self, "_startup_defer_full_until_priority_done", False)
                 and specific_doctors is not None
             )
-            self._refresh_worker_running = True
+            self._refresh_worker_running = True  # 冪等：旗標已在 main thread 同步設過(見上)
             try:
                 batches = partition_doctors_for_refresh_batches(doctors_to_check)
                 for bi, batch in enumerate(batches):
@@ -10999,22 +11034,34 @@ class AutomationApp:
         HOTKEY_HARD_TIMEOUT_SEC = 180
 
         def _hotkey_hard_timeout_watch():
+            # [stability r4] 逾時後若流程正阻塞在「等醫師回應的對話框」(_hotkey_awaiting_user)，
+            # 那是刻意等待、不是卡死 → 不強制解鎖，再延一個週期重評；避免醫師回應前看門狗
+            # 解鎖讓第二支熱鍵重入並行操作 HIS。只有「逾時且非等待使用者」才判定卡死強制解鎖。
             time.sleep(HOTKEY_HARD_TIMEOUT_SEC)
-            unlocked = False
-            with self._subsystem_lock:
-                if (self._subsystem_running
-                        and self._subsystem_token == subsystem_token
-                        and thread.is_alive()):
-                    self._subsystem_running = False
-                    unlocked = True
-            if unlocked:
-                logging.critical(
-                    "[hotkey-watchdog] %s 執行超過 %ds 仍未結束(疑似卡在無逾時的跨"
-                    "行程呼叫/醫院 app freeze) → 已強制解除熱鍵鎖定以恢復其他熱鍵"
-                    "(卡住的工作緒無法 kill，請留意畫面)",
-                    hotkey_name, HOTKEY_HARD_TIMEOUT_SEC)
-                put_ui_message(self.ui_queue, UiStatusMessage(
-                    text=f'狀態: {hotkey_name} 疑似卡死，已解除熱鍵鎖定（請檢查畫面）'))
+            while True:
+                unlocked = False
+                with self._subsystem_lock:
+                    active = (self._subsystem_running
+                              and self._subsystem_token == subsystem_token
+                              and thread.is_alive())
+                    awaiting = active and _hotkey_awaiting_user
+                    if active and not awaiting:
+                        self._subsystem_running = False
+                        unlocked = True
+                if not active:
+                    return  # 流程已正常結束或被後續熱鍵取代
+                if awaiting:
+                    time.sleep(HOTKEY_HARD_TIMEOUT_SEC)  # 仍在等使用者，再給一個週期
+                    continue
+                if unlocked:
+                    logging.critical(
+                        "[hotkey-watchdog] %s 執行超過 %ds 仍未結束(疑似卡在無逾時的跨"
+                        "行程呼叫/醫院 app freeze) → 已強制解除熱鍵鎖定以恢復其他熱鍵"
+                        "(卡住的工作緒無法 kill，請留意畫面)",
+                        hotkey_name, HOTKEY_HARD_TIMEOUT_SEC)
+                    put_ui_message(self.ui_queue, UiStatusMessage(
+                        text=f'狀態: {hotkey_name} 疑似卡死，已解除熱鍵鎖定（請檢查畫面）'))
+                return
 
         threading.Thread(target=_hotkey_hard_timeout_watch,
                          name=f"{hotkey_name}_HardTimeout", daemon=True).start()

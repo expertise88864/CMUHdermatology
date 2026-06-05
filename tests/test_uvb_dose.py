@@ -24,6 +24,18 @@ from cmuh_common.uvb_dose import (  # noqa: E402
 )
 
 
+# ─── [stability r4] 遺留死參數移除 ──────────────────────────────────────
+
+def test_update_uvb_in_text_rejects_removed_first_time_param():
+    """treat_as_first_time 是 v20.16→v20.17 重構遺留的死參數(簽章宣告但函式從未讀取)，
+    已移除以免未來 caller 依舊 docstring 誤傳而以為會跳過 decay。"""
+    import inspect
+    sig = inspect.signature(update_uvb_in_text)
+    assert "treat_as_first_time" not in sig.parameters
+    with pytest.raises(TypeError):
+        update_uvb_in_text("dummy text", treat_as_first_time=True)
+
+
 # ─── compute_new_dose: 各 day-bucket ────────────────────────────────────
 
 @pytest.mark.parametrize("days_diff", [0, 1])

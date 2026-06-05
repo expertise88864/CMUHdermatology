@@ -418,3 +418,44 @@ def test_check_and_update_rejects_duplicate_manifest_targets(tmp_path, monkeypat
     assert not (tmp_path / "same.py").exists()
     assert result.updated_files == []
     assert any("更新清單重複目標" in error for error in result.errors)
+
+
+# === [stability r4] ===
+
+def test_check_and_update_cleans_backup_after_successful_batch(tmp_path, monkeypatch):
+    """成功 commit 後 .bak 備份應被清掉，避免無人值守長跑下程式目錄堆積殘檔。"""
+    existing = tmp_path / "a.py"
+    existing.write_text("old-a", encoding="utf-8")
+    manifest = {
+        "app_version": "2099.01.01.1",
+        "files": [{"key": "a", "local_filename": "a.py"}],
+    }
+    monkeypatch.setattr(updater, "_fetch_manifest", lambda: manifest)
+    monkeypatch.setattr(updater, "get_app_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(updater, "is_frozen", lambda: False)
+    monkeypatch.setattr(
+        updater,
+        "_download_one",
+        lambda entry, _app_dir: (
+            entry["key"], entry["local_filename"], "2099.01.01.1",
+            f"new-{entry['key']}",
+        ),
+    )
+    monkeypatch.setattr(updater, "_precompile_files", lambda paths: None)
+
+    result = updater.check_and_update(write_files=True)
+
+    assert existing.read_text(encoding="utf-8") == "new-a"
+    assert result.has_update is True
+    assert not (tmp_path / "a.py.bak").exists()
+    assert not list(tmp_path.glob("*.bak"))
+
+
+def test_download_batch_has_wall_clock_deadline():
+    """整批下載有牆鐘總時限，且不靠 with-block join(會讓時限失效)。"""
+    import pathlib
+    assert hasattr(updater, "_DOWNLOAD_BATCH_DEADLINE_SEC")
+    assert updater._DOWNLOAD_BATCH_DEADLINE_SEC > 0
+    src = pathlib.Path(updater.__file__).read_text(encoding="utf-8")
+    assert "as_completed(futures, timeout=_DOWNLOAD_BATCH_DEADLINE_SEC)" in src
+    assert "shutdown(wait=False, cancel_futures=True)" in src

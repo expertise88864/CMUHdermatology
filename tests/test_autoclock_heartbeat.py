@@ -341,3 +341,31 @@ def test_clock_trigger_times_are_one_minute_into_window():
     assert autoclock.CLOCK_MIDDAY_IN_START_TIME == _dt_time(12, 31, 0)
     assert autoclock.TRIGGER_PM_OUT_START_TIME == _dt_time(17, 1, 0)
     assert autoclock.CLOCK_EVE_OUT_START_TIME == _dt_time(21, 1, 0)
+
+
+# === [stability r4] idle 回收器不得 quit 使用中的 driver ===
+
+def test_idle_janitor_skips_driver_in_use(monkeypatch):
+    """driver 標記 in_use(任務進行中)時，idle 回收器絕不 quit；避免單帳號耗時 >15 分
+    時砍掉使用中的 driver 造成後續帳號 InvalidSessionId。清 in_use 後才可回收。"""
+    pool = autoclock._persistent_driver_pool
+    quit_called = []
+
+    class _FakeDriver:
+        def quit(self):
+            quit_called.append(True)
+
+    # last_used=0 → idle_for 遠超過 timeout；唯一不該 quit 的理由就是 in_use=True
+    monkeypatch.setitem(pool, "driver", _FakeDriver())
+    monkeypatch.setitem(pool, "last_used", 0.0)
+    monkeypatch.setitem(pool, "in_use", True)
+
+    autoclock._idle_driver_janitor()
+    assert quit_called == [], "in_use 時不得 quit driver"
+    assert pool["driver"] is not None
+
+    # 任務結束清 in_use 後，閒置(last_used 很舊)的 driver 才可被回收
+    monkeypatch.setitem(pool, "in_use", False)
+    autoclock._idle_driver_janitor()
+    assert quit_called == [True]
+    assert pool["driver"] is None

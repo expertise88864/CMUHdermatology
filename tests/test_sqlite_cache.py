@@ -116,3 +116,76 @@ def test_load_returns_empty_without_query_when_initialize_fails(monkeypatch):
     )
 
     assert sc.load_clinic_counts() == {}
+
+
+# === [stability r4] 執行期(非啟動時)損壞復原 ===
+
+def test_is_corruption_error_classifies_lock_vs_malformed():
+    # 暫時鎖競爭 → 不是損壞，不應觸發重建
+    assert sc._is_corruption_error(
+        sqlite3.OperationalError("database is locked")) is False
+    assert sc._is_corruption_error(
+        sqlite3.OperationalError("database table is busy")) is False
+    # 真正的損壞 / 磁碟錯誤 → 視為損壞，應觸發重建
+    assert sc._is_corruption_error(
+        sqlite3.DatabaseError("database disk image is malformed")) is True
+    assert sc._is_corruption_error(
+        sqlite3.OperationalError("disk I/O error")) is True
+    assert sc._is_corruption_error(
+        sqlite3.DatabaseError("file is not a database")) is True
+    # 非 sqlite 例外 → 不重建
+    assert sc._is_corruption_error(ValueError("nope")) is False
+
+
+def test_save_clinic_counts_recovers_from_runtime_corruption(monkeypatch):
+    """啟動後才損壞：save 的 conn.execute 拋 DatabaseError → 清 _initialized
+    並關連線，讓下一次呼叫重走隔離+重建路徑（不再永久壞死至重啟）。"""
+    closed = []
+
+    class _CorruptConn:
+        def execute(self, *_a, **_k):
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(sc, "_initialized", True)
+    monkeypatch.setattr(sc, "_get_conn", lambda: _CorruptConn())
+    monkeypatch.setattr(sc, "_close_cached_conn", lambda: closed.append(True))
+
+    # 不應拋例外（錯誤被吞），但偵測到損壞後重設狀態
+    sc.save_clinic_counts({"D123": {"2026-05-24": [1, 2, 3]}})
+
+    assert closed == [True]
+    assert sc._initialized is False
+
+
+def test_load_clinic_counts_recovers_from_runtime_corruption(monkeypatch):
+    closed = []
+
+    class _CorruptConn:
+        def execute(self, *_a, **_k):
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(sc, "_initialized", True)
+    monkeypatch.setattr(sc, "_get_conn", lambda: _CorruptConn())
+    monkeypatch.setattr(sc, "_close_cached_conn", lambda: closed.append(True))
+
+    assert sc.load_clinic_counts() == {}
+    assert closed == [True]
+    assert sc._initialized is False
+
+
+def test_transient_lock_does_not_reset_initialized(monkeypatch):
+    """暫時鎖競爭不應拆連線重建（否則一次偶發鎖等待就浪費重連）。"""
+    closed = []
+
+    class _LockedConn:
+        def execute(self, *_a, **_k):
+            raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(sc, "_initialized", True)
+    monkeypatch.setattr(sc, "_get_conn", lambda: _LockedConn())
+    monkeypatch.setattr(sc, "_close_cached_conn", lambda: closed.append(True))
+
+    sc.save_clinic_counts({"D123": {"2026-05-24": [1]}})
+
+    assert closed == []
+    assert sc._initialized is True

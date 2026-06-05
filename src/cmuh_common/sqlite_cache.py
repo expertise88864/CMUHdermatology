@@ -196,6 +196,36 @@ def _ensure_initialized() -> bool:
             return False
 
 
+def _is_corruption_error(exc: BaseException) -> bool:
+    """[stability r4] 判斷例外是否為『DB 檔損壞』(需隔離重建)，而非暫時性鎖競爭。
+
+    sqlite3.OperationalError 是 DatabaseError 子類；'database is locked'/'busy' 屬
+    暫時鎖競爭，不應觸發重建(否則一次偶發鎖等待就拆連線、浪費)。其餘 DatabaseError
+    (malformed / not a database / disk I/O error 等)視為損壞。"""
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    if isinstance(exc, sqlite3.OperationalError):
+        msg = str(exc).lower()
+        if "lock" in msg or "busy" in msg:
+            return False
+    return True
+
+
+def _reset_for_corruption(where: str, exc: BaseException) -> None:
+    """[stability r4] 執行期(非啟動時)偵測到 DB 損壞 → 關閉連線並清 _initialized，
+    讓下一次呼叫重走 _ensure_initialized 的隔離+重建路徑。
+
+    原本 _initialized 一旦 True 永久 latch，啟動後才損壞(磁碟壞軌/被外部截斷/WAL 損壞)
+    時 save/load 的 except 只記 log、不復原 → 快取永久壞死直到 process 重啟。此函式把
+    『執行期損壞』導回既有的『啟動期損壞』復原機制。"""
+    global _initialized
+    with _db_lock:
+        logging.error("[O22] %s 偵測到 SQLite 疑似損壞(%s) → 關閉連線，下次呼叫將隔離重建",
+                      where, exc)
+        _close_cached_conn()
+        _initialized = False
+
+
 def _normalize_date_key(k) -> Optional[str]:
     """將 dict key 轉為 ISO 日期字串。"""
     if isinstance(k, (date, datetime)):
@@ -236,8 +266,10 @@ def load_clinic_counts(*, since_date: Optional[str] = None) -> dict:
                 except Exception:
                     continue
                 out.setdefault(doc_no, {})[date_iso] = payload
-    except Exception:
+    except Exception as e:
         logging.error("[O22] load_clinic_counts 失敗", exc_info=True)
+        if _is_corruption_error(e):
+            _reset_for_corruption("load_clinic_counts", e)
     return out
 
 
@@ -304,8 +336,10 @@ def save_clinic_counts(all_doctors_data: dict,
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
-    except Exception:
+    except Exception as e:
         logging.error("[O22] save_clinic_counts 失敗", exc_info=True)
+        if _is_corruption_error(e):
+            _reset_for_corruption("save_clinic_counts", e)
 
 
 def vacuum_old_entries(*, older_than_days: int = 30) -> int:
