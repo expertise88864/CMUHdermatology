@@ -4,12 +4,14 @@
 流程：
   1. sanity check：settings/ 不可被追蹤、.gitignore 完整、version.py 可讀
   2. 確認有 git 變更
-  3. bump 版本（YYYY.MM.DD.serial）
-  4. 同步 manifest.json（含 SHA256）
-  5. git add -A → commit → push
+  3. 品質關卡：ruff + pytest，紅燈就中止（壞 build 推不出去；尚未 bump/commit）
+  4. bump 版本（YYYY.MM.DD.serial）
+  5. 同步 manifest.json（含 SHA256）
+  6. git add -A → commit → push
 """
 from __future__ import annotations
 
+import importlib.util
 import re
 import subprocess
 import sys
@@ -69,8 +71,35 @@ def step2_check_changes() -> bool:
     return True
 
 
+def step_quality_gate() -> None:
+    """ruff + pytest 品質關卡。任一紅燈即中止推送（此時尚未 bump 版本、未 commit）。
+
+    工具未安裝時警示並略過該項（讓沒裝 dev 工具的機器仍能推），但 CI 仍會把關。
+    """
+    print("\n=== [3/7] 品質關卡（ruff + pytest）===")
+    checks = [
+        ("ruff", "ruff",
+         [sys.executable, "-m", "ruff", "check", "src", "scripts", "tests"]),
+        ("pytest", "pytest",
+         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]),
+    ]
+    failed = []
+    for label, module, cmd in checks:
+        if importlib.util.find_spec(module) is None:
+            print(f"  [略過] {label} 未安裝，跳過（建議 pip install {label}）。CI 仍會把關。")
+            continue
+        print(f"  $ {' '.join(cmd)}")
+        if subprocess.run(cmd, cwd=REPO_ROOT).returncode != 0:
+            failed.append(label)
+        else:
+            print(f"  [OK] {label} 通過")
+    if failed:
+        fail(f"品質關卡未通過（{', '.join(failed)} 紅燈），已中止推送。\n"
+             f"  尚未 bump 版本、未 commit；請修正上面紅燈後再 push。")
+
+
 def step3_bump_version() -> str:
-    print("\n=== [3/6] Bump 版本號 ===")
+    print("\n=== [4/7] Bump 版本號 ===")
     ver_file = REPO_ROOT / "src" / "cmuh_common" / "version.py"
     text = ver_file.read_text(encoding='utf-8')
     m = re.search(r'CURRENT_VERSION\s*=\s*["\']([\d.]+)["\']', text)
@@ -96,7 +125,7 @@ def step3_bump_version() -> str:
 
 
 def step4_sync_manifest(new_version: str) -> None:
-    print("\n=== [4/6] 同步 manifest.json（含 SHA256）===")
+    print("\n=== [5/7] 同步 manifest.json（含 SHA256）===")
     # 不 capture（避免 cp950 console 解碼 utf-8 中文輸出失敗）；讓子程序直接印
     cp = run([sys.executable, str(REPO_ROOT / "scripts" / "sync_manifest.py"), new_version],
              check=False)
@@ -105,7 +134,7 @@ def step4_sync_manifest(new_version: str) -> None:
 
 
 def step5_commit(commit_msg: str, new_version: str) -> None:
-    print("\n=== [5/6] Commit ===")
+    print("\n=== [6/7] Commit ===")
     if not commit_msg or commit_msg.strip() in ("", "1"):
         commit_msg = f"Update v{new_version}"
     run(["git", "add", "-A"])
@@ -115,7 +144,7 @@ def step5_commit(commit_msg: str, new_version: str) -> None:
 
 
 def step6_push() -> None:
-    print("\n=== [6/6] Push ===")
+    print("\n=== [7/7] Push ===")
     # 取當前分支
     cp = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], check=False, capture=True)
     branch = cp.stdout.strip() or "main"
@@ -143,6 +172,7 @@ def main(argv: list) -> int:
     step1_sanity()
     if not step2_check_changes():
         return 0
+    step_quality_gate()
     new_ver = step3_bump_version()
     step4_sync_manifest(new_ver)
     step5_commit(commit_msg, new_ver)

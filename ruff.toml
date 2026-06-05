@@ -1,0 +1,13 @@
+# Ruff 設定 —— push 前置關卡與 CI 強制的規則集。
+#
+# 只強制「真 bug」類規則,不強制風格類:
+#   F  = pyflakes：未定義名稱(F821，例如 scheduler 漏 import 的 _HOTKEY_BASE_SIZE)、
+#        重複定義(F811，去重重構時特別重要)、未使用 import(F401)、未使用變數(F841) 等。
+#   E9 = 語法錯誤(E901/E902/E999)。
+#
+# 本專案大量使用 `if cond: stmt` 一行多敘述(E701)等風格寫法,屬個人習慣、非 bug,
+# 故「不」納入強制,避免關卡永遠紅燈而失去意義。日後若想提升,可逐步加入 B(bugbear)等。
+line-length = 200
+
+[lint]
+select = ["F", "E9"]

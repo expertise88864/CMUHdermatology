@@ -178,7 +178,7 @@ def test_parse_uvb_with_colon():
     """
     text = "已打8折medication and follow up, UVB: 970mj/cm2 (197) on   (2026/05/24)         , increase 50mj/cm2 if no erythema  , MAX: 1000, W2, , 8 weeks (2025/3/4) tar shampoo"
     info = parse_uvb_line(text)
-    assert info is not None, f"UVB: 冒號 parse 失敗，real-world text 無法處理"
+    assert info is not None, "UVB: 冒號 parse 失敗，real-world text 無法處理"
     assert info.dose == 970
     assert info.count == 197
     assert info.last_date == date(2026, 5, 24)
@@ -1306,7 +1306,7 @@ def test_image2_liao_chinese_chars_between_colon_and_dose_parse_fail():
             "re-Acitreitin 1# QD on (2022/3/1)")
     r = update_uvb_in_text(text, today=date(2026, 5, 26))
     assert r.action == UvbAction.PARSE_FAIL, (
-        f"image 2 中文夾 UVB 跟劑量 → 必須 PARSE_FAIL，不該硬修改")
+        "image 2 中文夾 UVB 跟劑量 → 必須 PARSE_FAIL，不該硬修改")
 
 
 def test_stale_record_31_days_returns_confirm_needed():

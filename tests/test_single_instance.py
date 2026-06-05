@@ -74,7 +74,7 @@ def test_ensure_single_instance_retries_until_mutex_released(monkeypatch):
 
 def test_ensure_single_instance_access_denied_does_not_retry(monkeypatch):
     """ACCESS_DENIED 不重試：sleep 不該被呼叫，立即回 False。"""
-    fake = _patch_mutex(monkeypatch, handle=0, last_error=5)
+    _patch_mutex(monkeypatch, handle=0, last_error=5)
     slept = []
     monkeypatch.setattr(si.time, "sleep", lambda s: slept.append(s))
 

@@ -1,0 +1,37 @@
+name: CI
+
+# 在 push 到 main 與所有 PR 時跑;也可手動觸發。
+# 用 windows-latest:本專案依賴 pywin32 / pyautogui / keyboard / pystray 等
+# Windows-only 套件,測試會 import 到它們,必須在 Windows 上跑。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff pytest
+
+      - name: Ruff (真 bug 類 lint — F/E9，規則見 ruff.toml)
+        run: python -m ruff check src scripts tests
+
+      - name: Pytest (全測試 + import 冒煙測試)
+        run: python -m pytest -q -p no:cacheprovider

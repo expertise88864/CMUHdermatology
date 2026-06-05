@@ -56,7 +56,7 @@ RATE_LIMIT_MAX = 30            # 1 小時內最多 30 封
 DEFAULT_MAX_RETRIES = 2
 MAX_RETRIES = 5
 _rate_limit_lock = _threading.Lock()
-_recent_send_reservations: "collections.deque" = _collections.deque(
+_recent_send_reservations: "_collections.deque" = _collections.deque(
     maxlen=RATE_LIMIT_MAX * 4)
 
 
