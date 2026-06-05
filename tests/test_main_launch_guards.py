@@ -618,8 +618,6 @@ def test_f11_phototherapy_uses_finish_no_print_without_print_fallback():
     f11_main_src = _function_source(source_path, "_f11_快速完成_main")
     no_print_src = _function_source(source_path, "_f11_send_finish_no_print")
     all_finish_src = _function_source(source_path, "_f11_click_finish_all")
-    card_gate_src = _function_source(source_path, "_f11_card_allows_finish_all")
-    ensure_card_src = _function_source(source_path, "_f11_ensure_ic_card")
     main_src = source_path.read_text(encoding="utf-8")
 
     assert "MENU_ID_FINISH_NO_PRINT = 276" in main_src
@@ -629,15 +627,16 @@ def test_f11_phototherapy_uses_finish_no_print_without_print_fallback():
     assert "cmd_id = MENU_ID_FINISH_NO_PRINT" in no_print_src
     assert "照光病人不改按 全部完成" in no_print_src
     assert '"全部完成"' in all_finish_src
-    assert "_f11_ensure_ic_card" in all_finish_src
-    assert "_f11_card_allows_finish_all" in all_finish_src
-    assert "不按 全部完成" in all_finish_src
-    assert "any(ch.isdigit() for ch in value)" in card_gate_src
-    assert 'value.startswith(("V", "Ｖ"))' in card_gate_src
-    assert 'or value == "IC"' in card_gate_src
-    assert "卡號欄空白" in ensure_card_src
-    assert '"IC"' in ensure_card_src
     assert "fallback 全部完成" not in no_print_src
+
+    # [2026-06-05] 卡號偵測 / 自動補 IC / 卡號把關功能已移除：
+    # route B 一律直接按「全部完成」，不再讀卡號。確認相關符號徹底消失。
+    assert "_f11_ensure_ic_card" not in main_src
+    assert "_f11_card_allows_finish_all" not in main_src
+    assert "_f11_normalize_card_value" not in main_src
+    assert "_find_卡號_edit_hwnd" not in main_src
+    assert "_f11_ensure_ic_card" not in all_finish_src
+    assert "card_value" not in all_finish_src
 
 
 def test_f9_f10_fixed_waits_are_interruptible():
