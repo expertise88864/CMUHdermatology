@@ -237,9 +237,19 @@ def _resolve_commit_sha(timeout: float) -> str:
 
 
 def _fetch_manifest(timeout: float = MANIFEST_TIMEOUT) -> dict:
-    """取最新 commit 的 manifest，避免 Raw 分支路徑短暫回傳舊版清單。"""
+    """取 manifest。優先用「API 當下解析到的『新』commit」釘住下載：同一次更新所有檔
+    來自同一 commit、避開 Raw 分支短暫舊清單。
+
+    【2026-06-05 修正】若 commit SHA 是「API 失敗後沿用的舊磁碟快取」，**不可**拿它去
+    釘 manifest —— 否則一旦 api.github.com 長期不可達（醫院防火牆常擋 api.github.com
+    卻放行 raw.githubusercontent.com），機器會被永遠釘在那個舊 commit、再也更新不過去。
+    此時改走 branch 最新版（搭配 cache-buster），以「一定拿得到最新」為優先（branch CDN
+    至多短暫舊，下次排程檢查即修正），徹底避免「永久卡在舊版」。
+    """
     commit_sha = _resolve_commit_sha(timeout)
-    remote_ref = commit_sha or GITHUB_BRANCH
+    # 只有「API 當下成功取得的新 commit」才用來釘；舊快取(_commit_sha_from_cache=True)走 branch。
+    pinned_sha = "" if _commit_sha_from_cache else commit_sha
+    remote_ref = pinned_sha or GITHUB_BRANCH
     url = (
         f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}"
         f"/{remote_ref}/manifest.json?v={remote_ref}&t={time.time_ns()}"
@@ -248,9 +258,9 @@ def _fetch_manifest(timeout: float = MANIFEST_TIMEOUT) -> dict:
     resp.raise_for_status()
     resp.encoding = 'utf-8'
     manifest = resp.json()
-    if commit_sha:
-        manifest["_remote_commit_sha"] = commit_sha
-        manifest["_remote_commit_sha_from_cache"] = bool(_commit_sha_from_cache)
+    if pinned_sha:
+        manifest["_remote_commit_sha"] = pinned_sha
+        manifest["_remote_commit_sha_from_cache"] = False
     return manifest
 
 

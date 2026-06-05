@@ -150,7 +150,9 @@ def test_resolve_commit_sha_returns_empty_without_cache(monkeypatch):
     assert updater._resolve_commit_sha(5) == ""
 
 
-def test_fetch_manifest_pins_to_cached_sha_on_api_failure(monkeypatch):
+def test_fetch_manifest_falls_back_to_branch_when_only_stale_cache(monkeypatch):
+    """API 失敗、只能沿用『舊磁碟快取 commit』時，manifest 必須改走 branch 最新版，
+    而不是釘在舊 commit（否則醫院擋 api.github.com 的機器會永遠卡在舊版更新不過去）。"""
     cached_sha = "d" * 40
     monkeypatch.setattr(updater, "_commit_sha_cache", cached_sha)
     monkeypatch.setattr(updater.time, "time_ns", lambda: 42)
@@ -166,13 +168,12 @@ def test_fetch_manifest_pins_to_cached_sha_on_api_failure(monkeypatch):
 
     manifest = updater._fetch_manifest()
 
-    # API 失敗仍把 manifest 釘在 cached commit（不是 branch /main/ 舊版路徑）
-    assert manifest["_remote_commit_sha"] == cached_sha
-    assert manifest["_remote_commit_sha_from_cache"] is True
+    # 不再釘在舊 cached commit：manifest 不帶 commit 標記，且 manifest URL 走 branch
+    assert "_remote_commit_sha" not in manifest
     assert urls[-1] == (
         "https://raw.githubusercontent.com/"
-        f"{updater.GITHUB_OWNER}/{updater.GITHUB_REPO}/{cached_sha}"
-        f"/manifest.json?v={cached_sha}&t=42"
+        f"{updater.GITHUB_OWNER}/{updater.GITHUB_REPO}/{updater.GITHUB_BRANCH}"
+        f"/manifest.json?v={updater.GITHUB_BRANCH}&t=42"
     )
 
 
