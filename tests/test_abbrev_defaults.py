@@ -166,6 +166,20 @@ def test_replace_cooldown_timer_waits_only_remaining_time():
     assert "threading.Timer(self.COOLDOWN_SEC" not in source
 
 
+def test_native_edit_path_shortens_cooldown(monkeypatch):
+    """原生欄位快路徑（同步、不碰剪貼簿）應把 cool-down 大幅縮短，連續展開更即時。"""
+    monkeypatch.setattr(ae, "_replace_native_edit_suffix", lambda *a, **k: True)
+    engine = ae.AbbrevEngine(object())
+    engine._suppressing = True
+    engine._cooldown_until = ae.time.monotonic() + engine.COOLDOWN_SEC
+
+    engine._do_replace(3, "expanded ", "cert", "cert ")
+
+    remaining = engine._cooldown_until - ae.time.monotonic()
+    assert remaining <= engine.NATIVE_EDIT_COOLDOWN_SEC + 0.05
+    assert remaining < engine.COOLDOWN_SEC
+
+
 def test_replace_clears_suppress_when_cooldown_timer_cannot_start(monkeypatch):
     class FakeKeyboard:
         def send(self, _key):

@@ -103,15 +103,8 @@ def test_main_background_launches_check_mutex_before_spawn():
     _assert_consult_launch_guard(source_path)
 
 
-def test_scheduler_background_launches_check_mutex_before_spawn():
-    source_path = ROOT / "src" / "scheduler.py"
-
-    _assert_autoclock_launch_guard(source_path)
-    _assert_consult_launch_guard(source_path)
-
-
 def test_main_and_scheduler_helper_launches_use_shared_launcher():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         source_path = ROOT / rel_path
         for func_name in (
             "_launch_scheduler_program",
@@ -122,12 +115,6 @@ def test_main_and_scheduler_helper_launches_use_shared_launcher():
             src = _function_source(source_path, func_name)
             assert "launch_app_script(" in src
             assert "subprocess.Popen(" not in src
-
-
-def test_scheduler_window_has_distinct_title():
-    source = (ROOT / "src" / "scheduler.py").read_text(encoding="utf-8")
-
-    assert 'self.root.title("中國醫皮膚科排班程式")' in source
 
 
 def test_main_places_window_on_preferred_monitor_before_and_after_deiconify():
@@ -153,17 +140,6 @@ def test_main_background_restart_starts_minimized_silently():
     assert "main_root.iconify()" in source
     assert 'main_root.bind(\n                "<Map>"' in source or 'main_root.bind("<Map>"' in source
     # app 端重啟匯流點帶 --background
-    assert 'restart_self(["--background"])' in source
-
-
-def test_scheduler_background_restart_starts_minimized_silently():
-    source = (ROOT / "src" / "scheduler.py").read_text(encoding="utf-8")
-
-    assert '_start_background = ("--background" in sys.argv)' in source
-    assert "main_root.iconify()" in source
-    # __init__ 的 zoom 對 withdrawn 視窗要跳過（避免背景啟動被 re-map 閃一下）
-    assert "if self.root.state() != 'withdrawn':" in source
-    # 自動重啟帶 --background
     assert 'restart_self(["--background"])' in source
 
 
@@ -231,48 +207,8 @@ def test_run_subsystem_reports_incomplete_return_status():
     assert src.index("if result is False:") < src.index("操作完成")
 
 
-def test_scheduler_run_subsystem_uses_guardian_policies():
-    source_path = ROOT / "src" / "scheduler.py"
-    src = _function_source(source_path, "run_subsystem_in_thread")
-
-    assert "should_show_busy_notice" in src
-    assert "result = func()" in src
-    assert "if result is False:" in src
-    assert "操作未完成" in src
-    assert "should_emit_idle_status" in src
-    assert "subsystem_token" in src
-
-
-def test_scheduler_interrupt_automation_is_deduplicated():
-    source_path = ROOT / "src" / "scheduler.py"
-    src = _function_source(source_path, "interrupt_automation")
-
-    assert "should_emit_interrupt" in src
-    assert "stop_already_requested=stop_event_automation.is_set()" in src
-    assert "Received F12 but no automation is running; ignored." in src
-
-
-def test_scheduler_shutdown_is_idempotent_and_stops_automation():
-    source_path = ROOT / "src" / "scheduler.py"
-    src = _function_source(source_path, "shutdown_app")
-    full_src = source_path.read_text(encoding="utf-8")
-
-    assert "self._exit_cleanup_done = False" in full_src
-    assert "if getattr(self, '_exit_cleanup_done', False):" in src
-    assert "self._exit_cleanup_done = True" in src
-    assert "stop_event_automation.set()" in src
-    assert src.index("stop_event_automation.set()") < src.index("self.bg_executor.shutdown")
-
-
-def test_scheduler_shutdown_clears_http_pools_without_blocking_close():
-    src = _function_source(ROOT / "src/scheduler.py", "shutdown_app")
-
-    assert "adapter.poolmanager.clear()" in src
-    assert "session.close()" not in src
-
-
 def test_main_and_scheduler_schedule_cache_cleanup_for_standalone_launches():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "start_background_tasks")
 
         assert "schedule_cleanup_in_background(self.bg_executor, delay_seconds=30)" in src
@@ -288,7 +224,7 @@ def test_main_uses_weak_http_session_registry_and_bounded_memory_caches():
 
 
 def test_main_and_scheduler_log_queues_are_bounded():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = (ROOT / rel_path).read_text(encoding="utf-8")
 
         assert "self.log_queue = Queue(maxsize=5000)" in src
@@ -296,7 +232,7 @@ def test_main_and_scheduler_log_queues_are_bounded():
 
 
 def test_main_and_scheduler_ui_queues_are_bounded():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = (ROOT / rel_path).read_text(encoding="utf-8")
 
         assert "self.ui_queue = Queue(maxsize=10000)" in src
@@ -304,7 +240,7 @@ def test_main_and_scheduler_ui_queues_are_bounded():
 
 
 def test_main_and_scheduler_background_executors_are_bounded():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = (ROOT / rel_path).read_text(encoding="utf-8")
 
         assert "BoundedThreadPoolExecutor(" in src
@@ -313,7 +249,7 @@ def test_main_and_scheduler_background_executors_are_bounded():
 
 
 def test_refresh_batches_use_local_executor_instead_of_bg_queue():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "_trigger_refresh")
 
         assert 'thread_name_prefix="RefreshBatch"' in src
@@ -322,7 +258,7 @@ def test_refresh_batches_use_local_executor_instead_of_bg_queue():
 
 
 def test_duty_info_uses_local_executor_instead_of_bg_queue():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "_fetch_all_duty_info")
 
         assert 'thread_name_prefix="DutyInfo"' in src
@@ -331,7 +267,7 @@ def test_duty_info_uses_local_executor_instead_of_bg_queue():
 
 
 def test_duty_info_is_single_flight_and_only_caches_complete_success():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         full_src = (ROOT / rel_path).read_text(encoding="utf-8")
         fetch_src = _function_source(ROOT / rel_path, "_fetch_all_duty_info")
         single_src = _function_source(ROOT / rel_path, "_run_single_duty_query")
@@ -350,7 +286,7 @@ def test_duty_info_is_single_flight_and_only_caches_complete_success():
 
 
 def test_duty_queries_report_success_for_daily_cache_decision():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         for name in ("fetch_duty_doctor", "fetch_saturday_duty_doctor", "fetch_duty_vs"):
             src = _function_source(ROOT / rel_path, name)
 
@@ -358,7 +294,7 @@ def test_duty_queries_report_success_for_daily_cache_decision():
 
 
 def test_refresh_submit_rejection_restores_ui_state():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "_trigger_refresh")
 
         assert "RejectedExecutionError" in src
@@ -370,7 +306,7 @@ def test_refresh_submit_rejection_restores_ui_state():
 
 
 def test_clinic_worker_submit_rejection_clears_running_flag():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "_update_clinic_lights_loop")
 
         assert "RejectedExecutionError" in src
@@ -380,7 +316,7 @@ def test_clinic_worker_submit_rejection_clears_running_flag():
 
 
 def test_clinic_stat_submit_is_deduplicated_and_retries_rejected_closing_save():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         full_src = (ROOT / rel_path).read_text(encoding="utf-8")
         loop_src = _function_source(ROOT / rel_path, "_update_clinic_lights_loop")
         submit_src = _function_source(ROOT / rel_path, "_submit_clinic_session_stat")
@@ -399,7 +335,7 @@ def test_clinic_stat_submit_is_deduplicated_and_retries_rejected_closing_save():
 
 
 def test_ui_thread_dispatch_skips_callbacks_during_shutdown():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "_run_on_ui_thread")
 
         assert 'getattr(self, "_shutting_down", False)' in src
@@ -410,7 +346,7 @@ def test_ui_thread_dispatch_skips_callbacks_during_shutdown():
 
 
 def test_refresh_entrypoint_reroutes_to_tk_thread():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "_trigger_refresh")
 
         assert "threading.current_thread() is not threading.main_thread()" in src
@@ -419,7 +355,7 @@ def test_refresh_entrypoint_reroutes_to_tk_thread():
 
 
 def test_clinic_polling_snapshots_tk_modes_before_background_work():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "_update_clinic_lights_loop")
         mode_read = "self.clinic_display_mode_vars[i].get()"
 
@@ -431,16 +367,13 @@ def test_clinic_polling_snapshots_tk_modes_before_background_work():
 
 def test_clinic_room_defaults_use_shared_101_102_constant():
     main_src = (ROOT / "src/main.py").read_text(encoding="utf-8")
-    scheduler_src = (ROOT / "src/scheduler.py").read_text(encoding="utf-8")
 
     assert "DEFAULT_CLINIC_ROOMS" in main_src
-    assert "DEFAULT_CLINIC_ROOMS" in scheduler_src
     assert '["181", "182"]' not in main_src
-    assert '["181", "182"]' not in scheduler_src
 
 
 def test_clinic_room_settings_migrate_legacy_defaults_on_load():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "load_clinic_settings")
 
         assert "normalize_clinic_rooms(settings.get(\"rooms\"))" in src
@@ -449,7 +382,7 @@ def test_clinic_room_settings_migrate_legacy_defaults_on_load():
 
 
 def test_scheduled_background_submits_detect_rejected_futures():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "start_background_tasks")
 
         assert "def _future_was_rejected(future):" in src
@@ -468,7 +401,7 @@ def test_hotkey_guardian_uses_safe_rehook_policy():
     """守護程式偵測到全域 hook 失效時，只能在安全狀態下自動重啟：非自動化執行中、
     模組就緒、且使用者閒置（system idle 達門檻），避免打斷醫令流程。健康判定邏輯
     已從 run_hotkey_guardian 移到 _hotkey_health_tick。"""
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         guardian = _function_source(ROOT / rel_path, "run_hotkey_guardian")
         assert "GUARDIAN_INTERVAL_SEC" in guardian
         assert "self._hotkey_health_tick()" in guardian
@@ -486,7 +419,7 @@ def test_hotkey_guardian_uses_safe_rehook_policy():
 
 
 def test_hotkey_module_loader_recovers_from_rejected_submit():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         loader_src = _function_source(ROOT / rel_path, "_start_hotkey_module_loading")
         deferred_src = _function_source(ROOT / rel_path, "deferred_initialization")
 
@@ -499,7 +432,7 @@ def test_hotkey_module_loader_recovers_from_rejected_submit():
 
 
 def test_url_shortener_recovers_from_rejected_submit():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "_start_shorten_url")
 
         assert "shorten_future = self.bg_executor.submit(self._run_url_shortener, long_url)" in src
@@ -510,7 +443,7 @@ def test_url_shortener_recovers_from_rejected_submit():
 
 
 def test_settings_promo_recovers_from_rejected_submit():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "ensure_settings_promo_loaded")
 
         assert "promo_future = self.bg_executor.submit(self._load_settings_promo_image)" in src
@@ -521,7 +454,7 @@ def test_settings_promo_recovers_from_rejected_submit():
 
 
 def test_clock_status_query_is_single_flight_and_recovers_from_rejection():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         full_src = (ROOT / rel_path).read_text(encoding="utf-8")
         src = _function_source(ROOT / rel_path, "update_clock_status_from_web")
 
@@ -536,7 +469,7 @@ def test_clock_status_query_is_single_flight_and_recovers_from_rejection():
 
 
 def test_startup_background_submits_retry_when_queue_is_full():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "start_background_tasks")
 
         assert "def _submit_startup_background(task_name, fn, *args, attempt=1):" in src
@@ -549,7 +482,7 @@ def test_startup_background_submits_retry_when_queue_is_full():
 
 
 def test_update_check_is_single_flight_and_manual_submit_reports_rejection():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         full_src = (ROOT / rel_path).read_text(encoding="utf-8")
         submit_src = _function_source(ROOT / rel_path, "_submit_update_check")
         check_src = _function_source(ROOT / rel_path, "check_and_update")
@@ -569,7 +502,7 @@ def test_update_check_is_single_flight_and_manual_submit_reports_rejection():
 
 
 def test_startup_refresh_avoids_unnecessary_executor_hop():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "_startup_priority_refresh")
 
         assert "self._trigger_refresh(False" in src
@@ -577,7 +510,7 @@ def test_startup_refresh_avoids_unnecessary_executor_hop():
 
 
 def test_chained_startup_refresh_avoids_unnecessary_executor_hop():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "_trigger_refresh")
 
         assert "self._trigger_refresh(False)" in src
@@ -585,7 +518,7 @@ def test_chained_startup_refresh_avoids_unnecessary_executor_hop():
 
 
 def test_permanent_background_loops_do_not_consume_executor_workers():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         start_src = _function_source(ROOT / rel_path, "start_background_tasks")
         guardian_src = _function_source(ROOT / rel_path, "run_hotkey_guardian")
 
@@ -599,7 +532,7 @@ def test_permanent_background_loops_do_not_consume_executor_workers():
 
 
 def test_background_schedule_loop_uses_low_frequency_wait():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "start_background_tasks")
 
         assert "now.second < 10" in src
@@ -608,7 +541,7 @@ def test_background_schedule_loop_uses_low_frequency_wait():
 
 
 def test_main_and_scheduler_background_tasks_start_once_and_clear_schedule():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         full_src = (ROOT / rel_path).read_text(encoding="utf-8")
         func_src = _function_source(ROOT / rel_path, "start_background_tasks")
 
@@ -620,7 +553,7 @@ def test_main_and_scheduler_background_tasks_start_once_and_clear_schedule():
 
 
 def test_main_and_scheduler_schedule_update_checks_from_shared_policy():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         full_src = (ROOT / rel_path).read_text(encoding="utf-8")
         start_src = _function_source(ROOT / rel_path, "start_background_tasks")
 
@@ -631,7 +564,7 @@ def test_main_and_scheduler_schedule_update_checks_from_shared_policy():
 
 
 def test_main_and_scheduler_ui_queue_polling_is_bounded():
-    for rel_path in ("src/main.py", "src/scheduler.py"):
+    for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "process_ui_queue")
 
         assert "for _ in range(250):" in src

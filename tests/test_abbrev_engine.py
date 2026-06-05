@@ -336,3 +336,65 @@ def test_handle_event_typing_word_then_space_does_not_misfire(monkeypatch):
         eng._handle_event(_K(chh))
     eng._handle_event(_K("space"))
     assert eng._suppressing is False, "persist 結尾的 st 不該誤觸展開"
+
+
+def test_handle_event_backspace_correction_still_triggers(monkeypatch):
+    """打錯字→backspace 修正→重打，仍應觸發展開（user 回報：cery→⌫→t→空白 = cert）。"""
+    monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
+    monkeypatch.setattr(ae, "should_skip_for_input_method", lambda: False)
+    eng = _make_engine()
+    eng.install(AbbrevConfig(enabled=True, items=[
+        {"abbrev": "cert", "expansion": "patient cert"}]))
+    monkeypatch.setattr(eng, "_do_replace", lambda *a, **k: None)
+
+    class _K:
+        def __init__(self, n):
+            self.name = n
+
+    for ch in "cery":
+        eng._handle_event(_K(ch))
+    eng._handle_event(_K("backspace"))   # 刪掉打錯的 y
+    eng._handle_event(_K("t"))           # 改打 t → buffer 應重建為 cert
+    eng._handle_event(_K("space"))       # 觸發
+    assert eng._suppressing is True, "backspace 修正後的 cert 應觸發展開"
+
+
+def test_handle_event_backspace_pops_one_char_not_clear(monkeypatch):
+    """backspace 只刪 buffer 最後一字元，不整段清空；空 buffer 再刪也不出錯。"""
+    monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
+    eng = _make_engine()
+    eng.install(AbbrevConfig(enabled=True, items=[
+        {"abbrev": "cert", "expansion": "x"}]))
+
+    class _K:
+        def __init__(self, n):
+            self.name = n
+
+    for ch in "abc":
+        eng._handle_event(_K(ch))
+    assert eng._buffer == "abc"
+    eng._handle_event(_K("backspace"))
+    assert eng._buffer == "ab"
+    eng._handle_event(_K("backspace"))
+    eng._handle_event(_K("backspace"))
+    assert eng._buffer == ""
+    eng._handle_event(_K("backspace"))   # 空 buffer 再 backspace 不應報錯
+    assert eng._buffer == ""
+
+
+def test_handle_event_navigation_key_still_resets_buffer(monkeypatch):
+    """方向鍵移動游標 → buffer 失效 → 仍應整段清空（與 backspace 行為不同）。"""
+    monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
+    eng = _make_engine()
+    eng.install(AbbrevConfig(enabled=True, items=[
+        {"abbrev": "cert", "expansion": "x"}]))
+
+    class _K:
+        def __init__(self, n):
+            self.name = n
+
+    for ch in "cer":
+        eng._handle_event(_K(ch))
+    assert eng._buffer == "cer"
+    eng._handle_event(_K("left"))
+    assert eng._buffer == "", "方向鍵應清空 buffer"

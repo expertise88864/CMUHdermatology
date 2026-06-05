@@ -1042,8 +1042,12 @@ _RESET_KEY_NAMES = {
     "enter", "tab", "esc", "escape",
     "up", "down", "left", "right",
     "home", "end", "page up", "page down",
-    "delete", "backspace",
+    "delete",
 }
+# Backspace 不在重置集合：改為「刪掉 buffer 最後一個字元」(見 _handle_event)，
+# 鏡像使用者實際刪字，讓「打錯字→backspace 修正→重打」仍能觸發展開
+# （例：cery→⌫→t→空白 = cert）。
+_BACKSPACE_KEY_NAMES = {"backspace"}
 
 
 class AbbrevEngine:
@@ -1056,6 +1060,10 @@ class AbbrevEngine:
     # 展開後的冷卻時間（s）— 期間 buffer 暫停累積，避免 user 連打第二組
     # 縮寫時後續 keystroke 跟我們的 paste 競態。需 >= 整個替換流程時間。
     COOLDOWN_SEC = 0.9
+    # [速度] 原生欄位走「同步直接取代、完全不碰剪貼簿」的快路徑，沒有 paste 競態，
+    # 不需要上面為剪貼簿路徑設的長 cool-down。命中原生路徑時改用此縮短值，
+    # 讓連續展開（醫師快速打多組縮寫）更即時。只縮短、不延長。
+    NATIVE_EDIT_COOLDOWN_SEC = 0.25
     # 送 backspace 前的延遲（s）— 確保「縮寫 + 觸發空白」已先抵達目標視窗。
     # keyboard 模組 hook callback 跑在 hook thread，若不夠延遲就送 backspace，
     # 觸發空白還沒被 dispatch → backspace 跑到空白前面 → 刪錯/沒刪到。
@@ -1197,6 +1205,13 @@ class AbbrevEngine:
             self._try_expand(buffer_snapshot, " ")
             return
 
+        # backspace：刪掉 buffer 最後一個字元（鏡像使用者刪字），而非整段清空。
+        # 讓「打錯字→backspace 修正→重打」仍能觸發展開（例：cery→⌫→t→空白 = cert）。
+        if name in _BACKSPACE_KEY_NAMES:
+            with self._lock:
+                self._buffer = self._buffer[:-1]
+            return
+
         # 重置 buffer 的鍵
         if name in _RESET_KEY_NAMES:
             with self._lock:
@@ -1321,6 +1336,12 @@ class AbbrevEngine:
                 self.PRE_BACKSPACE_DELAY_SEC,
             )
             if used_native_edit:
+                # 原生欄位同步取代完成、不碰剪貼簿 → 無 paste 競態，cool-down 可大幅
+                # 縮短（只縮短不延長），讓連續展開更即時。
+                self._cooldown_until = min(
+                    self._cooldown_until,
+                    time.monotonic() + self.NATIVE_EDIT_COOLDOWN_SEC,
+                )
                 return
 
             # 非原生欄位仍等觸發空白抵達目標視窗，再走相容性較廣的 fallback。
