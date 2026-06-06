@@ -44,6 +44,7 @@ from cmuh_common.threshold_policy import (
     is_near_alert_threshold,
 )
 from cmuh_common.clinic_state import (
+    CLINIC_ROOM_COUNT,
     DEFAULT_CLINIC_ROOMS,
     build_dynamic_state,
     clinic_dynamic_state_key,
@@ -6591,7 +6592,7 @@ class AutomationApp:
         if not getattr(self, "clinic_ui_elements", None):
             return
         now = datetime.now()
-        for idx, ui in enumerate(self.clinic_ui_elements[:2]):
+        for idx, ui in enumerate(self.clinic_ui_elements[:CLINIC_ROOM_COUNT]):
             if idx >= len(getattr(self, "clinic_room_vars", [])):
                 continue
             room_code = self.clinic_room_vars[idx].get().strip()
@@ -7619,7 +7620,7 @@ class AutomationApp:
         _clinic_hdr_b = ("Microsoft JhengHei UI", _chdr_room_slot, "bold")
         _clinic_room_font = ("Arial", _chdr_room_entry, "bold")
 
-        for i in range(2):
+        for i in range(CLINIC_ROOM_COUNT):
             status_container.columnconfigure(i, weight=1)
             shadow_frame = tk.Frame(status_container, bg="#E0E0E0")
             shadow_frame.grid(row=0, column=i, padx=5, pady=2, sticky="nsew")
@@ -7746,7 +7747,7 @@ class AutomationApp:
                 "prev_sess_close": lbl_prev_close,
             })
 
-        for idx in range(2):
+        for idx in range(CLINIC_ROOM_COUNT):
             tc0 = resolve_clinic_reg64_time_code(self.clinic_display_mode_vars[idx].get())
             sb = self.clinic_ui_elements[idx]["slot_banner"]
             sb.config(text=reg64_slot_cn(tc0) or "—", fg=reg64_slot_label_color(tc0))
@@ -7851,17 +7852,17 @@ class AutomationApp:
         saved_modes = saved_settings.get("time_modes")
         if not isinstance(saved_modes, list):
             saved_modes = []
-        while len(saved_modes) < 2:
+        while len(saved_modes) < CLINIC_ROOM_COUNT:
             saved_modes.append("auto")
-        while len(saved_rooms) < 2:
+        while len(saved_rooms) < CLINIC_ROOM_COUNT:
             saved_rooms.append("")
         self.clinic_room_vars = [
-            tk.StringVar(value=saved_rooms[0]),
-            tk.StringVar(value=saved_rooms[1]),
+            tk.StringVar(value=saved_rooms[j])
+            for j in range(CLINIC_ROOM_COUNT)
         ]
         self.clinic_display_mode_vars = [
             tk.StringVar(value=_normalize_clinic_display_mode(saved_modes[j]))
-            for j in range(2)
+            for j in range(CLINIC_ROOM_COUNT)
         ]
         if not hasattr(self, "clinic_timecode_combos"):
             self.clinic_timecode_combos = []
@@ -8082,7 +8083,7 @@ class AutomationApp:
             return
 
         rooms_to_check = []
-        for i in range(2):
+        for i in range(CLINIC_ROOM_COUNT):
             code = self.clinic_room_vars[i].get().strip()
             mode = (
                 self.clinic_display_mode_vars[i].get()
@@ -8952,7 +8953,7 @@ class AutomationApp:
     # --- [新增] 讀取門診動態設定 ---
     def load_clinic_settings(self):
         # [修改] 預設更新頻率改為 60 秒 (符合您的需求)
-        default_settings = {"rooms": list(DEFAULT_CLINIC_ROOMS), "time_modes": ["auto", "auto"]}
+        default_settings = {"rooms": list(DEFAULT_CLINIC_ROOMS), "time_modes": ["auto"] * CLINIC_ROOM_COUNT}
         file_path = get_conf_path('clinic_settings.json')
         settings = load_json_dict(file_path, default_settings)
         rooms, changed = normalize_clinic_rooms(settings.get("rooms"))

@@ -6,19 +6,29 @@ from datetime import date, datetime
 from typing import Any, Callable
 
 
-DEFAULT_CLINIC_ROOMS = ("101", "102")
+DEFAULT_CLINIC_ROOMS = ("101", "102", "103")
 LEGACY_DEFAULT_CLINIC_ROOMS = ("181", "182")
+# 門診動態卡片數 = 預設診間數（目前 3 格：左中右）。所有迴圈／補滿都以此為準，避免 2/3 不一致。
+CLINIC_ROOM_COUNT = len(DEFAULT_CLINIC_ROOMS)
 
 
 def normalize_clinic_rooms(value: Any) -> tuple[list[str], bool]:
-    """Normalize two clinic rooms and migrate the historical 181/182 default."""
+    """正規化診間清單為 CLINIC_ROOM_COUNT 格，並遷移歷史預設。
+
+    - 非 list／壞值 → 回完整預設。
+    - 歷史 181/182 兩格預設 → 整組換成新預設（101/102/103）。
+    - 舊版只存 2 格的設定 → 保留前兩格，用對應位置的預設補上第 3 格（→ 103）。
+    回傳 (rooms, changed)；changed=True 表示需寫回磁碟。
+    """
     if not isinstance(value, list):
         return list(DEFAULT_CLINIC_ROOMS), True
-    rooms = [str(room or "").strip() for room in value[:2]]
-    while len(rooms) < 2:
-        rooms.append("")
-    if tuple(rooms) == LEGACY_DEFAULT_CLINIC_ROOMS:
+    rooms = [str(room or "").strip() for room in value[:CLINIC_ROOM_COUNT]]
+    n_legacy = len(LEGACY_DEFAULT_CLINIC_ROOMS)
+    if len(rooms) <= n_legacy and tuple(rooms[:n_legacy]) == LEGACY_DEFAULT_CLINIC_ROOMS:
         return list(DEFAULT_CLINIC_ROOMS), True
+    # 不足格數（例：舊版只存 2 格）→ 以對應位置的預設補滿
+    while len(rooms) < CLINIC_ROOM_COUNT:
+        rooms.append(DEFAULT_CLINIC_ROOMS[len(rooms)])
     return rooms, rooms != value
 
 
