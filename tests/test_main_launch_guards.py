@@ -831,5 +831,6 @@ def test_heavy_network_imports_are_lazy_after_splash():
     assert "def _ensure_network_imports(" in full
     # __init__ 內(8 空白縮排)有 bootstrap 呼叫(splash 之後)
     assert "\n        _ensure_network_imports()" in full
-    # 模組頂層不再有無條件的 `import requests`(改為佔位 + 延後)
-    assert "\nrequests = None" in full
+    # TYPE_CHECKING 慣用法：型別檢查期 import 真模組、執行期只佔位 None(else 分支，縮排)
+    assert "if TYPE_CHECKING:" in full
+    assert "\n    requests = None" in full

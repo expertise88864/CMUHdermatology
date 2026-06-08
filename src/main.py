@@ -4,7 +4,7 @@
 # 重構自 _originals/中國醫皮膚科主程式.pyw
 # 共用基底已抽出至 cmuh_common/，本檔僅保留業務邏輯（UI、抓網、熱鍵等）。
 # =============================================================================
-# [perf r5] PEP 563：讓所有型別註解(含函式簽章的 `session: requests.Session`)變成字串、
+# [perf r5] PEP 563：讓所有型別註解(含函式簽章的 `session: "_RequestsSession"`)變成字串、
 # 延後求值。這樣才能把重量級的 requests/urllib3/bs4 import 從模組頂層(splash 之前)延後到
 # AutomationApp.__init__(splash 之後)，加快感知啟動。本檔無 get_type_hints/dataclass，
 # 不會被 PEP 563 影響。
@@ -196,7 +196,7 @@ import hashlib
 from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import date, datetime, timedelta, time as dt_time
 from queue import Empty, Queue
-from typing import Any, NotRequired, Optional, TypedDict
+from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict
 
 class DoctorConfig(TypedDict):
     name: str
@@ -336,12 +336,22 @@ logging.getLogger("urllib3.connectionpool").addFilter(_cp_filter)
 # 也就是 splash 視窗出現「之前」同步 import → 使用者按下圖示後約 0.5s 畫面全黑無回饋。
 # 改為延後到 AutomationApp.__init__ 開頭(splash 之後)才載入，讓「正在初始化…」提早數百 ms
 # 出現。模組頂層與 def 簽章預設值都不使用這些名稱(只有函式 body 用，跑在 __init__ 之後)，
-# 加上檔首 `from __future__ import annotations` 讓 `session: requests.Session` 註解變字串、
+# 加上檔首 `from __future__ import annotations` 讓 `session: "_RequestsSession"` 註解變字串、
 # def 時不求值，故可安全延後。以下先佔位為 None，由 _ensure_network_imports() 填入模組全域。
-requests = None        # type: ignore[assignment]
-BeautifulSoup = None   # type: ignore[assignment]
-HTTPAdapter = None     # type: ignore[assignment]
-Retry = None           # type: ignore[assignment]
+if TYPE_CHECKING:
+    # 型別檢查期(pyright)：看到真實模組型別，讓 requests.Session()/BeautifulSoup() 等
+    # 呼叫都能正確解析。執行期不在此 import。
+    import requests
+    from bs4 import BeautifulSoup
+    from requests import Session as _RequestsSession
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+else:
+    # 執行期佔位，由 _ensure_network_imports() 在 splash 之後才真正 import 並填入。
+    requests = None
+    BeautifulSoup = None
+    HTTPAdapter = None
+    Retry = None
 _network_imports_ready = False
 
 
@@ -5714,7 +5724,7 @@ def _perform_duty_query(session, roc_date_str):
         raise last_exc
     raise RuntimeError("DutyQuery failed")
 
-def fetch_duty_doctor(ui_queue: "Queue[UiMessage]", session: requests.Session, r_doctor_map: dict[str, Any]):
+def fetch_duty_doctor(ui_queue: "Queue[UiMessage]", session: "_RequestsSession", r_doctor_map: dict[str, Any]):
     logging.info("Attempting to fetch today's duty doctor (Night Shift 1700-0800)...")
     doctor_name = "查詢失敗"
     found_target = False
@@ -5784,7 +5794,7 @@ def fetch_duty_doctor(ui_queue: "Queue[UiMessage]", session: requests.Session, r
     put_ui_message(ui_queue, UiDutyDoctorMessage(doctor_name=doctor_name))
     return doctor_name not in {"查詢失敗", "網路錯誤", "查詢錯誤"}
 
-def fetch_saturday_duty_doctor(ui_queue: "Queue[UiMessage]", session: requests.Session, r_doctor_map: dict[str, Any]):
+def fetch_saturday_duty_doctor(ui_queue: "Queue[UiMessage]", session: "_RequestsSession", r_doctor_map: dict[str, Any]):
     logging.info("Attempting to fetch this week's Saturday duty doctor...")
     doctor_name = "查詢失敗"
     saturday_date = date.today()
@@ -5823,7 +5833,7 @@ def fetch_saturday_duty_doctor(ui_queue: "Queue[UiMessage]", session: requests.S
     )
     return doctor_name not in {"查詢失敗", "網路錯誤", "查詢錯誤"}
 
-def fetch_duty_vs(ui_queue: "Queue[UiMessage]", session: requests.Session, vs_type: str):
+def fetch_duty_vs(ui_queue: "Queue[UiMessage]", session: "_RequestsSession", vs_type: str):
     is_saturday = (vs_type == 'saturday_vs')
     log_prefix = "Saturday" if is_saturday else "Today's"
     logging.info(f"Attempting to fetch {log_prefix} duty VS...")
