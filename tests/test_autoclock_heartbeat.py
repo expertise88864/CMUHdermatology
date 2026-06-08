@@ -14,6 +14,8 @@ import os
 import sys
 import inspect
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 # autoclock import 期間會跑 ensure_dependencies — 設定環境讓它跑過
@@ -438,6 +440,59 @@ def test_process_clock_task_filters_done_before_driver():
     assert "_is_clock_done(schedule_key" in src
     # 過濾必須發生在 _get_or_create_clock_driver 之前
     assert src.index("_is_clock_done(schedule_key") < src.index("_get_or_create_clock_driver()")
+
+
+def test_process_clock_task_done_accounts_skip_driver(monkeypatch):
+    """行為測試：同一打卡窗帳號已完成時，不建立 WebDriver、不重複登入。"""
+    schedule_key = "mon_am_in"
+    autoclock._clock_done.clear()
+    autoclock._mark_clock_done(schedule_key, "N24367")
+    monkeypatch.setattr(
+        autoclock,
+        "load_config",
+        lambda: [{"username": "N24367", "schedule": {schedule_key: True}}],
+    )
+    monkeypatch.setattr(
+        autoclock,
+        "_get_or_create_clock_driver",
+        lambda: pytest.fail("done account should skip driver creation"),
+    )
+
+    try:
+        autoclock.process_clock_task(schedule_key)
+    finally:
+        autoclock._clock_done.clear()
+
+
+def test_process_clock_task_rebuilds_dead_session_behavior(monkeypatch):
+    """行為測試：初始 driver session 死掉時，重建後用新 driver 執行帳號。"""
+    schedule_key = "mon_am_in"
+    first_driver = object()
+    rebuilt_driver = object()
+    created = [first_driver, rebuilt_driver]
+    performed = []
+
+    monkeypatch.setattr(
+        autoclock,
+        "load_config",
+        lambda: [{"username": "N24367", "schedule": {schedule_key: True}}],
+    )
+    monkeypatch.setattr(autoclock, "_get_or_create_clock_driver",
+                        lambda: created.pop(0))
+    monkeypatch.setattr(autoclock, "_driver_session_alive",
+                        lambda driver: driver is rebuilt_driver)
+    monkeypatch.setattr(autoclock, "WebDriverWait",
+                        lambda driver, timeout: ("wait", driver, timeout))
+    monkeypatch.setattr(
+        autoclock,
+        "perform_clock_action",
+        lambda driver, wait, *args, **kwargs: performed.append((driver, wait)),
+    )
+    autoclock.running.set()
+
+    autoclock.process_clock_task(schedule_key)
+
+    assert performed == [(rebuilt_driver, ("wait", rebuilt_driver, 20))]
 
 
 def test_perform_clock_action_marks_done_on_success_and_record():

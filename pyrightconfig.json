@@ -3,8 +3,6 @@
   "exclude": ["**/__pycache__", "**/node_modules", "build", "dist", "python_embed", ".wdm"],
   "typeCheckingMode": "basic",
 
-  "_comment": "本專案 ~30K 行多為未標註型別。pyright 在無標註下對『型別推論類』規則會大量誤報，故把那些設為 off；保留高價值規則(未定義名稱、缺 import、重複定義、self/cls 等)為 error，讓 CI 是有意義的綠燈關卡。reportPossiblyUnbound 設 warning：顯示但不擋 CI，供日後逐步修。日後補上型別標註可再把下列規則調回 warning/error。",
-
   "reportMissingModuleSource": "none",
   "reportMissingImports": "warning",
 

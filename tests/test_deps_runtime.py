@@ -85,3 +85,61 @@ def test_dependency_installer_window_is_destroyed_when_mainloop_fails(
         dr.ensure_dependencies([("pyautogui", "pyautogui")])
 
     assert FakeInstaller.destroyed is True
+
+
+def test_dependency_installer_cancel_exits_nonzero(tmp_path, monkeypatch):
+    from cmuh_common import deps_installer
+
+    class FakeInstaller:
+        def __init__(self, _required_libs, _missing_libs):
+            self.is_finished = False
+
+        def mainloop(self):
+            return None
+
+        def destroy(self):
+            return None
+
+    monkeypatch.setattr(dr, "is_frozen", lambda: False)
+    monkeypatch.setattr(dr, "get_app_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        dr,
+        "_find_missing_libs",
+        lambda _required_libs: [("pyautogui", "pyautogui")],
+    )
+    monkeypatch.setattr(deps_installer, "DependencyInstaller", FakeInstaller)
+
+    with pytest.raises(SystemExit) as exc:
+        dr.ensure_dependencies([("pyautogui", "pyautogui")])
+
+    assert exc.value.code == 1
+
+
+def test_dependency_still_missing_after_install_exits_nonzero(
+    tmp_path, monkeypatch
+):
+    from cmuh_common import deps_installer
+
+    class FakeInstaller:
+        def __init__(self, _required_libs, _missing_libs):
+            self.is_finished = True
+
+        def mainloop(self):
+            return None
+
+        def destroy(self):
+            return None
+
+    monkeypatch.setattr(dr, "is_frozen", lambda: False)
+    monkeypatch.setattr(dr, "get_app_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        dr,
+        "_find_missing_libs",
+        lambda _required_libs: [("pyautogui", "pyautogui")],
+    )
+    monkeypatch.setattr(deps_installer, "DependencyInstaller", FakeInstaller)
+
+    with pytest.raises(SystemExit) as exc:
+        dr.ensure_dependencies([("pyautogui", "pyautogui")])
+
+    assert exc.value.code == 1

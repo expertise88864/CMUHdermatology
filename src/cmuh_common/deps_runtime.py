@@ -105,13 +105,13 @@ def ensure_dependencies(
         del app
         gc.collect()  # [核心修正] 清除 Tkinter 變數，避免背景執行緒 Variable.__del__ 崩潰
         if not is_finished:
-            sys.exit(0)
+            sys.exit(1)
         # pip exit code 0 不等於 import 一定成功（例如 transitive dependency
         # 損壞或 .pyw 關聯切到另一套 Python）。成功前再做一次完整驗證。
         missing_after_install = _find_missing_libs(required_libs)
         if missing_after_install:
             logging.error("安裝後仍缺少依賴: %s", missing_after_install)
-            sys.exit(0)
+            sys.exit(1)
 
     # 寫快取
     try:

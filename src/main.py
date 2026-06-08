@@ -9514,6 +9514,33 @@ class AutomationApp:
                                   exc_info=True)
         return eng
 
+    def _maybe_warn_abbrev_external_conflict(self, ext: str | None) -> None:
+        """縮寫啟用且偵測到其他展開器時，單次提示使用者目前本程式會暫停縮寫。"""
+        if not ext or getattr(self, '_abbrev_external_warning_shown', False):
+            return
+        self._abbrev_external_warning_shown = True
+        logging.warning("[abbrev] 偵測到外部縮寫/展開程式 '%s'，本程式縮寫暫停", ext)
+
+        def _show_warning() -> None:
+            if getattr(self, '_shutting_down', False):
+                return
+            try:
+                messagebox.showwarning(
+                    "偵測到其他縮寫軟體",
+                    f"目前偵測到其他縮寫/文字展開軟體正在執行：{ext}\n\n"
+                    "為避免同一段文字被重複展開，本程式縮寫功能會先暫停。\n"
+                    "若要改用本程式縮寫，請先關閉該軟體，或到縮寫設定中手動開啟"
+                    "「允許自動關閉其他縮寫軟體」。",
+                    parent=getattr(self, "root", None),
+                )
+            except Exception:
+                logging.debug("[abbrev] 外部縮寫提示顯示失敗", exc_info=True)
+
+        try:
+            self.root.after(0, _show_warning)
+        except Exception:
+            _show_warning()
+
     def _abbrev_monitor_external(self):
         """[v6] 週期檢查外部文字展開程式 (PhraseExpress 等)。
         狀態改變 (出現/消失) → 重新 install (install 內部會依偵測結果決定
@@ -9534,6 +9561,7 @@ class AutomationApp:
                     # 狀態改變 → 重 install (install 偵測 ext 決定掛/不掛)
                     self._install_abbrev_listeners()
                     if ext:
+                        self._maybe_warn_abbrev_external_conflict(ext)
                         logging.warning(
                             "[abbrev] 外部展開程式 '%s' 出現 → 暫停本程式縮寫",
                             ext)
@@ -9570,6 +9598,9 @@ class AutomationApp:
             self._abbrev_config_cache = cfg
         try:
             eng.install(cfg)
+            if cfg.enabled:
+                self._maybe_warn_abbrev_external_conflict(
+                    getattr(eng, '_external_expander', None))
         except Exception:
             logging.exception("[abbrev] install 失敗")
 
@@ -9828,7 +9859,7 @@ class AutomationApp:
         row3.pack(fill='x', padx=10, pady=(0, 6))
         ttk.Checkbutton(
             row3,
-            text="偵測到其他縮寫軟體時自動關閉它（PhraseExpress 等，不含 AutoHotkey）",
+            text="允許自動關閉其他縮寫軟體（PhraseExpress 等，不含 AutoHotkey）",
             variable=self.abbrev_close_external_var,
             command=self._abbrev_on_toggle,
         ).pack(side='left')

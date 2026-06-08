@@ -89,7 +89,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": False,
     "skip_when_ime_active": True,
     "preserve_trailing_space": True,
-    "close_external_expander": True,
+    "close_external_expander": False,
     "items": DEFAULT_ITEMS,
 }
 
@@ -129,7 +129,7 @@ class AbbrevConfig:
     preserve_trailing_space: bool = True
     # 偵測到「專用」文字展開程式（PhraseExpress 等，不含 AutoHotkey）執行中時，
     # 是否強制關閉它、改用本程式縮寫。False = 沿用舊行為（暫停本程式禮讓對方）。
-    close_external_expander: bool = True
+    close_external_expander: bool = False
     items: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -294,7 +294,7 @@ def load_config(path: str) -> AbbrevConfig:
         enabled=bool(raw.get("enabled", False)),
         skip_when_ime_active=bool(raw.get("skip_when_ime_active", True)),
         preserve_trailing_space=bool(raw.get("preserve_trailing_space", True)),
-        close_external_expander=bool(raw.get("close_external_expander", True)),
+        close_external_expander=bool(raw.get("close_external_expander", False)),
         items=sort_abbrev_items(cleaned),
     )
 
@@ -331,7 +331,7 @@ def ensure_config_file(path: str) -> AbbrevConfig:
             "enabled": False,
             "skip_when_ime_active": True,
             "preserve_trailing_space": True,
-            "close_external_expander": True,
+            "close_external_expander": False,
             "items": [dict(it) for it in DEFAULT_ITEMS],
         }))
     return load_config(path)

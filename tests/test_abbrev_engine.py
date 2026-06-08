@@ -22,6 +22,13 @@ from cmuh_common.abbrev_engine import (  # noqa: E402
 )
 
 
+def test_external_expander_autoclose_defaults_to_off(tmp_path):
+    cfg = ae.ensure_config_file(str(tmp_path / "abbrev.json"))
+
+    assert AbbrevConfig().close_external_expander is False
+    assert cfg.close_external_expander is False
+
+
 # ─── render_expansion token ──────────────────────────────────────────────
 
 def test_render_da_slash_date():
