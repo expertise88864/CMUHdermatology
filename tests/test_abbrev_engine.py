@@ -131,11 +131,49 @@ def test_install_pauses_when_external_present(monkeypatch):
     monkeypatch.setattr(ae, "_list_process_names",
                         lambda: {"phraseexpress.exe"})
     eng = _make_engine()
-    cfg = AbbrevConfig(enabled=True,
+    # close_external_expander=False → 走「禮讓暫停」路徑（不關閉對方）
+    cfg = AbbrevConfig(enabled=True, close_external_expander=False,
                        items=[{"abbrev": "da", "expansion": "test"}])
     eng.install(cfg)
     assert eng.is_installed() is False
     assert eng._external_expander == "phraseexpress.exe"
+
+
+def test_install_closes_dedicated_expander_then_hooks(monkeypatch):
+    """close_external_expander=True：偵測到專用展開程式 → 關閉它 → 成功後掛 hook。"""
+    state = {"running": True}
+    monkeypatch.setattr(
+        ae, "_list_process_names",
+        lambda: {"phraseexpress.exe"} if state["running"] else {"notepad.exe"})
+
+    def fake_kill(image):
+        state["running"] = False
+        return True
+    monkeypatch.setattr(ae, "_taskkill_image", fake_kill)
+
+    eng = _make_engine()
+    cfg = AbbrevConfig(enabled=True, close_external_expander=True,
+                       items=[{"abbrev": "da", "expansion": "test"}])
+    eng.install(cfg)
+    assert eng.is_installed() is True
+    assert eng._external_expander is None
+
+
+def test_install_does_not_close_autohotkey(monkeypatch):
+    """AutoHotkey 不在自動關閉清單：close 開啟也只暫停、不關 AHK。"""
+    monkeypatch.setattr(ae, "_list_process_names",
+                        lambda: {"autohotkey64.exe"})
+    killed = []
+    monkeypatch.setattr(ae, "_taskkill_image",
+                        lambda image: (killed.append(image), True)[1])
+
+    eng = _make_engine()
+    cfg = AbbrevConfig(enabled=True, close_external_expander=True,
+                       items=[{"abbrev": "da", "expansion": "test"}])
+    eng.install(cfg)
+    assert eng.is_installed() is False
+    assert eng._external_expander == "autohotkey64.exe"
+    assert killed == []  # AHK 不應被強制關閉
 
 
 def test_install_hooks_when_no_external(monkeypatch):
@@ -161,7 +199,8 @@ def test_install_disabled_does_not_hook(monkeypatch):
 def test_install_rehooks_after_external_disappears(monkeypatch):
     """外部程式出現 → 暫停；之後消失 → 重 install 應恢復掛 hook。"""
     eng = _make_engine()
-    cfg = AbbrevConfig(enabled=True,
+    # close_external_expander=False → 純測「禮讓暫停 / 消失後恢復」，不觸發關閉
+    cfg = AbbrevConfig(enabled=True, close_external_expander=False,
                        items=[{"abbrev": "da", "expansion": "test"}])
     # 1. 外部程式在 → 暫停
     monkeypatch.setattr(ae, "_list_process_names",

@@ -9627,6 +9627,7 @@ class AutomationApp:
         cfg.enabled = bool(self.abbrev_enabled_var.get())
         cfg.skip_when_ime_active = bool(self.abbrev_ime_skip_var.get())
         cfg.preserve_trailing_space = bool(self.abbrev_trailing_space_var.get())
+        cfg.close_external_expander = bool(self.abbrev_close_external_var.get())
         self._abbrev_save_and_reload()
 
     def _abbrev_validate_input(self, abbrev_text, expansion_text, *, ignore_dup=None):
@@ -9793,6 +9794,7 @@ class AutomationApp:
         self.abbrev_enabled_var = tk.BooleanVar(value=cfg.enabled)
         self.abbrev_ime_skip_var = tk.BooleanVar(value=cfg.skip_when_ime_active)
         self.abbrev_trailing_space_var = tk.BooleanVar(value=cfg.preserve_trailing_space)
+        self.abbrev_close_external_var = tk.BooleanVar(value=cfg.close_external_expander)
         self.abbrev_new_abbrev_var = tk.StringVar()
 
         # 上方控制列
@@ -9821,6 +9823,15 @@ class AutomationApp:
             variable=self.abbrev_trailing_space_var,
             command=self._abbrev_on_toggle,
         ).pack(side='left', padx=(18, 0))
+
+        row3 = ttk.Frame(ctrl_frame)
+        row3.pack(fill='x', padx=10, pady=(0, 6))
+        ttk.Checkbutton(
+            row3,
+            text="偵測到其他縮寫軟體時自動關閉它（PhraseExpress 等，不含 AutoHotkey）",
+            variable=self.abbrev_close_external_var,
+            command=self._abbrev_on_toggle,
+        ).pack(side='left')
 
         # 縮寫列表
         list_frame = ttk.LabelFrame(abbrev_tab, text="縮寫清單（雙擊可編輯）")

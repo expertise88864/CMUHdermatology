@@ -89,6 +89,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": False,
     "skip_when_ime_active": True,
     "preserve_trailing_space": True,
+    "close_external_expander": True,
     "items": DEFAULT_ITEMS,
 }
 
@@ -126,6 +127,9 @@ class AbbrevConfig:
     enabled: bool = False
     skip_when_ime_active: bool = True
     preserve_trailing_space: bool = True
+    # 偵測到「專用」文字展開程式（PhraseExpress 等，不含 AutoHotkey）執行中時，
+    # 是否強制關閉它、改用本程式縮寫。False = 沿用舊行為（暫停本程式禮讓對方）。
+    close_external_expander: bool = True
     items: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -134,6 +138,7 @@ class AbbrevConfig:
             "enabled": bool(self.enabled),
             "skip_when_ime_active": bool(self.skip_when_ime_active),
             "preserve_trailing_space": bool(self.preserve_trailing_space),
+            "close_external_expander": bool(self.close_external_expander),
             "items": [
                 {"abbrev": str(it.get("abbrev", "")).strip(),
                  "expansion": str(it.get("expansion", ""))}
@@ -289,6 +294,7 @@ def load_config(path: str) -> AbbrevConfig:
         enabled=bool(raw.get("enabled", False)),
         skip_when_ime_active=bool(raw.get("skip_when_ime_active", True)),
         preserve_trailing_space=bool(raw.get("preserve_trailing_space", True)),
+        close_external_expander=bool(raw.get("close_external_expander", True)),
         items=sort_abbrev_items(cleaned),
     )
 
@@ -325,6 +331,7 @@ def ensure_config_file(path: str) -> AbbrevConfig:
             "enabled": False,
             "skip_when_ime_active": True,
             "preserve_trailing_space": True,
+            "close_external_expander": True,
             "items": [dict(it) for it in DEFAULT_ITEMS],
         }))
     return load_config(path)
@@ -641,6 +648,61 @@ def detect_external_expander() -> Optional[str]:
         if exe in names:
             return exe
     return None
+
+
+# 「專用」文字展開程式：偵測到時可在使用者開啟設定下強制關閉、改用本程式。
+# 刻意 **不含 AutoHotkey** —— AHK 是通用自動化工具，常被診間拿來做按鍵重對應 /
+# 其他巨集，無差別關掉它可能誤殺不相關的功能。AHK 仍會被 detect_external_expander
+# 偵測到 → 走「暫停本程式禮讓」的舊行為，但不會被本函式關閉。
+_AUTO_CLOSE_EXPANDER_EXES: frozenset = frozenset({
+    "phraseexpress.exe",
+    "phrase express.exe",
+    "breevy.exe",
+    "textexpander.exe",
+    "beeftext.exe",
+    "espanso.exe",
+    "espansod.exe",
+    "atext.exe",
+    "fastkeys.exe",
+    "activewords.exe",
+})
+
+
+def _taskkill_image(image_name: str) -> bool:
+    """taskkill /F /IM <image_name>（含子行程），回傳是否成功結束。
+    不閃黑框（CREATE_NO_WINDOW）。找不到行程(rc=128)視為已不在、回 False。"""
+    try:
+        import subprocess
+        CREATE_NO_WINDOW = 0x08000000
+        out = subprocess.run(
+            ["taskkill", "/F", "/T", "/IM", image_name],
+            capture_output=True, text=True, timeout=10,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        if out.returncode == 0:
+            logging.warning("[abbrev] 已強制關閉外部展開程式 '%s'（改用本程式縮寫）",
+                            image_name)
+            return True
+        logging.info("[abbrev] taskkill '%s' rc=%s：%s", image_name,
+                     out.returncode, (out.stderr or out.stdout or "").strip())
+        return False
+    except Exception:
+        logging.debug("[abbrev] taskkill '%s' 例外", image_name, exc_info=True)
+        return False
+
+
+def close_auto_closable_expanders() -> list:
+    """強制關閉所有「專用」文字展開程式（不含 AutoHotkey）。
+    回傳實際成功關閉的 exe 名稱清單；沒有可關的回空 list。"""
+    try:
+        names = _list_process_names()
+    except Exception:
+        return []
+    closed: list = []
+    for exe in _AUTO_CLOSE_EXPANDER_EXES:
+        if exe in names and _taskkill_image(exe):
+            closed.append(exe)
+    return closed
 
 
 # -----------------------------------------------------------------------------
@@ -1107,7 +1169,25 @@ class AbbrevEngine:
         外部展開程式（PhraseExpress 等）的偵測：install 時評估一次，依結果
         決定掛 hook 或暫停。出現/消失的持續監看由 main.py 的
         _abbrev_monitor_external（UI thread）週期重 install 來驅動。
+
+        cfg.close_external_expander=True 時，偵測到「專用」展開程式會先強制關閉它
+        （不含 AutoHotkey），再改用本程式；關不掉 / 剩 AutoHotkey 時退回暫停。
         """
+        # [鎖外處理] taskkill 最壞會等到 10s timeout；放在 self._lock 內會讓
+        # 期間的打字 hook callback（也要搶同一把鎖）卡住。故先在鎖外把「強制關閉
+        # 專用展開程式」做完，再進鎖做後續掛載判斷（鎖內會再 detect 一次確認）。
+        want_hook = bool(cfg.enabled) and any(
+            str(it.get("abbrev", "")).strip() for it in cfg.items
+        )
+        if want_hook and cfg.close_external_expander:
+            try:
+                if detect_external_expander():
+                    if close_auto_closable_expanders():
+                        # taskkill 後給 OS 一點時間把行程移出清單，再讓鎖內重新偵測。
+                        time.sleep(0.3)
+            except Exception:
+                logging.debug("[abbrev] 嘗試關閉外部展開程式時例外", exc_info=True)
+
         with self._lock:
             self._cfg = cfg
             self._rebuild_lookup_locked()
@@ -1117,7 +1197,9 @@ class AbbrevEngine:
                 logging.info("[abbrev] hook 未掛載（enabled=%s, items=%d）",
                              cfg.enabled, len(self._lookup))
                 return
-            # 偵測外部文字展開程式 → 有的話暫停，避免雙重展開
+            # 偵測外部文字展開程式 → 仍在的話暫停，避免雙重展開。
+            # （close_external_expander 開啟時，鎖外已嘗試關閉專用展開程式；
+            #   這裡若仍偵測到，多半是 AutoHotkey 或關閉失敗 → 禮讓暫停。）
             ext = detect_external_expander()
             self._external_expander = ext
             if ext:
