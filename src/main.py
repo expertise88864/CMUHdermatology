@@ -4,6 +4,12 @@
 # 重構自 _originals/中國醫皮膚科主程式.pyw
 # 共用基底已抽出至 cmuh_common/，本檔僅保留業務邏輯（UI、抓網、熱鍵等）。
 # =============================================================================
+# [perf r5] PEP 563：讓所有型別註解(含函式簽章的 `session: requests.Session`)變成字串、
+# 延後求值。這樣才能把重量級的 requests/urllib3/bs4 import 從模組頂層(splash 之前)延後到
+# AutomationApp.__init__(splash 之後)，加快感知啟動。本檔無 get_type_hints/dataclass，
+# 不會被 PEP 563 影響。
+from __future__ import annotations
+
 import os
 import sys
 
@@ -326,29 +332,46 @@ class _ConnPoolFullAggregator(logging.Filter):
 _cp_filter = _ConnPoolFullAggregator()
 logging.getLogger("urllib3.connectionpool").addFilter(_cp_filter)
 
-try:
-    # 嘗試匯入外部函式庫 (只保留輕量級與必要的)
-    import requests
-    
-    # --- [修正] SSL 驗證策略：只對已知院內主機關閉驗證，外部主機保持驗證 ---
-    # 全域停用 verify=False 是安全漏洞。改為只對院內 IP/域名例外。
-    from urllib3.exceptions import InsecureRequestWarning
-    requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
+# [perf r5] 重量級網路相依(requests/urllib3/bs4 累計約 400-500ms)原本在此模組頂層、
+# 也就是 splash 視窗出現「之前」同步 import → 使用者按下圖示後約 0.5s 畫面全黑無回饋。
+# 改為延後到 AutomationApp.__init__ 開頭(splash 之後)才載入，讓「正在初始化…」提早數百 ms
+# 出現。模組頂層與 def 簽章預設值都不使用這些名稱(只有函式 body 用，跑在 __init__ 之後)，
+# 加上檔首 `from __future__ import annotations` 讓 `session: requests.Session` 註解變字串、
+# def 時不求值，故可安全延後。以下先佔位為 None，由 _ensure_network_imports() 填入模組全域。
+requests = None        # type: ignore[assignment]
+BeautifulSoup = None   # type: ignore[assignment]
+HTTPAdapter = None     # type: ignore[assignment]
+Retry = None           # type: ignore[assignment]
+_network_imports_ready = False
 
-    # -----------------------------
 
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-    from bs4 import BeautifulSoup
-
-    # --- [修改] 移除這裡的 Selenium 相關 import，移到下方函式內 ---
-    # refresh_policy_utils 並非公開 PyPI 套件；門檻邏輯改由 cmuh_common.threshold_policy 提供。
-except ImportError as e:
-    missing_module = str(e).split("'")[1]
-    error_message = f"缺少必要的模組: {missing_module}\n\n請打開命令提示字元(cmd)並執行:\npip install {missing_module}"
-    logging.critical(error_message)
-    ctypes.windll.user32.MessageBoxW(0, error_message, "模組錯誤", 0x10)
-    sys.exit(1)
+def _ensure_network_imports():
+    """延後載入 requests/urllib3/bs4 並填入模組全域(冪等)。在 splash 顯示後、任何網路
+    呼叫之前(AutomationApp.__init__ 開頭)呼叫一次。缺件時跳 MessageBox 並 sys.exit(1)
+    (與原模組頂層 try/except 行為一致)。"""
+    global requests, BeautifulSoup, HTTPAdapter, Retry, _network_imports_ready
+    if _network_imports_ready:
+        return
+    try:
+        import requests as _requests
+        # --- [修正] SSL 驗證策略：只對已知院內主機關閉驗證，外部主機保持驗證 ---
+        # 全域停用 verify=False 是安全漏洞。改為只對院內 IP/域名例外。
+        from urllib3.exceptions import InsecureRequestWarning
+        _requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
+        from requests.adapters import HTTPAdapter as _HTTPAdapter
+        from urllib3.util.retry import Retry as _Retry
+        from bs4 import BeautifulSoup as _BeautifulSoup
+    except ImportError as e:
+        missing_module = str(e).split("'")[1] if "'" in str(e) else str(e)
+        error_message = f"缺少必要的模組: {missing_module}\n\n請打開命令提示字元(cmd)並執行:\npip install {missing_module}"
+        logging.critical(error_message)
+        ctypes.windll.user32.MessageBoxW(0, error_message, "模組錯誤", 0x10)
+        sys.exit(1)
+    requests = _requests
+    HTTPAdapter = _HTTPAdapter
+    Retry = _Retry
+    BeautifulSoup = _BeautifulSoup
+    _network_imports_ready = True
 
 # --- 3. 門診與醫師設定 ---
 DOCTORS = []
@@ -2741,6 +2764,13 @@ def _f11_popup_watcher(label: str = "F11",
     retry_counter: dict = {}
     handled_count = 0
     last_progress_log = time.time()
+    # [perf r5] _scan_unknown_popups 走全域 EnumWindows + Python callback(遍歷所有
+    # top-level window，~5-15ms/次)，純診斷用(只印 unknown-popup WARNING，不參與實際
+    # popup 處理)。原本每輪(0.3-0.4s)都跑，整趟 F11 燒掉數百次。改成 ≥2s 才掃一次：
+    # 診斷足夠(unknown popup 不會 200ms 內生滅、且 seen dict 去重)，省下無謂 CPU。
+    # 實際 popup 偵測(下方 FindWindowExW 迴圈)不受影響，零正確性風險。
+    UNKNOWN_SCAN_INTERVAL = 2.0
+    last_unknown_scan = 0.0
     # [2026-05-22 v41] 未知 popup 偵測 — 列出所有 visible top-level windows
     # 跟已知 9 個 class 比對，找出我們不認識的視窗 (這是 user 報「F11 卡死」
     # 但 watcher 0 個 popup 的根因 — 真的有 popup，只是我們不知道它的 class)。
@@ -2791,11 +2821,14 @@ def _f11_popup_watcher(label: str = "F11",
         except Exception:
             pass
 
-        # [v41] 偵測 unknown popup — 列舉所有 visible top-level windows
-        try:
-            _scan_unknown_popups(known_classes, unknown_seen, label)
-        except Exception:
-            logging.debug("[%s] unknown popup scan 例外", label, exc_info=True)
+        # [v41] 偵測 unknown popup — 列舉所有 visible top-level windows([perf r5] 節流 ≥2s)
+        _now = time.time()
+        if _now - last_unknown_scan >= UNKNOWN_SCAN_INTERVAL:
+            last_unknown_scan = _now
+            try:
+                _scan_unknown_popups(known_classes, unknown_seen, label)
+            except Exception:
+                logging.debug("[%s] unknown popup scan 例外", label, exc_info=True)
 
         found_one = False
         for cls_name, title_kw, handler in _F11_POPUP_HANDLERS:
@@ -2858,9 +2891,21 @@ def _f11_popup_watcher(label: str = "F11",
     return handled_count
 
 
+_menu_tree_dumped_once = False
+
+
 def _dump_menu_tree(main_hwnd: int) -> None:
     """[diagnostic] 把主視窗 menu bar 各子選單項目(text + command id + ownerdraw)印到
-    log。HIS 選單是 Delphi owner-drawn 時 GetMenuStringW 抓不到文字，需靠 id+位置對照。"""
+    log。HIS 選單是 Delphi owner-drawn 時 GetMenuStringW 抓不到文字，需靠 id+位置對照。
+
+    [perf r5] HIS「完成不印」選單是 owner-draw，_find_menu_command_id_by_text 每次都比不到
+    文字 → 每次 F11 route A(照光病人)都 dump 整棵選單樹(~200 行)，是 automation_ui.log
+    暴漲(4.4MB/session)的最大單一來源。fallback id(276)已知且穩定，故每個 session 只 dump
+    一次供對照即可，之後跳過。若 HIS 改版選單結構變動，下次啟動的首次 F11 仍會重新 dump 一次。"""
+    global _menu_tree_dumped_once
+    if _menu_tree_dumped_once:
+        return
+    _menu_tree_dumped_once = True
     user32 = ctypes.windll.user32
     MF_BYPOSITION = 0x400
     MF_OWNERDRAW = 0x100
@@ -6044,9 +6089,45 @@ def _send_alert_email_via_outlook(subject: str, body: str,
     return bool(result.get("ok"))
 
 
+# [perf r5] 東區休診推論索引 — 取代月曆重繪時每格×每醫師×每時段重掃整份
+# all_doctors_data(最壞 ~396 次/重繪 × 整月掃)的 _doctor_has_other_ext_on_weekday。
+# 每次 refresh 只全掃一次建索引，per-cell 查詢降為 O(1)。抽成純函式以便單元測試對拍
+# 等價性(見 tests/test_east_clinic_index.py 對 _doctor_has_other_ext_on_weekday 差分測試)。
+def _build_east_weekday_index(all_doctors_data, parse_item):
+    """建 (lookup_key, weekday, session) -> set(有東區的日期)。parse_item(item) ->
+    (session_name, ext_branch)，同時處理 dict 與舊式 str。語意對齊原方法：isinstance(date)
+    過濾、僅收 east、session 非空。"""
+    index: dict = {}
+    for lk, data in all_doctors_data.items():
+        if not isinstance(data, dict) or 'error' in data:
+            continue
+        for dkey, items in data.items():
+            if not isinstance(dkey, date):
+                continue
+            wd = dkey.weekday()
+            for item in items:
+                sn, ext = parse_item(item)
+                if ext == "east" and sn:
+                    index.setdefault((lk, wd, sn), set()).add(dkey)
+    return index
+
+
+def _east_index_has_other(index, doc_no, doc_name, weekday_idx, session_name, exclude_date):
+    """索引版查詢：是否有「其他(非 exclude_date)同 weekday」出現東區該診別。
+    doc_no/doc_name 兩鍵聯集，與 _doctor_has_other_ext_on_weekday 等價。"""
+    for lk in (doc_no, doc_name):
+        dates = index.get((lk, weekday_idx, session_name))
+        if dates and any(d != exclude_date for d in dates):
+            return True
+    return False
+
+
 # --- 9. UI 與應用程式主體 ---
 class AutomationApp:
     def __init__(self, root: tk.Tk, master_schedule: dict):
+        # [perf r5] splash 已顯示 → 此時才載入延後的重量級網路相依(requests/urllib3/bs4)，
+        # 填入模組全域供後續抓網函式使用。必須在任何網路呼叫之前(放 __init__ 最前)。
+        _ensure_network_imports()
         self.root = root
         self.root.title("中國醫皮膚科常用程式")
         place_tk_window_on_preferred_monitor(self.root)
@@ -6472,6 +6553,17 @@ class AutomationApp:
                                 self.all_doctors_data[doc_no] = _decode_cache_date_keys(doc_data)
                     logging.info("已載入門診人數快取（JSON fallback）。")
 
+            # [perf r5] 啟動時清一次過老(>30天)的門診人數 row。vacuum_old_entries 早已
+            # 實作但全專案從未被呼叫 → DB 隨運行天數線性累積舊日期 row，拖慢每次啟動的
+            # 全表載入。顯示只用近期/未來日期，刪舊不影響 UI。一次性小 DELETE，對啟動可忽略。
+            try:
+                from cmuh_common.sqlite_cache import vacuum_old_entries
+                _removed = vacuum_old_entries(older_than_days=30)
+                if _removed:
+                    logging.info("[O22] 啟動清理 %d 筆過老門診人數 row(>30天)", _removed)
+            except Exception:
+                logging.debug("[O22] vacuum 過老 row 失敗(忽略)", exc_info=True)
+
             # 2. 載入 主門診表 (master_schedule)
             sched_path = get_conf_path('cache_master_schedule.json')
             cached_schedule = load_master_schedule_cache(sched_path)
@@ -6540,7 +6632,10 @@ class AutomationApp:
 
     def _get_clinic_dynamic_state(self, room_code, time_code, doc_name=None, session_cn=None):
         key = self._clinic_dynamic_state_key(room_code, time_code)
-        state = self._clinic_dynamic_state_cache.get(key)
+        # [stability r5] persist 會整個 rebind cache(prune→新 dict)、clear 會 .pop，皆在
+        # _clinic_dynamic_state_lock 下。讀取取同一鎖避免讀到過渡狀態(背景 worker 呼叫)。
+        with self._clinic_dynamic_state_lock:
+            state = self._clinic_dynamic_state_cache.get(key)
         if self._clinic_dynamic_state_matches(state, room_code, time_code, doc_name, session_cn):
             return state
         return None
@@ -8723,7 +8818,11 @@ class AutomationApp:
         if not changed:
             return
         try:
-            _atomic_write_json(file_path, data)
+            # [perf r5] clinic_light_history 是純機器讀寫的大型快取(~220KB，每次門診輪詢
+            # 每診間寫一次)，沒人會手看。改 compact(indent=None + 無空白分隔)可把 json.dump
+            # 從 ~6ms 降到 ~1ms、檔案砍近半，fsync 位元組數也減半。讀端 safe_load_json 與
+            # 格式無關，round-trip 完全等價。其餘小型人讀設定檔維持預設 indent=4。
+            _atomic_write_json(file_path, data, indent=None, separators=(",", ":"))
         except Exception:
             pass
 
@@ -8865,21 +8964,32 @@ class AutomationApp:
                 return
 
 # --- 1. 重置目前狀態 (記憶體) ---
-            tracker['durations'] = []
-            tracker['waiting_durations'] = []
-            tracker['last_completed_set'] = set()
-            tracker['last_waiting_set'] = set()
-            tracker['last_valid_completion_time'] = time.time()
-            tracker['first_valid_skipped'] = False
-            tracker['is_first_run'] = True
-            tracker['had_any_activity'] = False
-            tracker['stable_since_ts'] = None
-            tracker['last_monitor_pair'] = None
-            tracker['actual_closing_dt'] = None
-            tracker['phototherapy_count'] = 0 
-            
-            # [新增] 重置等待時間相關
-            tracker['patient_checkin_times'] = {}
+            # [stability r5] 與背景燈號 worker(run_update 全程持 _tracker_lock 改寫同一
+            # tracker)序列化：避免 main thread 在此清空 dict/set 的同時，worker 正在迭代
+            # last_waiting_set / 對 patient_checkin_times 做 membership+del，觸發 KeyError /
+            # 'dict changed size' 殺背景緒，或剛重置又被舊計算寫回(lost update)。
+            # 鎖內重新取 tracker 引用(askyesno 對話框可能等了很久，原引用可能過時)。
+            with self._tracker_lock:
+                tracker = (self.clinic_trackers.get(tracker_key)
+                           or self.clinic_trackers.get(room_code))
+                if tracker is not None:
+                    tracker['durations'] = []
+                    tracker['waiting_durations'] = []
+                    tracker['last_completed_set'] = set()
+                    tracker['last_waiting_set'] = set()
+                    tracker['last_valid_completion_time'] = time.time()
+                    tracker['first_valid_skipped'] = False
+                    tracker['is_first_run'] = True
+                    tracker['had_any_activity'] = False
+                    tracker['stable_since_ts'] = None
+                    tracker['last_monitor_pair'] = None
+                    tracker['actual_closing_dt'] = None
+                    tracker['phototherapy_count'] = 0
+                    # [新增] 重置等待時間相關
+                    tracker['patient_checkin_times'] = {}
+
+            # _clear_clinic_dynamic_state 用不同鎖(_clinic_dynamic_state_lock)且含檔案 I/O，
+            # 留在 _tracker_lock 外，避免持鎖做磁碟 I/O / 巢狀鎖。
             self._clear_clinic_dynamic_state(
                 room_code,
                 resolve_clinic_reg64_time_code(mode, datetime.now()),
@@ -9388,7 +9498,7 @@ class AutomationApp:
             if not getattr(self, '_abbrev_monitor_started', False):
                 self._abbrev_monitor_started = True
                 try:
-                    self.root.after(60000, self._abbrev_monitor_external)
+                    self.root.after(180000, self._abbrev_monitor_external)
                 except Exception:
                     logging.debug("[abbrev] 啟動 external monitor 失敗",
                                   exc_info=True)
@@ -9397,8 +9507,9 @@ class AutomationApp:
     def _abbrev_monitor_external(self):
         """[v6] 週期檢查外部文字展開程式 (PhraseExpress 等)。
         狀態改變 (出現/消失) → 重新 install (install 內部會依偵測結果決定
-        掛 hook 或暫停)，避免雙重展開衝突。每 ~60s 跑一次（v9 由 20s 拉長，
-        降低 process 全掃描頻率；使用者極少在 session 中途開關 PhraseExpress）。
+        掛 hook 或暫停)，避免雙重展開衝突。[perf r5] 每 ~180s 跑一次（v9 由 20s→60s，
+        本輪 60s→180s：detect 走 psutil.process_iter 全行程列舉、跑在 Tk main thread，
+        屬粗粒度防呆，使用者極少在 session 中途開關 PhraseExpress，降頻減少 UI thread 負擔）。
         """
         try:
             eng = getattr(self, 'abbrev_engine', None)
@@ -9425,7 +9536,7 @@ class AutomationApp:
             # reschedule (即使這次例外也要繼續監看)
             if not getattr(self, '_shutting_down', False):
                 try:
-                    self.root.after(60000, self._abbrev_monitor_external)
+                    self.root.after(180000, self._abbrev_monitor_external)
                 except Exception:
                     logging.debug("[abbrev] reschedule monitor 失敗",
                                   exc_info=True)
@@ -10305,6 +10416,13 @@ class AutomationApp:
         current_order = [d['name'] for d in self.doctors_list]
         order_map = {name: i for i, name in enumerate(current_order)}
 
+        # [perf r5] 東區休診推論索引：每次 refresh 只全掃一次建索引(取代每格重掃整月，
+        # 見 _build_east_weekday_index 上方說明)。只在顯示東區時才建。
+        east_weekday_index = (
+            _build_east_weekday_index(self.all_doctors_data, self._appt_item_session_ext)
+            if self.show_external_clinics.get() else {}
+        )
+
         for week in range(num_weeks):
             for day_idx in range(6):
                 current_date = start_date + timedelta(days=(week * 7) + day_idx)
@@ -10558,8 +10676,10 @@ class AutomationApp:
                             key_ext = (doc_name, "east")
                             if key_ext in display_data[session_name]:
                                 continue
-                            if not self._doctor_has_other_ext_on_weekday(
-                                doc_no, doc_name, weekday_idx, session_name, current_date
+                            # [perf r5] O(1) 索引查詢取代每格重掃整月(語意等價，見上方索引建置)
+                            if not _east_index_has_other(
+                                east_weekday_index, doc_no, doc_name,
+                                weekday_idx, session_name, current_date
                             ):
                                 continue
                             display_data[session_name][key_ext] = (

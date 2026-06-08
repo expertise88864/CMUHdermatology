@@ -764,3 +764,72 @@ def test_reg64_calendar_cache_guarded_by_lock():
     assert "with self._reg64_cache_lock:" in write_src
     read_src = _function_source(source_path, "_reg64_total_for_calendar_cell")
     assert "with self._reg64_cache_lock:" in read_src
+
+
+# === [r5 穩定性 + 效能優化回歸保護] ===
+
+def test_reset_clinic_stats_resets_under_tracker_lock():
+    """[r5] reset 的記憶體 tracker 重置必須在 _tracker_lock 內(與背景 worker 序列化)，
+    避免兩緒同時改同一 dict/set 觸發 KeyError/dict-changed 或統計錯亂。"""
+    source_path = ROOT / "src" / "main.py"
+    src = _function_source(source_path, "reset_clinic_stats")
+    assert "with self._tracker_lock:" in src
+    lock_idx = src.index("with self._tracker_lock:")
+    # 重置欄位必須落在鎖之後
+    assert src.index("tracker['durations'] = []") > lock_idx
+    assert src.index("tracker['patient_checkin_times'] = {}") > lock_idx
+
+
+def test_dynamic_state_read_guarded_by_lock():
+    """[r5] _get_clinic_dynamic_state 讀取取同一把鎖(persist 整個 rebind / clear pop 都持鎖)。"""
+    source_path = ROOT / "src" / "main.py"
+    src = _function_source(source_path, "_get_clinic_dynamic_state")
+    assert "with self._clinic_dynamic_state_lock:" in src
+
+
+def test_f11_unknown_popup_scan_throttled():
+    """[r5] F11 watcher 的全域 EnumWindows 診斷掃描必須節流(非每輪)，省無謂 CPU。"""
+    source_path = ROOT / "src" / "main.py"
+    src = _function_source(source_path, "_f11_popup_watcher")
+    assert "UNKNOWN_SCAN_INTERVAL" in src
+    assert "last_unknown_scan" in src
+
+
+def test_menu_tree_dump_gated_once_per_session():
+    """[r5] _dump_menu_tree(owner-draw 選單每次 F11 route A 都 dump ~200 行，log 暴漲
+    主因)改為每 session 只 dump 一次。"""
+    source_path = ROOT / "src" / "main.py"
+    full = source_path.read_text(encoding="utf-8")
+    assert "_menu_tree_dumped_once" in full
+    src = _function_source(source_path, "_dump_menu_tree")
+    assert "if _menu_tree_dumped_once:" in src
+    assert "return" in src
+
+
+def test_clinic_light_history_written_compact():
+    """[r5] 大型純機器快取 clinic_light_history.json 用 compact(indent=None)序列化。"""
+    source_path = ROOT / "src" / "main.py"
+    full = source_path.read_text(encoding="utf-8")
+    assert 'indent=None, separators=(",", ":")' in full
+
+
+def test_startup_vacuums_old_clinic_count_rows():
+    """[r5] 啟動時呼叫 vacuum_old_entries 清過老 row(原本死碼從未被呼叫)。"""
+    source_path = ROOT / "src" / "main.py"
+    src = _function_source(source_path, "load_cached_data")
+    assert "vacuum_old_entries" in src
+
+
+def test_heavy_network_imports_are_lazy_after_splash():
+    """[r5] requests/urllib3/bs4(~500ms)延後到 __init__(splash 後)才 import，
+    模組頂層只佔位 None；加快感知啟動。"""
+    source_path = ROOT / "src" / "main.py"
+    full = source_path.read_text(encoding="utf-8")
+    # PEP 563 讓註解變字串，才能延後 import
+    assert "from __future__ import annotations" in full
+    # lazy bootstrap 機制存在
+    assert "def _ensure_network_imports(" in full
+    # __init__ 內(8 空白縮排)有 bootstrap 呼叫(splash 之後)
+    assert "\n        _ensure_network_imports()" in full
+    # 模組頂層不再有無條件的 `import requests`(改為佔位 + 延後)
+    assert "\nrequests = None" in full
