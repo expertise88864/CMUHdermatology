@@ -631,6 +631,31 @@ def get_current_swipe_info(driver, wait, get_loc):
     return sys_date, swipes, last_swipe
 
 
+# [fix 2026-06-08] 本窗已完成打卡的帳號標記。
+# 排程設計是「打卡窗內每分鐘 re-fire 同一任務、靠讀刷卡表冪等跳過」。但 re-fire 必須先
+# 成功登入才能讀刷卡表；若某次 re-fire 的登入剛好失敗(WebDriverException/多次登入失敗)，
+# 就會在『其實已打卡成功』的情況下跳出假的「打卡失敗」通知(user 實測：每到打卡時間右下角
+# 一直跳失敗，但實際已打卡成功)。改為：帳號一旦在本窗確認完成(打卡成功 或 已偵測到既有
+# 紀錄)，就記下來；後續 re-fire 直接略過該帳號，不再重開 driver/重新登入 → 不再產生假失敗。
+# key=(schedule_key, username)，value=date_str；以日期判定自動跨日重置、且大小有界(覆寫同 key)。
+_clock_done_lock = threading.Lock()
+_clock_done: dict = {}
+
+
+def _mark_clock_done(schedule_key, username) -> None:
+    if not schedule_key or not username:
+        return
+    with _clock_done_lock:
+        _clock_done[(schedule_key, username)] = date.today().isoformat()
+
+
+def _is_clock_done(schedule_key, username) -> bool:
+    if not schedule_key or not username:
+        return False
+    with _clock_done_lock:
+        return _clock_done.get((schedule_key, username)) == date.today().isoformat()
+
+
 def _check_swipes(type_str: str, start: dt_time, end: dt_time, swipes) -> bool:
     """檢查是否有「特定類型」紀錄『嚴格』落在 [start, end] 官方打卡區間內。
 
@@ -670,6 +695,8 @@ def perform_clock_action(driver, wait, acc, is_in: bool,
                 logging.info(
                     "%s 在區間 %s-%s 內已有 %s 紀錄，跳過。",
                     acc["username"], check_start, check_end, act_name)
+                # [fix] 已有紀錄=本窗確認完成 → 標記，後續 re-fire 直接略過不再登入
+                _mark_clock_done(task_label, acc["username"])
                 return
             if not dry_run:
                 logging.info(
@@ -709,6 +736,9 @@ def perform_clock_action(driver, wait, acc, is_in: bool,
                 pass
 
             logging.info("%s %s 打卡成功！", acc["username"], act_name)
+            # [fix] 打卡成功=本窗確認完成 → 標記，後續每分鐘 re-fire 直接略過該帳號，
+            # 不再重新登入(避免 re-fire 登入失敗時跳出假的「打卡失敗」通知)。
+            _mark_clock_done(task_label, acc["username"])
             return
 
         except (StaleElementReferenceException, WebDriverException) as e:
@@ -777,6 +807,15 @@ def process_clock_task(schedule_key: str | None) -> None:
         accs = [a for a in load_config()
                 if a.get("schedule", {}).get(schedule_key, False)]
         if not accs:
+            return
+
+        # [fix 2026-06-08] 本窗已確認完成打卡(成功/已有紀錄)的帳號，直接從本次 re-fire 排除。
+        # 打卡窗內每分鐘都會 re-fire 同一任務；第一次成功後，後續 re-fire 若還重開 driver+登入，
+        # 一旦登入剛好失敗就會跳假的「打卡失敗」通知。先過濾掉已完成帳號 → 全部完成就連 driver
+        # 都不開、直接返回，根除假失敗通知與每分鐘的重複登入開銷。
+        accs = [a for a in accs if not _is_clock_done(schedule_key, a.get("username"))]
+        if not accs:
+            logging.info("排程觸發: %s — 本窗所有帳號已完成打卡，略過 re-fire", schedule_key)
             return
 
         logging.info(

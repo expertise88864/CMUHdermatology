@@ -407,3 +407,41 @@ def test_health_declaration_logs_on_failure():
     # 找不到按鈕(今天不需宣告)仍靜默 return，不誤報
     assert "今天不需宣告" in src
     assert "except (TimeoutException, WebDriverException):\n        pass" not in src
+
+
+# === [fix 2026-06-08] 打卡成功後 re-fire 不再跳假「打卡失敗」===
+
+def test_clock_done_marking():
+    """本窗標記完成後 _is_clock_done 同日為 True；不同帳號/窗不受影響；跨日自動失效。"""
+    autoclock._clock_done.clear()
+    try:
+        assert autoclock._is_clock_done("mon_midday_in", "N24367") is False
+        autoclock._mark_clock_done("mon_midday_in", "N24367")
+        assert autoclock._is_clock_done("mon_midday_in", "N24367") is True
+        # 不同帳號 / 不同打卡窗互不影響
+        assert autoclock._is_clock_done("mon_midday_in", "OTHER") is False
+        assert autoclock._is_clock_done("mon_am_in", "N24367") is False
+        # 模擬跨日(value 改成舊日期) → 失效，隔天會重新打卡
+        autoclock._clock_done[("mon_midday_in", "N24367")] = "2000-01-01"
+        assert autoclock._is_clock_done("mon_midday_in", "N24367") is False
+        # 防呆：空值不誤判
+        autoclock._mark_clock_done("", "N24367")
+        assert autoclock._is_clock_done("", "N24367") is False
+    finally:
+        autoclock._clock_done.clear()
+
+
+def test_process_clock_task_filters_done_before_driver():
+    """原始碼守門：process_clock_task 在開 driver 前就排除本窗已完成帳號(全完成→不開 driver)。"""
+    import inspect
+    src = inspect.getsource(autoclock.process_clock_task)
+    assert "_is_clock_done(schedule_key" in src
+    # 過濾必須發生在 _get_or_create_clock_driver 之前
+    assert src.index("_is_clock_done(schedule_key") < src.index("_get_or_create_clock_driver()")
+
+
+def test_perform_clock_action_marks_done_on_success_and_record():
+    """原始碼守門：打卡成功 與 已有紀錄 兩條路徑都標記本窗完成，避免 re-fire 重登入。"""
+    import inspect
+    src = inspect.getsource(autoclock.perform_clock_action)
+    assert src.count("_mark_clock_done(task_label") >= 2
