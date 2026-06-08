@@ -479,11 +479,36 @@ def test_update_same_day_is_too_close():
 
 
 def test_update_no_uvb_returns_fallback():
-    """處置沒 UVB → NO_UVB_LINE 給 caller 走 fallback。"""
-    text = "keep phototherapy on both lower limbs to 680 mj/cm2 on (2026/5/26)"
+    """處置完全沒 UVB 關鍵字 → NO_UVB_LINE 給 caller 走 fallback。"""
+    text = "medication and regular follow up\nhesitate MTX"
     r = update_uvb_in_text(text, today=date(2026, 5, 28))
     assert r.action == UvbAction.NO_UVB_LINE
     assert r.new_text is None
+
+
+def test_update_keep_phototherapy_to_dose_at_max():
+    """[2026-06-08] 自由寫法「keep phototherapy … to <N> mj/cm2 … MAX <N>」(蔡國華
+    實機 case)：劑量已達 MAX、沒寫 increase → 視為保持(increase=0)，仍正常更新
+    count+date。原本因 dose 在「to」後面+缺 increase → NO_UVB_LINE 終止、跳過 51019。"""
+    text = ("局部 keep phototherapy on both lower limbs to 680  mj/cm2  on  (2026/6/4) "
+            "(489) ,  photo for insurance on (2023/7/25) . MAX 680 due to mild pain "
+            "for 680mj/cm2 , patient want to photo 2 times per week , 9 weeks appoint")
+    r = update_uvb_in_text(text, today=date(2026, 6, 8))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 680   # 已達 MAX → 保持不加量
+    assert r.new_count == 490  # 489 → 490
+    assert "(2026/06/08)" in r.new_text
+    assert "(490)" in r.new_text
+    # 不可誤抓 "want to photo 2" 當劑量(mj lookahead 保護)
+    assert "to 680" in r.new_text
+
+
+def test_phototherapy_to_dose_without_max_is_silent_skip():
+    """有 phototherapy + dose(自由寫法 to N mj) 但缺 MAX → SILENT_SKIP(不改劑量但
+    繼續 51019+療程)，不再誤判 NO_UVB_LINE 而終止。"""
+    text = "keep phototherapy on both lower limbs to 680 mj/cm2 on (2026/5/26)"
+    r = update_uvb_in_text(text, today=date(2026, 5, 28))
+    assert r.action == UvbAction.SILENT_SKIP
 
 
 def test_update_8_days_decay():

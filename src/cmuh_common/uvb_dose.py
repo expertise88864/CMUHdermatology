@@ -125,9 +125,14 @@ class UvbLineInfo:
 # 注意 alternation 順序: UVB|UV 必須長的先 — 否則 "UVB" 會被 UV 部分匹配
 # [2026-06-01] 分隔符也接受逗號:「phototherapy, 950mj」這類關鍵字與劑量數字間
 # 夾逗號的自由寫法(曾大鈞實機 case)。原本只允許冒號/空白,逗號會讓 dose 解析失敗。
+# [2026-06-08] 也接受「keyword … to <N> mj」自由寫法(蔡國華實機 case:
+#   「keep phototherapy on both lower limbs to 680 mj/cm2」)。關鍵字與劑量間夾一段
+#   文字、用「to」帶出劑量。為避免誤抓(如「want to photo 2 times」)，這個分支要求
+#   數字後面緊跟「mj」單位(zero-width lookahead)，且關鍵字到 to 之間 ≤40 字、不跨逗號。
 _UVB_DOSE_RE = re.compile(
     r"(UVB|Phototherapy|UV)(?:\s*[:：,，]?\s*"
-    r"|\s+[^\r\n,，]{0,40}?\bdose\s*[:：]?\s*)(\d+)",
+    r"|\s+[^\r\n,，]{0,40}?\bdose\s*[:：]?\s*"
+    r"|\s+[^\r\n,，]{0,40}?\bto\s+(?=\d+\s*mj))(\d+)",
     re.IGNORECASE)
 # [v20.11] 接受帶 paren 跟不帶 paren 兩種:
 #   (2026/05/24) — group 1-3
@@ -347,6 +352,13 @@ def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
     inc_m = _UVB_INCREASE_RE.search(segment)
     if not inc_m:
         if _has_maintain_dose(segment):
+            increase = 0
+        elif dose >= max_dose:
+            # [2026-06-08] 劑量已達/超過 MAX 且沒寫 increase → 本就無法再加量(會被
+            # cap 在 MAX)，視為 increase=0「保持」。涵蓋「keep phototherapy … to 680
+            # mj/cm2 … MAX 680 due to mild pain」這類固定劑量寫法(蔡國華實機 case)。
+            # 僅在 dose>=max 這種「無歧義」情況放寬；dose<max 仍維持 return None 的安全
+            # 預設(避免醫師漏寫 increase 時程式擅自猜測)。
             increase = 0
         else:
             return None
@@ -958,7 +970,12 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
             sanity_reason=f"次數 ({parsed.count}) 異常 [1-{MAX_COUNT}]",
             parsed=parsed, uvb_line_count=uvb_lines,
         )
-    if ((parsed.increase <= 0 and not _has_maintain_dose(parsed.full_match))
+    # increase=0(保持/不加量)合法的兩種情況：(a)明寫 maintain dose；(b)劑量已達/超過
+    # MAX→本就無法再加量(會被 cap)。[2026-06-08] 補上 (b)，與 parse_uvb_line 同步，
+    # 涵蓋「keep phototherapy … to 680 … MAX 680」固定劑量寫法(蔡國華實機 case)。
+    if ((parsed.increase <= 0
+            and not _has_maintain_dose(parsed.full_match)
+            and parsed.dose < parsed.max_dose)
             or parsed.increase > 200):
         return UvbUpdateResult(
             action=UvbAction.SANITY_FAIL,
