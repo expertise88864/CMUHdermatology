@@ -91,3 +91,33 @@ def test_load_credentials_replaces_invalid_smtp_port(tmp_path, monkeypatch,
 
     assert smtp_mail.load_credentials()["port"] == \
         smtp_mail.DEFAULT_CREDENTIALS["port"]
+
+
+# === [opt B1] load_credentials 純讀取、建範本分離 ===
+
+def test_load_credentials_is_read_only_when_file_missing(tmp_path, monkeypatch):
+    """檔案不存在時 load_credentials 不建檔(避免熱路徑 IMAP poll 每 20s 寫檔)，回 default。"""
+    missing = tmp_path / "smtp_credentials.json"
+    monkeypatch.setattr(smtp_mail, "CREDENTIALS_FILE", missing)
+
+    cred = smtp_mail.load_credentials()
+
+    assert not missing.exists()  # 純讀取，不建檔
+    assert cred["password"] == ""  # 回 default(password 空 → is_configured False)
+    assert cred["host"] == smtp_mail.DEFAULT_CREDENTIALS["host"]
+
+
+def test_ensure_credentials_template_creates_then_preserves(tmp_path, monkeypatch):
+    """ensure_credentials_template 缺檔時建範本；已存在則不覆寫使用者內容。"""
+    path = tmp_path / "smtp_credentials.json"
+    monkeypatch.setattr(smtp_mail, "CREDENTIALS_FILE", path)
+
+    smtp_mail.ensure_credentials_template()
+    assert path.exists()
+    assert json.loads(path.read_text(encoding="utf-8"))["host"] == \
+        smtp_mail.DEFAULT_CREDENTIALS["host"]
+
+    # 已存在 → 不覆寫使用者已填的 password
+    path.write_text(json.dumps({"password": "userset"}), encoding="utf-8")
+    smtp_mail.ensure_credentials_template()
+    assert json.loads(path.read_text(encoding="utf-8"))["password"] == "userset"

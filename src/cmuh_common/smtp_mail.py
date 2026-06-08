@@ -118,19 +118,31 @@ class SmtpNotConfiguredError(RuntimeError):
     """SMTP 設定不完整（通常是 password 為空）。"""
 
 
+def ensure_credentials_template() -> None:
+    """[opt B1] 若 SMTP 設定檔不存在，建立預設範本供使用者填入 App Password。
+    只在啟動 / 設定視窗開啟時呼叫一次 —— 與『讀取』分離，避免讀路徑(每 20s 的 IMAP
+    poll 也會走 load_credentials)帶寫檔副作用。"""
+    try:
+        if not CREDENTIALS_FILE.exists():
+            atomic_write_json(str(CREDENTIALS_FILE), DEFAULT_CREDENTIALS, indent=2)
+            logging.info("已建立 SMTP 設定範本：%s（請填入 App Password 後再寄信）",
+                         CREDENTIALS_FILE)
+    except Exception:
+        logging.warning("建立 SMTP 設定範本失敗（忽略）", exc_info=True)
+
+
 def load_credentials() -> dict:
-    """讀取 SMTP 設定，缺欄位以 default 補。檔案不存在則建立預設範本。"""
+    """讀取 SMTP 設定，缺欄位以 default 補。
+
+    [opt B1] 純讀取、無副作用：檔案不存在直接回 default(password 空 → is_configured()
+    為 False，會診流程自然靜默跳過)。建立範本改由 ensure_credentials_template() 在啟動時
+    呼叫，避免這個被熱路徑(IMAP poll 每 20s)呼叫的函式帶 fsync 寫檔副作用。"""
     cred = dict(DEFAULT_CREDENTIALS)
     try:
         if CREDENTIALS_FILE.exists():
             saved = safe_load_json(str(CREDENTIALS_FILE), default={})
             if isinstance(saved, dict):
                 cred.update(saved)
-        else:
-            # 建範本檔，使用者編輯填入 password
-            atomic_write_json(str(CREDENTIALS_FILE), DEFAULT_CREDENTIALS, indent=2)
-            logging.info("已建立 SMTP 設定範本：%s（請填入 App Password 後再寄信）",
-                         CREDENTIALS_FILE)
     except Exception:
         logging.warning("讀取 SMTP 設定失敗，使用內建預設", exc_info=True)
     # 正規化

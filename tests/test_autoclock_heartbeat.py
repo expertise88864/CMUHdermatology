@@ -369,3 +369,41 @@ def test_idle_janitor_skips_driver_in_use(monkeypatch):
     autoclock._idle_driver_janitor()
     assert quit_called == [True]
     assert pool["driver"] is None
+
+
+# === [opt A2] session 死亡偵測 + 重建 ===
+
+def test_driver_session_alive_probe():
+    """session 探測：title 正常→True；丟例外(InvalidSessionId 等)→False；None→False。"""
+    class _Alive:
+        @property
+        def title(self):
+            return "ok"
+
+    class _Dead:
+        @property
+        def title(self):
+            raise Exception("invalid session id: session deleted")
+
+    assert autoclock._driver_session_alive(_Alive()) is True
+    assert autoclock._driver_session_alive(_Dead()) is False
+    assert autoclock._driver_session_alive(None) is False
+
+
+def test_process_clock_task_rebuilds_dead_session():
+    """[opt A2] 任務中途 session 死掉 → 重建 driver 後繼續(原始碼守門，防回歸/被覆蓋)。"""
+    import inspect
+    src = inspect.getsource(autoclock.process_clock_task)
+    assert "_driver_session_alive(driver)" in src
+    assert "_get_or_create_clock_driver()" in src
+    assert "_MAX_REBUILDS" in src  # 有重建上限，避免無限重建耗光打卡窗
+
+
+def test_health_declaration_logs_on_failure():
+    """[opt B4] 健康宣告偵測到按鈕但流程失敗 → 留 warning(原為 except: pass 完全靜默)。"""
+    import inspect
+    src = inspect.getsource(autoclock.handle_health_declaration)
+    assert "健康宣告流程失敗" in src
+    # 找不到按鈕(今天不需宣告)仍靜默 return，不誤報
+    assert "今天不需宣告" in src
+    assert "except (TimeoutException, WebDriverException):\n        pass" not in src

@@ -538,6 +538,10 @@ def handle_health_declaration(driver, wait, short_wait, get_loc) -> None:
     orig = driver.current_window_handle
     try:
         btns = short_wait.until(EC.presence_of_all_elements_located(get_loc("health_button")))
+    except (TimeoutException, WebDriverException):
+        # [opt B4] 找不到健康宣告按鈕 = 今天不需宣告(正常情況)，靜默跳過。
+        return
+    try:
         btn = next((b for b in btns if b.is_displayed() and b.is_enabled()), None)
         if btn:
             wins_before = driver.window_handles
@@ -562,7 +566,13 @@ def handle_health_declaration(driver, wait, short_wait, get_loc) -> None:
                 driver.switch_to.window(orig)
                 wait.until(EC.element_to_be_clickable(get_loc("execute_button")))
     except (TimeoutException, WebDriverException):
-        pass
+        # [opt B4] 偵測到健康宣告按鈕、但後續流程(開窗/送出/切回)失敗 → 不再靜默吞掉
+        # (原為 except: pass，連 log 都沒有)。留 warning 供 log / Live Log 排障。
+        # 控制流維持原樣(仍 return，呼叫端照常往下點 execute)，不升級為打卡失敗——因為
+        # 「健康宣告是否為打卡硬性前置」未確認，誤升級會把『今天不需宣告』誤判成失敗。
+        logging.warning(
+            "[autoclock] 健康宣告流程失敗(已偵測到按鈕但未完成)，請留意是否需手動宣告",
+            exc_info=True)
 
 
 def get_current_swipe_info(driver, wait, get_loc):
@@ -723,6 +733,19 @@ def perform_clock_action(driver, wait, acc, is_in: bool,
 # =============================================================================
 # 排程
 # =============================================================================
+def _driver_session_alive(driver) -> bool:
+    """[opt A2] 輕量探測 WebDriver session 是否還活著(Chrome 未被防毒/系統殺、未 crash)。
+    跑一個極輕量的跨行程 command(driver.title)；session 已死會丟 InvalidSessionIdException
+    /WebDriverException。回 False 代表該重建 driver。"""
+    if driver is None:
+        return False
+    try:
+        _ = driver.title
+        return True
+    except Exception:
+        return False
+
+
 def process_clock_task(schedule_key: str | None) -> None:
     if schedule_key is None:
         return
@@ -779,9 +802,26 @@ def process_clock_task(schedule_key: str | None) -> None:
             _persistent_driver_pool["in_use"] = True
         try:
             wait = WebDriverWait(driver, 20)
+            # [opt A2] 任務中途若 Chrome session 死掉(被防毒/系統殺、crash、OOM)，原本
+            # perform_clock_action 會對「同一顆死 driver」每個帳號各跑 5 次重試+指數 backoff
+            # (單帳號光 backoff 就 ~62s 全失敗)，多帳號連坐 → 可能整個 30 分鐘打卡窗錯過。
+            # 改為每帳號前輕量探測 session；死掉就重建一顆健康 driver 再繼續(上限 2 次，避免
+            # Chrome 反覆死掉時無限重建耗光窗口)。
+            _rebuilds = 0
+            _MAX_REBUILDS = 2
             for acc in accs:
                 if not running.is_set():
                     break
+                if _rebuilds < _MAX_REBUILDS and not _driver_session_alive(driver):
+                    logging.warning(
+                        "[autoclock] 偵測到 Chrome session 已死 → 重建 driver 後繼續"
+                        "(第 %d/%d 次)", _rebuilds + 1, _MAX_REBUILDS)
+                    driver = _get_or_create_clock_driver()
+                    _rebuilds += 1
+                    if not driver:
+                        logging.error("[autoclock] 重建 driver 失敗，中止本任務剩餘帳號")
+                        break
+                    wait = WebDriverWait(driver, 20)
                 perform_clock_action(
                     driver, wait, acc, is_in, check_start, check_end,
                     dry_run=False, task_label=schedule_key,

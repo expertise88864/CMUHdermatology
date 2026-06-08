@@ -1696,6 +1696,10 @@ def _run_imap_check_with_timeout(kw: str, timeout: float = 60.0) -> dict:
         if t.is_alive():
             logging.warning(
                 "[watchdog] daemon thread 仍未結束，已放棄；保留引用，下一輪不疊加新 thread")
+            # [opt B2] worker 被放生、永遠走不到 finally 的 _clear_active → 主動把這條已關閉
+            # 的連線從 _active_conns 移除，避免死連線物件被 set 永久強引用無法 GC。
+            # single-flight 保證此刻 set 內只有這條(不會誤清新連線)。
+            force_close_active(clear=True)
         # 維持 _last_imap_thread = t（仍 alive），下一輪會看到並跳過直到它自己結束
         return _empty_imap_result(
             f"IMAP check timeout > {timeout:.0f}s (socket 已強制關閉)")
@@ -1914,6 +1918,7 @@ def scheduler_loop() -> None:
     IMAP_COOLDOWN_SEC = 300       # 之後暫停 5 分鐘
     consecutive_imap_errors = 0
     imap_cooldown_until = 0.0
+    last_cooldown_log = 0.0  # [opt B3] cooldown 進度 log 的時間節流(取代失效的 %60 modulo)
     # [優化] cfg 快取：原本每秒 load_config → 86400 reads/day。改快取 + 60s
     # 過期重讀。設定變更走 RELOAD_FLAG 強制重讀，所以使用者改設定也即時生效。
     cfg = None
@@ -1957,9 +1962,13 @@ def scheduler_loop() -> None:
                     # cooldown 期間：仍要把 last_email_check 推進避免一直 spam
                     # 但實際上不要 IMAP poll，等 cooldown 結束
                     remaining = imap_cooldown_until - time.time()
-                    if int(remaining) % 60 == 0:  # 每分鐘提醒一次
+                    # [opt B3] 原本 int(remaining) % 60 == 0 因評估點落在 ~20s 顆粒、
+                    # remaining 是浮點，幾乎永遠命中不到 60 倍數秒 → 這行提醒實務上從不印，
+                    # cooldown 進度在 log 中不可見。改用時間節流(比照同檔 half-dead log idiom)。
+                    if time.time() - last_cooldown_log >= 60:
                         logging.info("[IMAP cooldown] 連續失敗中，剩 %.0fs 後恢復",
                                       remaining)
+                        last_cooldown_log = time.time()
                     last_email_check = time.time()
                 if not in_cooldown and time.time() - last_email_check >= poll_sec:
                     last_email_check = time.time()
@@ -2026,10 +2035,20 @@ def scheduler_loop() -> None:
                                                   override_recipients=dedup_proceed)
                         elif not blocked:
                             # 比對到主旨但完全沒抓到 From → fallback 用設定的 recipients
-                            logging.info(
-                                "收到觸發信但無法解析 From，fallback 用 "
-                                "email_trigger_recipients")
-                            trigger_job_async("email")
+                            # [opt A1] 此 fallback 分支原本沒去重：若觸發信 From 解析不出
+                            # (畸形 From) 且 imap_reader 標已讀又失敗(只 log 不 raise)，這封
+                            # UNSEEN 信會每輪 IMAP poll(~20s)重新命中→每 20s 重跑完整 consult
+                            # flow+寄信，直到撞 SMTP rate-limit。用固定哨兵 key 套用與 allowed
+                            # 路徑一致的去重，把「每 20s」壓成「最多每 dedup 窗一次」。
+                            if _trigger_is_duplicate("__no_sender__"):
+                                logging.warning(
+                                    "[dedup] 無法解析 From 的觸發信在 %ds 內已處理過 → "
+                                    "略過避免重複寄信", _TRIGGER_DEDUP_WINDOW_SEC)
+                            else:
+                                logging.info(
+                                    "收到觸發信但無法解析 From，fallback 用 "
+                                    "email_trigger_recipients")
+                                trigger_job_async("email")
             # ★ Heartbeat：每 60s 一定寫一筆 log。下次再卡住 1 分鐘內就能發現。
             if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL:
                 next_poll_in = "-"
@@ -2523,6 +2542,12 @@ def main() -> None:
                 return
 
         logging.info("=== 會診查詢程式啟動 v%s ===", CURRENT_VERSION)
+        # [opt B1] 啟動時建一次 SMTP 設定範本(load_credentials 已改純讀取，不再於熱路徑寫檔)
+        try:
+            from cmuh_common.smtp_mail import ensure_credentials_template
+            ensure_credentials_template()
+        except Exception:
+            logging.debug("ensure_credentials_template 失敗（忽略）", exc_info=True)
         # 啟動權限狀態（給「自動提權有沒有真的生效」一個白紙黑字證據）
         logging.info("執行權限：%s",
                      "admin ✓" if is_admin() else "一般使用者 ✗（systemftp 會 740 失敗）")

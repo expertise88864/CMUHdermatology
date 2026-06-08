@@ -56,16 +56,26 @@ def _clear_active(conn: Optional[imaplib.IMAP4_SSL]) -> None:
         _active_conns.discard(conn)
 
 
-def force_close_active() -> bool:
+def force_close_active(clear: bool = False) -> bool:
     """從另一個 thread 緊急砍掉目前活動的 IMAP socket，讓 hang 的 recv 立即拋例外。
     回傳 True 表示有試著關（不保證 socket 確實已斷）；False 表示沒有 active 連線。
-    """
+
+    [opt B2] clear=True：關閉後一併把這些 conn 從 _active_conns 移除。供「worker thread
+    被放生、永遠走不到 finally 的 _clear_active」的逾時路徑使用，避免已死連線物件永久留在
+    set 內(socket/fd 已由上面 _force_close_conn 釋放，但 Python 物件仍被 set 強引用無法 GC)。
+    預設 False 維持原語意(force_close 不負責 discard)。
+    注意：目前為單連線設計(consult_query single-flight)，clear=True 等同清掉當下唯一那條；
+    若未來改成多連線並發，必須改成只清「逾時的那一條」而非全部，否則會誤清仍在用的健康連線。"""
     with _active_conn_lock:
         conns = list(_active_conns)
     if not conns:
         return False
     for conn in conns:
         _force_close_conn(conn)
+    if clear:
+        with _active_conn_lock:
+            for conn in conns:
+                _active_conns.discard(conn)
     return True
 
 
