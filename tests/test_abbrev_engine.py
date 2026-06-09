@@ -22,11 +22,46 @@ from cmuh_common.abbrev_engine import (  # noqa: E402
 )
 
 
-def test_external_expander_autoclose_defaults_to_off(tmp_path):
+def test_external_expander_autoclose_defaults_to_on(tmp_path):
+    """[2026-06-08] 預設改為開啟：偵測到其他展開軟體自動關閉、改用本程式縮寫。"""
     cfg = ae.ensure_config_file(str(tmp_path / "abbrev.json"))
 
-    assert AbbrevConfig().close_external_expander is False
-    assert cfg.close_external_expander is False
+    assert AbbrevConfig().close_external_expander is True
+    assert cfg.close_external_expander is True
+    # 缺 key 的舊配置(無 close_external_expander)載入後也應補成預設 True
+    import json
+    p = tmp_path / "legacy.json"
+    p.write_text(json.dumps({"enabled": True, "items": []}), encoding="utf-8")
+    assert ae.load_config(str(p)).close_external_expander is True
+    # 但使用者明確設 False 仍尊重(不被預設覆寫)
+    p2 = tmp_path / "explicit_off.json"
+    p2.write_text(json.dumps({"close_external_expander": False, "items": []}),
+                  encoding="utf-8")
+    assert ae.load_config(str(p2)).close_external_expander is False
+
+
+def test_install_captures_closed_expanders(monkeypatch):
+    """[2026-06-08] install 自動關閉專用展開程式後，_closed_expanders 應記下名稱供跳提示。"""
+    state = {"running": True}
+    monkeypatch.setattr(
+        ae, "_list_process_names",
+        lambda: {"phraseexpress.exe"} if state["running"] else {"notepad.exe"})
+
+    def fake_kill(image):
+        state["running"] = False
+        return True
+    monkeypatch.setattr(ae, "_taskkill_image", fake_kill)
+
+    eng = _make_engine()
+    cfg = AbbrevConfig(enabled=True, close_external_expander=True,
+                       items=[{"abbrev": "da", "expansion": "test"}])
+    eng.install(cfg)
+    assert eng._closed_expanders == ["phraseexpress.exe"]
+    assert eng.is_installed() is True
+
+    # 下一次 install 沒有可關的 → 清空(不會殘留、不會重複跳提示)
+    eng.install(cfg)
+    assert eng._closed_expanders == []
 
 
 # ─── render_expansion token ──────────────────────────────────────────────

@@ -9541,6 +9541,32 @@ class AutomationApp:
         except Exception:
             _show_warning()
 
+    def _maybe_notify_abbrev_closed_external(self, closed) -> None:
+        """[2026-06-08] 縮寫啟用且這次 install 真的自動關閉了其他展開軟體 → 主動跳提示
+        告知使用者(預設開啟自動關閉，但要讓使用者知道剛剛關掉了什麼)。"""
+        if not closed:
+            return
+        names = "、".join(str(c) for c in closed)
+        logging.warning("[abbrev] 已自動關閉其他展開軟體 %s，改用本程式縮寫", names)
+
+        def _show() -> None:
+            if getattr(self, '_shutting_down', False):
+                return
+            try:
+                self._show_notice(
+                    "已切換為本程式縮寫",
+                    f"偵測到其他縮寫/文字展開軟體（{names}），已自動關閉它、改用本程式縮寫，"
+                    "避免同一段文字被重複展開。\n"
+                    "若想改用該軟體：請到「縮寫設定」關閉「自動關閉其他縮寫軟體」後再開啟它。",
+                    level="info", auto_close_ms=6000)
+            except Exception:
+                logging.debug("[abbrev] 自動關閉提示顯示失敗", exc_info=True)
+
+        try:
+            self.root.after(0, _show)
+        except Exception:
+            _show()
+
     def _abbrev_monitor_external(self):
         """[v6] 週期檢查外部文字展開程式 (PhraseExpress 等)。
         狀態改變 (出現/消失) → 重新 install (install 內部會依偵測結果決定
@@ -9599,6 +9625,9 @@ class AutomationApp:
         try:
             eng.install(cfg)
             if cfg.enabled:
+                # [2026-06-08] 若這次 install 自動關閉了其他展開軟體 → 主動跳提示告知
+                self._maybe_notify_abbrev_closed_external(
+                    getattr(eng, '_closed_expanders', None))
                 self._maybe_warn_abbrev_external_conflict(
                     getattr(eng, '_external_expander', None))
         except Exception:

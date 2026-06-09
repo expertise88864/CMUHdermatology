@@ -89,7 +89,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": False,
     "skip_when_ime_active": True,
     "preserve_trailing_space": True,
-    "close_external_expander": False,
+    "close_external_expander": True,  # [2026-06-08] 預設開啟：偵測到其他展開軟體自動關閉
     "items": DEFAULT_ITEMS,
 }
 
@@ -128,8 +128,9 @@ class AbbrevConfig:
     skip_when_ime_active: bool = True
     preserve_trailing_space: bool = True
     # 偵測到「專用」文字展開程式（PhraseExpress 等，不含 AutoHotkey）執行中時，
-    # 是否強制關閉它、改用本程式縮寫。False = 沿用舊行為（暫停本程式禮讓對方）。
-    close_external_expander: bool = False
+    # 是否強制關閉它、改用本程式縮寫。[2026-06-08] 預設改 True（自動關閉並跳提示告知）；
+    # False = 沿用舊行為（暫停本程式禮讓對方）。
+    close_external_expander: bool = True
     items: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -294,7 +295,7 @@ def load_config(path: str) -> AbbrevConfig:
         enabled=bool(raw.get("enabled", False)),
         skip_when_ime_active=bool(raw.get("skip_when_ime_active", True)),
         preserve_trailing_space=bool(raw.get("preserve_trailing_space", True)),
-        close_external_expander=bool(raw.get("close_external_expander", False)),
+        close_external_expander=bool(raw.get("close_external_expander", True)),
         items=sort_abbrev_items(cleaned),
     )
 
@@ -331,7 +332,7 @@ def ensure_config_file(path: str) -> AbbrevConfig:
             "enabled": False,
             "skip_when_ime_active": True,
             "preserve_trailing_space": True,
-            "close_external_expander": False,
+            "close_external_expander": True,  # [2026-06-08] 預設開啟
             "items": [dict(it) for it in DEFAULT_ITEMS],
         }))
     return load_config(path)
@@ -1161,6 +1162,9 @@ class AbbrevEngine:
         # 注意：外部程式的「持續監看/重評估」由 main.py 的 _abbrev_monitor_external
         # （UI thread, root.after）驅動，本引擎不另起 timer，避免重複輪詢。
         self._external_expander: Optional[str] = None
+        # [2026-06-08] 本次 install 實際強制關閉了哪些外部展開程式（供 UI 跳提示用）。
+        # 每次 install 重置；非空代表這次真的關掉了東西、main.py 應主動跳提示告知使用者。
+        self._closed_expanders: list = []
 
     # ------------------------------------------------------------------ 公開 API
     def install(self, cfg: AbbrevConfig) -> None:
@@ -1179,10 +1183,13 @@ class AbbrevEngine:
         want_hook = bool(cfg.enabled) and any(
             str(it.get("abbrev", "")).strip() for it in cfg.items
         )
+        self._closed_expanders = []  # 每次 install 重置；下面若真的關了東西才填入
         if want_hook and cfg.close_external_expander:
             try:
                 if detect_external_expander():
-                    if close_auto_closable_expanders():
+                    closed = close_auto_closable_expanders()
+                    if closed:
+                        self._closed_expanders = list(closed)
                         # taskkill 後給 OS 一點時間把行程移出清單，再讓鎖內重新偵測。
                         time.sleep(0.3)
             except Exception:
