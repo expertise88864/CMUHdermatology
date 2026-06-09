@@ -253,6 +253,33 @@ def test_parse_max_at_phrase():
     assert "MAX at 1000" in r.new_text
 
 
+def test_parse_max_with_comma_separator():
+    """[2026-06-09] MAX 關鍵字與數字間夾逗號也要解析(劉峻榕實機 case)。
+    原本「fixed at, 1000」因逗號讓 MAX 抓不到 → 整行 parse_fail。"""
+    text = ("UVB: 300 mj/cm2 (8) on (2026/06/04), add 50 each time, "
+            "fixed at, 1000")
+    r = update_uvb_in_text(text, today=date(2026, 6, 8))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 350           # 300 + 50 (days_diff=4)
+    assert r.new_count == 9
+    assert "fixed at, 1000" in r.new_text   # 逗號格式保留
+    assert "(2026/06/08)" in r.new_text
+
+
+def test_parse_max_comma_variants_all_match():
+    """逗號分隔的多種 MAX 同義寫法都要抓得到。"""
+    for phrase, expected_max in [
+        ("MAX, 800", 800),
+        ("固定，1000", 1000),
+        ("upper limit, 950", 950),
+        ("fixed to, 1200", 1200),
+    ]:
+        text = f"UVB 500 mj/cm2 (3) on (2026/06/01), add 30 each time, {phrase}"
+        parsed = parse_uvb_line(text)
+        assert parsed is not None, phrase
+        assert parsed.max_dose == expected_max, phrase
+
+
 def test_parse_full_width_parentheses_preserves_shape():
     text = "UVB：970mj/cm2 （197） on （2026/05/24）, 每次加：50mj/cm2 if no erythema, 固定：1000, W2"
     r = update_uvb_in_text(text, today=date(2026, 5, 26))

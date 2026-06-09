@@ -179,15 +179,18 @@ _UVB_INCREASE_RE = re.compile(
 #   "max UVB 1800 mj/cm2")
 # [2026-06-01] 新增 "upper limit" / "上限" 同義(曾大鈞實機 case:
 #   "...Add 50mj each time, upper limit: 950mj")。
+# [2026-06-09] 分隔符也接受逗號:「fixed at, 1000」「MAX, 800」「固定，1000」這類
+#   關鍵字與數字間夾逗號的自由寫法(劉峻榕實機 case)。原本只允許冒號/空白,逗號會讓
+#   MAX 抓不到數字 → 整行 parse_fail。與 _UVB_DOSE_RE 已接受逗號的設計一致。
 _UVB_MAX_RE = re.compile(
-    r"(?:MAX(?:\s+(?:dose|UVB|Phototherapy))?(?:\s+(?:at|to))?\s*[:：]?\s*"
-    r"|\bfix(?:ed)?(?:\s+(?:at|to))?\s*[:：]?\s*"
-    r"|upper\s*limit(?:\s+(?:at|to))?\s*[:：]?\s*"
-    r"|(?:each\s+time\s+)?(?:till|until)\s*[:：]?\s*"
-    r"|maintain\s+dose\s+at\s*[:：]?\s*"
-    r"|最大(?:劑量|剂量)?\s*[:：]?\s*"
-    r"|上限(?:在|為)?\s*[:：]?\s*"
-    r"|固定(?:在|為)?\s*[:：]?\s*)(\d+)",
+    r"(?:MAX(?:\s+(?:dose|UVB|Phototherapy))?(?:\s+(?:at|to))?\s*[:：,，]?\s*"
+    r"|\bfix(?:ed)?(?:\s+(?:at|to))?\s*[:：,，]?\s*"
+    r"|upper\s*limit(?:\s+(?:at|to))?\s*[:：,，]?\s*"
+    r"|(?:each\s+time\s+)?(?:till|until)\s*[:：,，]?\s*"
+    r"|maintain\s+dose\s+at\s*[:：,，]?\s*"
+    r"|最大(?:劑量|剂量)?\s*[:：,，]?\s*"
+    r"|上限(?:在|為)?\s*[:：,，]?\s*"
+    r"|固定(?:在|為)?\s*[:：,，]?\s*)(\d+)",
     re.IGNORECASE,
 )
 
