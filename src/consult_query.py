@@ -168,6 +168,10 @@ DEFAULT_CONFIG = {
     # Gmail rate limit 對 IMAP 寬鬆，10-20 秒都很安全；想要更即時可降至 10
     # 秒；想要省連線可調回 60 秒。
     "email_trigger_poll_seconds": 20,
+    # [會診2 2026-06-11] 觸發信時效上限（小時）：程式停機數天恢復後，累積的舊未讀
+    # 觸發信不回放(標已讀清掉、不觸發)，避免把幾天前的請求當現在處理。0=不過濾。
+    # 解析不出信件時間時 fail-open 照常觸發(寧可多觸發、不可漏會診請求)。
+    "email_trigger_max_age_hours": 6,
 }
 
 MAX_RETRY_COUNT = 10
@@ -1483,6 +1487,10 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                         logging.info(
                             "[dedup] 已釋放失敗的 email 觸發者，可立即重試：%s",
                             ", ".join(str(x) for x in override_recipients))
+                        # [新功能 2026-06-11] 回信告知觸發者失敗(原本只寫 log，
+                        # 觸發醫師不知道沒成功、苦等不到結果)
+                        _send_failure_notice_async(override_recipients,
+                                                   str(last_err))
     finally:
         try:
             pythoncom.CoUninitialize()
@@ -1647,7 +1655,8 @@ def _empty_imap_result(err: str) -> dict:
 _last_imap_thread = None
 
 
-def _run_imap_check_with_timeout(kw: str, timeout: float = 60.0) -> dict:
+def _run_imap_check_with_timeout(kw: str, timeout: float = 60.0,
+                                 max_age_sec: float = 0.0) -> dict:
     """跑 check_trigger 在 daemon thread；超過 timeout 就 force-close socket 並回 error。
 
     為什麼要這層保護：imaplib 內部 socket recv 在某些情境（網路斷、Gmail TLS
@@ -1679,7 +1688,7 @@ def _run_imap_check_with_timeout(kw: str, timeout: float = 60.0) -> dict:
 
     def _worker():
         try:
-            box["r"] = check_trigger(kw)
+            box["r"] = check_trigger(kw, max_age_sec=max_age_sec or None)
         except Exception as e:  # noqa: BLE001
             box["r"] = _empty_imap_result(f"imap thread exception: {e!r}")
 
@@ -1725,6 +1734,48 @@ _recent_trigger_senders: dict = {}  # sender_email → last_processed_ts
 _trigger_dedup_lock = threading.Lock()
 
 
+# [opt 2026-06-11 會診1] 去重狀態輕量持久化：原本純記憶體，process 重啟(watchdog 重啟/
+# _hard_exit/自動更新重啟)即清空 → 若觸發信「標已讀失敗」(信仍 UNSEEN)，重啟後同一封信
+# 會被重新命中、重複截圖+寄信。把 {sender: ts} 存到小 json，啟動時載回未過期項。
+# 所有檔案 IO 都 try/except 降級回純記憶體行為，絕不讓持久化失敗影響主流程。
+_TRIGGER_DEDUP_STATE_FILE = SETTINGS_DIR / "consult_trigger_dedup.json"
+
+
+def _persist_trigger_dedup_locked() -> None:
+    """(呼叫端須持 _trigger_dedup_lock) 寫盤；檔案僅數筆 sender→ts，失敗只 debug。"""
+    try:
+        atomic_write_json(str(_TRIGGER_DEDUP_STATE_FILE),
+                          dict(_recent_trigger_senders))
+    except Exception:
+        logging.debug("[dedup] 去重狀態寫盤失敗(降級純記憶體)", exc_info=True)
+
+
+def load_trigger_dedup_state() -> None:
+    """啟動時載回未過期的去重狀態(跨重啟防重複觸發)。壞檔/缺檔靜默忽略。"""
+    try:
+        raw = safe_load_json(str(_TRIGGER_DEDUP_STATE_FILE), default={})
+        if not isinstance(raw, dict):
+            return
+        now = time.time()
+        loaded = 0
+        with _trigger_dedup_lock:
+            for k, v in raw.items():
+                try:
+                    ts = float(v)
+                except (TypeError, ValueError):
+                    continue
+                # 只載「未過期」項；ts 在未來(時鐘倒退)也丟棄。
+                # 注意用 <=：寫盤與重載可能落在同一時鐘 tick(now-ts==0)，不可誤丟。
+                if 0 <= now - ts < _TRIGGER_DEDUP_WINDOW_SEC:
+                    _recent_trigger_senders[str(k).strip().lower()] = ts
+                    loaded += 1
+        if loaded:
+            logging.info("[dedup] 已載回 %d 筆未過期去重狀態(跨重啟防重複觸發)",
+                         loaded)
+    except Exception:
+        logging.debug("[dedup] 去重狀態載入失敗(忽略)", exc_info=True)
+
+
 def _trigger_is_duplicate(sender: str) -> bool:
     """同 sender 5 分鐘內處理過 → True (應跳過)。"""
     now = time.time()
@@ -1738,6 +1789,7 @@ def _trigger_is_duplicate(sender: str) -> bool:
         expired = [k for k, v in _recent_trigger_senders.items() if v < cutoff]
         for k in expired:
             _recent_trigger_senders.pop(k, None)
+        _persist_trigger_dedup_locked()  # [會診1] 同步寫盤(跨重啟生效)
         return False
 
 
@@ -1752,6 +1804,77 @@ def _release_trigger_dedup(senders) -> None:
                 _recent_trigger_senders.pop(str(s).strip().lower(), None)
             except Exception:
                 pass
+        _persist_trigger_dedup_locked()  # [會診1] 釋放也同步寫盤(保持檔案一致)
+
+
+# [opt 2026-06-11 會診3] 去重吞掉觸發信時回「告知信」：原本被去重的觸發信只寫 log 就
+# 靜默忽略 → 醫師重發查詢卻苦等不到結果、也不知道被忽略了。改為回一封簡短告知信。
+# 同一 sender 每去重窗最多通知一次(避免連寄多封觸發信被通知轟炸)；寄送走獨立 daemon
+# thread(不卡 scheduler)，失敗只記 log。
+_dedup_notice_sent: dict = {}  # sender → 上次通知 ts(受 _trigger_dedup_lock 保護)
+
+
+def _send_dedup_notice_async(senders) -> None:
+    now = time.time()
+    to_notify = []
+    with _trigger_dedup_lock:
+        for s in senders:
+            k = str(s).strip().lower()
+            if now - _dedup_notice_sent.get(k, 0.0) >= _TRIGGER_DEDUP_WINDOW_SEC:
+                _dedup_notice_sent[k] = now
+                to_notify.append(str(s))
+        cutoff = now - _TRIGGER_DEDUP_WINDOW_SEC * 4
+        for k in [k for k, v in _dedup_notice_sent.items() if v < cutoff]:
+            _dedup_notice_sent.pop(k, None)
+    if not to_notify:
+        return
+
+    def _worker():
+        try:
+            from cmuh_common.smtp_mail import send_mail
+            mins = _TRIGGER_DEDUP_WINDOW_SEC // 60
+            send_mail(
+                recipients=to_notify,
+                subject="會診查詢：剛已處理（重複觸發已略過）",
+                body=(f"您在 {mins} 分鐘內的上一封觸發信已處理並回寄結果，"
+                      f"本次觸發已略過（避免重複查詢）。\n\n"
+                      f"如需最新清單，請於上次查詢約 {mins} 分鐘後再寄一次觸發信。"),
+                attachment_path=None,
+            )
+            logging.info("[dedup] 已回告知信(重複觸發已略過)：%s",
+                         ", ".join(to_notify))
+        except Exception:
+            logging.warning("[dedup] 告知信寄送失敗(不影響流程)", exc_info=True)
+
+    threading.Thread(target=_worker, name="ConsultDedupNotice",
+                     daemon=True).start()
+
+
+def _send_failure_notice_async(recipients, reason: str) -> None:
+    """[新功能 2026-06-11] email 觸發的會診查詢整個失敗(重試用盡)時回信告知觸發者。
+    原本只寫 log → 觸發醫師不知道沒成功、苦等不到結果。獨立 daemon thread 寄送。"""
+    if not recipients:
+        return
+
+    def _worker():
+        try:
+            from cmuh_common.smtp_mail import send_mail
+            send_mail(
+                recipients=[str(r) for r in recipients],
+                subject="會診查詢失敗通知",
+                body=("您的會診查詢觸發信已收到，但執行失敗（已重試多次仍未成功）。\n\n"
+                      f"最後錯誤：{str(reason)[:300]}\n\n"
+                      "已解除重查限制，您可立即重寄一封觸發信再試；"
+                      "若持續失敗請通知管理者查看 settings/consult_query.log。"),
+                attachment_path=None,
+            )
+            logging.info("[notify] 已寄失敗通知給觸發者：%s",
+                         ", ".join(str(r) for r in recipients))
+        except Exception:
+            logging.warning("[notify] 失敗通知寄送失敗(不影響流程)", exc_info=True)
+
+    threading.Thread(target=_worker, name="ConsultFailNotice",
+                     daemon=True).start()
 
 
 def _hard_exit(reason: str, code: int = 1) -> None:
@@ -1975,7 +2098,16 @@ def scheduler_loop() -> None:
                     kw = cfg.get("email_trigger_subject_keyword",
                                  DEFAULT_CONFIG["email_trigger_subject_keyword"])
                     # ★ 用 thread + 60s timeout 包起來，避免 imaplib socket 卡死整個 scheduler
-                    r = _run_imap_check_with_timeout(kw, timeout=IMAP_HARD_TIMEOUT)
+                    # [會診2] 觸發信時效上限(小時→秒)；0/負值=不過濾
+                    try:
+                        _max_age_h = float(cfg.get(
+                            "email_trigger_max_age_hours",
+                            DEFAULT_CONFIG["email_trigger_max_age_hours"]))
+                    except (TypeError, ValueError):
+                        _max_age_h = DEFAULT_CONFIG["email_trigger_max_age_hours"]
+                    r = _run_imap_check_with_timeout(
+                        kw, timeout=IMAP_HARD_TIMEOUT,
+                        max_age_sec=max(0.0, _max_age_h) * 3600)
                     if r.get("error"):
                         consecutive_imap_errors += 1
                         logging.warning("檢查觸發信失敗 (%d/%d): %s",
@@ -2026,6 +2158,9 @@ def scheduler_loop() -> None:
                                     "[dedup] %s 在 %ds 內已處理過 → 略過避免重複寄信",
                                     ", ".join(dedup_skipped),
                                     _TRIGGER_DEDUP_WINDOW_SEC)
+                                # [會診3 2026-06-11] 回告知信(原本靜默忽略，醫師重發
+                                # 查詢卻苦等不到結果也不知道被略過)
+                                _send_dedup_notice_async(dedup_skipped)
                             if dedup_proceed:
                                 logging.info(
                                     "收到觸發信（IMAP），立即執行 consult flow；"
@@ -2548,6 +2683,8 @@ def main() -> None:
             ensure_credentials_template()
         except Exception:
             logging.debug("ensure_credentials_template 失敗（忽略）", exc_info=True)
+        # [會診1 2026-06-11] 載回未過期去重狀態(跨重啟防「標已讀失敗的信」重複觸發)
+        load_trigger_dedup_state()
         # 啟動權限狀態（給「自動提權有沒有真的生效」一個白紙黑字證據）
         logging.info("執行權限：%s",
                      "admin ✓" if is_admin() else "一般使用者 ✗（systemftp 會 740 失敗）")

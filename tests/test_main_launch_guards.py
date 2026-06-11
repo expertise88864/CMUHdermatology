@@ -854,6 +854,21 @@ def test_hotkey_guardian_covers_abbrev_only_mode():
     assert "if not has_profile and not abbrev_active:" in src
 
 
+def test_abbrev_export_import_buttons_exist():
+    """[新功能 2026-06-11] 縮寫設定匯出/匯入：方法存在、匯入前驗證 items + 確認對話框、
+    匯入只取代清單(enabled/自動關閉等機台偏好不被匯入檔覆寫)。"""
+    source_path = ROOT / "src" / "main.py"
+    full = source_path.read_text(encoding="utf-8")
+    assert '"匯出設定"' in full and '"匯入設定"' in full
+    imp_src = _function_source(source_path, "_abbrev_import_settings")
+    # 先驗證檔案真的含 items，避免亂選檔被預設值機制靜默變成「匯入內建預設」
+    assert 'raw.get("items")' in imp_src
+    assert "askyesno" in imp_src  # 取代前確認
+    assert "cur.items = new_cfg.items" in imp_src  # 只取代清單
+    exp_src = _function_source(source_path, "_abbrev_export_settings")
+    assert "asksaveasfilename" in exp_src
+
+
 def test_heavy_network_imports_are_lazy_after_splash():
     """[r5] requests/urllib3/bs4(~500ms)延後到 __init__(splash 後)才 import，
     模組頂層只佔位 None；加快感知啟動。"""

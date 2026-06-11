@@ -28,6 +28,7 @@ import logging
 import socket
 import ssl
 import threading
+import time
 from typing import Optional
 
 from cmuh_common.smtp_mail import load_credentials
@@ -139,9 +140,39 @@ def _decode_subject(raw_subject: bytes) -> str:
         return raw_subject
 
 
+def _message_age_seconds(conn, uid) -> Optional[float]:
+    """[會診2 2026-06-11] 取該信 INTERNALDATE(伺服器收信時刻)距現在的秒數。
+    任何失敗(fetch 失敗/格式解析不出)一律回 None → 呼叫端 fail-open 視為新信照常觸發
+    (寧可多觸發、不可漏掉會診請求)。Internaldate2tuple 回本地時間 struct，配 mktime。"""
+    try:
+        typ, fetch = conn.fetch(uid, "(INTERNALDATE)")
+        if typ != "OK" or not fetch:
+            return None
+        raw = b""
+        for part in fetch:
+            if isinstance(part, bytes) and b"INTERNALDATE" in part:
+                raw = part
+                break
+            if (isinstance(part, tuple) and part
+                    and isinstance(part[0], bytes)
+                    and b"INTERNALDATE" in part[0]):
+                raw = part[0]
+                break
+        if not raw:
+            return None
+        tt = imaplib.Internaldate2tuple(raw)
+        if tt is None:
+            return None
+        return max(0.0, time.time() - time.mktime(tt))
+    except Exception:
+        logging.debug("INTERNALDATE 解析失敗(fail-open 視為新信)", exc_info=True)
+        return None
+
+
 def check_trigger(keyword: str, mark_read: bool = True,
                    timeout: float = 30.0,
-                   sample_count: int = 3) -> dict:
+                   sample_count: int = 3,
+                   max_age_sec: Optional[float] = None) -> dict:
     """掃描 IMAP 收件匣未讀信，主旨含 keyword 的就回報、抓 From 地址、並標為已讀。
 
     回傳 dict：
@@ -211,6 +242,7 @@ def check_trigger(keyword: str, mark_read: bool = True,
         from email.utils import parseaddr
 
         matched_ids = []
+        stale_ids = []  # [會診2] 主旨命中但太舊的觸發信(只清掉、不觸發)
         senders_seen = set()
         for uid in ids:
             try:
@@ -235,6 +267,21 @@ def check_trigger(keyword: str, mark_read: bool = True,
                             from_str = _decode_subject(
                                 line.split(b":", 1)[1].strip())
                 if keyword in subj_str:
+                    # [會診2 2026-06-11] 觸發信時效過濾：程式停機數天(或長期標已讀
+                    # 失敗)累積的舊未讀觸發信，恢復後第一輪 poll 會全部命中 → 把幾天
+                    # 前的請求當現在處理、回寄與當下不符的截圖。超過時效的命中信改
+                    # 「標已讀清掉但不觸發」。INTERNALDATE 解析失敗 → fail-open 照常
+                    # 觸發(寧可多觸發、不可漏會診請求)。
+                    if max_age_sec and max_age_sec > 0:
+                        age = _message_age_seconds(conn, uid)
+                        if age is not None and age > max_age_sec:
+                            stale_ids.append(uid)
+                            logging.warning(
+                                "[IMAP] 忽略陳舊觸發信(已 %.1f 小時 > 上限 %.1f "
+                                "小時)：主旨=%r 寄件人=%r — 標已讀不觸發",
+                                age / 3600, max_age_sec / 3600,
+                                subj_str[:60], from_str[:60])
+                            continue
                     matched_ids.append(uid)
                     # parseaddr 解 "Name <foo@bar.com>" → ("Name", "foo@bar.com")
                     _, addr = parseaddr(from_str)
@@ -251,10 +298,14 @@ def check_trigger(keyword: str, mark_read: bool = True,
         result["matched"] = len(matched_ids)
         result["triggered"] = result["matched"] > 0
 
-        if matched_ids and mark_read:
+        # [會診2] 陳舊命中信一併標已讀(清掉，避免之後每輪 poll 重複命中+重複 log)
+        ids_to_mark = list(matched_ids) if mark_read else []
+        if mark_read:
+            ids_to_mark += stale_ids
+        if ids_to_mark:
             # 一次標記多封為已讀
             try:
-                id_list = b",".join(matched_ids).decode("ascii")
+                id_list = b",".join(ids_to_mark).decode("ascii")
                 conn.store(id_list, "+FLAGS", "(\\Seen)")
             except Exception:
                 logging.warning("標已讀失敗（不影響觸發）", exc_info=True)

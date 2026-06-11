@@ -178,7 +178,7 @@ import threading
 import time
 import tkinter as tk
 from weakref import WeakSet
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 # =============================================================================
 # [開機前導] 自動依賴安裝與進度條介面 (Dependency Installer UI)
@@ -9706,6 +9706,71 @@ class AutomationApp:
             return
         self._install_abbrev_listeners()
 
+    def _abbrev_export_settings(self):
+        """[新功能 2026-06-11] 匯出縮寫設定到使用者選的 json(換電腦搬設定用)。"""
+        cfg = getattr(self, '_abbrev_config_cache', None)
+        if cfg is None or not cfg.items:
+            messagebox.showwarning("縮寫速寫", "目前沒有可匯出的縮寫。")
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="匯出縮寫設定",
+            defaultextension=".json",
+            initialfile=f"abbrev_settings_{date.today().isoformat()}.json",
+            filetypes=[("JSON 設定檔", "*.json")])
+        if not path:
+            return
+        try:
+            save_abbrev_config(path, cfg)
+            messagebox.showinfo(
+                "縮寫速寫", f"已匯出 {len(cfg.items)} 筆縮寫到：\n{path}")
+        except Exception:
+            logging.exception("[abbrev] 匯出失敗")
+            messagebox.showerror("縮寫速寫", "匯出失敗，請查看系統日誌。")
+
+    def _abbrev_import_settings(self):
+        """[新功能 2026-06-11] 從 json 匯入縮寫清單(完整取代、匯入前確認)。
+        只取代縮寫項目；enabled/IME/自動關閉等開關維持本機現值(那些是機台偏好)。
+        先驗證檔案確實含 items 清單，避免亂選檔案被 load 的預設值機制靜默變成
+        「匯入了內建預設清單」。"""
+        path = filedialog.askopenfilename(
+            parent=self.root, title="匯入縮寫設定",
+            filetypes=[("JSON 設定檔", "*.json"), ("所有檔案", "*.*")])
+        if not path:
+            return
+        try:
+            raw = load_json_dict(path, {}, merge_defaults=False)
+        except Exception:
+            raw = {}
+        if (not isinstance(raw, dict)
+                or not isinstance(raw.get("items"), list)
+                or not raw.get("items")):
+            messagebox.showerror(
+                "縮寫速寫", "檔案格式不正確（找不到縮寫項目清單），已取消匯入。")
+            return
+        try:
+            new_cfg = load_abbrev_config(path)  # 走既有驗證/去重/排序
+        except Exception:
+            logging.exception("[abbrev] 匯入解析失敗")
+            messagebox.showerror("縮寫速寫", "檔案無法解析為縮寫設定，已取消匯入。")
+            return
+        if not new_cfg.items:
+            messagebox.showwarning("縮寫速寫", "檔案內沒有有效縮寫項目，已取消匯入。")
+            return
+        cur = getattr(self, '_abbrev_config_cache', None)
+        cur_n = len(cur.items) if cur is not None else 0
+        if not messagebox.askyesno(
+                "確認匯入",
+                f"將以匯入檔的 {len(new_cfg.items)} 筆縮寫「完整取代」目前的 "
+                f"{cur_n} 筆。\n\n確定要匯入嗎？\n（建議先用「匯出設定」備份目前清單）"):
+            return
+        if cur is not None:
+            cur.items = new_cfg.items
+        else:
+            self._abbrev_config_cache = new_cfg
+        self._abbrev_save_and_reload()
+        self._abbrev_refresh_tree()
+        messagebox.showinfo("縮寫速寫", f"已匯入 {len(new_cfg.items)} 筆縮寫。")
+
     def _abbrev_refresh_tree(self):
         tree = getattr(self, '_abbrev_tree', None)
         if tree is None:
@@ -9968,6 +10033,9 @@ class AutomationApp:
         btn_row.pack(fill='x', padx=8, pady=(0, 6))
         ttk.Button(btn_row, text="編輯選取", command=self._abbrev_edit_selected).pack(side='left')
         ttk.Button(btn_row, text="刪除選取", command=self._abbrev_delete_selected).pack(side='left', padx=(6, 0))
+        # [新功能 2026-06-11] 匯出/匯入：方便換電腦搬縮寫設定
+        ttk.Button(btn_row, text="匯出設定", command=self._abbrev_export_settings).pack(side='left', padx=(18, 0))
+        ttk.Button(btn_row, text="匯入設定", command=self._abbrev_import_settings).pack(side='left', padx=(6, 0))
         ttk.Button(btn_row, text="重設為預設清單", command=self._abbrev_reset_defaults).pack(side='right')
 
         # 新增區塊
