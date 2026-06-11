@@ -40,6 +40,51 @@ def test_external_expander_autoclose_defaults_to_on(tmp_path):
     assert ae.load_config(str(p2)).close_external_expander is False
 
 
+def test_is_auto_closable():
+    """[fix A/B] 專用展開程式可自動關閉；AutoHotkey/未知程式不可。"""
+    assert ae.is_auto_closable("phraseexpress.exe") is True
+    assert ae.is_auto_closable("PhraseExpress.EXE") is True  # 大小寫不敏感
+    assert ae.is_auto_closable("autohotkey64.exe") is False
+    assert ae.is_auto_closable("notepad.exe") is False
+    assert ae.is_auto_closable(None) is False
+
+
+def test_close_expander_cooldown_stops_kill_war(monkeypatch):
+    """[fix B] 同一 exe 30 分鐘內被關 3 次(對方自動重啟)→ 冷卻、不再嘗試關，
+    避免每輪監看無限互殺。"""
+    monkeypatch.setattr(ae, "_list_process_names",
+                        lambda: {"phraseexpress.exe"})
+    kills = []
+    monkeypatch.setattr(ae, "_taskkill_image",
+                        lambda image: (kills.append(image), True)[1])
+    with ae._expander_close_lock:
+        ae._expander_close_history.clear()
+    try:
+        # 前 3 次允許關閉
+        for i in range(3):
+            assert ae.close_auto_closable_expanders() == ["phraseexpress.exe"], i
+        # 第 4 次：冷卻中 → 不關、回空(改走「暫停禮讓」路徑)
+        assert ae.close_auto_closable_expanders() == []
+        assert len(kills) == 3
+        # 視窗過期後恢復可關(把歷史時間戳改成很久以前)
+        with ae._expander_close_lock:
+            ae._expander_close_history["phraseexpress.exe"] = [
+                t - ae._CLOSE_HISTORY_WINDOW_SEC - 1
+                for t in ae._expander_close_history["phraseexpress.exe"]]
+        assert ae.close_auto_closable_expanders() == ["phraseexpress.exe"]
+    finally:
+        with ae._expander_close_lock:
+            ae._expander_close_history.clear()
+
+
+def test_taskkill_timeout_is_short():
+    """[fix A] taskkill timeout 必須短(≤3s)：可能被 UI thread 間接觸發，10s 凍死太久。"""
+    import inspect
+    src = inspect.getsource(ae._taskkill_image)
+    assert "timeout=3" in src
+    assert "timeout=10" not in src
+
+
 def test_install_captures_closed_expanders(monkeypatch):
     """[2026-06-08] install 自動關閉專用展開程式後，_closed_expanders 應記下名稱供跳提示。"""
     state = {"running": True}

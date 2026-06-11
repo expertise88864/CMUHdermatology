@@ -9583,17 +9583,19 @@ class AutomationApp:
                 ext = detect_external_expander()
                 last = getattr(self, '_abbrev_last_external', None)
                 if ext != last:
-                    self._abbrev_last_external = ext
-                    # 狀態改變 → 重 install (install 偵測 ext 決定掛/不掛)
-                    self._install_abbrev_listeners()
+                    # [fix B 2026-06-09] last 改由 install 完成後依「實際結果」更新
+                    # (_finish_install_abbrev)：自動關閉成功 → last=None，對方若自動重啟，
+                    # 下一輪 ext!=None 會再次處理(受 close 冷卻保護)。原本這裡直接記
+                    # last=ext，自動關閉成功後對方重啟 → ext==last → 永不再處理 →
+                    # 兩套縮寫並存、同段文字雙重展開。
                     if ext:
-                        self._maybe_warn_abbrev_external_conflict(ext)
-                        logging.warning(
-                            "[abbrev] 外部展開程式 '%s' 出現 → 暫停本程式縮寫",
-                            ext)
+                        logging.info(
+                            "[abbrev] 偵測到外部展開程式 '%s' → 重新評估"
+                            "(依設定自動關閉或禮讓暫停)", ext)
                     else:
                         logging.info(
                             "[abbrev] 外部展開程式已關閉 → 恢復本程式縮寫")
+                    self._install_abbrev_listeners()
         except Exception:
             logging.debug("[abbrev] external monitor 例外", exc_info=True)
         finally:
@@ -9621,15 +9623,64 @@ class AutomationApp:
             except Exception:
                 logging.exception("[abbrev] 載入設定失敗，使用空 cfg")
                 cfg = AbbrevConfig()
+                # [fix D] 設定損毀原本只寫 log 就靜默停用縮寫，使用者不知道 → 主動提示
+                self._show_notice(
+                    "縮寫設定載入失敗",
+                    "縮寫設定檔讀取失敗，縮寫功能已暫停。\n"
+                    "請開啟「縮寫設定」重新儲存一次，或檢查 settings/abbrev_settings.json。",
+                    level="error", auto_close_ms=8000)
             self._abbrev_config_cache = cfg
+        # [fix A 2026-06-09] 自動關閉外部展開程式的 taskkill(最壞 3s/個)不可在 Tk UI
+        # thread 跑(monitor/設定儲存/guardian 重掛都在 UI thread 呼叫本函式)。偵測到
+        # 「可自動關閉」的展開程式時 → 先丟背景執行緒把 taskkill 做完，再回 UI thread
+        # 掛 hook；其他情況(無外部程式/只剩 AHK)維持原同步路徑(engine 內部不會 taskkill)。
+        try:
+            if (cfg.enabled and cfg.close_external_expander
+                    and not getattr(self, '_abbrev_bg_close_running', False)):
+                from cmuh_common.abbrev_engine import (
+                    detect_external_expander, is_auto_closable)
+                _ext = detect_external_expander()
+                if _ext and is_auto_closable(_ext):
+                    self._abbrev_bg_close_running = True
+
+                    def _bg_close():
+                        closed = []
+                        try:
+                            from cmuh_common.abbrev_engine import (
+                                close_auto_closable_expanders)
+                            closed = close_auto_closable_expanders()
+                        except Exception:
+                            logging.debug("[abbrev] 背景關閉外部展開程式例外",
+                                          exc_info=True)
+
+                        def _finish(closed=closed):
+                            self._abbrev_bg_close_running = False
+                            self._finish_install_abbrev(eng, cfg, pre_closed=closed)
+                        try:
+                            self.root.after(0, _finish)
+                        except Exception:
+                            self._abbrev_bg_close_running = False
+                    self.bg_executor.submit(_bg_close)
+                    return
+        except Exception:
+            logging.debug("[abbrev] 背景關閉前置判斷例外", exc_info=True)
+        self._finish_install_abbrev(eng, cfg)
+
+    def _finish_install_abbrev(self, eng, cfg, pre_closed=None):
+        """install 的收尾(掛 hook + 依實際結果跳提示/警告 + 同步監看狀態)。
+        pre_closed: [fix A] 背景執行緒已先關閉的展開程式清單(供跳提示)。"""
         try:
             eng.install(cfg)
             if cfg.enabled:
-                # [2026-06-08] 若這次 install 自動關閉了其他展開軟體 → 主動跳提示告知
-                self._maybe_notify_abbrev_closed_external(
-                    getattr(eng, '_closed_expanders', None))
+                # [2026-06-08] 若這次自動關閉了其他展開軟體 → 主動跳提示告知
+                closed = list(pre_closed or []) + list(
+                    getattr(eng, '_closed_expanders', None) or [])
+                self._maybe_notify_abbrev_closed_external(closed)
                 self._maybe_warn_abbrev_external_conflict(
                     getattr(eng, '_external_expander', None))
+            # [fix B] 監看狀態同步：記「install 後的實際狀態」(自動關閉成功=None)。
+            # 對方自動重啟時 ext!=None 才會再次觸發處理；冷卻保護避免無限互殺。
+            self._abbrev_last_external = getattr(eng, '_external_expander', None)
         except Exception:
             logging.exception("[abbrev] install 失敗")
 
@@ -11593,8 +11644,15 @@ class AutomationApp:
             return
         has_profile = bool(getattr(self, 'hotkey_profile', None)
                            or getattr(self, 'hotkey_version', None))
-        if not has_profile:
-            return  # 院外模式/解析度不符：沒掛 F 鍵熱鍵，不需監看
+        # [fix C 2026-06-09] 縮寫速寫獨立於 HIS 模式：院外模式/解析度不符雖沒掛 F 鍵，
+        # 縮寫 hook 仍可能在跑(共用同一個 keyboard 底層 hook)。原本 has_profile=False
+        # 直接 return → 這種模式下 hook 被 Windows 移除(LowLevelHooksTimeout)時縮寫
+        # 無聲失效、沒人偵測。改為「有 F 鍵 profile 或 縮寫啟用中」都要監看。
+        _abbrev_cfg = getattr(self, '_abbrev_config_cache', None)
+        abbrev_active = bool(_abbrev_cfg is not None
+                             and getattr(_abbrev_cfg, 'enabled', False))
+        if not has_profile and not abbrev_active:
+            return  # 沒 F 鍵熱鍵也沒啟用縮寫：無 hook 可監看
 
         now = time.monotonic()
         hook_silent = now - getattr(self, '_hk_last_event_monotonic', now)

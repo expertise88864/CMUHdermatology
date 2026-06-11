@@ -820,6 +820,40 @@ def test_startup_vacuums_old_clinic_count_rows():
     assert "vacuum_old_entries" in src
 
 
+def test_abbrev_taskkill_runs_off_ui_thread():
+    """[fix A] 偵測到可自動關閉的展開程式時，taskkill 必須先丟背景執行緒，
+    關完才回 UI thread 掛 hook(否則 UI 凍最壞 3s/個)。"""
+    source_path = ROOT / "src" / "main.py"
+    src = _function_source(source_path, "_install_abbrev_listeners")
+    assert "is_auto_closable" in src
+    assert "bg_executor.submit" in src
+    assert "_abbrev_bg_close_running" in src
+    # 收尾函式存在且同步監看狀態
+    finish_src = _function_source(source_path, "_finish_install_abbrev")
+    assert "self._abbrev_last_external = getattr(eng, '_external_expander', None)" \
+        in finish_src
+
+
+def test_abbrev_monitor_syncs_state_after_install():
+    """[fix B] 監看的 last 狀態不可在 install 前直接記 ext(自動關閉成功後對方重啟
+    會 ext==last 永不再處理 → 雙重展開並存)；改由 _finish_install_abbrev 記
+    install 後實際狀態。"""
+    source_path = ROOT / "src" / "main.py"
+    src = _function_source(source_path, "_abbrev_monitor_external")
+    # 監看迴圈本身不再直接寫 last=ext
+    assert "self._abbrev_last_external = ext" not in src
+    assert "_install_abbrev_listeners()" in src
+
+
+def test_hotkey_guardian_covers_abbrev_only_mode():
+    """[fix C] 院外模式/解析度不符(無 F 鍵 profile)但縮寫啟用中 → guardian 仍須監看
+    hook 健康(縮寫與 F 鍵共用同一個 keyboard 底層 hook，死了要能自動重啟恢復)。"""
+    source_path = ROOT / "src" / "main.py"
+    src = _function_source(source_path, "_hotkey_health_tick")
+    assert "abbrev_active" in src
+    assert "if not has_profile and not abbrev_active:" in src
+
+
 def test_heavy_network_imports_are_lazy_after_splash():
     """[r5] requests/urllib3/bs4(~500ms)延後到 __init__(splash 後)才 import，
     模組頂層只佔位 None；加快感知啟動。"""

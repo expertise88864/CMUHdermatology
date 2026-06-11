@@ -669,15 +669,23 @@ _AUTO_CLOSE_EXPANDER_EXES: frozenset = frozenset({
 })
 
 
+def is_auto_closable(exe_name) -> bool:
+    """exe 是否屬於可被自動關閉的「專用」展開程式（不含 AutoHotkey）。"""
+    return str(exe_name or "").strip().lower() in _AUTO_CLOSE_EXPANDER_EXES
+
+
 def _taskkill_image(image_name: str) -> bool:
     """taskkill /F /IM <image_name>（含子行程），回傳是否成功結束。
-    不閃黑框（CREATE_NO_WINDOW）。找不到行程(rc=128)視為已不在、回 False。"""
+    不閃黑框（CREATE_NO_WINDOW）。找不到行程(rc=128)視為已不在、回 False。
+
+    [fix A 2026-06-09] timeout 10→3s：此函式可能被 UI thread 間接觸發(install 路徑)，
+    10s 卡死太久；taskkill /F 正常 <1s 完成，3s 已足，逾時就放棄(下一輪監看再試)。"""
     try:
         import subprocess
         CREATE_NO_WINDOW = 0x08000000
         out = subprocess.run(
             ["taskkill", "/F", "/T", "/IM", image_name],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=3,
             creationflags=CREATE_NO_WINDOW,
         )
         if out.returncode == 0:
@@ -692,16 +700,58 @@ def _taskkill_image(image_name: str) -> bool:
         return False
 
 
+# [fix B 2026-06-09] kill 戰爭防護：被關閉的展開程式若有開機自啟/守護行程會自動重啟，
+# 監看迴圈每輪又把它關掉 → 無限互殺。同一 exe 在 30 分鐘視窗內被關 ≥3 次 → 進入 30 分鐘
+# 冷卻，期間不再嘗試關閉(改走既有「偵測到衝突→暫停本程式禮讓」路徑，使用者會看到衝突警告，
+# 可自行決定關掉對方或關掉本程式的自動關閉設定)。狀態純記憶體(重啟歸零)、大小有界。
+_CLOSE_HISTORY_WINDOW_SEC = 1800.0
+_CLOSE_MAX_PER_WINDOW = 3
+_expander_close_history: dict = {}  # exe -> list[monotonic ts(最近的關閉時間)]
+_expander_close_lock = threading.Lock()
+
+# [fix D] BlockInput 失敗(非 admin)每 session 只警告一次(list 取代 global 旗標)
+_BLOCKINPUT_WARNED = [False]
+
+
+def _close_allowed(exe: str, now: Optional[float] = None) -> bool:
+    """同一 exe 在視窗內已關滿上限 → False(冷卻中)。"""
+    if now is None:
+        now = time.monotonic()
+    with _expander_close_lock:
+        hist = [t for t in _expander_close_history.get(exe, [])
+                if now - t < _CLOSE_HISTORY_WINDOW_SEC]
+        _expander_close_history[exe] = hist
+        return len(hist) < _CLOSE_MAX_PER_WINDOW
+
+
+def _record_close(exe: str, now: Optional[float] = None) -> None:
+    if now is None:
+        now = time.monotonic()
+    with _expander_close_lock:
+        _expander_close_history.setdefault(exe, []).append(now)
+
+
 def close_auto_closable_expanders() -> list:
     """強制關閉所有「專用」文字展開程式（不含 AutoHotkey）。
-    回傳實際成功關閉的 exe 名稱清單；沒有可關的回空 list。"""
+    回傳實際成功關閉的 exe 名稱清單；沒有可關的回空 list。
+    [fix B] 同一 exe 30 分鐘內已關 3 次 → 冷卻跳過(避免與自動重啟的對方無限互殺)。"""
     try:
         names = _list_process_names()
     except Exception:
         return []
     closed: list = []
     for exe in _AUTO_CLOSE_EXPANDER_EXES:
-        if exe in names and _taskkill_image(exe):
+        if exe not in names:
+            continue
+        if not _close_allowed(exe):
+            logging.warning(
+                "[abbrev] '%s' 在 %.0f 分鐘內已被關閉 %d 次仍反覆重啟(可能有開機自啟/"
+                "守護行程)→ 冷卻中暫不再關，改走「暫停本程式禮讓」。建議手動處理該軟體"
+                "的自啟設定。", exe, _CLOSE_HISTORY_WINDOW_SEC / 60,
+                _CLOSE_MAX_PER_WINDOW)
+            continue
+        if _taskkill_image(exe):
+            _record_close(exe)
             closed.append(exe)
     return closed
 
@@ -1508,6 +1558,15 @@ class AbbrevEngine:
                     blocked = bool(user32.BlockInput(True))
                 except Exception:
                     logging.debug("[abbrev] BlockInput 不可用", exc_info=True)
+                # [fix D 2026-06-09] BlockInput 失敗(通常=非 admin)原本只有 debug log，
+                # 排障時看不到「展開期間沒有凍結輸入、靠 cooldown 保護」這個重要事實。
+                # 每 session 警告一次(不洗版)。
+                if not blocked and not _BLOCKINPUT_WARNED[0]:
+                    _BLOCKINPUT_WARNED[0] = True
+                    logging.warning(
+                        "[abbrev] BlockInput 失敗(可能非系統管理員權限)——展開期間"
+                        "無法凍結使用者輸入，僅靠 cooldown 保護；快速連打時極小機率"
+                        "夾字。以系統管理員執行可消除此限制。")
                 try:
                     # 2a-1. 先送 backspace 刪除「縮寫 + 觸發空白」
                     bs_ok = _send_atomic_keystrokes(bs_events)
