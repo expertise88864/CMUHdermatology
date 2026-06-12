@@ -831,6 +831,28 @@ def test_update_multi_line_different_date_no_extra_update():
     assert "UVB: 800 (100) on (2026/5/17)" in r.new_text
 
 
+def test_update_multi_line_second_line_fixed_dose_at_max_also_updates():
+    """[review C 2026-06-12] 多行同日期、第二行是固定劑量行(已達 MAX、沒寫
+    increase → parse 視為 increase=0 保持)：Step B 的豁免條件須與第一行檢查
+    同步，第二行也要更新(count+date；劑量維持 cap 不加量)。
+    回歸：原本 Step B 漏了 dose>=max 豁免 → 第二行被 break 跳過、日期/次數
+    停在舊值，與已更新的第一行不一致。"""
+    text = (
+        "UVB: 900 mj/cm (126) on (2026/5/24) add 50 each time, keep max: 900. W4N\n"
+        "局部 UVB: 680 mj/cm2 (489) on (2026/5/24) MAX 680 due to mild pain"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    assert r.action == UvbAction.UPDATED
+    # 第一行照常
+    assert r.new_dose == 900
+    assert "(127)" in r.new_text
+    # 第二行(固定劑量)也要更新：劑量保持 680、count 489→490、日期更新
+    assert r.additional_lines_updated == 1
+    assert "UVB: 680" in r.new_text
+    assert "(490)" in r.new_text
+    assert r.new_text.count("(2026/05/26)") == 2
+
+
 def test_sanity_dose_2000_requires_confirm():
     """[v20.12] MAX_DOSE 上限改回 1500 — dose 2000 → CONFIRM_NEEDED。"""
     text = "UVB 2000 (5) on (2026/05/20), increase 100, MAX:2000"

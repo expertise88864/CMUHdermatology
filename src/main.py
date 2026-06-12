@@ -9660,8 +9660,16 @@ class AutomationApp:
                             self.root.after(0, _finish)
                         except Exception:
                             self._abbrev_bg_close_running = False
-                    self.bg_executor.submit(_bg_close)
-                    return
+                    # [review C 2026-06-12] submit 可能被 BoundedExecutor 拒絕；原本被
+                    # 外層 except 吃掉但旗標已設 True 且永不重置 → 整個 session 的背景
+                    # 關閉路徑永久停用。失敗時重置旗標並 fall through 同步收尾路徑。
+                    try:
+                        self.bg_executor.submit(_bg_close)
+                        return
+                    except Exception:
+                        self._abbrev_bg_close_running = False
+                        logging.warning("[abbrev] 背景關閉任務提交失敗，改走同步路徑",
+                                        exc_info=True)
         except Exception:
             logging.debug("[abbrev] 背景關閉前置判斷例外", exc_info=True)
         self._finish_install_abbrev(eng, cfg)
@@ -9748,7 +9756,9 @@ class AutomationApp:
                 "縮寫速寫", "檔案格式不正確（找不到縮寫項目清單），已取消匯入。")
             return
         try:
-            new_cfg = load_abbrev_config(path)  # 走既有驗證/去重/排序
+            # 走既有驗證/去重/排序；persist_migrations=False 唯讀解析 ——
+            # 匯入來源檔(可能是使用者 USB 上的備份)不可被遷移寫回改動。
+            new_cfg = load_abbrev_config(path, persist_migrations=False)
         except Exception:
             logging.exception("[abbrev] 匯入解析失敗")
             messagebox.showerror("縮寫速寫", "檔案無法解析為縮寫設定，已取消匯入。")

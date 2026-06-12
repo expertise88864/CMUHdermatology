@@ -124,6 +124,30 @@ def test_v7_config_removes_retired_doctor_defaults(tmp_path):
     assert values["st"] == "keep stable"
 
 
+def test_load_config_persist_migrations_false_does_not_rewrite_file(tmp_path):
+    """[review C 2026-06-12] 匯入用唯讀解析：遷移仍套用在「回傳的 cfg」，但匯入
+    來源檔(使用者 USB 上的備份)位元組原樣、不可被改寫。"""
+    path = tmp_path / "import_source.json"
+    original = json.dumps({
+        "schema_version": 5,
+        "enabled": True,
+        "items": [{"abbrev": "zz", "expansion": "custom"}],
+    })
+    path.write_text(original, encoding="utf-8")
+
+    cfg = ae.load_config(str(path), persist_migrations=False)
+
+    assert path.read_text(encoding="utf-8") == original  # 來源檔原樣
+    values = {item["abbrev"] for item in cfg.items}
+    assert "zz" in values
+    assert "nt" in values  # v5 遷移(還原 nt/se)仍套用在回傳值
+    # 對照組：預設 persist_migrations=True 會寫回(自家設定檔自動修復行為不變)
+    path2 = tmp_path / "own_settings.json"
+    path2.write_text(original, encoding="utf-8")
+    ae.load_config(str(path2))
+    assert path2.read_text(encoding="utf-8") != original
+
+
 def test_to_dict_sorts_abbreviations_case_insensitively():
     cfg = ae.AbbrevConfig(items=[
         {"abbrev": "zz", "expansion": "3"},

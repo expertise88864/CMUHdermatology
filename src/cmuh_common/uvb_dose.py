@@ -1083,8 +1083,13 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         if not skip_dose_sanity and (next_uvb.dose > MAX_DOSE
                                      or next_uvb.max_dose > MAX_DOSE):
             break
+        # [review C 2026-06-12] increase=0 的豁免條件與第一行檢查同步：明寫 maintain、
+        # 或「劑量已達/超過 MAX 的固定劑量行」(dose>=max 本就無法再加量)都合法。
+        # 原本漏了 dose>=max 豁免 → 多行處置中第 2 行以後的固定劑量行會中斷迴圈
+        # 不更新(第一行更新了、後行日期/次數停舊值，病歷不一致)。
         if ((next_uvb.increase <= 0
-             and not _has_maintain_dose(next_uvb.full_match))
+             and not _has_maintain_dose(next_uvb.full_match)
+             and next_uvb.dose < next_uvb.max_dose)
                 or next_uvb.increase > 200):
             break
         # 同日期 — 用該行自己的 dose/increase/MAX 算

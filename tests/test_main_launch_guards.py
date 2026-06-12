@@ -883,3 +883,16 @@ def test_heavy_network_imports_are_lazy_after_splash():
     # TYPE_CHECKING 慣用法：型別檢查期 import 真模組、執行期只佔位 None(else 分支，縮排)
     assert "if TYPE_CHECKING:" in full
     assert "\n    requests = None" in full
+
+
+def test_abbrev_bg_close_submit_failure_resets_flag():
+    """[review C 2026-06-12] 背景關閉外部展開軟體的 submit 可能被 BoundedExecutor
+    拒絕；失敗時必須重置 _abbrev_bg_close_running 並 fall through 同步路徑，否則
+    旗標永久卡 True → 整個 session 的背景關閉路徑停用。"""
+    src = _function_source(ROOT / "src/main.py", "_install_abbrev_listeners")
+
+    assert re.search(
+        r"try:\s*\n\s*self\.bg_executor\.submit\(_bg_close\)\s*\n\s*return\s*\n"
+        r"\s*except Exception:\s*\n\s*self\._abbrev_bg_close_running = False",
+        src,
+    ), "submit(_bg_close) 必須包 try/except 且失敗時重置旗標"

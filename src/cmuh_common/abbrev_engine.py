@@ -256,9 +256,13 @@ def _maybe_migrate_legacy(items: list[dict[str, str]]) -> bool:
     return changed
 
 
-def load_config(path: str) -> AbbrevConfig:
+def load_config(path: str, *, persist_migrations: bool = True) -> AbbrevConfig:
     """讀取設定，缺檔/壞檔自動回 defaults。
     若偵測到舊版內建 cert1/cert2 字面預設，會自動升級為動態 da_zh 版本。
+
+    persist_migrations=False：唯讀解析 —— 遷移/修復仍套用在「回傳的 cfg」上，
+    但不寫回 path。供「匯入」這類讀別人檔案的場景使用（匯入來源檔可能是使用者
+    USB 上的備份，被改寫會造成困惑）。預設 True 維持原行為（自家設定檔自動修復）。
     """
     loaded = load_json_dict(path, {}, merge_defaults=False)
     raw = dict(DEFAULT_CONFIG)
@@ -310,7 +314,7 @@ def load_config(path: str) -> AbbrevConfig:
         needs_save = True
     needs_save = _maybe_migrate_legacy(cfg.items) or needs_save
     cfg.items = sort_abbrev_items(cfg.items)
-    if needs_save:
+    if needs_save and persist_migrations:
         try:
             save_config(path, cfg)
         except Exception:
