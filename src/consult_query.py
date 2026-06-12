@@ -679,6 +679,20 @@ def close_pids(pids: set, grace: float = 2.5) -> None:
             logging.debug("terminate pid %s 失敗", pid, exc_info=True)
 
 
+def _cleanup_pids_excluding_borrowed(our_pids: set, before: set,
+                                     borrowed: bool) -> set:
+    """[review C2 fix 2026-06-12] SW_HIDE 後備模式收尾要關哪些 pid。
+
+    borrowed=True(本次沒有出現新登入視窗、借用了「啟動前就存在」的實例 ——
+    那可能是使用者自己開著的住院系統)時，排除 before 內的 pid：流程可以借
+    它完成截圖，但收尾絕不可替使用者關掉他的程式。一般情況(borrowed=False)
+    維持原行為，關掉本次開啟的全部實例。"""
+    pids = set(our_pids)
+    if borrowed:
+        return pids - set(before)
+    return pids
+
+
 # =============================================================================
 # 隱藏桌面（systemftp 完全在使用者看不到的虛擬桌面上跑，零干擾）
 # =============================================================================
@@ -919,6 +933,7 @@ def _run_with_sw_hide(cfg: dict) -> Path:
     threading.Thread(target=_stealth, name="ConsultStealth", daemon=True).start()
     fg_before = win32gui.GetForegroundWindow()
     our_pids: set = set()
+    borrowed = False  # 是否借用了啟動前就存在的實例(finally 收尾依此決定保留)
 
     try:
         # 等登入視窗出現；期間冒出「請勿開啟超過兩個」提示就立刻 PostMessage OK。
@@ -947,6 +962,15 @@ def _run_with_sw_hide(cfg: dict) -> Path:
             raise RuntimeError("等不到登入視窗（多開提示可能未正確關閉，或網路過慢）")
 
         our_pid = _window_pid(login)
+        # [review C2 fix] 借用偵測：登入視窗的 pid 在啟動前就存在 = 我們的新實例
+        # 沒有出現視窗(可能被多開限制擋下)、撿到的是「使用者自己開的」住院系統。
+        # 流程仍繼續(否則本次查詢直接失敗)，但收尾不可關掉使用者的實例。
+        borrowed = our_pid in before
+        if borrowed:
+            logging.warning(
+                "[SW_HIDE 後備] 未偵測到新登入視窗，借用既有 systemftp 實例"
+                "(pid=%s，可能是使用者開啟的住院系統)完成本次查詢；"
+                "收尾將保留該實例不關閉。", our_pid)
         our_pids = (_systemftp_pids() - before) | {our_pid}
         logging.info("登入視窗 hwnd=%s，本次實例 pid=%s", login, sorted(our_pids))
 
@@ -1031,9 +1055,11 @@ def _run_with_sw_hide(cfg: dict) -> Path:
         return shot_path
 
     finally:
-        # 收尾：停掉隱形執行緒、關閉我們這份 systemftp、把前景還給使用者
+        # 收尾：停掉隱形執行緒、關閉我們這份 systemftp、把前景還給使用者。
+        # [review C2 fix] 借用使用者既有實例時，排除啟動前就存在的 pid 不關。
         stealth_stop.set()
-        cleanup_pids = our_pids or (_systemftp_pids() - before)
+        cleanup_pids = _cleanup_pids_excluding_borrowed(
+            our_pids or (_systemftp_pids() - before), before, borrowed)
         try:
             close_pids(cleanup_pids)
             logging.info("已關閉本次開啟的 systemftp 實例")

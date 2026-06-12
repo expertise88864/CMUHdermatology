@@ -334,6 +334,30 @@ def test_empty_imap_result_has_all_keys_scheduler_reads():
     assert r["matched_senders"] == []
 
 
+def test_cleanup_excludes_user_instance_when_borrowed():
+    """[review C2 fix] SW_HIDE 後備借用「使用者自己開的」systemftp 時，收尾
+    不可替使用者關掉他的程式 —— 啟動前已存在的 pid 必須排除。"""
+    before = {100, 200}
+    our_pids = {100, 300}  # 100=借用的使用者實例, 300=本次起的子行程
+    assert cq._cleanup_pids_excluding_borrowed(our_pids, before, borrowed=True) \
+        == {300}
+
+
+def test_cleanup_normal_mode_closes_all_our_pids():
+    """非借用(正常路徑) → 維持原行為:本次開啟的全部關掉。"""
+    before = {100}
+    our_pids = {300, 301}
+    assert cq._cleanup_pids_excluding_borrowed(our_pids, before, borrowed=False) \
+        == {300, 301}
+
+
+def test_cleanup_borrowed_with_only_user_instance_closes_nothing():
+    """整組都是借來的(沒有任何新行程) → 收尾一個都不關(空集合安全)。"""
+    before = {100, 200}
+    assert cq._cleanup_pids_excluding_borrowed({100}, before, borrowed=True) \
+        == set()
+
+
 def test_normalize_retry_count_bounds():
     assert cq._normalize_retry_count(0) == cq.DEFAULT_CONFIG["retry_count"]  # 0=未設定→預設
     assert cq._normalize_retry_count(-5) == 1                # 負值夾到下限 1
