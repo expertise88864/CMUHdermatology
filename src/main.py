@@ -4939,7 +4939,13 @@ def _parse_main_hospital_schedule(soup):
                     else:
                         count = 0
 
-                date_key = _safe_parse_roc_date(roc_date_str)
+                # [review C2 2026-06-12] 與 _parse_doctor_info_dayoff 同款防護：
+                # 單格日期解析失敗只跳過該格，不可讓整個醫師的班表解析中斷。
+                try:
+                    date_key = _safe_parse_roc_date(roc_date_str)
+                except ValueError:
+                    logging.debug("班表略過無法解析日期之格: %r", roc_date_str)
+                    continue
                 appointments_by_date.setdefault(date_key, []).append({
                     'session': time_slot_text,
                     'count': count if count != "截止" else "截止",
@@ -5049,7 +5055,12 @@ def _parse_fh_like_weekly_schedule(soup, ext_branch):
                     count_match = _RE_COUNT_APPT.search(count_text)
                     count = int(count_match.group(1)) if count_match else 0
 
-                date_key = _safe_parse_roc_date(roc_date_str)
+                # [review C2 2026-06-12] 單格日期解析失敗只跳過該格(同 dayoff 解析防護)
+                try:
+                    date_key = _safe_parse_roc_date(roc_date_str)
+                except ValueError:
+                    logging.debug("分院週表略過無法解析日期之格: %r", roc_date_str)
+                    continue
                 appointments_by_date.setdefault(date_key, []).append({
                     "session": session_name,
                     "count": count if count != "截止" else "截止",
@@ -5123,7 +5134,12 @@ def _parse_branch_schedule(soup):
                     count_match = _RE_COUNT_APPT.search(count_text)
                     count = int(count_match.group(1)) if count_match else 0
 
-                date_key = _safe_parse_roc_date(roc_date_str)
+                # [review C2 2026-06-12] 單格日期解析失敗只跳過該格(同 dayoff 解析防護)
+                try:
+                    date_key = _safe_parse_roc_date(roc_date_str)
+                except ValueError:
+                    logging.debug("東區週表略過無法解析日期之格: %r", roc_date_str)
+                    continue
                 appointments_by_date.setdefault(date_key, []).append({
                     'session': session_name,
                     'count': count,

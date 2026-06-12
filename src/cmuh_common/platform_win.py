@@ -388,12 +388,19 @@ class _LASTINPUTINFO(ctypes.Structure):
 
 
 def get_idle_duration() -> float:
-    """系統閒置秒數。搬自原主程式 line 1036-1048，供自動重開機判斷。"""
+    """系統閒置秒數。搬自原主程式 line 1036-1048，供自動重開機判斷。
+
+    [review C2 2026-06-12] GetTickCount 回繞修正：ctypes 預設 restype=c_int(signed)，
+    開機 24.8 天後 tick 高位元為 1 → 回傳負值 → millis 變大負數 → 閒置秒數永遠 <0
+    → 「閒置自動重開機」永遠不觸發(而正是因為沒重開機才會走到這一步，形成死循環，
+    需手動重開才能解)。與 hotkey_guardian.system_idle_seconds 相同的 &0xFFFFFFFF
+    無號 32-bit 環算術(同檔早已修過同款 bug)。"""
     if os.name != 'nt':
         return 0.0
     lii = _LASTINPUTINFO()
     lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
     if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
         return 0.0
-    millis = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
+    tick = ctypes.windll.kernel32.GetTickCount() & 0xFFFFFFFF
+    millis = (tick - lii.dwTime) & 0xFFFFFFFF
     return millis / 1000.0
