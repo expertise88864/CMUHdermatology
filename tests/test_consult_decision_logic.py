@@ -34,8 +34,10 @@ def _base_cfg(**over) -> dict:
 class _JobHarness:
     """monkeypatch _do_full_job 的全部重依賴,記錄決策結果。"""
 
-    def __init__(self, monkeypatch, cfg, fail_times=0):
+    def __init__(self, monkeypatch, cfg, fail_times=0, extracted_text=""):
         self.sent = []          # [(recipients, subject)]
+        self.bodies = []        # 寄出的信件內文
+        self.extracted_text = extracted_text
         self.flow_runs = 0
         self.kills = 0
         self.sleeps = []
@@ -50,12 +52,13 @@ class _JobHarness:
             self.flow_runs += 1
             if self.flow_runs <= self._fail_times:
                 raise RuntimeError(f"simulated failure #{self.flow_runs}")
-            return Path("C:/fake/shot.png")
+            # [2026-06-13] run_consult_flow 改回傳 (截圖, 擷取文字)
+            return Path("C:/fake/shot.png"), self.extracted_text
         monkeypatch.setattr(cq, "run_consult_flow", _flow)
         monkeypatch.setattr(
             cq, "send_via_smtp",
             lambda shot, subject, body, recipients: self.sent.append(
-                (list(recipients), subject)))
+                (list(recipients), subject)) or self.bodies.append(body))
         monkeypatch.setattr(
             cq, "send_via_outlook",
             lambda shot, subject, body, recipients, sender_account="":
@@ -332,6 +335,48 @@ def test_empty_imap_result_has_all_keys_scheduler_reads():
         assert key in r, key
     assert r["triggered"] is False
     assert r["matched_senders"] == []
+
+
+# ─── [2026-06-13] 會診文字擷取 ───────────────────────────────────────────
+
+def test_extracted_text_appended_to_mail_body(monkeypatch):
+    """擷取到文字 → 附在信件內文(template 之後);沒擷取到 → 內文維持原樣。"""
+    h = _JobHarness(monkeypatch, _base_cfg(body_template="本文"),
+                    extracted_text="【病人 1】\n[內容1]\n蜂窩性組織炎")
+    cq._do_full_job("17:00")
+    assert h.bodies[0].startswith("本文")
+    assert "蜂窩性組織炎" in h.bodies[0]
+
+    h2 = _JobHarness(monkeypatch, _base_cfg(body_template="本文"),
+                     extracted_text="")
+    cq._do_full_job("17:00")
+    assert h2.bodies[0] == "本文"
+
+
+def test_find_text_panes_filters_and_sorts():
+    """挑文字面板:只收 Memo/RichEdit/Edit 類、高度>=40,依上→下排序。"""
+    kids = [
+        (1, "TDBGrid", "", (0, 0, 400, 200)),        # 格線 → 不收
+        (2, "TMemo", "", (0, 300, 400, 420)),         # 下面的 memo
+        (3, "TEditExt", "", (0, 250, 200, 270)),      # 高度 20 單行 → 不收
+        (4, "TRichEdit", "", (0, 210, 400, 290)),     # 上面的 richedit
+        (5, "TButton", "確認", (0, 430, 60, 455)),    # 按鈕 → 不收
+    ]
+    panes = cq._find_text_panes(kids)
+    assert [h for h, _c, _r in panes] == [4, 2]  # 上(210)→下(300)
+
+
+def test_format_extracted_entries():
+    out = cq._format_extracted_entries([
+        [("內容1", "會診事項 A"), ("內容2", "病情摘要 A")],
+        [("內容1", "  "), ("內容2", "")],            # 全空白 → 跳過
+        [("內容1", "會診事項 B"), ("內容2", "")],     # 空面板略過、非空保留
+    ])
+    assert "【病人 1】" in out and "會診事項 A" in out and "病情摘要 A" in out
+    assert "【病人 3】" in out and "會診事項 B" in out
+    assert "【病人 2】" not in out
+    assert cq._format_extracted_entries([]) == ""
+    assert cq._format_extracted_entries([[("內容1", "")]]) == ""
 
 
 def test_cleanup_excludes_user_instance_when_borrowed():

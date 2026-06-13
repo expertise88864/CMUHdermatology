@@ -656,6 +656,91 @@ def _is_clock_done(schedule_key, username) -> bool:
         return _clock_done.get((schedule_key, username)) == date.today().isoformat()
 
 
+# =============================================================================
+# [新功能 2026-06-13] 補卡提醒：打卡窗結束後仍未確認成功 → 跳通知提醒使用者
+# 去電子刷卡系統確認/補卡。原本失敗只記 log + 單次失敗通知，若整窗的 re-fire
+# 全部失敗(或程式中途才啟動)，使用者可能完全不知道漏打卡。
+# =============================================================================
+# 同一 (schedule_key) 當天只提醒一次；value=date_iso，跨日自動失效、大小有界。
+_missed_warned_lock = threading.Lock()
+_missed_warned: dict = {}
+
+# 窗結束後 90 秒才開始判定：避免「窗內最後一刻刷卡成功、但確認流程還在跑」的
+# 競態造成假提醒。15 分鐘後不再提醒(太久前的窗,提醒已無行動價值)。
+_MISSED_GRACE_START_SEC = 90
+_MISSED_GRACE_END_MIN = 15
+
+
+def _was_missed_warned_today(schedule_key: str) -> bool:
+    with _missed_warned_lock:
+        return _missed_warned.get(schedule_key) == date.today().isoformat()
+
+
+def _mark_missed_warned(schedule_key: str) -> None:
+    with _missed_warned_lock:
+        _missed_warned[schedule_key] = date.today().isoformat()
+
+
+def _windows_needing_missed_warning(now_dt, accounts, *, is_done,
+                                    already_warned) -> list:
+    """回傳 [(schedule_key, [username, ...]), ...]:剛結束的打卡窗中,
+    「有排該窗」但「本窗未確認完成」且「今天還沒提醒過」的帳號。
+
+    純函式(時間/狀態全由參數注入)以便單元測試。判定窗:
+    check_end+90s < now <= check_end+15min(避開窗尾確認競態、過久不再提醒)。
+    """
+    from datetime import timedelta
+    w = now_dt.weekday()
+    if w > 5:  # 週日不打卡(與 get_sched_key 一致)
+        return []
+    day = ["mon", "tue", "wed", "thu", "fri", "sat"][w]
+    out = []
+    for task_type, (_start, end) in VALIDATION_WINDOWS.items():
+        end_dt = datetime.combine(now_dt.date(), end)
+        lo = end_dt + timedelta(seconds=_MISSED_GRACE_START_SEC)
+        hi = end_dt + timedelta(minutes=_MISSED_GRACE_END_MIN)
+        if not (lo < now_dt <= hi):
+            continue
+        skey = f"{day}_{task_type}"
+        if already_warned(skey):
+            continue
+        missing = [
+            a.get("username") for a in accounts
+            if a.get("schedule", {}).get(skey, False)
+            and a.get("username")
+            and not is_done(skey, a.get("username"))
+        ]
+        if missing:
+            out.append((skey, missing))
+    return out
+
+
+def _missed_clock_check() -> None:
+    """每分鐘由排程器呼叫:打卡窗剛結束仍有帳號未確認成功 → 通知 + log。"""
+    try:
+        hits = _windows_needing_missed_warning(
+            datetime.now(), load_config(),
+            is_done=_is_clock_done,
+            already_warned=_was_missed_warned_today,
+        )
+        for skey, users in hits:
+            _mark_missed_warned(skey)
+            names = ", ".join(str(u) for u in users)
+            logging.warning(
+                "[補卡提醒] 打卡時段 %s 已結束,以下帳號本窗未確認成功打卡: %s "
+                "(可能登入連續失敗或程式窗內未執行,請至電子刷卡系統確認/補卡)",
+                skey, names)
+            notify_clock_failure(
+                "補卡提醒",
+                [f"打卡時段 {skey} 已結束",
+                 f"未確認成功: {names}",
+                 "請至電子刷卡系統確認,必要時補打卡"],
+                None,
+            )
+    except Exception:
+        logging.exception("[補卡提醒] 檢查例外(吞掉,不影響排程)")
+
+
 def _check_swipes(type_str: str, start: dt_time, end: dt_time, swipes) -> bool:
     """檢查是否有「特定類型」紀錄『嚴格』落在 [start, end] 官方打卡區間內。
 
@@ -1089,6 +1174,8 @@ def scheduler_loop() -> None:
     schedule.every(1).minute.at(":01").do(_scheduler_tick)
     # [優化] 每 2 分鐘主動檢查 idle driver，過期就 quit (省 ~150-250MB Chrome)
     schedule.every(2).minutes.do(_idle_driver_janitor)
+    # [新功能 2026-06-13] 補卡提醒:打卡窗結束 90s~15min 內檢查未完成帳號並通知
+    schedule.every(1).minute.at(":31").do(_missed_clock_check)
 
     # [P0-1] 啟動 self-watchdog 子 thread
     _ensure_autoclock_self_watchdog()

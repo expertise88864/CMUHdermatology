@@ -172,6 +172,15 @@ DEFAULT_CONFIG = {
     # 觸發信不回放(標已讀清掉、不觸發)，避免把幾天前的請求當現在處理。0=不過濾。
     # 解析不出信件時間時 fail-open 照常觸發(寧可多觸發、不可漏會診請求)。
     "email_trigger_max_age_hours": 6,
+    # [新功能 2026-06-13] 會診單內容文字擷取：截圖後依序背景點選清單病人列、
+    # 以 WM_GETTEXT 讀取下方「會診事項/病情摘要」文字控制項，附進信件內文
+    # (截圖照常為主，文字僅輔助)。完全 fail-open：任何失敗只記 log、照常寄截圖。
+    # 點擊參數為 Delphi 清單格線的估計值，跑一次後可依 log 的控制項樹微調。
+    "extract_text_enabled": True,
+    "extract_max_rows": 12,        # 最多嘗試點選幾列(病人數上限)
+    "extract_first_row_y": 32,     # 第一列資料的 client Y(略過表頭)
+    "extract_row_height": 19,      # 每列高度(px)
+    "extract_click_x": 12,         # 點擊 X:病人姓名前的選取框欄
 }
 
 MAX_RETRY_COUNT = 10
@@ -655,6 +664,158 @@ def capture_window_image(hwnd: int):
     return img
 
 
+# =============================================================================
+# [新功能 2026-06-13] 會診單內容文字擷取
+# 原理：會診清單是 Delphi 格線，下方「會診事項/病情摘要」是 Memo/RichEdit 類
+# 文字控制項。背景 PostMessage 依序點選每位病人列(同 type_via_focus 的點擊
+# idiom，不動真實滑鼠)，每次點選後用 WM_GETTEXT 讀取文字面板 → 彙整進信件。
+# 完全 fail-open：抓不到就回空字串、照常只寄截圖。每次執行都把控制項樹 dump
+# 進 log，供依實機結構微調 extract_* 設定參數。
+# =============================================================================
+def _read_ctrl_text(hwnd: int, max_len: int = 8192) -> str:
+    """WM_GETTEXT 讀控制項文字(SendMessageTimeout，目標忙線不阻塞)。"""
+    try:
+        buf = ctypes.create_unicode_buffer(max_len)
+        res = ctypes.c_ulong(0)
+        SMTO_ABORTIFHUNG = 0x0002
+        ctypes.windll.user32.SendMessageTimeoutW(
+            hwnd, win32con.WM_GETTEXT, max_len, buf,
+            SMTO_ABORTIFHUNG, 1200, ctypes.byref(res))
+        return buf.value or ""
+    except Exception:
+        return ""
+
+
+def _find_text_panes(children: list, min_height: int = 40) -> list:
+    """從控制項樹挑出可能承載會診事項/病情摘要的多行文字控制項。
+
+    純函式(輸入為 enum_children 的 (hwnd, class, text, rect) list)以便測試。
+    篩選:class 含 memo/richedit/richview/edit(大小寫無關)且高度 >= min_height
+    (排除單行篩選輸入框)。回傳依畫面位置(上→下、左→右)排序。"""
+    panes = []
+    for hwnd, cls, _txt, rect in children:
+        c = (cls or "").lower()
+        if not any(k in c for k in ("memo", "richedit", "richview", "edit")):
+            continue
+        try:
+            height = rect[3] - rect[1]
+        except (TypeError, IndexError):
+            continue
+        if height < min_height:
+            continue
+        panes.append((hwnd, cls, rect))
+    panes.sort(key=lambda item: (item[2][1], item[2][0]))
+    return panes
+
+
+def _format_extracted_entries(entries: list) -> str:
+    """把逐病人擷取結果組成信件附文。entries=[ [(label, text), ...], ... ]。
+    純函式以便測試;全空回空字串(信件就不附這段)。"""
+    blocks = []
+    for i, panes in enumerate(entries, 1):
+        texts = [(label, (text or "").strip()) for label, text in panes]
+        texts = [(label, text) for label, text in texts if text]
+        if not texts:
+            continue
+        lines = [f"【病人 {i}】"]
+        for label, text in texts:
+            lines.append(f"[{label}]")
+            lines.append(text)
+        blocks.append("\n".join(lines))
+    if not blocks:
+        return ""
+    return ("── 以下為自動擷取的會診文字內容(輔助閱讀，請以截圖為準) ──\n\n"
+            + "\n\n".join(blocks))
+
+
+def _click_grid_point(grid_hwnd: int, x: int, y: int) -> None:
+    """背景點擊格線 client 座標(PostMessage，不動真實滑鼠)。"""
+    lparam = ((y & 0xFFFF) << 16) | (x & 0xFFFF)
+    win32gui.PostMessage(grid_hwnd, win32con.WM_LBUTTONDOWN,
+                         win32con.MK_LBUTTON, lparam)
+    time.sleep(0.05)
+    win32gui.PostMessage(grid_hwnd, win32con.WM_LBUTTONUP, 0, lparam)
+
+
+def _read_panes_snapshot(panes: list) -> list:
+    """讀取全部文字面板目前內容 → [(label, text), ...]。label 依畫面順序編號
+    (內容1=最上面的面板;實機跑過一次後可依 log 對照其實際意義)。"""
+    out = []
+    for i, (hwnd, _cls, _rect) in enumerate(panes, 1):
+        out.append((f"內容{i}", _read_ctrl_text(hwnd)))
+    return out
+
+
+def _extract_consult_text(consult_hwnd: int, cfg: dict) -> str:
+    """主入口:從會診視窗擷取逐病人文字。任何失敗回空字串(fail-open)。"""
+    if not cfg.get("extract_text_enabled", True):
+        return ""
+    try:
+        children = enum_children(consult_hwnd)
+        # 控制項樹 dump(每次執行記一次)：供依實機結構微調 extract_* 參數
+        logging.info(
+            "[consult-extract] 控制項樹(%d 個): %s",
+            len(children),
+            " | ".join(
+                f"{cls}@({r[0]},{r[1]},{r[2]-r[0]}x{r[3]-r[1]})"
+                + (f" t={txt[:16]!r}" if txt else "")
+                for _h, cls, txt, r in children[:80]))
+
+        panes = _find_text_panes(children)
+        if not panes:
+            logging.info("[consult-extract] 找不到文字面板(Memo/RichEdit)，"
+                         "本次只寄截圖;請把上行控制項樹回報以便調整篩選")
+            return ""
+
+        grid = next(
+            (h for h, cls, _t, _r in children if "grid" in (cls or "").lower()),
+            None)
+        grid_rect = next(
+            (r for h, _c, _t, r in children if h == grid), None)
+
+        entries: list = []
+        seen_signatures: set = set()
+
+        def _snap_and_collect() -> bool:
+            snap = _read_panes_snapshot(panes)
+            sig = tuple(t for _l, t in snap)
+            if any(t.strip() for t in sig) and sig not in seen_signatures:
+                seen_signatures.add(sig)
+                entries.append(snap)
+                return True
+            return False
+
+        # 目前選取列(開窗預設選第一列)先收一次
+        _snap_and_collect()
+
+        if grid is not None and grid_rect is not None:
+            max_rows = int(cfg.get("extract_max_rows", 12) or 12)
+            first_y = int(cfg.get("extract_first_row_y", 32) or 32)
+            row_h = int(cfg.get("extract_row_height", 19) or 19)
+            click_x = int(cfg.get("extract_click_x", 12) or 12)
+            grid_height = grid_rect[3] - grid_rect[1]
+            no_new = 0
+            for row in range(max_rows):
+                y = first_y + row * row_h
+                if y >= grid_height - 2:
+                    break
+                _click_grid_point(grid, click_x, y)
+                time.sleep(0.35)  # 等 Delphi 把下方面板換成該病人內容
+                if _snap_and_collect():
+                    no_new = 0
+                else:
+                    no_new += 1
+                    if no_new >= 2:  # 連兩列沒有新內容=已過最後一列
+                        break
+        text = _format_extracted_entries(entries)
+        logging.info("[consult-extract] 擷取完成:%d 位病人、%d 字",
+                     len(entries), len(text))
+        return text
+    except Exception:
+        logging.warning("[consult-extract] 擷取失敗(照常只寄截圖)", exc_info=True)
+        return ""
+
+
 def close_pids(pids: set, grace: float = 2.5) -> None:
     """關閉指定行程：先對其視窗送 WM_CLOSE，逾時再強制結束。"""
     if not pids:
@@ -725,8 +886,9 @@ def _set_thread_desktop(hdesk) -> bool:
 # =============================================================================
 # 自動化主流程
 # =============================================================================
-def run_consult_flow(trigger_label: str = "") -> Path:
-    """執行完整會診查詢流程，回傳截圖路徑。失敗會 raise。
+def run_consult_flow(trigger_label: str = "") -> tuple:
+    """執行完整會診查詢流程，回傳 (截圖路徑, 擷取文字)。失敗會 raise。
+    擷取文字為 best-effort:抓不到時為空字串(信件就只有截圖)。
 
     優先用「隱藏桌面」執行 systemftp——它的所有視窗都在使用者看不到的
     虛擬桌面，永遠不會出現在使用者畫面、不會搶前景、滑鼠也不會動。
@@ -773,8 +935,8 @@ def run_consult_flow(trigger_label: str = "") -> Path:
     return _run_with_sw_hide(cfg)
 
 
-def _automation_on_hidden(cfg: dict) -> Path:
-    """在隱藏桌面執行完整流程（呼叫者需已 SetThreadDesktop）。
+def _automation_on_hidden(cfg: dict) -> tuple:
+    """在隱藏桌面執行完整流程（呼叫者需已 SetThreadDesktop）。回傳 (截圖, 文字)。
 
     因為隱藏桌面上 systemftp 是唯一前景應用，不需要 stealth thread、不需要
     show_offscreen、不會與使用者畫面衝突——程式碼相對單純。
@@ -890,7 +1052,9 @@ def _automation_on_hidden(cfg: dict) -> Path:
         shot_path = SHOTS_DIR / f"consult_{stamp}.png"
         img.save(shot_path)
         logging.info("已存檔截圖：%s", shot_path)
-        return shot_path
+        # [新功能 2026-06-13] 截圖(原始畫面)存檔後才逐列點選擷取文字(fail-open)
+        extracted = _extract_consult_text(consult, cfg)
+        return shot_path, extracted
 
     finally:
         cleanup_pids = our_pids or (_systemftp_pids() - before)
@@ -901,8 +1065,9 @@ def _automation_on_hidden(cfg: dict) -> Path:
             logging.warning("關閉 systemftp 失敗", exc_info=True)
 
 
-def _run_with_sw_hide(cfg: dict) -> Path:
-    """後備模式：使用者桌面上跑，配合 SW_HIDE 隱形執行緒（可能有短暫閃爍）。"""
+def _run_with_sw_hide(cfg: dict) -> tuple:
+    """後備模式：使用者桌面上跑，配合 SW_HIDE 隱形執行緒（可能有短暫閃爍）。
+    回傳 (截圖路徑, 擷取文字)。"""
     username = cfg["username"]
     password = cfg["password"]
 
@@ -1052,7 +1217,9 @@ def _run_with_sw_hide(cfg: dict) -> Path:
         shot_path = SHOTS_DIR / f"consult_{stamp}.png"
         img.save(shot_path)
         logging.info("已存檔截圖：%s", shot_path)
-        return shot_path
+        # [新功能 2026-06-13] 截圖(原始畫面)存檔後才逐列點選擷取文字(fail-open)
+        extracted = _extract_consult_text(consult, cfg)
+        return shot_path, extracted
 
     finally:
         # 收尾：停掉隱形執行緒、關閉我們這份 systemftp、把前景還給使用者。
@@ -1359,11 +1526,14 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                 logging.info("會診查詢任務 第 %d/%d 次嘗試（trigger=%s, 收件人組=%s, mail=%s）",
                              attempt, retry_count, trigger_label,
                              recipients_label, mail_method)
-                shot = run_consult_flow(trigger_label)
+                shot, extracted_text = run_consult_flow(trigger_label)
+                # [新功能 2026-06-13] 擷取到的會診文字附在信件內文(截圖仍為主)
+                final_body = (f"{body}\n\n{extracted_text}"
+                              if extracted_text else body)
                 if mail_method == "smtp":
-                    send_via_smtp(shot, subject, body, recipients)
+                    send_via_smtp(shot, subject, final_body, recipients)
                 else:
-                    send_via_outlook(shot, subject, body, recipients,
+                    send_via_outlook(shot, subject, final_body, recipients,
                                       sender_account=sender)
                 logging.info("會診查詢任務成功（第 %d 次嘗試）", attempt)
                 return  # 成功就跳出
