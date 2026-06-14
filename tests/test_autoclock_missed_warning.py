@@ -94,3 +94,101 @@ def test_midday_windows_independent():
                  _accounts(("A1", {"mon_midday_out": True,
                                    "mon_midday_in": True})))
     assert hits == [("mon_midday_out", ["A1"])]
+
+
+# ─── [新功能 2026-06-15] 打卡狀態跨重啟持久化 ───────────────────────────────
+
+import json  # noqa: E402
+
+
+def _reset_clock_state():
+    ac._clock_done.clear()
+    ac._missed_warned.clear()
+
+
+def test_clock_state_round_trip_survives_restart(tmp_path, monkeypatch):
+    """啟用持久化 → mark 落盤 → 清空記憶體(模擬重啟) → 載回仍恢復。"""
+    monkeypatch.setattr(ac, "CLOCK_STATE_FILE", tmp_path / "clock_state.json")
+    monkeypatch.setattr(ac, "_clock_state_persistence_enabled", True)
+    _reset_clock_state()
+    try:
+        ac._mark_clock_done("mon_am_in", "D15728")
+        ac._mark_missed_warned("mon_pm_out")
+        assert (tmp_path / "clock_state.json").exists()
+
+        _reset_clock_state()              # 模擬程序重啟:記憶體消失
+        ac._load_clock_state()
+        assert ac._is_clock_done("mon_am_in", "D15728") is True
+        assert ac._was_missed_warned_today("mon_pm_out") is True
+        assert ac._is_clock_done("mon_am_in", "OTHER") is False  # 沒存的不誤判
+    finally:
+        _reset_clock_state()
+
+
+def test_clock_state_cross_day_ignored(tmp_path, monkeypatch):
+    """檔案 date 非今日 → 跨日舊狀態整批忽略(避免昨天打卡擋掉今天)。"""
+    monkeypatch.setattr(ac, "CLOCK_STATE_FILE", tmp_path / "clock_state.json")
+    _reset_clock_state()
+    try:
+        (tmp_path / "clock_state.json").write_text(json.dumps({
+            "date": "2020-01-01",
+            "clock_done": [["mon_am_in", "D15728"]],
+            "missed_warned": ["mon_am_in"],
+        }), encoding="utf-8")
+        ac._load_clock_state()
+        assert ac._is_clock_done("mon_am_in", "D15728") is False
+        assert ac._was_missed_warned_today("mon_am_in") is False
+    finally:
+        _reset_clock_state()
+
+
+def test_clock_state_not_written_when_disabled(tmp_path, monkeypatch):
+    """未啟用持久化(短命/GUI 實例) → 只記憶體、不寫檔。"""
+    monkeypatch.setattr(ac, "CLOCK_STATE_FILE", tmp_path / "clock_state.json")
+    monkeypatch.setattr(ac, "_clock_state_persistence_enabled", False)
+    _reset_clock_state()
+    try:
+        ac._mark_clock_done("mon_am_in", "D15728")
+        assert not (tmp_path / "clock_state.json").exists()
+        assert ac._is_clock_done("mon_am_in", "D15728") is True
+    finally:
+        _reset_clock_state()
+
+
+def test_clock_state_load_survives_corrupt_file(tmp_path, monkeypatch):
+    """壞檔不可 raise(fail-open 降級純記憶體)。"""
+    monkeypatch.setattr(ac, "CLOCK_STATE_FILE", tmp_path / "clock_state.json")
+    _reset_clock_state()
+    try:
+        (tmp_path / "clock_state.json").write_text("{garbage", encoding="utf-8")
+        ac._load_clock_state()  # 不可 raise
+        assert ac._is_clock_done("mon_am_in", "D15728") is False
+    finally:
+        _reset_clock_state()
+
+
+def test_clock_state_load_survives_malformed_fields(tmp_path, monkeypatch):
+    """[codex review 2026-06-15] 合法 JSON 但欄位畸形(null/型別錯)不可拋例外
+    殺掉 scheduler 啟動(載入在註冊排程之前)。"""
+    monkeypatch.setattr(ac, "CLOCK_STATE_FILE", tmp_path / "clock_state.json")
+    today = ac.date.today().isoformat()
+    _reset_clock_state()
+    try:
+        # clock_done=null、missed_warned 是 dict(非 list) → 都不可 raise
+        (tmp_path / "clock_state.json").write_text(json.dumps({
+            "date": today, "clock_done": None, "missed_warned": {"x": 1},
+        }), encoding="utf-8")
+        ac._load_clock_state()  # 不可 raise
+        assert ac._is_clock_done("mon_am_in", "D15728") is False
+        # 畸形項中的合法部分:list 內混入壞元素也只跳過壞的
+        (tmp_path / "clock_state.json").write_text(json.dumps({
+            "date": today,
+            "clock_done": [["mon_am_in", "D1"], "bad", ["only_one"], 123],
+            "missed_warned": ["mon_am_in", 999, None],
+        }), encoding="utf-8")
+        _reset_clock_state()
+        ac._load_clock_state()
+        assert ac._is_clock_done("mon_am_in", "D1") is True   # 合法項載入
+        assert ac._was_missed_warned_today("mon_am_in") is True
+    finally:
+        _reset_clock_state()

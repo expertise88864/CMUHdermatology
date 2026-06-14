@@ -369,6 +369,27 @@ def _fmt_time_hhmm(d: datetime) -> str:
     return f"{d.hour:02d}:{d.minute:02d}"
 
 
+# -----------------------------------------------------------------------------
+# 游標定位 token：展開內容裡放 %|% 標記展開後游標要停的位置（模板填空用）。
+# 例："excisional biopsy %|% and follow up" 展開後游標停在兩字中間直接補字。
+# -----------------------------------------------------------------------------
+CURSOR_MARKER = "%|%"
+
+
+def split_cursor_marker(text: str) -> tuple[str, int]:
+    """把游標標記從文字中移除，回傳 (移除後文字, 游標需從末端左移的字元數)。
+
+    無標記 → (text, 0)（與舊行為一致）。以「第一個」標記為游標錨點；其餘多餘標記
+    一併移除避免字面 %|% 外洩（游標仍只停在第一個標記處）。
+    """
+    idx = text.find(CURSOR_MARKER)
+    if idx < 0:
+        return text, 0
+    head = text[:idx]
+    tail = text[idx + len(CURSOR_MARKER):].replace(CURSOR_MARKER, "")
+    return head + tail, len(tail)
+
+
 def render_expansion(template: str, now: Optional[datetime] = None) -> str:
     """把 template 內的日期/時間 token 替換為實際字串。
 
@@ -920,6 +941,7 @@ _KEYEVENTF_KEYUP = 0x0002
 _VK_BACK = 0x08
 _VK_CONTROL = 0x11
 _VK_V = 0x56
+_VK_LEFT = 0x25  # 游標定位 token 用：展開後把游標往左移回標記位置
 
 # 64-bit safe pointer-sized integer for dwExtraInfo
 _ULONG_PTR = ctypes.c_size_t
@@ -1119,8 +1141,14 @@ def _replace_native_edit_suffix(
     expected_suffix: str,
     replacement: str,
     timeout_sec: float,
+    cursor_left: int = 0,
 ) -> bool:
-    """Replace a verified suffix directly in native Windows text controls."""
+    """Replace a verified suffix directly in native Windows text controls.
+
+    cursor_left>0 時(游標定位 token)：取代完成後把 caret 精準設回標記位置
+    (start + len(replacement) - cursor_left)。原生控制項用 EM_SETSEL 比送
+    LEFT 方向鍵更可靠。
+    """
     hwnd = _get_focused_window_handle()
     if not hwnd or not _is_native_edit_control(hwnd):
         return False
@@ -1136,12 +1164,20 @@ def _replace_native_edit_suffix(
                 if suffix.casefold() == expected_suffix.casefold():
                     if _get_focused_window_handle() != hwnd:
                         return False
-                    return _replace_edit_selection(
-                        hwnd,
-                        caret - len(expected_suffix),
-                        caret,
-                        replacement,
-                    )
+                    start = caret - len(expected_suffix)
+                    ok = _replace_edit_selection(
+                        hwnd, start, caret, replacement)
+                    if ok and 0 < cursor_left <= len(replacement):
+                        # EM_SETSEL 用 UTF-16 code-unit 位移,Python len() 是 code point；
+                        # 標記前那段以 UTF-16 長度算偏移,非 BMP 字元(罕見)也正確。
+                        # [codex review 2026-06-15]
+                        before_cursor = replacement[:len(replacement) - cursor_left]
+                        final = start + len(
+                            before_cursor.encode("utf-16-le")) // 2
+                        if final >= start:
+                            _send_message_timeout(
+                                hwnd, _EM_SETSEL, final, final)
+                    return ok
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -1453,8 +1489,11 @@ class AbbrevEngine:
             logging.exception("[abbrev] render_expansion 失敗 abbrev=%s", matched_key)
             return False
 
-        if self._cfg.preserve_trailing_space:
+        # 游標定位 token：有 %|% 時就不補尾端空白(游標停在標記處,由使用者接著打字)
+        had_cursor_marker = CURSOR_MARKER in rendered
+        if self._cfg.preserve_trailing_space and not had_cursor_marker:
             rendered = rendered + " "
+        rendered, cursor_left = split_cursor_marker(rendered)
 
         # 刪掉「縮寫 + 觸發字元」共 len(matched_key)+1 個字元
         delete_count = min(len(matched_key) + len(trigger_char), self.MAX_BACKSPACE)
@@ -1473,7 +1512,8 @@ class AbbrevEngine:
         try:
             worker = threading.Thread(
                 target=self._do_replace,
-                args=(delete_count, rendered, matched_key, matched_key + trigger_char),
+                args=(delete_count, rendered, matched_key,
+                      matched_key + trigger_char, cursor_left),
                 daemon=True,
             )
             worker.start()
@@ -1490,6 +1530,7 @@ class AbbrevEngine:
         text: str,
         abbrev_key: str,
         typed_suffix: Optional[str] = None,
+        cursor_left: int = 0,
     ) -> None:
         """在獨立 thread 執行：原生欄位先嘗試直接取代，其他欄位再分兩段
         SendInput：(1) backspace × N → 等目標處理完刪除 → (2) Ctrl+V 貼上。
@@ -1516,6 +1557,7 @@ class AbbrevEngine:
                 typed_suffix or (abbrev_key + " "),
                 text,
                 self.PRE_BACKSPACE_DELAY_SEC,
+                cursor_left=cursor_left,
             )
             if used_native_edit:
                 # 原生欄位同步取代完成、不碰剪貼簿 → 無 paste 競態，cool-down 可大幅
@@ -1571,6 +1613,7 @@ class AbbrevEngine:
                         "[abbrev] BlockInput 失敗(可能非系統管理員權限)——展開期間"
                         "無法凍結使用者輸入，僅靠 cooldown 保護；快速連打時極小機率"
                         "夾字。以系統管理員執行可消除此限制。")
+                paste_settled = False  # 提前綁定:若 try 內提早拋例外,finally 後參照不會 NameError
                 try:
                     # 2a-1. 先送 backspace 刪除「縮寫 + 觸發空白」
                     bs_ok = _send_atomic_keystrokes(bs_events)
@@ -1579,6 +1622,20 @@ class AbbrevEngine:
                     # 2a-3. 送 Ctrl+V 貼上展開內容
                     paste_ok = _send_atomic_keystrokes(paste_events)
                     used_paste = bool(bs_ok and paste_ok)
+                    # 2a-4. 游標定位：貼上是「非同步」的，游標要等貼上『落地』後再移，
+                    #       否則 LEFT 可能在貼上前先動到舊內容 → 位置錯。等 POST_PASTE
+                    #       後(且仍在 BlockInput 凍結期內)才送 LEFter，與貼上正確排序。
+                    #       [codex review 2026-06-15 修:原本緊接 paste 送 LEFT 有競態]
+                    if used_paste and cursor_left > 0:
+                        time.sleep(self.POST_PASTE_DELAY_SEC)
+                        paste_settled = True
+                        left_events: list = []
+                        for _ in range(cursor_left):
+                            left_events.append((_VK_LEFT, True))
+                            left_events.append((_VK_LEFT, False))
+                        _send_atomic_keystrokes(left_events)
+                    else:
+                        paste_settled = False
                 finally:
                     if blocked:
                         try:
@@ -1587,7 +1644,9 @@ class AbbrevEngine:
                             pass
                 # 4a. 等 target app 非同步讀剪貼簿 + 處理 paste 完成，
                 #     才在 finally 還原剪貼簿（太早還原會貼到舊內容）。
-                time.sleep(self.POST_PASTE_DELAY_SEC)
+                #     游標定位路徑已在凍結期內等過 POST_PASTE,這裡不重複等。
+                if not paste_settled:
+                    time.sleep(self.POST_PASTE_DELAY_SEC)
             else:
                 # 2b. fallback: 剪貼簿寫入失敗 / 剪貼簿含非文字內容 → keystroke 老路
                 if force_keystroke:
@@ -1603,6 +1662,13 @@ class AbbrevEngine:
                 try:
                     kb.write(text)
                     used_keystroke = True
+                    # 游標定位：keystroke 路徑同樣送 LEFT 把游標移回標記位置
+                    if cursor_left > 0:
+                        for _ in range(cursor_left):
+                            try:
+                                kb.send("left")
+                            except Exception:
+                                break
                 except Exception:
                     logging.exception("[abbrev] keyboard.write fallback 失敗")
         except Exception:

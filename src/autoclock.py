@@ -647,6 +647,7 @@ def _mark_clock_done(schedule_key, username) -> None:
         return
     with _clock_done_lock:
         _clock_done[(schedule_key, username)] = date.today().isoformat()
+    _save_clock_state()
 
 
 def _is_clock_done(schedule_key, username) -> bool:
@@ -679,6 +680,81 @@ def _was_missed_warned_today(schedule_key: str) -> bool:
 def _mark_missed_warned(schedule_key: str) -> None:
     with _missed_warned_lock:
         _missed_warned[schedule_key] = date.today().isoformat()
+    _save_clock_state()
+
+
+# =============================================================================
+# [新功能 2026-06-15] 打卡狀態跨重啟持久化
+# _clock_done / _missed_warned 原為純記憶體 → watchdog/自動更新重啟即清空：
+#   - 重啟後 _clock_done 沒了 → 已打卡帳號又重開 driver+登入(re-fire 登入失敗會跳假失敗)
+#   - _missed_warned 沒了 → 同窗補卡提醒可能重跳
+# 落盤到 clock_state.json(全檔一個 date 戳,跨日整批失效),scheduler 啟動時載回。
+# 沿用 consult_query dedup 已驗證的持久化 pattern；全程 fail-open 降級純記憶體。
+# 只有長駐 scheduler 實例才啟用寫盤(_clock_state_persistence_enabled),避免 GUI/
+# 短命實例污染檔案。
+# =============================================================================
+CLOCK_STATE_FILE = SETTINGS_DIR / "clock_state.json"
+_clock_state_persistence_enabled = False
+# [codex review 2026-06-15] 序列化寫盤:worker(打卡)與 scheduler(補卡提醒)兩個
+# thread 都會觸發 _save_clock_state;原本只各自快照無序列化,並發時較舊的整檔快照
+# 可能後寫覆蓋較新的 → 漏存某些 clock_done/missed_warned。用一把存檔鎖把「快照+寫盤」
+# 串起來。注意:_mark_* 是先放掉 dict 鎖才呼叫 _save_clock_state,故不會與此鎖巢狀死結。
+_clock_state_save_lock = threading.Lock()
+
+
+def _save_clock_state() -> None:
+    """把今日的 _clock_done / _missed_warned 落盤(原子寫)。未啟用或失敗 → 靜默降級。
+    存檔鎖序列化整個「快照→寫檔」,避免並發後寫覆蓋。"""
+    if not _clock_state_persistence_enabled:
+        return
+    today = date.today().isoformat()
+    with _clock_state_save_lock:
+        with _clock_done_lock:
+            done = [[k, u] for (k, u), v in _clock_done.items() if v == today]
+        with _missed_warned_lock:
+            warned = [k for k, v in _missed_warned.items() if v == today]
+        try:
+            atomic_write_json(str(CLOCK_STATE_FILE),
+                              {"date": today, "clock_done": done,
+                               "missed_warned": warned})
+        except Exception:
+            logging.debug("[clock-state] 寫盤失敗(降級純記憶體)", exc_info=True)
+
+
+def _load_clock_state() -> None:
+    """啟動時載回今日打卡狀態(跨重啟防假失敗/防補卡提醒重跳)。
+    全檔 date != 今日 → 視為跨日舊狀態整批忽略;壞檔/缺檔/欄位型別異常一律靜默降級。
+    [codex review 2026-06-15] 整個函式包 try/except:合法 JSON 但欄位畸形
+    (如 clock_done=null)不可拋例外殺掉 scheduler 啟動(載入在註冊排程之前)。"""
+    try:
+        raw = safe_load_json(str(CLOCK_STATE_FILE), default={})
+        today = date.today().isoformat()
+        if not isinstance(raw, dict) or raw.get("date") != today:
+            return
+        done_n = 0
+        done_items = raw.get("clock_done") or []
+        warned_items = raw.get("missed_warned") or []
+        if not isinstance(done_items, list):
+            done_items = []
+        if not isinstance(warned_items, list):
+            warned_items = []
+        with _clock_done_lock:
+            for item in done_items:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    _clock_done[(str(item[0]), str(item[1]))] = today
+                    done_n += 1
+        warned_n = 0
+        with _missed_warned_lock:
+            for k in warned_items:
+                if isinstance(k, str) and k:
+                    _missed_warned[k] = today
+                    warned_n += 1
+        if done_n or warned_n:
+            logging.info("[clock-state] 已載回今日狀態:%d 筆已完成打卡、%d 筆已提醒"
+                         "(跨重啟)", done_n, warned_n)
+    except Exception:
+        logging.warning("[clock-state] 載入失敗(降級純記憶體,不影響打卡)",
+                        exc_info=True)
 
 
 def _windows_needing_missed_warning(now_dt, accounts, *, is_done,
@@ -1170,6 +1246,11 @@ def scheduler_loop() -> None:
     (3) 啟動 self-watchdog daemon thread 監看 scheduler thread is_alive + tick
     """
     logging.info("背景排程器已啟動...")
+    # [新功能 2026-06-15] 長駐 scheduler 啟用打卡狀態持久化 + 載回今日狀態
+    # (跨 watchdog/自動更新重啟,防已打卡帳號重登假失敗、補卡提醒重跳)。
+    global _clock_state_persistence_enabled
+    _clock_state_persistence_enabled = True
+    _load_clock_state()
     schedule.clear()
     schedule.every(1).minute.at(":01").do(_scheduler_tick)
     # [優化] 每 2 分鐘主動檢查 idle driver，過期就 quit (省 ~150-250MB Chrome)

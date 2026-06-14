@@ -464,6 +464,61 @@ def test_handle_event_typing_word_then_space_does_not_misfire(monkeypatch):
     assert eng._suppressing is False, "persist 結尾的 st 不該誤觸展開"
 
 
+# ─── 游標定位 token (%|%) ─────────────────────────────────────────────────
+
+def test_split_cursor_marker():
+    assert ae.split_cursor_marker("AAA%|%BBB") == ("AAABBB", 3)
+    assert ae.split_cursor_marker("no marker") == ("no marker", 0)
+    assert ae.split_cursor_marker("tail end%|%") == ("tail end", 0)  # 末端=游標在最後
+    assert ae.split_cursor_marker("%|%head") == ("head", 4)
+    # 多個標記:第一個是游標錨點,其餘移除避免字面 %|% 外洩
+    assert ae.split_cursor_marker("a%|%b%|%c") == ("abc", 2)
+
+
+def _feed_and_capture_do_replace(monkeypatch, expansion, *, abbrev="bx",
+                                 preserve_trailing=True):
+    """安裝含 expansion 的縮寫、打 abbrev+空白,回傳 _do_replace 收到的 args。"""
+    monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
+    monkeypatch.setattr(ae, "should_skip_for_input_method", lambda: False)
+    eng = _make_engine()
+    eng.install(AbbrevConfig(enabled=True, preserve_trailing_space=preserve_trailing,
+                             items=[{"abbrev": abbrev, "expansion": expansion}]))
+    cap = {}
+    monkeypatch.setattr(eng, "_do_replace",
+                        lambda *a, **k: cap.update(args=a))
+
+    class _K:
+        def __init__(self, n):
+            self.name = n
+
+    for ch in abbrev:
+        eng._handle_event(_K(ch))
+    eng._handle_event(_K("space"))
+    return cap["args"]
+
+
+def test_cursor_marker_passes_offset_and_skips_trailing_space(monkeypatch):
+    """有 %|% → rendered 去除標記、不補尾端空白、cursor_left=標記後字元數。"""
+    # _do_replace(delete_count, rendered, matched_key, typed_suffix, cursor_left)
+    args = _feed_and_capture_do_replace(monkeypatch, "AAA%|%BBB")
+    assert args[1] == "AAABBB"      # 標記移除、無尾端空白
+    assert args[4] == 3             # cursor_left = len("BBB")
+
+
+def test_no_cursor_marker_keeps_trailing_space_and_zero_offset(monkeypatch):
+    """無 %|% → 維持舊行為:補尾端空白、cursor_left=0。"""
+    args = _feed_and_capture_do_replace(monkeypatch, "keep stable")
+    assert args[1] == "keep stable "
+    assert args[4] == 0
+
+
+def test_cursor_marker_at_end_offset_zero(monkeypatch):
+    """%|% 在最末 → 游標停在末端(cursor_left=0),等同無位移但仍消除標記。"""
+    args = _feed_and_capture_do_replace(monkeypatch, "done%|%")
+    assert args[1] == "done"
+    assert args[4] == 0
+
+
 def test_handle_event_backspace_correction_still_triggers(monkeypatch):
     """打錯字→backspace 修正→重打，仍應觸發展開（user 回報：cery→⌫→t→空白 = cert）。"""
     monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
