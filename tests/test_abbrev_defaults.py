@@ -408,6 +408,56 @@ def test_ime_detection_allows_alphanumeric_mode_inside_chinese_ime(monkeypatch):
     assert not ae.should_skip_for_input_method()
 
 
+def _install_ime_control_stub(monkeypatch, conv_mode, open_status,
+                              ime_wnd=4321):
+    """[v7] 模擬「跨行程 WM_IME_CONTROL 查 IME」路徑:設定 ImmGetDefaultIMEWnd 與
+    _send_message_timeout(回 conversion mode / open status)。回傳記錄送出的查詢。"""
+    class FakeImm32:
+        @staticmethod
+        def ImmGetDefaultIMEWnd(_hwnd):
+            return ime_wnd
+
+    monkeypatch.setattr(ae, "_ensure_imm_configured", lambda: None)
+    monkeypatch.setattr(ae, "_get_focused_window_handle", lambda: 200)
+
+    class FakeWindll:
+        imm32 = FakeImm32()
+    monkeypatch.setattr(ae.ctypes, "windll", FakeWindll())
+
+    sent = []
+
+    def fake_send(hwnd, message, wparam=0, lparam=0, timeout_ms=80):
+        sent.append((hwnd, message, wparam))
+        if message == ae._WM_IME_CONTROL and wparam == ae._IMC_GETCONVERSIONMODE:
+            return True, conv_mode
+        if message == ae._WM_IME_CONTROL and wparam == ae._IMC_GETOPENSTATUS:
+            return True, open_status
+        return False, 0
+
+    monkeypatch.setattr(ae, "_send_message_timeout", fake_send)
+    return sent
+
+
+def test_ime_control_chinese_mode_skips(monkeypatch):
+    """跨行程查到「IME 開啟 + NATIVE 中文模式」→ 跳過展開(就是這次要修的情境)。"""
+    _install_ime_control_stub(
+        monkeypatch, conv_mode=ae._IME_CMODE_NATIVE, open_status=1)
+    assert ae.should_skip_for_input_method() is True
+
+
+def test_ime_control_english_mode_allows(monkeypatch):
+    """IME 開啟但英文模式(NATIVE off)→ 允許展開。"""
+    _install_ime_control_stub(monkeypatch, conv_mode=0, open_status=1)
+    assert ae.should_skip_for_input_method() is False
+
+
+def test_ime_control_closed_allows(monkeypatch):
+    """IME 關閉(直接英數)即使 conversion 殘留 NATIVE 也允許展開。"""
+    _install_ime_control_stub(
+        monkeypatch, conv_mode=ae._IME_CMODE_NATIVE, open_status=0)
+    assert ae.should_skip_for_input_method() is False
+
+
 def test_ime_detection_falls_back_to_foreground_context(monkeypatch):
     seen_handles = []
 

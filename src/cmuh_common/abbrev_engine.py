@@ -442,6 +442,15 @@ def render_expansion(template: str, now: Optional[datetime] = None) -> str:
 _IME_CMODE_NATIVE = 0x0001    # 中文/日文/韓文模式（false = 英文模式）
 _GCS_COMPSTR = 0x0008         # composition string
 
+# [2026-06-15] 跨行程查 IME 狀態:對「別的程式」的視窗,ImmGetContext /
+# ImmGetConversionStatus 並不可靠(IME 輸入內容屬該行程)。本縮寫是全域功能,使用者
+# 多半在 HIS/Word 等「其他程式」打字 → 舊作法在那些程式偵測不到中文模式 → 縮寫在
+# 中文模式照樣展開。改向目標執行緒的 IME 視窗(ImmGetDefaultIMEWnd)送 WM_IME_CONTROL
+# 查「開關狀態 / 轉換模式」,此法可跨行程正確取得,是這次修「中文模式仍展開」的關鍵。
+_WM_IME_CONTROL = 0x0283
+_IMC_GETCONVERSIONMODE = 0x0001
+_IMC_GETOPENSTATUS = 0x0005
+
 _IMM_CONFIGURED = False
 _FOCUS_CONFIGURED = False
 
@@ -510,6 +519,8 @@ def _ensure_imm_configured() -> None:
         return
     try:
         imm = ctypes.windll.imm32
+        imm.ImmGetDefaultIMEWnd.argtypes = [wintypes.HWND]
+        imm.ImmGetDefaultIMEWnd.restype = wintypes.HWND
         imm.ImmGetContext.argtypes = [wintypes.HWND]
         imm.ImmGetContext.restype = wintypes.HANDLE
         imm.ImmReleaseContext.argtypes = [wintypes.HWND, wintypes.HANDLE]
@@ -551,6 +562,29 @@ def should_skip_for_input_method() -> bool:
         hwnd = _get_focused_window_handle()
         if not hwnd:
             return False
+
+        # [v7 2026-06-15] 先用「跨行程可靠」的 WM_IME_CONTROL 查目標執行緒 IME 視窗:
+        # 在 HIS/Word 等其他程式打字時,舊的 ImmGetContext 路徑讀不到中文模式 → 縮寫
+        # 照樣展開。此法向該行程的 IME 視窗發訊息問狀態,跨行程有效。
+        #   中文輸入 = IME 開啟(GETOPENSTATUS) 且 轉換模式為 NATIVE(GETCONVERSIONMODE)。
+        #   英文模式(NATIVE off)或 IME 關閉(直接英數)→ 允許展開。
+        # 任一查詢失敗(極舊 IME / 無 IME 視窗)才退回下方舊 ImmGetContext 路徑。
+        try:
+            ime_wnd = imm32.ImmGetDefaultIMEWnd(hwnd)
+            if ime_wnd:
+                ok_conv, conv_mode = _send_message_timeout(
+                    int(ime_wnd), _WM_IME_CONTROL, _IMC_GETCONVERSIONMODE, 0,
+                    timeout_ms=120)
+                ok_open, open_status = _send_message_timeout(
+                    int(ime_wnd), _WM_IME_CONTROL, _IMC_GETOPENSTATUS, 0,
+                    timeout_ms=120)
+                if ok_conv and ok_open:
+                    return bool(open_status) and bool(
+                        conv_mode & _IME_CMODE_NATIVE)
+        except Exception:
+            logging.debug("[abbrev] WM_IME_CONTROL 查詢失敗,改用舊路徑",
+                          exc_info=True)
+
         himc = imm32.ImmGetContext(hwnd)
         if not himc:
             # Some legacy controls expose the IME context only on the
