@@ -891,14 +891,16 @@ def _format_patient_roster_html(texts: list, label: str) -> str:
 
 def _consult_band(label: str, para: str, *, bg: str, border: str,
                   label_fg: str, text_fg: str, text_size: str,
-                  line_height: str) -> str:
-    """一段有底色的橫幅(左側細框 + 字距小標 + 內文),會診原因/病情摘要共用。"""
+                  line_height: str, text_cls: str = "") -> str:
+    """一段有底色的橫幅(左側細框 + 字距小標 + 內文),會診原因/病情摘要共用。
+    text_cls 讓手機 media query 放大內文字級/行高(長內文好讀)。"""
+    cls = f' class="{text_cls}"' if text_cls else ""
     return (
         f'<div style="background:{bg};border-left:3px solid {border};'
-        f'border-radius:0 6px 6px 0;padding:9px 13px;margin-bottom:9px;">'
+        f'border-radius:0 6px 6px 0;padding:10px 14px;margin-bottom:9px;">'
         f'<div style="font-size:10.5px;letter-spacing:1px;color:{label_fg};'
-        f'text-transform:uppercase;font-weight:600;margin-bottom:3px;">{label}</div>'
-        f'<div style="font-size:{text_size};color:{text_fg};'
+        f'text-transform:uppercase;font-weight:600;margin-bottom:4px;">{label}</div>'
+        f'<div{cls} style="font-size:{text_size};color:{text_fg};'
         f'line-height:{line_height};">{para}</div></div>')
 
 
@@ -921,13 +923,14 @@ def _format_extracted_entries_html(entries: list, labels: list | None = None) ->
                 bands.append(_consult_band(
                     "會診原因", para, bg=_MAIL_REASON_BG, border=_MAIL_ACCENT,
                     label_fg=_MAIL_ACCENT, text_fg=_MAIL_REASON_FG,
-                    text_size="14px", line_height="1.5"))
+                    text_size="14px", line_height="1.55", text_cls="cq-read"))
             else:
+                # 病情摘要常很長 → 基礎字級拉到 14px/行高 1.8,手機再經 .cq-read 放大
                 bands.append(_consult_band(
                     _esc(disp), para, bg=_MAIL_SUMMARY_BG,
                     border=_MAIL_SUMMARY_BD, label_fg=_MAIL_SUMMARY_BD,
-                    text_fg=_MAIL_SUMMARY_FG, text_size="13.5px",
-                    line_height="1.75"))
+                    text_fg=_MAIL_SUMMARY_FG, text_size="14px",
+                    line_height="1.8", text_cls="cq-read"))
         sep = ("" if pos == len(rich) - 1
                else f"border-bottom:1px solid {_MAIL_HAIR};padding-bottom:22px;")
         blocks.append(
@@ -960,30 +963,50 @@ def _fmt_mail_datetime(date_str, time_str) -> str:
 
 def _build_consult_email_html(date_str: str, time_str: str, intro: str,
                               content_html: str) -> str:
-    """組整封 HTML 信(信箋式:頂端細強調線 + letterhead 標題 + 髮絲線分隔 +
-    留白)。content_html 可空(擷取失敗仍是乾淨的標題+前言+頁尾)。"""
+    """組整封 HTML 信(信箋式 + 響應式手機版)。content_html 可空(擷取失敗仍是
+    乾淨的標題+前言+頁尾)。
+
+    手機可讀性:完整 HTML 文件帶 viewport=device-width → iPhone 等不再用桌面寬度
+    縮放整封信導致字超小;@media(≤600px)讓卡片滿版、縮左右留白、放大內文字級與
+    行高(.cq-read)。支援 <style> 的客戶端(iOS Mail/Apple Mail)會套用;不支援的
+    (部分 Gmail)則退回 inline 基礎樣式,內文基礎字級也已拉到 14px,仍可讀。"""
     dt = _fmt_mail_datetime(date_str, time_str)
+    style = (
+        "<style>@media only screen and (max-width:600px){"
+        ".cq-bg{padding:0!important;}"
+        ".cq-card{border-radius:0!important;border-left:0!important;"
+        "border-right:0!important;}"
+        ".cq-pad{padding-left:18px!important;padding-right:18px!important;}"
+        ".cq-hr{margin-left:18px!important;margin-right:18px!important;}"
+        ".cq-read{font-size:15px!important;line-height:1.85!important;}"
+        "}</style>")
     return (
-        '<div style="background:#f5f6f8;padding:22px;font-family:-apple-system,'
+        '<!DOCTYPE html><html lang="zh-Hant"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        + style + '</head><body style="margin:0;padding:0;background:#f5f6f8;">'
+        '<div class="cq-bg" style="padding:22px;font-family:-apple-system,'
         "'Segoe UI','PingFang TC','Microsoft JhengHei',Roboto,sans-serif;\">"
-        '<div style="max-width:600px;margin:0 auto;background:#fff;'
+        '<div class="cq-card" style="max-width:600px;margin:0 auto;background:#fff;'
         'border:1px solid #ecedf0;border-radius:12px;overflow:hidden;">'
         f'<div style="height:3px;background:{_MAIL_ACCENT};"></div>'
-        '<div style="padding:30px 34px 0;">'
+        '<div class="cq-pad" style="padding:30px 34px 0;">'
         f'<div style="font-size:11px;letter-spacing:2px;color:{_MAIL_MUTED};'
         'text-transform:uppercase;">皮膚科會診系統</div>'
         f'<div style="font-size:21px;font-weight:600;color:{_MAIL_INK};'
         'margin-top:7px;">會診通知單</div>'
         f'<div style="font-size:13px;color:{_MAIL_MUTED};margin-top:5px;">'
         f'{_esc(dt)}　·　系統自動擷取</div></div>'
-        f'<div style="height:1px;background:{_MAIL_HAIR};margin:22px 34px;"></div>'
-        f'<div style="padding:0 34px;font-size:13px;line-height:1.7;'
-        f'color:#6b7280;">{_esc(intro)}</div>'
-        f'<div style="padding:0 34px;">{content_html}</div>'
-        f'<div style="height:1px;background:{_MAIL_HAIR};margin:28px 34px 0;"></div>'
-        f'<div style="padding:16px 34px 30px;font-size:11.5px;line-height:1.6;'
-        f'color:{_MAIL_FAINT};">本信由中國醫皮膚科系統自動擷取寄送　·　內容僅供'
-        '輔助閱讀,正式內容以附件截圖為準</div></div></div>')
+        f'<div class="cq-hr" style="height:1px;background:{_MAIL_HAIR};'
+        'margin:22px 34px;"></div>'
+        '<div class="cq-pad" style="padding:0 34px;font-size:13px;'
+        f'line-height:1.7;color:#6b7280;">{_esc(intro)}</div>'
+        f'<div class="cq-pad" style="padding:0 34px;">{content_html}</div>'
+        f'<div class="cq-hr" style="height:1px;background:{_MAIL_HAIR};'
+        'margin:28px 34px 0;"></div>'
+        '<div class="cq-pad" style="padding:16px 34px 30px;font-size:11.5px;'
+        f'line-height:1.6;color:{_MAIL_FAINT};">本信由中國醫皮膚科系統自動擷取'
+        '寄送　·　內容僅供輔助閱讀,正式內容以附件截圖為準</div>'
+        '</div></div></body></html>')
 
 
 def _format_extracted_entries(entries: list, labels: list | None = None) -> str:

@@ -519,6 +519,9 @@ def test_build_consult_email_html():
     assert "intro &lt;line&gt;" in out   # intro 也 escape
     assert "<p>x</p>" in out             # content 是我們產生的安全 HTML,原樣嵌入
     assert "正式內容以附件" in out        # footer
+    # 手機可讀性:viewport + media query(響應式)
+    assert 'name="viewport"' in out and "width=device-width" in out
+    assert "@media only screen and (max-width:600px)" in out
 
 
 def test_format_extracted_entries_with_named_labels():
