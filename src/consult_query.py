@@ -775,10 +775,22 @@ def _format_patient_roster(texts: list, label: str = "今日會診病人") -> st
 # 信件美化(HTML)— 與純文字版並存(multipart/alternative)。所有 HTML 用 inline
 # style + table 排版(email client 不吃 <style>/CSS 變數),文字一律 escape。
 # =============================================================================
-_MAIL_ACCENT = "#0f766e"       # 主色:醫療綠
-_MAIL_ACCENT_DK = "#0f5a52"
-_MAIL_TINT = "#e8f4f1"         # 會診原因 highlight 底
-_MAIL_BORDER = "#e6e9ee"
+# 高質感色板:單一強調色 + 中性灰階 + 大量留白 + 髮絲線。會診原因(綠)/病情摘要
+# (靛)兩色底橫幅清楚區分、好閱讀。
+_MAIL_ACCENT = "#0f766e"       # 主強調:醫療綠
+_MAIL_INK = "#1a2230"          # 主要文字
+_MAIL_BODY = "#39434f"         # 內文
+_MAIL_SUB = "#5b6470"          # 次要(表格欄位)
+_MAIL_MUTED = "#8a9099"        # 灰標
+_MAIL_FAINT = "#a3a8b0"        # 更淡(欄位小標/頁尾)
+_MAIL_HAIR = "#eef0f3"         # 區段髮絲線
+_MAIL_ROW = "#f2f3f5"          # 表格列線
+_MAIL_HEAD = "#e9ebee"         # 表頭線
+_MAIL_REASON_BG = "#e9f4f0"    # 會診原因底(綠)
+_MAIL_REASON_FG = "#134b40"
+_MAIL_SUMMARY_BD = "#3f5d7a"   # 病情摘要(靛)框線/標籤
+_MAIL_SUMMARY_BG = "#eef2f8"   # 病情摘要底
+_MAIL_SUMMARY_FG = "#39434f"
 
 # 病人列結構解析(best-effort):'莊振銘B7(163)0029588049(沈冠宇)06/15(08:20)'
 # → 姓名 / 病房 / 床號 / 病歷號 / 主治 / 時間。解析不到(如外籍病人無中文姓名)
@@ -822,7 +834,7 @@ def _parse_roster_row(text: str):
     ward = m.group("ward") or ""
     if not chart and not bed:
         return None  # 只認到姓名、無病歷號/床號 → 寧可顯示原字串避免遺漏資訊
-    ward_bed = " ".join(p for p in (ward, f"({bed})" if bed else "") if p)
+    ward_bed = " · ".join(p for p in (ward, bed) if p)
     return {"name": m.group("name"), "ward_bed": ward_bed, "chart": chart,
             "vs": m.group("vs") or "", "time": m.group("time") or ""}
 
@@ -831,107 +843,147 @@ def _esc(s) -> str:
     return _html.escape(str(s or ""))
 
 
+def _section_label(text: str, top: int = 26) -> str:
+    """小節標籤:字距微調的小寫強調色標題(信箋式)。"""
+    return (f'<div style="font-size:11px;letter-spacing:1.5px;'
+            f'color:{_MAIL_ACCENT};text-transform:uppercase;'
+            f'margin:{top}px 0 14px;">{_esc(text)}</div>')
+
+
 def _format_patient_roster_html(texts: list, label: str) -> str:
-    """病人清單 → HTML 表格。解析得到欄位就分欄;失敗整列顯示原字串。空回空字串。"""
+    """病人清單 → HTML 表格(髮絲線、字距小標、數字對齊)。解析得到欄位就分欄;
+    失敗整列顯示原字串。空回空字串。"""
     items = [t.strip() for t in texts if t and t.strip()]
     if not items:
         return ""
-    th = (f'padding:6px 8px;border-bottom:1px solid #dfe3e8;'
-          f'color:{_MAIL_ACCENT_DK};text-align:left;')
-    td = "padding:6px 8px;border-bottom:1px solid #eef0f3;"
+    th = (f"padding:0 0 8px;border-bottom:1px solid {_MAIL_HEAD};font-size:10.5px;"
+          f"letter-spacing:.8px;color:{_MAIL_FAINT};text-transform:uppercase;"
+          "text-align:left;")
+    th_r = th + "text-align:right;"
     rows = [
-        f'<tr style="background:#eef5f4;font-size:12.5px;">'
-        f'<td style="{th}">#</td><td style="{th}">姓名</td>'
-        f'<td style="{th}">病房/床</td><td style="{th}">病歷號</td>'
-        f'<td style="{th}">主治</td><td style="{th}">時間</td></tr>']
+        f'<tr><td style="{th}">姓名</td><td style="{th}">病房 / 床</td>'
+        f'<td style="{th}">病歷號</td><td style="{th}">主治</td>'
+        f'<td style="{th_r}">時間</td></tr>']
+    last = len(items)
     for i, t in enumerate(items, 1):
-        bg = "background:#fafbfc;" if i % 2 == 0 else ""
+        line = "" if i == last else f"border-bottom:1px solid {_MAIL_ROW};"
+        td = f"padding:11px 0;{line}font-size:13px;color:{_MAIL_SUB};"
+        td_num = td + "font-variant-numeric:tabular-nums;"
+        td_r = td_num + "text-align:right;"
         p = _parse_roster_row(t)
         if p:
             rows.append(
-                f'<tr style="{bg}font-size:12.5px;">'
-                f'<td style="{td}color:#9aa1ab;">{i}</td>'
-                f'<td style="{td}font-weight:600;color:#1f2937;">{_esc(p["name"])}</td>'
-                f'<td style="{td}color:#3f4753;">{_esc(p["ward_bed"])}</td>'
-                f'<td style="{td}color:#3f4753;">{_esc(p["chart"])}</td>'
-                f'<td style="{td}color:#3f4753;">{_esc(p["vs"])}</td>'
-                f'<td style="{td}color:#3f4753;">{_esc(p["time"])}</td></tr>')
+                f'<tr><td style="{td}color:{_MAIL_INK};font-weight:500;">'
+                f'{_esc(p["name"])}</td>'
+                f'<td style="{td}">{_esc(p["ward_bed"])}</td>'
+                f'<td style="{td_num}">{_esc(p["chart"])}</td>'
+                f'<td style="{td}">{_esc(p["vs"])}</td>'
+                f'<td style="{td_r}">{_esc(p["time"])}</td></tr>')
         else:
             rows.append(
-                f'<tr style="{bg}font-size:12.5px;">'
-                f'<td style="{td}color:#9aa1ab;">{i}</td>'
-                f'<td style="{td}color:#1f2937;" colspan="5">{_esc(t)}</td></tr>')
-    n = len(items)
+                f'<tr><td style="{td}color:{_MAIL_INK};" colspan="5">'
+                f'{_esc(t)}</td></tr>')
     return (
-        f'<div style="font-size:14px;font-weight:600;color:{_MAIL_ACCENT};'
-        f'border-left:3px solid {_MAIL_ACCENT};padding-left:8px;margin:14px 0 8px;">'
-        f'{_esc(label)}　{n} 位</div>'
-        f'<table style="width:100%;border-collapse:collapse;">'
+        _section_label(f"{label}　·　{len(items)} 位")
+        + '<table style="width:100%;border-collapse:collapse;">'
         + "".join(rows) + "</table>")
 
 
+def _consult_band(label: str, para: str, *, bg: str, border: str,
+                  label_fg: str, text_fg: str, text_size: str,
+                  line_height: str) -> str:
+    """一段有底色的橫幅(左側細框 + 字距小標 + 內文),會診原因/病情摘要共用。"""
+    return (
+        f'<div style="background:{bg};border-left:3px solid {border};'
+        f'border-radius:0 6px 6px 0;padding:9px 13px;margin-bottom:9px;">'
+        f'<div style="font-size:10.5px;letter-spacing:1px;color:{label_fg};'
+        f'text-transform:uppercase;font-weight:600;margin-bottom:3px;">{label}</div>'
+        f'<div style="font-size:{text_size};color:{text_fg};'
+        f'line-height:{line_height};">{para}</div></div>')
+
+
 def _format_extracted_entries_html(entries: list, labels: list | None = None) -> str:
-    """逐病人擷取內容 → HTML 卡片(會診原因 highlight + 病情摘要段落)。空回空字串。"""
+    """逐病人擷取內容 → 文件式區塊:姓名(細直線)+ 會診原因(綠橫幅)+ 病情摘要
+    (靛橫幅),病人間以髮絲線分隔。空回空字串。"""
+    rich = [(i, panes) for i, panes in enumerate(entries, 1)
+            if any((txt or "").strip() for _l, txt in panes)]
     blocks = []
-    for i, panes in enumerate(entries, 1):
+    for pos, (i, panes) in enumerate(rich):
         texts = [(lab, (txt or "").strip()) for lab, txt in panes]
         texts = [(lab, txt) for lab, txt in texts if txt]
-        if not texts:
-            continue
         head = (labels[i - 1] if labels and i - 1 < len(labels)
                 and labels[i - 1] else f"病人 {i}")
-        inner = []
+        bands = []
         for lab, txt in texts:
             disp = _PANE_LABEL_MAP.get(lab, lab)
             para = _esc(txt).replace("\n", "<br>")
             if disp == "會診原因":
-                inner.append(
-                    f'<div style="background:{_MAIL_TINT};border-radius:6px;'
-                    f'padding:7px 10px;margin-bottom:8px;">'
-                    f'<span style="display:inline-block;background:{_MAIL_ACCENT};'
-                    f'color:#fff;font-size:11px;padding:1px 7px;border-radius:4px;'
-                    f'margin-right:6px;">會診原因</span>'
-                    f'<span style="color:#1f3d39;font-size:13px;">{para}</span></div>')
+                bands.append(_consult_band(
+                    "會診原因", para, bg=_MAIL_REASON_BG, border=_MAIL_ACCENT,
+                    label_fg=_MAIL_ACCENT, text_fg=_MAIL_REASON_FG,
+                    text_size="14px", line_height="1.5"))
             else:
-                inner.append(
-                    f'<div style="font-size:11px;color:#8a9099;font-weight:600;'
-                    f'margin-bottom:3px;">{_esc(disp)}</div>'
-                    f'<div style="color:#36404c;font-size:12.5px;line-height:1.65;'
-                    f'margin-bottom:8px;">{para}</div>')
+                bands.append(_consult_band(
+                    _esc(disp), para, bg=_MAIL_SUMMARY_BG,
+                    border=_MAIL_SUMMARY_BD, label_fg=_MAIL_SUMMARY_BD,
+                    text_fg=_MAIL_SUMMARY_FG, text_size="13.5px",
+                    line_height="1.75"))
+        sep = ("" if pos == len(rich) - 1
+               else f"border-bottom:1px solid {_MAIL_HAIR};padding-bottom:22px;")
         blocks.append(
-            f'<div style="border:1px solid {_MAIL_BORDER};border-radius:8px;'
-            f'margin-bottom:12px;overflow:hidden;">'
-            f'<div style="background:#f4f7f6;padding:8px 12px;font-weight:600;'
-            f'color:{_MAIL_ACCENT_DK};font-size:13.5px;'
-            f'border-bottom:1px solid {_MAIL_BORDER};">{_esc(head)}</div>'
-            f'<div style="padding:10px 12px;">' + "".join(inner) + '</div></div>')
+            f'<div style="margin-bottom:22px;{sep}">'
+            f'<div style="font-size:15px;font-weight:600;color:{_MAIL_INK};'
+            f'border-left:2px solid {_MAIL_ACCENT};padding-left:11px;'
+            f'margin-bottom:11px;">{_esc(head)}</div>'
+            + "".join(bands) + "</div>")
     if not blocks:
         return ""
-    return (
-        f'<div style="font-size:14px;font-weight:600;color:{_MAIL_ACCENT};'
-        f'border-left:3px solid {_MAIL_ACCENT};padding-left:8px;margin:16px 0 10px;">'
-        f'會診內容（擷取文字,請以截圖為準）</div>' + "".join(blocks))
+    return _section_label("會診內容", top=30) + "".join(blocks)
+
+
+def _fmt_mail_datetime(date_str, time_str) -> str:
+    """'2026/6/15','1230' → '2026 年 6 月 15 日　12:30'。解析失敗回原樣串接。
+    [codex review] 先把輸入強制轉字串:None/數字等非預期型別不可在送信路徑拋例外。"""
+    date_str = str(date_str or "")
+    time_str = str(time_str or "")
+    d = date_str
+    try:
+        y, m, day = date_str.split("/")
+        d = f"{y} 年 {int(m)} 月 {int(day)} 日"
+    except Exception:
+        pass
+    t = time_str
+    if len(time_str) == 4 and time_str.isdigit():
+        t = f"{time_str[:2]}:{time_str[2:]}"
+    return f"{d}　{t}".strip()
 
 
 def _build_consult_email_html(date_str: str, time_str: str, intro: str,
                               content_html: str) -> str:
-    """組整封 HTML 信:標題列 + 前言 + 清單/內容 + 頁尾。content_html 可空。"""
+    """組整封 HTML 信(信箋式:頂端細強調線 + letterhead 標題 + 髮絲線分隔 +
+    留白)。content_html 可空(擷取失敗仍是乾淨的標題+前言+頁尾)。"""
+    dt = _fmt_mail_datetime(date_str, time_str)
     return (
-        '<div style="background:#eceff2;padding:18px;'
-        "font-family:-apple-system,'Segoe UI','Microsoft JhengHei',sans-serif;\">"
+        '<div style="background:#f5f6f8;padding:22px;font-family:-apple-system,'
+        "'Segoe UI','PingFang TC','Microsoft JhengHei',Roboto,sans-serif;\">"
         '<div style="max-width:600px;margin:0 auto;background:#fff;'
-        f'border:1px solid #e2e5ea;border-radius:10px;overflow:hidden;">'
-        f'<div style="background:{_MAIL_ACCENT};padding:18px 22px;">'
-        '<div style="color:#fff;font-size:18px;font-weight:600;">皮膚科會診通知單</div>'
-        f'<div style="color:#bfe3dc;font-size:13px;margin-top:3px;">'
-        f'{_esc(date_str)}　{_esc(time_str)}　系統自動擷取寄送</div></div>'
-        f'<div style="padding:16px 22px;color:#5b6470;font-size:13px;'
-        f'line-height:1.6;">{_esc(intro)}</div>'
-        f'<div style="padding:0 22px 4px;">{content_html}</div>'
-        '<div style="padding:8px 22px 18px;"><div style="border-top:1px solid '
-        '#eceef1;padding-top:10px;color:#9aa1ab;font-size:11.5px;line-height:1.5;">'
-        '本信由中國醫皮膚科系統自動擷取寄送,擷取文字僅供輔助閱讀,正式內容以附件'
-        '截圖為準。</div></div></div></div>')
+        'border:1px solid #ecedf0;border-radius:12px;overflow:hidden;">'
+        f'<div style="height:3px;background:{_MAIL_ACCENT};"></div>'
+        '<div style="padding:30px 34px 0;">'
+        f'<div style="font-size:11px;letter-spacing:2px;color:{_MAIL_MUTED};'
+        'text-transform:uppercase;">皮膚科會診系統</div>'
+        f'<div style="font-size:21px;font-weight:600;color:{_MAIL_INK};'
+        'margin-top:7px;">會診通知單</div>'
+        f'<div style="font-size:13px;color:{_MAIL_MUTED};margin-top:5px;">'
+        f'{_esc(dt)}　·　系統自動擷取</div></div>'
+        f'<div style="height:1px;background:{_MAIL_HAIR};margin:22px 34px;"></div>'
+        f'<div style="padding:0 34px;font-size:13px;line-height:1.7;'
+        f'color:#6b7280;">{_esc(intro)}</div>'
+        f'<div style="padding:0 34px;">{content_html}</div>'
+        f'<div style="height:1px;background:{_MAIL_HAIR};margin:28px 34px 0;"></div>'
+        f'<div style="padding:16px 34px 30px;font-size:11.5px;line-height:1.6;'
+        f'color:{_MAIL_FAINT};">本信由中國醫皮膚科系統自動擷取寄送　·　內容僅供'
+        '輔助閱讀,正式內容以附件截圖為準</div></div></div>')
 
 
 def _format_extracted_entries(entries: list, labels: list | None = None) -> str:

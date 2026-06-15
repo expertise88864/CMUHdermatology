@@ -454,7 +454,7 @@ def test_consult_slot_label():
 def test_parse_roster_row_structured():
     p = cq._parse_roster_row("莊振銘B7(163)0029588049(沈冠宇)06/15(08:20)")
     assert p["name"] == "莊振銘"
-    assert p["ward_bed"] == "B7 (163)"
+    assert p["ward_bed"] == "B7 · 163"
     assert p["chart"] == "0029588049"
     assert p["vs"] == "沈冠宇"
     assert p["time"] == "08:20"
@@ -502,11 +502,20 @@ def test_format_extracted_entries_html_escapes_and_empty():
     assert cq._format_extracted_entries_html([[("內容1", "")]]) == ""
 
 
+def test_fmt_mail_datetime():
+    assert cq._fmt_mail_datetime("2026/6/15", "1230") == "2026 年 6 月 15 日　12:30"
+    # 解析失敗(非預期格式)→ 原樣串接,不丟例外
+    assert "weird" in cq._fmt_mail_datetime("weird", "nope")
+    # [codex review] None/數字等非預期型別不可拋例外(在送信路徑)
+    assert cq._fmt_mail_datetime(None, None) == ""
+    assert "17:30" in cq._fmt_mail_datetime(20260615, 1730)   # 1730 → 17:30
+
+
 def test_build_consult_email_html():
     out = cq._build_consult_email_html("2026/6/15", "1230", "intro <line>",
                                        "<p>x</p>")
-    assert "皮膚科會診通知單" in out
-    assert "2026/6/15" in out and "1230" in out
+    assert "會診通知單" in out and "皮膚科會診系統" in out   # letterhead
+    assert "2026 年 6 月 15 日" in out and "12:30" in out   # 日期/時間美化
     assert "intro &lt;line&gt;" in out   # intro 也 escape
     assert "<p>x</p>" in out             # content 是我們產生的安全 HTML,原樣嵌入
     assert "正式內容以附件" in out        # footer
