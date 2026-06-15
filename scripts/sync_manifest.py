@@ -85,6 +85,10 @@ def collect_entries(version: str) -> list:
         "安裝Python.bat",
         "deploy/installer.bat",
         "scripts/verify_dependencies.py",
+        # 手動更新腳本本身也要納入線上更新 —— 否則卡在舊版/壞掉的 pull_update.bat
+        # 的電腦永遠收不到修正(catch-22),手動 git pull 也一直失敗。純文字 .bat,
+        # updater 走 text 路徑可處理(同 安裝Python.bat / installer.bat)。
+        "pull_update.bat",
         # 設定/資源檔
         "hotkey_overrides.json",
         "requirements.txt",

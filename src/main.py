@@ -7566,7 +7566,7 @@ class AutomationApp:
         web_buttons_row2 = [
             ("值班查詢", "https://forward01.cmuh.org.tw/peoplesystem/Duty/DutyQuery.aspx"),
             ("院內分機查詢", "https://forward01.cmuh.org.tw/MIS/TelQuery/TelQueryQNew.aspx"),
-            ("病理看片", "https://dsr.cmuh.org.tw/view/v2/LApi.Case/202526251"),
+            ("病理看片", "https://dsr.cmuh.org.tw/view/v2/LApi.Case/202630242"),
             ("Google", "https://www.google.com"),
         ]
         
@@ -10800,7 +10800,22 @@ class AutomationApp:
                                                             else:
                                                                 diff_text = f"距離門檻差 {-diff} 人"
                                                             level_prefix = "【第一次提醒】" if notify_level == 1 else "【第二次加強提醒】"
-                                                            msg = f"{level_prefix}\n{doc_name} {session_name}診\n掛號人數 {count} 人\n設定閾值 {full_threshold} 人\n{diff_text}"
+                                                            # 詳細通知(toast 與 email 共用):年/月/日(週X)、早上/下午/晚上、
+                                                            # 醫師、診間(例 101/102/103)、目前人數。依需求不寫預設/止掛門檻人數。
+                                                            _sess_label = {"上午": "早上"}.get(session_name, session_name)
+                                                            _wd = "一二三四五六日"[current_date.weekday()]
+                                                            _date_str = (f"{current_date.year}/{current_date.month}/"
+                                                                         f"{current_date.day}(週{_wd})")
+                                                            _branch_suffix = (_EXT_BRANCH_DISPLAY_SUFFIX.get(ext_branch, "")
+                                                                              if ext_branch else "")
+                                                            # _RE_ROOM 擷取的 room 已含「診」(如 101診);僅缺時才補,避免「101診診」。
+                                                            _room_label = ((room if "診" in room else f"{room}診")
+                                                                           if room else "(診間未提供)")
+                                                            _where = f"{doc_name}醫師 {_room_label}{_branch_suffix}"
+                                                            msg = (f"{level_prefix}\n"
+                                                                   f"{_date_str} {_sess_label}\n"
+                                                                   f"{_where}\n"
+                                                                   f"目前掛號 {count} 人")
                                                             # DND 邏輯改動 (2026-05-18)：
                                                             # 原本 DND 時直接 continue → toast 跟 email 都被擋掉，導致使用者
                                                             # 醒來完全不知道半夜門檻爆掉。改成：DND 只抑制 toast (避免半夜
@@ -10810,9 +10825,14 @@ class AutomationApp:
                                                                 self._dnd_suppressed_count += 1
                                                                 self.status_text.set(f"狀態: 勿擾時段，僅寄 email（{doc_name}{session_name}，{diff_text}）")
                                                                 logging.info(f"[ALERT DND] toast 抑制但 email 仍寄 {doc_name} {session_name} count={count} threshold={full_threshold} {diff_text}")
-                                                            def _notify_worker(nk=notify_key, m=msg, dn=doc_name, sn=session_name,
-                                                                                fth=full_threshold, cnt=count, lvl=notify_level,
-                                                                                dnd=is_dnd):
+                                                            _dnd_tag = "【夜間勿擾】" if is_dnd else ""
+                                                            # 主旨同樣帶日期/時段/診間/醫師/目前人數,不寫門檻人數
+                                                            alert_subject = (
+                                                                f"【止掛提醒】{_dnd_tag}{_date_str} {_sess_label} "
+                                                                f"{_where} 目前 {count} 人")
+                                                            def _notify_worker(nk=notify_key, m=msg,
+                                                                                subj=alert_subject,
+                                                                                lvl=notify_level, dnd=is_dnd):
                                                                 try:
                                                                     # toast 只在非 DND 時跳
                                                                     if not dnd:
@@ -10823,11 +10843,6 @@ class AutomationApp:
                                                                         rcpts = list(self.alert_email_recipients)
                                                                         if rcpts:
                                                                             try:
-                                                                                today = date.today()
-                                                                                dnd_tag = "【夜間勿擾】" if dnd else ""
-                                                                                subj = (f"【止掛提醒】{dnd_tag}{dn} {sn}診 "
-                                                                                        f"({today.year}/{today.month}/{today.day}) "
-                                                                                        f"已達 {cnt}/{fth}")
                                                                                 _send_alert_email_via_smtp(
                                                                                     subj, m, rcpts)
                                                                             except Exception:
