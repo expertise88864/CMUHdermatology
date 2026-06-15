@@ -47,6 +47,7 @@ ensure_dependencies(REQUIRED_LIBS)
 import ctypes  # noqa: E402
 import logging  # noqa: E402
 import queue  # noqa: E402
+import re  # noqa: E402
 import subprocess  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
@@ -172,15 +173,16 @@ DEFAULT_CONFIG = {
     # 觸發信不回放(標已讀清掉、不觸發)，避免把幾天前的請求當現在處理。0=不過濾。
     # 解析不出信件時間時 fail-open 照常觸發(寧可多觸發、不可漏會診請求)。
     "email_trigger_max_age_hours": 6,
-    # [新功能 2026-06-13] 會診單內容文字擷取：截圖後依序背景點選清單病人列、
-    # 以 WM_GETTEXT 讀取下方「會診事項/病情摘要」文字控制項，附進信件內文
-    # (截圖照常為主，文字僅輔助)。完全 fail-open：任何失敗只記 log、照常寄截圖。
-    # 點擊參數為 Delphi 清單格線的估計值，跑一次後可依 log 的控制項樹微調。
+    # [新功能 2026-06-13;2026-06-15 改用 TRadioButton] 會診單內容文字擷取:
+    # 病人清單 = 一顆顆 TRadioButton(文字含姓名+床號+病歷號),直接解析其文字
+    # 即得最準確的病人清單;再逐顆 BM_CLICK 選取、以 WM_GETTEXT 讀下方「會診
+    # 事項/病情摘要」文字控制項,一併附進信件(截圖照常為主)。完全 fail-open。
+    # 下列 extract_* 為「無 TRadioButton 時」的格線像素後備路徑參數(現環境用不到)。
     "extract_text_enabled": True,
-    "extract_max_rows": 12,        # 最多嘗試點選幾列(病人數上限)
-    "extract_first_row_y": 32,     # 第一列資料的 client Y(略過表頭)
-    "extract_row_height": 19,      # 每列高度(px)
-    "extract_click_x": 12,         # 點擊 X:病人姓名前的選取框欄
+    "extract_max_rows": 12,        # [後備] 最多嘗試點選幾列(病人數上限)
+    "extract_first_row_y": 32,     # [後備] 第一列資料的 client Y(略過表頭)
+    "extract_row_height": 19,      # [後備] 每列高度(px)
+    "extract_click_x": 12,         # [後備] 點擊 X:病人姓名前的選取框欄
 }
 
 MAX_RETRY_COUNT = 10
@@ -676,7 +678,8 @@ def _read_ctrl_text(hwnd: int, max_len: int = 8192) -> str:
     """WM_GETTEXT 讀控制項文字(SendMessageTimeout，目標忙線不阻塞)。"""
     try:
         buf = ctypes.create_unicode_buffer(max_len)
-        res = ctypes.c_ulong(0)
+        # lpdwResult 是 PDWORD_PTR(64 位元下 8 bytes);用 c_size_t 才不會寫越界。
+        res = ctypes.c_size_t(0)
         SMTO_ABORTIFHUNG = 0x0002
         ctypes.windll.user32.SendMessageTimeoutW(
             hwnd, win32con.WM_GETTEXT, max_len, buf,
@@ -708,16 +711,79 @@ def _find_text_panes(children: list, min_height: int = 40) -> list:
     return panes
 
 
-def _format_extracted_entries(entries: list) -> str:
+# [2026-06-15 consult-extract 結構修正] 實機 dump(consult_query.log)證實:會診
+# 清單的每位病人是一顆 **TRadioButton**(文字如 '莊振銘B7(163)002958' =
+# 姓名+床號+房號+病歷號),裝在 TPageControl→TTabSheet 內;清單**不是 Delphi
+# 格線**。舊版只找 class 含 "grid" 的控制項 → 永遠找不到 → 整個逐列點選迴圈
+# 被跳過,實測「0 位病人」。故改為直接從 TRadioButton 文字解析病人清單(免
+# OCR/截圖猜/像素點選),要逐病人內文則 BM_CLICK 該 radio 再讀下方 memo。
+# CJK 範圍涵蓋 Ext A(㐀-䶿)、基本區(一-鿿)、相容表意文字、Ext B+(astral)
+# —— 罕用字姓名(如 𠮷)也不致被漏判或截斷。
+_CJK_CHARS = r"㐀-䶿一-鿿豈-﫿\U00020000-\U0002ffff"
+_NAME_RE = re.compile(f"[{_CJK_CHARS}·]+")
+# 病人列文字結構:含床號/房號 '(數字)' 或 >=4 碼病歷號。以「結構」判定而非「含
+# 中文」—— 否則外籍病人(羅馬拼音姓名、無中文)會被漏掉=漏會診通知,有安全疑慮。
+_PATIENT_LABEL_RE = re.compile(r"\(\d+\)|\d{4,}")
+_PATIENT_RADIO_CLASS = "TRadioButton"
+
+
+def _find_patient_radios(children: list) -> list:
+    """從控制項樹挑出病人列 → [(hwnd, text, rect)]。純函式以便測試。
+
+    病人 = class 精確為 TRadioButton(排除篩選選項 —— 那些是 TRadioGroup 內的
+    TGroupButton,class 不同)且文字帶病人標記結構(床號/房號/病歷號)。以結構
+    而非「含中文」判定,外籍病人(無中文姓名)也不會被漏掉。依文字去重(同列只
+    留一筆),再依畫面位置(上→下、左→右)排序 = 清單實際顯示順序。呼叫端會先以
+    「在會診視窗子樹中可見」過濾,排除非作用分頁的殘留 radio。"""
+    out = []
+    seen = set()
+    for hwnd, cls, txt, rect in children:
+        if cls != _PATIENT_RADIO_CLASS:
+            continue
+        t = (txt or "").strip()
+        if not t or not _PATIENT_LABEL_RE.search(t) or t in seen:
+            continue
+        seen.add(t)
+        out.append((hwnd, t, rect))
+    out.sort(key=lambda it: (it[2][1], it[2][0]))
+    return out
+
+
+def _patient_display_name(text: str) -> str:
+    """取病人顯示簡名:開頭連續中文(含·)= 姓名。取不到回前 8 字。
+    '莊振銘B7(163)002958' → '莊振銘'。純函式。"""
+    t = (text or "").strip()
+    m = _NAME_RE.match(t)
+    return m.group(0) if m else t[:8]
+
+
+def _format_patient_roster(texts: list) -> str:
+    """把病人 radio 文字組成「今日會診病人清單」。純函式;空回空字串。
+    這份清單直接來自 UI 控制項文字,最準確,與下方逐病人內文/截圖互為佐證。"""
+    items = [t.strip() for t in texts if t and t.strip()]
+    if not items:
+        return ""
+    lines = [f"今日會診病人({len(items)} 位):"]
+    for i, t in enumerate(items, 1):
+        lines.append(f"{i}. {t}")
+    return "\n".join(lines)
+
+
+def _format_extracted_entries(entries: list, labels: list | None = None) -> str:
     """把逐病人擷取結果組成信件附文。entries=[ [(label, text), ...], ... ]。
-    純函式以便測試;全空回空字串(信件就不附這段)。"""
+    labels(可選)為各病人的標題(對齊 entries 索引),用於以姓名標示;未提供時
+    退回「病人 N」。純函式以便測試;全空回空字串(信件就不附這段)。"""
     blocks = []
     for i, panes in enumerate(entries, 1):
         texts = [(label, (text or "").strip()) for label, text in panes]
         texts = [(label, text) for label, text in texts if text]
         if not texts:
             continue
-        lines = [f"【病人 {i}】"]
+        if labels and i - 1 < len(labels) and labels[i - 1]:
+            head = labels[i - 1]
+        else:
+            head = f"病人 {i}"
+        lines = [f"【{head}】"]
         for label, text in texts:
             lines.append(f"[{label}]")
             lines.append(text)
@@ -746,6 +812,69 @@ def _read_panes_snapshot(panes: list) -> list:
     return out
 
 
+def _is_visible_below(hwnd: int, top: int) -> bool:
+    """hwnd 在「top 以下的子樹」中是否可見:檢查 hwnd 及其各祖先(往上到 top 為
+    止、不含 top)是否都有 WS_VISIBLE。
+
+    刻意忽略 top 本身的可見性 —— SW_HIDE 後備模式會把整個會診視窗藏起(top 無
+    WS_VISIBLE),此時 IsWindowVisible 對每個子控制項都回 False、無法分辨分頁;
+    但非作用分頁的 TTabSheet 其 WS_VISIBLE 仍被 TPageControl 清掉(與 top 無關),
+    故只看「到 top 為止」的鏈即可在兩種模式下都正確排除非作用分頁的殘留 radio。
+    任何例外回 True(fail-open,寧可多列也不漏病人)。"""
+    try:
+        cur = hwnd
+        for _ in range(50):  # 防環/防失控的上限
+            if not cur or cur == top:
+                return True
+            style = win32gui.GetWindowLong(cur, win32con.GWL_STYLE)
+            if not (style & win32con.WS_VISIBLE):
+                return False
+            cur = win32gui.GetParent(cur)
+        return True
+    except Exception:
+        return True
+
+
+def _select_patient_radio(hwnd: int) -> bool:
+    """同步選取病人 radio:SendMessageTimeout(BM_CLICK) 會等控制項處理完點擊
+    (Delphi OnClick 已觸發、開始載入下方會診內文),不動真實滑鼠。回傳是否確實
+    送達 —— 未送達時呼叫端必須放棄逐病人內文擷取(否則面板仍是上一位的內容,
+    會被錯置到這位病人名下)。"""
+    try:
+        # lpdwResult 是 PDWORD_PTR(64 位元下 8 bytes);用 c_size_t 才不會寫越界。
+        res = ctypes.c_size_t(0)
+        SMTO_ABORTIFHUNG = 0x0002
+        ok = ctypes.windll.user32.SendMessageTimeoutW(
+            hwnd, win32con.BM_CLICK, 0, 0, SMTO_ABORTIFHUNG, 1500,
+            ctypes.byref(res))
+        return bool(ok)
+    except Exception:
+        logging.debug("BM_CLICK radio %s 失敗", hwnd, exc_info=True)
+        return False
+
+
+def _read_panes_after_change(panes: list, baseline_sig, timeout: float = 2.5,
+                             interval: float = 0.12) -> tuple:
+    """選病人後輪詢面板,等內容(1)變得跟「點選前的 baseline」不同 且(2)連兩
+    次讀取一致(已穩定)。回 (snap, ok):
+      ok=True  → 已「脫離 baseline 且穩定」,snap 可信為這位病人的內文。
+      ok=False → 逾時仍未達成(沒換/載入過慢/多面板分批未定),snap 不可信,
+                 呼叫端必須放棄逐病人內文(絕不把混合/殘留內容錯置到病人名下)。
+    要求「穩定」是因多面板分批載入時,單看「有變」可能讀到「新面板+另一面板殘留
+    舊值」的混合快照。"""
+    deadline = time.time() + timeout
+    snap = _read_panes_snapshot(panes)
+    prev_sig = None
+    while time.time() < deadline:
+        sig = tuple(t for _l, t in snap)
+        if sig != baseline_sig and sig == prev_sig:
+            return snap, True      # 已脫離 baseline 且穩定 → 可信
+        prev_sig = sig
+        time.sleep(interval)
+        snap = _read_panes_snapshot(panes)
+    return snap, False             # 逾時:未達「脫離+穩定」→ 不可信
+
+
 def _extract_consult_text(consult_hwnd: int, cfg: dict) -> str:
     """主入口:從會診視窗擷取逐病人文字。任何失敗回空字串(fail-open)。"""
     if not cfg.get("extract_text_enabled", True):
@@ -761,55 +890,102 @@ def _extract_consult_text(consult_hwnd: int, cfg: dict) -> str:
                 + (f" t={txt[:16]!r}" if txt else "")
                 for _h, cls, txt, r in children[:80]))
 
+        # 病人清單 = TRadioButton 文字(最準確,直接來自 UI,免 OCR/像素點選)。
+        # 以「在會診視窗子樹中可見」過濾,排除非作用分頁的殘留 radio。此判定不看
+        # 會診視窗本身是否被 SW_HIDE,故隱藏桌面/正常/後備三種模式皆正確 —— 作用
+        # 分頁真的沒病人時清單即為空,不會誤把其他分頁的隱藏 radio 當成今日病人。
+        radios = _find_patient_radios(
+            [c for c in children if _is_visible_below(c[0], consult_hwnd)])
+        roster = _format_patient_roster([t for _h, t, _r in radios])
+
         panes = _find_text_panes(children)
         if not panes:
+            # 抓不到文字面板:逐病人內文擷取不了,但準確的病人清單仍可寄出。
             logging.info("[consult-extract] 找不到文字面板(Memo/RichEdit)，"
-                         "本次只寄截圖;請把上行控制項樹回報以便調整篩選")
-            return ""
-
-        grid = next(
-            (h for h, cls, _t, _r in children if "grid" in (cls or "").lower()),
-            None)
-        grid_rect = next(
-            (r for h, _c, _t, r in children if h == grid), None)
+                         "本次只附病人清單+截圖;請把上行控制項樹回報以便調整")
+            return roster
 
         entries: list = []
-        seen_signatures: set = set()
+        labels: list = []
 
-        def _snap_and_collect() -> bool:
-            snap = _read_panes_snapshot(panes)
-            sig = tuple(t for _l, t in snap)
-            if any(t.strip() for t in sig) and sig not in seen_signatures:
-                seen_signatures.add(sig)
-                entries.append(snap)
-                return True
-            return False
-
-        # 目前選取列(開窗預設選第一列)先收一次
-        _snap_and_collect()
-
-        if grid is not None and grid_rect is not None:
-            max_rows = int(cfg.get("extract_max_rows", 12) or 12)
-            first_y = int(cfg.get("extract_first_row_y", 32) or 32)
-            row_h = int(cfg.get("extract_row_height", 19) or 19)
-            click_x = int(cfg.get("extract_click_x", 12) or 12)
-            grid_height = grid_rect[3] - grid_rect[1]
-            no_new = 0
-            for row in range(max_rows):
-                y = first_y + row * row_h
-                if y >= grid_height - 2:
+        if radios:
+            # ── 主路徑:逐顆病人 radio 同步選取 → 等內文更新 → 讀 memo ──
+            # 每位病人「點選前」先記 baseline。任一情況無法「確認面板已是這位病人
+            # 的內容」就放棄整批逐病人內文(只附準確的病人清單 roster,絕不把別人
+            # 的內容錯置到某病人名下):
+            #   (a) 選取未送達;或
+            #   (b) 第二位以後點選後內文仍未更新(載入過慢/被忽略 → 無法確認)。
+            # 第一位(idx 0)是開窗預設選取列,內容本就為其所屬,未更新屬正常、保留。
+            logging.info("[consult-extract] 偵測到 TRadioButton 病人清單(%d 位)",
+                         len(radios))
+            for idx, (hwnd, text, _rect) in enumerate(radios):
+                baseline = tuple(t for _l, t in _read_panes_snapshot(panes))
+                if not _select_patient_radio(hwnd):
+                    logging.info("[consult-extract] 選取病人 radio 未送達，"
+                                 "放棄逐病人內文擷取(病人清單仍照常附上)")
+                    entries, labels = [], []
                     break
-                _click_grid_point(grid, click_x, y)
-                time.sleep(0.35)  # 等 Delphi 把下方面板換成該病人內容
-                if _snap_and_collect():
-                    no_new = 0
+                if idx == 0:
+                    # 開窗預設選取列:內容本就為其所屬(開窗前已 sleep 等載入),
+                    # 直接讀,不必等「變化」(它不會變)。
+                    snap = _read_panes_snapshot(panes)
                 else:
-                    no_new += 1
-                    if no_new >= 2:  # 連兩列沒有新內容=已過最後一列
+                    snap, ok = _read_panes_after_change(panes, baseline)
+                    if not ok:
+                        # 內文未「脫離 baseline 且穩定」→ 無法確認面板已是這位病人
+                        # (沒換/載入過慢/多面板未定)→ 放棄逐病人內文(避免把上一位
+                        # 或混合內容錯置到這位名下);準確的病人清單仍照常附上。
+                        logging.info("[consult-extract] 第 %d 位內文未穩定更新，"
+                                     "無法確認對應病人，放棄逐病人內文(清單仍附上)",
+                                     idx + 1)
+                        entries, labels = [], []
                         break
-        text = _format_extracted_entries(entries)
-        logging.info("[consult-extract] 擷取完成:%d 位病人、%d 字",
-                     len(entries), len(text))
+                entries.append(snap)
+                labels.append(_patient_display_name(text))
+        else:
+            # ── 後備路徑:舊式 Delphi 格線像素逐列點選(現環境非格線,僅保險) ──
+            logging.info("[consult-extract] 無 TRadioButton 病人清單，"
+                         "退回格線逐列點選後備路徑")
+            seen_signatures: set = set()
+
+            def _snap_and_collect() -> bool:
+                snap = _read_panes_snapshot(panes)
+                sig = tuple(t for _l, t in snap)
+                if any(t.strip() for t in sig) and sig not in seen_signatures:
+                    seen_signatures.add(sig)
+                    entries.append(snap)
+                    return True
+                return False
+
+            _snap_and_collect()  # 開窗預設選取列先收一次
+            grid = next((h for h, cls, _t, _r in children
+                         if "grid" in (cls or "").lower()), None)
+            grid_rect = next(
+                (r for h, _c, _t, r in children if h == grid), None)
+            if grid is not None and grid_rect is not None:
+                max_rows = int(cfg.get("extract_max_rows", 12) or 12)
+                first_y = int(cfg.get("extract_first_row_y", 32) or 32)
+                row_h = int(cfg.get("extract_row_height", 19) or 19)
+                click_x = int(cfg.get("extract_click_x", 12) or 12)
+                grid_height = grid_rect[3] - grid_rect[1]
+                no_new = 0
+                for row in range(max_rows):
+                    y = first_y + row * row_h
+                    if y >= grid_height - 2:
+                        break
+                    _click_grid_point(grid, click_x, y)
+                    time.sleep(0.35)  # 等 Delphi 把下方面板換成該病人內容
+                    if _snap_and_collect():
+                        no_new = 0
+                    else:
+                        no_new += 1
+                        if no_new >= 2:  # 連兩列沒有新內容=已過最後一列
+                            break
+
+        body = _format_extracted_entries(entries, labels=labels or None)
+        text = "\n\n".join(part for part in (roster, body) if part)
+        logging.info("[consult-extract] 擷取完成:清單 %d 位、內文區塊 %d 字",
+                     len(radios) or len(entries), len(text))
         return text
     except Exception:
         logging.warning("[consult-extract] 擷取失敗(照常只寄截圖)", exc_info=True)

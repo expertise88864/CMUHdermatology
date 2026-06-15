@@ -379,6 +379,70 @@ def test_format_extracted_entries():
     assert cq._format_extracted_entries([[("內容1", "")]]) == ""
 
 
+# ─── [2026-06-15] 病人清單改用 TRadioButton 解析 ──────────────────────────
+
+def test_find_patient_radios_picks_radiobuttons_only_and_sorts():
+    """病人 = class 精確 TRadioButton 且文字帶病人結構(床號/房號/病歷號);
+    TGroupButton(篩選選項)、空字串、無結構字串一律排除;依上→下、左→右排序。"""
+    kids = [
+        (10, "TRadioButton", "莊振銘B7(163)002958", (9, 130, 661, 151)),
+        (11, "TGroupButton", "依醫師查詢", (263, 51, 424, 72)),   # 篩選選項 → 排除
+        (12, "TRadioButton", "", (9, 110, 661, 131)),             # 空 → 排除
+        (13, "TRadioButton", "全部", (9, 90, 661, 111)),          # 無病人結構 → 排除
+        (14, "TRadioButton", "王小明A3(101)001234", (9, 170, 661, 191)),
+        (15, "TRadioButton", "莊振銘B7(163)002958", (9, 130, 661, 151)),  # 同文字 → 去重
+    ]
+    radios = cq._find_patient_radios(kids)
+    assert [h for h, _t, _r in radios] == [10, 14]  # 去重後;130 在 170 之前
+    assert radios[0][1] == "莊振銘B7(163)002958"
+
+
+def test_find_patient_radios_includes_foreign_names():
+    """外籍病人(羅馬拼音、無中文)只要有床號/房號/病歷號結構也算病人,絕不可
+    漏掉(漏病人=漏會診通知)。無結構的雜訊 radio 仍排除。"""
+    kids = [
+        (30, "TRadioButton", "NGUYEN VANB5(210)004222", (0, 0, 600, 21)),
+        (31, "TRadioButton", "陳𠮷祥C2(205)003111", (0, 30, 600, 51)),  # Ext-B 姓名
+        (32, "TRadioButton", "Select", (0, 60, 600, 81)),  # 無結構 → 排除
+    ]
+    radios = cq._find_patient_radios(kids)
+    assert [t for _h, t, _r in radios] == [
+        "NGUYEN VANB5(210)004222", "陳𠮷祥C2(205)003111"]
+
+
+def test_patient_display_name_extracts_leading_cjk():
+    assert cq._patient_display_name("莊振銘B7(163)002958") == "莊振銘"
+    assert cq._patient_display_name("  王小明A3(101)  ") == "王小明"
+    assert cq._patient_display_name("ABC123") == "ABC123"[:8]
+    assert cq._patient_display_name("") == ""
+
+
+def test_format_patient_roster():
+    out = cq._format_patient_roster(
+        ["莊振銘B7(163)002958", "  ", "王小明A3(101)001234"])
+    assert "今日會診病人(2 位):" in out
+    assert "1. 莊振銘B7(163)002958" in out
+    assert "2. 王小明A3(101)001234" in out
+    assert cq._format_patient_roster([]) == ""
+    assert cq._format_patient_roster(["   ", ""]) == ""
+
+
+def test_format_extracted_entries_with_named_labels():
+    """提供 labels 時以姓名標題,且 labels 對齊原始 entries 索引(空項被跳過
+    不影響非空項的標題對位)。"""
+    out = cq._format_extracted_entries(
+        [
+            [("內容1", "蜂窩性組織炎")],
+            [("內容1", "")],              # 空 → 跳過
+            [("內容1", "帶狀疱疹")],
+        ],
+        labels=["莊振銘", "王小明", "李大華"])
+    assert "【莊振銘】" in out and "蜂窩性組織炎" in out
+    assert "【李大華】" in out and "帶狀疱疹" in out
+    assert "【王小明】" not in out      # 內容空 → 整段跳過
+    assert "【病人" not in out          # 有 label 就不用預設編號
+
+
 def test_cleanup_excludes_user_instance_when_borrowed():
     """[review C2 fix] SW_HIDE 後備借用「使用者自己開的」systemftp 時，收尾
     不可替使用者關掉他的程式 —— 啟動前已存在的 pid 必須排除。"""
