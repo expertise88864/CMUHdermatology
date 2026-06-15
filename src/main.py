@@ -6525,6 +6525,16 @@ class AutomationApp:
 
         【穩定性 2026.05.20】os._exit(0) 跳過 atexit，但 mutex / log handler 需顯式釋放。
         """
+        # [加速關閉] 先把視窗即時藏起 → 使用者「點 X 立刻消失」的感受;隨後的 cleanup
+        # (解鉤熱鍵、砍殘留 chromedriver 等約 100-400ms)在視窗已不可見時進行,不再讓
+        # 使用者盯著還沒消失的視窗枯等。cleanup 仍同步完成(砍 chromedriver 必須在
+        # os._exit 前跑完,否則留孤兒),只是移到「視覺上已關閉」之後。
+        # 註:withdraw() 在 Windows 即時 SW_HIDE,毋需 update_idletasks();刻意不呼叫
+        # 它 —— 那會 pump 待處理的 after_idle(如閒置重開機倒數覆蓋窗,會阻塞 ~30s)。
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
         try:
             self._cleanup_for_exit()
         except Exception:
@@ -6596,16 +6606,23 @@ class AutomationApp:
                                 self.all_doctors_data[doc_no] = _decode_cache_date_keys(doc_data)
                     logging.info("已載入門診人數快取（JSON fallback）。")
 
-            # [perf r5] 啟動時清一次過老(>30天)的門診人數 row。vacuum_old_entries 早已
-            # 實作但全專案從未被呼叫 → DB 隨運行天數線性累積舊日期 row，拖慢每次啟動的
-            # 全表載入。顯示只用近期/未來日期，刪舊不影響 UI。一次性小 DELETE，對啟動可忽略。
+            # [perf r5] 清一次過老(>30天)的門診人數 row,避免 DB 隨運行天數累積舊日期
+            # row 拖慢全表載入。顯示只用近期/未來日期,刪舊不影響 UI。
+            # [perf 2026-06-15] 改丟背景 daemon 緒:此 DELETE 與啟動畫面無關,放背景不卡
+            # 開啟。SQLite 自行序列化讀寫;刪的是舊日期、UI 讀的是近期/未來,無邏輯衝突。
+            def _vacuum_old_counts_bg():
+                try:
+                    from cmuh_common.sqlite_cache import vacuum_old_entries
+                    _removed = vacuum_old_entries(older_than_days=30)
+                    if _removed:
+                        logging.info("[O22] 背景清理 %d 筆過老門診人數 row(>30天)", _removed)
+                except Exception:
+                    logging.debug("[O22] vacuum 過老 row 失敗(忽略)", exc_info=True)
             try:
-                from cmuh_common.sqlite_cache import vacuum_old_entries
-                _removed = vacuum_old_entries(older_than_days=30)
-                if _removed:
-                    logging.info("[O22] 啟動清理 %d 筆過老門診人數 row(>30天)", _removed)
+                threading.Thread(target=_vacuum_old_counts_bg,
+                                 name="VacuumOldCounts", daemon=True).start()
             except Exception:
-                logging.debug("[O22] vacuum 過老 row 失敗(忽略)", exc_info=True)
+                logging.debug("[O22] 啟動 vacuum 背景緒失敗(忽略)", exc_info=True)
 
             # 2. 載入 主門診表 (master_schedule)
             sched_path = get_conf_path('cache_master_schedule.json')
