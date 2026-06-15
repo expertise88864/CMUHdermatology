@@ -36,7 +36,8 @@ class _JobHarness:
 
     def __init__(self, monkeypatch, cfg, fail_times=0, extracted_text=""):
         self.sent = []          # [(recipients, subject)]
-        self.bodies = []        # 寄出的信件內文
+        self.bodies = []        # 寄出的純文字內文
+        self.html_bodies = []   # 寄出的 HTML 內文
         self.extracted_text = extracted_text
         self.flow_runs = 0
         self.kills = 0
@@ -52,17 +53,19 @@ class _JobHarness:
             self.flow_runs += 1
             if self.flow_runs <= self._fail_times:
                 raise RuntimeError(f"simulated failure #{self.flow_runs}")
-            # [2026-06-13] run_consult_flow 改回傳 (截圖, 擷取文字)
-            return Path("C:/fake/shot.png"), self.extracted_text
+            # [2026-06-15] run_consult_flow 改回傳 (截圖, 擷取純文字, 擷取HTML)
+            return Path("C:/fake/shot.png"), self.extracted_text, ""
         monkeypatch.setattr(cq, "run_consult_flow", _flow)
         monkeypatch.setattr(
             cq, "send_via_smtp",
-            lambda shot, subject, body, recipients: self.sent.append(
-                (list(recipients), subject)) or self.bodies.append(body))
+            lambda shot, subject, body, recipients, html_body="":
+                self.sent.append((list(recipients), subject))
+                or self.bodies.append(body)
+                or self.html_bodies.append(html_body))
         monkeypatch.setattr(
             cq, "send_via_outlook",
-            lambda shot, subject, body, recipients, sender_account="":
-                self.sent.append((list(recipients), subject)))
+            lambda shot, subject, body, recipients, sender_account="",
+            html_body="": self.sent.append((list(recipients), subject)))
         monkeypatch.setattr(
             cq, "_kill_systemftp",
             lambda: setattr(self, "kills", self.kills + 1))
@@ -209,7 +212,7 @@ def test_send_failure_also_retries(monkeypatch):
     h = _JobHarness(monkeypatch, _base_cfg(retry_count=2))
     calls = {"n": 0}
 
-    def _send_fail_once(shot, subject, body, recipients):
+    def _send_fail_once(shot, subject, body, recipients, html_body=""):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("smtp down")
@@ -425,6 +428,88 @@ def test_format_patient_roster():
     assert "2. 王小明A3(101)001234" in out
     assert cq._format_patient_roster([]) == ""
     assert cq._format_patient_roster(["   ", ""]) == ""
+
+
+def test_format_patient_roster_label_param():
+    """[美化] label 依時段帶入;預設維持舊行為(現有 UI/相容)。"""
+    out = cq._format_patient_roster(["王X"], label="下午會診清單")
+    assert out.startswith("下午會診清單(1 位):")
+    assert cq._format_patient_roster(["王X"]).startswith("今日會診病人(1 位):")
+
+
+# ─── 信件美化:時段標題 / 病人列解析 / HTML 排版 ──────────────────────────
+
+def test_consult_slot_label():
+    """12:30→昨晚今早;17:30→下午;email/手動用 now 時鐘;壞 label 退回 now。"""
+    from datetime import datetime
+    noon = datetime(2026, 6, 15, 12, 30)
+    eve = datetime(2026, 6, 15, 17, 30)
+    assert cq._consult_slot_label("12:30", noon) == "昨晚今早會診清單"
+    assert cq._consult_slot_label("17:30", eve) == "下午會診清單"
+    assert cq._consult_slot_label("email", datetime(2026, 6, 15, 9, 0)) == "昨晚今早會診清單"
+    assert cq._consult_slot_label("", datetime(2026, 6, 15, 16, 0)) == "下午會診清單"
+    assert cq._consult_slot_label("bad", noon) == "昨晚今早會診清單"
+
+
+def test_parse_roster_row_structured():
+    p = cq._parse_roster_row("莊振銘B7(163)0029588049(沈冠宇)06/15(08:20)")
+    assert p["name"] == "莊振銘"
+    assert p["ward_bed"] == "B7 (163)"
+    assert p["chart"] == "0029588049"
+    assert p["vs"] == "沈冠宇"
+    assert p["time"] == "08:20"
+
+
+def test_parse_roster_row_fallback():
+    """外籍(無中文姓名)或結構太弱 → None,呼叫端改顯示原字串、絕不漏人。"""
+    assert cq._parse_roster_row("JOHN SMITH 0012345678") is None
+    assert cq._parse_roster_row("王小明") is None          # 無病歷號/床號
+    assert cq._parse_roster_row("") is None
+    # [codex review] 尾端有未預期文字 → fullmatch 失敗 → None(改顯示原字串,
+    # 不靜默丟掉尾端資訊)
+    assert cq._parse_roster_row(
+        "莊振銘B7(163)0029588049(沈冠宇)06/15(08:20)備註XYZ") is None
+    # 該整列原字串會在 HTML 走 raw fallback、完整保留
+    out = cq._format_patient_roster_html(
+        ["莊振銘B7(163)0029588049(沈冠宇)06/15(08:20)備註XYZ"], "下午會診清單")
+    assert "備註XYZ" in out
+
+
+def test_format_patient_roster_html():
+    out = cq._format_patient_roster_html(
+        ["莊振銘B7(163)0029588049(沈冠宇)06/15(08:20)", "JOHN 0099"],
+        "昨晚今早會診清單")
+    assert "昨晚今早會診清單" in out and "2 位" in out
+    assert "莊振銘" in out and "0029588049" in out
+    assert "JOHN 0099" in out          # 無法解析 → 原字串(colspan)保留
+    assert "<table" in out
+    assert cq._format_patient_roster_html([], "x") == ""
+
+
+def test_format_extracted_entries_html():
+    entries = [[("內容1", "For biopsy"), ("內容2", "line1\nline2")]]
+    out = cq._format_extracted_entries_html(entries, labels=["莊振銘"])
+    assert "莊振銘" in out
+    assert "會診原因" in out and "For biopsy" in out
+    assert "病情摘要" in out and "line1<br>line2" in out   # 換行 → <br>
+    assert "會診內容" in out
+
+
+def test_format_extracted_entries_html_escapes_and_empty():
+    out = cq._format_extracted_entries_html([[("內容2", "a<b>&c")]], labels=["X"])
+    assert "&lt;b&gt;" in out and "&amp;c" in out and "<b>" not in out
+    assert cq._format_extracted_entries_html([]) == ""
+    assert cq._format_extracted_entries_html([[("內容1", "")]]) == ""
+
+
+def test_build_consult_email_html():
+    out = cq._build_consult_email_html("2026/6/15", "1230", "intro <line>",
+                                       "<p>x</p>")
+    assert "皮膚科會診通知單" in out
+    assert "2026/6/15" in out and "1230" in out
+    assert "intro &lt;line&gt;" in out   # intro 也 escape
+    assert "<p>x</p>" in out             # content 是我們產生的安全 HTML,原樣嵌入
+    assert "正式內容以附件" in out        # footer
 
 
 def test_format_extracted_entries_with_named_labels():

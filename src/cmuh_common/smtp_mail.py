@@ -173,9 +173,14 @@ def is_configured() -> bool:
 
 def _build_message(sender_address: str, sender_name: str,
                     recipients: list, subject: str, body: str,
-                    attachment_path: Optional[Path] = None) -> MIMEMultipart:
-    """組合 MIME 訊息。圖片附件用 MIMEImage（信箱有預覽），其他用 MIMEApplication。"""
-    msg = MIMEMultipart()
+                    attachment_path: Optional[Path] = None,
+                    html_body: Optional[str] = None) -> MIMEMultipart:
+    """組合 MIME 訊息。圖片附件用 MIMEImage（信箱有預覽），其他用 MIMEApplication。
+
+    html_body 有值時內文走 multipart/alternative：同時帶純文字(fallback)與 HTML，
+    不支援 HTML 的客戶端、螢幕閱讀器仍可讀純文字版。截圖附件不受影響照常夾帶
+    (外層 multipart/mixed)。"""
+    msg = MIMEMultipart()  # 預設 mixed：內文(alt 或 plain) + 截圖附件
     from_header = (f"{sender_name} <{sender_address}>"
                    if sender_name else sender_address)
     msg["From"] = from_header
@@ -183,7 +188,13 @@ def _build_message(sender_address: str, sender_name: str,
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=sender_address.split("@")[-1])
-    msg.attach(MIMEText(body, "plain", "utf-8"))
+    if html_body:
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(body, "plain", "utf-8"))      # fallback 在前
+        alt.attach(MIMEText(html_body, "html", "utf-8"))  # 客戶端優先顯示後者
+        msg.attach(alt)
+    else:
+        msg.attach(MIMEText(body, "plain", "utf-8"))
 
     if attachment_path and Path(attachment_path).exists():
         p = Path(attachment_path).resolve()
@@ -225,7 +236,8 @@ def send_mail(recipients: list, subject: str, body: str,
               attachment_path: Optional[Path] = None,
               timeout: float = 60.0,
               override_credentials: Optional[dict] = None,
-              max_retries: int = DEFAULT_MAX_RETRIES) -> None:
+              max_retries: int = DEFAULT_MAX_RETRIES,
+              html_body: Optional[str] = None) -> None:
     """同步寄一封信。失敗 raise；成功 log info。
 
     recipients: list of "x@y.z"
@@ -254,6 +266,7 @@ def send_mail(recipients: list, subject: str, body: str,
         recipients=recipients,
         subject=subject, body=body,
         attachment_path=attachment_path,
+        html_body=html_body,
     )
     max_retries = _normalize_max_retries(max_retries)
     reservation = _reserve_rate_limit_slot()

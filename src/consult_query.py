@@ -45,6 +45,7 @@ ensure_dependencies(REQUIRED_LIBS)
 
 # === 主要 import（依賴已就緒）===
 import ctypes  # noqa: E402
+import html as _html  # noqa: E402
 import logging  # noqa: E402
 import queue  # noqa: E402
 import re  # noqa: E402
@@ -757,16 +758,180 @@ def _patient_display_name(text: str) -> str:
     return m.group(0) if m else t[:8]
 
 
-def _format_patient_roster(texts: list) -> str:
-    """把病人 radio 文字組成「今日會診病人清單」。純函式;空回空字串。
-    這份清單直接來自 UI 控制項文字,最準確,與下方逐病人內文/截圖互為佐證。"""
+def _format_patient_roster(texts: list, label: str = "今日會診病人") -> str:
+    """把病人 radio 文字組成清單(純文字版)。純函式;空回空字串。
+    label 依寄送時段帶入(昨晚今早/下午會診清單)。這份清單直接來自 UI 控制項
+    文字,最準確,與下方逐病人內文/截圖互為佐證。"""
     items = [t.strip() for t in texts if t and t.strip()]
     if not items:
         return ""
-    lines = [f"今日會診病人({len(items)} 位):"]
+    lines = [f"{label}({len(items)} 位):"]
     for i, t in enumerate(items, 1):
         lines.append(f"{i}. {t}")
     return "\n".join(lines)
+
+
+# =============================================================================
+# 信件美化(HTML)— 與純文字版並存(multipart/alternative)。所有 HTML 用 inline
+# style + table 排版(email client 不吃 <style>/CSS 變數),文字一律 escape。
+# =============================================================================
+_MAIL_ACCENT = "#0f766e"       # 主色:醫療綠
+_MAIL_ACCENT_DK = "#0f5a52"
+_MAIL_TINT = "#e8f4f1"         # 會診原因 highlight 底
+_MAIL_BORDER = "#e6e9ee"
+
+# 病人列結構解析(best-effort):'莊振銘B7(163)0029588049(沈冠宇)06/15(08:20)'
+# → 姓名 / 病房 / 床號 / 病歷號 / 主治 / 時間。解析不到(如外籍病人無中文姓名)
+# 回 None,呼叫端整列顯示原字串 —— 絕不漏人、不亂拆。
+_ROSTER_ROW_RE = re.compile(
+    rf"^(?P<name>[{_CJK_CHARS}·]+)"
+    rf"(?P<ward>[A-Za-z]+\d+)?"
+    rf"(?:\((?P<bed>\d+)\))?"
+    rf"(?P<chart>\d{{6,}})?"
+    rf"(?:\((?P<vs>[{_CJK_CHARS}·]+)\))?"
+    rf"\s*(?P<date>\d{{1,2}}/\d{{1,2}})?"
+    rf"\s*(?:\((?P<time>\d{{1,2}}:\d{{2}})\))?")
+
+# 文字面板序號 → 有意義的標籤(實機:內容1=會診原因,內容2=病情摘要)
+_PANE_LABEL_MAP = {"內容1": "會診原因", "內容2": "病情摘要"}
+
+
+def _consult_slot_label(trigger_label: str, now: datetime) -> str:
+    """依寄送時段給清單標題。純函式。
+    中午班(<15:00,含 12:30 排程)= 昨晚今早會診清單;
+    下午班(>=15:00,含 17:30 排程)= 下午會診清單。
+    scheduled trigger(如 '12:30')用其時刻;email/手動用 now 的時鐘。"""
+    hour = now.hour
+    if trigger_label and ":" in trigger_label:
+        try:
+            hour = int(trigger_label.split(":")[0])
+        except (ValueError, IndexError):
+            hour = now.hour
+    return "昨晚今早會診清單" if hour < 15 else "下午會診清單"
+
+
+def _parse_roster_row(text: str):
+    """把一列病人文字解析成欄位 dict;結構太弱或非預期格式回 None(走 raw fallback)。
+    [codex review] 用 fullmatch:整列都被解析掉才算結構化,否則(尾端有未預期文字)
+    回 None 改顯示原字串 —— 避免 prefix match 把尾端資訊靜默丟掉。"""
+    m = _ROSTER_ROW_RE.fullmatch((text or "").strip())
+    if not m or not m.group("name"):
+        return None
+    chart = m.group("chart") or ""
+    bed = m.group("bed") or ""
+    ward = m.group("ward") or ""
+    if not chart and not bed:
+        return None  # 只認到姓名、無病歷號/床號 → 寧可顯示原字串避免遺漏資訊
+    ward_bed = " ".join(p for p in (ward, f"({bed})" if bed else "") if p)
+    return {"name": m.group("name"), "ward_bed": ward_bed, "chart": chart,
+            "vs": m.group("vs") or "", "time": m.group("time") or ""}
+
+
+def _esc(s) -> str:
+    return _html.escape(str(s or ""))
+
+
+def _format_patient_roster_html(texts: list, label: str) -> str:
+    """病人清單 → HTML 表格。解析得到欄位就分欄;失敗整列顯示原字串。空回空字串。"""
+    items = [t.strip() for t in texts if t and t.strip()]
+    if not items:
+        return ""
+    th = (f'padding:6px 8px;border-bottom:1px solid #dfe3e8;'
+          f'color:{_MAIL_ACCENT_DK};text-align:left;')
+    td = "padding:6px 8px;border-bottom:1px solid #eef0f3;"
+    rows = [
+        f'<tr style="background:#eef5f4;font-size:12.5px;">'
+        f'<td style="{th}">#</td><td style="{th}">姓名</td>'
+        f'<td style="{th}">病房/床</td><td style="{th}">病歷號</td>'
+        f'<td style="{th}">主治</td><td style="{th}">時間</td></tr>']
+    for i, t in enumerate(items, 1):
+        bg = "background:#fafbfc;" if i % 2 == 0 else ""
+        p = _parse_roster_row(t)
+        if p:
+            rows.append(
+                f'<tr style="{bg}font-size:12.5px;">'
+                f'<td style="{td}color:#9aa1ab;">{i}</td>'
+                f'<td style="{td}font-weight:600;color:#1f2937;">{_esc(p["name"])}</td>'
+                f'<td style="{td}color:#3f4753;">{_esc(p["ward_bed"])}</td>'
+                f'<td style="{td}color:#3f4753;">{_esc(p["chart"])}</td>'
+                f'<td style="{td}color:#3f4753;">{_esc(p["vs"])}</td>'
+                f'<td style="{td}color:#3f4753;">{_esc(p["time"])}</td></tr>')
+        else:
+            rows.append(
+                f'<tr style="{bg}font-size:12.5px;">'
+                f'<td style="{td}color:#9aa1ab;">{i}</td>'
+                f'<td style="{td}color:#1f2937;" colspan="5">{_esc(t)}</td></tr>')
+    n = len(items)
+    return (
+        f'<div style="font-size:14px;font-weight:600;color:{_MAIL_ACCENT};'
+        f'border-left:3px solid {_MAIL_ACCENT};padding-left:8px;margin:14px 0 8px;">'
+        f'{_esc(label)}　{n} 位</div>'
+        f'<table style="width:100%;border-collapse:collapse;">'
+        + "".join(rows) + "</table>")
+
+
+def _format_extracted_entries_html(entries: list, labels: list | None = None) -> str:
+    """逐病人擷取內容 → HTML 卡片(會診原因 highlight + 病情摘要段落)。空回空字串。"""
+    blocks = []
+    for i, panes in enumerate(entries, 1):
+        texts = [(lab, (txt or "").strip()) for lab, txt in panes]
+        texts = [(lab, txt) for lab, txt in texts if txt]
+        if not texts:
+            continue
+        head = (labels[i - 1] if labels and i - 1 < len(labels)
+                and labels[i - 1] else f"病人 {i}")
+        inner = []
+        for lab, txt in texts:
+            disp = _PANE_LABEL_MAP.get(lab, lab)
+            para = _esc(txt).replace("\n", "<br>")
+            if disp == "會診原因":
+                inner.append(
+                    f'<div style="background:{_MAIL_TINT};border-radius:6px;'
+                    f'padding:7px 10px;margin-bottom:8px;">'
+                    f'<span style="display:inline-block;background:{_MAIL_ACCENT};'
+                    f'color:#fff;font-size:11px;padding:1px 7px;border-radius:4px;'
+                    f'margin-right:6px;">會診原因</span>'
+                    f'<span style="color:#1f3d39;font-size:13px;">{para}</span></div>')
+            else:
+                inner.append(
+                    f'<div style="font-size:11px;color:#8a9099;font-weight:600;'
+                    f'margin-bottom:3px;">{_esc(disp)}</div>'
+                    f'<div style="color:#36404c;font-size:12.5px;line-height:1.65;'
+                    f'margin-bottom:8px;">{para}</div>')
+        blocks.append(
+            f'<div style="border:1px solid {_MAIL_BORDER};border-radius:8px;'
+            f'margin-bottom:12px;overflow:hidden;">'
+            f'<div style="background:#f4f7f6;padding:8px 12px;font-weight:600;'
+            f'color:{_MAIL_ACCENT_DK};font-size:13.5px;'
+            f'border-bottom:1px solid {_MAIL_BORDER};">{_esc(head)}</div>'
+            f'<div style="padding:10px 12px;">' + "".join(inner) + '</div></div>')
+    if not blocks:
+        return ""
+    return (
+        f'<div style="font-size:14px;font-weight:600;color:{_MAIL_ACCENT};'
+        f'border-left:3px solid {_MAIL_ACCENT};padding-left:8px;margin:16px 0 10px;">'
+        f'會診內容（擷取文字,請以截圖為準）</div>' + "".join(blocks))
+
+
+def _build_consult_email_html(date_str: str, time_str: str, intro: str,
+                              content_html: str) -> str:
+    """組整封 HTML 信:標題列 + 前言 + 清單/內容 + 頁尾。content_html 可空。"""
+    return (
+        '<div style="background:#eceff2;padding:18px;'
+        "font-family:-apple-system,'Segoe UI','Microsoft JhengHei',sans-serif;\">"
+        '<div style="max-width:600px;margin:0 auto;background:#fff;'
+        f'border:1px solid #e2e5ea;border-radius:10px;overflow:hidden;">'
+        f'<div style="background:{_MAIL_ACCENT};padding:18px 22px;">'
+        '<div style="color:#fff;font-size:18px;font-weight:600;">皮膚科會診通知單</div>'
+        f'<div style="color:#bfe3dc;font-size:13px;margin-top:3px;">'
+        f'{_esc(date_str)}　{_esc(time_str)}　系統自動擷取寄送</div></div>'
+        f'<div style="padding:16px 22px;color:#5b6470;font-size:13px;'
+        f'line-height:1.6;">{_esc(intro)}</div>'
+        f'<div style="padding:0 22px 4px;">{content_html}</div>'
+        '<div style="padding:8px 22px 18px;"><div style="border-top:1px solid '
+        '#eceef1;padding-top:10px;color:#9aa1ab;font-size:11.5px;line-height:1.5;">'
+        '本信由中國醫皮膚科系統自動擷取寄送,擷取文字僅供輔助閱讀,正式內容以附件'
+        '截圖為準。</div></div></div></div>')
 
 
 def _format_extracted_entries(entries: list, labels: list | None = None) -> str:
@@ -875,10 +1040,12 @@ def _read_panes_after_change(panes: list, baseline_sig, timeout: float = 2.5,
     return snap, False             # 逾時:未達「脫離+穩定」→ 不可信
 
 
-def _extract_consult_text(consult_hwnd: int, cfg: dict) -> str:
-    """主入口:從會診視窗擷取逐病人文字。任何失敗回空字串(fail-open)。"""
+def _extract_consult_text(consult_hwnd: int, cfg: dict,
+                          roster_label: str = "今日會診病人") -> tuple:
+    """主入口:從會診視窗擷取逐病人文字。回 (純文字版, HTML內容片段);
+    任何失敗回 ("", "")(fail-open)。roster_label 依寄送時段帶入清單標題。"""
     if not cfg.get("extract_text_enabled", True):
-        return ""
+        return "", ""
     try:
         children = enum_children(consult_hwnd)
         # 控制項樹 dump(每次執行記一次)：供依實機結構微調 extract_* 參數
@@ -896,14 +1063,16 @@ def _extract_consult_text(consult_hwnd: int, cfg: dict) -> str:
         # 分頁真的沒病人時清單即為空,不會誤把其他分頁的隱藏 radio 當成今日病人。
         radios = _find_patient_radios(
             [c for c in children if _is_visible_below(c[0], consult_hwnd)])
-        roster = _format_patient_roster([t for _h, t, _r in radios])
+        roster_texts = [t for _h, t, _r in radios]
+        roster = _format_patient_roster(roster_texts, label=roster_label)
+        roster_html = _format_patient_roster_html(roster_texts, roster_label)
 
         panes = _find_text_panes(children)
         if not panes:
             # 抓不到文字面板:逐病人內文擷取不了,但準確的病人清單仍可寄出。
             logging.info("[consult-extract] 找不到文字面板(Memo/RichEdit)，"
                          "本次只附病人清單+截圖;請把上行控制項樹回報以便調整")
-            return roster
+            return roster, roster_html
 
         entries: list = []
         labels: list = []
@@ -984,12 +1153,14 @@ def _extract_consult_text(consult_hwnd: int, cfg: dict) -> str:
 
         body = _format_extracted_entries(entries, labels=labels or None)
         text = "\n\n".join(part for part in (roster, body) if part)
+        body_html = _format_extracted_entries_html(entries, labels=labels or None)
+        html_inner = roster_html + body_html
         logging.info("[consult-extract] 擷取完成:清單 %d 位、內文區塊 %d 字",
                      len(radios) or len(entries), len(text))
-        return text
+        return text, html_inner
     except Exception:
         logging.warning("[consult-extract] 擷取失敗(照常只寄截圖)", exc_info=True)
-        return ""
+        return "", ""
 
 
 def close_pids(pids: set, grace: float = 2.5) -> None:
@@ -1063,8 +1234,8 @@ def _set_thread_desktop(hdesk) -> bool:
 # 自動化主流程
 # =============================================================================
 def run_consult_flow(trigger_label: str = "") -> tuple:
-    """執行完整會診查詢流程，回傳 (截圖路徑, 擷取文字)。失敗會 raise。
-    擷取文字為 best-effort:抓不到時為空字串(信件就只有截圖)。
+    """執行完整會診查詢流程，回傳 (截圖路徑, 擷取純文字, 擷取HTML片段)。失敗會 raise。
+    擷取內容為 best-effort:抓不到時為空字串(信件就只有截圖)。
 
     優先用「隱藏桌面」執行 systemftp——它的所有視窗都在使用者看不到的
     虛擬桌面，永遠不會出現在使用者畫面、不會搶前景、滑鼠也不會動。
@@ -1072,6 +1243,8 @@ def run_consult_flow(trigger_label: str = "") -> tuple:
     """
     cfg = load_config()
     logging.info("=== 開始會診查詢流程（觸發：%s）===", trigger_label or "手動")
+    # 清單標題依寄送時段:12:30→昨晚今早會診清單、17:30→下午會診清單
+    roster_label = _consult_slot_label(trigger_label, datetime.now())
 
     hdesk = _ensure_hidden_desktop()
     if hdesk:
@@ -1082,7 +1255,7 @@ def run_consult_flow(trigger_label: str = "") -> tuple:
             try:
                 if not _set_thread_desktop(hdesk):
                     raise RuntimeError("SetThreadDesktop 失敗")
-                result["shot"] = _automation_on_hidden(cfg)
+                result["shot"] = _automation_on_hidden(cfg, roster_label)
             except Exception as e:  # noqa: BLE001
                 result["error"] = e
             finally:
@@ -1108,10 +1281,10 @@ def run_consult_flow(trigger_label: str = "") -> tuple:
         return result["shot"]
 
     logging.warning("無法建立隱藏桌面，改用 SW_HIDE 後備模式（可能短暫看到視窗）")
-    return _run_with_sw_hide(cfg)
+    return _run_with_sw_hide(cfg, roster_label)
 
 
-def _automation_on_hidden(cfg: dict) -> tuple:
+def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -> tuple:
     """在隱藏桌面執行完整流程（呼叫者需已 SetThreadDesktop）。回傳 (截圖, 文字)。
 
     因為隱藏桌面上 systemftp 是唯一前景應用，不需要 stealth thread、不需要
@@ -1229,8 +1402,9 @@ def _automation_on_hidden(cfg: dict) -> tuple:
         img.save(shot_path)
         logging.info("已存檔截圖：%s", shot_path)
         # [新功能 2026-06-13] 截圖(原始畫面)存檔後才逐列點選擷取文字(fail-open)
-        extracted = _extract_consult_text(consult, cfg)
-        return shot_path, extracted
+        extracted, extracted_html = _extract_consult_text(
+            consult, cfg, roster_label)
+        return shot_path, extracted, extracted_html
 
     finally:
         cleanup_pids = our_pids or (_systemftp_pids() - before)
@@ -1241,7 +1415,7 @@ def _automation_on_hidden(cfg: dict) -> tuple:
             logging.warning("關閉 systemftp 失敗", exc_info=True)
 
 
-def _run_with_sw_hide(cfg: dict) -> tuple:
+def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tuple:
     """後備模式：使用者桌面上跑，配合 SW_HIDE 隱形執行緒（可能有短暫閃爍）。
     回傳 (截圖路徑, 擷取文字)。"""
     username = cfg["username"]
@@ -1394,8 +1568,9 @@ def _run_with_sw_hide(cfg: dict) -> tuple:
         img.save(shot_path)
         logging.info("已存檔截圖：%s", shot_path)
         # [新功能 2026-06-13] 截圖(原始畫面)存檔後才逐列點選擷取文字(fail-open)
-        extracted = _extract_consult_text(consult, cfg)
-        return shot_path, extracted
+        extracted, extracted_html = _extract_consult_text(
+            consult, cfg, roster_label)
+        return shot_path, extracted, extracted_html
 
     finally:
         # 收尾：停掉隱形執行緒、關閉我們這份 systemftp、把前景還給使用者。
@@ -1511,11 +1686,12 @@ def _pick_outlook_account(outlook, sender_account: str):
 
 
 def _outlook_send_worker(image_path, subject, body, recipients, result,
-                          sender_account: str = "") -> None:
+                          sender_account: str = "", html_body: str = "") -> None:
     """實際的 Outlook COM 寄信動作，在獨立執行緒執行（自己 CoInitialize）。
 
     sender_account：指定要用哪個 Outlook 帳號寄（SMTP 地址）。找不到時退回
-    Outlook 預設帳號，並在 log 留 warning。"""
+    Outlook 預設帳號，並在 log 留 warning。
+    html_body：有值時用 HTMLBody（美化版排版）；空字串則用純文字 Body。"""
     import pythoncom
     pythoncom.CoInitialize()
     try:
@@ -1523,7 +1699,10 @@ def _outlook_send_worker(image_path, subject, body, recipients, result,
         mail = outlook.CreateItem(0)  # olMailItem
         mail.To = "; ".join(recipients)
         mail.Subject = subject
-        mail.Body = body
+        if html_body:
+            mail.HTMLBody = html_body
+        else:
+            mail.Body = body
         if image_path and Path(image_path).exists():
             mail.Attachments.Add(str(Path(image_path).resolve()))
         # 強制寄件人帳號（SendUsingAccount）—— Outlook 必須已設定此帳號
@@ -1560,7 +1739,7 @@ def _outlook_send_worker(image_path, subject, body, recipients, result,
 
 def send_via_outlook(image_path: Path, subject: str, body: str,
                      recipients: list, timeout: float = 120.0,
-                     sender_account: str = "") -> None:
+                     sender_account: str = "", html_body: str = "") -> None:
     """用本機 Outlook 寄出。COM 動作在獨立執行緒執行並設逾時——若 Outlook 跳出
     安全提示或忙線卡住，最多等 timeout 秒就放棄，不會無限阻塞整個排程
     （先前第二次寄信卡死、整個任務不結束就是這個原因）。逾時或失敗會 raise。
@@ -1575,7 +1754,8 @@ def send_via_outlook(image_path: Path, subject: str, body: str,
     result: dict = {}
     worker = threading.Thread(
         target=_outlook_send_worker,
-        args=(image_path, subject, body, recipients, result, sender_account),
+        args=(image_path, subject, body, recipients, result, sender_account,
+              html_body),
         name="OutlookSend", daemon=True,
     )
     worker.start()
@@ -1593,7 +1773,8 @@ def send_via_outlook(image_path: Path, subject: str, body: str,
 
 
 def send_via_smtp(image_path: Path, subject: str, body: str,
-                  recipients: list, timeout: float = 60.0) -> None:
+                  recipients: list, timeout: float = 60.0,
+                  html_body: str = "") -> None:
     """用 SMTP 直接寄（Gmail / smtp.gmail.com）。
 
     為何不用 Outlook：admin 行程的 Outlook COM 會起一個 admin Outlook 實例，
@@ -1606,7 +1787,8 @@ def send_via_smtp(image_path: Path, subject: str, body: str,
     SmtpNotConfiguredError。"""
     from cmuh_common.smtp_mail import send_mail
     send_mail(recipients=recipients, subject=subject, body=body,
-              attachment_path=image_path, timeout=timeout)
+              attachment_path=image_path, timeout=timeout,
+              html_body=html_body or None)
 
 
 def _kill_systemftp() -> None:
@@ -1702,15 +1884,22 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                 logging.info("會診查詢任務 第 %d/%d 次嘗試（trigger=%s, 收件人組=%s, mail=%s）",
                              attempt, retry_count, trigger_label,
                              recipients_label, mail_method)
-                shot, extracted_text = run_consult_flow(trigger_label)
+                shot, extracted_text, extracted_html = run_consult_flow(
+                    trigger_label)
                 # [新功能 2026-06-13] 擷取到的會診文字附在信件內文(截圖仍為主)
                 final_body = (f"{body}\n\n{extracted_text}"
                               if extracted_text else body)
+                # [美化 2026-06-15] HTML 版排版(multipart/alternative;純文字為
+                # fallback)。截圖附件照常夾帶。
+                final_html = _build_consult_email_html(
+                    date_str, time_str, body, extracted_html)
                 if mail_method == "smtp":
-                    send_via_smtp(shot, subject, final_body, recipients)
+                    send_via_smtp(shot, subject, final_body, recipients,
+                                  html_body=final_html)
                 else:
                     send_via_outlook(shot, subject, final_body, recipients,
-                                      sender_account=sender)
+                                      sender_account=sender,
+                                      html_body=final_html)
                 logging.info("會診查詢任務成功（第 %d 次嘗試）", attempt)
                 return  # 成功就跳出
             except Exception as e:

@@ -121,3 +121,28 @@ def test_ensure_credentials_template_creates_then_preserves(tmp_path, monkeypatc
     path.write_text(json.dumps({"password": "userset"}), encoding="utf-8")
     smtp_mail.ensure_credentials_template()
     assert json.loads(path.read_text(encoding="utf-8"))["password"] == "userset"
+
+
+def test_build_message_html_is_multipart_alternative():
+    """[美化] 有 html_body → 內文走 multipart/alternative,同時含 plain 與 html;
+    截圖附件仍夾帶(外層 mixed)。"""
+    msg = smtp_mail._build_message(
+        "a@b.com", "Sender", ["r@x.tw"], "subj", "plain fallback",
+        attachment_path=None, html_body="<b>hi</b>")
+    types = [p.get_content_type() for p in msg.walk()]
+    assert "multipart/alternative" in types
+    assert "text/plain" in types and "text/html" in types
+    # plain 在前(fallback),html 在後(客戶端優先顯示)
+    leaves = [p.get_content_type() for p in msg.walk()
+              if not p.is_multipart()]
+    assert leaves.index("text/plain") < leaves.index("text/html")
+
+
+def test_build_message_no_html_stays_plain():
+    """無 html_body → 維持舊行為:純 text/plain,不產生 alternative。"""
+    msg = smtp_mail._build_message(
+        "a@b.com", "Sender", ["r@x.tw"], "subj", "plain only",
+        attachment_path=None)
+    types = [p.get_content_type() for p in msg.walk()]
+    assert "multipart/alternative" not in types
+    assert "text/plain" in types and "text/html" not in types
