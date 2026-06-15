@@ -74,9 +74,9 @@ DEFAULT_ITEMS: list[dict[str, str]] = [
     {
         "abbrev": "cert2",
         "expansion": (
-            "患者因上述皮膚疾病，曾於da_zh-21至本院皮膚科門診就醫，"
-            "後續於da_zh-17接受局部麻醉下之皮膚腫瘤切除及縫合手術，"
-            "術後病理檢查結果符合上述疾患。"
+            "患者因上述皮膚疾病，於da_zh-21至本院皮膚科門診就醫，"
+            "後續於da_zh-17接受局部麻醉下之皮膚腫瘤切除手術並縫合，"
+            "術後病理檢查結果合乎上述疾患。"
             "患者於術後之da_zh-14返回本院皮膚科門診接受照護，"
             "並分別於da_zh-7及da_zh分次拆除手術縫線。"
         ),
@@ -95,9 +95,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 
 # 舊版內建預設的逐字版本（用於偵測 user 是否還沿用舊預設，自動升級）。
-# 升級規則：若 user 的 cert1/cert2/ef expansion 完全等於下面字串 → 視為「沒改過」
+# 升級規則：若 user 的 cert1/cert2/ef expansion 完全等於下面任一字串 → 視為「沒改過」
 # → 替換為 DEFAULT_ITEMS 內的新版。User 手動編輯過的內容不會被動。
-_LEGACY_DEFAULTS_TO_MIGRATE: dict[str, str] = {
+# 值可為單一字串，或「多個歷代預設」的字串清單（每次改預設時把前一版加進清單，
+# 才不會漏升級從更早版本一路沒動過的機器）。
+_LEGACY_DEFAULTS_TO_MIGRATE: dict[str, "str | list[str]"] = {
     # [v7 2026-05-28] ef 預設改為含 "and follow up"
     "ef": "excisional biopsy, inform post-op 3x scar formation",
     # cert 預設日期由西式 da（(2026/6/1)）改為中文 da_zh（2026年6月1日）
@@ -108,13 +110,24 @@ _LEGACY_DEFAULTS_TO_MIGRATE: dict[str, str] = {
         "術後病理檢查結果合乎上述疾患。"
         "患者於da返回本院皮膚科門診接受術後照護並拆除手術縫線。"
     ),
-    "cert2": (
-        "患者因上述皮膚疾病，曾於da-21至本院皮膚科門診就醫，"
-        "後續於da-17接受局部麻醉下之皮膚腫瘤切除及縫合手術，"
-        "術後病理檢查結果符合上述疾患。"
-        "患者於術後之da-14返回本院皮膚科門診接受照護，"
-        "並分別於da-7及da分次拆除手術縫線。"
-    ),
+    "cert2": [
+        # 歷代預設①：西式 da-N 版本
+        (
+            "患者因上述皮膚疾病，曾於da-21至本院皮膚科門診就醫，"
+            "後續於da-17接受局部麻醉下之皮膚腫瘤切除及縫合手術，"
+            "術後病理檢查結果符合上述疾患。"
+            "患者於術後之da-14返回本院皮膚科門診接受照護，"
+            "並分別於da-7及da分次拆除手術縫線。"
+        ),
+        # 歷代預設②：中文 da_zh 版本（[2026-06-15] 改為下方新版前的預設）
+        (
+            "患者因上述皮膚疾病，曾於da_zh-21至本院皮膚科門診就醫，"
+            "後續於da_zh-17接受局部麻醉下之皮膚腫瘤切除及縫合手術，"
+            "術後病理檢查結果符合上述疾患。"
+            "患者於術後之da_zh-14返回本院皮膚科門診接受照護，"
+            "並分別於da_zh-7及da_zh分次拆除手術縫線。"
+        ),
+    ],
 }
 
 
@@ -246,9 +259,12 @@ def _maybe_migrate_legacy(items: list[dict[str, str]]) -> bool:
         legacy = _LEGACY_DEFAULTS_TO_MIGRATE.get(ab)
         if legacy is None:
             continue
-        if str(it.get("expansion", "")) == legacy:
+        # 值可為單一字串或「多個歷代預設」清單
+        legacy_variants = legacy if isinstance(legacy, (list, tuple)) else (legacy,)
+        cur_exp = str(it.get("expansion", ""))
+        if cur_exp in legacy_variants:
             new_exp = new_default_by_abbrev.get(ab)
-            if new_exp and new_exp != legacy:
+            if new_exp and new_exp != cur_exp:
                 it["expansion"] = new_exp
                 changed = True
                 logging.info(

@@ -346,6 +346,51 @@ def test_migrate_legacy_cert_preserves_user_custom():
     assert items[0]["expansion"] == "我自己的診斷書文字 da"
 
 
+_CERT2_NEW = (
+    "患者因上述皮膚疾病，於da_zh-21至本院皮膚科門診就醫，"
+    "後續於da_zh-17接受局部麻醉下之皮膚腫瘤切除手術並縫合，"
+    "術後病理檢查結果合乎上述疾患。"
+    "患者於術後之da_zh-14返回本院皮膚科門診接受照護，"
+    "並分別於da_zh-7及da_zh分次拆除手術縫線。"
+)
+
+
+def test_migrate_legacy_cert2_from_da_zh_to_new():
+    """[2026-06-15] 沿用上一版 cert2(da_zh「曾/切除及縫合手術/符合」)→ 升級為新版。"""
+    items = [{"abbrev": "cert2", "expansion": (
+        "患者因上述皮膚疾病，曾於da_zh-21至本院皮膚科門診就醫，"
+        "後續於da_zh-17接受局部麻醉下之皮膚腫瘤切除及縫合手術，"
+        "術後病理檢查結果符合上述疾患。"
+        "患者於術後之da_zh-14返回本院皮膚科門診接受照護，"
+        "並分別於da_zh-7及da_zh分次拆除手術縫線。"
+    )}]
+    changed = _maybe_migrate_legacy(items)
+    assert changed is True
+    assert items[0]["expansion"] == _CERT2_NEW
+
+
+def test_migrate_legacy_cert2_from_old_da_variant():
+    """更早的西式 da-N 版 cert2 也仍能升級(清單支援多個歷代預設)。"""
+    items = [{"abbrev": "cert2", "expansion": (
+        "患者因上述皮膚疾病，曾於da-21至本院皮膚科門診就醫，"
+        "後續於da-17接受局部麻醉下之皮膚腫瘤切除及縫合手術，"
+        "術後病理檢查結果符合上述疾患。"
+        "患者於術後之da-14返回本院皮膚科門診接受照護，"
+        "並分別於da-7及da分次拆除手術縫線。"
+    )}]
+    changed = _maybe_migrate_legacy(items)
+    assert changed is True
+    assert items[0]["expansion"] == _CERT2_NEW
+
+
+def test_migrate_legacy_cert2_preserves_user_custom():
+    """user 手動改過的 cert2 → 不該被升級覆蓋。"""
+    items = [{"abbrev": "cert2", "expansion": "我自訂的 cert2 da_zh"}]
+    changed = _maybe_migrate_legacy(items)
+    assert changed is False
+    assert items[0]["expansion"] == "我自訂的 cert2 da_zh"
+
+
 def test_replace_timing_constants_ordered():
     """[v7] 寧慢求對：確認延遲常數有被拉長 (deletion 正確性)。"""
     assert AbbrevEngine.PRE_BACKSPACE_DELAY_SEC >= 0.10
