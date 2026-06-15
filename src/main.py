@@ -5941,6 +5941,18 @@ CLINIC_METRIC_HISTORY_DAYS = 30
 CLINIC_LIGHT_HISTORY_DAYS = 30
 CLINIC_LIGHT_HISTORY_WINDOW_MINUTES = 9
 CLINIC_DYNAMIC_STATE_FILENAME = "clinic_dynamic_state.json"
+# 已寄出的止掛提醒信記錄(跨重啟去重用)。notify_key 內含日期,只保留近 7 天。
+ALERT_EMAIL_SENT_FILENAME = "alert_email_sent.json"
+ALERT_EMAIL_SENT_RETAIN_DAYS = 7
+
+
+def _filter_recent_alert_sent(data, cutoff: str) -> dict:
+    """保留 value(ISO 日期字串)>= cutoff 的項目;非 dict / 非字串鍵值一律剔除。
+    ISO 日期零補位 → 可直接字典序比較。純函式以便測試。"""
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items()
+            if isinstance(k, str) and isinstance(v, str) and v >= cutoff}
 NOTIFY_DO_NOT_DISTURB_START_HOUR = 0
 NOTIFY_DO_NOT_DISTURB_END_HOUR = 8
 
@@ -6218,6 +6230,9 @@ class AutomationApp:
         self._subsystem_running = False
         self._subsystem_lock = threading.Lock()
         self._subsystem_token = 0
+        self._subsystem_thread_ident = None   # 目前流程 thread 的 ident(供搶占/取消)
+        self._subsystem_thread = None          # 目前流程 thread 物件(供搶占判斷)
+        self._subsystem_current_hotkey = None  # 目前流程的熱鍵名稱(供同熱鍵搶占判斷)
         self._last_hotkey_busy_notice_at = 0.0
         # === 熱鍵健康監看狀態 ===
         # heartbeat hook 最近一次看到任何按鍵事件的時間（monotonic）。
@@ -6312,6 +6327,8 @@ class AutomationApp:
         self.alert_frequency = defaultdict(int)
         self._alert_popup_active = defaultdict(bool)
         self._alert_state_lock = threading.Lock()
+        # 已寄出止掛信的記錄(跨重啟去重;寄信前先查、寄成功後寫)
+        self._alert_email_sent = self._load_alert_email_sent()
         self._dnd_suppressed_count = 0
         self.notify_dnd_start_time_var = tk.StringVar(value=str(self.threshold_settings.get("notify_dnd_start_time", "00:00")))
         self.notify_dnd_end_time_var = tk.StringVar(value=str(self.threshold_settings.get("notify_dnd_end_time", "08:00")))
@@ -6645,6 +6662,40 @@ class AutomationApp:
             "states": self._clinic_dynamic_state_cache,
         }
         _atomic_write_json(get_conf_path(CLINIC_DYNAMIC_STATE_FILENAME), payload)
+
+    # ── 止掛提醒信「跨重啟去重」──────────────────────────────────────────
+    # 問題:寄信去重原本只靠記憶體 (self.alert_frequency / _alert_popup_active),
+    # 重開程式就歸零 → 同一診次當天會再寄一次。改為持久化『已寄出』的 notify_key,
+    # 寄信前先讀此記錄;已寄過就跳過,確保每個診次當天只寄一封。
+    def _load_alert_email_sent(self) -> dict:
+        """讀『已寄止掛信』記錄 → {notify_key: 'YYYY-MM-DD'}。只留近 N 天避免膨脹。"""
+        try:
+            data = load_json_dict(get_conf_path(ALERT_EMAIL_SENT_FILENAME), {},
+                                  merge_defaults=False)
+        except Exception:
+            return {}
+        cutoff = (date.today()
+                  - timedelta(days=ALERT_EMAIL_SENT_RETAIN_DAYS)).isoformat()
+        return _filter_recent_alert_sent(data, cutoff)
+
+    def _has_alert_email_been_sent(self, notify_key: str) -> bool:
+        with self._alert_state_lock:
+            return notify_key in self._alert_email_sent
+
+    def _mark_alert_email_sent(self, notify_key: str) -> None:
+        """記錄某止掛信已寄出並持久化(僅在『確實寄出成功』後呼叫)。
+
+        寫檔在鎖內完成:把「快照建立」與「落地」序列化,避免兩個通知緒各自在鎖外
+        以不同順序寫入 → 較舊的快照後到、覆蓋掉較新的(漏記 key → 重啟後重寄)。
+        寄信頻率極低(一天數次),寫檔僅 atomic rename(~毫秒),持鎖成本可忽略。"""
+        with self._alert_state_lock:
+            self._alert_email_sent[notify_key] = date.today().isoformat()
+            snapshot = dict(self._alert_email_sent)
+            try:
+                _atomic_write_json(get_conf_path(ALERT_EMAIL_SENT_FILENAME),
+                                   snapshot)
+            except Exception:
+                logging.warning("寫入止掛信寄出記錄失敗(不影響本次提醒)", exc_info=True)
 
     def _clinic_dynamic_state_matches(self, state, room_code, time_code, doc_name=None, session_cn=None):
         return state_matches(
@@ -9999,8 +10050,23 @@ class AutomationApp:
         self.abbrev_close_external_var = tk.BooleanVar(value=cfg.close_external_expander)
         self.abbrev_new_abbrev_var = tk.StringVar()
 
+        # [2026-06-15] 整頁可捲動:原本「動態日期 token」說明在最底,視窗不夠高時
+        # 被截掉看不到下半。改與「設定」頁相同作法,用 Canvas 包一層可垂直捲動內容區。
+        _abbrev_canvas = tk.Canvas(abbrev_tab, highlightthickness=0)
+        _abbrev_sb = ttk.Scrollbar(abbrev_tab, orient="vertical",
+                                   command=_abbrev_canvas.yview)
+        _body = ttk.Frame(_abbrev_canvas)
+        _body.bind("<Configure>", lambda e: _abbrev_canvas.configure(
+            scrollregion=_abbrev_canvas.bbox("all")))
+        _body_win = _abbrev_canvas.create_window((0, 0), window=_body, anchor="nw")
+        _abbrev_canvas.bind("<Configure>", lambda e: _abbrev_canvas.itemconfig(
+            _body_win, width=e.width))
+        _abbrev_canvas.configure(yscrollcommand=_abbrev_sb.set)
+        _abbrev_canvas.pack(side="left", fill="both", expand=True)
+        _abbrev_sb.pack(side="right", fill="y")
+
         # 上方控制列
-        ctrl_frame = ttk.LabelFrame(abbrev_tab, text="總開關")
+        ctrl_frame = ttk.LabelFrame(_body, text="總開關")
         ctrl_frame.pack(fill='x', pady=(0, 8))
         row1 = ttk.Frame(ctrl_frame)
         row1.pack(fill='x', padx=10, pady=(6, 2))
@@ -10036,7 +10102,7 @@ class AutomationApp:
         ).pack(side='left')
 
         # 縮寫列表
-        list_frame = ttk.LabelFrame(abbrev_tab, text="縮寫清單（雙擊可編輯）")
+        list_frame = ttk.LabelFrame(_body, text="縮寫清單（雙擊可編輯）")
         list_frame.pack(fill='both', expand=True, pady=(0, 8))
 
         tree_container = ttk.Frame(list_frame)
@@ -10065,7 +10131,7 @@ class AutomationApp:
         ttk.Button(btn_row, text="重設為預設清單", command=self._abbrev_reset_defaults).pack(side='right')
 
         # 新增區塊
-        add_frame = ttk.LabelFrame(abbrev_tab, text="新增縮寫")
+        add_frame = ttk.LabelFrame(_body, text="新增縮寫")
         add_frame.pack(fill='x', pady=(0, 8))
         add_inner = ttk.Frame(add_frame)
         add_inner.pack(fill='x', padx=10, pady=8)
@@ -10090,8 +10156,8 @@ class AutomationApp:
             row=2, column=1, sticky='e', pady=(4, 0))
 
         # token 說明區
-        hint_frame = ttk.LabelFrame(abbrev_tab, text="動態日期 token（可寫在「展開內文」裡）")
-        hint_frame.pack(fill='x')
+        hint_frame = ttk.LabelFrame(_body, text="動態日期 token（可寫在「展開內文」裡）")
+        hint_frame.pack(fill='x', pady=(0, 8))
         hint_text = (
             "  da        → 今日日期（斜線），例：(2026/5/27)\n"
             "  da1       → 現在時間，例：23:34\n"
@@ -10112,6 +10178,17 @@ class AutomationApp:
 
         # 列表填資料
         self._abbrev_refresh_tree()
+
+        # 滑鼠滾輪:整頁捲動;游標在縮寫清單(tree)上時改捲動清單本身。
+        def _abbrev_wheel(event):
+            _abbrev_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+        self._bind_mousewheel_recursive(abbrev_tab, _abbrev_wheel)
+
+        def _tree_wheel(event):
+            tree.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+        tree.bind("<MouseWheel>", _tree_wheel)
 
     def _create_settings_tab(self, settings_tab):
         canvas = tk.Canvas(settings_tab)
@@ -10839,14 +10916,20 @@ class AutomationApp:
                                                                         show_windows_notification("止掛提醒", m)
                                                                     # email：DND 也寄（第一次提醒）。第二次加強提醒只跳 Windows
                                                                     # 通知，避免一筆狀況收到兩封信。
+                                                                    # [2026-06-15] 跨重啟去重:寄前查持久化記錄,已寄過就跳過
+                                                                    # (避免重開程式/刷新人數重複寄同一診次的信);寄成功才記錄。
                                                                     if lvl == 1:
-                                                                        rcpts = list(self.alert_email_recipients)
-                                                                        if rcpts:
-                                                                            try:
-                                                                                _send_alert_email_via_smtp(
-                                                                                    subj, m, rcpts)
-                                                                            except Exception:
-                                                                                logging.warning("止掛提醒寄信例外", exc_info=True)
+                                                                        if self._has_alert_email_been_sent(nk):
+                                                                            logging.info("[ALERT] 止掛信先前已寄出，跳過重寄：%s", nk)
+                                                                        else:
+                                                                            rcpts = list(self.alert_email_recipients)
+                                                                            if rcpts:
+                                                                                try:
+                                                                                    if _send_alert_email_via_smtp(
+                                                                                            subj, m, rcpts):
+                                                                                        self._mark_alert_email_sent(nk)
+                                                                                except Exception:
+                                                                                    logging.warning("止掛提醒寄信例外", exc_info=True)
                                                                 finally:
                                                                     with self._alert_state_lock:
                                                                         self._alert_popup_active[nk] = False
@@ -11340,25 +11423,57 @@ class AutomationApp:
                 logging.debug("未來週次分頁狀態偵測失敗，標記為需重繪", exc_info=True)
                 self._future_tab_grid_stale = True
 
-    def run_subsystem_in_thread(self, func, hotkey_name):
+    def run_subsystem_in_thread(self, func, hotkey_name, preempt_same=False):
         is_busy = False
         show_busy_notice = False
         # 僅在 else 分支(非忙碌)會被覆寫；忙碌時提前 return 不會用到。
         # 預先綁定以消除靜態分析的 possibly-unbound 雜訊（行為不變）。
         subsystem_token = 0
+        is_preempt = False  # 本次是否為「同熱鍵搶占」(F11 執行中又按 F11)
         with self._subsystem_lock:
             if self._subsystem_running:
-                is_busy = True
-                now = time.monotonic()
-                if should_show_busy_notice(
-                    now, getattr(self, '_last_hotkey_busy_notice_at', 0.0),
-                ):
-                    self._last_hotkey_busy_notice_at = now
-                    show_busy_notice = True
+                if preempt_same and self._subsystem_current_hotkey == hotkey_name:
+                    # [2026-06-15] 同一支熱鍵(F11)執行中又被按下 → 終止前一次、改從這次
+                    # 重新開始(其餘熱鍵維持「忙碌略過」)。等同對舊流程做一次 F12:把舊
+                    # thread 加入 per-thread 取消集合(check_stop 會讓它 bail),並 bump token
+                    # 讓舊流程的 finally/看門狗失效;本次直接接手 running。下方沿用既有
+                    # 「取得流程後 clear stop_event」邏輯讓本次乾淨開跑,舊流程靠取消集合
+                    # 終止。注意:本專案在「等醫師回應對話框」期間本就允許他鍵重入,故不
+                    # 以鎖強制互斥(那會破壞該既有行為);搶占與既有 F12→他鍵 行為一致。
+                    is_preempt = True
+                    old_ident = self._subsystem_thread_ident
+                    if old_ident is not None:
+                        with _hotkey_cancelled_threads_lock:
+                            _hotkey_cancelled_threads.add(old_ident)
+                    # 清殘留 stop_event 必須在「同一臨界區」內完成(不可放到鎖外):否則被
+                    # 後續搶占而失效的本呼叫,仍會在鎖外執行 clear、抹掉給新流程的 F12。
+                    # 此處 running 本就為 True(舊流程),clear 只會抹掉「針對舊流程」的 F12,
+                    # 而舊流程已用取消集合中止 → 等同 F12 之效,故安全;給新流程的 F12 會在
+                    # 本臨界區之後、running 仍為 True 時送達,worker 的 check_stop 會看到。
+                    stop_event_automation.clear()
+                    self._subsystem_token += 1
+                    subsystem_token = self._subsystem_token
+                    self._subsystem_running = True   # 維持佔用,直接接手
+                    self._subsystem_current_hotkey = hotkey_name
+                    self._subsystem_thread_ident = None
+                    self._subsystem_thread = None
+                else:
+                    is_busy = True
+                    now = time.monotonic()
+                    if should_show_busy_notice(
+                        now, getattr(self, '_last_hotkey_busy_notice_at', 0.0),
+                    ):
+                        self._last_hotkey_busy_notice_at = now
+                        show_busy_notice = True
             else:
+                # 先 clear 再發佈 running:F12 只在 running=True 時設 stop_event,running 在
+                # clear 之後才為真,故此 clear 不會抹掉本次取得後使用者新按的 F12;且 clear
+                # 在臨界區內,被後續搶占而失效的呼叫不會在鎖外另行 clear 抹掉新流程的 F12。
+                stop_event_automation.clear()
                 self._subsystem_running = True
                 self._subsystem_token += 1
                 subsystem_token = self._subsystem_token
+                self._subsystem_current_hotkey = hotkey_name
 
         if is_busy:
             put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 前一個熱鍵流程尚未完成'))
@@ -11366,11 +11481,26 @@ class AutomationApp:
                 self._show_notice("熱鍵忙碌中", f"{hotkey_name} 已略過，請等待目前自動化完成。", level="warn", auto_close_ms=2500)
             return
 
-        stop_event_automation.clear()
+        if is_preempt:
+            put_ui_message(self.ui_queue, UiStatusMessage(
+                text=f'狀態: {hotkey_name} - 偵測到再次按下，終止前次流程並重新開始'))
+
         def wrapper():
-            logging.info(f"Starting subsystem from {hotkey_name}...")
-            put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 執行中...'))
+            my_ident = threading.get_ident()
             try:
+                # 在本緒內以 token 守衛註冊身分(取代「thread.start() 之後才在外面註冊」),
+                # 消除啟動與註冊之間被第二次 F11 搶占時讀到 ident=None、無法取消前一流程
+                # 的競態。若註冊前 token 已前進=已被後續同熱鍵搶占 → 直接放棄本次。
+                with self._subsystem_lock:
+                    if self._subsystem_token != subsystem_token:
+                        logging.info("[hotkey] %s 啟動前已被後續搶占，放棄本次", hotkey_name)
+                        return
+                    self._subsystem_thread_ident = my_ident
+                    self._subsystem_thread = threading.current_thread()
+                logging.info(f"Starting subsystem from {hotkey_name}...")
+                put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 執行中...'))
+                # 啟動前若已被 F12(stop_event)或後續搶占(取消集合)中止 → 先行 bail。
+                check_stop()
                 result = func()
                 if result is False:
                     logging.warning("Subsystem from %s returned incomplete status", hotkey_name)
@@ -11384,16 +11514,22 @@ class AutomationApp:
                 logging.exception(f"Error in '{hotkey_name}'")
                 put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 發生未預期錯誤'))
             finally:
-                with _hotkey_cancelled_threads_lock:
-                    _hotkey_cancelled_threads.discard(threading.get_ident())
                 with self._subsystem_lock:
                     if getattr(self, '_subsystem_thread_ident', None) == threading.get_ident():
                         self._subsystem_thread_ident = None
-                    # [stability] 只在「仍是本流程 token」時才復位，避免本 thread 若
-                    # 曾卡死、被硬上限看門狗強制復位、之後又有新熱鍵啟動(token 前進)
-                    # 時，這個遲來的 finally 誤清掉新流程的 running 旗標。
+                    # [stability] 只在「仍是本流程 token」時才復位，避免本 thread 若曾卡死、
+                    # 被硬上限看門狗強制復位、之後又有新熱鍵啟動(token 前進)時,這個遲來的
+                    # finally 誤清掉新流程的 running 旗標。
                     if self._subsystem_token == subsystem_token:
                         self._subsystem_running = False
+                        self._subsystem_thread = None
+                        self._subsystem_current_hotkey = None
+                # 在「復位 running 之後」才從取消集合移除本緒 ident:否則在「移除 →
+                # running=False」之間,搶占路徑(僅在 running=True 時)可能把本(即將結束的)
+                # ident 又加回取消集合而永久殘留;該 ident 日後被新 thread 重用時,新流程會
+                # 無故立即中止。復位後 running=False,搶占不再以本流程為對象,此時移除才安全。
+                with _hotkey_cancelled_threads_lock:
+                    _hotkey_cancelled_threads.discard(threading.get_ident())
                 time.sleep(2)
                 with self._subsystem_lock:
                     emit_idle = should_emit_idle_status(
@@ -11403,11 +11539,10 @@ class AutomationApp:
                     )
                 if emit_idle:
                     put_ui_message(self.ui_queue, UiStatusMessage(text='狀態: 閒置'))
+        # 身分註冊改在 wrapper 內(其首個動作,token 守衛)完成 —— 見上,以消除
+        # 「啟動→註冊」之間的搶占競態。此處只負責啟動。
         thread = threading.Thread(target=wrapper, name=f"{hotkey_name}_Thread", daemon=True)
         thread.start()
-        with self._subsystem_lock:
-            if self._subsystem_token == subsystem_token:
-                self._subsystem_thread_ident = thread.ident
 
         # [stability] 硬上限看門狗：若此流程因「無逾時的跨行程呼叫(醫院 app 凍住)」
         # 或任何原因卡住超過 HOTKEY_HARD_TIMEOUT_SEC，wrapper 的 finally 永遠跑不到
@@ -11624,7 +11759,10 @@ class AutomationApp:
             safe_unhook_all_hotkeys()
             for key, (func, name) in hotkeys_to_register.items():
                 f_use = func
-                action = lambda f=f_use, n=name: self.run_subsystem_in_thread(f, n)
+                # F11(快速完成)執行中再按 F11 → 終止前一次、改從這次重新開始;
+                # 其餘熱鍵維持「忙碌中略過」。
+                _preempt = (key == 'F11')
+                action = lambda f=f_use, n=name, p=_preempt: self.run_subsystem_in_thread(f, n, preempt_same=p)
                 if key in NO_GUARD_HOTKEYS:
                     # 完全跳過 class guard — 任何 app 都觸發 (e.g. F8 在瀏覽器)
                     callback = action
