@@ -1131,20 +1131,22 @@ def _extract_consult_text(consult_hwnd: int, cfg: dict,
 
         if radios:
             # ── 主路徑:逐顆病人 radio 同步選取 → 等內文更新 → 讀 memo ──
-            # 每位病人「點選前」先記 baseline。任一情況無法「確認面板已是這位病人
-            # 的內容」就放棄整批逐病人內文(只附準確的病人清單 roster,絕不把別人
-            # 的內容錯置到某病人名下):
+            # 每位病人「點選前」先記 baseline。逐位確認面板內容已是這位病人的;遇到
+            # 第一個無法確認者就【保留已確認的前段、就此停止】,不續讀後續病人。
+            # [安全] 為何停止而非跳過續讀:被跳過病人的「延遲非同步更新」可能在下一位
+            # 的「變化+穩定」判定期間才落地 → 把上一位內容錯置到下一位名下。停止即可
+            # 完全杜絕此 race(已確認的前段都是正確對位的)。準確的病人清單仍照常附上。
             #   (a) 選取未送達;或
             #   (b) 第二位以後點選後內文仍未更新(載入過慢/被忽略 → 無法確認)。
-            # 第一位(idx 0)是開窗預設選取列,內容本就為其所屬,未更新屬正常、保留。
+            # 第一位(idx 0)是開窗預設選取列,內容本就為其所屬,直接讀。
             logging.info("[consult-extract] 偵測到 TRadioButton 病人清單(%d 位)",
                          len(radios))
             for idx, (hwnd, text, _rect) in enumerate(radios):
                 baseline = tuple(t for _l, t in _read_panes_snapshot(panes))
                 if not _select_patient_radio(hwnd):
-                    logging.info("[consult-extract] 選取病人 radio 未送達，"
-                                 "放棄逐病人內文擷取(病人清單仍照常附上)")
-                    entries, labels = [], []
+                    logging.info("[consult-extract] 第 %d 位選取未送達;保留已確認的"
+                                 "前 %d 位、就此停止(不冒險續讀以免錯置)",
+                                 idx + 1, len(entries))
                     break
                 if idx == 0:
                     # 開窗預設選取列:內容本就為其所屬(開窗前已 sleep 等載入),
@@ -1153,13 +1155,10 @@ def _extract_consult_text(consult_hwnd: int, cfg: dict,
                 else:
                     snap, ok = _read_panes_after_change(panes, baseline)
                     if not ok:
-                        # 內文未「脫離 baseline 且穩定」→ 無法確認面板已是這位病人
-                        # (沒換/載入過慢/多面板未定)→ 放棄逐病人內文(避免把上一位
-                        # 或混合內容錯置到這位名下);準確的病人清單仍照常附上。
-                        logging.info("[consult-extract] 第 %d 位內文未穩定更新，"
-                                     "無法確認對應病人，放棄逐病人內文(清單仍附上)",
-                                     idx + 1)
-                        entries, labels = [], []
+                        # 內文未「脫離 baseline 且穩定」→ 無法確認 → 保留前段、停止
+                        # (避免被跳過病人的延遲更新錯置到後續病人名下)。
+                        logging.info("[consult-extract] 第 %d 位內文未穩定更新;保留"
+                                     "已確認的前 %d 位、就此停止", idx + 1, len(entries))
                         break
                 entries.append(snap)
                 labels.append(_patient_display_name(text))
