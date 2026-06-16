@@ -13,10 +13,24 @@
 from __future__ import annotations
 
 import logging
+import socket
+import time as _time
 from datetime import date as _date, datetime, time as dt_time
 from typing import Optional
 
-PUNCH_LOGIN_URL = "http://10.20.8.47/peoplesystem/electron_card/login.aspx"
+PUNCH_HOST = "10.20.8.47"
+PUNCH_LOGIN_URL = f"http://{PUNCH_HOST}/peoplesystem/electron_card/login.aspx"
+
+
+def portal_reachable(host: str = PUNCH_HOST, port: int = 80,
+                     timeout: float = 2.5) -> bool:
+    """快速 TCP 連線測打卡 portal 是否可達(院外/內網斷線時 2.5s 內就回 False,
+    免得後面 Chrome 一個個帳號各等十幾秒才逾時、拖慢寄信)。"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
 
 # datetime.weekday(): 0=Mon .. 6=Sun。打卡設定檔的排班 key 用這些前綴(無 sun=週日不排)。
 _DAY_ABBR = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
@@ -207,43 +221,62 @@ def read_today_swipes(driver, username: str, password: str, *,
         return [], str(e)[:40]
 
 
+def _error_result(username, msg) -> dict:
+    return {"username": str(username), "on": None, "on_time": None,
+            "off": None, "off_time": None, "error": msg}
+
+
 def query_accounts_today(accounts, *, am_window, pm_window,
                          when: Optional[datetime] = None,
-                         headless: bool = True) -> list:
+                         headless: bool = True,
+                         time_budget_sec: float = 90.0,
+                         page_load_timeout_sec: float = 20.0) -> list:
     """自建一個 headless Chrome,逐帳號登入查今日上/下班狀態。完全 fail-open。
     accounts = [{'username','password','schedule'(可選 dict)}, ...]。
     回每帳號 dict:{'username','on','on_time','off','off_time','error'}。
-    am_window/pm_window=(dt_time,dt_time)。任何一帳號失敗只在該筆帶 error,不影響其他。"""
-    results = []
+    am_window/pm_window=(dt_time,dt_time)。任何一帳號失敗只在該筆帶 error,不影響其他。
+
+    韌性:(1) 先 TCP 測 portal 可達(院外/斷線 2.5s 內就全標『連不到』、不啟 Chrome);
+    (2) set_page_load_timeout 限制單頁載入;(3) time_budget_sec 為整批上限,超時後剩餘
+    帳號標『查詢逾時』並停止 —— 避免 portal 卡住把寄信延後好幾分鐘。"""
+    accts = [a for a in (accounts or []) if str(a.get("username", "")).strip()]
+    if not accts:
+        return []
+
+    if not portal_reachable():
+        logging.info("[punch] 打卡 portal 連不到(院外/內網斷線?),跳過打卡查詢")
+        return [_error_result(a.get("username", ""), "打卡系統連不到(院外?)")
+                for a in accts]
+
     try:
         from selenium import webdriver
         from cmuh_common.chrome_options import build_chrome_options
     except Exception as e:  # noqa: BLE001
         logging.warning("[punch] selenium/chrome_options 載入失敗,跳過打卡查詢:%s", e)
-        for a in accounts or []:
-            results.append({"username": str(a.get("username", "")), "on": None,
-                            "on_time": None, "off": None, "off_time": None,
-                            "error": "selenium 不可用"})
-        return results
+        return [_error_result(a.get("username", ""), "selenium 不可用") for a in accts]
 
+    results = []
     driver = None
     try:
         try:
             driver = webdriver.Chrome(options=build_chrome_options(headless=headless))
+            try:
+                driver.set_page_load_timeout(page_load_timeout_sec)
+            except Exception:
+                logging.debug("[punch] set_page_load_timeout 失敗", exc_info=True)
         except Exception as e:  # noqa: BLE001
             logging.warning("[punch] 建立 Chrome 失敗,跳過打卡查詢:%s", e)
-            for a in accounts or []:
-                results.append({"username": str(a.get("username", "")), "on": None,
-                                "on_time": None, "off": None, "off_time": None,
-                                "error": "Chrome 啟動失敗"})
-            return results
+            return [_error_result(a.get("username", ""), "Chrome 啟動失敗") for a in accts]
 
-        for a in accounts or []:
+        deadline = _time.monotonic() + max(10.0, time_budget_sec)
+        for a in accts:
             username = str(a.get("username", "")).strip()
+            if _time.monotonic() > deadline:
+                # 整批已超時 → 剩餘帳號不再查,標逾時(避免無限拖慢寄信)
+                results.append(_error_result(username, "查詢逾時(略過)"))
+                continue
             password = str(a.get("password", ""))
             schedule = a.get("schedule") if isinstance(a.get("schedule"), dict) else {}
-            if not username:
-                continue
             swipes, err = read_today_swipes(driver, username, password)
             ev = evaluate_account(schedule, swipes, am_window, pm_window, when)
             ev["username"] = username

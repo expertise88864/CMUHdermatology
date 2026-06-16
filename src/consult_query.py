@@ -1131,14 +1131,24 @@ def _format_punch_html(results: list) -> str:
 
 
 def _load_autoclock_accounts() -> list:
-    """讀 autoclock_config.json 的帳號清單(只取有 username 的 dict)。fail-open 回 []。"""
+    """讀 autoclock_config.json 的帳號清單(有 username 的 dict,依 username 去重,保留
+    第一筆)。fail-open 回 []。去重避免設定檔誤填重複帳號時白白多登入一次。"""
     try:
         data = safe_load_json(_AUTOCLOCK_CONFIG_FILE, [])
     except Exception:
         return []
     if not isinstance(data, list):
         return []
-    return [a for a in data if isinstance(a, dict) and a.get("username")]
+    out, seen = [], set()
+    for a in data:
+        if not (isinstance(a, dict) and a.get("username")):
+            continue
+        u = str(a["username"]).strip()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append(a)
+    return out
 
 
 def _build_punch_status_sections(cfg: dict) -> tuple:

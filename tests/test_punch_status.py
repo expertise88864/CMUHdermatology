@@ -102,3 +102,19 @@ def test_evaluate_account_midday_clock_in_satisfies_morning():
     ev = ps.evaluate_account(sched, [("1150", "上班")], AM, PM, MON)
     assert ev["on"] == "ok" and ev["on_time"] == "11:50"
     assert ev["off"] == "off"
+
+
+def test_query_accounts_skips_when_portal_unreachable(monkeypatch):
+    """portal 連不到(院外)→ 不啟 Chrome,全部標『連不到』,快速返回。"""
+    monkeypatch.setattr(ps, "portal_reachable", lambda *a, **k: False)
+    accts = [{"username": "101358", "password": "x", "schedule": {}},
+             {"username": "D34251", "password": "y", "schedule": {}}]
+    res = ps.query_accounts_today(accts, am_window=AM, pm_window=PM)
+    assert len(res) == 2
+    assert all(r["error"] and "連不到" in r["error"] for r in res)
+    assert all(r["on"] is None and r["off"] is None for r in res)
+
+
+def test_query_accounts_empty_returns_empty(monkeypatch):
+    monkeypatch.setattr(ps, "portal_reachable", lambda *a, **k: True)
+    assert ps.query_accounts_today([], am_window=AM, pm_window=PM) == []

@@ -612,6 +612,18 @@ def test_format_punch_html_states_and_escaping():
     assert cq._format_punch_html([]) == ""
 
 
+def test_load_autoclock_accounts_dedups_and_filters(monkeypatch):
+    monkeypatch.setattr(cq, "safe_load_json", lambda *a, **k: [
+        {"username": "101358", "password": "a"},
+        {"username": "101358", "password": "b"},   # 重複 username → 去掉
+        {"username": "D34251", "password": "c"},
+        {"no_username": True},                       # 無 username → 略過
+        "not-a-dict",                                # 非 dict → 略過
+    ])
+    out = cq._load_autoclock_accounts()
+    assert [a["username"] for a in out] == ["101358", "D34251"]
+
+
 def test_punch_text_cell_labels():
     assert cq._punch_text_cell("ok", "08:15") == "✅ 成功（08:15）"
     assert cq._punch_text_cell("ok", None) == "✅ 成功"
