@@ -474,22 +474,28 @@ _orig_create_connection = _urllib3_conn.create_connection
 _orig_getaddrinfo = _socket.getaddrinfo
 
 # =============================================================================
-# [O36] Session 級熔斷器（Circuit Breaker）
-# 同個來源（east/auh/huisheng）連續失敗 N 次後，本 session 內完全停止嘗試。
-# 即使 backoff 過期也不再試。下次重啟程式才會重置。
-# 這避免「每 5 分鐘重複等 2 秒 timeout」的累積消耗。
+# [O36] 來源級熔斷器（Circuit Breaker）
+# 同個來源（east/auh/huisheng）連續失敗 N 次後暫停嘗試，避免「每 5 分鐘重複等
+# 2 秒 timeout」的累積消耗。
+# [2026-06-16 韌性] 改為「跳閘後逾 RESET 窗(30 分鐘)自動重置、放行一次重試」——
+# 原本一旦跳閘要重啟程式才恢復:醫院端短暫維護(剛好 3 次失敗)就會讓該來源整個
+# session(可能一整個下午)都沒資料,使用者只看到「無資料」卻不知是被熔斷。改為
+# 定時自我恢復:來源復原就 success 清掉;仍掛則再累積跳閘,不會回到狂打 timeout。
 # =============================================================================
-_CIRCUIT_BREAKER_STATE: dict[str, int] = {}  # source_key → consecutive_fail_count
+# source_key → {"fails": int, "tripped_at": monotonic 或 None}
+_CIRCUIT_BREAKER_STATE: dict[str, dict] = {}
 _CIRCUIT_BREAKER_LOCK = threading.Lock()
-_CIRCUIT_BREAKER_THRESHOLD = 3  # 連續 3 次失敗 → tripped
+_CIRCUIT_BREAKER_THRESHOLD = 3        # 連續 3 次失敗 → tripped
+_CIRCUIT_BREAKER_RESET_SEC = 1800.0   # 跳閘逾 30 分鐘 → 自動重置,放行一次重試
 
 
 def _circuit_record_fail(source: str) -> bool:
     """記錄失敗，回傳是否剛跳過閾值。"""
     with _CIRCUIT_BREAKER_LOCK:
-        n = _CIRCUIT_BREAKER_STATE.get(source, 0) + 1
-        _CIRCUIT_BREAKER_STATE[source] = n
-        if n == _CIRCUIT_BREAKER_THRESHOLD:
+        st = _CIRCUIT_BREAKER_STATE.setdefault(source, {"fails": 0, "tripped_at": None})
+        st["fails"] += 1
+        if st["fails"] == _CIRCUIT_BREAKER_THRESHOLD:
+            st["tripped_at"] = time.monotonic()
             return True  # 剛跳閾
         return False
 
@@ -497,14 +503,22 @@ def _circuit_record_fail(source: str) -> bool:
 def _circuit_record_success(source: str) -> None:
     """成功 → 重置計數。"""
     with _CIRCUIT_BREAKER_LOCK:
-        if source in _CIRCUIT_BREAKER_STATE:
-            del _CIRCUIT_BREAKER_STATE[source]
+        _CIRCUIT_BREAKER_STATE.pop(source, None)
 
 
 def _circuit_is_tripped(source: str) -> bool:
-    """是否已達閾值（本 session 不再試）。"""
+    """是否仍熔斷中。跳閘逾 RESET 窗 → 自動重置並放行一次重試(回 False)。"""
     with _CIRCUIT_BREAKER_LOCK:
-        return _CIRCUIT_BREAKER_STATE.get(source, 0) >= _CIRCUIT_BREAKER_THRESHOLD
+        st = _CIRCUIT_BREAKER_STATE.get(source)
+        if not st or st["fails"] < _CIRCUIT_BREAKER_THRESHOLD:
+            return False
+        ta = st.get("tripped_at")
+        if ta is not None and (time.monotonic() - ta) >= _CIRCUIT_BREAKER_RESET_SEC:
+            _CIRCUIT_BREAKER_STATE.pop(source, None)
+            logging.info("[circuit] 來源 %s 熔斷逾 %d 分鐘,自動重置重試",
+                         source, int(_CIRCUIT_BREAKER_RESET_SEC // 60))
+            return False
+        return True
 
 
 def _ipv4_first_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
@@ -6263,6 +6277,13 @@ class AutomationApp:
             thread_name_prefix="AppBgTask",
             reject_message="main background task backlog is full",
         )
+        # [2026-06-16 韌性] 鎖使用守則(避免 ABBA 死鎖):這些 app 狀態鎖各自保護一份
+        # 資料,「原則上一次只持有一把、且只圈住純記憶體操作、不在持鎖時做網路/磁碟
+        # /子行程 I/O」。若真的需要巢狀,固定以下取得順序(由外而內):
+        #   _subsystem_lock → _refresh_queue_lock → _tracker_lock → _doctor_data_lock
+        #   → _clinic_dynamic_state_lock → _history_lock → _alert_state_lock
+        # 跨物件鎖(模組級)如 status_driver_pool 的 init_lock→lock 為獨立子系統,不與
+        # 上列交叉持有。新增鎖請接在此清單末端並沿用「先外後內」原則。
         self._tracker_lock = threading.Lock()
         self._history_lock = threading.Lock()
         self._doctor_data_lock = threading.Lock()
