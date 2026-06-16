@@ -44,6 +44,8 @@ class _JobHarness:
         self.sleeps = []
         self.released = []      # _release_trigger_dedup 收到的 senders
         self.failure_notices = []  # (recipients, reason)
+        self.punch_text = ""       # stub 的打卡狀態純文字段落
+        self.punch_html = ""       # stub 的打卡狀態 HTML 段落
         self._fail_times = fail_times
 
         monkeypatch.setattr(cq, "load_config", lambda: dict(cfg))
@@ -77,6 +79,13 @@ class _JobHarness:
             cq, "_send_failure_notice_async",
             lambda recipients, reason: self.failure_notices.append(
                 (list(recipients), reason)))
+        # [2026-06-15] 打卡狀態查詢會起 Chrome,測決策邏輯時 stub 掉(回空段落)。
+        self.punch_calls = 0
+
+        def _stub_punch(cfg):
+            self.punch_calls += 1
+            return self.punch_text, self.punch_html
+        monkeypatch.setattr(cq, "_build_punch_status_sections", _stub_punch)
 
 
 # ─── _do_full_job 收件人路由 ─────────────────────────────────────────────
@@ -538,6 +547,75 @@ def test_format_extracted_entries_with_named_labels():
     assert "【李大華】" in out and "帶狀疱疹" in out
     assert "【王小明】" not in out      # 內容空 → 整段跳過
     assert "【病人" not in out          # 有 label 就不用預設編號
+
+
+# ─── [2026-06-15] 排程時間自動升級 12:30/17:00 → 12:31/17:01 ──────────────
+
+def test_load_config_migrates_old_default_times(monkeypatch, tmp_path):
+    import json
+    p = tmp_path / "consult_query_config.json"
+    p.write_text(json.dumps({"weekday_times": ["12:30", "17:00"],
+                             "weekend_times": ["12:30", "17:00"]}),
+                 encoding="utf-8")
+    monkeypatch.setattr(cq, "CONFIG_FILE", p)
+    cfg = cq.load_config()
+    assert cfg["weekday_times"] == ["12:31", "17:01"]
+    assert cfg["weekend_times"] == ["12:31", "17:01"]
+    saved = json.loads(p.read_text(encoding="utf-8"))   # 已寫回升級
+    assert saved["weekday_times"] == ["12:31", "17:01"]
+
+
+def test_load_config_keeps_custom_times(monkeypatch, tmp_path):
+    """使用者自訂過的時間(非舊預設)不可被升級覆蓋。"""
+    import json
+    p = tmp_path / "consult_query_config.json"
+    p.write_text(json.dumps({"weekday_times": ["12:00", "16:00"],
+                             "weekend_times": ["09:00"]}), encoding="utf-8")
+    monkeypatch.setattr(cq, "CONFIG_FILE", p)
+    cfg = cq.load_config()
+    assert cfg["weekday_times"] == ["12:00", "16:00"]
+    assert cfg["weekend_times"] == ["09:00"]
+
+
+# ─── [2026-06-15] 今日打卡狀態併入信件 ────────────────────────────────────
+
+def test_format_punch_text_states():
+    results = [
+        {"username": "101358", "on": "ok", "on_time": "08:15",
+         "off": "ok", "off_time": "17:05", "error": None},
+        {"username": "D34251", "on": "fail", "on_time": None,
+         "off": "off", "off_time": None, "error": None},
+        {"username": "N24367", "on": None, "on_time": None,
+         "off": None, "off_time": None, "error": "登入逾時/失敗"},
+    ]
+    out = cq._format_punch_text(results)
+    assert "今日打卡狀態（3 個帳號" in out
+    assert "101358" in out and "✅ 成功（08:15）" in out
+    assert "D34251" in out and "❌ 未打卡" in out and "➖ 今日無排班" in out
+    assert "N24367" in out and "⚠️ 查詢失敗（登入逾時/失敗）" in out
+    assert cq._format_punch_text([]) == ""
+
+
+def test_format_punch_html_states_and_escaping():
+    results = [
+        {"username": "101358", "on": "ok", "on_time": "08:15",
+         "off": "fail", "off_time": None, "error": None},
+        {"username": "N24367", "on": None, "on_time": None,
+         "off": None, "off_time": None, "error": "<bad&>"},
+    ]
+    html = cq._format_punch_html(results)
+    assert "今日打卡狀態" in html and "2 個帳號" in html
+    assert "101358" in html and "成功" in html and "未打卡" in html
+    # 錯誤訊息必須 HTML escape(防注入)
+    assert "&lt;bad&amp;&gt;" in html and "<bad&>" not in html
+    assert cq._format_punch_html([]) == ""
+
+
+def test_punch_text_cell_labels():
+    assert cq._punch_text_cell("ok", "08:15") == "✅ 成功（08:15）"
+    assert cq._punch_text_cell("ok", None) == "✅ 成功"
+    assert cq._punch_text_cell("fail", None) == "❌ 未打卡"
+    assert cq._punch_text_cell("off", None) == "➖ 今日無排班"
 
 
 def test_cleanup_excludes_user_instance_when_borrowed():

@@ -40,6 +40,8 @@ REQUIRED_LIBS = [
     ("Pillow", "PIL"),
     ("psutil", "psutil"),
     ("pywin32", "win32gui"),
+    # [2026-06-15] 信件併入打卡狀態需用 selenium 查打卡 portal(headless Chrome)。
+    ("selenium", "selenium"),
 ]
 ensure_dependencies(REQUIRED_LIBS)
 
@@ -54,7 +56,7 @@ import threading  # noqa: E402
 import time  # noqa: E402
 import traceback  # noqa: E402
 import tkinter as tk  # noqa: E402
-from datetime import datetime  # noqa: E402
+from datetime import datetime, time as dt_time  # noqa: E402
 from pathlib import Path  # noqa: E402
 from tkinter import messagebox, scrolledtext, ttk  # noqa: E402
 
@@ -144,11 +146,14 @@ DEFAULT_CONFIG = {
         "wesjefflee1111@gmail.com",
         "mbpushowo@gmail.com",
     ],
-    # 每天 12:30 + 17:00 都跑（不分平假日）
-    "weekday_times": ["12:30", "17:00"],   # 週一～週五
-    "weekend_times": ["12:30", "17:00"],   # 週六、週日（與平日相同）
+    # [2026-06-15] 每天 12:31 + 17:01 都跑（不分平假日）。延後 1 分鐘是為了在查詢會診的
+    # 同時，連帶查得到「中午前(12:30 截止)上班」與「17:00-17:30 下班」的打卡紀錄併入信件。
+    "weekday_times": ["12:31", "17:01"],   # 週一～週五
+    "weekend_times": ["12:31", "17:01"],   # 週六、週日（與平日相同）
     "subject_template": "{date} {time} 皮膚科會診通知單",
     "body_template": "附件為 {date} {time} 皮膚科會診通知單截圖，由系統自動擷取寄送。",
+    # [2026-06-15] 信件併入「今日打卡狀態」(autoclock 各帳號 上/下班)。關掉就不查不附。
+    "punch_status_in_email": True,
     "enabled": True,
     # 寄信方式："smtp"（推薦，預設，直接連 Gmail SMTP）或 "outlook"（透過
     # Outlook COM；admin 行程跟 user-level Outlook profile 不同會卡在 Outbox，
@@ -260,6 +265,14 @@ def _setup_logging() -> None:
 # =============================================================================
 # 設定檔
 # =============================================================================
+# [2026-06-15] 舊預設排程時間 → 新預設的自動升級對照。只有「完全等於舊預設」的
+# 設定檔才升級(沿用內建預設、沒自訂過的機器);使用者改過時間一律不動。
+_SCHED_TIME_MIGRATION = {
+    "weekday_times": (["12:30", "17:00"], ["12:31", "17:01"]),
+    "weekend_times": (["12:30", "17:00"], ["12:31", "17:01"]),
+}
+
+
 def load_config() -> dict:
     with _config_lock:
         cfg = dict(DEFAULT_CONFIG)
@@ -285,6 +298,21 @@ def load_config() -> dict:
             if not isinstance(cfg.get(key), list):
                 cfg[key] = list(DEFAULT_CONFIG[key])
             cfg[key] = [str(t).strip() for t in cfg[key] if str(t).strip()]
+        # [2026-06-15] 把「沿用舊預設 12:30/17:00」的存檔自動升級為新預設 12:31/17:01
+        # (延後 1 分鐘以連帶查得到中午前上班/17:00-17:30 下班的打卡)。只有完全等於
+        # 舊預設才升級;自訂過的時間不動。已在鎖內 → 直接 atomic_write_json 寫回。
+        migrated = False
+        for key, (old_def, new_def) in _SCHED_TIME_MIGRATION.items():
+            if cfg.get(key) == old_def:
+                cfg[key] = list(new_def)
+                migrated = True
+        if migrated:
+            try:
+                atomic_write_json(str(CONFIG_FILE), cfg)
+                logging.info("[migrate] 會診排程時間 12:30/17:00 → 12:31/17:01")
+            except Exception:
+                logging.warning("[migrate] 寫回升級後設定失敗(不影響本次執行)",
+                                exc_info=True)
         # 數值欄位防呆
         cfg["retry_count"] = _normalize_retry_count(cfg.get("retry_count", 3))
         # 觸發輪詢週期：限制 5-300 秒，超出範圍退回預設
@@ -1007,6 +1035,124 @@ def _build_consult_email_html(date_str: str, time_str: str, intro: str,
         f'line-height:1.6;color:{_MAIL_FAINT};">本信由中國醫皮膚科系統自動擷取'
         '寄送　·　內容僅供輔助閱讀,正式內容以附件截圖為準</div>'
         '</div></div></body></html>')
+
+
+# =============================================================================
+# [新功能 2026-06-15] 今日打卡狀態併入信件
+# 查 autoclock 各帳號今日「上班(07:30-12:30,含早上/中午上班)」與「下班
+# (17:00-17:30)」是否完成,排了班卻沒打到才標紅「未打卡」,沒排班標「無排班」。
+# 資料源 = 打卡 portal 真實紀錄(cmuh_common.punch_status,自建 headless Chrome)。
+# 完全 fail-open:查不到/查失敗都不影響會診信寄出。
+# =============================================================================
+_AUTOCLOCK_CONFIG_FILE = SETTINGS_DIR / "autoclock_config.json"
+# 上班窗涵蓋早上(am_in)與中午(midday_in)上班;下班窗為 pm_out。
+_PUNCH_AM_WINDOW = (dt_time(7, 30), dt_time(12, 30))
+_PUNCH_PM_WINDOW = (dt_time(17, 0), dt_time(17, 30))
+
+# state → (純文字標籤, HTML 文字色, HTML 底色)
+_PUNCH_VIEW = {
+    "ok":   ("✅ 成功", "#15803d", "#e8f5ee"),
+    "fail": ("❌ 未打卡", "#c0392b", "#fbeceb"),
+    "off":  ("➖ 今日無排班", _MAIL_FAINT, "#f4f5f6"),
+}
+
+
+def _punch_text_cell(state, time_str) -> str:
+    """單一上/下班狀態 → 純文字。純函式。"""
+    label = _PUNCH_VIEW.get(state, ("— 不明", "", ""))[0]
+    if state == "ok" and time_str:
+        return f"{label}（{time_str}）"
+    return label
+
+
+def _format_punch_text(results: list) -> str:
+    """各帳號今日上/下班狀態 → 純文字段落。純函式;空回空字串。
+    results=[{username, on, on_time, off, off_time, error}]。"""
+    if not results:
+        return ""
+    lines = [f"今日打卡狀態（{len(results)} 個帳號，上班 07:30-12:30 / 下班 17:00-17:30）："]
+    for r in results:
+        u = str(r.get("username", "")).strip()
+        if r.get("error"):
+            lines.append(f"  {u}　⚠️ 查詢失敗（{r['error']}）")
+            continue
+        on = _punch_text_cell(r.get("on"), r.get("on_time"))
+        off = _punch_text_cell(r.get("off"), r.get("off_time"))
+        lines.append(f"  {u}　上班 {on}　下班 {off}")
+    return "\n".join(lines)
+
+
+def _punch_badge_html(state, time_str) -> str:
+    """單一狀態 → 彩色徽章 HTML。純函式。"""
+    label, fg, bg = _PUNCH_VIEW.get(state, ("不明", _MAIL_MUTED, "#f4f5f6"))
+    t = f"　{_esc(time_str)}" if (state == "ok" and time_str) else ""
+    return (f'<span style="display:inline-block;padding:3px 10px;border-radius:11px;'
+            f'background:{bg};color:{fg};font-size:12px;font-weight:600;'
+            f'white-space:nowrap;">{_esc(label)}{t}</span>')
+
+
+def _format_punch_html(results: list) -> str:
+    """各帳號今日上/下班狀態 → HTML 表格(信箋式)。純函式;空回空字串。"""
+    if not results:
+        return ""
+    th = (f"padding:0 0 8px;border-bottom:1px solid {_MAIL_HEAD};font-size:10.5px;"
+          f"letter-spacing:.8px;color:{_MAIL_FAINT};text-transform:uppercase;"
+          "text-align:left;")
+    rows = [f'<tr><td style="{th}">打卡帳號</td><td style="{th}">上班</td>'
+            f'<td style="{th}">下班</td></tr>']
+    last = len(results)
+    for i, r in enumerate(results, 1):
+        line = "" if i == last else f"border-bottom:1px solid {_MAIL_ROW};"
+        td = f"padding:11px 0;{line}font-size:13px;color:{_MAIL_SUB};"
+        u = str(r.get("username", "")).strip()
+        name_td = (f'<td style="{td}color:{_MAIL_INK};font-weight:500;'
+                   f'font-variant-numeric:tabular-nums;">{_esc(u)}</td>')
+        if r.get("error"):
+            rows.append(
+                f'<tr>{name_td}<td style="{td}color:#b7791f;" colspan="2">'
+                f'⚠️ 查詢失敗（{_esc(r["error"])}）</td></tr>')
+        else:
+            rows.append(
+                f'<tr>{name_td}'
+                f'<td style="{td}">{_punch_badge_html(r.get("on"), r.get("on_time"))}</td>'
+                f'<td style="{td}">{_punch_badge_html(r.get("off"), r.get("off_time"))}</td>'
+                f'</tr>')
+    return (
+        _section_label(f"今日打卡狀態　·　{len(results)} 個帳號")
+        + '<table style="width:100%;border-collapse:collapse;">'
+        + "".join(rows) + "</table>")
+
+
+def _load_autoclock_accounts() -> list:
+    """讀 autoclock_config.json 的帳號清單(只取有 username 的 dict)。fail-open 回 []。"""
+    try:
+        data = safe_load_json(_AUTOCLOCK_CONFIG_FILE, [])
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [a for a in data if isinstance(a, dict) and a.get("username")]
+
+
+def _build_punch_status_sections(cfg: dict) -> tuple:
+    """查各帳號今日上/下班 → (純文字段落, HTML 段落)。完全 fail-open:任何失敗回
+    ('','')、不影響會診信寄出(打卡只是附帶資訊)。"""
+    if not cfg.get("punch_status_in_email", True):
+        return "", ""
+    try:
+        accounts = _load_autoclock_accounts()
+        if not accounts:
+            logging.info("[punch] 無 autoclock 帳號,信件不附打卡狀態")
+            return "", ""
+        from cmuh_common.punch_status import query_accounts_today
+        logging.info("[punch] 查詢 %d 個帳號今日打卡狀態…", len(accounts))
+        results = query_accounts_today(
+            accounts, am_window=_PUNCH_AM_WINDOW, pm_window=_PUNCH_PM_WINDOW)
+        return _format_punch_text(results), _format_punch_html(results)
+    except Exception:
+        logging.warning("[punch] 打卡狀態查詢/組裝失敗(會診信照常寄,不附打卡)",
+                        exc_info=True)
+        return "", ""
 
 
 def _format_extracted_entries(entries: list, labels: list | None = None) -> str:
@@ -1960,13 +2106,20 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                              recipients_label, mail_method)
                 shot, extracted_text, extracted_html = run_consult_flow(
                     trigger_label)
+                # [新功能 2026-06-15] 查今日打卡狀態(各帳號 上/下班),併入信件最前。
+                # 完全 fail-open:查不到只回空字串,會診信照常寄。
+                punch_text, punch_html = _build_punch_status_sections(cfg)
                 # [新功能 2026-06-13] 擷取到的會診文字附在信件內文(截圖仍為主)
-                final_body = (f"{body}\n\n{extracted_text}"
-                              if extracted_text else body)
+                text_parts = [body]
+                if punch_text:
+                    text_parts.append(punch_text)
+                if extracted_text:
+                    text_parts.append(extracted_text)
+                final_body = "\n\n".join(text_parts)
                 # [美化 2026-06-15] HTML 版排版(multipart/alternative;純文字為
-                # fallback)。截圖附件照常夾帶。
+                # fallback)。打卡狀態置於會診內容之前。截圖附件照常夾帶。
                 final_html = _build_consult_email_html(
-                    date_str, time_str, body, extracted_html)
+                    date_str, time_str, body, punch_html + extracted_html)
                 if mail_method == "smtp":
                     send_via_smtp(shot, subject, final_body, recipients,
                                   html_body=final_html)
