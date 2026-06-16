@@ -146,10 +146,11 @@ DEFAULT_CONFIG = {
         "wesjefflee1111@gmail.com",
         "mbpushowo@gmail.com",
     ],
-    # [2026-06-15] 每天 12:31 + 17:01 都跑（不分平假日）。延後 1 分鐘是為了在查詢會診的
-    # 同時，連帶查得到「中午前(12:30 截止)上班」與「17:00-17:30 下班」的打卡紀錄併入信件。
-    "weekday_times": ["12:31", "17:01"],   # 週一～週五
-    "weekend_times": ["12:31", "17:01"],   # 週六、週日（與平日相同）
+    # [2026-06-16] 每天 12:40 + 17:10 都跑（不分平假日）。打卡系統於 7:31/12:31/17:01
+    # 才登入打卡，故延後到 12:40 / 17:10 再查詢寄信，確保中午(12:31)上班與下午(17:01)
+    # 下班打卡都「已完成並寫入紀錄」後才查，不會還沒打卡就先寄出誤判未打卡。
+    "weekday_times": ["12:40", "17:10"],   # 週一～週五
+    "weekend_times": ["12:40", "17:10"],   # 週六、週日（與平日相同）
     "subject_template": "{date} {time} 皮膚科會診通知單",
     "body_template": "附件為 {date} {time} 皮膚科會診通知單截圖，由系統自動擷取寄送。",
     # [2026-06-15] 信件併入「今日打卡狀態」(autoclock 各帳號 上/下班)。關掉就不查不附。
@@ -265,11 +266,15 @@ def _setup_logging() -> None:
 # =============================================================================
 # 設定檔
 # =============================================================================
-# [2026-06-15] 舊預設排程時間 → 新預設的自動升級對照。只有「完全等於舊預設」的
-# 設定檔才升級(沿用內建預設、沒自訂過的機器);使用者改過時間一律不動。
+# [2026-06-15] 舊預設排程時間 → 新預設的自動升級對照。只有「完全等於某一代舊預設」
+# 的設定檔才升級(沿用內建預設、沒自訂過的機器);使用者改過時間一律不動。
+# 每個值 = (歷代舊預設清單, 新預設):同時涵蓋 12:30/17:00 與上一版 12:31/17:01,
+# 沿用任一代舊預設的機器更新後都會自動升級到 12:40/17:10。
+_OLD_SCHED_DEFAULTS = [["12:30", "17:00"], ["12:31", "17:01"]]
+_NEW_SCHED_DEFAULT = ["12:40", "17:10"]
 _SCHED_TIME_MIGRATION = {
-    "weekday_times": (["12:30", "17:00"], ["12:31", "17:01"]),
-    "weekend_times": (["12:30", "17:00"], ["12:31", "17:01"]),
+    "weekday_times": (_OLD_SCHED_DEFAULTS, _NEW_SCHED_DEFAULT),
+    "weekend_times": (_OLD_SCHED_DEFAULTS, _NEW_SCHED_DEFAULT),
 }
 
 
@@ -298,18 +303,18 @@ def load_config() -> dict:
             if not isinstance(cfg.get(key), list):
                 cfg[key] = list(DEFAULT_CONFIG[key])
             cfg[key] = [str(t).strip() for t in cfg[key] if str(t).strip()]
-        # [2026-06-15] 把「沿用舊預設 12:30/17:00」的存檔自動升級為新預設 12:31/17:01
-        # (延後 1 分鐘以連帶查得到中午前上班/17:00-17:30 下班的打卡)。只有完全等於
-        # 舊預設才升級;自訂過的時間不動。已在鎖內 → 直接 atomic_write_json 寫回。
+        # [2026-06-16] 把「沿用任一代舊預設(12:30/17:00 或 12:31/17:01)」的存檔自動
+        # 升級為新預設 12:40/17:10(延後以確保打卡完成後才查)。只有完全等於某代舊預設
+        # 才升級;自訂過的時間不動。已在鎖內 → 直接 atomic_write_json 寫回。
         migrated = False
-        for key, (old_def, new_def) in _SCHED_TIME_MIGRATION.items():
-            if cfg.get(key) == old_def:
+        for key, (old_defs, new_def) in _SCHED_TIME_MIGRATION.items():
+            if cfg.get(key) in old_defs:
                 cfg[key] = list(new_def)
                 migrated = True
         if migrated:
             try:
                 atomic_write_json(str(CONFIG_FILE), cfg)
-                logging.info("[migrate] 會診排程時間 12:30/17:00 → 12:31/17:01")
+                logging.info("[migrate] 會診排程時間升級為 %s", _NEW_SCHED_DEFAULT)
             except Exception:
                 logging.warning("[migrate] 寫回升級後設定失敗(不影響本次執行)",
                                 exc_info=True)
@@ -1045,8 +1050,10 @@ def _build_consult_email_html(date_str: str, time_str: str, intro: str,
 # 完全 fail-open:查不到/查失敗都不影響會診信寄出。
 # =============================================================================
 _AUTOCLOCK_CONFIG_FILE = SETTINGS_DIR / "autoclock_config.json"
-# 上班窗涵蓋早上(am_in)與中午(midday_in)上班;下班窗為 pm_out。
-_PUNCH_AM_WINDOW = (dt_time(7, 30), dt_time(12, 30))
+# 上班窗涵蓋早上(am_in,7:31)與中午(midday_in,12:31)上班。打卡系統中午是 12:31 才
+# 打卡(落在官方 12:30-13:00 窗),故上班窗需到 12:40(信件 12:40 才寄,屆時該筆已寫入)
+# 才抓得到中午上班;若只到 12:30 會漏掉 12:31 的中午上班、誤判未打卡。下班窗為 pm_out。
+_PUNCH_AM_WINDOW = (dt_time(7, 30), dt_time(12, 40))
 _PUNCH_PM_WINDOW = (dt_time(17, 0), dt_time(17, 30))
 
 # state → (純文字標籤, HTML 文字色, HTML 底色)

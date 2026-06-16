@@ -551,22 +551,23 @@ def test_format_extracted_entries_with_named_labels():
 
 # ─── [2026-06-15] 排程時間自動升級 12:30/17:00 → 12:31/17:01 ──────────────
 
-def test_load_config_migrates_old_default_times(monkeypatch, tmp_path):
+def test_load_config_migrates_both_old_default_times(monkeypatch, tmp_path):
+    """沿用任一代舊預設(12:30/17:00 或 12:31/17:01)→ 升級為 12:40/17:10 並寫回。"""
     import json
-    p = tmp_path / "consult_query_config.json"
-    p.write_text(json.dumps({"weekday_times": ["12:30", "17:00"],
-                             "weekend_times": ["12:30", "17:00"]}),
-                 encoding="utf-8")
-    monkeypatch.setattr(cq, "CONFIG_FILE", p)
-    cfg = cq.load_config()
-    assert cfg["weekday_times"] == ["12:31", "17:01"]
-    assert cfg["weekend_times"] == ["12:31", "17:01"]
-    saved = json.loads(p.read_text(encoding="utf-8"))   # 已寫回升級
-    assert saved["weekday_times"] == ["12:31", "17:01"]
+    for idx, old in enumerate((["12:30", "17:00"], ["12:31", "17:01"])):
+        p = tmp_path / f"cfg_{idx}.json"
+        p.write_text(json.dumps({"weekday_times": old, "weekend_times": old}),
+                     encoding="utf-8")
+        monkeypatch.setattr(cq, "CONFIG_FILE", p)
+        cfg = cq.load_config()
+        assert cfg["weekday_times"] == ["12:40", "17:10"]
+        assert cfg["weekend_times"] == ["12:40", "17:10"]
+        saved = json.loads(p.read_text(encoding="utf-8"))   # 已寫回升級
+        assert saved["weekday_times"] == ["12:40", "17:10"]
 
 
 def test_load_config_keeps_custom_times(monkeypatch, tmp_path):
-    """使用者自訂過的時間(非舊預設)不可被升級覆蓋。"""
+    """使用者自訂過的時間(非任一代舊預設)不可被升級覆蓋。"""
     import json
     p = tmp_path / "consult_query_config.json"
     p.write_text(json.dumps({"weekday_times": ["12:00", "16:00"],

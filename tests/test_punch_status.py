@@ -45,6 +45,13 @@ def test_swipe_in_window_noon_clock_in_counts():
     assert ps.swipe_in_window(swipes, "上班", *AM) == "11:00"
 
 
+def test_midday_clock_in_1231_needs_window_to_1240():
+    """打卡系統中午 12:31 才打卡;上班窗必須到 12:40 才抓得到(只到 12:30 會漏)。"""
+    swipes = [("1231", "上班")]
+    assert ps.swipe_in_window(swipes, "上班", dt_time(7, 30), dt_time(12, 30)) is None
+    assert ps.swipe_in_window(swipes, "上班", dt_time(7, 30), dt_time(12, 40)) == "12:31"
+
+
 def test_swipe_outside_window_is_none():
     swipes = [("0700", "上班"), ("1740", "下班")]  # 都在窗外
     assert ps.swipe_in_window(swipes, "上班", *AM) is None
