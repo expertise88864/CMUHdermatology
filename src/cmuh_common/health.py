@@ -180,7 +180,7 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
                   auto_restart_on_crit: bool,
                   crit_persistence_ticks: int,
                   disk_check_path: str,
-                  restart_callback=None) -> None:
+                  restart_callback=None, warn_callback=None) -> None:
     """背景監看迴圈。"""
     logging.info(
         "[health/%s] monitor 啟動 — RAM warn=%dMB crit=%dMB interval=%ds "
@@ -229,6 +229,16 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
                     "[health/%s] RAM=%.0fMB ≥ critical %dMB (連續 critical %d 次)；"
                     "考慮重啟",
                     tag, rss_mb, ram_crit_mb, consecutive_critical_ram)
+                # [2026-06-16 觀測] 自動重啟「前一個 tick」先警示使用者(讓他存檔),
+                # 不是等真的要重啟才無預警消失。只警示一次(streak 剛好到 N-1 那次)。
+                if (auto_restart_on_crit and warn_callback is not None
+                        and crit_persistence_ticks >= 2
+                        and consecutive_critical_ram == crit_persistence_ticks - 1):
+                    try:
+                        warn_callback(rss_mb, ram_crit_mb, max(1, interval_sec // 60))
+                    except Exception:
+                        logging.debug("[health/%s] warn_callback 失敗", tag,
+                                      exc_info=True)
                 # [A] 若連續超過 critical 達 N 次 → 自動重啟 (記憶體 leak 防護)
                 if (auto_restart_on_crit
                         and consecutive_critical_ram >= crit_persistence_ticks):
@@ -238,18 +248,25 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
                         consecutive_critical_ram * interval_sec // 60)
                     _flush_logging_handlers_nonblocking()
                     # 有 restart_callback（如主程式：本身沒有外層 watchdog 接手）→
-                    # 先 spawn 新 instance 再結束本 process（callback 內部會 os._exit）。
-                    # 沒 callback（會診/打卡：有外層 watchdog）→ 直接 os._exit(1) 由外層
-                    # watchdog 重啟。callback 沒成功 spawn 而返回 → 退回 os._exit(1)
-                    # （與舊行為相同，不會更糟）。
+                    # 先 spawn 新 instance 再結束本 process（callback=restart_self,成功
+                    # 會自己 os._exit；它只在「spawn 失敗、刻意保留舊行程」時才『返回』）。
+                    # [2026-06-16 韌性修正] 原本不論 callback 成敗都接 os._exit(1):若
+                    # restart_self 因 spawn 失敗而返回(它已保留舊行程),這裡卻又 os._exit
+                    # → 本行程(無外層 watchdog)被殺、且沒有新 instance → 整支程式消失要
+                    # 人工重開。改為:有 callback 的行程,重啟「未成功」時保留本行程(RAM 高
+                    # 雖差但活著),記 critical,下一個 tick RAM 仍 critical 會再試重啟。
+                    # 沒 callback 的行程(會診/打卡:有外層 watchdog)維持直接 os._exit(1)。
                     if restart_callback is not None:
                         try:
-                            restart_callback()
+                            restart_callback()   # 成功會自己結束本行程
                         except Exception:
-                            logging.exception(
-                                "[health/%s] restart_callback 失敗，改用 os._exit(1)",
-                                tag)
-                    os._exit(1)
+                            logging.exception("[health/%s] restart_callback 例外", tag)
+                        # 能執行到這 = 重啟未成功(新行程沒起來)→ 不 os._exit,保留本行程
+                        logging.critical(
+                            "[health/%s] 自動重啟未成功(新行程未起),暫時保留本行程避免"
+                            "無人可用,下一輪再試重啟", tag)
+                    else:
+                        os._exit(1)   # 無 callback:由外層 watchdog 接手重啟
             elif rss_mb >= ram_warn_mb:
                 consecutive_high_ram, consecutive_critical_ram = _next_ram_streaks(
                     rss_mb, ram_warn_mb, ram_crit_mb,
@@ -327,7 +344,7 @@ def start_health_monitor(tag: str,
                           auto_restart_on_crit: bool = False,
                           crit_persistence_ticks: int = 6,
                           disk_check_path: Optional[str] = None,
-                          restart_callback=None) -> bool:
+                          restart_callback=None, warn_callback=None) -> bool:
     """啟動 daemon thread 監看本 process 的健康度。
 
     tag: log 標籤 (e.g. "main", "consult", "autoclock")
@@ -356,7 +373,7 @@ def start_health_monitor(tag: str,
             target=_health_loop,
             args=(tag, ram_warn_mb, ram_crit_mb, interval_sec, network_check,
                   auto_restart_on_crit, crit_persistence_ticks, disk_check_path,
-                  restart_callback),
+                  restart_callback, warn_callback),
             name=f"HealthMonitor-{tag}",
             daemon=True,
         )

@@ -12584,11 +12584,22 @@ if __name__ == "__main__":
         # ensure_single_instance 的重試處理），而不是只 os._exit 後就再也不回來。
         # hard_exit_code=1：health 監看跑在 daemon thread，sys.exit 殺不掉 process，
         # 必須 os._exit。
+        # [2026-06-16 觀測] warn_callback:自動重啟前一個 tick(~5 分鐘前)先跳通知,
+        # 讓使用者有機會先存檔,不再無預警重啟消失。daemon 緒呼叫,只做輕量通知。
+        def _ram_restart_warn(rss_mb, crit_mb, eta_min):
+            try:
+                show_windows_notification(
+                    "記憶體偏高",
+                    f"記憶體使用 {int(rss_mb)}MB(上限 {int(crit_mb)}MB),"
+                    f"約 {eta_min} 分鐘後將自動重啟以釋放記憶體,請先存檔。")
+            except Exception:
+                logging.debug("RAM 重啟前通知失敗", exc_info=True)
         start_health_monitor("main", ram_warn_mb=500, ram_crit_mb=900,
                               interval_sec=300, network_check=False,
                               auto_restart_on_crit=True,
                               crit_persistence_ticks=6,
-                              restart_callback=lambda: restart_self(["--background"], hard_exit_code=1))
+                              restart_callback=lambda: restart_self(["--background"], hard_exit_code=1),
+                              warn_callback=_ram_restart_warn)
     except Exception:
         logging.debug("health monitor 啟動失敗", exc_info=True)
 
