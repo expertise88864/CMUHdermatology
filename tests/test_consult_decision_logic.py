@@ -137,6 +137,47 @@ def test_subject_time_uses_now_for_manual_label(monkeypatch):
     assert len(t) == 4 and t.isdigit()
 
 
+# ─── [2026-06-17] 今日打卡狀態只在排程觸發時查/附 ────────────────────────
+
+def test_scheduled_trigger_includes_punch_status(monkeypatch):
+    """排程(HH:MM)觸發 → 查並把今日打卡狀態併入信件(純文字+HTML)。"""
+    h = _JobHarness(monkeypatch, _base_cfg())
+    h.punch_text = "PUNCH_TEXT_MARK"
+    h.punch_html = "<i>PUNCH_HTML_MARK</i>"
+    cq._do_full_job("12:40")
+    assert h.punch_calls == 1                      # 有查打卡(登入 portal)
+    assert "PUNCH_TEXT_MARK" in h.bodies[0]
+    assert "PUNCH_HTML_MARK" in h.html_bodies[0]
+
+
+def test_email_trigger_skips_punch_status(monkeypatch):
+    """email(皮膚科會診觸發) → 完全不查打卡(不登入 portal)、信件不附。"""
+    h = _JobHarness(monkeypatch, _base_cfg())
+    h.punch_text = "PUNCH_TEXT_MARK"
+    h.punch_html = "<i>PUNCH_HTML_MARK</i>"
+    cq._do_full_job("email", override_recipients=["dr.wang@x.tw"])
+    assert h.punch_calls == 0                      # 連打卡查詢都沒呼叫
+    assert "PUNCH_TEXT_MARK" not in h.bodies[0]
+    assert "PUNCH_HTML_MARK" not in h.html_bodies[0]
+
+
+def test_manual_trigger_skips_punch_status(monkeypatch):
+    """手動觸發 → 同 email,不查不附打卡(只有排程雙日報告需要打卡狀態)。"""
+    h = _JobHarness(monkeypatch, _base_cfg())
+    h.punch_html = "<i>PUNCH_HTML_MARK</i>"
+    cq._do_full_job("手動")
+    assert h.punch_calls == 0
+    assert "PUNCH_HTML_MARK" not in h.html_bodies[0]
+
+
+def test_is_scheduled_trigger_classification():
+    assert cq._is_scheduled_trigger("12:40") is True
+    assert cq._is_scheduled_trigger("17:10") is True
+    assert cq._is_scheduled_trigger("email") is False
+    assert cq._is_scheduled_trigger("手動") is False
+    assert cq._is_scheduled_trigger("") is False
+
+
 # ─── _do_full_job 靜默跳過(多機部署) ────────────────────────────────────
 
 def test_smtp_not_configured_skips_whole_flow(monkeypatch):
@@ -559,7 +600,9 @@ def test_build_consult_email_html():
     assert "2026 年 6 月 15 日" in out and "12:30" in out   # 日期/時間美化
     assert "intro &lt;line&gt;" in out   # intro 也 escape
     assert "<p>x</p>" in out             # content 是我們產生的安全 HTML,原樣嵌入
-    assert "正式內容以附件" in out        # footer
+    # [2026-06-17] 頁尾「本信由…正式內容以附件截圖為準」已移除(user 要求)
+    assert "正式內容以附件" not in out
+    assert "本信由中國醫皮膚科系統" not in out
     # 手機可讀性:viewport + media query(響應式)
     assert 'name="viewport"' in out and "width=device-width" in out
     assert "@media only screen and (max-width:600px)" in out

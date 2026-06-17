@@ -1062,11 +1062,10 @@ def _build_consult_email_html(date_str: str, time_str: str, intro: str,
         '<div class="cq-pad" style="padding:0 34px;font-size:13px;'
         f'line-height:1.7;color:#6b7280;">{_esc(intro)}</div>'
         f'<div class="cq-pad" style="padding:0 34px;">{content_html}</div>'
-        f'<div class="cq-hr" style="height:1px;background:{_MAIL_HAIR};'
-        'margin:28px 34px 0;"></div>'
-        '<div class="cq-pad" style="padding:16px 34px 30px;font-size:11.5px;'
-        f'line-height:1.6;color:{_MAIL_FAINT};">本信由中國醫皮膚科系統自動擷取'
-        '寄送　·　內容僅供輔助閱讀,正式內容以附件截圖為準</div>'
+        # [2026-06-17] 移除頁尾「本信由中國醫皮膚科系統自動擷取寄送 · 內容僅供
+        # 輔助閱讀,正式內容以附件截圖為準」(user 要求)。保留 30px 底部留白,避免
+        # 卡片內容貼齊邊緣。
+        '<div style="height:30px;"></div>'
         '</div></div></body></html>')
 
 
@@ -1198,6 +1197,14 @@ def _build_punch_status_sections(cfg: dict) -> tuple:
         logging.warning("[punch] 打卡狀態查詢/組裝失敗(會診信照常寄,不附打卡)",
                         exc_info=True)
         return "", ""
+
+
+def _is_scheduled_trigger(trigger_label: str) -> bool:
+    """是否為「排程」觸發。排程的 trigger_label 是 HH:MM 時間字串(例 '12:40' /
+    '17:10',見 _rebuild_schedule:`trigger_job_async(trigger_label=t)`);email
+    (皮膚科會診觸發)是 'email'、手動是 '手動'。只有排程的雙日報告需要今日打卡
+    狀態;email / 手動觸發一律省略(連打卡 portal 都不登入查詢)。純函式。"""
+    return bool(trigger_label) and ":" in trigger_label
 
 
 def _format_extracted_entries(entries: list, labels: list | None = None) -> str:
@@ -2152,9 +2159,14 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                              recipients_label, mail_method)
                 shot, extracted_text, extracted_html = run_consult_flow(
                     trigger_label)
-                # [新功能 2026-06-15] 查今日打卡狀態(各帳號 上/下班),併入信件最前。
-                # 完全 fail-open:查不到只回空字串,會診信照常寄。
-                punch_text, punch_html = _build_punch_status_sections(cfg)
+                # [2026-06-17] 今日打卡狀態「只在排程(12:40/17:10 雙日報告)寄送時」
+                # 才查/附。email(皮膚科會診觸發)與手動觸發都省略,連打卡 portal 都
+                # 不登入查詢,直接查會診就好。
+                # [新功能 2026-06-15] 查詢本身完全 fail-open:查不到只回空字串。
+                if _is_scheduled_trigger(trigger_label):
+                    punch_text, punch_html = _build_punch_status_sections(cfg)
+                else:
+                    punch_text, punch_html = "", ""
                 # [新功能 2026-06-13] 擷取到的會診文字附在信件內文(截圖仍為主)
                 text_parts = [body]
                 if punch_text:
