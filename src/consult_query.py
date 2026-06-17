@@ -937,7 +937,7 @@ def _format_patient_roster_html(texts: list, label: str) -> str:
                 f'{_esc(t)}</td></tr>')
     return (
         _section_label(f"{label}　·　{len(items)} 位")
-        + '<table style="width:100%;border-collapse:collapse;">'
+        + '<table class="cq-tbl" style="width:100%;border-collapse:collapse;">'
         + "".join(rows) + "</table>")
 
 
@@ -968,10 +968,10 @@ def _format_extracted_entries_html(entries: list, labels: list | None = None) ->
         raw_head = (labels[i - 1] if labels and i - 1 < len(labels)
                     and labels[i - 1] else "")
         name, meta = _patient_head(raw_head) if raw_head else (f"病人 {i}", "")
-        # 姓名後接床位/病歷號/時間(較小、淡色,會自動換行不跑版)
-        meta_html = (f'<span style="font-weight:400;font-size:12.5px;'
-                     f'color:{_MAIL_SUB};margin-left:10px;">{_esc(meta)}</span>'
-                     ) if meta else ""
+        # 姓名後接床位/病歷號/時間(較小、淡色)。手機(cq-meta)會掉到下一行不跑版。
+        meta_html = (f'<span class="cq-meta" style="font-weight:400;'
+                     f'font-size:12.5px;color:{_MAIL_SUB};margin-left:10px;">'
+                     f'{_esc(meta)}</span>') if meta else ""
         bands = []
         for lab, txt in texts:
             disp = _PANE_LABEL_MAP.get(lab, lab)
@@ -1036,6 +1036,10 @@ def _build_consult_email_html(date_str: str, time_str: str, intro: str,
         ".cq-pad{padding-left:18px!important;padding-right:18px!important;}"
         ".cq-hr{margin-left:18px!important;margin-right:18px!important;}"
         ".cq-read{font-size:15px!important;line-height:1.85!important;}"
+        ".cq-tbl td{font-size:12px!important;padding-top:9px!important;"
+        "padding-bottom:9px!important;}"
+        ".cq-meta{display:block!important;margin-left:0!important;"
+        "margin-top:4px!important;}"
         "}</style>")
     return (
         '<!DOCTYPE html><html lang="zh-Hant"><head><meta charset="utf-8">'
@@ -1150,7 +1154,7 @@ def _format_punch_html(results: list) -> str:
                 f'</tr>')
     return (
         _section_label(f"今日打卡狀態　·　{len(results)} 個帳號")
-        + '<table style="width:100%;border-collapse:collapse;">'
+        + '<table class="cq-tbl" style="width:100%;border-collapse:collapse;">'
         + "".join(rows) + "</table>")
 
 
@@ -2934,7 +2938,7 @@ class ConfigApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"皮膚科會診查詢設定 (v{CURRENT_VERSION})")
-        self.geometry("760x620")
+        self.geometry("760x720")
         # [v18 2026-05-25] 攔截 Tk callback 例外進 log (原本進 stderr 黑洞)
         try:
             from cmuh_common.tk_exception import install_tk_exception_handler
@@ -2972,9 +2976,11 @@ class ConfigApp(tk.Tk):
                             show="" if self.show_pw.get() else "●")
                         ).grid(row=1, column=2, sticky="w", **pad)
 
-        rcp = ttk.LabelFrame(root, text="收件人（可隨時新增/刪除，最多 4 位）", padding=8)
+        rcp = ttk.LabelFrame(
+            root, text=f"收件人（可隨時新增/刪除，最多 {_MAX_RECIPIENTS} 位）",
+            padding=8)
         rcp.pack(fill=tk.X, pady=(0, 8))
-        self.rcp_list = tk.Listbox(rcp, height=4, font=("Consolas", 10))
+        self.rcp_list = tk.Listbox(rcp, height=7, font=("Consolas", 10))
         self.rcp_list.pack(side=tk.LEFT, fill=tk.X, expand=True)
         for r in self.cfg["recipients"]:
             self.rcp_list.insert(tk.END, r)
