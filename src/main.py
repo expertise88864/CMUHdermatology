@@ -3260,21 +3260,25 @@ def _replace_edit_text(field_hwnd: int, new_text: str,
 #
 # 醫師上次 = 主視窗上的 TButton text="醫師上次" (snapshot 證實);格線 class=
 # TStringAlignGrid (在 TFOpdditto1 視窗內)。可用 settings/card_autofill_config.json
-# {"enabled": false} 關閉 (預設啟用)。
+# {"enabled": true} 才啟用。[2026-06-17] 預設『關閉』:OCR 偶有誤判,暫時停用自動
+# 帶卡號(程式碼保留,待 OCR 準確度修正後再開)。F2/F3 仍會呼叫但立即 early-return,
+# 等同回到沒有自動帶卡號的舊行為。
 _CARD_AUTOFILL_CONFIG = os.path.join(SETTINGS_DIR, "card_autofill_config.json")
 
 
 def _card_autofill_enabled() -> bool:
-    """讀 settings/card_autofill_config.json 的 enabled(預設 True / 啟用)。"""
+    """讀 settings/card_autofill_config.json 的 enabled。
+
+    [2026-06-17] 預設『關閉』(OCR 待修正);只有設定檔存在且 enabled=true 才啟用。"""
     import json
     try:
         with open(_CARD_AUTOFILL_CONFIG, encoding="utf-8") as f:
-            return bool(json.load(f).get("enabled", True))
+            return bool(json.load(f).get("enabled", False))
     except FileNotFoundError:
-        return True
+        return False
     except Exception:
-        logging.debug("讀 card_autofill_config 失敗,預設啟用", exc_info=True)
-        return True
+        logging.debug("讀 card_autofill_config 失敗,預設停用", exc_info=True)
+        return False
 
 
 def _card_notify_async(title: str, msg: str) -> None:
