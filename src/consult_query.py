@@ -117,6 +117,9 @@ SYSTEMFTP_PATH = r"C:\admc\systemftp.exe"
 MUTEX_NAME = "Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1"
 CONFIG_MUTEX_NAME = "Local\\CMUH_Skin_ConsultQuery_Config_v1"
 
+# 設定視窗「收件人」清單上限(可多人;留些緩衝,避免誤填一大串)。
+_MAX_RECIPIENTS = 8
+
 DEFAULT_CONFIG = {
     "username": "101358",
     "password": "101aa358",
@@ -831,7 +834,7 @@ _MAIL_SUMMARY_FG = "#39434f"
 _ROSTER_ROW_RE = re.compile(
     rf"^(?P<name>[{_CJK_CHARS}·]+)"
     rf"(?P<ward>[A-Za-z]+\d+)?"
-    rf"(?:\((?P<bed>\d+)\))?"
+    rf"(?:\((?P<bed>[0-9A-Za-z]+)\))?"   # 床號可含英數,如 18A
     rf"(?P<chart>\d{{6,}})?"
     rf"(?:\((?P<vs>[{_CJK_CHARS}·]+)\))?"
     rf"\s*(?P<date>\d{{1,2}}/\d{{1,2}})?"
@@ -869,7 +872,23 @@ def _parse_roster_row(text: str):
         return None  # 只認到姓名、無病歷號/床號 → 寧可顯示原字串避免遺漏資訊
     ward_bed = " · ".join(p for p in (ward, bed) if p)
     return {"name": m.group("name"), "ward_bed": ward_bed, "chart": chart,
-            "vs": m.group("vs") or "", "time": m.group("time") or ""}
+            "vs": m.group("vs") or "", "date": m.group("date") or "",
+            "time": m.group("time") or ""}
+
+
+def _roster_when(p: dict) -> str:
+    """把解析結果的日期+時間組成顯示字串:'06/17 11:23' / '11:23' / ''。"""
+    return " ".join(x for x in (p.get("date", ""), p.get("time", "")) if x)
+
+
+def _patient_head(raw: str) -> tuple:
+    """從病人列原文取 (姓名, meta);meta = '病房·床 病歷號 日期時間'(存在才放,
+    全形空白分隔)。解析不出結構 → (顯示簡名, '')。純函式,給逐病人內文標題用。"""
+    p = _parse_roster_row(raw)
+    if not p:
+        return _patient_display_name(raw), ""
+    parts = [x for x in (p["ward_bed"], p["chart"], _roster_when(p)) if x]
+    return p["name"], "　".join(parts)
 
 
 def _esc(s) -> str:
@@ -911,7 +930,7 @@ def _format_patient_roster_html(texts: list, label: str) -> str:
                 f'<td style="{td}">{_esc(p["ward_bed"])}</td>'
                 f'<td style="{td_num}">{_esc(p["chart"])}</td>'
                 f'<td style="{td}">{_esc(p["vs"])}</td>'
-                f'<td style="{td_r}">{_esc(p["time"])}</td></tr>')
+                f'<td style="{td_r}">{_esc(_roster_when(p))}</td></tr>')
         else:
             rows.append(
                 f'<tr><td style="{td}color:{_MAIL_INK};" colspan="5">'
@@ -946,8 +965,13 @@ def _format_extracted_entries_html(entries: list, labels: list | None = None) ->
     for pos, (i, panes) in enumerate(rich):
         texts = [(lab, (txt or "").strip()) for lab, txt in panes]
         texts = [(lab, txt) for lab, txt in texts if txt]
-        head = (labels[i - 1] if labels and i - 1 < len(labels)
-                and labels[i - 1] else f"病人 {i}")
+        raw_head = (labels[i - 1] if labels and i - 1 < len(labels)
+                    and labels[i - 1] else "")
+        name, meta = _patient_head(raw_head) if raw_head else (f"病人 {i}", "")
+        # 姓名後接床位/病歷號/時間(較小、淡色,會自動換行不跑版)
+        meta_html = (f'<span style="font-weight:400;font-size:12.5px;'
+                     f'color:{_MAIL_SUB};margin-left:10px;">{_esc(meta)}</span>'
+                     ) if meta else ""
         bands = []
         for lab, txt in texts:
             disp = _PANE_LABEL_MAP.get(lab, lab)
@@ -970,7 +994,7 @@ def _format_extracted_entries_html(entries: list, labels: list | None = None) ->
             f'<div style="margin-bottom:22px;{sep}">'
             f'<div style="font-size:15px;font-weight:600;color:{_MAIL_INK};'
             f'border-left:2px solid {_MAIL_ACCENT};padding-left:11px;'
-            f'margin-bottom:11px;">{_esc(head)}</div>'
+            f'margin-bottom:11px;">{_esc(name)}{meta_html}</div>'
             + "".join(bands) + "</div>")
     if not blocks:
         return ""
@@ -1183,10 +1207,10 @@ def _format_extracted_entries(entries: list, labels: list | None = None) -> str:
         if not texts:
             continue
         if labels and i - 1 < len(labels) and labels[i - 1]:
-            head = labels[i - 1]
+            name, meta = _patient_head(labels[i - 1])
         else:
-            head = f"病人 {i}"
-        lines = [f"【{head}】"]
+            name, meta = f"病人 {i}", ""
+        lines = [f"【{name}】" + (f"　{meta}" if meta else "")]
         for label, text in texts:
             lines.append(f"[{label}]")
             lines.append(text)
@@ -1347,7 +1371,8 @@ def _extract_consult_text(consult_hwnd: int, cfg: dict,
                                      "已確認的前 %d 位、就此停止", idx + 1, len(entries))
                         break
                 entries.append(snap)
-                labels.append(_patient_display_name(text))
+                # 存整列原文(非僅姓名):逐病人標題要由它取出 姓名+床位+病歷號+時間
+                labels.append(text)
         else:
             # ── 後備路徑:舊式 Delphi 格線像素逐列點選(現環境非格線,僅保險) ──
             logging.info("[consult-extract] 無 TRadioButton 病人清單，"
@@ -3015,8 +3040,8 @@ class ConfigApp(tk.Tk):
         addr = self.rcp_entry.get().strip()
         if not addr:
             return
-        if self.rcp_list.size() >= 4:
-            messagebox.showwarning("上限", "最多 4 位收件人")
+        if self.rcp_list.size() >= _MAX_RECIPIENTS:
+            messagebox.showwarning("上限", f"最多 {_MAX_RECIPIENTS} 位收件人")
             return
         if addr in self.rcp_list.get(0, tk.END):
             return

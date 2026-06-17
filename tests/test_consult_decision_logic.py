@@ -466,7 +466,39 @@ def test_parse_roster_row_structured():
     assert p["ward_bed"] == "B7 · 163"
     assert p["chart"] == "0029588049"
     assert p["vs"] == "沈冠宇"
+    assert p["date"] == "06/15"
     assert p["time"] == "08:20"
+
+
+def test_parse_roster_row_alphanumeric_bed():
+    """床號含英數(如 18A)也要解析得出 —— 否則整列走 raw fallback 會擠成一團。"""
+    p = cq._parse_roster_row("簡志仲I8(18A)0042107068(謝佳陵)06/17(11:23)")
+    assert p is not None
+    assert p["name"] == "簡志仲"
+    assert p["ward_bed"] == "I8 · 18A"
+    assert p["chart"] == "0042107068"
+    assert p["vs"] == "謝佳陵"
+    assert p["date"] == "06/17"
+    assert p["time"] == "11:23"
+
+
+def test_patient_head_name_plus_meta():
+    """逐病人標題:姓名 + 床位/病歷號/日期時間。解析不出結構 → 僅顯示簡名。"""
+    name, meta = cq._patient_head("簡志仲I8(18A)0042107068(謝佳陵)06/17(11:23)")
+    assert name == "簡志仲"
+    assert "I8 · 18A" in meta and "0042107068" in meta and "06/17 11:23" in meta
+    # 純姓名(無結構)→ 回 (姓名, "")
+    assert cq._patient_head("王小明") == ("王小明", "")
+
+
+def test_extracted_entries_head_has_bed_chart_time():
+    """會診內容標題要帶床位/病歷號/時間(文字版與 HTML 版皆然)。"""
+    entries = [[("內容1", "癢")]]
+    labels = ["簡志仲I8(18A)0042107068(謝佳陵)06/17(11:23)"]
+    txt = cq._format_extracted_entries(entries, labels=labels)
+    assert "簡志仲" in txt and "0042107068" in txt and "06/17 11:23" in txt
+    html = cq._format_extracted_entries_html(entries, labels=labels)
+    assert "簡志仲" in html and "0042107068" in html and "18A" in html
 
 
 def test_parse_roster_row_fallback():
