@@ -2127,6 +2127,8 @@ def script_F2_adaptive():
     if not _f23_update_uvb_dose(label="F2"):
         logging.info("F2: UVB 前置檢查/更新未完成，已終止 (跳過 51019)")
         return False
+    # UVB 前置檢查過了(已 commit 要下 51019)才帶卡號 — 否則 precheck 中止卻已寫計費欄
+    _autofill_卡號_from_醫師上次(label="F2")
     ok = _script_code_input_adaptive("51019", label="F2", set_療程=2)
     logging.info("F2 (照光 2): %s", "done" if ok else "skipped")
     if not ok:
@@ -2146,6 +2148,8 @@ def script_F3_adaptive():
     if not _f23_update_uvb_dose(label="F3"):
         logging.info("F3: UVB 前置檢查/更新未完成，已終止 (跳過 51019)")
         return False
+    # UVB 前置檢查過了(已 commit 要下 51019)才帶卡號 — 否則 precheck 中止卻已寫計費欄
+    _autofill_卡號_from_醫師上次(label="F3")
     ok = _script_code_input_adaptive("51019", label="F3", set_療程=3)
     logging.info("F3 (照光 3): %s", "done" if ok else "skipped")
     if not ok:
@@ -3240,6 +3244,274 @@ def _replace_edit_text(field_hwnd: int, new_text: str,
     except Exception:
         logging.error("_replace_edit_text 失敗", exc_info=True)
         return False
+
+
+# =============================================================================
+# 照光 F2/F3 — 自動帶入「醫師上次」療程卡號 (OCR)
+# =============================================================================
+# 卡號欄常空白,卡號只在「醫師上次」那個 Delphi 格線 (TStringAlignGrid) 裡,而該
+# 格線直接畫到螢幕、Win32/UIA/MSAA/複製/PrintWindow 全部讀不到 (實測全黑/空) →
+# 唯一可行 = 視窗顯示時螢幕擷取 + Windows 內建 OCR。規則:取最上面「療程=1」那一
+# 列的卡號 (使用者指定)。解析/把關邏輯在 cmuh_common.ditto_card_ocr。
+#
+# 安全 (計費欄位):只在卡號欄「空白」時動作;只有 OCR 有把握 (4 位數字 + 同卡交叉
+# 驗證 + 最上列貼近表頭) 才填,沒把握不填只嗶聲提示;填完跳『非阻塞』提示讓醫師核對;
+# 寫入只用 WM_SETTEXT (瞬間、不動滑鼠、無空窗);整段 fail-open,絕不影響 51019 order。
+#
+# 醫師上次 = 主視窗上的 TButton text="醫師上次" (snapshot 證實);格線 class=
+# TStringAlignGrid (在 TFOpdditto1 視窗內)。可用 settings/card_autofill_config.json
+# {"enabled": false} 關閉 (預設啟用)。
+_CARD_AUTOFILL_CONFIG = os.path.join(SETTINGS_DIR, "card_autofill_config.json")
+
+
+def _card_autofill_enabled() -> bool:
+    """讀 settings/card_autofill_config.json 的 enabled(預設 True / 啟用)。"""
+    import json
+    try:
+        with open(_CARD_AUTOFILL_CONFIG, encoding="utf-8") as f:
+            return bool(json.load(f).get("enabled", True))
+    except FileNotFoundError:
+        return True
+    except Exception:
+        logging.debug("讀 card_autofill_config 失敗,預設啟用", exc_info=True)
+        return True
+
+
+def _card_notify_async(title: str, msg: str) -> None:
+    """非阻塞提示:在背景緒跳 MessageBox,避免 modal 卡住 hotkey 工作緒(否則
+    autofill 在 51019 之前,未關掉的對話框會擋住後面的 order 輸入)。"""
+    import threading
+    try:
+        threading.Thread(
+            target=lambda: show_windows_notification(title, msg),
+            daemon=True).start()
+    except Exception:
+        logging.debug("[卡號] 背景通知啟動失敗", exc_info=True)
+
+
+def _find_first_descendant_by_class(parent_hwnd: int, target_class: str) -> int:
+    """EnumChildWindows 找第一個 class=target_class 的子孫 hwnd。"""
+    found = [0]
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def cb(child, lparam):
+        try:
+            buf = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(child, buf, 64)
+            if buf.value == target_class:
+                found[0] = child
+                return False
+        except Exception:
+            pass
+        return True
+
+    ctypes.windll.user32.EnumChildWindows(parent_hwnd, cb, 0)
+    return found[0]
+
+
+def _find_療程卡號_edit_hwnd(main_hwnd: int) -> int:
+    """找頂部 header「卡號」輸入欄 hwnd = 與「療程」同一列、緊鄰其左邊的一般寬度欄。
+
+    用 production 驗證過的 _find_療程_edit_hwnd 定位療程欄(它若定位錯,療程輸入
+    早就壞了),再取「同一列 (top 接近療程)、在療程左邊、寬度像卡號欄 (60-115)」中
+    left 最大(最靠近療程)的那個。比自行重算窄欄更穩,也避免抓到別列的欄位。
+    snapshot:卡號 rel_left≈509 w≈85(內容為 4 位療程卡號如 0009/0033)。"""
+    liao_hwnd = _find_療程_edit_hwnd(main_hwnd)
+    if not liao_hwnd:
+        logging.warning("[卡號] 定位不到療程欄,無法推算卡號欄")
+        return 0
+    main_r = wintypes.RECT()
+    liao_r = wintypes.RECT()
+    if not ctypes.windll.user32.GetWindowRect(main_hwnd, ctypes.byref(main_r)):
+        return 0
+    if not ctypes.windll.user32.GetWindowRect(liao_hwnd, ctypes.byref(liao_r)):
+        return 0
+    liao_left, liao_top = liao_r.left, liao_r.top
+    edits = []
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def cb(child, lparam):
+        try:
+            buf = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(child, buf, 64)
+            if buf.value != "TEditExt":
+                return True
+            r = wintypes.RECT()
+            if not ctypes.windll.user32.GetWindowRect(child, ctypes.byref(r)):
+                return True
+            w = r.right - r.left
+            if (abs(r.top - liao_top) <= 8 and r.left < liao_left
+                    and 60 <= w <= 115):
+                edits.append((child, r.left, w))
+        except Exception:
+            pass
+        return True
+
+    ctypes.windll.user32.EnumChildWindows(main_hwnd, cb, 0)
+    seen = set()
+    uniq = [e for e in edits if not (e[0] in seen or seen.add(e[0]))]
+    if not uniq:
+        logging.warning("[卡號] 找不到療程左邊同列的卡號欄")
+        return 0
+    card = max(uniq, key=lambda e: e[1])  # 最靠近療程(left 最大)
+    logging.info("[卡號] 卡號欄 hwnd=%s rel_left=%s w=%s (療程 hwnd=%s)",
+                 card[0], card[1] - main_r.left, card[2], liao_hwnd)
+    return card[0]
+
+
+def _bring_window_front(hwnd: int) -> None:
+    """把任意視窗叫到最前(含 AttachThreadInput)。截圖前要視窗真的顯示才有像素。"""
+    try:
+        SW_RESTORE = 9
+        if ctypes.windll.user32.IsIconic(hwnd):
+            ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
+    except Exception:
+        pass
+    try:
+        cur = ctypes.windll.kernel32.GetCurrentThreadId()
+        fg = ctypes.windll.user32.GetForegroundWindow()
+        ftid = (ctypes.windll.user32.GetWindowThreadProcessId(fg, None)
+                if fg else 0)
+        attached = False
+        if ftid and ftid != cur:
+            attached = bool(
+                ctypes.windll.user32.AttachThreadInput(ftid, cur, True))
+        try:
+            HWND_TOP = 0
+            SWP_NOMOVE, SWP_NOSIZE = 0x0002, 0x0001
+            ctypes.windll.user32.SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
+                                              SWP_NOMOVE | SWP_NOSIZE)
+            ctypes.windll.user32.BringWindowToTop(hwnd)
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                ctypes.windll.user32.AttachThreadInput(ftid, cur, False)
+    except Exception:
+        logging.debug("[卡號] _bring_window_front 失敗", exc_info=True)
+
+
+def _close_window(hwnd: int) -> None:
+    try:
+        WM_CLOSE = 0x0010
+        ctypes.windll.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+    except Exception:
+        logging.debug("[卡號] 關視窗失敗 hwnd=%s", hwnd, exc_info=True)
+
+
+def _read_card_from_ditto_window(ditto_hwnd: int):
+    """醫師上次視窗已開:叫到最前 → 找格線 → 螢幕截圖 → OCR → 回 CardResult/None。"""
+    import tempfile
+
+    from cmuh_common import ditto_card_ocr
+    _bring_window_front(ditto_hwnd)
+    time.sleep(0.35)  # 等 Delphi 把格線畫到螢幕
+    # 安全:螢幕擷取前確認醫師上次『真的在最前景』。否則可能截到被遮住/別的視窗,
+    # OCR 出無關數字 → 誤填計費欄。叫不到前景就放棄(fail-open 退回手動)。
+    fg = ctypes.windll.user32.GetForegroundWindow()
+    if fg != ditto_hwnd:
+        logging.warning("[卡號] 醫師上次未在最前景(fg=%s ditto=%s),放棄擷取避免誤讀",
+                        fg, ditto_hwnd)
+        return None
+    grid = _find_first_descendant_by_class(ditto_hwnd, "TStringAlignGrid")
+    if not grid:
+        logging.warning("[卡號] 醫師上次視窗內找不到格線 TStringAlignGrid")
+        return None
+    r = wintypes.RECT()
+    if not ctypes.windll.user32.GetWindowRect(grid, ctypes.byref(r)):
+        return None
+    img = ditto_card_ocr.capture_grid_image(
+        grid, (r.left, r.top, r.right, r.bottom))
+    return ditto_card_ocr.read_card_from_image(img, tmp_dir=tempfile.gettempdir())
+
+
+def _autofill_卡號_from_醫師上次(label: str = "") -> None:
+    """照光 F2/F3:卡號欄空白時,開醫師上次 → OCR → 填「療程=1」那列卡號。
+
+    完全 fail-open:任何問題都只記 log / 提示,絕不丟例外影響後續 order。"""
+    try:
+        if not _card_autofill_enabled():
+            return
+        main_hwnd = _find_hospital_main_window()
+        if not main_hwnd:
+            return
+        card_hwnd = _find_療程卡號_edit_hwnd(main_hwnd)
+        if not card_hwnd:
+            return
+        cur = _wm_gettext_timeout(card_hwnd).strip()
+        if cur:   # 只在「空白」時動作:任何非空內容一律不碰(不覆蓋既有值)
+            logging.info("[%s 卡號] 卡號欄非空(%r),不動作", label, cur)
+            return
+        btn = _find_descendant_by_class_text(main_hwnd, "TButton", "醫師上次")
+        if not btn:
+            logging.info("[%s 卡號] 找不到『醫師上次』按鈕,略過", label)
+            return
+        existing = _find_window_by_class_title("TFOpdditto1")
+        # 從『按下按鈕』就進 try:即使等視窗時被 F12/取消打斷拋例外,finally 也保證
+        # 關掉我們開的醫師上次、還原前景,不會留下孤兒視窗。
+        ditto = None
+        result = None
+        try:
+            if not _post_click_to_control(btn):
+                logging.warning("[%s 卡號] 點『醫師上次』按鈕失敗", label)
+                return
+            ditto = _wait_for_window("TFOpdditto1", timeout=4.0,
+                                     exclude_hwnd=existing)
+            if not ditto:
+                # 可能在逾時後才開 → 再給一點時間抓,避免留下沒關的視窗
+                time.sleep(0.3)
+                ditto = _find_window_by_class_title("TFOpdditto1",
+                                                    exclude_hwnd=existing)
+            if not ditto:
+                logging.warning("[%s 卡號] 等不到醫師上次視窗", label)
+                return
+            result = _read_card_from_ditto_window(ditto)
+        finally:
+            # 不論成敗/中斷:關掉「我們開的」醫師上次(含逾時後才開的)+ 還原醫院前景。
+            # 不關使用者本來就開著的那個(existing)。
+            to_close = ditto or _find_window_by_class_title(
+                "TFOpdditto1", exclude_hwnd=existing)
+            if to_close and to_close != existing:
+                _close_window(to_close)
+                time.sleep(0.1)
+            _ensure_hospital_foreground(main_hwnd)
+            time.sleep(0.05)
+
+        filled = False
+        if result is not None and result.ok and result.card:
+            # 寫入前『緊接著』再確認一次仍空白(OCR 期間可能剛被填)→ 不覆蓋。
+            again = _wm_gettext_timeout(card_hwnd).strip()
+            if again:
+                logging.info("[%s 卡號] OCR 後卡號欄已有值(%r),不覆蓋", label, again)
+                return
+            # 只用 WM_SETTEXT:同緒、瞬間、不動滑鼠、寫入前後無空窗。計費欄『不』採用
+            # click+type 補寫(那會動滑鼠且 click→sleep→type 間有空窗,可能蓋掉別人剛
+            # 填的值,風險高於效益)。WM_SETTEXT 對 TEditExt 已於療程欄 production 驗證。
+            _wm_settext_timeout(card_hwnd, result.card)
+            verify = _wm_gettext_timeout(card_hwnd).strip()
+            if verify == result.card:
+                filled = True
+                logging.info("[%s 卡號] 已填卡號=%s", label, result.card)
+                _card_notify_async(
+                    "照光卡號", f"已自動帶入療程卡號 {result.card}\n(請核對是否正確)")
+            else:
+                logging.warning("[%s 卡號] WM_SETTEXT 未生效(verify=%r),改提示手動",
+                                label, verify)
+        if not filled:
+            reason = result.reason if result is not None else "讀取失敗"
+            logging.warning("[%s 卡號] 未自動填:%s", label, reason)
+            try:
+                import winsound
+                winsound.MessageBeep(0x30)
+            except Exception:
+                pass
+            _card_notify_async(
+                "照光卡號", "卡號自動讀取不確定,請手動填入卡號。")
+    except Exception:
+        logging.error("[%s 卡號] 自動帶卡號流程例外(已忽略)", label, exc_info=True)
 
 
 def script_F4_adaptive():
