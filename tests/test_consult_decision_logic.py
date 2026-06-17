@@ -137,7 +137,7 @@ def test_subject_time_uses_now_for_manual_label(monkeypatch):
     assert len(t) == 4 and t.isdigit()
 
 
-# ─── [2026-06-17] 今日打卡狀態只在排程觸發時查/附 ────────────────────────
+# ─── [2026-06-17] 今日打卡狀態:排程+手動查/附,只有 email 省略 ────────────
 
 def test_scheduled_trigger_includes_punch_status(monkeypatch):
     """排程(HH:MM)觸發 → 查並把今日打卡狀態併入信件(純文字+HTML)。"""
@@ -150,8 +150,19 @@ def test_scheduled_trigger_includes_punch_status(monkeypatch):
     assert "PUNCH_HTML_MARK" in h.html_bodies[0]
 
 
+def test_manual_trigger_includes_punch_status(monkeypatch):
+    """[2026-06-17 user 要求] 手動觸發 → 也查並附今日打卡狀態(同排程)。"""
+    h = _JobHarness(monkeypatch, _base_cfg())
+    h.punch_text = "PUNCH_TEXT_MARK"
+    h.punch_html = "<i>PUNCH_HTML_MARK</i>"
+    cq._do_full_job("手動")
+    assert h.punch_calls == 1
+    assert "PUNCH_TEXT_MARK" in h.bodies[0]
+    assert "PUNCH_HTML_MARK" in h.html_bodies[0]
+
+
 def test_email_trigger_skips_punch_status(monkeypatch):
-    """email(皮膚科會診觸發) → 完全不查打卡(不登入 portal)、信件不附。"""
+    """email(皮膚科會診觸發) → 唯一省略打卡的觸發:不查(不登入 portal)、信件不附。"""
     h = _JobHarness(monkeypatch, _base_cfg())
     h.punch_text = "PUNCH_TEXT_MARK"
     h.punch_html = "<i>PUNCH_HTML_MARK</i>"
@@ -161,21 +172,12 @@ def test_email_trigger_skips_punch_status(monkeypatch):
     assert "PUNCH_HTML_MARK" not in h.html_bodies[0]
 
 
-def test_manual_trigger_skips_punch_status(monkeypatch):
-    """手動觸發 → 同 email,不查不附打卡(只有排程雙日報告需要打卡狀態)。"""
-    h = _JobHarness(monkeypatch, _base_cfg())
-    h.punch_html = "<i>PUNCH_HTML_MARK</i>"
-    cq._do_full_job("手動")
-    assert h.punch_calls == 0
-    assert "PUNCH_HTML_MARK" not in h.html_bodies[0]
-
-
-def test_is_scheduled_trigger_classification():
-    assert cq._is_scheduled_trigger("12:40") is True
-    assert cq._is_scheduled_trigger("17:10") is True
-    assert cq._is_scheduled_trigger("email") is False
-    assert cq._is_scheduled_trigger("手動") is False
-    assert cq._is_scheduled_trigger("") is False
+def test_is_email_trigger_classification():
+    assert cq._is_email_trigger("email") is True
+    assert cq._is_email_trigger("12:40") is False
+    assert cq._is_email_trigger("17:10") is False
+    assert cq._is_email_trigger("手動") is False
+    assert cq._is_email_trigger("") is False
 
 
 # ─── _do_full_job 靜默跳過(多機部署) ────────────────────────────────────
