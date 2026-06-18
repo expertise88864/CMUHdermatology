@@ -24,6 +24,8 @@ def test_requested_default_abbreviations_are_present():
     assert defaults["mf"] == "medication and follow up"
     assert defaults["nt"] == "next time:"
     assert defaults["pred"] == "no DM/HBV/HCV"
+    assert defaults["inf"] == \
+        "incisional biopsy and follow up, inform post-op scar formation"
     assert defaults["cert"] == \
         "患者因上述皮膚疾病，曾於da_zh至本院皮膚科門診就醫治療，建議持續追蹤。"
     # [v8] 已退役的醫師代碼縮寫不再出現在預設清單
@@ -95,6 +97,45 @@ def test_v5_config_restores_requested_defaults_only(tmp_path):
     # [v8] 退役醫師代碼不再被還原
     for code in ("D15645", "101823", "D35819"):
         assert code not in values
+
+
+def test_v8_config_gets_inf_default_via_migration(tmp_path):
+    """[v9 2026-06-18] 現有 v8 使用者升級自動補上新預設 'inf',不動其自訂內容。"""
+    path = tmp_path / "abbrev_settings.json"
+    path.write_text(json.dumps({
+        "schema_version": 8,
+        "enabled": True,
+        "items": [{"abbrev": "st", "expansion": "my custom"},
+                  {"abbrev": "zz", "expansion": "custom"}],
+    }), encoding="utf-8")
+
+    cfg = ae.load_config(str(path))
+    values = {item["abbrev"]: item["expansion"] for item in cfg.items}
+
+    assert values["inf"] == \
+        "incisional biopsy and follow up, inform post-op scar formation"
+    assert values["st"] == "my custom"   # 自訂不被覆蓋
+    assert values["zz"] == "custom"      # 自訂保留
+    # v9 升級窗只補 inf:不重跑 v5/v8 遷移 → 不會把使用者沒有的 nt/se 又塞回來
+    assert "nt" not in values
+    assert "se" not in values
+    assert cfg.schema_version == ae.ABBREV_CONFIG_SCHEMA_VERSION
+
+
+def test_v8_config_does_not_re_remove_user_recreated_doctor_code(tmp_path):
+    """[codex 2026-06-18] v8→v9 不可重跑 v8 的醫師代碼清除 —— 否則使用者在 v8 之後
+    自建的同名縮寫(如 D35819)會被再次刪掉。"""
+    path = tmp_path / "abbrev_settings.json"
+    path.write_text(json.dumps({
+        "schema_version": 8,
+        "enabled": True,
+        "items": [{"abbrev": "D35819", "expansion": "my own note"}],
+    }), encoding="utf-8")
+
+    cfg = ae.load_config(str(path))
+    values = {item["abbrev"]: item["expansion"] for item in cfg.items}
+
+    assert values.get("D35819") == "my own note"   # 自建同名縮寫保留,不被清除
 
 
 def test_v7_config_removes_retired_doctor_defaults(tmp_path):

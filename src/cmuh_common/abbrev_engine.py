@@ -40,7 +40,7 @@ from cmuh_common.config_io import load_json_dict
 # -----------------------------------------------------------------------------
 # 預設 snippets（首次啟動自動寫入；不含 if，避免英文 "if " 誤觸）
 # -----------------------------------------------------------------------------
-ABBREV_CONFIG_SCHEMA_VERSION = 8  # [v8 2026-06-04] 移除指定醫師代碼預設縮寫（撤回 v7 推送）；bump 觸發現有使用者自動清除
+ABBREV_CONFIG_SCHEMA_VERSION = 9  # [v9 2026-06-18] 新增預設縮寫 inf(現有 v5+ 使用者自動補上);[v8] 移除醫師代碼預設
 MAX_ABBREV_LENGTH = 63
 
 DEFAULT_ITEMS: list[dict[str, str]] = [
@@ -61,6 +61,7 @@ DEFAULT_ITEMS: list[dict[str, str]] = [
     {"abbrev": "st",   "expansion": "keep stable"},
     {"abbrev": "nev1", "expansion": "r/o dysplastic nevus, r/o malignancy"},
     {"abbrev": "ef",   "expansion": "excisional biopsy and follow up, inform post-op 3x scar formation"},
+    {"abbrev": "inf",  "expansion": "incisional biopsy and follow up, inform post-op scar formation"},
     {"abbrev": "uvb",  "expansion": "UVB: 250 mj/cm2 (1) on da, increased 30 mj/cm2 if no erythema, MAX: 800 mj/cm2"},
     {
         "abbrev": "cert1",
@@ -220,6 +221,24 @@ def _restore_requested_defaults(items: list[dict[str, str]]) -> bool:
     return changed
 
 
+def _ensure_default_present(items: list[dict[str, str]], abbrev: str) -> bool:
+    """補上單一指定預設縮寫(使用者沒有同名才補)。不覆蓋既有、不動其他預設。
+
+    給「某個 schema 版本新增單一預設」用,比 _add_missing_default_items(會補回所有
+    使用者刻意刪掉的預設)精準,且只在該版本的升級窗一次。"""
+    key = abbrev.strip().casefold()
+    if any(str(it.get("abbrev", "")).strip().casefold() == key for it in items):
+        return False
+    default = next(
+        (dict(d) for d in DEFAULT_ITEMS
+         if str(d["abbrev"]).casefold() == key), None)
+    if not default:
+        return False
+    items.append(default)
+    logging.info("[abbrev] added new default '%s'", abbrev)
+    return True
+
+
 # [v8 2026-06-04] 已退役的醫師代碼預設縮寫（撤回 v7 推送）。schema < 8 升級時主動清除，
 # 依 abbrev 比對，不論 user 是否改過該筆 expansion。
 _RETIRED_DEFAULT_ABBREVS: set[str] = {
@@ -321,12 +340,19 @@ def load_config(path: str, *, persist_migrations: bool = True) -> AbbrevConfig:
 
     # 偵測 + 自動升級舊版預設；若有改 → 寫回磁碟
     if loaded_schema_version < ABBREV_CONFIG_SCHEMA_VERSION:
-        if loaded_schema_version >= 5:
-            needs_save = _restore_requested_defaults(cfg.items) or needs_save
-        else:
+        # 每個歷史遷移步驟「只在其對應的升級窗」做一次 —— 否則每次 bump schema 都重跑,
+        # 會把使用者後來自建/還原的同名縮寫又刪掉或又補回(codex review 2026-06-18)。
+        if loaded_schema_version < 5:
             needs_save = _add_missing_default_items(cfg.items) or needs_save
-        # [v8] 撤回 v7 推送的醫師代碼預設縮寫（含 user 改過 expansion 的）
-        needs_save = _remove_retired_defaults(cfg.items) or needs_save
+        elif loaded_schema_version < 8:
+            # v5~v7:還原 v5 回歸時消失的 nt/se(不還原使用者刻意刪的其他預設)
+            needs_save = _restore_requested_defaults(cfg.items) or needs_save
+        if loaded_schema_version < 8:
+            # [v8] 撤回 v7 推送的醫師代碼預設縮寫(含 user 改過 expansion 的)— 一次性
+            needs_save = _remove_retired_defaults(cfg.items) or needs_save
+        if loaded_schema_version < 9:
+            # [v9] 新增預設 inf:使用者沒有同名才補上,不覆蓋自訂、不動其他預設
+            needs_save = _ensure_default_present(cfg.items, "inf") or needs_save
         needs_save = True
     needs_save = _maybe_migrate_legacy(cfg.items) or needs_save
     cfg.items = sort_abbrev_items(cfg.items)
