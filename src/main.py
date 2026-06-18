@@ -6658,6 +6658,16 @@ class AutomationApp:
         self._schedule_refresh()
         self.startup_phase_text.set("快取完成")
 
+        # ─── 浮動門診動態小視窗(半透明置頂、預設關) ───────────────────
+        self._floating_status_by_index = {}            # index -> floating_clinic.RoomStatus
+        self.floating_clinic_win = None
+        self.floating_clinic_tick_id = None
+        self._floating_clinic_settings = self._load_floating_clinic_settings()
+        self.floating_clinic_enabled = tk.BooleanVar(
+            value=bool(self._floating_clinic_settings.get("enabled", False)))
+        self.floating_clinic_opacity = tk.DoubleVar(
+            value=float(self._floating_clinic_settings.get("opacity", 0.85)))
+
         self.root.after(50, self.deferred_initialization)
         self.root.after(100, self.process_ui_queue)
 
@@ -6667,6 +6677,13 @@ class AutomationApp:
         self._exit_cleanup_done = True
         self._shutting_down = True
         logging.info("Shutdown signal received.")
+        # 浮動門診動態:關閉前存好位置/大小並銷毀視窗(fail-open)
+        try:
+            if getattr(self, "floating_clinic_win", None):
+                self._save_floating_clinic_settings()
+                self._close_floating_clinic()
+        except Exception:
+            pass
         stop_event_main.set()
         # [O21] stop_event_automation 也設，讓所有業務迴圈即時退出
         try:
@@ -7722,6 +7739,13 @@ class AutomationApp:
         self.root.after(450, self._start_clinic_lights_polling_once)
 
         self._start_hotkey_module_loading()
+
+        # 浮動門診動態:若上次離開時是開啟狀態,延後自動開窗(fail-open)
+        try:
+            if self.floating_clinic_enabled.get():
+                self.root.after(800, self._open_floating_clinic)
+        except Exception:
+            pass
 
     def _create_summary_tab_content(self, summary_tab):
         # 值班資訊改置於底部「院內系統捷徑」網頁列最右側，總覽僅保留月曆以加大門診區
@@ -9085,6 +9109,178 @@ class AutomationApp:
             self._smart_widget_config(ui['status'], text=f"更新於 {datetime.now().strftime('%H:%M')}", fg="green")
             self._smart_widget_config(ui['total'], text=str(result.get('total', '-')))
             self._smart_widget_config(ui['waiting'], text=str(result.get('waiting', '-')))
+
+        # 浮動門診動態:把本診間最新狀態快取下來(視窗開著才有動作),fail-open
+        try:
+            self._capture_floating_status(index, result, tracker)
+        except Exception:
+            pass
+
+    # ─── 浮動門診動態小視窗 ────────────────────────────────────────────
+    def _load_floating_clinic_settings(self):
+        defaults = {"enabled": False, "opacity": 0.85, "geometry": ""}
+        try:
+            cfg = load_json_dict(
+                get_conf_path('floating_clinic_settings.json'), dict(defaults))
+        except Exception:
+            logging.debug("[浮動門診] 讀取設定失敗", exc_info=True)
+            cfg = dict(defaults)
+        # 欄位型別正規化:設定檔可能被手改成壞值(opacity=null/字串),__init__ 會直接
+        # float() → 不正規化會在建構期就炸掉整個程式。clamp_opacity 對壞值回 0.85。
+        from cmuh_common.floating_clinic import clamp_opacity
+        cfg["opacity"] = clamp_opacity(cfg.get("opacity"))
+        cfg["enabled"] = bool(cfg.get("enabled", False))
+        if not isinstance(cfg.get("geometry"), str):
+            cfg["geometry"] = ""
+        return cfg
+
+    def _save_floating_clinic_settings(self):
+        try:
+            cfg = {
+                "enabled": bool(self.floating_clinic_enabled.get()),
+                "opacity": round(float(self.floating_clinic_opacity.get()), 2),
+                "geometry": self._floating_clinic_settings.get("geometry", ""),
+            }
+            self._floating_clinic_settings = cfg
+            _atomic_write_json(get_conf_path('floating_clinic_settings.json'), cfg)
+        except Exception:
+            logging.debug("[浮動門診] 儲存設定失敗", exc_info=True)
+
+    def _on_floating_clinic_geometry(self, geometry):
+        # 視窗關閉/銷毀時回呼;先存起來,下次 save 時寫檔
+        self._floating_clinic_settings["geometry"] = geometry
+
+    def _on_floating_clinic_user_closed(self):
+        # 使用者按了視窗右上角 X → 關掉設定、存檔、銷毀視窗
+        try:
+            self.floating_clinic_enabled.set(False)
+        except Exception:
+            pass
+        self._save_floating_clinic_settings()
+        self._close_floating_clinic()
+
+    def _open_floating_clinic(self):
+        if getattr(self, "floating_clinic_win", None) is not None:
+            try:
+                if self.floating_clinic_win.exists():
+                    return
+            except Exception:
+                pass
+        try:
+            from cmuh_common import floating_clinic
+            self.floating_clinic_win = floating_clinic.ClinicFloatingWindow(
+                self.root,
+                opacity=float(self.floating_clinic_opacity.get()),
+                geometry=self._floating_clinic_settings.get("geometry", ""),
+                on_close=self._on_floating_clinic_user_closed,
+                on_geometry_change=self._on_floating_clinic_geometry,
+            )
+            self._floating_clinic_tick()
+        except Exception:
+            logging.debug("[浮動門診] 開啟視窗失敗", exc_info=True)
+            self.floating_clinic_win = None
+
+    def _close_floating_clinic(self):
+        if getattr(self, "floating_clinic_tick_id", None):
+            try:
+                self.root.after_cancel(self.floating_clinic_tick_id)
+            except Exception:
+                pass
+            self.floating_clinic_tick_id = None
+        if getattr(self, "floating_clinic_win", None):
+            try:
+                self.floating_clinic_win.destroy()
+            except Exception:
+                pass
+            self.floating_clinic_win = None
+
+    def _floating_clinic_tick(self):
+        if getattr(self, "_shutting_down", False):
+            return
+        win = getattr(self, "floating_clinic_win", None)
+        try:
+            if not win or not win.exists():
+                return
+        except Exception:
+            return
+        try:
+            from cmuh_common import floating_clinic
+            rooms = []
+            for i in range(CLINIC_ROOM_COUNT):
+                try:
+                    code = self.clinic_room_vars[i].get().strip()
+                except Exception:
+                    continue
+                if not code:
+                    continue
+                rs = self._floating_status_by_index.get(i)
+                if rs is None:
+                    rs = floating_clinic.RoomStatus(room=code, error=True)
+                rooms.append(rs)
+            win.update_rooms(rooms)
+            win.lift_to_top()
+        except Exception:
+            logging.debug("[浮動門診] tick 更新失敗", exc_info=True)
+        finally:
+            # 永遠重新排程,讓暫時性錯誤不會殺掉整個迴圈
+            try:
+                if not getattr(self, "_shutting_down", False) and win and win.exists():
+                    self.floating_clinic_tick_id = self.root.after(
+                        15000, self._floating_clinic_tick)
+            except Exception:
+                pass
+
+    def _toggle_floating_clinic(self):
+        try:
+            if self.floating_clinic_enabled.get():
+                self._open_floating_clinic()
+            else:
+                self._close_floating_clinic()
+        except Exception:
+            logging.debug("[浮動門診] 切換失敗", exc_info=True)
+        self._save_floating_clinic_settings()
+
+    def _set_floating_clinic_opacity(self, *args):
+        try:
+            win = getattr(self, "floating_clinic_win", None)
+            if win and win.exists():
+                win.set_opacity(float(self.floating_clinic_opacity.get()))
+            self._save_floating_clinic_settings()
+        except Exception:
+            logging.debug("[浮動門診] 調整透明度失敗", exc_info=True)
+
+    def _capture_floating_status(self, index, result, tracker):
+        # 視窗沒開就不做任何事(零額外負載)
+        if not getattr(self, "floating_clinic_win", None):
+            return
+        try:
+            room = (self.clinic_room_vars[index].get().strip()
+                    if index < len(self.clinic_room_vars) else "")
+            slot = reg64_slot_cn(result.get("reg64_time_code", "")) or ""
+            doctor = result.get("doc_name") or tracker.get("doc_name", "")
+            status_txt = result.get("status", "") or ""
+            error = ("錯誤" in status_txt) or ("逾時" in status_txt)
+            stopped = (bool(result.get("is_stopped"))
+                       or ("尚未開診" in status_txt) or ("休診" in status_txt))
+            closed = bool(result.get("is_closed")) or bool(tracker.get("actual_closing_dt"))
+            try:
+                waiting = int(result.get("waiting"))
+            except (TypeError, ValueError):
+                waiting = None
+            light = str(result.get("light", "") or "")
+            from cmuh_common import floating_clinic
+            self._floating_status_by_index[index] = floating_clinic.RoomStatus(
+                room=room or f"診間{index + 1}",
+                slot=slot,
+                doctor=doctor,
+                light=light,
+                waiting=waiting,
+                closed=closed,
+                stopped=stopped,
+                error=error,
+            )
+        except Exception:
+            logging.debug("[浮動門診] 擷取狀態失敗", exc_info=True)
 
     def _get_last_closing_time(self, doc_name, weekday_int, session_str):
         with self._history_lock:
@@ -10558,6 +10754,36 @@ class AutomationApp:
             variable=self.watchdog_enabled_var,
             command=self._on_watchdog_toggle,
         ).pack(anchor="w")
+
+        # ─── 浮動門診動態小視窗 ───────────────────────────────────────
+        floating_frame = ttk.LabelFrame(left_column, text="浮動門診動態視窗", padding=10)
+        floating_frame.pack(fill=tk.X, pady=(0, 15))
+        ttk.Checkbutton(
+            floating_frame,
+            text="啟用（半透明置頂小視窗，預設關）",
+            variable=self.floating_clinic_enabled,
+            command=self._toggle_floating_clinic,
+        ).pack(anchor="w", pady=2)
+        opacity_row = ttk.Frame(floating_frame)
+        opacity_row.pack(fill=tk.X, pady=(2, 2))
+        ttk.Label(opacity_row, text="透明度:").pack(side=tk.LEFT)
+        ttk.Scale(
+            opacity_row,
+            from_=0.25,
+            to=0.95,
+            variable=self.floating_clinic_opacity,
+            command=lambda v: self._set_floating_clinic_opacity(),
+            orient="horizontal",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+        ttk.Label(
+            floating_frame,
+            text=("顯示主程式追蹤的診間(101/102/103,可在上方診間設定更改),"
+                  "永遠置頂、不搶焦點、可拉大小。"),
+            foreground="gray",
+            style="Small.TLabel",
+            wraplength=420,
+            justify="left",
+        ).pack(anchor="w", pady=(2, 0))
 
         threshold_main_frame = ttk.LabelFrame(left_column, text="個別醫師止掛人數提醒設定", padding=10)
         threshold_main_frame.pack(fill=tk.X, pady=(0, 15))
