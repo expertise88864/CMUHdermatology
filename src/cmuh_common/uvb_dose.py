@@ -194,6 +194,21 @@ _UVB_MAX_RE = re.compile(
     re.IGNORECASE,
 )
 
+# [2026-06-18] 判斷某劑量數字「前方」是否緊跟 MAX/上限關鍵字 —— 是的話那個數字是
+# 上限(ceiling)而非本次要照的劑量,不可拿來當「本次劑量」跳確認(MAX 可超過 1500)。
+# 關鍵字集合與 _UVB_MAX_RE 同步,但拿掉結尾的 (\d+)、改成 anchored 在字串尾。
+_CEILING_KEYWORD_BEFORE_RE = re.compile(
+    r"(?:MAX(?:\s+(?:dose|UVB|Phototherapy))?(?:\s+(?:at|to))?"
+    r"|\bfix(?:ed)?(?:\s+(?:at|to))?"
+    r"|upper\s*limit(?:\s+(?:at|to))?"
+    r"|(?:each\s+time\s+)?(?:till|until)"
+    r"|maintain\s+dose\s+at"
+    r"|最大(?:劑量|剂量)?"
+    r"|上限(?:在|為)?"
+    r"|固定(?:在|為)?)\s*[:：,，]?\s*$",
+    re.IGNORECASE,
+)
+
 # [v20.12 2026-05-26] 同日期 triplet 偵測 — 用於更新非 UVB 關鍵字 (e.g. excimer
 # light) 但日期相同的 (count) ... (date) 三元組。
 # 例如:
@@ -1187,7 +1202,10 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         # 而非句尾的 MAX(fixed at / upper limit),才不會把 MAX>1500 又當成要確認。
         guard_dose_m = re.search(
             r"(\d+)\s*mj(?:/cm2?)?\s*$", dose_prefix, re.IGNORECASE)
-        if guard_dose_m is not None:
+        # 但若該數字前方緊跟 MAX/上限關鍵字(upper limit:/fixed at/MAX…),那是上限不是
+        # 本次劑量 → 不納入(否則 MAX>1500 又會害跳確認)。
+        if guard_dose_m is not None and not _CEILING_KEYWORD_BEFORE_RE.search(
+                dose_prefix[:guard_dose_m.start()]):
             max_applied_dose = max(max_applied_dose,
                                    int(guard_dose_m.group(1)))
         triplet_edits.append((m.span(), seg_text))

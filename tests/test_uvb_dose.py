@@ -1283,6 +1283,23 @@ def test_max_with_mj_unit_over_1500_still_no_confirm():
     assert r.new_text is not None and "1450" in r.new_text
 
 
+def test_continuation_ceiling_before_count_not_treated_as_dose():
+    """[2026-06-18] Codex review:續行守門 regex 不可把「上限值」誤當本次劑量。
+    若 (count) 前方緊跟的數字其實是 MAX/upper limit(ceiling),即使 >1500 也不該跳確認。
+
+    primary 1400+50=1450 (≤1500);續行 triplet 前方是 'also max 1800mj' → 1800 是上限,
+    要被排除 → 不跳確認、triplet 仍正常 bump count/date(證明守門有跑、只是排除上限)。
+    """
+    text = (
+        "UVB: 1400 mj/cm2 (10) on (2026/5/25) add 50 each time, fixed at 1800 "
+        "/ also max 1800mj (20) on (2026/5/25)"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 28))
+    assert r.action == UvbAction.UPDATED
+    assert r.additional_triplets_updated >= 1   # 續行 triplet 確實有被處理(守門有跑)
+    assert "(21)" in r.new_text                  # 上限值 1800 被排除,沒跳確認
+
+
 def test_too_close_takes_priority_over_dose_confirm():
     """[2026-06-18 改] >1500 確認改成「只看本次計算劑量」後,順序變成
     parse → sanity → stale → too_close → compute → (本次劑量>1500 確認)。
