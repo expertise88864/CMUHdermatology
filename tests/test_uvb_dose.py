@@ -990,14 +990,32 @@ def test_dose_over_1500_returns_confirm_needed():
     assert r.new_text is None
 
 
-def test_max_over_1500_returns_confirm_needed():
-    """[v20.12] dose 沒超過但 MAX > 1500 也要 CONFIRM。"""
+def test_max_over_1500_alone_no_confirm():
+    """[2026-06-18] MAX(最高劑量)>1500 但本次要照的劑量 ≤1500 → 不跳確認,直接更新。
+
+    使用者:MAX 最高劑量可超過 1500,不該因此每次跳確認;只有本次劑量真的 >1500 才確認。
+    dose 1400 + increase 50 = 1450 (≤1500),MAX 設 1800 → 直接 UPDATED。
+    """
     text = (
         "UVB: 1400 mj/cm2 (50) on (2026/5/20) add 50 each time, fixed at 1800"
     )
-    r = update_uvb_in_text(text, today=date(2026, 5, 26))
+    r = update_uvb_in_text(text, today=date(2026, 5, 23))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_text is not None and "1450" in r.new_text
+
+
+def test_computed_dose_over_1500_returns_confirm():
+    """[2026-06-18] MAX>1500 且本次「計算後劑量」>1500 → CONFIRM(按 Yes 才套用)。
+
+    dose 1480 + increase 50 = 1530 (>1500),MAX 1800 → 計算後超過 1500 → CONFIRM。
+    """
+    text = (
+        "UVB: 1480 mj/cm2 (50) on (2026/5/20) add 50 each time, fixed at 1800"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 23))
     assert r.action == UvbAction.CONFIRM_NEEDED
-    assert "1800" in (r.confirm_reason or "")
+    assert "1530" in (r.confirm_reason or "")
+    assert r.new_text is None
 
 
 def test_dose_exactly_1500_no_confirm():
