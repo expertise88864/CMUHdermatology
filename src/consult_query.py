@@ -833,7 +833,7 @@ _MAIL_SUMMARY_FG = "#39434f"
 # 回 None,呼叫端整列顯示原字串 —— 絕不漏人、不亂拆。
 _ROSTER_ROW_RE = re.compile(
     rf"^(?P<name>[{_CJK_CHARS}·]+)"
-    rf"(?P<ward>[A-Za-z]+\d+)?"
+    rf"(?P<ward>[A-Za-z]+\d*)?"          # 病房:字母開頭,數字可有可無(C16/B7,也含純字母如 BURN/ICU)
     rf"(?:\((?P<bed>[0-9A-Za-z]+)\))?"   # 床號可含英數,如 18A
     rf"(?P<chart>\d{{6,}})?"
     rf"(?:\((?P<vs>[{_CJK_CHARS}·]+)\))?"

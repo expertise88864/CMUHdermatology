@@ -525,6 +525,24 @@ def test_parse_roster_row_alphanumeric_bed():
     assert p["time"] == "11:23"
 
 
+def test_parse_roster_row_letter_only_ward():
+    """[2026-06-18] 純字母病房(如燒燙傷病房 BURN)也要解析 —— 原本 ward 正規式要求
+    字母後接數字(C16/B7),BURN 沒數字 → 整列 fullmatch 失敗 → 跑版擠成一團、
+    且會診內容標題缺病房床位。修法:ward 數字改為可有可無。"""
+    p = cq._parse_roster_row("賴義恩BURN(10B)0000416350(蔡李澄)06/18(11:27)")
+    assert p is not None
+    assert p["name"] == "賴義恩"
+    assert p["ward_bed"] == "BURN · 10B"
+    assert p["chart"] == "0000416350"
+    assert p["vs"] == "蔡李澄"
+    assert p["date"] == "06/18"
+    assert p["time"] == "11:27"
+    # 逐病人標題也要帶回病房/床位
+    name, meta = cq._patient_head("賴義恩BURN(10B)0000416350(蔡李澄)06/18(11:27)")
+    assert name == "賴義恩"
+    assert "BURN · 10B" in meta and "0000416350" in meta and "06/18 11:27" in meta
+
+
 def test_patient_head_name_plus_meta():
     """逐病人標題:姓名 + 床位/病歷號/日期時間。解析不出結構 → 僅顯示簡名。"""
     name, meta = cq._patient_head("簡志仲I8(18A)0042107068(謝佳陵)06/17(11:23)")
