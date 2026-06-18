@@ -1761,15 +1761,21 @@ def _hotkey_awaiting_user_scope():
 
 
 def _find_phototherapy_memo(main_hwnd: int) -> int:
-    """找照光處置 memo:先找 UVB(原關鍵字,UVB 病人優先),找不到才退而找 excimer。
-    分兩段是為了:正常 UVB 病人若在別處(病史/徵候)剛好提到 excimer,也不會被那個
-    非處置 memo 搶走(_find_disposition_memo 取 z-order 第一個含關鍵字者)。回 0 = 都沒有。"""
-    memo = _find_disposition_memo(
-        main_hwnd, keywords=("UVB", "Phototherapy", "光療"))
+    """找照光處置 memo,分兩段(_find_disposition_memo 取 z-order 第一個含關鍵字者,
+    無位置錨定):
+      Pass 1 = UVB-specific 關鍵字(UVB / 紫外線)。真正的 UVB 處置這個病人這次的健保
+        照光一定寫 UVB → 在這層就被選中、分流成 uvb。【刻意不放泛稱「光療/Phototherapy」】
+        —— 否則病史裡的「準分子光療 / excimer phototherapy」會在這層搶先被選,害真正的
+        UVB 病人被誤判成 pure_excimer 而漏 key 51019(Codex 審查抓到的高風險誤分流)。
+      Pass 2 = 泛稱光療 + excimer(UVB 處置偶爾只寫 phototherapy 不寫 UVB;或純自費
+        excimer)。找到後由 detect_phototherapy_kind 分類。
+    回 0 = 都沒有。"""
+    memo = _find_disposition_memo(main_hwnd, keywords=("UVB", "紫外線"))
     if memo:
         return memo
     return _find_disposition_memo(
-        main_hwnd, keywords=("excimer", "excime", "準分子"))
+        main_hwnd,
+        keywords=("Phototherapy", "光療", "excimer", "excime", "準分子"))
 
 
 def _detect_pure_excimer_disposition(label: str = "") -> bool:
@@ -3397,7 +3403,16 @@ def _set_身份_自費(value: str = "01", label: str = "") -> bool:
             f"請手動確認左上角身份是否為 {value} 再送出。")
         return False
     except Exception:
-        logging.exception("[%s][身份] 設身份例外", label)
+        # 例外路徑也要【警告醫師】—— caller(F1/F2/F3)已跳過 51019/療程,若這裡靜默
+        # 失敗會變成「沒 key 51019 又沒設身份」且無提示(Codex 審查抓到的破口)。
+        logging.exception("[%s][身份] 設身份例外 → 警告醫師手動確認", label)
+        try:
+            _show_uvb_warning(
+                0, "身份未自動設定",
+                f"自動設定身份時發生例外,可能未改成 {value}。\n\n"
+                f"請手動確認左上角身份是否為 {value} 再送出。")
+        except Exception:
+            logging.debug("[%s][身份] 例外警告顯示也失敗", label, exc_info=True)
         return False
 
 
