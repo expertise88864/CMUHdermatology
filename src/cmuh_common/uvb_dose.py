@@ -1071,6 +1071,9 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
     # ─── Step B: v20.11 同日期 UVB-關鍵字多行更新 ───────────────────────
     # 處置可能有多行 UVB (e.g. 不同部位獨立記)，全部 last_date 跟第一行一致的
     # 都套用 format_uvb_line (dose+count+date 全部更新)，不同日期就停。
+    # [2026-06-18] 追蹤「本次實際要照的最高劑量」(主行 + 同日多行 + 續行 triplet)。
+    # 主行 new_dose 已於上面 >1500 檢查;additional/續行則累積到這裡,函式尾端統一確認。
+    max_applied_dose = new_dose
     uvb_additional = 0
     cursor = first_end
     while True:
@@ -1084,10 +1087,8 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         # 各別 sanity (additional segment 也要過 dose 上下限)
         if (next_uvb.dose < MIN_DOSE or next_uvb.max_dose < MIN_DOSE):
             break
-        # [2026-06-18] MAX(最高劑量)可超過 1500 → 不再因該行 MAX 設定 >1500 中斷;
-        # 真正本次劑量是否 >1500 交給下方 next_new_dose 檢查。
-        if not skip_dose_sanity and next_uvb.dose > MAX_DOSE:
-            break
+        # [2026-06-18] additional 行的 MAX 與本次劑量都可超過 1500;是否 >1500 由
+        # 函式尾端 max_applied_dose 統一確認(不在此 break,以免漏更新同日其他行)。
         # [review C 2026-06-12] increase=0 的豁免條件與第一行檢查同步：明寫 maintain、
         # 或「劑量已達/超過 MAX 的固定劑量行」(dose>=max 本就無法再加量)都合法。
         # 原本漏了 dose>=max 豁免 → 多行處置中第 2 行以後的固定劑量行會中斷迴圈
@@ -1104,8 +1105,7 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         )
         if next_new_dose is None or next_new_dose < MIN_DOSE:
             break
-        if not skip_dose_sanity and next_new_dose > MAX_DOSE:
-            break
+        max_applied_dose = max(max_applied_dose, next_new_dose)
         next_new_count = (next_uvb.count + 1
                           if next_uvb.count is not None else None)
         next_new_line = format_uvb_line(
@@ -1181,6 +1181,11 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
             seg_text,
             count=1,
         )
+        # [2026-06-18] 續行 triplet 保留原劑量、只 bump count/date;若該劑量 >1500
+        # 也算「本次要照的劑量」→ 納入尾端統一確認。
+        if continuation_m is not None:
+            max_applied_dose = max(max_applied_dose,
+                                   int(continuation_m.group(1)))
         triplet_edits.append((m.span(), seg_text))
 
     triplet_count = 0
@@ -1193,6 +1198,19 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
     triplet_count += excimer_count
 
     new_text = working
+
+    # [2026-06-18] 統一上限確認:同日多行 / 續行 triplet 裡任一「本次要照的劑量」
+    # >1500 → 跳 Yes/No 確認(MAX 最高劑量本身可超過 1500、不在此擋;只看實際要照
+    # 的劑量)。主行已於上方檢查,此處補抓 additional/續行。caller 按 Yes 帶
+    # skip_dose_sanity=True 重 call → 略過本檢查、全部套用。
+    if not skip_dose_sanity and max_applied_dose > MAX_DOSE:
+        return UvbUpdateResult(
+            action=UvbAction.CONFIRM_NEEDED,
+            confirm_reason=(
+                f"本次要照的劑量 {max_applied_dose} mj/cm2 "
+                f"超過建議上限 {MAX_DOSE} mj/cm2"),
+            parsed=parsed, days_diff=days_diff, uvb_line_count=uvb_lines,
+        )
 
     # ─── Round-trip verify: 重新 parse 新 text 確認結果一致 ─────────────
     # 防 format_uvb_line 因為奇怪格式沒替換成功，dose/count/date 跟預期不符

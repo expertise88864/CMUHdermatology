@@ -1212,6 +1212,43 @@ def test_confirm_needed_yes_then_multi_triplet_works():
     assert r2.new_text.count("(2026/05/28)") == 3
 
 
+def test_additional_uvb_line_computed_over_1500_confirms():
+    """[2026-06-18] 同日多行:主行本次劑量 ≤1500 但第二行算出 >1500 → 不可靜默漏更新,
+    要跳 CONFIRM(按 Yes 後 skip_dose_sanity 全部套用)。
+
+    舊版靠「MAX>1500 一律確認」間接擋住;MAX 改成可超過 1500 後,改由函式尾端
+    max_applied_dose 統一抓。primary 1000+50=1050 (≤1500),第二行 1480+50=1530 (>1500)。
+    """
+    text = (
+        "UVB: 1000 mj/cm2 (5) on (2026/5/20) add 50 each time, fixed at 1200\n"
+        "局部 手背 UVB: 1480 mj/cm2 (5) on (2026/5/20) add 50 each time, fixed at 1800"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 23))
+    assert r.action == UvbAction.CONFIRM_NEEDED
+    assert "1530" in (r.confirm_reason or "")
+    assert r.new_text is None
+    # 按 Yes 後 (skip_dose_sanity) → 兩行都套用
+    r2 = update_uvb_in_text(text, today=date(2026, 5, 23), skip_dose_sanity=True)
+    assert r2.action == UvbAction.UPDATED
+    assert "UVB: 1050" in r2.new_text and "UVB: 1530" in r2.new_text
+
+
+def test_continuation_triplet_over_1500_confirms():
+    """[2026-06-18] 續行 triplet (/ new for ...) 保留劑量 1700 (>1500) → 也要 CONFIRM。
+
+    主行 1400+50=1450 (≤1500) 不會擋;續行 1700mj/cm2 是本次仍要照的劑量 → 尾端確認。
+    """
+    text = (
+        "UVB: 1400 mj/cm2 (10) on (2026/5/25) "
+        "/ new for back 1700mj/cm2 (20) on (2026/5/25) "
+        "add 50 each time, fixed at 1800"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 28))
+    assert r.action == UvbAction.CONFIRM_NEEDED
+    assert "1700" in (r.confirm_reason or "")
+    assert r.new_text is None
+
+
 def test_confirm_needed_at_too_close_priority():
     """[v20.12] 1 天差 priority 在 CONFIRM_NEEDED 之前 — 仍然 CONFIRM_NEEDED 先
     (因為超過上限是更嚴重的問題，醫師應先確認)。
