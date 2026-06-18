@@ -1183,9 +1183,15 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         )
         # [2026-06-18] 續行 triplet 保留原劑量、只 bump count/date;若該劑量 >1500
         # 也算「本次要照的劑量」→ 納入尾端統一確認。
-        if continuation_m is not None:
+        # 單位接受 mj / mj/cm / mj/cm2(與全域 dose parser 一致);continuation_m 的
+        # 單位匹配較窄(只 mj、mj/cm2),這裡另用較寬的 regex 抓緊鄰 (count) 前的劑量,
+        # 以免 mj/cm 等變體漏掉。仍只取 (count) 緊鄰前方的劑量 → 抓的是本次「劑量」
+        # 而非句尾的 MAX(fixed at / upper limit),才不會把 MAX>1500 又當成要確認。
+        guard_dose_m = re.search(
+            r"(\d+)\s*mj(?:/cm2?)?\s*$", dose_prefix, re.IGNORECASE)
+        if guard_dose_m is not None:
             max_applied_dose = max(max_applied_dose,
-                                   int(continuation_m.group(1)))
+                                   int(guard_dose_m.group(1)))
         triplet_edits.append((m.span(), seg_text))
 
     triplet_count = 0

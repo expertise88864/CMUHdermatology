@@ -1236,17 +1236,33 @@ def test_additional_uvb_line_computed_over_1500_confirms():
 def test_continuation_triplet_over_1500_confirms():
     """[2026-06-18] 續行 triplet (/ new for ...) 保留劑量 1700 (>1500) → 也要 CONFIRM。
 
-    主行 1400+50=1450 (≤1500) 不會擋;續行 1700mj/cm2 是本次仍要照的劑量 → 尾端確認。
+    主行 1400+50=1450 (≤1500) 不會擋;續行 1700mj/cm 是本次仍要照的劑量 → 尾端確認。
+    刻意用 'mj/cm'(無 2)變體 — Codex review 指出較窄的 continuation_m 會漏抓,需用
+    與全域 dose parser 一致的寬鬆單位匹配。
     """
     text = (
         "UVB: 1400 mj/cm2 (10) on (2026/5/25) "
-        "/ new for back 1700mj/cm2 (20) on (2026/5/25) "
+        "/ new for back 1700mj/cm (20) on (2026/5/25) "
         "add 50 each time, fixed at 1800"
     )
     r = update_uvb_in_text(text, today=date(2026, 5, 28))
     assert r.action == UvbAction.CONFIRM_NEEDED
     assert "1700" in (r.confirm_reason or "")
     assert r.new_text is None
+
+
+def test_max_with_mj_unit_over_1500_still_no_confirm():
+    """[2026-06-18] 句尾 MAX 帶 mj 單位且 >1500(upper limit: 1800mj)— 仍不可因 MAX
+    跳確認。只有緊鄰 (count) 前的「本次劑量」才算;本次 1400+50=1450 ≤1500 → UPDATED。
+
+    守住「掃整行抓 mj 數字」會誤把 MAX 當劑量、害使用者又被 MAX>1500 煩」的退化。
+    """
+    text = (
+        "UVB: 1400 mj/cm2 (10) on (2026/5/20) add 50 each time, upper limit: 1800mj"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 23))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_text is not None and "1450" in r.new_text
 
 
 def test_confirm_needed_at_too_close_priority():
