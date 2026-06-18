@@ -27,7 +27,6 @@ from cmuh_common.process_launch import launch_app_script
 from cmuh_common.atomic_io import atomic_write_json as _atomic_write_json
 from cmuh_common.config_io import load_json_dict, load_json_list
 from cmuh_common.app_settings import (
-    load_auto_reboot_settings as _load_auto_reboot_settings,
     load_doctors_settings as _load_doctors_settings,
     load_r_doctor_settings as _load_r_doctor_settings,
     load_threshold_settings as _load_threshold_settings,
@@ -76,8 +75,8 @@ from cmuh_common.clinic_light_history import (
     record_light_sample,
 )
 from cmuh_common.platform_win import (
-    run_as_admin, set_dpi_awareness, set_app_user_model_id, get_idle_duration,
-    get_virtual_screen_rect, get_primary_monitor_size,
+    run_as_admin, set_dpi_awareness, set_app_user_model_id,
+    get_primary_monitor_size,
     place_tk_window_on_preferred_monitor,
 )
 from cmuh_common.notifications import show_windows_notification
@@ -96,11 +95,7 @@ from cmuh_common.single_instance import (
 )
 from cmuh_common.duty_summary import build_duty_summary_parts
 from cmuh_common.settings_backup import (
-    DEFAULT_SETTINGS_BACKUP_FILES,
-    create_settings_snapshot,
-    find_latest_snapshot_for_date,
     normalize_hhmm,
-    restore_settings_snapshot,
 )
 from cmuh_common.abbrev_engine import (
     AbbrevEngine,
@@ -6584,11 +6579,6 @@ class AutomationApp:
         # 啟動時優先批次完成後再跑全體刷新，避免與固定延遲重疊造成「Refresh already running; queued」
         self._startup_defer_full_until_priority_done = False
 
-        self.auto_reboot_settings = self.load_auto_reboot_settings()
-        self.auto_reboot_enabled = tk.BooleanVar(value=self.auto_reboot_settings.get("enabled", False))
-        self.auto_reboot_time = tk.StringVar(value=self.auto_reboot_settings.get("time", "07:01"))
-        self.last_reboot_check_date = None
-
         self.threshold_settings = self.load_threshold_settings()
         try:
             _ufs = float(self.threshold_settings.get("ui_font_scale", 1.0))
@@ -6614,8 +6604,6 @@ class AutomationApp:
         self.val_alert_chang = self.alert_chang_enabled.get()
         self.val_alert_chen = self.alert_chen_enabled.get()
         self.val_out_of_hospital = self.out_of_hospital_var.get()
-        self.val_auto_reboot_enabled = self.auto_reboot_enabled.get()
-        self.val_auto_reboot_time = self.auto_reboot_time.get()
 
         self.r_doctor_map = self.load_r_doctor_settings()
         self.doctors_list = self.load_doctors_settings()
@@ -6827,7 +6815,7 @@ class AutomationApp:
         # 使用者盯著還沒消失的視窗枯等。cleanup 仍同步完成(砍 chromedriver 必須在
         # os._exit 前跑完,否則留孤兒),只是移到「視覺上已關閉」之後。
         # 註:withdraw() 在 Windows 即時 SW_HIDE,毋需 update_idletasks();刻意不呼叫
-        # 它 —— 那會 pump 待處理的 after_idle(如閒置重開機倒數覆蓋窗,會阻塞 ~30s)。
+        # 它 —— 那會 pump 待處理的 after_idle(可能含阻塞式覆蓋窗,拖慢關閉)。
         try:
             self.root.withdraw()
         except Exception:
@@ -7584,13 +7572,8 @@ class AutomationApp:
     def load_doctors_settings(self):
         return _load_doctors_settings()
 
-    # 4. 讀取 自動重開機 設定
-    def load_auto_reboot_settings(self):
-        return _load_auto_reboot_settings()
-
-    # 1. 儲存 所有設定 (包含 R醫師, 止掛, 醫師列表, 重開機)
+    # 1. 儲存 所有設定 (包含 R醫師, 止掛, 醫師列表)
     def save_all_settings(self):
-        self._backup_settings_snapshot()
         for r_key, entries in self.r_doctor_entries.items():
             self.r_doctor_map[r_key] = {"name": (entries["name_var"].get() or "").strip()}
         _atomic_write_json(get_conf_path('r_doctor_settings.json'), self.r_doctor_map)
@@ -7645,9 +7628,6 @@ class AutomationApp:
         
         self.doctors_list = new_doctors_list
         _atomic_write_json(get_conf_path('doctors.json'), self.doctors_list)
-        
-        reboot_config = { "enabled": self.auto_reboot_enabled.get(), "time": self.auto_reboot_time.get().strip() }
-        _atomic_write_json(get_conf_path('auto_reboot_settings.json'), reboot_config)
 
         self._show_notice("設定已儲存", "所有設定已寫入檔案。\n若變更「介面字體縮放」，請重新啟動程式後才會套用。", level="info", auto_close_ms=4500)
         global DOCTORS, DOCTOR_NAMES
@@ -7655,63 +7635,6 @@ class AutomationApp:
         DOCTOR_NAMES = [d["name"] for d in DOCTORS]
         self.refresh_all_calendars()
         self._trigger_refresh(is_manual=True)
-
-    def _settings_files_for_backup(self):
-        return list(DEFAULT_SETTINGS_BACKUP_FILES)
-
-    def _backup_settings_snapshot(self):
-        try:
-            snap_name, copied = create_settings_snapshot(
-                get_settings_dir(),
-                files=self._settings_files_for_backup(),
-            )
-            logging.info(f"設定快照完成: {snap_name}, files={copied}")
-        except Exception as e:
-            logging.error(f"設定快照失敗: {e}", exc_info=True)
-
-    def _restore_yesterday_settings_snapshot(self):
-        try:
-            base_dir = get_conf_path("versions")
-            if not os.path.isdir(base_dir):
-                self._show_notice("回復失敗", "尚未找到任何設定快照。", level="warn", auto_close_ms=3500)
-                return
-            snap_name = find_latest_snapshot_for_date(
-                get_settings_dir(),
-                date.today() - timedelta(days=1),
-            )
-            if not snap_name:
-                self._show_notice("回復失敗", "找不到昨天的設定快照。", level="warn", auto_close_ms=3500)
-                return
-            restored = restore_settings_snapshot(
-                get_settings_dir(),
-                snap_name,
-                files=self._settings_files_for_backup(),
-            )
-            self.threshold_settings = self.load_threshold_settings()
-            self.r_doctor_map = self.load_r_doctor_settings()
-            self.doctors_list = self.load_doctors_settings()
-            self.auto_reboot_settings = self.load_auto_reboot_settings()
-            self.alert_chang_enabled.set(self.threshold_settings.get("alert_chang_enabled", False))
-            self.alert_chen_enabled.set(self.threshold_settings.get("alert_chen_enabled", False))
-            self.out_of_hospital_var.set(self.threshold_settings.get("out_of_hospital_mode", False))
-            self.show_external_clinics.set(self.threshold_settings.get("show_external_clinics", True))
-            self.notify_dnd_start_time_var.set(str(self.threshold_settings.get("notify_dnd_start_time", "00:00")))
-            self.notify_dnd_end_time_var.set(str(self.threshold_settings.get("notify_dnd_end_time", "08:00")))
-            self.quick_text_f8_var.set(str(self.threshold_settings.get("quick_text_f8", F8_QUICK_TEXT_DEFAULT)))
-            self.auto_reboot_enabled.set(self.auto_reboot_settings.get("enabled", False))
-            self.auto_reboot_time.set(self.auto_reboot_settings.get("time", "07:01"))
-            if hasattr(self, "threshold_entries"):
-                for k, v in self.threshold_entries.items():
-                    v.set(self.threshold_settings.get(k, DEFAULT_THRESHOLDS.get(k, "")))
-            if hasattr(self, "r_doctor_entries"):
-                for r_key, entries in self.r_doctor_entries.items():
-                    entries["name_var"].set(self.r_doctor_map.get(r_key, {}).get("name", ""))
-            self.refresh_doctors_treeview()
-            self._show_notice("回復完成", f"已回復昨天快照：{snap_name}（{restored}檔）", level="info", auto_close_ms=4500)
-            self._trigger_refresh(is_manual=True)
-        except Exception as e:
-            logging.error(f"回復設定快照失敗: {e}", exc_info=True)
-            self._show_notice("回復失敗", f"回復設定時發生錯誤: {e}", level="error", auto_close_ms=5000)
 
     def load_heavy_modules(self):
         """將拖慢啟動速度的硬體綁定庫延遲至背景載入"""
@@ -10691,31 +10614,6 @@ class AutomationApp:
                   foreground="#666", font=("Microsoft JhengHei UI", self.f_sm)
                   ).pack(anchor="w", pady=(2, 0))
 
-        reboot_frame = ttk.LabelFrame(left_column, text="自動重開機設定 (閒置偵測)", padding=10)
-        reboot_frame.pack(fill=tk.X, pady=(0, 15))
-
-        # [修正 2] 定義同步函式，確保背景執行緒讀取到的是純 Python 變數
-        def sync_reboot_vars(*args):
-            try:
-                self.val_auto_reboot_enabled = self.auto_reboot_enabled.get()
-                self.val_auto_reboot_time = self.auto_reboot_time.get()
-            except Exception:
-                pass
-
-        # 綁定變數變更事件
-        self.auto_reboot_enabled.trace_add("write", sync_reboot_vars)
-        self.auto_reboot_time.trace_add("write", sync_reboot_vars)
-
-        def on_reboot_toggle():
-            # 這裡不需要手動更新變數了，trace_add 會處理
-            status = "開啟" if self.auto_reboot_enabled.get() else "關閉"
-            self.status_text.set(f"狀態: 自動重開機已 {status}")
-
-        ttk.Checkbutton(reboot_frame, text="啟用", variable=self.auto_reboot_enabled, command=on_reboot_toggle).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Label(reboot_frame, text="時間(24h):").pack(side=tk.LEFT, padx=(5, 2))
-        ttk.Entry(reboot_frame, textvariable=self.auto_reboot_time, width=5, justify='center').pack(side=tk.LEFT, padx=2)
-        ttk.Label(reboot_frame, text="(前1分閒置才執行)", style="Small.TLabel", foreground="gray").pack(side=tk.LEFT, padx=5)
-
         # F8 快速輸入文字設定 — 按 F8 → 輸入此欄位文字到目前 focused 控件
         f8_frame = ttk.LabelFrame(left_column, text="F8 快速輸入文字", padding=10)
         f8_frame.pack(fill=tk.X, pady=(0, 15))
@@ -10776,11 +10674,6 @@ class AutomationApp:
         self.promo_placeholder_label = ttk.Label(self.promo_frame, text="切換到設定頁後載入圖片", foreground="gray")
         self.promo_placeholder_label.pack(pady=6)
         # =========================================================================
-
-        backup_frame = ttk.LabelFrame(left_column, text="設定快照回復", padding=10)
-        backup_frame.pack(fill=tk.X, pady=(0, 15))
-        ttk.Label(backup_frame, text="儲存時會自動建立快照，可回復到昨天最新版本。", style="Small.TLabel", foreground="gray").pack(anchor="w", pady=(0, 6))
-        ttk.Button(backup_frame, text="回復到昨天設定", command=self._restore_yesterday_settings_snapshot).pack(anchor="w")
 
         # [這行保持在原本的最下方]
         ttk.Button(scrollable_frame, text="儲存所有設定", command=self.save_all_settings).pack(pady=20, ipady=5, ipadx=30)
@@ -12565,47 +12458,15 @@ class AutomationApp:
             while not stop_event_main.is_set():
                 # [穩定性] run_pending 包 try/except：schedule 預設會把工作的例外往外拋，
                 # 若任一工作(尤其直接註冊、未經 run_named_job 的 dynamic_cl_checker)拋例外，
-                # 會中斷此常駐迴圈 → 當天所有定時刷新/自動重開機停擺。包起來保住心跳。
+                # 會中斷此常駐迴圈 → 當天所有定時刷新停擺。包起來保住心跳。
                 try:
                     schedule.run_pending()
                 except Exception:
                     logging.error("schedule.run_pending 例外（已忽略，保住排程迴圈）", exc_info=True)
 
-                try:
-                    if self.val_auto_reboot_enabled:
-                        now = datetime.now()
-                        current_time_str = now.strftime("%H:%M")
-                        raw_time = str(self.val_auto_reboot_time).strip()
-                        
-                        if ':' in raw_time:
-                            parts = raw_time.split(':')
-                            target_time_str = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
-                        else:
-                            target_time_str = raw_time 
-
-                        current_date_str = now.strftime("%Y-%m-%d")
-
-                        # [2026-05-25 v15 CPU 優化] master loop sleep 1s → 5s
-                        # 後，second < 5 窗口可能整段被跳過。改 < 10 確保即使
-                        # sleep 在 0:59→1:04 跨過 0-5s 也能在 1:04 觸發到。
-                        # 同一分鐘多次觸發由 last_reboot_check_date != date 擋掉。
-                        if current_time_str == target_time_str and now.second < 10 and self.last_reboot_check_date != current_date_str:
-                            idle_seconds = get_idle_duration()
-
-                            if idle_seconds >= 60:
-                                logging.info(f"系統閒置 {idle_seconds:.0f}秒，執行自動重開機...")
-                                self.last_reboot_check_date = current_date_str
-                                self.root.after_idle(self.show_reboot_countdown)
-                            else:
-                                if now.second < 5:
-                                    logging.info(f"時間 ({current_time_str}) 符合，但系統非閒置 (閒置 {idle_seconds:.0f}秒 < 60秒)，跳過。")
-                except Exception as e:
-                    logging.error(f"Error in auto reboot check: {e}")
-
                 # [2026-05-25 v15 CPU 優化] 1s wait → 5s wait — master loop 是常駐
                 # 背景 thread，1s 太密 (每分鐘醒 60 次但 schedule jobs 都是 2 分鐘
                 # 以上精度)。改 5s 後 CPU 用量降 5x，shutdown 仍 ≤5s 內返回。
-                # auto-reboot 秒數窗口已配套放寬 (見上 second<10)。
                 if stop_event_main.wait(5.0):
                     break
 
@@ -12705,65 +12566,6 @@ class AutomationApp:
                 put_ui_message(self.ui_queue, UiStatusMessage(text="狀態: 更新檢查失敗"))
                 put_ui_message(self.ui_queue, UiAlertErrorMessage(
                     title="更新錯誤", msg=f"檢查更新時發生錯誤: {e}"))
-
-    def show_reboot_countdown(self, timeout=30):
-        """顯示置頂倒數視窗（橫跨所有螢幕，內容置於主螢幕中央）"""
-        top = tk.Toplevel(self.root)
-        top.title("系統即將重開機")
-        top.overrideredirect(True)  # 無邊框 overlay
-        top.attributes('-topmost', True)  # 置頂
-        top.configure(bg="#B71C1C")  # 紅色背景警示
-        # [雙螢幕] 橫跨整個虛擬桌面，避免警示只蓋住其中一個螢幕而被忽略
-        vx, vy, vw, vh = get_virtual_screen_rect()
-        try:
-            top.geometry(f"{vw}x{vh}+{vx}+{vy}")
-        except tk.TclError:
-            top.attributes('-fullscreen', True)
-        try:
-            top.focus_force()  # overrideredirect 視窗需主動搶焦點，<Key> 取消才有效
-        except tk.TclError:
-            pass
-
-        # 內容置於「主螢幕」中央（而非跨螢幕中央，避免文字落在兩螢幕接縫）
-        prim_w, prim_h = get_primary_monitor_size()
-        if prim_w <= 0 or prim_h <= 0:
-            prim_w, prim_h = vw, vh
-        content = tk.Frame(top, bg="#B71C1C")
-        content.place(x=(prim_w // 2) - vx, y=(prim_h // 2) - vy, anchor="center")
-
-        label = tk.Label(content, text=f"系統偵測閒置，將自動重開機維護\n\n{timeout} 秒後執行...",
-                         font=("Microsoft JhengHei UI", 48, "bold"), fg="white", bg="#B71C1C")
-        label.pack(expand=True)
-
-        cancel_btn = tk.Button(content, text="取消重開機 (Cancel)", font=("Microsoft JhengHei UI", 24),
-                               command=top.destroy, bg="white", fg="black", padx=50, pady=20)
-        cancel_btn.pack(pady=50)
-
-        # 倒數邏輯
-        self.reboot_cancelled = False
-        def countdown(count):
-            if not top.winfo_exists(): # 視窗被關閉代表取消
-                self.reboot_cancelled = True
-                return
-            
-            label.config(text=f"系統偵測閒置，將自動重開機維護\n\n{count} 秒後執行...")
-            if count > 0:
-                top.after(1000, countdown, count - 1)
-            else:
-                # 時間到，執行重開機
-                logging.info("Reboot countdown finished. Executing shutdown.")
-                top.destroy()
-                os.system("shutdown /r /t 0")
-
-        # 綁定任意鍵取消 (防呆)
-        top.bind("<Key>", lambda e: top.destroy())
-        top.bind("<Motion>", lambda e: None) # 滑鼠移動不取消，避免誤觸，必須點按鈕或按鍵
-
-        countdown(timeout)
-        
-        # 等待視窗關閉 (阻塞式等待，直到使用者取消或時間到)
-        self.root.wait_window(top)
-        return not self.reboot_cancelled # 回傳是否真的要執行 (True=執行, False=已取消)
 
 # --- 主程式執行區 ---
 if __name__ == "__main__":

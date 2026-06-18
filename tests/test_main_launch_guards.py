@@ -535,9 +535,11 @@ def test_background_schedule_loop_uses_low_frequency_wait():
     for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "start_background_tasks")
 
-        assert "now.second < 10" in src
+        # [2026-06-18] 自動重開機(含 now.second<10 的分鐘窗判斷)已移除;此迴圈現只剩
+        # schedule.run_pending() + 低頻 5 秒等待。
         assert "stop_event_main.wait(5.0)" in src
         assert "stop_event_main.wait(1.0)" not in src
+        assert "auto_reboot" not in src   # 防回歸:自動重開機不應再出現
 
 
 def test_main_and_scheduler_background_tasks_start_once_and_clear_schedule():
