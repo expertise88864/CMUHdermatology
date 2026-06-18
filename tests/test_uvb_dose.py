@@ -2292,10 +2292,38 @@ def test_detect_pure_uvb_is_uvb():
     ) == "uvb"
 
 
-@pytest.mark.parametrize("kw", ["UVB", "Phototherapy", "光療", "UV"])
-def test_detect_any_uvb_keyword_is_uvb(kw):
-    """任何 UVB 字眼(含與 excimer 並存時)→ uvb,不可誤判成自費。"""
+@pytest.mark.parametrize("kw", ["UVB", "UV", "NB-UVB", "紫外線"])
+def test_detect_uvb_specific_with_excimer_is_uvb(kw):
+    """UVB-specific 字眼(UVB/UV/紫外線)+ excimer → uvb(excimer+UVB 並存,要 key 51019)。"""
     assert detect_phototherapy_kind(f"excimer 1000mj {kw} 500mj") == "uvb"
+
+
+@pytest.mark.parametrize("kw", ["Phototherapy", "光療", "photo therapy"])
+def test_detect_generic_phototherapy_with_excimer_is_pure_excimer(kw):
+    """泛稱光療(Phototherapy/光療/photo therapy)是 excimer 也用的詞 → 與 excimer
+    並存且無 UVB-specific 時仍算 pure_excimer(自費)。避免「準分子光療 / excimer 光療」
+    被泛稱詞壓成健保 UVB(Codex/工作流審查抓到的最關鍵 billing bug)。"""
+    assert detect_phototherapy_kind(f"excimer 1000mj {kw}") == "pure_excimer"
+
+
+def test_detect_chinese_excimer_jun_fen_zi():
+    """中文「準分子光療」= excimer phototherapy → pure_excimer(不可因「光療」誤判 uvb)。"""
+    assert detect_phototherapy_kind(
+        "準分子光療 right cheek 700 mj/cm2 (5) on (2026/5/20)") == "pure_excimer"
+
+
+def test_detect_excimer_with_generic_guangliao_is_pure_excimer():
+    """'excimer 光療 ...' → pure_excimer(光療是泛稱,不壓過 excimer)。"""
+    assert detect_phototherapy_kind(
+        "excimer 光療 right cheek 700 mj/cm2 (5) on (2026/5/20) MAX 2000"
+    ) == "pure_excimer"
+
+
+def test_detect_generic_phototherapy_alone_is_uvb():
+    """只有泛稱光療、沒有 excimer → 沿用既有行為當 uvb(key 51019)。"""
+    assert detect_phototherapy_kind("phototherapy 500 mj/cm2 (5)") == "uvb"
+    assert detect_phototherapy_kind("光療 500 mj/cm2 (5)") == "uvb"
+    assert detect_phototherapy_kind("photo therapy 500 mj") == "uvb"  # 含空格
 
 
 def test_detect_none_when_no_phototherapy():

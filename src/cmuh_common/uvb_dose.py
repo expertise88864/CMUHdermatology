@@ -230,29 +230,39 @@ _EXCIMER_MARKER_RE = re.compile(r"\bexcimer(?:\s+light)?\b", re.IGNORECASE)
 _EXCIMER_DOSE_RE = re.compile(r"(\d+)\s*(mj(?:/cm2)?)", re.IGNORECASE)
 
 # [2026-06-18] F2/F3 照光分流偵測:處置屬於哪種照光,決定要不要 key 51019/療程、
-# 身份是否改 01。
-#   - has_uvb: 與 update_uvb_in_text 的 UVB 判定一致 + 光療,範圍取寬 → 只要有任何
-#     UVB 訊號就當成「有 UVB」(自費 Excimer 才會跳過 51019,寧可保守 key 51019)。
-#   - has_excimer: 寬鬆抓 "excime"(涵蓋打字漏 r 的 "excime"、"excimer"、"excimer light")。
-_PT_UVB_RE = re.compile(r"(?:UVB|Phototherapy|光療|\bUV\b)", re.IGNORECASE)
-_PT_EXCIMER_RE = re.compile(r"excime", re.IGNORECASE)
+# 身份是否改 01。關鍵在「光療 / Phototherapy 是【泛稱】」—— 中文「光療」「準分子光療」
+# 也用來指 excimer(準分子=excimer),不能因為出現「光療」就當成健保 UVB。
+# 故分三層,且【excimer 優先於泛稱光療】:
+#   1) UVB-specific:UVB / 紫外線 / 獨立 UV —— 一定是健保 UVB → "uvb"(含 excimer+UVB)。
+#   2) excimer(自費):excime(含打字漏 r)/ 中文「準分子」—— 無 UVB-specific 時 → "pure_excimer"
+#      (即使同時寫了泛稱「光療 / phototherapy」也算純 excimer)。
+#   3) 泛稱光療(photo therapy / 光療)且【無 excimer】→ 沿用既有行為當 "uvb"。
+_PT_UVB_SPECIFIC_RE = re.compile(r"(?:UVB|紫外線|\bUV\b)", re.IGNORECASE)
+_PT_EXCIMER_RE = re.compile(r"(?:excime|準分子)", re.IGNORECASE)
+_PT_GENERIC_RE = re.compile(r"(?:photo\s*therapy|光療)", re.IGNORECASE)
 
 
 def detect_phototherapy_kind(text: str) -> str:
     """判斷處置屬於哪種照光,給 F2/F3 分流用。回傳:
 
-      "uvb"          — 有 UVB(可能也含 Excimer)→ 正常 key 51019 + 療程,身份不動。
-      "pure_excimer" — 只有 Excimer、沒有任何 UVB 訊號 → 自費:不 key 51019/療程,身份→01。
-      "none"         — 兩種照光關鍵字都沒有。
+      "uvb"          — 有 UVB-specific 訊號(或只有泛稱光療、無 excimer)→ 正常
+                       key 51019 + 療程,身份不動(含 excimer+UVB 並存)。
+      "pure_excimer" — 有 excimer / 準分子 且【無】UVB-specific 訊號 → 自費:
+                       不 key 51019/療程,身份→01(即使處置另寫了泛稱「光療」)。
+      "none"         — 三種關鍵字都沒有。
 
-    安全考量:只要偵測到任何 UVB 字眼就回 "uvb"(寧可 key 51019 也不要把該健保的
-    UVB 誤判成自費而漏 key);"pure_excimer" 僅在「有 excimer 且完全無 UVB」時成立。
+    安全考量:
+      - 只要出現 UVB-specific(UVB/紫外線/獨立 UV)就回 "uvb",不會把健保 UVB 漏 key。
+      - 「光療 / phototherapy」是泛稱(中文「準分子光療」也是 excimer),不可單憑它
+        就壓過 excimer → excimer 比泛稱光療優先,避免自費 excimer 被誤判成健保 UVB。
     """
     t = text or ""
-    if _PT_UVB_RE.search(t):
+    if _PT_UVB_SPECIFIC_RE.search(t):
         return "uvb"
     if _PT_EXCIMER_RE.search(t):
         return "pure_excimer"
+    if _PT_GENERIC_RE.search(t):
+        return "uvb"
     return "none"
 
 

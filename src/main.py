@@ -1797,11 +1797,16 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
         return True
 
     # [2026-06-01] 多關鍵字：處置行可能寫 phototherapy/光療 而非 UVB
-    # [2026-06-18] 也加 excimer/excime(自費照光)→ 純 Excimer 病人也找得到處置欄,
-    # 才能進到下面的分流偵測(否則會在這裡誤判成「無 UVB」而中止)。
+    # [2026-06-18] 先找 UVB 處置(原關鍵字,正常 UVB 病人行為完全不變);找不到才退而
+    # 找含 excimer 的處置(純自費 Excimer 病人)。分兩段的理由:正常 UVB 病人若在別處
+    # (病史/徵候等)剛好提到 excimer,_find_disposition_memo 是「z-order 第一個含關鍵字
+    # 者」,把 excimer 併進同一輪會讓那個非處置 memo 可能搶先被選 → 誤判成 pure_excimer
+    # 而漏 key 51019。先 UVB 後 excimer 可保證真正的 UVB 處置永遠優先(審查抓到的回歸)。
     memo_hwnd = _find_disposition_memo(
-        main_hwnd,
-        keywords=("UVB", "Phototherapy", "光療", "excimer", "excime"))
+        main_hwnd, keywords=("UVB", "Phototherapy", "光療"))
+    if not memo_hwnd:
+        memo_hwnd = _find_disposition_memo(
+            main_hwnd, keywords=("excimer", "excime", "準分子"))
     if not memo_hwnd:
         if strict:
             logging.warning(
@@ -3239,13 +3244,25 @@ def _find_療程_edit_hwnd(main_hwnd: int) -> int:
 def _find_身份_edit_hwnd(main_hwnd: int) -> int:
     """動態找頂部 header「身份」輸入欄(原顯示 40/01 等代碼)的 hwnd。
 
-    身份欄是頂部 row(相對 y 80-135,與療程同一排)最左邊的 TEditExt。
-    probe(2026-06-18 張廖年峰機):身份 rel_left≈84、w≈89,其右依序為(空白)、
-    負擔(A12)、卡號、療程、類別、體重 → 取該 row 最左 = 身份。
-    與 _find_療程_edit_hwnd 同一套列舉,只差在「取最左」而非「取窄欄位」。"""
+    身份欄與療程在【同一排】(probe:皆 top≈110),身份是該排最左的 TEditExt。
+    定位策略:先用已驗證、且有寬度過濾的 _find_療程_edit_hwnd 取得「療程」當錨點,
+    再找與療程【同一 y(±8px)】的 TEditExt 取最左 = 身份。
+    這樣可避開「診斷排」(top≈136,最左欄 left 與身份相同=81 會撞)—— 之前單用
+    rel_y 80-135 的寬頻帶在非最大化視窗可能同時框到兩排、靠 z-order 決勝而誤抓
+    (工作流審查抓到的定位脆弱點)。
+    probe(2026-06-18 張廖年峰機):身份 rel_left≈84、w≈89;其右為(空白)、負擔(A12)、
+    卡號、療程、類別、體重。"""
+    療程_hwnd = _find_療程_edit_hwnd(main_hwnd)
+    if not 療程_hwnd:
+        logging.warning("[身份] 找不到療程錨點 → 無法定位身份欄,回 0")
+        return 0
     main_r = wintypes.RECT()
+    療程_r = wintypes.RECT()
     if not ctypes.windll.user32.GetWindowRect(main_hwnd, ctypes.byref(main_r)):
         return 0
+    if not ctypes.windll.user32.GetWindowRect(療程_hwnd, ctypes.byref(療程_r)):
+        return 0
+    療程_top = 療程_r.top
 
     edits = []
 
@@ -3262,8 +3279,8 @@ def _find_身份_edit_hwnd(main_hwnd: int) -> int:
             r = wintypes.RECT()
             if not ctypes.windll.user32.GetWindowRect(child, ctypes.byref(r)):
                 return True
-            rel_y = r.top - main_r.top
-            if 80 <= rel_y <= 135:  # 頂部 row
+            # 只收與療程【同一排】的欄位(±8px),排除診斷排等其他排
+            if abs(r.top - 療程_top) <= 8:
                 edits.append((child, r.left, r.top, r.right - r.left))
         except Exception:
             pass
@@ -3273,13 +3290,15 @@ def _find_身份_edit_hwnd(main_hwnd: int) -> int:
     seen = set()
     uniq = [e for e in edits if not (e[0] in seen or seen.add(e[0]))]
     if not uniq:
-        logging.warning("[身份] 頂部 row 找不到 TEditExt,回 0")
+        logging.warning("[身份] 療程同排找不到 TEditExt,回 0")
         return 0
     uniq.sort(key=lambda e: e[1])  # by left
-    logging.info("[身份] 頂部 row TEditExt 從左至右 (%d): %s",
-                 len(uniq), [(e[0], e[1] - main_r.left, e[3]) for e in uniq])
-    身份_hwnd = uniq[0][0]  # 最左 = 身份
-    logging.info("[身份] 身份 hwnd=%s (頂部 row 最左)", 身份_hwnd)
+    logging.info("[身份] 療程同排(top≈%d) TEditExt 從左至右 (%d): %s",
+                 療程_top - main_r.top, len(uniq),
+                 [(e[0], e[1] - main_r.left, e[3]) for e in uniq])
+    身份_hwnd, 身份_left, _t, 身份_w = uniq[0]  # 最左 = 身份
+    logging.info("[身份] 身份 hwnd=%s rel_left=%d w=%d (療程同排最左)",
+                 身份_hwnd, 身份_left - main_r.left, 身份_w)
     return 身份_hwnd
 
 
@@ -3307,12 +3326,15 @@ def _set_身份_自費(value: str = "01", label: str = "") -> bool:
                 f"請手動把身份改成 {value} 再送出。")
             return False
         before = (_read_tmemo_text(身份_hwnd) or "").strip()
-        # 安全把關:身份/負擔是短代碼(40/01/A12…)。若原值很長,極可能是定位錯欄位
-        # (例如抓到姓名欄)→ 不寫、警告,避免覆蓋無關欄位。
-        if len(before) > 6:
+        # 安全把關(正向辨識):身份別是「空白或 1-3 位純數字代碼」(40/01/10…)。
+        # 若原值非空且不符這個樣式(例如抓到負擔 'A12'、卡號 'IC49'、姓名或其他長
+        # 文字欄)→ 極可能定位錯欄位 → 不寫、警告。寫入前先正向確認這格「像身份欄」,
+        # 補上「寫回後讀同一 hwnd 的驗證會自我參照、寫錯欄仍會 pass」的破口
+        # (工作流審查抓到的中心風險)。
+        if before and not re.fullmatch(r"\d{1,3}", before):
             logging.warning(
-                "[%s][身份] 定位到的欄位原值過長 %r(疑似非身份欄)→ 不寫入",
-                label, before)
+                "[%s][身份] 定位到的欄位原值 %r 不像身份代碼(非空且非 1-3 位數字)"
+                " → 疑似定位錯欄位,不寫入", label, before)
             _show_uvb_warning(
                 main_hwnd, "身份未自動設定",
                 f"自動定位到的身份欄內容看起來不對(原值:{before!r})。\n\n"
