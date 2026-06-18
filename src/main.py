@@ -1561,36 +1561,43 @@ def _script_code_input_adaptive(code: str, label: str = "",
     if set_療程 is not None:
         time.sleep(0.08)  # 從 0.15s 降到 0.08s
         check_stop()
-        liaocheng_hwnd = _find_療程_edit_hwnd(hwnd)
-        if liaocheng_hwnd:
-            try:
-                ret = _wm_settext_timeout(liaocheng_hwnd, str(set_療程))
-                logging.info("[%s] 療程欄位 (hwnd=%s) WM_SETTEXT='%s'",
-                              label, liaocheng_hwnd, set_療程)
-                if not ret:
-                    logging.warning("[%s] WM_SETTEXT 療程 回傳失敗，fallback click",
-                                    label)
-                    if not _replace_edit_text(liaocheng_hwnd, str(set_療程),
-                                              main_hwnd=hwnd):
-                        workflow_ok = False
-            except Exception:
-                logging.warning("[%s] WM_SETTEXT 療程 失敗，fallback click",
-                                 label, exc_info=True)
-                if not _replace_edit_text(liaocheng_hwnd, str(set_療程), main_hwnd=hwnd):
-                    workflow_ok = False
-            try:
-                actual_療程 = _read_tmemo_text(liaocheng_hwnd).strip()
-                if actual_療程 != str(set_療程):
-                    logging.warning("[%s] 療程欄位驗證失敗，預期=%s 實際=%r",
-                                    label, set_療程, actual_療程)
-                    workflow_ok = False
-            except Exception:
-                logging.debug("[%s] 療程欄位驗證例外", label, exc_info=True)
-        else:
-            logging.warning("[%s] 找不到 療程 欄位（請手動填）", label)
+        if not _set_療程_only(hwnd, set_療程, label=label):
             workflow_ok = False
     _mark_hotkey_action_time()
     return workflow_ok
+
+
+def _set_療程_only(main_hwnd: int, value, label: str = "") -> bool:
+    """只設頂部「療程」欄=value(WM_SETTEXT→失敗 fallback click→寫回後 read-verify),
+    不經代碼輸入。供 F1/F2/F3 的 set_療程,以及 F1 純 Excimer(填療程但不 key 51019)
+    共用 —— 單一實作避免分歧。任一步失敗或驗證不符回 False。"""
+    liaocheng_hwnd = _find_療程_edit_hwnd(main_hwnd)
+    if not liaocheng_hwnd:
+        logging.warning("[%s] 找不到 療程 欄位（請手動填）", label)
+        return False
+    ok = True
+    try:
+        ret = _wm_settext_timeout(liaocheng_hwnd, str(value))
+        logging.info("[%s] 療程欄位 (hwnd=%s) WM_SETTEXT='%s'",
+                     label, liaocheng_hwnd, value)
+        if not ret:
+            logging.warning("[%s] WM_SETTEXT 療程 回傳失敗，fallback click", label)
+            if not _replace_edit_text(liaocheng_hwnd, str(value), main_hwnd=main_hwnd):
+                ok = False
+    except Exception:
+        logging.warning("[%s] WM_SETTEXT 療程 失敗，fallback click", label,
+                        exc_info=True)
+        if not _replace_edit_text(liaocheng_hwnd, str(value), main_hwnd=main_hwnd):
+            ok = False
+    try:
+        actual_療程 = _read_tmemo_text(liaocheng_hwnd).strip()
+        if actual_療程 != str(value):
+            logging.warning("[%s] 療程欄位驗證失敗，預期=%s 實際=%r",
+                            label, value, actual_療程)
+            ok = False
+    except Exception:
+        logging.debug("[%s] 療程欄位驗證例外", label, exc_info=True)
+    return ok
 
 
 def _read_tmemo_text(hwnd: int) -> str:
@@ -2214,6 +2221,41 @@ def _f1_update_uvb_dose_if_present(label: str = "F1") -> None:
     _update_uvb_dose_core(label, strict=False)
 
 
+# [2026-06-18] F1 純自費 Excimer 要 key 的醫令代碼(非 51019)。使用者明天確認數字後
+# 填入此字串;留空 = 暫不 key 醫令,F1 純 Excimer 只設療程 1(不動身份、不 key 51019)。
+F1_PURE_EXCIMER_CODE = ""
+
+
+def _f1_pure_excimer(label: str = "F1") -> bool:
+    """F1 純自費 Excimer(使用者 2026-06-18 拍板,僅 F1 改):
+      - 不動左上角「身份」(維持原樣,不寫 01,也不改健保)
+      - 不 key 51019
+      - 把「療程」設為 1(等同 UVB 的療程1)
+    F1_PURE_EXCIMER_CODE 有設定(明天確認代碼後)時,改走『key 該醫令 + 療程1』
+    (同 51019 流程但換代碼,仍不動身份)。"""
+    code = (F1_PURE_EXCIMER_CODE or "").strip()
+    if code:
+        ok = _script_code_input_adaptive(code, label=label, set_療程=1)
+        logging.info("[%s] 純 Excimer:醫令 %s + 療程1 → %s",
+                     label, code, "done" if ok else "skipped")
+        if not ok:
+            _show_uvb_warning(
+                0, "純 Excimer 自動處理未完成",
+                f"{label} 純 Excimer 的醫令 {code} 或療程 1 沒有確認完成。\n\n"
+                "請手動確認醫令與療程=1。")
+        return ok
+    # 尚未設定醫令代碼:只設療程 1(不動身份、不 key 51019)
+    main_hwnd = _find_hospital_main_window()
+    療程_ok = bool(main_hwnd) and _set_療程_only(main_hwnd, 1, label=label)
+    if not 療程_ok:
+        logging.warning("[%s] 純 Excimer:療程 1 未確認完成", label)
+        _show_uvb_warning(
+            main_hwnd or 0, "療程未自動設定",
+            f"{label} 純 Excimer 的療程 1 沒有確認完成。\n\n請手動把療程改成 1。")
+    logging.info("[%s] 純 Excimer:已設療程 1(未 key 醫令/51019、身份不動)", label)
+    return 療程_ok
+
+
 def script_F1_adaptive():
     """F1: 照光 (1) — 51019 + 療程 1，之後若有 UVB 行則更新 (寬鬆 mode)。
 
@@ -2222,11 +2264,12 @@ def script_F1_adaptive():
       - 沒 UVB → 跳過、不警告 (新病人正常情況)
       - 有 UVB → 套同樣劑量規則更新
       - PARSE_FAIL/SANITY_FAIL/TOO_CLOSE/寫回失敗 仍警告 (跟 F2/F3 同)
+    [2026-06-18] 純自費 Excimer 只在 F1 改:不動身份、不 key 51019、只設療程1
+    (見 _f1_pure_excimer);未來會改 key 另一個醫令(待確認)。F2/F3 維持身份01。
     """
     logging.info("--- Executing F1 (照光 1) ---")
-    # [2026-06-18] 純自費 Excimer 也在 F1 處理(使用者拍板):F1 是「先 51019 後 UVB」,
-    # 所以要在 key 51019 【之前】先判斷;純 Excimer → 設身份=01、不 key 51019/療程,
-    # 與 F2/F3 一致(billing 不論按哪個照光鍵都對)。偵測失敗一律當 normal(照常 51019)。
+    # F1 是「先 51019 後 UVB」,所以要在 key 51019 【之前】先判斷照光走向。
+    # 偵測失敗一律當 normal(照常 51019,不誤跳健保)。
     f1_route = _f1_phototherapy_route(label="F1")
     if f1_route == "ambiguous":
         logging.warning("F1: UVB 與 Excimer 分屬不同欄位 → 中止,交醫師手動")
@@ -2237,9 +2280,7 @@ def script_F1_adaptive():
             "F1 已停止 — 請醫師手動下醫令並確認身份別。")
         return False
     if f1_route == "pure_excimer":
-        _set_身份_自費("01", label="F1")
-        logging.info("F1 (照光 1): 純自費 Excimer — 已設身份 01,未 key 51019/療程")
-        return True
+        return _f1_pure_excimer(label="F1")
     ok = _script_code_input_adaptive("51019", label="F1", set_療程=1)
     logging.info("F1 (照光 1) 51019+療程: %s", "done" if ok else "skipped")
     if not ok:

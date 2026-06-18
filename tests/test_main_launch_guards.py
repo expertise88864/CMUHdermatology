@@ -68,6 +68,15 @@ def _has_return(func: ast.FunctionDef) -> bool:
     return any(isinstance(node, ast.Return) for node in ast.walk(func))
 
 
+def _called_names(func: ast.FunctionDef) -> set[str]:
+    """函式內以裸名稱呼叫的函式集合(供「有/沒有呼叫某函式」斷言)。"""
+    return {
+        node.func.id
+        for node in ast.walk(func)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+
 def _constant_strings(func: ast.FunctionDef) -> set[str]:
     return {
         node.value
@@ -179,6 +188,39 @@ def test_f2_f3_warn_when_code_input_fails_after_uvb_update():
             < _first_call_line(func, "_show_light_code_incomplete_warning")
         )
         assert len(_call_lines(func, "_show_light_code_incomplete_warning")) == 1
+
+
+def test_f1_pure_excimer_no_identity_no_51019_sets_療程1():
+    """[2026-06-18 user 拍板] F1 純自費 Excimer:不動身份、不 key 51019、只設療程1。"""
+    source_path = ROOT / "src" / "main.py"
+    f1 = _function_node(source_path, "script_F1_adaptive")
+    pure = _function_node(source_path, "_f1_pure_excimer")
+    # F1 主函式把純 excimer 委派給專屬 helper
+    assert "_f1_pure_excimer" in _called_names(f1)
+    # 不動身份:F1 主函式與 helper 都不呼叫 _set_身份_自費
+    assert "_set_身份_自費" not in _called_names(f1)
+    assert "_set_身份_自費" not in _called_names(pure)
+    # 不 key 51019:helper 沒有 "51019" 字面常數
+    assert "51019" not in _constant_strings(pure)
+    # 有設療程1:走 _set_療程_only,或(明天填代碼後)帶 set_療程 的代碼輸入
+    assert ("_set_療程_only" in _called_names(pure)
+            or "_script_code_input_adaptive" in _called_names(pure))
+
+
+def test_f2_f3_pure_excimer_still_set_identity_01():
+    """回歸:F2/F3 的純 excimer 維持「設身份 01」(本次只改 F1,不可波及 F2/F3)。"""
+    source_path = ROOT / "src" / "main.py"
+    for name in ("script_F2_adaptive", "script_F3_adaptive"):
+        func = _function_node(source_path, name)
+        assert "_set_身份_自費" in _called_names(func)
+        assert '_set_身份_自費("01"' in _function_source(source_path, name)
+
+
+def test_set_療程_only_is_shared_single_source():
+    """療程設定抽成 _set_療程_only 單一實作;_script_code_input_adaptive 也改用它。"""
+    source_path = ROOT / "src" / "main.py"
+    assert "_set_療程_only" in _called_names(
+        _function_node(source_path, "_script_code_input_adaptive"))
 
 
 def test_hotkey_scripts_return_completion_status():
@@ -702,9 +744,10 @@ def test_code_input_waits_for_focus_after_menu_command():
     assert "hotkey_modules.pyautogui.typewrite(code" not in code_input_src
     assert "workflow_ok = False" in code_input_src
     assert "if code and not workflow_ok:" in code_input_src
+    # 療程設定(現抽成 _set_療程_only)仍在「代碼輸入完成檢查」之後才執行
     assert (
         code_input_src.index("if code and not workflow_ok:")
-        < code_input_src.index("_find_療程_edit_hwnd")
+        < code_input_src.index("_set_療程_only")
     )
     assert code_input_src.count("_mark_hotkey_action_time()") >= 3
 
