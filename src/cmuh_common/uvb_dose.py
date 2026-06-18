@@ -855,9 +855,10 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
       - 任一不符 → 回 SANITY_FAIL 給 caller 警告
 
     [v20.12 2026-05-26 → 2026-06-18 調整] dose 上限 1500。MAX(最高劑量)欄位本身
-    可超過 1500、不跳確認;只有「本次要照的劑量」(原劑量或計算後新劑量) 超過 1500
-    才回 CONFIRM_NEEDED — caller 跳 Yes/No dialog，按 Yes 後以 skip_dose_sanity=True
-    重 call 跳過上限檢查繼續執行。
+    可超過 1500、不跳確認;只有「本次實際要照的劑量」(decay/maintain 計算後的 new_dose,
+    含同日多行/續行) 超過 1500 才回 CONFIRM_NEEDED。原劑量 >1500 但久未照光 decay 後
+    ≤1500 則不跳。caller 跳 Yes/No dialog，按 Yes 後以 skip_dose_sanity=True 重 call
+    跳過上限檢查繼續執行。
     新增同日期 triplet 偵測 — 處置內非 UVB-關鍵字 (如 excimer light) 但 (count)
     on (date) 日期跟第一行 UVB 相同的，count+1, date→today 一併更新。
 
@@ -938,19 +939,11 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         return UvbUpdateResult(action=UvbAction.PARSE_FAIL,
                                uvb_line_count=uvb_lines)
 
-    # ─── CONFIRM_NEEDED check (v20.12) ──────────────────────────────────
-    # 原劑量或 MAX 超過建議上限 → caller 跳 Yes/No 確認
-    # caller 按 Yes 後 skip_dose_sanity=True 重 call → 走下面的 sanity (略過上限)
-    # [2026-06-18] 只看「本次要照的劑量」是否超過 1500;MAX(最高劑量)設定可超過 1500
-    # 不再因此跳確認(可超過 1500)。原劑量本身已 >1500 → 本次必 >1500,先確認。
-    if not skip_dose_sanity and parsed.dose > MAX_DOSE:
-        return UvbUpdateResult(
-            action=UvbAction.CONFIRM_NEEDED,
-            confirm_reason=(
-                f"本次劑量 {parsed.dose} mj/cm2 超過建議上限 {MAX_DOSE} mj/cm2"),
-            last_date=parsed.last_date,
-            parsed=parsed, uvb_line_count=uvb_lines,
-        )
+    # [2026-06-18] CONFIRM_NEEDED 上限確認改為「只看本次要照的劑量」:
+    # 不在此用「原劑量 parsed.dose」早退 —— 原劑量 >1500 但久未照光經 decay 後本次
+    # 可能 ≤1500(例:1700 隔 15 天 → 850),早退會誤跳確認。也不在此用 MAX(最高劑量),
+    # MAX 可超過 1500。一律往下走 decay/maintain 計算,由「本次計算劑量 new_dose」
+    # (compute 之後)+ 同日多行/續行 max_applied_dose(函式尾端)統一判定是否 >1500。
 
     # ─── Sanity checks on parsed values ─────────────────────────────────
     # 下限永遠檢查；上限只在非 skip 模式才當作異常

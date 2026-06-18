@@ -1283,20 +1283,33 @@ def test_max_with_mj_unit_over_1500_still_no_confirm():
     assert r.new_text is not None and "1450" in r.new_text
 
 
-def test_confirm_needed_at_too_close_priority():
-    """[v20.12] 1 天差 priority 在 CONFIRM_NEEDED 之前 — 仍然 CONFIRM_NEEDED 先
-    (因為超過上限是更嚴重的問題，醫師應先確認)。
+def test_too_close_takes_priority_over_dose_confirm():
+    """[2026-06-18 改] >1500 確認改成「只看本次計算劑量」後,順序變成
+    parse → sanity → stale → too_close → compute → (本次劑量>1500 確認)。
 
-    實際上 CONFIRM_NEEDED 在 parse 完立刻檢查，days_diff 還沒算。所以順序是
-    parse → confirm → sanity → too_close → compute。
-    """
+    所以「昨天才照、今天又要照」(days_diff=1) 會先回 TOO_CLOSE — 本來就不該今天再照,
+    劑量是否 >1500 是算出來之後才談。比舊版(原劑量早退確認)更正確:間隔太短是更
+    根本的問題。"""
     text = (
         "UVB: 1600 mj/cm2 (50) on (2026/5/25) add 50 each time, fixed at 1600"
     )
     # today = 5/26, days_diff = 1 (too close)
     r = update_uvb_in_text(text, today=date(2026, 5, 26))
-    # 預期 CONFIRM_NEEDED 先 (因為 dose 上限是設計上 caller 該先決定)
-    assert r.action == UvbAction.CONFIRM_NEEDED
+    assert r.action == UvbAction.TOO_CLOSE
+
+
+def test_old_dose_over_1500_decays_below_no_confirm():
+    """[2026-06-18] 原劑量 >1500 但久未照光,decay 後本次劑量 ≤1500 → 不該跳確認。
+
+    Codex review 指出:早退用「原劑量」會誤判。原劑量 1700、隔 15 天 → decay 後遠
+    低於 1500,本次實際要照的劑量才是判準。"""
+    text = (
+        "UVB: 1700 mj/cm2 (50) on (2026/5/5) add 50 each time, fixed at 1800"
+    )
+    # 隔 15 天 → decay,本次計算劑量會 << 1500
+    r = update_uvb_in_text(text, today=date(2026, 5, 20))
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose is not None and r.new_dose <= 1500
 
 
 def test_skip_dose_sanity_still_blocks_next_day():
@@ -1531,24 +1544,22 @@ def test_stale_check_independent_of_dose_skip():
     assert "55" in (r.confirm_reason or "")
 
 
-def test_stale_check_and_dose_check_both_trigger_stale_first_or_dose():
-    """[v20.14] dose 超過 1500 + days 超過 30 → 兩個 confirm 都該觸發。
-    當前實作: dose check 在 stale check 之前 → 先吐 dose CONFIRM_NEEDED。
-    skip dose 後再 call → 才吐 stale CONFIRM_NEEDED。skip 兩個後正常 update。
+def test_stale_high_dose_record_stale_confirm_then_decayed_update():
+    """[2026-06-18 改] 原劑量 >1500 又久未照光(55 天)。>1500 確認改成只看「本次計算
+    劑量」後,先觸發的是 stale confirm(舊紀錄,在 compute 之前);caller 對 stale 按 Yes
+    會同時帶 skip_dose_sanity + skip_stale_check(見 main.py _f23),decay 後本次劑量
+    遠低於 1500 → 正常 update,不再多跳一次 dose-confirm。
     """
     text = "UVB: 1700 mj/cm2 (10) on (2026/04/01) add 50, MAX:1700"
     r1 = update_uvb_in_text(text, today=date(2026, 5, 26))
     assert r1.action == UvbAction.CONFIRM_NEEDED
-    assert "上限" in (r1.confirm_reason or "")  # dose-confirm 先
+    assert "距今" in (r1.confirm_reason or "")  # stale-confirm(非 dose-confirm)
 
+    # caller 對 stale confirm 按 Yes → 兩個 skip 一起帶
     r2 = update_uvb_in_text(text, today=date(2026, 5, 26),
-                            skip_dose_sanity=True)
-    assert r2.action == UvbAction.CONFIRM_NEEDED
-    assert "距今" in (r2.confirm_reason or "")  # 才換 stale-confirm
-
-    r3 = update_uvb_in_text(text, today=date(2026, 5, 26),
                             skip_dose_sanity=True, skip_stale_check=True)
-    assert r3.action == UvbAction.UPDATED
+    assert r2.action == UvbAction.UPDATED
+    assert r2.new_dose is not None and r2.new_dose <= 1500  # decay 後遠低於 1500
 
 
 def test_max_gap_days_still_sanity_fail_over_2_years():
