@@ -11200,8 +11200,18 @@ class AutomationApp:
                                                             _branch_suffix = (_EXT_BRANCH_DISPLAY_SUFFIX.get(ext_branch, "")
                                                                               if ext_branch else "")
                                                             # _RE_ROOM 擷取的 room 已含「診」(如 101診);僅缺時才補,避免「101診診」。
-                                                            _room_label = ((room if "診" in room else f"{room}診")
-                                                                           if room else "(診間未提供)")
+                                                            # [2026-06-19] 掛號資料沒帶診間時(如張廖年峰),回填 reg64 門診動態
+                                                            # 即時抓到的診間(同醫師同時段)。止掛當下診間燈亮著、reg64 有在輪詢,
+                                                            # snapshot 多半有值;仍取不到才顯示「(診間未提供)」。
+                                                            _room = room
+                                                            if not _room:
+                                                                with self._reg64_cache_lock:
+                                                                    _snap = self._reg64_public_snapshot.get(
+                                                                        (doc_name, session_name))
+                                                                if _snap and _snap.get("room"):
+                                                                    _room = str(_snap["room"])
+                                                            _room_label = ((_room if "診" in _room else f"{_room}診")
+                                                                           if _room else "(診間未提供)")
                                                             _where = f"{doc_name}醫師 {_room_label}{_branch_suffix}"
                                                             msg = (f"{level_prefix}\n"
                                                                    f"{_date_str} {_sess_label}\n"
