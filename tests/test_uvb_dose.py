@@ -1233,6 +1233,24 @@ def test_additional_uvb_line_computed_over_1500_confirms():
     assert "UVB: 1050" in r2.new_text and "UVB: 1530" in r2.new_text
 
 
+def test_additional_line_maintain_dose_no_false_confirm():
+    """[2026-06-18] 同日第二行寫 maintain dose → 維持原劑量(不加量),即使有 +50 與
+    MAX 1800,本次劑量仍是 1500 (≤1500) → 不該誤算成 1550 而跳確認。
+
+    Codex review 指出 Step B 沒沿用主行的 maintain 覆蓋,補上後此 case 應 UPDATED。
+    """
+    text = (
+        "UVB: 1000 mj/cm2 (5) on (2026/5/20) add 50 each time, fixed at 1200\n"
+        "局部 手背 UVB: 1500 mj/cm2 (5) on (2026/5/20) maintain dose, "
+        "add 50 each time, fixed at 1800"
+    )
+    r = update_uvb_in_text(text, today=date(2026, 5, 23))
+    assert r.action == UvbAction.UPDATED
+    assert "UVB: 1050" in r.new_text     # 第一行正常加量
+    assert "UVB: 1500" in r.new_text     # 第二行維持 1500
+    assert "1550" not in r.new_text      # 沒有被誤加到 1550
+
+
 def test_continuation_triplet_over_1500_confirms():
     """[2026-06-18] 續行 triplet (/ new for ...) 保留劑量 1700 (>1500) → 也要 CONFIRM。
 

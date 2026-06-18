@@ -1105,6 +1105,11 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         )
         if next_new_dose is None or next_new_dose < MIN_DOSE:
             break
+        # [2026-06-18] 與主行一致(見上方 v20.15 maintain 覆蓋):該行寫 maintain dose
+        # → 維持原劑量不加量。否則固定劑量行會被誤加,且本次劑量 ≤1500 卻誤算成 >1500
+        # 而跳確認。next_uvb.dose 已於上方通過 MIN 下限檢查。
+        if _has_maintain_dose(next_uvb.full_match):
+            next_new_dose = next_uvb.dose
         max_applied_dose = max(max_applied_dose, next_new_dose)
         next_new_count = (next_uvb.count + 1
                           if next_uvb.count is not None else None)
