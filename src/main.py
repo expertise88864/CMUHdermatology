@@ -1760,48 +1760,90 @@ def _hotkey_awaiting_user_scope():
         _hotkey_awaiting_user = prev
 
 
+def _collect_phototherapy_memos(main_hwnd: int) -> list:
+    """列舉所有 memo/edit/rich 控件,回傳 text 含任一照光關鍵字者 [(hwnd, text)]。
+    這裡的 'uv' 等寬鬆字串只是【粗篩】,真正分類交給 detect_phototherapy_kind(用
+    \\bUV\\b 等精準規則),所以粗篩多收到的無關欄位會被歸成 none、不影響結果。"""
+    items: list = []
+    keywords = ("uvb", "紫外線", "phototherapy", "photo therapy", "光療",
+                "excimer", "excime", "準分子", "uv")
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def cb(child, lparam):
+        try:
+            cls_buf = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(child, cls_buf, 64)
+            cls_lower = (cls_buf.value or "").lower()
+            if not any(s in cls_lower for s in ("memo", "edit", "rich")):
+                return True
+            text = _read_tmemo_text(child)
+            if not text:
+                return True
+            tl = text.lower()
+            if any(k in tl for k in keywords):
+                items.append((child, text))
+        except Exception:
+            pass
+        return True
+
+    try:
+        ctypes.windll.user32.EnumChildWindows(main_hwnd, cb, 0)
+    except Exception:
+        logging.debug("[Excimer] 列舉照光 memo 例外", exc_info=True)
+    return items
+
+
 def _resolve_phototherapy_disposition(main_hwnd: int):
-    """找照光處置 memo + 偵測「跨欄位歧義」。回 (memo_hwnd, ambiguous):
+    """回 (memo_hwnd, kind),kind ∈ "uvb" / "pure_excimer" / "ambiguous" / "none"。
 
-      memo_hwnd : 要分類/更新的處置 memo —— UVB-specific(UVB/紫外線)優先、再 excimer、
-                  再泛稱光療(Phototherapy/光療);0 = 都沒有。
-      ambiguous : True 代表 UVB-specific 與 excimer 出現在【不同控件】→ 無法確定哪個
-                  是「本次處置」(可能一個是處置、一個是病史)。caller 應警告並中止,不
-                  可自動分流(否則可能誤 key/誤跳 51019,或誤設身份)。
+    對【每一個】含照光關鍵字的 memo 各自用 detect_phototherapy_kind 精準分類(3-tier:
+    UVB-specific→uvb;有 excimer 無 UVB-specific→pure_excimer;只有泛稱光療→uvb),
+    再跨控件彙整:
+      - 同時出現 uvb memo 與 pure_excimer memo(必在不同控件)→ "ambiguous"
+        (無法判斷哪個是本次處置 — 可能一個是處置、一個是病史 → 交醫師手動)。
+      - 只有 uvb → "uvb";只有 pure_excimer → "pure_excimer";都沒有 → "none"。
 
-    _find_disposition_memo 是「z-order 第一個含關鍵字者」、無位置錨定,單看一個 memo
-    無法分辨現行處置 vs 病史。Codex 審查指出:純 Excimer 病人若病史提到 UVB,UVB-first
-    會選到舊的 UVB memo 而誤判 uvb;反之亦然。故同時找兩種、不同控件即視為歧義 → 交醫師。
-    若 UVB 與 excimer 在【同一個】memo(excimer+UVB 同次處置)→ 不歧義,照規格走 uvb。"""
-    uvb_memo = _find_disposition_memo(main_hwnd, keywords=("UVB", "紫外線"))
-    exc_memo = _find_disposition_memo(
-        main_hwnd, keywords=("excimer", "excime", "準分子"))
-    ambiguous = bool(uvb_memo and exc_memo and uvb_memo != exc_memo)
-    memo = uvb_memo or exc_memo or _find_disposition_memo(
-        main_hwnd, keywords=("Phototherapy", "光療"))
-    return (memo or 0), ambiguous
+    逐 memo 用 detect 分類(而非用關鍵字猜 UVB 側):即使現行 UVB 處置寫成泛稱
+    「Phototherapy / UV」(非字面 UVB),也會被正確歸成 uvb 而參與歧義判斷,不會被別
+    控件的舊 excimer 靜默搶走(Codex 審查連續抓到的誤分流類別)。"""
+    from cmuh_common.uvb_dose import (
+        combine_phototherapy_kinds, detect_phototherapy_kind)
+    uvb_hwnd = exc_hwnd = 0
+    kinds = []
+    for hwnd, text in _collect_phototherapy_memos(main_hwnd):
+        k = detect_phototherapy_kind(text)
+        kinds.append(k)
+        if k == "uvb" and not uvb_hwnd:
+            uvb_hwnd = hwnd
+        elif k == "pure_excimer" and not exc_hwnd:
+            exc_hwnd = hwnd
+    combined = combine_phototherapy_kinds(kinds)
+    if combined == "ambiguous":
+        logging.warning(
+            "[Excimer] 同時偵測到 UVB(hwnd=%s)與 Excimer(hwnd=%s)於不同欄位 "
+            "→ ambiguous", uvb_hwnd, exc_hwnd)
+        return uvb_hwnd, "ambiguous"
+    if combined == "uvb":
+        return uvb_hwnd, "uvb"
+    if combined == "pure_excimer":
+        return exc_hwnd, "pure_excimer"
+    return 0, "none"
 
 
 def _f1_phototherapy_route(label: str = "") -> str:
-    """只讀:給 F1 在 key 51019 前判斷本次照光走向。回:
-      "pure_excimer" — 純自費 Excimer(無 UVB)→ caller 設身份=01、跳過 51019/療程。
-      "ambiguous"    — UVB 與 excimer 分屬不同欄位 → caller 警告並中止(醫師手動)。
-      "normal"       — 一般(UVB / 無照光處置)→ caller 照常 51019/療程。
-    找不到主視窗/偵測例外一律回 "normal"(安全方向:照常 51019,不誤跳健保)。"""
+    """只讀:給 F1 在 key 51019 前判斷本次照光走向。回 "pure_excimer" / "ambiguous" /
+    "normal"(uvb 或無照光處置都當 normal:F1 照常 51019,UVB 在 51019 後 best-effort
+    更新)。找不到主視窗/例外一律 "normal"(安全方向:照常 51019,不誤跳健保)。"""
     try:
         main_hwnd = _find_hospital_main_window()
         if not main_hwnd:
             return "normal"
-        memo_hwnd, ambiguous = _resolve_phototherapy_disposition(main_hwnd)
-        if ambiguous:
+        _memo, kind = _resolve_phototherapy_disposition(main_hwnd)
+        if kind == "ambiguous":
             return "ambiguous"
-        if not memo_hwnd:
-            return "normal"  # 沒有照光處置(F1 第一次照光可能還沒寫)→ 照常
-        text = _read_tmemo_text(memo_hwnd)
-        if not text:
-            return "normal"
-        from cmuh_common.uvb_dose import detect_phototherapy_kind
-        if detect_phototherapy_kind(text) == "pure_excimer":
+        if kind == "pure_excimer":
             return "pure_excimer"
         return "normal"
     except Exception:
@@ -1846,11 +1888,11 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
         logging.info("[%s][UVB] 找不到主程式視窗 — 跳過 (best-effort)", label)
         return True
 
-    # [2026-06-01/06-18] 找照光處置 memo + 偵測跨欄位歧義(見 _resolve_phototherapy_disposition)。
-    memo_hwnd, photo_ambiguous = _resolve_phototherapy_disposition(main_hwnd)
+    # [2026-06-01/06-18] 找照光處置 memo + 分類(見 _resolve_phototherapy_disposition)。
+    memo_hwnd, photo_kind = _resolve_phototherapy_disposition(main_hwnd)
     # [2026-06-18] UVB 與 excimer 分屬不同控件 → 無法自動判斷本次是健保 UVB 還是自費
     # Excimer → 一律警告並中止,交醫師手動(billing 風險方向都很糟,寧可不自動動作)。
-    if photo_ambiguous:
+    if photo_kind == "ambiguous":
         logging.warning(
             "[%s][Excimer] UVB 與 Excimer 分屬不同欄位 → 無法自動分流,中止", label)
         _show_uvb_warning(
@@ -1892,19 +1934,13 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
     logging.info("[%s][UVB] memo hwnd=%s len=%d text=%r",
                  label, memo_hwnd, len(text), text[:500])
 
-    # [2026-06-18] 照光分流:純自費 Excimer(有 excimer、完全無 UVB)→ 不走 UVB 劑量
-    # 更新、不 key 51019/療程,改由 caller 設身份=01。Excimer+UVB 或純 UVB 走原流程。
-    # 偵測失敗(例外)→ 當作一般 UVB 流程(安全方向:仍會 key 51019,不會誤跳健保)。
-    try:
-        from cmuh_common.uvb_dose import detect_phototherapy_kind
-        if detect_phototherapy_kind(text) == "pure_excimer":
-            logging.info(
-                "[%s][Excimer] 純自費 Excimer(無 UVB)→ 不 key 51019/療程,"
-                "身份將設 01", label)
-            return _F23_PURE_EXCIMER
-    except Exception:
-        logging.exception(
-            "[%s][Excimer] 照光分流偵測例外 → 當作一般 UVB 流程", label)
+    # [2026-06-18] 照光分流:純自費 Excimer(已由 _resolve_phototherapy_disposition 分類)
+    # → 不走 UVB 劑量更新、不 key 51019/療程,改由 caller 設身份=01。
+    if photo_kind == "pure_excimer":
+        logging.info(
+            "[%s][Excimer] 純自費 Excimer(無 UVB)→ 不 key 51019/療程,身份將設 01",
+            label)
+        return _F23_PURE_EXCIMER
 
     try:
         from cmuh_common.uvb_dose import update_uvb_in_text, UvbAction

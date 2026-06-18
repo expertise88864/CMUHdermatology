@@ -16,6 +16,7 @@ from cmuh_common.uvb_dose import (  # noqa: E402
     UvbAction,
     UvbLineInfo,
     apply_uncertain_updates,
+    combine_phototherapy_kinds,
     compute_new_dose,
     detect_phototherapy_kind,
     format_uvb_line,
@@ -2336,3 +2337,24 @@ def test_detect_uv_word_boundary_not_substring():
     """\\bUV\\b 是字界比對,不會被無關字裡的 'uv' 子字串誤觸(例如 'uvula')。"""
     # 'uvula' 含 'uv' 子字串但非獨立 UV 字;且無 excimer → none
     assert detect_phototherapy_kind("uvula noted on exam, topical tx") == "none"
+
+
+# ─── [2026-06-18] 跨欄位彙整(現行處置 vs 病史無法靠單 memo 分辨 → 兩種並存=歧義)──
+
+def test_combine_uvb_and_excimer_in_different_fields_is_ambiguous():
+    """不同欄位同時有 uvb 與 pure_excimer → ambiguous(交醫師,避免 billing 誤分流)。"""
+    assert combine_phototherapy_kinds(["uvb", "pure_excimer"]) == "ambiguous"
+    assert combine_phototherapy_kinds(["pure_excimer", "none", "uvb"]) == "ambiguous"
+
+
+def test_combine_single_kind():
+    assert combine_phototherapy_kinds(["uvb"]) == "uvb"
+    assert combine_phototherapy_kinds(["uvb", "uvb", "none"]) == "uvb"
+    assert combine_phototherapy_kinds(["pure_excimer", "none"]) == "pure_excimer"
+    assert combine_phototherapy_kinds(["pure_excimer", "pure_excimer"]) == "pure_excimer"
+
+
+def test_combine_none_and_empty():
+    assert combine_phototherapy_kinds(["none", "none"]) == "none"
+    assert combine_phototherapy_kinds([]) == "none"
+    assert combine_phototherapy_kinds(None) == "none"  # type: ignore[arg-type]

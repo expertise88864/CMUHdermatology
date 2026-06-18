@@ -266,6 +266,29 @@ def detect_phototherapy_kind(text: str) -> str:
     return "none"
 
 
+def combine_phototherapy_kinds(kinds) -> str:
+    """把多個欄位(memo)各自的 detect_phototherapy_kind 結果彙整成單一結論:
+
+      "ambiguous"    — 同時出現 uvb 與 pure_excimer(分屬不同欄位)→ 無法判斷本次處置
+                       是健保 UVB 還是自費 Excimer,caller 應警告中止、交醫師手動。
+      "uvb"          — 只有 uvb(可能多個)。
+      "pure_excimer" — 只有 pure_excimer。
+      "none"         — 都沒有(忽略 "none")。
+
+    用於主程式逐 memo 分類後跨欄位彙整(現行處置 vs 病史無法靠單一 memo 分辨,故同時
+    存在兩種就視為歧義 → 交醫師,避免 billing 誤分流)。"""
+    s = set(kinds or ())
+    has_uvb = "uvb" in s
+    has_exc = "pure_excimer" in s
+    if has_uvb and has_exc:
+        return "ambiguous"
+    if has_uvb:
+        return "uvb"
+    if has_exc:
+        return "pure_excimer"
+    return "none"
+
+
 def _date_text(dt: date, sep: str = "/") -> str:
     """格式化日期並保留原本分隔符，sep 非 '-' 時預設用 '/'。"""
     sep = "-" if sep == "-" else "/"
