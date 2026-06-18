@@ -17,6 +17,7 @@ from cmuh_common.uvb_dose import (  # noqa: E402
     UvbLineInfo,
     apply_uncertain_updates,
     compute_new_dose,
+    detect_phototherapy_kind,
     format_uvb_line,
     parse_uvb_line,
     parse_uvb_partial,
@@ -2249,3 +2250,61 @@ def test_dateless_note_parse_line_is_none_but_partial_ok():
     assert parse_uvb_line(note) is None
     p = parse_uvb_partial(note)
     assert p is not None and p.dose == 950 and p.count == 10
+
+
+# ─── [2026-06-18] F2/F3 Excimer 自費照光分流偵測 ──────────────────────────
+
+def test_detect_pure_excimer_real_screenshot_case():
+    """實機截圖 case:四行 excimer(含一行打字漏 r 的 'excime'),完全沒有 UVB
+    → pure_excimer(身份→01、不 key 51019/療程)。"""
+    text = (
+        "excime 右側耳上方 2000 mj/cm2 on add 100 each, MAX 2000 mj/cm2\n"
+        "excimer 右側前面 2000 mj/cm2 on add 100 each, MAX 2000 mj/cm2\n"
+        "excimer 右側頭頂 1500 mj/cm2 on add 100 each, MAX 2000 mj/cm2\n"
+        "excimer 左側前面 700 mj/cm2 on add 100 each, MAX 2000 mj/cm2"
+    )
+    assert detect_phototherapy_kind(text) == "pure_excimer"
+
+
+def test_detect_excimer_typo_excime():
+    """打字漏 r 的 'excime' 也要算 excimer(寬鬆偵測,避免漏判成 none/abort)。"""
+    assert detect_phototherapy_kind("excime 左側 700 mj/cm2 ...") == "pure_excimer"
+
+
+def test_detect_excimer_light():
+    assert detect_phototherapy_kind(
+        "excimer light (25) 1000mJ for nape on (2026/5/25)") == "pure_excimer"
+
+
+def test_detect_excimer_plus_uvb_is_uvb():
+    """Excimer + UVB 同時存在 → uvb(正常 key 51019/療程,身份不動)。
+    安全方向:只要有 UVB 就不可跳過健保 51019。"""
+    text = (
+        "UVB: 500 mj/cm2 (5) on (2026/5/20) add 50 each time, fixed at 800\n"
+        "excimer light (10) 1000mJ for nape on (2026/5/20)"
+    )
+    assert detect_phototherapy_kind(text) == "uvb"
+
+
+def test_detect_pure_uvb_is_uvb():
+    assert detect_phototherapy_kind(
+        "UVB: 500 mj/cm2 (5) on (2026/5/20) add 50 each time, fixed at 800"
+    ) == "uvb"
+
+
+@pytest.mark.parametrize("kw", ["UVB", "Phototherapy", "光療", "UV"])
+def test_detect_any_uvb_keyword_is_uvb(kw):
+    """任何 UVB 字眼(含與 excimer 並存時)→ uvb,不可誤判成自費。"""
+    assert detect_phototherapy_kind(f"excimer 1000mj {kw} 500mj") == "uvb"
+
+
+def test_detect_none_when_no_phototherapy():
+    assert detect_phototherapy_kind("topical steroid bid, MPV") == "none"
+    assert detect_phototherapy_kind("") == "none"
+    assert detect_phototherapy_kind(None) == "none"  # type: ignore[arg-type]
+
+
+def test_detect_uv_word_boundary_not_substring():
+    """\\bUV\\b 是字界比對,不會被無關字裡的 'uv' 子字串誤觸(例如 'uvula')。"""
+    # 'uvula' 含 'uv' 子字串但非獨立 UV 字;且無 excimer → none
+    assert detect_phototherapy_kind("uvula noted on exam, topical tx") == "none"

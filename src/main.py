@@ -1760,8 +1760,18 @@ def _hotkey_awaiting_user_scope():
         _hotkey_awaiting_user = prev
 
 
-def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
+# [2026-06-18] 純自費 Excimer 哨符:_update_uvb_dose_core 偵測到「只有 Excimer、
+# 沒有 UVB」時回傳此值(truthy,所以 `if not res` 不會誤判成 abort;caller 用
+# `res == _F23_PURE_EXCIMER` 區分,代表要設身份=01、不 key 51019/療程)。其餘路徑
+# 仍回 True(正常)/False(中止),不需大改。
+_F23_PURE_EXCIMER = "pure_excimer"
+
+
+def _update_uvb_dose_core(label: str, *, strict: bool):
     """[v20.9 2026-05-26] F1 / F2/F3 共用核心邏輯。
+
+    [2026-06-18] 回傳值:True(正常,可續 51019/療程)/ False(中止)/
+    _F23_PURE_EXCIMER(純自費 Excimer — caller 應設身份=01、跳過 51019/療程)。
 
     strict=True (F2/F3): 沒 UVB / TMemo 空 / 找不到主視窗 → 警告 + return False
         (call site: F2/F3 — 第 2/3 次照光，處置一定要有 UVB 行)
@@ -1787,7 +1797,11 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
         return True
 
     # [2026-06-01] 多關鍵字：處置行可能寫 phototherapy/光療 而非 UVB
-    memo_hwnd = _find_disposition_memo(main_hwnd, keywords=("UVB", "Phototherapy", "光療"))
+    # [2026-06-18] 也加 excimer/excime(自費照光)→ 純 Excimer 病人也找得到處置欄,
+    # 才能進到下面的分流偵測(否則會在這裡誤判成「無 UVB」而中止)。
+    memo_hwnd = _find_disposition_memo(
+        main_hwnd,
+        keywords=("UVB", "Phototherapy", "光療", "excimer", "excime"))
     if not memo_hwnd:
         if strict:
             logging.warning(
@@ -1820,6 +1834,20 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
     # 方便事後 debug「為什麼 parse 失敗」之類問題 (前 500 字夠看 UVB 行)
     logging.info("[%s][UVB] memo hwnd=%s len=%d text=%r",
                  label, memo_hwnd, len(text), text[:500])
+
+    # [2026-06-18] 照光分流:純自費 Excimer(有 excimer、完全無 UVB)→ 不走 UVB 劑量
+    # 更新、不 key 51019/療程,改由 caller 設身份=01。Excimer+UVB 或純 UVB 走原流程。
+    # 偵測失敗(例外)→ 當作一般 UVB 流程(安全方向:仍會 key 51019,不會誤跳健保)。
+    try:
+        from cmuh_common.uvb_dose import detect_phototherapy_kind
+        if detect_phototherapy_kind(text) == "pure_excimer":
+            logging.info(
+                "[%s][Excimer] 純自費 Excimer(無 UVB)→ 不 key 51019/療程,"
+                "身份將設 01", label)
+            return _F23_PURE_EXCIMER
+    except Exception:
+        logging.exception(
+            "[%s][Excimer] 照光分流偵測例外 → 當作一般 UVB 流程", label)
 
     try:
         from cmuh_common.uvb_dose import update_uvb_in_text, UvbAction
@@ -2072,9 +2100,11 @@ def _update_uvb_dose_core(label: str, *, strict: bool) -> bool:
     return True
 
 
-def _f23_update_uvb_dose(label: str = "F2") -> bool:
-    """F2/F3 UVB 自動更新 — strict mode。
-    回 False → caller (script_F2/F3_adaptive) 應終止 (不跑 51019)。
+def _f23_update_uvb_dose(label: str = "F2"):
+    """F2/F3 UVB 自動更新 — strict mode。回傳:
+      False            → caller 應終止 (不跑 51019)。
+      _F23_PURE_EXCIMER → 純自費 Excimer:caller 應設身份=01、跳過 51019/療程。
+      True             → 正常,caller 續跑 51019/療程。
     """
     return _update_uvb_dose_core(label, strict=True)
 
@@ -2119,9 +2149,15 @@ def script_F2_adaptive():
     [v20 2026-05-26] 新增 UVB 自動劑量更新前處理。
     """
     logging.info("--- Executing F2 (照光 2) ---")
-    if not _f23_update_uvb_dose(label="F2"):
+    res = _f23_update_uvb_dose(label="F2")
+    if not res:
         logging.info("F2: UVB 前置檢查/更新未完成，已終止 (跳過 51019)")
         return False
+    if res == _F23_PURE_EXCIMER:
+        # 純自費 Excimer:不 key 51019/療程,把身份改成 01
+        _set_身份_自費("01", label="F2")
+        logging.info("F2 (照光 2): 純自費 Excimer — 已設身份 01,未 key 51019/療程")
+        return True
     # UVB 前置檢查過了(已 commit 要下 51019)才帶卡號 — 否則 precheck 中止卻已寫計費欄
     _autofill_卡號_from_醫師上次(label="F2")
     ok = _script_code_input_adaptive("51019", label="F2", set_療程=2)
@@ -2140,9 +2176,15 @@ def script_F3_adaptive():
     [v20 2026-05-26] 新增 UVB 自動劑量更新前處理。
     """
     logging.info("--- Executing F3 (照光 3) ---")
-    if not _f23_update_uvb_dose(label="F3"):
+    res = _f23_update_uvb_dose(label="F3")
+    if not res:
         logging.info("F3: UVB 前置檢查/更新未完成，已終止 (跳過 51019)")
         return False
+    if res == _F23_PURE_EXCIMER:
+        # 純自費 Excimer:不 key 51019/療程,把身份改成 01
+        _set_身份_自費("01", label="F3")
+        logging.info("F3 (照光 3): 純自費 Excimer — 已設身份 01,未 key 51019/療程")
+        return True
     # UVB 前置檢查過了(已 commit 要下 51019)才帶卡號 — 否則 precheck 中止卻已寫計費欄
     _autofill_卡號_from_醫師上次(label="F3")
     ok = _script_code_input_adaptive("51019", label="F3", set_療程=3)
@@ -3192,6 +3234,116 @@ def _find_療程_edit_hwnd(main_hwnd: int) -> int:
     療程_hwnd = narrow[0][0]
     logging.info("療程 hwnd=%s (頂部 row 第 1 個窄欄位 w<50)", 療程_hwnd)
     return 療程_hwnd
+
+
+def _find_身份_edit_hwnd(main_hwnd: int) -> int:
+    """動態找頂部 header「身份」輸入欄(原顯示 40/01 等代碼)的 hwnd。
+
+    身份欄是頂部 row(相對 y 80-135,與療程同一排)最左邊的 TEditExt。
+    probe(2026-06-18 張廖年峰機):身份 rel_left≈84、w≈89,其右依序為(空白)、
+    負擔(A12)、卡號、療程、類別、體重 → 取該 row 最左 = 身份。
+    與 _find_療程_edit_hwnd 同一套列舉,只差在「取最左」而非「取窄欄位」。"""
+    main_r = wintypes.RECT()
+    if not ctypes.windll.user32.GetWindowRect(main_hwnd, ctypes.byref(main_r)):
+        return 0
+
+    edits = []
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def cb(child, lparam):
+        try:
+            cls_buf = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(child, cls_buf, 64)
+            if cls_buf.value != "TEditExt":
+                return True
+            r = wintypes.RECT()
+            if not ctypes.windll.user32.GetWindowRect(child, ctypes.byref(r)):
+                return True
+            rel_y = r.top - main_r.top
+            if 80 <= rel_y <= 135:  # 頂部 row
+                edits.append((child, r.left, r.top, r.right - r.left))
+        except Exception:
+            pass
+        return True
+
+    ctypes.windll.user32.EnumChildWindows(main_hwnd, cb, 0)
+    seen = set()
+    uniq = [e for e in edits if not (e[0] in seen or seen.add(e[0]))]
+    if not uniq:
+        logging.warning("[身份] 頂部 row 找不到 TEditExt,回 0")
+        return 0
+    uniq.sort(key=lambda e: e[1])  # by left
+    logging.info("[身份] 頂部 row TEditExt 從左至右 (%d): %s",
+                 len(uniq), [(e[0], e[1] - main_r.left, e[3]) for e in uniq])
+    身份_hwnd = uniq[0][0]  # 最左 = 身份
+    logging.info("[身份] 身份 hwnd=%s (頂部 row 最左)", 身份_hwnd)
+    return 身份_hwnd
+
+
+def _set_身份_自費(value: str = "01", label: str = "") -> bool:
+    """純自費 Excimer:把左上角「身份」欄(原本 40 等)改成 value(預設 01)。
+
+    比照療程/卡號:WM_SETTEXT(逾時版)→ 失敗 fallback click → 寫回後 read-verify。
+    身份屬計費敏感欄位,任何一步失敗或驗證不符都【警告醫師手動確認】而不靜默放過。
+    依使用者拍板:不管原值(空白/40/其他)一律寫成 value。"""
+    try:
+        main_hwnd = _find_hospital_main_window()
+        if not main_hwnd:
+            logging.warning("[%s][身份] 找不到主視窗 → 無法設身份=%s", label, value)
+            _show_uvb_warning(
+                0, "身份未自動設定",
+                f"找不到西醫門診主視窗,無法把身份改成 {value}。\n\n"
+                f"請手動把左上角身份改成 {value} 再送出。")
+            return False
+        身份_hwnd = _find_身份_edit_hwnd(main_hwnd)
+        if not 身份_hwnd:
+            logging.warning("[%s][身份] 找不到身份欄 → 無法設 %s", label, value)
+            _show_uvb_warning(
+                main_hwnd, "身份未自動設定",
+                f"找不到左上角身份欄,無法自動改成 {value}。\n\n"
+                f"請手動把身份改成 {value} 再送出。")
+            return False
+        before = (_read_tmemo_text(身份_hwnd) or "").strip()
+        # 安全把關:身份/負擔是短代碼(40/01/A12…)。若原值很長,極可能是定位錯欄位
+        # (例如抓到姓名欄)→ 不寫、警告,避免覆蓋無關欄位。
+        if len(before) > 6:
+            logging.warning(
+                "[%s][身份] 定位到的欄位原值過長 %r(疑似非身份欄)→ 不寫入",
+                label, before)
+            _show_uvb_warning(
+                main_hwnd, "身份未自動設定",
+                f"自動定位到的身份欄內容看起來不對(原值:{before!r})。\n\n"
+                f"為安全起見未自動修改,請手動把身份改成 {value} 再送出。")
+            return False
+
+        ret = _wm_settext_timeout(身份_hwnd, value)
+        if not ret:
+            logging.warning("[%s][身份] WM_SETTEXT 回傳失敗 → fallback click", label)
+            _replace_edit_text(身份_hwnd, value, main_hwnd=main_hwnd)
+        time.sleep(0.05)
+        after = (_read_tmemo_text(身份_hwnd) or "").strip()
+        if after != value:
+            # 再試一次 fallback click(WM_SETTEXT 對某些 Delphi 自訂欄位無效)
+            _replace_edit_text(身份_hwnd, value, main_hwnd=main_hwnd)
+            time.sleep(0.05)
+            after = (_read_tmemo_text(身份_hwnd) or "").strip()
+        if after == value:
+            logging.info("[%s][身份] 已設身份 %r→%r(自費 Excimer)",
+                         label, before, value)
+            return True
+        logging.warning("[%s][身份] 設身份失敗 期望=%r 實際=%r → 警告醫師",
+                        label, value, after)
+        _show_uvb_warning(
+            main_hwnd, "身份設定驗證失敗",
+            f"自動把身份改成 {value} 後讀回驗證不符(實際:{after!r})。\n\n"
+            f"請手動確認左上角身份是否為 {value} 再送出。")
+        return False
+    except Exception:
+        logging.exception("[%s][身份] 設身份例外", label)
+        return False
 
 
 def _replace_edit_text(field_hwnd: int, new_text: str,
