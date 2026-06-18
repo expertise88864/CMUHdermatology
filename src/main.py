@@ -1760,6 +1760,40 @@ def _hotkey_awaiting_user_scope():
         _hotkey_awaiting_user = prev
 
 
+def _find_phototherapy_memo(main_hwnd: int) -> int:
+    """找照光處置 memo:先找 UVB(原關鍵字,UVB 病人優先),找不到才退而找 excimer。
+    分兩段是為了:正常 UVB 病人若在別處(病史/徵候)剛好提到 excimer,也不會被那個
+    非處置 memo 搶走(_find_disposition_memo 取 z-order 第一個含關鍵字者)。回 0 = 都沒有。"""
+    memo = _find_disposition_memo(
+        main_hwnd, keywords=("UVB", "Phototherapy", "光療"))
+    if memo:
+        return memo
+    return _find_disposition_memo(
+        main_hwnd, keywords=("excimer", "excime", "準分子"))
+
+
+def _detect_pure_excimer_disposition(label: str = "") -> bool:
+    """只讀:判斷目前處置是否為「純自費 Excimer(無 UVB)」。給 F1 在 key 51019 前先判斷
+    (F2/F3 是在 _update_uvb_dose_core 內判斷)。找不到主視窗/處置/偵測失敗一律回 False
+    (安全方向:當作非純 Excimer → 照常走 51019,不會誤跳健保)。"""
+    try:
+        main_hwnd = _find_hospital_main_window()
+        if not main_hwnd:
+            return False
+        memo_hwnd = _find_phototherapy_memo(main_hwnd)
+        if not memo_hwnd:
+            return False
+        text = _read_tmemo_text(memo_hwnd)
+        if not text:
+            return False
+        from cmuh_common.uvb_dose import detect_phototherapy_kind
+        return detect_phototherapy_kind(text) == "pure_excimer"
+    except Exception:
+        logging.exception(
+            "[%s][Excimer] F1 純 excimer 偵測例外 → 當作非純 excimer", label)
+        return False
+
+
 # [2026-06-18] 純自費 Excimer 哨符:_update_uvb_dose_core 偵測到「只有 Excimer、
 # 沒有 UVB」時回傳此值(truthy,所以 `if not res` 不會誤判成 abort;caller 用
 # `res == _F23_PURE_EXCIMER` 區分,代表要設身份=01、不 key 51019/療程)。其餘路徑
@@ -1796,17 +1830,9 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
         logging.info("[%s][UVB] 找不到主程式視窗 — 跳過 (best-effort)", label)
         return True
 
-    # [2026-06-01] 多關鍵字：處置行可能寫 phototherapy/光療 而非 UVB
-    # [2026-06-18] 先找 UVB 處置(原關鍵字,正常 UVB 病人行為完全不變);找不到才退而
-    # 找含 excimer 的處置(純自費 Excimer 病人)。分兩段的理由:正常 UVB 病人若在別處
-    # (病史/徵候等)剛好提到 excimer,_find_disposition_memo 是「z-order 第一個含關鍵字
-    # 者」,把 excimer 併進同一輪會讓那個非處置 memo 可能搶先被選 → 誤判成 pure_excimer
-    # 而漏 key 51019。先 UVB 後 excimer 可保證真正的 UVB 處置永遠優先(審查抓到的回歸)。
-    memo_hwnd = _find_disposition_memo(
-        main_hwnd, keywords=("UVB", "Phototherapy", "光療"))
-    if not memo_hwnd:
-        memo_hwnd = _find_disposition_memo(
-            main_hwnd, keywords=("excimer", "excime", "準分子"))
+    # [2026-06-01/06-18] 找照光處置 memo:UVB 優先、excimer 為退路
+    # (見 _find_phototherapy_memo — 確保正常 UVB 病人不被別處提到 excimer 的 memo 搶走)。
+    memo_hwnd = _find_phototherapy_memo(main_hwnd)
     if not memo_hwnd:
         if strict:
             logging.warning(
@@ -2136,6 +2162,13 @@ def script_F1_adaptive():
       - PARSE_FAIL/SANITY_FAIL/TOO_CLOSE/寫回失敗 仍警告 (跟 F2/F3 同)
     """
     logging.info("--- Executing F1 (照光 1) ---")
+    # [2026-06-18] 純自費 Excimer 也在 F1 處理(使用者拍板):F1 是「先 51019 後 UVB」,
+    # 所以要在 key 51019 【之前】先判斷;純 Excimer → 設身份=01、不 key 51019/療程,
+    # 與 F2/F3 一致(billing 不論按哪個照光鍵都對)。偵測失敗一律當非純 Excimer。
+    if _detect_pure_excimer_disposition(label="F1"):
+        _set_身份_自費("01", label="F1")
+        logging.info("F1 (照光 1): 純自費 Excimer — 已設身份 01,未 key 51019/療程")
+        return True
     ok = _script_code_input_adaptive("51019", label="F1", set_療程=1)
     logging.info("F1 (照光 1) 51019+療程: %s", "done" if ok else "skipped")
     if not ok:
