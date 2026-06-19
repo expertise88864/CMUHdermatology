@@ -194,6 +194,14 @@ def _set_ex_styles(tk_window, *, transparent: bool) -> None:
         logging.debug("[浮動門診] 設定延伸樣式失敗", exc_info=True)
 
 
+def _round_rect(cv, x1, y1, x2, y2, r, **kw):
+    """在 Canvas 上畫圓角矩形(smooth polygon)。kw 可帶 fill / outline / width。"""
+    r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+           x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+    return cv.create_polygon(pts, smooth=True, **kw)
+
+
 class ClinicFloatingWindow:
     """浮動門診動態視窗 — 兩個無邊框 Toplevel 達成「真正懸浮」:
 
@@ -211,6 +219,7 @@ class ClinicFloatingWindow:
                  geometry: str = "", on_close: Optional[Callable] = None,
                  on_geometry_change: Optional[Callable] = None) -> None:
         import tkinter as tk
+        import tkinter.font as tkfont
 
         self._tk = tk
         self.on_close = on_close
@@ -218,6 +227,17 @@ class ClinicFloatingWindow:
         self._opacity = clamp_opacity(opacity)
         self._cards_frame = None
         self._drag: dict = {}
+        # 字型物件(可量測寬度 → 算 tag/pill 圓角矩形大小)
+        self._fonts = {
+            "tag": tkfont.Font(family=_FONT, size=10, weight="bold"),
+            "room": tkfont.Font(family=_FONT, size=15, weight="bold"),
+            "doctor": tkfont.Font(family=_FONT, size=13, weight="bold"),
+            "light_big": tkfont.Font(family=_FONT, size=32, weight="bold"),
+            "light_sm": tkfont.Font(family=_FONT, size=18, weight="bold"),
+            "wait_lbl": tkfont.Font(family=_FONT, size=10),
+            "wait_num": tkfont.Font(family=_FONT, size=18, weight="bold"),
+            "empty": tkfont.Font(family=_FONT, size=12),
+        }
 
         # 位置/寬度(高度自動縮放)
         self._x, self._y, self._w = self._parse_geo(geometry)
@@ -419,46 +439,61 @@ class ClinicFloatingWindow:
                 logging.debug("[浮動門診] on_close 例外", exc_info=True)
         self.destroy()
 
+    def _card_width(self) -> int:
+        return max(self._MIN_W - 12, self._w - 14)
+
     def _build_card(self, parent, s: RoomStatus) -> None:
+        """用 Canvas 畫【圓角】卡片(tkinter 原生 Frame 無圓角)。"""
         tk = self._tk
+        f = self._fonts
         v = room_card_view(s)
         accent = slot_color(s.slot)
         state = v["state"]
         is_open = state == "open"
         slot = (s.slot or "").strip()
+        cw = self._card_width()
+        ch = 92 if is_open else 58
+        pad = 13
 
-        card = tk.Frame(parent, bg=_CARD_BG, highlightbackground=_BORDER,
-                        highlightcolor=_BORDER, highlightthickness=1, bd=0)
-        card.pack(fill="x", pady=(0, 7))
-        # 左側時段色條(看診中=飽和色,其餘=暗,一眼分辨在不在看診)
-        tk.Frame(card, bg=(accent if is_open else _LIGHT_DIM),
-                 width=5).pack(side="left", fill="y")
-        inner = tk.Frame(card, bg=_CARD_BG)
-        inner.pack(side="left", fill="both", expand=True, padx=(10, 11), pady=8)
+        cv = tk.Canvas(parent, width=cw, height=ch, bg=_WIN_BG,
+                       highlightthickness=0, bd=0)
+        cv.pack(pady=(0, 7))  # 固定寬、置中(圓角卡片左右等距)
+        # 卡片底(圓角 + 細邊)
+        _round_rect(cv, 1, 1, cw - 1, ch - 1, 12,
+                    fill=_CARD_BG, outline=_BORDER, width=1)
+        # 左側時段色條(看診中=飽和色 / 否則暗,圓角)
+        _round_rect(cv, 4, 11, 9, ch - 11, 2,
+                    fill=(accent if is_open else _LIGHT_DIM), outline="")
 
-        # ── 上排:時段 tag + 診間號(左) + 醫師(右,有顏色) ──
-        top = tk.Frame(inner, bg=_CARD_BG)
-        top.pack(fill="x")
+        # ── 上排:時段 tag(圓角)+ 診間號(左) + 醫師(右,上色) ──
+        x = pad
         if slot:
-            tk.Label(top, text=f" {slot} ", bg=accent, fg=_TAG_FG,
-                     font=(_FONT, 9, "bold")).pack(side="left", ipady=1)
-        tk.Label(top, text=f"  {str(s.room).strip()}", bg=_CARD_BG, fg=_INK,
-                 font=(_FONT, 15, "bold")).pack(side="left")
-        tk.Label(top, text=v["doctor"], bg=_CARD_BG, fg=_DOCTOR_FG,
-                 font=(_FONT, 12, "bold")).pack(side="right")
+            tw = f["tag"].measure(slot) + 16
+            _round_rect(cv, x, 11, x + tw, 31, 9, fill=accent, outline="")
+            cv.create_text(x + tw / 2, 21, text=slot, fill=_TAG_FG,
+                           font=f["tag"])
+            x += tw + 8
+        cv.create_text(x, 21, text=str(s.room).strip(), fill=_INK,
+                       anchor="w", font=f["room"])
+        cv.create_text(cw - pad, 21, text=v["doctor"], fill=_DOCTOR_FG,
+                       anchor="e", font=f["doctor"])
 
-        # ── 下排:燈號(hero,最大最顯眼) + 待診 pill(琥珀,醒目) ──
-        main = tk.Frame(inner, bg=_CARD_BG)
-        main.pack(fill="x", pady=(6, 0))
+        # ── 下排:燈號(hero) + 待診 pill(圓角琥珀,醒目) ──
         light_fg = accent if is_open else (_ERR_FG if state == "error" else _LIGHT_DIM)
-        tk.Label(main, text=v["light"], bg=_CARD_BG, fg=light_fg,
-                 font=(_FONT, 34 if is_open else 18, "bold")).pack(side="left",
-                                                                    anchor="s")
         if is_open:
-            pill = tk.Frame(main, bg=_PILL_BG)
-            pill.pack(side="right", anchor="center", pady=(2, 3))
-            tk.Label(pill, text="待診", bg=_PILL_BG, fg=_SUB,
-                     font=(_FONT, 10)).pack(side="left", padx=(9, 3), pady=2)
-            tk.Label(pill, text=v["waiting"], bg=_PILL_BG, fg=_WAIT_FG,
-                     font=(_FONT, 17, "bold")).pack(side="left", padx=(0, 10),
-                                                    pady=2)
+            cv.create_text(pad, ch - 13, text=v["light"], fill=light_fg,
+                           anchor="sw", font=f["light_big"])
+            lbl_w = f["wait_lbl"].measure("待診")
+            num_w = f["wait_num"].measure(v["waiting"])
+            pill_w = lbl_w + num_w + 24
+            px2, py1, py2 = cw - pad, ch - 42, ch - 15
+            px1 = px2 - pill_w
+            _round_rect(cv, px1, py1, px2, py2, 9, fill=_PILL_BG, outline="")
+            cy = (py1 + py2) / 2
+            cv.create_text(px1 + 9, cy, text="待診", fill=_SUB, anchor="w",
+                           font=f["wait_lbl"])
+            cv.create_text(px2 - 10, cy, text=v["waiting"], fill=_WAIT_FG,
+                           anchor="e", font=f["wait_num"])
+        else:
+            cv.create_text(pad, ch - 11, text=v["light"], fill=light_fg,
+                           anchor="sw", font=f["light_sm"])
