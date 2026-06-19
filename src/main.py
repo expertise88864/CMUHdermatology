@@ -2221,9 +2221,10 @@ def _f1_update_uvb_dose_if_present(label: str = "F1") -> None:
     _update_uvb_dose_core(label, strict=False)
 
 
-# [2026-06-18] F1 純自費 Excimer 要 key 的醫令代碼(非 51019)。使用者明天確認數字後
-# 填入此字串;留空 = 暫不 key 醫令,F1 純 Excimer 只設療程 1(不動身份、不 key 51019)。
-F1_PURE_EXCIMER_CODE = ""
+# [2026-06-19] F1 純自費 Excimer 要 key 的醫令代碼(自費 Excimer 專用,非健保 51019)。
+# 使用者確認 = 1850159 → F1 純 Excimer 走『key 1850159 + 療程1』(仍不動身份、不 key 51019)。
+# (留空時則只設療程 1、不 key 醫令 —— 保留為日後關閉用的安全退路。)
+F1_PURE_EXCIMER_CODE = "1850159"
 
 
 def _f1_pure_excimer(label: str = "F1") -> bool:

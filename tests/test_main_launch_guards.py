@@ -216,6 +216,15 @@ def test_f2_f3_pure_excimer_still_set_identity_01():
         assert '_set_身份_自費("01"' in _function_source(source_path, name)
 
 
+def test_f1_pure_excimer_code_filled_1850159():
+    """[2026-06-19 user] F1 純自費 Excimer 的醫令代碼已填 1850159(自費 Excimer 專用,
+    非健保 51019)。若被清回空字串會讓 F1 純 Excimer 不 key 醫令 → 漏帳,故鎖住此值。"""
+    source = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
+    assert 'F1_PURE_EXCIMER_CODE = "1850159"' in source
+    # 同時確認沒退回空字串
+    assert 'F1_PURE_EXCIMER_CODE = ""' not in source
+
+
 def test_set_療程_only_is_shared_single_source():
     """療程設定抽成 _set_療程_only 單一實作;_script_code_input_adaptive 也改用它。"""
     source_path = ROOT / "src" / "main.py"
