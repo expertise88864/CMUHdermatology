@@ -440,7 +440,8 @@ class ClinicFloatingWindow:
         self.destroy()
 
     def _card_width(self) -> int:
-        return max(self._MIN_W - 12, self._w - 14)
+        # self._w 已在 _parse_geo 夾在 >= _MIN_W;扣掉 body padx(12)+ 外框(2)= -14。
+        return self._w - 14
 
     def _build_card(self, parent, s: RoomStatus) -> None:
         """用 Canvas 畫【圓角】卡片(tkinter 原生 Frame 無圓角)。"""
