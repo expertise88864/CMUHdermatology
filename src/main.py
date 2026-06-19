@@ -8945,9 +8945,11 @@ class AutomationApp:
                             track=tracker,
                             display_cache=display,
                         ):
+                            # [2026-06-19] 先呼叫(最前面會擷取浮動快取、自身有 els 防護),
+                            # 再 guard 後面額外 widget → 沒開過門診分頁也能餵浮動視窗。
+                            self.update_single_clinic_ui(index, result, track, display_cache.get("curr_avg", "-"))
                             if index >= len(getattr(self, "clinic_ui_elements", ())):
                                 return
-                            self.update_single_clinic_ui(index, result, track, display_cache.get("curr_avg", "-"))
                             ui = self.clinic_ui_elements[index]
                             self._smart_widget_config(ui["comp_all"], text=str(result.get("completed", 0)))
                             self._smart_widget_config(ui["est_remain"], text=display_cache.get("est_remain", "—"), fg="#E65100")
@@ -9269,10 +9271,12 @@ class AutomationApp:
                     psc=prev_sess_close_str,
                     hl=hist_light_str,
                 ):
+                    # [2026-06-19] 先呼叫(它最前面會擷取浮動門診快取,且自身有 els 防護)
+                    # → 即使使用者沒開過門診分頁(clinic_ui_elements 空)也能餵浮動視窗;
+                    # 再 guard 後面只在有 UI 時才跑的額外 widget。
+                    self.update_single_clinic_ui(index, result, track, c_avg)
                     if index >= len(getattr(self, "clinic_ui_elements", ())):
                         return
-                    self.update_single_clinic_ui(index, result, track, c_avg)
-
                     ui = self.clinic_ui_elements[index]
 
                     self._smart_widget_config(ui['comp_all'], text=str(result.get('completed', 0)))
