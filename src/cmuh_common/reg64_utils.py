@@ -18,13 +18,16 @@ from typing import Optional
 
 
 def reg64_time_code_from_local_clock(when: Optional[datetime] = None) -> str:
-    """依本機時鐘：00:00–13:29→1，13:30–17:59→2，18:00–23:59→3。"""
+    """依本機時鐘：00:00–12:59→1(早上)，13:00–17:29→2(下午)，17:30–23:59→3(晚上)。
+
+    [2026-06-19 使用者] 切換點改為 13:00 轉下午、17:30 轉晚上(原本 13:30 / 18:00)。
+    """
     if when is None:
         when = datetime.now()
     cur = when.time()
-    if cur <= dt_time(13, 29, 59):
+    if cur <= dt_time(12, 59, 59):
         return "1"
-    if cur <= dt_time(17, 59, 59):
+    if cur <= dt_time(17, 29, 59):
         return "2"
     return "3"
 

@@ -12,8 +12,21 @@ from cmuh_common.reg64_utils import (  # noqa: E402
     prev_session_cn,
     reg64_clinic_quiet_hours,
     reg64_next_allowed_fetch_time,
+    reg64_time_code_from_local_clock,
     session_boundary_datetime,
 )
+
+
+def test_time_code_split_points_13_00_and_17_30():
+    """[2026-06-19 user] 切換點:13:00 轉下午、17:30 轉晚上(原 13:30 / 18:00)。"""
+    d = lambda h, m: datetime(2026, 6, 19, h, m)  # noqa: E731
+    assert reg64_time_code_from_local_clock(d(8, 0)) == "1"    # 早上
+    assert reg64_time_code_from_local_clock(d(12, 59)) == "1"  # 12:59 仍早上
+    assert reg64_time_code_from_local_clock(d(13, 0)) == "2"   # 13:00 起下午
+    assert reg64_time_code_from_local_clock(d(13, 29)) == "2"  # 舊邊界內仍下午
+    assert reg64_time_code_from_local_clock(d(17, 29)) == "2"  # 17:29 仍下午
+    assert reg64_time_code_from_local_clock(d(17, 30)) == "3"  # 17:30 起晚上
+    assert reg64_time_code_from_local_clock(d(18, 0)) == "3"   # 晚上
 
 
 def test_canonical_clinic_session_str_and_previous_session():

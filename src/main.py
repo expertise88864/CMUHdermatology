@@ -7080,10 +7080,8 @@ class AutomationApp:
         self._floating_status_by_room = {}             # room_code -> floating_clinic.RoomStatus
         self.floating_clinic_win = None
         self.floating_clinic_tick_id = None
-        self.clinic_appbar_win = None                  # 邊緣常駐條(AppBar)視窗
-        self.clinic_appbar_tick_id = None
         self._floating_clinic_settings = self._load_floating_clinic_settings()
-        # 門診動態顯示方式(單一真實來源):off / floating(浮動視窗) / appbar(邊緣常駐條)
+        # 門診動態顯示方式(單一真實來源):off / floating(浮動視窗)
         self.clinic_widget_mode = tk.StringVar(
             value=self._normalize_widget_mode(self._floating_clinic_settings.get("mode", "off")))
         self.floating_clinic_opacity = tk.DoubleVar(
@@ -7098,13 +7096,10 @@ class AutomationApp:
         self._exit_cleanup_done = True
         self._shutting_down = True
         logging.info("Shutdown signal received.")
-        # 門診動態小工具:關閉前存好設定並銷毀視窗(fail-open)。
-        # 【重要】邊緣常駐條務必銷毀 → 其 destroy() 會 ABM_REMOVE 把保留的下緣空間還回去,
-        # 否則桌面可用區會一直縮著。
+        # 門診動態小工具:關閉前存好設定並銷毀浮動視窗(fail-open)
         try:
             self._save_floating_clinic_settings()
             self._close_floating_clinic()
-            self._close_clinic_appbar()
         except Exception:
             pass
         stop_event_main.set()
@@ -8456,23 +8451,19 @@ class AutomationApp:
         clinic_status_frame = ttk.LabelFrame(tools_tab, text="目前門診動態")
         clinic_status_frame.pack(fill='both', expand=True, pady=0, anchor='n')
 
-        # ─── 門診動態顯示方式:關閉 / 浮動視窗 / 邊緣常駐條(最下緣)+ 透明度(由「設定」分頁移來) ───
-        floating_frame = ttk.LabelFrame(clinic_status_frame, text="門診動態視窗", padding=8)
+        # ─── 浮動門診動態視窗:啟用開關 + 透明度(由「設定」分頁移來,就近放門診動態區) ───
+        floating_frame = ttk.LabelFrame(clinic_status_frame, text="浮動門診動態視窗", padding=8)
         floating_frame.pack(fill='x', padx=5, pady=(4, 6))
-        _mode_row = ttk.Frame(floating_frame)
-        _mode_row.pack(fill='x')
-        ttk.Label(_mode_row, text="顯示方式:").pack(side='left')
-        for _val, _txt in (("off", "關閉"),
-                           ("floating", "浮動視窗"),
-                           ("appbar", "邊緣常駐條(最下緣)")):
-            ttk.Radiobutton(
-                _mode_row, text=_txt, value=_val,
-                variable=self.clinic_widget_mode,
-                command=self._apply_clinic_widget_mode,
-            ).pack(side='left', padx=(8, 0))
         _op_row = ttk.Frame(floating_frame)
-        _op_row.pack(fill='x', pady=(4, 0))
-        ttk.Label(_op_row, text="透明度:").pack(side='left')
+        _op_row.pack(fill='x')
+        ttk.Checkbutton(
+            _op_row,
+            text="啟用（半透明置頂、點擊穿透小窗）",
+            variable=self.clinic_widget_mode,
+            onvalue="floating", offvalue="off",
+            command=self._apply_clinic_widget_mode,
+        ).pack(side='left', pady=2)
+        ttk.Label(_op_row, text="透明度:").pack(side='left', padx=(16, 4))
         ttk.Scale(
             _op_row,
             from_=0.25,
@@ -8480,16 +8471,16 @@ class AutomationApp:
             variable=self.floating_clinic_opacity,
             command=lambda v: self._set_floating_clinic_opacity(),
             orient="horizontal",
-        ).pack(side='left', fill='x', expand=True, padx=(6, 0))
+        ).pack(side='left', fill='x', expand=True)
         ttk.Label(
             floating_frame,
-            text=("浮動視窗:半透明可拖曳小窗、點擊穿透;邊緣常駐條:貼螢幕最下緣一條、"
-                  "保留空間永不被蓋。兩者都顯示下方三診、依電腦時間自動切早/午/晚。"),
+            text=("半透明可拖曳小窗、點擊穿透(點得到後方 HIS),顯示下方三診、"
+                  "依電腦時間自動切早/午/晚。"),
             foreground="gray",
             style="Small.TLabel",
             wraplength=560,
             justify="left",
-        ).pack(anchor="w", pady=(4, 0))
+        ).pack(anchor="w", pady=(2, 0))
 
         self._ensure_clinic_room_model_from_disk()
 
@@ -9584,9 +9575,13 @@ class AutomationApp:
     # ─── 浮動門診動態小視窗 ────────────────────────────────────────────
     @staticmethod
     def _normalize_widget_mode(mode):
-        """門診動態顯示方式正規化:只認 off / floating / appbar,其餘一律 off。"""
+        """門診動態顯示方式正規化:只認 off / floating。
+        [2026-06-19] 邊緣常駐條(appbar)已移除(保留空間會與強制近全螢幕的醫囑系統衝突)
+        → 舊設定 "appbar" 一律遷移為 "floating"。"""
         m = str(mode).strip().lower() if mode is not None else "off"
-        return m if m in ("off", "floating", "appbar") else "off"
+        if m == "appbar":
+            return "floating"
+        return m if m in ("off", "floating") else "off"
 
     def _load_floating_clinic_settings(self):
         defaults = {"mode": "off", "opacity": 0.85, "geometry": ""}
@@ -9600,9 +9595,11 @@ class AutomationApp:
         # float() → 不正規化會在建構期就炸掉整個程式。clamp_opacity 對壞值回 0.85。
         from cmuh_common.floating_clinic import clamp_opacity
         cfg["opacity"] = clamp_opacity(cfg.get("opacity"))
-        # 顯示方式:相容舊版只有 "enabled" 布林的設定檔 → 推導 mode。
+        # 顯示方式:相容舊版只有 "enabled" 布林的設定檔 → 推導 mode;舊 "appbar" → "floating"。
         _mode = cfg.get("mode")
-        if _mode not in ("off", "floating", "appbar"):
+        if _mode in ("off", "floating", "appbar"):
+            _mode = self._normalize_widget_mode(_mode)   # appbar 一律遷移為 floating
+        else:
             _mode = "floating" if bool(cfg.get("enabled", False)) else "off"
         cfg["mode"] = _mode
         if not isinstance(cfg.get("geometry"), str):
@@ -9697,108 +9694,31 @@ class AutomationApp:
                 pass
 
     def _apply_clinic_widget_mode(self):
-        """依目前選的顯示方式(off/floating/appbar)開關對應視窗。兩者互斥、切換時先關另一個。"""
+        """依目前選的顯示方式(off/floating)開關浮動視窗。"""
         if getattr(self, "_shutting_down", False):
-            return  # 結束中:延後排程的此回呼若在 _cleanup_for_exit 後才觸發,不可再開窗(會漏 ABM_REMOVE)
+            return  # 結束中:延後排程的此回呼若在 _cleanup_for_exit 後才觸發,不可再開窗
         mode = self._normalize_widget_mode(self.clinic_widget_mode.get())
         try:
             if mode == "floating":
-                self._close_clinic_appbar()
                 self._open_floating_clinic()
-            elif mode == "appbar":
-                self._close_floating_clinic()
-                self._open_clinic_appbar()
             else:  # off
                 self._close_floating_clinic()
-                self._close_clinic_appbar()
         except Exception:
             logging.debug("[門診小工具] 切換顯示方式失敗", exc_info=True)
         self._save_floating_clinic_settings()
 
     def _set_floating_clinic_opacity(self, *args):
         try:
-            for w in (getattr(self, "floating_clinic_win", None),
-                      getattr(self, "clinic_appbar_win", None)):
-                try:
-                    if w and w.exists():
-                        w.set_opacity(float(self.floating_clinic_opacity.get()))
-                except Exception:
-                    pass
+            win = getattr(self, "floating_clinic_win", None)
+            if win and win.exists():
+                win.set_opacity(float(self.floating_clinic_opacity.get()))
             self._save_floating_clinic_settings()
         except Exception:
             logging.debug("[門診小工具] 調整透明度失敗", exc_info=True)
 
-    # ── 邊緣常駐條(AppBar)─────────────────────────────────────
-    def _open_clinic_appbar(self):
-        if getattr(self, "_shutting_down", False):
-            return  # 結束中不可註冊 appbar(ABM_NEW),否則沒有後續路徑保證 ABM_REMOVE → 桌面空間洩漏
-        if getattr(self, "clinic_appbar_win", None) is not None:
-            try:
-                if self.clinic_appbar_win.exists():
-                    return
-            except Exception:
-                pass
-        try:
-            from cmuh_common import clinic_appbar
-            self.clinic_appbar_win = clinic_appbar.ClinicAppBar(
-                self.root,
-                opacity=float(self.floating_clinic_opacity.get()),
-                edge="bottom",
-                on_close=self._on_clinic_appbar_user_closed,
-            )
-            self._clinic_appbar_tick()
-        except Exception:
-            logging.debug("[常駐條] 開啟失敗", exc_info=True)
-            self.clinic_appbar_win = None
-
-    def _close_clinic_appbar(self):
-        if getattr(self, "clinic_appbar_tick_id", None):
-            try:
-                self.root.after_cancel(self.clinic_appbar_tick_id)
-            except Exception:
-                pass
-            self.clinic_appbar_tick_id = None
-        if getattr(self, "clinic_appbar_win", None):
-            try:
-                self.clinic_appbar_win.destroy()   # destroy() 內會 ABM_REMOVE 還回保留空間
-            except Exception:
-                pass
-            self.clinic_appbar_win = None
-
-    def _on_clinic_appbar_user_closed(self):
-        # 使用者按了常駐條的 ✕ → 顯示方式改 off、存檔、銷毀(並還回空間)
-        try:
-            self.clinic_widget_mode.set("off")
-        except Exception:
-            pass
-        self._save_floating_clinic_settings()
-        self._close_clinic_appbar()
-
-    def _clinic_appbar_tick(self):
-        if getattr(self, "_shutting_down", False):
-            return
-        win = getattr(self, "clinic_appbar_win", None)
-        try:
-            if not win or not win.exists():
-                return
-        except Exception:
-            return
-        try:
-            win.update_rooms(self._collect_widget_room_status())
-            win.reassert()   # 重申位置(工作列/解析度變動)+ 置頂
-        except Exception:
-            logging.debug("[常駐條] tick 更新失敗", exc_info=True)
-        finally:
-            try:
-                if not getattr(self, "_shutting_down", False) and win and win.exists():
-                    self.clinic_appbar_tick_id = self.root.after(
-                        15000, self._clinic_appbar_tick)
-            except Exception:
-                pass
-
     def _collect_widget_room_status(self):
-        """收集要餵給浮動視窗/常駐條的各診間狀態:一律依電腦目前時間決定時段
-        (room_status_for_current_slot),不受卡片固定時段影響。浮動視窗與常駐條共用。"""
+        """收集要餵給浮動視窗的各診間狀態:一律依電腦目前時間決定時段
+        (room_status_for_current_slot),不受卡片固定時段影響。"""
         from cmuh_common import floating_clinic
         cur_tc = reg64_time_code_from_local_clock()
         cur_slot = reg64_slot_cn(cur_tc)
