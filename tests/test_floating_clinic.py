@@ -102,3 +102,22 @@ def test_parse_geometry_size():
     assert parse_geometry_size("bad") is None
     assert parse_geometry_size("") is None
     assert parse_geometry_size("0x0+1+1") is None   # 非正 → None
+
+
+def test_floating_window_has_current_time_row():
+    """[2026-06-19 user] 浮動視窗在標題列下、卡片上要有「目前時間」數字列(自走更新),
+    且高度計算要納入該列(不會被裁)。視窗為 GUI 元件,以原始碼守門避免被改掉。"""
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parents[1] / "src" / "cmuh_common" / "floating_clinic.py"
+    code = src.read_text(encoding="utf-8")
+    assert "_TIME_ROW_H" in code
+    assert "def _update_time(" in code
+    assert 'strftime("%H:%M")' in code
+    # 時間列固定在 body 最上方(side="top"),會排在 _render 重建的卡片之上
+    assert "self._time_lbl" in code
+    # 時間列高度以 winfo_reqheight 量測(含 DPI/字型縮放),避免固定常數在高 DPI 下裁切卡片
+    assert "winfo_reqheight" in code.split("def _time_row_height", 1)[1].split("\n    def ", 1)[0]
+    # 高度計算有納入時間列(用量測的 _time_row_height)
+    assert "_time_row_height()" in code.split("def _content_height", 1)[1].split("\n    def ", 1)[0]
+    # 銷毀時取消自走計時器,避免孤兒 after 回呼
+    assert "after_cancel(self._time_after_id)" in code
