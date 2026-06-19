@@ -256,7 +256,7 @@ class ClinicFloatingWindow:
     _CARD_H_OPEN = 90      # 看診中卡片高(燈號放大)
     _CARD_H_DIM = 68       # 未開診/關診/離線卡片高(要夠高,否則狀態字會疊到上排)
     _CARD_PADY = 7         # 卡片間距
-    _TIME_ROW_H = 56       # 目前時間列高度【後備值】;實際以 winfo_reqheight 量測(處理 DPI/字型縮放)
+    _TIME_ROW_H = 78       # 目前時間列高度【後備值】(日期 + 時:分:秒兩行);實際以 winfo_reqheight 量測
 
     def __init__(self, root, *, opacity: float = _OPACITY_DEFAULT,
                  geometry: str = "", on_close: Optional[Callable] = None,
@@ -269,7 +269,9 @@ class ClinicFloatingWindow:
         self.on_geometry_change = on_geometry_change
         self._opacity = clamp_opacity(opacity)
         self._cards_frame = None
-        self._time_lbl = None        # 目前時間數字標籤(自走更新)
+        self._time_frame = None      # 目前時間列容器(日期 + 時:分:秒)
+        self._date_lbl = None        # 日期 + 星期(較小)
+        self._time_lbl = None        # 時:分:秒(放大,自走更新)
         self._time_after_id = None
         self._last_rooms: list = []
         self._manual_h = None        # 使用者手動拉的高度(None=自動依卡片數縮放)
@@ -285,6 +287,7 @@ class ClinicFloatingWindow:
             "wait_num": tkfont.Font(family=_FONT, size=18, weight="bold"),
             "empty": tkfont.Font(family=_FONT, size=12),
             "clock": tkfont.Font(family=_FONT, size=20, weight="bold"),
+            "clock_date": tkfont.Font(family=_FONT, size=11),
         }
 
         # 位置/寬度(高度自動縮放)
@@ -305,12 +308,17 @@ class ClinicFloatingWindow:
         self._body = tk.Frame(self._outer, bg=_WIN_BG)
         self._body.pack(fill="both", expand=True, padx=6, pady=6)
 
-        # 目前時間(數字,標題列下、診間卡片上):一目了然、自走更新。固定在 body 最上方,
-        # 之後 _render 重建的卡片(side=top)會排在它下面。
-        self._time_lbl = tk.Label(self._body, text="", bg=_WIN_BG, fg=_INK,
+        # 目前時間(日期 + 時:分:秒,標題列下、診間卡片上):一目了然、自走更新。固定在 body
+        # 最上方,之後 _render 重建的卡片(side=top)會排在它下面。
+        self._time_frame = tk.Frame(self._body, bg=_WIN_BG)
+        self._time_frame.pack(side="top", fill="x", pady=(0, 5))
+        self._date_lbl = tk.Label(self._time_frame, text="", bg=_WIN_BG, fg=_SUB,
+                                  font=self._fonts["clock_date"])
+        self._date_lbl.pack(side="top", fill="x")
+        self._time_lbl = tk.Label(self._time_frame, text="", bg=_WIN_BG, fg=_INK,
                                   font=self._fonts["clock"])
-        self._time_lbl.pack(side="top", fill="x", pady=(0, 5))
-        self._update_time()   # 立即顯示 + 啟動自走更新
+        self._time_lbl.pack(side="top", fill="x")
+        self._update_time()   # 立即顯示 + 啟動自走更新(每秒)
 
         self._reposition(content_h=120)
         # 延伸樣式要在視窗 map 之後設(取得 hwnd):內容窗點擊穿透;標題列只不搶焦點。
@@ -438,15 +446,19 @@ class ClinicFloatingWindow:
         self._render()
 
     def _update_time(self) -> None:
-        """更新「目前時間」數字(HH:MM),並每 10 秒自走更新一次(分鐘變動會即時反映)。"""
+        """更新「目前時間」:日期(含星期)+ 時:分:秒,每秒自走更新一次。"""
         from datetime import datetime
         try:
+            now = datetime.now()
+            if self._date_lbl is not None and self._date_lbl.winfo_exists():
+                wd = "一二三四五六日"[now.weekday()]
+                self._date_lbl.config(text=now.strftime("%Y/%m/%d") + f" 週{wd}")
             if self._time_lbl is not None and self._time_lbl.winfo_exists():
-                self._time_lbl.config(text=datetime.now().strftime("%H:%M"))
+                self._time_lbl.config(text=now.strftime("%H:%M:%S"))
         except Exception:
             logging.debug("[浮動門診] 時間更新失敗", exc_info=True)
         try:
-            self._time_after_id = self.win.after(10000, self._update_time)
+            self._time_after_id = self.win.after(1000, self._update_time)
         except Exception:
             self._time_after_id = None
 
@@ -454,12 +466,12 @@ class ClinicFloatingWindow:
         return [s for s in self._last_rooms if should_show_room(s)]
 
     def _time_row_height(self) -> int:
-        """目前時間列實際高度:以 winfo_reqheight 量測(自動含 DPI/字型縮放)+ pack 下緣 pady(5);
-        量不到(尚未 realize)才用後備常數 _TIME_ROW_H。_content_height 在 update_idletasks 後呼叫,
-        故量測值可靠;後備值取較寬鬆,避免裁切。"""
+        """目前時間列(日期 + 時:分:秒兩行)實際高度:以容器 winfo_reqheight 量測
+        (自動含 DPI/字型縮放)+ pack 下緣 pady(5);量不到(尚未 realize)才用後備常數
+        _TIME_ROW_H。_content_height 在 update_idletasks 後呼叫,故量測值可靠;後備值取較寬鬆。"""
         try:
-            if self._time_lbl is not None:
-                rh = int(self._time_lbl.winfo_reqheight())
+            if self._time_frame is not None:
+                rh = int(self._time_frame.winfo_reqheight())
                 if rh > 0:
                     return rh + 5   # 對應 pack(pady=(0, 5))
         except Exception:
