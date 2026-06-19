@@ -950,3 +950,18 @@ def test_abbrev_bg_close_submit_failure_resets_flag():
         r"\s*except Exception:\s*\n\s*self\._abbrev_bg_close_running = False",
         src,
     ), "submit(_bg_close) 必須包 try/except 且失敗時重置旗標"
+
+
+def test_f11_checks_card_before_phototherapy_complete():
+    """[2026-06-19 user] F11 快速完成前要先檢查:療程 2/3(照光)且卡號空白 → 中止 +
+    提示。鎖住 script_F11_adaptive 有呼叫 _f11_precheck_card_for_phototherapy。"""
+    source_path = ROOT / "src" / "main.py"
+    f11 = _function_node(source_path, "script_F11_adaptive")
+    assert "_f11_precheck_card_for_phototherapy" in _called_names(f11)
+    pre = _function_node(source_path, "_f11_precheck_card_for_phototherapy")
+    # 前置檢查要讀療程欄與卡號欄
+    calls = _called_names(pre)
+    assert "_find_療程_edit_hwnd" in calls
+    assert "_find_療程卡號_edit_hwnd" in calls
+    # 提示文字含「目前卡號未輸入」
+    assert "目前卡號未輸入" in _function_source(source_path, "_f11_precheck_card_for_phototherapy")

@@ -3305,6 +3305,39 @@ def _f11_快速完成_main(label: str = "F11") -> bool:
     return True
 
 
+def _f11_precheck_card_for_phototherapy(label: str = "F11") -> bool:
+    """[2026-06-19] F11 前置:若頂部「療程」是 2 或 3(照光 2/3)且「卡號」欄目前空白
+    → 中止 F11 並提示「目前卡號未輸入」(照光要計費,卡號不能漏)。
+
+    回 True=可繼續;False=中止。找不到主視窗/療程/卡號欄、或讀取例外 → 一律放行
+    (保守:不確定就不擋,避免誤擋一般快速完成)。"""
+    try:
+        main_hwnd = _find_hospital_main_window()
+        if not main_hwnd:
+            return True
+        liao_hwnd = _find_療程_edit_hwnd(main_hwnd)
+        if not liao_hwnd:
+            return True
+        療程 = (_read_tmemo_text(liao_hwnd) or "").strip()
+        if 療程 not in ("2", "3"):
+            return True  # 不是照光 2/3 → 不檢查
+        card_hwnd = _find_療程卡號_edit_hwnd(main_hwnd)
+        if not card_hwnd:
+            return True  # 找不到卡號欄 → 不擋
+        card = (_read_tmemo_text(card_hwnd) or "").strip()
+        if card:
+            return True  # 卡號有值 → 放行
+        logging.warning("[%s] 療程=%s(照光)但卡號空白 → 中止 F11,提示醫師", label, 療程)
+        _show_uvb_warning(
+            main_hwnd, "目前卡號未輸入",
+            f"目前卡號未輸入。\n\n照光(療程 {療程})需要先輸入卡號,F11 已中止。\n"
+            "請輸入卡號後再按一次 F11。")
+        return False
+    except Exception:
+        logging.exception("[%s] F11 卡號前置檢查例外 → 放行", label)
+        return True
+
+
 def script_F11_adaptive():
     """F11 (解析度無關)：快速完成 — 全部完成 + 任意順序 popup 處理。
 
@@ -3320,6 +3353,10 @@ def script_F11_adaptive():
     不會塞爆 app message pump。
     """
     logging.info("--- Executing F11 (快速完成 adaptive) ---")
+    # [2026-06-19] 照光(療程 2/3)但卡號空白 → 中止 + 提示「目前卡號未輸入」
+    if not _f11_precheck_card_for_phototherapy(label="F11"):
+        logging.info("F11: 療程 2/3 但卡號空白 → 已中止(提示醫師輸入卡號)")
+        return False
     ok = _run_with_foreground_protector(_f11_快速完成_main, label="F11")
     logging.info("F11: %s", "done" if ok else "中斷")
     return bool(ok)

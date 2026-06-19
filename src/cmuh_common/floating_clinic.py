@@ -212,8 +212,11 @@ class ClinicFloatingWindow:
     """
 
     _BAR_H = 26
-    _DEFAULT_W = 232
-    _MIN_W = 150
+    _DEFAULT_W = 242
+    _MIN_W = 206            # 要夠寬讓「燈號 + 待診 pill」不重疊(舊版太窄 → 格式跑掉)
+    _CARD_H_OPEN = 92      # 看診中卡片高(燈號放大)
+    _CARD_H_DIM = 58       # 未開診/關診/離線卡片高
+    _CARD_PADY = 7         # 卡片間距
 
     def __init__(self, root, *, opacity: float = _OPACITY_DEFAULT,
                  geometry: str = "", on_close: Optional[Callable] = None,
@@ -226,6 +229,7 @@ class ClinicFloatingWindow:
         self.on_geometry_change = on_geometry_change
         self._opacity = clamp_opacity(opacity)
         self._cards_frame = None
+        self._last_rooms: list = []
         self._drag: dict = {}
         # 字型物件(可量測寬度 → 算 tag/pill 圓角矩形大小)
         self._fonts = {
@@ -307,9 +311,26 @@ class ClinicFloatingWindow:
         close.bind("<Button-1>", lambda e: self._handle_close())
         close.bind("<Enter>", lambda e: close.configure(fg=_ERR_FG))
         close.bind("<Leave>", lambda e: close.configure(fg=_HEADER_FG))
+        # 寬度縮放把手(內容窗點擊穿透無法放 grip,改放標題列):左右拖 = 改寬度。
+        grip = tk.Label(bar, text="↔", bg=_HEADER_BG, fg=_HEADER_FG,
+                        font=(_FONT, 11, "bold"), cursor="sb_h_double_arrow")
+        grip.pack(side="right", padx=(0, 4))
+        grip.bind("<Button-1>", self._resize_start)
+        grip.bind("<B1-Motion>", self._resize_move)
         for w in (bar, title):
             w.bind("<Button-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
+
+    def _resize_start(self, e) -> None:
+        self._drag["rw"] = self._w
+        self._drag["rx"] = e.x_root
+
+    def _resize_move(self, e) -> None:
+        neww = max(self._MIN_W,
+                   self._drag.get("rw", self._w) + (e.x_root - self._drag.get("rx", e.x_root)))
+        if neww != self._w:
+            self._w = neww
+            self._render()  # 用新寬度重畫卡片 + reposition
 
     def _reposition(self, content_h: Optional[int] = None) -> None:
         try:
@@ -345,8 +366,22 @@ class ClinicFloatingWindow:
 
     def update_rooms(self, rooms: list) -> None:
         """rooms: list[RoomStatus]。沒醫師的診自動隱藏;重建卡片 + 自動縮放高度。"""
+        self._last_rooms = list(rooms or [])
+        self._render()
+
+    def _content_height(self, visible: list) -> int:
+        """依顯示的卡片數【直接算】內容高(不靠 winfo_reqheight,更穩、不會虛高/被裁)。"""
+        if not visible:
+            return 64
+        total = 2 + 12  # 外框(1+1) + body pady(6+6)
+        for s in visible:
+            is_open = room_card_view(s)["state"] == "open"
+            total += (self._CARD_H_OPEN if is_open else self._CARD_H_DIM) + self._CARD_PADY
+        return total
+
+    def _render(self) -> None:
         tk = self._tk
-        visible = [s for s in rooms if should_show_room(s)]
+        visible = [s for s in self._last_rooms if should_show_room(s)]
         if self._cards_frame is not None:
             try:
                 self._cards_frame.destroy()
@@ -357,17 +392,14 @@ class ClinicFloatingWindow:
         self._cards_frame = frame
         if not visible:
             tk.Label(frame, text="目前無開診", bg=_WIN_BG, fg=_SUB,
-                     font=(_FONT, 12)).pack(pady=16)
+                     font=self._fonts["empty"]).pack(pady=16)
         for s in visible:
             self._build_card(frame, s)
-        # 依內容自動縮放高度
         try:
-            self._content.update_idletasks()
-            h = max(60, self._outer.winfo_reqheight())
-            self._reposition(content_h=h)
+            self._reposition(content_h=self._content_height(visible))
             _set_ex_styles(self._content, transparent=True)  # rebuild 後重申(保險)
         except Exception:
-            logging.debug("[浮動門診] 自動縮放失敗", exc_info=True)
+            logging.debug("[浮動門診] 重繪/縮放失敗", exc_info=True)
         self.lift_to_top()
 
     def get_geometry(self) -> str:
@@ -453,7 +485,7 @@ class ClinicFloatingWindow:
         is_open = state == "open"
         slot = (s.slot or "").strip()
         cw = self._card_width()
-        ch = 92 if is_open else 58
+        ch = self._CARD_H_OPEN if is_open else self._CARD_H_DIM
         pad = 13
 
         cv = tk.Canvas(parent, width=cw, height=ch, bg=_WIN_BG,
