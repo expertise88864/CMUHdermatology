@@ -194,6 +194,39 @@ def _set_ex_styles(tk_window, *, transparent: bool) -> None:
         logging.debug("[浮動門診] 設定延伸樣式失敗", exc_info=True)
 
 
+_CORNER_R = 12  # 圓角半徑
+
+
+def _apply_round_region(tk_window, w: int, h: int, radius: int, mode: str) -> None:
+    """用 GDI 把視窗剪成圓角(SetWindowRgn)→ 視窗本體就有圓角(不只卡片)。
+    mode:'top'=只圓上面兩角(標題列)、'bottom'=只圓下面兩角(內容窗)、'all'=四角。
+    只圓一邊的作法:把另一邊的圓角推到視窗外(被高度裁掉)→ 那邊看起來是直角。
+    系統接管 region(設新的會自動刪舊的),SetWindowRgn 失敗才自己 DeleteObject。
+    Windows 專屬,失敗忽略。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        gdi = ctypes.windll.gdi32
+        u = ctypes.windll.user32
+        gdi.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
+        gdi.CreateRoundRectRgn.restype = ctypes.c_void_p
+        gdi.DeleteObject.argtypes = [ctypes.c_void_p]
+        u.SetWindowRgn.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.BOOL]
+        u.SetWindowRgn.restype = ctypes.c_int
+        d = radius * 2
+        if mode == "top":          # 下面兩角推到 h+radius(視窗只有 h 高 → 下緣是直的)
+            rgn = gdi.CreateRoundRectRgn(0, 0, w + 1, h + radius + 1, d, d)
+        elif mode == "bottom":     # 上面兩角推到 -radius(視窗外 → 上緣是直的)
+            rgn = gdi.CreateRoundRectRgn(0, -radius, w + 1, h + 1, d, d)
+        else:
+            rgn = gdi.CreateRoundRectRgn(0, 0, w + 1, h + 1, d, d)
+        hwnd = _toplevel_hwnd(tk_window)
+        if not u.SetWindowRgn(hwnd, rgn, True):
+            gdi.DeleteObject(rgn)
+    except Exception:
+        logging.debug("[浮動門診] 圓角剪裁失敗", exc_info=True)
+
+
 def _round_rect(cv, x1, y1, x2, y2, r, **kw):
     """在 Canvas 上畫圓角矩形(smooth polygon)。kw 可帶 fill / outline / width。"""
     r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
@@ -271,6 +304,7 @@ class ClinicFloatingWindow:
             pass
         _set_ex_styles(self._content, transparent=True)
         _set_ex_styles(self.win, transparent=False)
+        self._apply_round_regions(120)  # 初始圓角(資料進來後 _render 會再套真實高度)
 
     # ── 建構輔助 ─────────────────────────────────────────────
     def _setup_toplevel(self, win, bg) -> None:
@@ -362,6 +396,12 @@ class ClinicFloatingWindow:
         except Exception:
             self._reposition()
 
+    def _apply_round_regions(self, content_h: int) -> None:
+        """把標題列(上圓)與內容窗(下圓)剪成圓角 → 整個浮窗看起來是圓角的。"""
+        _apply_round_region(self.win, self._w, self._BAR_H, _CORNER_R, "top")
+        _apply_round_region(self._content, self._w,
+                            max(2 * _CORNER_R, content_h), _CORNER_R, "bottom")
+
     # ── 對外 API ─────────────────────────────────────────────
     def _all_windows(self):
         return (self.win, getattr(self, "_content", None))
@@ -414,8 +454,10 @@ class ClinicFloatingWindow:
             self._content.update_idletasks()
             # 高度:使用者手動拉過就用手動值,否則依卡片數自動縮放
             h = self._manual_h if self._manual_h is not None else self._content_height(visible)
-            self._reposition(content_h=max(60, int(h)))
+            ch = max(60, int(h))
+            self._reposition(content_h=ch)
             _set_ex_styles(self._content, transparent=True)  # rebuild 後重申(保險)
+            self._apply_round_regions(ch)  # 圓角(視窗本體)
         except Exception:
             logging.debug("[浮動門診] 重繪/縮放失敗", exc_info=True)
         self.lift_to_top()

@@ -965,3 +965,16 @@ def test_f11_checks_card_before_phototherapy_complete():
     assert "_find_療程卡號_edit_hwnd" in calls
     # 提示文字含「目前卡號未輸入」
     assert "目前卡號未輸入" in _function_source(source_path, "_f11_precheck_card_for_phototherapy")
+
+
+def test_re_room_matches_letter_prefixed_room():
+    """[2026-06-19 user] 止掛信診間:_RE_ROOM 要能配 G06診(字母前綴)+ 101診(純數字),
+    否則 G06診(張廖年峰)會解析不到 → 信裡顯示「診間未提供」。"""
+    source = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
+    m = re.search(r"_RE_ROOM\s*=\s*re\.compile\(r'([^']+)'\)", source)
+    assert m, "找不到 _RE_ROOM 定義"
+    pat = re.compile(m.group(1))
+    assert pat.search("林某 (G06診) 已掛號").group(1) == "G06診"
+    assert pat.search("王某 (101診) 已掛號").group(1) == "101診"
+    assert pat.search("(自費門診)") is None
+    assert pat.search("(已關診)") is None

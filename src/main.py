@@ -220,7 +220,8 @@ def safe_unhook_all_hotkeys():
 
 # --- 模組級 Regex 常數 (只 compile 一次，避免每次呼叫重複編譯) ---
 _RE_COUNT_DIGIT = re.compile(r'(\d+)')          # 用於 _update_grid_data 計算人數
-_RE_ROOM        = re.compile(r'\((\d+診)\)')     # 用於 check_appointment_count 診間號
+_RE_ROOM        = re.compile(r'\(([A-Za-z0-9]+診)\)')  # 診間號:含字母前綴(如 G06診)+數字(101診)
+                                                 # [2026-06-19] 原本只配 \d+診 → 漏掉 G06診(張廖年峰)→ 止掛信顯示「診間未提供」
 _RE_COUNT_APPT  = re.compile(r'已掛號：(\d+)')   # 用於 check_appointment_count 掛號數
 _RE_PERSON      = re.compile(r'(\d+)\s*人')      # 用於 check_appointment_count 人數
 _RE_ROC_DATE    = re.compile(r'(\d{2,3})/(\d{2})/(\d{2})')
