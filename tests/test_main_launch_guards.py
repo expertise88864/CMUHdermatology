@@ -996,3 +996,37 @@ def test_overview_primary_rooms_a101_a103_and_no_legacy_181_182():
     # 顯示隱藏與排序都改用常數(不再硬編碼診間字串)
     assert "room not in _OVERVIEW_PRIMARY_ROOMS" in source
     assert "room in _OVERVIEW_PRIMARY_ROOMS" in source
+
+
+def test_clinic_widget_mode_and_appbar_lifecycle():
+    """[2026-06-19 user] 門診動態小工具改為三選一(off/floating/appbar)單一真實來源,
+    新增邊緣常駐條(AppBar)。守門:
+      - 用 clinic_widget_mode 取代舊的 floating_clinic_enabled 布林。
+      - 有 appbar 開/關/使用者關閉的生命週期方法。
+      - 結束清理一定要關閉常駐條(其 destroy 會 ABM_REMOVE 還回保留空間,否則桌面縮著)。"""
+    source = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
+    # 單一真實來源:不可再有舊的 floating_clinic_enabled
+    assert "floating_clinic_enabled" not in source
+    assert "self.clinic_widget_mode" in source
+    assert "_normalize_widget_mode" in source
+    # appbar 生命週期方法齊全
+    for name in ("_open_clinic_appbar", "_close_clinic_appbar",
+                 "_on_clinic_appbar_user_closed", "_clinic_appbar_tick"):
+        assert f"def {name}(" in source, name
+    # 結束清理必須關閉常駐條(歸還保留空間)
+    cleanup_src = _function_source(ROOT / "src" / "main.py", "_cleanup_for_exit")
+    assert "_close_clinic_appbar()" in cleanup_src
+    # 開窗路徑必須有 _shutting_down 防護:延後排程的回呼若在清理後才觸發,不可再 ABM_NEW(會漏 REMOVE)
+    open_src = _function_source(ROOT / "src" / "main.py", "_open_clinic_appbar")
+    assert "_shutting_down" in open_src
+
+
+def test_clinic_appbar_destroy_removes_reserved_space():
+    """[2026-06-19] 邊緣常駐條銷毀時務必 ABM_REMOVE(否則桌面可用區一直被縮)。
+    且順序正確:_undock 在視窗 destroy 之前(REMOVE 需要有效 hwnd)。"""
+    src = (ROOT / "src" / "cmuh_common" / "clinic_appbar.py").read_text(encoding="utf-8")
+    assert "_ABM_REMOVE" in src
+    destroy_src = _function_source(
+        ROOT / "src" / "cmuh_common" / "clinic_appbar.py", "destroy")
+    # destroy 內先 _undock(還空間)再銷毀視窗
+    assert destroy_src.index("_undock") < destroy_src.index("self.win.destroy")
