@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
-"""浮動門診動態小視窗 — 半透明、永遠置頂(不搶焦點)、無邊框、可調大小的 Toplevel。
+"""浮動門診動態小視窗 — 半透明、永遠置頂(不搶焦點)、無邊框、點擊穿透的浮窗。
 
 每個診間一張小卡:診間號 · 時段 · 醫師 · 【燈號(放大、最顯眼)】· 待診人數。
 資料由主程式餵入(沿用既有 reg64 60–90 秒輪詢的快取,本視窗不自行查詢、不增加醫院負載)。
 
-[2026-06-19] 改為無系統標題列(overrideredirect)+ 自製細標題列(可拖曳 + 關閉)
-+ 右下角縮放把手 + 深色 sleek 卡片,讓整體更美觀、旁邊近乎無邊框。
+[2026-06-19] 兩個無邊框 Toplevel 達成「真正懸浮」:
+  - 標題列視窗(可點):拖曳移動 + ✕ 關閉。
+  - 內容視窗(點擊穿透 WS_EX_TRANSPARENT):點卡片會穿到後方視窗,不擋住作業。
+  - 沒有醫師姓名的診間自動隱藏、視窗高度自動縮放;字體放大。
 
-設計:純邏輯(RoomStatus / clamp_opacity / room_card_view / parse_geometry_size)抽出來
-可單元測試;ClinicFloatingWindow(tkinter Toplevel)為 Windows/GUI 專屬,延後建立 widget。
+設計:純邏輯(RoomStatus / should_show_room / clamp_opacity / room_card_view /
+parse_geometry_size)抽出來可單元測試;ClinicFloatingWindow 為 Windows/GUI 專屬。
 """
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -49,6 +52,24 @@ class RoomStatus:
     closed: bool = False           # 已關診
     stopped: bool = False          # 未開診
     error: bool = False            # 查詢失敗 / 連線錯誤
+    fetched: bool = False          # 是否已從 reg64 查到過資料(False=還沒輪到)
+
+
+def should_show_room(s: RoomStatus) -> bool:
+    """這個診間要不要顯示在浮動視窗。純函式。
+
+    使用者規則(2026-06-19):
+      - 還沒查到資料(fetched=False)→ 先顯示(中性「—」),不要急著隱藏。
+      - 查到了但【完全沒有醫師姓名、也沒有燈號】→ 代表今天沒有這個診 → 隱藏(UI 自動縮減)。
+      - 有醫師姓名(即使未開診/關診)或有燈號 → 顯示(未開診就顯示「未開診」)。
+    """
+    if not s.fetched:
+        return True
+    if (s.doctor or "").strip():
+        return True
+    if str(s.light or "").strip():
+        return True
+    return False
 
 
 def clamp_opacity(value) -> float:
@@ -102,18 +123,54 @@ def parse_geometry_size(geometry: str) -> Optional[tuple]:
     return None
 
 
-# ── GUI(Windows / tkinter 專屬) ───────────────────────────────────────
-class ClinicFloatingWindow:
-    """浮動門診動態視窗。主程式建立一個、用 update_rooms() 餵資料。
+def parse_geometry_pos(geometry: str) -> Optional[tuple]:
+    """從 'WxH+X+Y' 取 (x, y);取不到回 None。純函式。"""
+    m = re.search(r"\+(-?\d+)\+(-?\d+)", str(geometry))
+    if m:
+        try:
+            return int(m.group(1)), int(m.group(2))
+        except ValueError:
+            pass
+    return None
 
-    - 無系統標題列/邊框(overrideredirect)→ 自製細標題列(拖曳 + 關閉)+ 右下角縮放把手
-    - 永遠置頂(-topmost)但不主動搶焦點(不 focus_force)
-    - 半透明(-alpha),可動態調整
-    - 關閉(✕)時呼叫 on_close(讓主程式把設定關掉並存檔)
+
+# ── GUI(Windows / tkinter 專屬) ───────────────────────────────────────
+_GWL_EXSTYLE = -20
+_WS_EX_LAYERED = 0x00080000
+_WS_EX_TRANSPARENT = 0x00000020
+_WS_EX_NOACTIVATE = 0x08000000
+
+
+def _set_click_through(tk_window, enable: bool = True) -> None:
+    """讓視窗點擊穿透(WS_EX_TRANSPARENT)+ 不搶焦點(WS_EX_NOACTIVATE)。Windows 專屬,
+    失敗忽略(非 Windows / 取不到 hwnd 時不影響其他功能)。"""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        wid = tk_window.winfo_id()
+        hwnd = user32.GetParent(wid) or wid  # tkinter 會包一層,取真正 toplevel
+        get_long = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
+        set_long = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+        ex = get_long(hwnd, _GWL_EXSTYLE)
+        flags = _WS_EX_LAYERED | _WS_EX_TRANSPARENT | _WS_EX_NOACTIVATE
+        ex = (ex | flags) if enable else (ex & ~(_WS_EX_TRANSPARENT | _WS_EX_NOACTIVATE))
+        set_long(hwnd, _GWL_EXSTYLE, ex)
+    except Exception:
+        logging.debug("[浮動門診] 設定點擊穿透失敗", exc_info=True)
+
+
+class ClinicFloatingWindow:
+    """浮動門診動態視窗 — 兩個無邊框 Toplevel 達成「真正懸浮」:
+
+    - 標題列視窗(self.win):可點 → 拖曳移動 + ✕ 關閉。
+    - 內容視窗(self._content):點擊穿透 → 點卡片會穿到後方視窗,不擋住打 HIS。
+    兩窗皆 -topmost + -alpha,移動/關閉/透明度同步。沒醫師的診自動隱藏、高度自動縮放。
+    對外 API(update_rooms/set_opacity/get_geometry/exists/lift_to_top/destroy)與舊版相容。
     """
 
-    _MIN_W = 168
-    _MIN_H = 120
+    _BAR_H = 26
+    _DEFAULT_W = 232
+    _MIN_W = 150
 
     def __init__(self, root, *, opacity: float = _OPACITY_DEFAULT,
                  geometry: str = "", on_close: Optional[Callable] = None,
@@ -123,50 +180,116 @@ class ClinicFloatingWindow:
         self._tk = tk
         self.on_close = on_close
         self.on_geometry_change = on_geometry_change
+        self._opacity = clamp_opacity(opacity)
         self._cards_frame = None
-        self._grip = None
-        self._drag = {}
+        self._drag: dict = {}
 
+        # 位置/寬度(高度自動縮放)
+        self._x, self._y, self._w = self._parse_geo(geometry)
+
+        # ── 標題列視窗(可點:拖曳 + 關閉) ──
         self.win = tk.Toplevel(root)
-        self.win.configure(bg=_WIN_BG)
-        # 無系統標題列/邊框
-        try:
-            self.win.overrideredirect(True)
-        except Exception:
-            logging.debug("[浮動門診] overrideredirect 設定失敗", exc_info=True)
-        try:
-            self.win.attributes("-topmost", True)
-        except Exception:
-            logging.debug("[浮動門診] -topmost 設定失敗", exc_info=True)
-        self.set_opacity(opacity)
-        if parse_geometry_size(geometry):
-            try:
-                self.win.geometry(geometry)
-            except Exception:
-                logging.debug("[浮動門診] 套用 geometry 失敗", exc_info=True)
-        else:
-            self.win.geometry("232x300")
+        self._setup_toplevel(self.win, _HEADER_BG)
+        self._build_bar()
 
-        # 外框(細邊框感):highlightthickness 當 1px 邊
-        self._outer = tk.Frame(self.win, bg=_WIN_BG,
+        # ── 內容視窗(點擊穿透) ──
+        self._content = tk.Toplevel(root)
+        self._setup_toplevel(self._content, _WIN_BG)
+        self._outer = tk.Frame(self._content, bg=_WIN_BG,
                                highlightbackground=_BORDER,
                                highlightcolor=_BORDER, highlightthickness=1, bd=0)
         self._outer.pack(fill="both", expand=True)
-        self._build_chrome()
         self._body = tk.Frame(self._outer, bg=_WIN_BG)
-        self._body.pack(fill="both", expand=True, padx=6, pady=(2, 7))
-        self._build_grip()
+        self._body.pack(fill="both", expand=True, padx=6, pady=6)
 
-    # ── 對外 API ──────────────────────────────────────────────
-    def set_opacity(self, value) -> None:
+        self._reposition(content_h=120)
+        # 點擊穿透要在視窗 map 之後設(取得 hwnd)
         try:
-            self.win.attributes("-alpha", clamp_opacity(value))
+            self._content.update_idletasks()
         except Exception:
-            logging.debug("[浮動門診] -alpha 設定失敗(改用不透明)", exc_info=True)
+            pass
+        _set_click_through(self._content, True)
+
+    # ── 建構輔助 ─────────────────────────────────────────────
+    def _setup_toplevel(self, win, bg) -> None:
+        try:
+            win.overrideredirect(True)
+        except Exception:
+            logging.debug("[浮動門診] overrideredirect 失敗", exc_info=True)
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            logging.debug("[浮動門診] -topmost 失敗", exc_info=True)
+        try:
+            win.attributes("-alpha", self._opacity)
+        except Exception:
+            logging.debug("[浮動門診] -alpha 失敗", exc_info=True)
+        win.configure(bg=bg)
+
+    def _parse_geo(self, geometry: str):
+        x, y, w = 80, 80, self._DEFAULT_W
+        wh = parse_geometry_size(geometry)
+        if wh:
+            w = max(self._MIN_W, wh[0])
+        pos = parse_geometry_pos(geometry)
+        if pos:
+            x, y = pos
+        return x, y, w
+
+    def _build_bar(self) -> None:
+        tk = self._tk
+        bar = tk.Frame(self.win, bg=_HEADER_BG, highlightbackground=_BORDER,
+                       highlightcolor=_BORDER, highlightthickness=1, bd=0)
+        bar.pack(fill="both", expand=True)
+        title = tk.Label(bar, text="⠿  門診動態", bg=_HEADER_BG, fg=_HEADER_FG,
+                         font=(_FONT, 10), cursor="fleur")
+        title.pack(side="left", padx=(8, 0))
+        close = tk.Label(bar, text="✕", bg=_HEADER_BG, fg=_HEADER_FG,
+                         font=(_FONT, 11, "bold"), cursor="hand2")
+        close.pack(side="right", padx=(0, 8))
+        close.bind("<Button-1>", lambda e: self._handle_close())
+        close.bind("<Enter>", lambda e: close.configure(fg=_ERR_FG))
+        close.bind("<Leave>", lambda e: close.configure(fg=_HEADER_FG))
+        for w in (bar, title):
+            w.bind("<Button-1>", self._drag_start)
+            w.bind("<B1-Motion>", self._drag_move)
+
+    def _reposition(self, content_h: Optional[int] = None) -> None:
+        try:
+            self.win.geometry(f"{self._w}x{self._BAR_H}+{self._x}+{self._y}")
+            if content_h is None:
+                content_h = max(60, self._content.winfo_height())
+            cy = self._y + self._BAR_H
+            self._content.geometry(f"{self._w}x{content_h}+{self._x}+{cy}")
+        except Exception:
+            logging.debug("[浮動門診] reposition 失敗", exc_info=True)
+
+    def _drag_start(self, e) -> None:
+        self._drag["ox"] = e.x_root - self._x
+        self._drag["oy"] = e.y_root - self._y
+
+    def _drag_move(self, e) -> None:
+        self._x = e.x_root - self._drag.get("ox", 0)
+        self._y = e.y_root - self._drag.get("oy", 0)
+        try:
+            self._reposition(content_h=self._content.winfo_height())
+        except Exception:
+            self._reposition()
+
+    # ── 對外 API ─────────────────────────────────────────────
+    def set_opacity(self, value) -> None:
+        self._opacity = clamp_opacity(value)
+        for w in (self.win, getattr(self, "_content", None)):
+            try:
+                if w is not None:
+                    w.attributes("-alpha", self._opacity)
+            except Exception:
+                logging.debug("[浮動門診] -alpha 設定失敗", exc_info=True)
 
     def update_rooms(self, rooms: list) -> None:
-        """rooms: list[RoomStatus]。重建卡片(數量少,直接重繪最簡單可靠)。"""
+        """rooms: list[RoomStatus]。沒醫師的診自動隱藏;重建卡片 + 自動縮放高度。"""
         tk = self._tk
+        visible = [s for s in rooms if should_show_room(s)]
         if self._cards_frame is not None:
             try:
                 self._cards_frame.destroy()
@@ -175,27 +298,36 @@ class ClinicFloatingWindow:
         frame = tk.Frame(self._body, bg=_WIN_BG)
         frame.pack(fill="both", expand=True)
         self._cards_frame = frame
-        for s in rooms:
+        if not visible:
+            tk.Label(frame, text="目前無開診", bg=_WIN_BG, fg=_SUB,
+                     font=(_FONT, 12)).pack(pady=16)
+        for s in visible:
             self._build_card(frame, s)
-        # 縮放把手保持在最上層
+        # 依內容自動縮放高度
         try:
-            if self._grip is not None:
-                self._grip.lift()
+            self._content.update_idletasks()
+            h = max(60, self._outer.winfo_reqheight())
+            self._reposition(content_h=h)
+            _set_click_through(self._content, True)  # rebuild 後重申(保險)
         except Exception:
-            pass
+            logging.debug("[浮動門診] 自動縮放失敗", exc_info=True)
+        self.lift_to_top()
 
     def get_geometry(self) -> str:
         try:
-            return self.win.winfo_geometry()
+            ch = self._content.winfo_height()
         except Exception:
-            return ""
+            ch = 200
+        return f"{self._w}x{self._BAR_H + ch}+{self._x}+{self._y}"
 
     def lift_to_top(self) -> None:
-        """重申置頂(不搶焦點):部分情況 topmost 會被其他視窗壓過。"""
-        try:
-            self.win.attributes("-topmost", True)
-        except Exception:
-            pass
+        """重申置頂(不搶焦點)。"""
+        for w in (getattr(self, "_content", None), self.win):
+            try:
+                if w is not None:
+                    w.attributes("-topmost", True)
+            except Exception:
+                pass
 
     def exists(self) -> bool:
         try:
@@ -211,67 +343,14 @@ class ClinicFloatingWindow:
                     self.on_geometry_change(g)
         except Exception:
             pass
-        try:
-            self.win.destroy()
-        except Exception:
-            pass
+        for w in (getattr(self, "_content", None), self.win):
+            try:
+                if w is not None:
+                    w.destroy()
+            except Exception:
+                pass
 
-    # ── 內部:自製標題列(拖曳 + 關閉) ─────────────────────────
-    def _build_chrome(self) -> None:
-        tk = self._tk
-        hdr = tk.Frame(self._outer, bg=_HEADER_BG)
-        hdr.pack(fill="x", side="top")
-        title = tk.Label(hdr, text="⠿  門診動態", bg=_HEADER_BG, fg=_HEADER_FG,
-                         font=(_FONT, 9), cursor="fleur")
-        title.pack(side="left", padx=(8, 0), pady=3)
-        close = tk.Label(hdr, text="✕", bg=_HEADER_BG, fg=_HEADER_FG,
-                         font=(_FONT, 10, "bold"), cursor="hand2")
-        close.pack(side="right", padx=(0, 8))
-        close.bind("<Button-1>", lambda e: self._handle_close())
-        close.bind("<Enter>", lambda e: close.configure(fg=_ERR_FG))
-        close.bind("<Leave>", lambda e: close.configure(fg=_HEADER_FG))
-        # 拖曳:標題列任意處
-        for w in (hdr, title):
-            w.bind("<Button-1>", self._drag_start)
-            w.bind("<B1-Motion>", self._drag_move)
-
-    def _build_grip(self) -> None:
-        tk = self._tk
-        grip = tk.Label(self._outer, text="◢", bg=_WIN_BG, fg=_SUB,
-                        font=(_FONT, 8), cursor="size_nw_se")
-        grip.place(relx=1.0, rely=1.0, anchor="se")
-        grip.bind("<Button-1>", self._resize_start)
-        grip.bind("<B1-Motion>", self._resize_move)
-        self._grip = grip
-
-    def _drag_start(self, e) -> None:
-        self._drag["ox"] = e.x_root - self.win.winfo_x()
-        self._drag["oy"] = e.y_root - self.win.winfo_y()
-
-    def _drag_move(self, e) -> None:
-        try:
-            x = e.x_root - self._drag.get("ox", 0)
-            y = e.y_root - self._drag.get("oy", 0)
-            self.win.geometry(f"+{x}+{y}")
-        except Exception:
-            pass
-
-    def _resize_start(self, e) -> None:
-        self._drag["w0"] = self.win.winfo_width()
-        self._drag["h0"] = self.win.winfo_height()
-        self._drag["rx"] = e.x_root
-        self._drag["ry"] = e.y_root
-
-    def _resize_move(self, e) -> None:
-        try:
-            w = max(self._MIN_W, self._drag.get("w0", self._MIN_W)
-                    + (e.x_root - self._drag.get("rx", e.x_root)))
-            h = max(self._MIN_H, self._drag.get("h0", self._MIN_H)
-                    + (e.y_root - self._drag.get("ry", e.y_root)))
-            self.win.geometry(f"{w}x{h}")
-        except Exception:
-            pass
-
+    # ── 內部 ─────────────────────────────────────────────────
     def _handle_close(self) -> None:
         try:
             if self.on_geometry_change:
@@ -288,7 +367,6 @@ class ClinicFloatingWindow:
                 logging.debug("[浮動門診] on_close 例外", exc_info=True)
         self.destroy()
 
-    # ── 內部:卡片 ────────────────────────────────────────────
     def _build_card(self, parent, s: RoomStatus) -> None:
         tk = self._tk
         v = room_card_view(s)
@@ -296,29 +374,28 @@ class ClinicFloatingWindow:
         card = tk.Frame(parent, bg=_CARD_BG, highlightbackground=_BORDER,
                         highlightcolor=_BORDER, highlightthickness=1, bd=0)
         card.pack(fill="x", pady=(0, 6))
-        # 左側時段色條(modern 卡片重點)
         tk.Frame(card, bg=accent, width=4).pack(side="left", fill="y")
         inner = tk.Frame(card, bg=_CARD_BG)
-        inner.pack(side="left", fill="both", expand=True, padx=(9, 10), pady=6)
-        # 標題列:診間 · 時段(左) + 醫師(右)
+        inner.pack(side="left", fill="both", expand=True, padx=(9, 10), pady=7)
+        # 標題列:診間 · 時段(左) + 醫師(右) —— 醫師字體放大到與診間/時段一致
         head = tk.Frame(inner, bg=_CARD_BG)
         head.pack(fill="x")
         tk.Label(head, text=v["title"], bg=_CARD_BG, fg=_INK,
-                 font=(_FONT, 11, "bold")).pack(side="left")
+                 font=(_FONT, 13, "bold")).pack(side="left")
         tk.Label(head, text=v["doctor"], bg=_CARD_BG, fg=_SUB,
-                 font=(_FONT, 9)).pack(side="right")
-        # 燈號(放大、最顯眼) + 待診
+                 font=(_FONT, 13)).pack(side="right")
+        # 燈號(放大、最顯眼) + 待診人數(也放大)
         body = tk.Frame(inner, bg=_CARD_BG)
-        body.pack(fill="x", pady=(2, 0))
+        body.pack(fill="x", pady=(3, 0))
         state = v["state"]
         light_fg = {"open": _LIGHT_OPEN, "error": _ERR_FG}.get(state, _LIGHT_DIM)
         big = state == "open"
         tk.Label(body, text=v["light"], bg=_CARD_BG, fg=light_fg,
-                 font=(_FONT, 30 if big else 15, "bold")).pack(side="left")
+                 font=(_FONT, 32 if big else 17, "bold")).pack(side="left")
         if big:
             wf = tk.Frame(body, bg=_CARD_BG)
-            wf.pack(side="right", anchor="s", pady=(0, 5))
+            wf.pack(side="right", anchor="s", pady=(0, 6))
             tk.Label(wf, text=v["waiting"], bg=_CARD_BG, fg=_INK,
-                     font=(_FONT, 14, "bold")).pack(side="top")
+                     font=(_FONT, 18, "bold")).pack(side="top")
             tk.Label(wf, text="待診", bg=_CARD_BG, fg=_SUB,
-                     font=(_FONT, 8)).pack(side="top")
+                     font=(_FONT, 11)).pack(side="top")

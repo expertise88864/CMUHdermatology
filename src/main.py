@@ -9616,6 +9616,7 @@ class AutomationApp:
                 closed=closed,
                 stopped=stopped,
                 error=error,
+                fetched=True,  # 已從 reg64 查到資料 → 浮動視窗才會依「有無醫師」決定隱藏
             )
         except Exception:
             logging.debug("[浮動門診] 擷取狀態失敗", exc_info=True)

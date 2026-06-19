@@ -8,10 +8,35 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from cmuh_common.floating_clinic import (  # noqa: E402
     RoomStatus,
     clamp_opacity,
+    parse_geometry_pos,
     parse_geometry_size,
     room_card_view,
+    should_show_room,
     slot_color,
 )
+
+
+def test_should_show_room_autohide_rules():
+    """[2026-06-19] 自動偵測診間:已查到但沒醫師沒燈號 → 隱藏(該診不存在);
+    有醫師(即使未開診)或有燈號 → 顯示;還沒查到資料 → 先顯示。"""
+    # 已查到、沒醫師、沒燈號 → 隱藏(例:103 今天沒這個診)
+    assert should_show_room(
+        RoomStatus(room="103", fetched=True)) is False
+    # 已查到、有醫師但未開診 → 顯示(會顯示未開診)
+    assert should_show_room(
+        RoomStatus(room="102", doctor="王醫師", stopped=True, fetched=True)) is True
+    # 已查到、有燈號(看診中)→ 顯示
+    assert should_show_room(
+        RoomStatus(room="101", light="32", fetched=True)) is True
+    # 還沒查到資料 → 先顯示(不要急著隱藏)
+    assert should_show_room(RoomStatus(room="103", fetched=False)) is True
+
+
+def test_parse_geometry_pos():
+    assert parse_geometry_pos("232x300+100+50") == (100, 50)
+    assert parse_geometry_pos("232x300+-20+-5") == (-20, -5)
+    assert parse_geometry_pos("232x300") is None
+    assert parse_geometry_pos("bad") is None
 
 
 def test_clamp_opacity_bounds_and_default():
