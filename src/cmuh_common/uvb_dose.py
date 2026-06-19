@@ -396,9 +396,14 @@ def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
     # UVB 之前 (e.g. "(2026/05/24) UVB 850 ...")
     line_start = text.rfind("\n", 0, dose_start) + 1  # 0 if not found
     segment = text[line_start:max_end]
+    dose_off = dose_start - line_start  # 劑量在 segment 內的位置
 
-    # 3. Date (segment 內第一個 YYYY/MM/DD or 民國 YYY/MM/DD or YYYMMDD)
-    date_m = _UVB_DATE_RE.search(segment)
+    # 3. Date — [2026-06-19] 優先找「劑量之後」的日期(典型寫法 "dose (count) on (date)");
+    #    找不到才回頭找劑量之前的(罕見「(date) UVB ...」寫法,v20.15 楊亮筠 case)。否則
+    #    像「UVB since (108/5/31), new UVB: 1300mj (142) on (2026/06/16)」會誤抓 since 起始
+    #    日(108/5/31=民國108=2019)→ days_diff 爆大誤判 SANITY_FAIL(陳松栢實機 case)。
+    date_m = (_UVB_DATE_RE.search(segment, dose_off)
+              or _UVB_DATE_RE.search(segment))
     if not date_m:
         return None
     ymd = _resolve_date_match(date_m)
@@ -832,6 +837,13 @@ def _detect_uncertain_triplets(text: str, today: date,
         except ValueError:
             continue
         if not (1 <= old_count <= MAX_COUNT):
+            continue
+        # [2026-06-19] 若這個 (count) 緊鄰前方已有日期(典型 "on(date), (count)" —— 主行
+        # 更新後的格式),代表它已經有自己的日期 partner → 不該再跟後方 120 字內別欄位的
+        # 日期(例如 "acitretin w7-9 on (date)")湊成「不確定 triplet」誤跳 Yes/No
+        # (林章熙實機 case:主行 count 被跟 acitretin 日期配對)。
+        pre = text[max(line_start, m.start() - 24):m.start()]
+        if _UVB_DATE_RE.search(pre):
             continue
         # 構造 "Yes 時" 套用的新 segment: count+1, date→today
         rep = m.group(0)

@@ -2358,3 +2358,47 @@ def test_combine_none_and_empty():
     assert combine_phototherapy_kinds(["none", "none"]) == "none"
     assert combine_phototherapy_kinds([]) == "none"
     assert combine_phototherapy_kinds(None) == "none"  # type: ignore[arg-type]
+
+
+# ─── [2026-06-19] 實機:UVB 行有「其他欄位的日期」混入,不可誤判 ──────────────
+
+def test_acitretin_date_not_paired_as_uncertain_triplet():
+    """林章熙實機:處置「on(date),(count)」格式 + 同行有 acitretin 的日期。
+    主行 count 不可跟 acitretin 的日期湊成「不確定 triplet」而誤跳 Yes/No。"""
+    text = (
+        "decrease UVB 1000mj/cm2 on(2026/06/16), (38), increase 20mj/cm2 if no "
+        "erythema, MAX:1000 mj/cm2, W2, W5.9 weeks appointment, acitretin w7-9 "
+        "on (2026/06/09) medication and follow up , suggest rheuma follow up ."
+    )
+    r = update_uvb_in_text(text, today=date(2026, 6, 19))
+    assert r.action == UvbAction.UPDATED
+    assert not r.uncertain_other_triplets          # 不該跳「不確定其他行」
+    assert "(39)" in r.new_text                     # 主行 count 38→39
+    assert "on(2026/06/19)" in r.new_text           # 主行日期→今天
+    assert "acitretin w7-9 on (2026/06/09)" in r.new_text  # acitretin 日期不動
+
+
+def test_uvb_since_start_date_not_used_as_photo_date():
+    """陳松栢實機:「UVB since (108/5/31), new UVB: 1300mj (142) on (2026/06/16)」。
+    日期要取劑量之後的 on(2026/06/16),不可抓到 since 起始日 108/5/31(民國108=2019)
+    而誤判成「距上次 2576 天」SANITY_FAIL。"""
+    text = (
+        "UVB since (108/5/31),  new UVB: 1300mj/cm2 (142)  on  (2026/06/16)  . "
+        "increase 80 mj/cm2 . take photo on  (2023/11/10) .w2M, W5. MAX 1300 "
+        "( patient want to 1050-1300 cycle) , 12 weeks appointment"
+    )
+    p = parse_uvb_line(text)
+    assert p is not None and p.last_date == date(2026, 6, 16)  # 不是 2019/5/31
+    r = update_uvb_in_text(text, today=date(2026, 6, 19))
+    assert r.action == UvbAction.UPDATED
+    assert r.days_diff == 3
+    assert "(143)" in r.new_text                    # count 142→143
+    assert "on  (2026/06/19)" in r.new_text         # 照光日期→今天
+    assert "since (108/5/31)" in r.new_text         # 起始日不動
+
+
+def test_date_before_uvb_still_works():
+    """回歸:v20.15「(date) 寫在 UVB 之前」且劑量之後沒有日期 → 仍取得前面的日期。"""
+    text = "(2026/05/24) UVB 850 mj/cm2 (5) add 30 each time, MAX 850"
+    p = parse_uvb_line(text)
+    assert p is not None and p.last_date == date(2026, 5, 24)
