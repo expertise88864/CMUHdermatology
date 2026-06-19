@@ -8446,8 +8446,38 @@ class AutomationApp:
         # =================================================================
         # --- 區塊 3: 目前門診動態 ---
         # =================================================================
-        clinic_status_frame = ttk.LabelFrame(tools_tab, text="目前門診動態") 
+        clinic_status_frame = ttk.LabelFrame(tools_tab, text="目前門診動態")
         clinic_status_frame.pack(fill='both', expand=True, pady=0, anchor='n')
+
+        # ─── 浮動門診動態小視窗:開關 + 透明度(由「設定」分頁移來,就近放門診動態區) ───
+        floating_frame = ttk.LabelFrame(clinic_status_frame, text="浮動門診動態視窗", padding=8)
+        floating_frame.pack(fill='x', padx=5, pady=(4, 6))
+        _fr_row = ttk.Frame(floating_frame)
+        _fr_row.pack(fill='x')
+        ttk.Checkbutton(
+            _fr_row,
+            text="啟用（半透明置頂小視窗，預設關）",
+            variable=self.floating_clinic_enabled,
+            command=self._toggle_floating_clinic,
+        ).pack(side='left', pady=2)
+        ttk.Label(_fr_row, text="透明度:").pack(side='left', padx=(16, 4))
+        ttk.Scale(
+            _fr_row,
+            from_=0.25,
+            to=0.95,
+            variable=self.floating_clinic_opacity,
+            command=lambda v: self._set_floating_clinic_opacity(),
+            orient="horizontal",
+        ).pack(side='left', fill='x', expand=True)
+        ttk.Label(
+            floating_frame,
+            text=("顯示下方三張卡追蹤的診間(可直接於卡片標題列改診間號),"
+                  "永遠置頂、不搶焦點、可拉大小。"),
+            foreground="gray",
+            style="Small.TLabel",
+            wraplength=560,
+            justify="left",
+        ).pack(anchor="w", pady=(2, 0))
 
         self._ensure_clinic_room_model_from_disk()
 
@@ -11181,35 +11211,8 @@ class AutomationApp:
             command=self._on_watchdog_toggle,
         ).pack(anchor="w")
 
-        # ─── 浮動門診動態小視窗 ───────────────────────────────────────
-        floating_frame = ttk.LabelFrame(left_column, text="浮動門診動態視窗", padding=10)
-        floating_frame.pack(fill=tk.X, pady=(0, 15))
-        ttk.Checkbutton(
-            floating_frame,
-            text="啟用（半透明置頂小視窗，預設關）",
-            variable=self.floating_clinic_enabled,
-            command=self._toggle_floating_clinic,
-        ).pack(anchor="w", pady=2)
-        opacity_row = ttk.Frame(floating_frame)
-        opacity_row.pack(fill=tk.X, pady=(2, 2))
-        ttk.Label(opacity_row, text="透明度:").pack(side=tk.LEFT)
-        ttk.Scale(
-            opacity_row,
-            from_=0.25,
-            to=0.95,
-            variable=self.floating_clinic_opacity,
-            command=lambda v: self._set_floating_clinic_opacity(),
-            orient="horizontal",
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
-        ttk.Label(
-            floating_frame,
-            text=("顯示主程式追蹤的診間(101/102/103,可在上方診間設定更改),"
-                  "永遠置頂、不搶焦點、可拉大小。"),
-            foreground="gray",
-            style="Small.TLabel",
-            wraplength=420,
-            justify="left",
-        ).pack(anchor="w", pady=(2, 0))
+        # 註:浮動門診動態小視窗的開關 + 透明度已移到「小工具」分頁的「目前門診動態」區
+        #     (_create_other_programs_tab),就近與門診動態卡片同處。設定值/變數不變。
 
         threshold_main_frame = ttk.LabelFrame(left_column, text="個別醫師止掛人數提醒設定", padding=10)
         threshold_main_frame.pack(fill=tk.X, pady=(0, 15))
