@@ -81,6 +81,27 @@ def resolve_clinic_reg64_time_code(mode: str,
     return reg64_time_code_from_local_clock(when)
 
 
+def overrun_effective_time_code(tc, earlier_sessions) -> str:
+    """早診/午診拖班的「有效輪詢時段」判定。純函式。
+
+    [2026-06-19 使用者] 早診可能拖到下午(甚至晚上)才看完。時段雖依時鐘前進,但若有「更早的時段」
+    今天看過診且尚未關診,就回傳【最早】那個仍在拖班的時段 → 繼續輪那一節,直到它真的關診
+    (已關診 / 燈號·完成·待診 30 分鐘沒變)才前進。同一診間同時只有一節在看診,故不增加輪詢負載。
+
+    tc:依本機時鐘算出的目前時段("1"/"2"/"3")。
+    earlier_sessions:比 tc 早的各時段狀態,【由最早到最晚】排序的可疊代物,
+                     每個元素為 (session_tc:int, had_activity:bool, closed:bool)。
+    """
+    try:
+        tc_i = int(tc)
+    except (TypeError, ValueError):
+        return str(tc)
+    for s_tc, had_activity, closed in earlier_sessions:
+        if had_activity and not closed:
+            return str(s_tc)   # 最早仍在拖班的時段(同診間單節 → 只會有一個)
+    return str(tc_i)
+
+
 def _reg64_tc_to_session_cn(time_code) -> str:
     """TimeCode → 上午／下午／晚上（注意：與 reg64_slot_cn 的「早上」略異，
     這個用「上午」是因為門診 metadata 內部就用這套字串）。"""

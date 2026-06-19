@@ -6620,6 +6620,7 @@ from cmuh_common.reg64_utils import (  # noqa: E402
     reg64_clinic_quiet_hours as _reg64_clinic_quiet_hours,
     reg64_next_allowed_fetch_time as _reg64_next_allowed_fetch_time,
     reg64_time_code_from_local_clock,
+    overrun_effective_time_code,
     reg64_slot_cn,
     reg64_slot_label_color,
     session_boundary_datetime as _session_boundary_datetime,
@@ -8998,6 +8999,9 @@ class AutomationApp:
                 if reg64_segment_just_changed:
                     mode = "auto"
                 tc_effective = resolve_clinic_reg64_time_code(mode, now)
+                # [2026-06-19] 早診拖班:時段雖已前進,但前一節今天看過診且尚未關診 → 繼續輪前一節
+                # (同一診間同時只有一節在看診 → 不增加負載),直到它真的關診才前進。
+                tc_effective = self._overrun_effective_tc(room_code, tc_effective)
                 spec_key = (str(room_code), str(tc_effective))
                 if spec_key in seen_spec_keys:
                     duplicate_specs.add(spec_key)
@@ -9135,6 +9139,7 @@ class AutomationApp:
                             tracker['is_first_run'] = True 
                             tracker['session_period'] = curr_session_i
                             tracker['had_any_activity'] = False
+                            tracker['is_ended'] = False
                             tracker['stable_since_ts'] = None
                             tracker['last_monitor_pair'] = None
                         
@@ -9294,6 +9299,10 @@ class AutomationApp:
                             if skip_plateau:
                                 tracker['stable_since_ts'] = None
                                 tracker['last_monitor_pair'] = None
+
+                            # [2026-06-19] 持久化關診狀態供早診拖班(overrun)判定:actual_closing_dt 在
+                            # 「網頁已關診但解析不到關診時刻」時會維持 None,故另存 is_ended 旗標。
+                            tracker['is_ended'] = bool(is_ended)
 
                             should_save = False
                             if has_valid_completion and not is_ended: should_save = True 
@@ -9678,8 +9687,8 @@ class AutomationApp:
         except Exception:
             return
         try:
-            # [2026-06-19] 時段一律依「目前電腦時間」自動切換(共用 _collect_widget_room_status):
-            # 只在快取資料正是目前時段時才採用,否則顯示「目前時段、待更新」。
+            # [2026-06-19] 直接顯示輪詢到的「正在看診中的時段」(含早診拖班,見
+            # _collect_widget_room_status / _overrun_effective_tc);已關診的診間會被隱藏。
             win.update_rooms(self._collect_widget_room_status())
             win.lift_to_top()
         except Exception:
@@ -9716,12 +9725,34 @@ class AutomationApp:
         except Exception:
             logging.debug("[門診小工具] 調整透明度失敗", exc_info=True)
 
+    def _overrun_effective_tc(self, room_code, tc):
+        """早診/午診拖班的有效輪詢時段:讀「所有更早時段」tracker 狀態(最早→最晚),委派純函式
+        overrun_effective_time_code 判定(見其 docstring)。純讀 tracker、不增加負載。
+
+        關診以 is_ended 旗標為準(網頁已關診但解析不到關診時刻時 actual_closing_dt 仍為 None,
+        故不能只看 actual_closing_dt,否則會卡住一直拖)。"""
+        try:
+            tc_i = int(tc)
+        except (TypeError, ValueError):
+            return tc
+        if tc_i <= 1:
+            return tc   # 早上(1)沒有更早時段可拖,免讀 tracker
+        earlier = []
+        try:
+            with self._tracker_lock:
+                for s in range(1, tc_i):   # 最早 → 最晚
+                    t = self.clinic_trackers.get(f"{room_code}/{s}")
+                    had = bool(t.get('had_any_activity')) if t else False
+                    closed = bool(t.get('is_ended') or t.get('actual_closing_dt')) if t else False
+                    earlier.append((s, had, closed))
+        except Exception:
+            return tc
+        return overrun_effective_time_code(tc, earlier)
+
     def _collect_widget_room_status(self):
-        """收集要餵給浮動視窗的各診間狀態:一律依電腦目前時間決定時段
-        (room_status_for_current_slot),不受卡片固定時段影響。"""
+        """收集要餵給浮動視窗的各診間狀態:直接顯示輪詢到的「正在看診中的時段」
+        (含早診拖班 → 持續顯示早診直到關診)。已關診的診間由 should_show_room 隱藏。"""
         from cmuh_common import floating_clinic
-        cur_tc = reg64_time_code_from_local_clock()
-        cur_slot = reg64_slot_cn(cur_tc)
         rooms = []
         for i in range(CLINIC_ROOM_COUNT):
             try:
@@ -9730,9 +9761,10 @@ class AutomationApp:
                 continue
             if not code:
                 continue
-            cached = self._floating_status_by_room.get(code)
-            rooms.append(floating_clinic.room_status_for_current_slot(
-                cached, code, cur_tc, cur_slot))
+            rs = self._floating_status_by_room.get(code)
+            if rs is None:
+                rs = floating_clinic.RoomStatus(room=code, light="")  # 還沒輪到 → pending
+            rooms.append(rs)
         return rooms
 
     def _capture_floating_status(self, index, result, tracker):
@@ -9755,7 +9787,6 @@ class AutomationApp:
             except (TypeError, ValueError):
                 waiting = None
             light = str(result.get("light", "") or "")
-            slot_tc = str(result.get("reg64_time_code", "") or "")
             from cmuh_common import floating_clinic
             self._floating_status_by_room[room] = floating_clinic.RoomStatus(
                 room=room,
@@ -9767,7 +9798,6 @@ class AutomationApp:
                 stopped=stopped,
                 error=error,
                 fetched=True,  # 已從 reg64 查到資料 → 浮動視窗才會依「有無醫師」決定隱藏
-                slot_tc=slot_tc,  # 這筆是哪個時段的資料 → 浮動視窗判斷是否為「目前時段」
             )
         except Exception:
             logging.debug("[浮動門診] 擷取狀態失敗", exc_info=True)

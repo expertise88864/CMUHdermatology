@@ -59,26 +59,9 @@ class RoomStatus:
     stopped: bool = False          # 未開診
     error: bool = False            # 查詢失敗 / 連線錯誤
     fetched: bool = False          # 是否已從 reg64 查到過資料(False=還沒輪到)
-    slot_tc: str = ""              # 這筆資料屬於哪個 reg64 TimeCode("1"/"2"/"3");用來判斷是否為「目前時段」
 
 
 _PLACEHOLDER_LIGHT = {"--", "—", "休", "0", ""}
-
-
-def room_status_for_current_slot(cached: Optional[RoomStatus], room: str,
-                                 cur_tc: str, cur_slot: str) -> RoomStatus:
-    """浮動視窗一律顯示「目前電腦時間」對應的時段(早上/下午/晚上)。純函式。
-
-    使用者需求(2026-06-19):浮動視窗的時段永遠依電腦時間自動切換,**不受**主程式
-    「目前門診動態」卡片被手動固定成某時段影響。
-      - 若快取資料正好是目前時段(slot_tc == cur_tc)→ 直接用該即時資料。
-      - 否則(還沒輪詢到 / 卡片被固定成別的時段 / 剛跨過時段交界尚未補上)→ 回傳該診間
-        「目前時段、資料待更新」的中性狀態(fetched=False → 顯示「—」),
-        絕不拿「別的時段」的舊資料魚目混珠。
-    """
-    if cached is not None and str(cur_tc) != "" and str(cached.slot_tc) == str(cur_tc):
-        return cached
-    return RoomStatus(room=room, slot=cur_slot, slot_tc=str(cur_tc))
 
 
 def should_show_room(s: RoomStatus) -> bool:
@@ -86,16 +69,20 @@ def should_show_room(s: RoomStatus) -> bool:
 
     使用者規則(2026-06-19):
       - 還沒查到資料(fetched=False)→ 先顯示(中性「—」),不要急著隱藏。
-      - 有醫師姓名 → 顯示(即使未開診/關診,顯示「未開診」/「關診」)。
-      - 沒醫師姓名:未開診/關診/離線 → 代表今天沒有這個診 → 隱藏(UI 自動縮減);
+      - 【已關診(closed)→ 一律不顯示】(早診拖班看完就消失,不佔位)。
+      - 有醫師姓名(且未關診)→ 顯示(即使未開診,顯示「未開診」)。
+      - 沒醫師姓名:未開診/離線 → 代表今天沒有這個診 → 隱藏(UI 自動縮減);
         其餘只有「真的有有效看診號」才顯示。
     [2026-06-19 修] 未開診的診間 reg64 燈號常是 '--' 佔位字,舊版誤判成「有燈號」而沒隱藏。
+    [2026-06-19 user] closed 改為一律隱藏(原本有醫師時會顯示「關診」)。
     """
     if not s.fetched:
         return True
+    if s.closed:
+        return False
     if (s.doctor or "").strip():
         return True
-    if s.error or s.stopped or s.closed:
+    if s.error or s.stopped:
         return False
     return str(s.light or "").strip() not in _PLACEHOLDER_LIGHT
 

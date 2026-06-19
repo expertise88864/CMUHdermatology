@@ -1016,3 +1016,19 @@ def test_clinic_widget_mode_floating_only_no_appbar():
     # "appbar" 遷移為 "floating"
     norm_src = _function_source(ROOT / "src" / "main.py", "_normalize_widget_mode")
     assert "floating" in norm_src and "appbar" in norm_src
+
+
+def test_overrun_polling_and_closed_hidden():
+    """[2026-06-19 user] 早診拖班:輪詢時段「關診才前進」;浮動視窗直接顯示看診中時段、關診隱藏。"""
+    source = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
+    # 輪詢有套用拖班(overrun)判定
+    assert "_overrun_effective_tc(room_code, tc_effective)" in source
+    assert "def _overrun_effective_tc(" in source
+    # 浮動收集不再強制「目前電腦時間」(room_status_for_current_slot 已移除)
+    assert "room_status_for_current_slot" not in source
+    fc = (ROOT / "src" / "cmuh_common" / "floating_clinic.py").read_text(encoding="utf-8")
+    assert "room_status_for_current_slot" not in fc
+    # should_show_room:closed 一律隱藏(早診拖班看完即消失)
+    show_src = _function_source(
+        ROOT / "src" / "cmuh_common" / "floating_clinic.py", "should_show_room")
+    assert "if s.closed:" in show_src

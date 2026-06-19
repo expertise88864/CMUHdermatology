@@ -9,12 +9,34 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from cmuh_common.reg64_utils import (  # noqa: E402
     canonical_clinic_session_str,
     clinic_int_count,
+    overrun_effective_time_code,
     prev_session_cn,
     reg64_clinic_quiet_hours,
     reg64_next_allowed_fetch_time,
     reg64_time_code_from_local_clock,
     session_boundary_datetime,
 )
+
+
+def test_overrun_effective_time_code():
+    """[2026-06-19 user] 早診拖班:更早時段有看過診且未關診 → 繼續輪【最早】仍拖班的那節;關診才前進。
+    earlier_sessions 由最早到最晚:[(tc, had_activity, closed), ...]。"""
+    # 早上(1):沒有更早時段,永遠回 1
+    assert overrun_effective_time_code("1", []) == "1"
+    # 下午(2):早診(1)還在看(有活動、未關)→ 拖回 1
+    assert overrun_effective_time_code("2", [(1, True, False)]) == "1"
+    # 下午(2):早診已關 → 前進到下午 2
+    assert overrun_effective_time_code("2", [(1, True, True)]) == "2"
+    # 下午(2):早診今天根本沒看過診 → 不拖,直接下午 2
+    assert overrun_effective_time_code("2", [(1, False, False)]) == "2"
+    # 晚上(3):早診(1)已關、午診(2)還在拖 → 回下午 2
+    assert overrun_effective_time_code("3", [(1, True, True), (2, True, False)]) == "2"
+    # 晚上(3):早診(1)竟拖到現在仍未關 → 回【最早】的 1(午診沒看過診)
+    assert overrun_effective_time_code("3", [(1, True, False), (2, False, False)]) == "1"
+    # 晚上(3):兩節都關了 → 晚上 3
+    assert overrun_effective_time_code("3", [(1, True, True), (2, True, True)]) == "3"
+    # 壞值容錯
+    assert overrun_effective_time_code("x", [(1, True, False)]) == "x"
 
 
 def test_time_code_split_points_13_00_and_17_30():
