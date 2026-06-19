@@ -838,12 +838,16 @@ def _detect_uncertain_triplets(text: str, today: date,
             continue
         if not (1 <= old_count <= MAX_COUNT):
             continue
-        # [2026-06-19] 若這個 (count) 緊鄰前方已有日期(典型 "on(date), (count)" —— 主行
-        # 更新後的格式),代表它已經有自己的日期 partner → 不該再跟後方 120 字內別欄位的
-        # 日期(例如 "acitretin w7-9 on (date)")湊成「不確定 triplet」誤跳 Yes/No
-        # (林章熙實機 case:主行 count 被跟 acitretin 日期配對)。
+        # [2026-06-19] 只有當這個 (count) 緊鄰前方【就是】一個日期(中間只隔標點/空白,
+        # 典型主行更新後格式 "on(date), (count)")才跳過 —— 代表 count 已有自己的日期
+        # partner,不該再跟後方 120 字內別欄位的日期(例如 "acitretin w7-9 on (date)")
+        # 湊成「不確定 triplet」誤跳 Yes/No(林章熙實機 case)。
+        # 若日期與 count 之間夾了別的字(如 "(date), excimer (count)"),仍是合法的第二
+        # 療程 triplet,要保留(Codex 審查:不可一律用 24 字內有日期就跳)。
         pre = text[max(line_start, m.start() - 24):m.start()]
-        if _UVB_DATE_RE.search(pre):
+        _pre_dates = list(_UVB_DATE_RE.finditer(pre))
+        if _pre_dates and re.fullmatch(
+                r"[\s,，、.。:：)）]*", pre[_pre_dates[-1].end():]):
             continue
         # 構造 "Yes 時" 套用的新 segment: count+1, date→today
         rep = m.group(0)

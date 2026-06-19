@@ -2402,3 +2402,20 @@ def test_date_before_uvb_still_works():
     text = "(2026/05/24) UVB 850 mj/cm2 (5) add 30 each time, MAX 850"
     p = parse_uvb_line(text)
     assert p is not None and p.last_date == date(2026, 5, 24)
+
+
+def test_uncertain_triplet_still_detected_when_word_between_date_and_count():
+    """[2026-06-19 Codex] 抑制條件要精準:只有「日期緊鄰 count、中間只隔標點/空白」
+    才跳(主行)。若日期與 count 之間夾了字(合法的第二療程 "(date) UVB (count)"),
+    仍要偵測為不確定 triplet,不可被前面有日期就一律抑制。"""
+    from cmuh_common.uvb_dose import _detect_uncertain_triplets
+    today = date(2026, 6, 19)
+    # acitretin case:主行 count (39) 緊鄰自己的日期 → 不配 acitretin 日期
+    a = ("decrease UVB 1000mj/cm2 on(2026/06/19), (39), MAX:1000, "
+         "acitretin w7-9 on (2026/06/09) fu")
+    assert _detect_uncertain_triplets(a, today) == []
+    # 第二療程:日期與 count 之間夾了 "UVB" 一字 → 仍要偵測
+    b = ("UVB 500 (11) on (2026/06/19), MAX 800, prior course (2026/05/01) "
+         "UVB (37) on (2026/05/22) MAX 800")
+    got = _detect_uncertain_triplets(b, today)
+    assert any(t["count"] == 37 and t["date"] == date(2026, 5, 22) for t in got)
