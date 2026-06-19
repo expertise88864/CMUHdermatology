@@ -9658,6 +9658,10 @@ class AutomationApp:
             return
         try:
             from cmuh_common import floating_clinic
+            # [2026-06-19] 浮動視窗時段一律依「目前電腦時間」自動切換,不受卡片固定時段影響。
+            # 每 15 秒 tick 重算目前時段;只在快取資料正是目前時段時才採用,否則顯示「目前時段、待更新」。
+            cur_tc = reg64_time_code_from_local_clock()
+            cur_slot = reg64_slot_cn(cur_tc)
             rooms = []
             for i in range(CLINIC_ROOM_COUNT):
                 try:
@@ -9666,10 +9670,9 @@ class AutomationApp:
                     continue
                 if not code:
                     continue
-                rs = self._floating_status_by_room.get(code)
-                if rs is None:
-                    # 還沒輪詢到資料 → 顯示中性「—」(不是錯誤 "?");燈號留空 = room_card_view 顯示 —
-                    rs = floating_clinic.RoomStatus(room=code, light="")
+                cached = self._floating_status_by_room.get(code)
+                rs = floating_clinic.room_status_for_current_slot(
+                    cached, code, cur_tc, cur_slot)
                 rooms.append(rs)
             win.update_rooms(rooms)
             win.lift_to_top()
@@ -9723,6 +9726,7 @@ class AutomationApp:
             except (TypeError, ValueError):
                 waiting = None
             light = str(result.get("light", "") or "")
+            slot_tc = str(result.get("reg64_time_code", "") or "")
             from cmuh_common import floating_clinic
             self._floating_status_by_room[room] = floating_clinic.RoomStatus(
                 room=room,
@@ -9734,6 +9738,7 @@ class AutomationApp:
                 stopped=stopped,
                 error=error,
                 fetched=True,  # 已從 reg64 查到資料 → 浮動視窗才會依「有無醫師」決定隱藏
+                slot_tc=slot_tc,  # 這筆是哪個時段的資料 → 浮動視窗判斷是否為「目前時段」
             )
         except Exception:
             logging.debug("[浮動門診] 擷取狀態失敗", exc_info=True)

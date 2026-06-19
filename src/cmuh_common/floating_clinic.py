@@ -57,9 +57,26 @@ class RoomStatus:
     stopped: bool = False          # 未開診
     error: bool = False            # 查詢失敗 / 連線錯誤
     fetched: bool = False          # 是否已從 reg64 查到過資料(False=還沒輪到)
+    slot_tc: str = ""              # 這筆資料屬於哪個 reg64 TimeCode("1"/"2"/"3");用來判斷是否為「目前時段」
 
 
 _PLACEHOLDER_LIGHT = {"--", "—", "休", "0", ""}
+
+
+def room_status_for_current_slot(cached: Optional[RoomStatus], room: str,
+                                 cur_tc: str, cur_slot: str) -> RoomStatus:
+    """浮動視窗一律顯示「目前電腦時間」對應的時段(早上/下午/晚上)。純函式。
+
+    使用者需求(2026-06-19):浮動視窗的時段永遠依電腦時間自動切換,**不受**主程式
+    「目前門診動態」卡片被手動固定成某時段影響。
+      - 若快取資料正好是目前時段(slot_tc == cur_tc)→ 直接用該即時資料。
+      - 否則(還沒輪詢到 / 卡片被固定成別的時段 / 剛跨過時段交界尚未補上)→ 回傳該診間
+        「目前時段、資料待更新」的中性狀態(fetched=False → 顯示「—」),
+        絕不拿「別的時段」的舊資料魚目混珠。
+    """
+    if cached is not None and str(cur_tc) != "" and str(cached.slot_tc) == str(cur_tc):
+        return cached
+    return RoomStatus(room=room, slot=cur_slot, slot_tc=str(cur_tc))
 
 
 def should_show_room(s: RoomStatus) -> bool:
