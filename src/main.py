@@ -220,11 +220,19 @@ def safe_unhook_all_hotkeys():
 
 # --- 模組級 Regex 常數 (只 compile 一次，避免每次呼叫重複編譯) ---
 _RE_COUNT_DIGIT = re.compile(r'(\d+)')          # 用於 _update_grid_data 計算人數
-_RE_ROOM        = re.compile(r'\(([A-Za-z0-9]+診)\)')  # 診間號:含字母前綴(如 G06診)+數字(101診)
-                                                 # [2026-06-19] 原本只配 \d+診 → 漏掉 G06診(張廖年峰)→ 止掛信顯示「診間未提供」
+_RE_ROOM        = re.compile(r'\(([A-Za-z0-9]+診)\)')  # 診間號:含字母前綴(如 A101診)+純數字(101診)
+                                                 # [2026-06-19] 原本只配 \d+診 → 漏掉含字母前綴的診間(如 A101診)→ 止掛信顯示「診間未提供」
 _RE_COUNT_APPT  = re.compile(r'已掛號：(\d+)')   # 用於 check_appointment_count 掛號數
 _RE_PERSON      = re.compile(r'(\d+)\s*人')      # 用於 check_appointment_count 人數
 _RE_ROC_DATE    = re.compile(r'(\d{2,3})/(\d{2})/(\d{2})')
+
+# 總覽門診表「本科主診間」:A101→A102→A103(自家固定診間)。語意:
+#   1) 醫師列不另標這三間的診間號(免冗餘);其餘診間(他科借診/特殊)才顯示「(診間)」。
+#   2) 排序依此序在最前 → 本院其他診間 → 分院最後。
+# [2026-06-19] 院方診間改號(舊 181/182診 → A101/A102/A103診);此處只認門診表顯示用的實體診間字串。
+# 註:room 由 _RE_ROOM(ASCII 括號+英數)擷取,reg52 多年來都回半形(舊 \(\d+診\) 正常運作),
+#     故此處直接 exact match;若實機出現大小寫/全形變體再依實際字串調整(同 _RE_ROOM 維護點)。
+_OVERVIEW_PRIMARY_ROOMS = ("A101診", "A102診", "A103診")
 
 # [O16] reg52 hot-path 預編譯：原本散落在函式內的 inline re.search/findall，集中宣告省 compile 開銷
 _RE_REG52_DATE_CNT_PAIRS = re.compile(r'(\d{2,3}/\d{2}/\d{2})\s*已掛號[：:]\s*(\d+)')
@@ -11809,12 +11817,12 @@ class AutomationApp:
                                 _suf = _EXT_BRANCH_DISPLAY_SUFFIX.get(ext_branch)
                                 if _suf:
                                     display_name += _suf
-                                elif room and room not in ("181診", "182診"):
+                                elif room and room not in _OVERVIEW_PRIMARY_ROOMS:
                                     display_name += f"({room})"
                                 if is_self_paid: display_name += "*"
                                 
                                 # 排序：(1) 非休診列優先，休診／無門診列一律置底
-                                # (2) 181→182→本院其他→分院；分院內：東區→亞大→惠和→惠盛→其他 (3) 醫師清單順序
+                                # (2) A101→A102→A103→本院其他→分院；分院內：東區→亞大→惠和→惠盛→其他 (3) 醫師清單順序
                                 is_dayoff_row = (
                                     tag in ("dayoff", "no_clinic")
                                     or ("休診" in status_text)
@@ -11822,16 +11830,13 @@ class AutomationApp:
                                 )
                                 dayoff_tier = 1 if is_dayoff_row else 0
                                 if ext_branch:
-                                    zone_bucket = 3
+                                    zone_bucket = len(_OVERVIEW_PRIMARY_ROOMS) + 1   # 分院最後
                                     brank = _calendar_branch_sort_rank(ext_branch)
-                                elif room == "181診":
-                                    zone_bucket = 0
-                                    brank = 0
-                                elif room == "182診":
-                                    zone_bucket = 1
+                                elif room in _OVERVIEW_PRIMARY_ROOMS:
+                                    zone_bucket = _OVERVIEW_PRIMARY_ROOMS.index(room)  # A101→0 A102→1 A103→2
                                     brank = 0
                                 else:
-                                    zone_bucket = 2
+                                    zone_bucket = len(_OVERVIEW_PRIMARY_ROOMS)       # 本院其他診間
                                     brank = 0
                                 sort_key = (dayoff_tier, zone_bucket, brank, doc_order_idx)
                                 
@@ -11849,7 +11854,7 @@ class AutomationApp:
                         
                         suffix = "*" if is_self_paid else ""
                         # 主院預設列無掛號資料＝休診：置底；區域視為本院其他診間
-                        sort_key = (1, 2, 0, order_map.get(doc_name, 99))
+                        sort_key = (1, len(_OVERVIEW_PRIMARY_ROOMS), 0, order_map.get(doc_name, 99))
                         display_data[session_name][key_main] = (doc_name + suffix, status_text, tag, sort_key)
 
                 # 東區慣例推論：其他「同星期幾」曾出現東區同診別，當日卻無東區列時，補「休診」(與網頁未列東區休診之情形)
@@ -11871,7 +11876,7 @@ class AutomationApp:
                                 doc_name + "(東區分院)",
                                 "休診",
                                 "dayoff",
-                                (1, 3, 0, order_map.get(doc_name, 99)),
+                                (1, len(_OVERVIEW_PRIMARY_ROOMS) + 1, 0, order_map.get(doc_name, 99)),
                             )
 
                 has_content = False
