@@ -1814,16 +1814,17 @@ def _collect_phototherapy_memos(main_hwnd: int) -> list:
 def _resolve_phototherapy_disposition(main_hwnd: int):
     """回 (memo_hwnd, kind),kind ∈ "uvb" / "pure_excimer" / "ambiguous" / "none"。
 
-    對【每一個】含照光關鍵字的 memo 各自用 detect_phototherapy_kind 精準分類(3-tier:
-    UVB-specific→uvb;有 excimer 無 UVB-specific→pure_excimer;只有泛稱光療→uvb),
-    再跨控件彙整:
-      - 同時出現 uvb memo 與 pure_excimer memo(必在不同控件)→ "ambiguous"
-        (無法判斷哪個是本次處置 — 可能一個是處置、一個是病史 → 交醫師手動)。
-      - 只有 uvb → "uvb";只有 pure_excimer → "pure_excimer";都沒有 → "none"。
+    對【每一個】含照光關鍵字的 memo 各自用 detect_phototherapy_kind 分類(UVB-specific→uvb;
+    有 excimer 無 UVB-specific→pure_excimer;只有泛稱光療→uvb_generic),再跨控件彙整:
+      - 同時出現【UVB-specific 的 uvb】memo 與 pure_excimer memo(不同控件)→ "ambiguous"
+        (真的無法判斷哪個是本次處置 → 交醫師手動)。
+      - 泛稱光療(uvb_generic)+ excimer → excimer 涵蓋 → "pure_excimer"(不歧義):
+        避免病史/轉介單的「refer for phototherapy」與處置的 excimer 互打而卡住 F2。
+      - 只有 uvb/uvb_generic → "uvb";只有 pure_excimer → "pure_excimer";都沒有 → "none"。
 
-    逐 memo 用 detect 分類(而非用關鍵字猜 UVB 側):即使現行 UVB 處置寫成泛稱
-    「Phototherapy / UV」(非字面 UVB),也會被正確歸成 uvb 而參與歧義判斷,不會被別
-    控件的舊 excimer 靜默搶走(Codex 審查連續抓到的誤分流類別)。"""
+    逐 memo 用 detect 分類(而非用關鍵字猜 UVB 側):即使現行 UVB 處置寫成 UVB-specific
+    字眼,也會被正確歸成 uvb 而參與歧義判斷,不會被別控件的舊 excimer 靜默搶走
+    (Codex 審查連續抓到的誤分流類別)。"""
     from cmuh_common.uvb_dose import (
         combine_phototherapy_kinds, detect_phototherapy_kind)
     uvb_hwnd = exc_hwnd = 0
@@ -1831,8 +1832,8 @@ def _resolve_phototherapy_disposition(main_hwnd: int):
     for hwnd, text in _collect_phototherapy_memos(main_hwnd):
         k = detect_phototherapy_kind(text)
         kinds.append(k)
-        if k == "uvb" and not uvb_hwnd:
-            uvb_hwnd = hwnd
+        if k in ("uvb", "uvb_generic") and not uvb_hwnd:
+            uvb_hwnd = hwnd   # 泛稱光療也記為 UVB 更新目標(只有泛稱時 combine 會收斂成 uvb)
         elif k == "pure_excimer" and not exc_hwnd:
             exc_hwnd = hwnd
     combined = combine_phototherapy_kinds(kinds)

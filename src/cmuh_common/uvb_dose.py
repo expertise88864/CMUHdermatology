@@ -240,21 +240,31 @@ _EXCIMER_DOSE_RE = re.compile(r"(\d+)\s*(mj(?:/cm2)?)", re.IGNORECASE)
 _PT_UVB_SPECIFIC_RE = re.compile(r"(?:UVB|紫外線|\bUV\b)", re.IGNORECASE)
 _PT_EXCIMER_RE = re.compile(r"(?:excime|準分子)", re.IGNORECASE)
 _PT_GENERIC_RE = re.compile(r"(?:photo\s*therapy|光療)", re.IGNORECASE)
+# 劑量訊號(數字+mJ):用來分辨「泛稱光療」是治療醫令行(有劑量)還是病史/轉介語境(無劑量)
+_PT_DOSE_RE = re.compile(r"\d\s*mj", re.IGNORECASE)
 
 
 def detect_phototherapy_kind(text: str) -> str:
-    """判斷處置屬於哪種照光,給 F2/F3 分流用。回傳:
+    """判斷【單一欄位】屬於哪種照光,給 F2/F3 分流用。回傳:
 
-      "uvb"          — 有 UVB-specific 訊號(或只有泛稱光療、無 excimer)→ 正常
-                       key 51019 + 療程,身份不動(含 excimer+UVB 並存)。
+      "uvb"          — 有 UVB-specific 訊號(UVB/紫外線/獨立 UV)→ 確定健保 UVB:
+                       正常 key 51019 + 療程,身份不動(含同欄位 excimer+UVB 並存)。
       "pure_excimer" — 有 excimer / 準分子 且【無】UVB-specific 訊號 → 自費:
-                       不 key 51019/療程,身份→01(即使處置另寫了泛稱「光療」)。
-      "none"         — 三種關鍵字都沒有。
+                       不 key 51019/療程,身份→01(即使同欄位另寫了泛稱「光療」)。
+      "uvb_generic"  — 只有【泛稱】光療(photo therapy / 光療)且【無劑量】(像病史/轉介語境,
+                       例:轉介單「refer for phototherapy」),無 UVB-specific 也無 excimer。
+                       單獨出現時當 uvb(combine 會收斂成 "uvb");但因「光療」是泛稱
+                       (準分子光療=excimer 也叫光療),【不可】與別欄位的 excimer 形成歧義 →
+                       由 combine 讓 excimer 涵蓋它(見 combine_phototherapy_kinds)。
+      "none"         — 都沒有。
 
-    安全考量:
-      - 只要出現 UVB-specific(UVB/紫外線/獨立 UV)就回 "uvb",不會把健保 UVB 漏 key。
-      - 「光療 / phototherapy」是泛稱(中文「準分子光療」也是 excimer),不可單憑它
-        就壓過 excimer → excimer 比泛稱光療優先,避免自費 excimer 被誤判成健保 UVB。
+    安全考量(billing 敏感):
+      - 只要出現 UVB-specific 就回 "uvb",不會把健保 UVB 漏 key;UVB-specific 與別欄位
+        excimer 仍會被 combine 判為 ambiguous(真正衝突,交醫師)。
+      - 「光療 / phototherapy」是泛稱(中文「準分子光療」也是 excimer)。但只有【無劑量】的泛稱
+        (病史/轉介語境)才弱化成 "uvb_generic" 讓 excimer 涵蓋;若泛稱光療【帶劑量】
+        (像 "phototherapy 500 mj/cm2" 的治療醫令行,可能是寫得不夠精確的健保 UVB)→ 仍回 "uvb",
+        與別欄位 excimer 維持 ambiguous,避免把可能的健保 UVB 靜默分流成自費 excimer。
     """
     t = text or ""
     if _PT_UVB_SPECIFIC_RE.search(t):
@@ -262,30 +272,34 @@ def detect_phototherapy_kind(text: str) -> str:
     if _PT_EXCIMER_RE.search(t):
         return "pure_excimer"
     if _PT_GENERIC_RE.search(t):
-        return "uvb"
+        # 帶劑量 → 像治療醫令行,當實質 UVB("uvb");無劑量 → 病史/轉介語境("uvb_generic")
+        return "uvb" if _PT_DOSE_RE.search(t) else "uvb_generic"
     return "none"
 
 
 def combine_phototherapy_kinds(kinds) -> str:
     """把多個欄位(memo)各自的 detect_phototherapy_kind 結果彙整成單一結論:
 
-      "ambiguous"    — 同時出現 uvb 與 pure_excimer(分屬不同欄位)→ 無法判斷本次處置
-                       是健保 UVB 還是自費 Excimer,caller 應警告中止、交醫師手動。
-      "uvb"          — 只有 uvb(可能多個)。
-      "pure_excimer" — 只有 pure_excimer。
+      "ambiguous"    — 同時出現【UVB-specific 的 "uvb"】與 pure_excimer(分屬不同欄位)→
+                       真正無法判斷是健保 UVB 還是自費 Excimer,caller 應警告中止、交醫師手動。
+      "pure_excimer" — 有 pure_excimer 且【無】UVB-specific(即使另有泛稱光療 "uvb_generic")。
+                       泛稱光療被 excimer 涵蓋(準分子光療=excimer),不形成歧義。
+      "uvb"          — 有 UVB-specific 或只有泛稱光療(無 excimer)。
       "none"         — 都沒有(忽略 "none")。
 
-    用於主程式逐 memo 分類後跨欄位彙整(現行處置 vs 病史無法靠單一 memo 分辨,故同時
-    存在兩種就視為歧義 → 交醫師,避免 billing 誤分流)。"""
+    用於主程式逐 memo 分類後跨欄位彙整。關鍵:只有【UVB-specific】才會與別欄位 excimer 形成
+    歧義;病史/轉介單裡的【泛稱】「光療 / phototherapy」不再與處置的 excimer 互打而誤判 ambiguous
+    (使用者實機案例:處置 excimer + 病史 'refer for phototherapy' 被卡住無法觸發 F2)。"""
     s = set(kinds or ())
-    has_uvb = "uvb" in s
+    has_uvb_specific = "uvb" in s
     has_exc = "pure_excimer" in s
-    if has_uvb and has_exc:
+    has_generic = "uvb_generic" in s
+    if has_uvb_specific and has_exc:
         return "ambiguous"
-    if has_uvb:
-        return "uvb"
     if has_exc:
-        return "pure_excimer"
+        return "pure_excimer"          # excimer 涵蓋泛稱光療,不歧義
+    if has_uvb_specific or has_generic:
+        return "uvb"
     return "none"
 
 

@@ -2320,11 +2320,25 @@ def test_detect_excimer_with_generic_guangliao_is_pure_excimer():
     ) == "pure_excimer"
 
 
-def test_detect_generic_phototherapy_alone_is_uvb():
-    """只有泛稱光療、沒有 excimer → 沿用既有行為當 uvb(key 51019)。"""
+def test_detect_generic_phototherapy_no_dose_is_uvb_generic():
+    """無劑量的泛稱光療(病史/轉介語境)→ "uvb_generic"(combine 單獨時仍收斂成 uvb)。"""
+    assert detect_phototherapy_kind("refer for phototherapy") == "uvb_generic"
+    assert detect_phototherapy_kind("光療 evaluation") == "uvb_generic"
+    assert detect_phototherapy_kind("plan photo therapy next visit") == "uvb_generic"  # 含空格
+    # 單獨泛稱光療 → combine 仍當 uvb(維持原本健保行為)
+    assert combine_phototherapy_kinds(["uvb_generic"]) == "uvb"
+    assert combine_phototherapy_kinds(["uvb_generic", "none"]) == "uvb"
+
+
+def test_detect_generic_phototherapy_with_dose_is_uvb():
+    """帶劑量的泛稱光療(像治療醫令行)→ "uvb"(billing 安全:與別欄位 excimer 仍 ambiguous,
+    不會把可能的健保 UVB 靜默分流成自費)。"""
     assert detect_phototherapy_kind("phototherapy 500 mj/cm2 (5)") == "uvb"
     assert detect_phototherapy_kind("光療 500 mj/cm2 (5)") == "uvb"
-    assert detect_phototherapy_kind("photo therapy 500 mj") == "uvb"  # 含空格
+    assert detect_phototherapy_kind("photo therapy 500 mj") == "uvb"
+    # 帶劑量泛稱光療 + 別欄位 excimer → 仍 ambiguous(不誤分流)
+    assert combine_phototherapy_kinds(
+        [detect_phototherapy_kind("phototherapy 500 mj/cm2"), "pure_excimer"]) == "ambiguous"
 
 
 def test_detect_none_when_no_phototherapy():
@@ -2342,9 +2356,31 @@ def test_detect_uv_word_boundary_not_substring():
 # ─── [2026-06-18] 跨欄位彙整(現行處置 vs 病史無法靠單 memo 分辨 → 兩種並存=歧義)──
 
 def test_combine_uvb_and_excimer_in_different_fields_is_ambiguous():
-    """不同欄位同時有 uvb 與 pure_excimer → ambiguous(交醫師,避免 billing 誤分流)。"""
+    """不同欄位同時有【UVB-specific 的 uvb】與 pure_excimer → ambiguous(交醫師,避免 billing 誤分流)。"""
     assert combine_phototherapy_kinds(["uvb", "pure_excimer"]) == "ambiguous"
     assert combine_phototherapy_kinds(["pure_excimer", "none", "uvb"]) == "ambiguous"
+
+
+def test_combine_generic_phototherapy_with_excimer_is_pure_excimer():
+    """[2026-06-19 user 實機] 病史「refer for phototherapy」(uvb_generic)+ 處置 excimer
+    (pure_excimer)分屬不同欄位 → 不可判 ambiguous 把 F2 卡住;泛稱光療被 excimer 涵蓋 →
+    pure_excimer(自費 excimer 正常分流)。但 UVB-specific(真 UVB)+ excimer 仍維持 ambiguous。"""
+    assert combine_phototherapy_kinds(["uvb_generic", "pure_excimer"]) == "pure_excimer"
+    assert combine_phototherapy_kinds(["pure_excimer", "none", "uvb_generic"]) == "pure_excimer"
+    # 對照:UVB-specific(非泛稱)+ excimer → 仍 ambiguous(真衝突,billing 安全)
+    assert combine_phototherapy_kinds(["uvb", "uvb_generic", "pure_excimer"]) == "ambiguous"
+
+
+def test_real_case_referral_phototherapy_plus_excimer_disposition():
+    """[2026-06-19 user 實機 賴源宏] 病史轉介單寫 phototherapy、處置是 excimer 1500 mj/cm2,
+    分屬不同欄位 → 整體應分流成 pure_excimer(不再卡 ambiguous、F2 可觸發)。"""
+    history = ("(114/06/24) skin lesion on left nape for 1M\n"
+               "refer from Dr. Wang for phototherapy............")
+    disposition = ("excimer 1500 mj/cm2 on (2026/6/17) , add 40 each, MAX 1500\n"
+                   "normal blood test\npic on (2025/9/12) (2025/10/28) (2026/6/16) 16")
+    kinds = [detect_phototherapy_kind(history), detect_phototherapy_kind(disposition)]
+    assert kinds == ["uvb_generic", "pure_excimer"]
+    assert combine_phototherapy_kinds(kinds) == "pure_excimer"
 
 
 def test_combine_single_kind():
