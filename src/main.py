@@ -1866,6 +1866,45 @@ def _f1_phototherapy_route(label: str = "") -> str:
 _F23_PURE_EXCIMER = "pure_excimer"
 
 
+def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
+                            label: str = "F2"):
+    """[2026-06-19] 純自費 Excimer:把 excimer 劑量行更新(次數+1、日期→今天、劑量
+    decay/加量並 cap 在 MAX,跟 UVB 一樣)後,回 _F23_PURE_EXCIMER(caller 設身份=01、
+    跳過 51019/療程)。
+
+    劑量更新是 best-effort:寫回失敗或非單純 UPDATED(太近/上限/格式)只記錄/警示,
+    【不影響身份=01】—— 這次就是自費 excimer visit,身份本來就該設 01。"""
+    try:
+        from cmuh_common.uvb_dose import UvbAction, update_uvb_in_text
+        result = update_uvb_in_text(text)
+        if result.action == UvbAction.UPDATED and result.new_text:
+            if _write_tmemo_text(memo_hwnd, result.new_text):
+                logging.info(
+                    "[%s][Excimer] 劑量已更新(次數→%s、日期→今天、劑量→%s)",
+                    label, result.new_count, result.new_dose)
+            else:
+                logging.warning(
+                    "[%s][Excimer] 劑量寫回失敗(身份仍會設 01)", label)
+                _show_uvb_warning(
+                    main_hwnd, "Excimer 劑量寫回失敗",
+                    "自費 Excimer 的劑量自動更新寫回失敗。\n身份仍會設為自費(01),"
+                    "但請醫師手動確認處置的次數/日期/劑量。")
+        elif result.action == UvbAction.TOO_CLOSE:
+            logging.warning("[%s][Excimer] 距上次照光僅 %s 天 → 劑量未自動更新",
+                            label, result.days_diff)
+            _show_uvb_warning(
+                main_hwnd, "Excimer 照光間隔太短",
+                f"距上次照光僅 {result.days_diff} 天,劑量未自動更新。\n"
+                "身份已設自費(01),請醫師確認照光劑量。")
+        else:
+            logging.info(
+                "[%s][Excimer] 劑量未自動更新(action=%s),身份仍設 01",
+                label, result.action)
+    except Exception:
+        logging.exception("[%s][Excimer] 劑量更新例外(身份仍設 01)", label)
+    return _F23_PURE_EXCIMER
+
+
 def _update_uvb_dose_core(label: str, *, strict: bool):
     """[v20.9 2026-05-26] F1 / F2/F3 共用核心邏輯。
 
@@ -1941,13 +1980,15 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
     logging.info("[%s][UVB] memo hwnd=%s len=%d text=%r",
                  label, memo_hwnd, len(text), text[:500])
 
-    # [2026-06-18] 照光分流:純自費 Excimer(已由 _resolve_phototherapy_disposition 分類)
-    # → 不走 UVB 劑量更新、不 key 51019/療程,改由 caller 設身份=01。
+    # [2026-06-18/19] 照光分流:純自費 Excimer(已由 _resolve_phototherapy_disposition
+    # 分類)→ 更新 excimer 劑量行(次數/日期/劑量,best-effort)後設身份=01、不 key
+    # 51019/療程。劑量更新走 excimer 專屬路徑(excimer 行非 UVB,不能用 UVB 的 round-trip
+    # verify),見 _f23_pure_excimer_update。
     if photo_kind == "pure_excimer":
         logging.info(
-            "[%s][Excimer] 純自費 Excimer(無 UVB)→ 不 key 51019/療程,身份將設 01",
-            label)
-        return _F23_PURE_EXCIMER
+            "[%s][Excimer] 純自費 Excimer(無 UVB)→ 更新 excimer 劑量 + 身份設 01,"
+            "不 key 51019/療程", label)
+        return _f23_pure_excimer_update(main_hwnd, memo_hwnd, text, label)
 
     try:
         from cmuh_common.uvb_dose import update_uvb_in_text, UvbAction

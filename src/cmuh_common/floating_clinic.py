@@ -214,8 +214,8 @@ class ClinicFloatingWindow:
     _BAR_H = 26
     _DEFAULT_W = 242
     _MIN_W = 206            # 要夠寬讓「燈號 + 待診 pill」不重疊(舊版太窄 → 格式跑掉)
-    _CARD_H_OPEN = 92      # 看診中卡片高(燈號放大)
-    _CARD_H_DIM = 58       # 未開診/關診/離線卡片高
+    _CARD_H_OPEN = 90      # 看診中卡片高(燈號放大)
+    _CARD_H_DIM = 68       # 未開診/關診/離線卡片高(要夠高,否則狀態字會疊到上排)
     _CARD_PADY = 7         # 卡片間距
 
     def __init__(self, root, *, opacity: float = _OPACITY_DEFAULT,
@@ -230,6 +230,7 @@ class ClinicFloatingWindow:
         self._opacity = clamp_opacity(opacity)
         self._cards_frame = None
         self._last_rooms: list = []
+        self._manual_h = None        # 使用者手動拉的高度(None=自動依卡片數縮放)
         self._drag: dict = {}
         # 字型物件(可量測寬度 → 算 tag/pill 圓角矩形大小)
         self._fonts = {
@@ -311,9 +312,10 @@ class ClinicFloatingWindow:
         close.bind("<Button-1>", lambda e: self._handle_close())
         close.bind("<Enter>", lambda e: close.configure(fg=_ERR_FG))
         close.bind("<Leave>", lambda e: close.configure(fg=_HEADER_FG))
-        # 寬度縮放把手(內容窗點擊穿透無法放 grip,改放標題列):左右拖 = 改寬度。
-        grip = tk.Label(bar, text="↔", bg=_HEADER_BG, fg=_HEADER_FG,
-                        font=(_FONT, 11, "bold"), cursor="sb_h_double_arrow")
+        # 縮放把手(內容窗點擊穿透無法放可點 grip → 放標題列):拖它可同時改寬+高
+        # (往右拉變寬、往下拉變高;高度變手動覆蓋自動縮放)。
+        grip = tk.Label(bar, text="⤢", bg=_HEADER_BG, fg=_HEADER_FG,
+                        font=(_FONT, 11, "bold"), cursor="bottom_right_corner")
         grip.pack(side="right", padx=(0, 4))
         grip.bind("<Button-1>", self._resize_start)
         grip.bind("<B1-Motion>", self._resize_move)
@@ -323,14 +325,20 @@ class ClinicFloatingWindow:
 
     def _resize_start(self, e) -> None:
         self._drag["rw"] = self._w
+        self._drag["rh"] = (self._manual_h
+                            if self._manual_h is not None
+                            else self._content_height(self._visible_rooms()))
         self._drag["rx"] = e.x_root
+        self._drag["ry"] = e.y_root
 
     def _resize_move(self, e) -> None:
         neww = max(self._MIN_W,
                    self._drag.get("rw", self._w) + (e.x_root - self._drag.get("rx", e.x_root)))
-        if neww != self._w:
-            self._w = neww
-            self._render()  # 用新寬度重畫卡片 + reposition
+        newh = max(60,
+                   self._drag.get("rh", 120) + (e.y_root - self._drag.get("ry", e.y_root)))
+        self._w = neww
+        self._manual_h = newh  # 手動高度(覆蓋自動縮放)
+        self._render()  # 用新寬高重畫 + reposition
 
     def _reposition(self, content_h: Optional[int] = None) -> None:
         try:
@@ -355,9 +363,12 @@ class ClinicFloatingWindow:
             self._reposition()
 
     # ── 對外 API ─────────────────────────────────────────────
+    def _all_windows(self):
+        return (self.win, getattr(self, "_content", None))
+
     def set_opacity(self, value) -> None:
         self._opacity = clamp_opacity(value)
-        for w in (self.win, getattr(self, "_content", None)):
+        for w in self._all_windows():
             try:
                 if w is not None:
                     w.attributes("-alpha", self._opacity)
@@ -368,6 +379,9 @@ class ClinicFloatingWindow:
         """rooms: list[RoomStatus]。沒醫師的診自動隱藏;重建卡片 + 自動縮放高度。"""
         self._last_rooms = list(rooms or [])
         self._render()
+
+    def _visible_rooms(self) -> list:
+        return [s for s in self._last_rooms if should_show_room(s)]
 
     def _content_height(self, visible: list) -> int:
         """依顯示的卡片數【直接算】內容高(不靠 winfo_reqheight,更穩、不會虛高/被裁)。"""
@@ -396,7 +410,11 @@ class ClinicFloatingWindow:
         for s in visible:
             self._build_card(frame, s)
         try:
-            self._reposition(content_h=self._content_height(visible))
+            # 先讓卡片 pack 落定,_reposition 設的 geometry 才不會被延後的 pack 蓋掉。
+            self._content.update_idletasks()
+            # 高度:使用者手動拉過就用手動值,否則依卡片數自動縮放
+            h = self._manual_h if self._manual_h is not None else self._content_height(visible)
+            self._reposition(content_h=max(60, int(h)))
             _set_ex_styles(self._content, transparent=True)  # rebuild 後重申(保險)
         except Exception:
             logging.debug("[浮動門診] 重繪/縮放失敗", exc_info=True)
@@ -411,7 +429,7 @@ class ClinicFloatingWindow:
 
     def lift_to_top(self) -> None:
         """重申置頂(不搶焦點)。"""
-        for w in (getattr(self, "_content", None), self.win):
+        for w in self._all_windows():
             try:
                 if w is not None:
                     w.attributes("-topmost", True)
@@ -419,8 +437,8 @@ class ClinicFloatingWindow:
                 pass
 
     def exists(self) -> bool:
-        """兩個視窗都在才算存在。其中一個沒了 → 清掉殘存的另一個、回 False,
-        讓主程式重建乾淨的一對(避免孤兒內容窗/標題列殘留)。"""
+        """標題列 + 內容窗都在才算存在。其中一個沒了 → 清掉殘存的(含縮放把手)、回
+        False,讓主程式重建乾淨的一組(避免孤兒視窗殘留)。"""
         def _alive(w):
             try:
                 return bool(w is not None and w.winfo_exists())
@@ -430,8 +448,8 @@ class ClinicFloatingWindow:
         content_ok = _alive(getattr(self, "_content", None))
         if bar_ok and content_ok:
             return True
-        if bar_ok or content_ok:  # 只剩一個 → 清掉(不走 on_geometry_change,狀態已壞)
-            for w in (getattr(self, "_content", None), self.win):
+        if bar_ok or content_ok:  # 只剩一個 → 全部清掉(狀態已壞)
+            for w in self._all_windows():
                 try:
                     if w is not None:
                         w.destroy()
@@ -447,7 +465,7 @@ class ClinicFloatingWindow:
                     self.on_geometry_change(g)
         except Exception:
             pass
-        for w in (getattr(self, "_content", None), self.win):
+        for w in self._all_windows():
             try:
                 if w is not None:
                     w.destroy()
@@ -512,21 +530,23 @@ class ClinicFloatingWindow:
                        anchor="e", font=f["doctor"])
 
         # ── 下排:燈號(hero) + 待診 pill(圓角琥珀,醒目) ──
+        # 燈號用 anchor="w"(左、垂直置中)固定在上排【下方】,不會疊到上排(舊版用
+        # 底部對齊在矮卡片上會與上排重疊 → 排版跑掉)。
         light_fg = accent if is_open else (_ERR_FG if state == "error" else _LIGHT_DIM)
         if is_open:
-            cv.create_text(pad, ch - 13, text=v["light"], fill=light_fg,
-                           anchor="sw", font=f["light_big"])
+            ly = 58
+            cv.create_text(pad, ly, text=v["light"], fill=light_fg,
+                           anchor="w", font=f["light_big"])
             lbl_w = f["wait_lbl"].measure("待診")
             num_w = f["wait_num"].measure(v["waiting"])
             pill_w = lbl_w + num_w + 24
-            px2, py1, py2 = cw - pad, ch - 42, ch - 15
+            px2 = cw - pad
             px1 = px2 - pill_w
-            _round_rect(cv, px1, py1, px2, py2, 9, fill=_PILL_BG, outline="")
-            cy = (py1 + py2) / 2
-            cv.create_text(px1 + 9, cy, text="待診", fill=_SUB, anchor="w",
+            _round_rect(cv, px1, ly - 14, px2, ly + 14, 9, fill=_PILL_BG, outline="")
+            cv.create_text(px1 + 9, ly, text="待診", fill=_SUB, anchor="w",
                            font=f["wait_lbl"])
-            cv.create_text(px2 - 10, cy, text=v["waiting"], fill=_WAIT_FG,
+            cv.create_text(px2 - 10, ly, text=v["waiting"], fill=_WAIT_FG,
                            anchor="e", font=f["wait_num"])
         else:
-            cv.create_text(pad, ch - 11, text=v["light"], fill=light_fg,
-                           anchor="sw", font=f["light_sm"])
+            cv.create_text(pad, 47, text=v["light"], fill=light_fg,
+                           anchor="w", font=f["light_sm"])
