@@ -22,6 +22,11 @@ def test_should_show_room_autohide_rules():
     # 已查到、沒醫師、沒燈號 → 隱藏(例:103 今天沒這個診)
     assert should_show_room(
         RoomStatus(room="103", fetched=True)) is False
+    # 實機 103:沒醫師 + 未開診 + 燈號是佔位字 '--' → 仍要隱藏(舊版誤判沒隱藏的 bug)
+    assert should_show_room(
+        RoomStatus(room="103", stopped=True, light="--", fetched=True)) is False
+    assert should_show_room(
+        RoomStatus(room="103", closed=True, light="休", fetched=True)) is False
     # 已查到、有醫師但未開診 → 顯示(會顯示未開診)
     assert should_show_room(
         RoomStatus(room="102", doctor="王醫師", stopped=True, fetched=True)) is True

@@ -39,6 +39,10 @@ _SUB = "#7c889b"           # 次要文字(灰)
 _LIGHT_OPEN = "#34d399"    # 看診中燈號(綠,最顯眼)
 _LIGHT_DIM = "#5b6678"     # 關診/未開診(灰)
 _ERR_FG = "#f87171"        # 錯誤/離線(紅)
+_DOCTOR_FG = "#93c5fd"     # 醫師姓名(柔藍,有顏色更好認)
+_PILL_BG = "#243049"       # 待診 pill 底(比卡片稍亮)
+_WAIT_FG = "#fbbf24"       # 待診人數(琥珀,最醒目)
+_TAG_FG = "#0b1018"        # 時段 tag 上的深色字(在亮色 accent 上)
 
 
 @dataclass
@@ -55,21 +59,26 @@ class RoomStatus:
     fetched: bool = False          # 是否已從 reg64 查到過資料(False=還沒輪到)
 
 
+_PLACEHOLDER_LIGHT = {"--", "—", "休", "0", ""}
+
+
 def should_show_room(s: RoomStatus) -> bool:
     """這個診間要不要顯示在浮動視窗。純函式。
 
     使用者規則(2026-06-19):
       - 還沒查到資料(fetched=False)→ 先顯示(中性「—」),不要急著隱藏。
-      - 查到了但【完全沒有醫師姓名、也沒有燈號】→ 代表今天沒有這個診 → 隱藏(UI 自動縮減)。
-      - 有醫師姓名(即使未開診/關診)或有燈號 → 顯示(未開診就顯示「未開診」)。
+      - 有醫師姓名 → 顯示(即使未開診/關診,顯示「未開診」/「關診」)。
+      - 沒醫師姓名:未開診/關診/離線 → 代表今天沒有這個診 → 隱藏(UI 自動縮減);
+        其餘只有「真的有有效看診號」才顯示。
+    [2026-06-19 修] 未開診的診間 reg64 燈號常是 '--' 佔位字,舊版誤判成「有燈號」而沒隱藏。
     """
     if not s.fetched:
         return True
     if (s.doctor or "").strip():
         return True
-    if str(s.light or "").strip():
-        return True
-    return False
+    if s.error or s.stopped or s.closed:
+        return False
+    return str(s.light or "").strip() not in _PLACEHOLDER_LIGHT
 
 
 def clamp_opacity(value) -> float:
@@ -414,31 +423,42 @@ class ClinicFloatingWindow:
         tk = self._tk
         v = room_card_view(s)
         accent = slot_color(s.slot)
+        state = v["state"]
+        is_open = state == "open"
+        slot = (s.slot or "").strip()
+
         card = tk.Frame(parent, bg=_CARD_BG, highlightbackground=_BORDER,
                         highlightcolor=_BORDER, highlightthickness=1, bd=0)
-        card.pack(fill="x", pady=(0, 6))
-        tk.Frame(card, bg=accent, width=4).pack(side="left", fill="y")
+        card.pack(fill="x", pady=(0, 7))
+        # 左側時段色條(看診中=飽和色,其餘=暗,一眼分辨在不在看診)
+        tk.Frame(card, bg=(accent if is_open else _LIGHT_DIM),
+                 width=5).pack(side="left", fill="y")
         inner = tk.Frame(card, bg=_CARD_BG)
-        inner.pack(side="left", fill="both", expand=True, padx=(9, 10), pady=7)
-        # 標題列:診間 · 時段(左) + 醫師(右) —— 醫師字體放大到與診間/時段一致
-        head = tk.Frame(inner, bg=_CARD_BG)
-        head.pack(fill="x")
-        tk.Label(head, text=v["title"], bg=_CARD_BG, fg=_INK,
-                 font=(_FONT, 13, "bold")).pack(side="left")
-        tk.Label(head, text=v["doctor"], bg=_CARD_BG, fg=_SUB,
-                 font=(_FONT, 13)).pack(side="right")
-        # 燈號(放大、最顯眼) + 待診人數(也放大)
-        body = tk.Frame(inner, bg=_CARD_BG)
-        body.pack(fill="x", pady=(3, 0))
-        state = v["state"]
-        light_fg = {"open": _LIGHT_OPEN, "error": _ERR_FG}.get(state, _LIGHT_DIM)
-        big = state == "open"
-        tk.Label(body, text=v["light"], bg=_CARD_BG, fg=light_fg,
-                 font=(_FONT, 32 if big else 17, "bold")).pack(side="left")
-        if big:
-            wf = tk.Frame(body, bg=_CARD_BG)
-            wf.pack(side="right", anchor="s", pady=(0, 6))
-            tk.Label(wf, text=v["waiting"], bg=_CARD_BG, fg=_INK,
-                     font=(_FONT, 18, "bold")).pack(side="top")
-            tk.Label(wf, text="待診", bg=_CARD_BG, fg=_SUB,
-                     font=(_FONT, 11)).pack(side="top")
+        inner.pack(side="left", fill="both", expand=True, padx=(10, 11), pady=8)
+
+        # ── 上排:時段 tag + 診間號(左) + 醫師(右,有顏色) ──
+        top = tk.Frame(inner, bg=_CARD_BG)
+        top.pack(fill="x")
+        if slot:
+            tk.Label(top, text=f" {slot} ", bg=accent, fg=_TAG_FG,
+                     font=(_FONT, 9, "bold")).pack(side="left", ipady=1)
+        tk.Label(top, text=f"  {str(s.room).strip()}", bg=_CARD_BG, fg=_INK,
+                 font=(_FONT, 15, "bold")).pack(side="left")
+        tk.Label(top, text=v["doctor"], bg=_CARD_BG, fg=_DOCTOR_FG,
+                 font=(_FONT, 12, "bold")).pack(side="right")
+
+        # ── 下排:燈號(hero,最大最顯眼) + 待診 pill(琥珀,醒目) ──
+        main = tk.Frame(inner, bg=_CARD_BG)
+        main.pack(fill="x", pady=(6, 0))
+        light_fg = accent if is_open else (_ERR_FG if state == "error" else _LIGHT_DIM)
+        tk.Label(main, text=v["light"], bg=_CARD_BG, fg=light_fg,
+                 font=(_FONT, 34 if is_open else 18, "bold")).pack(side="left",
+                                                                    anchor="s")
+        if is_open:
+            pill = tk.Frame(main, bg=_PILL_BG)
+            pill.pack(side="right", anchor="center", pady=(2, 3))
+            tk.Label(pill, text="待診", bg=_PILL_BG, fg=_SUB,
+                     font=(_FONT, 10)).pack(side="left", padx=(9, 3), pady=2)
+            tk.Label(pill, text=v["waiting"], bg=_PILL_BG, fg=_WAIT_FG,
+                     font=(_FONT, 17, "bold")).pack(side="left", padx=(0, 10),
+                                                    pady=2)
