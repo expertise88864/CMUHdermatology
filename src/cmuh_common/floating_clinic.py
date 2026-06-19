@@ -139,24 +139,50 @@ _GWL_EXSTYLE = -20
 _WS_EX_LAYERED = 0x00080000
 _WS_EX_TRANSPARENT = 0x00000020
 _WS_EX_NOACTIVATE = 0x08000000
+_GA_ROOT = 2
 
 
-def _set_click_through(tk_window, enable: bool = True) -> None:
-    """讓視窗點擊穿透(WS_EX_TRANSPARENT)+ 不搶焦點(WS_EX_NOACTIVATE)。Windows 專屬,
-    失敗忽略(非 Windows / 取不到 hwnd 時不影響其他功能)。"""
+def _toplevel_hwnd(tk_window) -> int:
+    """取得 tk window 的真正 Win32 top-level HWND。用 GetAncestor(GA_ROOT) 由 winfo_id
+    往上走到根視窗 —— 比 GetParent 可靠(overrideredirect 無外框時 GetParent 會抓到桌面,
+    把延伸樣式設到桌面就災難了)。設好 argtypes/restype 避免 64 位元 handle 截斷。"""
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    u.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+    u.GetAncestor.restype = wintypes.HWND
+    wid = tk_window.winfo_id()
+    return u.GetAncestor(wid, _GA_ROOT) or wid
+
+
+def _set_ex_styles(tk_window, *, transparent: bool) -> None:
+    """設定視窗延伸樣式。一律加 WS_EX_NOACTIVATE(點它不搶 HIS 焦點);transparent=True
+    再加 WS_EX_TRANSPARENT(點擊穿透 —— 給內容窗,點卡片穿到後方)。標題列用
+    transparent=False(仍可點拖曳/關閉,但不搶焦點)。
+
+    用正確 ctypes 原型(argtypes/restype + LONG_PTR)避免 64 位元 handle/long 截斷。
+    Windows 專屬,失敗忽略(非 Windows / 取不到 hwnd 時不影響其他功能)。"""
     try:
         import ctypes
-        user32 = ctypes.windll.user32
-        wid = tk_window.winfo_id()
-        hwnd = user32.GetParent(wid) or wid  # tkinter 會包一層,取真正 toplevel
-        get_long = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
-        set_long = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        long_ptr = ctypes.c_ssize_t  # LONG_PTR:64 位元為 8 bytes
+        if hasattr(u, "GetWindowLongPtrW"):
+            get_long, set_long = u.GetWindowLongPtrW, u.SetWindowLongPtrW
+        else:  # 32-bit Python
+            get_long, set_long = u.GetWindowLongW, u.SetWindowLongW
+        get_long.argtypes = [wintypes.HWND, ctypes.c_int]
+        get_long.restype = long_ptr
+        set_long.argtypes = [wintypes.HWND, ctypes.c_int, long_ptr]
+        set_long.restype = long_ptr
+        hwnd = _toplevel_hwnd(tk_window)
         ex = get_long(hwnd, _GWL_EXSTYLE)
-        flags = _WS_EX_LAYERED | _WS_EX_TRANSPARENT | _WS_EX_NOACTIVATE
-        ex = (ex | flags) if enable else (ex & ~(_WS_EX_TRANSPARENT | _WS_EX_NOACTIVATE))
+        ex |= _WS_EX_LAYERED | _WS_EX_NOACTIVATE
+        if transparent:
+            ex |= _WS_EX_TRANSPARENT
         set_long(hwnd, _GWL_EXSTYLE, ex)
     except Exception:
-        logging.debug("[浮動門診] 設定點擊穿透失敗", exc_info=True)
+        logging.debug("[浮動門診] 設定延伸樣式失敗", exc_info=True)
 
 
 class ClinicFloatingWindow:
@@ -203,12 +229,14 @@ class ClinicFloatingWindow:
         self._body.pack(fill="both", expand=True, padx=6, pady=6)
 
         self._reposition(content_h=120)
-        # 點擊穿透要在視窗 map 之後設(取得 hwnd)
+        # 延伸樣式要在視窗 map 之後設(取得 hwnd):內容窗點擊穿透;標題列只不搶焦點。
         try:
+            self.win.update_idletasks()
             self._content.update_idletasks()
         except Exception:
             pass
-        _set_click_through(self._content, True)
+        _set_ex_styles(self._content, transparent=True)
+        _set_ex_styles(self.win, transparent=False)
 
     # ── 建構輔助 ─────────────────────────────────────────────
     def _setup_toplevel(self, win, bg) -> None:
@@ -308,7 +336,7 @@ class ClinicFloatingWindow:
             self._content.update_idletasks()
             h = max(60, self._outer.winfo_reqheight())
             self._reposition(content_h=h)
-            _set_click_through(self._content, True)  # rebuild 後重申(保險)
+            _set_ex_styles(self._content, transparent=True)  # rebuild 後重申(保險)
         except Exception:
             logging.debug("[浮動門診] 自動縮放失敗", exc_info=True)
         self.lift_to_top()
@@ -330,10 +358,25 @@ class ClinicFloatingWindow:
                 pass
 
     def exists(self) -> bool:
-        try:
-            return bool(self.win.winfo_exists())
-        except Exception:
-            return False
+        """兩個視窗都在才算存在。其中一個沒了 → 清掉殘存的另一個、回 False,
+        讓主程式重建乾淨的一對(避免孤兒內容窗/標題列殘留)。"""
+        def _alive(w):
+            try:
+                return bool(w is not None and w.winfo_exists())
+            except Exception:
+                return False
+        bar_ok = _alive(self.win)
+        content_ok = _alive(getattr(self, "_content", None))
+        if bar_ok and content_ok:
+            return True
+        if bar_ok or content_ok:  # 只剩一個 → 清掉(不走 on_geometry_change,狀態已壞)
+            for w in (getattr(self, "_content", None), self.win):
+                try:
+                    if w is not None:
+                        w.destroy()
+                except Exception:
+                    pass
+        return False
 
     def destroy(self) -> None:
         try:
