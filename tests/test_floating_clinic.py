@@ -43,6 +43,8 @@ def test_room_card_view_closed_stopped_error():
     assert room_card_view(RoomStatus(room="103", stopped=True))["state"] == "stopped"
     assert room_card_view(RoomStatus(room="103", stopped=True))["light"] == "未開診"
     assert room_card_view(RoomStatus(room="104", error=True))["state"] == "error"
+    # [2026-06-19] 錯誤改顯示「離線」(比 "?" 清楚);無資料則由主程式餵 light="" → 顯示 —
+    assert room_card_view(RoomStatus(room="104", error=True))["light"] == "離線"
 
 
 def test_room_card_view_blanks():
@@ -53,9 +55,11 @@ def test_room_card_view_blanks():
 
 
 def test_slot_color():
-    assert slot_color("早上") == "#2E7D32"
-    assert slot_color("下午") == "#1565C0"
-    assert slot_color("晚上") == "#0D47A1"
+    # [2026-06-19] 深色主題:時段色改亮色(在深底上才顯眼)
+    assert slot_color("早上") == "#34d399"
+    assert slot_color("上午") == "#34d399"
+    assert slot_color("下午") == "#38bdf8"
+    assert slot_color("晚上") == "#818cf8"
     assert slot_color("") != ""   # 未知時段 → 有預設色,不空
 
 

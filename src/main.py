@@ -6988,7 +6988,9 @@ class AutomationApp:
         self.startup_phase_text.set("快取完成")
 
         # ─── 浮動門診動態小視窗(半透明置頂、預設關) ───────────────────
-        self._floating_status_by_index = {}            # index -> floating_clinic.RoomStatus
+        # 以「診間號」為 key(非 index)→ 不受診間重排影響;且輪詢時【無論視窗開沒開
+        # 都更新】,使用者一開視窗就有最新資料,不會卡在 60-90 秒前的 "?"。
+        self._floating_status_by_room = {}             # room_code -> floating_clinic.RoomStatus
         self.floating_clinic_win = None
         self.floating_clinic_tick_id = None
         self._floating_clinic_settings = self._load_floating_clinic_settings()
@@ -9373,6 +9375,13 @@ class AutomationApp:
 
     # [新增] 獨立的 UI 更新函數，方便在「停止查詢」時也能呼叫
     def update_single_clinic_ui(self, index, result, tracker, c_avg="-"):
+        # [2026-06-19] 浮動門診動態:在最前面就擷取(不依賴門診分頁是否已建好 UI)。
+        # 之前掛在函式尾端,但若使用者沒開過門診分頁,clinic_ui_elements 為空 → 下面
+        # 提早 return → 浮動視窗永遠拿不到資料而顯示 "?"。改放最前面、與 UI 無關。
+        try:
+            self._capture_floating_status(index, result, tracker)
+        except Exception:
+            pass
         els = getattr(self, "clinic_ui_elements", None)
         if not els or index >= len(els):
             return
@@ -9438,12 +9447,6 @@ class AutomationApp:
             self._smart_widget_config(ui['status'], text=f"更新於 {datetime.now().strftime('%H:%M')}", fg="green")
             self._smart_widget_config(ui['total'], text=str(result.get('total', '-')))
             self._smart_widget_config(ui['waiting'], text=str(result.get('waiting', '-')))
-
-        # 浮動門診動態:把本診間最新狀態快取下來(視窗開著才有動作),fail-open
-        try:
-            self._capture_floating_status(index, result, tracker)
-        except Exception:
-            pass
 
     # ─── 浮動門診動態小視窗 ────────────────────────────────────────────
     def _load_floating_clinic_settings(self):
@@ -9542,9 +9545,10 @@ class AutomationApp:
                     continue
                 if not code:
                     continue
-                rs = self._floating_status_by_index.get(i)
+                rs = self._floating_status_by_room.get(code)
                 if rs is None:
-                    rs = floating_clinic.RoomStatus(room=code, error=True)
+                    # 還沒輪詢到資料 → 顯示中性「—」(不是錯誤 "?");燈號留空 = room_card_view 顯示 —
+                    rs = floating_clinic.RoomStatus(room=code, light="")
                 rooms.append(rs)
             win.update_rooms(rooms)
             win.lift_to_top()
@@ -9579,12 +9583,13 @@ class AutomationApp:
             logging.debug("[浮動門診] 調整透明度失敗", exc_info=True)
 
     def _capture_floating_status(self, index, result, tracker):
-        # 視窗沒開就不做任何事(零額外負載)
-        if not getattr(self, "floating_clinic_win", None):
-            return
+        # [2026-06-19] 無論浮動視窗開沒開都快取(成本極小:只是組一個 dataclass),
+        # 這樣使用者一打開視窗就有最新資料,不會卡在前一輪 60-90 秒的 "?"。以診間號為 key。
         try:
             room = (self.clinic_room_vars[index].get().strip()
                     if index < len(self.clinic_room_vars) else "")
+            if not room:
+                return
             slot = reg64_slot_cn(result.get("reg64_time_code", "")) or ""
             doctor = result.get("doc_name") or tracker.get("doc_name", "")
             status_txt = result.get("status", "") or ""
@@ -9598,8 +9603,8 @@ class AutomationApp:
                 waiting = None
             light = str(result.get("light", "") or "")
             from cmuh_common import floating_clinic
-            self._floating_status_by_index[index] = floating_clinic.RoomStatus(
-                room=room or f"診間{index + 1}",
+            self._floating_status_by_room[room] = floating_clinic.RoomStatus(
+                room=room,
                 slot=slot,
                 doctor=doctor,
                 light=light,
