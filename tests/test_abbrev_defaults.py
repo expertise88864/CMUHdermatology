@@ -27,7 +27,7 @@ def test_requested_default_abbreviations_are_present():
     assert defaults["inf"] == \
         "incisional biopsy and follow up, inform post-op scar formation"
     assert defaults["cert"] == \
-        "患者因上述皮膚疾病，曾於da_zh至本院皮膚科門診就醫治療，建議持續追蹤。"
+        "患者因上述皮膚疾病，於da_zh至本院皮膚科門診就醫治療，建議持續追蹤。"
     # [v8] 已退役的醫師代碼縮寫不再出現在預設清單
     for code in ("D15645", "D15728", "D6175", "D20191", "D28592", "D34899",
                  "101823", "D31352", "101358", "D14355", "D35819"):
@@ -38,7 +38,35 @@ def test_cert_default_renders_dynamic_visit_date():
     template = _default_map()["cert"]
 
     assert ae.render_expansion(template, datetime(2026, 5, 31)) == \
-        "患者因上述皮膚疾病，曾於2026年5月31日至本院皮膚科門診就醫治療，建議持續追蹤。"
+        "患者因上述皮膚疾病，於2026年5月31日至本院皮膚科門診就醫治療，建議持續追蹤。"
+
+
+def test_cert_legacy_defaults_migrate_to_new_no_zeng(tmp_path):
+    """[2026-06-22 user] cert 預設去掉「曾」。沿用舊預設者(西式 da、或曾於da_zh 版)
+    載入時自動升級為新版;使用者自訂過的內容不動。"""
+    path = tmp_path / "abbrev_settings.json"
+    legacy_da = "患者因上述皮膚疾病，曾於da至本院皮膚科門診就醫治療，建議持續追蹤。"
+    legacy_dazh = "患者因上述皮膚疾病，曾於da_zh至本院皮膚科門診就醫治療，建議持續追蹤。"
+    new_cert = "患者因上述皮膚疾病，於da_zh至本院皮膚科門診就醫治療，建議持續追蹤。"
+    for legacy in (legacy_da, legacy_dazh):
+        path.write_text(json.dumps({
+            "schema_version": 9,
+            "enabled": True,
+            "items": [{"abbrev": "cert", "expansion": legacy}],
+        }), encoding="utf-8")
+        cfg = ae.load_config(str(path))
+        values = {it["abbrev"]: it["expansion"] for it in cfg.items}
+        assert values["cert"] == new_cert, legacy
+
+    # 使用者自訂過(不等於任何歷代預設)→ 不動
+    custom = "我自己改過的證明文字 da_zh"
+    path.write_text(json.dumps({
+        "schema_version": 9, "enabled": True,
+        "items": [{"abbrev": "cert", "expansion": custom}],
+    }), encoding="utf-8")
+    cfg = ae.load_config(str(path))
+    values = {it["abbrev"]: it["expansion"] for it in cfg.items}
+    assert values["cert"] == custom
 
 
 def test_old_config_adds_new_defaults_once_and_preserves_custom_text(tmp_path):

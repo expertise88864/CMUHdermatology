@@ -40,11 +40,11 @@ from cmuh_common.config_io import load_json_dict
 # -----------------------------------------------------------------------------
 # 預設 snippets（首次啟動自動寫入；不含 if，避免英文 "if " 誤觸）
 # -----------------------------------------------------------------------------
-ABBREV_CONFIG_SCHEMA_VERSION = 9  # [v9 2026-06-18] 新增預設縮寫 inf(現有 v5+ 使用者自動補上);[v8] 移除醫師代碼預設
+ABBREV_CONFIG_SCHEMA_VERSION = 10  # [v10 2026-06-22] cert 預設去掉「曾」(沿用舊版者自動升級);[v9] 新增 inf;[v8] 移除醫師代碼預設
 MAX_ABBREV_LENGTH = 63
 
 DEFAULT_ITEMS: list[dict[str, str]] = [
-    {"abbrev": "cert", "expansion": "患者因上述皮膚疾病，曾於da_zh至本院皮膚科門診就醫治療，建議持續追蹤。"},
+    {"abbrev": "cert", "expansion": "患者因上述皮膚疾病，於da_zh至本院皮膚科門診就醫治療，建議持續追蹤。"},
     {"abbrev": "da",   "expansion": "da"},
     {"abbrev": "da1",  "expansion": "da1"},
     {"abbrev": "da2",  "expansion": "da2"},
@@ -103,8 +103,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
 _LEGACY_DEFAULTS_TO_MIGRATE: dict[str, "str | list[str]"] = {
     # [v7 2026-05-28] ef 預設改為含 "and follow up"
     "ef": "excisional biopsy, inform post-op 3x scar formation",
-    # cert 預設日期由西式 da（(2026/6/1)）改為中文 da_zh（2026年6月1日）
-    "cert": "患者因上述皮膚疾病，曾於da至本院皮膚科門診就醫治療，建議持續追蹤。",
+    # cert 歷代預設(都自動升級為最新「去掉『曾』」版):
+    #   ① 西式 da（曾於da…）  ② 中文 da_zh（曾於da_zh…，[2026-06-19] 去『曾』前的版本）
+    "cert": [
+        "患者因上述皮膚疾病，曾於da至本院皮膚科門診就醫治療，建議持續追蹤。",
+        "患者因上述皮膚疾病，曾於da_zh至本院皮膚科門診就醫治療，建議持續追蹤。",
+    ],
     "cert1": (
         "患者因上述皮膚疾病，於2026年5月28日至本院皮膚科門診就醫治療，"
         "後續接受局部麻醉下皮膚腫瘤切除手術及縫合，"
