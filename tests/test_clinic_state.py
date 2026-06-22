@@ -101,3 +101,21 @@ def test_state_matching_and_cache_selection():
     states = {"a": state, "b": {"date": "2026/05/23"}, "c": "bad"}
     assert prune_states_for_today(states, "2026/05/24") == {"a": state}
     assert matching_state_keys(states, "181", "1", "王小明") == ["a"]
+
+
+def test_new_clinic_tracker_has_date_field():
+    """[2026-06-22] tracker 需有 date 欄位供主程式跨日重置;新建時為 None。"""
+    t = new_clinic_tracker("早上", 1000.0)
+    assert "date" in t
+    assert t["date"] is None
+
+
+def test_restore_tracker_carries_date_from_state():
+    """還原時帶入 state 的 date(state 只在=今日才會被還原),避免主程式誤判跨日而重置。"""
+    def _canon(v):
+        return {"上午": "早上"}.get(str(v or "").strip(), str(v or "").strip())
+    state = {"date": "2026/06/22", "doctor": "沈冠宇", "session": "早上"}
+    t = restore_tracker_from_state(state, "早上", 1000.0, _canon)
+    assert t["date"] == "2026/06/22"
+    # 壞 state(非 dict)→ 回新 tracker(date=None)
+    assert restore_tracker_from_state(None, "早上", 1000.0, _canon)["date"] is None

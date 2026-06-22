@@ -184,3 +184,24 @@ def reg64_next_allowed_fetch_time(when: Optional[datetime] = None) -> datetime:
     if current < start:
         return start
     return current
+
+
+def clinic_tight_poll_window(when: Optional[datetime] = None) -> bool:
+    """[2026-06-22 使用者] 是否處於「需要每分鐘輪詢」的早上門診起跑窗(08:20–12:00)。純函式。
+
+    門診多半 08:30 準時開診、燈號開始跳號;此窗內輪詢間隔固定 60 秒,確保即時抓到開診/跳號。
+    窗外維持 60–90 秒隨機(避免固定節拍打爆院方限制)。"""
+    t = (when or datetime.now()).time()
+    return dt_time(8, 20) <= t < dt_time(12, 0)
+
+
+def is_residual_stale_closed(is_closed: bool, is_stopped_dayoff: bool,
+                             had_any_activity: bool, before_boundary: bool) -> bool:
+    """早晨「殘留盤面」判定。純函式。
+
+    [2026-06-22] reg64 盤面在「今天該時段的診次開診前」可能還停留在上一個看診日同時段(已關診)。
+    若盤面說已關診,但【今天還沒看到任何活動 had_any_activity=False】且【還沒到該時段正常關診時間
+    before_boundary=True(如早診 12:00)】→ 八成是殘留盤面(今天的診還沒開),不應視為今天已關診。
+    真正排休(is_stopped_dayoff)不在此列(那是真的沒診,與時間無關)。"""
+    return (bool(is_closed) and not bool(is_stopped_dayoff)
+            and not bool(had_any_activity) and bool(before_boundary))

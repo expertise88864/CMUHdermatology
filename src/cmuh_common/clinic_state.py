@@ -42,6 +42,7 @@ def clinic_dynamic_state_key(room_code: Any, time_code: Any) -> str:
 
 def new_clinic_tracker(curr_session_i: str, current_timestamp: float) -> dict:
     return {
+        'date': None,   # 此 tracker 屬於哪一天(YYYY/MM/DD);跨日由主程式重置,清掉昨天的關診/活動殘留
         'last_completed_set': set(),
         'last_waiting_set': set(),
         'last_valid_completion_time': current_timestamp,
@@ -107,6 +108,8 @@ def restore_tracker_from_state(state: Any, curr_session_i: str,
     tracker = new_clinic_tracker(curr_session_i, current_timestamp)
     if not isinstance(state, dict):
         return tracker
+    # state 只會在「日期=今日」時被還原(load 端有日期守門),故帶入 date 避免主程式誤判跨日重置。
+    tracker["date"] = state.get("date")
     tracker["doc_name"] = (state.get("doctor") or "").strip()
     tracker["session_period"] = canonical_session(state.get("session")) or curr_session_i
     tracker["last_completed_set"] = int_set(state.get("last_completed_set"))

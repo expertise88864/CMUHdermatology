@@ -6622,6 +6622,8 @@ from cmuh_common.reg64_utils import (  # noqa: E402
     reg64_next_allowed_fetch_time as _reg64_next_allowed_fetch_time,
     reg64_time_code_from_local_clock,
     overrun_effective_time_code,
+    clinic_tight_poll_window,
+    is_residual_stale_closed,
     reg64_slot_cn,
     reg64_slot_label_color,
     session_boundary_datetime as _session_boundary_datetime,
@@ -9124,9 +9126,13 @@ class AutomationApp:
                         
                         is_doctor_changed = (curr_doc and tracker['doc_name'] and curr_doc != tracker['doc_name'])
                         is_session_changed = (tracker['session_period'] != curr_session_i)
-                        
-                        if is_doctor_changed or is_session_changed:
-                            logging.info(f"[{room_code}] 偵測到換診/換時段，重置所有統計數據。")
+                        # [2026-06-22] 跨日重置:記憶體 tracker 沒有日期概念,連續執行跨午夜時昨天的
+                        # actual_closing_dt/had_any_activity 會殘留 → 今天早上誤判「已關診」。日期一變就清。
+                        today_str = now.strftime("%Y/%m/%d")
+                        is_new_day = tracker.get('date') != today_str
+
+                        if is_doctor_changed or is_session_changed or is_new_day:
+                            logging.info(f"[{room_code}] 偵測到換診/換時段/跨日，重置所有統計數據。")
                             tracker['last_completed_set'] = set()
                             tracker['last_waiting_set'] = set()
                             tracker['durations'] = []
@@ -9137,15 +9143,41 @@ class AutomationApp:
                             tracker['first_valid_skipped'] = False
                             tracker['phototherapy_count'] = 0
                             tracker['patient_checkin_times'] = {}
-                            tracker['is_first_run'] = True 
+                            tracker['is_first_run'] = True
                             tracker['session_period'] = curr_session_i
                             tracker['had_any_activity'] = False
                             tracker['is_ended'] = False
                             tracker['stable_since_ts'] = None
                             tracker['last_monitor_pair'] = None
-                        
+                        tracker['date'] = today_str
+
                         tracker['doc_name'] = curr_doc
-                        
+
+                        # [2026-06-22] 早晨殘留盤面防呆 —— 必須在任何 tracker 統計被本輪 data 污染【之前】做:
+                        # reg64 盤面在今天該時段開診前,可能還停留在上一個看診日同時段(已關診)。盤面說已關診,
+                        # 但「今天稍早尚無活動(had_any_activity,跨日 reset 已清 False)+ 還沒到該時段正常關診
+                        # 時間」→ 八成是殘留盤面 → 視為尚未開診,把顯示用 data 蓋成 pending;這樣後續 completed_set/
+                        # first-run/關診偵測都看 pending,不會把昨天的看診號吃進今天 tracker、也不誤判已關診。
+                        # had_any_activity 用「本輪尚未更新前」的值(就在下面幾行才會被本輪 completed/waiting 更新)。
+                        if is_residual_stale_closed(
+                                data.get('is_closed', False),
+                                bool(data.get('is_stopped')) and bool(data.get('true_schedule_dayoff')),
+                                tracker.get('had_any_activity'),
+                                now < _session_boundary_datetime(curr_session_i, now)):
+                            logging.info(
+                                "[%s] 早晨殘留盤面(已關診但今天尚無活動、未到關診時間)→ 視為尚未開診",
+                                room_code)
+                            tracker['actual_closing_dt'] = None
+                            data['is_closed'] = False
+                            data['is_stopped'] = True
+                            data['status'] = "尚未開診"
+                            data['light'] = "--"
+                            data['total'] = "-"
+                            data['waiting'] = "-"
+                            data['completed'] = 0
+                            data['waiting_set'] = set()
+                            data['completed_set'] = set()
+
                         current_completed_set = data.get('completed_set', set())
                         current_waiting_set = data.get('waiting_set', set())
 
@@ -9233,6 +9265,8 @@ class AutomationApp:
                                 or data.get("is_closed")
                             )
 
+                            # 殘留盤面已在本輪稍早(任何 tracker 污染前)蓋成 pending(見上方 is_residual_stale_closed),
+                            # 故此處 is_closed_page 已是 False、不會誤判已關診。
                             is_closed_page = data.get('is_closed', False)
                             is_stopped_page = bool(data.get('is_stopped')) and bool(data.get('true_schedule_dayoff'))
                             is_ended = False
@@ -9442,8 +9476,12 @@ class AutomationApp:
                     logging.debug("月曆重繪排程失敗（門診動態後）", exc_info=True)
 
             self.root.after(0, _after_clinic_fetch_schedule_calendar)
-            # 60-90 秒隨機間隔，避免固定節拍打爆院方限制
-            self._clinic_dynamic_refresh_seconds = random.randint(60, 90)
+            # [2026-06-22] 早上門診起跑窗(8:20-12:00)固定 60 秒,確保準時抓到開診/跳號(診多半 8:30 開診);
+            # 其餘時段 60-90 秒隨機,避免固定節拍打爆院方限制。
+            if clinic_tight_poll_window(now):
+                self._clinic_dynamic_refresh_seconds = 60
+            else:
+                self._clinic_dynamic_refresh_seconds = random.randint(60, 90)
             self._reg64_dynamic_ttl_seconds = 50
             if source_timing.get("backoff_skip", 0) > 0 or abnormal_rooms:
                 now_ts = time.time()

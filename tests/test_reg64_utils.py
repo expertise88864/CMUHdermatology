@@ -9,6 +9,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from cmuh_common.reg64_utils import (  # noqa: E402
     canonical_clinic_session_str,
     clinic_int_count,
+    clinic_tight_poll_window,
+    is_residual_stale_closed,
     overrun_effective_time_code,
     prev_session_cn,
     reg64_clinic_quiet_hours,
@@ -16,6 +18,32 @@ from cmuh_common.reg64_utils import (  # noqa: E402
     reg64_time_code_from_local_clock,
     session_boundary_datetime,
 )
+
+
+def test_clinic_tight_poll_window_morning_ramp():
+    """[2026-06-22 user] 早上 08:20–12:00 需每分鐘輪詢(固定 60s);窗外維持 60-90s 隨機。"""
+    d = lambda h, m: datetime(2026, 6, 22, h, m)  # noqa: E731
+    assert clinic_tight_poll_window(d(8, 19)) is False
+    assert clinic_tight_poll_window(d(8, 20)) is True   # 起跑
+    assert clinic_tight_poll_window(d(8, 30)) is True   # 開診
+    assert clinic_tight_poll_window(d(11, 59)) is True
+    assert clinic_tight_poll_window(d(12, 0)) is False   # 早診結束
+    assert clinic_tight_poll_window(d(13, 30)) is False
+    assert clinic_tight_poll_window(d(7, 0)) is False
+
+
+def test_is_residual_stale_closed():
+    """早晨殘留盤面:已關診 + 今天尚無活動 + 未到關診時間 → True;其餘 → False。"""
+    # 殘留盤面(該防呆的情境)
+    assert is_residual_stale_closed(True, False, False, True) is True
+    # 今天已看過活動 → 真關診,非殘留
+    assert is_residual_stale_closed(True, False, True, True) is False
+    # 已過該時段關診時間 → 真關診
+    assert is_residual_stale_closed(True, False, False, False) is False
+    # 真排休(dayoff)→ 不是殘留盤面
+    assert is_residual_stale_closed(True, True, False, True) is False
+    # 盤面沒說關診 → 無關
+    assert is_residual_stale_closed(False, False, False, True) is False
 
 
 def test_overrun_effective_time_code():
