@@ -1048,3 +1048,6 @@ def test_morning_polling_and_residual_closed_guard_wired():
     # 殘留判定要早於「current_completed_set 取自 data」(否則昨天的看診號會先被寫進今天 tracker)
     assert (run_src.index("is_residual_stale_closed(")
             < run_src.index("current_completed_set = data.get(")), "殘留防呆必須在 tracker 污染前"
+    # [2026-06-22] 自我修復:盤面非關診/停診且未到該時段關診時間 → 清掉殘留 actual_closing_dt
+    # (解「明明在看診卻一直顯示已關診」)。
+    assert "not is_closed_page and not is_stopped_page and now < boundary" in run_src

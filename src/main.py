@@ -9269,6 +9269,17 @@ class AutomationApp:
                             is_closed_page = data.get('is_closed', False)
                             is_stopped_page = bool(data.get('is_stopped')) and bool(data.get('true_schedule_dayoff'))
                             is_ended = False
+                            boundary = _session_boundary_datetime(curr_session_i, now)
+
+                            # [2026-06-22] 自我修復:盤面【現在】不是已關診/停診、且還沒到該時段正常關診時間
+                            # (plateau 偵測本就只在過 boundary 後才跑)→ 此時段不可能已關診。主動清掉先前殘留/誤設
+                            # 的 actual_closing_dt。不論殘留怎麼來的(跨日殘留/還原舊狀態/瞬時誤判),只要盤面現在
+                            # 在看診、又還沒到關診時間,下一輪就清掉 → 解掉「明明在看診卻一直顯示已關診」
+                            # (實機:101 早診 09:51 顯示已關診12:00)。盤面真的顯示已關診時不在此清(交下方處理)。
+                            if (not is_closed_page and not is_stopped_page and now < boundary
+                                    and tracker.get('actual_closing_dt') is not None):
+                                logging.info("[%s] 盤面非關診且未到關診時間 → 清除殘留已關診標記", room_code)
+                                tracker['actual_closing_dt'] = None
 
                             if is_closed_page or is_stopped_page:
                                 is_ended = True
@@ -9312,12 +9323,14 @@ class AutomationApp:
                                     # 僅在能解析到關診時刻時記錄；否則維持 None，UI 顯示「已關診」不附時間
                                     tracker['actual_closing_dt'] = parsed_dt
                             elif not skip_plateau and tracker.get('had_any_activity'):
-                                boundary = _session_boundary_datetime(curr_session_i, now)
                                 if now >= boundary:
                                     pair = (completed_count_ui, waiting_count_ui)
                                     if tracker.get('last_monitor_pair') != pair:
+                                        # 進展有變(還在看診/拖班過了關診時間又動)→ 重置 plateau 計時,
+                                        # 並清掉先前殘留的關診標記(明明還在動,不算已關診)。
                                         tracker['last_monitor_pair'] = pair
                                         tracker['stable_since_ts'] = current_timestamp
+                                        tracker['actual_closing_dt'] = None
                                     else:
                                         ss = tracker.get('stable_since_ts')
                                         if ss is None:

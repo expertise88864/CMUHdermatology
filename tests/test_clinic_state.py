@@ -119,3 +119,19 @@ def test_restore_tracker_carries_date_from_state():
     assert t["date"] == "2026/06/22"
     # 壞 state(非 dict)→ 回新 tracker(date=None)
     assert restore_tracker_from_state(None, "早上", 1000.0, _canon)["date"] is None
+
+
+def test_is_ended_persists_round_trip():
+    """[2026-06-22] is_ended 需與 actual_closing_dt 一起持久化(原本漏存,跨重啟會掉)。"""
+    t = new_clinic_tracker("早上", 1000.0)
+    assert t["is_ended"] is False
+    t["is_ended"] = True
+    state = build_dynamic_state(
+        "2026/06/22", "2026-06-22T11:00:00", "101", "1", "早上", "沈冠宇",
+        t, {"light": "5"}, current_timestamp=1000.0)
+    assert state["is_ended"] is True
+
+    def _canon(v):
+        return {"上午": "早上"}.get(str(v or "").strip(), str(v or "").strip())
+    restored = restore_tracker_from_state(state, "早上", 1000.0, _canon)
+    assert restored["is_ended"] is True

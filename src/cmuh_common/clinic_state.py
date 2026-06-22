@@ -57,6 +57,7 @@ def new_clinic_tracker(curr_session_i: str, current_timestamp: float) -> dict:
         'is_first_run': True,
         'first_valid_skipped': False,
         'had_any_activity': False,
+        'is_ended': False,   # 本診次是否已關診(網頁已關診/dayoff/plateau);與 actual_closing_dt 一起持久化
         'stable_since_ts': None,
         'last_monitor_pair': None,
         'last_activity_ts': None,
@@ -126,6 +127,7 @@ def restore_tracker_from_state(state: Any, curr_session_i: str,
     except (TypeError, ValueError):
         tracker["last_valid_completion_time"] = current_timestamp
     tracker["is_saved"] = bool(state.get("is_saved", False))
+    tracker["is_ended"] = bool(state.get("is_ended", False))
     tracker["first_valid_skipped"] = bool(
         state.get("first_valid_skipped", bool(tracker["durations"])))
     tracker["had_any_activity"] = bool(
@@ -192,6 +194,7 @@ def build_dynamic_state(today_str: str, saved_at: str, room_code: Any,
         "durations": [float(x) for x in tracker.get("durations", [])],
         "waiting_durations": [float(x) for x in tracker.get("waiting_durations", [])],
         "is_saved": bool(tracker.get("is_saved", False)),
+        "is_ended": bool(tracker.get("is_ended", False)),
         "actual_closing_dt": actual_dt,
         "phototherapy_count": int(tracker.get("phototherapy_count", 0)),
         "patient_checkin_times": {
