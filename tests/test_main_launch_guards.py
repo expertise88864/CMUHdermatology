@@ -406,20 +406,21 @@ def test_clinic_error_path_hides_no_clinic_room_only_when_network_proven_up():
     # 兩個 gate 必須【同時】成立(and)才擷取→隱藏,不是「無快取就無條件隱藏」
     assert "_floating_error_streak" in src
     assert "streak >= FLOATING_ERROR_HIDE_STREAK" in src
-    assert "self._floating_network_seems_up()" in src
+    assert "self._floating_network_seems_up(room)" in src
     assert "self._capture_floating_status(" in src
-    # 網路可達須用【本輪】真的連到 reg64 的布林旗標佐證(非舊快取、非跨輪殘留的時間戳)
+    # 網路是否正常 = 有【其他】診間本輪 reg64 可達(排除 backoff stale fallback,非僅「畫面上還有
+    # 顯示舊快取」);冷啟動 + 全網斷線時無任何診間可達 → 不隱藏(Codex 第 3 輪修正點)。
     netfn = _function_source(ROOT / "src/main.py", "_floating_network_seems_up")
-    assert "_reg64_fresh_this_cycle" in netfn
-    # 本輪旗標只在「真的連到 reg64」那輪為 True:非 backoff(沒用舊快取)且非 cache_hit(非 TTL
-    # 內快取命中)→ 全斷線/只命中快取的那一輪明確為 False(Codex 第 4/6 輪修正)。
+    assert "_reg64_room_reachable" in netfn
+    assert "exclude" in netfn
+    assert "return False" in netfn   # 沒有他診可達(冷啟動/全斷線)→ 不隱藏
+    # 逐診間可達狀態:非 backoff(沒用 stale fallback)且非錯誤/逾時(cache 命中算可達);且必須
+    # 在排任何「錯誤診間隱藏」callback 之前就把【所有診間】本輪可達設好(每輪逐診間覆寫),否則
+    # UI 執行緒可能搶在 worker 設好前跑隱藏判斷,連不上的診間排在前面時讀到上一輪殘留(Codex r5 race)。
     loop = _function_source(ROOT / "src/main.py", "_update_clinic_lights_loop")
-    assert "self._reg64_fresh_this_cycle = _fresh_this_cycle" in loop
-    assert "not _bs_pk and not _ch_pk" in loop   # 預掃條件:非 backoff、非 cache_hit
-    # 且必須【在】排任何「錯誤診間隱藏」callback 之前就把本輪旗標設好(每輪明確覆寫 True/False),
-    # 否則 UI 執行緒可能搶在 worker 設旗標前跑隱藏判斷,連不上的診間排在前面時會每輪讀到舊值而
-    # 永遠藏不掉(Codex 第 5 輪 race);用每輪布林而非時間戳避免跨輪殘留(第 6 輪)。
-    assert (loop.index("self._reg64_fresh_this_cycle = _fresh_this_cycle")
+    assert "self._reg64_room_reachable[_room_pk] = (" in loop
+    assert 'not _bs_pk and "錯誤" not in _st and "逾時" not in _st' in loop
+    assert (loop.index("self._reg64_room_reachable[_room_pk]")
             < loop.index("update_single_clinic_ui_error"))
     # 成功/有快取那輪(非 error)把連續錯誤計數歸零
     cap = _function_source(ROOT / "src/main.py", "_capture_floating_status")

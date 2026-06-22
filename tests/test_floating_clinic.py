@@ -72,6 +72,23 @@ def test_floating_window_autosizes_before_first_show():
     assert "self._ensure_shown()" in render_body
 
 
+def test_floating_window_grows_width_to_fit_content():
+    """[2026-06-22 user] 一開窗診號/燈號被蓋住(預設寬度容不下 3 碼燈號如 142 + 醫師名):
+    _render 依 _content_width 量測所需寬度,只成長不縮(低於內容會蓋字),確保 3 碼燈號 + 待診
+    pill + 醫師名都放得下。GUI 行為以原始碼守門(量測對應 _build_card 排版,改版時別漏掉)。"""
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parents[1] / "src" / "cmuh_common" / "floating_clinic.py"
+    code = src.read_text(encoding="utf-8")
+    assert "def _content_width(" in code
+    cw = code.split("def _content_width(", 1)[1].split("\n    def ", 1)[0]
+    # 量測上排(診號 + 醫師)與下排(大燈號 + 待診 pill)兩者較寬
+    assert 'f["light_big"].measure(' in cw and 'f["doctor"].measure(' in cw
+    # _render 先把寬度成長到至少容得下內容,且在 _build_card / _reposition 之前
+    render_body = code.split("def _render(", 1)[1].split("\n    def ", 1)[0]
+    assert "self._content_width(visible)" in render_body
+    assert render_body.index("self._content_width(visible)") < render_body.index("self._build_card(")
+
+
 def test_parse_geometry_pos():
     assert parse_geometry_pos("232x300+100+50") == (100, 50)
     assert parse_geometry_pos("232x300+-20+-5") == (-20, -5)

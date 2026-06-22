@@ -525,10 +525,38 @@ class ClinicFloatingWindow:
             total += (self._CARD_H_OPEN if is_open else self._CARD_H_DIM) + self._CARD_PADY
         return total
 
+    def _content_width(self, visible: list) -> int:
+        """量測『不蓋住內容』所需的最小【視窗】寬:取所有顯示卡片中,上排(時段 tag + 診號 +
+        醫師)與下排(燈號 hero + 待診 pill)較寬者 + body padx/外框(14)。讓 3 碼燈號(如 142)
+        與醫師名都放得下,避免一開窗診號/燈號被蓋住。至少 _MIN_W;字型量測對應 _build_card 排版。"""
+        f = self._fonts
+        pad = 13
+        need = self._MIN_W
+        for s in visible:
+            v = room_card_view(s)
+            slot = (s.slot or "").strip()
+            # 上排:pad + [tag + 8] + 診號 + 間隔(14) + 醫師(右靠) + pad
+            tag_w = (f["tag"].measure(slot) + 16 + 8) if slot else 0
+            top = (pad + tag_w + f["room"].measure(str(s.room).strip())
+                   + 14 + f["doctor"].measure(v["doctor"]) + pad)
+            # 下排:看診中 = pad + 燈號(大) + 間隔(12) + 待診 pill + pad;其餘只有小燈號字
+            if v["state"] == "open":
+                pill_w = f["wait_lbl"].measure("待診") + f["wait_num"].measure(v["waiting"]) + 24
+                bottom = pad + f["light_big"].measure(v["light"]) + 12 + pill_w + pad
+            else:
+                bottom = pad + f["light_sm"].measure(v["light"]) + pad
+            need = max(need, int(top) + 14, int(bottom) + 14)  # +14 = 卡片→視窗
+        return int(need)
+
     def _render(self) -> None:
         tk = self._tk
         visible = [s for s in self._last_rooms if should_show_room(s)]
-        # [2026-06-22 user] 先依資料【純計算】高度並把視窗定位成正確高度,再重建卡片。
+        # [2026-06-22 user] 寬度:成長到至少容得下內容(3 碼燈號如 142 + 醫師名),避免一開窗
+        # 診號/燈號被蓋住。只成長不縮(使用者仍可手動再加寬;低於內容會蓋字所以不縮)。
+        ideal_w = self._content_width(visible)
+        if ideal_w > self._w:
+            self._w = ideal_w
+        # 先依資料【純計算】高度並把視窗定位成正確高度,再重建卡片。
         # _content_height 不需卡片已建(只看卡片數 + 量測時間列),故可先算。這樣等下卡片
         # pack 進來時視窗已是正確高度,update_idletasks 不會把卡片擠進舊的 120px → 不再閃一下
         # 「字被壓縮」。高度:使用者手動拉過就用手動值,否則依卡片數自動縮放。
