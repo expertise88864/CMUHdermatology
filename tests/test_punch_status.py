@@ -118,3 +118,78 @@ def test_query_accounts_skips_when_portal_unreachable(monkeypatch):
 def test_query_accounts_empty_returns_empty(monkeypatch):
     monkeypatch.setattr(ps, "portal_reachable", lambda *a, **k: True)
     assert ps.query_accounts_today([], am_window=AM, pm_window=PM) == []
+
+
+# ── [2026-06-22] 韌性:清 session + 登入逾時重試一次 ────────────────────────────
+
+def test_is_retryable_punch_error():
+    """逾時/連線/一般例外 → 可重試;帳密錯誤 / selenium 不可用 → 不重試。純函式。"""
+    assert ps._is_retryable_punch_error("登入逾時/失敗") is True
+    assert ps._is_retryable_punch_error("Message: timeout: ...") is True   # 一般例外字串
+    assert ps._is_retryable_punch_error("帳號/密碼錯誤") is False
+    assert ps._is_retryable_punch_error("selenium 不可用:No module") is False
+    assert ps._is_retryable_punch_error("") is False
+    assert ps._is_retryable_punch_error(None) is False
+
+
+class _FakeDriver:
+    def set_page_load_timeout(self, *a):
+        pass
+
+    def quit(self):
+        pass
+
+
+def _patch_chrome(monkeypatch):
+    import pytest
+    pytest.importorskip("selenium")
+    import selenium.webdriver as _wd
+    import cmuh_common.chrome_options as _co
+    monkeypatch.setattr(ps, "portal_reachable", lambda *a, **k: True)
+    monkeypatch.setattr(_wd, "Chrome", lambda *a, **k: _FakeDriver())
+    monkeypatch.setattr(_co, "build_chrome_options", lambda **k: object())
+
+
+def test_query_accounts_retries_once_on_retryable_error(monkeypatch):
+    """登入逾時(可重試)→ 清 session 後重試一次;第二次成功則採用其結果。"""
+    _patch_chrome(monkeypatch)
+    calls = {"n": 0}
+
+    def fake_read(driver, username, password, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return [], "登入逾時/失敗"            # 第一次失敗(可重試)
+        return [("0800", "上班")], None           # 第二次成功
+    monkeypatch.setattr(ps, "read_today_swipes", fake_read)
+
+    res = ps.query_accounts_today(
+        [{"username": "D34251", "password": "p", "schedule": {"mon_am_in": True}}],
+        am_window=AM, pm_window=PM, when=MON)
+    assert calls["n"] == 2            # 有重試
+    assert res[0]["error"] is None    # 採用第二次成功
+    assert res[0]["on"] == "ok" and res[0]["on_time"] == "08:00"
+
+
+def test_query_accounts_no_retry_on_auth_error(monkeypatch):
+    """帳密錯誤 → 不重試(重試也一樣,別浪費整批時間預算)。"""
+    _patch_chrome(monkeypatch)
+    calls = {"n": 0}
+
+    def fake_read(driver, username, password, **k):
+        calls["n"] += 1
+        return [], "帳號/密碼錯誤"
+    monkeypatch.setattr(ps, "read_today_swipes", fake_read)
+
+    res = ps.query_accounts_today(
+        [{"username": "D34251", "password": "p", "schedule": {}}],
+        am_window=AM, pm_window=PM, when=MON)
+    assert calls["n"] == 1            # 沒重試
+    assert "密碼錯誤" in res[0]["error"]
+
+
+def test_read_today_swipes_clears_cookies_per_account():
+    """read_today_swipes 開頭要清 session(delete_all_cookies),避免共用 driver 的
+    上一帳號登入狀態殘留害後面帳號登入逾時。selenium 流程無法純測,以原始碼守門。"""
+    import inspect
+    src = inspect.getsource(ps.read_today_swipes)
+    assert "delete_all_cookies" in src

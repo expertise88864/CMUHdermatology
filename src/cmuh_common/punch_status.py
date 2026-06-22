@@ -136,6 +136,13 @@ def read_today_swipes(driver, username: str, password: str, *,
 
     wait = WebDriverWait(driver, wait_sec)
     try:
+        # [2026-06-22] 多帳號共用同一個 driver 逐一查 → 先清掉上一個帳號殘留的登入 session,
+        # 否則 portal 可能仍認得上一個帳號、login.aspx 被導走 → 這個帳號登入逾時(實機:同一批
+        # 信件固定那幾個帳號「登入逾時/失敗」)。首個帳號尚未導頁時 delete 會丟例外,忽略即可。
+        try:
+            driver.delete_all_cookies()
+        except Exception:
+            logging.debug("[punch] delete_all_cookies 失敗(首帳號/尚未導頁,可忽略)", exc_info=True)
         driver.get(login_url)
         try:
             user_elem = wait.until(EC.element_to_be_clickable((By.ID, "TB_logid")))
@@ -221,6 +228,16 @@ def read_today_swipes(driver, username: str, password: str, *,
         return [], str(e)[:40]
 
 
+def _is_retryable_punch_error(err) -> bool:
+    """單帳號登入失敗,是否值得「清 session 後重試一次」。純函式。
+    逾時/連線/一般例外 → 可重試(多半是 portal 當下慢或 session 殘留);
+    明確帳密錯誤 / selenium 環境不可用 → 不重試(重試也一樣,只會浪費整批時間預算)。"""
+    if not err:
+        return False
+    e = str(err)
+    return not ("密碼錯誤" in e or "selenium 不可用" in e)
+
+
 def _error_result(username, msg) -> dict:
     return {"username": str(username), "on": None, "on_time": None,
             "off": None, "off_time": None, "error": msg}
@@ -229,7 +246,7 @@ def _error_result(username, msg) -> dict:
 def query_accounts_today(accounts, *, am_window, pm_window,
                          when: Optional[datetime] = None,
                          headless: bool = True,
-                         time_budget_sec: float = 90.0,
+                         time_budget_sec: float = 120.0,
                          page_load_timeout_sec: float = 20.0) -> list:
     """自建一個 headless Chrome,逐帳號登入查今日上/下班狀態。完全 fail-open。
     accounts = [{'username','password','schedule'(可選 dict)}, ...]。
@@ -278,6 +295,11 @@ def query_accounts_today(accounts, *, am_window, pm_window,
             password = str(a.get("password", ""))
             schedule = a.get("schedule") if isinstance(a.get("schedule"), dict) else {}
             swipes, err = read_today_swipes(driver, username, password)
+            # 登入逾時/連線類失敗 → 清 session(read_today_swipes 開頭會 delete_all_cookies)後重試
+            # 一次,但僅在整批時間預算內(避免拖慢寄信);明確帳密錯誤不重試。
+            if err and _is_retryable_punch_error(err) and _time.monotonic() < deadline:
+                logging.info("[punch] %s 查詢失敗(%s)→ 清 session 重試一次", username, err)
+                swipes, err = read_today_swipes(driver, username, password)
             ev = evaluate_account(schedule, swipes, am_window, pm_window, when)
             ev["username"] = username
             ev["error"] = err
