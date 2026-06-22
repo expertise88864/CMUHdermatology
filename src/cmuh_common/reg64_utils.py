@@ -172,15 +172,15 @@ def clinic_int_count(value, default: int = 0) -> int:
 
 
 def reg64_clinic_quiet_hours(when: Optional[datetime] = None) -> bool:
-    """Return true when reg64 HTTP polling should stay quiet."""
+    """半夜 00:00–07:00 暫停 reg64 輪詢(07:00 起恢復)。[2026-06-22] 由 <8 改 <7。"""
     current = when or datetime.now()
-    return current.hour < 8
+    return current.hour < 7
 
 
 def reg64_next_allowed_fetch_time(when: Optional[datetime] = None) -> datetime:
-    """Return the next 08:00 boundary, or when if polling is already allowed."""
+    """Return the next 07:00 boundary, or when if polling is already allowed."""
     current = when or datetime.now()
-    start = current.replace(hour=8, minute=0, second=0, microsecond=0)
+    start = current.replace(hour=7, minute=0, second=0, microsecond=0)
     if current < start:
         return start
     return current
@@ -189,7 +189,7 @@ def reg64_next_allowed_fetch_time(when: Optional[datetime] = None) -> datetime:
 def clinic_tight_poll_window(when: Optional[datetime] = None) -> bool:
     """[2026-06-22 使用者] 是否處於「需要每分鐘輪詢」的早上門診起跑窗(08:20–12:00)。純函式。
 
-    門診多半 08:30 準時開診、燈號開始跳號;此窗內輪詢間隔固定 60 秒,確保即時抓到開診/跳號。
+    門診多半 08:30 準時開診、燈號開始跳號;此窗內輪詢間隔 45–75 秒隨機,確保即時抓到開診/跳號。
     窗外維持 60–90 秒隨機(避免固定節拍打爆院方限制)。"""
     t = (when or datetime.now()).time()
     return dt_time(8, 20) <= t < dt_time(12, 0)

@@ -6635,7 +6635,7 @@ from cmuh_common.reg64_utils import (  # noqa: E402
 )
 
 
-# 門診動態燈號／候診輪詢間隔（秒）；實際間距 60-90 秒隨機，00:00-08:00 完全靜默
+# 門診動態燈號／候診輪詢間隔（秒）；窗外 60-90 秒隨機、早上 8:20-12:00 為 45-75 秒，00:00-07:00 完全靜默
 CLINIC_LIGHT_REFRESH_SECONDS = 60
 # reg64 單次 HTTP 逾時（秒）；院方尖峰易逾時，略增並搭配共用退避與序向請求。
 CLINIC_REG64_HTTP_TIMEOUT = 10
@@ -9476,10 +9476,10 @@ class AutomationApp:
                     logging.debug("月曆重繪排程失敗（門診動態後）", exc_info=True)
 
             self.root.after(0, _after_clinic_fetch_schedule_calendar)
-            # [2026-06-22] 早上門診起跑窗(8:20-12:00)固定 60 秒,確保準時抓到開診/跳號(診多半 8:30 開診);
+            # [2026-06-22] 早上門診起跑窗(8:20-12:00)45-75 秒隨機,準時抓到開診/跳號(診多半 8:30 開診);
             # 其餘時段 60-90 秒隨機,避免固定節拍打爆院方限制。
             if clinic_tight_poll_window(now):
-                self._clinic_dynamic_refresh_seconds = 60
+                self._clinic_dynamic_refresh_seconds = random.randint(45, 75)
             else:
                 self._clinic_dynamic_refresh_seconds = random.randint(60, 90)
             self._reg64_dynamic_ttl_seconds = 50
@@ -9517,8 +9517,8 @@ class AutomationApp:
         clinic_future.add_done_callback(_handle_clinic_submit_rejected)
         
         seconds = getattr(self, '_clinic_dynamic_refresh_seconds', 60)
-        if seconds < 60:
-            seconds = 60
+        if seconds < 45:   # [2026-06-22] 下限 60→45,讓早上起跑窗的 45-75 秒不被夾回 60
+            seconds = 45
         next_refresh_ms = seconds * 1000
         self.clinic_loop_id = self.root.after(next_refresh_ms, self._update_clinic_lights_loop)
 

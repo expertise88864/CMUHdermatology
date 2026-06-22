@@ -107,10 +107,12 @@ def test_clinic_int_count_rejects_non_integral_values():
 
 
 def test_reg64_quiet_hours_and_next_allowed_time():
-    early = datetime(2026, 5, 25, 7, 59)
-    allowed = datetime(2026, 5, 25, 8, 1)
+    """[2026-06-22] 暫停 00:00–07:00,07:00 起恢復(原為 08:00)。"""
+    early = datetime(2026, 5, 25, 6, 59)     # 06:59 仍暫停
+    allowed = datetime(2026, 5, 25, 7, 1)    # 07:01 已恢復
 
     assert reg64_clinic_quiet_hours(early)
     assert not reg64_clinic_quiet_hours(allowed)
-    assert reg64_next_allowed_fetch_time(early) == datetime(2026, 5, 25, 8, 0)
+    assert reg64_clinic_quiet_hours(datetime(2026, 5, 25, 7, 0)) is False  # 07:00 整恢復
+    assert reg64_next_allowed_fetch_time(early) == datetime(2026, 5, 25, 7, 0)
     assert reg64_next_allowed_fetch_time(allowed) == allowed
