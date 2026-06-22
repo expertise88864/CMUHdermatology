@@ -6622,7 +6622,6 @@ from cmuh_common.reg64_utils import (  # noqa: E402
     reg64_next_allowed_fetch_time as _reg64_next_allowed_fetch_time,
     reg64_time_code_from_local_clock,
     overrun_effective_time_code,
-    clinic_tight_poll_window,
     is_residual_stale_closed,
     reg64_slot_cn,
     reg64_slot_label_color,
@@ -6635,7 +6634,7 @@ from cmuh_common.reg64_utils import (  # noqa: E402
 )
 
 
-# 門診動態燈號／候診輪詢間隔（秒）；窗外 60-90 秒隨機、早上 8:20-12:00 為 45-75 秒，00:00-07:00 完全靜默
+# 門診動態燈號／候診輪詢間隔（秒）；07:00-00:00 一律 45-75 秒隨機，00:00-07:00 完全靜默
 CLINIC_LIGHT_REFRESH_SECONDS = 60
 # reg64 單次 HTTP 逾時（秒）；院方尖峰易逾時，略增並搭配共用退避與序向請求。
 CLINIC_REG64_HTTP_TIMEOUT = 10
@@ -9476,12 +9475,9 @@ class AutomationApp:
                     logging.debug("月曆重繪排程失敗（門診動態後）", exc_info=True)
 
             self.root.after(0, _after_clinic_fetch_schedule_calendar)
-            # [2026-06-22] 早上門診起跑窗(8:20-12:00)45-75 秒隨機,準時抓到開診/跳號(診多半 8:30 開診);
-            # 其餘時段 60-90 秒隨機,避免固定節拍打爆院方限制。
-            if clinic_tight_poll_window(now):
-                self._clinic_dynamic_refresh_seconds = random.randint(45, 75)
-            else:
-                self._clinic_dynamic_refresh_seconds = random.randint(60, 90)
+            # [2026-06-22] 07:00–00:00(quiet hours 之外)一律 45-75 秒隨機輪詢(隨機避免固定節拍打爆
+            # 院方限制);00:00–07:00 由 reg64_clinic_quiet_hours 暫停。
+            self._clinic_dynamic_refresh_seconds = random.randint(45, 75)
             self._reg64_dynamic_ttl_seconds = 50
             if source_timing.get("backoff_skip", 0) > 0 or abnormal_rooms:
                 now_ts = time.time()

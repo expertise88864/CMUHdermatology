@@ -1038,8 +1038,7 @@ def test_morning_polling_and_residual_closed_guard_wired():
     """[2026-06-22 user] 早上每分鐘輪詢 + 早晨殘留盤面防呆 已接進輪詢迴圈。
     run_update 邏輯難以純單元測,以原始碼守門避免被改掉。"""
     src = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
-    # Problem 1:早上起跑窗 45-75 秒隨機輪詢(窗外 60-90)
-    assert "clinic_tight_poll_window(now)" in src
+    # Problem 1:07:00–00:00 一律 45-75 秒隨機輪詢
     assert "random.randint(45, 75)" in src
     # Problem 2a:跨日重置(記憶體 tracker 清掉昨天的關診/活動殘留)
     assert "is_new_day" in src and "tracker['date'] = today_str" in src

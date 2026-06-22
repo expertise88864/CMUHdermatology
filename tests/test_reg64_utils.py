@@ -9,7 +9,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from cmuh_common.reg64_utils import (  # noqa: E402
     canonical_clinic_session_str,
     clinic_int_count,
-    clinic_tight_poll_window,
     is_residual_stale_closed,
     overrun_effective_time_code,
     prev_session_cn,
@@ -18,18 +17,6 @@ from cmuh_common.reg64_utils import (  # noqa: E402
     reg64_time_code_from_local_clock,
     session_boundary_datetime,
 )
-
-
-def test_clinic_tight_poll_window_morning_ramp():
-    """[2026-06-22 user] 早上 08:20–12:00 需每分鐘輪詢(固定 60s);窗外維持 60-90s 隨機。"""
-    d = lambda h, m: datetime(2026, 6, 22, h, m)  # noqa: E731
-    assert clinic_tight_poll_window(d(8, 19)) is False
-    assert clinic_tight_poll_window(d(8, 20)) is True   # 起跑
-    assert clinic_tight_poll_window(d(8, 30)) is True   # 開診
-    assert clinic_tight_poll_window(d(11, 59)) is True
-    assert clinic_tight_poll_window(d(12, 0)) is False   # 早診結束
-    assert clinic_tight_poll_window(d(13, 30)) is False
-    assert clinic_tight_poll_window(d(7, 0)) is False
 
 
 def test_is_residual_stale_closed():

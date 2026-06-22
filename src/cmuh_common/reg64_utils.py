@@ -186,15 +186,6 @@ def reg64_next_allowed_fetch_time(when: Optional[datetime] = None) -> datetime:
     return current
 
 
-def clinic_tight_poll_window(when: Optional[datetime] = None) -> bool:
-    """[2026-06-22 使用者] 是否處於「需要每分鐘輪詢」的早上門診起跑窗(08:20–12:00)。純函式。
-
-    門診多半 08:30 準時開診、燈號開始跳號;此窗內輪詢間隔 45–75 秒隨機,確保即時抓到開診/跳號。
-    窗外維持 60–90 秒隨機(避免固定節拍打爆院方限制)。"""
-    t = (when or datetime.now()).time()
-    return dt_time(8, 20) <= t < dt_time(12, 0)
-
-
 def is_residual_stale_closed(is_closed: bool, is_stopped_dayoff: bool,
                              had_any_activity: bool, before_boundary: bool) -> bool:
     """早晨「殘留盤面」判定。純函式。
