@@ -40,6 +40,38 @@ def test_should_show_room_autohide_rules():
     assert should_show_room(RoomStatus(room="103", fetched=False)) is True
 
 
+def test_should_show_room_hides_errored_no_clinic_room():
+    """[2026-06-22 user] 今天沒這個診、reg64 連線逾時/錯誤(error=True 但沒醫師)→ 隱藏。
+    主程式 update_single_clinic_ui_error 會把這種診以 error 旗標餵進浮動視窗,
+    不再卡成 fetched=False 的 pending 空白卡(原 102 沒診卻一直顯示的 bug)。"""
+    # 102 今天沒診、連線逾時:error=True、無醫師、燈號佔位 → 隱藏
+    assert should_show_room(
+        RoomStatus(room="102", error=True, light="--", fetched=True)) is False
+    # 但若(暫時)連線異常卻仍記得醫師姓名 → 仍顯示(視為該診存在,只是這輪連線異常)
+    assert should_show_room(
+        RoomStatus(room="102", error=True, doctor="王醫師", fetched=True)) is True
+
+
+def test_floating_window_autosizes_before_first_show():
+    """[2026-06-22 user] 浮動視窗開啟時先算好高度再現身,避免一開始字被壓縮:
+      - __init__ 先 withdraw 兩窗,第一次 _render 後才 deiconify(_ensure_shown);
+        另有 fallback 計時器保險,避免任何意外讓視窗卡在 withdraw 變隱形窗。
+      - _render 先算高度 + _reposition,再重建卡片(卡片 pack 進已正確高度的窗,不被擠壓)。
+    GUI 行為以原始碼守門(避免被改回先建卡片才量高度的舊流程)。"""
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parents[1] / "src" / "cmuh_common" / "floating_clinic.py"
+    code = src.read_text(encoding="utf-8")
+    assert "def _ensure_shown(" in code
+    assert ".withdraw()" in code and ".deiconify()" in code
+    assert "_first_shown" in code
+    # fallback:withdraw 後排一個 after 計時器叫 _ensure_shown(防呆,不會變隱形窗)
+    assert "after(400, self._ensure_shown)" in code
+    # _render 內:先 _reposition(算好高度)才 _build_card(先尺寸後卡片),結尾呼叫 _ensure_shown
+    render_body = code.split("def _render(", 1)[1].split("\n    def ", 1)[0]
+    assert render_body.index("self._reposition(content_h=ch)") < render_body.index("self._build_card(")
+    assert "self._ensure_shown()" in render_body
+
+
 def test_parse_geometry_pos():
     assert parse_geometry_pos("232x300+100+50") == (100, 50)
     assert parse_geometry_pos("232x300+-20+-5") == (-20, -5)

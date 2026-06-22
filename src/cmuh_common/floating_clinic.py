@@ -331,6 +331,21 @@ class ClinicFloatingWindow:
         _set_ex_styles(self.win, transparent=False)
         self._apply_round_regions(120)  # 初始圓角(資料進來後 _render 會再套真實高度)
 
+        # [2026-06-22 user] 先把兩個視窗藏起來,等第一次 _render 用「真實卡片數」算好高度後再
+        # 現身(見 _ensure_shown)→ 開窗時不會先閃一下 120px 佔位高度、字被擠壓。
+        # fallback:400ms 內若 _render 沒觸發(正常 _open 後會立刻 tick),也強制現身,
+        # 避免任何意外(render 例外/沒呼叫)讓視窗卡在 withdraw 變成隱形窗。
+        self._first_shown = False
+        for _w in (self.win, self._content):
+            try:
+                _w.withdraw()
+            except Exception:
+                logging.debug("[浮動門診] 初始 withdraw 失敗", exc_info=True)
+        try:
+            self.win.after(400, self._ensure_shown)
+        except Exception:
+            self._ensure_shown()
+
     # ── 建構輔助 ─────────────────────────────────────────────
     def _setup_toplevel(self, win, bg) -> None:
         try:
@@ -427,6 +442,26 @@ class ClinicFloatingWindow:
         _apply_round_region(self._content, self._w,
                             max(2 * _CORNER_R, content_h), _CORNER_R, "bottom")
 
+    def _ensure_shown(self) -> None:
+        """首次顯示:把 __init__ 先 withdraw 的兩個視窗叫出來。由第一次 _render(尺寸都算好
+        之後)呼叫;另有 400ms fallback 計時器保險,確保即使 render 沒觸發也不會變隱形窗。"""
+        if getattr(self, "_first_shown", True):
+            return
+        self._first_shown = True
+        for w in self._all_windows():
+            try:
+                if w is not None:
+                    w.deiconify()
+            except Exception:
+                logging.debug("[浮動門診] 首次現身 deiconify 失敗", exc_info=True)
+        # 重新 map 後重申延伸樣式(點擊穿透/不搶焦點),避免 deiconify 後失效。
+        try:
+            _set_ex_styles(self._content, transparent=True)
+            _set_ex_styles(self.win, transparent=False)
+        except Exception:
+            logging.debug("[浮動門診] 首次現身重申延伸樣式失敗", exc_info=True)
+        self.lift_to_top()
+
     # ── 對外 API ─────────────────────────────────────────────
     def _all_windows(self):
         return (self.win, getattr(self, "_content", None))
@@ -493,6 +528,13 @@ class ClinicFloatingWindow:
     def _render(self) -> None:
         tk = self._tk
         visible = [s for s in self._last_rooms if should_show_room(s)]
+        # [2026-06-22 user] 先依資料【純計算】高度並把視窗定位成正確高度,再重建卡片。
+        # _content_height 不需卡片已建(只看卡片數 + 量測時間列),故可先算。這樣等下卡片
+        # pack 進來時視窗已是正確高度,update_idletasks 不會把卡片擠進舊的 120px → 不再閃一下
+        # 「字被壓縮」。高度:使用者手動拉過就用手動值,否則依卡片數自動縮放。
+        h = self._manual_h if self._manual_h is not None else self._content_height(visible)
+        ch = max(60, int(h))
+        self._reposition(content_h=ch)
         if self._cards_frame is not None:
             try:
                 self._cards_frame.destroy()
@@ -507,16 +549,12 @@ class ClinicFloatingWindow:
         for s in visible:
             self._build_card(frame, s)
         try:
-            # 先讓卡片 pack 落定,_reposition 設的 geometry 才不會被延後的 pack 蓋掉。
             self._content.update_idletasks()
-            # 高度:使用者手動拉過就用手動值,否則依卡片數自動縮放
-            h = self._manual_h if self._manual_h is not None else self._content_height(visible)
-            ch = max(60, int(h))
-            self._reposition(content_h=ch)
             _set_ex_styles(self._content, transparent=True)  # rebuild 後重申(保險)
             self._apply_round_regions(ch)  # 圓角(視窗本體)
         except Exception:
             logging.debug("[浮動門診] 重繪/縮放失敗", exc_info=True)
+        self._ensure_shown()   # 首次:尺寸都算好後才現身(見 __init__ withdraw)
         self.lift_to_top()
 
     def get_geometry(self) -> str:

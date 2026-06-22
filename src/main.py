@@ -6643,6 +6643,11 @@ REG64_CMUH_BACKOFF_KEY = "reg64:appointment.cmuh.org.tw"
 # 門診動態：近一月統計天數、關診判定（時段底線後連續無變動秒數）
 CLINIC_METRIC_HISTORY_DAYS = 30
 CLINIC_LIGHT_HISTORY_DAYS = 30
+# 浮動視窗:連續「錯誤/逾時」達此次數,才把該診間【候選】視為「今天沒這個診」並隱藏。
+# 給暫時性連線異常(冷啟動、換節、院方瞬斷)幾輪緩衝,避免把其實有診的診間從 pending 誤藏。
+# 候選還要再過「本輪網路確實可達」這關(_reg64_fresh_this_cycle,每輪預掃時明確覆寫)才真的
+# 隱藏;全網斷線那一輪該旗標必為 False → 不隱藏(連線錯誤本身不是「沒診」的證據,須有本輪新鮮成功佐證)。
+FLOATING_ERROR_HIDE_STREAK = 3
 CLINIC_LIGHT_HISTORY_WINDOW_MINUTES = 9
 CLINIC_DYNAMIC_STATE_FILENAME = "clinic_dynamic_state.json"
 # 已寄出的止掛提醒信記錄(跨重啟去重用)。notify_key 內含日期,只保留近 7 天。
@@ -7081,6 +7086,14 @@ class AutomationApp:
         # 以「診間號」為 key(非 index)→ 不受診間重排影響;且輪詢時【無論視窗開沒開
         # 都更新】,使用者一開視窗就有最新資料,不會卡在 60-90 秒前的 "?"。
         self._floating_status_by_room = {}             # room_code -> floating_clinic.RoomStatus
+        # room_code -> 連續「錯誤/逾時且無今日快取」次數。達門檻才視為「今天真的沒這個診」
+        # 而以 error 旗標餵浮動視窗隱藏;單次/前幾次連線異常(冷啟動、換節、院方瞬斷)只是暫時
+        # 性,不馬上藏掉「其實有診」的診間(成功/有快取的那輪會在 _capture_floating_status 歸零)。
+        self._floating_error_streak = {}
+        # 【本輪】是否有任一診間真的連到 reg64 抓成功(每輪輪詢預掃時明確覆寫 True/False);
+        # _floating_network_seems_up 用它判斷網路本輪是否真的可達,才決定要不要把連不上的診間隱藏
+        # (見 update_single_clinic_ui_error)。用每輪布林而非時間戳,避免上一輪成功殘留誤判本輪可達。
+        self._reg64_fresh_this_cycle = False
         self.floating_clinic_win = None
         self.floating_clinic_tick_id = None
         self._floating_clinic_settings = self._load_floating_clinic_settings()
@@ -9032,6 +9045,22 @@ class AutomationApp:
                     time.sleep(0.4)
                 packed_rows.append(_fetch_reg64_pack(spec))
 
+            # [2026-06-22] 先掃一遍決定「本輪 reg64 是否真的連得上」:只要有任一列是「真的連到
+            # reg64 抓成功」(非錯誤/逾時、非 backoff 用舊快取、非 TTL 內 cache 命中)→ True,否則
+            # False。每輪都【明確覆寫】此旗標(全網斷線那一輪即明確為 False),且必須在下方處理迴圈
+            # 用 root.after 排任何「錯誤診間是否隱藏」之前設好 —— 否則 UI 執行緒可能搶在 worker 設好
+            # 本輪旗標前就跑隱藏判斷(race),連不上的診間排在有診的診間之前時會永遠藏不掉。
+            # 用『本輪布林』而非時間戳:避免上一輪較晚寫入的成功時間在窗內被誤判成本輪可達
+            # (Codex 第 6 輪:時間戳 + 視窗有跨輪殘留)。
+            _fresh_this_cycle = False
+            for _pk in packed_rows:
+                _st = (_pk[4] or {}).get("status", "") if _pk[4] else ""
+                _ch_pk, _bs_pk = _pk[5], _pk[6]
+                if not _bs_pk and not _ch_pk and "錯誤" not in _st and "逾時" not in _st:
+                    _fresh_this_cycle = True
+                    break
+            self._reg64_fresh_this_cycle = _fresh_this_cycle
+
             for pack in packed_rows:
                 i, room_code, mode, tc_effective, data, cache_hit, backoff_skip = pack
                 if cache_hit:
@@ -9091,6 +9120,7 @@ class AutomationApp:
                     self.root.after(0, lambda idx=i, res=data: self.update_single_clinic_ui_error(idx, res))
                     continue
 
+                # 新鮮成功時間戳已在上方 packed_rows 預掃時設好(在排任何隱藏判斷之前,避免 race)。
                 data = self._refine_clinic_reg64_for_display(data, mode, now, tc_effective)
                 self._update_reg64_public_cache(room_code, data)
 
@@ -9533,6 +9563,25 @@ class AutomationApp:
 
     # [新增] 用於錯誤時的 UI 更新函式，只更新狀態文字，不影響數值
     def update_single_clinic_ui_error(self, index, result):
+        # [2026-06-22 user 選「積極」] 浮動視窗:reg64 連線逾時/錯誤(無今日明確訊號)的診間,
+        # 要同時滿足兩個條件才視為「今天真的沒這個診」(例 102)並隱藏,避免誤藏其實有診的診間:
+        #   (1) 連續錯誤達門檻 FLOATING_ERROR_HIDE_STREAK(給暫時性瞬斷幾輪緩衝);且
+        #   (2) 同一時間【其他診間連得上、正在顯示有診】(_floating_network_seems_up)→ 佐證
+        #       reg64/網路是通的,那這一診持續連不上多半是它本來就沒診;全網斷線/冷啟動時
+        #       沒有任何診間有資料 → 不隱藏(連線錯誤本身不是「沒診」的證據)。
+        # 達標才以 error 旗標餵浮動視窗 → should_show_room 隱藏無醫師的錯誤診間;否則維持
+        # pending 顯示。成功/有快取那輪會在 _capture_floating_status 把連續計數歸零。
+        try:
+            room = (self.clinic_room_vars[index].get().strip()
+                    if index < len(self.clinic_room_vars) else "")
+            if room:
+                streak = self._floating_error_streak.get(room, 0) + 1
+                self._floating_error_streak[room] = streak
+                if (streak >= FLOATING_ERROR_HIDE_STREAK
+                        and self._floating_network_seems_up()):
+                    self._capture_floating_status(index, result, {})
+        except Exception:
+            logging.debug("[浮動門診] 錯誤狀態擷取失敗", exc_info=True)
         els = getattr(self, "clinic_ui_elements", None)
         if not els or index >= len(els):
             return
@@ -9815,6 +9864,15 @@ class AutomationApp:
             rooms.append(rs)
         return rooms
 
+    def _floating_network_seems_up(self):
+        """reg64/網路【本輪】是否真的連得上:本輪輪詢預掃時,只要有任一診間是「真的連到 reg64
+        抓成功」(非 backoff 用舊快取、非 TTL 內 cache 命中、非錯誤/逾時)就為 True,否則 False
+        (見 _update_clinic_lights_loop 預掃;每輪明確覆寫)。全網斷線那一輪必為 False → 呼叫端
+        不會把連不上的診間誤藏。
+        刻意用『本輪布林旗標』而非『其他診間舊快取』或『成功時間戳 + 視窗』:前者斷線時舊快取會被
+        誤判成可達(Codex 第 3 輪),後者上一輪較晚寫入的成功時間會在窗內殘留誤判本輪可達(第 6 輪)。"""
+        return bool(getattr(self, "_reg64_fresh_this_cycle", False))
+
     def _capture_floating_status(self, index, result, tracker):
         # [2026-06-19] 無論浮動視窗開沒開都快取(成本極小:只是組一個 dataclass),
         # 這樣使用者一打開視窗就有最新資料,不會卡在前一輪 60-90 秒的 "?"。以診間號為 key。
@@ -9835,6 +9893,10 @@ class AutomationApp:
             except (TypeError, ValueError):
                 waiting = None
             light = str(result.get("light", "") or "")
+            # 這一輪有成功/有快取(非 error)→ 連續錯誤計數歸零:有診的診間遇到暫時性瞬斷後
+            # 恢復,就不會被先前累積的錯誤次數誤判成「沒診」而隱藏。
+            if not error:
+                self._floating_error_streak[room] = 0
             from cmuh_common import floating_clinic
             self._floating_status_by_room[room] = floating_clinic.RoomStatus(
                 room=room,

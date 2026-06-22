@@ -396,6 +396,41 @@ def test_ui_thread_dispatch_skips_callbacks_during_shutdown():
         assert src.count("return True") >= 2
 
 
+def test_clinic_error_path_hides_no_clinic_room_only_when_network_proven_up():
+    """[2026-06-22 user 選「積極」] reg64 連線逾時/錯誤(無今日明確訊號)的診間,只有
+    『連續達門檻』且『其他診間連得上(網路正常)』兩條件同時成立才隱藏(視為今天沒這診,例 102)。
+    這直接擋掉 Codex 兩輪指出的 regression:連線錯誤本身不是『沒診』證據 —— 冷啟動/全網斷線時
+    沒有任何診間有資料 → _floating_network_seems_up 回 False → 一律不隱藏,不會誤藏其實有診的診間。
+    成功/有快取那輪在 _capture_floating_status 把連續計數歸零,瞬斷恢復後不會被誤藏。"""
+    src = _function_source(ROOT / "src/main.py", "update_single_clinic_ui_error")
+    # 兩個 gate 必須【同時】成立(and)才擷取→隱藏,不是「無快取就無條件隱藏」
+    assert "_floating_error_streak" in src
+    assert "streak >= FLOATING_ERROR_HIDE_STREAK" in src
+    assert "self._floating_network_seems_up()" in src
+    assert "self._capture_floating_status(" in src
+    # 網路可達須用【本輪】真的連到 reg64 的布林旗標佐證(非舊快取、非跨輪殘留的時間戳)
+    netfn = _function_source(ROOT / "src/main.py", "_floating_network_seems_up")
+    assert "_reg64_fresh_this_cycle" in netfn
+    # 本輪旗標只在「真的連到 reg64」那輪為 True:非 backoff(沒用舊快取)且非 cache_hit(非 TTL
+    # 內快取命中)→ 全斷線/只命中快取的那一輪明確為 False(Codex 第 4/6 輪修正)。
+    loop = _function_source(ROOT / "src/main.py", "_update_clinic_lights_loop")
+    assert "self._reg64_fresh_this_cycle = _fresh_this_cycle" in loop
+    assert "not _bs_pk and not _ch_pk" in loop   # 預掃條件:非 backoff、非 cache_hit
+    # 且必須【在】排任何「錯誤診間隱藏」callback 之前就把本輪旗標設好(每輪明確覆寫 True/False),
+    # 否則 UI 執行緒可能搶在 worker 設旗標前跑隱藏判斷,連不上的診間排在前面時會每輪讀到舊值而
+    # 永遠藏不掉(Codex 第 5 輪 race);用每輪布林而非時間戳避免跨輪殘留(第 6 輪)。
+    assert (loop.index("self._reg64_fresh_this_cycle = _fresh_this_cycle")
+            < loop.index("update_single_clinic_ui_error"))
+    # 成功/有快取那輪(非 error)把連續錯誤計數歸零
+    cap = _function_source(ROOT / "src/main.py", "_capture_floating_status")
+    assert "self._floating_error_streak[room] = 0" in cap
+    # 門檻常數:連續次數 >= 2(留緩衝給暫時性連線異常)
+    main_src = (ROOT / "src/main.py").read_text(encoding="utf-8")
+    import re as _re
+    m = _re.search(r"FLOATING_ERROR_HIDE_STREAK\s*=\s*(\d+)", main_src)
+    assert m is not None and int(m.group(1)) >= 2
+
+
 def test_refresh_entrypoint_reroutes_to_tk_thread():
     for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "_trigger_refresh")
