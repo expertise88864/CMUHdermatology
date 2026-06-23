@@ -1827,10 +1827,13 @@ def _resolve_phototherapy_disposition(main_hwnd: int):
     (Codex 審查連續抓到的誤分流類別)。"""
     from cmuh_common.uvb_dose import (
         combine_phototherapy_kinds, detect_phototherapy_kind)
+    # [2026-06-23 user] 傳今天進去 → 日期早於 2 個月前的照光段落(極可能已暫停)分流時忽略,
+    # 避免「本月 UVB + 一年多前舊 excimer」被誤判成 ambiguous 而卡住 F2(實機:圖二)。
+    today = date.today()
     uvb_hwnd = exc_hwnd = 0
     kinds = []
     for hwnd, text in _collect_phototherapy_memos(main_hwnd):
-        k = detect_phototherapy_kind(text)
+        k = detect_phototherapy_kind(text, today)
         kinds.append(k)
         if k in ("uvb", "uvb_generic") and not uvb_hwnd:
             uvb_hwnd = hwnd   # 泛稱光療也記為 UVB 更新目標(只有泛稱時 combine 會收斂成 uvb)

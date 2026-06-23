@@ -27,6 +27,7 @@ F2/F3 熱鍵觸發時：
 """
 from __future__ import annotations
 
+import calendar
 import math
 import re
 from dataclasses import dataclass
@@ -242,9 +243,89 @@ _PT_EXCIMER_RE = re.compile(r"(?:excime|準分子)", re.IGNORECASE)
 _PT_GENERIC_RE = re.compile(r"(?:photo\s*therapy|光療)", re.IGNORECASE)
 # 劑量訊號(數字+mJ):用來分辨「泛稱光療」是治療醫令行(有劑量)還是病史/轉介語境(無劑量)
 _PT_DOSE_RE = re.compile(r"\d\s*mj", re.IGNORECASE)
+# 任一照光關鍵字(粗篩用,給「濾掉太舊的照光段落」逐行判斷哪些行算照光段落)
+_PHOTO_ANY_RE = re.compile(
+    r"(?:UVB|紫外線|\bUV\b|excime|準分子|photo\s*therapy|光療)", re.IGNORECASE)
+# 預設:照光段落日期早於「今天 - 此月數」→ 視為已暫停,分流時忽略該段落(使用者 2026-06-23)
+STALE_PHOTO_MONTHS = 2
 
 
-def detect_phototherapy_kind(text: str) -> str:
+def _months_before(d: date, months: int) -> date:
+    """d 往前推 months 個月(跨年自動處理,日數超過當月則夾到月底)。純函式。"""
+    total = d.year * 12 + (d.month - 1) - months
+    y, m = divmod(total, 12)
+    m += 1
+    last = calendar.monthrange(y, m)[1]
+    return date(y, m, min(d.day, last))
+
+
+def _real_dates_in(text: str) -> list:
+    """text 內所有【可解析且為合法日曆日】的日期(date 物件)。單一把尺,給 strip 判斷「日期是否全部
+    太舊」與 _line_has_undated_active_photo 判斷「段內有無日期」共用 —— 兩邊用同一定義才不會不一致而誤丟。
+    日期形狀但解析不出(_resolve_date_match 回 None)或壞月日(date() 丟 ValueError)一律不算數。"""
+    out = []
+    for dm in _UVB_DATE_RE.finditer(text):
+        ymd = _resolve_date_match(dm)
+        if ymd:
+            try:
+                out.append(date(*ymd))
+            except ValueError:
+                pass
+    return out
+
+
+def strip_stale_phototherapy_segments(text: str, today: date,
+                                      months: int = STALE_PHOTO_MONTHS) -> str:
+    """逐【行】判斷:一行【有照光關鍵字、有日期、且該行所有日期都早於 (today - months 個月)】→ 視為
+    該段照光已暫停,分流偵測時忽略整行(只供分流,【不】改處置原文)。只要該行有任一【近期】日期、或
+    【根本沒日期】(像初診/醫師沒寫)→ 保留;非照光行一律保留。
+
+    [為何用整行『所有日期都太舊』而不是更細的段落切割] 真實病歷一個治療寫一行(例:UVB 一行、
+    excimer 一行),這條規則對使用者實機(圖二:近期 UVB 行 + 一年多前 excimer 行,各自一行)完全正確,
+    且【絕不比現況更不安全】—— 有任一近期日期就整行保留、分類與現行完全相同;只有『整行日期全部太舊』
+    才忽略(該行確定是停掉的舊治療)。在同一行硬切治療段落會因日期/關鍵字/劑量位置千變萬化而誤切、
+    把還在做的治療誤丟或讓舊治療誤導身份別(Codex 連續四輪指出多種誤切方向),反而不安全,故不採用。"""
+    if not text or today is None:
+        return text or ""
+    cutoff = _months_before(today, months)
+    kept = []
+    for line in re.split(r"[\r\n]+", text):
+        if _PHOTO_ANY_RE.search(line):
+            line_dates = _real_dates_in(line)
+            # 整行照光、日期全部太舊、【且該行沒有「無日期卻有劑量」的 active 段】→ 已暫停 → 忽略。
+            # 最後那道護欄保證【絕不會比現況更不安全】:只要行內還有一段在做(有劑量、沒日期)的醫令,
+            # 就整行保留、分類沿用現行,不會把它連同舊段一起丟掉而誤分流(Codex 指出的同行 active+舊 混合)。
+            if (line_dates and all(d < cutoff for d in line_dates)
+                    and not _line_has_undated_active_photo(line)):
+                continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _line_has_undated_active_photo(line: str) -> bool:
+    """該行是否含『無日期』的照光治療段落 → 視為可能還在做(沒日期就無法判斷新舊),整行保留不丟。
+    以照光關鍵字切段(關鍵字到下一個關鍵字前),只要某段【段內無日期】→ True。
+
+    [最保守、與寫法完全無關 —— 可數學證明絕不比現況更不安全] 只要行內有任一段照光沒寫日期就保留整行,
+    保證『絕不誤丟沒日期/近期的在做治療』(否則身份別/51019 會分流錯誤)。逐一列舉醫令字眼/數值都必有
+    漏網(Codex 連續八輪舉出 510 mj、increase 30、max 800、continue 510、x2 week、BIW、TIW… 各種寫法),
+    故不靠內容判斷,只看『有沒有日期』。只有【每一段照光都有日期、且日期全部太舊】(像圖二單一舊 excimer
+    一段、日期一年多前)才會整行忽略。代價:複合名稱(如 'UVB phototherapy'、'準分子光療')因關鍵字被切出
+    無日期殘段而不被忽略 → 偏安全方向(沿用現行分類、不誤分流),非本次新引入的風險。"""
+    marks = [m.start() for m in _PHOTO_ANY_RE.finditer(line)]
+    for i, start in enumerate(marks):
+        end = marks[i + 1] if i + 1 < len(marks) else len(line)
+        seg = line[start:end]
+        # 用【可解析且為合法日期】判斷(_real_dates_in,與下方 strip 的 line_dates 完全同一把尺)——
+        # 避免「日期形狀但解析不出(補零超界 '0050/06/10')或壞月日('2024/13/40')」的字串被當成『有
+        # 日期』,反而把實質無日期的在做治療誤丟(Codex 第 10 輪 #5)。段內無合法日期 → 視為無日期 → 保留。
+        if not _real_dates_in(seg):
+            return True
+    return False
+
+
+def detect_phototherapy_kind(text: str, today: Optional[date] = None,
+                             stale_months: int = STALE_PHOTO_MONTHS) -> str:
     """判斷【單一欄位】屬於哪種照光,給 F2/F3 分流用。回傳:
 
       "uvb"          — 有 UVB-specific 訊號(UVB/紫外線/獨立 UV)→ 確定健保 UVB:
@@ -265,8 +346,13 @@ def detect_phototherapy_kind(text: str) -> str:
         (病史/轉介語境)才弱化成 "uvb_generic" 讓 excimer 涵蓋;若泛稱光療【帶劑量】
         (像 "phototherapy 500 mj/cm2" 的治療醫令行,可能是寫得不夠精確的健保 UVB)→ 仍回 "uvb",
         與別欄位 excimer 維持 ambiguous,避免把可能的健保 UVB 靜默分流成自費 excimer。
+
+    [2026-06-23] 傳入 today 時,先濾掉『日期早於 today - stale_months 個月』的照光行
+    (見 strip_stale_phototherapy_segments)—— 那段照光極可能已暫停,不該拿來判斷本次身份別。
     """
     t = text or ""
+    if today is not None:
+        t = strip_stale_phototherapy_segments(t, today, stale_months)
     if _PT_UVB_SPECIFIC_RE.search(t):
         return "uvb"
     if _PT_EXCIMER_RE.search(t):
@@ -337,11 +423,14 @@ def _resolve_date_match(date_m) -> Optional[tuple]:
         10-12: ROC concat       (\\d{3}\\d{2}\\d{2})         民國年 + 1911
     """
     g = date_m.groups()
+    is_ad = False
     # AD slashed (paren or bare)
     if g[0]:    # AD paren
         y, m, d = int(g[0]), int(g[1]), int(g[2])
+        is_ad = True
     elif g[3]:  # AD bare
         y, m, d = int(g[3]), int(g[4]), int(g[5])
+        is_ad = True
     elif g[6]:  # ROC paren slash (3-digit)
         roc_y = int(g[6])
         if not (60 <= roc_y <= 200):  # 民國 60-200 = AD 1971-2111
@@ -354,6 +443,14 @@ def _resolve_date_match(date_m) -> Optional[tuple]:
         y, m, d = roc_y + 1911, int(g[10]), int(g[11])
     else:
         return None
+    # [2026-06-23] 4 位數「西元年」< 1911 不是真實病歷的西元年:幾乎都是補零的民國年
+    # (例 '0115' = 民國 115 = 2026)。在民國合理範圍就換算成西元;否則視為無法解析(回 None,
+    # 呼叫端當『無日期』處理)→ 絕不把當前治療的日期誤判成上古而誤丟(Codex 第 9 輪指出)。
+    if is_ad and y < 1911:
+        if 60 <= y <= 200:
+            y += 1911
+        else:
+            return None
     return y, m, d
 
 
@@ -729,8 +826,12 @@ class UvbUpdateResult:
     uncertain_other_triplets: Optional[list] = None
 
 
-def _update_excimer_lines(text: str, today: date) -> tuple[str, int, Optional[dict]]:
-    """Update structured excimer lines independently from UVB lines."""
+def _update_excimer_lines(text: str, today: date,
+                          allow_undated: bool = False) -> tuple[str, int, Optional[dict]]:
+    """Update structured excimer lines independently from UVB lines.
+
+    allow_undated=True(只給【純自費 Excimer】路徑用):連沒有日期的 excimer 劑量行也加劑量並
+    補今天日期(圖一)。UVB 路徑的 Step D 用 False —— UVB visit 不應順手改沒日期的 excimer 行。"""
     lines = text.splitlines(keepends=True)
     updated = 0
     first_update: Optional[dict] = None
@@ -743,8 +844,43 @@ def _update_excimer_lines(text: str, today: date) -> tuple[str, int, Optional[di
         max_m = _UVB_MAX_RE.search(line, marker.end())
         dose_m = _EXCIMER_DOSE_RE.search(line, marker.end())
         inc_m = _UVB_INCREASE_RE.search(line, marker.end())
-        if (date_m is None or max_m is None or dose_m is None
-                or dose_m.start() > date_m.start()):
+        if max_m is None or dose_m is None:
+            continue
+
+        # [2026-06-23 user] excimer 行有 劑量+MAX+increase 但【沒有日期】(像初診/醫師沒寫日期,
+        # 例:"excimer 510 mj/cm2 increase 30 ... max 800")→ F2 仍要加劑量(否則看起來沒反應)。
+        # 作法:dose+increase(cap MAX)後,在劑量單位後補「on (今天)」把這行轉成可追蹤 ——
+        # 同日再按會因 days_diff=0 落到下方 TOO_CLOSE 而不重複加(安全),隔日才走正常 decay/加量。
+        if date_m is None:
+            if (not allow_undated or inc_m is None
+                    or dose_m.start() > max_m.start()):
+                continue
+            try:
+                dose = int(dose_m.group(1))
+                max_dose = int(max_m.group(1))
+                increase = int(inc_m.group(1) or inc_m.group(2))
+            except (TypeError, ValueError):
+                continue
+            if (dose < MIN_DOSE or max_dose < MIN_DOSE
+                    or not (0 < increase <= 200) or dose >= max_dose):
+                continue
+            new_dose = dose if _has_maintain_dose(line) else min(dose + increase, max_dose)
+            stamp = f" on ({_date_text(today)})"
+            seed_edits = [
+                (dose_m.span(1), str(new_dose)),
+                ((dose_m.end(), dose_m.end()), stamp),
+            ]
+            new_line = line
+            for (start, end), replacement in sorted(seed_edits, reverse=True):
+                new_line = new_line[:start] + replacement + new_line[end:]
+            lines[index] = new_line
+            updated += 1
+            if first_update is None:
+                first_update = {"dose": new_dose, "count": None,
+                                "last_date": None, "days_diff": None}
+            continue
+
+        if dose_m.start() > date_m.start():
             continue
 
         ymd = _resolve_date_match(date_m)
@@ -986,10 +1122,12 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
     parsed = parse_uvb_line(text)
     if parsed is None:
         # excimer / excimer light 本身也是照光，不要求同時出現 UVB。
-        if not re.search(r"(?:UVB|Phototherapy|\bUV\b)", text,
+        # [2026-06-23] 排除字串要含中文「紫外線」(UVB 的中文)—— 否則只寫紫外線的健保 UVB 欄位
+        # 會誤入此 excimer 分支、又因 allow_undated=True 去動到無日期的 excimer 行(Codex 指出)。
+        if not re.search(r"(?:UVB|紫外線|Phototherapy|\bUV\b)", text,
                          re.IGNORECASE):
             excimer_text, excimer_count, excimer_first = _update_excimer_lines(
-                text, today)
+                text, today, allow_undated=True)
             if excimer_count and excimer_first:
                 return UvbUpdateResult(
                     action=UvbAction.UPDATED,

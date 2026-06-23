@@ -22,6 +22,7 @@ from cmuh_common.uvb_dose import (  # noqa: E402
     format_uvb_line,
     parse_uvb_line,
     parse_uvb_partial,
+    strip_stale_phototherapy_segments,
     update_uvb_in_text,
 )
 
@@ -2394,6 +2395,208 @@ def test_combine_none_and_empty():
     assert combine_phototherapy_kinds(["none", "none"]) == "none"
     assert combine_phototherapy_kinds([]) == "none"
     assert combine_phototherapy_kinds(None) == "none"  # type: ignore[arg-type]
+
+
+# ─── [2026-06-23 user] 圖二:照光段落日期 > 2 個月前 → 分流忽略(極可能已暫停)──────
+
+def test_detect_ignores_stale_excimer_segment_same_field():
+    """[2026-06-23 user 圖二] 同一處置欄:本月 UVB(2026/6/21)+ 一年多前 excimer(2024/12/09)。
+    傳今天進去 → 舊 excimer 行被忽略 → 整欄判 'uvb'(健保),不被舊 excimer 拖成自費/歧義。"""
+    today = date(2026, 6, 23)
+    disp = ("局部 手+臉 UVB: 450 mj/cm2(9) on (2026/6/21) add 50 each time, fixed at 800, W4M\n"
+            "excimer light 890 mj/cm2 for upper lip (24) on (2024/12/09), add 50 each, fixed 950")
+    assert detect_phototherapy_kind(disp, today) == "uvb"
+    # 不傳 today(舊行為)→ UVB-specific 仍先命中 → uvb(同欄 UVB 本就贏);此處重點是不會誤判
+
+
+def test_stale_excimer_in_separate_field_no_longer_ambiguous():
+    """[2026-06-23 user 圖二] UVB 與 excimer 分屬不同欄位、且 excimer 是一年多前(已暫停):
+    傳今天 → 舊 excimer 欄被忽略成 none → combine 收斂成 'uvb',不再 ambiguous 卡住 F2。
+    對照:不傳 today(舊行為)仍 ambiguous,確認是『日期忽略』帶來的差異。"""
+    today = date(2026, 6, 23)
+    uvb_field = "UVB: 450 mj/cm2(9) on (2026/6/21) add 50 each time, fixed at 800"
+    exc_field = "excimer light 890 mj/cm2 for upper lip (24) on (2024/12/09), fixed at 950"
+    ks_new = [detect_phototherapy_kind(uvb_field, today),
+              detect_phototherapy_kind(exc_field, today)]
+    assert ks_new == ["uvb", "none"]
+    assert combine_phototherapy_kinds(ks_new) == "uvb"
+    ks_old = [detect_phototherapy_kind(uvb_field), detect_phototherapy_kind(exc_field)]
+    assert combine_phototherapy_kinds(ks_old) == "ambiguous"
+
+
+def test_recent_excimer_not_ignored():
+    """安全:近期(2 個月內)的 excimer 不可被忽略 —— 仍是自費 excimer,身份要走 01。"""
+    today = date(2026, 6, 23)
+    assert detect_phototherapy_kind(
+        "excimer 700 mj/cm2 (5) on (2026/6/10) increase 30 max 950", today) == "pure_excimer"
+    # 邊界:剛好 2 個月前(非『早於』)仍保留
+    assert detect_phototherapy_kind(
+        "excimer 700 mj/cm2 (5) on (2026/4/23) increase 30 max 950", today) == "pure_excimer"
+
+
+def test_stale_strip_uses_all_dates_not_first_date():
+    """[Codex r1 安全] 不可用『整行第一個日期』一刀切 —— 一行有任一近期日期就整行保留,只有『該行
+    日期全部都太舊』才忽略。否則同一行的「舊註記日期 + 本月真正在做的照光」會被舊日期誤丟、害分流錯誤。"""
+    today = date(2026, 6, 23)
+    # 舊註記日期在前 + 本月 UVB(同一行)→ 有近期日期 → 整行保留 → uvb(不可被前面舊日期丟掉)
+    assert detect_phototherapy_kind(
+        "old note on (2024/12/09); UVB 450 mj/cm2 on (2026/6/21) max 800", today) == "uvb"
+    assert detect_phototherapy_kind(
+        "old note on (2024/12/09); excimer 700 mj/cm2 on (2026/6/10) max 950", today) == "pure_excimer"
+    # 同行有舊+近期兩個日期 → 保留(任一近期就不丟)
+    assert detect_phototherapy_kind(
+        "excimer 700 on (2024/12/09) re-start on (2026/6/10) max 950", today) == "pure_excimer"
+
+
+def test_zero_padded_roc_date_not_parsed_as_ancient_ad():
+    """[Codex r9 安全] 補零的 4 位數民國年(例 '0115' = 民國 115 = 2026)不可被當成西元 115 年(上古)
+    而把當前在做的治療誤判成太舊、誤丟。< 1911 的 4 位數年:在民國範圍就換算,否則回 None(無日期)。"""
+    today = date(2026, 6, 23)
+    # 當前(民國 115 = 2026)的 excimer 不可被誤丟
+    assert detect_phototherapy_kind("excimer 700 mj/cm2 on (0115/06/10) max 950", today) == "pure_excimer"
+    # 真正舊的(民國 113 = 2024)單一 excimer → 仍可正確忽略
+    assert detect_phototherapy_kind("excimer 700 mj/cm2 on (0113/10/09) max 950", today) == "none"
+    # 正常西元 4 位數不受影響
+    assert detect_phototherapy_kind("excimer 700 mj/cm2 on (2026/06/10) max 950", today) == "pure_excimer"
+
+
+def test_unparseable_or_invalid_date_counts_as_undated_not_dropped():
+    """[Codex r10] 護欄與 strip 對『有無日期』要用同一把尺(_real_dates_in:可解析且為合法日曆日)。
+    日期形狀但解析不出(補零超界 '0050/06/10')或壞月日('2024/13/40')→ 一律當『無日期』→ 該在做的
+    治療絕不被同行的舊日期一起誤丟。"""
+    today = date(2026, 6, 23)
+    assert detect_phototherapy_kind(
+        "old excimer on (2024/12/09); excimer 700 mj/cm2 on (0050/06/10) max 950", today) == "pure_excimer"
+    assert detect_phototherapy_kind(
+        "old excimer on (2024/12/09); excimer 700 mj/cm2 on (2024/13/40) max 950", today) == "pure_excimer"
+
+
+def test_stale_strip_drops_clean_single_stale_treatment():
+    """『單一照光關鍵字、該段有日期、且日期全部太舊』→ 忽略。這就是使用者實機(圖二)的型態:
+    excimer 一段、日期一年多前。只有「每一段照光都有日期且都太舊」才忽略(見 _line_has_undated_active_photo)。"""
+    today = date(2026, 6, 23)
+    # 圖二型:單一 excimer 關鍵字、該段有舊日期 → 丟
+    assert detect_phototherapy_kind(
+        "excimer light 890 mj/cm2 (24) on (2024/12/09) fixed at 950", today) == "none"
+    assert detect_phototherapy_kind(
+        "UVB 450 mj/cm2 (9) on (2024/12/09) increase 30 max 800", today) == "none"
+    # 對照:無日期的泛稱光療(轉介語境)→ 不丟 → uvb_generic
+    assert detect_phototherapy_kind("refer for phototherapy", today) == "uvb_generic"
+
+
+def test_stale_strip_never_drops_undated_active_order():
+    """[Codex 安全護欄,可數學證明] 行內只要有『無日期』的照光段(不論寫法/有無數值),即使同行
+    另有太舊日期,也【絕不】整行丟掉 → 保證絕不誤丟在做的治療、絕不比現況更不安全。
+    只有【每一段照光都有日期且全部太舊】才忽略。"""
+    today = date(2026, 6, 23)
+    # 舊 excimer 註記(有日期)+ 在做的 undated excimer 醫令 → 保留 → pure_excimer
+    assert detect_phototherapy_kind(
+        "old excimer on (2024/12/09); excimer 510 mj/cm2 increase 30 max 800", today) == "pure_excimer"
+    # 與在做的 UVB 欄一起 combine → 仍 ambiguous(沿用現行的安全中止,不會誤把自費 excimer 走 51019)
+    assert combine_phototherapy_kinds([
+        detect_phototherapy_kind("UVB 450 mj/cm2 on (2026/6/21) max 800", today),
+        detect_phototherapy_kind(
+            "old excimer on (2024/12/09); excimer 510 mj/cm2 increase 30 max 800", today),
+    ]) == "ambiguous"
+    # 各種寫法的無日期醫令一律保留(與字眼/有無數值無關):沒單位、continue/keep、頻率縮寫 BIW/TIW…
+    for active in (
+        "old excimer on (2024/12/09); excimer 510 increase 30 max 800",   # 沒寫 mj
+        "old excimer on (2024/12/09); excimer continue 510 x2/week",      # continue + 頻率
+        "old excimer on (2024/12/09); excimer keep 510",                  # keep
+        "old excimer on (2024/12/09); excimer BIW",                       # 頻率縮寫、無數值(Codex r8)
+    ):
+        assert detect_phototherapy_kind(active, today) != "none", active
+    # 日期寫在關鍵字前(該治療段內無日期)→ 護欄保留 → 沿用現行(never-worse)
+    assert detect_phototherapy_kind("(2024/12/09) UVB 450 mj/cm2 max 800", today) == "uvb"
+    # 複合名稱(關鍵字被切出無日期殘段,如 'UVB phototherapy')→ 保留、沿用現行分類(never-worse,
+    # 偏安全;非本次新引入的風險)。不會被忽略,但也絕不誤丟在做的治療。
+    assert detect_phototherapy_kind(
+        "UVB phototherapy 450 mj/cm2 on (2024/12/09) max 800", today) == "uvb"
+    assert detect_phototherapy_kind("準分子光療 700 mj/cm2 on (2024/12/09)", today) == "pure_excimer"
+
+
+def test_stale_strip_same_line_mixed_falls_back_safely():
+    """同一行混【舊+近期】不同治療(罕見;真實病歷一治療一行):有任一近期日期 → 整行保留 → 沿用
+    現行分類(UVB-specific 仍贏)—— 【與加這功能前完全相同,不會更不安全】。整行全舊才忽略。"""
+    today = date(2026, 6, 23)
+    assert detect_phototherapy_kind(
+        "UVB note on (2024/12/09); excimer 700 mj/cm2 on (2026/6/10) max 950", today) == "uvb"
+    assert detect_phototherapy_kind(
+        "UVB 450 mj/cm2 on (2026/6/21); excimer 700 mj/cm2 on (2024/12/09)", today) == "uvb"
+
+
+def test_strip_stale_keeps_undated_and_recent_photo_lines():
+    """strip 只丟『有照光關鍵字 + 日期早於 cutoff』的整行;無日期照光行、近期照光行、
+    非照光行一律保留。"""
+    today = date(2026, 6, 23)
+    text = ("excimer 510 mj/cm2 increase 30 max 800\n"          # 無日期 → 保留
+            "UVB 450 mj/cm2 (9) on (2026/6/21) max 800\n"        # 近期 → 保留
+            "excimer 900 (24) on (2024/12/09) max 950\n"         # 太舊 → 丟
+            "skin lesion on right neck")                          # 非照光 → 保留
+    out = strip_stale_phototherapy_segments(text, today)
+    assert "excimer 510" in out
+    assert "2026/6/21" in out
+    assert "2024/12/09" not in out
+    assert "skin lesion" in out
+
+
+# ─── [2026-06-23 user] 圖一:純 excimer 處置行無日期/次數 → F2 仍要加劑量 ──────────
+
+def test_excimer_no_date_line_bumps_dose_and_stamps_today():
+    """[2026-06-23 user 圖一] 'excimer 510 mj/cm2 increase 30 until turns reddish max 800'
+    沒有日期/次數,F2 仍要把劑量 +increase(510→540,cap MAX)並補今天日期 → 醫師看得到反應。"""
+    today = date(2026, 6, 23)
+    r = update_uvb_in_text(
+        "excimer 510 mj/cm2 increase 30 until turns reddish max 800", today=today)
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 540
+    assert r.new_text is not None
+    assert "excimer 540 mj/cm2" in r.new_text
+    assert "on (2026/06/23)" in r.new_text   # 補今天日期 → 轉成可追蹤
+
+
+def test_excimer_no_date_caps_at_max():
+    """加劑量不可超過 MAX:790 + 30 → cap 800(=MAX);已達 MAX(800)→ 不動(no_uvb_line)。"""
+    today = date(2026, 6, 23)
+    r = update_uvb_in_text("excimer 790 mj/cm2 increase 30 max 800", today=today)
+    assert r.action == UvbAction.UPDATED and r.new_dose == 800
+    r2 = update_uvb_in_text("excimer 800 mj/cm2 increase 30 max 800", today=today)
+    assert r2.action != UvbAction.UPDATED   # 已達上限 → 不再加
+
+
+def test_excimer_no_date_same_day_repress_does_not_double_bump():
+    """安全:補上今天日期後,同一天再按 F2 → 日期=今天 days_diff=0 → 落 TOO_CLOSE 不重複加劑量。"""
+    today = date(2026, 6, 23)
+    first = update_uvb_in_text(
+        "excimer 510 mj/cm2 increase 30 max 800", today=today)
+    assert first.action == UvbAction.UPDATED and first.new_text is not None
+    second = update_uvb_in_text(first.new_text, today=today)
+    assert second.action != UvbAction.UPDATED   # 不會 510→540→570
+    assert "540" in (second.new_text or first.new_text)
+
+
+def test_chinese_uvb_field_does_not_mutate_undated_excimer():
+    """[Codex r5 安全] 只寫中文「紫外線」(UVB)的健保欄位,不可誤入 excimer 分支去動到無日期的
+    excimer 行(allow_undated)。排除字串要含『紫外線』,否則中文 UVB 會繞過英文 UVB 判斷。"""
+    today = date(2026, 6, 23)
+    text = ("紫外線 450 mj/cm2 on (2026/6/10) max 800\n"
+            "excimer 510 mj/cm2 increase 30 max 800")
+    r = update_uvb_in_text(text, today=today)
+    # 無日期 excimer 行原封不動(沒被加劑量/補日期)
+    assert "excimer 510 mj/cm2 increase 30 max 800" in (r.new_text or text)
+
+
+def test_uvb_path_does_not_bump_undated_excimer_line():
+    """安全 gate:無日期 excimer 加劑量【只】在純自費 Excimer 路徑(allow_undated)生效;
+    有 UVB 的處置走 UVB 路徑(Step D)時,不可順手把沒日期的 excimer 行加劑量/補日期。"""
+    today = date(2026, 6, 23)
+    text = ("UVB 500 mj/cm2 (5) on (2026/6/16) increase 30 max 1000\n"
+            "excimer 800 mj/cm2 increase 30 max 1000")
+    r = update_uvb_in_text(text, today=today)
+    assert r.action == UvbAction.UPDATED and r.new_text is not None
+    assert "UVB 500 mj/cm2 (6)" in r.new_text   # UVB 行正常更新(7 天保持劑量、count+1)
+    # 無日期 excimer 行原封不動:劑量沒加(仍 800)、劑量單位後沒被插入「on (today)」
+    assert "excimer 800 mj/cm2 increase 30 max 1000" in r.new_text
 
 
 # ─── [2026-06-19] 實機:UVB 行有「其他欄位的日期」混入,不可誤判 ──────────────
