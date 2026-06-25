@@ -325,30 +325,39 @@ def test_load_config_times_non_list_falls_back(tmp_path, monkeypatch):
 
 # ─── _rebuild_schedule 排程建立 ──────────────────────────────────────────
 
-def test_rebuild_schedule_creates_jobs_for_valid_times(monkeypatch):
-    cfg = _base_cfg(enabled=True, weekday_times=["12:30"], weekend_times=["08:00"])
+def test_rebuild_schedule_creates_single_poll_job(monkeypatch):
+    """[2026-06-25] 改為每 N 分鐘輪詢:排程只建立 1 個 poll job(取代舊的逐時刻×天數)。"""
+    cfg = _base_cfg(enabled=True, poll_interval_minutes=15)
     monkeypatch.setattr(cq, "load_config", lambda: cfg)
     cq._rebuild_schedule()
     try:
-        # 平日 5 天 × 1 時刻 + 假日 2 天 × 1 時刻 = 7 jobs
-        assert len(cq.schedule.get_jobs()) == 7
+        jobs = cq.schedule.get_jobs()
+        assert len(jobs) == 1
+        assert jobs[0].interval == 15 and jobs[0].unit == "minutes"
     finally:
         cq.schedule.clear()
 
 
-def test_rebuild_schedule_bad_time_format_no_raise(monkeypatch):
-    """壞時間格式(缺冒號)不可炸掉排程器:記 error、該時刻不排。"""
-    cfg = _base_cfg(enabled=True, weekday_times=["banana"], weekend_times=[])
-    monkeypatch.setattr(cq, "load_config", lambda: cfg)
+def test_rebuild_schedule_clamps_interval(monkeypatch):
+    """間隔夾在 5~120 分鐘;壞值退回預設 15,不可炸掉排程器。"""
+    monkeypatch.setattr(cq, "load_config", lambda: _base_cfg(enabled=True, poll_interval_minutes=1))
+    cq._rebuild_schedule()
+    assert cq.schedule.get_jobs()[0].interval == 5      # 夾到下限
+    cq.schedule.clear()
+    monkeypatch.setattr(cq, "load_config", lambda: _base_cfg(enabled=True, poll_interval_minutes=999))
+    cq._rebuild_schedule()
+    assert cq.schedule.get_jobs()[0].interval == 120     # 夾到上限
+    cq.schedule.clear()
+    monkeypatch.setattr(cq, "load_config", lambda: _base_cfg(enabled=True, poll_interval_minutes="bad"))
     cq._rebuild_schedule()  # 不可 raise
     try:
-        assert len(cq.schedule.get_jobs()) == 0
+        assert cq.schedule.get_jobs()[0].interval == 15  # 壞值→預設
     finally:
         cq.schedule.clear()
 
 
 def test_rebuild_schedule_disabled_clears_jobs(monkeypatch):
-    cfg = _base_cfg(enabled=False, weekday_times=["12:30"])
+    cfg = _base_cfg(enabled=False, poll_interval_minutes=15)
     monkeypatch.setattr(cq, "load_config", lambda: cfg)
     cq._rebuild_schedule()
     try:
@@ -768,3 +777,122 @@ def test_normalize_retry_count_bounds():
     assert cq._normalize_retry_count(999) == cq.MAX_RETRY_COUNT
     assert cq._normalize_retry_count(None) == cq.DEFAULT_CONFIG["retry_count"]
     assert cq._normalize_retry_count("bad") == cq.DEFAULT_CONFIG["retry_count"]
+
+
+# ─── [2026-06-25] poll 輪詢:新會診才寄 + 半夜休息 ─────────────────────────────
+import types as _types  # noqa: E402
+from datetime import datetime as _DT  # noqa: E402
+
+
+def _poll_harness(monkeypatch, cfg, extracted_text, notified=None, now=None):
+    """在 _JobHarness 之上再 stub _load_notified/_save_notified(記憶體)與 datetime.now。"""
+    h = _JobHarness(monkeypatch, cfg, extracted_text=extracted_text)
+    store = {"charts": set(notified or set())}
+    monkeypatch.setattr(cq, "_load_notified", lambda: set(store["charts"]))
+    monkeypatch.setattr(cq, "_save_notified", lambda c: store.__setitem__("charts", set(c)))
+    if now is not None:
+        monkeypatch.setattr(cq, "datetime", _types.SimpleNamespace(now=lambda: now))
+    return h, store
+
+
+_TXT_1 = "會診清單(1 位):\n1. 王小明C16(18A)1234567(沈冠宇)06/25(09:00)"
+
+
+def test_poll_sends_only_on_new_chart(monkeypatch):
+    """poll:清單出現新病歷號 → 寄信,且把目前清單病歷號設為已通知基準。"""
+    cfg = _base_cfg(quiet_start_hour=0, quiet_end_hour=6)
+    h, store = _poll_harness(monkeypatch, cfg, _TXT_1, notified=set(), now=_DT(2026, 6, 25, 9, 0))
+    cq._do_full_job("poll")
+    assert len(h.sent) == 1
+    assert store["charts"] == {"1234567"}
+
+
+def test_poll_no_send_when_all_known(monkeypatch):
+    """poll:清單病歷號都已通知過 → 有讀但不寄(不重複)。"""
+    cfg = _base_cfg(quiet_start_hour=0, quiet_end_hour=6)
+    h, store = _poll_harness(monkeypatch, cfg, _TXT_1, notified={"1234567"}, now=_DT(2026, 6, 25, 9, 0))
+    cq._do_full_job("poll")
+    assert h.sent == []
+    assert h.flow_runs == 1   # 有開 systemftp 讀(才知道沒新的)
+
+
+def test_poll_quiet_hours_skips_entirely(monkeypatch):
+    """poll:00:00-06:00 休息 → 連 systemftp 都不開、不寄、基準不動。"""
+    cfg = _base_cfg(quiet_start_hour=0, quiet_end_hour=6)
+    txt = "會診清單(1 位):\n1. 夜間病人B7(5)9999999(許致榮)06/25(02:00)"
+    h, store = _poll_harness(monkeypatch, cfg, txt, notified=set(), now=_DT(2026, 6, 25, 2, 0))
+    cq._do_full_job("poll")
+    assert h.sent == [] and h.flow_runs == 0
+    assert store["charts"] == set()
+
+
+def test_poll_overnight_then_six_am_補寄(monkeypatch):
+    """過夜新增:02:30 休息不寄(基準不動);06:00 那輪偵測到新病歷號 → 一次補寄。"""
+    cfg = _base_cfg(quiet_start_hour=0, quiet_end_hour=6)
+    txt = "會診清單(1 位):\n1. 夜間病人B7(5)8888888(許致榮)06/25(02:30)"
+    h, store = _poll_harness(monkeypatch, cfg, txt, notified=set(), now=_DT(2026, 6, 25, 2, 30))
+    cq._do_full_job("poll")
+    assert h.sent == [] and store["charts"] == set()
+    monkeypatch.setattr(cq, "datetime", _types.SimpleNamespace(now=lambda: _DT(2026, 6, 25, 6, 0)))
+    cq._do_full_job("poll")
+    assert len(h.sent) == 1
+    assert store["charts"] == {"8888888"}
+
+
+def test_email_trigger_unconditional_despite_known(monkeypatch):
+    """email/手動觸發不受 poll 的新偵測/休息限制:即使病歷號都已通知過、即使半夜,也照常寄。"""
+    cfg = _base_cfg(quiet_start_hour=0, quiet_end_hour=6)
+    h, store = _poll_harness(monkeypatch, cfg, _TXT_1, notified={"1234567"}, now=_DT(2026, 6, 25, 2, 0))
+    cq._do_full_job("email", override_recipients=["dr@x.tw"])
+    assert len(h.sent) == 1
+
+
+def test_save_notified_memory_survives_file_write_failure(monkeypatch, tmp_path):
+    """[Codex] 寫檔失敗時,記憶體基準仍更新 → 下次 _load_notified 不把同一批當新會診(不會狂寄)。"""
+    monkeypatch.setattr(cq, "_NOTIFIED_FILE", tmp_path / "notified.json")
+    monkeypatch.setattr(cq, "_notified_memory", None, raising=False)
+
+    def _boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(cq, "atomic_write_json", _boom)
+    try:
+        cq._save_notified({"111111", "222222"})        # 寫檔失敗(被吞),但記憶體更新
+        assert cq._load_notified() == {"111111", "222222"}  # 不會重置 → 不重寄
+    finally:
+        cq._notified_memory = None   # 還原,避免影響其他測試
+
+
+def test_email_trigger_does_not_consume_poll_baseline(monkeypatch):
+    """[Codex r2] email 觸發寄給觸發醫師本人 → 不可更新 poll 基準,否則團隊那輪 poll 會漏寄。"""
+    cfg = _base_cfg(quiet_start_hour=0, quiet_end_hour=6)
+    txt = "會診清單(1 位):\n1. 新病人C16(18A)7654321(沈冠宇)06/25(09:00)"
+    h, store = _poll_harness(monkeypatch, cfg, txt, notified=set(), now=_DT(2026, 6, 25, 9, 0))
+    cq._do_full_job("email", override_recipients=["dr@x.tw"])   # 寄給醫師本人
+    assert store["charts"] == set()                              # 基準【沒】被 email 觸發更新
+    cq._do_full_job("poll")                                      # poll 仍偵測到新會診 → 寄團隊
+    assert len(h.sent) == 2                                      # email 1 + poll 1
+    assert store["charts"] == {"7654321"}                        # poll 才更新基準
+
+
+def test_manual_trigger_updates_baseline(monkeypatch):
+    """手動觸發寄給一般名單 → 更新基準,避免緊接的 poll 重複寄同一批給團隊。"""
+    cfg = _base_cfg(quiet_start_hour=0, quiet_end_hour=6)
+    h, store = _poll_harness(monkeypatch, cfg, _TXT_1, notified=set(), now=_DT(2026, 6, 25, 9, 0))
+    cq._do_full_job("手動")
+    assert store["charts"] == {"1234567"}    # 手動(一般名單)有更新基準
+    cq._do_full_job("poll")
+    assert len(h.sent) == 1                   # poll 看到都已通知 → 不重複寄
+
+
+def test_load_config_normalizes_bad_poll_quiet(monkeypatch, tmp_path):
+    """[Codex r2] 壞的 poll_interval / quiet hour(None/超界/字串)→ load_config 正規化成合法值,
+    不讓 _rebuild_schedule / poll 休息判斷的 int() 炸掉。"""
+    import json
+    f = tmp_path / "cfg.json"
+    f.write_text(json.dumps({"poll_interval_minutes": None,
+                             "quiet_start_hour": "x", "quiet_end_hour": 999}), encoding="utf-8")
+    monkeypatch.setattr(cq, "CONFIG_FILE", f)
+    cfg = cq.load_config()
+    assert cfg["poll_interval_minutes"] == 15        # None → 預設
+    assert cfg["quiet_start_hour"] == 0              # "x" → 預設 0
+    assert cfg["quiet_end_hour"] == 23               # 999 → 夾到 23

@@ -8,7 +8,8 @@
   4. 用 Win32 選單命令直接跳到「病人清單及交班 → 會診清單 → 我的會診清單」
   5. 擷取「會診通知單回覆」視窗畫面
   6. 透過 Outlook 寄出截圖給設定的收件人
-  7. 每日於設定時間（預設 12:00 / 17:00）自動執行
+  7. 每 N 分鐘（預設 15）輪詢會診清單，只在出現「新病歷號」時才寄信（信內含目前全部
+     未回覆清單）；00:00–06:00 休息不輪詢/不寄，過夜新增的由休息結束後第一輪一次補寄
 
 【解析度無關設計】
   全程不使用任何寫死的螢幕座標。所有控制項都在執行當下用 Win32 API
@@ -152,8 +153,14 @@ DEFAULT_CONFIG = {
     # [2026-06-16] 每天 12:40 + 17:10 都跑（不分平假日）。打卡系統於 7:31/12:31/17:01
     # 才登入打卡，故延後到 12:40 / 17:10 再查詢寄信，確保中午(12:31)上班與下午(17:01)
     # 下班打卡都「已完成並寫入紀錄」後才查，不會還沒打卡就先寄出誤判未打卡。
-    "weekday_times": ["12:40", "17:10"],   # 週一～週五
-    "weekend_times": ["12:40", "17:10"],   # 週六、週日（與平日相同）
+    "weekday_times": ["12:40", "17:10"],   # 週一～週五（已停用,改為 poll_interval_minutes 輪詢）
+    "weekend_times": ["12:40", "17:10"],   # 週六、週日（已停用,同上）
+    # [2026-06-25] 即時偵測:每 N 分鐘輪詢「我的會診清單」,只在出現「新病歷號」時才寄信
+    # (信內含目前全部未回覆清單)。已取代固定時間排程(12:40/17:10)。
+    "poll_interval_minutes": 15,
+    # 半夜休息時段 [start, end):此區間不輪詢、不寄信;過夜新增的會診由 end 之後第一輪一次補寄。
+    "quiet_start_hour": 0,
+    "quiet_end_hour": 6,
     "subject_template": "{date} {time} 皮膚科會診通知單",
     "body_template": "附件為 {date} {time} 皮膚科會診通知單截圖，由系統自動擷取寄送。",
     # [2026-06-15] 信件併入「今日打卡狀態」(autoclock 各帳號 上/下班)。關掉就不查不附。
@@ -331,6 +338,18 @@ def load_config() -> dict:
         except (TypeError, ValueError):
             cfg["email_trigger_poll_seconds"] = \
                 DEFAULT_CONFIG["email_trigger_poll_seconds"]
+        # [2026-06-25] 輪詢/休息時段數值防呆:None/壞值/超界 → 退回預設並夾範圍,
+        # 避免後續 _rebuild_schedule / poll 休息判斷的 int() 直接炸掉(Codex 指出)。
+        try:
+            cfg["poll_interval_minutes"] = max(
+                5, min(120, int(cfg.get("poll_interval_minutes", 15))))
+        except (TypeError, ValueError):
+            cfg["poll_interval_minutes"] = DEFAULT_CONFIG["poll_interval_minutes"]
+        for _qk in ("quiet_start_hour", "quiet_end_hour"):
+            try:
+                cfg[_qk] = max(0, min(23, int(cfg.get(_qk, DEFAULT_CONFIG[_qk]))))
+            except (TypeError, ValueError):
+                cfg[_qk] = DEFAULT_CONFIG[_qk]
         return cfg
 
 
@@ -341,6 +360,69 @@ def save_config(cfg: dict) -> None:
             logging.info("設定已儲存")
         except Exception:
             logging.error("儲存設定檔失敗", exc_info=True)
+
+
+# =============================================================================
+# [2026-06-25] 會診即時偵測:每 N 分鐘輪詢「我的會診清單」,只在出現「新病歷號」時才寄信
+# (信內含目前全部未回覆清單)。已通知過的病歷號集合持久化 → 跨重啟、跨多輪不重複寄。
+# =============================================================================
+_NOTIFIED_FILE = SETTINGS_DIR / "consult_notified.json"
+_CHART_RE = re.compile(r"\d{6,}")  # 病歷號:6+ 連續數字(會診清單列裡的識別碼)
+
+
+def _consult_signature(extracted_text: str) -> set:
+    """從擷取的會診清單文字抓所有病歷號(6+ 位數字)當「目前未回覆會診」識別集合。純函式。
+    病歷號穩定且必出現在病人清單列;以集合比對 → 新增的病歷號 = 新會診。"""
+    return set(_CHART_RE.findall(extracted_text or ""))
+
+
+# 行程內的權威基準:即使檔案寫入失敗(磁碟滿/權限),記憶體仍記得已通知過誰 → 下一輪 poll 不會
+# 重寄同一批(Codex 指出:只靠檔案、寫失敗會每 15 分鐘狂寄)。檔案只負責「跨重啟」記憶;單一
+# job 互斥(_consult_job_gate)→ 同時只有一個 _do_full_job 在跑,無並發競爭。None = 本行程尚未載入。
+_notified_memory = None
+
+
+def _load_notified() -> set:
+    """讀「已通知過的病歷號」基準。行程內已有記憶體值就用它(權威,不受檔案寫入失敗影響);
+    否則(剛啟動)從 SETTINGS_DIR/consult_notified.json 載入。失敗回空集合。"""
+    global _notified_memory
+    if _notified_memory is not None:
+        return set(_notified_memory)
+    try:
+        data = safe_load_json(str(_NOTIFIED_FILE), default={})
+        if isinstance(data, dict):
+            _notified_memory = {str(x) for x in (data.get("charts") or [])}
+            return set(_notified_memory)
+    except Exception:
+        logging.debug("讀取 consult_notified 失敗", exc_info=True)
+    _notified_memory = set()
+    return set()
+
+
+def _save_notified(charts: set) -> None:
+    """把「目前清單的病歷號」設為已通知基準(寄信成功後呼叫;poll/email/手動皆更新)。
+    【先更新記憶體(權威)再寫檔】→ 即使寫檔失敗,本行程後續 poll 也絕不重寄同一批;檔案僅供跨重啟。"""
+    global _notified_memory
+    _notified_memory = set(charts)
+    try:
+        atomic_write_json(str(_NOTIFIED_FILE), {"charts": sorted(charts)})
+    except Exception:
+        logging.warning("寫入 consult_notified 失敗(記憶體已記住,本行程不會重寄)", exc_info=True)
+
+
+def _in_quiet_hours(now: datetime, cfg: dict) -> bool:
+    """是否在「半夜休息」時段(預設 [0,6):00:00-06:00 不輪詢/不寄信)。純函式。"""
+    try:
+        start = int(cfg.get("quiet_start_hour", 0))
+        end = int(cfg.get("quiet_end_hour", 6))
+    except (TypeError, ValueError):
+        start, end = 0, 6
+    h = now.hour
+    if start == end:
+        return False
+    if start < end:
+        return start <= h < end
+    return h >= start or h < end   # 容錯:若設定跨午夜(start>end)
 
 
 # =============================================================================
@@ -2119,6 +2201,13 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                               trigger_label)
                 return
         now = datetime.now()
+        # [2026-06-25] 輪詢 poll:00:00-06:00 休息時段 → 直接不開 systemftp、不寄
+        # (過夜新增的會診由休息結束後第一輪 poll 的「新病歷號」比對一次補寄)。
+        if trigger_label == "poll" and _in_quiet_hours(now, cfg):
+            logging.info("[poll] 休息時段(%02d:00-%02d:00),本次不輪詢/不寄信",
+                         int(cfg.get("quiet_start_hour", 0)),
+                         int(cfg.get("quiet_end_hour", 6)))
+            return
         date_str = f"{now.year}/{now.month}/{now.day}"
         time_str = (trigger_label.replace(":", "")
                     if trigger_label and ":" in trigger_label
@@ -2160,6 +2249,17 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                              recipients_label, mail_method)
                 shot, extracted_text, extracted_html = run_consult_flow(
                     trigger_label)
+                # [2026-06-25] 輪詢 poll:只在「出現新病歷號」時才寄;否則靜默結束
+                # (不寄、不更新基準 → 下一輪仍會再比對)。email/手動觸發不受此限,照常無條件寄。
+                if trigger_label == "poll":
+                    _poll_sig = _consult_signature(extracted_text)
+                    _new = _poll_sig - _load_notified()
+                    if not _new:
+                        logging.info("[poll] 目前 %d 筆會診都已通知過,無新會診 → 不寄信",
+                                     len(_poll_sig))
+                        return
+                    logging.info("[poll] 偵測到 %d 筆新會診 → 寄出目前全部未回覆清單",
+                                 len(_new))
                 # [2026-06-17] 今日打卡狀態:排程(12:40/17:10)與手動觸發都查/附;
                 # 只有 email(皮膚科會診觸發)省略,連打卡 portal 都不登入,直接查會診。
                 # [新功能 2026-06-15] 查詢本身完全 fail-open:查不到只回空字串。
@@ -2185,6 +2285,15 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                     send_via_outlook(shot, subject, final_body, recipients,
                                       sender_account=sender,
                                       html_body=final_html)
+                # [2026-06-25] 寄出成功 → 更新「已通知病歷號」基準,下一輪 poll 不再重複寄同一批。
+                # 【只在寄給一般收件人時更新】(poll / 手動):email 觸發是寄給「觸發醫師本人」、
+                # 不是團隊一般名單,若也更新基準會害下一輪 poll 看不到這筆新會診而漏寄給團隊
+                # (Codex 指出)。override_recipients 只在 email 觸發時有值 → 用 label 判斷即可。
+                if trigger_label != "email":
+                    try:
+                        _save_notified(_consult_signature(extracted_text))
+                    except Exception:
+                        logging.debug("更新 consult_notified 失敗", exc_info=True)
                 logging.info("會診查詢任務成功（第 %d 次嘗試）", attempt)
                 return  # 成功就跳出
             except Exception as e:
@@ -2346,26 +2455,17 @@ def _rebuild_schedule() -> None:
     if not cfg.get("enabled", True):
         logging.info("排程目前為停用狀態")
         return
-    weekday_days = ("monday", "tuesday", "wednesday", "thursday", "friday")
-    weekend_days = ("saturday", "sunday")
-
-    def _add(days: tuple, times: list, label: str) -> None:
-        for t in times:
-            t = str(t).strip()
-            ok = True
-            for d in days:
-                try:
-                    getattr(schedule.every(), d).at(t).do(
-                        trigger_job_async, trigger_label=t)
-                except Exception:
-                    logging.error("排程時間格式錯誤：%r（需 HH:MM）", t)
-                    ok = False
-                    break
-            if ok:
-                logging.info("已排程%s %s 自動執行", label, t)
-
-    _add(weekday_days, cfg["weekday_times"], "平日(一～五)")
-    _add(weekend_days, cfg["weekend_times"], "假日(六、日)")
+    # [2026-06-25] 改為「每 N 分鐘輪詢會診清單」取代固定 12:40/17:10 排程。是否真的寄信由
+    # _do_full_job 的 poll 邏輯決定:只有出現「新病歷號」才寄、且 00:00-06:00 休息不輪詢/不寄。
+    try:
+        interval = int(cfg.get("poll_interval_minutes", 15))
+    except (TypeError, ValueError):
+        interval = 15
+    interval = max(5, min(120, interval))   # 夾在 5-120 分鐘,避免太密集打爆 systemftp/院方系統
+    schedule.every(interval).minutes.do(trigger_job_async, trigger_label="poll")
+    logging.info(
+        "已排程每 %d 分鐘輪詢會診清單(有新會診才寄信;%02d:00-%02d:00 休息)",
+        interval, int(cfg.get("quiet_start_hour", 0)), int(cfg.get("quiet_end_hour", 6)))
 
 
 def _empty_imap_result(err: str) -> dict:
@@ -3003,20 +3103,27 @@ class ConfigApp(tk.Tk):
         ttk.Button(rcp_btns, text="新增", command=self._add_rcp).pack(fill=tk.X, pady=1)
         ttk.Button(rcp_btns, text="刪除選定", command=self._del_rcp).pack(fill=tk.X, pady=1)
 
-        sched = ttk.LabelFrame(root, text="排程（HH:MM，多個時間用逗號分隔）", padding=8)
+        sched = ttk.LabelFrame(root, text="輪詢（每隔幾分鐘查一次,有新會診才寄信）", padding=8)
         sched.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(sched, text="平日（一～五）寄送時間:").grid(
+        ttk.Label(sched, text="輪詢間隔（分鐘,5~120）:").grid(
             row=0, column=0, sticky="w", **pad)
-        self.weekday_var = tk.StringVar(value=", ".join(self.cfg["weekday_times"]))
-        ttk.Entry(sched, textvariable=self.weekday_var, width=30,
+        self.interval_var = tk.StringVar(value=str(self.cfg.get("poll_interval_minutes", 15)))
+        ttk.Entry(sched, textvariable=self.interval_var, width=10,
                   font=("Consolas", 11)).grid(row=0, column=1, sticky="w", **pad)
-        ttk.Label(sched, text="假日（六、日）寄送時間:").grid(
+        ttk.Label(sched, text="半夜休息（不查不寄）起/迄時:").grid(
             row=1, column=0, sticky="w", **pad)
-        self.weekend_var = tk.StringVar(value=", ".join(self.cfg["weekend_times"]))
-        ttk.Entry(sched, textvariable=self.weekend_var, width=30,
-                  font=("Consolas", 11)).grid(row=1, column=1, sticky="w", **pad)
+        qrow = ttk.Frame(sched)
+        qrow.grid(row=1, column=1, sticky="w", **pad)
+        self.quiet_start_var = tk.StringVar(value=str(self.cfg.get("quiet_start_hour", 0)))
+        self.quiet_end_var = tk.StringVar(value=str(self.cfg.get("quiet_end_hour", 6)))
+        ttk.Entry(qrow, textvariable=self.quiet_start_var, width=4,
+                  font=("Consolas", 11)).pack(side=tk.LEFT)
+        ttk.Label(qrow, text=" 時 ～ ").pack(side=tk.LEFT)
+        ttk.Entry(qrow, textvariable=self.quiet_end_var, width=4,
+                  font=("Consolas", 11)).pack(side=tk.LEFT)
+        ttk.Label(qrow, text=" 時（預設 0~6）").pack(side=tk.LEFT)
         self.enabled_var = tk.BooleanVar(value=self.cfg.get("enabled", True))
-        ttk.Checkbutton(sched, text="啟用自動排程", variable=self.enabled_var
+        ttk.Checkbutton(sched, text="啟用自動輪詢", variable=self.enabled_var
                         ).grid(row=2, column=0, columnspan=2, sticky="w", **pad)
 
         trig = ttk.LabelFrame(root, text="信件遠端觸發（從手機/任何信箱寄一封信來即可遠端觸發）",
@@ -3076,10 +3183,19 @@ class ConfigApp(tk.Tk):
         cfg["username"] = self.user_var.get().strip()
         cfg["password"] = self.pass_var.get()
         cfg["recipients"] = list(self.rcp_list.get(0, tk.END))
-        cfg["weekday_times"] = [t.strip() for t in self.weekday_var.get().split(",")
-                                if t.strip()]
-        cfg["weekend_times"] = [t.strip() for t in self.weekend_var.get().split(",")
-                                if t.strip()]
+        # [2026-06-25] 改存輪詢間隔 / 半夜休息時段(取代舊的 12:40/17:10 固定排程)。壞值退回預設。
+        try:
+            cfg["poll_interval_minutes"] = max(5, min(120, int(self.interval_var.get().strip())))
+        except (TypeError, ValueError):
+            cfg["poll_interval_minutes"] = DEFAULT_CONFIG["poll_interval_minutes"]
+        try:
+            cfg["quiet_start_hour"] = max(0, min(23, int(self.quiet_start_var.get().strip())))
+        except (TypeError, ValueError):
+            cfg["quiet_start_hour"] = DEFAULT_CONFIG["quiet_start_hour"]
+        try:
+            cfg["quiet_end_hour"] = max(0, min(23, int(self.quiet_end_var.get().strip())))
+        except (TypeError, ValueError):
+            cfg["quiet_end_hour"] = DEFAULT_CONFIG["quiet_end_hour"]
         cfg["enabled"] = self.enabled_var.get()
         cfg["email_trigger_enabled"] = self.email_trigger_var.get()
         cfg["email_trigger_subject_keyword"] = self.email_trigger_kw_var.get().strip() \
