@@ -784,12 +784,19 @@ import types as _types  # noqa: E402
 from datetime import datetime as _DT  # noqa: E402
 
 
-def _poll_harness(monkeypatch, cfg, extracted_text, notified=None, now=None):
-    """在 _JobHarness 之上再 stub _load_notified/_save_notified(記憶體)與 datetime.now。"""
+def _poll_harness(monkeypatch, cfg, extracted_text, notified=None, now=None,
+                  initialized=True):
+    """在 _JobHarness 之上再 stub _load_notified/_save_notified/_baseline_initialized
+    (記憶體)與 datetime.now。initialized=False 模擬「第一次啟動還沒建基準」。"""
     h = _JobHarness(monkeypatch, cfg, extracted_text=extracted_text)
-    store = {"charts": set(notified or set())}
+    store = {"charts": set(notified or set()), "init": initialized}
+
+    def _save(c):
+        store["charts"] = set(c)
+        store["init"] = True
     monkeypatch.setattr(cq, "_load_notified", lambda: set(store["charts"]))
-    monkeypatch.setattr(cq, "_save_notified", lambda c: store.__setitem__("charts", set(c)))
+    monkeypatch.setattr(cq, "_save_notified", _save)
+    monkeypatch.setattr(cq, "_baseline_initialized", lambda: store["init"])
     if now is not None:
         monkeypatch.setattr(cq, "datetime", _types.SimpleNamespace(now=lambda: now))
     return h, store
@@ -855,11 +862,90 @@ def test_save_notified_memory_survives_file_write_failure(monkeypatch, tmp_path)
     def _boom(*a, **k):
         raise OSError("disk full")
     monkeypatch.setattr(cq, "atomic_write_json", _boom)
+    monkeypatch.setattr(cq, "_notified_initialized", None, raising=False)
     try:
         cq._save_notified({"111111", "222222"})        # 寫檔失敗(被吞),但記憶體更新
         assert cq._load_notified() == {"111111", "222222"}  # 不會重置 → 不重寄
+        assert cq._baseline_initialized() is True       # 已建過基準(即使寫檔失敗)
     finally:
-        cq._notified_memory = None   # 還原,避免影響其他測試
+        cq._notified_memory = None       # 還原,避免影響其他測試
+        cq._notified_initialized = None
+
+
+def test_legacy_notified_file_without_flag_treated_as_initialized(monkeypatch, tmp_path):
+    """[Codex] 升級相容:舊版(v2026.06.25.3)檔案只有 charts、沒 initialized → 視為已建基準,
+    升級後第一輪 poll 不會把當下已在清單的「新會診」靜默吞掉。"""
+    import json
+    f = tmp_path / "notified.json"
+    f.write_text(json.dumps({"charts": ["111111"]}), encoding="utf-8")  # 舊版格式(無 initialized)
+    monkeypatch.setattr(cq, "_NOTIFIED_FILE", f)
+    monkeypatch.setattr(cq, "_notified_memory", None, raising=False)
+    monkeypatch.setattr(cq, "_notified_initialized", None, raising=False)
+    try:
+        assert cq._baseline_initialized() is True       # 有 charts → 視為已建(不會靜默重建)
+        assert cq._load_notified() == {"111111"}
+    finally:
+        cq._notified_memory = None
+        cq._notified_initialized = None
+
+
+def test_empty_but_existing_file_treated_as_initialized(monkeypatch, tmp_path):
+    """[Codex r2] 舊版寫過的空基準 {"charts":[]} 也算已建(檔案存在=已建過)→ 升級後第一輪 poll
+    不會把當下「其實是新會診」靜默吞掉。"""
+    import json
+    f = tmp_path / "empty.json"
+    f.write_text(json.dumps({"charts": []}), encoding="utf-8")
+    monkeypatch.setattr(cq, "_NOTIFIED_FILE", f)
+    monkeypatch.setattr(cq, "_notified_memory", None, raising=False)
+    monkeypatch.setattr(cq, "_notified_initialized", None, raising=False)
+    try:
+        assert cq._baseline_initialized() is True
+    finally:
+        cq._notified_memory = None
+        cq._notified_initialized = None
+
+
+def test_missing_file_treated_as_uninitialized(monkeypatch, tmp_path):
+    """完全沒檔案 → 未建基準(initialized False)→ 第一輪 poll 才會走靜默建基準。"""
+    monkeypatch.setattr(cq, "_NOTIFIED_FILE", tmp_path / "missing.json")
+    monkeypatch.setattr(cq, "_notified_memory", None, raising=False)
+    monkeypatch.setattr(cq, "_notified_initialized", None, raising=False)
+    try:
+        assert cq._baseline_initialized() is False
+    finally:
+        cq._notified_memory = None
+        cq._notified_initialized = None
+
+
+def test_poll_first_startup_builds_baseline_silently(monkeypatch):
+    """[2026-06-25 user] 第一次啟動還沒建過基準 → 開機第一輪 poll 只建基準、不寄(避免重啟收全清單)。"""
+    cfg = _base_cfg(quiet_start_hour=0, quiet_end_hour=6)
+    txt = "會診清單(2 位):\n1. 甲C16(1)1111111(沈)06/25\n2. 乙C16(2)2222222(許)06/25"
+    h, store = _poll_harness(monkeypatch, cfg, txt, notified=set(),
+                             now=_DT(2026, 6, 25, 9, 0), initialized=False)
+    cq._do_full_job("poll")
+    assert h.sent == []                            # 開機第一輪:不寄
+    assert store["charts"] == {"1111111", "2222222"}  # 但已建立基準
+    assert store["init"] is True
+    # 第二輪同樣清單 → 已建基準、無新會診 → 不寄
+    cq._do_full_job("poll")
+    assert h.sent == []
+    # 第三輪出現新病歷號 → 寄
+    h.extracted_text = txt + "\n3. 丙C16(3)3333333(王)06/25"
+    cq._do_full_job("poll")
+    assert len(h.sent) == 1
+
+
+def test_poll_first_build_empty_list_then_new_consult_sends(monkeypatch):
+    """首輪讀到空清單也算「已建基準」(initialized=True)→ 之後出現第一筆會診仍會寄(不會被當基準吞掉)。"""
+    cfg = _base_cfg(quiet_start_hour=0, quiet_end_hour=6)
+    h, store = _poll_harness(monkeypatch, cfg, "會診清單(0 位):無未回覆",
+                             notified=set(), now=_DT(2026, 6, 25, 9, 0), initialized=False)
+    cq._do_full_job("poll")                        # 首輪:空清單 → 建空基準、不寄
+    assert h.sent == [] and store["init"] is True and store["charts"] == set()
+    h.extracted_text = "會診清單(1 位):\n1. 甲C16(1)1111111(沈)06/25"
+    cq._do_full_job("poll")                        # 出現第一筆 → 寄(沒被吞)
+    assert len(h.sent) == 1 and store["charts"] == {"1111111"}
 
 
 def test_email_trigger_does_not_consume_poll_baseline(monkeypatch):

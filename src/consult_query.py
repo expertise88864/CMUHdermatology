@@ -380,32 +380,51 @@ def _consult_signature(extracted_text: str) -> set:
 # 重寄同一批(Codex 指出:只靠檔案、寫失敗會每 15 分鐘狂寄)。檔案只負責「跨重啟」記憶;單一
 # job 互斥(_consult_job_gate)→ 同時只有一個 _do_full_job 在跑,無並發競爭。None = 本行程尚未載入。
 _notified_memory = None
+# 基準是否「曾經建立過」。用來區分「空集合(沒人未回覆,但已建過基準)」與「從沒建過基準」——
+# 後者(第一次啟動/檔案不存在)第一輪 poll 只建基準、不寄,避免重啟收一封全清單。None=尚未載入。
+_notified_initialized = None
 
 
 def _load_notified() -> set:
     """讀「已通知過的病歷號」基準。行程內已有記憶體值就用它(權威,不受檔案寫入失敗影響);
     否則(剛啟動)從 SETTINGS_DIR/consult_notified.json 載入。失敗回空集合。"""
-    global _notified_memory
+    global _notified_memory, _notified_initialized
     if _notified_memory is not None:
         return set(_notified_memory)
     try:
-        data = safe_load_json(str(_NOTIFIED_FILE), default={})
+        data = safe_load_json(str(_NOTIFIED_FILE), default=None)
         if isinstance(data, dict):
             _notified_memory = {str(x) for x in (data.get("charts") or [])}
+            # [Codex] 檔案存在且是合法 dict → 先前已建過基準(即使 charts 為空,也代表「已建、
+            # 目前沒人未回覆」而非從沒建過)。只有「檔案不存在 / 壞掉」才算從沒建過 → 第一輪 poll
+            # 才靜默建基準。避免升級(舊版只有 charts、甚至空 charts)後把當下新會診靜默吞掉漏寄。
+            _notified_initialized = True
             return set(_notified_memory)
     except Exception:
         logging.debug("讀取 consult_notified 失敗", exc_info=True)
     _notified_memory = set()
+    _notified_initialized = False
     return set()
+
+
+def _baseline_initialized() -> bool:
+    """基準是否曾經建立過(檔案有 initialized=true / 本行程已 _save_notified 過)。
+    False 代表第一次啟動還沒建基準 → 第一輪 poll 只建基準、不寄(避免重啟收全清單)。"""
+    global _notified_initialized
+    if _notified_initialized is None:
+        _load_notified()   # 順帶載入 _notified_initialized
+    return bool(_notified_initialized)
 
 
 def _save_notified(charts: set) -> None:
     """把「目前清單的病歷號」設為已通知基準(寄信成功後呼叫;poll/email/手動皆更新)。
     【先更新記憶體(權威)再寫檔】→ 即使寫檔失敗,本行程後續 poll 也絕不重寄同一批;檔案僅供跨重啟。"""
-    global _notified_memory
+    global _notified_memory, _notified_initialized
     _notified_memory = set(charts)
+    _notified_initialized = True
     try:
-        atomic_write_json(str(_NOTIFIED_FILE), {"charts": sorted(charts)})
+        atomic_write_json(str(_NOTIFIED_FILE),
+                          {"charts": sorted(charts), "initialized": True})
     except Exception:
         logging.warning("寫入 consult_notified 失敗(記憶體已記住,本行程不會重寄)", exc_info=True)
 
@@ -2253,6 +2272,12 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                 # (不寄、不更新基準 → 下一輪仍會再比對)。email/手動觸發不受此限,照常無條件寄。
                 if trigger_label == "poll":
                     _poll_sig = _consult_signature(extracted_text)
+                    if not _baseline_initialized():
+                        # [2026-06-25 user] 第一次啟動還沒建過基準 → 開機這輪只建基準、不寄,
+                        # 避免每次重啟收一封「全部未回覆清單」的信。之後才比對新病歷號。
+                        _save_notified(_poll_sig)
+                        logging.info("[poll] 首次建立會診基準(%d 筆),本輪不寄信", len(_poll_sig))
+                        return
                     _new = _poll_sig - _load_notified()
                     if not _new:
                         logging.info("[poll] 目前 %d 筆會診都已通知過,無新會診 → 不寄信",

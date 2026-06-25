@@ -2755,9 +2755,9 @@ def test_excimer_gate_blocks_real_phototherapy_treatment_signals():
 
 # ─── [2026-06-23 user] 圖一:純 excimer 處置行無日期/次數 → F2 仍要加劑量 ──────────
 
-def test_excimer_no_date_line_bumps_dose_and_stamps_today():
-    """[2026-06-23 user 圖一] 'excimer 510 mj/cm2 increase 30 until turns reddish max 800'
-    沒有日期/次數,F2 仍要把劑量 +increase(510→540,cap MAX)並補今天日期 → 醫師看得到反應。"""
+def test_excimer_no_date_line_bumps_dose_without_stamping_date():
+    """[2026-06-25 user] 沒有日期/次數 → 同一般 UVB first-time:只把劑量 +increase
+    (510→540,cap MAX),【不補日期、不補次數】(維持原本有什麼改什麼)。"""
     today = date(2026, 6, 23)
     r = update_uvb_in_text(
         "excimer 510 mj/cm2 increase 30 until turns reddish max 800", today=today)
@@ -2765,7 +2765,8 @@ def test_excimer_no_date_line_bumps_dose_and_stamps_today():
     assert r.new_dose == 540
     assert r.new_text is not None
     assert "excimer 540 mj/cm2" in r.new_text
-    assert "on (2026/06/23)" in r.new_text   # 補今天日期 → 轉成可追蹤
+    assert "on (" not in r.new_text          # 【不補日期】(同一般 UVB,不寫出來補完)
+    assert "(1)" not in r.new_text and "(102)" not in r.new_text  # 【不補次數】
 
 
 def test_excimer_no_date_caps_at_max():
@@ -2777,15 +2778,20 @@ def test_excimer_no_date_caps_at_max():
     assert r2.action != UvbAction.UPDATED   # 已達上限 → 不再加
 
 
-def test_excimer_no_date_same_day_repress_does_not_double_bump():
-    """安全:補上今天日期後,同一天再按 F2 → 日期=今天 days_diff=0 → 落 TOO_CLOSE 不重複加劑量。"""
+def test_excimer_no_date_repress_bumps_again_like_uvb_firsttime():
+    """[2026-06-25 user] 沒日期就不補日期(同一般 UVB first-time)→ 沒有日期可擋,
+    同一天再按 F2 會再加一次(510→540→570),和一般 UVB 沒日期行為一致(此為不補日期的取捨,
+    醫師需留意別重複按)。對照組:同樣寫法的 UVB 行也是再加一次。"""
     today = date(2026, 6, 23)
     first = update_uvb_in_text(
         "excimer 510 mj/cm2 increase 30 max 800", today=today)
-    assert first.action == UvbAction.UPDATED and first.new_text is not None
+    assert first.action == UvbAction.UPDATED and first.new_dose == 540
     second = update_uvb_in_text(first.new_text, today=today)
-    assert second.action != UvbAction.UPDATED   # 不會 510→540→570
-    assert "540" in (second.new_text or first.new_text)
+    assert second.action == UvbAction.UPDATED and second.new_dose == 570
+    # 對照:一般 UVB 沒日期行也是再加一次 → excimer 與 UVB 一致(同一般 UVB)
+    u1 = update_uvb_in_text("UVB 510 mj/cm2 increase 30 max 800", today=today)
+    u2 = update_uvb_in_text(u1.new_text, today=today)
+    assert u2.new_dose == 570
 
 
 def test_chinese_uvb_field_does_not_mutate_undated_excimer():
@@ -2810,6 +2816,107 @@ def test_uvb_path_does_not_bump_undated_excimer_line():
     assert "UVB 500 mj/cm2 (6)" in r.new_text   # UVB 行正常更新(7 天保持劑量、count+1)
     # 無日期 excimer 行原封不動:劑量沒加(仍 800)、劑量單位後沒被插入「on (today)」
     assert "excimer 800 mj/cm2 increase 30 max 1000" in r.new_text
+
+
+# ─── [2026-06-25] 純 excimer 劑量偵測修正(實機圖一/圖二「完全沒反應」)─────────────
+
+def test_excimer_dose_with_spaced_unit_detected_image1():
+    """圖一實機:'Excimer light: 700 m j/cm2'(m 與 j 中間有空格)舊版 _EXCIMER_DOSE_RE
+    抓不到劑量 → F2 完全沒反應。隔幾天(maintain)應正常更新(劑量保持 700、count+1、日期→今天)。"""
+    today = date(2026, 6, 25)
+    text = ("Excimer light: 700 m j/cm2(102) on (2026/06/18) , 2 shots, "
+            "maintain the dose, MAX: 700, sun-screen usage")
+    r = update_uvb_in_text(text, today=today)
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 700                      # maintain → 劑量不變
+    assert "700 m j/cm2(103)" in r.new_text       # count 102→103
+    assert "(2026/06/25)" in r.new_text           # 日期→今天
+
+
+def test_excimer_dose_without_unit_detected_image2():
+    """圖二實機:'Excimer light 810 (36)'(完全沒寫 mj 單位)舊版抓不到劑量 → 沒反應。
+    隔幾天(add 30、3 天)應正常更新(810→840、count 36→37、日期→今天)。"""
+    today = date(2026, 6, 25)
+    text = ("Excimer light 810 (36) on (2026/6/22), add 30 each time, "
+            "fixed at 1000  educate sun-burn reaction")
+    r = update_uvb_in_text(text, today=today)
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 840                      # 810 + 30
+    assert "Excimer light 840 (37)" in r.new_text
+    assert "(2026/06/25)" in r.new_text
+
+
+def test_excimer_same_day_returns_too_close_image1():
+    """圖一(日期=今天 days_diff=0)→ 同一般 UVB:回 TOO_CLOSE(上層跳提示、不加劑量、不設身份)。"""
+    today = date(2026, 6, 25)
+    text = ("Excimer light: 700 m j/cm2(102) on (2026/06/25) , 2 shots, "
+            "maintain the dose, MAX: 700, sun-screen usage")
+    r = update_uvb_in_text(text, today=today)
+    assert r.action == UvbAction.TOO_CLOSE
+    assert r.days_diff == 0
+    assert r.new_text is None                     # 沒改處置
+
+
+def test_excimer_same_day_returns_too_close_image2():
+    """圖二(日期=今天)→ TOO_CLOSE。"""
+    today = date(2026, 6, 25)
+    text = ("Excimer light 810 (36) on (2026/6/25), 1 shots, add 30 each time, "
+            "fixed at 1000  educate")
+    r = update_uvb_in_text(text, today=today)
+    assert r.action == UvbAction.TOO_CLOSE
+    assert r.days_diff == 0
+
+
+def test_excimer_ceiling_before_dose_not_read_as_dose():
+    """[Codex] 'fixed at 1000' 的上限在劑量前面時,1000 不可被當劑量;810 才是劑量(810→840)。"""
+    today = date(2026, 6, 25)
+    text = ("Excimer light fixed at 1000, 810 (36) on (2026/6/22), "
+            "add 30 each time")
+    r = update_uvb_in_text(text, today=today)
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 840
+    assert "fixed at 1000, 840" in r.new_text   # 改的是 810→840,不是 1000
+
+
+def test_excimer_bare_date_year_not_read_as_dose():
+    """[Codex r2] 沒加括號的日期 'on 2026/6/22' 的年份 2026 不可被當劑量(否則 edit 會把日期改壞)。
+    這種「日期在劑量前」的格式保守不更新(劑量需在日期前,同既有行為),且日期 2026 維持原樣。"""
+    today = date(2026, 6, 25)
+    text = "Excimer light on 2026/6/22 810 (36), add 30, fixed at 1000"
+    r = update_uvb_in_text(text, today=today)
+    assert r.action != UvbAction.UPDATED      # 劑量在日期後 → 不自動更新(不亂改)
+    assert "2026/6/22" in (r.new_text or text)  # 日期沒被當劑量改壞
+
+
+def test_excimer_spaced_paren_number_not_read_as_dose():
+    """[Codex] '( 600 )'(括號與數字間有空白)不可被當劑量;700 才是劑量。"""
+    today = date(2026, 6, 25)
+    text = "Excimer light ( 600 ) 700 on (2026/6/18), maintain the dose, MAX 700"
+    r = update_uvb_in_text(text, today=today)
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 700
+
+
+def test_excimer_multiline_one_today_returns_too_close_priority():
+    """[Codex] 多行 excimer:一行日期=今天(太近)、另一行隔 7 天可更新 → 保守一律回 TOO_CLOSE,
+    不自動更新任何行、不寫回(避免更新到別行又設身份 01,違背「當天不設身份」)。"""
+    today = date(2026, 6, 25)
+    text = ("Excimer light 810 (36) on (2026/6/25), add 30, MAX 1000\n"
+            "Excimer light 500 (10) on (2026/6/18), add 30, MAX 1000")
+    r = update_uvb_in_text(text, today=today)
+    assert r.action == UvbAction.TOO_CLOSE
+    assert r.new_text is None                   # 任何行都不寫回
+
+
+def test_excimer_no_count_only_updates_dose_and_date():
+    """沒有次數(沒寫 (N))→ 不補次數,只更新劑量+日期(維持有什麼改什麼)。"""
+    today = date(2026, 6, 25)
+    text = "Excimer light 810 on (2026/6/22), add 30 each time, MAX 1000"
+    r = update_uvb_in_text(text, today=today)
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 840
+    assert "Excimer light 840 on (2026/06/25)" in r.new_text
+    assert "(" not in r.new_text.split("on (")[0]   # 沒被插入次數括號
 
 
 # ─── [2026-06-19] 實機:UVB 行有「其他欄位的日期」混入,不可誤判 ──────────────

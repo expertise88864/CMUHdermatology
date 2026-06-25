@@ -230,6 +230,57 @@ _UVB_MARKER_RE = re.compile(
 _EXCIMER_MARKER_RE = re.compile(r"\bexcimer(?:\s+light)?\b", re.IGNORECASE)
 _EXCIMER_DOSE_RE = re.compile(r"(\d+)\s*(mj(?:/cm2)?)", re.IGNORECASE)
 
+
+# [2026-06-25] excimer 劑量偵測時,前方緊跟「上限 / 加劑量」關鍵字的數字【不是本次劑量】:
+#   - 上限:MAX / fixed at / upper limit / 上限 / 固定 …(= _CEILING_KEYWORD_BEFORE_RE 那組)
+#   - 加量:increase / add / 每次加 / 增加 …
+# 例:'Excimer fixed at 1000, 810 …' 的 1000 是上限、810 才是劑量 → 必須跳過 1000。
+_EXCIMER_NONDOSE_BEFORE_RE = re.compile(
+    r"(?:MAX(?:\s+(?:dose|UVB|Phototherapy))?(?:\s+(?:at|to))?"
+    r"|\bfix(?:ed)?(?:\s+(?:at|to))?"
+    r"|upper\s*limit(?:\s+(?:at|to))?"
+    r"|(?:each\s+time\s+)?(?:till|until)"
+    r"|maintain\s+dose\s+at"
+    r"|最大(?:劑量|剂量)?|上限(?:在|為)?|固定(?:在|為)?"
+    r"|in\s*cr(?:e?a?|a?e?)se[d]?(?:\s+by)?|add(?:ing|ed|s)?(?:\s+by)?"
+    r"|每次增加|每次加|增加|加)\s*[:：,，]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _find_excimer_dose(line: str, start: int, date_span=None):
+    """找 excimer 劑量:marker 之後第一個「不在括號內、非日期片段、前方非上限/加量關鍵字、
+    且 >= MIN_DOSE」的數字。
+
+    [2026-06-25] 不再硬性要求寫 'mj' 單位 —— 同一般 UVB(關鍵字後的數字就是劑量)。
+    實機 'Excimer light: 700 m j/cm2'(m 與 j 中間有空格)、'Excimer light 810'(沒寫單位)
+    舊 _EXCIMER_DOSE_RE 都吃不到 → F2/F3「完全沒反應」。排除:括號內(次數 (102)/日期)、
+    日期片段(像沒加括號的 'on 2026/6/22' 的年月日,Codex 指出否則會把 2026 當劑量)、前方是
+    MAX/上限/increase 關鍵字的數字(那是上限/加量)、< MIN_DOSE 的小數字(像 '2 shots'、'add 30')。
+    回 (數字起點, 數字終點, 數值) 或 None。"""
+    for nm in re.finditer(r"\d+", line[start:]):
+        s = start + nm.start()
+        e = start + nm.end()
+        # 落在主日期 span 內(年/月/日)→ 不是劑量(防 'on 2026/6/22 810' 把 2026 當劑量)
+        if date_span and s < date_span[1] and e > date_span[0]:
+            continue
+        # 與日期分隔符 '/'、'-' 相鄰且另一側也是數字(像 2026/6/22 的年月日片段)→ 不是劑量
+        if ((s > 1 and line[s - 1] in "/-" and line[s - 2].isdigit())
+                or (e + 1 < len(line) and line[e] in "/-" and line[e + 1].isdigit())):
+            continue
+        # 在括號內(次數 (102)/日期)→ 不是劑量;容許「( 102 )」括號與數字間有空白(Codex 指出)
+        j = s - 1
+        while j >= 0 and line[j] in " \t":
+            j -= 1
+        if j >= 0 and line[j] in "(（":
+            continue
+        if _EXCIMER_NONDOSE_BEFORE_RE.search(line[:s]):   # 前方是上限/加量關鍵字 → 不是劑量
+            continue
+        val = int(nm.group(0))
+        if val >= MIN_DOSE:
+            return s, e, val
+    return None
+
 # [2026-06-18] F2/F3 照光分流偵測:處置屬於哪種照光,決定要不要 key 51019/療程、
 # 身份是否改 01。關鍵在「光療 / Phototherapy 是【泛稱】」—— 中文「光療」「準分子光療」
 # 也用來指 excimer(準分子=excimer),不能因為出現「光療」就當成健保 UVB。
@@ -841,16 +892,26 @@ class UvbUpdateResult:
 
 def _update_excimer_lines(text: str, today: date,
                           allow_undated: bool = False,
-                          skip_stale: bool = False) -> tuple[str, int, Optional[dict]]:
+                          skip_stale: bool = False,
+                          flexible_dose: bool = False
+                          ) -> tuple[str, int, Optional[dict], Optional[int]]:
     """Update structured excimer lines independently from UVB lines.
 
-    allow_undated=True(只給【純自費 Excimer】路徑用):連沒有日期的 excimer 劑量行也加劑量並
-    補今天日期(圖一)。UVB 路徑的 Step D 用 False —— UVB visit 不應順手改沒日期的 excimer 行。
+    回傳 (新文字, 更新行數, 第一筆更新摘要, too_close_days)。too_close_days 非 None 代表
+    有「有效但日期距今 < 2 天」的 excimer 行 —— 上層應跳「距上次太近」提示、不加劑量、不設身份。
+
+    flexible_dose=True(只給【純自費 Excimer】路徑用):劑量用「marker 後第一個不在括號內且
+    >= MIN_DOSE 的數字」抓(同一般 UVB,容忍 '700 m j/cm2' 空格、'810' 無單位)。UVB 路徑的
+    Step D 用 False(維持嚴格 mj 比對)—— 不改健保 UVB visit 順手動 excimer 的既有保守行為。
+    allow_undated=True(只給【純自費 Excimer】路徑用):連沒有日期的 excimer 劑量行也加劑量。
+    [2026-06-25 user] 沒日期就【只改劑量、不補日期/次數】(維持原本有什麼改什麼,同一般 UVB
+    的 first-time)。UVB 路徑的 Step D 用 False —— UVB visit 不應順手改沒日期的 excimer 行。
     [2026-06-24] skip_stale=True(使用者在確認窗按 Yes 後)→ 不因『日期早於 1 個月』而略過該行,
     照舊紀錄繼續更新;預設 False 時,日期早於今天往前 1 個日曆月的 excimer 行一律略過(忽略舊段)。"""
     lines = text.splitlines(keepends=True)
     updated = 0
     first_update: Optional[dict] = None
+    too_close_days: Optional[int] = None
 
     for index, line in enumerate(lines):
         marker = _EXCIMER_MARKER_RE.search(line)
@@ -858,21 +919,29 @@ def _update_excimer_lines(text: str, today: date,
             continue
         date_m = _UVB_DATE_RE.search(line, marker.end())
         max_m = _UVB_MAX_RE.search(line, marker.end())
-        dose_m = _EXCIMER_DOSE_RE.search(line, marker.end())
+        # [2026-06-25] 純自費 excimer 路徑(flexible_dose)劑量改用「marker 後第一個不在括號內且
+        # >= MIN_DOSE 的數字」(同一般 UVB,不要求 mj 單位)→ '700 m j/cm2'(空格)、'810'(無單位)
+        # 都吃得到;UVB Step D 維持嚴格 _EXCIMER_DOSE_RE(要求 mj),不動既有保守行為。
+        if flexible_dose:
+            dose_info = _find_excimer_dose(
+                line, marker.end(),
+                date_span=(date_m.span() if date_m else None))
+        else:
+            _dm = _EXCIMER_DOSE_RE.search(line, marker.end())
+            dose_info = ((_dm.start(1), _dm.end(1), int(_dm.group(1)))
+                         if _dm else None)
         inc_m = _UVB_INCREASE_RE.search(line, marker.end())
-        if max_m is None or dose_m is None:
+        if max_m is None or dose_info is None:
             continue
+        dose_start, dose_end, dose = dose_info
 
-        # [2026-06-23 user] excimer 行有 劑量+MAX+increase 但【沒有日期】(像初診/醫師沒寫日期,
-        # 例:"excimer 510 mj/cm2 increase 30 ... max 800")→ F2 仍要加劑量(否則看起來沒反應)。
-        # 作法:dose+increase(cap MAX)後,在劑量單位後補「on (今天)」把這行轉成可追蹤 ——
-        # 同日再按會因 days_diff=0 落到下方 TOO_CLOSE 而不重複加(安全),隔日才走正常 decay/加量。
+        # 沒日期(像初診/醫師沒寫日期,例:"excimer 510 mj/cm2 increase 30 ... max 800")→
+        # 同一般 UVB 的 first-time:只加劑量(cap MAX),【不補日期、不補次數】(2026-06-25 user)。
         if date_m is None:
             if (not allow_undated or inc_m is None
-                    or dose_m.start() > max_m.start()):
+                    or dose_start > max_m.start()):
                 continue
             try:
-                dose = int(dose_m.group(1))
                 max_dose = int(max_m.group(1))
                 increase = int(inc_m.group(1) or inc_m.group(2))
             except (TypeError, ValueError):
@@ -881,22 +950,14 @@ def _update_excimer_lines(text: str, today: date,
                     or not (0 < increase <= 200) or dose >= max_dose):
                 continue
             new_dose = dose if _has_maintain_dose(line) else min(dose + increase, max_dose)
-            stamp = f" on ({_date_text(today)})"
-            seed_edits = [
-                (dose_m.span(1), str(new_dose)),
-                ((dose_m.end(), dose_m.end()), stamp),
-            ]
-            new_line = line
-            for (start, end), replacement in sorted(seed_edits, reverse=True):
-                new_line = new_line[:start] + replacement + new_line[end:]
-            lines[index] = new_line
+            lines[index] = line[:dose_start] + str(new_dose) + line[dose_end:]
             updated += 1
             if first_update is None:
                 first_update = {"dose": new_dose, "count": None,
                                 "last_date": None, "days_diff": None}
             continue
 
-        if dose_m.start() > date_m.start():
+        if dose_start > date_m.start():
             continue
 
         ymd = _resolve_date_match(date_m)
@@ -904,7 +965,6 @@ def _update_excimer_lines(text: str, today: date,
             continue
         try:
             last_date = date(*ymd)
-            dose = int(dose_m.group(1))
             max_dose = int(max_m.group(1))
             increase = int(inc_m.group(1) or inc_m.group(2)) if inc_m else 0
         except (TypeError, ValueError):
@@ -917,16 +977,22 @@ def _update_excimer_lines(text: str, today: date,
         count = int(count_m.group(1)) if count_m else None
         days_diff = (today - last_date).days
 
+        # 先擋真正無效/太久遠/舊段(這些靜默略過,跟原本一樣)
         if (dose < MIN_DOSE or max_dose < MIN_DOSE
                 or increase < 0 or increase > 200
                 or (count is not None and not (1 <= count <= MAX_COUNT))
-                or days_diff < TOO_CLOSE_DAYS
                 # [2026-06-24] >2 年(MAX_GAP_DAYS)一律不動 —— 即使 skip_stale(Yes),
                 # 太久遠的紀錄可能跑錯病人,與 UVB 路徑的硬停一致,不可照舊更新。
                 or days_diff > MAX_GAP_DAYS
                 # 1 個月門檻才受 skip_stale 控制:正常路徑略過舊段;Yes 後照舊紀錄更新。
                 or (not skip_stale
                     and last_date < _months_before(today, MODIFY_STALE_MONTHS))):
+            continue
+        # [2026-06-25 user] 日期距今 < 2 天(像當天又按一次)→ 不加劑量,但記下 days_diff 讓上層
+        # 跳「距上次太近」提示、不設身份(同一般 UVB 的 TOO_CLOSE)。負值(未來日期)維持原本靜默略過。
+        if days_diff < TOO_CLOSE_DAYS:
+            if 0 <= days_diff and too_close_days is None:
+                too_close_days = days_diff
             continue
 
         new_dose = compute_new_dose(
@@ -939,7 +1005,7 @@ def _update_excimer_lines(text: str, today: date,
         new_count = count + 1 if count is not None else None
 
         edits = [
-            (dose_m.span(1), str(new_dose)),
+            ((dose_start, dose_end), str(new_dose)),
             (date_m.span(), _today_in_format(today, date_m.group(0))),
         ]
         if count_m is not None and new_count is not None:
@@ -958,7 +1024,7 @@ def _update_excimer_lines(text: str, today: date,
                 "days_diff": days_diff,
             }
 
-    return "".join(lines), updated, first_update
+    return "".join(lines), updated, first_update, too_close_days
 
 
 def _count_uvb_lines(text: str) -> int:
@@ -1248,8 +1314,18 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         # 修正:舊版只要文字任一處出現 Phototherapy 字眼(連 'avoid phototherapy days' 這種備註)就誤擋
         # excimer 劑量更新(楊智翔實機:有 excimer 卻沒辦法修改)。紫外線仍保護 → 不會誤入 allow_undated。
         if not _has_uvb_or_phototherapy_treatment(text):
-            excimer_text, excimer_count, excimer_first = _update_excimer_lines(
-                text, today, allow_undated=True, skip_stale=skip_stale_check)
+            (excimer_text, excimer_count, excimer_first,
+             excimer_too_close) = _update_excimer_lines(
+                text, today, allow_undated=True, skip_stale=skip_stale_check,
+                flexible_dose=True)
+            # [2026-06-25 user] 只要有「有效但日期距今 < 2 天」的 excimer 行 → 一律回 TOO_CLOSE,
+            # 跳「太近」提示、不加劑量、不設身份(同一般 UVB)。此判斷【優先於 UPDATED】:即使另一行
+            # 可更新,只要存在當天行就保守不自動動作、交醫師手動(Codex 指出:否則會更新到別行又設
+            # 身份 01,違背「當天不設身份」)。丟掉已在記憶體改過的 excimer_text(不寫回)。
+            if excimer_too_close is not None:
+                return UvbUpdateResult(action=UvbAction.TOO_CLOSE,
+                                       days_diff=excimer_too_close,
+                                       uvb_line_count=uvb_lines)
             if excimer_count and excimer_first:
                 return UvbUpdateResult(
                     action=UvbAction.UPDATED,
@@ -1586,7 +1662,7 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         triplet_count += 1
 
     # ─── Step D: excimer / excimer light 各自依自己的欄位更新 ───────────
-    working, excimer_count, _ = _update_excimer_lines(working, today)
+    working, excimer_count, _, _ = _update_excimer_lines(working, today)
     triplet_count += excimer_count
 
     new_text = working

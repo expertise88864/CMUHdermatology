@@ -1903,12 +1903,16 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
                     "自費 Excimer 的劑量自動更新寫回失敗。\n身份仍會設為自費(01),"
                     "但請醫師手動確認處置的次數/日期/劑量。")
         elif result.action == UvbAction.TOO_CLOSE:
-            logging.warning("[%s][Excimer] 距上次照光僅 %s 天 → 劑量未自動更新",
-                            label, result.days_diff)
+            # [2026-06-25 user] 距上次照光 < 2 天 → 同一般 UVB:跳提示、不加劑量、【不設身份】。
+            logging.warning(
+                "[%s][Excimer] 距上次照光僅 %s 天 → 不更新劑量、不設身份(同一般 UVB)",
+                label, result.days_diff)
             _show_uvb_warning(
                 main_hwnd, "Excimer 照光間隔太短",
-                f"距上次照光僅 {result.days_diff} 天,劑量未自動更新。\n"
-                "身份已設自費(01),請醫師確認照光劑量。")
+                f"距上次照光僅 {result.days_diff} 天。\n\n"
+                "未自動更新劑量,也【未設定身份(自費 01)】。\n"
+                "若確實要照光,請醫師手動設定身份與劑量。")
+            return False   # 不設身份、不續做(同一般 UVB 的太近 → 中止)
         elif result.action == UvbAction.CONFIRM_NEEDED:
             # [2026-06-24] 純 excimer 也可能跳 stale 確認(>1 月舊紀錄)/ 劑量超限確認。
             # 跳 Yes/No;Yes → 帶 skip 旗標重跑並寫回。No → 不改劑量(身份仍設 01)。
