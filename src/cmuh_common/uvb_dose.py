@@ -243,6 +243,19 @@ _PT_EXCIMER_RE = re.compile(r"(?:excime|準分子)", re.IGNORECASE)
 _PT_GENERIC_RE = re.compile(r"(?:photo\s*therapy|光療)", re.IGNORECASE)
 # 劑量訊號(數字+mJ):用來分辨「泛稱光療」是治療醫令行(有劑量)還是病史/轉介語境(無劑量)
 _PT_DOSE_RE = re.compile(r"\d\s*mj", re.IGNORECASE)
+
+
+def _has_uvb_or_phototherapy_treatment(text: str) -> bool:
+    """text 是否有『會讓 excimer 退讓』的 UVB/光療治療訊號(給 update_uvb_in_text 的 excimer gate):
+      - UVB-specific(UVB / 紫外線 / 獨立 UV)→ True(健保 UVB,不論有無劑量都保護);
+      - UVB / Phototherapy / UV + 數字(劑量)→ True —— 直接用 parser 同一個 _UVB_DOSE_RE 偵測,
+        與「真的會被 parser 當成 UVB/光療治療」完全同一把尺(自動涵蓋跨行、無 mj 單位、夾 dose/to
+        等自由寫法,不會比 parser 寬鬆而漏判 → Codex 指出逐行 + \\d mj 太窄)。
+    只有衛教備註裡的裸 phototherapy 字眼(關鍵字後沒有可配對的劑量數字,如 'avoid phototherapy days')
+    → False → 不擋 excimer 劑量更新。"""
+    if not text:
+        return False
+    return bool(_PT_UVB_SPECIFIC_RE.search(text) or _UVB_DOSE_RE.search(text))
 # 任一照光關鍵字(粗篩用,給「濾掉太舊的照光段落」逐行判斷哪些行算照光段落)
 _PHOTO_ANY_RE = re.compile(
     r"(?:UVB|紫外線|\bUV\b|excime|準分子|photo\s*therapy|光療)", re.IGNORECASE)
@@ -1228,10 +1241,13 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
     parsed = parse_uvb_line(text)
     if parsed is None:
         # excimer / excimer light 本身也是照光，不要求同時出現 UVB。
-        # [2026-06-23] 排除字串要含中文「紫外線」(UVB 的中文)—— 否則只寫紫外線的健保 UVB 欄位
-        # 會誤入此 excimer 分支、又因 allow_undated=True 去動到無日期的 excimer 行(Codex 指出)。
-        if not re.search(r"(?:UVB|紫外線|Phototherapy|\bUV\b)", text,
-                         re.IGNORECASE):
+        # [2026-06-25] 只有「會讓 excimer 退讓的真 UVB/光療治療訊號」才不進 excimer 分支:
+        #   - UVB-specific(UVB / 紫外線 / 獨立 UV)—— 不論有無劑量都保護(健保 UVB);
+        #   - 泛稱 Phototherapy 且【同行有劑量】—— 像真正的光療醫令行(可能是健保 UVB,保守不當 excimer)。
+        # 但【衛教備註裡的裸 phototherapy 字眼(無劑量)】不算 → 照常更新 excimer。
+        # 修正:舊版只要文字任一處出現 Phototherapy 字眼(連 'avoid phototherapy days' 這種備註)就誤擋
+        # excimer 劑量更新(楊智翔實機:有 excimer 卻沒辦法修改)。紫外線仍保護 → 不會誤入 allow_undated。
+        if not _has_uvb_or_phototherapy_treatment(text):
             excimer_text, excimer_count, excimer_first = _update_excimer_lines(
                 text, today, allow_undated=True, skip_stale=skip_stale_check)
             if excimer_count and excimer_first:

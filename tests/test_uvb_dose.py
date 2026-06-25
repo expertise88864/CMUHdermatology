@@ -2717,6 +2717,42 @@ def test_strip_stale_keeps_undated_and_recent_photo_lines():
     assert "skin lesion" in out
 
 
+# ─── [2026-06-25 user 楊智翔] 衛教備註裡的 phototherapy 字眼不可擋掉 excimer 劑量更新 ──────
+
+def test_phototherapy_note_word_does_not_block_excimer_update():
+    """[2026-06-25 user 楊智翔實機] 處置是 excimer(近期),但夾了衛教備註
+    'suggest elidel use (avoid phototherapy days)' —— 裡面的 phototherapy 字眼不可被當成有 UVB
+    治療而擋掉 excimer 劑量更新。改用 detect 分流判斷(pure_excimer)→ 照常更新 excimer。"""
+    today = date(2026, 6, 25)
+    field = ("excimer 320mJ for 雙側太陽穴各*1 on (2026/6/22) 有紅且脫皮 increase 20mJ if no "
+             "erythema, 2 shots, MAX: 900mJ,\n"
+             "suggest elidel use (avoid phototherapy days) -> Tacrolimus 0.1,\n"
+             "OMP M3 on (2024/1/15) -> re-OMP M3 on (2025/12/15)\nCO2 laser, 3K, 6/17")
+    r = update_uvb_in_text(field, today=today)
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 340   # 320 + increase 20
+    # 安全:真正只有「紫外線(中文 UVB)+ excimer」的欄位,仍判 UVB → 不可去動無日期 excimer 行
+    zh = "紫外線 450 mj/cm2 on (2026/6/22) max 800\nexcimer 510 mj/cm2 increase 30 max 800"
+    rz = update_uvb_in_text(zh, today=today)
+    assert "excimer 510 mj/cm2 increase 30 max 800" in (rz.new_text or zh)
+
+
+def test_excimer_gate_blocks_real_phototherapy_treatment_signals():
+    """[Codex] excimer gate 用 parser 同一把尺 _UVB_DOSE_RE,不可比 parser 寬鬆:真正帶劑量的
+    UVB/Phototherapy 治療(跨行、無 mj 單位、to-劑量自由寫法、中文紫外線)都要擋掉 excimer 分支,
+    只有裸 phototherapy 字眼(無可配對劑量)才放行。"""
+    from cmuh_common.uvb_dose import _has_uvb_or_phototherapy_treatment as gate
+    # 裸 phototherapy 備註(無劑量數字)→ 不擋
+    assert gate("excimer 320mJ on (2026/6/22) increase 20 max 900\navoid phototherapy days") is False
+    # 真治療訊號(都要擋):跨行、無單位、to-劑量、中文紫外線、裸 UVB-specific
+    assert gate("Phototherapy\n500 mj/cm2 on (2026/6/22) max 1000\nexcimer 300 mj increase 20 max 800") is True
+    assert gate("Phototherapy 500 on (2026/6/22) max 1000\nexcimer 300 mj increase 20 max 800") is True
+    assert gate("keep phototherapy on both lower limbs to 680 mj/cm2\nexcimer 300 mj increase 20 max 800") is True
+    assert gate("紫外線 450 on (2026/6/22)\nexcimer 510 mj increase 30 max 800") is True
+    assert gate("hx of UVB; excimer 300 mj increase 30 max 800") is True
+    assert gate(None) is False and gate("") is False
+
+
 # ─── [2026-06-23 user] 圖一:純 excimer 處置行無日期/次數 → F2 仍要加劑量 ──────────
 
 def test_excimer_no_date_line_bumps_dose_and_stamps_today():
