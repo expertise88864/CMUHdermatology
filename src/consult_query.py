@@ -2487,9 +2487,13 @@ def _rebuild_schedule() -> None:
     except (TypeError, ValueError):
         interval = 15
     interval = max(5, min(120, interval))   # 夾在 5-120 分鐘,避免太密集打爆 systemftp/院方系統
-    schedule.every(interval).minutes.do(trigger_job_async, trigger_label="poll")
+    # [2026-06-25 user] 加 ±1 分鐘隨機抖動(N-1 ~ N+1 分),避免固定節拍打院方系統(同 reg64 45-75
+    # 秒隨機的理由);schedule 的 .to() 會在每次跑完後重新隨機下一次間隔。下限不低於 5 分。
+    lo = max(5, interval - 1)
+    hi = interval + 1
+    schedule.every(lo).to(hi).minutes.do(trigger_job_async, trigger_label="poll")
     logging.info(
-        "已排程每 %d 分鐘輪詢會診清單(有新會診才寄信;%02d:00-%02d:00 休息)",
+        "已排程每 %d 分鐘(±1 隨機)輪詢會診清單(有新會診才寄信;%02d:00-%02d:00 休息)",
         interval, int(cfg.get("quiet_start_hour", 0)), int(cfg.get("quiet_end_hour", 6)))
 
 

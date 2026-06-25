@@ -326,32 +326,37 @@ def test_load_config_times_non_list_falls_back(tmp_path, monkeypatch):
 # ─── _rebuild_schedule 排程建立 ──────────────────────────────────────────
 
 def test_rebuild_schedule_creates_single_poll_job(monkeypatch):
-    """[2026-06-25] 改為每 N 分鐘輪詢:排程只建立 1 個 poll job(取代舊的逐時刻×天數)。"""
+    """[2026-06-25] 改為每 N 分鐘輪詢(±1 隨機抖動):排程只建立 1 個 poll job;
+    .to() 讓間隔在 N-1 ~ N+1 分隨機(interval=下限14、latest=上限16)。"""
     cfg = _base_cfg(enabled=True, poll_interval_minutes=15)
     monkeypatch.setattr(cq, "load_config", lambda: cfg)
     cq._rebuild_schedule()
     try:
         jobs = cq.schedule.get_jobs()
         assert len(jobs) == 1
-        assert jobs[0].interval == 15 and jobs[0].unit == "minutes"
+        assert jobs[0].unit == "minutes"
+        assert jobs[0].interval == 14 and jobs[0].latest == 16   # 15 ±1 隨機區間
     finally:
         cq.schedule.clear()
 
 
 def test_rebuild_schedule_clamps_interval(monkeypatch):
-    """間隔夾在 5~120 分鐘;壞值退回預設 15,不可炸掉排程器。"""
+    """間隔夾在 5~120 分鐘;±1 抖動下限不低於 5;壞值退回預設 15,不可炸掉排程器。"""
     monkeypatch.setattr(cq, "load_config", lambda: _base_cfg(enabled=True, poll_interval_minutes=1))
     cq._rebuild_schedule()
-    assert cq.schedule.get_jobs()[0].interval == 5      # 夾到下限
+    j = cq.schedule.get_jobs()[0]
+    assert j.interval == 5 and j.latest == 6     # 夾到下限 5(±1 下限不低於 5)
     cq.schedule.clear()
     monkeypatch.setattr(cq, "load_config", lambda: _base_cfg(enabled=True, poll_interval_minutes=999))
     cq._rebuild_schedule()
-    assert cq.schedule.get_jobs()[0].interval == 120     # 夾到上限
+    j = cq.schedule.get_jobs()[0]
+    assert j.interval == 119 and j.latest == 121  # 夾到上限 120 → 119~121
     cq.schedule.clear()
     monkeypatch.setattr(cq, "load_config", lambda: _base_cfg(enabled=True, poll_interval_minutes="bad"))
     cq._rebuild_schedule()  # 不可 raise
     try:
-        assert cq.schedule.get_jobs()[0].interval == 15  # 壞值→預設
+        j = cq.schedule.get_jobs()[0]
+        assert j.interval == 14 and j.latest == 16  # 壞值→預設 15 → 14~16
     finally:
         cq.schedule.clear()
 

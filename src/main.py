@@ -7103,6 +7103,9 @@ class AutomationApp:
         self.cl_check_interval = 30
         self.cl_last_check_time = 0
         self._priority_refresh_last_check_time = defaultdict(float)
+        # [2026-06-25 user] 鄰近門檻(設定值-10)醫師的「下一次優先刷新」目標間隔(秒)。每次刷新後
+        # 重新隨機 15 分 ±1(14-16 分),避免固定節拍(同 reg64 45-75 秒隨機的理由)。未設定 → 預設 15 分。
+        self._priority_refresh_target_seconds = {}
         self._refresh_tick_after_id = None
         self._pending_refresh_tick_ui = None
 
@@ -13290,7 +13293,8 @@ class AutomationApp:
                     pass
 
             def dynamic_cl_checker():
-                # 當任何醫師人數達到門檻-10（總覽橘色底），縮短為每30分鐘刷新一次該醫師
+                # [2026-06-25 user] 當任何醫師人數達到門檻-10(總覽橘色底)→ 縮短為每約 15 分鐘
+                # (±1 分隨機,避免固定節拍)刷新一次該醫師(原為 30 分)。
                 try:
                     doctors_data_snapshot = self._get_all_doctors_data_snapshot()
                     now_ts = time.time()
@@ -13304,9 +13308,12 @@ class AutomationApp:
                         if not self._is_doctor_near_alert_threshold(doc_name, doctors_data_snapshot=doctors_data_snapshot):
                             continue
                         elapsed = now_ts - self._priority_refresh_last_check_time[doc_name]
-                        if elapsed >= (30 * 60):
+                        # 目標間隔:本醫師上次刷新後就隨機好的 15 分 ±1(未設過 → 預設 15 分)。
+                        target = self._priority_refresh_target_seconds.get(doc_name, 15 * 60)
+                        if elapsed >= target:
                             logging.info(
-                                f"[SCHEDULE:priority-check-2m] 觸發優先刷新：{doc_name}（鄰近門檻且距上次≥30分）"
+                                f"[SCHEDULE:priority-check-2m] 觸發優先刷新：{doc_name}"
+                                f"（鄰近門檻且距上次≥{int(target // 60)}分）"
                             )
                             future = self.bg_executor.submit(self._trigger_refresh, False, [doc])
                             if _future_was_rejected(future):
@@ -13315,10 +13322,12 @@ class AutomationApp:
                                 )
                                 continue
                             self._priority_refresh_last_check_time[doc_name] = now_ts
+                            # 下一輪重新隨機 15 分 ±1(14-16 分),讓刷新時點不固定
+                            self._priority_refresh_target_seconds[doc_name] = random.randint(14 * 60, 16 * 60)
                 except Exception as e:
                     logging.error(f"[SCHEDULE:priority-check-2m] failed: {e}", exc_info=True)
 
-            # 鄰近門檻檢查：改為每 2 分鐘喚醒（內部仍至少 15 分才觸發實際 refresh），減少無謂排程
+            # 鄰近門檻檢查：每 2 分鐘喚醒（內部約 15 分 ±1 隨機才觸發實際 refresh），減少無謂排程
             schedule.clear()
             schedule.every(2).minutes.do(dynamic_cl_checker).tag("priority-check", "2m")
             schedule.every(3).hours.do(
