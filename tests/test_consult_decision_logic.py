@@ -180,6 +180,69 @@ def test_is_email_trigger_classification():
     assert cq._is_email_trigger("") is False
 
 
+# ─── [2026-06-25] 打卡狀態時間閘:過 12:40 才附上班、過 17:10 才附下班 ──────────
+from datetime import datetime as _DT2  # noqa: E402
+
+_PUNCH_RESULT = [{"username": "a01", "on": "ok", "on_time": "07:31",
+                  "off": "ok", "off_time": "17:05"}]
+
+
+def _stub_punch(monkeypatch, results=None):
+    monkeypatch.setattr(cq, "_load_autoclock_accounts", lambda: [{"username": "a01"}])
+    import cmuh_common.punch_status as ps
+    monkeypatch.setattr(ps, "query_accounts_today",
+                        lambda accs, **k: list(results if results is not None else _PUNCH_RESULT))
+
+
+def _punch_rows(text):
+    """打卡純文字段落的「帳號列」(去掉表頭那一行)。"""
+    return "\n".join(text.splitlines()[1:]) if text else ""
+
+
+def test_punch_before_1240_not_attached(monkeypatch):
+    """09:30(過 12:40 前)→ 不查、不附(連 portal 都不登入)。"""
+    _stub_punch(monkeypatch)
+    t, h = cq._build_punch_status_sections({"punch_status_in_email": True},
+                                           now=_DT2(2026, 6, 25, 9, 30))
+    assert t == "" and h == ""
+
+
+def test_punch_between_1240_1710_shows_on_only(monkeypatch):
+    """13:00(12:40~17:10)→ 只附上班、不附下班(避免誤導的『下班未打卡』)。"""
+    _stub_punch(monkeypatch)
+    t, h = cq._build_punch_status_sections({"punch_status_in_email": True},
+                                           now=_DT2(2026, 6, 25, 13, 0))
+    assert "上班" in _punch_rows(t)
+    assert "下班" not in _punch_rows(t)       # 帳號列不出現下班
+    assert "下班" not in h                     # HTML 整段不出現下班欄
+
+
+def test_punch_after_1710_shows_both(monkeypatch):
+    """17:20(過 17:10)→ 上班 + 下班都附。"""
+    _stub_punch(monkeypatch)
+    t, h = cq._build_punch_status_sections({"punch_status_in_email": True},
+                                           now=_DT2(2026, 6, 25, 17, 20))
+    rows = _punch_rows(t)
+    assert "上班" in rows and "下班" in rows
+    assert "下班" in h
+
+
+def test_punch_disabled_config_empty(monkeypatch):
+    """punch_status_in_email=False → 任何時間都不附。"""
+    _stub_punch(monkeypatch)
+    t, h = cq._build_punch_status_sections({"punch_status_in_email": False},
+                                           now=_DT2(2026, 6, 25, 17, 20))
+    assert t == "" and h == ""
+
+
+def test_format_punch_show_off_false_omits_off_column():
+    """formatter:show_off=False → 純文字帳號列無下班、HTML 無下班欄。"""
+    txt = cq._format_punch_text(_PUNCH_RESULT, show_off=False)
+    html = cq._format_punch_html(_PUNCH_RESULT, show_off=False)
+    assert "下班" not in _punch_rows(txt)
+    assert "下班" not in html
+
+
 # ─── _do_full_job 靜默跳過(多機部署) ────────────────────────────────────
 
 def test_smtp_not_configured_skips_whole_flow(monkeypatch):

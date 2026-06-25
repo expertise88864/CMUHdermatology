@@ -1201,20 +1201,26 @@ def _punch_text_cell(state, time_str) -> str:
     return label
 
 
-def _format_punch_text(results: list) -> str:
+def _format_punch_text(results: list, show_off: bool = True) -> str:
     """各帳號今日上/下班狀態 → 純文字段落。純函式;空回空字串。
-    results=[{username, on, on_time, off, off_time, error}]。"""
+    results=[{username, on, on_time, off, off_time, error}]。
+    show_off=False(尚未過 17:10)→ 只列上班、不列下班(避免顯示誤導的「下班未打卡」)。"""
     if not results:
         return ""
-    lines = [f"今日打卡狀態（{len(results)} 個帳號，上班 07:30-12:30 / 下班 17:00-17:30）："]
+    win = ("上班 07:30-12:40 / 下班 17:00-17:30" if show_off
+           else "上班 07:30-12:40（過 17:10 才附下班）")
+    lines = [f"今日打卡狀態（{len(results)} 個帳號，{win}）："]
     for r in results:
         u = str(r.get("username", "")).strip()
         if r.get("error"):
             lines.append(f"  {u}　⚠️ 查詢失敗（{r['error']}）")
             continue
         on = _punch_text_cell(r.get("on"), r.get("on_time"))
-        off = _punch_text_cell(r.get("off"), r.get("off_time"))
-        lines.append(f"  {u}　上班 {on}　下班 {off}")
+        if show_off:
+            off = _punch_text_cell(r.get("off"), r.get("off_time"))
+            lines.append(f"  {u}　上班 {on}　下班 {off}")
+        else:
+            lines.append(f"  {u}　上班 {on}")
     return "\n".join(lines)
 
 
@@ -1227,15 +1233,18 @@ def _punch_badge_html(state, time_str) -> str:
             f'white-space:nowrap;">{_esc(label)}{t}</span>')
 
 
-def _format_punch_html(results: list) -> str:
-    """各帳號今日上/下班狀態 → HTML 表格(信箋式)。純函式;空回空字串。"""
+def _format_punch_html(results: list, show_off: bool = True) -> str:
+    """各帳號今日上/下班狀態 → HTML 表格(信箋式)。純函式;空回空字串。
+    show_off=False(尚未過 17:10)→ 不出「下班」欄(避免顯示誤導的「下班未打卡」)。"""
     if not results:
         return ""
     th = (f"padding:0 0 8px;border-bottom:1px solid {_MAIL_HEAD};font-size:10.5px;"
           f"letter-spacing:.8px;color:{_MAIL_FAINT};text-transform:uppercase;"
           "text-align:left;")
+    off_th = f'<td style="{th}">下班</td>' if show_off else ""
     rows = [f'<tr><td style="{th}">打卡帳號</td><td style="{th}">上班</td>'
-            f'<td style="{th}">下班</td></tr>']
+            f'{off_th}</tr>']
+    err_colspan = "2" if show_off else "1"
     last = len(results)
     for i, r in enumerate(results, 1):
         line = "" if i == last else f"border-bottom:1px solid {_MAIL_ROW};"
@@ -1245,16 +1254,19 @@ def _format_punch_html(results: list) -> str:
                    f'font-variant-numeric:tabular-nums;">{_esc(u)}</td>')
         if r.get("error"):
             rows.append(
-                f'<tr>{name_td}<td style="{td}color:#b7791f;" colspan="2">'
+                f'<tr>{name_td}<td style="{td}color:#b7791f;" colspan="{err_colspan}">'
                 f'⚠️ 查詢失敗（{_esc(r["error"])}）</td></tr>')
         else:
+            off_td = (f'<td style="{td}">'
+                      f'{_punch_badge_html(r.get("off"), r.get("off_time"))}</td>'
+                      if show_off else "")
             rows.append(
                 f'<tr>{name_td}'
                 f'<td style="{td}">{_punch_badge_html(r.get("on"), r.get("on_time"))}</td>'
-                f'<td style="{td}">{_punch_badge_html(r.get("off"), r.get("off_time"))}</td>'
-                f'</tr>')
+                f'{off_td}</tr>')
+    label = "今日打卡狀態" if show_off else "今日上班打卡狀態"
     return (
-        _section_label(f"今日打卡狀態　·　{len(results)} 個帳號")
+        _section_label(f"{label}　·　{len(results)} 個帳號")
         + '<table class="cq-tbl" style="width:100%;border-collapse:collapse;">'
         + "".join(rows) + "</table>")
 
@@ -1280,10 +1292,20 @@ def _load_autoclock_accounts() -> list:
     return out
 
 
-def _build_punch_status_sections(cfg: dict) -> tuple:
+def _build_punch_status_sections(cfg: dict, now: datetime = None) -> tuple:
     """查各帳號今日上/下班 → (純文字段落, HTML 段落)。完全 fail-open:任何失敗回
-    ('','')、不影響會診信寄出(打卡只是附帶資訊)。"""
+    ('','')、不影響會診信寄出(打卡只是附帶資訊)。
+
+    [2026-06-25 user] 時間閘:過了 12:40 才附「上班」、過了 17:10 才附「下班」。避免 poll 在
+    還沒到下班打卡時間就寄信、打卡表顯示誤導的「下班未打卡」。12:40 前兩者都還沒到 → 不查、不附
+    (連打卡 portal 都不登入)。email 觸發本就不進這支(在 _do_full_job 已先擋掉)。"""
     if not cfg.get("punch_status_in_email", True):
+        return "", ""
+    now = now or datetime.now()
+    show_on = now.time() >= dt_time(12, 40)    # 過了 12:40 才附上班
+    show_off = now.time() >= dt_time(17, 10)   # 過了 17:10 才附下班(必然 show_on 也成立)
+    if not show_on:
+        logging.info("[punch] 尚未過 12:40,本次不附今日打卡狀態(不登入打卡 portal)")
         return "", ""
     try:
         accounts = _load_autoclock_accounts()
@@ -1291,10 +1313,12 @@ def _build_punch_status_sections(cfg: dict) -> tuple:
             logging.info("[punch] 無 autoclock 帳號,信件不附打卡狀態")
             return "", ""
         from cmuh_common.punch_status import query_accounts_today
-        logging.info("[punch] 查詢 %d 個帳號今日打卡狀態…", len(accounts))
+        logging.info("[punch] 查詢 %d 個帳號今日打卡狀態(附下班=%s)…",
+                     len(accounts), show_off)
         results = query_accounts_today(
             accounts, am_window=_PUNCH_AM_WINDOW, pm_window=_PUNCH_PM_WINDOW)
-        return _format_punch_text(results), _format_punch_html(results)
+        return (_format_punch_text(results, show_off),
+                _format_punch_html(results, show_off))
     except Exception:
         logging.warning("[punch] 打卡狀態查詢/組裝失敗(會診信照常寄,不附打卡)",
                         exc_info=True)
