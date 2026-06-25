@@ -756,7 +756,8 @@ def _find_text_panes(children: list, min_height: int = 40) -> list:
 # OCR/截圖猜/像素點選),要逐病人內文則 BM_CLICK 該 radio 再讀下方 memo。
 # CJK 範圍涵蓋 Ext A(㐀-䶿)、基本區(一-鿿)、相容表意文字、Ext B+(astral)
 # —— 罕用字姓名(如 𠮷)也不致被漏判或截斷。
-_CJK_CHARS = r"㐀-䶿一-鿿豈-﫿\U00020000-\U0002ffff"
+_CJK_CHARS = (r"㐀-䶿一-鿿豈-﫿𠀀-𯿿"
+              r"-�■-◿")
 _NAME_RE = re.compile(f"[{_CJK_CHARS}·]+")
 # 病人列文字結構:含床號/房號 '(數字)' 或 >=4 碼病歷號。以「結構」判定而非「含
 # 中文」—— 否則外籍病人(羅馬拼音姓名、無中文)會被漏掉=漏會診通知,有安全疑慮。

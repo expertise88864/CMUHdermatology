@@ -827,11 +827,14 @@ class UvbUpdateResult:
 
 
 def _update_excimer_lines(text: str, today: date,
-                          allow_undated: bool = False) -> tuple[str, int, Optional[dict]]:
+                          allow_undated: bool = False,
+                          skip_stale: bool = False) -> tuple[str, int, Optional[dict]]:
     """Update structured excimer lines independently from UVB lines.
 
     allow_undated=True(只給【純自費 Excimer】路徑用):連沒有日期的 excimer 劑量行也加劑量並
-    補今天日期(圖一)。UVB 路徑的 Step D 用 False —— UVB visit 不應順手改沒日期的 excimer 行。"""
+    補今天日期(圖一)。UVB 路徑的 Step D 用 False —— UVB visit 不應順手改沒日期的 excimer 行。
+    [2026-06-24] skip_stale=True(使用者在確認窗按 Yes 後)→ 不因『日期早於 1 個月』而略過該行,
+    照舊紀錄繼續更新;預設 False 時,日期早於今天往前 1 個日曆月的 excimer 行一律略過(忽略舊段)。"""
     lines = text.splitlines(keepends=True)
     updated = 0
     first_update: Optional[dict] = None
@@ -904,7 +907,13 @@ def _update_excimer_lines(text: str, today: date,
         if (dose < MIN_DOSE or max_dose < MIN_DOSE
                 or increase < 0 or increase > 200
                 or (count is not None and not (1 <= count <= MAX_COUNT))
-                or days_diff < TOO_CLOSE_DAYS or days_diff > STALE_DAYS):
+                or days_diff < TOO_CLOSE_DAYS
+                # [2026-06-24] >2 年(MAX_GAP_DAYS)一律不動 —— 即使 skip_stale(Yes),
+                # 太久遠的紀錄可能跑錯病人,與 UVB 路徑的硬停一致,不可照舊更新。
+                or days_diff > MAX_GAP_DAYS
+                # 1 個月門檻才受 skip_stale 控制:正常路徑略過舊段;Yes 後照舊紀錄更新。
+                or (not skip_stale
+                    and last_date < _months_before(today, MODIFY_STALE_MONTHS))):
             continue
 
         new_dose = compute_new_dose(
@@ -973,6 +982,10 @@ def _detect_uncertain_triplets(text: str, today: date,
         # 太舊跳過 (> 1 年 — 歷史紀錄)
         days_ago = (today - seg_date).days
         if days_ago > max_days_ago:
+            continue
+        # [2026-06-24] 早於 1 個日曆月的舊段 → 視為「已暫停、忽略不修改」,不再當成
+        # 「不確定、要問醫師」(否則被驅動行重選略過的舊行又會跳 Yes/No,違背忽略舊行的意圖)。
+        if seg_date < _months_before(today, MODIFY_STALE_MONTHS):
             continue
         # marker 必須同行 (不跨 newline) — 避免誤抓不相關內容
         line_start = text.rfind("\n", 0, m.start()) + 1
@@ -1082,6 +1095,99 @@ def _first_time_update(parsed: UvbLineInfo, today: date,
     )
 
 
+# [2026-06-24] 「改劑量」的 staleness 門檻:照光行日期早於『今天往前 1 個日曆月』視為舊。
+# 與身份別分流的 STALE_PHOTO_MONTHS(=2,billing 用)是不同概念、各自獨立。
+MODIFY_STALE_MONTHS = 1
+
+
+def _first_fresh_uvb(text: str, cutoff: date) -> Optional[UvbLineInfo]:
+    """回 text 中第一個『日期 >= cutoff(近期)』的 UVB 行(span 轉成全文座標);沒有則 None。
+
+    用於多行:若排在最上面的 UVB 行是舊的(早於 1 個月),改用下面第一條近期 UVB 行來
+    驅動更新——舊行因排在驅動行之前、不會被 Step A/B 動到(等於忽略不修改)。
+
+    [2026-06-24] 逐【行】嘗試 parse(而非用 parse_uvb_line 對整段 search 再前進)——
+    舊行與近期行之間若夾了壞格式 / 有 dose 卻無 MAX/日期 的 UVB 殘句,parse_uvb_line 會回
+    None;逐行掃才不會在那裡提早停、漏掉下面真正的近期行(codex 指出)。"""
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        p = parse_uvb_line(line)
+        if (p is not None and p.last_date is not None
+                and p.last_date >= cutoff):
+            p.span = (p.span[0] + pos, p.span[1] + pos)   # 該行 span → 全文座標
+            return p
+        pos += len(line)
+    return None
+
+
+def _stale_confirm_result(text: str, today: date) -> "UvbUpdateResult":
+    """所有照光行都早於 1 個月 → 回 CONFIRM_NEEDED(單行舊 / 多行全舊 / 單行舊 excimer)。
+    confirm_reason 含「距今 N 天」字樣,讓 caller 判定為 stale 確認窗。"""
+    dts = [d for d in _real_dates_in(text) if d <= today]
+    last = max(dts) if dts else None
+    days = (today - last).days if last is not None else None
+    if last is not None:
+        reason = (f"上次照光日期 {last.strftime('%Y/%m/%d')} 距今 {days} 天 "
+                  f"(超過 1 個月) — 病歷可能是舊紀錄，請確認是否真要按舊紀錄繼續更新")
+    else:
+        reason = "照光紀錄距今已超過 1 個月 — 請確認是否真要按舊紀錄繼續更新"
+    return UvbUpdateResult(
+        action=UvbAction.CONFIRM_NEEDED, confirm_reason=reason,
+        last_date=last, days_diff=days, uvb_line_count=_count_uvb_lines(text))
+
+
+def _all_excimer_stale(text: str, today: date) -> bool:
+    """純 excimer 是否該跳『按舊紀錄確認』:【每一行】excimer 都『早於 1 個月』(全舊),
+    【且】至少有一行在 2 年內(Yes 後 _update_excimer_lines 才真的能更新)。
+
+    [2026-06-24] 兩道條件:
+      - 「全部 excimer 行都舊」而非「任一行舊」—— 否則「舊 excimer + 一行太近的 excimer」
+        也會跳確認,Yes 後反而更新到舊行(太近的那行才是當前治療)。有近期日期、或有【無日期】
+        (可能在做)的 excimer 行 → 非全舊、不跳確認。
+      - 「至少一行在 2 年內」—— 否則全部 >2 年時跳了確認、Yes 卻因 MAX_GAP_DAYS 不更新,白跳窗。"""
+    has_excimer = False
+    has_updatable = False
+    cutoff = _months_before(today, MODIFY_STALE_MONTHS)
+    for line in re.split(r"[\r\n]+", text):
+        if _EXCIMER_MARKER_RE.search(line):
+            dts = _real_dates_in(line)
+            if not dts:
+                return False          # 無日期 excimer 行(可能在做)→ 非全舊
+            if not all(d < cutoff for d in dts):
+                return False          # 有近期日期 → 非全舊
+            has_excimer = True
+            if any(0 <= (today - d).days <= MAX_GAP_DAYS for d in dts):
+                has_updatable = True  # 1 個月 ~ 2 年 → Yes 後可更新
+    return has_excimer and has_updatable
+
+
+def uvb_written_back_ok(text: str, expected_dose, expected_count,
+                        today: Optional[date] = None) -> bool:
+    """寫回後驗證(給 caller 用):掃描 text 內【所有】UVB 行,有一條 dose==expected_dose、
+    count==expected_count 且【日期==today(剛寫回的那條)】即視為寫回成功。
+
+    [2026-06-24] 三個重點:
+      1. 不能只看第一行 —— driver 重選(舊行在上、改下面近期行)後,被更新的驅動行未必是
+         第一條 UVB;只看第一行會把已正確寫回的 stale-above-fresh 誤判失敗。
+      2. 必須一併比對【日期==today】—— 否則巧合 dose/count 相同的舊行(如未動的 530 (6) on
+         3/1)會讓『寫回其實失敗』被誤判成功(codex 指出)。
+      3. 逐【行】嘗試 parse —— 中間夾壞格式 / 有 dose 卻無 MAX/日期 的 UVB 殘句時,整段
+         search 會在那裡失敗或把殘句 dose 跟後面行的 MAX/日期湊在一起,導致驗不到真正更新
+         的那一行而誤判失敗(codex 指出)。
+    無日期(first-time)case:沒有日期可比,改用 parse_uvb_partial 且僅在『確實無日期』時以
+    dose+count 認可(有日期卻沒寫成 today → 視為失敗,不走此後備)。"""
+    if today is None:
+        today = date.today()
+    for line in text.splitlines(keepends=True):
+        p = parse_uvb_line(line)
+        if (p is not None and p.dose == expected_dose
+                and p.count == expected_count and p.last_date == today):
+            return True
+    pp = parse_uvb_partial(text)
+    return bool(pp is not None and pp.last_date is None
+                and pp.dose == expected_dose and pp.count == expected_count)
+
+
 def update_uvb_in_text(text: str, today: Optional[date] = None,
                        skip_dose_sanity: bool = False,
                        skip_stale_check: bool = False) -> UvbUpdateResult:
@@ -1127,7 +1233,7 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         if not re.search(r"(?:UVB|紫外線|Phototherapy|\bUV\b)", text,
                          re.IGNORECASE):
             excimer_text, excimer_count, excimer_first = _update_excimer_lines(
-                text, today, allow_undated=True)
+                text, today, allow_undated=True, skip_stale=skip_stale_check)
             if excimer_count and excimer_first:
                 return UvbUpdateResult(
                     action=UvbAction.UPDATED,
@@ -1139,6 +1245,11 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
                     uvb_line_count=excimer_count,
                     additional_triplets_updated=max(0, excimer_count - 1),
                 )
+            # [2026-06-24] 純 excimer 但每一行日期都早於 1 個月(被略過、沒更新到)→
+            # 跳 Yes/No 確認(單行舊 excimer / 多行 excimer 全舊);Yes 後 caller 帶
+            # skip_stale_check=True 重 call → 上面 skip_stale=True 會照舊紀錄更新。
+            if not skip_stale_check and _all_excimer_stale(text, today):
+                return _stale_confirm_result(text, today)
         # Strict parse 失敗 — 試 partial parse 看是不是「沒日期」case
         partial = parse_uvb_partial(text)
         if partial is None:
@@ -1186,6 +1297,25 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
     # 可能 ≤1500(例:1700 隔 15 天 → 850),早退會誤跳確認。也不在此用 MAX(最高劑量),
     # MAX 可超過 1500。一律往下走 decay/maintain 計算,由「本次計算劑量 new_dose」
     # (compute 之後)+ 同日多行/續行 max_applied_dose(函式尾端)統一判定是否 >1500。
+
+    # [2026-06-24] staleness 分流(改劑量,門檻 = 1 個日曆月):
+    #   - 第一行 UVB 太舊(早於 today-1月)但下面有近期 UVB 行 → 改用近期行驅動,舊行排在
+    #     前面、不會被 Step A/B 動到(等於忽略不修改),不跳窗。
+    #   - 沒有任何近期 UVB 行(單行舊 / 多行全舊)→ 跳 Yes/No 確認;Yes(skip_stale_check)後
+    #     維持舊 parsed、照舊紀錄繼續更新。
+    # 注意:driver 重選【不受】skip_stale_check 影響(dose-confirm 的 Yes 重 call 也要略過舊行);
+    # 只有「全舊 → 確認」這一步才受 skip_stale_check 控制。
+    _cutoff = _months_before(today, MODIFY_STALE_MONTHS)
+    if parsed.last_date is not None and parsed.last_date < _cutoff:
+        _fresh = _first_fresh_uvb(text, _cutoff)
+        if _fresh is not None:
+            parsed = _fresh
+        elif (not skip_stale_check
+              and (today - parsed.last_date).days <= MAX_GAP_DAYS):
+            # 1 個月 ~ 2 年的舊紀錄 → 跳 Yes/No 確認。
+            # 超過 2 年(MAX_GAP_DAYS)不在此攔截 → 落到下方 sanity 檢查回 SANITY_FAIL
+            # (病歷可能跑錯病人,維持硬停);skip_stale_check(Yes)時亦不攔,照舊更新。
+            return _stale_confirm_result(text, today)
 
     # ─── Sanity checks on parsed values ─────────────────────────────────
     # 下限永遠檢查；上限只在非 skip 模式才當作異常
@@ -1242,18 +1372,8 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
             parsed=parsed, uvb_line_count=uvb_lines,
         )
 
-    # [v20.14 2026-05-26] 距上次 > 30 天 → 病歷可能是舊紀錄，跳 Yes/No 確認
-    # caller 按 Yes 後以 skip_stale_check=True 重 call 繼續走 decay 計算
-    if days_diff > STALE_DAYS and not skip_stale_check:
-        return UvbUpdateResult(
-            action=UvbAction.CONFIRM_NEEDED,
-            confirm_reason=(
-                f"上次照光日期 {parsed.last_date.strftime('%Y/%m/%d')} "
-                f"距今 {days_diff} 天 (超過 {STALE_DAYS} 天) — "
-                f"病歷可能是舊紀錄，請確認是否真要按舊紀錄繼續更新"),
-            last_date=parsed.last_date, days_diff=days_diff,
-            parsed=parsed, uvb_line_count=uvb_lines,
-        )
+    # [2026-06-24] 「久未照光 → 確認」已改由前面的 staleness 分流(driver 重選 +
+    # _stale_confirm_result,門檻 1 個日曆月)處理,此處不再重複 STALE_DAYS(30天)檢查。
 
     if days_diff < TOO_CLOSE_DAYS:
         return UvbUpdateResult(
@@ -1407,6 +1527,13 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         seg_days_diff = (today - seg_date).days
         if seg_days_diff < TOO_CLOSE_DAYS or seg_days_diff > MAX_GAP_DAYS:
             continue
+        # [2026-06-24] 略過「與驅動行【不同日期】且早於 1 個月」的舊段 triplet —— 那是另一筆
+        # 要忽略的舊紀錄,避免其劑量剛好等於驅動行 MAX 時被當「安全續行」誤改 count/date。
+        # 但驅動行【自己同日期】的續行 triplet 不在此略過(seg_date==parsed.last_date):
+        # 否則「全舊 → 確認 Yes」後主行更新了、同筆續行卻沒跟著更新(codex 指出)。
+        if (seg_date != parsed.last_date
+                and seg_date < _months_before(today, MODIFY_STALE_MONTHS)):
+            continue
         # 構造該 triplet 替換內容: count→count+1, date→today
         seg_text = m.group(0)
         seg_text = re.sub(
@@ -1461,9 +1588,13 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
             parsed=parsed, days_diff=days_diff, uvb_line_count=uvb_lines,
         )
 
-    # ─── Round-trip verify: 重新 parse 新 text 確認結果一致 ─────────────
-    # 防 format_uvb_line 因為奇怪格式沒替換成功，dose/count/date 跟預期不符
-    verify = parse_uvb_line(new_text)
+    # ─── Round-trip verify: 重新 parse 驅動行的新內容確認結果一致 ─────────
+    # 防 format_uvb_line 因為奇怪格式沒替換成功，dose/count/date 跟預期不符。
+    # [2026-06-24] 直接 parse Step A 產生的 new_line(驅動行新內容),【不靠位置】——
+    # driver 重選時第一行是舊行;且驅動行前方若有 fresh excimer 被 Step D 改成不同長度,
+    # 用原始 span 切片會偏位 → 改驗 new_line 本身,與位置/前方編輯無關(new_line 在 Step A
+    # 後不會再被 Step B/C/D 動到:Step C 對 date==today 的驅動行會跳過)。
+    verify = parse_uvb_line(new_line)
     if verify is None:
         return UvbUpdateResult(
             action=UvbAction.SANITY_FAIL,

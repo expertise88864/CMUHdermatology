@@ -1909,6 +1909,50 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
                 main_hwnd, "Excimer 照光間隔太短",
                 f"距上次照光僅 {result.days_diff} 天,劑量未自動更新。\n"
                 "身份已設自費(01),請醫師確認照光劑量。")
+        elif result.action == UvbAction.CONFIRM_NEEDED:
+            # [2026-06-24] 純 excimer 也可能跳 stale 確認(>1 月舊紀錄)/ 劑量超限確認。
+            # 跳 Yes/No;Yes → 帶 skip 旗標重跑並寫回。No → 不改劑量(身份仍設 01)。
+            confirm_reason = result.confirm_reason or "請確認"
+            is_stale = "距今" in confirm_reason and "天" in confirm_reason
+            dlg_title = (f"Excimer 距上次照光時間過長 - {label}" if is_stale
+                         else f"Excimer 劑量超過建議上限 - {label}")
+            dlg_intro = ("請確認是否要按舊紀錄繼續更新" if is_stale
+                         else "請確認劑量")
+            try:
+                import winsound
+                winsound.MessageBeep(0x30)
+            except Exception:
+                pass
+            # MB_ICONQUESTION|MB_YESNO|MB_TOPMOST|MB_SETFOREGROUND|MB_DEFBUTTON2(預設否)
+            flags = 0x20 | 0x4 | 0x40000 | 0x10000 | 0x100
+            try:
+                with _hotkey_awaiting_user_scope():
+                    ans = ctypes.windll.user32.MessageBoxW(
+                        main_hwnd,
+                        f"{dlg_intro}\n\n{confirm_reason}\n\n要繼續執行變更嗎?",
+                        dlg_title, flags)
+            except Exception:
+                logging.exception(
+                    "[%s][Excimer] CONFIRM_NEEDED MessageBoxW 失敗", label)
+                ans = 7  # 視為否
+            if ans == 6:  # IDYES
+                result = update_uvb_in_text(
+                    text, skip_dose_sanity=True, skip_stale_check=True)
+                if result.action == UvbAction.UPDATED and result.new_text:
+                    if _write_tmemo_text(memo_hwnd, result.new_text):
+                        logging.info(
+                            "[%s][Excimer] (確認後)劑量已更新(次數→%s、劑量→%s)",
+                            label, result.new_count, result.new_dose)
+                    else:
+                        logging.warning(
+                            "[%s][Excimer] (確認後)劑量寫回失敗(身份仍設 01)",
+                            label)
+                else:
+                    logging.info("[%s][Excimer] 確認後 action=%s,未更新劑量",
+                                 label, result.action)
+            else:
+                logging.info(
+                    "[%s][Excimer] 使用者按否 → 劑量未更新(身份仍設 01)", label)
         else:
             logging.info(
                 "[%s][Excimer] 劑量未自動更新(action=%s),身份仍設 01",
@@ -2192,15 +2236,18 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
     # 寫回後實機 read 驗證 — Delphi onChange 可能 reformat 過
     actual_text = _read_tmemo_text(memo_hwnd)
     if actual_text:
-        from cmuh_common.uvb_dose import parse_uvb_line, parse_uvb_partial
+        from cmuh_common.uvb_dose import (
+            parse_uvb_line, parse_uvb_partial, uvb_written_back_ok)
         # [2026-06-04] 處置「無日期」時 parse_uvb_line 會回 None(它要求 on (日期))，
         # 但 update_uvb_in_text 是用 parse_uvb_partial 處理無日期 → 寫回後也無日期。
         # verify 必須同樣容忍無日期(partial fallback)，否則「劑量其實已改」卻被誤判
         # verify 失敗而中止、跳過 51019(沈冠宇實機 case: "UVB: 950 mj/cm2 (10)" 無日期)。
-        verify = parse_uvb_line(actual_text) or parse_uvb_partial(actual_text)
-        if (verify is None
-                or verify.dose != result.new_dose
-                or verify.count != result.new_count):
+        # [2026-06-24] 改用 uvb_written_back_ok 掃【所有】UVB 行比對 —— driver 重選
+        # (舊行在上、改下面近期行)後,更新的驅動行未必是第一條;只看第一行會把已正確
+        # 寫回的 stale-above-fresh 情境誤判失敗。verify 變數仍保留供失敗時的 log/提示顯示。
+        if not uvb_written_back_ok(actual_text, result.new_dose,
+                                   result.new_count):
+            verify = parse_uvb_line(actual_text) or parse_uvb_partial(actual_text)
             logging.warning(
                 "[%s][UVB] 寫回後實機 verify 失敗 — 預期 dose=%s count=%s, "
                 "實際=%r → 終止", label, result.new_dose, result.new_count,

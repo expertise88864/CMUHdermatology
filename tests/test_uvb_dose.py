@@ -1589,7 +1589,184 @@ def test_max_gap_days_still_sanity_fail_over_2_years():
     # 2023/01/01 → 2026/05/26 = 1241 天
     r = update_uvb_in_text(text, today=date(2026, 5, 26))
     assert r.action == UvbAction.SANITY_FAIL
-    assert ">730" in (r.sanity_reason or "") or "730" in (r.sanity_reason or "")
+    assert "730" in (r.sanity_reason or "")
+
+
+# ─── [2026-06-24] 1 個日曆月門檻 + 單行/多行 staleness 分流 ────────────────
+
+_TODAY = date(2026, 6, 24)
+
+
+def test_multi_stale_above_fresh_skips_old_updates_new():
+    """[Gap A] 舊行(3/1)排在新行(6/17)上面 → 略過舊行、只改新行、不跳窗;舊行原樣保留。"""
+    text = ("UVB: 700 mj/cm2 (20) on (2026/03/01), increase 30, MAX:900\n"
+            "UVB: 500 mj/cm2 (5) on (2026/06/17), increase 30, MAX:800")
+    r = update_uvb_in_text(text, today=_TODAY)
+    assert r.action == UvbAction.UPDATED
+    assert "(2026/03/01)" in r.new_text          # 舊行日期原樣保留
+    assert "700 mj/cm2 (20)" in r.new_text        # 舊行劑量/次數不動
+    assert "(2026/06/24)" in r.new_text          # 新行更新到今天
+    assert "(6)" in r.new_text                    # 新行 count 5→6
+    assert r.uncertain_other_triplets is None     # 舊行不再被當「不確定要問」
+
+
+def test_gap_a_stale_line_dose_equals_driver_max_not_touched():
+    """[codex P2] 被略過的舊行,其劑量剛好等於新驅動行 MAX 時,舊行 (count)/(date)
+    也不可被 Step C 當「安全續行」誤改 —— 與「忽略舊行」一致。"""
+    text = ("UVB: 800 mj/cm2 (20) on (2026/03/01), increase 30, MAX:900\n"
+            "UVB: 500 mj/cm2 (5) on (2026/06/17), increase 30, MAX:800")
+    r = update_uvb_in_text(text, today=_TODAY)
+    assert r.action == UvbAction.UPDATED
+    assert "(20) on (2026/03/01)" in r.new_text   # 舊行 count/date 完全不動
+    assert "(6) on (2026/06/24)" in r.new_text     # 新行才更新
+
+
+def test_gap_a_fresh_excimer_before_driver_no_false_sanity_fail():
+    """[codex P2] 驅動 UVB 行前方有 fresh excimer,Step D 把它劑量改短(1000→250)造成位移;
+    verify 改驗 new_line 後不可誤判 SANITY_FAIL,UVB 驅動行要正常更新。"""
+    text = ("UVB: 700 mj/cm2 (20) on (2026/03/01), increase 30, MAX:900\n"
+            "excimer light 1000 mj/cm2 (8) on (2026/06/01), increase 30, max 1200\n"
+            "UVB: 500 mj/cm2 (5) on (2026/06/17), increase 30, MAX:800")
+    r = update_uvb_in_text(text, today=_TODAY)
+    assert r.action == UvbAction.UPDATED
+    assert "(6) on (2026/06/24)" in r.new_text   # UVB 驅動行更新
+    assert "(2026/03/01)" in r.new_text          # 最上面舊 UVB 行不動
+
+
+def test_gap_a_skips_malformed_uvb_between_stale_and_fresh():
+    """[codex P2] 舊 UVB 行 + 中間壞格式 UVB 殘句(有 dose 無 MAX/日期)+ 下面近期 UVB 行 →
+    驅動行重選要逐行掃、跳過壞句找到近期行,不可在壞句處提早停而誤判全舊。"""
+    text = ("UVB: 700 mj/cm2 (20) on (2026/03/01), increase 30, MAX:900\n"
+            "UVB 600 mj/cm2 maintain\n"   # 壞格式:有 dose 但無 MAX/日期 → parse 失敗
+            "UVB: 500 mj/cm2 (5) on (2026/06/17), increase 30, MAX:800")
+    r = update_uvb_in_text(text, today=_TODAY)
+    assert r.action == UvbAction.UPDATED
+    assert "(6) on (2026/06/24)" in r.new_text   # 下面近期行被更新
+    assert "(2026/03/01)" in r.new_text          # 最上面舊行不動
+
+
+def test_multi_fresh_above_stale_below_keeps_old():
+    """新行在上、舊行在下 → 改新、舊行不動、不跳窗。"""
+    text = ("UVB: 500 mj/cm2 (5) on (2026/06/17), increase 30, MAX:800\n"
+            "UVB: 700 mj/cm2 (20) on (2026/03/01), increase 30, MAX:900")
+    r = update_uvb_in_text(text, today=_TODAY)
+    assert r.action == UvbAction.UPDATED
+    assert "(2026/03/01)" in r.new_text and "700 mj/cm2 (20)" in r.new_text
+
+
+def test_multi_all_stale_confirms():
+    """多行但每行都 >1 個月 → 跳確認(沒有任何近期行可改)。"""
+    text = ("UVB: 700 mj/cm2 (20) on (2026/03/01), increase 30, MAX:900\n"
+            "UVB: 500 mj/cm2 (5) on (2026/02/01), increase 30, MAX:800")
+    r = update_uvb_in_text(text, today=_TODAY)
+    assert r.action == UvbAction.CONFIRM_NEEDED
+    assert "距今" in (r.confirm_reason or "")
+
+
+def test_stale_yes_updates_same_record_continuation_triplet():
+    """[codex P2] 舊 UVB 行含『同日期續行 triplet』→ 確認 Yes 後,主行與續行都要更新到今天
+    (不可因舊段略過而把同筆續行漏掉)。"""
+    text = ("UVB: 1000 mj/cm2 (10) on (2026/03/01), increase 30, MAX:1000, "
+            "continue 1000 mj/cm2 (44) on (2026/03/01)")
+    r = update_uvb_in_text(text, today=_TODAY)
+    assert r.action == UvbAction.CONFIRM_NEEDED
+    r2 = update_uvb_in_text(text, today=_TODAY,
+                            skip_stale_check=True, skip_dose_sanity=True)
+    assert r2.action == UvbAction.UPDATED
+    assert (r2.new_text or "").count("(2026/06/24)") == 2  # 主行 + 續行都到今天
+    assert "(2026/03/01)" not in (r2.new_text or "")        # 無殘留舊日期
+
+
+def test_single_stale_excimer_confirms_then_yes_updates():
+    """[Gap B] 單一一行舊 excimer(>1月)→ 跳確認;Yes(skip_stale_check)後才更新。"""
+    text = "excimer light 510 mj/cm2 (8) on (2026/03/01), increase 30, max 800"
+    r = update_uvb_in_text(text, today=_TODAY)
+    assert r.action == UvbAction.CONFIRM_NEEDED
+    assert "距今" in (r.confirm_reason or "")
+    r2 = update_uvb_in_text(text, today=_TODAY,
+                            skip_stale_check=True, skip_dose_sanity=True)
+    assert r2.action == UvbAction.UPDATED
+    assert "(2026/06/24)" in (r2.new_text or "")
+
+
+def test_mixed_stale_uvb_excimer_yes_updates_uvb_keeps_old_excimer():
+    """[codex P2] 混合『舊 UVB + 舊 excimer』→ 跳確認;Yes 後只更新主行 UVB,舊 excimer
+    維持不動 —— 因 skip_stale_check 在 main.py 與『劑量超限確認』共用,Step D 不放行舊段,
+    避免只確認劑量的情境誤改舊 excimer。"""
+    text = ("UVB: 500 mj/cm2 (5) on (2026/03/01), increase 30, MAX:800\n"
+            "excimer light 600 mj/cm2 (8) on (2026/03/01), increase 30, max 900")
+    r = update_uvb_in_text(text, today=_TODAY)
+    assert r.action == UvbAction.CONFIRM_NEEDED
+    r2 = update_uvb_in_text(text, today=_TODAY,
+                            skip_stale_check=True, skip_dose_sanity=True)
+    assert r2.action == UvbAction.UPDATED
+    assert "(6) on (2026/06/24)" in r2.new_text                  # UVB 主行更新
+    assert "excimer light 600 mj/cm2 (8) on (2026/03/01)" in r2.new_text  # 舊 excimer 不動
+
+
+def test_pure_excimer_old_plus_too_close_no_stale_confirm():
+    """[codex P2] 舊 excimer + 太近(<2天)的 excimer → 不可跳 stale 確認 ——
+    否則 Yes 會更新到舊行,但太近的那行才是當前治療。"""
+    text = ("excimer light 510 mj/cm2 (8) on (2026/03/01), increase 30, max 800\n"
+            "excimer light 520 mj/cm2 (9) on (2026/06/23), increase 30, max 800")
+    r = update_uvb_in_text(text, today=_TODAY)  # 6/23 距今 1 天(太近)
+    assert r.action != UvbAction.CONFIRM_NEEDED
+
+
+def test_very_old_excimer_not_updated_even_after_yes():
+    """[codex P2] >2 年的 excimer 即使按 Yes(skip_stale_check)也不更新 —— 可能跑錯病人,
+    與 UVB 路徑的硬停一致。"""
+    text = "excimer light 510 mj/cm2 (8) on (2020/01/01), increase 30, max 800"
+    # 第一次:>2 年 → 不跳確認(否則 Yes 也不更新、白跳窗)
+    assert update_uvb_in_text(text, today=_TODAY).action != UvbAction.CONFIRM_NEEDED
+    # 即使硬帶 Yes 旗標也不更新
+    r2 = update_uvb_in_text(text, today=_TODAY,
+                            skip_stale_check=True, skip_dose_sanity=True)
+    assert r2.action != UvbAction.UPDATED
+    assert "(2026/06/24)" not in (r2.new_text or "")  # 沒被改成今天
+
+
+def test_fresh_excimer_updates_normally():
+    """單一一行近期 excimer(<1月)→ 正常加劑量,不跳窗。"""
+    text = "excimer light 510 mj/cm2 (8) on (2026/06/17), increase 30, max 800"
+    r = update_uvb_in_text(text, today=_TODAY)
+    assert r.action == UvbAction.UPDATED
+    assert "(9)" in r.new_text and "(2026/06/24)" in r.new_text
+
+
+def test_calendar_month_threshold_about_5_weeks_stale():
+    """門檻是 1 個日曆月:約 5 週前(早於 today 往前 1 月)的單行 → 跳確認。"""
+    text = "UVB: 500 mj/cm2 (5) on (2026/05/10), increase 30, MAX:800"
+    r = update_uvb_in_text(text, today=_TODAY)  # 5/10 早於 5/24(today-1月)→ 舊
+    assert r.action == UvbAction.CONFIRM_NEEDED
+
+
+def test_uvb_written_back_ok_scans_all_lines():
+    """[codex P2] 寫回後驗證掃【所有】UVB 行 —— driver 重選後更新的行未必是第一條,
+    只看第一行會把 stale-above-fresh 已正確寫回誤判失敗。"""
+    from cmuh_common.uvb_dose import uvb_written_back_ok
+    text = ("UVB: 700 mj/cm2 (20) on (2026/03/01), increase 30, MAX:900\n"
+            "UVB: 500 mj/cm2 (6) on (2026/06/24), increase 30, MAX:800")
+    assert uvb_written_back_ok(text, 500, 6, _TODAY) is True   # 第二行(今天)符合
+    assert uvb_written_back_ok(text, 999, 6, _TODAY) is False   # 沒有任何行符合
+    # [codex P2] 巧合 dose/count 相同但日期是舊的(3/1)→ 不可誤判成功(寫回其實失敗)
+    stale = "UVB: 530 mj/cm2 (6) on (2026/03/01), increase 30, MAX:900"
+    assert uvb_written_back_ok(stale, 530, 6, _TODAY) is False
+    # 無日期 first-time case:用 partial 認可(本來就無日期可比)
+    assert uvb_written_back_ok("UVB: 850 mj/cm2 (10), MAX:1000", 850, 10,
+                               _TODAY) is True
+    # [codex P2] 中間夾壞格式 UVB 殘句,仍要驗得到下面真正更新的行
+    text3 = ("UVB: 700 mj/cm2 (20) on (2026/03/01), increase 30, MAX:900\n"
+             "UVB 600 mj/cm2 maintain\n"
+             "UVB: 500 mj/cm2 (6) on (2026/06/24), increase 30, MAX:800")
+    assert uvb_written_back_ok(text3, 500, 6, _TODAY) is True
+
+
+def test_calendar_month_threshold_within_month_updates():
+    """1 個日曆月內(today 往前 1 月之後)的單行 → 正常更新,不跳窗。"""
+    text = "UVB: 500 mj/cm2 (5) on (2026/06/01), increase 30, MAX:800"
+    r = update_uvb_in_text(text, today=_TODAY)  # 6/1 晚於 5/24 → 近期
+    assert r.action == UvbAction.UPDATED
 
 
 # ─── v20.15 5 張 screenshot 的 parse 擴充 ──────────────────────────────

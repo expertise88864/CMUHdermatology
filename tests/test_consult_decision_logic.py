@@ -543,6 +543,18 @@ def test_parse_roster_row_letter_only_ward():
     assert "BURN · 10B" in meta and "0000416350" in meta and "06/18 11:27" in meta
 
 
+def test_parse_roster_row_garbled_name():
+    """[2026-06-24] 姓名含造字/亂碼字(私用區 EUDC / 替代字 U+FFFD / tofu 方塊 U+25AF)
+    也要解析 —— 否則整列 fullmatch 失敗 → 清單擠成一團跑版(黃琇▯ 實機 case)。"""
+    for garble in (chr(0xE123), chr(0xFFFD), chr(0x25AF)):
+        row = f"黃琇{garble}C11(202)0000350887(吳伯元)06/24(11:21)"
+        p = cq._parse_roster_row(row)
+        assert p is not None, hex(ord(garble))
+        assert p["ward_bed"] == "C11 · 202"
+        assert p["chart"] == "0000350887"
+        assert p["vs"] == "吳伯元"
+
+
 def test_patient_head_name_plus_meta():
     """逐病人標題:姓名 + 床位/病歷號/日期時間。解析不出結構 → 僅顯示簡名。"""
     name, meta = cq._patient_head("簡志仲I8(18A)0042107068(謝佳陵)06/17(11:23)")
