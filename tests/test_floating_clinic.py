@@ -5,6 +5,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from datetime import datetime as _DT  # noqa: E402
+
 from cmuh_common.floating_clinic import (  # noqa: E402
     RoomStatus,
     clamp_opacity,
@@ -27,7 +29,7 @@ def test_should_show_room_autohide_rules():
         RoomStatus(room="103", stopped=True, light="--", fetched=True)) is False
     assert should_show_room(
         RoomStatus(room="103", closed=True, light="休", fetched=True)) is False
-    # 已查到、有醫師但未開診 → 顯示(會顯示未開診)
+    # 已查到、有醫師但未開診、【無時段對照】→ 顯示(無法判斷開診時間 → 保守顯示未開診)
     assert should_show_room(
         RoomStatus(room="102", doctor="王醫師", stopped=True, fetched=True)) is True
     # 已查到、有燈號(看診中)→ 顯示
@@ -38,6 +40,38 @@ def test_should_show_room_autohide_rules():
         RoomStatus(room="101", doctor="王醫師", light="58", closed=True, fetched=True)) is False
     # 還沒查到資料 → 先顯示(不要急著隱藏)
     assert should_show_room(RoomStatus(room="103", fetched=False)) is True
+
+
+def test_should_show_room_stopped_time_cutoff_by_slot():
+    """[2026-06-25 user] 有醫師但「未開診」:過了該時段開診時間(早 08:40 / 午 13:40 / 晚 18:10)
+    還沒開 → 隱藏;在那之前先顯示。實機案例:102 謝佳陵晚診到 21:31 還未開診 → 該隱藏。"""
+    def ev(now):   # 晚上未開診(謝佳陵)
+        return should_show_room(
+            RoomStatus(room="102", doctor="謝佳陵", slot="晚上", stopped=True, fetched=True), now)
+    assert ev(_DT(2026, 6, 25, 21, 31)) is False   # 過 18:10 → 隱藏(實機 102)
+    assert ev(_DT(2026, 6, 25, 18, 10)) is False   # 18:10 整 → 隱藏
+    assert ev(_DT(2026, 6, 25, 17, 0)) is True     # 未到 18:10 → 先顯示
+
+    def am(now):   # 早上未開診
+        return should_show_room(
+            RoomStatus(room="201", doctor="王醫師", slot="早上", stopped=True, fetched=True), now)
+    assert am(_DT(2026, 6, 25, 9, 0)) is False      # 過 08:40 → 隱藏
+    assert am(_DT(2026, 6, 25, 8, 0)) is True        # 未到 → 顯示
+
+    def pm(now):   # 下午未開診
+        return should_show_room(
+            RoomStatus(room="301", doctor="李醫師", slot="下午", stopped=True, fetched=True), now)
+    assert pm(_DT(2026, 6, 25, 14, 0)) is False      # 過 13:40 → 隱藏
+    assert pm(_DT(2026, 6, 25, 13, 0)) is True        # 未到 → 顯示
+
+    # 看診中(有燈號)→ 不受時間閘影響,一律顯示
+    assert should_show_room(
+        RoomStatus(room="101", doctor="張廖年峰", slot="晚上", light="208",
+                   waiting=8, fetched=True), _DT(2026, 6, 25, 21, 31)) is True
+    # 已關診 → 一律隱藏(與時間閘無關)
+    assert should_show_room(
+        RoomStatus(room="102", doctor="謝佳陵", slot="晚上", closed=True, fetched=True),
+        _DT(2026, 6, 25, 17, 0)) is False
 
 
 def test_should_show_room_hides_errored_no_clinic_room():

@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime, time as dt_time
 from typing import Callable, Optional
 
 # ── 視覺常數(深色 sleek 風;半透明浮窗在深色上最好看) ──────────────────
@@ -63,24 +64,49 @@ class RoomStatus:
 
 _PLACEHOLDER_LIGHT = {"--", "—", "休", "0", ""}
 
+# [2026-06-25 user] 各時段「未開診(stopped)」過了開診時間還沒開 → 視為今天這診不會開了 → 隱藏。
+# 在那之前先顯示「未開診」,讓使用者知道今天有排這診。取不到時段對照(空/未知時段)→ 不靠這條藏。
+_STOPPED_HIDE_AFTER = {
+    "早上": dt_time(8, 40), "上午": dt_time(8, 40),
+    "下午": dt_time(13, 40),
+    "晚上": dt_time(18, 10),
+}
 
-def should_show_room(s: RoomStatus) -> bool:
-    """這個診間要不要顯示在浮動視窗。純函式。
 
-    使用者規則(2026-06-19):
+def _stopped_past_cutoff(slot: str, now=None) -> bool:
+    """該時段『未開診』是否已過開診時間(早 08:40 / 午 13:40 / 晚 18:10)→ 視為今天不會開了。
+    取不到時段對照 → 回 False(不靠這條藏,維持顯示)。now=None 用現在時間。純函式(可注入 now)。"""
+    cutoff = _STOPPED_HIDE_AFTER.get((slot or "").strip())
+    if cutoff is None:
+        return False
+    if now is None:
+        now = datetime.now()
+    return now.time() >= cutoff
+
+
+def should_show_room(s: RoomStatus, now=None) -> bool:
+    """這個診間要不要顯示在浮動視窗。純函式(now 可注入,預設現在時間)。
+
+    使用者規則(2026-06-19;2026-06-25 補時間閘):
       - 還沒查到資料(fetched=False)→ 先顯示(中性「—」),不要急著隱藏。
       - 【已關診(closed)→ 一律不顯示】(早診拖班看完就消失,不佔位)。
-      - 有醫師姓名(且未關診)→ 顯示(即使未開診,顯示「未開診」)。
+      - 有醫師姓名 +「未開診」:過了該時段開診時間(早 08:40 / 午 13:40 / 晚 18:10)還沒開
+        → 視為今天不會開了 → 隱藏;在那之前先顯示「未開診」(讓使用者知道今天有排這診)。
+      - 有醫師姓名(其餘未關診情形,含離線)→ 顯示。
       - 沒醫師姓名:未開診/離線 → 代表今天沒有這個診 → 隱藏(UI 自動縮減);
         其餘只有「真的有有效看診號」才顯示。
     [2026-06-19 修] 未開診的診間 reg64 燈號常是 '--' 佔位字,舊版誤判成「有燈號」而沒隱藏。
     [2026-06-19 user] closed 改為一律隱藏(原本有醫師時會顯示「關診」)。
+    [2026-06-25 user] 未開診加時間閘:過了開診時間還沒開才隱藏(原本有醫師就一直顯示未開診)。
     """
     if not s.fetched:
         return True
     if s.closed:
         return False
-    if (s.doctor or "").strip():
+    has_doctor = bool((s.doctor or "").strip())
+    if s.stopped and has_doctor and _stopped_past_cutoff(s.slot, now):
+        return False
+    if has_doctor:
         return True
     if s.error or s.stopped:
         return False
