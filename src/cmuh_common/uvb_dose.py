@@ -130,10 +130,17 @@ class UvbLineInfo:
 #   「keep phototherapy on both lower limbs to 680 mj/cm2」)。關鍵字與劑量間夾一段
 #   文字、用「to」帶出劑量。為避免誤抓(如「want to photo 2 times」)，這個分支要求
 #   數字後面緊跟「mj」單位(zero-width lookahead)，且關鍵字到 to 之間 ≤40 字、不跨逗號。
+# [2026-06-26] 也接受「keyword<描述文字>: <劑量>」自由寫法(簡子泰實機 case:
+#   「UVB局部臉和後背: 440 mj/cm2(9)…」)。關鍵字後【沒空格】直接接中文描述(局部臉和後背)、再用冒號
+#   帶出劑量 → 原本三個分支都比不到(branch1 要求數字緊跟關鍵字;branch2/3 要求關鍵字後有空白再接
+#   dose/to)。新 branch4:關鍵字後 ≤40 字「非數字、非逗號」的描述 + 冒號 + 劑量。因排除數字,描述段
+#   不會跨過任何數字(會停在第一個數字),故抓到的是【冒號後的第一個數字=本次劑量】、不會誤抓後面的
+#   max(如 fixed at 1000);且描述在冒號【前】,故「UVB: 已打折 1000」(中文在冒號後)不會被這支誤吃。
 _UVB_DOSE_RE = re.compile(
     r"(UVB|Phototherapy|UV)(?:\s*[:：,，]?\s*"
     r"|\s+[^\r\n,，]{0,40}?\bdose\s*[:：]?\s*"
-    r"|\s+[^\r\n,，]{0,40}?\bto\s+(?=\d+\s*mj))(\d+)",
+    r"|\s+[^\r\n,，]{0,40}?\bto\s+(?=\d+\s*mj)"
+    r"|[^\r\n\d,，]{0,40}?[:：]\s*)(\d+)",
     re.IGNORECASE)
 # [v20.11] 接受帶 paren 跟不帶 paren 兩種:
 #   (2026/05/24) — group 1-3
@@ -554,6 +561,11 @@ def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
         dose = int(dose_m.group(2))
     except ValueError:
         return None
+    # [2026-06-26 Codex] 劑量數字若【緊跟】上限/固定關鍵字(max / fixed / upper limit / 上限 / 固定…,
+    # 即 _CEILING_KEYWORD_BEFORE_RE)→ 那是上限不是本次劑量(新 branch4 '描述+冒號' 會把 'UVB max: 1000'
+    # 的 1000 誤抓成劑量)。寧可回 None(parse_fail 讓醫師手動),也絕不可拿上限當本次劑量去加減/維持。
+    if _CEILING_KEYWORD_BEFORE_RE.search(text[:dose_m.start(2)]):
+        return None
     keyword_text = dose_m.group(1)  # "UVB" or "Phototherapy"
     dose_start = dose_m.start()
 
@@ -658,6 +670,9 @@ def parse_uvb_partial(text: str) -> Optional[UvbLineInfo]:
     try:
         dose = int(dose_m.group(2))
     except ValueError:
+        return None
+    # [2026-06-26 Codex] 同 parse_uvb_line:劑量緊跟上限/固定關鍵字 → 是上限不是劑量 → 不解析。
+    if _CEILING_KEYWORD_BEFORE_RE.search(text[:dose_m.start(2)]):
         return None
     keyword_text = dose_m.group(1)
     dose_start = dose_m.start()

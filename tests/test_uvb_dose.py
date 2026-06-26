@@ -2867,6 +2867,53 @@ def test_excimer_same_day_returns_too_close_image2():
     assert r.days_diff == 0
 
 
+def test_uvb_keyword_then_chinese_desc_colon_dose_parses():
+    """[2026-06-26 簡子泰實機] 'UVB局部臉和後背: 440 ...' —— 關鍵字後沒空格直接接中文描述、再用冒號
+    帶出劑量,原本三個分支都比不到 → F2「找不到可解析的 UVB 行」。新分支要能解析並正常加劑量。"""
+    today = date(2026, 6, 26)
+    text = ("UVB局部臉和後背: 440 mj/cm2(9) on (2026/6/24) add 30 each time, "
+            "fixed at 1000mj/cm2")
+    r = update_uvb_in_text(text, today=today)
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 470          # 440 + 30(隔 2 天)
+    assert "(10)" in r.new_text       # 次數 9→10
+    assert "(2026/06/26)" in r.new_text
+    assert "fixed at 1000" in r.new_text   # max 不被當劑量改掉
+
+
+def test_uvb_desc_colon_dose_not_grab_max():
+    """新分支安全:'UVB臉部: 500 ... fixed at 800' 抓到的是冒號後第一個數字(劑量 500),不是後面的
+    上限 800。"""
+    today = date(2026, 6, 26)
+    text = "UVB臉部: 500 mj/cm2(3) on (2026/6/24) add 50 each time, fixed at 800"
+    r = update_uvb_in_text(text, today=today)
+    assert r.action == UvbAction.UPDATED
+    assert r.new_dose == 550          # 500 + 50,不是 800
+
+
+def test_uvb_chinese_after_colon_still_parse_fail():
+    """回歸守門:'UVB: 已打折 1000'(中文在冒號【後】)仍維持 parse_fail,不被新分支誤吃成劑量 1000。"""
+    today = date(2026, 6, 26)
+    r = update_uvb_in_text("UVB: 已打折 1000 mj/cm2 on (2026/6/24)", today=today)
+    assert r.action != UvbAction.UPDATED
+
+
+def test_uvb_ceiling_label_before_dose_not_used_as_dose():
+    """[Codex] 上限標籤在劑量前(如 'UVB max: 1000 … 440')→ 新 branch4 會把 1000(上限)誤抓成劑量。
+    守門:劑量緊跟 max/fixed/上限/固定 等上限關鍵字 → 不解析(不可拿上限當本次劑量)。各種寫法都不可
+    更新成上限值。"""
+    today = date(2026, 6, 26)
+    for text in (
+        "UVB max: 1000 mj/cm2 fixed at 1000, 440 mj on (2026/6/24) add 30",
+        "UVB max : 1000 mj/cm2 on (2026/6/24) add 30 max 1000",   # 冒號前有空格
+        "UVB 上限: 800 mj/cm2 on (2026/6/24) add 30 fixed at 800",
+        "UVB fixed: 900 mj/cm2 on (2026/6/24) add 30 fixed at 900",
+    ):
+        r = update_uvb_in_text(text, today=today)
+        assert r.action != UvbAction.UPDATED, text   # 絕不可用上限值更新
+        assert r.new_dose is None, text
+
+
 def test_excimer_ceiling_before_dose_not_read_as_dose():
     """[Codex] 'fixed at 1000' 的上限在劑量前面時,1000 不可被當劑量;810 才是劑量(810→840)。"""
     today = date(2026, 6, 25)
