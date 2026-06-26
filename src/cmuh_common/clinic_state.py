@@ -147,7 +147,9 @@ def restore_tracker_from_state(state: Any, curr_session_i: str,
             pass
     tracker["patient_checkin_times"] = patient_times
 
-    for key in ("stable_since_ts",):
+    # [2026-06-26] last_activity_ts 也持久化:拖班 plateau 門檻(30→60 分)靠它判定「最後進展是否
+    # 在關診時間後」,跨重啟要保留,否則重啟後深度拖班診會短暫退回 30 分門檻而可能誤關。
+    for key in ("stable_since_ts", "last_activity_ts"):
         try:
             tracker[key] = float(state[key]) if state.get(key) is not None else None
         except (TypeError, ValueError):
@@ -206,6 +208,7 @@ def build_dynamic_state(today_str: str, saved_at: str, room_code: Any,
         "first_valid_skipped": bool(tracker.get("first_valid_skipped", False)),
         "had_any_activity": bool(tracker.get("had_any_activity", False)),
         "stable_since_ts": tracker.get("stable_since_ts"),
+        "last_activity_ts": tracker.get("last_activity_ts"),
         "last_monitor_pair": (
             list(tracker.get("last_monitor_pair"))
             if tracker.get("last_monitor_pair") else None

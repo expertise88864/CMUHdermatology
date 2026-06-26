@@ -961,6 +961,14 @@ def _initialize_status_driver():
     try:
         # [優化] Selenium 4.6+ 自動呼叫底層 Selenium Manager 載入驅動，秒開毫秒就緒
         driver = webdriver.Chrome(options=build_chrome_options(headless=True))
+        # [2026-06-26] 設網頁載入逾時:院方系統半夜維護/網路閒置斷線時 driver.get 可能【無限期】
+        # 卡住 → 打卡查詢執行緒永遠不結束 → _clock_status_worker_running 旗標卡死 → 之後 08:00/
+        # 17:03/手動全部被「上一輪仍在查詢」擋掉(跨日後就再也不更新,得重開程式)。設逾時 → 卡住會
+        # 丟 TimeoutException、查詢正常結束、旗標歸零。(比照 punch_status.query_accounts_today。)
+        try:
+            driver.set_page_load_timeout(_STATUS_DRIVER_PAGELOAD_TIMEOUT)
+        except Exception:
+            logging.debug("set_page_load_timeout 失敗", exc_info=True)
         logging.info("Headless WebDriver initialized successfully.")
         return driver
     except Exception as e:
@@ -982,6 +990,11 @@ _status_driver_pool = {
 # (08:00 / 17:03 daily + 手動觸發)，30 分鐘太久。10 分鐘 idle 釋放，
 # 下次重新 spin up 約 1-2 秒對使用者觀感無差，省 ~150-250MB Chrome RAM。
 _STATUS_DRIVER_IDLE_TIMEOUT = 10 * 60
+# [2026-06-26] 常駐查詢 driver 的網頁載入逾時(秒)。防 driver.get 無限期卡住 → 查詢執行緒不死、
+# _clock_status_worker_running 旗標不會卡死(跨日後打卡狀態查詢全停的根因)。
+_STATUS_DRIVER_PAGELOAD_TIMEOUT = 30
+# 打卡查詢「正在查詢」旗標的年齡上限(秒)。超過視為上一輪卡死、允許強制開新一輪(自癒雙保險)。
+_CLOCK_WORKER_MAX_AGE_SEC = 180
 
 
 def _get_or_create_status_driver():
@@ -6751,6 +6764,13 @@ REG64_BACKOFF_BASE_SECONDS = 60
 REG64_BACKOFF_MAX_SECONDS = 5 * 60
 GLOBAL_REFRESH_SNAPSHOT_TTL_SECONDS = 180
 CLINIC_CLOSE_PLATEAU_SECONDS = 30 * 60
+# [2026-06-26] 拖班診(最後一次看診進展 last_activity_ts 發生在「過關診時間之後」)久久沒變更,可能是
+# 醫師在看一個很久的病人/中間有空檔,而非真的關診。對這種「確認拖班」的診把 plateau 門檻拉長為 60 分,
+# 避免把還在看的診誤判關診、從浮動視窗消失(實機:早診拖到下午 14:42 還在看卻不見了)。在關診時間前就停
+# (last_activity_ts < boundary)的診維持 30 分正常偵測,不受影響。
+# [Codex] 用 last_activity_ts(絕對時戳)判定 → 不必處理「過關診 > N 小時」太晚套門檻、或「剛好在 boundary
+# 前後之間才進展」的漏判;且前一節/前一天的活動時戳必早於本節 boundary,跨日/跨節不會誤判。
+CLINIC_CLOSE_PLATEAU_SECONDS_OVERRUN = 60 * 60  # 確認拖班(最後進展在關診時間後)的 plateau 門檻 = 60 分
 
 
 from cmuh_common.reg64_utils import _reg64_tc_to_session_cn  # noqa: E402
@@ -9234,6 +9254,10 @@ class AutomationApp:
                             tracker['is_ended'] = False
                             tracker['stable_since_ts'] = None
                             tracker['last_monitor_pair'] = None
+                            # [2026-06-26 Codex] 換診/跨日重置要清 last_activity_ts,否則新診次的第一輪
+                            # (is_first_run)因新加的 guard 不會覆寫它 → 會繼承上一節「過關診時間後的活動
+                            # 時戳」而誤判拖班用 60 分門檻。
+                            tracker['last_activity_ts'] = None
                         tracker['date'] = today_str
 
                         tracker['doc_name'] = curr_doc
@@ -9271,9 +9295,13 @@ class AutomationApp:
                         if completed_count_ui > 0 or waiting_count_ui > 0:
                             tracker['had_any_activity'] = True
 
-                        # [2026-05-22] 記 last_activity_ts — completed/waiting set 有變化才更新
-                        if (current_completed_set != tracker.get('last_completed_set', set())
-                                or current_waiting_set != tracker.get('last_waiting_set', set())):
+                        # [2026-05-22] 記 last_activity_ts — completed/waiting set 有變化才更新。
+                        # [2026-06-26 Codex] 第一次觀測(is_first_run)只是建立基準、不算「進展」—— 否則
+                        # 重啟/快取 miss 後遇到「其實早就停了」的診,會把初次快照(空集合→非空)誤當成
+                        # boundary 後的進展,讓拖班 plateau 門檻誤用 60 分。基準不更新時戳,第二輪起真的有變才記。
+                        if (not tracker['is_first_run']
+                                and (current_completed_set != tracker.get('last_completed_set', set())
+                                     or current_waiting_set != tracker.get('last_waiting_set', set()))):
                             tracker['last_activity_ts'] = current_timestamp
 
                         if tracker['is_first_run']:
@@ -9422,7 +9450,17 @@ class AutomationApp:
                                         if ss is None:
                                             tracker['stable_since_ts'] = current_timestamp
                                             ss = current_timestamp
-                                        if current_timestamp - ss >= CLINIC_CLOSE_PLATEAU_SECONDS:
+                                        # [2026-06-26] 確認拖班 = 最後一次看診進展(last_activity_ts)發生在「過關診
+                                        # 時間之後」→ plateau 門檻拉長 30→60 分,避免把還在看的久病人/空檔誤判關診而
+                                        # 從浮窗消失。在關診時間前就停的診(last_activity_ts < boundary)維持 30 分。
+                                        # 用絕對時戳判定 → 自動不受跨日/跨節漏判或殘留影響(前一節/前一天的活動時戳
+                                        # 必早於本節 boundary);也涵蓋「在 boundary 前後之間才進展」的邊界 case(Codex)。
+                                        last_act = tracker.get('last_activity_ts')
+                                        overran = (last_act is not None
+                                                   and last_act >= boundary.timestamp())
+                                        plateau_sec = (CLINIC_CLOSE_PLATEAU_SECONDS_OVERRUN
+                                                       if overran else CLINIC_CLOSE_PLATEAU_SECONDS)
+                                        if current_timestamp - ss >= plateau_sec:
                                             if tracker['actual_closing_dt'] is None:
                                                 tracker['actual_closing_dt'] = datetime.fromtimestamp(ss)
                                             is_ended = True
@@ -10183,6 +10221,7 @@ class AutomationApp:
                     tracker['had_any_activity'] = False
                     tracker['stable_since_ts'] = None
                     tracker['last_monitor_pair'] = None
+                    tracker['last_activity_ts'] = None  # [2026-06-26 Codex] 重置清活動時戳,別讓拖班門檻誤繼承
                     tracker['actual_closing_dt'] = None
                     tracker['phototherapy_count'] = 0
                     # [新增] 重置等待時間相關
@@ -12390,8 +12429,15 @@ class AutomationApp:
             put_ui_message(self.ui_queue, UiClockStatusMessage(status_data={'error': '院外模式停用'}))
             return
         if self._clock_status_worker_running:
-            logging.info("打卡狀態上一輪仍在查詢，略過重複請求")
-            return
+            # [2026-06-26] 年齡保險:正常一輪查詢頂多幾十秒。若「正在查詢」已超過上限(疑似上一輪
+            # 卡死、旗標沒歸零)→ 不再無限略過,視為上一輪已死、強制開新的一輪(自癒)。搭配 Part1
+            # 的 page-load 逾時,理論上不會卡住;此為雙保險,避免任何意外讓打卡狀態跨日後永遠不更新。
+            started = getattr(self, '_clock_status_worker_started_at', 0.0)
+            if (time.time() - started) < _CLOCK_WORKER_MAX_AGE_SEC:
+                logging.info("打卡狀態上一輪仍在查詢，略過重複請求")
+                return
+            logging.warning(
+                "打卡狀態上一輪查詢疑似卡住(>%d秒)，強制開新一輪", _CLOCK_WORKER_MAX_AGE_SEC)
 
         put_ui_message(self.ui_queue, UiClockStatusMessage(status_data='querying'))
 
@@ -12452,6 +12498,7 @@ class AutomationApp:
                 self._clock_status_worker_running = False
 
         self._clock_status_worker_running = True
+        self._clock_status_worker_started_at = time.time()   # [2026-06-26] 給年齡保險判斷用
         clock_future = self.bg_executor.submit(run_check)
 
         def _handle_clock_submit_rejected(fut):
@@ -13347,6 +13394,7 @@ class AutomationApp:
                     )
                 ).tag("update-check", "daily-3x")
 
+            _sched_last_date = date.today()   # [2026-06-26] 跨日偵測用
             while not stop_event_main.is_set():
                 # [穩定性] run_pending 包 try/except：schedule 預設會把工作的例外往外拋，
                 # 若任一工作(尤其直接註冊、未經 run_named_job 的 dynamic_cl_checker)拋例外，
@@ -13355,6 +13403,18 @@ class AutomationApp:
                     schedule.run_pending()
                 except Exception:
                     logging.error("schedule.run_pending 例外（已忽略，保住排程迴圈）", exc_info=True)
+
+                # [2026-06-26] 跨日強制刷新打卡狀態:程式開著跨過半夜時,主動觸發一次乾淨查詢(等於
+                # 自動幫使用者「重開那一下」),不用等 08:00、也不用真的重開。00:00 一過幾秒內就更新成
+                # 新的一天(尚未打卡前正常顯示未打卡,07:31 打卡後 08:00 排程那次會帶到)。
+                try:
+                    _today = date.today()
+                    if _today != _sched_last_date:
+                        _sched_last_date = _today
+                        logging.info("[SCHEDULE] 偵測到跨日 → 強制刷新今日打卡狀態")
+                        self.update_clock_status_from_web()
+                except Exception:
+                    logging.debug("跨日打卡刷新觸發失敗", exc_info=True)
 
                 # [2026-05-25 v15 CPU 優化] 1s wait → 5s wait — master loop 是常駐
                 # 背景 thread，1s 太密 (每分鐘醒 60 次但 schedule jobs 都是 2 分鐘
