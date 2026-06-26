@@ -9928,17 +9928,44 @@ class AutomationApp:
             return tc
         if tc_i <= 1:
             return tc   # 早上(1)沒有更早時段可拖,免讀 tracker
-        earlier = []
+        # 先讀 in-memory tracker(最即時)。鎖內只讀、不呼叫別的鎖(避免巢狀)。
+        in_mem = {}
         try:
             with self._tracker_lock:
                 for s in range(1, tc_i):   # 最早 → 最晚
                     t = self.clinic_trackers.get(f"{room_code}/{s}")
-                    had = bool(t.get('had_any_activity')) if t else False
-                    closed = bool(t.get('is_ended') or t.get('actual_closing_dt')) if t else False
-                    earlier.append((s, had, closed))
+                    if t is not None:
+                        in_mem[s] = (
+                            bool(t.get('had_any_activity')),
+                            bool(t.get('is_ended') or t.get('actual_closing_dt')))
         except Exception:
             return tc
+        # [2026-06-26 user] in-memory 沒有的早時段 → 從持久化狀態(clinic_dynamic_state.json)補。
+        # 下午【重啟】程式時,早上的 tracker 還沒在本次行程建起來(本行程只會輪詢目前時段)→ 少了這層
+        # 補償就讀不到「早診今天看過診且還沒關」→ overrun 判定不到 → 早診拖班直接被隱藏(使用者實機)。
+        # cache 載入時已用日期過濾(只今日),故不會誤用昨日;讀不到 → (False, False)。
+        earlier = []
+        for s in range(1, tc_i):
+            if s in in_mem:
+                had, closed = in_mem[s]
+            else:
+                had, closed = self._persisted_session_overrun_state(room_code, s)
+            earlier.append((s, had, closed))
         return overrun_effective_time_code(tc, earlier)
+
+    def _persisted_session_overrun_state(self, room_code, s):
+        """讀持久化門診動態狀態裡某早時段的 (had_activity, closed),供 overrun 在【重啟後早上 tracker
+        還沒建】時判定早診是否還在拖。cache 只含今日;讀不到/壞值 → (False, False)。純讀、取自己的鎖。"""
+        try:
+            key = self._clinic_dynamic_state_key(room_code, s)
+            with self._clinic_dynamic_state_lock:
+                st = self._clinic_dynamic_state_cache.get(key)
+            if not isinstance(st, dict):
+                return (False, False)
+            return (bool(st.get('had_any_activity')),
+                    bool(st.get('is_ended') or st.get('actual_closing_dt')))
+        except Exception:
+            return (False, False)
 
     def _collect_widget_room_status(self):
         """收集要餵給浮動視窗的各診間狀態:直接顯示輪詢到的「正在看診中的時段」
