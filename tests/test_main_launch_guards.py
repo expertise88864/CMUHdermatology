@@ -812,8 +812,14 @@ def test_uvb_messagebox_marks_awaiting_user_for_hotkey_watchdog():
     assert "def _hotkey_awaiting_user_scope(" in full
 
     core_src = _function_source(source_path, "_update_uvb_dose_core")
-    # 兩處 MessageBoxW(劑量確認 + uncertain 行)都要被 awaiting-user scope 包住
-    assert core_src.count("with _hotkey_awaiting_user_scope():") >= 2
+    # [2026-06-29] 劑量確認對話已收斂到 _photo_confirm_yesno 元件(excimer/UVB 共用):它必須把 MessageBoxW
+    # 包在 awaiting-user scope 內(看門狗在等待醫師回應時不強制解鎖)。core 走該元件 + 仍直接保有 uncertain
+    # 行的 MessageBoxW + scope。兩處醫師確認對話因此都受 awaiting-user 保護(一處在元件、一處在 core)。
+    confirm_src = _function_source(source_path, "_photo_confirm_yesno")
+    assert "with _hotkey_awaiting_user_scope():" in confirm_src
+    assert "MessageBoxW" in confirm_src
+    assert "_photo_confirm_yesno(" in core_src                 # 劑量確認走共用元件
+    assert core_src.count("with _hotkey_awaiting_user_scope():") >= 1  # uncertain 行仍在 core 內被包住
     assert "MessageBoxW" in core_src
 
     watch_src = _function_source(source_path, "_hotkey_hard_timeout_watch")

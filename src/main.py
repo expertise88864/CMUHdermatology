@@ -1746,6 +1746,33 @@ def _show_uvb_warning(main_hwnd: int, title: str, msg: str) -> None:
         logging.debug("MessageBox 例外", exc_info=True)
 
 
+def _photo_confirm_yesno(main_hwnd: int, title: str, intro: str, reason: str,
+                         *, tag: str = "UVB", label: str = "F2") -> bool:
+    """[2026-06-29] F2/F3 醫囑流程統一的 Yes/No 確認元件(stale 舊紀錄 / 劑量超限共用)。
+
+    原本 excimer 與 UVB 兩條路徑各有一份幾乎相同的確認對話(beep + MessageBoxW),收斂成此單一元件 ——
+    日後要改確認文案 / 旗標 / 行為只需動一處。Windows MessageBoxW:
+      MB_ICONQUESTION|YESNO|TOPMOST|SETFOREGROUND|DEFBUTTON2(預設『否』,避免隨手 Enter 通過異常劑量)。
+    訊息固定 "{intro}\\n\\n{reason}\\n\\n要繼續執行變更嗎?"。
+    回 True=按『是』;按『否』/取消/MessageBoxW 失敗一律回 False(保守:不自動更新),失敗會記 traceback。"""
+    try:
+        import winsound
+        winsound.MessageBeep(0x30)
+    except Exception:
+        pass
+    # MB_ICONQUESTION(0x20)|MB_YESNO(0x4)|MB_TOPMOST(0x40000)|MB_SETFOREGROUND(0x10000)
+    # |MB_DEFBUTTON2(0x100,預設『否』)
+    flags = 0x20 | 0x4 | 0x40000 | 0x10000 | 0x100
+    try:
+        with _hotkey_awaiting_user_scope():
+            ans = ctypes.windll.user32.MessageBoxW(
+                main_hwnd, f"{intro}\n\n{reason}\n\n要繼續執行變更嗎?", title, flags)
+    except Exception:
+        logging.exception("[%s][%s] CONFIRM_NEEDED MessageBoxW 失敗", label, tag)
+        return False   # 失敗保守視為『否』:不自動更新劑量
+    return ans == 6   # IDYES
+
+
 def _show_light_code_incomplete_warning(label: str, set_療程: int,
                                         *, uvb_already_updated: bool) -> None:
     """照光代碼/療程未確認完成時，用前景警告避免半套狀態被忽略。"""
@@ -1935,24 +1962,8 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
                          else f"Excimer 劑量超過建議上限 - {label}")
             dlg_intro = ("請確認是否要按舊紀錄繼續更新" if is_stale
                          else "請確認劑量")
-            try:
-                import winsound
-                winsound.MessageBeep(0x30)
-            except Exception:
-                pass
-            # MB_ICONQUESTION|MB_YESNO|MB_TOPMOST|MB_SETFOREGROUND|MB_DEFBUTTON2(預設否)
-            flags = 0x20 | 0x4 | 0x40000 | 0x10000 | 0x100
-            try:
-                with _hotkey_awaiting_user_scope():
-                    ans = ctypes.windll.user32.MessageBoxW(
-                        main_hwnd,
-                        f"{dlg_intro}\n\n{confirm_reason}\n\n要繼續執行變更嗎?",
-                        dlg_title, flags)
-            except Exception:
-                logging.exception(
-                    "[%s][Excimer] CONFIRM_NEEDED MessageBoxW 失敗", label)
-                ans = 7  # 視為否
-            if ans == 6:  # IDYES
+            if _photo_confirm_yesno(main_hwnd, dlg_title, dlg_intro,
+                                    confirm_reason, tag="Excimer", label=label):
                 result = update_uvb_in_text(
                     text, skip_dose_sanity=True, skip_stale_check=True)
                 if result.action == UvbAction.UPDATED and result.new_text:
@@ -2096,30 +2107,12 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
             kind = "dose"
         logging.info("[%s][UVB] CONFIRM_NEEDED (%s): %s — 跳 Yes/No 確認",
                      label, kind, confirm_reason)
-        try:
-            import winsound
-            winsound.MessageBeep(0x30)
-        except Exception:
-            pass
-        # MB_ICONQUESTION(0x20) | MB_YESNO(0x4) | MB_TOPMOST(0x40000)
-        # | MB_SETFOREGROUND(0x10000) | MB_DEFBUTTON2(0x100) — 預設「否」
-        # (避免 user 隨手 Enter 就 yes 通過異常劑量)
-        flags = 0x20 | 0x4 | 0x40000 | 0x10000 | 0x100
-        try:
-            with _hotkey_awaiting_user_scope():
-                ans = ctypes.windll.user32.MessageBoxW(
-                    main_hwnd,
-                    f"{dialog_intro}\n\n{confirm_reason}\n\n要繼續執行變更嗎?",
-                    dialog_title,
-                    flags,
-                )
-        except Exception:
-            logging.exception("[%s][UVB] CONFIRM_NEEDED MessageBoxW 失敗", label)
-            return False if strict else True
+        _confirmed = _photo_confirm_yesno(
+            main_hwnd, dialog_title, dialog_intro, confirm_reason,
+            tag="UVB", label=label)
         check_stop()
-        # IDYES = 6, IDNO = 7
-        if ans != 6:
-            logging.info("[%s][UVB] CONFIRM_NEEDED user 按否/取消 → 停止", label)
+        if not _confirmed:   # 否 / 取消 / MessageBoxW 失敗 → 一律停止(保守)
+            logging.info("[%s][UVB] CONFIRM_NEEDED user 按否/取消/失敗 → 停止", label)
             return False if strict else True
         logging.info("[%s][UVB] CONFIRM_NEEDED user 按是 → 重 call 帶 skip flags",
                      label)
