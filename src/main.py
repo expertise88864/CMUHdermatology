@@ -1281,9 +1281,10 @@ def _mark_hotkey_action_time() -> None:
 # 解析度無關熱鍵 (adaptive) — 不依賴座標，直接 Win32 SendMessage 觸發選單
 # =============================================================================
 # 設計：主程式 (TFopdmain) 在任何解析度／DPI 下，「醫令」選單第三段的 menu
-# command ID 都是 215=類別字首 / 217=代碼字首 / 218=代碼輸入 / 219=名稱輸入
-# / ... 連續 ID。透過 SendMessage(WM_COMMAND, 218) 就能觸發代碼輸入，焦點
+# command ID 是連續 ID。透過 SendMessage(WM_COMMAND, 代碼輸入 id) 就能觸發代碼輸入，焦點
 # 自動跳到醫令代碼欄；之後用 pyautogui 模擬鍵盤打代碼 + Enter。
+# [2026-06-29] HIS 改版 V.1150629.01 → 整批選單 id +1 位移(user 跑 test_yiling_menu_id.py 實測:
+#   代碼輸入 218→219、同意書 668→669)。同段的 類別字首/代碼字首/名稱輸入(目前未被使用)一併 +1。
 #
 # 設計演化 (僅歷史說明 — 舊 script 已 2026-05-19 移除)：
 #   舊版 = pyautogui.click(x, y) 點選單 + 點代碼輸入 — 三個解析度三份 code
@@ -1295,11 +1296,11 @@ def _mark_hotkey_action_time() -> None:
 _HOSPITAL_WIN_CLASS = "TFopdmain"
 _HOSPITAL_WIN_TITLE_KW = "西醫門診醫師作業"
 
-# 醫令 子選單 command ID (probe + user 確認 2026-05-18)
-MENU_ID_類別字首 = 215
-MENU_ID_代碼字首 = 217
-MENU_ID_代碼輸入 = 218
-MENU_ID_名稱輸入 = 219
+# 醫令 子選單 command ID (probe + user 確認;2026-06-29 HIS V.1150629.01 改版後整批 +1)
+MENU_ID_類別字首 = 216   # 215→216(未使用,隨同段 +1)
+MENU_ID_代碼字首 = 218   # 217→218(未使用,隨同段 +1)
+MENU_ID_代碼輸入 = 219   # 218→219(user 實測確認;F1~F5 都走這個)
+MENU_ID_名稱輸入 = 220   # 219→220(未使用,隨同段 +1)
 
 
 def _find_hospital_main_window() -> int:
@@ -1343,8 +1344,8 @@ def _send_yiling_menu_command(hwnd: int, menu_id: int) -> bool:
     poll 視窗出現。
 
     HIWORD(wParam)=0 表示來源是 menu (不是 accelerator/control)。
-    F3/F4 觸發代碼輸入 (id=218) 用 Send 跑得通，是因為代碼輸入是輕量 UI
-    操作（focus 跳到 grid）；開 modal 同意書視窗 (id=668) 重量級。"""
+    F3/F4 觸發代碼輸入 (id=219) 用 Send 跑得通，是因為代碼輸入是輕量 UI
+    操作（focus 跳到 grid）；開 modal 同意書視窗 (id=669) 重量級。"""
     if not hwnd:
         return False
     WM_COMMAND = 0x0111
@@ -4004,16 +4005,16 @@ def script_F4_adaptive():
 # F9/F10 (同意書) — 通用 Win32 helpers
 # =============================================================================
 # 同意書開立作業 視窗 class = TOrMain（snapshot 2026-05-18 證實）。
-# 「其他 → 同意書」menu id = 668（user 測試確認）。
+# 「其他 → 同意書」menu id = 669（user 測試確認;2026-06-29 HIS V.1150629.01 改版後 668→669,整批 +1）。
 # 流程：
-#   1. SendMessage(TFopdmain, WM_COMMAND, 668)  → 打開 TOrMain 視窗
+#   1. SendMessage(TFopdmain, WM_COMMAND, 669)  → 打開 TOrMain 視窗
 #   2. 等 TOrMain 出現 (FindWindow loop)
 #   3. 切到「手術及治療」TTabSheet（點 tab header）
 #   4. 點 MO04 (F9) / MU02 (F10) radio (TGroupButton text 含 code)
 #   5. 點「開立電子」TButton
 #   6+ 後續 popup 操作（Round 2 之後加）
 
-MENU_ID_同意書 = 668
+MENU_ID_同意書 = 669
 
 
 def _find_window_by_class_title(class_name: str, title_kw: str = "",

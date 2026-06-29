@@ -96,8 +96,8 @@ def main() -> int:
         return 1
 
     root = tk.Tk()
-    root.title("醫令 menu ID 測試")
-    root.geometry("620x480")
+    root.title("HIS 選單 ID 重新校正 (V.1150629 改版後)")
+    root.geometry("760x780")
     root.attributes("-topmost", True)
 
     ttk.Label(root, text=f"目標視窗 hwnd={target}",
@@ -107,33 +107,44 @@ def main() -> int:
               foreground="gray").pack()
 
     ttk.Label(root,
-              text=("\n按下方按鈕 → 對主程式送 WM_COMMAND→ 觀察畫面\n"
-                    "若焦點跳到「醫令代碼」輸入欄 → 找到了！\n"
-                    "若跳出其他對話框 → 按下一個 id 試\n"),
+              text=("[2026-06-29] HIS 今天改版 V.1150629.01 → 選單指令 id 位移,要重新校正。\n"
+                    "按某區的 id 按鈕 → 送該選單指令給主程式 → 看主程式畫面反應,\n"
+                    "找出每個功能【現在】正確的 id,回報給 Claude(例:代碼輸入=id220、同意書=id665)。"),
               font=("Microsoft JhengHei UI", 10),
               foreground="darkblue").pack(pady=5)
+    ttk.Label(root,
+              text=("⚠ 這些只會「開啟對話框/視窗」,看完按取消即可,不會送出或完成病歷。\n"
+                    "⚠ 請【不要】自己亂試「完成」選單的 id(可能會送出/完成該次門診)。"),
+              font=("Microsoft JhengHei UI", 9, "bold"),
+              foreground="#B00020").pack(pady=(0, 4))
 
-    # 試的 id 範圍：依 probe 結果，pos=29-37 對應 id=214-223
-    test_ids = list(range(210, 226))
-
-    result_var = tk.StringVar(value="目前最後送出的 id：(無)")
+    result_var = tk.StringVar(value="目前最後送出的 id:(無)")
     ttk.Label(root, textvariable=result_var,
-              font=("Consolas", 11),
-              foreground="darkgreen").pack(pady=8)
-
-    btn_frame = ttk.Frame(root)
-    btn_frame.pack(pady=5)
+              font=("Consolas", 12, "bold"),
+              foreground="darkgreen").pack(pady=6)
 
     def make_handler(cid: int):
         def _click():
             send_menu_command(target, cid)
-            result_var.set(f"目前最後送出的 id：{cid}    請看主程式畫面")
+            result_var.set(f"剛送出 id={cid} → 請看主程式畫面反應")
         return _click
 
-    for i, cid in enumerate(test_ids):
-        b = ttk.Button(btn_frame, text=f"id={cid}", width=10,
-                        command=make_handler(cid))
-        b.grid(row=i // 4, column=i % 4, padx=4, pady=4)
+    # 依今天 probe 的新選單結構分區;只放「開對話框」的安全範圍,刻意不含「完成」選單。
+    groups = [
+        ("① 代碼輸入(修 F1~F5):按了焦點跳到下方『醫令代碼』輸入欄 = 對(舊 id 是 218)",
+         range(213, 235)),
+        ("② 同意書(修 F9/F10):按了跳出『同意書開立作業』視窗 = 對(舊 id 是 668)",
+         range(660, 672)),
+    ]
+    for title, ids in groups:
+        ttk.Label(root, text=title, font=("Microsoft JhengHei UI", 10, "bold"),
+                  foreground="#8B0000").pack(pady=(10, 2), anchor="w", padx=14)
+        gf = ttk.Frame(root)
+        gf.pack(pady=2)
+        for i, cid in enumerate(ids):
+            ttk.Button(gf, text=f"id={cid}", width=8,
+                       command=make_handler(cid)).grid(
+                           row=i // 6, column=i % 6, padx=3, pady=3)
 
     ttk.Separator(root, orient="horizontal").pack(fill="x", pady=10, padx=20)
 
