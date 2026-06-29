@@ -7079,6 +7079,13 @@ class AutomationApp:
         self._startup_defer_full_until_priority_done = False
 
         self.threshold_settings = self.load_threshold_settings()
+        # [2026-06-29] 載入可選的 UVB 劑量規則覆寫(settings/uvb_rules.json):沒檔→寫出預設模板供編輯,
+        # 壞值→逐欄退回程式內預設。best-effort,任何失敗都不影響啟動與劑量計算。
+        try:
+            from cmuh_common.uvb_dose import load_and_apply_uvb_rules
+            load_and_apply_uvb_rules()
+        except Exception:
+            pass
         try:
             _ufs = float(self.threshold_settings.get("ui_font_scale", 1.0))
         except (TypeError, ValueError):
