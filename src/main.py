@@ -2903,20 +2903,101 @@ def _f11_handle_primary_care_refer(hwnd: int, label: str = "") -> bool:
     return False
 
 
-def _f11_handle_transfer_msg(hwnd: int, label: str = "") -> bool:
-    """病人轉診提示畫面 popup (class=TFTunMsg) — 兩個 state 同一個 hwnd：
-      state A：顯示「轉診病人就診動向追蹤」tab
-        → 勾 TGroupButton「轉回原診所繼續治療」+ 點 TButton「處理/離開」
-        → popup 轉到 state B
-      state B：顯示確認 tab
-        → 點 TButton「印轉回單後離開」(注意：實際 text 是「印轉回單」)
-        → popup 關
+# [2026-06-29] 轉診視窗『本次門診預掛紀錄』TXStringGrid 是 owner-drawn,UIA/MSAA/Win32 都讀不到
+# 內容(user 探測 _referral_uia_probe 確認:無 Grid pattern、0 個有文字、accChildCount=0)。改用
+# 畫面取樣:表頭以下的資料列區若出現『深色文字』(資料列的黑字)→ 有預約列。門檻給寬(空表幾乎 0 個
+# 內容像素,有列則數十~數百);log 印出實測 content 值方便在實機微調這兩個常數。
+# 表格用既有的 _find_first_descendant_by_class(定義在後方 ~line 3870,EnumChildWindows 第一個)找;
+# 轉診視窗內只有一個 TXStringGrid(探測確認),故「第一個」即預掛紀錄表格,不另重複定義。
+_APPT_GRID_HEADER_SKIP_PX = 24   # 跳過表頭(欄位標題)那一列再取樣
+_APPT_GRID_CONTENT_MIN = 12      # 內容像素 >= 此值 → 視為「有預約列」
 
-    偵測：找對應 control 是否 IsWindowVisible+Enabled，決定當前 state。
+
+def _referral_grid_has_appointments(dialog_hwnd: int, label: str = "") -> bool:
+    """轉診視窗的『本次門診預掛紀錄』(TXStringGrid)有沒有預約列。owner-drawn 讀不到內容,改用畫面
+    取樣表頭以下的資料列區:有足夠『深色文字』(資料列黑字)→ True。任何失敗一律回 False → 保守走『轉回
+    原診所』(等同本功能加入前的既有行為,不會更糟)。"""
+    try:
+        grid = _find_first_descendant_by_class(dialog_hwnd, "TXStringGrid")
+        if not grid:
+            logging.info("[%s] 轉診:找不到預掛表格,當作沒預約", label)
+            return False
+        r = wintypes.RECT()
+        if not ctypes.windll.user32.GetWindowRect(grid, ctypes.byref(r)):
+            return False
+        left, data_top = r.left, r.top + _APPT_GRID_HEADER_SKIP_PX
+        w, h = r.right - r.left, r.bottom - data_top
+        if w < 20 or h < 8:
+            return False
+        pag = getattr(hotkey_modules, "pyautogui", None)
+        if pag is None:
+            logging.warning("[%s] 轉診:pyautogui 未就緒,保守當沒預約", label)
+            return False
+        img = pag.screenshot(region=(left, data_top, w, h))
+        px = img.load()
+        iw, ih = img.size
+        content = 0
+        for y in range(0, ih, 3):
+            for x in range(0, iw, 5):
+                p = px[x, y]
+                rr, gg, bb = p[0], p[1], p[2]
+                # [Codex] 只數【深色文字】像素;【不】把藍色選取列當內容 —— 否則空表若仍畫出空白選取
+                # 帶,會誤判成有預約 → 誤選本科門診、漏印轉回單(高風險方向)。空表幾乎 0 個深色像素。
+                # 代價:被選取那一列若是白字藍底會數不到,但其餘列的深色文字仍足以判定有預約。
+                if rr < 110 and gg < 110 and bb < 110:
+                    content += 1
+        has = content >= _APPT_GRID_CONTENT_MIN
+        logging.info("[%s] 轉診:預掛表格內容取樣 content=%s(門檻 %s)→ %s",
+                     label, content, _APPT_GRID_CONTENT_MIN,
+                     "有預約→本科門診" if has else "沒預約→轉回原診所")
+        return has
+    except Exception:
+        logging.exception("[%s] 轉診:偵測預掛表格例外,保守當沒預約", label)
+        return False
+
+
+def _f11_handle_transfer_msg(hwnd: int, label: str = "") -> bool:
+    """病人轉診提示畫面 popup (class=TFTunMsg)。[2026-06-29] 依『本次門診預掛紀錄』有無預約決定動向:
+      有預約(病人要回本科)→ 勾「本科門診進一步追蹤治療」→ 點「處理/離開」→ 視窗直接關(無 state B);
+      沒預約 → 維持原本:勾「轉回原診所繼續治療」→ 點「處理/離開」→ state B 點「印轉回單後離開」。
+    預掛表格是 owner-drawn(UIA/MSAA 讀不到),用畫面取樣判斷(_referral_grid_has_appointments);
+    偵測失敗一律當『沒預約』走轉回原診所(保守,等同本分支加入前的行為)。
     """
     logging.info("[%s] 轉診提示 popup hwnd=%s", label, hwnd)
     time.sleep(0.12)
     check_stop()
+
+    # [2026-06-29] 有預約 → 本科門診進一步追蹤治療(選 + 處理/離開,視窗直接關,無 state B)。
+    if _referral_grid_has_appointments(hwnd, label):
+        appt_radios = _find_descendants_by_exact_text(
+            hwnd, "TGroupButton", "本科門診進一步追蹤治療")
+        appt_target = 0
+        for rh, _, _ in appt_radios:
+            try:
+                if (ctypes.windll.user32.IsWindowVisible(rh)
+                        and ctypes.windll.user32.IsWindowEnabled(rh)):
+                    appt_target = rh
+                    break
+            except Exception:
+                continue
+        if appt_target:
+            _post_click_to_control(appt_target)
+            logging.info("[%s]   有預約 → 已勾「本科門診進一步追蹤治療」", label)
+            time.sleep(0.12)
+            check_stop()
+            if _click_button_normalized_text(hwnd, "處理/離開"):
+                # [Codex] 成功條件 = 視窗真的關閉;沒關回 False 讓 watcher 重試,別誤標 handled。
+                if _wait_window_closed(hwnd, timeout=5):
+                    logging.info("[%s]   本科門診:已點處理/離開、視窗已關", label)
+                    return True
+                logging.warning("[%s]   本科門診:點了處理/離開但視窗未關 → 交 watcher 重試", label)
+                return False
+            logging.warning("[%s]   本科門診路徑:找不到「處理/離開」", label)
+            return False
+        # [Codex] 已判定有預約但定位不到「本科門診」radio = 矛盾狀態;【不】退回去點轉回原診所
+        # (會選錯動向、誤印轉回單)。回 False 讓 watcher 重試;真的一直找不到就交醫師手動。
+        logging.warning("[%s]   有預約但找不到「本科門診」radio → 停手交人工(不誤走轉回原診所)", label)
+        return False
 
     # Step A: 如果還在 state A，勾 radio + 點 處理/離開
     radios = _find_descendants_by_exact_text(
