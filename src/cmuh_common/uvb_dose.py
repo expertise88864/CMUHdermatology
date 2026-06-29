@@ -301,6 +301,77 @@ _PT_EXCIMER_RE = re.compile(r"(?:excime|準分子)", re.IGNORECASE)
 _PT_GENERIC_RE = re.compile(r"(?:photo\s*therapy|光療)", re.IGNORECASE)
 # 劑量訊號(數字+mJ):用來分辨「泛稱光療」是治療醫令行(有劑量)還是病史/轉介語境(無劑量)
 _PT_DOSE_RE = re.compile(r"\d\s*mj", re.IGNORECASE)
+_PT_NUM_RE = re.compile(r"\d+")
+_PT_MJ_PREFIX_RE = re.compile(r"\s*mj", re.IGNORECASE)
+# [2026-06-29 Codex r3-r6] 判斷 UVB 字眼附近的數字是不是『真照光劑量』要靠【劑量醫令結構】,不能只看
+# 數字本身,否則病史的次數('2 years'/'10 times')、年份('course 2019')、病歷號('chart 123456')、
+# 體重('BW 100 kg')、BSA、檢驗值都會被當劑量而把純 excimer 卡住;反過來把無單位真劑量誤排成年份又會
+# 漏 key 健保。劑量結構 = 數字後緊接:次數括號 '(9)/(20)'、'on (日期)'、increase/add/max/fixed/shots
+# 等醫令詞('mj' 單位另判、不限距離)。
+_PT_DOSE_CONTEXT_RE = re.compile(
+    r"\s*(?:"
+    r"[\(（]\s*\d+\s*[\)）]"                       # 次數括號 (9)/(20)(純數字,排除日期 (2026/6/24))
+    r"|on\s*[\(（]\s*\d"                           # on (日期)
+    r"|(?:increase|inc|add|max|fixed|shots)\b"    # 劑量醫令詞
+    r")", re.IGNORECASE)
+# 數字若【緊接】在 UVB 字眼後(中間只隔空白/冒號/逗號)→ 可當無單位劑量('紫外線 450'、'UVB, 850'),但要
+# 非 4 位年份、後面不接 次數/年數/療程數/藥物單位('UVB 2 years'、'UVB 100 times'、'UVB 100 doses'、
+# 'UVB 2019' 排除)。doses? 也排除('100 doses' = 病史療程數,非劑量)。
+_PT_UVB_SEP_RE = re.compile(r"[\s:：,，、]*")
+_PT_NONDOSE_AFTER_RE = re.compile(
+    r"\s*(?:years?|yrs?|times?|sessions?|doses?|months?|weeks?|days?|"
+    r"年|個?月|週|次|回|堂|療程|歲|"
+    r"(?:mg|mcg|ug|ml|cc|iu|kg)\b|%)", re.IGNORECASE)
+
+
+def _uvb_window_has_dose(window: str) -> bool:
+    """window =『UVB 字眼起(視窗開頭即該字眼)→ 其後第一個 excimer marker 為止』。裡面有沒有一個帶
+    【劑量醫令結構】的數字:
+      1) 緊接 'mj' 的數字 → 一定算(單位明確,不限距離);
+      2) 否則先要 ≥ MIN_DOSE(<50 的多半是次數/年數,如 '2 years'、'x 10 (3)' → 直接略過);
+      3) 後面接 次數括號/on(日期)/醫令詞(_PT_DOSE_CONTEXT_RE)→ 結構化劑量,不限距離(體位描述很長時劑量
+         會離 UVB 字眼很遠,Codex r7);
+      4) 或【緊接 UVB 字眼】(中間只隔 空白/冒號/逗號)且非 4 位年份、後面不接 次數/年數/療程數/藥物單位
+         → 無單位劑量('紫外線 450')。
+    排除病史的次數/年數/年份/病歷號/體重/BSA/檢驗值(它們不在 UVB 字眼正後方,也沒有劑量結構)。"""
+    kw = _PT_UVB_SPECIFIC_RE.match(window)
+    kw_end = kw.end() if kw else 0
+    for nm in _PT_NUM_RE.finditer(window):
+        rest = window[nm.end():]
+        if _PT_MJ_PREFIX_RE.match(rest):
+            return True
+        num = nm.group(0)
+        n = int(num)
+        if n < MIN_DOSE:
+            continue
+        if _PT_DOSE_CONTEXT_RE.match(rest):
+            return True
+        if (_PT_UVB_SEP_RE.fullmatch(window[kw_end:nm.start()])
+                and not (len(num) == 4 and 1990 <= n <= 2099)
+                and not _PT_NONDOSE_AFTER_RE.match(rest)):
+            return True
+    return False
+
+
+def _has_dosed_uvb_specific(t: str) -> bool:
+    """是否有【帶劑量的 UVB-specific 醫令】= 本次真健保 UVB(會與別欄位 excimer 形成 ambiguous,且
+    update 端據此強制走/不走 excimer)。
+
+    [2026-06-29 Codex r3-r6] 劑量必須歸屬給 UVB 自己:不能讓 excimer 的劑量(r3 跨行/r4 同行)替它背書,
+    也不能把病史的次數/年數/年份/病歷號/體重/檢驗值(r5/r6)當劑量。做法:對每個 UVB 字眼,只看『該字眼
+    起 → 其後第一個 excimer marker 為止』的視窗,且視窗內要有帶劑量醫令結構的數字(見 _uvb_window_has_dose):
+      - 'Previous tx: UVB 2 years ago, now excimer 700 mj' → 視窗 'UVB 2 years ago, now ' 無劑量結構、
+        '700' 在 excimer 之後不算 → 讓位給 excimer → pure_excimer(不再被 bare UVB 卡住)。
+      - 'excimer 1000mj UVB 500mj'(UVB 在 excimer 之後且自己帶劑量)→ 視窗 'UVB 500mj' → uvb(健保不可漏 key)。
+      - 'UVB: 2000 (20) on (date) max 2500'(無單位 4 位數)→ 後接次數括號 → uvb(年份判定不會誤排真劑量)。
+    註:極罕見的『UVB + excimer: 450/700』共用劑量合併醫令,UVB 視窗在 excimer 前結束、看不到 450 →
+    會判 pure_excimer(可接受邊角;真實病歷一治療一行/一欄,且醫師仍會在 F2 結果上看到)。"""
+    for um in _PT_UVB_SPECIFIC_RE.finditer(t):
+        nxt_exc = _PT_EXCIMER_RE.search(t, um.end())
+        window = t[um.start():nxt_exc.start() if nxt_exc else len(t)]
+        if _uvb_window_has_dose(window):
+            return True
+    return False
 
 
 def _has_uvb_or_phototherapy_treatment(text: str) -> bool:
@@ -395,6 +466,53 @@ def _line_has_undated_active_photo(line: str) -> bool:
     return False
 
 
+def _line_has_undated_uvb_segment(line: str) -> bool:
+    """以照光關鍵字切段、【首段從行首起】(關鍵字前的日期也算進首段)→ 有任一段無合法日期 = 該段照光沒寫
+    日期(可能還在做)。與 _line_has_undated_active_photo 差在『首段含關鍵字前文字』→ 正確處理『日期寫在
+    關鍵字前』(楊亮筠實機 '(2026/05/15) UVB 500 ...';parse_uvb_line 也特別支援此格式)。否則舊 UVB 會因
+    關鍵字後沒日期而被誤判成無日期 active 段而不被忽略(Codex r9)。供 _strip_stale_uvb_when_recent_excimer
+    判斷舊 UVB 行是否可忽略;多段時後段日期歸前段、後段判無日期 → 偏保守(整行保留),不會誤丟。"""
+    marks = [m.start() for m in _PHOTO_ANY_RE.finditer(line)]
+    for i in range(len(marks)):
+        seg_start = 0 if i == 0 else marks[i]
+        seg_end = marks[i + 1] if i + 1 < len(marks) else len(line)
+        if not _real_dates_in(line[seg_start:seg_end]):
+            return True
+    return False
+
+
+def _strip_stale_uvb_when_recent_excimer(text: str, today: date) -> str:
+    """有【近期(未過 MODIFY_STALE_MONTHS=1 個月)的 excimer】時,把【整段日期都早於 1 個月的純 UVB 行】
+    當作已停掉的舊 UVB → 分流時忽略,讓近期 excimer 主導。
+
+    [2026-06-29 Codex r8] detect 的一般 strip 用 STALE_PHOTO_MONTHS(=2 個月),但 update 的 stale-confirm
+    用 MODIFY_STALE_MONTHS(=1 個月)。兩者不一致時,1-2 個月前的舊 UVB(像近期改做 excimer、處置欄仍留
+    5-8 週前 UVB 紀錄、一治療一行)會:被 detect 判 uvb(2 月內不 strip)→ 主流程偏健保 UVB/ambiguous;
+    update 又對它跳『超過 1 個月』確認 → 近期 excimer 本該更新卻被卡住、或醫師按 Yes 誤改舊 UVB。故此處讓
+    【近期 excimer 在場】時把『日期全部早於 1 個月』的純 UVB 行一併忽略,使 detect 與 update 對「本次治療
+    是那個 excimer」取得一致(且合規:不替已停掉的舊 UVB key 51019)。只在 excimer 近期時生效;UVB-only
+    或 excimer 也舊 → 不動(維持舊 UVB 的 stale-confirm 流程);同行 UVB+excimer 合併醫令 → 不動(保守)。"""
+    if not text or today is None:
+        return text or ""
+    cutoff = _months_before(today, MODIFY_STALE_MONTHS)
+    lines = re.split(r"[\r\n]+", text)
+    has_recent_excimer = any(
+        _PT_EXCIMER_RE.search(ln)
+        and (not _real_dates_in(ln) or any(d >= cutoff for d in _real_dates_in(ln)))
+        for ln in lines)
+    if not has_recent_excimer:
+        return text
+    kept = []
+    for line in lines:
+        if _PT_UVB_SPECIFIC_RE.search(line) and not _PT_EXCIMER_RE.search(line):
+            dts = _real_dates_in(line)
+            if (dts and all(d < cutoff for d in dts)
+                    and not _line_has_undated_uvb_segment(line)):
+                continue   # 純 UVB 行、日期全部早於 1 個月 → 已停掉的舊 UVB → 忽略,讓近期 excimer 主導
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def detect_phototherapy_kind(text: str, today: Optional[date] = None,
                              stale_months: int = STALE_PHOTO_MONTHS) -> str:
     """判斷【單一欄位】屬於哪種照光,給 F2/F3 分流用。回傳:
@@ -424,12 +542,27 @@ def detect_phototherapy_kind(text: str, today: Optional[date] = None,
     t = text or ""
     if today is not None:
         t = strip_stale_phototherapy_segments(t, today, stale_months)
-    if _PT_UVB_SPECIFIC_RE.search(t):
+        # [2026-06-29 Codex r8] 近期 excimer 在場時,連 1-2 個月前的舊 UVB 也忽略(與 update 的
+        # MODIFY_STALE_MONTHS 一致),避免舊 UVB 把近期 excimer 卡住或誤分流成健保 UVB。
+        t = _strip_stale_uvb_when_recent_excimer(t, today)
+    # [2026-06-27] UVB-specific 也要【有劑量】才算「本次健保 UVB 醫令」(會與別欄位 excimer 形成歧義);
+    # 只有 UVB 字眼【無任何劑量】= 病史/轉介語境(陳韻璇實機:病史 'Previous tx: UVB at singapore',
+    # 處置只有 excimer)→ 不算本次 UVB,讓 excimer 涵蓋,不再誤判 ambiguous 卡住 F2。
+    # [2026-06-29 Codex r3] 順序很重要:先判「帶劑量 UVB」→ uvb,再判 excimer → pure_excimer,最後才是
+    # bare UVB → uvb_generic。原本「UVB-specific 一律先回(uvb/uvb_generic)」會讓『bare UVB + 同欄位
+    # excimer』回 uvb_generic;若此欄是唯一照光欄,combine 會收斂成 uvb → 把純 excimer 誤分流成健保 UVB,
+    # 且 update 端 _is_pure_excimer 不成立而把 excimer 卡住。改成 excimer 早於 bare-UVB 即可正確 pure_excimer。
+    # 劑量歸屬用 _has_dosed_uvb_specific(排除 excimer 行),避免 excimer 劑量替 bare UVB 背書。
+    if _has_dosed_uvb_specific(t):
         return "uvb"
     if _PT_EXCIMER_RE.search(t):
         return "pure_excimer"
+    if _PT_UVB_SPECIFIC_RE.search(t):
+        # 只有 bare UVB(無劑量、無 excimer)= 病史/轉介語境 → uvb_generic;單獨一欄時 combine 收斂成 uvb。
+        return "uvb_generic"
     if _PT_GENERIC_RE.search(t):
-        # 帶劑量 → 像治療醫令行,當實質 UVB("uvb");無劑量 → 病史/轉介語境("uvb_generic")
+        # 帶劑量 → 像治療醫令行,當實質 UVB("uvb");無劑量 → 病史/轉介語境("uvb_generic")。
+        # (此分支必【無】excimer —— 上面已先回 pure_excimer,故 _PT_DOSE_RE 全域搜不會抓到 excimer 劑量)
         return "uvb" if _PT_DOSE_RE.search(t) else "uvb_generic"
     return "none"
 
@@ -1217,7 +1350,11 @@ def _first_fresh_uvb(text: str, cutoff: date) -> Optional[UvbLineInfo]:
 def _stale_confirm_result(text: str, today: date) -> "UvbUpdateResult":
     """所有照光行都早於 1 個月 → 回 CONFIRM_NEEDED(單行舊 / 多行全舊 / 單行舊 excimer)。
     confirm_reason 含「距今 N 天」字樣,讓 caller 判定為 stale 確認窗。"""
-    dts = [d for d in _real_dates_in(text) if d <= today]
+    # [2026-06-27] 只取「真的早於 1 個月」的日期當『上次照光日期』:否則若文字裡另有近期日期(像近期
+    # excimer / 近期藥物日期),max(全部) 會挑到那個近期日期 → 顯示「距今 2 天 (超過 1 個月)」自相矛盾
+    # (林怡君實機)。改只看 stale 的日期 → 顯示的日期與「超過 1 個月」一致。
+    cutoff = _months_before(today, MODIFY_STALE_MONTHS)
+    dts = [d for d in _real_dates_in(text) if d <= today and d < cutoff]
     last = max(dts) if dts else None
     days = (today - last).days if last is not None else None
     if last is not None:
@@ -1320,6 +1457,14 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
     uvb_lines = _count_uvb_lines(text)
 
     parsed = parse_uvb_line(text)
+    # [2026-06-27 林怡君] 本次治療其實是近期 excimer(同欄位另有舊 UVB 病歷紀錄)時,detect_phototherapy_kind
+    # (會 strip 掉早於 2 個月的舊照光段)會判為 pure_excimer;但 parse_uvb_line 不 strip → 會抓到那條舊 UVB
+    # → 落到 UVB 路徑把舊 UVB(2024/11/12)當本次而誤跳「距今超過 1 個月」確認。故 detect 判 pure_excimer
+    # 時,即使 parse 到舊 UVB 也把 parsed 歸 None、強制走 excimer 分支(更新近期 excimer、保留舊 UVB 行)。
+    # 與主程式身份別分流一致、billing 安全:近期真有 UVB 時 detect 會是 uvb/ambiguous,不會誤判 pure_excimer。
+    _is_pure_excimer = detect_phototherapy_kind(text, today) == "pure_excimer"
+    if _is_pure_excimer:
+        parsed = None
     if parsed is None:
         # excimer / excimer light 本身也是照光，不要求同時出現 UVB。
         # [2026-06-25] 只有「會讓 excimer 退讓的真 UVB/光療治療訊號」才不進 excimer 分支:
@@ -1328,7 +1473,7 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         # 但【衛教備註裡的裸 phototherapy 字眼(無劑量)】不算 → 照常更新 excimer。
         # 修正:舊版只要文字任一處出現 Phototherapy 字眼(連 'avoid phototherapy days' 這種備註)就誤擋
         # excimer 劑量更新(楊智翔實機:有 excimer 卻沒辦法修改)。紫外線仍保護 → 不會誤入 allow_undated。
-        if not _has_uvb_or_phototherapy_treatment(text):
+        if _is_pure_excimer or not _has_uvb_or_phototherapy_treatment(text):
             (excimer_text, excimer_count, excimer_first,
              excimer_too_close) = _update_excimer_lines(
                 text, today, allow_undated=True, skip_stale=skip_stale_check,

@@ -1734,6 +1734,67 @@ def test_fresh_excimer_updates_normally():
     assert "(9)" in r.new_text and "(2026/06/24)" in r.new_text
 
 
+def test_recent_excimer_with_old_uvb_record_updates_not_stale_confirm():
+    """[2026-06-27 林怡君] 近期 excimer + 同欄位舊 UVB 病歷紀錄(>1月,如 2024/11/12)→ detect
+    判 pure_excimer;update_uvb_in_text 也要走 excimer 更新(更新近期 excimer、保留舊 UVB 行),
+    不可把舊 UVB 當本次而誤跳『距今超過 1 個月』確認(實機:6/25→6/27 只差 2 天卻顯示超過 1 月)。"""
+    text = ("excimer light 700 mj/cm2 (138) on (2026/06/20), increase 50, max 1500\n"
+            "UVB: 1500 mj/cm2 (232) on (2024/11/12)")
+    r = update_uvb_in_text(text, today=_TODAY)
+    assert r.action == UvbAction.UPDATED
+    assert "750 mj/cm2 (139) on (2026/06/24)" in r.new_text   # 近期 excimer 加劑量
+    assert "UVB: 1500 mj/cm2 (232) on (2024/11/12)" in r.new_text  # 舊 UVB 行保留不動
+
+
+def test_one_to_two_month_old_uvb_defers_to_recent_excimer():
+    """[2026-06-29 Codex r8] detect strip 用 2 個月、update stale-confirm 用 1 個月,兩者不一致時 1-2 個月
+    前的舊 UVB(近期改做 excimer、處置欄仍留 5-8 週前 UVB)會把近期 excimer 卡住。近期 excimer 在場時,
+    『日期全部早於 1 個月』的純 UVB 行要一併忽略 → detect=pure_excimer、update 更新近期 excimer、保留舊
+    UVB 行,不再對舊 UVB 跳『超過 1 個月』確認。"""
+    today = date(2026, 6, 29)
+    text = ("excimer light 700 mj/cm2 (138) on (2026/06/25), increase 50, max 1500\n"
+            "UVB: 1500 mj/cm2 (232) on (2026/05/15), increase 50, max 2000")
+    assert detect_phototherapy_kind(text, today) == "pure_excimer"
+    r = update_uvb_in_text(text, today=today)
+    assert r.action == UvbAction.UPDATED
+    assert "750 mj/cm2 (139) on (2026/06/29)" in r.new_text          # 近期 excimer 更新
+    assert "UVB: 1500 mj/cm2 (232) on (2026/05/15)" in r.new_text    # 舊 UVB 行保留不動
+    # 護欄1:近期 UVB(<1月)+ excimer 並存 → 仍 uvb(可能是合併治療,健保不漏 key)
+    assert detect_phototherapy_kind(
+        "UVB 500 mj/cm2 (5) on (2026/06/26)\nexcimer 700 mj/cm2 (8) on (2026/06/25)",
+        today) == "uvb"
+    # 護欄2:舊 UVB【單獨】(無近期 excimer)→ 仍 uvb,update 照常跳 stale 確認(不被本修改影響)
+    assert detect_phototherapy_kind("UVB: 1500 mj/cm2 (232) on (2026/05/15)", today) == "uvb"
+    assert update_uvb_in_text(
+        "UVB: 1500 mj/cm2 (232) on (2026/05/15) increase 50 max 2000",
+        today=today).action == UvbAction.CONFIRM_NEEDED
+    # [2026-06-29 Codex r9] 舊 UVB 採『日期寫在關鍵字前』格式(楊亮筠實機)也要能忽略 → pure_excimer。
+    text2 = ("(2026/05/15) UVB 500 mj/cm2 increase 30 max 900\n"
+             "excimer light 700 mj/cm2 (8) on (2026/06/25), increase 50, max 1500")
+    assert detect_phototherapy_kind(text2, today) == "pure_excimer"
+    r2 = update_uvb_in_text(text2, today=today)
+    assert r2.action == UvbAction.UPDATED
+    assert "750 mj/cm2 (9) on (2026/06/29)" in r2.new_text
+    assert "(2026/05/15) UVB 500 mj/cm2" in r2.new_text            # 舊 UVB 行保留
+    # 護欄3:日期在關鍵字前但【近期】UVB + excimer → 仍 uvb(不可誤忽略近期 UVB)
+    assert detect_phototherapy_kind(
+        "(2026/06/26) UVB 500 mj/cm2 increase 30 max 900\n"
+        "excimer light 700 mj/cm2 (8) on (2026/06/25)", today) == "uvb"
+
+
+def test_stale_confirm_message_uses_stale_date_not_recent_unrelated_date():
+    """[2026-06-27] stale 確認訊息的『上次照光日期』只取真的早於 1 月的日期 —— 否則文字裡另有
+    近期日期(如近期藥物起始日)時 max(全部) 會挑到那個近期日期 → 顯示『距今 4 天 (超過 1 個月)』
+    自相矛盾。應顯示真正 stale 的照光日期、與『超過 1 個月』一致。"""
+    text = ("UVB: 500 mj/cm2 (5) on (2026/03/01), increase 30, MAX:800\n"
+            "AZA 100mg qd start (2026/06/20)")
+    r = update_uvb_in_text(text, today=_TODAY)
+    assert r.action == UvbAction.CONFIRM_NEEDED
+    assert "2026/03/01" in r.confirm_reason       # 顯示真正 stale 的日期
+    assert "2026/06/20" not in r.confirm_reason    # 不挑到近期無關日期
+    assert "距今 115 天" in r.confirm_reason         # 與『超過 1 個月』一致
+
+
 def test_calendar_month_threshold_about_5_weeks_stale():
     """門檻是 1 個日曆月:約 5 週前(早於 today 往前 1 月)的單行 → 跳確認。"""
     text = "UVB: 500 mj/cm2 (5) on (2026/05/10), increase 30, MAX:800"
@@ -2519,6 +2580,87 @@ def test_detect_generic_phototherapy_with_dose_is_uvb():
         [detect_phototherapy_kind("phototherapy 500 mj/cm2"), "pure_excimer"]) == "ambiguous"
 
 
+def test_detect_uvb_specific_no_dose_is_uvb_generic():
+    """[2026-06-27 陳韻璇實機] 病史只提到 UVB 字眼【無劑量】(像 'Previous tx: UVB at singapore')→
+    弱化成 uvb_generic(不算本次健保 UVB 醫令),才不會與處置的 excimer 形成假 ambiguous 卡住 F2。
+    有劑量的真 UVB 醫令(含中文紫外線、無單位寫法)仍是 uvb,與別欄位 excimer 仍 ambiguous(billing 安全)。"""
+    assert detect_phototherapy_kind("Previous tx: UVB at singapore") == "uvb_generic"
+    # [2026-06-29 Codex r3] 同欄位 bare UVB(無劑量)+ excimer → 直接 pure_excimer(excimer 早於
+    # bare-UVB 判定),不再回 uvb_generic 而被 combine 收斂成 uvb 誤分流、或卡住 update 的 excimer。
+    assert detect_phototherapy_kind("h/o UVB years ago, now excimer") == "pure_excimer"
+    # 病史 UVB(無劑量)+ 處置 excimer(不同欄位)→ pure_excimer(不卡 F2),不再 ambiguous
+    assert combine_phototherapy_kinds(
+        [detect_phototherapy_kind("Previous tx: UVB at singapore"),
+         "pure_excimer"]) == "pure_excimer"
+    # [2026-06-29 Codex r3] 關鍵:excimer 自己的『X mj』不可替同欄位的 bare UVB 背書 → 仍是 pure_excimer。
+    assert detect_phototherapy_kind(
+        "Previous tx: UVB at singapore\n"
+        "excimer light 700 mj/cm2 (138) on (2026/06/20), increase 50, max 1500"
+    ) == "pure_excimer"
+    assert detect_phototherapy_kind(
+        "UVB once\nexcimer 800 mj/cm2 (5) on (2026/06/20) increase 30 max 1500"
+    ) == "pure_excimer"
+    # [2026-06-29 Codex r4] 同一【行】bare UVB 後面接 excimer 劑量,excimer 的 mj 也不可替 bare UVB
+    # 背書 → 仍 pure_excimer(只取 excimer marker 之前的 UVB 子句判斷帶劑量)。
+    assert detect_phototherapy_kind(
+        "Previous tx: UVB at singapore, now excimer light 700 mj/cm2 (138) "
+        "on (2026/06/20), increase 50, max 1500"
+    ) == "pure_excimer"
+    # 對照:同行 excimer 之前若 UVB 自己就帶劑量 → 仍是 uvb(真健保 UVB,與別欄位 excimer → ambiguous)
+    assert detect_phototherapy_kind(
+        "UVB 500 mj/cm2 then excimer 700 mj/cm2") == "uvb"
+    # [2026-06-29 Codex r5] 病史 UVB 後面的『次數/年數/年份』不是劑量 → 仍 pure_excimer,不卡住 excimer。
+    for hist in (
+        "Previous tx: UVB 2 years ago, now excimer 700 mj/cm2 (3) on (2026/06/20) max 1500",
+        "Previous tx: UVB x 10 times at singapore, now excimer 700 mj/cm2 (3) on (2026/06/20) max 1500",
+        "Previous tx: UVB course 2019 at singapore, now excimer 700 mj/cm2 (3) on (2026/06/20) max 1500",
+    ):
+        assert detect_phototherapy_kind(hist) == "pure_excimer", hist
+    # 對照:病史次數/年數不算劑量 → 單欄無 excimer 時仍是 bare uvb_generic(combine 單獨→uvb)
+    assert detect_phototherapy_kind("Previous tx: UVB 2 years ago") == "uvb_generic"
+    # 藥物劑量(mg)在 UVB 字眼附近也不可被當成 UVB 劑量
+    assert detect_phototherapy_kind(
+        "UVB hx, MTX 450 mg/wk, now excimer 700 mj/cm2 (3) on (2026/06/20) max 1500"
+    ) == "pure_excimer"
+    # [2026-06-29 Codex r6] 病歷號/體重/BSA/民國日期等『非劑量結構』的數字旁邊有 bare UVB → 仍 pure_excimer。
+    _exc = "now excimer 700 mj/cm2 (3) on (2026/06/20) max 1500"
+    for noise in ("chart no 123456", "BW 100 kg", "BSA 100", "(115/06/01)"):
+        assert detect_phototherapy_kind(f"UVB hx, {noise}, {_exc}") == "pure_excimer", noise
+    # 對照:無單位 4 位數真劑量(後接次數括號的劑量結構)不會被年份判定誤排 → 仍 uvb(健保不漏 key)
+    assert detect_phototherapy_kind(
+        "UVB: 2000 (20) on (2026/06/20) increase 50 max 2500\n"
+        "excimer 700 mj/cm2 (3) on (2026/06/20) max 1500"
+    ) == "uvb"
+    # [2026-06-29 Codex r7] 結構化無單位劑量即使離 UVB 字眼很遠(體位描述很長)也要算 → uvb,不漏 key。
+    assert detect_phototherapy_kind(
+        "UVB face neck anterior trunk posterior trunk both arms both legs 450 (1) "
+        "on (2026/06/20) add 30 max 900\nexcimer 700 mj/cm2 (3) on (2026/06/20) max 1500"
+    ) == "uvb"
+    # [2026-06-29 Codex r7] 病史『100 doses(療程數)』、『x 10 (2019)』、『10 (3) times』都不是劑量結構
+    # (數字 <MIN_DOSE 或後接 doses/times)→ 仍 pure_excimer,不卡住 excimer。
+    for hist in ("UVB 100 doses in Singapore", "UVB x 10 (2019)", "UVB 10 (3) times"):
+        assert detect_phototherapy_kind(f"Previous tx: {hist}, {_exc}") == "pure_excimer", hist
+    # 對照:真 UVB 醫令(有劑量,含中文紫外線/無單位)仍是 uvb → 與別欄位 excimer 仍 ambiguous。
+    # [Codex] 中文紫外線 + 無單位(_PT_DOSE_RE 只認 mj、_UVB_DOSE_RE 不認紫外線)也不可被誤弱化成
+    # uvb_generic 而靜默分流成自費 excimer。
+    assert detect_phototherapy_kind("UVB 850 mj/cm2 on (2026/6/24)") == "uvb"
+    assert detect_phototherapy_kind("紫外線 450 mj/cm2") == "uvb"
+    assert detect_phototherapy_kind("紫外線 450 on (2026/6/24) add 30") == "uvb"   # 中文+無單位
+    assert detect_phototherapy_kind("UVB 850 on (2026/6/24)") == "uvb"   # 無單位也算有劑量
+    # [Codex r2] 無單位 + 逗號/換行隔開也要算有醫令(billing 安全:寧 uvb/ambiguous 不靜默自費)
+    assert detect_phototherapy_kind("UVB, 850 on (2026/6/24)") == "uvb"   # 緊接(逗號)→ 無單位劑量
+    assert detect_phototherapy_kind("紫外線\n450 on (2026/6/24)") == "uvb"  # 緊接(換行)+ on(日期)
+    # [2026-06-29 Codex r3-r6 改版] 改用「劑量醫令結構」判定後,無單位數字若【沒緊接 UVB 字眼】且【無
+    # 劑量結構】(沒 mj/次數括號/on(日期)/醫令詞)→ 視為非劑量(避免病史的次數/年數/檢驗值卡住 excimer)。
+    # '紫外線 治療, 450'(中間夾「治療」非緊接、450 後也無結構)→ uvb_generic(單欄時 combine 仍收斂成 uvb)。
+    assert detect_phototherapy_kind("紫外線 治療, 450") == "uvb_generic"
+    assert combine_phototherapy_kinds([detect_phototherapy_kind("紫外線 治療, 450")]) == "uvb"
+    assert combine_phototherapy_kinds(
+        [detect_phototherapy_kind("紫外線 450"), "pure_excimer"]) == "ambiguous"
+    assert combine_phototherapy_kinds(
+        [detect_phototherapy_kind("UVB 850 mj/cm2"), "pure_excimer"]) == "ambiguous"
+
+
 def test_detect_none_when_no_phototherapy():
     assert detect_phototherapy_kind("topical steroid bid, MPV") == "none"
     assert detect_phototherapy_kind("") == "none"
@@ -2693,11 +2835,14 @@ def test_stale_strip_never_drops_undated_active_order():
 
 
 def test_stale_strip_same_line_mixed_falls_back_safely():
-    """同一行混【舊+近期】不同治療(罕見;真實病歷一治療一行):有任一近期日期 → 整行保留 → 沿用
-    現行分類(UVB-specific 仍贏)—— 【與加這功能前完全相同,不會更不安全】。整行全舊才忽略。"""
+    """同一行混【舊+近期】不同治療(罕見;真實病歷一治療一行):有任一近期日期 → 整行保留。
+    [2026-06-29 Codex r3-r5 改版] 分類改用「劑量歸屬」:dose-less 的舊 UVB『note』不再壓過近期 excimer
+    → 第一例改判 pure_excimer(舊且無劑量的 UVB = 病史,本次治療是近期 excimer;這正是要修的『bare/舊
+    UVB 不該卡住 excimer』)。第二例 UVB 自己近期且帶劑量 → 仍 uvb(健保不可漏 key)。"""
     today = date(2026, 6, 23)
     assert detect_phototherapy_kind(
-        "UVB note on (2024/12/09); excimer 700 mj/cm2 on (2026/6/10) max 950", today) == "uvb"
+        "UVB note on (2024/12/09); excimer 700 mj/cm2 on (2026/6/10) max 950",
+        today) == "pure_excimer"
     assert detect_phototherapy_kind(
         "UVB 450 mj/cm2 on (2026/6/21); excimer 700 mj/cm2 on (2024/12/09)", today) == "uvb"
 
