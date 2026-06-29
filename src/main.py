@@ -3230,8 +3230,9 @@ def _dump_menu_tree(main_hwnd: int) -> None:
 
     [perf r5] HIS「完成不印」選單是 owner-draw，_find_menu_command_id_by_text 每次都比不到
     文字 → 每次 F11 route A(照光病人)都 dump 整棵選單樹(~200 行)，是 automation_ui.log
-    暴漲(4.4MB/session)的最大單一來源。fallback id(276)已知且穩定，故每個 session 只 dump
-    一次供對照即可，之後跳過。若 HIS 改版選單結構變動，下次啟動的首次 F11 仍會重新 dump 一次。"""
+    暴漲(4.4MB/session)的最大單一來源。fallback id(MENU_ID_FINISH_NO_PRINT,2026-06-29 起=277)
+    已知且穩定，故每個 session 只 dump 一次供對照即可，之後跳過。若 HIS 改版選單結構變動,下次啟動
+    的首次 F11 仍會重新 dump 一次。"""
     global _menu_tree_dumped_once
     if _menu_tree_dumped_once:
         return
@@ -3303,7 +3304,9 @@ def _find_menu_command_id_by_text(main_hwnd: int, target_text: str) -> int:
         return 0
 
 
-MENU_ID_FINISH_NO_PRINT = 276  # 完成 > 完成不印；automation_ui.log 2026-06-04 top[4].sub[1]
+# 完成 > 完成不印。[2026-06-29] HIS V.1150629.01 改版整批 +1:舊 276→277(使用者確認完成不印壞掉,
+# 且 probe 新「完成」選單 top[4] index 1 = id 277,與 +1 一致)。F11 照光療程 2/3 用,避免印繳費單。
+MENU_ID_FINISH_NO_PRINT = 277
 
 
 def _f11_normalize_course_value(raw_value: str) -> str:

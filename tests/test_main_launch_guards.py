@@ -709,7 +709,7 @@ def test_f11_phototherapy_uses_finish_no_print_without_print_fallback():
     all_finish_src = _function_source(source_path, "_f11_click_finish_all")
     main_src = source_path.read_text(encoding="utf-8")
 
-    assert "MENU_ID_FINISH_NO_PRINT = 276" in main_src
+    assert "MENU_ID_FINISH_NO_PRINT = 277" in main_src  # [2026-06-29] HIS V.1150629.01 改版 +1
     assert 'if course_value in ("2", "3"):' in f11_main_src
     assert "_f11_send_finish_no_print" in f11_main_src
     assert "_f11_click_finish_all" in f11_main_src
