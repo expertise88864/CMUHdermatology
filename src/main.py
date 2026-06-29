@@ -3423,8 +3423,10 @@ def _f11_send_finish_no_print(main_hwnd: int, course_value: str,
             logging.info("[%s] 完成不印動態 id=%s（既有備援 id=%s）",
                          label, dynamic_id, MENU_ID_FINISH_NO_PRINT)
     else:
-        logging.warning("[%s] 完成不印動態解析失敗，改用既有備援 id=%s",
-                        label, MENU_ID_FINISH_NO_PRINT)
+        # owner-draw 選單 GetMenuStringW 讀不到文字 → 按文字解析本就比不到「完成不印」,
+        # 屬預期;靠校正過的 MENU_ID_FINISH_NO_PRINT。降為 INFO 避免假警報(非真失敗)。
+        logging.info("[%s] 完成不印:owner-draw 選單無文字(預期),使用校正 id=%s",
+                     label, MENU_ID_FINISH_NO_PRINT)
     if MENU_ID_FINISH_NO_PRINT not in candidate_ids:
         candidate_ids.append(MENU_ID_FINISH_NO_PRINT)
 
