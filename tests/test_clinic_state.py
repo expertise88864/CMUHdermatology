@@ -20,21 +20,29 @@ from cmuh_common.clinic_state import (  # noqa: E402
 )
 
 
-def test_default_clinic_rooms_are_101_102_103():
-    assert DEFAULT_CLINIC_ROOMS == ("101", "102", "103")
+def test_default_clinic_rooms_are_101_102_103_105():
+    # [2026-06-29] 本科 4 診:101/102/103/105(無 104)
+    assert DEFAULT_CLINIC_ROOMS == ("101", "102", "103", "105")
 
 
 def test_normalize_clinic_rooms_migrates_legacy_defaults():
-    assert normalize_clinic_rooms(["181", "182"]) == (["101", "102", "103"], True)
+    assert normalize_clinic_rooms(["181", "182"]) == (["101", "102", "103", "105"], True)
+
+
+def test_normalize_clinic_rooms_pads_old_3room_default_to_105():
+    # [2026-06-29] 舊版預設 3 格 101/102/103 → 自動補上第 4 格 105(現有使用者設定自動遷移)
+    assert normalize_clinic_rooms(["101", "102", "103"]) == (["101", "102", "103", "105"], True)
 
 
 def test_normalize_clinic_rooms_preserves_custom_rooms_and_repairs_bad_values():
-    # 自訂前兩格 → 保留並用對應預設補上第三格(103)；舊版 2 格設定一律升級成 3 格
-    assert normalize_clinic_rooms([" 201 ", "202"]) == (["201", "202", "103"], True)
-    assert normalize_clinic_rooms(["201", "202"]) == (["201", "202", "103"], True)
-    # 已是完整三格 → 不變動
-    assert normalize_clinic_rooms(["201", "202", "203"]) == (["201", "202", "203"], False)
-    assert normalize_clinic_rooms("bad") == (["101", "102", "103"], True)
+    # 自訂前幾格 → 保留並用對應預設補滿到 4 格(103/105)
+    assert normalize_clinic_rooms([" 201 ", "202"]) == (["201", "202", "103", "105"], True)
+    assert normalize_clinic_rooms(["201", "202"]) == (["201", "202", "103", "105"], True)
+    # 舊版完整 3 格自訂 → 補上第 4 格(105)
+    assert normalize_clinic_rooms(["201", "202", "203"]) == (["201", "202", "203", "105"], True)
+    # 已是完整 4 格 → 不變動
+    assert normalize_clinic_rooms(["201", "202", "203", "205"]) == (["201", "202", "203", "205"], False)
+    assert normalize_clinic_rooms("bad") == (["101", "102", "103", "105"], True)
 
 
 def _canon(value):

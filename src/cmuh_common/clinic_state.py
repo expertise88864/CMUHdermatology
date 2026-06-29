@@ -6,9 +6,10 @@ from datetime import date, datetime
 from typing import Any, Callable
 
 
-DEFAULT_CLINIC_ROOMS = ("101", "102", "103")
+# [2026-06-29] 本科固定診間 4 間:101/102/103/105(院方跳號、無 104)。
+DEFAULT_CLINIC_ROOMS = ("101", "102", "103", "105")
 LEGACY_DEFAULT_CLINIC_ROOMS = ("181", "182")
-# 門診動態卡片數 = 預設診間數（目前 3 格：左中右）。所有迴圈／補滿都以此為準，避免 2/3 不一致。
+# 門診動態卡片數 = 預設診間數（目前 4 格）。所有迴圈／補滿都以此為準,避免格數不一致。
 CLINIC_ROOM_COUNT = len(DEFAULT_CLINIC_ROOMS)
 
 
@@ -16,8 +17,9 @@ def normalize_clinic_rooms(value: Any) -> tuple[list[str], bool]:
     """正規化診間清單為 CLINIC_ROOM_COUNT 格，並遷移歷史預設。
 
     - 非 list／壞值 → 回完整預設。
-    - 歷史 181/182 兩格預設 → 整組換成新預設（101/102/103）。
-    - 舊版只存 2 格的設定 → 保留前兩格，用對應位置的預設補上第 3 格（→ 103）。
+    - 歷史 181/182 兩格預設 → 整組換成新預設（101/102/103/105）。
+    - 不足格數（如舊版 2 格、或先前 3 格 101/102/103）→ 保留既有格、用對應位置的預設補滿到
+      CLINIC_ROOM_COUNT(舊 3 格設定會自動補上第 4 格 → 105)。
     回傳 (rooms, changed)；changed=True 表示需寫回磁碟。
     """
     if not isinstance(value, list):
