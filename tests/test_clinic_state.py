@@ -20,29 +20,35 @@ from cmuh_common.clinic_state import (  # noqa: E402
 )
 
 
-def test_default_clinic_rooms_are_101_102_103_105():
-    # [2026-06-29] 本科 4 診:101/102/103/105(無 104)
-    assert DEFAULT_CLINIC_ROOMS == ("101", "102", "103", "105")
+_DEF5 = ["101", "102", "103", "104", "105"]
+
+
+def test_default_clinic_rooms_are_101_to_105():
+    # [2026-06-29] 本科 5 診:101/102/103/104/105
+    assert DEFAULT_CLINIC_ROOMS == ("101", "102", "103", "104", "105")
 
 
 def test_normalize_clinic_rooms_migrates_legacy_defaults():
-    assert normalize_clinic_rooms(["181", "182"]) == (["101", "102", "103", "105"], True)
+    assert normalize_clinic_rooms(["181", "182"]) == (_DEF5, True)
 
 
-def test_normalize_clinic_rooms_pads_old_3room_default_to_105():
-    # [2026-06-29] 舊版預設 3 格 101/102/103 → 自動補上第 4 格 105(現有使用者設定自動遷移)
-    assert normalize_clinic_rooms(["101", "102", "103"]) == (["101", "102", "103", "105"], True)
+def test_normalize_clinic_rooms_upgrades_prior_defaults_to_full():
+    # [2026-06-29] 歷次預設(3 格、或 4 格無 104)→ 整組升級成完整 5 格,不會重複 105/漏 104
+    assert normalize_clinic_rooms(["101", "102", "103"]) == (_DEF5, True)
+    assert normalize_clinic_rooms(["101", "102", "103", "105"]) == (_DEF5, True)
+    # 已是完整 5 格預設 → 不變動
+    assert normalize_clinic_rooms(["101", "102", "103", "104", "105"]) == (_DEF5, False)
 
 
 def test_normalize_clinic_rooms_preserves_custom_rooms_and_repairs_bad_values():
-    # 自訂前幾格 → 保留並用對應預設補滿到 4 格(103/105)
-    assert normalize_clinic_rooms([" 201 ", "202"]) == (["201", "202", "103", "105"], True)
-    assert normalize_clinic_rooms(["201", "202"]) == (["201", "202", "103", "105"], True)
-    # 舊版完整 3 格自訂 → 補上第 4 格(105)
-    assert normalize_clinic_rooms(["201", "202", "203"]) == (["201", "202", "203", "105"], True)
-    # 已是完整 4 格 → 不變動
-    assert normalize_clinic_rooms(["201", "202", "203", "205"]) == (["201", "202", "203", "205"], False)
-    assert normalize_clinic_rooms("bad") == (["101", "102", "103", "105"], True)
+    # 自訂前幾格 → 保留並用對應預設補滿到 5 格(103/104/105)
+    assert normalize_clinic_rooms([" 201 ", "202"]) == (["201", "202", "103", "104", "105"], True)
+    assert normalize_clinic_rooms(["201", "202"]) == (["201", "202", "103", "104", "105"], True)
+    assert normalize_clinic_rooms(["201", "202", "203"]) == (["201", "202", "203", "104", "105"], True)
+    # 已是完整 5 格自訂 → 不變動
+    assert normalize_clinic_rooms(["201", "202", "203", "204", "205"]) == (
+        ["201", "202", "203", "204", "205"], False)
+    assert normalize_clinic_rooms("bad") == (_DEF5, True)
 
 
 def _canon(value):

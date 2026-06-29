@@ -6,10 +6,18 @@ from datetime import date, datetime
 from typing import Any, Callable
 
 
-# [2026-06-29] 本科固定診間 4 間:101/102/103/105(院方跳號、無 104)。
-DEFAULT_CLINIC_ROOMS = ("101", "102", "103", "105")
+# [2026-06-29] 本科固定診間 5 間:101/102/103/104/105。
+DEFAULT_CLINIC_ROOMS = ("101", "102", "103", "104", "105")
 LEGACY_DEFAULT_CLINIC_ROOMS = ("181", "182")
-# 門診動態卡片數 = 預設診間數（目前 4 格）。所有迴圈／補滿都以此為準,避免格數不一致。
+# 歷次預設(每次改診間數就把舊預設加進來)。整組剛好等於其中之一 → 視為「沒自訂、用舊預設」→ 自動
+# 升級成目前完整預設。沒有這條的話,先前 4 格 101/102/103/105 會被當自訂,盲目補滿成 …/105/105
+# (重複 105、漏掉 104)。
+_PRIOR_DEFAULT_ROOMS = (
+    ("181", "182"),                         # 最舊(院方改號前)
+    ("101", "102", "103"),                  # 3 診時期
+    ("101", "102", "103", "105"),           # 4 診時期(當時誤以為跳號無 104)
+)
+# 門診動態卡片數 = 預設診間數（目前 5 格）。所有迴圈／補滿都以此為準,避免格數不一致。
 CLINIC_ROOM_COUNT = len(DEFAULT_CLINIC_ROOMS)
 
 
@@ -17,18 +25,21 @@ def normalize_clinic_rooms(value: Any) -> tuple[list[str], bool]:
     """正規化診間清單為 CLINIC_ROOM_COUNT 格，並遷移歷史預設。
 
     - 非 list／壞值 → 回完整預設。
-    - 歷史 181/182 兩格預設 → 整組換成新預設（101/102/103/105）。
-    - 不足格數（如舊版 2 格、或先前 3 格 101/102/103）→ 保留既有格、用對應位置的預設補滿到
-      CLINIC_ROOM_COUNT(舊 3 格設定會自動補上第 4 格 → 105)。
+    - 整組等於歷次預設之一(181/182、101/102/103、101/102/103/105)→ 升級成目前完整預設
+      (101/102/103/104/105);這樣每次改診間都能正確補位,不會把 105 重複或漏掉 104。
+    - 其餘(視為自訂)且不足格數 → 保留既有格、用對應位置的預設補滿到 CLINIC_ROOM_COUNT。
     回傳 (rooms, changed)；changed=True 表示需寫回磁碟。
     """
     if not isinstance(value, list):
         return list(DEFAULT_CLINIC_ROOMS), True
     rooms = [str(room or "").strip() for room in value[:CLINIC_ROOM_COUNT]]
+    # 整組是歷次預設 → 升級成目前完整預設
+    if tuple(rooms) in _PRIOR_DEFAULT_ROOMS:
+        return list(DEFAULT_CLINIC_ROOMS), True
     n_legacy = len(LEGACY_DEFAULT_CLINIC_ROOMS)
     if len(rooms) <= n_legacy and tuple(rooms[:n_legacy]) == LEGACY_DEFAULT_CLINIC_ROOMS:
         return list(DEFAULT_CLINIC_ROOMS), True
-    # 不足格數（例：舊版只存 2 格）→ 以對應位置的預設補滿
+    # 自訂但不足格數（例：只填前幾格）→ 以對應位置的預設補滿
     while len(rooms) < CLINIC_ROOM_COUNT:
         rooms.append(DEFAULT_CLINIC_ROOMS[len(rooms)])
     return rooms, rooms != value

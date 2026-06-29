@@ -1022,9 +1022,9 @@ def test_re_room_matches_letter_prefixed_room():
     assert pat.search("(已關診)") is None
 
 
-def test_overview_primary_rooms_a101_a103_a105_and_no_legacy_181_182():
+def test_overview_primary_rooms_a101_to_a105_and_no_legacy_181_182():
     """[2026-06-19 user] 總覽醫師門診表:本科主診間 A101→A102→A103診。
-    [2026-06-29] 加入第 4 間固定診 A105診(院方跳號無 A104)。
+    [2026-06-29] 本科固定診擴為 5 間,加入 A104診、A105診。
     這幾間自動隱藏診間號(自家診間免標)、排序排最前;其餘診間才顯示「(診間)」。
     舊的 181診/182診 硬編碼(顯示隱藏 + 排序桶)必須移除,改用 _OVERVIEW_PRIMARY_ROOMS 常數。"""
     source = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
@@ -1032,7 +1032,7 @@ def test_overview_primary_rooms_a101_a103_a105_and_no_legacy_181_182():
     m = re.search(r"_OVERVIEW_PRIMARY_ROOMS\s*=\s*\(([^)]*)\)", source)
     assert m, "找不到 _OVERVIEW_PRIMARY_ROOMS 定義"
     rooms = re.findall(r'"([^"]+)"', m.group(1))
-    assert rooms == ["A101診", "A102診", "A103診", "A105診"], rooms
+    assert rooms == ["A101診", "A102診", "A103診", "A104診", "A105診"], rooms
     # 舊的門診表硬編碼診間字串已不存在(避免回退到 181/182診)
     assert '"181診"' not in source
     assert '"182診"' not in source
