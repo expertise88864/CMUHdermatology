@@ -40,7 +40,7 @@ from cmuh_common.config_io import load_json_dict
 # -----------------------------------------------------------------------------
 # 預設 snippets（首次啟動自動寫入；不含 if，避免英文 "if " 誤觸）
 # -----------------------------------------------------------------------------
-ABBREV_CONFIG_SCHEMA_VERSION = 10  # [v10 2026-06-22] cert 預設去掉「曾」(沿用舊版者自動升級);[v9] 新增 inf;[v8] 移除醫師代碼預設
+ABBREV_CONFIG_SCHEMA_VERSION = 11  # [v11 2026-06-30] 新增 df→dermatofibroma;[v10] cert 去「曾」;[v9] 新增 inf;[v8] 移除醫師代碼預設
 MAX_ABBREV_LENGTH = 63
 
 DEFAULT_ITEMS: list[dict[str, str]] = [
@@ -49,6 +49,7 @@ DEFAULT_ITEMS: list[dict[str, str]] = [
     {"abbrev": "da1",  "expansion": "da1"},
     {"abbrev": "da2",  "expansion": "da2"},
     {"abbrev": "cbt",  "expansion": "check blood test"},
+    {"abbrev": "df",   "expansion": "dermatofibroma"},
     {"abbrev": "ec",   "expansion": "epidermoid cyst"},
     {"abbrev": "mf",   "expansion": "medication and follow up"},
     {"abbrev": "nt",   "expansion": "next time:"},
@@ -357,6 +358,9 @@ def load_config(path: str, *, persist_migrations: bool = True) -> AbbrevConfig:
         if loaded_schema_version < 9:
             # [v9] 新增預設 inf:使用者沒有同名才補上,不覆蓋自訂、不動其他預設
             needs_save = _ensure_default_present(cfg.items, "inf") or needs_save
+        if loaded_schema_version < 11:
+            # [v11] 新增預設 df→dermatofibroma:使用者沒有同名才補,不覆蓋自訂、不動其他預設
+            needs_save = _ensure_default_present(cfg.items, "df") or needs_save
         needs_save = True
     needs_save = _maybe_migrate_legacy(cfg.items) or needs_save
     cfg.items = sort_abbrev_items(cfg.items)
