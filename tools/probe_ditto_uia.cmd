@@ -11,7 +11,7 @@ REM   1. In the HIS: DITTO -> 醫師上次, leave that list window OPEN.
 REM   2. Double-click this file.
 REM   3. Result saves to settings\_ditto_uia_probe.txt -- send it to Claude.
 
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 where python >nul 2>nul
 if errorlevel 1 (

@@ -11,7 +11,7 @@ settings\\_ditto_ocr_probe.txt(.cmd 另存一份 _ditto_ocr_run.log)。
 
 用法:
   1. HIS 裡 DITTO → 醫師上次,清單開著(療程1 / 卡號 那幾列看得到)
-  2. 雙擊 probe_ditto_ocr.cmd   (會自動加 --show,連螢幕 BitBlt 也測)
+  2. 雙擊 tools\probe_ditto_ocr.cmd   (會自動加 --show,連螢幕 BitBlt 也測)
   3. 把 settings\\_ditto_ocr_probe.txt 貼給 Claude,連同 settings\\_ditto_*.png
 """
 from __future__ import annotations

@@ -7,7 +7,7 @@
   2. 同時列舉主視窗 (TFopdmain) 底下所有 Edit-like 控制項 + 文字 + 位置,並標出 text 含
      "40" 的候選 —— 即使焦點沒讀到,也能用「左上角、文字=40」交叉確認。
 
-用法:雙擊 身份欄探測.cmd → 掛入一位病人 → 切回 HIS、用滑鼠點一下身份欄(顯示 40 那格)
+用法:雙擊 tools\身份欄探測.cmd → 掛入一位病人 → 切回 HIS、用滑鼠點一下身份欄(顯示 40 那格)
 → 等倒數完。結果存到 settings\\_identity_field_probe.txt,整個貼給 Claude。
 """
 from __future__ import annotations

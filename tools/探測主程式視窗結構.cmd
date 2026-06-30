@@ -18,7 +18,7 @@ REM      settings\main_app_menu_probe.txt
 REM      Paste its content to Claude.
 REM ============================================================================
 
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 echo.
 echo ============================================================

@@ -3,7 +3,7 @@ setlocal EnableDelayedExpansion
 chcp 65001 >nul
 REM =============================================================================
 REM build_all.bat — 一鍵打包 4 個 .exe（離線部署備案）
-REM 一般部署用 deploy\installer.bat 走 Embedded Python；本檔是「全離線單檔」備案。
+REM 一般部署用根目錄的 第一次執行先點我.bat 走 Embedded Python；本檔是「全離線單檔」備案。
 REM =============================================================================
 
 cd /d "%~dp0\.."

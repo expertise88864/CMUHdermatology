@@ -8,7 +8,7 @@ REM   3. Switch back to the HIS and CLICK INSIDE the 卡號 field (caret blinkin
 REM      BEFORE the countdown ends.
 REM   4. Send Claude: settings\_card_field_probe.txt
 
-cd /d "%~dp0"
+cd /d "%~dp0.."
 chcp 65001 >nul
 set "PYTHONIOENCODING=utf-8"
 if not exist settings mkdir settings
@@ -30,7 +30,7 @@ exit /b 1
 
 :run
 REM No output redirect: you must SEE the countdown so you know when to click.
-%PYEXE% "%~dp0scripts\probe_card_field.py"
+%PYEXE% "%~dp0..\scripts\probe_card_field.py"
 echo.
 echo (Result saved to settings\_card_field_probe.txt -- send it to Claude.)
 echo.

@@ -5,7 +5,7 @@
 時間到時本工具讀「目前有輸入焦點的控制項」,回報它的 hwnd / class / 位置 /
 目前文字,以及它在主視窗內的相對位置 → Claude 就能寫出穩當的卡號欄定位。
 
-用法:雙擊 probe_card_field.cmd → 切回 HIS、點一下卡號欄 → 等倒數完。
+用法:雙擊 tools\probe_card_field.cmd → 切回 HIS、點一下卡號欄 → 等倒數完。
 結果存到 settings\\_card_field_probe.txt。
 """
 from __future__ import annotations

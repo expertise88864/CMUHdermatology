@@ -13,7 +13,7 @@ powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
 exit /b 0
 
 :elevated
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 where python >nul 2>nul
 if errorlevel 1 (

@@ -16,7 +16,7 @@ REM   4. The slowest 30 imports will print; full log at settings\startup_profile
 REM =============================================================================
 
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 set "PYEXE="
 set "PER_USER_PY_DIR=%LOCALAPPDATA%\Programs\Python\Python312"
@@ -37,7 +37,7 @@ if not defined PYEXE (
 )
 
 if not exist "settings" mkdir "settings"
-set "OUT=%~dp0settings\startup_profile.txt"
+set "OUT=%~dp0..\settings\startup_profile.txt"
 
 echo.
 echo === Profiling main.py startup imports ===
@@ -48,11 +48,11 @@ echo The main program will open. Close it normally when ready; then this
 echo window will summarize the slowest imports.
 echo.
 
-"%PYEXE%" -X importtime "%~dp0src\main.py" 2> "%OUT%"
+"%PYEXE%" -X importtime "%~dp0..\src\main.py" 2> "%OUT%"
 
 echo.
 echo === Slowest imports ===
-"%PYEXE%" "%~dp0scripts\analyze_startup_profile.py" "%OUT%"
+"%PYEXE%" "%~dp0..\scripts\analyze_startup_profile.py" "%OUT%"
 
 echo.
 echo Full log:  %OUT%

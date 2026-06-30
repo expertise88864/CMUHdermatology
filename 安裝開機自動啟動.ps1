@@ -64,7 +64,7 @@ if (-not $pythonw) {
 }
 if (-not $pythonw) {
     [System.Windows.Forms.MessageBox]::Show(
-        "找不到 pythonw.exe`n`n請先安裝 Python 3.10+ 或執行 deploy\installer.bat。",
+        "找不到 pythonw.exe`n`n請先安裝 Python 3.10+ 或執行根目錄的 第一次執行先點我.bat。",
         '錯誤', 'OK', 'Error') | Out-Null
     exit 1
 }

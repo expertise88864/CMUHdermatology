@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 chcp 65001 >nul
 REM =============================================================================
-REM installer.bat — 中國醫皮膚科常用程式 一鍵部署器（Embedded Python 改良版）
+REM 第一次執行先點我.bat（原 installer.bat）— 中國醫皮膚科常用程式 一鍵部署器（Embedded Python 改良版）
 REM
 REM 邏輯：
 REM   有 Python 3.10+ → 直接用系統 Python，git clone 原始碼，建桌面捷徑

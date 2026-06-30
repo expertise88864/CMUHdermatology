@@ -28,18 +28,20 @@ pythonw src\main.py
 
 ### 方法 C — 桌面捷徑
 
-跑一次 `deploy\installer.bat` 即可建立 4 個桌面捷徑（也可直接給其他電腦用）。
+跑一次根目錄的 `第一次執行先點我.bat`（原 `deploy\installer.bat`，已改名移到根目錄）即可
+建立桌面捷徑（也可直接給其他電腦用）。
 
 ## 部署到其他電腦
 
-已經下載完整資料夾時，先雙擊根目錄的 `安裝Python.bat`。它會安裝套件後
-實際 import 驗證所有必要模組，並印出真正使用的 Python 路徑。
+**已經下載完整資料夾時**，直接雙擊根目錄的 `第一次執行先點我.bat`：它會自動偵測 Python
+（沒有就下載 Embedded Python 3.12）、安裝相依套件、建立 5 個桌面捷徑、接上線上自動更新。
+（只想就地安裝套件、不另建捷徑，也可改雙擊 `安裝Python.bat`。）
 
-下載 `deploy/installer.bat`，雙擊即可：
+**從零開始（連資料夾都沒有）**，下載這支 bootstrap 後雙擊即可（檔名為中文，URL 已編碼）：
 
 ```cmd
-powershell -Command "Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/expertise88864/CMUHdermatology/main/deploy/installer.bat' -OutFile '%USERPROFILE%\Desktop\installer.bat'"
-%USERPROFILE%\Desktop\installer.bat
+powershell -Command "Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/expertise88864/CMUHdermatology/main/%E7%AC%AC%E4%B8%80%E6%AC%A1%E5%9F%B7%E8%A1%8C%E5%85%88%E9%BB%9E%E6%88%91.bat' -OutFile '%USERPROFILE%\Desktop\第一次執行先點我.bat'"
+%USERPROFILE%\Desktop\第一次執行先點我.bat
 ```
 
 - 有 Python 3.10+ → 直接用系統 Python

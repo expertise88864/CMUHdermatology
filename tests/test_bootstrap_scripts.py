@@ -23,7 +23,8 @@ def test_root_python_setup_stays_ascii_and_verifies_imports():
 
 
 def test_deploy_installer_verifies_imports_and_fails_closed():
-    src = (ROOT / "deploy" / "installer.bat").read_text(encoding="utf-8")
+    # [2026-06-30] 原 deploy/installer.bat,改名移到根目錄「第一次執行先點我.bat」。
+    src = (ROOT / "第一次執行先點我.bat").read_text(encoding="utf-8")
 
     assert "scripts\\verify_dependencies.py" in src
     assert "settings\\python_setup.log" in src
@@ -43,5 +44,5 @@ def test_manifest_sync_includes_dependency_bootstrap_files():
     src = (ROOT / "scripts" / "sync_manifest.py").read_text(encoding="utf-8")
 
     assert '"安裝Python.bat"' in src
-    assert '"deploy/installer.bat"' in src
+    assert '"第一次執行先點我.bat"' in src
     assert '"scripts/verify_dependencies.py"' in src

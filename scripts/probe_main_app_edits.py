@@ -5,7 +5,7 @@ hwnd + class + text + 螢幕位置。
 用途：找出「療程」輸入欄位的 hwnd，讓 F4 可以 SendMessage 設定它（不用
 寫死座標）。
 
-用法（雙擊「探測療程欄位.cmd」，會自動提權跑此 .py）：
+用法（雙擊「tools\探測療程欄位.cmd」，會自動提權跑此 .py）：
   1. 開啟主程式並掛入患者（畫面顯示像截圖：療程欄目前值 = "3"）
   2. 跑 probe
   3. 把 settings/main_app_edits_probe.txt 內容貼給 Claude

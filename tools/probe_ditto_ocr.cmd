@@ -9,11 +9,11 @@ REM   1. In the HIS: DITTO -> medical-history list, leave it OPEN with the top r
 REM   2. Double-click this file. (May auto-install the OCR package "winsdk" once.)
 REM   3. Send Claude: settings\_ditto_ocr_probe.txt  (and settings\_ditto_grid.png).
 
-cd /d "%~dp0"
+cd /d "%~dp0.."
 chcp 65001 >nul
 set "PYTHONIOENCODING=utf-8"
 if not exist settings mkdir settings
-set "LOG=%~dp0settings\_ditto_ocr_run.log"
+set "LOG=%~dp0..\settings\_ditto_ocr_run.log"
 
 where python >nul 2>nul
 if not errorlevel 1 (
@@ -35,7 +35,7 @@ exit /b 1
 :run
 echo Running probe with %PYEXE% ...  (full log: %LOG%)
 echo.
-%PYEXE% "%~dp0scripts\probe_ditto_ocr.py" --show > "%LOG%" 2>&1
+%PYEXE% "%~dp0..\scripts\probe_ditto_ocr.py" --show > "%LOG%" 2>&1
 echo ------------------------- OUTPUT -------------------------
 type "%LOG%"
 echo ----------------------------------------------------------

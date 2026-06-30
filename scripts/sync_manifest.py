@@ -83,7 +83,7 @@ def collect_entries(version: str) -> list:
         "清理重複打卡程式.ps1",
         # Python / dependency bootstrap
         "安裝Python.bat",
-        "deploy/installer.bat",
+        "第一次執行先點我.bat",  # [2026-06-30] 原 deploy/installer.bat,改名移到根目錄
         "scripts/verify_dependencies.py",
         # 手動更新腳本本身也要納入線上更新 —— 否則卡在舊版/壞掉的 pull_update.bat
         # 的電腦永遠收不到修正(catch-22),手動 git pull 也一直失敗。純文字 .bat,
