@@ -3021,7 +3021,9 @@ def _f11_handle_transfer_msg(hwnd: int, label: str = "") -> bool:
                 #      TabSheet6,只剩一顆「離開」鈕)→ 需再按「離開」才會關(= user 回報的
                 #      「點了本科門診後還是跳出要按離開的畫面」)。只在「離開」鈕真的【可見】
                 #      (分頁已切過去)時才點,避免誤點到隱藏分頁上的鈕。
-                end_t = time.time() + 6
+                # 實測:會關就會在 ~1s 內關、部分負擔頁也會在 ~1s 內跳出 → 窗口給 2s(含餘裕)就夠,
+                # 不用等 6s。真有更慢的情況,handler 最上面的『部分負擔頁復原』會在 watcher 重進來時兜底。
+                end_t = time.time() + 2
                 while time.time() < end_t:
                     check_stop()
                     if not ctypes.windll.user32.IsWindow(hwnd):
@@ -3038,8 +3040,8 @@ def _f11_handle_transfer_msg(hwnd: int, label: str = "") -> bool:
                         logging.warning("[%s]   本科門診:按了離開但視窗未關 → 交 watcher 重試", label)
                         return False
                     time.sleep(0.15)
-                logging.warning("[%s]   本科門診:處理/離開後 6s 內視窗未關、也沒出現「離開」鈕 "
-                                "→ 交 watcher 重試", label)
+                logging.warning("[%s]   本科門診:處理/離開後 2s 內視窗未關、也沒出現「離開」鈕 "
+                                "→ 交 watcher 重試(最上面復原會兜底)", label)
                 return False
             logging.warning("[%s]   本科門診路徑:找不到「處理/離開」", label)
             return False
