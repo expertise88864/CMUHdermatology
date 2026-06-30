@@ -2956,6 +2956,20 @@ def _referral_grid_has_appointments(dialog_hwnd: int, label: str = "") -> bool:
         return False
 
 
+def _f11_first_visible_enabled(parent_hwnd: int, target_class: str,
+                               target_text: str) -> int:
+    """回第一個 class+exact-text 且【可見+enabled】的子孫 hwnd;沒有回 0。
+    用 IsWindowVisible gate 過濾 Delphi 隱藏分頁(TTabSheet)上的同名控件。"""
+    for h, _, _ in _find_descendants_by_exact_text(parent_hwnd, target_class, target_text):
+        try:
+            if (ctypes.windll.user32.IsWindowVisible(h)
+                    and ctypes.windll.user32.IsWindowEnabled(h)):
+                return h
+        except Exception:
+            continue
+    return 0
+
+
 def _f11_handle_transfer_msg(hwnd: int, label: str = "") -> bool:
     """病人轉診提示畫面 popup (class=TFTunMsg)。[2026-06-29] 依『本次門診預掛紀錄』有無預約決定動向:
       有預約(病人要回本科)→ 勾「本科門診進一步追蹤治療」→ 點「處理/離開」→ 視窗直接關(無 state B);
@@ -2966,6 +2980,20 @@ def _f11_handle_transfer_msg(hwnd: int, label: str = "") -> bool:
     logging.info("[%s] 轉診提示 popup hwnd=%s", label, hwnd)
     time.sleep(0.12)
     check_stop()
+
+    # [2026-06-30][Codex] 復原:watcher 重進來時,視窗可能已停在『部分負擔提示』分頁(TabSheet6)。
+    # 特徵 = 有【可見】的「離開」鈕,且【沒有】可見的「處理/離開」鈕與動向 radio(動向頁的控件都被
+    # 切到背景隱藏了)。此時直接按「離開」收尾,讓重試能從這頁恢復,不會掉進『沒預約→轉回原診所』而卡死。
+    # 用強門檻(同時要求離開可見+處理離開/radio 都不可見)避免在動向頁誤觸,不新增誤點面。
+    if (not _f11_first_visible_enabled(hwnd, "TButton", "處理/離開")
+            and not _f11_first_visible_enabled(hwnd, "TGroupButton", "本科門診進一步追蹤治療")
+            and not _f11_first_visible_enabled(hwnd, "TGroupButton", "轉回原診所繼續治療")):
+        leave_only = _f11_first_visible_enabled(hwnd, "TButton", "離開")
+        if leave_only:
+            clicked = _post_click_to_control(leave_only)
+            logging.info("[%s] 轉診:停在部分負擔提示頁 → 按「離開」(hwnd=%s, sent=%s)",
+                         label, leave_only, clicked)
+            return _wait_window_closed(hwnd, timeout=5)
 
     # [2026-06-29] 有預約 → 本科門診進一步追蹤治療(選 + 處理/離開,視窗直接關,無 state B)。
     if _referral_grid_has_appointments(hwnd, label):
@@ -2987,10 +3015,31 @@ def _f11_handle_transfer_msg(hwnd: int, label: str = "") -> bool:
             check_stop()
             if _click_button_normalized_text(hwnd, "處理/離開"):
                 # [Codex] 成功條件 = 視窗真的關閉;沒關回 False 讓 watcher 重試,別誤標 handled。
-                if _wait_window_closed(hwnd, timeout=5):
-                    logging.info("[%s]   本科門診:已點處理/離開、視窗已關", label)
-                    return True
-                logging.warning("[%s]   本科門診:點了處理/離開但視窗未關 → 交 watcher 重試", label)
+                # [2026-06-30] 處理/離開 後有兩種結果,同一迴圈擇先處理:
+                #   ① 視窗直接關(非轉診-in 病人)→ 完成;
+                #   ② 轉診-in 病人會切到『部分負擔提示』分頁(TFTunMsg 內 TPageControl 的
+                #      TabSheet6,只剩一顆「離開」鈕)→ 需再按「離開」才會關(= user 回報的
+                #      「點了本科門診後還是跳出要按離開的畫面」)。只在「離開」鈕真的【可見】
+                #      (分頁已切過去)時才點,避免誤點到隱藏分頁上的鈕。
+                end_t = time.time() + 6
+                while time.time() < end_t:
+                    check_stop()
+                    if not ctypes.windll.user32.IsWindow(hwnd):
+                        logging.info("[%s]   本科門診:已點處理/離開、視窗已關", label)
+                        return True
+                    leave_btn = _f11_first_visible_enabled(hwnd, "TButton", "離開")
+                    if leave_btn:
+                        clicked = _post_click_to_control(leave_btn)
+                        logging.info("[%s]   本科門診:部分負擔提示頁按「離開」(hwnd=%s, sent=%s)",
+                                     label, leave_btn, clicked)
+                        if _wait_window_closed(hwnd, timeout=5):
+                            logging.info("[%s]   本科門診:離開後視窗已關", label)
+                            return True
+                        logging.warning("[%s]   本科門診:按了離開但視窗未關 → 交 watcher 重試", label)
+                        return False
+                    time.sleep(0.15)
+                logging.warning("[%s]   本科門診:處理/離開後 6s 內視窗未關、也沒出現「離開」鈕 "
+                                "→ 交 watcher 重試", label)
                 return False
             logging.warning("[%s]   本科門診路徑:找不到「處理/離開」", label)
             return False
