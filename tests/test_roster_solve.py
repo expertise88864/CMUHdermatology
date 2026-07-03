@@ -289,6 +289,18 @@ def test_vs_no_fixed_weekday_no_range():
 
 
 # ─── 帳本目標與報告 ───────────────────────────────────────────────────────
+def test_count_balance_secondary_keeps_points_priority():
+    """次要班數平衡：點數仍平衡（優先），班數全距壓到最小（同分決勝）。"""
+    from cmuh_common.roster.rules import RULE_REGISTRY
+    assert any(getattr(c, "rule_id", "") == "count_balance" for c in RULE_REGISTRY)
+    r = solve_duty(make_ctx())                       # 3 R, 2026-08
+    assert r.status == "ok"
+    pts = list(r.points_by_person.values())
+    assert max(pts) - min(pts) <= 1                  # 點數平衡（優先）不被犧牲
+    counts = list(r.duty_counts.values())
+    assert max(counts) - min(counts) <= 2            # 班數全距最小化
+
+
 def test_ledger_carryover_shifts_target():
     # r1 上月多值 3 點 → 目標調低;點數應低於其他人
     r = solve_duty(make_ctx(ledger={R1: 3.0}))

@@ -336,11 +336,18 @@ class DutyRangeRule(Rule):
 
 
 # ─── 軟規則（目標函數）───────────────────────────────────────────────────
+# 點數項權重：遠大於次要「班數全距」項的最大可能值（≤ 當月天數，恆 <1000）。
+# 點數 dev 為整數，任何非零改善 ≥ POINT_WEIGHT×1 ＝ 10000 >> 班數項 → 保證
+# 「點數平衡優先、班數平衡僅為同分決勝」，即使帳本為任意分數（round 後 dev 可
+# 差 <100 也無妨，因為權重差距把它壓死）。
+POINT_WEIGHT = 10000
+
+
 @register_rule
 class PointBalanceRule(Rule):
     kind = "soft"
     rule_id = "point_balance"
-    描述 = "點數平衡：|每人點數 −(公平份額−帳本結轉)| 總和最小化"
+    描述 = "點數平衡：|每人點數 −(公平份額−帳本結轉)| 總和最小化（最高優先軟目標）"
 
     def objective_terms(self, mc, ctx):
         if len(ctx.members) <= 1:
@@ -356,8 +363,30 @@ class PointBalanceRule(Rule):
             dev = mc.model.NewIntVar(0, 100 * total + abs(target),
                                      f"dev_{m.id}")
             mc.model.AddAbsEquality(dev, pts_scaled - target)
-            terms.append((dev, 1))
+            terms.append((dev, POINT_WEIGHT))
         return terms
+
+
+@register_rule
+class DutyCountBalanceRule(Rule):
+    kind = "soft"
+    rule_id = "count_balance"
+    描述 = ("班數平衡（次要）：讓每人『總班數』盡量接近，但**僅在不損及點數平衡"
+          "時**。本項最大貢獻＝班數全距(≤天數<1000)，遠小於點數項每步 "
+          "POINT_WEIGHT=10000 → 點數平均優先、班數平均當同分決勝。")
+
+    def objective_terms(self, mc, ctx):
+        if len(ctx.members) <= 1:
+            return []
+        days = len(ctx.days)
+        cmax = mc.model.NewIntVar(0, days, "cnt_max")
+        cmin = mc.model.NewIntVar(0, days, "cnt_min")
+        for m in ctx.members:
+            cnt = sum(mc.x[(d, m.id)] for d in ctx.days)
+            mc.model.Add(cmax >= cnt)
+            mc.model.Add(cmin <= cnt)
+        # 最小化 (cmax - cmin) = 班數全距；權重 1（點數項每步 ≥100 主導）
+        return [(cmax, 1), (cmin, -1)]
 
 
 # ─── 整體可行性預檢（非約束）──────────────────────────────────────────────
