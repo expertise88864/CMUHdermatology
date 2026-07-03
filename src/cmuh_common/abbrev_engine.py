@@ -1297,6 +1297,10 @@ class AbbrevEngine:
     # 展開後的冷卻時間（s）— 期間 buffer 暫停累積，避免 user 連打第二組
     # 縮寫時後續 keystroke 跟我們的 paste 競態。需 >= 整個替換流程時間。
     COOLDOWN_SEC = 0.9
+    # [W9 2026-07-03] 非系統管理員時 BlockInput 失敗 → 展開期間無法凍結使用者輸入,
+    # 只能靠 cooldown 保護。此時把 cooldown 額外拉長,縮小「backspace+貼上」之間使用者
+    # 真實按鍵夾入的窗口(admin 環境走 BlockInput 凍結,不受此影響)。
+    NON_ADMIN_EXTRA_COOLDOWN_SEC = 0.6
     # [速度] 原生欄位走「同步直接取代、完全不碰剪貼簿」的快路徑，沒有 paste 競態，
     # 不需要上面為剪貼簿路徑設的長 cool-down。命中原生路徑時改用此縮短值，
     # 讓連續展開（醫師快速打多組縮寫）更即時。只縮短、不延長。
@@ -1327,6 +1331,10 @@ class AbbrevEngine:
         self._buffer: str = ""
         self._press_hook: Any = None
         self._suppressing = False
+        # [W8 2026-07-03] 展開世代 token:每次展開/自癒遞增。延遲的 cooldown Timer
+        # (_clear)只在 token 未變時才清 buffer —— 避免「自癒已恢復、使用者重新打字後」
+        # 一個晚爆的舊 Timer 把新輸入清掉。單一寫者(hook 緒),GIL 下讀寫原子,無需鎖。
+        self._suppress_token = 0
         # [2026-06-05] 上次打字時的鍵盤焦點控制項 HWND。焦點(欄位/視窗)改變就清空
         # buffer，避免在 A 欄打"ne"、點到 B 欄打"v1 "被拼成假縮寫 nev1 而誤觸發。
         self._last_focus_hwnd: int = 0
@@ -1468,8 +1476,12 @@ class AbbrevEngine:
         if self._suppressing:
             if time.monotonic() > self._cooldown_until + self.SUPPRESS_SELFHEAL_MARGIN_SEC:
                 logging.warning("[abbrev] _suppressing 逾時未清除，自癒強制重置")
-                self._suppressing = False
+                # [W8] token bump + 旗標/buffer 清除在同一把 _lock 內原子完成,讓任何
+                # 延遲未爆的 _clear Timer 失效(且與其 token 檢查序列化),避免它稍後把
+                # 使用者自癒後新打的字清掉。
                 with self._lock:
+                    self._suppress_token += 1
+                    self._suppressing = False
                     self._buffer = ""
             else:
                 return
@@ -1584,6 +1596,9 @@ class AbbrevEngine:
 
         # 立即進入 suppress + cool-down（同步，在 hook thread 內），這樣
         # 後續按鍵會被忽略，避免重複觸發。
+        with self._lock:                             # [W8] token bump 與清除守衛序列化
+            self._suppress_token += 1                # 本次展開世代
+            suppress_token = self._suppress_token
         self._suppressing = True
         self._cooldown_until = time.monotonic() + self.COOLDOWN_SEC
 
@@ -1597,7 +1612,7 @@ class AbbrevEngine:
             worker = threading.Thread(
                 target=self._do_replace,
                 args=(delete_count, rendered, matched_key,
-                      matched_key + trigger_char, cursor_left),
+                      matched_key + trigger_char, cursor_left, suppress_token),
                 daemon=True,
             )
             worker.start()
@@ -1615,6 +1630,7 @@ class AbbrevEngine:
         abbrev_key: str,
         typed_suffix: Optional[str] = None,
         cursor_left: int = 0,
+        suppress_token: int = 0,
     ) -> None:
         """在獨立 thread 執行：原生欄位先嘗試直接取代，其他欄位再分兩段
         SendInput：(1) backspace × N → 等目標處理完刪除 → (2) Ctrl+V 貼上。
@@ -1691,12 +1707,16 @@ class AbbrevEngine:
                 # [fix D 2026-06-09] BlockInput 失敗(通常=非 admin)原本只有 debug log，
                 # 排障時看不到「展開期間沒有凍結輸入、靠 cooldown 保護」這個重要事實。
                 # 每 session 警告一次(不洗版)。
-                if not blocked and not _BLOCKINPUT_WARNED[0]:
-                    _BLOCKINPUT_WARNED[0] = True
-                    logging.warning(
-                        "[abbrev] BlockInput 失敗(可能非系統管理員權限)——展開期間"
-                        "無法凍結使用者輸入，僅靠 cooldown 保護；快速連打時極小機率"
-                        "夾字。以系統管理員執行可消除此限制。")
+                if not blocked:
+                    # [W9] 沒凍結成功 → 額外拉長本次 cooldown,縮小按鍵夾入窗口。
+                    # 在此(Timer 排程於函式尾端 1790 之前)延長 _cooldown_until 才會生效。
+                    self._cooldown_until += self.NON_ADMIN_EXTRA_COOLDOWN_SEC
+                    if not _BLOCKINPUT_WARNED[0]:
+                        _BLOCKINPUT_WARNED[0] = True
+                        logging.warning(
+                            "[abbrev] BlockInput 失敗(可能非系統管理員權限)——展開期間"
+                            "無法凍結使用者輸入，僅靠(已加長的)cooldown 保護；快速連打時"
+                            "極小機率夾字。以系統管理員執行可消除此限制。")
                 paste_settled = False  # 提前綁定:若 try 內提早拋例外,finally 後參照不會 NameError
                 try:
                     # 2a-1. 先送 backspace 刪除「縮寫 + 觸發空白」
@@ -1782,20 +1802,32 @@ class AbbrevEngine:
             logging.info("[abbrev] 展開 '%s' → %d 字 (%s)",
                          abbrev_key, len(text), mode)
 
-            # cool-down 期滿後才清 suppress 旗標 + buffer
-            def _clear():
-                self._suppressing = False
-                with self._lock:
-                    self._buffer = ""
+            # cool-down 期滿後才清 suppress 旗標 + buffer(token 守衛見 _clear_after_cooldown)
             remaining = max(0.0, self._cooldown_until - time.monotonic())
             if remaining:
-                t = threading.Timer(remaining, _clear)
+                t = threading.Timer(remaining, self._clear_after_cooldown,
+                                    args=(suppress_token,))
                 t.daemon = True
                 try:
                     t.start()
                 except Exception:
                     logging.exception(
                         "[abbrev] cooldown timer start failed; clear now")
-                    _clear()
+                    self._clear_after_cooldown(suppress_token)
             else:
-                _clear()
+                self._clear_after_cooldown(suppress_token)
+
+    def _clear_after_cooldown(self, suppress_token: int) -> None:
+        """[W8] cooldown 期滿清 suppress 旗標 + buffer。token 守衛:期間若已有更新的
+        展開/自癒(self._suppress_token 已前進)→ 這個延遲 Timer 已過期,不可再清 buffer
+        (否則會清掉使用者自癒/新展開後打的字)。
+
+        [W8 codex review] token 檢查與 buffer 清除在【同一把 _lock】內原子完成 —— 否則
+        「檢查通過後、清除前」被自癒/新輸入插隊(hook 緒 bump token + 打新字)會造成
+        check-then-act race 仍清掉新 buffer。所有 token 變動(_try_expand/自癒)亦在
+        _lock 內,與此檢查序列化。"""
+        with self._lock:
+            if self._suppress_token != suppress_token:
+                return
+            self._suppressing = False
+            self._buffer = ""

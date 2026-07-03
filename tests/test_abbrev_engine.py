@@ -512,6 +512,47 @@ def test_handle_event_typing_word_then_space_does_not_misfire(monkeypatch):
     assert eng._suppressing is False, "persist 結尾的 st 不該誤觸展開"
 
 
+# ─── W8:cooldown Timer 的 token 守衛(防延遲 Timer 清掉新輸入) ─────────────
+
+def test_clear_after_cooldown_respects_token():
+    """過期 token(自癒/新展開後 token 已前進)→ _clear 不清 buffer;當前 token → 正常清。"""
+    eng = _make_engine()
+    eng._suppressing = True
+    eng._suppress_token = 5
+    with eng._lock:
+        eng._buffer = "cert"
+    # 舊 Timer(token=4)已過期 → 不可清(否則清掉使用者自癒後打的 cert)
+    eng._clear_after_cooldown(4)
+    assert eng._buffer == "cert"
+    assert eng._suppressing is True
+    # 當前 token=5 → 正常清
+    eng._clear_after_cooldown(5)
+    assert eng._buffer == ""
+    assert eng._suppressing is False
+
+
+def test_selfheal_bumps_token_invalidating_stale_timer():
+    """自癒重置會遞增 token,使先前排定的延遲 _clear 失效(不再清 buffer)。"""
+    eng = _make_engine()
+    eng._suppressing = True
+    eng._cooldown_until = 0.0          # 已遠過期 → 觸發自癒
+    eng._suppress_token = 3
+    scheduled_token = eng._suppress_token   # 假設某 Timer 以此 token 排定
+
+    class _K:
+        def __init__(self, n):
+            self.name = n
+    # 自癒路徑:_suppressing=True 但已超過 cooldown+margin → 重置 + bump token
+    eng._handle_event(_K("a"))
+    assert eng._suppress_token != scheduled_token   # token 已前進
+    # 使用者自癒後打的字
+    with eng._lock:
+        eng._buffer = "newword"
+    # 那個舊 Timer 現在才爆 → 因 token 過期,不清
+    eng._clear_after_cooldown(scheduled_token)
+    assert eng._buffer == "newword"
+
+
 # ─── 游標定位 token (%|%) ─────────────────────────────────────────────────
 
 def test_split_cursor_marker():
