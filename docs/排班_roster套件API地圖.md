@@ -78,8 +78,8 @@
 
 ---
 
-## 4. service.py 方法清單(細節見施工指南 §3)
-`RosterService(storage)`:`build_context(scope,ym)->SolveContext`、`run_solve(scope,ym,allow_disable_color=False)->SolveResult`、`accept_solution(scope,ym,ctx,result)`(月檔 duty→last_weekend→report→settle_month→save_ledger→save_month,鎖定格不覆蓋)、`set_cell(scope,ym,d,person,via="manual")`(改完跑 quick_validate)、`toggle_lock`、`set_leaves`、`set_must`、`finalize(ym,on)`、`quick_validate(scope,ym)->list[Precheck]`。
+## 4. service.py 方法清單(已實裝於 `src/cmuh_common/roster/service.py`;細節見施工指南 §3)
+`RosterService(storage)`:`build_context(scope,ym)->SolveContext`、`run_solve(scope,ym,allow_disable_color=False)->SolveResult`、`render_report(scope,ym,result)->str`、`accept_solution(scope,ym,result)`(**不收 ctx**,內部重建;月檔 duty→last_weekend→report→settle_month→save_ledger→save_month,鎖定格不覆蓋,status!=ok/已定案早擋)、`set_cell(scope,ym,d,person,via="manual")->list[Precheck]`(改完跑 quick_validate)、`toggle_lock(scope,ym,d)->bool`、`set_leaves(scope,ym,mid,dates)`、`set_must(scope,ym,mid,dates)`、`finalize(ym,on)`(force save)、`quick_validate(scope,ym)->list[Precheck]`(run_prechecks + 週末成對完整性)。
 測試 `tests/test_roster_service.py`(全用 `tmp_path` storage):build_context 欄位齊全+ISO 轉換、accept 後月檔+ledger+last_weekend 正確、鎖定格不被覆蓋、set_cell 審計+警告、finalize 擋 save、同月二次 accept 帳本不重複累計。
 
 ---
