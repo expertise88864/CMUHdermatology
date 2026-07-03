@@ -1,0 +1,80 @@
+# -*- coding: utf-8 -*-
+"""點數帳本（設計文件 §5 ledger.json / §6 月結）。
+
+語意：正值＝多值了（下月目標調低）；負值＝欠的（下月目標調高、多排償還）。
+月結公式：new_ledger[p] = old_ledger[p] + (points_p − 月總點數/人數)
+（solver 的目標就是讓 points_p ≈ 月總/人數 − old_ledger[p]，理想時 new≈0。）
+
+同月重排：先 rollback_month 移除該月舊分錄影響，再 settle_month 重記——
+history 每筆存 {month, scope, deltas:{person: delta}}，rollback 即反向相減。
+人員異動：reset_member 歸零（設計文件 3.2 R / V6 定案）。
+"""
+from __future__ import annotations
+
+import logging
+
+
+def fair_share(total_points: float, n_members: int) -> float:
+    if n_members <= 0:
+        return 0.0
+    return total_points / n_members
+
+
+def settle_month(ledger: dict, scope: str, month: str,
+                 points_by_person: dict) -> dict:
+    """把該月結果記入帳本（會先自動回滾同月同 scope 舊分錄）。
+
+    points_by_person: {member_id: 本月實得點數}
+    回傳更新後 ledger（就地修改並回傳，呼叫端負責 save）。
+    """
+    rollback_month(ledger, scope, month)
+    n = len(points_by_person)
+    share = fair_share(sum(points_by_person.values()), n)
+    book = ledger.setdefault(scope, {})
+    deltas = {}
+    for pid, pts in points_by_person.items():
+        delta = round(pts - share, 4)
+        book[pid] = round(book.get(pid, 0.0) + delta, 4)
+        deltas[pid] = delta
+    ledger.setdefault("history", []).append(
+        {"month": month, "scope": scope, "deltas": deltas})
+    return ledger
+
+
+def rollback_month(ledger: dict, scope: str, month: str) -> bool:
+    """移除該月該 scope 的分錄影響（重排前呼叫）。回傳是否有回滾。"""
+    hist = ledger.setdefault("history", [])
+    book = ledger.setdefault(scope, {})
+    rolled = False
+    kept = []
+    for entry in hist:
+        if entry.get("month") == month and entry.get("scope") == scope:
+            for pid, delta in (entry.get("deltas") or {}).items():
+                if pid in book:
+                    book[pid] = round(book[pid] - float(delta), 4)
+            rolled = True
+        else:
+            kept.append(entry)
+    ledger["history"] = kept
+    return rolled
+
+
+def reset_member(ledger: dict, scope: str, member_id: str) -> None:
+    """人員異動（離職/新人）→ 餘額歸零（歷史分錄保留供追溯）。"""
+    book = ledger.setdefault(scope, {})
+    if member_id in book and book[member_id]:
+        logging.info("[roster.ledger] %s/%s 帳本 %.2f → 0（人員異動歸零）",
+                     scope, member_id, book[member_id])
+    book[member_id] = 0.0
+
+
+def sync_members(ledger: dict, scope: str, member_ids: list) -> None:
+    """名單同步：新人補 0；已移除者刪除餘額（=作廢，V5 定案）。"""
+    book = ledger.setdefault(scope, {})
+    for mid in member_ids:
+        book.setdefault(mid, 0.0)
+    for mid in list(book):
+        if mid not in member_ids:
+            logging.info("[roster.ledger] %s/%s 已離開名單，餘額 %.2f 作廢",
+                         scope, mid, book[mid])
+            del book[mid]
