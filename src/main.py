@@ -1785,15 +1785,51 @@ def _photo_confirm_yesno(main_hwnd: int, title: str, intro: str, reason: str,
     return ans == 6   # IDYES
 
 
+# [W7 2026-07-03] 半套帳務精準對帳:記錄本次 F2/F3 實際寫回的 UVB「原值→新值」,供
+# 「UVB 已寫、但 51019/療程失敗」時的警告精準列出,醫師可據以【手動補 51019+療程】或
+# 【手動把 UVB 改回原值】——保守路線,不自動 rollback(再寫一次也可能失敗、更難收拾)。
+# 每次 _update_uvb_dose_core 開頭清空,只在確實寫回+verify 通過後填;只反映本次流程
+# (熱鍵序列化執行,無並發)。None = 本次沒有實際改動 UVB。
+_last_uvb_write = None
+
+
+def _record_uvb_write(label, old_dose, old_count, new_dose, new_count) -> None:
+    global _last_uvb_write
+    _last_uvb_write = {
+        "label": label, "old_dose": old_dose, "old_count": old_count,
+        "new_dose": new_dose, "new_count": new_count,
+    }
+
+
+def _fmt_uvb_dc(dose, count) -> str:
+    d = "?" if dose is None else str(dose)
+    c = "（未寫次數）" if count is None else str(count)
+    return f"劑量 {d}、次數 {c}"
+
+
 def _show_light_code_incomplete_warning(label: str, set_療程: int,
                                         *, uvb_already_updated: bool) -> None:
-    """照光代碼/療程未確認完成時，用前景警告避免半套狀態被忽略。"""
+    """照光代碼/療程未確認完成時，用前景警告避免半套狀態被忽略。
+    [W7] 若本次確實改過 UVB(_last_uvb_write 有值)→ 精準列出原值→新值 + 兩個手動選項。"""
     main_hwnd = _find_hospital_main_window()
-    if uvb_already_updated:
+    rec = _last_uvb_write
+    if uvb_already_updated and isinstance(rec, dict) and rec.get("label") == label:
+        old = _fmt_uvb_dc(rec.get("old_dose"), rec.get("old_count"))
+        new = _fmt_uvb_dc(rec.get("new_dose"), rec.get("new_count"))
         msg = (
-            f"{label} 的 UVB 處置已更新成功，\n"
-            f"但 51019 或療程 {set_療程} 沒有確認完成。\n\n"
-            f"請立刻檢查醫令是否已有 51019，且療程欄位是否為 {set_療程}。"
+            f"⚠ {label} 半套狀態需要你手動處理:\n\n"
+            f"● UVB 處置【已寫回】:\n    原 {old}\n    → 已改為 {new}\n"
+            f"● 但 51019 醫令 或 療程 {set_療程} 【沒有】確認完成。\n\n"
+            f"請二選一手動處理:\n"
+            f"(A) 補齊:手動下 51019 醫令、並把療程欄設為 {set_療程}(維持這次的新劑量);或\n"
+            f"(B) 取消:把 UVB 劑量/次數手動改回原值({old})。\n\n"
+            f"務必擇一完成再送出,以免病歷只改了劑量卻沒有對應醫令。"
+        )
+    elif uvb_already_updated:
+        # 走到 UVB 步驟成功但本次沒有實際改動 UVB(例如無 UVB 行可改)→ 不誤稱「已更新」
+        msg = (
+            f"{label} 的 51019 或療程 {set_療程} 沒有確認完成。\n\n"
+            f"請檢查醫令是否已有 51019、療程欄位是否為 {set_療程},並手動補齊。"
         )
     else:
         msg = (
@@ -2040,6 +2076,8 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
     回 True → caller 可繼續 (UPDATED / strict=False 路徑下的 best-effort skip)
     回 False → caller 應終止 (僅 strict=True 路徑會回此值)
     """
+    global _last_uvb_write
+    _last_uvb_write = None  # [W7] 清空;只在本次確實寫回 UVB 後才填,供半套對帳警告
     main_hwnd = _find_hospital_main_window()
     if not main_hwnd:
         if strict:
@@ -2302,6 +2340,13 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
                 f"count={getattr(verify, 'count', '?')}\n\n"
                 f"{label} 已停止，請醫師手動確認處置內容。")
             return False
+        # [W7 codex review] 只在「讀回成功(actual_text 非空)且 verify 通過」時才記錄
+        # 原值→新值。讀回失敗(_read_tmemo_text 逾時回空字串,跳過整個 if actual_text)
+        # 時不記 → 半套警告退回一般版,不精準宣稱「已寫回 X→Y」(寫入未經確認)。
+        _record_uvb_write(
+            label, getattr(result.parsed, "dose", None),
+            getattr(result.parsed, "count", None),
+            result.new_dose, result.new_count)
 
     if result.additional_lines_updated > 0:
         logging.info(
