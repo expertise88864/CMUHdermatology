@@ -7,11 +7,15 @@ from datetime import date
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from cmuh_common.roster import ledger as lg  # noqa: E402
+from cmuh_common.roster import solve_rvs as sr  # noqa: E402
 from cmuh_common.roster.model import (  # noqa: E402
-    Member, RosterParams, build_duty_blocks, day_point, month_dates, week_key,
+    Member, RosterParams, SolveContext, build_duty_blocks, day_point,
+    month_dates, week_key,
 )
+from cmuh_common.roster.report import build_report  # noqa: E402
+from cmuh_common.roster.rules import Precheck  # noqa: E402
 from cmuh_common.roster.storage import (  # noqa: E402
-    FinalizedMonthError, NewerSchemaError, RosterStorage,
+    KEEP_SNAPSHOTS, FinalizedMonthError, NewerSchemaError, RosterStorage,
 )
 
 P = RosterParams()
@@ -117,6 +121,19 @@ def test_ledger_reset_and_sync():
     assert "a" not in led["r"] and led["r"]["new"] == 0.0 and led["r"]["b"] == -2.0
 
 
+def test_ledger_history_trimmed_to_keep_months():
+    """[OPT-4] history 只留近 HISTORY_KEEP_MONTHS 個月，不無限膨脹（餘額不受影響）。"""
+    led = {"r": {}, "vs": {}, "history": []}
+    keep = lg.HISTORY_KEEP_MONTHS
+    for i in range(keep + 6):                    # 結算超過上限的月數
+        ym = f"20{20 + i // 12:02d}-{i % 12 + 1:02d}"
+        lg.settle_month(led, "r", ym, {"a": 2, "b": 0})
+    months = {h["month"] for h in led["history"]}
+    assert len(months) == keep                   # 只留近 keep 個月
+    # 最舊的月份已被修剪、最新的保留
+    assert "2020-01" not in months
+
+
 # ─── storage ──────────────────────────────────────────────────────────────
 def test_storage_month_roundtrip_snapshot_finalize(tmp_path):
     st = RosterStorage(str(tmp_path))
@@ -205,6 +222,80 @@ def test_storage_save_paths_guard_newer_schema(tmp_path):
             assert False, f"{name} 應拋 NewerSchemaError"
         except NewerSchemaError:
             pass
+
+
+def test_storage_snapshot_pruned_to_keep(tmp_path):
+    """[OPT-5] 快照數量上限 KEEP_SNAPSHOTS：連存超過上限只保留最新 N 份。"""
+    st = RosterStorage(str(tmp_path))
+    st.save_month("2026-10", {"v": 0})               # 首存無快照
+    for i in range(KEEP_SNAPSHOTS + 3):              # 之後每存產生一份快照
+        st.save_month("2026-10", {"v": i + 1})
+    snaps = list((tmp_path / "months").glob("2026-10.json.bak-*"))
+    assert len(snaps) == KEEP_SNAPSHOTS
+
+
+# ─── solver 放寬階梯去重 / 診斷 / 失敗報告（monkeypatch _build_and_solve，無 ortools）──
+def _infeasible_counter(monkeypatch):
+    calls: list = []
+
+    def fake(ctx, scope, level):
+        calls.append(level)
+        return "INFEASIBLE", None
+    monkeypatch.setattr(sr, "_build_and_solve", fake)
+    return calls
+
+
+def _prep(scope, members, **kw):
+    return SolveContext(scope=scope, year=2026, month=8, members=members,
+                        **kw).prepare()
+
+
+def test_solve_vs_skips_duplicate_levels(monkeypatch):
+    """[OPT-1] VS 無 duty_range → L0/L1/L2 規則集相同 → 只求 L0，再測 L3 一次。"""
+    calls = _infeasible_counter(monkeypatch)
+    r = sr.solve_duty(_prep("vs", [Member("D", "D"), Member("J", "J")]))
+    assert r.status == "infeasible"
+    assert calls == [sr.L0_FULL, sr.L3_NO_COLOR]     # L1/L2 跳過
+
+
+def test_solve_r_scope_skips_only_L2(monkeypatch):
+    """[OPT-1] R 有 duty_range（L1 關）→ L0≠L1 都試、L2==L1 跳過；L3 只測一次。"""
+    calls = _infeasible_counter(monkeypatch)
+    r = sr.solve_duty(_prep("r", [Member("a", "甲", fixed_weekday=2),
+                                  Member("b", "乙")]))
+    assert r.status == "infeasible"
+    assert sr.L0_FULL in calls and sr.L1_NO_RANGE in calls
+    assert sr.L2_RESERVED not in calls
+    assert calls.count(sr.L3_NO_COLOR) == 1
+
+
+def test_diagnose_lists_single_eligible_days(monkeypatch):
+    """[OPT-3] 無解診斷列出「僅 1 人可值」的緊繃日。"""
+    _infeasible_counter(monkeypatch)
+    ctx = _prep("vs", [Member("D", "D"), Member("J", "J")],
+                leaves={"J": {date(2026, 8, 3)}})    # 8/3 只剩 D 可值
+    r = sr.solve_duty(ctx)
+    assert r.status == "infeasible"
+    assert any("僅 1 人可值" in s for s in r.diagnosis)
+    assert any("8/3" in s for s in r.diagnosis)
+
+
+def test_report_failure_paths():
+    """[OPT-6] build_report 對三種失敗 status 產生可辨識內容。"""
+    ctx = _prep("r", [Member("a", "甲"), Member("b", "乙")])
+    pf = sr.SolveResult(status="precheck_failed", scope="r",
+                        prechecks=[Precheck("error", "core", "8/14 無人可值")])
+    t = build_report(ctx, pf, "R 排班")
+    assert "未進行求解" in t and "本次狀態: precheck_failed" in t
+
+    inf = sr.SolveResult(status="infeasible", scope="r",
+                         diagnosis=["僅 1 人可值: 8/3→僅 a"])
+    t = build_report(ctx, inf, "R 排班")
+    assert "僅 1 人可值" in t and "本次狀態: infeasible" in t
+
+    nc = sr.SolveResult(status="need_confirm_color", scope="r",
+                        diagnosis=["停用色塊規則後可解。"])
+    assert "停用色塊規則後可解" in build_report(ctx, nc, "R 排班")
 
 
 def test_member_roundtrip():

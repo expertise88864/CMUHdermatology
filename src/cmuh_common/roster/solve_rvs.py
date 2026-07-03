@@ -182,13 +182,20 @@ def solve_duty(ctx: SolveContext, allow_disable_color: bool = False) -> SolveRes
             res.status = "precheck_failed"
             return res
 
-        max_auto = L2_RESERVED
-        levels = [L0_FULL, L1_NO_RANGE, L2_RESERVED]
-        if allow_disable_color:
-            levels.append(L3_NO_COLOR)
+        auto_levels = [L0_FULL, L1_NO_RANGE, L2_RESERVED]
+        rules = rules_for(scope)
 
         chosen = None
-        for level in levels:
+        prev_active = None
+        for level in auto_levels:
+            # [OPT-1] 該層 active 規則集與前一層相同（如 VS 無 duty_range、或 L2
+            # 保留級）→ 必得同解，跳過避免重複求解。
+            active = frozenset(r.rule_id for r in rules if r.active_at(level))
+            if active == prev_active:
+                logging.info("[roster.solve] %s %04d-%02d 跳過 %s（規則集同前層）",
+                             scope, ctx.year, ctx.month, _LEVEL_NAMES[level])
+                continue
+            prev_active = active
             name, assignments = _build_and_solve(ctx, scope, level)
             logging.info("[roster.solve] %s %04d-%02d %s → %s",
                          scope, ctx.year, ctx.month, _LEVEL_NAMES[level], name)
@@ -197,24 +204,23 @@ def solve_duty(ctx: SolveContext, allow_disable_color: bool = False) -> SolveRes
                 break
 
         if chosen is None:
-            # 自動層級全數無解：測「停用色塊」可否解 → 請使用者確認
-            if not allow_disable_color:
-                _n, test = _build_and_solve(ctx, scope, L3_NO_COLOR)
-                if test is not None:
-                    res.status = "need_confirm_color"
-                    res.diagnosis = [
-                        "在不動色塊連週規則的前提下無解；停用色塊規則後可解。",
-                        "請確認是否放寬（將出現同色連週值班）。"]
-                    return res
-            res.status = "infeasible"
-            res.diagnosis = _diagnose(ctx, scope)
-            return res
+            # [OPT-3] 自動層級全無解 → 測「停用色塊連週」恰一次，結果同時決定
+            # need_confirm/採用/診斷（不再於 _diagnose 重測一次）。
+            _n, l3 = _build_and_solve(ctx, scope, L3_NO_COLOR)
+            if l3 is not None and allow_disable_color:
+                chosen = (L3_NO_COLOR, l3)                # 已獲授權 → 直接採用
+            elif l3 is not None:
+                res.status = "need_confirm_color"
+                res.diagnosis = [
+                    "在不動色塊連週規則的前提下無解；停用色塊規則後可解。",
+                    "請確認是否放寬（將出現同色連週值班）。"]
+                return res
+            else:
+                res.status = "infeasible"
+                res.diagnosis = _diagnose(ctx, scope, l3_solvable=False)
+                return res
 
         level, assignments = chosen
-        if level > max_auto and not allow_disable_color:  # 理論上不會到
-            res.status = "need_confirm_color"
-            return res
-
         res.status = "ok"
         res.level_used = level
         res.level_name = _LEVEL_NAMES[level]
@@ -251,17 +257,32 @@ def solve_duty(ctx: SolveContext, allow_disable_color: bool = False) -> SolveRes
         return res
 
 
-def _diagnose(ctx: SolveContext, scope: str) -> list:
-    """最終無解時的人話診斷：逐一單獨停用可疑規則試解，指出元凶。"""
-    out = ["自動放寬到底仍無解。逐一停用規則測試："]
-    cp_model = _lazy_cp_model()  # noqa: F841 （確保已安裝，統一錯誤訊息）
-    suspects = [(L3_NO_COLOR, "色塊連週")]
-    for level, label in suspects:
+def _diagnose(ctx: SolveContext, scope: str, l3_solvable=None) -> list:
+    """最終無解時的人話診斷。
+
+    l3_solvable: 呼叫端已測過「停用色塊連週」是否可解（True/False）→ 直接引用，
+    不重測；None（向後相容）→ 自行測一次。另列出「僅剩 1 人可值」的緊繃日，
+    幫使用者定位是哪些請假密集的日子卡住。
+    """
+    out = ["自動放寬到底仍無解。診斷："]
+    if l3_solvable is None:
         try:
-            _n, test = _build_and_solve(ctx, scope, level)
-            out.append(f"  停用「{label}」→ {'可解' if test else '仍無解'}")
+            _n, test = _build_and_solve(ctx, scope, L3_NO_COLOR)
+            l3_solvable = test is not None
         except Exception:
-            out.append(f"  停用「{label}」測試失敗")
+            out.append("  停用「色塊連週」測試失敗")
+    if l3_solvable is True:
+        out.append("  停用「色塊連週」→ 可解（元凶多為色塊連週太緊）")
+    elif l3_solvable is False:
+        out.append("  停用「色塊連週」→ 仍無解（與色塊無關）")
+
+    tight = [f"{d.month}/{d.day}→僅 {elig[0]}"
+             for d in ctx.days
+             for elig in [[m.id for m in ctx.members if not ctx.on_leave(m.id, d)]]
+             if len(elig) == 1]
+    if tight:
+        out.append("  僅 1 人可值（請假密集）: " + "、".join(tight[:10])
+                   + ("…" if len(tight) > 10 else ""))
     out.append("若仍無解：多半是 請假/指定 彼此衝突，請檢查預檢警告與"
                "當月請假密度。")
     return out

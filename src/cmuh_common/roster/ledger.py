@@ -13,6 +13,18 @@ from __future__ import annotations
 
 import logging
 
+# history 只供「同月重排時回滾」用；超過此月數的舊分錄不會再被回滾 → 修剪避免無限膨脹。
+HISTORY_KEEP_MONTHS = 24
+
+
+def _trim_history(ledger: dict, keep_months: int = HISTORY_KEEP_MONTHS) -> None:
+    hist = ledger.get("history") or []
+    months = sorted({e.get("month") for e in hist if e.get("month")}, reverse=True)
+    if len(months) <= keep_months:
+        return
+    keep = set(months[:keep_months])
+    ledger["history"] = [e for e in hist if e.get("month") in keep]
+
 
 def fair_share(total_points: float, n_members: int) -> float:
     if n_members <= 0:
@@ -38,6 +50,7 @@ def settle_month(ledger: dict, scope: str, month: str,
         deltas[pid] = delta
     ledger.setdefault("history", []).append(
         {"month": month, "scope": scope, "deltas": deltas})
+    _trim_history(ledger)      # [OPT-4] 舊分錄不再被回滾 → 限制 history 大小
     return ledger
 
 
