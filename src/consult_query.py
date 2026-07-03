@@ -87,6 +87,7 @@ from cmuh_common.logging_setup import attach_queue_handler, setup_logging  # noq
 from cmuh_common.paths import get_app_dir, get_settings_dir, restart_self  # noqa: E402
 from cmuh_common.platform_win import is_admin, run_as_admin  # noqa: E402
 from cmuh_common.process_launch import launch_python_script  # noqa: E402
+from cmuh_common.win32_safe import call_with_timeout  # noqa: E402
 from cmuh_common.single_instance import (  # noqa: E402
     ensure_single_instance, release_single_instance,
 )
@@ -747,7 +748,27 @@ def resolve_menu_command_id(main_hwnd: int) -> int | None:
         return MENU_ID_EXPECTED
 
 
+_CAPTURE_TIMEOUT_SEC = 15.0
+_CAPTURE_SENTINEL = object()
+# [W11] 逐病人文字擷取的總體上限(病人多/後端慢時,保留已確認前段停止)。
+_EXTRACT_TOTAL_TIMEOUT_SEC = 25
+
+
 def capture_window_image(hwnd: int):
+    """[W11 2026-07-03] PrintWindow 會送 WM_PRINT 給目標視窗;Delphi HIS GUI 凍結時
+    可能【無限阻塞】。把整個擷取丟到 daemon thread + 逾時,逾時/失敗一律 raise,交由
+    run_consult_flow 的重試處理(不會卡死流程)。GDI 資源在該 thread 內建立與釋放。"""
+    img = call_with_timeout(lambda: _capture_window_image_impl(hwnd),
+                            _CAPTURE_TIMEOUT_SEC, default=_CAPTURE_SENTINEL,
+                            name="capture_window_image")
+    if img is _CAPTURE_SENTINEL:
+        raise RuntimeError(
+            f"PrintWindow 截圖失敗或逾時(>{_CAPTURE_TIMEOUT_SEC:.0f}s,視窗可能凍結/"
+            "正被關閉)——本次流程將重試")
+    return img
+
+
+def _capture_window_image_impl(hwnd: int):
     """用 PrintWindow 擷取視窗影像（即使被遮住/非前景也能擷取，不干擾使用者）。"""
     from PIL import Image
 
@@ -1489,7 +1510,15 @@ def _extract_consult_text(consult_hwnd: int, cfg: dict,
             # 第一位(idx 0)是開窗預設選取列,內容本就為其所屬,直接讀。
             logging.info("[consult-extract] 偵測到 TRadioButton 病人清單(%d 位)",
                          len(radios))
+            # [W11] 逐病人擷取的總體 deadline:病人多 + 後端慢時,避免 N×每列等待累積
+            # 拖住整個流程。逾時就保留已確認的前段停止(與逐位確認失敗同語意)。
+            extract_deadline = time.monotonic() + _EXTRACT_TOTAL_TIMEOUT_SEC
             for idx, (hwnd, text, _rect) in enumerate(radios):
+                if time.monotonic() > extract_deadline:
+                    logging.info("[consult-extract] 逐病人擷取超過 %ds → 保留已確認的"
+                                 "前 %d 位、就此停止", _EXTRACT_TOTAL_TIMEOUT_SEC,
+                                 len(entries))
+                    break
                 baseline = tuple(t for _l, t in _read_panes_snapshot(panes))
                 if not _select_patient_radio(hwnd):
                     logging.info("[consult-extract] 第 %d 位選取未送達;保留已確認的"
