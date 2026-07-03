@@ -2191,18 +2191,39 @@ def send_via_smtp(image_path: Path, subject: str, body: str,
               html_body=html_body or None)
 
 
-def _kill_systemftp() -> None:
-    """taskkill /F /IM systemftp.exe — 強制清理殘留實例。
+def _kill_systemftp(before_pids=None) -> None:
+    """[W6 2026-07-03] 重試前清理『本次任務期間新出現的』systemftp 殘留 —— 只殺
+    `目前 systemftp PID − before_pids`(before_pids 為 _do_full_job 開始前的快照)。
 
-    用於重試前的環境清理。失敗時靜默（可能是「沒有 process 可殺」也算正常）。"""
+    改法理由:絕不再 taskkill /IM systemftp.exe 全機掃殺(會殺掉使用者手動開的住院
+    系統、或另一台自動化實例)。使用者『任務開始前就已存在』的實例都在 before_pids
+    裡,一律不動;卡死超時而 finally 來不及關的孤兒(在本任務期間才出現)則會被清掉,
+    避免下一輪 attempt 撞到 wedged 實例。於清理當下即時計算(不靠 worker 事後回填),
+    避免 worker 超時仍存活/事後回填造成的競態。
+
+    殘留邊界:使用者若『恰好在本任務進行中』才手動開 systemftp,會被納入(窄窗,與既有
+    finally 清理同語意)。before_pids=None 時保守不動作(fail-open,不誤殺)。
+    失敗時靜默(可能已結束、沒 process 可殺)。"""
+    if before_pids is None:
+        logging.debug("[cleanup] 未提供 before 快照 → 略過清理(不做全機 taskkill)")
+        return
     try:
-        subprocess.run(
-            ["taskkill", "/F", "/IM", "systemftp.exe"],
-            capture_output=True, timeout=10,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        orphans = sorted(_systemftp_pids() - set(before_pids))
     except Exception:
-        logging.debug("taskkill systemftp.exe 失敗（可能本來就沒在跑）", exc_info=True)
+        logging.debug("[cleanup] 計算孤兒 PID 失敗", exc_info=True)
+        return
+    if not orphans:
+        logging.debug("[cleanup] 本任務期間無新增 systemftp,無需清理")
+        return
+    args = ["taskkill", "/F"]
+    for p in orphans:
+        args += ["/PID", str(p)]
+    try:
+        subprocess.run(args, capture_output=True, timeout=10,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        logging.info("[cleanup] 已清本任務期間新增的 systemftp PID: %s", orphans)
+    except Exception:
+        logging.debug("taskkill 本任務 PID 失敗（可能已結束）", exc_info=True)
 
 
 def _do_full_job(trigger_label: str, override_recipients=None) -> None:
@@ -2279,6 +2300,9 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
         body = cfg["body_template"].format(date=date_str, time=time_str)
 
         last_err = None  # 最後一次的失敗例外，用於三次都失敗的 log
+        # [W6 2026-07-03] 任務開始前的 systemftp 快照:重試清理只殺「這之後才出現」的
+        # 實例(使用者既有的住院系統都在這份快照裡,永不誤殺)。
+        job_before_pids = _systemftp_pids()
         # [v17 2026-05-25] Exponential backoff — 原本 retry 間固定 sleep 3s，
         # 三次重試集中在 5-6 分鐘窗口內，醫院 systemftp 後端 transient 慢時
         # 三次都撞在同個 server 卡死期。今天 16:54 IMAP 觸發 → 三次「等不到
@@ -2358,7 +2382,7 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                     logging.info(
                         "殺 systemftp.exe 後重試（sleep %d 秒，exponential backoff）",
                         backoff)
-                    _kill_systemftp()
+                    _kill_systemftp(job_before_pids)
                     time.sleep(backoff)
                 else:
                     logging.error("會診查詢任務已重試 %d 次仍失敗，放棄。最後錯誤：%s",

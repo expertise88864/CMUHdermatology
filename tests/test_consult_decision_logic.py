@@ -70,7 +70,7 @@ class _JobHarness:
             html_body="": self.sent.append((list(recipients), subject)))
         monkeypatch.setattr(
             cq, "_kill_systemftp",
-            lambda: setattr(self, "kills", self.kills + 1))
+            lambda *a, **k: setattr(self, "kills", self.kills + 1))
         monkeypatch.setattr(time, "sleep", lambda s: self.sleeps.append(s))
         monkeypatch.setattr(
             cq, "_release_trigger_dedup",
