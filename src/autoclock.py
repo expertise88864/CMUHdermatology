@@ -576,9 +576,14 @@ def handle_health_declaration(driver, wait, short_wait, get_loc) -> None:
 
 
 def get_current_swipe_info(driver, wait, get_loc):
+    """回 (sys_date, swipes, last_swipe, read_ok)。
+    [W4 2026-07-03] read_ok:是否『成功讀到刷卡表』(即使當日空)。逾時/例外/JS 未回
+    list 時為 False —— 呼叫端據此區分「確定無紀錄」vs「讀取失敗」,讀取失敗時絕不打卡
+    (重複打卡比晚打卡嚴重),交由重試/下一分鐘 re-fire 重讀。"""
     sys_date = None
     swipes: list = []
     last_swipe = None
+    read_ok = False
     try:
         wait.until(EC.presence_of_element_located(get_loc("swipe_table")))
         try:
@@ -610,6 +615,9 @@ def get_current_swipe_info(driver, wait, get_loc):
             return data;
             """
         )
+        # [W4] execute_script 成功回 list(即使空)= 確實讀到刷卡表;非 list(None/JS 異常)
+        # 視為讀取失敗,不可被下游當成「當日無紀錄」而重複打卡。
+        read_ok = isinstance(rows_data, list)
 
         all_dts = []
         for r in rows_data or []:
@@ -627,8 +635,8 @@ def get_current_swipe_info(driver, wait, get_loc):
         if all_dts:
             last_swipe = max(all_dts)
     except (TimeoutException, WebDriverException, TypeError):
-        pass
-    return sys_date, swipes, last_swipe
+        read_ok = False
+    return sys_date, swipes, last_swipe, read_ok
 
 
 # [fix 2026-06-08] 本窗已完成打卡的帳號標記。
@@ -835,6 +843,30 @@ def _check_swipes(type_str: str, start: dt_time, end: dt_time, swipes) -> bool:
     return False
 
 
+def _verify_clock_recorded(driver, get_loc, act_name: str,
+                           check_start: dt_time, check_end: dt_time,
+                           username: str, timeout_sec: float = 20.0,
+                           poll_sec: float = 3.0) -> bool:
+    """[W3 2026-07-03] 點擊執行後重讀刷卡表,確認 act_name 的新紀錄已落在打卡區間內。
+    輪詢至確認或逾時。每次用短逾時 wait(5s)避免頁面跳走時卡滿整個 timeout。
+    回 True=已確認寫入(可標記完成);False=逾時仍未確認(caller 不標記,交 re-fire 重讀)。
+    讀取失敗(read_ok=False)一律當作『尚未確認』,絕不當成已成功。"""
+    short_wait = WebDriverWait(driver, 5)
+    deadline = time_module.monotonic() + timeout_sec
+    while True:
+        try:
+            _sd, swipes, _last, read_ok = get_current_swipe_info(
+                driver, short_wait, get_loc)
+            if read_ok and _check_swipes(act_name, check_start, check_end, swipes):
+                return True
+        except Exception:
+            logging.debug("[autoclock] 打卡後重讀刷卡表例外(續輪詢) user=%s",
+                          username, exc_info=True)
+        if time_module.monotonic() >= deadline:
+            return False
+        time_module.sleep(poll_sec)
+
+
 def perform_clock_action(driver, wait, acc, is_in: bool,
                         check_start: dt_time, check_end: dt_time,
                         dry_run: bool = False, task_label: str = "") -> None:
@@ -847,8 +879,15 @@ def perform_clock_action(driver, wait, acc, is_in: bool,
         try:
             login(driver, wait, acc["username"], acc["password"])
 
-            _sys_date, swipes, _last = get_current_swipe_info(driver, wait, get_loc)
+            _sys_date, swipes, _last, swipes_read_ok = get_current_swipe_info(
+                driver, wait, get_loc)
             act_name = "上班" if is_in else "下班"
+
+            # [W4 2026-07-03] 讀刷卡表失敗 → 無法判斷是否已打卡 → 絕不打卡(避免重複打卡),
+            # 拋出交給重試/下一分鐘 re-fire 重讀。dry_run 例外(僅驗流程)。
+            if not dry_run and not swipes_read_ok:
+                raise WebDriverException(
+                    "讀取刷卡表失敗,略過本次打卡以免重複打卡(將重試/下次 re-fire 重讀)")
 
             has_record_in_window = _check_swipes(act_name, check_start, check_end, swipes)
 
@@ -896,10 +935,20 @@ def perform_clock_action(driver, wait, acc, is_in: bool,
             except TimeoutException:
                 pass
 
-            logging.info("%s %s 打卡成功！", acc["username"], act_name)
-            # [fix] 打卡成功=本窗確認完成 → 標記，後續每分鐘 re-fire 直接略過該帳號，
-            # 不再重新登入(避免 re-fire 登入失敗時跳出假的「打卡失敗」通知)。
-            _mark_clock_done(task_label, acc["username"])
+            # [W3 2026-07-03] 不再「點擊即標記完成」——那會在點擊後 portal/網路失敗時
+            # 造成假成功(本窗 re-fire 全跳過→漏打卡)。改為重讀刷卡表確認新紀錄真的
+            # 寫入才標記。確認不到就不標記(記警告),交下一分鐘 re-fire 重讀:紀錄真在
+            # 會走 has_record 路徑補標記;真沒進去則重打。任何情況都不會重複打卡。
+            if _verify_clock_recorded(driver, get_loc, act_name,
+                                      check_start, check_end, acc["username"]):
+                logging.info("%s %s 打卡成功(已重讀刷卡表確認紀錄)！",
+                             acc["username"], act_name)
+                _mark_clock_done(task_label, acc["username"])
+            else:
+                logging.warning(
+                    "%s %s 打卡已送出,但重讀刷卡表未能確認到紀錄 — 不標記完成,"
+                    "下次 re-fire 會重讀確認(避免假成功漏打卡)。",
+                    acc["username"], act_name)
             return
 
         except (StaleElementReferenceException, WebDriverException) as e:
