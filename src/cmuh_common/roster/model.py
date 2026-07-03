@@ -78,6 +78,11 @@ class RosterParams:
 
 
 # ─── 月曆工具 ─────────────────────────────────────────────────────────────
+def roc(year: int) -> int:
+    """西元 → 民國年（2026 → 115）。匯出檔名/表頭用。"""
+    return year - 1911
+
+
 def month_dates(year: int, month: int) -> list[date]:
     """該月全部日期（升冪）。"""
     _, last = calendar.monthrange(year, month)
@@ -86,6 +91,16 @@ def month_dates(year: int, month: int) -> list[date]:
 
 def is_weekend(d: date) -> bool:
     return d.weekday() >= 5  # 5=週六 6=週日
+
+
+def week_matrix(year: int, month: int) -> list:
+    """月曆週列矩陣（每列 7 格，週一起始；非本月格為 None）。UI 月曆與匯出共用。"""
+    days = month_dates(year, month)
+    lead = days[0].weekday()                 # 週一=0 → 月初前空格數
+    cells: list = [None] * lead + list(days)
+    while len(cells) % 7:
+        cells.append(None)
+    return [cells[i:i + 7] for i in range(0, len(cells), 7)]
 
 
 def week_key(d: date) -> str:

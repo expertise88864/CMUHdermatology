@@ -7,10 +7,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import tkinter as tk
 from datetime import date
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from cmuh_common.deps_runtime import ensure_dependencies
 from cmuh_common.roster.model import day_point, is_weekend
@@ -151,7 +152,8 @@ class CalendarDutyTab(ttk.Frame):
         self._clear_btn.pack(side="left", padx=4)
         self._report_btn = ttk.Button(bar, text="報告", command=self._on_report)
         self._report_btn.pack(side="left", padx=4)
-        ttk.Button(bar, text="匯出", state="disabled").pack(side="left", padx=4)
+        # 匯出不進 _toolbar/finalized 停用集：定案月仍可匯出（唯讀輸出、不改資料）
+        ttk.Button(bar, text="匯出", command=self._on_export).pack(side="left", padx=4)
         self._final_var = tk.BooleanVar(value=False)
         self._final_chk = ttk.Checkbutton(
             bar, text="定案", variable=self._final_var, command=self._on_finalize)
@@ -361,10 +363,12 @@ class CalendarDutyTab(ttk.Frame):
 
         def work():
             err = ""
+            # 同匯出：ensure_dependencies 取消/失敗會 SystemExit，需一併攔截，
+            # 否則 _after_install 不排程，UI 卡在「安裝中…」。
             try:
                 ensure_dependencies(_ORTOOLS_DEP)
-            except Exception as e:  # noqa: BLE001
-                err = str(e)
+            except (Exception, SystemExit) as e:  # noqa: BLE001
+                err = str(e) or "已取消或安裝失敗"
             self.after(0, lambda: self._after_install(err))
         threading.Thread(target=work, name="ortools-install", daemon=True).start()
 
@@ -451,6 +455,51 @@ class CalendarDutyTab(ttk.Frame):
                 self.service.set_cell(self.scope, self.app.ym,
                                       date.fromisoformat(iso), None)
         self.refresh()
+
+    def _on_export(self) -> None:
+        """匯出整月班表（R+VS）。副檔名決定 Excel/Word；重依賴 lazy 安裝。"""
+        from cmuh_common.roster.export_common import default_filename
+        data = self.service.build_export(self.app.ym)
+        path = filedialog.asksaveasfilename(
+            title="匯出班表", defaultextension=".xlsx",
+            initialfile=default_filename(data, ".xlsx"),
+            filetypes=[("Excel 活頁簿", "*.xlsx"), ("Word 文件", "*.docx")])
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in (".xlsx", ".docx"):        # 只認這兩種，免寫出錯副檔名的檔
+            messagebox.showerror(
+                "不支援的格式",
+                f"僅支援 Excel(.xlsx) 或 Word(.docx)，收到：{ext or '（無副檔名）'}")
+            return
+        dep = ([("openpyxl", "openpyxl")] if ext == ".xlsx"
+               else [("python-docx", "docx")])
+        self._status.set("匯出中…")
+
+        def work():
+            err = ""
+            # ensure_dependencies 取消/失敗會 sys.exit(1)→SystemExit（非 Exception 子類），
+            # 必須一併攔截，否則 _after_export 不會被排程，UI 卡在「匯出中…」。
+            try:
+                ensure_dependencies(dep)
+                if ext == ".xlsx":
+                    from cmuh_common.roster import export_xlsx
+                    export_xlsx.export(path, data)
+                else:
+                    from cmuh_common.roster import export_docx
+                    export_docx.export(path, data)
+            except (Exception, SystemExit) as e:  # noqa: BLE001
+                logging.exception("[roster.ui] 匯出失敗")
+                err = str(e) or "已取消或安裝失敗"
+            self.after(0, lambda: self._after_export(path, err))
+        threading.Thread(target=work, name="roster-export", daemon=True).start()
+
+    def _after_export(self, path, err) -> None:
+        self._status.set("就緒")
+        if err:
+            messagebox.showerror("匯出失敗", f"匯出時發生錯誤：\n{err}")
+        else:
+            messagebox.showinfo("匯出完成", f"已匯出：\n{path}")
 
     def _on_report(self) -> None:
         month = self.service.storage.load_month(self.app.ym)

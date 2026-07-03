@@ -107,6 +107,45 @@ class RosterService:
         apply_boundary_from_prev(ctx)
         return ctx
 
+    # ── 匯出資料組裝 ────────────────────────────────────────────────────
+    def build_export(self, ym: str) -> dict:
+        """組裝匯出所需的整月資料（R+VS），與 storage/UI 解耦（純資料，可測）。
+
+        duty 值為 {date: person_id}（只取有排班者）；names 為 {id: 顯示名}
+        （R 用姓名、VS 用代號）；leaves 為 {id: [date,...]}。
+        """
+        cfg = self.storage.load_config()
+        month = self.storage.load_month(ym)
+        y, m = int(ym[:4]), int(ym[5:7])
+        holiday_table = self.storage.load_holiday_duty()
+        holidays = set(holiday_table["r"]) | set(holiday_table["vs"])
+        ledger = self.storage.load_ledger()
+
+        def scope_block(scope: str) -> dict:
+            members = [Member.from_dict(d)
+                       for d in (cfg.get(f"{scope}_members") or [])]
+            names = {mm.id: (mm.name or mm.id) if scope == "r" else mm.id
+                     for mm in members}
+            duty: dict = {}
+            for iso, cell in (month.get(f"{scope}_duty") or {}).items():
+                p = cell.get("person")
+                if p:
+                    try:
+                        duty[date.fromisoformat(iso)] = p
+                    except (ValueError, TypeError):
+                        continue
+            leaves = _parse_date_map((month.get("leaves") or {}).get(scope) or {})
+            return {"members": [mm.id for mm in members], "names": names,
+                    "duty": duty, "leaves": {k: sorted(v) for k, v in leaves.items()},
+                    "ledger": dict((ledger.get(scope)) or {})}
+
+        return {
+            "ym": ym, "year": y, "month": m,
+            "holidays": holidays,
+            "params": RosterParams.from_config(cfg),
+            "r": scope_block("r"), "vs": scope_block("vs"),
+        }
+
     # ── 求解與落地 ──────────────────────────────────────────────────────
     def run_solve(self, scope: str, ym: str,
                   allow_disable_color: bool = False) -> SolveResult:
