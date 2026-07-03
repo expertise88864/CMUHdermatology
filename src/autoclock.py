@@ -131,6 +131,38 @@ _scheduler_thread_ref: threading.Thread | None = None
 _self_watchdog_thread_ref: threading.Thread | None = None
 _self_watchdog_lock = threading.Lock()
 
+# [W12 2026-07-03] 目前正在跑的打卡任務(供 self-watchdog 偵測「任務卡太久」——
+# scheduler 仍每分鐘 tick,但單一 Selenium 打卡任務可能 hang;原本 watchdog 只看
+# scheduler tick、看不到卡住的任務)。started 為 monotonic 秒;0=無任務在跑。
+import contextlib as _contextlib  # noqa: E402
+_active_clock_task = {"started": 0.0, "label": ""}
+_active_clock_task_lock = threading.Lock()
+# 單一打卡任務跑超過這個秒數即視為異常(driver 逾時 30s×步驟 + 5 次重試,正常遠低於此)。
+_ACTIVE_TASK_WARN_SEC = 300
+
+
+@_contextlib.contextmanager
+def _active_clock_task_scope(label):
+    with _active_clock_task_lock:
+        _active_clock_task["started"] = time_module.monotonic()
+        _active_clock_task["label"] = label or ""
+    try:
+        yield
+    finally:
+        with _active_clock_task_lock:
+            _active_clock_task["started"] = 0.0
+            _active_clock_task["label"] = ""
+
+
+def _active_clock_task_age():
+    """回 (label, age_sec);無任務在跑回 (None, 0.0)。純讀,供 watchdog 判斷卡住。"""
+    with _active_clock_task_lock:
+        started = _active_clock_task["started"]
+        label = _active_clock_task["label"]
+    if started <= 0:
+        return None, 0.0
+    return label, time_module.monotonic() - started
+
 
 def _sleep_while_running(seconds: float, step: float = 0.5) -> bool:
     """Sleep up to seconds, but return quickly after running.clear()."""
@@ -1039,7 +1071,11 @@ def process_clock_task(schedule_key: str | None) -> None:
     # RLock.locked() bug 時加這段 timing log，沒注意別名 → 每次中午/早上打卡
     # 觸發 process_clock_task 立刻 NameError crash → user 中午沒打到卡。
     t_wait_start = time_module.time()
-    with clock_lock:
+    # [W12] 先取 clock_lock 再進 scope:單一全域標記只在「真正執行中(持鎖)」的任務上設,
+    # 避免第二個 process_clock_task(如 UI 測試 dry-run 與排程並行)在等鎖時覆蓋標記、
+    # 或第一個任務 finally 清掉還在跑的第二個任務的標記(codex review)。clock_lock 已
+    # 序列化執行,故同時最多一個 scope 生效。
+    with clock_lock, _active_clock_task_scope(schedule_key):
         wait_ms = (time_module.time() - t_wait_start) * 1000
         if wait_ms > 100:
             logging.warning(
@@ -1273,10 +1309,25 @@ def _autoclock_self_watchdog() -> None:
     KILL_THRESHOLD = 20
     CHECK_INTERVAL = 30
     dead_detected_at = 0.0
+    stuck_task_warned = False   # [W12] 卡住任務只警告一次(不洗版)
     while running.is_set():
         try:
             if not _sleep_while_running(CHECK_INTERVAL):
                 break
+            # [W12] 偵測「單一打卡任務卡太久」——scheduler 仍 tick,但 Selenium 任務可能
+            # hang。只警告(卡住的 Selenium 執行緒無法安全 kill;driver 逾時/task gate
+            # 會兜底)。持續卡住只警告一次,任務結束後重置。
+            task_label, task_age = _active_clock_task_age()
+            if task_label and task_age > _ACTIVE_TASK_WARN_SEC:
+                if not stuck_task_warned:
+                    stuck_task_warned = True
+                    logging.critical(
+                        "[autoclock/self-watchdog] 打卡任務 %s 已執行 %.0fs(>%ds,疑似"
+                        " Selenium 卡住)——請留意是否有帳號漏打卡;driver 逾時與 task "
+                        "gate 會兜底,scheduler 本身仍存活。",
+                        task_label, task_age, _ACTIVE_TASK_WARN_SEC)
+            else:
+                stuck_task_warned = False
             # Stage 0: thread 真死了 → 立刻退場
             global _scheduler_thread_ref
             if _scheduler_thread_ref is not None and not _scheduler_thread_ref.is_alive():

@@ -10,6 +10,8 @@ import sys
 from datetime import time as dt_time
 from unittest.mock import Mock
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import autoclock as ac  # noqa: E402
@@ -137,3 +139,21 @@ def test_validate_accounts_total_on_non_list():
     assert ac._validate_accounts(None) == []          # None → 空(無設定)
     assert ac._validate_accounts({}) == []            # 空 dict falsy → 空
     assert any("不是清單" in s for s in ac._validate_accounts(123))  # truthy 純量 → 提示
+
+
+# ─── W12:打卡任務進行中追蹤(供 self-watchdog 偵測卡住任務) ─────────────
+
+def test_active_clock_task_scope_tracks_and_clears():
+    assert ac._active_clock_task_age() == (None, 0.0)
+    with ac._active_clock_task_scope("mon_am_in"):
+        label, age = ac._active_clock_task_age()
+        assert label == "mon_am_in" and age >= 0.0
+    assert ac._active_clock_task_age() == (None, 0.0)   # 離開 scope 清空
+
+
+def test_active_clock_task_scope_clears_on_exception():
+    """任務中途拋例外也要清掉標記(否則 watchdog 誤判永遠卡住)。"""
+    with pytest.raises(RuntimeError):
+        with ac._active_clock_task_scope("x"):
+            raise RuntimeError("boom")
+    assert ac._active_clock_task_age()[0] is None
