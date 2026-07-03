@@ -164,6 +164,42 @@ class RosterStorage:
         t = self.load_holiday_duty()
         return set(t["r"]) | set(t["vs"])
 
+    # ── 門診週模板 / Clerk 梯次 / 切片室開放格網（Phase 3）─────────────────
+    def load_clinic_template(self) -> dict:
+        """{"template": {weekday: {session: [{room,doctor,is_self_paid}]}}}。"""
+        d = self._check_schema(_load_json(self._path("clinic_template.json")),
+                               "clinic_template.json")
+        d.setdefault("template", {})
+        return d
+
+    def save_clinic_template(self, data: dict) -> None:
+        self._check_schema(_load_json(self._path("clinic_template.json")),
+                           "clinic_template.json")
+        self._save(self._path("clinic_template.json"), data)
+
+    def load_clerk_batches(self) -> list:
+        """[{"id","start_monday","members":[...]}]（依起始日升冪）。"""
+        d = self._check_schema(_load_json(self._path("clerk_batches.json")),
+                               "clerk_batches.json")
+        items = list(d.get("batches") or [])
+        return sorted(items, key=lambda b: str(b.get("start_monday", "")))
+
+    def save_clerk_batches(self, batches: list) -> None:
+        self._check_schema(_load_json(self._path("clerk_batches.json")),
+                           "clerk_batches.json")
+        self._save(self._path("clerk_batches.json"), {"batches": list(batches)})
+
+    def load_biopsy_grid(self) -> dict:
+        """{batch_id: {iso_date: {"上午":bool,"下午":bool}}}。"""
+        d = self._check_schema(_load_json(self._path("biopsy_grid.json")),
+                               "biopsy_grid.json")
+        return dict(d.get("grid") or {})
+
+    def save_biopsy_grid(self, grid: dict) -> None:
+        self._check_schema(_load_json(self._path("biopsy_grid.json")),
+                           "biopsy_grid.json")
+        self._save(self._path("biopsy_grid.json"), {"grid": grid})
+
     # ── 月份檔 ───────────────────────────────────────────────────────────
     def load_month(self, ym: str) -> dict:
         d = self._check_schema(_load_json(self._month_path(ym)), f"{ym}.json")

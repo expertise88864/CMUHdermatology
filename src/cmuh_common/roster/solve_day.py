@@ -56,6 +56,7 @@ class SessionCtx:
     capacity: int
     fc: FairCounters
     room_slots: dict = field(default_factory=dict)
+    batch_key: str = ""               # 切片輪替以「梯次」為單位（代號跨梯會重用）
 
     @property
     def wed_pm(self) -> bool:
@@ -98,21 +99,37 @@ class BiopsyStep(FillStep):
             log.append(f"⚠ {ctx.session} 切片室開放但無 Clerk 可排")
             return
         fc = ctx.fc
-        undone = [c for c in ctx.clerk if fc.biopsy_done.get(c, 0) == 0]
-        pick = _pick(undone or ctx.clerk, fc.biopsy_done, fc.last_biopsy)
+        bk = ctx.batch_key
+
+        def key(c):
+            return (fc.biopsy_done.get((bk, c), 0),
+                    fc.last_biopsy.get((bk, c), date.min), c)
+        undone = [c for c in ctx.clerk if fc.biopsy_done.get((bk, c), 0) == 0]
+        pick = min(undone or ctx.clerk, key=key)         # 本梯未輪過者優先
         ctx.clerk.remove(pick)
         slots[BIOPSY] = [pick]
-        fc.biopsy_done[pick] = fc.biopsy_done.get(pick, 0) + 1
-        fc.last_biopsy[pick] = ctx.d
+        fc.biopsy_done[(bk, pick)] = fc.biopsy_done.get((bk, pick), 0) + 1
+        fc.last_biopsy[(bk, pick)] = ctx.d
         log.append(f"{ctx.session} 切片室 ← Clerk {pick}")
 
 
-def _seat(ctx, pool, room):
-    pick = _pick(pool, ctx.fc.seat, ctx.fc.last_seat)
+def _pgy_ck(ctx, p):
+    return ("pgy", p)                    # PGY 代號整月穩定 → 全月共用
+
+
+def _clerk_ck(ctx, c):
+    return ("clerk", ctx.batch_key, c)   # Clerk 代號跨梯會重用 → 依梯次命名空間
+
+
+def _seat(ctx, pool, room, ck):
+    """依 ck(人)命名空間的座位公平計數輪選並就座。"""
+    pick = min(pool, key=lambda p: (ctx.fc.seat.get(ck(ctx, p), 0),
+                                    ctx.fc.last_seat.get(ck(ctx, p), date.min), p))
     pool.remove(pick)
     ctx.room_slots[room].append(pick)
-    ctx.fc.seat[pick] = ctx.fc.seat.get(pick, 0) + 1
-    ctx.fc.last_seat[pick] = ctx.d
+    k = ck(ctx, pick)
+    ctx.fc.seat[k] = ctx.fc.seat.get(k, 0) + 1
+    ctx.fc.last_seat[k] = ctx.d
     return pick
 
 
@@ -121,7 +138,7 @@ class ClerkSeedStep(FillStep):
         for r in ctx.rooms:
             if not ctx.clerk:
                 break
-            _seat(ctx, ctx.clerk, r)
+            _seat(ctx, ctx.clerk, r, _clerk_ck)
 
 
 class PgyMixStep(FillStep):
@@ -132,7 +149,7 @@ class PgyMixStep(FillStep):
             if not ctx.pgy:
                 return
             if len(ctx.room_slots[r]) == 1 < ctx.capacity:
-                _seat(ctx, ctx.pgy, r)
+                _seat(ctx, ctx.pgy, r, _pgy_ck)
         # (b) 再填空診間的第 1、2 位（PGY 只優先到第 2 位；第 3 位起留給 Clerk
         #     overflow — 見 §3.6 步驟 4/5）。無 Clerk 月即由此直填診間。
         for slot in range(min(ctx.capacity, 2)):
@@ -140,14 +157,14 @@ class PgyMixStep(FillStep):
                 if not ctx.pgy:
                     return
                 if len(ctx.room_slots[r]) == slot:
-                    _seat(ctx, ctx.pgy, r)
+                    _seat(ctx, ctx.pgy, r, _pgy_ck)
 
 
 class ClerkOverflowStep(FillStep):
     def run(self, ctx, slots, log):
         for r in ctx.rooms:
             while len(ctx.room_slots[r]) < ctx.capacity and ctx.clerk:
-                _seat(ctx, ctx.clerk, r)
+                _seat(ctx, ctx.clerk, r, _clerk_ck)
 
 
 class RestStep(FillStep):
@@ -155,9 +172,14 @@ class RestStep(FillStep):
         rest_people = sorted(ctx.pgy + ctx.clerk)
         if not rest_people:
             return
-        for p in rest_people:
-            ctx.fc.rest[p] = ctx.fc.rest.get(p, 0) + 1
-            ctx.fc.last_rest[p] = ctx.d
+        for p in ctx.pgy:                              # 放假計數同樣分命名空間
+            k = _pgy_ck(ctx, p)
+            ctx.fc.rest[k] = ctx.fc.rest.get(k, 0) + 1
+            ctx.fc.last_rest[k] = ctx.d
+        for c in ctx.clerk:
+            k = _clerk_ck(ctx, c)
+            ctx.fc.rest[k] = ctx.fc.rest.get(k, 0) + 1
+            ctx.fc.last_rest[k] = ctx.d
         slots[REST] = rest_people
         log.append(f"{ctx.session} 放假：{'、'.join(rest_people)}")
 
@@ -168,13 +190,13 @@ PIPELINE = [TreatmentStep(), BiopsyStep(), ClerkSeedStep(),
 
 def solve_session(d: date, session: str, rooms: list, pgy_avail: list,
                   clerk_avail: list, biopsy_open: bool, fc: FairCounters,
-                  capacity: int = 2, pipeline=None) -> tuple:
+                  capacity: int = 2, pipeline=None, batch_key: str = "") -> tuple:
     """單一時段填充 → (slots, log)。slots: {房/治療室/切片室/放假: [代號,...]}。"""
     ctx = SessionCtx(
         d=d, session=session, rooms=sorted(rooms),
         pgy=sorted(pgy_avail), clerk=sorted(clerk_avail),
         biopsy_open=biopsy_open, capacity=capacity, fc=fc,
-        room_slots={r: [] for r in sorted(rooms)})
+        room_slots={r: [] for r in sorted(rooms)}, batch_key=batch_key)
     slots: dict = {}
     log: list = []
     for step in (pipeline or PIPELINE):
@@ -190,7 +212,7 @@ class DaySolveInput:
     ym: str
     grid: dict                    # {date: {session: [rooms]}}（clinic_grid.month_grid）
     pgy_roster: list              # 該月 PGY 代號
-    clerk_roster: list            # 該月 Clerk 代號（無 Clerk 月＝[]）
+    clerk_batches: list = field(default_factory=list)  # ClerkBatch 樣（.covers/.members/.id）
     biopsy_open: dict = field(default_factory=dict)   # {iso: {session: bool}}
     leaves: dict = field(default_factory=dict)        # {"pgy":{c:set},"clerk":{c:set}}
     capacity: int = 2
@@ -204,7 +226,8 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
     """整月逐（工作日×早/午）填充 → (day_slots, log, warnings)。
 
     day_slots: {iso: {session: {slot: [代號]}}}；warnings: 人話警告清單。
-    治療室每個非假日工作日的每個時段都需 1 PGY（含週三下午，即使跟診關閉）。
+    - 治療室每個非假日工作日每時段都需 1 PGY（含週三下午，即使跟診關閉）。
+    - Clerk 逐日只取「當日所屬兩週梯次」的成員（跨梯不互相借人）。
     """
     fc = FairCounters()
     day_slots: dict = {}
@@ -213,10 +236,16 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
     pgy_leave = (inp.leaves.get("pgy") or {})
     clerk_leave = (inp.leaves.get("clerk") or {})
 
+    solved_batch_ids: set = set()
     for d in sorted(inp.grid):
         if is_weekend(d):
             continue
         iso = d.isoformat()
+        batch = next((b for b in inp.clerk_batches if b.covers(d)), None)
+        clerk_members = batch.members if batch else []
+        batch_key = batch.id if batch else ""
+        if batch:
+            solved_batch_ids.add(batch.id)
         for session in STUDENT_SESSIONS:
             rooms = (inp.grid.get(d) or {}).get(session) or []
             # 週三下午跟診關閉但治療室照開 → 該時段仍需跑（rooms 為 []）
@@ -224,18 +253,21 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
             slots, slog = solve_session(
                 d, session, rooms,
                 _avail(inp.pgy_roster, pgy_leave, d),
-                _avail(inp.clerk_roster, clerk_leave, d),
-                biopsy, fc, inp.capacity)
+                _avail(clerk_members, clerk_leave, d),
+                biopsy, fc, inp.capacity, batch_key=batch_key)
             day_slots.setdefault(iso, {})[session] = slots
             log.append(f"{d.month}/{d.day}({'一二三四五六日'[d.weekday()]}) "
                        + "；".join(slog))
             warnings.extend(f"{d.month}/{d.day} {ln.lstrip('⚠ ')}"
                             for ln in slog if ln.startswith("⚠"))
 
-    # 切片室輪不到：本梯（此處以整月近似）仍 biopsy_done==0 的 Clerk
-    if inp.clerk_roster:
-        missed = [c for c in sorted(inp.clerk_roster)
-                  if fc.biopsy_done.get(c, 0) == 0]
+    # 切片室輪不到：只對「本月確有工作日被排」的梯次示警（否則邊界梯次會誤報）
+    for b in inp.clerk_batches:
+        if b.id not in solved_batch_ids:
+            continue
+        missed = [c for c in sorted(b.members)
+                  if fc.biopsy_done.get((b.id, c), 0) == 0]
         if missed:
-            warnings.append("切片室輪不到（本月內未排到）：" + "、".join(missed))
+            warnings.append(f"切片室輪不到（梯次 {b.id}，本月內未排到）："
+                            + "、".join(missed))
     return day_slots, log, warnings

@@ -24,10 +24,12 @@ import time
 from datetime import date
 
 from cmuh_common.roster.calendar_colors import week_colors_for_year
+from cmuh_common.roster.clinic_grid import month_grid
 from cmuh_common.roster.ledger import settle_month
 from cmuh_common.roster.model import (
-    Member, RosterParams, SolveContext, day_point,
+    ClerkBatch, Member, RosterParams, SolveContext, batches_covering, day_point,
 )
+from cmuh_common.roster.solve_day import DaySolveInput, month_solve_day
 from cmuh_common.roster.report import build_report
 from cmuh_common.roster.rules import Precheck, collect_directives, run_prechecks
 from cmuh_common.roster.solve_rvs import (
@@ -145,6 +147,75 @@ class RosterService:
             "params": RosterParams.from_config(cfg),
             "r": scope_block("r"), "vs": scope_block("vs"),
         }
+
+    # ── PGY/Clerk 日排班（Phase 3）──────────────────────────────────────
+    def build_day_input(self, ym: str) -> DaySolveInput:
+        """組裝 PGY/Clerk 日填充器輸入（開診格網 + 名單 + 切片開放 + 請假）。"""
+        cfg = self.storage.load_config()
+        month = self.storage.load_month(ym)
+        y, m = int(ym[:4]), int(ym[5:7])
+        holidays = self.storage.holidays_set()
+        template = self.storage.load_clinic_template().get("template") or {}
+        grid = month_grid(ym, template, holidays,
+                          month.get("grid_overrides") or {})
+
+        pgy_roster = month.get("pgy_month_roster")
+        if pgy_roster is None:                     # 未指定當月人員 → 用 config 預設代號
+            pgy_roster = [str(mm.get("id")) for mm in (cfg.get("pgy_members") or [])]
+
+        batches = [ClerkBatch.from_dict(b)
+                   for b in self.storage.load_clerk_batches()]
+        covering = batches_covering(batches, y, m)     # 逐日在 solve 時再依 covers 分配
+        bio_all = self.storage.load_biopsy_grid()
+        biopsy_open: dict = {}
+        for b in covering:
+            for iso, sess in (bio_all.get(b.id) or {}).items():
+                try:                                   # 只採「該梯次確實涵蓋」的日期，
+                    if not b.covers(date.fromisoformat(iso)):  # 忽略梯次外的過期/誤設
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                biopsy_open.setdefault(iso, {}).update(sess)
+
+        leaves = {
+            "pgy": _parse_date_map((month.get("leaves") or {}).get("pgy") or {}),
+            "clerk": _parse_date_map((month.get("leaves") or {}).get("clerk") or {}),
+        }
+        return DaySolveInput(
+            ym=ym, grid=grid, pgy_roster=list(pgy_roster),
+            clerk_batches=covering, biopsy_open=biopsy_open, leaves=leaves,
+            capacity=RosterParams.from_config(cfg).room_capacity)
+
+    def run_day_solve(self, ym: str) -> tuple:
+        """build_day_input → month_solve_day。回 (day_slots, log, warnings)，不落地。"""
+        return month_solve_day(self.build_day_input(ym))
+
+    def accept_day_solution(self, ym: str, day_slots: dict) -> None:
+        month = self.storage.load_month(ym)
+        if month.get("finalized"):
+            raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能套用")
+        month["day_slots"] = day_slots
+        self.storage.save_month(ym, month)
+
+    def set_day_slot(self, ym: str, d: date, session: str, slot: str,
+                     people) -> None:
+        """手動改某日某時段某格（slot＝治療室/切片室/房號/放假；people 空→移除）。"""
+        month = self.storage.load_month(ym)
+        sess = (month.setdefault("day_slots", {})
+                .setdefault(d.isoformat(), {}).setdefault(session, {}))
+        old = sess.get(slot)
+        if people:
+            sess[slot] = list(people)
+        else:
+            sess.pop(slot, None)
+        self._audit(month, "day", f"{d.isoformat()} {session} {slot}",
+                    old, people, "manual")
+        self.storage.save_month(ym, month)
+
+    def set_pgy_month_roster(self, ym: str, codes) -> None:
+        month = self.storage.load_month(ym)
+        month["pgy_month_roster"] = [str(c) for c in codes]
+        self.storage.save_month(ym, month)
 
     # ── 求解與落地 ──────────────────────────────────────────────────────
     def run_solve(self, scope: str, ym: str,

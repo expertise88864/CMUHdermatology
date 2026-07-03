@@ -7,6 +7,7 @@ from datetime import date
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from cmuh_common.roster.clinic_grid import is_session_open, month_grid  # noqa: E402
+from cmuh_common.roster.model import ClerkBatch  # noqa: E402
 from cmuh_common.roster.solve_day import (  # noqa: E402
     BIOPSY, REST, TREATMENT, DaySolveInput, FairCounters, month_solve_day,
     solve_session,
@@ -164,7 +165,7 @@ def test_determinism_same_input():
 def test_month_solve_day_no_clerk():
     grid = month_grid("2026-08", _TEMPLATE, set())
     inp = DaySolveInput(ym="2026-08", grid=grid,
-                        pgy_roster=["A", "B", "C"], clerk_roster=[])
+                        pgy_roster=["A", "B", "C"], clerk_batches=[])
     day_slots, log, warnings = month_solve_day(inp)
     mon = day_slots["2026-08-03"]["上午"]
     assert mon[TREATMENT]                                    # 週一早有治療室
@@ -173,9 +174,45 @@ def test_month_solve_day_no_clerk():
 
 def test_month_solve_day_biopsy_missed_warning():
     grid = month_grid("2026-08", _TEMPLATE, set())
+    batch = ClerkBatch("b1", date(2026, 8, 3), ["1", "2", "3"])
     inp = DaySolveInput(
         ym="2026-08", grid=grid, pgy_roster=["A"],
-        clerk_roster=["1", "2", "3"],
-        biopsy_open={})                                      # 切片室全程不開
+        clerk_batches=[batch], biopsy_open={})               # 切片室全程不開
     _ds, _log, warnings = month_solve_day(inp)
     assert any("切片室輪不到" in w for w in warnings)         # 3 人都沒輪到
+
+
+def test_month_solve_day_clerk_only_within_batch():
+    """跨梯次：batch1 成員不得排進 batch2 涵蓋的日期（P1 修正）。"""
+    grid = month_grid("2026-08", _TEMPLATE, set())
+    b1 = ClerkBatch("b1", date(2026, 8, 3), ["1"])       # 8/3–8/16
+    b2 = ClerkBatch("b2", date(2026, 8, 17), ["9"])      # 8/17–8/30
+    inp = DaySolveInput(ym="2026-08", grid=grid, pgy_roster=["A", "B"],
+                        clerk_batches=[b1, b2])
+    day_slots, _log, _w = month_solve_day(inp)
+
+    def _people(iso):
+        out = set()
+        for sess in day_slots.get(iso, {}).values():
+            for who in sess.values():
+                out.update(who)
+        return out
+    assert "1" in _people("2026-08-03") and "9" not in _people("2026-08-03")
+    assert "9" in _people("2026-08-17") and "1" not in _people("2026-08-17")
+
+
+def test_clerk_fairness_resets_per_batch():
+    """代號跨梯重用：新梯的 '1' 不應繼承舊梯 '1' 的座位數而被冷落。"""
+    one_room = {str(wd): {"上午": [{"room": "101"}]} for wd in range(5)}
+    grid = month_grid("2026-08", one_room, set())
+    b1 = ClerkBatch("b1", date(2026, 8, 3), ["1"])       # 前兩週只有 "1"，天天就座
+    b2 = ClerkBatch("b2", date(2026, 8, 17), ["1", "2"])  # 後兩週 "1","2"（"1" 是新人）
+    inp = DaySolveInput(ym="2026-08", grid=grid, pgy_roster=["A"],
+                        clerk_batches=[b1, b2])
+    day_slots, _log, _w = month_solve_day(inp)
+    # 收集 b2 期間 101 診間坐過的人
+    seated_b2 = set()
+    for iso, sess in day_slots.items():
+        if iso >= "2026-08-17":
+            seated_b2.update((sess.get("上午") or {}).get("101", []))
+    assert "1" in seated_b2 and "2" in seated_b2          # 新梯 "1" 有被公平排到

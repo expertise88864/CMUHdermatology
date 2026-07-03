@@ -53,6 +53,35 @@ class Member:
         return out
 
 
+# ─── Clerk 梯次 ───────────────────────────────────────────────────────────
+@dataclass
+class ClerkBatch:
+    """Clerk 兩週一梯次（起始必為週一，不綁月份，可跨月）。"""
+    id: str
+    start_monday: date
+    members: list = field(default_factory=list)   # clerk 代號
+
+    def covers(self, d: date) -> bool:
+        return self.start_monday <= d < self.start_monday + timedelta(days=14)
+
+    @staticmethod
+    def from_dict(dd: dict) -> "ClerkBatch":
+        return ClerkBatch(
+            id=str(dd.get("id", "")),
+            start_monday=date.fromisoformat(dd["start_monday"]),
+            members=[str(x) for x in (dd.get("members") or [])])
+
+    def to_dict(self) -> dict:
+        return {"id": self.id, "start_monday": self.start_monday.isoformat(),
+                "members": list(self.members)}
+
+
+def batches_covering(batches: list, year: int, month: int) -> list:
+    """回傳與該月任一天重疊的梯次（ClerkBatch 清單）。"""
+    days = set(month_dates(year, month))
+    return [b for b in batches if any(b.covers(d) for d in days)]
+
+
 # ─── 參數 ────────────────────────────────────────────────────────────────
 @dataclass
 class RosterParams:
