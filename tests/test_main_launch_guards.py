@@ -232,6 +232,14 @@ def test_set_療程_only_is_shared_single_source():
         _function_node(source_path, "_script_code_input_adaptive"))
 
 
+def test_find_hospital_main_window_enum_has_timeout():
+    """[W2] 主視窗尋找(callback 內 raw GetWindowTextW 會在 HIS 凍結時無限阻塞)
+    必須包在 call_with_timeout 逾時內,逾時 fail-open 回 0(熱鍵乾淨中止而非卡死)。"""
+    source_path = ROOT / "src" / "main.py"
+    func = _function_node(source_path, "_find_hospital_main_window")
+    assert "call_with_timeout" in _called_names(func)
+
+
 def test_hotkey_scripts_return_completion_status():
     source_path = ROOT / "src" / "main.py"
 

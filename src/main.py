@@ -24,6 +24,7 @@ from cmuh_common.paths import (
     get_app_dir, get_settings_dir, get_conf_path, restart_self,
 )
 from cmuh_common.process_launch import launch_app_script
+from cmuh_common.win32_safe import call_with_timeout, WIN_ENUM_TIMEOUT_SEC
 from cmuh_common.atomic_io import atomic_write_json as _atomic_write_json
 from cmuh_common.config_io import load_json_dict, load_json_list
 from cmuh_common.app_settings import (
@@ -1305,34 +1306,42 @@ MENU_ID_名稱輸入 = 220   # 219→220(未使用,隨同段 +1)
 
 def _find_hospital_main_window() -> int:
     """找主程式視窗 (class=TFopdmain, title 含「西醫門診醫師作業」)。
-    回傳 hwnd；找不到回 0。"""
-    found = [0]
+    回傳 hwnd；找不到回 0。
 
-    EnumWindowsProc = ctypes.WINFUNCTYPE(
-        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    [W2 2026-07-03] callback 內用 raw GetWindowTextW(送 WM_GETTEXT),HIS GUI 執行緒
+    凍結時會【無限期阻塞】。此函式是每支熱鍵最先呼叫的入口 → 一卡整個熱鍵子系統死。
+    故整個列舉丟到 daemon thread + 逾時,逾時回 0(當作沒找到),讓熱鍵乾淨中止而非卡死。"""
+    def _enum() -> int:
+        found = [0]
 
-    @EnumWindowsProc
-    def cb(hwnd, lparam):
-        try:
-            if not ctypes.windll.user32.IsWindowVisible(hwnd):
-                return True
-            cls_buf = ctypes.create_unicode_buffer(64)
-            ctypes.windll.user32.GetClassNameW(hwnd, cls_buf, 64)
-            if cls_buf.value != _HOSPITAL_WIN_CLASS:
-                return True
-            n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-            if n > 0:
-                t_buf = ctypes.create_unicode_buffer(n + 1)
-                ctypes.windll.user32.GetWindowTextW(hwnd, t_buf, n + 1)
-                if _HOSPITAL_WIN_TITLE_KW in t_buf.value:
-                    found[0] = hwnd
-                    return False  # 停止枚舉
-        except Exception:
-            pass
-        return True
+        EnumWindowsProc = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
-    ctypes.windll.user32.EnumWindows(cb, 0)
-    return found[0]
+        @EnumWindowsProc
+        def cb(hwnd, lparam):
+            try:
+                if not ctypes.windll.user32.IsWindowVisible(hwnd):
+                    return True
+                cls_buf = ctypes.create_unicode_buffer(64)
+                ctypes.windll.user32.GetClassNameW(hwnd, cls_buf, 64)
+                if cls_buf.value != _HOSPITAL_WIN_CLASS:
+                    return True
+                n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                if n > 0:
+                    t_buf = ctypes.create_unicode_buffer(n + 1)
+                    ctypes.windll.user32.GetWindowTextW(hwnd, t_buf, n + 1)
+                    if _HOSPITAL_WIN_TITLE_KW in t_buf.value:
+                        found[0] = hwnd
+                        return False  # 停止枚舉
+            except Exception:
+                pass
+            return True
+
+        ctypes.windll.user32.EnumWindows(cb, 0)
+        return found[0]
+
+    return call_with_timeout(_enum, WIN_ENUM_TIMEOUT_SEC, default=0,
+                             name="find_hospital_main_window")
 
 
 def _send_yiling_menu_command(hwnd: int, menu_id: int) -> bool:
