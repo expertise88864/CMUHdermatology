@@ -23,6 +23,7 @@ import logging
 import time
 from datetime import date
 
+from cmuh_common.roster.calendar_colors import week_colors_for_year
 from cmuh_common.roster.ledger import settle_month
 from cmuh_common.roster.model import (
     Member, RosterParams, SolveContext, day_point,
@@ -89,7 +90,12 @@ class RosterService:
                     logging.warning("[roster.service] 鎖定格壞日期略過 %r", iso)
 
         ledger = dict((self.storage.load_ledger().get(scope)) or {})
-        week_colors = self.storage.load_week_colors()
+        # 週色：決定性自動套色（依 115 行事曆 4 週交替邏輯，涵蓋跨年邊界的
+        # y-1/y/y+1）為基底 → 使用者於設定頁的手動覆蓋優先蓋上。
+        week_colors: dict = {}
+        for yr in (y - 1, y, y + 1):
+            week_colors.update(week_colors_for_year(yr))
+        week_colors.update(self.storage.load_week_colors())
         prev = self.storage.prev_month_last_weekend(ym, scope)
 
         ctx = SolveContext(

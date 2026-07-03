@@ -11,6 +11,7 @@ import tkinter as tk
 from datetime import date
 from tkinter import messagebox, ttk
 
+from cmuh_common.roster.calendar_colors import week_colors_for_year
 from cmuh_common.roster.ledger import reset_member, sync_members
 from cmuh_common.roster.model import month_dates, week_key
 
@@ -341,18 +342,20 @@ class SettingsTab(ttk.Frame):
             return                                   # 輸入中的暫態非數字
         self._save_cfg()
 
-    # ── 區塊 5：手動週色（Phase 2 再做 PDF 匯入）───────────────────────────
+    # ── 區塊 5：行事曆週色（決定性自動套色，可手動覆蓋）─────────────────────
     def _build_week_colors(self) -> None:
-        lf = ttk.LabelFrame(self._body, text="行事曆週色（雙擊切換 未設定→粉→綠）",
-                            padding=8)
+        lf = ttk.LabelFrame(
+            self._body,
+            text="行事曆週色（依 115 行事曆 4 週交替自動套色；雙擊該週可手動覆蓋）",
+            padding=8)
         lf.pack(fill="x", padx=10, pady=6)
         bar = ttk.Frame(lf); bar.pack(fill="x")
         ttk.Label(bar, text="年").pack(side="left")
         self._wc_year = tk.IntVar(value=date.today().year)
         ttk.Spinbox(bar, from_=2020, to=2100, width=6, textvariable=self._wc_year,
                     command=self._reload_week_colors).pack(side="left", padx=4)
-        ttk.Button(bar, text="匯入行事曆 PDF（開發中）", state="disabled"
-                   ).pack(side="left", padx=8)
+        ttk.Label(bar, text="（自動色往後年度自動延續，通常免手動）",
+                  foreground="gray").pack(side="left", padx=8)
         cols = ("week", "range", "color")
         self._wc_tree = ttk.Treeview(lf, columns=cols, show="headings", height=6)
         for c, t, w in (("week", "ISO 週", 90), ("range", "起訖", 150),
@@ -376,27 +379,32 @@ class SettingsTab(ttk.Frame):
 
     def _reload_week_colors(self) -> None:
         self._wc_tree.delete(*self._wc_tree.get_children())
-        colors = self.service.storage.load_week_colors()
+        year = self._wc_year.get()
+        auto = week_colors_for_year(year)
+        manual = self.service.storage.load_week_colors()
         label = {"pink": "粉", "green": "綠"}
-        for wk, lo, hi in self._year_weeks(self._wc_year.get()):
+        for wk, lo, hi in self._year_weeks(year):
+            eff = manual.get(wk, auto.get(wk, ""))
+            tag = "（手動）" if wk in manual else "（自動）"
             self._wc_tree.insert("", "end", iid=wk, values=(
                 wk, f"{lo.month}/{lo.day}–{hi.month}/{hi.day}",
-                label.get(colors.get(wk), "")))
+                f"{label.get(eff, '?')}{tag}"))
 
     def _week_color_cycle(self, _event) -> None:
+        """雙擊循環：自動 → 手動粉 → 手動綠 → 自動（移除覆蓋回歸決定性色）。"""
         sel = self._wc_tree.selection()
         if not sel:
             return
         wk = sel[0]
-        colors = self.service.storage.load_week_colors()   # 全年度攤平集合
-        nxt = {"": "pink", "pink": "green", "green": ""}[colors.get(wk, "")]
+        manual = self.service.storage.load_week_colors()   # 全年度攤平覆蓋集
+        nxt = {None: "pink", "pink": "green", "green": None}[manual.get(wk)]
         if nxt:
-            colors[wk] = nxt
+            manual[wk] = nxt
         else:
-            colors.pop(wk, None)                            # 清除該週
-        # replace=True：整組取代（否則 merge 無法真正刪掉已清除的週）
+            manual.pop(wk, None)                            # 移除覆蓋→回自動色
+        # replace=True：整組取代（否則 merge 無法真正刪掉已移除的覆蓋）
         self.service.storage.save_week_colors(
-            self._wc_year.get(), colors, source="manual", replace=True)
+            self._wc_year.get(), manual, source="manual", replace=True)
         self._reload_week_colors()
         self._notify()
 
