@@ -25,11 +25,12 @@ import ctypes
 import logging
 import threading
 import tkinter as tk
+from datetime import date
 from tkinter import ttk
 
 # --- cmuh_common 共用基礎建設（stdlib/ctypes 基底，可於 ensure_dependencies 前先 import）---
 from cmuh_common.version import CURRENT_VERSION
-from cmuh_common.paths import get_app_dir, restart_self
+from cmuh_common.paths import get_app_dir, get_settings_dir, restart_self
 from cmuh_common.platform_win import set_dpi_awareness, set_app_user_model_id
 from cmuh_common.window_icon import apply_tk_window_icon
 from cmuh_common.logging_setup import setup_logging
@@ -49,6 +50,12 @@ ensure_dependencies(REQUIRED_LIBS)
 
 # 需要第三方套件（requests）的模組，於 ensure_dependencies 之後才 import。
 from cmuh_common import updater as _updater_mod  # noqa: E402
+
+# 排班業務層與 UI（純 stdlib + cmuh_common；ortools 於「自動排班」時才 lazy 裝）。
+from cmuh_common.roster.service import RosterService  # noqa: E402
+from cmuh_common.roster.storage import RosterStorage  # noqa: E402
+from cmuh_common.roster.ui.duty import CalendarDutyTab  # noqa: E402
+from cmuh_common.roster.ui.settings import SettingsTab  # noqa: E402
 
 BASE_DIR = get_app_dir()
 LOG_FILE = os.path.join(BASE_DIR, "automation_ui.log")
@@ -80,45 +87,95 @@ def _check_updates_in_background(root: tk.Tk) -> None:
 
 
 class ScheduleApp:
-    """醫師排班程式 —— 乾淨起點。
+    """醫師排班程式主視窗：ttk.Notebook 五分頁（lazy 建）。
 
-    目前只顯示占位畫面；真正的排班邏輯由此開始長。共用基礎建設（logging /
-    single-instance / 圖示 / 線上更新 / 例外攔截）已於 main() 接好，無需重做。
+    共用基礎建設（logging / single-instance / 圖示 / 線上更新 / 例外攔截）已於
+    main() 接好。所有排班讀寫經 RosterService；R/VS 分頁共用 self.ym（月份）。
+    PGY / Clerk 分頁為 Phase 3，先放占位。
     """
 
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(WINDOW_TITLE)
-        self.root.geometry("900x600")
-        self.root.minsize(640, 480)
+        self.root.geometry("1080x720")
+        self.root.minsize(820, 560)
         try:
             apply_tk_window_icon(self.root)
         except Exception:
             logging.debug("套用視窗圖示失敗", exc_info=True)
-        self._build_placeholder_ui()
 
-    def _build_placeholder_ui(self) -> None:
-        frame = ttk.Frame(self.root, padding=40)
-        frame.pack(fill="both", expand=True)
+        self.storage = RosterStorage(os.path.join(get_settings_dir(), "roster"))
+        self.service = RosterService(self.storage)
+        today = date.today()
+        self.ym = f"{today.year:04d}-{today.month:02d}"   # R/VS 共用月份
+        self._duty_tabs: dict = {}
 
-        ttk.Label(
-            frame, text="中國醫皮膚科排班程式",
-            font=("Microsoft JhengHei UI", 24, "bold"),
-        ).pack(pady=(48, 12))
-        ttk.Label(
-            frame, text="排班功能開發中",
-            font=("Microsoft JhengHei UI", 14), foreground="gray",
-        ).pack(pady=4)
-        ttk.Label(
-            frame,
-            text="（本程式已清空為乾淨骨架，待實作真正的醫師排班）",
-            font=("Microsoft JhengHei UI", 10), foreground="gray",
-        ).pack(pady=4)
+        self._build_ui()
 
-        ttk.Label(
-            frame, text=f"v{CURRENT_VERSION}",
-            font=("Consolas", 9), foreground="gray",
-        ).pack(side="bottom", pady=8)
+    def _build_ui(self) -> None:
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill="both", expand=True)
+        self._nb = nb
+        self._containers: dict = {}
+        self._builders: dict = {}
+        self._built: dict = {}
+
+        specs = [
+            ("設定", self._build_settings),
+            ("R 排班", lambda c: self._build_duty(c, "r")),
+            ("VS 排班", lambda c: self._build_duty(c, "vs")),
+            ("PGY", lambda c: self._build_placeholder(c, "PGY 排班（Phase 3）")),
+            ("見習 Clerk", lambda c: self._build_placeholder(c, "Clerk 排班（Phase 3）")),
+        ]
+        for name, builder in specs:
+            cont = ttk.Frame(nb)
+            nb.add(cont, text=name)
+            self._containers[name] = cont
+            self._builders[name] = builder
+        nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        self._ensure_built("設定")   # 首頁先建好
+
+        ttk.Label(self.root, text=f"v{CURRENT_VERSION}", anchor="e",
+                  font=("Consolas", 8), foreground="gray").pack(fill="x")
+
+    def _on_tab_changed(self, _event) -> None:
+        try:
+            name = self._nb.tab(self._nb.select(), "text")
+        except tk.TclError:
+            return
+        self._ensure_built(name)
+        inst = self._built.get(name)
+        if hasattr(inst, "on_shown"):
+            inst.on_shown()          # 切到 R/VS → 同步共用月份並重畫
+
+    def _ensure_built(self, name: str) -> None:
+        if name in self._built:
+            return
+        self._built[name] = self._builders[name](self._containers[name])
+
+    def _build_settings(self, cont):
+        tab = SettingsTab(cont, self.service, on_changed=self._on_settings_changed)
+        tab.pack(fill="both", expand=True)
+        return tab
+
+    def _build_duty(self, cont, scope):
+        tab = CalendarDutyTab(cont, self.service, scope, self)
+        tab.pack(fill="both", expand=True)
+        self._duty_tabs[scope] = tab
+        return tab
+
+    def _build_placeholder(self, cont, text):
+        ttk.Label(cont, text=text, foreground="gray",
+                  font=("Microsoft JhengHei UI", 15)).pack(pady=80)
+        return None
+
+    def _on_settings_changed(self) -> None:
+        """設定變動（名單/假日/週色/參數）→ 已建的 R/VS 分頁重畫。"""
+        for tab in self._duty_tabs.values():
+            try:
+                tab.refresh()
+            except Exception:
+                logging.exception("[roster.ui] 設定變更後重繪失敗")
 
 
 def main() -> None:

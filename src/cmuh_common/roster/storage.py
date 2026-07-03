@@ -123,11 +123,16 @@ class RosterStorage:
                                "week_colors.json")
         return dict(d.get("weeks") or {})
 
-    def save_week_colors(self, year: int, weeks: dict, source: str = "manual") -> None:
+    def save_week_colors(self, year: int, weeks: dict, source: str = "manual",
+                         replace: bool = False) -> None:
+        """weeks: {week_key: "pink"/"green"}。
+
+        replace=False（預設）：併入既有（只增/改，無法刪）。
+        replace=True：以 weeks 整組取代（UI 手動清除某週色時用，需傳完整集合）。
+        """
         cur = _load_json(self._path("week_colors.json"))
         self._check_schema(cur, "week_colors.json")   # [codex P2] 防降級毀損
-        merged = dict(cur.get("weeks") or {})
-        merged.update(weeks)
+        merged = dict(weeks) if replace else {**(cur.get("weeks") or {}), **weeks}
         self._save(self._path("week_colors.json"),
                    {"year": year, "weeks": merged, "source": source})
 

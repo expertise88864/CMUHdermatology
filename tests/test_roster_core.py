@@ -163,6 +163,14 @@ def test_storage_week_colors_merge(tmp_path):
     assert st.load_week_colors() == {"2026-W31": "pink", "2026-W32": "green"}
 
 
+def test_storage_week_colors_replace_can_delete(tmp_path):
+    st = RosterStorage(str(tmp_path))
+    st.save_week_colors(2026, {"2026-W31": "pink", "2026-W32": "green"})
+    # replace=True 整組取代 → 可真正刪掉 W31（merge 做不到）
+    st.save_week_colors(2026, {"2026-W32": "green"}, replace=True)
+    assert st.load_week_colors() == {"2026-W32": "green"}
+
+
 def test_storage_prev_month_last_weekend(tmp_path):
     st = RosterStorage(str(tmp_path))
     st.save_month("2026-07", {"last_weekend": {
