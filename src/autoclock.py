@@ -459,11 +459,50 @@ def _handle_clock_failure(driver, username: str, task_label: str, exc, dry_run: 
 # =============================================================================
 # 設定檔讀寫
 # =============================================================================
+_last_config_warn_set: set = set()
+
+
+def _validate_accounts(accounts) -> list:
+    """[W13 2026-07-03] 純函式:回傳帳號設定的警告清單(不擋啟動、不丟棄帳號 —— 只醒目
+    提示使用者修正)。檢查:非 dict 項、缺 username/password、重複 username。"""
+    if not isinstance(accounts, list):
+        # [codex review] 對非 list 純量(如整數)保持 total,不拋 TypeError
+        return [] if not accounts else [f"帳號設定不是清單:{accounts!r}"]
+    warnings = []
+    seen: dict = {}
+    for i, acc in enumerate(accounts):
+        if not isinstance(acc, dict):
+            warnings.append(f"第 {i + 1} 筆帳號設定不是物件:{acc!r}")
+            continue
+        u = str(acc.get("username", "") or "").strip()
+        if u:
+            seen[u] = seen.get(u, 0) + 1
+        else:
+            warnings.append(f"第 {i + 1} 筆帳號缺 username(該筆無法登入打卡)")
+        if not acc.get("password"):
+            warnings.append(f"帳號 {u or ('#' + str(i + 1))} 缺 password(該筆無法登入打卡)")
+    for u, n in seen.items():
+        if n > 1:
+            warnings.append(f"username {u} 重複出現 {n} 次(會重複登入/打卡,請刪除多餘筆)")
+    return warnings
+
+
+def _warn_config_issues(accounts) -> None:
+    """驗證並【只在警告集合有變化時】記 log,避免每分鐘 load_config 洗版。"""
+    global _last_config_warn_set
+    cur = set(_validate_accounts(accounts))
+    if cur and cur != _last_config_warn_set:
+        for w in sorted(cur):
+            logging.warning("[autoclock][config] %s", w)
+    _last_config_warn_set = cur
+
+
 def load_config() -> list:
     global accounts_data
     with _config_lock:
         data = safe_load_json(str(CONFIG_FILE), default=[])
         accounts_data = data if isinstance(data, list) else []
+    _warn_config_issues(accounts_data)  # [W13] 醒目提示設定問題(不擋啟動)
     return accounts_data
 
 

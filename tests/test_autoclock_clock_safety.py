@@ -105,3 +105,35 @@ def test_verify_read_failure_never_confirms(monkeypatch):
     assert ac._verify_clock_recorded(
         object(), _loc, "上班", dt_time(7, 31), dt_time(8, 0), "u1",
         timeout_sec=0.0, poll_sec=0.0) is False
+
+
+# ─── W13:帳號設定驗證(不擋啟動,只警告) ─────────────────────────────────
+
+def test_validate_accounts_ok():
+    assert ac._validate_accounts(
+        [{"username": "a01", "password": "x"}]) == []
+
+
+def test_validate_accounts_flags_missing_fields():
+    w = ac._validate_accounts([{"username": "", "password": ""}])
+    assert any("username" in s for s in w)
+    assert any("password" in s for s in w)
+
+
+def test_validate_accounts_flags_duplicate_username():
+    w = ac._validate_accounts([
+        {"username": "a01", "password": "x"},
+        {"username": "a01", "password": "y"}])
+    assert any("重複" in s and "a01" in s for s in w)
+
+
+def test_validate_accounts_flags_non_dict():
+    w = ac._validate_accounts(["not-a-dict", {"username": "a", "password": "p"}])
+    assert any("不是物件" in s for s in w)
+
+
+def test_validate_accounts_total_on_non_list():
+    """[codex review] 非 list 純量不可拋例外。"""
+    assert ac._validate_accounts(None) == []          # None → 空(無設定)
+    assert ac._validate_accounts({}) == []            # 空 dict falsy → 空
+    assert any("不是清單" in s for s in ac._validate_accounts(123))  # truthy 純量 → 提示
