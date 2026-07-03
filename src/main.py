@@ -1815,6 +1815,26 @@ _hotkey_cancelled_threads = set()
 _hotkey_cancelled_threads_lock = threading.Lock()
 
 
+def _hotkey_watchdog_action(still_ours: bool, alive: bool, awaiting: bool) -> str:
+    """[W1 2026-07-03] 硬逾時看門狗的純決策(可測試):
+      'gone'         → 流程已正常結束/被後續熱鍵取代,看門狗可退出。
+      'clear_dead'   → 旗標殘留但 worker thread 已死(finally 沒清到)→ 清旗標(安全)。
+      'keep_awaiting'→ 正卡在「等醫師回應對話框」→ 維持鎖定、再等一個週期。
+      'keep_stuck'   → 卡住且 thread 仍活著 → 【維持鎖定】+警告,絕不解鎖。
+
+    關鍵安全變更:舊版在 'keep_stuck' 情況會強制清 _subsystem_running(解鎖),但卡住的
+    worker 仍活著、可能正卡在 HIS 半寫入狀態 → 放第二支熱鍵進來並行寫同一病歷/醫令
+    會造成 billing 錯亂。改為『thread 還活著就絕不解鎖』;真的卡死請 F12/重啟(卡住的
+    worker 一旦結束或 HIS 恢復,其 finally 會自行清旗標、熱鍵自動恢復)。"""
+    if not still_ours:
+        return "gone"
+    if not alive:
+        return "clear_dead"
+    if awaiting:
+        return "keep_awaiting"
+    return "keep_stuck"
+
+
 @contextlib.contextmanager
 def _hotkey_awaiting_user_scope():
     """標記目前熱鍵流程正阻塞等待使用者回應(MessageBoxW)。離開時還原為先前狀態
@@ -12870,46 +12890,50 @@ class AutomationApp:
         thread = threading.Thread(target=wrapper, name=f"{hotkey_name}_Thread", daemon=True)
         thread.start()
 
-        # [stability] 硬上限看門狗：若此流程因「無逾時的跨行程呼叫(醫院 app 凍住)」
-        # 或任何原因卡住超過 HOTKEY_HARD_TIMEOUT_SEC，wrapper 的 finally 永遠跑不到
-        # → _subsystem_running 永遠 True → 之後每個熱鍵都被擋「前一個流程尚未完成」、
-        # F12 也救不回(thread 卡在 kernel 內無法觀察 stop_event)、連 hotkey guardian
-        # 自動重掛也被封死。獨立計時器在逾時後強制復位 _subsystem_running(僅當仍是
-        # 本 token 且 thread 還活著)，讓後續熱鍵恢復。卡住的 thread 無法 kill，但不
-        # 再永久封鎖全部熱鍵。timeout 取較寬(180s)以免誤砍合法的慢流程(F9/F10 重試)。
+        # [stability][W1 2026-07-03] 硬上限看門狗：流程若卡住超過 HOTKEY_HARD_TIMEOUT_SEC，
+        # wrapper 的 finally 跑不到 → _subsystem_running 永遠 True。
+        # 【安全變更】舊版逾時後會「強制解鎖」讓其他熱鍵恢復,但卡住的 worker 仍活著、
+        # 可能正卡在 HIS 半寫入 → 第二支熱鍵並行寫同一病歷/醫令 = billing 錯亂。
+        # 改為:worker thread 還活著就【絕不解鎖】,只警告醫師(F12/重啟);worker 一旦
+        # 結束或 HIS 恢復,其 finally 會自行清旗標、熱鍵自動恢復。只有「旗標殘留但 thread
+        # 已死」(finally 沒清到,罕見)才由看門狗代清。搭配 W2 主視窗尋找逾時,多數卡死
+        # 已能自解,真正需要重啟的永久死結才會維持鎖定。timeout 180s 避免誤判慢流程。
         HOTKEY_HARD_TIMEOUT_SEC = 180
 
         def _hotkey_hard_timeout_watch():
-            # [stability r4] 逾時後若流程正阻塞在「等醫師回應的對話框」(_hotkey_awaiting_user)，
-            # 那是刻意等待、不是卡死 → 不強制解鎖，再延一個週期重評；避免醫師回應前看門狗
-            # 解鎖讓第二支熱鍵重入並行操作 HIS。只有「逾時且非等待使用者」才判定卡死強制解鎖。
             time.sleep(HOTKEY_HARD_TIMEOUT_SEC)
             while True:
-                unlocked = False
                 with self._subsystem_lock:
-                    active = (self._subsystem_running
-                              and self._subsystem_token == subsystem_token
-                              and thread.is_alive())
-                    awaiting = active and _hotkey_awaiting_user
-                    if active and not awaiting:
+                    still_ours = (self._subsystem_running
+                                  and self._subsystem_token == subsystem_token)
+                    alive = thread.is_alive()
+                    awaiting = still_ours and alive and _hotkey_awaiting_user
+                    action = _hotkey_watchdog_action(still_ours, alive, awaiting)
+                    if action == "clear_dead":
                         self._subsystem_running = False
-                        unlocked = True
-                if not active:
+                        self._subsystem_thread = None
+                if action == "gone":
                     return  # 流程已正常結束或被後續熱鍵取代
-                if awaiting:
+                if action == "clear_dead":
+                    logging.critical(
+                        "[hotkey-watchdog] %s worker 已結束但 _subsystem_running 殘留 "
+                        "→ 已代為清除,恢復熱鍵。", hotkey_name)
+                    return
+                if action == "keep_awaiting":
                     put_ui_message(self.ui_queue, UiStatusMessage(
                         text=f'狀態: {hotkey_name} 等待醫師回應中，按 F12 可取消等待'))
-                    time.sleep(HOTKEY_HARD_TIMEOUT_SEC)  # 仍在等使用者，再給一個週期
+                    time.sleep(HOTKEY_HARD_TIMEOUT_SEC)
                     continue
-                if unlocked:
-                    logging.critical(
-                        "[hotkey-watchdog] %s 執行超過 %ds 仍未結束(疑似卡在無逾時的跨"
-                        "行程呼叫/醫院 app freeze) → 已強制解除熱鍵鎖定以恢復其他熱鍵"
-                        "(卡住的工作緒無法 kill，請留意畫面)",
-                        hotkey_name, HOTKEY_HARD_TIMEOUT_SEC)
-                    put_ui_message(self.ui_queue, UiStatusMessage(
-                        text=f'狀態: {hotkey_name} 疑似卡死，已解除熱鍵鎖定（請檢查畫面）'))
-                return
+                # action == "keep_stuck":卡住且 thread 仍活著 → 維持鎖定,絕不放第二支
+                # 熱鍵並行操作 HIS。持續警告直到 worker 結束(HIS 恢復)或使用者重啟。
+                logging.critical(
+                    "[hotkey-watchdog] %s 執行超過 %ds 仍在跑且未在等醫師回應(疑似卡在"
+                    "無逾時跨行程呼叫/HIS freeze)→ 維持熱鍵鎖定以免第二支熱鍵並行操作"
+                    "HIS;請按 F12,無效則重新啟動程式(卡住工作緒無法強制 kill)。",
+                    hotkey_name, HOTKEY_HARD_TIMEOUT_SEC)
+                put_ui_message(self.ui_queue, UiStatusMessage(
+                    text=f'狀態: {hotkey_name} 卡住未結束，熱鍵暫停中，請按 F12 或重啟程式'))
+                time.sleep(HOTKEY_HARD_TIMEOUT_SEC)  # 再等一個週期重評(worker 可能恢復)
 
         threading.Thread(target=_hotkey_hard_timeout_watch,
                          name=f"{hotkey_name}_HardTimeout", daemon=True).start()

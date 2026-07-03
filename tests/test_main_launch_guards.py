@@ -232,6 +232,13 @@ def test_set_療程_only_is_shared_single_source():
         _function_node(source_path, "_script_code_input_adaptive"))
 
 
+def test_hotkey_watchdog_uses_pure_decision_helper():
+    """[W1] 硬逾時看門狗改用純決策 _hotkey_watchdog_action(worker 活著絕不解鎖)。"""
+    source_path = ROOT / "src" / "main.py"
+    func = _function_node(source_path, "run_subsystem_in_thread")
+    assert "_hotkey_watchdog_action" in _called_names(func)
+
+
 def test_find_hospital_main_window_enum_has_timeout():
     """[W2] 主視窗尋找(callback 內 raw GetWindowTextW 會在 HIS 凍結時無限阻塞)
     必須包在 call_with_timeout 逾時內,逾時 fail-open 回 0(熱鍵乾淨中止而非卡死)。"""
