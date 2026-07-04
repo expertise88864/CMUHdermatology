@@ -372,8 +372,47 @@ class RosterService:
     def set_must(self, scope: str, ym: str, member_id: str, dates) -> None:
         self._set_date_map(scope, ym, "must_duty", member_id, dates)
 
+    def resettle_from_duty(self, scope: str, ym: str) -> dict:
+        """以目前月檔『實際排班』（含手動調整/換班）重算該 scope 帳本。
+
+        自動回滾同月同 scope 舊分錄再重記 → 帳本永遠反映最終排班（accept 之後
+        又手改的格也算進去）。回傳每人本月點數。
+
+        名單清空時仍會 settle（points 空 → 回滾該月舊分錄、不留殘餘）。已定案
+        月份唯讀，拒絕重算。"""
+        if self.storage.load_month(ym).get("finalized"):
+            raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能重算帳本")
+        ctx = self.build_context(scope, ym)
+        duty = (self.storage.load_month(ym).get(f"{scope}_duty") or {})
+        points = {m.id: 0 for m in ctx.members}
+        for iso, cell in duty.items():
+            p = cell.get("person")
+            if p not in points:
+                continue
+            try:
+                points[p] += day_point(date.fromisoformat(iso),
+                                       ctx.holidays, ctx.params)
+            except (ValueError, TypeError):
+                continue
+        ledger = self.storage.load_ledger()
+        settle_month(ledger, scope, ym, points)
+        self.storage.save_ledger(ledger)
+        return points
+
     def finalize(self, ym: str, on: bool) -> None:
-        """定案/解除定案。解除需覆寫已定案月檔 → 一律 force=True。"""
+        """定案/解除定案。解除需覆寫已定案月檔 → 一律 force=True。
+
+        定案時：以最終（含手動調整/換班）的 R/VS 排班重算帳本，確保帳本＝實況。"""
+        if on:
+            m0 = self.storage.load_month(ym)
+            hist = self.storage.load_ledger().get("history") or []
+            settled = {h.get("scope") for h in hist if h.get("month") == ym}
+            for scope in ("r", "vs"):
+                # 有排班、或本月已有結算（可能被清空 → 需回滾）都要重算。
+                # 重算失敗即讓例外上拋 → 中止定案（不留「已定案但帳本沒更新」的
+                # 半套狀態）；UI 會攔截顯示錯誤並還原定案勾選。
+                if m0.get(f"{scope}_duty") or scope in settled:
+                    self.resettle_from_duty(scope, ym)
         month = self.storage.load_month(ym)
         month["finalized"] = bool(on)
         self._audit(month, "-", ym, None, f"finalized={bool(on)}", "finalize")

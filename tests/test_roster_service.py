@@ -129,6 +129,62 @@ def test_accept_preserves_locked_cell(tmp_path):
     assert month["r_duty"]["2026-08-01"]["source"] == "auto"
 
 
+def test_resettle_from_duty_reflects_manual_edits(tmp_path):
+    svc = _svc(tmp_path)
+    svc.accept_solution("r", YM, _result_for(svc, YM, _cover(svc, YM, "A")))
+    svc.set_cell("r", YM, date(2026, 8, 5), "B")     # 8/5(週二) 手動換給 B
+    pts = svc.resettle_from_duty("r", YM)
+    assert pts["B"] == 1                              # B 得 8/5 一個平日點
+    hist = [h for h in svc.storage.load_ledger()["history"]
+            if h["month"] == YM and h["scope"] == "r"]
+    assert len(hist) == 1                             # 同月回滾重記，只一筆
+
+
+def test_finalize_resettles_ledger_from_final_duty(tmp_path):
+    svc = _svc(tmp_path)
+    svc.accept_solution("r", YM, _result_for(svc, YM, _cover(svc, YM, "A")))
+    b_before = svc.storage.load_ledger()["r"]["B"]
+    svc.set_cell("r", YM, date(2026, 8, 5), "B")
+    svc.finalize(YM, True)                            # 定案 → 依最終排班重算
+    assert svc.storage.load_ledger()["r"]["B"] > b_before   # B 值了 8/5 → 帳本上升
+
+
+def test_finalize_resettles_even_after_duty_cleared(tmp_path):
+    """accept 後把 R 排班全清 → 定案仍要回滾該月結算（帳本歸零，不留舊分錄）。"""
+    svc = _svc(tmp_path)
+    svc.accept_solution("r", YM, _result_for(svc, YM, _cover(svc, YM, "A")))
+    assert svc.storage.load_ledger()["r"]["A"] > 0
+    m = svc.storage.load_month(YM)
+    m["r_duty"] = {}
+    svc.storage.save_month(YM, m)
+    svc.finalize(YM, True)
+    led = svc.storage.load_ledger()["r"]
+    assert led["A"] == 0.0 and led["B"] == 0.0        # 空排班 → 該月結算回滾為 0
+
+
+def test_resettle_blocked_when_finalized(tmp_path):
+    svc = _svc(tmp_path)
+    svc.accept_solution("r", YM, _result_for(svc, YM, _cover(svc, YM, "A")))
+    svc.finalize(YM, True)
+    with pytest.raises(FinalizedMonthError):
+        svc.resettle_from_duty("r", YM)
+
+
+def test_resettle_rolls_back_when_members_emptied(tmp_path):
+    """名單清空後重算 → 仍回滾該月舊結算（不再 early-return 留殘餘）。"""
+    svc = _svc(tmp_path)
+    svc.accept_solution("r", YM, _result_for(svc, YM, _cover(svc, YM, "A")))
+    cfg = svc.storage.load_config()
+    cfg["r_members"] = []
+    svc.storage.save_config(cfg)
+    svc.resettle_from_duty("r", YM)
+    led = svc.storage.load_ledger()
+    hist = [h for h in led["history"]
+            if h["month"] == YM and h["scope"] == "r"]
+    assert len(hist) == 1 and hist[0]["deltas"] == {}    # 舊分錄回滾、重記為空
+    assert led["r"]["A"] == 0.0 and led["r"]["B"] == 0.0  # 餘額歸零
+
+
 def test_accept_rejects_non_ok(tmp_path):
     svc = _svc(tmp_path)
     with pytest.raises(ValueError):

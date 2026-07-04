@@ -157,6 +157,9 @@ class CalendarDutyTab(ttk.Frame):
         self._clear_btn.pack(side="left", padx=4)
         self._report_btn = ttk.Button(bar, text="報告", command=self._on_report)
         self._report_btn.pack(side="left", padx=4)
+        self._resettle_btn = ttk.Button(bar, text="重算帳本",
+                                        command=self._on_resettle)
+        self._resettle_btn.pack(side="left", padx=4)
         # 匯出不進 _toolbar/finalized 停用集：定案月仍可匯出（唯讀輸出、不改資料）
         ttk.Button(bar, text="匯出", command=self._on_export).pack(side="left", padx=4)
         self._final_var = tk.BooleanVar(value=False)
@@ -164,7 +167,7 @@ class CalendarDutyTab(ttk.Frame):
             bar, text="定案", variable=self._final_var, command=self._on_finalize)
         self._final_chk.pack(side="left", padx=12)
         self._toolbar = [self._auto_btn, self._clear_btn, self._report_btn,
-                         self._final_chk]
+                         self._resettle_btn, self._final_chk]
 
     def _build_side(self, parent) -> None:
         ttk.Label(parent, text="結算", font=("Microsoft JhengHei UI", 10, "bold")
@@ -506,6 +509,18 @@ class CalendarDutyTab(ttk.Frame):
         else:
             messagebox.showinfo("匯出完成", f"已匯出：\n{path}")
 
+    def _on_resettle(self) -> None:
+        """以目前（含手動換班）排班重算帳本結轉，並刷新結算面板。"""
+        if self._finalized or self._busy_flag:      # 求解中不得動帳本（避免據舊帳本套用）
+            return
+        try:
+            self.service.resettle_from_duty(self.scope, self.app.ym)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("重算帳本失敗", str(e))
+            return
+        self.refresh()
+        messagebox.showinfo("重算帳本", "已依目前排班重算帳本結轉。")
+
     def _on_report(self) -> None:
         month = self.service.storage.load_month(self.app.ym)
         text = month.get(f"report_{self.scope}") or "（本月尚未排班，無報告）"
@@ -536,5 +551,5 @@ class CalendarDutyTab(ttk.Frame):
 
     def _apply_finalized_state(self) -> None:
         state = "disabled" if self._finalized else "normal"
-        for w in (self._auto_btn, self._clear_btn):
+        for w in (self._auto_btn, self._clear_btn, self._resettle_btn):
             w.config(state=state)
