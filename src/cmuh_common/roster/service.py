@@ -181,10 +181,18 @@ class RosterService:
             "pgy": _parse_date_map((month.get("leaves") or {}).get("pgy") or {}),
             "clerk": _parse_date_map((month.get("leaves") or {}).get("clerk") or {}),
         }
+        # 鎖定時段：以「目前 day_slots 內容」為鎖定值（自動排班時保留、只重排其餘）
+        day_slots = month.get("day_slots") or {}
+        locked: dict = {}
+        for iso, sessions in (month.get("day_locks") or {}).items():
+            for session, on in sessions.items():
+                slots = (day_slots.get(iso) or {}).get(session)
+                if on and slots is not None:
+                    locked.setdefault(iso, {})[session] = slots
         return DaySolveInput(
             ym=ym, grid=grid, pgy_roster=list(pgy_roster),
             clerk_batches=covering, biopsy_open=biopsy_open, leaves=leaves,
-            capacity=RosterParams.from_config(cfg).room_capacity)
+            capacity=RosterParams.from_config(cfg).room_capacity, locked=locked)
 
     def run_day_solve(self, ym: str) -> tuple:
         """build_day_input → month_solve_day。回 (day_slots, log, warnings)，不落地。"""
@@ -217,6 +225,42 @@ class RosterService:
     def set_pgy_month_roster(self, ym: str, codes) -> None:
         month = self.storage.load_month(ym)
         month["pgy_month_roster"] = [str(c) for c in codes]
+        self.storage.save_month(ym, month)
+
+    def toggle_day_lock(self, ym: str, d: date, session: str) -> bool:
+        """鎖定/解鎖某日某時段（鎖定後自動排班不重排該時段）。回傳新狀態。"""
+        month = self.storage.load_month(ym)
+        if month.get("finalized"):
+            raise FinalizedMonthError(f"{ym} 已定案（唯讀）")
+        locks = month.setdefault("day_locks", {}).setdefault(d.isoformat(), {})
+        new = not locks.get(session)
+        if new:
+            locks[session] = True
+        else:
+            locks.pop(session, None)
+            if not locks:
+                month["day_locks"].pop(d.isoformat(), None)
+        self.storage.save_month(ym, month)
+        return new
+
+    def is_day_locked(self, ym: str, d: date, session: str) -> bool:
+        month = self.storage.load_month(ym)
+        return bool(((month.get("day_locks") or {}).get(d.isoformat())
+                     or {}).get(session))
+
+    def clear_unlocked_day(self, ym: str) -> None:
+        """清除未鎖定的日排班時段（保留鎖定時段）。"""
+        month = self.storage.load_month(ym)
+        if month.get("finalized"):
+            raise FinalizedMonthError(f"{ym} 已定案（唯讀）")
+        day_locks = month.get("day_locks") or {}
+        kept: dict = {}
+        for iso, sessions in (month.get("day_slots") or {}).items():
+            for session, slots in sessions.items():
+                if (day_locks.get(iso) or {}).get(session):
+                    kept.setdefault(iso, {})[session] = slots
+        month["day_slots"] = kept
+        month["day_report"] = ""       # 舊報告已與清除後不符 → 一併清掉，避免誤導
         self.storage.save_month(ym, month)
 
     def get_leaves(self, scope: str, ym: str, member_id: str) -> set:

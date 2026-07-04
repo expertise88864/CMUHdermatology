@@ -249,6 +249,36 @@ def test_day_edit_dialog_saves(root, tmp_path):
     assert got == ["A"]
 
 
+def test_day_tab_lock_toggle(root, tmp_path):
+    svc = _svc(tmp_path)
+    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    svc.accept_day_solution(YM, svc.run_day_solve(YM)[0])
+    tab.refresh()
+    tab._tree.selection_set("2026-08-03|上午")
+    tab._on_toggle_lock()
+    assert svc.is_day_locked(YM, date(2026, 8, 3), "上午")
+    assert "🔒" in tab._tree.item("2026-08-03|上午", "values")   # 鎖列顯示
+
+
+def test_day_tab_can_unlock_empty_session(root, tmp_path):
+    """鎖定後把該時段清空 → 仍能從 UI 解鎖（不被空時段擋，codex P2）。"""
+    svc = _svc(tmp_path)
+    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    svc.accept_day_solution(YM, svc.run_day_solve(YM)[0])
+    svc.toggle_day_lock(YM, date(2026, 8, 3), "上午")
+    m = svc.storage.load_month(YM)                    # 清空該鎖定時段內容
+    m["day_slots"]["2026-08-03"]["上午"] = {}
+    svc.storage.save_month(YM, m)
+    tab.refresh()
+    tab._tree.selection_set("2026-08-03|上午")
+    tab._on_toggle_lock()                             # 應能解鎖
+    assert not svc.is_day_locked(YM, date(2026, 8, 3), "上午")
+
+
 def test_day_tab_finalize_disables_edit_controls(root, tmp_path):
     svc = _svc(tmp_path)
     tab = DayScheduleTab(root, svc, "pgy", _app())

@@ -67,7 +67,10 @@ class DayScheduleTab(ttk.Frame):
         self._selector.pack(side="left")
         self._auto_btn = ttk.Button(bar, text="自動排班", command=self._on_auto)
         self._auto_btn.pack(side="left", padx=(12, 4))
-        self._clear_btn = ttk.Button(bar, text="清除", command=self._on_clear)
+        self._lock_btn = ttk.Button(bar, text="🔒鎖定/解鎖選取",
+                                    command=self._on_toggle_lock)
+        self._lock_btn.pack(side="left", padx=4)
+        self._clear_btn = ttk.Button(bar, text="清除未鎖定", command=self._on_clear)
         self._clear_btn.pack(side="left", padx=4)
         self._edit_btns = []                             # 定案時一併停用的編輯鈕
         self._leave_btn = ttk.Button(bar, text="請假…", command=self._on_leave)
@@ -87,11 +90,12 @@ class DayScheduleTab(ttk.Frame):
     def _build_grid(self, parent) -> None:
         wrap = ttk.Frame(parent)
         wrap.pack(side="left", fill="both", expand=True)
-        cols = ("date", "session", "tx", "biopsy", "rooms", "rest")
-        heads = {"date": "日期", "session": "時段", "tx": "治療室",
-                 "biopsy": "切片室", "rooms": "跟診診間", "rest": "放假"}
-        widths = {"date": 90, "session": 44, "tx": 60, "biopsy": 60,
-                  "rooms": 240, "rest": 90}
+        cols = ("date", "session", "lock", "tx", "biopsy", "rooms", "rest")
+        heads = {"date": "日期", "session": "時段", "lock": "鎖",
+                 "tx": "治療室", "biopsy": "切片室", "rooms": "跟診診間",
+                 "rest": "放假"}
+        widths = {"date": 90, "session": 44, "lock": 32, "tx": 60,
+                  "biopsy": 60, "rooms": 220, "rest": 90}
         self._tree = ttk.Treeview(wrap, columns=cols, show="headings", height=22)
         for c in cols:
             self._tree.heading(c, text=heads[c])
@@ -121,6 +125,7 @@ class DayScheduleTab(ttk.Frame):
         self._finalized = bool(month.get("finalized"))
         self._final_var.set(self._finalized)
         day_slots = month.get("day_slots") or {}
+        day_locks = month.get("day_locks") or {}
         grid = self.service.build_day_input(ym).grid
 
         self._tree.delete(*self._tree.get_children())
@@ -130,9 +135,11 @@ class DayScheduleTab(ttk.Frame):
                 rooms_open = (grid.get(d) or {}).get(session) or []
                 rooms_disp = _rooms_summary(slots) or (
                     "（" + "、".join(rooms_open) + "）" if rooms_open else "—")
+                locked = (day_locks.get(d.isoformat()) or {}).get(session)
                 self._tree.insert("", "end", iid=f"{d.isoformat()}|{session}",
                                   values=(
                     f"{d.month}/{d.day}({_WD[d.weekday()]})", session,
+                    "🔒" if locked else "",
                     "".join(slots.get(TREATMENT, [])),
                     "".join(slots.get(BIOPSY, [])),
                     rooms_disp, "".join(slots.get(REST, []))))
@@ -210,13 +217,31 @@ class DayScheduleTab(ttk.Frame):
         ttk.Button(bar, text="取消", command=win.destroy).pack(side="right")
         win.grab_set()
 
+    def _on_toggle_lock(self) -> None:
+        if self._finalized:
+            return
+        sel = self._tree.selection()
+        if not sel or "|" not in sel[0]:
+            return
+        iso, session = sel[0].split("|", 1)
+        d = date.fromisoformat(iso)
+        # 解鎖一律允許；只有「要新鎖定空時段」才擋（避免鎖住無內容的格後無法解）
+        if not self.service.is_day_locked(self.app.ym, d, session):
+            slots = ((self.service.storage.load_month(self.app.ym).get("day_slots")
+                      or {}).get(iso) or {}).get(session)
+            if not slots:
+                messagebox.showinfo("鎖定", "此時段尚未排班，無法鎖定")
+                return
+        self.service.toggle_day_lock(self.app.ym, d, session)
+        self.refresh()
+
     def _on_clear(self) -> None:
         if self._finalized:
             return
-        if not messagebox.askyesno("清除", "清除本月 PGY/Clerk 日排班結果？"):
+        if not messagebox.askyesno("清除未鎖定", "清除本月所有「未鎖定」的日排班時段？"):
             return
         try:
-            self.service.accept_day_solution(self.app.ym, {})
+            self.service.clear_unlocked_day(self.app.ym)
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("清除失敗", str(e))
             return
@@ -284,7 +309,7 @@ class DayScheduleTab(ttk.Frame):
 
     def _apply_finalized_state(self) -> None:
         state = "disabled" if self._finalized else "normal"
-        for w in (self._auto_btn, self._clear_btn, *self._edit_btns):
+        for w in (self._auto_btn, self._clear_btn, self._lock_btn, *self._edit_btns):
             w.config(state=state)
 
 

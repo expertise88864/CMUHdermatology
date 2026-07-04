@@ -124,6 +124,38 @@ def test_run_day_solve_deterministic(tmp_path):
     assert REST is not None                             # 匯入正常
 
 
+def test_day_lock_toggle_and_preserved_on_resolve(tmp_path):
+    svc = _svc(tmp_path)
+    svc.accept_day_solution(YM, svc.run_day_solve(YM)[0])   # 先套用一次
+    d = date(2026, 8, 3)
+    assert svc.toggle_day_lock(YM, d, "上午") is True
+    assert svc.is_day_locked(YM, d, "上午")
+    locked_slots = svc.storage.load_month(YM)["day_slots"]["2026-08-03"]["上午"]
+    assert svc.build_day_input(YM).locked["2026-08-03"]["上午"] == locked_slots
+    # 重排 → 鎖定時段不變
+    ds2, _l, _w = svc.run_day_solve(YM)
+    assert ds2["2026-08-03"]["上午"] == locked_slots
+    assert svc.toggle_day_lock(YM, d, "上午") is False      # 解鎖
+    assert not svc.is_day_locked(YM, d, "上午")
+
+
+def test_clear_unlocked_day_keeps_locked(tmp_path):
+    svc = _svc(tmp_path)
+    svc.accept_day_solution(YM, svc.run_day_solve(YM)[0])
+    svc.toggle_day_lock(YM, date(2026, 8, 3), "上午")
+    svc.clear_unlocked_day(YM)
+    remaining = svc.storage.load_month(YM)["day_slots"]
+    assert "上午" in remaining.get("2026-08-03", {})          # 鎖定保留
+    assert "下午" not in remaining.get("2026-08-03", {})       # 未鎖定清掉
+
+
+def test_clear_unlocked_clears_stale_report(tmp_path):
+    svc = _svc(tmp_path)
+    svc.accept_day_solution(YM, svc.run_day_solve(YM)[0], report="OLD")
+    svc.clear_unlocked_day(YM)
+    assert svc.storage.load_month(YM)["day_report"] == ""    # 舊報告一併清除
+
+
 def test_wed_pm_treatment_present(tmp_path):
     """週三下午跟診關閉但治療室仍排（day_slots 有治療室、無房）。"""
     svc = _svc(tmp_path)

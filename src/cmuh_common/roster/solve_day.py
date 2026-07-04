@@ -216,10 +216,38 @@ class DaySolveInput:
     biopsy_open: dict = field(default_factory=dict)   # {iso: {session: bool}}
     leaves: dict = field(default_factory=dict)        # {"pgy":{c:set},"clerk":{c:set}}
     capacity: int = 2
+    locked: dict = field(default_factory=dict)        # {iso: {session: slots}} 鎖定不重排
 
 
 def _avail(roster: list, leave_map: dict, d: date) -> list:
     return sorted(p for p in roster if d not in (leave_map.get(p) or set()))
+
+
+def replay_counters(fc: FairCounters, d: date, session: str, slots: dict,
+                    batch_key: str, pgy_set: set, clerk_set: set) -> None:
+    """把「已鎖定/既存」時段結果餵進公平計數，讓後續未鎖時段對齊（不重新分配）。
+    以名單分類 PGY/Clerk 命名空間（座位/放假）；治療室→tx、切片室→biopsy。"""
+    wed_pm = (d.weekday() == WED and session == "下午")
+    for p in slots.get(TREATMENT, []):
+        fc.tx_total[p] = fc.tx_total.get(p, 0) + 1
+        if wed_pm:
+            fc.tx_wed_pm[p] = fc.tx_wed_pm.get(p, 0) + 1
+        fc.last_tx[p] = d
+    for c in slots.get(BIOPSY, []):
+        k = (batch_key, c)
+        fc.biopsy_done[k] = fc.biopsy_done.get(k, 0) + 1
+        fc.last_biopsy[k] = d
+
+    def _ck(p):
+        return ("pgy", p) if p in pgy_set else ("clerk", batch_key, p)
+    for slot, people in slots.items():
+        if slot in (TREATMENT, BIOPSY):
+            continue
+        target = (fc.rest, fc.last_rest) if slot == REST else (fc.seat, fc.last_seat)
+        for p in people:
+            k = _ck(p)
+            target[0][k] = target[0].get(k, 0) + 1
+            target[1][k] = d
 
 
 def month_solve_day(inp: DaySolveInput) -> tuple:
@@ -246,7 +274,16 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
         batch_key = batch.id if batch else ""
         if batch:
             solved_batch_ids.add(batch.id)
+        pgy_set, clerk_set = set(inp.pgy_roster), set(clerk_members)
         for session in STUDENT_SESSIONS:
+            locked_slots = (inp.locked.get(iso) or {}).get(session)
+            if locked_slots is not None:          # 鎖定時段：保留原樣、只餵進計數
+                day_slots.setdefault(iso, {})[session] = locked_slots
+                replay_counters(fc, d, session, locked_slots, batch_key,
+                                pgy_set, clerk_set)
+                log.append(f"{d.month}/{d.day}({'一二三四五六日'[d.weekday()]}) "
+                           f"{session} 🔒鎖定（不重排）")
+                continue
             rooms = (inp.grid.get(d) or {}).get(session) or []
             # 週三下午跟診關閉但治療室照開 → 該時段仍需跑（rooms 為 []）
             biopsy = bool((inp.biopsy_open.get(iso) or {}).get(session))

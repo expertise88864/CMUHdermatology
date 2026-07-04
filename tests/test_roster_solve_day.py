@@ -172,6 +172,18 @@ def test_month_solve_day_no_clerk():
     assert log and not warnings                              # 無 Clerk → 無切片警告
 
 
+def test_locked_session_preserved_and_counted():
+    """鎖定時段原樣保留，且餵進公平計數 → 未鎖時段對齊（治療室不重複選同人）。"""
+    grid = month_grid("2026-08", _TEMPLATE, set())
+    locked = {"2026-08-03": {"上午": {TREATMENT: ["C"], "101": ["A"], "103": ["B"]}}}
+    inp = DaySolveInput(ym="2026-08", grid=grid, pgy_roster=["A", "B", "C"],
+                        clerk_batches=[], locked=locked)
+    day_slots, _log, _w = month_solve_day(inp)
+    assert day_slots["2026-08-03"]["上午"] == locked["2026-08-03"]["上午"]  # 原樣
+    # C 已在鎖定時段值治療室(tx=1) → 同日下午治療室改選 A/B（tx 公平）
+    assert day_slots["2026-08-03"]["下午"][TREATMENT][0] in ("A", "B")
+
+
 def test_month_solve_day_biopsy_missed_warning():
     grid = month_grid("2026-08", _TEMPLATE, set())
     batch = ClerkBatch("b1", date(2026, 8, 3), ["1", "2", "3"])
