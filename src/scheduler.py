@@ -54,6 +54,7 @@ from cmuh_common import updater as _updater_mod  # noqa: E402
 # 排班業務層與 UI（純 stdlib + cmuh_common；ortools 於「自動排班」時才 lazy 裝）。
 from cmuh_common.roster.service import RosterService  # noqa: E402
 from cmuh_common.roster.storage import RosterStorage  # noqa: E402
+from cmuh_common.roster.ui.day_tab import DayScheduleTab  # noqa: E402
 from cmuh_common.roster.ui.duty import CalendarDutyTab  # noqa: E402
 from cmuh_common.roster.ui.settings import SettingsTab  # noqa: E402
 
@@ -124,8 +125,8 @@ class ScheduleApp:
             ("設定", self._build_settings),
             ("R 排班", lambda c: self._build_duty(c, "r")),
             ("VS 排班", lambda c: self._build_duty(c, "vs")),
-            ("PGY", lambda c: self._build_placeholder(c, "PGY 排班（Phase 3）")),
-            ("見習 Clerk", lambda c: self._build_placeholder(c, "Clerk 排班（Phase 3）")),
+            ("PGY", lambda c: self._build_day(c, "pgy")),
+            ("見習 Clerk", lambda c: self._build_day(c, "clerk")),
         ]
         for name, builder in specs:
             cont = ttk.Frame(nb)
@@ -162,6 +163,11 @@ class ScheduleApp:
         tab = CalendarDutyTab(cont, self.service, scope, self)
         tab.pack(fill="both", expand=True)
         self._duty_tabs[scope] = tab
+        return tab
+
+    def _build_day(self, cont, scope):
+        tab = DayScheduleTab(cont, self.service, scope, self)
+        tab.pack(fill="both", expand=True)
         return tab
 
     def _build_placeholder(self, cont, text):

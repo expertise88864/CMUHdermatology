@@ -9,6 +9,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from cmuh_common.roster.ui.common import (  # noqa: E402
     MEMBER_PALETTE, calendar_matrix, member_color, next_in_cycle, ym_add, ym_of,
 )
+from cmuh_common.roster.ui.day_tab import _rooms_summary, _split_codes  # noqa: E402
+
+
+def test_split_codes_all_delimiters():
+    assert _split_codes("A、B") == ["A", "B"]            # 頓號（畫面顯示用）
+    assert _split_codes("A, B，C 、D") == ["A", "B", "C", "D"]
+    assert _split_codes("") == [] and _split_codes(None) == []
+
+
+def test_rooms_summary_handles_nonnumeric_rooms():
+    slots = {"治療室": ["A"], "A101": ["B"], "診1": ["C", "D"], "放假": ["E"]}
+    s = _rooms_summary(slots)
+    assert "A101:B" in s and "診1:CD" in s               # 非數字房號也要顯示
+    assert "治療室" not in s and "放假" not in s          # 特殊格不算房
 
 
 def test_ym_add_wraps_year():

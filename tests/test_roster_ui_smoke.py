@@ -25,8 +25,10 @@ pytestmark = pytest.mark.skipif(not _HAS_TK, reason="無可用顯示器/或 tk �
 
 from cmuh_common.roster.service import RosterService  # noqa: E402
 from cmuh_common.roster.storage import RosterStorage  # noqa: E402
+from cmuh_common.roster.ui import day_tab as day_mod  # noqa: E402
 from cmuh_common.roster.ui import duty as duty_mod  # noqa: E402
 from cmuh_common.roster.ui import settings as settings_mod  # noqa: E402
+from cmuh_common.roster.ui.day_tab import DayScheduleTab  # noqa: E402
 from cmuh_common.roster.ui.duty import CalendarDutyTab  # noqa: E402
 from cmuh_common.roster.ui.settings import SettingsTab  # noqa: E402
 
@@ -46,7 +48,7 @@ def root():
 
 @pytest.fixture(autouse=True)
 def noblock(monkeypatch):
-    for mod in (duty_mod, settings_mod):
+    for mod in (duty_mod, settings_mod, day_mod):
         monkeypatch.setattr(mod.messagebox, "askyesno", lambda *a, **k: True)
         monkeypatch.setattr(mod.messagebox, "showwarning", lambda *a, **k: None)
         monkeypatch.setattr(mod.messagebox, "showerror", lambda *a, **k: None)
@@ -59,10 +61,12 @@ def _svc(tmp_path):
         "r_members": [{"id": "A", "name": "甲", "fixed_weekday": 2},
                       {"id": "B", "name": "乙"}],
         "vs_members": [{"id": "D", "name": "D"}],
+        "pgy_members": [{"id": "A"}, {"id": "B"}],
         "points": {"weekday": 1, "weekend": 2, "national_holiday": 1},
         "duty_range_soft": [9, 11],
     })
     st.save_holiday_duty({"r": {date(2026, 8, 15): "A"}, "vs": {}})
+    st.save_clinic_template({"template": {"0": {"上午": [{"room": "101"}]}}})
     return RosterService(st)
 
 
@@ -154,3 +158,86 @@ def test_leave_editor_saves(root, tmp_path):
     ed._save()
     assert svc.build_context("r", YM).leaves["A"] == {
         date(2026, 8, 10), date(2026, 8, 11)}
+
+
+# ─── PGY/Clerk 日排班分頁 ────────────────────────────────────────────────────
+def test_pgy_day_tab_builds_and_roster(root, tmp_path):
+    svc = _svc(tmp_path)
+    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    assert "2026-08-03|上午" in tab._tree.get_children()   # 週一有工作日列
+    assert tab._roster_members() == [{"id": "A", "name": ""},
+                                     {"id": "B", "name": ""}]
+
+
+def test_clerk_day_tab_builds(root, tmp_path):
+    svc = _svc(tmp_path)
+    tab = DayScheduleTab(root, svc, "clerk", _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    assert tab._tree.get_children()
+
+
+def test_day_tab_auto_accept_flow(root, tmp_path):
+    svc = _svc(tmp_path)
+    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    ds, _log, _w = svc.run_day_solve(YM)
+    svc.accept_day_solution(YM, ds)
+    tab.refresh()                                          # 重繪不炸
+    mon = svc.storage.load_month(YM)["day_slots"]["2026-08-03"]["上午"]
+    assert mon.get("治療室")                               # 週一早有治療室 PGY
+
+
+def test_day_edit_dialog_saves(root, tmp_path):
+    svc = _svc(tmp_path)
+    dlg = day_mod._DayEditDialog(root, svc, YM, date(2026, 8, 3), "上午",
+                                 lambda: None)
+    root.update()
+    dlg._entries["治療室"].delete(0, "end")
+    dlg._entries["治療室"].insert(0, "A")
+    dlg._save()
+    got = svc.storage.load_month(YM)["day_slots"]["2026-08-03"]["上午"]["治療室"]
+    assert got == ["A"]
+
+
+def test_day_tab_finalize_disables_edit_controls(root, tmp_path):
+    svc = _svc(tmp_path)
+    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    tab._final_var.set(True)
+    tab._on_finalize()
+    assert str(tab._auto_btn["state"]) == "disabled"
+    assert str(tab._leave_btn["state"]) == "disabled"
+    tab._edit_pgy_roster()                                 # 定案後為 no-op，不炸
+    tab._on_leave()
+    assert svc.storage.load_month(YM)["finalized"] is True
+
+
+def test_day_edit_preserves_multi_person_on_unchanged_save(root, tmp_path):
+    """開啟含多人的格、原封不動存 → 不得被 `、` 併成單一 id（codex P2）。"""
+    svc = _svc(tmp_path)
+    svc.set_day_slot(YM, date(2026, 8, 3), "上午", "101", ["A", "B"])
+    dlg = day_mod._DayEditDialog(root, svc, YM, date(2026, 8, 3), "上午",
+                                 lambda: None)
+    root.update()
+    dlg._save()                                            # 不改直接存
+    got = svc.storage.load_month(YM)["day_slots"]["2026-08-03"]["上午"]["101"]
+    assert got == ["A", "B"]
+
+
+def test_day_edit_dialog_can_clear_stale_room(root, tmp_path):
+    """已從模板移除/關閉的房號殘留指派 → 編輯視窗仍要能清除（codex P2）。"""
+    svc = _svc(tmp_path)
+    svc.set_day_slot(YM, date(2026, 8, 3), "上午", "999", ["A"])   # 非模板房
+    dlg = day_mod._DayEditDialog(root, svc, YM, date(2026, 8, 3), "上午",
+                                 lambda: None)
+    root.update()
+    assert "999" in dlg._entries                           # 殘留房也有欄位
+    dlg._entries["999"].delete(0, "end")                   # 清空
+    dlg._save()
+    slots = svc.storage.load_month(YM)["day_slots"]["2026-08-03"]["上午"]
+    assert "999" not in slots

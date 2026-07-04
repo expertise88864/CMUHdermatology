@@ -27,7 +27,7 @@ _ORTOOLS_DEP = [("ortools==9.15.6755", "ortools")]
 class LeaveEditor(tk.Toplevel):
     """月曆點選式編輯請假/指定（mode="leave"/"must"）。點日期 toggle，確定即存。"""
 
-    def __init__(self, master, service, scope, ym, mode):
+    def __init__(self, master, service, scope, ym, mode, members=None):
         super().__init__(master)
         self.service = service
         self.scope = scope
@@ -36,7 +36,10 @@ class LeaveEditor(tk.Toplevel):
         self.title(f"{'請假' if mode == 'leave' else '一定要值班'}編輯 · {ym}")
         self.resizable(False, False)
         self.transient(master)
-        self._members = service.storage.load_config().get(f"{scope}_members") or []
+        # members 可由呼叫端指定（PGY 當月人員 / Clerk 梯次成員）；否則抓 config
+        self._members = (members if members is not None
+                         else service.storage.load_config().get(f"{scope}_members")
+                         or [])
         self._selected: set = set()
         self._buttons: dict = {}
 
@@ -86,9 +89,11 @@ class LeaveEditor(tk.Toplevel):
 
     def _load_member(self) -> None:
         mid = self._member_id()
-        ctx = self.service.build_context(self.scope, self.ym)
-        src = ctx.leaves if self.mode == "leave" else ctx.must_duty
-        self._selected = set(src.get(mid) or set())
+        if self.mode == "leave":                     # 請假：任一 scope 皆可
+            self._selected = set(self.service.get_leaves(self.scope, self.ym, mid))
+        else:                                        # 指定值班：僅 R/VS 有此概念
+            ctx = self.service.build_context(self.scope, self.ym)
+            self._selected = set(ctx.must_duty.get(mid) or set())
         self._refresh_buttons()
 
     def _toggle(self, d: date) -> None:

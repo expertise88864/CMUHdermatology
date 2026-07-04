@@ -190,11 +190,13 @@ class RosterService:
         """build_day_input → month_solve_day。回 (day_slots, log, warnings)，不落地。"""
         return month_solve_day(self.build_day_input(ym))
 
-    def accept_day_solution(self, ym: str, day_slots: dict) -> None:
+    def accept_day_solution(self, ym: str, day_slots: dict,
+                            report: "str | None" = None) -> None:
         month = self.storage.load_month(ym)
         if month.get("finalized"):
             raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能套用")
         month["day_slots"] = day_slots
+        month["day_report"] = report or ""      # 供「報告」鈕顯示落地當下的報告
         self.storage.save_month(ym, month)
 
     def set_day_slot(self, ym: str, d: date, session: str, slot: str,
@@ -216,6 +218,18 @@ class RosterService:
         month = self.storage.load_month(ym)
         month["pgy_month_roster"] = [str(c) for c in codes]
         self.storage.save_month(ym, month)
+
+    def get_leaves(self, scope: str, ym: str, member_id: str) -> set:
+        """讀某人某月請假日集合（適用任一 scope：r/vs/pgy/clerk）。"""
+        month = self.storage.load_month(ym)
+        raw = ((month.get("leaves") or {}).get(scope) or {}).get(member_id) or []
+        out: set = set()
+        for iso in raw:
+            try:
+                out.add(date.fromisoformat(iso))
+            except (ValueError, TypeError):
+                continue
+        return out
 
     # ── 求解與落地 ──────────────────────────────────────────────────────
     def run_solve(self, scope: str, ym: str,
