@@ -7330,6 +7330,10 @@ class AutomationApp:
         self._dnd_suppressed_count = 0
         self.notify_dnd_start_time_var = tk.StringVar(value=str(self.threshold_settings.get("notify_dnd_start_time", "00:00")))
         self.notify_dnd_end_time_var = tk.StringVar(value=str(self.threshold_settings.get("notify_dnd_end_time", "08:00")))
+        # [2026-07-04 user] 門診人數/止掛監測是否連半夜(00–07 點)也跑。預設 True＝
+        # 全天候(寄止掛信/刷新不受 reg64 半夜暫停限制)；關閉才恢復舊的夜間暫停。
+        self.clinic_night_monitor_var = tk.BooleanVar(
+            value=bool(self.threshold_settings.get("clinic_night_monitor", True)))
         # F8 快速輸入文字 (預設 dtderm25，可在設定頁修改)
         self.quick_text_f8_var = tk.StringVar(value=str(self.threshold_settings.get("quick_text_f8", F8_QUICK_TEXT_DEFAULT)))
         self._live_count_samples = defaultdict(lambda: deque(maxlen=12))
@@ -8343,6 +8347,7 @@ class AutomationApp:
         self.notify_dnd_end_time_var.set(dnd_end)
         self.threshold_settings['notify_dnd_start_time'] = dnd_start
         self.threshold_settings['notify_dnd_end_time'] = dnd_end
+        self.threshold_settings['clinic_night_monitor'] = bool(self.clinic_night_monitor_var.get())
         # F8 快速輸入文字 — 空字串不存（讓 _load_f8_quick_text 回 default）
         try:
             qt = str(self.quick_text_f8_var.get())
@@ -8361,7 +8366,18 @@ class AutomationApp:
         self.threshold_settings['alert_email_recipients'] = list(self.alert_email_recipients)
 
         _atomic_write_json(get_conf_path('threshold_settings.json'), self.threshold_settings)
-        
+
+        # [2026-07-04] 設定變更後立即讓門診監測套用新的「半夜監測」設定：取消可能仍
+        # 停在 07:00 的排程、立刻重跑一次（否則在 00–07 點重新開啟時要等到 07:00）。
+        try:
+            if getattr(self, "clinic_loop_id", None) is not None:
+                self.root.after_cancel(self.clinic_loop_id)
+                self.clinic_loop_id = None
+            if hasattr(self, "_update_clinic_lights_loop"):
+                self.clinic_loop_id = self.root.after(1000, self._update_clinic_lights_loop)
+        except Exception:
+            logging.debug("設定變更後重啟門診監測迴圈失敗", exc_info=True)
+
         new_doctors_list = []
         for item_id in self.doctors_tree.get_children():
             item = self.doctors_tree.item(item_id)
@@ -9265,7 +9281,10 @@ class AutomationApp:
             self._clinic_dynamic_refresh_seconds = CLINIC_LIGHT_REFRESH_SECONDS
 
         now_gate = datetime.now()
-        if _reg64_clinic_quiet_hours(now_gate):
+        # [2026-07-04 user] 預設全天候監測；只有關閉「半夜監測」時才在 00–07 點暫停。
+        _mv = getattr(self, "clinic_night_monitor_var", None)
+        _monitor_night = _mv.get() if _mv is not None else True
+        if not _monitor_night and _reg64_clinic_quiet_hours(now_gate):
             nxt = _reg64_next_allowed_fetch_time(now_gate)
             delay_ms = max(int((nxt - datetime.now()).total_seconds() * 1000), 5_000)
             self.clinic_loop_id = self.root.after(delay_ms, self._update_clinic_lights_loop)
@@ -11653,6 +11672,8 @@ class AutomationApp:
         ttk.Entry(dnd_row, width=6, textvariable=self.notify_dnd_end_time_var, justify="center").pack(side=tk.LEFT, padx=(2, 2))
         ttk.Label(dnd_row, text="(HH:MM，00:00-24:00)").pack(side=tk.LEFT, padx=(4, 0))
         ttk.Label(mode_frame, text="勿擾時段只記錄狀態與日誌，不跳彈窗。", foreground="gray", style="Small.TLabel").pack(anchor="w")
+        ttk.Checkbutton(mode_frame, text="半夜(00–07 點)也監測門診並寄止掛提醒信",
+                        variable=self.clinic_night_monitor_var).pack(anchor="w", pady=(4, 0))
         
         # 在 _create_settings_tab 內部
         def on_mode_change():
