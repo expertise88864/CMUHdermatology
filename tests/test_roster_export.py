@@ -35,6 +35,41 @@ def _svc(tmp_path):
     return RosterService(st)
 
 
+# ─── 定案 PDF 留底 ───────────────────────────────────────────────────────────
+def test_build_finalize_pdf_sections(tmp_path):
+    svc = _svc(tmp_path)
+    m = svc.storage.load_month(YM)
+    m["report_r"] = "RR報告"
+    m["report_vs"] = "VV報告"
+    m["day_report"] = "DD日報告"
+    svc.storage.save_month(YM, m)
+    secs = svc.build_finalize_pdf_sections(YM)
+    titles = [t for t, _ in secs]
+    bodies = [b for _, b in secs]
+    assert any("定案留底" in t for t in titles)          # 封面
+    assert "RR報告" in bodies and "VV報告" in bodies and "DD日報告" in bodies
+
+
+def test_archive_finalize_pdf_writes_pdf(tmp_path):
+    pytest.importorskip("reportlab")
+    svc = _svc(tmp_path)
+    m = svc.storage.load_month(YM)
+    m["report_r"] = "定案內容\n第二行"
+    svc.storage.save_month(YM, m)
+    path = svc.archive_finalize_pdf(YM)
+    assert path.endswith("115年08月定案.pdf") and os.path.exists(path)
+    with open(path, "rb") as f:
+        assert f.read(4) == b"%PDF"                      # 真的是 PDF
+
+
+def test_export_pdf_empty_sections_no_crash(tmp_path):
+    pytest.importorskip("reportlab")
+    from cmuh_common.roster import export_pdf
+    out = tmp_path / "empty.pdf"
+    export_pdf.export(str(out), [])
+    assert out.exists() and out.read_bytes()[:4] == b"%PDF"
+
+
 # ─── 純函式 ─────────────────────────────────────────────────────────────────
 def test_build_export_structure(tmp_path):
     data = _svc(tmp_path).build_export(YM)

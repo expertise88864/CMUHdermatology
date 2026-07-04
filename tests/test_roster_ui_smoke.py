@@ -53,6 +53,9 @@ def noblock(monkeypatch):
         monkeypatch.setattr(mod.messagebox, "showwarning", lambda *a, **k: None)
         monkeypatch.setattr(mod.messagebox, "showerror", lambda *a, **k: None)
         monkeypatch.setattr(mod.messagebox, "showinfo", lambda *a, **k: None)
+    # 定案 PDF 走背景執行緒 + Tk after，測試無 mainloop → 換成 no-op（PDF 另檔測）
+    for mod in (duty_mod, day_mod):
+        monkeypatch.setattr(mod, "archive_finalize_pdf_async", lambda *a, **k: None)
 
 
 def _svc(tmp_path):

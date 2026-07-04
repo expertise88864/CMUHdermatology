@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from datetime import date
 
@@ -28,6 +29,7 @@ from cmuh_common.roster.clinic_grid import month_grid
 from cmuh_common.roster.ledger import settle_month
 from cmuh_common.roster.model import (
     ClerkBatch, Member, RosterParams, SolveContext, batches_covering, day_point,
+    roc,
 )
 from cmuh_common.roster.solve_day import DaySolveInput, month_solve_day
 from cmuh_common.roster.report import build_report
@@ -417,6 +419,33 @@ class RosterService:
         month["finalized"] = bool(on)
         self._audit(month, "-", ym, None, f"finalized={bool(on)}", "finalize")
         self.storage.save_month(ym, month, force=True)
+
+    # ── 定案 PDF 留底 ───────────────────────────────────────────────────
+    def build_finalize_pdf_sections(self, ym: str) -> list:
+        """組裝定案 PDF 內容：封面 + R/VS/日排班決策報告（純資料，可測）。"""
+        month = self.storage.load_month(ym)
+        y, m = int(ym[:4]), int(ym[5:7])
+        sections = [(f"{roc(y)}年{m:02d}月 排班定案留底",
+                     f"月份：{ym}\n產生時間：{_now()}\n"
+                     f"（本檔為定案當下的排班快照，供存證留底）")]
+        for scope, label in (("r", "R 排班決策報告"), ("vs", "VS 排班決策報告")):
+            rpt = month.get(f"report_{scope}")
+            if rpt:
+                sections.append((label, rpt))
+        if month.get("day_report"):
+            sections.append(("PGY / Clerk 日排班報告", month["day_report"]))
+        return sections
+
+    def archive_finalize_pdf(self, ym: str) -> str:
+        """把該月定案排班報告輸出成 PDF 存到 <roster>/finalized/。回傳路徑。
+        reportlab 未安裝 → RuntimeError（呼叫端 UI 負責 lazy 安裝後重試）。"""
+        from cmuh_common.roster import export_pdf
+        y, m = int(ym[:4]), int(ym[5:7])
+        out_dir = os.path.join(self.storage.base_dir, "finalized")
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"{roc(y)}年{m:02d}月定案.pdf")
+        export_pdf.export(path, self.build_finalize_pdf_sections(ym))
+        return path
 
     # ── 驗證（不求解）────────────────────────────────────────────────────
     def quick_validate(self, scope: str, ym: str) -> list:

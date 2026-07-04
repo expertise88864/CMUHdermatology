@@ -2,6 +2,8 @@
 """排班 UI 的純函式與共用小元件（純函式可獨立測試，不需顯示器）。"""
 from __future__ import annotations
 
+import logging
+import threading
 import tkinter as tk
 from datetime import date
 from tkinter import ttk
@@ -116,3 +118,31 @@ class StatusBar(ttk.Frame):
 
     def set(self, text: str) -> None:
         self._var.set(text)
+
+
+def archive_finalize_pdf_async(parent, service, ym) -> None:
+    """定案後於背景 lazy 安裝 reportlab 並輸出定案 PDF 留底，完成以 messagebox 告知。
+    非阻塞（背景執行緒）；reportlab 已在 → 直接產生；未安裝 → 下載後產生。"""
+    from tkinter import messagebox
+
+    from cmuh_common.deps_runtime import ensure_dependencies
+
+    def work():
+        err, path = "", ""
+        try:
+            try:
+                import reportlab  # noqa: F401,PLC0415
+            except ImportError:
+                ensure_dependencies([("reportlab", "reportlab")])
+            path = service.archive_finalize_pdf(ym)
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            logging.exception("[roster.ui] 定案 PDF 留底失敗")
+            err = str(e) or "已取消或安裝失敗"
+
+        def done():
+            if err:
+                messagebox.showwarning("定案 PDF 留底", f"PDF 留底未完成：\n{err}")
+            else:
+                messagebox.showinfo("定案 PDF 留底", f"已輸出定案留底 PDF：\n{path}")
+        parent.after(0, done)
+    threading.Thread(target=work, name="finalize-pdf", daemon=True).start()

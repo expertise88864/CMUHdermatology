@@ -16,7 +16,9 @@ from tkinter import messagebox, ttk
 
 from cmuh_common.roster.model import ClerkBatch, batches_covering
 from cmuh_common.roster.solve_day import BIOPSY, REST, TREATMENT
-from cmuh_common.roster.ui.common import MonthSelector, StatusBar
+from cmuh_common.roster.ui.common import (
+    MonthSelector, StatusBar, archive_finalize_pdf_async,
+)
 from cmuh_common.roster.ui.duty import LeaveEditor
 
 _WD = "一二三四五六日"
@@ -306,6 +308,8 @@ class DayScheduleTab(ttk.Frame):
             return
         self._finalized = on
         self._apply_finalized_state()
+        if on:                              # 定案 → 背景輸出 PDF 留底
+            archive_finalize_pdf_async(self, self.service, self.app.ym)
 
     def _apply_finalized_state(self) -> None:
         state = "disabled" if self._finalized else "normal"

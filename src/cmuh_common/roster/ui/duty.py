@@ -16,8 +16,8 @@ from tkinter import filedialog, messagebox, ttk
 from cmuh_common.deps_runtime import ensure_dependencies
 from cmuh_common.roster.model import day_point, is_weekend
 from cmuh_common.roster.ui.common import (
-    WEEKDAY_HEADERS, MonthSelector, StatusBar, calendar_matrix, fg_for,
-    member_color, next_in_cycle,
+    WEEKDAY_HEADERS, MonthSelector, StatusBar, archive_finalize_pdf_async,
+    calendar_matrix, fg_for, member_color, next_in_cycle,
 )
 
 _SCOPE_TITLE = {"r": "R 排班", "vs": "VS 排班"}
@@ -548,6 +548,8 @@ class CalendarDutyTab(ttk.Frame):
         self._finalized = on
         self._apply_finalized_state()
         self.refresh()
+        if on:                              # 定案 → 背景輸出 PDF 留底
+            archive_finalize_pdf_async(self, self.service, self.app.ym)
 
     def _apply_finalized_state(self) -> None:
         state = "disabled" if self._finalized else "normal"
