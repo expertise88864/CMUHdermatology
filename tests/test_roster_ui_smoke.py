@@ -91,6 +91,52 @@ def test_settings_tab_builds_and_reloads(root, tmp_path):
     assert svc.storage.load_config()["duty_range_soft"] == [9, 11]
 
 
+def test_settings_phase3_blocks(root, tmp_path):
+    svc = _svc(tmp_path)                                # _svc 已存門診模板(101)
+    svc.storage.save_clerk_batches(
+        [{"id": "b1", "start_monday": "2026-08-03", "members": ["1", "2"]}])
+    tab = SettingsTab(root, svc)
+    tab.pack(fill="both", expand=True)
+    root.update()
+    assert tab._tpl_tree.get_children()                # 門診模板有 101 那筆
+    assert "b1" in tab._batch_tree.get_children()       # Clerk 梯次有 b1
+    # PGY 預設代號存檔（頓號分隔）
+    tab._pgy_entry.delete(0, "end")
+    tab._pgy_entry.insert(0, "X、Y")
+    tab._save_pgy_defaults()
+    assert [m["id"] for m in svc.storage.load_config()["pgy_members"]] == ["X", "Y"]
+    # 刪除門診模板列
+    tab._tpl_tree.selection_set(tab._tpl_tree.get_children()[0])
+    tab._template_del()
+    assert not tab._tpl_tree.get_children()
+
+
+def test_biopsy_seed_from_prev_batch(root, tmp_path):
+    """新梯次切片格網預設複製前一梯次（依相對週幾對齊）。"""
+    svc = _svc(tmp_path)
+    svc.storage.save_clerk_batches(
+        [{"id": "b1", "start_monday": "2026-08-03", "members": ["1"]}])
+    svc.storage.save_biopsy_grid({"b1": {"2026-08-03": {"上午": True}}})  # 梯1 週一早開
+    tab = SettingsTab(svc and root, svc)
+    root.update()
+    b2 = {"id": "b2", "start_monday": "2026-08-17", "members": ["2"]}
+    tab._seed_biopsy_from_prev(
+        b2, svc.storage.load_clerk_batches() + [b2])
+    g = svc.storage.load_biopsy_grid()
+    assert g["b2"]["2026-08-17"]["上午"] is True     # 梯2 週一(8/17)早對齊複製
+
+
+def test_shift_biopsy_grid_on_start_change(root, tmp_path):
+    """改梯次起始日 → 切片格網整組平移，不遺失（codex P2）。"""
+    svc = _svc(tmp_path)
+    svc.storage.save_biopsy_grid({"b1": {"2026-08-03": {"上午": True}}})
+    tab = SettingsTab(root, svc)
+    root.update()
+    tab._shift_biopsy_grid("b1", "2026-08-03", "2026-08-10")   # 後移一週
+    g = svc.storage.load_biopsy_grid()
+    assert "2026-08-03" not in g["b1"] and g["b1"]["2026-08-10"]["上午"] is True
+
+
 def test_duty_tab_manual_edit_and_lock(root, tmp_path):
     svc = _svc(tmp_path)
     tab = CalendarDutyTab(root, svc, "r", _app())

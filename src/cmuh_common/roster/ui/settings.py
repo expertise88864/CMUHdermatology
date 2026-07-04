@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import tkinter as tk
-from datetime import date
+from datetime import date, datetime, timedelta
 from tkinter import messagebox, ttk
 
 from cmuh_common.roster.calendar_colors import week_colors_for_year
@@ -114,6 +114,9 @@ class SettingsTab(ttk.Frame):
         self._build_members("vs", "VS 主治醫師名單", with_level=False, with_wd=False)
         self._build_holiday_table()
         self._build_params()
+        self._build_pgy_defaults()
+        self._build_clinic_template()
+        self._build_clerk_batches()
         self._build_week_colors()
         self._build_ledger_view()
 
@@ -342,6 +345,223 @@ class SettingsTab(ttk.Frame):
             return                                   # 輸入中的暫態非數字
         self._save_cfg()
 
+    # ── PGY 預設代號 ─────────────────────────────────────────────────────
+    def _build_pgy_defaults(self) -> None:
+        lf = ttk.LabelFrame(self._body, text="PGY 預設代號（每月可於 PGY 分頁再調整）",
+                            padding=8)
+        lf.pack(fill="x", padx=10, pady=6)
+        self._pgy_entry = ttk.Entry(lf, width=40)
+        self._pgy_entry.insert(0, "、".join(
+            str(mm.get("id")) for mm in (self._cfg.get("pgy_members") or [])))
+        self._pgy_entry.pack(side="left", padx=(0, 6))
+        ttk.Button(lf, text="儲存", command=self._save_pgy_defaults
+                   ).pack(side="left")
+
+    def _save_pgy_defaults(self) -> None:
+        codes = [c.strip() for c in self._pgy_entry.get().replace("，", ",")
+                 .replace("、", ",").split(",") if c.strip()]
+        self._cfg["pgy_members"] = [{"id": c} for c in codes]
+        self._save_cfg()
+
+    # ── 門診週模板（開診格網來源）─────────────────────────────────────────
+    def _build_clinic_template(self) -> None:
+        lf = ttk.LabelFrame(
+            self._body, text="門診週模板（週幾×時段開哪些診間；自費診勾選後不排學生）",
+            padding=8)
+        lf.pack(fill="x", padx=10, pady=6)
+        cols = ("wd", "session", "room", "doctor", "paid")
+        self._tpl_tree = ttk.Treeview(lf, columns=cols, show="headings", height=5)
+        for c, t, w in (("wd", "週幾", 50), ("session", "時段", 60),
+                        ("room", "診間", 70), ("doctor", "醫師", 80),
+                        ("paid", "自費", 50)):
+            self._tpl_tree.heading(c, text=t)
+            self._tpl_tree.column(c, width=w, anchor="center")
+        self._tpl_tree.pack(fill="x")
+        bar = ttk.Frame(lf); bar.pack(fill="x", pady=(6, 0))
+        ttk.Button(bar, text="新增", command=self._template_add).pack(side="left")
+        ttk.Button(bar, text="刪除選取", command=self._template_del
+                   ).pack(side="left", padx=4)
+        self._reload_template()
+
+    def _load_template(self) -> dict:
+        return self.service.storage.load_clinic_template()
+
+    def _reload_template(self) -> None:
+        self._tpl_tree.delete(*self._tpl_tree.get_children())
+        tpl = (self._load_template().get("template") or {})
+        for wd in sorted(tpl):
+            for session in ("上午", "下午"):
+                for i, e in enumerate(tpl[wd].get(session) or []):
+                    self._tpl_tree.insert("", "end", iid=f"{wd}|{session}|{i}",
+                                          values=(
+                        _WD_CHOICES[int(wd) + 1], session, e.get("room", ""),
+                        e.get("doctor", ""), "✓" if e.get("is_self_paid") else ""))
+
+    def _template_add(self) -> None:
+        dlg = _ClinicRoomDialog(self)
+        if not dlg.result:
+            return
+        wd, session, room, doctor, paid = dlg.result
+        data = self._load_template()
+        tpl = data.setdefault("template", {})
+        entry = {"room": room, "doctor": doctor}
+        if paid:
+            entry["is_self_paid"] = True
+        tpl.setdefault(str(wd), {}).setdefault(session, []).append(entry)
+        self.service.storage.save_clinic_template(data)
+        self._reload_template()
+        self._notify()
+
+    def _template_del(self) -> None:
+        sel = self._tpl_tree.selection()
+        if not sel or "|" not in sel[0]:
+            return
+        wd, session, idx = sel[0].split("|")
+        data = self._load_template()
+        lst = ((data.get("template") or {}).get(wd) or {}).get(session) or []
+        try:
+            lst.pop(int(idx))
+        except (ValueError, IndexError):
+            return
+        self.service.storage.save_clinic_template(data)
+        self._reload_template()
+        self._notify()
+
+    # ── Clerk 梯次（兩週一梯，起始必週一）+ 切片室開放格網 ──────────────────
+    def _build_clerk_batches(self) -> None:
+        lf = ttk.LabelFrame(self._body, text="Clerk 梯次（兩週一梯，起始必為週一）",
+                            padding=8)
+        lf.pack(fill="x", padx=10, pady=6)
+        cols = ("start", "members")
+        self._batch_tree = ttk.Treeview(lf, columns=cols, show="headings", height=4)
+        self._batch_tree.heading("start", text="起始週一")
+        self._batch_tree.heading("members", text="成員代號")
+        self._batch_tree.column("start", width=110, anchor="center")
+        self._batch_tree.column("members", width=200, anchor="w")
+        self._batch_tree.pack(fill="x")
+        bar = ttk.Frame(lf); bar.pack(fill="x", pady=(6, 0))
+        ttk.Button(bar, text="新增", command=self._batch_add).pack(side="left")
+        ttk.Button(bar, text="編輯", command=self._batch_edit
+                   ).pack(side="left", padx=4)
+        ttk.Button(bar, text="刪除", command=self._batch_del).pack(side="left")
+        ttk.Button(bar, text="切片室開放…", command=self._batch_biopsy
+                   ).pack(side="left", padx=(12, 0))
+        self._reload_batches()
+
+    @staticmethod
+    def _batch_key(b: dict) -> str:
+        """樹列 iid 與查找共用的鍵（id 缺失的舊資料退回 start_monday，前後一致）。"""
+        return str(b.get("id") or b.get("start_monday") or "")
+
+    def _reload_batches(self) -> None:
+        self._batch_tree.delete(*self._batch_tree.get_children())
+        for b in self.service.storage.load_clerk_batches():
+            self._batch_tree.insert("", "end", iid=self._batch_key(b),
+                                    values=(b.get("start_monday", ""),
+                                            "、".join(b.get("members") or [])))
+
+    def _batch_add(self) -> None:
+        dlg = _ClerkBatchDialog(self, {})
+        if dlg.result:
+            batches = self.service.storage.load_clerk_batches()
+            batches.append(dlg.result)
+            self.service.storage.save_clerk_batches(batches)
+            self._seed_biopsy_from_prev(dlg.result, batches)   # 預設複製上一梯次模式
+            self._reload_batches()
+            self._notify()
+
+    def _seed_biopsy_from_prev(self, new_batch: dict, batches: list) -> None:
+        """新梯次切片格網預設＝複製「前一梯次」的模式（依相對週幾對齊，C3 定案）。"""
+        grid_all = self.service.storage.load_biopsy_grid()
+        if grid_all.get(new_batch["id"]):
+            return                                   # 已有設定就不覆蓋
+        prevs = [b for b in batches
+                 if b.get("id") and b["id"] != new_batch["id"]
+                 and b.get("start_monday", "") < new_batch["start_monday"]]
+        if not prevs:
+            return
+        prev = max(prevs, key=lambda b: b["start_monday"])
+        prev_grid = grid_all.get(prev["id"]) or {}
+        if not prev_grid:
+            return
+        ns = date.fromisoformat(new_batch["start_monday"])
+        ps = date.fromisoformat(prev["start_monday"])
+        seeded: dict = {}
+        for i in range(14):                          # 相對第 i 天對齊（皆週一起 → 同週幾）
+            pg = prev_grid.get((ps + timedelta(days=i)).isoformat())
+            if pg:
+                seeded[(ns + timedelta(days=i)).isoformat()] = dict(pg)
+        if seeded:
+            grid_all[new_batch["id"]] = seeded
+            self.service.storage.save_biopsy_grid(grid_all)
+
+    def _batch_edit(self) -> None:
+        sel = self._batch_tree.selection()
+        if not sel:
+            return
+        batches = self.service.storage.load_clerk_batches()
+        cur = next((b for b in batches if self._batch_key(b) == sel[0]), None)
+        if cur is None:
+            return
+        old_start = cur.get("start_monday")
+        dlg = _ClerkBatchDialog(self, cur)
+        if dlg.result:
+            cur.update(dlg.result)
+            self.service.storage.save_clerk_batches(batches)
+            if cur.get("id") and cur.get("start_monday") != old_start:
+                self._shift_biopsy_grid(cur["id"], old_start, cur["start_monday"])
+            self._reload_batches()
+            self._notify()
+
+    def _shift_biopsy_grid(self, batch_id, old_start, new_start) -> None:
+        """改梯次起始日 → 把切片格網整組平移相同天數（否則新窗覆蓋不到、資料失效）。"""
+        grid_all = self.service.storage.load_biopsy_grid()
+        g = grid_all.get(batch_id)
+        if not g or not old_start or not new_start:
+            return
+        try:
+            delta = (date.fromisoformat(new_start)
+                     - date.fromisoformat(old_start)).days
+        except ValueError:
+            return
+        if delta == 0:
+            return
+        shifted: dict = {}
+        for iso, sess in g.items():
+            try:
+                nd = date.fromisoformat(iso) + timedelta(days=delta)
+            except ValueError:
+                continue
+            shifted[nd.isoformat()] = sess
+        grid_all[batch_id] = shifted
+        self.service.storage.save_biopsy_grid(grid_all)
+
+    def _batch_del(self) -> None:
+        sel = self._batch_tree.selection()
+        if not sel or not messagebox.askyesno("刪除梯次", f"刪除梯次 {sel[0]}？"):
+            return
+        batches = [b for b in self.service.storage.load_clerk_batches()
+                   if self._batch_key(b) != sel[0]]
+        self.service.storage.save_clerk_batches(batches)
+        self._reload_batches()
+        self._notify()
+
+    def _batch_biopsy(self) -> None:
+        sel = self._batch_tree.selection()
+        if not sel:
+            messagebox.showinfo("切片室開放", "請先選一個梯次")
+            return
+        batch = next((b for b in self.service.storage.load_clerk_batches()
+                      if self._batch_key(b) == sel[0]), None)
+        if not batch:
+            return
+        if not batch.get("id"):     # 切片格網以 id 為鍵（build_day_input 亦然）
+            messagebox.showinfo("切片室開放",
+                                "此梯次尚無 id，請先按「編輯」儲存一次以指派 id")
+            return
+        _BiopsyGridDialog(self, self.service, batch)
+        self._notify()
+
     # ── 區塊 5：行事曆週色（決定性自動套色，可手動覆蓋）─────────────────────
     def _build_week_colors(self) -> None:
         lf = ttk.LabelFrame(
@@ -446,3 +666,149 @@ class SettingsTab(ttk.Frame):
         self.service.storage.save_ledger(ledger)
         self._reload_ledger()
         logging.info("[roster.ui] 帳本歸零 %s/%s", scope, mid)
+
+
+# ─── Phase 3 設定用對話框 ───────────────────────────────────────────────────
+class _ClinicRoomDialog(tk.Toplevel):
+    """新增一筆門診格（週幾×時段×診間）。回填 self.result 或 None。"""
+    _WD5 = ("一", "二", "三", "四", "五")
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("新增門診格")
+        self.resizable(False, False)
+        self.transient(master)
+        self.result = None
+        pad = {"padx": 8, "pady": 4}
+        ttk.Label(self, text="週幾").grid(row=0, column=0, sticky="e", **pad)
+        self._wd = ttk.Combobox(self, width=8, state="readonly", values=self._WD5)
+        self._wd.current(0)
+        self._wd.grid(row=0, column=1, sticky="w", **pad)
+        ttk.Label(self, text="時段").grid(row=1, column=0, sticky="e", **pad)
+        self._sess = ttk.Combobox(self, width=8, state="readonly",
+                                  values=("上午", "下午"))
+        self._sess.current(0)
+        self._sess.grid(row=1, column=1, sticky="w", **pad)
+        ttk.Label(self, text="診間房號").grid(row=2, column=0, sticky="e", **pad)
+        self._room = ttk.Entry(self, width=12)
+        self._room.grid(row=2, column=1, sticky="w", **pad)
+        ttk.Label(self, text="醫師（選填）").grid(row=3, column=0, sticky="e", **pad)
+        self._doc = ttk.Entry(self, width=12)
+        self._doc.grid(row=3, column=1, sticky="w", **pad)
+        self._paid = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self, text="自費/美容診（不排學生）", variable=self._paid
+                        ).grid(row=4, column=0, columnspan=2, **pad)
+        bar = ttk.Frame(self)
+        bar.grid(row=5, column=0, columnspan=2, pady=8)
+        ttk.Button(bar, text="確定", command=self._ok).pack(side="left", padx=6)
+        ttk.Button(bar, text="取消", command=self.destroy).pack(side="left", padx=6)
+        self._room.focus_set()
+        self.grab_set()
+        self.wait_window(self)
+
+    def _ok(self):
+        room = self._room.get().strip()
+        if not room:
+            messagebox.showwarning("欄位", "請填診間房號", parent=self)
+            return
+        self.result = (self._wd.current(), self._sess.get(), room,
+                       self._doc.get().strip(), bool(self._paid.get()))
+        self.destroy()
+
+
+class _ClerkBatchDialog(tk.Toplevel):
+    """新增/編輯 Clerk 梯次（起始必週一）。回填 self.result 或 None。"""
+
+    def __init__(self, master, initial: dict):
+        super().__init__(master)
+        self.title("Clerk 梯次")
+        self.resizable(False, False)
+        self.transient(master)
+        self.result = None
+        self._initial_id = initial.get("id")     # 編輯時沿用原 id（切片格網掛在 id 上）
+        pad = {"padx": 8, "pady": 4}
+        ttk.Label(self, text="起始日（週一）YYYY-MM-DD").grid(
+            row=0, column=0, sticky="e", **pad)
+        self._start = ttk.Entry(self, width=14)
+        self._start.insert(0, initial.get("start_monday", ""))
+        self._start.grid(row=0, column=1, sticky="w", **pad)
+        ttk.Label(self, text="成員代號（頓/逗號分隔）").grid(
+            row=1, column=0, sticky="e", **pad)
+        self._members = ttk.Entry(self, width=22)
+        self._members.insert(0, "、".join(initial.get("members") or []))
+        self._members.grid(row=1, column=1, sticky="w", **pad)
+        bar = ttk.Frame(self)
+        bar.grid(row=2, column=0, columnspan=2, pady=8)
+        ttk.Button(bar, text="確定", command=self._ok).pack(side="left", padx=6)
+        ttk.Button(bar, text="取消", command=self.destroy).pack(side="left", padx=6)
+        self.grab_set()
+        self.wait_window(self)
+
+    def _ok(self):
+        raw = self._start.get().strip()
+        try:
+            d = date.fromisoformat(raw)
+        except ValueError:
+            messagebox.showwarning("日期", "請輸入 YYYY-MM-DD", parent=self)
+            return
+        if d.weekday() != 0:
+            messagebox.showwarning("起始日", "梯次起始必為週一", parent=self)
+            return
+        members = [c.strip() for c in self._members.get().replace("，", ",")
+                   .replace("、", ",").split(",") if c.strip()]
+        # 穩定唯一 id（不綁 start_monday）→ 同週一可多梯不撞、改起始日不斷開切片格網
+        bid = self._initial_id or ("b" + datetime.now().strftime("%Y%m%d%H%M%S%f"))
+        self.result = {"id": bid, "start_monday": raw, "members": members}
+        self.destroy()
+
+
+class _BiopsyGridDialog(tk.Toplevel):
+    """某梯次 14 天的切片室開放格網（週三下午恆關、週末不排）。存即生效。"""
+
+    def __init__(self, master, service, batch: dict):
+        super().__init__(master)
+        self.service = service
+        self.batch_id = batch.get("id")
+        start = date.fromisoformat(batch["start_monday"])
+        self.title(f"切片室開放 · 梯次 {self.batch_id}")
+        self.resizable(False, False)
+        self.transient(master)
+        cur = service.storage.load_biopsy_grid().get(self.batch_id) or {}
+        self._vars: dict = {}
+        ttk.Label(self, text="勾選＝該時段切片室開放（週三下午恆關）",
+                  padding=6).grid(row=0, column=0, columnspan=3)
+        row = 1
+        for i in range(14):
+            d = start + timedelta(days=i)
+            if d.weekday() >= 5:
+                continue
+            iso = d.isoformat()
+            ttk.Label(self, text=f"{d.month}/{d.day}"
+                      f"({'一二三四五六日'[d.weekday()]})").grid(
+                row=row, column=0, sticky="w", padx=8, pady=1)
+            sess_cur = cur.get(iso) or {}
+            for c, session in enumerate(("上午", "下午"), start=1):
+                wed_pm = (d.weekday() == 2 and session == "下午")
+                v = tk.BooleanVar(value=bool(sess_cur.get(session)) and not wed_pm)
+                ttk.Checkbutton(self, text=session, variable=v,
+                                state="disabled" if wed_pm else "normal").grid(
+                    row=row, column=c, padx=4)
+                if not wed_pm:
+                    self._vars[(iso, session)] = v
+            row += 1
+        bar = ttk.Frame(self)
+        bar.grid(row=row, column=0, columnspan=3, pady=8)
+        ttk.Button(bar, text="儲存", command=self._save).pack(side="left", padx=6)
+        ttk.Button(bar, text="取消", command=self.destroy).pack(side="left", padx=6)
+        self.grab_set()
+        self.wait_window(self)
+
+    def _save(self):
+        grid_all = self.service.storage.load_biopsy_grid()
+        newg: dict = {}
+        for (iso, session), v in self._vars.items():
+            if v.get():
+                newg.setdefault(iso, {})[session] = True
+        grid_all[self.batch_id] = newg
+        self.service.storage.save_biopsy_grid(grid_all)
+        self.destroy()
