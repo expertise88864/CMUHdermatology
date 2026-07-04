@@ -52,8 +52,8 @@ ensure_dependencies(REQUIRED_LIBS)
 from cmuh_common import updater as _updater_mod  # noqa: E402
 
 # 排班業務層與 UI（純 stdlib + cmuh_common；ortools 於「自動排班」時才 lazy 裝）。
+from cmuh_common.roster.gitsync_storage import GitSyncStorage  # noqa: E402
 from cmuh_common.roster.service import RosterService  # noqa: E402
-from cmuh_common.roster.storage import RosterStorage  # noqa: E402
 from cmuh_common.roster.ui.day_tab import DayScheduleTab  # noqa: E402
 from cmuh_common.roster.ui.duty import CalendarDutyTab  # noqa: E402
 from cmuh_common.roster.ui.settings import SettingsTab  # noqa: E402
@@ -105,7 +105,9 @@ class ScheduleApp:
         except Exception:
             logging.debug("套用視窗圖示失敗", exc_info=True)
 
-        self.storage = RosterStorage(os.path.join(get_settings_dir(), "roster"))
+        # GitSyncStorage：roster 目錄若是 git repo（使用者設好 private repo）→
+        # 開檔 pull、存檔背景 push 跨機同步；否則自動退化為純本機 storage。
+        self.storage = GitSyncStorage(os.path.join(get_settings_dir(), "roster"))
         self.service = RosterService(self.storage)
         today = date.today()
         self.ym = f"{today.year:04d}-{today.month:02d}"   # R/VS 共用月份
@@ -225,11 +227,16 @@ def main() -> None:
     except Exception:
         logging.debug("Tk callback exception hook 安裝失敗", exc_info=True)
 
-    ScheduleApp(root)
+    app = ScheduleApp(root)
     _check_updates_in_background(root)
 
     logging.info("--- 排班程式骨架啟動 (v%s) ---", CURRENT_VERSION)
     root.mainloop()
+    # 關閉前把尚未去抖推送的變更同步推上去（跨機同步，非 git repo 時為 no-op）。
+    try:
+        app.storage.flush()
+    except Exception:
+        logging.debug("關閉前 git 同步 flush 失敗", exc_info=True)
     logging.info("--- Script Finished ---")
 
 
