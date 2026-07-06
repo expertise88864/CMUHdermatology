@@ -78,6 +78,18 @@ def test_swipe_read_ok_true_with_rows():
     assert isinstance(swipes, list)
 
 
+def test_swipe_read_anchor_is_system_time_not_empty_table():
+    """[2026-07-06] get_current_swipe_info 必須等 system_time(lb_systime),不可等
+    swipe_table(Gv_attppre)。空的 ASP.NET GridView(當日尚無紀錄,例:早上第一次上班打卡
+    前)不渲染任何 <table> → 等 Gv_attppre 會逾時 → read_ok=False → 第一次打卡永遠卡住
+    (死結:無紀錄→空表→不渲染→等不到→不打卡)。上面 _FakeWait.until 是 no-op、測不到真實
+    逾時,故以原始碼守門鎖住錨點,避免回歸。"""
+    import inspect
+    src = inspect.getsource(ac.get_current_swipe_info)
+    assert 'presence_of_element_located(get_loc("system_time"))' in src
+    assert 'presence_of_element_located(get_loc("swipe_table"))' not in src
+
+
 # ─── W3:_verify_clock_recorded ───────────────────────────────────────────
 
 def test_verify_true_when_record_appears(monkeypatch):

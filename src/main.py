@@ -1151,8 +1151,11 @@ def _get_swipe_status_from_web(username, password):
                 login_btn = wait.until(EC.element_to_be_clickable((By.ID, "bt_login")))
                 driver.execute_script("arguments[0].click();", login_btn)
                 
-                # 等待表格出現
-                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "Gv_attppre")))
+                # [2026-07-06] 登入成功錨點改用 lb_systime,不再等 Gv_attppre。空的 ASP.NET
+                # GridView(當日尚無刷卡紀錄)不渲染任何 <table> → 等 Gv_attppre 會逾時 → 誤判
+                # 「登入逾時/失敗」(打卡查詢整天壞掉的根因)。lb_systime 在登入後一定存在(空表
+                # 也在);下方 JS querySelectorAll 對不存在的表安全回 []=今日無紀錄。
+                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "lb_systime")))
                 login_success = True
                 break 
             

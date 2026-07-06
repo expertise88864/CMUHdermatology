@@ -656,7 +656,14 @@ def get_current_swipe_info(driver, wait, get_loc):
     last_swipe = None
     read_ok = False
     try:
-        wait.until(EC.presence_of_element_located(get_loc("swipe_table")))
+        # [2026-07-06] 錨點改用 system_time(lb_systime),不再等 swipe_table(Gv_attppre)。
+        # 空的 ASP.NET GridView(當日尚無刷卡紀錄,例如早上第一次上班打卡前)不渲染任何
+        # <table> 元素 → 等 Gv_attppre 會逾時 → read_ok=False → 誤判「讀取失敗」而跳過打卡
+        # (死結:無紀錄→空表→不渲染→等不到→不打卡→仍無紀錄)。lb_systime 在登入後的打卡頁
+        # 一定存在(空表也在),用它確認「已在打卡頁」;下方 JS querySelectorAll 對不存在的表
+        # 安全回 []=當日無紀錄,read_ok=True → 可正常打卡。真的沒登入成功時 lb_systime 等不到
+        # → 仍逾時 → read_ok=False(安全:不誤打卡)。
+        wait.until(EC.presence_of_element_located(get_loc("system_time")))
         try:
             txt = driver.find_element(*get_loc("system_time")).text
             if "年" in txt:

@@ -167,8 +167,11 @@ def read_today_swipes(driver, username: str, password: str, *,
             try:
                 btn = wait.until(EC.element_to_be_clickable((By.ID, "bt_login")))
                 driver.execute_script("arguments[0].click();", btn)
+                # [2026-07-06] 登入成功錨點改用 lb_systime,不再等 Gv_attppre。空的 GridView
+                # (當日尚無刷卡紀錄)不渲染 → 等 Gv_attppre 逾時 → 誤判「登入逾時/失敗」。
+                # lb_systime 在登入後一定存在(空表也在);下方 JS 對不存在的表安全回 []=今日無紀錄。
                 WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.ID, "Gv_attppre")))
+                    EC.presence_of_element_located((By.ID, "lb_systime")))
                 login_ok = True
                 break
             except UnexpectedAlertPresentException as e:

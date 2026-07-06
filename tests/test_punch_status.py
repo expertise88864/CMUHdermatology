@@ -193,3 +193,14 @@ def test_read_today_swipes_clears_cookies_per_account():
     import inspect
     src = inspect.getsource(ps.read_today_swipes)
     assert "delete_all_cookies" in src
+
+
+def test_read_today_swipes_login_anchor_tolerates_empty_table():
+    """[2026-07-06] 登入成功錨點必須是 lb_systime,不可是 Gv_attppre。空的刷卡表(當日尚無
+    紀錄)在新版 portal 完全不渲染 <table> → 若等 Gv_attppre 會逾時 → 誤判『登入逾時/失敗』
+    (主程式打卡查詢 + 會診信打卡狀態整天壞掉的共同根因)。lb_systime 在登入後一定存在(空表
+    也在)。selenium 流程無法純測,以原始碼守門。"""
+    import inspect
+    src = inspect.getsource(ps.read_today_swipes)
+    assert 'presence_of_element_located((By.ID, "lb_systime"))' in src
+    assert 'presence_of_element_located((By.ID, "Gv_attppre"))' not in src

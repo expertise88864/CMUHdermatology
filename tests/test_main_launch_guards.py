@@ -289,6 +289,16 @@ def test_main_uses_weak_http_session_registry_and_bounded_memory_caches():
     assert "trim_oldest_entries(_source_backoff_state, _SOURCE_STATE_MAX_ENTRIES)" in src
 
 
+def test_clock_query_login_anchor_tolerates_empty_table():
+    """[2026-07-06] 主程式打卡查詢(_get_swipe_status_from_web)的『登入成功』等待錨點必須
+    是 lb_systime,不可等 Gv_attppre。空的 ASP.NET GridView(當日尚無刷卡紀錄)不渲染任何
+    <table> → 等 Gv_attppre 會逾時 → 誤判『登入逾時/失敗』(打卡查詢整天壞掉的根因)。
+    讀表 JS 內的 "#Gv_attppre" 選擇器可保留(對空表安全回 []),只是不可當登入等待條件。"""
+    src = _function_source(ROOT / "src" / "main.py", "_get_swipe_status_from_web")
+    assert 'presence_of_element_located((By.ID, "lb_systime"))' in src
+    assert 'presence_of_element_located((By.ID, "Gv_attppre"))' not in src
+
+
 def test_main_and_scheduler_log_queues_are_bounded():
     for rel_path in ("src/main.py",):
         src = (ROOT / rel_path).read_text(encoding="utf-8")
