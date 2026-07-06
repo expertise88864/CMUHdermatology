@@ -245,7 +245,7 @@ class RosterService:
 
     def set_day_slot(self, ym: str, d: date, session: str, slot: str,
                      people) -> None:
-        """手動改某日某時段某格（slot＝治療室/切片室/房號/放假；people 空→移除）。"""
+        """手動改某日某時段某格（slot＝照光/治療室/切片室/房號/放假；people 空→移除）。"""
         month = self.storage.load_month(ym)
         sess = (month.setdefault("day_slots", {})
                 .setdefault(d.isoformat(), {}).setdefault(session, {}))
@@ -297,6 +297,67 @@ class RosterService:
                     kept.setdefault(iso, {})[session] = slots
         month["day_slots"] = kept
         month["day_report"] = ""       # 舊報告已與清除後不符 → 一併清掉，避免誤導
+        self.storage.save_month(ym, month)
+
+    # ── 本月門診停診（某診 VS 請假 → 該診間該期間不開）──────────────────
+    def clinic_rooms_for_month(self, ym: str) -> list:
+        """本月門診週模板出現過的所有跟診房號（供停診選擇；升冪去重、排除自費）。"""
+        template = self.storage.load_clinic_template().get("template") or {}
+        rooms: set = set()
+        for wd_map in template.values():
+            for entries in (wd_map or {}).values():
+                for e in (entries or []):
+                    if e.get("room") and not e.get("is_self_paid"):
+                        rooms.add(str(e["room"]))
+        return sorted(rooms)
+
+    def clinic_closures(self, ym: str) -> dict:
+        """回本月各 (iso, session) 被停診的房號集合：{iso: {session: [room,...]}}。"""
+        ov = self.storage.load_month(ym).get("grid_overrides") or {}
+        out: dict = {}
+        for iso, sess_map in ov.items():
+            for session, sov in (sess_map or {}).items():
+                closed = list((sov or {}).get("closed_rooms") or [])
+                if closed:
+                    out.setdefault(iso, {})[session] = closed
+        return out
+
+    def set_clinic_closed(self, ym: str, room: str, start: date, end: date,
+                          sessions, closed: bool = True) -> None:
+        """在 [start, end] 的每個工作日、指定時段，將某跟診診間標記停診/恢復。
+
+        寫入月檔 grid_overrides[iso][session]['closed_rooms']；month_grid 會據此把
+        該診間排除，自動排班就不會把 PGY/Clerk 排進去。恢復＝從清單移除。
+        """
+        month = self.storage.load_month(ym)
+        if month.get("finalized"):
+            raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能改門診")
+        room = str(room)
+        sessions = [s for s in (sessions or []) if s]
+        # 以「模板原始開診」判斷該室哪些日/時段真的有開，只對那些寫 override，
+        # 避免對本來就沒開這室的日子（週末/假日/非該診週幾/週三下午）塞垃圾。
+        template = self.storage.load_clinic_template().get("template") or {}
+        base = month_grid(ym, template, self.storage.holidays_set())
+        ov = month.setdefault("grid_overrides", {})
+        for d, day in base.items():
+            if d < start or d > end:
+                continue
+            iso = d.isoformat()
+            for session in sessions:
+                if room not in (day.get(session) or []):
+                    continue                      # 該日該時段本來就沒開這室 → 跳過
+                sess = ov.setdefault(iso, {}).setdefault(session, {})
+                lst = sess.setdefault("closed_rooms", [])
+                if closed and room not in lst:
+                    lst.append(room)
+                elif not closed and room in lst:
+                    lst.remove(room)
+                if not lst:                       # 清理空殼，grid_overrides 不留垃圾
+                    sess.pop("closed_rooms", None)
+                if not sess:
+                    ov[iso].pop(session, None)
+            if iso in ov and not ov[iso]:
+                ov.pop(iso, None)
         self.storage.save_month(ym, month)
 
     def get_leaves(self, scope: str, ym: str, member_id: str) -> set:

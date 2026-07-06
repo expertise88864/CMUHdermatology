@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
-"""PGY/Clerk 逐時段填充器（設計文件 §3.6 五步驟＋放假；純函式、決定性）。
+"""PGY/Clerk 逐時段填充器（設計文件 §3.6；純函式、決定性）。
 
 每時段輸入：跟診診間(房號升冪)、可用 PGY、可用 Clerk、診間容量、切片室是否開。
-六步驟（各為一個可替換 FillStep，順序 = PIPELINE）：
-  1 治療室Step   ← 1 位 PGY（總治療室次數最少者；週三下午另計 tx_wed_pm 公平）
-  2 切片室Step   ← 1 位 Clerk（僅切片室開；優先本梯未輪過切片者）
-  3 ClerkSeed    每個開診診間各放 1 位 Clerk（房號序、就座公平輪轉）
-  4 PgyMix       逐欄補 PGY（先補到「有 1 人的診間」形成 1C+1P；無 Clerk 月直接填診）
-  5 ClerkOverflow 剩 Clerk 補進剩餘容量
-  6 RestStep     還沒位子 → 放假（放假次數輪平均）
+七步驟（各為一個可替換 FillStep，順序 = PIPELINE）：
+  1 照光Step     ← 1 位 PGY（**每個時段一律要 1 位**，含週三下午；最優先；照光總次數
+                  最少者，週三下午另計 photo_wed_pm 公平）
+  2 治療室Step   ← 1 位 PGY（**週三下午休診不排**；其餘時段皆排；治療室總次數最少者）
+  3 切片室Step   ← 1 位 Clerk（僅切片室開；優先本梯未輪過切片者）
+  4 ClerkSeed    每個開診診間各放 1 位 Clerk（房號序、就座公平輪轉）
+  5 PgyMix       逐欄補 PGY（先補到「有 1 人的診間」形成 1C+1P；無 Clerk 月直接填診）
+  6 ClerkOverflow 剩 Clerk 補進剩餘容量
+  7 RestStep     還沒位子 → 放假（放假次數輪平均）
 
+先照光、再治療室，兩者各消耗 1 位 PGY，剩餘 PGY 才與 Clerk 一起進診間。
 決定性鐵律：一切輪選用 key=(次數, 上次輪到日期 or date.min, 代號) 取最小。
-不硬塞：治療室無 PGY / 切片室開但無 Clerk → 記警告，不填。
+不硬塞：照光/治療室無 PGY、切片室開但無 Clerk → 記警告，不填（貪婪填充器無法硬性
+保證滿足，缺人時以警告呈現）。
 """
 from __future__ import annotations
 
@@ -20,7 +24,8 @@ from datetime import date
 
 from cmuh_common.roster.model import STUDENT_SESSIONS, is_weekend
 
-TREATMENT = "治療室"
+PHOTO = "照光"        # 每時段必排 1 PGY（含週三下午），最優先
+TREATMENT = "治療室"  # 每時段 1 PGY，但週三下午休診不排
 BIOPSY = "切片室"
 REST = "放假"
 WED = 2
@@ -34,11 +39,13 @@ def _pick(cands: list, count_map: dict, last_map: dict):
 
 @dataclass
 class FairCounters:
+    photo_total: dict = field(default_factory=dict)  # PGY 照光總次數
+    photo_wed_pm: dict = field(default_factory=dict)  # PGY 週三下午照光次數
     tx_total: dict = field(default_factory=dict)     # PGY 治療室總次數
-    tx_wed_pm: dict = field(default_factory=dict)    # PGY 週三下午治療室次數
     rest: dict = field(default_factory=dict)         # 放假次數（PGY+Clerk）
     biopsy_done: dict = field(default_factory=dict)  # Clerk 本梯切片次數
     seat: dict = field(default_factory=dict)         # 診間就座次數（公平輪轉）
+    last_photo: dict = field(default_factory=dict)
     last_tx: dict = field(default_factory=dict)
     last_rest: dict = field(default_factory=dict)
     last_biopsy: dict = field(default_factory=dict)
@@ -68,26 +75,46 @@ class FillStep:
         raise NotImplementedError
 
 
-class TreatmentStep(FillStep):
+class PhotoStep(FillStep):
+    """照光：每個時段（含週三下午）一律排 1 位 PGY，最優先。"""
+
     def run(self, ctx, slots, log):
+        if not ctx.pgy:
+            log.append(f"⚠ {ctx.session} 照光無 PGY 可排（全請假？）")
+            return
+        fc = ctx.fc
+        if ctx.wed_pm:                          # 週三下午：先比 photo_wed_pm 再比總次數
+            pick = min(ctx.pgy, key=lambda p: (
+                fc.photo_wed_pm.get(p, 0), fc.photo_total.get(p, 0),
+                fc.last_photo.get(p, date.min), p))
+        else:
+            pick = _pick(ctx.pgy, fc.photo_total, fc.last_photo)
+        ctx.pgy.remove(pick)
+        slots[PHOTO] = [pick]
+        fc.photo_total[pick] = fc.photo_total.get(pick, 0) + 1
+        if ctx.wed_pm:
+            fc.photo_wed_pm[pick] = fc.photo_wed_pm.get(pick, 0) + 1
+        fc.last_photo[pick] = ctx.d
+        log.append(f"{ctx.session} 照光 ← PGY {pick}"
+                   + ("（週三下午）" if ctx.wed_pm else ""))
+
+
+class TreatmentStep(FillStep):
+    """治療室：除週三下午（休診）外，每個時段排 1 位 PGY（照光之後、進診間之前）。"""
+
+    def run(self, ctx, slots, log):
+        if ctx.wed_pm:                          # 週三下午治療室休診（照光另開）
+            return
         if not ctx.pgy:
             log.append(f"⚠ {ctx.session} 治療室無 PGY 可排（全請假？）")
             return
         fc = ctx.fc
-        if ctx.wed_pm:                          # 週三下午：先比 tx_wed_pm 再比總次數
-            pick = min(ctx.pgy, key=lambda p: (
-                fc.tx_wed_pm.get(p, 0), fc.tx_total.get(p, 0),
-                fc.last_tx.get(p, date.min), p))
-        else:
-            pick = _pick(ctx.pgy, fc.tx_total, fc.last_tx)
+        pick = _pick(ctx.pgy, fc.tx_total, fc.last_tx)
         ctx.pgy.remove(pick)
         slots[TREATMENT] = [pick]
         fc.tx_total[pick] = fc.tx_total.get(pick, 0) + 1
-        if ctx.wed_pm:
-            fc.tx_wed_pm[pick] = fc.tx_wed_pm.get(pick, 0) + 1
         fc.last_tx[pick] = ctx.d
-        log.append(f"{ctx.session} 治療室 ← PGY {pick}"
-                   + ("（週三下午）" if ctx.wed_pm else ""))
+        log.append(f"{ctx.session} 治療室 ← PGY {pick}")
 
 
 class BiopsyStep(FillStep):
@@ -184,7 +211,7 @@ class RestStep(FillStep):
         log.append(f"{ctx.session} 放假：{'、'.join(rest_people)}")
 
 
-PIPELINE = [TreatmentStep(), BiopsyStep(), ClerkSeedStep(),
+PIPELINE = [PhotoStep(), TreatmentStep(), BiopsyStep(), ClerkSeedStep(),
             PgyMixStep(), ClerkOverflowStep(), RestStep()]
 
 
@@ -231,11 +258,14 @@ def replay_counters(fc: FairCounters, d: date, session: str, slots: dict,
     """把「已鎖定/既存」時段結果餵進公平計數，讓後續未鎖時段對齊（不重新分配）。
     以名單分類 PGY/Clerk 命名空間（座位/放假）；治療室→tx、切片室→biopsy。"""
     wed_pm = (d.weekday() == WED and session == "下午")
-    # 治療室 key 是裸代號、PGY 代號整月穩定，stale key 不污染現役者 → 不過濾。
+    # 照光/治療室 key 是裸代號、PGY 代號整月穩定，stale key 不污染現役者 → 不過濾。
+    for p in slots.get(PHOTO, []):
+        fc.photo_total[p] = fc.photo_total.get(p, 0) + 1
+        if wed_pm:
+            fc.photo_wed_pm[p] = fc.photo_wed_pm.get(p, 0) + 1
+        fc.last_photo[p] = d
     for p in slots.get(TREATMENT, []):
         fc.tx_total[p] = fc.tx_total.get(p, 0) + 1
-        if wed_pm:
-            fc.tx_wed_pm[p] = fc.tx_wed_pm.get(p, 0) + 1
         fc.last_tx[p] = d
     for c in slots.get(BIOPSY, []):
         if c not in clerk_set:            # RF-10：已換梯/非名單代號不污染切片命名空間
@@ -247,7 +277,7 @@ def replay_counters(fc: FairCounters, d: date, session: str, slots: dict,
     def _ck(p):
         return ("pgy", p) if p in pgy_set else ("clerk", batch_key, p)
     for slot, people in slots.items():
-        if slot in (TREATMENT, BIOPSY):
+        if slot in (PHOTO, TREATMENT, BIOPSY):
             continue
         target = (fc.rest, fc.last_rest) if slot == REST else (fc.seat, fc.last_seat)
         for p in people:
@@ -311,7 +341,7 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
                 continue
             filtered = {}
             for slot_name, people in slots.items():
-                if slot_name == TREATMENT:            # 治療室屬 PGY 月度公平 → 不跨月餵
+                if slot_name in (PHOTO, TREATMENT):   # 照光/治療室屬 PGY 月度公平→不跨月餵
                     continue
                 keep = [p for p in people
                         if p in members and p not in inp.prior_pgy]

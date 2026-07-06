@@ -360,6 +360,25 @@ def test_day_tab_auto_accept_flow(root, tmp_path):
     assert mon.get("治療室")                               # 週一早有治療室 PGY
 
 
+def test_clinic_closure_dialog_closes_room(root, tmp_path):
+    """本月停診對話框：選診間+日期+時段→停診，寫進 grid_overrides。"""
+    svc = _svc(tmp_path)                                    # 模板 週一 上午 101
+    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    dlg = day_mod._ClinicClosureDialog(tab, svc, YM)
+    root.update()
+    dlg._room.set("101")
+    dlg._start.delete(0, "end")
+    dlg._start.insert(0, "2026-08-03")
+    dlg._end.delete(0, "end")
+    dlg._end.insert(0, "2026-08-03")
+    dlg._pm.set(False)                                     # 只停上午
+    dlg._apply(True)
+    assert svc.clinic_closures(YM)["2026-08-03"]["上午"] == ["101"]
+    assert "101" not in svc.build_day_input(YM).grid[date(2026, 8, 3)]["上午"]
+
+
 def test_day_edit_dialog_saves(root, tmp_path):
     svc = _svc(tmp_path)
     dlg = day_mod._DayEditDialog(root, svc, YM, date(2026, 8, 3), "上午",

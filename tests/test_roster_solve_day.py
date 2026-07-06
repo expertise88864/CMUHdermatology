@@ -9,8 +9,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from cmuh_common.roster.clinic_grid import is_session_open, month_grid  # noqa: E402
 from cmuh_common.roster.model import ClerkBatch  # noqa: E402
 from cmuh_common.roster.solve_day import (  # noqa: E402
-    BIOPSY, REST, TREATMENT, DaySolveInput, FairCounters, month_solve_day,
-    replay_counters, solve_session,
+    BIOPSY, PHOTO, REST, TREATMENT, DaySolveInput, FairCounters,
+    month_solve_day, replay_counters, solve_session,
 )
 
 # 2026-08：週一 3/10/17/24/31；週三 5/12/19/26
@@ -49,35 +49,35 @@ def test_month_grid_self_paid_excluded_and_overrides():
 
 # ─── solve_session 五步驟 ───────────────────────────────────────────────────
 def test_no_clerk_month_columns_fill():
-    """無 Clerk：治療室 1 PGY，其餘 PGY 逐欄填診（101 兩人、102 一人）。"""
+    """無 Clerk：照光 1 PGY、治療室 1 PGY，其餘 PGY 逐欄填診。"""
     fc = FairCounters()
     slots, _log = solve_session(
         date(2026, 8, 3), "上午", ["101", "102"],
         pgy_avail=["A", "B", "C", "D"], clerk_avail=[],
         biopsy_open=False, fc=fc)
-    assert slots[TREATMENT] == ["A"]
-    assert slots["101"] == ["B", "D"] and slots["102"] == ["C"]
+    assert slots[PHOTO] == ["A"] and slots[TREATMENT] == ["B"]
+    assert slots["101"] == ["C"] and slots["102"] == ["D"]
     assert BIOPSY not in slots and REST not in slots
 
 
 def test_mixed_one_clerk_one_pgy():
-    """1 診間：Clerk 先坐、PGY 補第 2 位 → 1C+1P 混搭（治療室先吃掉 A）。"""
+    """照光+治療室各吃 1 PGY 後，剩 1 PGY 與 Clerk 配成 1C+1P 混搭。"""
     fc = FairCounters()
     slots, _log = solve_session(
         date(2026, 8, 3), "上午", ["101"],
-        pgy_avail=["A", "B"], clerk_avail=["1"], biopsy_open=False, fc=fc)
-    assert slots[TREATMENT] == ["A"]                         # 治療室先取 1 PGY
-    assert slots["101"] == ["1", "B"]                        # Clerk 先、PGY 後
+        pgy_avail=["A", "B", "C"], clerk_avail=["1"], biopsy_open=False, fc=fc)
+    assert slots[PHOTO] == ["A"] and slots[TREATMENT] == ["B"]
+    assert slots["101"] == ["1", "C"]                        # Clerk 先、PGY 後
 
 
 def test_fewer_clerks_than_rooms_pairs_first():
-    """Clerk 少於診間：PGY 先與已坐 Clerk 的診間配對，而非先佔空房。"""
+    """Clerk 少於診間：剩餘 PGY 先與已坐 Clerk 的診間配對，而非先佔空房。"""
     fc = FairCounters()
     slots, _log = solve_session(
         date(2026, 8, 3), "上午", ["101", "102"],
-        pgy_avail=["A", "B"], clerk_avail=["1"], biopsy_open=False, fc=fc)
-    assert slots[TREATMENT] == ["A"]
-    assert slots["101"] == ["1", "B"]                        # 配成 1C+1P
+        pgy_avail=["A", "B", "C"], clerk_avail=["1"], biopsy_open=False, fc=fc)
+    assert slots[PHOTO] == ["A"] and slots[TREATMENT] == ["B"]
+    assert slots["101"] == ["1", "C"]                        # 配成 1C+1P
     assert "102" not in slots                                # 沒人 → 不輸出空房
 
 
@@ -87,7 +87,7 @@ def test_biopsy_assign_and_prefer_undone():
         date(2026, 8, 3), "上午", ["101"],
         pgy_avail=["A"], clerk_avail=["1", "2"],
         biopsy_open=True, fc=fc)
-    assert slots[TREATMENT] == ["A"]
+    assert slots[PHOTO] == ["A"]                             # 照光先吃掉唯一 PGY
     assert slots[BIOPSY] == ["1"]                            # 未輪過者優先
     assert slots["101"] == ["2"]
 
@@ -111,13 +111,15 @@ def test_treatment_no_pgy_warns_not_forced():
     assert slots["101"] == ["1"]                             # Clerk 仍照排
 
 
-def test_wed_pm_treatment_only():
+def test_wed_pm_photo_only():
+    """週三下午：只排照光（治療室休診），沒位子者放假。"""
     fc = FairCounters()
     slots, _log = solve_session(
         date(2026, 8, 5), "下午", [],                        # 週三下午跟診關閉
         pgy_avail=["A", "B"], clerk_avail=[], biopsy_open=False, fc=fc)
-    assert slots[TREATMENT] == ["A"]
-    assert fc.tx_wed_pm.get("A") == 1                        # 週三下午計數
+    assert slots[PHOTO] == ["A"]
+    assert TREATMENT not in slots                            # 週三下午治療室不排
+    assert fc.photo_wed_pm.get("A") == 1                     # 週三下午照光計數
     assert slots[REST] == ["B"]                              # 沒位子 → 放假
 
 
@@ -132,25 +134,37 @@ def test_wed_pm_biopsy_forced_closed():
 
 
 def test_capacity3_clerk_overflow_before_third_pgy():
-    """容量 3：第 3 位留給 Clerk overflow，多餘 PGY 放假（非塞第 3 個 PGY）。"""
+    """容量 3：照光+治療室各 1 PGY 後，診間第 3 位留給 Clerk overflow（非第 2 個 PGY）。"""
     fc = FairCounters()
     slots, _log = solve_session(
         date(2026, 8, 3), "上午", ["101"],
         pgy_avail=["A", "P1", "P2"], clerk_avail=["1", "2"],
         biopsy_open=False, fc=fc, capacity=3)
-    assert slots[TREATMENT] == ["A"]
-    assert slots["101"] == ["1", "P1", "2"]                  # C, P(2nd), C(3rd)
-    assert slots[REST] == ["P2"]                             # 多餘 PGY 放假
+    assert slots[PHOTO] == ["A"] and slots[TREATMENT] == ["P1"]
+    assert slots["101"] == ["1", "P2", "2"]                  # C, P(2nd), C(3rd 給 Clerk)
+    assert REST not in slots
 
 
-def test_treatment_fairness_rotates():
+def test_photo_priority_over_treatment_when_scarce():
+    """只有 1 PGY：照光最優先拿到人，治療室湊不到人 → 警告不硬塞。"""
+    fc = FairCounters()
+    slots, log = solve_session(
+        date(2026, 8, 3), "上午", ["101"],
+        pgy_avail=["A"], clerk_avail=[], biopsy_open=False, fc=fc)
+    assert slots[PHOTO] == ["A"]                             # 照光一定要，先拿
+    assert TREATMENT not in slots                            # 治療室沒人
+    assert any("治療室無 PGY" in ln for ln in log)
+
+
+def test_photo_fairness_rotates():
+    """照光每時段必排且輪平均：連續 3 時段輪 A→B→C。"""
     fc = FairCounters()
     picks = []
     for _ in range(3):                                       # 連續 3 個時段
         slots, _l = solve_session(date(2026, 8, 3), "上午", [],
                                   ["A", "B", "C"], [], False, fc)
-        picks.append(slots[TREATMENT][0])
-    assert picks == ["A", "B", "C"]                          # 輪平均
+        picks.append(slots[PHOTO][0])
+    assert picks == ["A", "B", "C"]                          # 照光輪平均
 
 
 def test_determinism_same_input():

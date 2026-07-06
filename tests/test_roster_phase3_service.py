@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from cmuh_common.roster.model import ClerkBatch, batches_covering  # noqa: E402
 from cmuh_common.roster.service import RosterService  # noqa: E402
-from cmuh_common.roster.solve_day import BIOPSY, REST, TREATMENT  # noqa: E402
+from cmuh_common.roster.solve_day import BIOPSY, PHOTO, REST, TREATMENT  # noqa: E402
 from cmuh_common.roster.storage import (  # noqa: E402
     FinalizedMonthError, RosterStorage,
 )
@@ -169,6 +169,34 @@ def test_rf09_build_day_input_pulls_prior_month_sessions(tmp_path):
     assert "A" in inp.prior_pgy                             # 上月 PGY 供 replay 剔除
 
 
+def test_clinic_closure_removes_room_for_range(tmp_path):
+    """本月停診：某診間在選定日期範圍不進格網、不排人；範圍外照常；恢復後清乾淨。"""
+    svc = _svc(tmp_path)                                    # 週一 上午 [101,103]
+    assert "101" in svc.clinic_rooms_for_month(YM)
+    svc.set_clinic_closed(YM, "101", date(2026, 8, 3), date(2026, 8, 10), ["上午"])
+    grid = svc.build_day_input(YM).grid
+    assert "101" not in grid[date(2026, 8, 3)]["上午"]      # 停診日不含 101
+    assert "103" in grid[date(2026, 8, 3)]["上午"]          # 其他診照常
+    assert "101" in grid[date(2026, 8, 17)]["上午"]         # 範圍外照常開
+    assert svc.clinic_closures(YM)["2026-08-03"]["上午"] == ["101"]
+    ds, _l, _w = svc.run_day_solve(YM)                      # 自動排班不排人進停診診間
+    assert "101" not in ds.get("2026-08-03", {}).get("上午", {})
+    # 恢復開診 → 清乾淨
+    svc.set_clinic_closed(YM, "101", date(2026, 8, 3), date(2026, 8, 10),
+                          ["上午"], closed=False)
+    assert "101" in svc.build_day_input(YM).grid[date(2026, 8, 3)]["上午"]
+    assert svc.clinic_closures(YM) == {}
+
+
+def test_clinic_closure_finalized_guard(tmp_path):
+    svc = _svc(tmp_path)
+    m = svc.storage.load_month(YM)
+    m["finalized"] = True
+    svc.storage.save_month(YM, m)
+    with pytest.raises(FinalizedMonthError):
+        svc.set_clinic_closed(YM, "101", date(2026, 8, 3), date(2026, 8, 3), ["上午"])
+
+
 def test_rf04_locked_preserved_when_day_becomes_holiday(tmp_path):
     """RF-04：鎖定日事後變假日（掉出格網）→ 即使套用一份漏掉該日的 stale 預覽，
     service 層仍會把鎖定時段強制併回，不得刪除鎖定內容。"""
@@ -188,10 +216,24 @@ def test_rf04_locked_preserved_when_day_becomes_holiday(tmp_path):
     assert kept == locked_slots                            # 鎖定內容仍原樣併回保留
 
 
-def test_wed_pm_treatment_present(tmp_path):
-    """週三下午跟診關閉但治療室仍排（day_slots 有治療室、無房）。"""
+def test_wed_pm_photo_present_treatment_absent(tmp_path):
+    """週三下午：照光照排、治療室休診（day_slots 有照光、無治療室、無房）。"""
     svc = _svc(tmp_path)
     day_slots, _log, _w = svc.run_day_solve(YM)
     wed_pm = day_slots["2026-08-05"]["下午"]            # 8/5 週三
-    assert TREATMENT in wed_pm
+    assert PHOTO in wed_pm and TREATMENT not in wed_pm
     assert not any(k.isdigit() for k in wed_pm)         # 無房號格
+
+
+def test_photo_every_session_treatment_skips_wed_pm(tmp_path):
+    """照光每個時段一律有人；治療室只在非週三下午的時段有人。"""
+    svc = _svc(tmp_path)                                # pgy A,B,C
+    day_slots, _log, _w = svc.run_day_solve(YM)
+    for iso, sessions in day_slots.items():
+        wd = date.fromisoformat(iso).weekday()
+        for session, slots in sessions.items():
+            assert slots.get(PHOTO), f"{iso} {session} 照光應必排"
+            if wd == 2 and session == "下午":
+                assert TREATMENT not in slots             # 週三下午治療室休診
+            else:
+                assert slots.get(TREATMENT), f"{iso} {session} 治療室應排"
