@@ -94,6 +94,39 @@ def test_default_filename():
     assert default_filename(data, ".xlsx") == "115年07月班表.xlsx"
 
 
+def test_rf11_member_tally_includes_removed_member(tmp_path):
+    """RF-11：值班者已不在 config 名單 → member_tally 仍動態納入、不漏點數。"""
+    svc = _svc(tmp_path)
+    cfg = svc.storage.load_config()
+    cfg["r_members"] = [{"id": "A", "name": "甲"}]       # 移除 B（月檔 duty 仍有 B）
+    svc.storage.save_config(cfg)
+    data = svc.build_export(YM)
+    tally = member_tally(data["r"], data["holidays"], data["params"])
+    assert tally["B"] == {"wd": 1, "we": 0, "pt": 1}     # 8/3 週一
+
+
+def test_rf11_summary_sheet_includes_removed_member(tmp_path):
+    """RF-11：結算 sheet 補列已離名單的值班者（標「(已離)」、帳本印「—」）。"""
+    pytest.importorskip("openpyxl")
+    from openpyxl import load_workbook
+
+    from cmuh_common.roster import export_xlsx
+    svc = _svc(tmp_path)
+    cfg = svc.storage.load_config()
+    cfg["r_members"] = [{"id": "A", "name": "甲"}]
+    svc.storage.save_config(cfg)
+    data = svc.build_export(YM)
+    out = tmp_path / "out.xlsx"
+    export_xlsx.export(str(out), data)
+    wb = load_workbook(str(out))
+    rows = [[c.value for c in row] for row in wb["結算"].iter_rows(min_row=2)]
+    b_rows = [r for r in rows if r[1] and str(r[1]).startswith("B")]
+    assert b_rows, "結算 sheet 應補上已離名單的 B 一列"
+    assert "已離" in b_rows[0][1]
+    assert b_rows[0][2] == 1 and b_rows[0][5] == 1       # 平日班=1、點數=1
+    assert b_rows[0][6] == "—"                           # 帳本作廢印 —
+
+
 # ─── Excel 產檔讀回 ─────────────────────────────────────────────────────────
 def test_export_xlsx_roundtrip(tmp_path):
     pytest.importorskip("openpyxl")

@@ -127,3 +127,148 @@ def test_offline_push_failure_is_non_fatal(tmp_path):
     st.save_config({"r_members": [{"id": "A"}]})     # commit ok
     st.flush()                                        # push 失敗但不拋
     assert st.load_config()["r_members"] == [{"id": "A"}]
+
+
+# ── RF-01/06/07/13 回歸測試 ───────────────────────────────────────────────
+def _two_clones(tmp_path):
+    """建 bare remote + 兩個設好 identity 的工作 clone（含一個初始 commit）。"""
+    remote = tmp_path / "remote.git"
+    a = tmp_path / "work_a"
+    b = tmp_path / "work_b"
+    subprocess.run(["git", "init", "--bare", str(remote)],
+                   capture_output=True, check=True)
+    subprocess.run(["git", "clone", str(remote), str(a)],
+                   capture_output=True, check=True)
+    _git(a, "config", "user.email", "a@a")
+    _git(a, "config", "user.name", "aaa")
+    (a / "README").write_text("roster", encoding="utf-8")
+    # 已初始化的共享 repo：.gitignore 早已被 commit（後續 clone 皆取得追蹤版本，
+    # _ensure_gitignore 會跳過，不會各機留未追蹤檔撞 ff-only merge）。
+    (a / ".gitignore").write_text("*.bak-*\n*.corrupt-*\n*.tmp\n", encoding="utf-8")
+    _git(a, "add", "-A")
+    _git(a, "commit", "-m", "init")
+    _git(a, "push", "-u", "origin", "HEAD")
+    subprocess.run(["git", "clone", str(remote), str(b)],
+                   capture_output=True, check=True)
+    _git(b, "config", "user.email", "b@b")
+    _git(b, "config", "user.name", "bbb")
+    return remote, a, b
+
+
+def test_rf01_periodic_pull_gets_other_machine_change(tmp_path):
+    """長駐 B：A 中途改班並 flush → B 週期 pull 一輪即拿到 A 的資料並通知。"""
+    _remote, a, b = _two_clones(tmp_path)
+    st_a = GitSyncStorage(str(a), pull_interval_sec=0)      # 關背景執行緒，手動觸發
+    notified = []
+    st_b = GitSyncStorage(str(b), pull_interval_sec=0,
+                          on_remote_change=lambda: notified.append(1))
+    st_a.save_month("2026-08", {"r_duty": {"2026-08-01": {"person": "A"}}})
+    st_a.flush()
+    assert st_b.load_month("2026-08").get("r_duty") == {}   # 尚未 pull
+    st_b._periodic_pull()                                    # 模擬一輪週期 pull
+    assert st_b.load_month("2026-08")["r_duty"] == {"2026-08-01": {"person": "A"}}
+    assert notified == [1]                                   # on_remote_change 有被呼叫
+    assert st_b.sync_state == "ok"
+
+
+def test_rf01_divergent_different_files_auto_rebase(tmp_path):
+    """A 改 config、B 改 ledger（不同檔）→ rebase 自動復原，兩邊收斂、狀態 ok。"""
+    _remote, a, b = _two_clones(tmp_path)
+    st_a = GitSyncStorage(str(a), pull_interval_sec=0)
+    st_b = GitSyncStorage(str(b), pull_interval_sec=0)
+    st_a.save_config({"r_members": [{"id": "A"}]})
+    st_a.flush()
+    st_b.save_ledger({"r": {"bal": {"X": 1.5}}})           # 不同檔
+    st_b.flush()                                            # 分歧 → rebase 自動復原
+    assert st_b.sync_state == "ok"
+    st_a._periodic_pull()                                   # A 補拉 B 的 ledger
+    assert st_a.load_ledger()["r"] == {"bal": {"X": 1.5}}
+    assert st_b.load_config()["r_members"] == [{"id": "A"}]
+
+
+def test_rf01_divergent_same_file_flags_diverged(tmp_path):
+    """A、B 改同一檔 → rebase 衝突 → abort、狀態 diverged、工作樹乾淨。"""
+    _remote, a, b = _two_clones(tmp_path)
+    st_a = GitSyncStorage(str(a), pull_interval_sec=0)
+    states = []
+    st_b = GitSyncStorage(str(b), pull_interval_sec=0,
+                          on_sync_state=lambda s, d: states.append(s))
+    st_a.save_config({"r_members": [{"id": "AAA"}]})
+    st_a.flush()
+    st_b.save_config({"r_members": [{"id": "BBB"}]})       # 同一檔、不同內容
+    st_b.flush()
+    assert st_b.sync_state == "diverged"
+    assert "diverged" in states
+    porcelain = _git(b, "status", "--porcelain").stdout
+    assert "rebase" not in porcelain.lower()              # rebase --abort 後無殘留
+    assert not (b / ".git" / "rebase-merge").exists()
+    assert not (b / ".git" / "rebase-apply").exists()
+
+
+def test_rf06_push_is_serialized_by_git_lock(tmp_path):
+    """RF-06：flush() 與 _push() 並發時，任一時刻最多一個 git 操作在跑。"""
+    _remote, work = _init_repo_with_remote(tmp_path)
+    st = GitSyncStorage(str(work), pull_interval_sec=0)
+    st.save_config({"r_members": [{"id": "A"}]})
+    import threading as _t
+    active = [0]
+    peak = [0]
+    mlock = _t.Lock()
+    real = st._git
+
+    def traced(*a, **k):
+        with mlock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        try:
+            if a and a[0] == "push":
+                import time as _time
+                _time.sleep(0.3)
+            return real(*a, **k)
+        finally:
+            with mlock:
+                active[0] -= 1
+    st._git = traced
+    t1 = _t.Thread(target=st.flush)
+    t2 = _t.Thread(target=st._push)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert peak[0] == 1                                    # 全程序列化，無併發 git
+
+
+def test_rf07_snapshots_excluded_by_gitignore(tmp_path):
+    """RF-07：.gitignore 排除 *.bak-* → 快照不進 repo、不無界膨脹。"""
+    remote, work = _init_repo_with_remote(tmp_path)
+    st = GitSyncStorage(str(work))
+    assert (work / ".gitignore").exists()
+    for i in range(3):                                     # 3 次 → 產生 2 個 .bak-*
+        st.save_month("2026-08", {"r_duty": {"2026-08-01": {"person": str(i)}}})
+    assert list((work / "months").glob("*.bak-*"))         # 本地確實有快照
+    st.flush()
+    tracked = _git(work, "ls-files").stdout
+    assert "bak-" not in tracked                           # 但沒被 git 追蹤
+    assert ".gitignore" in tracked
+    check = tmp_path / "check"
+    subprocess.run(["git", "clone", str(remote), str(check)],
+                   capture_output=True, check=True)
+    assert not list((check / "months").glob("*.bak-*"))    # 遠端也沒有
+
+
+def test_rf13_git_uses_create_no_window(tmp_path, monkeypatch):
+    """RF-13：_git 帶 creationflags=CREATE_NO_WINDOW（Windows 下不閃黑窗）。"""
+    if os.name != "nt":
+        pytest.skip("僅 Windows 有 CREATE_NO_WINDOW")
+    work = tmp_path / "work"
+    subprocess.run(["git", "init", str(work)], capture_output=True, check=True)
+    st = GitSyncStorage(str(work))
+    seen = {}
+    real_run = subprocess.run
+
+    def spy_run(*a, **k):
+        seen["creationflags"] = k.get("creationflags")
+        return real_run(*a, **k)
+    monkeypatch.setattr(subprocess, "run", spy_run)
+    st._git("status")
+    assert seen["creationflags"] & 0x08000000              # CREATE_NO_WINDOW

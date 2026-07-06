@@ -105,13 +105,20 @@ class ScheduleApp:
         except Exception:
             logging.debug("套用視窗圖示失敗", exc_info=True)
 
+        self._duty_tabs: dict = {}
+        self._day_tabs: dict = {}
+        self._diverged_warned = False
+
         # GitSyncStorage：roster 目錄若是 git repo（使用者設好 private repo）→
-        # 開檔 pull、存檔背景 push 跨機同步；否則自動退化為純本機 storage。
-        self.storage = GitSyncStorage(os.path.join(get_settings_dir(), "roster"))
+        # 開檔 pull、存檔背景 push、週期性 pull 跨機同步；否則退化為純本機 storage。
+        # 同步狀態/遠端變更 callback 在背景 thread 觸發，於此 marshal 回主執行緒。
+        self.storage = GitSyncStorage(
+            os.path.join(get_settings_dir(), "roster"),
+            on_sync_state=self._on_sync_state,
+            on_remote_change=self._on_remote_change)
         self.service = RosterService(self.storage)
         today = date.today()
         self.ym = f"{today.year:04d}-{today.month:02d}"   # R/VS 共用月份
-        self._duty_tabs: dict = {}
 
         self._build_ui()
 
@@ -138,8 +145,15 @@ class ScheduleApp:
         nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         self._ensure_built("設定")   # 首頁先建好
 
-        ttk.Label(self.root, text=f"v{CURRENT_VERSION}", anchor="e",
-                  font=("Consolas", 8), foreground="gray").pack(fill="x")
+        bottom = ttk.Frame(self.root)
+        bottom.pack(fill="x")
+        # 同步狀態（跨機 git 同步）：預設空字串，由 _on_sync_state 更新。
+        self._sync_label = ttk.Label(bottom, text="", anchor="w",
+                                     font=("Microsoft JhengHei UI", 8),
+                                     foreground="gray")
+        self._sync_label.pack(side="left", padx=(6, 0))
+        ttk.Label(bottom, text=f"v{CURRENT_VERSION}", anchor="e",
+                  font=("Consolas", 8), foreground="gray").pack(side="right")
 
     def _on_tab_changed(self, _event) -> None:
         try:
@@ -170,6 +184,7 @@ class ScheduleApp:
     def _build_day(self, cont, scope):
         tab = DayScheduleTab(cont, self.service, scope, self)
         tab.pack(fill="both", expand=True)
+        self._day_tabs[scope] = tab
         return tab
 
     def _build_placeholder(self, cont, text):
@@ -184,6 +199,52 @@ class ScheduleApp:
                 tab.refresh()
             except Exception:
                 logging.exception("[roster.ui] 設定變更後重繪失敗")
+
+    # ── 跨機 git 同步 callback（背景 thread → marshal 回主執行緒）──────────
+    def _on_sync_state(self, state: str, detail: str = "") -> None:
+        """GitSyncStorage 回報同步狀態（背景 thread）→ 更新底部狀態列。"""
+        try:
+            self.root.after(0, lambda: self._apply_sync_state(state, detail))
+        except (tk.TclError, RuntimeError):
+            pass                                  # mainloop 已結束（關閉/flush 階段）
+
+    def _apply_sync_state(self, state: str, detail: str) -> None:
+        texts = {
+            "ok": ("已同步", "gray"),
+            "offline": ("離線，變更僅存本機", "#c06000"),
+            "diverged": ("同步衝突！需人工處理", "#c00000"),
+            "error": ("同步設定異常", "#c00000"),
+        }
+        text, color = texts.get(state, (state, "gray"))
+        try:
+            self._sync_label.config(text=text, foreground=color)
+        except (tk.TclError, AttributeError):
+            return
+        if state == "diverged" and not self._diverged_warned:
+            self._diverged_warned = True
+            try:
+                from tkinter import messagebox
+                messagebox.showwarning(
+                    "排班資料同步衝突",
+                    "本機與另一台電腦的排班各自有修改且自動合併失敗。\n\n"
+                    "請保留一台繼續編輯，另一台關閉程式後在 settings/roster 資料夾\n"
+                    "執行 git pull --rebase 並解決衝突；完成前該台的修改不會同步。")
+            except Exception:
+                logging.debug("[roster.ui] 同步衝突提示失敗", exc_info=True)
+
+    def _on_remote_change(self) -> None:
+        """週期性 pull 抓到遠端新資料（背景 thread）→ 重畫所有已建分頁。"""
+        try:
+            self.root.after(0, self._refresh_all_tabs)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _refresh_all_tabs(self) -> None:
+        for tab in list(self._duty_tabs.values()) + list(self._day_tabs.values()):
+            try:
+                tab.refresh()
+            except Exception:
+                logging.exception("[roster.ui] 遠端變更後重繪失敗")
 
 
 def main() -> None:
@@ -231,13 +292,25 @@ def main() -> None:
     _check_updates_in_background(root)
 
     logging.info("--- 排班程式骨架啟動 (v%s) ---", CURRENT_VERSION)
-    root.mainloop()
-    # 關閉前把尚未去抖推送的變更同步推上去（跨機同步，非 git repo 時為 no-op）。
+    _run_app(root, app)
+
+
+def _run_app(root: tk.Tk, app: "ScheduleApp") -> None:
+    """跑 mainloop，並在任何離開路徑（正常關閉 / KeyboardInterrupt / 自動更新
+    restart_self 的 SystemExit 穿出 mainloop）都收尾：先釋放單例 mutex 讓重啟的
+    新行程能啟動，再 flush 把去抖中的 push 推完（跨機同步，非 git repo 時為 no-op）。
+    """
     try:
-        app.storage.flush()
-    except Exception:
-        logging.debug("關閉前 git 同步 flush 失敗", exc_info=True)
-    logging.info("--- Script Finished ---")
+        root.mainloop()
+    finally:
+        # restart_self 已 spawn 新行程；flush 的 git push 可能卡到 30s（離線 timeout），
+        # 新行程 ensure_single_instance 只重試 1.5s，必須先釋放 mutex 讓它能啟動。
+        release_single_instance()   # 冪等；atexit 再跑一次是 no-op
+        try:
+            app.storage.flush()
+        except Exception:
+            logging.debug("關閉前 git 同步 flush 失敗", exc_info=True)
+        logging.info("--- Script Finished ---")
 
 
 if __name__ == "__main__":

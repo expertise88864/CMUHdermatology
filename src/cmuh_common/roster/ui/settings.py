@@ -96,6 +96,8 @@ class SettingsTab(ttk.Frame):
         self.service = service
         self.on_changed = on_changed
         self._cfg = self.service.storage.load_config()
+        self._param_after_id = None                      # RF-21 參數存檔去抖 timer id
+        self.bind("<Destroy>", self._flush_params)       # 關窗前補存去抖中的參數
 
         # 整頁可捲動（區塊多）
         canvas = tk.Canvas(self, highlightthickness=0)
@@ -130,6 +132,15 @@ class SettingsTab(ttk.Frame):
         if self.on_changed:
             self.on_changed()
 
+    def on_shown(self) -> None:
+        """RF-19：切回設定分頁時重讀 storage 支撐的檢視（帳本為主——R/VS 分頁套用/
+        重算/定案都會改 ledger.json；其餘一併同步多機 git 與他分頁變動）。"""
+        self._reload_ledger()
+        self._reload_holidays()
+        self._reload_week_colors()
+        self._reload_batches()
+        self._reload_template()
+
     # ── 區塊 1/2：R / VS 名單 ────────────────────────────────────────────
     def _members(self, scope: str) -> list:
         return self._cfg.setdefault(f"{scope}_members", [])
@@ -163,13 +174,22 @@ class SettingsTab(ttk.Frame):
     def _reload_members(self, scope) -> None:
         tree, with_level, with_wd = self._member_trees[scope]
         tree.delete(*tree.get_children())
+        seen: set = set()
         for mem in self._members(scope):
+            # RF-18：空代號或重複代號直接以資料值當 Treeview iid 會撞根節點/既有節點
+            # 拋 TclError → SettingsTab 建構失敗 → 整個排班程式啟動即崩潰（多機人工解
+            # JSON 衝突留成兩筆是設計內流程）。略過顯示、不動檔案，讓使用者能開程式自救。
+            iid = str(mem.get("id") or "")
+            if not iid or iid in seen:
+                logging.warning("[roster.ui] 名單重複/空代號略過顯示：%r", mem)
+                continue
+            seen.add(iid)
             vals = [mem.get("id", ""), mem.get("name", "")]
             if with_level:
                 vals.append(mem.get("level", ""))
             if with_wd:
                 vals.append(_wd_to_text(mem.get("fixed_weekday")))
-            tree.insert("", "end", iid=mem.get("id", ""), values=vals)
+            tree.insert("", "end", iid=iid, values=vals)
 
     def _member_add(self, scope) -> None:
         _tree, with_level, with_wd = self._member_trees[scope]
@@ -313,8 +333,10 @@ class SettingsTab(ttk.Frame):
 
         def spin(parent, frm, to, init):
             var = tk.IntVar(value=int(init))
-            ttk.Spinbox(parent, from_=frm, to=to, width=5, textvariable=var,
-                        command=self._save_params).pack(side="left", padx=(2, 12))
+            # RF-21：只掛 trace，不掛 command——箭頭點擊會先寫 textvariable（觸發
+            # trace）再 invoke command，兩者並掛＝一次點擊觸發兩次存檔。
+            ttk.Spinbox(parent, from_=frm, to=to, width=5, textvariable=var
+                        ).pack(side="left", padx=(2, 12))
             var.trace_add("write", lambda *_a: self._save_params())
             return var
 
@@ -335,6 +357,17 @@ class SettingsTab(ttk.Frame):
         self._p_cap = spin(rowb, 1, 9, self._cfg.get("room_capacity", 2))
 
     def _save_params(self) -> None:
+        # RF-21：去抖 800ms——每個鍵擊/箭頭都觸發，直接存會每次全量 save_config +
+        # GitSync commit + 兩個 duty 分頁重繪 → UI 卡頓、git 雜訊 commit、暫態外洩。
+        if getattr(self, "_param_after_id", None):
+            try:
+                self.after_cancel(self._param_after_id)
+            except (tk.TclError, ValueError):
+                pass
+        self._param_after_id = self.after(800, self._save_params_now)
+
+    def _save_params_now(self) -> None:
+        self._param_after_id = None
         try:
             self._cfg["points"] = {
                 "weekday": self._p_wd.get(), "weekend": self._p_we.get(),
@@ -344,6 +377,22 @@ class SettingsTab(ttk.Frame):
         except (tk.TclError, ValueError):
             return                                   # 輸入中的暫態非數字
         self._save_cfg()
+
+    def _flush_params(self, event=None) -> None:
+        """關窗前把去抖中尚未存的參數立即存檔（避免關窗前 800ms 內的修改遺失）。"""
+        if event is not None and getattr(event, "widget", None) is not self:
+            return
+        if not getattr(self, "_param_after_id", None):
+            return
+        try:
+            self.after_cancel(self._param_after_id)
+        except (tk.TclError, ValueError):
+            pass
+        self._param_after_id = None
+        try:
+            self._save_params_now()
+        except tk.TclError:
+            pass                                     # destroy 時 var.get 可能已失效
 
     # ── PGY 預設代號 ─────────────────────────────────────────────────────
     def _build_pgy_defaults(self) -> None:
@@ -455,8 +504,16 @@ class SettingsTab(ttk.Frame):
 
     def _reload_batches(self) -> None:
         self._batch_tree.delete(*self._batch_tree.get_children())
+        seen: set = set()
         for b in self.service.storage.load_clerk_batches():
-            self._batch_tree.insert("", "end", iid=self._batch_key(b),
+            # RF-18：無 id 且無 start_monday（回傳 ""）或重複鍵 → 撞 Treeview iid 拋
+            # TclError → 啟動即崩潰。略過顯示、不動檔案（讓使用者能開程式自行刪修）。
+            key = self._batch_key(b)
+            if not key or key in seen:
+                logging.warning("[roster.ui] Clerk 梯次重複/空鍵略過顯示：%r", b)
+                continue
+            seen.add(key)
+            self._batch_tree.insert("", "end", iid=key,
                                     values=(b.get("start_monday", ""),
                                             "、".join(b.get("members") or [])))
 

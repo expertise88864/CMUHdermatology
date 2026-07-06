@@ -9,12 +9,14 @@ WD_CN = "一二三四五六日"                       # 週一..週日
 
 def member_tally(block: dict, holidays: set, params) -> dict:
     """{member_id: {"wd":平日班,"we":假日班,"pt":點數}}。block 為 build_export 的
-    scope 區塊（含 members / duty）。"""
+    scope 區塊（含 members / duty）。
+
+    RF-11：duty 中「已不在目前 config 名單」的值班者（換血/改 id 後匯出歷史月）也會
+    被動態納入——否則月曆頁印得出人、結算頁卻整列消失，對帳時數字對不上。
+    """
     out = {mid: {"wd": 0, "we": 0, "pt": 0} for mid in block["members"]}
     for d, p in block["duty"].items():
-        if p not in out:
-            continue
-        t = out[p]
+        t = out.setdefault(p, {"wd": 0, "we": 0, "pt": 0})
         if is_weekend(d):
             t["we"] += 1
         else:

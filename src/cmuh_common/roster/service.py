@@ -191,10 +191,34 @@ class RosterService:
                 slots = (day_slots.get(iso) or {}).get(session)
                 if on and slots is not None:
                     locked.setdefault(iso, {})[session] = slots
+
+        # RF-09：跨月梯次公平計數延續——對每個「起始日早於本月 1 號」的 covering 梯次，
+        # 讀上月檔 day_slots 中該梯 covers 的時段，供 month_solve_day 先回放進 fc。
+        prior_sessions: dict = {}
+        prior_pgy: set = set()
+        first = date(y, m, 1)
+        cross = [b for b in covering if b.start_monday < first]
+        if cross:
+            py, pm = (y - 1, 12) if m == 1 else (y, m - 1)
+            prev = self.storage.load_month(f"{py:04d}-{pm:02d}")
+            prev_slots = prev.get("day_slots") or {}
+            for iso, sessions in prev_slots.items():
+                try:
+                    dd = date.fromisoformat(iso)
+                except (ValueError, TypeError):
+                    continue
+                if any(b.covers(dd) for b in cross):
+                    prior_sessions.setdefault(iso, {}).update(sessions)
+            prev_pgy = prev.get("pgy_month_roster")
+            if prev_pgy is None:
+                prev_pgy = [str(mm.get("id")) for mm in (cfg.get("pgy_members") or [])]
+            prior_pgy = {str(x) for x in prev_pgy}
+
         return DaySolveInput(
             ym=ym, grid=grid, pgy_roster=list(pgy_roster),
             clerk_batches=covering, biopsy_open=biopsy_open, leaves=leaves,
-            capacity=RosterParams.from_config(cfg).room_capacity, locked=locked)
+            capacity=RosterParams.from_config(cfg).room_capacity, locked=locked,
+            prior_sessions=prior_sessions, prior_pgy=prior_pgy)
 
     def run_day_solve(self, ym: str) -> tuple:
         """build_day_input → month_solve_day。回 (day_slots, log, warnings)，不落地。"""
@@ -205,6 +229,16 @@ class RosterService:
         month = self.storage.load_month(ym)
         if month.get("finalized"):
             raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能套用")
+        # RF-04：落地前把「目前月檔中鎖定且有內容」的時段強制併回，不信任呼叫端帶來的
+        # day_slots 對鎖定時段的處置——掉出開診格網（如事後加假日）的鎖定日不會出現在
+        # solver 輸出，若整批覆蓋會靜默刪除鎖定內容並留幽靈鎖。淺拷貝勿改呼叫端 preview。
+        day_slots = {iso: dict(sess) for iso, sess in (day_slots or {}).items()}
+        cur = month.get("day_slots") or {}
+        for iso, sessions in (month.get("day_locks") or {}).items():
+            for session, on in sessions.items():
+                kept = (cur.get(iso) or {}).get(session)
+                if on and kept is not None:
+                    day_slots.setdefault(iso, {})[session] = kept
         month["day_slots"] = day_slots
         month["day_report"] = report or ""      # 供「報告」鈕顯示落地當下的報告
         self.storage.save_month(ym, month)
@@ -353,6 +387,26 @@ class RosterService:
         self.storage.save_month(ym, month)
         return self.quick_validate(scope, ym)
 
+    def clear_unlocked(self, scope: str, ym: str) -> None:
+        """清除未鎖定的 R/VS 值班格（保留鎖定格），一次 load/save，並清舊決策報告。
+
+        RF-20：取代 UI 逐格 set_cell（避免整月最多 31 次 load/save + 驗證 +
+        GitSync commit 造成 UI 凍結與 commit 洪水）。
+        """
+        month = self.storage.load_month(ym)
+        if month.get("finalized"):
+            raise FinalizedMonthError(f"{ym} 已定案（唯讀）")
+        duty = month.get(f"{scope}_duty") or {}
+        # 與逐格迴圈語意等價：只清「有 person 且未鎖」的格，保留鎖定格與無 person 殘格。
+        kept = {iso: c for iso, c in duty.items()
+                if c.get("locked") or not c.get("person")}
+        if kept == duty:                       # 沒有未鎖已排格 → 不 save，免空 commit
+            return
+        month[f"{scope}_duty"] = kept
+        month[f"report_{scope}"] = ""          # 舊報告已與清除後不符 → 一併清掉
+        self._audit(month, scope, "clear_unlocked", None, None, "clear")
+        self.storage.save_month(ym, month)
+
     def toggle_lock(self, scope: str, ym: str, d: date) -> bool:
         """切換鎖定（空格不可鎖）。回傳切換後的鎖定狀態。"""
         month = self.storage.load_month(ym)
@@ -467,6 +521,14 @@ class RosterService:
         if set(result.assignments) != set(ctx.days):
             return "涵蓋日期與當月不符"
         mids = set(ctx.member_ids())
+        # RF-03：鎖定格人選已不在名單時，accept 會保留舊鎖定人（service 寫入時無條件保留
+        # locked 格），但 solver/帳本/報告用的是另派的人 → 班表≠帳本≠預覽的分歧狀態。
+        # 六項既有檢查都看不到（該鎖定 directive 被 collect 忽略），在此明確擋下並給指引。
+        day_set = set(ctx.days)
+        for d, mid in sorted(ctx.locks.items()):
+            if d in day_set and mid not in mids:
+                return (f"{d.month}/{d.day} 鎖定格的 {mid} 已不在名單，"
+                        f"請先解鎖該格或改鎖名單內人選")
         # 結算基準＝result.points_by_person 的成員集（solver 對每位成員都填一筆）；
         # 與當前名單不符（含「預覽後新增成員」——舊 result 名單較小仍能通過逐格檢查）
         # → fair_share 會算在錯誤的人數/人選上，拒絕重排。

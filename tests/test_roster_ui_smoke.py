@@ -94,6 +94,64 @@ def test_settings_tab_builds_and_reloads(root, tmp_path):
     assert svc.storage.load_config()["duty_range_soft"] == [9, 11]
 
 
+def test_rf18_duplicate_member_id_no_startup_crash(root, tmp_path):
+    """RF-18：config 名單重複/空代號 → SettingsTab 建構不得拋 TclError。"""
+    svc = _svc(tmp_path)
+    cfg = svc.storage.load_config()
+    cfg["r_members"] = [{"id": "A"}, {"id": "A"}, {"id": ""}]   # 重複 + 空代號
+    svc.storage.save_config(cfg)
+    tab = SettingsTab(root, svc)                    # 不應拋例外
+    tab.pack(fill="both", expand=True)
+    root.update()
+    assert tab._member_trees["r"][0].get_children() == ("A",)   # 只顯示一筆 A
+
+
+def test_rf18_duplicate_batch_key_no_startup_crash(root, tmp_path):
+    """RF-18：兩筆無 id 同起始日的舊 Clerk 梯次 → 不得撞 Treeview iid 崩潰。"""
+    svc = _svc(tmp_path)
+    svc.storage.save_clerk_batches([
+        {"start_monday": "2026-08-03", "members": ["1"]},
+        {"start_monday": "2026-08-03", "members": ["2"]}])       # 無 id 同起始日
+    tab = SettingsTab(root, svc)                    # 不應拋例外
+    tab.pack(fill="both", expand=True)
+    root.update()
+    assert len(tab._batch_tree.get_children()) == 1
+
+
+def test_rf19_on_shown_reloads_ledger(root, tmp_path):
+    """RF-19：R/VS 分頁改帳本後切回設定頁 → on_shown 重讀顯示新餘額。"""
+    svc = _svc(tmp_path)
+    tab = SettingsTab(root, svc)
+    tab.pack(fill="both", expand=True)
+    root.update()
+    led = svc.storage.load_ledger()                 # 模擬 R 分頁 accept/重算改帳本
+    led["r"] = {"A": 3.5}
+    svc.storage.save_ledger(led)
+    tab.on_shown()
+    assert tab._led_tree.item("r:A", "values")[2] == "+3.50"
+
+
+def test_rf21_param_save_is_debounced(root, tmp_path, monkeypatch):
+    """RF-21：連續三次鍵擊 → 800ms 內 0 次 save_config，去抖後恰 1 次。"""
+    import time
+    svc = _svc(tmp_path)
+    tab = SettingsTab(root, svc)
+    tab.pack(fill="both", expand=True)
+    root.update()
+    calls = []
+    monkeypatch.setattr(svc.storage, "save_config", lambda cfg: calls.append(1))
+    tab._p_wd.set(2)
+    tab._p_wd.set(3)
+    tab._p_wd.set(4)                                # 模擬三次鍵擊
+    root.update()
+    assert calls == []                             # 800ms 內尚未存
+    deadline = time.time() + 3
+    while time.time() < deadline and not calls:    # 等去抖觸發
+        root.update()
+        time.sleep(0.05)
+    assert len(calls) == 1                          # 恰 1 次
+
+
 def test_settings_phase3_blocks(root, tmp_path):
     svc = _svc(tmp_path)                                # _svc 已存門診模板(101)
     svc.storage.save_clerk_batches(
@@ -167,10 +225,72 @@ def test_duty_tab_clear_unlocked_keeps_locked(root, tmp_path):
     tab._set_cell_and_refresh(date(2026, 8, 5), "A")
     tab._set_cell_and_refresh(date(2026, 8, 6), "B")
     tab._toggle_lock(date(2026, 8, 5))         # 鎖定 8/5
+    m = svc.storage.load_month(YM)             # RF-20：塞舊報告，清除後應一併清空
+    m["report_r"] = "OLD"
+    svc.storage.save_month(YM, m)
     tab._on_clear_unlocked()                    # 清未鎖定（askyesno→True）
     duty = svc.storage.load_month(YM)["r_duty"]
     assert "2026-08-05" in duty                 # 鎖定保留
     assert "2026-08-06" not in duty             # 未鎖定被清
+    assert svc.storage.load_month(YM).get("report_r") == ""   # RF-20：舊報告清空
+
+
+def test_rf05_discards_result_when_month_changed(root, tmp_path):
+    """RF-05：求解期間切月 → 結果屬別的月 → 捨棄不預覽/不套用。"""
+    svc = _svc(tmp_path)
+    tab = CalendarDutyTab(root, svc, "r", _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    tab.app.ym = "2026-09"                       # 求解期間切走月份
+    tab._on_solved(types.SimpleNamespace(status="ok"), "2026-08")
+    assert not [w for w in tab.winfo_children() if isinstance(w, tk.Toplevel)]
+    assert svc.storage.load_month("2026-09").get("r_duty") == {}
+
+
+def test_rf05_selector_disabled_while_busy(root, tmp_path):
+    """RF-05：求解中 MonthSelector 的 ◀▶ 停用；結束恢復。"""
+    svc = _svc(tmp_path)
+    tab = CalendarDutyTab(root, svc, "r", _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    tab._busy("x")
+    assert str(tab._selector._prev_btn["state"]) == "disabled"
+    assert str(tab._selector._next_btn["state"]) == "disabled"
+    tab._unbusy()
+    assert str(tab._selector._prev_btn["state"]) == "normal"
+
+
+def test_rf16_unbusy_on_finalized_month_keeps_report_and_final(root, tmp_path):
+    """RF-16：求解結束停在已定案月，報告鈕/定案勾選不得被永久停用。"""
+    svc = _svc(tmp_path)
+    m = svc.storage.load_month("2026-09")
+    m["finalized"] = True
+    svc.storage.save_month("2026-09", m)
+    tab = CalendarDutyTab(root, svc, "r", _app())    # app.ym=2026-08（未定案）
+    tab.pack(fill="both", expand=True)
+    root.update()
+    tab._busy("x")
+    tab._on_month_change("2026-09")                   # 求解中切到已定案月
+    tab._unbusy()                                     # 求解結束
+    assert str(tab._report_btn["state"]) == "normal"
+    assert str(tab._final_chk["state"]) == "normal"
+    tab._on_month_change("2026-08")                   # 切回未定案月
+    assert str(tab._auto_btn["state"]) == "normal"
+
+
+def test_rf17_refresh_during_busy_keeps_disabled_and_no_edit(root, tmp_path):
+    """RF-17：求解中 refresh 不得重新啟用編輯鈕；手排格為 no-op。"""
+    svc = _svc(tmp_path)
+    tab = CalendarDutyTab(root, svc, "r", _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    tab._busy("x")
+    tab.refresh()                                     # 切月/設定變更會觸發
+    assert str(tab._auto_btn["state"]) == "disabled"
+    assert str(tab._clear_btn["state"]) == "disabled"
+    assert str(tab._resettle_btn["state"]) == "disabled"
+    tab._on_cell_left(date(2026, 8, 3))               # 求解中手排 → no-op
+    assert "2026-08-03" not in svc.storage.load_month(YM).get("r_duty", {})
 
 
 def test_duty_tab_finalize_disables_editing(root, tmp_path):

@@ -74,12 +74,19 @@ def _sheet_summary(ws, data: dict) -> None:
     for scope in ("r", "vs"):
         block = data[scope]
         tally = member_tally(block, data["holidays"], data["params"])
-        for mid in block["members"]:
+        roster = set(block["members"])
+        # RF-11：先列目前名單，再補「有值班但已不在名單」者（動態納入，不漏列漏點數）。
+        extra = sorted(set(tally) - roster)
+        for mid in list(block["members"]) + extra:
             t = tally[mid]
-            bal = float(block["ledger"].get(mid, 0.0))
-            ws.append([scope.upper(), block["names"].get(mid, mid),
-                       t["wd"], t["we"], t["wd"] + t["we"], t["pt"],
-                       round(bal, 2)])
+            name = block["names"].get(mid, mid)
+            if mid in roster:
+                bal_cell = round(float(block["ledger"].get(mid, 0.0)), 2)
+            else:
+                name = f"{name}(已離)"
+                bal_cell = "—"        # 帳本已作廢，印 0.0 會被誤讀成「餘額歸零」
+            ws.append([scope.upper(), name,
+                       t["wd"], t["we"], t["wd"] + t["we"], t["pt"], bal_cell])
             row += 1
     for c, w in zip("ABCDEFG", (6, 10, 6, 6, 6, 6, 8)):
         ws.column_dimensions[c].width = w

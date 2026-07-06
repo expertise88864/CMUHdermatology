@@ -91,3 +91,9 @@ def sync_members(ledger: dict, scope: str, member_ids: list) -> None:
             logging.info("[roster.ledger] %s/%s 已離開名單，餘額 %.2f 作廢",
                          scope, mid, book[mid])
             del book[mid]
+            # RF-14：作廢＝餘額與歷史貢獻一併作廢，同步清掉「本 scope」history 內該員
+            # deltas，避免「移除→重加→同月 resettle」時 rollback 憑空再扣一次生成欠款。
+            # 只清本 scope（同 id 可能存在於另一 scope，清錯會造成鏡像雙重計入）。
+            for e in (ledger.get("history") or []):
+                if e.get("scope") == scope:
+                    (e.get("deltas") or {}).pop(mid, None)

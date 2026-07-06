@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from cmuh_common.roster.model import ClerkBatch, batches_covering  # noqa: E402
 from cmuh_common.roster.service import RosterService  # noqa: E402
-from cmuh_common.roster.solve_day import REST, TREATMENT  # noqa: E402
+from cmuh_common.roster.solve_day import BIOPSY, REST, TREATMENT  # noqa: E402
 from cmuh_common.roster.storage import (  # noqa: E402
     FinalizedMonthError, RosterStorage,
 )
@@ -154,6 +154,38 @@ def test_clear_unlocked_clears_stale_report(tmp_path):
     svc.accept_day_solution(YM, svc.run_day_solve(YM)[0], report="OLD")
     svc.clear_unlocked_day(YM)
     assert svc.storage.load_month(YM)["day_report"] == ""    # 舊報告一併清除
+
+
+def test_rf09_build_day_input_pulls_prior_month_sessions(tmp_path):
+    """RF-09：build_day_input 對跨月梯次讀上月 day_slots 填 prior_sessions。"""
+    svc = _svc(tmp_path)
+    svc.storage.save_clerk_batches([
+        {"id": "b", "start_monday": "2026-07-27", "members": ["1", "2"]}])
+    prev = svc.storage.load_month("2026-07")
+    prev["day_slots"] = {"2026-07-30": {"上午": {BIOPSY: ["1"]}}}
+    svc.storage.save_month("2026-07", prev)
+    inp = svc.build_day_input(YM)
+    assert inp.prior_sessions.get("2026-07-30", {}).get("上午", {}).get(BIOPSY) == ["1"]
+    assert "A" in inp.prior_pgy                             # 上月 PGY 供 replay 剔除
+
+
+def test_rf04_locked_preserved_when_day_becomes_holiday(tmp_path):
+    """RF-04：鎖定日事後變假日（掉出格網）→ 即使套用一份漏掉該日的 stale 預覽，
+    service 層仍會把鎖定時段強制併回，不得刪除鎖定內容。"""
+    svc = _svc(tmp_path)
+    svc.accept_day_solution(YM, svc.run_day_solve(YM)[0])
+    d = date(2026, 8, 3)
+    svc.toggle_day_lock(YM, d, "上午")
+    locked_slots = svc.storage.load_month(YM)["day_slots"]["2026-08-03"]["上午"]
+    # 事後把 8/3 加進國定假日表 → month_grid 排除該日
+    svc.storage.save_holiday_duty({"r": {d: "X"}, "vs": {}})
+    ds2, _l, _w = svc.run_day_solve(YM)
+    # 模擬掉出格網的 stale 預覽（漏掉 8/3）→ 直接餵給 accept 測 service 層防線
+    stale = {iso: sess for iso, sess in ds2.items() if iso != "2026-08-03"}
+    assert "2026-08-03" not in stale
+    svc.accept_day_solution(YM, stale)                     # 整批覆蓋（漏了鎖定日）
+    kept = svc.storage.load_month(YM)["day_slots"].get("2026-08-03", {}).get("上午")
+    assert kept == locked_slots                            # 鎖定內容仍原樣併回保留
 
 
 def test_wed_pm_treatment_present(tmp_path):

@@ -6,11 +6,27 @@
 - 開檔時 `git pull --ff-only`（只快進；有衝突/落後 → 警告，不自動 merge，交人工）。
 - 每次存檔：**本地 commit（同步、快，不卡 UI）** + **背景去抖 push**（把連續多筆
   存檔合併成一次 push，避免每個欄位各推一次、也不讓網路 push 凍住 UI）。
+- **推前先同步**（pull-before-push）：push 前先 fetch + ff-only merge；分歧時試
+  `git pull --rebase`（兩台改不同檔可全自動復原），rebase 失敗（同檔衝突）→
+  `rebase --abort` 並回報 diverged 狀態，絕不自動 merge JSON、交人工。
+- **週期性 pull**：長駐時每 `pull_interval_sec` 秒背景 fetch + ff-only，抓另一台
+  的變更；HEAD 有變即透過 `on_remote_change` 通知 UI 重繪。
+- 同步狀態透過 `on_sync_state(state, detail)` 回報（state ∈ ok/offline/diverged/
+  error）。**callback 會在背景 thread 執行**，UI 端需自行 marshal 回主執行緒
+  （並吞掉 mainloop 結束後的 TclError）。
 - 目錄非 git repo（使用者未設定 private repo）→ 自動退化為純 RosterStorage，
   所有存取照常、完全不碰 git。
 
+git 併發：所有會動到 working tree / index / refs 的操作（commit、pull、push、
+週期 pull）一律持 `self._git_lock`（RLock），避免背景 push 與 UI 存檔 commit、
+或兩個 push 互撞 .git/index.lock 或把 rebase/merge 中間態 commit 出去。
+
 前提：使用者已在該目錄 `git init` 或 clone private repo，且設好 remote 與認證
 （SSH key / 認證管理員）。本層只呼叫 git，不管理認證。
+
+註：本層會在首次啟動時建立 `.gitignore`（排除 *.bak-* / *.corrupt-* / *.tmp
+快照與暫存檔）。若既有 repo 在此版本前已誤把 *.bak-* commit 進歷史，需人工
+一次性 `git rm --cached -- '*.bak-*'` 清除，本層不自動處理。
 """
 from __future__ import annotations
 
@@ -25,50 +41,170 @@ from cmuh_common.roster.storage import RosterStorage
 
 class GitSyncStorage(RosterStorage):
     def __init__(self, base_dir: str, remote_sync: bool = True,
-                 push_debounce_sec: float = 3.0):
+                 push_debounce_sec: float = 3.0,
+                 on_sync_state=None, on_remote_change=None,
+                 pull_interval_sec: float = 300.0):
         super().__init__(base_dir)
         self._remote_sync = remote_sync
         self._debounce = push_debounce_sec
+        self._on_sync_state = on_sync_state
+        self._on_remote_change = on_remote_change
+        self._pull_interval = pull_interval_sec
         self._git_ok = self._is_git_repo()
-        self._push_lock = threading.Lock()
+        self.sync_state = "ok"
+        self._push_lock = threading.Lock()        # 只管 _push_timer 欄位
+        self._git_lock = threading.RLock()        # 所有 git working-tree/refs 操作
         self._push_timer: "threading.Timer | None" = None
+        self._stop_evt = threading.Event()
+        self._pull_thread: "threading.Thread | None" = None
         if self._git_ok and self._remote_sync:
+            # 先 pull：若 clone 的 repo 已含（他機提交過的）.gitignore，_ensure_gitignore
+            # 會偵測到而跳過，避免本機留下未追蹤的 .gitignore 撞掉之後的 ff-only merge。
             self._pull()
+            self._ensure_gitignore()
+            if self._pull_interval and self._pull_interval > 0:
+                self._pull_thread = threading.Thread(
+                    target=self._pull_loop, name="roster-git-pull", daemon=True)
+                self._pull_thread.start()
 
     # ── git 基礎 ─────────────────────────────────────────────────────────
     def _is_git_repo(self) -> bool:
         return os.path.isdir(os.path.join(self.base_dir, ".git"))
 
     def _git(self, *args, timeout: float = 30.0) -> subprocess.CompletedProcess:
+        # creationflags=CREATE_NO_WINDOW：pythonw(.pyw)無 console 環境下不閃黑窗
+        # （getattr 在非 Windows 回 0，POSIX 的 creationflags=0 為合法預設）。
         return subprocess.run(
             ["git", "-C", self.base_dir, *args],
-            capture_output=True, text=True, timeout=timeout, check=False)
+            capture_output=True, text=True, timeout=timeout, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+    def _ensure_gitignore(self) -> None:
+        """首次啟動建立 .gitignore（已存在則尊重使用者自訂、不動）。"""
+        p = os.path.join(self.base_dir, ".gitignore")
+        if os.path.exists(p):
+            return
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                # *.bak-*：storage 月檔快照；*.corrupt-*：壞檔備份（防禦性）；
+                # *.tmp：atomic_io 暫存檔（*.{name}.XXXX.tmp 亦被 * 涵蓋）。
+                f.write("*.bak-*\n*.corrupt-*\n*.tmp\n")
+        except OSError as e:
+            logging.warning("[roster.gitsync] 寫入 .gitignore 失敗（略過）：%s", e)
+
+    def _set_state(self, state: str, detail: str = "") -> None:
+        """更新同步狀態並通知 callback（callback 在呼叫端 thread 執行）。"""
+        self.sync_state = state
+        if state == "ok":
+            logging.info("[roster.gitsync] 同步狀態：ok")
+        else:
+            logging.warning("[roster.gitsync] 同步狀態：%s（%s）", state, detail)
+        cb = self._on_sync_state
+        if cb is not None:
+            try:
+                cb(state, detail)
+            except Exception:
+                logging.debug("[roster.gitsync] on_sync_state callback 失敗",
+                              exc_info=True)
+
+    def _current_branch(self) -> "str | None":
+        try:
+            r = self._git("rev-parse", "--abbrev-ref", "HEAD")
+        except (OSError, subprocess.SubprocessError):
+            return None
+        b = (r.stdout or "").strip()
+        if r.returncode != 0 or not b or b == "HEAD":   # detached / 解析失敗
+            return None
+        return b
+
+    def _rev_parse(self, ref: str) -> "str | None":
+        try:
+            r = self._git("rev-parse", ref)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return (r.stdout or "").strip() if r.returncode == 0 else None
 
     def _pull(self) -> None:
-        try:
-            r = self._git("pull", "--ff-only")
-        except (OSError, subprocess.SubprocessError) as e:
-            logging.warning("[roster.gitsync] pull 執行失敗（略過）：%s", e)
-            return
-        if r.returncode != 0:
-            logging.warning(
-                "[roster.gitsync] pull 未成功（可能離線/有衝突需人工處理，不自動"
-                "合併）：%s", (r.stderr or r.stdout).strip())
+        with self._git_lock:
+            try:
+                r = self._git("pull", "--ff-only")
+            except (OSError, subprocess.SubprocessError) as e:
+                logging.warning("[roster.gitsync] pull 執行失敗（略過）：%s", e)
+                self._set_state("offline", str(e))
+                return
+            if r.returncode != 0:
+                detail = (r.stderr or r.stdout).strip()
+                logging.warning(
+                    "[roster.gitsync] pull 未成功（可能離線/有衝突需人工處理，不自動"
+                    "合併）：%s", detail)
+                # 開檔 pull 失敗：保守回報 offline（真正的分歧由 push 路徑偵測並升級
+                # 為 diverged，避免啟動即彈嚇人的衝突視窗）。
+                self._set_state("offline", detail)
+            else:
+                self._set_state("ok")
+
+    # ── 週期性 pull（抓另一台的變更）────────────────────────────────────
+    def _pull_loop(self) -> None:
+        while not self._stop_evt.wait(self._pull_interval):
+            try:
+                self._periodic_pull()
+            except Exception:
+                logging.debug("[roster.gitsync] 週期 pull 失敗", exc_info=True)
+
+    def _periodic_pull(self) -> None:
+        """背景 fetch + ff-only；HEAD 有變 → 通知 on_remote_change。"""
+        changed = False
+        with self._git_lock:
+            remote = self._remote_name()
+            branch = self._current_branch()
+            if not remote or not branch:
+                return
+            before = self._rev_parse("HEAD")
+            f = self._git("fetch", remote, branch)
+            if f.returncode != 0:
+                self._set_state("offline", (f.stderr or f.stdout).strip())
+                return
+            m = self._git("merge", "--ff-only", "FETCH_HEAD")
+            if m.returncode == 0:
+                self._set_state("ok")
+                after = self._rev_parse("HEAD")
+                changed = bool(before and after and before != after)
+            # ff-only 失敗＝本機領先或分歧 → 留給 push 路徑處理，不在此升級狀態
+        if changed and self._on_remote_change is not None:
+            try:
+                self._on_remote_change()
+            except Exception:
+                logging.debug("[roster.gitsync] on_remote_change callback 失敗",
+                              exc_info=True)
 
     # ── 存檔攔截：本地 commit + 去抖 push ────────────────────────────────
     def _save(self, path: str, data: dict) -> None:
-        super()._save(path, data)                # 先照常原子寫入
+        super()._save(path, data)                # 先照常原子寫入（write-through，不卡）
         if not (self._git_ok and self._remote_sync):
             return
-        if self._commit(path):                   # commit 真的成功（或乾淨無變更）才推
+        # 拿不到 git 鎖＝背景正在 push/pull：檔案已寫盤，這次先略過 commit，
+        # 下次存檔的 add -A 會補收；仍排一次 push 以免變更留在本機。
+        if not self._git_lock.acquire(timeout=3.0):
+            logging.warning(
+                "[roster.gitsync] git 忙碌中，本次存檔延後 commit（檔案已寫盤，"
+                "下次存檔補收）：%s", os.path.basename(path))
             self._schedule_push()
+            return
+        try:
+            if self._commit(os.path.basename(path)):
+                self._schedule_push()
+        finally:
+            self._git_lock.release()
 
-    def _commit(self, path: str) -> bool:
-        """本地 commit。回傳是否可繼續推送（成功 or 乾淨無變更＝True；真失敗＝False）。"""
+    def _commit(self, label: str) -> bool:
+        """本地 commit（呼叫端須持 _git_lock）。
+
+        回傳是否可繼續推送（成功 or 乾淨無變更＝True；真失敗＝False）。
+        """
         try:
             self._git("add", "-A")
             r = self._git("commit", "-m",
-                          f"roster sync: {os.path.basename(path)} "
+                          f"roster sync: {label} "
                           f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
         except (OSError, subprocess.SubprocessError) as e:
             logging.warning("[roster.gitsync] 本地 commit 執行失敗：%s", e)
@@ -100,28 +236,63 @@ class GitSyncStorage(RosterStorage):
             self._push_timer.start()
 
     def _push(self) -> None:
-        remote = self._remote_name()
-        if not remote:
-            logging.info("[roster.gitsync] 尚未設定 remote，略過 push")
-            return
-        try:
-            # 明確 push 到 remote 的同名分支（HEAD）→ 不依賴 upstream 設定，
-            # `git init`+add remote 未 set-upstream 的情況也能推。
-            r = self._git("push", remote, "HEAD")
-        except (OSError, subprocess.SubprocessError) as e:
-            logging.warning("[roster.gitsync] push 執行失敗（略過，下次存檔再推）：%s", e)
-            return
-        if r.returncode != 0:
-            logging.warning(
-                "[roster.gitsync] push 未成功（可能離線/遠端較新需先 pull）：%s",
-                (r.stderr or r.stdout).strip())
+        """推前先同步（fetch + ff-only；分歧試 rebase）再 push。全程持 _git_lock。"""
+        with self._git_lock:
+            remote = self._remote_name()
+            if not remote:
+                logging.info("[roster.gitsync] 尚未設定 remote，略過 push")
+                return
+            branch = self._current_branch()
+            if not branch:
+                self._set_state("error", "detached HEAD，無法同步")
+                return
+            # 先確認遠端是否已有此分支：不存在＝首推（無需 fetch，直接 push 建立）；
+            # ls-remote 失敗＝連不到遠端（離線）。
+            ls = self._git("ls-remote", "--heads", remote, branch)
+            if ls.returncode != 0:
+                self._set_state("offline", (ls.stderr or ls.stdout).strip())
+                return
+            if (ls.stdout or "").strip():
+                f = self._git("fetch", remote, branch)
+                if f.returncode != 0:
+                    self._set_state("offline", (f.stderr or f.stdout).strip())
+                    return
+                m = self._git("merge", "--ff-only", "FETCH_HEAD")
+                if m.returncode != 0:
+                    # 分歧：先試 rebase（兩台改不同檔可自動復原）
+                    rb = self._git("pull", "--rebase", remote, branch)
+                    if rb.returncode != 0:
+                        self._git("rebase", "--abort")   # 同檔衝突 → 交人工
+                        self._set_state("diverged", (rb.stderr or rb.stdout).strip())
+                        return
+            try:
+                p = self._git("push", remote, "HEAD")
+            except (OSError, subprocess.SubprocessError) as e:
+                logging.warning(
+                    "[roster.gitsync] push 執行失敗（略過，下次存檔再推）：%s", e)
+                self._set_state("offline", str(e))
+                return
+            if p.returncode != 0:
+                detail = (p.stderr or p.stdout).strip()
+                logging.warning(
+                    "[roster.gitsync] push 未成功（可能離線/遠端較新需先 pull）：%s",
+                    detail)
+                self._set_state("offline", detail)
+                return
+            self._set_state("ok")
 
     def flush(self) -> None:
-        """立即推送（取消去抖、同步 push）；關閉程式前可呼叫確保不漏推。"""
+        """立即推送（取消去抖、同步 push）；關閉程式前呼叫確保不漏推。
+
+        先做一次 catch-up commit（補收 _save 因鎖逾時略過的變更），再 push。
+        """
         if not (self._git_ok and self._remote_sync):
             return
+        self._stop_evt.set()                     # 收掉週期 pull 執行緒
         with self._push_lock:
             if self._push_timer is not None:
                 self._push_timer.cancel()
                 self._push_timer = None
-        self._push()
+        with self._git_lock:
+            self._commit("關閉前同步")           # 補收未 commit 的變更
+            self._push()

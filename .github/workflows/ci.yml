@@ -29,6 +29,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install ruff pytest pyright
+          # RF-15：CI 裝 ortools 讓 tests/test_roster_solve.py 的 22 個 solver 測試真的跑
+          # （requirements.txt 維持不含 ortools＝使用者機器 lazy 安裝設計）。
+          # 版本與 src/cmuh_common/roster/__init__.py 的 ORTOOLS_PINNED_VERSION 同步。
+          pip install "ortools==9.15.6755"
+          # 防呆：裝失敗立即紅，避免 solver 測試退回靜默 skip 而無人察覺
+          python -c "import ortools"
 
       - name: Ruff (真 bug 類 lint — F/E9，規則見 ruff.toml)
         run: python -m ruff check src scripts tests

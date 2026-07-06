@@ -78,13 +78,15 @@ class MonthSelector(ttk.Frame):
         super().__init__(master)
         self._ym = initial_ym
         self._on_change = on_change
-        ttk.Button(self, text="◀", width=3,
-                   command=lambda: self._shift(-1)).pack(side="left")
+        self._prev_btn = ttk.Button(self, text="◀", width=3,
+                                    command=lambda: self._shift(-1))
+        self._prev_btn.pack(side="left")
         self._label = ttk.Label(self, width=12, anchor="center",
                                 font=("Microsoft JhengHei UI", 11, "bold"))
         self._label.pack(side="left", padx=4)
-        ttk.Button(self, text="▶", width=3,
-                   command=lambda: self._shift(1)).pack(side="left")
+        self._next_btn = ttk.Button(self, text="▶", width=3,
+                                    command=lambda: self._shift(1))
+        self._next_btn.pack(side="left")
         self._refresh()
 
     @property
@@ -95,6 +97,12 @@ class MonthSelector(ttk.Frame):
         """外部同步月份（不觸發 on_change，避免回圈）。"""
         self._ym = ym
         self._refresh()
+
+    def set_enabled(self, on: bool) -> None:
+        """啟用/停用 ◀▶（求解中停用，避免切月造成錯月重解/套用）。"""
+        st = "normal" if on else "disabled"
+        self._prev_btn.config(state=st)
+        self._next_btn.config(state=st)
 
     def _shift(self, delta: int) -> None:
         self._ym = ym_add(self._ym, delta)

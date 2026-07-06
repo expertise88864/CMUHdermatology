@@ -294,7 +294,7 @@ class CalendarDutyTab(ttk.Frame):
         return list(self._member_map().keys())
 
     def _on_cell_left(self, d: date) -> None:
-        if self._finalized:
+        if self._finalized or self._busy_flag:       # RF-17：求解中不得手排
             return
         duty = (self.service.storage.load_month(self.app.ym)
                 .get(f"{self.scope}_duty") or {})
@@ -304,7 +304,7 @@ class CalendarDutyTab(ttk.Frame):
         self.refresh()
 
     def _on_cell_right(self, event, d: date) -> None:
-        if self._finalized:
+        if self._finalized or self._busy_flag:       # RF-17：求解中不得開右鍵選單
             return
         menu = tk.Menu(self, tearoff=0)
         pick = tk.Menu(menu, tearoff=0)
@@ -342,19 +342,24 @@ class CalendarDutyTab(ttk.Frame):
     def _busy(self, text) -> None:
         self._busy_flag = True
         self._status.set(text)
+        self._selector.set_enabled(False)        # RF-05：求解中鎖住月份切換
         for w in self._toolbar:
             w.config(state="disabled")
 
     def _unbusy(self) -> None:
+        # RF-16：無條件恢復再套定案狀態——否則求解結束時若停在已定案月，「報告」鈕與
+        # 「定案」勾選會被永久停用（切回未定案月也救不回）。
         self._busy_flag = False
         self._status.set("就緒")
-        if not self._finalized:
-            for w in self._toolbar:
-                w.config(state="normal")
+        self._selector.set_enabled(True)
+        for w in self._toolbar:
+            w.config(state="normal")
+        self._apply_finalized_state()
 
     def _on_auto(self) -> None:
         if self._finalized or self._busy_flag:
             return
+        ym = self.app.ym                             # RF-05：捕捉觸發當下的月份
         try:
             import ortools  # noqa: F401
         except ImportError:
@@ -362,11 +367,11 @@ class CalendarDutyTab(ttk.Frame):
                     "需要安裝排班引擎",
                     "首次使用自動排班需下載 Google OR-Tools（約 30MB）。現在安裝？"):
                 return
-            self._install_then_solve()
+            self._install_then_solve(ym)
             return
-        self._start_solve()
+        self._start_solve(ym=ym)
 
-    def _install_then_solve(self) -> None:
+    def _install_then_solve(self, ym) -> None:
         self._busy("安裝排班引擎中（首次約需 1-2 分鐘）…")
 
         def work():
@@ -377,27 +382,28 @@ class CalendarDutyTab(ttk.Frame):
                 ensure_dependencies(_ORTOOLS_DEP)
             except (Exception, SystemExit) as e:  # noqa: BLE001
                 err = str(e) or "已取消或安裝失敗"
-            self.after(0, lambda: self._after_install(err))
+            self.after(0, lambda: self._after_install(err, ym))
         threading.Thread(target=work, name="ortools-install", daemon=True).start()
 
-    def _after_install(self, err) -> None:
+    def _after_install(self, err, ym) -> None:
         if err:
             self._unbusy()
             messagebox.showerror(
                 "安裝失敗",
                 f"排班引擎安裝失敗，請檢查網路後重試。\n詳見 dependency_install.log\n{err}")
             return
-        self._start_solve()
+        self._start_solve(ym=ym)
 
-    def _start_solve(self, allow_disable_color=False) -> None:
+    def _start_solve(self, allow_disable_color=False, ym=None) -> None:
         self._busy("排班中…")
-        ym, scope = self.app.ym, self.scope
+        ym = ym or self.app.ym                        # RF-05：一路帶著求解目標月
+        scope = self.scope
 
         def work():
             try:
                 res = self.service.run_solve(
                     scope, ym, allow_disable_color=allow_disable_color)
-                self.after(0, lambda: self._on_solved(res))
+                self.after(0, lambda: self._on_solved(res, ym))
             except Exception as e:  # noqa: BLE001
                 logging.exception("[roster.ui] 求解例外")
                 self.after(0, lambda exc=e: self._on_solve_error(exc))
@@ -407,24 +413,32 @@ class CalendarDutyTab(ttk.Frame):
         self._unbusy()
         messagebox.showerror("排班失敗", f"求解時發生錯誤：\n{exc}")
 
-    def _on_solved(self, res) -> None:
+    def _on_solved(self, res, ym) -> None:
         self._unbusy()
+        # RF-05：求解期間若月份已被切走，結果屬「別的月」→ 一律捨棄不套用/不預覽，
+        # 避免 need_confirm_color 對切換後的月份放寬重解、或預覽混搭錯月內容。
+        if ym != self.app.ym:
+            messagebox.showinfo(
+                "排班結果已捨棄",
+                f"求解期間月份已由 {ym} 切至 {self.app.ym}，結果未套用，"
+                f"請切回 {ym} 重新排班。")
+            return
         if res.status == "ok":
-            self._preview_and_accept(res)
+            self._preview_and_accept(res, ym)
         elif res.status == "need_confirm_color":
             if messagebox.askyesno(
                     "需放寬色塊連週規則",
                     "\n".join(res.diagnosis) + "\n\n是否放寬（將出現同色連週值班）？"):
-                self._start_solve(allow_disable_color=True)
+                self._start_solve(allow_disable_color=True, ym=ym)
         else:   # precheck_failed / infeasible / error
             self._show_report_text(
-                self.service.render_report(self.scope, self.app.ym, res),
+                self.service.render_report(self.scope, ym, res),
                 title=f"{_SCOPE_TITLE[self.scope]}（{res.status}）")
 
-    def _preview_and_accept(self, res) -> None:
-        text = self.service.render_report(self.scope, self.app.ym, res)
+    def _preview_and_accept(self, res, ym) -> None:
+        text = self.service.render_report(self.scope, ym, res)
         win = tk.Toplevel(self)
-        win.title(f"排班預覽 · {_SCOPE_TITLE[self.scope]} · {self.app.ym}")
+        win.title(f"排班預覽 · {_SCOPE_TITLE[self.scope]} · {ym}")
         win.transient(self)
         txt = tk.Text(win, wrap="none", width=64, height=28,
                       font=("Consolas", 10))
@@ -436,7 +450,7 @@ class CalendarDutyTab(ttk.Frame):
 
         def apply():
             try:
-                self.service.accept_solution(self.scope, self.app.ym, res)
+                self.service.accept_solution(self.scope, ym, res)
             except ValueError as e:
                 messagebox.showwarning("結果已過期", str(e), parent=win)
                 win.destroy()
@@ -452,16 +466,17 @@ class CalendarDutyTab(ttk.Frame):
 
     # ── 其他工具鈕 ───────────────────────────────────────────────────────
     def _on_clear_unlocked(self) -> None:
-        if self._finalized:
+        if self._finalized or self._busy_flag:       # RF-17：求解中不得清除
             return
         if not messagebox.askyesno("清除未鎖定", "清除所有未鎖定的排班格？"):
             return
-        duty = (self.service.storage.load_month(self.app.ym)
-                .get(f"{self.scope}_duty") or {})
-        for iso, cell in list(duty.items()):
-            if cell.get("person") and not cell.get("locked"):
-                self.service.set_cell(self.scope, self.app.ym,
-                                      date.fromisoformat(iso), None)
+        # RF-20：一次 load/save（非逐格 set_cell → 免 N 次驗證/git commit、UI 不凍結），
+        # 並清掉舊決策報告（清除後與 report 不符 → 誤導）。
+        try:
+            self.service.clear_unlocked(self.scope, self.app.ym)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("清除失敗", str(e))
+            return
         self.refresh()
 
     def _on_export(self) -> None:
@@ -552,6 +567,8 @@ class CalendarDutyTab(ttk.Frame):
             archive_finalize_pdf_async(self, self.service, self.app.ym)
 
     def _apply_finalized_state(self) -> None:
-        state = "disabled" if self._finalized else "normal"
+        # RF-17：求解中（_busy_flag）也要保持停用——refresh（切月/切分頁/設定變更）
+        # 會走到這裡，若只看 _finalized 會把編輯鈕在求解中重新啟用。
+        state = "disabled" if (self._finalized or self._busy_flag) else "normal"
         for w in (self._auto_btn, self._clear_btn, self._resettle_btn):
             w.config(state=state)

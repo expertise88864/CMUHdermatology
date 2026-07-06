@@ -217,6 +217,9 @@ class DaySolveInput:
     leaves: dict = field(default_factory=dict)        # {"pgy":{c:set},"clerk":{c:set}}
     capacity: int = 2
     locked: dict = field(default_factory=dict)        # {iso: {session: slots}} 鎖定不重排
+    # RF-09 跨月梯次延續：上月屬某跨月梯次的既存 day_slots（只餵切片/clerk 公平計數）
+    prior_sessions: dict = field(default_factory=dict)  # {iso: {session: slots}}
+    prior_pgy: set = field(default_factory=set)          # 上月 PGY 代號（從 replay 剔除）
 
 
 def _avail(roster: list, leave_map: dict, d: date) -> list:
@@ -228,12 +231,15 @@ def replay_counters(fc: FairCounters, d: date, session: str, slots: dict,
     """把「已鎖定/既存」時段結果餵進公平計數，讓後續未鎖時段對齊（不重新分配）。
     以名單分類 PGY/Clerk 命名空間（座位/放假）；治療室→tx、切片室→biopsy。"""
     wed_pm = (d.weekday() == WED and session == "下午")
+    # 治療室 key 是裸代號、PGY 代號整月穩定，stale key 不污染現役者 → 不過濾。
     for p in slots.get(TREATMENT, []):
         fc.tx_total[p] = fc.tx_total.get(p, 0) + 1
         if wed_pm:
             fc.tx_wed_pm[p] = fc.tx_wed_pm.get(p, 0) + 1
         fc.last_tx[p] = d
     for c in slots.get(BIOPSY, []):
+        if c not in clerk_set:            # RF-10：已換梯/非名單代號不污染切片命名空間
+            continue
         k = (batch_key, c)
         fc.biopsy_done[k] = fc.biopsy_done.get(k, 0) + 1
         fc.last_biopsy[k] = d
@@ -245,9 +251,31 @@ def replay_counters(fc: FairCounters, d: date, session: str, slots: dict,
             continue
         target = (fc.rest, fc.last_rest) if slot == REST else (fc.seat, fc.last_seat)
         for p in people:
+            if p not in pgy_set and p not in clerk_set:
+                continue                  # RF-10：未知代號不計座位/放假（不誤繼承）
             k = _ck(p)
             target[0][k] = target[0].get(k, 0) + 1
             target[1][k] = d
+
+
+def _warn_locked_content(warnings: list, d: date, session: str, locked_slots: dict,
+                         pgy_set: set, clerk_set: set,
+                         pgy_leave: dict, clerk_leave: dict) -> None:
+    """RF-10：鎖定內容原樣保留，但檢核當日請假者 / 非名單代號並人話警告（不改內容）。"""
+    warned_leave: set = set()
+    for slot_name, people in locked_slots.items():
+        for p in people:
+            if p not in pgy_set and p not in clerk_set:
+                warnings.append(f"{d.month}/{d.day} {session} 🔒鎖定時段內 {p} "
+                                f"不在本月 PGY 名單/當日梯次——請確認")
+                continue
+            if slot_name == REST or p in warned_leave:  # 放假不算衝突；同人只警告一次
+                continue
+            leave_set = pgy_leave.get(p) if p in pgy_set else clerk_leave.get(p)
+            if leave_set and d in leave_set:
+                warned_leave.add(p)
+                warnings.append(f"{d.month}/{d.day} {session} 🔒鎖定時段內 {p} "
+                                f"當日已請假，仍照鎖定排入——請確認或解鎖重排")
 
 
 def month_solve_day(inp: DaySolveInput) -> tuple:
@@ -264,12 +292,49 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
     pgy_leave = (inp.leaves.get("pgy") or {})
     clerk_leave = (inp.leaves.get("clerk") or {})
 
+    # RF-09：先把上月跨月梯次的既存班表餵進 fc（只餵切片室與 clerk 座位/放假；跳過
+    # 治療室與上月 PGY，避免污染本月 PGY 月度公平），讓「本梯未輪過切片」的判定與月底
+    # missed 警告都以「整梯」而非「本月」為單位。
+    for iso in sorted(inp.prior_sessions):
+        try:
+            d = date.fromisoformat(iso)
+        except (ValueError, TypeError):
+            continue
+        batch = next((b for b in inp.clerk_batches if b.covers(d)), None)
+        if batch is None:
+            continue
+        members = set(batch.members)
+        sessions = inp.prior_sessions[iso]
+        for session in STUDENT_SESSIONS:
+            slots = sessions.get(session)
+            if not slots:
+                continue
+            filtered = {}
+            for slot_name, people in slots.items():
+                if slot_name == TREATMENT:            # 治療室屬 PGY 月度公平 → 不跨月餵
+                    continue
+                keep = [p for p in people
+                        if p in members and p not in inp.prior_pgy]
+                if keep:
+                    filtered[slot_name] = keep
+            if filtered:
+                replay_counters(fc, d, session, filtered, batch.id,
+                                pgy_set=set(), clerk_set=members)
+
     solved_batch_ids: set = set()
+    overlap_days: dict = {}               # {(勝者id, 敗者id): [最早重疊日, 最晚重疊日]}
     for d in sorted(inp.grid):
         if is_weekend(d):
             continue
         iso = d.isoformat()
-        batch = next((b for b in inp.clerk_batches if b.covers(d)), None)
+        # RF-08：同日可能被多個梯次涵蓋（設定允許同週一多梯、或起始日打錯部分重疊）。
+        # 維持與原 next() 相同的決定性勝者＝原始順序第一個；其餘梯次成員該日不排，
+        # 累積重疊區間於迴圈後一次示警（點名被忽略的梯次與實際重疊日期）。
+        covering_today = [b for b in inp.clerk_batches if b.covers(d)]
+        batch = covering_today[0] if covering_today else None
+        for loser in covering_today[1:]:
+            rng = overlap_days.setdefault((batch.id, loser.id), [d, d])
+            rng[0], rng[1] = min(rng[0], d), max(rng[1], d)
         clerk_members = batch.members if batch else []
         batch_key = batch.id if batch else ""
         if batch:
@@ -279,6 +344,8 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
             locked_slots = (inp.locked.get(iso) or {}).get(session)
             if locked_slots is not None:          # 鎖定時段：保留原樣、只餵進計數
                 day_slots.setdefault(iso, {})[session] = locked_slots
+                _warn_locked_content(warnings, d, session, locked_slots,
+                                     pgy_set, clerk_set, pgy_leave, clerk_leave)
                 replay_counters(fc, d, session, locked_slots, batch_key,
                                 pgy_set, clerk_set)
                 log.append(f"{d.month}/{d.day}({'一二三四五六日'[d.weekday()]}) "
@@ -298,6 +365,23 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
             warnings.extend(f"{d.month}/{d.day} {ln.lstrip('⚠ ')}"
                             for ln in slog if ln.startswith("⚠"))
 
+    # RF-02：鎖定時段的日期若事後掉出開診格網（假日/週末），主迴圈迭代不到 → 在此
+    # 一律原樣補回輸出並人話警告，絕不因格網變動而無聲刪除鎖定內容（不餵計數：該日
+    # 實際休診，餵計數會扭曲治療室/放假公平輪轉）。
+    for iso, sessions in sorted(inp.locked.items()):
+        for session, slots in sessions.items():
+            if session not in day_slots.get(iso, {}):
+                day_slots.setdefault(iso, {})[session] = slots
+                warnings.append(f"{iso} {session} 🔒鎖定時段不在本月開診格網"
+                                f"（假日/週末？），已原樣保留，請確認是否解鎖")
+                log.append(f"{iso} {session} 🔒鎖定時段不在開診格網，原樣保留")
+
+    # RF-08：梯次重疊 → 點名被忽略的梯次與實際重疊日期（協助定位打錯的起始日）。
+    for (win, lose), (d1, d2) in sorted(overlap_days.items()):
+        warnings.append(
+            f"梯次重疊：{d1.isoformat()}～{d2.isoformat()} 由梯次 {win} 與 {lose} "
+            f"同時涵蓋，重疊日只採 {win}，{lose} 成員該期間不會被排班——請修正梯次起始日")
+
     # 切片室輪不到：只對「本月確有工作日被排」的梯次示警（否則邊界梯次會誤報）
     for b in inp.clerk_batches:
         if b.id not in solved_batch_ids:
@@ -305,6 +389,6 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
         missed = [c for c in sorted(b.members)
                   if fc.biopsy_done.get((b.id, c), 0) == 0]
         if missed:
-            warnings.append(f"切片室輪不到（梯次 {b.id}，本月內未排到）："
+            warnings.append(f"切片室輪不到（梯次 {b.id}，本梯內未排到）："
                             + "、".join(missed))
     return day_slots, log, warnings

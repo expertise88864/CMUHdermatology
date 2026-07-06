@@ -121,6 +121,30 @@ def test_ledger_reset_and_sync():
     assert "a" not in led["r"] and led["r"]["new"] == 0.0 and led["r"]["b"] == -2.0
 
 
+def test_rf14_remove_readd_resettle_no_phantom():
+    """RF-14：移除→重加→同月 resettle 不得憑空生欠款（history deltas 一併作廢）。"""
+    led = {"r": {}, "vs": {}, "history": []}
+    lg.settle_month(led, "r", "2026-01", {"a": 16, "b": 12})
+    assert led["r"] == {"a": 2.0, "b": -2.0}
+    lg.sync_members(led, "r", ["b"])                 # 移除 a → 餘額作廢
+    for e in led["history"]:                          # 且 history 內 a 的 deltas 已清
+        if e.get("scope") == "r":
+            assert "a" not in (e.get("deltas") or {})
+    lg.sync_members(led, "r", ["a", "b"])            # a 重加 → 0
+    lg.settle_month(led, "r", "2026-01", {"a": 0, "b": 0})   # 同月重算（清空後）
+    assert led["r"]["a"] == 0.0 and led["r"]["b"] == 0.0     # 不得為 -2.0
+
+
+def test_rf14_sync_members_scope_isolated_history():
+    """RF-14：只清本 scope 的 history deltas，另一 scope 同 id 保留。"""
+    led = {"r": {}, "vs": {}, "history": []}
+    lg.settle_month(led, "r", "2026-01", {"a": 16, "b": 12})
+    lg.settle_month(led, "vs", "2026-01", {"a": 10, "b": 6})
+    lg.sync_members(led, "r", ["b"])                 # 只從 r 移除 a
+    vs_hist = [e for e in led["history"] if e.get("scope") == "vs"]
+    assert any("a" in (e.get("deltas") or {}) for e in vs_hist)  # vs 的 a 未被誤清
+
+
 def test_ledger_history_trimmed_to_keep_months():
     """[OPT-4] history 只留近 HISTORY_KEEP_MONTHS 個月，不無限膨脹（餘額不受影響）。"""
     led = {"r": {}, "vs": {}, "history": []}

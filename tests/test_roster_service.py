@@ -213,6 +213,49 @@ def test_accept_rejects_stale_lock(tmp_path):
     assert svc.storage.load_ledger()["r"] == {}     # 帳本未被 settle
 
 
+def test_rf20_clear_unlocked_keeps_locked_and_clears_report(tmp_path):
+    """RF-20：clear_unlocked 一次 save、僅保留鎖定格、清空 report_r。"""
+    svc = _svc(tmp_path)
+    svc.set_cell("r", YM, date(2026, 8, 5), "A")
+    svc.set_cell("r", YM, date(2026, 8, 6), "B")
+    svc.set_cell("r", YM, date(2026, 8, 7), "A")
+    svc.toggle_lock("r", YM, date(2026, 8, 5))         # 鎖 8/5
+    m = svc.storage.load_month(YM)
+    m["report_r"] = "OLD REPORT"
+    svc.storage.save_month(YM, m)
+    svc.clear_unlocked("r", YM)
+    reload = svc.storage.load_month(YM)
+    assert set(reload["r_duty"]) == {"2026-08-05"}     # 僅鎖定格保留
+    assert reload["report_r"] == ""                    # 舊報告清空
+
+
+def test_rf20_clear_unlocked_finalized_guard(tmp_path):
+    """RF-20：已定案月 clear_unlocked 應拋 FinalizedMonthError。"""
+    svc = _svc(tmp_path)
+    svc.set_cell("r", YM, date(2026, 8, 5), "A")
+    m = svc.storage.load_month(YM)
+    m["finalized"] = True
+    svc.storage.save_month(YM, m)
+    with pytest.raises(FinalizedMonthError):
+        svc.clear_unlocked("r", YM)
+
+
+def test_rf03_rejects_lock_person_left_roster(tmp_path):
+    """RF-03：鎖定格人選被移出名單 → accept 拒絕（不寫出班表≠帳本的分歧狀態）。"""
+    svc = _svc(tmp_path, r_members=("A", "B", "C"))
+    svc.storage.save_month(YM, {"r_duty": {
+        "2026-08-03": {"person": "C", "locked": True, "source": "manual"}}})
+    cfg = svc.storage.load_config()                    # 移除 C
+    cfg["r_members"] = [m for m in cfg["r_members"] if m["id"] != "C"]
+    svc.storage.save_config(cfg)
+    res = _result_for(svc, YM, _cover(svc, YM, "A",
+                                      overrides={date(2026, 8, 3): "B"}))
+    with pytest.raises(ValueError, match="鎖定格"):
+        svc.accept_solution("r", YM, res)
+    assert svc.storage.load_ledger()["r"] == {}       # 無半套寫入
+    assert svc.storage.load_month(YM)["r_duty"]["2026-08-03"]["person"] == "C"
+
+
 def test_accept_rejects_stale_after_leave_change(tmp_path):
     """預覽後才有人請假（非鎖定變動）→ 舊 result 把請假者排上 → 拒絕。"""
     svc = _svc(tmp_path)
