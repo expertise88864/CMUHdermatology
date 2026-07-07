@@ -13,11 +13,14 @@ def member_tally(block: dict, holidays: set, params) -> dict:
 
     RF-11：duty 中「已不在目前 config 名單」的值班者（換血/改 id 後匯出歷史月）也會
     被動態納入——否則月曆頁印得出人、結算頁卻整列消失，對帳時數字對不上。
+
+    codex(33d8ecd)：平日的國定假日也算「假日班」——它在月曆被標假日、點數也以假日計，
+    結算表的平日/假日欄需一致（否則國定假日班被誤記進平日欄）。
     """
     out = {mid: {"wd": 0, "we": 0, "pt": 0} for mid in block["members"]}
     for d, p in block["duty"].items():
         t = out.setdefault(p, {"wd": 0, "we": 0, "pt": 0})
-        if is_weekend(d):
+        if is_weekend(d) or d in holidays:      # 週末或國定假日 → 假日班
             t["we"] += 1
         else:
             t["wd"] += 1

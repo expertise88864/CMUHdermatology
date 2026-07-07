@@ -110,6 +110,15 @@ def test_default_filename():
     assert default_filename(data, ".xlsx") == "115年07月班表.xlsx"
 
 
+def test_member_tally_weekday_holiday_counts_as_holiday(tmp_path):
+    """codex(33d8ecd)：平日的國定假日算假日班（we 欄），不進平日欄（wd）。"""
+    svc = _svc(tmp_path)
+    svc.storage.save_holiday_duty({"r": {date(2026, 8, 3): "X"}, "vs": {}})  # 8/3 週一設假日
+    data = svc.build_export(YM)
+    tally = member_tally(data["r"], data["holidays"], data["params"])
+    assert tally["B"] == {"wd": 0, "we": 1, "pt": 1}   # 8/3 週一國定假日→假日班
+
+
 def test_rf11_member_tally_includes_removed_member(tmp_path):
     """RF-11：值班者已不在 config 名單 → member_tally 仍動態納入、不漏點數。"""
     svc = _svc(tmp_path)
