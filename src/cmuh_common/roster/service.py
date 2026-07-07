@@ -328,6 +328,10 @@ class RosterService:
 
         寫入月檔 grid_overrides[iso][session]['closed_rooms']；month_grid 會據此把
         該診間排除，自動排班就不會把 PGY/Clerk 排進去。恢復＝從清單移除。
+
+        停診時，若當月已排過班（day_slots 已有該診間的人），一併把該診間的既有指派清掉，
+        讓「現有班表」也立即反映停診（否則格網仍顯示停診診間有人，直到手動重排）；但
+        鎖定的時段（day_locks）不動——鎖定契約是使用者鎖了就不無聲刪除，交由使用者自行處理。
         """
         month = self.storage.load_month(ym)
         if month.get("finalized"):
@@ -339,6 +343,8 @@ class RosterService:
         template = self.storage.load_clinic_template().get("template") or {}
         base = month_grid(ym, template, self.storage.holidays_set())
         ov = month.setdefault("grid_overrides", {})
+        day_slots = month.get("day_slots") or {}
+        day_locks = month.get("day_locks") or {}
         for d, day in base.items():
             if d < start or d > end:
                 continue
@@ -356,6 +362,11 @@ class RosterService:
                     sess.pop("closed_rooms", None)
                 if not sess:
                     ov[iso].pop(session, None)
+                # 停診 → 清掉既有班表中該診間的人（未鎖定時段才動，尊重鎖定契約）
+                if closed and not (day_locks.get(iso) or {}).get(session):
+                    slots = (day_slots.get(iso) or {}).get(session)
+                    if slots and room in slots:
+                        slots.pop(room, None)
             if iso in ov and not ov[iso]:
                 ov.pop(iso, None)
         self.storage.save_month(ym, month)

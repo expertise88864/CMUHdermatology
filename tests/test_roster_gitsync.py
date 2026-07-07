@@ -143,8 +143,9 @@ def _two_clones(tmp_path):
     _git(a, "config", "user.name", "aaa")
     (a / "README").write_text("roster", encoding="utf-8")
     # 已初始化的共享 repo：.gitignore 早已被 commit（後續 clone 皆取得追蹤版本，
-    # _ensure_gitignore 會跳過，不會各機留未追蹤檔撞 ff-only merge）。
-    (a / ".gitignore").write_text("*.bak-*\n*.corrupt-*\n*.tmp\n", encoding="utf-8")
+    # _ensure_gitignore 補缺行後不變，不會各機留未追蹤檔撞 ff-only merge）。
+    (a / ".gitignore").write_text(
+        "*.bak-*\n*.corrupt-*\n*.tmp\nfinalized/\n", encoding="utf-8")
     _git(a, "add", "-A")
     _git(a, "commit", "-m", "init")
     _git(a, "push", "-u", "origin", "HEAD")
@@ -254,6 +255,31 @@ def test_rf07_snapshots_excluded_by_gitignore(tmp_path):
     subprocess.run(["git", "clone", str(remote), str(check)],
                    capture_output=True, check=True)
     assert not list((check / "months").glob("*.bak-*"))    # 遠端也沒有
+
+
+def test_gitignore_includes_finalized(tmp_path):
+    """codex(794124e)：定案 PDF 目錄 finalized/ 應被 gitignore（純本機、不進 git）。"""
+    _remote, work = _init_repo_with_remote(tmp_path)
+    st = GitSyncStorage(str(work))
+    assert st._git_ok
+    lines = (work / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "finalized/" in lines and "*.bak-*" in lines
+
+
+def test_push_catches_up_uncommitted_change(tmp_path):
+    """codex(7657f7a)：_save 因鎖逾時只寫盤未 commit 時，背景 _push 會先補 commit 再推。"""
+    import json
+    remote, work = _init_repo_with_remote(tmp_path)
+    st = GitSyncStorage(str(work), pull_interval_sec=0)
+    # 模擬「已寫盤但未 commit」（跳過 _commit 的狀態）
+    (work / "config.json").write_text(
+        '{"r_members":[{"id":"Z"}],"schema_version":1}', encoding="utf-8")
+    st._push()                                     # 背景推送應先補 commit 再推
+    check = tmp_path / "check"
+    subprocess.run(["git", "clone", str(remote), str(check)],
+                   capture_output=True, check=True)
+    got = json.loads((check / "config.json").read_text(encoding="utf-8"))
+    assert got["r_members"] == [{"id": "Z"}]        # 遠端已收到補收的變更
 
 
 def test_rf13_git_uses_create_no_window(tmp_path, monkeypatch):

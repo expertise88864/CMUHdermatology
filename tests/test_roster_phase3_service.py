@@ -188,6 +188,18 @@ def test_clinic_closure_removes_room_for_range(tmp_path):
     assert svc.clinic_closures(YM) == {}
 
 
+def test_clinic_closure_clears_existing_assignments(tmp_path):
+    """停診時清掉既有班表中該診間的人（未鎖定時段）；鎖定時段保留（鎖定契約）。"""
+    svc = _svc(tmp_path)
+    svc.set_day_slot(YM, date(2026, 8, 3), "上午", "101", ["A"])
+    svc.set_day_slot(YM, date(2026, 8, 10), "上午", "101", ["B"])
+    svc.toggle_day_lock(YM, date(2026, 8, 10), "上午")     # 鎖定 8/10 上午
+    svc.set_clinic_closed(YM, "101", date(2026, 8, 3), date(2026, 8, 10), ["上午"])
+    m = svc.storage.load_month(YM)
+    assert "101" not in m["day_slots"]["2026-08-03"]["上午"]      # 未鎖 → 一併清掉
+    assert m["day_slots"]["2026-08-10"]["上午"]["101"] == ["B"]   # 鎖定 → 保留
+
+
 def test_clinic_closure_finalized_guard(tmp_path):
     svc = _svc(tmp_path)
     m = svc.storage.load_month(YM)

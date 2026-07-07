@@ -70,6 +70,22 @@ def test_export_pdf_empty_sections_no_crash(tmp_path):
     assert out.exists() and out.read_bytes()[:4] == b"%PDF"
 
 
+def test_export_pdf_wrap_splits_long_line():
+    """codex(794124e)：過長行逐字斷行，不整段畫出頁面右緣（避免被裁）。"""
+    from cmuh_common.roster.export_pdf import _wrap
+    assert _wrap("abcdefghij", len, 4) == ["abcd", "efgh", "ij"]
+    assert _wrap("ab", len, 4) == ["ab"]            # 不需斷
+    assert _wrap("", len, 4) == [""]                # 空行保留間距
+
+
+def test_export_pdf_long_line_produces_valid_pdf(tmp_path):
+    pytest.importorskip("reportlab")
+    from cmuh_common.roster import export_pdf
+    out = tmp_path / "long.pdf"
+    export_pdf.export(str(out), [("測試", "甲乙丙丁戊己庚辛" * 40)])   # 遠超一行寬
+    assert out.exists() and out.read_bytes()[:4] == b"%PDF"
+
+
 # ─── 純函式 ─────────────────────────────────────────────────────────────────
 def test_build_export_structure(tmp_path):
     data = _svc(tmp_path).build_export(YM)

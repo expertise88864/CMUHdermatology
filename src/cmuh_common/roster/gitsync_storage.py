@@ -72,23 +72,43 @@ class GitSyncStorage(RosterStorage):
         return os.path.isdir(os.path.join(self.base_dir, ".git"))
 
     def _git(self, *args, timeout: float = 30.0) -> subprocess.CompletedProcess:
+        # encoding='utf-8'（不用 text=True 的 locale 預設）：cp950/big5 中文 Windows
+        # （診間電腦）上，git 輸出的 UTF-8 中文（commit 訊息/分支/路徑）才不會
+        # UnicodeDecodeError 炸掉背景 push 執行緒。errors='replace' 再兜底。
+        # LC_ALL=C 讓 git 訊息維持英文（'nothing to commit' 判斷穩定）；
+        # GIT_TERMINAL_PROMPT=0 讓無 console 時 git 不卡等認證輸入直接失敗走離線。
         # creationflags=CREATE_NO_WINDOW：pythonw(.pyw)無 console 環境下不閃黑窗
         # （getattr 在非 Windows 回 0，POSIX 的 creationflags=0 為合法預設）。
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}
         return subprocess.run(
             ["git", "-C", self.base_dir, *args],
-            capture_output=True, text=True, timeout=timeout, check=False,
+            capture_output=True, encoding="utf-8", errors="replace",
+            timeout=timeout, check=False, env=env,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
+    # 需被 git 忽略的檔類：
+    # *.bak-*：storage 月檔快照；*.corrupt-*：壞檔備份（防禦性）；
+    # *.tmp：atomic_io 暫存檔（*.{name}.XXXX.tmp 亦被 * 涵蓋）；
+    # finalized/：定案 PDF 留底（二進位、可由已同步的月檔重生 → 純本機不進 git，
+    #   避免 repo 二進位膨脹，也免「PDF 直寫後遲遲沒 commit/推」的同步時序問題）。
+    _GITIGNORE_LINES = ("*.bak-*", "*.corrupt-*", "*.tmp", "finalized/")
+
     def _ensure_gitignore(self) -> None:
-        """首次啟動建立 .gitignore（已存在則尊重使用者自訂、不動）。"""
+        """確保 .gitignore 含必要規則（保留使用者既有內容，只補缺的標準行）。"""
         p = os.path.join(self.base_dir, ".gitignore")
-        if os.path.exists(p):
-            return
         try:
-            with open(p, "w", encoding="utf-8") as f:
-                # *.bak-*：storage 月檔快照；*.corrupt-*：壞檔備份（防禦性）；
-                # *.tmp：atomic_io 暫存檔（*.{name}.XXXX.tmp 亦被 * 涵蓋）。
-                f.write("*.bak-*\n*.corrupt-*\n*.tmp\n")
+            existing = ""
+            if os.path.exists(p):
+                with open(p, encoding="utf-8") as f:
+                    existing = f.read()
+            have = set(existing.splitlines())
+            missing = [ln for ln in self._GITIGNORE_LINES if ln not in have]
+            if not missing:
+                return
+            with open(p, "a" if existing else "w", encoding="utf-8") as f:
+                if existing and not existing.endswith("\n"):
+                    f.write("\n")
+                f.write("\n".join(missing) + "\n")
         except OSError as e:
             logging.warning("[roster.gitsync] 寫入 .gitignore 失敗（略過）：%s", e)
 
@@ -238,6 +258,10 @@ class GitSyncStorage(RosterStorage):
     def _push(self) -> None:
         """推前先同步（fetch + ff-only；分歧試 rebase）再 push。全程持 _git_lock。"""
         with self._git_lock:
+            # 先補收：_save 因鎖逾時略過 commit 時只排了 push，這裡（鎖已空出）把那筆
+            # 已寫盤但未 commit 的變更補 commit 進來，避免「存檔成功卻遲遲沒推、他機看到
+            # 舊資料」直到下次存檔或關程式才補上。乾淨樹＝nothing-to-commit（no-op）。
+            self._commit("背景補收")
             remote = self._remote_name()
             if not remote:
                 logging.info("[roster.gitsync] 尚未設定 remote，略過 push")
