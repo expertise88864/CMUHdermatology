@@ -346,6 +346,18 @@ VALIDATION_WINDOWS = {
     "eve_out": (dt_time(21, 0, 0), dt_time(21, 30, 0)),
 }
 
+
+class ClockAuthError(Exception):
+    """[AC-09] 帳號/密碼錯誤——不可重試(重試也一樣,只會反覆登入失敗、有帳號鎖定風險)。"""
+
+
+def _clock_window_passed(check_end: dt_time, grace_sec: int = 0) -> bool:
+    """[AC-01] 當下是否已超過打卡窗尾(可加緩衝秒)。打卡窗皆日間、不跨午夜。"""
+    from datetime import timedelta
+    now = datetime.now()
+    deadline = datetime.combine(now.date(), check_end) + timedelta(seconds=grace_sec)
+    return now > deadline
+
 LOCATORS = {
     "username": ("id", "TB_logid"),
     "password": ("id", "TB_pwd"),
@@ -529,13 +541,27 @@ def _warn_config_issues(accounts) -> None:
     _last_config_warn_set = cur
 
 
+def _sanitize_accounts(accounts) -> list:
+    """[AC-02] 消毒成 tick 路徑安全可迭代的形狀:剔除非 dict 項、schedule 非 dict
+    以 {} 取代(手改 JSON 塞 schedule:null / 非物件項時,避免每分鐘 tick 崩潰整批漏
+    打卡)。原始問題仍由 _warn_config_issues 對未消毒資料醒目提示。"""
+    out = []
+    for acc in (accounts if isinstance(accounts, list) else []):
+        if not isinstance(acc, dict):
+            continue
+        if not isinstance(acc.get("schedule"), dict):
+            acc = {**acc, "schedule": {}}
+        out.append(acc)
+    return out
+
+
 def load_config() -> list:
     global accounts_data
     with _config_lock:
         data = safe_load_json(str(CONFIG_FILE), default=[])
         accounts_data = data if isinstance(data, list) else []
-    _warn_config_issues(accounts_data)  # [W13] 醒目提示設定問題(不擋啟動)
-    return accounts_data
+    _warn_config_issues(accounts_data)  # [W13] 對原始資料醒目提示設定問題(不擋啟動)
+    return _sanitize_accounts(accounts_data)  # [AC-02] tick/迴圈路徑一律拿到安全資料
 
 
 def save_config() -> bool:
@@ -578,11 +604,25 @@ def login(driver, wait, username: str, password: str) -> None:
             login_btn = driver.find_element(*get_loc("login_button"))
             driver.execute_script("arguments[0].click();", login_btn)
 
+            # [AC-09] 錯帳密多半跳 JS alert(非 lblErrorMessage 元素)。先處理掉並分類為
+            # 不可重試,否則 alert 卡住頁面 → 後續 wait 逾時(WebDriverException)被當一般
+            # 網路錯誤重試 5x×外層 5x,反覆登入失敗且有 portal 帳號鎖定風險。
+            try:
+                _alert = WebDriverWait(driver, 2).until(EC.alert_is_present())
+                _txt = (_alert.text or "").strip()
+                try:
+                    _alert.accept()
+                except Exception:
+                    pass
+                raise ClockAuthError(f"登入被拒(可能帳號/密碼錯誤): {_txt[:40]}")
+            except TimeoutException:
+                pass
+
             try:
                 err_elem = WebDriverWait(driver, 2).until(
                     EC.visibility_of_element_located(get_loc("login_error_message")))
                 if err_elem.text.strip():
-                    raise RuntimeError(f"登入失敗: {err_elem.text}")
+                    raise ClockAuthError(f"登入失敗: {err_elem.text.strip()[:40]}")
             except TimeoutException:
                 pass
 
@@ -1006,6 +1046,15 @@ def perform_clock_action(driver, wait, acc, is_in: bool,
                 )
                 return
 
+            # [AC-01] 窗尾防線:portal 緩慢/登入重試堆疊時,確認點擊當下仍未超過打卡窗尾
+            # (加 60s 緩衝吸收「點擊→刷卡表登錄」延遲)。超窗放棄點擊,避免打出遲到紀錄;
+            # 未標記完成 → 由 _missed_clock_check 於窗結束後發補卡提醒接手。
+            if _clock_window_passed(check_end, grace_sec=60):
+                logging.warning(
+                    "[窗尾防線] %s %s 準備點擊時已超過打卡窗尾 %s(+60s 緩衝),放棄點擊"
+                    "避免遲到紀錄,交補卡提醒。", acc.get("username", "?"), act_name, check_end)
+                return
+
             driver.execute_script("arguments[0].click();", exec_btn)
 
             try:
@@ -1029,23 +1078,32 @@ def perform_clock_action(driver, wait, acc, is_in: bool,
                     acc["username"], act_name)
             return
 
+        except ClockAuthError as e:
+            # [AC-09] 帳密錯誤:當窗不再重試,單次醒目通知(避免反覆登入 + 帳號鎖定風險)。
+            logging.error("%s 帳號/密碼錯誤,當窗不再重試: %s", acc.get("username", "?"), e)
+            if dry_run:
+                messagebox.showerror("測試失敗(帳號/密碼錯誤)", str(e))
+            else:
+                _handle_clock_failure(driver, acc.get("username", "?"),
+                                      task_label, e, dry_run)
+            return
         except (StaleElementReferenceException, WebDriverException) as e:
             last_exc = e
             logging.warning(
                 "%s 操作遇到 %s，重試中 (%s/%s)...",
-                acc["username"], type(e).__name__, attempt + 1, retries)
+                acc.get("username", "?"), type(e).__name__, attempt + 1, retries)
             if attempt < retries - 1:
                 exponential_backoff_sleep(attempt, base_seconds=2.0, max_seconds=60.0)
             else:
-                logging.error("%s WebDriver 錯誤，重試用盡: %s", acc["username"], e)
+                logging.error("%s WebDriver 錯誤，重試用盡: %s", acc.get("username", "?"), e)
         except Exception as e:
             last_exc = e
-            logging.error("%s 操作失敗: %s", acc["username"], e)
+            logging.error("%s 操作失敗: %s", acc.get("username", "?"), e)
             if dry_run:
                 messagebox.showerror("測試失敗", str(e))
             break
 
-    _handle_clock_failure(driver, acc["username"], task_label, last_exc, dry_run)
+    _handle_clock_failure(driver, acc.get("username", "?"), task_label, last_exc, dry_run)
 
 
 # =============================================================================
@@ -1142,6 +1200,14 @@ def process_clock_task(schedule_key: str | None) -> None:
             _MAX_REBUILDS = 2
             for acc in accs:
                 if not running.is_set():
+                    break
+                # [AC-01] 窗尾防線:任務在窗尾起跑 + portal 慢時,已排隊到窗外的帳號不再
+                # 打卡(避免遲到紀錄),交補卡提醒接手。perform_clock_action 內另有一道點擊前檢查。
+                if _clock_window_passed(check_end):
+                    logging.warning(
+                        "[窗尾防線] 任務 %s 執行到 %s 已超過打卡窗尾 %s,剩餘帳號不再打卡"
+                        "(避免遲到紀錄),交補卡提醒。", schedule_key,
+                        datetime.now().strftime("%H:%M:%S"), check_end)
                     break
                 if _rebuilds < _MAX_REBUILDS and not _driver_session_alive(driver):
                     logging.warning(

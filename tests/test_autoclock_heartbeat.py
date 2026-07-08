@@ -479,6 +479,8 @@ def test_process_clock_task_rebuilds_dead_session_behavior(monkeypatch):
     )
     monkeypatch.setattr(autoclock, "_get_or_create_clock_driver",
                         lambda: created.pop(0))
+    # [AC-01] 本測試與窗尾防線無關;測試在任意實際時間跑,停用窗尾檢查以免超窗 break。
+    monkeypatch.setattr(autoclock, "_clock_window_passed", lambda *a, **k: False)
     monkeypatch.setattr(autoclock, "_driver_session_alive",
                         lambda driver: driver is rebuilt_driver)
     monkeypatch.setattr(autoclock, "WebDriverWait",

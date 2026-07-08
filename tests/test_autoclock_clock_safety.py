@@ -7,7 +7,7 @@ W3:點擊執行後須重讀刷卡表確認紀錄寫入才標記完成(_verify_cl
 """
 import os
 import sys
-from datetime import time as dt_time
+from datetime import datetime as _real_datetime, time as dt_time
 from unittest.mock import Mock
 
 import pytest
@@ -15,7 +15,9 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import autoclock as ac  # noqa: E402
-from selenium.common.exceptions import WebDriverException  # noqa: E402
+from selenium.common.exceptions import (  # noqa: E402
+    StaleElementReferenceException, WebDriverException,
+)
 
 
 class _FakeWait:
@@ -169,3 +171,93 @@ def test_active_clock_task_scope_clears_on_exception():
         with ac._active_clock_task_scope("x"):
             raise RuntimeError("boom")
     assert ac._active_clock_task_age()[0] is None
+
+
+# ─── AC-01:窗尾防線(_clock_window_passed) ────────────────────────────────
+
+def _freeze(monkeypatch, when: _real_datetime):
+    class _FakeDatetime:
+        @staticmethod
+        def now():
+            return when
+
+        @staticmethod
+        def combine(d, t):
+            return _real_datetime.combine(d, t)
+    monkeypatch.setattr(ac, "datetime", _FakeDatetime)
+
+
+def test_clock_window_not_passed_within_window(monkeypatch):
+    _freeze(monkeypatch, _real_datetime(2026, 7, 8, 7, 45))     # 窗內
+    assert ac._clock_window_passed(dt_time(8, 0)) is False
+
+
+def test_clock_window_passed_after_window(monkeypatch):
+    _freeze(monkeypatch, _real_datetime(2026, 7, 8, 8, 3))      # 超窗 3 分鐘=遲到
+    assert ac._clock_window_passed(dt_time(8, 0)) is True
+    assert ac._clock_window_passed(dt_time(8, 0), grace_sec=60) is True   # 仍超緩衝
+
+
+def test_clock_window_grace_absorbs_slight_overshoot(monkeypatch):
+    _freeze(monkeypatch, _real_datetime(2026, 7, 8, 8, 0, 30))  # 超窗 30 秒
+    assert ac._clock_window_passed(dt_time(8, 0)) is True                 # 無緩衝→超
+    assert ac._clock_window_passed(dt_time(8, 0), grace_sec=60) is False  # 60s 緩衝內
+
+
+# ─── AC-02:畸形設定消毒(_sanitize_accounts / load_config) ────────────────
+
+def test_sanitize_accounts_schedule_null_becomes_dict():
+    out = ac._sanitize_accounts(
+        [{"username": "a", "password": "p", "schedule": None}])
+    assert out[0]["schedule"] == {}
+    # 修前這行會 AttributeError(None.get)
+    assert out[0].get("schedule", {}).get("mon_am_in", False) is False
+
+
+def test_sanitize_accounts_drops_non_dict_items():
+    out = ac._sanitize_accounts(
+        ["junk", 123, {"username": "a", "schedule": {"mon_am_in": True}}])
+    assert len(out) == 1 and out[0]["username"] == "a"
+
+
+def test_sanitize_accounts_non_list_is_empty():
+    assert ac._sanitize_accounts(None) == []
+    assert ac._sanitize_accounts("x") == []
+
+
+def test_load_config_result_safe_for_schedule_get(monkeypatch):
+    """AC-02 端到端:畸形設定經 load_config 後,tick 的 schedule comprehension 不崩。"""
+    bad = [{"username": "a", "password": "p", "schedule": None},
+           "junk",
+           {"username": "b", "password": "p", "schedule": {"mon_am_in": True}}]
+    monkeypatch.setattr(ac, "safe_load_json", lambda *a, **k: bad)
+    accs = ac.load_config()
+    filtered = [a for a in accs if a.get("schedule", {}).get("mon_am_in", False)]
+    assert filtered == [{"username": "b", "password": "p",
+                         "schedule": {"mon_am_in": True}}]
+
+
+# ─── AC-09:帳密錯誤不可重試(ClockAuthError) ──────────────────────────────
+
+def test_auth_error_not_a_webdriver_exception():
+    """ClockAuthError 不屬 WebDriver/Stale → 不落入 login/perform 的重試 except。"""
+    assert not issubclass(ac.ClockAuthError, WebDriverException)
+    assert not issubclass(ac.ClockAuthError, StaleElementReferenceException)
+
+
+def test_perform_clock_action_no_retry_on_auth_error(monkeypatch):
+    """帳密錯誤 → login 只呼叫一次(非重試 5x),單次失敗通知。"""
+    calls = {"login": 0, "fail": 0}
+
+    def fake_login(*a, **k):
+        calls["login"] += 1
+        raise ac.ClockAuthError("登入被拒(可能帳號/密碼錯誤)")
+    monkeypatch.setattr(ac, "login", fake_login)
+    monkeypatch.setattr(ac, "_handle_clock_failure",
+                        lambda *a, **k: calls.__setitem__("fail", calls["fail"] + 1))
+    ac.perform_clock_action(
+        object(), _FakeWait(), {"username": "u", "password": "p"},
+        is_in=True, check_start=dt_time(7, 30), check_end=dt_time(8, 0),
+        dry_run=False, task_label="mon_am_in")
+    assert calls["login"] == 1        # 未重試
+    assert calls["fail"] == 1         # 單次通知
