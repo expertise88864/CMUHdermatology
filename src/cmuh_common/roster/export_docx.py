@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from cmuh_common.roster.export_common import (
-    WD_CN, leaves_summary, title_text,
+    WD_CN, day_grid_rows, leaves_summary, title_text,
 )
 from cmuh_common.roster.model import week_matrix
 
@@ -44,4 +44,27 @@ def export(path: str, data: dict) -> None:
             table.cell(3, c).text = vs["names"].get(vp, vp) if vp else ""
         doc.add_paragraph("")            # 週表格之間留白
 
+    _add_day_schedule(doc, data)         # [RS-01] PGY/Clerk 日排班
     doc.save(path)
+
+
+def _add_day_schedule(doc, data: dict) -> None:
+    """[RS-01] 附上 PGY/Clerk 週格網：每週一表格（首列＝日期；其後上午/下午各一列，
+    欄1＝時段標籤、欄2-6＝週一~五）。無日排班則整段略過。"""
+    blocks = day_grid_rows(data.get("day_slots") or {}, data["year"], data["month"])
+    if not blocks:
+        return
+    doc.add_heading("PGY / Clerk 日排班", level=2)
+    for blk in blocks:
+        rows = 1 + len(blk["sessions"])
+        table = doc.add_table(rows=rows, cols=6)
+        table.style = "Table Grid"
+        table.cell(0, 0).text = "日期"
+        for c, d in enumerate(blk["weekdays"], start=1):
+            table.cell(0, c).text = (f"{d.month}/{d.day}（{WD_CN[d.weekday()]}）"
+                                     if d else "")
+        for r, (sess, cells) in enumerate(blk["sessions"], start=1):
+            table.cell(r, 0).text = sess
+            for c, val in enumerate(cells, start=1):
+                table.cell(r, c).text = val
+        doc.add_paragraph("")

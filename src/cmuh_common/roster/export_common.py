@@ -2,7 +2,10 @@
 """匯出共用純函式（供 export_xlsx / export_docx）：統計、檔名、請假摘要。"""
 from __future__ import annotations
 
-from cmuh_common.roster.model import day_point, is_weekend, roc
+from cmuh_common.roster.model import (
+    STUDENT_SESSIONS, day_point, is_weekend, roc, week_matrix,
+)
+from cmuh_common.roster.solve_day import BIOPSY, PHOTO, REST, TREATMENT
 
 WD_CN = "一二三四五六日"                       # 週一..週日
 
@@ -47,3 +50,43 @@ def default_filename(data: dict, ext: str) -> str:
 
 def title_text(data: dict) -> str:
     return f"中國醫藥大學附設醫院 皮膚部　{roc(data['year'])}年{data['month']:02d}月 值班表"
+
+
+# ── PGY / Clerk 日排班匯出（RS-01） ─────────────────────────────────────────
+def _fmt_day_cell(slotmap: dict) -> str:
+    """把某(日,時段)的 {slot: [成員]} 排成 '照光:A 治療室:B 101:C 切片室:D' 字串。
+    順序：照光→治療室→跟診房(數字/字典序)→切片室→放假；空格省略。純函式。"""
+    if not slotmap:
+        return ""
+    rooms = sorted(k for k in slotmap
+                   if k not in (PHOTO, TREATMENT, BIOPSY, REST))
+    parts = []
+    for slot in (PHOTO, TREATMENT, *rooms, BIOPSY, REST):
+        members = slotmap.get(slot)
+        if members:
+            parts.append(f"{slot}:{'、'.join(members)}")
+    return " ".join(parts)
+
+
+def day_grid_rows(day_slots: dict, year: int, month: int) -> list:
+    """PGY/Clerk 週格網（供 export_xlsx / export_docx 共用的純函式）。
+
+    回傳每週一塊（僅含週一~週五；整週皆空的週略過）：
+      {"weekdays": [週一..週五 date|None],
+       "sessions": [(時段, [該時段週一..週五格字串 ×5]), ...]}
+    格字串見 _fmt_day_cell。學生不排週末，故只取每列前五欄。"""
+    day_slots = day_slots or {}
+    blocks: list = []
+    for week in week_matrix(year, month):
+        weekdays = list(week[:5])                        # 週一..週五
+        sessions = []
+        for sess in STUDENT_SESSIONS:
+            cells = []
+            for d in weekdays:
+                slotmap = ((day_slots.get(d.isoformat()) or {}).get(sess) or {}
+                           if d is not None else {})
+                cells.append(_fmt_day_cell(slotmap))
+            sessions.append((sess, cells))
+        if any(c for _s, cs in sessions for c in cs):    # 該週有任一格有內容才輸出
+            blocks.append({"weekdays": weekdays, "sessions": sessions})
+    return blocks

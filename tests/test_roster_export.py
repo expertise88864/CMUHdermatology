@@ -225,3 +225,69 @@ def test_rp3_05_pdf_export_with_symbols_smoke(tmp_path):
     out = str(tmp_path / "final.pdf")
     export_pdf.export(out, [("標題\U0001F512", "第一行 ✓\n第二行 ⚠ \U0001F600")])
     assert os.path.exists(out)
+
+
+# ─── RS-01：PGY/Clerk 日排班匯出 ────────────────────────────────────────────
+def test_rs01_fmt_cell_and_grid_rows():
+    """[RS-01] 格字串順序＝照光→治療室→房→切片→放假；週三下午照光有人無治療室。"""
+    from cmuh_common.roster.export_common import _fmt_day_cell, day_grid_rows
+    assert _fmt_day_cell(
+        {"照光": ["A"], "治療室": ["B"], "101": ["C"], "切片室": ["1"]}
+    ) == "照光:A 治療室:B 101:C 切片室:1"
+    assert _fmt_day_cell({"照光": ["A", "B"]}) == "照光:A、B"
+    assert _fmt_day_cell({}) == ""
+
+    day_slots = {
+        "2026-08-03": {"上午": {"照光": ["A"], "治療室": ["B"], "101": ["C"]}},
+        "2026-08-05": {"下午": {"照光": ["A"]}},          # 週三下午：只有照光
+    }
+    blocks = day_grid_rows(day_slots, 2026, 8)
+    assert blocks
+    # 找含 8/5（週三）的週，確認下午格＝照光有人、無治療室
+    wed_cells = []
+    for blk in blocks:
+        for i, d in enumerate(blk["weekdays"]):
+            if d and d.isoformat() == "2026-08-05":
+                pm = dict(blk["sessions"])["下午"]
+                wed_cells.append(pm[i])
+    assert wed_cells == ["照光:A"]
+    assert all("治療室" not in c for c in wed_cells)
+
+
+def _day_export_data(tmp_path):
+    st = RosterStorage(str(tmp_path))
+    st.save_config({"r_members": [], "vs_members": []})
+    m = st.load_month(YM)
+    m["day_slots"] = {
+        "2026-08-03": {"上午": {"照光": ["A"], "治療室": ["B"], "101": ["C"]}},
+        "2026-08-05": {"下午": {"照光": ["A"]}},
+    }
+    st.save_month(YM, m)
+    return RosterService(st).build_export(YM)
+
+
+def test_rs01_xlsx_has_pgy_clerk_sheet(tmp_path):
+    op = pytest.importorskip("openpyxl")
+    from cmuh_common.roster import export_xlsx
+    data = _day_export_data(tmp_path)
+    path = str(tmp_path / "day.xlsx")
+    export_xlsx.export(path, data)
+    wb = op.load_workbook(path)
+    assert "PGY-Clerk" in wb.sheetnames
+    # 內容有出現照光/治療室（至少一格非空）
+    ws = wb["PGY-Clerk"]
+    joined = "".join(str(c.value or "") for row in ws.iter_rows() for c in row)
+    assert "照光:A" in joined and "治療室:B" in joined
+
+
+def test_rs01_docx_has_day_schedule(tmp_path):
+    pytest.importorskip("docx")
+    from docx import Document
+
+    from cmuh_common.roster import export_docx
+    data = _day_export_data(tmp_path)
+    path = str(tmp_path / "day.docx")
+    export_docx.export(path, data)
+    doc = Document(path)
+    heads = [p.text for p in doc.paragraphs]
+    assert any("PGY / Clerk 日排班" in t for t in heads)

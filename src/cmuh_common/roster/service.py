@@ -31,7 +31,9 @@ from cmuh_common.roster.model import (
     ClerkBatch, Member, RosterParams, SolveContext, batches_covering, day_point,
     roc,
 )
-from cmuh_common.roster.solve_day import DaySolveInput, month_solve_day
+from cmuh_common.roster.solve_day import (
+    BIOPSY, PHOTO, REST, TREATMENT, DaySolveInput, month_solve_day,
+)
 from cmuh_common.roster.report import build_report
 from cmuh_common.roster.rules import Precheck, collect_directives, run_prechecks
 from cmuh_common.roster.solve_rvs import (
@@ -40,6 +42,7 @@ from cmuh_common.roster.solve_rvs import (
 from cmuh_common.roster.storage import FinalizedMonthError, RosterStorage
 
 _SCOPE_LABEL = {"r": "R 排班", "vs": "VS 排班"}
+_SPECIAL_SLOTS = frozenset((PHOTO, TREATMENT, BIOPSY, REST))   # 非跟診房的特殊格
 
 
 def _now() -> str:
@@ -146,11 +149,20 @@ class RosterService:
                     "duty": duty, "leaves": {k: sorted(v) for k, v in leaves.items()},
                     "ledger": dict((ledger.get(scope)) or {})}
 
+        # [RS-01] 供 PGY/Clerk 日排班匯出：帶上 day_slots（已排內容）與開診格網。
+        try:
+            day_grid = self.build_day_input(ym).grid
+        except Exception:
+            logging.warning("build_export 取日排班格網失敗（仍照常匯出 R/VS）",
+                            exc_info=True)
+            day_grid = {}
         return {
             "ym": ym, "year": y, "month": m,
             "holidays": holidays,
             "params": RosterParams.from_config(cfg),
             "r": scope_block("r"), "vs": scope_block("vs"),
+            "day_slots": month.get("day_slots") or {},
+            "day_grid": day_grid,
         }
 
     # ── PGY/Clerk 日排班（Phase 3）──────────────────────────────────────
@@ -260,6 +272,79 @@ class RosterService:
         self._audit(month, "day", f"{d.isoformat()} {session} {slot}",
                     old, people, "manual")
         self.storage.save_month(ym, month)
+
+    def set_day_session(self, ym: str, d: date, session: str, slots: dict) -> int:
+        """[RS-06] 一次覆寫某(日,時段)的所有格（slots＝{slot: [人]}；空清單→移除該格）。
+        一次 load、逐格 diff 才記 audit、一次 save。回傳實際變動的格數。取代
+        _DayEditDialog 逐格呼叫 set_day_slot（每格各一次 load/save/git commit）。"""
+        month = self.storage.load_month(ym)
+        sess = (month.setdefault("day_slots", {})
+                .setdefault(d.isoformat(), {}).setdefault(session, {}))
+        changed = 0
+        for slot, people in slots.items():
+            old = sess.get(slot)
+            new = list(people) if people else None
+            if (old or None) == (new or None):
+                continue                          # 無變化 → 不記 audit、不算入變動
+            changed += 1
+            if new:
+                sess[slot] = new
+            else:
+                sess.pop(slot, None)
+            self._audit(month, "day", f"{d.isoformat()} {session} {slot}",
+                        old, people, "manual")
+        if changed:
+            # 與逐格 set_day_slot 行為一致（清空後留空殼 {}，不另做空殼清理，
+            # 避免下游直接索引 day_slots[iso][session] 的路徑 KeyError）。
+            self.storage.save_month(ym, month)
+        return changed
+
+    def quick_validate_day(self, ym: str) -> list:
+        """[RS-07] PGY/Clerk 日排班快速檢查（warn 不擋存，符合設計 §16.4）。回傳訊息清單：
+        (a)請假者被排、(b)代號不在當日名單/梯次、(c)週三下午治療室/切片有人、
+        (d)房容量超標、(e)停診房仍有人（兜 RS-03/05 殘留）。"""
+        out: list = []
+        month = self.storage.load_month(ym)
+        day_slots = month.get("day_slots") or {}
+        if not day_slots:
+            return out
+        inp = self.build_day_input(ym)
+        cap = inp.capacity
+        pgy_set = {str(c) for c in inp.pgy_roster}
+        closures = self.clinic_closures(ym)
+        for iso in sorted(day_slots):
+            try:
+                d = date.fromisoformat(iso)
+            except (ValueError, TypeError):
+                continue
+            clerk_today = {str(c) for b in inp.clerk_batches
+                           if b.covers(d) for c in b.members}
+            valid = pgy_set | clerk_today
+            leavers = {mid for mid, ds in (inp.leaves.get("pgy") or {}).items()
+                       if d in ds}
+            leavers |= {mid for mid, ds in (inp.leaves.get("clerk") or {}).items()
+                        if d in ds}
+            for session, slots in (day_slots.get(iso) or {}).items():
+                closed = set((closures.get(iso) or {}).get(session) or [])
+                for slot, members in (slots or {}).items():
+                    members = members or []
+                    if (d.weekday() == 2 and session == "下午"
+                            and slot in (TREATMENT, BIOPSY) and members):
+                        out.append(f"{iso} {session}：{slot} 週三下午應休診，"
+                                   f"卻排了 {'、'.join(members)}")
+                    if slot not in _SPECIAL_SLOTS and len(members) > cap:
+                        out.append(f"{iso} {session} {slot} 診：{len(members)} 人"
+                                   f"超過容量 {cap}")
+                    if slot in closed and members:
+                        out.append(f"{iso} {session}：{slot} 已停診，"
+                                   f"卻仍排了 {'、'.join(members)}")
+                    for c in members:
+                        if c in leavers:
+                            out.append(f"{iso} {session} {slot}：{c} 當日請假卻被排")
+                        elif c not in valid:
+                            out.append(f"{iso} {session} {slot}："
+                                       f"{c} 不在當日 PGY 名單/梯次")
+        return out
 
     def set_pgy_month_roster(self, ym: str, codes) -> None:
         month = self.storage.load_month(ym)

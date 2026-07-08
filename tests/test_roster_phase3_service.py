@@ -277,3 +277,57 @@ def test_rs05_closure_skipped_locked_and_audit(tmp_path):
     m = svc.storage.load_month(YM)
     assert m["day_slots"]["2026-08-10"]["上午"]["101"] == ["B"]   # 鎖定保留
     assert any(a.get("via") == "closure" for a in m.get("audit", []))
+
+
+# ─── RS-06：_DayEditDialog 批次儲存（set_day_session） ───────────────────────
+def test_rs06_set_day_session_single_save_and_noop(tmp_path, monkeypatch):
+    """[RS-06] 一次覆寫整個時段：多格只 save 一次；內容無變化則完全不 save。"""
+    svc = _svc(tmp_path)
+    calls = {"n": 0}
+    orig = svc.storage.save_month
+    monkeypatch.setattr(svc.storage, "save_month",
+                        lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1),
+                                         orig(*a, **k))[1])
+    n = svc.set_day_session(YM, date(2026, 8, 3), "上午",
+                            {PHOTO: ["A"], TREATMENT: ["B"], "101": ["C"]})
+    assert n == 3 and calls["n"] == 1                    # 三格變動、僅一次落檔
+    calls["n"] = 0
+    n2 = svc.set_day_session(YM, date(2026, 8, 3), "上午",
+                             {PHOTO: ["A"], TREATMENT: ["B"], "101": ["C"]})
+    assert n2 == 0 and calls["n"] == 0                   # 無變化 → 不 save
+    slots = svc.storage.load_month(YM)["day_slots"]["2026-08-03"]["上午"]
+    assert slots[PHOTO] == ["A"] and slots["101"] == ["C"]
+
+
+def test_rs06_set_day_session_clears_slot_content(tmp_path):
+    """清空某格 → 該格不再有內容（與逐格 set_day_slot 一致，空殼留否為實作細節）。"""
+    svc = _svc(tmp_path)
+    svc.set_day_session(YM, date(2026, 8, 3), "上午", {PHOTO: ["A"]})
+    svc.set_day_session(YM, date(2026, 8, 3), "上午", {PHOTO: []})   # 清空該格
+    sess = (((svc.storage.load_month(YM).get("day_slots") or {})
+             .get("2026-08-03") or {}).get("上午") or {})
+    assert PHOTO not in sess
+
+
+# ─── RS-07：日排班快速檢查（quick_validate_day） ────────────────────────────
+def test_rs07_quick_validate_flags_leave_and_wed_pm(tmp_path):
+    """[RS-07] 手排請假者 → 警告；週三下午治療室有人 → 警告。"""
+    svc = _svc(tmp_path)
+    svc.set_leaves("pgy", YM, "A", {date(2026, 8, 3)})
+    svc.set_day_slot(YM, date(2026, 8, 3), "上午", PHOTO, ["A"])   # 請假者被排
+    svc.set_day_slot(YM, date(2026, 8, 5), "下午", TREATMENT, ["B"])  # 週三下午治療室
+    warns = svc.quick_validate_day(YM)
+    assert any("請假" in w and "A" in w for w in warns)
+    assert any("週三下午" in w and TREATMENT in w for w in warns)
+
+
+def test_rs07_quick_validate_flags_closed_room_residue(tmp_path):
+    """[RS-07] 停診房仍有人（兜 RS-03/05 殘留）→ 警告。"""
+    svc = _svc(tmp_path)
+    svc.set_day_slot(YM, date(2026, 8, 3), "上午", "101", ["A"])
+    m = svc.storage.load_month(YM)
+    (m.setdefault("grid_overrides", {}).setdefault("2026-08-03", {})
+     .setdefault("上午", {}))["closed_rooms"] = ["101"]
+    svc.storage.save_month(YM, m)
+    warns = svc.quick_validate_day(YM)
+    assert any("停診" in w and "101" in w for w in warns)

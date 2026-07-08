@@ -478,3 +478,25 @@ def test_rp3_20_leave_editor_keeps_edits_across_member_switch(root, tmp_path):
     leaves = svc.build_context("r", YM).leaves
     assert leaves["A"] == {date(2026, 8, 10), date(2026, 8, 11)}
     assert leaves["B"] == {date(2026, 8, 12)}
+
+
+def test_rs07_day_tab_refresh_populates_warnings(root, tmp_path):
+    """[RS-07] refresh 會呼叫 quick_validate_day 並填警告面板（週三下午治療室有人）。"""
+    svc = _svc(tmp_path)
+    svc.set_day_slot(YM, date(2026, 8, 5), "下午", "治療室", ["A"])   # 週三下午
+    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    tab.refresh()
+    items = [tab._warns.get(i) for i in range(tab._warns.size())]
+    assert any("週三下午" in it for it in items)
+
+
+def test_rs01_day_tab_export_cancel_no_crash(root, tmp_path, monkeypatch):
+    """[RS-01] 日排班分頁「匯出」鈕：取消存檔對話框 → 直接 return，不起緒、不炸。"""
+    svc = _svc(tmp_path)
+    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    monkeypatch.setattr(day_mod.filedialog, "asksaveasfilename", lambda **k: "")
+    tab._on_export()      # 取消 → 不應拋例外

@@ -6,7 +6,9 @@ Sheet「結算」：每位成員的平日/假日/總班/點數/帳本餘額。
 """
 from __future__ import annotations
 
-from cmuh_common.roster.export_common import WD_CN, member_tally, title_text
+from cmuh_common.roster.export_common import (
+    WD_CN, day_grid_rows, member_tally, title_text,
+)
 from cmuh_common.roster.model import is_weekend, week_matrix
 
 
@@ -17,6 +19,7 @@ def export(path: str, data: dict) -> None:
     wb = Workbook()
     _sheet_calendar(wb.active, data)
     _sheet_summary(wb.create_sheet("結算"), data)
+    _sheet_day_schedule(wb.create_sheet("PGY-Clerk"), data)   # [RS-01]
     # 通用樣式：所有格自動換行、置中
     for ws in wb.worksheets:
         for row in ws.iter_rows():
@@ -90,3 +93,37 @@ def _sheet_summary(ws, data: dict) -> None:
             row += 1
     for c, w in zip("ABCDEFG", (6, 10, 6, 6, 6, 6, 8)):
         ws.column_dimensions[c].width = w
+
+
+def _sheet_day_schedule(ws, data: dict) -> None:
+    """[RS-01] PGY/Clerk 日排班：每週一區塊（日期表頭列 + 上午/下午各一列，欄＝週一~五）。"""
+    from openpyxl.styles import Font, PatternFill
+
+    ws.title = "PGY-Clerk"
+    ws.merge_cells("A1:F1")
+    ws["A1"] = f"PGY / Clerk 日排班（{data['year']}/{data['month']:02d}）"
+    ws["A1"].font = Font(bold=True, size=14)
+
+    blocks = day_grid_rows(data.get("day_slots") or {}, data["year"], data["month"])
+    row = 2
+    for blk in blocks:
+        hcell = ws.cell(row=row, column=1, value="日期")
+        hcell.font = Font(bold=True)
+        for c, d in enumerate(blk["weekdays"], start=2):
+            v = f"{d.month}/{d.day}（{WD_CN[d.weekday()]}）" if d else ""
+            cc = ws.cell(row=row, column=c, value=v)
+            cc.font = Font(bold=True)
+            cc.fill = PatternFill("solid", fgColor="EFEFEF")
+        row += 1
+        for sess, cells in blk["sessions"]:
+            ws.cell(row=row, column=1, value=sess).font = Font(bold=True)
+            for c, val in enumerate(cells, start=2):
+                ws.cell(row=row, column=c, value=val)
+            ws.row_dimensions[row].height = 40
+            row += 1
+        row += 1                                   # 週之間留空列
+    if not blocks:
+        ws["A2"] = "（本月無 PGY / Clerk 日排班）"
+    ws.column_dimensions["A"].width = 8
+    for c in "BCDEF":
+        ws.column_dimensions[c].width = 20
