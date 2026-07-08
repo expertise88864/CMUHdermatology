@@ -22,6 +22,9 @@ import cmuh_common.smtp_mail as smtp_mail  # noqa: E402
 def _base_cfg(**over) -> dict:
     cfg = dict(cq.DEFAULT_CONFIG)
     cfg.update({
+        # [CQ-04] DEFAULT_CONFIG 帳密現為空;測試需非空,否則 _do_full_job 的帳密守衛擋下 flow
+        "username": "testuser",
+        "password": "testpass",
         "mail_method": "smtp",
         "recipients": ["sched_a@x.tw", "sched_b@x.tw"],
         "email_trigger_recipients": ["fallback@x.tw"],
@@ -565,6 +568,82 @@ def test_manual_extract_failure_does_not_overwrite_baseline(monkeypatch):
     cq._do_full_job("手動")
     assert len(h.sent) == 1                              # 手動照常寄
     assert saved == []                                   # 基準未被覆寫
+
+
+# ─── CQ-04/05/07:帳密硬編碼、systemftp 孤兒、收件人空 ──────────────────────
+
+def test_default_config_has_no_hardcoded_credentials():
+    """[CQ-04] DEFAULT_CONFIG 不得硬編碼院內 HIS 帳密(此檔進 public repo)。"""
+    assert cq.DEFAULT_CONFIG["username"] == ""
+    assert cq.DEFAULT_CONFIG["password"] == ""
+
+
+def test_has_his_credentials_guard():
+    """[CQ-04] 空/缺帳密 → False(main 會強制開設定,不以空帳密啟動)。"""
+    assert cq._has_his_credentials({"username": "u", "password": "p"}) is True
+    assert cq._has_his_credentials({"username": "", "password": "p"}) is False
+    assert cq._has_his_credentials({"username": "u", "password": ""}) is False
+    assert cq._has_his_credentials({"username": " ", "password": "p"}) is False
+    assert cq._has_his_credentials({}) is False
+
+
+def test_cleanup_orphan_systemftp_kills_only_windowless(monkeypatch):
+    """[CQ-05] 本 session 中使用者桌面無可見視窗的 systemftp=孤兒→關;有視窗者保留。"""
+    monkeypatch.setattr(cq, "_systemftp_pids", lambda: {100, 200, 300})
+    monkeypatch.setattr(cq, "_pid_session", lambda pid: 1)   # 全在同一 session
+    monkeypatch.setattr(cq.os, "getpid", lambda: 50)
+    monkeypatch.setattr(cq, "find_windows", lambda *a, **k: [11, 22])   # 兩個可見視窗
+    monkeypatch.setattr(cq, "_window_pid", lambda h: {11: 100, 22: 200}.get(h, -1))
+    killed = []
+    monkeypatch.setattr(cq, "close_pids", lambda pids, **k: killed.append(set(pids)))
+    cq._cleanup_orphan_systemftp()
+    assert killed == [{300}]           # 只關無視窗孤兒 300;100/200 保留
+
+
+def test_cleanup_orphan_systemftp_ignores_other_session(monkeypatch):
+    """[CQ-05 codex] 其他登入 session 的 systemftp 不納入判定(免殺其他使用者的 HIS)。"""
+    monkeypatch.setattr(cq, "_systemftp_pids", lambda: {100, 999})
+    monkeypatch.setattr(cq, "_pid_session",
+                        lambda pid: 1 if pid in (50, 100) else 2)   # 999 屬別的 session
+    monkeypatch.setattr(cq.os, "getpid", lambda: 50)
+    monkeypatch.setattr(cq, "find_windows", lambda *a, **k: [])     # 本 session 無視窗
+    monkeypatch.setattr(cq, "_window_pid", lambda h: -1)
+    killed = []
+    monkeypatch.setattr(cq, "close_pids", lambda pids, **k: killed.append(set(pids)))
+    cq._cleanup_orphan_systemftp()
+    assert killed == [{100}]           # 只清本 session 孤兒 100;別 session 的 999 不動
+
+
+def test_cleanup_orphan_systemftp_skips_when_no_session(monkeypatch):
+    """[CQ-05 codex] 取不到本 session id → 保守整個跳過(不冒險殺跨 session)。"""
+    monkeypatch.setattr(cq, "_systemftp_pids", lambda: {100})
+    monkeypatch.setattr(cq, "_pid_session", lambda pid: None)
+    killed = []
+    monkeypatch.setattr(cq, "close_pids", lambda pids, **k: killed.append(pids))
+    cq._cleanup_orphan_systemftp()
+    assert killed == []
+
+
+def test_cleanup_orphan_systemftp_noop_when_none(monkeypatch):
+    monkeypatch.setattr(cq, "_systemftp_pids", lambda: set())
+    called = []
+    monkeypatch.setattr(cq, "close_pids", lambda pids, **k: called.append(pids))
+    cq._cleanup_orphan_systemftp()
+    assert called == []
+
+
+def test_do_full_job_empty_recipients_skips_flow(monkeypatch):
+    """[CQ-07] 收件人為空 → 不跑 flow、不寄信(免每輪白開 systemftp 登入擷取 3 次才失敗)。"""
+    h = _JobHarness(monkeypatch, _base_cfg(recipients=[]))
+    cq._do_full_job("17:00")
+    assert h.flow_runs == 0 and h.sent == []
+
+
+def test_do_full_job_blank_credentials_skips_flow(monkeypatch):
+    """[CQ-04] 執行中設定被改成空帳密 → 不跑 flow(避免空帳密每輪登入失敗/帳號鎖定)。"""
+    h = _JobHarness(monkeypatch, _base_cfg(username="", password=""))
+    cq._do_full_job("17:00")
+    assert h.flow_runs == 0 and h.sent == []
 
 
 def test_grid_fallback_none_only_when_entries_found(monkeypatch):

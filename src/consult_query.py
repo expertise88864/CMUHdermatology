@@ -123,8 +123,10 @@ CONFIG_MUTEX_NAME = "Local\\CMUH_Skin_ConsultQuery_Config_v1"
 _MAX_RECIPIENTS = 8
 
 DEFAULT_CONFIG = {
-    "username": "101358",
-    "password": "101aa358",
+    # [CQ-04] 不硬編碼院內 HIS 帳密(此檔進 public repo)。首啟無設定檔會強制開設定
+    # 視窗填寫(見 main());既有部署 config 已存在、不受影響。
+    "username": "",
+    "password": "",
     # 一般排程（每日 12:30 / 17:00）收件人
     "recipients": [
         "expertise88864@gmail.com",
@@ -287,6 +289,13 @@ _SCHED_TIME_MIGRATION = {
     "weekday_times": (_OLD_SCHED_DEFAULTS, _NEW_SCHED_DEFAULT),
     "weekend_times": (_OLD_SCHED_DEFAULTS, _NEW_SCHED_DEFAULT),
 }
+
+
+def _has_his_credentials(cfg: dict) -> bool:
+    """[CQ-04] 設定是否已填 HIS 帳號/密碼。空帳密不啟動——否則每輪排程/手動都以空字串
+    登入、每次失敗(甚至有 portal 鎖定風險),而使用者只會覺得「都沒收到信」。"""
+    return bool(str(cfg.get("username") or "").strip()
+                and str(cfg.get("password") or "").strip())
 
 
 def load_config() -> dict:
@@ -488,6 +497,18 @@ def _window_pid(hwnd: int) -> int:
         return -1
 
 
+def _pid_session(pid: int):
+    """[CQ-05] 回 PID 所屬的 Windows 登入 session id(取不到回 None)。用於多使用者/RDS
+    機器把孤兒清掃限縮在本 session,避免誤殺其他使用者的行程。"""
+    try:
+        sid = ctypes.c_ulong()
+        if ctypes.windll.kernel32.ProcessIdToSessionId(int(pid), ctypes.byref(sid)):
+            return sid.value
+    except Exception:
+        pass
+    return None
+
+
 def find_windows(class_name: str | None = None, title_prefix: str | None = None,
                  pids: set | None = None, visible_only: bool = True) -> list:
     """列舉符合條件的 top-level 視窗，回傳 hwnd list。"""
@@ -644,6 +665,31 @@ def show_offscreen(hwnd: int) -> None:
                               win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
     except Exception:
         logging.debug("show_offscreen 失敗", exc_info=True)
+
+
+def _save_window_state(hwnd: int):
+    """[CQ-06] 記錄視窗原始 placement + 擴充樣式(GWL_EXSTYLE),供借用使用者既有實例時
+    finally 還原 —— 否則 show_offscreen 把使用者的住院系統移到螢幕外並改成工具視窗後不還原,
+    使用者的視窗會「憑空消失」到重開程式為止。失敗回 None。"""
+    try:
+        return (win32gui.GetWindowPlacement(hwnd),
+                win32gui.GetWindowLong(hwnd, GWL_EXSTYLE))
+    except Exception:
+        logging.debug("[CQ-06] 記錄視窗狀態失敗", exc_info=True)
+        return None
+
+
+def _restore_window_state(hwnd: int, state) -> None:
+    """[CQ-06] 還原 _save_window_state 存下的 placement + 樣式(借用視窗收尾用)。"""
+    if not state:
+        return
+    placement, exstyle = state
+    try:
+        if win32gui.IsWindow(hwnd):
+            win32gui.SetWindowLong(hwnd, GWL_EXSTYLE, exstyle)
+            win32gui.SetWindowPlacement(hwnd, placement)
+    except Exception:
+        logging.debug("[CQ-06] 還原借用視窗狀態失敗", exc_info=True)
 
 
 def settext_safe(hwnd: int, text: str) -> None:
@@ -1910,6 +1956,7 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
     fg_before = win32gui.GetForegroundWindow()
     our_pids: set = set()
     borrowed = False  # 是否借用了啟動前就存在的實例(finally 收尾依此決定保留)
+    borrowed_win_state: dict = {}  # [CQ-06] 借用視窗 hwnd → 原始 (placement, exstyle)
 
     try:
         # 等登入視窗出現；期間冒出「請勿開啟超過兩個」提示就立刻 PostMessage OK。
@@ -1955,6 +2002,8 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
         # 最大化、移到螢幕外後顯示再 SetForegroundWindow（使用者看不到、滑鼠不動），
         # 再 SetFocus + WM_CHAR 打字。stealth_skip 讓隱形執行緒別把它藏回去。
         stealth_skip.add(login)
+        if borrowed:  # [CQ-06] 借用使用者實例 → 先存原始狀態,finally 還原(免視窗消失)
+            borrowed_win_state[login] = _save_window_state(login)
         show_offscreen(login)
         if not force_foreground(login):
             logging.warning("登入視窗未取得前景，仍嘗試輸入")
@@ -2016,6 +2065,8 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
             raise RuntimeError("等不到會診通知單視窗")
         # 主執行緒接手：別讓隱形執行緒藏它，解除最大化移到螢幕外顯示後 PrintWindow
         stealth_skip.add(consult)
+        if borrowed:  # [CQ-06] 借用視窗 → 存原始狀態供 finally 還原
+            borrowed_win_state[consult] = _save_window_state(consult)
         show_offscreen(consult)
         time.sleep(1.8)  # 讓清單內容載入完成
         logging.info("會診通知單視窗已開啟，準備擷取")
@@ -2044,6 +2095,10 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
             logging.info("已關閉本次開啟的 systemftp 實例")
         except Exception:
             logging.warning("關閉 systemftp 實例失敗", exc_info=True)
+        # [CQ-06] 借用使用者既有實例的視窗被 show_offscreen 移到螢幕外+改工具視窗 → 還原
+        # 原始位置/樣式,否則使用者的住院系統會消失到重開為止。放在關閉本次實例後、還前景前。
+        for _hwnd, _state in borrowed_win_state.items():
+            _restore_window_state(_hwnd, _state)
         try:
             if fg_before and win32gui.IsWindow(fg_before):
                 win32gui.SetForegroundWindow(fg_before)
@@ -2287,6 +2342,44 @@ def _kill_systemftp(before_pids=None) -> None:
         logging.debug("taskkill 本任務 PID 失敗（可能已結束）", exc_info=True)
 
 
+def _cleanup_orphan_systemftp() -> None:
+    """[CQ-05] 啟動清掃:上次硬退(self-watchdog/托盤退出/更新重啟)遺留在隱藏桌面的
+    systemftp —— 已登入 HIS、隱形、佔記憶體,且下次任務的 before_pids 快照會把它圈進
+    「不可殺」而永久存活累積(≥2 個時配合『請勿開啟超過兩個』限制會讓後續登入更不穩)。
+
+    判定:某 systemftp PID 在【使用者桌面】沒有任何可見 top-level 視窗 → 視為前世孤兒
+    (隱藏桌面殘留)→ 關閉。保守起見只殺『使用者桌面無可見視窗』者,絕不動使用者正常開啟的
+    住院系統(它在使用者桌面必有可見視窗,含最小化)。只在啟動時(持有單例 mutex 後)呼叫一次。
+    """
+    try:
+        all_pids = _systemftp_pids()
+        if not all_pids:
+            return
+        # [CQ-05 codex] 多使用者/RDS/快速使用者切換:_systemftp_pids() 是全機掃描,但
+        # EnumWindows 只看得到「本 session 桌面」的視窗 → 其他使用者作用中的 HIS(不同
+        # session)會被誤判無視窗=孤兒而被殺(本程式可能提權)。故先把候選 PID 過濾到
+        # 本登入 session,取不到本 session id 時保守整個跳過。
+        my_sid = _pid_session(os.getpid())
+        if my_sid is None:
+            logging.debug("[CQ-05] 取不到本 session id → 保守跳過孤兒清掃")
+            return
+        all_pids = {p for p in all_pids if _pid_session(p) == my_sid}
+        if not all_pids:
+            return
+        # 本主執行緒在使用者互動桌面 → EnumWindows 只列舉本 session 桌面的視窗;
+        # 隱藏桌面(HIDDEN_DESKTOP_NAME)上的孤兒在此看不到任何視窗 → 被判為孤兒。
+        visible = find_windows(pids=all_pids, visible_only=True)
+        on_user_desktop = {_window_pid(h) for h in visible}
+        orphans = all_pids - on_user_desktop
+        if orphans:
+            logging.warning(
+                "[CQ-05] 清掃前世遺留的隱形 systemftp 孤兒(使用者桌面無視窗): %s",
+                sorted(orphans))
+            close_pids(orphans)
+    except Exception:
+        logging.warning("[CQ-05] systemftp 孤兒清掃失敗(略過,不影響啟動)", exc_info=True)
+
+
 def _do_full_job(trigger_label: str, override_recipients=None) -> None:
     """完整一次任務：跑流程 → 寄信。供排程／手動共用，整體互斥。
 
@@ -2356,6 +2449,21 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
             recipients_label = "recipients"
         sender = cfg.get("sender_account", "") or ""
         retry_count = _normalize_retry_count(cfg.get("retry_count", 3))
+
+        # [CQ-04] 執行中設定被改成空帳密 → 不跑 HIS 自動化(避免以空帳密每輪登入失敗、
+        # 甚至觸發 portal 帳號鎖定;啟動守衛只擋開機那次,這裡擋執行期改動)。
+        if not _has_his_credentials(cfg):
+            logging.error(
+                "[會診] 尚未設定 HIS 帳號/密碼,本次(%s)不執行流程;請至設定填寫。",
+                trigger_label)
+            return
+        # [CQ-07] 收件人被清空 → 不跑完整 HIS 自動化(免每輪白開 systemftp、登入、擷取 3 次
+        # 才在寄信步驟失敗),直接記 error 返回。
+        if not recipients:
+            logging.error(
+                "[會診] 收件人清單為空(%s),本次(%s)不執行流程/不寄信;請至設定填寫收件人。",
+                recipients_label, trigger_label)
+            return
 
         subject = cfg["subject_template"].format(date=date_str, time=time_str)
         body = cfg["body_template"].format(date=date_str, time=time_str)
@@ -3677,12 +3785,14 @@ def main() -> None:
                 release_single_instance()
             return
 
-        # 第一次啟動：設定檔不存在 → 強制開設定視窗
-        if not CONFIG_FILE.exists():
-            logging.info("首次啟動，未偵測到設定檔，先開啟設定視窗")
+        # 第一次啟動(無設定檔)或【尚未填 HIS 帳密】→ 強制開設定視窗。
+        # [CQ-04] 帳密不再硬編碼,故也要擋「設定檔存在但缺帳密」→ 否則每輪以空帳密狂試登入。
+        if not CONFIG_FILE.exists() or not _has_his_credentials(load_config()):
+            logging.info("首次啟動或尚未設定 HIS 帳號/密碼，先開啟設定視窗")
             ConfigApp().mainloop()
-            if not CONFIG_FILE.exists():
-                logging.info("設定視窗關閉但未儲存任何設定，結束")
+            if not _has_his_credentials(load_config()):
+                logging.info("設定視窗關閉但仍未填 HIS 帳號/密碼，結束"
+                             "(不以空帳密啟動,避免每輪登入失敗)")
                 return
 
         logging.info("=== 會診查詢程式啟動 v%s ===", CURRENT_VERSION)
@@ -3697,6 +3807,9 @@ def main() -> None:
         # 啟動權限狀態（給「自動提權有沒有真的生效」一個白紙黑字證據）
         logging.info("執行權限：%s",
                      "admin ✓" if is_admin() else "一般使用者 ✗（systemftp 會 740 失敗）")
+        # [CQ-05] 清掃前世硬退遺留在隱藏桌面的 systemftp 孤兒(持有單例 mutex 後才做,
+        # 確保不會誤殺另一個實例的作用中 systemftp)。
+        _cleanup_orphan_systemftp()
         threading.Thread(target=_check_update_in_background,
                          name="ConsultUpdateChecker", daemon=True).start()
 
