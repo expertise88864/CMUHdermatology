@@ -205,3 +205,23 @@ def test_export_empty_month_no_crash(tmp_path):
     data = RosterService(st).build_export(YM)
     export_xlsx.export(str(tmp_path / "empty.xlsx"), data)
     assert (tmp_path / "empty.xlsx").exists()
+
+
+# ─── RP3-05：定案 PDF 符號淨化 ──────────────────────────────────────────────
+def test_rp3_05_pdf_sanitize_maps_and_boxes():
+    """[RP3-05] 已知符號換可讀替代；BMP 外字元一律 □（避免 MSung 字型畫成空框）。"""
+    from cmuh_common.roster.export_pdf import _sanitize
+    assert _sanitize("\U0001F512鎖定") == "[鎖]鎖定"
+    assert _sanitize("✓通過 ✗失敗 ⚠注意") == "[v]通過 [x]失敗 [!]注意"
+    assert _sanitize("純中文與 ASCII abc 不變") == "純中文與 ASCII abc 不變"
+    assert _sanitize("\U0001F600") == "□"          # 未列入對照的 emoji → □
+    assert _sanitize("・═") == ".="
+
+
+def test_rp3_05_pdf_export_with_symbols_smoke(tmp_path):
+    """含 🔒/⚠/emoji 的 sections 仍能產出 PDF（不因字型缺字崩）。"""
+    pytest.importorskip("reportlab")
+    from cmuh_common.roster import export_pdf
+    out = str(tmp_path / "final.pdf")
+    export_pdf.export(out, [("標題\U0001F512", "第一行 ✓\n第二行 ⚠ \U0001F600")])
+    assert os.path.exists(out)

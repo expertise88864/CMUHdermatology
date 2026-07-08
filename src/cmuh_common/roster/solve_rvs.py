@@ -232,7 +232,10 @@ def solve_duty(ctx: SolveContext, allow_disable_color: bool = False) -> SolveRes
         for m in ctx.members:
             days_m = [d for d, mid in assignments.items() if mid == m.id]
             res.duty_counts[m.id] = len(days_m)
-            res.weekend_counts[m.id] = sum(1 for d in days_m if is_weekend(d))
+            # [RS-02] 平日的國定假日也算「假日班」(月曆標假日、點數也以假日計),
+            # 須與 export_common.member_tally 的 we 欄一致(否則報告/UI 三處矛盾)。
+            res.weekend_counts[m.id] = sum(
+                1 for d in days_m if is_weekend(d) or d in ctx.holidays)
             res.weekday_counts[m.id] = res.duty_counts[m.id] - res.weekend_counts[m.id]
             res.points_by_person[m.id] = sum(
                 day_point(d, ctx.holidays, ctx.params) for d in days_m)

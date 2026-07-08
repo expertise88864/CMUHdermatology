@@ -446,11 +446,24 @@ class _ClinicClosureDialog(tk.Toplevel):
             messagebox.showwarning("缺時段", "至少選一個時段", parent=self)
             return
         try:
-            self.service.set_clinic_closed(self.ym, room, start, end, sessions,
-                                           closed=closed)
+            res = self.service.set_clinic_closed(self.ym, room, start, end,
+                                                  sessions, closed=closed)
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("失敗", str(e), parent=self)
             return
+        # [RS-03/RS-05] 回報:清掉多少既有指派、以及撞到鎖定未自動移除的時段。
+        res = res or {}
+        cleared = res.get("cleared", 0)
+        skipped = res.get("skipped_locked") or []
+        msgs = []
+        if cleared:
+            msgs.append(f"已自現有班表移除 {cleared} 個指派，請重新自動排班。")
+        if skipped:
+            spans = "、".join(f"{iso} {sess}" for iso, sess in skipped)
+            msgs.append(f"下列鎖定時段有停診診間的人，未自動移除（尊重鎖定），"
+                        f"請自行處理：\n{spans}")
+        if msgs:
+            messagebox.showinfo("停診完成", "\n\n".join(msgs), parent=self)
         self.destroy()
 
 

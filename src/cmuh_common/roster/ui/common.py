@@ -152,5 +152,10 @@ def archive_finalize_pdf_async(parent, service, ym) -> None:
                 messagebox.showwarning("定案 PDF 留底", f"PDF 留底未完成：\n{err}")
             else:
                 messagebox.showinfo("定案 PDF 留底", f"已輸出定案留底 PDF：\n{path}")
-        parent.after(0, done)
+        try:
+            parent.after(0, done)
+        except (tk.TclError, RuntimeError):
+            # [RP3-18] 背景輸出完成時視窗可能已關閉,after 指令失效會拋 TclError →
+            # 靜默略過完成通知,別讓背景緒未捕捉例外炸掉。
+            logging.info("[roster.ui] 定案 PDF 完成時視窗已關閉，略過完成通知")
     threading.Thread(target=work, name="finalize-pdf", daemon=True).start()

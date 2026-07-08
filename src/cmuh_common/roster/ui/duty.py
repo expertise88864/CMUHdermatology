@@ -42,6 +42,8 @@ class LeaveEditor(tk.Toplevel):
                          or [])
         self._selected: set = set()
         self._buttons: dict = {}
+        self._loaded_mid = None              # [RP3-20] 目前載入 _selected 的成員 id
+        self._loaded_baseline: set = set()   # 載入當下的勾選(偵測切換時是否有變)
 
         top = ttk.Frame(self, padding=8)
         top.pack(fill="x")
@@ -52,7 +54,8 @@ class LeaveEditor(tk.Toplevel):
             values=[f"{m.get('id')} {m.get('name', '')}".strip()
                     for m in self._members])
         self._combo.pack(side="left", padx=6)
-        self._combo.bind("<<ComboboxSelected>>", lambda _e: self._load_member())
+        self._combo.bind("<<ComboboxSelected>>",
+                         lambda _e: self._on_member_change())
         if self._members:
             self._combo.current(0)
 
@@ -87,6 +90,23 @@ class LeaveEditor(tk.Toplevel):
                 b.grid(row=r, column=c, padx=1, pady=1)
                 self._buttons[d] = b
 
+    def _on_member_change(self) -> None:
+        # [RP3-20] 切成員前先把上一位的未存變更落檔,否則切走即遺失。
+        self._commit_current()
+        self._load_member()
+
+    def _commit_current(self) -> None:
+        """把目前載入成員的勾選落檔（僅在相對載入基準確有變動時才寫）。"""
+        if self._loaded_mid is None or self._selected == self._loaded_baseline:
+            return
+        if self.mode == "leave":
+            self.service.set_leaves(self.scope, self.ym, self._loaded_mid,
+                                    self._selected)
+        else:
+            self.service.set_must(self.scope, self.ym, self._loaded_mid,
+                                  self._selected)
+        self._loaded_baseline = set(self._selected)
+
     def _load_member(self) -> None:
         mid = self._member_id()
         if self.mode == "leave":                     # 請假：任一 scope 皆可
@@ -94,6 +114,8 @@ class LeaveEditor(tk.Toplevel):
         else:                                        # 指定值班：僅 R/VS 有此概念
             ctx = self.service.build_context(self.scope, self.ym)
             self._selected = set(ctx.must_duty.get(mid) or set())
+        self._loaded_mid = mid                       # [RP3-20] 記住載入者與基準
+        self._loaded_baseline = set(self._selected)
         self._refresh_buttons()
 
     def _toggle(self, d: date) -> None:
@@ -110,14 +132,8 @@ class LeaveEditor(tk.Toplevel):
                      bg="#F58518" if on else "SystemButtonFace")
 
     def _save(self) -> None:
-        mid = self._member_id()
-        if not mid:
-            self.destroy()
-            return
-        if self.mode == "leave":
-            self.service.set_leaves(self.scope, self.ym, mid, self._selected)
-        else:
-            self.service.set_must(self.scope, self.ym, mid, self._selected)
+        # [RP3-20] 存目前成員(含這次)的變更後關閉;先前切換過的成員已在切換時落檔。
+        self._commit_current()
         self.destroy()
 
 
@@ -258,19 +274,25 @@ class CalendarDutyTab(ttk.Frame):
                     continue
         tally = {mid: {"wd": 0, "we": 0, "pt": 0} for mid in members}
         for d, p in assigned.items():
-            if p not in tally:
-                continue
-            t = tally[p]
-            if is_weekend(d):
+            # [RS-02/RF-11] 已離目前名單的值班者(換血/改 id 後檢視歷史月)也動態納入,
+            # 否則月曆排得出人、結算卻整列消失、數字對不上。比照 member_tally 的 setdefault。
+            t = tally.setdefault(p, {"wd": 0, "we": 0, "pt": 0})
+            # [RS-02] 平日的國定假日算「假日班」,與 member_tally / solve_rvs 一致。
+            if is_weekend(d) or d in ctx.holidays:
                 t["we"] += 1
             else:
                 t["wd"] += 1
             t["pt"] += day_point(d, ctx.holidays, ctx.params)
         self._sum.delete(*self._sum.get_children())
         for mid, t in tally.items():
-            bal = float(ctx.ledger.get(mid, 0.0))
+            if mid in members:
+                name = members[mid]["name"]
+                bal = f"{float(ctx.ledger.get(mid, 0.0)):+.1f}"
+            else:                      # 已離名單:顯示 id、帳本欄不適用
+                name = mid
+                bal = "—"
             self._sum.insert("", "end", values=(
-                members[mid]["name"], t["wd"], t["we"], t["pt"], f"{bal:+.1f}"))
+                name, t["wd"], t["we"], t["pt"], bal))
 
         self._warns.delete(0, tk.END)
         mark = {"error": "✗", "warn": "⚠", "info": "・"}

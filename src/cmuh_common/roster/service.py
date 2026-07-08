@@ -135,9 +135,12 @@ class RosterService:
                 p = cell.get("person")
                 if p:
                     try:
-                        duty[date.fromisoformat(iso)] = p
+                        dt = date.fromisoformat(iso)
                     except (ValueError, TypeError):
                         continue
+                    if (dt.year, dt.month) != (y, m):
+                        continue          # [RP3-07] 非當月鍵不計入結算,避免虛增
+                    duty[dt] = p
             leaves = _parse_date_map((month.get("leaves") or {}).get(scope) or {})
             return {"members": [mm.id for mm in members], "names": names,
                     "duty": duty, "leaves": {k: sorted(v) for k, v in leaves.items()},
@@ -332,6 +335,10 @@ class RosterService:
         停診時，若當月已排過班（day_slots 已有該診間的人），一併把該診間的既有指派清掉，
         讓「現有班表」也立即反映停診（否則格網仍顯示停診診間有人，直到手動重排）；但
         鎖定的時段（day_locks）不動——鎖定契約是使用者鎖了就不無聲刪除，交由使用者自行處理。
+
+        回傳 {"cleared": 清掉的既有指派數, "skipped_locked": [(iso, session), ...]}：
+        cleared>0 時已一併清空 day_report（RS-03，舊報告已與清除後不符）；skipped_locked
+        為停診撞到鎖定、未自動移除的時段（RS-05），交呼叫端提示使用者自行處理。
         """
         month = self.storage.load_month(ym)
         if month.get("finalized"):
@@ -345,6 +352,8 @@ class RosterService:
         ov = month.setdefault("grid_overrides", {})
         day_slots = month.get("day_slots") or {}
         day_locks = month.get("day_locks") or {}
+        cleared = 0                 # [RS-03] 實際清掉的既有指派數
+        skipped_locked: list = []   # [RS-05] 撞到鎖定、未自動移除的停診時段
         for d, day in base.items():
             if d < start or d > end:
                 continue
@@ -362,14 +371,28 @@ class RosterService:
                     sess.pop("closed_rooms", None)
                 if not sess:
                     ov[iso].pop(session, None)
-                # 停診 → 清掉既有班表中該診間的人（未鎖定時段才動，尊重鎖定契約）
-                if closed and not (day_locks.get(iso) or {}).get(session):
+                # 停診 → 清掉既有班表中該診間的人。未鎖定才動(尊重鎖定契約);鎖定時段
+                # 若正排著該診間的人,不無聲刪除 → 收集回報使用者自行處理(RS-05)。
+                if closed:
                     slots = (day_slots.get(iso) or {}).get(session)
                     if slots and room in slots:
-                        slots.pop(room, None)
+                        if (day_locks.get(iso) or {}).get(session):
+                            skipped_locked.append((iso, session))
+                        else:
+                            slots.pop(room, None)
+                            cleared += 1
             if iso in ov and not ov[iso]:
                 ov.pop(iso, None)
+        if cleared:
+            # [RS-03] 有清掉指派 → 舊 day_report 已與現況不符,一併清空避免幽靈化。
+            month["day_report"] = ""
+        # [RS-05] 停診/恢復是影響班表的動作,留 audit 痕跡。
+        self._audit(month, "day",
+                    f"closure:{room} {start.isoformat()}~{end.isoformat()} "
+                    f"{sorted(sessions)}",
+                    None, "closed" if closed else "open", "closure")
         self.storage.save_month(ym, month)
+        return {"cleared": cleared, "skipped_locked": skipped_locked}
 
     def get_leaves(self, scope: str, ym: str, member_id: str) -> set:
         """讀某人某月請假日集合（適用任一 scope：r/vs/pgy/clerk）。"""

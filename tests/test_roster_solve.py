@@ -318,3 +318,27 @@ def test_report_sections_and_content():
         assert section in text
     # last_weekend 供下月使用
     assert r.last_weekend and r.last_weekend["saturday"] == "2026-08-29"
+
+
+# ─── RS-02：平日國定假日算「假日班」（weekend_counts 三處一致） ──────────────
+def test_rs02_weekend_counts_includes_weekday_holiday():
+    """[RS-02] 平日國定假日算假日班：weekend_counts 需與 is_weekend|holiday 重算一致
+    （＝export_common.member_tally 的 we 欄語意）。修正前 9/28（週一）假日會被漏算進
+    平日欄，與月曆/點數/匯出三處矛盾。"""
+    from cmuh_common.roster.model import is_weekend
+    sats = [date(2026, 9, d) for d in (5, 12, 19, 26)]
+    colors = {week_key(s): ("pink" if i % 2 == 0 else "green")
+              for i, s in enumerate(sats)}
+    ctx = make_ctx(month=9, holidays={date(2026, 9, 28)},
+                   annual={date(2026, 9, 28): R2}, colors=colors)
+    r = solve_duty(ctx)
+    assert r.status == "ok"
+    assert not is_weekend(date(2026, 9, 28))          # 確為平日假日
+    assert date(2026, 9, 28) in r.assignments          # 有指派 → 測得到
+    for mid in ctx.member_ids():
+        days_m = [d for d, p in r.assignments.items() if p == mid]
+        expected_we = sum(1 for d in days_m if is_weekend(d) or d in ctx.holidays)
+        assert r.weekend_counts[mid] == expected_we
+        assert r.weekday_counts[mid] == r.duty_counts[mid] - r.weekend_counts[mid]
+    holder = r.assignments[date(2026, 9, 28)]           # 指派到平日假日者
+    assert r.weekend_counts[holder] >= 1                # 該天計入假日欄（修正前會少）

@@ -815,7 +815,9 @@ class _ClerkBatchDialog(tk.Toplevel):
                    .replace("、", ",").split(",") if c.strip()]
         # 穩定唯一 id（不綁 start_monday）→ 同週一可多梯不撞、改起始日不斷開切片格網
         bid = self._initial_id or ("b" + datetime.now().strftime("%Y%m%d%H%M%S%f"))
-        self.result = {"id": bid, "start_monday": raw, "members": members}
+        # [RP3-19] 存正規化 ISO（d 已驗證）→ "20260706" 之類基本格式輸入不會以未正規化
+        # 字串落檔,避免排序/字串比較不一致。
+        self.result = {"id": bid, "start_monday": d.isoformat(), "members": members}
         self.destroy()
 
 

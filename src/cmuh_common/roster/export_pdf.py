@@ -8,6 +8,26 @@ from __future__ import annotations
 
 _FONT = "MSung-Light"        # reportlab 內建繁中 CID 字型（CNS-CS）
 
+# [RP3-05] MSung-Light 這顆 CID 字型畫不出 emoji/部分符號 → 定案 PDF 會出現空框(□)。
+# 換成可讀替代;BMP 外(emoji 等)一律 □。只用於 PDF,UI 報告保留原符號。
+_MAP = {
+    "\U0001F512": "[鎖]", "⚠": "[!]", "✗": "[x]", "✓": "[v]",
+    "・": ".", "═": "=",
+}
+
+
+def _sanitize(s: str) -> str:
+    """把 PDF 字型無法呈現的符號換成可讀替代（BMP 外字元一律 □）。純函式。"""
+    out = []
+    for ch in s:
+        if ch in _MAP:
+            out.append(_MAP[ch])
+        elif ord(ch) > 0xFFFF:
+            out.append("□")
+        else:
+            out.append(ch)
+    return "".join(out)
+
 
 def _wrap(s: str, measure, max_w: float) -> list:
     """把過寬的行逐字斷行，避免超出頁面右緣被裁掉。
@@ -56,11 +76,12 @@ def export(path: str, sections: list) -> None:
     for title, text in sections:
         y = top
         c.setFont(_FONT, 14)
-        c.drawString(left, y, str(title))
+        c.drawString(left, y, _sanitize(str(title)))   # [RP3-05] 淨化避免空框
         y -= 22
         c.setFont(_FONT, 9)
         for line in str(text).split("\n"):
-            for seg in _wrap(line, _measure, max_w):   # 過長行斷行，避免右緣被裁
+            # 先淨化再斷行,讓寬度量測與實際印出的替代字元一致。
+            for seg in _wrap(_sanitize(line), _measure, max_w):
                 if y < bottom:
                     c.showPage()
                     c.setFont(_FONT, 9)

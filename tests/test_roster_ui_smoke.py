@@ -459,3 +459,22 @@ def test_day_edit_dialog_can_clear_stale_room(root, tmp_path):
     dlg._save()
     slots = svc.storage.load_month(YM)["day_slots"]["2026-08-03"]["上午"]
     assert "999" not in slots
+
+
+def test_rp3_20_leave_editor_keeps_edits_across_member_switch(root, tmp_path):
+    """[RP3-20] 為 A 勾兩天 → 切到 B 勾一天 → 儲存：A、B 的請假都要落檔
+    （修正前切換成員會靜默丟掉前一位的未存勾選）。"""
+    svc = _svc(tmp_path)                       # r_members 至少 A、B
+    ed = duty_mod.LeaveEditor(root, svc, "r", YM, "leave")
+    root.update()
+    ed._combo.current(0)                       # A
+    ed._load_member()
+    ed._toggle(date(2026, 8, 10))
+    ed._toggle(date(2026, 8, 11))
+    ed._combo.current(1)                       # 切到 B
+    ed._on_member_change()                     # 先 commit A 再載入 B
+    ed._toggle(date(2026, 8, 12))
+    ed._save()
+    leaves = svc.build_context("r", YM).leaves
+    assert leaves["A"] == {date(2026, 8, 10), date(2026, 8, 11)}
+    assert leaves["B"] == {date(2026, 8, 12)}

@@ -51,6 +51,11 @@ class GitSyncStorage(RosterStorage):
         self._on_remote_change = on_remote_change
         self._pull_interval = pull_interval_sec
         self._git_ok = self._is_git_repo()
+        # [RP3-02] 讓退化(未啟用 git 同步)路徑可察——否則診間電腦若非 repo,
+        # 只會靜默改用純本機儲存,沒人知道跨機同步其實沒在運作。
+        logging.info("[roster.gitsync] git 同步：%s（repo=%s、remote_sync=%s、%s）",
+                     "啟用" if (self._git_ok and self._remote_sync) else "未啟用",
+                     self._git_ok, self._remote_sync, self.base_dir)
         self.sync_state = "ok"
         self._push_lock = threading.Lock()        # 只管 _push_timer 欄位
         self._git_lock = threading.RLock()        # 所有 git working-tree/refs 操作
@@ -69,7 +74,9 @@ class GitSyncStorage(RosterStorage):
 
     # ── git 基礎 ─────────────────────────────────────────────────────────
     def _is_git_repo(self) -> bool:
-        return os.path.isdir(os.path.join(self.base_dir, ".git"))
+        # [RP3-02] worktree/submodule 的 .git 是「檔案」(gitdir 指標)不是目錄,
+        # 用 exists 才不會把它們誤判成非 repo 而靜默停用同步。
+        return os.path.exists(os.path.join(self.base_dir, ".git"))
 
     def _git(self, *args, timeout: float = 30.0) -> subprocess.CompletedProcess:
         # encoding='utf-8'（不用 text=True 的 locale 預設）：cp950/big5 中文 Windows
@@ -147,7 +154,13 @@ class GitSyncStorage(RosterStorage):
     def _pull(self) -> None:
         with self._git_lock:
             try:
-                r = self._git("pull", "--ff-only")
+                # [RP3-13] 限時 8s——啟動時 _pull 阻塞 UI,遠端不通/慢時原本可卡到
+                # git 內建逾時(最長 ~30s);超時就以本機資料開檔,別讓開程式空等。
+                r = self._git("pull", "--ff-only", timeout=8.0)
+            except subprocess.TimeoutExpired as e:
+                logging.warning("[roster.gitsync] pull 逾時（>8s），以本機資料開啟：%s", e)
+                self._set_state("offline", "pull 逾時，以本機資料開啟")
+                return
             except (OSError, subprocess.SubprocessError) as e:
                 logging.warning("[roster.gitsync] pull 執行失敗（略過）：%s", e)
                 self._set_state("offline", str(e))

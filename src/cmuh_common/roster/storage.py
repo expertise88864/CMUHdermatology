@@ -115,6 +115,9 @@ class RosterStorage:
     def save_ledger(self, ledger: dict) -> None:
         # [codex P2] 寫前檢查既有檔 schema：防舊版程式把新版檔靜默降級毀損
         self._check_schema(_load_json(self._path("ledger.json")), "ledger.json")
+        # [RP3-10a] 比照 save_month 先留 .bak 快照——ledger.json 記結算/欠點,
+        # 遭誤寫時可回溯(誤結算/rollback 後才發現時救得回來)。
+        self._snapshot(self._path("ledger.json"))
         self._save(self._path("ledger.json"), ledger)
 
     def load_week_colors(self) -> dict:

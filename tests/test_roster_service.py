@@ -387,3 +387,28 @@ def test_run_solve_then_accept_integration(tmp_path):
     assert len(month["r_duty"]) == 31             # 每天都排到
     assert "決策報告" in month["report_r"]
     assert month["last_weekend"]["r"]["person"]
+
+
+# ─── RP3-07 / RP3-10a ───────────────────────────────────────────────────────
+def test_rp3_07_build_export_ignores_cross_month_duty(tmp_path):
+    """[RP3-07] build_export 只計當月 duty 鍵；跨月殘留鍵不虛增結算。"""
+    st = _storage(tmp_path)
+    st.save_month(YM, {"r_duty": {
+        "2026-08-03": {"person": "A"},
+        "2026-07-30": {"person": "A"},      # 跨月殘留鍵（上月）
+        "2026-09-01": {"person": "B"},      # 跨月殘留鍵（下月）
+    }})
+    blk = RosterService(st).build_export(YM)["r"]
+    assert date(2026, 8, 3) in blk["duty"]
+    assert date(2026, 7, 30) not in blk["duty"]
+    assert date(2026, 9, 1) not in blk["duty"]
+
+
+def test_rp3_10a_save_ledger_snapshots(tmp_path):
+    """[RP3-10a] save_ledger 比照 save_month 先留 .bak 快照（誤結算後可回溯）。"""
+    import glob
+    st = _storage(tmp_path)
+    st.save_ledger({"r": {"A": 1.0}, "vs": {}, "history": []})
+    st.save_ledger({"r": {"A": 2.0}, "vs": {}, "history": []})   # 第二次寫入前留快照
+    p = st._path("ledger.json")
+    assert glob.glob(f"{p}.bak-*")

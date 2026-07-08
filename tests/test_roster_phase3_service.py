@@ -249,3 +249,31 @@ def test_photo_every_session_treatment_skips_wed_pm(tmp_path):
                 assert TREATMENT not in slots             # 週三下午治療室休診
             else:
                 assert slots.get(TREATMENT), f"{iso} {session} 治療室應排"
+
+
+# ─── RS-03 / RS-05：停診清報告 + audit + 撞鎖定回饋 ──────────────────────────
+def test_rs03_closure_clears_stale_day_report(tmp_path):
+    """[RS-03] 停診清掉既有指派後，舊 day_report 一併清空（被清者不在報告幽靈化），
+    並回傳清除數量供對話框提示。"""
+    svc = _svc(tmp_path)
+    svc.set_day_slot(YM, date(2026, 8, 3), "上午", "101", ["A"])
+    m = svc.storage.load_month(YM)
+    m["day_report"] = "舊報告內容"
+    svc.storage.save_month(YM, m)
+    res = svc.set_clinic_closed(YM, "101", date(2026, 8, 3), date(2026, 8, 3), ["上午"])
+    assert res["cleared"] == 1
+    assert svc.storage.load_month(YM)["day_report"] == ""
+
+
+def test_rs05_closure_skipped_locked_and_audit(tmp_path):
+    """[RS-05] 停診撞到鎖定時段：不清該指派、回報 skipped_locked；且寫 closure audit。"""
+    svc = _svc(tmp_path)
+    svc.set_day_slot(YM, date(2026, 8, 10), "上午", "101", ["B"])
+    svc.toggle_day_lock(YM, date(2026, 8, 10), "上午")
+    res = svc.set_clinic_closed(YM, "101", date(2026, 8, 10), date(2026, 8, 10),
+                                ["上午"])
+    assert res["cleared"] == 0
+    assert ("2026-08-10", "上午") in res["skipped_locked"]
+    m = svc.storage.load_month(YM)
+    assert m["day_slots"]["2026-08-10"]["上午"]["101"] == ["B"]   # 鎖定保留
+    assert any(a.get("via") == "closure" for a in m.get("audit", []))

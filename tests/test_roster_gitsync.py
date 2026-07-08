@@ -298,3 +298,26 @@ def test_rf13_git_uses_create_no_window(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", spy_run)
     st._git("status")
     assert seen["creationflags"] & 0x08000000              # CREATE_NO_WINDOW
+
+
+# ─── RP3-02 / RP3-13 ────────────────────────────────────────────────────────
+def test_rp3_02_is_git_repo_accepts_gitfile(tmp_path):
+    """[RP3-02] worktree/submodule 的 .git 是「檔案」(gitdir 指標) → 仍應認得是
+    repo，不因用 isdir 而誤判成非 repo、靜默停用同步。"""
+    base = tmp_path / "wt"
+    base.mkdir()
+    (base / ".git").write_text("gitdir: /somewhere/.git/worktrees/wt\n",
+                               encoding="utf-8")
+    st = GitSyncStorage(str(base), remote_sync=False)
+    assert st._git_ok is True
+
+
+def test_rp3_13_pull_timeout_degrades_offline(tmp_path, monkeypatch):
+    """[RP3-13] pull 逾時 → 以本機資料開啟（offline），不卡 UI、不炸背景緒。"""
+    st = GitSyncStorage(str(tmp_path / "roster"), remote_sync=False)
+
+    def boom(*_a, **_k):
+        raise subprocess.TimeoutExpired(cmd="git pull", timeout=8.0)
+    monkeypatch.setattr(st, "_git", boom)
+    st._pull()
+    assert st.sync_state == "offline"
