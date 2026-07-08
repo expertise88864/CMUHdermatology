@@ -31,14 +31,19 @@ def _base_cfg(**over) -> dict:
     return cfg
 
 
+_DERIVE = object()   # sentinel:roster_texts 未明指 → 由 extracted_text 動態導出
+
+
 class _JobHarness:
     """monkeypatch _do_full_job 的全部重依賴,記錄決策結果。"""
 
-    def __init__(self, monkeypatch, cfg, fail_times=0, extracted_text=""):
+    def __init__(self, monkeypatch, cfg, fail_times=0, extracted_text="",
+                 roster_texts=_DERIVE):
         self.sent = []          # [(recipients, subject)]
         self.bodies = []        # 寄出的純文字內文
         self.html_bodies = []   # 寄出的 HTML 內文
         self.extracted_text = extracted_text
+        self.roster_texts = roster_texts   # None=解析失敗/停用、[]=無病人、[...]=清單列
         self.flow_runs = 0
         self.kills = 0
         self.sleeps = []
@@ -55,8 +60,13 @@ class _JobHarness:
             self.flow_runs += 1
             if self.flow_runs <= self._fail_times:
                 raise RuntimeError(f"simulated failure #{self.flow_runs}")
-            # [2026-06-15] run_consult_flow 改回傳 (截圖, 擷取純文字, 擷取HTML)
-            return Path("C:/fake/shot.png"), self.extracted_text, ""
+            # [CQ-01] run_consult_flow 回傳 (截圖, 擷取純文字, 擷取HTML, roster_texts)
+            roster = self.roster_texts
+            if roster is _DERIVE:
+                # 未明指 → 由當前 extracted_text 動態導出(truthy→單列、空→[]);
+                # 讓多輪測試改 h.extracted_text 後 signature 也跟著更新。
+                roster = [self.extracted_text] if self.extracted_text else []
+            return (Path("C:/fake/shot.png"), self.extracted_text, "", roster)
         monkeypatch.setattr(cq, "run_consult_flow", _flow)
         monkeypatch.setattr(
             cq, "send_via_smtp",
@@ -424,6 +434,19 @@ def test_rebuild_schedule_clamps_interval(monkeypatch):
         cq.schedule.clear()
 
 
+def test_rebuild_schedule_no_poll_when_extract_disabled(monkeypatch):
+    """[CQ-01] 擷取關閉時輪詢無法偵測新會診 → 不建 poll job(避免每輪 fail-open 狂寄)。"""
+    monkeypatch.setattr(
+        cq, "load_config",
+        lambda: _base_cfg(enabled=True, poll_interval_minutes=15,
+                          extract_text_enabled=False))
+    cq._rebuild_schedule()
+    try:
+        assert cq.schedule.get_jobs() == []      # 沒有輪詢 job
+    finally:
+        cq.schedule.clear()
+
+
 def test_rebuild_schedule_disabled_clears_jobs(monkeypatch):
     cfg = _base_cfg(enabled=False, poll_interval_minutes=15)
     monkeypatch.setattr(cq, "load_config", lambda: cfg)
@@ -483,6 +506,83 @@ def test_extracted_text_appended_to_mail_body(monkeypatch):
                      extracted_text="")
     cq._do_full_job("17:00")
     assert h2.bodies[0] == "本文"
+
+
+# ─── CQ-01/02/03:會診 poll 通道(解析失敗 fail-open、signature 只看清單) ────
+
+def test_signature_from_roster_ignores_body_junk():
+    """[CQ-02] signature 只從清單列取病歷號,不把病情摘要的身分證/手機當病歷號。"""
+    assert cq._consult_signature_from_roster(["王小明1234567"]) == {"1234567"}
+    assert cq._consult_signature_from_roster([]) == set()
+    assert cq._consult_signature_from_roster(None) == set()
+    # 舊 _consult_signature 會把內文雜數字誤當病歷號(對照:證明新函式的必要性)
+    assert cq._consult_signature(
+        "身分證A123456789 電話0912345678 於20260615入院") != set()
+
+
+def test_poll_extract_failure_fails_open_and_keeps_baseline(monkeypatch):
+    """[CQ-01] poll 清單解析失敗(roster=None) → fail-open 照常寄信、信首註記、不更新基準。"""
+    h = _JobHarness(monkeypatch, _base_cfg(), roster_texts=None)
+    monkeypatch.setattr(cq, "_in_quiet_hours", lambda *a, **k: False)
+    monkeypatch.setattr(cq, "_baseline_initialized", lambda: True)
+    monkeypatch.setattr(cq, "_load_notified", lambda: {"1234567"})
+    saved = []
+    monkeypatch.setattr(cq, "_save_notified", lambda s: saved.append(set(s)))
+    cq._do_full_job("poll")
+    assert len(h.sent) == 1                              # fail-open:有寄(非靜默不寄)
+    assert any("解析失敗" in b for b in h.bodies)         # 信首註記以截圖為準
+    assert saved == []                                   # 基準未被空集合覆寫
+
+
+def test_poll_no_new_chart_does_not_send(monkeypatch):
+    """[CQ-01] poll 清單成功但都通知過 → 不寄(維持原行為)。"""
+    h = _JobHarness(monkeypatch, _base_cfg(), roster_texts=["王小明1234567"])
+    monkeypatch.setattr(cq, "_in_quiet_hours", lambda *a, **k: False)
+    monkeypatch.setattr(cq, "_baseline_initialized", lambda: True)
+    monkeypatch.setattr(cq, "_load_notified", lambda: {"1234567"})
+    cq._do_full_job("poll")
+    assert h.sent == []                                  # 無新會診 → 不寄
+
+
+def test_poll_new_chart_sends_and_updates_baseline(monkeypatch):
+    """[CQ-01/02] poll 出現新病歷號 → 寄信並更新基準(只含清單病歷號)。"""
+    h = _JobHarness(monkeypatch, _base_cfg(), roster_texts=["王小明1234567"])
+    monkeypatch.setattr(cq, "_in_quiet_hours", lambda *a, **k: False)
+    monkeypatch.setattr(cq, "_baseline_initialized", lambda: True)
+    monkeypatch.setattr(cq, "_load_notified", lambda: set())
+    saved = []
+    monkeypatch.setattr(cq, "_save_notified", lambda s: saved.append(set(s)))
+    cq._do_full_job("poll")
+    assert len(h.sent) == 1
+    assert saved and saved[-1] == {"1234567"}
+
+
+def test_manual_extract_failure_does_not_overwrite_baseline(monkeypatch):
+    """[CQ-03] 手動觸發但擷取失敗(roster=None) → 照常寄信但不用空集合覆寫基準。"""
+    h = _JobHarness(monkeypatch, _base_cfg(), roster_texts=None)
+    saved = []
+    monkeypatch.setattr(cq, "_save_notified", lambda s: saved.append(set(s)))
+    cq._do_full_job("手動")
+    assert len(h.sent) == 1                              # 手動照常寄
+    assert saved == []                                   # 基準未被覆寫
+
+
+def test_grid_fallback_none_only_when_entries_found(monkeypatch):
+    """[CQ-01 codex] 格線後備:真的收到病人(entries 非空)→ roster None(poll fail-open);
+    今天沒病人(entries 空)→ roster 維持 [](無新會診,不因空清單每輪 fail-open 狂寄)。"""
+    monkeypatch.setattr(cq, "enum_children",
+                        lambda hwnd: [(1, "TPanel", "", (0, 0, 10, 10))])
+    monkeypatch.setattr(cq, "_is_visible_below", lambda h, top: True)
+    monkeypatch.setattr(cq, "_find_patient_radios", lambda ch: [])   # 無 radio → 走 else
+    monkeypatch.setattr(cq, "_find_text_panes", lambda ch: ["pane"])  # 有面板 → 不早退
+    # (a) 面板有病人內容 → entries 非空 → roster None(fail-open)
+    monkeypatch.setattr(cq, "_read_panes_snapshot", lambda panes: [("內容1", "病人甲內容")])
+    _t, _h, roster = cq._extract_consult_text(123, {"extract_text_enabled": True})
+    assert roster is None
+    # (b) 面板空(今天沒病人)→ entries 空 → roster 維持 []
+    monkeypatch.setattr(cq, "_read_panes_snapshot", lambda panes: [("內容1", "")])
+    _t2, _h2, roster2 = cq._extract_consult_text(123, {"extract_text_enabled": True})
+    assert roster2 == []
 
 
 def test_find_text_panes_filters_and_sorts():
