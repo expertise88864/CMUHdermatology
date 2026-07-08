@@ -80,7 +80,7 @@ from cmuh_common.platform_win import (
     get_primary_monitor_size,
     place_tk_window_on_preferred_monitor,
 )
-from cmuh_common.notifications import show_windows_notification
+from cmuh_common.notifications import show_windows_notification, show_winotify_toast
 from cmuh_common.window_icon import apply_tk_window_icon as _apply_tk_window_icon
 from cmuh_common.logging_setup import attach_queue_handler
 from cmuh_common.bounded_executor import BoundedThreadPoolExecutor, RejectedExecutionError
@@ -6928,9 +6928,12 @@ CLINIC_LIGHT_HISTORY_DAYS = 30
 FLOATING_ERROR_HIDE_STREAK = 3
 CLINIC_LIGHT_HISTORY_WINDOW_MINUTES = 9
 CLINIC_DYNAMIC_STATE_FILENAME = "clinic_dynamic_state.json"
-# 已寄出的止掛提醒信記錄(跨重啟去重用)。notify_key 內含日期,只保留近 7 天。
+# 已寄出的止掛提醒信記錄(跨重啟去重用)。notify_key 內含日期。
+# [MN-04] 總覽涵蓋今天+13 天且止掛不限今天:對遠期診次(最多 13 天後)寄信後,若在該診次
+# 到來前重啟,保留期以「寄出日」過濾——只保留近 7 天會把仍未過期的遠期診次記錄剪掉 →
+# frequency 歸零 → 同診次重寄。保留期需 > 總覽 13 天視窗;取 21 天(留 8 天安全邊際)。
 ALERT_EMAIL_SENT_FILENAME = "alert_email_sent.json"
-ALERT_EMAIL_SENT_RETAIN_DAYS = 7
+ALERT_EMAIL_SENT_RETAIN_DAYS = 21
 
 
 def _filter_recent_alert_sent(data, cutoff: str) -> dict:
@@ -6940,6 +6943,20 @@ def _filter_recent_alert_sent(data, cutoff: str) -> dict:
         return {}
     return {k: v for k, v in data.items()
             if isinstance(k, str) and isinstance(v, str) and v >= cutoff}
+
+
+def _clinic_refresh_seconds(hour: int) -> int:
+    """[MN-03] 診間燈號輪詢間隔(秒)。半夜監測開啟時,00-07 點放慢到 180-300 秒
+    (多機夜間負載禮貌);其餘時段維持 45-75 秒隨機。純函式以便測試。"""
+    if hour < 7:
+        return random.randint(180, 300)
+    return random.randint(45, 75)
+
+
+def _reg64_micro_ttl_seconds(hour: int) -> int:
+    """[MN-03] reg64 micro-cache TTL(秒)。夜間放寬到 170 秒配合放慢的輪詢,
+    其餘時段 50 秒。純函式以便測試。"""
+    return 170 if hour < 7 else 50
 NOTIFY_DO_NOT_DISTURB_START_HOUR = 0
 NOTIFY_DO_NOT_DISTURB_END_HOUR = 8
 
@@ -9848,10 +9865,14 @@ class AutomationApp:
                     logging.debug("月曆重繪排程失敗（門診動態後）", exc_info=True)
 
             self.root.after(0, _after_clinic_fetch_schedule_calendar)
-            # [2026-06-22] 07:00–00:00(quiet hours 之外)一律 45-75 秒隨機輪詢(隨機避免固定節拍打爆
-            # 院方限制);00:00–07:00 由 reg64_clinic_quiet_hours 暫停。
-            self._clinic_dynamic_refresh_seconds = random.randint(45, 75)
-            self._reg64_dynamic_ttl_seconds = 50
+            # [2026-06-22] 07:00–00:00 一律 45-75 秒隨機輪詢(隨機避免固定節拍打爆院方限制)。
+            # [MN-03/舊註解訂正] 舊註解稱「00:00–07:00 由 reg64_clinic_quiet_hours 暫停」——僅在
+            # 使用者【關閉半夜監測】時才暫停(見上方 gate);預設半夜監測開啟時 00-07 仍會走到這裡。
+            # 半夜監測開啟時 00-07 點放慢輪詢(多機夜間負載禮貌;白天不變)。本段在 bg_executor
+            # worker 執行,用 datetime.now() 取時(勿讀 tk 變數);間隔邏輯抽成純函式以便測試。
+            _now_hour = datetime.now().hour
+            self._clinic_dynamic_refresh_seconds = _clinic_refresh_seconds(_now_hour)
+            self._reg64_dynamic_ttl_seconds = _reg64_micro_ttl_seconds(_now_hour)
             if source_timing.get("backoff_skip", 0) > 0 or abnormal_rooms:
                 now_ts = time.time()
                 last_ts = float(getattr(self, "_reg64_abnormal_log_ts", 0.0))
@@ -9865,6 +9886,11 @@ class AutomationApp:
         def guarded_run_update(rooms):
             try:
                 run_update(rooms)
+            except Exception:
+                # [MN-05] run_update 例外原本被丟進 future、done_callback 只認
+                # RejectedExecutionError → 靜默吞掉、除錯全盲。這裡先記下再吞
+                # (下一輪已在主緒排程,監測不中斷;僅需可見的錯誤軌跡)。
+                logging.exception("診間燈號輪詢例外")
             finally:
                 self._clinic_lights_worker_running = False
 
@@ -12310,8 +12336,20 @@ class AutomationApp:
                                                             is_dnd = self._is_notification_suppressed_now()
                                                             if is_dnd:
                                                                 self._dnd_suppressed_count += 1
-                                                                self.status_text.set(f"狀態: 勿擾時段，僅寄 email（{doc_name}{session_name}，{diff_text}）")
-                                                                logging.info(f"[ALERT DND] toast 抑制但 email 仍寄 {doc_name} {session_name} count={count} threshold={full_threshold} {diff_text}")
+                                                                # [MN-06] DND 只抑制 toast;email 是否真的會寄取決於 level 與是否已寄過
+                                                                # (見 _notify_worker 的 MN-01/02)。狀態文字須據實——第二次提醒若前次
+                                                                # 已成功寄出,這次純略過(不再寄信),顯示「僅寄 email」會誤導。
+                                                                # _notify_worker 實際會寄 email 的充要條件=「此 notify_key 尚未成功寄過」
+                                                                # (lvl==1 未寄過才寄;lvl==2 也只在未寄過時補寄)。狀態文字據此判斷,
+                                                                # 涵蓋:重啟後記憶體 frequency 歸零→首觸發 lvl=1,但持久化記錄顯示已寄過
+                                                                # → worker 其實跳過不寄,狀態就不能再說「僅寄 email」。
+                                                                _will_email = not self._has_alert_email_been_sent(notify_key)
+                                                                if _will_email:
+                                                                    self.status_text.set(f"狀態: 勿擾時段，僅寄 email（{doc_name}{session_name}，{diff_text}）")
+                                                                    logging.info(f"[ALERT DND] toast 抑制但 email 仍寄 {doc_name} {session_name} count={count} threshold={full_threshold} {diff_text}")
+                                                                else:
+                                                                    self.status_text.set(f"狀態: 勿擾時段，第二次提醒略過（{doc_name}{session_name}，前次已寄）")
+                                                                    logging.info(f"[ALERT DND] 第二次提醒略過(前次已寄,僅抑制 toast) {doc_name} {session_name} count={count} {diff_text}")
                                                             _dnd_tag = "【夜間勿擾】" if is_dnd else ""
                                                             # 主旨同樣帶日期/時段/診間/醫師/目前人數,不寫門檻人數
                                                             alert_subject = (
@@ -12321,14 +12359,17 @@ class AutomationApp:
                                                                                 subj=alert_subject,
                                                                                 lvl=notify_level, dnd=is_dnd):
                                                                 try:
-                                                                    # toast 只在非 DND 時跳
-                                                                    if not dnd:
-                                                                        show_windows_notification("止掛提醒", m)
-                                                                    # email：DND 也寄（第一次提醒）。第二次加強提醒只跳 Windows
-                                                                    # 通知，避免一筆狀況收到兩封信。
+                                                                    # [MN-01] email 先寄,再跳通知。原本先跳阻塞式 MessageBox 再寄信 →
+                                                                    # 診間無人按掉彈窗時 email 被卡住;期間程式被關(daemon 緒死)→
+                                                                    # 該信永遠沒寄也沒記錄。寄信擺前面確保不被 UI 阻塞/中止。
+                                                                    # email：DND 也寄(第一次提醒)。
                                                                     # [2026-06-15] 跨重啟去重:寄前查持久化記錄,已寄過就跳過
                                                                     # (避免重開程式/刷新人數重複寄同一診次的信);寄成功才記錄。
-                                                                    if lvl == 1:
+                                                                    # [MN-02] 第二次加強提醒(lvl=2)原本一律不寄 → 第一次遇 SMTP 暫時
+                                                                    # 故障失敗後當天整診次零封信。改成:前次已成功寄出者 lvl=2 仍只跳
+                                                                    # 通知(不重複信);前次未成功者,lvl=2 給一次補寄機會。
+                                                                    if lvl == 1 or (lvl == 2 and
+                                                                                    not self._has_alert_email_been_sent(nk)):
                                                                         if self._has_alert_email_been_sent(nk):
                                                                             logging.info("[ALERT] 止掛信先前已寄出，跳過重寄：%s", nk)
                                                                         else:
@@ -12340,6 +12381,11 @@ class AutomationApp:
                                                                                         self._mark_alert_email_sent(nk)
                                                                                 except Exception:
                                                                                     logging.warning("止掛提醒寄信例外", exc_info=True)
+                                                                    # toast 只在非 DND 時跳;優先用非阻塞 winotify,失敗才 fallback
+                                                                    # 阻塞式 MessageBox(MN-01:即使 fallback,email 已在上面寄完)。
+                                                                    if not dnd:
+                                                                        if not show_winotify_toast("止掛提醒", m):
+                                                                            show_windows_notification("止掛提醒", m)
                                                                 finally:
                                                                     with self._alert_state_lock:
                                                                         self._alert_popup_active[nk] = False
