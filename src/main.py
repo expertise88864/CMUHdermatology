@@ -14007,36 +14007,30 @@ if __name__ == "__main__":
         except Exception:
             pass
     try:
-        if _start_background:
-            # 背景重啟：直接從 withdrawn 進 iconify（實測不會 map、不閃、不搶焦點），
-            # 視窗縮在工作列。使用者第一次從工作列還原(<Map>, state=normal)時，才放到
-            # 偏好螢幕並最大化，兼顧「重啟不干擾」與「打開後仍是熟悉的最大化視窗」。
-            main_root.attributes("-topmost", False)
+        # [2026-07-08 使用者需求] 一般啟動與背景重啟一致：直接從 withdrawn 進 iconify
+        # （實測不會 map、不閃、不搶焦點），主程式開啟後就縮在工作列，不像一般程式疊加顯示
+        # 在螢幕上。使用者第一次從工作列還原(<Map>, state=normal)時，才放到偏好螢幕
+        # （現為【主螢幕】，見 choose_preferred_monitor）並最大化——兼顧「開啟不干擾」與
+        # 「還原後仍是熟悉的最大化視窗」。原本一般啟動會 deiconify 疊加、且偏好副螢幕。
+        main_root.attributes("-topmost", False)
 
-            def _maximize_on_first_restore(event=None):
-                if event is not None and getattr(event, "widget", None) is not main_root:
-                    return
-                if main_root.state() != "normal":
-                    return
-                try:
-                    main_root.unbind("<Map>", _first_map_bind_id)
-                except Exception:
-                    pass
-                try:
-                    place_tk_window_on_preferred_monitor(main_root)
-                except Exception:
-                    logging.debug("還原後定位/最大化失敗", exc_info=True)
+        def _maximize_on_first_restore(event=None):
+            if event is not None and getattr(event, "widget", None) is not main_root:
+                return
+            if main_root.state() != "normal":
+                return
+            try:
+                main_root.unbind("<Map>", _first_map_bind_id)
+            except Exception:
+                pass
+            try:
+                place_tk_window_on_preferred_monitor(main_root)
+            except Exception:
+                logging.debug("還原後定位/最大化失敗", exc_info=True)
 
-            _first_map_bind_id = main_root.bind(
-                "<Map>", _maximize_on_first_restore, add="+")
-            main_root.iconify()
-        else:
-            main_root.deiconify()
-            place_tk_window_on_preferred_monitor(main_root)
-            # 顯式解除 topmost（修：splash 關閉後主視窗有時殘留 topmost，導致無法切到其他程式）
-            main_root.attributes("-topmost", False)
-            main_root.lift()
-            main_root.focus_force()
+        _first_map_bind_id = main_root.bind(
+            "<Map>", _maximize_on_first_restore, add="+")
+        main_root.iconify()
     except Exception:
         pass
 

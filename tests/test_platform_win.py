@@ -52,11 +52,12 @@ def test_active_physical_monitors_returns_list():
     assert isinstance(get_active_physical_monitors(), list)
 
 
-def test_choose_preferred_monitor_uses_secondary_even_when_left_of_primary():
+def test_choose_preferred_monitor_uses_primary_when_available():
+    # [2026-07-08 使用者需求] 改為主螢幕優先（原本偏好副螢幕）。
     primary = MonitorRect(0, 0, 1920, 1080, True)
     secondary = MonitorRect(-1920, 0, 1920, 1080, False)
 
-    assert choose_preferred_monitor([primary, secondary]) == secondary
+    assert choose_preferred_monitor([primary, secondary]) == primary
 
 
 def test_choose_preferred_monitor_falls_back_to_primary():
@@ -65,12 +66,21 @@ def test_choose_preferred_monitor_falls_back_to_primary():
     assert choose_preferred_monitor([primary]) == primary
 
 
-def test_choose_preferred_monitor_uses_largest_secondary_deterministically():
+def test_choose_preferred_monitor_prefers_primary_over_larger_secondary():
+    # 即使副螢幕更大，也一律用主螢幕。
     primary = MonitorRect(0, 0, 1920, 1080, True)
     small = MonitorRect(1920, 0, 1280, 720, False)
     large = MonitorRect(-2560, 0, 2560, 1440, False)
 
-    assert choose_preferred_monitor([small, primary, large]) == large
+    assert choose_preferred_monitor([small, primary, large]) == primary
+
+
+def test_choose_preferred_monitor_no_primary_falls_back_to_largest():
+    # 極端情形：偵測不到主螢幕旗標 → 退回最大的可用螢幕（不致回 None）。
+    a = MonitorRect(0, 0, 1280, 720, False)
+    b = MonitorRect(1280, 0, 2560, 1440, False)
+
+    assert choose_preferred_monitor([a, b]) == b
 
 
 def test_display_device_mirror_driver_is_excluded():

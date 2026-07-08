@@ -126,28 +126,33 @@ def test_main_and_scheduler_helper_launches_use_shared_launcher():
             assert "subprocess.Popen(" not in src
 
 
-def test_main_places_window_on_preferred_monitor_before_and_after_deiconify():
+def test_main_starts_minimized_on_preferred_monitor():
+    """[2026-07-08 使用者需求] 主程式啟動一律縮到最小進工作列（不 deiconify 疊加顯示），
+    第一次 <Map> 還原時才定位到偏好（現為主）螢幕並最大化。__init__ 仍會呼叫定位函式。"""
     source = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
 
     assert "place_tk_window_on_preferred_monitor(self.root)" in source
-    # 手動啟動路徑：deiconify 後立即定位到偏好螢幕（縮排無關，可包在 else 分支內）
-    assert re.search(
+    # 啟動顯示區塊不再以 deiconify 立即疊加顯示（改為 iconify 進工作列）
+    assert not re.search(
         r"main_root\.deiconify\(\)\s*\n\s*place_tk_window_on_preferred_monitor\(main_root\)",
         source,
     )
+    assert "main_root.iconify()" in source
+    # 還原時（<Map>）才定位/最大化
+    assert re.search(r'main_root\.bind\(\s*"<Map>"', source)
 
 
 def test_main_background_restart_starts_minimized_silently():
     """背景重啟（--background）必須靜默：不開 splash、視窗最小化進工作列、
-    不搶焦點；第一次還原時才定位/最大化。手動啟動則維持正常顯示。"""
+    不搶焦點；第一次還原時才定位/最大化。[2026-07-08] 手動啟動亦統一為最小化。"""
     source = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
 
     assert '_start_background = ("--background" in sys.argv)' in source
     # splash 只在非背景啟動時顯示
     assert "if not _start_background:" in source
-    # 背景啟動以最小化進工作列、第一次 <Map> 還原時才最大化
+    # 啟動以最小化進工作列、第一次 <Map> 還原時才最大化（縮排無關，用 regex）
     assert "main_root.iconify()" in source
-    assert 'main_root.bind(\n                "<Map>"' in source or 'main_root.bind("<Map>"' in source
+    assert re.search(r'main_root\.bind\(\s*"<Map>"', source)
     # app 端重啟匯流點帶 --background
     assert 'restart_self(["--background"])' in source
 

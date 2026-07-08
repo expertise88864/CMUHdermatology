@@ -211,12 +211,15 @@ def get_active_physical_monitors() -> list[MonitorRect]:
 
 
 def choose_preferred_monitor(monitors) -> MonitorRect | None:
-    """Prefer the largest real secondary monitor; otherwise use primary."""
+    """Prefer the primary monitor; fall back to the largest available.
+
+    [2026-07-08 使用者需求] 改為「主螢幕優先」（原本偏好最大的副螢幕）：診間主程式要在
+    主螢幕開啟，不要切到副螢幕。此函式只被主視窗/開場 splash 的定位使用。"""
     rows = [m for m in monitors if isinstance(m, MonitorRect) and m.area > 0]
     if not rows:
         return None
-    secondary = [m for m in rows if not m.is_primary]
-    candidates = secondary or [m for m in rows if m.is_primary] or rows
+    primary = [m for m in rows if m.is_primary]
+    candidates = primary or rows
     return sorted(candidates, key=lambda m: (-m.area, m.left, m.top))[0]
 
 
