@@ -15,8 +15,10 @@ def test_is_frozen_default_false():
     assert is_frozen() is False
 
 
-def test_app_dir_exists():
-    d = get_app_dir()
+def test_app_dir_exists(real_get_app_dir):
+    # repo 級 conftest 為隔離會把 get_app_dir 導向 tmp;這裡要驗『正版』的路徑選擇邏輯,
+    # 故用 real_get_app_dir 夾具拿未被導向的函式(直接跑本檔時 fallback 成 import 的版本)。
+    d = real_get_app_dir()
     assert os.path.isdir(d), f"app_dir 不存在: {d}"
 
 
@@ -33,7 +35,7 @@ def test_conf_path():
 
 if __name__ == "__main__":
     test_is_frozen_default_false()
-    test_app_dir_exists()
+    test_app_dir_exists(get_app_dir)  # 直接跑：無 conftest，import 的即正版
     test_settings_dir_created()
     test_conf_path()
     print("[OK] paths tests passed")

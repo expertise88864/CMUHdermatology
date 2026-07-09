@@ -31,13 +31,17 @@ ENTRY_MODULES = [
 
 
 @pytest.mark.parametrize("module", ENTRY_MODULES)
-def test_entry_module_imports_cleanly(module):
+def test_entry_module_imports_cleanly(module, tmp_path):
+    # 子程序是全新直譯器、吃不到 repo 級 conftest 的 get_app_dir 導向;若沿用 pytest
+    # 的 cwd,模組層 get_settings_dir() 會在 repo 目錄建 settings/、debug_dumps/。
+    # 用 cwd=tmp_path 隔離 → 模組層副作用(建 settings/log)落在測試用暫存目錄,不污染 repo。
     code = f"import sys; sys.path.insert(0, {str(_SRC)!r}); import {module}"
     result = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,
         text=True,
         timeout=180,
+        cwd=str(tmp_path),
     )
     assert result.returncode == 0, (
         f"`import {module}` 失敗 (returncode={result.returncode})。\n"
