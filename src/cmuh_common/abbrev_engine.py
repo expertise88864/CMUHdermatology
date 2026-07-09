@@ -33,8 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
-from cmuh_common.atomic_io import atomic_write_json
-from cmuh_common.config_io import load_json_dict
+from cmuh_common.atomic_io import atomic_write_json, safe_load_json_ex
 
 
 # -----------------------------------------------------------------------------
@@ -151,6 +150,12 @@ class AbbrevConfig:
     # False = 沿用舊行為（暫停本程式禮讓對方）。
     close_external_expander: bool = True
     items: list[dict[str, str]] = field(default_factory=list)
+    # [AB-04/AB-08] 本次載入是否從損壞檔復原（safe_load_json 已 backup 壞檔）。非持久化：
+    # 不進 to_dict、不參與相等比較；供 main.py 決定是否跳「設定曾損壞、已還原預設」提示。
+    recovered_from_corrupt: bool = field(default=False, compare=False, repr=False)
+    # [AB-04/codex P1] 本次載入是否「持續讀取失敗且無上次快取」→ 回的是 fallback 預設。
+    # main.py 不得快取此結果為權威（否則日後存檔會用預設覆寫使用者的好檔），下輪重載重試。
+    load_failed: bool = field(default=False, compare=False, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -296,6 +301,11 @@ def _maybe_migrate_legacy(items: list[dict[str, str]]) -> bool:
     return changed
 
 
+# [AB-04/codex P1] 每個設定檔路徑「上次成功載入」的設定；暫時性讀取失敗時沿用它，
+# 避免用預設值覆寫使用者好檔。單一寫者情境（設定載入），GIL 下讀寫原子。
+_LAST_GOOD_CONFIG: dict = {}
+
+
 def load_config(path: str, *, persist_migrations: bool = True) -> AbbrevConfig:
     """讀取設定，缺檔/壞檔自動回 defaults。
     若偵測到舊版內建 cert1/cert2 字面預設，會自動升級為動態 da_zh 版本。
@@ -303,8 +313,35 @@ def load_config(path: str, *, persist_migrations: bool = True) -> AbbrevConfig:
     persist_migrations=False：唯讀解析 —— 遷移/修復仍套用在「回傳的 cfg」上，
     但不寫回 path。供「匯入」這類讀別人檔案的場景使用（匯入來源檔可能是使用者
     USB 上的備份，被改寫會造成困惑）。預設 True 維持原行為（自家設定檔自動修復）。
+
+    [AB-04] 設定檔存在但暫時讀取失敗（防毒/備份軟體鎖住 → OSError）時，**強制唯讀不寫回**：
+    否則會以純預設值原子覆寫，刪掉使用者多年自訂縮寫且靜默停用。原檔完好，稍後正常重載即可救回。
+    [AB-08] 損壞檔（已 backup）→ 回傳 cfg 帶 recovered_from_corrupt=True 供 main.py 跳提示。
     """
-    loaded = load_json_dict(path, {}, merge_defaults=False)
+    loaded, _load_status = safe_load_json_ex(path, {})
+    # [AB-04/codex P1] 暫時性讀取失敗（防毒/備份軟體鎖住 → OSError）→ 短暫重試，多半 <1s 解鎖。
+    _retries = 0
+    while _load_status == "error" and _retries < 3:
+        time.sleep(0.15)
+        loaded, _load_status = safe_load_json_ex(path, {})
+        _retries += 1
+    if not isinstance(loaded, dict):
+        loaded = {}
+    recovered_from_corrupt = (_load_status == "corrupt")
+    load_failed = False
+    if _load_status == "error":
+        # 重試後仍失敗：優先沿用「上次成功載入」的設定（含真正的自訂縮寫），絕不用預設覆寫好檔。
+        _cached = _LAST_GOOD_CONFIG.get(os.path.abspath(path))
+        if _cached is not None:
+            logging.warning(
+                "[abbrev] 設定檔持續讀取失敗，沿用上次成功載入的設定（不覆寫）：%s", path)
+            return _cached
+        # 無上次快取（首次載入即遇鎖）→ 回 fallback 預設，但標記 load_failed + 不落盤；
+        # main.py 不快取此結果、下輪重載重試，避免把 fallback 當權威而日後存檔覆寫好檔。
+        persist_migrations = False
+        load_failed = True
+        logging.warning(
+            "[abbrev] 設定檔持續讀取失敗且無上次快取，本次唯讀不覆寫、不快取：%s", path)
     raw = dict(DEFAULT_CONFIG)
     raw.update(loaded)
     try:
@@ -370,6 +407,10 @@ def load_config(path: str, *, persist_migrations: bool = True) -> AbbrevConfig:
         except Exception:
             logging.debug("[abbrev] migrate 後存檔失敗", exc_info=True)
 
+    cfg.recovered_from_corrupt = recovered_from_corrupt   # [AB-08] 供 main.py 跳提示
+    cfg.load_failed = load_failed
+    if not load_failed:                                    # [AB-04] 只快取成功載入的
+        _LAST_GOOD_CONFIG[os.path.abspath(path)] = cfg
     return cfg
 
 
@@ -730,7 +771,7 @@ def _list_process_names() -> set:
         CREATE_NO_WINDOW = 0x08000000
         out = subprocess.run(
             ["tasklist", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=3,   # [AB-07] 10→3s,免長卡
             creationflags=CREATE_NO_WINDOW,
         )
         names = set()
@@ -925,14 +966,19 @@ def _ensure_win32_configured() -> None:
         logging.debug("[abbrev] Win32 signatures 設定失敗", exc_info=True)
 
 
-def _clipboard_get_text() -> Optional[str]:
-    """讀剪貼簿 unicode 文字；非文字 / 無資料 / 失敗則回 None。"""
+# [AB-05b] 區分「開剪貼簿失敗」(別人佔用)與「真空/非文字」(None)。開啟失敗時呼叫端
+# 應直接走 keystroke、完全不碰剪貼簿,並跳過還原(不可寫入空字串清掉使用者內容)。
+_CLIP_OPEN_FAILED = object()
+
+
+def _clipboard_get_text() -> Any:
+    """讀剪貼簿 unicode 文字；真空/非文字/鎖定失敗回 None；【開啟失敗】回 _CLIP_OPEN_FAILED。"""
     try:
         _ensure_win32_configured()
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
         if not _open_clipboard_with_retry(user32):
-            return None
+            return _CLIP_OPEN_FAILED          # [AB-05b] 開不了 → 呼叫端別碰剪貼簿
         try:
             h = user32.GetClipboardData(_CF_UNICODETEXT)
             if not h:
@@ -951,8 +997,48 @@ def _clipboard_get_text() -> Optional[str]:
         return None
 
 
-def _clipboard_set_text(text: str) -> bool:
-    """寫 unicode 文字到剪貼簿；成功 True。"""
+def _clipboard_set_text(text: str, *, restore_on_fail: Optional[str] = None) -> bool:
+    """寫 unicode 文字到剪貼簿；成功 True。[AB-05a] restore_on_fail 見 _clipboard_set_text_impl。"""
+    return _clipboard_set_text_impl(text, restore_on_fail=restore_on_fail)
+
+
+def _set_clipboard_data_within_open(text: str) -> bool:
+    """在【已開啟】的剪貼簿內寫入 text（供 AB-05a：Set 失敗後回寫 old）。呼叫者需已
+    OpenClipboard 且會 CloseClipboard。成功後所有權轉移、不可 GlobalFree。"""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        data = (text + "\x00").encode("utf-16-le")
+        h = kernel32.GlobalAlloc(_GMEM_MOVEABLE, len(data))
+        if not h:
+            return False
+        p = kernel32.GlobalLock(h)
+        if not p:
+            try:
+                kernel32.GlobalFree(h)
+            except Exception:
+                pass
+            return False
+        try:
+            ctypes.memmove(p, data, len(data))
+        finally:
+            kernel32.GlobalUnlock(h)
+        if not user32.SetClipboardData(_CF_UNICODETEXT, h):
+            try:
+                kernel32.GlobalFree(h)
+            except Exception:
+                pass
+            return False
+        return True
+    except Exception:
+        logging.debug("[abbrev] 回寫剪貼簿失敗", exc_info=True)
+        return False
+
+
+def _clipboard_set_text_impl(text: str, *, restore_on_fail: Optional[str] = None) -> bool:
+    """寫 unicode 文字到剪貼簿；成功 True。
+    [AB-05a] restore_on_fail 非空且「已 EmptyClipboard 但 SetClipboardData 失敗」時,
+    在同一 session 盡力回寫 restore_on_fail,避免把使用者原剪貼簿清成空的還原不回。"""
     h_mem = None
     try:
         _ensure_win32_configured()
@@ -979,6 +1065,10 @@ def _clipboard_set_text(text: str) -> bool:
                 return False
             # 注意：SetClipboardData 接管 h_mem 所有權；成功後勿 GlobalFree
             if not user32.SetClipboardData(_CF_UNICODETEXT, h_mem):
+                # [AB-05a] 已 EmptyClipboard、Set 失敗 → 剪貼簿現為空,盡力回寫 old
+                # (h_mem 所有權仍在我方,下面 finally 會 GlobalFree)。
+                if restore_on_fail:
+                    _set_clipboard_data_within_open(restore_on_fail)
                 return False
             h_mem = None
             return True
@@ -1221,22 +1311,39 @@ def _replace_edit_selection(hwnd: int, start: int, end: int, text: str) -> bool:
     return ok
 
 
+# [AB-02] 原生欄位取代三態：只有 NOT_APPLICABLE（非原生控制項）才可讓呼叫端走剪貼簿
+# 盲刪 fallback。一旦確認是原生控制項，任何失敗一律 ABORT（放棄展開、留縮寫原文），
+# 絕不落入盲刪——SETSEL 已動或 REPLACESEL 逾時走盲刪會多刪字 / 與已執行的取代重複。
+_NATIVE_REPLACED = "REPLACED"
+_NATIVE_ABORT = "ABORT"
+_NATIVE_NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
 def _replace_native_edit_suffix(
     expected_suffix: str,
     replacement: str,
     timeout_sec: float,
     cursor_left: int = 0,
-) -> bool:
-    """Replace a verified suffix directly in native Windows text controls.
+) -> str:
+    """在原生 Windows 文字控制項直接核對並取代 suffix。回三態（見 _NATIVE_*）。
 
     cursor_left>0 時(游標定位 token)：取代完成後把 caret 精準設回標記位置
     (start + len(replacement) - cursor_left)。原生控制項用 EM_SETSEL 比送
     LEFT 方向鍵更可靠。
+    [AB-06] native 路徑把 \\n 正規化為 \\r\\n，原生 Edit 才不會把換行顯示成方框。
     """
     hwnd = _get_focused_window_handle()
     if not hwnd or not _is_native_edit_control(hwnd):
-        return False
+        return _NATIVE_NOT_APPLICABLE
 
+    orig_replacement = replacement
+    replacement = replacement.replace("\r\n", "\n").replace("\n", "\r\n")
+    # [AB-06/codex P2] \n→\r\n 使「游標之後」那段每個【裸 \n】多 1 個 code unit → cursor_left
+    # (以原文 code point 計)需補償,否則游標標記後有換行時 caret 會偏右。已是 \r\n 的不變長,
+    # 不可計入(否則反而偏左)——故只數裸 LF = 全部 \n 扣掉 \r\n 內的 \n。
+    if 0 < cursor_left <= len(orig_replacement):
+        tail = orig_replacement[len(orig_replacement) - cursor_left:]
+        cursor_left += tail.count("\n") - tail.count("\r\n")
     deadline = time.monotonic() + max(0.0, timeout_sec)
     while True:
         selection = _get_edit_selection(hwnd)
@@ -1247,11 +1354,16 @@ def _replace_native_edit_suffix(
                 suffix = text[caret - len(expected_suffix) : caret]
                 if suffix.casefold() == expected_suffix.casefold():
                     if _get_focused_window_handle() != hwnd:
-                        return False
+                        return _NATIVE_ABORT          # 焦點已離開,別動
                     start = caret - len(expected_suffix)
                     ok = _replace_edit_selection(
                         hwnd, start, caret, replacement)
-                    if ok and 0 < cursor_left <= len(replacement):
+                    if not ok:
+                        # [AB-02] SETSEL 可能已把選取設成 [start,caret]、REPLACESEL 失敗/
+                        # 逾時 → 收回選取(避免下個鍵覆寫整段),放棄本次展開,不落盲刪。
+                        _send_message_timeout(hwnd, _EM_SETSEL, caret, caret)
+                        return _NATIVE_ABORT
+                    if 0 < cursor_left <= len(replacement):
                         # EM_SETSEL 用 UTF-16 code-unit 位移,Python len() 是 code point；
                         # 標記前那段以 UTF-16 長度算偏移,非 BMP 字元(罕見)也正確。
                         # [codex review 2026-06-15]
@@ -1261,11 +1373,14 @@ def _replace_native_edit_suffix(
                         if final >= start:
                             _send_message_timeout(
                                 hwnd, _EM_SETSEL, final, final)
-                    return ok
+                    return _NATIVE_REPLACED
+                # [codex P1] suffix 不符,多半是觸發空白還沒抵達目標控制項(正常時序窗口)
+                # → 繼續輪詢到 deadline,不可立即放棄(否則常態漏展開)。
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return False
+            # [AB-02] 原生控制項逾時仍取不到符合的 suffix → 放棄而非盲刪(避免多刪/重複)。
+            return _NATIVE_ABORT
         time.sleep(min(_NATIVE_EDIT_POLL_INTERVAL_SEC, remaining))
 
 
@@ -1285,6 +1400,19 @@ _RESET_KEY_NAMES = {
 # 鏡像使用者實際刪字，讓「打錯字→backspace 修正→重打」仍能觸發展開
 # （例：cery→⌫→t→空白 = cert）。
 _BACKSPACE_KEY_NAMES = {"backspace"}
+
+# [AB-03] 純修飾鍵：suppress「送鍵前」窗口內按到這些鍵不算「文字夾入」（不會污染欄位）。
+# 除此之外的任何鍵（printable / backspace / left / delete / enter…）在我方尚未開始送鍵
+# （self._sending=False）時出現 → 判定為使用者真實輸入夾入 → 標記 _interleaved，
+# _do_replace 送鍵前據此整次放棄。改用「送鍵階段旗標」而非按鍵名白名單：因為 SendInput
+# 送出的 backspace/v/left 與使用者真打的同名、無法用名稱區分（codex P1）。
+_MODIFIER_KEY_NAMES = {
+    "shift", "left shift", "right shift",
+    "ctrl", "left ctrl", "right ctrl",
+    "alt", "left alt", "right alt", "alt gr",
+    "windows", "left windows", "right windows",
+    "caps lock",
+}
 
 
 class AbbrevEngine:
@@ -1319,6 +1447,8 @@ class AbbrevEngine:
     # [v9] _suppressing 自癒餘裕（s）：若旗標卡住超過 cooldown + 此餘裕仍未清，
     # 視為 worker thread 異常未 reset → 強制重置，避免縮寫永久失效要重啟。
     SUPPRESS_SELFHEAL_MARGIN_SEC = 2.0
+    # [AB-08] buffer 閒置多久（s）自動清空：避免很久前打的殘字與現在打的拼成假縮寫。
+    BUFFER_IDLE_CLEAR_SEC = 10.0
 
     def __init__(self, kb_module: Any) -> None:
         """kb_module = `keyboard` PyPI 套件物件（已 import 完成）。"""
@@ -1331,6 +1461,16 @@ class AbbrevEngine:
         self._buffer: str = ""
         self._press_hook: Any = None
         self._suppressing = False
+        # [AB-03] 本次展開的 suppress 窗口內是否偵測到「使用者真實按鍵夾入」。
+        # 由 hook 緒在 suppress「送鍵前」期間標記,_do_replace 送鍵前讀取決定是否放棄。
+        self._interleaved = False
+        # [AB-03] 是否已進入「我方送鍵」階段。進入後 hook 收到的鍵是 SendInput 注入的,
+        # 不再標記 interleaved；進入前的任何非修飾鍵都算使用者夾入。
+        self._sending = False
+        # [AB-08] IME 中文模式導致本次跳過展開(供空白觸發端決定清空而非保留 buffer)。
+        self._ime_skipped = False
+        # [AB-08] 最後一次可打字按鍵的時間(monotonic),供 buffer 閒置自動清空。
+        self._last_key_ts = 0.0
         # [W8 2026-07-03] 展開世代 token:每次展開/自癒遞增。延遲的 cooldown Timer
         # (_clear)只在 token 未變時才清 buffer —— 避免「自癒已恢復、使用者重新打字後」
         # 一個晚爆的舊 Timer 把新輸入清掉。單一寫者(hook 緒),GIL 下讀寫原子,無需鎖。
@@ -1377,6 +1517,16 @@ class AbbrevEngine:
             except Exception:
                 logging.debug("[abbrev] 嘗試關閉外部展開程式時例外", exc_info=True)
 
+        # [AB-07] 在【鎖外】偵測外部展開程式(內含 tasklist,最壞數秒)——放進 self._lock 會
+        # 讓期間所有打字 hook callback(搶同一把鎖)一起卡住。鎖內只讀這個結果。
+        # 放在關閉區塊之後,反映「關掉專用展開程式後」的最新狀態。
+        ext_detected: Optional[str] = None
+        if want_hook:
+            try:
+                ext_detected = detect_external_expander()
+            except Exception:
+                logging.debug("[abbrev] 鎖外偵測外部展開程式例外", exc_info=True)
+
         with self._lock:
             self._cfg = cfg
             self._rebuild_lookup_locked()
@@ -1386,10 +1536,10 @@ class AbbrevEngine:
                 logging.info("[abbrev] hook 未掛載（enabled=%s, items=%d）",
                              cfg.enabled, len(self._lookup))
                 return
-            # 偵測外部文字展開程式 → 仍在的話暫停，避免雙重展開。
-            # （close_external_expander 開啟時，鎖外已嘗試關閉專用展開程式；
-            #   這裡若仍偵測到，多半是 AutoHotkey 或關閉失敗 → 禮讓暫停。）
-            ext = detect_external_expander()
+            # 外部文字展開程式仍在的話暫停，避免雙重展開。（close_external_expander 開啟時，
+            # 鎖外已嘗試關閉專用展開程式；仍偵測到多半是 AutoHotkey 或關閉失敗 → 禮讓暫停。）
+            # [AB-07] 用鎖外預先偵測的結果,鎖內不再跑 tasklist。
+            ext = ext_detected
             self._external_expander = ext
             if ext:
                 logging.warning(
@@ -1484,6 +1634,12 @@ class AbbrevEngine:
                     self._suppressing = False
                     self._buffer = ""
             else:
+                # [AB-03] 我方尚未開始送鍵(_sending=False)時,收到任何「非純修飾鍵」→
+                # 使用者真實輸入夾入欄位,標記 interleaved(_do_replace 送鍵前據此放棄)。
+                # 進入送鍵階段後收到的是 SendInput 注入鍵,不標記。
+                _n = getattr(event, "name", None)
+                if (not self._sending) and _n and _n not in _MODIFIER_KEY_NAMES:
+                    self._interleaved = True
                 return
 
         # cool-down 期間（展開剛完成）— 不更新 buffer、不觸發
@@ -1494,6 +1650,15 @@ class AbbrevEngine:
         if not name:
             return
 
+        # [AB-08] buffer 閒置過久 → 清空(避免久前殘字與現在打的/觸發拼成假縮寫)。
+        # 放在所有分支之前 → trigger(space) 也適用:等 >10s 後按空白不會展開很久前的殘留
+        # 候選(codex P2)。檢查用「上一次的 _last_key_ts」,更新在檢查之後。
+        _now = time.monotonic()
+        if self._buffer and (_now - self._last_key_ts) > self.BUFFER_IDLE_CLEAR_SEC:
+            with self._lock:
+                self._buffer = ""
+        self._last_key_ts = _now
+
         # trigger 鍵（空白）：嘗試展開
         if name in _TRIGGER_KEY_NAMES:
             # 焦點換了 → 先清空,避免在新欄位展開舊欄位殘留的縮寫
@@ -1502,6 +1667,13 @@ class AbbrevEngine:
                 buffer_snapshot = self._buffer
                 self._buffer = ""
             expanded = self._try_expand(buffer_snapshot, " ")
+            if not expanded and self._ime_skipped:
+                # [AB-08] IME 中文模式跳過 → 使用者正在打中文,清空 buffer(不保留候選,
+                # 免中文夾雜的殘留字後續與英數拼成假縮寫誤觸)。
+                self._ime_skipped = False
+                with self._lock:
+                    self._buffer = ""
+                return
             if not expanded:
                 # [優化] 沒展開 → 把「候選 + 觸發空白」留回 buffer。讓使用者發現打錯、
                 # 用 backspace 刪掉空白再改字(例:「nev 」→⌫→「nev1」)時 buffer 仍能
@@ -1528,6 +1700,21 @@ class AbbrevEngine:
 
         # printable 單字元（'a' 'B' '1' '/' '-' '_' 等）
         if len(name) == 1:
+            # [AB-01] Ctrl/Alt/Win 同按 → 此字元屬快捷鍵命令(如 Ctrl+C)而非欄位文字。
+            # 清空 buffer 並略過,避免混入(例:Ctrl+C 後打 bt␣ → buffer 'cbt' 誤命中
+            # 'cbt' → 盲刪路徑多吃 1 個既有病歷字元)。Shift 不算(大寫仍是文字)。
+            kb = self._kb
+            if kb is not None and hasattr(kb, "is_pressed"):
+                try:
+                    if (kb.is_pressed("ctrl") or kb.is_pressed("alt")
+                            or kb.is_pressed("windows")):
+                        with self._lock:
+                            self._buffer = ""
+                        return
+                except Exception:
+                    logging.debug("[abbrev] is_pressed 查詢失敗,照常累積",
+                                  exc_info=True)
+            # (buffer 閒置清空已在函式開頭統一處理,見 AB-08)
             # 焦點(欄位/視窗)換了 → 先清空舊欄位殘留,再開始累積本欄位的字
             self._reset_buffer_if_focus_changed()
             ch = name.lower()
@@ -1544,6 +1731,7 @@ class AbbrevEngine:
     def _try_expand(self, buffer_snapshot: str, trigger_char: str) -> bool:
         """回傳 True=有啟動展開；False=沒展開(無匹配/非完整字/IME/render 失敗/
         worker 啟動失敗)。空白觸發端用此決定沒展開時是否保留 buffer 供後續編輯。"""
+        self._ime_skipped = False        # [AB-08] 本次是否因 IME 中文模式跳過
         if not buffer_snapshot or not self._lookup:
             return False
 
@@ -1576,6 +1764,7 @@ class AbbrevEngine:
         # 偵測不到時就照常展開 — 寧可展開也不要整個功能卡死）
         if self._cfg.skip_when_ime_active and should_skip_for_input_method():
             logging.debug("[abbrev] IME 中文模式或組字中，跳過 '%s'", matched_key)
+            self._ime_skipped = True     # [AB-08] 通知觸發端清空 buffer(非保留)
             return False
 
         raw_expansion = self._lookup[matched_key]
@@ -1599,6 +1788,8 @@ class AbbrevEngine:
         with self._lock:                             # [W8] token bump 與清除守衛序列化
             self._suppress_token += 1                # 本次展開世代
             suppress_token = self._suppress_token
+        self._interleaved = False                    # [AB-03] 先重置,再開 suppress
+        self._sending = False                        # [AB-03] 尚未進入送鍵階段
         self._suppressing = True
         self._cooldown_until = time.monotonic() + self.COOLDOWN_SEC
 
@@ -1653,13 +1844,14 @@ class AbbrevEngine:
         used_keystroke = False
         try:
             # 原生 Windows 文字欄位可直接核對並取代 suffix，不需剪貼簿或 backspace。
-            used_native_edit = _replace_native_edit_suffix(
+            native_result = _replace_native_edit_suffix(
                 typed_suffix or (abbrev_key + " "),
                 text,
                 self.PRE_BACKSPACE_DELAY_SEC,
                 cursor_left=cursor_left,
             )
-            if used_native_edit:
+            if native_result == _NATIVE_REPLACED:
+                used_native_edit = True
                 # 原生欄位同步取代完成、不碰剪貼簿 → 無 paste 競態，cool-down 可大幅
                 # 縮短（只縮短不延長），讓連續展開更即時。
                 self._cooldown_until = min(
@@ -1667,6 +1859,13 @@ class AbbrevEngine:
                     time.monotonic() + self.NATIVE_EDIT_COOLDOWN_SEC,
                 )
                 return
+            if native_result == _NATIVE_ABORT:
+                # [AB-02] 原生欄位取代中止 → 絕不 fallback 盲刪(會多刪/與已執行取代重複),
+                # 放棄本次展開、留縮寫原文。
+                logging.info("[abbrev] 原生欄位取代中止,放棄展開(不盲刪) abbrev=%s",
+                             abbrev_key)
+                return
+            # native_result == NOT_APPLICABLE → 非原生欄位,走剪貼簿/keystroke fallback。
 
             # 非原生欄位仍等觸發空白抵達目標視窗，再走相容性較廣的 fallback。
             remaining_delay = self.PRE_BACKSPACE_DELAY_SEC - (
@@ -1675,13 +1874,29 @@ class AbbrevEngine:
             if remaining_delay > 0:
                 time.sleep(remaining_delay)
 
+            # [AB-03] 送任何 backspace/貼上前:suppress 窗口內若偵測到使用者真實按鍵已
+            # 落進欄位,整次放棄(不 backspace、不貼上,留縮寫原文),避免盲刪到新打的字。
+            if self._interleaved:
+                logging.info(
+                    "[abbrev] 展開前偵測到夾入的使用者按鍵,放棄本次展開 abbrev=%s",
+                    abbrev_key)
+                return
+
             # 1. 備份 + 設剪貼簿（paste mode 首選）
             old_clip = _clipboard_get_text()
-            # [safety] 剪貼簿存著非文字內容(圖片/檔案/HTML)時 old_clip 為 None；走
-            # paste 路徑會 EmptyClipboard 清掉它且無法還原 → 改走 keystroke fallback
-            # 完全不碰剪貼簿，保住使用者剛複製的資料。
-            force_keystroke = (old_clip is None and _clipboard_has_nontext_data())
-            clip_ok = (not force_keystroke) and _clipboard_set_text(text)
+            if old_clip is _CLIP_OPEN_FAILED:
+                # [AB-05b] 開剪貼簿失敗(別人佔用)→ 無法可靠備份/還原 → 直接 keystroke,
+                # 完全不碰剪貼簿(免清掉使用者內容且還原不回)。
+                force_keystroke = True
+                old_clip = None
+            else:
+                # [safety] 剪貼簿存著非文字內容(圖片/檔案/HTML)時 old_clip 為 None；走
+                # paste 路徑會 EmptyClipboard 清掉它且無法還原 → 改走 keystroke fallback
+                # 完全不碰剪貼簿，保住使用者剛複製的資料。
+                force_keystroke = (old_clip is None and _clipboard_has_nontext_data())
+            # [AB-05a] 傳 old_clip:若 EmptyClipboard 後 Set 失敗,盡力回寫,不留空剪貼簿。
+            clip_ok = (not force_keystroke) and _clipboard_set_text(
+                text, restore_on_fail=old_clip)
 
             if clip_ok:
                 # [v7] 拆成「先刪除、再貼上」兩段原子 SendInput，中間留時間
@@ -1697,6 +1912,13 @@ class AbbrevEngine:
                     (_VK_CONTROL, False),
                 ]
 
+                # [AB-03 codex P1] 送鍵前最後一次確認:剪貼簿設定期間又有使用者按鍵夾入
+                # → 放棄(finally 因 clip_ok=True 會把剪貼簿還原成使用者原內容)。
+                if self._interleaved:
+                    logging.info("[abbrev] 送鍵前偵測到夾入按鍵,放棄展開 abbrev=%s",
+                                 abbrev_key)
+                    return
+                self._sending = True   # 之後 hook 收到的是我方注入鍵,不再標記 interleaved
                 # BlockInput 凍結 user 輸入 → 兩段 SendInput → 解凍
                 user32 = ctypes.windll.user32
                 blocked = False
@@ -1753,6 +1975,19 @@ class AbbrevEngine:
                     time.sleep(self.POST_PASTE_DELAY_SEC)
             else:
                 # 2b. fallback: 剪貼簿寫入失敗 / 剪貼簿含非文字內容 → keystroke 老路
+                # [AB-06] keystroke fallback 會把 \n 打成 Enter → 某些表單=直接送出!
+                # 多行展開一律放棄(不 backspace、不打字),留縮寫原文,絕不誤送 Enter。
+                if "\n" in text or "\r" in text:
+                    logging.warning(
+                        "[abbrev] 多行展開且剪貼簿不可用,放棄(避免 keystroke 把換行"
+                        "打成 Enter 送出表單) abbrev=%s", abbrev_key)
+                    return
+                # [AB-03 codex P1] keystroke 送鍵前最後確認夾入。
+                if self._interleaved:
+                    logging.info("[abbrev] 送鍵前偵測到夾入按鍵,放棄展開(keystroke) "
+                                 "abbrev=%s", abbrev_key)
+                    return
+                self._sending = True
                 if force_keystroke:
                     logging.info("[abbrev] 剪貼簿含非文字內容(圖片/檔案)，改用 "
                                  "keystroke 展開以免破壞使用者剪貼簿")

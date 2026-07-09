@@ -11147,7 +11147,23 @@ class AutomationApp:
                     "縮寫設定檔讀取失敗，縮寫功能已暫停。\n"
                     "請開啟「縮寫設定」重新儲存一次，或檢查 settings/abbrev_settings.json。",
                     level="error", auto_close_ms=8000)
-            self._abbrev_config_cache = cfg
+            # [AB-08] load_abbrev_config 內部吞例外回 defaults、幾乎不 raise → 上面 except 是
+            # 死路徑。改由 recovered_from_corrupt 旗標觸發提示：設定檔曾損壞、已 backup 為
+            # .corrupt-* 並還原成預設，使用者才知道自訂縮寫可能要手動救回。
+            if getattr(cfg, "recovered_from_corrupt", False):
+                self._show_notice(
+                    "縮寫設定曾損壞",
+                    "縮寫設定檔內容損壞，已備份為 .corrupt-* 並還原成預設。\n"
+                    "自訂縮寫可能遺失，請開啟「縮寫設定」重新確認，"
+                    "或從 settings/ 的 .corrupt-* 備份手動還原。",
+                    level="warn", auto_close_ms=8000)
+            # [AB-04/codex P1] 設定「持續讀取失敗」回的是 fallback 預設 → 不可快取為權威
+            # （否則日後存檔會用預設覆寫使用者好檔）。本次仍以 cfg 掛載（多半停用），但不快取，
+            # 下輪 _install_abbrev_listeners 會重載重試，鎖解除後即恢復真正的設定。
+            if getattr(cfg, "load_failed", False):
+                logging.warning("[abbrev] 設定載入持續失敗，本次不快取，下輪重試")
+            else:
+                self._abbrev_config_cache = cfg
         # [fix A 2026-06-09] 自動關閉外部展開程式的 taskkill(最壞 3s/個)不可在 Tk UI
         # thread 跑(monitor/設定儲存/guardian 重掛都在 UI thread 呼叫本函式)。偵測到
         # 「可自動關閉」的展開程式時 → 先丟背景執行緒把 taskkill 做完，再回 UI thread

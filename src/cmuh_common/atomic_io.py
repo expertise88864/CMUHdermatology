@@ -98,6 +98,44 @@ def atomic_write_json(file_path: str, data, **kwargs) -> None:
         raise
 
 
+def safe_load_json_ex(file_path: str, default=None, *,
+                      backup_on_corrupt: bool = True):
+    """同 safe_load_json，但額外回傳「載入狀態」以便呼叫端決策。回 (value, status)：
+
+      "ok"      正常載入
+      "missing" 檔案不存在（回 default）
+      "corrupt" JSON/編碼損壞——已 backup 壞檔並回 default（原檔已被 rename 移走）
+      "error"   OSError/PermissionError 等暫時性失敗（回 default；**原檔通常仍完好**）
+
+    用途（AB-04）：呼叫端可據 status 決定「是否可用預設值覆寫原檔」——missing/corrupt
+    可（原檔已不存在/已移走），但 "error" **不可**（只是暫時被防毒/備份軟體鎖住，覆寫
+    會把使用者的好檔毀成預設）。
+    """
+    if not os.path.exists(file_path):
+        return default, "missing"
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return json.load(f), "ok"
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        logging.warning("[safe_load_json] %s 內容損壞 (%s): %s",
+                          file_path, type(e).__name__, e)
+        if backup_on_corrupt:
+            try:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                bak = _next_corrupt_backup_path(file_path, ts)
+                _replace_with_retry(file_path, bak)
+                logging.warning("[safe_load_json] 已 backup 壞檔到 %s", bak)
+            except Exception:
+                logging.debug("[safe_load_json] backup 壞檔失敗", exc_info=True)
+        return default, "corrupt"
+    except (PermissionError, OSError) as e:
+        logging.warning("[safe_load_json] %s 讀取失敗 (%s)", file_path, e)
+        return default, "error"
+    except Exception:
+        logging.exception("[safe_load_json] %s 未預期例外", file_path)
+        return default, "error"
+
+
 def safe_load_json(file_path: str, default=None, *,
                     backup_on_corrupt: bool = True):
     """讀 JSON，corrupt 自動 backup 壞檔 + log warning + 回 default。
@@ -113,31 +151,12 @@ def safe_load_json(file_path: str, default=None, *,
       - 其他例外 → log error → 回 default
 
     backup_on_corrupt=True 時，壞檔會 rename 成 `<file_path>.corrupt-<timestamp>`，
-    方便事後 forensic / 手動還原。
+    方便事後 forensic / 手動還原。需要區分失敗原因（暫時鎖住 vs 損壞）請改用
+    safe_load_json_ex（契約向後相容，本函式只是丟掉 status）。
     """
-    if not os.path.exists(file_path):
-        return default
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        logging.warning("[safe_load_json] %s 內容損壞 (%s): %s",
-                          file_path, type(e).__name__, e)
-        if backup_on_corrupt:
-            try:
-                ts = time.strftime("%Y%m%d_%H%M%S")
-                bak = _next_corrupt_backup_path(file_path, ts)
-                _replace_with_retry(file_path, bak)
-                logging.warning("[safe_load_json] 已 backup 壞檔到 %s", bak)
-            except Exception:
-                logging.debug("[safe_load_json] backup 壞檔失敗", exc_info=True)
-        return default
-    except (PermissionError, OSError) as e:
-        logging.warning("[safe_load_json] %s 讀取失敗 (%s)", file_path, e)
-        return default
-    except Exception:
-        logging.exception("[safe_load_json] %s 未預期例外", file_path)
-        return default
+    value, _status = safe_load_json_ex(
+        file_path, default, backup_on_corrupt=backup_on_corrupt)
+    return value
 
 
 def atomic_write_text(file_path: str, content: str, encoding: str = 'utf-8') -> bool:

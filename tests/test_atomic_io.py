@@ -123,3 +123,52 @@ if __name__ == "__main__":
     test_atomic_write_text_creates_parent_dir_and_cleans_tmp()
     test_safe_load_json_backs_up_corrupt_file()
     print("[OK] atomic_io tests passed")
+
+
+# ═══ AB-04：safe_load_json_ex 區分暫時鎖住 vs 損壞 ═══════════════════════════
+def test_safe_load_json_ex_status_missing_ok_corrupt():
+    import glob
+    from cmuh_common.atomic_io import safe_load_json_ex
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "c.json")
+        # missing
+        assert safe_load_json_ex(p, {"d": 1}) == ({"d": 1}, "missing")
+        # ok
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('{"a": 1}')
+        assert safe_load_json_ex(p, {}) == ({"a": 1}, "ok")
+        # corrupt → backup 壞檔並回 default
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{bad json")
+        val, status = safe_load_json_ex(p, {"d": 2})
+        assert val == {"d": 2} and status == "corrupt"
+        assert not os.path.exists(p)                 # 壞檔已 rename
+        assert glob.glob(p + ".corrupt-*")
+
+
+def test_safe_load_json_ex_status_error_keeps_file(monkeypatch):
+    from cmuh_common import atomic_io as _aio
+    from cmuh_common.atomic_io import safe_load_json_ex
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "locked.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('{"a": 1}')
+        before = open(p, "rb").read()
+
+        def boom(*_a, **_k):
+            raise PermissionError("locked by AV")
+        monkeypatch.setattr(_aio, "open", boom, raising=False)
+        val, status = safe_load_json_ex(p, {"fallback": True})
+        assert status == "error" and val == {"fallback": True}
+        # 原檔完好、未被 backup/刪除
+        assert open(p, "rb").read() == before
+
+
+def test_safe_load_json_wrapper_unchanged():
+    """safe_load_json 契約不變（只丟掉 status）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "x.json")
+        assert safe_load_json(p, default={"d": 1}) == {"d": 1}
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('{"a": 2}')
+        assert safe_load_json(p, default={}) == {"a": 2}

@@ -300,7 +300,9 @@ def test_replace_cooldown_timer_waits_only_remaining_time():
 
 def test_native_edit_path_shortens_cooldown(monkeypatch):
     """原生欄位快路徑（同步、不碰剪貼簿）應把 cool-down 大幅縮短，連續展開更即時。"""
-    monkeypatch.setattr(ae, "_replace_native_edit_suffix", lambda *a, **k: True)
+    # [AB-02] _replace_native_edit_suffix 改回三態；REPLACED 才走快路徑。
+    monkeypatch.setattr(ae, "_replace_native_edit_suffix",
+                        lambda *a, **k: ae._NATIVE_REPLACED)
     engine = ae.AbbrevEngine(object())
     engine._suppressing = True
     engine._cooldown_until = ae.time.monotonic() + engine.COOLDOWN_SEC
@@ -328,7 +330,7 @@ def test_replace_clears_suppress_when_cooldown_timer_cannot_start(monkeypatch):
             raise RuntimeError("thread unavailable")
 
     monkeypatch.setattr(ae, "_clipboard_get_text", lambda: None)
-    monkeypatch.setattr(ae, "_clipboard_set_text", lambda _text: False)
+    monkeypatch.setattr(ae, "_clipboard_set_text", lambda _text, **_k: False)
     monkeypatch.setattr(ae.threading, "Timer", BrokenTimer)
     monkeypatch.setattr(ae.AbbrevEngine, "PRE_BACKSPACE_DELAY_SEC", 0)
     engine = ae.AbbrevEngine(FakeKeyboard())
@@ -378,7 +380,8 @@ def test_native_edit_replacement_verifies_suffix_before_replacing(monkeypatch):
             (hwnd, start, end, text)) or True,
     )
 
-    assert ae._replace_native_edit_suffix("st ", "keep stable ", 0)
+    assert ae._replace_native_edit_suffix(
+        "st ", "keep stable ", 0) == ae._NATIVE_REPLACED
     assert calls == [(123, 2, 5, "keep stable ")]
 
 
@@ -396,11 +399,14 @@ def test_native_edit_replacement_rejects_changed_focus(monkeypatch):
             AssertionError("must not replace text after focus changed")),
     )
 
-    assert not ae._replace_native_edit_suffix("st ", "keep stable ", 0)
+    # [AB-02] 焦點改變 → ABORT（不取代、也不 fallback 盲刪），非舊的 False。
+    assert ae._replace_native_edit_suffix(
+        "st ", "keep stable ", 0) == ae._NATIVE_ABORT
 
 
 def test_replace_uses_native_edit_path_without_clipboard(monkeypatch):
-    monkeypatch.setattr(ae, "_replace_native_edit_suffix", lambda *_args: True)
+    monkeypatch.setattr(ae, "_replace_native_edit_suffix",
+                        lambda *_args: ae._NATIVE_REPLACED)
     monkeypatch.setattr(
         ae,
         "_clipboard_get_text",
