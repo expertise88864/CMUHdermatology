@@ -2035,6 +2035,9 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
                          else "請確認劑量")
             if _photo_confirm_yesno(main_hwnd, dlg_title, dlg_intro,
                                     confirm_reason, tag="Excimer", label=label):
+                # [H4 2026-07-09] 醫師停在 Yes/No 時按 F12 → 尊重取消,不再重算/寫回處置欄。
+                # 對照 _update_uvb_dose_core CONFIRM_NEEDED 路徑(2186)確認後都有 check_stop。
+                check_stop()
                 result = update_uvb_in_text(
                     text, skip_dose_sanity=True, skip_stale_check=True)
                 if result.action == UvbAction.UPDATED and result.new_text:
@@ -2056,6 +2059,10 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
             logging.info(
                 "[%s][Excimer] 劑量未自動更新(action=%s),身份仍設 01",
                 label, result.action)
+    except SubsystemInterrupted:
+        # [H4 2026-07-09] F12 取消【必須】往上傳,不可被下面的 except Exception 吞掉
+        # (否則舊 worker 會照樣寫回處置欄+設身份,違背 F12 取消語意)。
+        raise
     except Exception:
         logging.exception("[%s][Excimer] 劑量更新例外(身份仍設 01)", label)
     return _F23_PURE_EXCIMER
@@ -2990,6 +2997,38 @@ _APPT_GRID_HEADER_SKIP_PX = 24   # 跳過表頭(欄位標題)那一列再取樣
 _APPT_GRID_CONTENT_MIN = 12      # 內容像素 >= 此值 → 視為「有預約列」
 
 
+def _window_is_ancestor(ancestor_hwnd: int, hwnd: int) -> bool:
+    """hwnd 是否為 ancestor_hwnd 本身、或其子孫(沿 parent 鏈上溯)。"""
+    if not hwnd or not ancestor_hwnd:
+        return False
+    GA_PARENT = 1
+    cur = hwnd
+    for _ in range(64):   # 防環,最多上溯 64 層
+        if cur == ancestor_hwnd:
+            return True
+        try:
+            parent = ctypes.windll.user32.GetAncestor(cur, GA_PARENT)
+        except Exception:
+            return False
+        if not parent or parent == cur:
+            return False
+        cur = parent
+    return False
+
+
+def _screen_point_in_window(root_hwnd: int, x: int, y: int) -> bool:
+    """螢幕座標 (x,y) 最上層的視窗是否屬於 root_hwnd(本身或子孫)。
+    用於確認畫面取樣點沒被別的視窗(如 Chrome)遮住 —— 遮住時 WindowFromPoint 會回別視窗。"""
+    try:
+        wfp = ctypes.windll.user32.WindowFromPoint
+        wfp.argtypes = [wintypes.POINT]
+        wfp.restype = wintypes.HWND
+        top = wfp(wintypes.POINT(int(x), int(y)))
+    except Exception:
+        return False
+    return _window_is_ancestor(root_hwnd, top)
+
+
 def _referral_grid_has_appointments(dialog_hwnd: int, label: str = "") -> bool:
     """轉診視窗的『本次門診預掛紀錄』(TXStringGrid)有沒有預約列。owner-drawn 讀不到內容,改用畫面
     取樣表頭以下的資料列區:有足夠『深色文字』(資料列黑字)→ True。任何失敗一律回 False → 保守走『轉回
@@ -3005,6 +3044,16 @@ def _referral_grid_has_appointments(dialog_hwnd: int, label: str = "") -> bool:
         left, data_top = r.left, r.top + _APPT_GRID_HEADER_SKIP_PX
         w, h = r.right - r.left, r.bottom - data_top
         if w < 20 or h < 8:
+            return False
+        # [H5 2026-07-09] F11 全程掛 ForegroundProtector,使用者切到 Chrome 時本轉診視窗在背景
+        # 被處理;pyautogui 抓的是【螢幕最上層】像素 → 若被 Chrome 等視窗遮住,會抓到網頁的深色
+        # 文字 → 誤判「有預約」→ 誤勾本科門診、漏印轉回單(高風險方向)。取樣前用 WindowFromPoint
+        # 驗證表格中心垂直線三點都仍屬於本視窗;有任一被遮 → 保守當沒預約(轉回原診所),不亂取樣。
+        cx = left + w // 2
+        probe_ys = (data_top + 3, data_top + h // 2, data_top + h - 3)
+        if not all(_screen_point_in_window(dialog_hwnd, cx, py) for py in probe_ys):
+            logging.warning("[%s] 轉診:預掛表格被遮住/不在最上層 → 保守當沒預約(轉回原診所)",
+                            label)
             return False
         pag = getattr(hotkey_modules, "pyautogui", None)
         if pag is None:
@@ -4231,9 +4280,25 @@ def script_F4_adaptive():
 MENU_ID_同意書 = 669
 
 
+def _get_window_pid(hwnd: int) -> int:
+    """回傳視窗所屬行程 PID(失敗回 0)。用於「只對 HIS 行程的對話框動作」的把關。"""
+    try:
+        pid = ctypes.c_ulong(0)
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value)
+    except Exception:
+        return 0
+
+
 def _find_window_by_class_title(class_name: str, title_kw: str = "",
-                                  exclude_hwnd: int = 0) -> int:
+                                  exclude_hwnd: int = 0,
+                                  require_pid: int = 0,
+                                  exclude_hwnds: tuple = ()) -> int:
     """全域找 class=X 且 title 含 keyword 的可見視窗。
+
+    [H1 2026-07-09] require_pid 非 0 時,只回傳【屬於該 PID(HIS 行程)】的視窗 —— 避免把
+    別的程式跳出的同 class(#32770)標準對話框誤當 HIS 警告框去自動按「是」。exclude_hwnds
+    可額外排除多個(如已處理過的第一個對話框),避免重複動作。
 
     [2026-05-22 v38] 從 EnumWindows + Python callback 改 FindWindowExW
     (純 Win32，不走 Python boundary)。EnumWindows + Python cb 每個 top-level
@@ -4258,13 +4323,21 @@ def _find_window_by_class_title(class_name: str, title_kw: str = "",
         if not hwnd:
             return 0
         prev = hwnd
-        if hwnd == exclude_hwnd:
+        if hwnd == exclude_hwnd or (exclude_hwnds and hwnd in exclude_hwnds):
             continue
         try:
             if not user32.IsWindowVisible(hwnd):
                 continue
         except Exception:
             continue
+        if require_pid:
+            try:
+                wpid = ctypes.c_ulong(0)
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+                if wpid.value != require_pid:
+                    continue
+            except Exception:
+                continue
         if title_kw:
             try:
                 n = user32.GetWindowTextLengthW(hwnd)
@@ -4284,12 +4357,15 @@ def _find_window_by_class_title(class_name: str, title_kw: str = "",
 def _wait_for_window(class_name: str, title_kw: str = "",
                        timeout: float = 10.0,
                        exclude_hwnd: int = 0,
-                       poll_sec: float = 0.03) -> int:
+                       poll_sec: float = 0.03,
+                       require_pid: int = 0) -> int:
     """每 poll_sec 找一次，最多等 timeout 秒。回傳 hwnd 或 0。
-    poll_sec 預設 30ms (比早期 100ms 快 — 對 F9/F10 警告 dialog 反應更即時)。"""
+    poll_sec 預設 30ms (比早期 100ms 快 — 對 F9/F10 警告 dialog 反應更即時)。
+    [H1] require_pid 非 0 時只等【該 HIS 行程】的視窗(不會被別程式的同 class 對話框攔截)。"""
     end = time.time() + timeout
     while time.time() < end:
-        hwnd = _find_window_by_class_title(class_name, title_kw, exclude_hwnd)
+        hwnd = _find_window_by_class_title(class_name, title_kw, exclude_hwnd,
+                                           require_pid=require_pid)
         if hwnd:
             return hwnd
         _sleep_interruptible(min(poll_sec, max(0.0, end - time.time())))
@@ -4533,6 +4609,10 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
     2-3s 卡頓究竟是 (a) server 自然延遲 (無法優化) 還是 (b) 我們可控的部分。
     """
     t_round_start = time.time()
+    # [H1 2026-07-09] 取 popup(確定是 HIS 視窗)的 PID,後續只對【同一 HIS 行程】的
+    # #32770 對話框自動按「是」—— 避免 10s 等待窗內別的程式跳出的標準對話框(存檔/刪除/
+    # 警告)被誤按「是」而造成文書/資料事故。popup_pid=0(取不到)時退回舊行為。
+    popup_pid = _get_window_pid(popup_hwnd)
     # Step A: 點 popup 內的 開立電子 button (async)
     if not _click_button_by_text(popup_hwnd, "開立電子"):
         logging.warning("[%s] popup 找不到 開立電子 button", label)
@@ -4544,7 +4624,7 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
     # Step B: 等警告對話框出現 (class #32770)
     # title 可能是 "警告" 或其他變體，用 class 即可
     dlg = _wait_for_window("#32770", title_kw="", timeout=10,
-                            exclude_hwnd=popup_hwnd)
+                            exclude_hwnd=popup_hwnd, require_pid=popup_pid)
     t_dlg_appeared = time.time()
     if not dlg:
         logging.info("[%s] 沒等到警告對話框 (可能直接送出)", label)
@@ -4587,7 +4667,9 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
         if not ctypes.windll.user32.IsWindow(popup_hwnd):
             logging.info("[%s] popup 已關 → 無第二 dialog 需處理", label)
             return True
-        dlg2 = _find_window_by_class_title("#32770", "", exclude_hwnd=popup_hwnd)
+        dlg2 = _find_window_by_class_title(
+            "#32770", "", exclude_hwnd=popup_hwnd, require_pid=popup_pid,
+            exclude_hwnds=(dlg,) if dlg else ())   # 排除已處理的第一個對話框,避免重複轟
         if dlg2:
             break
         time.sleep(0.05)
@@ -5009,8 +5091,11 @@ def _switch_tab_by_text(or_hwnd: int, tab_text: str) -> tuple[bool, int]:
         logging.info("_switch_tab: ActivePage 已切到 target_sheet (z-order 驗證通過)")
     else:
         logging.warning("_switch_tab: ActivePage 切換失敗 — 視覺仍可能在錯 tab，"
-                          "開立電子可能 submit 錯誤頁面。caller 需注意")
-    return True, target_sheet
+                          "開立電子可能 submit 錯誤頁面 → 回傳 success=False 讓 caller 中止")
+    # [H3 2026-07-09] 第一個回傳值改回報【ActivePage 是否真的切成功】,不再永遠 True。
+    # 開立電子的 submit 依【視覺 ActivePage】決定,swap 失敗仍送出=歷史上的「微小皮膚移植」
+    # 錯誤同意書事故(v27/v28)。改成失敗即讓 caller 中止、交人工開立,寧可不自動也不送錯。
+    return success, target_sheet
 
 
 def _click_radio_by_text(parent_hwnd: int, text_keyword: str) -> bool:
@@ -5479,19 +5564,29 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
     check_stop()
 
     # Step 7 (Round 2): 清空 2 個 edit + 勾 局麻
-    _f9_f10_round2_popup_actions(popup, label=label)
+    # [H2 2026-07-09] round2 失敗(TEdit/局麻 radio 找不到 → 欄位沒清成/局麻沒勾)【不可】照樣
+    # 進 Round 4 自動送出電子同意書 —— 否則會送出一份沒清空既往內容/沒勾局麻的錯誤文書。中止交人工。
+    if not _f9_f10_round2_popup_actions(popup, label=label):
+        logging.warning("[%s] Round 2 失敗(欄位沒清成/局麻沒勾)→ 不自動送出,交醫師手動確認", label)
+        return False
     logging.info("[%s] Round 2 完成 (清空+局麻)", label)
 
     # Step 8 (Round 3): 對 2 個片語欄位執行 click 片語→選 row→帶回
     check_stop()
-    _f9_f10_round3_phrases(popup, phrase_row_所患, phrase_row_手術, label=label)
+    # [H2] 片語沒選成也一樣不可自動送出(內容不完整的同意書)→ 中止交人工。
+    if not _f9_f10_round3_phrases(popup, phrase_row_所患, phrase_row_手術, label=label):
+        logging.warning("[%s] Round 3 失敗(片語沒選成)→ 不自動送出,交醫師手動確認", label)
+        return False
     logging.info("[%s] Round 3 完成 (片語)", label)
 
     # Step 9 (Round 4): 點 popup 開立電子 + 警告對話框「是」+ (未滿 18 對話框)
     # [2026-05-22 v38] 0.3s→0.1s — 片語選擇完 popup 已穩定，不需這麼久 settle
     check_stop()
     time.sleep(0.1)
-    _f9_f10_round4_submit_and_confirm(popup, label=label)
+    # [H2] round4 若連 開立電子 都沒點成(找不到按鈕)→ 回報未完成,不假裝成功。
+    if not _f9_f10_round4_submit_and_confirm(popup, label=label):
+        logging.warning("[%s] Round 4 未完整完成(開立電子/確認框未如預期)", label)
+        return False
     logging.info("[%s] Round 4 完成 (整段 F9/F10 流程完成)", label)
     return True
 
