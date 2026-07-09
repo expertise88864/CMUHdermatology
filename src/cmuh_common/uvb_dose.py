@@ -395,7 +395,9 @@ def _find_excimer_dose(line: str, start: int, date_span=None):
             j -= 1
         if j >= 0 and line[j] in "(（":
             continue
-        if _EXCIMER_NONDOSE_BEFORE_RE.search(line[:s]):   # 前方是上限/加量關鍵字 → 不是劑量
+        # [codex P1] 只看「本段起點(start) 之後」的緊鄰前綴,避免同行前一段的 add/MAX 關鍵字
+        # 誤判掉後一段的劑量(此檢查本就 $ 錨定緊鄰前綴,改用 line[start:s] 語意更精準且不改行為)。
+        if _EXCIMER_NONDOSE_BEFORE_RE.search(line[start:s]):   # 前方是上限/加量關鍵字 → 不是劑量
             continue
         val = int(nm.group(0))
         if val >= MIN_DOSE:
@@ -1152,6 +1154,165 @@ class UvbUpdateResult:
     uncertain_other_triplets: Optional[list] = None
 
 
+# [codex P1] 續行延續的【否決】關鍵字:明確提到「過去/之前/上次/病史/N 天前」的行,即使結構
+# 完整(dose+add+MAX)也【絕不】當成當次醫令延續去改 —— 避免誤改病史/舊療程紀錄(醫療文書安全)。
+# 注意只比對 'last time/visit/...' 不比對 'each time'(避免誤傷 'add N each time' 的正常醫令)。
+_EXCIMER_HISTORY_HINT_RE = re.compile(
+    r"\b(?:previous(?:ly)?|prior|history|hx"
+    r"|last\s+(?:time|visit|dose|session|course)"
+    r"|\d+\s*(?:days?|weeks?|months?|years?)\s+ago|ago)\b"
+    r"|前次|上次|上回|之前|過去|先前|曾經|舊(?:的)?療程|病史",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_excimer_continuation(line: str) -> bool:
+    """[2026-07-09 多段修正] 判斷「沒有 excimer 關鍵字、卻是前一個 excimer 醫令延續」的續行。
+
+    實機(圖一/二):醫師把同一次 excimer 處置的不同部位分行寫,續行只寫劑量不重複 excimer 字眼
+    (例 '左右頭皮各一發: 600mj/cm2, add 30 each time, MAX: 1000')→ 舊版 `search` 找不到 marker
+    整行跳過、漏改。保守把關:必須【同時】具備(1)劑量數字(>=MIN_DOSE、非括號內次數、非上限/
+    加量關鍵字後的數字)、(2)加量關鍵字(add/increase/每次加)、(3)上限關鍵字(MAX/fixed/上限)——
+    三者齊全才算一段合法照光劑量醫令。衛教/病史/一般醫囑不會三者齊全 → 不會被誤當劑量更改。
+    另外[codex P1]即使三者齊全,只要行內出現「過去/之前/上次/病史」等字樣(病史/舊療程),也一律
+    否決,絕不改動歷史醫療文字(醫療安全紅線:不確定就不動)。此判斷只在 flexible_dose(純自費
+    excimer)路徑、且緊接 excimer 段時才生效。"""
+    if _EXCIMER_HISTORY_HINT_RE.search(line):   # 病史/過去療程行 → 絕不當延續改動
+        return False
+    if _find_excimer_dose(line, 0) is None:
+        return False
+    if _UVB_MAX_RE.search(line) is None:
+        return False
+    if _UVB_INCREASE_RE.search(line) is None:
+        return False
+    return True
+
+
+def _compute_excimer_segment_edit(
+        line: str, seg_start: int, dose_bound: int, tail_start: int, today: date,
+        allow_undated: bool, skip_stale: bool):
+    """對 line 的一個 excimer 劑量段算更新(flexible_dose 路徑用)。
+
+    劑量/次數限制在 [seg_start, dose_bound) 內(同行多 marker 時不可抓到下一段的劑量/次數)。
+    日期/上限/加量:【先在本段 [seg_start, dose_bound) 內找(段自己的)】,段內沒有才退回句尾共用
+    區 [tail_start, EOL)(像 '..., excimer 440 for X, on (日期) add 10 fixed 700' 的日期/上限/加量
+    是兩段共用寫在句尾) —— 這樣既能吃共用句尾,又不會讓前一段誤偷後一段【自己】的日期/上限
+    (codex P1:否則無日期的第一段會借到第二段的日期、套錯 staleness/覆寫日期)。
+    回 (edits, first_update, too_close, recognized):edits 為 [((start,end), 取代字串)],沒更新
+    則為 [];recognized=本段確實是「有劑量＋上限」的照光劑量醫令(即使因太近/太舊/無效值而沒改),
+    供上層判定要不要啟用續行延續 —— 純提及 excimer 而無劑量(如 'discuss excimer')recognized=False。
+    邏輯與原本單段完全一致(只是把範圍參數化),含所有既有防呆與 compute_new_dose。"""
+    def _seg_meta(rx):
+        """段內優先;段內沒有才退回句尾共用區(僅當句尾確實在本段之後,避免自借)。
+
+        [設計決策 — 句尾共用是【刻意】保留的]實機 figure 3:
+          'excimer light 580mJ (151) for 嘴周圍, excimer light 440mJ (147) for 右下耳,
+           on (日期) add 10mJ each time fixed at 700mJ'
+        ——整句只寫一個日期/加量/上限,是【兩段共用】(同一次照光的不同部位),使用者明確要求
+        兩段都要遞增。第一段(580)本來就靠這個句尾共用才會更新;若禁止前段借用句尾(如某次
+        Codex 建議),figure 3 的 580 反而會停止更新=退步。此借用不會繞過任何安全防線:借到
+        的日期一樣要過 too_close/stale(>1月轉確認窗)/>2年硬停/次數範圍/MIN_DOSE(見下方防呆),
+        '不確定就不動' 仍成立。故【保留句尾共用】,不採「禁止借用最後一段 metadata」的建議。"""
+        m = rx.search(line, seg_start, dose_bound)
+        if m is None and tail_start > dose_bound:
+            m = rx.search(line, tail_start)
+        return m
+
+    def _seg_maintain():
+        """[codex P1] maintain-dose(維持不加量)也要限本段(＋句尾共用區),否則某一段寫了
+        maintain 會把【其他段】的 add 也壓掉(該段本應遞增卻被誤留原劑量)。"""
+        if _has_maintain_dose(line[seg_start:dose_bound]):
+            return True
+        return tail_start > dose_bound and _has_maintain_dose(line[tail_start:])
+
+    date_m = _seg_meta(_UVB_DATE_RE)
+    max_m = _seg_meta(_UVB_MAX_RE)
+    inc_m = _seg_meta(_UVB_INCREASE_RE)
+    dose_info = _find_excimer_dose(
+        line, seg_start, date_span=(date_m.span() if date_m else None))
+    # 劑量必須落在本段範圍內 —— 否則本段其實沒劑量(下一個 marker 段才有)→ 不處理。
+    if dose_info is not None and dose_info[0] >= dose_bound:
+        dose_info = None
+    # recognized:本段有劑量＋上限結構 → 是一段真的照光劑量醫令(啟用續行延續的依據)。
+    recognized = dose_info is not None and max_m is not None
+    if max_m is None or dose_info is None:
+        return [], None, None, recognized
+    dose_start, dose_end, dose = dose_info
+
+    # 沒日期(初診/醫師沒寫日期)→ first-time:只加劑量(cap MAX),不補日期/次數(2026-06-25 user)。
+    if date_m is None:
+        if not allow_undated or inc_m is None or dose_start > max_m.start():
+            return [], None, None, recognized
+        try:
+            max_dose = int(max_m.group(1))
+            increase = int(inc_m.group(1) or inc_m.group(2))
+        except (TypeError, ValueError):
+            return [], None, None, recognized
+        if (dose < MIN_DOSE or max_dose < MIN_DOSE
+                or not (0 < increase <= 200) or dose >= max_dose):
+            return [], None, None, recognized
+        new_dose = dose if _seg_maintain() else min(dose + increase, max_dose)
+        return ([((dose_start, dose_end), str(new_dose))],
+                {"dose": new_dose, "count": None, "last_date": None, "days_diff": None},
+                None, recognized)
+
+    if dose_start > date_m.start():
+        return [], None, None, recognized
+    ymd = _resolve_date_match(date_m)
+    if ymd is None:
+        return [], None, None, recognized
+    try:
+        last_date = date(*ymd)
+        max_dose = int(max_m.group(1))
+        increase = int(inc_m.group(1) or inc_m.group(2)) if inc_m else 0
+    except (TypeError, ValueError):
+        return [], None, None, recognized
+
+    masked = (line[:date_m.start()]
+              + " " * (date_m.end() - date_m.start())
+              + line[date_m.end():])
+    # 次數(N)限制在本段起點~min(下一段起點, 日期起點) —— 不可抓到下一段的次數或日期後的數字。
+    count_upper = min(dose_bound, date_m.start())
+    count_m = _UVB_COUNT_RE.search(masked, seg_start, count_upper)
+    count = int(count_m.group(1)) if count_m else None
+    days_diff = (today - last_date).days
+
+    # 先擋真正無效/太久遠/舊段(靜默略過,跟原本一樣)
+    if (dose < MIN_DOSE or max_dose < MIN_DOSE
+            or increase < 0 or increase > 200
+            or (count is not None and not (1 <= count <= MAX_COUNT))
+            # [2026-06-24] >2 年(MAX_GAP_DAYS)一律不動 —— 即使 skip_stale(Yes),
+            # 太久遠的紀錄可能跑錯病人,與 UVB 路徑的硬停一致,不可照舊更新。
+            or days_diff > MAX_GAP_DAYS
+            # 1 個月門檻才受 skip_stale 控制:正常路徑略過舊段;Yes 後照舊紀錄更新。
+            or (not skip_stale
+                and last_date < _months_before(today, MODIFY_STALE_MONTHS))):
+        return [], None, None, recognized
+    # [2026-06-25 user] 日期距今 < 2 天(當天又按一次)→ 不加劑量,但記下 days_diff 讓上層跳
+    # 「距上次太近」、不設身份。負值(未來日期)維持原本靜默略過(too_close 回 None)。
+    if days_diff < TOO_CLOSE_DAYS:
+        return [], None, (days_diff if 0 <= days_diff else None), recognized
+
+    new_dose = compute_new_dose(
+        dose=dose, increase=increase, max_dose=max_dose, days_diff=days_diff)
+    if new_dose is None:
+        return [], None, None, recognized
+    if _seg_maintain():
+        new_dose = dose
+    new_count = count + 1 if count is not None else None
+
+    edits = [
+        ((dose_start, dose_end), str(new_dose)),
+        (date_m.span(), _today_in_format(today, date_m.group(0))),
+    ]
+    if count_m is not None and new_count is not None:
+        edits.append((count_m.span(1), str(new_count)))
+    return (edits,
+            {"dose": new_dose, "count": new_count,
+             "last_date": last_date, "days_diff": days_diff},
+            None, recognized)
+
+
 def _update_excimer_lines(text: str, today: date,
                           allow_undated: bool = False,
                           skip_stale: bool = False,
@@ -1159,39 +1320,90 @@ def _update_excimer_lines(text: str, today: date,
                           ) -> tuple[str, int, Optional[dict], Optional[int]]:
     """Update structured excimer lines independently from UVB lines.
 
-    回傳 (新文字, 更新行數, 第一筆更新摘要, too_close_days)。too_close_days 非 None 代表
-    有「有效但日期距今 < 2 天」的 excimer 行 —— 上層應跳「距上次太近」提示、不加劑量、不設身份。
+    回傳 (新文字, 更新段數, 第一筆更新摘要, too_close_days)。too_close_days 非 None 代表
+    有「有效但日期距今 < 2 天」的 excimer 段 —— 上層應跳「距上次太近」提示、不加劑量、不設身份。
 
-    flexible_dose=True(只給【純自費 Excimer】路徑用):劑量用「marker 後第一個不在括號內且
-    >= MIN_DOSE 的數字」抓(同一般 UVB,容忍 '700 m j/cm2' 空格、'810' 無單位)。UVB 路徑的
-    Step D 用 False(維持嚴格 mj 比對)—— 不改健保 UVB visit 順手動 excimer 的既有保守行為。
-    allow_undated=True(只給【純自費 Excimer】路徑用):連沒有日期的 excimer 劑量行也加劑量。
+    flexible_dose=True(只給【純自費 Excimer】F2/F3 路徑用):劑量用「第一個不在括號內且
+    >= MIN_DOSE 的數字」抓(同一般 UVB,容忍 '700 m j/cm2' 空格、'810' 無單位),【並支援多段】:
+    同一行多個 excimer marker、以及沒重複 excimer 字眼但結構完整的續行,每一段各自更新。
+    UVB 路徑的 Step D 用 False(維持嚴格 mj 比對＋單段)—— 不改健保 UVB visit 順手動 excimer 的
+    既有保守行為。
+    allow_undated=True(只給【純自費 Excimer】路徑用):連沒有日期的 excimer 劑量段也加劑量。
     [2026-06-25 user] 沒日期就【只改劑量、不補日期/次數】(維持原本有什麼改什麼,同一般 UVB
     的 first-time)。UVB 路徑的 Step D 用 False —— UVB visit 不應順手改沒日期的 excimer 行。
-    [2026-06-24] skip_stale=True(使用者在確認窗按 Yes 後)→ 不因『日期早於 1 個月』而略過該行,
-    照舊紀錄繼續更新;預設 False 時,日期早於今天往前 1 個日曆月的 excimer 行一律略過(忽略舊段)。"""
+    [2026-06-24] skip_stale=True(使用者在確認窗按 Yes 後)→ 不因『日期早於 1 個月』而略過該段,
+    照舊紀錄繼續更新;預設 False 時,日期早於今天往前 1 個日曆月的 excimer 段一律略過(忽略舊段)。
+    """
     lines = text.splitlines(keepends=True)
     updated = 0
     first_update: Optional[dict] = None
     too_close_days: Optional[int] = None
 
+    if flexible_dose:
+        # 【純自費 Excimer F2/F3 多段】[2026-07-09 楊智翔實機]原本每個處置欄只改「第一個 excimer
+        # 關鍵字後的第一個劑量」→ 同一行第二段(圖三 440)、沒重複關鍵字的續行(圖一 middle neck、
+        # 圖二 頭皮)漏改。改為:逐行取【所有】excimer marker 各自成段(劑量限本段、日期/上限/加量
+        # 可共用句尾);無 marker 但結構完整(dose+increase+MAX)且緊接 excimer 段的續行也視為延續。
+        last_seg_was_excimer = False
+        for index, line in enumerate(lines):
+            markers = list(_EXCIMER_MARKER_RE.finditer(line))
+            if markers:
+                segments = [
+                    (m.end(),
+                     markers[mi + 1].start() if mi + 1 < len(markers) else len(line))
+                    for mi, m in enumerate(markers)
+                ]
+                # 句尾共用區起點 = 最後一個 marker 之後(前面各段若自己沒日期/上限/加量才退回這裡借)。
+                tail_start = markers[-1].end()
+            elif last_seg_was_excimer and _looks_like_excimer_continuation(line):
+                segments = [(0, len(line))]
+                tail_start = 0   # 續行單段:整行即本段,不需要句尾借用
+            else:
+                last_seg_was_excimer = False  # 非 excimer 行 → 中斷延續,不跨越誤改
+                continue
+
+            line_edits: dict = {}   # span → 取代字串;同 span(共用日期)自動去重
+            line_recognized = False
+            for seg_start, dose_bound in segments:
+                edits, seg_first, seg_too_close, recognized = \
+                    _compute_excimer_segment_edit(
+                        line, seg_start, dose_bound, tail_start,
+                        today, allow_undated, skip_stale)
+                if recognized:
+                    line_recognized = True
+                if seg_too_close is not None and too_close_days is None:
+                    too_close_days = seg_too_close
+                if not edits:
+                    continue
+                for span, replacement in edits:
+                    line_edits[span] = replacement
+                updated += 1
+                if first_update is None and seg_first is not None:
+                    first_update = seg_first
+            # [codex P1] 只有本行確實是「有劑量＋上限」的照光劑量醫令才啟用/維持續行延續 ——
+            # 純提及 excimer(如 'discuss excimer treatment',無劑量)不可讓下一個不相關的
+            # dose+increase+MAX 行被當成延續而誤改。
+            last_seg_was_excimer = line_recognized
+            if line_edits:
+                new_line = line
+                for (start, end), replacement in sorted(line_edits.items(), reverse=True):
+                    new_line = new_line[:start] + replacement + new_line[end:]
+                lines[index] = new_line
+
+        return "".join(lines), updated, first_update, too_close_days
+
+    # 【健保 UVB visit Step D】flexible_dose=False —— 維持既有保守單段行為:嚴格 _EXCIMER_DOSE_RE
+    # (要求 mj 單位)、每行只認第一個 marker 後的第一個劑量,不擴充多段(不動 UVB visit 順手動
+    # excimer 的既有行為)。此路徑目前只被 UVB Step D 以預設參數呼叫。
     for index, line in enumerate(lines):
         marker = _EXCIMER_MARKER_RE.search(line)
         if marker is None:
             continue
         date_m = _UVB_DATE_RE.search(line, marker.end())
         max_m = _UVB_MAX_RE.search(line, marker.end())
-        # [2026-06-25] 純自費 excimer 路徑(flexible_dose)劑量改用「marker 後第一個不在括號內且
-        # >= MIN_DOSE 的數字」(同一般 UVB,不要求 mj 單位)→ '700 m j/cm2'(空格)、'810'(無單位)
-        # 都吃得到;UVB Step D 維持嚴格 _EXCIMER_DOSE_RE(要求 mj),不動既有保守行為。
-        if flexible_dose:
-            dose_info = _find_excimer_dose(
-                line, marker.end(),
-                date_span=(date_m.span() if date_m else None))
-        else:
-            _dm = _EXCIMER_DOSE_RE.search(line, marker.end())
-            dose_info = ((_dm.start(1), _dm.end(1), int(_dm.group(1)))
-                         if _dm else None)
+        _dm = _EXCIMER_DOSE_RE.search(line, marker.end())
+        dose_info = ((_dm.start(1), _dm.end(1), int(_dm.group(1)))
+                     if _dm else None)
         inc_m = _UVB_INCREASE_RE.search(line, marker.end())
         if max_m is None or dose_info is None:
             continue
