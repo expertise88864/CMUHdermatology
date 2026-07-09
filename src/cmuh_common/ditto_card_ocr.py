@@ -275,15 +275,26 @@ _OCR_INSTALL_TRIED = False
 
 
 def _bg_install_winsdk() -> None:
-    """背景緒補裝 winsdk(不阻塞 hotkey)。裝好後設快取,下次 F2/F3 即可用。"""
+    """[M6 2026-07-09] 背景緒補裝 winsdk。【預設不在生產機 runtime pip install】—— 對 PyPI 做
+    runtime 安裝有供應鏈風險、裝進共用環境會影響其他功能,pythonw 下 subprocess 還會閃 console。
+    改為:預設只記錄提示「請部署時預先打包 winsdk」;只有明確設環境變數
+    CMUH_ALLOW_WINSDK_AUTOINSTALL=1(dev/自願)才真的 pip install,且帶 CREATE_NO_WINDOW 不閃視窗。"""
     global _OCR_ROOT_CACHE
+    import os
+    if os.environ.get("CMUH_ALLOW_WINSDK_AUTOINSTALL", "").strip().lower() not in (
+            "1", "true", "yes"):
+        logging.warning(
+            "[卡號OCR] winsdk 未安裝且未開放 runtime 安裝 → 卡號 OCR 停用(功能退回手動);"
+            "請部署時預先打包 winsdk。(設 CMUH_ALLOW_WINSDK_AUTOINSTALL=1 才會自動安裝)")
+        return
     try:
         import importlib
         import subprocess
         import sys
-        logging.info("[卡號OCR] winsdk 未安裝,背景補裝中…")
+        logging.info("[卡號OCR] winsdk 未安裝,背景補裝中…(已由環境變數開放 runtime 安裝)")
+        creationflags = 0x08000000 if os.name == "nt" else 0   # CREATE_NO_WINDOW,不閃 console
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "winsdk"],
-                       check=False, timeout=300)
+                       check=False, timeout=300, creationflags=creationflags)
         importlib.import_module("winsdk.windows.media.ocr")
         _OCR_ROOT_CACHE = "winsdk"
         logging.info("[卡號OCR] winsdk 背景安裝完成,下次可用")
@@ -363,48 +374,53 @@ def read_card_from_image(grid_img, *, tmp_dir,
     from PIL import Image  # noqa: F401
     import os
 
+    # [L3 2026-07-09] 這些暫存 PNG 是【病人卡號格線的截圖(含 PHI)】。原本清除是行末 inline,
+    # 早退(找不到卡號欄)或 OCR 例外時會【留下 PHI 檔在共用 %TEMP%】。改用 try/finally 保證清除
+    # (save_debug 時才刻意保留供除錯)。收集所有寫出的暫存檔,離開時一律嘗試刪除。
     full_png = os.path.join(tmp_dir, "_ditto_card_full.png")
-    grid_img.save(full_png)
-    words = _ocr_words_of_png(full_png, scale=1.0)
+    tmp_pngs: list[str] = []
+    try:
+        # [codex P2] 先登記待清路徑再寫檔 —— save() 建/截檔後若拋錯(磁碟滿/IO error),path 已在
+        # tmp_pngs → finally 仍會刪掉半成品 PHI 檔;反之(先寫後登記)拋錯就會漏一個檔在共用 %TEMP%。
+        tmp_pngs.append(full_png)
+        grid_img.save(full_png)
+        words = _ocr_words_of_png(full_png, scale=1.0)
 
-    card_x = find_card_column_x(words)
-    tiao_x = find_tiao_column_x(words)
-    if card_x is None:
-        return CardResult(None, "none", "OCR 找不到『卡號』欄標題")
+        card_x = find_card_column_x(words)
+        tiao_x = find_tiao_column_x(words)
+        if card_x is None:
+            return CardResult(None, "none", "OCR 找不到『卡號』欄標題")
 
-    card_cells = card_cells_from_words(words, card_x)
+        card_cells = card_cells_from_words(words, card_x)
 
-    tiao_cells: list[tuple[int, str]] = []
-    if tiao_x is not None:
-        # 療欄是單一數字,整張 OCR 常漏 → 裁切該欄 + 放大 5x 再認一次
-        scale = 5
-        x0 = max(0, int(tiao_x - 38))
-        x1 = min(grid_img.width, int(tiao_x + 38))
-        strip = grid_img.crop((x0, 0, x1, grid_img.height))
-        strip = strip.resize((strip.width * scale, strip.height * scale))
-        strip_png = os.path.join(tmp_dir, "_ditto_card_tiao.png")
-        strip.save(strip_png)
-        tiao_words = _ocr_words_of_png(strip_png, scale=scale)
-        # 裁切後 x 要加回 x0 才是原圖座標
-        for w in tiao_words:
-            w.x += x0
-        tiao_cells = tiao_cells_from_words(tiao_words, tiao_x)
+        tiao_cells: list[tuple[int, str]] = []
+        if tiao_x is not None:
+            # 療欄是單一數字,整張 OCR 常漏 → 裁切該欄 + 放大 5x 再認一次
+            scale = 5
+            x0 = max(0, int(tiao_x - 38))
+            x1 = min(grid_img.width, int(tiao_x + 38))
+            strip = grid_img.crop((x0, 0, x1, grid_img.height))
+            strip = strip.resize((strip.width * scale, strip.height * scale))
+            strip_png = os.path.join(tmp_dir, "_ditto_card_tiao.png")
+            tmp_pngs.append(strip_png)   # [codex P2] 同上:先登記再寫,save 拋錯也保證被清
+            strip.save(strip_png)
+            tiao_words = _ocr_words_of_png(strip_png, scale=scale)
+            # 裁切後 x 要加回 x0 才是原圖座標
+            for w in tiao_words:
+                w.x += x0
+            tiao_cells = tiao_cells_from_words(tiao_words, tiao_x)
+
+        header_y = min((w.y for w in _header_band(words)), default=None)
+        result = pick_card_number(card_cells, tiao_cells, header_y=header_y)
+        logging.info("[卡號OCR] %s (card=%s conf=%s 卡號列=%d 療列=%d header_y=%s)",
+                     result.reason, result.card, result.confidence,
+                     len(card_cells), len(tiao_cells), header_y)
+        return result
+    finally:
+        # 一律清除 PHI 暫存(save_debug 才保留);任一刪除失敗不影響其他檔與回傳。
         if not save_debug:
-            for p in (strip_png,):
+            for p in tmp_pngs:
                 try:
                     os.remove(p)
                 except Exception:
                     pass
-
-    if not save_debug:
-        try:
-            os.remove(full_png)
-        except Exception:
-            pass
-
-    header_y = min((w.y for w in _header_band(words)), default=None)
-    result = pick_card_number(card_cells, tiao_cells, header_y=header_y)
-    logging.info("[卡號OCR] %s (card=%s conf=%s 卡號列=%d 療列=%d header_y=%s)",
-                 result.reason, result.card, result.confidence,
-                 len(card_cells), len(tiao_cells), header_y)
-    return result

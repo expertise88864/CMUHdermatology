@@ -807,7 +807,10 @@ def test_code_input_waits_for_focus_after_menu_command():
     assert 0.6 in constants
 
     wait_src = _function_source(source_path, "_wait_for_code_input_focus")
-    assert "is_input_like and (focus != previous_focus or not previous_focus)" in wait_src
+    # [M2 2026-07-09 + codex] previous_focus 已知時維持「input-like 且焦點已改變」;未知時必須
+    # 正面辨識為格線內嵌代碼輸入器(inplace/grid),不收一般 edit/memo/rich,寧可回 0 交人工。
+    assert "is_input_like and focus != previous_focus" in wait_src
+    assert "_GRID_CODE_EDITOR" in wait_src
     assert "return 0" in wait_src
 
     code_input_src = _function_source(source_path, "_script_code_input_adaptive")

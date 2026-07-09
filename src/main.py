@@ -1300,6 +1300,38 @@ def _mark_hotkey_action_time() -> None:
 _HOSPITAL_WIN_CLASS = "TFopdmain"
 _HOSPITAL_WIN_TITLE_KW = "西醫門診醫師作業"
 
+# [M1 2026-07-09] HIS 版本守門(偵測 + 警示)。選單 command id(代碼輸入/同意書/完成不印)是對特定
+# HIS 版本【硬編碼校正】的;HIS 改版曾整批位移(2026-06-29 全部 +1)→ 舊 id 會觸發到別的選單功能。
+# 若主視窗 title 帶的版本字串與校正版本不同 → 記 WARNING 提醒 id 可能已位移(需實測重新校正)。
+# 【刻意只警示、不硬停 F 鍵】:硬停在版本字串誤判時會讓醫師整組熱鍵失效(比原 bug 更糟);且完成不印
+# 已有 _find_menu_command_id_by_text 動態解析當備援。title 沒有可辨識版本字串 → 不動作(避免假警報)。
+# 硬停 + 醫師對話框待有實機可確認 title 格式再補(不確定就不自動動作,連自己的守門也一樣)。
+_HIS_CALIBRATED_VERSION = "1150629"   # 選單 id 校正對應的 HIS 版本(2026-06-29 V.1150629.01 改版後)
+_HIS_VERSION_RE = re.compile(r"[Vv]\.?\s*(\d{6,8})")
+_his_version_checked = False
+
+
+def _his_title_version(title: str):
+    """從主視窗 title 取 HIS 版本號(6-8 位數字,如 1150629);找不到回 None。純函式,好測。"""
+    m = _HIS_VERSION_RE.search(title or "")
+    return m.group(1) if m else None
+
+
+def _maybe_warn_his_version(title: str) -> None:
+    """一次性:title 版本與校正版本不同 → WARNING(不硬停 F 鍵)。title 沒版本字串 → 不動作(不假警報)。"""
+    global _his_version_checked
+    if _his_version_checked:
+        return
+    ver = _his_title_version(title)
+    if ver is None:
+        return                       # title 無版本字串 → 不判斷,避免假警報/永久誤停
+    _his_version_checked = True       # 有抓到版本才算檢查過,避免早期抓不到就永久跳過
+    if ver != _HIS_CALIBRATED_VERSION:
+        logging.warning(
+            "[HIS版本] 主視窗版本=%s 與選單 id 校正版本 %s 不同 —— F 鍵自動選單(代碼輸入/"
+            "同意書/完成不印)的 command id 可能已位移,請實測重新校正(scripts/test_yiling_menu_id.py);"
+            "完成不印已有動態解析備援。", ver, _HIS_CALIBRATED_VERSION)
+
 # 醫令 子選單 command ID (probe + user 確認;2026-06-29 HIS V.1150629.01 改版後整批 +1)
 MENU_ID_類別字首 = 216   # 215→216(未使用,隨同段 +1)
 MENU_ID_代碼字首 = 218   # 217→218(未使用,隨同段 +1)
@@ -1335,6 +1367,7 @@ def _find_hospital_main_window() -> int:
                     ctypes.windll.user32.GetWindowTextW(hwnd, t_buf, n + 1)
                     if _HOSPITAL_WIN_TITLE_KW in t_buf.value:
                         found[0] = hwnd
+                        _maybe_warn_his_version(t_buf.value)  # [M1] 版本守門(一次性,只警示)
                         return False  # 停止枚舉
             except Exception:
                 pass
@@ -1414,16 +1447,31 @@ def _wait_for_code_input_focus(target_hwnd: int, *,
                                previous_focus: int = 0,
                                timeout: float = 0.6,
                                poll: float = 0.03) -> int:
-    """等代碼輸入 menu 讓焦點移到可輸入控件，避免固定 sleep 抓到舊焦點。"""
+    """等代碼輸入 menu 讓焦點移到可輸入控件，避免固定 sleep 抓到舊焦點。
+
+    [M2 2026-07-09 + codex] previous_focus 讀不到(=0)時【不可】只憑「有 edit 就通過」——若選單命令
+    沒生效(如 HIS 改版 menu id 漂移),焦點可能仍停在醫師的病歷 TMemo/TRichEdit,或病人其他一般
+    TEdit 欄位 → 代碼(51019 等)會被打進錯的欄位。改嚴格:previous_focus 未知時必須【正面辨識】
+    為格線內嵌代碼輸入器(class 含 inplace / grid),不接受一般 edit/memo/rich;寧可 return 0
+    (caller 放棄自動化,交人工)也不把代碼 key 到不確定的欄位。有 previous_focus 時維持原本行為。"""
     end_t = time.time() + timeout
+    # 代碼輸入欄是 Delphi 格線的內嵌編輯器(TInplaceEdit / TStringGrid…),用這個正面辨識。
+    _GRID_CODE_EDITOR = ("inplace", "grid")
     while time.time() < end_t:
         focus = _get_thread_focus(target_hwnd)
         if focus and focus != target_hwnd:
             cls = _get_class_name_of(focus).lower()
-            is_input_like = any(
-                s in cls for s in ("edit", "memo", "rich", "grid"))
-            if is_input_like and (focus != previous_focus or not previous_focus):
-                return focus
+            if previous_focus:
+                # 有前焦點:input-like 且焦點確實已從舊焦點移開(維持原本行為)。
+                is_input_like = any(
+                    s in cls for s in ("edit", "memo", "rich", "grid"))
+                if is_input_like and focus != previous_focus:
+                    return focus
+            else:
+                # 前焦點未知:嚴格 —— 只收正面辨識為格線內嵌代碼輸入器者,其餘(一般 edit/memo/
+                # rich/病人其他欄位)一律不收,回 0 交人工,避免把代碼 key 錯地方。
+                if any(s in cls for s in _GRID_CODE_EDITOR):
+                    return focus
         _sleep_interruptible(poll)
     return 0
 
@@ -3330,6 +3378,22 @@ def _scan_unknown_popups(known_classes: set, seen: dict, label: str) -> None:
         pass
 
 
+def _popup_identity(hwnd: int) -> tuple:
+    """[M3/codex 2026-07-09] 輕量視窗『身分』:(標題文字, 直系子視窗數)。同 class 但【不同實例】
+    (內容不同,如 chained Delphi dialog 換了一個)時身分會不同 —— 用來偵測某 hwnd 被同 class 的
+    新 popup 重用(此時身分變了 → 應重新處理,不可沿用舊 handled 記錄而跳過)。handler 只是按鈕
+    click,同一實例的標題/子視窗數穩定 → 身分不變 → 正確視為已處理、不重複動作。"""
+    try:
+        txt = _get_window_text(hwnd)
+    except Exception:
+        txt = ""
+    try:
+        cnt = len(_enum_direct_children(hwnd))
+    except Exception:
+        cnt = -1
+    return (txt, cnt)
+
+
 def _f11_popup_watcher(label: str = "F11",
                         total_timeout: float = 60.0) -> int:
     """輪詢已知 popup → 依現身順序執行對應 handler。
@@ -3346,9 +3410,13 @@ def _f11_popup_watcher(label: str = "F11",
     回傳：處理過的 popup 數量
     """
     start = time.time()
-    handled = set()  # 已處理過的 hwnd，避免重複
-    # 每個 hwnd 的 retry 次數 — 若 handler 回 False 但 popup 還在 (race 沒按到 /
-    # radio 還沒 enable)，給最多 3 次機會，超過就放棄不再卡
+    # [M3 2026-07-09 + codex] key=(hwnd, class),value=該實例的 _popup_identity(標題+子視窗數)。
+    # 裸 hwnd 會被系統回收重用 —— 舊 popup 關閉後同 class 新 popup 撿到同一 hwnd 會被誤判
+    # already-handled 而永久跳過。三重保險:(1)key 加 class;(2)迴圈內以 IsWindow prune 掉已消失項;
+    # (3)value 存視窗身分,同 hwnd+class 但身分不同(內容變了=新實例)即重新處理。
+    handled: dict = {}       # (hwnd, class) → 已處理該實例的身分
+    # 每個 (hwnd, class) 的 retry 次數 — handler 回 False 但 popup 還在 (race 沒按到 /
+    # radio 還沒 enable) 時給最多 3 次機會，超過放棄不卡
     retry_counter: dict = {}
     handled_count = 0
     last_progress_log = time.time()
@@ -3418,11 +3486,31 @@ def _f11_popup_watcher(label: str = "F11",
             except Exception:
                 logging.debug("[%s] unknown popup scan 例外", label, exc_info=True)
 
+        # [M3] 清掉 hwnd 已被系統回收(IsWindow=False)的 handled/retry 項,避免重用的 hwnd 被
+        # 永久跳過。與下方 (hwnd, class) key 雙保險。
+        try:
+            _dead = [k for k in handled
+                     if not ctypes.windll.user32.IsWindow(k[0])]
+            for _k in _dead:
+                handled.pop(_k, None)
+                retry_counter.pop(_k, None)
+        except Exception:
+            pass
+
         found_one = False
         for cls_name, title_kw, handler in _F11_POPUP_HANDLERS:
             hwnd = _find_window_by_class_title(cls_name, title_kw)
-            if hwnd and hwnd not in handled:
-                attempts = retry_counter.get(hwnd, 0)
+            key = (hwnd, cls_name)
+            # 身分(標題+子視窗數)不同於上次處理 → 視為新實例(hwnd 被同 class 新 popup 重用),重處理。
+            # [限制] 若新舊實例的 class/title/子視窗數全同且中間沒被 prune 觀察到關閉,身分無法區分 —— 這是
+            # 對外部 owner-drawn Delphi 視窗做去重的先天限制(Win32 無穩定 per-instance id)。實際
+            # _F11_POPUP_HANDLERS 各 popup 為【不同 class】,此殘留情境幾乎不會發生。
+            ident = _popup_identity(hwnd) if hwnd else None
+            if hwnd and handled.get(key) != ident:
+                # [codex P2] retry 次數綁定 identity —— hwnd 被新實例重用(身分變)時歸零,讓新
+                # popup 拿到完整重試次數,不會沿用舊實例殘留的計數而提早放棄。
+                _rc = retry_counter.get(key)
+                attempts = _rc[1] if (_rc and _rc[0] == ident) else 0
                 # [2026-05-22 v40] 每 popup 處理前後打 timestamp，定位卡死
                 t_handler_start = time.time()
                 logging.info("[%s][timeline] 偵測到 popup %s hwnd=%s "
@@ -3444,13 +3532,23 @@ def _f11_popup_watcher(label: str = "F11",
                 popup_still_open = bool(
                     ctypes.windll.user32.IsWindow(hwnd))
                 if ok or not popup_still_open or attempts >= 2:
-                    handled.add(hwnd)
+                    handled[key] = ident   # 記下已處理【這個實例】的身分
                     handled_count += 1
                     if not ok and not popup_still_open:
                         logging.info("[%s] %s popup 已關 (可能 user 手動)，"
                                        "標記 handled", label, cls_name)
+                    elif ok and popup_still_open:
+                        # [M3/codex 2026-07-09] 成功處理但 popup 尚未關 → 短暫等它關閉,讓該 hwnd
+                        # 先釋放,縮小「同 class 的下一個 popup 立刻撿到同一 hwnd、下輪被誤判
+                        # already-handled 而跳過」的視窗(chained Delphi dialog 常見)。最多 ~1.2s,
+                        # 期間可 F12 中止;popup 通常按完很快就關,多半提早 break。
+                        _close_deadline = time.time() + 1.2
+                        while time.time() < _close_deadline:
+                            if not ctypes.windll.user32.IsWindow(hwnd):
+                                break
+                            _sleep_interruptible(0.05)
                 else:
-                    retry_counter[hwnd] = attempts + 1
+                    retry_counter[key] = (ident, attempts + 1)   # [codex P2] 綁 identity
                     logging.warning(
                         "[%s] %s handler 回 False 且 popup 仍存在 → "
                         "第 %d 次後 retry", label, cls_name, attempts + 1)
@@ -3695,7 +3793,9 @@ def _f11_precheck_card_for_phototherapy(label: str = "F11") -> bool:
         liao_hwnd = _find_療程_edit_hwnd(main_hwnd)
         if not liao_hwnd:
             return True
-        療程 = (_read_tmemo_text(liao_hwnd) or "").strip()
+        # [M5 2026-07-09] 與 _f11_read_course_value 共用同一 normalize —— 否則療程欄若是全形
+        # 「２」/「３」會不等於 "2"/"3" → 跳過卡號檢查、照光仍「完成不印」→ 卡號空白照樣完成。
+        療程 = _f11_normalize_course_value(_read_tmemo_text(liao_hwnd))
         if 療程 not in ("2", "3"):
             return True  # 不是照光 2/3 → 不檢查
         card_hwnd = _find_療程卡號_edit_hwnd(main_hwnd)
@@ -3952,6 +4052,17 @@ def _replace_edit_text(field_hwnd: int, new_text: str,
             return False
         cx = (r.left + r.right) // 2
         cy = (r.top + r.bottom) // 2
+
+        # [M4 2026-07-09] 這是【螢幕座標實體點擊+typewrite】—— HIS 被別視窗(Chrome 等)蓋住時,
+        # click 會落在覆蓋視窗上、把值(身份 01/療程)打進別的應用程式。動作前:(1)把 HIS 拉到前景;
+        # (2)用 WindowFromPoint 驗點擊中心【確實屬於目標欄位】,被遮/不在最上層就中止不亂打,
+        # 交由 caller(F1/F2/F3 設身份/療程)走既有的失敗警示路徑,由醫師手動確認。
+        _ensure_hospital_foreground(main_hwnd or field_hwnd)
+        time.sleep(0.05)   # 等前景切換 + 重繪
+        if not _screen_point_in_window(field_hwnd, cx, cy):
+            logging.warning(
+                "_replace_edit_text: 目標欄位被遮住/不在最上層 → 中止,不把值打到別的視窗")
+            return False
 
         # 暫存滑鼠位置 (操作完還原)
         pt = wintypes.POINT()
@@ -5521,17 +5632,35 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
             info_dlg = _find_window_by_class_title("TMessageForm",
                                                      title_kw="Information")
             if info_dlg:
-                # dialog 只有 1 個 TButton (&Yes)，直接 enum + click
                 buttons = _enum_class_in_window(info_dlg, "TButton")
-                if buttons:
-                    _post_click_to_control(buttons[0][0])
+                # [L1 2026-07-09] 原本盲點 buttons[0]。標準未滿18 Information 只有一顆 &Yes;
+                # 但若是 Yes/No 等多鈕變體,盲點第一顆可能點到「否」。改:單顆才直接點;多顆時
+                # 只點文字為 Yes/確定/是/OK 的那顆,認不出就【不自動點】交醫師,避免誤點。
+                target_btn = 0
+                if len(buttons) == 1:
+                    target_btn = buttons[0][0]
+                elif len(buttons) > 1:
+                    for b in buttons:
+                        try:
+                            bt = _get_window_text(b[0]).replace("&", "").strip().lower()
+                        except Exception:
+                            bt = ""
+                        if bt in ("yes", "ok", "確定", "是"):
+                            target_btn = b[0]
+                            break
+                if target_btn:
+                    _post_click_to_control(target_btn)
                     logging.info(
                         "[%s] 偵測到未滿18歲 Information dialog (hwnd=%s)，"
-                        "已自動點 Yes (button hwnd=%s)",
-                        label, info_dlg, buttons[0][0])
+                        "已自動點 Yes (button hwnd=%s, 共 %d 顆)",
+                        label, info_dlg, target_btn, len(buttons))
                     age_dlg_handled = True
                     _sleep_interruptible(0.3)  # 給 Delphi 處理 dismiss + 開 popup
                     continue
+                elif buttons:
+                    logging.warning(
+                        "[%s] Information dialog 有 %d 顆按鈕但認不出 Yes → 不自動點,交醫師",
+                        label, len(buttons))
         _sleep_interruptible(0.1)
     if not popup:
         logging.warning("[%s] 等不到 popup (Tfm_agree) 60s 超時", label)
@@ -13325,6 +13454,18 @@ class AutomationApp:
                                 "[hotkey] %s 觸發但前景=%r 不在 allow list %s → skip",
                                 key_name, cls_buf.value, tag)
                             return
+                        # [L5 2026-07-09] #32770 是【任何程式】共用的 Windows 標準對話框 class;
+                        # 只憑 class 放行會讓別的程式的對話框在前景時也能觸發 F9-F12(對 HIS 背景
+                        # 亂動)。額外要求該 #32770 確實屬於 HIS 行程,否則 skip。其餘 class 都是 HIS
+                        # 專屬,不需此檢查。找不到 HIS/取不到 PID → 保守 skip。
+                        if cls_buf.value == "#32770":
+                            his_hwnd = _find_hospital_main_window()
+                            his_pid = _get_window_pid(his_hwnd) if his_hwnd else 0
+                            if not his_pid or _get_window_pid(fg_hwnd) != his_pid:
+                                logging.debug(
+                                    "[hotkey] %s 前景 #32770 不屬 HIS 行程 → skip",
+                                    key_name)
+                                return
                     except Exception:
                         logging.debug("[hotkey] 前景偵測失敗，保險 skip",
                                        exc_info=True)
