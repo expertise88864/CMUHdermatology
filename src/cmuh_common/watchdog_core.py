@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import csv
 import json
 import locale
@@ -154,13 +155,99 @@ _CRASH_LOOP_LOCK = threading.Lock()
 CRASH_LOOP_WINDOW_SEC = 600       # 10 分鐘
 CRASH_LOOP_MAX_RESTARTS = 5       # 內 5 次以上 → 視為 crash loop
 CRASH_LOOP_SUSPEND_SEC = 1800     # 暫停 30 分鐘
+# [AC-07] crash-loop 啟動歷史落盤路徑。--once 模式每次都是全新行程,記憶體 dict 會歸零 →
+# crash-loop 計數永遠累積不起來、防護等於失效。落盤後 daemon 與 --once 共用同一份歷史。
+RESTART_HISTORY_PATH = SETTINGS_DIR / ".watchdog_restart_history.json"
+
+
+def _restart_history_path() -> str:
+    return str(RESTART_HISTORY_PATH)
+
+
+def _load_restart_history() -> None:
+    """[AC-07] 從檔載入啟動歷史/暫停狀態（讓 --once 也能累積 crash-loop 計數）。"""
+    try:
+        data = safe_load_json(_restart_history_path(), {}) or {}
+    except Exception:
+        return
+    hist = data.get("history")
+    if isinstance(hist, dict):
+        _RESTART_HISTORY.clear()
+        for name, ts in hist.items():
+            if isinstance(ts, list):
+                _RESTART_HISTORY[str(name)] = [
+                    float(t) for t in ts if isinstance(t, (int, float))]
+    susp = data.get("suspended_until")
+    if isinstance(susp, dict):
+        _SUSPENDED_UNTIL.clear()
+        for name, until in susp.items():
+            if isinstance(until, (int, float)):
+                _SUSPENDED_UNTIL[str(name)] = float(until)
+
+
+def _save_restart_history() -> None:
+    """[AC-07] 落盤啟動歷史/暫停狀態。"""
+    try:
+        atomic_write_json(_restart_history_path(),
+                          {"history": _RESTART_HISTORY,
+                           "suspended_until": _SUSPENDED_UNTIL})
+    except Exception:
+        logging.debug("[watchdog] 寫入啟動歷史失敗", exc_info=True)
+
+
+@contextlib.contextmanager
+def _restart_history_lock(timeout_sec: float = 3.0):
+    """[codex P2] 跨行程互斥檔案鎖，序列化 crash-loop 歷史的 read-modify-write，避免
+    daemon 與 --once 同時 load-modify-save 造成 lost update（掉某程式的啟動記錄、破壞
+    crash-loop 偵測）。O_CREAT|O_EXCL 建鎖檔；拿不到就短暫等；逾時 fail-open（寧可極
+    罕見的 lost update 也不要卡住整個 watchdog tick）；離開刪鎖檔。與歷史檔同目錄。"""
+    lock_path = _restart_history_path() + ".lock"
+    deadline = time.monotonic() + timeout_sec
+    fd = -1
+    try:
+        os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+    except Exception:
+        pass
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(lock_path) > 10:
+                    os.remove(lock_path)      # stale（持鎖行程崩潰）→ 搶過來
+                    continue
+            except FileNotFoundError:
+                continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                break                         # 逾時 → fail-open，不持鎖也繼續
+            time.sleep(0.02)
+        except Exception:
+            break
+    try:
+        yield
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            try:
+                os.remove(lock_path)
+            except Exception:
+                pass
 
 
 def _record_restart_and_check_crash_loop(name: str) -> bool:
     """紀錄一次啟動。回傳 True = 沒進入 crash loop, 可以繼續啟動。
     回傳 False = 已經 crash loop 中，呼叫端應跳過啟動。"""
     now = time.time()
-    with _CRASH_LOOP_LOCK:
+    # [codex P2] _CRASH_LOOP_LOCK 只擋同行程;_restart_history_lock 擋跨行程,一起把整段
+    # load-modify-save 序列化,避免 daemon 與 --once 併發 lost update。
+    with _CRASH_LOOP_LOCK, _restart_history_lock():
+        _load_restart_history()          # [AC-07] 先讀檔(--once 也能累積)
         # 檢查是否仍在 suspend 期間
         until = _SUSPENDED_UNTIL.get(name, 0.0)
         if now < until:
@@ -196,7 +283,9 @@ def _record_restart_and_check_crash_loop(name: str) -> bool:
                 logging.exception("[watchdog] 寫 auto-update suspend flag 失敗")
             # 清歷史避免後續又連續觸發
             hist.clear()
+            _save_restart_history()      # [AC-07] 落盤(suspend + 清空後的歷史)
             return False
+        _save_restart_history()          # [AC-07] 落盤本次啟動記錄
         return True
 
 
@@ -367,6 +456,35 @@ def find_matching_pids(procs: list, keyword: str, exclude_pid: int = 0) -> list:
             if kw in p.get("cmdline", "").lower() and p["pid"] != exclude_pid]
 
 
+def _read_python_process_csv_via_powershell() -> str:
+    """[AC-06] WMIC 在 Win11 24H2+ 已移除 → 改用 PowerShell CIM（Get-CimInstance
+    Win32_Process，不受 WMIC 移除影響）列舉 python launchers。輸出成與 wmic /FORMAT:CSV
+    同結構的 CSV（欄：Node,CommandLine,ProcessId）供既有 parser 沿用；CREATE_NO_WINDOW
+    免閃黑窗；utf-8 解碼。"""
+    _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    # [codex P1] Windows PowerShell 5.1 的原生 stdout 預設用 OEM/主控台碼頁(繁中機為
+    # cp950),不是 UTF-8。若不強制輸出 UTF-8,下面 encoding='utf-8' 解碼會把中文 CommandLine
+    # 打亂 → _wmic_find_pids 比對不到中文關鍵字 → 這條 fallback 形同虛設。先設 OutputEncoding。
+    ps = (
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+        "Get-CimInstance Win32_Process "
+        "-Filter \"Name='pythonw.exe' or Name='python.exe'\" | "
+        "Select-Object @{Name='Node';Expression={$env:COMPUTERNAME}},"
+        "CommandLine,ProcessId | ConvertTo-Csv -NoTypeInformation"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=15,
+            encoding="utf-8", errors="replace",
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except Exception:
+        logging.debug("[watchdog] PowerShell CIM fallback 例外", exc_info=True)
+        return ""
+    return (r.stdout or "") if r.returncode == 0 else ""
+
+
 def _read_wmic_python_process_csv() -> str:
     global _wmic_cache_until, _wmic_cache_stdout, _wmic_cache_run
     now = time.monotonic()
@@ -378,6 +496,7 @@ def _read_wmic_python_process_csv() -> str:
     # (因為 admin process 用 psutil 看不到 cmdline)，原本沒設 creationflags 會閃
     # 黑色 console 視窗。Windows-only flag，os.name=='nt' 才有意義。
     _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    stdout = ""
     try:
         r = subprocess.run(
             ["wmic", "process", "where",
@@ -387,13 +506,16 @@ def _read_wmic_python_process_csv() -> str:
             encoding=locale.getpreferredencoding(False), errors="replace",
             creationflags=_CREATE_NO_WINDOW,
         )
+        if r.returncode == 0:
+            stdout = r.stdout or ""
     except Exception:
-        logging.debug("[watchdog] wmic fallback 例外", exc_info=True)
-        return _remember_wmic_process_csv("", run_fn, now)
+        # [AC-06] wmic 不存在(Win11 24H2+ 已移除,FileNotFoundError)或執行失敗 →
+        # 落 PowerShell CIM fallback,否則整條半死救援失效。
+        logging.debug("[watchdog] wmic 不可用,改用 PowerShell CIM", exc_info=True)
 
-    if r.returncode == 0:
-        return _remember_wmic_process_csv(r.stdout or "", run_fn, now)
-    return _remember_wmic_process_csv("", run_fn, now)
+    if not stdout.strip():
+        stdout = _read_python_process_csv_via_powershell()
+    return _remember_wmic_process_csv(stdout, run_fn, now)
 
 
 def _wmic_find_pids(process_keyword: str, *, log_on_empty: bool = True) -> list:
@@ -456,11 +578,13 @@ def _find_pids_holding_mutex(process_keyword: str, mutex_name: str = "") -> list
 
 # ─── Kill + start ───────────────────────────────────────────────────────
 def kill_pid(pid: int) -> bool:
-    """taskkill /F /PID — 需 admin 才砍得了 admin process。
-    [v16 2026-05-25] 加 CREATE_NO_WINDOW 避免閃 console。"""
+    """taskkill /F /T /PID — 需 admin 才砍得了 admin process。
+    [v16 2026-05-25] 加 CREATE_NO_WINDOW 避免閃 console。
+    [AC-03] 加 /T 連同子行程樹一起殺 → 硬殺卡住的打卡程式時，其子 chromedriver/Chrome
+    也一併清掉，不遺留孤兒瀏覽器佔資源。"""
     try:
         r = subprocess.run(
-            ["taskkill", "/F", "/PID", str(pid)],
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
             capture_output=True, text=True, timeout=10,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )

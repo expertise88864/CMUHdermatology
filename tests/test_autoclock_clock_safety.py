@@ -261,3 +261,47 @@ def test_perform_clock_action_no_retry_on_auth_error(monkeypatch):
         dry_run=False, task_label="mon_am_in")
     assert calls["login"] == 1        # 未重試
     assert calls["fail"] == 1         # 單次通知
+
+
+# ─── 批次6 打卡週邊 AC-03/04/05/08（原始碼守門，避免回歸） ────────────────────
+def _autoclock_src():
+    return (os.path.join(os.path.dirname(__file__), "..", "src", "autoclock.py"))
+
+
+def test_ac03_hard_exit_releases_driver_and_startup_sweep():
+    """[AC-03] 硬退前釋放常駐 driver；啟動清掃父已死的孤兒 chromedriver。"""
+    with open(_autoclock_src(), encoding="utf-8") as f:
+        src = f.read()
+    assert "def _cleanup_orphan_chromedrivers_at_startup" in src
+    assert "_cleanup_orphan_chromedrivers_at_startup()" in src   # 有被呼叫
+    # _autoclock_hard_exit 於 os._exit 前釋放 driver（放獨立緒 target=...+逾時，
+    # 不阻塞硬退；codex P1）
+    hx = src[src.index("def _autoclock_hard_exit"):]
+    hx = hx[:hx.index("def _autoclock_self_watchdog")]
+    assert "target=_release_persistent_clock_driver" in hx
+    assert (hx.index("target=_release_persistent_clock_driver")
+            < hx.index("_os._exit("))
+
+
+def test_ac04_health_check_probe_outside_pool_lock():
+    """[AC-04] window_handles 健康檢查在 pool lock 之外做（CAS 回寫）。"""
+    with open(_autoclock_src(), encoding="utf-8") as f:
+        src = f.read()
+    assert "if pool[\"driver\"] is d:" in src        # CAS
+    # window_handles 探測後才進 CAS 鎖（結構性檢查）
+    assert "d.window_handles" in src
+
+
+def test_ac05_configure_returns_to_background():
+    """[AC-05] 設定視窗關閉（非儲存並重啟）→ 回背景模式。"""
+    with open(_autoclock_src(), encoding="utf-8") as f:
+        src = f.read()
+    assert "_config_restart_requested" in src
+    assert "if not _config_restart_requested:" in src
+
+
+def test_ac08_health_monitor_passes_restart_callback():
+    """[AC-08] autoclock health monitor 傳 restart_callback（不依賴外層 watchdog）。"""
+    with open(_autoclock_src(), encoding="utf-8") as f:
+        src = f.read()
+    assert "restart_callback=lambda: restart_program(" in src

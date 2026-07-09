@@ -210,7 +210,7 @@ def _configure_clock_driver_timeouts(driver) -> None:
                           method_name, exc_info=True)
 
 
-def _get_or_create_clock_driver():
+def _get_or_create_clock_driver(_depth: int = 0):
     """取得常駐 driver；若 idle 過久或健康檢查失敗則重建。
 
     [2026-05-22 v45 P0-2 修補] driver.quit() 移到 lock 外 — 原本持鎖 quit
@@ -232,15 +232,19 @@ def _get_or_create_clock_driver():
             d = None
             pool["driver"] = None
 
-        # 健康檢查
-        if d is not None:
-            try:
-                _ = d.window_handles
-            except Exception:
-                logging.info("[autoclock] driver 已死，重建")
-                old_driver_to_quit = d
-                d = None
-                pool["driver"] = None
+    # [AC-04] 健康檢查（window_handles）改到【鎖外】做：chromedriver wedge 時 window_handles
+    # 會阻塞，若在 pool lock 內就會連鎖卡住 heartbeat/scheduler 取鎖 → 整個打卡子系統癱瘓。
+    # 鎖內只取引用，鎖外探測；探測失敗回鎖內 CAS（仍是同一 driver 才清，免清掉別緒新建的）。
+    if d is not None:
+        try:
+            _ = d.window_handles
+        except Exception:
+            logging.info("[autoclock] driver 已死，重建")
+            with pool["lock"]:
+                if pool["driver"] is d:
+                    pool["driver"] = None
+            old_driver_to_quit = d
+            d = None
 
     # 鎖外 quit 舊 driver — 即使 hang 也不影響其他 thread 取得 pool lock
     if old_driver_to_quit is not None:
@@ -276,8 +280,18 @@ def _get_or_create_clock_driver():
         return d
 
     # 走原路徑（既有 driver 仍健康）— 鎖內更新 last_used
+    # [codex P2] 健康檢查已移到鎖外做(AC-04),探測「成功」到此的空窗內,別緒可能已把這個
+    # driver quit 掉並換成新的(或清成 None)。若直接回傳舊 d,呼叫端會立刻 WebDriver 失敗、
+    # 可能漏打卡。鎖內確認 pool 仍是同一 driver 才回傳;被換掉→回傳當前新 driver;被清成
+    # None→有限深度重試(走重建路徑)。
     with pool["lock"]:
-        pool["last_used"] = time_module.time()
+        current = pool["driver"]
+        if current is not None:      # 仍是 d、或別緒剛換上的新 driver → 皆可回傳
+            pool["last_used"] = time_module.time()
+            return current
+    # pool 被別緒清成 None(mid-rebuild)→ 有限深度重試(此時 d 已非權威,重跑會走重建)
+    if _depth < 3:
+        return _get_or_create_clock_driver(_depth + 1)
     return d
 
 
@@ -1361,6 +1375,18 @@ def _autoclock_hard_exit(reason: str, code: int = 1) -> None:
                         pass
     except Exception:
         pass
+    # [AC-03] os._exit 會跳過 atexit → 常駐 chromedriver/Chrome 變孤兒。硬退前 best-effort
+    # 釋放常駐 driver,避免每次硬退堆積一組孤兒瀏覽器。
+    # [codex P1] 但「一定要退」優先於「清乾淨」:_release_persistent_clock_driver 會取 pool
+    # lock,若正是被卡死的執行緒持著(hard_exit 要救的情境)就會永遠卡在取鎖、到不了 os._exit
+    # → self-watchdog 失效。故放獨立 daemon 緒 + 短逾時;逾時就放棄清理直接硬退。
+    try:
+        _rel = threading.Thread(target=_release_persistent_clock_driver,
+                                name="AutoclockHardExitRelease", daemon=True)
+        _rel.start()
+        _rel.join(timeout=2.0)
+    except Exception:
+        pass
     _os._exit(code)
 
 
@@ -1713,7 +1739,11 @@ class ClockApp(tk.Tk):
             self.user_var.set("")
 
     def save_and_bg(self):
+        global _config_restart_requested
+        # [AC-05/codex P2] 旗標只在 save_config 成功後才設：否則 save_config 拋例外時旗標
+        # 已 True 但 restart_program 從未執行 → 使用者關窗時 main() 誤跳過回背景 → 打卡消失。
         save_config()
+        _config_restart_requested = True    # 已主動重啟,mainloop 返回後別再重啟
         restart_program()
 
     def on_closing(self):
@@ -1734,6 +1764,47 @@ def toggle_console(icon=None, item=None):
             win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
         else:
             win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+
+
+# [AC-05] 設定視窗是否經「儲存並重啟(背景)」主動觸發重啟。用來區分：
+#   True  = save_and_bg 已呼叫 restart_program（mainloop 返回後不要再重啟一次）
+#   False = 使用者按 X 關閉設定窗 → mainloop 返回後應 restart_program 回背景模式
+_config_restart_requested = False
+
+
+def _cleanup_orphan_chromedrivers_at_startup() -> None:
+    """[AC-03] 啟動時清掃「父行程已死」的孤兒 chromedriver + 其子 chrome。
+
+    前一個 autoclock 實例崩潰/被硬殺（未走 /T）可能留下無主 chromedriver 佔資源；
+    父行程已不存在的 chromedriver 已無 client 可操控、留著也沒用。**保守**：只清「父行程
+    確定已死」者，父不明（ppid<=0）或父仍在（含 PID 被重用）一律不動，降低誤殺其他工具。
+    """
+    try:
+        import psutil
+    except ImportError:
+        return
+    try:
+        alive = set(psutil.pids())
+        for p in psutil.process_iter(['pid', 'name', 'ppid']):
+            try:
+                name = (p.info.get('name') or '').lower()
+                if 'chromedriver' not in name:
+                    continue
+                ppid = p.info.get('ppid') or 0
+                if not ppid or ppid in alive:
+                    continue          # 父不明或仍在 → 保守不動
+                for child in p.children(recursive=True):
+                    try:
+                        child.kill()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+                p.kill()
+                logging.info("[autoclock] 啟動清掃孤兒 chromedriver pid=%s（父行程已死）",
+                             p.info.get('pid'))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        logging.debug("[autoclock] 清掃孤兒 chromedriver 例外", exc_info=True)
 
 
 def restart_program(args_add=None, hard_exit_code=None) -> None:
@@ -1891,10 +1962,15 @@ def main() -> None:
         try:
             from cmuh_common.health import start_health_monitor
             # 打卡 Chrome 啟動後正常 RSS ~300MB；warn 500、crit 800
+            # [AC-08] 傳 restart_callback：health RAM-crit 自殺(os._exit)假設「外層 watchdog
+            # 必在跑」，但 watchdog 主程式監看預設 False → 沒人接手重啟 = 打卡直接消失。改由
+            # autoclock 自身重啟(restart_program 會先釋放 driver 再 restart_self),不依賴外層。
             start_health_monitor("autoclock", ram_warn_mb=500, ram_crit_mb=800,
                                   interval_sec=300, network_check=False,
                                   auto_restart_on_crit=True,
-                                  crit_persistence_ticks=6)
+                                  crit_persistence_ticks=6,
+                                  restart_callback=lambda: restart_program(
+                                      hard_exit_code=1))
         except Exception:
             logging.debug("health monitor 啟動失敗", exc_info=True)
 
@@ -1922,6 +1998,12 @@ def main() -> None:
         if len(sys.argv) > 1:
             if sys.argv[1] == "--configure":
                 ClockApp(accounts_data).mainloop()
+                # [AC-05] 設定視窗關閉(按 X / on_closing)後，若不是經「儲存並重啟(背景)」
+                # 離開，就回背景模式繼續自動打卡——否則關掉設定窗＝背景打卡程式一起消失，
+                # 使用者以為還在打卡卻早已沒在跑(漏打卡)。
+                if not _config_restart_requested:
+                    logging.info("[autoclock] 設定視窗關閉，回背景模式繼續自動打卡")
+                    restart_program()
                 return
             if sys.argv[1] == "--test-login":
                 _run_test_ui()
@@ -1940,6 +2022,9 @@ def main() -> None:
                     win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
             except Exception:
                 pass
+
+        # [AC-03] 背景模式起跑前先清掃前世崩潰遺留的孤兒 chromedriver（父行程已死者）。
+        _cleanup_orphan_chromedrivers_at_startup()
 
         background_thread = threading.Thread(target=scheduler_loop, daemon=True,
                                               name="AutoclockScheduler")

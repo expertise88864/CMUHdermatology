@@ -12,6 +12,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from cmuh_common import watchdog_core as wc  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolate_restart_history(tmp_path, monkeypatch):
+    """[AC-07] crash-loop 啟動歷史現在會落盤 → 每個測試隔離到 tmp，避免寫進真實
+    settings/、以及跨測試/跨執行累積觸發 crash-loop suspend（會連帶污染 auto-update
+    暫停旗標、拖垮 updater 測試）。"""
+    monkeypatch.setattr(wc, "_restart_history_path",
+                        lambda: str(tmp_path / "restart_history.json"))
+    wc._RESTART_HISTORY.clear()
+    wc._SUSPENDED_UNTIL.clear()
+    yield
+    wc._RESTART_HISTORY.clear()
+    wc._SUSPENDED_UNTIL.clear()
+
+
 def test_find_pids_holding_mutex_does_not_broad_kill_when_wmic_fails(monkeypatch):
     """WMIC 失敗時不可退化成回傳所有 pythonw.exe PID。"""
 
@@ -113,7 +127,51 @@ def test_wmic_fallback_reuses_short_lived_empty_snapshot(monkeypatch):
 
     assert wc._wmic_find_pids("中國醫皮膚科打卡程式", log_on_empty=False) == []
     assert wc._wmic_find_pids("中國醫皮膚科會診查詢程式", log_on_empty=False) == []
-    assert len(calls) == 1
+    # [AC-06] wmic 空/失敗 → 追加一次 PowerShell CIM fallback;兩者在同一次讀取內,結果
+    # 快取 → 第二次 _wmic_find_pids 走快取不再 launch。故總計 = wmic + CIM = 2。
+    assert len(calls) == 2
+    assert any(c[0][0] == "powershell" for c in calls)
+
+
+def test_ac03_kill_pid_uses_tree_flag(monkeypatch):
+    """[AC-03] kill_pid 用 /T 連子行程樹(chromedriver/Chrome)一起殺,不遺留孤兒。"""
+    seen = {}
+
+    class R:
+        returncode = 0
+
+    def fake_run(cmd, *a, **k):
+        seen["cmd"] = cmd
+        return R()
+    monkeypatch.setattr(wc.subprocess, "run", fake_run)
+    assert wc.kill_pid(4321) is True
+    assert "/T" in seen["cmd"] and "/F" in seen["cmd"] and "4321" in seen["cmd"]
+
+
+def test_ac06_wmic_missing_falls_back_to_cim(monkeypatch):
+    """[AC-06] wmic 不存在(FileNotFoundError,Win11 24H2+)→ 走 PowerShell CIM 並正確解析。"""
+    calls = []
+    csv_out = ('"Node","CommandLine","ProcessId"\r\n'
+               '"PC","pythonw.exe C:\\x\\中國醫皮膚科打卡程式.pyw","999999"\r\n')
+
+    class R:
+        returncode = 0
+        stdout = csv_out
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        if cmd[0] == "wmic":
+            raise FileNotFoundError("wmic removed on 24H2")
+        return R()                       # powershell CIM
+
+    monkeypatch.setattr(wc.subprocess, "run", fake_run)
+    monkeypatch.setattr(wc, "_wmic_cache_until", 0.0)
+    monkeypatch.setattr(wc, "_wmic_cache_stdout", "")
+    monkeypatch.setattr(wc, "_wmic_cache_run", None)
+
+    assert wc._wmic_find_pids("打卡程式", log_on_empty=False) == [999999]
+    assert any(c[0] == "wmic" for c in calls)          # 先試 wmic
+    assert any(c[0] == "powershell" for c in calls)    # 失敗 → CIM fallback
 
 
 def test_ensure_program_stale_kill_failure_does_not_start_duplicate(tmp_path, monkeypatch):
@@ -562,3 +620,34 @@ def test_ensure_program_falls_through_when_wmic_also_blind(tmp_path, monkeypatch
     # 沒 PID + log 還新鮮 → 應該回「視為健在」(Fallback 2)
     assert "視為健在" in msg or "找不到 PID 但 log" in msg, \
         f"WMIC 也 blind 時應走 log 新鮮度 fallback, 實際: {msg!r}"
+
+
+def test_ac07_crash_loop_persists_across_once_runs(tmp_path, monkeypatch):
+    """[AC-07] 啟動歷史落盤 → --once（每次全新記憶體）也能累積 crash-loop 計數。"""
+    monkeypatch.setattr(wc, "_restart_history_path",
+                        lambda: str(tmp_path / "restart_history.json"))
+    monkeypatch.setattr(wc, "suspend_auto_updates", lambda *a, **k: "")
+
+    def once(name):
+        # 模擬每次 --once 都是全新行程（記憶體 dict 歸零），只靠檔案累積
+        wc._RESTART_HISTORY.clear()
+        wc._SUSPENDED_UNTIL.clear()
+        return wc._record_restart_and_check_crash_loop(name)
+
+    results = [once("clock") for _ in range(7)]
+    assert all(results[:5])            # 前 5 次可啟動
+    assert results[5] is False         # 第 6 次（>5）→ crash loop 暫停
+    assert results[6] is False         # 之後仍在暫停期
+
+
+def test_ac07_restart_history_lock_lifecycle(tmp_path, monkeypatch):
+    """[codex P2] 跨行程鎖:持鎖期間鎖檔存在、離開刪除(可重入取得)。"""
+    monkeypatch.setattr(wc, "_restart_history_path",
+                        lambda: str(tmp_path / "h.json"))
+    lock_file = str(tmp_path / "h.json.lock")
+    with wc._restart_history_lock():
+        assert os.path.exists(lock_file)
+    assert not os.path.exists(lock_file)
+    # 釋放後可再取得(不會因殘留鎖檔卡住)
+    with wc._restart_history_lock():
+        assert os.path.exists(lock_file)
