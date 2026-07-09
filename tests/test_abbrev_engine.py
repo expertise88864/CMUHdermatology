@@ -198,9 +198,11 @@ def test_detect_external_swallows_exception(monkeypatch):
 # ─── install() 在外部程式執行時暫停 ──────────────────────────────────────
 
 class _FakeKb:
-    """假的 keyboard 模組，只提供 on_press / unhook。"""
+    """假的 keyboard 模組。提供 on_press / unhook / is_pressed / send / write。"""
     def __init__(self):
         self.hooked = False
+        self.pressed = set()      # [AB-01] 模擬按住的修飾鍵集合
+        self.sent = []            # 記錄 send/write（供 fallback 測試斷言）
 
     def on_press(self, cb):
         self.hooked = True
@@ -208,6 +210,15 @@ class _FakeKb:
 
     def unhook(self, h):
         self.hooked = False
+
+    def is_pressed(self, key):
+        return key in self.pressed
+
+    def send(self, key):
+        self.sent.append(("send", key))
+
+    def write(self, text):
+        self.sent.append(("write", text))
 
 
 def _make_engine():
@@ -781,3 +792,266 @@ def test_clipboard_restore_handles_originally_empty_clipboard():
     assert 'old_clip if old_clip is not None else ""' in src
     # 舊的會漏掉「空剪貼簿」的還原條件不應再存在
     assert "if old_clip is not None and clip_ok:" not in src
+
+
+# ═══ 批次 5：縮寫引擎安全修正（AB-01/02/03/06/07/08） ══════════════════════
+import threading as _threading  # noqa: E402
+import time as _time  # noqa: E402
+
+
+class _K:
+    def __init__(self, n):
+        self.name = n
+
+
+def _engine_with_lookup(lookup, max_len=None):
+    eng = _make_engine()
+    eng._lookup = dict(lookup)
+    eng._max_abbrev_len = max_len or max((len(k) for k in lookup), default=0)
+    return eng
+
+
+# ─── AB-01：Ctrl/Alt/Win chord 字母不混入 buffer ─────────────────────────────
+def test_ab01_ctrl_chord_letter_not_in_buffer():
+    eng = _engine_with_lookup({"cbt": "x"})
+    eng._kb.pressed = {"ctrl"}
+    eng._handle_event(_K("c"))            # Ctrl+C 的 c
+    assert eng._buffer == ""              # chord 字母清空 buffer、不累積
+    eng._kb.pressed = set()               # 放開 Ctrl
+    eng._handle_event(_K("b"))
+    eng._handle_event(_K("t"))
+    assert eng._buffer == "bt"            # 之後正常累積,不含 c
+
+
+def test_ab01_shift_letter_still_accumulates():
+    eng = _engine_with_lookup({"abcd": "x"})
+    eng._kb.pressed = {"shift"}           # Shift 是大寫,仍是文字
+    eng._handle_event(_K("a"))
+    assert eng._buffer == "a"
+
+
+# ─── AB-08：buffer 閒置自動清空 / IME-skip 清空 ─────────────────────────────
+def test_ab08_idle_clears_buffer():
+    eng = _engine_with_lookup({"abcd": "x"})
+    eng._handle_event(_K("a"))
+    assert eng._buffer == "a"
+    eng._last_key_ts -= (eng.BUFFER_IDLE_CLEAR_SEC + 1)   # 模擬閒置逾時
+    eng._handle_event(_K("b"))
+    assert eng._buffer == "b"             # 閒置後先清空,只剩新字
+
+
+def test_ab08_idle_clears_before_trigger_space(monkeypatch):
+    """[codex P2] 閒置 >BUFFER_IDLE_CLEAR_SEC 後按空白,不展開很久前殘留的候選。"""
+    eng = _engine_with_lookup({"df": "dermatofibroma"})
+    eng._cfg = AbbrevConfig(enabled=True, skip_when_ime_active=False)
+    expanded = []
+    monkeypatch.setattr(eng, "_do_replace", lambda *a, **k: expanded.append(a))
+    monkeypatch.setattr(ae, "should_skip_for_input_method", lambda: False)
+    eng._handle_event(_K("d"))
+    eng._handle_event(_K("f"))
+    assert eng._buffer == "df"
+    eng._last_key_ts -= (eng.BUFFER_IDLE_CLEAR_SEC + 1)   # 模擬閒置逾時
+    eng._handle_event(_K("space"))
+    assert expanded == []                 # 閒置後 buffer 已清 → 不展開陳舊候選
+    assert eng._buffer.strip() == ""      # 只剩無害的觸發空白,無殘留 "df"
+
+
+def test_ab08_ime_skip_clears_buffer(monkeypatch):
+    eng = _engine_with_lookup({"df": "dermatofibroma"})
+    eng._cfg = AbbrevConfig(enabled=True, skip_when_ime_active=True)
+    monkeypatch.setattr(eng, "_do_replace", lambda *a, **k: None)
+    monkeypatch.setattr(ae, "should_skip_for_input_method", lambda: True)
+    eng._handle_event(_K("d"))
+    eng._handle_event(_K("f"))
+    assert eng._buffer == "df"
+    eng._handle_event(_K("space"))        # 觸發 → IME 中文模式 → 跳過並清空
+    assert eng._buffer == ""
+
+
+# ─── AB-03：suppress 窗口偵測夾入按鍵 → 放棄展開 ────────────────────────────
+def test_ab03_interleaved_marks_user_key_before_sending():
+    eng = _make_engine()
+    eng._suppressing = True
+    eng._sending = False
+    eng._interleaved = False
+    eng._cooldown_until = _time.monotonic() + 10     # 仍在 cooldown 內
+    eng._handle_event(_K("x"))            # 送鍵前的使用者字母 → 夾入
+    assert eng._interleaved is True
+    # 純修飾鍵不算夾入
+    eng._interleaved = False
+    for mod in ("shift", "ctrl", "alt"):
+        eng._handle_event(_K(mod))
+    assert eng._interleaved is False
+    # 進入送鍵階段後,我方注入鍵(含 backspace/v/left)不再標記
+    eng._sending = True
+    eng._interleaved = False
+    for injected in ("backspace", "v", "left"):
+        eng._handle_event(_K(injected))
+    assert eng._interleaved is False
+
+
+def test_ab03_user_backspace_before_sending_is_interleaved():
+    """[codex P1] 送鍵前使用者真打的 backspace/left/v 也算夾入(不再被當我方注入放行)。"""
+    eng = _make_engine()
+    eng._suppressing = True
+    eng._sending = False
+    eng._cooldown_until = _time.monotonic() + 10
+    for k in ("backspace", "left", "v"):
+        eng._interleaved = False
+        eng._handle_event(_K(k))
+        assert eng._interleaved is True, k
+
+
+def test_ab03_do_replace_aborts_when_interleaved(monkeypatch):
+    eng = _make_engine()
+    monkeypatch.setattr(ae, "_replace_native_edit_suffix",
+                        lambda *a, **k: ae._NATIVE_NOT_APPLICABLE)
+    got = []
+    monkeypatch.setattr(ae, "_clipboard_get_text", lambda: got.append("get"))
+    eng.PRE_BACKSPACE_DELAY_SEC = 0.0
+    eng._interleaved = True
+    eng._do_replace(3, "dermatofibroma", "df", "df ", 0, 1)
+    assert eng._kb.sent == []             # 夾入 → 完全不送鍵
+    assert got == []                      # 也不碰剪貼簿
+
+
+# ─── AB-02：原生欄位 ABORT → 不 fallback 盲刪、不碰剪貼簿 ────────────────────
+def test_ab02_native_abort_no_fallback(monkeypatch):
+    eng = _make_engine()
+    monkeypatch.setattr(ae, "_replace_native_edit_suffix",
+                        lambda *a, **k: ae._NATIVE_ABORT)
+    touched = []
+    monkeypatch.setattr(ae, "_clipboard_get_text",
+                        lambda: touched.append("get"))
+    monkeypatch.setattr(ae, "_clipboard_set_text",
+                        lambda *a, **k: touched.append("set") or True)
+    eng.PRE_BACKSPACE_DELAY_SEC = 0.0
+    eng._do_replace(3, "dermatofibroma", "df", "df ", 0, 1)
+    assert eng._kb.sent == [] and touched == []   # ABORT → 不 fallback
+
+
+def test_ab02_native_states_exist():
+    assert ae._NATIVE_REPLACED != ae._NATIVE_ABORT != ae._NATIVE_NOT_APPLICABLE
+
+
+def test_ab02_native_timeout_aborts_not_fallback(monkeypatch):
+    """[codex P1] 原生控制項 suffix 一直不符 → 輪詢到 deadline → ABORT(不 fallback 盲刪),
+    但這是 deadline 才決定,不是首次不符就放棄(見 keep-polling)。"""
+    monkeypatch.setattr(ae, "_get_focused_window_handle", lambda: 1)
+    monkeypatch.setattr(ae, "_is_native_edit_control", lambda h: True)
+    monkeypatch.setattr(ae, "_get_edit_selection", lambda h: (5, 5))
+    monkeypatch.setattr(ae, "_read_window_text", lambda h: "xxxxxx")  # suffix 永不符
+    res = ae._replace_native_edit_suffix("ml ", "X", 0.0, cursor_left=0)
+    assert res == ae._NATIVE_ABORT
+
+
+def test_ab02_native_polls_until_suffix_arrives(monkeypatch):
+    """[codex P1] 首次讀到 suffix 未到(空白還沒抵達)→ 繼續輪詢,之後抵達 → REPLACED。"""
+    monkeypatch.setattr(ae, "_get_focused_window_handle", lambda: 1)
+    monkeypatch.setattr(ae, "_is_native_edit_control", lambda h: True)
+    monkeypatch.setattr(ae, "_get_edit_selection", lambda h: (5, 5))
+    texts = iter(["xxml", "xxml "])       # 第一次空白未到(不符),第二次抵達(符)
+    monkeypatch.setattr(ae, "_read_window_text", lambda h: next(texts, "xxml "))
+    monkeypatch.setattr(ae, "_replace_edit_selection", lambda *a: True)
+    monkeypatch.setattr(ae, "_send_message_timeout", lambda *a: (True, 0))
+    monkeypatch.setattr(ae.time, "sleep", lambda s: None)
+    res = ae._replace_native_edit_suffix("ml ", "keep", 1.0, cursor_left=0)
+    assert res == ae._NATIVE_REPLACED     # 不因首次不符就放棄
+
+
+# ─── AB-06：多行 keystroke fallback 放棄（不誤送 Enter） ─────────────────────
+def test_ab06_keystroke_fallback_aborts_multiline(monkeypatch):
+    eng = _make_engine()
+    monkeypatch.setattr(ae, "_replace_native_edit_suffix",
+                        lambda *a, **k: ae._NATIVE_NOT_APPLICABLE)
+    monkeypatch.setattr(ae, "_clipboard_get_text", lambda: "old")
+    monkeypatch.setattr(ae, "_clipboard_has_nontext_data", lambda: False)
+    monkeypatch.setattr(ae, "_clipboard_set_text", lambda *a, **k: False)  # 逼 keystroke
+    eng.PRE_BACKSPACE_DELAY_SEC = 0.0
+    eng._interleaved = False
+    eng._do_replace(3, "line1\nline2", "ml", "ml ", 0, 1)
+    assert eng._kb.sent == []             # 多行+剪貼簿不可用 → 放棄,不送 backspace/Enter
+
+
+def test_ab06_native_crlf_cursor_offset_compensated(monkeypatch):
+    """[codex P2] native 多行 \\n→\\r\\n 後,游標標記之後有換行時 caret 需補償,
+    否則會偏右。replacement 'A\\nB' + cursor_left=2(游標在 A 之後)→ 補償後 caret=start+1。"""
+    monkeypatch.setattr(ae, "_get_focused_window_handle", lambda: 1)
+    monkeypatch.setattr(ae, "_is_native_edit_control", lambda h: True)
+    monkeypatch.setattr(ae, "_get_edit_selection", lambda h: (5, 5))
+    monkeypatch.setattr(ae, "_read_window_text", lambda h: "xxml ")
+    monkeypatch.setattr(ae, "_replace_edit_selection", lambda *a: True)
+    setsel = []
+
+    def fake_smt(hwnd, msg, w, lparam):
+        if msg == ae._EM_SETSEL:
+            setsel.append((w, lparam))
+        return True, 0
+    monkeypatch.setattr(ae, "_send_message_timeout", fake_smt)
+
+    res = ae._replace_native_edit_suffix("ml ", "A\nB", 0, cursor_left=2)
+    assert res == ae._NATIVE_REPLACED
+    # start = caret(5) - len("ml ")(3) = 2；補償後 before_cursor="A" → caret=start+1=3
+    assert setsel == [(3, 3)]          # 未補償會是 (4,4)
+
+
+def test_ab06_native_crlf_no_overcompensate_existing_crlf(monkeypatch):
+    """[codex P2] tail 已是 \\r\\n(轉換不增長)→ 不補償,否則 caret 偏左。"""
+    monkeypatch.setattr(ae, "_get_focused_window_handle", lambda: 1)
+    monkeypatch.setattr(ae, "_is_native_edit_control", lambda h: True)
+    monkeypatch.setattr(ae, "_get_edit_selection", lambda h: (5, 5))
+    monkeypatch.setattr(ae, "_read_window_text", lambda h: "xxml ")
+    monkeypatch.setattr(ae, "_replace_edit_selection", lambda *a: True)
+    setsel = []
+
+    def fake_smt(hwnd, msg, w, lparam):
+        if msg == ae._EM_SETSEL:
+            setsel.append((w, lparam))
+        return True, 0
+    monkeypatch.setattr(ae, "_send_message_timeout", fake_smt)
+
+    res = ae._replace_native_edit_suffix("ml ", "A\r\nB", 0, cursor_left=3)
+    assert res == ae._NATIVE_REPLACED
+    assert setsel == [(3, 3)]          # 過度補償會變 (2,2)
+
+
+def test_ab06_single_line_keystroke_fallback_still_writes(monkeypatch):
+    eng = _make_engine()
+    monkeypatch.setattr(ae, "_replace_native_edit_suffix",
+                        lambda *a, **k: ae._NATIVE_NOT_APPLICABLE)
+    monkeypatch.setattr(ae, "_clipboard_get_text", lambda: "old")
+    monkeypatch.setattr(ae, "_clipboard_has_nontext_data", lambda: False)
+    monkeypatch.setattr(ae, "_clipboard_set_text", lambda *a, **k: False)
+    eng.PRE_BACKSPACE_DELAY_SEC = 0.0
+    eng._interleaved = False
+    eng._do_replace(3, "dermatofibroma", "df", "df ", 0, 0)
+    assert ("write", "dermatofibroma") in eng._kb.sent   # 單行照常 keystroke
+
+
+# ─── AB-07：外部展開程式偵測在鎖外（tasklist 慢也不卡打字 hook 的鎖） ─────────
+def test_ab07_detect_runs_outside_lock(monkeypatch):
+    eng = _make_engine()
+    in_detect = _threading.Event()
+    release = _threading.Event()
+
+    def slow_list():
+        in_detect.set()
+        release.wait(1.0)          # 卡在 detect 中,直到主緒量測完鎖等待
+        return {"notepad.exe"}
+    monkeypatch.setattr(ae, "_list_process_names", slow_list)
+    cfg = AbbrevConfig(enabled=True, close_external_expander=False,
+                       items=[{"abbrev": "da", "expansion": "x"}])
+    dt = {}
+
+    def hammer():
+        in_detect.wait(1.0)        # 等 install 進到（鎖外的）detect
+        t0 = _time.monotonic()
+        with eng._lock:            # detect 在鎖外 → 此時鎖應可即時取得
+            pass
+        dt["v"] = _time.monotonic() - t0
+        release.set()
+    th = _threading.Thread(target=hammer)
+    th.start()
+    eng.install(cfg)
+    th.join()
+    assert dt["v"] < 0.1           # detect 卡住時鎖仍即時可取得 → detect 確在鎖外
