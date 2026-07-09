@@ -43,11 +43,23 @@ class StartupSplash:
     def show(self) -> None:
         if self._parent is None:
             return
+        # [2026-07-09 白框修正] 原版 `self._top = top` 在函式最後才賦值——中間任何一步
+        # 失敗（破損 tk 的 ttk.Progressbar 建不出來等），白底置頂無邊框的 Toplevel 已經
+        # 建立、卻沒掛到 self._top → close() 變 no-op → 「白色方框」孤兒永遠擋在桌面
+        # （主視窗改為啟動即最小化後特別明顯）。改為：
+        #   1. Toplevel 一建立就掛上 self._top（close 永遠找得到它）。
+        #   2. 先 withdraw、全部內容蓋好才 deiconify（蓋到一半失敗＝從沒現身）。
+        #   3. 失敗路徑主動銷毀 + 記 warning（可在 automation_ui.log 追蹤）。
         try:
             top = tk.Toplevel(self._parent)
+        except Exception as e:
+            logging.warning("splash 建立失敗（忽略）: %s", e)
+            return
+        self._top = top
+        try:
+            top.withdraw()              # 蓋好內容才現身
             top.title(self._title)
             top.overrideredirect(True)  # 無邊框
-            top.attributes("-topmost", True)
             top.configure(bg="#FFFFFF")
 
             # 置中
@@ -85,10 +97,20 @@ class StartupSplash:
             except Exception:
                 pass
 
-            self._top = top
+            top.deiconify()             # 全部蓋好，這時才現身
+            top.attributes("-topmost", True)
             top.update_idletasks()
         except Exception as e:
-            logging.debug("splash show 失敗（忽略）: %s", e)
+            logging.warning("splash show 失敗，銷毀殘窗（忽略）: %s", e)
+            try:
+                top.destroy()
+            except Exception:
+                try:
+                    top.withdraw()      # 銷毀不了至少藏起來，不留白框
+                except Exception:
+                    pass
+            self._top = None
+            self._label_var = None
 
     def update_text(self, text: str) -> None:
         if self._label_var is None or self._top is None:
@@ -113,7 +135,13 @@ class StartupSplash:
         try:
             self._top.destroy()
         except Exception:
-            logging.debug("splash close 失敗（忽略）", exc_info=True)
+            # [2026-07-09 白框修正] destroy 失敗原本只記 debug → 白底置頂窗殘留桌面
+            # 無人知曉。fallback withdraw 至少把它藏起來，並升 warning 便於追蹤。
+            logging.warning("splash destroy 失敗，改 withdraw 藏起", exc_info=True)
+            try:
+                self._top.withdraw()
+            except Exception:
+                pass
         self._top = None
         # 確保 parent root 沒被殘留 topmost
         try:
