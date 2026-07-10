@@ -38,6 +38,7 @@ class StartupSplash:
         self._title = title
         self._top: tk.Toplevel | None = None
         self._label_var: tk.StringVar | None = None
+        self._geom: tuple[int, int, int, int] | None = None  # (x,y,w,h) 供關閉後強制重繪該區
         self._closed = threading.Event()
 
     def show(self) -> None:
@@ -74,6 +75,7 @@ class StartupSplash:
                 x = (sw - w) // 2
                 y = (sh - h) // 2
             move_tk_window_to_monitor(top, MonitorRect(x, y, w, h))
+            self._geom = (x, y, w, h)   # 記住位置,close() 後強制重繪此區消除白框殘影
 
             # 邊框 + 主題色 frame
             outer = tk.Frame(top, bg="#005A9C")
@@ -103,14 +105,17 @@ class StartupSplash:
         except Exception as e:
             logging.warning("splash show 失敗，銷毀殘窗（忽略）: %s", e)
             try:
+                top.withdraw()          # 先 SW_HIDE(讓 OS 重繪桌面),再 destroy,避免白框殘影
+                top.update_idletasks()
+            except Exception:
+                pass
+            try:
                 top.destroy()
             except Exception:
-                try:
-                    top.withdraw()      # 銷毀不了至少藏起來，不留白框
-                except Exception:
-                    pass
+                pass
             self._top = None
             self._label_var = None
+            self._repaint_ghost_region()
 
     def update_text(self, text: str) -> None:
         if self._label_var is None or self._top is None:
@@ -121,28 +126,57 @@ class StartupSplash:
         except Exception:
             pass
 
+    def _repaint_ghost_region(self) -> None:
+        """[2026-07-10 白框殘影修正] 強制重繪 splash 曾佔用的桌面矩形,消除殘影白框。
+
+        overrideredirect(無邊框)的白窗 destroy 時,若主視窗仍 withdrawn(畫面上沒有其他視窗
+        會自然重繪該區),Windows 常留下一塊「純白、無邊框、不能移動」的殘影(把所有視窗縮到
+        桌面時最明顯)。withdraw(SW_HIDE)通常已足以觸發重繪,這裡再用 RedrawWindow 對桌面該
+        矩形強制 invalidate+erase 當保險。純 Windows API,失敗忽略。"""
+        geom = self._geom
+        if not geom:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            x, y, w, h = geom
+            rect = wintypes.RECT(int(x), int(y), int(x + w), int(y + h))
+            RDW_INVALIDATE = 0x0001
+            RDW_ERASE = 0x0004
+            RDW_ALLCHILDREN = 0x0080
+            # hWnd=NULL → 更新桌面;lprcUpdate=rect → 只重繪 splash 曾佔的那塊,避免全螢幕閃爍。
+            ctypes.windll.user32.RedrawWindow(
+                None, ctypes.byref(rect), None,
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN)
+        except Exception:
+            logging.debug("splash 殘影區重繪失敗（忽略）", exc_info=True)
+
     def close(self) -> None:
         if self._closed.is_set():
             return
         self._closed.set()
-        if self._top is None:
+        top = self._top
+        self._top = None
+        if top is None:
             return
         try:
             # 先解除 topmost，避免 Windows 把 topmost 旗標「傳染」給 parent root
-            self._top.attributes("-topmost", False)
+            top.attributes("-topmost", False)
+        except Exception:
+            pass
+        # [2026-07-10 白框殘影修正] 直接 destroy overrideredirect 白窗(且主視窗還 withdrawn)會在
+        # 桌面留下純白殘影方框。改為:先 withdraw(SW_HIDE,OS 重繪底下桌面)+ flush,再 destroy。
+        try:
+            top.withdraw()
+            top.update_idletasks()
         except Exception:
             pass
         try:
-            self._top.destroy()
+            top.destroy()
         except Exception:
-            # [2026-07-09 白框修正] destroy 失敗原本只記 debug → 白底置頂窗殘留桌面
-            # 無人知曉。fallback withdraw 至少把它藏起來，並升 warning 便於追蹤。
-            logging.warning("splash destroy 失敗，改 withdraw 藏起", exc_info=True)
-            try:
-                self._top.withdraw()
-            except Exception:
-                pass
-        self._top = None
+            logging.warning("splash destroy 失敗（已先 withdraw 藏起）", exc_info=True)
+        # 保險:對 splash 曾佔的桌面矩形強制重繪,徹底消除殘影白框。
+        self._repaint_ghost_region()
         # 確保 parent root 沒被殘留 topmost
         try:
             if self._parent is not None:

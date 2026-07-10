@@ -102,3 +102,26 @@ def test_top_assigned_immediately_source_guard():
     src = inspect.getsource(StartupSplash.show)
     assert src.index("self._top = top") < src.index("top.withdraw()")
     assert "top.deiconify()" in src              # 蓋好才現身
+
+
+def test_close_withdraws_before_destroy_source_guard():
+    """[白框殘影守門] close() 必須【先 withdraw(SW_HIDE) 再 destroy】並強制重繪殘影區——
+    直接 destroy overrideredirect 白窗(主視窗還 withdrawn 時)會在桌面留純白殘影方框。"""
+    import inspect
+    src = inspect.getsource(StartupSplash.close)
+    assert "top.withdraw()" in src and "top.destroy()" in src
+    assert src.index("top.withdraw()") < src.index("top.destroy()"), \
+        "close 必須先 withdraw 再 destroy,否則留白框殘影"
+    assert "_repaint_ghost_region" in src, "close 應強制重繪 splash 曾佔的桌面區"
+
+
+def test_geom_recorded_and_repaint_helper_exists(root):
+    """show() 要記下 splash 位置(_geom),close() 的殘影重繪才有矩形可用。"""
+    sp = StartupSplash(root, "載入中…")
+    sp.show()
+    assert sp._geom is not None and len(sp._geom) == 4   # (x,y,w,h)
+    assert hasattr(sp, "_repaint_ghost_region")
+    sp.close()
+    root.update()
+    assert sp._top is None
+    assert _visible_toplevels(root) == []
