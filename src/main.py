@@ -2050,6 +2050,7 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
         from cmuh_common.uvb_dose import UvbAction, update_uvb_in_text
         result = update_uvb_in_text(text)
         if result.action == UvbAction.UPDATED and result.new_text:
+            check_stop()   # [UD-04] 寫回處置欄(唯一直接改病歷的動作)前的最終取消閘門
             if _write_tmemo_text(memo_hwnd, result.new_text):
                 logging.info(
                     "[%s][Excimer] 劑量已更新(次數→%s、日期→今天、劑量→%s)",
@@ -2081,11 +2082,15 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
                          else f"Excimer 劑量超過建議上限 - {label}")
             dlg_intro = ("請確認是否要按舊紀錄繼續更新" if is_stale
                          else "請確認劑量")
-            if _photo_confirm_yesno(main_hwnd, dlg_title, dlg_intro,
-                                    confirm_reason, tag="Excimer", label=label):
-                # [H4 2026-07-09] 醫師停在 Yes/No 時按 F12 → 尊重取消,不再重算/寫回處置欄。
-                # 對照 _update_uvb_dose_core CONFIRM_NEEDED 路徑(2186)確認後都有 check_stop。
-                check_stop()
+            _confirmed = _photo_confirm_yesno(
+                main_hwnd, dlg_title, dlg_intro,
+                confirm_reason, tag="Excimer", label=label)
+            # [UD-02/H4 2026-07-10] 不論 Yes/No,對話框返回後一律 check_stop:醫師停在對話框時按 F12
+            # → interrupt 會清 _subsystem_running 並把本緒加入取消集合。舊版只在 Yes 分支有 check_stop,
+            # 按【否】會 fall-through 到 return _F23_PURE_EXCIMER → caller 照樣寫身份=01,且醫師此刻可
+            # 啟新熱鍵 → 兩流程並行操作 HIS(W1 力避)。移到 if 之前,涵蓋 Yes/No 兩分支。
+            check_stop()
+            if _confirmed:
                 result = update_uvb_in_text(
                     text, skip_dose_sanity=True, skip_stale_check=True)
                 if result.action == UvbAction.UPDATED and result.new_text:
@@ -2363,6 +2368,10 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
             final_text = result.new_text
 
     # UPDATED: 寫回 TMemo
+    # [UD-04 2026-07-10] 寫回處置欄是全鏈唯一直接改病歷的動作,卻是唯一沒有取消閘門的步驟:從
+    # wrapper 的 check_stop 到此要經過『找主視窗+列舉控件+逐一 gettext(各 2.5s 上限)+parse』,
+    # HIS 慢時達數秒,期間按 F12 原本完全不被理會、memo 照樣被覆寫。補上最終 check_stop(近零成本)。
+    check_stop()
     if not _write_tmemo_text(memo_hwnd, final_text):
         logging.warning("[%s][UVB] WM_SETTEXT 寫回處置失敗 → 終止", label)
         _show_uvb_warning(
@@ -2556,8 +2565,21 @@ def script_F2_adaptive():
         logging.info("F2 (照光 2): 純自費 Excimer — 已設身份 01,未 key 51019/療程")
         return True
     # UVB 前置檢查過了(已 commit 要下 51019)才帶卡號 — 否則 precheck 中止卻已寫計費欄
-    _autofill_卡號_from_醫師上次(label="F2")
-    ok = _script_code_input_adaptive("51019", label="F2", set_療程=2)
+    # [UD-03 2026-07-10] UVB 已寫回後,51019 階段若以【例外/F12】(而非正常回 False)收場,原本 W7
+    # 『UVB 已改 X→Y、請補 51019 或改回』精準警告不會出現(只被 wrapper 改成一行狀態列)→ 病歷已改
+    # +醫令沒進的半套狀態無人把關。包 try:攔到任何例外(含 SubsystemInterrupted)→ 若本次確實改過
+    # UVB(_last_uvb_write 有本 label 紀錄)→ 先跳 W7 半套警告,再 re-raise 讓 wrapper 照常處理。
+    try:
+        _autofill_卡號_from_醫師上次(label="F2")
+        ok = _script_code_input_adaptive("51019", label="F2", set_療程=2)
+    except Exception:
+        try:
+            _rec = _last_uvb_write
+            if isinstance(_rec, dict) and _rec.get("label") == "F2":
+                _show_light_code_incomplete_warning("F2", 2, uvb_already_updated=True)
+        except Exception:
+            logging.exception("[F2] 半套警告顯示失敗(仍照常 re-raise 原例外)")
+        raise   # 原例外(含 F12 SubsystemInterrupted)照常往上,由 wrapper 處理
     logging.info("F2 (照光 2): %s", "done" if ok else "skipped")
     if not ok:
         logging.warning("F2: UVB 已更新，但 51019/療程2 未確認完成")
@@ -2583,8 +2605,18 @@ def script_F3_adaptive():
         logging.info("F3 (照光 3): 純自費 Excimer — 已設身份 01,未 key 51019/療程")
         return True
     # UVB 前置檢查過了(已 commit 要下 51019)才帶卡號 — 否則 precheck 中止卻已寫計費欄
-    _autofill_卡號_from_醫師上次(label="F3")
-    ok = _script_code_input_adaptive("51019", label="F3", set_療程=3)
+    # [UD-03 2026-07-10] 同 F2:51019 階段以例外/F12 收場時,若已改過 UVB → 先跳 W7 半套警告再 re-raise。
+    try:
+        _autofill_卡號_from_醫師上次(label="F3")
+        ok = _script_code_input_adaptive("51019", label="F3", set_療程=3)
+    except Exception:
+        try:
+            _rec = _last_uvb_write
+            if isinstance(_rec, dict) and _rec.get("label") == "F3":
+                _show_light_code_incomplete_warning("F3", 3, uvb_already_updated=True)
+        except Exception:
+            logging.exception("[F3] 半套警告顯示失敗(仍照常 re-raise 原例外)")
+        raise   # 原例外(含 F12 SubsystemInterrupted)照常往上,由 wrapper 處理
     logging.info("F3 (照光 3): %s", "done" if ok else "skipped")
     if not ok:
         logging.warning("F3: UVB 已更新，但 51019/療程3 未確認完成")
@@ -3968,6 +4000,9 @@ def _set_身份_自費(value: str = "01", label: str = "") -> bool:
     比照療程/卡號:WM_SETTEXT(逾時版)→ 失敗 fallback click → 寫回後 read-verify。
     身份屬計費敏感欄位,任何一步失敗或驗證不符都【警告醫師手動確認】而不靜默放過。
     依使用者拍板:不管原值(空白/40/其他)一律寫成 value。"""
+    # [UD-02 2026-07-10] 身份=01 是計費敏感寫入。放在 try 之前 check_stop(不會被下方 except 吞掉):
+    # 醫師若在前一步(確認框等)按 F12,到此已被取消 → 不可再寫身份欄。
+    check_stop()
     try:
         main_hwnd = _find_hospital_main_window()
         if not main_hwnd:
@@ -4363,6 +4398,11 @@ def _autofill_卡號_from_醫師上次(label: str = "") -> None:
                 pass
             _card_notify_async(
                 "照光卡號", "卡號自動讀取不確定,請手動填入卡號。")
+    except SubsystemInterrupted:
+        # [UD-01 2026-07-10] 卡號 OCR 要開『醫師上次』視窗+截圖辨識,耗時數秒,是 F2/F3 全程中醫師
+        # 最有機會按 F12 的窗口(發現按錯病人)。此函式的 fail-open 只該涵蓋『自身功能失敗』,不可把
+        # 『醫師取消(F12)』也吞掉 —— 吞掉會讓 F2/F3 照樣往下進 51019/設身份。往上傳,乾淨中止。
+        raise
     except Exception:
         logging.error("[%s 卡號] 自動帶卡號流程例外(已忽略)", label, exc_info=True)
 

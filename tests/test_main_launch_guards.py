@@ -192,7 +192,13 @@ def test_f2_f3_warn_when_code_input_fails_after_uvb_update():
             _first_call_line(func, "_script_code_input_adaptive")
             < _first_call_line(func, "_show_light_code_incomplete_warning")
         )
-        assert len(_call_lines(func, "_show_light_code_incomplete_warning")) == 1
+        # [UD-03 2026-07-10] 現在有兩條半套警告路徑:(1) 51019 正常回 False 的 `if not ok`,
+        # (2) 51019 階段以例外/F12 收場的 except 分支(已改 UVB 才警告,再 re-raise)。故 2 次。
+        warn_lines = _call_lines(func, "_show_light_code_incomplete_warning")
+        assert len(warn_lines) == 2, f"應有 2 條半套警告路徑(正常 + 例外),實際 {warn_lines}"
+        # 例外分支要 re-raise 原例外(含 F12),確認有 raise 且用 _last_uvb_write 判定
+        src = _function_source(source_path, name)
+        assert "_last_uvb_write" in src and "raise" in src
 
 
 def test_f1_pure_excimer_no_identity_no_51019_sets_療程1():
