@@ -816,6 +816,63 @@ def _resolve_date_match(date_m) -> Optional[tuple]:
     return y, m, d
 
 
+# [UC-02 2026-07-10] 「日期形狀殘跡」偵測 —— 比 _UVB_DATE_RE 寬,用來抓「看起來像日期但沒被
+# 解析成功」的殘跡(裸民國 115/7/9、點分隔 2026.7.9、括號 7-8 位純數字/病歷號連寫日期)。有這種
+# 殘跡就【不是】真正無日期的 first-time,而是『日期存在但解析不出』→ 走 first-time 會繞過
+# TOO_CLOSE/decay/stale 全部間隔防線(昨天照過也照樣 +increase)。
+# [codex P2] 限縮到「合理日期範圍」避免誤判量測值:年只收西元 1900-2099 或民國 100-199(_UVB_DATE_RE
+#  /_resolve_date_match 實際支援的範圍)、月 1-12、日 1-31。這樣血壓 'BP 120/80/70'(月 80 超範圍)、
+#  檢驗 'lab 500/10/20'(年 500 非合理年)都不會被當日期而誤 PARSE_FAIL。
+_UNPARSED_DATE_SHAPE_RE = re.compile(
+    r"\b(?:(?:19|20)\d{2}|1\d{2})"           # 年:西元 1900-2099 或民國 100-199
+    r"[./-](?:0?[1-9]|1[0-2])"                # 月 1-12
+    r"[./-](?:0?[1-9]|[12]\d|3[01])\b"        # 日 1-31
+    r"|[(（]\s*\d{7,8}\s*[)）]")                # 括號 7-8 位連寫(日期/病歷號)
+
+
+def _has_unparsed_date_shape(segment: str) -> bool:
+    """segment 內是否含『看起來像日期但沒被 _UVB_DATE_RE 解析成功』的殘跡。[UC-02]"""
+    return bool(_UNPARSED_DATE_SHAPE_RE.search(segment))
+
+
+def _first_resolvable_date(segment: str, dose_off: int):
+    """[UC-02] 回 (date_m, last_date):用 finditer 逐一試,回第一個能解析成合法日期者;優先『劑量
+    之後』的日期(典型 'dose (count) on (date)')。原本只試第一個【形狀】match、resolve 失敗就整段
+    放棄 → 7-8 位病歷號 (1234567)/壞日期會讓真正合法的 (2026/7/9) 被跳過、整段誤當『無日期』走
+    first-time。找不到任何可解析日期回 (None, None)。
+
+    [codex P1] 劑量之後若【出現過】日期形狀但都不可解析(如 'on (2026/2/30)' 二月卅日)→ 不可退回用
+    劑量【之前】的日期(那可能是 'since 起始日' 等不相關日期,會把治療時序算錯);安全 fail 交醫師。
+    只有劑量之後【完全沒有】任何日期形狀時,才用劑量之前的(罕見 '(date) UVB ...' 寫法)。"""
+    post_dose_shape_seen = False
+    best_before = None
+    for m in _UVB_DATE_RE.finditer(segment):
+        after_dose = m.start() >= dose_off
+        if after_dose:
+            post_dose_shape_seen = True
+        ymd = _resolve_date_match(m)
+        d = None
+        if ymd is not None:
+            try:
+                d = date(*ymd)
+            except (ValueError, TypeError):
+                d = None
+        if d is None:
+            continue
+        if after_dose:
+            return m, d            # 劑量之後、可解析 → 直接用(最典型)
+        if best_before is None:
+            best_before = (m, d)   # 劑量之前第一個可解析的,僅在「劑量之後完全無日期形狀」時才用
+    if post_dose_shape_seen:
+        return None, None          # 劑量之後有(被 _UVB_DATE_RE 認出的)日期形狀但都壞 → 安全 fail
+    # [codex P1-2] 劑量之後即使 _UVB_DATE_RE 沒認出(不支援格式:點分隔 2026.7.9、裸民國),仍可能
+    #  有日期 → 用更寬的形狀偵測;有 → 不可退回劑量【之前】的日期(那可能是 since 起始日,會把治療
+    #  時序算錯)。安全 fail 交醫師。
+    if _UNPARSED_DATE_SHAPE_RE.search(segment, dose_off):
+        return None, None
+    return best_before if best_before else (None, None)
+
+
 def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
     """從 text 中找第一個 UVB 行，回 UvbLineInfo 或 None。
 
@@ -887,27 +944,24 @@ def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
     #    找不到才回頭找劑量之前的(罕見「(date) UVB ...」寫法,v20.15 楊亮筠 case)。否則
     #    像「UVB since (108/5/31), new UVB: 1300mj (142) on (2026/06/16)」會誤抓 since 起始
     #    日(108/5/31=民國108=2019)→ days_diff 爆大誤判 SANITY_FAIL(陳松栢實機 case)。
-    date_m = (_UVB_DATE_RE.search(segment, dose_off)
-              or _UVB_DATE_RE.search(segment))
-    if not date_m:
-        return None
-    ymd = _resolve_date_match(date_m)
-    if ymd is None:
-        return None
-    try:
-        last_date = date(*ymd)
-    except (ValueError, TypeError):
+    # [UC-02] 用 finditer 逐一試到能解析(原本只試第一個形狀 match、resolve 失敗就整段放棄 →
+    #  7-8 位病歷號/壞日期會讓真正合法的日期被跳過、誤當『無日期』first-time 繞過間隔防線)。
+    date_m, last_date = _first_resolvable_date(segment, dose_off)
+    if date_m is None:
         return None
     date_text = date_m.group(0)
 
     # 4. Count (segment 內第一個數字 paren，排除 date 範圍)
     # [v20.7] count 變 Optional — 沒 (N) 處置仍可更新 dose/date
+    # [UC-05] count 先在【劑量之後】找 —— 否則 v20.15 segment 擴到行首後,行首清單編號「(1)」會
+    #  被當次數(編號被 +1、真次數不動);劑量之前的括號數字只在劑量之後找不到時才接受。
     seg_masked = (
         segment[:date_m.start()]
         + " " * (date_m.end() - date_m.start())
         + segment[date_m.end():]
     )
-    count_m = _UVB_COUNT_RE.search(seg_masked)
+    count_m = (_UVB_COUNT_RE.search(seg_masked, dose_off)
+               or _UVB_COUNT_RE.search(seg_masked))
     count: Optional[int] = None
     if count_m:
         try:
@@ -986,29 +1040,23 @@ def parse_uvb_partial(text: str) -> Optional[UvbLineInfo]:
 
     line_start = text.rfind("\n", 0, dose_start) + 1
     segment = text[line_start:max_end]
+    dose_off = dose_start - line_start
 
-    # Optional date
-    last_date: Optional[date] = None
-    date_text = ""
-    date_m = _UVB_DATE_RE.search(segment)
-    if date_m:
-        ymd = _resolve_date_match(date_m)
-        if ymd is not None:
-            try:
-                last_date = date(*ymd)
-                date_text = date_m.group(0)
-            except (ValueError, TypeError):
-                last_date = None
-                date_text = ""
+    # Optional date [UC-02] 同 parse_uvb_line 用 finditer 試到能解析(避免壞日期/病歷號讓可解析的
+    #  日期被跳過 → 誤當無日期 first-time)。
+    date_m, resolved_date = _first_resolvable_date(segment, dose_off)
+    last_date: Optional[date] = resolved_date
+    date_text = date_m.group(0) if date_m else ""
 
-    # Optional count (mask date span if any)
+    # Optional count (mask date span if any) [UC-05] count 先在劑量之後找,避免行首編號被當次數。
     if date_m:
         seg_masked = (segment[:date_m.start()]
                       + " " * (date_m.end() - date_m.start())
                       + segment[date_m.end():])
     else:
         seg_masked = segment
-    count_m = _UVB_COUNT_RE.search(seg_masked)
+    count_m = (_UVB_COUNT_RE.search(seg_masked, dose_off)
+               or _UVB_COUNT_RE.search(seg_masked))
     count: Optional[int] = None
     if count_m:
         try:
@@ -1127,11 +1175,17 @@ def format_uvb_line(original: UvbLineInfo, *, new_dose: int,
     src = _replace_uvb_dose(src, original.dose, new_dose)
 
     # 2. 替換 count: (N) → (N+1) — 僅當原本有 count 且傳入 new_count
+    # [UC-05/codex P2] \u53EA\u66FF\u63DB\u3010\u95DC\u9375\u5B57\u4E4B\u5F8C\u3011\u7684 (N):\u771F\u6B21\u6578\u5728\u5291\u91CF\u4E4B\u5F8C\u3001\u884C\u9996\u6E05\u55AE\u7DE8\u865F\u300C(1)\u300D\u5728\u95DC\u9375\u5B57
+    #  \u4E4B\u524D\u3002count \u503C\u525B\u597D\u7B49\u65BC\u884C\u9996\u7DE8\u865F\u6642(\u5982 '(1) UVB 500 (1)'),\u4E0D\u9650\u4F4D\u7F6E\u6703\u628A\u884C\u9996 (1) \u8AA4\u6539\u6210 (2)\u3001
+    #  \u771F\u6B21\u6578\u4E0D\u52D5\u3002\u7528\u95DC\u9375\u5B57\u4F4D\u7F6E\u5207\u958B,\u53EA\u5728 tail \u66FF\u63DB\u7B2C\u4E00\u500B\u3002
     if original.count is not None and new_count is not None:
-        src = re.sub(
+        _kw = original.keyword_text or "UVB"
+        _kpos = src.lower().find(_kw.lower())
+        _from = _kpos if _kpos >= 0 else 0
+        src = src[:_from] + re.sub(
             r"([\(\uFF08]\s*)" + str(original.count) + r"(\s*[\)\uFF09])",
             lambda mo: f"{mo.group(1)}{new_count}{mo.group(2)}",
-            src,
+            src[_from:],
             count=1,
         )
 
@@ -1659,6 +1713,16 @@ def _first_time_update(parsed: UvbLineInfo, today: date,
 
     v20.17 起此 path 是 silent — 不再需要 Yes/No 確認。
     """
+    # [UC-06] first-time 原本跳過所有 sanity → 一次加 500(add 500)、或 (20260708) 被當次數 +1 都
+    #  照寫。補上與 dated 路徑相同的結構把關:count 需 1..MAX_COUNT、increase 需 0..200、dose 需
+    #  >= MIN_DOSE;超出 → 不猜、回 PARSE_FAIL 交醫師。(刻意【不】套用全域 1500 上限確認 —— 醫師
+    #  親手寫的 dose+max 仍視為可信,維持既有 silent first-time 設計。)
+    if parsed.count is not None and not (1 <= parsed.count <= MAX_COUNT):
+        return UvbUpdateResult(action=UvbAction.PARSE_FAIL, uvb_line_count=uvb_lines)
+    if parsed.increase is not None and not (0 <= parsed.increase <= 200):
+        return UvbUpdateResult(action=UvbAction.PARSE_FAIL, uvb_line_count=uvb_lines)
+    if parsed.dose < MIN_DOSE:
+        return UvbUpdateResult(action=UvbAction.PARSE_FAIL, uvb_line_count=uvb_lines)
     # 若有 increase → 套用 +increase 公式 (尊重原 MAX); 否則保持原 dose
     if parsed.increase is not None and parsed.max_dose:
         new_dose = min(parsed.dose + parsed.increase, parsed.max_dose)
@@ -1672,11 +1736,15 @@ def _first_time_update(parsed: UvbLineInfo, today: date,
     src = _replace_uvb_dose(src, parsed.dose, new_dose)
 
     # 2. 原句有 count 才更新 count；沒有 date 就保持沒有 date。
+    # [UC-05/codex P2] 同 format_uvb_line:只替換關鍵字之後的 (N),避免行首清單編號被誤改。
     if parsed.count is not None and new_count is not None:
-        src = re.sub(
+        _kw = parsed.keyword_text or "UVB"
+        _kpos = src.lower().find(_kw.lower())
+        _from = _kpos if _kpos >= 0 else 0
+        src = src[:_from] + re.sub(
             r"([\(（]\s*)" + str(parsed.count) + r"(\s*[\)）])",
             lambda mo: f"{mo.group(1)}{new_count}{mo.group(2)}",
-            src, count=1,
+            src[_from:], count=1,
         )
 
     return UvbUpdateResult(
@@ -1896,12 +1964,22 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
                                    uvb_line_count=uvb_lines)
         # Partial 抓到 dose+max
         if partial.last_date is None:
-            # [v20.17] 沒 date → 直接 silent first-time 更新，不跳對話框
+            # [UC-02] 安全網:segment 內若有『日期形狀殘跡』(未被解析成功的日期,如裸民國 115/7/9、
+            #  點分隔 2026.7.9、括號 7-8 位純數字/病歷號),代表這【不是】真正無日期的 first-time,
+            #  而是『日期存在但解析不出』→ 走 first-time 會繞過 TOO_CLOSE/decay/stale 全部間隔防線
+            #  (昨天照過也照樣 +increase)。一律 PARSE_FAIL 交醫師,不猜。
+            if _has_unparsed_date_shape(partial.full_match):
+                return UvbUpdateResult(action=UvbAction.PARSE_FAIL,
+                                       uvb_line_count=uvb_lines)
+            # [v20.17] 真的沒 date → silent first-time 更新，不跳對話框
             # (user request: "不用跳出是否新增日期 直接修改劑量")
             # 註：first-time 刻意只受 phrase 內「本地 max」約束(_first_time_update
             # 已 min(dose+increase, 本地max) 夾住)，不套用全域 MAX_DOSE 上限確認
             # ——醫師當下親手寫的 dose+max 視為可信(見 test_silent_first_time_*)。
             result = _first_time_update(partial, today, uvb_lines)
+            # [UC-06] first-time 的 sanity 沒過會回 PARSE_FAIL(無 new_text)→ 不可 splice,直接回。
+            if result.action != UvbAction.UPDATED or result.new_text is None:
+                return result
             # 接回原文
             full_new = (text[:partial.span[0]]
                         + result.new_text
