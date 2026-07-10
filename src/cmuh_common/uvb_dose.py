@@ -293,6 +293,44 @@ _UVB_INCREASE_RE = re.compile(
     r"|"
     r"(\d+)\s*(?:mj(?:/cm2)?)?\s*(?:each(?:\s+time)?|每次)",
     re.IGNORECASE)
+
+# [UC-03 2026-07-10] 遞減/維持醫囑不可被當加量。上面 branch(b)「數字 + each time/每次」無方向
+# 判斷 → "decrease 50 each time" 被當 +50(遞減變加量、過量寫回);且 first-match-wins 讓「劑量
+# 150 each time」蓋掉後面明寫的 "add 20"。改用下面 _find_uvb_increase:branch(a) 明寫 add/increase
+# 【優先】;沒有才用 branch(b),且 branch(b) 數字前方緊跟 decrease/reduce/taper/lower/減/降/'-'
+# 一律否決。(只給【UVB 主 parse】用;excimer 多段路徑另有自己的 _seg_meta,不動。)
+_INCREASE_A_RE = re.compile(          # branch(a):明寫 add/increase 關鍵字 + 數字
+    r"(?:(?:in\s*cr(?:e?a?|a?e?)se[d]?|add(?:ing|ed|s)?)(?:\s+by)?"
+    r"|每次增加|每次加|增加|加)\s*[:：]?\s*(\d+)",
+    re.IGNORECASE)
+_INCREASE_B_RE = re.compile(          # branch(b):數字 + each time/每次
+    r"(\d+)\s*(?:mj(?:/cm2)?)?\s*(?:each(?:\s+time)?|每次)",
+    re.IGNORECASE)
+_DECREASE_BEFORE_RE = re.compile(     # 數字前方緊跟這些 = 遞減醫囑,不是加量
+    r"(?:de\s*cr(?:e?a?|a?e?)se[d]?|reduc(?:e|ed|es|ing|tion)|taper(?:ed|ing)?"
+    r"|lower(?:ed|ing)?|每次減|減(?:少|量|到)?|降(?:低|到)?|調降|-)"
+    r"\s*(?:by\s+)?[:：,，]?\s*$",
+    re.IGNORECASE)
+
+
+def _find_uvb_increase(segment: str) -> Optional[int]:
+    """找 UVB 加量值(方向安全)。明寫 add/increase(branch a)優先;沒有才用『數字 + each time』
+    (branch b),且該數字前方緊跟 decrease/reduce/taper/lower/減/降/'-' 一律否決。回加量值或
+    None(找不到 → caller 走 maintain/dose>=max/PARSE_FAIL 既有邏輯)。[UC-03]"""
+    a = _INCREASE_A_RE.search(segment)
+    if a:
+        try:
+            return int(a.group(1))
+        except (TypeError, ValueError):
+            return None
+    for b in _INCREASE_B_RE.finditer(segment):
+        if _DECREASE_BEFORE_RE.search(segment[:b.start(1)]):
+            continue   # 遞減醫囑,不是加量 → 略過這個「數字 each time」
+        try:
+            return int(b.group(1))
+        except (TypeError, ValueError):
+            return None
+    return None
 # [v20.8] MAX 接受多種同義表達:
 #   MAX:N / MAX N / MAX at N / MAX dose: N / fix N / fixed at N / fixed to N / 固定 N
 # \bfix(?:ed)? 確保 word boundary 避免抓到 "prefix"/"fixing" 等
@@ -304,15 +342,19 @@ _UVB_INCREASE_RE = re.compile(
 # [2026-06-09] 分隔符也接受逗號:「fixed at, 1000」「MAX, 800」「固定，1000」這類
 #   關鍵字與數字間夾逗號的自由寫法(劉峻榕實機 case)。原本只允許冒號/空白,逗號會讓
 #   MAX 抓不到數字 → 整行 parse_fail。與 _UVB_DOSE_RE 已接受逗號的設計一致。
+# [UC-04 2026-07-10] till/until 前加 \b —— 否則 "still 900" 內含 till 會被當上限(把 900 當 MAX,
+#   讓無 MAX 行被誤判結構完整而自動更新);捕獲數字後加 (?![\d/-]) —— 否則 "treat until 2026/9/1"
+#   的年份 2026 會被當 MAX、真 MAX:800 被略過 → 劑量寫回突破醫師上限(830>800 實測)。日期年份
+#   後接 / 或 - 會被 lookahead(含 greedy 回溯)整段否決,regex 續掃到後面真正的 MAX。
 _UVB_MAX_RE = re.compile(
     r"(?:MAX(?:\s+(?:dose|UVB|Phototherapy))?(?:\s+(?:at|to))?\s*[:：,，]?\s*"
     r"|\bfix(?:ed)?(?:\s+(?:at|to))?\s*[:：,，]?\s*"
     r"|upper\s*limit(?:\s+(?:at|to))?\s*[:：,，]?\s*"
-    r"|(?:each\s+time\s+)?(?:till|until)\s*[:：,，]?\s*"
+    r"|(?:each\s+time\s+)?\b(?:till|until)\s*[:：,，]?\s*"
     r"|maintain\s+dose\s+at\s*[:：,，]?\s*"
     r"|最大(?:劑量|剂量)?\s*[:：,，]?\s*"
     r"|上限(?:在|為)?\s*[:：,，]?\s*"
-    r"|固定(?:在|為)?\s*[:：,，]?\s*)(\d+)",
+    r"|固定(?:在|為)?\s*[:：,，]?\s*)(\d+)(?![\d/-])",
     re.IGNORECASE,
 )
 
@@ -323,7 +365,7 @@ _CEILING_KEYWORD_BEFORE_RE = re.compile(
     r"(?:MAX(?:\s+(?:dose|UVB|Phototherapy))?(?:\s+(?:at|to))?"
     r"|\bfix(?:ed)?(?:\s+(?:at|to))?"
     r"|upper\s*limit(?:\s+(?:at|to))?"
-    r"|(?:each\s+time\s+)?(?:till|until)"
+    r"|(?:each\s+time\s+)?\b(?:till|until)"     # [UC-04] \b 擋 "still"
     r"|maintain\s+dose\s+at"
     r"|最大(?:劑量|剂量)?"
     r"|上限(?:在|為)?"
@@ -360,7 +402,7 @@ _EXCIMER_NONDOSE_BEFORE_RE = re.compile(
     r"(?:MAX(?:\s+(?:dose|UVB|Phototherapy))?(?:\s+(?:at|to))?"
     r"|\bfix(?:ed)?(?:\s+(?:at|to))?"
     r"|upper\s*limit(?:\s+(?:at|to))?"
-    r"|(?:each\s+time\s+)?(?:till|until)"
+    r"|(?:each\s+time\s+)?\b(?:till|until)"     # [UC-04] \b 擋 "still"
     r"|maintain\s+dose\s+at"
     r"|最大(?:劑量|剂量)?|上限(?:在|為)?|固定(?:在|為)?"
     r"|in\s*cr(?:e?a?|a?e?)se[d]?(?:\s+by)?|add(?:ing|ed|s)?(?:\s+by)?"
@@ -818,8 +860,15 @@ def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
     keyword_text = dose_m.group(1)  # "UVB" or "Phototherapy"
     dose_start = dose_m.start()
 
-    # 2. MAX (從 UVB 之後找)
-    max_m = _UVB_MAX_RE.search(text, dose_start)
+    # 2. MAX (從 UVB 之後找) [UC-01 2026-07-10] 限制在 dose 所在行 —— 否則 UVB 行沒寫 MAX 時
+    #    會 borrow 下一行別的治療(excimer 等)的 MAX,把 dose/date/count 縫合成假醫令、寫回錯
+    #    劑量(實測 "UVB 850 keep\nexcimer... MAX 700" → 850 被改成 700);混合病歷是常態,且
+    #    round-trip verify 用同一 parser 重 parse 同樣縫合＝共享盲點照樣過,故必須在 parse 阻斷。
+    #    找不到同行 MAX → 維持既有 return None(PARSE_FAIL/SILENT_SKIP)交醫師。
+    _line_end = text.find("\n", dose_start)
+    if _line_end == -1:
+        _line_end = len(text)
+    max_m = _UVB_MAX_RE.search(text, dose_start, _line_end)
     if not max_m:
         return None
     try:
@@ -866,9 +915,10 @@ def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
         except ValueError:
             count = None
 
-    # 5. Increase / add
-    inc_m = _UVB_INCREASE_RE.search(segment)
-    if not inc_m:
+    # 5. Increase / add  [UC-03] 方向安全:add/increase 優先;"N each time" 前是 decrease/
+    #    reduce/taper/減/降/- 一律否決(遞減醫囑不是加量,回 None → 走下方 maintain/PARSE_FAIL)。
+    increase = _find_uvb_increase(segment)
+    if increase is None:
         if _has_maintain_dose(segment):
             increase = 0
         elif dose >= max_dose:
@@ -879,12 +929,6 @@ def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
             # 預設(避免醫師漏寫 increase 時程式擅自猜測)。
             increase = 0
         else:
-            return None
-    else:
-        try:
-            # group(1)=關鍵字在前的數字；group(2)="N each time" 數字在前的數字
-            increase = int(inc_m.group(1) or inc_m.group(2))
-        except (ValueError, TypeError):
             return None
 
     return UvbLineInfo(
@@ -926,7 +970,12 @@ def parse_uvb_partial(text: str) -> Optional[UvbLineInfo]:
     keyword_text = dose_m.group(1)
     dose_start = dose_m.start()
 
-    max_m = _UVB_MAX_RE.search(text, dose_start)
+    # [UC-01] 同 parse_uvb_line:MAX 限 dose 所在行,不跨行縫合(此為 strict 失敗的 fallback,
+    #  不修同樣會從這條路徑把下一行別的治療的 MAX 縫進來)。
+    _line_end = text.find("\n", dose_start)
+    if _line_end == -1:
+        _line_end = len(text)
+    max_m = _UVB_MAX_RE.search(text, dose_start, _line_end)
     if not max_m:
         return None
     try:
@@ -967,14 +1016,8 @@ def parse_uvb_partial(text: str) -> Optional[UvbLineInfo]:
         except ValueError:
             count = None
 
-    # Optional increase
-    inc_m = _UVB_INCREASE_RE.search(segment)
-    increase: Optional[int] = None
-    if inc_m:
-        try:
-            increase = int(inc_m.group(1) or inc_m.group(2))
-        except (ValueError, TypeError):
-            increase = None
+    # Optional increase  [UC-03] 方向安全 helper(遞減不當加量、add 優先於「劑量 each time」)
+    increase: Optional[int] = _find_uvb_increase(segment)
 
     return UvbLineInfo(
         full_match=segment,
