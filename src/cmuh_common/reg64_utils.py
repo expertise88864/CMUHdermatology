@@ -13,6 +13,7 @@ API:
 """
 from __future__ import annotations
 
+import math
 from datetime import datetime, time as dt_time
 from typing import Optional
 
@@ -161,6 +162,10 @@ def clinic_int_count(value, default: int = 0) -> int:
     if isinstance(value, int):
         return value
     if isinstance(value, float):
+        # [CL-01] json.load 預設吃 NaN/Infinity 字面值,快取檔數值欄壞掉重載即可帶進 nan/inf;
+        # int(nan)→ValueError、int(inf)→OverflowError 會讓上層計數/顯示中斷,而非回保守 default。
+        if not math.isfinite(value):
+            return default
         return int(value) if value == int(value) else default
     try:
         text = str(value).strip()

@@ -10488,6 +10488,13 @@ class AutomationApp:
                 st = self._clinic_dynamic_state_cache.get(key)
             if not isinstance(st, dict):
                 return (False, False)
+            # [FC-02] 只信「今日」的持久化狀態。cache 只在 load 時整批以日期過濾、且只在 persist 時
+            # prune_states_for_today;若程式【跨午夜連續執行】,早診昨天的 state(had_activity 但當時
+            # 崩潰沒落 is_ended)會殘留在 cache 裡 → 今日誤判早診仍在拖班、把昨天早診當「還在看」。
+            # 與權威讀取器 _get_clinic_dynamic_state → state_matches 的日期守門(clinic_state.py:105)
+            # 一致:state.date != 今日 → 視同無早診狀態,回 (False, False)。
+            if st.get("date") != self._clinic_dynamic_today_str():
+                return (False, False)
             return (bool(st.get('had_any_activity')),
                     bool(st.get('is_ended') or st.get('actual_closing_dt')))
         except Exception:

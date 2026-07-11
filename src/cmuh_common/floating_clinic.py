@@ -138,7 +138,12 @@ def room_card_view(s: RoomStatus) -> dict:
     elif s.closed:
         light, waiting, state = "關診", "—", "closed"
     else:
-        light = str(s.light).strip() or "—"
+        # [FC-01] 與主 UI update_single_clinic_ui 對齊:燈號解析失敗時上游 fetch 會預設 "0"
+        # (頁面改版/只抓到半頁即發生),原樣塞進浮窗 hero 會顯示 32pt 大字「0」→ 醫師瞥一眼會誤以為
+        # 「才剛開診/看到 0 號」,實為解析失敗。把 "0"/"--"/空字串一律收斂成佔位「—」(可見度判斷 line
+        # 113 早已用 _PLACEHOLDER_LIGHT 把 "0" 當無燈號,這裡讓顯示與其一致;"休" 維持原樣不動)。
+        _light = str(s.light).strip()
+        light = _light if _light not in ("", "0", "--") else "—"
         waiting = "—" if s.waiting is None else str(s.waiting)
         state = "open"
     title = " · ".join(p for p in (str(s.room).strip(), (s.slot or "").strip()) if p)
