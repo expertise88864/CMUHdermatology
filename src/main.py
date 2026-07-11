@@ -1281,6 +1281,16 @@ def _mark_hotkey_action_time() -> None:
         _runner_1280.last_action_time = time.time()
 
 
+# [MG-02] 自動更新「需重啟」不可在熱鍵自動化(F1-F12)進行中硬砍:重啟是 spawn+sys.exit,daemon 熱鍵緒
+# 會在【任意指令中間】被切斷(不像 F12 只在 check_stop 安全點停)→ 醫令欄殘碼沒 Enter、F9/F10 同意書
+# 半開、設定頁未存編輯蒸發。排程時點(07:00/13:00/18:00)全在門診時段,撞上機率不低。改為等『無 subsystem
+# 在跑且距最後一次熱鍵動作 ≥N 秒』才重啟;忙碌時每隔幾秒重查,並設總延後上限(旗標卡死的極端情況由熱鍵
+# watchdog 兜底清除,不讓自動更新永不生效)。
+_UPDATE_RESTART_IDLE_GAP_SEC = 8.0        # 距最後一次熱鍵動作至少閒置這麼久才敢重啟
+_UPDATE_RESTART_RECHECK_MS = 5000         # 忙碌時每 5 秒重查一次
+_UPDATE_RESTART_MAX_DEFER_ATTEMPTS = 180  # ~15 分上限(180×5s);到頂仍未閒置就重啟
+
+
 # =============================================================================
 # 解析度無關熱鍵 (adaptive) — 不依賴座標，直接 Win32 SendMessage 觸發選單
 # =============================================================================
@@ -6862,7 +6872,11 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                 logging.info(f"AUH merged slots = {auh_merged_slots} ({doctor_name})")
 
             if html_east or html_huihe or html_huisheng or html_auh:
-                put_ui_message(ui_queue, UiClinicDataMessage(doctor_name=doc_no, data=appointments_by_date))
+                # [MG-01] 這是「先送一版讓 UI 有東西」的預備送出,但緊接著下面 _merge_dayoff_overrides
+                # 會【原地】改寫同一個 appointments_by_date;若原樣把活 dict 交給 UI,UI 緒存進
+                # all_doctors_data、主緒 _update_grid_data 無鎖迭代時 worker 正在原地合併 → 偶發
+                # dict-changed-size 月曆重繪炸掉/畫出合併到一半的休診。與 6719 對齊:交出 deepcopy 快照。
+                put_ui_message(ui_queue, UiClinicDataMessage(doctor_name=doc_no, data=deepcopy(appointments_by_date)))
 
             dayoff_data = _parse_doctor_info_dayoff(BeautifulSoup(html_dayoff, "lxml")) if html_dayoff else {}
             if dayoff_data:
@@ -7833,6 +7847,28 @@ class AutomationApp:
         # 帶 --background：重啟後的新行程靜默啟動（不開 splash、最小化進工作列），
         # 不打斷使用者當下操作。此方法是所有 app 端重啟（自動更新 / 閒置熱鍵恢復）的匯流點。
         restart_self(["--background"])
+
+    def _restart_when_hotkey_idle(self, attempts: int = 0):
+        """[MG-02] 自動更新需重啟時的閘門:熱鍵自動化進行中【不可】重啟(見 _UPDATE_RESTART_* 常數旁
+        說明)。等『無 subsystem 在跑且距最後一次熱鍵動作 ≥N 秒』才 _restart_app;忙碌則每隔幾秒重查。
+        到延後上限仍未閒置就重啟(旗標卡死由熱鍵 watchdog 兜底,不讓更新永不生效)。只在主緒操作。"""
+        if threading.current_thread() is not threading.main_thread():
+            self.root.after(0, lambda: self._restart_when_hotkey_idle(attempts))
+            return
+        busy = bool(getattr(self, "_subsystem_running", False))
+        idle_gap = time.time() - getattr(_runner_1280, "last_action_time", 0.0)
+        if attempts >= _UPDATE_RESTART_MAX_DEFER_ATTEMPTS:
+            logging.warning("[更新] 熱鍵仍忙但已達重啟延後上限(%d),仍執行重啟(busy=%s, idle_gap=%.1fs)",
+                            attempts, busy, idle_gap)
+            self._restart_app()
+            return
+        if not busy and idle_gap >= _UPDATE_RESTART_IDLE_GAP_SEC:
+            self._restart_app()
+            return
+        logging.info("[更新] 熱鍵自動化進行中,延後重啟(busy=%s, idle_gap=%.1fs, 第 %d 次重查)",
+                     busy, idle_gap, attempts + 1)
+        self.root.after(_UPDATE_RESTART_RECHECK_MS,
+                        lambda: self._restart_when_hotkey_idle(attempts + 1))
 
     def shutdown_app(self):
         """關閉時不可在主執行緒上 executor.shutdown(wait=True)，否則會卡到背景 HTTP／排程結束。
@@ -12897,7 +12933,9 @@ class AutomationApp:
                     case UiAlertInfoMessage(title=title, msg=amsg, need_restart=need_restart):
                         self._show_notice(title, amsg, level="info", auto_close_ms=5000 if not need_restart else 2000)
                         if need_restart:
-                            self.root.after(2000, self._restart_app)
+                            # [MG-02] 不再無條件 2 秒後硬砍;改走閘門:熱鍵自動化進行中會延後到閒置才重啟,
+                            # 避免把 daemon 熱鍵緒在指令中間切斷(醫令殘碼/同意書半開)。
+                            self.root.after(2000, self._restart_when_hotkey_idle)
                     case UiAlertErrorMessage(title=title, msg=emsg):
                         self._show_notice(title, emsg, level="error", auto_close_ms=7000)
                     case UiClinicDataMessage(doctor_name=doctor_name, data=appointment_data):
@@ -14105,13 +14143,15 @@ class AutomationApp:
             if _updater_mod.need_restart_after_update(result):
                 msg_lines = [f"{fn} (v{ver})" for fn, ver in result.updated_files]
                 if is_manual:
-                    msg = "以下程式已更新完成：\n\n" + "\n".join(msg_lines) + "\n\n程式將立即重新啟動。"
+                    # [MG-02] 重啟改走閘門(熱鍵忙碌時會延後),用字改「將於目前操作結束後」以免與實際不符。
+                    msg = ("以下程式已更新完成：\n\n" + "\n".join(msg_lines)
+                           + "\n\n將於目前操作結束後自動重新啟動。")
                     put_ui_message(self.ui_queue, UiAlertInfoMessage(
                         title="更新完成", msg=msg, need_restart=True))
                 else:
                     logging.info("Auto-update applied. Requesting restart on UI thread...")
                     put_ui_message(self.ui_queue, UiAlertInfoMessage(
-                        title="自動更新完成", msg="已套用自動更新，程式將重新啟動。",
+                        title="自動更新完成", msg="已套用自動更新，將於目前操作結束後自動重新啟動。",
                         need_restart=True))
             elif result.is_frozen and result.has_update:
                 # .exe 模式偵測到新版：跳通知請使用者去 GitHub release 下載

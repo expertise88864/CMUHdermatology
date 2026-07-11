@@ -288,7 +288,18 @@ def main() -> None:
     except Exception:
         logging.debug("Tk callback exception hook 安裝失敗", exc_info=True)
 
-    app = ScheduleApp(root)
+    try:
+        app = ScheduleApp(root)
+    except Exception:
+        # [EH-03] 建構失敗原本只進 log(sys.excepthook)、視窗閃一下就消失,使用者一頭霧水(以為當機)。
+        # 比照主程式 AutomationApp 建構的處理:記完整 traceback + 跳可見錯誤框提示看 log,再乾淨退出。
+        logging.exception("排班程式初始化失敗 (ScheduleApp 建構)")
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                0, "排班程式初始化失敗，請查看 log 後重新啟動。", WINDOW_TITLE, 0x10)  # MB_ICONERROR
+        except Exception:
+            logging.debug("排班初始化失敗錯誤框顯示失敗", exc_info=True)
+        sys.exit(1)
     _check_updates_in_background(root)
 
     logging.info("--- 排班程式骨架啟動 (v%s) ---", CURRENT_VERSION)
