@@ -13,6 +13,7 @@
   4. SHA256 校驗 + 全部成功才寫入（任一失敗則整批不寫，保持本地一致性）
   5. 失敗時保留本地舊版，記 log，不阻擋啟動
 """
+import contextlib
 import hashlib
 import logging
 import os
@@ -359,12 +360,17 @@ def _download_one(file_entry: dict, app_dir: str) -> Optional[tuple]:
         if local_sha == expected_sha:
             return None
 
-    # 【穩定性 2026-05-21】SHA mismatch backoff：先前該 key hash 對不上，且還在 backoff 中 → skip
+    # 【穩定性 2026-05-21】SHA mismatch backoff：先前該 key hash 對不上，且還在 backoff 中
     now_ts = time.time()
     until = _sha_mismatch_until.get(key, 0.0)
     if now_ts < until:
-        logging.debug("[%s] SHA mismatch backoff 中（剩 %.0fs），跳過", key, until - now_ts)
-        return None
+        # [IE-01 2026-07-10] backoff 中【不可】return None(=「不需更新」)—— 這個檔其實落後、只是
+        # 暫時抓不到,當它不需更新的話其餘檔照寫 → 磁碟混版本(cmuh_common 五程式共用,一支混版
+        # 拖垮全部,還可能 ImportError crash-loop)。改 raise 讓整批 fail-closed(caller「任一失敗
+        # 整批不寫」),backoff 過後自然重試補齊。「寧可不更也不能壞」。
+        raise ValueError(
+            f"[{key}] 仍在下載失敗 backoff 中（剩 {until - now_ts:.0f}s）—"
+            f"整批暫不更新以避免混版本")
 
     local_ver = _read_local_version(local_path)
 
@@ -410,6 +416,78 @@ def _download_one(file_entry: dict, app_dir: str) -> Optional[tuple]:
         actual_version = expected_version  # 子模組可能沒有頂層宣告，採 manifest 版本
 
     return (key, local_filename, actual_version, content)
+
+
+@contextlib.contextmanager
+def _updater_write_lock(timeout_sec: float = 30.0):
+    """[IE-02 2026-07-10 + codex] 跨行程 + 跨 session 的「更新寫入」鎖。開機時 watchdog 幾乎同時拉起
+    五支程式,每支啟動都背景 check_and_update、全部寫同一批 src/cmuh_common/*.py 與同名 .bak →
+    .bak 互踩、回滾還原到錯版本、混 commit。用鎖讓寫檔階段序列化。
+
+    刻意用 msvcrt.locking 對 app_dir 下 .updater_write.lock 的位元組上【OS 級鎖】,而非:
+      - Local\\ named mutex —— 只在同一 Windows session 內有效(互動使用者 vs schtasks session 0 /
+        多 RDP session 各自一把,不互斥);
+      - 手動 O_CREAT|O_EXCL 鎖檔 + stale 判斷 —— [codex] 有 stale 回收的 remove race(兩行程同時
+        判 stale、一個刪+建新鎖,另一個 remove 把新鎖刪掉 → 併發寫)。
+    msvcrt.locking 是 OS 鎖:持有者行程結束/crash 時 Windows【自動釋放】,不需手動判 stale,徹底
+    避開該 race;鎖檔路徑固定 → 跨 session 共享;不需 Global\\ 的 SeCreateGlobalPrivilege。
+
+    yield True=可寫(拿到鎖,或非 Windows/鎖機制故障退回無鎖);False=逾時沒拿到 → caller 本輪放棄。
+    yield 在 try/finally(非 try/except)內,不吞 body 例外。"""
+    try:
+        lock_path = os.path.join(get_app_dir(), ".updater_write.lock")
+    except Exception:
+        yield True
+        return
+    try:
+        import msvcrt
+    except Exception:
+        yield True                     # 非 Windows / 無 msvcrt → 不擋(部署目標是 Windows)
+        return
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+    except OSError:
+        logging.debug("[更新] 開更新鎖檔失敗,退回無鎖", exc_info=True)
+        yield True
+        return
+    try:
+        # [codex P1] msvcrt.locking 從「目前檔位」鎖 nbytes。新建的 .updater_write.lock 是空檔;
+        # 為跨 Windows/CRT 版本穩健(不倚賴「可鎖超過 EOF」的行為),先確保檔內至少 1 byte、再把
+        # 檔位歸零,固定鎖 [0,1)。本機實測空檔可鎖,此步僅作保險與可攜性。
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"\0")
+        os.lseek(fd, 0, os.SEEK_SET)
+    except OSError:
+        logging.debug("[更新] 初始化鎖檔失敗,退回無鎖", exc_info=True)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        yield True
+        return
+    acquired = False
+    deadline = time.time() + timeout_sec
+    while True:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)   # non-blocking 取 1 byte 獨佔鎖
+            acquired = True
+            break
+        except OSError:                # 別的行程持有中
+            if time.time() >= deadline:
+                break
+            time.sleep(0.2)
+    try:
+        yield acquired                 # yield 在 try/finally 內,body 例外照常往上、鎖照樣釋放
+    finally:
+        if acquired:
+            try:
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        try:
+            os.close(fd)               # 關 fd 一併釋放鎖;不刪鎖檔(靠 OS 鎖不靠檔案存在)
+        except OSError:
+            pass
 
 
 def check_and_update(
@@ -562,15 +640,78 @@ def check_and_update(
         logging.warning("更新清單驗證失敗，取消整批寫入")
         return result
 
-    # [stability] 兩階段批次寫入，盡量逼近「全有或全無」，避免部分檔新、部分檔
-    # 舊的版本錯亂(version skew，例如 version.py 已新但它 import 的模組還舊 →
-    # 下次啟動 ImportError 又因 SHA 短路不再重抓 → 程式 brick)：
-    #   Phase 1：每個檔的新內容先寫到各自的 .upd.tmp（含 fsync）。任一失敗 → 清掉
-    #            所有 .upd.tmp、整批放棄（此時磁碟上的正式檔完全沒被動過）。
-    #   Phase 2：逐檔 backup(.bak)→os.replace（同磁碟 rename，幾乎不會失敗）。萬一
-    #            中途失敗，從 .bak 回滾已替換的檔。
-    # 比原本逐檔 atomic_write_text 更安全：把最可能失敗的「寫內容/fsync」(磁碟滿、
-    # AV 鎖檔)全部擋在任何 os.replace 之前。
+    # [IE-02 2026-07-10] 進入寫檔階段前取【跨行程更新鎖】:五程式開機幾乎同時 check_and_update、
+    #  全部寫同一批 src/cmuh_common/*.py 與同名 .bak → .bak 互踩/回滾還原到錯版本/混 commit。
+    #  序列化寫檔階段,同一時間只有一支在寫。拿不到鎖 → 本輪放棄(fail-closed)。
+    with _updater_write_lock() as _acquired:
+        if not _acquired:
+            logging.info("[更新] 另一程式正在寫入更新,本輪放棄(避免混版本),下輪再試")
+            result.errors.append("另一程式正在寫入更新,本輪放棄")
+            return result
+        # [IE-04 2026-07-10] 進 Phase 1 前【再查一次】suspend:上面只在函式開頭查一次,但下載最長
+        #  5 分鐘,期間 watchdog 若偵測 crash-loop 寫下抑制旗標,不重查會照樣把(很可能肇事的)新版
+        #  寫進磁碟。有旗標 → 整批放棄。
+        _susp = get_auto_update_suspend_until()
+        if _susp:
+            logging.warning("[更新] 寫入前發現 auto-update 已被抑制,整批放棄(不寫任何檔)")
+            result.suspended_until = _susp
+            return result
+        # [codex P2 2026-07-10] 取得鎖後【再驗一次磁碟版本】:併發下另一支程式可能在我下載期間已寫入
+        #  【更新】的版本(鎖保證那是完整一批)。若我下載的是較舊 manifest revision,拿到鎖後不可用
+        #  過時的 prepared_writes 覆蓋 → 降版 + 假的「已更新/需重啟」。
+        #  只在磁碟版本【嚴格大於】本批 manifest 版本時放棄(=別人已寫更新版,寫下去會降版)。
+        #  磁碟版本【等於】本批時【仍要寫】—— 那是同版的 SHA 修復(某檔損壞/缺漏),prepared_writes
+        #  帶著修復內容,不可因 app 版號相同就當「已是最新」而丟棄(否則同版損壞永遠修不回)。
+        #
+        # [codex P2 round3] 有人問:同 app_version 但「不同 commit」的 hotfix 併發下,舊 revision 會不會
+        #  在此把新 revision 覆蓋(同版回滾)？在本專案【不會發生】,且無法用 commit sha 更好地防:
+        #   (1) push_helper 每次 push 都必 bump app_version(YYYY.MM.DD.serial 單調遞增、每 push 唯一);
+        #       故「同 app_version」恆指【同一份已發佈 revision】= 修復,不存在內容不同的競爭 revision。
+        #   (2) 就算真要比 revision 新舊,git commit sha 是【無序】的 —— 只能判斷「不同」,判斷不了「誰較新」。
+        #       能單調排序 revision 的只有 app_version 本身(見(1)),所以拿 _remote_commit_sha 反而更弱。
+        #  因此「等於就寫(修復)」在此是正確且無回滾風險的;真正的降版由上面的嚴格 > 擋掉。
+        _disk_ver = _read_ondisk_app_version(app_dir)
+        if (_disk_ver and result.manifest_app_version
+                and parse_version(_disk_ver)
+                > parse_version(result.manifest_app_version)):
+            logging.info(
+                "[更新] 取得鎖後發現磁碟版本 v%s 已【新於】本批 v%s(另一程式已寫更新版),整批放棄避免降版",
+                _disk_ver, result.manifest_app_version)
+            # [codex P2] 別的程式已把磁碟更新到 v_disk。若 v_disk 比「本行程啟動時載入的執行版本
+            #  CURRENT_VERSION」還新,代表我正在跑舊碼、磁碟已是新碼:之後任何 lazy import 會抓到新檔
+            #  → 版本錯亂(正是本批要防的 skew)。標記需重啟,讓 caller 重啟本行程、乾淨載入磁碟新版。
+            #  (本行程沒寫任何檔,updated_files 放一筆說明用合成項目,好讓 main.py 的重啟提示有內容。)
+            if parse_version(_disk_ver) > parse_version(CURRENT_VERSION):
+                result.has_update = True
+                result.updated_files.append(("(另一程式已更新，本程式需重啟)", _disk_ver))
+            return result
+        return _commit_pending_writes(prepared_writes, result)
+
+
+def _read_ondisk_app_version(app_dir: str) -> str:
+    """讀磁碟上 src/cmuh_common/version.py 的 CURRENT_VERSION(可能已被另一程式更新到最新);讀不到
+    回 ''。用於取得更新寫入鎖【之後】的降版防護(module 級 import 的 CURRENT_VERSION 是啟動當下的,
+    可能過時)。[codex P2]"""
+    try:
+        vp = os.path.join(app_dir, "src", "cmuh_common", "version.py")
+        with open(vp, "r", encoding="utf-8") as f:
+            m = re.search(r'CURRENT_VERSION\s*=\s*["\']([\d.]+)["\']', f.read())
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
+def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> UpdateResult:
+    """[IE-02/IE-04 抽出] 兩階段批次寫入。由 check_and_update 在【持有跨行程更新鎖、且再次確認未被
+    suspend】之後呼叫。
+
+    [stability] 盡量逼近「全有或全無」,避免部分檔新、部分檔舊的版本錯亂(version skew,例如
+    version.py 已新但它 import 的模組還舊 → 下次啟動 ImportError 又因 SHA 短路不再重抓 → 程式 brick):
+      Phase 1:每個檔的新內容先寫到各自的 .upd.tmp(含 fsync)。任一失敗 → 清掉所有 .upd.tmp、整批
+              放棄(此時磁碟上的正式檔完全沒被動過)。
+      Phase 2:逐檔 backup(.bak)→os.replace(同磁碟 rename,幾乎不會失敗)。萬一中途失敗,從 .bak 回滾。
+    比原本逐檔 atomic_write_text 更安全:把最可能失敗的「寫內容/fsync」(磁碟滿、AV 鎖檔)全部擋在任何
+    os.replace 之前。"""
     import tempfile
 
     staged: list = []  # (tmp, target, existed_before, key, local_filename, new_ver)

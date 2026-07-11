@@ -28,13 +28,15 @@ def test_suspend_auto_updates_round_trips_active_flag(tmp_path, monkeypatch):
     assert "reason: test crash loop" in Path(path).read_text(encoding="utf-8")
 
 
-def test_stale_auto_update_suspend_flag_is_removed(tmp_path, monkeypatch):
+def test_stale_auto_update_suspend_flag_expires_but_is_kept(tmp_path, monkeypatch):
+    # [IE-03 2026-07-10] 已過期的旗標【不再刪除】—— 避免「讀到過期→準備刪」與 watchdog「同時
+    # 寫新旗標」之間的 TOCTOU 把新旗標刪掉。過期本來就不生效(回 0),留著無害,下次 suspend 會覆寫。
     monkeypatch.setattr(update_policy, "get_settings_dir", lambda: str(tmp_path))
     flag = tmp_path / update_policy.AUTO_UPDATE_SUSPEND_FILENAME
     flag.write_text("1000\nreason: old\n", encoding="utf-8")
 
     assert update_policy.get_auto_update_suspend_until(now=1001) == 0.0
-    assert not flag.exists()
+    assert flag.exists(), "過期旗標不再被刪(TOCTOU 防護)"
 
 
 def test_bad_auto_update_suspend_flag_is_removed(tmp_path, monkeypatch):
