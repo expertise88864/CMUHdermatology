@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Optional
 
 from cmuh_common.paths import get_settings_dir
-from cmuh_common.atomic_io import atomic_write_json, safe_load_json
+from cmuh_common.atomic_io import atomic_write_json, safe_load_json_ex
 
 CREDENTIALS_FILE = Path(get_settings_dir()) / "smtp_credentials.json"
 
@@ -140,8 +140,18 @@ def load_credentials() -> dict:
     cred = dict(DEFAULT_CREDENTIALS)
     try:
         if CREDENTIALS_FILE.exists():
-            saved = safe_load_json(str(CREDENTIALS_FILE), default={})
-            if isinstance(saved, dict):
+            # [IF-02] credentials 檔【不可】用預設的 backup_on_corrupt=True:官方流程是使用者用記事本
+            # 貼 App Password,存成 UTF-8 BOM(BOM 已由 utf-8-sig 容忍)或 ANSI/cp950(from_name 中文)時
+            # 會 UnicodeDecodeError → 若照預設把「唯一一份帳密」rename 成 .corrupt 搬走,SMTP 寄信+IMAP
+            # 收信會【一次全滅】且診間無人看 log。改 backup_on_corrupt=False:壞檔【原地保留】可救,並
+            # 明確 log 告警;讀不到就回 default(password 空 → is_configured() False,流程自然靜默跳過)。
+            saved, _status = safe_load_json_ex(
+                str(CREDENTIALS_FILE), default={}, backup_on_corrupt=False)
+            if _status == "corrupt":
+                logging.error(
+                    "SMTP 設定檔 %s 內容無法解析(可能存成 ANSI/cp950 或非 JSON);已保留原檔未搬移,"
+                    "請用『UTF-8』重新存檔。在修好前寄信/收信會停用。", CREDENTIALS_FILE)
+            elif isinstance(saved, dict):
                 cred.update(saved)
     except Exception:
         logging.warning("讀取 SMTP 設定失敗，使用內建預設", exc_info=True)

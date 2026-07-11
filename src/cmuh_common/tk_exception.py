@@ -15,8 +15,15 @@ import logging
 from typing import Optional
 
 
-def _report_callback_exception(exc, val, tb) -> None:
-    """Tk override hook — 把 callback 例外寫進 logging instead of stderr。"""
+def _report_callback_exception(*args) -> None:
+    """Tk override hook — 把 callback 例外寫進 logging instead of stderr。
+
+    [IF-01] 用 *args 相容兩條指派路徑,否則 class-attr 路徑被呼叫必拋 TypeError、原始例外遺失:
+      - 設成 instance attr(root.report_callback_exception=...)→ Tk 呼叫傳 (exc, val, tb) 3 個;
+      - 設成 class attr(tk.Tk.report_callback_exception=...)→ 變 descriptor,instance 呼叫會綁定
+        self → (self, exc, val, tb) 4 個。取最後三個即為 (exc, val, tb),兩路徑都不炸。
+    """
+    exc, val, tb = args[-3:]
     logging.error("Uncaught Tk callback exception", exc_info=(exc, val, tb))
 
 

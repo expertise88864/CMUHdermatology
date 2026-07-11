@@ -114,7 +114,9 @@ def safe_load_json_ex(file_path: str, default=None, *,
     if not os.path.exists(file_path):
         return default, "missing"
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        # [IF-02] 用 utf-8-sig 讀:容忍記事本另存 UTF-8 時加的 BOM(否則 json.load 直接 JSONDecodeError
+        # → 被當 corrupt)。utf-8-sig 對「無 BOM 的純 utf-8」行為與 utf-8 完全一致,向後相容、無副作用。
+        with open(file_path, 'r', encoding='utf-8-sig') as f:
             return json.load(f), "ok"
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         logging.warning("[safe_load_json] %s 內容損壞 (%s): %s",

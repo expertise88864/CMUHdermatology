@@ -80,7 +80,8 @@ from cmuh_common.platform_win import (
     get_primary_monitor_size,
     place_tk_window_on_preferred_monitor,
 )
-from cmuh_common.notifications import show_windows_notification, show_winotify_toast
+from cmuh_common.notifications import (
+    show_windows_notification, show_windows_notification_async, show_winotify_toast)
 from cmuh_common.window_icon import apply_tk_window_icon as _apply_tk_window_icon
 from cmuh_common.logging_setup import attach_queue_handler
 from cmuh_common.bounded_executor import BoundedThreadPoolExecutor, RejectedExecutionError
@@ -14282,7 +14283,10 @@ if __name__ == "__main__":
         # 讓使用者有機會先存檔,不再無預警重啟消失。daemon 緒呼叫,只做輕量通知。
         def _ram_restart_warn(rss_mb, crit_mb, eta_min):
             try:
-                show_windows_notification(
+                # [IF-03] 此 callback 由 health monitor 監看緒 inline 呼叫;必須用【非阻塞】版,否則
+                # 無人按掉「記憶體偏高」MessageBox → 監看緒卡死不再 tick → consecutive_critical_ram
+                # 永遠到不了門檻 → RAM 失控自動重啟在最需要的無人場景失效(main 無外層 watchdog 接手)。
+                show_windows_notification_async(
                     "記憶體偏高",
                     f"記憶體使用 {int(rss_mb)}MB(上限 {int(crit_mb)}MB),"
                     f"約 {eta_min} 分鐘後將自動重啟以釋放記憶體,請先存檔。")
