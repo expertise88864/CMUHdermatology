@@ -36,3 +36,4 @@ chromedriver_cache/
 debug_dumps/
 .updater_write.lock
 startup_crash.log
+.codex-review/

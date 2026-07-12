@@ -309,7 +309,10 @@ _INCREASE_B_RE = re.compile(          # branch(b):數字 + each time/每次
 _DECREASE_BEFORE_RE = re.compile(     # 數字前方緊跟這些 = 遞減醫囑,不是加量
     r"(?:de\s*cr(?:e?a?|a?e?)se[d]?|reduc(?:e|ed|es|ing|tion)|taper(?:ed|ing)?"
     r"|lower(?:ed|ing)?|每次減|減(?:少|量|到)?|降(?:低|到)?|調降|-)"
-    r"\s*(?:by\s+)?[:：,，]?\s*$",
+    # [UC-03b audit 2026-07-12] 遞減動詞與數字間可夾中性字(dose/dosage/劑量/the):
+    # "decrease dose by 50 each time" 也必須被判為遞減 → 否則 branch(b) 會把 50 當 +50、
+    # 該減反增(800→850)。只放行「動詞後緊跟劑量名詞/by」的組合,不影響 "decrease 50"。
+    r"\s*(?:(?:the\s+)?dos(?:e|age)|劑量)?\s*(?:by\s+)?[:：,，]?\s*$",
     re.IGNORECASE)
 
 
@@ -354,7 +357,10 @@ _UVB_MAX_RE = re.compile(
     r"|maintain\s+dose\s+at\s*[:：,，]?\s*"
     r"|最大(?:劑量|剂量)?\s*[:：,，]?\s*"
     r"|上限(?:在|為)?\s*[:：,，]?\s*"
-    r"|固定(?:在|為)?\s*[:：,，]?\s*)(\d+)(?![\d/-])",
+    r"|固定(?:在|為)?\s*[:：,，]?\s*)(\d+)(?![\d/-])(?!\.\d)",
+    # [UC-04b audit 2026-07-12] 除 / - 外再擋「.」分隔日期:"treat until 2026.9.1" 的 2026
+    # 不可當 MAX(否則略過真正 MAX:800 → 寫 830 破上限)。用 (?!\.\d) 只擋「點後接數字」的
+    # 日期,不誤殺句尾句點如 "MAX: 800."(點後非數字 → 仍接受 800)。
     re.IGNORECASE,
 )
 

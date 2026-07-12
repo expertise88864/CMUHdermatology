@@ -2105,6 +2105,9 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
                 result = update_uvb_in_text(
                     text, skip_dose_sanity=True, skip_stale_check=True)
                 if result.action == UvbAction.UPDATED and result.new_text:
+                    # [audit 2026-07-12] 與 UPDATED 路徑(上方)一致:寫回處置欄前緊鄰的最終
+                    # 取消閘門(check_stop 在 if _confirmed 前,但重算與寫回間再確認一次更保險)。
+                    check_stop()
                     if _write_tmemo_text(memo_hwnd, result.new_text):
                         logging.info(
                             "[%s][Excimer] (確認後)劑量已更新(次數→%s、劑量→%s)",
@@ -2572,6 +2575,10 @@ def script_F2_adaptive():
         return False
     if res == _F23_PURE_EXCIMER:
         # 純自費 Excimer:不 key 51019/療程,把身份改成 01
+        # [audit 2026-07-12] 寫身份(計費欄)前的最終 F12 閘門:pure-excimer 內部 check_stop 通過
+        # 後,劑量寫回(可阻塞 SendMessage)期間醫師若按 F12,此處 check_stop 會 raise → 不改身份。
+        # 與 UD-04「寫回處置欄前尊重取消」同一語意,補齊下游身份欄。
+        check_stop()
         _set_身份_自費("01", label="F2")
         logging.info("F2 (照光 2): 純自費 Excimer — 已設身份 01,未 key 51019/療程")
         return True
@@ -2612,6 +2619,8 @@ def script_F3_adaptive():
         return False
     if res == _F23_PURE_EXCIMER:
         # 純自費 Excimer:不 key 51019/療程,把身份改成 01
+        # [audit 2026-07-12] 同 F2:寫身份(計費欄)前的最終 F12 閘門(見 script_F2_adaptive 說明)。
+        check_stop()
         _set_身份_自費("01", label="F3")
         logging.info("F3 (照光 3): 純自費 Excimer — 已設身份 01,未 key 51019/療程")
         return True
