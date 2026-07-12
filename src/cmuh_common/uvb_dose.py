@@ -13,7 +13,10 @@ F2/F3 熱鍵觸發時：
     2-6 天 → dose + increase, cap MAX
     = 7 天 → 保持 dose 不變
     8-14 天 → dose × 0.75, floor 到 10 的倍數 (435→430, 432→430)
-    > 14 天 → 固定 250
+    15-21 天 → dose × 0.5, floor 到 10 的倍數
+    > 21 天 → 固定 250 (LONG_GAP_DOSE)
+    [UC-09 audit 2026-07-12] 補回 15-21 ×0.5 桶(原 docstring 漏列且誤寫「>14 固定 250」);
+    以 compute_new_dose 常數為準。
 
 【格式範例】
     UVB 520mj/cm2  (11) on  (2026/05/26)  , increase 30mj/cm2 if no erythema , MAX:800 mj/cm2 , W2, W5M
@@ -2088,6 +2091,20 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
             parsed=parsed, uvb_line_count=uvb_lines,
         )
 
+    # [UC-11 audit 2026-07-12] 病歷矛盾:原劑量已 > 本行 MAX(如 900 但 MAX:800)。原本 2-6 天
+    # 會靜默 min() 壓回 800、7 天卻保持 900 → 行為不一致且都在靜默處理。改為交醫師確認(dose==MAX
+    # 的合法固定劑量不受影響,用嚴格 >);按 Yes 後 skip_dose_sanity 放行。
+    if not skip_dose_sanity and parsed.max_dose and parsed.dose > parsed.max_dose:
+        return UvbUpdateResult(
+            action=UvbAction.CONFIRM_NEEDED,
+            confirm_reason=(
+                f"原劑量 {parsed.dose} mj/cm2 已超過本行 MAX {parsed.max_dose} mj/cm2,"
+                "病歷可能有誤,請確認是否仍要更新"),
+            last_date=parsed.last_date,
+            days_diff=days_diff,
+            parsed=parsed, uvb_line_count=uvb_lines,
+        )
+
     new_dose = compute_new_dose(
         dose=parsed.dose, increase=parsed.increase,
         max_dose=parsed.max_dose, days_diff=days_diff,
@@ -2158,6 +2175,19 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
              and next_uvb.dose < next_uvb.max_dose)
                 or next_uvb.increase > 200):
             break
+        # [UC-11 audit 2026-07-12] 同日附加行同樣把關(與主行一致):原劑量 > 該行 MAX → 交
+        # 醫師確認,不靜默 min() 壓回。否則「主行合法、第二行 900>MAX800」會被靜默壓 800。
+        if (not skip_dose_sanity and next_uvb.max_dose
+                and next_uvb.dose > next_uvb.max_dose):
+            return UvbUpdateResult(
+                action=UvbAction.CONFIRM_NEEDED,
+                confirm_reason=(
+                    f"同日另一行原劑量 {next_uvb.dose} mj/cm2 已超過該行 MAX "
+                    f"{next_uvb.max_dose} mj/cm2,病歷可能有誤,請確認是否仍要更新"),
+                last_date=parsed.last_date,
+                days_diff=days_diff,
+                parsed=parsed, uvb_line_count=uvb_lines,
+            )
         # 同日期 — 用該行自己的 dose/increase/MAX 算
         next_new_dose = compute_new_dose(
             dose=next_uvb.dose, increase=next_uvb.increase,

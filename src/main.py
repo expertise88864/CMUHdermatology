@@ -1671,6 +1671,20 @@ def _set_療程_only(main_hwnd: int, value, label: str = "") -> bool:
     if not liaocheng_hwnd:
         logging.warning("[%s] 找不到 療程 欄位（請手動填）", label)
         return False
+    # [UD-05 audit 2026-07-12] 寫入前正向把關(比照 _set_身份_自費):療程欄合法原值=空白或個位
+    # 數字(1/2/3)。定位到的欄原值若「非空且非個位數」→ 疑似版面漂移抓錯窄欄 → 不寫,交醫師手動,
+    # 避免把 1/2/3 寫進別欄(且身份欄以療程為錨、連帶錯)。讀不到(空)則放行,由寫後 verify 兜底。
+    try:
+        _療程_before = (_read_tmemo_text(liaocheng_hwnd) or "").strip()
+    except Exception:
+        _療程_before = ""
+    if _療程_before and not re.fullmatch(r"\d", _療程_before):
+        logging.warning("[%s] 療程欄原值 %r 不像療程(非空且非個位數)→ 疑似定位錯欄,不寫",
+                        label, _療程_before)
+        _show_uvb_warning(main_hwnd, "療程未自動設定",
+                          f"自動定位到的療程欄內容看起來不對(原值:{_療程_before!r})。\n"
+                          f"請醫師手動把療程改成 {value}。")
+        return False
     ok = True
     try:
         ret = _wm_settext_timeout(liaocheng_hwnd, str(value))
