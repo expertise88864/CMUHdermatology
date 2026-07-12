@@ -10591,7 +10591,8 @@ class AutomationApp:
         [關鍵] 判定用『可達』(會排除 backoff stale fallback)而非『畫面上還顯示著』:斷線時其他診間
         雖仍顯示舊快取,但它們本輪是 backoff stale → 不算可達(Codex 第 3 輪指出的盲點)。"""
         exclude = str(exclude_room)
-        for code, reachable in self._reg64_room_reachable.items():
+        # [FC-03 audit 2026-07-12] 讀端快照:bg worker 會寫此 dict,主緒直接迭代可能 dict-changed-size。
+        for code, reachable in list(self._reg64_room_reachable.items()):
             if code != exclude and reachable:
                 return True
         return False

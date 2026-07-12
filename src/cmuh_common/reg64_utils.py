@@ -26,9 +26,11 @@ def reg64_time_code_from_local_clock(when: Optional[datetime] = None) -> str:
     if when is None:
         when = datetime.now()
     cur = when.time()
-    if cur <= dt_time(12, 59, 59):
+    # [CL-03 audit 2026-07-12] 半開區間:原本含微秒的 `<= 12:59:59` 會讓 12:59:59.5 提早落
+    # 下午,與註解「13:00 轉下午」不符。改 `< 13:00` / `< 17:30`。
+    if cur < dt_time(13, 0):
         return "1"
-    if cur <= dt_time(17, 29, 59):
+    if cur < dt_time(17, 30):
         return "2"
     return "3"
 

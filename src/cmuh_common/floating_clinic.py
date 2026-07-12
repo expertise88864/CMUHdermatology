@@ -372,8 +372,10 @@ class ClinicFloatingWindow:
                 _w.withdraw()
             except Exception:
                 logging.debug("[浮動門診] 初始 withdraw 失敗", exc_info=True)
+        # [FC-05 audit 2026-07-12] 保存 after id,destroy() 時取消,避免回呼在視窗已毀後才觸發。
+        self._ensure_shown_id = None
         try:
-            self.win.after(400, self._ensure_shown)
+            self._ensure_shown_id = self.win.after(400, self._ensure_shown)
         except Exception:
             self._ensure_shown()
 
@@ -645,12 +647,9 @@ class ClinicFloatingWindow:
         if bar_ok and content_ok:
             return True
         if bar_ok or content_ok:  # 只剩一個 → 全部清掉(狀態已壞)
-            for w in self._all_windows():
-                try:
-                    if w is not None:
-                        w.destroy()
-                except Exception:
-                    pass
+            # [FC-05 audit 2026-07-12] 走 self.destroy() 而非裸 destroy:一併取消時鐘/ensure_shown
+            # 的 after 回呼並存檔 geometry,避免殘留 after 續 fire 或幾何遺失。
+            self.destroy()
         return False
 
     def destroy(self) -> None:
@@ -660,6 +659,13 @@ class ClinicFloatingWindow:
             except Exception:
                 pass
             self._time_after_id = None
+        # [FC-05 audit 2026-07-12] 一併取消 _ensure_shown 的延遲回呼(避免視窗已毀後才 fire)。
+        if getattr(self, "_ensure_shown_id", None):
+            try:
+                self.win.after_cancel(self._ensure_shown_id)
+            except Exception:
+                pass
+            self._ensure_shown_id = None
         try:
             if self.on_geometry_change:
                 g = self.get_geometry()

@@ -89,6 +89,9 @@ def is_near_alert_threshold(
         normalized_margin = 10
 
     for appt_item in sessions:
+        # [CL-04 audit 2026-07-12] 已止掛(is_stopped:不會再增號)不應因既有數接近門檻而誤發「快滿」。
+        if isinstance(appt_item, dict) and appt_item.get("is_stopped"):
+            continue
         session_name, status_text = appt_item_session_and_count_text(appt_item)
         if "休診" in status_text or "停診" in status_text:
             continue

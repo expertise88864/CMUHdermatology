@@ -2,6 +2,7 @@
 """Clinic statistics-history helpers."""
 from __future__ import annotations
 
+import statistics
 from datetime import datetime, date
 from typing import Any, Callable
 
@@ -11,10 +12,12 @@ def duration_stats(durations: Any) -> tuple[list[float], list[float], float | No
     dur_list = [float(x) for x in (durations or [])]
     if not dur_list:
         return [], [], None
-    avg_raw = sum(dur_list) / len(dur_list)
-    valid_data = [x for x in dur_list if (avg_raw * 0.5) <= x <= (avg_raw * 2.0)]
+    # [CL-02 audit 2026-07-12] 以中位數為中心裁剪離群 —— 原本用「含離群的平均」定帶,單一
+    # 卡住(超長)的計時會把帶整個拉高、離群反而落在帶內;全被裁掉時回退中位數(非放回全體含離群)。
+    med = statistics.median(dur_list)
+    valid_data = [x for x in dur_list if (med * 0.5) <= x <= (med * 2.0)]
     if not valid_data:
-        valid_data = dur_list
+        valid_data = [med]
     final_avg_sec = sum(valid_data) / len(valid_data)
     return dur_list, valid_data, round(final_avg_sec / 60, 1)
 
@@ -231,7 +234,16 @@ def historical_duration_totals(history: list, doc_name: str,
 def all_time_average_text(history_totals: tuple[float, int],
                           current_durations: Any = None) -> str:
     total_minutes, total_count = history_totals
-    valid_current = [float(x) for x in (current_durations or []) if x > 0]
+    # [CL-07 audit 2026-07-12] 先 coerce 再比較 —— 原本 `if x > 0` 作用於未轉型的 x,
+    # 混型(字串)輸入會 TypeError 而非優雅回 "-"。
+    valid_current = []
+    for _x in (current_durations or []):
+        try:
+            _v = float(_x)
+        except (TypeError, ValueError):
+            continue
+        if _v > 0:
+            valid_current.append(_v)
     if valid_current:
         total_minutes += sum(valid_current) / 60.0
         total_count += len(valid_current)

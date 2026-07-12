@@ -33,11 +33,14 @@ def normalize_clinic_rooms(value: Any) -> tuple[list[str], bool]:
     if not isinstance(value, list):
         return list(DEFAULT_CLINIC_ROOMS), True
     rooms = [str(room or "").strip() for room in value[:CLINIC_ROOM_COUNT]]
+    # [CL-06 audit 2026-07-12] 整組空白(使用者不慎清空全部)→ 回完整預設,否則
+    # clinic_dynamic_state_key 會產生「/時段」錯位鍵。保守只處理「全空」;部分留空屬罕見
+    # 且語意不明(可能刻意少診),不動。(原 LEGACY_DEFAULT_CLINIC_ROOMS 分支經 _PRIOR
+    # 先攔為不可達死碼,已移除。)
+    if rooms and not any(r for r in rooms):
+        return list(DEFAULT_CLINIC_ROOMS), True
     # 整組是歷次預設 → 升級成目前完整預設
     if tuple(rooms) in _PRIOR_DEFAULT_ROOMS:
-        return list(DEFAULT_CLINIC_ROOMS), True
-    n_legacy = len(LEGACY_DEFAULT_CLINIC_ROOMS)
-    if len(rooms) <= n_legacy and tuple(rooms[:n_legacy]) == LEGACY_DEFAULT_CLINIC_ROOMS:
         return list(DEFAULT_CLINIC_ROOMS), True
     # 自訂但不足格數（例：只填前幾格）→ 以對應位置的預設補滿
     while len(rooms) < CLINIC_ROOM_COUNT:
