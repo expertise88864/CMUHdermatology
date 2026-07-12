@@ -1878,11 +1878,15 @@ def _photo_confirm_yesno(main_hwnd: int, title: str, intro: str, reason: str,
 _last_uvb_write = None
 
 
-def _record_uvb_write(label, old_dose, old_count, new_dose, new_count) -> None:
+def _record_uvb_write(label, old_dose, old_count, new_dose, new_count,
+                      extra_lines: int = 0) -> None:
+    # [UD-11 2026-07-12] extra_lines=同批一併更新的其他行/續行/uncertain 行數 —— W7
+    # 半套警告的「(B) 改回原值」若只提主行,醫師會漏還原這些行,一併記錄供文案提醒。
     global _last_uvb_write
     _last_uvb_write = {
         "label": label, "old_dose": old_dose, "old_count": old_count,
         "new_dose": new_dose, "new_count": new_count,
+        "extra_lines": extra_lines,
     }
 
 
@@ -1901,13 +1905,19 @@ def _show_light_code_incomplete_warning(label: str, set_療程: int,
     if uvb_already_updated and isinstance(rec, dict) and rec.get("label") == label:
         old = _fmt_uvb_dc(rec.get("old_dose"), rec.get("old_count"))
         new = _fmt_uvb_dc(rec.get("new_dose"), rec.get("new_count"))
+        # [UD-11] 同批還更新了其他行/續行/uncertain 行 → (B) 只改回主行不完整,追加提醒
+        _extra = rec.get("extra_lines") or 0
+        extra_note = (
+            f"\n    (注意:另有 {_extra} 處其他光療行/同行續行的次數/日期"
+            f"也已一併更新,選 (B) 時請一併改回。)"
+        ) if _extra else ""
         msg = (
             f"⚠ {label} 半套狀態需要你手動處理:\n\n"
             f"● UVB 處置【已寫回】:\n    原 {old}\n    → 已改為 {new}\n"
             f"● 但 51019 醫令 或 療程 {set_療程} 【沒有】確認完成。\n\n"
             f"請二選一手動處理:\n"
             f"(A) 補齊:手動下 51019 醫令、並把療程欄設為 {set_療程}(維持這次的新劑量);或\n"
-            f"(B) 取消:把 UVB 劑量/次數手動改回原值({old})。\n\n"
+            f"(B) 取消:把 UVB 劑量/次數手動改回原值({old})。{extra_note}\n\n"
             f"務必擇一完成再送出,以免病歷只改了劑量卻沒有對應醫令。"
         )
     elif uvb_already_updated:
@@ -2072,14 +2082,30 @@ def _f1_phototherapy_route(label: str = "") -> str:
 _F23_PURE_EXCIMER = "pure_excimer"
 
 
+class _PureExcimerAbortedType(str):
+    """[UD-14 codex 2026-07-12] 「純自費 Excimer 分流【成立】、但劑量更新中止
+    (如 TOO_CLOSE)」的哨符 —— 分流結論與更新成敗分離,讓 F1 能對這種情況也跳
+    分流矛盾警告(舊版此路徑回 False,分流資訊丟失)。
+
+    刻意 falsy:任何未特別處理的呼叫端(F2/F3 的 `if not res`)一律當「中止」
+    (fail-closed:不 key 51019、不設身份,與原本回 False 的行為完全相同)。"""
+    def __bool__(self) -> bool:
+        return False
+
+
+_F23_PURE_EXCIMER_ABORTED = _PureExcimerAbortedType("pure_excimer_aborted")
+
+
 def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
                             label: str = "F2"):
     """[2026-06-19] 純自費 Excimer:把 excimer 劑量行更新(次數+1、日期→今天、劑量
     decay/加量並 cap 在 MAX,跟 UVB 一樣)後,回 _F23_PURE_EXCIMER(caller 設身份=01、
     跳過 51019/療程)。
 
-    劑量更新是 best-effort:寫回失敗或非單純 UPDATED(太近/上限/格式)只記錄/警示,
-    【不影響身份=01】—— 這次就是自費 excimer visit,身份本來就該設 01。"""
+    劑量更新是 best-effort:寫回失敗或非單純 UPDATED(上限/格式)只記錄/警示,
+    【不影響身份=01】—— 這次就是自費 excimer visit,身份本來就該設 01。
+    例外:TOO_CLOSE(間隔太短)回 falsy 的 _F23_PURE_EXCIMER_ABORTED —— 中止、
+    不設身份(同一般 UVB),但保留「分流=純 excimer」結論供 F1 矛盾警告([UD-14])。"""
     try:
         from cmuh_common.uvb_dose import UvbAction, update_uvb_in_text
         result = update_uvb_in_text(text)
@@ -2106,7 +2132,9 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
                 f"距上次照光僅 {result.days_diff} 天。\n\n"
                 "未自動更新劑量,也【未設定身份(自費 01)】。\n"
                 "若確實要照光,請醫師手動設定身份與劑量。")
-            return False   # 不設身份、不續做(同一般 UVB 的太近 → 中止)
+            # [UD-14 codex] 回 falsy 哨符而非 False:F2/F3 的 `if not res` 行為不變
+            # (中止、不設身份),但保留「分流=純 excimer」結論給 F1 判斷矛盾警告。
+            return _F23_PURE_EXCIMER_ABORTED   # 不設身份、不續做(同一般 UVB 的太近 → 中止)
         elif result.action == UvbAction.CONFIRM_NEEDED:
             # [2026-06-24] 純 excimer 也可能跳 stale 確認(>1 月舊紀錄)/ 劑量超限確認。
             # 跳 Yes/No;Yes → 帶 skip 旗標重跑並寫回。No → 不改劑量(身份仍設 01)。
@@ -2158,8 +2186,13 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
     return _F23_PURE_EXCIMER
 
 
-def _update_uvb_dose_core(label: str, *, strict: bool):
+def _update_uvb_dose_core(label: str, *, strict: bool,
+                          codes_already_placed: str = ""):
     """[v20.9 2026-05-26] F1 / F2/F3 共用核心邏輯。
+
+    [UD-09 2026-07-12] codes_already_placed:非空=呼叫端在本函式【之前】已輸入完成的
+    醫令/療程描述(F1 是「先 51019+療程 後 UVB」)。更新失敗時附在警告文案,提醒醫師
+    若因此決定不照光,記得手動刪除已下的醫令。F2/F3(先 UVB 後 51019)不傳。
 
     [2026-06-18] 回傳值:True(正常,可續 51019/療程)/ False(中止)/
     _F23_PURE_EXCIMER(純自費 Excimer — caller 應設身份=01、跳過 51019/療程)。
@@ -2178,6 +2211,11 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
     """
     global _last_uvb_write
     _last_uvb_write = None  # [W7] 清空;只在本次確實寫回 UVB 後才填,供半套對帳警告
+    # [UD-09] 失敗警告的附註:醫令已先行輸入(F1)時提醒勿忘刪除;F2/F3 為空字串無影響。
+    _placed_note = (
+        f"\n\n注意:{codes_already_placed} 已在本次 {label} 先行輸入完成。\n"
+        f"若醫師因此決定今天不照光,請記得手動刪除該醫令與療程設定。"
+    ) if codes_already_placed else ""
     main_hwnd = _find_hospital_main_window()
     if not main_hwnd:
         if strict:
@@ -2261,8 +2299,14 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
     # [v20.12 2026-05-26] CONFIRM_NEEDED — dose / MAX 超過建議上限 (1500 mj/cm2)
     # 跳 Yes/No dialog，按 Yes 重 call 帶 skip_dose_sanity=True 跳過上限檢查。
     # [v20.14 2026-05-26] 也用於 stale check (距上次 > 30 天) — confirm_reason
-    # 文字會包含「天」字眼，title 也跟著改。Yes → 同時帶 skip_stale_check=True
-    if result.action == UvbAction.CONFIRM_NEEDED:
+    # 文字會包含「天」字眼，title 也跟著改。
+    # [UD-07 2026-07-12] 舊版按「是」後【同時】帶 skip_dose_sanity+skip_stale_check 重
+    # call:一筆既 stale 又劑量超限的紀錄,醫師只確認了其中一種,另一種確認被靜默跳過。
+    # 改成迴圈:每次只帶「已確認那種」的 skip flag,另一種 CONFIRM 會再跳一次窗;同種
+    # confirm 帶了對應 flag 仍重複出現(理論上不可能)→ 保守中止,防無限跳窗。
+    _skip_flags: dict = {}
+    _confirmed_kinds: set = set()
+    while result.action == UvbAction.CONFIRM_NEEDED:
         confirm_reason = result.confirm_reason or "原劑量或 MAX 超過建議上限"
         # [v20.17] 沒日期已改成 silent first-time update，不會再跳到這裡。
         # 這個 path 只剩 dose-over-limit / stale-record 兩種。
@@ -2271,10 +2315,21 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
             dialog_title = f"UVB 距上次照光時間過長 - {label}"
             dialog_intro = "請確認是否要按舊紀錄繼續更新"
             kind = "stale"
+            skip_flag = "skip_stale_check"
         else:
             dialog_title = f"UVB 劑量超過建議上限 - {label}"
             dialog_intro = "請確認劑量"
             kind = "dose"
+            skip_flag = "skip_dose_sanity"
+        if kind in _confirmed_kinds:
+            logging.warning(
+                "[%s][UVB] CONFIRM_NEEDED (%s) 已確認過仍重複出現 → 保守中止",
+                label, kind)
+            _show_uvb_warning(
+                main_hwnd, "UVB 確認流程異常",
+                f"確認後仍重複要求同種確認(程式異常)。\n\n"
+                f"{label} 已停止，請醫師確認處置後手動處理。{_placed_note}")
+            return False if strict else True
         logging.info("[%s][UVB] CONFIRM_NEEDED (%s): %s — 跳 Yes/No 確認",
                      label, kind, confirm_reason)
         _confirmed = _photo_confirm_yesno(
@@ -2284,12 +2339,11 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
         if not _confirmed:   # 否 / 取消 / MessageBoxW 失敗 → 一律停止(保守)
             logging.info("[%s][UVB] CONFIRM_NEEDED user 按否/取消/失敗 → 停止", label)
             return False if strict else True
-        logging.info("[%s][UVB] CONFIRM_NEEDED user 按是 → 重 call 帶 skip flags",
-                     label)
-        # [v20.14] 同時帶兩個 skip flag，無論本次是 dose 還是 stale confirm，
-        # 第二次 call 都不會再卡同樣的 confirm。
-        result = update_uvb_in_text(
-            text, skip_dose_sanity=True, skip_stale_check=True)
+        _confirmed_kinds.add(kind)
+        _skip_flags[skip_flag] = True
+        logging.info("[%s][UVB] CONFIRM_NEEDED (%s) user 按是 → 重 call 帶 %s",
+                     label, kind, skip_flag)
+        result = update_uvb_in_text(text, **_skip_flags)
 
     # [v20.17] SILENT_SKIP — 處置有 UVB+dose 但缺 MAX/increase (e.g. 梁雯琳
     # "keep UVB 850 mj/cm2") → 不修改處置但繼續執行 51019+療程
@@ -2317,7 +2371,7 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
             main_hwnd, "UVB parse 失敗",
             f"處置含 UVB 字串但無法解析格式\n\n"
             f"預期: UVB 劑量mj/cm2 (次數) on (日期), increase N, MAX:N\n\n"
-            f"{label} 已停止，請醫師確認處置欄 UVB 行格式後手動處理。")
+            f"{label} 已停止，請醫師確認處置欄 UVB 行格式後手動處理。{_placed_note}")
         return False
 
     if result.action == UvbAction.SANITY_FAIL:
@@ -2327,7 +2381,7 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
             main_hwnd, "UVB 數值異常",
             f"處置 UVB 行的數值看起來不對:\n\n"
             f"{result.sanity_reason}\n\n"
-            f"{label} 已停止，請醫師確認後手動處理。")
+            f"{label} 已停止，請醫師確認後手動處理。{_placed_note}")
         return False
 
     if result.action == UvbAction.TOO_CLOSE:
@@ -2338,7 +2392,7 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
             main_hwnd, "UVB 照光間隔太短",
             f"病人 {last_str} 已照光 (距今僅 {result.days_diff} 天)\n\n"
             f"間隔不足 ≥ 2 天 — 已停止 {label} 自動處理。\n"
-            f"若仍要照光，請醫師確認後手動處理。")
+            f"若仍要照光，請醫師確認後手動處理。{_placed_note}")
         return False
 
     # [v20.13 2026-05-26] UPDATED 但偵測到「不確定的其他 triplet」(日期不同
@@ -2347,6 +2401,7 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
     #   No  = 取消，不寫入處置、不執行 51019 (避免半套更新)
     uncertain = getattr(result, 'uncertain_other_triplets', None) or []
     final_text = result.new_text
+    _uncertain_applied = 0   # [UD-11] 實際套用的 uncertain 行數(供 W7 對帳記錄)
     if uncertain:
         lines_show = "\n".join(
             f"  • [{u['date'].strftime('%m/%d')} ({u['days_ago']}天前) "
@@ -2398,11 +2453,21 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
         try:
             from cmuh_common.uvb_dose import apply_uncertain_updates
             final_text = apply_uncertain_updates(result.new_text, uncertain)
+            _uncertain_applied = len(uncertain)
             logging.info("[%s][UVB] uncertain user 按是 → 套用 %d 個額外行",
                          label, len(uncertain))
         except Exception:
             logging.exception("[%s][UVB] apply_uncertain_updates 失敗", label)
             final_text = result.new_text
+            # [UD-10 2026-07-12] 醫師剛按「是」承諾這些行會一併更新;套用失敗若靜默
+            # fallback,醫師會誤以為額外行已更新。跳警告點名【沒有】更新;主行更新
+            # (獨立產生、後續有 round-trip verify)照常寫回,不因額外行失敗放棄。
+            _show_uvb_warning(
+                main_hwnd, "UVB 額外行未更新",
+                f"你剛按「是」要一併更新 {len(uncertain)} 行其他光療紀錄,"
+                f"但套用時發生程式錯誤。\n\n"
+                f"主要 UVB 行仍會正常更新;上述額外行【沒有】更新\n"
+                f"(次數/日期維持原樣),請於 {label} 完成後手動檢查並自行更新。")
 
     # UPDATED: 寫回 TMemo
     # [UD-04 2026-07-10] 寫回處置欄是全鏈唯一直接改病歷的動作,卻是唯一沒有取消閘門的步驟:從
@@ -2414,7 +2479,7 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
         _show_uvb_warning(
             main_hwnd, "UVB 寫回失敗",
             f"寫回處置欄失敗 (WM_SETTEXT)\n\n"
-            f"{label} 已停止 — 處置欄未更新，請醫師確認後手動處理。")
+            f"{label} 已停止 — 處置欄未更新，請醫師確認後手動處理。{_placed_note}")
         return False
 
     # 寫回後實機 read 驗證 — Delphi onChange 可能 reformat 過
@@ -2426,7 +2491,8 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
         logging.warning("[%s][UVB] 寫回後 read-back 空字串,無法驗證 → 保守中止", label)
         _show_uvb_warning(
             main_hwnd, "UVB 寫回無法驗證",
-            f"{label} 寫回後讀不到處置內容,無法確認是否成功。\n請醫師手動核對後再送出。")
+            f"{label} 寫回後讀不到處置內容,無法確認是否成功。\n請醫師手動核對後再送出。"
+            f"{_placed_note}")
         return False
     if actual_text:
         from cmuh_common.uvb_dose import (
@@ -2451,7 +2517,7 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
                 f"預期: dose={result.new_dose} count={result.new_count}\n"
                 f"實際讀回: dose={getattr(verify, 'dose', '?')} "
                 f"count={getattr(verify, 'count', '?')}\n\n"
-                f"{label} 已停止，請醫師手動確認處置內容。")
+                f"{label} 已停止，請醫師手動確認處置內容。{_placed_note}")
             return False
         # [W7 codex review] 只在「讀回成功(actual_text 非空)且 verify 通過」時才記錄
         # 原值→新值。讀回失敗(_read_tmemo_text 逾時回空字串,跳過整個 if actual_text)
@@ -2459,7 +2525,12 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
         _record_uvb_write(
             label, getattr(result.parsed, "dose", None),
             getattr(result.parsed, "count", None),
-            result.new_dose, result.new_count)
+            result.new_dose, result.new_count,
+            # [UD-11] 同批一併更新的行數:Step B 同日附加行 + Step C/D 同日 triplet
+            # + 醫師按「是」後套用的 uncertain 行(套用失敗時為 0,與實況一致)
+            extra_lines=(result.additional_lines_updated
+                         + getattr(result, 'additional_triplets_updated', 0)
+                         + _uncertain_applied))
 
     if result.additional_lines_updated > 0:
         logging.info(
@@ -2514,12 +2585,37 @@ def _f1_update_uvb_dose_if_present(label: str = "F1") -> None:
     """[v20.9] F1 UVB 自動更新 — 寬鬆 mode。
 
     F1 = 第一次照光，處置可能沒寫 UVB → NO_UVB_LINE 是正常情境不警告。
-    其他真實異常 (parse fail / sanity fail / too close / 寫回失敗) 仍警告。
+    其他真實異常 (parse fail / sanity fail / too close / 寫回失敗) 仍警告
+    ([UD-09] 文案附「51019+療程1 已下」提醒 — F1 先醫令後 UVB,失敗時醫師
+    若決定不照光,容易忘刪已下的醫令)。
 
     F1 流程是先 51019 後 UVB，所以這個函數沒有 abort 51019 的意義 —
     不論 return 值都不影響 51019 (已執行完)。caller 不需要看 return。
     """
-    _update_uvb_dose_core(label, strict=False)
+    res = _update_uvb_dose_core(label, strict=False,
+                                codes_already_placed="51019 醫令與療程 1")
+    # [UD-14 2026-07-12] F1 是「先 51019 後 UVB」:key 51019 前的 _f1_phototherapy_route
+    # 偵測【例外/找不到視窗時 fallback normal】,此處 core 二次分流卻判為純自費 Excimer
+    # → 健保醫令+自費處置並存的矛盾狀態,原本無任何警示。兩個修正方向(刪醫令 vs 還原
+    # excimer 行)都涉計費,不自動回退 → 跳人工核對警告。
+    # [codex P2] 更新中止(如 TOO_CLOSE 回 falsy 哨符 _F23_PURE_EXCIMER_ABORTED)時分流
+    # 一樣是純 excimer、矛盾一樣存在 → 兩種結局都要警告,僅文案區分行有沒有被更新。
+    # (route 正常判到 pure_excimer 的 F1 走 _f1_pure_excimer,不會進到這裡。)
+    if res == _F23_PURE_EXCIMER or res == _F23_PURE_EXCIMER_ABORTED:
+        _exc_state = ("excimer 行可能已更新次數/日期/劑量"
+                      if res == _F23_PURE_EXCIMER
+                      else "excimer 行【未】更新(更新因間隔太短等原因中止)")
+        logging.warning(
+            "[%s] route=normal 已 key 51019,但 core 二次分流=純自費 Excimer(%s) "
+            "→ 矛盾,跳人工核對警告", label, res)
+        _show_uvb_warning(
+            _find_hospital_main_window() or 0,
+            "F1 照光分流矛盾,請人工核對",
+            f"F1 前段已輸入 51019 醫令+療程 1(當時判定走健保 UVB),\n"
+            f"但處置更新階段偵測為【純自費 Excimer】({_exc_state})。\n\n"
+            f"健保醫令與自費處置並存,請人工核對本次實際照光種類:\n"
+            f"  • 若為自費 Excimer:請刪除 51019/療程 1,並確認身份別與 excimer 行;\n"
+            f"  • 若為健保 UVB:請檢查 excimer 行是否被誤更新並改回。")
 
 
 # [2026-06-19] F1 純自費 Excimer 要 key 的醫令代碼(自費 Excimer 專用,非健保 51019)。
