@@ -13781,6 +13781,9 @@ class AutomationApp:
             system_idle_sec=idle,
             seconds_since_last_restart=secs_since_restart,
             restarts_this_session=getattr(self, '_hk_auto_restart_count', 0),
+            # [SP-03 2026-07-12] idle 門檻 3s→30s:僅在使用者閒置較久才自動重啟,避免操作中打斷。
+            # (重啟計數跨行程持久化屬 SP-03 之(b),涉 settings 檔隔離,緩修。)
+            idle_required_sec=30.0,
         ):
             self._hk_last_auto_restart_monotonic = now
             self._hk_auto_restart_count = getattr(self, '_hk_auto_restart_count', 0) + 1

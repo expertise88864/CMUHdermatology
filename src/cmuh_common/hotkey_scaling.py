@@ -52,7 +52,18 @@ def configure_hotkey_scaling(enabled: bool,
         HOTKEY_ADAPTIVE_STATE["scale_y"] = 1.0
         return
     base_w, base_h = _HOTKEY_BASE_SIZE[base_version]
-    target_w, target_h = int(target_size[0]), int(target_size[1])
+    # [SP-01 2026-07-12] target_size 無效((0,0)/None/非數字)→ 視同 disabled(回原值不縮放);否則
+    # int(None) 會拋 TypeError、(0,0) 會讓 scale=0 把 F11 所有座標縮到左上角(HIS 誤點)。
+    try:
+        target_w, target_h = int(target_size[0]), int(target_size[1])
+    except (TypeError, ValueError, IndexError):
+        target_w = target_h = 0
+    if target_w <= 0 or target_h <= 0:
+        HOTKEY_ADAPTIVE_STATE["base_size"] = (0, 0)
+        HOTKEY_ADAPTIVE_STATE["target_size"] = (0, 0)
+        HOTKEY_ADAPTIVE_STATE["scale_x"] = 1.0
+        HOTKEY_ADAPTIVE_STATE["scale_y"] = 1.0
+        return
     HOTKEY_ADAPTIVE_STATE["base_size"] = (base_w, base_h)
     HOTKEY_ADAPTIVE_STATE["target_size"] = (target_w, target_h)
     HOTKEY_ADAPTIVE_STATE["scale_x"] = target_w / float(base_w)

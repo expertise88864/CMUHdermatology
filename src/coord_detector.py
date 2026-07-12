@@ -164,13 +164,16 @@ class CoordinateDetectorApp:
                     img = ImageGrab.grab(bbox=(x, y, x + 1, y + 1), all_screens=True)
                     r, g, b = img.getpixel((0, 0))[:3]
                 except Exception:
-                    r, g, b = self._last_color
-                self._last_color = (r, g, b)
-                self._last_pos = (x, y)
-                hex_color = f"#{r:02x}{g:02x}{b:02x}"
-                self.rgb_var.set(f"({r}, {g}, {b})")
-                self.hex_var.set(hex_color)
-                self.color_preview.config(background=hex_color)
+                    # [SP-06 2026-07-12] 取色失敗:不更新 _last_pos(讓 50ms 後同位置自動重試)、
+                    # 不沿用舊色顯示錯 RGB(下游餵 F11 比色)。只顯示失敗狀態。
+                    self.rgb_var.set("(讀取失敗)")
+                else:
+                    self._last_color = (r, g, b)
+                    self._last_pos = (x, y)
+                    hex_color = f"#{r:02x}{g:02x}{b:02x}"
+                    self.rgb_var.set(f"({r}, {g}, {b})")
+                    self.hex_var.set(hex_color)
+                    self.color_preview.config(background=hex_color)
         except tk.TclError:
             return
         except Exception as e:
@@ -181,10 +184,18 @@ class CoordinateDetectorApp:
 
     def setup_hotkey(self) -> None:
         try:
-            keyboard.add_hotkey(self.HOTKEY,
-                                lambda: self.root.after(0, self.record_current_data))
+            keyboard.add_hotkey(self.HOTKEY, self._on_hotkey_safe)
         except Exception:
             self.status_var.set(f"熱鍵 {self.HOTKEY} 設定失敗! (可能需要管理員權限)")
+
+    def _on_hotkey_safe(self) -> None:
+        # [SP-05 2026-07-12] keyboard hook 於自身緒回呼;關窗瞬間對已毀 root 呼 after 會拋 TclError
+        # → 包起來,避免 hook 緒例外。
+        try:
+            if self.root.winfo_exists():
+                self.root.after(0, self.record_current_data)
+        except (tk.TclError, RuntimeError):
+            pass
 
     def record_current_data(self) -> None:
         if not self.root.winfo_exists():

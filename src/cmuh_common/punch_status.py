@@ -178,8 +178,12 @@ def read_today_swipes(driver, username: str, password: str, *,
                 return [], (getattr(e, "alert_text", "") or "登入 Alert")[:30]
             except TimeoutException:
                 try:
-                    driver.switch_to.alert.accept()
-                    return [], "帳號/密碼錯誤"
+                    _alert = driver.switch_to.alert
+                    _txt = (_alert.text or "").strip()
+                    _alert.accept()
+                    # [SP-07 2026-07-12] 回實際 alert 文字(而非硬編「帳號/密碼錯誤」)。硬編含「密碼
+                    # 錯誤」會讓 _is_retryable_punch_error 判不可重試,暫態問題(逾時彈框)因此失去重試。
+                    return [], (_txt[:30] or "登入 Alert")
                 except Exception:
                     pass
                 try:
