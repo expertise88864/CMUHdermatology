@@ -238,8 +238,47 @@ def _send_once(cred: dict, msg, timeout: float) -> None:
             if use_tls:
                 server.starttls(context=ssl.create_default_context())
                 server.ehlo()
+            # [IF-08 2026-07-12] 無 TLS 且非 loopback → 拒絕明文送 App Password(帳密明文過網)。
+            # 此分支 port≠465;正常設定為 587+STARTTLS(use_tls=True)不受影響。loopback 判斷涵蓋
+            # localhost/LOCALHOST/localhost./127.0.0.0-8/::1(本機 relay 明文可接受)。
+            if not use_tls and not _is_loopback_host(host):
+                raise RuntimeError(
+                    "拒絕在無 TLS 下對非本機 SMTP 傳送帳密(use_tls=False);"
+                    "請改用 587+STARTTLS 或 465 SSL。")
             server.login(cred["username"], cred["password"])
             server.send_message(msg)
+
+
+def _is_loopback_host(host) -> bool:
+    """host 是否為本機 loopback(無 TLS 明文送帳密僅在此可接受)。涵蓋 localhost/大小寫/
+    結尾點/127.0.0.0-8/::1。"""
+    h = str(host or "").strip().rstrip(".").lower()
+    if h == "localhost":
+        return True
+    try:
+        import ipaddress
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+def _smtp_error_is_permanent(e) -> bool:
+    """SMTP 例外是否為永久性(全部相關 response code 皆 5xx)。含任何 4xx、或取不到碼、或非
+    SMTP 錯誤(逾時/OSError)一律回 False(視為可重試),以免把 greylisting/暫時性失敗的信丟掉。"""
+    codes = []
+    if isinstance(e, smtplib.SMTPRecipientsRefused):
+        codes = [c for (c, _m) in (getattr(e, "recipients", {}) or {}).values()]
+    elif isinstance(e, (smtplib.SMTPSenderRefused, smtplib.SMTPDataError,
+                        smtplib.SMTPResponseException)):
+        code = getattr(e, "smtp_code", None)
+        if code is not None:
+            codes = [code]
+    if not codes:
+        return False
+    try:
+        return all(500 <= int(c) < 600 for c in codes)
+    except (TypeError, ValueError):
+        return False
 
 
 def send_mail(recipients: list, subject: str, body: str,
@@ -296,6 +335,13 @@ def send_mail(recipients: list, subject: str, body: str,
                 f"請確認 settings/smtp_credentials.json 的 password 是 Gmail "
                 f"App Password（16 字元），不是您日常登入的密碼。") from e
         except (socket.timeout, smtplib.SMTPException, OSError) as e:
+            # [IF-07 2026-07-12] 永久性 SMTP 錯誤(全部相關 response code 皆 5xx:收件人/寄件人被
+            # 拒、DATA 5xx)不會自己好 → 不重試,免徒勞 backoff。但同類例外也可能帶 4xx(暫時,如
+            # greylisting/信箱暫時滿)→ 那些仍走下面重試,以免把可恢復的信丟掉(codex)。
+            if _smtp_error_is_permanent(e):
+                _rollback_rate_limit_slot(reservation)
+                raise RuntimeError(
+                    f"SMTP 永久性錯誤(5xx),不重試：{type(e).__name__}: {e}") from e
             if attempt < max_retries:
                 backoff = min(10, 2 * (2 ** attempt))  # 2s, 4s, 8s, 10s (capped)
                 logging.warning(

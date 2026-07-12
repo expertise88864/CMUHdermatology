@@ -219,13 +219,12 @@ def check_trigger(keyword: str, mark_read: bool = True,
         # 注意：IMAP SEARCH 對非 ASCII 主旨要用 LITERAL+CHARSET UTF-8
         # imaplib 支援：search(charset, *criteria)
         try:
-            kw_bytes = keyword.encode("utf-8")
-            # Gmail/Dovecot 都支援 CHARSET UTF-8
+            # ASCII 主旨 → server-side SEARCH(高效);中文主旨會在 imaplib ASCII 編碼階段先拋
+            # UnicodeEncodeError → 落 except 後備「全 UNSEEN client 端比對」。
+            # [IF-05 2026-07-12] 移除原「typ!=OK 改 UTF-8 mode」死碼:中文走的是【例外】路徑而非
+            # typ!=OK,該 UTF-8 retry 永不執行(kw_bytes 一併移除)。
             typ, data = conn.search(None, "UNSEEN", "SUBJECT",
                                      f'"{keyword}"')
-            # 如果上面失敗（不支援 inline 中文），改用 utf-8 mode
-            if typ != "OK":
-                typ, data = conn.search("UTF-8", "UNSEEN", "SUBJECT", kw_bytes)
         except Exception:
             # 後備：撈 UNSEEN 後 client 端比對
             typ, data = conn.search(None, "UNSEEN")

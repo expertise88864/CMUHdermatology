@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "app_version": "2026.07.12.5",
+  "app_version": "2026.07.12.6",
   "min_supported_local_version": "2026.04.01.0",
   "release_url": "https://github.com/expertise88864/CMUHdermatology/releases/latest",
   "files": [
@@ -8,721 +8,721 @@
       "key": "autoclock",
       "remote_path": "src/autoclock.py",
       "local_filename": "src/autoclock.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "34d90e660ec1a59f8191281836471a2126a6c9cc8a1f93ecefaa433f52b7d3b8"
     },
     {
       "key": "clock.__init__",
       "remote_path": "src/clock/__init__.py",
       "local_filename": "src/clock/__init__.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "08b9eb9d5fe94fd7fcf2954a03c0c1577bceea3b4147865199f943254fed296e"
     },
     {
       "key": "clock.webdriver_setup",
       "remote_path": "src/clock/webdriver_setup.py",
       "local_filename": "src/clock/webdriver_setup.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "fa31a86937d6e6d1a6753c80cb5fa0689152c141f275a1f2f2e1da264e5ee036"
     },
     {
       "key": "cmuh_common.__init__",
       "remote_path": "src/cmuh_common/__init__.py",
       "local_filename": "src/cmuh_common/__init__.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "ef99ad0bf85918858d596f60d2275c3bff03c053049c270efba88ecebe53dbdb"
     },
     {
       "key": "cmuh_common.abbrev_engine",
       "remote_path": "src/cmuh_common/abbrev_engine.py",
       "local_filename": "src/cmuh_common/abbrev_engine.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "f2e65b0ce67b14cca6172d4494eddeebad3cf0c3a8dc4bc8df2549b3b8611a69"
     },
     {
       "key": "cmuh_common.app_settings",
       "remote_path": "src/cmuh_common/app_settings.py",
       "local_filename": "src/cmuh_common/app_settings.py",
-      "version": "2026.07.12.5",
-      "sha256": "ff9d530eb8bccc0169b694db6108da8c3c1128450fb441292e17858e5d8e6cdb"
+      "version": "2026.07.12.6",
+      "sha256": "7ab1e5e066c2d94ec8eca8ab0c818d2044d4e2be2c80b4179636e9aced322245"
     },
     {
       "key": "cmuh_common.appt_utils",
       "remote_path": "src/cmuh_common/appt_utils.py",
       "local_filename": "src/cmuh_common/appt_utils.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "fd4e897229a3fd03395386d6c1c53a50bc5eb9459d3d1f9e7cba9231f22a15b7"
     },
     {
       "key": "cmuh_common.atomic_io",
       "remote_path": "src/cmuh_common/atomic_io.py",
       "local_filename": "src/cmuh_common/atomic_io.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "5fcfb07fc94cd93773491011e83f34364b58fad9072b8a72b4e64169cb0968bd"
     },
     {
       "key": "cmuh_common.bounded_executor",
       "remote_path": "src/cmuh_common/bounded_executor.py",
       "local_filename": "src/cmuh_common/bounded_executor.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "a52ab7f461f1b5b60679d6ccde6e4738a9368324252d4835c892ed3fd0197fc2"
     },
     {
       "key": "cmuh_common.cache_cleanup",
       "remote_path": "src/cmuh_common/cache_cleanup.py",
       "local_filename": "src/cmuh_common/cache_cleanup.py",
-      "version": "2026.07.12.5",
-      "sha256": "69c41ffeb05484c6da70d38ed908972e077a12065107c56f8369396c50310d84"
+      "version": "2026.07.12.6",
+      "sha256": "7cb384ccb98159d2869dc95dc5d9b4c9f743b243f1e5990e8f4dec19d244ddc7"
     },
     {
       "key": "cmuh_common.cache_state",
       "remote_path": "src/cmuh_common/cache_state.py",
       "local_filename": "src/cmuh_common/cache_state.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "8d8d312585fdd246f3915a6172a7daa79294bdf7f93502dee4b5166163c162f6"
     },
     {
       "key": "cmuh_common.chrome_options",
       "remote_path": "src/cmuh_common/chrome_options.py",
       "local_filename": "src/cmuh_common/chrome_options.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "7e6d7f63eb219d114dfcf732c21896c3107aeb93a897ba571ac716f99046fc86"
     },
     {
       "key": "cmuh_common.clinic_history",
       "remote_path": "src/cmuh_common/clinic_history.py",
       "local_filename": "src/cmuh_common/clinic_history.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "4411549d99a25826b966a2c1d9a686fdf8e2e9d645e14bbe5cde9b22b90abed3"
     },
     {
       "key": "cmuh_common.clinic_light_history",
       "remote_path": "src/cmuh_common/clinic_light_history.py",
       "local_filename": "src/cmuh_common/clinic_light_history.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "71092daee2a1a36919d04b94b1bfd6c9167b17d66563323acfc8e839ff8667cc"
     },
     {
       "key": "cmuh_common.clinic_state",
       "remote_path": "src/cmuh_common/clinic_state.py",
       "local_filename": "src/cmuh_common/clinic_state.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "2169e43e7c0aeea4c5d62af52356a0006035d24340a5b845053fa3e7382ac38a"
     },
     {
       "key": "cmuh_common.config_io",
       "remote_path": "src/cmuh_common/config_io.py",
       "local_filename": "src/cmuh_common/config_io.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "ee328567a3d5cc9c0d2b1ab3f93412b8ce4335da2d8cbdc2b438d3d340c817ba"
     },
     {
       "key": "cmuh_common.date_utils",
       "remote_path": "src/cmuh_common/date_utils.py",
       "local_filename": "src/cmuh_common/date_utils.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "4e8c572c62327b950ac41032d4e7e40d6178acce10430d07aea222eb05c5cc71"
     },
     {
       "key": "cmuh_common.deps_installer",
       "remote_path": "src/cmuh_common/deps_installer.py",
       "local_filename": "src/cmuh_common/deps_installer.py",
-      "version": "2026.07.12.5",
-      "sha256": "006c5115afdf63c9798ceb076ee91302932b4dc8824c137a499c18c6f58f551a"
+      "version": "2026.07.12.6",
+      "sha256": "570702647e0db8518b93c237e0eb86a17c0f68793cb9b46f1f3799ad905e3377"
     },
     {
       "key": "cmuh_common.deps_runtime",
       "remote_path": "src/cmuh_common/deps_runtime.py",
       "local_filename": "src/cmuh_common/deps_runtime.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "27094807c069a7a84f9658da09315c1ef88bcd3519e7cf3adb2e2c01ff80bea5"
     },
     {
       "key": "cmuh_common.ditto_card_ocr",
       "remote_path": "src/cmuh_common/ditto_card_ocr.py",
       "local_filename": "src/cmuh_common/ditto_card_ocr.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "8071addf19ff9c73a270f20b5467252bf9b69ccdc97f58f628c4e4e9e948ad84"
     },
     {
       "key": "cmuh_common.duty_summary",
       "remote_path": "src/cmuh_common/duty_summary.py",
       "local_filename": "src/cmuh_common/duty_summary.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "f8f42f1a59c19a3108f3d4286ccd47c3ee25062cea3e27444459cf43800a380c"
     },
     {
       "key": "cmuh_common.floating_clinic",
       "remote_path": "src/cmuh_common/floating_clinic.py",
       "local_filename": "src/cmuh_common/floating_clinic.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "790e6720316e4b222f586fd9d57db75b52260f93f14757eaf40c674ec175ffca"
     },
     {
       "key": "cmuh_common.health",
       "remote_path": "src/cmuh_common/health.py",
       "local_filename": "src/cmuh_common/health.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "0e47f31f2943926cf2c3179c334bed9b5abd3fef97b504756de766dcf1c649b3"
     },
     {
       "key": "cmuh_common.hotkey_guardian",
       "remote_path": "src/cmuh_common/hotkey_guardian.py",
       "local_filename": "src/cmuh_common/hotkey_guardian.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "af1e05bbc64321ab8616952f58291f4e4b0773c41641a071e636dfebd32a54d4"
     },
     {
       "key": "cmuh_common.hotkey_scaling",
       "remote_path": "src/cmuh_common/hotkey_scaling.py",
       "local_filename": "src/cmuh_common/hotkey_scaling.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "865f1cd7c7c6d557ad4165a4a0f7d81405f319ce18b1b49ec88862f673bd3b2c"
     },
     {
       "key": "cmuh_common.http_client",
       "remote_path": "src/cmuh_common/http_client.py",
       "local_filename": "src/cmuh_common/http_client.py",
-      "version": "2026.07.12.5",
-      "sha256": "b7c0fe4a24da2380dee064ba4e6c5401453a7ddbb3a332d997647e4c9663e32c"
+      "version": "2026.07.12.6",
+      "sha256": "7651de698b6e24f9fb349befd80e938c2bb3afa478a2df66473948d9eff8f177"
     },
     {
       "key": "cmuh_common.icons",
       "remote_path": "src/cmuh_common/icons.py",
       "local_filename": "src/cmuh_common/icons.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "5b7d5e80077571ce83328c2be5b175fbe65579a3bb13e2d2f2397817038dcc2b"
     },
     {
       "key": "cmuh_common.imap_reader",
       "remote_path": "src/cmuh_common/imap_reader.py",
       "local_filename": "src/cmuh_common/imap_reader.py",
-      "version": "2026.07.12.5",
-      "sha256": "4624aee0f6a96a256aed46ae1c9625328fdae141c9ec5e9cfc64d466bd52d944"
+      "version": "2026.07.12.6",
+      "sha256": "fa8f91e335fa52258085ed4d652df096a36c1ef9c30600986d52fdf0e3b92bf2"
     },
     {
       "key": "cmuh_common.logging_setup",
       "remote_path": "src/cmuh_common/logging_setup.py",
       "local_filename": "src/cmuh_common/logging_setup.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "22dcb0b05f0a21ce8c7a9e4cf370dd62e2d3605be0e1abe2b8533ded7b1c84ac"
     },
     {
       "key": "cmuh_common.master_schedule_cache",
       "remote_path": "src/cmuh_common/master_schedule_cache.py",
       "local_filename": "src/cmuh_common/master_schedule_cache.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "ed1d5cdbd12626d01f934a0424fb78280a8067f84309a36ee09b37ffc9b2dec8"
     },
     {
       "key": "cmuh_common.memory_cache",
       "remote_path": "src/cmuh_common/memory_cache.py",
       "local_filename": "src/cmuh_common/memory_cache.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "0a01b6a7bc392be43c43f3b2b69ba6b037369e2b12363c329508dba0c259ff58"
     },
     {
       "key": "cmuh_common.notifications",
       "remote_path": "src/cmuh_common/notifications.py",
       "local_filename": "src/cmuh_common/notifications.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "7942a0bd03985829f551e2b9dd06ea4411bc22d286901dce583bf25cd90b3d40"
     },
     {
       "key": "cmuh_common.paths",
       "remote_path": "src/cmuh_common/paths.py",
       "local_filename": "src/cmuh_common/paths.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "f374959045a0d5098709434f06fafd3a2a8f1bb28e54aa05696f7e2f7de9eb2f"
     },
     {
       "key": "cmuh_common.pixel_picker",
       "remote_path": "src/cmuh_common/pixel_picker.py",
       "local_filename": "src/cmuh_common/pixel_picker.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "4222bd7f68a22607dcc1f52a74ea532c04c0345204c317091d3cfc644076fcea"
     },
     {
       "key": "cmuh_common.platform_win",
       "remote_path": "src/cmuh_common/platform_win.py",
       "local_filename": "src/cmuh_common/platform_win.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "c7b7b270d4f6781958db791e142398ea72946408ed73b043d3099b8cfe7f6fae"
     },
     {
       "key": "cmuh_common.process_launch",
       "remote_path": "src/cmuh_common/process_launch.py",
       "local_filename": "src/cmuh_common/process_launch.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "3995da599c8c18157da5e546415d4f235fc4dd302ca63a09a79c768638b5b29f"
     },
     {
       "key": "cmuh_common.punch_status",
       "remote_path": "src/cmuh_common/punch_status.py",
       "local_filename": "src/cmuh_common/punch_status.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "fbcab8840a3c61e7c3dfd3e6d909357734b2629eb4c173457ccc33d4f285a08f"
     },
     {
       "key": "cmuh_common.refresh_policy",
       "remote_path": "src/cmuh_common/refresh_policy.py",
       "local_filename": "src/cmuh_common/refresh_policy.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "66a33e7dc63fbc14e28d5b0617866d05587fee4e79766ad5fea983cc85f0f429"
     },
     {
       "key": "cmuh_common.reg64_utils",
       "remote_path": "src/cmuh_common/reg64_utils.py",
       "local_filename": "src/cmuh_common/reg64_utils.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "5a010ecd743bd241be8ca0466d98759ed845e00c206df716291593c64f408007"
     },
     {
       "key": "cmuh_common.roster.__init__",
       "remote_path": "src/cmuh_common/roster/__init__.py",
       "local_filename": "src/cmuh_common/roster/__init__.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "bd23d3ee1def912c342ffa2d4b2717a9494d63f44529c8a3ac8fff060260deee"
     },
     {
       "key": "cmuh_common.roster.calendar_colors",
       "remote_path": "src/cmuh_common/roster/calendar_colors.py",
       "local_filename": "src/cmuh_common/roster/calendar_colors.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "d83c2389822d045641f930d8691ef129d9dd56cddfde22d1dcaec01423394e4d"
     },
     {
       "key": "cmuh_common.roster.clinic_grid",
       "remote_path": "src/cmuh_common/roster/clinic_grid.py",
       "local_filename": "src/cmuh_common/roster/clinic_grid.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "80c74d24c793332520bb0c6a66b074de32e9c2400585deb3c83c166d128a503d"
     },
     {
       "key": "cmuh_common.roster.export_common",
       "remote_path": "src/cmuh_common/roster/export_common.py",
       "local_filename": "src/cmuh_common/roster/export_common.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "7a43c905adc5720487848b3f9c5b2867886a65625c7cc40634101c2c8103a8e6"
     },
     {
       "key": "cmuh_common.roster.export_docx",
       "remote_path": "src/cmuh_common/roster/export_docx.py",
       "local_filename": "src/cmuh_common/roster/export_docx.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "816b9e647dd520b2e108b0c7acfa1546decf09629037703cc3fb6dbffc2d5c60"
     },
     {
       "key": "cmuh_common.roster.export_pdf",
       "remote_path": "src/cmuh_common/roster/export_pdf.py",
       "local_filename": "src/cmuh_common/roster/export_pdf.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "b055f19dd8905f62a52e14a76c82a831dbee63c0635ade77812c88cff1b31060"
     },
     {
       "key": "cmuh_common.roster.export_xlsx",
       "remote_path": "src/cmuh_common/roster/export_xlsx.py",
       "local_filename": "src/cmuh_common/roster/export_xlsx.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "1a123d992ca3f7399feaa903b24cc9301c7fba63cf39de538a071f4b68a9ea30"
     },
     {
       "key": "cmuh_common.roster.gitsync_storage",
       "remote_path": "src/cmuh_common/roster/gitsync_storage.py",
       "local_filename": "src/cmuh_common/roster/gitsync_storage.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "9303db380b687a970bac30052e48adaaf16bfd2342252fd8b9eba994fdde8b7f"
     },
     {
       "key": "cmuh_common.roster.ledger",
       "remote_path": "src/cmuh_common/roster/ledger.py",
       "local_filename": "src/cmuh_common/roster/ledger.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "bff3f0bfd3e0071f39ce7795de81d6c3550f3344da55036447d76bcbc348e176"
     },
     {
       "key": "cmuh_common.roster.model",
       "remote_path": "src/cmuh_common/roster/model.py",
       "local_filename": "src/cmuh_common/roster/model.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "1895f592bce4b03b6b7a4f84602bd63a1fc8b34272116dc0a53e895bae01313b"
     },
     {
       "key": "cmuh_common.roster.report",
       "remote_path": "src/cmuh_common/roster/report.py",
       "local_filename": "src/cmuh_common/roster/report.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "d1f7b5c9a079ab19fb6095ae22de626e3e18b8bb000bf2d49fe8fe2e5b4597dc"
     },
     {
       "key": "cmuh_common.roster.rules",
       "remote_path": "src/cmuh_common/roster/rules.py",
       "local_filename": "src/cmuh_common/roster/rules.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "9bbbfbf9797dd01f59a9d9133fda26f74d353b8f8e5d0b8b8180c9b2f43c4e71"
     },
     {
       "key": "cmuh_common.roster.service",
       "remote_path": "src/cmuh_common/roster/service.py",
       "local_filename": "src/cmuh_common/roster/service.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "b41037419a091c0ecd46bfebd186481b6ede54fdcf55f372d383f1f548419c8d"
     },
     {
       "key": "cmuh_common.roster.solve_day",
       "remote_path": "src/cmuh_common/roster/solve_day.py",
       "local_filename": "src/cmuh_common/roster/solve_day.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "20728d42bc22aa722d11625bd0f99472ef65738c2a8480e25a28dc3a4e667835"
     },
     {
       "key": "cmuh_common.roster.solve_rvs",
       "remote_path": "src/cmuh_common/roster/solve_rvs.py",
       "local_filename": "src/cmuh_common/roster/solve_rvs.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "88eb2ffa386876825622265df915977563a9797ed95bbda4b7d0a778a46bf9cf"
     },
     {
       "key": "cmuh_common.roster.storage",
       "remote_path": "src/cmuh_common/roster/storage.py",
       "local_filename": "src/cmuh_common/roster/storage.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "669e1801576bf343dfcab77d6d6149240ce1aece4b47fa6dede55bafb5857cd6"
     },
     {
       "key": "cmuh_common.roster.ui.__init__",
       "remote_path": "src/cmuh_common/roster/ui/__init__.py",
       "local_filename": "src/cmuh_common/roster/ui/__init__.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "e1875810c908b793e164042edbd93cbdd03dd11bc1688380b69d67ce4d38ac14"
     },
     {
       "key": "cmuh_common.roster.ui.common",
       "remote_path": "src/cmuh_common/roster/ui/common.py",
       "local_filename": "src/cmuh_common/roster/ui/common.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "62822b87823d7b6436b3863d1126099a8668b95e7e0c52cde56c04ec8dffa32d"
     },
     {
       "key": "cmuh_common.roster.ui.day_tab",
       "remote_path": "src/cmuh_common/roster/ui/day_tab.py",
       "local_filename": "src/cmuh_common/roster/ui/day_tab.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "f8203f3a5d8c42f3af883e2b5b923e14a459ef030b30f13c61cb0459ce8591aa"
     },
     {
       "key": "cmuh_common.roster.ui.duty",
       "remote_path": "src/cmuh_common/roster/ui/duty.py",
       "local_filename": "src/cmuh_common/roster/ui/duty.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "b028777a41d6f0e607e6a9688772548a8de6b9efc63926dda91f7294584a7877"
     },
     {
       "key": "cmuh_common.roster.ui.settings",
       "remote_path": "src/cmuh_common/roster/ui/settings.py",
       "local_filename": "src/cmuh_common/roster/ui/settings.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "f05675afafbd6ab7006889afdebfb3a68316f1228e60b7634b1b8b383b3ece78"
     },
     {
       "key": "cmuh_common.settings_backup",
       "remote_path": "src/cmuh_common/settings_backup.py",
       "local_filename": "src/cmuh_common/settings_backup.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "8853bc66a3a1dfb9f8ad66f57c988dc2cc6a122cb1a824d691bc180e403ffb8e"
     },
     {
       "key": "cmuh_common.single_instance",
       "remote_path": "src/cmuh_common/single_instance.py",
       "local_filename": "src/cmuh_common/single_instance.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "5e466fa69f535534531707f28a322fb7c7bf4a6cc7042524959a12ee1310d319"
     },
     {
       "key": "cmuh_common.smtp_mail",
       "remote_path": "src/cmuh_common/smtp_mail.py",
       "local_filename": "src/cmuh_common/smtp_mail.py",
-      "version": "2026.07.12.5",
-      "sha256": "8161f20df8c93a1abdbd5bd5736d847d4d4efa29fea56bf4dee39da8da2708f6"
+      "version": "2026.07.12.6",
+      "sha256": "a369f3919696530e4707e30e94ad86a1eedb539245250a2e30a485990704837c"
     },
     {
       "key": "cmuh_common.splash",
       "remote_path": "src/cmuh_common/splash.py",
       "local_filename": "src/cmuh_common/splash.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "ce2ec6a6cf0176c86f89359aff800433d88b5c7932fae3872497f3bdd1a42bab"
     },
     {
       "key": "cmuh_common.sqlite_cache",
       "remote_path": "src/cmuh_common/sqlite_cache.py",
       "local_filename": "src/cmuh_common/sqlite_cache.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "4e411ac22ff2bb8cd13cf80c6dcead5b4f5f2835bd93e64abc8bacaa94437875"
     },
     {
       "key": "cmuh_common.task_gate",
       "remote_path": "src/cmuh_common/task_gate.py",
       "local_filename": "src/cmuh_common/task_gate.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "0aff5e8edc43d41b7c544c7e50002c06f7bc4f04027da80296a0c1b88d76121c"
     },
     {
       "key": "cmuh_common.threshold_policy",
       "remote_path": "src/cmuh_common/threshold_policy.py",
       "local_filename": "src/cmuh_common/threshold_policy.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "7cd15eb31314e7ab48309f1f4f5fc37afb42e0c03132a74fe283076d45e1390e"
     },
     {
       "key": "cmuh_common.tk_exception",
       "remote_path": "src/cmuh_common/tk_exception.py",
       "local_filename": "src/cmuh_common/tk_exception.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "18704bd57e4eced6211f2a3ac225b6bcbc028d002b66ead1034f2cdee0543ba2"
     },
     {
       "key": "cmuh_common.ui_messages",
       "remote_path": "src/cmuh_common/ui_messages.py",
       "local_filename": "src/cmuh_common/ui_messages.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "358c4ce8f0ca7fe4b5a2845f8787e1196057a878b3288b44b30bc866281f2440"
     },
     {
       "key": "cmuh_common.ui_utils",
       "remote_path": "src/cmuh_common/ui_utils.py",
       "local_filename": "src/cmuh_common/ui_utils.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "28fbbdb1e9b0e0faa39efa7338e2e9b61cc8a0f70097be07ce096ab1daa1af0c"
     },
     {
       "key": "cmuh_common.update_policy",
       "remote_path": "src/cmuh_common/update_policy.py",
       "local_filename": "src/cmuh_common/update_policy.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "70d63069f5b9d0ec899ac02d8dca953372f87165a81f51c98ef41ca3f8744c7f"
     },
     {
       "key": "cmuh_common.updater",
       "remote_path": "src/cmuh_common/updater.py",
       "local_filename": "src/cmuh_common/updater.py",
-      "version": "2026.07.12.5",
-      "sha256": "4ad8a7c00e0eb5585a06b951b123b6894cfea563d4db0e6eb7ad203c392258cf"
+      "version": "2026.07.12.6",
+      "sha256": "7ce5eaf73209e0abbcd3ffe3711427bbfc3f652ed3abd725a5847e464df49b04"
     },
     {
       "key": "cmuh_common.uvb_dose",
       "remote_path": "src/cmuh_common/uvb_dose.py",
       "local_filename": "src/cmuh_common/uvb_dose.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "0139a17dba470d1e19e85b1ed1619bc535b1533eaa5af69a6d5ef423422a685e"
     },
     {
       "key": "cmuh_common.version",
       "remote_path": "src/cmuh_common/version.py",
       "local_filename": "src/cmuh_common/version.py",
-      "version": "2026.07.12.5",
-      "sha256": "41c725144f8bcbf618547aada21835dda1e3999e0fa376b0d8d0b4a9e55eaac9"
+      "version": "2026.07.12.6",
+      "sha256": "f09aeedf70c13fed81027a1164eb477cc5629ebeae7365b69c739847805cd601"
     },
     {
       "key": "cmuh_common.watchdog_core",
       "remote_path": "src/cmuh_common/watchdog_core.py",
       "local_filename": "src/cmuh_common/watchdog_core.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "9755c56f3967d2600ba3c0a86057b8be62faa0e070fe9ed0325c2b0b1ac096aa"
     },
     {
       "key": "cmuh_common.win32_safe",
       "remote_path": "src/cmuh_common/win32_safe.py",
       "local_filename": "src/cmuh_common/win32_safe.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "e3db27ef9c4d3b23aeb5beac52462cab3fd21d1d64d206f3dfe45a8dc5d9180f"
     },
     {
       "key": "cmuh_common.window_icon",
       "remote_path": "src/cmuh_common/window_icon.py",
       "local_filename": "src/cmuh_common/window_icon.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "ae35320f342c6a2a6d5f7ff5867c8b254399560d43f1d1620469806e6d5ea687"
     },
     {
       "key": "consult_query",
       "remote_path": "src/consult_query.py",
       "local_filename": "src/consult_query.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "e2511bb64fe5fdeb4d00f15315cc63a20b01a7b664ee42456fe27a47f4c73213"
     },
     {
       "key": "coord",
       "remote_path": "src/coord_detector.py",
       "local_filename": "src/coord_detector.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "1586548c2064f477d943481ca6ce35ced06bb72890f05efb96869620d6a4dbe9"
     },
     {
       "key": "main",
       "remote_path": "src/main.py",
       "local_filename": "src/main.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "13dbcf3a2d6826c234b9a026afc670bb0692a7c6047f60ed49725798fe6103a5"
     },
     {
       "key": "scheduler",
       "remote_path": "src/scheduler.py",
       "local_filename": "src/scheduler.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "24880b340b538b15495ce7c8f1b6b0c24180e2e16e7af4f386713e60e6100e4e"
     },
     {
       "key": "watchdog_runner",
       "remote_path": "src/watchdog_runner.py",
       "local_filename": "src/watchdog_runner.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "2c79907c9a353af995a1c42d56482187867327f182e4e757d5a1e28696a0be2a"
     },
     {
       "key": "中國醫皮膚科主程式_pyw",
       "remote_path": "中國醫皮膚科主程式.pyw",
       "local_filename": "中國醫皮膚科主程式.pyw",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "9e72e8eff6d20a85e713a9f2027fe5db2ba61da6646a107c6846de1426c0b5d6"
     },
     {
       "key": "中國醫皮膚科打卡程式_pyw",
       "remote_path": "中國醫皮膚科打卡程式.pyw",
       "local_filename": "中國醫皮膚科打卡程式.pyw",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "b47df2af476302c87265feeb4768ebd9c7d5aeb594631bca1dc73629f5490535"
     },
     {
       "key": "中國醫皮膚科排班程式_pyw",
       "remote_path": "中國醫皮膚科排班程式.pyw",
       "local_filename": "中國醫皮膚科排班程式.pyw",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "caae16d79a1581213cbd4bf7c3e8573a7e220222e717f93f872d2b981549b9f4"
     },
     {
       "key": "中國醫皮膚科會診查詢程式_pyw",
       "remote_path": "中國醫皮膚科會診查詢程式.pyw",
       "local_filename": "中國醫皮膚科會診查詢程式.pyw",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "ee84fabda0988beb0f2af4ace4a2997fb21efea29585bbf3199b35d5d3ed13af"
     },
     {
       "key": "中國醫皮膚科點座標偵測程式_pyw",
       "remote_path": "中國醫皮膚科點座標偵測程式.pyw",
       "local_filename": "中國醫皮膚科點座標偵測程式.pyw",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "5208a1353e5f46e725077ce1ac83f0da1b0c21b7978eba7919e6a4e41e60e11d"
     },
     {
       "key": "中國醫皮膚科守護程式_pyw",
       "remote_path": "中國醫皮膚科守護程式.pyw",
       "local_filename": "中國醫皮膚科守護程式.pyw",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "d1d7b51fd2901ccec45f7841902e09c2b35d455470ea33bbbcfa48bf0f8540f1"
     },
     {
       "key": "安裝開機自動啟動_cmd",
       "remote_path": "安裝開機自動啟動.cmd",
       "local_filename": "安裝開機自動啟動.cmd",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "4263ef5045dbbc38e905b5f1a310d0ef4f989acdb3903f67244c0e6fe34b0da3"
     },
     {
       "key": "安裝開機自動啟動_ps1",
       "remote_path": "安裝開機自動啟動.ps1",
       "local_filename": "安裝開機自動啟動.ps1",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "4ef39bacfbf52401f7a9f268362d7bef6089ccd2fc43d95a9854027c4216c2bf"
     },
     {
       "key": "移除開機自動啟動_cmd",
       "remote_path": "移除開機自動啟動.cmd",
       "local_filename": "移除開機自動啟動.cmd",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "1b53ba875184dc31bab4029ce1bbfae9925fd00a1330d29c60c18565052ca2dd"
     },
     {
       "key": "移除開機自動啟動_ps1",
       "remote_path": "移除開機自動啟動.ps1",
       "local_filename": "移除開機自動啟動.ps1",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "0768b049d837fd5ef2cf6e353c8af861f62024f73c7570be20b8c17f7224f973"
     },
     {
       "key": "清除所有皮膚科排程_cmd",
       "remote_path": "清除所有皮膚科排程.cmd",
       "local_filename": "清除所有皮膚科排程.cmd",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "50816968d5a1da3b2a7456b68ba7073c1fe1702e689f896e9856331850bbb33e"
     },
     {
       "key": "清除所有皮膚科排程_ps1",
       "remote_path": "清除所有皮膚科排程.ps1",
       "local_filename": "清除所有皮膚科排程.ps1",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "7a32602a8a93a090d37d246f6de57a9451e48a52009a9c1d0d1b47904ee06ef0"
     },
     {
       "key": "診斷打卡重複執行_cmd",
       "remote_path": "診斷打卡重複執行.cmd",
       "local_filename": "診斷打卡重複執行.cmd",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "8604232e9d269bf89469240bff045c7556bd9a1d19be5eeb1bf8be092694fb64"
     },
     {
       "key": "診斷打卡重複執行_ps1",
       "remote_path": "診斷打卡重複執行.ps1",
       "local_filename": "診斷打卡重複執行.ps1",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "4c2d9e23f6235b854b6bdb478ec6df8b0d7837ac65aae744130b173e35b1f7d4"
     },
     {
       "key": "清理重複打卡程式_cmd",
       "remote_path": "清理重複打卡程式.cmd",
       "local_filename": "清理重複打卡程式.cmd",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "95ab9766b2bd01c911e666a0114f40839cfbd2065c314cae9836ca5ee5d112ab"
     },
     {
       "key": "清理重複打卡程式_ps1",
       "remote_path": "清理重複打卡程式.ps1",
       "local_filename": "清理重複打卡程式.ps1",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "d287270ef1c113e09ce073b18655aa7b8d1242ba244ac713b649841597c4e8ff"
     },
     {
       "key": "安裝Python_bat",
       "remote_path": "安裝Python.bat",
       "local_filename": "安裝Python.bat",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "50092749c650dec44b7a545ec20b4a4f907a06c700243773037c24b8f15bae47"
     },
     {
       "key": "第一次執行先點我_bat",
       "remote_path": "第一次執行先點我.bat",
       "local_filename": "第一次執行先點我.bat",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "5ec16c9326bee3723f1f4f388aa9cad4688d84170f27483337c962a188d9f7a8"
     },
     {
       "key": "scripts_verify_dependencies_py",
       "remote_path": "scripts/verify_dependencies.py",
       "local_filename": "scripts/verify_dependencies.py",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "3553db262a3be117281d964427da6ecb34e71dc6775d990e82f3b77be2704dec"
     },
     {
       "key": "pull_update_bat",
       "remote_path": "pull_update.bat",
       "local_filename": "pull_update.bat",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "bc21791a0bbc4a1ac3758f9a5e2b7f9922dab54ae9124b9a70f10aa648c573c8"
     },
     {
       "key": "requirements_txt",
       "remote_path": "requirements.txt",
       "local_filename": "requirements.txt",
-      "version": "2026.07.12.5",
+      "version": "2026.07.12.6",
       "sha256": "7b564b58046381960dcbbd929bfe445731ab18baeb08e071eb5de60d49c6b453"
     }
   ]

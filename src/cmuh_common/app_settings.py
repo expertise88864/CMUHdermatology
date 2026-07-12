@@ -2,6 +2,10 @@
 """Application settings loaders shared by the main app and scheduler."""
 from __future__ import annotations
 
+import logging
+import os
+import time
+
 from cmuh_common.atomic_io import atomic_write_json
 from cmuh_common.config_io import (
     clone_default,
@@ -97,6 +101,18 @@ def load_doctors_settings(path: str | None = None) -> list:
     data = load_json_list(target, defaults)
     normalized, fixed = normalize_doctor_rows(data, defaults)
     if fixed:
+        # [IE-11 2026-07-12] 若正規化結果退回預設(原檔形狀全錯被整個丟棄)且原檔確有異於預設的
+        # 內容 → 覆寫前先備份成 .invalid-<ts>,免 OneDrive 還原的舊格式檔被靜默清空無法救回。
+        if normalized == defaults and data != defaults:
+            try:
+                # [codex 2026-07-12] 備份名含 PID,避免同秒兩 process/session 產生同名 .invalid-<ts>
+                # 而第二個覆寫掉第一個的原檔備份;且不覆寫既有備份。
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                dest = f"{target}.invalid-{ts}-{os.getpid()}"
+                if os.path.exists(target) and not os.path.exists(dest):
+                    os.replace(target, dest)
+            except OSError:
+                logging.debug("[doctors] 備份 .invalid 失敗", exc_info=True)
         atomic_write_json(target, normalized)
     return normalized
 

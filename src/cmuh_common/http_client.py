@@ -21,7 +21,10 @@ INTERNAL_HOSTS: set[str] = {
 def is_internal(url: str) -> bool:
     """判斷 URL 是否為已知院內主機（用於決定 SSL verify 策略）。"""
     try:
-        host = urlparse(url).netloc.split(':')[0]
+        # [IF-06 2026-07-12] 用 hostname(自動剝 userinfo/port、無 scheme 較穩)取代
+        # netloc.split(':')[0] —— 後者會被 userinfo 欺騙(如 https://10.20.8.47:x@evil.com
+        # 的 netloc 為 "10.20.8.47:x@evil.com",split(':')[0]="10.20.8.47" 誤判內網→停 SSL verify)。
+        host = (urlparse(url).hostname or "").lower()
         return host in INTERNAL_HOSTS
     except Exception:
         return False

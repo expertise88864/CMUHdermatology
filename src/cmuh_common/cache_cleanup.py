@@ -99,9 +99,26 @@ def cleanup_old_files() -> dict:
             return (now - p.stat().st_mtime) > DAY
         except OSError:
             return False
+    # [IE-08 2026-07-12] tmp 掃描擴到 src 子目錄:updater Phase1 的 .upd.tmp 建在 src/cmuh_common,
+    # 原本只掃 app_dir/settings_dir 掃不到,會無人值守緩慢堆積。
     stats['tmp_files'] = 0
-    for d in (app_dir, settings_dir):
+    for d in (app_dir, app_dir / 'src', app_dir / 'src' / 'cmuh_common',
+              app_dir / 'src' / 'clock', settings_dir):
         stats['tmp_files'] += _scan_and_clean(d, predicate=is_old_tmp, label='tmp_files')
+
+    # [IE-08 2026-07-12] .corrupt-<ts> 救援副本(atomic_io/sqlite_cache 損壞時產生)>30 天清理,
+    # 保留 30 天搶救窗後移除,免堆積。
+    def is_old_corrupt(p: Path) -> bool:
+        if '.corrupt-' not in p.name:
+            return False
+        try:
+            return (now - p.stat().st_mtime) > 30 * DAY
+        except OSError:
+            return False
+    stats['corrupt_files'] = 0
+    for d in (app_dir, settings_dir, app_dir / 'src' / 'cmuh_common'):
+        stats['corrupt_files'] += _scan_and_clean(
+            d, predicate=is_old_corrupt, label='corrupt_files')
 
     # 4. __pycache__ 內 30 天前的 .pyc
     pycache_removed = 0

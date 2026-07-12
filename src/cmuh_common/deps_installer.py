@@ -4,7 +4,7 @@
 外觀行為（首次執行/例行檢查雙文案、進度條）維持原樣。
 [2026-05-29 強化] 安裝失敗不再靜默繼續 → import 崩潰：
   - 收集失敗清單，結束時若有失敗 → 明確 messagebox 報錯 + is_finished 維持
-    False（deps_runtime 會 sys.exit(0) 乾淨退出），不繼續 import 缺套件而崩潰。
+    False（deps_runtime 會 sys.exit(1) 乾淨退出），不繼續 import 缺套件而崩潰。
   - 安裝指令改吃 requirements.txt 的版本 spec（含上限 pin），避免 runtime
     fallback 抓到破壞性新版。
 """
@@ -272,7 +272,7 @@ class DependencyInstaller(tk.Tk):
             self.update_ui(current_progress, f"驗證完成: {pkg_name}")
 
         # [2026-05-29] 有任何套件安裝失敗 → 明確報錯，不靜默繼續導致 import 崩潰。
-        # is_finished 維持 False，deps_runtime 收到後會 sys.exit(0) 乾淨退出。
+        # is_finished 維持 False，deps_runtime 收到後會 sys.exit(1) 乾淨退出。
         if self.failed_libs:
             logging.error("[deps] 安裝失敗清單: %s", self.failed_libs)
             self._run_on_ui_thread(self._show_failure_and_quit)
@@ -305,7 +305,7 @@ class DependencyInstaller(tk.Tk):
             )
         except Exception:
             logging.debug("[deps] 顯示失敗對話框失敗", exc_info=True)
-        # is_finished 保持 False → deps_runtime sys.exit(0)
+        # is_finished 保持 False → deps_runtime sys.exit(1)
         self._request_close()
 
     def update_ui(self, progress: float, status_text: str) -> None:

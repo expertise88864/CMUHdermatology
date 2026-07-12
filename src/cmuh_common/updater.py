@@ -265,6 +265,10 @@ def _fetch_manifest(timeout: float = MANIFEST_TIMEOUT) -> dict:
     resp.raise_for_status()
     resp.encoding = 'utf-8'
     manifest = resp.json()
+    # [IE-05 2026-07-12] manifest 為合法 JSON 但非 dict(如 list)時,下游 .get() 會在 try 外
+    # 拋 AttributeError 逃逸;此處提早驗證,轉成受控錯誤訊息。
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest.json 頂層非物件(dict)")
     if pinned_sha:
         manifest["_remote_commit_sha"] = pinned_sha
         manifest["_remote_commit_sha_from_cache"] = False
@@ -351,6 +355,10 @@ def _download_one(file_entry: dict, app_dir: str) -> Optional[tuple]:
     local_filename = file_entry["local_filename"]
     expected_version = file_entry.get("version", "0.0.0")
     expected_sha = (file_entry.get("sha256") or "").lower().strip()
+    # [IE-06 2026-07-12] manifest 條目缺 sha256 → 不可不校驗就寫入(資料落地 fail-closed)。與
+    # IE-01 同模式:raise 讓整批不更新(現況 sync_manifest 一律產 sha,缺 sha=清單異常)。
+    if not expected_sha:
+        raise ValueError(f"[{key}] manifest 缺 sha256,拒絕不校驗寫入(整批暫不更新)")
 
     local_path = _resolve_target_path(app_dir, local_filename)
 
