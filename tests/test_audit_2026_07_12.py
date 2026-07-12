@@ -125,3 +125,39 @@ def test_u5_confirmed_branch_write_has_stop_gate():
     # 該 log 在 _write_tmemo_text 成功分支內;往上 8 行內須見 check_stop()
     assert any("check_stop()" in lines[j] for j in range(max(0, idx - 8), idx)), \
         "確認後分支寫回前缺 check_stop 閘門(U5)"
+
+
+def _func_body(src, func_def):
+    start = src.find(func_def)
+    assert start != -1, f"找不到 {func_def}"
+    nxt = src.find("\ndef ", start + 1)
+    return src[start:nxt if nxt != -1 else len(src)]
+
+
+# ── U3/UD-01b:卡號(計費欄)寫回前的 F12 閘門 ────────────────────────────────
+def test_u3_card_write_has_stop_gate():
+    src = _main_src()
+    lines = src.splitlines()
+    idx = next((i for i, ln in enumerate(lines)
+                if "_wm_settext_timeout(card_hwnd, result.card)" in ln), None)
+    assert idx is not None, "找不到卡號寫回行"
+    assert any("check_stop()" in lines[j] for j in range(max(0, idx - 6), idx)), \
+        "卡號寫回前缺 check_stop 閘門(U3/UD-01b)"
+
+
+# ── F3:#32770 取不到 HIS 行程 PID 時 fail-closed(不自動按是) ─────────────────
+def test_f3_round4_fail_closed_on_zero_pid():
+    body = _func_body(_main_src(), "def _f9_f10_round4_submit_and_confirm")
+    assert "if not popup_pid:" in body, "round4 缺 popup_pid==0 的 fail-closed 分支(F3)"
+    # fail-closed 分支須在自動 PostMessage IDYES 之前
+    assert body.index("if not popup_pid:") < body.index("IDYES"), \
+        "fail-closed 分支須在自動按是(IDYES)之前(F3)"
+
+
+# ── F1:同意書 popup 只認【本 HIS 行程新開】、排除既有 stale popup ──────────────
+def test_f1_consent_popup_scoped_by_pid_and_exclude():
+    src = _main_src()
+    assert "or_pid = _get_window_pid(or_hwnd)" in src, "未取 HIS 行程 PID(F1)"
+    assert "stale_popup = _find_window_by_class_title" in src, "未快照既有 popup(F1)"
+    assert "require_pid=or_pid" in src, "同意書 popup 查找未帶 require_pid=or_pid(F1)"
+    assert "exclude_hwnd=stale_popup" in src, "同意書 popup 查找未排除 stale_popup(F1)"

@@ -4398,6 +4398,10 @@ def _autofill_卡號_from_醫師上次(label: str = "") -> None:
             # 只用 WM_SETTEXT:同緒、瞬間、不動滑鼠、寫入前後無空窗。計費欄『不』採用
             # click+type 補寫(那會動滑鼠且 click→sleep→type 間有空窗,可能蓋掉別人剛
             # 填的值,風險高於效益)。WM_SETTEXT 對 TEditExt 已於療程欄 production 驗證。
+            # [UD-01b audit 2026-07-12] 寫入計費欄(卡號)前的最終 F12 閘門:OCR/cleanup/gettext
+            # 期間(數秒)F12 不會經過 check_stop → 若不補,取消後仍會寫卡號。此處 raise 由下方
+            # `except SubsystemInterrupted: raise` 傳播,乾淨中止(UD-01 已備妥傳播路徑)。
+            check_stop()
             _wm_settext_timeout(card_hwnd, result.card)
             verify = _wm_gettext_timeout(card_hwnd).strip()
             if verify == result.card:
@@ -4782,7 +4786,10 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
     t_round_start = time.time()
     # [H1 2026-07-09] 取 popup(確定是 HIS 視窗)的 PID,後續只對【同一 HIS 行程】的
     # #32770 對話框自動按「是」—— 避免 10s 等待窗內別的程式跳出的標準對話框(存檔/刪除/
-    # 警告)被誤按「是」而造成文書/資料事故。popup_pid=0(取不到)時退回舊行為。
+    # 警告)被誤按「是」而造成文書/資料事故。
+    # [F3 audit 2026-07-12] PID 取不到改 fail-closed(原本退回舊 fail-open 行為):require_pid=0
+    # 會對【任一行程】的 #32770 自動按是,萬一是別程式的存檔/刪除框即釀事故。popup_hwnd 歷經
+    # round1-3 必為有效視窗,取不到 PID 幾乎不可能;真發生時不自動確認、交醫師手動按「是」。
     popup_pid = _get_window_pid(popup_hwnd)
     # Step A: 點 popup 內的 開立電子 button (async)
     if not _click_button_by_text(popup_hwnd, "開立電子"):
@@ -4791,6 +4798,11 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
     t_clicked = time.time()
     logging.info("[%s] 已點 popup 開立電子 (+%.0fms)，等警告對話框",
                   label, (t_clicked - t_round_start) * 1000)
+    if not popup_pid:
+        logging.warning(
+            "[%s] 無法取得同意書 popup 的 HIS 行程 PID → 不自動確認 #32770 警告框"
+            "(fail-closed,避免誤按別程式對話框),請醫師手動按「是」", label)
+        return True
 
     # Step B: 等警告對話框出現 (class #32770)
     # title 可能是 "警告" 或其他變體，用 class 即可
@@ -5662,6 +5674,11 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
     _sleep_interruptible(0.2)
 
     # Step 5: 點 同意書視窗的 開立電子 按鈕
+    # [F1 audit 2026-07-12] 點擊前先記下本 HIS 行程 PID + 既有 Tfm_agree popup:之後只認
+    # 【本 HIS 行程新開】的同意書 popup,避免選到殘留(前一份沒關)或別行程/別 HIS 實例的
+    # 同一 class 同標題 popup,而對錯病人清欄位+送出。
+    or_pid = _get_window_pid(or_hwnd)
+    stale_popup = _find_window_by_class_title("Tfm_agree", title_kw="列印同意")
     # 先試 target_sheet (若按鈕在分頁內)，找不到再用 or_hwnd (按鈕通常在
     # TOrMain 底層 panel 不在 tab 頁內)
     if not _click_button_by_text(target_sheet, "開立電子"):
@@ -5681,9 +5698,11 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
     age_dlg_handled = False
     popup_deadline = time.time() + 60
     while time.time() < popup_deadline:
-        # 先檢查目標 popup
+        # 先檢查目標 popup(只認本 HIS 行程新開、且非點擊前既有的 stale popup)
         candidate = _find_window_by_class_title("Tfm_agree",
-                                                  title_kw="列印同意")
+                                                  title_kw="列印同意",
+                                                  exclude_hwnd=stale_popup,
+                                                  require_pid=or_pid)
         if candidate:
             popup = candidate
             break
