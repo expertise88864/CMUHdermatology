@@ -1541,8 +1541,14 @@ def _send_chars_to_window(hwnd: int, text: str) -> bool:
         return False
     WM_CHAR = 0x0102
     try:
+        user32 = ctypes.windll.user32
         for ch in text:
-            ctypes.windll.user32.PostMessageW(hwnd, WM_CHAR, ord(ch), 0)
+            # [UD-12 2026-07-12] 逐字前確認視窗仍在:編輯器中途被關(hwnd 失效)即中止回 False,交
+            # caller 走警示,避免代碼欄殘留半截醫令(原本不論如何一律回 True)。
+            if not user32.IsWindow(hwnd):
+                logging.warning("[send_chars] 目標視窗中途消失,中止(已送部分字元)")
+                return False
+            user32.PostMessageW(hwnd, WM_CHAR, ord(ch), 0)
             time.sleep(0.02)  # 給 Delphi 依序處理（非同步下保險）
         return True
     except Exception:
@@ -1829,7 +1835,10 @@ def _show_uvb_warning(main_hwnd: int, title: str, msg: str) -> None:
     try:
         # MB_ICONWARNING(0x30) | MB_TOPMOST(0x40000) | MB_SETFOREGROUND(0x10000)
         flags = 0x30 | 0x40000 | 0x10000
-        ctypes.windll.user32.MessageBoxW(main_hwnd, msg, title, flags)
+        # [UD-13 2026-07-12] 阻塞對話框期間標記「等待使用者」,watchdog 不誤報 keep_stuck
+        # (比照 _photo_confirm_yesno)。
+        with _hotkey_awaiting_user_scope():
+            ctypes.windll.user32.MessageBoxW(main_hwnd, msg, title, flags)
     except Exception:
         logging.debug("MessageBox 例外", exc_info=True)
 
@@ -2410,6 +2419,15 @@ def _update_uvb_dose_core(label: str, *, strict: bool):
 
     # 寫回後實機 read 驗證 — Delphi onChange 可能 reformat 過
     actual_text = _read_tmemo_text(memo_hwnd)
+    if not actual_text:
+        # [UD-08 2026-07-12] read-back 讀回空字串(HIS 卡頓/WM_GETTEXT 逾時)→ 無法驗證寫回是否
+        # 成功。保守中止(strict):避免「寫回其實失敗但 51019 照下」的反向不一致無人把關;已跳警告
+        # 請醫師手動核對(原本空字串會靜默跳過 verify、照樣續跑 51019)。
+        logging.warning("[%s][UVB] 寫回後 read-back 空字串,無法驗證 → 保守中止", label)
+        _show_uvb_warning(
+            main_hwnd, "UVB 寫回無法驗證",
+            f"{label} 寫回後讀不到處置內容,無法確認是否成功。\n請醫師手動核對後再送出。")
+        return False
     if actual_text:
         from cmuh_common.uvb_dose import (
             parse_uvb_line, parse_uvb_partial, uvb_written_back_ok)
