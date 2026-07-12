@@ -1613,12 +1613,18 @@ def _count_uvb_lines(text: str) -> int:
 
 
 def _detect_uncertain_triplets(text: str, today: date,
-                                max_days_ago: int = 365) -> list:
+                                max_days_ago: int = 365,
+                                driver_max_dose: int = 0) -> list:
     """[v20.13] 偵測 text 中「看起來像 UVB/excimer 但日期不同於今天」的 triplet。
 
     使用情境：update_uvb_in_text 第一行 UVB 已更新，同日期 triplet 也更新後，
     剩下的 (count) ... (date) 若有 UVB-marker 又日期合理 (近 1 年內)，
     視為「不確定該不該更新」，caller 應該跳 Yes/No 詢問醫師。
+
+    [UC-07 2026-07-12] driver_max_dose(選填)=驅動行 MAX。capped(緊鄰該 triplet
+    前方的劑量 >= 適用 MAX)且已進 decay 區間(>SAME_DOSE_DAYS)的段一律排除 ——
+    不問醫師、留原樣(Yes 套用是 kept-dose bump,會把未衰退劑量標成今天),
+    與 Step C 的不-bump 守衛成對,見迴圈內註解。
 
     Returns list of dicts:
         [{'line': str, 'count': int, 'date': date, 'days_ago': int,
@@ -1660,6 +1666,26 @@ def _detect_uncertain_triplets(text: str, today: date,
             continue
         if not (1 <= old_count <= MAX_COUNT):
             continue
+        # [UC-07 2026-07-12] capped(緊鄰劑量 >= 適用 MAX)且已進 decay 區間(>7 天)的段:
+        # 「Yes 套用」只 bump count/date、【不重算劑量】(kept-dose)→ 會把未衰退劑量標成
+        # 今天(獨立算應 ×0.75/×0.5)。Step C 已同步不 bump 這類段;此處一併排除、留原樣
+        # 交醫師手動,免得 Step C 跳過後又經 uncertain-Yes 寫回(codex 指出的交互)。
+        # (codex P1:不可 parse 整行拿 primary dose 判 capped —— 同一行 primary 500<800
+        #  + 續行 800 capped 會誤放行;須逐 triplet 取「緊鄰該 triplet 前方的劑量」,
+        #  比照 Step C continuation_m/guard_dose_m 的作法、用同款寬單位 regex。)
+        # 適用 MAX=該行自己的 MAX;行內無 MAX(parse 失敗)時退驅動行 MAX —— Step C 正是
+        # 拿驅動行 MAX 判 capped 而跳過的,不退則同款段仍會從這裡漏回寫。其餘 uncertain
+        # 行為(dose<其行 MAX 的第二療程行、無緊鄰劑量的 excimer 行)不變。
+        if days_ago > SAME_DOSE_DAYS:
+            dose_prefix = text[max(line_start, m.start() - 32):m.start()]
+            trip_dose_m = re.search(
+                r"(\d+)\s*mj(?:/cm2?)?\s*$", dose_prefix, re.IGNORECASE)
+            if trip_dose_m is not None:
+                _lp = parse_uvb_line(line_text) or parse_uvb_partial(line_text)
+                _applicable_max = ((_lp.max_dose if _lp is not None else 0)
+                                   or driver_max_dose)
+                if _applicable_max and int(trip_dose_m.group(1)) >= _applicable_max:
+                    continue
         # [2026-06-19] 只有當這個 (count) 緊鄰前方【就是】一個日期(中間只隔標點/空白,
         # 典型主行更新後格式 "on(date), (count)")才跳過 —— 代表 count 已有自己的日期
         # partner,不該再跟後方 120 字內別欄位的日期(例如 "acitretin w7-9 on (date)")
@@ -2219,7 +2245,7 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
     # Step A 已經把第一行 triplet 的 date 改成 today，所以這裡掃描 working text
     # 時，第一行的 triplet 不會匹配 parsed.last_date，自動跳過。
     # 只更新 count + date，不動 segment 內 dose (continuation 通常 fixed at MAX
-    # 不會變；若要 dose decay，後續再加)。
+    # 不會變；[UC-07] 跨日期且進入 decay 區間者不 bump、留原樣交醫師,見迴圈內守衛)。
     triplet_edits = []
     for m in _TRIPLET_RE.finditer(working):
         try:
@@ -2261,6 +2287,14 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
                 continue
         seg_days_diff = (today - seg_date).days
         if seg_days_diff < TOO_CLOSE_DAYS or seg_days_diff > MAX_GAP_DAYS:
+            continue
+        # [UC-07 2026-07-12] 跨日期續行且已進入 decay 區間(>SAME_DOSE_DAYS):其劑量==本行
+        # MAX 只是「已達上限」,不代表今天仍可照原劑量(當獨立劑量算應衰退,例:14 天前
+        # 800→應 ×0.75=600)。醫療保守=不靜默 bump 成今天,留原樣交醫師;且下方
+        # _detect_uncertain_triplets 以同款 capped 判定排除、不進 Yes/No(否則醫師按 Yes
+        # 仍 kept-dose 寫回未衰退值 —— codex 指出的交互)。同日期續行(共用驅動行日期)與
+        # ≤SAME_DOSE_DAYS(不需衰退,keep/加量 cap MAX 結果同 kept-dose)不受影響。
+        if seg_date != parsed.last_date and seg_days_diff > SAME_DOSE_DAYS:
             continue
         # [2026-06-24] 略過「與驅動行【不同日期】且早於 1 個月」的舊段 triplet —— 那是另一筆
         # 要忽略的舊紀錄,避免其劑量剛好等於驅動行 MAX 時被當「安全續行」誤改 count/date。
@@ -2354,7 +2388,8 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
     # 例：line 1 是 excimer (37) (2026/5/22), line 2 是 UVB ... (2026/5/24)
     # Step A 處理 line 2 (UVB)，Step C 因日期不同沒動 line 1。
     # 但醫師可能希望 line 1 也一起更新 — 跳 Yes/No 給醫師決定。
-    uncertain_others = _detect_uncertain_triplets(new_text, today)
+    uncertain_others = _detect_uncertain_triplets(
+        new_text, today, driver_max_dose=parsed.max_dose)
 
     return UvbUpdateResult(
         action=UvbAction.UPDATED,
