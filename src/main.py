@@ -7829,7 +7829,8 @@ class AutomationApp:
               .exe / chrome_native_messaging_host 等。比 driver.quit() 快 10x
               (taskkill 100ms vs Chrome graceful shutdown 1-2s)。
 
-        只 kill「父進程是本程式」的，避免誤殺其他 Chrome。
+        [MG-04] kill「父進程是本程式」或「父進程已死的真孤兒」chromedriver（後者=前次崩潰殘留）;
+        父進程存活且非本程式者不動,避免誤殺其他 Chrome。
         """
         try:
             import psutil
@@ -7844,7 +7845,10 @@ class AutomationApp:
                     if 'chromedriver' not in n:
                         continue
                     ppid = p.info.get('ppid', 0)
-                    if ppid == my_pid:
+                    # [MG-04 2026-07-12] 除本程式直屬子 chromedriver 外,也收「父行程已不存在」的真
+                    # 孤兒(前次崩潰殘留、父已死);診間機的 chromedriver 皆來自本套件自動化,父已死者
+                    # 即洩漏行程(~150MB)。用 pid_exists 保守判定(PID 被重用→存在→不誤殺)。
+                    if ppid == my_pid or (ppid and not psutil.pid_exists(ppid)):
                         to_kill.append(p)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
@@ -8746,8 +8750,10 @@ class AutomationApp:
             item = self.doctors_tree.item(item_id)
             doc_no, name = item['values'] 
             existing_doctor = next((doc for doc in self.doctors_list if doc['name'] == name), None)
-            notifications = existing_doctor['notifications'] if existing_doctor else False
-            new_doctors_list.append({"name": name, "doc_no": doc_no, "notifications": notifications})
+            # [MG-03 2026-07-12] Treeview 對純數字代號回 int → str() 統一;notifications 缺鍵改 .get
+            # 兜底(原本下標缺鍵 KeyError 會讓 doctors.json 沒寫成,但 r_doctor/threshold 已寫=半套且無提示)。
+            notifications = existing_doctor.get('notifications', False) if existing_doctor else False
+            new_doctors_list.append({"name": name, "doc_no": str(doc_no), "notifications": notifications})
         
         self.doctors_list = new_doctors_list
         _atomic_write_json(get_conf_path('doctors.json'), self.doctors_list)
