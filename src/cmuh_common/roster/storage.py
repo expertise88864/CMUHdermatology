@@ -240,6 +240,38 @@ class RosterStorage:
         data["saved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self._save(path, data)
 
+    def iter_month_yms(self) -> list:
+        """回傳 months/ 內所有月份檔的 'YYYY-MM'（升冪）。供跨全部月份的維護作業
+        （例如成員代號連動改名）列舉；glob '*.json' 不會掃到 '.bak-<ts>' 快照。"""
+        out = []
+        for p in glob.glob(os.path.join(self.months_dir, "*.json")):
+            stem = os.path.basename(p)[:-5]            # 去掉 '.json'
+            if len(stem) == 7 and stem[4] == "-" and stem[:4].isdigit() \
+                    and stem[5:].isdigit():
+                out.append(stem)
+        return sorted(out)
+
+    def assert_readable(self, name: str) -> None:
+        """嚴格檢查某檔可正確解析；存在但壞掉/讀不到 → 拋 ValueError。
+
+        name：相對 base_dir 的檔名（如 'ledger.json'）或絕對路徑（月檔用 _month_path 傳入）。
+        用途：跨檔維護作業（如 rename_member 連動改代號）寫入【前】的預檢——一般 load_* 用的
+        _load_json 會把壞檔/鎖檔靜默當空 dict，交易式改名若照寫會用空白覆蓋壞檔而【靜默清空】
+        帳本/月檔。改名前逐檔跑這個，壞檔就中止整個改名、要求先修復。"""
+        path = name if os.path.isabs(name) else self._path(name)
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            raise ValueError(
+                f"{os.path.basename(path)} 損壞或無法讀取（{e}）") from e
+        # [codex P1] 非物件頂層（如 []）雖能 parse，但 _load_json 會把它當空 dict → 仍會被空白覆蓋。
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"{os.path.basename(path)} 頂層不是 JSON 物件（{type(data).__name__}）")
+
     # ── 跨月銜接輔助 ─────────────────────────────────────────────────────
     def prev_month_last_weekend(self, ym: str, scope: str) -> Optional[tuple]:
         """讀上月檔的「最後週末」摘要 → (saturday_date, member_id) 或 None。

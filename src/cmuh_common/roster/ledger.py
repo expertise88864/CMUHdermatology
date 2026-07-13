@@ -73,12 +73,22 @@ def rollback_month(ledger: dict, scope: str, month: str) -> bool:
 
 
 def reset_member(ledger: dict, scope: str, member_id: str) -> None:
-    """人員異動（離職/新人）→ 餘額歸零（歷史分錄保留供追溯）。"""
+    """人員異動（離職/新人）→ 餘額歸零，並清掉該員在本 scope history 的 deltas。
+
+    [RF-21 2026-07-13] 與 sync_members 的 RF-14 同因：餘額歸零但 history 分錄留著
+    → 打破「餘額 = history deltas 總和」不變式 → 之後【同月 resettle】時 rollback 會
+    從已歸零的餘額憑空再扣一次舊 delta，settle 再加回新 delta——若排班沒變就完全抵銷
+    （多值一班的人帳本永遠顯示 0），變了就生成幻影 ±（實測 2026-08 vs 換人重排後
+    D:+1.0/R:-1.0，真實應為 +0.8/-0.2）。歸零＝該員過往貢獻一併作廢，deltas 必須同步
+    清掉（只清本 scope，同 id 可能存在另一 scope）。"""
     book = ledger.setdefault(scope, {})
     if member_id in book and book[member_id]:
         logging.info("[roster.ledger] %s/%s 帳本 %.2f → 0（人員異動歸零）",
                      scope, member_id, book[member_id])
     book[member_id] = 0.0
+    for e in (ledger.get("history") or []):
+        if e.get("scope") == scope:
+            (e.get("deltas") or {}).pop(member_id, None)
 
 
 def sync_members(ledger: dict, scope: str, member_ids: list) -> None:

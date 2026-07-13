@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import time
@@ -771,6 +772,190 @@ class RosterService:
 
     def set_must(self, scope: str, ym: str, member_id: str, dates) -> None:
         self._set_date_map(scope, ym, "must_duty", member_id, dates)
+
+    def rename_member(self, scope: str, old_id: str, new_id: str) -> int:
+        """把某 scope 成員的代號 old_id 連動改成 new_id（跨所有資料一次到位）。回傳異動處數。
+
+        代號是帳本/值班/請假/切片計數的主鍵，單改名單會讓其餘資料仍指向舊鍵而斷鏈，故集中在本層
+        一次改齊：config 名單、ledger（餘額+本 scope history deltas）、【所有月份】的 duty.person /
+        leaves[scope] / must_duty[scope] / last_weekend[scope].person（含已定案月 → force）、
+        holiday_duty[scope] 指定值、R 專屬 saturday_biopsy.person 與 biopsy.json（counts+history）。
+
+        [codex] 交易式：先【全部載入】（各檔的 schema/讀取檢查在此就炸，尚未寫任何檔）＋守門，再於
+        記憶體改好，最後逐檔寫；任一寫入失敗即【回滾】已寫的檔，不留半套改名。guard：new_id 去空白
+        後不可空、不可撞現有成員，且不可已存在於任何「以 id 為鍵」的歷史資料（帳本餘額/分錄/切片
+        計數/請假/指定）→ 避免蓋掉離職者的歷史紀錄。
+        """
+        old_id = str(old_id)
+        new_id = str(new_id).strip()
+        if not new_id:
+            raise ValueError("新代號不可空白")
+        if new_id == old_id:
+            return 0
+
+        # ── Phase 1：全部載入（讀取/schema 錯誤在此就炸，尚未寫任何檔）＋守門 ──────────
+        # [codex P1] 先嚴格預檢每個要改寫的檔：storage 一般 load_* 用的 _load_json 會把壞檔/鎖檔
+        # 靜默當成空 dict，交易式改名若照寫就會用【空白覆蓋】壞檔而靜默清空帳本/月檔。壞檔 → 中止。
+        yms = self.storage.iter_month_yms()
+        preflight = ["config.json", "ledger.json", "holiday_duty.json"]
+        if scope == "r":
+            preflight.append("biopsy.json")
+        for name in preflight:
+            self.storage.assert_readable(name)
+        for ym in yms:
+            self.storage.assert_readable(self.storage._month_path(ym))
+
+        cfg = self.storage.load_config()
+        members = cfg.get(f"{scope}_members") or []
+        ids = [str(m.get("id")) for m in members]
+        if old_id not in ids:
+            raise ValueError(f"{scope.upper()} 名單中找不到代號 {old_id}")
+        if new_id in ids:
+            raise ValueError(f"代號 {new_id} 已存在於 {scope.upper()} 名單，不可重複")
+        ledger = self.storage.load_ledger()
+        holiday = self.storage.load_holiday_duty()
+        biopsy = self.storage.load_biopsy() if scope == "r" else None
+        months = {ym: self.storage.load_month(ym) for ym in yms}
+
+        # [codex] new_id 必須是「全新」代號：不可已出現在任何歷史資料——無論當【鍵】(帳本/切片
+        # 計數/請假指定，覆蓋會蓋掉離職者紀錄) 或當【值】(值班/國定假日/last_weekend/週六切片/切片
+        # 分錄的 person，混用會讓 old_id 與某離職者 new_id 的歷史混為一人無法辨識)。
+        clashes = set()
+        if new_id in (ledger.get(scope) or {}):
+            clashes.add("帳本餘額")
+        for e in (ledger.get("history") or []):
+            if e.get("scope") == scope and new_id in (e.get("deltas") or {}):
+                clashes.add("帳本分錄")
+        if scope == "r":
+            if new_id in ((biopsy or {}).get("counts") or {}):
+                clashes.add("切片計數")
+            for e in ((biopsy or {}).get("history") or []):
+                if new_id in (e.get("assign") or {}).values():
+                    clashes.add("切片分錄")
+        if new_id in (holiday.get(scope) or {}).values():
+            clashes.add("國定假日指定")
+        for m in months.values():
+            for mk in ("leaves", "must_duty"):
+                if new_id in ((m.get(mk) or {}).get(scope) or {}):
+                    clashes.add("請假/指定")
+            for cell in (m.get(f"{scope}_duty") or {}).values():
+                if cell.get("person") == new_id:
+                    clashes.add("值班紀錄")
+            if ((m.get("last_weekend") or {}).get(scope) or {}).get("person") == new_id:
+                clashes.add("last_weekend")
+            if scope == "r":
+                for cell in (m.get("saturday_biopsy") or {}).values():
+                    if cell.get("person") == new_id:
+                        clashes.add("週六切片")
+        if clashes:
+            raise ValueError(
+                f"代號 {new_id} 已出現在歷史資料（{'、'.join(sorted(clashes))}），"
+                f"為免與離職者紀錄混同，請改用全新代號")
+
+        # 回滾用原內容（deepcopy 必須在改動【之前】拍下）
+        snap = {"config": copy.deepcopy(cfg), "ledger": copy.deepcopy(ledger),
+                "holiday": copy.deepcopy(holiday),
+                "biopsy": copy.deepcopy(biopsy) if biopsy is not None else None,
+                "months": {ym: copy.deepcopy(m) for ym, m in months.items()}}
+
+        # ── Phase 2：記憶體改好（收集待寫檔）──────────────────────────────────────
+        changed = 0
+        for m in members:                                   # 1) config 名單
+            if str(m.get("id")) == old_id:
+                m["id"] = new_id
+                changed += 1
+        book = ledger.setdefault(scope, {})                 # 2) ledger 餘額 + 本 scope deltas
+        if old_id in book:
+            book[new_id] = book.pop(old_id)
+            changed += 1
+        for e in (ledger.get("history") or []):
+            if e.get("scope") == scope:
+                deltas = e.get("deltas") or {}
+                if old_id in deltas:
+                    deltas[new_id] = deltas.pop(old_id)
+                    changed += 1
+        sub = holiday.get(scope) or {}                      # 5) holiday_duty[scope] 指定值
+        holiday_changed = False
+        for d, mid in list(sub.items()):
+            if mid == old_id:
+                sub[d] = new_id
+                changed += 1
+                holiday_changed = True
+        biopsy_changed = False
+        if scope == "r":                                    # 4) biopsy.json
+            counts = biopsy.get("counts") or {}
+            if old_id in counts:
+                counts[new_id] = counts.pop(old_id)
+                changed += 1
+                biopsy_changed = True
+            for e in (biopsy.get("history") or []):
+                assign = e.get("assign") or {}
+                for iso, mid in list(assign.items()):
+                    if mid == old_id:
+                        assign[iso] = new_id
+                        changed += 1
+                        biopsy_changed = True
+        touched_months = []                                 # 3) 所有月份
+        for ym, month in months.items():
+            touched = False
+            for cell in (month.get(f"{scope}_duty") or {}).values():
+                if cell.get("person") == old_id:
+                    cell["person"] = new_id
+                    touched = True
+                    changed += 1
+            for mapkey in ("leaves", "must_duty"):
+                sm = (month.get(mapkey) or {}).get(scope) or {}
+                if old_id in sm:
+                    sm[new_id] = sm.pop(old_id)
+                    touched = True
+                    changed += 1
+            lw = (month.get("last_weekend") or {}).get(scope) or {}
+            if lw.get("person") == old_id:
+                lw["person"] = new_id
+                touched = True
+                changed += 1
+            if scope == "r":
+                for cell in (month.get("saturday_biopsy") or {}).values():
+                    if cell.get("person") == old_id:
+                        cell["person"] = new_id
+                        touched = True
+                        changed += 1
+            if touched:
+                touched_months.append(ym)
+
+        # ── Phase 3：逐檔寫入；任一失敗即回滾已寫的檔（不留半套改名）──────────────────
+        writes = [("config", cfg, snap["config"],
+                   lambda d: self.storage.save_config(d)),
+                  ("ledger", ledger, snap["ledger"],
+                   lambda d: self.storage.save_ledger(d))]
+        if holiday_changed:
+            writes.append(("holiday", holiday, snap["holiday"],
+                           lambda d: self.storage.save_holiday_duty(d)))
+        if biopsy_changed:
+            writes.append(("biopsy", biopsy, snap["biopsy"],
+                           lambda d: self.storage.save_biopsy(d)))
+        for ym in touched_months:
+            writes.append((f"month:{ym}", months[ym], snap["months"][ym],
+                           (lambda y: lambda d: self.storage.save_month(
+                               y, d, force=True))(ym)))
+        done = []
+        try:
+            for _label, new_data, old_data, save_fn in writes:
+                save_fn(new_data)
+                done.append((old_data, save_fn))
+        except Exception:
+            logging.exception("[roster.service] 改名寫入失敗，回滾已寫的 %d 檔", len(done))
+            for old_data, save_fn in reversed(done):
+                try:
+                    save_fn(old_data)
+                except Exception:
+                    logging.exception("[roster.service] 改名回滾失敗，資料可能半套，"
+                                      "請從 .bak 快照人工還原")
+            raise
+
+        logging.info("[roster.service] 代號連動改名 %s/%s → %s（%d 處）",
+                     scope, old_id, new_id, changed)
+        return changed
 
     def resettle_from_duty(self, scope: str, ym: str) -> dict:
         """以目前月檔『實際排班』（含手動調整/換班）重算該 scope 帳本。

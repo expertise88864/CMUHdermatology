@@ -145,6 +145,56 @@ def test_rf14_sync_members_scope_isolated_history():
     assert any("a" in (e.get("deltas") or {}) for e in vs_hist)  # vs 的 a 未被誤清
 
 
+def test_rf21_reset_member_purges_history_deltas():
+    """RF-21：歸零＝餘額+該員 history deltas 一併作廢（RF-14 同因跟進）。"""
+    led = {"r": {}, "vs": {}, "history": []}
+    lg.settle_month(led, "vs", "2026-08", {"D": 6, "R": 7, "S": 6, "L": 6, "T": 6})
+    lg.reset_member(led, "vs", "R")
+    assert led["vs"]["R"] == 0.0
+    for e in led["history"]:
+        if e.get("scope") == "vs":
+            assert "R" not in (e.get("deltas") or {}), "歸零後 history deltas 應清掉"
+
+
+def test_rf21_zero_all_then_same_month_resettle_shows_extra_shift():
+    """RF-21 使用者實測情境①：全員歸零→同月(排班沒變)重算 → 多值一班者必須顯示 +0.8,
+    不得因 rollback 憑空再扣舊 delta 而與 settle 抵銷成全 0(=「點數沒有變動」)。"""
+    led = {"r": {}, "vs": {}, "history": []}
+    pts = {"D": 6, "R": 7, "S": 6, "L": 6, "T": 6}    # R 多值一班(平日 1 點)
+    lg.settle_month(led, "vs", "2026-08", pts)
+    assert led["vs"]["R"] == 0.8
+    for mid in pts:                                    # 全員歸零(設定頁逐一按)
+        lg.reset_member(led, "vs", mid)
+    assert all(v == 0.0 for v in led["vs"].values())
+    lg.settle_month(led, "vs", "2026-08", pts)         # 定案/重算帳本(排班沒變)
+    assert led["vs"]["R"] == 0.8, "多值一班者帳本應 +0.8,不得被舊分錄抵銷成 0"
+    assert led["vs"]["D"] == -0.2
+
+
+def test_rf21_zero_all_then_swap_resettle_no_phantom():
+    """RF-21 使用者實測情境②：全員歸零→同月換人多值重排 → 應得真實 ±0.8/∓0.2,
+    不得生成幻影 ±1.0(舊 bug:D:+1.0/R:-1.0)。"""
+    led = {"r": {}, "vs": {}, "history": []}
+    lg.settle_month(led, "vs", "2026-08",
+                    {"D": 6, "R": 7, "S": 6, "L": 6, "T": 6})   # 先 R 多值
+    for mid in ("D", "R", "S", "L", "T"):
+        lg.reset_member(led, "vs", mid)
+    lg.settle_month(led, "vs", "2026-08",
+                    {"D": 7, "R": 6, "S": 6, "L": 6, "T": 6})   # 改 D 多值
+    assert led["vs"]["D"] == 0.8, "換 D 多值應 +0.8,不得幻影 +1.0"
+    assert led["vs"]["R"] == -0.2, "R 應 -0.2,不得被冤枉成 -1.0"
+
+
+def test_rf21_reset_member_scope_isolated():
+    """RF-21：只清本 scope；另一 scope 同 id 的 deltas 保留(比照 RF-14)。"""
+    led = {"r": {}, "vs": {}, "history": []}
+    lg.settle_month(led, "r", "2026-08", {"a": 16, "b": 12})
+    lg.settle_month(led, "vs", "2026-08", {"a": 10, "b": 6})
+    lg.reset_member(led, "r", "a")
+    vs_hist = [e for e in led["history"] if e.get("scope") == "vs"]
+    assert any("a" in (e.get("deltas") or {}) for e in vs_hist)
+
+
 def test_ledger_history_trimmed_to_keep_months():
     """[OPT-4] history 只留近 HISTORY_KEEP_MONTHS 個月，不無限膨脹（餘額不受影響）。"""
     led = {"r": {}, "vs": {}, "history": []}

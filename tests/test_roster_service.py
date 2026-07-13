@@ -412,3 +412,183 @@ def test_rp3_10a_save_ledger_snapshots(tmp_path):
     st.save_ledger({"r": {"A": 2.0}, "vs": {}, "history": []})   # 第二次寫入前留快照
     p = st._path("ledger.json")
     assert glob.glob(f"{p}.bak-*")
+
+
+# ─── rename_member（代號連動改名，2026-07-13 使用者需求）───────────────────────
+def _rename_storage(tmp_path):
+    st = RosterStorage(str(tmp_path))
+    st.save_config({
+        "r_members": [{"id": "K", "name": "老K"}, {"id": "C", "name": "小C"}],
+        "vs_members": [{"id": "R", "name": "VS-R"}],
+        "points": {"weekday": 1, "weekend": 2, "national_holiday": 1},
+        "duty_range_soft": [9, 11],
+    })
+    return st
+
+
+def test_iter_month_yms(tmp_path):
+    st = RosterStorage(str(tmp_path))
+    for ym in ("2026-08", "2026-07", "2026-12"):
+        st.save_month(ym, {})
+    assert st.iter_month_yms() == ["2026-07", "2026-08", "2026-12"]
+
+
+def test_rename_member_cascades_everywhere(tmp_path):
+    st = _rename_storage(tmp_path)
+    svc = RosterService(st)
+    st.save_ledger({
+        "r": {"K": 1.5, "C": -1.5}, "vs": {"K": 9.9},
+        "history": [
+            {"month": "2026-08", "scope": "r", "deltas": {"K": 1.5, "C": -1.5}},
+            {"month": "2026-08", "scope": "vs", "deltas": {"K": 9.9}},   # 另一 scope 同 id
+        ]})
+    st.save_month("2026-08", {
+        "r_duty": {"2026-08-01": {"person": "K"}, "2026-08-02": {"person": "C"}},
+        "leaves": {"r": {"K": ["2026-08-10"]}, "vs": {"K": ["2026-08-11"]}},
+        "must_duty": {"r": {"K": ["2026-08-05"]}},
+        "saturday_biopsy": {"2026-08-01": {"person": "K", "reason": "值班連動"}},
+        "last_weekend": {"r": {"saturday": "2026-08-29", "person": "K"}},
+    })
+    st.save_biopsy({"counts": {"K": 3, "C": 2},
+                    "history": [{"month": "2026-08", "assign": {"2026-08-01": "K"}}]})
+    st.save_holiday_duty({"r": {date(2026, 8, 15): "K"},   # 國定假日指定 K 值班
+                          "vs": {date(2026, 8, 15): "K"}})  # 另一 scope 同 id → 不動
+
+    n = svc.rename_member("r", "K", "K2")
+    assert n > 0
+
+    cfg = st.load_config()
+    assert [m["id"] for m in cfg["r_members"]] == ["K2", "C"]
+    led = st.load_ledger()
+    assert led["r"] == {"K2": 1.5, "C": -1.5}
+    r_hist = next(h for h in led["history"] if h["scope"] == "r")
+    assert r_hist["deltas"] == {"K2": 1.5, "C": -1.5}
+    vs_hist = next(h for h in led["history"] if h["scope"] == "vs")
+    assert vs_hist["deltas"] == {"K": 9.9}                 # 另一 scope 的同 id 不動
+    assert led["vs"] == {"K": 9.9}                         # vs 餘額不動
+    m = st.load_month("2026-08")
+    assert m["r_duty"]["2026-08-01"]["person"] == "K2"
+    assert m["r_duty"]["2026-08-02"]["person"] == "C"
+    assert m["leaves"]["r"] == {"K2": ["2026-08-10"]}
+    assert m["leaves"]["vs"] == {"K": ["2026-08-11"]}      # vs scope 不動
+    assert m["must_duty"]["r"] == {"K2": ["2026-08-05"]}
+    assert m["saturday_biopsy"]["2026-08-01"]["person"] == "K2"
+    assert m["last_weekend"]["r"]["person"] == "K2"
+    bp = st.load_biopsy()
+    assert bp["counts"] == {"K2": 3, "C": 2}
+    assert bp["history"][0]["assign"] == {"2026-08-01": "K2"}
+    hol = st.load_holiday_duty()
+    assert hol["r"] == {date(2026, 8, 15): "K2"}          # 國定假日指定值也連動
+    assert hol["vs"] == {date(2026, 8, 15): "K"}          # 另一 scope 同 id 不動
+
+
+def test_rename_member_updates_finalized_month(tmp_path):
+    st = _rename_storage(tmp_path)
+    svc = RosterService(st)
+    st.save_month("2026-08", {"finalized": True,
+                              "r_duty": {"2026-08-01": {"person": "K"}}}, force=True)
+    svc.rename_member("r", "K", "KK")
+    m = st.load_month("2026-08")
+    assert m["finalized"] is True                          # 仍定案
+    assert m["r_duty"]["2026-08-01"]["person"] == "KK"     # 但代號已連動改
+
+
+def test_rename_member_vs_scope_no_biopsy(tmp_path):
+    st = _rename_storage(tmp_path)
+    svc = RosterService(st)
+    st.save_month("2026-08", {"vs_duty": {"2026-08-01": {"person": "R"}},
+                              "leaves": {"vs": {"R": ["2026-08-02"]}}})
+    svc.rename_member("vs", "R", "RR")
+    cfg = st.load_config()
+    assert [m["id"] for m in cfg["vs_members"]] == ["RR"]
+    m = st.load_month("2026-08")
+    assert m["vs_duty"]["2026-08-01"]["person"] == "RR"
+    assert m["leaves"]["vs"] == {"RR": ["2026-08-02"]}
+
+
+def test_rename_member_guards(tmp_path):
+    svc = RosterService(_rename_storage(tmp_path))
+    assert svc.rename_member("r", "K", "K") == 0           # 同號 → no-op
+    with pytest.raises(ValueError):
+        svc.rename_member("r", "K", "   ")                 # 空白
+    with pytest.raises(ValueError):
+        svc.rename_member("r", "K", "C")                   # 撞現有成員
+    with pytest.raises(ValueError):
+        svc.rename_member("r", "NOPE", "X")                # old 不存在
+
+
+def test_rename_member_rejects_historical_key_collision(tmp_path):
+    """[codex] new_id 已是離職者在歷史資料的【鍵】→ 拒絕，避免覆蓋其累計/餘額。"""
+    st = _rename_storage(tmp_path)
+    svc = RosterService(st)
+    # GONE 是離職者（不在名單），但切片計數/帳本仍留其歷史
+    st.save_biopsy({"counts": {"K": 3, "GONE": 9}, "history": []})
+    with pytest.raises(ValueError, match="切片計數"):
+        svc.rename_member("r", "K", "GONE")
+    # 帳本餘額殘留
+    st.save_biopsy({"counts": {}, "history": []})
+    led = st.load_ledger(); led["r"] = {"K": 1.0, "GONE": -5.0}; st.save_ledger(led)
+    with pytest.raises(ValueError, match="帳本餘額"):
+        svc.rename_member("r", "K", "GONE")
+
+
+def test_rename_member_rejects_value_based_collision(tmp_path):
+    """[codex P1] new_id 只當過離職者的【值】(值班/國定假日 person) 也要擋，避免兩人歷史混同。"""
+    st = _rename_storage(tmp_path)
+    svc = RosterService(st)
+    # GONE 只出現在舊月份的值班值（person），沒當任何鍵
+    st.save_month("2026-07", {"r_duty": {"2026-07-04": {"person": "GONE"}}})
+    with pytest.raises(ValueError, match="值班紀錄"):
+        svc.rename_member("r", "K", "GONE")
+    # 只出現在國定假日指定值
+    st.save_month("2026-07", {})
+    st.save_holiday_duty({"r": {date(2026, 7, 4): "GONE"}, "vs": {}})
+    with pytest.raises(ValueError, match="國定假日指定"):
+        svc.rename_member("r", "K", "GONE")
+
+
+def test_rename_member_aborts_on_corrupt_file(tmp_path):
+    """[codex P1] 關鍵檔損壞（_load_json 會靜默當空）→ 改名前預檢就中止，不用空白覆蓋清空。"""
+    st = _rename_storage(tmp_path)
+    svc = RosterService(st)
+    st.save_ledger({"r": {"K": 5.0, "C": -5.0}, "vs": {}, "history": []})
+    # 把 ledger.json 弄壞（模擬記事本存錯/半寫）
+    with open(st._path("ledger.json"), "w", encoding="utf-8") as f:
+        f.write("{ this is not valid json ")
+    with pytest.raises(ValueError, match="ledger.json"):
+        svc.rename_member("r", "K", "K7")
+    # config 未被改（改名整個中止）
+    assert [m["id"] for m in st.load_config()["r_members"]] == ["K", "C"]
+    # 頂層非物件（[]）雖能 parse 但 _load_json 會當空 → 也要擋
+    with open(st._path("ledger.json"), "w", encoding="utf-8") as f:
+        f.write("[]")
+    with pytest.raises(ValueError, match="ledger.json"):
+        svc.rename_member("r", "K", "K7")
+    assert [m["id"] for m in st.load_config()["r_members"]] == ["K", "C"]
+
+
+def test_rename_member_rolls_back_on_write_failure(tmp_path, monkeypatch):
+    """[codex P1] 寫入中途失敗 → 已寫的檔回滾，不留半套改名（config 不可停在 new_id）。"""
+    st = _rename_storage(tmp_path)
+    svc = RosterService(st)
+    st.save_ledger({"r": {"K": 2.0, "C": -2.0}, "vs": {},
+                    "history": [{"month": "2026-08", "scope": "r",
+                                 "deltas": {"K": 2.0, "C": -2.0}}]})
+    st.save_month("2026-08", {"r_duty": {"2026-08-01": {"person": "K"}}})
+
+    # 讓「寫月檔」那一步炸（config/ledger 已寫），驗證兩者被回滾
+    real_save_month = st.save_month
+
+    def boom(ym, data, force=False):
+        raise OSError("disk full (simulated)")
+    monkeypatch.setattr(st, "save_month", boom)
+
+    with pytest.raises(OSError):
+        svc.rename_member("r", "K", "K9")
+
+    monkeypatch.setattr(st, "save_month", real_save_month)
+    cfg = st.load_config()
+    assert [m["id"] for m in cfg["r_members"]] == ["K", "C"], "config 應已回滾成舊代號"
+    led = st.load_ledger()
+    assert led["r"] == {"K": 2.0, "C": -2.0}, "ledger 應已回滾"
+    assert st.load_month("2026-08")["r_duty"]["2026-08-01"]["person"] == "K"

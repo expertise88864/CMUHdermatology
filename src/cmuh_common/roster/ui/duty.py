@@ -188,26 +188,65 @@ class CalendarDutyTab(ttk.Frame):
     def _build_side(self, parent) -> None:
         ttk.Label(parent, text="結算", font=("Microsoft JhengHei UI", 10, "bold")
                   ).pack(anchor="w", padx=6, pady=(6, 0))
-        cols = ("m", "wd", "we", "pt", "bal")
+        cols = ("id", "m", "wd", "we", "pt", "bal")
         self._sum = ttk.Treeview(parent, columns=cols, show="headings", height=8)
-        for c, t, w in (("m", "成員", 60), ("wd", "平日", 42), ("we", "假日", 42),
-                        ("pt", "點", 42), ("bal", "帳本", 54)):
+        for c, t, w in (("id", "代號", 44), ("m", "姓名", 58), ("wd", "平日", 40),
+                        ("we", "假日", 40), ("pt", "點", 38), ("bal", "帳本", 50)):
             self._sum.heading(c, text=t)
             self._sum.column(c, width=w, anchor="center")
         self._sum.pack(fill="x", padx=6)
+        # [2026-07-13 使用者] 週六 R2/R3 切片累計次數（存在 biopsy.json，本來只在決策報告
+        # 文字裡；這裡直接顯示在 UI）。此帳本＝跨月累計「次數」，與上方點數帳本(結轉)不同。
+        self._bx = None
+        if self.scope == "r":
+            ttk.Label(parent, text="週六切片累計（R2/R3，跨月次數）",
+                      font=("Microsoft JhengHei UI", 10, "bold")
+                      ).pack(anchor="w", padx=6, pady=(8, 0))
+            self._bx = ttk.Treeview(parent, columns=("who", "cnt"),
+                                    show="headings", height=3)
+            self._bx.heading("who", text="住院醫師")
+            self._bx.column("who", width=150, anchor="w")
+            self._bx.heading("cnt", text="累計次數")
+            self._bx.column("cnt", width=60, anchor="center")
+            self._bx.pack(fill="x", padx=6)
         ttk.Label(parent, text="警告", font=("Microsoft JhengHei UI", 10, "bold")
                   ).pack(anchor="w", padx=6, pady=(8, 0))
         self._warns = tk.Listbox(parent, height=10, width=34)
         self._warns.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+    def _reload_biopsy_counts(self, ctx) -> None:
+        """R 分頁：讀 biopsy.json 的累計次數，配 biopsy_pair 認出 R2/R3 顯示。"""
+        if self.scope != "r" or not getattr(self, "_bx", None):
+            return
+        from cmuh_common.roster.saturday_biopsy import biopsy_pair
+        self._bx.delete(*self._bx.get_children())
+        counts = (self.service.storage.load_biopsy().get("counts") or {})
+        pair, _notes = biopsy_pair(ctx.members)
+        if not pair:
+            self._bx.insert("", "end", values=("（名單缺 R2/R3）", "—"))
+            return
+        for m in pair:
+            who = (f"{m.id} {m.name}（{m.level}）" if m.name
+                   else f"{m.id}（{m.level}）")
+            self._bx.insert("", "end", values=(who, int(counts.get(m.id, 0))))
 
     # ── 資料 → 畫面 ──────────────────────────────────────────────────────
     def _member_map(self) -> dict:
         cfg = self.service.storage.load_config()
         out = {}
         for i, m in enumerate(cfg.get(f"{self.scope}_members") or []):
-            out[m.get("id")] = {"name": m.get("name") or m.get("id"),
-                                "color": member_color(i)}
+            mid = m.get("id")
+            out[mid] = {"id": mid, "name": m.get("name") or mid,
+                        "color": member_color(i)}
         return out
+
+    @staticmethod
+    def _who_label(pid, info) -> str:
+        """月曆格/切片列的顯示：代號＋姓名（姓名空或同代號時只顯示代號）。"""
+        if not info:
+            return str(pid) if pid else ""
+        nm = info.get("name")
+        return f"{pid} {nm}" if nm and nm != pid else str(pid)
 
     def refresh(self) -> None:
         """重畫整個分頁（月曆格 + 結算 + 警告 + 定案狀態）。"""
@@ -239,6 +278,7 @@ class CalendarDutyTab(ttk.Frame):
             self._grid_holder.columnconfigure(c, weight=1)
 
         self._refresh_side(ctx, duty, members)
+        self._reload_biopsy_counts(ctx)
         self._apply_finalized_state()
 
     def _make_cell(self, r, c, d, duty, holidays, params, members,
@@ -253,17 +293,17 @@ class CalendarDutyTab(ttk.Frame):
         info = members.get(pid)
         bg = info["color"] if info else ("#F0E7D8" if d in holidays else "#FFFFFF")
         fg = fg_for(bg) if info else "#000000"
-        name = info["name"] if info else ""
+        # [2026-07-13 使用者] 除姓名外一併顯示代號（代號＋姓名）
+        who = self._who_label(pid, info) if pid else ""
         pts = day_point(d, holidays, params)
         mark = " 🔒" if locked else ""
         hol = "假 " if (d in holidays and not is_weekend(d)) else ""
-        text = f"{hol}{d.day}\n{name}\n{pts}點{mark}"
-        # [週六切片] R 分頁週六格第 4 行顯示切片負責人
+        text = f"{hol}{d.day}\n{who}\n{pts}點{mark}"
+        # [週六切片] R 分頁週六格第 4 行顯示切片負責人（代號＋姓名）
         bp = ((biopsy or {}).get(iso) or {}).get("person")
         height = 3
         if bp:
-            binfo = members.get(bp)
-            text += f"\n切:{binfo['name'] if binfo else bp}"
+            text += f"\n切:{self._who_label(bp, members.get(bp))}"
             height = 4
         lbl = tk.Label(self._grid_holder, text=text, bg=bg, fg=fg,
                        width=8, height=height, relief="ridge", justify="center",
@@ -299,11 +339,11 @@ class CalendarDutyTab(ttk.Frame):
             if mid in members:
                 name = members[mid]["name"]
                 bal = f"{float(ctx.ledger.get(mid, 0.0)):+.1f}"
-            else:                      # 已離名單:顯示 id、帳本欄不適用
-                name = mid
+            else:                      # 已離名單:代號欄仍顯示 id、帳本欄不適用
+                name = "（已離名單）"
                 bal = "—"
             self._sum.insert("", "end", values=(
-                name, t["wd"], t["we"], t["pt"], bal))
+                mid, name, t["wd"], t["we"], t["pt"], bal))
 
         self._warns.delete(0, tk.END)
         mark = {"error": "✗", "warn": "⚠", "info": "・"}

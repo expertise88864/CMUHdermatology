@@ -214,14 +214,42 @@ class SettingsTab(ttk.Frame):
         idx = next((i for i, m in enumerate(members) if m.get("id") == sel[0]), -1)
         if idx < 0:
             return
+        old_id = str(members[idx].get("id"))
+        # 代號可改：改代號＝行政遷移，需連動所有資料（見 service.rename_member），故 id 解鎖。
         dlg = _MemberDialog(self, "編輯成員", members[idx], with_level, with_wd,
-                            id_locked=True)   # id 是帳本鍵，不可改
+                            id_locked=False)
         if not dlg.result:
             return
-        dlg.result["id"] = members[idx]["id"]        # 保險：鎖住 id
-        members[idx] = dlg.result
-        self._save_cfg()
+        new_id = str(dlg.result.get("id")).strip()
+        # [codex P2] 代號有變時，先做（交易式的）連動改名，成功後才套用其餘欄位——否則改名失敗卻
+        # 已先存了姓名/級職，會留半套。改名走 service.rename_member（config+帳本+所有月份+切片一次到位）。
+        eff_id = old_id
+        if new_id and new_id != old_id:
+            if any(str(m.get("id")) == new_id for m in self._members(scope)):
+                messagebox.showwarning("重複", f"代號 {new_id} 已存在，代號未變更")
+                return
+            try:
+                n = self.service.rename_member(scope, old_id, new_id)
+            except Exception as e:  # noqa: BLE001
+                messagebox.showerror("改代號失敗", str(e))
+                self._cfg = self.service.storage.load_config()   # 與磁碟同步（未變動）
+                self._reload_members(scope)
+                return
+            self._cfg = self.service.storage.load_config()       # rename 改了 config → 重讀
+            eff_id = new_id
+            self._notify()                                        # 通知排班分頁重載
+            messagebox.showinfo(
+                "改代號", f"已將 {old_id} 連動改為 {new_id}（更新 {n} 處資料）。")
+        # 套用「非代號」欄位（姓名/級職/固定值班）到（改名後的）成員
+        members = self._members(scope)
+        j = next((i for i, m in enumerate(members) if str(m.get("id")) == eff_id), -1)
+        if j >= 0:
+            updated = dict(dlg.result)
+            updated["id"] = eff_id
+            members[j] = updated
+            self._save_cfg()
         self._reload_members(scope)
+        self._reload_ledger()
 
     def _member_del(self, scope) -> None:
         tree, _wl, _ww = self._member_trees[scope]
