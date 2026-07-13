@@ -7796,9 +7796,10 @@ class AutomationApp:
         self.cl_check_interval = 30
         self.cl_last_check_time = 0
         self._priority_refresh_last_check_time = defaultdict(float)
-        # [2026-06-25 user] 鄰近門檻(設定值-10)醫師的「下一次優先刷新」目標間隔(秒)。每次刷新後
-        # 重新隨機 15 分 ±1(14-16 分),避免固定節拍(同 reg64 45-75 秒隨機的理由)。未設定 → 預設 15 分。
-        self._priority_refresh_target_seconds = {}
+        # [2026-07-13 user] 鄰近門檻醫師的「下一次優先刷新」計畫：{doc_name: (tier, 目標間隔秒)}。
+        # tier='critical'(門檻-3)→15分±1、'near'(門檻-10)→60分±2。存 tier 是為了在 tier 升/降級時
+        # (例如從門檻-10 追進門檻-3)立刻改用新間隔，而非等舊間隔跑完。每次刷新後依當前 tier 重隨機。
+        self._priority_refresh_plan = {}
         self._refresh_tick_after_id = None
         self._pending_refresh_tick_ui = None
 
@@ -14026,6 +14027,50 @@ class AutomationApp:
             return is_near_alert_threshold(sessions, weekday_idx, threshold_map, margin=10)
         return False
 
+    def _doctor_alert_proximity_tier(self, doctor_name, doctors_data_snapshot=None):
+        """[2026-07-13 使用者] 回傳醫師鄰近止掛門檻的等級（決定優先刷新間隔）：
+          'critical' 已達門檻-3  → 每 15 分刷新該醫師一次
+          'near'     已達門檻-10 → 每 60 分刷新該醫師一次
+          None       兩者皆非    → 不納入優先刷新（走一般 3 小時全體刷新）
+        純讀當前快取，只刷該醫師、不連動其他醫師。"""
+        if not doctor_name:
+            return None
+        threshold_map = self._get_doctor_threshold_map(doctor_name)
+        if not threshold_map:
+            return None
+        today = date.today()
+        weekday_idx = today.weekday()
+        data_source = (doctors_data_snapshot if doctors_data_snapshot is not None
+                       else self._get_all_doctors_data_snapshot())
+        doc_no = ""
+        for doc in self.doctors_list:
+            if doc.get("name") == doctor_name:
+                doc_no = str(doc.get("doc_no", ""))
+                break
+        for lookup_key in (doc_no, doctor_name):
+            if not lookup_key:
+                continue
+            doc_data = data_source.get(lookup_key)
+            if not doc_data or not isinstance(doc_data, dict) or "error" in doc_data:
+                continue
+            sessions = doc_data.get(today)
+            if not sessions:
+                continue
+            if is_near_alert_threshold(sessions, weekday_idx, threshold_map, margin=3):
+                return "critical"
+            if is_near_alert_threshold(sessions, weekday_idx, threshold_map, margin=10):
+                return "near"
+            return None
+        return None
+
+    @staticmethod
+    def _priority_refresh_interval_for_tier(tier: str) -> int:
+        """優先刷新目標間隔(秒)，帶 ±... 隨機避免固定節拍（同 reg64 隨機的理由）：
+          critical(門檻-3)→ 15 分 ±1；near(門檻-10)→ 60 分 ±2。"""
+        if tier == "critical":
+            return random.randint(14 * 60, 16 * 60)
+        return random.randint(58 * 60, 62 * 60)
+
 # --- [修正] 背景任務啟動 (修正重開機邏輯) ---
     def start_background_tasks(self):
         if self._background_tasks_started:
@@ -14159,8 +14204,8 @@ class AutomationApp:
                     pass
 
             def dynamic_cl_checker():
-                # [2026-06-25 user] 當任何醫師人數達到門檻-10(總覽橘色底)→ 縮短為每約 15 分鐘
-                # (±1 分隨機,避免固定節拍)刷新一次該醫師(原為 30 分)。
+                # [2026-07-13 user] 依鄰近門檻等級分兩級縮短該醫師的刷新間隔（只刷該醫師、不連動他人）：
+                #   門檻-10(near)→ 每 60 分；門檻-3(critical)→ 每 15 分。tier 升/降級即刻改用新間隔。
                 try:
                     doctors_data_snapshot = self._get_all_doctors_data_snapshot()
                     now_ts = time.time()
@@ -14171,15 +14216,23 @@ class AutomationApp:
                         threshold_map = self._get_doctor_threshold_map(doc_name)
                         if not threshold_map:
                             continue  # 無設定門檻的醫師不納入
-                        if not self._is_doctor_near_alert_threshold(doc_name, doctors_data_snapshot=doctors_data_snapshot):
+                        tier = self._doctor_alert_proximity_tier(
+                            doc_name, doctors_data_snapshot=doctors_data_snapshot)
+                        if tier is None:
+                            self._priority_refresh_plan.pop(doc_name, None)  # 離開門檻區 → 清計畫
                             continue
+                        plan = self._priority_refresh_plan.get(doc_name)
+                        # tier 首見或改變(升/降級)→ 立刻以新 tier 的目標間隔評估，不等舊間隔跑完
+                        if plan is None or plan[0] != tier:
+                            target = self._priority_refresh_interval_for_tier(tier)
+                            self._priority_refresh_plan[doc_name] = (tier, target)
+                        else:
+                            target = plan[1]
                         elapsed = now_ts - self._priority_refresh_last_check_time[doc_name]
-                        # 目標間隔:本醫師上次刷新後就隨機好的 15 分 ±1(未設過 → 預設 15 分)。
-                        target = self._priority_refresh_target_seconds.get(doc_name, 15 * 60)
                         if elapsed >= target:
                             logging.info(
                                 f"[SCHEDULE:priority-check-2m] 觸發優先刷新：{doc_name}"
-                                f"（鄰近門檻且距上次≥{int(target // 60)}分）"
+                                f"（{tier} 且距上次≥{int(target // 60)}分）"
                             )
                             future = self.bg_executor.submit(self._trigger_refresh, False, [doc])
                             if _future_was_rejected(future):
@@ -14188,8 +14241,9 @@ class AutomationApp:
                                 )
                                 continue
                             self._priority_refresh_last_check_time[doc_name] = now_ts
-                            # 下一輪重新隨機 15 分 ±1(14-16 分),讓刷新時點不固定
-                            self._priority_refresh_target_seconds[doc_name] = random.randint(14 * 60, 16 * 60)
+                            # 下一輪依當前 tier 重新隨機間隔，讓刷新時點不固定
+                            self._priority_refresh_plan[doc_name] = (
+                                tier, self._priority_refresh_interval_for_tier(tier))
                 except Exception as e:
                     logging.error(f"[SCHEDULE:priority-check-2m] failed: {e}", exc_info=True)
 

@@ -80,3 +80,16 @@ def test_run_app_pushes_pending_commit_on_systemexit(tmp_path, monkeypatch):
     subprocess.run(["git", "clone", str(remote), str(check)],
                    capture_output=True, check=True)
     assert (check / "config.json").exists()
+
+
+def test_default_ym_is_next_month():
+    """[2026-07-13 使用者] 打開排班程式預設顯示【下個月】(7月→8月；12月→隔年1月)。"""
+    import inspect
+    src = inspect.getsource(scheduler.ScheduleApp.__init__)
+    assert "today.month + 1" in src and "today.year + 1" in src, \
+        "預設月份應為下個月(而非當月)"
+
+    def nxt(y, m):
+        return (y + 1, 1) if m == 12 else (y, m + 1)
+    assert nxt(2026, 7) == (2026, 8)
+    assert nxt(2026, 12) == (2027, 1)

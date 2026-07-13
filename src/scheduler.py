@@ -117,8 +117,11 @@ class ScheduleApp:
             on_sync_state=self._on_sync_state,
             on_remote_change=self._on_remote_change)
         self.service = RosterService(self.storage)
+        # [2026-07-13 使用者] 打開就預設【下個月】——通常打開排班程式就是要排下個月的班
+        # （7 月開 → 顯示 8 月；12 月開 → 顯示隔年 1 月）。R/VS/PGY/Clerk 共用此月份。
         today = date.today()
-        self.ym = f"{today.year:04d}-{today.month:02d}"   # R/VS 共用月份
+        ny, nm = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
+        self.ym = f"{ny:04d}-{nm:02d}"
 
         self._build_ui()
 
