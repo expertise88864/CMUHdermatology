@@ -11,13 +11,14 @@
 #   diff      低風險/局部(文案、註解、CSS、tests-only)     medium / 額外檔 3 / findings 3
 #   targeted  一般非 trivial 實作(預設)                     medium / 額外檔 12 / findings 5
 #   deep      醫療劑量、醫令自動化、資安、資料完整、併發、大重構 high / 額外檔 30 / findings 8
-#   resume    第二輪(僅限 confirmed P0/P1/material P2 修正後);沿用第一輪 session
+#   resume    後續輪(第 2、3、…;僅限 confirmed findings 修正後);沿用第一輪 session
 #
 # 設計原則(勿改):
 #   * 絕不把完整 diff 放進 prompt 或 argv;Codex 在 repo 內自行跑 git。
 #   * --ignore-user-config 隔離 ~/.codex/config.toml(不載 plugins/apps/browser/notify)。
 #   * --sandbox read-only:Codex 不得寫檔、commit、跑 tests/build/lint/probe。
-#   * 每個 task 最多兩輪;第二輪必須 resume 同一 session,不得重建。
+#   * [2026-07-13 使用者定案] 無輪數上限:每輪修正 confirmed findings 後 resume 同一
+#     session 續審,直到 APPROVE 才 push(不得重建 session、不得 --last)。
 #   * 結果只讀「最後一則訊息」(-o),不掃整份輸出。
 set -uo pipefail
 
@@ -95,7 +96,9 @@ log_usage() {  # $1 mode $2 effort $3 base $4 pass
   echo "$res"
 }
 
-# ================= resume(第二輪) =================
+# ================= resume(後續輪:第 2、3、…直到 APPROVE) =================
+# [2026-07-13 使用者定案] 取消「每 task 最多兩輪」硬上限,改為「跑到 GPT-5.6 APPROVE
+# 才能 push」。每一輪修正 confirmed findings 後 resume 同一 session 續審;pass 累加。
 if [ "$MODE" = "resume" ]; then
   SID="${2:-}"
   if [ -z "$SID" ]; then
@@ -103,27 +106,29 @@ if [ "$MODE" = "resume" ]; then
     SID="$(cat "$SESSION_FILE")"
   fi
   PREV_PASS="$(cat "$PASS_FILE" 2>/dev/null || echo 0)"
-  [ "$PREV_PASS" = "1" ] || die "第二輪只能在完成第一輪之後(目前 pass=$PREV_PASS)。每 task 最多兩輪。"
+  [ "$PREV_PASS" -ge 1 ] 2>/dev/null \
+    || die "resume 只能在完成第一輪之後(目前 pass=$PREV_PASS)。請先跑第一輪。"
+  THIS_PASS=$((PREV_PASS + 1))
   RESUME_EFFORT="$(tail -1 "$USAGE_TSV" | cut -f5)"; [ -n "$RESUME_EFFORT" ] || RESUME_EFFORT="medium"
   RESUME_BASE="$(tail -1 "$USAGE_TSV" | cut -f6)";   [ -n "$RESUME_BASE" ] || RESUME_BASE="unavailable"
   build_flags "$RESUME_EFFORT" resume
   read -r -d '' RESUME_PROMPT <<'RP' || true
-Second and final review pass. Inspect only the corrections made for CONFIRMED
-findings from the previous review. Verify that those defects are resolved and
-that the corrections introduced no concrete regression. Do not repeat the
-original full exploration. Remain strictly read-only. End with exactly APPROVE
-or REQUEST_CHANGES.
+Follow-up review pass. Inspect only the corrections made for CONFIRMED findings
+from the previous review. Verify that those defects are resolved and that the
+corrections introduced no concrete regression. Do not repeat the original full
+exploration. Remain strictly read-only. End with exactly APPROVE or
+REQUEST_CHANGES.
 RP
-  echo "[codex-review] resume session=$SID effort=$RESUME_EFFORT (pass 2/2)"
+  echo "[codex-review] resume session=$SID effort=$RESUME_EFFORT (pass $THIS_PASS)"
   : > "$LAST_MSG"
   ( cd "$REPO_ROOT" && codex exec resume "$SID" "${FLAGS[@]}" "$RESUME_PROMPT" ) 2>&1 | tee "$RAW_LOG"
   CODEX_RC=${PIPESTATUS[0]}
   if [ "$CODEX_RC" -ne 0 ] && [ ! -s "$LAST_MSG" ]; then
-    die "codex exec resume 啟動失敗(exit=$CODEX_RC),未產生 review;不計第二輪。"
+    die "codex exec resume 啟動失敗(exit=$CODEX_RC),未產生 review;本輪不計。"
   fi
-  echo 2 > "$PASS_FILE"
-  RESULT="$(log_usage "resume" "$RESUME_EFFORT" "$RESUME_BASE" 2)"
-  echo; echo "[codex-review] result=$RESULT (pass 2/2)"
+  echo "$THIS_PASS" > "$PASS_FILE"
+  RESULT="$(log_usage "resume" "$RESUME_EFFORT" "$RESUME_BASE" "$THIS_PASS")"
+  echo; echo "[codex-review] result=$RESULT (pass $THIS_PASS)"
   # 限流僅在「未產生明確結論」時才視為不可信 —— 否則 review 的 diff 內容含 'rate limit'
   # 字面(如本 wrapper 自身原始碼)會誤判。有 APPROVE/REQUEST_CHANGES 即代表完整產出。
   if is_rate_limited && [ "$RESULT" = "UNKNOWN" ]; then

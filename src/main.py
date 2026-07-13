@@ -7368,6 +7368,69 @@ ALERT_EMAIL_SENT_FILENAME = "alert_email_sent.json"
 ALERT_EMAIL_SENT_RETAIN_DAYS = 21
 
 
+# ── 個別醫師止掛「優先刷新」分級（2026-07-13 使用者需求）───────────────────────
+# 越接近門檻刷越密（只刷【該醫師】、不連動其他醫師）：
+#   門檻-10(near)→ 30 分、門檻-5(mid)→ 15 分、門檻-3(critical)→ 10 分。
+# tier 名稱 →(margin, 基準間隔秒)。判級時由最接近門檻往外試（critical→mid→near）。
+PRIORITY_REFRESH_TIERS = (
+    ("critical", 3, 10 * 60),
+    ("mid", 5, 15 * 60),
+    ("near", 10, 30 * 60),
+)
+PRIORITY_REFRESH_TIER_BASE = {name: base for name, _m, base in PRIORITY_REFRESH_TIERS}
+# 反 bot 抖動幅度：實際間隔為基準的 ±(10%~20%)（幅度恆落在 10-20%、不會退化成固定
+# 節拍被判為 bot、也不超過 20% 讓資料太舊）。
+PRIORITY_REFRESH_JITTER_MIN = 0.10
+PRIORITY_REFRESH_JITTER_MAX = 0.20
+# 優先刷新檢查【喚醒間隔】（秒）。排程每 PRIORITY_REFRESH_CHECK_SECONDS 喚醒一次評估
+# 「距上次是否已達目標間隔」。30 秒遠細於最短基準 10 分。
+PRIORITY_REFRESH_CHECK_SECONDS = 30
+# 排程喚醒延遲上限估計（秒）：schedule 於工作完成後才排下一次、master loop 每 5 秒 pump，
+# 故實際喚醒可能比「上次觸發 + N×間隔」晚達近一個檢查間隔。抖動候選須【內縮】此邊際 →
+# 即使喚醒延遲,實際觸發間隔仍落在 ±[10%,20%]、且絕不進位回基準（codex 第二輪指出：純
+# 30s 網格假設完美對齊、未計排程延遲 → -10% 候選可能被延成 -4%）。取 2×檢查間隔保守覆蓋
+# 實測 <35s 的最壞延遲；候選 t 之 [t, t+guard] 需完整落在子帶內。
+PRIORITY_REFRESH_DRIFT_GUARD = 2 * PRIORITY_REFRESH_CHECK_SECONDS   # 60s
+
+
+def _priority_refresh_jitter_choices(
+        base_seconds: int,
+        step: int = PRIORITY_REFRESH_CHECK_SECONDS,
+        guard: int = PRIORITY_REFRESH_DRIFT_GUARD) -> tuple:
+    """回傳基準的 ±(10%~20%) 抖動候選（秒），對齊 step 網格、且【排除基準值本身】。
+
+    每個候選 t 皆滿足 [t, t+guard] 完整落在負向子帶 [-20%,-10%] 或正向子帶 [+10%,+20%]
+    → 即使排程喚醒比目標晚（延遲 <guard），實際觸發間隔 = t + 延遲 仍落在 ±[10%,20%] 帶內
+    且永不等於基準（反 bot、且忠實 10-20% 抖動）。候選 t 的 [t,t+guard] 相鄰重疊 → 加上
+    連續的喚醒延遲,實際觸發時點連續覆蓋整個子帶。純函式以便測試。"""
+    lo = base_seconds - base_seconds // 5           # -20%
+    lo_edge = base_seconds - base_seconds // 10     # -10%
+    hi_edge = base_seconds + base_seconds // 10     # +10%
+    hi = base_seconds + base_seconds // 5           # +20%
+    out = []
+    v = (lo // step) * step
+    if v < lo:
+        v += step
+    while v <= hi:
+        # [t, t+guard] 需完整落在某一子帶（內縮 guard 抵銷喚醒延遲）
+        if (lo <= v and v + guard <= lo_edge) or (hi_edge <= v and v + guard <= hi):
+            out.append(v)
+        v += step
+    return tuple(out)
+
+
+PRIORITY_REFRESH_JITTER_CHOICES = {
+    name: _priority_refresh_jitter_choices(base)
+    for name, base in PRIORITY_REFRESH_TIER_BASE.items()
+}
+
+
+def _priority_refresh_interval_seconds(base_seconds: int) -> int:
+    """從該基準的 ±(10%~20%) 抖動候選中隨機取一（反 bot、避免固定節拍）。純函式以便測試。"""
+    choices = _priority_refresh_jitter_choices(base_seconds)
+    return random.choice(choices) if choices else base_seconds
+
+
 def _filter_recent_alert_sent(data, cutoff: str) -> dict:
     """保留 value(ISO 日期字串)>= cutoff 的項目;非 dict / 非字串鍵值一律剔除。
     ISO 日期零補位 → 可直接字典序比較。純函式以便測試。"""
@@ -7793,8 +7856,9 @@ class AutomationApp:
         self.cl_last_check_time = 0
         self._priority_refresh_last_check_time = defaultdict(float)
         # [2026-07-13 user] 鄰近門檻醫師的「下一次優先刷新」計畫：{doc_name: (tier, 目標間隔秒)}。
-        # tier='critical'(門檻-3)→15分±1、'near'(門檻-10)→60分±2。存 tier 是為了在 tier 升/降級時
-        # (例如從門檻-10 追進門檻-3)立刻改用新間隔，而非等舊間隔跑完。每次刷新後依當前 tier 重隨機。
+        # tier='critical'(門檻-3)→10分、'mid'(門檻-5)→15分、'near'(門檻-10)→30分，各帶 ±10-20% 抖動。
+        # 存 tier 是為了在 tier 升/降級時(例如從門檻-10 追進門檻-3)立刻改用新間隔，而非等舊間隔跑完。
+        # 每次刷新後依當前 tier 重隨機(抖動)。
         self._priority_refresh_plan = {}
         self._refresh_tick_after_id = None
         self._pending_refresh_tick_ui = None
@@ -13986,9 +14050,10 @@ class AutomationApp:
 
     def _doctor_alert_proximity_tier(self, doctor_name, doctors_data_snapshot=None):
         """[2026-07-13 使用者] 回傳醫師鄰近止掛門檻的等級（決定優先刷新間隔）：
-          'critical' 已達門檻-3  → 每 15 分刷新該醫師一次
-          'near'     已達門檻-10 → 每 60 分刷新該醫師一次
-          None       兩者皆非    → 不納入優先刷新（走一般 3 小時全體刷新）
+          'critical' 已達門檻-3  → 每 10 分刷新該醫師一次（±10-20% 抖動）
+          'mid'      已達門檻-5  → 每 15 分刷新該醫師一次（±10-20% 抖動）
+          'near'     已達門檻-10 → 每 30 分刷新該醫師一次（±10-20% 抖動）
+          None       皆非        → 不納入優先刷新（走一般 3 小時全體刷新）
         純讀當前快取，只刷該醫師、不連動其他醫師。"""
         if not doctor_name:
             return None
@@ -14013,8 +14078,11 @@ class AutomationApp:
             sessions = doc_data.get(today)
             if not sessions:
                 continue
+            # 由最接近門檻往外判：門檻-3→critical、門檻-5→mid、門檻-10→near。
             if is_near_alert_threshold(sessions, weekday_idx, threshold_map, margin=3):
                 return "critical"
+            if is_near_alert_threshold(sessions, weekday_idx, threshold_map, margin=5):
+                return "mid"
             if is_near_alert_threshold(sessions, weekday_idx, threshold_map, margin=10):
                 return "near"
             return None
@@ -14022,11 +14090,12 @@ class AutomationApp:
 
     @staticmethod
     def _priority_refresh_interval_for_tier(tier: str) -> int:
-        """優先刷新目標間隔(秒)，帶 ±... 隨機避免固定節拍（同 reg64 隨機的理由）：
-          critical(門檻-3)→ 15 分 ±1；near(門檻-10)→ 60 分 ±2。"""
-        if tier == "critical":
-            return random.randint(14 * 60, 16 * 60)
-        return random.randint(58 * 60, 62 * 60)
+        """優先刷新目標間隔(秒)，帶 ±(10%~20%) 隨機避免固定節拍（反 bot，同 reg64 隨機的
+        理由）：門檻-3(critical)→ 10 分、門檻-5(mid)→ 15 分、門檻-10(near)→ 30 分，各
+        套 ±10-20% 抖動（對齊 30 秒喚醒網格 → 實際觸發即此值、不回退基準）。未知 tier
+        退回 near(30 分)基準。"""
+        base = PRIORITY_REFRESH_TIER_BASE.get(tier, PRIORITY_REFRESH_TIER_BASE["near"])
+        return _priority_refresh_interval_seconds(base)
 
 # --- [修正] 背景任務啟動 (修正重開機邏輯) ---
     def start_background_tasks(self):
@@ -14161,8 +14230,9 @@ class AutomationApp:
                     pass
 
             def dynamic_cl_checker():
-                # [2026-07-13 user] 依鄰近門檻等級分兩級縮短該醫師的刷新間隔（只刷該醫師、不連動他人）：
-                #   門檻-10(near)→ 每 60 分；門檻-3(critical)→ 每 15 分。tier 升/降級即刻改用新間隔。
+                # [2026-07-13 user] 依鄰近門檻等級分三級縮短該醫師的刷新間隔（只刷該醫師、不連動他人）：
+                #   門檻-10(near)→ 每 30 分；門檻-5(mid)→ 每 15 分；門檻-3(critical)→ 每 10 分（各 ±10-20% 抖動）。
+                #   tier 升/降級即刻改用新間隔。
                 try:
                     doctors_data_snapshot = self._get_all_doctors_data_snapshot()
                     now_ts = time.time()
@@ -14188,13 +14258,13 @@ class AutomationApp:
                         elapsed = now_ts - self._priority_refresh_last_check_time[doc_name]
                         if elapsed >= target:
                             logging.info(
-                                f"[SCHEDULE:priority-check-2m] 觸發優先刷新：{doc_name}"
+                                f"[SCHEDULE:priority-check] 觸發優先刷新：{doc_name}"
                                 f"（{tier} 且距上次≥{int(target // 60)}分）"
                             )
                             future = self.bg_executor.submit(self._trigger_refresh, False, [doc])
                             if _future_was_rejected(future):
                                 logging.warning(
-                                    f"[SCHEDULE:priority-check-2m] 略過優先刷新：{doc_name}，背景佇列已滿"
+                                    f"[SCHEDULE:priority-check] 略過優先刷新：{doc_name}，背景佇列已滿"
                                 )
                                 continue
                             self._priority_refresh_last_check_time[doc_name] = now_ts
@@ -14202,11 +14272,14 @@ class AutomationApp:
                             self._priority_refresh_plan[doc_name] = (
                                 tier, self._priority_refresh_interval_for_tier(tier))
                 except Exception as e:
-                    logging.error(f"[SCHEDULE:priority-check-2m] failed: {e}", exc_info=True)
+                    logging.error(f"[SCHEDULE:priority-check] failed: {e}", exc_info=True)
 
-            # 鄰近門檻檢查：每 2 分鐘喚醒（內部約 15 分 ±1 隨機才觸發實際 refresh），減少無謂排程
+            # 鄰近門檻檢查：每 PRIORITY_REFRESH_CHECK_SECONDS(30s) 喚醒（細於最短基準 10 分，
+            # 讓抖動忠實呈現、不被喚醒粒度侵蝕回固定節拍；內部依 tier 達目標間隔才觸發實際
+            # refresh、且只讀快取+比對時間戳，30s 一輪成本極輕）。
             schedule.clear()
-            schedule.every(2).minutes.do(dynamic_cl_checker).tag("priority-check", "2m")
+            schedule.every(PRIORITY_REFRESH_CHECK_SECONDS).seconds.do(
+                dynamic_cl_checker).tag("priority-check", "30s")
             schedule.every(3).hours.do(
                 lambda: run_named_job("refresh-all-3h", lambda: self.bg_executor.submit(self._trigger_refresh, False, DOCTORS))
             ).tag("refresh", "all-doctors", "3h")
