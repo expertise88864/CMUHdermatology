@@ -46,6 +46,12 @@ def build_chrome_options(headless: bool = True):
     opts = Options()
     if headless:
         opts.add_argument("--headless=new")
+        # [2026-07-13 診間實機] 某些 Chrome 版本的 headless=new 有回歸:把本應隱藏的
+        # 瀏覽器視窗真的畫在桌面上 —— 1280x800 純白、無邊框、無工作列鈕、點不到也
+        # 拖不動;主程式的常駐 status driver 活著它就一直在,關主程式才消失。標準
+        # 緩解:把視窗位置推到虛擬桌面外 —— 正常隱藏時此參數無感,發作時白窗落在
+        # 看不到的地方。(虛擬桌面座標上限 ±32767,實際螢幕不會配置在 -32000。)
+        opts.add_argument("--window-position=-32000,-32000")
 
     args = [
         # ─── 必要 ────────────────────────────────────────
