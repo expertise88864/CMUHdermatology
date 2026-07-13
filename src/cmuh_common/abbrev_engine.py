@@ -374,9 +374,11 @@ def load_config(path: str, *, persist_migrations: bool = True) -> AbbrevConfig:
         schema_version=max(
             ABBREV_CONFIG_SCHEMA_VERSION, loaded_schema_version),
         enabled=bool(raw.get("enabled", False)),
-        skip_when_ime_active=bool(raw.get("skip_when_ime_active", True)),
-        preserve_trailing_space=bool(raw.get("preserve_trailing_space", True)),
-        close_external_expander=bool(raw.get("close_external_expander", True)),
+        # [2026-07-13 使用者] 這三項不再讓使用者勾選：只要啟用縮寫速寫就【一律開啟】
+        # （中文組字中暫停展開、展開後保留結尾空白、偵測到其他縮寫軟體自動關閉），故忽略存檔值固定 True。
+        skip_when_ime_active=True,
+        preserve_trailing_space=True,
+        close_external_expander=True,
         items=sort_abbrev_items(cleaned),
     )
 

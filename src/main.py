@@ -96,9 +96,6 @@ from cmuh_common.single_instance import (
     ensure_single_instance, is_instance_running, release_single_instance,
 )
 from cmuh_common.duty_summary import build_duty_summary_parts
-from cmuh_common.settings_backup import (
-    normalize_hhmm,
-)
 from cmuh_common.abbrev_engine import (
     AbbrevEngine,
     AbbrevConfig,
@@ -7767,7 +7764,8 @@ class AutomationApp:
         self.alert_email_sender = str(self.threshold_settings.get(
             "alert_email_sender", "cmuhdermatology@gmail.com"))
         self.out_of_hospital_var = tk.BooleanVar(value=self.threshold_settings.get("out_of_hospital_mode", False))
-        self.show_external_clinics = tk.BooleanVar(value=self.threshold_settings.get("show_external_clinics", True))
+        # [2026-07-13 使用者] 外院/分院診次固定顯示（設定已移除、不再讓使用者勾選）。
+        self.show_external_clinics = tk.BooleanVar(value=True)
 
         self.val_alert_chang = self.alert_chang_enabled.get()
         self.val_alert_chen = self.alert_chen_enabled.get()
@@ -7783,12 +7781,10 @@ class AutomationApp:
         # 已寄出止掛信的記錄(跨重啟去重;寄信前先查、寄成功後寫)
         self._alert_email_sent = self._load_alert_email_sent()
         self._dnd_suppressed_count = 0
-        self.notify_dnd_start_time_var = tk.StringVar(value=str(self.threshold_settings.get("notify_dnd_start_time", "00:00")))
-        self.notify_dnd_end_time_var = tk.StringVar(value=str(self.threshold_settings.get("notify_dnd_end_time", "08:00")))
-        # [2026-07-04 user] 門診人數/止掛監測是否連半夜(00–07 點)也跑。預設 True＝
-        # 全天候(寄止掛信/刷新不受 reg64 半夜暫停限制)；關閉才恢復舊的夜間暫停。
-        self.clinic_night_monitor_var = tk.BooleanVar(
-            value=bool(self.threshold_settings.get("clinic_night_monitor", True)))
+        # [2026-07-13 使用者] 「提醒勿擾時段」與「半夜也監測」設定已移除、不再讓使用者勾選；
+        # 固定行為：止掛提醒(reg52)email 全天候照寄；夜間 00:00–08:00 只寄 email+記 log、不跳彈窗
+        # (見 _is_notification_suppressed_now)；門診進度/現場人數(reg64)固定 00:00–07:00 不刷新
+        # (見 _update_clinic_lights_loop 的 _reg64_clinic_quiet_hours 閘)。
         # F8 快速輸入文字 (預設 dtderm25，可在設定頁修改)
         self.quick_text_f8_var = tk.StringVar(value=str(self.threshold_settings.get("quick_text_f8", F8_QUICK_TEXT_DEFAULT)))
         self._live_count_samples = defaultdict(lambda: deque(maxlen=12))
@@ -8734,21 +8730,11 @@ class AutomationApp:
             self.log_text_widget.configure(state='disabled')
 
     def _is_notification_suppressed_now(self):
-        def _parse_hhmm(text, fallback_h):
-            s = str(text).strip()
-            if ":" not in s:
-                return fallback_h * 60
-            hh, mm = s.split(":", 1)
-            try:
-                h = max(0, min(24, int(hh)))
-                m = max(0, min(59, int(mm)))
-                if h == 24:
-                    m = 0
-                return h * 60 + m
-            except (TypeError, ValueError):
-                return fallback_h * 60
-        start_m = _parse_hhmm(self.threshold_settings.get("notify_dnd_start_time", "00:00"), NOTIFY_DO_NOT_DISTURB_START_HOUR)
-        end_m = _parse_hhmm(self.threshold_settings.get("notify_dnd_end_time", "08:00"), NOTIFY_DO_NOT_DISTURB_END_HOUR)
+        # [2026-07-13 使用者] 「提醒勿擾時段」可調設定已移除，固定 00:00–08:00 為勿擾窗：此時段止掛提醒
+        # 只寄 email + 記 log、【不跳彈窗】(夜間診間無人看螢幕)，其餘時段照跳。email 一律 24 小時照寄
+        # (本函式只管『要不要跳彈窗』，不影響寄信偵測)。
+        start_m = NOTIFY_DO_NOT_DISTURB_START_HOUR * 60
+        end_m = NOTIFY_DO_NOT_DISTURB_END_HOUR * 60
         now = datetime.now()
         now_m = now.hour * 60 + now.minute
         if start_m == end_m:
@@ -8822,14 +8808,8 @@ class AutomationApp:
         self.threshold_settings['alert_chang_enabled'] = self.alert_chang_enabled.get()
         self.threshold_settings['alert_chen_enabled'] = self.alert_chen_enabled.get()
         self.threshold_settings['out_of_hospital_mode'] = self.out_of_hospital_var.get()
-        self.threshold_settings['show_external_clinics'] = self.show_external_clinics.get()
-        dnd_start = normalize_hhmm(self.notify_dnd_start_time_var.get(), "00:00")
-        dnd_end = normalize_hhmm(self.notify_dnd_end_time_var.get(), "08:00")
-        self.notify_dnd_start_time_var.set(dnd_start)
-        self.notify_dnd_end_time_var.set(dnd_end)
-        self.threshold_settings['notify_dnd_start_time'] = dnd_start
-        self.threshold_settings['notify_dnd_end_time'] = dnd_end
-        self.threshold_settings['clinic_night_monitor'] = bool(self.clinic_night_monitor_var.get())
+        # [2026-07-13 使用者] show_external_clinics / notify_dnd / clinic_night_monitor 設定已移除；
+        # 行為固定（外院分院固定顯示、勿擾窗固定 00–08 只不跳彈窗、reg64 固定 00–07 暫停），不再存這幾個鍵。
         # F8 快速輸入文字 — 空字串不存（讓 _load_f8_quick_text 回 default）
         try:
             qt = str(self.quick_text_f8_var.get())
@@ -9765,10 +9745,9 @@ class AutomationApp:
             self._clinic_dynamic_refresh_seconds = CLINIC_LIGHT_REFRESH_SECONDS
 
         now_gate = datetime.now()
-        # [2026-07-04 user] 預設全天候監測；只有關閉「半夜監測」時才在 00–07 點暫停。
-        _mv = getattr(self, "clinic_night_monitor_var", None)
-        _monitor_night = _mv.get() if _mv is not None else True
-        if not _monitor_night and _reg64_clinic_quiet_hours(now_gate):
+        # [2026-07-13 使用者] 「半夜也監測」設定已移除；固定在 00:00–07:00 暫停 reg64（門診進度/現場
+        # 人數），此時段不刷新。止掛提醒(reg52 掛號數)另有排程、全天候，不受此閘影響。
+        if _reg64_clinic_quiet_hours(now_gate):
             nxt = _reg64_next_allowed_fetch_time(now_gate)
             delay_ms = max(int((nxt - datetime.now()).total_seconds() * 1000), 5_000)
             self.clinic_loop_id = self.root.after(delay_ms, self._update_clinic_lights_loop)
@@ -11547,7 +11526,7 @@ class AutomationApp:
                     "已切換為本程式縮寫",
                     f"偵測到其他縮寫/文字展開軟體（{names}），已自動關閉它、改用本程式縮寫，"
                     "避免同一段文字被重複展開。\n"
-                    "若想改用該軟體：請到「縮寫設定」關閉「自動關閉其他縮寫軟體」後再開啟它。",
+                    "若想改用該軟體：請先在「縮寫設定」關閉「啟用縮寫速寫」，再開啟該軟體。",
                     level="info", auto_close_ms=6000)
             except Exception:
                 logging.debug("[abbrev] 自動關閉提示顯示失敗", exc_info=True)
@@ -11812,14 +11791,16 @@ class AutomationApp:
                 pass
 
     def _abbrev_on_toggle(self):
-        """啟用 / IME / 補空白 checkbox 變動時即時存檔 + reload。"""
+        """啟用 checkbox 變動時即時存檔 + reload。
+        [2026-07-13 使用者] IME 暫停/保留結尾空白/自動關閉其他縮寫軟體不再讓使用者勾選，
+        一律固定開啟（from_dict 已強制 True），這裡只同步「啟用」開關。"""
         cfg = getattr(self, '_abbrev_config_cache', None)
         if cfg is None:
             return
         cfg.enabled = bool(self.abbrev_enabled_var.get())
-        cfg.skip_when_ime_active = bool(self.abbrev_ime_skip_var.get())
-        cfg.preserve_trailing_space = bool(self.abbrev_trailing_space_var.get())
-        cfg.close_external_expander = bool(self.abbrev_close_external_var.get())
+        cfg.skip_when_ime_active = True
+        cfg.preserve_trailing_space = True
+        cfg.close_external_expander = True
         self._abbrev_save_and_reload()
 
     def _abbrev_validate_input(self, abbrev_text, expansion_text, *, ignore_dup=None):
@@ -11982,11 +11963,8 @@ class AutomationApp:
             )
         self._abbrev_config_cache = cfg
 
-        # 控制變數
+        # 控制變數（[2026-07-13 使用者] IME暫停/保留結尾空白/自動關閉其他縮寫軟體不再給勾選，固定開啟）
         self.abbrev_enabled_var = tk.BooleanVar(value=cfg.enabled)
-        self.abbrev_ime_skip_var = tk.BooleanVar(value=cfg.skip_when_ime_active)
-        self.abbrev_trailing_space_var = tk.BooleanVar(value=cfg.preserve_trailing_space)
-        self.abbrev_close_external_var = tk.BooleanVar(value=cfg.close_external_expander)
         self.abbrev_new_abbrev_var = tk.StringVar()
 
         # [2026-06-15] 整頁可捲動:原本「動態日期 token」說明在最底,視窗不夠高時
@@ -12018,27 +11996,14 @@ class AutomationApp:
             row1, text=f"共 {len(cfg.items)} 筆", foreground="#607D8B")
         self._abbrev_count_label.pack(side='right')
 
+        # [2026-07-13 使用者] 移除三個勾選（中文組字中暫停、保留結尾空白、自動關閉其他縮寫軟體）；
+        # 啟用縮寫速寫後這三項一律自動開啟，改為固定說明文字。
         row2 = ttk.Frame(ctrl_frame)
-        row2.pack(fill='x', padx=10, pady=(0, 4))
-        ttk.Checkbutton(
-            row2, text="中文輸入法組字中暫停展開（建議勾選）",
-            variable=self.abbrev_ime_skip_var,
-            command=self._abbrev_on_toggle,
-        ).pack(side='left')
-        ttk.Checkbutton(
-            row2, text="展開後保留結尾空白",
-            variable=self.abbrev_trailing_space_var,
-            command=self._abbrev_on_toggle,
-        ).pack(side='left', padx=(18, 0))
-
-        row3 = ttk.Frame(ctrl_frame)
-        row3.pack(fill='x', padx=10, pady=(0, 6))
-        ttk.Checkbutton(
-            row3,
-            text="允許自動關閉其他縮寫軟體（PhraseExpress 等，不含 AutoHotkey）",
-            variable=self.abbrev_close_external_var,
-            command=self._abbrev_on_toggle,
-        ).pack(side='left')
+        row2.pack(fill='x', padx=10, pady=(0, 6))
+        ttk.Label(
+            row2,
+            text="啟用後自動：中文組字中暫停展開、展開後保留結尾空白、偵測到其他縮寫軟體自動關閉。",
+            foreground="#607D8B", wraplength=560, justify="left").pack(side='left')
 
         # 縮寫列表
         list_frame = ttk.LabelFrame(_body, text="縮寫清單（雙擊可編輯）")
@@ -12181,17 +12146,14 @@ class AutomationApp:
         # --- 左欄內容 (保持不變) ---
         mode_frame = ttk.LabelFrame(left_column, text="模式與顯示設定", padding=10)
         mode_frame.pack(fill=tk.X, pady=(0, 15))
-        dnd_row = ttk.Frame(mode_frame)
-        dnd_row.pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(dnd_row, text="提醒勿擾時段").pack(side=tk.LEFT)
-        ttk.Entry(dnd_row, width=6, textvariable=self.notify_dnd_start_time_var, justify="center").pack(side=tk.LEFT, padx=(6, 2))
-        ttk.Label(dnd_row, text="~").pack(side=tk.LEFT)
-        ttk.Entry(dnd_row, width=6, textvariable=self.notify_dnd_end_time_var, justify="center").pack(side=tk.LEFT, padx=(2, 2))
-        ttk.Label(dnd_row, text="(HH:MM，00:00-24:00)").pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Label(mode_frame, text="勿擾時段只記錄狀態與日誌，不跳彈窗。", foreground="gray", style="Small.TLabel").pack(anchor="w")
-        ttk.Checkbutton(mode_frame, text="半夜(00–07 點)也監測門診並寄止掛提醒信",
-                        variable=self.clinic_night_monitor_var).pack(anchor="w", pady=(4, 0))
-        
+        # [2026-07-13 使用者] 已移除「提醒勿擾時段」「半夜也監測」「顯示外院/分院」三個設定；行為固定：
+        # 止掛提醒 email 全天候照寄、夜間(00–08)只不跳彈窗；外院/分院固定顯示；reg64 固定 00–07 暫停。
+        ttk.Label(mode_frame,
+                  text="止掛提醒 24 小時偵測（夜間 00–08 只寄 email、不跳彈窗）；外院/分院固定顯示；"
+                       "門診進度 00–07 暫停刷新。",
+                  foreground="gray", style="Small.TLabel", wraplength=320,
+                  justify="left").pack(anchor="w")
+
         # 在 _create_settings_tab 內部
         def on_mode_change():
             self.val_out_of_hospital = self.out_of_hospital_var.get()
@@ -12213,12 +12175,7 @@ class AutomationApp:
                 self.status_text.set("狀態: 院內模式")
                 self.update_clock_status_from_web()
 
-        def on_external_clinic_change():
-            self.status_text.set("狀態: 設定變更，正在重新整理顯示...")
-            self._trigger_refresh(True)
-
         ttk.Checkbutton(mode_frame, text="開啟「醫院外模式」", variable=self.out_of_hospital_var, command=on_mode_change).pack(anchor="w", pady=2)
-        ttk.Checkbutton(mode_frame, text="顯示「外院/分院」診次", variable=self.show_external_clinics, command=on_external_clinic_change).pack(anchor="w", pady=2)
 
         ui_scale_frame = ttk.LabelFrame(left_column, text="介面字體", padding=10)
         ui_scale_frame.pack(fill=tk.X, pady=(0, 15))

@@ -33,11 +33,11 @@ def test_external_expander_autoclose_defaults_to_on(tmp_path):
     p = tmp_path / "legacy.json"
     p.write_text(json.dumps({"enabled": True, "items": []}), encoding="utf-8")
     assert ae.load_config(str(p)).close_external_expander is True
-    # 但使用者明確設 False 仍尊重(不被預設覆寫)
+    # [2026-07-13 使用者] 改為「不再讓使用者勾選、一律開啟」：即使存檔明確設 False 也【強制 True】。
     p2 = tmp_path / "explicit_off.json"
     p2.write_text(json.dumps({"close_external_expander": False, "items": []}),
                   encoding="utf-8")
-    assert ae.load_config(str(p2)).close_external_expander is False
+    assert ae.load_config(str(p2)).close_external_expander is True
 
 
 def test_is_auto_closable():
