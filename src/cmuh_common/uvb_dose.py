@@ -225,6 +225,11 @@ class UvbLineInfo:
     date_text: str = ""
     # [v20.15] keyword 文字 ("UVB" 或 "Phototherapy") — format_uvb_line 用
     keyword_text: str = "UVB"
+    # [UC-08 2026-07-12] date_text 在 full_match 內的 (start, end) — format_uvb_line
+    # 寫回時精確替換 parse 選中的那一個日期。行內同值日期出現兩次(如
+    # "(10) 2026/7/8 done, next on (2026/7/8)")時,str.find 會換到第一個而非
+    # parse 選中的那個 → 換錯欄位。None=舊 caller 未填,退回 find 行為。
+    date_span: Optional[tuple] = None
 
 
 # [v20.6 2026-05-26] 從「整段 regex」改成「獨立 field 解析」
@@ -401,6 +406,14 @@ _UVB_MARKER_RE = re.compile(
 )
 _EXCIMER_MARKER_RE = re.compile(r"\bexcimer(?:\s+light)?\b", re.IGNORECASE)
 _EXCIMER_DOSE_RE = re.compile(r"(\d+)\s*(mj(?:/cm2)?)", re.IGNORECASE)
+
+# [UC-08 2026-07-12] triplet 中段((count) 與配對 (日期) 之間)的「裸日期樣 token」
+# 偵測 —— 帶括號的日期本就被 _TRIPLET_RE 的中段排除,裸日期(斜線/連字號/點分)不會。
+# (count) 與較遠的括號日期之間夾另一個日期時,count 的歸屬不明(更可能屬於較近那個
+# 日期)→ Step C 不 bump、uncertain 不納入,留原樣交醫師。典型案例:Step A 更新
+# "(10) 2026/7/8 done, next on (2026/7/8)" 後殘留的重複日期,會讓驅動行自己的 count
+# 被當續行再 +1(count+2、行內兩處日期都被改)。
+_DATE_LIKE_IN_MIDDLE_RE = re.compile(r"\d{2,4}[./-]\d{1,2}[./-]\d{1,2}")
 
 
 # [2026-06-25] excimer 劑量偵測時,前方緊跟「上限 / 加劑量」關鍵字的數字【不是本次劑量】:
@@ -1004,6 +1017,7 @@ def parse_uvb_line(text: str) -> Optional[UvbLineInfo]:
         span=(line_start, max_end),
         date_text=date_text,
         keyword_text=keyword_text,
+        date_span=date_m.span(),   # [UC-08] date_m 是對 segment 匹配,span 直接可用
     )
 
 
@@ -1086,6 +1100,7 @@ def parse_uvb_partial(text: str) -> Optional[UvbLineInfo]:
         span=(line_start, max_end),
         date_text=date_text,
         keyword_text=keyword_text,
+        date_span=date_m.span() if date_m else None,   # [UC-08] 同 parse_uvb_line
     )
 
 
@@ -1177,13 +1192,40 @@ def format_uvb_line(original: UvbLineInfo, *, new_dose: int,
     # 不用 regex 替換是因為要保持其他空白格式
     src = original.full_match
 
-    # 1. 替換 dose：找原 dose 數字第一次出現 (在 UVB 之後)
+    # 1. 替換日期(最先換)— [v20.15] 用 original.date_text 對應同 format 寫回
+    #    (支援 AD slashed / ROC slashed / ROC concat)。
+    # [UC-08 2026-07-12] 優先用 parse 時記下的 date_span 精確替換:
+    #  - 行內同值日期出現兩次(如 "(10) 2026/7/8 done, next on (2026/7/8)")時,
+    #    str.find 會換到第一個而非 parse 選中的那個 → 換錯欄位、殘留的舊日期再被
+    #    Step C 湊成幽靈 triplet(count+2、整行日期被改)。
+    #  - span 是相對原始 full_match 的 offset,dose/count 替換會改變字串長度 →
+    #    日期必須【最先】換(dose/count 用 regex 對齊 pattern,不受先後影響;新日期
+    #    字串必含分隔符或為 7 位數,不可能匹配 1-999 的 count pattern)。
+    #  - span 內容與 date_text 不符(防衛:舊 caller 手工構造 UvbLineInfo)→ 退回
+    #    原 find 行為。
+    _date_done = False
+    if original.date_text:
+        new_date_text = _today_in_format(today, original.date_text)
+        ds = original.date_span
+        if (ds and 0 <= ds[0] < ds[1] <= len(src)
+                and src[ds[0]:ds[1]] == original.date_text):
+            src = src[:ds[0]] + new_date_text + src[ds[1]:]
+        else:
+            idx = src.find(original.date_text)
+            if idx >= 0:
+                src = (src[:idx] + new_date_text
+                       + src[idx + len(original.date_text):])
+            else:
+                src = src.replace(original.date_text, new_date_text, 1)
+        _date_done = True
+
+    # 2. 替換 dose：找原 dose 數字第一次出現 (在 UVB 之後)
     #    使用 regex 因為要對齊「UVB 520」這個 pattern，不能誤改 "(11)" 的 11
     #    [v20.2] 允許「UVB:」冒號 — 跟 parse regex 一致
     #    [v20.18] 接受 "UV" 簡寫 — 跟 _UVB_DOSE_RE 一致
     src = _replace_uvb_dose(src, original.dose, new_dose)
 
-    # 2. 替換 count: (N) → (N+1) — 僅當原本有 count 且傳入 new_count
+    # 3. 替換 count: (N) → (N+1) — 僅當原本有 count 且傳入 new_count
     # [UC-05/codex P2] \u53EA\u66FF\u63DB\u3010\u95DC\u9375\u5B57\u4E4B\u5F8C\u3011\u7684 (N):\u771F\u6B21\u6578\u5728\u5291\u91CF\u4E4B\u5F8C\u3001\u884C\u9996\u6E05\u55AE\u7DE8\u865F\u300C(1)\u300D\u5728\u95DC\u9375\u5B57
     #  \u4E4B\u524D\u3002count \u503C\u525B\u597D\u7B49\u65BC\u884C\u9996\u7DE8\u865F\u6642(\u5982 '(1) UVB 500 (1)'),\u4E0D\u9650\u4F4D\u7F6E\u6703\u628A\u884C\u9996 (1) \u8AA4\u6539\u6210 (2)\u3001
     #  \u771F\u6B21\u6578\u4E0D\u52D5\u3002\u7528\u95DC\u9375\u5B57\u4F4D\u7F6E\u5207\u958B,\u53EA\u5728 tail \u66FF\u63DB\u7B2C\u4E00\u500B\u3002
@@ -1198,16 +1240,8 @@ def format_uvb_line(original: UvbLineInfo, *, new_dose: int,
             count=1,
         )
 
-    # 3. 替換日期 — [v20.15] 用 original.date_text 找原樣字串，對應同 format
-    # 寫回 (支援 AD slashed / ROC slashed / ROC concat 三種格式)
-    if original.date_text:
-        new_date_text = _today_in_format(today, original.date_text)
-        idx = src.find(original.date_text)
-        if idx >= 0:
-            src = (src[:idx] + new_date_text
-                   + src[idx + len(original.date_text):])
-        else:
-            src = src.replace(original.date_text, new_date_text, 1)
+    # 日期已於步驟 1 換完 → 完成
+    if _date_done:
         return src
 
     # Fallback (老舊 caller 沒填 date_text) — 用零填充 AD format
@@ -1665,6 +1699,11 @@ def _detect_uncertain_triplets(text: str, today: date,
         except ValueError:
             continue
         if not (1 <= old_count <= MAX_COUNT):
+            continue
+        # [UC-08 2026-07-12] 與 Step C 同款守衛:(count) 與配對 (日期) 之間夾另一個
+        # 裸日期 → 配對歸屬不明,不納入 uncertain(否則 Step C 跳過的幽靈 triplet 會
+        # 變成 Yes/No 問醫師,按 Yes 又 kept-dose 再 bump 一次)。
+        if _DATE_LIKE_IN_MIDDLE_RE.search(m.group(2)):
             continue
         # [UC-07 2026-07-12] capped(緊鄰劑量 >= 適用 MAX)且已進 decay 區間(>7 天)的段:
         # 「Yes 套用」只 bump count/date、【不重算劑量】(kept-dose)→ 會把未衰退劑量標成
@@ -2276,6 +2315,11 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         # Same-line continuation segments are phototherapy too. They may carry
         # their own date, so update them independently when a dose precedes
         # the triplet. Other different-date triplets remain uncertain.
+        # [UC-08 2026-07-12] (count) 與配對 (日期) 之間夾另一個裸日期 → 配對歸屬不明
+        # (count 更可能屬於較近那個日期;典型=Step A 更新後殘留的重複日期,會把驅動行
+        # 自己的 count 再 +1 成 count+2)→ 不 bump,留原樣交醫師。
+        if _DATE_LIKE_IN_MIDDLE_RE.search(m.group(2)):
+            continue
         dose_prefix = working[max(line_start, m.start() - 32):m.start()]
         continuation_m = re.search(
             r"(\d+)\s*mj(?:/cm2)?\s*$", dose_prefix, re.IGNORECASE)
