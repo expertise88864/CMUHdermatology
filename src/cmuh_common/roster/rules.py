@@ -368,6 +368,73 @@ class PointBalanceRule(Rule):
 
 
 @register_rule
+class ConsecutiveDutyRule(Rule):
+    kind = "soft"
+    rule_id = "consecutive_duty"
+    描述 = ("連續值班軟限制（2026-07-13 使用者需求，取代 G4「無連續限制」舊定案）："
+          "盡量不排連 4 天、更不排連 5 天；3 天勉強可接受。純軟性——硬約束（假日"
+          "成對/三連休/指定/固定週幾）逼出的連值照常成立，本規則只在可行解之間挑"
+          "連值較少的。跨月連續性由 ctx.prev_tail（上月最後 4 天值班）當常數納入。")
+
+    # 權重階梯（objective 單位；1.0 點的點數 dev = 100(scale)×POINT_WEIGHT = 1,000,000；
+    # 最小點數步進 0.01 點 = 10,000；count_balance 全距 ≤31）：
+    #   RUN5 ≈ 10 點 dev —— 幾乎只剩硬約束逼迫才會出現 5 連。
+    #   RUN4 ≈ 3 點 dev —— 寧可挪一班（≈2 點 dev，帳本下月自動找補）也要拆 4 連。
+    #   RUN3 = 500 —— 低於最小點數步進（不犧牲點數公平）、高於 count_balance（≤31）
+    #     → 純同分決勝：白給的情況下偏好 2 連以下（「3 天勉強可接受」）。
+    # 一個 5 連同時含 3 個 3 連窗＋2 個 4 連窗 → 懲罰自然疊加遞增。
+    RUN3_WEIGHT = 500
+    RUN4_WEIGHT = 3_000_000
+    RUN5_WEIGHT = 10_000_000
+
+    def _windows(self, ctx):
+        """產生 (win_dates, length) —— 對「上月尾端＋本月」連續時間軸取 3/4/5 日窗，
+        至少含一個本月日期。ctx.days 為整月升冪（必然日曆連續）。"""
+        from datetime import timedelta
+        tail = sorted(d for d in ctx.prev_tail if d < ctx.days[0])
+        # 只納「與本月首日連續銜接」的尾端（缺天=斷鏈,之前的日子與本月不連續）
+        timeline: list = []
+        cur = ctx.days[0]
+        for d in reversed(tail):
+            if d == cur - timedelta(days=1):
+                timeline.insert(0, d)
+                cur = d
+            else:
+                break
+        timeline += ctx.days
+        first_in_month = len(timeline) - len(ctx.days)
+        for length in (3, 4, 5):
+            for i in range(len(timeline) - length + 1):
+                if i + length - 1 < first_in_month:
+                    continue                      # 全在上月 → 與本次求解無關
+                yield timeline[i:i + length], length
+
+    def objective_terms(self, mc, ctx):
+        if not ctx.days:
+            return []
+        weight = {3: self.RUN3_WEIGHT, 4: self.RUN4_WEIGHT, 5: self.RUN5_WEIGHT}
+        in_month = set(ctx.days)
+        terms = []
+        for m in ctx.members:
+            for win, length in self._windows(ctx):
+                var_days = [d for d in win if d in in_month]
+                prev_days = [d for d in win if d not in in_month]
+                # 上月尾端日不是本人 → 這扇窗不可能成為本人的連值 → 免建變數
+                if any(ctx.prev_tail.get(d) != m.id for d in prev_days):
+                    continue
+                if not var_days:
+                    continue
+                b = mc.model.NewBoolVar(
+                    f"run{length}_{m.id}_{win[0].isoformat()}")
+                # 窗內本月日全排本人 ⇒ sum==len ⇒ b 被逼成 1;否則 b 可為 0(最小化)
+                mc.model.Add(
+                    sum(mc.x[(d, m.id)] for d in var_days)
+                    - (len(var_days) - 1) <= b)
+                terms.append((b, weight[length]))
+        return terms
+
+
+@register_rule
 class DutyCountBalanceRule(Rule):
     kind = "soft"
     rule_id = "count_balance"

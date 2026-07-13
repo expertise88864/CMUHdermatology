@@ -57,6 +57,9 @@ def _sheet_calendar(ws, data: dict) -> None:
                 lines.append(f"R:{r['names'].get(rp, rp)}")
             if vp:
                 lines.append(f"VS:{vs['names'].get(vp, vp)}")
+            bp = (data.get("saturday_biopsy") or {}).get(d)   # [週六切片]
+            if bp:
+                lines.append(f"切:{r['names'].get(bp, bp)}")
             cell = ws.cell(row=row, column=c, value="\n".join(lines))
             if is_weekend(d) or d in data["holidays"]:
                 cell.fill = PatternFill("solid", fgColor="FFF3D6")

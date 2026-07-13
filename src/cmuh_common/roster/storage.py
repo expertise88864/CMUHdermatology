@@ -120,6 +120,20 @@ class RosterStorage:
         self._snapshot(self._path("ledger.json"))
         self._save(self._path("ledger.json"), ledger)
 
+    def load_biopsy(self) -> dict:
+        """週六切片計數帳本 {"counts":{mid:int}, "history":[{month, assign}]}。"""
+        d = self._check_schema(_load_json(self._path("biopsy.json")),
+                               "biopsy.json")
+        d.setdefault("counts", {})
+        d.setdefault("history", [])
+        return d
+
+    def save_biopsy(self, book: dict) -> None:
+        # 比照 save_ledger：寫前 schema 檢查 + .bak 快照（計數帳本可回溯）
+        self._check_schema(_load_json(self._path("biopsy.json")), "biopsy.json")
+        self._snapshot(self._path("biopsy.json"))
+        self._save(self._path("biopsy.json"), book)
+
     def load_week_colors(self) -> dict:
         """{"2026-W31": "pink", ...}（攤平所有年度檔內容）。"""
         d = self._check_schema(_load_json(self._path("week_colors.json")),

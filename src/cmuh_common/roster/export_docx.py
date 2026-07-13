@@ -40,7 +40,12 @@ def export(path: str, data: dict) -> None:
             table.cell(1, c).text = WD_CN[d.weekday()]
             rp = r["duty"].get(d)
             vp = vs["duty"].get(d)
-            table.cell(2, c).text = r["names"].get(rp, rp) if rp else ""
+            rtext = r["names"].get(rp, rp) if rp else ""
+            bp = (data.get("saturday_biopsy") or {}).get(d)   # [週六切片]
+            if bp:
+                rtext = (rtext + "\n" if rtext else "") + \
+                    f"切:{r['names'].get(bp, bp)}"
+            table.cell(2, c).text = rtext
             table.cell(3, c).text = vs["names"].get(vp, vp) if vp else ""
         doc.add_paragraph("")            # 週表格之間留白
 

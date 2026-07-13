@@ -220,6 +220,8 @@ class CalendarDutyTab(ttk.Frame):
         params = ctx.params
         members = self._member_map()
         duty = month.get(f"{self.scope}_duty") or {}
+        # [週六切片] R 分頁的週六格附註(值班連動/次數平衡由 service 排定)
+        biopsy = (month.get("saturday_biopsy") or {}) if self.scope == "r" else {}
 
         for w in self._grid_holder.winfo_children():
             w.destroy()
@@ -231,14 +233,16 @@ class CalendarDutyTab(ttk.Frame):
         y, m = int(ym[:4]), int(ym[5:7])
         for r, week in enumerate(calendar_matrix(y, m), start=1):
             for c, d in enumerate(week):
-                self._make_cell(r, c, d, duty, holidays, params, members)
+                self._make_cell(r, c, d, duty, holidays, params, members,
+                                biopsy)
         for c in range(7):
             self._grid_holder.columnconfigure(c, weight=1)
 
         self._refresh_side(ctx, duty, members)
         self._apply_finalized_state()
 
-    def _make_cell(self, r, c, d, duty, holidays, params, members) -> None:
+    def _make_cell(self, r, c, d, duty, holidays, params, members,
+                   biopsy=None) -> None:
         if d is None:
             tk.Frame(self._grid_holder).grid(row=r, column=c)
             return
@@ -254,8 +258,15 @@ class CalendarDutyTab(ttk.Frame):
         mark = " 🔒" if locked else ""
         hol = "假 " if (d in holidays and not is_weekend(d)) else ""
         text = f"{hol}{d.day}\n{name}\n{pts}點{mark}"
+        # [週六切片] R 分頁週六格第 4 行顯示切片負責人
+        bp = ((biopsy or {}).get(iso) or {}).get("person")
+        height = 3
+        if bp:
+            binfo = members.get(bp)
+            text += f"\n切:{binfo['name'] if binfo else bp}"
+            height = 4
         lbl = tk.Label(self._grid_holder, text=text, bg=bg, fg=fg,
-                       width=8, height=3, relief="ridge", justify="center",
+                       width=8, height=height, relief="ridge", justify="center",
                        font=("Microsoft JhengHei UI", 9))
         lbl.grid(row=r, column=c, sticky="nsew", padx=1, pady=1)
         if not self._finalized:

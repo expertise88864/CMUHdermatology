@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from datetime import date
+from datetime import date, timedelta
 
 from cmuh_common.roster.calendar_colors import week_colors_for_year
 from cmuh_common.roster.clinic_grid import month_grid
@@ -36,6 +36,9 @@ from cmuh_common.roster.solve_day import (
 )
 from cmuh_common.roster.report import build_report
 from cmuh_common.roster.rules import Precheck, collect_directives, run_prechecks
+from cmuh_common.roster.saturday_biopsy import (
+    assign_saturday_biopsy, biopsy_pair, format_biopsy_section,
+    last_assigned_before, settle_biopsy)
 from cmuh_common.roster.solve_rvs import (
     SolveResult, apply_boundary_from_prev, solve_duty,
 )
@@ -105,10 +108,29 @@ class RosterService:
         week_colors.update(self.storage.load_week_colors())
         prev = self.storage.prev_month_last_weekend(ym, scope)
 
+        # [2026-07-13 連續值班] 上月最後 4 天已排值班 → prev_tail(連續值班軟限制
+        # 的跨月常數;5 日窗最多需要往前看 4 天)。上月檔不存在時 load_month 回預設
+        # (duty 空)→ prev_tail 空,規則自動退化成只看本月。
+        prev_tail: dict = {}
+        first = date(y, m, 1)
+        prev_ym = f"{y - 1}-12" if m == 1 else f"{y}-{m - 1:02d}"
+        try:
+            prev_duty = (self.storage.load_month(prev_ym)
+                         .get(f"{scope}_duty") or {})
+            for k in range(1, 5):
+                dd = first - timedelta(days=k)
+                cell = prev_duty.get(dd.isoformat()) or {}
+                if cell.get("person"):
+                    prev_tail[dd] = str(cell["person"])
+        except Exception:
+            logging.exception("[roster.service] 讀上月值班尾端失敗（略過，"
+                              "連續值班限制只看本月）")
+
         ctx = SolveContext(
             scope=scope, year=y, month=m, members=members, holidays=holidays,
             leaves=leaves, must_duty=must, annual_holiday=annual, locks=locks,
             ledger=ledger, week_colors=week_colors, prev_last_weekend=prev,
+            prev_tail=prev_tail,
             params=RosterParams.from_config(cfg))
         ctx.prepare()
         apply_boundary_from_prev(ctx)
@@ -156,11 +178,25 @@ class RosterService:
             logging.warning("build_export 取日排班格網失敗（仍照常匯出 R/VS）",
                             exc_info=True)
             day_grid = {}
+        # [週六切片] 匯出月曆的週六格附註（人名用 r names 對照）
+        sat_biopsy: dict = {}
+        for iso, cell in (month.get("saturday_biopsy") or {}).items():
+            p = (cell or {}).get("person")
+            if not p:
+                continue
+            try:
+                dt = date.fromisoformat(iso)
+            except (ValueError, TypeError):
+                continue
+            if (dt.year, dt.month) == (y, m):
+                sat_biopsy[dt] = str(p)
+
         return {
             "ym": ym, "year": y, "month": m,
             "holidays": holidays,
             "params": RosterParams.from_config(cfg),
             "r": scope_block("r"), "vs": scope_block("vs"),
+            "saturday_biopsy": sat_biopsy,
             "day_slots": month.get("day_slots") or {},
             "day_grid": day_grid,
         }
@@ -498,10 +534,94 @@ class RosterService:
         ctx = self.build_context(scope, ym)
         return solve_duty(ctx, allow_disable_color=allow_disable_color)
 
+    # ── 週六切片（R2/R3 輪排，2026-07-13）────────────────────────────────
+    def _biopsy_compute(self, ym: str, duty_by_date: dict,
+                        book: "dict | None" = None) -> tuple:
+        """以指定值班表計算該月週六切片
+        → (assign, notes, pair, counts_after, names)。
+
+        counts 基底＝biopsy.json 回滾本月舊分錄後的累計（同月重排不重複累計；
+        在副本上回滾，不動傳入的 book）。純計算，不寫任何檔。"""
+        from cmuh_common.roster.saturday_biopsy import rollback_biopsy
+        cfg = self.storage.load_config()
+        members = [Member.from_dict(d) for d in (cfg.get("r_members") or [])]
+        y, m = int(ym[:4]), int(ym[5:7])
+        month = self.storage.load_month(ym)
+        leaves = _parse_date_map((month.get("leaves") or {}).get("r") or {})
+        if book is None:
+            book = self.storage.load_biopsy()
+        base = {"counts": dict(book.get("counts") or {}),
+                "history": [dict(e) for e in (book.get("history") or [])]}
+        rollback_biopsy(base, ym)
+        assign, notes = assign_saturday_biopsy(
+            year=y, month=m, members=members, duty=duty_by_date,
+            leaves=leaves, counts=base["counts"],
+            last_person=last_assigned_before(book, ym))
+        pair, _ = biopsy_pair(members)
+        counts_after = dict(base["counts"])
+        for cell in assign.values():
+            mid = cell["person"]
+            counts_after[mid] = int(counts_after.get(mid, 0)) + 1
+        names = {mm.id: (mm.name or mm.id) for mm in members}
+        return assign, notes, pair, counts_after, names
+
+    def recompute_saturday_biopsy(self, ym: str,
+                                  month: "dict | None" = None) -> tuple:
+        """依月檔現況（r_duty）重排週六切片並結算計數帳本。
+
+        month 傳入 → 就地更新 month["saturday_biopsy"]、【不寫任何檔】，回
+        (assign, notes, book)——呼叫端 save_month 成功後再 save_biopsy(book)
+        （月檔是 gate：定案擋下時計數帳本不得先行落地）。
+        month=None → 自行 load；save_month 成功後 save_biopsy。"""
+        own = month is None
+        if own:
+            month = self.storage.load_month(ym)
+        y, m = int(ym[:4]), int(ym[5:7])
+        duty_by_date: dict = {}
+        for iso, cell in (month.get("r_duty") or {}).items():
+            p = (cell or {}).get("person")
+            if not p:
+                continue
+            try:
+                dt = date.fromisoformat(iso)
+            except (ValueError, TypeError):
+                continue
+            if (dt.year, dt.month) == (y, m):
+                duty_by_date[dt] = str(p)
+        book = self.storage.load_biopsy()
+        assign, notes, pair, after, names = self._biopsy_compute(
+            ym, duty_by_date, book)
+        month["saturday_biopsy"] = {
+            d.isoformat(): dict(cell) for d, cell in assign.items()}
+        # [codex P2] 已存決策報告的[週六切片]段同步刷新——否則手改週六格/請假後,
+        # 報告(與定案 PDF 讀的 report_r)仍印舊切片人選,與月檔/匯出不一致。
+        rpt = month.get("report_r") or ""
+        if rpt and pair:
+            section = format_biopsy_section(assign, notes, after, pair, names)
+            i = rpt.find("[週六切片]")
+            base_rpt = rpt[:i].rstrip() if i >= 0 else rpt.rstrip()
+            month["report_r"] = ((base_rpt + "\n\n" + section)
+                                 if base_rpt else section)
+        settle_biopsy(book, ym, assign)
+        if own:
+            self.storage.save_month(ym, month)   # 定案 → 拋例外,帳本不落地
+            self.storage.save_biopsy(book)
+        return assign, notes, book
+
     def render_report(self, scope: str, ym: str, result: SolveResult) -> str:
-        """以目前 storage 狀態重建 ctx，產生 result 的四段式決策報告（純字串）。"""
+        """以目前 storage 狀態重建 ctx，產生 result 的四段式決策報告（純字串）。
+        R 排班另附「週六切片」預覽段（依 result 的值班連動＋次數平衡，未落地）。"""
         ctx = self.build_context(scope, ym)
-        return build_report(ctx, result, _SCOPE_LABEL.get(scope, scope))
+        base = build_report(ctx, result, _SCOPE_LABEL.get(scope, scope))
+        if scope == "r" and result.status == "ok":
+            try:
+                assign, notes, pair, after, names = self._biopsy_compute(
+                    ym, dict(result.assignments))
+                base += "\n\n" + format_biopsy_section(
+                    assign, notes, after, pair, names)
+            except Exception:
+                logging.exception("[roster.service] 週六切片預覽段生成失敗（略過）")
+        return base
 
     def accept_solution(self, scope: str, ym: str, result: SolveResult) -> None:
         """使用者接受排班結果 → 落地（順序固定）：
@@ -540,13 +660,30 @@ class RosterService:
                                  "locked": False, "source": "auto"}
         month[f"{scope}_duty"] = new_duty
         month.setdefault("last_weekend", {})[scope] = result.last_weekend
-        month[f"report_{scope}"] = build_report(
-            ctx, result, _SCOPE_LABEL.get(scope, scope))
+        report = build_report(ctx, result, _SCOPE_LABEL.get(scope, scope))
+
+        # [週六切片 2026-07-13] R 排班落地 → 以最終月檔 duty（含保留的鎖定格）
+        # 重排週六切片並附報告段；biopsy.json 於 save_month 成功後才寫。
+        biopsy_book = None
+        if scope == "r":
+            try:
+                # 先寫入本次 report(recompute 會在其上刷新/附加[週六切片]段)
+                month["report_r"] = report
+                assign, notes, biopsy_book = self.recompute_saturday_biopsy(
+                    ym, month)
+                report = month["report_r"]
+            except Exception:
+                biopsy_book = None
+                logging.exception("[roster.service] 週六切片重排失敗"
+                                  "（值班照常落地，切片請手動處理）")
+        month[f"report_{scope}"] = report
 
         ledger = self.storage.load_ledger()
         settle_month(ledger, scope, ym, result.points_by_person)
         self.storage.save_ledger(ledger)
         self.storage.save_month(ym, month)
+        if biopsy_book is not None:
+            self.storage.save_biopsy(biopsy_book)
 
     # ── 手動編輯（每次立即存檔 + 審計）──────────────────────────────────
     def set_cell(self, scope: str, ym: str, d: date,
@@ -564,7 +701,17 @@ class RosterService:
             locked = bool(old.get("locked")) if old else False
             duty[iso] = {"person": person, "locked": locked, "source": via}
         self._audit(month, scope, iso, old_person, person, via)
+        # [週六切片] 手改 R 週六值班 → 值班連動可能改變,同批重排(月檔存檔成功
+        # 才寫計數帳本;重排失敗不擋手動改格)。
+        biopsy_book = None
+        if scope == "r" and d.weekday() == 5:
+            try:
+                _a, _n, biopsy_book = self.recompute_saturday_biopsy(ym, month)
+            except Exception:
+                logging.exception("[roster.service] set_cell 週六切片重排失敗（略過）")
         self.storage.save_month(ym, month)
+        if biopsy_book is not None:
+            self.storage.save_biopsy(biopsy_book)
         return self.quick_validate(scope, ym)
 
     def clear_unlocked(self, scope: str, ym: str) -> None:
@@ -585,7 +732,16 @@ class RosterService:
         month[f"{scope}_duty"] = kept
         month[f"report_{scope}"] = ""          # 舊報告已與清除後不符 → 一併清掉
         self._audit(month, scope, "clear_unlocked", None, None, "clear")
+        # [週六切片] R 值班清除 → 切片依殘餘(鎖定)值班+次數平衡重排,與月檔同批
+        biopsy_book = None
+        if scope == "r":
+            try:
+                _a, _n, biopsy_book = self.recompute_saturday_biopsy(ym, month)
+            except Exception:
+                logging.exception("[roster.service] clear_unlocked 週六切片重排失敗（略過）")
         self.storage.save_month(ym, month)
+        if biopsy_book is not None:
+            self.storage.save_biopsy(biopsy_book)
 
     def toggle_lock(self, scope: str, ym: str, d: date) -> bool:
         """切換鎖定（空格不可鎖）。回傳切換後的鎖定狀態。"""
@@ -604,6 +760,14 @@ class RosterService:
 
     def set_leaves(self, scope: str, ym: str, member_id: str, dates) -> None:
         self._set_date_map(scope, ym, "leaves", member_id, dates)
+        # [codex P2] R 請假變動影響週六切片（平衡候選排除/值班連動的請假優先）
+        # → 同步重排＋刷新報告段；定案月 _set_date_map 已先拋,不會走到這裡。
+        if scope == "r":
+            try:
+                self.recompute_saturday_biopsy(ym)
+            except Exception:
+                logging.exception(
+                    "[roster.service] set_leaves 週六切片重排失敗（略過）")
 
     def set_must(self, scope: str, ym: str, member_id: str, dates) -> None:
         self._set_date_map(scope, ym, "must_duty", member_id, dates)
@@ -633,6 +797,12 @@ class RosterService:
         ledger = self.storage.load_ledger()
         settle_month(ledger, scope, ym, points)
         self.storage.save_ledger(ledger)
+        # [週六切片] 重算帳本＝以最終實排為準 → 切片同步重排(含 finalize 前重算)
+        if scope == "r":
+            try:
+                self.recompute_saturday_biopsy(ym)
+            except Exception:
+                logging.exception("[roster.service] resettle 週六切片重排失敗（略過）")
         return points
 
     def finalize(self, ym: str, on: bool) -> None:
@@ -693,7 +863,42 @@ class RosterService:
         checks = list(run_prechecks(ctx, scope))
         checks.extend(self._weekend_integrity(ctx, scope, ym))
         checks.extend(self._manual_cell_checks(ctx, scope, ym))
+        if scope == "r":
+            checks.extend(self._biopsy_checks(ctx, ym))
         return checks
+
+    def _biopsy_checks(self, ctx: SolveContext, ym: str) -> list:
+        """[週六切片] 驗證層安全網：缺 R2/R3 級提示；值班連動不符警告
+        （改格/重排會自動重算,此處只補「外部途徑改壞」的把關）。"""
+        out: list = []
+        pair, notes = biopsy_pair(ctx.members)
+        for n in notes:
+            out.append(Precheck("info", "saturday_biopsy", n))
+        if not pair:
+            return out
+        pair_ids = {m.id for m in pair}
+        month = self.storage.load_month(ym)
+        duty = month.get("r_duty") or {}
+        for iso, cell in sorted((month.get("saturday_biopsy") or {}).items()):
+            dp = (duty.get(iso) or {}).get("person")
+            bp = (cell or {}).get("person")
+            try:
+                dd = date.fromisoformat(iso)
+            except (ValueError, TypeError):
+                continue
+            # 值班連動不符(值班者未請假才要求連動 —— 請假優先於連動)
+            if (dp in pair_ids and bp != dp
+                    and dd not in (ctx.leaves.get(dp) or set())):
+                out.append(Precheck(
+                    "warn", "saturday_biopsy",
+                    f"{dd.month}/{dd.day}(六) 值班 {dp} 為 R2/R3,切片應值班連動"
+                    f"（目前={bp}）；改該週六格或重新排班會自動重算"))
+            # [codex P2] 切片人選當日請假 → 警告(外部途徑改壞月檔的安全網)
+            if bp and dd in (ctx.leaves.get(bp) or set()):
+                out.append(Precheck(
+                    "warn", "saturday_biopsy",
+                    f"{dd.month}/{dd.day}(六) 切片 {bp} 當日請假,請重排或手動調整"))
+        return out
 
     def _result_stale_reason(self, ctx: SolveContext,
                              result: SolveResult) -> "str | None":

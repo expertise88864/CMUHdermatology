@@ -259,6 +259,10 @@ class SolveContext:
     week_colors: dict = field(default_factory=dict)
     prev_last_weekend: Optional[tuple] = None
     boundary_fix: dict = field(default_factory=dict)
+    # [2026-07-13 連續值班] 上月「最後 4 天」的已排值班 {date: member_id}(缺月檔
+    # 或未排=空)。連續值班軟限制需要看跨月尾端,否則上月底連休鏈接本月初的 4/5 連
+    # 看不見。僅供軟規則當常數使用,不產生任何硬約束。
+    prev_tail: dict = field(default_factory=dict)
     params: RosterParams = field(default_factory=RosterParams)
 
     # 建構後由 prepare() 填入
