@@ -1095,6 +1095,29 @@ def _release_status_driver():
 import atexit as _atexit
 _atexit.register(_release_status_driver)
 
+
+def _dismiss_status_driver_alert(driver) -> bool:
+    """清掉常駐 Chrome 頁面上殘留的 JS alert，回傳是否清掉了至少一個。
+
+    [2026-07-14 實機] 打卡網站閒置一段時間會彈「閒置時間過長，將被導向登入畫面！」的
+    JS alert。常駐 status driver 上一輪查完停在打卡頁,放著跨過閒置逾時後那個【未處理的
+    alert】會讓下一次查詢的 driver.get()／任何頁面指令直接拋 UnexpectedAlertPresentException
+    → 整個打卡狀態查詢失敗、UI 顯示不出打卡狀態(reg64 掛號查詢不受影響,故只有打卡壞)。
+    查詢開頭先把它 accept 掉即可恢復(本函式每次查詢都會重新 driver.get 登入頁+重登)。
+    迴圈上限 3 次:accept 後極少數情況頁面會再冒一個,給幾次;正常一次就清完。"""
+    cleared = False
+    for _ in range(3):
+        try:
+            alert = driver.switch_to.alert
+            txt = (alert.text or "").strip()
+            alert.accept()
+            cleared = True
+            logging.info("[打卡] 清除殘留 alert：%s", txt[:40])
+        except Exception:
+            break
+    return cleared
+
+
 # --- [修正] 打卡狀態抓取 (修正密碼錯誤Alert處理 + TAB優化) ---
 # [O3] 改用常駐 Chrome（_get_or_create_status_driver），首次後再按只要 1-2 秒
 def _get_swipe_status_from_web(username, password):
@@ -1117,8 +1140,18 @@ def _get_swipe_status_from_web(username, password):
     result = {'上班': None, '下班': None} 
 
     try:
-        driver.get(LOGIN_URL)
-        
+        # [2026-07-14] 常駐 Chrome 重用時,先清掉上一輪 session 閒置逾時殘留的 alert
+        # (「閒置時間過長，將被導向登入畫面」)。否則接下來的 driver.get 會撞
+        # UnexpectedAlertPresentException 而整個查詢失敗 → 放著跨過閒置逾時後打卡狀態就
+        # 查不到。清完再照常重新 get 登入頁 + 重登。get 若仍撞殘留 alert(清除與 get 之間
+        # races),再清一次重試一次。
+        _dismiss_status_driver_alert(driver)
+        try:
+            driver.get(LOGIN_URL)
+        except UnexpectedAlertPresentException:
+            _dismiss_status_driver_alert(driver)
+            driver.get(LOGIN_URL)
+
         # 1. 輸入帳號並觸發 PostBack
         try:
             user_elem = wait.until(EC.element_to_be_clickable((By.ID, "TB_logid")))
@@ -12060,14 +12093,8 @@ class AutomationApp:
             row1, text=f"共 {len(cfg.items)} 筆", foreground="#607D8B")
         self._abbrev_count_label.pack(side='right')
 
-        # [2026-07-13 使用者] 移除三個勾選（中文組字中暫停、保留結尾空白、自動關閉其他縮寫軟體）；
-        # 啟用縮寫速寫後這三項一律自動開啟，改為固定說明文字。
-        row2 = ttk.Frame(ctrl_frame)
-        row2.pack(fill='x', padx=10, pady=(0, 6))
-        ttk.Label(
-            row2,
-            text="啟用後自動：中文組字中暫停展開、展開後保留結尾空白、偵測到其他縮寫軟體自動關閉。",
-            foreground="#607D8B", wraplength=560, justify="left").pack(side='left')
+        # [2026-07-13 使用者] 三項行為（中文組字中暫停、保留結尾空白、自動關閉其他縮寫
+        # 軟體）啟用縮寫速寫後一律自動開啟；不再顯示勾選，也不顯示說明文字。
 
         # 縮寫列表
         list_frame = ttk.LabelFrame(_body, text="縮寫清單（雙擊可編輯）")
