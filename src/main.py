@@ -1058,6 +1058,90 @@ def _get_or_create_status_driver():
     return driver
 
 
+# 丟棄 driver 時 graceful quit 的寬限秒數;逾時依該 driver 的 chromedriver PID 砍行程樹
+# (正常 quit <2s;卡死才會走到砍樹)。
+_STATUS_DISCARD_QUIT_GRACE_SEC = 8
+
+
+def _discard_status_driver(failed_driver=None) -> None:
+    """丟棄失敗的常駐 driver（下一次查詢會重建全新 Chrome，spin up 約 1-2 秒）。
+
+    [2026-07-15 跨夜] 打卡查詢失敗時呼叫：pool 健康檢查（window_handles）只驗 browser
+    行程活著，renderer 已死（"tab crashed"/"disconnected"，程式放跨夜最常見）時仍會把
+    壞 driver 交回 → 若不丟棄，之後每一輪（含失敗自動重試）都拿到同一個壞 driver 永久
+    失敗；且重試會一直刷新 last_used，連 10 分鐘 idle 淘汰都永遠不觸發。
+
+    [codex] 帶 failed_driver 做身分比對：180s worker-age 保險允許新舊查詢重疊，舊查詢
+    「晚到的失敗」若無條件清池，會把新查詢正在用的【新 driver】quit 掉、害新查詢跟著
+    失敗。只在池中仍是那個失敗的 driver 時才清池；已被汰換 → 只善後失敗的那份自己
+    （新一輪汰換時多半已 quit 過，重複 quit 由 except 容忍）。None＝無條件清（相容）。
+    比照 _get_or_create_status_driver：鎖內只 nullify、鎖外 quit（chromedriver hang 時
+    不可佔住 pool lock 拖累掛號 refresh/UI）。"""
+    pool = _status_driver_pool
+    with pool["lock"]:
+        cur = pool["driver"]
+        if failed_driver is None or cur is failed_driver:
+            pool["driver"] = None
+            to_quit = cur if cur is not None else failed_driver
+        else:
+            to_quit = failed_driver   # 池中已是新 driver → 不動池,只收失敗的那份
+    if to_quit is not None:
+        # [codex P1] quit 丟 daemon 緒非同步執行:chromedriver 卡死時 quit 可能永不返回
+        # (repo 前例:_release_status_driver 因此改走 taskkill)。若在失敗路徑同步 quit,
+        # 查詢的 error 回不去、worker 旗標清不掉、3 分鐘重試也排不了——修跨夜反被 quit
+        # 卡死。
+        # [codex P2] daemon 緒內做「有界清理」:graceful quit 給寬限秒數,逾時就依【該
+        # driver 專屬的 chromedriver PID】精準砍行程樹——否則卡死的 quit 會讓整棵
+        # Chrome 樹殘留,每次重試再開新 driver,一波最多累積 5 棵(程式跨夜長跑不會經過
+        # atexit 清理)。砍樹後卡住的 quit 連線會斷開自行出錯返回,緒也跟著收掉;
+        # 依 PID 鎖定該份 driver,不掃全域、不影響池中的新 driver(身分比對見上)。
+        try:
+            _svc_pid = to_quit.service.process.pid
+        except Exception:
+            _svc_pid = None
+
+        def _quit_async(d=to_quit, svc_pid=_svc_pid):
+            done = threading.Event()
+
+            def _graceful():
+                try:
+                    d.quit()
+                except Exception:
+                    logging.debug("discard status driver quit 失敗", exc_info=True)
+                finally:
+                    done.set()
+
+            try:
+                threading.Thread(target=_graceful, name="StatusDriverQuit",
+                                 daemon=True).start()
+            except Exception:
+                logging.debug("discard graceful quit 緒啟動失敗", exc_info=True)
+                done.set()
+            if done.wait(_STATUS_DISCARD_QUIT_GRACE_SEC):
+                return
+            if not svc_pid:
+                logging.warning("打卡 driver quit 卡住且無 chromedriver PID 可砍（放生）")
+                return
+            try:
+                import psutil as _ps
+                proc = _ps.Process(svc_pid)
+                for ch in proc.children(recursive=True):
+                    try:
+                        ch.kill()
+                    except (_ps.NoSuchProcess, _ps.AccessDenied):
+                        pass
+                proc.kill()
+                logging.warning("打卡 driver quit 卡住(>%ds)，已強制結束 chromedriver "
+                                "PID %s 行程樹", _STATUS_DISCARD_QUIT_GRACE_SEC, svc_pid)
+            except Exception:
+                logging.debug("discard 強制砍 chromedriver 樹失敗", exc_info=True)
+        try:
+            threading.Thread(target=_quit_async, name="StatusDriverDiscard",
+                             daemon=True).start()
+        except Exception:
+            logging.debug("discard quit thread 啟動失敗（略過）", exc_info=True)
+
+
 def _release_status_driver():
     """程式結束時 quit 常駐 driver。
 
@@ -1281,9 +1365,14 @@ def _get_swipe_status_from_web(username, password):
 
     except Exception as e:
         logging.error(f"打卡檢查發生錯誤: {e}")
+        # [2026-07-15 跨夜] 走到這裡多半代表 driver/頁面已壞（tab crashed、載入逾時、
+        # session 斷線）→ 丟棄【本輪失敗的】driver，下一輪（排程或失敗自動重試）重建全新
+        # Chrome，不讓壞 driver 卡住之後所有查詢（健康檢查驗不出 renderer 死亡）。帶身分
+        # 比對：重疊查詢時晚到的失敗不可清掉新查詢正在用的新 driver（見 discard 說明）。
+        _discard_status_driver(driver)
         return {"error": str(e)[:20]}
-    # [O3] 注意：不再 driver.quit()！常駐 Chrome 由 _get_or_create_status_driver
-    # 控管，30 分鐘 idle 自動 quit；程式結束時 atexit 也會清理。
+    # [O3] 注意：正常路徑不 driver.quit()！常駐 Chrome 由 _get_or_create_status_driver
+    # 控管，10 分鐘 idle 自動 quit；程式結束時 atexit 也會清理。
 
 # =============================================================================
 # --- 6. 自動化腳本 ---
@@ -7760,6 +7849,10 @@ class AutomationApp:
         self._settings_promo_loaded = False
         self._settings_promo_loading = False
         self._clock_status_worker_running = False
+        # [2026-07-15 跨夜] 打卡查詢失敗自動重試（3 分鐘、連續上限 5 次、成功歸零）：
+        # 排程一天只有 07:40/08:00/17:03，任一次暫時性失敗原本會灰燈掛到下個排程。
+        self._clock_status_retry_count = 0
+        self._clock_status_retry_after_id = None
         self._clinic_duplicate_rooms_notice = ()
         self._clinic_lights_worker_running = False
         self._clinic_stat_pending_keys = set()
@@ -13267,12 +13360,16 @@ class AutomationApp:
         next_delay = 80 if had_work else 320
         self._ui_queue_poll_id = self.root.after(next_delay, self.process_ui_queue)
         
-    def update_clock_status_from_web(self):
+    def update_clock_status_from_web(self, from_retry=False):
         if threading.current_thread() is not threading.main_thread():
-            self.root.after(0, self.update_clock_status_from_web)
+            self.root.after(0, lambda: self.update_clock_status_from_web(from_retry))
             return
         if getattr(self, '_shutting_down', False):
             return
+        # [2026-07-15 跨夜] 新一波查詢（排程/跨日/啟動/手動）重置重試預算——每波最多
+        # 連續自動重試 _CLOCK_RETRY_MAX 次；重試自身(from_retry=True)不重置，否則上限失效。
+        if not from_retry:
+            self._clock_status_retry_count = 0
         if hasattr(self, 'val_out_of_hospital') and self.val_out_of_hospital:
             logging.info("院外模式開啟中，跳過打卡狀態查詢 (需內網)")
             put_ui_message(self.ui_queue, UiClockStatusMessage(status_data={'error': '院外模式停用'}))
@@ -13362,10 +13459,49 @@ class AutomationApp:
 
         clock_future.add_done_callback(_handle_clock_submit_rejected)
 
+    # ── [2026-07-15 跨夜] 打卡查詢失敗自動重試 ──────────────────────────────
+    _CLOCK_RETRY_DELAY_MS = 3 * 60 * 1000   # 失敗後 3 分鐘重試
+    _CLOCK_RETRY_MAX = 5                    # 連續失敗上限（成功歸零；之後等下個排程/跨日）
+    _CLOCK_RETRY_SKIP_ERRORS = ("院外模式停用",)   # 刻意停用 → 不重試
+
+    def _maybe_retry_clock_status(self, err) -> None:
+        """打卡查詢失敗的自癒重試。排程一天只有 07:40/08:00/17:03（+跨日/啟動），
+        任何一次暫時性失敗（portal 慢、閒置 alert race、Chrome renderer 死）原本會
+        灰燈掛到下個排程——程式放跨夜時＝整個上午看不到打卡狀態。改為失敗後 3 分鐘
+        自動重試、連續上限 5 次（配 _discard_status_driver 每輪都是全新 Chrome）。
+        只由 UI queue 消費端（主緒）呼叫 → root.after 安全；重排前取消前一顆不堆疊。"""
+        if str(err) in self._CLOCK_RETRY_SKIP_ERRORS:
+            return
+        if self._clock_status_retry_count >= self._CLOCK_RETRY_MAX:
+            logging.warning("打卡狀態連續失敗 %d 次，暫停自動重試（等下個排程/跨日再查）",
+                            self._clock_status_retry_count)
+            return
+        self._clock_status_retry_count += 1
+        self._cancel_clock_status_retry()
+        self._clock_status_retry_after_id = self.root.after(
+            self._CLOCK_RETRY_DELAY_MS, self._run_clock_status_retry)
+        logging.info("打卡狀態查詢失敗（%s），3 分鐘後自動重試（第 %d/%d 次）",
+                     err, self._clock_status_retry_count, self._CLOCK_RETRY_MAX)
+
+    def _cancel_clock_status_retry(self) -> None:
+        prev = self._clock_status_retry_after_id
+        self._clock_status_retry_after_id = None
+        if prev is not None:
+            try:
+                self.root.after_cancel(prev)
+            except Exception:
+                logging.debug("取消打卡重試排程失敗", exc_info=True)
+
+    def _run_clock_status_retry(self) -> None:
+        self._clock_status_retry_after_id = None
+        if getattr(self, '_shutting_down', False):
+            return
+        self.update_clock_status_from_web(from_retry=True)
+
     # --- [修正] 更新打卡狀態 UI (加入型別檢查) ---
     def _update_clock_status_ui(self, status_data):
         """
-        status_data: 
+        status_data:
           - 'querying': 正在查詢中 (str)
           - 字典 {'上班': True/False/None, ...}: 查詢結果 (dict)
           - 字典 {'error': ...}: 發生錯誤或停用 (dict)
@@ -13385,12 +13521,18 @@ class AutomationApp:
             # 灰色表示停用或錯誤
             set_light(self.light_in, "gray")
             set_light(self.light_out, "gray")
+            # [2026-07-15 跨夜] 真失敗 → 3 分鐘後自動重試（刻意停用不重試）
+            self._maybe_retry_clock_status(status_data["error"])
             return
 
         # [關鍵修正] 確保 status_data 是字典才繼續，避免 AttributeError
         if not isinstance(status_data, dict):
             logging.error(f"Invalid status_data type received: {type(status_data)}")
             return
+
+        # [2026-07-15 跨夜] 查詢成功 → 歸零連續失敗計數、取消 pending 重試
+        self._clock_status_retry_count = 0
+        self._cancel_clock_status_retry()
 
         # 3. 處理正常結果
         # 上班燈
@@ -14314,6 +14456,10 @@ class AutomationApp:
                 lambda: run_named_job("duty-refresh-4h", lambda: self.bg_executor.submit(self._fetch_all_duty_info))
             ).tag("duty", "4h")
             
+            # [2026-07-15 跨夜] 加 07:40:程式放跨夜時,打卡程式 07:31 自動打卡後原本要等
+            # 08:00 才第一次查詢(每天重開程式的人啟動 +3.5s 就查,反而看得到)→ 07:40 查一次,
+            # 早上到院即看到綠燈。08:00 保留(涵蓋 07:40-08:00 間的手動補打卡)。
+            schedule.every().day.at("07:40").do(lambda: run_named_job("clock-status-0740", self.update_clock_status_from_web)).tag("clock", "daily")
             schedule.every().day.at("08:00").do(lambda: run_named_job("clock-status-0800", self.update_clock_status_from_web)).tag("clock", "daily")
             schedule.every().day.at("17:03").do(lambda: run_named_job("clock-status-1703", self.update_clock_status_from_web)).tag("clock", "daily")
             for update_time in AUTO_UPDATE_CHECK_TIMES:
