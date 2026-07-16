@@ -58,6 +58,41 @@ def test_ui_error_branch_passes_kind():
     assert 'status_data.get("error_kind"' in src, "錯誤分支應把 error_kind 傳給重試閘門"
 
 
+# ── [金絲雀 讀取面] 打卡 portal 結構改版 ──────────────────────────────────────
+def test_portal_changed_kind_is_non_transient():
+    # portal_changed 屬非 transient → retry gate 自動不重試(重試無用)
+    assert main.CLOCK_ERR_PORTAL_CHANGED != main.CLOCK_ERR_TRANSIENT
+    e = main._clock_error("疑似打卡系統改版(表格缺)", main.CLOCK_ERR_PORTAL_CHANGED)
+    assert e["error_kind"] == main.CLOCK_ERR_PORTAL_CHANGED
+
+
+def test_swipe_check_reports_portal_change_on_missing_table():
+    src = inspect.getsource(main._get_swipe_status_from_web)
+    # JS 回報表格元素是否存在
+    assert 'getElementById("Gv_attppre")' in src and '"present"' in src, \
+        "應回報打卡表元素是否存在(區分改版 vs 今日無打卡)"
+    # 登入成功但表格元素不在 → 回 portal_changed(不重試、明示改版)
+    assert "if not table_present:" in src
+    assert "CLOCK_ERR_PORTAL_CHANGED" in src
+    # 相容舊格式(直接回 list)
+    assert "table_present, rows_data = True" in src
+
+
+def test_portal_changed_not_retried(monkeypatch):
+    # 行為:portal_changed 不排自動重試(走非 transient 分支)
+    import types
+    app = types.SimpleNamespace(
+        root=types.SimpleNamespace(after=lambda *a: (_ for _ in ()).throw(
+            AssertionError("portal_changed 不該排重試")),
+            after_cancel=lambda *a: None),
+        _clock_status_retry_count=0, _clock_status_retry_after_id=None,
+        _CLOCK_RETRY_DELAY_MS=1, _CLOCK_RETRY_MAX=5,
+        _cancel_clock_status_retry=lambda: None)
+    main.AutomationApp._maybe_retry_clock_status(
+        app, "疑似打卡系統改版", main.CLOCK_ERR_PORTAL_CHANGED)
+    assert app._clock_status_retry_count == 0
+
+
 # ── 世代序號:卡死舊 worker 不覆寫新結果、不清新旗標(主緒原子閘門) ───────────────
 def test_generation_advanced_before_querying():
     src = inspect.getsource(main.AutomationApp.update_clock_status_from_web)

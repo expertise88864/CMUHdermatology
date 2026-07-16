@@ -83,6 +83,11 @@ from cmuh_common.platform_win import (
 from cmuh_common.notifications import (
     show_windows_notification, show_windows_notification_async, show_winotify_toast)
 from cmuh_common.window_icon import apply_tk_window_icon as _apply_tk_window_icon
+from cmuh_common.contract_canary import (
+    BASELINE_FILENAME as _CANARY_BASELINE_FILENAME,
+    ContractBaseline as _ContractBaseline,
+    compare_fingerprint as _canary_compare,
+)
 from cmuh_common.logging_setup import attach_queue_handler
 from cmuh_common.bounded_executor import BoundedThreadPoolExecutor, RejectedExecutionError
 from cmuh_common.http_client import is_internal as _is_internal
@@ -1004,6 +1009,8 @@ _CLOCK_WORKER_MAX_AGE_SEC = 180
 CLOCK_ERR_AUTH = "auth"            # 帳號/密碼錯、登入被拒 → 絕不自動重試(防鎖帳號)
 CLOCK_ERR_DISABLED = "disabled"   # 刻意停用(院外模式)→ 不重試
 CLOCK_ERR_TRANSIENT = "transient"  # 逾時 / driver crash / 網路 / 未分類 → 可自動重試
+# [金絲雀] portal 結構改版(登入成功但關鍵元素缺)→ 不重試(重試無用)、明示疑似改版
+CLOCK_ERR_PORTAL_CHANGED = "portal_changed"
 
 
 def _clock_error(text, kind: str = CLOCK_ERR_TRANSIENT) -> dict:
@@ -1327,21 +1334,33 @@ def _get_swipe_status_from_web(username, password):
         except Exception:
             logging.warning(f"解析網站日期失敗，使用本機日期: {sys_date}")
 
-        rows_data = driver.execute_script("""
+        # [金絲雀][打卡讀取面] 順便回報打卡表元素是否存在:登入成功(已過 lb_systime 錨點)
+        # 卻連 #Gv_attppre 表格【元素】都不在 → 疑似 portal 改版(元素被改名/移除),而非
+        # 「今日無打卡」(那是元素在、0 列)。改版下不重試、明示,不靜默顯示錯資料。
+        _js = driver.execute_script("""
+            var table = document.getElementById("Gv_attppre");
             var rows = document.querySelectorAll("#Gv_attppre tbody tr");
             var data = [];
             for (var i = 1; i < rows.length; i++) {
                 var cols = rows[i].querySelectorAll("td");
                 if (cols.length >= 3) {
                     data.push([
-                        cols[0].innerText.trim(), 
-                        cols[1].innerText.trim(), 
-                        cols[2].innerText.trim() 
+                        cols[0].innerText.trim(),
+                        cols[1].innerText.trim(),
+                        cols[2].innerText.trim()
                     ]);
                 }
             }
-            return data;
+            return {"present": !!table, "rows": data};
         """)
+        if isinstance(_js, dict):
+            table_present = bool(_js.get("present"))
+            rows_data = _js.get("rows") or []
+        else:                                  # 相容:舊格式(直接回 list)
+            table_present, rows_data = True, (_js or [])
+        if not table_present:
+            logging.error("[金絲雀][打卡] 登入成功但 Gv_attppre 表格元素不存在 → 疑似 portal 改版")
+            return _clock_error("疑似打卡系統改版(表格缺)", CLOCK_ERR_PORTAL_CHANGED)
 
         swipes = []
         if rows_data:
@@ -1454,7 +1473,25 @@ _HOSPITAL_WIN_TITLE_KW = "西醫門診醫師作業"
 # 硬停 + 醫師對話框待有實機可確認 title 格式再補(不確定就不自動動作,連自己的守門也一樣)。
 _HIS_CALIBRATED_VERSION = "1150629"   # 選單 id 校正對應的 HIS 版本(2026-06-29 V.1150629.01 改版後)
 _HIS_VERSION_RE = re.compile(r"[Vv]\.?\s*(\d{6,8})")
-_his_version_checked = False
+
+# ── 契約金絲雀:HIS 寫入面(2026-07-16) ─────────────────────────────────────────
+# F1–F12 靠硬編碼選單 command id 操作 HIS;院方改版(如 2026-06-29 整批 +1)會讓 F 鍵
+# 打到別的選單功能 → 寫錯病歷。金絲雀:每次危險寫入前比對「主視窗版本」與基線,不符即
+# 【fail-closed 停止自動寫入】+ 疑似改版警告,交醫師手動(把「寫錯」換成「不寫、你手動」)。
+# 指紋只用 title 版本號(HIS 選單多為 owner-draw、動態文字讀不到 → 版本字串是最可靠信號)。
+_CANARY_HIS_SURFACE = "his_menu"
+_his_write_verdict = None       # 最近一次 HIS 寫入契約裁決(CanaryVerdict|None),gate 讀它
+_his_current_fp = None          # 最近一次採樣的現況指紋(dict|None),重新校正用
+_his_canary_warned = False      # 疑似改版警告只記一次 log(避免洗版)
+_contract_baseline_singleton = None
+
+
+def _contract_baseline() -> "_ContractBaseline":
+    global _contract_baseline_singleton
+    if _contract_baseline_singleton is None:
+        _contract_baseline_singleton = _ContractBaseline(
+            get_conf_path(_CANARY_BASELINE_FILENAME))
+    return _contract_baseline_singleton
 
 
 def _his_title_version(title: str):
@@ -1463,20 +1500,31 @@ def _his_title_version(title: str):
     return m.group(1) if m else None
 
 
-def _maybe_warn_his_version(title: str) -> None:
-    """一次性:title 版本與校正版本不同 → WARNING(不硬停 F 鍵)。title 沒版本字串 → 不動作(不假警報)。"""
-    global _his_version_checked
-    if _his_version_checked:
-        return
+def _his_write_baseline_fp() -> dict:
+    """HIS 寫入契約基線指紋:優先使用者校正過的基線檔;無則以硬編碼校正版本為隱性基線。"""
+    fp = _contract_baseline().get(_CANARY_HIS_SURFACE)
+    if isinstance(fp, dict) and fp.get("title_version"):
+        return fp
+    return {"title_version": _HIS_CALIBRATED_VERSION}
+
+
+def sample_his_current_fp(title: str):
+    """從 title 採樣 HIS 寫入契約現況指紋;採不到版本回 None(→ 裁決 UNKNOWN,不擋)。純函式。"""
     ver = _his_title_version(title)
-    if ver is None:
-        return                       # title 無版本字串 → 不判斷,避免假警報/永久誤停
-    _his_version_checked = True       # 有抓到版本才算檢查過,避免早期抓不到就永久跳過
-    if ver != _HIS_CALIBRATED_VERSION:
-        logging.warning(
-            "[HIS版本] 主視窗版本=%s 與選單 id 校正版本 %s 不同 —— F 鍵自動選單(代碼輸入/"
-            "同意書/完成不印)的 command id 可能已位移,請實測重新校正(scripts/test_yiling_menu_id.py);"
-            "完成不印已有動態解析備援。", ver, _HIS_CALIBRATED_VERSION)
+    return {"title_version": ver} if ver is not None else None
+
+
+def _sample_his_write_contract(title: str) -> None:
+    """採樣現況並與基線裁決,存 module 變數供寫入 gate 讀。DRIFT 時記一次警告 log。
+    每次找到主視窗都會呼叫(裁決要最新);警告一次性(不洗版)。"""
+    global _his_write_verdict, _his_current_fp, _his_canary_warned
+    _his_current_fp = sample_his_current_fp(title)
+    v = _canary_compare(_CANARY_HIS_SURFACE, _his_write_baseline_fp(),
+                        _his_current_fp)
+    _his_write_verdict = v
+    if v.is_drift and not _his_canary_warned:
+        _his_canary_warned = True
+        logging.warning("[金絲雀] %s", v.human())
 
 # 醫令 子選單 command ID (probe + user 確認;2026-06-29 HIS V.1150629.01 改版後整批 +1)
 MENU_ID_類別字首 = 216   # 215→216(未使用,隨同段 +1)
@@ -1513,7 +1561,8 @@ def _find_hospital_main_window() -> int:
                     ctypes.windll.user32.GetWindowTextW(hwnd, t_buf, n + 1)
                     if _HOSPITAL_WIN_TITLE_KW in t_buf.value:
                         found[0] = hwnd
-                        _maybe_warn_his_version(t_buf.value)  # [M1] 版本守門(一次性,只警示)
+                        # [金絲雀] 採樣 HIS 寫入契約(版本)並裁決,供危險寫入 gate 讀
+                        _sample_his_write_contract(t_buf.value)
                         return False  # 停止枚舉
             except Exception:
                 pass
@@ -1551,6 +1600,32 @@ def _send_yiling_menu_command(hwnd: int, menu_id: int) -> bool:
         logging.warning("PostMessageW WM_COMMAND menu_id=%s 例外 hwnd=%s",
                         menu_id, hwnd, exc_info=True)
         return False
+
+
+def _his_write_contract_ok(main_hwnd: int, label: str) -> bool:
+    """[金絲雀] 危險 HIS 寫入(醫令代碼/UVB 劑量/excimer 劑量)前的 fail-closed 閘門。
+
+    回 True＝契約 OK / 無法判定 → 放行;False＝DRIFT(疑似改版)→ 已擋、已跳警告,呼叫端
+    應乾淨中止本次自動寫入。裁決由 _find_hospital_main_window 找到視窗時採樣存入
+    _his_write_verdict(gate 前一定已呼叫過該函式取得 main_hwnd)。
+
+    【刻意】只有明確 DRIFT 才擋;UNKNOWN(採不到版本)/UNCALIBRATED/OK 都放行——若因假警報
+    或採樣失敗就停掉整組 F 鍵,比改版風險更糟(醫師整天不能用熱鍵)。醫師確認新版無誤後,
+    可到設定頁按「重新校正金絲雀」把現況版本記為新基線即放行。"""
+    v = _his_write_verdict
+    if v is None or not v.should_block_write:
+        return True
+    logging.error("[%s][金絲雀] %s → fail-closed 停止自動寫入", label, v.human())
+    try:
+        _show_uvb_warning(
+            main_hwnd, "疑似院方改版,自動寫入已停",
+            f"HIS 主視窗版本與上次校正不符：{v.detail}\n\n"
+            f"為避免選單 id 位移而寫錯病歷,{label} 已【停止自動處理】。\n"
+            f"請【手動】下醫令/確認劑量;並通知開發者核對 F 鍵選單 id 是否需重新校正。\n\n"
+            f"(若已確認新版本無誤,可到設定頁按「重新校正金絲雀」放行。)")
+    except Exception:
+        logging.debug("[金絲雀] 警告視窗顯示失敗(仍已擋)", exc_info=True)
+    return False
 
 
 def _ensure_hospital_foreground(hwnd: int) -> None:
@@ -1756,6 +1831,10 @@ def _script_code_input_adaptive(code: str, label: str = "",
         logging.warning("[%s adaptive] 找不到主程式視窗 (class=%s, title 含 %s)",
                         label or "code-input", _HOSPITAL_WIN_CLASS,
                         _HOSPITAL_WIN_TITLE_KW)
+        return False
+    # [金絲雀] 送任何選單/打任何醫令代碼前先過契約閘門:疑似改版 → 停止(不寫)
+    if not _his_write_contract_ok(hwnd, label or "代碼輸入"):
+        _mark_hotkey_action_time()
         return False
     workflow_ok = True
     _ensure_hospital_foreground(hwnd)
@@ -2361,6 +2440,11 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
             return False
         logging.info("[%s][UVB] 找不到主程式視窗 — 跳過 (best-effort)", label)
         return True
+
+    # [金絲雀] 寫回劑量前先過契約閘門:疑似改版 → 停止(不寫回處置欄)。strict 的 F2/F3
+    # 回 False 中止;寬鬆的 F1 回 True 略過(與「找不到視窗」的 best-effort 語意一致)。
+    if not _his_write_contract_ok(main_hwnd, f"{label} UVB 劑量更新"):
+        return False if strict else True
 
     # [2026-06-01/06-18] 找照光處置 memo + 分類(見 _resolve_phototherapy_disposition)。
     memo_hwnd, photo_kind = _resolve_phototherapy_disposition(main_hwnd)
@@ -12298,6 +12382,83 @@ class AutomationApp:
             return "break"
         tree.bind("<MouseWheel>", _tree_wheel)
 
+    # ── 契約金絲雀（院方改版偵測）設定區塊 ──────────────────────────────────
+    def _canary_status_text(self) -> str:
+        """HIS 寫入契約現況(讀 module 級最近裁決)。"""
+        v = _his_write_verdict
+        if v is None:
+            return "HIS 寫入契約：尚未偵測（開啟 HIS 主視窗後按「重新整理」）"
+        return "HIS 寫入契約：" + v.human()
+
+    def _build_canary_settings(self, parent) -> None:
+        cf = ttk.LabelFrame(parent, text="契約金絲雀（院方改版偵測）", padding=10)
+        cf.pack(fill=tk.X, pady=(0, 15))
+        self._canary_status_var = tk.StringVar(value=self._canary_status_text())
+        ttk.Label(cf, textvariable=self._canary_status_var, wraplength=300,
+                  justify="left", style="Small.TLabel").pack(anchor="w", pady=(0, 6))
+        btns = ttk.Frame(cf)
+        btns.pack(fill=tk.X)
+        ttk.Button(btns, text="重新整理",
+                   command=self._refresh_canary_status).pack(side=tk.LEFT)
+        ttk.Button(btns, text="重新校正",
+                   command=self._recalibrate_his_canary).pack(side=tk.LEFT, padx=6)
+        ttk.Label(cf, text="偵測到院方改版（主視窗版本與基線不符）時，F 鍵會停止自動"
+                  "寫入醫令/劑量，避免寫錯病歷；確認新版無誤後按「重新校正」放行。",
+                  foreground="gray", wraplength=300, justify="left",
+                  style="Small.TLabel").pack(anchor="w", pady=(6, 0))
+
+    def _refresh_canary_status(self) -> None:
+        """主動找一次 HIS 主視窗（會採樣 _his_write_verdict）並更新顯示。"""
+        try:
+            _find_hospital_main_window()
+        except Exception:
+            logging.debug("[金絲雀] 重新整理採樣失敗", exc_info=True)
+        if hasattr(self, "_canary_status_var"):
+            self._canary_status_var.set(self._canary_status_text())
+
+    def _recalibrate_his_canary(self) -> None:
+        """重新校正 HIS 寫入契約：把現況版本記為新基線（醫師確認新版無誤後）。"""
+        try:
+            _find_hospital_main_window()          # 採樣 → _his_current_fp
+        except Exception:
+            logging.debug("[金絲雀] 校正前採樣失敗", exc_info=True)
+        fp = _his_current_fp
+        if not isinstance(fp, dict) or not fp.get("title_version"):
+            messagebox.showwarning(
+                "無法校正金絲雀",
+                "找不到 HIS 主視窗、或主視窗標題沒有版本號，無法校正。\n"
+                "請先確認「西醫門診醫師作業」主程式已開啟，再試一次。")
+            return
+        ver = fp["title_version"]
+        if not messagebox.askyesno(
+                "確認重新校正金絲雀",
+                f"將把目前 HIS 版本 {ver} 記為新基線。\n\n"
+                f"⚠ 請只在你【已確認新版本的 F 鍵選單/欄位都正確】後才校正——\n"
+                f"校正後金絲雀不再對此版本示警，F 鍵自動寫入會照常進行。\n\n確定校正？"):
+            return
+        try:
+            saved = _contract_baseline().set(_CANARY_HIS_SURFACE, fp,
+                                             note=f"UI 校正 v{ver}")
+        except Exception:
+            logging.exception("[金絲雀] 重新校正失敗")
+            messagebox.showerror("校正失敗", "寫入基線檔失敗，請查看日誌。")
+            return
+        if not saved:
+            # [codex] 基線檔為較新版本 schema → 拒絕覆寫(防降版毀損),不可誤報成功
+            messagebox.showerror(
+                "校正被拒（防降版）",
+                "契約基線檔是較新版本程式寫的，已拒絕用舊版覆寫以免毀損。\n"
+                "請先把本程式更新到最新版，再重新校正。")
+            return
+        try:
+            _find_hospital_main_window()          # 重新採樣(基線=現況 → OK)
+        except Exception:
+            logging.debug("[金絲雀] 校正後重新採樣失敗", exc_info=True)
+        if hasattr(self, "_canary_status_var"):
+            self._canary_status_var.set(self._canary_status_text())
+        messagebox.showinfo("金絲雀已校正",
+                            f"已記錄 HIS 版本 {ver} 為新基線，自動寫入恢復。")
+
     def _create_settings_tab(self, settings_tab):
         canvas = tk.Canvas(settings_tab)
         scrollbar = ttk.Scrollbar(settings_tab, orient="vertical", command=canvas.yview)
@@ -12387,6 +12548,8 @@ class AutomationApp:
         ttk.Label(ui_scale_frame, text="縮放 (0.85–1.45，儲存後重新啟動生效):").pack(anchor="w")
         sp_font = tk.Spinbox(ui_scale_frame, from_=0.85, to=1.45, increment=0.05, width=6, textvariable=self.ui_font_scale_var, format="%.2f")
         sp_font.pack(anchor="w", pady=(4, 0))
+
+        self._build_canary_settings(left_column)   # [金絲雀] 院方改版偵測狀態 + 重新校正
 
         r_doctor_frame = ttk.LabelFrame(left_column, text="R1-R3 醫師姓名（值班對照）", padding=10)
         r_doctor_frame.pack(fill=tk.X, pady=(0, 15))

@@ -22,35 +22,33 @@ def test_m1_his_title_version_parse():
     assert main._his_title_version("") is None
 
 
-def test_m1_warns_only_on_mismatch_and_never_on_missing(caplog):
+def test_m1_upgraded_to_canary_sampling(caplog):
+    # [金絲雀 2026-07-16] M1 版本守門升級為金絲雀:_maybe_warn_his_version 已由
+    # _sample_his_write_contract 取代(採樣 + 裁決 + 一次性警告)。
     import logging
-    # 版本不同 → WARNING
-    main._his_version_checked = False
+    from cmuh_common import contract_canary as cc
+    assert not hasattr(main, "_maybe_warn_his_version"), "舊版本守門應已被金絲雀取代"
+
+    # 版本不同 → DRIFT 裁決 + 一次性警告
+    main._his_write_verdict = None
+    main._his_canary_warned = False
     with caplog.at_level(logging.WARNING):
-        main._maybe_warn_his_version("西醫門診醫師作業 V.1150630.01")
-    assert any("HIS版本" in r.message for r in caplog.records), "版本不同應警示"
-    assert main._his_version_checked is True
+        main._sample_his_write_contract("西醫門診醫師作業 V.1150630.01")
+    assert main._his_write_verdict.status == cc.STATUS_DRIFT
+    assert main._his_write_verdict.should_block_write is True
+    assert any("金絲雀" in r.message for r in caplog.records), "版本不同應警示"
 
-    # 版本相同 → 不警示
-    main._his_version_checked = False
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-        main._maybe_warn_his_version("西醫門診醫師作業 V.1150629.01")
-    assert not any("HIS版本" in r.message for r in caplog.records), "版本相同不應警示"
+    # 版本相同 → OK、不擋
+    main._his_canary_warned = False
+    main._sample_his_write_contract("西醫門診醫師作業 V.1150629.01")
+    assert main._his_write_verdict.status == cc.STATUS_OK
+    assert main._his_write_verdict.should_block_write is False
 
-    # title 無版本字串 → 不動作、不假警報、flag 不設(避免早期抓不到就永久跳過)
-    main._his_version_checked = False
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-        main._maybe_warn_his_version("西醫門診醫師作業")
-    assert not any("HIS版本" in r.message for r in caplog.records)
-    assert main._his_version_checked is False
-
-
-def test_m1_disable_is_deliberately_not_implemented():
-    # 刻意只警示不硬停 F 鍵(版本字串誤判會鎖死醫師)→ 守門:不得出現「停用熱鍵」類硬停動作
-    src = inspect.getsource(main._maybe_warn_his_version)
-    assert "safe_unhook_all_hotkeys" not in src and "return" in src
+    # title 無版本字串 → UNKNOWN(採不到)→ 不擋(不假警報停熱鍵)
+    main._his_canary_warned = False
+    main._sample_his_write_contract("西醫門診醫師作業")
+    assert main._his_write_verdict.status == cc.STATUS_UNKNOWN
+    assert main._his_write_verdict.should_block_write is False
 
 
 # ══ M2：代碼輸入 focus 嚴格判準(previous_focus 未知時排除病歷 memo/rich)══════════
