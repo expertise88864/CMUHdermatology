@@ -587,8 +587,17 @@ def test_clock_status_query_is_single_flight_and_recovers_from_rejection():
         assert "clock_future = self.bg_executor.submit(run_check)" in src
         assert "clock_future.add_done_callback(_handle_clock_submit_rejected)" in src
         assert "RejectedExecutionError" in src
-        assert src.count("self._clock_status_worker_running = False") >= 2
-        assert "UiClockStatusMessage(status_data={'error': '背景忙碌'})" in src
+        # [GPT-5.6 P1 pass1] 旗標清除已移到主緒消費端(_on_clock_status_message,原子 gen 閘門),
+        # update_clock_status_from_web 內只設 True、不再跨緒清旗標。
+        assert "self._clock_status_worker_running = False" not in src
+        consumer = _function_source(ROOT / rel_path, "_on_clock_status_message")
+        assert "self._clock_status_worker_running = False" in consumer
+        assert "generation != self._clock_status_generation" in consumer
+        # [GPT-5.6 P1] 佇列滿的錯誤改走 _clock_error(結構化 kind)、帶 generation 供閘控
+        assert '_clock_error(' in src and '"背景忙碌"' in src
+        # [GPT-5.6 P1] 世代序號:gen 遞增早於 querying;worker 結果帶 generation
+        assert "self._clock_status_generation += 1" in src
+        assert "generation=gen)" in src
 
 
 def test_startup_background_submits_retry_when_queue_is_full():

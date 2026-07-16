@@ -33,8 +33,12 @@ jobs:
           # （requirements.txt 維持不含 ortools＝使用者機器 lazy 安裝設計）。
           # 版本與 src/cmuh_common/roster/__init__.py 的 ORTOOLS_PINNED_VERSION 同步。
           pip install "ortools==9.15.6755"
-          # 防呆：裝失敗立即紅，避免 solver 測試退回靜默 skip 而無人察覺
-          python -c "import ortools"
+          # [GPT-5.6 P1 2026-07-16] 匯出重依賴：CI 補裝 openpyxl/python-docx/reportlab，
+          # 讓 tests/test_roster_export.py 的 10 項真跑（匯出=每月實際用的功能，原本在 CI
+          # 靜默 skip＝等於沒測）。這三個同屬 lazy 安裝設計，requirements.txt 不含。
+          pip install openpyxl python-docx reportlab
+          # 防呆：任一重依賴裝失敗立即紅，避免對應測試退回靜默 skip 而無人察覺
+          python -c "import ortools, openpyxl, docx, reportlab"
 
       - name: Ruff (真 bug 類 lint — F/E9，規則見 ruff.toml)
         run: python -m ruff check src scripts tests

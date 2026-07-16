@@ -997,6 +997,19 @@ _STATUS_DRIVER_PAGELOAD_TIMEOUT = 30
 # 打卡查詢「正在查詢」旗標的年齡上限(秒)。超過視為上一輪卡死、允許強制開新一輪(自癒雙保險)。
 _CLOCK_WORKER_MAX_AGE_SEC = 180
 
+# ── 打卡查詢錯誤分類（2026-07-16）──────────────────────────────────────────────
+# [GPT-5.6 架構審查 P1] 登入/帳密錯原本與逾時同走「灰燈 + 自動重試」→ 錯密碼會被
+# 每波重試 5 次(一天 3 波)反覆送出,有【鎖帳號】風險。改成結構化 error_kind:只有
+# transient(逾時/driver crash/網路)才自動重試;auth(帳密錯)與 disabled(刻意停用)絕不重試。
+CLOCK_ERR_AUTH = "auth"            # 帳號/密碼錯、登入被拒 → 絕不自動重試(防鎖帳號)
+CLOCK_ERR_DISABLED = "disabled"   # 刻意停用(院外模式)→ 不重試
+CLOCK_ERR_TRANSIENT = "transient"  # 逾時 / driver crash / 網路 / 未分類 → 可自動重試
+
+
+def _clock_error(text, kind: str = CLOCK_ERR_TRANSIENT) -> dict:
+    """打卡查詢錯誤結果。error=UI 顯示字串(維持既有短字串);error_kind 供重試閘門判斷。"""
+    return {"error": str(text)[:40], "error_kind": kind}
+
 
 def _get_or_create_status_driver():
     """取得常駐 status driver。若不存在或已 idle 超時就重建。
@@ -1210,7 +1223,7 @@ def _get_swipe_status_from_web(username, password):
     PM_START = dt_time(17, 0); PM_END = dt_time(17, 30)
 
     driver = _get_or_create_status_driver()
-    if not driver: return {"error": "Driver失敗"}
+    if not driver: return _clock_error("Driver失敗", CLOCK_ERR_TRANSIENT)
     
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
@@ -1278,14 +1291,15 @@ def _get_swipe_status_from_web(username, password):
             except UnexpectedAlertPresentException as e:
                 alert_text = e.alert_text
                 logging.error(f"登入時遇到 Alert: {alert_text}")
-                return {"error": f"{alert_text}"} # 直接回傳 Alert 內容給 UI 顯示
-            
+                # [P1] 登入被 portal 以 alert 拒絕＝帳密/帳號問題 → AUTH,絕不自動重試(防鎖帳號)
+                return _clock_error(alert_text, CLOCK_ERR_AUTH)
+
             except TimeoutException:
                 logging.warning("點擊後未偵測到頁面跳轉，可能點擊無效，準備重試...")
                 # 如果有 Alert 擋住，這裡也嘗試切換去接受它
                 try:
                     driver.switch_to.alert.accept()
-                    return {"error": "密碼/帳號錯誤"}
+                    return _clock_error("密碼/帳號錯誤", CLOCK_ERR_AUTH)   # [P1] AUTH 不重試
                 except Exception:
                     pass
 
@@ -1295,7 +1309,9 @@ def _get_swipe_status_from_web(username, password):
                     break
 
         if not login_success:
-            return {"error": "登入逾時/失敗"}
+            # 登入沒成功但也【沒】撞到帳密 alert(上面 AUTH 已先攔)→ 多為 portal 慢/頁面
+            # 未跳轉的暫時性問題 → TRANSIENT,允許有界自動重試。
+            return _clock_error("登入逾時/失敗", CLOCK_ERR_TRANSIENT)
 
         # 4. 解析資料
         sys_date = date.today()
@@ -1370,7 +1386,7 @@ def _get_swipe_status_from_web(username, password):
         # Chrome，不讓壞 driver 卡住之後所有查詢（健康檢查驗不出 renderer 死亡）。帶身分
         # 比對：重疊查詢時晚到的失敗不可清掉新查詢正在用的新 driver（見 discard 說明）。
         _discard_status_driver(driver)
-        return {"error": str(e)[:20]}
+        return _clock_error(str(e), CLOCK_ERR_TRANSIENT)
     # [O3] 注意：正常路徑不 driver.quit()！常駐 Chrome 由 _get_or_create_status_driver
     # 控管，10 分鐘 idle 自動 quit；程式結束時 atexit 也會清理。
 
@@ -7849,6 +7865,10 @@ class AutomationApp:
         self._settings_promo_loaded = False
         self._settings_promo_loading = False
         self._clock_status_worker_running = False
+        # [GPT-5.6 P1 2026-07-16] 打卡查詢「世代序號」:180s age 保險允許卡死的舊 worker 尚未
+        # 結束就開新一輪,兩者共用 driver。序號只由主緒在開新一輪時 +1;worker 收尾/發布結果
+        # 前比對自己的 gen 是否仍是最新 → 晚完成的舊 worker 不清新一輪的旗標、不覆寫新結果。
+        self._clock_status_generation = 0
         # [2026-07-15 跨夜] 打卡查詢失敗自動重試（3 分鐘、連續上限 5 次、成功歸零）：
         # 排程一天只有 07:40/08:00/17:03，任一次暫時性失敗原本會灰燈掛到下個排程。
         self._clock_status_retry_count = 0
@@ -12351,8 +12371,9 @@ class AutomationApp:
                 except Exception:
                     logging.exception("[abbrev] 院外模式切換後 install 失敗")
                 self.status_text.set("狀態: 院外模式 (功能已停用)")
-                # 打卡燈號設為灰色表示停用
-                put_ui_message(self.ui_queue, UiClockStatusMessage(status_data={'error': '院外模式停用'}))
+                # 打卡燈號設為灰色表示停用（disabled → 不觸發自動重試）
+                put_ui_message(self.ui_queue, UiClockStatusMessage(
+                    status_data=_clock_error("院外模式停用", CLOCK_ERR_DISABLED)))
             else:
                 logging.info("切換至 [院內模式]")
                 self.setup_hotkeys()
@@ -13313,8 +13334,8 @@ class AutomationApp:
                         # 【效能 2026.05.20】debounce — 4 個 duty future 完成順序不一，
                         # 同步寫 4 次同一檔會凍 UI 150-300ms。
                         self._schedule_save_cache('cache_duty_info.json', duty_cache)
-                    case UiClockStatusMessage(status_data=payload):
-                        self._update_clock_status_ui(payload)
+                    case UiClockStatusMessage(status_data=payload, generation=gen):
+                        self._on_clock_status_message(payload, gen)
                     case _:
                         logging.warning("未知的 UI 訊息型別: %r", msg)
         except Exception:
@@ -13372,7 +13393,8 @@ class AutomationApp:
             self._clock_status_retry_count = 0
         if hasattr(self, 'val_out_of_hospital') and self.val_out_of_hospital:
             logging.info("院外模式開啟中，跳過打卡狀態查詢 (需內網)")
-            put_ui_message(self.ui_queue, UiClockStatusMessage(status_data={'error': '院外模式停用'}))
+            put_ui_message(self.ui_queue, UiClockStatusMessage(
+                status_data=_clock_error("院外模式停用", CLOCK_ERR_DISABLED)))
             return
         if self._clock_status_worker_running:
             # [2026-06-26] 年齡保險:正常一輪查詢頂多幾十秒。若「正在查詢」已超過上限(疑似上一輪
@@ -13385,7 +13407,12 @@ class AutomationApp:
             logging.warning(
                 "打卡狀態上一輪查詢疑似卡住(>%d秒)，強制開新一輪", _CLOCK_WORKER_MAX_AGE_SEC)
 
-        put_ui_message(self.ui_queue, UiClockStatusMessage(status_data='querying'))
+        # [GPT-5.6 P1 pass1] 世代序號在【發布 querying 之前】就遞增,並讓後續 worker 結果
+        # 一律帶 gen 由主緒消費端閘控 → 晚到的舊世代結果一定排在新 querying 之後也會被拒。
+        self._clock_status_generation += 1
+        gen = self._clock_status_generation
+        put_ui_message(self.ui_queue,
+                       UiClockStatusMessage(status_data='querying'))
 
         # [修正] 從設定檔讀取，不把帳密寫死在程式碼裡
         # [v18 2026-05-25] base64 decode 加保護 — credentials.json 部分損壞 /
@@ -13428,49 +13455,64 @@ class AutomationApp:
                 _write_default_credentials()
         except Exception as e:
             logging.error(f"讀取打卡帳號失敗: {e}")
-            put_ui_message(self.ui_queue, UiClockStatusMessage(status_data={'error': '帳號讀取失敗'}))
+            put_ui_message(self.ui_queue, UiClockStatusMessage(
+                status_data=_clock_error("帳號讀取失敗", CLOCK_ERR_TRANSIENT)))
             return
 
         logging.info(f"Starting background clock status check for {username}...")
 
-        def run_check():
+        # [GPT-5.6 P1 pass1] worker 不再自行比對 gen / 清旗標(check-then-act 跨緒非原子)。
+        # 改為:worker 只【一律發布】帶自己 gen 的結果訊息;主緒消費端(_on_clock_status_message,
+        # 唯一改 generation 者)比對 gen → 過時世代直接拒收、gen 相符才套用結果並清 running
+        # 旗標。比對與清旗標同在主緒 = 原子,徹底消除「舊 worker 晚到覆寫新結果/誤清新旗標」。
+        def run_check(gen=gen):
             try:
                 status_result = _get_swipe_status_from_web(username, password)
-                put_ui_message(self.ui_queue, UiClockStatusMessage(status_data=status_result))
             except Exception:
                 logging.exception("打卡狀態背景查詢失敗")
-                put_ui_message(self.ui_queue, UiClockStatusMessage(status_data={'error': '查詢失敗'}))
-            finally:
-                self._clock_status_worker_running = False
+                status_result = _clock_error("查詢失敗", CLOCK_ERR_TRANSIENT)
+            put_ui_message(self.ui_queue, UiClockStatusMessage(
+                status_data=status_result, generation=gen))
 
         self._clock_status_worker_running = True
         self._clock_status_worker_started_at = time.time()   # [2026-06-26] 給年齡保險判斷用
         clock_future = self.bg_executor.submit(run_check)
 
-        def _handle_clock_submit_rejected(fut):
+        def _handle_clock_submit_rejected(fut, gen=gen):
             try:
                 rejected = fut.cancelled() or isinstance(fut.exception(), RejectedExecutionError)
             except Exception:
                 rejected = False
             if rejected:
-                self._clock_status_worker_running = False
                 logging.warning("打卡狀態背景查詢未啟動：背景佇列已滿")
-                put_ui_message(self.ui_queue, UiClockStatusMessage(status_data={'error': '背景忙碌'}))
+                # 帶 gen:主緒消費端會據此清旗標(gen 相符時)+套用錯誤,不在此跨緒直接清旗標
+                put_ui_message(self.ui_queue, UiClockStatusMessage(
+                    status_data=_clock_error("背景忙碌", CLOCK_ERR_TRANSIENT),
+                    generation=gen))
 
         clock_future.add_done_callback(_handle_clock_submit_rejected)
 
     # ── [2026-07-15 跨夜] 打卡查詢失敗自動重試 ──────────────────────────────
     _CLOCK_RETRY_DELAY_MS = 3 * 60 * 1000   # 失敗後 3 分鐘重試
     _CLOCK_RETRY_MAX = 5                    # 連續失敗上限（成功歸零；之後等下個排程/跨日）
-    _CLOCK_RETRY_SKIP_ERRORS = ("院外模式停用",)   # 刻意停用 → 不重試
 
-    def _maybe_retry_clock_status(self, err) -> None:
+    def _maybe_retry_clock_status(self, err, kind=CLOCK_ERR_TRANSIENT) -> None:
         """打卡查詢失敗的自癒重試。排程一天只有 07:40/08:00/17:03（+跨日/啟動），
         任何一次暫時性失敗（portal 慢、閒置 alert race、Chrome renderer 死）原本會
         灰燈掛到下個排程——程式放跨夜時＝整個上午看不到打卡狀態。改為失敗後 3 分鐘
         自動重試、連續上限 5 次（配 _discard_status_driver 每輪都是全新 Chrome）。
-        只由 UI queue 消費端（主緒）呼叫 → root.after 安全；重排前取消前一顆不堆疊。"""
-        if str(err) in self._CLOCK_RETRY_SKIP_ERRORS:
+        只由 UI queue 消費端（主緒）呼叫 → root.after 安全；重排前取消前一顆不堆疊。
+
+        [GPT-5.6 P1] 只重試 transient(逾時/driver/網路);auth(帳密錯)與 disabled(院外模式)
+        絕不重試——否則錯密碼會被每波 5 次反覆送出而【鎖帳號】。未帶 kind → 視為 transient
+        (相容;所有 auth 路徑已在 _get_swipe_status_from_web 明確標記)。"""
+        if kind != CLOCK_ERR_TRANSIENT:
+            # [GPT-5.6 P1 pass1] auth/disabled 不只是「不再排新重試」——還要【取消先前
+            # transient 失敗已排下的重試】,否則那顆 3 分鐘 callback 仍會帶已知錯的帳密重登
+            # → 破壞「auth 絕不重試」保證、多送一次鎖帳號嘗試。
+            logging.info("打卡狀態錯誤類型=%s（非暫時性）→ 不自動重試,並取消既有重試（%s）",
+                         kind, err)
+            self._cancel_clock_status_retry()
             return
         if self._clock_status_retry_count >= self._CLOCK_RETRY_MAX:
             logging.warning("打卡狀態連續失敗 %d 次，暫停自動重試（等下個排程/跨日再查）",
@@ -13498,6 +13540,22 @@ class AutomationApp:
             return
         self.update_clock_status_from_web(from_retry=True)
 
+    def _on_clock_status_message(self, status_data, generation) -> None:
+        """[GPT-5.6 P1 pass1] 打卡查詢訊息在主緒(唯一改 generation 者)的世代閘門。
+
+        generation is None → 非 worker 結果(querying/停用/設定錯)→ 直接套用、不動旗標。
+        generation 有值 → worker 結果:與目前世代不符即拒收(卡死舊 worker 晚到,不覆寫新
+        一輪)；相符才清 running 旗標並套用。比對與清旗標同在主緒 = 原子,無跨緒 check-then-act
+        競態(worker 只讀 generation、不寫)。"""
+        if generation is not None:
+            if generation != self._clock_status_generation:
+                logging.info("打卡狀態舊世代(gen=%s)結果已過時,丟棄(現 gen=%s)",
+                             generation, self._clock_status_generation)
+                return
+            # 這一輪(最新世代)的 worker 已回報 → 清單飛旗標(主緒,安全)
+            self._clock_status_worker_running = False
+        self._update_clock_status_ui(status_data)
+
     # --- [修正] 更新打卡狀態 UI (加入型別檢查) ---
     def _update_clock_status_ui(self, status_data):
         """
@@ -13521,8 +13579,11 @@ class AutomationApp:
             # 灰色表示停用或錯誤
             set_light(self.light_in, "gray")
             set_light(self.light_out, "gray")
-            # [2026-07-15 跨夜] 真失敗 → 3 分鐘後自動重試（刻意停用不重試）
-            self._maybe_retry_clock_status(status_data["error"])
+            # [2026-07-15 跨夜／GPT-5.6 P1] 只有 transient 才 3 分鐘後自動重試;
+            # auth(帳密錯,防鎖帳號)與 disabled(院外模式)不重試。未帶 kind 視為 transient。
+            self._maybe_retry_clock_status(
+                status_data["error"],
+                status_data.get("error_kind", CLOCK_ERR_TRANSIENT))
             return
 
         # [關鍵修正] 確保 status_data 是字典才繼續，避免 AttributeError

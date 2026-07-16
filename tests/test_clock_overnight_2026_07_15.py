@@ -194,42 +194,71 @@ def _fake_app():
         _clock_status_retry_after_id=None,
         _CLOCK_RETRY_DELAY_MS=main.AutomationApp._CLOCK_RETRY_DELAY_MS,
         _CLOCK_RETRY_MAX=main.AutomationApp._CLOCK_RETRY_MAX,
-        _CLOCK_RETRY_SKIP_ERRORS=main.AutomationApp._CLOCK_RETRY_SKIP_ERRORS,
         _run_clock_status_retry=lambda: None,
         _maybe_retry_clock_status=None, _cancel_clock_status_retry=None)
 
 
-def test_retry_scheduled_on_failure_and_capped():
-    app = _fake_app()
+def _bound_retry(app):
     app._cancel_clock_status_retry = types.MethodType(
         main.AutomationApp._cancel_clock_status_retry, app)
-    retry = types.MethodType(main.AutomationApp._maybe_retry_clock_status, app)
-    for i in range(1, 6):                       # 連續 5 次失敗 → 每次都排重試
-        retry("查詢失敗")
+    return types.MethodType(main.AutomationApp._maybe_retry_clock_status, app)
+
+
+def test_retry_scheduled_on_failure_and_capped():
+    app = _fake_app()
+    retry = _bound_retry(app)
+    for i in range(1, 6):                       # 連續 5 次 transient 失敗 → 每次都排重試
+        retry("查詢失敗", main.CLOCK_ERR_TRANSIENT)
         assert app._clock_status_retry_count == i
         assert len(app.root.scheduled) == i
         assert app.root.scheduled[-1][0] == 3 * 60 * 1000   # 3 分鐘
-    retry("查詢失敗")                            # 第 6 次 → 超過上限,不再排
+    retry("查詢失敗", main.CLOCK_ERR_TRANSIENT)   # 第 6 次 → 超過上限,不再排
     assert len(app.root.scheduled) == 5, "連續失敗達上限後應停止重試"
 
 
 def test_retry_skips_deliberate_disable():
     app = _fake_app()
-    app._cancel_clock_status_retry = types.MethodType(
-        main.AutomationApp._cancel_clock_status_retry, app)
-    retry = types.MethodType(main.AutomationApp._maybe_retry_clock_status, app)
-    retry("院外模式停用")                        # 刻意停用 → 不重試
+    retry = _bound_retry(app)
+    retry("院外模式停用", main.CLOCK_ERR_DISABLED)   # 刻意停用 → 不重試
     assert app.root.scheduled == []
     assert app._clock_status_retry_count == 0
 
 
+def test_retry_skips_auth_error_to_avoid_lockout():
+    # [GPT-5.6 P1] 帳密錯(auth)絕不自動重試 —— 否則每波 5 次反覆送出會鎖帳號。
+    app = _fake_app()
+    retry = _bound_retry(app)
+    retry("密碼/帳號錯誤", main.CLOCK_ERR_AUTH)
+    assert app.root.scheduled == [], "auth 錯誤不得排自動重試(防鎖帳號)"
+    assert app._clock_status_retry_count == 0
+
+
+def test_auth_cancels_already_armed_transient_retry():
+    # [GPT-5.6 P1 pass1] 先前 transient 失敗已排 3 分鐘重試,隨後某輪報 auth →
+    # 必須【取消】那顆 pending 重試,否則它照樣帶已知錯帳密重登(多送一次鎖帳號嘗試)。
+    app = _fake_app()
+    retry = _bound_retry(app)
+    retry("查詢失敗", main.CLOCK_ERR_TRANSIENT)          # 先排一顆
+    assert app._clock_status_retry_after_id is not None
+    armed = app._clock_status_retry_after_id
+    retry("密碼/帳號錯誤", main.CLOCK_ERR_AUTH)           # auth 進來
+    assert armed in app.root.cancelled, "auth 應取消先前已排的 transient 重試"
+    assert app._clock_status_retry_after_id is None
+
+
+def test_retry_unknown_kind_defaults_transient():
+    # 相容:未帶 kind → 視為 transient(仍自動重試)。
+    app = _fake_app()
+    retry = _bound_retry(app)
+    retry("查詢失敗")                            # 不傳 kind
+    assert len(app.root.scheduled) == 1
+
+
 def test_retry_cancels_previous_before_rescheduling():
     app = _fake_app()
-    app._cancel_clock_status_retry = types.MethodType(
-        main.AutomationApp._cancel_clock_status_retry, app)
-    retry = types.MethodType(main.AutomationApp._maybe_retry_clock_status, app)
-    retry("查詢失敗")
-    retry("查詢失敗")
+    retry = _bound_retry(app)
+    retry("查詢失敗", main.CLOCK_ERR_TRANSIENT)
+    retry("查詢失敗", main.CLOCK_ERR_TRANSIENT)
     assert "after#1" in app.root.cancelled, "重排前應取消前一顆 after(不堆疊)"
 
 

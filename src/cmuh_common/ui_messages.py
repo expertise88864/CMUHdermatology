@@ -7,7 +7,7 @@
 from dataclasses import dataclass
 from datetime import date
 from queue import Empty, Full, Queue
-from typing import Any, TypeAlias, Union
+from typing import Any, Optional, TypeAlias, Union
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,8 +54,14 @@ class UiSaturdayVsMessage:
 
 @dataclass(frozen=True, slots=True)
 class UiClockStatusMessage:
-    """payload: 'querying' | dict（打卡結果或 {'error': ...}）"""
+    """payload: 'querying' | dict（打卡結果或 {'error': ...}）。
+
+    generation: 打卡查詢「世代序號」。worker 發布結果時帶自己那一輪的 gen；主緒消費端
+    (唯一改 generation 者)比對後拒收過時世代 → 卡死舊 worker 晚到的結果不覆寫新一輪、
+    也由消費端在 gen 相符時清 running 旗標（檢查與清旗標同在主緒＝原子,無跨緒競態）。
+    None＝非 worker 結果(querying/停用/設定錯)→ 一律套用、不動旗標。"""
     status_data: Union[str, dict[str, Any]]
+    generation: Optional[int] = None
 
 
 @dataclass(frozen=True, slots=True)
