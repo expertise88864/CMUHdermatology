@@ -1466,7 +1466,7 @@ _HOSPITAL_WIN_TITLE_KW = "西醫門診醫師作業"
 # 【刻意只警示、不硬停 F 鍵】:硬停在版本字串誤判時會讓醫師整組熱鍵失效(比原 bug 更糟);且完成不印
 # 已有 _find_menu_command_id_by_text 動態解析當備援。title 沒有可辨識版本字串 → 不動作(避免假警報)。
 # 硬停 + 醫師對話框待有實機可確認 title 格式再補(不確定就不自動動作,連自己的守門也一樣)。
-_HIS_CALIBRATED_VERSION = "1150629"   # 選單 id 校正對應的 HIS 版本(2026-06-29 V.1150629.01 改版後)
+_HIS_CALIBRATED_VERSION = "1150713"   # 選單 id 校正對應的 HIS 版本(2026-07-13 V.1150713.02 改版後,使用者實測選單 id 仍正常;前一版 1150629)
 _HIS_VERSION_RE = re.compile(r"[Vv]\.?\s*(\d{6,8})")
 # [金絲雀 2026-07-17] 另抓含尾碼的完整版本(V.1150629.01 → 1150629.01)。主版本相同但尾碼
 # 不同(.01→.02)也可能是改版;但尾碼比對【只在基線本身帶尾碼時】才生效(見 sample_his_current_fp)
@@ -1482,6 +1482,12 @@ _CANARY_HIS_SURFACE = "his_menu"
 # [codex] 不再保留「最近裁決/現況指紋」的可變全域——安全關鍵路徑(寫入 gate、重新校正)
 # 與設定頁顯示都【自足即時採樣】(用當下 hwnd 的 title 現算),徹底免除跨緒覆寫/清空競態。
 _his_canary_warned = False      # 疑似改版警告只記一次 log(避免洗版),非競態敏感
+# [金絲雀 2026-07-17 使用者定案] 改版時【不擋自動寫入、不跳窗】,只寄信通知一次(每個偵測到
+# 的現況版本一次,避免洗版)。notified=寄信成功、終局去重;inflight=同版本寄送中(擋並發、
+# 避免每次找視窗堆一條 60s 逾時背景緒);兩者共用同一 lock(去重跨緒安全)。
+_his_drift_notified_versions: set = set()
+_his_drift_inflight_versions: set = set()
+_his_drift_notify_lock = threading.Lock()
 _contract_baseline_singleton = None
 
 
@@ -1538,14 +1544,99 @@ def _his_write_verdict_for(title: str):
                            sample_his_current_fp(title))
 
 
+def _load_alert_recipients() -> list:
+    """讀 threshold_settings.json 的 alert_email_recipients(與止掛提醒同一組收件人)。
+    模組級、不依賴 app 實例;讀不到/無設定回空 list(→ 不寄、不報錯)。"""
+    import json
+    try:
+        with open(get_conf_path('threshold_settings.json'), encoding='utf-8') as f:
+            d = json.load(f)
+        r = d.get('alert_email_recipients')
+        if isinstance(r, list):
+            return [str(x).strip() for x in r if str(x).strip()]
+    except Exception:
+        logging.debug("[金絲雀] 讀取通知收件人失敗", exc_info=True)
+    return []
+
+
+def _his_drift_current_version(verdict) -> str:
+    """從裁決取現況版本當「已通知」去重 key。
+    [codex] 優先用含尾碼的完整版本(title_version_full)—— 否則同主版本的點版(如 1150714.01
+    與 1150714.02)會共用同一 key、後者被去重吃掉、漏通知。無 full 差異則退主版本,再退 detail。"""
+    cur_major = None
+    for ch in (verdict.changes or []):
+        if not ch:
+            continue
+        if ch[0] == "title_version_full":
+            return str(ch[2])
+        if ch[0] == "title_version":
+            cur_major = str(ch[2])
+    if cur_major is not None:
+        return cur_major
+    return verdict.detail or "unknown"
+
+
+def _notify_his_drift(verdict) -> None:
+    """[金絲雀 2026-07-17 使用者定案] 偵測到 HIS 改版 → 【寄信通知一次】(每個現況版本只寄
+    一次,避免洗版),但【不擋自動寫入、不跳警告視窗】。功能照常執行;醫師若發現異常會自行
+    停用。理由:實務上「誤擋 + 每按一次跳窗」比偶發改版更難用;改版風險由醫師現場判斷兜底。
+    寄信丟背景 daemon 緒(SMTP 逾時可達 60s,絕不可卡住熱鍵/找視窗流程)。
+
+    [codex] 「已通知」只在【寄信成功後】才記,寄失敗/起緒失敗則釋放、留待下次找視窗重試
+    (否則一次暫時性 SMTP 失敗就讓該版本整個 process 再也不通知)。同時用 in-flight 集合鎖住
+    「同版本同時只允許一次寄送」,避免每次找視窗都堆一條 60s 逾時的背景緒。"""
+    ver = _his_drift_current_version(verdict)
+    with _his_drift_notify_lock:
+        if (ver in _his_drift_notified_versions
+                or ver in _his_drift_inflight_versions):
+            return
+        _his_drift_inflight_versions.add(ver)
+
+    subject = f"[皮膚科自動化] 偵測到 HIS 主視窗改版:{ver}"
+    body = (f"HIS 主視窗版本與金絲雀校正基線不符。\n\n{verdict.human()}\n\n"
+            f"F 鍵自動化【未被擋下、仍照常執行】(依使用者設定:改版只通知、不停用)。\n"
+            f"請盡快核對 F1–F11 選單 id 是否仍正確;若功能異常,請先手動停用該熱鍵,並更新"
+            f"校正版本(_HIS_CALIBRATED_VERSION)或於設定頁按「重新校正」把現況記為新基線。\n\n"
+            f"(同一版本此信只寄一次。)")
+
+    def _bg() -> None:
+        ok = False
+        try:
+            recipients = _load_alert_recipients()
+            if recipients:
+                ok = bool(_send_alert_email_via_smtp(subject, body, recipients))
+            else:
+                logging.debug("[金絲雀] 偵測到改版但無通知收件人(alert_email_recipients 空),"
+                              "稍後找視窗時再試")
+        except Exception:
+            logging.debug("[金絲雀] 改版通知寄信失敗(不影響操作),稍後重試", exc_info=True)
+        finally:
+            with _his_drift_notify_lock:
+                _his_drift_inflight_versions.discard(ver)
+                if ok:   # 只有真的寄成功才標記「已通知」,失敗留待重試
+                    _his_drift_notified_versions.add(ver)
+
+    try:
+        threading.Thread(target=_bg, daemon=True, name="canary-drift-mail").start()
+    except Exception:
+        # 連背景緒都起不了 → 釋放 in-flight,讓下次找視窗可重試(不永久卡住通知)
+        with _his_drift_notify_lock:
+            _his_drift_inflight_versions.discard(ver)
+        logging.debug("[金絲雀] 通知背景緒啟動失敗(稍後重試)", exc_info=True)
+
+
 def _sample_his_write_contract(title: str) -> None:
-    """[金絲雀] 找到主視窗時的一次性改版警告:DRIFT 記一次 warning log(不存任何全域、
-    不影響 gate——gate 自足採樣)。純提示用途,讓改版在按 F 鍵前就先被記錄。"""
+    """[金絲雀 2026-07-17 使用者定案] 找到主視窗時採樣裁決:偵測到院方改版(DRIFT)→ 記一次
+    warning log + 【寄信通知一次】(每個新版本一次);【不擋自動寫入、不跳窗】——誤擋+洗版
+    比偶發改版更難用,改版風險由醫師現場判斷兜底(發現功能異常自行停用)。"""
     global _his_canary_warned
     v = _his_write_verdict_for(title)
-    if v.is_drift and not _his_canary_warned:
+    if not v.is_drift:
+        return
+    if not _his_canary_warned:
         _his_canary_warned = True
         logging.warning("[金絲雀] %s", v.human())
+    _notify_his_drift(v)
 
 # 醫令 子選單 command ID (probe + user 確認;2026-06-29 HIS V.1150629.01 改版後整批 +1)
 MENU_ID_類別字首 = 216   # 215→216(未使用,隨同段 +1)
@@ -1642,35 +1733,6 @@ def _his_title_of(hwnd: int) -> str:
 
     return call_with_timeout(_get, WIN_ENUM_TIMEOUT_SEC, default="",
                              name="his_title_of")
-
-
-def _his_write_contract_ok(main_hwnd: int, label: str) -> bool:
-    """[金絲雀] 危險 HIS 寫入(醫令代碼/UVB 劑量/excimer 劑量)前的 fail-closed 閘門。
-
-    回 True＝契約 OK / 無法判定 → 放行;False＝DRIFT(疑似改版)→ 已擋、已跳警告,呼叫端
-    應乾淨中止本次自動寫入。
-
-    [codex P1] 【自足即時採樣】:用本次傳入的 main_hwnd 取 title 當場裁決,不讀任何可變
-    全域。因為若讀全域,並行呼叫(設定頁重新整理、另一支熱鍵)覆寫/清空全域會害 gate 讀到
-    被清成 None 的值而 fail-open 在確認漂移下仍寫入。改用 local 裁決＝天然無跨緒競態。
-
-    【刻意】只有明確 DRIFT 才擋;UNKNOWN(採不到版本)/UNCALIBRATED/OK 都放行——若因假警報
-    或採樣失敗就停掉整組 F 鍵,比改版風險更糟(醫師整天不能用熱鍵)。醫師確認新版無誤後,
-    可到設定頁按「重新校正金絲雀」把現況版本記為新基線即放行。"""
-    v = _his_write_verdict_for(_his_title_of(main_hwnd))
-    if not v.should_block_write:
-        return True
-    logging.error("[%s][金絲雀] %s → fail-closed 停止自動寫入", label, v.human())
-    try:
-        _show_uvb_warning(
-            main_hwnd, "疑似院方改版,自動寫入已停",
-            f"HIS 主視窗版本與上次校正不符：{v.detail}\n\n"
-            f"為避免選單 id 位移而寫錯病歷,{label} 已【停止自動處理】。\n"
-            f"請【手動】下醫令/確認劑量;並通知開發者核對 F 鍵選單 id 是否需重新校正。\n\n"
-            f"(若已確認新版本無誤,可到設定頁按「重新校正金絲雀」放行。)")
-    except Exception:
-        logging.debug("[金絲雀] 警告視窗顯示失敗(仍已擋)", exc_info=True)
-    return False
 
 
 def _ensure_hospital_foreground(hwnd: int) -> None:
@@ -1876,10 +1938,6 @@ def _script_code_input_adaptive(code: str, label: str = "",
         logging.warning("[%s adaptive] 找不到主程式視窗 (class=%s, title 含 %s)",
                         label or "code-input", _HOSPITAL_WIN_CLASS,
                         _HOSPITAL_WIN_TITLE_KW)
-        return False
-    # [金絲雀] 送任何選單/打任何醫令代碼前先過契約閘門:疑似改版 → 停止(不寫)
-    if not _his_write_contract_ok(hwnd, label or "代碼輸入"):
-        _mark_hotkey_action_time()
         return False
     workflow_ok = True
     _ensure_hospital_foreground(hwnd)
@@ -2485,11 +2543,6 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
             return False
         logging.info("[%s][UVB] 找不到主程式視窗 — 跳過 (best-effort)", label)
         return True
-
-    # [金絲雀] 寫回劑量前先過契約閘門:疑似改版 → 停止(不寫回處置欄)。strict 的 F2/F3
-    # 回 False 中止;寬鬆的 F1 回 True 略過(與「找不到視窗」的 best-effort 語意一致)。
-    if not _his_write_contract_ok(main_hwnd, f"{label} UVB 劑量更新"):
-        return False if strict else True
 
     # [2026-06-01/06-18] 找照光處置 memo + 分類(見 _resolve_phototherapy_disposition)。
     memo_hwnd, photo_kind = _resolve_phototherapy_disposition(main_hwnd)
@@ -4197,12 +4250,6 @@ def _f11_快速完成_main(label: str = "F11") -> bool:
         return False
     logging.info("[%s][timeline] 找到 main_hwnd=%s (+%.0fms)",
                   label, main_hwnd, (time.time() - t_f11_start) * 1000)
-    # [金絲雀 2026-07-17] F11 完成動作(送「完成不印」id 277 / 按「全部完成」)亦為 HIS 寫入 →
-    # 補上與 F1–F5/UVB 相同的契約閘門(先前 F11 未納管,設定頁卻宣稱「F 鍵寫入都會停」)。
-    # 疑似改版 → 停止,不送完成動作(避免 id 位移誤觸別的選單/送出繳費單等)。
-    if not _his_write_contract_ok(main_hwnd, label):
-        _mark_hotkey_action_time()
-        return False
 
     # Step 1: 完成路徑分流。
     #   Route A: 療程=2/3（照光）→ 完成不印，不按「全部完成」。
@@ -6017,12 +6064,6 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
     main_hwnd = _find_hospital_main_window()
     if not main_hwnd:
         logging.warning("[%s] 找不到主程式視窗", label)
-        return False
-    # [金絲雀 2026-07-17] 同意書開立(送選單 id 669、選 tab/radio、開立電子)也是 HIS 寫入 →
-    # 補上與 F1–F5/UVB 相同的契約閘門(先前只有 F1–F5/UVB 有,設定頁卻宣稱「F 鍵寫入都會停」)。
-    # 疑似改版 → 停止,不送同意書 command(避免 id 位移開錯功能/寫錯病歷)。
-    if not _his_write_contract_ok(main_hwnd, label or "同意書"):
-        _mark_hotkey_action_time()
         return False
     # 用 Post (非同步) 避免 SendMessage 卡住 (實測 2026-05-18 12:43)
     if not _send_yiling_menu_command(main_hwnd, MENU_ID_同意書):
@@ -12465,9 +12506,10 @@ class AutomationApp:
                    command=self._refresh_canary_status).pack(side=tk.LEFT)
         ttk.Button(btns, text="重新校正",
                    command=self._recalibrate_his_canary).pack(side=tk.LEFT, padx=6)
-        ttk.Label(cf, text="偵測到院方改版（主視窗版本與基線不符）時，F1–F5 醫令代碼、"
-                  "UVB/照光劑量、F9/F10 同意書與 F11 快速完成都會停止自動寫入，避免寫錯"
-                  "病歷；確認新版無誤後按「重新校正」放行。",
+        ttk.Label(cf, text="偵測到院方改版（主視窗版本與基線不符）時，會【寄信通知】"
+                  "(止掛提醒收件人),但【不會擋住自動寫入、不影響操作、不重複跳窗】。"
+                  "若發現 F1–F11 功能異常，請手動停用該熱鍵並通知開發者核對選單 id；"
+                  "確認新版無誤後按「重新校正」把現況記為新基線、停止通知。",
                   foreground="gray", wraplength=300, justify="left",
                   style="Small.TLabel").pack(anchor="w", pady=(6, 0))
 
