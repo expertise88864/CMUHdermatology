@@ -7623,7 +7623,11 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                 logging.info(f"[SOURCE_TIMING] {doctor_name}: {source_timing}")
             logging.info(f"Check for {doctor_name} ({doc_no}) successful. Found {data_count} slots.")
             put_ui_message(ui_queue, UiRefreshTickMessage(doctor_name=doctor_name))
-            put_ui_message(ui_queue, UiClinicDataMessage(doctor_name=doc_no, data=appointments_by_date))
+            # [codex] 這裡才是「完整成功的即時資料」(已併休診覆蓋)→ 唯一可以解鎖遠期止掛
+            # 提醒掃描的來源。其他 emit(磁碟快取 fallback / 漸進式部分結果 / 快照重播 /
+            # 錯誤)一律維持 is_live_final=False,不得讓掃描拿它們去寄信。
+            put_ui_message(ui_queue, UiClinicDataMessage(
+                doctor_name=doc_no, data=appointments_by_date, is_live_final=True))
             return
 
         except Reg52BackoffActive as e:
@@ -7924,12 +7928,22 @@ CLINIC_LIGHT_HISTORY_DAYS = 30
 FLOATING_ERROR_HIDE_STREAK = 3
 CLINIC_LIGHT_HISTORY_WINDOW_MINUTES = 9
 CLINIC_DYNAMIC_STATE_FILENAME = "clinic_dynamic_state.json"
+# ── 止掛提醒:不依賴 UI 的背景掃描前瞻天數(使用者定案 2026-07-17)────────────────
+# 【為何存在】原本止掛提醒是寄生在主行事曆 refresh(_update_grid_data 且 is_future=False)
+# 裡,而主行事曆錨在【本週一 + 2 週】→ 實際可提前偵測的天數會隨週內遞減(週一 13 天、
+# 週五只剩 9 天、週日只剩 7 天);更遠的診次只出現在「未來週次」分頁,那裡傳 is_future=True
+# 直接把寄信關掉、且資料只在該分頁被點開時才更新。結果:兩三週前就掛滿的熱門診次【永遠
+# 不會提醒】(使用者實例 2026-07-17:7/30 晚上張廖年峰已 >129 人卻沒收到信)。
+# 改為固定「今天起 N 天」,與日曆週脫鉤。
+STOP_SIGNUP_SCAN_DAYS = 28
+
 # 已寄出的止掛提醒信記錄(跨重啟去重用)。notify_key 內含日期。
-# [MN-04] 總覽涵蓋今天+13 天且止掛不限今天:對遠期診次(最多 13 天後)寄信後,若在該診次
-# 到來前重啟,保留期以「寄出日」過濾——只保留近 7 天會把仍未過期的遠期診次記錄剪掉 →
-# frequency 歸零 → 同診次重寄。保留期需 > 總覽 13 天視窗;取 21 天(留 8 天安全邊際)。
+# [MN-04] 止掛不限今天:對遠期診次寄信後,若在該診次到來前重啟,保留期以「寄出日」過濾
+# ——保留期若短於前瞻視窗,遠期診次的記錄會在該診次到來【之前】就被剪掉 → 去重失效 →
+# 同一診次重寄。故保留期【必須】大於 STOP_SIGNUP_SCAN_DAYS,且兩者綁在一起,免得日後有人
+# 只調前瞻天數卻忘了同步保留期(28 天前瞻 + 21 天保留 = 第 21 天重寄一次)。
 ALERT_EMAIL_SENT_FILENAME = "alert_email_sent.json"
-ALERT_EMAIL_SENT_RETAIN_DAYS = 21
+ALERT_EMAIL_SENT_RETAIN_DAYS = STOP_SIGNUP_SCAN_DAYS + 14
 
 
 # ── 個別醫師止掛「優先刷新」分級（2026-07-13 使用者需求）───────────────────────
@@ -8088,6 +8102,52 @@ def _hotkey_builtin_map_for_profile(profile: str) -> dict:
 # =============================================================================
 # 止掛提醒寄信（Outlook COM，在獨立執行緒+逾時，避免卡到主迴圈）
 # =============================================================================
+def _parse_appt_item_for_alert(appt_item):
+    """把快取的門診項目正規化成 (session_name, count, is_stopped, ext_branch, room)。
+
+    純函式(好測):供止掛背景掃描用,與 _update_grid_data 內的解析同源(dict 新格式 +
+    舊字串格式)。休診/停診/取不到人數 → 回 None(不是「0 人」,不可拿去比門檻)。"""
+    if isinstance(appt_item, dict):
+        session_name = str(appt_item.get("session", ""))
+        raw_count = appt_item.get("count", 0)
+        is_stopped = bool(appt_item.get("is_stopped", False))
+        ext_branch = _appt_dict_ext_branch(appt_item)
+        room = str(appt_item.get("room", "") or "")
+        status_text = str(raw_count) + ("人" if isinstance(raw_count, int) else "")
+    else:
+        text = str(appt_item)
+        parts = text.split("|")
+        status_part = parts[0]
+        ext_branch = None
+        is_stopped = False
+        room = ""
+        for p in parts[1:]:
+            if p.startswith("Ext:"):
+                val = p.split(":", 1)[1]
+                ext_branch = {"1": "east", "east": "east", "auh": "auh",
+                              "huihe": "huihe", "huisheng": "huisheng"}.get(val)
+            elif p.startswith("Rm:"):
+                room = p.split(":", 1)[1]
+            elif p.startswith("Stop:"):
+                is_stopped = (p.split(":", 1)[1] == "1")
+        if ":" not in status_part:
+            return None
+        session_name, status_text = status_part.split(":", 1)
+        status_text = status_text.strip()
+    if not session_name:
+        return None
+    if "休診" in status_text or "停診" in status_text:
+        return None
+    m = _RE_COUNT_DIGIT.search(status_text)
+    if not m:
+        return None
+    try:
+        count = int(m.group(1))
+    except ValueError:
+        return None
+    return (session_name, count, is_stopped, ext_branch, room)
+
+
 def _send_alert_email_via_smtp(subject: str, body: str,
                                 recipients: list, timeout: float = 60.0) -> bool:
     """達到門檻時透過 SMTP (Gmail) 寄信。回傳是否成功（失敗只 log，不影響主程式）。
@@ -8412,6 +8472,15 @@ class AutomationApp:
         self.notified_counts = defaultdict(int)
         self.alert_frequency = defaultdict(int)
         self._alert_popup_active = defaultdict(bool)
+        # [codex 2026-07-17] 止掛信「正在寄」的 notify_key —— 行事曆 notify 與遠期背景掃描
+        # 【共用】這一組(以前各自用不同的 gate,兩邊都會看到「還沒寄」而各寄一封:持久化
+        # 的「已寄」記號是【寄成功之後】才寫的,中間有窗)。見 _claim_alert_email。
+        self._alert_email_inflight = set()
+        # [2026-07-17] 開機時會先用【磁碟舊快取】渲染一次行事曆 → 若讓掃描吃到舊資料,可能
+        # 寄出過期的錯誤提醒,而且會把該診次永久標記成已寄 → 之後真的爆掉反而不提醒。
+        # 故:只有本次執行【已收到該醫師的即時 reg52 資料】才納入掃描。存的是 all_doctors_data
+        # 用到的 key(doc_no 或醫師姓名皆可能)。
+        self._live_clinic_data_keys = set()
         self._alert_state_lock = threading.Lock()
         # 已寄出止掛信的記錄(跨重啟去重;寄信前先查、寄成功後寫)
         self._alert_email_sent = self._load_alert_email_sent()
@@ -8852,6 +8921,30 @@ class AutomationApp:
     def _has_alert_email_been_sent(self, notify_key: str) -> bool:
         with self._alert_state_lock:
             return notify_key in self._alert_email_sent
+
+    def _claim_alert_email(self, notify_key: str) -> bool:
+        """[codex 2026-07-17] 原子取得某止掛信的【寄送權】。
+
+        為何需要:止掛信有兩條寄送路徑(行事曆 notify、遠期背景掃描),而持久化的「已寄」
+        記號是【寄成功之後】才寫的 → 原本各自「先查已寄、再寄」的非原子序列會讓兩邊同時
+        看到「還沒寄」→ 同一診次寄出兩封。這裡在同一把鎖內同時檢查【已寄過】與【正在寄】,
+        兩條路徑都必須先取得寄送權才可以寄。
+
+        回 True = 你可以寄(且已登記為寄送中,寄完【務必】呼叫 _release_alert_email_claim)。
+        回 False = 已經寄過、或另一條路徑正在寄 → 不要寄。"""
+        with self._alert_state_lock:
+            if notify_key in self._alert_email_sent:
+                return False
+            if notify_key in self._alert_email_inflight:
+                return False
+            self._alert_email_inflight.add(notify_key)
+            return True
+
+    def _release_alert_email_claim(self, notify_key: str) -> None:
+        """釋放寄送權(寄成功與否都要釋放:成功已由 _mark_alert_email_sent 永久去重,
+        失敗則讓下次觸發/掃描可以重試,不會因為卡住旗標而整個診次再也不寄)。"""
+        with self._alert_state_lock:
+            self._alert_email_inflight.discard(notify_key)
 
     def _mark_alert_email_sent(self, notify_key: str) -> None:
         """記錄某止掛信已寄出並持久化(僅在『確實寄出成功』後呼叫)。
@@ -13534,19 +13627,24 @@ class AutomationApp:
                                                                     # [MN-02] 第二次加強提醒(lvl=2)原本一律不寄 → 第一次遇 SMTP 暫時
                                                                     # 故障失敗後當天整診次零封信。改成:前次已成功寄出者 lvl=2 仍只跳
                                                                     # 通知(不重複信);前次未成功者,lvl=2 給一次補寄機會。
-                                                                    if lvl == 1 or (lvl == 2 and
-                                                                                    not self._has_alert_email_been_sent(nk)):
-                                                                        if self._has_alert_email_been_sent(nk):
-                                                                            logging.info("[ALERT] 止掛信先前已寄出，跳過重寄：%s", nk)
-                                                                        else:
+                                                                    # [codex 2026-07-17] 改走共用的原子 claim:同時擋掉「已寄過」與
+                                                                    # 「另一條路徑(遠期背景掃描)正在寄」。原本「先查已寄、再寄」是
+                                                                    # 非原子的,兩條路徑會同時看到還沒寄 → 同一診次寄兩封。
+                                                                    # claim 失敗即代表已寄過或正在寄 → 不寄(涵蓋舊 lvl==2 的語意:
+                                                                    # 前次寄失敗沒留記號 → claim 會成功 → 仍有補寄機會)。
+                                                                    if self._claim_alert_email(nk):
+                                                                        try:
                                                                             rcpts = list(self.alert_email_recipients)
                                                                             if rcpts:
-                                                                                try:
-                                                                                    if _send_alert_email_via_smtp(
-                                                                                            subj, m, rcpts):
-                                                                                        self._mark_alert_email_sent(nk)
-                                                                                except Exception:
-                                                                                    logging.warning("止掛提醒寄信例外", exc_info=True)
+                                                                                if _send_alert_email_via_smtp(
+                                                                                        subj, m, rcpts):
+                                                                                    self._mark_alert_email_sent(nk)
+                                                                        except Exception:
+                                                                            logging.warning("止掛提醒寄信例外", exc_info=True)
+                                                                        finally:
+                                                                            self._release_alert_email_claim(nk)
+                                                                    else:
+                                                                        logging.info("[ALERT] 止掛信已寄出或正在寄,跳過重寄：%s", nk)
                                                                     # toast 只在非 DND 時跳;優先用非阻塞 winotify,失敗才 fallback
                                                                     # 阻塞式 MessageBox(MN-01:即使 fallback,email 已在上面寄完)。
                                                                     if not dnd:
@@ -13781,7 +13879,8 @@ class AutomationApp:
                             self.root.after(2000, self._restart_when_hotkey_idle)
                     case UiAlertErrorMessage(title=title, msg=emsg):
                         self._show_notice(title, emsg, level="error", auto_close_ms=7000)
-                    case UiClinicDataMessage(doctor_name=doctor_name, data=appointment_data):
+                    case UiClinicDataMessage(doctor_name=doctor_name, data=appointment_data,
+                                            is_live_final=is_live_final):
                         if doctor_name and appointment_data is not None:
                             with self._doctor_data_lock:
                                 if (
@@ -13792,6 +13891,17 @@ class AutomationApp:
                                     logging.warning(f"[CACHE_PROTECT] 保留 {doctor_name} 既有門診人數快取，略過錯誤覆蓋。")
                                     continue
                                 self.all_doctors_data[doctor_name] = appointment_data
+                                # [codex 2026-07-17] 遠期止掛掃描的資格【綁在目前存著的這筆
+                                # 資料】,不是「這位醫師曾經拿過即時資料」:因為每一筆 payload
+                                # 都會覆蓋 all_doctors_data,若資格是黏著的,之後來一筆漸進式
+                                # 部分結果(還沒併休診覆蓋)或磁碟快取 fallback 覆蓋上去,掃描
+                                # 仍會拿那筆非最終資料去寄信。故:最終即時資料→解鎖;任何
+                                # 非最終資料覆蓋→立刻取消資格,等下一筆最終資料再解鎖。
+                                with self._alert_state_lock:
+                                    if is_live_final:
+                                        self._live_clinic_data_keys.add(doctor_name)
+                                    else:
+                                        self._live_clinic_data_keys.discard(doctor_name)
                             self._schedule_refresh()
                             # [效能] 傳 bound method(thunk)而非預先 deepcopy：deepcopy 延到寫檔時做一次
                             self._schedule_save_cache('cache_clinic_counts.json', self._get_all_doctors_data_snapshot)
@@ -14126,9 +14236,132 @@ class AutomationApp:
         else: color_out = "gray"
         set_light(self.light_out, color_out)
 
+    def _scan_future_stop_signup_alerts(self, today=None) -> None:
+        """[2026-07-17] 止掛提醒的【不依賴 UI】背景掃描:今天起 STOP_SIGNUP_SCAN_DAYS 天。
+
+        today 可注入(測試用);正式執行一律用今天。
+
+        為何需要:見 STOP_SIGNUP_SCAN_DAYS 的說明——舊做法把提醒寄生在主行事曆 refresh,
+        視窗錨在日曆週(週五只剩 9 天),遠期診次只在「未來週次」分頁而那裡寄信被關掉,
+        導致兩三週前就掛滿的診次永遠不提醒。
+
+        【不增加院方負載】:只讀 all_doctors_data —— reg52 早就把好幾週的資料抓進記憶體
+        (未來週次分頁就是純讀它、不另外抓),所以本掃描不發任何新請求。
+        【只寄 email、不跳彈窗】:幾週後的診次不該在看診中打斷醫師(彈窗仍由行事曆負責today
+        附近的診次)。與行事曆共用同一組 notify_key 持久化去重 → 不會重複寄。"""
+        try:
+            enabled = {}
+            if self.alert_chang_enabled.get():
+                enabled["張廖年峰"] = self._get_doctor_threshold_map("張廖年峰")
+            if self.alert_chen_enabled.get():
+                enabled["陳駿升"] = self._get_doctor_threshold_map("陳駿升")
+            enabled = {k: v for k, v in enabled.items() if v}
+            if not enabled:
+                return
+            recipients = list(self.alert_email_recipients)
+            if not recipients:
+                return
+
+            today = today or date.today()
+            with self._alert_state_lock:
+                live_keys = set(self._live_clinic_data_keys)
+            snapshot = {}
+            with self._doctor_data_lock:
+                for doc_info in self.doctors_list:
+                    name = doc_info.get('name')
+                    if name not in enabled:
+                        continue
+                    doc_no = str(doc_info.get('doc_no'))
+                    # [codex] 只掃「本次執行已收到即時資料」的醫師 —— 開機時的磁碟舊快取
+                    # 不可拿來寄提醒(會寄錯且永久去重,害真的爆掉時反而不提醒)。
+                    if doc_no not in live_keys and name not in live_keys:
+                        continue
+                    d = (self.all_doctors_data.get(doc_no)
+                         or self.all_doctors_data.get(name))
+                    if isinstance(d, dict) and 'error' not in d:
+                        snapshot[name] = {k: list(v) for k, v in d.items()
+                                          if isinstance(k, date) and
+                                          today <= k <= today + timedelta(
+                                              days=STOP_SIGNUP_SCAN_DAYS)}
+
+            for doc_name, by_date in snapshot.items():
+                tmap = enabled[doc_name]
+                for cur, items in sorted(by_date.items()):
+                    for appt_item in items:
+                        parsed = _parse_appt_item_for_alert(appt_item)
+                        if not parsed:
+                            continue
+                        session_name, count, is_stopped, ext_branch, room = parsed
+                        if is_stopped:
+                            continue   # 已止掛 → 不會再增號,不必提醒
+                        full_threshold = tmap.get((cur.weekday(), session_name))
+                        if not isinstance(full_threshold, int):
+                            continue
+                        if count < full_threshold:
+                            continue
+                        nk = f"{cur}_{session_name}_{doc_name}_{ext_branch or 'main'}"
+                        # [codex] 與行事曆 notify 共用同一個原子 claim → 不會兩條路徑各寄一封
+                        if not self._claim_alert_email(nk):
+                            continue
+                        self._dispatch_future_stop_alert(
+                            nk, doc_name, cur, session_name, count,
+                            full_threshold, ext_branch, room, recipients, today)
+        except Exception:
+            logging.warning("[ALERT] 止掛背景掃描例外(不影響其他功能)", exc_info=True)
+
+    def _dispatch_future_stop_alert(self, nk, doc_name, cur, session_name, count,
+                                    full_threshold, ext_branch, room, recipients,
+                                    today=None):
+        """把一封遠期止掛提醒丟背景緒寄出(SMTP 逾時可達 60s,不可卡住 UI 緒)。
+        寄成功才記錄已寄(與行事曆同一份持久化記錄)。"""
+        _sess_label = {"上午": "早上"}.get(session_name, session_name)
+        _wd = "一二三四五六日"[cur.weekday()]
+        _date_str = f"{cur.year}/{cur.month}/{cur.day}(週{_wd})"
+        _branch_suffix = (_EXT_BRANCH_DISPLAY_SUFFIX.get(ext_branch, "")
+                          if ext_branch else "")
+        _room = room
+        if not _room:
+            with self._reg64_cache_lock:
+                _snap = self._reg64_public_snapshot.get((doc_name, session_name))
+            if _snap and _snap.get("room"):
+                _room = str(_snap["room"])
+        _room_label = ((_room if "診" in _room else f"{_room}診")
+                       if _room else "(診間未提供)")
+        _where = f"{doc_name}醫師 {_room_label}{_branch_suffix}"
+        days_left = (cur - (today or date.today())).days
+        # 主旨與行事曆版本同格式(【止掛提醒】開頭)→ 既有信箱規則/篩選continue 有效
+        subject = f"【止掛提醒】{_date_str} {_sess_label} {_where} 目前 {count} 人"
+        msg = (f"【提前提醒】距此診次還有 {days_left} 天\n"
+               f"{_date_str} {_sess_label}\n"
+               f"{_where}\n"
+               f"目前掛號 {count} 人(已達/超過止掛門檻 {full_threshold} 人)\n\n"
+               f"(此診次只會通知這一封;若要停止收此類信,可在設定頁關閉該醫師的止掛提醒。)")
+
+        def _worker():
+            # 寄送權已由呼叫端 _claim_alert_email 取得 → 這裡直接寄,寄成功才永久記號。
+            try:
+                if _send_alert_email_via_smtp(subject, msg, list(recipients)):
+                    self._mark_alert_email_sent(nk)
+                    logging.info("[ALERT] 已寄遠期止掛提醒 %s(還有 %d 天,%d 人)",
+                                 nk, days_left, count)
+            except Exception:
+                logging.warning("[ALERT] 遠期止掛提醒寄信例外", exc_info=True)
+            finally:
+                self._release_alert_email_claim(nk)
+
+        try:
+            threading.Thread(target=_worker, name="FutureStopAlert",
+                             daemon=True).start()
+        except Exception:
+            self._release_alert_email_claim(nk)
+            logging.exception("[ALERT] 遠期止掛提醒緒啟動失敗")
+
     def refresh_all_calendars(self):
         start_date = date.today() - timedelta(days=date.today().weekday())
         self._update_grid_data(start_date, self.summary_calendar_widgets, 2)
+        # [2026-07-17] 行事曆只涵蓋本週一+2 週且未來分頁不寄信 → 遠期掛滿的診次靠這支
+        # 不依賴 UI 的掃描補上(純讀既有快取,不增加院方請求)。
+        self._scan_future_stop_signup_alerts()
         # [修正] 只有在「未來週次查詢」分頁被選中時才更新，避免隱藏分頁也跑全量重繪
         if hasattr(self, 'future_week_selector') and self.future_week_selector.get():
             try:

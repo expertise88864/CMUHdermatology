@@ -118,14 +118,21 @@ def test_notify_worker_prefers_nonblocking_winotify():
 
 # ─── MN-02:第二次提醒補寄(前次寄失敗者) ────────────────────────────────
 
-def test_notify_worker_lvl2_retries_when_not_yet_sent():
-    """寄信 gate 條件須含『lvl==2 且尚未寄過』的補寄分支。"""
+def test_notify_worker_uses_shared_atomic_email_claim():
+    """[2026-07-17] MN-02 的意圖(前次寄失敗要能補寄、寄成功不得重寄)現在由共用的原子
+    寄送權 _claim_alert_email 實作,取代原本 `lvl == 1 or (lvl == 2 and not 已寄)` 的
+    非原子條件 —— 因為新增了第二條寄信路徑(遠期止掛背景掃描),而「已寄」記號是寄成功後
+    才寫的,兩條路徑各自「先查再寄」會同一診次寄兩封。
+
+    claim 同時擋「已寄過」與「另一條路徑正在寄」;寄失敗會釋放且不留記號 → 下次觸發
+    (含 lvl=2 與背景掃描)仍會重試,MN-02 的補寄語意因此保留且更通用。
+    實際行為(失敗可重試、成功不重寄、兩路徑不重複)由
+    tests/test_stop_signup_future_scan_2026_07_17.py 以行為測試涵蓋。"""
     fn = _find_funcdef("_notify_worker")
     src = ast.get_source_segment(MAIN_SRC.read_text(encoding="utf-8"), fn)
-    assert "lvl == 2" in src, "缺第二次提醒補寄條件"
-    assert "_has_alert_email_been_sent" in src, "補寄條件未查已寄狀態"
-    # gate 不再是「只有 lvl == 1 才寄」的死路
-    assert "lvl == 1 or" in src, "寄信 gate 仍只認 lvl==1(未補寄)"
+    assert "_claim_alert_email" in src, "寄信前須取得共用的原子寄送權"
+    assert "_release_alert_email_claim" in src, "寄完(含失敗)須釋放寄送權,否則永久卡死"
+    assert "_mark_alert_email_sent" in src, "寄成功才可留下永久去重記號"
 
 
 # ─── MN-05:輪詢例外要可見 ────────────────────────────────────────────────

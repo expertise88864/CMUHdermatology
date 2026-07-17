@@ -24,6 +24,11 @@ class UiRefreshTickMessage:
 class UiClinicDataMessage:
     doctor_name: str
     data: Any
+    # [codex 2026-07-17] 這個訊息有多種來源:磁碟舊快取 fallback、漸進式部分結果(還沒併
+    # 休診覆蓋)、快照重播、錯誤payload,以及【最後那筆完整成功的即時資料】。遠期止掛提醒
+    # 只能用最後這種來判斷要不要寄信(拿舊/半套資料寄會寄錯,而且會把該診次永久標記已寄,
+    # 害之後真的爆掉反而不提醒)。故用本旗標明確標示來源,預設 False(不解鎖提醒掃描)。
+    is_live_final: bool = False
 
 
 @dataclass(frozen=True, slots=True)
