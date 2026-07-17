@@ -15,43 +15,53 @@ import main  # noqa: E402
 from cmuh_common import contract_canary as cc  # noqa: E402
 
 
-def _sample(monkeypatch, title, baseline_fp=None):
-    """以指定基線採樣(隔離基線檔),回裁決存入 main._his_write_verdict。"""
+def _verdict(monkeypatch, title, baseline_fp=None):
+    """以指定基線即時裁決(隔離基線檔),回 CanaryVerdict(純函式,不碰全域)。"""
     if baseline_fp is None:
         baseline_fp = {"title_version": main._HIS_CALIBRATED_VERSION}
     monkeypatch.setattr(main, "_his_write_baseline_fp", lambda: baseline_fp)
-    main._his_canary_warned = False
-    main._sample_his_write_contract(title)
+    return main._his_write_verdict_for(title)
 
 
-# ── 採樣裁決 ─────────────────────────────────────────────────────────────────
-def test_sample_ok_on_matching_version(monkeypatch):
-    _sample(monkeypatch, "西醫門診醫師作業 V.1150629.01")
-    assert main._his_write_verdict.status == cc.STATUS_OK
+# ── 採樣裁決(純函式 _his_write_verdict_for) ─────────────────────────────────
+def test_verdict_ok_on_matching_version(monkeypatch):
+    assert _verdict(monkeypatch, "西醫門診醫師作業 V.1150629.01").status == cc.STATUS_OK
 
 
-def test_sample_drift_on_version_shift(monkeypatch):
-    _sample(monkeypatch, "西醫門診醫師作業 V.1150701.01")
-    assert main._his_write_verdict.status == cc.STATUS_DRIFT
-    assert main._his_write_verdict.should_block_write is True
+def test_verdict_drift_on_version_shift(monkeypatch):
+    v = _verdict(monkeypatch, "西醫門診醫師作業 V.1150701.01")
+    assert v.status == cc.STATUS_DRIFT and v.should_block_write is True
 
 
-def test_sample_unknown_when_no_version_string(monkeypatch):
-    _sample(monkeypatch, "西醫門診醫師作業")
-    assert main._his_write_verdict.status == cc.STATUS_UNKNOWN
-    assert main._his_write_verdict.should_block_write is False
+def test_verdict_unknown_when_no_version_string(monkeypatch):
+    v = _verdict(monkeypatch, "西醫門診醫師作業")
+    assert v.status == cc.STATUS_UNKNOWN and v.should_block_write is False
 
 
-def test_sample_uses_calibrated_baseline_from_file(monkeypatch):
+def test_verdict_uses_calibrated_baseline_from_file(monkeypatch):
     # 使用者校正過的基線(新版本)→ 該版本變 OK
-    _sample(monkeypatch, "西醫門診醫師作業 V.1150701.01",
-            baseline_fp={"title_version": "1150701"})
-    assert main._his_write_verdict.status == cc.STATUS_OK
+    v = _verdict(monkeypatch, "西醫門診醫師作業 V.1150701.01",
+                 baseline_fp={"title_version": "1150701"})
+    assert v.status == cc.STATUS_OK
 
 
-# ── 寫入 gate:_his_write_contract_ok ─────────────────────────────────────────
+def test_no_mutable_verdict_globals():
+    # [codex P2] 不再保留可變全域裁決/指紋(自足採樣,免競態)
+    assert not hasattr(main, "_his_write_verdict")
+    assert not hasattr(main, "_his_current_fp")
+
+
+# ── 寫入 gate:_his_write_contract_ok（自足即時採樣，不讀全域）─────────────────
+def _gate_env(monkeypatch, title, baseline_fp=None):
+    """gate 自己採樣:monkeypatch 取標題與基線,不依賴全域 verdict。"""
+    if baseline_fp is None:
+        baseline_fp = {"title_version": main._HIS_CALIBRATED_VERSION}
+    monkeypatch.setattr(main, "_his_write_baseline_fp", lambda: baseline_fp)
+    monkeypatch.setattr(main, "_his_title_of", lambda hwnd: title)
+
+
 def test_gate_blocks_on_drift(monkeypatch):
-    _sample(monkeypatch, "西醫門診醫師作業 V.1150701.01")   # DRIFT
+    _gate_env(monkeypatch, "西醫門診醫師作業 V.1150701.01")   # DRIFT
     shown = {}
     monkeypatch.setattr(main, "_show_uvb_warning",
                         lambda h, t, m: shown.update(title=t, msg=m))
@@ -60,7 +70,7 @@ def test_gate_blocks_on_drift(monkeypatch):
 
 
 def test_gate_passes_on_ok(monkeypatch):
-    _sample(monkeypatch, "西醫門診醫師作業 V.1150629.01")   # OK
+    _gate_env(monkeypatch, "西醫門診醫師作業 V.1150629.01")   # OK
     called = {"warn": False}
     monkeypatch.setattr(main, "_show_uvb_warning",
                         lambda *a, **k: called.update(warn=True))
@@ -68,14 +78,20 @@ def test_gate_passes_on_ok(monkeypatch):
     assert called["warn"] is False               # OK 不跳警告
 
 
-def test_gate_passes_on_unknown_and_uncalibrated(monkeypatch):
+def test_gate_passes_on_unknown(monkeypatch):
     monkeypatch.setattr(main, "_show_uvb_warning", lambda *a, **k: None)
-    # UNKNOWN(採不到版本)→ 放行
-    _sample(monkeypatch, "西醫門診醫師作業")
+    _gate_env(monkeypatch, "西醫門診醫師作業")               # 無版本→UNKNOWN→放行
     assert main._his_write_contract_ok(1, "F2") is True
-    # 裁決為 None(從未採樣)→ 放行
-    main._his_write_verdict = None
-    assert main._his_write_contract_ok(1, "F2") is True
+    monkeypatch.setattr(main, "_his_title_of", lambda hwnd: "")  # 取不到 title→放行
+    assert main._his_write_contract_ok(0, "F2") is True
+
+
+def test_gate_self_sufficient_no_prior_sampling(monkeypatch):
+    # [codex P1] gate 首次呼叫(從未預先採樣、無任何全域狀態可讀)就自足裁決 → 確認漂移
+    # 仍正確擋;不可能因並行呼叫覆寫/清空全域而 fail-open(全域已移除)。
+    _gate_env(monkeypatch, "西醫門診醫師作業 V.1150701.01")   # 現況 DRIFT
+    monkeypatch.setattr(main, "_show_uvb_warning", lambda *a, **k: None)
+    assert main._his_write_contract_ok(1234, "F2") is False  # 用自己的 title 採樣→擋
 
 
 # ── gate 已接到危險寫入匯流點(原始碼守門) ────────────────────────────────────
@@ -98,36 +114,46 @@ def test_sampling_wired_into_find_window():
     assert "_sample_his_write_contract" in src, "找到主視窗時應採樣 HIS 寫入契約"
 
 
+def test_gate_and_recalibrate_do_not_read_global_verdict():
+    # [codex P1] 安全關鍵路徑(gate/重新校正)自足即時採樣,不得讀全域 _his_write_verdict/
+    # _his_current_fp(那只供顯示;讀全域會有並行覆寫/清空的競態)。
+    gate_src = inspect.getsource(main._his_write_contract_ok)
+    # 自足:用當下 hwnd 的 title 即時裁決,不讀任何可變全域
+    assert "_his_write_verdict_for(_his_title_of(main_hwnd))" in gate_src, \
+        "gate 應用傳入 hwnd 的 title 自足裁決"
+    recal_src = inspect.getsource(main.AutomationApp._recalibrate_his_canary)
+    assert "sample_his_current_fp(_his_title_of(" in recal_src, "重新校正應自足採樣"
+    assert "fp = _his_current_fp" not in recal_src, "重新校正不得讀全域 _his_current_fp"
+
+
 # ── 重新校正 UI(設定頁）───────────────────────────────────────────────────
-def test_recalibrate_writes_current_version_as_baseline(monkeypatch, tmp_path):
-    # 現況版本 1150701(異於硬編碼基線 → DRIFT)→ 校正後基線=1150701 → 變 OK
+def _recal_env(monkeypatch, tmp_path_or_file, title, hwnd=123):
     monkeypatch.setattr(main, "_contract_baseline_singleton", None)
-    monkeypatch.setattr(main, "get_conf_path",
-                        lambda name: str(tmp_path / name))
-    monkeypatch.setattr(main, "_find_hospital_main_window",
-                        lambda: main._sample_his_write_contract(
-                            "西醫門診醫師作業 V.1150701.01") or 123)
+    monkeypatch.setattr(main, "_find_hospital_main_window", lambda: hwnd)
+    monkeypatch.setattr(main, "_his_title_of", lambda h: title)
+
+
+def test_recalibrate_writes_current_version_as_baseline(monkeypatch, tmp_path):
+    # 現況版本 1150701 → 校正後基線=1150701
+    monkeypatch.setattr(main, "get_conf_path", lambda name: str(tmp_path / name))
+    _recal_env(monkeypatch, tmp_path, "西醫門診醫師作業 V.1150701.01")
     monkeypatch.setattr(main.messagebox, "askyesno", lambda *a, **k: True)
     monkeypatch.setattr(main.messagebox, "showinfo", lambda *a, **k: None)
-
-    # 校正前:DRIFT(現況 1150701 vs 硬編碼 1150629)
-    main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01")
-    assert main._his_write_verdict.should_block_write is True
 
     app = main.AutomationApp.__new__(main.AutomationApp)
     main.AutomationApp._recalibrate_his_canary(app)
 
-    # 基線檔已記錄 1150701
+    # 基線檔已記錄現況版本
     assert main._contract_baseline().get("his_menu") == {"title_version": "1150701"}
-    # 重新採樣後不再擋
-    assert main._his_write_verdict.should_block_write is False
+    # 之後 gate 用該基線採樣同版本 → 不再擋
+    monkeypatch.setattr(main, "_his_title_of",
+                        lambda h: "西醫門診醫師作業 V.1150701.01")
+    assert main._his_write_contract_ok(123, "F2") is True
 
 
 def test_recalibrate_aborts_when_no_version(monkeypatch, tmp_path):
-    monkeypatch.setattr(main, "_contract_baseline_singleton", None)
     monkeypatch.setattr(main, "get_conf_path", lambda name: str(tmp_path / name))
-    monkeypatch.setattr(main, "_find_hospital_main_window",
-                        lambda: main._sample_his_write_contract("西醫門診醫師作業") or 0)
+    _recal_env(monkeypatch, tmp_path, "西醫門診醫師作業")     # 找到視窗但無版本號
     warned = {"w": False}
     monkeypatch.setattr(main.messagebox, "showwarning",
                         lambda *a, **k: warned.update(w=True))
@@ -145,11 +171,8 @@ def test_recalibrate_shows_error_not_success_when_refused(monkeypatch, tmp_path)
     p = tmp_path / "contract_baseline.json"
     p.write_text(json.dumps({"schema_version": 999, "surfaces": {}}),
                  encoding="utf-8")
-    monkeypatch.setattr(main, "_contract_baseline_singleton", None)
     monkeypatch.setattr(main, "get_conf_path", lambda name: str(p))
-    monkeypatch.setattr(main, "_find_hospital_main_window",
-                        lambda: main._sample_his_write_contract(
-                            "西醫門診醫師作業 V.1150701.01") or 1)
+    _recal_env(monkeypatch, p, "西醫門診醫師作業 V.1150701.01")
     monkeypatch.setattr(main.messagebox, "askyesno", lambda *a, **k: True)
     calls = {"error": False, "info": False}
     monkeypatch.setattr(main.messagebox, "showerror",
@@ -169,9 +192,14 @@ def test_canary_settings_wired_into_settings_tab():
     assert "_build_canary_settings(left_column)" in src
 
 
-def test_canary_status_text_reflects_verdict(monkeypatch):
+def test_canary_status_text_now_reflects_live_sample(monkeypatch):
     app = main.AutomationApp.__new__(main.AutomationApp)
-    main._his_write_verdict = None
-    assert "尚未偵測" in main.AutomationApp._canary_status_text(app)
-    _sample(monkeypatch, "西醫門診醫師作業 V.1150701.01")   # DRIFT
-    assert "改版" in main.AutomationApp._canary_status_text(app)
+    # 找不到視窗 → 尚未偵測(誠實,不 stale)
+    monkeypatch.setattr(main, "_find_hospital_main_window", lambda: 0)
+    assert "尚未偵測" in main.AutomationApp._canary_status_text_now(app)
+    # 找到視窗 + DRIFT title → 顯示疑似改版
+    monkeypatch.setattr(main, "_find_hospital_main_window", lambda: 123)
+    monkeypatch.setattr(main, "_his_title_of", lambda h: "西醫門診醫師作業 V.1150701.01")
+    monkeypatch.setattr(main, "_his_write_baseline_fp",
+                        lambda: {"title_version": "1150629"})
+    assert "改版" in main.AutomationApp._canary_status_text_now(app)

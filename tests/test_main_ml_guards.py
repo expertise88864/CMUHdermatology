@@ -22,33 +22,28 @@ def test_m1_his_title_version_parse():
     assert main._his_title_version("") is None
 
 
-def test_m1_upgraded_to_canary_sampling(caplog):
-    # [金絲雀 2026-07-16] M1 版本守門升級為金絲雀:_maybe_warn_his_version 已由
-    # _sample_his_write_contract 取代(採樣 + 裁決 + 一次性警告)。
+def test_m1_upgraded_to_canary_verdict(monkeypatch, caplog):
+    # [金絲雀 2026-07-16] M1 版本守門升級為金絲雀:_maybe_warn_his_version 已移除;
+    # 裁決由純函式 _his_write_verdict_for(現況 vs 基線)提供,gate 自足採樣。
     import logging
     from cmuh_common import contract_canary as cc
     assert not hasattr(main, "_maybe_warn_his_version"), "舊版本守門應已被金絲雀取代"
+    monkeypatch.setattr(main, "_his_write_baseline_fp",
+                        lambda: {"title_version": main._HIS_CALIBRATED_VERSION})
 
-    # 版本不同 → DRIFT 裁決 + 一次性警告
-    main._his_write_verdict = None
+    # 版本不同 → DRIFT、擋
+    v = main._his_write_verdict_for("西醫門診醫師作業 V.1150630.01")
+    assert v.status == cc.STATUS_DRIFT and v.should_block_write is True
+    # 版本相同 → OK、不擋
+    assert main._his_write_verdict_for("西醫門診醫師作業 V.1150629.01").status == cc.STATUS_OK
+    # 無版本字串 → UNKNOWN、不擋(不假警報停熱鍵)
+    assert main._his_write_verdict_for("西醫門診醫師作業").status == cc.STATUS_UNKNOWN
+
+    # 找視窗時的一次性 DRIFT 警告 log(_sample_his_write_contract,不存全域)
     main._his_canary_warned = False
     with caplog.at_level(logging.WARNING):
         main._sample_his_write_contract("西醫門診醫師作業 V.1150630.01")
-    assert main._his_write_verdict.status == cc.STATUS_DRIFT
-    assert main._his_write_verdict.should_block_write is True
-    assert any("金絲雀" in r.message for r in caplog.records), "版本不同應警示"
-
-    # 版本相同 → OK、不擋
-    main._his_canary_warned = False
-    main._sample_his_write_contract("西醫門診醫師作業 V.1150629.01")
-    assert main._his_write_verdict.status == cc.STATUS_OK
-    assert main._his_write_verdict.should_block_write is False
-
-    # title 無版本字串 → UNKNOWN(採不到)→ 不擋(不假警報停熱鍵)
-    main._his_canary_warned = False
-    main._sample_his_write_contract("西醫門診醫師作業")
-    assert main._his_write_verdict.status == cc.STATUS_UNKNOWN
-    assert main._his_write_verdict.should_block_write is False
+    assert any("金絲雀" in r.message for r in caplog.records), "版本不同應警示一次"
 
 
 # ══ M2：代碼輸入 focus 嚴格判準(previous_focus 未知時排除病歷 memo/rich)══════════
