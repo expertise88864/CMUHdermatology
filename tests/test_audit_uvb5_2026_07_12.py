@@ -45,6 +45,8 @@ def test_ud08_empty_readback_aborts():
     idx = next((i for i, ln in enumerate(lines)
                 if "actual_text = _read_tmemo_text(memo_hwnd)" in ln), None)
     assert idx is not None, "找不到 read-back 段"
-    window = "\n".join(lines[idx:idx + 12])
+    # [2026-07-17] 視窗 12→20 行:稽核帳本(_record_his_action)插入後 return False 被推出
+    # 原視窗,但保守中止行為未變。此測本就只守「空回讀→不繼續」,不該綁死行距。
+    window = "\n".join(lines[idx:idx + 20])
     assert "if not actual_text:" in window and "return False" in window, \
         "UD-08 read-back 空字串未保守中止"
