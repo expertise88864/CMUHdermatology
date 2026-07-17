@@ -587,17 +587,17 @@ def test_has_his_credentials_guard():
     assert cq._has_his_credentials({}) is False
 
 
-def test_cleanup_orphan_systemftp_kills_only_windowless(monkeypatch):
-    """[CQ-05] 本 session 中使用者桌面無可見視窗的 systemftp=孤兒→關;有視窗者保留。"""
+def test_cleanup_orphan_systemftp_kills_only_hidden_desktop(monkeypatch):
+    """[CQ-05 codex 正面識別] 只關「本 session ∩ 確實在隱藏桌面上」的 systemftp=孤兒;
+    100/200 在使用者桌面(不在隱藏桌面)一律保留 —— 不靠『暫無視窗』負面推斷。"""
     monkeypatch.setattr(cq, "_systemftp_pids", lambda: {100, 200, 300})
     monkeypatch.setattr(cq, "_pid_session", lambda pid: 1)   # 全在同一 session
     monkeypatch.setattr(cq.os, "getpid", lambda: 50)
-    monkeypatch.setattr(cq, "find_windows", lambda *a, **k: [11, 22])   # 兩個可見視窗
-    monkeypatch.setattr(cq, "_window_pid", lambda h: {11: 100, 22: 200}.get(h, -1))
+    monkeypatch.setattr(cq, "_hidden_desktop_pids", lambda: {300})   # 只有 300 在隱藏桌面
     killed = []
     monkeypatch.setattr(cq, "close_pids", lambda pids, **k: killed.append(set(pids)))
     cq._cleanup_orphan_systemftp()
-    assert killed == [{300}]           # 只關無視窗孤兒 300;100/200 保留
+    assert killed == [{300}]           # 只關隱藏桌面孤兒 300;使用者桌面的 100/200 保留
 
 
 def test_cleanup_orphan_systemftp_ignores_other_session(monkeypatch):
@@ -606,8 +606,7 @@ def test_cleanup_orphan_systemftp_ignores_other_session(monkeypatch):
     monkeypatch.setattr(cq, "_pid_session",
                         lambda pid: 1 if pid in (50, 100) else 2)   # 999 屬別的 session
     monkeypatch.setattr(cq.os, "getpid", lambda: 50)
-    monkeypatch.setattr(cq, "find_windows", lambda *a, **k: [])     # 本 session 無視窗
-    monkeypatch.setattr(cq, "_window_pid", lambda h: -1)
+    monkeypatch.setattr(cq, "_hidden_desktop_pids", lambda: {100, 999})   # 兩者都在隱藏桌面
     killed = []
     monkeypatch.setattr(cq, "close_pids", lambda pids, **k: killed.append(set(pids)))
     cq._cleanup_orphan_systemftp()

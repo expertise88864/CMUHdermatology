@@ -48,6 +48,7 @@ ensure_dependencies(REQUIRED_LIBS)
 
 # === 主要 import（依賴已就緒）===
 import ctypes  # noqa: E402
+from ctypes import wintypes  # noqa: E402
 import html as _html  # noqa: E402
 import logging  # noqa: E402
 import queue  # noqa: E402
@@ -1817,6 +1818,7 @@ def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -
         # 等登入視窗（期間關多開提示）。隱藏桌面上 find_windows 自動列舉
         # 該桌面的視窗（因為本執行緒已 SetThreadDesktop 過去）。
         login = None
+        saw_multi_instance = False   # [2026-07-17] 是否關過多開提示(用於更明確的失敗訊息)
         deadline = time.time() + 120
         while time.time() < deadline:
             if not running.is_set():
@@ -1825,6 +1827,7 @@ def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -
                 ok_btn = find_child(ph, "TButton", "OK")
                 if ok_btn:
                     click_button(ok_btn)
+                    saw_multi_instance = True
                     logging.info("已關閉多開提示視窗")
                     time.sleep(0.6)
             cands = find_windows(LOGIN_CLASS, LOGIN_TITLE_PREFIX)
@@ -1835,6 +1838,13 @@ def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -
                 break
             time.sleep(0.5)
         if not login:
+            # [2026-07-17] 關過多開提示卻始終等不到登入視窗＝systemftp 偵測到已達「最多兩個」
+            # 上限,新實例不進登入畫面。多因隱藏桌面累積的 systemftp 孤兒(更新重啟/硬退遺留)
+            # 佔位;放棄後 _do_full_job 會清孤兒自癒。訊息點名以便一眼判別根因。
+            if saw_multi_instance:
+                raise RuntimeError(
+                    "等不到登入視窗（systemftp 疑似已達『最多兩個』上限：隱藏桌面有殘留孤兒"
+                    "佔位、或使用者已手動開啟住院系統）")
             raise RuntimeError("等不到登入視窗")
         our_pid = _window_pid(login)
         our_pids = (_systemftp_pids() - before) | {our_pid}
@@ -2342,38 +2352,71 @@ def _kill_systemftp(before_pids=None) -> None:
         logging.debug("taskkill 本任務 PID 失敗（可能已結束）", exc_info=True)
 
 
-def _cleanup_orphan_systemftp() -> None:
-    """[CQ-05] 啟動清掃:上次硬退(self-watchdog/托盤退出/更新重啟)遺留在隱藏桌面的
-    systemftp —— 已登入 HIS、隱形、佔記憶體,且下次任務的 before_pids 快照會把它圈進
-    「不可殺」而永久存活累積(≥2 個時配合『請勿開啟超過兩個』限制會讓後續登入更不穩)。
-
-    判定:某 systemftp PID 在【使用者桌面】沒有任何可見 top-level 視窗 → 視為前世孤兒
-    (隱藏桌面殘留)→ 關閉。保守起見只殺『使用者桌面無可見視窗』者,絕不動使用者正常開啟的
-    住院系統(它在使用者桌面必有可見視窗,含最小化)。只在啟動時(持有單例 mutex 後)呼叫一次。
-    """
+def _hidden_desktop_pids() -> set:
+    """[codex 2026-07-17] 正面識別:列舉【本程式隱藏桌面 HIDDEN_DESKTOP_NAME】上所有
+    top-level 視窗的擁有者 PID = 確實在隱藏桌面上跑的行程。EnumDesktopWindows 列舉該桌面
+    全部視窗(含被隱形執行緒 SW_HIDE 的),故已登入的隱形孤兒也抓得到。取不到桌面/失敗回
+    空集合(保守 → 上層不殺任何行程)。"""
+    _DESKTOP_ENUMERATE = 0x0040
+    _DESKTOP_READOBJECTS = 0x0001
+    hdesk = None
     try:
-        all_pids = _systemftp_pids()
-        if not all_pids:
-            return
-        # [CQ-05 codex] 多使用者/RDS/快速使用者切換:_systemftp_pids() 是全機掃描,但
-        # EnumWindows 只看得到「本 session 桌面」的視窗 → 其他使用者作用中的 HIS(不同
-        # session)會被誤判無視窗=孤兒而被殺(本程式可能提權)。故先把候選 PID 過濾到
-        # 本登入 session,取不到本 session id 時保守整個跳過。
+        hdesk = _user32.OpenDesktopW(HIDDEN_DESKTOP_NAME, 0, False,
+                                     _DESKTOP_ENUMERATE | _DESKTOP_READOBJECTS)
+        if not hdesk:
+            return set()
+        pids: set = set()
+        EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND,
+                                      wintypes.LPARAM)
+
+        @EnumProc
+        def _cb(hwnd, _lparam):
+            try:
+                pid = wintypes.DWORD()
+                _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value:
+                    pids.add(pid.value)
+            except Exception:
+                pass
+            return True
+
+        _user32.EnumDesktopWindows(hdesk, _cb, 0)
+        return pids
+    except Exception:
+        logging.debug("[CQ-05] 列舉隱藏桌面視窗失敗(保守回空)", exc_info=True)
+        return set()
+    finally:
+        if hdesk:
+            try:
+                _user32.CloseDesktop(hdesk)
+            except Exception:
+                pass
+
+
+def _cleanup_orphan_systemftp() -> None:
+    """[CQ-05] 清掃硬退(self-watchdog/托盤退出/更新重啟)遺留在隱藏桌面的 systemftp —— 已
+    登入 HIS、隱形、佔記憶體,且下次任務的 before_pids 快照會把它圈進「不可殺」而永久存活
+    累積(≥2 個時配合『請勿開啟超過兩個』限制會讓後續登入更不穩)。啟動時、以及每次任務
+    重試到底放棄後各呼叫一次(後者讓運行期累積的孤兒也能被清、下一輪自癒)。
+
+    [codex 2026-07-17] 【正面識別】隱藏桌面孤兒:只殺「本 session 且【確實在本程式隱藏桌面
+    上有視窗】」的 systemftp,不靠「使用者桌面暫無視窗」的負面推斷 —— 使用者手動開啟/正在
+    啟動(登入視窗尚未出現)的住院系統在【使用者桌面】、不在隱藏桌面,故【永不】被誤殺,
+    也無任何時間競態(不需去抖動)。清掃時機(啟動前、放棄後)隱藏桌面上不會有本次任務
+    在用的實例,所以隱藏桌面上的 systemftp 都是前世孤兒。"""
+    try:
         my_sid = _pid_session(os.getpid())
         if my_sid is None:
+            # 多使用者/RDS:取不到本 session id → 保守整個跳過(不誤動其他 session 行程)。
             logging.debug("[CQ-05] 取不到本 session id → 保守跳過孤兒清掃")
             return
-        all_pids = {p for p in all_pids if _pid_session(p) == my_sid}
-        if not all_pids:
+        same_session = {p for p in _systemftp_pids() if _pid_session(p) == my_sid}
+        if not same_session:
             return
-        # 本主執行緒在使用者互動桌面 → EnumWindows 只列舉本 session 桌面的視窗;
-        # 隱藏桌面(HIDDEN_DESKTOP_NAME)上的孤兒在此看不到任何視窗 → 被判為孤兒。
-        visible = find_windows(pids=all_pids, visible_only=True)
-        on_user_desktop = {_window_pid(h) for h in visible}
-        orphans = all_pids - on_user_desktop
+        orphans = same_session & _hidden_desktop_pids()
         if orphans:
             logging.warning(
-                "[CQ-05] 清掃前世遺留的隱形 systemftp 孤兒(使用者桌面無視窗): %s",
+                "[CQ-05] 清掃隱藏桌面殘留的 systemftp 孤兒(正面識別在隱藏桌面上): %s",
                 sorted(orphans))
             close_pids(orphans)
     except Exception:
@@ -2576,6 +2619,15 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                 else:
                     logging.error("會診查詢任務已重試 %d 次仍失敗，放棄。最後錯誤：%s",
                                   retry_count, last_err)
+                    # [2026-07-17] 「等不到登入視窗」多因隱藏桌面累積的 systemftp 孤兒
+                    # (更新重啟/硬退遺留,運行期間累積)佔滿『最多兩個』上限。啟動清掃只在
+                    # 啟動跑一次、重試的 _kill_systemftp 又只殺本次新增 → 孤兒永久存活、會診
+                    # 查詢卡死到下次重啟。放棄後【清一次孤兒】(只殺本 session 且使用者桌面無
+                    # 可見視窗者＝隱藏桌面殘留,絕不動使用者手動開的住院系統)讓下一輪能自癒。
+                    try:
+                        _cleanup_orphan_systemftp()
+                    except Exception:
+                        logging.debug("放棄後孤兒清掃失敗（略過）", exc_info=True)
                     # [stability] email 觸發整個失敗(沒寄出結果) → 把觸發者從去重
                     # 名單移除，讓使用者可立即重發觸發信重試，不必等 5 分鐘去重窗
                     # 過期才生效。
