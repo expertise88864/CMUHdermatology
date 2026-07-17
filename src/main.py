@@ -1468,6 +1468,10 @@ _HOSPITAL_WIN_TITLE_KW = "西醫門診醫師作業"
 # 硬停 + 醫師對話框待有實機可確認 title 格式再補(不確定就不自動動作,連自己的守門也一樣)。
 _HIS_CALIBRATED_VERSION = "1150629"   # 選單 id 校正對應的 HIS 版本(2026-06-29 V.1150629.01 改版後)
 _HIS_VERSION_RE = re.compile(r"[Vv]\.?\s*(\d{6,8})")
+# [金絲雀 2026-07-17] 另抓含尾碼的完整版本(V.1150629.01 → 1150629.01)。主版本相同但尾碼
+# 不同(.01→.02)也可能是改版;但尾碼比對【只在基線本身帶尾碼時】才生效(見 sample_his_current_fp)
+# ,故隱性硬編碼基線(只有主版本、無尾碼)不會一開機就因尾碼把 F 鍵全擋死。
+_HIS_VERSION_FULL_RE = re.compile(r"[Vv]\.?\s*(\d{6,8}(?:\.\d{1,3})*)")
 
 # ── 契約金絲雀:HIS 寫入面(2026-07-16) ─────────────────────────────────────────
 # F1–F12 靠硬編碼選單 command id 操作 HIS;院方改版(如 2026-06-29 整批 +1)會讓 F 鍵
@@ -1490,8 +1494,15 @@ def _contract_baseline() -> "_ContractBaseline":
 
 
 def _his_title_version(title: str):
-    """從主視窗 title 取 HIS 版本號(6-8 位數字,如 1150629);找不到回 None。純函式,好測。"""
+    """從主視窗 title 取 HIS 主版本號(6-8 位數字,如 1150629);找不到回 None。純函式,好測。"""
     m = _HIS_VERSION_RE.search(title or "")
+    return m.group(1) if m else None
+
+
+def _his_title_version_full(title: str):
+    """[金絲雀 2026-07-17] 取含尾碼的完整版本(如 1150629.01);無尾碼時等同主版本;找不到回 None。
+    純函式。尾碼是否納入 DRIFT 判定,取決於基線是否帶尾碼(見 sample_his_current_fp)。"""
+    m = _HIS_VERSION_FULL_RE.search(title or "")
     return m.group(1) if m else None
 
 
@@ -1504,9 +1515,21 @@ def _his_write_baseline_fp() -> dict:
 
 
 def sample_his_current_fp(title: str):
-    """從 title 採樣 HIS 寫入契約現況指紋;採不到版本回 None(→ 裁決 UNKNOWN,不擋)。純函式。"""
+    """從 title 採樣 HIS 寫入契約現況指紋;採不到版本回 None(→ 裁決 UNKNOWN,不擋)。純函式。
+
+    [金絲雀 2026-07-17] 除主版本 title_version(1150629)外,另存含尾碼的 title_version_full
+    (1150629.01)。compare_fingerprint 以【基線的鍵】為比對範圍,而隱性硬編碼基線只含
+    title_version → 尾碼預設【不】比對(不會一開機就把 F 鍵全擋死);唯有使用者在實機
+    「重新校正」把現況(含 full)寫進基線後,尾碼變動(.01→.02)才會被判 DRIFT。這樣
+    既補上 GPT 指出的尾碼 false-negative,又不冒盲抓尾碼把熱鍵全擋死的風險。"""
     ver = _his_title_version(title)
-    return {"title_version": ver} if ver is not None else None
+    if ver is None:
+        return None
+    fp = {"title_version": ver}
+    full = _his_title_version_full(title)
+    if full is not None:
+        fp["title_version_full"] = full
+    return fp
 
 
 def _his_write_verdict_for(title: str):
@@ -4174,6 +4197,12 @@ def _f11_快速完成_main(label: str = "F11") -> bool:
         return False
     logging.info("[%s][timeline] 找到 main_hwnd=%s (+%.0fms)",
                   label, main_hwnd, (time.time() - t_f11_start) * 1000)
+    # [金絲雀 2026-07-17] F11 完成動作(送「完成不印」id 277 / 按「全部完成」)亦為 HIS 寫入 →
+    # 補上與 F1–F5/UVB 相同的契約閘門(先前 F11 未納管,設定頁卻宣稱「F 鍵寫入都會停」)。
+    # 疑似改版 → 停止,不送完成動作(避免 id 位移誤觸別的選單/送出繳費單等)。
+    if not _his_write_contract_ok(main_hwnd, label):
+        _mark_hotkey_action_time()
+        return False
 
     # Step 1: 完成路徑分流。
     #   Route A: 療程=2/3（照光）→ 完成不印，不按「全部完成」。
@@ -5988,6 +6017,12 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
     main_hwnd = _find_hospital_main_window()
     if not main_hwnd:
         logging.warning("[%s] 找不到主程式視窗", label)
+        return False
+    # [金絲雀 2026-07-17] 同意書開立(送選單 id 669、選 tab/radio、開立電子)也是 HIS 寫入 →
+    # 補上與 F1–F5/UVB 相同的契約閘門(先前只有 F1–F5/UVB 有,設定頁卻宣稱「F 鍵寫入都會停」)。
+    # 疑似改版 → 停止,不送同意書 command(避免 id 位移開錯功能/寫錯病歷)。
+    if not _his_write_contract_ok(main_hwnd, label or "同意書"):
+        _mark_hotkey_action_time()
         return False
     # 用 Post (非同步) 避免 SendMessage 卡住 (實測 2026-05-18 12:43)
     if not _send_yiling_menu_command(main_hwnd, MENU_ID_同意書):
@@ -12430,9 +12465,9 @@ class AutomationApp:
                    command=self._refresh_canary_status).pack(side=tk.LEFT)
         ttk.Button(btns, text="重新校正",
                    command=self._recalibrate_his_canary).pack(side=tk.LEFT, padx=6)
-        ttk.Label(cf, text="偵測到院方改版（主視窗版本與基線不符）時，F1–F5 醫令代碼與"
-                  "UVB/照光劑量會停止自動寫入，避免寫錯病歷；確認新版無誤後按「重新校正」"
-                  "放行。（F9/F10 同意書、F11 轉診目前未納入契約閘門。）",
+        ttk.Label(cf, text="偵測到院方改版（主視窗版本與基線不符）時，F1–F5 醫令代碼、"
+                  "UVB/照光劑量、F9/F10 同意書與 F11 快速完成都會停止自動寫入，避免寫錯"
+                  "病歷；確認新版無誤後按「重新校正」放行。",
                   foreground="gray", wraplength=300, justify="left",
                   style="Small.TLabel").pack(anchor="w", pady=(6, 0))
 

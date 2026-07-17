@@ -109,9 +109,56 @@ def test_gate_wired_into_code_input_and_uvb():
             < uvb_src.index("_resolve_phototherapy_disposition")), "gate 須在寫回前"
 
 
+def test_gate_wired_into_consent_and_f11():
+    # [金絲雀 2026-07-17 Finding #5] F9/F10(同意書 669)與 F11(完成 277/全部完成)也是 HIS
+    # 寫入,先前未納 gate、設定頁卻宣稱「F 鍵寫入都會停」→ 補上,讓宣稱名副其實。
+    consent_src = inspect.getsource(main.script_F9_F10_consent_form_adaptive)
+    assert "_his_write_contract_ok(main_hwnd, " in consent_src, "同意書寫入前應過金絲雀 gate"
+    assert (consent_src.index("_his_write_contract_ok")
+            < consent_src.index("_send_yiling_menu_command")), "gate 須在送同意書 command 前"
+
+    f11_src = inspect.getsource(main._f11_快速完成_main)
+    assert "_his_write_contract_ok(main_hwnd, " in f11_src, "F11 完成前應過金絲雀 gate"
+    # gate 須在任何完成動作(送「完成不印」/ 按「全部完成」)之前
+    assert (f11_src.index("_his_write_contract_ok")
+            < f11_src.index("_f11_send_finish_no_print")), "gate 須在送完成動作前"
+    assert (f11_src.index("_his_write_contract_ok")
+            < f11_src.index("_f11_click_finish_all")), "gate 須在按全部完成前"
+
+
 def test_sampling_wired_into_find_window():
     src = inspect.getsource(main._find_hospital_main_window)
     assert "_sample_his_write_contract" in src, "找到主視窗時應採樣 HIS 寫入契約"
+
+
+# ── 版本尾碼(.01/.02):安全 opt-in DRIFT(Finding #4) ─────────────────────────
+def test_suffix_ignored_when_baseline_has_no_suffix(monkeypatch):
+    # [金絲雀 2026-07-17] 隱性硬編碼基線只有主版本(無尾碼)→ 尾碼【不】比對,
+    # 現況尾碼再怎麼變都不 DRIFT(不會一開機把 F 鍵全擋死)。
+    monkeypatch.setattr(main, "_his_write_baseline_fp",
+                        lambda: {"title_version": "1150629"})
+    assert main._his_write_verdict_for("西醫門診醫師作業 V.1150629.99").status == cc.STATUS_OK
+    assert main._his_write_verdict_for("西醫門診醫師作業 V.1150629").status == cc.STATUS_OK
+
+
+def test_suffix_drift_after_recalibration(monkeypatch):
+    # [金絲雀 2026-07-17] 使用者實機重新校正後,基線帶尾碼(title_version_full)→ 此後尾碼
+    # 變動(.01→.02)才會被判 DRIFT(主版本相同也擋)。這正是 GPT 指出的 false-negative 修法。
+    monkeypatch.setattr(main, "_his_write_baseline_fp",
+                        lambda: {"title_version": "1150629",
+                                 "title_version_full": "1150629.01"})
+    same = main._his_write_verdict_for("西醫門診醫師作業 V.1150629.01")
+    assert same.status == cc.STATUS_OK
+    shifted = main._his_write_verdict_for("西醫門診醫師作業 V.1150629.02")
+    assert shifted.status == cc.STATUS_DRIFT and shifted.should_block_write is True
+
+
+def test_sample_fp_includes_full_version():
+    # 採樣現況指紋同時含主版本與含尾碼的完整版本(供實機校正後尾碼比對)
+    fp = main.sample_his_current_fp("西醫門診醫師作業 V.1150629.01")
+    assert fp == {"title_version": "1150629", "title_version_full": "1150629.01"}
+    # 無版本 → None(→ UNKNOWN,不擋)
+    assert main.sample_his_current_fp("西醫門診醫師作業") is None
 
 
 def test_gate_and_recalibrate_do_not_read_global_verdict():
@@ -143,8 +190,9 @@ def test_recalibrate_writes_current_version_as_baseline(monkeypatch, tmp_path):
     app = main.AutomationApp.__new__(main.AutomationApp)
     main.AutomationApp._recalibrate_his_canary(app)
 
-    # 基線檔已記錄現況版本
-    assert main._contract_baseline().get("his_menu") == {"title_version": "1150701"}
+    # 基線檔已記錄現況版本(含尾碼 full;實機重新校正後尾碼才納入 DRIFT 判定)
+    assert main._contract_baseline().get("his_menu") == {
+        "title_version": "1150701", "title_version_full": "1150701.01"}
     # 之後 gate 用該基線採樣同版本 → 不再擋
     monkeypatch.setattr(main, "_his_title_of",
                         lambda h: "西醫門診醫師作業 V.1150701.01")
@@ -190,6 +238,15 @@ def test_recalibrate_shows_error_not_success_when_refused(monkeypatch, tmp_path)
 def test_canary_settings_wired_into_settings_tab():
     src = inspect.getsource(main.AutomationApp._create_settings_tab)
     assert "_build_canary_settings(left_column)" in src
+
+
+def test_canary_settings_copy_lists_all_gated_writes():
+    # [codex 2026-07-17] 說明文字須與實際 gate 覆蓋一致:F9/F10 同意書、F11 快速完成
+    # 既已納管,就不得再顯示「未納入契約閘門」,也不得把 F11 誤標成「轉診」。
+    src = inspect.getsource(main.AutomationApp._build_canary_settings)
+    assert "F9/F10 同意書" in src and "F11 快速完成" in src, "說明應列出新納管的 F9/F10/F11"
+    assert "未納入契約閘門" not in src, "F9/F10/F11 已納管,不可再宣稱未納入"
+    assert "F11 轉診" not in src, "F11 是快速完成,非轉診"
 
 
 def test_canary_status_text_now_reflects_live_sample(monkeypatch):
