@@ -75,12 +75,19 @@ class _SyncThread:
 
 
 def _notify_env(monkeypatch, baseline_fp=None):
-    """隔離通知狀態:重置去重集合/一次性 log 旗標,寄信同步化並改記錄器。回 sent list。"""
+    """隔離通知狀態:重置去重集合/一次性 log 旗標,寄信同步化並改記錄器。
+    持久化隔離:seed 標記為已載(不讀檔)、persist 改 no-op(P2-03 持久化另有專門測試)。
+    回 sent list。"""
     if baseline_fp is None:
         baseline_fp = {"title_version": main._HIS_CALIBRATED_VERSION}
     monkeypatch.setattr(main, "_his_write_baseline_fp", lambda: baseline_fp)
     monkeypatch.setattr(main, "_his_drift_notified_versions", set())
     monkeypatch.setattr(main, "_his_drift_inflight_versions", set())
+    monkeypatch.setattr(main, "_his_drift_persist_pending", set())
+    monkeypatch.setattr(main, "_his_drift_persist_retry_inflight", set())
+    monkeypatch.setattr(main, "_his_drift_no_recipient_logged", set())
+    monkeypatch.setattr(main, "_his_drift_persist_loaded", True)   # 跳過 seed 的檔案 IO
+    monkeypatch.setattr(main, "_persist_his_drift_notified", lambda k: True)
     monkeypatch.setattr(main, "_his_canary_warned", False)
     monkeypatch.setattr(main.threading, "Thread", _SyncThread)
     monkeypatch.setattr(main, "_load_alert_recipients", lambda: ["dev@example.com"])
@@ -124,14 +131,15 @@ def test_notify_retries_until_send_succeeds(monkeypatch):
     outcome = {"ok": False}
     monkeypatch.setattr(main, "_send_alert_email_via_smtp",
                         lambda s, b, r, **k: sent.append(s) or outcome["ok"])
+    _k = "1150701@1150713"                               # 去重 key = 現況@基線
     main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01")   # 寄失敗(False)
     assert len(sent) == 1
-    assert "1150701" not in main._his_drift_notified_versions, "寄失敗不得標記已通知"
+    assert _k not in main._his_drift_notified_versions, "寄失敗不得標記已通知"
     main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01")   # 重試
     assert len(sent) == 2, "上次寄失敗 → 應重試"
     outcome["ok"] = True
     main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01")   # 這次成功
-    assert len(sent) == 3 and "1150701" in main._his_drift_notified_versions
+    assert len(sent) == 3 and _k in main._his_drift_notified_versions
     main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01")   # 成功後不再寄
     assert len(sent) == 3, "寄成功後同版本不再寄"
 
@@ -145,6 +153,191 @@ def test_dedup_uses_full_version_after_recalibration(monkeypatch):
     main._sample_his_write_contract("西醫門診醫師作業 V.1150714.01")
     main._sample_his_write_contract("西醫門診醫師作業 V.1150714.02")   # 同主版本、不同點版
     assert len(sent) == 2, "同主版本的不同點版應各通知一次"
+
+
+# ── P2-03:改版通知去重持久化 + 無收件人不起緒 ───────────────────────────────
+def test_notify_key_includes_baseline():
+    # 同一現況版本、不同基線 → 不同 key(重新校正後真改版不被舊記錄永久壓住)
+    v1 = cc.compare_fingerprint("his_menu", {"title_version": "1150713"},
+                                {"title_version": "1150701"})
+    v2 = cc.compare_fingerprint("his_menu", {"title_version": "1150800"},
+                                {"title_version": "1150701"})
+    assert main._his_drift_notify_key(v1) == "1150701@1150713"
+    assert main._his_drift_notify_key(v2) == "1150701@1150800"
+
+
+def test_notified_versions_persist_across_restart(monkeypatch, tmp_path):
+    # [P2-03] 重啟後同一改版版本【不再重寄】:寄成功寫進磁碟,seed 從磁碟載回。
+    import json
+    monkeypatch.setattr(main, "get_conf_path", lambda name: str(tmp_path / name))
+    monkeypatch.setattr(main, "_his_write_baseline_fp",
+                        lambda: {"title_version": "1150713"})
+    monkeypatch.setattr(main, "_his_drift_notified_versions", set())
+    monkeypatch.setattr(main, "_his_drift_inflight_versions", set())
+    monkeypatch.setattr(main, "_his_drift_persist_pending", set())
+    monkeypatch.setattr(main, "_his_drift_persist_retry_inflight", set())
+    monkeypatch.setattr(main, "_his_drift_no_recipient_logged", set())
+    monkeypatch.setattr(main, "_his_drift_persist_loaded", False)
+    monkeypatch.setattr(main.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(main, "_load_alert_recipients", lambda: ["dev@example.com"])
+    sent = []
+    monkeypatch.setattr(main, "_send_alert_email_via_smtp",
+                        lambda s, b, r, **k: sent.append(s) or True)
+
+    main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01")
+    assert len(sent) == 1
+    saved = json.loads((tmp_path / main.HIS_DRIFT_NOTIFIED_FILENAME)
+                       .read_text(encoding="utf-8"))
+    assert "1150701@1150713" in saved, "寄成功應寫進持久化檔"
+
+    # 模擬重啟:清空記憶體集合、重設 seed 旗標(檔案保留)
+    monkeypatch.setattr(main, "_his_drift_notified_versions", set())
+    monkeypatch.setattr(main, "_his_drift_persist_loaded", False)
+    main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01")
+    assert len(sent) == 1, "重啟後同一改版版本不得重寄(已持久化)"
+
+
+def test_no_recipient_does_not_spawn_thread(monkeypatch):
+    # [P2-03] 無收件人時【不起緒】—— 否則沒設收件人時每次找視窗都堆一條立即結束的背景緒
+    monkeypatch.setattr(main, "_his_write_baseline_fp",
+                        lambda: {"title_version": "1150713"})
+    monkeypatch.setattr(main, "_his_drift_notified_versions", set())
+    monkeypatch.setattr(main, "_his_drift_inflight_versions", set())
+    monkeypatch.setattr(main, "_his_drift_persist_pending", set())
+    monkeypatch.setattr(main, "_his_drift_persist_retry_inflight", set())
+    monkeypatch.setattr(main, "_his_drift_no_recipient_logged", set())
+    monkeypatch.setattr(main, "_his_drift_persist_loaded", True)
+    monkeypatch.setattr(main, "_load_alert_recipients", lambda: [])
+    threads = []
+
+    class _CountThread:
+        def __init__(self, *a, **k):
+            threads.append(1)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(main.threading, "Thread", _CountThread)
+    for _ in range(5):
+        main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01")
+    assert threads == [], "無收件人時不得起任何寄信緒"
+
+
+def test_seed_loads_persisted_notified(monkeypatch, tmp_path):
+    # seed 把磁碟記錄載入記憶體集合(冪等)
+    import json
+    (tmp_path / main.HIS_DRIFT_NOTIFIED_FILENAME).write_text(
+        json.dumps({"1150701@1150713": "2026-07-19T10:00:00"}), encoding="utf-8")
+    monkeypatch.setattr(main, "get_conf_path", lambda name: str(tmp_path / name))
+    monkeypatch.setattr(main, "_his_drift_notified_versions", set())
+    monkeypatch.setattr(main, "_his_drift_persist_loaded", False)
+    main._seed_his_drift_notified_once()
+    assert "1150701@1150713" in main._his_drift_notified_versions
+
+
+def test_persist_prunes_old_entries(monkeypatch, tmp_path):
+    # 超過保留天數的舊項讀取時剪掉(改版罕見,避免無限膨脹)
+    import json
+    old = "2000-01-01T00:00:00"
+    (tmp_path / main.HIS_DRIFT_NOTIFIED_FILENAME).write_text(
+        json.dumps({"old@x": old}), encoding="utf-8")
+    monkeypatch.setattr(main, "get_conf_path", lambda name: str(tmp_path / name))
+    d, transient = main._load_his_drift_notified()
+    assert d == {} and transient is False, "超過保留天數的舊項應被剪掉"
+
+
+def test_seed_transient_read_error_does_not_mark_loaded(monkeypatch):
+    # [codex P2] 暫時性讀取失敗(檔案被鎖)不得標記 seed 完成 —— 否則把「暫時讀不到」當成
+    # 「沒有任何已通知記錄」,先前已通知的版本會重寄。下次呼叫會再試。
+    monkeypatch.setattr(main, "_his_drift_notified_versions", set())
+    monkeypatch.setattr(main, "_his_drift_persist_loaded", False)
+    monkeypatch.setattr(main, "_safe_load_json_ex", lambda *a, **k: ({}, "error"))
+    main._seed_his_drift_notified_once()
+    assert main._his_drift_persist_loaded is False
+    assert main._his_drift_notified_versions == set()
+
+
+def test_notify_deferred_when_dedup_state_cannot_load(monkeypatch):
+    # [codex P2] 去重狀態暫時載不進(檔案被鎖)→ 本次【不寄】,避免把已通知版本重寄;
+    # 檔案鎖解除後(load 正常)才寄。
+    monkeypatch.setattr(main, "_his_write_baseline_fp",
+                        lambda: {"title_version": "1150713"})
+    monkeypatch.setattr(main, "_his_drift_notified_versions", set())
+    monkeypatch.setattr(main, "_his_drift_inflight_versions", set())
+    monkeypatch.setattr(main, "_his_drift_persist_pending", set())
+    monkeypatch.setattr(main, "_his_drift_persist_retry_inflight", set())
+    monkeypatch.setattr(main, "_his_drift_no_recipient_logged", set())
+    monkeypatch.setattr(main, "_his_drift_persist_loaded", False)
+    monkeypatch.setattr(main, "_persist_his_drift_notified", lambda k: True)
+    monkeypatch.setattr(main.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(main, "_load_alert_recipients", lambda: ["dev@example.com"])
+    sent = []
+    monkeypatch.setattr(main, "_send_alert_email_via_smtp",
+                        lambda s, b, r, **k: sent.append(s) or True)
+    # 暫時性讀取失敗 → seed 載不進 → 不寄
+    monkeypatch.setattr(main, "_safe_load_json_ex", lambda *a, **k: ({}, "error"))
+    main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01")
+    assert sent == [], "去重狀態載不進時不得寄(避免重寄已通知版本)"
+    # 鎖解除 → seed 載到(空)→ 正常寄
+    monkeypatch.setattr(main, "_safe_load_json_ex", lambda *a, **k: ({}, "missing"))
+    main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01")
+    assert len(sent) == 1
+
+
+def test_pending_persist_retry_runs_in_background(monkeypatch):
+    # [codex P2] 補寫是檔案 IO,不可在找視窗/熱鍵路徑同步做 → 必須丟背景緒
+    src = inspect.getsource(main._retry_pending_his_drift_persist)
+    assert "threading.Thread(" in src and "_persist_his_drift_notified" in src, \
+        "pending 補寫應在背景緒做,不可同步阻塞熱鍵路徑"
+    assert "_his_drift_persist_retry_inflight" in src, "應有 in-flight 擋並發(避免堆緒)"
+
+
+def test_persist_transient_error_does_not_overwrite(monkeypatch, tmp_path):
+    # [codex P2] 讀到暫時性錯誤 → 不可用只含新 key 的 dict 覆寫,清掉既有記錄
+    import json
+    p = tmp_path / main.HIS_DRIFT_NOTIFIED_FILENAME
+    p.write_text(json.dumps({"A@x": "2026-07-19T10:00:00"}), encoding="utf-8")
+    monkeypatch.setattr(main, "get_conf_path", lambda name: str(tmp_path / name))
+    monkeypatch.setattr(main, "_safe_load_json_ex", lambda *a, **k: ({}, "error"))
+    assert main._persist_his_drift_notified("B@y") is False, "暫時性錯誤應回 False"
+    assert "A@x" in json.loads(p.read_text(encoding="utf-8")), "原檔不得被覆寫清空"
+
+
+def test_failed_persist_stays_pending_no_resend_then_retries(monkeypatch):
+    # [codex P2] 寄成功但持久化失敗 → 本 process 不重寄(記憶體已記),留 pending;下次偵測
+    # 補寫(不重寄);寫成功清 pending → 重啟後不重寄。
+    monkeypatch.setattr(main, "_his_write_baseline_fp",
+                        lambda: {"title_version": "1150713"})
+    monkeypatch.setattr(main, "_his_drift_notified_versions", set())
+    monkeypatch.setattr(main, "_his_drift_inflight_versions", set())
+    monkeypatch.setattr(main, "_his_drift_persist_pending", set())
+    monkeypatch.setattr(main, "_his_drift_persist_retry_inflight", set())
+    monkeypatch.setattr(main, "_his_drift_no_recipient_logged", set())
+    monkeypatch.setattr(main, "_his_drift_persist_loaded", True)
+    monkeypatch.setattr(main.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(main, "_load_alert_recipients", lambda: ["dev@example.com"])
+    sent = []
+    monkeypatch.setattr(main, "_send_alert_email_via_smtp",
+                        lambda s, b, r, **k: sent.append(s) or True)
+    persist_ok = {"v": False}
+    persist_calls = []
+    monkeypatch.setattr(main, "_persist_his_drift_notified",
+                        lambda k: persist_calls.append(k) or persist_ok["v"])
+    k = "1150701@1150713"
+    main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01")   # 寄成功、持久化失敗
+    assert len(sent) == 1
+    assert k in main._his_drift_notified_versions      # 記憶體已記 → 本 process 不重寄
+    assert k in main._his_drift_persist_pending        # 但留 pending 待補寫
+    persist_ok["v"] = True
+    main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01")   # 補寫(不重寄)
+    assert len(sent) == 1, "不得重寄"
+    assert len(persist_calls) == 2 and k not in main._his_drift_persist_pending
+
+
+def test_drift_seed_wired_into_startup():
+    src = open(main.__file__, encoding="utf-8").read()
+    assert '"canary-drift-seed", _seed_his_drift_notified_once' in src, \
+        "開機應背景載入已通知改版記錄(避免檔案 IO 落在熱鍵路徑)"
 
 
 def test_no_blocking_write_gate_anywhere():
