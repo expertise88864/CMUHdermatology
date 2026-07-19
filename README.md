@@ -81,8 +81,11 @@ powershell -Command "Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/e
 
 設計慣例（全 repo 一致）：
 
-- **醫療保守**：UVB 劑量/醫令寫回「不確定就不動、交醫師」；寫入 fail-closed、唯讀 fail-open；
-  寫回後 round-trip 驗證；F12 全鏈可取消。
+- **醫療保守**：UVB 劑量/醫令寫回「不確定就不動、交醫師」；寫回後 round-trip 驗證(讀不回/
+  對不上就中止＝fail-closed)、唯讀 fail-open；F12 全鏈可取消。
+- **院方改版偵測(契約金絲雀)**：比對主視窗版本與校正基線偵測 HIS 改版。政策 = **notify-only**
+  (使用者定案)：偵測到改版**只寄信通知、不擋自動寫入、不跳窗**——誤擋+洗版比偶發改版更難用,
+  改版風險由醫師現場判斷兜底；並有 append-only 稽核帳本(hash-chain)記錄每次外部動作供事後查證。
 - **決定性**：排班 CP-SAT 固定 seed、單 worker、ortools 釘版（`9.15.6755`）——同輸入同輸出。
 - **對外禮貌**：所有院方網站輪詢帶隨機抖動（反固定節拍）、退避（backoff）、夜間降頻。
 - **Tk 只在主緒碰**；背景工作經 UI queue 回主緒；跨行程單例（mutex）。

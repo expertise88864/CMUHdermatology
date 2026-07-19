@@ -54,6 +54,15 @@ def test_no_mutable_verdict_globals():
     assert not hasattr(main, "_his_current_fp")
 
 
+def test_his_canary_policy_is_notify_only_and_routed():
+    # [P2-04] HIS 寫入面政策 = NOTIFY_ONLY,且【單一可見宣告】;偵測走 policy_action 決策,
+    # 不是散在各處直接判 is_drift 再私接行為。
+    assert main._HIS_CANARY_POLICY == cc.POLICY_NOTIFY_ONLY
+    src = inspect.getsource(main._sample_his_write_contract)
+    assert "_canary_policy_action(v.status, _HIS_CANARY_POLICY)" in src, \
+        "偵測應由政策 × 裁決映射決定動作(政策與裁決分離)"
+
+
 # ── 改版偵測 = 通知不擋(_sample_his_write_contract → _notify_his_drift) ──────────
 class _SyncThread:
     """把 threading.Thread 換成同步執行,讓寄信在測試內即時發生、可斷言(不等背景緒)。"""

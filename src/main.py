@@ -84,9 +84,13 @@ from cmuh_common.notifications import (
     show_windows_notification, show_windows_notification_async, show_winotify_toast)
 from cmuh_common.window_icon import apply_tk_window_icon as _apply_tk_window_icon
 from cmuh_common.contract_canary import (
+    ACTION_NOTIFY as _CANARY_ACTION_NOTIFY,
+    ACTION_PROCEED as _CANARY_ACTION_PROCEED,
     BASELINE_FILENAME as _CANARY_BASELINE_FILENAME,
+    POLICY_NOTIFY_ONLY as _CANARY_POLICY_NOTIFY_ONLY,
     ContractBaseline as _ContractBaseline,
     compare_fingerprint as _canary_compare,
+    policy_action as _canary_policy_action,
 )
 from cmuh_common.action_ledger import (
     LEDGER_FILENAME as _LEDGER_FILENAME,
@@ -1484,12 +1488,16 @@ _HIS_VERSION_RE = re.compile(r"[Vv]\.?\s*(\d{6,8})")
 # ,故隱性硬編碼基線(只有主版本、無尾碼)不會一開機就因尾碼把 F 鍵全擋死。
 _HIS_VERSION_FULL_RE = re.compile(r"[Vv]\.?\s*(\d{6,8}(?:\.\d{1,3})*)")
 
-# ── 契約金絲雀:HIS 寫入面(2026-07-16) ─────────────────────────────────────────
-# F1–F12 靠硬編碼選單 command id 操作 HIS;院方改版(如 2026-06-29 整批 +1)會讓 F 鍵
-# 打到別的選單功能 → 寫錯病歷。金絲雀:每次危險寫入前比對「主視窗版本」與基線,不符即
-# 【fail-closed 停止自動寫入】+ 疑似改版警告,交醫師手動(把「寫錯」換成「不寫、你手動」)。
-# 指紋只用 title 版本號(HIS 選單多為 owner-draw、動態文字讀不到 → 版本字串是最可靠信號)。
+# ── 契約金絲雀:HIS 寫入面(2026-07-16;政策 2026-07-17 改 notify-only) ────────────
+# F1–F12 靠硬編碼選單 command id 操作 HIS;院方改版(如 2026-06-29 整批 +1)會讓 F 鍵打到
+# 別的選單功能 → 寫錯病歷。金絲雀:比對「主視窗版本」與基線偵測改版。指紋只用 title 版本號
+# (HIS 選單多 owner-draw、動態文字讀不到 → 版本字串最可靠)。
+# 【政策(見 contract_canary 的 verdict/policy 分離)】偵測到改版時該怎麼辦,由下面這個【單一
+# 可見宣告】決定,不散在各處。現行 = NOTIFY_ONLY(使用者定案):只寄信通知,不擋自動寫入、
+# 不跳窗。★未來若要改回擋寫入:把 _HIS_CANARY_POLICY 改成 POLICY_BLOCK_ON_DRIFT,並在
+# _sample_his_write_contract 對 ACTION_BLOCK 加擋下路徑 —— 不要在別處偷接 gate。★
 _CANARY_HIS_SURFACE = "his_menu"
+_HIS_CANARY_POLICY = _CANARY_POLICY_NOTIFY_ONLY
 # [codex] 不再保留「最近裁決/現況指紋」的可變全域——安全關鍵路徑(寫入 gate、重新校正)
 # 與設定頁顯示都【自足即時採樣】(用當下 hwnd 的 title 現算),徹底免除跨緒覆寫/清空競態。
 _his_canary_warned = False      # 疑似改版警告只記一次 log(避免洗版),非競態敏感
@@ -1895,12 +1903,18 @@ def _sample_his_write_contract(title: str) -> None:
     v = _his_write_verdict_for(title)
     # 單一 tuple 指派 → 讀取端不會拿到撕裂的 (版本, 裁決) 組合
     _his_last_sample = (_his_title_version_full(title) or "", v.status)
-    if not v.is_drift:
+    # 裁決(v.status,事實)→ 套政策 → 動作。現行政策 NOTIFY_ONLY 下:DRIFT→NOTIFY、
+    # 其餘→PROCEED。走 policy_action 而非 v.is_drift 直判,是為了讓「政策」真的驅動行為
+    # (未來改 POLICY_BLOCK_ON_DRIFT,這裡才會收到 ACTION_BLOCK 而需要加擋下路徑)。
+    action = _canary_policy_action(v.status, _HIS_CANARY_POLICY)
+    if action == _CANARY_ACTION_PROCEED:
         return
-    if not _his_canary_warned:
-        _his_canary_warned = True
-        logging.warning("[金絲雀] %s", v.human())
-    _notify_his_drift(v)
+    if action == _CANARY_ACTION_NOTIFY:
+        if not _his_canary_warned:
+            _his_canary_warned = True
+            logging.warning("[金絲雀] %s", v.human())
+        _notify_his_drift(v)
+    # ACTION_BLOCK:NOTIFY_ONLY 政策下不會走到;未來改擋寫入政策時在此加擋下訊號。
 
 # 醫令 子選單 command ID (probe + user 確認;2026-06-29 HIS V.1150629.01 改版後整批 +1)
 MENU_ID_類別字首 = 216   # 215→216(未使用,隨同段 +1)

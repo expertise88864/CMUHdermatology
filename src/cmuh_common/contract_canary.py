@@ -3,10 +3,20 @@
 
 【動機】F1–F12 靠硬編碼的選單 command id / 視窗 class / 欄位結構操作 HIS;掛號/打卡
 靠元素 id 解析網頁。院方悄悄改版（例：2026-06-29 選單 id 整批 +1）時，舊假設會讓自動化
-【寫錯病歷】或【顯示錯資料】，且往往沒有明顯報錯。金絲雀＝每次危險動作前先確認「契約」
-仍成立，不成立就依面向裁決：
-  - 寫入面（HIS 醫令/劑量）＝ fail-closed：DRIFT 就停止自動寫入 + 疑似改版警告，交醫師手動。
-  - 讀取面（打卡/掛號）＝ 標記存疑：DRIFT 就不顯示可能錯的值 + 通知，不靜默顯示錯資料。
+【寫錯病歷】或【顯示錯資料】，且往往沒有明顯報錯。金絲雀＝比對「現況指紋 vs 校正基線」,
+偵測契約是否還成立。
+
+【裁決(verdict)與政策(policy)分離】——重要,勿再合併:
+  * verdict 只回報【事實】:改版了沒(status ∈ ok/drift/uncalibrated/unknown)。
+  * policy 決定【該怎麼辦】:偵測到 DRIFT 要通知、擋下、還是標記存疑。由 policy_action() 映射。
+  分離的用意:未來要調整「怎麼處理改版」只改政策,不動比對邏輯;也避免把政策當成裁決的
+  固有屬性(舊版有 should_block_write 這種寫法,讓人誤以為「DRIFT 就一定會擋寫入」——已移除)。
+
+【現行政策】
+  * HIS 寫入面(醫令/劑量)= POLICY_NOTIFY_ONLY(使用者定案 2026-07-17):偵測到改版【只寄信
+    通知、不擋自動寫入、不跳窗】。理由:實務上「誤擋 + 每按一次跳窗」比偶發改版更難用,改版
+    風險由醫師現場判斷兜底(發現功能異常自行停用)。★勿看到殘留就把「擋寫入」接回去★。
+  * 讀取面(打卡/掛號)= POLICY_MARK_SUSPECT(語意保留;目前無 active surface 走本框架)。
 
 【設計】每個【面向 surface】有一份可序列化的「結構指紋 fingerprint」(dict)。本模組只有
 純邏輯 + 基線檔 IO，【不依賴 Win32/Selenium】——採樣（取得現況指紋）由各面向的呼叫端做
@@ -25,11 +35,34 @@ from cmuh_common.atomic_io import atomic_write_json
 SCHEMA_VERSION = 1
 BASELINE_FILENAME = "contract_baseline.json"
 
-# 裁決狀態
+# 裁決狀態(verdict = 純事實:現況 vs 基線的比對結果,不含任何「該怎麼辦」)
 STATUS_OK = "ok"                    # 現況與基線一致
 STATUS_DRIFT = "drift"              # 現況與基線不符（疑似改版）
 STATUS_UNCALIBRATED = "uncalibrated"  # 尚未建立基線（需校正）
-STATUS_UNKNOWN = "unknown"          # 採樣本身失敗（取不到現況）→ 不判定、不擋（避免假警報）
+STATUS_UNKNOWN = "unknown"          # 採樣本身失敗（取不到現況）→ 不判定（避免假警報）
+
+# ── 政策(policy):偵測到 DRIFT 時「該怎麼辦」——與裁決事實分離 ─────────────────
+POLICY_NOTIFY_ONLY = "notify_only"        # 偵測到就通知,【不】改變自動化行為(現行 HIS 寫入面)
+POLICY_BLOCK_ON_DRIFT = "block_on_drift"  # DRIFT 時擋下動作(fail-closed;目前無 surface 採用)
+POLICY_MARK_SUSPECT = "mark_suspect"      # DRIFT 時不輸出可能錯的值(讀取面語意;目前無 active surface)
+
+# 動作(action):政策 × 裁決狀態 → 該採取的動作
+ACTION_PROCEED = "proceed"    # 照常(不通知、不擋)
+ACTION_NOTIFY = "notify"      # 通知,但照常執行
+ACTION_BLOCK = "block"        # 擋下(不執行/不輸出)
+
+
+def policy_action(status: str, policy: str) -> str:
+    """把「裁決狀態」在給定「政策」下映射成「該採取的動作」。純函式(好測)。
+
+    【跨政策一律】只有明確 DRIFT 才可能觸發通知/擋下 —— OK / UNKNOWN(採不到現況)/
+    UNCALIBRATED(沒基線)都 PROCEED。刻意如此:不因假警報或採樣失敗停自動化(那比改版
+    風險更糟);沒基線時仍靠「隱性硬編碼基線」比對抓 DRIFT(見呼叫端採樣)。"""
+    if status != STATUS_DRIFT:
+        return ACTION_PROCEED
+    if policy in (POLICY_BLOCK_ON_DRIFT, POLICY_MARK_SUSPECT):
+        return ACTION_BLOCK
+    return ACTION_NOTIFY          # POLICY_NOTIFY_ONLY(含未知政策一律最保守=只通知不擋)
 
 
 @dataclass
@@ -44,14 +77,10 @@ class CanaryVerdict:
     def is_drift(self) -> bool:
         return self.status == STATUS_DRIFT
 
-    @property
-    def should_block_write(self) -> bool:
-        """寫入面是否應 fail-closed（擋自動寫入）。
-
-        【刻意】只有明確 DRIFT 才擋——uncalibrated（沒基線）/unknown（採不到現況）都不擋:
-        若因假警報或採樣失敗就停掉整組 F 鍵，比原本的改版風險更糟（醫師整天不能用熱鍵）。
-        沒基線時「以硬編碼常數為隱性基線」的比對仍能抓到 DRIFT（見 his_menu 採樣）。"""
-        return self.status == STATUS_DRIFT
+    def action_under(self, policy: str) -> str:
+        """本裁決在給定政策下該採取的動作(見 policy_action)。verdict 本身【不】預設政策
+        —— 呼叫端必須明確傳入政策,避免「裁決自帶動作」那種隱性耦合。"""
+        return policy_action(self.status, policy)
 
     def human(self) -> str:
         base = {

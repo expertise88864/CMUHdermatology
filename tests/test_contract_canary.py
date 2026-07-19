@@ -7,22 +7,22 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from cmuh_common.contract_canary import (  # noqa: E402
+    ACTION_BLOCK, ACTION_NOTIFY, ACTION_PROCEED,
+    POLICY_BLOCK_ON_DRIFT, POLICY_MARK_SUSPECT, POLICY_NOTIFY_ONLY,
     STATUS_DRIFT, STATUS_OK, STATUS_UNCALIBRATED, STATUS_UNKNOWN,
-    ContractBaseline, compare_fingerprint,
+    ContractBaseline, compare_fingerprint, policy_action,
 )
 
 
-# ── compare_fingerprint 裁決 ─────────────────────────────────────────────────
+# ── compare_fingerprint 裁決(純事實,不含政策) ──────────────────────────────
 def test_ok_when_identical():
     v = compare_fingerprint("his_menu", {"代碼輸入": 219}, {"代碼輸入": 219})
     assert v.status == STATUS_OK and not v.is_drift
-    assert v.should_block_write is False
 
 
 def test_drift_when_value_changed():
     v = compare_fingerprint("his_menu", {"代碼輸入": 219}, {"代碼輸入": 220})
     assert v.status == STATUS_DRIFT and v.is_drift
-    assert v.should_block_write is True
     assert v.changes == [("代碼輸入", 219, 220)]
     assert "219" in v.detail and "220" in v.detail
 
@@ -30,13 +30,47 @@ def test_drift_when_value_changed():
 def test_uncalibrated_when_no_baseline():
     v = compare_fingerprint("punch", None, {"lb_systime": True})
     assert v.status == STATUS_UNCALIBRATED
-    assert v.should_block_write is False    # 沒基線不擋(避免假警報停熱鍵)
 
 
 def test_unknown_when_sampling_failed():
     v = compare_fingerprint("punch", {"lb_systime": True}, None)
     assert v.status == STATUS_UNKNOWN
-    assert v.should_block_write is False    # 採不到現況不擋
+
+
+def test_verdict_has_no_embedded_policy():
+    # [P2-04] 裁決不得再自帶「該怎麼辦」的政策屬性(舊 should_block_write 已移除):
+    # 避免未來維護者看到它就把「擋寫入」接回去。動作一律由 policy_action 顯式決定。
+    v = compare_fingerprint("his_menu", {"x": 1}, {"x": 2})
+    assert not hasattr(v, "should_block_write")
+
+
+# ── 政策 × 裁決 → 動作(policy_action;與裁決分離) ──────────────────────────────
+def test_policy_only_acts_on_drift_across_all_policies():
+    # OK/UNKNOWN/UNCALIBRATED 一律 PROCEED(不因假警報/採樣失敗停自動化),跨所有政策一致
+    for status in (STATUS_OK, STATUS_UNKNOWN, STATUS_UNCALIBRATED):
+        for pol in (POLICY_NOTIFY_ONLY, POLICY_BLOCK_ON_DRIFT, POLICY_MARK_SUSPECT):
+            assert policy_action(status, pol) == ACTION_PROCEED
+
+
+def test_notify_only_policy_drift_notifies_not_blocks():
+    # 現行 HIS 寫入面政策:DRIFT → 通知,不擋
+    assert policy_action(STATUS_DRIFT, POLICY_NOTIFY_ONLY) == ACTION_NOTIFY
+
+
+def test_block_policies_block_on_drift():
+    assert policy_action(STATUS_DRIFT, POLICY_BLOCK_ON_DRIFT) == ACTION_BLOCK
+    assert policy_action(STATUS_DRIFT, POLICY_MARK_SUSPECT) == ACTION_BLOCK
+
+
+def test_unknown_policy_defaults_to_notify_not_block():
+    # 未知政策字串 → 最保守(只通知不擋),不可意外擋掉自動化
+    assert policy_action(STATUS_DRIFT, "some_future_policy") == ACTION_NOTIFY
+
+
+def test_verdict_action_under_matches_policy_action():
+    v = compare_fingerprint("his_menu", {"x": 1}, {"x": 2})
+    assert v.action_under(POLICY_NOTIFY_ONLY) == ACTION_NOTIFY
+    assert v.action_under(POLICY_BLOCK_ON_DRIFT) == ACTION_BLOCK
 
 
 def test_keys_and_ignore():
@@ -82,9 +116,9 @@ def test_baseline_end_to_end_verdict(tmp_path):
     # 現況一致 → OK
     assert compare_fingerprint("his_menu", b.get("his_menu"),
                                {"代碼輸入": 219}).status == STATUS_OK
-    # 院方改版後動態 id 位移 → DRIFT → 擋寫
+    # 院方改版後動態 id 位移 → DRIFT(事實);現行政策下 → 通知(不擋)
     v = compare_fingerprint("his_menu", b.get("his_menu"), {"代碼輸入": 220})
-    assert v.should_block_write is True
+    assert v.is_drift and v.action_under(POLICY_NOTIFY_ONLY) == ACTION_NOTIFY
 
 
 def test_baseline_clear(tmp_path):
