@@ -1542,6 +1542,108 @@ _ledger_writer_started = False
 _ledger_writer_lock = threading.Lock()
 _ledger_dropped = 0            # 佇列滿被丟棄(未入列)
 _ledger_write_failures = 0     # 已入列但 record() 落地失敗(磁碟拒寫/硬上限)
+# [批次三] 稽核健康通知去重:同一問題摘要每個 process 只寄一次;mismatch 即時信
+# 以 (action, 日期) 去重(同一功能同一天寄一次,避免連按 F 鍵洗信箱)。
+# [codex P1] 「已寄」只在【寄成功後】才記(與 drift/止掛通知同一鐵律,已在別處犯過兩次):
+# 先記再寄的話,一次暫時性 SMTP 失敗就把該問題整個 process 永久滅音 —— 偵測控制自廢。
+# inflight 擋並發,sent 才是終局去重。
+_audit_alert_sent_summaries: set = set()
+_audit_alert_inflight_summaries: set = set()
+_audit_mismatch_notified: set = set()
+_audit_mismatch_inflight: set = set()
+_audit_notify_lock = threading.Lock()
+
+
+def audit_health_check(notify: bool = True) -> dict:
+    """[GPT-5.6 批次三] 稽核健康檢查:驗證帳本完整性 + 彙整本次執行的遺失計數。
+
+    讓稽核從「被動鑑識」變成「主動偵測」:verify 失敗/有遺失 → 寄信(同一問題寄成功後
+    每個 process 只寄一次;寄失敗下次檢查重試)。供開機檢查、每日排程與設定頁按鈕共用。
+    同步檔案 IO,【勿】在 UI/熱鍵緒直接呼叫(排程與按鈕都丟背景)。不拋。
+
+    [codex P2] 走 ActionLedger.health_check(持寫入鎖)而非模組級快照:與寫入/輪替並行
+    時裸讀檔案會看到「新紀錄+舊 anchor」的暫態 → 誤報竄改、寄假警報。"""
+    snap = _action_ledger().health_check(dropped=_ledger_dropped,
+                                         write_failures=_ledger_write_failures)
+    try:
+        if snap["ok"]:
+            logging.info("[audit-health] %s", snap["summary"])
+            return snap
+        logging.warning("[audit-health][%s] %s", snap["level"], snap["summary"])
+        if not notify:
+            return snap
+        key = snap["summary"]
+        with _audit_notify_lock:
+            if (key in _audit_alert_sent_summaries
+                    or key in _audit_alert_inflight_summaries):
+                return snap
+            _audit_alert_inflight_summaries.add(key)
+        sent_ok = False
+        try:
+            recipients = _load_alert_recipients()
+            if recipients:
+                level_tag = "帳本異常" if snap["level"] == "error" else "紀錄遺失"
+                sent_ok = bool(_send_alert_email_via_smtp(
+                    f"[皮膚科自動化] 稽核{level_tag}:{_machine_name_safe()}",
+                    f"外部動作稽核帳本健康檢查未通過。\n\n{snap['summary']}\n\n"
+                    f"層級:{snap['level']}(error=帳本無法證明完整/偵測性控制已失效;"
+                    f"warn=帳本完整但本次執行有動作沒被記到)\n"
+                    f"(同一問題此信只寄一次;詳見 log 與 settings/{_LEDGER_FILENAME})",
+                    recipients))
+        finally:
+            with _audit_notify_lock:
+                _audit_alert_inflight_summaries.discard(key)
+                if sent_ok:            # 寄成功才終局去重;失敗/無收件人 → 下次檢查重試
+                    _audit_alert_sent_summaries.add(key)
+    except Exception:
+        logging.debug("[audit-health] 通知失敗(不影響檢查結果)", exc_info=True)
+    return snap
+
+
+def _machine_name_safe() -> str:
+    try:
+        return str(os.environ.get("COMPUTERNAME") or "本機")
+    except Exception:
+        return "本機"
+
+
+def _notify_audit_mismatch(action: str, detail: str) -> None:
+    """[批次三] 回讀 mismatch 的即時通知:mismatch = 自動化寫的值與 HIS 讀回的不一致,
+    正是「改版寫錯病歷」的第一時間訊號,不能等人翻帳本才發現。醫師端已有警告視窗
+    (呼叫點既有),這封信給維護者。同功能同日去重;背景 daemon 緒寄,不卡帳本寫入緒。"""
+    key = f"{action}|{date.today().isoformat()}"
+    with _audit_notify_lock:
+        # [codex P1] 先佔 inflight,寄成功才進 notified —— 寄失敗要能在下一次 mismatch
+        # 時重試,不可一次 SMTP 故障就把該功能整天滅音。
+        if key in _audit_mismatch_notified or key in _audit_mismatch_inflight:
+            return
+        _audit_mismatch_inflight.add(key)
+
+    def _bg():
+        sent_ok = False
+        try:
+            recipients = _load_alert_recipients()
+            if recipients:
+                sent_ok = bool(_send_alert_email_via_smtp(
+                    f"[皮膚科自動化] 回讀不符:{action}",
+                    f"自動化寫入後回讀驗證不一致(該次寫入已依既有流程中止/警告醫師)。\n\n"
+                    f"功能:{action}\n細節:{detail}\n電腦:{_machine_name_safe()}\n\n"
+                    f"這通常代表 HIS 改版/欄位位移 —— 請核對後於設定頁重新校正金絲雀。\n"
+                    f"(同一功能同一天只寄一次。)", recipients))
+        except Exception:
+            logging.debug("[audit-health] mismatch 通知寄信失敗", exc_info=True)
+        finally:
+            with _audit_notify_lock:
+                _audit_mismatch_inflight.discard(key)
+                if sent_ok:
+                    _audit_mismatch_notified.add(key)
+
+    try:
+        threading.Thread(target=_bg, daemon=True, name="audit-mismatch-mail").start()
+    except Exception:
+        with _audit_notify_lock:
+            _audit_mismatch_inflight.discard(key)
+        logging.debug("[audit-health] mismatch 通知緒啟動失敗", exc_info=True)
 
 
 def _ledger_writer_loop(q=None) -> None:
@@ -1569,6 +1671,10 @@ def _ledger_writer_loop(q=None) -> None:
                 _ledger_write_failures += 1
                 logging.warning("[ledger] 稽核寫入失敗(未落地,累計 %d 筆):%s %s",
                                 _ledger_write_failures, surface, action)
+            # [批次三] 回讀不符 → 即時通知維護者(醫師端警告視窗在呼叫點既有;這封信
+            # 讓改版寫錯不用等人翻帳本才發現)。async 寄,不卡本寫入緒。
+            if str(fields.get("outcome", "")) == _LEDGER_MISMATCH:
+                _notify_audit_mismatch(action, str(fields.get("detail", "")))
         except Exception:
             logging.debug("[ledger] 背景寫入失敗(不影響操作)", exc_info=True)
         finally:
@@ -12913,6 +13019,50 @@ class AutomationApp:
                   "確認新版無誤後按「重新校正」把現況記為新基線、停止通知。",
                   foreground="gray", wraplength=300, justify="left",
                   style="Small.TLabel").pack(anchor="w", pady=(6, 0))
+        # [GPT-5.6 批次三] 稽核帳本健康狀態:遺失/毀損不可只留在 log 裡靜默。
+        # 開機與每日 07:20 會自動檢查+異常寄信;這裡提供手動檢查與可見狀態。
+        self._audit_health_var = tk.StringVar(
+            value="稽核帳本:按「檢查」驗證(開機與每日 07:20 也會自動檢查)")
+        ttk.Label(cf, textvariable=self._audit_health_var, wraplength=300,
+                  justify="left", style="Small.TLabel").pack(anchor="w", pady=(6, 0))
+        ttk.Button(cf, text="檢查稽核帳本",
+                   command=self._check_audit_health_ui).pack(anchor="w", pady=(2, 0))
+
+    def _check_audit_health_ui(self) -> None:
+        """設定頁按鈕:背景跑健康檢查(同步檔案 IO 不可在 UI 緒),完成後主緒更新顯示。"""
+        if hasattr(self, "_audit_health_var"):
+            self._audit_health_var.set("稽核帳本:檢查中…")
+
+        def _bg():
+            snap = audit_health_check(notify=False)   # 手動檢查只顯示,不重複寄信
+            mark = {"ok": "✅", "warn": "⚠", "error": "❌"}.get(snap["level"], "?")
+            text = f"稽核帳本:{mark} {snap['summary']}"
+            try:
+                self.root.after(0, lambda: self._audit_health_var.set(text))
+            except Exception:
+                logging.debug("[audit-health] UI 更新失敗", exc_info=True)
+
+        # [codex P3] BoundedThreadPoolExecutor 滿載時不是 raise,而是回一個【已失敗的
+        # Future】—— 只包 try/except 永遠接不到,UI 會永遠卡在「檢查中…」。用 done
+        # callback 檢查 future 例外,失敗時把狀態改回可再試。
+        def _on_done(fut):
+            try:
+                exc = fut.exception()
+            except Exception:
+                exc = None
+            if exc is not None:
+                logging.debug("[audit-health] 檢查任務未執行:%s", exc)
+                try:
+                    self.root.after(0, lambda: self._audit_health_var.set(
+                        "稽核帳本:系統忙碌,檢查未執行,請稍後再按"))
+                except Exception:
+                    pass
+
+        try:
+            self.bg_executor.submit(_bg).add_done_callback(_on_done)
+        except Exception:
+            logging.debug("[audit-health] 檢查任務提交失敗", exc_info=True)
+            self._audit_health_var.set("稽核帳本:檢查啟動失敗(見 log)")
 
     def _refresh_canary_status(self) -> None:
         """即時採樣並更新顯示（自足,找不到視窗顯示「尚未偵測」,永不 stale）。"""
@@ -15248,6 +15398,11 @@ class AutomationApp:
         self.root.after(6000, lambda: _submit_startup_background(
             "chrome-prewarm", _prewarm_chrome))
 
+        # [GPT-5.6 批次三] 開機稽核健康檢查:上次執行若有截斷/毀損(當機、磁碟滿),
+        # 開機就發現並寄信,而不是等事故後翻帳本。延後 12s 避開啟動高峰;背景跑。
+        self.root.after(12000, lambda: _submit_startup_background(
+            "audit-health-startup", audit_health_check))
+
         # [O17] 啟動 30 秒後背景清理舊 cache、log 備份、tmp、過期 pyc
         try:
             from cmuh_common.cache_cleanup import schedule_cleanup_in_background
@@ -15339,6 +15494,13 @@ class AutomationApp:
             schedule.every(4).hours.do(
                 lambda: run_named_job("duty-refresh-4h", lambda: self.bg_executor.submit(self._fetch_all_duty_info))
             ).tag("duty", "4h")
+            # [GPT-5.6 批次三] 稽核帳本每日健康檢查(verify_generations + 遺失計數,
+            # 異常寄信)。同步檔案 IO → 丟 bg_executor,不佔排程/UI 緒。07:20 在打卡
+            # (07:31)與晨間查詢之前,異常當天一早就看得到。
+            schedule.every().day.at("07:20").do(
+                lambda: run_named_job("audit-health-daily",
+                                      lambda: self.bg_executor.submit(audit_health_check))
+            ).tag("audit", "daily")
             
             # [2026-07-15 跨夜] 加 07:40:程式放跨夜時,打卡程式 07:31 自動打卡後原本要等
             # 08:00 才第一次查詢(每天重開程式的人啟動 +3.5s 就查,反而看得到)→ 07:40 查一次,

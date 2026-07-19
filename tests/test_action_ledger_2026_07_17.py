@@ -647,3 +647,46 @@ def test_sampled_his_field_text_never_reaches_ledger():
                 call = chunk.split(")\n")[0]
                 assert leak not in call, f"{why}:採樣原文 {leak} 不得進帳本({call[:80]})"
         assert "已遮罩" in src, f"{why} 應以遮罩/長度取代原文"
+
+
+# ══ 批次三:PII 縱深防禦 + 稽核健康(GPT-5.6 第三輪)═══════════════════════════
+def test_sanitize_masks_pii_but_keeps_legit_values():
+    # 合法稽核值(醫令代碼最長 7 位、HIS 版本、劑量)不受影響
+    assert al.sanitize_text("51017") == "51017"
+    assert al.sanitize_text("1850159") == "1850159"          # 7 位醫令代碼
+    assert al.sanitize_text("1150713.02") == "1150713.02"     # 版本:7位.2位
+    assert al.sanitize_text("dose=680→700 count=10→11") == "dose=680→700 count=10→11"
+    # 病歷號(8 位)/身分證/手機 → 遮
+    assert "[REDACTED]" in al.sanitize_text("回讀=12345678")
+    assert "12345678" not in al.sanitize_text("回讀=12345678")
+    assert "[REDACTED]" in al.sanitize_text("A123456789")
+    assert "[REDACTED]" in al.sanitize_text("0912345678")
+    assert al.sanitize_text(None) == ""
+
+
+def test_record_sanitizes_value_and_detail(tmp_path):
+    # [P2-07] 呼叫端誤傳病歷號也不落地(縱深防禦,不只靠註解)
+    lg = _ledger(tmp_path)
+    lg.record(al.SURFACE_HIS_FIELD, "療程", value="回讀=87654321",
+              detail="病人 A123456789 的欄位")
+    r = al.read_records(lg.path)[0]
+    assert "87654321" not in r["value"] and "[REDACTED]" in r["value"]
+    assert "A123456789" not in r["detail"] and "[REDACTED]" in r["detail"]
+    assert al.verify_chain(lg.path)[0] is True, "消毒後 hash chain 仍須一致"
+
+
+def test_health_snapshot_states(tmp_path):
+    p = str(tmp_path / "action_ledger.jsonl")
+    # 尚無帳本 = 正常初始
+    assert al.health_snapshot(p)["level"] == "ok"
+    # 正常帳本
+    lg = al.ActionLedger(p)
+    lg.record(al.SURFACE_HIS_MENU, "F2", value="51017")
+    assert al.health_snapshot(p)["level"] == "ok"
+    # 有遺失計數 → warn(帳本完整但有動作沒記到)
+    snap = al.health_snapshot(p, dropped=2, write_failures=1)
+    assert snap["level"] == "warn" and snap["ok"] is False
+    # 帳本被竄改 → error(偵測性控制失效)
+    lines = open(p, encoding="utf-8").read().splitlines()
+    open(p, "w", encoding="utf-8").write(lines[0].replace("51017", "99999") + "\n")
+    assert al.health_snapshot(p)["level"] == "error"

@@ -33,6 +33,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 from datetime import datetime
 
@@ -77,6 +78,29 @@ _FIELDS = ("target", "value", "his_version", "canary", "outcome", "detail",
 def _canonical(d: dict) -> str:
     """穩定序列化(排序鍵、無多餘空白)——hash chain 與寫檔共用,確保可重算。"""
     return json.dumps(d, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+# ── PII 縱深防禦(GPT-5.6 第三輪 P2-07)────────────────────────────────────────
+# 文件說「呼叫端絕不可傳病人明文」,但只靠註解不是 enforcement:未來任何新呼叫點誤傳
+# detail=採樣原文,病歷內容就永久進帳本。故落地前統一消毒。樣式刻意保守,只遮「幾乎
+# 不可能是合法稽核值」的樣式 —— 醫令代碼最長 7 位數(1850159)、HIS 版本 1150713(.02)
+# 都是 ≤7 位段,不受影響;病歷號(8 位數)、身分證(1 字母+9 數字)、手機(09 開頭 10 位)
+# 會被遮。誤遮的代價只是稽核少一點細節,遠小於 PII 外洩。
+_PII_PATTERNS = (
+    re.compile(r"[A-Za-z][12]\d{8}"),      # 台灣身分證:1 字母 + 1/2 + 8 數字(先於長數字)
+    re.compile(r"\d{8,}"),                 # 8 位以上連續數字:病歷號/卡號/電話
+)
+
+
+def sanitize_text(s) -> str:
+    """把可能是病人識別資料的樣式換成 [REDACTED]。純函式;非字串先 str()。不拋。"""
+    try:
+        out = str(s or "")
+        for pat in _PII_PATTERNS:
+            out = pat.sub("[REDACTED]", out)
+        return out
+    except Exception:
+        return "[REDACTED]"
 
 
 def chain_hash(prev_hash: str, payload: dict) -> str:
@@ -230,6 +254,19 @@ class ActionLedger:
         except Exception:
             return False
 
+    def health_check(self, *, dropped: int = 0, write_failures: int = 0) -> dict:
+        """[codex P2] 【持寫入鎖】做健康快照。健康檢查與寫入/輪替並行時,模組級
+        health_snapshot 會讀到「新紀錄+舊 anchor」或輪替中途的暫態 → 誤報竄改、寄假警報。
+        持同一把鎖讓驗證看到穩定狀態(驗證數 MB 檔很快、一天只跑兩次,writer 最多被擋
+        數十 ms)。活體檢查一律走這裡;模組級 health_snapshot 留給離線/測試。不拋。"""
+        try:
+            with self._lock:
+                return health_snapshot(self.path, self.keep, dropped=dropped,
+                                       write_failures=write_failures)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "level": "error", "verified": 0,
+                    "summary": f"健康檢查本身失敗:{e}"}
+
     def record(self, surface: str, action: str, ts: str = "", **fields) -> bool:
         """記一筆外部動作。回是否寫成功(呼叫端【不應】依此改變臨床行為)。
 
@@ -258,7 +295,11 @@ class ActionLedger:
                     "prev": self._last_hash,
                 }
                 for k in _FIELDS:
-                    payload[k] = str(fields.get(k, "") or "")
+                    # [P2-07] value/detail 是自由文字,落地前強制消毒(縱深防禦,
+                    # 不只靠呼叫端自律);其餘欄位是受控值,原樣。
+                    raw = fields.get(k, "") or ""
+                    payload[k] = (sanitize_text(raw) if k in ("value", "detail")
+                                  else str(raw))
                 if not payload["outcome"]:
                     # [GPT-5.6 第三輪] 預設 unknown 而非 ok:呼叫端忘了傳 outcome 不可
                     # 自動變成「成功」紀錄(不安全預設會讓帳本失真)。
@@ -515,3 +556,42 @@ def verify_generations(path, keep: int = DEFAULT_KEEP) -> tuple:
                 f"最舊留存筆 seq={first_seq} 大於 anchor 記錄的保留邊界 {a_oldest}"
                 f"(疑遭截頭刪除)")
     return (True, len(all_recs), "chain 完整(含 anchor 截頭/截尾比對)")
+
+
+def health_snapshot(path, keep: int = DEFAULT_KEEP, *, dropped: int = 0,
+                    write_failures: int = 0, empty_is_ok: bool = True) -> dict:
+    """[GPT-5.6 第三輪批次三] 稽核健康快照:把「帳本可信嗎」變成一個可判讀的結果,
+    供啟動檢查/每日檢查/設定頁顯示共用。純讀取,不拋。
+
+    回 {"ok": bool, "level": "ok|warn|error", "summary": str, "verified": int}。
+    - verify_generations 失敗 → error(帳本無法證明完整 —— 偵測性控制已失效)。
+    - dropped/write_failures > 0 → warn(有動作沒被記到;帳本本身仍完整)。
+    - 尚無任何帳本檔且 empty_is_ok → ok(還沒發生過任何外部動作,是正常初始狀態)。
+    """
+    try:
+        base = str(path)
+        any_file = any(os.path.exists(p) for p in
+                       [base] + [f"{base}.{i}" for i in range(1, int(keep) + 1)])
+        # [codex P1] 「真正的初始狀態」= 帳本檔【和 anchor】都不存在。anchor 只在寫過
+        # 紀錄後才會出現 —— anchor 還在、.jsonl 全被刪掉 ≠ 沒發生過動作,是整本被刪,
+        # 必須 error;否則刪光帳本反而被回報健康。
+        anchor_exists = os.path.exists(base + ANCHOR_SUFFIX)
+        if not any_file and anchor_exists:
+            v_ok, n, v_msg = False, 0, \
+                "帳本檔全數不存在但 anchor 仍在(曾有紀錄,疑遭整本刪除)"
+        elif not any_file and empty_is_ok:
+            v_ok, n, v_msg = True, 0, "尚無稽核紀錄(尚未執行過外部動作)"
+        else:
+            v_ok, n, v_msg = verify_generations(base, keep=keep)
+        if not v_ok:
+            return {"ok": False, "level": "error", "verified": n,
+                    "summary": f"帳本完整性驗證失敗:{v_msg}"}
+        if dropped or write_failures:
+            return {"ok": False, "level": "warn", "verified": n,
+                    "summary": (f"帳本完整({n} 筆),但本次執行有紀錄遺失:"
+                                f"佇列丟棄 {dropped} 筆、落地失敗 {write_failures} 筆")}
+        return {"ok": True, "level": "ok", "verified": n,
+                "summary": f"帳本完整({n} 筆),無遺失"}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "level": "error", "verified": 0,
+                "summary": f"健康檢查本身失敗:{e}"}
