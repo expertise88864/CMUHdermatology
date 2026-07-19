@@ -94,6 +94,7 @@ from cmuh_common.action_ledger import (
     OUTCOME_MISMATCH as _LEDGER_MISMATCH,
     OUTCOME_OK as _LEDGER_OK,
     OUTCOME_SKIPPED as _LEDGER_SKIPPED,
+    OUTCOME_SUBMITTED_UNVERIFIED as _LEDGER_SUBMITTED,
     SURFACE_HIS_FIELD as _LEDGER_HIS_FIELD,
     SURFACE_HIS_MENU as _LEDGER_HIS_MENU,
     ActionLedger as _ActionLedger,
@@ -1539,7 +1540,8 @@ _LEDGER_QUEUE_MAX = 256
 _ledger_queue: "Queue" = Queue(maxsize=_LEDGER_QUEUE_MAX)
 _ledger_writer_started = False
 _ledger_writer_lock = threading.Lock()
-_ledger_dropped = 0
+_ledger_dropped = 0            # 佇列滿被丟棄(未入列)
+_ledger_write_failures = 0     # 已入列但 record() 落地失敗(磁碟拒寫/硬上限)
 
 
 def _ledger_writer_loop(q=None) -> None:
@@ -1559,7 +1561,14 @@ def _ledger_writer_loop(q=None) -> None:
             if item is None:            # 哨兵 → 收工
                 return
             surface, action, fields, ts = item
-            _action_ledger().record(surface, action, ts=ts, **fields)
+            # [GPT-5.6 第三輪] record() 回 False = 這筆稽核【沒有落地】(磁碟拒寫/硬上限)。
+            # 原本丟棄回傳值 → 關機 flush 看 task_done 以為都寫完了、遺失無人知。至少要
+            # 計數 + warning(完整的 audit health 面板待後續批次)。
+            if not _action_ledger().record(surface, action, ts=ts, **fields):
+                global _ledger_write_failures
+                _ledger_write_failures += 1
+                logging.warning("[ledger] 稽核寫入失敗(未落地,累計 %d 筆):%s %s",
+                                _ledger_write_failures, surface, action)
         except Exception:
             logging.debug("[ledger] 背景寫入失敗(不影響操作)", exc_info=True)
         finally:
@@ -2014,7 +2023,12 @@ def _send_chars_to_window(hwnd: int, text: str) -> bool:
             if not user32.IsWindow(hwnd):
                 logging.warning("[send_chars] 目標視窗中途消失,中止(已送部分字元)")
                 return False
-            user32.PostMessageW(hwnd, WM_CHAR, ord(ch), 0)
+            # [GPT-5.6 第三輪] PostMessageW 回 0 = Windows 根本沒收(佇列滿/hwnd 失效)。
+            # 原本完全不檢查 → 送出失敗仍回 True → 稽核記成功、半截醫令沒人知道。
+            if not user32.PostMessageW(hwnd, WM_CHAR, ord(ch), 0):
+                logging.warning("[send_chars] PostMessageW 回 0(佇列滿/視窗失效),"
+                                "中止(已送部分字元)")
+                return False
             time.sleep(0.02)  # 給 Delphi 依序處理（非同步下保險）
         return True
     except Exception:
@@ -2039,8 +2053,22 @@ def _send_enter_to_window(hwnd: int) -> bool:
         # [修正 2026-06-01] 原本在 keydown/keyup 之後又額外 PostMessage 一個 WM_CHAR \r，
         # 等於控制項收到兩個 Enter 字元（keydown 被翻譯出的 \r + 這個多餘的 \r）→
         # 醫令代碼被送出兩次 → F1/F2/F3/F4/F5 跳「資料重複確認」。移除多餘的 WM_CHAR。
-        ctypes.windll.user32.PostMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0x1C0001)
-        ctypes.windll.user32.PostMessageW(hwnd, WM_KEYUP, VK_RETURN, 0xC01C0001)
+        # [GPT-5.6 第三輪 + codex P1] 檢查 PostMessageW 回傳,但要分清【提交點】:
+        # Delphi 的 TranslateMessage 是對 WM_KEYDOWN 轉出 Enter 的 WM_CHAR —— keydown
+        # 一旦被接受,醫令【可能已經提交】。此時若因 keyup 失敗回 False,呼叫端會誤判
+        # 「什麼都沒送」→ 跳過療程/記 failed、重試還可能把已提交的醫令再下一次。
+        # 故:keydown 失敗(真的沒送)→ False;keydown 成功後 keyup 失敗 → 補送一次,
+        # 無論補送成敗都回 True(提交點已過,不可走「沒送出」的重試/中止路徑)。
+        ok_down = ctypes.windll.user32.PostMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0x1C0001)
+        if not ok_down:
+            logging.warning("[send_enter] keydown PostMessageW 回 0,未送出 Enter")
+            return False
+        ok_up = ctypes.windll.user32.PostMessageW(hwnd, WM_KEYUP, VK_RETURN, 0xC01C0001)
+        if not ok_up:
+            ok_up = ctypes.windll.user32.PostMessageW(hwnd, WM_KEYUP, VK_RETURN,
+                                                      0xC01C0001)   # 補送一次
+            logging.warning("[send_enter] keyup 首送失敗(補送%s);keydown 已被接受,"
+                            "Enter 視為已提交", "成功" if ok_up else "仍失敗")
         return True
     except Exception:
         return False
@@ -2112,19 +2140,29 @@ def _script_code_input_adaptive(code: str, label: str = "",
             chars_ok = _send_chars_to_window(focused, code)
             time.sleep(0.05)
             check_stop()
-            enter_ok = _send_enter_to_window(focused)
+            # [codex P1] 字元沒送完整就【絕不可按 Enter】—— Enter 會把欄位裡的半截代碼
+            # (如 51019 只送到 510)真的提交進 HIS。字元不完整 → 跳過 Enter,交醫師手動
+            # 清掉殘碼(下方警告路徑);這比「送出錯的醫令」安全得多。
+            enter_ok = _send_enter_to_window(focused) if chars_ok else False
             if not (chars_ok and enter_ok):
-                logging.warning("[%s] 代碼輸入訊息送出不完整 chars=%s enter=%s",
-                                label, chars_ok, enter_ok)
+                logging.warning("[%s] 代碼輸入訊息送出不完整 chars=%s enter=%s%s",
+                                label, chars_ok, enter_ok,
+                                "(字元不完整,已跳過 Enter 避免送出半截醫令,"
+                                "請手動清掉輸入欄殘碼)" if not chars_ok else "")
                 workflow_ok = False
             # [稽核 2026-07-17] 醫令代碼是後果最高的寫入,且【無回讀】(只確認訊息送出,
             # 不確認代碼真的落進欄位)。改版不擋之後,至少要留下「幾點、哪支熱鍵、送了什麼
             # 代碼、當時 HIS 版本/金絲雀裁決」的紀錄,事後查得出寫錯了什麼。
+            # [GPT-5.6 第三輪] 無回讀 → 最多只能記 submitted_unverified,不可記 ok:
+            # 「PostMessage 被 Windows 接受」≠「HIS 真的處理了醫令」,記 ok 會讓帳本
+            # 產生錯誤安全感。
             _record_his_action(
                 _LEDGER_HIS_MENU, f"{label or '代碼輸入'} 醫令代碼", main_hwnd=hwnd,
                 target=f"menu:{MENU_ID_代碼輸入}", value=str(code),
-                outcome=_LEDGER_OK if (chars_ok and enter_ok) else _LEDGER_FAILED,
-                detail="" if (chars_ok and enter_ok)
+                outcome=_LEDGER_SUBMITTED if (chars_ok and enter_ok)
+                        else _LEDGER_FAILED,
+                detail="已送出,無回讀路徑可確認 HIS 已處理"
+                       if (chars_ok and enter_ok)
                        else f"chars={chars_ok} enter={enter_ok}")
         else:
             logging.warning("[%s] 等不到可信的代碼輸入焦點，停止送出 %r",
@@ -4413,9 +4451,12 @@ def _f11_send_finish_no_print(main_hwnd: int, course_value: str,
                          (time.time() - started_at) * 1000)
             # [稽核 2026-07-17] 完成動作無回讀(送出即結束)→ 至少留下送了哪個 id、當時
             # HIS 版本。改版讓 id 位移誤觸別的選單時,這是唯一的事後線索。
+            # [GPT-5.6 第三輪] 無回讀 → 記 submitted_unverified,不可記 ok。
             _record_his_action(_LEDGER_HIS_MENU, f"{label} 完成不印",
                                main_hwnd=main_hwnd, target=f"menu:{cmd_id}",
-                               value=f"療程={course_value}", outcome=_LEDGER_OK)
+                               value=f"療程={course_value}",
+                               outcome=_LEDGER_SUBMITTED,
+                               detail="已送出,無回讀路徑可確認完成動作已處理")
             return True
         logging.warning("[%s] 完成不印 menu id=%s 送出失敗，嘗試下一個候選",
                         label, cmd_id)
@@ -4442,8 +4483,24 @@ def _f11_click_finish_all(main_hwnd: int, course_value: str,
                  (time.time() - started_at) * 1000)
     if not btns:
         logging.warning("[%s] 找不到 全部完成 button", label)
+        _record_his_action(_LEDGER_HIS_MENU, f"{label} 全部完成",
+                           main_hwnd=main_hwnd, target="button:全部完成",
+                           value=f"療程={course_value}", outcome=_LEDGER_FAILED,
+                           detail="找不到 全部完成 button,未送出")
         return False
-    _post_click_to_control(btns[0][0])
+    # [GPT-5.6 第三輪] 原本忽略 _post_click_to_control 的回傳、click 失敗照樣回 True →
+    # 主流程當成完成成功、稽核也漏記。route B 與 route A(完成不印)同為 F11 的完成動作,
+    # 必須同樣誠實:click 送出失敗回 False;送出成功也只是 submitted_unverified(無回讀)。
+    click_ok = _post_click_to_control(btns[0][0])
+    _record_his_action(_LEDGER_HIS_MENU, f"{label} 全部完成",
+                       main_hwnd=main_hwnd, target="button:全部完成",
+                       value=f"療程={course_value}",
+                       outcome=_LEDGER_SUBMITTED if click_ok else _LEDGER_FAILED,
+                       detail="已送出 click,無回讀路徑可確認完成動作已處理"
+                              if click_ok else "PostMessage click 送出失敗")
+    if not click_ok:
+        logging.warning("[%s] 全部完成 click 送出失敗", label)
+        return False
     logging.info("[%s][timeline] PostMessage 全部完成 click 完成 (hwnd=%s)，"
                  "sleep 0.5s 給 app settle", label, btns[0][0])
     return True
@@ -14313,7 +14370,24 @@ class AutomationApp:
                                     full_threshold, ext_branch, room, recipients,
                                     today=None):
         """把一封遠期止掛提醒丟背景緒寄出(SMTP 逾時可達 60s,不可卡住 UI 緒)。
-        寄成功才記錄已寄(與行事曆同一份持久化記錄)。"""
+        寄成功才記錄已寄(與行事曆同一份持久化記錄)。
+
+        [GPT-5.6 P1-01] 呼叫端已取得 nk 的寄送權;本函式【任何一步】失敗都必須釋放它 ——
+        原本 try 只包住 Thread 啟動,組主旨/讀 snapshot 等前置若拋例外會被外層掃描的
+        catch 吞掉,claim 永久卡在 in-flight → 該診次本次執行再也不寄、也沒有任何提示。
+        故整段包起來:寄送權「移交給 worker」成功前,任何例外都在這裡釋放。"""
+        try:
+            self._dispatch_future_stop_alert_inner(
+                nk, doc_name, cur, session_name, count, full_threshold,
+                ext_branch, room, recipients, today)
+        except Exception:
+            self._release_alert_email_claim(nk)
+            logging.warning("[ALERT] 遠期止掛提醒組裝/啟動失敗(已釋放寄送權,下輪重試)",
+                            exc_info=True)
+
+    def _dispatch_future_stop_alert_inner(self, nk, doc_name, cur, session_name,
+                                          count, full_threshold, ext_branch, room,
+                                          recipients, today=None):
         _sess_label = {"上午": "早上"}.get(session_name, session_name)
         _wd = "一二三四五六日"[cur.weekday()]
         _date_str = f"{cur.year}/{cur.month}/{cur.day}(週{_wd})"

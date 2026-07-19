@@ -283,6 +283,46 @@ def test_claim_is_atomic_and_released_on_failure(monkeypatch):
     assert app._claim_alert_email(nk) is False, "已寄過就不再給寄送權"
 
 
+def test_claim_released_when_dispatch_body_raises(monkeypatch):
+    """[GPT-5.6 P1-01 fault-injection] 組主旨/讀 snapshot 階段(Thread 啟動前)拋例外
+    → 外層掃描的 catch 會吞掉,但寄送權必須釋放,否則該診次永久卡在 in-flight、
+    本次執行再也不寄。"""
+    today = date(2026, 7, 17)
+    target = date(2026, 7, 30)
+    app, _ = _app(monkeypatch, {target: [
+        {"session": "晚上", "count": 130, "is_stopped": False}]})
+    _dispatch_sync(monkeypatch, app)
+    # 讓組裝階段炸掉(reg64 snapshot 被非預期資料覆蓋的模擬)
+    monkeypatch.setattr(app, "_dispatch_future_stop_alert_inner",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            RuntimeError("subject assembly boom")))
+    app._scan_future_stop_signup_alerts(today=today)
+    assert app._alert_email_inflight == set(), \
+        "組裝失敗必須釋放寄送權(不得永久卡 in-flight)"
+    # 釋放後下一輪(組裝恢復正常)仍能寄出
+    monkeypatch.undo()
+    app2, _ = _app(monkeypatch, {target: [
+        {"session": "晚上", "count": 130, "is_stopped": False}]})
+    mails = _dispatch_sync(monkeypatch, app2)
+    app2._scan_future_stop_signup_alerts(today=today)
+    assert len(mails) == 1, "上輪組裝失敗 → 本輪應可重試寄出"
+
+
+def test_claim_released_when_thread_start_raises(monkeypatch):
+    # Thread 啟動失敗(執行緒耗盡)也必須釋放寄送權
+    today = date(2026, 7, 17)
+    target = date(2026, 7, 30)
+    app, _ = _app(monkeypatch, {target: [
+        {"session": "晚上", "count": 130, "is_stopped": False}]})
+    monkeypatch.setattr(main, "_send_alert_email_via_smtp",
+                        lambda *a, **k: True)
+    monkeypatch.setattr(main.threading, "Thread",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            RuntimeError("no more threads")))
+    app._scan_future_stop_signup_alerts(today=today)
+    assert app._alert_email_inflight == set(), "Thread 啟動失敗必須釋放寄送權"
+
+
 def test_failed_send_can_retry_next_scan(monkeypatch):
     # 寄失敗(SMTP 暫時故障)→ 沒有永久記號 → 下一輪掃描應重試
     today = date(2026, 7, 17)

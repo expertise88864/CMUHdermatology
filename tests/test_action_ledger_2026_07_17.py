@@ -49,10 +49,17 @@ def test_records_append_only_and_chain_links(tmp_path):
     assert ok is True and n == 2, msg
 
 
-def test_outcome_defaults_to_ok(tmp_path):
+def test_outcome_defaults_to_unknown_not_ok(tmp_path):
+    # [GPT-5.6 第三輪] 預設 outcome 不可是 ok:呼叫端忘了傳就自動變「成功」紀錄,
+    # 是不安全預設,會讓帳本產生假成功。
     lg = _ledger(tmp_path)
     lg.record(al.SURFACE_HIS_FIELD, "療程")
-    assert al.read_records(lg.path)[0]["outcome"] == al.OUTCOME_OK
+    assert al.read_records(lg.path)[0]["outcome"] == al.OUTCOME_UNKNOWN
+
+
+def test_submitted_unverified_distinct_from_ok():
+    # 「訊息送出成功」≠「HIS 動作成功」:無回讀的路徑最多記 submitted_unverified
+    assert al.OUTCOME_SUBMITTED_UNVERIFIED != al.OUTCOME_OK
 
 
 def test_mismatch_outcome_is_recorded(tmp_path):
@@ -576,6 +583,26 @@ def test_ledger_writer_loop_survives_record_exception(monkeypatch):
     q.join()
     stop()
     assert calls["n"] == 3, "單筆失敗後仍須繼續處理後續紀錄"
+
+
+def test_no_readback_paths_record_submitted_unverified_not_ok():
+    # [GPT-5.6 第三輪] 醫令代碼與 F11 完成(不印/全部完成)都【無回讀】——「PostMessage
+    # 被 Windows 接受」不可記成 ok,最多 submitted_unverified;否則帳本假成功。
+    for fn, why in ((main._script_code_input_adaptive, "醫令代碼"),
+                    (main._f11_send_finish_no_print, "F11 完成不印"),
+                    (main._f11_click_finish_all, "F11 全部完成")):
+        src = inspect.getsource(fn)
+        assert "_LEDGER_SUBMITTED" in src, f"{why} 無回讀 → 應記 submitted_unverified"
+        assert "outcome=_LEDGER_OK" not in src, f"{why} 無回讀 → 不得記 ok"
+
+
+def test_f11_route_b_honors_click_result_and_audits():
+    # [GPT-5.6 第三輪 P1] route B(全部完成)原本忽略 click 結果直接回 True 且零稽核
+    src = inspect.getsource(main._f11_click_finish_all)
+    assert "click_ok = _post_click_to_control" in src, "須檢查 click 送出結果"
+    assert "_record_his_action(" in src, "route B 也是 F11 完成動作,必須記帳"
+    assert "if not click_ok:" in src and "return False" in src, \
+        "click 送出失敗不得回報成功"
 
 
 def test_high_consequence_writes_are_wired_to_ledger():

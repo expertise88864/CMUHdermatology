@@ -50,10 +50,24 @@ SURFACE_HIS_MENU = "his_menu"        # 送選單 command(醫令代碼/完成/同
 SURFACE_HIS_FIELD = "his_field"      # 寫欄位(療程/身份/卡號/劑量 memo)
 
 # 結果(outcome)
+# [GPT-5.6 第三輪] 「PostMessage 被 Windows 接受」不等於「HIS 動作成功」:控制項可能已
+# 切換、佇列可能滿、Enter 可能沒被處理、醫令可能被拒。把兩者都記成 ok 會讓帳本產生
+# 錯誤安全感(比沒有帳本更糟)。故區分:
+#   ok                    = 有【回讀/可觀察證據】確認動作結果(療程/身份/卡號/UVB 的
+#                           read-verify、同意書視窗真的開出來)
+#   submitted_unverified  = 訊息已成功送出(PostMessage 非 0),但【無法確認】HIS 真的
+#                           處理了 —— 無回讀路徑(醫令代碼、F11 完成)最多只能記到這級
+#   mismatch              = 回讀與預期不符 —— 最重要的訊號
+#   failed                = 送出/寫入本身失敗(PostMessage 回 0、WM_SETTEXT 失敗…)
+#   skipped               = 前置條件不成立,沒有真的寫
+#   unknown               = 呼叫端沒宣告 —— 【預設】。預設不能是 ok:忘了傳 outcome
+#                           就自動產生假成功紀錄,是不安全預設。
 OUTCOME_OK = "ok"
-OUTCOME_MISMATCH = "mismatch"        # 回讀與預期不符 —— 最重要的訊號
-OUTCOME_FAILED = "failed"            # 送出/寫入本身失敗
-OUTCOME_SKIPPED = "skipped"          # 前置條件不成立,沒有真的寫
+OUTCOME_SUBMITTED_UNVERIFIED = "submitted_unverified"
+OUTCOME_MISMATCH = "mismatch"
+OUTCOME_FAILED = "failed"
+OUTCOME_SKIPPED = "skipped"
+OUTCOME_UNKNOWN = "unknown"
 
 # 稽核紀錄的字串欄位(hash 計算範圍;順序無關,canonical json 會排序)
 _FIELDS = ("target", "value", "his_version", "canary", "outcome", "detail",
@@ -246,7 +260,9 @@ class ActionLedger:
                 for k in _FIELDS:
                     payload[k] = str(fields.get(k, "") or "")
                 if not payload["outcome"]:
-                    payload["outcome"] = OUTCOME_OK
+                    # [GPT-5.6 第三輪] 預設 unknown 而非 ok:呼叫端忘了傳 outcome 不可
+                    # 自動變成「成功」紀錄(不安全預設會讓帳本失真)。
+                    payload["outcome"] = OUTCOME_UNKNOWN
                 rec = dict(payload)
                 rec["hash"] = chain_hash(self._last_hash, payload)
                 with open(self.path, "a", encoding="utf-8") as f:
