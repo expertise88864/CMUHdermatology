@@ -1601,7 +1601,7 @@ def audit_health_check(notify: bool = True) -> dict:
             _audit_alert_inflight_summaries.add(key)
         sent_ok = False
         try:
-            recipients = _load_alert_recipients()
+            recipients = _developer_alert_recipients()
             if recipients:
                 level_tag = "帳本異常" if snap["level"] == "error" else "紀錄遺失"
                 sent_ok = bool(_send_alert_email_via_smtp(
@@ -1643,7 +1643,7 @@ def _notify_audit_mismatch(action: str, detail: str) -> None:
     def _bg():
         sent_ok = False
         try:
-            recipients = _load_alert_recipients()
+            recipients = _developer_alert_recipients()
             if recipients:
                 sent_ok = bool(_send_alert_email_via_smtp(
                     f"[皮膚科自動化] 回讀不符:{action}",
@@ -1823,6 +1823,18 @@ def _his_write_verdict_for(title: str):
                            sample_his_current_fp(title))
 
 
+# [使用者定案 2026-07-20] 金絲雀改版偵測、稽核健康/回讀不符等「開發者維護訊息」只寄給
+# 開發者本人,【不】寄給止掛提醒那組臨床收件人(改版訊息不該騷擾其他醫師)。硬編碼(使用者
+# 要求直接寫入程式),與 consult_query 收件人同屬使用者定案的公開個人 email。
+DEVELOPER_ALERT_EMAIL = "expertise88864@gmail.com"
+
+
+def _developer_alert_recipients() -> list:
+    """開發者維護通知(金絲雀改版、稽核健康/mismatch)的收件人 = 開發者本人。
+    與臨床止掛提醒收件人(_load_alert_recipients)刻意分開。"""
+    return [DEVELOPER_ALERT_EMAIL]
+
+
 def _load_alert_recipients() -> list:
     """讀 threshold_settings.json 的 alert_email_recipients(與止掛提醒同一組收件人)。
     模組級、不依賴 app 實例;讀不到/無設定回空 list(→ 不寄、不報錯)。"""
@@ -1988,7 +2000,7 @@ def _notify_his_drift(verdict) -> None:
         return
     # [P2-03] 收件人檢查便宜(讀 JSON)且只在偵測到改版(罕見)才走到 → 同步檢查;沒收件人
     # 就【不起緒】,每版本記一次 log。有收件人才進 in-flight + 起背景緒寄(SMTP 才是慢的)。
-    recipients = _load_alert_recipients()
+    recipients = _developer_alert_recipients()
     if not recipients:
         with _his_drift_notify_lock:
             if ver_key not in _his_drift_no_recipient_logged:
@@ -14713,12 +14725,12 @@ class AutomationApp:
         _where = f"{doc_name}醫師 {_room_label}{_branch_suffix}"
         days_left = (cur - (today or date.today())).days
         # 主旨與行事曆版本同格式(【止掛提醒】開頭)→ 既有信箱規則/篩選continue 有效
+        # [使用者定案 2026-07-20] 拿掉「提前提醒/距此診次還有 N 天」與結尾附註 —— 只要達到
+        # 人數就該止掛,不需框成「提前」;days_left 仍保留供 log。
         subject = f"【止掛提醒】{_date_str} {_sess_label} {_where} 目前 {count} 人"
-        msg = (f"【提前提醒】距此診次還有 {days_left} 天\n"
-               f"{_date_str} {_sess_label}\n"
+        msg = (f"{_date_str} {_sess_label}\n"
                f"{_where}\n"
-               f"目前掛號 {count} 人(已達/超過止掛門檻 {full_threshold} 人)\n\n"
-               f"(此診次只會通知這一封;若要停止收此類信,可在設定頁關閉該醫師的止掛提醒。)")
+               f"目前掛號 {count} 人(已達/超過止掛門檻 {full_threshold} 人)")
 
         def _worker():
             # 寄送權已由呼叫端 _claim_alert_email 取得 → 這裡直接寄,寄成功才永久記號。

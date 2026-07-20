@@ -28,7 +28,7 @@ def _health_env(monkeypatch, tmp_path, snap=None):
     monkeypatch.setattr(main, "_audit_alert_inflight_summaries", set())
     monkeypatch.setattr(main, "_ledger_dropped", 0)
     monkeypatch.setattr(main, "_ledger_write_failures", 0)
-    monkeypatch.setattr(main, "_load_alert_recipients", lambda: ["dev@example.com"])
+    monkeypatch.setattr(main, "_developer_alert_recipients", lambda: ["dev@example.com"])
     sent = []
     monkeypatch.setattr(main, "_send_alert_email_via_smtp",
                         lambda subj, body, rcpts, **k:
@@ -83,7 +83,7 @@ def test_notify_false_checks_without_email(monkeypatch, tmp_path):
 def test_health_check_never_raises(monkeypatch, tmp_path):
     _health_env(monkeypatch, tmp_path,
                 snap={"ok": False, "level": "error", "verified": 0, "summary": "x"})
-    monkeypatch.setattr(main, "_load_alert_recipients",
+    monkeypatch.setattr(main, "_developer_alert_recipients",
                         lambda: (_ for _ in ()).throw(RuntimeError("boom")))
     snap = main.audit_health_check()          # 不得拋
     assert snap["level"] == "error"
@@ -122,7 +122,7 @@ def test_failed_alert_email_retries_on_next_check(monkeypatch, tmp_path):
 def test_no_recipients_does_not_consume_dedup(monkeypatch, tmp_path):
     _health_env(monkeypatch, tmp_path)
     monkeypatch.setattr(main, "_ledger_dropped", 3)
-    monkeypatch.setattr(main, "_load_alert_recipients", lambda: [])
+    monkeypatch.setattr(main, "_developer_alert_recipients", lambda: [])
     main.audit_health_check()
     assert main._audit_alert_sent_summaries == set(), \
         "無收件人不得標記已寄(之後設定好收件人要能寄出)"
@@ -146,7 +146,7 @@ def _sync_thread(monkeypatch):
 def test_mismatch_notify_dedups_per_action_per_day(monkeypatch):
     monkeypatch.setattr(main, "_audit_mismatch_notified", set())
     monkeypatch.setattr(main, "_audit_mismatch_inflight", set())
-    monkeypatch.setattr(main, "_load_alert_recipients", lambda: ["dev@example.com"])
+    monkeypatch.setattr(main, "_developer_alert_recipients", lambda: ["dev@example.com"])
     sent = []
     monkeypatch.setattr(main, "_send_alert_email_via_smtp",
                         lambda subj, body, rcpts, **k: sent.append(subj) or True)
@@ -162,7 +162,7 @@ def test_mismatch_failed_send_can_retry(monkeypatch):
     # [codex P1] 寄失敗不進 notified → 同功能之後再 mismatch 仍會通知
     monkeypatch.setattr(main, "_audit_mismatch_notified", set())
     monkeypatch.setattr(main, "_audit_mismatch_inflight", set())
-    monkeypatch.setattr(main, "_load_alert_recipients", lambda: ["dev@example.com"])
+    monkeypatch.setattr(main, "_developer_alert_recipients", lambda: ["dev@example.com"])
     ok = {"v": False}
     attempts = []
     monkeypatch.setattr(main, "_send_alert_email_via_smtp",

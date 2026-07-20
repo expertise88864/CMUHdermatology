@@ -90,7 +90,7 @@ def _notify_env(monkeypatch, baseline_fp=None):
     monkeypatch.setattr(main, "_persist_his_drift_notified", lambda k: True)
     monkeypatch.setattr(main, "_his_canary_warned", False)
     monkeypatch.setattr(main.threading, "Thread", _SyncThread)
-    monkeypatch.setattr(main, "_load_alert_recipients", lambda: ["dev@example.com"])
+    monkeypatch.setattr(main, "_developer_alert_recipients", lambda: ["dev@example.com"])
     sent = []
     monkeypatch.setattr(main, "_send_alert_email_via_smtp",
                         lambda subject, body, recipients, **k:
@@ -119,7 +119,7 @@ def test_ok_and_unknown_do_not_notify(monkeypatch):
 def test_notify_skips_when_no_recipients(monkeypatch):
     # 無收件人 → 不寄、不報錯(仍不擋)
     sent = _notify_env(monkeypatch)
-    monkeypatch.setattr(main, "_load_alert_recipients", lambda: [])
+    monkeypatch.setattr(main, "_developer_alert_recipients", lambda: [])
     main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01")
     assert sent == []
 
@@ -155,6 +155,39 @@ def test_dedup_uses_full_version_after_recalibration(monkeypatch):
     assert len(sent) == 2, "同主版本的不同點版應各通知一次"
 
 
+# ── 開發者 email:改版/維護訊息只寄開發者本人(使用者定案 2026-07-20) ──────────
+def test_canary_drift_goes_to_developer_email_only(monkeypatch):
+    monkeypatch.setattr(main, "_his_write_baseline_fp",
+                        lambda: {"title_version": "1150713"})
+    monkeypatch.setattr(main, "_his_drift_notified_versions", set())
+    monkeypatch.setattr(main, "_his_drift_inflight_versions", set())
+    monkeypatch.setattr(main, "_his_drift_persist_pending", set())
+    monkeypatch.setattr(main, "_his_drift_persist_retry_inflight", set())
+    monkeypatch.setattr(main, "_his_drift_no_recipient_logged", set())
+    monkeypatch.setattr(main, "_his_drift_persist_loaded", True)
+    monkeypatch.setattr(main, "_persist_his_drift_notified", lambda k: True)
+    monkeypatch.setattr(main.threading, "Thread", _SyncThread)
+    # 若誤用臨床止掛收件人,這個 stub 會現形
+    monkeypatch.setattr(main, "_load_alert_recipients", lambda: ["clinical@example.com"])
+    sent = []
+    monkeypatch.setattr(main, "_send_alert_email_via_smtp",
+                        lambda s, b, r, **k: sent.append(list(r)) or True)
+    main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01")
+    assert sent == [[main.DEVELOPER_ALERT_EMAIL]], "改版訊息只寄開發者,不寄臨床止掛收件人"
+    assert main.DEVELOPER_ALERT_EMAIL == "expertise88864@gmail.com"
+
+
+def test_dev_notifications_use_developer_email_not_clinical():
+    # 金絲雀/稽核維護訊息 → 開發者;止掛提醒(臨床)→ 仍用臨床收件人,不得改成開發者
+    for fn in (main._notify_his_drift, main.audit_health_check,
+               main._notify_audit_mismatch):
+        assert "_developer_alert_recipients()" in inspect.getsource(fn), \
+            f"{fn.__name__} 應寄開發者 email"
+    assert "_developer_alert_recipients" not in \
+        inspect.getsource(main.AutomationApp._dispatch_future_stop_alert_inner), \
+        "止掛提醒是臨床通知,不得改寄開發者"
+
+
 # ── P2-03:改版通知去重持久化 + 無收件人不起緒 ───────────────────────────────
 def test_notify_key_includes_baseline():
     # 同一現況版本、不同基線 → 不同 key(重新校正後真改版不被舊記錄永久壓住)
@@ -179,7 +212,7 @@ def test_notified_versions_persist_across_restart(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_his_drift_no_recipient_logged", set())
     monkeypatch.setattr(main, "_his_drift_persist_loaded", False)
     monkeypatch.setattr(main.threading, "Thread", _SyncThread)
-    monkeypatch.setattr(main, "_load_alert_recipients", lambda: ["dev@example.com"])
+    monkeypatch.setattr(main, "_developer_alert_recipients", lambda: ["dev@example.com"])
     sent = []
     monkeypatch.setattr(main, "_send_alert_email_via_smtp",
                         lambda s, b, r, **k: sent.append(s) or True)
@@ -207,7 +240,7 @@ def test_no_recipient_does_not_spawn_thread(monkeypatch):
     monkeypatch.setattr(main, "_his_drift_persist_retry_inflight", set())
     monkeypatch.setattr(main, "_his_drift_no_recipient_logged", set())
     monkeypatch.setattr(main, "_his_drift_persist_loaded", True)
-    monkeypatch.setattr(main, "_load_alert_recipients", lambda: [])
+    monkeypatch.setattr(main, "_developer_alert_recipients", lambda: [])
     threads = []
 
     class _CountThread:
@@ -270,7 +303,7 @@ def test_notify_deferred_when_dedup_state_cannot_load(monkeypatch):
     monkeypatch.setattr(main, "_his_drift_persist_loaded", False)
     monkeypatch.setattr(main, "_persist_his_drift_notified", lambda k: True)
     monkeypatch.setattr(main.threading, "Thread", _SyncThread)
-    monkeypatch.setattr(main, "_load_alert_recipients", lambda: ["dev@example.com"])
+    monkeypatch.setattr(main, "_developer_alert_recipients", lambda: ["dev@example.com"])
     sent = []
     monkeypatch.setattr(main, "_send_alert_email_via_smtp",
                         lambda s, b, r, **k: sent.append(s) or True)
@@ -315,7 +348,7 @@ def test_failed_persist_stays_pending_no_resend_then_retries(monkeypatch):
     monkeypatch.setattr(main, "_his_drift_no_recipient_logged", set())
     monkeypatch.setattr(main, "_his_drift_persist_loaded", True)
     monkeypatch.setattr(main.threading, "Thread", _SyncThread)
-    monkeypatch.setattr(main, "_load_alert_recipients", lambda: ["dev@example.com"])
+    monkeypatch.setattr(main, "_developer_alert_recipients", lambda: ["dev@example.com"])
     sent = []
     monkeypatch.setattr(main, "_send_alert_email_via_smtp",
                         lambda s, b, r, **k: sent.append(s) or True)

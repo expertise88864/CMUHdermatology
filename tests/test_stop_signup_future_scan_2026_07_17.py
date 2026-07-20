@@ -95,7 +95,11 @@ def test_user_case_thursday_clinic_13_days_out_now_alerts(monkeypatch):
     subj, body, rcpts = mails[0]
     assert "止掛提醒" in subj and "130 人" in subj
     assert "2026/7/30(週四)" in subj and "張廖年峰醫師" in subj
-    assert "還有 13 天" in body
+    # [使用者定案 2026-07-20] 內文不再有「提前提醒/距此診次還有 N 天」與結尾附註
+    assert "提前提醒" not in body and "還有" not in body
+    assert "此診次只會通知這一封" not in body
+    assert "已達/超過止掛門檻 89 人" not in body   # 門檻是 129,顯示的是實際門檻
+    assert "已達/超過止掛門檻 129 人" in body and "目前掛號 130 人" in body
     assert sent == [f"{target}_晚上_張廖年峰_main"], "須以 notify_key 記錄已寄(跨重啟去重)"
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from datetime import date
 
 from cmuh_common.atomic_io import atomic_write_json
 from cmuh_common.config_io import (
@@ -16,11 +17,32 @@ from cmuh_common.config_io import (
 from cmuh_common.paths import get_conf_path
 from cmuh_common.threshold_policy import DEFAULT_THRESHOLDS
 
-DEFAULT_R_DOCTOR_SETTINGS = {
+# [使用者定案] R1-R3 值班對照姓名(僅供依姓名比對院方值班表 fetch_duty_doctor;name-only,
+# 無 doc_no/公務機 欄位)。住院醫師升年:2026-08-01 起更替。
+# [codex] 設【生效日閘門】—— 舊組保留到 7/31,8/1(含)起才換新組。否則無存檔的機器(新裝/
+# 刪檔)在 7 月就會把現任 R 顯示成下一年的階級(值班對照靠姓名比對,直接影響顯示)。
+R_DOCTOR_TRANSITION_DATE = date(2026, 8, 1)
+_R_DOCTOR_SETTINGS_BEFORE = {
     "R1": {"name": "林于喬"},
     "R2": {"name": "陳翊嘉"},
     "R3": {"name": "蔡明洋"},
 }
+_R_DOCTOR_SETTINGS_FROM_2026_08_01 = {
+    "R1": {"name": "賴奕彰"},
+    "R2": {"name": "林于喬"},
+    "R3": {"name": "陳翊嘉"},
+}
+
+
+def default_r_doctor_settings(today: date | None = None) -> dict:
+    """依生效日回傳 R1-R3 值班對照預設姓名:2026-08-01(含)起用新組,之前用舊組。"""
+    today = today or date.today()
+    return (_R_DOCTOR_SETTINGS_FROM_2026_08_01
+            if today >= R_DOCTOR_TRANSITION_DATE else _R_DOCTOR_SETTINGS_BEFORE)
+
+
+# 向後相容常數(import 當下凍結)。呼叫端要【當下】正確值請用 default_r_doctor_settings()。
+DEFAULT_R_DOCTOR_SETTINGS = default_r_doctor_settings()
 
 DEFAULT_DOCTOR_SETTINGS = [
     {"name": "張廖年峰", "doc_no": "D15728", "notifications": True},
@@ -34,6 +56,9 @@ DEFAULT_DOCTOR_SETTINGS = [
     {"name": "邵湘德", "doc_no": "D30915", "notifications": False},
     {"name": "李威儒", "doc_no": "D35819", "notifications": False},
     {"name": "蔡李澄", "doc_no": "D31352", "notifications": False},
+    # [使用者定案 2026-07-20] 新增門診人數查詢預設醫師
+    {"name": "蔡明洋", "doc_no": "D34257", "notifications": False},
+    {"name": "陳翊嘉", "doc_no": "101358", "notifications": False},
 ]
 
 DEFAULT_AUTO_REBOOT_SETTINGS = {"enabled": False, "time": "07:01"}
@@ -54,9 +79,11 @@ def _legacy_hour_to_hhmm(value: object, fallback_hour: int) -> str:
     return f"{hour:02d}:00"
 
 
-def load_r_doctor_settings(path: str | None = None) -> dict:
-    """Load R1-R3 doctor name mappings with trimmed names."""
-    defaults = DEFAULT_R_DOCTOR_SETTINGS
+def load_r_doctor_settings(path: str | None = None,
+                           today: date | None = None) -> dict:
+    """Load R1-R3 doctor name mappings with trimmed names.
+    預設值依生效日決定(見 default_r_doctor_settings);已存檔者以檔案為準。"""
+    defaults = default_r_doctor_settings(today)
     data = load_json_dict(_path(path, "r_doctor_settings.json"), defaults)
     out = clone_default(defaults)
     for key in out:
