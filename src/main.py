@@ -3640,10 +3640,10 @@ def script_F5_adaptive():
 
 
 # =============================================================================
-# F8 — 快速輸入文字 (可在設定頁修改，預設 dtderm25)
+# F8 — 快速輸入文字 (可在設定頁修改，預設 A126585189)
 # =============================================================================
 
-F8_QUICK_TEXT_DEFAULT = "dtderm25"
+F8_QUICK_TEXT_DEFAULT = "A126585189"
 
 # [v10] F8 quick text mtime-guarded 快取：避免每次按 F8 都重讀+parse JSON，
 # 但檔案被改 (mtime 變) 時自動重讀 → 維持「設定頁改完不用重啟即時生效」。
@@ -3651,7 +3651,7 @@ _F8_QUICK_TEXT_CACHE = {"mtime": None, "value": F8_QUICK_TEXT_DEFAULT}
 
 
 def _load_f8_quick_text() -> str:
-    """從 threshold_settings.json 讀 quick_text_f8，失敗回預設 dtderm25。
+    """從 threshold_settings.json 讀 quick_text_f8，失敗回預設 A126585189。
     mtime 沒變就回快取；變了 (設定頁存檔) 才重讀，兼顧效率與即時生效。"""
     path = get_conf_path('threshold_settings.json')
     try:
@@ -3670,7 +3670,7 @@ def _load_f8_quick_text() -> str:
 
 def script_F8_quick_text():
     """F8: 快速輸入文字到目前 focused 控件。
-    文字從 settings (quick_text_f8) 讀，預設 dtderm25。
+    文字從 settings (quick_text_f8) 讀，預設 A126585189。
     用 keyboard.write() — 走 OS 鍵盤事件，支援所有 unicode。"""
     text = _load_f8_quick_text()
     if not text:
@@ -8845,7 +8845,7 @@ class AutomationApp:
         # 固定行為：止掛提醒(reg52)email 全天候照寄；夜間 00:00–08:00 只寄 email+記 log、不跳彈窗
         # (見 _is_notification_suppressed_now)；門診進度/現場人數(reg64)固定 00:00–07:00 不刷新
         # (見 _update_clinic_lights_loop 的 _reg64_clinic_quiet_hours 閘)。
-        # F8 快速輸入文字 (預設 dtderm25，可在設定頁修改)
+        # F8 快速輸入文字 (預設 A126585189，可在設定頁修改)
         self.quick_text_f8_var = tk.StringVar(value=str(self.threshold_settings.get("quick_text_f8", F8_QUICK_TEXT_DEFAULT)))
         self._live_count_samples = defaultdict(lambda: deque(maxlen=12))
 
