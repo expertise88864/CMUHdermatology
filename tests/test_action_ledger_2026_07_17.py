@@ -558,6 +558,55 @@ def test_record_his_action_drops_when_queue_full_without_waiting(monkeypatch):
     assert main._ledger_dropped >= 8, "滿了要計數丟棄"
 
 
+def test_correlation_id_shared_within_hotkey_flow(monkeypatch):
+    # [P2-05] 同一次熱鍵流程(同一 correlation id)的所有紀錄共用該 id;非空才設。
+    monkeypatch.setattr(main, "_his_title_of", lambda h: "")
+    monkeypatch.setattr(main, "_ledger_queue", main.Queue(maxsize=16))
+    monkeypatch.setattr(main, "_ensure_ledger_writer", lambda: None)
+    # 模擬熱鍵 wrapper 設定 thread-local
+    main._his_correlation.cid = "F11#42"
+    try:
+        main._record_his_action(al.SURFACE_HIS_MENU, "F11 完成不印", value="277")
+        main._record_his_action(al.SURFACE_HIS_FIELD, "F11 療程", value="2")
+    finally:
+        main._his_correlation.cid = ""
+    items = []
+    while not main._ledger_queue.empty():
+        items.append(main._ledger_queue.get_nowait())
+    cids = [fields.get("correlation_id") for _s, _a, fields, _ts in items]
+    assert cids == ["F11#42", "F11#42"], "同次流程共用同一 correlation_id"
+
+
+def test_correlation_id_absent_outside_hotkey_flow(monkeypatch):
+    # 非熱鍵路徑(thread-local 未設)→ 不硬塞 correlation_id
+    monkeypatch.setattr(main, "_his_title_of", lambda h: "")
+    monkeypatch.setattr(main, "_ledger_queue", main.Queue(maxsize=8))
+    monkeypatch.setattr(main, "_ensure_ledger_writer", lambda: None)
+    main._his_correlation.cid = ""
+    main._record_his_action(al.SURFACE_HIS_MENU, "F2", value="51017")
+    _s, _a, fields, _ts = main._ledger_queue.get_nowait()
+    assert fields.get("correlation_id", "") == ""
+
+
+def test_correlation_id_set_and_cleared_in_hotkey_wrapper():
+    # 源碼守門:wrapper 在跑 func() 前設 correlation id、finally 清掉
+    src = inspect.getsource(main.AutomationApp.run_subsystem_in_thread)
+    assert '_his_correlation.cid = f"{_SESSION_NONCE}#{hotkey_name}#{subsystem_token}"' in src, \
+        "每次熱鍵流程應設一組 correlation id(含 process nonce 前綴)"
+    i = src.index("result = func()")
+    assert src.rindex('_his_correlation.cid = f"', 0, i) < i, "correlation id 應在 func() 前設"
+    assert '_his_correlation.cid = ""' in src, "finally 應清掉 correlation id"
+
+
+def test_session_nonce_prefixes_correlation_id_for_cross_restart_uniqueness():
+    # [codex R1] token 每次啟動從 0 重數,帳本跨重啟持久化 → 少了 process nonce 前綴,
+    # 不同啟動的 "F11#42" 會撞成同一 id。守門:nonce 非空、已被前綴進 wrapper 設的 cid。
+    assert isinstance(main._SESSION_NONCE, str) and main._SESSION_NONCE, \
+        "應有非空的 process 級 session nonce"
+    src = inspect.getsource(main.AutomationApp.run_subsystem_in_thread)
+    assert "{_SESSION_NONCE}#" in src, "correlation id 應以 process nonce 為前綴,跨重啟才不撞號"
+
+
 def test_record_his_action_swallows_all_errors(monkeypatch):
     # 稽核【絕不可】弄壞臨床功能:入列路徑爆炸也只能吞掉
     def _boom():

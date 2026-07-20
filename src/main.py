@@ -1563,6 +1563,23 @@ _ledger_writer_started = False
 _ledger_writer_lock = threading.Lock()
 _ledger_dropped = 0            # 佇列滿被丟棄(未入列)
 _ledger_write_failures = 0     # 已入列但 record() 落地失敗(磁碟拒寫/硬上限)
+# [GPT-5.6 P2-05] 交易關聯 ID:同一次 F 鍵按下(一個 subsystem run)產生的所有稽核紀錄
+# 共用一組 correlation_id,事後才回答得出「這筆 UVB 寫回和哪次 51019、哪次 F11 完成是同一
+# 個病人流程」。每次熱鍵在新 thread 跑(run_subsystem_in_thread.wrapper),故用 thread-local
+# 天然逐次隔離;由 wrapper 設定、_record_his_action 讀取(兩者同在該熱鍵緒上)。
+_his_correlation = threading.local()
+# [P2-05 / codex R1] Per-process session nonce。correlation id 的 token 部分是
+# self._subsystem_token,每次啟動都從 0 重數,而帳本 settings/action_ledger.jsonl
+# 是跨重啟持久化的 —— 少了 nonce,今天這個 process 的 "F11#42" 會與明天重開後另
+# 一位病人的 "F11#42" 在帳本裡撞成同一 id,事後分群把不相干的流程併在一起,正好
+# 廢掉這個欄位存在的理由。加一組 process 唯一的前綴(啟動時戳+隨機尾碼,依審查建議;
+# time/random 皆已 import,免加 uuid 相依)。兩次啟動要撞需同一秒 AND 同一 24-bit
+# 隨機值 —— 對稽核分群而言可忽略。
+_SESSION_NONCE = f"{int(time.time()):x}{random.randint(0, 0xFFFFFF):06x}"
+
+
+def _current_correlation_id() -> str:
+    return getattr(_his_correlation, "cid", "") or ""
 # [批次三] 稽核健康通知去重:同一問題摘要每個 process 只寄一次;mismatch 即時信
 # 以 (action, 日期) 去重(同一功能同一天寄一次,避免連按 F 鍵洗信箱)。
 # [codex P1] 「已寄」只在【寄成功後】才記(與 drift/止掛通知同一鐵律,已在別處犯過兩次):
@@ -1768,6 +1785,11 @@ def _record_his_action(surface: str, action: str, main_hwnd: int = 0,
             fields.setdefault("his_version", ver)
             fields.setdefault("canary", canary)
         fields.setdefault("app_version", str(CURRENT_VERSION))
+        # [P2-05] 同一次熱鍵流程的所有紀錄共用 correlation_id(在熱鍵緒讀 thread-local,
+        # 非空才設 → 非熱鍵路徑呼叫時留空,不硬塞)。
+        _cid = _current_correlation_id()
+        if _cid:
+            fields.setdefault("correlation_id", _cid)
         ts = datetime.now().isoformat(timespec="seconds")   # 動作發生當下的時間
         _ensure_ledger_writer()
         _ledger_queue.put_nowait((str(surface), str(action), dict(fields), ts))
@@ -14867,6 +14889,11 @@ class AutomationApp:
                     self._subsystem_thread = threading.current_thread()
                 logging.info(f"Starting subsystem from {hotkey_name}...")
                 put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 執行中...'))
+                # [P2-05] 本次熱鍵流程的交易關聯 ID(nonce#hotkey#token,每次按下唯一;
+                # 熱鍵單一執行故不會撞號;nonce 為 process 唯一,跨重啟不撞號 —— 見 _SESSION_NONCE)。
+                # 本 wrapper 在本熱鍵緒上跑,func() 內的 _record_his_action 讀同一個
+                # thread-local → 同次流程的稽核紀錄共用此 id。
+                _his_correlation.cid = f"{_SESSION_NONCE}#{hotkey_name}#{subsystem_token}"
                 # 啟動前若已被 F12(stop_event)或後續搶占(取消集合)中止 → 先行 bail。
                 check_stop()
                 result = func()
@@ -14882,6 +14909,7 @@ class AutomationApp:
                 logging.exception(f"Error in '{hotkey_name}'")
                 put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 發生未預期錯誤'))
             finally:
+                _his_correlation.cid = ""     # [P2-05] 收尾清關聯 ID(新緒本就乾淨,防禦性)
                 with self._subsystem_lock:
                     if getattr(self, '_subsystem_thread_ident', None) == threading.get_ident():
                         self._subsystem_thread_ident = None
