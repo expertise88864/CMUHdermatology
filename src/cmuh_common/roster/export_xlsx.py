@@ -13,7 +13,7 @@ from cmuh_common.roster.model import is_weekend, week_matrix
 
 
 def export(path: str, data: dict) -> None:
-    from openpyxl import Workbook  # noqa: PLC0415（lazy 重依賴）
+    from openpyxl import Workbook  # noqa: PLC0415 (lazy 重依賴)
     from openpyxl.styles import Alignment
 
     wb = Workbook()
@@ -94,7 +94,7 @@ def _sheet_summary(ws, data: dict) -> None:
             ws.append([scope.upper(), name,
                        t["wd"], t["we"], t["wd"] + t["we"], t["pt"], bal_cell])
             row += 1
-    for c, w in zip("ABCDEFG", (6, 10, 6, 6, 6, 6, 8)):
+    for c, w in zip("ABCDEFG", (6, 10, 6, 6, 6, 6, 8), strict=True):
         ws.column_dimensions[c].width = w
 
 

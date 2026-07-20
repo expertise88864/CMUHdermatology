@@ -73,7 +73,7 @@ def pick_pixel(parent: tk.Misc, on_done: Callable[[int, int, int, int, int], Non
     # 也要把 toplevel 全找一輪
     try:
         root = parent.winfo_toplevel()
-        for child in root.tk.eval("winfo children .").split():
+        for _child in root.tk.eval("winfo children .").split():
             pass  # 簡化：只 hide ancestors
     except Exception:
         pass

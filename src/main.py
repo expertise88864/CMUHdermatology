@@ -12155,10 +12155,12 @@ class AutomationApp:
                 _normalize_clinic_display_mode(self.clinic_display_mode_vars[j].get())
                 for j in range(len(self.clinic_room_vars))
             ]
+            # rooms 與 time_modes 皆按 self.clinic_room_vars 逐一建立 → 長度必然相等,
+            # strict=True 當防呆(若日後兩者建法分歧會立刻炸出來,而非默默截斷)。
             duplicate_pairs = sorted({
                 (room, mode)
-                for room, mode in zip(rooms, time_modes)
-                if room and sum(1 for r, m in zip(rooms, time_modes) if r == room and m == mode) > 1
+                for room, mode in zip(rooms, time_modes, strict=True)
+                if room and sum(1 for r, m in zip(rooms, time_modes, strict=True) if r == room and m == mode) > 1
             })
             data = {
                 "rooms": rooms,
@@ -12534,7 +12536,7 @@ class AutomationApp:
         self.future_week_selector = ttk.Combobox(controls_frame, values=options, state='readonly'); self.future_week_selector.pack(side='left'); self.future_week_selector.bind("<<ComboboxSelected>>", self.on_future_week_selected)
         future_display_frame = ttk.Frame(future_tab); future_display_frame.pack(fill="both", expand=True, pady=(5,0)); labels_frame = ttk.Frame(future_display_frame); labels_frame.pack(side="left", fill="y", padx=(0, 5)); calendar_container = ttk.Frame(future_display_frame); calendar_container.pack(side="left", fill="both", expand=True)
         self.future_week_labels = []; ttk.Label(labels_frame, text="", style="Header.TLabel").pack(pady=1)
-        for i in range(2): label = ttk.Label(labels_frame, text="", font=("Microsoft JhengHei UI", 9, "bold"), anchor="center"); label.pack(fill="both", expand=True); self.future_week_labels.append(label)
+        for _ in range(2): label = ttk.Label(labels_frame, text="", font=("Microsoft JhengHei UI", 9, "bold"), anchor="center"); label.pack(fill="both", expand=True); self.future_week_labels.append(label)
         self.future_calendar_widgets = self._create_calendar_grid(calendar_container, num_weeks=2)
         if options: self.future_week_selector.set(options[0]); self.on_future_week_selected()
 
@@ -14144,7 +14146,7 @@ class AutomationApp:
                     )
                     render_signature.append((session_name, tuple((clinic[0], clinic[1], clinic[2]) for _, clinic in sorted_clinics[:FIXED_SLOTS])))
                     prepared_states = []
-                    for idx, (doc_name_key, clinic_data) in enumerate(sorted_clinics[:FIXED_SLOTS]):
+                    for _idx, (_doc_name_key, clinic_data) in enumerate(sorted_clinics[:FIXED_SLOTS]):
                         final_name, status_text, tag, _ = clinic_data
 
                         # 一般列白底；休診用淡灰底標記；逾時與一般列同白底（不另套色票）

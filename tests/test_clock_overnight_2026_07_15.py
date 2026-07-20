@@ -130,8 +130,8 @@ def test_discard_kills_process_tree_when_quit_hangs_forever(monkeypatch):
         main._discard_status_driver(d)
         try:
             dummy.wait(timeout=10)             # 寬限 1s 後應被砍 → wait 返回
-        except subprocess.TimeoutExpired:
-            raise AssertionError("quit 永久卡死時,寬限逾時應強制結束該 driver 行程樹")
+        except subprocess.TimeoutExpired as exc:
+            raise AssertionError("quit 永久卡死時,寬限逾時應強制結束該 driver 行程樹") from exc
         assert dummy.returncode is not None
     finally:
         if dummy.poll() is None:

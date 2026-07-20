@@ -229,7 +229,9 @@ def check_trigger(keyword: str, mark_read: bool = True,
             # 後備：撈 UNSEEN 後 client 端比對
             typ, data = conn.search(None, "UNSEEN")
             if typ != "OK":
-                raise RuntimeError(f"IMAP SEARCH 失敗：{typ} {data}")
+                # 後備搜尋本身回了非 OK → 這是新的失敗條件(訊息已自足),與觸發後備的
+                # 原例外無因果關係 → from None 明示不接續原鏈。
+                raise RuntimeError(f"IMAP SEARCH 失敗：{typ} {data}") from None
 
         if typ != "OK" or not data:
             result["error"] = f"IMAP SEARCH 異常回應：{typ}"

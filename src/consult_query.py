@@ -1810,7 +1810,7 @@ def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -
         win32process.CreateProcess(SYSTEMFTP_PATH, None, None, None,
                                     False, 0, None, None, si)
     except Exception as e:
-        raise RuntimeError(f"在隱藏桌面啟動 systemftp.exe 失敗：{e}")
+        raise RuntimeError(f"在隱藏桌面啟動 systemftp.exe 失敗：{e}") from e
     logging.info("已在隱藏桌面啟動 systemftp.exe")
 
     our_pids: set = set()
@@ -1944,8 +1944,8 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
     startup.wShowWindow = 0  # SW_HIDE
     try:
         subprocess.Popen([SYSTEMFTP_PATH], startupinfo=startup)
-    except FileNotFoundError:
-        raise RuntimeError(f"找不到住院醫囑系統程式：{SYSTEMFTP_PATH}")
+    except FileNotFoundError as e:
+        raise RuntimeError(f"找不到住院醫囑系統程式：{SYSTEMFTP_PATH}") from e
     logging.info("已啟動 systemftp.exe（SW_HIDE 後備模式）")
 
     stealth_stop = threading.Event()

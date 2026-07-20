@@ -6,8 +6,18 @@
 #   E9 = 語法錯誤(E901/E902/E999)。
 #
 # 本專案大量使用 `if cond: stmt` 一行多敘述(E701)等風格寫法,屬個人習慣、非 bug,
-# 故「不」納入強制,避免關卡永遠紅燈而失去意義。日後若想提升,可逐步加入 B(bugbear)等。
+# 故「不」納入強制,避免關卡永遠紅燈而失去意義。
+#
+# [2026-07-20] 依註解預告加入 B(flake8-bugbear)——「真 bug 傾向」規則:
+#   B904 例外鏈(raise ... from)、B905 zip(strict=)、B006 可變預設參數、B012 finally 內
+#   break/return 吞例外……等。加入時一次修完當下全部命中(B904×4/B905×7/B007×6/B011×3)。
+# 唯【B023】(closure 未綁 loop 變數)全數為【誤報】故 ignore:本專案這些 closure 都在
+#   同一輪迴圈內【同步】跑完(submit 後立即 .result() join,見 main.py reg52 併發抓取),
+#   loop 變數不會在 closure 執行前改變 → 綁定與否無差,硬綁只是徒增雜訊(比照 E701 不與
+#   linter 糾纏非 bug 的立場)。★未來若把這些 closure 改成【延後/跨迴圈】執行,務必移除此
+#   ignore 並改用預設參數綁定,否則會踩到真正的 late-binding bug。★
 line-length = 200
 
 [lint]
-select = ["F", "E9"]
+select = ["F", "E9", "B"]
+ignore = ["B023"]

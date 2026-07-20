@@ -135,7 +135,7 @@ def _dedupe_rows(ys: list[int], tol: int = 10) -> list[int]:
 def _estimate_pitch(ys: list[int]) -> Optional[float]:
     """估每列間距(去重後連續 y 差的中位數)。少於兩列回 None。"""
     rows = _dedupe_rows(ys)
-    diffs = sorted(b - a for a, b in zip(rows, rows[1:]) if b - a > 0)
+    diffs = sorted(b - a for a, b in zip(rows, rows[1:], strict=False) if b - a > 0)
     if not diffs:
         return None
     return diffs[len(diffs) // 2]

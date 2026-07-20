@@ -222,7 +222,7 @@ def test_storage_month_roundtrip_snapshot_finalize(tmp_path):
     st.save_month("2026-08", data)
     try:
         st.save_month("2026-08", {"x": 1})
-        assert False, "應拋 FinalizedMonthError"
+        raise AssertionError("應拋 FinalizedMonthError")
     except FinalizedMonthError:
         pass
     st.save_month("2026-08", {"x": 1}, force=True)   # force 可
@@ -277,7 +277,7 @@ def test_storage_newer_schema_rejected(tmp_path):
     p.write_text('{"schema_version": 99}', encoding="utf-8")
     try:
         st.load_month("2026-08")
-        assert False, "應拋 NewerSchemaError"
+        raise AssertionError("應拋 NewerSchemaError")
     except NewerSchemaError:
         pass
 
@@ -293,7 +293,7 @@ def test_storage_save_paths_guard_newer_schema(tmp_path):
         (tmp_path / name).write_text('{"schema_version": 99}', encoding="utf-8")
         try:
             saver()
-            assert False, f"{name} 應拋 NewerSchemaError"
+            raise AssertionError(f"{name} 應拋 NewerSchemaError")
         except NewerSchemaError:
             pass
 

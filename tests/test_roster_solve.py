@@ -149,7 +149,7 @@ def test_same_color_forbids_consecutive_weekends():
     r = solve_duty(ctx)
     assert r.status == "ok"
     sats = [date(2026, 8, d) for d in (1, 8, 15, 22, 29)]
-    for a, b in zip(sats, sats[1:]):
+    for a, b in zip(sats, sats[1:], strict=False):       # 相鄰配對,長度刻意差一
         assert r.assignments[a] != r.assignments[b]      # 禁止連週
 
 
@@ -169,7 +169,7 @@ def test_missing_colors_conservative_and_warn():
     assert r.status == "ok"
     assert any("色塊未設定" in c.msg for c in r.prechecks)
     sats = [date(2026, 8, d) for d in (1, 8, 15, 22, 29)]
-    for a, b in zip(sats, sats[1:]):                      # 保守=視為同色禁連
+    for a, b in zip(sats, sats[1:], strict=False):        # 保守=視為同色禁連(相鄰配對)
         assert r.assignments[a] != r.assignments[b]
 
 

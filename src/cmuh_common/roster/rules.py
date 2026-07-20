@@ -265,7 +265,9 @@ class ColorRule(Rule):
                 unknown = ca is None or cb is None
                 out.append((prev_person, None, target,
                             unknown or ca == cb, unknown))
-        for a, b in zip(blocks[idx0:], blocks[idx0 + 1:]):
+        # 相鄰配對(sliding window):blocks[idx0:] 比 blocks[idx0+1:] 多一個 → 長度刻意不等,
+        # 必須 strict=False(strict=True 會誤拋)。
+        for a, b in zip(blocks[idx0:], blocks[idx0 + 1:], strict=False):
             ca, cb = ctx.color_of_block(a), ctx.color_of_block(b)
             unknown = ca is None or cb is None
             out.append((None, a, b, unknown or ca == cb, unknown))
@@ -278,7 +280,7 @@ class ColorRule(Rule):
                 "warn", self.rule_id,
                 "只有 1 位成員 → 色塊連週規則自動停用（無從輪替）"))
             return checks
-        for prev_p, a, b, same, unknown in self._pairs(ctx):
+        for _prev_p, _a, b, same, unknown in self._pairs(ctx):
             if unknown and same:
                 anchor = b.color_anchor()
                 checks.append(Precheck(

@@ -13,7 +13,7 @@ from cmuh_common.roster.model import week_matrix
 
 
 def export(path: str, data: dict) -> None:
-    from docx import Document  # noqa: PLC0415（lazy 重依賴）
+    from docx import Document  # noqa: PLC0415 (lazy 重依賴)
     from docx.enum.text import WD_ALIGN_PARAGRAPH
 
     doc = Document()
