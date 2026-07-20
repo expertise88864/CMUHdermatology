@@ -347,6 +347,43 @@ def test_failed_send_can_retry_next_scan(monkeypatch):
     assert len(attempts) == 2 and len(sent) == 1, "上次失敗 → 下一輪應重試並成功"
 
 
+def test_malformed_date_value_skipped_not_aborting_scan(monkeypatch):
+    # [codex P2] 某日的值不是 list(None/int/壞物件)→ 只跳過該日,不炸掉整輪;同醫師其他
+    # 日期仍正常寄。原本 list(v) 會拋例外被外層 catch → 全部醫師都不寄。
+    today = date(2026, 7, 17)
+    good = date(2026, 7, 30)
+    bad = date(2026, 7, 28)
+    app, _ = _app(monkeypatch, {
+        bad: None,                                   # 畸形:非 list
+        good: [{"session": "晚上", "count": 130, "is_stopped": False}],
+    })
+    mails = _dispatch_sync(monkeypatch, app)
+    app._scan_future_stop_signup_alerts(today=today)
+    assert len(mails) == 1, "壞日期跳過,好日期仍應寄"
+
+
+def test_one_bad_doctor_does_not_block_other_doctor(monkeypatch):
+    # [codex P2] 一位醫師的快取整塊畸形 → 只跳過該位,另一位仍正常寄
+    today = date(2026, 7, 17)                     # 週五
+    tue = date(2026, 7, 21)                       # 週二(陳駿升晚上門檻表內,門檻 59)
+    assert tue.weekday() == 1
+    app, _ = _app(monkeypatch, {})
+    app.alert_chen_enabled = _FakeVar(True)       # 兩位都啟用
+    app.doctors_list = [
+        {"name": "張廖年峰", "doc_no": "D12345"},
+        {"name": "陳駿升", "doc_no": "D67890"},
+    ]
+    app._live_clinic_data_keys = {"D12345", "D67890"}
+    app.all_doctors_data = {
+        "D12345": "整塊不是 dict",                 # 張廖:畸形 → 該位跳過
+        "D67890": {tue: [{"session": "晚上", "count": 100, "is_stopped": False}]},
+    }
+    mails = _dispatch_sync(monkeypatch, app)
+    app._scan_future_stop_signup_alerts(today=today)
+    assert len(mails) == 1 and "陳駿升" in mails[0][0], \
+        "張廖快取畸形不得害陳駿升的提醒不寄"
+
+
 def test_scan_swallows_errors(monkeypatch):
     # 掃描壞掉不可影響行事曆/其他功能
     app, _ = _app(monkeypatch, {})

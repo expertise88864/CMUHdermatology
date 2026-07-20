@@ -14641,49 +14641,71 @@ class AutomationApp:
                 return
 
             today = today or date.today()
+            # [codex P3] 視窗 = 今天起未來 STOP_SIGNUP_SCAN_DAYS 天(含今天 → 共 +1 個日曆日;
+            # 刻意 inclusive、寧可多涵蓋一天也不漏掉最遠的滿診)。
+            horizon = today + timedelta(days=STOP_SIGNUP_SCAN_DAYS)
             with self._alert_state_lock:
                 live_keys = set(self._live_clinic_data_keys)
             snapshot = {}
             with self._doctor_data_lock:
                 for doc_info in self.doctors_list:
-                    name = doc_info.get('name')
-                    if name not in enabled:
-                        continue
-                    doc_no = str(doc_info.get('doc_no'))
-                    # [codex] 只掃「本次執行已收到即時資料」的醫師 —— 開機時的磁碟舊快取
-                    # 不可拿來寄提醒(會寄錯且永久去重,害真的爆掉時反而不提醒)。
-                    if doc_no not in live_keys and name not in live_keys:
-                        continue
-                    d = (self.all_doctors_data.get(doc_no)
-                         or self.all_doctors_data.get(name))
-                    if isinstance(d, dict) and 'error' not in d:
-                        snapshot[name] = {k: list(v) for k, v in d.items()
-                                          if isinstance(k, date) and
-                                          today <= k <= today + timedelta(
-                                              days=STOP_SIGNUP_SCAN_DAYS)}
+                    # [codex P2] 每位醫師獨立 try:某位的快取畸形(整塊非 dict、某日非 list…)
+                    # 只跳過【該位】,不炸掉整輪掃描害其他醫師的提醒全部不寄。
+                    try:
+                        name = doc_info.get('name')
+                        if name not in enabled:
+                            continue
+                        doc_no = str(doc_info.get('doc_no'))
+                        # [codex] 只掃「本次執行已收到即時資料」的醫師 —— 開機時的磁碟舊快取
+                        # 不可拿來寄提醒(會寄錯且永久去重,害真的爆掉時反而不提醒)。
+                        if doc_no not in live_keys and name not in live_keys:
+                            continue
+                        d = (self.all_doctors_data.get(doc_no)
+                             or self.all_doctors_data.get(name))
+                        if not (isinstance(d, dict) and 'error' not in d):
+                            continue
+                        # [codex P2] 逐日取值,某日的值不是 list/tuple(None/int/壞物件)只跳過
+                        # 該日,不讓 list(v) 拋例外炸整輪。
+                        day_map = {k: list(v) for k, v in d.items()
+                                   if isinstance(k, date) and today <= k <= horizon
+                                   and isinstance(v, (list, tuple))}
+                        if day_map:
+                            snapshot[name] = day_map
+                    except Exception:
+                        logging.debug("[ALERT] 止掛掃描:醫師 %s 快取異常,跳過該位",
+                                      doc_info.get('name'), exc_info=True)
 
             for doc_name, by_date in snapshot.items():
-                tmap = enabled[doc_name]
-                for cur, items in sorted(by_date.items()):
-                    for appt_item in items:
-                        parsed = _parse_appt_item_for_alert(appt_item)
-                        if not parsed:
-                            continue
-                        session_name, count, is_stopped, ext_branch, room = parsed
-                        if is_stopped:
-                            continue   # 已止掛 → 不會再增號,不必提醒
-                        full_threshold = tmap.get((cur.weekday(), session_name))
-                        if not isinstance(full_threshold, int):
-                            continue
-                        if count < full_threshold:
-                            continue
-                        nk = f"{cur}_{session_name}_{doc_name}_{ext_branch or 'main'}"
-                        # [codex] 與行事曆 notify 共用同一個原子 claim → 不會兩條路徑各寄一封
-                        if not self._claim_alert_email(nk):
-                            continue
-                        self._dispatch_future_stop_alert(
-                            nk, doc_name, cur, session_name, count,
-                            full_threshold, ext_branch, room, recipients, today)
+                try:
+                    tmap = enabled[doc_name]
+                    for cur, items in sorted(by_date.items()):
+                        for appt_item in items:
+                            try:
+                                parsed = _parse_appt_item_for_alert(appt_item)
+                                if not parsed:
+                                    continue
+                                session_name, count, is_stopped, ext_branch, room = parsed
+                                if is_stopped:
+                                    continue   # 已止掛 → 不會再增號,不必提醒
+                                full_threshold = tmap.get((cur.weekday(), session_name))
+                                if not isinstance(full_threshold, int):
+                                    continue
+                                if count < full_threshold:
+                                    continue
+                                nk = f"{cur}_{session_name}_{doc_name}_{ext_branch or 'main'}"
+                                # [codex] 與行事曆 notify 共用原子 claim → 不會兩路徑各寄一封
+                                if not self._claim_alert_email(nk):
+                                    continue
+                                self._dispatch_future_stop_alert(
+                                    nk, doc_name, cur, session_name, count,
+                                    full_threshold, ext_branch, room, recipients, today)
+                            except Exception:
+                                # [codex P2] 單筆診次異常只跳過該筆,不影響同醫師其他診次
+                                logging.debug("[ALERT] 止掛掃描:單筆診次異常,跳過",
+                                              exc_info=True)
+                except Exception:
+                    logging.debug("[ALERT] 止掛掃描:醫師 %s 處理異常,跳過該位",
+                                  doc_name, exc_info=True)
         except Exception:
             logging.warning("[ALERT] 止掛背景掃描例外(不影響其他功能)", exc_info=True)
 
