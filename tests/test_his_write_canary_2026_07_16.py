@@ -5,8 +5,8 @@
 [2026-07-17 使用者定案] 改為【偵測 + 寄信通知一次、不擋、不跳窗】:實務上「誤擋 + 每按一次
   跳窗」比偶發改版更難用;改版風險由醫師現場判斷兜底(發現功能異常自行停用)。偵測集中在
   _sample_his_write_contract(找到主視窗時),寫入路徑不再有 gate。通知每個現況版本只寄一次,
-  丟背景 daemon 緒寄(SMTP 逾時不可卡熱鍵)。校正基線 _HIS_CALIBRATED_VERSION=1150713
-  (2026-07-13 HIS V.1150713.02 改版、使用者實測選單 id 仍正常)。
+  丟背景 daemon 緒寄(SMTP 逾時不可卡熱鍵)。校正基線 _HIS_CALIBRATED_VERSION=1150720
+  (2026-07-20 HIS V.1150720.01 改版、使用者實測:同意書 669→670、代碼輸入 219 仍正常，已重新校正)。
 採樣只用主視窗 title 版本號(選單多 owner-draw、動態文字讀不到 → 版本字串最可靠)。
 """
 import inspect
@@ -29,8 +29,8 @@ def _verdict(monkeypatch, title, baseline_fp=None):
 
 # ── 採樣裁決(純函式 _his_write_verdict_for) ─────────────────────────────────
 def test_verdict_ok_on_matching_version(monkeypatch):
-    # 現行校正版本 1150713(2026-07-13 改版,實測正常)
-    assert _verdict(monkeypatch, "西醫門診醫師作業 V.1150713.02").status == cc.STATUS_OK
+    # 現行校正版本 1150720(2026-07-20 改版:同意書 669→670、代碼輸入 219 仍正常，已重新校正)
+    assert _verdict(monkeypatch, "西醫門診醫師作業 V.1150720.01").status == cc.STATUS_OK
 
 
 def test_verdict_drift_on_version_shift(monkeypatch):
@@ -111,7 +111,7 @@ def test_drift_notifies_once_per_version_and_does_not_return_block(monkeypatch):
 
 def test_ok_and_unknown_do_not_notify(monkeypatch):
     sent = _notify_env(monkeypatch)
-    main._sample_his_write_contract("西醫門診醫師作業 V.1150713.02")   # OK
+    main._sample_his_write_contract("西醫門診醫師作業 V.1150720.01")   # OK(=校正版本)
     main._sample_his_write_contract("西醫門診醫師作業")               # 無版本→UNKNOWN
     assert sent == [], "契約一致/採不到版本都不寄信"
 
@@ -131,7 +131,7 @@ def test_notify_retries_until_send_succeeds(monkeypatch):
     outcome = {"ok": False}
     monkeypatch.setattr(main, "_send_alert_email_via_smtp",
                         lambda s, b, r, **k: sent.append(s) or outcome["ok"])
-    _k = "1150701@1150713"                               # 去重 key = 現況@基線
+    _k = "1150701@1150720"                               # 去重 key = 現況@基線(校正=1150720)
     main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01")   # 寄失敗(False)
     assert len(sent) == 1
     assert _k not in main._his_drift_notified_versions, "寄失敗不得標記已通知"

@@ -1482,7 +1482,7 @@ _HOSPITAL_WIN_TITLE_KW = "西醫門診醫師作業"
 # 【刻意只警示、不硬停 F 鍵】:硬停在版本字串誤判時會讓醫師整組熱鍵失效(比原 bug 更糟);且完成不印
 # 已有 _find_menu_command_id_by_text 動態解析當備援。title 沒有可辨識版本字串 → 不動作(避免假警報)。
 # 硬停 + 醫師對話框待有實機可確認 title 格式再補(不確定就不自動動作,連自己的守門也一樣)。
-_HIS_CALIBRATED_VERSION = "1150713"   # 選單 id 校正對應的 HIS 版本(2026-07-13 V.1150713.02 改版後,使用者實測選單 id 仍正常;前一版 1150629)
+_HIS_CALIBRATED_VERSION = "1150720"   # 選單 id 校正對應的 HIS 版本(2026-07-20 V.1150720.01 改版:使用者實測 同意書 669→670、代碼輸入 219 仍正常→已校正;前版 1150713/1150629)
 _HIS_VERSION_RE = re.compile(r"[Vv]\.?\s*(\d{6,8})")
 # [金絲雀 2026-07-17] 另抓含尾碼的完整版本(V.1150629.01 → 1150629.01)。主版本相同但尾碼
 # 不同(.01→.02)也可能是改版;但尾碼比對【只在基線本身帶尾碼時】才生效(見 sample_his_current_fp)
@@ -5479,16 +5479,18 @@ def script_F4_adaptive():
 # F9/F10 (同意書) — 通用 Win32 helpers
 # =============================================================================
 # 同意書開立作業 視窗 class = TOrMain（snapshot 2026-05-18 證實）。
-# 「其他 → 同意書」menu id = 669（user 測試確認;2026-06-29 HIS V.1150629.01 改版後 668→669,整批 +1）。
+# 「其他 → 同意書」menu id：668(原始)→669(2026-06-29 V.1150629.01,整批+1)→670(2026-07-20 V.1150720.01,
+#   使用者 test_yiling_menu_id.py 實測確認 F9/F10 壞掉、669→670;同時 F1~F5 代碼輸入 id=219 仍正常，
+#   代表這次只有「其他」選單位移、「醫令」段沒動，故非整批位移)。
 # 流程：
-#   1. SendMessage(TFopdmain, WM_COMMAND, 669)  → 打開 TOrMain 視窗
+#   1. SendMessage(TFopdmain, WM_COMMAND, 670)  → 打開 TOrMain 視窗
 #   2. 等 TOrMain 出現 (FindWindow loop)
 #   3. 切到「手術及治療」TTabSheet（點 tab header）
 #   4. 點 MO04 (F9) / MU02 (F10) radio (TGroupButton text 含 code)
 #   5. 點「開立電子」TButton
 #   6+ 後續 popup 操作（Round 2 之後加）
 
-MENU_ID_同意書 = 669
+MENU_ID_同意書 = 670
 
 
 def _get_window_pid(hwnd: int) -> int:
