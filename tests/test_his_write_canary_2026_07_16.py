@@ -15,8 +15,22 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import pytest  # noqa: E402
+
 import main  # noqa: E402
 from cmuh_common import contract_canary as cc  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _watchdog_enabled_by_default(monkeypatch, request):
+    """本檔多數測試在驗「偵測到 HIS 改版後的寄信/去重」邏輯 → 送信面預設【本機啟用 watchdog】
+    (2026-07-23 使用者:改版通知只由啟用 watchdog 的電腦寄)。直接測 helper 本身的
+    test_watchdog_enabled_reads_master_enabled 除外(它自 patch watchdog_core.load_config);
+    測 gate 行為的測試會在 body 內自行覆寫此預設。"""
+    if request.node.name == "test_watchdog_enabled_reads_master_enabled":
+        return
+    monkeypatch.setattr(main, "_watchdog_enabled_on_this_machine", lambda: True)
+    monkeypatch.setattr(main, "_his_drift_watchdog_gate_logged", False)
 
 
 def _verdict(monkeypatch, title, baseline_fp=None):
@@ -89,6 +103,7 @@ def _notify_env(monkeypatch, baseline_fp=None):
     monkeypatch.setattr(main, "_his_drift_persist_loaded", True)   # 跳過 seed 的檔案 IO
     monkeypatch.setattr(main, "_persist_his_drift_notified", lambda k: True)
     monkeypatch.setattr(main, "_his_canary_warned", False)
+    # 送信面「本機啟用 watchdog」由 autouse fixture _watchdog_enabled_by_default 預設。
     monkeypatch.setattr(main.threading, "Thread", _SyncThread)
     monkeypatch.setattr(main, "_developer_alert_recipients", lambda: ["dev@example.com"])
     sent = []
@@ -186,6 +201,53 @@ def test_dev_notifications_use_developer_email_not_clinical():
     assert "_developer_alert_recipients" not in \
         inspect.getsource(main.AutomationApp._dispatch_future_stop_alert_inner), \
         "止掛提醒是臨床通知,不得改寄開發者"
+
+
+# ── 2026-07-23:改版通知只由本機啟用 watchdog 的電腦寄(避免多台灌信) ─────────────
+def test_his_drift_notification_gated_to_watchdog_machine(monkeypatch):
+    # HIS 改版是全域事件,每台診間機都會各自偵測到 → 只有【本機啟用 watchdog】的電腦才寄
+    # 改版通知,避免 N 台各寄一封灌爆開發者信箱。
+    sent = _notify_env(monkeypatch)
+    # 本機未啟用 watchdog → 偵測到改版但不寄(仍不擋、不報錯)
+    monkeypatch.setattr(main, "_watchdog_enabled_on_this_machine", lambda: False)
+    assert main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01") is None
+    assert sent == [], "非 watchdog 主機不得寄改版通知"
+    # 同一台改成啟用 watchdog → 才會寄(其餘寄信邏輯不變)
+    monkeypatch.setattr(main, "_watchdog_enabled_on_this_machine", lambda: True)
+    main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01")
+    assert len(sent) == 1 and "1150701" in sent[0][0], "watchdog 主機應寄改版通知"
+
+
+def test_watchdog_enabled_reads_master_enabled(monkeypatch):
+    # helper 直接反映 watchdog_config 的 master_enabled;缺欄位/讀取例外一律保守回 False
+    # (寧可不寄,也不要因讀取例外讓每台機器都改回亂寄)。
+    import cmuh_common.watchdog_core as wc
+    monkeypatch.setattr(wc, "load_config", lambda: {"master_enabled": True})
+    assert main._watchdog_enabled_on_this_machine() is True
+    monkeypatch.setattr(wc, "load_config", lambda: {"master_enabled": False})
+    assert main._watchdog_enabled_on_this_machine() is False
+    monkeypatch.setattr(wc, "load_config", lambda: {})            # 缺欄位 → 預設 False
+    assert main._watchdog_enabled_on_this_machine() is False
+
+    def _boom():
+        raise RuntimeError("config unreadable")
+    monkeypatch.setattr(wc, "load_config", _boom)
+    assert main._watchdog_enabled_on_this_machine() is False, "讀取例外一律視為未啟用"
+
+
+def test_startup_seed_only_when_watchdog_enabled(monkeypatch):
+    # [codex R1] 開機預載去重狀態(_seed_his_drift_notified_if_watchdog,由 startup 排程呼叫)
+    # 也只在啟用 watchdog 時做 → 非 watchdog 機完全不碰 his_drift_notified.json(不 seed、
+    # 不會因壞檔被 safe_load_json_ex 改名 .corrupt),與寄件 gate 契約一致。
+    calls = []
+    monkeypatch.setattr(main, "_seed_his_drift_notified_once",
+                        lambda: calls.append(1))
+    monkeypatch.setattr(main, "_watchdog_enabled_on_this_machine", lambda: False)
+    main._seed_his_drift_notified_if_watchdog()
+    assert calls == [], "非 watchdog 機開機不得載回改版去重狀態(不碰持久化檔)"
+    monkeypatch.setattr(main, "_watchdog_enabled_on_this_machine", lambda: True)
+    main._seed_his_drift_notified_if_watchdog()
+    assert calls == [1], "watchdog 機開機才載回去重狀態"
 
 
 # ── P2-03:改版通知去重持久化 + 無收件人不起緒 ───────────────────────────────
@@ -369,8 +431,10 @@ def test_failed_persist_stays_pending_no_resend_then_retries(monkeypatch):
 
 def test_drift_seed_wired_into_startup():
     src = open(main.__file__, encoding="utf-8").read()
-    assert '"canary-drift-seed", _seed_his_drift_notified_once' in src, \
-        "開機應背景載入已通知改版記錄(避免檔案 IO 落在熱鍵路徑)"
+    # [codex R1] 開機背景載入已通知改版記錄(避免檔案 IO 落在熱鍵路徑),但走 _if_watchdog
+    # 版:非 watchdog 機不 seed、不碰 his_drift_notified.json。
+    assert '"canary-drift-seed", _seed_his_drift_notified_if_watchdog' in src, \
+        "開機應背景載入已通知改版記錄,且受 watchdog gate 保護"
 
 
 def test_no_blocking_write_gate_anywhere():

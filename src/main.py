@@ -1991,6 +1991,31 @@ def _retry_pending_his_drift_persist(ver_key: str) -> None:
         logging.debug("[金絲雀] 持久化補寫緒啟動失敗(下次再試)", exc_info=True)
 
 
+# [2026-07-23 使用者] 金絲雀「HIS 改版」通知的寄件閘:只由【本機啟用 watchdog】的電腦寄出。
+_his_drift_watchdog_gate_logged = False
+
+
+def _watchdog_enabled_on_this_machine() -> bool:
+    """本機 watchdog 總開關(settings/watchdog_config.json 的 master_enabled)是否啟用。
+    讀取失敗一律回 False —— 保守:寧可這台不寄,也不要因讀取例外讓每台機器又都改回亂寄。"""
+    try:
+        from cmuh_common.watchdog_core import load_config as _wd_load
+        return bool(_wd_load().get("master_enabled", False))
+    except Exception:
+        logging.debug("[金絲雀] 讀 watchdog master_enabled 失敗 → 視為未啟用,不寄改版通知",
+                      exc_info=True)
+        return False
+
+
+def _seed_his_drift_notified_if_watchdog() -> None:
+    """[codex R1] 開機預載去重狀態的 watchdog gate。只有【本機啟用 watchdog】(=會寄改版通知
+    的機器)才需要把 his_drift_notified.json 載回記憶體;非 watchdog 機完全【不碰】該檔——不
+    seed、不會因壞檔被 safe_load_json_ex 改名成 .corrupt-*,與 _notify_his_drift 的寄件 gate
+    契約一致(非 watchdog 機不參與改版通知的任何持久化狀態)。"""
+    if _watchdog_enabled_on_this_machine():
+        _seed_his_drift_notified_once()
+
+
 def _notify_his_drift(verdict) -> None:
     """[金絲雀 2026-07-17 使用者定案] 偵測到 HIS 改版 → 【寄信通知一次】(每個現況版本只寄
     一次,避免洗版),但【不擋自動寫入、不跳警告視窗】。功能照常執行;醫師若發現異常會自行
@@ -2004,6 +2029,19 @@ def _notify_his_drift(verdict) -> None:
     [P2-03] 去重跨重啟持久化(_persist_his_drift_notified);key 含基線(_his_drift_notify_key)。
     無收件人時【不起緒】,只每版本記一次 log —— 否則沒設收件人時每次找視窗都堆一條立即結束
     的緒。"""
+    global _his_drift_watchdog_gate_logged
+    # [2026-07-23 使用者] 只有本機啟用 watchdog 才寄 HIS 改版通知。HIS 改版是【全域事件】,
+    # 每台診間機都會各自偵測到 → 不 gate 的話開發者信箱會被 N 台灌同一封信。watchdog
+    # master_enabled 是 per-machine opt-in(常開的那台主機才勾)→ 天然收斂成單一寄件來源。
+    # ★取捨:若那台 watchdog 機當下沒開,這封改版通知就沒人寄(使用者接受:寧可單一來源偶
+    # 爾漏,也不要 N 台狂寄)。★ 本機【本地】的偵測 warning(_sample_his_write_contract 的
+    # _his_canary_warned)不受影響,現場診斷仍在;此處被 gate 掉時另記一次 process 級 log。
+    if not _watchdog_enabled_on_this_machine():
+        if not _his_drift_watchdog_gate_logged:
+            _his_drift_watchdog_gate_logged = True
+            logging.info("[金絲雀] 偵測到 HIS 改版,但本機未啟用 watchdog → 不寄改版通知"
+                         "(由 watchdog 主機統一寄,避免多台重複灌信)。")
+        return
     if not _seed_his_drift_notified_once():        # 冪等;開機背景已載,這裡後備
         # [codex P2] 持久化去重狀態這次載不進來(檔案暫時被鎖)→ 本次【不寄】,避免把已通知
         # 的版本重寄。改版是持久狀態,下次找視窗會再試 seed,載到後才寄(頂多延後幾次)。
@@ -15630,8 +15668,10 @@ class AutomationApp:
 
         # [GPT-5.6 P2-03] 開機把「已通知改版版本」從磁碟載回記憶體 → 重啟後同一改版不重寄。
         # 早點做(400ms),趕在使用者按第一個 F 鍵、偵測到改版之前;檔案 IO 因此不落在熱鍵路徑。
+        # [codex R1 2026-07-23] 走 _if_watchdog 版:非 watchdog 機不寄改版通知,也就不需要(也
+        # 不該)碰 his_drift_notified.json;gate 判斷在背景緒做,不落主緒。
         self.root.after(400, lambda: _submit_startup_background(
-            "canary-drift-seed", _seed_his_drift_notified_once))
+            "canary-drift-seed", _seed_his_drift_notified_if_watchdog))
 
         # [O17] 啟動 30 秒後背景清理舊 cache、log 備份、tmp、過期 pyc
         try:
