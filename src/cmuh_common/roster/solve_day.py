@@ -13,12 +13,15 @@
   7 RestStep     還沒位子 → 放假（放假次數輪平均）
 
 先照光、再治療室，兩者各消耗 1 位 PGY，剩餘 PGY 才與 Clerk 一起進診間。
-決定性鐵律：一切輪選用 key=(次數, 上次輪到日期 or date.min, 代號) 取最小。
+決定性鐵律：一切輪選用 key=(次數, 決定性抖動, 代號) 取最小；抖動＝crc32(日期|時段|
+用途|代號)——同輸入恆同結果（可重跑重現），但逐日/逐時段變化 → 平手時打散，不會
+鎖死「同人固定同時段」的節拍（見 _jitter）。
 不硬塞：照光/治療室無 PGY、切片室開但無 Clerk → 記警告，不填（貪婪填充器無法硬性
 保證滿足，缺人時以警告呈現）。
 """
 from __future__ import annotations
 
+import zlib
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -31,10 +34,22 @@ REST = "放假"
 WED = 2
 
 
-def _pick(cands: list, count_map: dict, last_map: dict):
-    """公平輪選：次數最少 → 最久沒輪到 → 代號字典序（決定性）。"""
+def _jitter(d: date, session: str, purpose: str, code: str) -> int:
+    """[2026-07-23 使用者] 決定性抖動，取代舊的「最久沒輪到(LRU)」平手決勝。
+
+    LRU 在「每天早/午兩時段」的固定節拍下會形成穩定輪轉週期 → 鎖死成固定配對
+    （實測：2 位 PGY 時 A 永遠早上照光、B 永遠下午）。改用 crc32(日期|時段|用途|代號)：
+    主鍵仍是「次數」→ 整月每人次數照樣平均（spread ≤1 性質不變）；平手時逐日/逐時段
+    亂序打散，誰排早誰排午不再固定。非真亂數（不用 random/時鐘），同輸入恆同結果，
+    決定性鐵律不破（重排/回放/測試皆可重現）。"""
+    return zlib.crc32(f"{d.isoformat()}|{session}|{purpose}|{code}"
+                      .encode("utf-8"))
+
+
+def _pick(ctx: "SessionCtx", cands: list, count_map: dict, purpose: str):
+    """公平輪選：次數最少 → 決定性抖動 → 代號字典序（決定性；見 _jitter）。"""
     return min(cands, key=lambda p: (count_map.get(p, 0),
-                                     last_map.get(p, date.min), p))
+                                     _jitter(ctx.d, ctx.session, purpose, p), p))
 
 
 @dataclass
@@ -45,6 +60,8 @@ class FairCounters:
     rest: dict = field(default_factory=dict)         # 放假次數（PGY+Clerk）
     biopsy_done: dict = field(default_factory=dict)  # Clerk 本梯切片次數
     seat: dict = field(default_factory=dict)         # 診間就座次數（公平輪轉）
+    # last_*：最近一次輪到日期。[2026-07-23] 輪選 key 已改用 _jitter 平手決勝（LRU 會
+    # 鎖死固定配對），這些欄位保留作紀錄/回放資料，不再參與輪選。
     last_photo: dict = field(default_factory=dict)
     last_tx: dict = field(default_factory=dict)
     last_rest: dict = field(default_factory=dict)
@@ -86,9 +103,9 @@ class PhotoStep(FillStep):
         if ctx.wed_pm:                          # 週三下午：先比 photo_wed_pm 再比總次數
             pick = min(ctx.pgy, key=lambda p: (
                 fc.photo_wed_pm.get(p, 0), fc.photo_total.get(p, 0),
-                fc.last_photo.get(p, date.min), p))
+                _jitter(ctx.d, ctx.session, "photo", p), p))
         else:
-            pick = _pick(ctx.pgy, fc.photo_total, fc.last_photo)
+            pick = _pick(ctx, ctx.pgy, fc.photo_total, "photo")
         ctx.pgy.remove(pick)
         slots[PHOTO] = [pick]
         fc.photo_total[pick] = fc.photo_total.get(pick, 0) + 1
@@ -109,7 +126,7 @@ class TreatmentStep(FillStep):
             log.append(f"⚠ {ctx.session} 治療室無 PGY 可排（全請假？）")
             return
         fc = ctx.fc
-        pick = _pick(ctx.pgy, fc.tx_total, fc.last_tx)
+        pick = _pick(ctx, ctx.pgy, fc.tx_total, "tx")
         ctx.pgy.remove(pick)
         slots[TREATMENT] = [pick]
         fc.tx_total[pick] = fc.tx_total.get(pick, 0) + 1
@@ -130,7 +147,7 @@ class BiopsyStep(FillStep):
 
         def key(c):
             return (fc.biopsy_done.get((bk, c), 0),
-                    fc.last_biopsy.get((bk, c), date.min), c)
+                    _jitter(ctx.d, ctx.session, "biopsy", c), c)
         undone = [c for c in ctx.clerk if fc.biopsy_done.get((bk, c), 0) == 0]
         pick = min(undone or ctx.clerk, key=key)         # 本梯未輪過者優先
         ctx.clerk.remove(pick)
@@ -149,9 +166,9 @@ def _clerk_ck(ctx, c):
 
 
 def _seat(ctx, pool, room, ck):
-    """依 ck(人)命名空間的座位公平計數輪選並就座。"""
+    """依 ck(人)命名空間的座位公平計數輪選並就座（平手用決定性抖動，見 _jitter）。"""
     pick = min(pool, key=lambda p: (ctx.fc.seat.get(ck(ctx, p), 0),
-                                    ctx.fc.last_seat.get(ck(ctx, p), date.min), p))
+                                    _jitter(ctx.d, ctx.session, "seat", p), p))
     pool.remove(pick)
     ctx.room_slots[room].append(pick)
     k = ck(ctx, pick)

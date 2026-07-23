@@ -8,7 +8,7 @@
   3. format_course_stats：0 切片 Clerk 帶「未排切片」標記。
   4. 公平性釘位（使用者需求語意）：整月照光/治療室次數 spread ≤1、週三下午照光
      獨立 spread ≤1；切片室每人至少 1 次（時段足夠時）。
-  5. _day_cell_text：月曆總覽單日格摘要（純函式）。
+  5. _overview_cell_rows：月曆總覽單日格結構化列（純函式）。
 """
 import os
 import sys
@@ -22,7 +22,7 @@ from cmuh_common.roster.solve_day import (  # noqa: E402
     format_course_stats, month_solve_day, person_course_stats, solve_session,
 )
 from cmuh_common.roster.storage import RosterStorage  # noqa: E402
-from cmuh_common.roster.ui.day_tab import _day_cell_text  # noqa: E402
+from cmuh_common.roster.ui.day_tab import _overview_cell_rows  # noqa: E402
 
 WED_ISO = "2026-08-05"      # 2026/8/5 = 週三
 
@@ -195,19 +195,20 @@ def test_batch_every_clerk_gets_biopsy_when_enough_sessions():
         f"每位 Clerk 至少一次切片: {fc.biopsy_done}"
 
 
-# ─── 月曆總覽單日格（純函式）───────────────────────────────────────────────
-def test_day_cell_text_summary():
-    txt = _day_cell_text(date(2026, 8, 5), {
+# ─── 月曆總覽單日格結構化列（純函式）─────────────────────────────────────────
+def test_overview_cell_rows_structure_and_order():
+    rows = _overview_cell_rows({
         "上午": {PHOTO: ["A"], TREATMENT: ["B"], "101": ["C", "D"], REST: ["E"]},
         "下午": {PHOTO: ["F"]},
     })
-    assert txt.splitlines()[0].startswith("5")
-    assert "照:A" in txt and "治:B" in txt
-    assert "101:C、D" in txt
-    assert "休:E" in txt
-    assert "午 照:F" in txt
+    assert rows == [
+        ("上午", "photo", "照光", "A"),
+        ("上午", "tx", "治療", "B"),
+        ("上午", "room", "101", "C、D"),
+        ("上午", "rest", "休", "E"),
+        ("下午", "photo", "照光", "F"),
+    ]
 
 
-def test_day_cell_text_empty_sessions_omitted():
-    txt = _day_cell_text(date(2026, 8, 5), {})
-    assert txt.splitlines() == ["5（三）"]
+def test_overview_cell_rows_empty():
+    assert _overview_cell_rows({}) == []

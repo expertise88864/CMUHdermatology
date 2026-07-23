@@ -2,7 +2,7 @@
 """PGY/Clerk 開診格網 + 五步驟填充器（純函式，無 ortools）。"""
 import os
 import sys
-from datetime import date
+from datetime import date, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
@@ -49,14 +49,18 @@ def test_month_grid_self_paid_excluded_and_overrides():
 
 # ─── solve_session 五步驟 ───────────────────────────────────────────────────
 def test_no_clerk_month_columns_fill():
-    """無 Clerk：照光 1 PGY、治療室 1 PGY，其餘 PGY 逐欄填診。"""
+    """無 Clerk：照光 1 PGY、治療室 1 PGY，其餘 PGY 逐欄填診。
+    [2026-07-23] 平手決勝改決定性抖動（打散固定早/午配對）→ 不釘死誰在哪格，
+    只驗語意：四格各 1 人、四人不重複、無切片/放假。"""
     fc = FairCounters()
     slots, _log = solve_session(
         date(2026, 8, 3), "上午", ["101", "102"],
         pgy_avail=["A", "B", "C", "D"], clerk_avail=[],
         biopsy_open=False, fc=fc)
-    assert slots[PHOTO] == ["A"] and slots[TREATMENT] == ["B"]
-    assert slots["101"] == ["C"] and slots["102"] == ["D"]
+    assert len(slots[PHOTO]) == 1 and len(slots[TREATMENT]) == 1
+    assert len(slots["101"]) == 1 and len(slots["102"]) == 1
+    assigned = [*slots[PHOTO], *slots[TREATMENT], *slots["101"], *slots["102"]]
+    assert sorted(assigned) == ["A", "B", "C", "D"]          # 全上、不重複
     assert BIOPSY not in slots and REST not in slots
 
 
@@ -83,13 +87,25 @@ def test_fewer_clerks_than_rooms_pairs_first():
 
 def test_biopsy_assign_and_prefer_undone():
     fc = FairCounters()
+    fc.biopsy_done[("", "2")] = 1                            # "2" 本梯已輪過
     slots, _log = solve_session(
         date(2026, 8, 3), "上午", ["101"],
         pgy_avail=["A"], clerk_avail=["1", "2"],
         biopsy_open=True, fc=fc)
     assert slots[PHOTO] == ["A"]                             # 照光先吃掉唯一 PGY
-    assert slots[BIOPSY] == ["1"]                            # 未輪過者優先
+    assert slots[BIOPSY] == ["1"]                            # 未輪過者優先（不受抖動影響）
     assert slots["101"] == ["2"]
+
+
+def test_biopsy_fresh_pair_one_in_biopsy_one_in_room():
+    """兩位皆未輪過：切片取其一、另一位進診間（平手由決定性抖動決定，不釘死誰）。"""
+    fc = FairCounters()
+    slots, _log = solve_session(
+        date(2026, 8, 3), "上午", ["101"],
+        pgy_avail=["A"], clerk_avail=["1", "2"],
+        biopsy_open=True, fc=fc)
+    assert len(slots[BIOPSY]) == 1 and len(slots["101"]) == 1
+    assert sorted([*slots[BIOPSY], *slots["101"]]) == ["1", "2"]
 
 
 def test_biopsy_open_but_no_clerk_warns():
@@ -117,10 +133,12 @@ def test_wed_pm_photo_only():
     slots, _log = solve_session(
         date(2026, 8, 5), "下午", [],                        # 週三下午跟診關閉
         pgy_avail=["A", "B"], clerk_avail=[], biopsy_open=False, fc=fc)
-    assert slots[PHOTO] == ["A"]
+    picked = slots[PHOTO][0]
+    other = "B" if picked == "A" else "A"
+    assert picked in ("A", "B") and len(slots[PHOTO]) == 1
     assert TREATMENT not in slots                            # 週三下午治療室不排
-    assert fc.photo_wed_pm.get("A") == 1                     # 週三下午照光計數
-    assert slots[REST] == ["B"]                              # 沒位子 → 放假
+    assert fc.photo_wed_pm.get(picked) == 1                  # 週三下午照光計數
+    assert slots[REST] == [other]                            # 沒位子 → 放假
 
 
 def test_wed_pm_biopsy_forced_closed():
@@ -134,14 +152,22 @@ def test_wed_pm_biopsy_forced_closed():
 
 
 def test_capacity3_clerk_overflow_before_third_pgy():
-    """容量 3：照光+治療室各 1 PGY 後，診間第 3 位留給 Clerk overflow（非第 2 個 PGY）。"""
+    """容量 3：照光+治療室各 1 PGY 後，診間第 3 位留給 Clerk overflow（非第 2 個 PGY）。
+    [2026-07-23] 不釘死是哪位 PGY，驗結構：房內 = Clerk、PGY、Clerk（C-P-C）。"""
     fc = FairCounters()
     slots, _log = solve_session(
         date(2026, 8, 3), "上午", ["101"],
         pgy_avail=["A", "P1", "P2"], clerk_avail=["1", "2"],
         biopsy_open=False, fc=fc, capacity=3)
-    assert slots[PHOTO] == ["A"] and slots[TREATMENT] == ["P1"]
-    assert slots["101"] == ["1", "P2", "2"]                  # C, P(2nd), C(3rd 給 Clerk)
+    pgys = {"A", "P1", "P2"}
+    assert len(slots[PHOTO]) == 1 and slots[PHOTO][0] in pgys
+    assert len(slots[TREATMENT]) == 1 and slots[TREATMENT][0] in pgys
+    room = slots["101"]
+    assert len(room) == 3
+    assert room[0] in ("1", "2") and room[2] in ("1", "2")   # 1、3 位是 Clerk
+    assert room[1] in pgys                                    # 第 2 位是剩下的 PGY
+    assert sorted([slots[PHOTO][0], slots[TREATMENT][0], room[1]]) \
+        == sorted(pgys)                                       # 三位 PGY 全上、不重複
     assert REST not in slots
 
 
@@ -157,14 +183,14 @@ def test_photo_priority_over_treatment_when_scarce():
 
 
 def test_photo_fairness_rotates():
-    """照光每時段必排且輪平均：連續 3 時段輪 A→B→C。"""
+    """照光每時段必排且輪平均：連續 3 時段三人各輪 1 次（順序由抖動決定，不釘死）。"""
     fc = FairCounters()
     picks = []
     for _ in range(3):                                       # 連續 3 個時段
         slots, _l = solve_session(date(2026, 8, 3), "上午", [],
                                   ["A", "B", "C"], [], False, fc)
         picks.append(slots[PHOTO][0])
-    assert picks == ["A", "B", "C"]                          # 照光輪平均
+    assert sorted(picks) == ["A", "B", "C"]                  # 各 1 次 = 輪平均
 
 
 def test_determinism_same_input():
@@ -173,6 +199,30 @@ def test_determinism_same_input():
         return solve_session(date(2026, 8, 3), "上午", ["101", "102"],
                              ["A", "B", "C"], ["1", "2"], True, fc)[0]
     assert run() == run()
+
+
+def test_photo_not_fixed_to_same_session_over_month():
+    """[2026-07-23 使用者] 反固定配對：2 位 PGY 整月排班，早上照光不得永遠同一人
+    （舊 LRU 平手決勝在早/午雙時段節拍下會鎖死 A 恆早、B 恆午）；抖動打散後，
+    整月照光/治療室總次數仍平均（spread ≤1）。"""
+    pgy = ["A", "B"]
+    grid = {}
+    d = date(2026, 8, 3)
+    while d <= date(2026, 8, 28):
+        if d.weekday() < 5:
+            grid[d] = {"上午": ["101"],
+                       "下午": [] if d.weekday() == 2 else ["101"]}
+        d += timedelta(days=1)
+    day_slots, _log, _w = month_solve_day(DaySolveInput(
+        ym="2026-08", grid=grid, pgy_roster=pgy))
+    am = [s["上午"][PHOTO][0] for s in day_slots.values()
+          if PHOTO in (s.get("上午") or {})]
+    pm = [s["下午"][PHOTO][0] for s in day_slots.values()
+          if PHOTO in (s.get("下午") or {})]
+    assert len(set(am)) > 1, f"早上照光不得固定同一人: {am}"
+    assert len(set(pm)) > 1, f"下午照光不得固定同一人: {pm}"
+    totals = {p: (am + pm).count(p) for p in pgy}
+    assert abs(totals["A"] - totals["B"]) <= 1, f"整月照光仍需平均: {totals}"
 
 
 # ─── month_solve_day ────────────────────────────────────────────────────────

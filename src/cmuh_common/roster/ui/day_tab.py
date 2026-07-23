@@ -50,25 +50,37 @@ def _rooms_summary(slots: dict) -> str:
     return "  ".join(parts)
 
 
-def _day_cell_text(d: date, sessions: dict) -> str:
-    """[2026-07-23] 月曆總覽單日格文字（純函式）。sessions={session:{slot:[代號]}}。
-    每時段一行摘要（照/治/切）＋一行跟診房＋放假；空時段不輸出。"""
-    lines = [f"{d.day}（{_WD[d.weekday()]}）"]
-    for session, tag in (("上午", "早"), ("下午", "午")):
+def _overview_cell_rows(sessions: dict) -> list:
+    """[2026-07-23] 月曆總覽單日格的結構化列（純函式，供 UI 上色排版）。
+
+    sessions={session:{slot:[代號]}} → [(session, kind, label, people)]；
+    kind ∈ photo/tx/biopsy/room/rest（照/治/切固定順序在前，跟診房升冪，休最後）。
+    空時段不輸出。"""
+    out = []
+    for session in ("上午", "下午"):
         slots = sessions.get(session) or {}
-        if not slots:
-            continue
-        parts = [f"{lab}:{'、'.join(slots[key])}"
-                 for key, lab in ((PHOTO, "照"), (TREATMENT, "治"), (BIOPSY, "切"))
-                 if slots.get(key)]
-        lines.append(f"{tag} " + " ".join(parts) if parts else tag)
-        rooms = [f"{k}:{'、'.join(v)}" for k, v in sorted(slots.items())
-                 if k not in _SPECIAL_SLOTS and v]
-        if rooms:
-            lines.append("  " + " ".join(rooms))
+        for key, kind, lab in ((PHOTO, "photo", "照光"),
+                               (TREATMENT, "tx", "治療"),
+                               (BIOPSY, "biopsy", "切片")):
+            if slots.get(key):
+                out.append((session, kind, lab, "、".join(slots[key])))
+        for k in sorted(slots):
+            if k not in _SPECIAL_SLOTS and slots[k]:
+                out.append((session, "room", k, "、".join(slots[k])))
         if slots.get(REST):
-            lines.append("  休:" + "、".join(slots[REST]))
-    return "\n".join(lines)
+            out.append((session, "rest", "休", "、".join(slots[REST])))
+    return out
+
+
+# 總覽色籤配色（chip 底色, chip 字色）——淡底深字，一眼分得出角色
+_OVR_STYLE = {
+    "photo": ("#FFE9A8", "#7A5C00"),    # 照光=琥珀
+    "tx": ("#CDEBDC", "#1B6B45"),       # 治療室=綠
+    "biopsy": ("#E5D6F5", "#5E3B8C"),   # 切片室=紫
+    "room": ("#D6E6F7", "#1F4E8C"),     # 跟診房=藍
+    "rest": ("#EAEAEA", "#808080"),     # 放假=灰
+}
+_OVR_FONT = "Microsoft JhengHei UI"
 
 
 class DayScheduleTab(ttk.Frame):
@@ -414,49 +426,101 @@ class DayScheduleTab(ttk.Frame):
         t.pack(fill="both", expand=True, padx=6, pady=6)
         ttk.Button(win, text="關閉", command=win.destroy).pack(pady=(0, 6))
 
+    def _build_overview_cell(self, parent, d, sessions) -> tk.Frame:
+        """[2026-07-23 使用者美化] 單日卡片：日期標頭＋早/午分區＋角色色籤＋人名加粗。"""
+        weekend = d.weekday() >= 5
+        cell = tk.Frame(parent, bg="#FFFFFF", highlightthickness=1,
+                        highlightbackground="#C9CFD6")
+        hdr = tk.Label(cell, text=f"{d.day}（{_WD[d.weekday()]}）", anchor="w",
+                       bg=("#F3DDDD" if weekend else "#E7EDF4"),
+                       fg=("#8B2020" if weekend else "#2A3B50"),
+                       font=(_OVR_FONT, 10, "bold"), padx=6)
+        hdr.pack(fill="x")
+        rows = _overview_cell_rows(sessions)
+        if not rows:
+            tk.Label(cell, text="—", bg="#FFFFFF", fg="#BBBBBB",
+                     font=(_OVR_FONT, 10)).pack(anchor="w", padx=8, pady=2)
+            return cell
+        last_session = None
+        for session, kind, lab, people in rows:
+            row = tk.Frame(cell, bg="#FFFFFF")
+            row.pack(fill="x", padx=4, pady=1)
+            mark = ("早" if session == "上午" else "午") \
+                if session != last_session else ""
+            last_session = session
+            tk.Label(row, text=mark, width=2, bg="#FFFFFF",
+                     fg=("#B26500" if session == "上午" else "#1F4E8C"),
+                     font=(_OVR_FONT, 9, "bold")).pack(side="left")
+            chip_bg, chip_fg = _OVR_STYLE[kind]
+            tk.Label(row, text=lab, bg=chip_bg, fg=chip_fg, padx=4,
+                     font=(_OVR_FONT, 8, "bold")).pack(side="left")
+            tk.Label(row, text=people, bg="#FFFFFF", fg="#1A1A1A", padx=4,
+                     font=(_OVR_FONT, 10, "bold"), anchor="w",
+                     justify="left", wraplength=140).pack(side="left",
+                                                          fill="x", expand=True)
+        return cell
+
     def _on_overview(self) -> None:
         """[2026-07-23 使用者] 日排班月曆總覽：像 R/VS 分頁一樣按日期排的整月格狀檢視
-        （唯讀；每格＝當日早/午的照/治/切/跟診房/放假摘要）。"""
+        （唯讀；每格＝當日早/午的照/治/切/跟診房/放假，色籤卡片式呈現）。"""
         ym = self.app.ym
         y, m = int(ym[:4]), int(ym[5:7])
         day_slots = (self.service.storage.load_month(ym).get("day_slots") or {})
         win = tk.Toplevel(self)
         win.title(f"日排班月曆總覽 · {ym}")
         win.transient(self)
-        win.geometry("1180x760")
-        # 先 pack 底部按鈕/橫捲軸，再 pack expand 的 canvas（順序反了會被擠出視窗外）
+        win.geometry("1240x800")
+        # 先 pack 底部按鈕/橫捲軸/頂部圖例，再 pack expand 的 canvas
         ttk.Button(win, text="關閉", command=win.destroy).pack(side="bottom",
                                                               pady=4)
-        canvas = tk.Canvas(win, highlightthickness=0)
+        legend = tk.Frame(win)
+        legend.pack(side="top", fill="x", padx=8, pady=(6, 2))
+        tk.Label(legend, text=f"{y} 年 {m} 月", font=(_OVR_FONT, 12, "bold")
+                 ).pack(side="left", padx=(0, 12))
+        for kind, lab in (("photo", "照光"), ("tx", "治療室"),
+                          ("biopsy", "切片室"), ("room", "跟診"),
+                          ("rest", "放假")):
+            bg, fg = _OVR_STYLE[kind]
+            tk.Label(legend, text=lab, bg=bg, fg=fg, padx=6,
+                     font=(_OVR_FONT, 9, "bold")).pack(side="left", padx=3)
+        canvas = tk.Canvas(win, highlightthickness=0, bg="#F7F8FA")
         vsb = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
-        # [codex P2] 7 欄×寬24字元可能超過視窗寬（依字型度量）→ 沒有橫捲軸時最右欄
-        # 會被裁掉看不到。加水平捲軸讓所有欄位可達。
+        # [codex P2] 欄寬可能超過視窗寬（依字型度量）→ 加水平捲軸讓所有欄位可達。
         hsb = ttk.Scrollbar(win, orient="horizontal", command=canvas.xview)
         hsb.pack(side="bottom", fill="x")
-        body = ttk.Frame(canvas)
+        body = tk.Frame(canvas, bg="#F7F8FA")
         body.bind("<Configure>",
                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=body, anchor="nw")
         canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         canvas.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
+
+        # 滑鼠滾輪捲動。[codex P2] 綁在本 Toplevel（子元件事件經 bindtags 冒泡到本窗）
+        # 而非 bind_all/unbind_all——全域綁定在關窗解綁時會把別處（主視窗/另一個總覽窗）
+        # 的滾輪 handler 一併清掉。綁本窗＝作用域天然限定、關窗自動消失。
+        def _wheel(ev):
+            try:
+                canvas.yview_scroll(-1 if ev.delta > 0 else 1, "units")
+            except tk.TclError:
+                pass
+        win.bind("<MouseWheel>", _wheel)
+
         for c, h in enumerate(WEEKDAY_HEADERS):
-            ttk.Label(body, text=h, anchor="center",
-                      foreground="#B00" if c >= 5 else "#000").grid(
-                row=0, column=c, sticky="nsew", padx=1, pady=1)
+            tk.Label(body, text=h, anchor="center", bg="#F7F8FA",
+                     font=(_OVR_FONT, 10, "bold"),
+                     fg="#B00020" if c >= 5 else "#2A3B50").grid(
+                row=0, column=c, sticky="nsew", padx=2, pady=(2, 4))
         for r, week in enumerate(calendar_matrix(y, m), start=1):
             for c, d in enumerate(week):
                 if d is None:
-                    tk.Frame(body).grid(row=r, column=c)
+                    tk.Frame(body, bg="#F7F8FA").grid(row=r, column=c)
                     continue
-                text = _day_cell_text(d, day_slots.get(d.isoformat()) or {})
-                bg = "#F1F1F1" if d.weekday() >= 5 else "#FFFFFF"
-                tk.Label(body, text=text, bg=bg, anchor="nw", justify="left",
-                         relief="ridge", width=24, wraplength=178,
-                         font=("Microsoft JhengHei UI", 9)).grid(
-                    row=r, column=c, sticky="nsew", padx=1, pady=1)
+                cell = self._build_overview_cell(
+                    body, d, day_slots.get(d.isoformat()) or {})
+                cell.grid(row=r, column=c, sticky="nsew", padx=2, pady=2)
         for c in range(7):
-            body.columnconfigure(c, weight=1)
+            body.columnconfigure(c, weight=1, minsize=172)
 
     def _on_export(self) -> None:
         """[RS-01] 匯出整月班表（R/VS 月曆 + PGY/Clerk 日排班）。副檔名決定 Excel/Word；
