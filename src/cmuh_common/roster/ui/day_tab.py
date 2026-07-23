@@ -125,10 +125,16 @@ class DayScheduleTab(ttk.Frame):
             pb = ttk.Button(bar, text="當月 PGY 人員…", command=self._edit_pgy_roster)
             pb.pack(side="left", padx=4)
             self._edit_btns.append(pb)
+            # [2026-07-23 使用者] Apply 本科 PGY（101 診週二/週五平手優先）
+            ab = ttk.Button(bar, text="Apply本科…", command=self._edit_apply_pref)
+            ab.pack(side="left", padx=4)
+            self._edit_btns.append(ab)
         ttk.Button(bar, text="報告/警告", command=self._on_report
                    ).pack(side="left", padx=4)
-        ttk.Button(bar, text="月曆總覽", command=self._on_overview
-                   ).pack(side="left", padx=4)
+        # [2026-07-23 使用者] 月曆總覽改為分頁內建預設檢視;此鈕切換 列表↔月曆
+        self._view_btn = ttk.Button(bar, text="切換列表檢視",
+                                    command=self._on_toggle_view)
+        self._view_btn.pack(side="left", padx=4)
         ttk.Button(bar, text="匯出", command=self._on_export).pack(side="left", padx=4)
         self._final_var = tk.BooleanVar(value=False)
         self._final_chk = ttk.Checkbutton(
@@ -136,24 +142,69 @@ class DayScheduleTab(ttk.Frame):
         self._final_chk.pack(side="left", padx=12)
 
     def _build_grid(self, parent) -> None:
+        """中央區＝兩個可切換檢視：月曆總覽（預設；2026-07-23 使用者：比較少看列表）
+        與列表（鎖定/雙擊編輯用，按「切換列表檢視」叫出）。"""
         wrap = ttk.Frame(parent)
         wrap.pack(side="left", fill="both", expand=True)
+        # ── 列表檢視（預設隱藏）─────────────────────────────────────────
+        self._list_wrap = ttk.Frame(wrap)
         cols = ("date", "session", "lock", "photo", "tx", "biopsy", "rooms", "rest")
         heads = {"date": "日期", "session": "時段", "lock": "鎖",
                  "photo": "照光", "tx": "治療室", "biopsy": "切片室",
                  "rooms": "跟診診間", "rest": "放假"}
         widths = {"date": 90, "session": 44, "lock": 32, "photo": 60, "tx": 60,
                   "biopsy": 60, "rooms": 200, "rest": 90}
-        self._tree = ttk.Treeview(wrap, columns=cols, show="headings", height=22)
+        self._tree = ttk.Treeview(self._list_wrap, columns=cols,
+                                  show="headings", height=22)
         for c in cols:
             self._tree.heading(c, text=heads[c])
             self._tree.column(c, width=widths[c],
                               anchor="w" if c == "rooms" else "center")
-        vsb = ttk.Scrollbar(wrap, orient="vertical", command=self._tree.yview)
+        vsb = ttk.Scrollbar(self._list_wrap, orient="vertical",
+                            command=self._tree.yview)
         self._tree.configure(yscrollcommand=vsb.set)
         self._tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
         self._tree.bind("<Double-1>", self._on_edit_row)
+        # ── 月曆總覽檢視（預設顯示；refresh 時重繪）───────────────────────
+        self._cal_wrap = ttk.Frame(wrap)
+        self._cal_canvas = tk.Canvas(self._cal_wrap, highlightthickness=0,
+                                     bg="#F7F8FA")
+        cvsb = ttk.Scrollbar(self._cal_wrap, orient="vertical",
+                             command=self._cal_canvas.yview)
+        chsb = ttk.Scrollbar(self._cal_wrap, orient="horizontal",
+                             command=self._cal_canvas.xview)
+        chsb.pack(side="bottom", fill="x")
+        self._cal_body = tk.Frame(self._cal_canvas, bg="#F7F8FA")
+        self._cal_body.bind(
+            "<Configure>",
+            lambda e: self._cal_canvas.configure(
+                scrollregion=self._cal_canvas.bbox("all")))
+        self._cal_canvas.create_window((0, 0), window=self._cal_body,
+                                       anchor="nw")
+        self._cal_canvas.configure(yscrollcommand=cvsb.set,
+                                   xscrollcommand=chsb.set)
+        self._cal_canvas.pack(side="left", fill="both", expand=True)
+        cvsb.pack(side="right", fill="y")
+        self._view_mode = "cal"
+        self._cal_wrap.pack(fill="both", expand=True)
+
+    def _show_view(self, mode: str) -> None:
+        """切換中央檢視：'cal'=月曆總覽（預設）、'list'=列表（鎖定/編輯用）。"""
+        if mode == self._view_mode:
+            return
+        if mode == "cal":
+            self._list_wrap.pack_forget()
+            self._cal_wrap.pack(fill="both", expand=True)
+            self._view_btn.config(text="切換列表檢視")
+        else:
+            self._cal_wrap.pack_forget()
+            self._list_wrap.pack(fill="both", expand=True)
+            self._view_btn.config(text="切換月曆檢視")
+        self._view_mode = mode
+
+    def _on_toggle_view(self) -> None:
+        self._show_view("list" if self._view_mode == "cal" else "cal")
 
     def _build_side(self, parent) -> None:
         side = ttk.Frame(parent, width=250)
@@ -226,6 +277,10 @@ class DayScheduleTab(ttk.Frame):
             self._refresh_stats()
         except Exception:
             logging.debug("[roster.ui] 週期統計刷新失敗", exc_info=True)
+        try:
+            self._render_calendar(day_slots)
+        except Exception:
+            logging.debug("[roster.ui] 月曆總覽重繪失敗", exc_info=True)
 
     def _refresh_stats(self) -> None:
         """[2026-07-23] 側欄週期次數統計（吃存檔 day_slots，含手動改過的格）。"""
@@ -333,6 +388,7 @@ class DayScheduleTab(ttk.Frame):
             win.destroy()
             self.refresh()
             self._refresh_warnings(warnings)
+            self._show_view("cal")   # [2026-07-23 使用者] 套用後直接顯示月曆總覽
         ttk.Button(bar, text="套用", command=apply).pack(side="right", padx=6)
         ttk.Button(bar, text="取消", command=win.destroy).pack(side="right")
         win.grab_set()
@@ -342,6 +398,9 @@ class DayScheduleTab(ttk.Frame):
             return
         sel = self._tree.selection()
         if not sel or "|" not in sel[0]:
+            if self._view_mode == "cal":     # 月曆檢視無法選取 → 提示切列表
+                messagebox.showinfo(
+                    "鎖定", "請先按「切換列表檢視」，在列表中選取要鎖定/解鎖的時段")
             return
         iso, session = sel[0].split("|", 1)
         d = date.fromisoformat(iso)
@@ -404,6 +463,51 @@ class DayScheduleTab(ttk.Frame):
         self.service.set_pgy_month_roster(self.app.ym, _split_codes(val))
         self.refresh()
 
+    def _edit_apply_pref(self) -> None:
+        """[2026-07-23 使用者] 勾選本月「Apply 本科」PGY（至多 2 位）：自動排班時
+        週二/週五早午的 101 診在【次數平手時】優先排這些人（公平最優先）。"""
+        if self._finalized:
+            return
+        roster = [m["id"] for m in self._roster_members()]
+        if not roster:
+            messagebox.showinfo("Apply本科", "本月沒有 PGY 人員（先設定當月 PGY）")
+            return
+        cur = set((self.service.storage.load_month(self.app.ym)
+                   .get("pgy_apply_pref")) or [])
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Apply 本科 PGY · {self.app.ym}")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        ttk.Label(dlg, padding=8, justify="left",
+                  text="勾選有意 Apply 本科的 PGY（至多 2 位）：\n"
+                       "自動排班時，週二/週五（早午）的 101 診跟診會在\n"
+                       "【次數平手時】優先排入勾選者。\n"
+                       "公平第一：整月各項次數平均、請假優先，偏好只是最後的平手決勝。"
+                  ).pack(anchor="w")
+        vars_ = {}
+        for c in roster:
+            v = tk.BooleanVar(value=(c in cur))
+            ttk.Checkbutton(dlg, text=c, variable=v).pack(anchor="w", padx=16)
+            vars_[c] = v
+
+        def ok():
+            picked = [c for c, v in vars_.items() if v.get()]
+            if len(picked) > 2:
+                messagebox.showwarning("Apply本科", "最多選 2 位", parent=dlg)
+                return
+            try:
+                self.service.set_pgy_apply_pref(self.app.ym, picked)
+            except Exception as e:  # noqa: BLE001
+                messagebox.showerror("儲存失敗", str(e), parent=dlg)
+                return
+            dlg.destroy()
+            self.refresh()
+        bar = ttk.Frame(dlg)
+        bar.pack(pady=8)
+        ttk.Button(bar, text="確定", command=ok).pack(side="left", padx=6)
+        ttk.Button(bar, text="取消", command=dlg.destroy).pack(side="left", padx=6)
+        dlg.grab_set()
+
     def _on_edit_row(self, _event) -> None:
         if self._finalized:
             return
@@ -460,58 +564,31 @@ class DayScheduleTab(ttk.Frame):
                                                           fill="x", expand=True)
         return cell
 
-    def _on_overview(self) -> None:
-        """[2026-07-23 使用者] 日排班月曆總覽：像 R/VS 分頁一樣按日期排的整月格狀檢視
-        （唯讀；每格＝當日早/午的照/治/切/跟診房/放假，色籤卡片式呈現）。"""
+    def _render_calendar(self, day_slots: dict) -> None:
+        """[2026-07-23 使用者] 內嵌月曆總覽（分頁預設檢視）：整月色籤卡片格狀重繪。
+        頂列＝月份＋色籤圖例；每格＝當日早/午的照/治/切/跟診房/放假。"""
         ym = self.app.ym
         y, m = int(ym[:4]), int(ym[5:7])
-        day_slots = (self.service.storage.load_month(ym).get("day_slots") or {})
-        win = tk.Toplevel(self)
-        win.title(f"日排班月曆總覽 · {ym}")
-        win.transient(self)
-        win.geometry("1240x800")
-        # 先 pack 底部按鈕/橫捲軸/頂部圖例，再 pack expand 的 canvas
-        ttk.Button(win, text="關閉", command=win.destroy).pack(side="bottom",
-                                                              pady=4)
-        legend = tk.Frame(win)
-        legend.pack(side="top", fill="x", padx=8, pady=(6, 2))
-        tk.Label(legend, text=f"{y} 年 {m} 月", font=(_OVR_FONT, 12, "bold")
-                 ).pack(side="left", padx=(0, 12))
+        body = self._cal_body
+        for w in body.winfo_children():
+            w.destroy()
+        legend = tk.Frame(body, bg="#F7F8FA")
+        legend.grid(row=0, column=0, columnspan=7, sticky="w",
+                    padx=4, pady=(4, 2))
+        tk.Label(legend, text=f"{y} 年 {m} 月", bg="#F7F8FA",
+                 font=(_OVR_FONT, 12, "bold")).pack(side="left", padx=(0, 12))
         for kind, lab in (("photo", "照光"), ("tx", "治療室"),
                           ("biopsy", "切片室"), ("room", "跟診"),
                           ("rest", "放假")):
             bg, fg = _OVR_STYLE[kind]
             tk.Label(legend, text=lab, bg=bg, fg=fg, padx=6,
                      font=(_OVR_FONT, 9, "bold")).pack(side="left", padx=3)
-        canvas = tk.Canvas(win, highlightthickness=0, bg="#F7F8FA")
-        vsb = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
-        # [codex P2] 欄寬可能超過視窗寬（依字型度量）→ 加水平捲軸讓所有欄位可達。
-        hsb = ttk.Scrollbar(win, orient="horizontal", command=canvas.xview)
-        hsb.pack(side="bottom", fill="x")
-        body = tk.Frame(canvas, bg="#F7F8FA")
-        body.bind("<Configure>",
-                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=body, anchor="nw")
-        canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
-
-        # 滑鼠滾輪捲動。[codex P2] 綁在本 Toplevel（子元件事件經 bindtags 冒泡到本窗）
-        # 而非 bind_all/unbind_all——全域綁定在關窗解綁時會把別處（主視窗/另一個總覽窗）
-        # 的滾輪 handler 一併清掉。綁本窗＝作用域天然限定、關窗自動消失。
-        def _wheel(ev):
-            try:
-                canvas.yview_scroll(-1 if ev.delta > 0 else 1, "units")
-            except tk.TclError:
-                pass
-        win.bind("<MouseWheel>", _wheel)
-
         for c, h in enumerate(WEEKDAY_HEADERS):
             tk.Label(body, text=h, anchor="center", bg="#F7F8FA",
                      font=(_OVR_FONT, 10, "bold"),
                      fg="#B00020" if c >= 5 else "#2A3B50").grid(
-                row=0, column=c, sticky="nsew", padx=2, pady=(2, 4))
-        for r, week in enumerate(calendar_matrix(y, m), start=1):
+                row=1, column=c, sticky="nsew", padx=2, pady=(2, 4))
+        for r, week in enumerate(calendar_matrix(y, m), start=2):
             for c, d in enumerate(week):
                 if d is None:
                     tk.Frame(body, bg="#F7F8FA").grid(row=r, column=c)

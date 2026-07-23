@@ -271,7 +271,8 @@ class RosterService:
             ym=ym, grid=grid, pgy_roster=list(pgy_roster),
             clerk_batches=covering, biopsy_open=biopsy_open, leaves=leaves,
             capacity=RosterParams.from_config(cfg).room_capacity, locked=locked,
-            prior_sessions=prior_sessions, prior_pgy=prior_pgy)
+            prior_sessions=prior_sessions, prior_pgy=prior_pgy,
+            apply_pref={str(c) for c in (month.get("pgy_apply_pref") or [])})
 
     def run_day_solve(self, ym: str) -> tuple:
         """build_day_input → month_solve_day。回 (day_slots, log, warnings)，不落地。"""
@@ -439,6 +440,19 @@ class RosterService:
     def set_pgy_month_roster(self, ym: str, codes) -> None:
         month = self.storage.load_month(ym)
         month["pgy_month_roster"] = [str(c) for c in codes]
+        self.storage.save_month(ym, month)
+
+    def set_pgy_apply_pref(self, ym: str, codes) -> None:
+        """[2026-07-23 使用者] 設定本月「Apply 本科」PGY（至多 2 位）：自動排班時，
+        週二/週五早午的 101 診跟診在【座位次數平手時】優先排這些人（公平最優先，
+        偏好只是最後的平手決勝）。"""
+        codes = [str(c) for c in codes]
+        if len(codes) > 2:
+            raise ValueError("Apply 本科優先最多選 2 位")
+        month = self.storage.load_month(ym)
+        old = month.get("pgy_apply_pref")
+        month["pgy_apply_pref"] = codes
+        self._audit(month, "pgy", f"{ym} apply_pref", old, codes, "manual")
         self.storage.save_month(ym, month)
 
     def toggle_day_lock(self, ym: str, d: date, session: str) -> bool:

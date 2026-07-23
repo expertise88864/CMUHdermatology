@@ -212,3 +212,16 @@ def test_overview_cell_rows_structure_and_order():
 
 def test_overview_cell_rows_empty():
     assert _overview_cell_rows({}) == []
+
+
+# ─── Apply 本科（service 層 round-trip）───────────────────────────────────────
+def test_set_pgy_apply_pref_roundtrip_and_limit(tmp_path):
+    import pytest
+    svc, st = _svc(tmp_path)
+    svc.set_pgy_apply_pref("2026-08", ["P1", "P2"])
+    assert st.load_month("2026-08")["pgy_apply_pref"] == ["P1", "P2"]
+    assert svc.build_day_input("2026-08").apply_pref == {"P1", "P2"}
+    with pytest.raises(ValueError, match="最多選 2"):
+        svc.set_pgy_apply_pref("2026-08", ["P1", "P2", "P3"])
+    svc.set_pgy_apply_pref("2026-08", [])                    # 清空
+    assert svc.build_day_input("2026-08").apply_pref == set()

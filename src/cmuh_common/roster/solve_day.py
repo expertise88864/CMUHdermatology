@@ -33,6 +33,13 @@ BIOPSY = "切片室"
 REST = "放假"
 WED = 2
 
+# [2026-07-23 使用者] 「Apply 本科」PGY 優先偏好：勾選的 PGY（至多 2 位）在
+# 週二/週五（weekday 1/4）早午的 101 診跟診「優先安排」。公平最優先——偏好只做
+# 座位輪選的【平手決勝】（排在座位次數之後、抖動之前），次數落後者永遠先補，
+# 整月跟診次數 spread ≤1 性質不變；請假者本來就不在候選內。
+APPLY_PREF_ROOM = "101"
+APPLY_PREF_WEEKDAYS = (1, 4)          # 週二、週五（早午時段皆適用）
+
 
 def _jitter(d: date, session: str, purpose: str, code: str) -> int:
     """[2026-07-23 使用者] 決定性抖動，取代舊的「最久沒輪到(LRU)」平手決勝。
@@ -81,10 +88,18 @@ class SessionCtx:
     fc: FairCounters
     room_slots: dict = field(default_factory=dict)
     batch_key: str = ""               # 切片輪替以「梯次」為單位（代號跨梯會重用）
+    apply_pref: frozenset = frozenset()   # Apply 本科 PGY（101 診週二/週五平手優先）
 
     @property
     def wed_pm(self) -> bool:
         return self.d.weekday() == WED and self.session == "下午"
+
+    def room_pref(self, room) -> frozenset:
+        """該房此時段的「平手優先」集合：僅 101 診且週二/週五時＝apply_pref，其餘空。"""
+        if (str(room).strip() == APPLY_PREF_ROOM
+                and self.d.weekday() in APPLY_PREF_WEEKDAYS):
+            return self.apply_pref
+        return frozenset()
 
 
 class FillStep:
@@ -165,9 +180,13 @@ def _clerk_ck(ctx, c):
     return ("clerk", ctx.batch_key, c)   # Clerk 代號跨梯會重用 → 依梯次命名空間
 
 
-def _seat(ctx, pool, room, ck):
-    """依 ck(人)命名空間的座位公平計數輪選並就座（平手用決定性抖動，見 _jitter）。"""
+def _seat(ctx, pool, room, ck, prefer: frozenset = frozenset()):
+    """依 ck(人)命名空間的座位公平計數輪選並就座。
+
+    key＝(座位次數, 非偏好者, 抖動, 代號)：次數最少者恆優先（公平第一）；次數平手時
+    prefer 集合內的人先上（Apply 本科 101 診週二/週五）；再平手才由決定性抖動打散。"""
     pick = min(pool, key=lambda p: (ctx.fc.seat.get(ck(ctx, p), 0),
+                                    0 if p in prefer else 1,
                                     _jitter(ctx.d, ctx.session, "seat", p), p))
     pool.remove(pick)
     ctx.room_slots[room].append(pick)
@@ -193,7 +212,7 @@ class PgyMixStep(FillStep):
             if not ctx.pgy:
                 return
             if len(ctx.room_slots[r]) == 1 < ctx.capacity:
-                _seat(ctx, ctx.pgy, r, _pgy_ck)
+                _seat(ctx, ctx.pgy, r, _pgy_ck, prefer=ctx.room_pref(r))
         # (b) 再填空診間的第 1、2 位（PGY 只優先到第 2 位；第 3 位起留給 Clerk
         #     overflow — 見 §3.6 步驟 4/5）。無 Clerk 月即由此直填診間。
         for slot in range(min(ctx.capacity, 2)):
@@ -201,7 +220,7 @@ class PgyMixStep(FillStep):
                 if not ctx.pgy:
                     return
                 if len(ctx.room_slots[r]) == slot:
-                    _seat(ctx, ctx.pgy, r, _pgy_ck)
+                    _seat(ctx, ctx.pgy, r, _pgy_ck, prefer=ctx.room_pref(r))
 
 
 class ClerkOverflowStep(FillStep):
@@ -234,13 +253,15 @@ PIPELINE = [PhotoStep(), TreatmentStep(), BiopsyStep(), ClerkSeedStep(),
 
 def solve_session(d: date, session: str, rooms: list, pgy_avail: list,
                   clerk_avail: list, biopsy_open: bool, fc: FairCounters,
-                  capacity: int = 2, pipeline=None, batch_key: str = "") -> tuple:
+                  capacity: int = 2, pipeline=None, batch_key: str = "",
+                  apply_pref=frozenset()) -> tuple:
     """單一時段填充 → (slots, log)。slots: {房/治療室/切片室/放假: [代號,...]}。"""
     ctx = SessionCtx(
         d=d, session=session, rooms=sorted(rooms),
         pgy=sorted(pgy_avail), clerk=sorted(clerk_avail),
         biopsy_open=biopsy_open, capacity=capacity, fc=fc,
-        room_slots={r: [] for r in sorted(rooms)}, batch_key=batch_key)
+        room_slots={r: [] for r in sorted(rooms)}, batch_key=batch_key,
+        apply_pref=frozenset(apply_pref))
     slots: dict = {}
     log: list = []
     for step in (pipeline or PIPELINE):
@@ -264,6 +285,7 @@ class DaySolveInput:
     # RF-09 跨月梯次延續：上月屬某跨月梯次的既存 day_slots（只餵切片/clerk 公平計數）
     prior_sessions: dict = field(default_factory=dict)  # {iso: {session: slots}}
     prior_pgy: set = field(default_factory=set)          # 上月 PGY 代號（從 replay 剔除）
+    apply_pref: set = field(default_factory=set)  # Apply 本科 PGY（101 週二/五平手優先）
 
 
 def _avail(roster: list, leave_map: dict, d: date) -> list:
@@ -405,7 +427,8 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
                 d, session, rooms,
                 _avail(inp.pgy_roster, pgy_leave, d),
                 _avail(clerk_members, clerk_leave, d),
-                biopsy, fc, inp.capacity, batch_key=batch_key)
+                biopsy, fc, inp.capacity, batch_key=batch_key,
+                apply_pref=inp.apply_pref)
             day_slots.setdefault(iso, {})[session] = slots
             log.append(f"{d.month}/{d.day}({'一二三四五六日'[d.weekday()]}) "
                        + "；".join(slog))

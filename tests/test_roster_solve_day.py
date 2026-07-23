@@ -378,3 +378,50 @@ def test_rf10_replay_counters_skips_unknown_codes():
     assert fc.tx_total.get("A") == 1                          # 治療室仍計數
     assert ("b2", "Zstale") not in fc.biopsy_done             # 換梯代號不污染切片
     assert ("clerk", "b2", "9") not in fc.seat               # 未知代號不佔座位計數
+
+
+# ─── Apply 本科優先（2026-07-23 使用者）────────────────────────────────────────
+def test_apply_pref_wins_ties_on_tue_fri_101():
+    """勾選者在週二/週五的 101 診【次數平手時】恆優先（壓過抖動，跨多個日期驗證）。"""
+    from cmuh_common.roster.solve_day import PgyMixStep, SessionCtx
+    for iso in ("2026-08-04", "2026-08-07", "2026-08-11", "2026-08-14",
+                "2026-08-18", "2026-08-21"):                 # 二/五 交錯
+        for session in ("上午", "下午"):
+            fc = FairCounters()
+            ctx = SessionCtx(
+                d=date.fromisoformat(iso), session=session, rooms=["101"],
+                pgy=["A", "B"], clerk=[], biopsy_open=False, capacity=2,
+                fc=fc, room_slots={"101": []}, apply_pref=frozenset({"B"}))
+            PgyMixStep().run(ctx, {}, [])
+            assert ctx.room_slots["101"][0] == "B", \
+                f"{iso} {session}: 平手時 Apply 者應先進 101"
+
+
+def test_apply_pref_never_beats_fairness():
+    """公平第一：Apply 者座位次數落後才輪得到別人？——反向：Apply 者次數【較多】時,
+    次數較少者恆先上（偏好不得壓過次數）。"""
+    from cmuh_common.roster.solve_day import PgyMixStep, SessionCtx
+    fc = FairCounters()
+    fc.seat[("pgy", "B")] = 1                               # Apply 者已多坐過一次
+    ctx = SessionCtx(
+        d=date(2026, 8, 4), session="上午", rooms=["101"],
+        pgy=["A", "B"], clerk=[], biopsy_open=False, capacity=2,
+        fc=fc, room_slots={"101": []}, apply_pref=frozenset({"B"}))
+    PgyMixStep().run(ctx, {}, [])
+    assert ctx.room_slots["101"][0] == "A", "次數較少者恆優先（公平>偏好）"
+
+
+def test_apply_pref_only_tue_fri_101():
+    """偏好只作用在 週二/週五 × 101：其他日/其他房 room_pref 為空。"""
+    from cmuh_common.roster.solve_day import SessionCtx
+    fc = FairCounters()
+
+    def ctx_for(iso, room):
+        return SessionCtx(d=date.fromisoformat(iso), session="上午",
+                          rooms=[room], pgy=[], clerk=[], biopsy_open=False,
+                          capacity=2, fc=fc, room_slots={room: []},
+                          apply_pref=frozenset({"B"}))
+    assert ctx_for("2026-08-04", "101").room_pref("101") == {"B"}   # 週二 101
+    assert ctx_for("2026-08-07", "101").room_pref("101") == {"B"}   # 週五 101
+    assert ctx_for("2026-08-05", "101").room_pref("101") == frozenset()  # 週三
+    assert ctx_for("2026-08-04", "102").room_pref("102") == frozenset()  # 別房

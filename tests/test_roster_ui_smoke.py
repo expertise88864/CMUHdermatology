@@ -500,3 +500,17 @@ def test_rs01_day_tab_export_cancel_no_crash(root, tmp_path, monkeypatch):
     root.update()
     monkeypatch.setattr(day_mod.filedialog, "asksaveasfilename", lambda **k: "")
     tab._on_export()      # 取消 → 不應拋例外
+
+
+def test_day_tab_default_calendar_view_and_toggle(root, tmp_path):
+    """[2026-07-23 使用者] 預設檢視＝月曆總覽（比較少看列表）；按鈕切換列表↔月曆。"""
+    svc = _svc(tmp_path)
+    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    assert tab._view_mode == "cal"                         # 預設月曆
+    assert tab._cal_body.winfo_children()                  # 月曆已繪（圖例+表頭+格）
+    tab._on_toggle_view()
+    assert tab._view_mode == "list"
+    tab._on_toggle_view()
+    assert tab._view_mode == "cal"
