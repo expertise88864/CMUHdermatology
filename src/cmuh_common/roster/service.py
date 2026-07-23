@@ -34,6 +34,7 @@ from cmuh_common.roster.model import (
 )
 from cmuh_common.roster.solve_day import (
     BIOPSY, PHOTO, REST, TREATMENT, DaySolveInput, month_solve_day,
+    person_course_stats,
 )
 from cmuh_common.roster.report import build_report
 from cmuh_common.roster.rules import Precheck, collect_directives, run_prechecks
@@ -276,14 +277,11 @@ class RosterService:
         """build_day_input → month_solve_day。回 (day_slots, log, warnings)，不落地。"""
         return month_solve_day(self.build_day_input(ym))
 
-    def accept_day_solution(self, ym: str, day_slots: dict,
-                            report: "str | None" = None) -> None:
-        month = self.storage.load_month(ym)
-        if month.get("finalized"):
-            raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能套用")
-        # RF-04：落地前把「目前月檔中鎖定且有內容」的時段強制併回，不信任呼叫端帶來的
-        # day_slots 對鎖定時段的處置——掉出開診格網（如事後加假日）的鎖定日不會出現在
-        # solver 輸出，若整批覆蓋會靜默刪除鎖定內容並留幽靈鎖。淺拷貝勿改呼叫端 preview。
+    @staticmethod
+    def _overlay_locked_sessions(month: dict, day_slots: dict) -> dict:
+        """RF-04：把月檔中「鎖定且有內容」的時段強制蓋回 day_slots（淺拷貝，不改輸入）。
+        掉出開診格網（如事後加假日）的鎖定日不會出現在 solver 輸出，若整批覆蓋會靜默刪除
+        鎖定內容並留幽靈鎖。accept 與預覽統計共用（[codex P2] 報告統計必須＝實際落地內容）。"""
         day_slots = {iso: dict(sess) for iso, sess in (day_slots or {}).items()}
         cur = month.get("day_slots") or {}
         for iso, sessions in (month.get("day_locks") or {}).items():
@@ -291,7 +289,18 @@ class RosterService:
                 kept = (cur.get(iso) or {}).get(session)
                 if on and kept is not None:
                     day_slots.setdefault(iso, {})[session] = kept
-        month["day_slots"] = day_slots
+        return day_slots
+
+    def day_slots_with_locks(self, ym: str, day_slots: dict) -> dict:
+        """預覽統計用：回傳與 accept_day_solution 相同「鎖定合併」後的 day_slots。"""
+        return self._overlay_locked_sessions(self.storage.load_month(ym), day_slots)
+
+    def accept_day_solution(self, ym: str, day_slots: dict,
+                            report: "str | None" = None) -> None:
+        month = self.storage.load_month(ym)
+        if month.get("finalized"):
+            raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能套用")
+        month["day_slots"] = self._overlay_locked_sessions(month, day_slots)
         month["day_report"] = report or ""      # 供「報告」鈕顯示落地當下的報告
         self.storage.save_month(ym, month)
 
@@ -382,6 +391,50 @@ class RosterService:
                             out.append(f"{iso} {session} {slot}："
                                        f"{c} 不在當日 PGY 名單/梯次")
         return out
+
+    def day_course_stats(self, ym: str,
+                         day_slots_override: "dict | None" = None) -> dict:
+        """[2026-07-23 使用者] 週期次數統計：PGY=本月、Clerk=整個兩週梯次（跨月自動把
+        另一半月份的存檔 day_slots 合併進來，以梯次起訖裁切）。統計吃「排出來的結果」
+        （含手動改過/鎖定的格），不是 solver 內部計數。
+
+        day_slots_override: 用 preview 的 day_slots 取代【本月】內容（預覽報告用）；
+        其他月份一律讀存檔。回：
+          {"pgy": {"roster": [...], "stats": {code: {photo,photo_wed_pm,tx,biopsy,follow,rest}}},
+           "batches": [{"id","start","end","members","stats"}]}
+        """
+        inp = self.build_day_input(ym)
+        cur_slots = (day_slots_override if day_slots_override is not None
+                     else (self.storage.load_month(ym).get("day_slots") or {}))
+        # [codex P2] PGY=本月 → 以月份起訖裁切:set_day_slot 不強制 d∈ym,月檔可能殘留
+        # 跨月 iso 鍵(如鎖定殘留),不裁切會灌進 PGY 月統計。
+        y, m = int(ym[:4]), int(ym[5:7])
+        m_first = date(y, m, 1)
+        m_last = (date(y + 1, 1, 1) if m == 12 else date(y, m + 1, 1)) \
+            - timedelta(days=1)
+        pgy_stats = person_course_stats(
+            cur_slots, include={str(c) for c in inp.pgy_roster},
+            start=m_first, end=m_last)
+        batches_out = []
+        for b in inp.clerk_batches:
+            b_end = b.start_monday + timedelta(days=13)
+            merged: dict = {}
+            for ymm in sorted({f"{d.year:04d}-{d.month:02d}"
+                               for d in (b.start_monday, b_end)}):
+                slots = (cur_slots if ymm == ym
+                         else (self.storage.load_month(ymm).get("day_slots") or {}))
+                # [codex P2] 各月檔只採「屬於該月」的 iso 鍵:月檔可能殘留跨月鍵
+                # (set_day_slot 不強制 d∈ym),不過濾會蓋掉另一個月檔的權威內容。
+                merged.update({iso: v for iso, v in slots.items()
+                               if iso[:7] == ymm})
+            batches_out.append({
+                "id": b.id, "start": b.start_monday.isoformat(),
+                "end": b_end.isoformat(), "members": list(b.members),
+                "stats": person_course_stats(
+                    merged, include={str(c) for c in b.members},
+                    start=b.start_monday, end=b_end)})
+        return {"pgy": {"roster": list(inp.pgy_roster), "stats": pgy_stats},
+                "batches": batches_out}
 
     def set_pgy_month_roster(self, ym: str, codes) -> None:
         month = self.storage.load_month(ym)

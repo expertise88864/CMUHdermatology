@@ -422,3 +422,81 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
             warnings.append(f"切片室輪不到（梯次 {b.id}，本梯內未排到）："
                             + "、".join(missed))
     return day_slots, log, warnings
+
+
+# ─── 週期統計（2026-07-23 使用者需求）────────────────────────────────────────
+# 排班排出來之後，統計整個 course（PGY=月、Clerk=兩週梯次）每人的各類次數，
+# 給 UI 側欄/報告呈現，讓「照光/治療室盡量一致、週三下午照光獨立平均、Clerk 至少
+# 跟過一次切片」可被使用者直接驗證。純函式：吃 day_slots 形狀資料（含手動改過的格）。
+STAT_KEYS = ("photo", "photo_wed_pm", "tx", "biopsy", "follow", "rest")
+
+
+def person_course_stats(sessions_by_iso: dict, include=None,
+                        start: "date | None" = None,
+                        end: "date | None" = None) -> dict:
+    """統計每人次數 → {code: {photo, photo_wed_pm, tx, biopsy, follow, rest}}。
+
+    sessions_by_iso: {iso: {session: {slot: [codes]}}}（月檔 day_slots 或 preview）。
+    include: 只統計這些代號（None=全部）；start/end: 只統計此日期範圍（含端點，
+    Clerk 梯次跨月時由呼叫端把兩個月的 day_slots 合併餵入並以梯次起訖裁切）。
+    slot 分類：照光/治療室/切片室/放假為特殊格；其餘一律視為「跟診」（房號可為任意字串）。
+    壞日期鍵略過（與 storage 讀取容錯一致）。
+    """
+    out: dict = {}
+
+    def bump(code, key):
+        if include is not None and code not in include:
+            return
+        st = out.setdefault(code, dict.fromkeys(STAT_KEYS, 0))
+        st[key] += 1
+
+    for iso in sorted(sessions_by_iso or {}):
+        try:
+            d = date.fromisoformat(iso)
+        except (ValueError, TypeError):
+            continue
+        if (start and d < start) or (end and d > end):
+            continue
+        for session, slots in (sessions_by_iso[iso] or {}).items():
+            wed_pm = (d.weekday() == WED and session == "下午")
+            for slot, people in (slots or {}).items():
+                for p in people or []:
+                    if slot == PHOTO:
+                        bump(p, "photo")
+                        if wed_pm:
+                            bump(p, "photo_wed_pm")
+                    elif slot == TREATMENT:
+                        bump(p, "tx")
+                    elif slot == BIOPSY:
+                        bump(p, "biopsy")
+                    elif slot == REST:
+                        bump(p, "rest")
+                    else:
+                        bump(p, "follow")
+    return out
+
+
+def format_course_stats(pgy_stats: dict, pgy_roster: list,
+                        batch_stats: list) -> str:
+    """把週期統計排成 monospace 文字段（給決策報告/預覽）。
+
+    pgy_stats: person_course_stats 結果；pgy_roster: 本月 PGY 代號（沒排到也列 0）。
+    batch_stats: [{"id","start","end","members","stats"}]（每梯一筆，跨月已合併）。
+    """
+    lines = ["【週期次數統計】",
+             "  PGY（本月）：  照光  週三午照  治療室  跟診  放假"]
+    for c in sorted({*pgy_roster, *pgy_stats}):
+        st = pgy_stats.get(c) or dict.fromkeys(STAT_KEYS, 0)
+        lines.append(f"    {c:<8s}  {st['photo']:>3d}  {st['photo_wed_pm']:>6d}"
+                     f"  {st['tx']:>5d}  {st['follow']:>3d}  {st['rest']:>3d}")
+    for b in batch_stats:
+        lines.append(f"  Clerk 梯次 {b['id']}（{b['start']}～{b['end']}）："
+                     f"切片  跟診  放假")
+        for c in sorted({*b.get("members", []), *b["stats"]}):
+            st = b["stats"].get(c) or dict.fromkeys(STAT_KEYS, 0)
+            mark = "  ⚠未排切片" if st["biopsy"] == 0 else ""
+            lines.append(f"    {c:<8s}  {st['biopsy']:>3d}  {st['follow']:>3d}"
+                         f"  {st['rest']:>3d}{mark}")
+    if not batch_stats:
+        lines.append("  Clerk：本月無梯次")
+    return "\n".join(lines)
