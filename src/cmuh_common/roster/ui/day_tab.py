@@ -22,8 +22,9 @@ from cmuh_common.roster.solve_day import (
     BIOPSY, PHOTO, REST, STAT_KEYS, TREATMENT, format_course_stats,
 )
 from cmuh_common.roster.ui.common import (
-    WEEKDAY_HEADERS, MonthSelector, StatusBar, archive_finalize_pdf_async,
-    calendar_matrix,
+    CARD_BG, CARD_BORDER, CARD_CANVAS_BG, CARD_HDR_NORMAL, CARD_HDR_WEEKEND,
+    CARD_SEP, CARD_TODAY_BORDER, OVR_FONT, OVR_STYLE, WEEKDAY_HEADERS,
+    MonthSelector, StatusBar, archive_finalize_pdf_async, calendar_matrix,
 )
 from cmuh_common.roster.ui.duty import LeaveEditor
 
@@ -72,15 +73,9 @@ def _overview_cell_rows(sessions: dict) -> list:
     return out
 
 
-# 總覽色籤配色（chip 底色, chip 字色）——淡底深字，一眼分得出角色
-_OVR_STYLE = {
-    "photo": ("#FFE9A8", "#7A5C00"),    # 照光=琥珀
-    "tx": ("#CDEBDC", "#1B6B45"),       # 治療室=綠
-    "biopsy": ("#E5D6F5", "#5E3B8C"),   # 切片室=紫
-    "room": ("#D6E6F7", "#1F4E8C"),     # 跟診房=藍
-    "rest": ("#EAEAEA", "#808080"),     # 放假=灰
-}
-_OVR_FONT = "Microsoft JhengHei UI"
+# 總覽色籤配色/字型改由 ui.common 共用（R/VS 月曆卡片同套視覺；別名保留舊名稱）
+_OVR_STYLE = OVR_STYLE
+_OVR_FONT = OVR_FONT
 
 
 class DayScheduleTab(ttk.Frame):
@@ -169,13 +164,13 @@ class DayScheduleTab(ttk.Frame):
         # ── 月曆總覽檢視（預設顯示；refresh 時重繪）───────────────────────
         self._cal_wrap = ttk.Frame(wrap)
         self._cal_canvas = tk.Canvas(self._cal_wrap, highlightthickness=0,
-                                     bg="#F7F8FA")
+                                     bg=CARD_CANVAS_BG)
         cvsb = ttk.Scrollbar(self._cal_wrap, orient="vertical",
                              command=self._cal_canvas.yview)
         chsb = ttk.Scrollbar(self._cal_wrap, orient="horizontal",
                              command=self._cal_canvas.xview)
         chsb.pack(side="bottom", fill="x")
-        self._cal_body = tk.Frame(self._cal_canvas, bg="#F7F8FA")
+        self._cal_body = tk.Frame(self._cal_canvas, bg=CARD_CANVAS_BG)
         self._cal_body.bind(
             "<Configure>",
             lambda e: self._cal_canvas.configure(
@@ -531,34 +526,42 @@ class DayScheduleTab(ttk.Frame):
         ttk.Button(win, text="關閉", command=win.destroy).pack(pady=(0, 6))
 
     def _build_overview_cell(self, parent, d, sessions) -> tk.Frame:
-        """[2026-07-23 使用者美化] 單日卡片：日期標頭＋早/午分區＋角色色籤＋人名加粗。"""
+        """[2026-07-23 使用者美化] 單日卡片：日期標頭＋早/午分區＋角色色籤＋人名加粗；
+        今日金框、早/午之間細分隔線。"""
         weekend = d.weekday() >= 5
-        cell = tk.Frame(parent, bg="#FFFFFF", highlightthickness=1,
-                        highlightbackground="#C9CFD6")
-        hdr = tk.Label(cell, text=f"{d.day}（{_WD[d.weekday()]}）", anchor="w",
-                       bg=("#F3DDDD" if weekend else "#E7EDF4"),
-                       fg=("#8B2020" if weekend else "#2A3B50"),
+        today = (d == date.today())
+        cell = tk.Frame(parent, bg=CARD_BG,
+                        highlightthickness=(2 if today else 1),
+                        highlightbackground=(CARD_TODAY_BORDER if today
+                                             else CARD_BORDER))
+        hbg, hfg = CARD_HDR_WEEKEND if weekend else CARD_HDR_NORMAL
+        hdr = tk.Label(cell, text=f"{d.day}（{_WD[d.weekday()]}）"
+                       + ("  ⬅今天" if today else ""),
+                       anchor="w", bg=hbg, fg=hfg,
                        font=(_OVR_FONT, 10, "bold"), padx=6)
         hdr.pack(fill="x")
         rows = _overview_cell_rows(sessions)
         if not rows:
-            tk.Label(cell, text="—", bg="#FFFFFF", fg="#BBBBBB",
+            tk.Label(cell, text="—", bg=CARD_BG, fg="#BBBBBB",
                      font=(_OVR_FONT, 10)).pack(anchor="w", padx=8, pady=2)
             return cell
         last_session = None
         for session, kind, lab, people in rows:
-            row = tk.Frame(cell, bg="#FFFFFF")
+            if last_session is not None and session != last_session:
+                tk.Frame(cell, bg=CARD_SEP, height=1).pack(fill="x",
+                                                           padx=4, pady=2)
+            row = tk.Frame(cell, bg=CARD_BG)
             row.pack(fill="x", padx=4, pady=1)
             mark = ("早" if session == "上午" else "午") \
                 if session != last_session else ""
             last_session = session
-            tk.Label(row, text=mark, width=2, bg="#FFFFFF",
+            tk.Label(row, text=mark, width=2, bg=CARD_BG,
                      fg=("#B26500" if session == "上午" else "#1F4E8C"),
                      font=(_OVR_FONT, 9, "bold")).pack(side="left")
             chip_bg, chip_fg = _OVR_STYLE[kind]
             tk.Label(row, text=lab, bg=chip_bg, fg=chip_fg, padx=4,
                      font=(_OVR_FONT, 8, "bold")).pack(side="left")
-            tk.Label(row, text=people, bg="#FFFFFF", fg="#1A1A1A", padx=4,
+            tk.Label(row, text=people, bg=CARD_BG, fg="#1A1A1A", padx=4,
                      font=(_OVR_FONT, 10, "bold"), anchor="w",
                      justify="left", wraplength=140).pack(side="left",
                                                           fill="x", expand=True)
@@ -572,10 +575,10 @@ class DayScheduleTab(ttk.Frame):
         body = self._cal_body
         for w in body.winfo_children():
             w.destroy()
-        legend = tk.Frame(body, bg="#F7F8FA")
+        legend = tk.Frame(body, bg=CARD_CANVAS_BG)
         legend.grid(row=0, column=0, columnspan=7, sticky="w",
                     padx=4, pady=(4, 2))
-        tk.Label(legend, text=f"{y} 年 {m} 月", bg="#F7F8FA",
+        tk.Label(legend, text=f"{y} 年 {m} 月", bg=CARD_CANVAS_BG,
                  font=(_OVR_FONT, 12, "bold")).pack(side="left", padx=(0, 12))
         for kind, lab in (("photo", "照光"), ("tx", "治療室"),
                           ("biopsy", "切片室"), ("room", "跟診"),
@@ -584,14 +587,14 @@ class DayScheduleTab(ttk.Frame):
             tk.Label(legend, text=lab, bg=bg, fg=fg, padx=6,
                      font=(_OVR_FONT, 9, "bold")).pack(side="left", padx=3)
         for c, h in enumerate(WEEKDAY_HEADERS):
-            tk.Label(body, text=h, anchor="center", bg="#F7F8FA",
+            tk.Label(body, text=h, anchor="center", bg=CARD_CANVAS_BG,
                      font=(_OVR_FONT, 10, "bold"),
                      fg="#B00020" if c >= 5 else "#2A3B50").grid(
                 row=1, column=c, sticky="nsew", padx=2, pady=(2, 4))
         for r, week in enumerate(calendar_matrix(y, m), start=2):
             for c, d in enumerate(week):
                 if d is None:
-                    tk.Frame(body, bg="#F7F8FA").grid(row=r, column=c)
+                    tk.Frame(body, bg=CARD_CANVAS_BG).grid(row=r, column=c)
                     continue
                 cell = self._build_overview_cell(
                     body, d, day_slots.get(d.isoformat()) or {})

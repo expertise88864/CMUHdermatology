@@ -13,6 +13,25 @@ from cmuh_common.roster.model import month_dates
 # 週一起始（與引擎 ISO 週一致；週六/日排在最右，方便看週末成對）
 WEEKDAY_HEADERS = ("一", "二", "三", "四", "五", "六", "日")
 
+# ── 月曆卡片共用視覺（2026-07-23 使用者：PGY/Clerk 總覽樣式套用到 R/VS）────────
+# 色籤配色（chip 底色, chip 字色）——淡底深字，一眼分得出角色
+OVR_STYLE = {
+    "photo": ("#FFE9A8", "#7A5C00"),    # 照光=琥珀
+    "tx": ("#CDEBDC", "#1B6B45"),       # 治療室=綠
+    "biopsy": ("#E5D6F5", "#5E3B8C"),   # 切片室=紫
+    "room": ("#D6E6F7", "#1F4E8C"),     # 跟診房=藍
+    "rest": ("#EAEAEA", "#808080"),     # 放假=灰
+}
+OVR_FONT = "Microsoft JhengHei UI"
+CARD_BG = "#FFFFFF"
+CARD_CANVAS_BG = "#F7F8FA"              # 月曆底色（格與格之間）
+CARD_BORDER = "#C9CFD6"
+CARD_TODAY_BORDER = "#E8A317"           # 今日=金框（一眼定位今天）
+CARD_HDR_NORMAL = ("#E7EDF4", "#2A3B50")     # 平日標頭（底, 字）
+CARD_HDR_WEEKEND = ("#F3DDDD", "#8B2020")    # 週末標頭
+CARD_HDR_HOLIDAY = ("#FFE3B8", "#8A5A00")    # 平日國定假日標頭
+CARD_SEP = "#E3E7EC"                    # 早/午分隔線
+
 # 成員色：色盲友善固定調色盤（藍/橙/綠/紫/棕/粉/青/黃），足夠 R(≤4)/VS(≤8) 用。
 MEMBER_PALETTE = (
     "#4C78A8", "#F58518", "#54A24B", "#B279A2",

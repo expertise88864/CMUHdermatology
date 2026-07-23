@@ -16,9 +16,13 @@ from tkinter import filedialog, messagebox, ttk
 from cmuh_common.deps_runtime import ensure_dependencies
 from cmuh_common.roster.model import day_point, is_weekend
 from cmuh_common.roster.ui.common import (
-    WEEKDAY_HEADERS, MonthSelector, StatusBar, archive_finalize_pdf_async,
-    calendar_matrix, fg_for, member_color, next_in_cycle,
+    CARD_BG, CARD_BORDER, CARD_HDR_HOLIDAY, CARD_HDR_NORMAL, CARD_HDR_WEEKEND,
+    CARD_TODAY_BORDER, OVR_FONT, OVR_STYLE, WEEKDAY_HEADERS,
+    MonthSelector, StatusBar, archive_finalize_pdf_async, calendar_matrix,
+    fg_for, member_color, next_in_cycle,
 )
+
+_WD = "一二三四五六日"
 
 _SCOPE_TITLE = {"r": "R 排班", "vs": "VS 排班"}
 _ORTOOLS_DEP = [("ortools==9.15.6755", "ortools")]
@@ -283,35 +287,68 @@ class CalendarDutyTab(ttk.Frame):
 
     def _make_cell(self, r, c, d, duty, holidays, params, members,
                    biopsy=None) -> None:
+        """[2026-07-23 使用者] R/VS 月曆格套用 PGY/Clerk 總覽的卡片式視覺：
+        日期標頭（日+週幾+點數+🔒/假）＋值班者色塊（成員色、代號+姓名加粗）
+        ＋R 週六切片紫籤列；今日金框。點擊互動不變（左鍵輪換/右鍵選單，綁到全卡）。"""
         if d is None:
             tk.Frame(self._grid_holder).grid(row=r, column=c)
             return
         iso = d.isoformat()
-        cell = duty.get(iso) or {}
-        pid = cell.get("person")
-        locked = bool(cell.get("locked"))
+        cell_data = duty.get(iso) or {}
+        pid = cell_data.get("person")
+        locked = bool(cell_data.get("locked"))
         info = members.get(pid)
-        bg = info["color"] if info else ("#F0E7D8" if d in holidays else "#FFFFFF")
-        fg = fg_for(bg) if info else "#000000"
-        # [2026-07-13 使用者] 除姓名外一併顯示代號（代號＋姓名）
-        who = self._who_label(pid, info) if pid else ""
+        holiday = d in holidays and not is_weekend(d)
+        today = (d == date.today())
         pts = day_point(d, holidays, params)
-        mark = " 🔒" if locked else ""
-        hol = "假 " if (d in holidays and not is_weekend(d)) else ""
-        text = f"{hol}{d.day}\n{who}\n{pts}點{mark}"
-        # [週六切片] R 分頁週六格第 4 行顯示切片負責人（代號＋姓名）
+
+        card = tk.Frame(self._grid_holder, bg=CARD_BG,
+                        highlightthickness=(2 if today else 1),
+                        highlightbackground=(CARD_TODAY_BORDER if today
+                                             else CARD_BORDER))
+        card.grid(row=r, column=c, sticky="nsew", padx=1, pady=1)
+        hbg, hfg = (CARD_HDR_HOLIDAY if holiday
+                    else CARD_HDR_WEEKEND if is_weekend(d)
+                    else CARD_HDR_NORMAL)
+        hdr = tk.Frame(card, bg=hbg)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=f"{d.day}（{_WD[d.weekday()]}）"
+                 + ("假" if holiday else ""), bg=hbg, fg=hfg, padx=4,
+                 font=(OVR_FONT, 9, "bold")).pack(side="left")
+        tk.Label(hdr, text=f"{pts}點" + (" 🔒" if locked else ""),
+                 bg=hbg, fg=hfg, padx=4,
+                 font=(OVR_FONT, 8)).pack(side="right")
+        if pid:
+            pbg = info["color"] if info else "#9E9E9E"
+            # [codex P2] width+wraplength 上限:月曆格網無捲軸,長姓名不設限會把整欄
+            # 撐寬、擠爆七欄+側欄(舊 Label 有 width=8 束縛,卡片化後補回等效上限)。
+            tk.Label(card, text=self._who_label(pid, info), bg=pbg,
+                     fg=fg_for(pbg), padx=4, pady=2, anchor="w", width=11,
+                     wraplength=104, justify="left",
+                     font=(OVR_FONT, 10, "bold")).pack(fill="x",
+                                                       padx=3, pady=(3, 1))
+        else:
+            tk.Label(card, text="—", bg=CARD_BG, fg="#BBBBBB",
+                     font=(OVR_FONT, 10)).pack(anchor="w", padx=8, pady=(3, 1))
+        # [週六切片] R 分頁週六格：切片負責人（紫籤＋代號+姓名）
         bp = ((biopsy or {}).get(iso) or {}).get("person")
-        height = 3
         if bp:
-            text += f"\n切:{self._who_label(bp, members.get(bp))}"
-            height = 4
-        lbl = tk.Label(self._grid_holder, text=text, bg=bg, fg=fg,
-                       width=8, height=height, relief="ridge", justify="center",
-                       font=("Microsoft JhengHei UI", 9))
-        lbl.grid(row=r, column=c, sticky="nsew", padx=1, pady=1)
+            brow = tk.Frame(card, bg=CARD_BG)
+            brow.pack(fill="x", padx=3, pady=(0, 2))
+            cbg, cfg2 = OVR_STYLE["biopsy"]
+            tk.Label(brow, text="切片", bg=cbg, fg=cfg2, padx=3,
+                     font=(OVR_FONT, 8, "bold")).pack(side="left")
+            tk.Label(brow, text=self._who_label(bp, members.get(bp)),
+                     bg=CARD_BG, fg="#1A1A1A", padx=3, width=9,
+                     wraplength=84, justify="left", anchor="w",
+                     font=(OVR_FONT, 9, "bold")).pack(side="left")
         if not self._finalized:
-            lbl.bind("<Button-1>", lambda _e, dd=d: self._on_cell_left(dd))
-            lbl.bind("<Button-3>", lambda e, dd=d: self._on_cell_right(e, dd))
+            def _bind_tree(w):
+                w.bind("<Button-1>", lambda _e, dd=d: self._on_cell_left(dd))
+                w.bind("<Button-3>", lambda e, dd=d: self._on_cell_right(e, dd))
+                for ch in w.winfo_children():
+                    _bind_tree(ch)
+            _bind_tree(card)
 
     def _refresh_side(self, ctx, duty, members) -> None:
         # 結算：由目前格子即時統計
