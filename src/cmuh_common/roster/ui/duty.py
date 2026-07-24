@@ -19,7 +19,7 @@ from cmuh_common.roster.ui.common import (
     CARD_BG, CARD_BORDER, CARD_HDR_HOLIDAY, CARD_HDR_NORMAL, CARD_HDR_WEEKEND,
     CARD_TODAY_BORDER, LINE_CHIP, OVR_FONT, OVR_STYLE, WEEKDAY_HEADERS,
     MonthSelector, StatusBar, archive_finalize_pdf_async, bind_hover_highlight,
-    calendar_matrix, fg_for, member_color, next_in_cycle,
+    calendar_matrix, fg_for, member_color, next_in_cycle, vs_member_color,
 )
 
 _WD = "一二三四五六日"
@@ -260,11 +260,13 @@ class CalendarDutyTab(ttk.Frame):
     # ── 資料 → 畫面 ──────────────────────────────────────────────────────
     def _member_map(self, scope: str) -> dict:
         cfg = self.service.storage.load_config()
+        # [2026-07-24 使用者] R 亮色盤 / VS 深色盤（零重疊）→ 同格一線/三線不撞色
+        pick = member_color if scope == "r" else vs_member_color
         out = {}
         for i, m in enumerate(cfg.get(f"{scope}_members") or []):
             mid = m.get("id")
             out[mid] = {"id": mid, "name": m.get("name") or mid,
-                        "color": member_color(i)}
+                        "color": pick(i)}
         return out
 
     @staticmethod

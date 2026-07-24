@@ -93,3 +93,10 @@ def test_default_ym_is_next_month():
         return (y + 1, 1) if m == 12 else (y, m + 1)
     assert nxt(2026, 7) == (2026, 8)
     assert nxt(2026, 12) == (2027, 1)
+
+
+def test_scheduler_opens_maximized():
+    """[2026-07-24 使用者] 排班程式開啟直接全螢幕（最大化）。"""
+    import inspect
+    src = inspect.getsource(scheduler.ScheduleApp.__init__)
+    assert 'state("zoomed")' in src

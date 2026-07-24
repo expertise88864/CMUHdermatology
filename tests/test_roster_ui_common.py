@@ -70,3 +70,15 @@ def test_member_color_stable_and_wraps():
     assert member_color(0) == MEMBER_PALETTE[0]
     assert member_color(len(MEMBER_PALETTE)) == MEMBER_PALETTE[0]   # 循環
     assert member_color(1) != member_color(0)
+
+
+def test_vs_palette_disjoint_from_r_palette():
+    """[2026-07-24 使用者] R 亮色盤與 VS 深色盤零重疊 → 合併月曆同格一線/三線不撞色。"""
+    from cmuh_common.roster.ui.common import VS_MEMBER_PALETTE, vs_member_color
+    assert set(MEMBER_PALETTE).isdisjoint(VS_MEMBER_PALETTE)
+    assert len(set(VS_MEMBER_PALETTE)) == len(VS_MEMBER_PALETTE)   # 盤內不重複
+    assert vs_member_color(0) == VS_MEMBER_PALETTE[0]
+    assert vs_member_color(len(VS_MEMBER_PALETTE)) == VS_MEMBER_PALETTE[0]  # 循環
+    # 同序位跨盤必不同色（撞色主因＝兩名單都從第 0 色起算）
+    for i in range(8):
+        assert member_color(i) != vs_member_color(i)

@@ -61,16 +61,28 @@ def bind_hover_highlight(card, normal_color, hover=CARD_HOVER_BORDER) -> None:
     _walk(card)
     card.bind("<Leave>", _off, add="+")
 
-# 成員色：色盲友善固定調色盤（藍/橙/綠/紫/棕/粉/青/黃），足夠 R(≤4)/VS(≤8) 用。
-MEMBER_PALETTE = (
+# 成員色：色盲友善固定調色盤（藍/橙/綠/紫/棕/粉/青/黃）。
+# [2026-07-24 使用者] R 與 VS 各用【完全不相交】的調色盤——合併月曆每格上下並列
+# 一線/三線,若共用同一盤且各自從第 0 色起算,R 第 n 位與 VS 第 n 位必同色
+# （實測 K/吳伯元同藍、林于喬/陳駿升同橘）→ 很難閱讀。
+MEMBER_PALETTE = (                      # R（一線）用：亮色系
     "#4C78A8", "#F58518", "#54A24B", "#B279A2",
     "#8C564B", "#E377C2", "#17BECF", "#BCBD22",
+)
+VS_MEMBER_PALETTE = (                   # VS（三線）用：深色系,與上盤零重疊
+    "#7D3C98", "#117A65", "#B9770E", "#5D6D7E",
+    "#C2185B", "#00838F", "#8D6E63", "#556B2F",
 )
 
 
 def member_color(index: int) -> str:
-    """依成員在名單中的序位取固定色（超過調色盤數量則循環）。"""
+    """R 成員依名單序位取固定色（超過調色盤數量則循環）。"""
     return MEMBER_PALETTE[index % len(MEMBER_PALETTE)]
+
+
+def vs_member_color(index: int) -> str:
+    """VS 成員色（獨立深色盤,與 R 盤零重疊 → 一線/三線同格不撞色）。"""
+    return VS_MEMBER_PALETTE[index % len(VS_MEMBER_PALETTE)]
 
 
 def fg_for(bg_hex: str) -> str:

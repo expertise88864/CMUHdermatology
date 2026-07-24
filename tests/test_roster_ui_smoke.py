@@ -547,3 +547,12 @@ def test_merged_day_tab_has_both_stats_and_cell_menu(root, tmp_path):
     assert tab._stats_pgy.winfo_exists() and tab._stats_clerk.winfo_exists()
     src = _ins.getsource(day_mod.DayScheduleTab._render_calendar)
     assert "_attach_cell_menu(" in src, "月曆格應可直接點選編輯"
+
+
+def test_member_map_uses_disjoint_palettes(root, tmp_path):
+    """[2026-07-24 使用者] 合併分頁：R 第 n 位與 VS 第 n 位不得同色。"""
+    svc = _svc(tmp_path)
+    tab = CalendarDutyTab(root, svc, _app())
+    r_colors = {v["color"] for v in tab._member_map("r").values()}
+    vs_colors = {v["color"] for v in tab._member_map("vs").values()}
+    assert r_colors.isdisjoint(vs_colors)

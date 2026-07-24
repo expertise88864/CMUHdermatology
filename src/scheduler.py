@@ -98,8 +98,13 @@ class ScheduleApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(WINDOW_TITLE)
-        self.root.geometry("1080x720")
+        self.root.geometry("1080x720")     # 取消最大化後的還原尺寸
         self.root.minsize(820, 560)
+        # [2026-07-24 使用者] 開啟直接全螢幕（最大化）——月曆兩列卡片需要空間
+        try:
+            self.root.state("zoomed")
+        except tk.TclError:
+            logging.debug("視窗最大化失敗（非 Windows?）", exc_info=True)
         try:
             apply_tk_window_icon(self.root)
         except Exception:
