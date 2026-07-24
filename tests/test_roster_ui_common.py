@@ -82,3 +82,16 @@ def test_vs_palette_disjoint_from_r_palette():
     # 同序位跨盤必不同色（撞色主因＝兩名單都從第 0 色起算）
     for i in range(8):
         assert member_color(i) != vs_member_color(i)
+
+
+def test_tint_and_shade_colors():
+    """[2026-07-24 使用者] 三線淡底深字的調色 helper：tint 變亮、shade 變暗、壞值原樣。"""
+    from cmuh_common.roster.ui.common import shade_color, tint_color
+
+    def lum(h):
+        return (0.299 * int(h[1:3], 16) + 0.587 * int(h[3:5], 16)
+                + 0.114 * int(h[5:7], 16))
+    for c in ("#117A65", "#B9770E", "#7D3C98"):
+        assert lum(tint_color(c)) > lum(c) + 60, "tint 應明顯變亮(淡底)"
+        assert lum(shade_color(c)) < lum(c), "shade 應變暗(深字)"
+    assert tint_color("bad") == "bad" and shade_color("") == ""   # 壞值原樣
