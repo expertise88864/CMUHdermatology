@@ -85,6 +85,29 @@ def vs_member_color(index: int) -> str:
     return VS_MEMBER_PALETTE[index % len(VS_MEMBER_PALETTE)]
 
 
+def _mix(hex_color: str, target: int, ratio: float) -> str:
+    """把顏色朝 target(0=黑,255=白)混合 ratio 比例。壞值回原色。純函式。"""
+    try:
+        r = int(hex_color[1:3], 16)
+        g = int(hex_color[3:5], 16)
+        b = int(hex_color[5:7], 16)
+    except (ValueError, IndexError, TypeError):
+        return hex_color
+    mix = [round(c + (target - c) * ratio) for c in (r, g, b)]
+    return "#{:02X}{:02X}{:02X}".format(*mix)
+
+
+def tint_color(hex_color: str, ratio: float = 0.82) -> str:
+    """淡化（朝白混合）。[2026-07-24 使用者] 三線改「淡底深字」與一線「實心白字」
+    做結構性區分——即使兩盤色相接近（橘vs赭、綠vs藍綠）也一眼分辨,不再賭選色。"""
+    return _mix(hex_color, 255, ratio)
+
+
+def shade_color(hex_color: str, ratio: float = 0.35) -> str:
+    """加深（朝黑混合）——淡底上的文字色。"""
+    return _mix(hex_color, 0, ratio)
+
+
 def fg_for(bg_hex: str) -> str:
     """依背景色亮度回傳可讀的前景色（深底→白字，淺底→黑字）。"""
     try:

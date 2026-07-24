@@ -19,7 +19,8 @@ from cmuh_common.roster.ui.common import (
     CARD_BG, CARD_BORDER, CARD_HDR_HOLIDAY, CARD_HDR_NORMAL, CARD_HDR_WEEKEND,
     CARD_TODAY_BORDER, LINE_CHIP, OVR_FONT, OVR_STYLE, WEEKDAY_HEADERS,
     MonthSelector, StatusBar, archive_finalize_pdf_async, bind_hover_highlight,
-    calendar_matrix, fg_for, member_color, next_in_cycle, vs_member_color,
+    calendar_matrix, fg_for, member_color, next_in_cycle, shade_color,
+    tint_color, vs_member_color,
 )
 
 _WD = "一二三四五六日"
@@ -353,11 +354,17 @@ class CalendarDutyTab(ttk.Frame):
             tk.Label(row, text=line, bg=chip_bg, fg=chip_fg, padx=3,
                      font=(OVR_FONT, 8, "bold")).pack(side="left")
             if pid:
-                pbg = info["color"] if info else "#9E9E9E"
+                base = info["color"] if info else "#9E9E9E"
+                # [2026-07-24 使用者] 結構性區分（不賭色相）：一線＝實心色塊+白/黑字,
+                # 三線＝同色系【淡底+深色字】——即使兩盤色相接近也一眼分辨。
+                if scope == "r":
+                    pbg, pfg = base, fg_for(base)
+                else:
+                    pbg, pfg = tint_color(base), shade_color(base)
                 # [codex P2] width+wraplength 上限:月曆格網無捲軸,長姓名不設限會把
                 # 整欄撐寬、擠爆七欄+側欄。
                 tk.Label(row, text=self._who_label(pid, info)
-                         + (" 🔒" if locked else ""), bg=pbg, fg=fg_for(pbg),
+                         + (" 🔒" if locked else ""), bg=pbg, fg=pfg,
                          padx=4, anchor="w", width=10, wraplength=92,
                          justify="left", font=(OVR_FONT, 10, "bold")
                          ).pack(side="left", fill="x", expand=True, padx=(2, 0))

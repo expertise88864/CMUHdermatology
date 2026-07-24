@@ -95,3 +95,17 @@ def test_tint_and_shade_colors():
         assert lum(tint_color(c)) > lum(c) + 60, "tint 應明顯變亮(淡底)"
         assert lum(shade_color(c)) < lum(c), "shade 應變暗(深字)"
     assert tint_color("bad") == "bad" and shade_color("") == ""   # 壞值原樣
+
+
+def test_duty_cell_actually_uses_tint_for_vs():
+    """[2026-07-24 事故] v2026.07.24.4 push 途中 OneDrive 把 duty.py/common.py 還原,
+    tint 只剩測試、使用處全失——helper 測試照綠、實機三線仍實心色塊。
+    這支直接釘「duty.py 的三線分支真的呼叫 tint/shade」,再被還原就整套紅。"""
+    import inspect
+
+    from cmuh_common.roster.ui import duty
+    src = inspect.getsource(duty)
+    assert "tint_color(base)" in src, "三線人員底色應為 tint_color(淡底)"
+    assert "shade_color(base)" in src, "三線人員字色應為 shade_color(深字)"
+    # 一線維持實心底 + fg_for 自動黑白字（結構性區分的另一半）
+    assert "fg_for(base)" in src
