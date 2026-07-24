@@ -22,15 +22,18 @@ from cmuh_common.roster.solve_day import (
     BIOPSY, PHOTO, REST, STAT_KEYS, TREATMENT, format_course_stats,
 )
 from cmuh_common.roster.ui.common import (
-    CARD_BG, CARD_BORDER, CARD_CANVAS_BG, CARD_HDR_NORMAL, CARD_HDR_WEEKEND,
-    CARD_SEP, CARD_TODAY_BORDER, OVR_FONT, OVR_STYLE, WEEKDAY_HEADERS,
-    MonthSelector, StatusBar, archive_finalize_pdf_async, bind_hover_highlight,
-    calendar_matrix,
+    CARD_BORDER, CARD_CANVAS_BG, CARD_HDR_HOLIDAY, CARD_HDR_NORMAL,
+    CARD_HDR_WEEKEND, CARD_SEP, CARD_TODAY_BORDER, OVR_FONT, OVR_STYLE,
+    WEEKDAY_HEADERS, MonthSelector, StatusBar, archive_finalize_pdf_async,
+    bind_canvas_mousewheel, bind_hover_highlight, calendar_matrix, card_body_bg,
 )
 from cmuh_common.roster.ui.duty import LeaveEditor
 
 _WD = "一二三四五六日"
 _TITLE = "PGY / Clerk 排班"
+# [2026-07-24 UI] 閒置時狀態列＝操作提示（月曆格點擊選單原本無處可發現）。
+_IDLE_HINT = ("就緒｜月曆格：點擊＝編輯/鎖定選單；滾輪捲動（Shift+滾輪＝水平）"
+              "｜列表檢視：雙擊列＝編輯、選取後可按🔒")
 
 
 def _split_codes(text: str) -> list:
@@ -97,6 +100,7 @@ class DayScheduleTab(ttk.Frame):
         self._status = StatusBar(self)
         self._status.pack(fill="x", side="bottom")
         self.refresh()
+        self._status.set(_IDLE_HINT)     # [2026-07-24] 閒置時顯示操作提示
 
     # ── 版面 ─────────────────────────────────────────────────────────────
     def _build_toolbar(self) -> None:
@@ -183,6 +187,8 @@ class DayScheduleTab(ttk.Frame):
                                    xscrollcommand=chsb.set)
         self._cal_canvas.pack(side="left", fill="both", expand=True)
         cvsb.pack(side="right", fill="y")
+        # [2026-07-24 UI 互動] 月曆吃滾輪（指標在月曆區域內才動作,不污染其他元件）
+        bind_canvas_mousewheel(self._cal_canvas, self._cal_wrap)
         self._view_mode = "cal"
         self._cal_wrap.pack(fill="both", expand=True)
 
@@ -537,24 +543,31 @@ class DayScheduleTab(ttk.Frame):
         t.pack(fill="both", expand=True, padx=6, pady=6)
         ttk.Button(win, text="關閉", command=win.destroy).pack(pady=(0, 6))
 
-    def _build_overview_cell(self, parent, d, sessions) -> tk.Frame:
+    def _build_overview_cell(self, parent, d, sessions,
+                             holidays=frozenset()) -> tk.Frame:
         """[2026-07-23 使用者美化] 單日卡片：日期標頭＋早/午分區＋角色色籤＋人名加粗；
-        今日金框、早/午之間細分隔線。"""
+        今日金框、早/午之間細分隔線。
+        [2026-07-24 易讀性] 週末/平日國定假日整格淡底＋假日標頭（原本 day 月曆只認
+        週末,平日假日看起來像普通上班日）。"""
         weekend = d.weekday() >= 5
+        holiday = (d in holidays) and not weekend
         today = (d == date.today())
-        cell = tk.Frame(parent, bg=CARD_BG,
+        body_bg = card_body_bg(weekend, holiday)
+        cell = tk.Frame(parent, bg=body_bg,
                         highlightthickness=(2 if today else 1),
                         highlightbackground=(CARD_TODAY_BORDER if today
                                              else CARD_BORDER))
-        hbg, hfg = CARD_HDR_WEEKEND if weekend else CARD_HDR_NORMAL
+        hbg, hfg = (CARD_HDR_HOLIDAY if holiday
+                    else CARD_HDR_WEEKEND if weekend else CARD_HDR_NORMAL)
         hdr = tk.Label(cell, text=f"{d.day}（{_WD[d.weekday()]}）"
+                       + ("假" if holiday else "")
                        + ("  ⬅今天" if today else ""),
                        anchor="w", bg=hbg, fg=hfg,
                        font=(_OVR_FONT, 10, "bold"), padx=6)
         hdr.pack(fill="x")
         rows = _overview_cell_rows(sessions)
         if not rows:
-            tk.Label(cell, text="—", bg=CARD_BG, fg="#BBBBBB",
+            tk.Label(cell, text="—", bg=body_bg, fg="#BBBBBB",
                      font=(_OVR_FONT, 10)).pack(anchor="w", padx=8, pady=2)
             return cell
         last_session = None
@@ -562,18 +575,18 @@ class DayScheduleTab(ttk.Frame):
             if last_session is not None and session != last_session:
                 tk.Frame(cell, bg=CARD_SEP, height=1).pack(fill="x",
                                                            padx=4, pady=2)
-            row = tk.Frame(cell, bg=CARD_BG)
+            row = tk.Frame(cell, bg=body_bg)
             row.pack(fill="x", padx=4, pady=1)
             mark = ("早" if session == "上午" else "午") \
                 if session != last_session else ""
             last_session = session
-            tk.Label(row, text=mark, width=2, bg=CARD_BG,
+            tk.Label(row, text=mark, width=2, bg=body_bg,
                      fg=("#B26500" if session == "上午" else "#1F4E8C"),
                      font=(_OVR_FONT, 9, "bold")).pack(side="left")
             chip_bg, chip_fg = _OVR_STYLE[kind]
             tk.Label(row, text=lab, bg=chip_bg, fg=chip_fg, padx=4,
                      font=(_OVR_FONT, 8, "bold")).pack(side="left")
-            tk.Label(row, text=people, bg=CARD_BG, fg="#1A1A1A", padx=4,
+            tk.Label(row, text=people, bg=body_bg, fg="#1A1A1A", padx=4,
                      font=(_OVR_FONT, 10, "bold"), anchor="w",
                      justify="left", wraplength=140).pack(side="left",
                                                           fill="x", expand=True)
@@ -615,6 +628,12 @@ class DayScheduleTab(ttk.Frame):
         頂列＝月份＋色籤圖例；每格＝當日早/午的照/治/切/跟診房/放假。"""
         ym = self.app.ym
         y, m = int(ym[:4]), int(ym[5:7])
+        try:                              # [2026-07-24] 假日集合（年度指定表）
+            holidays = self.service.storage.holidays_set()
+        except Exception:
+            logging.debug("[roster.ui] holidays_set 讀取失敗（假日標記略過）",
+                          exc_info=True)
+            holidays = set()
         body = self._cal_body
         for w in body.winfo_children():
             w.destroy()
@@ -640,12 +659,14 @@ class DayScheduleTab(ttk.Frame):
                     tk.Frame(body, bg=CARD_CANVAS_BG).grid(row=r, column=c)
                     continue
                 cell = self._build_overview_cell(
-                    body, d, day_slots.get(d.isoformat()) or {})
+                    body, d, day_slots.get(d.isoformat()) or {},
+                    holidays=holidays)
                 cell.grid(row=r, column=c, sticky="nsew", padx=2, pady=2)
                 # [2026-07-23 使用者②] 月曆格可直接點選編輯/鎖定（免切列表）
                 self._attach_cell_menu(cell, d)
         for c in range(7):
-            body.columnconfigure(c, weight=1, minsize=172)
+            # uniform＝七欄等寬（原本依內容伸縮,忙碌日把整欄撐寬、週末縮成細條）
+            body.columnconfigure(c, weight=1, minsize=172, uniform="dcal")
 
     def _on_export(self) -> None:
         """[RS-01] 匯出整月班表（R/VS 月曆 + PGY/Clerk 日排班）。副檔名決定 Excel/Word；

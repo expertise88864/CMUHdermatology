@@ -14,12 +14,13 @@ from datetime import date
 from tkinter import filedialog, messagebox, ttk
 
 from cmuh_common.deps_runtime import ensure_dependencies
-from cmuh_common.roster.model import day_point, is_weekend
+from cmuh_common.roster.model import day_point, is_weekend, week_key
 from cmuh_common.roster.ui.common import (
-    CARD_BG, CARD_BORDER, CARD_HDR_HOLIDAY, CARD_HDR_NORMAL, CARD_HDR_WEEKEND,
-    CARD_TODAY_BORDER, LINE_CHIP, OVR_FONT, OVR_STYLE, WEEKDAY_HEADERS,
-    MonthSelector, StatusBar, archive_finalize_pdf_async, bind_hover_highlight,
-    calendar_matrix, fg_for, member_color, next_in_cycle, shade_color,
+    CARD_BORDER, CARD_HDR_HOLIDAY, CARD_HDR_NORMAL, CARD_HDR_WEEKEND,
+    CARD_TODAY_BORDER, LINE_CHIP, OVR_FONT, OVR_STYLE, WARN_SEVERITY_FG,
+    WEEK_COLOR_CHIP, WEEKDAY_HEADERS, MonthSelector, StatusBar,
+    archive_finalize_pdf_async, bind_hover_highlight, calendar_matrix,
+    card_body_bg, fg_for, member_color, next_in_cycle, shade_color,
     tint_color, vs_member_color,
 )
 
@@ -27,6 +28,9 @@ _WD = "一二三四五六日"
 
 _SCOPE_TITLE = {"r": "R 排班", "vs": "VS 排班"}
 _ORTOOLS_DEP = [("ortools==9.15.6755", "ortools")]
+# [2026-07-24 UI] 閒置時狀態列＝操作提示（左鍵輪換/右鍵選單原本無處可發現）。
+_IDLE_HINT = ("就緒｜月曆格：左鍵輪換人選、右鍵指定/鎖定/請假/清空"
+              "｜週六標頭粉週/綠週＝色塊連週規則的週色")
 
 
 class LeaveEditor(tk.Toplevel):
@@ -167,6 +171,7 @@ class CalendarDutyTab(ttk.Frame):
         self._status.pack(fill="x", side="bottom")
 
         self.refresh()
+        self._status.set(_IDLE_HINT)     # [2026-07-24] 閒置時顯示操作提示
 
     # ── 版面 ─────────────────────────────────────────────────────────────
     def _build_toolbar(self) -> None:
@@ -300,12 +305,17 @@ class CalendarDutyTab(ttk.Frame):
                       foreground="#B00" if wknd else "#000").grid(
                 row=0, column=c, sticky="nsew", padx=1, pady=1)
         y, m = int(ym[:4]), int(ym[5:7])
-        for r, week in enumerate(calendar_matrix(y, m), start=1):
+        weeks = calendar_matrix(y, m)
+        for r, week in enumerate(weeks, start=1):
             for c, d in enumerate(week):
                 self._make_cell(r, c, d, duty, holidays, params, members,
-                                biopsy)
+                                biopsy, week_colors=ctx_r.week_colors)
+        # [2026-07-24 易讀性] uniform＝七欄等寬、各週等高：最大化視窗時月曆平均撐滿,
+        # 不再依內容擠出寬窄不一的欄列。
         for c in range(7):
-            self._grid_holder.columnconfigure(c, weight=1)
+            self._grid_holder.columnconfigure(c, weight=1, uniform="cal")
+        for r in range(1, len(weeks) + 1):
+            self._grid_holder.rowconfigure(r, weight=1, uniform="calrow")
 
         self._refresh_side(ctx_r, duty["r"], members["r"], self._sum["r"])
         self._refresh_side(ctx_vs, duty["vs"], members["vs"], self._sum["vs"])
@@ -314,10 +324,12 @@ class CalendarDutyTab(ttk.Frame):
         self._apply_finalized_state()
 
     def _make_cell(self, r, c, d, duty, holidays, params, members,
-                   biopsy=None) -> None:
+                   biopsy=None, week_colors=None) -> None:
         """[2026-07-23 整合] 每格同時顯示一線(R)/三線(VS)兩列：線別色籤＋值班者
         成員色塊＋各自 🔒；R 週六另有切片紫籤列。各列可獨立左鍵輪換/右鍵選單；
-        滑鼠懸停藍框回饋（duty=members={"r":…, "vs":…}）。"""
+        滑鼠懸停藍框回饋（duty=members={"r":…, "vs":…}）。
+        [2026-07-24 易讀性] 週末/平日假日整格淡底（不只標頭）；週六標頭加粉週/綠週
+        色籤（week_colors＝ColorRule 的週色,「連續兩週末同色須換人」在月曆上看得懂）。"""
         if d is None:
             tk.Frame(self._grid_holder).grid(row=r, column=c)
             return
@@ -325,9 +337,10 @@ class CalendarDutyTab(ttk.Frame):
         holiday = d in holidays and not is_weekend(d)
         today = (d == date.today())
         pts = day_point(d, holidays, params)
+        body_bg = card_body_bg(is_weekend(d), holiday)
 
         border = CARD_TODAY_BORDER if today else CARD_BORDER
-        card = tk.Frame(self._grid_holder, bg=CARD_BG,
+        card = tk.Frame(self._grid_holder, bg=body_bg,
                         highlightthickness=(2 if today else 1),
                         highlightbackground=border)
         card.grid(row=r, column=c, sticky="nsew", padx=1, pady=1)
@@ -340,6 +353,12 @@ class CalendarDutyTab(ttk.Frame):
                  + ("假" if holiday else "") + ("  ⬅今天" if today else ""),
                  bg=hbg, fg=hfg, padx=4,
                  font=(OVR_FONT, 9, "bold")).pack(side="left")
+        wc_chip = (WEEK_COLOR_CHIP.get((week_colors or {}).get(week_key(d)))
+                   if d.weekday() == 5 else None)
+        if wc_chip:
+            wbg, wfg, wlab = wc_chip
+            tk.Label(hdr, text=wlab, bg=wbg, fg=wfg, padx=3,
+                     font=(OVR_FONT, 8, "bold")).pack(side="left", padx=(2, 0))
         tk.Label(hdr, text=f"{pts}點", bg=hbg, fg=hfg, padx=4,
                  font=(OVR_FONT, 8)).pack(side="right")
 
@@ -349,7 +368,7 @@ class CalendarDutyTab(ttk.Frame):
             locked = bool(cell_data.get("locked"))
             info = members[scope].get(pid)
             chip_bg, chip_fg, line = LINE_CHIP[scope]
-            row = tk.Frame(card, bg=CARD_BG)
+            row = tk.Frame(card, bg=body_bg)
             row.pack(fill="x", padx=3, pady=1)
             tk.Label(row, text=line, bg=chip_bg, fg=chip_fg, padx=3,
                      font=(OVR_FONT, 8, "bold")).pack(side="left")
@@ -369,7 +388,7 @@ class CalendarDutyTab(ttk.Frame):
                          justify="left", font=(OVR_FONT, 10, "bold")
                          ).pack(side="left", fill="x", expand=True, padx=(2, 0))
             else:
-                tk.Label(row, text="—" + (" 🔒" if locked else ""), bg=CARD_BG,
+                tk.Label(row, text="—" + (" 🔒" if locked else ""), bg=body_bg,
                          fg="#BBBBBB", padx=4, anchor="w",
                          font=(OVR_FONT, 10)).pack(side="left", fill="x",
                                                    expand=True, padx=(2, 0))
@@ -387,20 +406,22 @@ class CalendarDutyTab(ttk.Frame):
         # [週六切片] 週六格：切片負責人（紫籤＋代號+姓名，屬 R 名單）
         bp = ((biopsy or {}).get(iso) or {}).get("person")
         if bp:
-            brow = tk.Frame(card, bg=CARD_BG)
+            brow = tk.Frame(card, bg=body_bg)
             brow.pack(fill="x", padx=3, pady=(0, 2))
             cbg, cfg2 = OVR_STYLE["biopsy"]
             tk.Label(brow, text="切片", bg=cbg, fg=cfg2, padx=3,
                      font=(OVR_FONT, 8, "bold")).pack(side="left")
             tk.Label(brow, text=self._who_label(bp, members["r"].get(bp)),
-                     bg=CARD_BG, fg="#1A1A1A", padx=3, width=9,
+                     bg=body_bg, fg="#1A1A1A", padx=3, width=9,
                      wraplength=84, justify="left", anchor="w",
                      font=(OVR_FONT, 9, "bold")).pack(side="left")
         if not self._finalized:
             bind_hover_highlight(card, border)   # [UI 互動] 懸停藍框回饋
 
     def _refresh_warnings(self) -> None:
-        """兩線警告合併顯示（[R]/[VS] 前綴）。"""
+        """兩線警告合併顯示（[R]/[VS] 前綴）。
+        [2026-07-24 易讀性] 逐列依嚴重度上色（error 紅/warn 橘/info 灰）——
+        原本整面黑字,掃不出哪列是真擋排班的錯。"""
         self._warns.delete(0, tk.END)
         mark = {"error": "✗", "warn": "⚠", "info": "・"}
         for scope in ("r", "vs"):
@@ -408,8 +429,12 @@ class CalendarDutyTab(ttk.Frame):
                 self._warns.insert(
                     tk.END,
                     f"[{scope.upper()}]{mark.get(ck.severity, '?')} {ck.msg}")
+                fg = WARN_SEVERITY_FG.get(ck.severity)
+                if fg:
+                    self._warns.itemconfig(tk.END, foreground=fg)
         if not self._warns.size():
             self._warns.insert(tk.END, "（無）")
+            self._warns.itemconfig(tk.END, foreground="#9AA3AC")
 
     def _refresh_side(self, ctx, duty, members, tree) -> None:
         # 結算：由目前格子即時統計
@@ -516,7 +541,7 @@ class CalendarDutyTab(ttk.Frame):
         # RF-16：無條件恢復再套定案狀態——否則求解結束時若停在已定案月，「報告」鈕與
         # 「定案」勾選會被永久停用（切回未定案月也救不回）。
         self._busy_flag = False
-        self._status.set("就緒")
+        self._status.set(_IDLE_HINT)
         self._selector.set_enabled(True)
         for w in self._toolbar:
             w.config(state="normal")
@@ -686,7 +711,7 @@ class CalendarDutyTab(ttk.Frame):
         threading.Thread(target=work, name="roster-export", daemon=True).start()
 
     def _after_export(self, path, err) -> None:
-        self._status.set("就緒")
+        self._status.set(_IDLE_HINT)
         if err:
             messagebox.showerror("匯出失敗", f"匯出時發生錯誤：\n{err}")
         else:

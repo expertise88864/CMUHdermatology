@@ -32,6 +32,26 @@ CARD_HDR_WEEKEND = ("#F3DDDD", "#8B2020")    # 週末標頭
 CARD_HDR_HOLIDAY = ("#FFE3B8", "#8A5A00")    # 平日國定假日標頭
 CARD_SEP = "#E3E7EC"                    # 早/午分隔線
 CARD_HOVER_BORDER = "#5B8DEF"           # 滑鼠懸停框（可點擊格的視覺回饋）
+# [2026-07-24 使用者易讀性] 格「身」也上淡底（原本只有標頭有色、格身全白 → 掃視時
+# 週末/假日欄不突出）。淡到不干擾成員色塊，但整欄一眼可辨。
+CARD_BODY_WEEKEND = "#FBF3F5"           # 週末格身＝極淡粉
+CARD_BODY_HOLIDAY = "#FDF6E7"           # 平日國定假日格身＝極淡橘
+# 週色塊（粉/綠，ColorRule「連續兩週末同色須換人」的依據）→ 週六格標頭色籤，
+# 讓「為什麼這兩週換人」直接在月曆上看得懂。鍵值對齊 calendar_colors.PINK/GREEN。
+WEEK_COLOR_CHIP = {"pink": ("#F8BBD0", "#7A2044", "粉週"),
+                   "green": ("#C8E6C9", "#1B5E20", "綠週")}
+# 警告面板逐列前景色（依 Precheck.severity）——紅=擋、橘=注意、灰=僅供參考。
+WARN_SEVERITY_FG = {"error": "#B00020", "warn": "#B26500", "info": "#607080"}
+
+
+def card_body_bg(weekend: bool, holiday: bool) -> str:
+    """月曆格「身」底色：平日假日＞週末＞平日白。holiday 語意同 duty 標頭
+    （＝平日的國定假日；週末假日仍走週末色），caller 傳旗標、此處只管優先序。"""
+    if holiday:
+        return CARD_BODY_HOLIDAY
+    if weekend:
+        return CARD_BODY_WEEKEND
+    return CARD_BG
 # R/VS 合併分頁的線別色籤（chip 底色, chip 字色, 標籤）。
 # [2026-07-24 使用者] 淡底色籤在小尺寸下一線/三線幾乎分不出來 → 改深底白字高對比：
 # 一線=深紅底白字、三線=深藍底白字，一眼可辨。
@@ -60,6 +80,40 @@ def bind_hover_highlight(card, normal_color, hover=CARD_HOVER_BORDER) -> None:
             _walk(ch)
     _walk(card)
     card.bind("<Leave>", _off, add="+")
+
+
+def bind_canvas_mousewheel(canvas, wrap) -> None:
+    """[2026-07-24 UI 互動] 讓 Canvas 月曆吃滑鼠滾輪（Shift+滾輪＝水平）。
+
+    Windows 的 <MouseWheel> 不會自動送到指標下的 Canvas → 需要 bind_all；為避免
+    「全域滾輪污染」（先前 codex 在總覽視窗抓過：bind_all 讓滾輪連別的分頁/元件都
+    被劫走），handler 先檢查【指標當下是否落在 wrap 區域內】（含子元件，沿 master
+    鏈判定），不在就完全不動作——Treeview/Listbox 等原生 class binding 不受影響。
+    Enter/Leave 縮放式 bind/unbind 在這裡行不通：指標移進「格子（Canvas 子元件）」
+    會對 Canvas 發 Leave（NotifyInferior），滾輪會在格子上失效。"""
+    canvas.configure(yscrollincrement=24, xscrollincrement=24)
+
+    def _hit(e) -> bool:
+        try:
+            w = canvas.winfo_containing(e.x_root, e.y_root)
+        except (tk.TclError, KeyError):
+            return False
+        while w is not None:
+            if w is wrap:
+                return True
+            w = getattr(w, "master", None)
+        return False
+
+    def _scroll(e, horizontal=False):
+        if not _hit(e):
+            return
+        step = -3 if e.delta > 0 else 3
+        (canvas.xview_scroll if horizontal else canvas.yview_scroll)(step,
+                                                                     "units")
+
+    canvas.bind_all("<MouseWheel>", _scroll, add="+")
+    canvas.bind_all("<Shift-MouseWheel>",
+                    lambda e: _scroll(e, horizontal=True), add="+")
 
 # 成員色：色盲友善固定調色盤（藍/橙/綠/紫/棕/粉/青/黃）。
 # [2026-07-24 使用者] R 與 VS 各用【完全不相交】的調色盤——合併月曆每格上下並列
