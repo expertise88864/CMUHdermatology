@@ -8429,6 +8429,73 @@ def _reg64_micro_ttl_seconds(hour: int) -> int:
 NOTIFY_DO_NOT_DISTURB_START_HOUR = 0
 NOTIFY_DO_NOT_DISTURB_END_HOUR = 8
 
+
+# ── 電源策略（2026-07-24 使用者：主程式開著時螢幕關不掉）────────────────────────
+# 目標：螢幕 15 分鐘後照常關閉、但主機【不休眠】（監測/止掛提醒要繼續跑）。
+# 主程式開著時螢幕關不掉的常見元兇＝status driver 的 Chrome 對系統掛 DISPLAY
+# keep-awake（wake-lock）；本程式自己【從不】設 ES_DISPLAY_REQUIRED。
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001          # 只保系統不睡；【刻意不含】顯示器
+SCREEN_OFF_MINUTES = 15
+
+
+def _keep_system_awake_display_free() -> None:
+    """主緒呼叫：主程式存活期間系統不進睡眠（ES_CONTINUOUS 綁呼叫緒壽命→必須主緒），
+    但不設 ES_DISPLAY_REQUIRED → 螢幕照電源計畫時間關閉。失敗僅記 log（非致命）。
+    [codex P2] API 被拒時回 0（不拋例外）→ 檢查回傳值,不得誤報成功。"""
+    try:
+        prev = ctypes.windll.kernel32.SetThreadExecutionState(
+            _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED)
+        if prev:
+            logging.info("[電源] 已設定：主機不休眠（不含顯示器，螢幕可正常關閉）")
+        else:
+            logging.warning("[電源] SetThreadExecutionState 被拒（回 0），"
+                            "主機防睡眠未生效——依電源計畫的睡眠停用兜底")
+    except Exception:
+        logging.warning("[電源] SetThreadExecutionState 失敗", exc_info=True)
+
+
+def _apply_screen_off_power_plan() -> None:
+    """背景執行：以 powercfg 強制電源策略（主程式以 admin 執行，權限足夠）：
+      1. 螢幕 AC/DC 皆 15 分鐘後關閉；
+      2. 睡眠/休眠停用（=0，主機永不睡）。
+    ★【刻意永久性——使用者定案 2026-07-24】這是診間機的「常態」電源設定，程式退出
+    後【不還原】：需求就是這批機器平常螢幕 15 分要關、主機永不睡（夜間監測/止掛
+    提醒與 watchdog 都要跑）。退出還原會把機器帶回「螢幕永不關」的問題狀態
+    （codex 曾提退出還原，屬一般軟體慣例，與本機群的使用情境相反，故明文不採）。★
+    Chrome wake-lock 的處理【不在這裡】：只在我們自己啟動的 status driver 關掉
+    Wake Lock API（chrome_options 的 disable-blink-features=WakeLock）——[codex P1]
+    不可用全機 powercfg requestsoverride 壓 chrome.exe/python.exe 的 DISPLAY
+    （永久生效且波及使用者自己的 Chrome 看影片等正當 keep-awake）。
+    每條各自失敗只記 log，不影響其他條與主流程。"""
+    mins = str(SCREEN_OFF_MINUTES)
+    cmds = (
+        ("monitor-timeout-ac", mins), ("monitor-timeout-dc", mins),
+        ("standby-timeout-ac", "0"), ("standby-timeout-dc", "0"),
+        ("hibernate-timeout-ac", "0"), ("hibernate-timeout-dc", "0"),
+    )
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    failed = []
+    for key, val in cmds:
+        try:
+            cp = subprocess.run(["powercfg", "/change", key, val],
+                                creationflags=flags, capture_output=True,
+                                timeout=15, check=False)
+            # [codex P2] 檢查 returncode：無權限/不支援時不得無聲當成功
+            if cp.returncode != 0:
+                failed.append(key)
+                logging.warning("[電源] powercfg /change %s 失敗 rc=%s: %r",
+                                key, cp.returncode,
+                                (cp.stderr or cp.stdout or b"")[:200])
+        except Exception:
+            failed.append(key)
+            logging.debug("[電源] powercfg /change %s 例外", key, exc_info=True)
+    if failed:
+        logging.warning("[電源] 電源計畫【部分未生效】：%s（其餘已套用）",
+                        "、".join(failed))
+    else:
+        logging.info("[電源] 電源計畫已強制：螢幕 %s 分關閉、睡眠/休眠停用", mins)
+
 # [O10] 拉長主院 cache TTL 120s → 300s（5 分鐘）；分院 180 → 600s（10 分鐘）
 # 院方主機自身慢（~3-7s），cache 命中時 UI 立即顯示，不必每 2 分鐘抓一次
 REG52_MAIN_TTL_SECONDS = 300
@@ -15605,6 +15672,12 @@ class AutomationApp:
         # UI thread 等 GitHub raw，院內網路慢時 splash 卡 8-180s。子程式自己也會
         # 做 check_and_update，不必由主程式同步保證。
         _submit_startup_background("update-check", self.check_and_update, False)
+
+        # [2026-07-24 使用者] 螢幕 15 分鐘後可關閉、但主機不休眠。
+        # SetThreadExecutionState 必須在【主緒】呼叫(ES_CONTINUOUS 綁定呼叫緒的存活,
+        # 主緒=Tk mainloop 與行程同壽命);powercfg 批次丟背景(subprocess 不卡 UI)。
+        _keep_system_awake_display_free()
+        _submit_startup_background("power-policy", _apply_screen_off_power_plan)
 
         self.startup_phase_text.set("任務排程")
 

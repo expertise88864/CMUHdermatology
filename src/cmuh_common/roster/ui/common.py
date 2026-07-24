@@ -32,9 +32,11 @@ CARD_HDR_WEEKEND = ("#F3DDDD", "#8B2020")    # 週末標頭
 CARD_HDR_HOLIDAY = ("#FFE3B8", "#8A5A00")    # 平日國定假日標頭
 CARD_SEP = "#E3E7EC"                    # 早/午分隔線
 CARD_HOVER_BORDER = "#5B8DEF"           # 滑鼠懸停框（可點擊格的視覺回饋）
-# R/VS 合併分頁的線別色籤（chip 底色, chip 字色, 標籤）——一線紅系、三線藍系
-LINE_CHIP = {"r": ("#F5C6C2", "#78281F", "一線"),
-             "vs": ("#BBDDF2", "#1B4F72", "三線")}
+# R/VS 合併分頁的線別色籤（chip 底色, chip 字色, 標籤）。
+# [2026-07-24 使用者] 淡底色籤在小尺寸下一線/三線幾乎分不出來 → 改深底白字高對比：
+# 一線=深紅底白字、三線=深藍底白字，一眼可辨。
+LINE_CHIP = {"r": ("#C0392B", "#FFFFFF", "一線"),
+             "vs": ("#1F4E8C", "#FFFFFF", "三線")}
 
 
 def bind_hover_highlight(card, normal_color, hover=CARD_HOVER_BORDER) -> None:

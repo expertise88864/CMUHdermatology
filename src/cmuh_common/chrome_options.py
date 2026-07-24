@@ -33,6 +33,11 @@ _DISABLED_FEATURES = ",".join((
     "AcceptCHFrame",
     "InterestCohort",
     "AutofillServerCommunication",
+    # [2026-07-24 使用者] WakeLock：主程式常駐 status driver 若被頁面要求
+    # wake-lock 會對系統掛 DISPLAY keep-awake → 診間螢幕永遠關不掉。只關
+    # 【我們自己啟動的】Chrome 的 Wake Lock API,不影響使用者自己的 Chrome
+    # （codex P1:不可用全機 powercfg requestsoverride 誤傷他人看影片等情境）。
+    "WakeLock",
 ))
 
 
@@ -88,6 +93,10 @@ def build_chrome_options(headless: bool = True):
         "--js-flags=--max-old-space-size=128",
         # [v15] 用 disable-features 一次關一票背景功能 (見 _DISABLED_FEATURES)
         f"--disable-features={_DISABLED_FEATURES}",
+        # [2026-07-24 codex P1] Wake Lock 是 Blink runtime feature——頁面呼叫
+        # navigator.wakeLock 擋螢幕關閉要用 disable-blink-features 才真正關掉
+        # （上面 disable-features 的 WakeLock 為 browser 側保險,兩者並列）。
+        "--disable-blink-features=WakeLock",
     ]
     for a in args:
         opts.add_argument(a)
