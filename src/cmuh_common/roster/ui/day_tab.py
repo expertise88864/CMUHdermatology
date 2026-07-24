@@ -24,12 +24,13 @@ from cmuh_common.roster.solve_day import (
 from cmuh_common.roster.ui.common import (
     CARD_BG, CARD_BORDER, CARD_CANVAS_BG, CARD_HDR_NORMAL, CARD_HDR_WEEKEND,
     CARD_SEP, CARD_TODAY_BORDER, OVR_FONT, OVR_STYLE, WEEKDAY_HEADERS,
-    MonthSelector, StatusBar, archive_finalize_pdf_async, calendar_matrix,
+    MonthSelector, StatusBar, archive_finalize_pdf_async, bind_hover_highlight,
+    calendar_matrix,
 )
 from cmuh_common.roster.ui.duty import LeaveEditor
 
 _WD = "一二三四五六日"
-_TITLE = {"pgy": "PGY 排班", "clerk": "Clerk 排班"}
+_TITLE = "PGY / Clerk 排班"
 
 
 def _split_codes(text: str) -> list:
@@ -79,10 +80,12 @@ _OVR_FONT = OVR_FONT
 
 
 class DayScheduleTab(ttk.Frame):
-    def __init__(self, master, service, scope, app):
+    """[2026-07-23 使用者整合] PGY + 見習 Clerk 合併為單一分頁（本來就是同一份
+    day_slots）：月曆總覽為預設檢視、右側同時放 PGY / Clerk 兩個週期統計面板。"""
+
+    def __init__(self, master, service, app):
         super().__init__(master)
         self.service = service
-        self.scope = scope           # "pgy" / "clerk"
         self.app = app
         self._finalized = False
 
@@ -97,7 +100,7 @@ class DayScheduleTab(ttk.Frame):
 
     # ── 版面 ─────────────────────────────────────────────────────────────
     def _build_toolbar(self) -> None:
-        bar = ttk.Frame(self, padding=(6, 6))
+        bar = ttk.Frame(self, padding=(6, 4))
         bar.pack(fill="x")
         self._selector = MonthSelector(bar, self.app.ym, self._on_month_change)
         self._selector.pack(side="left")
@@ -108,22 +111,6 @@ class DayScheduleTab(ttk.Frame):
         self._lock_btn.pack(side="left", padx=4)
         self._clear_btn = ttk.Button(bar, text="清除未鎖定", command=self._on_clear)
         self._clear_btn.pack(side="left", padx=4)
-        self._edit_btns = []                             # 定案時一併停用的編輯鈕
-        self._leave_btn = ttk.Button(bar, text="請假…", command=self._on_leave)
-        self._leave_btn.pack(side="left", padx=4)
-        self._edit_btns.append(self._leave_btn)
-        self._closure_btn = ttk.Button(bar, text="本月停診…",
-                                       command=self._on_clinic_closure)
-        self._closure_btn.pack(side="left", padx=4)
-        self._edit_btns.append(self._closure_btn)
-        if self.scope == "pgy":
-            pb = ttk.Button(bar, text="當月 PGY 人員…", command=self._edit_pgy_roster)
-            pb.pack(side="left", padx=4)
-            self._edit_btns.append(pb)
-            # [2026-07-23 使用者] Apply 本科 PGY（101 診週二/週五平手優先）
-            ab = ttk.Button(bar, text="Apply本科…", command=self._edit_apply_pref)
-            ab.pack(side="left", padx=4)
-            self._edit_btns.append(ab)
         ttk.Button(bar, text="報告/警告", command=self._on_report
                    ).pack(side="left", padx=4)
         # [2026-07-23 使用者] 月曆總覽改為分頁內建預設檢視;此鈕切換 列表↔月曆
@@ -134,7 +121,22 @@ class DayScheduleTab(ttk.Frame):
         self._final_var = tk.BooleanVar(value=False)
         self._final_chk = ttk.Checkbutton(
             bar, text="定案", variable=self._final_var, command=self._on_finalize)
-        self._final_chk.pack(side="left", padx=12)
+        self._final_chk.pack(side="left", padx=8)
+        # 第二列：名單/請假/停診等編輯（PGY 與 Clerk 並列）
+        bar2 = ttk.Frame(self, padding=(6, 0))
+        bar2.pack(fill="x")
+        self._edit_btns = []                             # 定案時一併停用的編輯鈕
+        for text, cmd in (
+                ("PGY 請假…", lambda: self._on_leave("pgy")),
+                ("Clerk 請假…", lambda: self._on_leave("clerk")),
+                ("本月停診…", self._on_clinic_closure),
+                ("當月 PGY 人員…", self._edit_pgy_roster),
+                ("Apply本科…", self._edit_apply_pref)):
+            b = ttk.Button(bar2, text=text, command=cmd)
+            b.pack(side="left", padx=4)
+            self._edit_btns.append(b)
+        ttk.Label(bar2, text="（Clerk 梯次/切片室開放於「設定」分頁管理）",
+                  foreground="gray").pack(side="left", padx=8)
 
     def _build_grid(self, parent) -> None:
         """中央區＝兩個可切換檢視：月曆總覽（預設；2026-07-23 使用者：比較少看列表）
@@ -202,39 +204,42 @@ class DayScheduleTab(ttk.Frame):
         self._show_view("list" if self._view_mode == "cal" else "cal")
 
     def _build_side(self, parent) -> None:
-        side = ttk.Frame(parent, width=250)
+        side = ttk.Frame(parent, width=260)
         side.pack(side="right", fill="y")
-        # [2026-07-23 使用者] 週期次數統計：PGY=本月(照光/週三午照/治療室/跟診/放假)、
-        # Clerk=整個兩週梯次(切片/跟診/放假,跨月合併),讓公平性可被直接驗證。
-        ttk.Label(side, text="週期次數統計",
-                  font=("Microsoft JhengHei UI", 10, "bold")
-                  ).pack(anchor="w", padx=6, pady=(6, 0))
-        if self.scope == "pgy":
-            cols = ("c", "p", "w", "t", "f", "r")
-            heads = (("c", "代號", 52), ("p", "照光", 40), ("w", "週三午", 50),
-                     ("t", "治療", 40), ("f", "跟診", 40), ("r", "放假", 40))
-            hint = "照光/治療室整月盡量一致；週三下午照光另獨立輪平均"
-        else:
-            cols = ("c", "b", "f", "r")
-            heads = (("c", "代號", 70), ("b", "切片", 46), ("f", "跟診", 46),
-                     ("r", "放假", 46))
-            hint = "每梯（兩週，跨月合併計）至少跟過一次切片室；紅底＝本梯尚未排到"
-        self._stats = ttk.Treeview(side, columns=cols, show="headings", height=9)
-        for c, t, w in heads:
-            self._stats.heading(c, text=t)
-            self._stats.column(c, width=w, anchor="center")
-        self._stats.tag_configure("hdr", background="#E8E8E8")
-        self._stats.tag_configure("miss", background="#FFD2D2")
-        self._stats.pack(fill="x", padx=6)
-        ttk.Label(side, text=hint, foreground="gray", wraplength=240,
+        # [2026-07-23 整合] 右側同時放 PGY 與 Clerk 兩個週期統計面板。
+        ttk.Label(side, text="PGY 週期統計（本月）",
+                  font=(_OVR_FONT, 10, "bold")).pack(anchor="w", padx=6,
+                                                     pady=(6, 0))
+        self._stats_pgy = ttk.Treeview(side, columns=("c", "p", "w", "t", "f",
+                                                      "r"),
+                                       show="headings", height=5)
+        for c, t, w in (("c", "代號", 52), ("p", "照光", 40), ("w", "週三午", 50),
+                        ("t", "治療", 40), ("f", "跟診", 40), ("r", "放假", 40)):
+            self._stats_pgy.heading(c, text=t)
+            self._stats_pgy.column(c, width=w, anchor="center")
+        self._stats_pgy.pack(fill="x", padx=6)
+        ttk.Label(side, text="照光/治療室整月盡量一致；週三下午照光另獨立輪平均",
+                  foreground="gray", wraplength=250,
                   justify="left").pack(anchor="w", padx=6, pady=(2, 0))
-        ttk.Label(side, text="警告", font=("Microsoft JhengHei UI", 10, "bold")
+        ttk.Label(side, text="Clerk 週期統計（整梯兩週）",
+                  font=(_OVR_FONT, 10, "bold")).pack(anchor="w", padx=6,
+                                                     pady=(8, 0))
+        self._stats_clerk = ttk.Treeview(side, columns=("c", "b", "f", "r"),
+                                         show="headings", height=5)
+        for c, t, w in (("c", "代號", 70), ("b", "切片", 46), ("f", "跟診", 46),
+                        ("r", "放假", 46)):
+            self._stats_clerk.heading(c, text=t)
+            self._stats_clerk.column(c, width=w, anchor="center")
+        self._stats_clerk.tag_configure("hdr", background="#E8E8E8")
+        self._stats_clerk.tag_configure("miss", background="#FFD2D2")
+        self._stats_clerk.pack(fill="x", padx=6)
+        ttk.Label(side, text="每梯（跨月合併計）至少跟過一次切片室；紅底＝尚未排到",
+                  foreground="gray", wraplength=250,
+                  justify="left").pack(anchor="w", padx=6, pady=(2, 0))
+        ttk.Label(side, text="警告", font=(_OVR_FONT, 10, "bold")
                   ).pack(anchor="w", padx=6, pady=(6, 0))
-        self._warns = tk.Listbox(side, width=32, height=12)
+        self._warns = tk.Listbox(side, width=32, height=10)
         self._warns.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-        if self.scope == "clerk":
-            ttk.Label(side, text="（Clerk 梯次/切片室開放\n於「設定」分頁管理）",
-                      foreground="gray").pack(anchor="w", padx=6)
 
     # ── 資料 → 畫面 ──────────────────────────────────────────────────────
     def refresh(self) -> None:
@@ -278,25 +283,25 @@ class DayScheduleTab(ttk.Frame):
             logging.debug("[roster.ui] 月曆總覽重繪失敗", exc_info=True)
 
     def _refresh_stats(self) -> None:
-        """[2026-07-23] 側欄週期次數統計（吃存檔 day_slots，含手動改過的格）。"""
+        """[2026-07-23] 側欄週期次數統計（PGY+Clerk 皆刷；吃存檔 day_slots）。"""
         data = self.service.day_course_stats(self.app.ym)
-        t = self._stats
+        t = self._stats_pgy
         t.delete(*t.get_children())
-        if self.scope == "pgy":
-            stats, roster = data["pgy"]["stats"], data["pgy"]["roster"]
-            for c in sorted({*roster, *stats}):
-                st = stats.get(c) or dict.fromkeys(STAT_KEYS, 0)
-                t.insert("", "end", values=(c, st["photo"], st["photo_wed_pm"],
-                                            st["tx"], st["follow"], st["rest"]))
-            return
+        stats, roster = data["pgy"]["stats"], data["pgy"]["roster"]
+        for c in sorted({*roster, *stats}):
+            st = stats.get(c) or dict.fromkeys(STAT_KEYS, 0)
+            t.insert("", "end", values=(c, st["photo"], st["photo_wed_pm"],
+                                        st["tx"], st["follow"], st["rest"]))
+        t2 = self._stats_clerk
+        t2.delete(*t2.get_children())
         for b in data["batches"]:
-            t.insert("", "end", tags=("hdr",),
-                     values=(f"梯 {b['start'][5:]}~{b['end'][5:]}", "", "", ""))
+            t2.insert("", "end", tags=("hdr",),
+                      values=(f"梯 {b['start'][5:]}~{b['end'][5:]}", "", "", ""))
             for c in sorted({*b["members"], *b["stats"]}):
                 st = b["stats"].get(c) or dict.fromkeys(STAT_KEYS, 0)
-                t.insert("", "end",
-                         tags=(("miss",) if st["biopsy"] == 0 else ()),
-                         values=(c, st["biopsy"], st["follow"], st["rest"]))
+                t2.insert("", "end",
+                          tags=(("miss",) if st["biopsy"] == 0 else ()),
+                          values=(c, st["biopsy"], st["follow"], st["rest"]))
 
     def _refresh_warnings(self, warnings) -> None:
         self._warns.delete(0, tk.END)
@@ -306,10 +311,10 @@ class DayScheduleTab(ttk.Frame):
             self._warns.insert(tk.END, "（無警告）")
 
     # ── 名單 ─────────────────────────────────────────────────────────────
-    def _roster_members(self) -> list:
-        """側邊/請假用的成員清單 [{id,name}]。"""
+    def _roster_members(self, scope: str) -> list:
+        """側邊/請假用的成員清單 [{id,name}]（scope="pgy"/"clerk"）。"""
         ym = self.app.ym
-        if self.scope == "pgy":
+        if scope == "pgy":
             inp = self.service.build_day_input(ym)
             return [{"id": c, "name": ""} for c in inp.pgy_roster]
         y, m = int(ym[:4]), int(ym[5:7])
@@ -364,7 +369,7 @@ class DayScheduleTab(ttk.Frame):
             eff_slots = day_slots
         report = self._format_report(log, warnings, eff_slots)
         win = tk.Toplevel(self)
-        win.title(f"日排班預覽 · {_TITLE[self.scope]} · {self.app.ym}")
+        win.title(f"日排班預覽 · {_TITLE} · {self.app.ym}")
         win.transient(self)
         txt = tk.Text(win, wrap="none", width=70, height=28, font=("Consolas", 10))
         txt.insert("1.0", report)
@@ -388,26 +393,33 @@ class DayScheduleTab(ttk.Frame):
         ttk.Button(bar, text="取消", command=win.destroy).pack(side="right")
         win.grab_set()
 
-    def _on_toggle_lock(self) -> None:
+    def _toggle_lock_session(self, d: date, session: str) -> None:
+        """鎖定/解鎖某(日,時段)。解鎖一律允許；只有「要新鎖定空時段」才擋
+        （避免鎖住無內容的格後無法解）。列表選取與月曆格選單共用。"""
         if self._finalized:
             return
-        sel = self._tree.selection()
-        if not sel or "|" not in sel[0]:
-            if self._view_mode == "cal":     # 月曆檢視無法選取 → 提示切列表
-                messagebox.showinfo(
-                    "鎖定", "請先按「切換列表檢視」，在列表中選取要鎖定/解鎖的時段")
-            return
-        iso, session = sel[0].split("|", 1)
-        d = date.fromisoformat(iso)
-        # 解鎖一律允許；只有「要新鎖定空時段」才擋（避免鎖住無內容的格後無法解）
         if not self.service.is_day_locked(self.app.ym, d, session):
-            slots = ((self.service.storage.load_month(self.app.ym).get("day_slots")
-                      or {}).get(iso) or {}).get(session)
+            slots = ((self.service.storage.load_month(self.app.ym)
+                      .get("day_slots") or {}).get(d.isoformat())
+                     or {}).get(session)
             if not slots:
                 messagebox.showinfo("鎖定", "此時段尚未排班，無法鎖定")
                 return
         self.service.toggle_day_lock(self.app.ym, d, session)
         self.refresh()
+
+    def _on_toggle_lock(self) -> None:
+        if self._finalized:
+            return
+        sel = self._tree.selection()
+        if not sel or "|" not in sel[0]:
+            if self._view_mode == "cal":     # 月曆檢視：直接點格子也可鎖定
+                messagebox.showinfo(
+                    "鎖定", "月曆檢視可直接點日期格 → 選「鎖定上午/下午」；\n"
+                            "或按「切換列表檢視」在列表中選取時段後再按本鈕")
+            return
+        iso, session = sel[0].split("|", 1)
+        self._toggle_lock_session(date.fromisoformat(iso), session)
 
     def _on_clear(self) -> None:
         if self._finalized:
@@ -422,14 +434,14 @@ class DayScheduleTab(ttk.Frame):
         self.refresh()
         self._refresh_warnings([])
 
-    def _on_leave(self) -> None:
+    def _on_leave(self, scope: str) -> None:
         if self._finalized:
             return
-        members = self._roster_members()
+        members = self._roster_members(scope)
         if not members:
             messagebox.showinfo("請假", "本月沒有可請假的人員（先設定 PGY 人員 / Clerk 梯次）")
             return
-        ed = LeaveEditor(self, self.service, self.scope, self.app.ym, "leave",
+        ed = LeaveEditor(self, self.service, scope, self.app.ym, "leave",
                          members=members)
         self.wait_window(ed)
         self.refresh()
@@ -463,7 +475,7 @@ class DayScheduleTab(ttk.Frame):
         週二/週五早午的 101 診在【次數平手時】優先排這些人（公平最優先）。"""
         if self._finalized:
             return
-        roster = [m["id"] for m in self._roster_members()]
+        roster = [m["id"] for m in self._roster_members("pgy")]
         if not roster:
             messagebox.showinfo("Apply本科", "本月沒有 PGY 人員（先設定當月 PGY）")
             return
@@ -518,7 +530,7 @@ class DayScheduleTab(ttk.Frame):
         month = self.service.storage.load_month(self.app.ym)
         text = month.get("day_report") or "（本月尚未套用日排班，無報告）"
         win = tk.Toplevel(self)
-        win.title(f"{_TITLE[self.scope]} 報告/警告 · {self.app.ym}")
+        win.title(f"{_TITLE} 報告/警告 · {self.app.ym}")
         t = tk.Text(win, wrap="none", width=70, height=30, font=("Consolas", 10))
         t.insert("1.0", text)
         t.config(state="disabled")
@@ -567,6 +579,37 @@ class DayScheduleTab(ttk.Frame):
                                                           fill="x", expand=True)
         return cell
 
+    def _attach_cell_menu(self, cell, d) -> None:
+        """[2026-07-23 使用者②] 月曆格可直接點選編輯：左/右鍵 → 選單（編輯上午/下午
+        的各格＝強制指定照光/治療室/切片/跟診/放假；鎖定切換），免切列表。含懸停回饋。"""
+        def _menu(event):
+            if self._finalized:
+                return
+            m = tk.Menu(self, tearoff=0)
+            for session in ("上午", "下午"):
+                m.add_command(
+                    label=f"編輯{session}（照光/治療室/切片/跟診/放假）…",
+                    command=lambda s=session: _DayEditDialog(
+                        self, self.service, self.app.ym, d, s, self.refresh))
+            m.add_separator()
+            for session in ("上午", "下午"):
+                locked = self.service.is_day_locked(self.app.ym, d, session)
+                m.add_command(
+                    label=f"{'解鎖' if locked else '鎖定'}{session} 🔒",
+                    command=lambda s=session: self._toggle_lock_session(d, s))
+            m.tk_popup(event.x_root, event.y_root)
+
+        def _bind_tree(w):
+            w.bind("<Button-1>", _menu)
+            w.bind("<Button-3>", _menu)
+            w.configure(cursor="hand2")
+            for ch in w.winfo_children():
+                _bind_tree(ch)
+        if not self._finalized:
+            _bind_tree(cell)
+            bind_hover_highlight(
+                cell, CARD_TODAY_BORDER if d == date.today() else CARD_BORDER)
+
     def _render_calendar(self, day_slots: dict) -> None:
         """[2026-07-23 使用者] 內嵌月曆總覽（分頁預設檢視）：整月色籤卡片格狀重繪。
         頂列＝月份＋色籤圖例；每格＝當日早/午的照/治/切/跟診房/放假。"""
@@ -599,6 +642,8 @@ class DayScheduleTab(ttk.Frame):
                 cell = self._build_overview_cell(
                     body, d, day_slots.get(d.isoformat()) or {})
                 cell.grid(row=r, column=c, sticky="nsew", padx=2, pady=2)
+                # [2026-07-23 使用者②] 月曆格可直接點選編輯/鎖定（免切列表）
+                self._attach_cell_menu(cell, d)
         for c in range(7):
             body.columnconfigure(c, weight=1, minsize=172)
 

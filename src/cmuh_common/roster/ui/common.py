@@ -31,6 +31,33 @@ CARD_HDR_NORMAL = ("#E7EDF4", "#2A3B50")     # 平日標頭（底, 字）
 CARD_HDR_WEEKEND = ("#F3DDDD", "#8B2020")    # 週末標頭
 CARD_HDR_HOLIDAY = ("#FFE3B8", "#8A5A00")    # 平日國定假日標頭
 CARD_SEP = "#E3E7EC"                    # 早/午分隔線
+CARD_HOVER_BORDER = "#5B8DEF"           # 滑鼠懸停框（可點擊格的視覺回饋）
+# R/VS 合併分頁的線別色籤（chip 底色, chip 字色, 標籤）——一線紅系、三線藍系
+LINE_CHIP = {"r": ("#F5C6C2", "#78281F", "一線"),
+             "vs": ("#BBDDF2", "#1B4F72", "三線")}
+
+
+def bind_hover_highlight(card, normal_color, hover=CARD_HOVER_BORDER) -> None:
+    """[2026-07-23 UI 互動強化] 可點擊卡片的滑鼠懸停回饋：進入變藍框、離開還原。
+    Enter 綁到卡片與所有子元件（游標移到子元件時保持高亮）；Leave 只綁卡片本體。"""
+    def _on(_e):
+        try:
+            card.config(highlightbackground=hover)
+        except tk.TclError:
+            pass
+
+    def _off(_e):
+        try:
+            card.config(highlightbackground=normal_color)
+        except tk.TclError:
+            pass
+
+    def _walk(w):
+        w.bind("<Enter>", _on, add="+")
+        for ch in w.winfo_children():
+            _walk(ch)
+    _walk(card)
+    card.bind("<Leave>", _off, add="+")
 
 # 成員色：色盲友善固定調色盤（藍/橙/綠/紫/棕/粉/青/黃），足夠 R(≤4)/VS(≤8) 用。
 MEMBER_PALETTE = (

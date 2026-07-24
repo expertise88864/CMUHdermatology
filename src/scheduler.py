@@ -133,12 +133,13 @@ class ScheduleApp:
         self._builders: dict = {}
         self._built: dict = {}
 
+        # [2026-07-23 使用者整合] R+VS 合併為「值班排班」單一分頁（月曆每格顯示
+        # 一線/三線、右側兩個結算）；PGY+Clerk 合併為「PGY/Clerk 排班」（本來就共用
+        # day_slots，右側兩個統計）。
         specs = [
             ("設定", self._build_settings),
-            ("R 排班", lambda c: self._build_duty(c, "r")),
-            ("VS 排班", lambda c: self._build_duty(c, "vs")),
-            ("PGY", lambda c: self._build_day(c, "pgy")),
-            ("見習 Clerk", lambda c: self._build_day(c, "clerk")),
+            ("值班排班 R/VS", self._build_duty),
+            ("PGY / Clerk 排班", self._build_day),
         ]
         for name, builder in specs:
             cont = ttk.Frame(nb)
@@ -178,16 +179,16 @@ class ScheduleApp:
         tab.pack(fill="both", expand=True)
         return tab
 
-    def _build_duty(self, cont, scope):
-        tab = CalendarDutyTab(cont, self.service, scope, self)
+    def _build_duty(self, cont):
+        tab = CalendarDutyTab(cont, self.service, self)
         tab.pack(fill="both", expand=True)
-        self._duty_tabs[scope] = tab
+        self._duty_tabs["rvs"] = tab
         return tab
 
-    def _build_day(self, cont, scope):
-        tab = DayScheduleTab(cont, self.service, scope, self)
+    def _build_day(self, cont):
+        tab = DayScheduleTab(cont, self.service, self)
         tab.pack(fill="both", expand=True)
-        self._day_tabs[scope] = tab
+        self._day_tabs["day"] = tab
         return tab
 
     def _build_placeholder(self, cont, text):

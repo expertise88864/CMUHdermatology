@@ -200,35 +200,35 @@ def test_shift_biopsy_grid_on_start_change(root, tmp_path):
 
 def test_duty_tab_manual_edit_and_lock(root, tmp_path):
     svc = _svc(tmp_path)
-    tab = CalendarDutyTab(root, svc, "r", _app())
+    tab = CalendarDutyTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
 
     d = date(2026, 8, 3)                       # 週一
-    tab._on_cell_left(d)                       # None → A（名單首位）
+    tab._on_cell_left(d, "r")                       # None → A（名單首位）
     cell = svc.storage.load_month(YM)["r_duty"]["2026-08-03"]
     assert cell["person"] == "A" and cell["locked"] is False
 
-    tab._toggle_lock(d)
+    tab._toggle_lock(d, "r")
     assert svc.storage.load_month(YM)["r_duty"]["2026-08-03"]["locked"] is True
     assert svc.build_context("r", YM).locks == {d: "A"}
 
-    tab._set_cell_and_refresh(date(2026, 8, 4), "B")
+    tab._set_cell_and_refresh(date(2026, 8, 4), "B", "r")
     assert svc.storage.load_month(YM)["r_duty"]["2026-08-04"]["person"] == "B"
 
 
 def test_duty_tab_clear_unlocked_keeps_locked(root, tmp_path):
     svc = _svc(tmp_path)
-    tab = CalendarDutyTab(root, svc, "r", _app())
+    tab = CalendarDutyTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
-    tab._set_cell_and_refresh(date(2026, 8, 5), "A")
-    tab._set_cell_and_refresh(date(2026, 8, 6), "B")
-    tab._toggle_lock(date(2026, 8, 5))         # 鎖定 8/5
+    tab._set_cell_and_refresh(date(2026, 8, 5), "A", "r")
+    tab._set_cell_and_refresh(date(2026, 8, 6), "B", "r")
+    tab._toggle_lock(date(2026, 8, 5), "r")         # 鎖定 8/5
     m = svc.storage.load_month(YM)             # RF-20：塞舊報告，清除後應一併清空
     m["report_r"] = "OLD"
     svc.storage.save_month(YM, m)
-    tab._on_clear_unlocked()                    # 清未鎖定（askyesno→True）
+    tab._on_clear_unlocked("r")                    # 清未鎖定（askyesno→True）
     duty = svc.storage.load_month(YM)["r_duty"]
     assert "2026-08-05" in duty                 # 鎖定保留
     assert "2026-08-06" not in duty             # 未鎖定被清
@@ -238,11 +238,11 @@ def test_duty_tab_clear_unlocked_keeps_locked(root, tmp_path):
 def test_rf05_discards_result_when_month_changed(root, tmp_path):
     """RF-05：求解期間切月 → 結果屬別的月 → 捨棄不預覽/不套用。"""
     svc = _svc(tmp_path)
-    tab = CalendarDutyTab(root, svc, "r", _app())
+    tab = CalendarDutyTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
     tab.app.ym = "2026-09"                       # 求解期間切走月份
-    tab._on_solved(types.SimpleNamespace(status="ok"), "2026-08")
+    tab._on_solved(types.SimpleNamespace(status="ok"), "2026-08", "r")
     assert not [w for w in tab.winfo_children() if isinstance(w, tk.Toplevel)]
     assert svc.storage.load_month("2026-09").get("r_duty") == {}
 
@@ -250,7 +250,7 @@ def test_rf05_discards_result_when_month_changed(root, tmp_path):
 def test_rf05_selector_disabled_while_busy(root, tmp_path):
     """RF-05：求解中 MonthSelector 的 ◀▶ 停用；結束恢復。"""
     svc = _svc(tmp_path)
-    tab = CalendarDutyTab(root, svc, "r", _app())
+    tab = CalendarDutyTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
     tab._busy("x")
@@ -266,54 +266,57 @@ def test_rf16_unbusy_on_finalized_month_keeps_report_and_final(root, tmp_path):
     m = svc.storage.load_month("2026-09")
     m["finalized"] = True
     svc.storage.save_month("2026-09", m)
-    tab = CalendarDutyTab(root, svc, "r", _app())    # app.ym=2026-08（未定案）
+    tab = CalendarDutyTab(root, svc, _app())    # app.ym=2026-08（未定案）
     tab.pack(fill="both", expand=True)
     root.update()
     tab._busy("x")
     tab._on_month_change("2026-09")                   # 求解中切到已定案月
     tab._unbusy()                                     # 求解結束
-    assert str(tab._report_btn["state"]) == "normal"
+    assert str(tab._report_btns["r"]["state"]) == "normal"
     assert str(tab._final_chk["state"]) == "normal"
     tab._on_month_change("2026-08")                   # 切回未定案月
-    assert str(tab._auto_btn["state"]) == "normal"
+    assert str(tab._auto_btns["r"]["state"]) == "normal"
 
 
 def test_rf17_refresh_during_busy_keeps_disabled_and_no_edit(root, tmp_path):
     """RF-17：求解中 refresh 不得重新啟用編輯鈕；手排格為 no-op。"""
     svc = _svc(tmp_path)
-    tab = CalendarDutyTab(root, svc, "r", _app())
+    tab = CalendarDutyTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
     tab._busy("x")
     tab.refresh()                                     # 切月/設定變更會觸發
-    assert str(tab._auto_btn["state"]) == "disabled"
-    assert str(tab._clear_btn["state"]) == "disabled"
-    assert str(tab._resettle_btn["state"]) == "disabled"
-    tab._on_cell_left(date(2026, 8, 3))               # 求解中手排 → no-op
+    assert str(tab._auto_btns["r"]["state"]) == "disabled"
+    assert str(tab._clear_btns["r"]["state"]) == "disabled"
+    assert str(tab._resettle_btns["r"]["state"]) == "disabled"
+    tab._on_cell_left(date(2026, 8, 3), "r")               # 求解中手排 → no-op
     assert "2026-08-03" not in svc.storage.load_month(YM).get("r_duty", {})
 
 
 def test_duty_tab_finalize_disables_editing(root, tmp_path):
     svc = _svc(tmp_path)
-    tab = CalendarDutyTab(root, svc, "r", _app())
+    tab = CalendarDutyTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
     tab._final_var.set(True)
     tab._on_finalize()
     assert svc.storage.load_month(YM)["finalized"] is True
-    assert str(tab._auto_btn["state"]) == "disabled"
+    assert str(tab._auto_btns["r"]["state"]) == "disabled"
     tab._final_var.set(False)
     tab._on_finalize()
     assert svc.storage.load_month(YM)["finalized"] is False
 
 
-def test_vs_tab_reuses_same_class(root, tmp_path):
+def test_vs_row_edits_vs_scope_in_merged_tab(root, tmp_path):
+    """[2026-07-23 整合] 同一分頁點 VS（三線）列 → 只改 vs_duty，不碰 r_duty。"""
     svc = _svc(tmp_path)
-    tab = CalendarDutyTab(root, svc, "vs", _app())   # scope="vs" 直接重用
+    tab = CalendarDutyTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
-    tab._on_cell_left(date(2026, 8, 3))
-    assert svc.storage.load_month(YM)["vs_duty"]["2026-08-03"]["person"] == "D"
+    tab._on_cell_left(date(2026, 8, 3), "vs")
+    m = svc.storage.load_month(YM)
+    assert m["vs_duty"]["2026-08-03"]["person"] == "D"
+    assert "2026-08-03" not in (m.get("r_duty") or {})     # 一線不受影響
 
 
 def test_leave_editor_saves(root, tmp_path):
@@ -332,17 +335,17 @@ def test_leave_editor_saves(root, tmp_path):
 # ─── PGY/Clerk 日排班分頁 ────────────────────────────────────────────────────
 def test_pgy_day_tab_builds_and_roster(root, tmp_path):
     svc = _svc(tmp_path)
-    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab = DayScheduleTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
     assert "2026-08-03|上午" in tab._tree.get_children()   # 週一有工作日列
-    assert tab._roster_members() == [{"id": "A", "name": ""},
+    assert tab._roster_members("pgy") == [{"id": "A", "name": ""},
                                      {"id": "B", "name": ""}]
 
 
 def test_clerk_day_tab_builds(root, tmp_path):
     svc = _svc(tmp_path)
-    tab = DayScheduleTab(root, svc, "clerk", _app())
+    tab = DayScheduleTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
     assert tab._tree.get_children()
@@ -350,7 +353,7 @@ def test_clerk_day_tab_builds(root, tmp_path):
 
 def test_day_tab_auto_accept_flow(root, tmp_path):
     svc = _svc(tmp_path)
-    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab = DayScheduleTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
     ds, _log, _w = svc.run_day_solve(YM)
@@ -363,7 +366,7 @@ def test_day_tab_auto_accept_flow(root, tmp_path):
 def test_clinic_closure_dialog_closes_room(root, tmp_path):
     """本月停診對話框：選診間+日期+時段→停診，寫進 grid_overrides。"""
     svc = _svc(tmp_path)                                    # 模板 週一 上午 101
-    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab = DayScheduleTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
     dlg = day_mod._ClinicClosureDialog(tab, svc, YM)
@@ -393,7 +396,7 @@ def test_day_edit_dialog_saves(root, tmp_path):
 
 def test_day_tab_lock_toggle(root, tmp_path):
     svc = _svc(tmp_path)
-    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab = DayScheduleTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
     svc.accept_day_solution(YM, svc.run_day_solve(YM)[0])
@@ -407,7 +410,7 @@ def test_day_tab_lock_toggle(root, tmp_path):
 def test_day_tab_can_unlock_empty_session(root, tmp_path):
     """鎖定後把該時段清空 → 仍能從 UI 解鎖（不被空時段擋，codex P2）。"""
     svc = _svc(tmp_path)
-    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab = DayScheduleTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
     svc.accept_day_solution(YM, svc.run_day_solve(YM)[0])
@@ -423,15 +426,16 @@ def test_day_tab_can_unlock_empty_session(root, tmp_path):
 
 def test_day_tab_finalize_disables_edit_controls(root, tmp_path):
     svc = _svc(tmp_path)
-    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab = DayScheduleTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
     tab._final_var.set(True)
     tab._on_finalize()
     assert str(tab._auto_btn["state"]) == "disabled"
-    assert str(tab._leave_btn["state"]) == "disabled"
+    for b in tab._edit_btns:                               # 兩列編輯鈕全停用
+        assert str(b["state"]) == "disabled"
     tab._edit_pgy_roster()                                 # 定案後為 no-op，不炸
-    tab._on_leave()
+    tab._on_leave("pgy")
     assert svc.storage.load_month(YM)["finalized"] is True
 
 
@@ -484,7 +488,7 @@ def test_rs07_day_tab_refresh_populates_warnings(root, tmp_path):
     """[RS-07] refresh 會呼叫 quick_validate_day 並填警告面板（週三下午治療室有人）。"""
     svc = _svc(tmp_path)
     svc.set_day_slot(YM, date(2026, 8, 5), "下午", "治療室", ["A"])   # 週三下午
-    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab = DayScheduleTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
     tab.refresh()
@@ -495,7 +499,7 @@ def test_rs07_day_tab_refresh_populates_warnings(root, tmp_path):
 def test_rs01_day_tab_export_cancel_no_crash(root, tmp_path, monkeypatch):
     """[RS-01] 日排班分頁「匯出」鈕：取消存檔對話框 → 直接 return，不起緒、不炸。"""
     svc = _svc(tmp_path)
-    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab = DayScheduleTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
     monkeypatch.setattr(day_mod.filedialog, "asksaveasfilename", lambda **k: "")
@@ -505,7 +509,7 @@ def test_rs01_day_tab_export_cancel_no_crash(root, tmp_path, monkeypatch):
 def test_day_tab_default_calendar_view_and_toggle(root, tmp_path):
     """[2026-07-23 使用者] 預設檢視＝月曆總覽（比較少看列表）；按鈕切換列表↔月曆。"""
     svc = _svc(tmp_path)
-    tab = DayScheduleTab(root, svc, "pgy", _app())
+    tab = DayScheduleTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
     assert tab._view_mode == "cal"                         # 預設月曆
@@ -514,3 +518,32 @@ def test_day_tab_default_calendar_view_and_toggle(root, tmp_path):
     assert tab._view_mode == "list"
     tab._on_toggle_view()
     assert tab._view_mode == "cal"
+
+
+def test_merged_duty_tab_has_both_summaries(root, tmp_path):
+    """[2026-07-23 整合] 合併值班分頁：右側同時有 R 與 VS 兩個結算面板，各自統計。"""
+    svc = _svc(tmp_path)
+    tab = CalendarDutyTab(root, svc, _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    tab._set_cell_and_refresh(date(2026, 8, 3), "A", "r")
+    tab._set_cell_and_refresh(date(2026, 8, 3), "D", "vs")
+    r_rows = [tab._sum["r"].item(i)["values"]
+              for i in tab._sum["r"].get_children()]
+    vs_rows = [tab._sum["vs"].item(i)["values"]
+               for i in tab._sum["vs"].get_children()]
+    assert any(str(v[0]) == "A" and int(v[2]) == 1 for v in r_rows)   # R 平日1班
+    assert any(str(v[0]) == "D" and int(v[2]) == 1 for v in vs_rows)  # VS 平日1班
+
+
+def test_merged_day_tab_has_both_stats_and_cell_menu(root, tmp_path):
+    """[2026-07-23 整合] 合併日排班分頁：PGY/Clerk 兩個統計面板都在；月曆格
+    有直接編輯選單掛載（_attach_cell_menu 於 _render_calendar 逐格呼叫）。"""
+    import inspect as _ins
+    svc = _svc(tmp_path)
+    tab = DayScheduleTab(root, svc, _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    assert tab._stats_pgy.winfo_exists() and tab._stats_clerk.winfo_exists()
+    src = _ins.getsource(day_mod.DayScheduleTab._render_calendar)
+    assert "_attach_cell_menu(" in src, "月曆格應可直接點選編輯"
