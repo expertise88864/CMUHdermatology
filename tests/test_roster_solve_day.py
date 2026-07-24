@@ -111,13 +111,64 @@ def test_biopsy_fresh_pair_one_in_biopsy_one_in_room():
     assert sorted([*slots[BIOPSY], *slots["101"]]) == ["1", "2"]
 
 
-def test_biopsy_open_but_no_clerk_warns():
+def test_biopsy_open_but_no_clerk_stays_silent():
+    """[2026-07-24 使用者] 切片室空下來沒關係 → 開放但無 Clerk 不再逐時段警告
+    （噪音）；真正整梯輪不到者由月底「切片室輪不到」警告點名。"""
     fc = FairCounters()
     slots, log = solve_session(
         date(2026, 8, 3), "上午", ["101"],
         pgy_avail=["A"], clerk_avail=[], biopsy_open=True, fc=fc)
     assert BIOPSY not in slots
-    assert any("切片室開放但無 Clerk" in ln for ln in log)
+    assert not any("切片室" in ln for ln in log)
+
+
+def test_biopsy_left_empty_when_all_done():
+    """[2026-07-24 使用者] 每人整梯一次就好：全員都輪過 → 切片室空下來，
+    Clerk 改進診間，不硬塞、不警告。"""
+    fc = FairCounters()
+    fc.biopsy_done[("bx", "1")] = 1
+    fc.biopsy_done[("bx", "2")] = 1
+    slots, log = solve_session(
+        date(2026, 8, 3), "上午", ["101"],
+        pgy_avail=["A", "B"], clerk_avail=["1", "2"],
+        biopsy_open=True, fc=fc, batch_key="bx")
+    assert BIOPSY not in slots, f"全員輪過仍排切片: {slots}"
+    assert sorted(slots["101"]) == ["1", "2"]                # 改進診間
+    assert not any("⚠" in ln for ln in log)
+
+
+def test_biopsy_not_morning_and_afternoon_same_person_same_day():
+    """[2026-07-24 使用者] 同一人不得同日早+午都切片：早上切過→次數=1，
+    下午不再是候選（唯一 Clerk 時下午切片室留空、人進診間）。"""
+    fc = FairCounters()
+    d = date(2026, 8, 3)
+    am, _ = solve_session(d, "上午", ["101"], pgy_avail=["A", "B", "C"],
+                          clerk_avail=["1"], biopsy_open=True, fc=fc,
+                          batch_key="bx")
+    assert am[BIOPSY] == ["1"]
+    pm, _ = solve_session(d, "下午", ["101"], pgy_avail=["A", "B", "C"],
+                          clerk_avail=["1"], biopsy_open=True, fc=fc,
+                          batch_key="bx")
+    assert BIOPSY not in pm, f"同日下午又切片: {pm}"
+    assert "1" in pm.get("101", []), "下午應改進診間跟診"
+
+
+def test_biopsy_exactly_once_per_clerk_over_month():
+    """[2026-07-24 使用者] 整月切片開好開滿 → 每位 Clerk 恰好一次（不是至少
+    一次），之後所有時段切片室留空。"""
+    fc = FairCounters()
+    clerks = ["K1", "K2", "K3"]
+    d = date(2026, 8, 3)
+    filled = 0
+    for _ in range(10):                       # 10 個工作日早診、全開切片
+        if d.weekday() < 5 and d.weekday() != 2:
+            slots, _ = solve_session(d, "上午", ["101"], [], list(clerks),
+                                     True, fc, batch_key="bx")
+            filled += 1 if BIOPSY in slots else 0
+        d += timedelta(days=1)
+    assert filled == 3, f"應恰排 3 次(每人一次)後留空: {filled}"
+    assert all(fc.biopsy_done.get(("bx", c), 0) == 1 for c in clerks), \
+        f"每人恰一次: {fc.biopsy_done}"
 
 
 def test_treatment_no_pgy_warns_not_forced():

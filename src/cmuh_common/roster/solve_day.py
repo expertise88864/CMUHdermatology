@@ -6,7 +6,8 @@
   1 照光Step     ← 1 位 PGY（**每個時段一律要 1 位**，含週三下午；最優先；照光總次數
                   最少者，週三下午另計 photo_wed_pm 公平）
   2 治療室Step   ← 1 位 PGY（**週三下午休診不排**；其餘時段皆排；治療室總次數最少者）
-  3 切片室Step   ← 1 位 Clerk（僅切片室開；優先本梯未輪過切片者）
+  3 切片室Step   ← 1 位 Clerk（僅切片室開；[2026-07-24] 只排本梯未輪過者——
+                  每人整梯一次就好，全員輪過後切片室空下來，同日早午不連切）
   4 ClerkSeed    每個開診診間各放 1 位 Clerk（房序=決定性洗牌、就座公平輪轉）
   5 PgyMix       逐欄補 PGY（先補到「有 1 人的診間」形成 1C+1P；無 Clerk 月直接填診）
   6 ClerkOverflow 剩 Clerk 補進剩餘容量
@@ -20,8 +21,9 @@
 決定性鐵律：一切輪選用 key=(次數, 決定性抖動, 代號) 取最小；抖動＝crc32(日期|時段|
 用途|代號)——同輸入恆同結果（可重跑重現），但逐日/逐時段變化 → 平手時打散，不會
 鎖死「同人固定同時段」的節拍（見 _jitter）。
-不硬塞：照光/治療室無 PGY、切片室開但無 Clerk → 記警告，不填（貪婪填充器無法硬性
-保證滿足，缺人時以警告呈現）。
+不硬塞：照光/治療室無 PGY → 記警告，不填（貪婪填充器無法硬性保證滿足，缺人時
+以警告呈現）；切片室無「本梯未輪過」候選 → 靜默留空（空下來是常態，逐時段警告
+只會是噪音；真正整梯輪不到者由月底「切片室輪不到」警告點名）。
 """
 from __future__ import annotations
 
@@ -161,17 +163,17 @@ class BiopsyStep(FillStep):
         # 週三下午切片室硬性關閉（C3 定案）→ 即使手動格網誤設為開，也不排。
         if not ctx.biopsy_open or ctx.wed_pm:
             return
-        if not ctx.clerk:
-            log.append(f"⚠ {ctx.session} 切片室開放但無 Clerk 可排")
-            return
         fc = ctx.fc
         bk = ctx.batch_key
-
-        def key(c):
-            return (fc.biopsy_done.get((bk, c), 0),
-                    _jitter(ctx.d, ctx.session, "biopsy", c), c)
+        # [2026-07-24 使用者] 每人整梯「一次就好」：只從本梯未輪過者挑 1 位；
+        # 全員都輪過（或未輪過者今日請假/不可用）→ 切片室空下來沒關係，不硬塞
+        # 也不逐時段警告——真正整梯輪不到者由月底「切片室輪不到」警告點名。
+        # 同人同日早+午連切自然不可能：早上切過者次數=1，下午已不在候選內。
         undone = [c for c in ctx.clerk if fc.biopsy_done.get((bk, c), 0) == 0]
-        pick = min(undone or ctx.clerk, key=key)         # 本梯未輪過者優先
+        if not undone:
+            return
+        pick = min(undone, key=lambda c: (
+            _jitter(ctx.d, ctx.session, "biopsy", c), c))
         ctx.clerk.remove(pick)
         slots[BIOPSY] = [pick]
         fc.biopsy_done[(bk, pick)] = fc.biopsy_done.get((bk, pick), 0) + 1
