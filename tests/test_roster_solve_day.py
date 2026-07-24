@@ -75,14 +75,17 @@ def test_mixed_one_clerk_one_pgy():
 
 
 def test_fewer_clerks_than_rooms_pairs_first():
-    """Clerk 少於診間：剩餘 PGY 先與已坐 Clerk 的診間配對，而非先佔空房。"""
+    """Clerk 少於診間：剩餘 PGY 先與已坐 Clerk 的診間配對，而非先佔空房。
+    [2026-07-24] 診間順序改決定性洗牌（房多樣性）→ 不釘死配對發生在 101，
+    只驗語意：恰有一房＝Clerk+PGY 配對、另一房沒人不輸出。"""
     fc = FairCounters()
     slots, _log = solve_session(
         date(2026, 8, 3), "上午", ["101", "102"],
         pgy_avail=["A", "B", "C"], clerk_avail=["1"], biopsy_open=False, fc=fc)
     assert slots[PHOTO] == ["A"] and slots[TREATMENT] == ["B"]
-    assert slots["101"] == ["1", "C"]                        # 配成 1C+1P
-    assert "102" not in slots                                # 沒人 → 不輸出空房
+    paired = [r for r in ("101", "102") if r in slots]
+    assert len(paired) == 1, f"應恰有一房成對: {slots}"       # 沒人的房不輸出
+    assert slots[paired[0]] == ["1", "C"]                    # 配成 1C+1P(Clerk先)
 
 
 def test_biopsy_assign_and_prefer_undone():

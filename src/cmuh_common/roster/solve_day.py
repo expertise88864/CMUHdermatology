@@ -7,9 +7,13 @@
                   最少者，週三下午另計 photo_wed_pm 公平）
   2 治療室Step   ← 1 位 PGY（**週三下午休診不排**；其餘時段皆排；治療室總次數最少者）
   3 切片室Step   ← 1 位 Clerk（僅切片室開；優先本梯未輪過切片者）
-  4 ClerkSeed    每個開診診間各放 1 位 Clerk（房號序、就座公平輪轉）
+  4 ClerkSeed    每個開診診間各放 1 位 Clerk（房序=決定性洗牌、就座公平輪轉）
   5 PgyMix       逐欄補 PGY（先補到「有 1 人的診間」形成 1C+1P；無 Clerk 月直接填診）
   6 ClerkOverflow 剩 Clerk 補進剩餘容量
+  [2026-07-24 使用者] 跟診房多樣性：就座輪選在「總次數/Apply偏好」之後加比
+  「跟過這間診的次數」(少者先)與「上次就是這間」懲罰(反連排)；診間處理順序改
+  決定性抖動洗牌(原固定房號升冪→人少於房時永遠只填低房號,學生從跟不到 103/105)
+  ——被填的房與 1C+1P 配對組合逐日變化,一起跟診的人自然錯開。
   7 RestStep     還沒位子 → 放假（放假次數輪平均）
 
 先照光、再治療室，兩者各消耗 1 位 PGY，剩餘 PGY 才與 Clerk 一起進診間。
@@ -67,6 +71,9 @@ class FairCounters:
     rest: dict = field(default_factory=dict)         # 放假次數（PGY+Clerk）
     biopsy_done: dict = field(default_factory=dict)  # Clerk 本梯切片次數
     seat: dict = field(default_factory=dict)         # 診間就座次數（公平輪轉）
+    # [2026-07-24 使用者] 跟診房多樣性：每人×每房次數（盡量輪過各診,不固定跟同房）
+    seat_room: dict = field(default_factory=dict)    # {(ck, 房): 次數}
+    last_seat_room: dict = field(default_factory=dict)  # {ck: 房} 上次跟的房(反連排)
     # last_*：最近一次輪到日期。[2026-07-23] 輪選 key 已改用 _jitter 平手決勝（LRU 會
     # 鎖死固定配對），這些欄位保留作紀錄/回放資料，不再參與輪選。
     last_photo: dict = field(default_factory=dict)
@@ -183,22 +190,49 @@ def _clerk_ck(ctx, c):
 def _seat(ctx, pool, room, ck, prefer: frozenset = frozenset()):
     """依 ck(人)命名空間的座位公平計數輪選並就座。
 
-    key＝(座位次數, 非偏好者, 抖動, 代號)：次數最少者恆優先（公平第一）；次數平手時
-    prefer 集合內的人先上（Apply 本科 101 診週二/週五）；再平手才由決定性抖動打散。"""
-    pick = min(pool, key=lambda p: (ctx.fc.seat.get(ck(ctx, p), 0),
-                                    0 if p in prefer else 1,
-                                    _jitter(ctx.d, ctx.session, "seat", p), p))
+    key＝(座位次數, 非偏好者, 該房次數, 連排懲罰, 抖動, 代號)：
+    總次數最少者恆優先（公平第一）；平手時 prefer 先上（Apply 本科 101 週二/五）；
+    [2026-07-24 使用者] 再比「跟過這間診的次數」少者先（每人盡量輪過 101~105 各診,
+    不固定都跟同一診）、再罰「上一次跟診就是這間」（反連排）；最後決定性抖動打散。"""
+    rk = str(room).strip()
+    fc = ctx.fc
+
+    def _key(p):
+        k = ck(ctx, p)
+        return (fc.seat.get(k, 0),
+                0 if p in prefer else 1,
+                fc.seat_room.get((k, rk), 0),
+                1 if fc.last_seat_room.get(k) == rk else 0,
+                _jitter(ctx.d, ctx.session, "seat", p), p)
+    pick = min(pool, key=_key)
     pool.remove(pick)
     ctx.room_slots[room].append(pick)
     k = ck(ctx, pick)
-    ctx.fc.seat[k] = ctx.fc.seat.get(k, 0) + 1
-    ctx.fc.last_seat[k] = ctx.d
+    fc.seat[k] = fc.seat.get(k, 0) + 1
+    fc.seat_room[(k, rk)] = fc.seat_room.get((k, rk), 0) + 1
+    fc.last_seat_room[k] = rk
+    fc.last_seat[k] = ctx.d
     return pick
+
+
+def _room_order(ctx, pref_first: bool = False) -> list:
+    """[2026-07-24 使用者] 診間處理順序＝決定性抖動洗牌（逐日/逐時段變化）。
+
+    原固定房號升冪：學生少於診間數時永遠只填低房號（都跟 101/102,從輪不到
+    103/105）,且 1C+1P 配對房固定 → 改洗牌後被填的房與配對組合天天不同。
+    pref_first：Apply 本科生效日（週二/五且有勾選者）把 101 提到最前,
+    偏好者的平手決勝不會先被洗到前面的別房消耗掉。"""
+    rooms = sorted(ctx.rooms, key=lambda r: (
+        _jitter(ctx.d, ctx.session, "roomorder", str(r)), str(r)))
+    if (pref_first and ctx.apply_pref
+            and ctx.d.weekday() in APPLY_PREF_WEEKDAYS):
+        rooms.sort(key=lambda r: 0 if str(r).strip() == APPLY_PREF_ROOM else 1)
+    return rooms
 
 
 class ClerkSeedStep(FillStep):
     def run(self, ctx, slots, log):
-        for r in ctx.rooms:
+        for r in _room_order(ctx):
             if not ctx.clerk:
                 break
             _seat(ctx, ctx.clerk, r, _clerk_ck)
@@ -206,9 +240,10 @@ class ClerkSeedStep(FillStep):
 
 class PgyMixStep(FillStep):
     def run(self, ctx, slots, log):
+        rooms = _room_order(ctx, pref_first=True)
         # (a) 優先補「已坐 1 位 Clerk」的診間第 2 位 → 形成 1C+1P 混搭
         #     （Clerk 少於診間數時，先配對再說，不先去佔空房）
-        for r in ctx.rooms:
+        for r in rooms:
             if not ctx.pgy:
                 return
             if len(ctx.room_slots[r]) == 1 < ctx.capacity:
@@ -216,7 +251,7 @@ class PgyMixStep(FillStep):
         # (b) 再填空診間的第 1、2 位（PGY 只優先到第 2 位；第 3 位起留給 Clerk
         #     overflow — 見 §3.6 步驟 4/5）。無 Clerk 月即由此直填診間。
         for slot in range(min(ctx.capacity, 2)):
-            for r in ctx.rooms:
+            for r in rooms:
                 if not ctx.pgy:
                     return
                 if len(ctx.room_slots[r]) == slot:
@@ -225,7 +260,7 @@ class PgyMixStep(FillStep):
 
 class ClerkOverflowStep(FillStep):
     def run(self, ctx, slots, log):
-        for r in ctx.rooms:
+        for r in _room_order(ctx):
             while len(ctx.room_slots[r]) < ctx.capacity and ctx.clerk:
                 _seat(ctx, ctx.clerk, r, _clerk_ck)
 
@@ -318,13 +353,19 @@ def replay_counters(fc: FairCounters, d: date, session: str, slots: dict,
     for slot, people in slots.items():
         if slot in (PHOTO, TREATMENT, BIOPSY):
             continue
-        target = (fc.rest, fc.last_rest) if slot == REST else (fc.seat, fc.last_seat)
         for p in people:
             if p not in pgy_set and p not in clerk_set:
                 continue                  # RF-10：未知代號不計座位/放假（不誤繼承）
             k = _ck(p)
-            target[0][k] = target[0].get(k, 0) + 1
-            target[1][k] = d
+            if slot == REST:
+                fc.rest[k] = fc.rest.get(k, 0) + 1
+                fc.last_rest[k] = d
+            else:                         # 跟診：連同房多樣性計數一起回放
+                fc.seat[k] = fc.seat.get(k, 0) + 1
+                fc.last_seat[k] = d
+                rk = str(slot).strip()
+                fc.seat_room[(k, rk)] = fc.seat_room.get((k, rk), 0) + 1
+                fc.last_seat_room[k] = rk
 
 
 def _warn_locked_content(warnings: list, d: date, session: str, locked_slots: dict,
