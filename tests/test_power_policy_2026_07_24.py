@@ -105,6 +105,44 @@ def test_single_execution_state_call_site_without_display_bit():
     assert (main._ES_CONTINUOUS | main._ES_SYSTEM_REQUIRED) & _ES_DISPLAY_REQUIRED == 0
 
 
+def test_screen_off_due_arming_cycle():
+    """[2026-07-24 使用者] 強制關屏 watchdog：閒置到點且上膛才送、送一次即 disarm
+    （不重複轟炸→不閃爍）、一有輸入重新上膛。"""
+    limit = main.SCREEN_OFF_MINUTES * 60
+    assert main._screen_off_due(limit, True) == (True, False)
+    assert main._screen_off_due(limit + 5, False) == (False, False)
+    assert main._screen_off_due(3, False) == (False, True)
+    assert main._screen_off_due(limit - 1, True) == (False, True)
+
+
+def test_tick_delta_wraparound():
+    """GetTickCount 32 位元約 49.7 天回繞 → 無號差值仍正確（不會算出負閒置）。"""
+    assert main._tick_delta(5000, 1000) == 4000
+    assert main._tick_delta(5, 0xFFFFFFFB) == 10
+
+
+def test_send_monitor_off_broadcast_with_timeout():
+    """HWND_BROADCAST 必須用 SendMessageTimeout(ABORTIFHUNG)——卡死視窗不得
+    永久阻塞 watchdog 緒；常數釘位（SC_MONITORPOWER/關閉）。"""
+    src = inspect.getsource(main._send_monitor_off)
+    assert "SendMessageTimeoutW" in src
+    assert "_SMTO_ABORTIFHUNG" in src
+    assert main._SC_MONITORPOWER == 0xF170 and main._MONITOR_OFF == 2
+
+
+def test_idle_seconds_failure_returns_zero(monkeypatch):
+    """GetLastInputInfo 失敗 → 回 0（當作剛有輸入：寧可不關，絕不誤關）。"""
+    monkeypatch.setattr(main.ctypes.windll.user32, "GetLastInputInfo",
+                        lambda *_a: 0, raising=False)
+    assert main._idle_seconds() == 0.0
+
+
+def test_force_off_watchdog_wired_in_startup():
+    src = inspect.getsource(main.AutomationApp.start_background_tasks)
+    assert "_force_screen_off_watchdog" in src, \
+        "強制關屏 watchdog 應在啟動背景任務中開緒"
+
+
 def test_line_chip_high_contrast():
     """[2026-07-24 使用者] 一線/三線色籤高對比：深紅 vs 深藍、白字，不再相近。"""
     r_bg, r_fg, r_lab = LINE_CHIP["r"]

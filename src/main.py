@@ -8496,6 +8496,74 @@ def _apply_screen_off_power_plan() -> None:
     else:
         logging.info("[電源] 電源計畫已強制：螢幕 %s 分關閉、睡眠/休眠停用", mins)
 
+
+# [2026-07-24 使用者] 被動版（電源計畫 15 分）實測有機器仍不關——powercfg /requests
+# DISPLAY 乾淨、逾時 900 秒正確、查無兇手 → 補【強制版】watchdog：使用者閒置
+# （GetLastInputInfo）滿 15 分鐘就直接送 SC_MONITORPOWER 關螢幕，不管任何程式/
+# 原因擋；碰鍵盤滑鼠 Windows 自動亮回。代價（使用者知情接受）：影片播放中閒置
+# 一樣照關。主機不睡由上面的 execution state + 電源計畫負責，與本 watchdog 無關。
+_WM_SYSCOMMAND = 0x0112
+_SC_MONITORPOWER = 0xF170
+_MONITOR_OFF = 2                          # lParam：2=關閉螢幕（1=省電、-1=開）
+_HWND_BROADCAST = 0xFFFF
+_SMTO_ABORTIFHUNG = 0x0002
+_FORCE_OFF_POLL_SECONDS = 30
+
+
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+
+def _tick_delta(tick_now: int, tick_then: int) -> int:
+    """GetTickCount 為 32 位元、約 49.7 天回繞 → 無號差值（回繞後仍正確）。"""
+    return (tick_now - tick_then) & 0xFFFFFFFF
+
+
+def _idle_seconds() -> float:
+    """使用者最後一次鍵盤/滑鼠輸入距今秒數。查詢失敗回 0（當作剛有輸入 →
+    寧可不關，絕不誤關）。"""
+    try:
+        lii = _LASTINPUTINFO()
+        lii.cbSize = ctypes.sizeof(lii)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+            return 0.0
+        return _tick_delta(ctypes.windll.kernel32.GetTickCount(),
+                           lii.dwTime) / 1000.0
+    except Exception:
+        return 0.0
+
+
+def _screen_off_due(idle_s: float, armed: bool) -> tuple:
+    """→ (這輪要不要送關屏, 下一輪 armed)。純函式（可測）。
+    armed＝「這段閒置期還沒送過」：送一次即 disarm——避免每 30 秒重複轟炸
+    （螢幕被硬體/例外喚醒時反覆強關會閃爍）；一有輸入（閒置歸零）重新上膛。"""
+    if idle_s >= SCREEN_OFF_MINUTES * 60:
+        return (armed, False)
+    return (False, True)
+
+
+def _send_monitor_off() -> None:
+    """廣播 SC_MONITORPOWER=off 關螢幕。用 SendMessageTimeout(ABORTIFHUNG) 而非
+    SendMessage：HWND_BROADCAST 碰到卡死視窗會讓 watchdog 緒永久阻塞。"""
+    try:
+        res = ctypes.c_size_t(0)
+        ctypes.windll.user32.SendMessageTimeoutW(
+            _HWND_BROADCAST, _WM_SYSCOMMAND, _SC_MONITORPOWER, _MONITOR_OFF,
+            _SMTO_ABORTIFHUNG, 2000, ctypes.byref(res))
+        logging.info("[電源] 閒置滿 %d 分鐘 → 已強制關閉螢幕", SCREEN_OFF_MINUTES)
+    except Exception:
+        logging.warning("[電源] 強制關螢幕失敗", exc_info=True)
+
+
+def _force_screen_off_watchdog() -> None:
+    """daemon 緒：每 30 秒查一次閒置，滿 15 分鐘強制關螢幕（每段閒置期只送一次）。"""
+    armed = True
+    while True:
+        time.sleep(_FORCE_OFF_POLL_SECONDS)
+        due, armed = _screen_off_due(_idle_seconds(), armed)
+        if due:
+            _send_monitor_off()
+
 # [O10] 拉長主院 cache TTL 120s → 300s（5 分鐘）；分院 180 → 600s（10 分鐘）
 # 院方主機自身慢（~3-7s），cache 命中時 UI 立即顯示，不必每 2 分鐘抓一次
 REG52_MAIN_TTL_SECONDS = 300
@@ -15678,6 +15746,10 @@ class AutomationApp:
         # 主緒=Tk mainloop 與行程同壽命);powercfg 批次丟背景(subprocess 不卡 UI)。
         _keep_system_awake_display_free()
         _submit_startup_background("power-policy", _apply_screen_off_power_plan)
+        # [2026-07-24 使用者] 強制版：閒置 15 分鐘直接關螢幕（被動電源計畫實測
+        # 有機器不動作 → 不再依賴 Windows 自己關）。
+        threading.Thread(target=_force_screen_off_watchdog,
+                         name="screen-off-watchdog", daemon=True).start()
 
         self.startup_phase_text.set("任務排程")
 
