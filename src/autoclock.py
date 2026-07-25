@@ -53,7 +53,9 @@ from selenium.webdriver.support import expected_conditions as EC  # noqa: E402
 from selenium.webdriver.support.ui import WebDriverWait  # noqa: E402
 
 from clock.webdriver_setup import initialize_driver  # noqa: E402
-from cmuh_common.atomic_io import atomic_write_json, safe_load_json  # noqa: E402
+from cmuh_common.atomic_io import (  # noqa: E402
+    atomic_write_json, safe_load_json, safe_load_json_ex,
+)
 from cmuh_common.logging_setup import (  # noqa: E402
     attach_queue_handler,
     attach_stream_handler,
@@ -110,6 +112,9 @@ SCRIPT_NAME = os.path.basename(__file__)
 AUTOCLOCK_MUTEX_NAME = "Local\\CMUH_Skin_AutoClock_SingleInstance_v1"
 
 accounts_data: list = []
+# [2026-07-25 審查] 設定檔「暫時性讀取失敗」旗標：True 代表磁碟上很可能還有一份好檔,
+# 記憶體中的空/殘缺內容【不得】寫回(見 load_config/save_config 與 main 的啟動分支)。
+_config_load_failed = False
 _config_lock = threading.Lock()
 running = threading.Event()
 running.set()
@@ -570,9 +575,20 @@ def _sanitize_accounts(accounts) -> list:
 
 
 def load_config() -> list:
-    global accounts_data
+    """[2026-07-25 審查] 讀取設定。**暫時性讀取失敗絕不可當成「還沒設定」**——
+    防毒/OneDrive/備份軟體短暫鎖住 autoclock_config.json 時,舊版 safe_load_json 回 []
+    與「首次啟動尚未設定」無法區分,結果:①當次完全不啟動排程(整天不打卡)②開出空的
+    設定視窗,使用者關窗選「儲存」就把帳密與整張班表寫成 [] 永久毀掉(atomic_write_json
+    無 .bak)。改用 safe_load_json_ex 取狀態,"error" 時設旗標讓上層拒絕破壞性動作。"""
+    global accounts_data, _config_load_failed
     with _config_lock:
-        data = safe_load_json(str(CONFIG_FILE), default=[])
+        data, status = safe_load_json_ex(str(CONFIG_FILE), default=[])
+        # missing(首次啟動)/corrupt(壞檔已被 backup 移走) → 視為空、可正常編輯儲存;
+        # error(原檔通常仍完好) → 標記失敗,禁止用記憶體中的空資料覆寫。
+        _config_load_failed = (status == "error")
+        if _config_load_failed:
+            logging.error("[autoclock] 設定檔暫時讀取失敗(status=error)：%s"
+                          " —— 本次不視為『未設定』,並禁止覆寫存檔", CONFIG_FILE)
         accounts_data = data if isinstance(data, list) else []
     _warn_config_issues(accounts_data)  # [W13] 對原始資料醒目提示設定問題(不擋啟動)
     return _sanitize_accounts(accounts_data)  # [AC-02] tick/迴圈路徑一律拿到安全資料
@@ -581,6 +597,11 @@ def load_config() -> list:
 def save_config() -> bool:
     global accounts_data
     with _config_lock:
+        # [2026-07-25 審查] 讀取曾暫時失敗 → 記憶體內容不足以代表磁碟上的好檔,
+        # 一旦寫回就把使用者的帳密/班表毀成空。寧可不存也不可覆寫。
+        if _config_load_failed:
+            logging.error("[autoclock] 設定檔先前讀取失敗,拒絕覆寫存檔(保護原檔)")
+            return False
         try:
             accounts_data.sort(key=lambda x: x.get("username", ""))
             atomic_write_json(str(CONFIG_FILE), accounts_data)
@@ -1721,9 +1742,17 @@ class ClockApp(tk.Tk):
         global accounts_data
         accounts_data = self.accounts
 
-        save_config()
+        # [2026-07-25 審查] 存檔失敗不可還報「成功」——舊版忽略回傳值,使用者以為
+        # 存好了、重啟後卻載回舊設定,新班表無聲失效。
+        ok = save_config()
         self.populate_listbox()
-        messagebox.showinfo("成功", f"帳號 {u} 已儲存")
+        if ok:
+            messagebox.showinfo("成功", f"帳號 {u} 已儲存")
+        else:
+            messagebox.showerror(
+                "儲存失敗",
+                f"帳號 {u} 未能寫入設定檔，變更尚未生效。\n"
+                "請查看 settings\\autoclock.log 後重試。")
 
     def delete_account(self):
         sel = self.listbox.curselection()
@@ -1734,21 +1763,33 @@ class ClockApp(tk.Tk):
             self.accounts = [a for a in self.accounts if a["username"] != u]
             global accounts_data
             accounts_data = self.accounts
-            save_config()
+            if not save_config():
+                messagebox.showerror(
+                    "儲存失敗", "刪除未能寫入設定檔，變更尚未生效。")
             self.populate_listbox()
             self.user_var.set("")
 
     def save_and_bg(self):
         global _config_restart_requested
-        # [AC-05/codex P2] 旗標只在 save_config 成功後才設：否則 save_config 拋例外時旗標
-        # 已 True 但 restart_program 從未執行 → 使用者關窗時 main() 誤跳過回背景 → 打卡消失。
-        save_config()
+        # [AC-05/codex P2] 旗標只在 save_config 成功後才設：否則旗標已 True 但
+        # restart_program 從未執行 → 使用者關窗時 main() 誤跳過回背景 → 打卡消失。
+        # [2026-07-25 審查] save_config 內部吞例外只回 False(不會拋),故原本的保護是
+        # 空的;改為真的檢查回傳值:存檔失敗就不重啟(重啟只會載回舊設定,讓人誤以為生效)。
+        if not save_config():
+            messagebox.showerror(
+                "儲存失敗", "設定未能寫入，因此不重新啟動。\n"
+                            "請查看 settings\\autoclock.log 後重試。")
+            return
         _config_restart_requested = True    # 已主動重啟,mainloop 返回後別再重啟
         restart_program()
 
     def on_closing(self):
-        if messagebox.askyesno("關閉", "離開前儲存設定?"):
-            save_config()
+        if messagebox.askyesno("關閉", "離開前儲存設定?") and not save_config():
+            if not messagebox.askyesno(
+                    "儲存失敗",
+                    "設定未能寫入(檔案可能被鎖住或先前讀取失敗)。\n"
+                    "仍要關閉嗎？(未儲存的變更將遺失)"):
+                return                      # 讓使用者留在視窗重試
         self.destroy()
 
 
@@ -2008,6 +2049,22 @@ def main() -> None:
             if sys.argv[1] == "--test-login":
                 _run_test_ui()
                 return
+
+        # [2026-07-25 審查] 設定檔暫時讀不到 → 【不可】當成「未設定」而開空的設定視窗:
+        # 那會 ①整天不啟動排程(靜默漏打卡) ②使用者關窗按「儲存」就把好檔覆寫成空。
+        # 明確告知後結束,交由 watchdog/下次啟動重試(此時原檔仍完好)。
+        if _config_load_failed:
+            logging.error("[autoclock] 設定檔讀取失敗,本次不啟動(避免覆寫原檔)")
+            try:
+                ctypes.windll.user32.MessageBoxW(
+                    0, f"讀不到打卡設定檔(可能被防毒/同步軟體暫時鎖住)：\n"
+                       f"{CONFIG_FILE}\n\n"
+                       f"為避免覆寫掉您既有的帳號與班表，本次不啟動。\n"
+                       f"請稍後重新開啟；若持續發生請查看 settings\\autoclock.log。",
+                    "自動打卡", 0x10)          # MB_ICONERROR
+            except Exception:
+                logging.debug("設定檔讀取失敗提示框顯示失敗", exc_info=True)
+            return
 
         if not accounts_data:
             ClockApp(accounts_data).mainloop()

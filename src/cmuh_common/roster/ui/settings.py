@@ -123,10 +123,39 @@ class SettingsTab(ttk.Frame):
         self._build_ledger_view()
 
     # ── 共用 ─────────────────────────────────────────────────────────────
-    def _save_cfg(self) -> None:
-        self.service.storage.save_config(self._cfg)
+    def _save_cfg(self) -> bool:
+        """存檔設定；成功回 True。**呼叫端必須看回傳值並中止後續寫入。**
+
+        [2026-07-25 審查] storage 加了壞檔/鎖檔守門後會拋 ValueError；若不接，Tk
+        callback 例外只會進 log（tk_exception 不跳窗）→ 使用者以為改好了。
+        [codex R2] 但「失敗就重讀磁碟蓋掉 self._cfg」會更慘：檔案若仍被鎖著，
+        非嚴格的 load_config() 回 {} → self._cfg 變空 → 呼叫端接著跑的
+        _sync_ledger() 會拿到空名單，把【可寫的】ledger.json 裡的餘額與歷史永久刪掉。
+        故：失敗時【絕不動 self._cfg】（記憶體仍是使用者的編輯，反正沒寫出去），
+        只有在檔案確實可嚴格解析時才重讀重畫；並回 False 讓呼叫端停手。"""
+        try:
+            self.service.storage.save_config(self._cfg)
+        except Exception as e:  # noqa: BLE001
+            logging.exception("[roster.ui] 設定存檔失敗")
+            messagebox.showerror(
+                "設定未儲存",
+                f"設定未能寫入（檔案可能損壞或被防毒/同步軟體鎖住）：\n{e}\n\n"
+                f"這次的變更尚未生效，請處理該檔後重試。")
+            try:
+                # 只有「磁碟上確實有一份可正確解析的設定」時才把畫面拉回磁碟真值；
+                # 讀不到就維持現狀，不可用空白覆蓋記憶體（見上方 codex R2 說明）。
+                self.service.storage.assert_readable("config.json")
+                self._cfg = self.service.storage.load_config()
+                for scope in self._member_trees:      # 只重載真的存在的成員樹
+                    self._reload_members(scope)
+                self.on_shown()          # 帳本/假日/週色/梯次/模板一併回磁碟真值
+            except Exception:
+                logging.info("[roster.ui] 設定檔仍無法讀取 → 保留目前畫面內容",
+                             exc_info=True)
+            return False
         if self.on_changed:
             self.on_changed()
+        return True
 
     def _notify(self) -> None:
         if self.on_changed:
@@ -201,7 +230,11 @@ class SettingsTab(ttk.Frame):
             messagebox.showwarning("重複", f"代號 {dlg.result['id']} 已存在")
             return
         self._members(scope).append(dlg.result)
-        self._save_cfg()
+        # [codex R2] 存檔失敗 → 立刻停手：後面的 _sync_ledger 會拿目前名單去
+        # sync_members,若因存檔失敗而名單不可信,會把帳本餘額/歷史永久刪掉。
+        if not self._save_cfg():
+            self._reload_members(scope)
+            return
         self._reload_members(scope)
         self._sync_ledger(scope)
 
@@ -247,7 +280,9 @@ class SettingsTab(ttk.Frame):
             updated = dict(dlg.result)
             updated["id"] = eff_id
             members[j] = updated
-            self._save_cfg()
+            if not self._save_cfg():      # [codex R2] 失敗即停,不裝作已生效
+                self._reload_members(scope)
+                return
         self._reload_members(scope)
         self._reload_ledger()
 
@@ -262,7 +297,9 @@ class SettingsTab(ttk.Frame):
             return
         self._cfg[f"{scope}_members"] = [
             m for m in self._members(scope) if m.get("id") != sel[0]]
-        self._save_cfg()
+        if not self._save_cfg():          # [codex R2] 同上：失敗不得動帳本
+            self._reload_members(scope)
+            return
         self._reload_members(scope)
         self._sync_ledger(scope)
 

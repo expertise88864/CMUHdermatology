@@ -2444,9 +2444,20 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
     if not _flow_lock.acquire(blocking=False):
         logging.info("已有一個會診查詢任務進行中，本次（%s）略過", trigger_label)
         return
-    import pythoncom
-    pythoncom.CoInitialize()
+    # [2026-07-25 審查] import/CoInitialize 必須在 try 內：舊版放在 acquire 與 try 之間,
+    # 這兩行只要拋一次例外(自動更新正在改寫 pywin32 檔案、CoInitialize 回
+    # RPC_E_CHANGED_MODE 等),鎖就【永久洩漏】——之後每次輪詢都只印 INFO「已有任務
+    # 進行中」然後跳過,log 看起來完全正常,實際上會診查詢再也不會執行。
+    # (ActiveTaskGate 45 分鐘會自癒,_flow_lock 不會。)
+    # [codex] 兩個哨兵缺一不可：pythoncom 只代表 import 成功,不代表 CoInitialize 成功。
+    # CoInitialize 若拋例外(如 RPC_E_CHANGED_MODE——該緒早被別處初始化成別種 apartment)
+    # 卻仍在 finally 呼叫 CoUninitialize,等於去拆別人的 apartment,之後該緒的 COM 會壞掉。
+    pythoncom = None
+    com_initialized = False
     try:
+        import pythoncom       # noqa: PLC0415
+        pythoncom.CoInitialize()
+        com_initialized = True
         cfg = load_config()
         mail_method = str(cfg.get("mail_method", "smtp")).lower()
         # SMTP 模式：檢查 password 是否已填，沒填則靜默跳過（多機部署：只有有
@@ -2641,11 +2652,12 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                         _send_failure_notice_async(override_recipients,
                                                    str(last_err))
     finally:
-        try:
-            pythoncom.CoUninitialize()
-        except Exception:
-            pass
-        _flow_lock.release()
+        if com_initialized:            # 只有 CoInitialize 真的成功過才配對 Uninitialize
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+        _flow_lock.release()           # ★無論如何都要釋放（見上方鎖洩漏註解）
 
 
 def _notify(title: str, msg: str) -> None:

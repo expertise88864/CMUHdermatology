@@ -230,7 +230,9 @@ def test_load_config_result_safe_for_schedule_get(monkeypatch):
     bad = [{"username": "a", "password": "p", "schedule": None},
            "junk",
            {"username": "b", "password": "p", "schedule": {"mon_am_in": True}}]
-    monkeypatch.setattr(ac, "safe_load_json", lambda *a, **k: bad)
+    # [2026-07-25] load_config 改用 safe_load_json_ex（需要載入狀態來區分
+    # 「暫時讀取失敗」與「未設定」，見 test_config_loss_guards_2026_07_25.py）
+    monkeypatch.setattr(ac, "safe_load_json_ex", lambda *a, **k: (bad, "ok"))
     accs = ac.load_config()
     filtered = [a for a in accs if a.get("schedule", {}).get("mon_am_in", False)]
     assert filtered == [{"username": "b", "password": "p",

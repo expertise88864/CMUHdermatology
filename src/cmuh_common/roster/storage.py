@@ -68,7 +68,53 @@ class RosterStorage:
                 f"請先更新程式再開啟")
         return data
 
+    def _guard_overwrite(self, path: str) -> None:
+        """[2026-07-25 審查] 寫入前確認不會用「從讀不到的檔推導出來的空內容」覆蓋好資料。
+
+        病灶：`_load_json` 把壞檔/鎖檔一律靜默當成 {}（見其 docstring），於是
+        load→編輯→save 這條再普通不過的路徑會把整份資料寫成空白。實測：config.json
+        帶 git conflict marker 時，設定頁名單顯示全空，使用者只要改一個參數（Spinbox
+        去抖 800ms 自動存檔）就把 R/VS/PGY 名單永久清掉；月檔同理，還會因為讀到
+        finalized=False 而靜默解除定案。
+
+        策略與 cmuh_common.atomic_io 一致，依失敗種類分流：
+          - 可正常解析 → 照常覆寫。
+          - 內容損壞(JSON/編碼壞掉) → 先備份成 .corrupt-<ts> 再允許覆寫；否則使用者
+            會被永久卡住(存不了任何東西)。備份都失敗就拒寫。
+          - OSError/PermissionError(被防毒/同步軟體暫時鎖住,**原檔通常完好**)
+            → 拒寫並拋 ValueError，由 UI 顯示錯誤，稍後重試即可。
+        """
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                loaded = json.load(f)
+            # [codex] roster 全部檔案的根都必須是 object。語法正確但根是 list/純量
+            # （多機合併殘留、外部工具誤寫）同樣會被 _load_json 轉成 {} 顯示為空 →
+            # 屬於「結構性壞檔」,比照壞檔備份後才允許覆寫（assert_readable 也是這個
+            # 契約:非 dict 根一律視為壞檔）。否則週色/年度假日表這類無快照的檔會直接
+            # 無備份消失。
+            if isinstance(loaded, dict):
+                return
+            raise json.JSONDecodeError("root is not a JSON object", "", 0)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+            bak = f"{path}.corrupt-{stamp}"
+            try:
+                shutil.copy2(path, bak)
+            except OSError as e:
+                raise ValueError(
+                    f"{os.path.basename(path)} 內容損壞且無法備份，為避免遺失既有"
+                    f"資料已中止存檔。請先手動處理該檔：{path}") from e
+            logging.warning("[roster.storage] 壞檔已備份到 %s（允許覆寫）", bak)
+            return
+        except OSError as e:
+            raise ValueError(
+                f"{os.path.basename(path)} 暫時無法讀取（可能被防毒/同步軟體鎖住），"
+                f"為保護既有資料已中止存檔，請稍後再試。") from e
+
     def _save(self, path: str, data: dict) -> None:
+        self._guard_overwrite(path)
         data = dict(data)
         data["schema_version"] = SCHEMA_VERSION
         # atomic_write_json 回傳 None、失敗時拋例外（cmuh_common.atomic_io 介面）
@@ -102,7 +148,10 @@ class RosterStorage:
                                   "config.json")
 
     def save_config(self, cfg: dict) -> None:
+        # [2026-07-25 審查] config.json 是唯一沒有快照保護的存檔路徑（ledger/biopsy/
+        # 月檔都有 _snapshot）——而它存的是全部成員名單，誤刪最痛。補上快照。
         self._check_schema(_load_json(self._path("config.json")), "config.json")
+        self._snapshot(self._path("config.json"))
         self._save(self._path("config.json"), cfg)
 
     def load_ledger(self) -> dict:

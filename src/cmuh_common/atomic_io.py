@@ -128,7 +128,15 @@ def safe_load_json_ex(file_path: str, default=None, *,
                 _replace_with_retry(file_path, bak)
                 logging.warning("[safe_load_json] 已 backup 壞檔到 %s", bak)
             except Exception:
-                logging.debug("[safe_load_json] backup 壞檔失敗", exc_info=True)
+                # [2026-07-25 審查] backup 失敗仍回 "corrupt" 會**違反本函式自己的契約**
+                # （見 docstring:"corrupt" 代表「原檔已被 rename 移走」故可安全覆寫）。
+                # 別的行程允許讀取但拒絕 rename/delete 時就會走到這裡:呼叫端據 "corrupt"
+                # 判定可覆寫 → 直接把使用者的原檔蓋掉且**毫無備份**。原檔既然還在,
+                # 語意上就等同 "error"(暫時性失敗、原檔完好、不可覆寫)。
+                logging.warning("[safe_load_json] 壞檔 backup 失敗，原檔仍在 → "
+                                "回報 error(不可覆寫): %s", file_path,
+                                exc_info=True)
+                return default, "error"
         return default, "corrupt"
     except (PermissionError, OSError) as e:
         logging.warning("[safe_load_json] %s 讀取失敗 (%s)", file_path, e)

@@ -746,6 +746,12 @@ class RosterService:
                                   "（值班照常落地，切片請手動處理）")
         month[f"report_{scope}"] = report
 
+        # [2026-07-25 審查/codex] 帳本先寫、月檔後寫：月檔若在守門處被擋（壞檔/鎖檔）
+        # 就會留下「帳本已結算、月檔還是舊班表」的半套狀態。先把兩個目標都預檢過，
+        # 讓失敗發生在任何寫入之前（無法做到真正的跨檔交易，但可消掉最常見的半套）。
+        month_path = self.storage._month_path(ym)
+        self.storage.assert_readable(month_path)
+        self.storage._guard_overwrite(str(month_path))
         ledger = self.storage.load_ledger()
         settle_month(ledger, scope, ym, result.points_by_person)
         self.storage.save_ledger(ledger)
@@ -1032,6 +1038,11 @@ class RosterService:
 
         名單清空時仍會 settle（points 空 → 回滾該月舊分錄、不留殘餘）。已定案
         月份唯讀，拒絕重算。"""
+        # [2026-07-25 審查/codex] 先確認【來源】月檔讀得到才計算：_load_json 對壞檔/
+        # 鎖檔一律回 {}，此處會因此算出「全月 0 點」，settle_month 回滾掉真正的舊分錄，
+        # 而 save_ledger 寫的是另一個檔（守門看不到來源有問題）→ 帳本被清成零、UI 還
+        # 報成功。定案判斷本身也會因為讀到 finalized=False 而失效。
+        self.storage.assert_readable(self.storage._month_path(ym))
         if self.storage.load_month(ym).get("finalized"):
             raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能重算帳本")
         ctx = self.build_context(scope, ym)
