@@ -226,15 +226,15 @@ def _pair_key(a, b) -> tuple:
 def _seat(ctx, pool, room, ck, prefer: frozenset = frozenset()):
     """依 ck(人)命名空間的座位公平計數輪選並就座。
 
-    key＝(補假欠額, 座位次數, 非偏好者, 該房次數, 連排懲罰, 同伴次數, 抖動, 代號)：
-    [2026-07-25 使用者] 首鍵＝「欠半天假者最後才入座」——週三下午照光超出配額的人,
-    在人多於位子的時段留到最後,位子不夠時自然放假抵銷（見 PhotoStep/RestStep）。
-    這是刻意用「少跟一次診」換「多值一次週三下午」,故排在座位公平之前；欠額還清
-    （rest_owed 歸零）後立刻回到一般公平輪轉,不會持續少班。
-    其次總次數最少者優先（公平）；平手時 prefer 先上（Apply 本科 101 週二/五）；
+    key＝(座位次數, 非偏好者, 該房次數, 連排懲罰, 同伴次數, 補假欠額, 抖動, 代號)：
+    總次數最少者優先（公平）；平手時 prefer 先上（Apply 本科 101 週二/五）；
     [2026-07-24] 再比「跟過這間診的次數」少者先、罰「上一次跟診就是這間」（反連排）；
     [2026-07-25 使用者] 再比「與本房已就座者共事過幾次」少者先——房多樣性只管
     「誰跟哪一間」,管不到「誰跟誰」,故仍可能固定同兩人成對（如 1、2 號總是一起）。
+    [2026-07-25 使用者定案] 補假欠額排在【所有排班條件之後、僅早於抖動】：補假是
+    「軟性規定,排在最後」——只有在座位公平/偏好/房多樣性/同伴多樣性全部平手時,
+    才讓欠假者留下（→ 位子不夠自然放假抵銷）。絕不為了補假犧牲上述任一條件,故
+    補假常常排不到,屬預期（月底以警告點名,由使用者自行斟酌手動給假）。
     最後決定性抖動打散。"""
     rk = str(room).strip()
     fc = ctx.fc
@@ -245,12 +245,12 @@ def _seat(ctx, pool, room, ck, prefer: frozenset = frozenset()):
         # 補假欠額只對 PGY 有意義（週三下午照光是 PGY 的事）；ck 首欄即命名空間
         owed = fc.rest_owed.get(p, 0) if k[0] == "pgy" else 0
         pair_cost = sum(fc.pair.get(_pair_key(k, q), 0) for q in seated)
-        return (1 if owed > 0 else 0,
-                fc.seat.get(k, 0),
+        return (fc.seat.get(k, 0),
                 0 if p in prefer else 1,
                 fc.seat_room.get((k, rk), 0),
                 1 if fc.last_seat_room.get(k) == rk else 0,
                 pair_cost,
+                1 if owed > 0 else 0,          # ★軟性、排最後：全平手時才生效
                 _jitter(ctx.d, ctx.session, "seat", p), p)
     pick = min(pool, key=_key)
     pool.remove(pick)
@@ -323,12 +323,21 @@ class RestStep(FillStep):
         if not rest_people:
             return
         owed_paid = []
+        # [2026-07-25 審查修正] 只有【本時段確實有 PGY 坐進診間】時,放假才算「補假」
+        # ——放假要能算補償,前提是他本來真的可以去跟診卻讓了出來。
+        # ① 週三下午沒有跟診房、治療室休診、切片室關閉 → 非照光的 PGY 人人都放假,
+        #    那是結構性休息。舊版對任何放假照扣,導致多值者在「別人照光的那個週三下午」
+        #    被自動扣掉債務 → 補假常態空轉(實測他放假次數反而比別人少),連警告都吃掉。
+        # ② [codex] 只看「有沒有診間」仍不夠:room_capacity=1 且 Clerk 先佔滿各房時
+        #    (ClerkSeedStep 每房先坐 1 位 → PgyMixStep 一位 PGY 也排不進去),
+        #    PGY 無論欠不欠假都上不了診 → 那次放假同樣不是讓出座位。
+        can_compensate = any(k[0] == "pgy"
+                             for ks in ctx.seat_ck.values() for k in ks)
         for p in ctx.pgy:                              # 放假計數同樣分命名空間
             k = _pgy_ck(ctx, p)
             ctx.fc.rest[k] = ctx.fc.rest.get(k, 0) + 1
             ctx.fc.last_rest[k] = ctx.d
-            # [2026-07-25 使用者] 週三下午超額者這次真的放到假 → 欠額還一次。
-            if ctx.fc.rest_owed.get(p, 0) > 0:
+            if can_compensate and ctx.fc.rest_owed.get(p, 0) > 0:
                 ctx.fc.rest_owed[p] -= 1
                 owed_paid.append(p)
         for c in ctx.clerk:
@@ -423,6 +432,15 @@ def replay_counters(fc: FairCounters, d: date, session: str, slots: dict,
 
     def _ck(p):
         return ("pgy", p) if p in pgy_set else ("clerk", batch_key, p)
+    # [2026-07-25 審查修正 / codex] 同 RestStep：鎖定時段要有【PGY 實際坐在診間】才
+    # 算得上「讓出跟診」。只看「有沒有診間格」不夠——診間裡若全是 Clerk(容量 1 或
+    # Clerk 較多時),PGY 本來就上不了診,那次放假不是補償。
+    _room_slots = {s: ps for s, ps in slots.items()
+                   if s not in (PHOTO, TREATMENT, BIOPSY, REST)}
+    can_compensate = any(p in pgy_set for ps in _room_slots.values() for p in ps)
+    # [codex] 手動誤植:同一人既在放假格又出現在別的工作格 → 那不是真的放假,不抵債。
+    _working = {p for ps in _room_slots.values() for p in ps}
+    _working |= {p for s in (PHOTO, TREATMENT, BIOPSY) for p in slots.get(s, [])}
     for slot, people in slots.items():
         if slot in (PHOTO, TREATMENT, BIOPSY):
             continue
@@ -434,7 +452,8 @@ def replay_counters(fc: FairCounters, d: date, session: str, slots: dict,
                 fc.rest[k] = fc.rest.get(k, 0) + 1
                 fc.last_rest[k] = d
                 # [codex R1] 鎖定時段已放到假的欠債 PGY → 債務還清,免日後重複補假
-                if k[0] == "pgy" and fc.rest_owed.get(p, 0) > 0:
+                if (can_compensate and k[0] == "pgy" and p not in _working
+                        and fc.rest_owed.get(p, 0) > 0):
                     fc.rest_owed[p] -= 1
             else:                         # 跟診：連同房多樣性計數一起回放
                 fc.seat[k] = fc.seat.get(k, 0) + 1
@@ -620,9 +639,10 @@ def _solve_month_once(inp: DaySolveInput, preset_owed: "dict | None" = None
     unpaid = sorted((p, n) for p, n in fc.rest_owed.items() if n > 0)
     if unpaid:
         warnings.append(
-            "週三下午多值、自動排班未能排到補假時段："
+            "週三下午多值、未排到補假（補假為軟性條件、排在所有排班條件之後，"
+            "排不到屬正常）："
             + "、".join(f"{p}×{n}" for p, n in unpaid)
-            + "（多半是每逢空檔時該員都被照光/治療室徵召）—— 請視情況手動安排半天假")
+            + " —— 如要補，請手動於月曆給半天假")
 
     # 切片室輪不到：只對「本月確有工作日被排」的梯次示警（否則邊界梯次會誤報）
     for b in inp.clerk_batches:

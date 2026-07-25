@@ -640,12 +640,20 @@ def test_locked_wed_pm_over_quota_records_debt():
 
 
 def test_locked_rest_clears_debt_no_double_compensation():
-    """[codex R1] 欠債者在鎖定時段已放到假 → 債務扣除,不得日後再補一次（補兩次半天）。"""
+    """[codex R1] 欠債者在鎖定時段已【讓出跟診】放假 → 債務扣除,不得日後再補一次。
+    [2026-07-25 審查] 但必須是有診間格的時段（A 放假、B 在診間）才算讓出;
+    只有放假格、沒有診間的鎖定時段（如週三下午）是結構性休息,不得抵債。"""
     fc = FairCounters()
     fc.rest_owed["A"] = 1
-    replay_counters(fc, date(2026, 8, 6), "上午", {REST: ["A"]}, "",
-                    pgy_set={"A"}, clerk_set=set())
-    assert fc.rest_owed["A"] == 0, "鎖定格已放假 → 債務還清"
+    replay_counters(fc, date(2026, 8, 6), "上午", {"101": ["B"], REST: ["A"]},
+                    "", pgy_set={"A", "B"}, clerk_set=set())
+    assert fc.rest_owed["A"] == 0, "有診間格、他人在跟診而 A 放假 → 債務還清"
+
+    fc2 = FairCounters()
+    fc2.rest_owed["A"] = 1
+    replay_counters(fc2, date(2026, 8, 5), "下午", {PHOTO: ["B"], REST: ["A"]},
+                    "", pgy_set={"A", "B"}, clerk_set=set())
+    assert fc2.rest_owed["A"] == 1, "無診間格（週三下午）→ 結構性休息,不得抵債"
 
 
 def test_unpaid_rest_debt_is_warned_not_silently_dropped():
@@ -654,7 +662,7 @@ def test_unpaid_rest_debt_is_warned_not_silently_dropped():
     grid = {date(2026, 8, 26): {"上午": ["101"], "下午": []}}
     day_slots, _log, warnings = month_solve_day(DaySolveInput(
         ym="2026-08", grid=grid, pgy_roster=["A", "B"]))
-    msg = [w for w in warnings if "未能排到補假時段" in w]
+    msg = [w for w in warnings if "未排到補假" in w]
     assert msg, f"未兌現的補假債務應點名警告：{warnings}"
     # [codex R3] 警告不得宣稱程式沒驗證過的事：本情境班表裡其實【有人放假】
     # （只是不是欠債者本人）→ 不可寫「整月各時段皆滿編/無可用空檔」。
@@ -685,7 +693,7 @@ def test_debt_from_last_wednesday_is_backfilled_into_earlier_slack():
     assert owed_p in rested, (
         f"月底超額者 {owed_p} 應回填到月初空檔補假；"
         f"週一={mon}，警告={warnings}")
-    assert not any("補假未排到" in w for w in warnings), \
+    assert not any("未排到補假" in w for w in warnings), \
         f"已補到假就不該再警告：{warnings}"
     assert any("補週三下午半天假" in ln for ln in log)
 
@@ -711,7 +719,7 @@ def test_two_pass_does_not_double_compensate():
     quota = len(wed) // len(pgy)                  # 4 // 7 = 0
     total_over = sum(max(0, n - quota) for n in counts.values())
     assert total_over > 0, "本情境應有超額（4 場 7 人,配額 0）"
-    assert not any("補假未排到" in w for w in warnings), \
+    assert not any("未排到補假" in w for w in warnings), \
         f"空檔充足 → 應全部補到假：{warnings}"
 
 
@@ -723,3 +731,107 @@ def test_locked_photo_non_pgy_code_does_not_create_debt():
                     pgy_set={"A"}, clerk_set=set(), wed_pm_quota=0)
     assert fc.rest_owed == {}, f"非現役 PGY 不得產生補假債：{fc.rest_owed}"
     assert fc.photo_wed_pm.get("幽靈代號") == 1, "照光次數統計維持既有容錯"
+
+
+def test_rest_compensation_is_soft_and_never_beats_seat_fairness():
+    """[2026-07-25 使用者定案] 補假是【軟性、排在最後】的條件：只有在座位公平等
+    所有排班條件都平手時才生效,絕不可為了補假讓欠假者少跟診。
+
+    情境：欠假者 B 的跟診次數【最少】(0)、其他人都跟很多(5) → 公平要求 B 先入座。
+    舊版把補假放在第一鍵會讓 B 被留下放假(犧牲公平);新版必須照公平排 B 進診間。"""
+    fc = FairCounters()
+    fc.rest_owed["B"] = 1
+    fc.photo_total["B"] = fc.tx_total["B"] = 99      # 不被照光/治療室徵召
+    for p in ("C", "D", "E"):
+        fc.seat[("pgy", p)] = 5                      # 其他人已跟很多診
+    slots, _log = solve_session(
+        date(2026, 8, 3), "上午", ["101"],            # 照光1+治療1+診2 = 4 位、5 人
+        pgy_avail=["B", "C", "D", "E", "F"], clerk_avail=[],
+        biopsy_open=False, fc=fc)
+    assert "B" in slots.get("101", []), \
+        f"跟診次數最少者應照公平先入座,不得為了補假被留下：{slots}"
+    assert fc.rest_owed["B"] == 1, "沒放到假 → 債務保留（下次全平手時再說）"
+
+
+def test_rest_compensation_applies_only_on_full_tie():
+    """全條件平手時（同樣 0 次跟診、同房、無配對史）→ 補假才作為最後決勝生效。"""
+    fc = FairCounters()
+    fc.rest_owed["B"] = 1
+    fc.photo_total["B"] = fc.tx_total["B"] = 99
+    slots, _log = solve_session(
+        date(2026, 8, 4), "上午", ["101"], pgy_avail=["B", "C", "D", "E", "F"],
+        clerk_avail=[], biopsy_open=False, fc=fc)
+    assert "B" in slots.get(REST, []), f"全平手 → 欠假者留下放假：{slots}"
+    assert fc.rest_owed["B"] == 0
+
+
+def test_wed_pm_structural_rest_does_not_pay_the_debt():
+    """[2026-07-25 審查] 週三下午沒有診間/治療室/切片室 → 非照光者【人人都放假】,
+    那是結構性休息,不是補償,不得拿來抵補假債（舊版照抵 → 多值週三下午的人放假次數
+    反而比別人少,且債務歸零後連警告都不會出現）。"""
+    fc = FairCounters()
+    fc.rest_owed["B"] = 1
+    slots, _log = solve_session(
+        date(2026, 8, 5), "下午", [],              # 週三下午:無診間
+        pgy_avail=["A", "B"], clerk_avail=[], biopsy_open=False, fc=fc)
+    rested = slots.get(REST, [])
+    if "B" in rested:                              # B 沒照光 → 結構性放假
+        assert fc.rest_owed["B"] == 1, "結構性放假不得抵債"
+
+
+def test_extra_wed_pm_person_is_not_worse_off_over_a_month():
+    """整月端到端：多值一次週三下午的人,不得因為補假機制反而【放假比別人少】;
+    補不到就要有警告,不可靜默。"""
+    grid = {}
+    d = date(2026, 8, 3)
+    while d <= date(2026, 8, 28):
+        if d.weekday() < 5:
+            grid[d] = {"上午": ["101", "102", "103"],
+                       "下午": [] if d.weekday() == 2 else ["101", "102"]}
+        d += timedelta(days=1)
+    pgy = ["P1", "P2", "P3"]
+    day_slots, _log, warnings = month_solve_day(DaySolveInput(
+        ym="2026-08", grid=grid, pgy_roster=pgy))
+    from cmuh_common.roster.solve_day import person_course_stats
+    st = person_course_stats(day_slots)
+    over = [p for p in pgy if st[p]["photo_wed_pm"] > 4 // len(pgy)]
+    assert over, "4 個週三 ÷ 3 人 → 必有人多值"
+    for p in over:
+        others = [st[q]["rest"] for q in pgy if q != p]
+        assert st[p]["rest"] >= min(others) or any("未排到補假" in w
+                                                   for w in warnings), (
+            f"{p} 多值週三下午卻放假最少({st[p]['rest']} vs {others})且無警告")
+
+
+def test_clerk_only_rooms_do_not_pay_pgy_debt():
+    """[codex] room_capacity=1 且 Clerk 先佔滿各房 → PGY 一位也進不了診間,
+    此時 PGY 放假不是「讓出跟診」,不得抵補假債（只看「有沒有診間」會誤判）。"""
+    fc = FairCounters()
+    fc.rest_owed["B"] = 1
+    fc.photo_total["B"] = fc.tx_total["B"] = 99      # 不被照光/治療室徵召
+    slots, _log = solve_session(
+        date(2026, 8, 3), "上午", ["101", "102"], capacity=1,
+        pgy_avail=["B", "C", "D"], clerk_avail=["1", "2"],
+        biopsy_open=False, fc=fc)
+    assert slots.get("101") == ["1"] or slots.get("101") == ["2"]
+    assert "B" in slots.get(REST, []), "容量 1 且 Clerk 佔滿 → PGY 只能放假"
+    assert fc.rest_owed["B"] == 1, "PGY 進不了診間 → 該次放假不算補假"
+
+
+def test_locked_room_with_only_clerk_does_not_pay_debt():
+    """鎖定時段診間裡只有 Clerk → PGY 本來就上不了診,放假不抵債。"""
+    fc = FairCounters()
+    fc.rest_owed["A"] = 1
+    replay_counters(fc, date(2026, 8, 6), "上午", {"101": ["1"], REST: ["A"]},
+                    "B1", pgy_set={"A"}, clerk_set={"1"})
+    assert fc.rest_owed["A"] == 1, "診間全是 Clerk → 不算讓出 PGY 座位"
+
+
+def test_locked_person_both_resting_and_working_does_not_pay_debt():
+    """[codex] 手動誤植:同一人既在放假格又在工作格 → 不是真的放假,不得抵債。"""
+    fc = FairCounters()
+    fc.rest_owed["A"] = 1
+    replay_counters(fc, date(2026, 8, 6), "上午",
+                    {"101": ["A", "B"], REST: ["A"]}, "",
+                    pgy_set={"A", "B"}, clerk_set=set())
+    assert fc.rest_owed["A"] == 1, "同時在跟診又列放假 → 不抵債"
