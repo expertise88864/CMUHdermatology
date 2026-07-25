@@ -7287,6 +7287,36 @@ def _fetch_huisheng_reg52_html(session, doc_no: str, doctor_name: str):
 # _normalize_dayoff_session: 抽到 cmuh_common.appt_utils（13 行刪除）
 # _merge_appointments_by_date: 抽到 cmuh_common.appt_utils（26 行刪除）
 # _merge_dayoff_overrides: 抽到 cmuh_common.appt_utils（21 行刪除）
+def _split_schbox_by_date(cell):
+    """把一格 schBox 依 visitDate 切開,回 (格首共用文字, {id(visitDate div): 該日期自己的文字})。
+
+    [2026-07-26 審查 ★止掛提醒★] 同一格常列出好幾個日期(同一診每週重複),而「止掛」是
+    【單一日期】的狀態 —— reg52 把它寫在該日期後面的 div。原本 `"止掛" in cell_content`
+    用【整格】文字判斷,只要其中一天止掛,同格其他日期全部被標成 is_stopped;止掛提醒掃描
+    看到 is_stopped 就 `continue`(已止掛不必再提醒)→ 那些日期的提醒信被靜默吃掉。
+    格首(第一個 visitDate 之前)的文字是整格共用的標題(診間號碼等),仍套用到所有日期
+    —— 若整格都停,「止掛」會寫在這裡,不能漏掉。
+    結構不符(visitDate 不是本格直接子節點)時回空 dict,呼叫端退回整格文字=維持既有行為。
+    """
+    header_parts = []
+    groups = {}
+    current = None
+    for child in cell.children:
+        get_attr = getattr(child, "get", None)
+        classes = child.get("class") or [] if get_attr is not None else []
+        text = (child.get_text(strip=True)
+                if hasattr(child, "get_text") else str(child).strip())
+        if "visitDate" in classes:
+            current = id(child)
+            groups[current] = [text]
+        elif current is not None:
+            if text:
+                groups[current].append(text)
+        elif text:
+            header_parts.append(text)
+    return "".join(header_parts), {k: "".join(v) for k, v in groups.items()}
+
+
 def _parse_main_hospital_schedule(soup):
     schedule_table = soup.select_one('table.schedule')
     if not schedule_table:
@@ -7321,8 +7351,10 @@ def _parse_main_hospital_schedule(soup):
 
         for cell in row.select('td.schBox'):
             cell_content = cell.get_text(strip=True)
+            # 東區分院/診間號碼是【整格】的屬性(同一診的所有日期共用),維持整格判斷;
+            # 止掛是【單一日期】的狀態,改在下面逐日期算(見 _split_schbox_by_date)。
             is_external = "東區分院" in cell_content
-            is_stopped = "止掛" in cell_content
+            header_text, date_group_texts = _split_schbox_by_date(cell)
 
             room = ""
             room_match = _RE_ROOM.search(cell_content)
@@ -7330,6 +7362,10 @@ def _parse_main_hospital_schedule(soup):
                 room = room_match.group(1)
 
             for date_div in cell.find_all('div', class_='visitDate'):
+                own_text = date_group_texts.get(id(date_div))
+                stop_scope = (cell_content if own_text is None
+                              else header_text + own_text)
+                is_stopped = "止掛" in stop_scope
                 date_tag = date_div.find('b')
                 if not date_tag:
                     continue
@@ -9270,29 +9306,59 @@ class AutomationApp:
             self.root.after(0, self._restart_app)
             return
         logging.info("Restart requested.")
-        self._cleanup_for_exit()
-        try:
-            self.root.update_idletasks()
-        except Exception:
-            logging.debug("update_idletasks before restart failed.", exc_info=True)
-        try:
-            self.root.destroy()
-        except Exception:
-            logging.debug("root.destroy during restart failed.", exc_info=True)
-        # [2026-05-22 v29] 必須在 restart_self() 之前 release mutex，否則新 process
-        # 起來時 mutex 還被舊 process 持有 → ensure_single_instance() 看到 mutex
-        # 存在 → 跳「已在執行中」MessageBox → exit → user 看到「自動更新沒重啟」。
-        # atexit handler 在 os.execv / subprocess+sys.exit 路徑可能不保證會跑，
-        # 必須顯式釋放。
-        try:
-            release_single_instance()
-            logging.info("[restart] mutex released before respawn")
-        except Exception:
-            logging.debug("release_single_instance during restart failed.",
-                           exc_info=True)
+
+        def _teardown_for_handover():
+            """[2026-07-26 審查 ★可用性★] 破壞性拆解【延後到 restart_self 確認新行程存活
+            之後】才做。舊版在 spawn 前就 _cleanup_for_exit()(拔熱鍵、收 Chrome/executor)
+            + root.destroy() + 釋放 mutex,於是 restart_self 內「新行程早夭 → 保留舊行程
+            不退出」的保護 return 回來時,舊行程其實已經被拆光:沒有熱鍵、沒有視窗、
+            mutex 也放了 —— 主程式等於整個消失,診間要人工重開。與 autoclock.restart_program
+            同款修法(見 restart_self 的 on_confirmed 說明)。
+
+            mutex 也一併延後:新行程的 ensure_single_instance 對 ALREADY_EXISTS 會重試
+            retry_sec(1.5s),而 restart_self 只等 0.6s 就會呼叫本函式 → 新行程一定還在
+            重試窗內就拿得到 mutex(見 test_restart_defers_teardown_until_handover)。"""
+            # ★順序有時間預算★ [外審] 新行程只重試 1.5 秒就會放棄 mutex 並跳
+            # 「已在執行中」。本函式已在 spawn 後 0.6 秒才被呼叫,剩不到 0.9 秒,
+            # 而 _flush_ledger_before_exit 上限 2.0 秒、_cleanup_for_exit 還要收
+            # Chrome/executor —— 排在它們後面釋放 mutex 一定來不及。
+            # 故【快而關鍵的兩件事先做】:拔熱鍵(順帶消除新舊行程同時吃熱鍵的空窗)、
+            # 放 mutex;慢動作全部排在後面。這裡已是「確認接手」之後,不會再回頭。
+            try:
+                safe_unhook_all_hotkeys()
+            except Exception:
+                logging.debug("unhook hotkeys during restart failed.", exc_info=True)
+            # [2026-05-22 v29] mutex 一定要釋放,否則新 process 的 ensure_single_instance
+            # 看到 mutex → 跳「已在執行中」→ exit → 使用者看到「自動更新沒重啟」。
+            # atexit handler 在 subprocess+sys.exit 路徑不保證會跑,必須顯式釋放。
+            try:
+                release_single_instance()
+                logging.info("[restart] mutex released after handover confirmed")
+            except Exception:
+                logging.debug("release_single_instance during restart failed.",
+                              exc_info=True)
+            try:
+                # [codex P2] 稽核寫入緒是 daemon,行程退出會直接砍掉 → 重啟前剛入列的
+                # 動作紀錄會憑空消失。自動更新重啟很頻繁,這不是罕見路徑。
+                _flush_ledger_before_exit()
+            except Exception:
+                logging.debug("[ledger] 重啟前排空例外(忽略)", exc_info=True)
+            try:
+                self._cleanup_for_exit()
+            except Exception:
+                logging.debug("cleanup during restart failed.", exc_info=True)
+            try:
+                self.root.update_idletasks()
+            except Exception:
+                logging.debug("update_idletasks before restart failed.", exc_info=True)
+            try:
+                self.root.destroy()
+            except Exception:
+                logging.debug("root.destroy during restart failed.", exc_info=True)
+
         # 帶 --background：重啟後的新行程靜默啟動（不開 splash、最小化進工作列），
         # 不打斷使用者當下操作。此方法是所有 app 端重啟（自動更新 / 閒置熱鍵恢復）的匯流點。
-        restart_self(["--background"])
+        restart_self(["--background"], on_confirmed=_teardown_for_handover)
 
     def _restart_when_hotkey_idle(self, attempts: int = 0):
         """[MG-02] 自動更新需重啟時的閘門:熱鍵自動化進行中【不可】重啟(見 _UPDATE_RESTART_* 常數旁

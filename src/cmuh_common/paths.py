@@ -87,6 +87,14 @@ def get_log_path(filename: str = 'app.log') -> str:
     return os.path.join(get_app_dir(), filename)
 
 
+# spawn 後確認新行程沒有「起來就馬上死」的輪詢窗 = POLLS × INTERVAL ≈ 0.6 秒。
+# [2026-07-26] 提成常數是因為呼叫端(main._restart_app)把【釋放 mutex】延後到 on_confirmed:
+# 新行程的 ensure_single_instance 對 ALREADY_EXISTS 只重試 retry_sec(預設 1.5 秒),
+# 本輪詢窗必須明顯小於它,新行程才一定還在重試窗內就等到 mutex。有測試釘住這個關係。
+_SPAWN_ALIVE_POLLS = 6
+_SPAWN_ALIVE_INTERVAL_SEC = 0.1
+
+
 def restart_self(extra_args=None, hard_exit_code=None,
                  on_confirmed=None) -> None:
     """雙軌重啟。
@@ -100,6 +108,11 @@ def restart_self(extra_args=None, hard_exit_code=None,
     才會被呼叫（新行程早夭而保留舊行程時不呼叫）。用途：把「停排程/停 tray/釋放 mutex/
     收 driver」等破壞性拆解延後到確定接手成功之後，避免 spawn 失敗時舊行程已被拆光而
     整個消失（見 autoclock.restart_program）。callback 內例外只記 log，不影響退出。
+    傳了 on_confirmed 時，Popen 失敗【不會】退回 os.execv —— execv 無法確認接手且成功時
+    永不返回，會讓 callback 裡的拆解整個跳過（見下方 except）。
+    ★callback 內的順序要自己顧時間預算★：本函式已先等掉 _SPAWN_ALIVE_POLLS ×
+    _SPAWN_ALIVE_INTERVAL_SEC（約 0.6s），而新行程搶 mutex 只重試 retry_sec（1.5s），
+    所以「釋放 mutex」要排在 callback 的最前面，慢動作（排空佇列、收 driver）排後面。
 
     .pyw 模式：subprocess.Popen(pythonw, sys.argv[0], ...) + sys.exit
     .exe 模式：subprocess.Popen(sys.executable, ...) + sys.exit
@@ -136,8 +149,8 @@ def restart_self(extra_args=None, hard_exit_code=None,
         # 還有一個能用。（單例 mutex 重啟競態已由 ensure_single_instance 重試處理，
         # 故正常情況新行程會穩定存活。）
         import time as _time
-        for _ in range(6):  # 最多約 0.6 秒
-            _time.sleep(0.1)
+        for _ in range(_SPAWN_ALIVE_POLLS):        # 最多約 0.6 秒
+            _time.sleep(_SPAWN_ALIVE_INTERVAL_SEC)
             rc = proc.poll()
             if rc is not None:
                 logging.error(
@@ -156,6 +169,17 @@ def restart_self(extra_args=None, hard_exit_code=None,
             except Exception:
                 logging.exception("[restart_self] on_confirmed 收尾失敗（仍照常退出）")
     except Exception as e:
+        # [2026-07-26 外審] os.execv 是「取代本行程」——【無法確認新行程真的活著】,
+        # 而且成功時永不返回 → on_confirmed 一定不會被呼叫。呼叫端傳 on_confirmed 就是
+        # 明確要求「確認接手後才拆解」;此時走這條 fallback 會讓稽核排空/mutex 釋放/
+        # Chrome 收尾全部跳過(稽核憑空消失、chromedriver 變孤兒)。
+        # 故有 on_confirmed 時【不走 fallback】,保留完好的舊行程不動 —— 這次不重啟
+        # (自動更新下次還會再試),遠好過賭一把換到一個拆了一半的狀態。
+        if on_confirmed is not None:
+            logging.error(
+                "[restart_self] subprocess.Popen 失敗: %s — 呼叫端要求確認接手後才拆解,"
+                "不走無法確認的 os.execv fallback,保留舊行程繼續運作(本次不重啟)", e)
+            return
         logging.error("[restart_self] subprocess.Popen 失敗: %s — fallback os.execv", e)
         try:
             os.execv(cmd[0], cmd)

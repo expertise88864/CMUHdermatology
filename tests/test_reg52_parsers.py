@@ -93,3 +93,77 @@ def test_idle_duration_uses_unsigned_tick_arithmetic():
     from cmuh_common import platform_win
     src = inspect.getsource(platform_win.get_idle_duration)
     assert src.count("& 0xFFFFFFFF") >= 2  # tick 取值與差值各一次
+
+
+# ── [2026-07-26 審查] 止掛是「單一日期」的狀態,不可跨同格其他日期 ──────────────
+_MULTI_DATE_CELL = """
+<table class="schedule">
+  <tr><th>表頭</th></tr>
+  <tr>
+    <td class="timeSlot AM">上午</td>
+    <td class="schBox">(101診)
+      <div class="visitDate"><b>115/07/28</b></div>
+      <div>已掛號：12</div>
+      <div class="visitDate"><b>115/08/04</b></div>
+      <div>止掛</div>
+      <div class="visitDate"><b>115/08/11</b></div>
+      <div>已掛號：3</div>
+    </td>
+  </tr>
+</table>
+"""
+
+
+def test_stop_flag_does_not_leak_to_other_dates_in_same_cell():
+    """★止掛提醒★ 同一格常列多個日期(同一診每週重複)。原本用【整格】文字判斷,
+    只要其中一天止掛,同格其他日期全被標成 is_stopped;止掛掃描看到 is_stopped 就
+    `continue`(已止掛不必再提醒)→ 那些日期的提醒信被靜默吃掉。"""
+    from datetime import date
+    result = main._parse_main_hospital_schedule(_soup(_MULTI_DATE_CELL))
+    assert result[date(2026, 8, 4)][0]["is_stopped"] is True, "真正止掛的那天要標"
+    assert result[date(2026, 7, 28)][0]["is_stopped"] is False, "止掛外洩到前一個日期"
+    assert result[date(2026, 8, 11)][0]["is_stopped"] is False, "止掛外洩到後一個日期"
+    # 人數/診間不可因為這次改動而跑掉
+    assert result[date(2026, 7, 28)][0]["count"] == 12
+    assert result[date(2026, 8, 11)][0]["count"] == 3
+    assert result[date(2026, 7, 28)][0]["room"] == "101診"
+
+
+def test_cell_level_stop_still_applies_to_every_date():
+    """整格都停時「止掛」寫在格首(第一個 visitDate 之前)→ 全部日期都要標,不可漏。"""
+    html = _MULTI_DATE_CELL.replace("(101診)", "(101診) 止掛").replace(
+        "<div>止掛</div>", "<div>已掛號：5</div>")
+    result = main._parse_main_hospital_schedule(_soup(html))
+    assert all(v[0]["is_stopped"] for v in result.values()), "格首的止掛必須套用到整格"
+
+
+def test_ext_branch_and_room_remain_cell_level():
+    """東區分院/診間是【整格】屬性(同一診所有日期共用),不可被這次的逐日期切分改掉。"""
+    from datetime import date
+    html = _MULTI_DATE_CELL.replace("(101診)", "(203診) 東區分院")
+    result = main._parse_main_hospital_schedule(_soup(html))
+    for v in result.values():
+        assert v[0]["is_ext"] is True
+        assert v[0]["ext_branch"] == "east"
+        assert v[0]["room"] == "203診"
+    assert result[date(2026, 8, 4)][0]["is_stopped"] is True
+    assert result[date(2026, 7, 28)][0]["is_stopped"] is False
+
+
+def test_split_helper_degrades_to_cell_text_when_structure_differs():
+    """visitDate 不是本格直接子節點(版型不同)→ 切不出來時退回整格文字=既有行為,
+    不可因為切不出來就把所有日期都當成沒止掛(那會漏標真正停診的日期)。"""
+    from datetime import date
+    html = """
+    <table class="schedule">
+      <tr><th>表頭</th></tr>
+      <tr>
+        <td class="timeSlot AM">上午</td>
+        <td class="schBox"><span>(101診)止掛
+          <div class="visitDate"><b>115/07/28</b></div><div>已掛號：12</div>
+        </span></td>
+      </tr>
+    </table>
+    """
+    result = main._parse_main_hospital_schedule(_soup(html))
+    assert result[date(2026, 7, 28)][0]["is_stopped"] is True

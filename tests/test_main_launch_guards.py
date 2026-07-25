@@ -154,7 +154,9 @@ def test_main_background_restart_starts_minimized_silently():
     assert "main_root.iconify()" in source
     assert re.search(r'main_root\.bind\(\s*"<Map>"', source)
     # app 端重啟匯流點帶 --background
-    assert 'restart_self(["--background"])' in source
+    # [2026-07-26] 不綁死呼叫形狀:_restart_app 現在還會傳 on_confirmed(把破壞性拆解
+    # 延後到確認新行程存活之後)。這裡守的契約是「重啟一定帶 --background」,不是參數個數。
+    assert re.search(r'restart_self\(\s*\["--background"\]', source)
 
 
 def test_startup_splash_uses_same_preferred_monitor_as_main_window():
