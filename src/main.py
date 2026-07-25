@@ -2715,6 +2715,42 @@ def _show_uvb_warning(main_hwnd: int, title: str, msg: str) -> None:
         logging.debug("MessageBox 例外", exc_info=True)
 
 
+def _warn_excimer_segment_skipped(main_hwnd: int, label: str,
+                                  note: Optional[str]) -> None:
+    """[2026-07-25 外審 F3 ★病人安全★] 有 excimer 段因為「不是加量醫囑」(遞減/方向不明)
+    刻意沒更新 → 醫師會以為整條處置都自動處理好了,必須明講是哪一段沒動。
+
+    抽成函式是因為純 excimer 有【兩條】寫回路徑(直接更新、stale 確認後重算),
+    外審 R5 指出第二條漏接 —— 重複的處理碼就是會漏,統一走這裡。"""
+    if not note:
+        return
+    logging.warning("[%s][Excimer] 有段落未自動更新(非加量醫囑):%s", label, note)
+    _show_uvb_warning(
+        main_hwnd, "Excimer 有段落未自動更新",
+        f"處置中的「{note}」未被判定為加量醫囑,\n"
+        f"該段劑量【沒有】自動更新(其他段已更新)。\n\n"
+        f"請醫師確認該段後手動調整。")
+
+
+def _warn_excimer_not_updated(main_hwnd: int, label: str, result) -> None:
+    """[外審 F3/R5] 純 excimer 的「沒有更新任何一段」收尾:SANITY_FAIL 代表程式解析出的值
+    不可信(或整段不是加量醫囑)→ 必須讓醫師看到並手動處理,不可只寫 log 就去設身份 01。
+
+    身份仍設 01(這次就是自費 excimer visit,身份本來就該設),與「寫回失敗」分支的既有取捨一致。"""
+    from cmuh_common.uvb_dose import UvbAction
+    if result.action == UvbAction.SANITY_FAIL:
+        logging.warning("[%s][Excimer] sanity check 失敗: %s → 劑量未更新(身份仍設 01)",
+                        label, result.sanity_reason)
+        _show_uvb_warning(
+            main_hwnd, "Excimer 劑量未自動更新",
+            f"{result.sanity_reason}\n\n"
+            f"身份仍會設為自費(01),但劑量【沒有】自動更新,\n"
+            f"請醫師確認處置後手動調整。")
+        return
+    logging.info("[%s][Excimer] 劑量未自動更新(action=%s),身份仍設 01",
+                 label, result.action)
+
+
 def _photo_confirm_yesno(main_hwnd: int, title: str, intro: str, reason: str,
                          *, tag: str = "UVB", label: str = "F2") -> bool:
     """[2026-06-29] F2/F3 醫囑流程統一的 Yes/No 確認元件(stale 舊紀錄 / 劑量超限共用)。
@@ -2987,6 +3023,8 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
                 logging.info(
                     "[%s][Excimer] 劑量已更新(次數→%s、日期→今天、劑量→%s)",
                     label, result.new_count, result.new_dose)
+                _warn_excimer_segment_skipped(
+                    main_hwnd, label, result.decrease_note)
             else:
                 logging.warning(
                     "[%s][Excimer] 劑量寫回失敗(身份仍會設 01)", label)
@@ -3035,20 +3073,22 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
                         logging.info(
                             "[%s][Excimer] (確認後)劑量已更新(次數→%s、劑量→%s)",
                             label, result.new_count, result.new_dose)
+                        # [外審 R5] 這條「確認後重算」路徑原本漏接 F3 的兩個提示。
+                        _warn_excimer_segment_skipped(
+                            main_hwnd, label, result.decrease_note)
                     else:
                         logging.warning(
                             "[%s][Excimer] (確認後)劑量寫回失敗(身份仍設 01)",
                             label)
                 else:
-                    logging.info("[%s][Excimer] 確認後 action=%s,未更新劑量",
-                                 label, result.action)
+                    _warn_excimer_not_updated(main_hwnd, label, result)
             else:
                 logging.info(
                     "[%s][Excimer] 使用者按否 → 劑量未更新(身份仍設 01)", label)
         else:
-            logging.info(
-                "[%s][Excimer] 劑量未自動更新(action=%s),身份仍設 01",
-                label, result.action)
+            # [2026-07-25 外審 F3 ★病人安全★] 舊版所有非 UPDATED 的 action 一律只寫 log 就
+            # 往下設身份 01 —— 醫師完全看不到「劑量沒被自動更新」。改由共用 helper 處理。
+            _warn_excimer_not_updated(main_hwnd, label, result)
     except SubsystemInterrupted:
         # [H4 2026-07-09] F12 取消【必須】往上傳,不可被下面的 except Exception 吞掉
         # (否則舊 worker 會照樣寫回處置欄+設身份,違背 F12 取消語意)。
@@ -3426,6 +3466,18 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
             value=f"dose={getattr(result.parsed, 'dose', None)}→{result.new_dose} "
                   f"count={getattr(result.parsed, 'count', None)}→{result.new_count}",
             outcome=_LEDGER_OK)
+
+    # [2026-07-25 外審 F3 ★病人安全★] Step D 有 excimer 段因為「不是加量醫囑」(遞減/方向
+    # 不明)被刻意跳過。UVB 主行已正確寫回,但那一段【沒動】—— 醫師看到 UVB 更新成功,很容易
+    # 以為整條處置都處理好了。必須明講,且要在回讀驗證通過之後(不精準宣稱未經確認的事)。
+    if getattr(result, 'decrease_note', None):
+        logging.warning("[%s][UVB] 有 excimer 段未自動更新(非加量醫囑):%s",
+                        label, result.decrease_note)
+        _show_uvb_warning(
+            main_hwnd, "有 excimer 段未自動更新",
+            f"UVB 劑量已更新,但處置中的「{result.decrease_note}」\n"
+            f"未被判定為加量醫囑,該 excimer 段的劑量【沒有】自動更新。\n\n"
+            f"請醫師確認該段後手動調整。")
 
     if result.additional_lines_updated > 0:
         logging.info(

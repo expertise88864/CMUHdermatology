@@ -31,6 +31,7 @@ F2/F3 熱鍵觸發時：
 from __future__ import annotations
 
 import calendar
+import logging
 import math
 import re
 from dataclasses import dataclass
@@ -322,6 +323,104 @@ _DECREASE_BEFORE_RE = re.compile(     # 數字前方緊跟這些 = 遞減醫囑,
     # 該減反增(800→850)。只放行「動詞後緊跟劑量名詞/by」的組合,不影響 "decrease 50"。
     r"\s*(?:(?:the\s+)?dos(?:e|age)|劑量)?\s*(?:by\s+)?[:：,，]?\s*$",
     re.IGNORECASE)
+
+
+# [2026-07-25 外審 F1/F2 ★病人安全★] 方向判定【不可】以「_UVB_INCREASE_RE 有命中」為前提。
+# _UVB_INCREASE_RE 只認得 add/increase/增加/加 與「數字 + each time/每次」,所以
+#   「每次減 50」「decrease 50」(不帶 each time)  → 它完全不命中
+# → 舊寫法 (inc_m is not None and _inc_safe is None) 判不出遞減 → increase 當 0
+# → 回 UPDATED:劑量【照原值 600 寫回】並把日期/次數推進成「今天照過 600」。醫囑寫的是減量
+# (多半因紅斑/灼傷),照原劑量給同樣有害,而且病歷還被記成已照。故改為【正面偵測遞減醫囑】。
+# 刻意【不】收 _DECREASE_BEFORE_RE 裡的 '-':它在那裡只用於「緊貼數字前一格」的極窄位置,
+# 拿來全段掃會把日期 2026-07-20 判成遞減。'-50 each time' 仍由下面的 fallback 判定接住。
+_DECREASE_ORDER_RE = re.compile(
+    r"(?:de\s*cr(?:e?a?|a?e?)se[d]?|reduc(?:e|ed|es|ing|tion)|taper(?:ed|ing)?"
+    r"|lower(?:ed|ing)?|每次減|減(?:少|量|到)?|降(?:低|到)?|調降)"
+    # 連接詞含中文「到/至」:「減量到 300」「降至 250」若漏掉,同樣會落回 increase=0 →
+    # 維持原劑量 600 照寫並推進次數 —— 與 F1 完全同一類的失效,必須一起收。
+    r"\s*(?:(?:the\s+)?dos(?:e|age)|劑量)?\s*(?:by|to|到|至)?\s*[:：,，]?\s*(\d+)",
+    re.IGNORECASE)
+
+
+# [外審 R4] 上限之後的區域常接【別的藥物】醫囑('MTX 6# QW taper to 3#'、'dupi taper to 4w'、
+# 'cyclosporine 100mg reduce to 50mg')。那些 taper/reduce 講的是藥,不是光療劑量,拿來擋
+# excimer 會讓合法的 hold-dose 醫囑停止服務。判方向前先把【藥物劑量寫法】(數字+藥物單位)
+# 抹掉:光療的加減量寫的是 mJ 與「each time/每次」,不會用 #/mg/週 這些單位,不受影響。
+_DRUG_DOSING_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:#|mg|mcg|ml|%|w(?:k|ks|eeks?)?\b|d(?:ays?)?\b"
+    r"|顆|粒|片|支|週|周|天)",
+    re.IGNORECASE)
+
+
+def _strip_drug_dosing(segment: str) -> str:
+    """把「數字+藥物單位」換成空白,讓方向偵測看不到別的藥物的加減量。"""
+    return _DRUG_DOSING_RE.sub(" ", segment)
+
+
+def _find_decrease_order(segment: str) -> Optional[str]:
+    """段內若寫有遞減醫囑,回【原文片段】(給醫師看的訊息只能引用原文,不得推斷成因);否則 None。
+
+    要求「遞減動詞後緊跟數字」(中間只容許 dose/劑量/by/to 等中性字)是刻意的:
+    'keep phototherapy on both lower limbs to 680' 這種描述句,lower 後面是 limbs 不是數字
+    → 不會被誤判成遞減而停止服務(誤擋 = 醫師要手動,有可用性代價)。"""
+    m = _DECREASE_ORDER_RE.search(segment)
+    return m.group(0).strip() if m else None
+
+
+def _direction_safe_increase(line: str, seg_start: int, seg_end: int,
+                             tail_start: Optional[int],
+                             dose_end: Optional[int] = None):
+    """回 (加量值或 None, 非加量醫囑的原文片段或 None)。excimer 兩條路徑共用,避免各修各的。
+
+    搜尋範圍與 _seg_meta 同語意:【段內優先,段內完全沒有方向指令才退回句尾共用區】。
+    - 段內有遞減、句尾有加量(混寫)→ 段內優先 → 判遞減 → 不動(安全側)。
+    - figure 3(段內什麼都沒有、日期/加量/上限全寫在句尾共用)→ 退回句尾 → 照舊更新(不退步)。
+    遞減判定用【正面偵測】加上「方向盲有命中但方向安全回 None」的 fallback(接住 '-50 each
+    time' 這類靠緊鄰位置判斷的寫法),兩者任一成立即不更新。"""
+    seg_off = seg_start
+    seg = line[seg_start:seg_end]
+    if (_UVB_INCREASE_RE.search(seg) is None and not _DECREASE_ORDER_RE.search(seg)
+            and tail_start is not None and tail_start > seg_end):
+        seg = line[tail_start:]
+        seg_off = tail_start
+    # [外審 R2] 遞減偵測必須限定在【本段的光療劑量子句】內,不可整段亂掃 —— 同一行常有
+    # 別的醫囑(實測 'excimer …, increase 50 each time, MAX 1000; MTX 6# QW taper to 3#'
+    # 被藥物的 taper 壓掉明寫的 increase 50 → 合法醫囑停止服務)。子句邊界取兩層:
+    #   (1) 分號 = 另一則醫囑的開始(病歷慣例,repo 既有案例的藥物多半另起一行或用 ;);
+    #   (2) 上限(MAX/fixed/upper limit)= 光療劑量醫囑的收尾,其後多半是別的東西。
+    clause = seg.split(";")[0]
+    # 上限只有【寫在劑量之後】才算子句收尾。實機也有「Excimer light fixed at 1000, 810 (36)
+    # on (日期), add 30 each time」這種上限寫在最前面的 —— 拿它當右界會把 add 30 切掉,
+    # 810 就不再加量(退步)。故只取劑量之後的第一個上限;沒有就不設右界。
+    _dose_rel = max(0, dose_end - seg_off) if dose_end is not None else 0
+    _ceil = next((m for m in _UVB_MAX_RE.finditer(clause)
+                  if m.start() >= _dose_rel), None)
+    core = clause[:_ceil.end()] if _ceil else clause
+    # 光療子句內寫了遞減 → 一律不動(F1/F2 的紅線,優先於任何加量字樣)。
+    dec = _find_decrease_order(core)
+    if dec:
+        return None, dec
+    inc = _find_uvb_increase(core)
+    if inc is not None:
+        return inc, None
+    # 子句內找不到可信加量時才看上限之後,且【兩個方向都要看】(外審 R3):
+    #   'MAX 1000, decrease 50 each time' 遞減寫在上限後 → 仍必須擋(不可因 R2 的收斂漏掉);
+    #   'MAX 1000, increase 50 each time' 加量寫在上限後 → 舊版本來就吃得到,不可退步
+    #     (只擋不吃會變成「維持 600 照寫 + 次數推進成今天照過」—— 與 F1 同一類的失效)。
+    # 遞減優先於加量:同時出現時走安全側。
+    # 上限之後才是別的醫囑最常出現的地方 → 只在這裡濾掉藥物劑量寫法(外審 R4)。
+    # core 是光療醫囑本體,不做這層過濾,以免影響既有解析。
+    rest = _strip_drug_dosing(clause[_ceil.end():]) if _ceil else ""
+    dec_rest = _find_decrease_order(rest)
+    if dec_rest:
+        return None, dec_rest
+    inc_rest = _find_uvb_increase(rest)
+    if inc_rest is not None:
+        return inc_rest, None
+    m = _UVB_INCREASE_RE.search(core) or _UVB_INCREASE_RE.search(rest)
+    if m is not None:
+        return None, m.group(0).strip()   # 方向盲有命中、方向安全沒有 = 遞減語意
+    return None, None
 
 
 def _find_uvb_increase(segment: str) -> Optional[int]:
@@ -1292,6 +1391,10 @@ class UvbUpdateResult:
     # [v20.13] 偵測到的「不確定 / 需要醫師確認」其他 triplet (e.g. line 1 是
     # excimer 但日期跟第一行 UVB 不同)。caller 應該跳 Yes/No 詢問是否套用。
     uncertain_other_triplets: Optional[list] = None
+    # [2026-07-25 外審 F3] 有 excimer 段因為「不是加量醫囑」(遞減/方向不明)而【刻意沒更新】
+    # 時,放該段的原文片段。caller 必須把它顯示給醫師 —— 否則醫師會以為劑量都自動處理好了,
+    # 沿用未減量的原劑量。UPDATED 時代表「其他段有更新、這段沒有」,仍要提示。
+    decrease_note: Optional[str] = None
 
 
 # [codex P1] 續行延續的【否決】關鍵字:明確提到「過去/之前/上次/病史/N 天前」的行,即使結構
@@ -1338,7 +1441,8 @@ def _compute_excimer_segment_edit(
     區 [tail_start, EOL)(像 '..., excimer 440 for X, on (日期) add 10 fixed 700' 的日期/上限/加量
     是兩段共用寫在句尾) —— 這樣既能吃共用句尾,又不會讓前一段誤偷後一段【自己】的日期/上限
     (codex P1:否則無日期的第一段會借到第二段的日期、套錯 staleness/覆寫日期)。
-    回 (edits, first_update, too_close, recognized):edits 為 [((start,end), 取代字串)],沒更新
+    回 (edits, first_update, too_close, recognized, decrease):decrease=非加量醫囑的原文片段
+    (本段刻意不自動改,交醫師)。edits 為 [((start,end), 取代字串)],沒更新
     則為 [];recognized=本段確實是「有劑量＋上限」的照光劑量醫令(即使因太近/太舊/無效值而沒改),
     供上層判定要不要啟用續行延續 —— 純提及 excimer 而無劑量(如 'discuss excimer')recognized=False。
     邏輯與原本單段完全一致(只是把範圍參數化),含所有既有防呆與 compute_new_dose。"""
@@ -1367,46 +1471,67 @@ def _compute_excimer_segment_edit(
 
     date_m = _seg_meta(_UVB_DATE_RE)
     max_m = _seg_meta(_UVB_MAX_RE)
+    # [2026-07-25 審查 ★病人安全★] 原本用方向盲的 _UVB_INCREASE_RE:
+    # 「decrease 50 each time」「reduce dose by 50 each time」都會被讀成 +50
+    # (實測 excimer 600 → 650,醫囑寫的是【減】50 → 100 mj 反向誤差),而 excimer
+    # 寫回【沒有回讀驗證、也不跳確認框】。UC-03 早就做了方向安全的 _find_uvb_increase,
+    # 當時註解只寫「excimer 多段路徑另有自己的 _seg_meta,不動」——那記錄的是修正範圍,
+    # 不是安全論證。改為與 UVB 路徑共用同一個判定。
     inc_m = _seg_meta(_UVB_INCREASE_RE)
     dose_info = _find_excimer_dose(
         line, seg_start, date_span=(date_m.span() if date_m else None))
     # 劑量必須落在本段範圍內 —— 否則本段其實沒劑量(下一個 marker 段才有)→ 不處理。
     if dose_info is not None and dose_info[0] >= dose_bound:
         dose_info = None
+    # 方向判定的搜尋範圍必須與 _seg_meta 同語意(段內優先、段內沒有才退回句尾共用區),
+    # 否則 figure 3 的前段會因為加量字樣寫在句尾而被誤判成遞減 → 停止更新(退步)。
+    # 需要劑量位置才能判斷「上限是不是子句收尾」,故排在 dose_info 之後。
+    _inc_safe, _decrease_text = _direction_safe_increase(
+        line, seg_start, dose_bound, tail_start,
+        dose_end=dose_info[1] if dose_info else None)
     # recognized:本段有劑量＋上限結構 → 是一段真的照光劑量醫令(啟用續行延續的依據)。
     recognized = dose_info is not None and max_m is not None
+    if _decrease_text:
+        # 遞減醫囑:不動這段(recognized 仍為 True —— 它確實是一段照光劑量醫令,
+        # 只是我們刻意不自動改),並【回報上層】。[外審 F3] 只回空 edits 不夠:上層會變成
+        # NO_UVB_LINE,呼叫端只寫 log 就繼續往下跑,醫師看不到任何提示 → 可能沿用未減量的
+        # 原劑量。必須一路傳回 update_uvb_in_text 轉成 SANITY_FAIL(呼叫端會跳警告窗)。
+        logging.warning("[uvb] excimer 段的「%s」未判定為加量醫囑 → 不自動更新劑量,交醫師手動調整", _decrease_text)
+        return [], None, None, recognized, _decrease_text
     if max_m is None or dose_info is None:
-        return [], None, None, recognized
+        return [], None, None, recognized, False
     dose_start, dose_end, dose = dose_info
 
     # 沒日期(初診/醫師沒寫日期)→ first-time:只加劑量(cap MAX),不補日期/次數(2026-06-25 user)。
     if date_m is None:
         if not allow_undated or inc_m is None or dose_start > max_m.start():
-            return [], None, None, recognized
+            return [], None, None, recognized, False
         try:
             max_dose = int(max_m.group(1))
-            increase = int(inc_m.group(1) or inc_m.group(2))
+            increase = _inc_safe          # 方向安全(遞減醫囑 → None)
+            if increase is None:
+                return [], None, None, recognized, False
         except (TypeError, ValueError):
-            return [], None, None, recognized
+            return [], None, None, recognized, False
         if (dose < MIN_DOSE or max_dose < MIN_DOSE
                 or not (0 < increase <= 200) or dose >= max_dose):
-            return [], None, None, recognized
+            return [], None, None, recognized, False
         new_dose = dose if _seg_maintain() else min(dose + increase, max_dose)
         return ([((dose_start, dose_end), str(new_dose))],
                 {"dose": new_dose, "count": None, "last_date": None, "days_diff": None},
-                None, recognized)
+                None, recognized, False)
 
     if dose_start > date_m.start():
-        return [], None, None, recognized
+        return [], None, None, recognized, False
     ymd = _resolve_date_match(date_m)
     if ymd is None:
-        return [], None, None, recognized
+        return [], None, None, recognized, False
     try:
         last_date = date(*ymd)
         max_dose = int(max_m.group(1))
-        increase = int(inc_m.group(1) or inc_m.group(2)) if inc_m else 0
+        increase = _inc_safe if _inc_safe is not None else 0
     except (TypeError, ValueError):
-        return [], None, None, recognized
+        return [], None, None, recognized, False
 
     masked = (line[:date_m.start()]
               + " " * (date_m.end() - date_m.start())
@@ -1427,16 +1552,16 @@ def _compute_excimer_segment_edit(
             # 1 個月門檻才受 skip_stale 控制:正常路徑略過舊段;Yes 後照舊紀錄更新。
             or (not skip_stale
                 and last_date < _months_before(today, MODIFY_STALE_MONTHS))):
-        return [], None, None, recognized
+        return [], None, None, recognized, False
     # [2026-06-25 user] 日期距今 < 2 天(當天又按一次)→ 不加劑量,但記下 days_diff 讓上層跳
     # 「距上次太近」、不設身份。負值(未來日期)維持原本靜默略過(too_close 回 None)。
     if days_diff < TOO_CLOSE_DAYS:
-        return [], None, (days_diff if 0 <= days_diff else None), recognized
+        return [], None, (days_diff if 0 <= days_diff else None), recognized, False
 
     new_dose = compute_new_dose(
         dose=dose, increase=increase, max_dose=max_dose, days_diff=days_diff)
     if new_dose is None:
-        return [], None, None, recognized
+        return [], None, None, recognized, False
     if _seg_maintain():
         new_dose = dose
     new_count = count + 1 if count is not None else None
@@ -1450,17 +1575,21 @@ def _compute_excimer_segment_edit(
     return (edits,
             {"dose": new_dose, "count": new_count,
              "last_date": last_date, "days_diff": days_diff},
-            None, recognized)
+            None, recognized, False)
 
 
 def _update_excimer_lines(text: str, today: date,
                           allow_undated: bool = False,
                           skip_stale: bool = False,
                           flexible_dose: bool = False
-                          ) -> tuple[str, int, Optional[dict], Optional[int]]:
+                          ) -> tuple[str, int, Optional[dict], Optional[int],
+                                     Optional[str]]:
     """Update structured excimer lines independently from UVB lines.
 
-    回傳 (新文字, 更新段數, 第一筆更新摘要, too_close_days)。too_close_days 非 None 代表
+    回傳 (新文字, 更新段數, 第一筆更新摘要, too_close_days, decrease_seen)。
+    [外審 F3] decrease_seen=非加量醫囑的【原文片段】(該段刻意不動)—— 上層必須讓醫師看到,不可靜默
+    (只回空 edits 會落到 NO_UVB_LINE,純 excimer 呼叫端只寫 log 就繼續往下跑)。
+    too_close_days 非 None 代表
     有「有效但日期距今 < 2 天」的 excimer 段 —— 上層應跳「距上次太近」提示、不加劑量、不設身份。
 
     flexible_dose=True(只給【純自費 Excimer】F2/F3 路徑用):劑量用「第一個不在括號內且
@@ -1478,6 +1607,7 @@ def _update_excimer_lines(text: str, today: date,
     updated = 0
     first_update: Optional[dict] = None
     too_close_days: Optional[int] = None
+    decrease_seen: Optional[str] = None
 
     if flexible_dose:
         # 【純自費 Excimer F2/F3 多段】[2026-07-09 楊智翔實機]原本每個處置欄只改「第一個 excimer
@@ -1505,12 +1635,14 @@ def _update_excimer_lines(text: str, today: date,
             line_edits: dict = {}   # span → 取代字串;同 span(共用日期)自動去重
             line_recognized = False
             for seg_start, dose_bound in segments:
-                edits, seg_first, seg_too_close, recognized = \
+                edits, seg_first, seg_too_close, recognized, seg_decrease = \
                     _compute_excimer_segment_edit(
                         line, seg_start, dose_bound, tail_start,
                         today, allow_undated, skip_stale)
                 if recognized:
                     line_recognized = True
+                if seg_decrease and not decrease_seen:
+                    decrease_seen = seg_decrease
                 if seg_too_close is not None and too_close_days is None:
                     too_close_days = seg_too_close
                 if not edits:
@@ -1530,13 +1662,14 @@ def _update_excimer_lines(text: str, today: date,
                     new_line = new_line[:start] + replacement + new_line[end:]
                 lines[index] = new_line
 
-        return "".join(lines), updated, first_update, too_close_days
+        return "".join(lines), updated, first_update, too_close_days, decrease_seen
 
     # 【健保 UVB visit Step D】flexible_dose=False —— 維持既有保守單段行為:嚴格 _EXCIMER_DOSE_RE
     # (要求 mj 單位)、每行只認第一個 marker 後的第一個劑量,不擴充多段(不動 UVB visit 順手動
     # excimer 的既有行為)。此路徑目前只被 UVB Step D 以預設參數呼叫。
     for index, line in enumerate(lines):
-        marker = _EXCIMER_MARKER_RE.search(line)
+        _markers = list(_EXCIMER_MARKER_RE.finditer(line))
+        marker = _markers[0] if _markers else None
         if marker is None:
             continue
         date_m = _UVB_DATE_RE.search(line, marker.end())
@@ -1545,6 +1678,21 @@ def _update_excimer_lines(text: str, today: date,
         dose_info = ((_dm.start(1), _dm.end(1), int(_dm.group(1)))
                      if _dm else None)
         inc_m = _UVB_INCREASE_RE.search(line, marker.end())
+        # [2026-07-25 審查 + 外審 F2] 同上:方向安全判定(遞減醫囑不得被讀成加量)。
+        # 這條嚴格路徑在一般 UVB 就診的 Step D 也會被走到,且它【只處理第一個 marker 段】,
+        # 所以方向判定也必須以第二個 marker 為上界 —— 否則同行第二段的 "increase 20" 會被
+        # 第一段(寫著 decrease 50)借去,實測把 600 寫成 620:遞減醫囑直接變成加量。
+        # 範圍語意與 flexible 路徑共用同一個 helper(段內優先、段內沒有才退回句尾共用區)。
+        _seg_end = _markers[1].start() if len(_markers) > 1 else len(line)
+        _tail_start = _markers[-1].end() if len(_markers) > 1 else None
+        _inc_safe, _seg_decrease = _direction_safe_increase(
+            line, marker.end(), _seg_end, _tail_start,
+            dose_end=dose_info[1] if dose_info else None)
+        if _seg_decrease:
+            logging.warning("[uvb] excimer(嚴格)段的「%s」未判定為加量醫囑 → 不自動更新劑量", _seg_decrease)
+            if not decrease_seen:
+                decrease_seen = _seg_decrease
+            continue                       # 遞減醫囑:同上,不動、交醫師
         if max_m is None or dose_info is None:
             continue
         dose_start, dose_end, dose = dose_info
@@ -1557,7 +1705,9 @@ def _update_excimer_lines(text: str, today: date,
                 continue
             try:
                 max_dose = int(max_m.group(1))
-                increase = int(inc_m.group(1) or inc_m.group(2))
+                increase = _inc_safe
+                if increase is None:
+                    continue
             except (TypeError, ValueError):
                 continue
             if (dose < MIN_DOSE or max_dose < MIN_DOSE
@@ -1580,7 +1730,7 @@ def _update_excimer_lines(text: str, today: date,
         try:
             last_date = date(*ymd)
             max_dose = int(max_m.group(1))
-            increase = int(inc_m.group(1) or inc_m.group(2)) if inc_m else 0
+            increase = _inc_safe if _inc_safe is not None else 0
         except (TypeError, ValueError):
             continue
 
@@ -1638,7 +1788,7 @@ def _update_excimer_lines(text: str, today: date,
                 "days_diff": days_diff,
             }
 
-    return "".join(lines), updated, first_update, too_close_days
+    return "".join(lines), updated, first_update, too_close_days, decrease_seen
 
 
 def _count_uvb_lines(text: str) -> int:
@@ -1797,11 +1947,43 @@ def _first_time_update(parsed: UvbLineInfo, today: date,
         return UvbUpdateResult(action=UvbAction.PARSE_FAIL, uvb_line_count=uvb_lines)
     if parsed.dose < MIN_DOSE:
         return UvbUpdateResult(action=UvbAction.PARSE_FAIL, uvb_line_count=uvb_lines)
+    # [2026-07-25 審查 ★病人安全★] UC-06 補了 count/increase/dose,**漏了 max_dose**。
+    # 實測:「MAX: 1,500 mj/cm2」的千分位逗號讓 _UVB_MAX_RE 只吃到 1 → min(500+30, 1)=1
+    # → 處置欄被寫成「UVB 1 mj/cm2」(500 → 1);「fixed 3 times per week」同理寫成 3。
+    # 有日期的路徑早就擋這個(max_dose < MIN_DOSE → SANITY_FAIL,見 _dated_update),
+    # excimer 無日期路徑也擋(max_dose < MIN_DOSE or dose >= max_dose → skip),
+    # 只有這條「首次治療」路徑沒擋,而它【沒有回讀驗證】也【不跳確認框】。
+    # 一律比照姊妹路徑 fail-closed:算不出可信的上限就不猜,交醫師手動。
+    # [外審 F4] 訊息【只能陳述程式確知的事】。程式確知的是「解析出的 MAX 低於下限」,
+    # 【不知道】成因(逗號?fixed N times?醫師真的寫了 MAX 3?),所以不可寫「可能是…」
+    # 去引導醫師 —— 那是推斷,而且 "until 3 weeks" 這種根本不屬於列舉的任何一種。
+    # 改為只講事實 + 一句不含判斷的指示,並附上原文行讓醫師自己看。
+    if parsed.max_dose is not None and parsed.max_dose < MIN_DOSE:
+        logging.warning("[uvb] 首次治療:解析出的 MAX %s 低於下限 %s → 不自動更新,"
+                        "交醫師確認。原文行:%r",
+                        parsed.max_dose, MIN_DOSE, parsed.full_match[:200])
+        return UvbUpdateResult(
+            action=UvbAction.SANITY_FAIL, uvb_line_count=uvb_lines,
+            sanity_reason=f"解析出的 MAX 是 {parsed.max_dose},低於下限 {MIN_DOSE}"
+                          f"\n處置原文:{parsed.full_match.strip()[:200]}")
+    if parsed.max_dose is not None and parsed.dose > parsed.max_dose:
+        logging.warning("[uvb] 首次治療:dose %s 已超過 MAX %s → 不自動更新,交醫師確認",
+                        parsed.dose, parsed.max_dose)
+        return UvbUpdateResult(
+            action=UvbAction.SANITY_FAIL, uvb_line_count=uvb_lines,
+            sanity_reason=f"目前劑量 {parsed.dose} 已超過 MAX {parsed.max_dose}")
     # 若有 increase → 套用 +increase 公式 (尊重原 MAX); 否則保持原 dose
     if parsed.increase is not None and parsed.max_dose:
         new_dose = min(parsed.dose + parsed.increase, parsed.max_dose)
     else:
         new_dose = parsed.dose
+    # 最後一道:算出來的劑量本身也必須合理(理論上前面已擋完,這裡是不變式)
+    if new_dose < MIN_DOSE:
+        logging.warning("[uvb] 首次治療:算出的新劑量 %s 低於下限 %s → 不寫入",
+                        new_dose, MIN_DOSE)
+        return UvbUpdateResult(
+            action=UvbAction.SANITY_FAIL, uvb_line_count=uvb_lines,
+            sanity_reason=f"算出的新劑量 {new_dose} 低於下限 {MIN_DOSE}")
     new_count = parsed.count + 1 if parsed.count is not None else None
     src = parsed.full_match
 
@@ -1986,7 +2168,7 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         # excimer 劑量更新(楊智翔實機:有 excimer 卻沒辦法修改)。紫外線仍保護 → 不會誤入 allow_undated。
         if _is_pure_excimer or not _has_uvb_or_phototherapy_treatment(text):
             (excimer_text, excimer_count, excimer_first,
-             excimer_too_close) = _update_excimer_lines(
+             excimer_too_close, excimer_decrease) = _update_excimer_lines(
                 text, today, allow_undated=True, skip_stale=skip_stale_check,
                 flexible_dose=True)
             # [2026-06-25 user] 只要有「有效但日期距今 < 2 天」的 excimer 行 → 一律回 TOO_CLOSE,
@@ -2000,6 +2182,7 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
             if excimer_count and excimer_first:
                 return UvbUpdateResult(
                     action=UvbAction.UPDATED,
+                    decrease_note=excimer_decrease,
                     new_text=excimer_text,
                     new_dose=excimer_first["dose"],
                     new_count=excimer_first["count"],
@@ -2007,6 +2190,18 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
                     days_diff=excimer_first["days_diff"],
                     uvb_line_count=excimer_count,
                     additional_triplets_updated=max(0, excimer_count - 1),
+                )
+            # [外審 F3 ★病人安全★] 有段落因為「不是加量醫囑」被刻意跳過、且【沒有任何段更新】
+            # → 不可靜默落到下面的 NO_UVB_LINE(純 excimer 呼叫端只寫 log 就繼續設身份,
+            # 醫師看不到提示 → 可能沿用未減量的原劑量)。回 SANITY_FAIL 讓呼叫端跳警告窗。
+            if excimer_decrease:
+                return UvbUpdateResult(
+                    action=UvbAction.SANITY_FAIL,
+                    uvb_line_count=uvb_lines,
+                    decrease_note=excimer_decrease,
+                    sanity_reason=(
+                        f"excimer 段的「{excimer_decrease}」未被判定為加量醫囑 → "
+                        f"劑量未自動更新,請確認後手動調整"),
                 )
             # [2026-06-24] 純 excimer 但每一行日期都早於 1 個月(被略過、沒更新到)→
             # 跳 Yes/No 確認(單行舊 excimer / 多行 excimer 全舊);Yes 後 caller 帶
@@ -2383,7 +2578,8 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         triplet_count += 1
 
     # ─── Step D: excimer / excimer light 各自依自己的欄位更新 ───────────
-    working, excimer_count, _, _ = _update_excimer_lines(working, today)
+    working, excimer_count, _, _, excimer_decrease = _update_excimer_lines(
+        working, today)
     triplet_count += excimer_count
 
     new_text = working
@@ -2447,4 +2643,7 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         additional_lines_updated=uvb_additional,
         additional_triplets_updated=triplet_count,
         uncertain_other_triplets=uncertain_others if uncertain_others else None,
+        # [外審 F3] Step D 有 excimer 段因「不是加量醫囑」被跳過 → UVB 主醫囑照常更新
+        # (那是另一行、本來就該更新),但必須讓醫師知道那一段【沒有】被自動處理。
+        decrease_note=excimer_decrease,
     )
