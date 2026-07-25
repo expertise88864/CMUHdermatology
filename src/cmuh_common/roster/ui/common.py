@@ -42,6 +42,15 @@ WEEK_COLOR_CHIP = {"pink": ("#F8BBD0", "#7A2044", "粉週"),
                    "green": ("#C8E6C9", "#1B5E20", "綠週")}
 # 警告面板逐列前景色（依 Precheck.severity）——紅=擋、橘=注意、灰=僅供參考。
 WARN_SEVERITY_FG = {"error": "#B00020", "warn": "#B26500", "info": "#607080"}
+# [2026-07-24 使用者互動] 「筆刷」＝在圖例點一位成員後,直接點月曆格即指派該人
+# （不必左鍵輪換 N 次或右鍵翻選單）。選中的圖例籤用粗深藍框標示。
+BRUSH_ACTIVE_BORDER = "#1F6FEB"
+BRUSH_IDLE_BORDER = "#D0D5DB"
+# 結算面板帳本結轉正負色（正=別人欠他/綠、負=他欠班/紅）。
+TALLY_POS_FG = "#1B6B45"
+TALLY_NEG_FG = "#B00020"
+TALLY_GONE_FG = "#9AA3AC"               # 已離名單列
+LEAVE_MARK = "⚠"                        # 值班者當天請假 → 格內警示（手動排班誤指派）
 
 
 def card_body_bg(weekend: bool, holiday: bool) -> str:

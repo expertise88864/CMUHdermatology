@@ -16,12 +16,13 @@ from tkinter import filedialog, messagebox, ttk
 from cmuh_common.deps_runtime import ensure_dependencies
 from cmuh_common.roster.model import day_point, is_weekend, week_key
 from cmuh_common.roster.ui.common import (
-    CARD_BORDER, CARD_HDR_HOLIDAY, CARD_HDR_NORMAL, CARD_HDR_WEEKEND,
-    CARD_TODAY_BORDER, LINE_CHIP, OVR_FONT, OVR_STYLE, WARN_SEVERITY_FG,
-    WEEK_COLOR_CHIP, WEEKDAY_HEADERS, MonthSelector, StatusBar,
-    archive_finalize_pdf_async, bind_hover_highlight, calendar_matrix,
-    card_body_bg, fg_for, member_color, next_in_cycle, shade_color,
-    tint_color, vs_member_color,
+    BRUSH_ACTIVE_BORDER, BRUSH_IDLE_BORDER, CARD_BORDER, CARD_HDR_HOLIDAY,
+    CARD_HDR_NORMAL, CARD_HDR_WEEKEND, CARD_TODAY_BORDER, LEAVE_MARK,
+    LINE_CHIP, OVR_FONT, OVR_STYLE, TALLY_GONE_FG, TALLY_NEG_FG, TALLY_POS_FG,
+    WARN_SEVERITY_FG, WEEK_COLOR_CHIP, WEEKDAY_HEADERS, MonthSelector,
+    StatusBar, archive_finalize_pdf_async, bind_hover_highlight,
+    calendar_matrix, card_body_bg, fg_for, member_color, next_in_cycle,
+    shade_color, tint_color, vs_member_color,
 )
 
 _WD = "一二三四五六日"
@@ -29,8 +30,8 @@ _WD = "一二三四五六日"
 _SCOPE_TITLE = {"r": "R 排班", "vs": "VS 排班"}
 _ORTOOLS_DEP = [("ortools==9.15.6755", "ortools")]
 # [2026-07-24 UI] 閒置時狀態列＝操作提示（左鍵輪換/右鍵選單原本無處可發現）。
-_IDLE_HINT = ("就緒｜月曆格：左鍵輪換人選、右鍵指定/鎖定/請假/清空"
-              "｜週六標頭粉週/綠週＝色塊連週規則的週色")
+_IDLE_HINT = ("就緒｜圖例點一位＝筆刷,之後點格直接指派｜月曆格：左鍵輪換、"
+              "右鍵指定/鎖定/請假/清空｜⚠＝該人當天請假")
 
 
 class LeaveEditor(tk.Toplevel):
@@ -158,12 +159,20 @@ class CalendarDutyTab(ttk.Frame):
         self._finalized = False
         self._busy_flag = False
         self._toolbar: list = []
+        # [2026-07-24 使用者] 筆刷：圖例點一位成員後,點月曆格即直接指派該人
+        # （取代「左鍵輪換 N 次」）。None＝未選,維持原本輪換行為。
+        self._brush: dict = {"r": None, "vs": None}
+        self._legend_chips: dict = {}
 
         self._build_toolbar()
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True)
-        self._grid_holder = ttk.Frame(body, padding=4)
-        self._grid_holder.pack(side="left", fill="both", expand=True)
+        left = ttk.Frame(body)
+        left.pack(side="left", fill="both", expand=True)
+        self._legend_holder = ttk.Frame(left, padding=(4, 2, 4, 0))
+        self._legend_holder.pack(fill="x")
+        self._grid_holder = ttk.Frame(left, padding=4)
+        self._grid_holder.pack(fill="both", expand=True)
         side = ttk.Frame(body, width=250)
         side.pack(side="right", fill="y")
         self._build_side(side)
@@ -228,6 +237,10 @@ class CalendarDutyTab(ttk.Frame):
                             ("pt", "點", 38), ("bal", "帳本", 50)):
                 tree.heading(c, text=t)
                 tree.column(c, width=w, anchor="center")
+            # [2026-07-24 易讀性] 帳本結轉正負一眼分：負(欠班)紅、正綠、已離名單灰
+            tree.tag_configure("neg", foreground=TALLY_NEG_FG)
+            tree.tag_configure("pos", foreground=TALLY_POS_FG)
+            tree.tag_configure("gone", foreground=TALLY_GONE_FG)
             tree.pack(fill="x", padx=6)
             self._sum[scope] = tree
         # [2026-07-13 使用者] 週六 R2/R3 切片累計次數（存在 biopsy.json）。
@@ -296,6 +309,25 @@ class CalendarDutyTab(ttk.Frame):
         members = {"r": self._member_map("r"), "vs": self._member_map("vs")}
         duty = {"r": month.get("r_duty") or {}, "vs": month.get("vs_duty") or {}}
         biopsy = month.get("saturday_biopsy") or {}
+        # [2026-07-24] 請假表：格內 ⚠ 標記 + 右鍵選單標示（手動排班看得到限制）
+        leaves = {"r": (ctx_r.leaves or {}), "vs": (ctx_vs.leaves or {})}
+        ctxs = {"r": ctx_r, "vs": ctx_vs}
+        tallies = {s: self._compute_tally(ctxs[s], duty[s], members[s])
+                   for s in ("r", "vs")}
+        # [codex R1] 設定頁刪除成員/改代號後會觸發本 refresh,但筆刷仍指著舊 id:
+        # 圖例已無該籤(使用者看不到筆刷還開著),點格卻仍會寫入 —— 而 set_cell 不驗證
+        # 成員是否存在 → 幽靈代號被塗進月曆甚至匯出。名單裡沒有就主動失效。
+        dropped = False
+        for s in ("r", "vs"):
+            if self._brush[s] and self._brush[s] not in members[s]:
+                self._brush[s] = None
+                dropped = True
+        # [codex R2] 筆刷失效【必須同步更新狀態列】:否則圖例已無選中籤、狀態列卻還寫
+        # 著「筆刷:R B」,使用者照著提示點格 → 變成輪換、寫進非預期的人。求解/匯出中
+        # 不覆蓋(那時狀態列是進度訊息)。
+        if dropped and not self._busy_flag:
+            self._status.set(self._idle_status())
+        self._build_legend(members, tallies)
 
         for w in self._grid_holder.winfo_children():
             w.destroy()
@@ -309,7 +341,8 @@ class CalendarDutyTab(ttk.Frame):
         for r, week in enumerate(weeks, start=1):
             for c, d in enumerate(week):
                 self._make_cell(r, c, d, duty, holidays, params, members,
-                                biopsy, week_colors=ctx_r.week_colors)
+                                biopsy, week_colors=ctx_r.week_colors,
+                                leaves=leaves)
         # [2026-07-24 易讀性] uniform＝七欄等寬、各週等高：最大化視窗時月曆平均撐滿,
         # 不再依內容擠出寬窄不一的欄列。
         for c in range(7):
@@ -317,14 +350,103 @@ class CalendarDutyTab(ttk.Frame):
         for r in range(1, len(weeks) + 1):
             self._grid_holder.rowconfigure(r, weight=1, uniform="calrow")
 
-        self._refresh_side(ctx_r, duty["r"], members["r"], self._sum["r"])
-        self._refresh_side(ctx_vs, duty["vs"], members["vs"], self._sum["vs"])
+        for s in ("r", "vs"):
+            self._refresh_side(ctxs[s], members[s], self._sum[s], tallies[s])
         self._reload_biopsy_counts(ctx_r)
         self._refresh_warnings()
         self._apply_finalized_state()
 
+    @staticmethod
+    def _compute_tally(ctx, duty, members) -> dict:
+        """由目前格子即時統計每人平日/假日/點數（圖例與結算面板共用同一份）。
+
+        [RS-02/RF-11] 已離目前名單的值班者也用 setdefault 納入,否則月曆排得出人、
+        結算卻整列消失、數字對不上。[RS-02] 平日的國定假日算「假日班」。"""
+        tally = {mid: {"wd": 0, "we": 0, "pt": 0} for mid in members}
+        for iso, cell in duty.items():
+            p = (cell or {}).get("person")
+            if not p:
+                continue
+            try:
+                d = date.fromisoformat(iso)
+            except (ValueError, TypeError):
+                continue
+            t = tally.setdefault(p, {"wd": 0, "we": 0, "pt": 0})
+            if is_weekend(d) or d in ctx.holidays:
+                t["we"] += 1
+            else:
+                t["wd"] += 1
+            t["pt"] += day_point(d, ctx.holidays, ctx.params)
+        return tally
+
+    def _build_legend(self, members, tallies) -> None:
+        """[2026-07-24 使用者] 月曆上方成員圖例：色塊＋代號姓名＋平日/假日次數。
+        點一位＝設為「筆刷」,之後點月曆格即直接指派該人（免左鍵輪換 N 次）；
+        再點一次同一位＝取消筆刷。定案月不顯示（唯讀,無從編輯）。"""
+        for w in self._legend_holder.winfo_children():
+            w.destroy()
+        self._legend_chips = {}
+        if self._finalized:
+            return
+        for scope in ("r", "vs"):
+            info_map = members[scope]
+            if not info_map:
+                continue
+            chip_bg, chip_fg, line = LINE_CHIP[scope]
+            row = ttk.Frame(self._legend_holder)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=line, bg=chip_bg, fg=chip_fg, padx=4,
+                     font=(OVR_FONT, 8, "bold")).pack(side="left")
+            for mid, info in info_map.items():
+                t = tallies[scope].get(mid) or {"wd": 0, "we": 0}
+                base = info["color"]
+                # 一線實心/三線淡底——與月曆格內同一套結構性區分,圖例才對得上格子
+                if scope == "r":
+                    pbg, pfg = base, fg_for(base)
+                else:
+                    pbg, pfg = tint_color(base), shade_color(base)
+                active = (self._brush[scope] == mid)
+                chip = tk.Label(
+                    row, text=f"{self._who_label(mid, info)} {t['wd']}/{t['we']}",
+                    bg=pbg, fg=pfg, padx=5, pady=1, cursor="hand2",
+                    highlightthickness=2,
+                    highlightbackground=(BRUSH_ACTIVE_BORDER if active
+                                         else BRUSH_IDLE_BORDER),
+                    font=(OVR_FONT, 9, "bold" if active else "normal"))
+                chip.pack(side="left", padx=2)
+                chip.bind("<Button-1>",
+                          lambda _e, s=scope, mm=mid: self._on_brush_pick(s, mm))
+                self._legend_chips[(scope, mid)] = chip
+            tk.Label(row, text="（點成員＝筆刷；數字＝平日/假日）",
+                     fg="#8A9099", font=(OVR_FONT, 8)).pack(side="left", padx=6)
+
+    def _on_brush_pick(self, scope: str, mid) -> None:
+        """圖例點選 → 設/取消筆刷。設定後點月曆格即指派該人（不再輪換）。"""
+        if self._finalized or self._busy_flag:
+            return
+        self._brush[scope] = None if self._brush[scope] == mid else mid
+        self.refresh()
+        self._status.set(self._idle_status())
+
+    def _idle_status(self) -> str:
+        """閒置狀態列：有筆刷時顯示筆刷提示（否則一般操作提示）。
+        求解/匯出結束後回到這裡,才不會把仍生效的筆刷狀態洗掉造成誤解。"""
+        parts = []
+        for scope in ("r", "vs"):
+            mid = self._brush.get(scope)
+            if not mid:
+                continue
+            _bg, _fg, line = LINE_CHIP[scope]
+            info = self._member_map(scope).get(mid)
+            parts.append(f"{line} {self._who_label(mid, info)}")
+        if parts:
+            return ("筆刷：" + "、".join(parts)
+                    + "｜點月曆格＝直接指派（點已是該人的格＝清空）；"
+                      "再點一次圖例取消筆刷")
+        return _IDLE_HINT
+
     def _make_cell(self, r, c, d, duty, holidays, params, members,
-                   biopsy=None, week_colors=None) -> None:
+                   biopsy=None, week_colors=None, leaves=None) -> None:
         """[2026-07-23 整合] 每格同時顯示一線(R)/三線(VS)兩列：線別色籤＋值班者
         成員色塊＋各自 🔒；R 週六另有切片紫籤列。各列可獨立左鍵輪換/右鍵選單；
         滑鼠懸停藍框回饋（duty=members={"r":…, "vs":…}）。
@@ -380,9 +502,13 @@ class CalendarDutyTab(ttk.Frame):
                     pbg, pfg = base, fg_for(base)
                 else:
                     pbg, pfg = tint_color(base), shade_color(base)
+                # [2026-07-24] 該人當天請假 → 加 ⚠：手動指派/筆刷誤點時當場看得見,
+                # 不必等右側警告面板或重排才發現。
+                on_leave = d in ((leaves or {}).get(scope, {}).get(pid) or ())
                 # [codex P2] width+wraplength 上限:月曆格網無捲軸,長姓名不設限會把
                 # 整欄撐寬、擠爆七欄+側欄。
                 tk.Label(row, text=self._who_label(pid, info)
+                         + (f" {LEAVE_MARK}" if on_leave else "")
                          + (" 🔒" if locked else ""), bg=pbg, fg=pfg,
                          padx=4, anchor="w", width=10, wraplength=92,
                          justify="left", font=(OVR_FONT, 10, "bold")
@@ -436,37 +562,21 @@ class CalendarDutyTab(ttk.Frame):
             self._warns.insert(tk.END, "（無）")
             self._warns.itemconfig(tk.END, foreground="#9AA3AC")
 
-    def _refresh_side(self, ctx, duty, members, tree) -> None:
-        # 結算：由目前格子即時統計
-        assigned: dict = {}
-        for iso, cell in duty.items():
-            p = cell.get("person")
-            if p:
-                try:
-                    assigned[date.fromisoformat(iso)] = p
-                except (ValueError, TypeError):
-                    continue
-        tally = {mid: {"wd": 0, "we": 0, "pt": 0} for mid in members}
-        for d, p in assigned.items():
-            # [RS-02/RF-11] 已離目前名單的值班者(換血/改 id 後檢視歷史月)也動態納入,
-            # 否則月曆排得出人、結算卻整列消失、數字對不上。比照 member_tally 的 setdefault。
-            t = tally.setdefault(p, {"wd": 0, "we": 0, "pt": 0})
-            # [RS-02] 平日的國定假日算「假日班」,與 member_tally / solve_rvs 一致。
-            if is_weekend(d) or d in ctx.holidays:
-                t["we"] += 1
-            else:
-                t["wd"] += 1
-            t["pt"] += day_point(d, ctx.holidays, ctx.params)
+    def _refresh_side(self, ctx, members, tree, tally) -> None:
+        """結算面板（統計由 _compute_tally 預先算好,與上方圖例同一份數字）。
+        [2026-07-24 易讀性] 帳本結轉依正負上色（負＝欠班紅、正＝綠）、已離名單灰。"""
         tree.delete(*tree.get_children())
         for mid, t in tally.items():
             if mid in members:
                 name = members[mid]["name"]
-                bal = f"{float(ctx.ledger.get(mid, 0.0)):+.1f}"
+                bal_val = float(ctx.ledger.get(mid, 0.0))
+                bal = f"{bal_val:+.1f}"
+                tag = ("neg" if bal_val < 0 else "pos" if bal_val > 0 else "")
             else:                      # 已離名單:代號欄仍顯示 id、帳本欄不適用
                 name = "（已離名單）"
-                bal = "—"
-            tree.insert("", "end", values=(
-                mid, name, t["wd"], t["we"], t["pt"], bal))
+                bal, tag = "—", "gone"
+            tree.insert("", "end", tags=((tag,) if tag else ()),
+                        values=(mid, name, t["wd"], t["we"], t["pt"], bal))
 
     # ── 互動：手動改格 ───────────────────────────────────────────────────
     def _on_month_change(self, ym) -> None:
@@ -488,7 +598,23 @@ class CalendarDutyTab(ttk.Frame):
         duty = (self.service.storage.load_month(self.app.ym)
                 .get(f"{scope}_duty") or {})
         cur = (duty.get(d.isoformat()) or {}).get("person")
-        nxt = next_in_cycle(cur, self._member_ids(scope))
+        brush = self._brush.get(scope)
+        # [codex R1] 第二道:設定頁的變更若在上次 refresh 之後才到(改名/刪除),
+        # 這裡再驗一次才寫入,絕不把不在名單的代號塗進月曆。
+        # [codex R2] 且【中止本次點擊】——使用者的手勢意思是「塗上那個人」,那個人已
+        # 不存在時把它改判成輪換,等於替他寫進一個沒打算選的人。清掉筆刷、更新提示,
+        # 讓下一次點擊是使用者在知情下做的決定。
+        if brush and brush not in self._member_map(scope):
+            self._brush[scope] = None
+            self.refresh()
+            self._status.set(self._idle_status())
+            return
+        if brush:
+            # [2026-07-24 筆刷] 已選成員 → 直接指派；點「已是該人」的格＝清空
+            # （同一手勢可塗可擦,不必為了清空改用右鍵）。
+            nxt = None if cur == brush else brush
+        else:
+            nxt = next_in_cycle(cur, self._member_ids(scope))
         self.service.set_cell(scope, self.app.ym, d, nxt)
         self.refresh()
 
@@ -498,9 +624,26 @@ class CalendarDutyTab(ttk.Frame):
         _bg, _fg, line = LINE_CHIP[scope]
         menu = tk.Menu(self, tearoff=0)
         pick = tk.Menu(menu, tearoff=0)
-        for mid, info in self._member_map(scope).items():
+        # [2026-07-24 易讀性] 選單直接帶「目前值班者 ✓ / 本月平日+假日次數 / 當天請假」,
+        # 免翻右側面板就能判斷該指派誰（挑人本來就是看誰班少、誰沒請假）。
+        month = self.service.storage.load_month(self.app.ym)
+        duty_map = month.get(f"{scope}_duty") or {}
+        cur = (duty_map.get(d.isoformat()) or {}).get("person")
+        try:
+            ctx = self.service.build_context(scope, self.app.ym)
+            members = self._member_map(scope)
+            tally = self._compute_tally(ctx, duty_map, members)
+            leaves = ctx.leaves or {}
+        except Exception:               # 讀取失敗 → 退回純名單選單（不擋編輯）
+            logging.debug("[roster.ui] 右鍵選單統計讀取失敗", exc_info=True)
+            members, tally, leaves = self._member_map(scope), {}, {}
+        for mid, info in members.items():
+            t = tally.get(mid) or {"wd": 0, "we": 0}
+            on_leave = d in (leaves.get(mid) or ())
             pick.add_command(
-                label=f"{mid} {info['name']}",
+                label=("✓ " if mid == cur else "　")
+                      + f"{mid} {info['name']}　平{t['wd']}/假{t['we']}"
+                      + (f"　{LEAVE_MARK}當天請假" if on_leave else ""),
                 command=lambda mm=mid: self._set_cell_and_refresh(d, mm, scope))
         menu.add_cascade(label=f"指定{line}人選", menu=pick)
         menu.add_command(label=f"切換{line}鎖定 🔒",
@@ -541,7 +684,7 @@ class CalendarDutyTab(ttk.Frame):
         # RF-16：無條件恢復再套定案狀態——否則求解結束時若停在已定案月，「報告」鈕與
         # 「定案」勾選會被永久停用（切回未定案月也救不回）。
         self._busy_flag = False
-        self._status.set(_IDLE_HINT)
+        self._status.set(self._idle_status())
         self._selector.set_enabled(True)
         for w in self._toolbar:
             w.config(state="normal")
@@ -711,7 +854,7 @@ class CalendarDutyTab(ttk.Frame):
         threading.Thread(target=work, name="roster-export", daemon=True).start()
 
     def _after_export(self, path, err) -> None:
-        self._status.set(_IDLE_HINT)
+        self._status.set(self._idle_status())
         if err:
             messagebox.showerror("匯出失敗", f"匯出時發生錯誤：\n{err}")
         else:

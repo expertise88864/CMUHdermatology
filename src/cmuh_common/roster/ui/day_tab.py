@@ -867,7 +867,12 @@ class _ClinicClosureDialog(tk.Toplevel):
 
 
 class _DayEditDialog(tk.Toplevel):
-    """手動改某日某時段的各格（照光/治療室/切片室/房號/放假），逗號分隔代號。"""
+    """手動改某日某時段的各格（照光/治療室/切片室/房號/放假），逗號分隔代號。
+
+    [2026-07-24 使用者] 每格加「＋選人」「✕清空」：＋ 列出本日可排人員（PGY 當月
+    名單＋涵蓋當日的 Clerk 梯次），並標示【已排在本時段其他格】與【當天請假】——
+    不必背代號、也不必先去別的頁查誰請假。輸入框保留（自由輸入/殘留房號仍可編輯）。
+    """
 
     def __init__(self, master, service, ym, d, session, on_done):
         super().__init__(master)
@@ -888,6 +893,7 @@ class _DayEditDialog(tk.Toplevel):
         # 併入「已存但已從模板移除/被關閉」的房號 → 殘留指派才可編輯/清除
         stale = [k for k in slots if k not in _SPECIAL_SLOTS and k not in rooms]
         self._slots = [PHOTO, TREATMENT, BIOPSY, *sorted({*rooms, *stale}), REST]
+        self._cands, self._leaves = self._load_candidates()
         self._entries: dict = {}
         for i, slot in enumerate(self._slots):
             ttk.Label(self, text=slot).grid(row=i, column=0, sticky="e",
@@ -896,11 +902,98 @@ class _DayEditDialog(tk.Toplevel):
             ent.insert(0, "、".join(slots.get(slot, [])))
             ent.grid(row=i, column=1, padx=8, pady=3)
             self._entries[slot] = ent
+            box = ttk.Frame(self)
+            box.grid(row=i, column=2, sticky="w", padx=(0, 8))
+            btn = ttk.Button(box, text="＋ 選人", width=7)
+            btn.config(command=lambda s=slot, b=btn: self._pick_menu(s, b))
+            btn.pack(side="left")
+            ttk.Button(box, text="✕", width=3,
+                       command=lambda s=slot: self._clear_slot(s)
+                       ).pack(side="left", padx=(2, 0))
+        ttk.Label(self, foreground="gray", justify="left",
+                  text="＋ 選人＝點名單加入/移除（標示已排他格、當天請假）；"
+                       "✕＝清空該格；輸入框仍可自由輸入代號"
+                  ).grid(row=len(self._slots), column=0, columnspan=3,
+                         sticky="w", padx=8, pady=(4, 0))
         bar = ttk.Frame(self)
-        bar.grid(row=len(self._slots), column=0, columnspan=2, pady=8)
+        bar.grid(row=len(self._slots) + 1, column=0, columnspan=3, pady=8)
         ttk.Button(bar, text="儲存", command=self._save).pack(side="left", padx=6)
         ttk.Button(bar, text="取消", command=self.destroy).pack(side="left", padx=6)
         self.grab_set()
+
+    def _load_candidates(self) -> tuple:
+        """本日可排人員（PGY 當月名單 + 涵蓋當日的 Clerk 梯次成員）與請假表。
+        取自 build_day_input（與自動排班同一份輸入）；讀取失敗 → 空名單,
+        「＋選人」顯示提示但不影響原有的自由輸入編輯。"""
+        try:
+            inp = self.service.build_day_input(self.ym)
+        except Exception:
+            logging.debug("[roster.ui] 編輯視窗候選名單讀取失敗", exc_info=True)
+            return [], {}
+        codes = list(inp.pgy_roster or [])
+        for b in (inp.clerk_batches or []):
+            try:
+                if b.covers(self.d):
+                    codes.extend(b.members or [])
+            except Exception:            # 壞梯次資料只跳過該梯,不炸整個編輯視窗
+                logging.debug("[roster.ui] 梯次 covers 判定失敗（略過該梯）",
+                              exc_info=True)
+        leaves: dict = {}
+        for scope in ("pgy", "clerk"):
+            for c, days in ((inp.leaves or {}).get(scope) or {}).items():
+                leaves.setdefault(c, set()).update(days or ())
+        seen, out = set(), []
+        for c in codes:                  # 去重且保留順序（PGY 在前、Clerk 在後）
+            if c and c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out, leaves
+
+    def _current(self) -> dict:
+        """目前【畫面上】各格的代號（含尚未儲存的輸入）→ {slot: [codes]}。"""
+        return {s: _split_codes(e.get()) for s, e in self._entries.items()}
+
+    def _pick_menu(self, slot: str, btn) -> None:
+        """「＋選人」選單：點一位即加入該格；已在該格者顯示 ✓ 並可點掉。
+        標示【已排本時段其他格】與【當天請假】,但不阻擋（尊重手動決定）。"""
+        cur = self._current()
+        here = cur.get(slot) or []
+        m = tk.Menu(self, tearoff=0)
+        if not self._cands:
+            m.add_command(label="（本月無 PGY / 當日無 Clerk 梯次名單）",
+                          state="disabled")
+        for c in self._cands:
+            other = [s for s, v in cur.items() if s != slot and c in v]
+            mark = ""
+            if self.d in (self._leaves.get(c) or ()):
+                mark += "　⚠當天請假"
+            if other:
+                mark += f"　(已排 {other[0]})"
+            picked = c in here
+            m.add_command(label=("✓ " if picked else "　") + c + mark
+                          + ("　→移除" if picked else ""),
+                          command=lambda cc=c, s=slot: self._toggle_code(s, cc))
+        try:
+            m.tk_popup(btn.winfo_rootx(),
+                       btn.winfo_rooty() + btn.winfo_height())
+        finally:
+            m.grab_release()
+
+    def _toggle_code(self, slot: str, code: str) -> None:
+        codes = _split_codes(self._entries[slot].get())
+        if code in codes:
+            codes = [c for c in codes if c != code]
+        else:
+            codes.append(code)
+        self._set_slot_text(slot, codes)
+
+    def _clear_slot(self, slot: str) -> None:
+        self._set_slot_text(slot, [])
+
+    def _set_slot_text(self, slot: str, codes: list) -> None:
+        ent = self._entries[slot]
+        ent.delete(0, "end")
+        ent.insert(0, "、".join(codes))
 
     def _save(self) -> None:
         # [RS-06] 一次覆寫整個時段（單次 load/save/git commit），取代逐格 set_day_slot。

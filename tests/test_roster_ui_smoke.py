@@ -556,3 +556,162 @@ def test_member_map_uses_disjoint_palettes(root, tmp_path):
     r_colors = {v["color"] for v in tab._member_map("r").values()}
     vs_colors = {v["color"] for v in tab._member_map("vs").values()}
     assert r_colors.isdisjoint(vs_colors)
+
+
+# ── 2026-07-24 互動強化：筆刷指派 / 圖例 / 請假標記 / 點選式編輯 ──────────────
+def test_brush_assigns_directly_and_toggles_off(root, tmp_path):
+    """[筆刷] 圖例選一位 → 點格直接指派該人（不再左鍵輪換）；點「已是該人」的格
+    ＝清空；再點一次圖例＝取消筆刷後回到輪換行為。"""
+    svc = _svc(tmp_path)
+    tab = CalendarDutyTab(root, svc, _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    d1, d2 = date(2026, 8, 3), date(2026, 8, 4)
+
+    tab._on_brush_pick("r", "B")                  # 選 B 當筆刷（名單第 2 位）
+    assert tab._brush["r"] == "B"
+    tab._on_cell_left(d1, "r")                    # 空格 → 直接是 B（非輪換的 A）
+    assert svc.storage.load_month(YM)["r_duty"]["2026-08-03"]["person"] == "B"
+    tab._on_cell_left(d1, "r")                    # 同一格再點 → 清空（可塗可擦）
+    assert (svc.storage.load_month(YM)["r_duty"].get("2026-08-03") or {}
+            ).get("person") in (None, "")
+
+    tab._on_brush_pick("r", "B")                  # 取消筆刷
+    assert tab._brush["r"] is None
+    tab._on_cell_left(d2, "r")                    # 回到輪換 → 名單首位 A
+    assert svc.storage.load_month(YM)["r_duty"]["2026-08-04"]["person"] == "A"
+
+
+def test_brush_is_per_scope(root, tmp_path):
+    """一線/三線各自獨立筆刷：設 R 的筆刷不得影響 VS 格的輪換行為。"""
+    svc = _svc(tmp_path)
+    tab = CalendarDutyTab(root, svc, _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    tab._on_brush_pick("r", "B")
+    assert tab._brush["vs"] is None
+    tab._on_cell_left(date(2026, 8, 5), "vs")     # VS 無筆刷 → 輪換到首位 D
+    assert svc.storage.load_month(YM)["vs_duty"]["2026-08-05"]["person"] == "D"
+
+
+def test_brush_invalidated_when_member_removed(root, tmp_path):
+    """[codex R1] 設定頁刪除成員/改代號後,筆刷不得繼續把【已不存在的代號】塗進月曆
+    （set_cell 不驗證成員存在 → 幽靈代號會進月檔甚至匯出）。"""
+    svc = _svc(tmp_path)
+    tab = CalendarDutyTab(root, svc, _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    tab._on_brush_pick("r", "B")
+    assert tab._brush["r"] == "B"
+
+    cfg = svc.storage.load_config()               # 模擬設定頁把 B 刪掉
+    cfg["r_members"] = [m for m in cfg["r_members"] if m["id"] != "B"]
+    svc.storage.save_config(cfg)
+    tab.refresh()                                 # 設定變更 → 分頁重畫
+    assert tab._brush["r"] is None, "名單已無此人 → 筆刷須失效"
+    # [codex R2] 狀態列必須同步,否則還寫著「筆刷：一線 B」會誘導使用者點格而誤寫別人
+    # （比對閒置提示全文：_IDLE_HINT 本身含「筆刷」二字的用法說明,不能只查關鍵字）
+    assert tab._status._var.get() == duty_mod._IDLE_HINT, \
+        "筆刷失效後狀態列應回到一般操作提示,不得停留在筆刷提示"
+
+    tab._brush["r"] = "GHOST"                     # 第二道:refresh 後才變更的情況
+    tab._on_cell_left(date(2026, 8, 3), "r")
+    duty = svc.storage.load_month(YM).get("r_duty") or {}
+    assert (duty.get("2026-08-03") or {}).get("person") in (None, ""), \
+        "筆刷失效時應【中止該次點擊】,不得寫入幽靈代號、也不得改判成輪換寫進別人"
+    assert tab._brush["r"] is None
+
+
+def test_legend_chips_built_and_hidden_when_finalized(root, tmp_path):
+    """圖例每位成員一個可點色籤；定案月唯讀 → 不顯示圖例（無從編輯就不誤導）。"""
+    svc = _svc(tmp_path)
+    tab = CalendarDutyTab(root, svc, _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    assert ("r", "A") in tab._legend_chips and ("r", "B") in tab._legend_chips
+    assert ("vs", "D") in tab._legend_chips
+
+    tab._final_var.set(True)
+    tab._on_finalize()
+    root.update()
+    assert tab._legend_chips == {}, "定案月不應顯示可點的圖例筆刷"
+
+
+def test_compute_tally_counts_holiday_as_weekend(root, tmp_path):
+    """[RS-02] 平日的國定假日算「假日班」；未在名單的舊值班者也要納入統計。"""
+    svc = _svc(tmp_path)
+    tab = CalendarDutyTab(root, svc, _app())
+    ctx = svc.build_context("r", YM)
+    duty = {"2026-08-03": {"person": "A"},        # 週一平日
+            "2026-08-15": {"person": "A"},        # 國定假日（_svc 有設；當日為週六）
+            "2026-08-10": {"person": "ZZ"},       # 已離名單者（週一）
+            "2026-08-08": {"person": "ZZ"},       # 週六 → 假日班
+            "bad-date": {"person": "A"}}          # 壞鍵不得炸
+    tally = tab._compute_tally(ctx, duty, tab._member_map("r"))
+    assert tally["A"]["wd"] == 1 and tally["A"]["we"] == 1
+    assert tally["ZZ"]["wd"] == 1 and tally["ZZ"]["we"] == 1, \
+        "已離名單的值班者仍須計入（數字才對得上）"
+
+
+def test_leave_mark_shown_in_cell(root, tmp_path):
+    """值班者當天請假 → 月曆格顯示 ⚠（手動指派誤點當場看得見）。"""
+    svc = _svc(tmp_path)
+    svc.set_leaves("r", YM, "A", {date(2026, 8, 3)})
+    svc.set_cell("r", YM, date(2026, 8, 3), "A")
+    tab = CalendarDutyTab(root, svc, _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+    texts = [w.cget("text") for w in _walk_widgets(tab)
+             if isinstance(w, tk.Label) and "A" in str(w.cget("text"))]
+    assert any(duty_mod.LEAVE_MARK in t for t in texts), \
+        "當天請假的值班者應在格內標 ⚠"
+
+
+def _walk_widgets(w):
+    out = [w]
+    for ch in w.winfo_children():
+        out.extend(_walk_widgets(ch))
+    return out
+
+
+def test_day_edit_dialog_pick_toggle_and_clear(root, tmp_path):
+    """[點選式編輯] ＋選人 → _toggle_code 加入/移除、✕ 清空；候選名單取自
+    build_day_input（PGY 當月名單），不必手打代號。"""
+    svc = _svc(tmp_path)
+    dlg = day_mod._DayEditDialog(root, svc, YM, date(2026, 8, 3), "上午",
+                                 lambda: None)
+    root.update()
+    assert "A" in dlg._cands and "B" in dlg._cands, "PGY 名單應成為候選人"
+
+    dlg._toggle_code("治療室", "A")
+    assert dlg._entries["治療室"].get() == "A"
+    dlg._toggle_code("治療室", "B")
+    assert _split_codes_ui(dlg._entries["治療室"].get()) == ["A", "B"]
+    dlg._toggle_code("治療室", "A")                  # 再點同一位 → 移除
+    assert _split_codes_ui(dlg._entries["治療室"].get()) == ["B"]
+    dlg._clear_slot("治療室")
+    assert dlg._entries["治療室"].get() == ""
+    dlg._toggle_code("治療室", "A")
+    dlg._save()
+    got = svc.storage.load_month(YM)["day_slots"]["2026-08-03"]["上午"]["治療室"]
+    assert got == ["A"], "點選式編輯的結果要能正常存檔"
+
+
+def _split_codes_ui(text):
+    return day_mod._split_codes(text)
+
+
+def test_day_edit_dialog_marks_leave_and_other_slot(root, tmp_path):
+    """＋選人選單的資訊：當天請假、已排本時段其他格 —— 供判斷,不阻擋指派。"""
+    svc = _svc(tmp_path)
+    svc.set_leaves("pgy", YM, "A", {date(2026, 8, 3)})
+    dlg = day_mod._DayEditDialog(root, svc, YM, date(2026, 8, 3), "上午",
+                                 lambda: None)
+    root.update()
+    assert date(2026, 8, 3) in dlg._leaves.get("A", set()), "請假表應載入"
+    dlg._toggle_code("照光", "B")
+    cur = dlg._current()
+    assert cur["照光"] == ["B"], "_current 應反映尚未儲存的畫面輸入"
+    # 仍可把已排他格的人加到別格（只標示、不阻擋）
+    dlg._toggle_code("治療室", "B")
+    assert dlg._entries["治療室"].get() == "B"
