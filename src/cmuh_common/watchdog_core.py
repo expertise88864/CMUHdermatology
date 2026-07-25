@@ -594,8 +594,41 @@ def kill_pid(pid: int) -> bool:
         return False
 
 
+def current_session_id():
+    """本行程所在的 Windows terminal session id;取不到回 None(不猜)。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        sid = ctypes.c_ulong()
+        ok = ctypes.windll.kernel32.ProcessIdToSessionId(
+            ctypes.c_ulong(os.getpid()), ctypes.byref(sid))
+        return int(sid.value) if ok else None
+    except Exception:
+        logging.debug("[watchdog] ProcessIdToSessionId 失敗", exc_info=True)
+        return None
+
+
 def start_program(pyw_path: Path, pythonw: str) -> int:
-    """以 admin 子行程啟動 .pyw（繼承父 process 的 admin token，無 UAC）。"""
+    """以 admin 子行程啟動 .pyw（繼承父 process 的 admin token，無 UAC）。
+
+    [2026-07-26 審查 ★重複打卡★] session 0 一律拒絕啟動。背景:安裝腳本用
+    `schtasks /SC MINUTE` 建立 watchdog 的週期性 task 時【沒有 /IT】,那種 task 跑在
+    session 0(非互動);子行程會跟著落在 session 0 —— 使用者看不到、Chrome 自動化也
+    沒有互動桌面,而且各程式的單例 mutex 都是 `Local\\`(per-session),擋不住跨 session
+    的第二份 → 打卡程式同時跑兩份、重複打卡(repo 內的「清理重複打卡程式.ps1」
+    「診斷打卡重複執行.ps1」就是這個現象留下的現場工具)。
+    偵測(WMIC/psutil)與 kill 在 session 0 仍然有效,故只擋【啟動】這一個動作。
+    安裝腳本已補 /IT;此處是給既有安裝的兜底,使用者不必重跑安裝也不會再被重複打卡。
+    """
+    session_id = current_session_id()
+    if session_id == 0:
+        logging.error(
+            "[watchdog] 目前跑在 session 0(非互動),拒絕啟動 %s —— 從這裡啟動的程式"
+            "使用者看不到,而且單例 mutex 是 Local\\(per-session)擋不住跨 session 的"
+            "第二份,會造成重複執行/重複打卡。請重跑「安裝開機自動啟動」讓排程加上 /IT。",
+            pyw_path.name)
+        return 0
     try:
         p = launch_python_script(
             str(pyw_path),
@@ -723,6 +756,18 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
         return f"○ {name}: disabled"
     if mode == "inner" and prog.get("outer_only", False):
         return f"○ {name}: outer_only (跳過)"
+
+    # [2026-07-26 審查 ★重複打卡 / 外審 R1★] session 0 的 watchdog【什麼補救動作都不做】。
+    # 閘門必須在這裡(kill 與 restart 記帳之前),不能只擋 start_program:
+    # kill+restart 是一筆交易,先砍了才發現不能起 → 互動 session 的打卡程式被砍掉又沒被
+    # 補回來,比放著不管更糟(可能整段錯過打卡);而且每次被拒的啟動都會被記成一次重啟嘗試,
+    # 週期性 task 每 2 分鐘跑一次 → 很快誤觸 crash-loop 判定、把自動更新停掉一小時。
+    # 檔案 851-853 附近的既有不變式也寫著「不能重啟就不可以砍」。
+    # 只擋補救動作;偵測/log 照跑,互動 session 的 watchdog 仍會正常把它救起來。
+    if current_session_id() == 0:
+        return (f"○ {name}: 跳過 (watchdog 跑在 session 0,非互動 —— 從這裡啟動的程式"
+                f"使用者看不到,且單例 mutex 是 Local\\ 擋不住跨 session 的第二份,"
+                f"會造成重複執行/重複打卡。請重跑「安裝開機自動啟動」讓排程加上 /IT)")
 
     # [v4] per-machine opt-in：required_config_file 不存在 → 本機不該跑這支
     # 程式 (e.g. 沒設定過打卡的電腦，autoclock_config.json 不會存在；其他電腦

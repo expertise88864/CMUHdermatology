@@ -212,12 +212,19 @@ foreach ($p in $programs) {
                 # schtasks /SC MINUTE /MO 2 = 每 2 分鐘
                 # /RL HIGHEST = admin (繼承當前 admin token，不跳 UAC)
                 # /RU = 跑在哪個帳號 (預設當前帳號；指定避免歧義)
+                # /IT = 【必要】只在該使用者登入時跑，且跑在他的互動 session。
+                #   沒有 /IT 的 task 會跑在 session 0（非互動）：watchdog 從那裡啟動的
+                #   程式使用者看不到、Chrome 自動化沒有互動桌面，而且各程式的單例 mutex
+                #   都是 Local\（per-session）擋不住跨 session 的第二份 → 打卡程式同時
+                #   跑兩份、重複打卡。（watchdog_core.start_program 另有 session 0 的
+                #   執行期兜底，給已經裝過舊排程的機器用。）
                 # /F = 強制覆寫同名 task
                 $schtasksOut = & schtasks.exe /Create /F `
                     /TN $p.TaskName `
                     /TR $tr `
                     /SC MINUTE /MO 2 `
                     /RL HIGHEST `
+                    /IT `
                     /RU $user 2>&1
                 if ($LASTEXITCODE -ne 0) {
                     throw "schtasks /Create 失敗 (exit=$LASTEXITCODE): $schtasksOut"
