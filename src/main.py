@@ -2286,9 +2286,32 @@ def _wait_for_code_input_focus(target_hwnd: int, *,
             cls = _get_class_name_of(focus).lower()
             if previous_focus:
                 # 有前焦點:input-like 且焦點確實已從舊焦點移開(維持原本行為)。
-                is_input_like = any(
-                    s in cls for s in ("edit", "memo", "rich", "grid"))
+                # [2026-07-26 審查 ★病歷污染★] memo / rich 一律拒絕。
+                # 本函式存在的理由就是「選單命令沒生效時,焦點可能仍停在醫師的病歷
+                # TMemo/TRichEdit」;焦點從甲 memo 移到乙 memo 一樣通過
+                # `focus != previous_focus` → 接著就是 WM_CHAR 打入 51019 等代碼 + Enter,
+                # 直接寫進病歷內文。事後 log 只留證據,擋不住污染。
+                # 這是【窄的否定規則】,不需要假設合法輸入器一定含 inplace/grid ——
+                # 其餘 edit/grid 的相容行為完全不動,所以不會因為猜錯而誤擋 F1-F5;
+                # 而嚴格分支(前焦點未知)本來就拒絕 memo/rich,兩邊假設終於一致。
+                # ★不可用白名單擋★ "TRichEdit"/"TDBRichEdit" 的 class 名裡就含 "edit",
+                # 只把 memo/rich 從白名單拿掉【擋不住】它們(測試抓到過)。必須明確排除。
+                is_memo_like = any(s in cls for s in ("memo", "rich"))
+                is_input_like = (not is_memo_like
+                                 and any(s in cls for s in ("edit", "grid")))
+                if is_memo_like and focus != previous_focus:
+                    logging.warning(
+                        "[代碼輸入] 焦點跑到 class=%r(病歷內文類控件)→ 不輸入代碼,"
+                        "交人工。多半是代碼輸入選單命令沒生效(HIS 改版 menu id 漂移?)", cls)
                 if is_input_like and focus != previous_focus:
+                    if not any(s in cls for s in _GRID_CODE_EDITOR):
+                        # 收下了,但不是正面辨識出的格線內嵌編輯器 → 留證據。
+                        # 要把這分支也收成「正面辨識」需要實機日誌佐證合法 class 長怎樣,
+                        # 沒有證據就收緊等於拿假設去擋 F1-F5,誤擋的代價是診間停擺。
+                        logging.warning(
+                            "[代碼輸入] 焦點控件 class=%r 不是格線內嵌代碼編輯器,"
+                            "僅因「input-like 且焦點已移動」而接受。若代碼曾被打錯欄位,"
+                            "請把這行提供給開發者(用於收緊此判斷)。", cls)
                     return focus
             else:
                 # 前焦點未知:嚴格 —— 只收正面辨識為格線內嵌代碼輸入器者,其餘(一般 edit/memo/

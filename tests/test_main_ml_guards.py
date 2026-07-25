@@ -9,6 +9,8 @@ import inspect
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import main  # noqa: E402
@@ -80,10 +82,21 @@ def test_m2_unknown_focus_accepts_stringgrid(monkeypatch):
     assert main._wait_for_code_input_focus(100, previous_focus=0, timeout=0.2) == 500
 
 
-def test_m2_known_focus_preserves_lenient_behavior(monkeypatch):
-    # previous_focus 已知且焦點已改變 → 維持原本(input-like 即可,含 memo)
-    _patch_focus(monkeypatch, 500, "TMemo")
+def test_m2_known_focus_stays_lenient_for_edit_controls(monkeypatch):
+    # previous_focus 已知且焦點已改變 → 維持原本寬鬆(一般 edit 也收,不要求 inplace/grid)
+    _patch_focus(monkeypatch, 500, "TEdit")
     assert main._wait_for_code_input_focus(100, previous_focus=999, timeout=0.2) == 500
+
+
+@pytest.mark.parametrize("cls", ["TMemo", "TRichEdit", "TDBRichEdit"])
+def test_m2_known_focus_rejects_chart_text_controls(monkeypatch, cls):
+    """[2026-07-26 審查修訂] 原本這裡釘的是「含 memo 也照收」。改掉的理由:
+    焦點從甲 memo 移到乙 memo 一樣通過 `focus != previous_focus` → 接著就是
+    WM_CHAR 打入 51019 + Enter 寫進病歷內文(污染病歷)。拒絕 memo/rich 是【窄的
+    否定規則】,其餘 edit/grid 相容行為不動,不會誤擋 F1-F5;而嚴格分支本來就拒絕
+    memo/rich,兩個分支的假設終於一致。"""
+    _patch_focus(monkeypatch, 500, cls)
+    assert main._wait_for_code_input_focus(100, previous_focus=999, timeout=0.2) == 0
 
 
 # ══ M3/M4/M5 + L1/L5 原始碼守門 ════════════════════════════════════════════════
