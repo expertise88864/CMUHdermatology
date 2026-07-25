@@ -126,19 +126,24 @@ def test_restart_program_releases_mutex_before_respawn(monkeypatch):
     monkeypatch.setattr(autoclock, "tray_icon_object", None)
     monkeypatch.setattr(autoclock, "release_single_instance",
                         lambda: calls.append("release"))
+    # [2026-07-25 審查/codex] 新契約：破壞性拆解交給 on_confirmed，只有 restart_self
+    # 確認新行程存活、即將退出時才會呼叫。這個樁【模擬接手成功】→ 拆解應發生。
     monkeypatch.setattr(
         autoclock,
         "restart_self",
-        lambda extra, hard_exit_code=None:
+        lambda extra, hard_exit_code=None, on_confirmed=None: (
             calls.append(("restart", extra, hard_exit_code)),
+            on_confirmed() if on_confirmed else None),
     )
     monkeypatch.setattr(sys, "argv", ["autoclock.py", "--configure"])
     autoclock.running.set()
 
     autoclock.restart_program()
 
-    assert calls == ["release", ("restart", [], None)]
-    assert not autoclock.running.is_set()
+    # 順序仍是「先 spawn、確認存活後才放 mutex」——mutex 在 on_confirmed 裡釋放，
+    # 子行程搶不到會自行重試（~1.5s > 存活檢查 0.6s）。
+    assert calls == [("restart", [], None), "release"]
+    assert not autoclock.running.is_set(), "接手成功後才拆解"
 
 
 def test_restart_program_passes_hard_exit_code_for_background_restart(monkeypatch):
@@ -150,16 +155,42 @@ def test_restart_program_passes_hard_exit_code_for_background_restart(monkeypatc
     monkeypatch.setattr(
         autoclock,
         "restart_self",
-        lambda extra, hard_exit_code=None:
+        lambda extra, hard_exit_code=None, on_confirmed=None: (
             calls.append(("restart", extra, hard_exit_code)),
+            on_confirmed() if on_confirmed else None),
     )
     monkeypatch.setattr(sys, "argv", ["autoclock.py"])
     autoclock.running.set()
 
     autoclock.restart_program(hard_exit_code=1)
 
-    assert calls == ["release", ("restart", [], 1)]
+    assert calls == [("restart", [], 1), "release"]
     assert not autoclock.running.is_set()
+
+
+def test_restart_failure_leaves_process_fully_intact(monkeypatch):
+    """[codex R2] ★spawn 失敗時本行程必須【完全沒被動過】★：排程/看門狗/tray/mutex
+    全部原封不動 → 自動打卡不中斷（舊版會被拆光而整個消失，補通知並不能解決可用性）。"""
+    calls = []
+    monkeypatch.setattr(autoclock, "tray_icon_object", None)
+    monkeypatch.setattr(autoclock, "release_single_instance",
+                        lambda: calls.append("release"))
+    monkeypatch.setattr(autoclock, "_release_persistent_clock_driver",
+                        lambda: calls.append("driver"))
+    monkeypatch.setattr(autoclock, "_notify_restart_failed",
+                        lambda: calls.append("notify"))
+    # 樁不呼叫 on_confirmed＝模擬「新行程早夭、保留舊行程」
+    monkeypatch.setattr(
+        autoclock, "restart_self",
+        lambda extra, hard_exit_code=None, on_confirmed=None:
+            calls.append("restart"))
+    monkeypatch.setattr(sys, "argv", ["autoclock.py"])
+    autoclock.running.set()
+
+    autoclock.restart_program()
+
+    assert calls == ["restart", "notify"], f"不得有任何拆解動作：{calls}"
+    assert autoclock.running.is_set(), "排程必須繼續跑"
 
 
 def test_run_immediate_test_skips_duplicate_until_worker_finishes(monkeypatch):

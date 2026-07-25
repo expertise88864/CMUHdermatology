@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import calendar
+import logging
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Optional
@@ -65,11 +66,32 @@ class ClerkBatch:
         return self.start_monday <= d < self.start_monday + timedelta(days=14)
 
     @staticmethod
-    def from_dict(dd: dict) -> "ClerkBatch":
-        return ClerkBatch(
-            id=str(dd.get("id", "")),
-            start_monday=date.fromisoformat(dd["start_monday"]),
-            members=[str(x) for x in (dd.get("members") or [])])
+    def from_dict(dd: dict) -> "ClerkBatch | None":
+        """壞資料回 None（呼叫端略過該梯），不拋例外。
+
+        [2026-07-25 審查] 舊版對缺 start_monday / 壞日期字串直接拋 KeyError/ValueError。
+        而多機人工解 JSON 衝突留下壞梯次是【設計內預期】的情況（設定頁 RF-18 就特地
+        「略過顯示、不動檔案，讓使用者能開程式自救」）——但同一份資料一進 build_day_input
+        就炸，PGY/Clerk 分頁的 refresh() 沒有 try、整個分頁畫不出來，使用者反而更難自救。"""
+        # [codex] 合法 JSON 但結構壞掉的情況同樣要擋（多機人工合併後很常見）：
+        #   - 整筆是 null / 字串 → dd.get 會拋 AttributeError（不在原本的 except 內）
+        #   - "members": "C12"（字串而非陣列）→ 逐字元展開成 ['C','1','2']，
+        #     會安靜地產生一份錯誤的 Clerk 名單（比拋例外更糟）
+        if not isinstance(dd, dict):
+            logging.warning("[roster.model] 梯次項目不是物件，已略過：%r", dd)
+            return None
+        raw_members = dd.get("members") or []
+        if not isinstance(raw_members, (list, tuple)):
+            logging.warning("[roster.model] 梯次 members 不是陣列，已略過：%r", dd)
+            return None
+        try:
+            return ClerkBatch(
+                id=str(dd.get("id", "")),
+                start_monday=date.fromisoformat(str(dd["start_monday"])),
+                members=[str(x) for x in raw_members])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            logging.warning("[roster.model] 梯次資料無法解析，已略過：%r", dd)
+            return None
 
     def to_dict(self) -> dict:
         return {"id": self.id, "start_monday": self.start_monday.isoformat(),

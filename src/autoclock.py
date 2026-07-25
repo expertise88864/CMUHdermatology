@@ -690,10 +690,12 @@ def handle_health_declaration(driver, wait, short_wait, get_loc) -> None:
     except (TimeoutException, WebDriverException):
         # [opt B4] 找不到健康宣告按鈕 = 今天不需宣告(正常情況)，靜默跳過。
         return
+    # [codex] 提到外層：finally 需要它來判斷「哪些視窗是這次新開的」——只能關這些,
+    # 不可關掉所有非 orig 的視窗(HIS 可能另有合法對話框)。
+    wins_before = list(driver.window_handles)
     try:
         btn = next((b for b in btns if b.is_displayed() and b.is_enabled()), None)
         if btn:
-            wins_before = driver.window_handles
             try:
                 driver.execute_script("arguments[0].click();", btn)
             except WebDriverException:
@@ -722,6 +724,26 @@ def handle_health_declaration(driver, wait, short_wait, get_loc) -> None:
         logging.warning(
             "[autoclock] 健康宣告流程失敗(已偵測到按鈕但未完成)，請留意是否需手動宣告",
             exc_info=True)
+    finally:
+        # [2026-07-25 審查] ★收掉這次新開的窗並回到原視窗★：上面的 except 維持「照常
+        # 往下走」的設計,但若失敗發生在切到宣告彈窗之後(送出鈕逾時/close 失敗),driver
+        # 就停在彈窗上 → 呼叫端接著等 execute_button 必然逾時 20s、落入重試,每次重試又
+        # 點一次健康宣告、再洩漏一個視窗(最多 5 個),整個帳號的打卡可能就此耗掉。
+        # [codex] ①不可只在 current != orig 時才處理——切窗【失敗】時 current 仍是
+        # orig,彈窗卻已存在(照樣洩漏);②只關「相對 wins_before 新增」的視窗,不可關掉
+        # 所有非 orig 的視窗(HIS 可能另有合法對話框)。
+        try:
+            leaked = [w for w in driver.window_handles if w not in wins_before]
+            for w in leaked:
+                try:
+                    driver.switch_to.window(w)
+                    driver.close()
+                except WebDriverException:
+                    pass
+            if leaked or driver.current_window_handle != orig:
+                driver.switch_to.window(orig)
+        except WebDriverException:
+            logging.debug("[autoclock] 健康宣告後收窗/切回原視窗失敗", exc_info=True)
 
 
 def get_current_swipe_info(driver, wait, get_loc):
@@ -1394,7 +1416,15 @@ def _scheduler_tick() -> None:
         finally:
             _clock_task_gate.release(key, lease)
 
-    threading.Thread(target=_worker, name=f"AutoClockTask-{key}", daemon=True).start()
+    # [2026-07-25 審查] lease 在 Thread.start() 之前就取得：start() 若拋例外
+    # (緒耗盡/直譯器關閉中),_worker 的 finally 永遠不會跑 → lease 洩漏,該 schedule key
+    # 要等 stale_after_sec(90 分鐘) 才自癒 → 整個 29 分鐘的打卡窗被靜默跳過。
+    try:
+        threading.Thread(target=_worker, name=f"AutoClockTask-{key}",
+                         daemon=True).start()
+    except Exception:
+        _clock_task_gate.release(key, lease)
+        logging.exception("[autoclock] 打卡任務緒啟動失敗(已釋放 lease,下一分鐘再試)")
 
 
 def _idle_driver_janitor() -> None:
@@ -1922,33 +1952,75 @@ def _cleanup_orphan_chromedrivers_at_startup() -> None:
         logging.debug("[autoclock] 清掃孤兒 chromedriver 例外", exc_info=True)
 
 
+def _notify_restart_failed() -> None:
+    """重啟失敗的告知。[codex] notify_clock_failure 在沒安裝 winotify 時會靜默 return,
+    故再加一層 MessageBox 後備——這種事必須讓使用者確實知道。"""
+    try:
+        notify_clock_failure(
+            "更新後重啟失敗",
+            ["新版本無法啟動，已繼續使用目前版本執行自動打卡。",
+             "請找時間確認程式更新是否損毀。"])
+    except Exception:
+        logging.debug("[autoclock restart] toast 通知失敗", exc_info=True)
+    if not (WINOTIFY_AVAILABLE and WinotifyNotification is not None):
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                0, "自動打卡：更新後的新版本無法啟動。\n"
+                   "已繼續使用目前版本執行自動打卡（打卡未中斷），\n"
+                   "但請找時間確認程式更新是否損毀。",
+                "自動打卡", 0x30)          # MB_ICONWARNING
+        except Exception:
+            logging.debug("[autoclock restart] MessageBox 後備通知失敗",
+                          exc_info=True)
+
+
 def restart_program(args_add=None, hard_exit_code=None) -> None:
-    """[修正] 改用 cmuh_common.paths.restart_self 雙軌相容。"""
+    """[修正] 改用 cmuh_common.paths.restart_self 雙軌相容。
+
+    [2026-07-25 審查/codex] ★破壞性拆解一律延後到「確認新行程存活」之後★。
+    `restart_self` 有一道保護：新行程若在 0.6 秒內就死掉（壞更新/缺依賴），它會記
+    error 並 return 而不退出，讓舊行程繼續服務。但舊版在呼叫它【之前】就 running.clear()
+    + 停 tray + 釋放 mutex + 收 driver → 保護 return 回來時本行程已被拆光（排程/看門狗
+    迴圈與 tray 都停了、main() 隨即返回）→ 打卡程式整個消失，正是該保護想避免的事；
+    只補一句通知並不能解決「可用性」本身（何況沒裝 winotify 時連通知都不會出現）。
+    改法：把拆解包成 on_confirmed 交給 restart_self，只有確定接手成功才執行。
+    子行程搶單例 mutex 失敗會自行重試（~1.5s > 存活檢查的 0.6s），故先 spawn 再放
+    mutex 仍然安全。spawn 失敗時本行程【完全沒被動過】，排程照常繼續跑。"""
     global tray_icon_object
-    running.clear()
-    if tray_icon_object:
-        tray_icon_object.stop()
-    try:
-        release_single_instance()
-        logging.info("[autoclock restart] mutex released before respawn")
-    except Exception:
-        logging.debug("[autoclock restart] release_single_instance failed",
-                      exc_info=True)
-    # [stability] respawn 前先收掉本 process 的常駐 chromedriver/Chrome：否則重啟後
-    # 新 instance 會再開一份，舊的若因 pystray 吞掉 callback 內的 SystemExit /
-    # main thread 收尾延遲而沒退，chromedriver/Chrome 進程會累積。不依賴 atexit/race。
-    try:
-        _release_persistent_clock_driver()
-    except Exception:
-        logging.debug("[autoclock restart] release persistent driver failed",
-                      exc_info=True)
+
+    def _teardown_for_handover() -> None:
+        """確認新行程活著之後才做的收尾（本函式只會在即將退出時被呼叫一次）。"""
+        global tray_icon_object
+        running.clear()
+        if tray_icon_object:
+            tray_icon_object.stop()
+        try:
+            release_single_instance()
+            logging.info("[autoclock restart] mutex released (handover confirmed)")
+        except Exception:
+            logging.debug("[autoclock restart] release_single_instance failed",
+                          exc_info=True)
+        # [stability] 收掉本 process 的常駐 chromedriver/Chrome：否則重啟後新 instance
+        # 會再開一份，舊的若沒退乾淨，chromedriver/Chrome 進程會累積。
+        try:
+            _release_persistent_clock_driver()
+        except Exception:
+            logging.debug("[autoclock restart] release persistent driver failed",
+                          exc_info=True)
+
     extra: list = []
     for a in sys.argv[1:]:
         if a not in ("--configure", "--test-login"):
             extra.append(a)
     if args_add:
         extra.append(args_add)
-    restart_self(extra, hard_exit_code=hard_exit_code)
+    restart_self(extra, hard_exit_code=hard_exit_code,
+                 on_confirmed=_teardown_for_handover)
+    # 走到這裡＝新行程早夭、restart_self 刻意保留本行程；因為拆解在 on_confirmed 裡，
+    # 本行程的排程/看門狗/tray/mutex 都【原封不動】→ 自動打卡繼續運作。
+    logging.error("[autoclock restart] 新行程未能存活 → 本行程續跑（未拆解），"
+                  "自動打卡不中斷；請檢查更新是否損毀")
+    _notify_restart_failed()
 
 
 def exit_action(icon=None, item=None) -> None:
@@ -2017,8 +2089,12 @@ def run_immediate_test(icon=None) -> None:
         finally:
             _test_login_gate.release("test-login", lease)
 
-    threading.Thread(target=_worker, name="AutoClockTestLogin",
-                     daemon=True).start()
+    try:                                   # [2026-07-25 審查] 同上:start 失敗要還 lease
+        threading.Thread(target=_worker, name="AutoClockTestLogin",
+                         daemon=True).start()
+    except Exception:
+        _test_login_gate.release("test-login", lease)
+        logging.exception("[autoclock] 測試登入緒啟動失敗(已釋放 lease)")
 
 
 def _run_test_ui() -> None:

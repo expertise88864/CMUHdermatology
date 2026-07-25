@@ -87,13 +87,19 @@ def get_log_path(filename: str = 'app.log') -> str:
     return os.path.join(get_app_dir(), filename)
 
 
-def restart_self(extra_args=None, hard_exit_code=None) -> None:
+def restart_self(extra_args=None, hard_exit_code=None,
+                 on_confirmed=None) -> None:
     """雙軌重啟。
 
     hard_exit_code：None（預設）→ 成功 spawn 後以 sys.exit(0) 結束（給 main thread
     用，能跑 atexit/finally）。給整數 → 改用 os._exit(code)。供「非 main thread」
     呼叫者使用（例如 health 監看 daemon）：sys.exit 在子 thread 只會結束該 thread、
     process 不會退 → 會變成新舊兩個 instance；os._exit 才能強制整個 process 結束。
+
+    on_confirmed：可選的收尾 callback。**只有在確認新行程存活、即將退出本行程之前**
+    才會被呼叫（新行程早夭而保留舊行程時不呼叫）。用途：把「停排程/停 tray/釋放 mutex/
+    收 driver」等破壞性拆解延後到確定接手成功之後，避免 spawn 失敗時舊行程已被拆光而
+    整個消失（見 autoclock.restart_program）。callback 內例外只記 log，不影響退出。
 
     .pyw 模式：subprocess.Popen(pythonw, sys.argv[0], ...) + sys.exit
     .exe 模式：subprocess.Popen(sys.executable, ...) + sys.exit
@@ -138,6 +144,17 @@ def restart_self(extra_args=None, hard_exit_code=None) -> None:
                     "[restart_self] 新行程啟動後立即結束 (exit=%s)，保留舊行程不退出",
                     rc)
                 return
+        # [2026-07-25 審查/codex] 確認新行程存活【之後】才做破壞性拆解。
+        # 背景：呼叫端(如 autoclock.restart_program)原本必須在 spawn 前就 running.clear()
+        # + 停 tray + 釋放 mutex,於是上面「保留舊行程」的保護 return 回去時,舊行程其實
+        # 已經被拆光 → 排程/看門狗迴圈與 tray 都停了、main() 隨即返回 → 打卡程式整個消失,
+        # 正是這道保護想避免的事。改由呼叫端把拆解包成 on_confirmed 交進來,只有確定
+        # 新行程活著才執行;子行程搶 mutex 失敗會自行重試(~1.5s > 這裡的 0.6s),故仍安全。
+        if on_confirmed is not None:
+            try:
+                on_confirmed()
+            except Exception:
+                logging.exception("[restart_self] on_confirmed 收尾失敗（仍照常退出）")
     except Exception as e:
         logging.error("[restart_self] subprocess.Popen 失敗: %s — fallback os.execv", e)
         try:

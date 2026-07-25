@@ -247,7 +247,9 @@ class RosterStorage:
         """[{"id","start_monday","members":[...]}]（依起始日升冪）。"""
         d = self._check_schema(_load_json(self._path("clerk_batches.json")),
                                "clerk_batches.json")
-        items = list(d.get("batches") or [])
+        # [codex] 非 dict 項（多機合併後可能出現 null/字串）在這裡就會讓 b.get 拋
+        # AttributeError —— 比 from_dict 更早,連讓它回 None 的機會都沒有 → 先濾掉。
+        items = [b for b in (d.get("batches") or []) if isinstance(b, dict)]
         return sorted(items, key=lambda b: str(b.get("start_monday", "")))
 
     def save_clerk_batches(self, batches: list) -> None:

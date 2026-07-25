@@ -324,8 +324,9 @@ class DayScheduleTab(ttk.Frame):
             inp = self.service.build_day_input(ym)
             return [{"id": c, "name": ""} for c in inp.pgy_roster]
         y, m = int(ym[:4]), int(ym[5:7])
-        batches = [ClerkBatch.from_dict(b)
-                   for b in self.service.storage.load_clerk_batches()]
+        batches = [b for b in (ClerkBatch.from_dict(x)
+                               for x in self.service.storage.load_clerk_batches())
+                   if b is not None]
         codes = sorted({c for b in batches_covering(batches, y, m)
                         for c in b.members})
         return [{"id": c, "name": ""} for c in codes]

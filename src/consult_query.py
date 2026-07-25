@@ -117,6 +117,8 @@ RELOAD_FLAG = SETTINGS_DIR / "consult_query_reload.flag"
 MAX_SHOT_FILES = 60
 
 SYSTEMFTP_PATH = r"C:\admc\systemftp.exe"
+# [2026-07-25 審查] 行程名（小寫）；強制結束前重新確認身分用，避免 PID 重用時誤殺。
+SYSTEMFTP_EXE_NAME = "systemftp.exe"
 MUTEX_NAME = "Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1"
 CONFIG_MUTEX_NAME = "Local\\CMUH_Skin_ConsultQuery_Config_v1"
 
@@ -483,7 +485,7 @@ def _systemftp_pids() -> set:
     out = set()
     for p in psutil.process_iter(["name"]):
         try:
-            if (p.info["name"] or "").lower() == "systemftp.exe":
+            if (p.info["name"] or "").lower() == SYSTEMFTP_EXE_NAME:
                 out.add(p.pid)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
@@ -785,6 +787,53 @@ def click_button(hwnd: int) -> None:
         logging.debug("BM_CLICK 失敗", exc_info=True)
 
 
+MENU_CAPTION_EXPECTED = "我的會診清單"
+MF_BYPOSITION = 0x00000400        # GetMenuStringW 以「位置」而非命令 ID 取項目
+
+
+def _normalize_menu_caption(text: str) -> str:
+    """正規化選單標題：去掉助記符 & 與快捷鍵欄(Tab 之後)、去空白。
+    例：'我的會診清單(&M)\\tCtrl+M' → '我的會診清單'。"""
+    s = str(text or "").split("\t")[0]
+    s = re.sub(r"\(&.\)", "", s).replace("&", "")
+    return s.strip()
+
+
+def _menu_caption_at(sub_menu: int, idx: int) -> str:
+    """讀取選單項標題（正規化後）；取不到回空字串。純 Win32 查詢,不改任何狀態。
+
+    用 ctypes 直呼 user32.GetMenuStringW —— pywin32 的 win32gui **沒有** GetMenuString
+    （第一版誤用,會永遠 AttributeError → 永遠回 False → 選單真的位移時也永遠救不回來）。"""
+    try:
+        buf = ctypes.create_unicode_buffer(256)
+        n = ctypes.windll.user32.GetMenuStringW(
+            ctypes.c_void_p(int(sub_menu)), ctypes.c_uint(int(idx)),
+            buf, ctypes.c_int(len(buf)), ctypes.c_uint(MF_BYPOSITION))
+        return _normalize_menu_caption(buf.value) if n > 0 else ""
+    except Exception:
+        logging.debug("讀取選單標題失敗（視為取不到）", exc_info=True)
+        return ""
+
+
+def _find_menu_id_by_caption(sub_menu: int, caption: str) -> "int | None":
+    """[codex] 在子選單裡【依確切標題】找命令 ID。
+
+    只比對「含『會診』」是不夠的：院方若插入『全部會診清單』『會診回覆』等項目,
+    位移後的項目照樣含「會診」→ 會把【別的命令】送進住院醫囑系統。改為要求標題
+    正規化後與 MENU_CAPTION_EXPECTED 完全相同,並直接以標題定位(不再信任位置索引)。"""
+    try:
+        count = ctypes.windll.user32.GetMenuItemCount(
+            ctypes.c_void_p(int(sub_menu)))
+        for i in range(max(0, int(count))):
+            if _menu_caption_at(sub_menu, i) == caption:
+                cmd = win32gui.GetMenuItemID(sub_menu, i)
+                if cmd and cmd != -1:
+                    return cmd
+    except Exception:
+        logging.debug("依標題尋找選單項失敗", exc_info=True)
+    return None
+
+
 def resolve_menu_command_id(main_hwnd: int) -> int | None:
     """走訪主視窗選單樹，取得「我的會診清單」的命令 ID。
 
@@ -807,8 +856,23 @@ def resolve_menu_command_id(main_hwnd: int) -> int | None:
                 cmd_id = win32gui.GetMenuItemID(sub, idx)
                 if cmd_id and cmd_id != -1:
                     if cmd_id != MENU_ID_EXPECTED:
-                        logging.info("選單 ID 走訪結果 %s（預設值 %s）",
-                                     cmd_id, MENU_ID_EXPECTED)
+                        # [2026-07-25 審查] 走訪結果與預期不同 → 多半是院方在選單插了
+                        # 一項而位置索引 (4,8,0) 位移。此 ID 會被 PostMessage 送進
+                        # 【住院醫囑系統】,送錯等於在醫囑程式裡按下不明功能表項目。
+                        # [codex] 位置已不可信 → 改【依確切標題】重新定位;找不到就放棄
+                        # 本次(呼叫端會重試/告警),絕不硬送未知命令。
+                        by_caption = _find_menu_id_by_caption(
+                            sub, MENU_CAPTION_EXPECTED)
+                        if by_caption is None:
+                            logging.error(
+                                "選單走訪得到非預期 ID %s(預設 %s),且在該子選單中找不到"
+                                "標題為「%s」的項目 → 疑似院方改版,本次不送出選單命令",
+                                cmd_id, MENU_ID_EXPECTED, MENU_CAPTION_EXPECTED)
+                            return None
+                        logging.info(
+                            "選單位置疑似位移(位置 ID=%s),改依標題「%s」定位 → ID %s",
+                            cmd_id, MENU_CAPTION_EXPECTED, by_caption)
+                        return by_caption
                     return cmd_id
         return MENU_ID_EXPECTED
     except Exception:
@@ -1541,13 +1605,18 @@ def _extract_consult_text(consult_hwnd: int, cfg: dict,
         return "", "", None
     try:
         children = enum_children(consult_hwnd)
-        # 控制項樹 dump(每次執行記一次)：供依實機結構微調 extract_* 參數
+        # 控制項樹 dump(每次執行記一次)：供依實機結構微調 extract_* 參數。
+        # [2026-07-25 審查] 只記 class 與座標,**不再記控制項文字**——TRadioButton 的
+        # 文字就是「姓名+病房+床號+病歷號」(見 _find_patient_radios 註解),而本函式每
+        # ~15 分鐘的輪詢都會跑一次 → 等於把全院會診病人清單持續寫進沒有保存期限的
+        # consult_query.log。這個 dump 當初只是為了「依實機結構微調參數」,結構資訊
+        # (class/尺寸/位置)就足夠,病人識別資料不需要也不該留在這裡。
         logging.info(
             "[consult-extract] 控制項樹(%d 個): %s",
             len(children),
             " | ".join(
                 f"{cls}@({r[0]},{r[1]},{r[2]-r[0]}x{r[3]-r[1]})"
-                + (f" t={txt[:16]!r}" if txt else "")
+                + (f" len={len(txt)}" if txt else "")
                 for _h, cls, txt, r in children[:80]))
 
         # 病人清單 = TRadioButton 文字(最準確,直接來自 UI,免 OCR/像素點選)。
@@ -1670,8 +1739,45 @@ def _extract_consult_text(consult_hwnd: int, cfg: dict,
         return "", "", None
 
 
+def _validated_systemftp_pids(pids: set) -> set:
+    """[2026-07-25 審查/codex] 從候選 PID 篩出「確實是本 session 的 systemftp」。
+
+    pids 是流程早期(登入視窗出現時)的快照,最長可能在 ~5 分鐘後才被使用：
+      ① PID 重用：該行程若已結束、Windows 把 PID 回收給別的程式 → 不可動它。
+      ② 跨 session：共用/RDS 診間機上別的使用者也可能開著住院醫囑系統,他的 PID 不在
+         before 快照裡 → 會被誤判成「本次新增」。
+    取不到自己的 session 時【fail-closed】(整批不動),與 _cleanup_orphan_systemftp 一致
+    —— 寧可留下孤兒(下輪清掃會處理),也不要關掉別人的醫囑系統。"""
+    if not pids:
+        return set()
+    my_session = _pid_session(os.getpid())
+    if my_session is None:
+        logging.warning("[cleanup] 取不到本行程 session → 不動任何行程(fail-closed)")
+        return set()
+    out = set()
+    for pid in pids:
+        try:
+            p = psutil.Process(pid)
+            if (p.name() or "").lower() != SYSTEMFTP_EXE_NAME:
+                logging.info("[cleanup] pid %s 已非 systemftp(PID 重用?),略過", pid)
+                continue
+            if _pid_session(pid) != my_session:
+                logging.info("[cleanup] pid %s 屬其他登入 session,略過", pid)
+                continue
+            out.add(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        except Exception:
+            logging.debug("[cleanup] 驗證 pid %s 失敗(略過)", pid, exc_info=True)
+    return out
+
+
 def close_pids(pids: set, grace: float = 2.5) -> None:
-    """關閉指定行程：先對其視窗送 WM_CLOSE，逾時再強制結束。"""
+    """關閉指定行程：先對其視窗送 WM_CLOSE，逾時再強制結束。
+
+    [codex] 驗證必須在【送 WM_CLOSE 之前】：舊版先對快照 PID 的所有視窗送 WM_CLOSE,
+    才在 terminate 前檢查身分 → 別人的住院醫囑系統早就被關掉了(WM_CLOSE 也是關閉)。"""
+    pids = _validated_systemftp_pids(pids)
     if not pids:
         return
     for hwnd in find_windows(pids=pids, visible_only=False):
@@ -1684,9 +1790,11 @@ def close_pids(pids: set, grace: float = 2.5) -> None:
         if not (_systemftp_pids() & pids):
             return
         time.sleep(0.3)
-    for pid in pids:
+    for pid in pids:                       # 已由 _validated_systemftp_pids 驗證過
         try:
             p = psutil.Process(pid)
+            if (p.name() or "").lower() != SYSTEMFTP_EXE_NAME:
+                continue                   # grace 期間才被回收的極端情況,再擋一次
             p.terminate()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
@@ -1891,6 +1999,10 @@ def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -
 
         # 送選單命令：我的會診清單
         cmd_id = resolve_menu_command_id(main_hwnd)
+        if cmd_id is None:   # [2026-07-25] 選單疑似位移且標題核對不符 → 不硬送未知命令
+            raise RuntimeError(
+                "無法確認「我的會診清單」選單命令(疑似住院醫囑系統改版),"
+                "本次中止以免對醫囑系統送出不明命令")
         win32gui.PostMessage(main_hwnd, win32con.WM_COMMAND, cmd_id, 0)
         logging.info("已送出選單命令（id=%s）", cmd_id)
 
@@ -2057,6 +2169,9 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
 
         # 送選單命令：我的會診清單（背景 PostMessage，不點滑鼠、解析度無關）
         cmd_id = resolve_menu_command_id(main_hwnd)
+        if cmd_id is None:   # 同上：寧可失敗重試,也不對醫囑系統送不明命令
+            raise RuntimeError(
+                "無法確認「我的會診清單」選單命令(疑似住院醫囑系統改版),本次中止")
         win32gui.PostMessage(main_hwnd, win32con.WM_COMMAND, cmd_id, 0)
         logging.info("已送出選單命令（我的會診清單，id=%s）", cmd_id)
 

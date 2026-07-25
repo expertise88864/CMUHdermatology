@@ -218,8 +218,10 @@ class RosterService:
         if pgy_roster is None:                     # 未指定當月人員 → 用 config 預設代號
             pgy_roster = [str(mm.get("id")) for mm in (cfg.get("pgy_members") or [])]
 
-        batches = [ClerkBatch.from_dict(b)
-                   for b in self.storage.load_clerk_batches()]
+        # [2026-07-25 審查] from_dict 對壞梯次回 None（不再拋例外）→ 濾掉
+        batches = [b for b in (ClerkBatch.from_dict(x)
+                               for x in self.storage.load_clerk_batches())
+                   if b is not None]
         covering = batches_covering(batches, y, m)     # 逐日在 solve 時再依 covers 分配
         bio_all = self.storage.load_biopsy_grid()
         biopsy_open: dict = {}
@@ -1048,15 +1050,24 @@ class RosterService:
         ctx = self.build_context(scope, ym)
         duty = (self.storage.load_month(ym).get(f"{scope}_duty") or {})
         points = {m.id: 0 for m in ctx.members}
+        y, m = int(ym[:4]), int(ym[5:7])
         for iso, cell in duty.items():
             p = cell.get("person")
             if p not in points:
                 continue
             try:
-                points[p] += day_point(date.fromisoformat(iso),
-                                       ctx.holidays, ctx.params)
+                dt = date.fromisoformat(iso)
             except (ValueError, TypeError):
                 continue
+            # [2026-07-25 審查/RP3-07] 非當月鍵不計入結算：跨機人工合併/外部編輯可能在
+            # 月檔留下鄰月日期,算進去會虛增該人點數 → fair_share 與每人 delta 一起偏掉,
+            # 錯誤帳本還會結轉到下個月的排班目標。build_export / recompute_saturday_biopsy
+            # / day_course_stats 都有這道過濾,只有這條【真正寫進 ledger.json】的路徑漏了。
+            if (dt.year, dt.month) != (y, m):
+                logging.warning("[roster.service] %s 月檔含非當月鍵 %s，重算帳本時略過",
+                                ym, iso)
+                continue
+            points[p] += day_point(dt, ctx.holidays, ctx.params)
         ledger = self.storage.load_ledger()
         settle_month(ledger, scope, ym, points)
         self.storage.save_ledger(ledger)

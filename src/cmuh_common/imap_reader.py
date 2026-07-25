@@ -35,6 +35,9 @@ from cmuh_common.smtp_mail import load_credentials
 
 DEFAULT_IMAP_HOST = "imap.gmail.com"
 DEFAULT_IMAP_PORT = 993
+# [2026-07-25 審查] 後備掃描（中文關鍵字必走）單輪最多檢查幾封未讀信。
+# 每封需一次 FETCH round-trip，不設上限時未讀累積數百封就會撐爆單輪時限。
+_MAX_SCAN_IDS = 50
 
 # ─── Watchdog 支援：暴露當前活動的 IMAP 連線給外部 force-close ────────────
 # 用途：如果 check_trigger 在 socket 上卡住 > N 秒，呼叫端可從另一個 thread
@@ -238,6 +241,18 @@ def check_trigger(keyword: str, mark_read: bool = True,
             return result
 
         ids = data[0].split() if data[0] else []
+        # [2026-07-25 審查] 只掃「最新的 N 封」。中文關鍵字必然走這條後備路徑
+        # (imaplib 對非 ASCII 關鍵字會在編碼階段拋例外) → 每封未讀信都要一次 FETCH
+        # round-trip。信箱累積數百封未讀時,單輪就會超過 IMAP_HARD_TIMEOUT(60s) →
+        # 看門狗每輪強制關 socket → 3 次錯誤 → 5 分鐘冷卻 → 循環,email 觸發功能實質
+        # 永久失效(只留 warning)。觸發信本來就是「剛剛寄的」,掃最新幾十封即足夠;
+        # SEARCH 回傳的序號為遞增,故取尾端＝最新。
+        if len(ids) > _MAX_SCAN_IDS:
+            logging.warning(
+                "[IMAP] 未讀 %d 封超過單輪掃描上限 %d → 只檢查最新 %d 封"
+                "（信箱未讀過多，建議清理；觸發信為即時寄出故不受影響）",
+                len(ids), _MAX_SCAN_IDS, _MAX_SCAN_IDS)
+            ids = ids[-_MAX_SCAN_IDS:]
         result["scanned"] = len(ids)
 
         from email.utils import parseaddr
