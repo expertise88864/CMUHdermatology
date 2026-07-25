@@ -605,10 +605,13 @@ def save_config() -> bool:
         try:
             accounts_data.sort(key=lambda x: x.get("username", ""))
             atomic_write_json(str(CONFIG_FILE), accounts_data)
-            return True
         except Exception as e:
             logging.error("儲存失敗: %s", e)
             return False
+    # [2026-07-25 審查] 設定存檔成功＝帳密可能剛被更正 → 解除「帳密錯誤」封鎖,
+    # 不必等到隔天。放在 _config_lock 之外呼叫,避免與 _clock_done_lock 巢狀。
+    _clear_auth_failed()
+    return True
 
 
 # =============================================================================
@@ -818,6 +821,56 @@ def _is_clock_done(schedule_key, username) -> bool:
         return _clock_done.get((schedule_key, username)) == date.today().isoformat()
 
 
+# [2026-07-25 審查] 帳密錯誤的「當窗記憶」。AC-09 只讓 ClockAuthError 在【單次
+# perform_clock_action 內】不重試,但排程是每分鐘 re-fire,而 _clock_done 只在【成功】
+# 時才寫 → 密碼過期時同一個打卡窗會重登約 29 次、一天約 145 次,醫院 AD 幾乎必鎖帳號;
+# 帳號一鎖,連本來會成功的其他窗也全滅(這正是 AC-09 想避免的結果)。
+# 與 _clock_done 同形狀:key=(schedule_key, username)、value=今日日期 → 跨日自動失效、
+# 大小有界;一併持久化,免得 watchdog/自動更新重啟後又重新試 29 次。
+# granularity 取「每窗一次」而非「整天一次」:每天最多 5 次且時間分散(07:31/12:00/
+# 12:31/17:01/21:01),不會觸發 AD 的短觀察窗計數,又保留「使用者中途改好密碼、下一個
+# 窗自然恢復」的機會;真的改了密碼還會由 save_config 成功時主動清除(見 _clear_auth_failed)。
+_auth_failed: dict = {}
+
+
+def _mark_auth_failed(schedule_key, username) -> None:
+    if not schedule_key or not username:
+        return
+    with _clock_done_lock:                 # 與 _clock_done 共用鎖(同一份狀態檔)
+        _auth_failed[(schedule_key, username)] = date.today().isoformat()
+    _save_clock_state()
+
+
+def _is_auth_failed(schedule_key, username) -> bool:
+    if not schedule_key or not username:
+        return False
+    with _clock_done_lock:
+        return _auth_failed.get((schedule_key, username)) == date.today().isoformat()
+
+
+def _clear_auth_failed() -> None:
+    """帳密可能已被更正(設定存檔成功)→ 解除封鎖,讓下一次 re-fire 重新嘗試。
+
+    [codex] **不可只清記憶體**：真實流程是「tray → 設定」,而設定是以 `--configure`
+    重啟成新行程,該模式不啟動 scheduler → 既沒跑 `_load_clock_state()`、
+    `_clock_state_persistence_enabled` 也還是 False。此時記憶體的 _auth_failed 是空的,
+    舊版靠 `had` 判斷就直接什麼都不做 → 回到背景模式後封鎖又從磁碟載回來,該帳號整窗
+    仍被跳過(可能真的漏打卡)。故：直接原子改寫 clock_state.json 的 auth_failed 欄位,
+    保留其餘欄位,且不受 persistence 旗標與載入與否影響。"""
+    with _clock_done_lock:
+        _auth_failed.clear()
+    try:
+        raw = safe_load_json(str(CLOCK_STATE_FILE), default=None)
+        if isinstance(raw, dict) and raw.get("auth_failed"):
+            raw["auth_failed"] = []
+            atomic_write_json(str(CLOCK_STATE_FILE), raw)
+            logging.info("[autoclock] 設定已更新 → 清除帳密錯誤封鎖(含磁碟狀態),"
+                         "恢復自動打卡嘗試")
+    except Exception:
+        logging.warning("[autoclock] 清除磁碟上的帳密錯誤封鎖失敗,"
+                        "背景行程可能仍會跳過該帳號至隔日", exc_info=True)
+
+
 # =============================================================================
 # [新功能 2026-06-13] 補卡提醒：打卡窗結束後仍未確認成功 → 跳通知提醒使用者
 # 去電子刷卡系統確認/補卡。原本失敗只記 log + 單次失敗通知，若整窗的 re-fire
@@ -872,12 +925,14 @@ def _save_clock_state() -> None:
     with _clock_state_save_lock:
         with _clock_done_lock:
             done = [[k, u] for (k, u), v in _clock_done.items() if v == today]
+            # [2026-07-25] 帳密錯誤封鎖也要跨重啟保留,否則 watchdog 一重啟就又試 29 次
+            auth = [[k, u] for (k, u), v in _auth_failed.items() if v == today]
         with _missed_warned_lock:
             warned = [k for k, v in _missed_warned.items() if v == today]
         try:
             atomic_write_json(str(CLOCK_STATE_FILE),
                               {"date": today, "clock_done": done,
-                               "missed_warned": warned})
+                               "missed_warned": warned, "auth_failed": auth})
         except Exception:
             logging.debug("[clock-state] 寫盤失敗(降級純記憶體)", exc_info=True)
 
@@ -895,15 +950,21 @@ def _load_clock_state() -> None:
         done_n = 0
         done_items = raw.get("clock_done") or []
         warned_items = raw.get("missed_warned") or []
+        auth_items = raw.get("auth_failed") or []
         if not isinstance(done_items, list):
             done_items = []
         if not isinstance(warned_items, list):
             warned_items = []
+        if not isinstance(auth_items, list):
+            auth_items = []
         with _clock_done_lock:
             for item in done_items:
                 if isinstance(item, (list, tuple)) and len(item) == 2:
                     _clock_done[(str(item[0]), str(item[1]))] = today
                     done_n += 1
+            for item in auth_items:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    _auth_failed[(str(item[0]), str(item[1]))] = today
         warned_n = 0
         with _missed_warned_lock:
             for k in warned_items:
@@ -1119,6 +1180,10 @@ def perform_clock_action(driver, wait, acc, is_in: bool,
             if dry_run:
                 messagebox.showerror("測試失敗(帳號/密碼錯誤)", str(e))
             else:
+                # [2026-07-25 審查] 記下「本窗此帳號帳密錯誤」→ 每分鐘的 re-fire 會直接
+                # 跳過,不再重登約 29 次(舊版只有這個 except 擋單次呼叫,擋不住 re-fire,
+                # 一天約 145 次錯誤登入 → AD 鎖帳號 → 連本來會成功的窗也全滅)。
+                _mark_auth_failed(task_label, acc.get("username"))
                 _handle_clock_failure(driver, acc.get("username", "?"),
                                       task_label, e, dry_run)
             return
@@ -1199,6 +1264,15 @@ def process_clock_task(schedule_key: str | None) -> None:
         # 一旦登入剛好失敗就會跳假的「打卡失敗」通知。先過濾掉已完成帳號 → 全部完成就連 driver
         # 都不開、直接返回，根除假失敗通知與每分鐘的重複登入開銷。
         accs = [a for a in accs if not _is_clock_done(schedule_key, a.get("username"))]
+        # [2026-07-25 審查] 本窗已確認帳密錯誤的帳號同樣不再 re-fire（見 _auth_failed）：
+        # 重登不會讓密碼變對，只會逼近 AD 鎖定門檻，並每分鐘洗一次失敗通知。
+        _blocked = [a for a in accs if _is_auth_failed(schedule_key, a.get("username"))]
+        if _blocked:
+            logging.info("排程觸發: %s — 略過帳密錯誤的帳號(本窗不再重試): %s",
+                         schedule_key,
+                         "、".join(str(a.get("username")) for a in _blocked))
+        accs = [a for a in accs
+                if not _is_auth_failed(schedule_key, a.get("username"))]
         if not accs:
             logging.info("排程觸發: %s — 本窗所有帳號已完成打卡，略過 re-fire", schedule_key)
             return

@@ -2561,11 +2561,28 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                             _save_notified(_poll_sig)
                             logging.info("[poll] 首次建立會診基準(%d 筆),本輪不寄信",
                                          len(_poll_sig))
+                            _note_job_success()   # [codex] 這是【成功】跑完的一輪
                             return
                         _new = _poll_sig - _load_notified()
                         if not _new:
+                            # [2026-07-25 審查] 基準必須【剪枝】成目前清單,否則已回覆而
+                            # 離開清單的病歷號會永遠留在基準裡 → 同一床日後【再次開會診】
+                            # 時算不出「新」,那張會診單就永遠不會通知(除非剛好有別的新病人
+                            # 一起出現才連帶寄出整份清單)。
+                            # 安全性:_save_notified 是整組取代,而「有寄信」那條路徑
+                            # (下方 _save_notified(_consult_signature_from_roster(...)))
+                            # 本來就是這樣剪枝的 → 兩條路徑語意一致,不引入新的重寄風險;
+                            # 且此處必然是清單解析成功的分支(解析失敗走 fail-open 不更新基準)。
+                            if _poll_sig != _load_notified():
+                                _save_notified(_poll_sig)
+                                logging.info("[poll] 已回覆離開清單的會診從基準剪除"
+                                             "(日後同一床再會診才通知得到)")
                             logging.info("[poll] 目前 %d 筆會診都已通知過,無新會診 → 不寄信",
                                          len(_poll_sig))
+                            # [codex] 「跑成功但沒有新會診」是【健康】的一輪,必須清零
+                            # 連續失敗計數——否則零星失敗會被累加成假的「連續故障」,
+                            # 恢復後也永遠清不掉,冷卻期一過又誤報一次。
+                            _note_job_success()
                             return
                         logging.info("[poll] 偵測到 %d 筆新會診 → 寄出目前全部未回覆清單",
                                      len(_new))
@@ -2612,6 +2629,7 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                     except Exception:
                         logging.debug("更新 consult_notified 失敗", exc_info=True)
                 logging.info("會診查詢任務成功（第 %d 次嘗試）", attempt)
+                _note_job_success()      # [2026-07-25] 清空連續失敗計數
                 return  # 成功就跳出
             except Exception as e:
                 last_err = e
@@ -2630,6 +2648,21 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                 else:
                     logging.error("會診查詢任務已重試 %d 次仍失敗，放棄。最後錯誤：%s",
                                   retry_count, last_err)
+                    # [2026-07-25 審查] 連續失敗達門檻 → 告警給一般收件人。
+                    # 輪詢模式「沒信」是常態,故障不主動說就沒人會發現(見 _note_job_failure)。
+                    # [codex] 收件人固定用【一般團隊名單】：email 觸發時 recipients
+                    # 已被改寫成觸發醫師本人,若沿用會 ①健康告警寄給該醫師(他同時還會
+                    # 收到下方的個人失敗通知 → 同一次失敗收兩封) ②團隊反而收不到
+                    # ③六小時冷卻已被消耗,下一輪 poll 失敗也補不了通知。
+                    # [codex R2] 不可 `or recipients` 當後備：團隊名單為空而本次是
+                    # email 觸發時,recipients 仍是觸發醫師 → 又變成寄給他(且他還會收到
+                    # 下方的個人失敗通知＝同次兩封)、團隊依然收不到。沒有團隊收件人時
+                    # 就只記 warning(不啟動六小時冷卻,見 _note_job_failure)。
+                    try:
+                        _note_job_failure(cfg.get("recipients") or [],
+                                          str(last_err))
+                    except Exception:
+                        logging.debug("連續失敗告警處理失敗（略過）", exc_info=True)
                     # [2026-07-17] 「等不到登入視窗」多因隱藏桌面累積的 systemftp 孤兒
                     # (更新重啟/硬退遺留,運行期間累積)佔滿『最多兩個』上限。啟動清掃只在
                     # 啟動跑一次、重試的 _kill_systemftp 又只殺本次新增 → 孤兒永久存活、會診
@@ -3010,6 +3043,64 @@ def _send_dedup_notice_async(senders) -> None:
             logging.warning("[dedup] 告知信寄送失敗(不影響流程)", exc_info=True)
 
     threading.Thread(target=_worker, name="ConsultDedupNotice",
+                     daemon=True).start()
+
+
+# [2026-07-25 審查] 輪詢模式的「整個任務失敗」原本【誰都不會被通知】：email 觸發者有
+# 回信、poll/手動沒有。而輪詢模式「沒收到信」本來就是常態(沒有新會診就不寄) → HIS 改版
+# 之類的永久故障與「今天沒有新會診」在使用者眼中完全一樣;外層 watchdog 只看 log 檔
+# mtime,而錯誤一直在寫 log → 它會回報健康。結果是團隊看著一片安靜、以為沒有會診。
+# 故:連續失敗達門檻就寄一封節流告警,恢復後自動重置。
+_JOB_FAIL_ALERT_THRESHOLD = 3          # 連續 3 次放棄(≈45 分鐘無法查詢)才告警,避免暫時性抖動
+_JOB_FAIL_ALERT_COOLDOWN_SEC = 6 * 3600
+_job_fail_streak = 0
+_job_fail_last_alert = 0.0
+
+
+def _note_job_success() -> None:
+    """任務成功跑完 → 清空連續失敗計數（並在剛從故障恢復時留一行 log）。"""
+    global _job_fail_streak
+    if _job_fail_streak:
+        logging.info("[health] 會診查詢已恢復正常(先前連續失敗 %d 次)", _job_fail_streak)
+    _job_fail_streak = 0
+
+
+def _note_job_failure(recipients, reason: str) -> None:
+    """任務重試用盡 → 累計；達門檻且過了冷卻時間就寄一封告警（節流，不洗信箱）。"""
+    global _job_fail_streak, _job_fail_last_alert
+    _job_fail_streak += 1
+    if _job_fail_streak < _JOB_FAIL_ALERT_THRESHOLD:
+        return
+    now = time.time()
+    if now - _job_fail_last_alert < _JOB_FAIL_ALERT_COOLDOWN_SEC:
+        return
+    if not recipients:
+        logging.warning("[health] 會診查詢連續失敗 %d 次,但無收件人可告警",
+                        _job_fail_streak)
+        return
+    _job_fail_last_alert = now
+    streak = _job_fail_streak
+
+    def _worker():
+        try:
+            from cmuh_common.smtp_mail import send_mail
+            send_mail(
+                recipients=[str(r) for r in recipients],
+                subject="⚠ 會診查詢自動化連續失敗",
+                body=("會診查詢的自動輪詢已連續失敗 "
+                      f"{streak} 次，目前很可能查不到任何會診。\n\n"
+                      f"最後錯誤：{str(reason)[:300]}\n\n"
+                      "請注意：輪詢模式在「沒有新會診」時本來就不會寄信，因此這種故障"
+                      "從外觀上與「今天沒有新會診」完全一樣——請改用人工方式確認會診，"
+                      "並查看 settings/consult_query.log。\n"
+                      "（恢復正常後不會再寄；同一波故障最多 6 小時提醒一次。）"),
+                attachment_path=None,
+            )
+            logging.info("[health] 已寄出連續失敗告警(%d 次)", streak)
+        except Exception:
+            logging.warning("[health] 連續失敗告警寄送失敗", exc_info=True)
+
+    threading.Thread(target=_worker, name="ConsultHealthAlert",
                      daemon=True).start()
 
 
