@@ -342,3 +342,83 @@ def test_rs02_weekend_counts_includes_weekday_holiday():
         assert r.weekday_counts[mid] == r.duty_counts[mid] - r.weekend_counts[mid]
     holder = r.assignments[date(2026, 9, 28)]           # 指派到平日假日者
     assert r.weekend_counts[holder] >= 1                # 該天計入假日欄（修正前會少）
+
+
+# ─── 2026-07-25 使用者規則：每人每月最多 2 個週末 ─────────────────────────────
+def _weekend_counts(ctx, r):
+    """每人「含週六的週末段」數（週六+週日同段算一個）。"""
+    out = {m.id: 0 for m in ctx.members}
+    for b in ctx.blocks:
+        if b.saturday is None:
+            continue
+        who = r.assignments.get(b.days[0])
+        if who:
+            out[who] = out.get(who, 0) + 1
+    return out
+
+
+def test_weekend_cap_two_per_person():
+    """[使用者] 3 人值班 → 一個月不該有人值到 3 個週末（8 月有 5 個週末 = 2+2+1）。"""
+    ctx = make_ctx()
+    r = solve_duty(ctx)
+    assert r.status == "ok"
+    wk = _weekend_counts(ctx, r)
+    assert sum(wk.values()) == 5, f"8 月應有 5 個週末段：{wk}"
+    assert max(wk.values()) <= 2, f"不得有人值超過 2 個週末：{wk}"
+
+
+def test_weekend_cap_holds_even_when_ledger_pushes_points():
+    """帳本讓某人需要補很多點數（週末點數最高）時,仍不得靠塞第 3 個週末達成。"""
+    ctx = make_ctx(ledger={R1: -8.0})          # r1 欠 8 點 → 目標點數拉高
+    r = solve_duty(ctx)
+    assert r.status == "ok"
+    wk = _weekend_counts(ctx, r)
+    assert wk[R1] <= 2, f"r1 縱使需補點數也不得值 3 個週末：{wk}"
+
+
+def test_weekend_cap_precheck_warns_when_arithmetic_impossible():
+    """人數不足以讓每人 ≤2 個週末（5 週末 ÷ 2 人）→ 預檢提示,但仍求解不擋。"""
+    two = [Member(R1, "甲", "R1"), Member(R2, "乙", "R2")]
+    ctx = make_ctx(members=two)
+    r = solve_duty(ctx)
+    assert r.status == "ok"
+    assert any(c.rule_id == "weekend_cap" and c.severity == "warn"
+               for c in r.prechecks), \
+        f"應提示週末數與人數在算術上不相容：{[c.msg for c in r.prechecks]}"
+
+
+def test_weekend_cap_ignores_orphan_sunday_block():
+    """月初孤兒週日（其週六在上月）屬上月那個週末 → 不計入本月週末上限。
+    2026/11/1 為週日 → 產生孤兒塊。"""
+    ctx = make_ctx(year=2026, month=11, colors={})
+    blocks = [b for b in ctx.blocks if b.saturday is None]
+    assert blocks and blocks[0].kind == "weekend_orphan", "11 月應有孤兒週日塊"
+    from cmuh_common.roster.rules import WeekendCapRule
+    counted = WeekendCapRule._weekend_blocks(ctx)
+    assert all(b.saturday is not None for b in counted)
+    assert len(counted) == len(ctx.blocks) - 1
+
+
+def test_weekend_cap_weight_dominates_point_transfer():
+    """[codex R1] 權重必須嚴格大於「把一個週末段換人」造成的點數目標變動。
+    搬動 P 點的週末段會【同時】改變兩人的絕對偏差（最壞各 P 點）→ 上界 2×P 點;
+    第一版寫死 4,000,000 只算了單邊 4 點,長連休段(含國定假日)更會超出。"""
+    from cmuh_common.roster.rules import POINT_WEIGHT, WeekendCapRule
+    ctx = make_ctx()
+    blocks = WeekendCapRule._weekend_blocks(ctx)
+    w = WeekendCapRule.over_weight(ctx, blocks)
+    max_pts = max(b.points(ctx.holidays, ctx.params) for b in blocks)
+    assert w > 2 * max_pts * 100 * POINT_WEIGHT, "須嚴格支配雙人點數偏差上界"
+    assert max_pts >= 4, "8 月週末段至少 週六2+週日2 = 4 點"
+
+
+def test_weekend_cap_holds_without_fixed_weekday_confounders():
+    """隔離情境（無固定週幾、色塊交替不設限）+ 極端帳本壓力：點數平衡單獨會想把
+    第 3 個週末塞給欠點數最多的人,週末上限仍須守住。"""
+    plain = [Member(R1, "甲", "R1"), Member(R2, "乙", "R2"),
+             Member(R3, "丙", "R3")]
+    ctx = make_ctx(members=plain, ledger={R1: -12.0, R2: 2.0, R3: 2.0})
+    r = solve_duty(ctx)
+    assert r.status == "ok"
+    wk = _weekend_counts(ctx, r)
+    assert max(wk.values()) <= 2, f"帳本壓力下仍不得有人值 3 個週末：{wk}"

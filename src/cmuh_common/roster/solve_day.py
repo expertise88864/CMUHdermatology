@@ -76,6 +76,16 @@ class FairCounters:
     # [2026-07-24 使用者] 跟診房多樣性：每人×每房次數（盡量輪過各診,不固定跟同房）
     seat_room: dict = field(default_factory=dict)    # {(ck, 房): 次數}
     last_seat_room: dict = field(default_factory=dict)  # {ck: 房} 上次跟的房(反連排)
+    # [2026-07-25 使用者] 同伴多樣性：兩人同一診間共事次數（避免「1、2 號永遠一起
+    # 跟 101」——房多樣性只管「誰跟哪一間」,管不到「誰跟誰」）。鍵=兩人 ck 排序後的
+    # tuple,故與人員命名空間一致（Clerk 跨梯不互相繼承）。
+    pair: dict = field(default_factory=dict)         # {(ck_a, ck_b): 共事次數}
+    # [2026-07-25 使用者] 週三下午照光超額者的「補半天假」欠額：多值一次週三下午
+    # → 欠 1 次半天假,之後在「排班允許（該時段人多於位子）」時優先讓他放假抵銷。
+    rest_owed: dict = field(default_factory=dict)    # {pgy 代號: 待補半天假次數}
+    # [codex R2] 整月「累計產生」的補假債（只增不減）。第一趟求解用它得知「誰、共欠幾次」,
+    # 第二趟把債務從月初就預先掛上 → 月底才超額的人也能用月初的空檔補到假。
+    rest_owed_total: dict = field(default_factory=dict)
     # last_*：最近一次輪到日期。[2026-07-23] 輪選 key 已改用 _jitter 平手決勝（LRU 會
     # 鎖死固定配對），這些欄位保留作紀錄/回放資料，不再參與輪選。
     last_photo: dict = field(default_factory=dict)
@@ -96,8 +106,18 @@ class SessionCtx:
     capacity: int
     fc: FairCounters
     room_slots: dict = field(default_factory=dict)
+    # [codex R1] 房內每位已就座者的【真實 ck】(角色感知)。同伴計數不可用「本次候選池
+    # 的 ck resolver」去推斷房內既有者——PgyMixStep 進場時房裡坐的是 Clerk,用 _pgy_ck
+    # 推會標成 ("pgy", 代號),與 replay_counters 的 ("clerk", 梯次, 代號) 永遠對不上
+    # (代號跨梯重用時還會誤繼承別梯的配對史)。
+    seat_ck: dict = field(default_factory=dict)
     batch_key: str = ""               # 切片輪替以「梯次」為單位（代號跨梯會重用）
     apply_pref: frozenset = frozenset()   # Apply 本科 PGY（101 診週二/週五平手優先）
+    # [2026-07-25 使用者] 本月每人週三下午照光的基準配額＝週三下午場次 ÷ PGY 人數
+    # （整除部分）。超過此數者視為「多值了」→ 記 rest_owed,後續補半天假。
+    wed_pm_quota: int = 0
+    # [codex R2] 第二趟求解時債務已於月初預掛 → 不可再累加（否則補兩次半天假）。
+    incur_debt: bool = True
 
     @property
     def wed_pm(self) -> bool:
@@ -133,11 +153,19 @@ class PhotoStep(FillStep):
         ctx.pgy.remove(pick)
         slots[PHOTO] = [pick]
         fc.photo_total[pick] = fc.photo_total.get(pick, 0) + 1
+        owed = ""
         if ctx.wed_pm:
             fc.photo_wed_pm[pick] = fc.photo_wed_pm.get(pick, 0) + 1
+            # [2026-07-25 使用者] 週三下午無法整除人數時,總有人要多值一次
+            # （例：5 場 2 人 → 3/2）。多出的那次記一筆「欠半天假」,之後在人多於
+            # 位子的時段優先讓他放假抵銷（見 _seat 的 owed 排序與 RestStep）。
+            if ctx.incur_debt and fc.photo_wed_pm[pick] > ctx.wed_pm_quota:
+                fc.rest_owed[pick] = fc.rest_owed.get(pick, 0) + 1
+                fc.rest_owed_total[pick] = fc.rest_owed_total.get(pick, 0) + 1
+                owed = "、超出配額 → 記補半天假"
         fc.last_photo[pick] = ctx.d
         log.append(f"{ctx.session} 照光 ← PGY {pick}"
-                   + ("（週三下午）" if ctx.wed_pm else ""))
+                   + ("（週三下午" + owed + "）" if ctx.wed_pm else ""))
 
 
 class TreatmentStep(FillStep):
@@ -189,27 +217,49 @@ def _clerk_ck(ctx, c):
     return ("clerk", ctx.batch_key, c)   # Clerk 代號跨梯會重用 → 依梯次命名空間
 
 
+def _pair_key(a, b) -> tuple:
+    """同伴計數的對稱鍵（兩人 ck 排序）——(A,B) 與 (B,A) 視為同一組。"""
+    sa, sb = str(a), str(b)
+    return (sa, sb) if sa <= sb else (sb, sa)
+
+
 def _seat(ctx, pool, room, ck, prefer: frozenset = frozenset()):
     """依 ck(人)命名空間的座位公平計數輪選並就座。
 
-    key＝(座位次數, 非偏好者, 該房次數, 連排懲罰, 抖動, 代號)：
-    總次數最少者恆優先（公平第一）；平手時 prefer 先上（Apply 本科 101 週二/五）；
-    [2026-07-24 使用者] 再比「跟過這間診的次數」少者先（每人盡量輪過 101~105 各診,
-    不固定都跟同一診）、再罰「上一次跟診就是這間」（反連排）；最後決定性抖動打散。"""
+    key＝(補假欠額, 座位次數, 非偏好者, 該房次數, 連排懲罰, 同伴次數, 抖動, 代號)：
+    [2026-07-25 使用者] 首鍵＝「欠半天假者最後才入座」——週三下午照光超出配額的人,
+    在人多於位子的時段留到最後,位子不夠時自然放假抵銷（見 PhotoStep/RestStep）。
+    這是刻意用「少跟一次診」換「多值一次週三下午」,故排在座位公平之前；欠額還清
+    （rest_owed 歸零）後立刻回到一般公平輪轉,不會持續少班。
+    其次總次數最少者優先（公平）；平手時 prefer 先上（Apply 本科 101 週二/五）；
+    [2026-07-24] 再比「跟過這間診的次數」少者先、罰「上一次跟診就是這間」（反連排）；
+    [2026-07-25 使用者] 再比「與本房已就座者共事過幾次」少者先——房多樣性只管
+    「誰跟哪一間」,管不到「誰跟誰」,故仍可能固定同兩人成對（如 1、2 號總是一起）。
+    最後決定性抖動打散。"""
     rk = str(room).strip()
     fc = ctx.fc
+    seated = ctx.seat_ck.setdefault(room, [])   # [codex R1] 房內既有者的真實 ck
 
     def _key(p):
         k = ck(ctx, p)
-        return (fc.seat.get(k, 0),
+        # 補假欠額只對 PGY 有意義（週三下午照光是 PGY 的事）；ck 首欄即命名空間
+        owed = fc.rest_owed.get(p, 0) if k[0] == "pgy" else 0
+        pair_cost = sum(fc.pair.get(_pair_key(k, q), 0) for q in seated)
+        return (1 if owed > 0 else 0,
+                fc.seat.get(k, 0),
                 0 if p in prefer else 1,
                 fc.seat_room.get((k, rk), 0),
                 1 if fc.last_seat_room.get(k) == rk else 0,
+                pair_cost,
                 _jitter(ctx.d, ctx.session, "seat", p), p)
     pick = min(pool, key=_key)
     pool.remove(pick)
-    ctx.room_slots[room].append(pick)
     k = ck(ctx, pick)
+    for q in seated:                       # 與本房已就座者各記一次共事
+        pk = _pair_key(k, q)
+        fc.pair[pk] = fc.pair.get(pk, 0) + 1
+    ctx.room_slots[room].append(pick)
+    seated.append(k)                       # 保存真實 ck 供後續同房者比對
     fc.seat[k] = fc.seat.get(k, 0) + 1
     fc.seat_room[(k, rk)] = fc.seat_room.get((k, rk), 0) + 1
     fc.last_seat_room[k] = rk
@@ -272,16 +322,23 @@ class RestStep(FillStep):
         rest_people = sorted(ctx.pgy + ctx.clerk)
         if not rest_people:
             return
+        owed_paid = []
         for p in ctx.pgy:                              # 放假計數同樣分命名空間
             k = _pgy_ck(ctx, p)
             ctx.fc.rest[k] = ctx.fc.rest.get(k, 0) + 1
             ctx.fc.last_rest[k] = ctx.d
+            # [2026-07-25 使用者] 週三下午超額者這次真的放到假 → 欠額還一次。
+            if ctx.fc.rest_owed.get(p, 0) > 0:
+                ctx.fc.rest_owed[p] -= 1
+                owed_paid.append(p)
         for c in ctx.clerk:
             k = _clerk_ck(ctx, c)
             ctx.fc.rest[k] = ctx.fc.rest.get(k, 0) + 1
             ctx.fc.last_rest[k] = ctx.d
         slots[REST] = rest_people
-        log.append(f"{ctx.session} 放假：{'、'.join(rest_people)}")
+        log.append(f"{ctx.session} 放假：{'、'.join(rest_people)}"
+                   + (f"（{'、'.join(owed_paid)} 補週三下午半天假）"
+                      if owed_paid else ""))
 
 
 PIPELINE = [PhotoStep(), TreatmentStep(), BiopsyStep(), ClerkSeedStep(),
@@ -291,14 +348,16 @@ PIPELINE = [PhotoStep(), TreatmentStep(), BiopsyStep(), ClerkSeedStep(),
 def solve_session(d: date, session: str, rooms: list, pgy_avail: list,
                   clerk_avail: list, biopsy_open: bool, fc: FairCounters,
                   capacity: int = 2, pipeline=None, batch_key: str = "",
-                  apply_pref=frozenset()) -> tuple:
+                  apply_pref=frozenset(), wed_pm_quota: int = 0,
+                  incur_debt: bool = True) -> tuple:
     """單一時段填充 → (slots, log)。slots: {房/治療室/切片室/放假: [代號,...]}。"""
     ctx = SessionCtx(
         d=d, session=session, rooms=sorted(rooms),
         pgy=sorted(pgy_avail), clerk=sorted(clerk_avail),
         biopsy_open=biopsy_open, capacity=capacity, fc=fc,
         room_slots={r: [] for r in sorted(rooms)}, batch_key=batch_key,
-        apply_pref=frozenset(apply_pref))
+        apply_pref=frozenset(apply_pref), wed_pm_quota=wed_pm_quota,
+        incur_debt=incur_debt)
     slots: dict = {}
     log: list = []
     for step in (pipeline or PIPELINE):
@@ -330,15 +389,27 @@ def _avail(roster: list, leave_map: dict, d: date) -> list:
 
 
 def replay_counters(fc: FairCounters, d: date, session: str, slots: dict,
-                    batch_key: str, pgy_set: set, clerk_set: set) -> None:
+                    batch_key: str, pgy_set: set, clerk_set: set,
+                    wed_pm_quota: int = 0, incur_debt: bool = True) -> None:
     """把「已鎖定/既存」時段結果餵進公平計數，讓後續未鎖時段對齊（不重新分配）。
-    以名單分類 PGY/Clerk 命名空間（座位/放假）；治療室→tx、切片室→biopsy。"""
+    以名單分類 PGY/Clerk 命名空間（座位/放假）；治療室→tx、切片室→biopsy。
+
+    [codex R1] 補假債務(rest_owed)也要回放,規則與 PhotoStep/RestStep 完全一致：
+    鎖定的週三下午照光若讓某人超過配額 → 記債（否則他該補的半天假被漏掉）；
+    鎖定時段裡已放到假的欠債者 → 扣債（否則之後會再補一次、變成補兩次半天）。
+    順序同求解（照光先、放假後），故同一時段內「超額當下即放假」也能正確相抵。"""
     wed_pm = (d.weekday() == WED and session == "下午")
     # 照光/治療室 key 是裸代號、PGY 代號整月穩定，stale key 不污染現役者 → 不過濾。
     for p in slots.get(PHOTO, []):
         fc.photo_total[p] = fc.photo_total.get(p, 0) + 1
         if wed_pm:
             fc.photo_wed_pm[p] = fc.photo_wed_pm.get(p, 0) + 1
+            # [codex R2] 只有【現役 PGY】才會產生補假債：鎖定格容許保留過期/非名單/
+            # 誤植的 Clerk 代號（_warn_locked_content 只警告不改內容）,那些代號不該
+            # 冒出「某某要補半天假」的假債與假警告。照光次數統計維持既有容錯不過濾。
+            if incur_debt and p in pgy_set and fc.photo_wed_pm[p] > wed_pm_quota:
+                fc.rest_owed[p] = fc.rest_owed.get(p, 0) + 1
+                fc.rest_owed_total[p] = fc.rest_owed_total.get(p, 0) + 1
         fc.last_photo[p] = d
     for p in slots.get(TREATMENT, []):
         fc.tx_total[p] = fc.tx_total.get(p, 0) + 1
@@ -362,12 +433,26 @@ def replay_counters(fc: FairCounters, d: date, session: str, slots: dict,
             if slot == REST:
                 fc.rest[k] = fc.rest.get(k, 0) + 1
                 fc.last_rest[k] = d
+                # [codex R1] 鎖定時段已放到假的欠債 PGY → 債務還清,免日後重複補假
+                if k[0] == "pgy" and fc.rest_owed.get(p, 0) > 0:
+                    fc.rest_owed[p] -= 1
             else:                         # 跟診：連同房多樣性計數一起回放
                 fc.seat[k] = fc.seat.get(k, 0) + 1
                 fc.last_seat[k] = d
                 rk = str(slot).strip()
                 fc.seat_room[(k, rk)] = fc.seat_room.get((k, rk), 0) + 1
                 fc.last_seat_room[k] = rk
+    # [2026-07-25] 同伴計數同樣回放：鎖定/跨月既存格若不算共事次數,後續未鎖時段
+    # 會以為這兩人沒配過而繼續把他們湊在一起。同房內兩兩各記一次。
+    # （獨立一圈跑,不可併進上面的 for——併進去會逐房重跑而重複計數。）
+    for slot, people in slots.items():
+        if slot in (PHOTO, TREATMENT, BIOPSY, REST):
+            continue
+        known = [p for p in people if p in pgy_set or p in clerk_set]
+        for i, a in enumerate(known):
+            for b in known[i + 1:]:
+                pk = _pair_key(_ck(a), _ck(b))
+                fc.pair[pk] = fc.pair.get(pk, 0) + 1
 
 
 def _warn_locked_content(warnings: list, d: date, session: str, locked_slots: dict,
@@ -391,18 +476,48 @@ def _warn_locked_content(warnings: list, d: date, session: str, locked_slots: di
 
 
 def month_solve_day(inp: DaySolveInput) -> tuple:
-    """整月逐（工作日×早/午）填充 → (day_slots, log, warnings)。
+    """整月填充 → (day_slots, log, warnings)。【兩趟求解】以兌現週三下午補假。
+
+    [codex R2] 為什麼要跑兩趟：單趟逐日貪婪只能在「債務產生之後」找空檔補假,若超額
+    發生在月底最後幾個時段,月初明明有空檔也補不到（而且無從得知,只能事後警告）。
+    第一趟先問出「誰、整月共欠幾次半天假」（rest_owed_total）,第二趟把債務【從月初就
+    預先掛上】,那些人一遇到有空檔的時段就先補假。
+    這樣做安全的前提（已驗證）：照光/治療室的人選只取決於 photo_*/tx_* 計數,與座位/
+    放假完全無關 → 兩趟的照光指派必然相同,故第一趟算出的欠額對第二趟仍然成立;
+    第二趟以 incur_debt=False 避免重複累加。無人欠債時直接用第一趟結果（不重跑）。
+    """
+    first_slots, first_log, first_warn, fc1 = _solve_month_once(inp)
+    incurred = {p: n for p, n in fc1.rest_owed_total.items() if n > 0}
+    if not incurred:
+        return first_slots, first_log, first_warn
+    return _solve_month_once(inp, preset_owed=incurred)[:3]
+
+
+def _solve_month_once(inp: DaySolveInput, preset_owed: "dict | None" = None
+                      ) -> tuple:
+    """單趟整月逐（工作日×早/午）填充 → (day_slots, log, warnings, fc)。
 
     day_slots: {iso: {session: {slot: [代號]}}}；warnings: 人話警告清單。
     - 治療室每個非假日工作日每時段都需 1 PGY（含週三下午，即使跟診關閉）。
     - Clerk 逐日只取「當日所屬兩週梯次」的成員（跨梯不互相借人）。
+    preset_owed: 第二趟用——月初即掛上的補假債；同時停止再次累加（見 month_solve_day）。
     """
     fc = FairCounters()
+    incur_debt = preset_owed is None
+    if preset_owed:
+        fc.rest_owed = dict(preset_owed)
     day_slots: dict = {}
     log: list = []
     warnings: list = []
     pgy_leave = (inp.leaves.get("pgy") or {})
     clerk_leave = (inp.leaves.get("clerk") or {})
+    # [2026-07-25 使用者] 週三下午照光配額：本月週三下午場次 ÷ PGY 人數（整除部分）。
+    # 例：4 場 2 人 → 每人 2 次,無人超額；5 場 2 人 → 配額 2,拿到第 3 次者記補半天假。
+    # 以「本月排定的週三」估算(不扣請假——請假是動態的,配額只當門檻;真正的平均仍由
+    # photo_wed_pm 主鍵保證)。
+    n_wed_pm = sum(1 for d in inp.grid if not is_weekend(d) and d.weekday() == WED)
+    n_pgy = len(inp.pgy_roster or [])
+    wed_pm_quota = (n_wed_pm // n_pgy) if n_pgy else 0
 
     # RF-09：先把上月跨月梯次的既存班表餵進 fc（只餵切片室與 clerk 座位/放假；跳過
     # 治療室與上月 PGY，避免污染本月 PGY 月度公平），讓「本梯未輪過切片」的判定與月底
@@ -459,7 +574,8 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
                 _warn_locked_content(warnings, d, session, locked_slots,
                                      pgy_set, clerk_set, pgy_leave, clerk_leave)
                 replay_counters(fc, d, session, locked_slots, batch_key,
-                                pgy_set, clerk_set)
+                                pgy_set, clerk_set, wed_pm_quota=wed_pm_quota,
+                                incur_debt=incur_debt)
                 log.append(f"{d.month}/{d.day}({'一二三四五六日'[d.weekday()]}) "
                            f"{session} 🔒鎖定（不重排）")
                 continue
@@ -471,7 +587,8 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
                 _avail(inp.pgy_roster, pgy_leave, d),
                 _avail(clerk_members, clerk_leave, d),
                 biopsy, fc, inp.capacity, batch_key=batch_key,
-                apply_pref=inp.apply_pref)
+                apply_pref=inp.apply_pref, wed_pm_quota=wed_pm_quota,
+                incur_debt=incur_debt)
             day_slots.setdefault(iso, {})[session] = slots
             log.append(f"{d.month}/{d.day}({'一二三四五六日'[d.weekday()]}) "
                        + "；".join(slog))
@@ -495,6 +612,18 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
             f"梯次重疊：{d1.isoformat()}～{d2.isoformat()} 由梯次 {win} 與 {lose} "
             f"同時涵蓋，重疊日只採 {win}，{lose} 成員該期間不會被排班——請修正梯次起始日")
 
+    # [codex R1/R2/R3] 補假債務未兌現 → 點名示警,不得靜默丟棄。
+    # ★措辭鐵律：只陳述【程式確知】的事。這裡唯一確知的是「沒排到」——不可宣稱
+    # 「整月各時段皆滿編」(常見情況其實是別人有放假、只是欠債者每次都被照光/治療室
+    # 徵召走;照光/治療室的次數平均是硬需求,不會為了補假讓賢)。第一版寫「本月已無
+    # 可用空檔」、第二版寫「各時段皆滿編」都是程式沒驗證過的推斷,連兩輪被 codex 抓。
+    unpaid = sorted((p, n) for p, n in fc.rest_owed.items() if n > 0)
+    if unpaid:
+        warnings.append(
+            "週三下午多值、自動排班未能排到補假時段："
+            + "、".join(f"{p}×{n}" for p, n in unpaid)
+            + "（多半是每逢空檔時該員都被照光/治療室徵召）—— 請視情況手動安排半天假")
+
     # 切片室輪不到：只對「本月確有工作日被排」的梯次示警（否則邊界梯次會誤報）
     for b in inp.clerk_batches:
         if b.id not in solved_batch_ids:
@@ -504,7 +633,7 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
         if missed:
             warnings.append(f"切片室輪不到（梯次 {b.id}，本梯內未排到）："
                             + "、".join(missed))
-    return day_slots, log, warnings
+    return day_slots, log, warnings, fc
 
 
 # ─── 週期統計（2026-07-23 使用者需求）────────────────────────────────────────

@@ -437,6 +437,68 @@ class ConsecutiveDutyRule(Rule):
 
 
 @register_rule
+class WeekendCapRule(Rule):
+    scope = "r"
+    kind = "soft"
+    rule_id = "weekend_cap"
+    描述 = ("[2026-07-25 使用者] 每人每月最多值 2 個週末（含週六的區塊；週六+週日同段"
+          "算一個）。R 有 3 人、一個月至多 5 個週末 → 上限 2 在算術上恆可滿足"
+          "（ceil(5/3)=2）,不該有人值到 3 個週末。純軟規則:硬約束（指定/年度假日表/"
+          "跨月銜接/請假逼出的唯一解）照常成立,本規則只在可行解之間挑週末較平均的。")
+
+    WEEKEND_CAP = 2
+
+    @staticmethod
+    def _weekend_blocks(ctx) -> list:
+        """只算「含本月週六」的區塊。月初孤兒週日屬上月那個週末（其週六在上月、
+        由跨月銜接固定給上月人選）→ 不計入本月週末數,否則會誤判超標。"""
+        return [b for b in ctx.blocks if b.saturday is not None]
+
+    def precheck(self, ctx):
+        blocks = self._weekend_blocks(ctx)
+        n = len(ctx.members)
+        if n <= 1 or not blocks:
+            return []
+        if len(blocks) > self.WEEKEND_CAP * n:
+            return [Precheck(
+                "warn", self.rule_id,
+                f"本月 {len(blocks)} 個週末 ÷ {n} 人，每人最多 "
+                f"{self.WEEKEND_CAP} 個在算術上不可能 → 必有人超標（僅提示，"
+                f"仍會盡量平均）")]
+        return []
+
+    @staticmethod
+    def over_weight(ctx, blocks) -> int:
+        """[codex R1] 動態權重：必須嚴格大於「把一個週末段換人」所能造成的點數目標變動,
+        否則即使存在人人 ≤2 個週末的可行解,求解器仍可能保留第 3 個。
+
+        推導：把一個 P 點的週末段從甲移到乙,會【同時】改變兩人的絕對偏差,最壞各 P 點
+        → 2P 點。1.0 點 dev = 100(scale)×POINT_WEIGHT = 1,000,000（見 PointBalanceRule）
+        → 上界 = 2×P×100×POINT_WEIGHT,取 +1 以嚴格支配。P 取本月週末段的最大點數
+        （含國定假日鏈進來的長連休段,例：五六日 = 1+2+2 = 5 點,比預設週六日 4 點更大——
+        我第一版寫死 4,000,000 正是漏算了「雙人」與「長連休段」這兩件事）。
+        代價：極端情況下會為了守住上限而犧牲一些點數公平,但那份差額會進帳本、下月自動
+        找補（與 ConsecutiveDutyRule 同一套邏輯），符合使用者「仍要盡量最多兩個週末」。"""
+        max_pts = max((b.points(ctx.holidays, ctx.params) for b in blocks),
+                      default=0)
+        return 2 * max_pts * 100 * POINT_WEIGHT + 1
+
+    def objective_terms(self, mc, ctx):
+        blocks = self._weekend_blocks(ctx)
+        if len(ctx.members) <= 1 or not blocks:
+            return []
+        weight = self.over_weight(ctx, blocks)
+        terms = []
+        for m in ctx.members:
+            # 區塊內各日已由 WeekendBlockRule 綁成同一人 → 取代表日 days[0] 即可
+            cnt = sum(mc.x[(b.days[0], m.id)] for b in blocks)
+            over = mc.model.NewIntVar(0, len(blocks), f"wkover_{m.id}")
+            mc.model.Add(over >= cnt - self.WEEKEND_CAP)   # 下界 0 → over=max(0,超額)
+            terms.append((over, weight))
+        return terms
+
+
+@register_rule
 class DutyCountBalanceRule(Rule):
     kind = "soft"
     rule_id = "count_balance"
