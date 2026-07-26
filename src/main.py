@@ -3844,6 +3844,40 @@ def _load_f8_quick_text() -> str:
     return value
 
 
+_COORD_DETECTOR_TITLE_KW = "座標與顏色偵測器"
+
+
+def _coord_detector_window_open() -> bool:
+    """座標偵測器是否還開著(不論它是不是前景)。
+
+    [2026-07-26 外審] 量座標時前景本來就是被量的那個視窗(HIS),所以判斷不能用前景,
+    要看它的視窗【存不存在】。列舉頂層視窗比對標題;任何失敗都回 False(fail-open:
+    寧可照常輸入,也不要因為偵測不到就讓 F8 整個失效)。"""
+    found = [False]
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND,
+                                         wintypes.LPARAM)
+
+    @EnumWindowsProc
+    def _cb(hwnd, _lparam):
+        try:
+            if not ctypes.windll.user32.IsWindowVisible(hwnd):
+                return True
+            if _COORD_DETECTOR_TITLE_KW in (_get_window_text(hwnd) or ""):
+                found[0] = True
+                return False
+        except Exception:
+            pass
+        return True
+
+    try:
+        ctypes.windll.user32.EnumWindows(_cb, 0)
+    except Exception:
+        logging.debug("F8: 列舉視窗判斷座標偵測器失敗(照常輸入)", exc_info=True)
+        return False
+    return found[0]
+
+
 def script_F8_quick_text():
     """F8: 快速輸入文字到目前 focused 控件。
     文字從 settings (quick_text_f8) 讀，預設 A126585189。
@@ -3859,6 +3893,17 @@ def script_F8_quick_text():
     kb = getattr(hotkey_modules, 'keyboard', None)
     if kb is None:
         logging.warning("F8: keyboard 模組未就緒，跳過")
+        return
+    # [2026-07-26 審查 ★誤打字進 HIS★] 座標偵測器【也用 F8】(它的記錄熱鍵),而 F8 在
+    # NO_GUARD_HOTKEYS 裡、刻意跳過醫院視窗檢查 → 任何 app 都會觸發。
+    # ★關鍵(外審指正)★ 判斷條件【不能】是「偵測器是不是前景」——量座標的整個重點就是
+    # 量【別的視窗】:偵測器只設 topmost、不搶前景,使用者是點開 HIS 要量的畫面、
+    # 把滑鼠移到目標位置再按 F8。那一刻前景是 HIS,舊寫法的守衛完全不會生效,
+    # 身分證字號照樣被打進病歷/醫令欄 —— 保護了不重要的情況、漏掉真正危險的那個。
+    # 正確條件:只要偵測器【還開著】,F8 就是它的記錄熱鍵,主程式一律不注入文字。
+    if _coord_detector_window_open():
+        logging.info("F8: 座標偵測器開著 → 跳過快速輸入"
+                     "(此時 F8 是它的記錄熱鍵,注入文字會打進正在量測的視窗)")
         return
     # [2026-07-26 審查] F8 是【對 HIS 欄位注入文字】的外部動作,卻是唯一沒進稽核帳本的
     # 熱鍵。帳本的用途正是「事後查得出程式對 HIS 做過什麼」——改版/欄位漂移把文字打到
