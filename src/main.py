@@ -9179,6 +9179,41 @@ def _parse_appt_item_for_alert(appt_item):
 # 完全靜默的:兩條寄送路徑都只是 `if not recipients: return False` / `if rcpts:`,
 # 沒有任何 log。使用者看到功能開著、門檻也設了,信卻永遠不來,而且查 log 也查不到原因。
 # 這裡做節流告警(同一天只講一次),避免掃描迴圈洗版。
+_REG64_TABLE_MISSING_LOGGED: dict = {}
+
+
+def _log_reg64_table_missing_once(room_code, had_light_anchor: bool,
+                                  is_closed: bool, is_stopped: bool) -> None:
+    """reg64 找不到病人清單表格時留一則診斷(每個診間每天一次)。
+
+    [2026-07-26 審查] 只記錄、不改變行為 —— 見呼叫點說明。記下「燈號錨點有沒有出現」
+    是關鍵鑑別資訊:錨點有=頁面是對的但表格不見了(可疑);錨點也沒有=多半根本不是該頁面。
+
+    [外審] 節流鍵必須含【訊號等級】,不能只用 (診間, 日期):
+    同一診間清晨常因未開診而合法缺表(低訊號),若那筆先佔掉當天的額度,
+    稍後真正要蒐證的「看診中、有燈號錨點、表格卻不見」(高訊號)就永遠不會被記下 ——
+    等於這個診斷專門漏掉唯一有價值的案例。
+    """
+    try:
+        today_s = datetime.now().strftime("%Y-%m-%d")
+        # 高訊號 = 頁面是對的(有錨點)、而且正在看診(非關診/未開診),表格卻不見了。
+        level = ("high" if (had_light_anchor and not is_closed and not is_stopped)
+                 else "low")
+        key = (str(room_code), level)
+        if _REG64_TABLE_MISSING_LOGGED.get(key) == today_s:
+            return
+        _REG64_TABLE_MISSING_LOGGED[key] = today_s
+        logging.warning(
+            "[reg64] 診間 %s 找不到病人清單表格(bgcolor=#fffff0)——"
+            "現場人數會顯示 0。訊號=%s、燈號錨點=%s、已關診=%s、未開診=%s。"
+            "若當下實際【有】候診病人,請把這行提供給開發者"
+            "(本日每診間、每種訊號各記一次)",
+            room_code, level, "有" if had_light_anchor else "無",
+            is_closed, is_stopped)
+    except Exception:
+        logging.debug("[reg64] 表格缺失診斷記錄失敗", exc_info=True)
+
+
 _ALERT_NO_RECIPIENT_WARNED_DAY = [""]
 
 
@@ -11548,6 +11583,17 @@ class AutomationApp:
                     light_num = m2.group(1)
             
             table = soup.find('table', attrs={'bgcolor': '#fffff0'})
+            # [2026-07-26 審查] 這個選擇器是寫死的 bgcolor。若網站改版,table 會是 None →
+            # 下面 total/waiting/completed 全部維持 0,而回傳的 status 仍是「更新成功」
+            # → 畫面顯示「現場 0 人等待」,醫師看到的是一個【空診間】,而不是「讀取失敗」。
+            # 【刻意不改行為、只留證據】:我不知道這個頁面在「今天真的還沒有病人」時
+            # 會不會渲染這張表 —— 若不會,把「表格不存在」當成改版就會在最需要顯示的時刻
+            # 誤報,那正是 2026-07-16 打卡 portal 撤回過的錯誤(見 punch_status 註解)。
+            # 先讓實機日誌累積:等看到「有燈號錨點、卻沒有表格」的實際案例與當下情境,
+            # 才有依據決定要不要升級成錯誤狀態。節流成每個診間每天一次,不洗版。
+            if table is None:
+                _log_reg64_table_missing_once(room_code, bool(match_light),
+                                              is_closed, is_stopped)
             total_count = 0 
             waiting_count = 0
             completed_count = 0 
