@@ -9175,6 +9175,33 @@ def _parse_appt_item_for_alert(appt_item):
     return (session_name, count, is_stopped, ext_branch, room)
 
 
+# [2026-07-26 審查 ★該來的信永遠不來★] 「觸發了止掛提醒、但收件人清單是空的」原本是
+# 完全靜默的:兩條寄送路徑都只是 `if not recipients: return False` / `if rcpts:`,
+# 沒有任何 log。使用者看到功能開著、門檻也設了,信卻永遠不來,而且查 log 也查不到原因。
+# 這裡做節流告警(同一天只講一次),避免掃描迴圈洗版。
+_ALERT_NO_RECIPIENT_WARNED_DAY = [""]
+
+
+def _warn_alert_has_no_recipients(where: str, *,
+                                  threshold_reached: bool = True) -> None:
+    """收件人清單是空的 → 告警不會寄出。節流成一天一次(掃描是分鐘級迴圈,不節流會洗版)。
+
+    threshold_reached:呼叫點是否【已經確認有診次達到門檻】。
+    [外審] 措辭必須跟呼叫點確知的事實一致 —— 遠期掃描是在【還沒檢查任何診次之前】
+    就因為沒有收件人而返回,那時說「已達門檻」是程式不知道的事。
+    """
+    today_s = datetime.now().strftime("%Y-%m-%d")
+    if _ALERT_NO_RECIPIENT_WARNED_DAY[0] == today_s:
+        return
+    _ALERT_NO_RECIPIENT_WARNED_DAY[0] = today_s
+    what = ("已達止掛門檻但【收件人清單是空的】→ 這封提醒不會寄出"
+            if threshold_reached else
+            "【收件人清單是空的】→ 本輪不執行(就算有診次達門檻也不會通知)")
+    logging.warning(
+        "[ALERT] %s:%s。請到設定頁的「止掛提醒收件人」加入 email(本日只提示一次)",
+        where, what)
+
+
 def _send_alert_email_via_smtp(subject: str, body: str,
                                 recipients: list, timeout: float = 60.0) -> bool:
     """達到門檻時透過 SMTP (Gmail) 寄信。回傳是否成功（失敗只 log，不影響主程式）。
@@ -9184,6 +9211,7 @@ def _send_alert_email_via_smtp(subject: str, body: str,
     成功但信永遠卡在隱形 Outbox 寄不出。SMTP 跳過整個 UAC 跟 Outlook profile
     地獄，admin/user 任何權限都能寄。設定見 settings/smtp_credentials.json。"""
     if not recipients:
+        _warn_alert_has_no_recipients("SMTP 寄信")
         return False
     try:
         from cmuh_common.smtp_mail import (
@@ -14817,6 +14845,8 @@ class AutomationApp:
                                                                     if self._claim_alert_email(nk):
                                                                         try:
                                                                             rcpts = list(self.alert_email_recipients)
+                                                                            if not rcpts:
+                                                                                _warn_alert_has_no_recipients("行事曆止掛通知")
                                                                             if rcpts:
                                                                                 if _send_alert_email_via_smtp(
                                                                                         subj, m, rcpts):
@@ -15442,6 +15472,8 @@ class AutomationApp:
                 return
             recipients = list(self.alert_email_recipients)
             if not recipients:
+                # [外審] 這裡是【還沒檢查任何診次】就返回 —— 不可沿用「已達門檻」的措辭。
+                _warn_alert_has_no_recipients("遠期止掛掃描", threshold_reached=False)
                 return
 
             today = today or date.today()
