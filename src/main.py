@@ -2341,26 +2341,41 @@ def _wm_settext_timeout(hwnd: int, text: str, timeout_ms: int = 2500) -> int:
         return 0
 
 
-def _wm_gettext_timeout(hwnd: int, timeout_ms: int = 2500) -> str:
-    """WM_GETTEXTLENGTH + WM_GETTEXT，走 SendMessageTimeout(SMTO_ABORTIFHUNG)。
-    理由同 _wm_settext_timeout（避免讀文字時被凍住的醫院 app 永久阻塞）。"""
+def _wm_gettext_timeout_ex(hwnd: int, timeout_ms: int = 2500):
+    """同 _wm_gettext_timeout,但額外回傳「這次讀取有沒有成功」。回 (text, ok)。
+
+    [2026-07-26 審查] 舊介面對【逾時/視窗凍住】與【欄位真的是空的】都回 ""——
+    呼叫端無法區分,於是「讀不到」被當成「欄位是空的」而放行寫入(見 _set_療程_only
+    的原值合理性檢查)。ok=False 代表「不知道欄位裡是什麼」,呼叫端該保守中止。
+    """
     try:
-        n = _send_message_timeout(hwnd, 0x000E, 0, 0,
-                                  timeout_ms=timeout_ms)  # WM_GETTEXTLENGTH
+        ok, n = _send_message_timeout_ex(hwnd, 0x000E, 0, 0,
+                                         timeout_ms=timeout_ms)  # WM_GETTEXTLENGTH
+        if not ok:
+            return "", False
         try:
             n = int(n)
         except (TypeError, ValueError):
             n = 0
         if n <= 0:
-            return ""
+            return "", True          # 真的是空欄位(訊息有回應)
         buf = ctypes.create_unicode_buffer(n + 1)
         addr = ctypes.cast(buf, ctypes.c_void_p).value or 0
-        _send_message_timeout(hwnd, 0x000D, n + 1, addr,
-                              timeout_ms=timeout_ms)  # WM_GETTEXT
-        return buf.value or ""
+        ok2, _ = _send_message_timeout_ex(hwnd, 0x000D, n + 1, addr,
+                                          timeout_ms=timeout_ms)  # WM_GETTEXT
+        if not ok2:
+            return "", False
+        return (buf.value or ""), True
     except Exception:
         logging.debug("_wm_gettext_timeout 失敗 hwnd=%s", hwnd, exc_info=True)
-        return ""
+        return "", False
+
+
+def _wm_gettext_timeout(hwnd: int, timeout_ms: int = 2500) -> str:
+    """WM_GETTEXTLENGTH + WM_GETTEXT，走 SendMessageTimeout(SMTO_ABORTIFHUNG)。
+    理由同 _wm_settext_timeout（避免讀文字時被凍住的醫院 app 永久阻塞）。
+    無法區分「讀取失敗」與「空欄位」;需要區分請用 _wm_gettext_timeout_ex。"""
+    return _wm_gettext_timeout_ex(hwnd, timeout_ms)[0]
 
 
 def _send_chars_to_window(hwnd: int, text: str) -> bool:
@@ -2557,11 +2572,23 @@ def _set_療程_only(main_hwnd: int, value, label: str = "") -> bool:
         return False
     # [UD-05 audit 2026-07-12] 寫入前正向把關(比照 _set_身份_自費):療程欄合法原值=空白或個位
     # 數字(1/2/3)。定位到的欄原值若「非空且非個位數」→ 疑似版面漂移抓錯窄欄 → 不寫,交醫師手動,
-    # 避免把 1/2/3 寫進別欄(且身份欄以療程為錨、連帶錯)。讀不到(空)則放行,由寫後 verify 兜底。
+    # 避免把 1/2/3 寫進別欄(且身份欄以療程為錨、連帶錯)。
+    # [2026-07-26 審查] 舊版把「讀不到」與「欄位是空的」都當成空字串放行 —— 但
+    # _wm_gettext_timeout 對【逾時/視窗凍住】也回 ""。HIS 卡住時等於整個原值把關被繞過:
+    # 抓錯欄位也照寫。改用帶狀態的讀取,讀取本身失敗就不寫(這道把關存在的理由就是
+    # 「不確定就不要寫」,而讀不到正是最不確定的情況)。
     try:
-        _療程_before = (_read_tmemo_text(liaocheng_hwnd) or "").strip()
+        _療程_raw, _read_ok = _wm_gettext_timeout_ex(liaocheng_hwnd)
+        _療程_before = (_療程_raw or "").strip()
     except Exception:
-        _療程_before = ""
+        _療程_before, _read_ok = "", False
+    if not _read_ok:
+        logging.warning("[%s] 療程欄原值讀取失敗(逾時/視窗無回應)→ 不寫,交醫師手動", label)
+        _show_uvb_warning(main_hwnd, "療程未自動設定",
+                          f"讀不到療程欄目前的內容(醫院程式無回應),\n"
+                          f"為避免寫錯欄位,療程沒有自動設定。\n"
+                          f"請醫師手動把療程改成 {value}。")
+        return False
     if _療程_before and not re.fullmatch(r"\d", _療程_before):
         logging.warning("[%s] 療程欄原值 %r 不像療程(非空且非個位數)→ 疑似定位錯欄,不寫",
                         label, _療程_before)
@@ -3905,7 +3932,14 @@ def _f11_handle_pain(hwnd: int, label: str = "") -> bool:
     time.sleep(0.15)
     check_stop()
 
+    # [外審 R5] 預設 False:只有 BM_GETCHECK 回讀確認「0 分已選取」才算成功。
+    # 預設 True 的話,連一個 TGroupButton 都找不到(popup 版面改版)時完全沒有驗證,
+    # 卻照樣回報成功 → watcher 標記 handled、不再重試,疼痛指數一直沒設。
+    radio_ok = False
     radios = _enum_class_in_window(hwnd, "TGroupButton")
+    if not radios:
+        logging.warning("[%s]   疼痛指數 popup 內找不到任何 TGroupButton(版面改版?)"
+                        "→ 沒有勾到 0 分,本 handler 回報未完成", label)
     if radios:
         from collections import Counter
         tops = Counter(r[1] for r in radios)
@@ -3913,14 +3947,40 @@ def _f11_handle_pain(hwnd: int, label: str = "") -> bool:
         same_row = sorted([r for r in radios if r[1] == target_top],
                            key=lambda r: r[2])
         if len(same_row) >= 6:
-            _post_click_to_control(same_row[0][0])
-            logging.info("[%s]   已勾 0 radio (hwnd=%s)", label, same_row[0][0])
+            _radio_hwnd = same_row[0][0]
+            _post_click_to_control(_radio_hwnd)
             time.sleep(0.08)
+            # [2026-07-26 審查] 開迴路動作要回讀。原本直接 log「已勾 0 radio」——
+            # 那是【推斷】:PostMessage 送出去 ≠ radio 真的被選取(Delphi 的
+            # TGroupButton 在 disabled/尚未 paint 完時吃掉訊息是常見的)。
+            # 用 BM_GETCHECK 回讀;沒選到就照實說,別讓 log 顯示成功。
+            try:
+                _checked = _send_message_timeout(_radio_hwnd, 0x00F0, 0, 0)  # BM_GETCHECK
+            except Exception:
+                _checked = 0
+            if _checked:
+                radio_ok = True
+                logging.info("[%s]   已勾 0 radio (hwnd=%s,回讀確認)",
+                             label, _radio_hwnd)
+            else:
+                logging.warning(
+                    "[%s]   0 radio 送出點擊後回讀【未選取】(hwnd=%s)—— 仍會點「處理」"
+                    "讓流程不卡住,但本 handler 回報未完成(疼痛指數可能沒設定)",
+                    label, _radio_hwnd)
         else:
             logging.warning("[%s]   量表 row 只 %d 個 radios，跳過勾選",
                               label, len(same_row))
     check_stop()
 
+    if not radio_ok:
+        # [2026-07-26 外審 R6] 沒確認勾到 0 分就【不要點「處理」】。
+        # 上一版仍然點下去,結果 popup 關閉 → watcher 的
+        # `if ok or not popup_still_open` 照樣標記 handled → 永遠不會重試,
+        # 疼痛指數就這樣沒被設定。不點的話 popup 留著:watcher 會重試(最多 3 次),
+        # 都失敗時 popup 仍開著,醫師看得到、可以手動處理 —— 這比靜默送出好。
+        logging.warning("[%s]   未確認勾到 0 分 → 不點「處理」,保留 popup 交由重試/醫師處理",
+                        label)
+        return False
     if _click_button_normalized_text(hwnd, "處理"):
         logging.info("[%s]   已點 處理", label)
         _wait_window_closed(hwnd, timeout=5)
@@ -6303,6 +6363,14 @@ def _send_message_timeout(hwnd: int, msg: int, wparam: int, lparam: int,
     一旦縮寫功能（使用者多半開著）碰過原生欄位，這裡若用 c_long → byref 型別
     不符 → ctypes.ArgumentError（症狀：F9/F10 點「局麻」radio 時整個流程當掉，
     且與螢幕解析度無關）。用 c_size_t 對「有設/沒設 argtypes」兩種情況都正確。"""
+    return _send_message_timeout_ex(hwnd, msg, wparam, lparam,
+                                    timeout_ms=timeout_ms)[1]
+
+
+def _send_message_timeout_ex(hwnd: int, msg: int, wparam: int, lparam: int,
+                             timeout_ms: int = 2000):
+    """同 _send_message_timeout,但回 (ok, result)。ok=False 代表逾時/失敗 ——
+    此時 result 沒有意義(呼叫端不可把它當成對方視窗的真實回覆)。"""
     result = ctypes.c_size_t(0)
     SMTO_ABORTIFHUNG = 0x0002
     SendMessageTimeoutW = ctypes.windll.user32.SendMessageTimeoutW
@@ -6311,7 +6379,8 @@ def _send_message_timeout(hwnd: int, msg: int, wparam: int, lparam: int,
                                 ctypes.byref(result))
     if ret == 0:
         logging.debug("SendMessageTimeout 失敗或超時 hwnd=%s msg=0x%X", hwnd, msg)
-    return result.value
+        return False, result.value
+    return True, result.value
 
 
 # Kernel32 argtypes 顯式設定 — 64-bit Python ctypes 預設把指標當 c_int (4 bytes)
@@ -9223,6 +9292,10 @@ class AutomationApp:
         self._save_cache_latest = {}
         self._avg_history_cache = {}  # [優化] 快取歷史平均，避免每次重算
         self._refresh_worker_running = False
+        # [2026-07-26 外審] refresh 世代:worker 完成後的 UI 收尾(root.after 排到
+        # main thread 才跑)必須確認「我還是最新的那一輪」,否則舊 worker 的 callback
+        # 會在新 worker 執行中把 UI 顯示成『閒置』並重新啟用按鈕。
+        self._refresh_generation = 0
         self._queued_refresh_requests = deque()
         self._queued_refresh_signatures = set()
         self._active_refresh_signature = None
@@ -12832,8 +12905,23 @@ class AutomationApp:
         logging.info(f"--- Triggering refresh (manual={is_manual}) ---")
         req_signature = _build_refresh_signature(is_manual, specific_doctors)
 
-        if self._refresh_worker_running:
-            with self._refresh_queue_lock:
+        # [2026-07-26 外審 R4] 檢查、入列、搶旗標必須在【同一個臨界區】內。
+        # worker 現在是在鎖內清旗標並抽乾佇列的,所以「鎖外檢查」有真實空窗:
+        # 呼叫端讀到 True → 還沒拿到鎖 → worker 清完旗標並把佇列抽乾 →
+        # 呼叫端才拿到鎖並把請求 append 進去 → 那筆請求【永遠不會有人接手】,
+        # 刷新就這樣靜默消失。
+        _queued_size = None
+        _my_refresh_gen = 0      # 只有搶到旗標的那條路徑會用到(見下方 return)
+        with self._refresh_queue_lock:
+            if not self._refresh_worker_running:
+                self._active_refresh_signature = req_signature
+                # [stability r4] 同步搶下單飛旗標(原本只在 worker 內才設)。否則 submit 後、
+                # worker 設旗標前的空窗內,下一個 _trigger_refresh 讀到 False→跳過去重→
+                # 重複 submit 同一刷新,對掛號站送雙倍請求、惡化 backoff。
+                self._refresh_worker_running = True
+                self._refresh_generation += 1
+                _my_refresh_gen = self._refresh_generation
+            else:
                 if req_signature == self._active_refresh_signature or req_signature in self._queued_refresh_signatures:
                     logging.info(f"Duplicate refresh request skipped. signature={req_signature}")
                     return
@@ -12868,16 +12956,11 @@ class AutomationApp:
                         return
                 self._queued_refresh_requests.append((is_manual, specific_doctors, req_signature))
                 self._queued_refresh_signatures.add(req_signature)
-                qsize = len(self._queued_refresh_requests)
-            logging.info(f"Refresh already running; queued request. queue_size={qsize}")
+                _queued_size = len(self._queued_refresh_requests)
+        if _queued_size is not None:
+            logging.info(
+                f"Refresh already running; queued request. queue_size={_queued_size}")
             return
-        with self._refresh_queue_lock:
-            self._active_refresh_signature = req_signature
-            # [stability r4] 在 main thread 同步搶下單飛旗標(原本只在 worker 內 9137 才設，
-            # 而 worker 是 bg_executor 非同步才跑到那行)。否則 submit 後、worker 設旗標前的
-            # 空窗內，下一個 _trigger_refresh 讀到 False→跳過去重→重複 submit 同一刷新，
-            # 對掛號站送雙倍請求、惡化 backoff。同步設定後同 signature 會被 9073 去重正確攔下。
-            self._refresh_worker_running = True
 
         if specific_doctors is None:
             now_ts = time.time()
@@ -12931,21 +13014,41 @@ class AutomationApp:
                     if bi < len(batches) - 1:
                         time.sleep(0.18)
             finally:
-                self._refresh_worker_running = False
+                # [2026-07-26 外審] 清除端要與設定端在【同一個臨界區】內,而且順序是
+                # 「先清 signature、取出佇列,最後才把 running 設 False」。
+                # 舊版先在鎖外把 running 設 False:那一瞬間 main thread 若觸發新的
+                # refresh B,B 會看到 False 而啟動並寫入自己的 active signature,
+                # 接著本 worker 才進鎖把【B 的】signature 清成 None →
+                # B 執行期間的同款請求無法去重(重複打掛號站)、本 worker 的完成 callback
+                # 還會把仍在刷新中的 UI 顯示成「閒置」並重新啟用按鈕。
                 with self._refresh_queue_lock:
                     self._active_refresh_signature = None
                     queued_request = self._queued_refresh_requests.popleft() if self._queued_refresh_requests else None
                     if queued_request is not None:
                         self._queued_refresh_signatures.discard(queued_request[2])
+                    self._refresh_worker_running = False
                 refresh_time = datetime.now().strftime('%H:%M:%S')
 
-                def _on_refresh_worker_done(rt=refresh_time, qr=queued_request):
-                    self._cancel_pending_refresh_tick_ui()
-                    self.refresh_button.config(state="normal")
-                    self.last_refresh_text.set(f"更新: {rt}")
-                    if self._heavy_modules_ready:
-                        self.startup_phase_text.set("完成")
-                    self.status_text.set(f"狀態: 閒置（最新更新: {rt}）")
+                def _on_refresh_worker_done(rt=refresh_time, qr=queued_request,
+                                            gen=_my_refresh_gen):
+                    # [外審] 歸屬驗證:排隊期間若已有新一輪 refresh 啟動,這個 callback
+                    # 就不是「目前狀態」的擁有者 —— 只處理佇列接力,不可把 UI 改成閒置
+                    # 或重新啟用按鈕(那會在新一輪執行中謊報已完成)。
+                    _owns_ui = (gen == self._refresh_generation)
+                    if not _owns_ui:
+                        logging.debug(
+                            "[refresh] 完成 callback 世代 %s != 目前 %s → 不動 UI 狀態,"
+                            "但完成記帳與佇列接力照做", gen, self._refresh_generation)
+                    else:
+                        self._cancel_pending_refresh_tick_ui()
+                        self.refresh_button.config(state="normal")
+                        self.last_refresh_text.set(f"更新: {rt}")
+                        if self._heavy_modules_ready:
+                            self.startup_phase_text.set("完成")
+                        self.status_text.set(f"狀態: 閒置（最新更新: {rt}）")
+                    # [外審 R6] 非 UI 的完成記帳【不可】因為世代不符而被丟掉 ——
+                    # 這一輪 full refresh 確實完成了,快照/時間戳是後續「要不要重抓」
+                    # 的依據;漏記會讓下一次判斷以為資料很舊而重複整批抓。
                     if specific_doctors is None:
                         with self._doctor_data_lock:
                             self._last_full_refresh_snapshot = deepcopy(self.all_doctors_data)
@@ -12971,12 +13074,14 @@ class AutomationApp:
             logging.warning("掛號刷新背景工作未啟動：背景佇列已滿")
 
             def _reset_rejected_refresh():
+                # [2026-07-26 外審] 同上:running 旗標要在鎖內、且【最後】才清,
+                # 否則會清掉下一個 refresh 剛寫入的 signature。
                 with self._refresh_queue_lock:
                     self._active_refresh_signature = None
                     queued_request = self._queued_refresh_requests.popleft() if self._queued_refresh_requests else None
                     if queued_request is not None:
                         self._queued_refresh_signatures.discard(queued_request[2])
-                self._refresh_worker_running = False
+                    self._refresh_worker_running = False
                 self._cancel_pending_refresh_tick_ui()
                 self.refresh_button.config(state="normal")
                 self.status_text.set("狀態: 背景佇列忙碌，刷新稍後重試")
