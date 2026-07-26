@@ -9147,8 +9147,21 @@ def _send_alert_email_via_smtp(subject: str, body: str,
         logging.warning("smtp_mail 模組載入失敗，止掛信跳過", exc_info=True)
         return False
     try:
-        send_mail(recipients=recipients, subject=subject, body=body,
-                  attachment_path=None, timeout=timeout)
+        refused = send_mail(recipients=recipients, subject=subject, body=body,
+                            attachment_path=None, timeout=timeout) or {}
+        if refused:
+            # [2026-07-26 外審] send_mail 的回傳值【不可】丟掉:部分收件人被拒時
+            # smtplib 是正常返回的,舊版一律回 True → 呼叫端把這則告警記成「已寄出」
+            # 並永久去重 → 那些人這輩子都收不到這則止掛/稽核/改版告警,而且無跡可循。
+            #
+            # 為什麼仍回 True(而不是 False):至少有一個人收到了,這則事件確實已發出。
+            # 回 False 會讓呼叫端不記錄去重 → 每個掃描週期都重寄 → 已收到的人被重複
+            # 轟炸,而被拒的位址(打錯字/不存在)不會因為重寄就變好。真正的修法是把
+            # 錯的收件人改掉,所以這裡把「誰沒收到」用 error 級別講清楚給人看。
+            logging.error(
+                "[ALERT] 「%s」有收件人沒收到信:%s —— 請檢查收件人設定(位址打錯/"
+                "信箱已滿);其餘收件人已送達,本則不會重寄以免重複轟炸",
+                subject, ", ".join(sorted(str(r) for r in refused)))
         return True
     except SmtpNotConfiguredError as e:
         logging.warning("止掛提醒寄信跳過（SMTP 尚未設定）：%s", e)

@@ -195,16 +195,36 @@ def read_today_swipes(driver, username: str, password: str, *,
 
         # 系統日期(ROC) → 用來只挑今日的列;失敗退回本機日期
         sys_date = _date.today()
+        _sys_date_parsed = False
+        _sys_date_raw = ""
         try:
-            txt = driver.find_element(By.ID, "lb_systime").text
-            if "年" in txt:
-                y = int(txt.split("年")[0])
-                m = int(txt.split("年")[1].split("月")[0])
-                d = int(txt.split("月")[1].split("日")[0])
+            _sys_date_raw = driver.find_element(By.ID, "lb_systime").text
+            if "年" in _sys_date_raw:
+                y = int(_sys_date_raw.split("年")[0])
+                m = int(_sys_date_raw.split("年")[1].split("月")[0])
+                d = int(_sys_date_raw.split("月")[1].split("日")[0])
                 sys_date = _date(y + 1911, m, d)
+                _sys_date_parsed = True
         except Exception:
-            logging.debug("[punch] 解析網站日期失敗,用本機日期", exc_info=True)
+            logging.debug("[punch] 讀/解析網站系統日期例外", exc_info=True)
+        if not _sys_date_parsed:
+            # [2026-07-26 審查 + 外審] 這是「改用本機日期猜」的降級。
+            # 舊版只在【拋例外】時記 debug —— 但 lb_systime 存在卻是空字串、ISO 日期、
+            # 或改版成不含「年」的格式時【不會拋例外】,`if "年" in txt` 直接不成立,
+            # 於是靜默沿用本機日期:本機時鐘/時區一偏差就挑不到今日的列 → 誤報沒打卡。
+            # 用明確的 parsed 旗標,任何沒解析成功的情況都要看得見。
+            logging.warning(
+                "[punch] 解析網站系統日期失敗(原文=%r),改用本機日期 %s —— "
+                "本機時鐘若有偏差可能挑錯今日列而誤報未打卡",
+                (_sys_date_raw or "")[:40], sys_date)
 
+        # [2026-07-16 已定案,勿再改] **不可**把「#Gv_attppre 表格不存在」當成 portal 改版:
+        # 空的 ASP.NET GridView(當日尚無刷卡紀錄)本來就【完全不渲染 <table>】,
+        # 表格不在 = 今天還沒打卡,不是改版。把它當改版會在「早上未打卡」——最該顯示
+        # 未打卡的時刻——變成「查詢失敗」而隱藏最重要的訊號。
+        # commit d9f38be 已為此撤回過一次完整實作;main.py 約 1353 行也留有同樣的說明。
+        # 登入成功由 lb_systime 錨點保護;表格層級【沒有】可靠的改版信號,不做勝過做錯。
+        # (2026-07-26 我又寫了一次同樣的偵測,被外審擋下 —— 動這裡之前先讀這段。)
         rows = driver.execute_script("""
             var rows = document.querySelectorAll("#Gv_attppre tbody tr");
             var data = [];

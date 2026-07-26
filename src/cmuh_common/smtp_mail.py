@@ -118,6 +118,12 @@ class SmtpNotConfiguredError(RuntimeError):
     """SMTP 設定不完整（通常是 password 為空）。"""
 
 
+# [2026-07-26 審查] 本次執行中最後一次【成功讀到】的設定檔內容。
+# 用途:設定檔被防毒/備份短暫鎖住時,不要讓「讀不到」被當成「沒設定」而靜默停用所有寄信
+# (見 load_credentials 的 "error" 分支)。只放記憶體、不落盤。
+_LAST_GOOD_CREDENTIALS: dict = {}
+
+
 def ensure_credentials_template() -> None:
     """[opt B1] 若 SMTP 設定檔不存在，建立預設範本供使用者填入 App Password。
     只在啟動 / 設定視窗開啟時呼叫一次 —— 與『讀取』分離，避免讀路徑(每 20s 的 IMAP
@@ -151,8 +157,29 @@ def load_credentials() -> dict:
                 logging.error(
                     "SMTP 設定檔 %s 內容無法解析(可能存成 ANSI/cp950 或非 JSON);已保留原檔未搬移,"
                     "請用『UTF-8』重新存檔。在修好前寄信/收信會停用。", CREDENTIALS_FILE)
+            elif _status == "error":
+                # [2026-07-26 審查 ★所有告警一起消失★] 檔案還在、只是【暫時】讀不到
+                # (防毒/備份掃描時鎖住)。舊版把 default({}) 當成合法內容 → password 空
+                # → is_configured() 回 False → 呼叫端「自然靜默跳過」,止掛提醒/會診通知/
+                # 改版通知【全部不寄】而且【一行 log 都沒有】。
+                # 這裡沿用上一次成功讀到的帳密:檔案沒變、值一定還是對的,寄信照常;
+                # 沒有快取(開機後第一次就讀不到)才退回停用,並且一定要留下 log。
+                if _LAST_GOOD_CREDENTIALS:
+                    logging.warning(
+                        "SMTP 設定檔暫時讀不到(檔案仍在,可能被防毒/備份鎖住)→ "
+                        "沿用本次執行中上一次成功讀到的設定,寄信不中斷:%s", CREDENTIALS_FILE)
+                    cred.update(_LAST_GOOD_CREDENTIALS)
+                else:
+                    logging.error(
+                        "SMTP 設定檔暫時讀不到且本次執行尚未成功讀過(檔案仍在,可能被防毒/"
+                        "備份鎖住)→ 這段期間【所有通知信都不會寄出】:%s", CREDENTIALS_FILE)
             elif isinstance(saved, dict):
                 cred.update(saved)
+                # [外審] 成功讀到就【無條件】換掉快取,空 dict 也算 —— 舊寫法用 `if saved`
+                # 守著,於是使用者刻意把設定清空({})之後,下一次暫時讀取失敗會把
+                # 【舊帳密復活】,把已經關掉的寄信又打開。成功讀到 = 這才是現況。
+                _LAST_GOOD_CREDENTIALS.clear()
+                _LAST_GOOD_CREDENTIALS.update(saved)
     except Exception:
         logging.warning("讀取 SMTP 設定失敗，使用內建預設", exc_info=True)
     # 正規化
@@ -220,8 +247,15 @@ def _build_message(sender_address: str, sender_name: str,
     return msg
 
 
-def _send_once(cred: dict, msg, timeout: float) -> None:
-    """單次 SMTP 寄送嘗試 — 失敗會 raise 給 caller 判斷是否重試。"""
+def _send_once(cred: dict, msg, timeout: float) -> dict:
+    """單次 SMTP 寄送嘗試 — 失敗會 raise 給 caller 判斷是否重試。
+
+    [2026-07-26 審查 ★假成功★] 回傳 `send_message` 的【被拒收件人 dict】。
+    smtplib 只有在【全部】收件人都被拒時才拋 SMTPRecipientsRefused;只有一部分被拒
+    (信箱打錯、對方信箱滿)時是【正常返回】並把被拒者放在回傳值裡。舊版把它丟掉,
+    於是那些人永遠收不到止掛提醒/會診通知,而 log 寫著「SMTP 已寄出(→ 全部人)」——
+    故障與正常完全長得一樣。
+    """
     host, port = cred["host"], cred["port"]
     use_tls = cred["use_tls"]
     if port == 465:
@@ -230,7 +264,7 @@ def _send_once(cred: dict, msg, timeout: float) -> None:
         with smtplib.SMTP_SSL(host, port, timeout=timeout,
                                context=context) as server:
             server.login(cred["username"], cred["password"])
-            server.send_message(msg)
+            return server.send_message(msg) or {}
     else:
         # 587 STARTTLS（Gmail 推薦）或 25 明文（不建議）
         with smtplib.SMTP(host, port, timeout=timeout) as server:
@@ -246,7 +280,7 @@ def _send_once(cred: dict, msg, timeout: float) -> None:
                     "拒絕在無 TLS 下對非本機 SMTP 傳送帳密(use_tls=False);"
                     "請改用 587+STARTTLS 或 465 SSL。")
             server.login(cred["username"], cred["password"])
-            server.send_message(msg)
+            return server.send_message(msg) or {}
 
 
 def _is_loopback_host(host) -> bool:
@@ -286,8 +320,12 @@ def send_mail(recipients: list, subject: str, body: str,
               timeout: float = 60.0,
               override_credentials: Optional[dict] = None,
               max_retries: int = DEFAULT_MAX_RETRIES,
-              html_body: Optional[str] = None) -> None:
+              html_body: Optional[str] = None) -> dict:
     """同步寄一封信。失敗 raise；成功 log info。
+
+    回傳【被拒收件人】的 dict(空 dict = 全部送達)。[2026-07-26 審查]
+    smtplib 只在【全部】收件人被拒時才拋例外,部分被拒是正常返回 —— 呼叫端若要
+    嚴格處理(例如標記某位收件人長期收不到),看這個回傳值。
 
     recipients: list of "x@y.z"
     attachment_path: None 或 Path（會自動判斷 image / generic）
@@ -321,9 +359,10 @@ def send_mail(recipients: list, subject: str, body: str,
     reservation = _reserve_rate_limit_slot()
 
     import time as _time
+    refused: dict = {}
     for attempt in range(max_retries + 1):
         try:
-            _send_once(cred, msg, timeout)
+            refused = _send_once(cred, msg, timeout) or {}
             if attempt > 0:
                 logging.info("SMTP 第 %d 次重試成功", attempt)
             break  # success
@@ -363,5 +402,21 @@ def send_mail(recipients: list, subject: str, body: str,
             _rollback_rate_limit_slot(reservation)
             raise
 
-    logging.info("SMTP 已寄出（%s → %s）：%s",
-                 cred["from_address"], ", ".join(recipients), subject)
+    # [2026-07-26 審查 ★假成功★] 部分收件人被拒時 smtplib 是【正常返回】的,
+    # 舊版直接印「已寄出 → 全部人」。實際上那些人一封都沒收到,而這些信正是
+    # 止掛提醒/會診通知/改版通知 —— 收不到就等於那個人的告警永久失效,且無跡可循。
+    if refused:
+        _bad = sorted(str(r) for r in refused)
+        _ok = [r for r in recipients if r not in refused]
+        logging.error(
+            "SMTP 部分收件人被拒(這些人【沒有】收到信):%s;實際送達:%s。主旨:%s。"
+            "被拒原因:%s",
+            ", ".join(_bad), ", ".join(_ok) or "(無)", subject, refused)
+        logging.info("SMTP 已寄出（%s → %s）：%s",
+                     cred["from_address"], ", ".join(_ok) or "(無)", subject)
+    else:
+        logging.info("SMTP 已寄出（%s → %s）：%s",
+                     cred["from_address"], ", ".join(recipients), subject)
+    # 回傳被拒清單(空 dict = 全部送達)。刻意【不 raise】:已送達的人不該因為重試而收到
+    # 重複的信;呼叫端要更嚴格處理可以看這個回傳值。
+    return refused
