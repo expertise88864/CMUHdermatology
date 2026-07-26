@@ -5073,9 +5073,35 @@ def _find_療程_edit_hwnd(main_hwnd: int) -> int:
     if not narrow:
         logging.warning("頂部 row 找不到窄欄位 (療程)，回 0")
         return 0
+    # [2026-07-26 審查 ★寫錯欄位★] 原本直接取 narrow[0] —— 沒有任何結構驗證。
+    # 上面的 rel_y 80-135 是【寬頻帶】,在非最大化視窗可能同時框到「療程排」與
+    # 「診斷排」(_find_身份_edit_hwnd 的註解就記著這個定位脆弱點)。兩排混在一起再
+    # 依 left 排序,最左的窄欄位未必是療程 → 療程次數被寫進別的欄位,而且【寫回不回讀】。
+    # 正面辨識:療程與類別是【同一排的兩個相鄰窄欄位】(probe 在 1280x1024 與 1920x1080
+    # 都是這個結構)。先依 top 分排,取「該排至少有兩個窄欄位」的那一排;找不到或有多排
+    # 都符合(無法區分)→ 回 0 交人工,不猜。
+    rows: list = []          # [(top, [窄欄位…])]
+    for e in sorted(narrow, key=lambda x: (x[2], x[1])):
+        for row in rows:
+            if abs(e[2] - row[0]) <= 8:
+                row[1].append(e)
+                break
+        else:
+            rows.append((e[2], [e]))
+    candidate_rows = [row for row in rows if len(row[1]) >= 2]
+    if len(candidate_rows) != 1:
+        logging.warning(
+            "療程定位放棄:窄欄位分成 %d 排、其中有兩個以上窄欄位的排有 %d 排"
+            "(需要剛好 1 排 = 療程+類別)。各排:%s",
+            len(rows), len(candidate_rows),
+            [(row[0] - main_r.top, [(e[0], e[1] - main_r.left, e[3])
+                                    for e in row[1]]) for row in rows])
+        return 0
+    row_fields = sorted(candidate_rows[0][1], key=lambda e: e[1])
     # 左到右第一個窄欄位 = 療程 (第二個 = 類別)
-    療程_hwnd = narrow[0][0]
-    logging.info("療程 hwnd=%s (頂部 row 第 1 個窄欄位 w<50)", 療程_hwnd)
+    療程_hwnd = row_fields[0][0]
+    logging.info("療程 hwnd=%s (療程排 rel_y=%s 的第 1 個窄欄位,同排共 %d 個)",
+                 療程_hwnd, candidate_rows[0][0] - main_r.top, len(row_fields))
     return 療程_hwnd
 
 
@@ -5680,18 +5706,43 @@ def _find_window_by_class_title(class_name: str, title_kw: str = "",
     # while True FindWindowExW loop 一定 return (hwnd or 0)，下面永遠到不了。
 
 
+def _collect_windows_by_class(class_name: str, title_kw: str = "",
+                              require_pid: int = 0) -> tuple:
+    """[2026-07-26 審查] 列出目前【已存在】的同 class 視窗,給呼叫端在觸發新視窗之前
+    先拍快照、之後用 exclude_hwnds 排除。
+
+    需要它的原因:`_wait_for_window` 是「找到就回傳」——上一次流程留下沒關的同意書/
+    片語視窗會讓它【立刻回傳舊視窗】,後續整段操作都打在舊視窗上,而且表面上完全正常
+    (視窗有、按鈕點得到、log 一路綠)。
+    內部重複呼叫 `_find_window_by_class_title` 並把找到的逐一排除,直到找不到為止。"""
+    found: list = []
+    for _ in range(32):        # 上限防禦:正常最多一兩個,不會無限長
+        hwnd = _find_window_by_class_title(class_name, title_kw,
+                                           require_pid=require_pid,
+                                           exclude_hwnds=tuple(found))
+        if not hwnd:
+            break
+        found.append(hwnd)
+    return tuple(found)
+
+
 def _wait_for_window(class_name: str, title_kw: str = "",
                        timeout: float = 10.0,
                        exclude_hwnd: int = 0,
                        poll_sec: float = 0.03,
-                       require_pid: int = 0) -> int:
+                       require_pid: int = 0,
+                       exclude_hwnds: tuple = ()) -> int:
     """每 poll_sec 找一次，最多等 timeout 秒。回傳 hwnd 或 0。
     poll_sec 預設 30ms (比早期 100ms 快 — 對 F9/F10 警告 dialog 反應更即時)。
-    [H1] require_pid 非 0 時只等【該 HIS 行程】的視窗(不會被別程式的同 class 對話框攔截)。"""
+    [H1] require_pid 非 0 時只等【該 HIS 行程】的視窗(不會被別程式的同 class 對話框攔截)。
+    [2026-07-26 審查] exclude_hwnds:呼叫前【已存在】的同 class 視窗。不排除的話,
+    上一次流程留下沒關的視窗會讓本函式【立刻回傳那個舊視窗】,後續全部操作都打在
+    舊視窗上(而且看起來完全正常)。"""
     end = time.time() + timeout
     while time.time() < end:
         hwnd = _find_window_by_class_title(class_name, title_kw, exclude_hwnd,
-                                           require_pid=require_pid)
+                                           require_pid=require_pid,
+                                           exclude_hwnds=exclude_hwnds)
         if hwnd:
             return hwnd
         _sleep_interruptible(min(poll_sec, max(0.0, end - time.time())))
@@ -5729,13 +5780,80 @@ class _ForegroundProtector:
         self._stop = threading.Event()
         self._thread = None
         self.tracked_user_hwnd = 0
+        self._tracked_identity = None   # (pid, class) —— 見 _tracked_still_valid
         self._restore_count = 0
+        self._his_pid = 0
+
+    @staticmethod
+    def _window_identity(hwnd: int):
+        """視窗身分 = (PID, class, title)。用來偵測 HWND 被回收後換了個視窗。
+        取不到 PID(視窗已消失)回 None。
+
+        [外審 R4] 只用 (PID, class) 擋不住「同一個程式關掉一個視窗、又開一個同 class
+        的新視窗」剛好拿到同一個 HWND(例:瀏覽器關一個視窗再開一個)。加上標題後,
+        這種情況幾乎必然被偵測到(不同分頁/文件標題不同)。
+        三者【全都相同】時仍會被當成同一個視窗 —— 那代表同程式、同類型、同標題,
+        把焦點還回去本來就無害,不值得為它引入 SetWinEventHook 這種重機制。
+        代價方向也對:標題合法變動導致誤判失效,後果只是「暫時不保護」,
+        使用者下次點回該視窗就會重新追蹤。"""
+        pid = _get_window_pid(hwnd)
+        if not pid:
+            return None
+        try:
+            n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(max(0, n) + 1)
+            ctypes.windll.user32.GetWindowTextW(hwnd, buf, max(0, n) + 1)
+            title = buf.value
+        except Exception:
+            title = ""
+        return (pid, _get_class_name_of(hwnd), title)
+
+    def _track(self, hwnd: int, ident=None) -> None:
+        self.tracked_user_hwnd = hwnd
+        self._tracked_identity = ident or self._window_identity(hwnd)
+
+    def _tracked_still_valid(self) -> bool:
+        """[2026-07-26 外審 R2] 只檢查 IsWindow 不夠:視窗在兩次輪詢(300ms)之間關閉、
+        HWND 又被【回收】給另一個視窗時,IsWindow 仍為真 → SetForegroundWindow 會把
+        焦點搶去那個毫不相干的新視窗。故連 (PID, class) 身分一起比對。"""
+        if not self.tracked_user_hwnd:
+            return False
+        if not ctypes.windll.user32.IsWindow(self.tracked_user_hwnd):
+            return False
+        if self._tracked_identity is None:
+            return False
+        return self._window_identity(self.tracked_user_hwnd) == self._tracked_identity
+
+    def _is_hospital_window(self, hwnd: int, cls: str) -> bool:
+        """[2026-07-26 審查] 醫院視窗要【class + 行程】兩者都對。
+
+        只比 class 的話,別的 Delphi 程式(class 名稱本來就容易撞)一取得前景就會被
+        當成「醫院搶焦點」→ 保護器把使用者正在用的視窗搶回去,反而是它在搶焦點。
+        取不到 HIS PID 時一律回 False(= 不做保護)—— 見下方說明。"""
+        if cls not in HOSPITAL_WINDOW_CLASSES:
+            return False
+        if not self._his_pid:
+            # [外審 R3] 不可退回「只比 class」:HOSPITAL_WINDOW_CLASSES 裡有 #32770
+            # (Windows 標準對話框,任何程式都在用)→ 別的程式一跳存檔/警告框就會被當成
+            # 「醫院搶焦點」,保護器反而把使用者正在用的視窗搶走。
+            # 認不出 HIS 就【不做保護】(頂多焦點被 HIS 搶走=困擾),絕不亂搶。
+            return False
+        # [外審] HIS PID 已知時,候選視窗的 PID 取不到【不可】當成醫院視窗 ——
+        # 那正是「class 撞名的別程式視窗」最可能發生的情況,放行等於這個修正沒做。
+        # 退回只比 class 的後備只適用於「連 HIS PID 都拿不到」。
+        return _get_window_pid(hwnd) == self._his_pid
 
     def start(self):
+        # HIS 行程 PID:用來把「醫院視窗」與「剛好同 class 的別程式視窗」分開。
+        try:
+            his_main = _find_hospital_main_window()
+            self._his_pid = _get_window_pid(his_main) if his_main else 0
+        except Exception:
+            self._his_pid = 0
         # 初始：若 foreground 是非醫院視窗，先記下來（保護它）
         cur = ctypes.windll.user32.GetForegroundWindow()
-        if cur and _get_class_name_of(cur) not in HOSPITAL_WINDOW_CLASSES:
-            self.tracked_user_hwnd = cur
+        if cur and not self._is_hospital_window(cur, _get_class_name_of(cur)):
+            self._track(cur)
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run, name="F9_F10_ForegroundProtector", daemon=True)
@@ -5760,18 +5878,28 @@ class _ForegroundProtector:
                     time.sleep(POLL_SEC)
                     continue
                 cur_cls = _get_class_name_of(cur)
-                is_hospital = cur_cls in HOSPITAL_WINDOW_CLASSES
+                is_hospital = self._is_hospital_window(cur, cur_cls)
+                # [2026-07-26 審查] 追蹤的視窗關掉後要【清掉】。舊版只在 restore 前
+                # 檢查 IsWindow 卻不清空 —— Windows 會回收 HWND 值,同一個數字之後可能
+                # 屬於【別的視窗(甚至 HIS 自己的)】,那時 SetForegroundWindow 就把焦點
+                # 拉到一個使用者根本沒在用的視窗。
+                if self.tracked_user_hwnd and not self._tracked_still_valid():
+                    logging.debug(
+                        "ForegroundProtector 追蹤視窗 %s 已關閉或 HWND 被回收 → 清除追蹤",
+                        self.tracked_user_hwnd)
+                    self.tracked_user_hwnd = 0
+                    self._tracked_identity = None
                 if is_hospital:
                     # 醫院視窗成為 foreground。如果使用者有追蹤的非醫院視窗，
                     # 就 restore 它。否則 (使用者本來就在醫院視窗) 不動。
-                    if (self.tracked_user_hwnd
-                            and ctypes.windll.user32.IsWindow(self.tracked_user_hwnd)):
+                    if self.tracked_user_hwnd:
                         ctypes.windll.user32.SetForegroundWindow(self.tracked_user_hwnd)
                         self._restore_count += 1
                 else:
                     # 非醫院視窗 = 使用者「真的」想用的視窗，記下來
-                    if cur != self.tracked_user_hwnd:
-                        self.tracked_user_hwnd = cur
+                    ident = self._window_identity(cur)
+                    if cur != self.tracked_user_hwnd or ident != self._tracked_identity:
+                        self._track(cur, ident)
                         logging.debug("ForegroundProtector tracked=%s (%s)",
                                        cur, cur_cls)
             except Exception:
@@ -5953,7 +6081,9 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
         logging.warning(
             "[%s] 無法取得同意書 popup 的 HIS 行程 PID → 不自動確認 #32770 警告框"
             "(fail-closed,避免誤按別程式對話框),請醫師手動按「是」", label)
-        return True
+        # [2026-07-26 審查] 這裡是【交給醫師手動】,不是流程完成 —— 回 True 會讓呼叫端
+        # 記「整段 F9/F10 流程完成」、UI 顯示「操作完成」,醫師看到就走了。回 False。
+        return False
 
     # Step B: 等警告對話框出現 (class #32770)
     # title 可能是 "警告" 或其他變體，用 class 即可
@@ -5961,8 +6091,10 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
                             exclude_hwnd=popup_hwnd, require_pid=popup_pid)
     t_dlg_appeared = time.time()
     if not dlg:
-        logging.info("[%s] 沒等到警告對話框 (可能直接送出)", label)
-        return True
+        # [2026-07-26 審查] 「可能直接送出」是推測。程式確知的只有「沒看到警告框」——
+        # 用可觀察的事實(popup 有沒有關)來判定,不用推測當成功。
+        logging.info("[%s] 沒等到警告對話框,改以同意書 popup 是否關閉判定", label)
+        return _f9_f10_wait_consent_popup_closed(popup_hwnd, label=label)
     server_resp_ms = (t_dlg_appeared - t_clicked) * 1000
     logging.info("[%s] 警告對話框 hwnd=%s (server 處理 %.0fms — 自然延遲)",
                   label, dlg, server_resp_ms)
@@ -5986,6 +6118,13 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
         check_stop()
     t_dlg_closed = time.time()
     dlg_close_ms = (t_dlg_closed - t_idyes_posted) * 1000
+    # [2026-07-26 審查] 迴圈也可能是【逾時】才離開 —— 那代表「是」沒被接受,
+    # 舊版照樣印「已關」並繼續往下走到 return True。要先確認它真的關了。
+    if ctypes.windll.user32.IsWindow(dlg):
+        logging.warning(
+            "[%s] 警告對話框送出 IDYES 後 5 秒仍未關閉(hwnd=%s)→ 無法確認已送出,"
+            "回報未完成,請醫師確認同意書狀態", label, dlg)
+        return False
     logging.info("[%s] 警告對話框已關 (是→關 %.0fms — server 寫入時間)",
                   label, dlg_close_ms)
 
@@ -6021,8 +6160,36 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
             if not ctypes.windll.user32.IsWindow(dlg2):
                 break
             time.sleep(0.05)
+        if ctypes.windll.user32.IsWindow(dlg2):
+            # [外審 R3] 已知有一個確認框沒被解掉 → 不可回報成功。即使同意書 popup
+            # 剛好也關了(可能是別的原因),「還有確認框開著」本身就是未完成的事實。
+            logging.warning(
+                "[%s] 第二個對話框送出 IDYES/IDOK 後仍未關閉(hwnd=%s)→ 回報未完成,"
+                "請醫師確認該對話框與同意書狀態", label, dlg2)
+            return False
         logging.info("[%s] 第二個對話框處理完", label)
-    return True
+    return _f9_f10_wait_consent_popup_closed(popup_hwnd, label=label)
+
+
+def _f9_f10_wait_consent_popup_closed(popup_hwnd: int, *, label: str = "",
+                                      timeout: float = 5.0) -> bool:
+    """[2026-07-26 審查 ★假成功★] 等同意書 popup 真的關閉 —— 這是本流程唯一可觀察的
+    「送出完成」訊號(上面 poll 的 exit 條件 (a) 就是這樣判定的)。
+
+    舊版最後無條件 `return True`:警告框沒關、第二個對話框沒關、popup 還開著,
+    通通回報成功 → 呼叫端記「Round 4 完成 (整段 F9/F10 流程完成)」、UI 顯示「操作完成」。
+    醫師看到完成訊息就走了,同意書其實沒送出 —— 故障與正常長得一模一樣。
+    """
+    end_t = time.time() + max(0.0, timeout)
+    while time.time() < end_t:
+        if not ctypes.windll.user32.IsWindow(popup_hwnd):
+            return True
+        time.sleep(0.05)
+        check_stop()
+    logging.warning(
+        "[%s] 同意書 popup 在 %.1fs 後仍開著(hwnd=%s)→ 無法確認已送出,回報未完成。"
+        "請醫師確認同意書狀態", label, timeout, popup_hwnd)
+    return False
 
 
 def _enum_direct_children(parent_hwnd: int,
@@ -6487,6 +6654,18 @@ def _select_phrase_and_return(片語_btn_hwnd: int, row_idx: int,
 
     Default 高亮列 = row 0（user 觀察）。若 row_idx > 0 就 VK_DOWN row_idx 次。
     """
+    # [2026-07-26 審查] 同 TOrMain:先記下已存在的片語 popup 與 HIS PID,只認新開的。
+    # PID 取自片語按鈕本身 —— 它是同意書 popup 的子控件,必屬 HIS 行程。
+    _his_pid = _get_window_pid(片語_btn_hwnd)
+    if not _his_pid:
+        logging.warning("[%s] 取不到片語按鈕的 HIS 行程 PID → 不自動選片語"
+                        "(fail-closed,避免選到別行程的片語視窗),請醫師手動操作", label)
+        return False
+    _stale_phrase = _collect_windows_by_class("TfrmOrrSentence", "請選擇片語",
+                                              require_pid=_his_pid)
+    if _stale_phrase:
+        logging.warning("[%s] 點片語前已存在 %d 個片語 popup %s → 一律排除,只認新開的",
+                        label, len(_stale_phrase), _stale_phrase)
     # 點 片語 button (async, opens TfrmOrrSentence popup)
     if not _post_click_to_control(片語_btn_hwnd):
         logging.warning("[%s] 點 片語 button 失敗", label)
@@ -6495,7 +6674,9 @@ def _select_phrase_and_return(片語_btn_hwnd: int, row_idx: int,
 
     # Wait for 片語 popup (timeout 8s)
     phrase_popup = _wait_for_window("TfrmOrrSentence",
-                                      title_kw="請選擇片語", timeout=8)
+                                      title_kw="請選擇片語", timeout=8,
+                                      require_pid=_his_pid,
+                                      exclude_hwnds=_stale_phrase)
     if not phrase_popup:
         logging.warning("[%s] 等不到 TfrmOrrSentence popup", label)
         return False
@@ -6534,16 +6715,19 @@ def _select_phrase_and_return(片語_btn_hwnd: int, row_idx: int,
         return False
     logging.info("[%s] 已點 帶回", label)
 
-    # 等 popup 關閉（class TfrmOrrSentence 消失）
+    # 等 popup 關閉 —— [2026-07-26 審查] 要等【這一個 hwnd】關,不可用 class 全域找:
+    #  (a) 殘留的舊 popup 會讓全域查詢一直有結果 → 每個片語都白等滿 5 秒,最後還回 True;
+    #  (b) 沒關成功卻回 True → 片語根本沒帶回,流程照樣進 Round 4 送出同意書。
     end_t = time.time() + 5
     while time.time() < end_t:
-        if not _find_window_by_class_title("TfrmOrrSentence", "請選擇片語"):
+        if not ctypes.windll.user32.IsWindow(phrase_popup):
             logging.info("[%s] 片語 popup 已關閉", label)
             return True
         time.sleep(0.1)
         check_stop()
-    logging.warning("[%s] 片語 popup 未在 5 秒內關閉（可能仍卡）", label)
-    return True  # 還是回 True 讓主流程繼續
+    logging.warning("[%s] 片語 popup(hwnd=%s)未在 5 秒內關閉 → 片語可能沒帶回,"
+                    "回報未完成,交醫師確認", label, phrase_popup)
+    return False
 
 
 def _find_descendants_by_exact_text(parent_hwnd: int, target_class: str,
@@ -6771,6 +6955,23 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
     if not main_hwnd:
         logging.warning("[%s] 找不到主程式視窗", label)
         return False
+    # [2026-07-26 審查] 送命令【之前】先記下已存在的同意書視窗與 HIS PID:
+    #  - 舊視窗沒排除 → _wait_for_window 會立刻回傳上一次殘留的 TOrMain,
+    #    接下來整段 R1-R4 都打在舊視窗上(表面上完全正常);
+    #  - 不限定 PID → 別程式剛好有同 class 視窗時會被攔截。
+    _his_pid = _get_window_pid(main_hwnd)
+    if not _his_pid:
+        # [外審] require_pid=0 等於【關掉】行程過濾 —— 另一個 HIS instance 的同意書視窗
+        # 會被選中,最後對錯的行程/病人送出同意書。Round 4 對取不到 PID 早就是 fail-closed,
+        # 這條同樣是身分敏感路徑,取捨要一致。
+        logging.warning("[%s] 取不到主程式視窗的 HIS 行程 PID → 不自動開同意書"
+                        "(fail-closed,避免對錯的行程送出),請醫師手動操作", label)
+        return False
+    _stale_ormain = _collect_windows_by_class("TOrMain", "同意書開立作業",
+                                              require_pid=_his_pid)
+    if _stale_ormain:
+        logging.warning("[%s] 送出同意書命令前已存在 %d 個同意書視窗 %s → 一律排除,"
+                        "只認新開的", label, len(_stale_ormain), _stale_ormain)
     # 用 Post (非同步) 避免 SendMessage 卡住 (實測 2026-05-18 12:43)
     if not _send_yiling_menu_command(main_hwnd, MENU_ID_同意書):
         logging.warning("[%s] 同意書 WM_COMMAND 送出失敗", label)
@@ -6782,14 +6983,16 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
     # (reg52.cgi 500 error 同期間) 導致 8s 不夠 → TOrMain 沒開出來。25s 給
     # server slow 時段充裕時間。retry 一次防偶發 message lost。
     or_hwnd = _wait_for_window("TOrMain", title_kw="同意書開立作業",
-                                 timeout=25)
+                                 timeout=25, require_pid=_his_pid,
+                                 exclude_hwnds=_stale_ormain)
     if not or_hwnd:
         logging.warning("[%s] 等 TOrMain 25s 超時，重 Post WM_COMMAND 再試 1 次", label)
         if not _send_yiling_menu_command(main_hwnd, MENU_ID_同意書):
             logging.warning("[%s] 同意書 retry WM_COMMAND 送出失敗", label)
             return False
         or_hwnd = _wait_for_window("TOrMain", title_kw="同意書開立作業",
-                                     timeout=15)
+                                     timeout=15, require_pid=_his_pid,
+                                     exclude_hwnds=_stale_ormain)
         if not or_hwnd:
             logging.warning(
                 "[%s] 重試後仍等不到 TOrMain — 可能醫院後端慢/同意書系統未啟動",
