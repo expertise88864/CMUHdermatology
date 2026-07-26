@@ -3796,16 +3796,40 @@ def script_F8_quick_text():
     if not text:
         logging.info("F8: quick_text 為空，跳過")
         return
-    logging.info("--- Executing F8 (快速輸入 %r) ---", text)
+    # [2026-07-26 審查] 【不可】把 quick text 原文寫進 log:預設值就是身分證字號格式,
+    # 使用者也可能設成病歷號等 PII,而 automation_ui.log 是 RotatingFileHandler
+    # 持久保存並輪替備份的。只記長度。
+    logging.info("--- Executing F8 (快速輸入 %d 字) ---", len(text))
     kb = getattr(hotkey_modules, 'keyboard', None)
     if kb is None:
         logging.warning("F8: keyboard 模組未就緒，跳過")
         return
+    # [2026-07-26 審查] F8 是【對 HIS 欄位注入文字】的外部動作,卻是唯一沒進稽核帳本的
+    # 熱鍵。帳本的用途正是「事後查得出程式對 HIS 做過什麼」——改版/欄位漂移把文字打到
+    # 錯的地方時,沒有紀錄就查不出來。目標欄位是「當下焦點」,連 target 都無法事先確定,
+    # 更需要留痕。記的是欄位識別與長度,不記內容(內容可能是病歷號等 PII)。
+    _focus_hwnd = 0
+    _focus_cls = ""
+    try:
+        _fg = ctypes.windll.user32.GetForegroundWindow()
+        _focus_hwnd = _get_thread_focus(_fg) if _fg else 0
+        _focus_cls = _get_class_name_of(_focus_hwnd) if _focus_hwnd else ""
+    except Exception:
+        logging.debug("F8: 取焦點控件失敗(不影響輸入)", exc_info=True)
     try:
         kb.write(text)
         logging.info("F8: 已輸入 %d 字", len(text))
+        _record_his_action(
+            _LEDGER_HIS_FIELD, "F8 快速輸入",
+            target=f"focus:{_focus_cls or '未知'}#{_focus_hwnd}",
+            value=f"len={len(text)}", outcome=_LEDGER_OK)
     except Exception:
         logging.error("F8: keyboard.write 失敗", exc_info=True)
+        _record_his_action(
+            _LEDGER_HIS_FIELD, "F8 快速輸入",
+            target=f"focus:{_focus_cls or '未知'}#{_focus_hwnd}",
+            value=f"len={len(text)}", outcome=_LEDGER_FAILED,
+            detail="keyboard.write 例外")
 
 
 # =============================================================================
@@ -3853,7 +3877,14 @@ def _click_button_normalized_text(parent_hwnd: int, target_text: str) -> int:
 
     ctypes.windll.user32.EnumChildWindows(parent_hwnd, cb, 0)
     if out[0]:
-        _post_click_to_control(out[0])
+        # [2026-07-26 審查] _post_click_to_control 的回傳值原本被丟掉 —— 找得到按鈕、
+        # 但 PostMessage 沒送成功(視窗剛被關掉、佇列滿)時仍回傳 hwnd,呼叫端
+        # `if _click_button_normalized_text(...)` 就當成「已點」往下走,實際沒點到。
+        # 送不出去就回 0,讓呼叫端走既有的失敗分支(重試/警告),不假裝成功。
+        if not _post_click_to_control(out[0]):
+            logging.warning("[F11] 找到按鈕 %r(hwnd=%s)但點擊訊息送出失敗",
+                            target_text, out[0])
+            return 0
     return out[0]
 
 

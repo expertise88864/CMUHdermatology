@@ -1958,11 +1958,22 @@ class AbbrevEngine:
                 try:
                     # 2a-1. 先送 backspace 刪除「縮寫 + 觸發空白」
                     bs_ok = _send_atomic_keystrokes(bs_events)
-                    # 2a-2. 等目標 app 確實處理完刪除，再貼上
-                    time.sleep(self.POST_BACKSPACE_DELAY_SEC)
-                    # 2a-3. 送 Ctrl+V 貼上展開內容
-                    paste_ok = _send_atomic_keystrokes(paste_events)
-                    used_paste = bool(bs_ok and paste_ok)
+                    # [2026-07-26 審查] backspace 沒送成功就【不可以貼上】:縮寫還留在
+                    # 欄位裡,再貼上展開內容會變成「nev nevus, benign appearing」這種
+                    # 疊字,直接寫進病歷。舊版無條件往下送 Ctrl+V,只把 bs_ok 併進
+                    # used_paste(那只影響後續判斷,擋不住已經貼出去的字)。
+                    if not bs_ok:
+                        logging.warning(
+                            "[abbrev] backspace 送出失敗 → 不貼上展開內容"
+                            "(避免縮寫與展開文字疊在一起),本次展開放棄")
+                        paste_ok = False
+                        used_paste = False
+                    else:
+                        # 2a-2. 等目標 app 確實處理完刪除，再貼上
+                        time.sleep(self.POST_BACKSPACE_DELAY_SEC)
+                        # 2a-3. 送 Ctrl+V 貼上展開內容
+                        paste_ok = _send_atomic_keystrokes(paste_events)
+                        used_paste = bool(paste_ok)
                     # 2a-4. 游標定位：貼上是「非同步」的，游標要等貼上『落地』後再移，
                     #       否則 LEFT 可能在貼上前先動到舊內容 → 位置錯。等 POST_PASTE
                     #       後(且仍在 BlockInput 凍結期內)才送 LEFter，與貼上正確排序。

@@ -25,7 +25,8 @@ import threading
 import time
 from pathlib import Path
 
-from cmuh_common.atomic_io import atomic_write_json, safe_load_json
+from cmuh_common.atomic_io import (atomic_write_json, safe_load_json,
+                                   safe_load_json_ex)
 from cmuh_common.process_launch import launch_python_script
 from cmuh_common.update_policy import suspend_auto_updates
 
@@ -364,8 +365,26 @@ def _get_psutil():
 
 
 # ─── Config ──────────────────────────────────────────────────────────────
+_config_load_failed = False    # [2026-07-26] 上一次讀 config 是「暫時性失敗」
+
+
+def config_load_failed() -> bool:
+    """上一次 load_config 是否為暫時性讀取失敗(檔案仍在、只是讀不到)。
+
+    [2026-07-26 審查] 與打卡/排班同一個病灶:防毒/備份軟體鎖檔時 safe_load_json 回 default,
+    watchdog 會拿【預設設定】跑一輪 —— 使用者關掉的程式被當成「該啟動」、
+    per-machine 的啟用選項全被忽略;而且 _migrate_config 一旦判定要遷移,還會把
+    那份預設值【寫回檔案】,永久蓋掉使用者的設定。呼叫端應據此跳過本輪。"""
+    return _config_load_failed
+
+
 def load_config() -> dict:
-    """讀 config；不存在自動寫 default；缺漏鍵 fallback。"""
+    """讀 config；不存在自動寫 default；缺漏鍵 fallback。
+
+    暫時性讀取失敗時設定 config_load_failed(),並【絕不】把預設值寫回檔案。
+    """
+    global _config_load_failed
+    _config_load_failed = False
     if not CONFIG_PATH.exists():
         try:
             CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -374,7 +393,12 @@ def load_config() -> dict:
             logging.exception("[watchdog] 寫預設 config 失敗")
         return _default_config_copy()
 
-    cfg = safe_load_json(str(CONFIG_PATH), default=None)
+    cfg, status = safe_load_json_ex(str(CONFIG_PATH), default=None)
+    if status == "error":
+        # 原檔仍完好、只是暫時讀不到 → 不可用預設值蓋回去,也不該拿預設設定跑一輪。
+        _config_load_failed = True
+        logging.warning("[watchdog] config 暫時讀取失敗(檔案仍在)→ 本輪跳過,不覆寫")
+        return _default_config_copy()
     if not isinstance(cfg, dict):
         logging.warning("[watchdog] config 不可用或格式錯誤，用記憶體 default")
         return _default_config_copy()
@@ -948,6 +972,12 @@ def run_one_tick(mode: str, log_fn=None) -> list:
     回傳：[msg, msg, ...]
     """
     cfg = load_config()
+    # [2026-07-26 審查] 設定檔只是【暫時】讀不到(防毒/備份鎖檔)時,拿到的是記憶體預設值:
+    # master_enabled 預設 False 會讓 watchdog 這輪什麼都不做(還好),但若預設是 True,
+    # 使用者在本機關掉的程式會被當成「該啟動」而重開,per-machine 的啟用選項也全被忽略。
+    # 行動咽喉就在這裡,一律跳過本輪 —— 檔案解鎖後下一輪自然恢復。
+    if config_load_failed():
+        return ["○ watchdog: 設定檔暫時讀不到 → 本輪不做任何動作(不拿預設值當使用者設定)"]
     # [v5] 總開關：master_enabled=False → watchdog 整個不動 (預設情況)
     if not cfg.get("master_enabled", False):
         return ["○ watchdog: master_enabled=False (已停用，主程式設定頁可開啟)"]

@@ -98,6 +98,25 @@ def refresh_master_schedule_if_needed(
         logging.warning("[master_schedule] fetch failed; keep cache: %s", exc)
         return "fetch_failed"
 
+    # [2026-07-26 審查 ★資料損失★] 抓取端在「網頁抓到了、但一個醫師都解析不出來」時
+    # 【不會拋例外】,只回 {}(見 main.create_master_schedule_from_web:版面改版、
+    # 選擇器失效都是這個結果)。舊版把 {} 當成合法的新排程送進 UI queue → 整份主排程
+    # (全科醫師的門診時段)被覆蓋成空的,而且靜默 —— 與「讀檔失敗被當成沒資料再覆蓋」
+    # 同一個病灶。空結果一律視為抓取失敗,保留既有快取。
+    if not new_schedule:
+        logging.warning(
+            "[master_schedule] 抓到的排程是空的(多半是網頁改版/選擇器失效)"
+            " → 視為抓取失敗,保留既有快取不覆寫")
+        return "fetch_failed"
+
+    # 大幅縮水多半也是解析部分失效。這裡【仍然接受】(醫師確實可能離職/停診),
+    # 但一定要留下可追查的紀錄 —— 沒有 log 就沒有依據判斷要不要加更嚴的守衛。
+    _old = load_master_schedule_cache(cache_path)
+    if _old and len(new_schedule) * 2 < len(_old):
+        logging.warning(
+            "[master_schedule] 醫師數從 %d 掉到 %d(少於一半)—— 仍套用,但若排程顯示"
+            "異常請把這行提供給開發者", len(_old), len(new_schedule))
+
     if cache_age is not None and cache_age < ttl_seconds:
         old_schedule = load_master_schedule_cache(cache_path)
         if old_schedule and _schedule_hash(old_schedule) == _schedule_hash(new_schedule):
