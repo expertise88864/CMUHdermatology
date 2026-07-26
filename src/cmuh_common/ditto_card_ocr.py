@@ -138,7 +138,13 @@ def _estimate_pitch(ys: list[int]) -> Optional[float]:
     diffs = sorted(b - a for a, b in zip(rows, rows[1:], strict=False) if b - a > 0)
     if not diffs:
         return None
-    return diffs[len(diffs) // 2]
+    # [2026-07-26 外審] 取【最小】的相鄰間距,不是中位數。
+    # OCR 漏列只會讓某些相鄰差變成真實列距的整數倍(2×、3×…),【不會】變小;
+    # 中位數在偶數筆時還會取到較大的那個。實例:辨識列 70/101/163(真實列距≈31)
+    # → diffs=[31, 62] → 舊寫法取 62 → 門檻膨脹成 1.8×62,第二列與表頭距離 66
+    # 反而通過守衛 → 漏讀最上面那張(當次)卡時,底下的舊卡號會被當成現在的卡寫進 HIS。
+    # 取最小值:漏列不影響它;雜訊若拉出更小的間距,門檻變嚴 → 擋下不填 = 安全側。
+    return diffs[0]
 
 
 def _top_row_near_header(card_ys: list[int], all_row_ys: list[int],

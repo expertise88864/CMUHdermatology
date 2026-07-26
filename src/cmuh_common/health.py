@@ -32,6 +32,11 @@ def _coerce_float(value, default: float, *, min_value: float) -> float:
     return max(min_value, out)
 
 
+# [2026-07-26 審查] 自動重啟連續失敗上限。超過就停止自動重啟,只留 critical 交人工 ——
+# 一直重試不會解決 spawn 失敗的根因(磁碟滿/防毒擋/路徑壞),只會不斷產生半死的子行程。
+_MAX_AUTO_RESTART_ATTEMPTS = 3
+
+
 def _coerce_int(value, default: int, *, min_value: int) -> int:
     try:
         out = int(value)
@@ -190,6 +195,7 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
 
     consecutive_high_ram = 0
     consecutive_critical_ram = 0
+    restart_attempts = 0        # [2026-07-26] 自動重啟嘗試次數(有上限,見下方)
     last_network_down_log = 0.0
     last_disk_warn = 0.0
     # 時鐘漂移：紀錄 (time.time, time.monotonic) 配對，每 tick 比較 delta
@@ -257,14 +263,32 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
                     # 雖差但活著),記 critical,下一個 tick RAM 仍 critical 會再試重啟。
                     # 沒 callback 的行程(會診/打卡:有外層 watchdog)維持直接 os._exit(1)。
                     if restart_callback is not None:
+                        # [2026-07-26 審查] 重試要有退避與上限。舊版失敗後不重置
+                        # consecutive_critical_ram,於是【每一個 tick(5 分鐘)都再試一次】,
+                        # 而且永遠不停:spawn 一直失敗(磁碟滿、防毒擋、路徑壞)時會不斷
+                        # 產生半死的子行程、洗爆 log,問題卻一點都沒解決。
+                        # 失敗後把連續計數歸零 → 下一次嘗試要再累積滿 N 個 tick(約 30 分);
+                        # 連續失敗達上限就停止自動重啟,只留一則 critical 交人工處理
+                        # (本行程繼續跑 —— RAM 高雖差,但活著比消失好,這是既有取捨)。
+                        restart_attempts += 1
                         try:
                             restart_callback()   # 成功會自己結束本行程
                         except Exception:
                             logging.exception("[health/%s] restart_callback 例外", tag)
                         # 能執行到這 = 重啟未成功(新行程沒起來)→ 不 os._exit,保留本行程
-                        logging.critical(
-                            "[health/%s] 自動重啟未成功(新行程未起),暫時保留本行程避免"
-                            "無人可用,下一輪再試重啟", tag)
+                        consecutive_critical_ram = 0
+                        if restart_attempts >= _MAX_AUTO_RESTART_ATTEMPTS:
+                            auto_restart_on_crit = False
+                            logging.critical(
+                                "[health/%s] 自動重啟連續失敗 %d 次 → 停止自動重啟,"
+                                "本行程繼續執行(RAM 仍偏高),請人工處理",
+                                tag, restart_attempts)
+                        else:
+                            logging.critical(
+                                "[health/%s] 自動重啟未成功(新行程未起,第 %d/%d 次),"
+                                "保留本行程避免無人可用;需再連續 %d 次 critical 才會重試",
+                                tag, restart_attempts, _MAX_AUTO_RESTART_ATTEMPTS,
+                                crit_persistence_ticks)
                     else:
                         os._exit(1)   # 無 callback:由外層 watchdog 接手重啟
             elif rss_mb >= ram_warn_mb:
@@ -284,6 +308,14 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
                     rss_mb, ram_warn_mb, ram_crit_mb,
                     consecutive_high_ram, consecutive_critical_ram,
                 )
+                # [2026-07-26 外審] RAM 回到正常 = 這一波 critical 事件結束 →
+                # 重試計數歸零。不歸零的話,三次【互不相關】的偶發重啟失敗就會永久
+                # 關掉自動重啟,而 log 卻寫著「連續失敗」——訊息與事實不符。
+                # 真正達到上限(同一波內連續失敗 N 次)才會永久停用,那是刻意的。
+                if restart_attempts and auto_restart_on_crit:
+                    logging.info("[health/%s] RAM 回到正常 → 重啟重試計數歸零(原 %d)",
+                                 tag, restart_attempts)
+                    restart_attempts = 0
                 logging.debug("[health/%s] RAM=%.0fMB OK", tag, rss_mb)
 
             # ─── 網路 ──────────────────────────────────────────────

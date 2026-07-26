@@ -2474,12 +2474,19 @@ def _force_ime_english(hwnd: int = 0) -> None:
 
 
 def _script_code_input_adaptive(code: str, label: str = "",
-                                  set_療程=None) -> bool:
+                                  set_療程=None,
+                                  warn_on_silent_failure: bool = True) -> bool:
     """共通流程：找視窗 → SendMessage 觸發代碼輸入 → 等焦點 → 打代碼 → Enter。
     可選 set_療程：完成代碼輸入後動態找頂部「療程」欄並改成該值。
 
     code="" 時跳過 typewrite + Enter（只開啟代碼輸入 dialog，由使用者手動
     輸入代碼+Enter）。用於 F5 KOH 場景。
+
+    warn_on_silent_failure：「什麼都沒發生」時要不要在這裡跳警告視窗。
+    [2026-07-26 外審] F1/F2/F3 的呼叫端已有 `_show_light_code_incomplete_warning`,
+    那則訊息更重要(會說明 UVB 劑量已經被改、處於半套狀態、該怎麼收拾)。這裡再跳一個
+    通用視窗只會擋在前面、延後真正該看的訊息,程式若在第一個視窗開著時結束更會讓它
+    完全不出現。故 F1-F3 傳 False;F4/F5(呼叫端沒有自己的警告)維持 True。
 
     set_療程=None 表示不改 療程（F4 冷凍 / F5 KOH 用）。
     set_療程=1/2/3 用於 F1/F2/F3 照光不同療程次數。
@@ -2500,6 +2507,12 @@ def _script_code_input_adaptive(code: str, label: str = "",
     previous_focus = _get_thread_focus(hwnd)
     if not _send_yiling_menu_command(hwnd, MENU_ID_代碼輸入):
         logging.warning("[%s] 代碼輸入 menu command 送出失敗", label)
+        # [2026-07-26 審查] 同上:連選單命令都送不出去時,醫師更需要知道「什麼都沒發生」。
+        if warn_on_silent_failure:
+            _show_uvb_warning(
+                hwnd, f"{label or '代碼輸入'} 未送出",
+                f"無法開啟「醫令→代碼輸入」(選單命令送出失敗)。\n"
+                f"請醫師手動操作{('並輸入 ' + str(code)) if code else ''}。")
         _mark_hotkey_action_time()
         return False
     # 等焦點移到醫令代碼欄；快時立即通過，慢時最多等 0.6 秒。
@@ -2544,10 +2557,22 @@ def _script_code_input_adaptive(code: str, label: str = "",
                             label, code)
             workflow_ok = False
             # 焦點沒落在代碼輸入欄 → 沒有真的送出(選單 id 位移時就是走這條)
+            # [外審] 稽核【必須排在阻塞對話框之前】:_show_uvb_warning 是同步 MessageBoxW,
+            # 排在它後面會讓紀錄時間變成「醫師關掉視窗的時間」;而且對話框開著時若程式被
+            # 關閉/強制重啟,這筆紀錄根本不會產生 —— 帳本契約是「動作發生的當下」。
             _record_his_action(
                 _LEDGER_HIS_MENU, f"{label or '代碼輸入'} 醫令代碼", main_hwnd=hwnd,
                 target=f"menu:{MENU_ID_代碼輸入}", value=str(code),
                 outcome=_LEDGER_SKIPPED, detail="等不到可信的代碼輸入焦點,未送出")
+            # [2026-07-26 審查] 醫師按了 F1-F5 卻【完全沒有東西發生】——舊版只寫 log,
+            # 醫師會以為醫令已下(這條路徑正是 HIS 改版把選單 id 位移時會走到的)。
+            # 熱鍵的價值就在「按了就會下」,靜默失敗比跳一個窗糟糕得多。
+            if warn_on_silent_failure:
+                _show_uvb_warning(
+                    hwnd, f"{label or '代碼輸入'} 未送出",
+                    f"代碼 {code} 沒有送出 —— 等不到代碼輸入欄位取得焦點。\n"
+                    f"常見原因是醫院系統改版讓「醫令→代碼輸入」選單位置改變。\n\n"
+                    f"請醫師手動輸入 {code},並把這個訊息告知開發者。")
     if code and not workflow_ok:
         logging.warning("[%s] 代碼輸入未完成，跳過療程欄位修改", label)
         _mark_hotkey_action_time()
@@ -3637,7 +3662,8 @@ def _f1_pure_excimer(label: str = "F1") -> bool:
     (同 51019 流程但換代碼,仍不動身份)。"""
     code = (F1_PURE_EXCIMER_CODE or "").strip()
     if code:
-        ok = _script_code_input_adaptive(code, label=label, set_療程=1)
+        ok = _script_code_input_adaptive(code, label=label, set_療程=1,
+                                         warn_on_silent_failure=False)
         logging.info("[%s] 純 Excimer:醫令 %s + 療程1 → %s",
                      label, code, "done" if ok else "skipped")
         if not ok:
@@ -3683,7 +3709,8 @@ def script_F1_adaptive():
         return False
     if f1_route == "pure_excimer":
         return _f1_pure_excimer(label="F1")
-    ok = _script_code_input_adaptive("51019", label="F1", set_療程=1)
+    ok = _script_code_input_adaptive("51019", label="F1", set_療程=1,
+                                     warn_on_silent_failure=False)
     logging.info("F1 (照光 1) 51019+療程: %s", "done" if ok else "skipped")
     if not ok:
         logging.warning("F1: 51019/療程未完成，跳過 UVB 更新以避免半套寫入")
@@ -3721,7 +3748,8 @@ def script_F2_adaptive():
     # UVB(_last_uvb_write 有本 label 紀錄)→ 先跳 W7 半套警告,再 re-raise 讓 wrapper 照常處理。
     try:
         _autofill_卡號_from_醫師上次(label="F2")
-        ok = _script_code_input_adaptive("51019", label="F2", set_療程=2)
+        ok = _script_code_input_adaptive("51019", label="F2", set_療程=2,
+                                         warn_on_silent_failure=False)
     except Exception:
         try:
             _rec = _last_uvb_write
@@ -3760,7 +3788,8 @@ def script_F3_adaptive():
     # [UD-03 2026-07-10] 同 F2:51019 階段以例外/F12 收場時,若已改過 UVB → 先跳 W7 半套警告再 re-raise。
     try:
         _autofill_卡號_from_醫師上次(label="F3")
-        ok = _script_code_input_adaptive("51019", label="F3", set_療程=3)
+        ok = _script_code_input_adaptive("51019", label="F3", set_療程=3,
+                                         warn_on_silent_failure=False)
     except Exception:
         try:
             _rec = _last_uvb_write
@@ -10661,13 +10690,25 @@ class AutomationApp:
         hotkey_future.add_done_callback(_handle_hotkey_loader_rejected)
 
     def deferred_initialization(self):
-        """在 UI 渲染完成後才執行的初始化任務"""
-        self.startup_phase_text.set("背景任務")
-        self.start_background_tasks()
-        # 門診動態：勿等「小工具」懶載入才輪詢，否則無法累積關診／掛號統計與總覽 reg64 快取
-        self.root.after(450, self._start_clinic_lights_polling_once)
+        """在 UI 渲染完成後才執行的初始化任務。
 
-        self._start_hotkey_module_loading()
+        [2026-07-26 審查] 每一步各自隔離。原本是一條直線:`start_background_tasks()`
+        一拋例外,後面的門診動態輪詢與【熱鍵模組載入】就整個不會執行 ——
+        熱鍵是本程式的核心功能,使用者只會看到「按 F1 沒反應」,而畫面一切正常。
+        彼此沒有依賴關係,一步壞不該拖垮其餘。
+        """
+        def _step(name, fn):
+            try:
+                fn()
+            except Exception:
+                logging.exception("[startup] 延後初始化步驟失敗(其餘照常進行):%s", name)
+
+        _step("階段文字", lambda: self.startup_phase_text.set("背景任務"))
+        _step("背景任務", self.start_background_tasks)
+        # 門診動態：勿等「小工具」懶載入才輪詢，否則無法累積關診／掛號統計與總覽 reg64 快取
+        _step("門診動態輪詢",
+              lambda: self.root.after(450, self._start_clinic_lights_polling_once))
+        _step("熱鍵模組載入", self._start_hotkey_module_loading)
 
         # 門診動態小工具:依上次選的顯示方式,延後自動開窗(fail-open)。
         # 排 _apply_clinic_widget_mode(而非直接 _open_*),讓回呼於觸發當下重新讀 mode →

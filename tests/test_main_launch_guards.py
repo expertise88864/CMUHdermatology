@@ -553,7 +553,12 @@ def test_hotkey_module_loader_recovers_from_rejected_submit():
         assert "RejectedExecutionError" in loader_src
         assert "self._heavy_modules_loading = False" in loader_src
         assert "self.root.after(5000, self._start_hotkey_module_loading)" in loader_src
-        assert "self._start_hotkey_module_loading()" in deferred_src
+        # [2026-07-26] 延後初始化改成每步各自隔離(一步壞不拖垮其餘),熱鍵載入現在
+        # 是經由 _step("熱鍵模組載入", self._start_hotkey_module_loading) 呼叫。
+        # 這裡守的契約是「熱鍵一定會被載入」,不是呼叫的字面寫法。
+        assert "self._start_hotkey_module_loading" in deferred_src
+        # 且必須被隔離包起來 —— 否則前一步拋例外會讓熱鍵整個不載入。
+        assert "_step(" in deferred_src
 
 
 def test_url_shortener_recovers_from_rejected_submit():
