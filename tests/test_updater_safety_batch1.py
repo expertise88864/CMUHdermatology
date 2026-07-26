@@ -135,7 +135,9 @@ def test_ie02_downgrade_protection_after_lock():
     # [codex P2] 取鎖後要重讀磁碟版本、比對 manifest 版本,避免用過時 prepared_writes 覆蓋降版
     src = inspect.getsource(updater.check_and_update)
     lock_idx = src.index("_updater_write_lock(")
-    assert "_read_ondisk_app_version(" in src[lock_idx:], \
+    # [2026-07-26] 改用帶狀態的 _ex 版(要區分「讀不到」與「磁碟上沒有版本」——
+    # 前者若當成後者,降版守衛會被整個跳過)。這裡守的契約是「取鎖後要重讀磁碟版本」。
+    assert "_read_ondisk_app_version_ex(" in src[lock_idx:], \
         "codex P2: 取鎖後應重讀磁碟版本做降版防護"
     # helper 讀得到 repo 內真實版本(非空、可解析)
     v = updater._read_ondisk_app_version(str(ROOT))

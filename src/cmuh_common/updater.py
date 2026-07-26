@@ -678,7 +678,20 @@ def check_and_update(
         #   (2) 就算真要比 revision 新舊,git commit sha 是【無序】的 —— 只能判斷「不同」,判斷不了「誰較新」。
         #       能單調排序 revision 的只有 app_version 本身(見(1)),所以拿 _remote_commit_sha 反而更弱。
         #  因此「等於就寫(修復)」在此是正確且無回滾風險的;真正的降版由上面的嚴格 > 擋掉。
-        _disk_ver = _read_ondisk_app_version(app_dir)
+        _disk_ver, _disk_status = _read_ondisk_app_version_ex(app_dir)
+        if _disk_status == "error":
+            # [2026-07-26 審查] 磁碟版本【暫時】讀不到(原檔完好、只是被鎖住)。
+            # 此時無法確認「本批是不是比磁碟舊」→ 不可寫,否則會踩到降版/版本錯亂。
+            # 放棄本批的成本只是晚一輪更新;寫下去的成本是把診間程式降版、或寫成半新半舊。
+            logging.warning(
+                "[更新] 取得鎖後讀不到磁碟版本(檔案仍在)→ 無法確認是否會降版,"
+                "整批放棄,下一輪再更新")
+            # [外審] 一定要記進 result.errors:呼叫端(main.py 的更新檢查)是靠這個欄位
+            # 分辨「失敗」與「已是最新」的 —— 不記的話 UI 會顯示「所有程式皆為最新版本」,
+            # 但其實是下載好的更新被丟掉了。與其他 fail-closed 路徑(取不到寫入鎖等)一致。
+            result.errors.append(
+                "讀不到磁碟上的版本檔(可能被防毒/備份鎖住)→ 為避免降版,本次更新未套用")
+            return result
         if (_disk_ver and result.manifest_app_version
                 and parse_version(_disk_ver)
                 > parse_version(result.manifest_app_version)):
@@ -696,17 +709,49 @@ def check_and_update(
         return _commit_pending_writes(prepared_writes, result)
 
 
-def _read_ondisk_app_version(app_dir: str) -> str:
-    """讀磁碟上 src/cmuh_common/version.py 的 CURRENT_VERSION(可能已被另一程式更新到最新);讀不到
-    回 ''。用於取得更新寫入鎖【之後】的降版防護(module 級 import 的 CURRENT_VERSION 是啟動當下的,
-    可能過時)。[codex P2]"""
+def _read_ondisk_app_version_ex(app_dir: str) -> tuple:
+    """讀磁碟上 src/cmuh_common/version.py 的 CURRENT_VERSION,回 (version, status)。
+
+    status 與本專案既有的 safe_load_json_ex 契約一致:
+      "ok"          讀到且解析成功
+      "missing"     檔案不存在(不完整的安裝)
+      "unparsable"  檔案在但找不到 CURRENT_VERSION(內容損壞/寫到一半)
+      "error"       OSError/PermissionError 等【暫時性】失敗 —— **原檔通常仍完好**
+
+    [2026-07-26 審查 ★降版 / 版本錯亂★] 舊版三種失敗全部回 ''(與「沒有版本」無法區分),
+    而呼叫端的降版守衛寫成 `if (_disk_ver and ...)` —— 於是防毒/備份軟體鎖住 version.py
+    的那一瞬間,守衛【整個被跳過】:本批若是較舊的 manifest revision(CDN 舊清單),
+    就會直接覆蓋磁碟上別的程式剛寫好的新版 = 降版 + 部分檔新部分檔舊,
+    正是 _commit_pending_writes 的說明裡要防的 version skew。
+    區分之後:missing/unparsable 代表磁碟上【沒有可信版本可比】,寫下去是修復(照舊放行);
+    "error" 代表原檔完好只是讀不到 → 呼叫端必須放棄本批,下一輪再更新。
+    """
+    vp = os.path.join(app_dir, "src", "cmuh_common", "version.py")
     try:
-        vp = os.path.join(app_dir, "src", "cmuh_common", "version.py")
         with open(vp, "r", encoding="utf-8") as f:
-            m = re.search(r'CURRENT_VERSION\s*=\s*["\']([\d.]+)["\']', f.read())
-        return m.group(1) if m else ""
+            content = f.read()
+    except FileNotFoundError:
+        return "", "missing"
+    except UnicodeDecodeError:
+        # [外審] 內容不是合法 UTF-8 = 檔案【損壞】(寫到一半/磁碟壞軌),不是「暫時讀不到」。
+        # 歸到 error 會讓這台機器【永遠】不再更新(每輪都放棄)= brick;
+        # 歸到 unparsable 才會走修復路徑,把完整的一批寫回去。
+        logging.warning("[更新] 磁碟版本檔內容非合法 UTF-8(視為損壞,將由更新修復):%s", vp)
+        return "", "unparsable"
+    except OSError:
+        logging.warning("[更新] 讀磁碟版本失敗(檔案仍在,可能被防毒/備份鎖住):%s",
+                        vp, exc_info=True)
+        return "", "error"
     except Exception:
-        return ""
+        logging.warning("[更新] 讀磁碟版本發生非預期例外:%s", vp, exc_info=True)
+        return "", "error"
+    m = re.search(r'CURRENT_VERSION\s*=\s*["\']([\d.]+)["\']', content)
+    return (m.group(1), "ok") if m else ("", "unparsable")
+
+
+def _read_ondisk_app_version(app_dir: str) -> str:
+    """相容用薄包裝(只取版本字串)。需要區分「讀不到」與「沒有版本」請用 _ex 版。"""
+    return _read_ondisk_app_version_ex(app_dir)[0]
 
 
 def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> UpdateResult:
