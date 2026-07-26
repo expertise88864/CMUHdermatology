@@ -482,6 +482,15 @@ _CEILING_KEYWORD_BEFORE_RE = re.compile(
     r"|maintain\s+dose\s+at"
     r"|最大(?:劑量|剂量)?"
     r"|上限(?:在|為)?"
+    # [2026-07-26 審查 ★超過醫師寫的目標★] 「increase to N」「up to N」「raise to N」
+    # 「增加到 N」「調到 N」裡的 N 是醫師要【達到】的目標,不是目前劑量。實測
+    # 「UVB increase to 600 mj/cm2 (10) on (日期), add 30 each time, MAX 1000」
+    # 舊版把 600 當成目前劑量 → 寫回 630,直接超過醫師寫的 600。
+    # 收進這組「數字前方關鍵字 = 不是本次劑量」之後,該行會落到既有的
+    # parse_fail / skip 路徑交醫師處理(不猜,與本模組一貫取捨一致)。
+    # 只收【明確帶 to/到】的寫法:單獨的 "increase 30" 是加量值,不在此列。
+    r"|(?:in\s*cr(?:e?a?|a?e?)se[d]?|raise[d]?|adjust(?:ed)?|up)\s+to"
+    r"|(?:增加|調整|調|加)到"
     r"|固定(?:在|為)?)\s*[:：,，]?\s*$",
     re.IGNORECASE,
 )
@@ -526,7 +535,13 @@ _EXCIMER_NONDOSE_BEFORE_RE = re.compile(
     r"|(?:each\s+time\s+)?\b(?:till|until)"     # [UC-04] \b 擋 "still"
     r"|maintain\s+dose\s+at"
     r"|最大(?:劑量|剂量)?|上限(?:在|為)?|固定(?:在|為)?"
-    r"|in\s*cr(?:e?a?|a?e?)se[d]?(?:\s+by)?|add(?:ing|ed|s)?(?:\s+by)?"
+    # [2026-07-26 審查] 「increase to N」「raise to N」「up to N」的 N 是醫師要達到的
+    # 【目標】,不是目前劑量。舊版 (?:\s+by)? 吃不到中間的 " to " → $ 錨定失敗 → 600 被
+    # 當成目前劑量,實測 excimer「increase to 600 …, add 30 each time」寫回 630,
+    # 超過醫師寫的 600。與 UVB 路徑的 _CEILING_KEYWORD_BEFORE_RE 同步收進來。
+    r"|in\s*cr(?:e?a?|a?e?)se[d]?(?:\s+(?:by|to))?|add(?:ing|ed|s)?(?:\s+(?:by|to))?"
+    r"|raise[d]?\s+to|adjust(?:ed)?\s+to|\bup\s+to"
+    r"|(?:增加|調整|調|加)到"
     r"|每次增加|每次加|增加|加)\s*[:：,，]?\s*$",
     re.IGNORECASE,
 )
@@ -1865,16 +1880,50 @@ def _detect_uncertain_triplets(text: str, today: date,
         # 適用 MAX=該行自己的 MAX;行內無 MAX(parse 失敗)時退驅動行 MAX —— Step C 正是
         # 拿驅動行 MAX 判 capped 而跳過的,不退則同款段仍會從這裡漏回寫。其餘 uncertain
         # 行為(dose<其行 MAX 的第二療程行、無緊鄰劑量的 excimer 行)不變。
+        # [2026-07-26 審查 ★病人安全★] UC-07 的理由對,但只擋了 capped。
+        # 「Yes 套用」原本是 kept-dose bump —— 只改 count/date、【完全不重算劑量】,
+        # 於是間隔已進衰減區的段會把【未衰減的舊劑量】標記成今天照的:
+        # 8-14 天應 ×0.75、15-21 天 ×0.5、>21 天回 250,照原劑量給就是過量。
+        # 修法不是把這些段丟掉(那會拿掉醫師既有的便利),而是【連劑量一起算好】——
+        # 關鍵事實:衰減桶(days_diff > SAME_DOSE_DAYS)的 compute_new_dose 只用
+        # dose/max_dose,【不使用 increase】,所以不知道該段自己的 increase 也算得準。
+        # 拿不到該段劑量或適用 MAX 時就不猜:不納入 uncertain,留原樣交醫師。
+        decay_span_start = None
+        decay_new_dose = None
+        decay_old_dose_text = ""
         if days_ago > SAME_DOSE_DAYS:
-            dose_prefix = text[max(line_start, m.start() - 32):m.start()]
+            _prefix_start = max(line_start, m.start() - 32)
+            dose_prefix = text[_prefix_start:m.start()]
             trip_dose_m = re.search(
                 r"(\d+)\s*mj(?:/cm2?)?\s*$", dose_prefix, re.IGNORECASE)
-            if trip_dose_m is not None:
-                _lp = parse_uvb_line(line_text) or parse_uvb_partial(line_text)
-                _applicable_max = ((_lp.max_dose if _lp is not None else 0)
-                                   or driver_max_dose)
-                if _applicable_max and int(trip_dose_m.group(1)) >= _applicable_max:
-                    continue
+            # [外審] 這個數字也可能是【上限或目標】而不是目前劑量:
+            # 「UVB increase to 600 mj/cm2 (5) …」的 600 是醫師要達到的目標,
+            # 拿去算衰減會把它改寫成 450,直接破壞醫囑。與主解析路徑套同一組守衛。
+            if trip_dose_m is not None and _CEILING_KEYWORD_BEFORE_RE.search(
+                    dose_prefix[:trip_dose_m.start(1)]):
+                trip_dose_m = None      # → 走 dose_not_recalculated 警示路徑
+            _lp = parse_uvb_line(line_text) or parse_uvb_partial(line_text)
+            _applicable_max = ((_lp.max_dose if _lp is not None else 0)
+                               or driver_max_dose)
+            if trip_dose_m is not None and _applicable_max:
+                _trip_dose = int(trip_dose_m.group(1))
+                if _trip_dose >= _applicable_max:
+                    continue    # [UC-07] capped 段維持排除(衰減會低於已 cap 的劑量)
+                _decayed = compute_new_dose(dose=_trip_dose, increase=0,
+                                            max_dose=_applicable_max,
+                                            days_diff=days_ago)
+                if _decayed is not None and _decayed < _trip_dose:
+                    _cand_start = _prefix_start + trip_dose_m.start(1)
+                    # span 往左擴到劑量數字 → 不可與前一個 triplet 的 span 重疊
+                    # (apply_uncertain_updates 由後往前套,重疊會把文字切壞)。
+                    if not (out and _cand_start < out[-1]['span'][1]):
+                        decay_span_start = _cand_start
+                        decay_new_dose = _decayed
+                        decay_old_dose_text = trip_dose_m.group(1)
+            # 歸屬不到該段自己的劑量(如 'excimer 800 upper back (37)'、'UVB (37)')→
+            # 【無法】算衰減。此時維持既有行為(仍問醫師),但要在結果裡標記
+            # dose_not_recalculated,呼叫端必須據此告訴醫師「這幾行的劑量不會重算」——
+            # 不可讓醫師以為按「是」就全部處理好了(訊息只能陳述程式真的會做的事)。
         # [2026-06-19] 只有當這個 (count) 緊鄰前方【就是】一個日期(中間只隔標點/空白,
         # 典型主行更新後格式 "on(date), (count)")才跳過 —— 代表 count 已有自己的日期
         # partner,不該再跟後方 120 字內別欄位的日期(例如 "acitretin w7-9 on (date)")
@@ -1900,14 +1949,25 @@ def _detect_uncertain_triplets(text: str, today: date,
             rep,
             count=1,
         )
+        seg_span = m.span()
+        if decay_span_start is not None and decay_new_dose is not None:
+            # 把替換段往左擴到劑量數字,並把劑量換成衰減後的值。
+            seg_span = (decay_span_start, m.end())
+            rep = (str(decay_new_dose)
+                   + text[decay_span_start + len(decay_old_dose_text):m.start()]
+                   + rep)
         out.append({
             'line': line_text.strip(),
             'count': old_count,
             'date': seg_date,
             'days_ago': days_ago,
-            'span': m.span(),
-            'original_seg': m.group(0),
+            'span': seg_span,
+            'original_seg': text[seg_span[0]:seg_span[1]],
             'replacement': rep,
+            'old_dose': int(decay_old_dose_text) if decay_old_dose_text else None,
+            'new_dose': decay_new_dose,
+            'dose_not_recalculated': (days_ago > SAME_DOSE_DAYS
+                                      and decay_new_dose is None),
         })
     return out
 

@@ -950,8 +950,8 @@ def test_ab02_native_polls_until_suffix_arrives(monkeypatch):
     monkeypatch.setattr(ae, "_get_focused_window_handle", lambda: 1)
     monkeypatch.setattr(ae, "_is_native_edit_control", lambda h: True)
     monkeypatch.setattr(ae, "_get_edit_selection", lambda h: (5, 5))
-    texts = iter(["xxml", "xxml "])       # 第一次空白未到(不符),第二次抵達(符)
-    monkeypatch.setattr(ae, "_read_window_text", lambda h: next(texts, "xxml "))
+    texts = iter(["x ml", "x ml "])      # 第一次空白未到(不符),第二次抵達(符)
+    monkeypatch.setattr(ae, "_read_window_text", lambda h: next(texts, "x ml "))
     monkeypatch.setattr(ae, "_replace_edit_selection", lambda *a: True)
     monkeypatch.setattr(ae, "_send_message_timeout", lambda *a: (True, 0))
     monkeypatch.setattr(ae.time, "sleep", lambda s: None)
@@ -979,7 +979,9 @@ def test_ab06_native_crlf_cursor_offset_compensated(monkeypatch):
     monkeypatch.setattr(ae, "_get_focused_window_handle", lambda: 1)
     monkeypatch.setattr(ae, "_is_native_edit_control", lambda h: True)
     monkeypatch.setattr(ae, "_get_edit_selection", lambda h: (5, 5))
-    monkeypatch.setattr(ae, "_read_window_text", lambda h: "xxml ")
+    # [2026-07-26] "xxml " 會讓縮寫黏在 "xx" 後面 → 新的字邊界守衛會 ABORT。
+    # 本測試測的是 CRLF/游標補償,不是邊界,故改用邊界乾淨的假資料。
+    monkeypatch.setattr(ae, "_read_window_text", lambda h: "x ml ")
     monkeypatch.setattr(ae, "_replace_edit_selection", lambda *a: True)
     setsel = []
 
@@ -1000,7 +1002,9 @@ def test_ab06_native_crlf_no_overcompensate_existing_crlf(monkeypatch):
     monkeypatch.setattr(ae, "_get_focused_window_handle", lambda: 1)
     monkeypatch.setattr(ae, "_is_native_edit_control", lambda h: True)
     monkeypatch.setattr(ae, "_get_edit_selection", lambda h: (5, 5))
-    monkeypatch.setattr(ae, "_read_window_text", lambda h: "xxml ")
+    # [2026-07-26] "xxml " 會讓縮寫黏在 "xx" 後面 → 新的字邊界守衛會 ABORT。
+    # 本測試測的是 CRLF/游標補償,不是邊界,故改用邊界乾淨的假資料。
+    monkeypatch.setattr(ae, "_read_window_text", lambda h: "x ml ")
     monkeypatch.setattr(ae, "_replace_edit_selection", lambda *a: True)
     setsel = []
 

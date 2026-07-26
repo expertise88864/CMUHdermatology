@@ -372,7 +372,9 @@ def test_native_edit_replacement_verifies_suffix_before_replacing(monkeypatch):
     monkeypatch.setattr(ae, "_get_focused_window_handle", lambda: 123)
     monkeypatch.setattr(ae, "_is_native_edit_control", lambda _hwnd: True)
     monkeypatch.setattr(ae, "_get_edit_selection", lambda _hwnd: (5, 5))
-    monkeypatch.setattr(ae, "_read_window_text", lambda _hwnd: "xxst ")
+    # [2026-07-26] "xxst " 會讓縮寫黏在 "xx" 後面 → 新的字邊界守衛會 ABORT。
+    # 本測試測的是「取代前先核對 suffix」,不是邊界,故改用邊界乾淨的假資料。
+    monkeypatch.setattr(ae, "_read_window_text", lambda _hwnd: "x st ")
     monkeypatch.setattr(
         ae,
         "_replace_edit_selection",

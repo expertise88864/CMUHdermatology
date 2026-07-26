@@ -3340,7 +3340,14 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
     if uncertain:
         lines_show = "\n".join(
             f"  • [{u['date'].strftime('%m/%d')} ({u['days_ago']}天前) "
-            f"次數 {u['count']}]\n      {u['line'][:100]}"
+            f"次數 {u['count']}]"
+            # [2026-07-26 審查] 間隔久了要衰減劑量。能歸屬到該行劑量的,程式會一起算好
+            # 並寫進去;歸屬不到的【不會重算】,必須明講,不可讓醫師以為全部處理好了。
+            + (f" 劑量 {u['old_dose']}→{u['new_dose']}"
+               if u.get('new_dose') else "")
+            + (" ★該行劑量不會自動重算(間隔已超過 7 天,請醫師自行判斷是否要降)★"
+               if u.get('dose_not_recalculated') else "")
+            + f"\n      {u['line'][:100]}"
             for u in uncertain
         )
         update_summary = (

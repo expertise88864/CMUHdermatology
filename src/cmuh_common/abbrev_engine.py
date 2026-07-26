@@ -1358,6 +1358,19 @@ def _replace_native_edit_suffix(
                     if _get_focused_window_handle() != hwnd:
                         return _NATIVE_ABORT          # 焦點已離開,別動
                     start = caret - len(expected_suffix)
+                    # [2026-07-26 審查 ★字中展開★] 完整字邊界要用【欄位真實文字】再確認一次。
+                    # 上游 _try_expand 是拿【內部 buffer】的前一字元判斷,而 buffer 在
+                    # cool-down 期間【不收按鍵】(見 _cooldown_until 那道 return)——
+                    # 使用者在 cooldown 內打的字沒進 buffer,buffer 的前綴就是空的 →
+                    # 邊界檢查通過 → 縮寫黏在別的字尾巴上照樣被展開(例:打 "persi" 落在
+                    # cooldown 內、接著打 "st" → 以為是字首,其實是 persist 的字尾)。
+                    # 這裡手上就有 text 與 start,是唯一權威的判準。
+                    if start > 0 and text[start - 1].isalnum():
+                        logging.debug(
+                            "[abbrev] 原生欄位實際前一字元=%r 為字母/數字/中文(非邊界)"
+                            "→ 放棄展開 '%s'(多半是 cool-down 期間的按鍵沒進 buffer)",
+                            text[start - 1], expected_suffix)
+                        return _NATIVE_ABORT
                     ok = _replace_edit_selection(
                         hwnd, start, caret, replacement)
                     if not ok:
