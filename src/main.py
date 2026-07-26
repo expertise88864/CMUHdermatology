@@ -10192,7 +10192,11 @@ class AutomationApp:
             result.setdefault("total", "-")
             result.setdefault("waiting", "-")
             result.setdefault("completed", 0)
+            # [2026-07-26 外審] 【不可】用 `or` 標記快取:持久化的 last_result 本來就帶
+            # status="更新成功",`result.get("status") or "上次快取"` 永遠不會生效。
+            # 改用專用旗標,不會被任何既有狀態字串遮蔽。
             result["status"] = result.get("status") or "上次快取"
+            result["from_cache"] = True
             display = state.get("last_display") or {}
             self.update_single_clinic_ui(idx, result, tracker, display.get("curr_avg", "-"))
             self._smart_widget_config(ui["comp_all"], text=str(result.get("completed", 0)))
@@ -11778,6 +11782,8 @@ class AutomationApp:
                         cached_result.setdefault("total", "-")
                         cached_result.setdefault("waiting", "-")
                         cached_result.setdefault("completed", 0)
+                        # [2026-07-26 外審] 這條退避/斷線回退路徑同樣是快取,要標記。
+                        cached_result["from_cache"] = True
                         display = cached_state.get("last_display") or {}
 
                         def update_cached_ui(
@@ -12384,6 +12390,17 @@ class AutomationApp:
             self._smart_widget_config(ui['status'], text="本日停診", fg="#78909C")
             self._smart_widget_config(ui['card_bg'], bg="#ECEFF1")
             self._smart_widget_config(ui['doc_name'], fg="#90A4AE")
+        elif result.get("from_cache") or "快取" in status_txt:
+            # [2026-07-26 審查 ★把舊資料講成即時★] 從磁碟狀態還原的路徑(開窗/切分頁時)
+            # 會把 status 設成「上次快取」,但這裡原本沒有對應分支 → 掉進下面的
+            # 「正常看診中」→ 顯示【綠色的「更新於 <現在時刻>」】。
+            # 那份候診人數可能是幾小時前、甚至上一個時段留下的,醫師卻會據此判斷
+            # 要不要現在過去診間。顯示層必須說出程式確知的事:這是快取、不是即時。
+            # (顏色與另一條快取路徑「保留上次快取,等待連線恢復」一致。)
+            self._smart_widget_config(ui['card_bg'], bg="#FAFAFA")
+            self._smart_widget_config(ui['status'], text="上次快取(非即時)", fg="#607D8B")
+            self._smart_widget_config(ui['total'], text=str(result.get('total', '-')))
+            self._smart_widget_config(ui['waiting'], text=str(result.get('waiting', '-')))
         else:
             # 正常看診中
             self._smart_widget_config(ui['card_bg'], bg="white")
