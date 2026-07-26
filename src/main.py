@@ -30,6 +30,7 @@ from cmuh_common.atomic_io import safe_load_json_ex as _safe_load_json_ex
 from cmuh_common.config_io import load_json_dict, load_json_list
 from cmuh_common.app_settings import (
     load_doctors_settings as _load_doctors_settings,
+    settings_load_failed as _settings_load_failed,
     load_r_doctor_settings as _load_r_doctor_settings,
     load_threshold_settings as _load_threshold_settings,
 )
@@ -10599,6 +10600,24 @@ class AutomationApp:
 
     # 1. 儲存 所有設定 (包含 R醫師, 止掛, 醫師列表)
     def save_all_settings(self):
+        # [2026-07-26 審查 ★設定永久消失★] 啟動時若設定檔剛好被防毒/備份鎖住,
+        # loader 會回【預設值】並載進記憶體(門檻、止掛提醒收件人、醫師清單、F8 文字全部)。
+        # 使用者接著在設定頁按一次「儲存」,就把那份預設值原子性地寫回磁碟 ——
+        # 真正的設定永久消失,而且整個過程沒有任何徵兆。這是今天這批一路在修的
+        # 「讀檔失敗被當成沒有資料,然後被正常寫回覆蓋」,只是換成主程式的設定檔。
+        # 寫入咽喉就在這裡:只要本次執行曾經讀不到,一律拒絕存檔並告訴使用者為什麼。
+        _failed = _settings_load_failed()
+        if _failed:
+            logging.error("[設定] 拒絕存檔:本次執行曾讀不到 %s(用的是預設值)", _failed)
+            messagebox.showwarning(
+                "設定未儲存",
+                "偵測到本程式啟動時讀不到下列設定檔(檔案仍在,可能被防毒/備份軟體鎖住):\n"
+                f"  {', '.join(sorted(_failed))}\n\n"
+                "目前畫面上顯示的是【預設值】,不是您原本的設定。\n"
+                "為了避免把您的門檻/收件人/醫師清單覆蓋成預設,這次【沒有存檔】。\n\n"
+                "請重新啟動主程式;若重啟後仍然出現此訊息,請把 log 提供給開發者。",
+                parent=self.root)
+            return
         for r_key, entries in self.r_doctor_entries.items():
             self.r_doctor_map[r_key] = {"name": (entries["name_var"].get() or "").strip()}
         _atomic_write_json(get_conf_path('r_doctor_settings.json'), self.r_doctor_map)
