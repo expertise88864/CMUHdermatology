@@ -248,7 +248,9 @@ def solve_duty(ctx: SolveContext, allow_disable_color: bool = False) -> SolveRes
             last = weekend_blocks[-1]
             res.last_weekend = {
                 "saturday": last.saturday.isoformat(),
-                "person": assignments.get(last.days[0], ""),
+                # 取【週六】當天的人：連休段可能往前鏈入週五假日（days[0]=週五），
+                # 且 [2026-07-27] 起使用者指定可拆段 → days[0] 未必是值週末的人。
+                "person": assignments.get(last.saturday, ""),
             }
         return res
     except RuntimeError:

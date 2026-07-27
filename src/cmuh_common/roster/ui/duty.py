@@ -530,17 +530,30 @@ class CalendarDutyTab(ttk.Frame):
                 _bind_row(row)
 
         # [週六切片] 週六格：切片負責人（紫籤＋代號+姓名，屬 R 名單）
+        # [2026-07-27 使用者] 週六一律顯示此列（未排到人顯示「—」），並可【右鍵
+        # 強制指定人選】——原本只在有人時才畫，沒排到的週六連右鍵都按不到。
         bp = ((biopsy or {}).get(iso) or {}).get("person")
-        if bp:
+        if d.weekday() == 5:
+            manual = ((biopsy or {}).get(iso) or {}).get("reason") == "手動指定"
             brow = tk.Frame(card, bg=body_bg)
             brow.pack(fill="x", padx=3, pady=(0, 2))
             cbg, cfg2 = OVR_STYLE["biopsy"]
             tk.Label(brow, text="切片", bg=cbg, fg=cfg2, padx=3,
                      font=(OVR_FONT, 8, "bold")).pack(side="left")
-            tk.Label(brow, text=self._who_label(bp, members["r"].get(bp)),
-                     bg=body_bg, fg="#1A1A1A", padx=3, width=9,
-                     wraplength=84, justify="left", anchor="w",
+            tk.Label(brow,
+                     text=(self._who_label(bp, members["r"].get(bp)) if bp
+                           else "—") + ("　📌" if manual else ""),
+                     bg=body_bg, fg="#1A1A1A" if bp else "#BBBBBB", padx=3,
+                     width=9, wraplength=84, justify="left", anchor="w",
                      font=(OVR_FONT, 9, "bold")).pack(side="left")
+            if not self._finalized:
+                def _bind_bio(w):
+                    w.bind("<Button-3>",
+                           lambda e, dd=d: self._on_biopsy_right(e, dd))
+                    w.configure(cursor="hand2")
+                    for ch in w.winfo_children():
+                        _bind_bio(ch)
+                _bind_bio(brow)
         if not self._finalized:
             bind_hover_highlight(card, border)   # [UI 互動] 懸停藍框回饋
 
@@ -658,6 +671,52 @@ class CalendarDutyTab(ttk.Frame):
                          command=lambda: self._set_cell_and_refresh(d, None,
                                                                     scope))
         menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_biopsy_right(self, event, d: date) -> None:
+        """[2026-07-27 使用者] 週六切片右鍵：強制指定人選 / 改回自動。
+        候選只列本月 R2/R3（切片本來就只由這兩級輪），選單帶 ✓目前、累計次數、
+        當天請假標記。指定會存進月檔並在之後所有重排中沿用。"""
+        if self._finalized or self._busy_flag:
+            return
+        from cmuh_common.roster.saturday_biopsy import biopsy_pair
+        try:
+            ctx = self.service.build_context("r", self.app.ym)
+            pair, _notes = biopsy_pair(ctx.members)
+            counts = (self.service.storage.load_biopsy().get("counts") or {})
+            leaves = ctx.leaves or {}
+        except Exception:
+            logging.debug("[roster.ui] 切片右鍵選單讀取失敗", exc_info=True)
+            pair, counts, leaves = [], {}, {}
+        month = self.service.storage.load_month(self.app.ym)
+        cell = (month.get("saturday_biopsy") or {}).get(d.isoformat()) or {}
+        cur = cell.get("person")
+        pinned = (month.get("biopsy_override") or {}).get(d.isoformat())
+        menu = tk.Menu(self, tearoff=0)
+        if pair:
+            pick = tk.Menu(menu, tearoff=0)
+            for mm in pair:
+                on_leave = d in (leaves.get(mm.id) or ())
+                pick.add_command(
+                    label=("✓ " if mm.id == cur else "　")
+                          + f"{mm.id} {mm.name or mm.id}"
+                          + f"　累計{int(counts.get(mm.id, 0))}"
+                          + (f"　{LEAVE_MARK}當天請假" if on_leave else ""),
+                    command=lambda mid=mm.id: self._set_biopsy(d, mid))
+            menu.add_cascade(label="指定切片人選", menu=pick)
+        else:
+            menu.add_command(label="（本月無 R2/R3，無法指定）", state="disabled")
+        menu.add_command(label="改回自動排（清除指定）",
+                         command=lambda: self._set_biopsy(d, None),
+                         state=("normal" if pinned else "disabled"))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _set_biopsy(self, d, mid) -> None:
+        try:
+            self.service.set_biopsy_person(self.app.ym, d, mid)
+        except Exception as e:                                  # noqa: BLE001
+            logging.exception("[roster.ui] 指定週六切片失敗")
+            messagebox.showwarning("指定切片", f"未能寫入：\n{e}")
+        self.refresh()
 
     def _set_cell_and_refresh(self, d, mid, scope) -> None:
         self.service.set_cell(scope, self.app.ym, d, mid)

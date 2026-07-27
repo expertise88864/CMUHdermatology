@@ -55,15 +55,21 @@ def month_saturdays(year: int, month: int) -> list:
 
 def assign_saturday_biopsy(*, year: int, month: int, members, duty: dict,
                            leaves: dict, counts: dict,
-                           last_person: Optional[str] = None) -> tuple:
+                           last_person: Optional[str] = None,
+                           overrides: Optional[dict] = None) -> tuple:
     """排該月每個週六的切片 → (assign, notes)。決定性（同輸入同輸出）。
 
     duty:   {date: member_id} 該月值班（只看週六的鍵）
     leaves: {member_id: set[date]} 請假
     counts: {member_id: int} 累計切片次數（【不含】本月 —— 呼叫端先回滾本月）
     last_person: 本月之前最近一次切片的人（跨月「同數輪替」決勝；None 可）
+    overrides: {date: member_id} [2026-07-27 使用者] 手動右鍵指定的切片人選——
+        最高優先，蓋過值班連動與次數平衡；名單外代號忽略並附註；當日請假仍照排
+        （與鎖定格同語意：使用者明確指定為準，只附註提醒）。指定者照樣累計次數，
+        後續週六的次數平衡會把它算進去。
 
-    assign: {date: {"person": mid, "reason": "值班連動"|"次數平衡"}}
+    assign: {date: {"person": mid,
+                    "reason": "手動指定"|"值班連動"|"次數平衡"}}
     notes:  人話清單（缺級、兩人皆請假等）
     """
     pair, notes = biopsy_pair(members)
@@ -72,11 +78,26 @@ def assign_saturday_biopsy(*, year: int, month: int, members, duty: dict,
     pair_ids = [m.id for m in pair]
     run = {mid: int(counts.get(mid, 0)) for mid in pair_ids}
     last = last_person if last_person in pair_ids else None
+    ov_map = dict(overrides or {})
     assign: dict = {}
     for sat in month_saturdays(year, month):
         duty_p = duty.get(sat)
         on_leave = {mid for mid in pair_ids
                     if sat in (leaves.get(mid) or set())}
+        ov = ov_map.get(sat)
+        if ov is not None and ov not in pair_ids:
+            notes.append(f"{sat.month}/{sat.day}(六) 手動指定的切片人選 "
+                         f"'{ov}' 不是本月 R2/R3 → 忽略，改自動排")
+            ov = None
+        if ov is not None:                    # ★手動指定最高優先
+            if ov in on_leave:
+                notes.append(f"{sat.month}/{sat.day}(六) 手動指定切片 {ov} "
+                             f"當日請假，仍照指定排入——請確認或改回自動")
+            pick, reason = ov, "手動指定"
+            assign[sat] = {"person": pick, "reason": reason}
+            run[pick] += 1
+            last = pick
+            continue
         # [codex P2] 請假最高優先(全系統 R4 原則):值班連動也不得把「當日請假」
         # 的人排切片——手動改格可造成「值班=請假者」的矛盾班表(驗證層警告但不擋
         # 存),此時切片退回次數平衡並附註,不放大矛盾。

@@ -605,8 +605,23 @@ class RosterService:
         return solve_duty(ctx, allow_disable_color=allow_disable_color)
 
     # ── 週六切片（R2/R3 輪排，2026-07-13）────────────────────────────────
+    @staticmethod
+    def _biopsy_overrides(month: dict) -> dict:
+        """[2026-07-27 使用者] 月檔內「手動指定的週六切片人選」→ {date: mid}。
+        壞鍵略過（與其他讀取容錯一致）。"""
+        out: dict = {}
+        for iso, mid in (month.get("biopsy_override") or {}).items():
+            if not mid:
+                continue
+            try:
+                out[date.fromisoformat(iso)] = str(mid)
+            except (ValueError, TypeError):
+                continue
+        return out
+
     def _biopsy_compute(self, ym: str, duty_by_date: dict,
-                        book: "dict | None" = None) -> tuple:
+                        book: "dict | None" = None,
+                        month: "dict | None" = None) -> tuple:
         """以指定值班表計算該月週六切片
         → (assign, notes, pair, counts_after, names)。
 
@@ -616,7 +631,10 @@ class RosterService:
         cfg = self.storage.load_config()
         members = [Member.from_dict(d) for d in (cfg.get("r_members") or [])]
         y, m = int(ym[:4]), int(ym[5:7])
-        month = self.storage.load_month(ym)
+        # [2026-07-27] month 可由呼叫端傳入【記憶體中尚未存檔的月檔】——手動指定
+        # 切片後若這裡自行重讀磁碟，會讀到舊的 override 而把指定吃掉。
+        if month is None:
+            month = self.storage.load_month(ym)
         leaves = _parse_date_map((month.get("leaves") or {}).get("r") or {})
         if book is None:
             book = self.storage.load_biopsy()
@@ -626,7 +644,8 @@ class RosterService:
         assign, notes = assign_saturday_biopsy(
             year=y, month=m, members=members, duty=duty_by_date,
             leaves=leaves, counts=base["counts"],
-            last_person=last_assigned_before(book, ym))
+            last_person=last_assigned_before(book, ym),
+            overrides=self._biopsy_overrides(month))
         pair, _ = biopsy_pair(members)
         counts_after = dict(base["counts"])
         for cell in assign.values():
@@ -660,7 +679,7 @@ class RosterService:
                 duty_by_date[dt] = str(p)
         book = self.storage.load_biopsy()
         assign, notes, pair, after, names = self._biopsy_compute(
-            ym, duty_by_date, book)
+            ym, duty_by_date, book, month=month)
         month["saturday_biopsy"] = {
             d.isoformat(): dict(cell) for d, cell in assign.items()}
         # [codex P2] 已存決策報告的[週六切片]段同步刷新——否則手改週六格/請假後,
@@ -789,6 +808,38 @@ class RosterService:
         if biopsy_book is not None:
             self.storage.save_biopsy(biopsy_book)
         return self.quick_validate(scope, ym)
+
+    def set_biopsy_person(self, ym: str, d: date,
+                          person: "str | None") -> list:
+        """[2026-07-27 使用者] 右鍵強制指定某週六的切片人選（person=None → 清除
+        指定、改回自動排）。回改後 quick_validate("r") 警告（不阻止儲存）。
+
+        指定存在月檔 biopsy_override，之後任何重排（手改值班、請假變動、重跑自動
+        排班）都會沿用——否則 set_cell 的連動重排會立刻把手動指定洗掉。
+        非週六直接忽略（切片只在週六）。定案月由 save_month 擋下並拋例外。
+        """
+        if d.weekday() != 5:
+            return self.quick_validate("r", ym)
+        month = self.storage.load_month(ym)
+        ov = month.setdefault("biopsy_override", {})
+        iso = d.isoformat()
+        old = ov.get(iso)
+        if person is None:
+            ov.pop(iso, None)
+        else:
+            ov[iso] = str(person)
+        if not ov:
+            month.pop("biopsy_override", None)
+        self._audit(month, "r", f"biopsy:{iso}", old, person, "manual")
+        biopsy_book = None
+        try:
+            _a, _n, biopsy_book = self.recompute_saturday_biopsy(ym, month)
+        except Exception:
+            logging.exception("[roster.service] 手動指定切片後重排失敗（略過）")
+        self.storage.save_month(ym, month)     # 定案 → 拋例外,帳本不落地
+        if biopsy_book is not None:
+            self.storage.save_biopsy(biopsy_book)
+        return self.quick_validate("r", ym)
 
     def clear_unlocked(self, scope: str, ym: str) -> None:
         """清除未鎖定的 R/VS 值班格（保留鎖定格），一次 load/save，並清舊決策報告。
@@ -993,6 +1044,14 @@ class RosterService:
                 for cell in (month.get("saturday_biopsy") or {}).values():
                     if cell.get("person") == old_id:
                         cell["person"] = new_id
+                        touched = True
+                        changed += 1
+                # [2026-07-27] 手動指定的切片人選同樣是以代號為鍵 → 一起改名，
+                # 否則改代號後指定指向不存在的人，重排時會被當「不在名單」丟掉。
+                for iso, mid in list((month.get("biopsy_override")
+                                      or {}).items()):
+                    if mid == old_id:
+                        month["biopsy_override"][iso] = new_id
                         touched = True
                         changed += 1
             if touched:

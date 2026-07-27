@@ -111,12 +111,18 @@ def test_must_saturday_auto_pairs_sunday():
     assert r.reasons[date(2026, 8, 8)] == "指定"
 
 
-def test_two_must_same_weekend_is_conflict():
+def test_two_must_same_weekend_splits_block_per_directives():
+    """[2026-07-27 使用者] 同一連休段被指定給不同人 → 【不再中止求解】，
+    改依指定拆段照排（使用者的手動指定就是要蓋過「連休段同一人」原則），
+    僅留警告。舊行為 precheck_failed 會讓人「怎麼指定都排不出來」。"""
     ctx = make_ctx(must={R1: [date(2026, 8, 8)], R2: [date(2026, 8, 9)]})
     r = solve_duty(ctx)
-    assert r.status == "precheck_failed"
-    assert any(c.severity == "error" and "被指定給多人" in c.msg
+    assert r.status == "ok"
+    assert r.assignments[date(2026, 8, 8)] == R1
+    assert r.assignments[date(2026, 8, 9)] == R2
+    assert any(c.severity == "warn" and "被指定給多人" in c.msg
                for c in r.prechecks)
+    assert not any(c.severity == "error" for c in r.prechecks)
 
 
 def test_directive_on_leave_day_is_conflict():

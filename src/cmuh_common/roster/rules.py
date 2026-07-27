@@ -150,23 +150,59 @@ class DirectiveRule(Rule):
             mc.model.Add(mc.x[(d, mid)] == 1)
 
 
+def split_block_runs(days: list, directed: dict) -> list:
+    """[2026-07-27 使用者] 把連休段依【使用者明確指定】切成數段 → [[date,...], ...]。
+
+    directed: {date: member_id}，只含該段內有被指定（鎖定/指定/年度指定/跨月銜接）
+    的日期。走訪日期序，遇到「本日指定人 ≠ 本段已定的指定人」就開新段；未指定日
+    併入當前段。無指定、或全段指定同一人 → 回傳單一段（＝原本的整段同一人）。
+
+    用途：使用者明確要求「9/25-27 給 Z、9/28 給 K」時，不該因為「連休段須同一人」
+    而整個求解失敗——指定是使用者的意志，規則讓位並改以警告提醒。純函式。
+    """
+    runs: list = []
+    cur: list = []
+    cur_mid = None
+    for d in days:
+        mid = directed.get(d)
+        if cur and mid is not None and cur_mid is not None and mid != cur_mid:
+            runs.append(cur)
+            cur, cur_mid = [], None
+        cur.append(d)
+        if mid is not None:
+            cur_mid = mid
+    if cur:
+        runs.append(cur)
+    return runs
+
+
 @register_rule
 class WeekendBlockRule(Rule):
     rule_id = "weekend_pair"
-    描述 = "週六+週日(含相鄰國定假日連休段)須同一人"
+    描述 = "週六+週日(含相鄰國定假日連休段)須同一人；使用者明確指定可拆段"
 
     def precheck(self, ctx):
         checks = []
         directives, _ = collect_directives(ctx)
         for b in ctx.blocks:
-            # 區塊內兩個不同指定人 → error
+            # [2026-07-27 使用者] 區塊內有多個指定人 → 【不再是 error】。
+            # 舊行為：整個求解中止（precheck_failed），使用者即使手動指定也排不出來。
+            # 新行為：依指定把連休段拆成數段（見 split_block_runs），只留警告。
             assigned = {directives[d][0] for d in b.days if d in directives}
             if len(assigned) > 1:
                 span = f"{b.days[0].month}/{b.days[0].day}-{b.days[-1].day}"
+                runs = split_block_runs(
+                    b.days, {d: directives[d][0] for d in b.days
+                             if d in directives})
+                desc = "、".join(
+                    f"{r[0].month}/{r[0].day}"
+                    + (f"-{r[-1].day}" if len(r) > 1 else "")
+                    for r in runs)
                 checks.append(Precheck(
-                    "error", self.rule_id,
-                    f"週末連休段 {span} 被指定給多人 {sorted(assigned)}，"
-                    f"同段必須同一人"))
+                    "warn", self.rule_id,
+                    f"週末連休段 {span} 被指定給多人 {sorted(assigned)} → "
+                    f"依你的指定拆成 {desc} 分別排班"
+                    f"（連休段原則上同一人，此處以你的指定為準）"))
             # 區塊完全無人可值 → error
             ok = [m.id for m in ctx.members
                   if all(not ctx.on_leave(m.id, d) for d in b.days)]
@@ -183,11 +219,17 @@ class WeekendBlockRule(Rule):
         return checks
 
     def apply(self, mc, ctx):
+        directives, _ = collect_directives(ctx)
         for b in ctx.blocks:
-            first = b.days[0]
-            for d in b.days[1:]:
-                for m in ctx.members:
-                    mc.model.Add(mc.x[(d, m.id)] == mc.x[(first, m.id)])
+            # [2026-07-27] 依使用者指定拆段：同段內仍綁同一人，跨段不再強制相等
+            # （無指定/指定同一人時 runs 只有一段 → 與舊行為完全相同）。
+            runs = split_block_runs(
+                b.days, {d: directives[d][0] for d in b.days if d in directives})
+            for run in runs:
+                first = run[0]
+                for d in run[1:]:
+                    for m in ctx.members:
+                        mc.model.Add(mc.x[(d, m.id)] == mc.x[(first, m.id)])
 
 
 @register_rule
@@ -490,8 +532,10 @@ class WeekendCapRule(Rule):
         weight = self.over_weight(ctx, blocks)
         terms = []
         for m in ctx.members:
-            # 區塊內各日已由 WeekendBlockRule 綁成同一人 → 取代表日 days[0] 即可
-            cnt = sum(mc.x[(b.days[0], m.id)] for b in blocks)
+            # 代表日取【週六】：連休段可能往前鏈入週五假日（days[0] 會是週五），
+            # 且 [2026-07-27] 起使用者指定可把連休段拆給不同人 → 用 days[0] 會把
+            # 「誰值了這個週末」算到別人頭上。_weekend_blocks 已保證 saturday 存在。
+            cnt = sum(mc.x[(b.saturday, m.id)] for b in blocks)
             over = mc.model.NewIntVar(0, len(blocks), f"wkover_{m.id}")
             mc.model.Add(over >= cnt - self.WEEKEND_CAP)   # 下界 0 → over=max(0,超額)
             terms.append((over, weight))
