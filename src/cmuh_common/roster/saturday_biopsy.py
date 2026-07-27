@@ -15,7 +15,7 @@ R2/R3 兩位住院醫師輪流負責每個週六的切片時段：
 from __future__ import annotations
 
 import calendar
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 
 BIOPSY_LEVELS = ("R2", "R3")
@@ -112,11 +112,26 @@ def assign_saturday_biopsy(*, year: int, month: int, members, duty: dict,
                 notes.append(f"{sat.month}/{sat.day}(六) R2/R3 皆請假 → "
                              f"切片未排，請手動安排")
                 continue
-            # 次數平衡：(累計次數, 是否為上次切片者, 名單序) —— 同數時與上次
-            # 不同者優先（自然輪替）、再同取 R2 在前。
-            pick = min(cands, key=lambda mid: (run[mid], mid == last,
+            # 次數平衡：(累計次數, 沒值週五, 是否為上次切片者, 名單序)。
+            # ★[2026-07-27 使用者] 週五連動排在【累計次數之後】★
+            #   使用者要「切片的人盡量也值週五」，但同一句話裡把它定為【最後條件】、
+            #   且另外明確要求「R2/R3 週六切片次數一整年下來一樣」→ 次數平衡不可讓位，
+            #   週五連動只在次數平手時決勝。
+            #   它取代的是原本的「與上次不同者優先」輪替：輪替本來就只是次數平衡的
+            #   弱化版（挑完 run[pick]+=1，下個週六自然換人，全距仍 ≤1），
+            #   讓位給一個使用者明講的需求是划算的；輪替仍留在後面當次要決勝。
+            #   週六值班若是 R2/R3 本來就走「值班連動」不到這裡；這條專門處理
+            #   「週六值班是 R1（或兩人都沒值）」時該挑誰。
+            fri_person = duty.get(sat - timedelta(days=1))
+            pick = min(cands, key=lambda mid: (run[mid], mid != fri_person,
+                                               mid == last,
                                                pair_ids.index(mid)))
             reason = "次數平衡"
+            # 只有在「真的有得選」而且週五連動確實是決勝因素時才這樣標，
+            # 否則報告會宣稱一件程式並不確知的事。
+            tied = [mid for mid in cands if run[mid] == run[pick]]
+            if len(tied) > 1 and pick == fri_person:
+                reason = "次數平衡·週五連動"
         assign[sat] = {"person": pick, "reason": reason}
         run[pick] += 1
         last = pick

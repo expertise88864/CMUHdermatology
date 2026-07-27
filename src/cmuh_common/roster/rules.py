@@ -23,6 +23,7 @@ from typing import Optional
 from cmuh_common.roster.model import (
     SolveContext, day_point, week_key,
 )
+from cmuh_common.roster.saturday_biopsy import BIOPSY_LEVELS
 
 # 放寬階梯層級（設計文件 §6）
 L0_FULL = 0          # 全部規則
@@ -543,12 +544,82 @@ class WeekendCapRule(Rule):
 
 
 @register_rule
+class FridayBiopsyLinkRule(Rule):
+    scope = "r"
+    kind = "soft"
+    rule_id = "friday_biopsy_link"
+    描述 = ("[2026-07-27 使用者] 週六早上切片的人，盡量也值週五。切片由 R2/R3 輪，"
+          "且「該週六值班者若是 R2/R3 就由他切片」（值班連動，見 saturday_biopsy），"
+          "所以在值班模型裡等價於：週六排到 R2/R3 時，盡量讓【同一人】也值週五。"
+          "使用者定調為【最後條件】——排班允許才做，不得犧牲點數公平。")
+
+    # ★用「獎勵連上」而非「懲罰沒連上」★
+    #   若寫成懲罰「R2 值週六但沒值週五」，求解器可以改把【R1】排進週六來躲掉罰則
+    #   （成本 0）—— 那反而破壞了使用者更想要的「週末由 R2/R3 值」。獎勵式則是:
+    #   連上得 -W、沒連上 0、週六排 R1 也是 0 → 只會往「連上」推，不會把人趕走。
+    #
+    # 權重推導（單位同 objective）:
+    #   上界 < DutyCountBalanceRule.RANGE_WEIGHT = 1,500
+    #     → 使用者同一則需求把本條定為【最後條件】，而把「班數接近一致」列為
+    #       獨立要求 → 一單位班數全距(1,500)必須壓過單一個週五連動(600)。
+    #   下界 > ConsecutiveDutyRule.RUN3_WEIGHT = 500
+    #     → 週五+週六+週日＝3 連值，會吃到 3 連罰則 500；本獎勵必須壓過它，
+    #       否則這條規則在最常見的情境下等於沒作用（連動本身就會製造 3 連）。
+    #       使用者 2026-07-13 已定案「3 天勉強可接受」，2026-07-27 又明確要這條連動
+    #       → 由本規則勝出。4 連(3,000,000)/5 連(10,000,000) 仍遠遠壓過，不會被誘發。
+    #   ★誠實揭露★ 每月最多 5 個週六 → 連動總獎勵上限 3,000，仍大於單一單位
+    #     班數全距 1,500。也就是「3 個以上的週五連動」可以換掉 1 天的班數差距。
+    #     要做到完全支配需 RANGE_WEIGHT > 3,000，但那會讓班數項在全距較大時
+    #     突破點數步進(見 DutyCountBalanceRule 的推導)，反而危及最高優先的點數公平。
+    #     取捨後選擇「單一連動絕不換班數、多個連動才可能」。
+    LINK_WEIGHT = 600
+
+    def objective_terms(self, mc, ctx):
+        if len(ctx.members) <= 1 or not ctx.days:
+            return []
+        from datetime import timedelta
+        day_set = set(ctx.days)
+        biopsy_members = [m for m in ctx.members
+                          if (m.level or "").strip().upper() in BIOPSY_LEVELS]
+        if not biopsy_members:
+            return []
+        terms = []
+        for sat in ctx.days:
+            if sat.weekday() != 5:
+                continue
+            fri = sat - timedelta(days=1)
+            if fri not in day_set:
+                continue          # 月初週六 → 週五在上月，本次求解管不到
+            for m in biopsy_members:
+                if ctx.on_leave(m.id, fri) or ctx.on_leave(m.id, sat):
+                    continue
+                linked = mc.model.NewBoolVar(
+                    f"fribio_{m.id}_{sat.isoformat()}")
+                mc.model.Add(linked <= mc.x[(fri, m.id)])
+                mc.model.Add(linked <= mc.x[(sat, m.id)])
+                terms.append((linked, -self.LINK_WEIGHT))
+        return terms
+
+
+@register_rule
 class DutyCountBalanceRule(Rule):
     kind = "soft"
     rule_id = "count_balance"
-    描述 = ("班數平衡（次要）：讓每人『總班數』盡量接近，但**僅在不損及點數平衡"
-          "時**。本項最大貢獻＝班數全距(≤天數<1000)，遠小於點數項每步 "
-          "POINT_WEIGHT=10000 → 點數平均優先、班數平均當同分決勝。")
+    描述 = ("班數平衡：讓每人『總班數』盡量接近，但**僅在不損及點數平衡時**。"
+          "[2026-07-27 使用者]「在R/VS值班，若點數允許的情況下，也盡量要安排"
+          "班數接近或一致」→ 從最弱的同分決勝(權重 1)提升為點數之下的實質優先。")
+
+    # 權重推導（單位同 objective）：
+    #   上界:點數最小步進 = 0.01 點 × 100(scale) × POINT_WEIGHT = 10,000。
+    #     班數全距在點數已平衡的前提下實務上 ≤5（要拉開全距就得拿週末(2 點)換
+    #     平日(1 點)，點數項會先擋下）→ 最大貢獻 5×1,500 = 7,500 < 10,000，
+    #     點數公平仍然絕對優先(使用者的「若點數允許的情況下」)。
+    #   下界:> ConsecutiveDutyRule.RUN3_WEIGHT(500) 與
+    #     FridayBiopsyLinkRule.LINK_WEIGHT(600) —— 這兩條使用者都定調為
+    #     「勉強可接受 / 最後條件」，班數一致是明確要求，應排在它們之上。
+    #   ★原本權重 1 的問題★:1 單位班數全距只值 1，連 3 連值罰則(500)都輸，
+    #     實務上等於「幾乎不會為了班數平均動任何一格」。
+    RANGE_WEIGHT = 1500
 
     def objective_terms(self, mc, ctx):
         if len(ctx.members) <= 1:
@@ -560,8 +631,8 @@ class DutyCountBalanceRule(Rule):
             cnt = sum(mc.x[(d, m.id)] for d in ctx.days)
             mc.model.Add(cmax >= cnt)
             mc.model.Add(cmin <= cnt)
-        # 最小化 (cmax - cmin) = 班數全距；權重 1（點數項每步 ≥100 主導）
-        return [(cmax, 1), (cmin, -1)]
+        # 最小化 (cmax - cmin) = 班數全距
+        return [(cmax, self.RANGE_WEIGHT), (cmin, -self.RANGE_WEIGHT)]
 
 
 # ─── 整體可行性預檢（非約束）──────────────────────────────────────────────
