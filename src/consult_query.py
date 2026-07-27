@@ -65,6 +65,7 @@ from tkinter import messagebox, scrolledtext, ttk  # noqa: E402
 import psutil  # noqa: E402
 import schedule  # noqa: E402
 import win32con  # noqa: E402
+import win32event  # noqa: E402
 import win32gui  # noqa: E402
 import win32process  # noqa: E402
 import win32ui  # noqa: E402
@@ -1914,14 +1915,28 @@ def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -
     si.dwFlags = win32con.STARTF_USESHOWWINDOW
     si.wShowWindow = win32con.SW_SHOW  # 隱藏桌面上正常顯示，使用者看不到
     si.lpDesktop = HIDDEN_DESKTOP_NAME
+    # [2026-07-27 實機故障根因] CreateProcess 的回傳值原本【整個被丟掉】,於是我們
+    # 不知道自己開的是哪個 PID,只能靠前後快照去猜(our_pids / _systemftp_pids()-before)。
+    # 猜的方式一旦失準(psutil 名稱查詢失敗被判成「已非 systemftp(PID 重用?)」、
+    # 或資源緊繃時列舉不到),清理就整個跳過 → 一個 systemftp 永遠留在隱藏桌面。
+    # 每輪輪詢(15 分)累積一個:先撞住院系統「最多兩個」上限(等不到登入視窗),
+    # 再撞 desktop heap/handle 耗盡(EnumWindows 記憶體不足、can't start new thread、
+    # CreateProcess 系統資源不足)——2026-07-27 早上整段收不到會診就是這樣來的。
+    # 而孤兒清掃 _cleanup_orphan_systemftp 靠【視窗列舉】做正面識別,在資源耗盡時
+    # 自己也失效 —— 復原機制被它要修的那個狀況弄壞。
+    # 修法:留住 CreateProcess 給的【行程 handle】。用 handle 終止有兩個關鍵性質:
+    #   ① 只要 handle 沒關,核心就不會回收該 PID → 不可能「PID 重用」而誤殺別人;
+    #   ② handle 來自我們自己的 CreateProcess → 終止的必然是我們開的那一個,
+    #      完全不需要名稱/session/視窗列舉,資源耗盡時照樣有效。
     try:
-        win32process.CreateProcess(SYSTEMFTP_PATH, None, None, None,
-                                    False, 0, None, None, si)
+        _hproc, _hthread, _spawned_pid, _ = win32process.CreateProcess(
+            SYSTEMFTP_PATH, None, None, None, False, 0, None, None, si)
     except Exception as e:
         raise RuntimeError(f"在隱藏桌面啟動 systemftp.exe 失敗：{e}") from e
-    logging.info("已在隱藏桌面啟動 systemftp.exe")
+    logging.info("已在隱藏桌面啟動 systemftp.exe (pid=%s)", _spawned_pid)
 
-    our_pids: set = set()
+    # 自己開的 PID 直接納入,不再只靠快照差集去猜。
+    our_pids: set = {_spawned_pid}
     try:
         # 等登入視窗（期間關多開提示）。隱藏桌面上 find_windows 自動列舉
         # 該桌面的視窗（因為本執行緒已 SetThreadDesktop 過去）。
@@ -2042,6 +2057,29 @@ def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -
             logging.info("已關閉本次開啟的 systemftp 實例")
         except Exception:
             logging.warning("關閉 systemftp 失敗", exc_info=True)
+        # [2026-07-27] 最後保險:不論上面的優雅關閉有沒有成功(或有沒有被身分驗證
+        # 略過),都用【我們自己的行程 handle】確認它真的結束了。這一步不依賴
+        # psutil 名稱、不依賴 session、不依賴視窗列舉,所以資源耗盡時仍然有效;
+        # 而且 handle 綁定的必然是我們開的那個行程,不可能誤殺使用者的醫囑系統。
+        try:
+            _still_running = (
+                win32event.WaitForSingleObject(_hproc, 0) == win32event.WAIT_TIMEOUT)
+            if _still_running:
+                logging.warning(
+                    "[cleanup] 本次開啟的 systemftp (pid=%s) 在優雅關閉後仍在執行 → "
+                    "以行程 handle 強制結束(避免留在隱藏桌面累積)", _spawned_pid)
+                win32process.TerminateProcess(_hproc, 1)
+                win32event.WaitForSingleObject(_hproc, 3000)
+        except Exception:
+            logging.warning("[cleanup] 以 handle 確認/結束 systemftp 失敗",
+                            exc_info=True)
+        finally:
+            # handle 一定要關:不關的話核心會一直保留該 PID(且我們自己也在洩漏 handle)。
+            for _h in (_hthread, _hproc):
+                try:
+                    _h.Close()
+                except Exception:
+                    pass
 
 
 def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tuple:
