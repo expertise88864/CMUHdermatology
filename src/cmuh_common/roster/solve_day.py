@@ -59,6 +59,14 @@ def _jitter(d: date, session: str, purpose: str, code: str) -> int:
                       .encode("utf-8"))
 
 
+def _idle_today(fc: "FairCounters", k, d: date) -> int:
+    """[2026-07-27 使用者] 0＝今天還沒有任何工作（優先給事做）、1＝今天已有工作。
+
+    早上時段人人皆 0（本日尚未開排）→ 此項不生效，等同舊行為；下午才真正分道，
+    讓「早上放假的人」優先補上位子，避免整天放假。純函式。"""
+    return 0 if fc.worked_day.get(k) != d else 1
+
+
 def _pick(ctx: "SessionCtx", cands: list, count_map: dict, purpose: str):
     """公平輪選：次數最少 → 決定性抖動 → 代號字典序（決定性；見 _jitter）。"""
     return min(cands, key=lambda p: (count_map.get(p, 0),
@@ -86,6 +94,10 @@ class FairCounters:
     # [codex R2] 整月「累計產生」的補假債（只增不減）。第一趟求解用它得知「誰、共欠幾次」,
     # 第二趟把債務從月初就預先掛上 → 月底才超額的人也能用月初的空檔補到假。
     rest_owed_total: dict = field(default_factory=dict)
+    # [2026-07-27 使用者] 反「整天放假」：記錄每人最近一次【有工作】的日期
+    # （照光/治療室/切片室/跟診皆算）。下午輪選時「今天還沒有任何工作」者優先，
+    # 讓每人每天盡量至少有半天有事做,而不是早上放假下午又放假。
+    worked_day: dict = field(default_factory=dict)   # {ck: 最近有工作的日期}
     # last_*：最近一次輪到日期。[2026-07-23] 輪選 key 已改用 _jitter 平手決勝（LRU 會
     # 鎖死固定配對），這些欄位保留作紀錄/回放資料，不再參與輪選。
     last_photo: dict = field(default_factory=dict)
@@ -164,6 +176,7 @@ class PhotoStep(FillStep):
                 fc.rest_owed_total[pick] = fc.rest_owed_total.get(pick, 0) + 1
                 owed = "、超出配額 → 記補半天假"
         fc.last_photo[pick] = ctx.d
+        fc.worked_day[_pgy_ck(ctx, pick)] = ctx.d      # 反整天放假：今日已有工作
         log.append(f"{ctx.session} 照光 ← PGY {pick}"
                    + ("（週三下午" + owed + "）" if ctx.wed_pm else ""))
 
@@ -183,6 +196,7 @@ class TreatmentStep(FillStep):
         slots[TREATMENT] = [pick]
         fc.tx_total[pick] = fc.tx_total.get(pick, 0) + 1
         fc.last_tx[pick] = ctx.d
+        fc.worked_day[_pgy_ck(ctx, pick)] = ctx.d      # 反整天放假：今日已有工作
         log.append(f"{ctx.session} 治療室 ← PGY {pick}")
 
 
@@ -203,13 +217,17 @@ class BiopsyStep(FillStep):
         cands = [c for c in ctx.clerk if fc.last_biopsy.get((bk, c)) != ctx.d]
         if not cands:
             return
+        # 次數公平第一（整梯次數差 ≤1）；[2026-07-27] 平手時「今天還沒事做」者先，
+        # 助攻反整天放假（不動搖切片次數公平）。
         pick = min(cands, key=lambda c: (
             fc.biopsy_done.get((bk, c), 0),
+            _idle_today(fc, _clerk_ck(ctx, c), ctx.d),
             _jitter(ctx.d, ctx.session, "biopsy", c), c))
         ctx.clerk.remove(pick)
         slots[BIOPSY] = [pick]
         fc.biopsy_done[(bk, pick)] = fc.biopsy_done.get((bk, pick), 0) + 1
         fc.last_biopsy[(bk, pick)] = ctx.d
+        fc.worked_day[_clerk_ck(ctx, pick)] = ctx.d    # 反整天放假：今日已有工作
         log.append(f"{ctx.session} 切片室 ← Clerk {pick}")
 
 
@@ -230,8 +248,15 @@ def _pair_key(a, b) -> tuple:
 def _seat(ctx, pool, room, ck, prefer: frozenset = frozenset()):
     """依 ck(人)命名空間的座位公平計數輪選並就座。
 
-    key＝(座位次數, 非偏好者, 該房次數, 連排懲罰, 同伴次數, 補假欠額, 抖動, 代號)：
-    總次數最少者優先（公平）；平手時 prefer 先上（Apply 本科 101 週二/五）；
+    key＝(今日尚無工作, 座位次數, 非偏好者, 該房次數, 連排懲罰, 同伴次數, 補假欠額,
+    抖動, 代號)：
+    [2026-07-27 使用者] 首鍵＝「今天還沒有任何工作的人最優先」——目標是每人每天
+    至少有半天有事做,不要早上放假下午又放假。放在最前面才有效（放在次數之後等於
+    幾乎不生效：早上放假的人座位次數本來就較低,原本就會被選,失效的正是「次數偏高
+    但整天閒著」這個真正要救的情形）。不會破壞長期公平：早上放假者當日至多補到 1
+    個位子,仍少於整天有課者的 2 個,座位次數自我校正（實測 spread 仍 ≤1）。
+    早上時段人人皆「今日尚無工作」→ 此鍵在上午不生效,上午行為與舊版相同。
+    次之總次數最少者優先（公平）；平手時 prefer 先上（Apply 本科 101 週二/五）；
     [2026-07-24] 再比「跟過這間診的次數」少者先、罰「上一次跟診就是這間」（反連排）；
     [2026-07-25 使用者] 再比「與本房已就座者共事過幾次」少者先——房多樣性只管
     「誰跟哪一間」,管不到「誰跟誰」,故仍可能固定同兩人成對（如 1、2 號總是一起）。
@@ -249,7 +274,8 @@ def _seat(ctx, pool, room, ck, prefer: frozenset = frozenset()):
         # 補假欠額只對 PGY 有意義（週三下午照光是 PGY 的事）；ck 首欄即命名空間
         owed = fc.rest_owed.get(p, 0) if k[0] == "pgy" else 0
         pair_cost = sum(fc.pair.get(_pair_key(k, q), 0) for q in seated)
-        return (fc.seat.get(k, 0),
+        return (_idle_today(fc, k, ctx.d),   # ★今天還沒事做的人最優先（反整天放假）
+                fc.seat.get(k, 0),
                 0 if p in prefer else 1,
                 fc.seat_room.get((k, rk), 0),
                 1 if fc.last_seat_room.get(k) == rk else 0,
@@ -268,6 +294,7 @@ def _seat(ctx, pool, room, ck, prefer: frozenset = frozenset()):
     fc.seat_room[(k, rk)] = fc.seat_room.get((k, rk), 0) + 1
     fc.last_seat_room[k] = rk
     fc.last_seat[k] = ctx.d
+    fc.worked_day[k] = ctx.d               # 反整天放假：今日已有工作
     return pick
 
 
@@ -445,6 +472,11 @@ def replay_counters(fc: FairCounters, d: date, session: str, slots: dict,
     # [codex] 手動誤植:同一人既在放假格又出現在別的工作格 → 那不是真的放假,不抵債。
     _working = {p for ps in _room_slots.values() for p in ps}
     _working |= {p for s in (PHOTO, TREATMENT, BIOPSY) for p in slots.get(s, [])}
+    # [2026-07-27 使用者] 反整天放假的「今日已有工作」也要回放：早上鎖定/既存格
+    # 裡有工作的人，下午自動排班時不得再被當成「今天閒著」而優先補位。
+    for p in _working:
+        if p in pgy_set or p in clerk_set:
+            fc.worked_day[_ck(p)] = d
     for slot, people in slots.items():
         if slot in (PHOTO, TREATMENT, BIOPSY):
             continue
