@@ -6283,9 +6283,13 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
     logging.info("[%s] 已 PostMessage WM_COMMAND IDYES (=是) 給對話框", label)
 
     # 等對話框關 (30ms poll → 對話框關閉延遲最多 30ms)
+    # [2026-07-27 外審] 迴圈的離開條件也要用可見性 —— 只看 IsWindow 的話,
+    # Delphi 保留表單物件時每次都會白等滿 5 秒,而且下面還會把它記成
+    # 「server 寫入時間 5000ms」(把等待誤植成伺服器耗時)。
     end_t = time.time() + 5
     while time.time() < end_t:
-        if not ctypes.windll.user32.IsWindow(dlg):
+        _u32 = ctypes.windll.user32
+        if not _u32.IsWindow(dlg) or not _u32.IsWindowVisible(dlg):
             break
         time.sleep(0.03)
         check_stop()
@@ -6293,7 +6297,8 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
     dlg_close_ms = (t_dlg_closed - t_idyes_posted) * 1000
     # [2026-07-26 審查] 迴圈也可能是【逾時】才離開 —— 那代表「是」沒被接受,
     # 舊版照樣印「已關」並繼續往下走到 return True。要先確認它真的關了。
-    if ctypes.windll.user32.IsWindow(dlg):
+    if (ctypes.windll.user32.IsWindow(dlg)
+            and ctypes.windll.user32.IsWindowVisible(dlg)):
         logging.warning(
             "[%s] 警告對話框送出 IDYES 後 5 秒仍未關閉(hwnd=%s)→ 無法確認已送出,"
             "回報未完成,請醫師確認同意書狀態", label, dlg)
@@ -6310,7 +6315,8 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
     dlg2 = 0
     poll_deadline = time.time() + 0.5
     while time.time() < poll_deadline:
-        if not ctypes.windll.user32.IsWindow(popup_hwnd):
+        _u32 = ctypes.windll.user32
+        if not _u32.IsWindow(popup_hwnd) or not _u32.IsWindowVisible(popup_hwnd):
             logging.info("[%s] popup 已關 → 無第二 dialog 需處理", label)
             return True
         dlg2 = _find_window_by_class_title(
@@ -6330,10 +6336,12 @@ def _f9_f10_round4_submit_and_confirm(popup_hwnd: int, label: str = "") -> bool:
         ctypes.windll.user32.PostMessageW(dlg2, WM_COMMAND, IDOK, 0)
         end_t = time.time() + 5
         while time.time() < end_t:
-            if not ctypes.windll.user32.IsWindow(dlg2):
+            _u32 = ctypes.windll.user32
+            if not _u32.IsWindow(dlg2) or not _u32.IsWindowVisible(dlg2):
                 break
             time.sleep(0.05)
-        if ctypes.windll.user32.IsWindow(dlg2):
+        if (ctypes.windll.user32.IsWindow(dlg2)
+                and ctypes.windll.user32.IsWindowVisible(dlg2)):
             # [外審 R3] 已知有一個確認框沒被解掉 → 不可回報成功。即使同意書 popup
             # 剛好也關了(可能是別的原因),「還有確認框開著」本身就是未完成的事實。
             logging.warning(
@@ -6353,9 +6361,14 @@ def _f9_f10_wait_consent_popup_closed(popup_hwnd: int, *, label: str = "",
     通通回報成功 → 呼叫端記「Round 4 完成 (整段 F9/F10 流程完成)」、UI 顯示「操作完成」。
     醫師看到完成訊息就走了,同意書其實沒送出 —— 故障與正常長得一模一樣。
     """
+    # [2026-07-27 實機修正] 判定「關閉」要看【可見性】—— Delphi modal form 關閉多半只是
+    # Hide,IsWindow 會永遠是真。只看 IsWindow 會讓這裡必定逾時 → 每次都回報
+    # 「同意書未送出」的假警報(與片語 popup 同一個地雷,同批修)。
     end_t = time.time() + max(0.0, timeout)
     while time.time() < end_t:
-        if not ctypes.windll.user32.IsWindow(popup_hwnd):
+        _u32 = ctypes.windll.user32
+        if (not _u32.IsWindow(popup_hwnd)
+                or not _u32.IsWindowVisible(popup_hwnd)):
             return True
         time.sleep(0.05)
         check_stop()
@@ -6900,9 +6913,19 @@ def _select_phrase_and_return(片語_btn_hwnd: int, row_idx: int,
     # 等 popup 關閉 —— [2026-07-26 審查] 要等【這一個 hwnd】關,不可用 class 全域找:
     #  (a) 殘留的舊 popup 會讓全域查詢一直有結果 → 每個片語都白等滿 5 秒,最後還回 True;
     #  (b) 沒關成功卻回 True → 片語根本沒帶回,流程照樣進 Round 4 送出同意書。
+    # [2026-07-27 實機修正 ★F9/F10 全面卡住★] 判定「關閉」必須看【可見性】,不是視窗物件
+    # 是否被銷毀。Delphi 的 modal form 關閉時多半只是 Hide(表單物件留著重用)→
+    # `IsWindow(hwnd)` 永遠是真 → 這個迴圈必定跑滿 5 秒 → Round 3 一律判失敗 →
+    # F9/F10 從此都停在「片語沒選成,交醫師手動確認」。
+    # 舊版用 `_find_window_by_class_title` 之所以會過,正是因為它內部會跳過
+    # 不可見視窗(IsWindowVisible)—— 我 2026-07-26 改成只看 IsWindow 時弄丟了這個語意。
+    # 這裡保留「只看這一個 hwnd」的改進(不會被殘留的別的 popup 誤導),
+    # 但把條件改回「這個 hwnd 不再可見」= 已關閉。
     end_t = time.time() + 5
     while time.time() < end_t:
-        if not ctypes.windll.user32.IsWindow(phrase_popup):
+        _u32 = ctypes.windll.user32
+        if (not _u32.IsWindow(phrase_popup)
+                or not _u32.IsWindowVisible(phrase_popup)):
             logging.info("[%s] 片語 popup 已關閉", label)
             return True
         time.sleep(0.1)
