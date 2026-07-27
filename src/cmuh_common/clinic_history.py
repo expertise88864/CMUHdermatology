@@ -49,6 +49,16 @@ def upsert_session_stat(
         return history, False
     dur_list, valid_data, final_avg_min = duration_stats(durations)
     has_dur = bool(dur_list)
+    # ★[2026-07-27 外審 P2] 完成人數是「頁面實測值」,與有沒有看診時長樣本無關★
+    #   原本 completed_count 只在 `if has_dur:` 內寫入 → 程式在診次進行到一半才開啟
+    #   (沒觀察到任何完成轉換、durations 是空的)時,實測到的 15 人會被存成 0。
+    #   於是磁碟上「completed_count=0 且無樣本」同時代表「真的 0 人」與「沒記到」,
+    #   下游怎麼猜都是錯的。改成一律保存實測值,並標記 completion_observed,
+    #   讓下游不必推測。
+    try:
+        observed_completed = max(0, int(completed_count))
+    except (TypeError, ValueError):
+        observed_completed = None
     closing = (closing_time or "").strip()
     if not has_dur and (not allow_empty_sample or (not closing and total_reg is None)):
         return history, False
@@ -71,6 +81,18 @@ def upsert_session_stat(
             record["avg_time_min"] = final_avg_min
             record["raw_sample_count"] = len(dur_list)
             record["valid_sample_count"] = len(valid_data)
+        elif observed_completed is not None:
+            # 沒有新的時長樣本,但完成人數仍是實測值 → 保存。只在往上時更新:
+            # 同一診次內完成數單調不減,這樣單次讀取異常(頁面暫時解析成 0)
+            # 不會把已記錄的 24 蓋掉。
+            try:
+                prev_completed = int(record.get("completed_count", 0) or 0)
+            except (TypeError, ValueError):
+                prev_completed = 0
+            if observed_completed > prev_completed:
+                record["completed_count"] = observed_completed
+        if observed_completed is not None:
+            record["completion_observed"] = True
         if closing:
             record["closing_time"] = closing
         if total_reg is not None:
@@ -86,7 +108,9 @@ def upsert_session_stat(
             "room": room_code,
             "session": session_key,
             "doctor": doc_name,
-            "completed_count": completed_count if has_dur else 0,
+            "completed_count": (completed_count if has_dur
+                                else (observed_completed or 0)),
+            "completion_observed": observed_completed is not None,
             "avg_time_min": final_avg_min if has_dur else 0.0,
             "raw_sample_count": len(dur_list) if has_dur else 0,
             "valid_sample_count": len(valid_data) if has_dur else 0,
@@ -186,10 +210,30 @@ def monthly_slot_metric_avgs(history: list, doc_name: str, room_code: Any,
                 totals.append(float(total_reg))
             except (TypeError, ValueError):
                 pass
+        # ★[2026-07-27 外審 P2] 只排除【舊格式、無從得知】的列,不做推測★
+        #   upsert_session_stat 現在一律保存頁面實測的完成人數並標記
+        #   completion_observed,所以有標記的列(含真的 0 人)都是實測值,照算。
+        #   2026-07-27 之前寫下的列沒有這個標記,其中「completed_count=0 且完全
+        #   沒有樣本」的形狀同時代表「真的 0 人」與「當時被 has_dur 閘門丟掉的
+        #   實測值」—— 兩者在磁碟上無法區分,只能排除,否則會系統性把完成平均
+        #   拉低(畫面出現「掛號 30 / 完成 12」這種對不起來的數)。
+        #   這批舊列會隨 30 天視窗自然淘汰。
         try:
-            comps.append(float(row.get("completed_count", 0)))
+            _comp = float(row.get("completed_count", 0))
         except (TypeError, ValueError):
             pass
+        else:
+            if row.get("completion_observed") is True:
+                comps.append(_comp)
+            else:
+                _samples = 0
+                for _k in ("valid_sample_count", "raw_sample_count"):
+                    try:
+                        _samples = max(_samples, int(row.get(_k, 0) or 0))
+                    except (TypeError, ValueError):
+                        pass
+                if not (_comp == 0 and _samples == 0):
+                    comps.append(_comp)
         photo = row.get("phototherapy")
         if photo is not None and photo != "":
             try:

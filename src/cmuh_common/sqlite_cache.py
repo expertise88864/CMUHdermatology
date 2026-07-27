@@ -163,28 +163,65 @@ def _ensure_initialized() -> bool:
             # 在此 except 失敗 → clinic-counts 快取永久壞掉、永不恢復。改為：隔離損壞
             # 檔(連同 -wal/-shm sidecar)成 .corrupt-<ts>，重建一個空 DB，讓快取自我
             # 修復(僅丟失歷史樣本，會重新累積)。
+            # ★[2026-07-27 review] 這裡是【唯一會毀掉整份歷史快取】的路徑，
+            #   所以必須先用 _is_corruption_error 分流：'database is locked'/'busy'
+            #   只是暫時鎖競爭(自我重啟時舊 process 還沒放手、設定目錄在
+            #   網路碟/OneDrive 卡住…)，把它當損壞就會在一次偶發等逾時後
+            #   把 30 天的門診人數全部隔離掉。暫時性 → 本次停用快取即可，
+            #   下次啟動自然重試。★
+            if not _is_corruption_error(e):
+                logging.error(
+                    "[O22] SQLite 初始化遇到暫時性鎖競爭(%s)：本次停用門診人數快取，"
+                    "【不】隔離資料檔，下次啟動會自動重試", e, exc_info=True)
+                _close_cached_conn()
+                return False
             logging.error("[O22] SQLite 疑似損壞(%s)，隔離舊檔並重建空 DB", e,
                           exc_info=True)
             _close_cached_conn()
             try:
                 ts = time.strftime("%Y%m%d_%H%M%S")
                 base = _db_path()
+                # ★[2026-07-27 外審 P3] 三種結局要分開記，而且主 DB 與 sidecar
+                #   不可混為一談：改名=救援副本還在、直接刪除=救不回來、
+                #   搬不走=資料原封不動。只有【主 DB】真的被移走時，
+                #   「歷史快取丟失」才是事實。★
+                renamed, deleted, stuck = [], [], []
                 for suffix in ("", "-wal", "-shm"):
                     p = base + suffix
-                    if os.path.exists(p):
+                    if not os.path.exists(p):
+                        continue
+                    label = suffix or "主DB"
+                    try:
+                        os.replace(p, f"{p}.corrupt-{ts}")
+                        renamed.append(label)
+                    except OSError:
                         try:
-                            os.replace(p, f"{p}.corrupt-{ts}")
+                            os.remove(p)
+                            deleted.append(label)
                         except OSError:
-                            try:
-                                os.remove(p)
-                            except OSError:
-                                logging.debug("[O22] 移除損壞檔失敗 %s", p,
-                                              exc_info=True)
+                            stuck.append(label)
+                            logging.debug("[O22] 移除損壞檔失敗 %s", p,
+                                          exc_info=True)
                 conn = _get_conn()
                 _ensure_schema(conn)
                 _initialized = True
-                logging.warning(
-                    "[O22] 已重建空 clinic_counts DB（歷史快取丟失，將重新累積）")
+                detail = "改名保留=%s、直接刪除=%s、搬不走=%s" % (
+                    renamed or "無", deleted or "無", stuck or "無")
+                if "主DB" in renamed:
+                    logging.warning(
+                        "[O22] 主 DB 已隔離為 .corrupt-%s 並重建空 clinic_counts DB"
+                        "（歷史快取丟失，將重新累積；救援副本仍在磁碟上）；%s",
+                        ts, detail)
+                elif "主DB" in deleted:
+                    logging.warning(
+                        "[O22] 主 DB 改名失敗、已直接刪除並重建空 clinic_counts DB"
+                        "（歷史快取丟失且【沒有】救援副本）；%s", detail)
+                else:
+                    # 主 DB 搬不走(Windows 上被開啟的檔案不能改名)＝原封不動，
+                    # 不可謊報「已重建空 DB、歷史丟失」。
+                    logging.warning(
+                        "[O22] 主 DB 檔搬不走(可能仍被占用)，但本次已能正常開啟；"
+                        "資料未動，繼續沿用；%s", detail)
                 return True
             except Exception:
                 logging.error("[O22] SQLite 損壞後重建失敗", exc_info=True)
