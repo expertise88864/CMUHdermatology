@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import re
 import subprocess
@@ -96,6 +97,52 @@ def step_quality_gate() -> None:
     if failed:
         fail(f"品質關卡未通過（{', '.join(failed)} 紅燈），已中止推送。\n"
              f"  尚未 bump 版本、未 commit；請修正上面紅燈後再 push。")
+
+
+def snapshot_tracked_sources() -> dict:
+    """回傳 {相對路徑: SHA256}（src/ scripts/ tests/ 下的追蹤中檔案）。
+
+    [2026-07-27 事故防護] OneDrive 會在 session 中途靜默把未提交的 src 還原成舊版。
+    實測兩次（v2026.07.24.4 / v2026.07.27.4）都發生在【pytest 綠燈之後、git add 之前】
+    這段空窗：關卡驗的是新碼、commit 進去的卻是被還原的舊碼，HEAD 自相矛盾
+    （新測試 + 舊實作 = 必紅）且【已推上線】。故在 commit 前重驗指紋。
+    """
+    # --others --exclude-standard：連「尚未追蹤但即將被 git add -A 收進去」的新檔
+    # 也納入（事故當次就有新測試檔；只驗已追蹤檔會漏掉新檔被還原/刪除的情形）。
+    cp = run(["git", "ls-files", "--cached", "--others", "--exclude-standard",
+              "src", "scripts", "tests"], check=False, capture=True)
+    snap = {}
+    for rel in cp.stdout.splitlines():
+        rel = rel.strip()
+        # version.py 由 bump 合法改寫（在關卡之後）→ 排除，否則必誤報
+        if not rel or rel.replace("\\", "/").endswith("cmuh_common/version.py"):
+            continue
+        p = REPO_ROOT / rel
+        try:
+            snap[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+        except OSError:
+            snap[rel] = ""          # 讀不到（剛被刪/鎖住）也記錄，變動即偵測得到
+    return snap
+
+
+def verify_unchanged_since_tests(before: dict) -> None:
+    """commit 前重算指紋：與品質關卡當下不一致 → 中止推送並點名檔案。
+
+    絕不自動覆蓋/還原檔案——無法判斷哪一份才是使用者要的，只中止並要求人工確認。
+    """
+    print("\n=== [6/8] 防還原檢查（品質關卡後檔案未被竄改）===")
+    after = snapshot_tracked_sources()
+    changed = sorted(k for k in set(before) | set(after)
+                     if before.get(k) != after.get(k))
+    if changed:
+        listing = "\n".join(f"    - {c}" for c in changed[:20])
+        more = f"\n    …等共 {len(changed)} 個檔案" if len(changed) > 20 else ""
+        fail("【檔案在測試通過後被改動】已中止推送（尚未 commit）：\n"
+             f"{listing}{more}\n"
+             "  最可能是 OneDrive 把未提交的檔案還原成舊版（本 repo 已發生兩次）。\n"
+             "  請確認上列檔案內容是否為你要的版本（必要時自 %TEMP% 備份還原），\n"
+             "  再重新執行 push_helper。")
+    print(f"  [OK] {len(after)} 個追蹤檔案指紋一致")
 
 
 def step3_bump_version() -> str:
@@ -184,8 +231,12 @@ def main(argv: list) -> int:
     if not step2_check_changes():
         return 0
     step_quality_gate()
+    # [2026-07-27] 關卡通過當下的檔案指紋 → commit 前重驗（見 verify_unchanged_since_tests）
+    fingerprint = snapshot_tracked_sources()
     new_ver = step3_bump_version()
     step4_sync_manifest(new_ver)
+    # bump/manifest 只動 version.py 與 manifest.json（不在 src/scripts/tests 指紋範圍）
+    verify_unchanged_since_tests(fingerprint)
     step5_commit(commit_msg, new_ver)
     step6_push()
 

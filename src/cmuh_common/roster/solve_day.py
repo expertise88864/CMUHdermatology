@@ -6,8 +6,8 @@
   1 照光Step     ← 1 位 PGY（**每個時段一律要 1 位**，含週三下午；最優先；照光總次數
                   最少者，週三下午另計 photo_wed_pm 公平）
   2 治療室Step   ← 1 位 PGY（**週三下午休診不排**；其餘時段皆排；治療室總次數最少者）
-  3 切片室Step   ← 1 位 Clerk（僅切片室開；[2026-07-24] 只排本梯未輪過者——
-                  每人整梯一次就好，全員輪過後切片室空下來，同日早午不連切）
+  3 切片室Step   ← 1 位 Clerk（僅切片室開；[2026-07-24 修訂] 開放就排好排滿，
+                  本梯切片次數最少者優先＝每人至少一次、次數差 ≤1、同日早午不連切）
   4 ClerkSeed    每個開診診間各放 1 位 Clerk（房序=決定性洗牌、就座公平輪轉）
   5 PgyMix       逐欄補 PGY（先補到「有 1 人的診間」形成 1C+1P；無 Clerk 月直接填診）
   6 ClerkOverflow 剩 Clerk 補進剩餘容量
@@ -22,8 +22,8 @@
 用途|代號)——同輸入恆同結果（可重跑重現），但逐日/逐時段變化 → 平手時打散，不會
 鎖死「同人固定同時段」的節拍（見 _jitter）。
 不硬塞：照光/治療室無 PGY → 記警告，不填（貪婪填充器無法硬性保證滿足，缺人時
-以警告呈現）；切片室無「本梯未輪過」候選 → 靜默留空（空下來是常態，逐時段警告
-只會是噪音；真正整梯輪不到者由月底「切片室輪不到」警告點名）。
+以警告呈現）；切片室當日全體已切/全請假 → 靜默留空（同日不重複是規則，非異常）
+——整梯輪不到或次數不均由月底警告點名。
 """
 from __future__ import annotations
 
@@ -193,14 +193,18 @@ class BiopsyStep(FillStep):
             return
         fc = ctx.fc
         bk = ctx.batch_key
-        # [2026-07-24 使用者] 每人整梯「一次就好」：只從本梯未輪過者挑 1 位；
-        # 全員都輪過（或未輪過者今日請假/不可用）→ 切片室空下來沒關係，不硬塞
-        # 也不逐時段警告——真正整梯輪不到者由月底「切片室輪不到」警告點名。
-        # 同人同日早+午連切自然不可能：早上切過者次數=1，下午已不在候選內。
-        undone = [c for c in ctx.clerk if fc.biopsy_done.get((bk, c), 0) == 0]
-        if not undone:
+        # [2026-07-24 使用者·修訂] 切片室開放就【排好排滿】：每人整梯至少一次、
+        # 不限一次（2、3 次都行），但同梯次數要一樣 → key 以「本梯切片次數最少者
+        # 優先」輪選（min-first 天生保證 spread ≤1，且所有人輪過一遍前不會有人
+        # 排到第二次＝at-least-once 自動達成）。舊版「每人一次就好、之後留空」
+        # 造成切片室大量空著、Clerk 卻在放假（使用者附圖）→ 廢除。
+        # 放假是最後一步（RestStep）：切片/診間都填完剩下的人才放假。
+        # 同日早+午不得同一人（次數平手時早上切過者仍可能中選）→ 明確排除。
+        cands = [c for c in ctx.clerk if fc.last_biopsy.get((bk, c)) != ctx.d]
+        if not cands:
             return
-        pick = min(undone, key=lambda c: (
+        pick = min(cands, key=lambda c: (
+            fc.biopsy_done.get((bk, c), 0),
             _jitter(ctx.d, ctx.session, "biopsy", c), c))
         ctx.clerk.remove(pick)
         slots[BIOPSY] = [pick]
@@ -648,11 +652,19 @@ def _solve_month_once(inp: DaySolveInput, preset_owed: "dict | None" = None
     for b in inp.clerk_batches:
         if b.id not in solved_batch_ids:
             continue
-        missed = [c for c in sorted(b.members)
-                  if fc.biopsy_done.get((b.id, c), 0) == 0]
+        counts = {c: fc.biopsy_done.get((b.id, c), 0) for c in sorted(b.members)}
+        missed = [c for c, n in counts.items() if n == 0]
         if missed:
             warnings.append(f"切片室輪不到（梯次 {b.id}，本梯內未排到）："
                             + "、".join(missed))
+        # [2026-07-24 使用者] 同梯切片次數要一樣：min-first 輪選天生 spread ≤1，
+        # 差距 >1 必是請假/鎖定/切片開放時段不足所致 → 點名讓使用者手動調整。
+        # （跨月梯次只解到半途時計數已含上月回放，不會誤報。）
+        elif counts and max(counts.values()) - min(counts.values()) > 1:
+            warnings.append(
+                f"切片室次數不均（梯次 {b.id}，同梯應盡量一致）："
+                + "、".join(f"{c}×{n}" for c, n in counts.items())
+                + " —— 多因請假/鎖定時段所致，可手動於月曆調整")
     return day_slots, log, warnings, fc
 
 
