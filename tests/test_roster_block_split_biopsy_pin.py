@@ -87,6 +87,57 @@ def test_last_weekend_person_taken_from_saturday():
         f"應取週六當天的人,不是 days[0](9/25 的 K): {res.last_weekend}"
 
 
+def _svc_with_members(tmp_path):
+    from cmuh_common.roster.service import RosterService
+    from cmuh_common.roster.storage import RosterStorage
+    st = RosterStorage(str(tmp_path))
+    st.save_config({
+        "r_members": [m.to_dict() for m in _MEMBERS],
+        "vs_members": [{"id": "D", "name": "D醫師"}],
+        "points": {"weekday": 1, "weekend": 2, "national_holiday": 1},
+    })
+    return RosterService(st), st
+
+
+def test_split_result_can_be_accepted(tmp_path):
+    """[2026-07-27 事故] 求解成功後【套用】仍被「結果已過期（連休段 9/25 起已非
+    同一人）」擋下 → 使用者看得到結果卻永遠存不進去。套用檢查也要以拆出的段為單位。"""
+    svc, st = _svc_with_members(tmp_path)
+    st.save_holiday_duty({"r": {"2026-09-25": "Z", "2026-09-26": "Z",
+                                "2026-09-27": "Z", "2026-09-28": "K"},
+                          "vs": {}})
+    ym = "2026-09"
+    res = solve_duty(svc.build_context("r", ym))
+    assert res.status == "ok"
+    svc.accept_solution("r", ym, res)              # 不得拋「排班結果已過期」
+    duty = st.load_month(ym)["r_duty"]
+    for day, who in ((25, "Z"), (26, "Z"), (27, "Z"), (28, "K")):
+        assert (duty.get(f"2026-09-{day}") or {}).get("person") == who
+
+
+def test_split_does_not_warn_pair_broken(tmp_path):
+    """依指定拆段是預期結果 → 套用後不該一直跳「成對被改破」。"""
+    svc, st = _svc_with_members(tmp_path)
+    st.save_holiday_duty({"r": {"2026-09-25": "Z", "2026-09-26": "Z",
+                                "2026-09-27": "Z", "2026-09-28": "K"},
+                          "vs": {}})
+    ym = "2026-09"
+    svc.accept_solution("r", ym, solve_duty(svc.build_context("r", ym)))
+    msgs = [c.msg for c in svc.quick_validate("r", ym)]
+    assert not any("成對被改破" in m for m in msgs), msgs
+    assert not any("成對不完整" in m for m in msgs), msgs
+
+
+def test_unsplit_block_broken_manually_still_warns(tmp_path):
+    """反面：沒有指定的連休段被手動排成不同人 → 仍要警告（防護沒被拆段機制吃掉）。"""
+    svc, st = _svc_with_members(tmp_path)
+    ym = "2026-08"                                  # 8/8(六)、8/9(日) 無假日鏈
+    svc.set_cell("r", ym, date(2026, 8, 8), "Z")
+    svc.set_cell("r", ym, date(2026, 8, 9), "K")
+    msgs = [c.msg for c in svc.quick_validate("r", ym)]
+    assert any("成對被改破" in m for m in msgs), msgs
+
+
 # ─── 2. 週六切片手動指定 ────────────────────────────────────────────────────
 def _sat_kwargs(**over):
     base = dict(year=2026, month=8, members=_MEMBERS,

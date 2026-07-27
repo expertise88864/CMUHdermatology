@@ -37,7 +37,8 @@ from cmuh_common.roster.solve_day import (
     person_course_stats,
 )
 from cmuh_common.roster.report import build_report
-from cmuh_common.roster.rules import Precheck, collect_directives, run_prechecks
+from cmuh_common.roster.rules import (
+    Precheck, collect_directives, run_prechecks, split_block_runs)
 from cmuh_common.roster.saturday_biopsy import (
     assign_saturday_biopsy, biopsy_pair, format_biopsy_section,
     last_assigned_before, settle_biopsy)
@@ -1264,10 +1265,16 @@ class RosterService:
             if result.assignments.get(d) != mid:
                 return f"{d.month}/{d.day} {src} {mid} 未被結果採用"
         for b in ctx.blocks:                       # 假日變動可能改變區塊分組
-            persons = {result.assignments.get(x) for x in b.days}
-            if len(persons) > 1:
-                return (f"連休段 {b.days[0].month}/{b.days[0].day} 起"
-                        f"已非同一人（假日/區塊變動）")
+            # [2026-07-27 使用者] 連休段可依使用者指定拆段（見 split_block_runs）
+            # → 只要求「同一段內同一人」。舊版要求整個連休段同一人，使用者刻意把
+            # 9/25-27 給 Z、9/28 給 K 時，求解成功卻永遠卡在「結果已過期」套用不了。
+            for run in split_block_runs(
+                    b.days,
+                    {d: directives[d][0] for d in b.days if d in directives}):
+                persons = {result.assignments.get(x) for x in run}
+                if len(persons) > 1:
+                    return (f"連休段 {run[0].month}/{run[0].day} 起"
+                            f"已非同一人（假日/區塊變動）")
         # 假日/點數設定變動：assignments 仍合法但每人點數已不同 → 舊 points 會 settle
         # 出錯誤帳本（報告/targets 也過期）。以當前 ctx 重算，不一致即拒絕、要求重排。
         recomputed = {m.id: 0 for m in ctx.members}
@@ -1331,20 +1338,27 @@ class RosterService:
                 except (ValueError, TypeError):
                     continue
         checks: list = []
+        directives, _ = collect_directives(ctx)
         for b in ctx.blocks:
-            persons = {assigned.get(d) for d in b.days}
-            span = f"{b.days[0].month}/{b.days[0].day}-{b.days[-1].day}"
-            if persons == {None}:
-                continue                      # 整段尚未排 → 不算「改破」
-            if None in persons:
-                checks.append(Precheck(
-                    "warn", "weekend_pair",
-                    f"週末連休段 {span} 有日期未排班（成對不完整）"))
-            elif len(persons) > 1:
-                checks.append(Precheck(
-                    "warn", "weekend_pair",
-                    f"週末連休段 {span} 被手動排給不同人 "
-                    f"{sorted(p for p in persons if p)}（成對被改破）"))
+            # [2026-07-27 使用者] 以「依指定拆出的段」為單位檢查——使用者刻意把
+            # 連休段指定給不同人時，那是預期結果，不該每次都跳「成對被改破」。
+            for run in split_block_runs(
+                    b.days,
+                    {d: directives[d][0] for d in b.days if d in directives}):
+                persons = {assigned.get(d) for d in run}
+                span = (f"{run[0].month}/{run[0].day}"
+                        + (f"-{run[-1].day}" if len(run) > 1 else ""))
+                if persons == {None}:
+                    continue                  # 整段尚未排 → 不算「改破」
+                if None in persons:
+                    checks.append(Precheck(
+                        "warn", "weekend_pair",
+                        f"週末連休段 {span} 有日期未排班（成對不完整）"))
+                elif len(persons) > 1:
+                    checks.append(Precheck(
+                        "warn", "weekend_pair",
+                        f"週末連休段 {span} 被手動排給不同人 "
+                        f"{sorted(p for p in persons if p)}（成對被改破）"))
         return checks
 
     @staticmethod
