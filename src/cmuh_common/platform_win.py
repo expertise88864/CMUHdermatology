@@ -8,6 +8,8 @@ import sys
 from ctypes import wintypes
 from dataclasses import dataclass
 
+from cmuh_common.paths import is_frozen
+
 # GetSystemMetrics 索引（multi-monitor 用）
 _SM_CXSCREEN = 0          # 主螢幕寬（實體像素）
 _SM_CYSCREEN = 1          # 主螢幕高
@@ -104,9 +106,20 @@ def run_as_admin() -> None:
     sys.exit(0)
 
 
-def _admin_relaunch_params(argv=None) -> str:
-    """Build ShellExecuteW params with Windows-safe quoting."""
-    return subprocess.list2cmdline(list(argv if argv is not None else sys.argv))
+def _admin_relaunch_params(argv=None, *, frozen=None) -> str:
+    """Build ShellExecuteW params with Windows-safe quoting.
+
+    [2026-07-27 review] .exe(PyInstaller frozen)模式下 sys.executable 就是程式本身，
+    argv[0] 也是同一個 exe —— 全部帶進 params 會變成
+    `app.exe "C:\\...\\app.exe" --background`，把自己的路徑當成第一個引數傳給自己。
+    `paths.restart_self` 早就分兩種模式處理(frozen 時 `[sys.executable] + args`)，
+    這裡沿用同一條規則以免兩處行為不一致。
+    (目前 repo 沒有 .spec / 打包腳本，實務上跑 .pyw；此為與既有模式對齊的一致性修正。)
+    """
+    args = list(argv if argv is not None else sys.argv)
+    if is_frozen() if frozen is None else frozen:
+        args = args[1:]
+    return subprocess.list2cmdline(args)
 
 
 def set_dpi_awareness() -> None:

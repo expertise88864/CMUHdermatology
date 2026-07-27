@@ -54,6 +54,7 @@ from cmuh_common.threshold_policy import (
 from cmuh_common.clinic_state import (
     CLINIC_ROOM_COUNT,
     DEFAULT_CLINIC_ROOMS,
+    apply_newly_completed,
     build_dynamic_state,
     clinic_dynamic_state_key,
     clinic_dynamic_today_str,
@@ -11957,38 +11958,10 @@ class AutomationApp:
                                     tracker['patient_checkin_times'][pt_num] = current_timestamp
 
                             newly_completed = current_completed_set - tracker['last_completed_set']
-                            has_valid_completion = False
-
-                            for pt_num in newly_completed:
-                                is_photo_case = False 
-                                dwell_time = 0
-
-                                if pt_num not in tracker['patient_checkin_times']:
-                                    is_photo_case = True
-                                else:
-                                    start_time = tracker['patient_checkin_times'][pt_num]
-                                    dwell_time = current_timestamp - start_time
-                                    del tracker['patient_checkin_times'][pt_num] 
-
-                                    if dwell_time < 60:
-                                        is_photo_case = True
-
-                                if is_photo_case:
-                                    tracker['phototherapy_count'] += 1
-                                else:
-                                    doctor_pace = current_timestamp - tracker['last_valid_completion_time']
-                                    
-                                    if not tracker['first_valid_skipped']:
-                                        tracker['first_valid_skipped'] = True
-                                    else:
-                                        if doctor_pace < 3600: 
-                                            tracker['durations'].append(doctor_pace)
-                                    
-                                    if dwell_time < 10800:
-                                        tracker['waiting_durations'].append(dwell_time)
-
-                                    tracker['last_valid_completion_time'] = current_timestamp
-                                    has_valid_completion = True
+                            # [2026-07-27 review] 同一輪可能有多位病人一起完成,間隔要整批
+                            # 平分(原本只有第一位拿到完整間隔、其餘記 0)。抽成純函式便於測試。
+                            has_valid_completion = apply_newly_completed(
+                                tracker, newly_completed, current_timestamp)
 
                             tracker['last_completed_set'] = current_completed_set
                             tracker['last_waiting_set'] = current_waiting_set

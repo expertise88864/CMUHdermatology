@@ -80,6 +80,57 @@ def new_clinic_tracker(curr_session_i: str, current_timestamp: float) -> dict:
     }
 
 
+PHOTO_DWELL_MAX_SEC = 60          # 停留 < 60 秒視為照光/快速個案，不列入看診時長
+PACE_SAMPLE_MAX_SEC = 3600        # 單次間隔 ≥ 1 小時視為休息/斷線，整批丟棄
+WAITING_SAMPLE_MAX_SEC = 10800    # 候診 ≥ 3 小時視為異常，不列入候診時長
+
+
+def apply_newly_completed(tracker: dict, newly_completed, current_timestamp: float) -> bool:
+    """把「本輪新完成的病人」併入 tracker 統計。回傳是否有有效(非照光)完成。
+
+    ★[2026-07-27 review] newly_completed 是【集合】,同一輪(輪詢間隔 60 秒)可能有
+      多位病人一起被判定完成。原本逐筆計算
+      `doctor_pace = now - last_valid_completion_time` 並在迴圈內就把
+      last_valid_completion_time 更新成 now → 只有迴圈中【第一位】拿到完整間隔,
+      同批其餘全部拿到 0。0 之後會被 duration_stats 的中位數帶裁掉,於是
+      「兩人共用 300 秒」被記成一筆 300(而非兩筆 150)→ 平均看診時間、
+      進而「預估剩餘」被系統性高估。改成整批平分同一段間隔。★
+
+    ★同批共用同一個基準,所以「跳過第一筆」必須跳過【整批】——
+      原本只跳過集合迭代到的第一位,其餘拿著無效基準算出的 0 照樣進樣本。★
+    """
+    valid_dwells: list[float] = []
+    checkin = tracker.setdefault('patient_checkin_times', {})
+    for pt_num in newly_completed:
+        if pt_num not in checkin:
+            # 從沒出現在候診名單 → 照光/快速個案
+            tracker['phototherapy_count'] = tracker.get('phototherapy_count', 0) + 1
+            continue
+        dwell_time = current_timestamp - checkin.pop(pt_num)
+        if dwell_time < PHOTO_DWELL_MAX_SEC:
+            tracker['phototherapy_count'] = tracker.get('phototherapy_count', 0) + 1
+            continue
+        valid_dwells.append(dwell_time)
+
+    if not valid_dwells:
+        return False
+
+    doctor_pace = current_timestamp - tracker['last_valid_completion_time']
+    if not tracker.get('first_valid_skipped'):
+        # 第一筆的「間隔」是從程式啟動/上次存檔算起的,不是醫師節奏 → 整批不取樣
+        tracker['first_valid_skipped'] = True
+    elif doctor_pace < PACE_SAMPLE_MAX_SEC:
+        share = doctor_pace / len(valid_dwells)
+        tracker['durations'].extend([share] * len(valid_dwells))
+
+    for dwell_time in valid_dwells:
+        if dwell_time < WAITING_SAMPLE_MAX_SEC:
+            tracker['waiting_durations'].append(dwell_time)
+
+    tracker['last_valid_completion_time'] = current_timestamp
+    return True
+
+
 def int_set(value: Any) -> set[int]:
     out = set()
     for item in value or []:
