@@ -122,9 +122,9 @@ def test_biopsy_open_but_no_clerk_stays_silent():
     assert not any("切片室" in ln for ln in log)
 
 
-def test_biopsy_left_empty_when_all_done():
-    """[2026-07-24 使用者] 每人整梯一次就好：全員都輪過 → 切片室空下來，
-    Clerk 改進診間，不硬塞、不警告。"""
+def test_biopsy_keeps_filling_after_everyone_had_one():
+    """[2026-07-24 使用者·修訂] 全員都輪過一次後，切片室【照排不留空】（可 2、3 次），
+    次數最少者優先——舊版「一次就好」讓切片室空著、Clerk 卻在放假。"""
     fc = FairCounters()
     fc.biopsy_done[("bx", "1")] = 1
     fc.biopsy_done[("bx", "2")] = 1
@@ -132,9 +132,35 @@ def test_biopsy_left_empty_when_all_done():
         date(2026, 8, 3), "上午", ["101"],
         pgy_avail=["A", "B"], clerk_avail=["1", "2"],
         biopsy_open=True, fc=fc, batch_key="bx")
-    assert BIOPSY not in slots, f"全員輪過仍排切片: {slots}"
-    assert sorted(slots["101"]) == ["1", "2"]                # 改進診間
+    assert len(slots[BIOPSY]) == 1, f"全員輪過就不排了: {slots}"
     assert not any("⚠" in ln for ln in log)
+
+
+def test_biopsy_picks_least_count_first():
+    """次數少者優先（壓過抖動）→ 同梯次數自然拉平，且所有人輪過前不會有人排第二次。"""
+    fc = FairCounters()
+    fc.biopsy_done[("bx", "1")] = 2
+    fc.biopsy_done[("bx", "2")] = 1
+    slots, _log = solve_session(
+        date(2026, 8, 3), "上午", ["101"],
+        pgy_avail=["A"], clerk_avail=["1", "2", "3"],
+        biopsy_open=True, fc=fc, batch_key="bx")
+    assert slots[BIOPSY] == ["3"], "應選次數 0 的 3"
+
+
+def test_biopsy_rest_only_after_biopsy_filled():
+    """[2026-07-24 使用者] 排完才放假：切片室開著就不該有 Clerk 在放假
+    （診間坐滿後剩下的人先進切片室，真的沒位子才休）。"""
+    fc = FairCounters()
+    fc.biopsy_done[("bx", "1")] = 1           # 全員都已切過一次
+    fc.biopsy_done[("bx", "2")] = 1
+    fc.biopsy_done[("bx", "3")] = 1
+    slots, _log = solve_session(
+        date(2026, 8, 3), "上午", ["101"],    # 1 房 ×2 位 = 2 個跟診座位
+        pgy_avail=["A", "B"], clerk_avail=["1", "2", "3"],
+        biopsy_open=True, fc=fc, batch_key="bx")
+    assert BIOPSY in slots, "切片室開著卻留空"
+    assert REST not in slots, f"切片室還空著就放假: {slots}"
 
 
 def test_biopsy_not_morning_and_afternoon_same_person_same_day():
@@ -153,22 +179,24 @@ def test_biopsy_not_morning_and_afternoon_same_person_same_day():
     assert "1" in pm.get("101", []), "下午應改進診間跟診"
 
 
-def test_biopsy_exactly_once_per_clerk_over_month():
-    """[2026-07-24 使用者] 整月切片開好開滿 → 每位 Clerk 恰好一次（不是至少
-    一次），之後所有時段切片室留空。"""
+def test_biopsy_every_session_filled_and_counts_even():
+    """[2026-07-24 使用者·修訂] 整梯切片開好開滿 → 每個時段都排到人（不留空）、
+    每人至少一次、同梯次數差 ≤1（不限一次，可 2、3 次）。"""
     fc = FairCounters()
     clerks = ["K1", "K2", "K3"]
     d = date(2026, 8, 3)
-    filled = 0
-    for _ in range(10):                       # 10 個工作日早診、全開切片
+    opened = filled = 0
+    for _ in range(14):                       # 兩週工作日早診、全開切片
         if d.weekday() < 5 and d.weekday() != 2:
             slots, _ = solve_session(d, "上午", ["101"], [], list(clerks),
                                      True, fc, batch_key="bx")
+            opened += 1
             filled += 1 if BIOPSY in slots else 0
         d += timedelta(days=1)
-    assert filled == 3, f"應恰排 3 次(每人一次)後留空: {filled}"
-    assert all(fc.biopsy_done.get(("bx", c), 0) == 1 for c in clerks), \
-        f"每人恰一次: {fc.biopsy_done}"
+    assert filled == opened, f"有時段切片室留空: {filled}/{opened}"
+    counts = [fc.biopsy_done.get(("bx", c), 0) for c in clerks]
+    assert min(counts) >= 1, f"有人整梯沒切過: {counts}"
+    assert max(counts) - min(counts) <= 1, f"同梯次數不一致: {counts}"
 
 
 def test_treatment_no_pgy_warns_not_forced():
