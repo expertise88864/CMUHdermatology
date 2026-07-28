@@ -187,3 +187,32 @@ def test_writer_loop_tolerates_the_old_four_field_item():
     body = code[i:i + 1500]
     assert "if len(item) >= 5:" in body
     assert "locator = None" in body
+
+
+def test_alert_includes_what_it_meant_to_write():
+    """[2026-07-28] 原本只印回讀值,看不出「本來要寫什麼」——
+    少了預期值就分不出是「寫錯」還是「讀錯/根本沒寫進去」。
+    (實機案例:信上只有『回讀 dose=800 count=21』,無從判斷。)"""
+    code = _code_only(_main_src())
+    i = code.index("def _notify_audit_mismatch(")
+    body = code[i:i + 3500]
+    assert "預期寫入:{expected" in body
+    assert "實際回讀:{detail}" in body
+
+
+def test_expected_value_comes_from_the_ledger_value_field():
+    """value 依 _record_his_action 的契約必為非 PII(醫令代碼/劑量/療程數),
+    拿來當「預期寫入」是安全的;detail 同理。不可改抓別的欄位。"""
+    code = _code_only(_main_src())
+    i = code.index("def _ledger_writer_loop(")
+    body = code[i:i + 2000]
+    assert 'expected=str(fields.get("value", ""))' in body
+
+
+def test_his_calibrated_version_matches_user_confirmed_build():
+    """[2026-07-28 使用者實測] V.1150722.01 全部熱鍵功能正常 → 校正版本必須跟上,
+    否則每台沒有自訂基線的機器都會一直收到「疑似改版」通知。"""
+    import re as _re
+    src = _main_src()
+    m = _re.search(r'_HIS_CALIBRATED_VERSION = "(\d+)"', src)
+    assert m and m.group(1) == "1150722", "校正版本應為 1150722"

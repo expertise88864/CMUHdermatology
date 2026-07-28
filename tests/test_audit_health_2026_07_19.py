@@ -182,8 +182,9 @@ def test_writer_loop_triggers_mismatch_notify(monkeypatch):
     notified = []
     monkeypatch.setattr(
         main, "_notify_audit_mismatch",
-        # [2026-07-28] 簽章多了 locator/ts(病人定位資訊,不進帳本)
-        lambda action, detail, locator=None, ts="": notified.append(action))
+        # [2026-07-28] 簽章多了 locator/ts/expected
+        # (病人定位資訊與「預期寫入」,兩者都不進 hash-chain 帳本)
+        lambda action, detail, locator=None, ts="", expected="": notified.append(action))
     monkeypatch.setattr(main, "_action_ledger",
                         lambda: type("L", (), {"record": lambda s, *a, **k: True})())
     q = main.Queue(maxsize=8)
@@ -202,7 +203,7 @@ def test_writer_loop_passes_the_patient_locator_through(monkeypatch):
     seen = []
     monkeypatch.setattr(
         main, "_notify_audit_mismatch",
-        lambda action, detail, locator=None, ts="": seen.append((locator, ts)))
+        lambda action, detail, locator=None, ts="", expected="": seen.append((locator, ts)))
     monkeypatch.setattr(main, "_action_ledger",
                         lambda: type("L", (), {"record": lambda s, *a, **k: True})())
     q = main.Queue(maxsize=8)
@@ -220,7 +221,7 @@ def test_writer_loop_tolerates_legacy_four_field_item(monkeypatch):
     seen = []
     monkeypatch.setattr(
         main, "_notify_audit_mismatch",
-        lambda action, detail, locator=None, ts="": seen.append(locator))
+        lambda action, detail, locator=None, ts="", expected="": seen.append(locator))
     monkeypatch.setattr(main, "_action_ledger",
                         lambda: type("L", (), {"record": lambda s, *a, **k: True})())
     q = main.Queue(maxsize=8)

@@ -1499,7 +1499,7 @@ _HOSPITAL_WIN_TITLE_KW = "西醫門診醫師作業"
 # 【刻意只警示、不硬停 F 鍵】:硬停在版本字串誤判時會讓醫師整組熱鍵失效(比原 bug 更糟);且完成不印
 # 已有 _find_menu_command_id_by_text 動態解析當備援。title 沒有可辨識版本字串 → 不動作(避免假警報)。
 # 硬停 + 醫師對話框待有實機可確認 title 格式再補(不確定就不自動動作,連自己的守門也一樣)。
-_HIS_CALIBRATED_VERSION = "1150720"   # 選單 id 校正對應的 HIS 版本(2026-07-20 V.1150720.01 改版:使用者實測 同意書 669→670、代碼輸入 219 仍正常→已校正;前版 1150713/1150629)
+_HIS_CALIBRATED_VERSION = "1150722"   # 選單 id 校正對應的 HIS 版本(2026-07-28 V.1150722.01:使用者實測【所有熱鍵功能皆正常】→ 選單 id 未位移,直接校正;前版 1150720/1150713/1150629)
 _HIS_VERSION_RE = re.compile(r"[Vv]\.?\s*(\d{6,8})")
 # [金絲雀 2026-07-17] 另抓含尾碼的完整版本(V.1150629.01 → 1150629.01)。主版本相同但尾碼
 # 不同(.01→.02)也可能是改版;但尾碼比對【只在基線本身帶尾碼時】才生效(見 sample_his_current_fp)
@@ -1709,7 +1709,7 @@ def _machine_name_safe() -> str:
 
 
 def _notify_audit_mismatch(action: str, detail: str, locator=None,
-                           ts: str = "") -> None:
+                           ts: str = "", expected: str = "") -> None:
     """[批次三] 回讀 mismatch 的即時通知:mismatch = 自動化寫的值與 HIS 讀回的不一致,
     正是「改版寫錯病歷」的第一時間訊號,不能等人翻帳本才發現。醫師端已有警告視窗
     (呼叫點既有),這封信給維護者。同功能同日去重;背景 daemon 緒寄,不卡帳本寫入緒。
@@ -1726,8 +1726,8 @@ def _notify_audit_mismatch(action: str, detail: str, locator=None,
             action=str(action), detail=str(detail), locator=locator)
     except Exception:
         logging.debug("[locator] 索引寫入失敗(不影響告警)", exc_info=True)
-    logging.warning("[audit] 回讀不符:%s | %s | 病人定位:%s",
-                    action, detail, _loc_text)
+    logging.warning("[audit] 回讀不符:%s | 預期 %s | %s | 病人定位:%s",
+                    action, expected or "(未提供)", detail, _loc_text)
 
     key = f"{action}|{date.today().isoformat()}"
     with _audit_notify_lock:
@@ -1745,7 +1745,11 @@ def _notify_audit_mismatch(action: str, detail: str, locator=None,
                 sent_ok = bool(_send_alert_email_via_smtp(
                     f"[皮膚科自動化] 回讀不符:{action}",
                     f"自動化寫入後回讀驗證不一致(該次寫入已依既有流程中止/警告醫師)。\n\n"
-                    f"功能:{action}\n細節:{detail}\n"
+                    f"功能:{action}\n"
+                    # [2026-07-28] 原本只印回讀值,看不出「本來要寫什麼」——
+                    # 少了預期值就分不出是「寫錯」還是「讀錯/根本沒寫進去」。
+                    f"預期寫入:{expected or '(未提供)'}\n"
+                    f"實際回讀:{detail}\n"
                     f"病人定位:{_loc_text}\n"
                     f"時間:{ts or '(未提供)'}\n電腦:{_machine_name_safe()}\n\n"
                     f"這通常代表 HIS 改版/欄位位移 —— 請核對後於設定頁重新校正金絲雀。\n"
@@ -1802,8 +1806,11 @@ def _ledger_writer_loop(q=None) -> None:
             # [批次三] 回讀不符 → 即時通知維護者(醫師端警告視窗在呼叫點既有;這封信
             # 讓改版寫錯不用等人翻帳本才發現)。async 寄,不卡本寫入緒。
             if str(fields.get("outcome", "")) == _LEDGER_MISMATCH:
+                # value 依 _record_his_action 的契約必為非 PII(醫令代碼/劑量/療程數),
+                # 拿來當「預期寫入」是安全的。
                 _notify_audit_mismatch(action, str(fields.get("detail", "")),
-                                       locator=locator, ts=ts)
+                                       locator=locator, ts=ts,
+                                       expected=str(fields.get("value", "")))
         except Exception:
             logging.debug("[ledger] 背景寫入失敗(不影響操作)", exc_info=True)
         finally:
