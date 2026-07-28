@@ -30,6 +30,7 @@ from cmuh_common.atomic_io import safe_load_json_ex as _safe_load_json_ex
 from cmuh_common.config_io import load_json_dict, load_json_list
 from cmuh_common.app_settings import (
     load_doctors_settings as _load_doctors_settings,
+    clear_load_failed as _clear_settings_load_failed,
     settings_load_failed as _settings_load_failed,
     load_r_doctor_settings as _load_r_doctor_settings,
     load_threshold_settings as _load_threshold_settings,
@@ -50,6 +51,13 @@ from cmuh_common.threshold_policy import (
     DEFAULT_THRESHOLDS,
     build_doctor_threshold_map,
     is_near_alert_threshold,
+)
+from cmuh_common.settings_defaults import (
+    SETTINGS_GROUPS,
+    F8_QUICK_TEXT_DEFAULT as _F8_QUICK_TEXT_DEFAULT,
+    describe as _describe_settings_default,
+    group as _settings_group,
+    restore_defaults as _restore_settings_defaults,
 )
 from cmuh_common.clinic_state import (
     CLINIC_ROOM_COUNT,
@@ -3821,7 +3829,9 @@ def script_F5_adaptive():
 # F8 — 快速輸入文字 (可在設定頁修改，預設 A126585189)
 # =============================================================================
 
-F8_QUICK_TEXT_DEFAULT = "A126585189"
+# [2026-07-27] 值本身搬到 cmuh_common.settings_defaults(設定預設值的單一事實來源);
+# 此處保留同名別名,既有呼叫端與測試不受影響。
+F8_QUICK_TEXT_DEFAULT = _F8_QUICK_TEXT_DEFAULT
 
 # [v10] F8 quick text mtime-guarded 快取：避免每次按 F8 都重讀+parse JSON，
 # 但檔案被改 (mtime 變) 時自動重讀 → 維持「設定頁改完不用重啟即時生效」。
@@ -14423,8 +14433,148 @@ class AutomationApp:
         # =========================================================================
 
         # [這行保持在原本的最下方]
-        ttk.Button(scrollable_frame, text="儲存所有設定", command=self.save_all_settings).pack(pady=20, ipady=5, ipadx=30)
+        _bottom = ttk.Frame(scrollable_frame)
+        _bottom.pack(pady=20)
+        ttk.Button(_bottom, text="儲存所有設定", command=self.save_all_settings).pack(
+            side=tk.LEFT, ipady=5, ipadx=30)
+        ttk.Button(_bottom, text="還原預設設定…", command=self.open_restore_defaults_dialog
+                   ).pack(side=tk.LEFT, padx=(16, 0), ipady=5, ipadx=12)
         self._bind_mousewheel_recursive(scrollable_frame, _on_mousewheel)
+
+    # ─── 還原預設設定 ────────────────────────────────────────────────────
+    # [2026-07-27 使用者] 「新增一個返回預設設定功能(可以直接載入設定頁面預設的設定,
+    # 如原本預設醫師代號/原本預設止掛提醒email等等)」。
+    # 擴充規約:群組清單來自 cmuh_common.settings_defaults.SETTINGS_GROUPS —— 之後新增
+    # 設定檔只要在那邊加一個 SettingsGroup,這個對話框會自動長出那一項,不必改 UI。
+    def open_restore_defaults_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("還原預設設定")
+        win.transient(self.root)
+        win.grab_set()
+        frm = ttk.Frame(win, padding=14)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            frm,
+            text="勾選要還原成【原廠預設】的項目。還原前會自動把現有設定檔另存備份。",
+            wraplength=560, justify="left",
+            font=("Microsoft JhengHei UI", self.f_md, "bold")).pack(anchor="w")
+        ttk.Label(
+            frm,
+            text="⚠ 還原後畫面會立即套用預設值,並【直接寫入檔案】(不需再按「儲存所有設定」)。",
+            wraplength=560, justify="left", foreground="#B00020",
+            font=("Microsoft JhengHei UI", self.f_sm)).pack(anchor="w", pady=(2, 10))
+
+        vars_by_key = {}
+        for g in SETTINGS_GROUPS:
+            row = ttk.Frame(frm)
+            row.pack(fill=tk.X, pady=(0, 6))
+            var = tk.BooleanVar(value=True)
+            vars_by_key[g.key] = var
+            ttk.Checkbutton(row, text=g.label, variable=var).pack(anchor="w")
+            # 讓使用者按下去【之前】就看得到會變成什麼,而不是按完才發現
+            ttk.Label(row, text=f"    → {_describe_settings_default(g.key)}",
+                      wraplength=540, justify="left", foreground="#666",
+                      font=("Microsoft JhengHei UI", self.f_sm)).pack(anchor="w")
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill=tk.X, pady=(10, 0))
+
+        def _do():
+            keys = [k for k, v in vars_by_key.items() if v.get()]
+            if not keys:
+                messagebox.showinfo("沒有選擇項目", "請至少勾選一項再還原。", parent=win)
+                return
+            labels = "\n".join(f"  • {g.label}" for g in SETTINGS_GROUPS
+                               if g.key in keys)
+            if not messagebox.askyesno(
+                    "確認還原預設",
+                    f"將把下列設定還原成原廠預設:\n\n{labels}\n\n"
+                    "現有設定會先備份成 .before-reset-<時間> 檔案。確定要還原嗎?",
+                    parent=win):
+                return
+            win.destroy()
+            self._restore_settings_defaults(keys)
+
+        ttk.Button(btns, text="還原選定項目", command=_do).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side=tk.RIGHT, padx=(0, 8))
+
+    def _restore_settings_defaults(self, keys):
+        """執行還原 → 重載記憶體 → 更新畫面。失敗只回報,不讓例外炸掉 UI。"""
+        report = _restore_settings_defaults(keys, conf_path=get_conf_path)
+        for key, _fn in report.restored:
+            # 成功寫入之後才解除「本次執行讀不到 → 拒絕存檔」的保護:使用者是明確
+            # 要求覆蓋、而且原檔已備份,再擋著只會讓他重置完卻不能按儲存。
+            try:
+                _clear_settings_load_failed(_settings_group(key).filename)
+            except Exception:
+                logging.debug("[設定] 解除拒絕存檔保護失敗 key=%s", key, exc_info=True)
+        try:
+            self._reload_settings_into_ui()
+        except Exception:
+            logging.error("[設定] 還原後更新畫面失敗", exc_info=True)
+            messagebox.showwarning(
+                "已還原,但畫面未更新",
+                "設定檔已還原成預設,但畫面重整失敗。請重新啟動主程式。",
+                parent=self.root)
+            return
+        lines = []
+        if report.restored:
+            lines.append("已還原:\n" + "\n".join(
+                f"  • {_settings_group(k).label}" for k, _ in report.restored))
+        if report.backups:
+            lines.append(f"原設定已備份 {len(report.backups)} 個檔案"
+                         f"(settings 資料夾內的 .before-reset-* )。")
+        if report.failures:
+            lines.append("下列項目【沒有】還原:\n" + "\n".join(
+                f"  • {_settings_group(k).label}:{why}"
+                for k, why in report.failures))
+        self._show_notice(
+            "還原預設設定" + ("" if report.ok else "(部分失敗)"),
+            "\n\n".join(lines) or "沒有任何項目被還原。",
+            level="info" if report.ok else "warn",
+            auto_close_ms=None if not report.ok else 6000)
+
+    def _reload_settings_into_ui(self):
+        """把磁碟上的設定重新讀進記憶體並刷新設定頁控件。
+
+        擴充規約:新增一個設定控件時,把「從 self.* 灌回控件」的那一行加到這裡,
+        還原預設與未來任何「重讀設定」的需求就都自動涵蓋。
+        """
+        self.r_doctor_map = self.load_r_doctor_settings()
+        self.threshold_settings = self.load_threshold_settings()
+        self.doctors_list = self.load_doctors_settings()
+        self.alert_email_recipients = list(
+            self.threshold_settings.get('alert_email_recipients') or [])
+
+        for r_key, entries in getattr(self, 'r_doctor_entries', {}).items():
+            entries["name_var"].set(self.r_doctor_map.get(r_key, {}).get('name', ''))
+        for key, var in getattr(self, 'threshold_entries', {}).items():
+            var.set(self.threshold_settings.get(key, DEFAULT_THRESHOLDS.get(key, '')))
+        for attr, key, fallback in (
+                ('alert_chang_enabled', 'alert_chang_enabled', False),
+                ('alert_chen_enabled', 'alert_chen_enabled', False),
+                ('out_of_hospital_var', 'out_of_hospital_mode', False),
+                ('quick_text_f8_var', 'quick_text_f8', F8_QUICK_TEXT_DEFAULT),
+                ('ui_font_scale_var', 'ui_font_scale', 1.0)):
+            var = getattr(self, attr, None)
+            if var is not None:
+                var.set(self.threshold_settings.get(key, fallback))
+        # 影子變數要跟著走,否則止掛提醒仍沿用還原前的開關
+        self.val_alert_chang = self.alert_chang_enabled.get()
+        self.val_alert_chen = self.alert_chen_enabled.get()
+
+        if getattr(self, 'alert_mail_listbox', None) is not None:
+            self.alert_mail_listbox.delete(0, tk.END)
+            for r in self.alert_email_recipients:
+                self.alert_mail_listbox.insert(tk.END, r)
+        if getattr(self, 'doctors_tree', None) is not None:
+            self.refresh_doctors_treeview()
+
+        global DOCTORS, DOCTOR_NAMES
+        DOCTORS = self.doctors_list
+        DOCTOR_NAMES = [d["name"] for d in DOCTORS]
+        self.refresh_all_calendars()
+        self._trigger_refresh(is_manual=True)
 
     def refresh_doctors_treeview(self):
         for i in self.doctors_tree.get_children(): self.doctors_tree.delete(i)

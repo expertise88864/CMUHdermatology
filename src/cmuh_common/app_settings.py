@@ -16,7 +16,6 @@ from cmuh_common.config_io import (
     normalize_doctor_rows,
 )
 from cmuh_common.paths import get_conf_path
-from cmuh_common.threshold_policy import DEFAULT_THRESHOLDS
 
 # [2026-07-26 審查 ★設定被覆蓋★] 本次執行中「暫時讀不到」(檔案仍在,只是被防毒/備份鎖住)
 # 的設定檔名。載入失敗時這些 loader 會回【預設值】—— 若呼叫端拿那份預設值去存檔,
@@ -28,6 +27,18 @@ _LOAD_FAILED_FILES: set = set()
 def settings_load_failed() -> set:
     """本次執行中曾經「暫時讀不到」的設定檔名(空 set = 都正常)。"""
     return set(_LOAD_FAILED_FILES)
+
+
+def clear_load_failed(filename: str) -> None:
+    """把某個設定檔標記為「已無讀取失敗疑慮」。
+
+    [2026-07-27] 只有「還原預設」該呼叫:那條路徑是使用者【明確要求】把該檔覆蓋成
+    預設,而且已先備份原檔 —— 拒絕存檔的守衛(防的是無意間覆蓋)在此已無意義,
+    再留著只會讓使用者重置完卻永遠不能按儲存。**成功寫入之後**才可呼叫。
+    """
+    if filename in _LOAD_FAILED_FILES:
+        _LOAD_FAILED_FILES.discard(filename)
+        logging.info("設定檔 %s 已還原為預設 → 解除本次執行的「拒絕存檔」保護", filename)
 
 
 def _note_load_status(filename: str, status: str) -> None:
@@ -126,8 +137,18 @@ def load_threshold_settings(
     dnd_end_hour: int = DEFAULT_NOTIFY_DND_END_HOUR,
 ) -> dict:
     """Load threshold settings and fill legacy notification defaults."""
-    defaults = default_thresholds or DEFAULT_THRESHOLDS
-    data, _st = load_json_dict_ex(_path(path, "threshold_settings.json"), defaults)
+    # [2026-07-27] 預設值改由 settings_defaults 統一宣告(門檻 + 收件人 + F8 + 介面),
+    # 這樣「新增一個設定鍵」只要動那一份 dict,載入/還原預設/摘要三件事自動涵蓋。
+    # 呼叫端仍可用 default_thresholds 覆寫(測試用)。
+    from cmuh_common.settings_defaults import default_threshold_settings
+    defaults = dict(default_threshold_settings())
+    if default_thresholds:
+        defaults.update(default_thresholds)
+    # ★順序很重要★ 下面那幾條「舊格式推導」的條件都是 `if key not in data`。
+    # 若先把預設合進來,每個鍵都會存在 → 推導全部失效,而舊機器的檔案往往【只有】
+    # notify_dnd_*_hour(沒有 *_time),它們的勿擾時段就會被悄悄換成預設值。
+    # 故:先拿【原始檔案內容】做推導,最後才用預設補齊缺的鍵。
+    data, _st = load_json_dict_ex(_path(path, "threshold_settings.json"), None)
     _note_load_status("threshold_settings.json", _st)
     if "ui_font_scale" not in data:
         data["ui_font_scale"] = 1.0
@@ -145,7 +166,9 @@ def load_threshold_settings(
             data.get("notify_dnd_end_hour", dnd_end_hour),
             dnd_end_hour,
         )
-    return data
+    out = defaults
+    out.update(data)
+    return out
 
 
 def load_doctors_settings(path: str | None = None) -> list:
