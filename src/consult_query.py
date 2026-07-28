@@ -2801,18 +2801,18 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                 else:
                     logging.error("會診查詢任務已重試 %d 次仍失敗，放棄。最後錯誤：%s",
                                   retry_count, last_err)
-                    # [2026-07-25 審查] 連續失敗達門檻 → 告警給一般收件人。
-                    # 輪詢模式「沒信」是常態,故障不主動說就沒人會發現(見 _note_job_failure)。
-                    # [codex] 收件人固定用【一般團隊名單】：email 觸發時 recipients
-                    # 已被改寫成觸發醫師本人,若沿用會 ①健康告警寄給該醫師(他同時還會
-                    # 收到下方的個人失敗通知 → 同一次失敗收兩封) ②團隊反而收不到
-                    # ③六小時冷卻已被消耗,下一輪 poll 失敗也補不了通知。
-                    # [codex R2] 不可 `or recipients` 當後備：團隊名單為空而本次是
-                    # email 觸發時,recipients 仍是觸發醫師 → 又變成寄給他(且他還會收到
-                    # 下方的個人失敗通知＝同次兩封)、團隊依然收不到。沒有團隊收件人時
-                    # 就只記 warning(不啟動六小時冷卻,見 _note_job_failure)。
+                    # 連續失敗達門檻 → 告警。輪詢模式「沒信」是常態,故障不主動說
+                    # 就沒人會發現(見 _note_job_failure)。
+                    # ★[2026-08-02 使用者定案] 收件人改為【只有開發者】★
+                    #   推翻 2026-07-25 的「寄給團隊名單」定案 —— 使用者實際收到那封信
+                    #   之後認為:系統/自動化故障訊息不該騷擾整組臨床人員,他們對
+                    #   「等不到主畫面」也無從處理。臨床事件(會診查詢結果、止掛達門檻)
+                    #   仍照舊寄給各自的名單,只有【故障告警】改道。
+                    #   原本的兩個坑因此自然消失:①email 觸發時 recipients 已被改寫成
+                    #   觸發醫師本人(沿用會讓他同一次失敗收兩封);②團隊名單為空時
+                    #   不可 `or recipients` 當後備(codex R2)。現在收件人與 cfg 無關。
                     try:
-                        _note_job_failure(cfg.get("recipients") or [],
+                        _note_job_failure(_developer_alert_recipients(),
                                           str(last_err))
                     except Exception:
                         logging.debug("連續失敗告警處理失敗（略過）", exc_info=True)
@@ -3204,6 +3204,11 @@ def _send_dedup_notice_async(senders) -> None:
 # 之類的永久故障與「今天沒有新會診」在使用者眼中完全一樣;外層 watchdog 只看 log 檔
 # mtime,而錯誤一直在寫 log → 它會回報健康。結果是團隊看著一片安靜、以為沒有會診。
 # 故:連續失敗達門檻就寄一封節流告警,恢復後自動重置。
+# 系統故障告警的收件人 = 開發者本人(單一宣告處在 cmuh_common.settings_defaults)
+from cmuh_common.settings_defaults import (  # noqa: E402
+    developer_alert_recipients as _developer_alert_recipients,
+)
+
 _JOB_FAIL_ALERT_THRESHOLD = 3          # 連續 3 次放棄(≈45 分鐘無法查詢)才告警,避免暫時性抖動
 _JOB_FAIL_ALERT_COOLDOWN_SEC = 6 * 3600
 _job_fail_streak = 0
@@ -3219,7 +3224,11 @@ def _note_job_success() -> None:
 
 
 def _note_job_failure(recipients, reason: str) -> None:
-    """任務重試用盡 → 累計；達門檻且過了冷卻時間就寄一封告警（節流，不洗信箱）。"""
+    """任務重試用盡 → 累計；達門檻且過了冷卻時間就寄一封告警（節流，不洗信箱）。
+
+    [2026-08-02] recipients 由呼叫端固定傳入開發者信箱(見呼叫點的說明),
+    不再取自 cfg —— 這封是【系統故障】告警,不是臨床通知。
+    """
     global _job_fail_streak, _job_fail_last_alert
     _job_fail_streak += 1
     if _job_fail_streak < _JOB_FAIL_ALERT_THRESHOLD:
@@ -3244,8 +3253,9 @@ def _note_job_failure(recipients, reason: str) -> None:
                       f"{streak} 次，目前很可能查不到任何會診。\n\n"
                       f"最後錯誤：{str(reason)[:300]}\n\n"
                       "請注意：輪詢模式在「沒有新會診」時本來就不會寄信，因此這種故障"
-                      "從外觀上與「今天沒有新會診」完全一樣——請改用人工方式確認會診，"
+                      "從外觀上與「今天沒有新會診」完全一樣——期間請以人工方式確認會診，"
                       "並查看 settings/consult_query.log。\n"
+                      "（本信只寄給開發者；臨床同仁不會收到，需要時請自行轉知。）\n"
                       "（恢復正常後不會再寄；同一波故障最多 6 小時提醒一次。）"),
                 attachment_path=None,
             )

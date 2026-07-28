@@ -62,7 +62,9 @@ from cmuh_common.patient_locator import (
     parse_banner as _parse_patient_banner,
 )
 from cmuh_common.settings_defaults import (
+    DEVELOPER_ALERT_EMAIL as _DEVELOPER_ALERT_EMAIL,
     SETTINGS_GROUPS,
+    developer_alert_recipients as _developer_alert_recipients_shared,
     F8_QUICK_TEXT_DEFAULT as _F8_QUICK_TEXT_DEFAULT,
     describe as _describe_settings_default,
     group as _settings_group,
@@ -1950,13 +1952,14 @@ def _his_write_verdict_for(title: str):
 # [使用者定案 2026-07-20] 金絲雀改版偵測、稽核健康/回讀不符等「開發者維護訊息」只寄給
 # 開發者本人,【不】寄給止掛提醒那組臨床收件人(改版訊息不該騷擾其他醫師)。硬編碼(使用者
 # 要求直接寫入程式),與 consult_query 收件人同屬使用者定案的公開個人 email。
-DEVELOPER_ALERT_EMAIL = "expertise88864@gmail.com"
+# [2026-08-02] 值搬到 cmuh_common.settings_defaults(單一宣告處);consult_query 也用同一份。
+DEVELOPER_ALERT_EMAIL = _DEVELOPER_ALERT_EMAIL
 
 
 def _developer_alert_recipients() -> list:
     """開發者維護通知(金絲雀改版、稽核健康/mismatch)的收件人 = 開發者本人。
     與臨床止掛提醒收件人(_load_alert_recipients)刻意分開。"""
-    return [DEVELOPER_ALERT_EMAIL]
+    return _developer_alert_recipients_shared()
 
 
 def _load_alert_recipients() -> list:

@@ -37,17 +37,35 @@ def _write(p, obj):
 
 
 # ─── 預設值本身 ────────────────────────────────────────────────────────────
-def test_default_alert_recipient_is_the_requested_address():
-    assert (sd.DEFAULT_ALERT_EMAIL_RECIPIENTS
-            == ["lai.i.chang.58@gmail.com"])
+# [2026-08-02 使用者定案] 止掛提醒的預設收件人擴充為四人。
+WANT_ALERT_RECIPIENTS = [
+    "lai.i.chang.58@gmail.com",
+    "expertise88864@gmail.com",
+    "chilly840724@gmail.com",
+    "mbpushowo@gmail.com",
+]
+
+
+def test_default_alert_recipients_are_the_requested_addresses():
+    assert sd.DEFAULT_ALERT_EMAIL_RECIPIENTS == WANT_ALERT_RECIPIENTS
     assert (sd.default_threshold_settings()["alert_email_recipients"]
-            == ["lai.i.chang.58@gmail.com"])
+            == WANT_ALERT_RECIPIENTS)
 
 
-def test_new_install_gets_the_default_recipient(tmp_path):
+def test_new_install_gets_the_default_recipients(tmp_path):
     """全新機器(檔案不存在)→ 直接帶入預設收件人。"""
     got = load_threshold_settings(str(tmp_path / "threshold.json"))
-    assert got["alert_email_recipients"] == ["lai.i.chang.58@gmail.com"]
+    assert got["alert_email_recipients"] == WANT_ALERT_RECIPIENTS
+
+
+def test_developer_alert_email_is_declared_once():
+    """★系統故障告警 vs 臨床通知是兩條線★ 開發者信箱只宣告一次,
+    main.py 與 consult_query.py 都從這裡取,不各自硬編碼。"""
+    assert sd.DEVELOPER_ALERT_EMAIL == "expertise88864@gmail.com"
+    assert sd.developer_alert_recipients() == ["expertise88864@gmail.com"]
+    a = sd.developer_alert_recipients()
+    a.append("污染")
+    assert sd.developer_alert_recipients() == ["expertise88864@gmail.com"]
 
 
 def test_deliberately_emptied_recipients_must_not_be_resurrected(tmp_path):

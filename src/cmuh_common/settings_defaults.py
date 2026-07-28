@@ -44,7 +44,26 @@ DEFAULT_NOTIFY_DND_END_HOUR = 8
 #   merge 語意是 base.update(file) → 檔案有鍵就以檔案為準)。使用者若刻意把收件人
 #   清空,檔案裡會是 `[]`(鍵存在)→ 不會被這個預設復活。這點很重要:同一個坑
 #   在 smtp_mail 的帳密快取上踩過一次(「成功讀到空設定要無條件清快取」)。
-DEFAULT_ALERT_EMAIL_RECIPIENTS = ["lai.i.chang.58@gmail.com"]
+DEFAULT_ALERT_EMAIL_RECIPIENTS = [
+    "lai.i.chang.58@gmail.com",
+    "expertise88864@gmail.com",
+    "chilly840724@gmail.com",
+    "mbpushowo@gmail.com",
+]
+
+# [2026-08-02 使用者定案] 「這種系統提示錯誤的信件直接寄給開發者email」。
+# ★這推翻了 2026-07-25 的定案(會診連續失敗告警寄給團隊名單)★ —— 使用者實際收到
+# 那封信之後認為系統故障訊息不該騷擾整組臨床人員,改為只寄開發者本人。
+# 【單一宣告處】main.py 與 consult_query.py 都從這裡取,不各自硬編碼一份。
+#
+# 界線:「系統/自動化故障」→ 開發者(本常數)。
+#       「臨床事件」(止掛達門檻、會診查詢結果、email 觸發的回信)→ 各自的收件人名單。
+DEVELOPER_ALERT_EMAIL = "expertise88864@gmail.com"
+
+
+def developer_alert_recipients() -> list:
+    """系統/自動化故障告警的收件人 = 開發者本人(每次回新 list,呼叫端可安全修改)。"""
+    return [DEVELOPER_ALERT_EMAIL]
 
 
 def default_threshold_settings() -> dict:

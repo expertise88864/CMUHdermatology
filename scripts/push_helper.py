@@ -11,7 +11,6 @@
 """
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import re
 import subprocess
@@ -99,30 +98,133 @@ def step_quality_gate() -> None:
              f"  尚未 bump 版本、未 commit；請修正上面紅燈後再 push。")
 
 
-def snapshot_tracked_sources() -> dict:
-    """回傳 {相對路徑: SHA256}（src/ scripts/ tests/ 下的追蹤中檔案）。
+VERSION_REL = "src/cmuh_common/version.py"
+MANIFEST_REL = "manifest.json"
+# git add -A 會收進來、且值得防還原的範圍
+SCAN_PATHS = ["src", "scripts", "tests", MANIFEST_REL]
 
-    [2026-07-27 事故防護] OneDrive 會在 session 中途靜默把未提交的 src 還原成舊版。
-    實測兩次（v2026.07.24.4 / v2026.07.27.4）都發生在【pytest 綠燈之後、git add 之前】
-    這段空窗：關卡驗的是新碼、commit 進去的卻是被還原的舊碼，HEAD 自相矛盾
-    （新測試 + 舊實作 = 必紅）且【已推上線】。故在 commit 前重驗指紋。
+
+def _git_bytes(args: list, stdin: bytes = b"") -> bytes:
+    cp = subprocess.run(["git", *args], input=stdin, cwd=REPO_ROOT,
+                        capture_output=True, text=False)
+    if cp.returncode != 0:
+        fail(f"git {' '.join(args)} 失敗，為安全起見中止推送。\n"
+             f"{cp.stderr.decode('utf-8', 'replace')[:400]}")
+    return cp.stdout
+
+
+def worktree_blob_ids(*, include_version: bool = False) -> dict:
+    """{相對路徑: git blob id}——「這些檔案現在 git add 進去會變成什麼」。
+
+    ★[2026-08-02 補審] 一定要讓 git 自己算,不可自行 sha256(檔案原始 bytes)★
+    本機 core.autocrlf=true 且 .gitattributes 是 `* text=auto eol=lf`,git 在
+    add 時會把 CRLF 正規化成 LF。更致命的是 push_helper **自己** bump 出來的
+    version.py 在磁碟上就是 CRLF(Path.write_text 在 Windows 把 \n 轉成 \r\n)——
+    自算的 hash 與 index 裡的必然不同,會變成【每一次推送都誤報】。
+    `git hash-object` 會依 .gitattributes 套用同一組 filter(實測其輸出等於
+    `git ls-files -s` 的 blob id),binary 檔也由 git 自行判定,正確且不必自己猜。
+
+    include_version:bump 會在關卡之後合法改寫 version.py → 關卡前後的比對要排除它;
+    index 比對則必須納入(見 main())。
     """
     # --others --exclude-standard：連「尚未追蹤但即將被 git add -A 收進去」的新檔
     # 也納入（事故當次就有新測試檔；只驗已追蹤檔會漏掉新檔被還原/刪除的情形）。
-    cp = run(["git", "ls-files", "--cached", "--others", "--exclude-standard",
-              "src", "scripts", "tests"], check=False, capture=True)
-    snap = {}
-    for rel in cp.stdout.splitlines():
-        rel = rel.strip()
-        # version.py 由 bump 合法改寫（在關卡之後）→ 排除，否則必誤報
-        if not rel or rel.replace("\\", "/").endswith("cmuh_common/version.py"):
+    listed = _git_bytes(["ls-files", "--cached", "--others", "--exclude-standard",
+                         "-z", *SCAN_PATHS])
+    rels = [x.decode("utf-8", "surrogateescape")
+            for x in listed.split(b"\0") if x]
+    if not include_version:
+        rels = [r for r in rels if r.replace("\\", "/") != VERSION_REL]
+    existing = [r for r in rels if (REPO_ROOT / r).exists()]
+    out = {r: "" for r in rels}          # 不存在(已刪/讀不到)→ 空字串
+    if existing:
+        ids = _git_bytes(
+            ["hash-object", "--stdin-paths"],
+            ("\n".join(existing) + "\n").encode("utf-8")).split()
+        if len(ids) != len(existing):
+            fail("git hash-object 回傳筆數與檔案數不符，為安全起見中止推送。")
+        for rel, bid in zip(existing, ids, strict=True):
+            out[rel] = bid.decode("ascii")
+    return out
+
+
+def index_blob_ids() -> dict:
+    """{相對路徑: blob id}——index 裡真的要 commit 的內容。"""
+    raw = _git_bytes(["ls-files", "-s", "-z", *SCAN_PATHS])
+    out = {}
+    for entry in raw.split(b"\0"):
+        if not entry:
             continue
-        p = REPO_ROOT / rel
-        try:
-            snap[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
-        except OSError:
-            snap[rel] = ""          # 讀不到（剛被刪/鎖住）也記錄，變動即偵測得到
-    return snap
+        meta, _, path = entry.partition(b"\t")
+        parts = meta.split()
+        if len(parts) >= 2:
+            out[path.decode("utf-8", "surrogateescape")] = parts[1].decode("ascii")
+    return out
+
+
+# 舊名保留:既有測試與呼叫端沿用(語意由 sha256 改為 git blob id)
+snapshot_tracked_sources = worktree_blob_ids
+
+
+def verify_index_matches(expected: dict) -> None:
+    """★真正的防線★ `git add -A` 之後,比對【index 裡真的要 commit 的內容】。
+
+    [2026-08-02 補審 P1] 原本只比對「工作目錄的兩次快照」,留下兩個空窗:
+      (1) 品質關卡返回 → 取基準之間被還原 → 舊版直接成為合法基準,檢查必過。
+      (2) 檢查通過 → `git add -A` 之間被還原 → 被還原的內容照樣進 commit。
+    這正是本防護聲稱要消除的事故類型。改成對 index 驗證後,「測過的內容」與
+    「commit 進去的內容」之間不再有任何空窗 —— commit 的就是這個 index。
+
+    空字串 = 取樣當下該檔就不在(使用者刻意刪除)→ 它【本來就該】從 index 消失。
+    第一版把「index 沒有這個項目」一律當成異常,結果刪掉一個 source 檔就再也
+    push 不出去(補審第 2 輪抓到,是我引進的迴歸)。兩個方向現在都覆蓋:
+    該在卻不在、以及該不在卻還在(刪掉後又被還原回來)。
+    """
+    print("")
+    print("=== [7/9] 防還原檢查（index 內容 == 測過的內容）===")
+    actual = index_blob_ids()
+    # ★[2026-08-02 補審第 4 輪] 比對【聯集】,不可只比 expected 的鍵★
+    #   取樣之後、git add -A 之前才出現的新檔,只比 expected 就完全看不到 ——
+    #   它會被 staged 並 commit 出去,而那正是「commit 的內容 == 測過的內容」
+    #   要保證的事。空字串仍代表「預期不存在」,刻意刪檔的情形不受影響。
+    changed = sorted(r for r in {*expected, *actual}
+                     if actual.get(r, "") != expected.get(r, ""))
+    if changed:
+        listing = "\n".join(f"    - {c}" for c in changed[:20])
+        more = f"\n    …等共 {len(changed)} 個檔案" if len(changed) > 20 else ""
+        fail("【即將 commit 的內容與測過的內容不符】已中止推送（尚未 commit）：\n"
+             f"{listing}{more}\n"
+             "  最可能是 OneDrive 把未提交的檔案還原成舊版（本 repo 已發生兩次）。\n"
+             "  請確認上列檔案內容是否為你要的版本（必要時自 %TEMP% 備份還原），\n"
+             "  再重新執行 push_helper。")
+    print(f"  [OK] {len(expected)} 個檔案的 index 內容與測過的一致")
+
+
+def verify_staged_version_consistency(new_version: str) -> None:
+    """★[2026-08-02 補審] 檢查【真正要 commit 的】version.py 與 manifest.json 一致★
+
+    比「盯著微秒級的還原時窗」更可靠的做法,是直接驗那個【會造成危害的不變量】:
+    committed version.py 的 CURRENT_VERSION 必須等於 manifest.json 的 app_version。
+    兩者不一致時,所有機器下載後 SHA256 對不上 → 更新 fail-closed 全面停更。
+    不管中間發生過什麼還原/競態,這條檢查都成立。
+    """
+    print("")
+    print("=== [7.5/9] 版本一致性（index 內的 version.py == manifest）===")
+    ver_blob = _git_bytes(["cat-file", "blob", f":{VERSION_REL}"]).decode(
+        "utf-8", "replace")
+    man_blob = _git_bytes(["cat-file", "blob", f":{MANIFEST_REL}"]).decode(
+        "utf-8", "replace")
+    m = re.search(r'CURRENT_VERSION\s*=\s*["\']([^"\']+)["\']', ver_blob)
+    staged_ver = m.group(1) if m else "(解析不到)"
+    m2 = re.search(r'"app_version"\s*:\s*"([^"]+)"', man_blob)
+    staged_man = m2.group(1) if m2 else "(解析不到)"
+    if staged_ver != new_version or staged_man != new_version:
+        fail("【即將 commit 的版本不一致】已中止推送（尚未 commit）：\n"
+             f"    本次 bump 版本      = {new_version}\n"
+             f"    index 內 version.py = {staged_ver}\n"
+             f"    index 內 manifest   = {staged_man}\n"
+             "  若放行，其他機器下載後 SHA256 會對不上而讓更新全面 fail-closed。")
+    print(f"  [OK] version.py 與 manifest 皆為 {new_version}")
 
 
 def verify_unchanged_since_tests(before: dict) -> None:
@@ -130,7 +232,7 @@ def verify_unchanged_since_tests(before: dict) -> None:
 
     絕不自動覆蓋/還原檔案——無法判斷哪一份才是使用者要的，只中止並要求人工確認。
     """
-    print("\n=== [6/8] 防還原檢查（品質關卡後檔案未被竄改）===")
+    print("\n=== [5/9] 防還原檢查（品質關卡期間檔案未被竄改）===")
     after = snapshot_tracked_sources()
     changed = sorted(k for k in set(before) | set(after)
                      if before.get(k) != after.get(k))
@@ -142,7 +244,7 @@ def verify_unchanged_since_tests(before: dict) -> None:
              "  最可能是 OneDrive 把未提交的檔案還原成舊版（本 repo 已發生兩次）。\n"
              "  請確認上列檔案內容是否為你要的版本（必要時自 %TEMP% 備份還原），\n"
              "  再重新執行 push_helper。")
-    print(f"  [OK] {len(after)} 個追蹤檔案指紋一致")
+    print(f"  [OK] {len(after)} 個追蹤檔案內容一致")
 
 
 def step3_bump_version() -> str:
@@ -180,11 +282,20 @@ def step4_sync_manifest(new_version: str) -> None:
         fail("sync_manifest.py 失敗")
 
 
+def step5_stage() -> None:
+    """把變更放進 index。★與 commit 分開★:分開之後才能在 commit 之前比對
+    「index 裡真的要提交的內容」;原本 add 與 commit 綁在一起,驗證只能驗
+    工作目錄,add 與 commit 之間仍有空窗。"""
+    print("")
+    print("=== [6/9] git add ===")
+    run(["git", "add", "-A"])
+
+
 def step5_commit(commit_msg: str, new_version: str) -> None:
-    print("\n=== [6/7] Commit ===")
+    print("")
+    print("=== [8/9] Commit ===")
     if not commit_msg or commit_msg.strip() in ("", "1"):
         commit_msg = f"Update v{new_version}"
-    run(["git", "add", "-A"])
     # 用 UTF-8 暫存檔 + `git commit -F`：Windows 上 subprocess 會以系統 ANSI(cp936/gbk)
     # 編碼參數，commit message 含 emoji/特殊符號(例 U+232B 退格符)時會 UnicodeEncodeError
     # 而中斷整個推送。改寫成 UTF-8 檔讓 git 自行讀取，與系統 codepage 無關，穩定不踩雷。
@@ -202,7 +313,7 @@ def step5_commit(commit_msg: str, new_version: str) -> None:
 
 
 def step6_push() -> None:
-    print("\n=== [7/7] Push ===")
+    print("\n=== [9/9] Push ===")
     # 取當前分支
     cp = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], check=False, capture=True)
     branch = cp.stdout.strip() or "main"
@@ -230,13 +341,24 @@ def main(argv: list) -> int:
     step1_sanity()
     if not step2_check_changes():
         return 0
-    step_quality_gate()
-    # [2026-07-27] 關卡通過當下的檔案指紋 → commit 前重驗（見 verify_unchanged_since_tests）
+    # [2026-08-02 補審 P1] 指紋要在【品質關卡之前】取。原本在關卡返回【之後】才取,
+    # 若 OneDrive 剛好在那個瞬間還原,舊版就成為合法基準、檢查必過 —— 基準本身被
+    # 污染,後面驗什麼都沒用。關卡(ruff/pytest)不會改動 src/scripts/tests,提前取樣安全。
     fingerprint = snapshot_tracked_sources()
+    step_quality_gate()
+    verify_unchanged_since_tests(fingerprint)
     new_ver = step3_bump_version()
     step4_sync_manifest(new_ver)
-    # bump/manifest 只動 version.py 與 manifest.json（不在 src/scripts/tests 指紋範圍）
-    verify_unchanged_since_tests(fingerprint)
+    # bump/sync_manifest 合法改寫 version.py 與 manifest.json → 取它們【當下】的內容
+    # 當作預期值,一併納入 index 比對。★不可像原本那樣永久排除 version.py★:
+    # 若 bump 後被還原,commit 進去的是舊 CURRENT_VERSION、manifest 卻記著新版本與
+    # 新雜湊 → 所有機器下載後 SHA256 對不上、更新 fail-closed 全面停更。
+    expected = dict(fingerprint)
+    expected.update({k: v for k, v in worktree_blob_ids(include_version=True).items()
+                     if k in (VERSION_REL, MANIFEST_REL)})
+    step5_stage()
+    verify_index_matches(expected)
+    verify_staged_version_consistency(new_ver)
     step5_commit(commit_msg, new_ver)
     step6_push()
 

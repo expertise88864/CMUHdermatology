@@ -95,6 +95,41 @@ _SPAWN_ALIVE_POLLS = 6
 _SPAWN_ALIVE_INTERVAL_SEC = 0.1
 
 
+RESTART_ERR_GLOB = "cmuh_restart_*.err"
+RESTART_ERR_KEEP_SEC = 86400        # 保留一天,足夠事後查一次早夭原因
+
+
+def sweep_old_restart_err_files(tmpdir: str,
+                                keep_sec: int = RESTART_ERR_KEEP_SEC,
+                                now: float | None = None) -> int:
+    """清掉上次重啟留下的子行程 stderr 暫存檔。回傳刪除數。絕不拋。
+
+    ★[2026-08-02 補審] 為什麼清理只能在「下次 spawn」做★
+    成功重啟時,子行程會【持有那個 handle 直到它自己結束】,父行程刪不掉
+    (Windows 不允許刪除他人開啟中的檔)。不在下次 spawn 清掃的話,每一次成功
+    重啟都會在 %TEMP% 永久留下一個檔 —— 更新/閒置重啟每天都會發生。
+
+    只掃自己的命名樣式、只刪超過 keep_sec 的,刪不掉(還被開著/沒權限)就略過,
+    絕不因為清理失敗而影響重啟本身。
+    """
+    import glob
+    import time as _t
+    removed = 0
+    cutoff = (now if now is not None else _t.time()) - keep_sec
+    try:
+        candidates = glob.glob(os.path.join(tmpdir, RESTART_ERR_GLOB))
+    except Exception:
+        return 0
+    for old in candidates:
+        try:
+            if os.path.getmtime(old) < cutoff:
+                os.remove(old)
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def restart_self(extra_args=None, hard_exit_code=None,
                  on_confirmed=None) -> None:
     """雙軌重啟。
@@ -139,9 +174,44 @@ def restart_self(extra_args=None, hard_exit_code=None,
     if sys.platform == "win32":
         creationflags = 0x00000008 | 0x00000200
 
+    # [2026-08-02] 接住子行程的 stderr。pythonw + DETACHED_PROCESS 沒有 console,
+    # 子行程若因 ImportError/壞更新而秒退,traceback 會【完全消失】——實機只看得到
+    # 「新版本無法啟動」這句話,沒有任何線索可查(使用者 2026-08-02 回報)。
+    # 存活確認通過就不再需要它(正常運作時 stderr 是空的);早夭時把尾巴記進 log。
+    import tempfile
+
+    _tmpdir = tempfile.gettempdir()
+    try:
+        sweep_old_restart_err_files(_tmpdir)
+    except Exception:
+        logging.debug("[restart_self] 清理舊 stderr 暫存檔失敗(忽略)", exc_info=True)
+    _err_path = os.path.join(
+        _tmpdir,
+        f"cmuh_restart_{os.path.basename(str(sys.argv[0])) or 'app'}_{os.getpid()}.err")
+    _errf = None
+    try:
+        _errf = open(_err_path, "wb")
+    except OSError:
+        _err_path = ""
+
+    def _child_stderr_tail() -> str:
+        """讀子行程留下的 stderr 尾巴(讀不到就誠實說讀不到,不假裝沒事)。"""
+        if not _err_path:
+            return "(未能建立 stderr 暫存檔)"
+        try:
+            if _errf is not None:
+                _errf.flush()
+            with open(_err_path, "rb") as f:
+                data = f.read()[-2000:]
+            text = data.decode("utf-8", "replace").strip()
+            return text or "(子行程沒有留下任何 stderr)"
+        except OSError:
+            return "(讀不到 stderr 暫存檔)"
+
     try:
         proc = subprocess.Popen(cmd, creationflags=creationflags, close_fds=True,
-                                 cwd=get_app_dir())
+                                cwd=get_app_dir(),
+                                stdout=_errf, stderr=subprocess.STDOUT)
         logging.info("[restart_self] spawned new process pid=%s: %s", proc.pid, cmd)
         # [stability] 確認新行程沒有「起來就馬上死」再退出舊行程。主程式沒有外層
         # watchdog 接手，若新行程秒退（crash / 撞單例 mutex）又把舊的關掉 → 整個
@@ -154,9 +224,24 @@ def restart_self(extra_args=None, hard_exit_code=None,
             rc = proc.poll()
             if rc is not None:
                 logging.error(
-                    "[restart_self] 新行程啟動後立即結束 (exit=%s)，保留舊行程不退出",
-                    rc)
+                    "[restart_self] 新行程啟動後立即結束 (exit=%s)，保留舊行程不退出。"
+                    "\n--- 新行程 stderr ---\n%s\n--- stderr 結束 ---",
+                    rc, _child_stderr_tail())
+                try:
+                    if _errf is not None:
+                        _errf.close()
+                    if _err_path:
+                        os.remove(_err_path)
+                except OSError:
+                    pass
                 return
+        try:
+            if _errf is not None:
+                _errf.close()       # 父行程放掉自己的 handle;子行程仍持有
+        except OSError:
+            pass
+        # 註:這個檔【不能】在這裡刪 —— 子行程還開著它。改由下次 spawn 時的
+        #     _sweep_old_restart_err_files 清掉(超過一天且已無人開啟者)。
         # [2026-07-25 審查/codex] 確認新行程存活【之後】才做破壞性拆解。
         # 背景：呼叫端(如 autoclock.restart_program)原本必須在 spawn 前就 running.clear()
         # + 停 tray + 釋放 mutex,於是上面「保留舊行程」的保護 return 回去時,舊行程其實
@@ -169,6 +254,14 @@ def restart_self(extra_args=None, hard_exit_code=None,
             except Exception:
                 logging.exception("[restart_self] on_confirmed 收尾失敗（仍照常退出）")
     except Exception as e:
+        # Popen 失敗 → 子行程根本沒起來,沒人持有這個檔 → 這裡就能直接刪掉。
+        try:
+            if _errf is not None:
+                _errf.close()
+            if _err_path:
+                os.remove(_err_path)
+        except OSError:
+            pass
         # [2026-07-26 外審] os.execv 是「取代本行程」——【無法確認新行程真的活著】,
         # 而且成功時永不返回 → on_confirmed 一定不會被呼叫。呼叫端傳 on_confirmed 就是
         # 明確要求「確認接手後才拆解」;此時走這條 fallback 會讓稽核排空/mutex 釋放/

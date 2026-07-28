@@ -195,27 +195,42 @@ def test_healthy_quiet_poll_resets_failure_streak():
         "首次建立基準也是成功的一輪"
 
 
-def test_health_alert_goes_to_team_not_email_trigger_sender():
-    """[codex] email 觸發時 recipients 已被改寫成觸發醫師本人 → 健康告警必須改用
-    一般團隊名單,否則團隊收不到、觸發者收兩封,且六小時冷卻被白白消耗。"""
+def test_health_alert_goes_to_the_developer_only():
+    """★[2026-08-02 使用者定案] 推翻 2026-07-25 的「寄給團隊名單」★
+
+    使用者實際收到那封信(收件人有六位臨床同仁)之後定案:
+    「這種系統提示錯誤的信件直接寄給開發者email」——系統/自動化故障訊息不該騷擾
+    整組臨床人員,他們對「等不到主畫面」也無從處理。
+    臨床事件(會診查詢結果、email 觸發的回信)仍照舊寄給各自的名單。
+
+    順帶說明:原本兩個坑(email 觸發時 recipients 已被改寫成觸發醫師本人、
+    團隊名單為空時不可 `or recipients` 當後備)因為收件人不再取自 cfg 而自然消失,
+    但下面仍反向釘住,避免哪天有人又把 cfg 接回去。
+    """
     import inspect
     src = inspect.getsource(cq._do_full_job)
     i = src.index("_note_job_failure(")
     seg = src[i:i + 200]
-    assert 'cfg.get("recipients")' in seg, \
-        "健康告警必須明確使用一般收件人,不可沿用被觸發者改寫過的 recipients"
+    assert "_developer_alert_recipients()" in seg, \
+        "系統故障告警必須寄給開發者"
+    assert 'cfg.get("recipients")' not in seg, \
+        "不可再取自 cfg(那是臨床名單)"
+    assert "or recipients" not in seg, "更不可退回被觸發者改寫過的 recipients"
 
 
-def test_health_alert_never_falls_back_to_trigger_sender():
-    """[codex R2] 不可用 `or recipients` 當後備：團隊名單為空且本次是 email 觸發時,
-    recipients 仍是觸發醫師 → 又寄給他(且他還會收到個人失敗通知＝同次兩封)。"""
+def test_developer_alert_uses_the_single_declaration():
+    """開發者信箱只宣告一次(cmuh_common.settings_defaults),不可各自硬編碼。"""
+    from cmuh_common.settings_defaults import DEVELOPER_ALERT_EMAIL
+    assert cq._developer_alert_recipients() == [DEVELOPER_ALERT_EMAIL]
     import inspect
-    src = inspect.getsource(cq._do_full_job)
-    i = src.index("_note_job_failure(")
-    seg = src[i:i + 120]
-    assert 'cfg.get("recipients") or []' in seg, \
-        "健康告警的收件人只能來自團隊名單,空就是空"
-    assert "or recipients" not in seg, "不得退回被觸發者改寫過的 recipients"
+    src = inspect.getsource(cq)
+    # 注意:cfg 的 recipients / test_recipients / email_trigger_recipients 裡
+    # 本來就【合法】含有開發者本人(他是臨床名單的一員),那與「告警信箱」無關。
+    # 這裡要釘的是:告警用的那個函式來自單一宣告處,不是自己再定義一份。
+    assert "from cmuh_common.settings_defaults import" in src
+    assert "developer_alert_recipients as _developer_alert_recipients" in src
+    assert "def _developer_alert_recipients" not in src, \
+        "不可在 consult_query 內自己再定義一份"
 
 
 def test_no_team_recipients_does_not_burn_cooldown(monkeypatch):

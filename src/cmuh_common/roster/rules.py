@@ -205,13 +205,22 @@ class WeekendBlockRule(Rule):
                     f"依你的指定拆成 {desc} 分別排班"
                     f"（連休段原則上同一人，此處以你的指定為準）"))
             # 區塊完全無人可值 → error
-            ok = [m.id for m in ctx.members
-                  if all(not ctx.on_leave(m.id, d) for d in b.days)]
-            if not ok:
-                span = f"{b.days[0].month}/{b.days[0].day}-{b.days[-1].day}"
-                checks.append(Precheck(
-                    "error", self.rule_id,
-                    f"週末連休段 {span} 所有人皆請假，無人可值"))
+            # ★[2026-08-02 補審 P2] 要【逐段】檢查,不可要求同一人覆蓋整個原始區塊。
+            #   拆段之後每一段各自綁同一人,段與段之間互不相干。反例:9/25-27 指定 Z、
+            #   9/28 指定 K,Z 只在 9/28 請假、K 只在 9/25-27 請假 —— 兩段各自完全可解、
+            #   指定日也沒有請假衝突,但「找得到人值完整四天嗎」的答案是「沒有」,
+            #   於是回 precheck_failed 把整個求解擋掉。無指定時 runs 只有一段,行為不變。★
+            runs = split_block_runs(
+                b.days, {d: directives[d][0] for d in b.days if d in directives})
+            for run in runs:
+                ok = [m.id for m in ctx.members
+                      if all(not ctx.on_leave(m.id, d) for d in run)]
+                if not ok:
+                    span = (f"{run[0].month}/{run[0].day}"
+                            + (f"-{run[-1].day}" if len(run) > 1 else ""))
+                    checks.append(Precheck(
+                        "error", self.rule_id,
+                        f"週末連休段 {span} 所有人皆請假，無人可值"))
             if b.kind == "weekend_orphan" and not ctx.boundary_fix:
                 checks.append(Precheck(
                     "warn", self.rule_id,
@@ -339,16 +348,22 @@ class ColorRule(Rule):
     def apply(self, mc, ctx):
         if len(ctx.members) <= 1:
             return
+        # ★[2026-08-02 補審 P1] 代表日必須用 color_anchor()(＝週六;孤兒塊才退回
+        #   days[0]),不可用 days[0]。連休段會【往前鏈入週五國定假日】,而
+        #   2026-07-27 起使用者指定可把連休段拆給不同人 → days[0] 可能是「週五那個人」,
+        #   把連週限制套在他身上會:誤擋實際合規的班表,或放行真正值週末的人連值兩個
+        #   同色週末。同一批已為此把 WeekendCapRule 與 res.last_weekend 改取週六,
+        #   獨漏這裡;而 _pairs() 查週色時本來就已經用 color_anchor()。★
         for prev_p, a, b, same, _unknown in self._pairs(ctx):
             if not same:
                 continue
             if a is None:  # 跨月：上月人選不得值本月第一週末
                 if prev_p in ctx.member_ids():
-                    mc.model.Add(mc.x[(b.days[0], prev_p)] == 0)
+                    mc.model.Add(mc.x[(b.color_anchor(), prev_p)] == 0)
             else:
                 for m in ctx.members:
-                    mc.model.Add(
-                        mc.x[(a.days[0], m.id)] + mc.x[(b.days[0], m.id)] <= 1)
+                    mc.model.Add(mc.x[(a.color_anchor(), m.id)]
+                                 + mc.x[(b.color_anchor(), m.id)] <= 1)
 
 
 @register_rule
