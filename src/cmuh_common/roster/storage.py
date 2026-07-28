@@ -269,6 +269,15 @@ class RosterStorage:
         self._save(self._path("biopsy_grid.json"), {"grid": grid})
 
     # ── 月份檔 ───────────────────────────────────────────────────────────
+    def month_exists(self, ym: str) -> bool:
+        """該月月檔是否真的存在。
+
+        [2026-08-02] `load_month` 對不存在的月份會回一份預設 dict(刻意如此),
+        所以「有沒有這個月」不能用它判斷 —— 跨月連動需要先確認下個月真的排過,
+        否則會憑空產生一份月檔。
+        """
+        return os.path.exists(self._month_path(ym))
+
     def load_month(self, ym: str) -> dict:
         d = self._check_schema(_load_json(self._month_path(ym)), f"{ym}.json")
         d.setdefault("month", ym)

@@ -620,6 +620,26 @@ class RosterService:
                 continue
         return out
 
+    def _prev_month_friday_duty(self, year: int, month: int) -> dict:
+        """月初 1 號是週六時,回 {上月最後一天(週五): 值班人};其餘情況回空 dict。
+
+        只在真的需要時才去讀上月月檔(避免每次重排都多一次磁碟 IO);讀不到就回空 ——
+        沒有上月資料時「週五連動」單純不生效,不可因此讓整個切片重排失敗。
+        """
+        first = date(year, month, 1)
+        if first.weekday() != 5:            # 1 號不是週六 → 週五在本月,不必跨月
+            return {}
+        fri = first - timedelta(days=1)
+        prev_ym = f"{fri.year:04d}-{fri.month:02d}"
+        try:
+            prev = self.storage.load_month(prev_ym)
+        except Exception:
+            logging.debug("[roster.service] 讀上月月檔失敗(週五連動略過)", exc_info=True)
+            return {}
+        cell = ((prev.get("r_duty") or {}).get(fri.isoformat()) or {})
+        person = cell.get("person")
+        return {fri: str(person)} if person else {}
+
     def _biopsy_compute(self, ym: str, duty_by_date: dict,
                         book: "dict | None" = None,
                         month: "dict | None" = None) -> tuple:
@@ -632,6 +652,12 @@ class RosterService:
         cfg = self.storage.load_config()
         members = [Member.from_dict(d) for d in (cfg.get("r_members") or [])]
         y, m = int(ym[:4]), int(ym[5:7])
+        # ★[2026-08-02 補審] 跨月週五收攏在這裡,而不是各呼叫端自己補★
+        #   放在 recompute 那邊的話,report 預覽(render_report)這條路徑就沒有,
+        #   於是「月初 1 號是週六」的月份會出現【預覽的切片人選與定案後不同】。
+        #   本函式是所有切片計算的唯一入口,補在這裡才不會有人漏掉。
+        duty_by_date = dict(duty_by_date)
+        duty_by_date.update(self._prev_month_friday_duty(y, m))
         # [2026-07-27] month 可由呼叫端傳入【記憶體中尚未存檔的月檔】——手動指定
         # 切片後若這裡自行重讀磁碟，會讀到舊的 override 而把指定吃掉。
         if month is None:
@@ -678,6 +704,10 @@ class RosterService:
                 continue
             if (dt.year, dt.month) == (y, m):
                 duty_by_date[dt] = str(p)
+        # ★[2026-08-02 補審 P2] 月初就是週六時,它的週五在【上個月】★
+        #   本迴圈把非當月日期全部丟掉,於是正式服務路徑永遠看不到那個週五 ——
+        #   週五連動在「月初 1 號是週六」的月份完全失效。
+        #   (我原本的測試直接把 7/31 塞進純函式的 duty,沒走服務層,因此沒抓到。)
         book = self.storage.load_biopsy()
         assign, notes, pair, after, names = self._biopsy_compute(
             ym, duty_by_date, book, month=month)
@@ -799,8 +829,22 @@ class RosterService:
         self._audit(month, scope, iso, old_person, person, via)
         # [週六切片] 手改 R 週六值班 → 值班連動可能改變,同批重排(月檔存檔成功
         # 才寫計數帳本;重排失敗不擋手動改格)。
+        # ★[2026-08-02 補審 P2] 週五也要觸發★ 2026-07-27 起切片人選在「次數平手」時
+        #   會參考【週五值班】(使用者需求:週六早上切片的人盡量也值週五)。只在週六
+        #   觸發的話,改完週五之後月檔/biopsy.json/決策報告/匯出全都還是舊人選,
+        #   而且畫面上看不出來 —— 它們與求解結果不一致卻沒有任何提示。
+        #   ★月底的週五要重排【下個月】★:它的翌日(下月 1 號)若是週六,
+        #   _biopsy_compute 會用到它(見 _prev_month_friday_duty)——只跳過不做,
+        #   下月月檔/帳本/報告就會停在舊人選。我第一版只寫「不影響本月」就跳過,
+        #   與同一批的跨月修正自相矛盾(補審第 2 輪抓到)。
         biopsy_book = None
-        if scope == "r" and d.weekday() == 5:
+        _next_day = d + timedelta(days=1)
+        _same_month_friday = d.weekday() == 4 and _next_day.month == d.month
+        # ★週五的隔天【永遠】是週六 —— 要檢查的是跨月,不是星期幾。
+        #   寫成 `_next_day.weekday() == 5` 會讓每一次月內的週五修改都額外重排並
+        #   再存一次【本月】(_next_ym 就是本月)→ 重複快照與多餘 IO。★
+        _cross_month_friday = d.weekday() == 4 and _next_day.month != d.month
+        if scope == "r" and (d.weekday() == 5 or _same_month_friday):
             try:
                 _a, _n, biopsy_book = self.recompute_saturday_biopsy(ym, month)
             except Exception:
@@ -808,6 +852,19 @@ class RosterService:
         self.storage.save_month(ym, month)
         if biopsy_book is not None:
             self.storage.save_biopsy(biopsy_book)
+        # 月底週五(翌日是下月 1 號且為週六)→ 重排【下個月】。本月月檔已存好,
+        # 這裡才動下月,兩者互不影響;下月沒有月檔就什麼都不做。
+        if scope == "r" and _cross_month_friday:
+            _next_ym = f"{_next_day.year:04d}-{_next_day.month:02d}"
+            try:
+                # 下月沒排過 → 不做(不可憑空生出一份月檔);
+                # 已定案 → 唯讀,save_month 會丟 FinalizedMonthError,先跳過免噪音。
+                if (self.storage.month_exists(_next_ym)
+                        and not self.storage.load_month(_next_ym).get("finalized")):
+                    self.recompute_saturday_biopsy(_next_ym)
+            except Exception:
+                logging.exception(
+                    "[roster.service] set_cell 跨月週六切片重排失敗（略過）")
         return self.quick_validate(scope, ym)
 
     def set_biopsy_person(self, ym: str, d: date,
