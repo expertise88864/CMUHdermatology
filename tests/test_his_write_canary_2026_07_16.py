@@ -19,6 +19,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import pytest  # noqa: E402
 
 import main  # noqa: E402
+from cmuh_common import his_contract as hc  # noqa: E402
+
+
+def _title_of_calibrated() -> str:
+    """組出「與現行校正版本相同」的主視窗標題。
+    測試不該硬編碼版本號 —— 那會讓每次院方改版都要改一堆測試檔。"""
+    return f"西醫門診醫師作業 V.{hc.CALIBRATED_VERSION}.01"
 from cmuh_common import contract_canary as cc  # noqa: E402
 
 
@@ -44,8 +51,9 @@ def _verdict(monkeypatch, title, baseline_fp=None):
 
 # ── 採樣裁決(純函式 _his_write_verdict_for) ─────────────────────────────────
 def test_verdict_ok_on_matching_version(monkeypatch):
-    # 現行校正版本 1150722(2026-07-28 使用者實測所有熱鍵皆正常)
-    assert _verdict(monkeypatch, "西醫門診醫師作業 V.1150722.01").status == cc.STATUS_OK
+    # 與校正版本相同 → OK。★版本字串由 his_contract 組出來,不再硬編碼★
+    #  (2026-07-28 校正到 1150722 時,光是「改一個常數」就動到 4 支測試檔。)
+    assert _verdict(monkeypatch, _title_of_calibrated()).status == cc.STATUS_OK
 
 
 def test_verdict_drift_on_version_shift(monkeypatch):
@@ -127,7 +135,7 @@ def test_drift_notifies_once_per_version_and_does_not_return_block(monkeypatch):
 
 def test_ok_and_unknown_do_not_notify(monkeypatch):
     sent = _notify_env(monkeypatch)
-    main._sample_his_write_contract("西醫門診醫師作業 V.1150722.01")   # OK(=校正版本)
+    main._sample_his_write_contract(_title_of_calibrated())   # OK(=校正版本)
     main._sample_his_write_contract("西醫門診醫師作業")               # 無版本→UNKNOWN
     assert sent == [], "契約一致/採不到版本都不寄信"
 
@@ -147,7 +155,7 @@ def test_notify_retries_until_send_succeeds(monkeypatch):
     outcome = {"ok": False}
     monkeypatch.setattr(main, "_send_alert_email_via_smtp",
                         lambda s, b, r, **k: sent.append(s) or outcome["ok"])
-    _k = "1150701@1150722"                               # 去重 key = 現況@基線(校正=1150722)
+    _k = f"1150701@{hc.CALIBRATED_VERSION}"              # 去重 key = 現況@基線
     main._sample_his_write_contract("西醫門診醫師作業 V.1150701.01")   # 寄失敗(False)
     assert len(sent) == 1
     assert _k not in main._his_drift_notified_versions, "寄失敗不得標記已通知"

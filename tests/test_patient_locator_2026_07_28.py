@@ -163,12 +163,13 @@ def test_locator_must_not_enter_the_ledger_fields():
 
 
 def test_index_is_written_before_the_dedup_gate():
-    """★去重擋掉的是信,不是紀錄★ 索引寫入必須在 _audit_notify_lock 去重之前。"""
+    """★去重擋掉的是信,不是紀錄★ 索引寫入必須在去重之前。
+    (2026-07-28 去重改用共用的 AlertDeduper.claim,順序要求不變。)"""
     code = _code_only(_main_src())
     i = code.index("def _notify_audit_mismatch(")
     body = code[i:i + 2500]
     i_idx = body.index("_append_locator_index(")
-    i_dedup = body.index("_audit_notify_lock")
+    i_dedup = body.index("_MISMATCH_ALERTS.claim(")
     assert i_idx < i_dedup, "索引寫在去重之後 → 同一天第二個病人查不到"
 
 
@@ -212,7 +213,8 @@ def test_expected_value_comes_from_the_ledger_value_field():
 def test_his_calibrated_version_matches_user_confirmed_build():
     """[2026-07-28 使用者實測] V.1150722.01 全部熱鍵功能正常 → 校正版本必須跟上,
     否則每台沒有自訂基線的機器都會一直收到「疑似改版」通知。"""
-    import re as _re
-    src = _main_src()
-    m = _re.search(r'_HIS_CALIBRATED_VERSION = "(\d+)"', src)
-    assert m and m.group(1) == "1150722", "校正版本應為 1150722"
+    from cmuh_common import his_contract as hc
+    assert hc.CALIBRATED_VERSION == "1150722"
+    # main 的別名要真的指向單一宣告處(不可又有一份自己的字面值)
+    import main
+    assert main._HIS_CALIBRATED_VERSION == hc.CALIBRATED_VERSION

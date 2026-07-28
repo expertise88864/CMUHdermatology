@@ -36,8 +36,10 @@ def test_m1_upgraded_to_canary_verdict(monkeypatch, caplog):
     # 版本不同 → DRIFT(裁決本身仍判漂移;是否擋是上層策略,見金絲雀測試)
     v = main._his_write_verdict_for("西醫門診醫師作業 V.1150630.01")
     assert v.status == cc.STATUS_DRIFT
-    # 版本相同(現行校正版本 1150722)→ OK
-    assert main._his_write_verdict_for("西醫門診醫師作業 V.1150722.01").status == cc.STATUS_OK
+    # 版本相同 → OK(版本字串由 his_contract 組出,不硬編碼)
+    from cmuh_common import his_contract as hc
+    _t = f"西醫門診醫師作業 V.{hc.CALIBRATED_VERSION}.01"
+    assert main._his_write_verdict_for(_t).status == cc.STATUS_OK
     # 無版本字串 → UNKNOWN(不假警報)
     assert main._his_write_verdict_for("西醫門診醫師作業").status == cc.STATUS_UNKNOWN
 

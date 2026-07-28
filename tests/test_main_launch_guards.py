@@ -737,6 +737,8 @@ def test_his_menu_id_calibration_2026_07_20():
     sys.path.insert(0, str(ROOT / "src"))
     import main
     assert main.MENU_ID_同意書 == 670, "F9/F10 同意書選單 id(1150722 實測仍為 670)"
+    # ★數值用字面值釘死★ 這是「打到別的選單 = 寫錯病歷」的防線,
+    #   不可改成讀 his_contract —— 那會退化成 assert X == X。
     assert main.MENU_ID_代碼輸入 == 219, "F1~F5 代碼輸入選單 id(1150722 仍 219)"
     assert main._HIS_CALIBRATED_VERSION == "1150722", "版本守門基線應同步到 1150722"
 
@@ -773,7 +775,14 @@ def test_f11_phototherapy_uses_finish_no_print_without_print_fallback():
     all_finish_src = _function_source(source_path, "_f11_click_finish_all")
     main_src = source_path.read_text(encoding="utf-8")
 
-    assert "MENU_ID_FINISH_NO_PRINT = 277" in main_src  # [2026-06-29] HIS V.1150629.01 改版 +1
+    # [2026-07-28 擴充性] 值搬到 cmuh_common.his_contract(單一宣告處)後,這裡改測
+    # 「實際生效的值」+「字面值確實宣告在那一支」——後者仍用字面值,不可退化成
+    # assert X == X(打到別的選單 = 寫錯病歷,這是安全防線)。
+    import main as _main
+    assert _main.MENU_ID_FINISH_NO_PRINT == 277
+    _hc_src = (ROOT / "src" / "cmuh_common" / "his_contract.py").read_text(
+        encoding="utf-8")
+    assert "MENU_ID_FINISH_NO_PRINT = 277" in _hc_src
     assert 'if course_value in ("2", "3"):' in f11_main_src
     assert "_f11_send_finish_no_print" in f11_main_src
     assert "_f11_click_finish_all" in f11_main_src

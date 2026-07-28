@@ -52,6 +52,8 @@ from cmuh_common.threshold_policy import (
     build_doctor_threshold_map,
     is_near_alert_threshold,
 )
+from cmuh_common import his_contract as _HIS_CONTRACT
+from cmuh_common.alert_dedupe import AlertDeduper as _AlertDeduper
 from cmuh_common.patient_locator import (
     INDEX_FILENAME as _LOCATOR_INDEX_FILENAME,
     MAX_CONTROLS_TO_SCAN as _LOCATOR_MAX_CONTROLS,
@@ -1499,7 +1501,10 @@ _HOSPITAL_WIN_TITLE_KW = "西醫門診醫師作業"
 # 【刻意只警示、不硬停 F 鍵】:硬停在版本字串誤判時會讓醫師整組熱鍵失效(比原 bug 更糟);且完成不印
 # 已有 _find_menu_command_id_by_text 動態解析當備援。title 沒有可辨識版本字串 → 不動作(避免假警報)。
 # 硬停 + 醫師對話框待有實機可確認 title 格式再補(不確定就不自動動作,連自己的守門也一樣)。
-_HIS_CALIBRATED_VERSION = "1150722"   # 選單 id 校正對應的 HIS 版本(2026-07-28 V.1150722.01:使用者實測【所有熱鍵功能皆正常】→ 選單 id 未位移,直接校正;前版 1150720/1150713/1150629)
+# [2026-07-28 擴充性] 值與校正沿革都在 cmuh_common.his_contract(單一宣告處)。
+# ★下次院方改版只改那一支★:換 CALIBRATED_VERSION、必要時改 MENU_ID_*,
+#   並在 CALIBRATION_HISTORY 補上憑據。本處保留同名別名,呼叫端不受影響。
+_HIS_CALIBRATED_VERSION = _HIS_CONTRACT.CALIBRATED_VERSION
 _HIS_VERSION_RE = re.compile(r"[Vv]\.?\s*(\d{6,8})")
 # [金絲雀 2026-07-17] 另抓含尾碼的完整版本(V.1150629.01 → 1150629.01)。主版本相同但尾碼
 # 不同(.01→.02)也可能是改版;但尾碼比對【只在基線本身帶尾碼時】才生效(見 sample_his_current_fp)
@@ -1602,11 +1607,12 @@ def _current_correlation_id() -> str:
 # [codex P1] 「已寄」只在【寄成功後】才記(與 drift/止掛通知同一鐵律,已在別處犯過兩次):
 # 先記再寄的話,一次暫時性 SMTP 失敗就把該問題整個 process 永久滅音 —— 偵測控制自廢。
 # inflight 擋並發,sent 才是終局去重。
-_audit_alert_sent_summaries: set = set()
-_audit_alert_inflight_summaries: set = set()
-_audit_mismatch_notified: set = set()
-_audit_mismatch_inflight: set = set()
-_audit_notify_lock = threading.Lock()
+# [2026-07-28 擴充性] 原本這裡是 4 個集合 + 1 把 lock,而且 HIS 改版通知那邊還有
+# 另一組同構的 8 個全域 —— 同一套「inflight / 寄成功才終局去重 / 失敗下次重試」的
+# 樣板被重寫了四次,而寫錯的後果(告警永久滅音)看起來跟一切正常一模一樣。
+# 改用 AlertDeduper:新增一種告警只要再開一個實例,不必再自己管集合與鎖。
+_AUDIT_HEALTH_ALERTS = _AlertDeduper("audit-health")
+_MISMATCH_ALERTS = _AlertDeduper("audit-mismatch")
 
 
 def audit_health_check(notify: bool = True) -> dict:
@@ -1627,29 +1633,23 @@ def audit_health_check(notify: bool = True) -> dict:
         logging.warning("[audit-health][%s] %s", snap["level"], snap["summary"])
         if not notify:
             return snap
-        key = snap["summary"]
-        with _audit_notify_lock:
-            if (key in _audit_alert_sent_summaries
-                    or key in _audit_alert_inflight_summaries):
-                return snap
-            _audit_alert_inflight_summaries.add(key)
-        sent_ok = False
-        try:
+        # [2026-07-28 擴充性] inflight / 終局去重 / 失敗重試的樣板改用共用去重器,
+        # 四條告警路徑不再各寫一份。語意不變:寄成功才終局去重,失敗或無收件人
+        # → 下次檢查重試。
+        def _send() -> bool:
             recipients = _developer_alert_recipients()
-            if recipients:
-                level_tag = "帳本異常" if snap["level"] == "error" else "紀錄遺失"
-                sent_ok = bool(_send_alert_email_via_smtp(
-                    f"[皮膚科自動化] 稽核{level_tag}:{_machine_name_safe()}",
-                    f"外部動作稽核帳本健康檢查未通過。\n\n{snap['summary']}\n\n"
-                    f"層級:{snap['level']}(error=帳本無法證明完整/偵測性控制已失效;"
-                    f"warn=帳本完整但本次執行有動作沒被記到)\n"
-                    f"(同一問題此信只寄一次;詳見 log 與 settings/{_LEDGER_FILENAME})",
-                    recipients))
-        finally:
-            with _audit_notify_lock:
-                _audit_alert_inflight_summaries.discard(key)
-                if sent_ok:            # 寄成功才終局去重;失敗/無收件人 → 下次檢查重試
-                    _audit_alert_sent_summaries.add(key)
+            if not recipients:
+                return False
+            level_tag = "帳本異常" if snap["level"] == "error" else "紀錄遺失"
+            return bool(_send_alert_email_via_smtp(
+                f"[皮膚科自動化] 稽核{level_tag}:{_machine_name_safe()}",
+                f"外部動作稽核帳本健康檢查未通過。\n\n{snap['summary']}\n\n"
+                f"層級:{snap['level']}(error=帳本無法證明完整/偵測性控制已失效;"
+                f"warn=帳本完整但本次執行有動作沒被記到)\n"
+                f"(同一問題此信只寄一次;詳見 log 與 settings/{_LEDGER_FILENAME})",
+                recipients))
+
+        _AUDIT_HEALTH_ALERTS.send_once(snap["summary"], _send)
     except Exception:
         logging.debug("[audit-health] 通知失敗(不影響檢查結果)", exc_info=True)
     return snap
@@ -1730,12 +1730,11 @@ def _notify_audit_mismatch(action: str, detail: str, locator=None,
                     action, expected or "(未提供)", detail, _loc_text)
 
     key = f"{action}|{date.today().isoformat()}"
-    with _audit_notify_lock:
-        # [codex P1] 先佔 inflight,寄成功才進 notified —— 寄失敗要能在下一次 mismatch
-        # 時重試,不可一次 SMTP 故障就把該功能整天滅音。
-        if key in _audit_mismatch_notified or key in _audit_mismatch_inflight:
-            return
-        _audit_mismatch_inflight.add(key)
+    # [codex P1] 先佔 inflight —— 必須在 spawn【之前】同步佔,否則兩次呼叫之間會各堆
+    # 一條 60 秒逾時的寄信緒。寄成功才終局去重:寄失敗要能在下一次 mismatch 時重試,
+    # 不可一次 SMTP 故障就把該功能整天滅音。[2026-07-28] 這套語意改由共用去重器保證。
+    if not _MISMATCH_ALERTS.claim(key):
+        return
 
     def _bg():
         sent_ok = False
@@ -1759,16 +1758,12 @@ def _notify_audit_mismatch(action: str, detail: str, locator=None,
         except Exception:
             logging.debug("[audit-health] mismatch 通知寄信失敗", exc_info=True)
         finally:
-            with _audit_notify_lock:
-                _audit_mismatch_inflight.discard(key)
-                if sent_ok:
-                    _audit_mismatch_notified.add(key)
+            _MISMATCH_ALERTS.release(key, sent_ok)
 
     try:
         threading.Thread(target=_bg, daemon=True, name="audit-mismatch-mail").start()
     except Exception:
-        with _audit_notify_lock:
-            _audit_mismatch_inflight.discard(key)
+        _MISMATCH_ALERTS.release(key, False)   # 緒沒起來 → 歸還,下次還能重試
         logging.debug("[audit-health] mismatch 通知緒啟動失敗", exc_info=True)
 
 
@@ -2240,11 +2235,11 @@ def _sample_his_write_contract(title: str) -> None:
         _notify_his_drift(v)
     # ACTION_BLOCK:NOTIFY_ONLY 政策下不會走到;未來改擋寫入政策時在此加擋下訊號。
 
-# 醫令 子選單 command ID (probe + user 確認;2026-06-29 HIS V.1150629.01 改版後整批 +1)
-MENU_ID_類別字首 = 216   # 215→216(未使用,隨同段 +1)
-MENU_ID_代碼字首 = 218   # 217→218(未使用,隨同段 +1)
-MENU_ID_代碼輸入 = 219   # 218→219(user 實測確認;F1~F5 都走這個)
-MENU_ID_名稱輸入 = 220   # 219→220(未使用,隨同段 +1)
+# 醫令 子選單 command ID —— 值在 cmuh_common.his_contract(單一宣告處),此處為別名。
+MENU_ID_類別字首 = _HIS_CONTRACT.MENU_ID_類別字首
+MENU_ID_代碼字首 = _HIS_CONTRACT.MENU_ID_代碼字首
+MENU_ID_代碼輸入 = _HIS_CONTRACT.MENU_ID_代碼輸入     # F1~F5 都走這個
+MENU_ID_名稱輸入 = _HIS_CONTRACT.MENU_ID_名稱輸入
 
 
 def _find_hospital_main_window() -> int:
@@ -5091,9 +5086,9 @@ def _find_menu_command_id_by_text(main_hwnd: int, target_text: str) -> int:
         return 0
 
 
-# 完成 > 完成不印。[2026-06-29] HIS V.1150629.01 改版整批 +1:舊 276→277(使用者確認完成不印壞掉,
-# 且 probe 新「完成」選單 top[4] index 1 = id 277,與 +1 一致)。F11 照光療程 2/3 用,避免印繳費單。
-MENU_ID_FINISH_NO_PRINT = 277
+# 完成 > 完成不印(F11 照光療程 2/3 用,避免印繳費單)。
+# 值與校正沿革在 cmuh_common.his_contract,此處為別名。
+MENU_ID_FINISH_NO_PRINT = _HIS_CONTRACT.MENU_ID_FINISH_NO_PRINT
 
 
 def _f11_normalize_course_value(raw_value: str) -> str:
@@ -5910,7 +5905,8 @@ def script_F4_adaptive():
 #   5. 點「開立電子」TButton
 #   6+ 後續 popup 操作（Round 2 之後加）
 
-MENU_ID_同意書 = 670
+# 值與校正沿革在 cmuh_common.his_contract,此處為別名。
+MENU_ID_同意書 = _HIS_CONTRACT.MENU_ID_同意書
 
 
 def _get_window_pid(hwnd: int) -> int:

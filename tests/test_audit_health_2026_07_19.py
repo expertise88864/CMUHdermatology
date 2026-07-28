@@ -24,8 +24,8 @@ def _health_env(monkeypatch, tmp_path, snap=None):
     """隔離健康檢查環境:指到 tmp 帳本(重置 singleton)、重置去重、攔截寄信。回 sent list。"""
     monkeypatch.setattr(main, "get_conf_path", lambda name: str(tmp_path / name))
     monkeypatch.setattr(main, "_action_ledger_singleton", None)
-    monkeypatch.setattr(main, "_audit_alert_sent_summaries", set())
-    monkeypatch.setattr(main, "_audit_alert_inflight_summaries", set())
+    # [2026-07-28] 去重狀態改由 AlertDeduper 持有(原本是 4 個模組級集合 + 1 把鎖)
+    main._AUDIT_HEALTH_ALERTS.reset()
     monkeypatch.setattr(main, "_ledger_dropped", 0)
     monkeypatch.setattr(main, "_ledger_write_failures", 0)
     monkeypatch.setattr(main, "_developer_alert_recipients", lambda: ["dev@example.com"])
@@ -124,7 +124,8 @@ def test_no_recipients_does_not_consume_dedup(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_ledger_dropped", 3)
     monkeypatch.setattr(main, "_developer_alert_recipients", lambda: [])
     main.audit_health_check()
-    assert main._audit_alert_sent_summaries == set(), \
+    assert main._AUDIT_HEALTH_ALERTS.pending() == set()
+    assert not main._AUDIT_HEALTH_ALERTS._done, \
         "無收件人不得標記已寄(之後設定好收件人要能寄出)"
 
 
@@ -144,8 +145,7 @@ def _sync_thread(monkeypatch):
 
 
 def test_mismatch_notify_dedups_per_action_per_day(monkeypatch):
-    monkeypatch.setattr(main, "_audit_mismatch_notified", set())
-    monkeypatch.setattr(main, "_audit_mismatch_inflight", set())
+    main._MISMATCH_ALERTS.reset()
     monkeypatch.setattr(main, "_developer_alert_recipients", lambda: ["dev@example.com"])
     sent = []
     monkeypatch.setattr(main, "_send_alert_email_via_smtp",
@@ -160,8 +160,7 @@ def test_mismatch_notify_dedups_per_action_per_day(monkeypatch):
 
 def test_mismatch_failed_send_can_retry(monkeypatch):
     # [codex P1] 寄失敗不進 notified → 同功能之後再 mismatch 仍會通知
-    monkeypatch.setattr(main, "_audit_mismatch_notified", set())
-    monkeypatch.setattr(main, "_audit_mismatch_inflight", set())
+    main._MISMATCH_ALERTS.reset()
     monkeypatch.setattr(main, "_developer_alert_recipients", lambda: ["dev@example.com"])
     ok = {"v": False}
     attempts = []
@@ -169,10 +168,12 @@ def test_mismatch_failed_send_can_retry(monkeypatch):
                         lambda s, b, r, **k: attempts.append(s) or ok["v"])
     _sync_thread(monkeypatch)
     main._notify_audit_mismatch("F2 UVB 劑量", "d")
-    assert len(attempts) == 1 and main._audit_mismatch_notified == set()
+    assert len(attempts) == 1
+    assert not main._MISMATCH_ALERTS._done, "寄失敗不可終局去重(要能重試)"
     ok["v"] = True
     main._notify_audit_mismatch("F2 UVB 劑量", "d")
-    assert len(attempts) == 2 and len(main._audit_mismatch_notified) == 1
+    assert len(attempts) == 2
+    assert len(main._MISMATCH_ALERTS._done) == 1, "寄成功才終局去重"
     main._notify_audit_mismatch("F2 UVB 劑量", "d")
     assert len(attempts) == 2, "寄成功後同日同功能不再寄"
 
