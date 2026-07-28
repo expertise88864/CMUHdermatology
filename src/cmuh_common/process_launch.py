@@ -61,14 +61,20 @@ def resolve_app_script(script_name: str, *, app_dir: str | None = None) -> str:
 def launch_app_script(
     script_name: str,
     *,
+    args: tuple[str, ...] | list[str] = (),
     executable: str | None = None,
     app_dir: str | None = None,
 ) -> subprocess.Popen:
-    """Start a root launcher using a stable absolute path and working directory."""
+    """Start a root launcher using a stable absolute path and working directory.
+
+    [2026-08-02] 加上 args:主程式要能用 `--configure` 明確叫出打卡設定視窗
+    (背景模式在沒有設定檔時已改為【不啟動】,設定必須有一條明確的路)。
+    """
     app_root = os.path.realpath(os.path.abspath(app_dir or get_app_dir()))
     script_path = resolve_app_script(script_name, app_dir=app_root)
     return launch_python_script(
         script_path,
+        args=tuple(args),
         executable=executable,
         cwd=app_root,
     )

@@ -1919,6 +1919,13 @@ def toggle_console(icon=None, item=None):
 #   False = 使用者按 X 關閉設定窗 → mainloop 返回後應 restart_program 回背景模式
 _config_restart_requested = False
 
+# [2026-08-02 補審] 「沒有可用設定時改開設定視窗」的旗標。
+# ★為什麼不是讓呼叫端自己判斷檔案在不在★:autoclock 的閘門看的是「有沒有帳號」,
+#   而檔案可能存在卻是 `[]`(使用者刪光最後一個帳號)。兩邊判斷不同步的話,
+#   主程式的按鈕會啟動背景模式、autoclock 靜默結束 → 設定視窗再也叫不出來。
+#   把「什麼算可用設定」留在 autoclock 判斷一次,呼叫端只表達意圖。
+CONFIGURE_IF_EMPTY_FLAG = "--configure-if-empty"
+
 
 def _cleanup_orphan_chromedrivers_at_startup() -> None:
     """[AC-03] 啟動時清掃「父行程已死」的孤兒 chromedriver + 其子 chrome。
@@ -2017,6 +2024,12 @@ def restart_program(args_add=None, hard_exit_code=None) -> None:
             extra.append(a)
     if args_add:
         extra.append(args_add)
+    # ★內部重啟一律帶上旗標★ 走到這裡表示程式本來就在跑;若新行程發現設定變成空的
+    #   (例如使用者剛在設定視窗刪光最後一個帳號並存檔),應該把設定視窗開回來,
+    #   而不是靜默消失 —— 那會讓使用者以為打卡還在跑。
+    #   冷啟動(捷徑/啟動資料夾,argv 沒有旗標)才是使用者要的「直接不啟動」。
+    if CONFIGURE_IF_EMPTY_FLAG not in extra:
+        extra.append(CONFIGURE_IF_EMPTY_FLAG)
     outcome = restart_self(extra, hard_exit_code=hard_exit_code,
                            on_confirmed=_teardown_for_handover)
     # 走到這裡＝新行程早夭、restart_self 刻意保留本行程；因為拆解在 on_confirmed 裡，
@@ -2201,19 +2214,24 @@ def main() -> None:
         #   不跑打卡的機器則根本不會觸發更新重啟。
         load_config()
 
-        if len(sys.argv) > 1:
-            if sys.argv[1] == "--configure":
-                ClockApp(accounts_data).mainloop()
-                # [AC-05] 設定視窗關閉(按 X / on_closing)後，若不是經「儲存並重啟(背景)」
-                # 離開，就回背景模式繼續自動打卡——否則關掉設定窗＝背景打卡程式一起消失，
-                # 使用者以為還在打卡卻早已沒在跑(漏打卡)。
-                if not _config_restart_requested:
-                    logging.info("[autoclock] 設定視窗關閉，回背景模式繼續自動打卡")
-                    restart_program()
-                return
-            if sys.argv[1] == "--test-login":
-                _run_test_ui()
-                return
+        # ★[2026-08-02 補審 P1] 旗標判斷必須與【順序無關】★
+        #   原本是 `sys.argv[1] == "--configure"`(位置判斷)。主程式的按鈕會帶
+        #   `--configure-if-empty` 啟動,之後 tray 的「設定」再 append `--configure`
+        #   → argv 變成 ["--configure-if-empty", "--configure"],argv[1] 兩個分支
+        #   都不匹配 → 直接落回背景模式,設定視窗永遠打不開。
+        _flags = set(sys.argv[1:])
+        if "--configure" in _flags:
+            ClockApp(accounts_data).mainloop()
+            # [AC-05] 設定視窗關閉(按 X / on_closing)後，若不是經「儲存並重啟(背景)」
+            # 離開，就回背景模式繼續自動打卡——否則關掉設定窗＝背景打卡程式一起消失，
+            # 使用者以為還在打卡卻早已沒在跑(漏打卡)。
+            if not _config_restart_requested:
+                logging.info("[autoclock] 設定視窗關閉，回背景模式繼續自動打卡")
+                restart_program()
+            return
+        if "--test-login" in _flags:
+            _run_test_ui()
+            return
 
         # [2026-07-25 審查] 設定檔暫時讀不到 → 【不可】當成「未設定」而開空的設定視窗:
         # 那會 ①整天不啟動排程(靜默漏打卡) ②使用者關窗按「儲存」就把好檔覆寫成空。
@@ -2232,7 +2250,22 @@ def main() -> None:
             return
 
         if not accounts_data:
-            ClockApp(accounts_data).mainloop()
+            if CONFIGURE_IF_EMPTY_FLAG in sys.argv[1:]:
+                # 呼叫端明確表達「沒有可用設定就讓我設定」(主程式的按鈕、
+                # 以及任何內部重啟)→ 開設定視窗,而不是靜默消失。
+                logging.info("[autoclock] 無可用設定 + %s → 開設定視窗",
+                             CONFIGURE_IF_EMPTY_FLAG)
+                ClockApp(accounts_data).mainloop()
+                return
+            # ★[2026-08-02 使用者定案]「一台沒有打卡設定檔的電腦不用啟動 autoclock」★
+            #   原本會開設定視窗 —— 於是每一台被順手啟動過的電腦(捷徑/啟動資料夾)
+            #   都會跳出一個沒人要設定的視窗,而且在更新檢查搬位置之前還會連帶
+            #   產生「新版本無法啟動」的假警報。
+            #   ★設定的路仍然在★:`--configure` 一定會開設定視窗(見上方 argv 分支),
+            #   主程式「小工具 → 打卡程式」在偵測到沒有設定檔時就是帶這個參數啟動的。
+            logging.info("[autoclock] 本機沒有打卡設定(%s 不存在或為空)→ 不啟動。"
+                         "要在這台電腦設定打卡,請用主程式的「打卡程式」按鈕"
+                         "(或以 --configure 啟動)。", CONFIG_FILE)
             return
 
         global background_thread, tray_icon_object

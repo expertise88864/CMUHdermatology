@@ -142,7 +142,10 @@ def test_restart_program_releases_mutex_before_respawn(monkeypatch):
 
     # 順序仍是「先 spawn、確認存活後才放 mutex」——mutex 在 on_confirmed 裡釋放，
     # 子行程搶不到會自行重試（~1.5s > 存活檢查 0.6s）。
-    assert calls == [("restart", [], None), "release"]
+    # [2026-08-02] 內部重啟一律帶 --configure-if-empty:新行程若發現設定變成空的
+    # (使用者剛刪光最後一個帳號並存檔),要把設定視窗開回來而不是靜默消失。
+    assert calls == [("restart", [autoclock.CONFIGURE_IF_EMPTY_FLAG], None),
+                     "release"]
     assert not autoclock.running.is_set(), "接手成功後才拆解"
 
 
@@ -164,7 +167,8 @@ def test_restart_program_passes_hard_exit_code_for_background_restart(monkeypatc
 
     autoclock.restart_program(hard_exit_code=1)
 
-    assert calls == [("restart", [], 1), "release"]
+    assert calls == [("restart", [autoclock.CONFIGURE_IF_EMPTY_FLAG], 1),
+                     "release"]
     assert not autoclock.running.is_set()
 
 

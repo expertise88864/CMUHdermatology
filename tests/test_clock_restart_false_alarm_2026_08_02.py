@@ -148,3 +148,85 @@ def test_nonzero_exit_without_traceback_is_a_crash():
 
 def test_unparseable_returncode_is_conservative():
     assert paths.classify_child_exit(None, "") == paths.SPAWN_CHILD_CRASHED
+
+
+# ─── [使用者定案] 沒有設定檔的電腦不啟動 autoclock ────────────────────────
+def test_background_launch_without_config_does_not_open_a_window():
+    """★使用者定案★「一台沒有打卡設定檔的電腦不用啟動 autoclock」。
+
+    原本是開設定視窗 —— 於是每一台被順手啟動過的電腦(捷徑/啟動資料夾)都會跳出
+    一個沒人要設定的視窗,而且在更新檢查搬位置之前還會連帶產生假警報。
+    """
+    code = _code_only(_src('autoclock.py'))
+    i = code.index("if not accounts_data:")
+    seg = code[i:i + 900]
+    # 有 --configure-if-empty 的路徑會開視窗(那是主程式按鈕/內部重啟);
+    # 這裡要驗的是【沒有旗標】的冷啟動路徑 —— 它必須直接 return,不開視窗。
+    i_silent = seg.index("不啟動")
+    cold = seg[i_silent:]
+    assert "ClockApp(" not in cold, "★冷啟動無設定時不可開設定視窗★"
+    assert "return" in cold
+
+
+def test_configure_flag_still_opens_the_window():
+    """★設定的路必須還在★ 否則新機器永遠沒辦法第一次設定。"""
+    code = _code_only(_src('autoclock.py'))
+    i = code.index('"--configure" in _flags')
+    seg = code[i:i + 400]
+    assert "ClockApp(" in seg and "mainloop()" in seg
+
+
+def test_main_button_always_expresses_intent_not_a_file_check():
+    """★補審 P2★ 按鈕【不可】自己判斷設定檔在不在。
+
+    autoclock 的閘門看的是「有沒有帳號」,而檔案可能存在卻是 `[]`(使用者刪光最後
+    一個帳號)。兩邊判斷不同步 → 按鈕啟動背景模式、autoclock 靜默結束,
+    設定視窗再也叫不出來。「什麼算可用設定」只由 autoclock 判斷一次。
+    """
+    code = _code_only(_src('main.py'))
+    i = code.index("def _launch_autoclock_program(")
+    seg = code[i:i + 1400]
+    assert '"--configure-if-empty"' in seg
+    assert "autoclock_config.json" not in seg, "★不可在呼叫端重複判斷可用性★"
+
+
+def test_configure_if_empty_opens_the_window_when_no_accounts():
+    code = _code_only(_src('autoclock.py'))
+    i = code.index("if not accounts_data:")
+    seg = code[i:i + 900]
+    i_flag = seg.index("CONFIGURE_IF_EMPTY_FLAG in sys.argv[1:]")
+    i_silent = seg.index("不啟動")
+    assert i_flag < i_silent, "有旗標時先開視窗,沒有才靜默結束"
+    assert "ClockApp(" in seg[i_flag:i_silent]
+
+
+def test_internal_restart_always_carries_the_flag():
+    """★內部重啟一律帶旗標★ 使用者在設定視窗刪光最後一個帳號並存檔後,新行程
+    若靜默消失,使用者會以為打卡還在跑。冷啟動(捷徑)才該直接不啟動。"""
+    code = _code_only(_src('autoclock.py'))
+    i = code.index("def restart_program(")
+    seg = code[i:i + 2500]
+    assert "if CONFIGURE_IF_EMPTY_FLAG not in extra:" in seg
+    assert "extra.append(CONFIGURE_IF_EMPTY_FLAG)" in seg
+
+
+def test_launch_app_script_forwards_args():
+    from cmuh_common.process_launch import launch_app_script
+    import inspect
+    sig = inspect.signature(launch_app_script)
+    assert "args" in sig.parameters
+    src = inspect.getsource(launch_app_script)
+    assert "args=tuple(args)" in src, "要真的往下傳,不是只收著"
+
+
+def test_flag_detection_is_order_independent():
+    """★補審 P1★ 主程式按鈕帶 --configure-if-empty 啟動後,tray「設定」會再
+    append --configure → argv 變成 ["--configure-if-empty", "--configure"]。
+    用 `sys.argv[1] == ...` 位置判斷的話兩個分支都不匹配 → 直接落回背景模式,
+    設定視窗永遠打不開。"""
+    code = _code_only(_src('autoclock.py'))
+    i = code.index("_flags = set(sys.argv[1:])")
+    seg = code[i:i + 700]
+    assert '"--configure" in _flags' in seg
+    assert '"--test-login" in _flags' in seg
+    assert "sys.argv[1] ==" not in code, "★不可再用位置判斷旗標★"

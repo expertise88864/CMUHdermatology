@@ -11199,9 +11199,17 @@ class AutomationApp:
         if is_instance_running("Local\\CMUH_Skin_AutoClock_SingleInstance_v1"):
             logging.info("Autoclock program is already running; skip launch")
             return
+        # [2026-08-02] 打卡程式在【沒有可用設定】時已改為不啟動(使用者定案:
+        # 沒設定的電腦不用跑 autoclock)。這顆按鈕是「設定」那條路,所以一律帶
+        # --configure-if-empty:有設定就進背景模式,沒有就開設定視窗。
+        # ★不可在這裡自己判斷檔案在不在★ —— 檔案可能存在卻是 `[]`(使用者刪光最後
+        #   一個帳號),那樣按鈕會啟動背景模式、autoclock 靜默結束,設定視窗再也
+        #   叫不出來。「什麼算可用設定」只由 autoclock 判斷一次。
         try:
-            logging.info(f"Launching autoclock program: {autoclock_script_name}")
-            launch_app_script(autoclock_script_name)
+            logging.info("Launching autoclock program: %s (--configure-if-empty)",
+                         autoclock_script_name)
+            launch_app_script(autoclock_script_name,
+                              args=("--configure-if-empty",))
         except FileNotFoundError:
             messagebox.showerror("啟動失敗", f"找不到打卡程式檔案: {autoclock_script_name}\n\n請確認主程式與打卡程式在同一個資料夾中。")
             logging.error(f"Autoclock script not found: {autoclock_script_name}")
