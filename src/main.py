@@ -52,6 +52,13 @@ from cmuh_common.threshold_policy import (
     build_doctor_threshold_map,
     is_near_alert_threshold,
 )
+from cmuh_common.patient_locator import (
+    INDEX_FILENAME as _LOCATOR_INDEX_FILENAME,
+    MAX_CONTROLS_TO_SCAN as _LOCATOR_MAX_CONTROLS,
+    append_index as _append_locator_index,
+    format_for_alert as _format_patient_locator,
+    parse_banner as _parse_patient_banner,
+)
 from cmuh_common.settings_defaults import (
     SETTINGS_GROUPS,
     F8_QUICK_TEXT_DEFAULT as _F8_QUICK_TEXT_DEFAULT,
@@ -1648,6 +1655,52 @@ def audit_health_check(notify: bool = True) -> dict:
     return snap
 
 
+def _sample_patient_locator(main_hwnd: int = 0):
+    """列舉 HIS 主視窗子控件,找出病人資訊橫幅並擷取【白名單】定位欄位。
+
+    [2026-07-28 使用者] 「沒有紀錄該病人診間/診號/或是病歷號,這樣我沒辦法查詢是
+    哪個病人有錯誤」。主視窗**標題列只有版本號**,病人資訊在上方一條獨立橫幅:
+        1150728 早上 103診 113號 -呂冠愷(24994923)女 42歲1月 (0730623) #C0024322
+
+    ★只在回讀不符(罕見、流程已中止)時呼叫★ —— 列舉子視窗有成本,不可放進正常路徑。
+    ★用內容過濾而非 class 名稱識別★ 與 `_find_disposition_memo` 同一套思路,改版時
+      比較不會整組失效;而且我們只【讀】不寫,誤判最壞的後果是拿不到定位資訊。
+    ★姓名/生日不會離開這個函式★ 原文只存在區域變數,`parse_banner` 只回白名單 dict。
+    絕不拋、絕不阻塞(WM_GETTEXT 走既有的逾時版本)。
+    """
+    if not main_hwnd:
+        return None
+    children: list = []
+
+    _EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @_EnumProc
+    def _cb(child, _lparam):
+        children.append(int(child))
+        return len(children) < _LOCATOR_MAX_CONTROLS
+
+    try:
+        ctypes.windll.user32.EnumChildWindows(main_hwnd, _cb, 0)
+    except Exception:
+        logging.debug("[locator] EnumChildWindows 例外", exc_info=True)
+        return None
+    for hwnd in children:
+        try:
+            text = _wm_gettext_timeout(hwnd)
+        except Exception:
+            continue
+        try:
+            loc = _parse_patient_banner(text)
+        except Exception:
+            logging.debug("[locator] 橫幅解析例外", exc_info=True)
+            continue
+        if loc:
+            return loc
+    logging.info("[locator] 掃過 %d 個控件仍找不到病人資訊橫幅"
+                 "(院方改版或當下沒開病歷?)", len(children))
+    return None
+
+
 def _machine_name_safe() -> str:
     try:
         return str(os.environ.get("COMPUTERNAME") or "本機")
@@ -1655,10 +1708,27 @@ def _machine_name_safe() -> str:
         return "本機"
 
 
-def _notify_audit_mismatch(action: str, detail: str) -> None:
+def _notify_audit_mismatch(action: str, detail: str, locator=None,
+                           ts: str = "") -> None:
     """[批次三] 回讀 mismatch 的即時通知:mismatch = 自動化寫的值與 HIS 讀回的不一致,
     正是「改版寫錯病歷」的第一時間訊號,不能等人翻帳本才發現。醫師端已有警告視窗
-    (呼叫點既有),這封信給維護者。同功能同日去重;背景 daemon 緒寄,不卡帳本寫入緒。"""
+    (呼叫點既有),這封信給維護者。同功能同日去重;背景 daemon 緒寄,不卡帳本寫入緒。
+
+    [2026-07-28 使用者] locator = 病人定位資訊(診間/診號/病歷號,白名單擷取)。
+    ★索引檔的寫入在去重【之前】★ —— 去重擋掉的是信,不是紀錄:同一天第二個出問題
+    的病人本來完全查不到,而 SMTP 掛掉時連第一個都會遺失。索引與 hash-chain 稽核
+    帳本分開,帳本「不存病人明文識別」的既有定案不動。"""
+    _loc_text = _format_patient_locator(locator)
+    try:
+        _append_locator_index(
+            get_conf_path(_LOCATOR_INDEX_FILENAME),
+            ts=ts or datetime.now().isoformat(timespec="seconds"),
+            action=str(action), detail=str(detail), locator=locator)
+    except Exception:
+        logging.debug("[locator] 索引寫入失敗(不影響告警)", exc_info=True)
+    logging.warning("[audit] 回讀不符:%s | %s | 病人定位:%s",
+                    action, detail, _loc_text)
+
     key = f"{action}|{date.today().isoformat()}"
     with _audit_notify_lock:
         # [codex P1] 先佔 inflight,寄成功才進 notified —— 寄失敗要能在下一次 mismatch
@@ -1675,9 +1745,13 @@ def _notify_audit_mismatch(action: str, detail: str) -> None:
                 sent_ok = bool(_send_alert_email_via_smtp(
                     f"[皮膚科自動化] 回讀不符:{action}",
                     f"自動化寫入後回讀驗證不一致(該次寫入已依既有流程中止/警告醫師)。\n\n"
-                    f"功能:{action}\n細節:{detail}\n電腦:{_machine_name_safe()}\n\n"
+                    f"功能:{action}\n細節:{detail}\n"
+                    f"病人定位:{_loc_text}\n"
+                    f"時間:{ts or '(未提供)'}\n電腦:{_machine_name_safe()}\n\n"
                     f"這通常代表 HIS 改版/欄位位移 —— 請核對後於設定頁重新校正金絲雀。\n"
-                    f"(同一功能同一天只寄一次。)", recipients))
+                    f"(同一功能同一天只寄一次;但【每一筆】都會記進 "
+                    f"settings/{_LOCATOR_INDEX_FILENAME},同一天後續的病人請查該檔。)",
+                    recipients))
         except Exception:
             logging.debug("[audit-health] mismatch 通知寄信失敗", exc_info=True)
         finally:
@@ -1710,7 +1784,13 @@ def _ledger_writer_loop(q=None) -> None:
         try:
             if item is None:            # 哨兵 → 收工
                 return
-            surface, action, fields, ts = item
+            # [2026-07-28] 項目多了第 5 個欄位(病人定位資訊,不進帳本)。
+            # 容忍 4 元素的舊格式:關機排空時佇列裡可能還有改版前入列的項目。
+            if len(item) >= 5:
+                surface, action, fields, ts, locator = item[:5]
+            else:
+                surface, action, fields, ts = item
+                locator = None
             # [GPT-5.6 第三輪] record() 回 False = 這筆稽核【沒有落地】(磁碟拒寫/硬上限)。
             # 原本丟棄回傳值 → 關機 flush 看 task_done 以為都寫完了、遺失無人知。至少要
             # 計數 + warning(完整的 audit health 面板待後續批次)。
@@ -1722,7 +1802,8 @@ def _ledger_writer_loop(q=None) -> None:
             # [批次三] 回讀不符 → 即時通知維護者(醫師端警告視窗在呼叫點既有;這封信
             # 讓改版寫錯不用等人翻帳本才發現)。async 寄,不卡本寫入緒。
             if str(fields.get("outcome", "")) == _LEDGER_MISMATCH:
-                _notify_audit_mismatch(action, str(fields.get("detail", "")))
+                _notify_audit_mismatch(action, str(fields.get("detail", "")),
+                                       locator=locator, ts=ts)
         except Exception:
             logging.debug("[ledger] 背景寫入失敗(不影響操作)", exc_info=True)
         finally:
@@ -1801,8 +1882,17 @@ def _record_his_action(surface: str, action: str, main_hwnd: int = 0,
         if _cid:
             fields.setdefault("correlation_id", _cid)
         ts = datetime.now().isoformat(timespec="seconds")   # 動作發生當下的時間
+        # [2026-07-28 使用者] 回讀不符時,在【動作當下】採樣病人定位資訊 —— 這是
+        # 唯一能保證抓到正確病人的時機(背景緒稍後才採樣可能已經換病人了)。
+        # ★不進 fields★ fields 會落進 hash-chain 稽核帳本,而帳本明訂不存病人明文
+        #   識別;定位資訊走佇列的獨立欄位,只給告警信與定位索引檔用。
+        # 只在 mismatch 時採樣:列舉子視窗有成本,不可放進正常路徑。
+        locator = None
+        if str(fields.get("outcome", "")) == _LEDGER_MISMATCH:
+            locator = _sample_patient_locator(main_hwnd)
         _ensure_ledger_writer()
-        _ledger_queue.put_nowait((str(surface), str(action), dict(fields), ts))
+        _ledger_queue.put_nowait(
+            (str(surface), str(action), dict(fields), ts, locator))
     except Exception:
         # 佇列滿(Full)或其他任何問題 → 丟棄,絕不等待
         _ledger_dropped += 1

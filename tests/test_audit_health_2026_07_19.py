@@ -180,18 +180,54 @@ def test_mismatch_failed_send_can_retry(monkeypatch):
 def test_writer_loop_triggers_mismatch_notify(monkeypatch):
     # 帳本落地 outcome=mismatch → writer 觸發即時通知
     notified = []
-    monkeypatch.setattr(main, "_notify_audit_mismatch",
-                        lambda action, detail: notified.append(action))
+    monkeypatch.setattr(
+        main, "_notify_audit_mismatch",
+        # [2026-07-28] 簽章多了 locator/ts(病人定位資訊,不進帳本)
+        lambda action, detail, locator=None, ts="": notified.append(action))
     monkeypatch.setattr(main, "_action_ledger",
                         lambda: type("L", (), {"record": lambda s, *a, **k: True})())
     q = main.Queue(maxsize=8)
     q.put_nowait((al.SURFACE_HIS_FIELD, "F2 UVB 劑量",
-                  {"outcome": al.OUTCOME_MISMATCH, "detail": "回讀不符"}, "ts"))
+                  {"outcome": al.OUTCOME_MISMATCH, "detail": "回讀不符"},
+                  "ts", None))
     q.put_nowait((al.SURFACE_HIS_FIELD, "F3 療程",
-                  {"outcome": al.OUTCOME_OK}, "ts"))
+                  {"outcome": al.OUTCOME_OK}, "ts", None))
     q.put_nowait(None)                        # 哨兵收工
     main._ledger_writer_loop(q)
     assert notified == ["F2 UVB 劑量"], "只有 mismatch 觸發即時通知"
+
+
+def test_writer_loop_passes_the_patient_locator_through(monkeypatch):
+    """[2026-07-28] 病人定位資訊要從入列端一路帶到通知端(不經過帳本 fields)。"""
+    seen = []
+    monkeypatch.setattr(
+        main, "_notify_audit_mismatch",
+        lambda action, detail, locator=None, ts="": seen.append((locator, ts)))
+    monkeypatch.setattr(main, "_action_ledger",
+                        lambda: type("L", (), {"record": lambda s, *a, **k: True})())
+    q = main.Queue(maxsize=8)
+    loc = {"room": "103", "seq": "113", "chart_no": "24994923"}
+    q.put_nowait((al.SURFACE_HIS_FIELD, "F1 UVB 劑量",
+                  {"outcome": al.OUTCOME_MISMATCH, "detail": "d"},
+                  "2026-07-28T09:15:00", loc))
+    q.put_nowait(None)
+    main._ledger_writer_loop(q)
+    assert seen == [(loc, "2026-07-28T09:15:00")]
+
+
+def test_writer_loop_tolerates_legacy_four_field_item(monkeypatch):
+    """關機排空時佇列裡可能還有改版前入列的 4 元素項目 → 不可 unpack 炸掉。"""
+    seen = []
+    monkeypatch.setattr(
+        main, "_notify_audit_mismatch",
+        lambda action, detail, locator=None, ts="": seen.append(locator))
+    monkeypatch.setattr(main, "_action_ledger",
+                        lambda: type("L", (), {"record": lambda s, *a, **k: True})())
+    q = main.Queue(maxsize=8)
+    q.put_nowait((al.SURFACE_HIS_FIELD, "F1", {"outcome": al.OUTCOME_MISMATCH}, "ts"))
+    q.put_nowait(None)
+    main._ledger_writer_loop(q)
+    assert seen == [None]
 
 
 # ── 佈線守門 ─────────────────────────────────────────────────────────────────

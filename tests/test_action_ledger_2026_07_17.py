@@ -412,7 +412,8 @@ def test_version_canary_snapshot_taken_at_action_time(monkeypatch):
 
     main._record_his_action(al.SURFACE_HIS_MENU, "F2 醫令代碼", main_hwnd=123,
                             value="51017")
-    surface, action, fields, ts = _drain_ledger_queue()[0]
+    # [2026-07-28] 項目多了第 5 欄(病人定位資訊,刻意不進帳本 fields)
+    surface, action, fields, ts = _drain_ledger_queue()[0][:4]
     # 版本已在入列時就定好(不是等背景緒)
     assert fields["his_version"] == "1150713.02" and fields["canary"] == "ok"
     assert surface == al.SURFACE_HIS_MENU and fields["value"] == "51017"
@@ -573,7 +574,7 @@ def test_correlation_id_shared_within_hotkey_flow(monkeypatch):
     items = []
     while not main._ledger_queue.empty():
         items.append(main._ledger_queue.get_nowait())
-    cids = [fields.get("correlation_id") for _s, _a, fields, _ts in items]
+    cids = [it[2].get("correlation_id") for it in items]
     assert cids == ["F11#42", "F11#42"], "同次流程共用同一 correlation_id"
 
 
@@ -584,7 +585,7 @@ def test_correlation_id_absent_outside_hotkey_flow(monkeypatch):
     monkeypatch.setattr(main, "_ensure_ledger_writer", lambda: None)
     main._his_correlation.cid = ""
     main._record_his_action(al.SURFACE_HIS_MENU, "F2", value="51017")
-    _s, _a, fields, _ts = main._ledger_queue.get_nowait()
+    _s, _a, fields, _ts = main._ledger_queue.get_nowait()[:4]
     assert fields.get("correlation_id", "") == ""
 
 
