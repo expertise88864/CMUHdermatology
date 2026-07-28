@@ -107,7 +107,12 @@ def test_index_check_passes_on_clean_index():
                   capture_output=True, text=True).stdout
     if out.strip():
         pytest.skip("工作區有未提交變更,index 與工作目錄本來就會不同")
-    ph.verify_index_matches(ph.snapshot_tracked_sources())   # 不得拋出
+    # ★expected 必須涵蓋 index 內的所有檔★ `snapshot_tracked_sources()` 預設
+    #   排除 version.py(那是給「關卡前後比對」用的),而 verify_index_matches
+    #   比對的是【聯集】—— 少了 version.py 就會被判成「index 多了一個檔」。
+    #   正式流程在 main() 裡是 fingerprint + version.py + manifest.json,
+    #   不受影響;是這支測試餵錯了 expected(CI 在乾淨工作區上跑才暴露)。
+    ph.verify_index_matches(ph.worktree_blob_ids(include_version=True))
 
 
 def test_index_check_flags_missing_file():
@@ -133,25 +138,46 @@ def test_version_and_manifest_are_checked_against_index():
     assert ph.MANIFEST_REL == "manifest.json"
 
 
-def test_hashes_come_from_git_not_from_raw_bytes():
-    """★[2026-08-02 補審第 3 輪] CRLF 正規化★
+def test_worktree_blob_ids_match_the_index_on_a_clean_tree():
+    """★真正的不變量(與平台無關)★ 工作目錄算出來的 blob id 必須等於 index 裡的。
 
-    本機 core.autocrlf=true 且 .gitattributes 是 `* text=auto eol=lf`,
-    而 push_helper 自己 bump 出來的 version.py 在磁碟上就是 CRLF
-    (Path.write_text 在 Windows 把 \n 轉成 \r\n)。自行 sha256(原始 bytes)
-    與 index 裡的 blob 必然不同 → 【每一次推送都誤報】。
-    必須讓 git 自己算(git hash-object 會套用同一組 filter)。
+    這是「不可自行 sha256」的根據:讓 git 自己算,filter(CRLF 正規化、binary
+    判定)才會與 `git add` 完全一致。
     """
     ph = _load()
+    import subprocess as _sp
+    if _sp.run(["git", "status", "--porcelain"], cwd=ph.REPO_ROOT,
+               capture_output=True, text=True).stdout.strip():
+        pytest.skip("工作區有未提交變更,兩者本來就會不同")
     ids = ph.worktree_blob_ids(include_version=True)
     idx = ph.index_blob_ids()
+    diff = sorted(k for k in {*ids, *idx} if ids.get(k) != idx.get(k))
+    assert diff == [], f"乾淨工作區下不該有差異:{diff}"
+
+
+def test_crlf_file_would_break_a_naive_sha256():
+    """★CRLF 正規化 —— 這是 Windows 專屬的失效情境★
+
+    開發機 core.autocrlf=true 且 .gitattributes 是 `* text=auto eol=lf`,
+    而 push_helper 自己 bump 出來的 version.py 在磁碟上就是 CRLF
+    (Path.write_text 在 Windows 把 \n 轉成 CRLF)→ 自行 sha256(原始 bytes)
+    與 index 裡的 blob 必然對不上 → 【每一次推送都誤報】。
+
+    ★CI 跑在 Linux,checkout 出來是 LF —— 前提不成立時要 skip,不是失敗★
+    (我第一版把「磁碟上是 CRLF」寫成無條件斷言,CI 一跑就紅。)
+    """
+    ph = _load()
     rel = "src/cmuh_common/version.py"
     raw = (ph.REPO_ROOT / rel).read_bytes()
-    assert b"\r\n" in raw, "前提:version.py 在磁碟上是 CRLF(這正是問題來源)"
-    assert ids[rel] == idx[rel], "git 算出來的 blob id 必須與 index 一致"
+    if b"\r\n" not in raw:
+        pytest.skip("本平台 checkout 是 LF(Linux/CI)→ 這個失效情境不會發生")
+    lf = raw.replace(b"\r\n", b"\n")
     import hashlib
-    assert hashlib.sha256(raw).hexdigest() != ids[rel], \
-        "★不可用原始 bytes 的 sha256★ 那與 git blob id 是兩回事"
+    assert hashlib.sha256(raw).hexdigest() != hashlib.sha256(lf).hexdigest(), \
+        "CRLF 與 LF 的 sha256 不同 —— 這正是自算會對不上 index 的原因"
+    ids = ph.worktree_blob_ids(include_version=True)
+    idx = ph.index_blob_ids()
+    assert ids[rel] == idx[rel], "讓 git 自己算就不受影響"
 
 
 def test_version_consistency_guard_rejects_mismatch(capsys):
