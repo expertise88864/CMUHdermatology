@@ -57,6 +57,9 @@ from cmuh_common.alert_dedupe import AlertDeduper as _AlertDeduper
 from cmuh_common.patient_locator import (
     INDEX_FILENAME as _LOCATOR_INDEX_FILENAME,
     MAX_CONTROLS_TO_SCAN as _LOCATOR_MAX_CONTROLS,
+    SCAN_PER_CONTROL_TIMEOUT_MS as _LOCATOR_CONTROL_TIMEOUT_MS,
+    SCAN_TOTAL_BUDGET_SEC as _LOCATOR_SCAN_BUDGET_SEC,
+    format_for_log as _format_patient_locator_safe,
     append_index as _append_locator_index,
     format_for_alert as _format_patient_locator,
     parse_banner as _parse_patient_banner,
@@ -1686,9 +1689,28 @@ def _sample_patient_locator(main_hwnd: int = 0):
     except Exception:
         logging.debug("[locator] EnumChildWindows 例外", exc_info=True)
         return None
+    # ★[2026-08-02 補審 P1] 這裡跑在熱鍵緒,而 mismatch 的典型成因就是 HIS 沒回應。
+    #   預設 2.5 秒 × 400 個控件 ≈ 1,000 秒,期間所有熱鍵全被鎖住。
+    #   → 單控件逾時壓到 120ms、整體 2 秒 deadline、每圈檢查 F12。
+    #   抓不到定位資訊只是「查不到是哪個病人」,鎖住熱鍵卻是診間停擺,孰輕孰重很清楚。★
+    _deadline = time.monotonic() + _LOCATOR_SCAN_BUDGET_SEC
     for hwnd in children:
+        if time.monotonic() > _deadline:
+            logging.info("[locator] 掃描超過 %.1fs 預算 → 放棄取定位資訊(不拖住熱鍵)",
+                         _LOCATOR_SCAN_BUDGET_SEC)
+            return None
+        # ★[2026-08-02 補審第 2 次] F12 只中止【採樣】,不可往上拋★
+        #   check_stop() 丟 SubsystemInterrupted,而本函式是從 _record_his_action
+        #   的 mismatch 分支呼叫的 —— 拋出去會被那裡的廣義 except 吞掉,
+        #   結果整筆稽核紀錄、定位索引與告警信【全部消失】。那比不檢查 F12 更糟:
+        #   醫師按取消,系統就把「剛剛寫錯了」這件事一起忘掉。
         try:
-            text = _wm_gettext_timeout(hwnd)
+            check_stop()
+        except SubsystemInterrupted:
+            logging.info("[locator] F12 取消 → 中止取定位資訊(稽核紀錄照常寫入)")
+            return None
+        try:
+            text = _wm_gettext_timeout(hwnd, timeout_ms=_LOCATOR_CONTROL_TIMEOUT_MS)
         except Exception:
             continue
         try:
@@ -1728,8 +1750,14 @@ def _notify_audit_mismatch(action: str, detail: str, locator=None,
             action=str(action), detail=str(detail), locator=locator)
     except Exception:
         logging.debug("[locator] 索引寫入失敗(不影響告警)", exc_info=True)
-    logging.warning("[audit] 回讀不符:%s | 預期 %s | %s | 病人定位:%s",
-                    action, expected or "(未提供)", detail, _loc_text)
+    # ★[2026-08-02 補審 P2] 一般 log 不可寫病歷號★
+    #   automation_ui.log 是容量輪替(5MB×3)、沒有 30 天期限,而且常被整包交給
+    #   開發者除錯 —— 本檔第 ~3996 行早就明訂病歷號不得寫進這個 log。
+    #   這裡只留診間/診號(定位夠用),病歷號留在有明確保存期限的定位索引與告警信。
+    logging.warning("[audit] 回讀不符:%s | 預期 %s | %s | 病人定位:%s"
+                    "(完整定位含病歷號請查 settings/%s)",
+                    action, expected or "(未提供)", detail,
+                    _format_patient_locator_safe(locator), _LOCATOR_INDEX_FILENAME)
 
     key = f"{action}|{date.today().isoformat()}"
     # [codex P1] 先佔 inflight —— 必須在 spawn【之前】同步佔,否則兩次呼叫之間會各堆

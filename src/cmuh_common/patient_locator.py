@@ -31,10 +31,34 @@ INDEX_FILENAME = "patient_locator_index.jsonl"
 INDEX_RETAIN_DAYS = 30
 # 橫幅通常在視窗上方,不必掃到底;掃太多控件會拖慢熱鍵緒。
 MAX_CONTROLS_TO_SCAN = 400
+# ★[2026-08-02 補審 P1] 這段跑在【熱鍵緒】上,而且只在 mismatch 時觸發 ——
+#   mismatch 的典型成因正是「HIS 沒有回應」。若每個控件都用預設 2.5 秒逾時,
+#   400 × 2.5s ≈ 1,000 秒,期間所有熱鍵全被鎖住(F12 也不會被檢查)。
+#   故:單控件逾時壓到很短,並加一道整體 deadline。抓不到就誠實回報抓不到。
+SCAN_PER_CONTROL_TIMEOUT_MS = 120
+SCAN_TOTAL_BUDGET_SEC = 2.0
 MAX_TEXT_LEN = 400          # 超過這個長度的控件不可能是橫幅(多半是病歷 memo)
 
-# 民國 7 碼日期(1150728);前後不可再接數字,免得從病歷號中間切出來
-_ROC_DATE_RE = re.compile(r"(?<!\d)(\d{7})(?!\d)")
+# 民國 7 碼日期(1150728)。★[2026-08-02 補審 P1] 必須錨在【開頭】並驗證是合法日期★
+#   原本用「橫幅中任何一個獨立七位數」——而實機橫幅本來就含七位的【生日】
+#   (0730623)。只要院方把開頭日期改成西元八碼/斜線格式、或那一格暫時是空的,
+#   生日就會滿足 banner 識別條件並被輸出成 date_roc,進而進入告警信與索引檔,
+#   直接違反本模組「生日一律不取」的核心承諾。
+_ROC_DATE_RE = re.compile(r"^\s*(\d{7})(?!\d)")
+
+
+def _valid_roc_date(text: str) -> bool:
+    """民國日期合理性:年 100-199、月 01-12、日 01-31。
+
+    不做真正的日曆驗證(閏年/大小月)——這只是用來把「七位數的生日」與
+    「七位數的民國日期」分開,過度嚴格反而會在院方改格式時整組失效。
+    """
+    if not text or len(text) != 7 or not text.isdigit():
+        return False
+    year, month, day = int(text[:3]), int(text[3:5]), int(text[5:7])
+    return 100 <= year <= 199 and 1 <= month <= 12 and 1 <= day <= 31
+
+
 _SESSION_RE = re.compile(r"(早上|上午|下午|晚上|夜診)")
 _ROOM_RE = re.compile(r"(\d{1,4})\s*診")
 _SEQ_RE = re.compile(r"(\d{1,4})\s*號")
@@ -58,7 +82,8 @@ def looks_like_banner(text: str) -> bool:
     """
     if not text or len(text) > MAX_TEXT_LEN:
         return False
-    return bool(_ROC_DATE_RE.search(text)
+    m = _ROC_DATE_RE.search(text)
+    return bool(m and _valid_roc_date(m.group(1))
                 and _ROOM_RE.search(text)
                 and _SEQ_RE.search(text))
 
@@ -72,7 +97,7 @@ def parse_banner(text: str):
         return None
     out = {}
     m = _ROC_DATE_RE.search(text)
-    if m:
+    if m and _valid_roc_date(m.group(1)):
         out["date_roc"] = m.group(1)
     m = _SESSION_RE.search(text)
     if m:
@@ -108,6 +133,20 @@ def format_for_alert(loc) -> str:
         parts.append(f"就診序號 {loc['visit_no']}")
     tail = " ".join(x for x in (loc.get("date_roc"), loc.get("session")) if x)
     return " / ".join(parts) + (f"({tail})" if tail else "")
+
+
+def format_for_log(loc) -> str:
+    """給【一般 log】用的定位字串 —— ★不含病歷號★。
+
+    [2026-08-02 補審 P2] `automation_ui.log` 是容量輪替、沒有保存期限,而且常被
+    整包交給開發者除錯。病歷號只留在有明確 30 天期限的定位索引與告警信裡;
+    一般 log 有「診間/診號」就足以對應到索引裡那一筆。
+    """
+    if not loc:
+        return "(無法取得)"
+    parts = [f"診間 {loc[k]}" if k == "room" else f"診號 {loc[k]}"
+             for k in ("room", "seq") if loc.get(k)]
+    return "/".join(parts) if parts else "(無診間診號)"
 
 
 # ─── 獨立定位索引檔 ────────────────────────────────────────────────────────

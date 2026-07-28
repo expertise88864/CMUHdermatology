@@ -22,6 +22,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import shutil
 import time
 from dataclasses import dataclass
 from datetime import date
@@ -239,7 +240,28 @@ def _backup_existing(target: str) -> str:
     dest = f"{target}.before-reset-{ts}-{os.getpid()}"
     if os.path.exists(dest):          # 同秒同 process 連按兩次 → 不覆蓋既有備份
         return dest
-    os.replace(target, dest)
+    # ★[2026-08-02 補審 P2] 用【複製】而不是搬移★
+    #   原本是 os.replace(target, dest):正式檔在寫入預設值【之前】就消失了。
+    #   若接著 atomic_write_json 因磁碟滿/權限/暫時鎖定而失敗,使用者的設定檔
+    #   就整個不見 —— 而 main 仍會重載設定,loader 對缺檔一律套預設,
+    #   等於「還原失敗」卻造成了比還原更嚴重的後果(下次啟動也繼續用預設)。
+    #   複製之後,寫入失敗時正式檔原封不動。
+    # ★[2026-08-02 補審第 2 次] copy2 不是原子的★
+    #   中途失敗會留下一個【半截】的 dest;同秒同 PID 再按一次時,上面的
+    #   `os.path.exists(dest)` 會把那個半截檔當成有效備份而直接返回,接著就用
+    #   預設值覆蓋正式檔 —— 使用者的設定實際上沒有任何可用備份。
+    #   故:先寫暫存、再原子改名;失敗就把暫存清掉,絕不留下半截。
+    tmp = f"{dest}.partial"
+    try:
+        shutil.copy2(target, tmp)
+        os.replace(tmp, dest)
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
     return dest
 
 

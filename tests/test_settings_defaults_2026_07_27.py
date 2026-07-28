@@ -162,10 +162,14 @@ def test_restore_on_a_machine_with_no_file_yet(tmp_path):
 
 
 def test_backup_failure_must_not_overwrite(tmp_path, monkeypatch):
-    """★沒有退路的破壞性寫入不可接受★ 備份失敗就不還原,原檔要原封不動。"""
+    """★沒有退路的破壞性寫入不可接受★ 備份失敗就不還原,原檔要原封不動。
+
+    [2026-08-02 補審 P2] 備份已由 os.replace(搬移)改為 shutil.copy2(複製)——
+    搬移會讓正式檔在寫入預設值【之前】就消失,寫入失敗時設定就整個不見。
+    """
     p = _conf_path(tmp_path)("doctors.json")
     _write(p, [{"name": "自訂醫師", "doc_no": "X1", "notifications": False}])
-    monkeypatch.setattr(sd.os, "replace",
+    monkeypatch.setattr(sd.shutil, "copy2",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("locked")))
     rep = sd.restore_defaults(["doctors"], conf_path=_conf_path(tmp_path))
     assert not rep.ok and rep.restored == []
