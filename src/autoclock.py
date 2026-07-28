@@ -61,6 +61,9 @@ from cmuh_common.logging_setup import (  # noqa: E402
     attach_stream_handler,
     setup_logging,
 )
+from cmuh_common.paths import (
+    SPAWN_CHILD_EXITED_ORDERLY as _SPAWN_CHILD_EXITED_ORDERLY,
+)  # noqa: E402
 from cmuh_common.paths import get_app_dir, get_settings_dir, restart_self  # noqa: E402
 from cmuh_common.platform_win import set_dpi_awareness  # noqa: E402
 from cmuh_common.single_instance import ensure_single_instance, release_single_instance  # noqa: E402
@@ -2014,10 +2017,19 @@ def restart_program(args_add=None, hard_exit_code=None) -> None:
             extra.append(a)
     if args_add:
         extra.append(args_add)
-    restart_self(extra, hard_exit_code=hard_exit_code,
-                 on_confirmed=_teardown_for_handover)
+    outcome = restart_self(extra, hard_exit_code=hard_exit_code,
+                           on_confirmed=_teardown_for_handover)
     # 走到這裡＝新行程早夭、restart_self 刻意保留本行程；因為拆解在 on_confirmed 裡，
     # 本行程的排程/看門狗/tray/mutex 都【原封不動】→ 自動打卡繼續運作。
+    # ★[2026-08-02 使用者回報] 只有真的像崩潰才示警★
+    #   使用者回報「沒有執行打卡程式的電腦一直跳『新版本無法啟動』」。
+    #   在那些機器上新行程是【照設計】自行結束的(沒有打卡設定檔 → main() 直接
+    #   返回,exit=0、無 stderr),把它說成「無法啟動」是在陳述程式並不確知的事,
+    #   而且對一台根本不跑打卡的電腦來說完全是噪音。
+    if outcome == _SPAWN_CHILD_EXITED_ORDERLY:
+        logging.info("[autoclock restart] 新行程自行正常結束(本機多半未設定打卡)"
+                     " → 不視為失敗,不打擾使用者")
+        return
     logging.error("[autoclock restart] 新行程未能存活 → 本行程續跑（未拆解），"
                   "自動打卡不中斷；請檢查更新是否損毀")
     _notify_restart_failed()
@@ -2180,10 +2192,13 @@ def main() -> None:
                 )
             threading.excepthook = _thread_excepthook
 
-        # 背景檢查更新（不阻塞）
-        threading.Thread(target=_check_update_in_background,
-                         name="ClockUpdateChecker", daemon=True).start()
-
+        # ★[2026-08-02 使用者回報] 更新檢查【不可】在設定閘門之前啟動★
+        #   原本在這裡就開背景緒:一台根本沒有打卡設定檔的電腦,只要 autoclock 被
+        #   啟動一次(捷徑/啟動資料夾/手動),更新檢查就會「發現新版 → restart_program」,
+        #   而新行程照設計立刻結束(無設定 → main() 直接返回)→ 被誤報成
+        #   「新版本無法啟動」。今天推了 8 個版本,於是每次啟動都中。
+        #   移到「確定要進背景模式」之後:真的在跑打卡的機器行為完全不變,
+        #   不跑打卡的機器則根本不會觸發更新重啟。
         load_config()
 
         if len(sys.argv) > 1:
@@ -2232,6 +2247,10 @@ def main() -> None:
 
         # [AC-03] 背景模式起跑前先清掃前世崩潰遺留的孤兒 chromedriver（父行程已死者）。
         _cleanup_orphan_chromedrivers_at_startup()
+
+        # 背景檢查更新（不阻塞）——確定本機真的要跑打卡之後才啟動(見上方說明)。
+        threading.Thread(target=_check_update_in_background,
+                         name="ClockUpdateChecker", daemon=True).start()
 
         background_thread = threading.Thread(target=scheduler_loop, daemon=True,
                                               name="AutoclockScheduler")

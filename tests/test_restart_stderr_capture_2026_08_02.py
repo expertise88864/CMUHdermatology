@@ -31,12 +31,17 @@ def test_child_stderr_is_captured():
 
 
 def test_early_death_logs_the_stderr_tail():
-    """★這才是使用者要的答案★ 早夭時要把 stderr 尾巴記進 log,不能只記 exit code。"""
+    """★這才是使用者要的答案★ 早夭時要把 stderr 尾巴記進 log,不能只記 exit code。
+
+    [2026-08-02] 取 tail 的位置往前移了(要先拿到內容才能判斷是崩潰還是照設計
+    自行結束),故改為斷言「早夭分支內確實取了 stderr 並寫進 error log」。
+    """
     body = _restart_self_body()
-    i = body.index("新行程啟動後立即結束")
-    seg = body[i:i + 500]
-    assert "_child_stderr_tail()" in seg
-    assert "stderr" in seg
+    i = body.index("rc is not None:")
+    seg = body[i:i + 1200]
+    assert "tail = _child_stderr_tail()" in seg
+    assert "新行程啟動後立即結束" in seg
+    assert "--- 新行程 stderr ---" in seg
 
 
 def test_stderr_tail_is_honest_when_unavailable():

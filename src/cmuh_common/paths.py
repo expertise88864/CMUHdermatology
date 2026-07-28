@@ -95,6 +95,36 @@ _SPAWN_ALIVE_POLLS = 6
 _SPAWN_ALIVE_INTERVAL_SEC = 0.1
 
 
+# restart_self 的回傳值(成功時本行程直接退出,故只有失敗路徑會回傳)。
+# 呼叫端據此決定要不要對使用者示警 —— 「照設計自行結束」不該被說成「無法啟動」。
+SPAWN_FAILED = "spawn_failed"                    # Popen 本身失敗
+SPAWN_CHILD_CRASHED = "child_crashed"            # 子行程早夭且非正常結束
+SPAWN_CHILD_EXITED_ORDERLY = "child_exited_orderly"   # exit=0 且無 stderr
+_NO_STDERR_MARKERS = ("(子行程沒有留下任何 stderr)", "(未能建立 stderr 暫存檔)",
+                      "(讀不到 stderr 暫存檔)", "")
+# 崩潰的痕跡。★不可用「stderr 是空的」當判準★:autoclock 的 _setup_clock_logging()
+# 會把 StreamHandler 接到 stderr,而「=== autoclock vX 啟動 ===」在設定閘門【之前】
+# 就寫出去了 —— 於是 tail 永遠不是空的,orderly 永遠不成立,整個判定形同虛設。
+# (這正是本判定第一版的錯誤;外審抓到。)改為看有沒有 Python 例外的痕跡。
+_CRASH_MARKERS = ("Traceback (most recent call last)", "SyntaxError",
+                  "ImportError", "ModuleNotFoundError", "Fatal Python error")
+
+
+def classify_child_exit(rc, stderr_tail: str) -> str:
+    """把「子行程早夭」分類成 orderly / crashed。純函式,好測。
+
+    orderly = 結束碼 0 且看不到 Python 例外的痕跡 → 新行程是【自己決定】結束的
+    (例如本機沒有該程式的設定檔、單例已被別人持有)。那不是「新版本無法啟動」。
+    """
+    try:
+        code = int(rc)
+    except (TypeError, ValueError):
+        return SPAWN_CHILD_CRASHED
+    text = stderr_tail or ""
+    if any(marker in text for marker in _CRASH_MARKERS):
+        return SPAWN_CHILD_CRASHED
+    return SPAWN_CHILD_EXITED_ORDERLY if code == 0 else SPAWN_CHILD_CRASHED
+
 RESTART_ERR_GLOB = "cmuh_restart_*.err"
 RESTART_ERR_KEEP_SEC = 86400        # 保留一天,足夠事後查一次早夭原因
 
@@ -223,10 +253,23 @@ def restart_self(extra_args=None, hard_exit_code=None,
             _time.sleep(_SPAWN_ALIVE_INTERVAL_SEC)
             rc = proc.poll()
             if rc is not None:
-                logging.error(
-                    "[restart_self] 新行程啟動後立即結束 (exit=%s)，保留舊行程不退出。"
-                    "\n--- 新行程 stderr ---\n%s\n--- stderr 結束 ---",
-                    rc, _child_stderr_tail())
+                tail = _child_stderr_tail()
+                # ★[2026-08-02] 分辨「崩潰」與「照設計自行結束」★
+                #   exit=0 且沒有任何 stderr → 新行程是【自己決定】結束的,例如
+                #   這台機器沒有該程式的設定檔、或單例已被別人持有。那不是
+                #   「新版本無法啟動」—— 對使用者宣稱後者,就是在陳述程式並不
+                #   確知的事(使用者回報:沒在跑打卡的電腦一直跳這個通知)。
+                outcome = classify_child_exit(rc, tail)
+                orderly = outcome == SPAWN_CHILD_EXITED_ORDERLY
+                if orderly:
+                    logging.info(
+                        "[restart_self] 新行程自行正常結束 (exit=0、無 stderr)"
+                        " → 多半是本機未設定該程式或單例已在執行;保留舊行程不退出")
+                else:
+                    logging.error(
+                        "[restart_self] 新行程啟動後立即結束 (exit=%s)，保留舊行程不退出。"
+                        "\n--- 新行程 stderr ---\n%s\n--- stderr 結束 ---",
+                        rc, tail)
                 try:
                     if _errf is not None:
                         _errf.close()
@@ -234,7 +277,7 @@ def restart_self(extra_args=None, hard_exit_code=None,
                         os.remove(_err_path)
                 except OSError:
                     pass
-                return
+                return outcome
         try:
             if _errf is not None:
                 _errf.close()       # 父行程放掉自己的 handle;子行程仍持有
@@ -272,13 +315,13 @@ def restart_self(extra_args=None, hard_exit_code=None,
             logging.error(
                 "[restart_self] subprocess.Popen 失敗: %s — 呼叫端要求確認接手後才拆解,"
                 "不走無法確認的 os.execv fallback,保留舊行程繼續運作(本次不重啟)", e)
-            return
+            return SPAWN_FAILED
         logging.error("[restart_self] subprocess.Popen 失敗: %s — fallback os.execv", e)
         try:
             os.execv(cmd[0], cmd)
         except Exception:
             logging.error("[restart_self] os.execv fallback 也失敗", exc_info=True)
-            return
+            return SPAWN_FAILED
     # spawn 成功且新行程存活 → 退出本 process
     if hard_exit_code is not None:
         os._exit(hard_exit_code)
