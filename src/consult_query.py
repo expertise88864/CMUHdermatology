@@ -1901,6 +1901,88 @@ def run_consult_flow(trigger_label: str = "") -> tuple:
     return _run_with_sw_hide(cfg, roster_label)
 
 
+def _wait_main_window_after_login(our_pids: set, *, visible_only: bool,
+                                  timeout_sec: float = 120.0) -> int:
+    """等住院醫囑主畫面出現;期間把擋在前面的「訊息通知」按掉。回傳 main hwnd。
+
+    ★[2026-07-29 實機故障] 原本的迴圈條件是 `if mains and not notice`★
+      —— 只要還找得到 NOTICE_CLASS 視窗就【拒絕】接受主畫面。實機 log 顯示
+      「已關閉訊息通知主畫面」每 0.6 秒重複一次、整整刷滿 120 秒(1,568 行 log
+      幾乎全是它),然後回報「等不到主畫面」。也就是說:點了確認之後那個視窗仍然
+      找得到,於是永遠卡在「先把通知關掉」這一步。
+
+    改用 Win32 的正規訊號:**主視窗被 modal 擋住時會被 disable**。
+    `IsWindowEnabled(main)` 與可見性無關,在隱藏桌面/SW_HIDE 兩種模式下都成立 ——
+    這正是原本用 `not notice` 想表達、卻表達錯了的那件事。
+    (visible_only 不可一律改成 True:`_stealth()` 會把視窗 SW_HIDE,
+     那條路徑上可見性根本不是有效訊號 —— 見 2026-05-15 的既有註解。)
+
+    另外兩件事也一起補上,因為這次的 log 讓人查不下去:
+      * 點確認的訊息【節流】並帶上 hwnd 與次數 —— 原本無法分辨「同一個視窗一直
+        關不掉」與「通知有一整排、關掉一個又來一個」,兩者的處置完全不同。
+      * 逾時時吐出【當下看到什麼】(class / 可見 / enabled),而不是只說「等不到」。
+    """
+    deadline = time.time() + timeout_sec
+    clicks = 0
+    last_notice_hwnd = None
+    distinct_notices = set()
+    while time.time() < deadline:
+        if not running.is_set():
+            raise RuntimeError("流程已被中止")
+        mains = find_windows(MAIN_CLASS, pids=our_pids, visible_only=visible_only)
+        if mains:
+            try:
+                unblocked = bool(win32gui.IsWindowEnabled(mains[0]))
+            except Exception:
+                unblocked = True        # 問不到就別擋住流程(最壞是多按一次確認)
+            if unblocked:
+                if clicks:
+                    logging.info("主畫面已可操作(期間關掉 %d 次訊息通知,"
+                                 "不同視窗 %d 個)", clicks, len(distinct_notices))
+                return mains[0]
+        notice = find_windows(NOTICE_CLASS, pids=our_pids,
+                              visible_only=visible_only)
+        if notice:
+            btn = find_child(notice[0], "TButton", "確認")
+            if btn:
+                click_button(btn)
+                clicks += 1
+                distinct_notices.add(notice[0])
+                # 節流:前 3 次逐次記,之後每 20 次記一次(原本每 0.6 秒記一行,
+                # 120 秒就把整份 log 洗掉,真正有用的訊息全被淹沒)。
+                if clicks <= 3 or clicks % 20 == 0:
+                    logging.info("已關閉訊息通知主畫面(hwnd=%s,第 %d 次,"
+                                 "至今不同視窗 %d 個)",
+                                 notice[0], clicks, len(distinct_notices))
+                last_notice_hwnd = notice[0]
+                time.sleep(0.6)
+                continue
+        time.sleep(0.4)
+    raise RuntimeError(
+        "登入後等不到住院醫囑主畫面 —— " + _describe_windows_for_diag(
+            our_pids, clicks, last_notice_hwnd, distinct_notices))
+
+
+def _describe_windows_for_diag(our_pids: set, clicks: int, last_notice,
+                               distinct_notices: set) -> str:
+    """逾時時把「當下看到什麼」寫清楚。只有 class/旗標,不含任何視窗文字內容。"""
+    try:
+        seen = []
+        for hwnd in find_windows(pids=our_pids, visible_only=False):
+            try:
+                seen.append("%s(vis=%d,en=%d)" % (
+                    win32gui.GetClassName(hwnd),
+                    int(win32gui.IsWindowVisible(hwnd)),
+                    int(win32gui.IsWindowEnabled(hwnd))))
+            except Exception:
+                continue
+        detail = "、".join(seen[:12]) or "(列舉不到任何視窗)"
+    except Exception:
+        detail = "(視窗列舉失敗)"
+    return (f"期間按了 {clicks} 次「確認」(不同通知視窗 {len(distinct_notices)} 個,"
+            f"最後一個 hwnd={last_notice});當下看到的視窗:{detail}")
+
+
 def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -> tuple:
     """在隱藏桌面執行完整流程（呼叫者需已 SetThreadDesktop）。回傳 (截圖, 文字)。
 
@@ -1989,27 +2071,10 @@ def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -
         click_button(confirm)
         logging.info("已送出登入")
 
-        # 等主視窗（期間關訊息通知）
-        main_hwnd = None
-        deadline = time.time() + 120
-        while time.time() < deadline:
-            if not running.is_set():
-                raise RuntimeError("流程已被中止")
-            notice = find_windows(NOTICE_CLASS, pids=our_pids)
-            if notice:
-                btn = find_child(notice[0], "TButton", "確認")
-                if btn:
-                    click_button(btn)
-                    logging.info("已關閉訊息通知主畫面")
-                    time.sleep(0.6)
-                    continue
-            mains = find_windows(MAIN_CLASS, pids=our_pids)
-            if mains and not notice:
-                main_hwnd = mains[0]
-                break
-            time.sleep(0.4)
-        if not main_hwnd:
-            raise RuntimeError("等不到主畫面")
+        # 等主視窗（期間關訊息通知）——見 _wait_main_window_after_login 的說明
+        # helper 逾時會【自己拋出帶診斷的例外】,不再回 None ——
+        # 原本這裡的 `raise RuntimeError("等不到主畫面")` 正是那句什麼都沒說的訊息。
+        main_hwnd = _wait_main_window_after_login(our_pids, visible_only=True)
         logging.info("已進入主畫面")
 
         # 送選單命令：我的會診清單
@@ -2181,28 +2246,10 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
         click_button(confirm)  # PostMessage BM_CLICK，非阻塞
         logging.info("已送出登入")
 
-        # 等主視窗；期間若跳「訊息通知主畫面」就按確認（全部背景訊息、視窗已隱藏）
-        main_hwnd = None
-        deadline = time.time() + 120
-        while time.time() < deadline:
-            if not running.is_set():
-                raise RuntimeError("流程已被中止")
-            notice = find_windows(NOTICE_CLASS, pids=our_pids,
-                                  visible_only=False)
-            if notice:
-                btn = find_child(notice[0], "TButton", "確認")
-                if btn:
-                    click_button(btn)
-                    logging.info("已關閉訊息通知主畫面")
-                    time.sleep(0.6)
-                    continue
-            mains = find_windows(MAIN_CLASS, pids=our_pids, visible_only=False)
-            if mains and not notice:
-                main_hwnd = mains[0]
-                break
-            time.sleep(0.4)
-        if not main_hwnd:
-            raise RuntimeError("登入後等不到住院醫囑主畫面")
+        # 等主視窗；期間若跳「訊息通知主畫面」就按確認。
+        # visible_only=False:本路徑會把視窗 SW_HIDE(見 2026-05-15 註解),
+        # 可見性在這裡不是有效訊號。
+        main_hwnd = _wait_main_window_after_login(our_pids, visible_only=False)
         logging.info("已進入主畫面")
 
         # 送選單命令：我的會診清單（背景 PostMessage，不點滑鼠、解析度無關）
