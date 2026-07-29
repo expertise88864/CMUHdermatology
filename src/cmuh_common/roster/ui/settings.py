@@ -27,6 +27,18 @@ def _text_to_wd(text: str):
     return None if i == 0 else i - 1
 
 
+def _field_changed(new, old) -> bool:
+    """成員欄位是否真的被使用者改動過。
+
+    對話框對「沒填」一律回空字串（級職）或 None（固定值班），而原紀錄可能根本
+    沒有那個鍵 → 兩邊都視為「沒填」，不可算成一次變更（否則每次按確定都會塞
+    `level: ""` 這種空欄位進去）。
+    """
+    if new in ("", None) and old in ("", None):
+        return False
+    return new != old
+
+
 class _MemberDialog(tk.Toplevel):
     """新增/編輯成員。回填 self.result（dict）或 None（取消）。"""
 
@@ -97,6 +109,8 @@ class SettingsTab(ttk.Frame):
         self.on_changed = on_changed
         self._cfg = self.service.storage.load_config()
         self._param_after_id = None                      # RF-21 參數存檔去抖 timer id
+        # ★[2026-08-02 補審] 重讀 config 時 IntVar.set 會觸發 trace → 又存一次檔★
+        self._suspend_param_save = False
         self.bind("<Destroy>", self._flush_params)       # 關窗前補存去抖中的參數
 
         # 整頁可捲動（區塊多）
@@ -161,9 +175,105 @@ class SettingsTab(ttk.Frame):
         if self.on_changed:
             self.on_changed()
 
+    # ── config.json：讀-改-寫（不可用開程式當下的快照整包覆寫）───────────────
+    def _refresh_cfg_from_disk(self) -> bool:
+        """把 self._cfg 換成【磁碟上當下】的內容；讀不到就不動、回 False。
+
+        ★[2026-08-02 補審] config.json 是唯一被「整包覆寫」的設定檔★
+        名單／點數／班數範圍／診間容量／PGY 預設代號全住在裡面，而 `_save_cfg()`
+        寫的是整份 `self._cfg`。若它仍是開程式當下的快照，他機經 GitSync 合併進
+        磁碟的變更就會在下一次存檔時被【無聲覆蓋】——這正是今天早上在
+        gitsync_storage 修的同一個病灶（使用者對著舊資料繼續編輯並蓋掉剛拉進來
+        的變更），只是換到 UI 這一層。帳本更慘：名單變動後 `_sync_ledger` 會拿
+        這份陳舊名單去 `sync_members`，把他機新成員的餘額與 history deltas
+        一併刪掉，只留一行 INFO log。
+        RF-19 已讓 `on_shown` 重讀了帳本/假日/週色/梯次/模板五個檢視，獨漏 config
+        ——偏偏它是唯一整包覆寫的那一個。
+
+        ★讀不到絕不可拿 {} 當基底★（2026-07-25 教訓，不得因為改成重讀而重新引進）：
+        非嚴格的 `load_config()` 對壞檔/鎖檔靜默回 {}，用它當讀-改-寫的基底會把
+        整份設定清空。故先 `assert_readable`，失敗就保留記憶體內容並回 False。
+        """
+        try:
+            self.service.storage.assert_readable("config.json")
+            self._cfg = self.service.storage.load_config()
+            return True
+        except Exception:
+            logging.warning("[roster.ui] 設定檔目前讀不到 → 保留畫面內容、不寫入",
+                            exc_info=True)
+            return False
+
+    def _sync_cfg_before_edit(self) -> bool:
+        """任何一次 config 編輯【寫入之前】都先與磁碟對齊；不成即中止並說明。"""
+        if self._refresh_cfg_from_disk():
+            return True
+        messagebox.showerror(
+            "設定未儲存",
+            "目前讀不到設定檔（可能損壞或被防毒/同步軟體鎖住）。\n\n"
+            "為避免覆蓋掉其他電腦已同步進來的設定，這次的變更沒有寫入，"
+            "請處理該檔後重試。")
+        return False
+
+    def _reload_cfg(self) -> None:
+        """重讀 config.json 並把它支撐的所有控制項拉回磁碟真值（純顯示，不寫檔）。"""
+        # 去抖中的參數編輯先落地，否則下面的 var.set 會把使用者剛打的數字洗掉。
+        self._flush_params()
+        if not self._refresh_cfg_from_disk():
+            return
+        for scope in self._member_trees:
+            self._reload_members(scope)
+        self._reload_param_widgets()
+        self._reload_pgy_widget()
+
+    def _reload_param_widgets(self) -> None:
+        if not hasattr(self, "_p_cap"):
+            return                       # 尚未建構（防禦；正常流程不會走到）
+        pts = self._cfg.get("points") or {}
+        rng = self._cfg.get("duty_range_soft") or [9, 11]
+        # trace 是同步觸發的 → 用旗標包住這一段即可，不必動 after。
+        self._suspend_param_save = True
+        try:
+            self._p_wd.set(int(pts.get("weekday", 1)))
+            self._p_we.set(int(pts.get("weekend", 2)))
+            self._p_hol.set(int(pts.get("national_holiday", 1)))
+            self._p_min.set(int(rng[0]))
+            self._p_max.set(int(rng[1]))
+            self._p_cap.set(int(self._cfg.get("room_capacity", 2)))
+        except (tk.TclError, ValueError, IndexError, TypeError):
+            logging.debug("[roster.ui] 參數控制項重載失敗（維持現值）", exc_info=True)
+        finally:
+            self._suspend_param_save = False
+        self._params_loaded = self._param_snapshot()
+
+    def _pgy_text(self) -> str:
+        return "、".join(str(mm.get("id"))
+                        for mm in (self._cfg.get("pgy_members") or []))
+
+    def _reload_pgy_widget(self) -> None:
+        """把 PGY 預設代號欄拉回磁碟真值 —— 但【使用者打到一半的內容不可洗掉】。
+
+        ★[2026-08-02 補審 第2輪] 這一欄沒有自動存檔★ 參數微調鈕有去抖存檔
+        （`_reload_cfg` 也會先 `_flush_params()` 把它落地），但 PGY 這欄要按「儲存」
+        才寫。遠端同步（`_refresh_all_tabs` → `on_shown`）若無條件重填，就會把
+        使用者正在打的字直接吃掉，而且他不會知道發生了什麼。
+        故：內容與上次載入的不同（＝有未存的編輯）就整個不動；他按下「儲存」時
+        `_sync_cfg_before_edit` 仍會先對齊磁碟，不會蓋到他機改的其他鍵。
+        """
+        if not hasattr(self, "_pgy_entry"):
+            return
+        try:
+            if self._pgy_entry.get().strip() != (self._pgy_loaded or "").strip():
+                return                       # 有未儲存的編輯 → 尊重使用者的輸入
+            self._pgy_loaded = self._pgy_text()
+            self._pgy_entry.delete(0, "end")
+            self._pgy_entry.insert(0, self._pgy_loaded)
+        except tk.TclError:
+            logging.debug("[roster.ui] PGY 預設代號欄重載失敗", exc_info=True)
+
     def on_shown(self) -> None:
         """RF-19：切回設定分頁時重讀 storage 支撐的檢視（帳本為主——R/VS 分頁套用/
         重算/定案都會改 ledger.json；其餘一併同步多機 git 與他分頁變動）。"""
+        self._reload_cfg()          # ★[2026-08-02 補審] 第六個檢視，原本漏了
         self._reload_ledger()
         self._reload_holidays()
         self._reload_week_colors()
@@ -226,8 +336,13 @@ class SettingsTab(ttk.Frame):
                             id_locked=False)
         if not dlg.result:
             return
+        # ★[2026-08-02 補審] 先與磁碟對齊再改★ 否則這次存檔會把他機剛同步進來的
+        #   名單變更整包蓋掉（順帶讓重複代號檢查也看得到他機新增的同代號）。
+        if not self._sync_cfg_before_edit():
+            return
         if any(m.get("id") == dlg.result["id"] for m in self._members(scope)):
             messagebox.showwarning("重複", f"代號 {dlg.result['id']} 已存在")
+            self._reload_members(scope)
             return
         self._members(scope).append(dlg.result)
         # [codex R2] 存檔失敗 → 立刻停手：後面的 _sync_ledger 會拿目前名單去
@@ -248,10 +363,17 @@ class SettingsTab(ttk.Frame):
         if idx < 0:
             return
         old_id = str(members[idx].get("id"))
+        # ★[2026-08-02 補審 第2輪] 對話框本身也是一份快照★
+        #   _MemberDialog 回的是【全部欄位】（姓名/級職/固定值班），值都預填自開窗
+        #   當下的紀錄。若整包蓋回去，開窗期間他機改的其他欄位（例如級職）就會被
+        #   使用者沒動過的舊值悄悄還原。留下開窗當下的內容，稍後只套「真的被改的」欄位。
+        before = dict(members[idx])
         # 代號可改：改代號＝行政遷移，需連動所有資料（見 service.rename_member），故 id 解鎖。
         dlg = _MemberDialog(self, "編輯成員", members[idx], with_level, with_wd,
                             id_locked=False)
         if not dlg.result:
+            return
+        if not self._sync_cfg_before_edit():      # ★同上：寫入前先對齊磁碟★
             return
         new_id = str(dlg.result.get("id")).strip()
         # [codex P2] 代號有變時，先做（交易式的）連動改名，成功後才套用其餘欄位——否則改名失敗卻
@@ -276,8 +398,19 @@ class SettingsTab(ttk.Frame):
         # 套用「非代號」欄位（姓名/級職/固定值班）到（改名後的）成員
         members = self._members(scope)
         j = next((i for i, m in enumerate(members) if str(m.get("id")) == eff_id), -1)
+        if j < 0:
+            # 對齊磁碟後才發現這個人已經不在名單（多半是另一台電腦剛刪掉）——
+            # 說出來，不要讓「按了確定卻什麼都沒變」看起來像當掉。
+            messagebox.showwarning(
+                "成員已不存在",
+                f"{eff_id} 已不在 {scope.upper()} 名單（可能已在另一台電腦刪除），"
+                f"本次變更未套用。")
         if j >= 0:
-            updated = dict(dlg.result)
+            # 只把【使用者真的改動過的】欄位疊上磁碟現值（見上方 before 的說明）。
+            edits = {k: v for k, v in dlg.result.items()
+                     if k != "id" and _field_changed(v, before.get(k))}
+            updated = dict(members[j])
+            updated.update(edits)
             updated["id"] = eff_id
             members[j] = updated
             if not self._save_cfg():      # [codex R2] 失敗即停,不裝作已生效
@@ -294,6 +427,8 @@ class SettingsTab(ttk.Frame):
         if not messagebox.askyesno(
                 "刪除成員",
                 f"刪除 {sel[0]}？該員在 {scope.upper()} 的帳本餘額將一併作廢。"):
+            return
+        if not self._sync_cfg_before_edit():      # ★同上：寫入前先對齊磁碟★
             return
         self._cfg[f"{scope}_members"] = [
             m for m in self._members(scope) if m.get("id") != sel[0]]
@@ -420,8 +555,18 @@ class SettingsTab(ttk.Frame):
         self._p_max = spin(rowb, 0, 31, rng[1])
         ttk.Label(rowb, text="診間容量").pack(side="left")
         self._p_cap = spin(rowb, 1, 9, self._cfg.get("room_capacity", 2))
+        # 「上次載入/存檔當下的值」——與現值比對即知使用者真的動了哪幾格
+        self._params_loaded = self._param_snapshot()
+
+    def _param_snapshot(self) -> dict:
+        return {"weekday": self._p_wd.get(), "weekend": self._p_we.get(),
+                "national_holiday": self._p_hol.get(),
+                "min": self._p_min.get(), "max": self._p_max.get(),
+                "cap": self._p_cap.get()}
 
     def _save_params(self) -> None:
+        if self._suspend_param_save:       # 重讀磁碟時的 var.set，不是使用者的編輯
+            return
         # RF-21：去抖 800ms——每個鍵擊/箭頭都觸發，直接存會每次全量 save_config +
         # GitSync commit + 兩個 duty 分頁重繪 → UI 卡頓、git 雜訊 commit、暫態外洩。
         if getattr(self, "_param_after_id", None):
@@ -433,15 +578,43 @@ class SettingsTab(ttk.Frame):
 
     def _save_params_now(self) -> None:
         self._param_after_id = None
-        try:
-            self._cfg["points"] = {
-                "weekday": self._p_wd.get(), "weekend": self._p_we.get(),
-                "national_holiday": self._p_hol.get()}
-            self._cfg["duty_range_soft"] = [self._p_min.get(), self._p_max.get()]
-            self._cfg["room_capacity"] = self._p_cap.get()
+        try:                                         # 先取值：暫態非數字就地放棄，免無謂 IO
+            snap = self._param_snapshot()
+            pts = {k: snap[k] for k in
+                   ("weekday", "weekend", "national_holiday")}
+            rng = [snap["min"], snap["max"]]
+            cap = snap["cap"]
         except (tk.TclError, ValueError):
             return                                   # 輸入中的暫態非數字
-        self._save_cfg()
+        # ★[2026-08-02 補審] 點數/班數範圍/診間容量與名單同住 config.json——
+        #   只是動一下微調鈕，也會把整份陳舊快照寫回去。先對齊磁碟。
+        if not self._sync_cfg_before_edit():
+            return
+        # ★[第3輪外審] 而且只能覆蓋【使用者真的動過的那幾格】★
+        #   六個數字任一改動都會觸發一次存檔；若整組寫回，另一台電腦剛改的
+        #   points.weekday 就會被本機沒碰過的舊值還原。與成員編輯同一個修法：
+        #   基底取磁碟現值，只疊上「與上次載入不同」的欄位。
+        was = self._params_loaded or {}
+        base = dict(self._cfg.get("points") or {})
+        for key in ("weekday", "weekend", "national_holiday"):
+            if key not in base or pts[key] != was.get(key):
+                base[key] = pts[key]
+        self._cfg["points"] = base
+        cur_rng = list(self._cfg.get("duty_range_soft") or [])
+        if len(cur_rng) != 2:                     # 磁碟上沒有/格式壞 → 用畫面上的
+            cur_rng = list(rng)
+        if rng[0] != was.get("min"):
+            cur_rng[0] = rng[0]
+        if rng[1] != was.get("max"):
+            cur_rng[1] = rng[1]
+        self._cfg["duty_range_soft"] = cur_rng
+        if "room_capacity" not in self._cfg or cap != was.get("cap"):
+            self._cfg["room_capacity"] = cap
+        if self._save_cfg():
+            self._params_loaded = {"weekday": pts["weekday"],
+                                   "weekend": pts["weekend"],
+                                   "national_holiday": pts["national_holiday"],
+                                   "min": rng[0], "max": rng[1], "cap": cap}
 
     def _flush_params(self, event=None) -> None:
         """關窗前把去抖中尚未存的參數立即存檔（避免關窗前 800ms 內的修改遺失）。"""
@@ -465,8 +638,9 @@ class SettingsTab(ttk.Frame):
                             padding=8)
         lf.pack(fill="x", padx=10, pady=6)
         self._pgy_entry = ttk.Entry(lf, width=40)
-        self._pgy_entry.insert(0, "、".join(
-            str(mm.get("id")) for mm in (self._cfg.get("pgy_members") or [])))
+        # 記下「載入當下的內容」——與現值不同即代表有未儲存的編輯（見 _reload_pgy_widget）
+        self._pgy_loaded = self._pgy_text()
+        self._pgy_entry.insert(0, self._pgy_loaded)
         self._pgy_entry.pack(side="left", padx=(0, 6))
         ttk.Button(lf, text="儲存", command=self._save_pgy_defaults
                    ).pack(side="left")
@@ -474,8 +648,11 @@ class SettingsTab(ttk.Frame):
     def _save_pgy_defaults(self) -> None:
         codes = [c.strip() for c in self._pgy_entry.get().replace("，", ",")
                  .replace("、", ",").split(",") if c.strip()]
+        if not self._sync_cfg_before_edit():      # ★同上：寫入前先對齊磁碟★
+            return
         self._cfg["pgy_members"] = [{"id": c} for c in codes]
-        self._save_cfg()
+        if self._save_cfg():
+            self._pgy_loaded = self._pgy_entry.get()   # 已存檔 → 不再算「未儲存的編輯」
 
     # ── 門診週模板（開診格網來源）─────────────────────────────────────────
     def _build_clinic_template(self) -> None:

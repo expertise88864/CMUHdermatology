@@ -13,34 +13,21 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-try:
-    import tkinter as tk
+try:                        # 模組層 import 不可在無 tkinter 的環境變成收集期錯誤；
+    import tkinter as tk    # 真正要用時由 conftest 的 tk_root 夾具逐支 skip。
     from tkinter import ttk
-    _r = tk.Tk()
-    ttk.Progressbar(_r)
-    _r.destroy()
-    _HAS_TK = True
-except Exception:
-    _HAS_TK = False
-
-pytestmark = pytest.mark.skipif(not _HAS_TK, reason="無可用顯示器/或 tk 安裝不完整")
+except Exception:           # noqa: BLE001
+    tk = ttk = None         # type: ignore[assignment]
 
 from cmuh_common import splash as splash_mod  # noqa: E402
 from cmuh_common.splash import StartupSplash  # noqa: E402
 
 
 @pytest.fixture
-def root():
-    try:
-        r = tk.Tk()
-    except tk.TclError as e:
-        pytest.skip(f"tk 建立失敗：{e}")
-    r.withdraw()
-    yield r
-    try:
-        r.destroy()
-    except Exception:
-        pass
+def root(tk_root):
+    """[2026-08-02] 改用 conftest 的共用 root（見那裡的說明）。"""
+    tk_root.withdraw()
+    return tk_root
 
 
 def _visible_toplevels(r) -> list:

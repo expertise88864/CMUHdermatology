@@ -155,3 +155,61 @@ def _isolate_settings_dir(tmp_path, monkeypatch):
     monkeypatch.setitem(_APP_DIR_HOLDER, "app", str(app_dir))
     _redirect_cached_consts(monkeypatch, str(app_dir))
     yield
+
+
+# ── Tk：全 session 共用【唯一一個】root ────────────────────────────────────
+# 這台開發機的 Tcl 一個行程只容得下一個活著的 root：各測試檔自己建 root 時，先跑
+# 的那個能用，後跑的整檔建不起來而被 skip —— **全套仍是綠燈，但那些測試一支都沒跑**
+# （實測：多加一個 Tk 測試檔就讓 test_roster_ui_smoke 的 42 支全部變 skip；反過來
+# 排序則換成新檔的 9 支全變 skip）。這正是「測試給假信心」那條教訓的另一種長相，
+# 而且它只由檔案順序決定，加一個檔就可能悄悄關掉別檔的覆蓋率。
+# 故：集中在此建立、全 session 共用、永不 destroy。測試要的是乾淨的子視窗，
+# 不是各自的 root。
+#
+# ★不可用 session/module 級 fixture 建立★：那些比 `_isolate_settings_dir`
+# （function 級 autouse）更早 setup，在該時點碰 Tk 會拿到
+# 「Can't find a usable init.tcl」而整檔跳過。故用 function 級 fixture ＋ 模組級
+# 快取延遲建立。
+_TK_ROOT: list = []
+_TK_GAVE_UP: list = []
+
+
+@pytest.fixture
+def tk_root():
+    """全 session 共用的 Tk root（無可用 Tk → skip）。每支測試前後清掉子視窗。"""
+    try:                       # headless CI 可能連 tkinter 都沒裝 → skip，不是 error
+        import tkinter as tk
+        from tkinter import ttk
+    except Exception as e:     # noqa: BLE001
+        pytest.skip(f"無 tkinter：{e}")
+    if _TK_GAVE_UP:
+        pytest.skip(f"無可用顯示器/或 tk 安裝不完整：{_TK_GAVE_UP[0]}")
+    if not _TK_ROOT:
+        try:
+            r = tk.Tk()
+            ttk.Spinbox(r)          # 破損的 tk 安裝缺 ttk/spinbox.tcl → 在此失敗
+            ttk.Treeview(r)
+            ttk.Progressbar(r)
+            for w in r.winfo_children():
+                w.destroy()
+        except Exception as e:      # noqa: BLE001
+            # 失敗一次就記下來：這裡的 Tcl 一旦建失敗過就再也建不起來，
+            # 每支測試各重試一次只是白費時間。
+            _TK_GAVE_UP.append(e)
+            pytest.skip(f"無可用顯示器/或 tk 安裝不完整：{e}")
+        _TK_ROOT.append(r)
+    r = _TK_ROOT[0]
+    _drop_children(r)
+    yield r
+    # 收尾必須吞掉任何例外：monkeypatch 是 autouse 夾具先要到的，所以它的還原
+    # 【比本夾具晚】跑 —— 測試若 monkeypatch 掉某個 widget 的 destroy（
+    # test_splash 就有一支這樣測 fallback），這裡會踩到那個還沒被還原的假 destroy。
+    _drop_children(r)
+
+
+def _drop_children(r) -> None:
+    for w in list(r.winfo_children()):
+        try:
+            w.destroy()
+        except Exception:                       # noqa: BLE001,S110
+            pass

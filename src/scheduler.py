@@ -182,6 +182,7 @@ class ScheduleApp:
     def _build_settings(self, cont):
         tab = SettingsTab(cont, self.service, on_changed=self._on_settings_changed)
         tab.pack(fill="both", expand=True)
+        self._settings_tab = tab
         return tab
 
     def _build_duty(self, cont):
@@ -254,6 +255,15 @@ class ScheduleApp:
                 tab.refresh()
             except Exception:
                 logging.exception("[roster.ui] 遠端變更後重繪失敗")
+        # ★[2026-08-02 補審] 設定分頁同樣讀 storage，而且它握著 config.json 的整份
+        #   快照並【整包覆寫】——不重讀的話，使用者會對著舊名單編輯，下一次存檔就把
+        #   剛同步進來的變更蓋掉（名單回退，帳本餘額還會被 _sync_ledger 作廢）。
+        tab = getattr(self, "_settings_tab", None)
+        if tab is not None:
+            try:
+                tab.on_shown()
+            except Exception:
+                logging.exception("[roster.ui] 遠端變更後設定分頁重讀失敗")
 
 
 def main() -> None:

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """roster UI 冒煙測試：實際建立 Tk 元件、跑 refresh 與手動改格路徑，抓接線錯誤。
-無顯示器（Tk 建立失敗）→ 整檔跳過。所有 messagebox 皆 monkeypatch 掉不阻塞。"""
+無顯示器（Tk 建立失敗）→ 由 conftest 的 tk_root 夾具逐支 skip。
+所有 messagebox 皆 monkeypatch 掉不阻塞。"""
 import os
 import sys
 import types
@@ -10,18 +11,11 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-try:
-    import tkinter as tk
+try:                        # 模組層 import 不可在無 tkinter 的環境變成收集期錯誤；
+    import tkinter as tk    # 真正要用時由 conftest 的 tk_root 夾具逐支 skip。
     from tkinter import ttk
-    _r = tk.Tk()
-    ttk.Spinbox(_r)            # 破損的 tk 安裝缺 ttk/spinbox.tcl → 在此失敗
-    ttk.Treeview(_r)
-    _r.destroy()
-    _HAS_TK = True
-except Exception:
-    _HAS_TK = False
-
-pytestmark = pytest.mark.skipif(not _HAS_TK, reason="無可用顯示器/或 tk 安裝不完整")
+except Exception:           # noqa: BLE001
+    tk = ttk = None         # type: ignore[assignment]
 
 from cmuh_common.roster.service import RosterService  # noqa: E402
 from cmuh_common.roster.storage import RosterStorage  # noqa: E402
@@ -36,14 +30,11 @@ YM = "2026-08"
 
 
 @pytest.fixture
-def root():
-    try:
-        r = tk.Tk()
-    except tk.TclError as e:            # 破損 tk 的偶發失敗 → 跳過而非 error
-        pytest.skip(f"tk 建立失敗：{e}")
-    r.geometry("1000x700")
-    yield r
-    r.destroy()
+def root(tk_root):
+    """[2026-08-02] 改用 conftest 的共用 root。原本每支測試各建一個，
+    會與其他 Tk 測試檔互搶：先跑的能用、後跑的整檔 skip（見 conftest 說明）。"""
+    tk_root.geometry("1000x700")
+    return tk_root
 
 
 @pytest.fixture(autouse=True)
