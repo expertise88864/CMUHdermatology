@@ -187,6 +187,17 @@ def solve_duty(ctx: SolveContext, allow_disable_color: bool = False) -> SolveRes
 
         chosen = None
         prev_active = None
+        # ★[2026-08-02 補審] 求解器「沒算完」不等於「無解」★
+        #   CP-SAT 逾時回 UNKNOWN、模型異常回 MODEL_INVALID,兩者都不是 INFEASIBLE。
+        #   原本一律當成無解,診斷還會斷言「停用色塊連週 → 仍無解(與色塊無關)」——
+        #   那是程式沒有驗證過的推斷。使用者會照著去翻請假/指定找一個不存在的衝突,
+        #   而真正該做的只是重試。(措辭鐵律:只陳述程式確知的事;solve_day 已經
+        #   為同一件事被外審抓過兩輪。)
+        #   ★而 UNKNOWN 與 MODEL_INVALID 也不可混為一談★(第 2 輪外審):
+        #   逾時叫使用者「稍後重試」是對的,模型異常重試一百次也一樣 —— 那是程式的
+        #   臭蟲,要叫他回報、看 log。把兩者說成同一件事,又是一次「宣稱不確知的事」。
+        timed_out: list = []      # UNKNOWN：沒算完
+        broken: list = []         # MODEL_INVALID 等：模型/求解器本身有問題
         for level in auto_levels:
             # [OPT-1] 該層 active 規則集與前一層相同（如 VS 無 duty_range、或 L2
             # 保留級）→ 必得同解，跳過避免重複求解。
@@ -202,18 +213,53 @@ def solve_duty(ctx: SolveContext, allow_disable_color: bool = False) -> SolveRes
             if assignments is not None:
                 chosen = (level, assignments)
                 break
+            if name == "UNKNOWN":
+                timed_out.append(_LEVEL_NAMES[level])
+            elif name != "INFEASIBLE":
+                broken.append(f"{_LEVEL_NAMES[level]}（{name}）")
 
         if chosen is None:
             # [OPT-3] 自動層級全無解 → 測「停用色塊連週」恰一次，結果同時決定
             # need_confirm/採用/診斷（不再於 _diagnose 重測一次）。
-            _n, l3 = _build_and_solve(ctx, scope, L3_NO_COLOR)
+            l3_name, l3 = _build_and_solve(ctx, scope, L3_NO_COLOR)
+            if l3 is None and l3_name == "UNKNOWN":
+                timed_out.append(_LEVEL_NAMES[L3_NO_COLOR])
+            elif l3 is None and l3_name != "INFEASIBLE":
+                broken.append(f"{_LEVEL_NAMES[L3_NO_COLOR]}（{l3_name}）")
             if l3 is not None and allow_disable_color:
                 chosen = (L3_NO_COLOR, l3)                # 已獲授權 → 直接採用
             elif l3 is not None:
                 res.status = "need_confirm_color"
+                # ★不可宣稱「不動色塊就無解」★ 自動層級若只是沒算完,那句話就是
+                #   程式沒驗證過的推斷(外審第 1 輪抓到)。
+                unresolved = timed_out + broken
+                head = ("在不動色塊連週規則的前提下無解；停用色塊規則後可解。"
+                        if not unresolved else
+                        "自動層級中有層級未得出結論（"
+                        + "、".join(unresolved)
+                        + "），並【未】證明不動色塊就無解；停用色塊後可解。")
+                res.diagnosis = [head, "請確認是否放寬（將出現同色連週值班）。"]
+                return res
+            elif broken:
+                # 模型異常不是逾時,重試沒有用；這是程式的問題,要能被回報。
+                res.status = "error"
                 res.diagnosis = [
-                    "在不動色塊連週規則的前提下無解；停用色塊規則後可解。",
-                    "請確認是否放寬（將出現同色連週值班）。"]
+                    "求解器回報模型異常——這【不是】「無解」，也不是逾時。",
+                    "  異常層級：" + "、".join(broken),
+                    "  重試不會有幫助；請回報此訊息並附上 automation_ui.log。",
+                    "★請勿據此去調整請假或指定★——程式並沒有判定它們有衝突。"]
+                return res
+            elif timed_out:
+                # 只要有任何一層是「沒算完」,就不可以說無解——連色塊那條路都還沒
+                # 排除,使用者甚至沒被問到要不要放寬色塊。
+                res.status = "timeout"
+                res.diagnosis = [
+                    "求解器在時限內沒有得出結論——這【不是】「無解」，是還沒算完。",
+                    "  未得出結論的層級：" + "、".join(timed_out),
+                    f"  時限 {SOLVE_TIMEOUT_SEC:.0f} 秒；本規模（≤31 天 × ≤10 人）"
+                    f"正常應在 1 秒內完成，多半是機器當下負載過重。",
+                    "  請稍後再按一次自動排班。",
+                    "★請勿據此去調整請假或指定★——程式並沒有判定它們有衝突。"]
                 return res
             else:
                 res.status = "infeasible"
@@ -221,6 +267,17 @@ def solve_duty(ctx: SolveContext, allow_disable_color: bool = False) -> SolveRes
                 return res
 
         level, assignments = chosen
+        if timed_out or broken:
+            # ★較嚴格的層級只是沒算完,不代表它無解★ 報告會寫「有規則被放寬」,
+            #   讀起來像是「嚴格規則滿足不了」——那件事程式並沒有證明。
+            res.diagnosis = ["以下層級未得出結論（非「無解」）："
+                             + "、".join(timed_out + broken)]
+            if timed_out:
+                res.diagnosis.append(
+                    "  求解器沒算完；重按一次自動排班有機會拿到更嚴格層級的結果。")
+            if broken:
+                res.diagnosis.append(
+                    "  其中有模型異常，重試無用；請回報並附上 automation_ui.log。")
         res.status = "ok"
         res.level_used = level
         res.level_name = _LEVEL_NAMES[level]

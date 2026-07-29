@@ -51,6 +51,8 @@ def build_report(ctx: SolveContext, result, scope_label: str) -> str:
         lines.append(f"  求解層級: {result.level_name}")
         if result.level_used:
             lines.append("  ⚠ 有規則被放寬，請留意上方預檢與下方結算")
+        # 成功時也可能帶診斷（例如較嚴格層級只是逾時、並未被證明無解）
+        lines.extend(f"  ⚠ {s}" for s in result.diagnosis)
         for d in ctx.days:
             mid = result.assignments.get(d)
             if mid is None:
@@ -64,7 +66,11 @@ def build_report(ctx: SolveContext, result, scope_label: str) -> str:
         lines.append("  ✗ 預檢有錯誤（見上），未進行求解。請先解決衝突。")
     elif result.status == "need_confirm_color":
         lines.extend(f"  ⚠ {s}" for s in result.diagnosis)
-    elif result.status == "infeasible":
+    elif result.status in ("infeasible", "timeout"):
+        # timeout 與 infeasible 都靠 diagnosis 說明；不可落到下面那句「求解器例外」，
+        # 逾時並不是例外，而且那句會讓使用者去翻一個根本沒有 traceback 的 log。
+        lines.extend(f"  ✗ {s}" for s in result.diagnosis)
+    elif result.diagnosis:
         lines.extend(f"  ✗ {s}" for s in result.diagnosis)
     else:
         lines.append("  ✗ 求解器例外，詳見 automation_ui.log")

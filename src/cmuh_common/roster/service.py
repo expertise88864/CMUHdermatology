@@ -40,8 +40,8 @@ from cmuh_common.roster.report import build_report
 from cmuh_common.roster.rules import (
     Precheck, collect_directives, run_prechecks, split_block_runs)
 from cmuh_common.roster.saturday_biopsy import (
-    assign_saturday_biopsy, biopsy_pair, format_biopsy_section,
-    last_assigned_before, settle_biopsy)
+    assign_saturday_biopsy, biopsy_pair, can_rollback as biopsy_can_rollback,
+    format_biopsy_section, last_assigned_before, settle_biopsy)
 from cmuh_common.roster.solve_rvs import (
     SolveResult, apply_boundary_from_prev, solve_duty,
 )
@@ -692,6 +692,16 @@ class RosterService:
         own = month is None
         if own:
             month = self.storage.load_month(ym)
+        # ★[2026-08-02 補審 第1輪] 要拒絕就得在【改動 month 之前】拒絕★
+        #   settle_biopsy 的守門原本要到函式尾端才拋,那時 month["saturday_biopsy"]
+        #   與 report_r 都已經改過了;而呼叫端(set_cell / set_biopsy_person /
+        #   clear_unlocked)一律把例外當成可略過並【照樣存檔】——於是月檔被改了、
+        #   biopsy.json 的次數沒動,兩邊從此不一致,而且使用者完全看不到。
+        book = self.storage.load_biopsy()
+        if not biopsy_can_rollback(book, ym):
+            raise ValueError(
+                f"{ym} 早於切片帳本保留的最舊月份，無法安全重算切片次數"
+                f"（重記會重複計入）。該月的切片人選維持原樣。")
         y, m = int(ym[:4]), int(ym[5:7])
         duty_by_date: dict = {}
         for iso, cell in (month.get("r_duty") or {}).items():
@@ -708,7 +718,6 @@ class RosterService:
         #   本迴圈把非當月日期全部丟掉,於是正式服務路徑永遠看不到那個週五 ——
         #   週五連動在「月初 1 號是週六」的月份完全失效。
         #   (我原本的測試直接把 7/31 塞進純函式的 duty,沒走服務層,因此沒抓到。)
-        book = self.storage.load_biopsy()
         assign, notes, pair, after, names = self._biopsy_compute(
             ym, duty_by_date, book, month=month)
         month["saturday_biopsy"] = {
@@ -878,6 +887,16 @@ class RosterService:
         """
         if d.weekday() != 5:
             return self.quick_validate("r", ym)
+        # ★[2026-08-02 補審 第2輪] 這條路徑仍會存下半套★
+        #   原本先寫 biopsy_override 再呼叫重排,重排被擋下時例外被吞掉、
+        #   override 卻照樣存進月檔 —— 那個指定【永遠不會生效】(該月已經不能重排),
+        #   月檔於是留著一個與 saturday_biopsy 矛盾、又無人能調和的欄位。
+        #   本函式的目的就是切片,重排做不到就整個拒絕,由 UI 跳訊息告訴使用者。
+        if not biopsy_can_rollback(self.storage.load_biopsy(), ym):
+            raise ValueError(
+                f"{ym} 早於切片帳本保留的最舊月份，該月的切片已無法重算，"
+                f"因此無法指定切片人選（指定了也不會生效）。"
+                f"如需調整請直接編輯 biopsy.json。")
         month = self.storage.load_month(ym)
         ov = month.setdefault("biopsy_override", {})
         iso = d.isoformat()
@@ -1262,6 +1281,12 @@ class RosterService:
         """[週六切片] 驗證層安全網：缺 R2/R3 級提示；值班連動不符警告
         （改格/重排會自動重算,此處只補「外部途徑改壞」的把關）。"""
         out: list = []
+        if not biopsy_can_rollback(self.storage.load_biopsy(), ym):
+            # 不只是「不重算」——要讓使用者知道這個月的切片次數不再會自動維護。
+            out.append(Precheck(
+                "warn", "saturday_biopsy",
+                f"{ym} 早於切片帳本保留的最舊月份，切片人選不會再自動重算"
+                f"（改值班/請假都不會連動）；如需調整請直接編輯 biopsy.json。"))
         pair, notes = biopsy_pair(ctx.members)
         for n in notes:
             out.append(Precheck("info", "saturday_biopsy", n))

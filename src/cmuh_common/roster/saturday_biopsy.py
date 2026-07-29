@@ -139,7 +139,32 @@ def assign_saturday_biopsy(*, year: int, month: int, members, duty: dict,
 
 
 # ─── 計數帳本（biopsy.json；仿 ledger 的回滾語意）────────────────────────────
+def can_rollback(book: dict, ym: str,
+                 keep_months: int = HISTORY_KEEP_MONTHS) -> bool:
+    """該月的切片分錄還在不在（或根本沒有過）。推導規則與 ledger.can_rollback 相同
+    （見那裡的說明：不可存水位線，否則對既有的 biopsy.json 完全無效）。"""
+    hist = book.get("history") or []
+    months = {e.get("month") for e in hist if e.get("month")}
+    months.discard(None)
+    if ym in months:
+        return True
+    if len(months) < keep_months:
+        return True
+    return ym > min(months)
+
+
 def _trim_history(book: dict, keep_months: int = HISTORY_KEEP_MONTHS) -> None:
+    """修剪過舊的分錄（[OPT-4] 限制檔案大小）。
+
+    ★[2026-08-02 補審] 被修剪掉的月份必須留下水位線★
+    修剪本身沒問題，但它讓「重算同一個月」從冪等變成【會重複計入】：
+    `rollback_*` 找不到舊分錄 → 回滾不到任何東西 → 接著又加一次 delta，
+    累計次數就這樣悄悄翻倍（實測：2024-01 讓 某人 +1 次，隔 30 個月後回頭重算，
+    變成 +2 次）。而累計次數正是R2/R3 全年次數平均的基準，錯了之後每一個月都跟著錯。
+    原註解只寫「舊分錄不再被回滾」，低估了後果——不是「無法復原」，是「會算錯」。
+
+    故：記下【被丟掉的最新月份】當水位線，settle 時據此擋下（見 settle_* 的說明）。
+    """
     hist = book.get("history") or []
     months = sorted({e.get("month") for e in hist if e.get("month")},
                     reverse=True)
@@ -171,7 +196,16 @@ def settle_biopsy(book: dict, ym: str, assign: dict) -> dict:
     """把該月切片結果記入計數帳本（先自動回滾同月舊分錄）。
 
     assign: {date|iso: {"person": mid, ...}}。就地修改並回傳，呼叫端負責 save。
+
+    ★[2026-08-02 補審] 分錄已被修剪的月份一律拒絕結算★（同 ledger.settle_month）
+    切片累計次數就是「R2/R3 全年下來次數要一樣」的依據，重複計入會讓某人永遠
+    被判定成「已經切很多次」而輪不到。
     """
+    if not can_rollback(book, ym):
+        raise ValueError(
+            f"{ym} 比切片帳本保留的最舊月份還早（上限 {HISTORY_KEEP_MONTHS} 個月），"
+            f"無法確認它的舊分錄是否已被修剪掉——若已被修剪，重記會在已計入的次數上"
+            f"再加一次。如確實需要調整該月，請直接修改 biopsy.json 的 counts。")
     rollback_biopsy(book, ym)
     counts = book.setdefault("counts", {})
     iso_assign: dict = {}

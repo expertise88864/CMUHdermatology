@@ -153,7 +153,21 @@ class RosterStorage:
                 f"為保護既有資料已中止存檔，請稍後再試。") from e
 
     def _save(self, path: str, data: dict) -> None:
+        """唯一的寫入出口：守門 → 留快照 → 原子寫入。
+
+        ★[2026-08-02 補審] 快照掛在這裡，不是各個 `save_*` 各自呼叫★
+        原本是各 `save_*` 自己叫 `_snapshot`，結果只有 config / ledger / biopsy /
+        月檔有，週色 / 年度假日表 / 門診模板 / Clerk 梯次 / 切片格網一個都沒有——
+        寫壞就沒有回頭路。年度假日表最要緊：它的鍵集合【就是】國定假日清單，
+        被清空等於整年的點數與週末連休區塊全部算錯。
+        （2026-07-25 的審查註解就寫過「config.json 是唯一沒有快照保護的存檔路徑…
+        誤刪最痛」，當時補了 config 卻沒有回頭看還有誰漏——所以這次改成掛在唯一
+        出口上：不是「補上五個呼叫」，而是【以後不可能再漏】。）
+        順序：守門在前，被拒寫時不留快照——什麼都沒改卻佔掉保留額度，會把真正
+        有用的歷史擠掉。`.bak-*` 已在 GitSync 的 .gitignore 內，不會同步出去。
+        """
         self._guard_overwrite(path)
+        self._snapshot(path)
         data = dict(data)
         data["schema_version"] = SCHEMA_VERSION
         # atomic_write_json 回傳 None、失敗時拋例外（cmuh_common.atomic_io 介面）
@@ -187,11 +201,9 @@ class RosterStorage:
                                   "config.json")
 
     def save_config(self, cfg: dict) -> None:
-        # [2026-07-25 審查] config.json 是唯一沒有快照保護的存檔路徑（ledger/biopsy/
-        # 月檔都有 _snapshot）——而它存的是全部成員名單，誤刪最痛。補上快照。
+        # [2026-07-25 審查] config.json 存的是全部成員名單，誤刪最痛（快照見 _save）。
         self._check_schema(_load_json(self._path("config.json")), "config.json",
                            for_write=True)
-        self._snapshot(self._path("config.json"))
         self._save(self._path("config.json"), cfg)
 
     def load_ledger(self) -> dict:
@@ -206,9 +218,7 @@ class RosterStorage:
         # [codex P2] 寫前檢查既有檔 schema：防舊版程式把新版檔靜默降級毀損
         self._check_schema(_load_json(self._path("ledger.json")), "ledger.json",
                            for_write=True)
-        # [RP3-10a] 比照 save_month 先留 .bak 快照——ledger.json 記結算/欠點,
-        # 遭誤寫時可回溯(誤結算/rollback 後才發現時救得回來)。
-        self._snapshot(self._path("ledger.json"))
+        # [RP3-10a] ledger.json 記結算/欠點,遭誤寫時可回溯 —— 快照由 _save 統一留。
         self._save(self._path("ledger.json"), ledger)
 
     def load_biopsy(self) -> dict:
@@ -220,10 +230,9 @@ class RosterStorage:
         return d
 
     def save_biopsy(self, book: dict) -> None:
-        # 比照 save_ledger：寫前 schema 檢查 + .bak 快照（計數帳本可回溯）
+        # 比照 save_ledger：寫前 schema 檢查（.bak 快照由 _save 統一留）
         self._check_schema(_load_json(self._path("biopsy.json")), "biopsy.json",
                            for_write=True)
-        self._snapshot(self._path("biopsy.json"))
         self._save(self._path("biopsy.json"), book)
 
     def load_week_colors(self) -> dict:
@@ -337,7 +346,6 @@ class RosterStorage:
         self._check_schema(existing, f"{ym}.json", for_write=True)
         if existing.get("finalized") and not force:
             raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能修改")
-        self._snapshot(path)
         data = dict(data)
         data["month"] = ym
         data["saved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
