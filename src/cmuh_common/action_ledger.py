@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from dataclasses import dataclass
 import os
 import re
 import threading
@@ -166,6 +167,28 @@ def _compute_oldest_seq(base: str, keep: int) -> int:
     return _first_seq_of(base) or 1
 
 
+@dataclass(frozen=True)
+class RecordResult:
+    """一次 record() 的結果。
+
+    entry_written    JSONL 那一行有沒有寫進去(＝這筆稽核有沒有落地)
+    anchor_written   anchor 側檔有沒有跟著更新(＝這筆之後能不能證明沒被截尾)
+    fully_verifiable 兩者皆成立
+
+    `__bool__` 刻意等同 entry_written:既有呼叫端的 `if not record(...)` 問的是
+    「這筆有沒有寫進去」,不可因為 anchor 失敗就把它算成遺失。
+    """
+    entry_written: bool
+    anchor_written: bool
+
+    @property
+    def fully_verifiable(self) -> bool:
+        return self.entry_written and self.anchor_written
+
+    def __bool__(self) -> bool:
+        return self.entry_written
+
+
 class ActionLedger:
     """append-only、hash-chained、會輪替的動作帳本。所有方法都不拋例外。
 
@@ -267,8 +290,18 @@ class ActionLedger:
             return {"ok": False, "level": "error", "verified": 0,
                     "summary": f"健康檢查本身失敗:{e}"}
 
-    def record(self, surface: str, action: str, ts: str = "", **fields) -> bool:
-        """記一筆外部動作。回是否寫成功(呼叫端【不應】依此改變臨床行為)。
+    def record(self, surface: str, action: str, ts: str = "",
+               **fields) -> "RecordResult":
+        """記一筆外部動作。回 RecordResult(呼叫端【不應】依此改變臨床行為)。
+
+        ★[2026-08-02 第二輪外審 P1-04] entry 與 anchor 必須分開回報★
+        原本無條件 `return True`,把 `_write_anchor()` 的成敗丟掉。但 anchor 存在的
+        理由正是「讓【截尾】變得可偵測」—— 雜湊鏈自己證不了後面還有沒有紀錄。
+        anchor 沒寫成功 ＝ 這一筆【無法被證明完整】,而呼叫端(writer loop 只看布林)
+        會以為一切正常:計數不增、關機 flush 視為全部落地,要等下一次 audit health
+        check 才可能發現 anchor 對不上。
+        `RecordResult.__bool__` 仍是 entry_written,既有的 `if not record(...)`
+        語意不變(那個計數的意思是「這筆稽核沒寫進去」,不該被 anchor 失敗灌爆)。
 
         ts:動作【發生】的時間(ISO 字串)。非同步寫入時務必由呼叫端在動作當下帶入,
         否則會記成背景緒實際落檔的時間。省略則用現在。
@@ -282,7 +315,7 @@ class ActionLedger:
                 self._rotate_if_needed()
                 if self._over_hard_cap():
                     logging.warning("[ledger] 檔案超過硬上限且輪替失敗 → 丟棄本筆稽核紀錄")
-                    return False
+                    return RecordResult(False, False)
                 seq = int(self._last_seq) + 1
                 payload = {
                     "schema_version": SCHEMA_VERSION,
@@ -310,11 +343,15 @@ class ActionLedger:
                     f.write(_canonical(rec) + "\n")
                 self._last_hash = rec["hash"]
                 self._last_seq = seq
-                self._write_anchor(seq, rec["hash"])
-                return True
+                anchored = self._write_anchor(seq, rec["hash"])
+                if not anchored:
+                    logging.warning(
+                        "[ledger] seq=%d 已寫入但 anchor 更新失敗 → 這一筆無法證明"
+                        "完整(截尾將偵測不到)", seq)
+                return RecordResult(True, bool(anchored))
         except Exception:
             logging.debug("[ledger] 記錄失敗(不影響操作)", exc_info=True)
-            return False
+            return RecordResult(False, False)
 
     # ── anchor 側檔:讓「截尾」變得可偵測(鏈自己證不了後面還有沒有)────────────
     @property

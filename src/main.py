@@ -1590,6 +1590,17 @@ _ledger_writer_started = False
 _ledger_writer_lock = threading.Lock()
 _ledger_dropped = 0            # 佇列滿被丟棄(未入列)
 _ledger_write_failures = 0     # 已入列但 record() 落地失敗(磁碟拒寫/硬上限)
+# [2026-08-02 第二輪外審 P1-04] 已落地、但 anchor 沒更新成功 → 這幾筆【無法證明
+# 沒被截尾】。與 write_failures 分開計:那個是「沒寫進去」,這個是「寫進去了但
+# 證不了完整」,混在一起會讓兩種問題都失焦。
+# ★兩個計數,不是一個★(外審第 1 輪):anchor 記的是【累計】末筆 seq/hash,所以
+# 後來任何一次成功的 anchor 更新,就把先前那幾筆也一起證明了 —— 只留一個永不歸零
+# 的計數,會讓一次短暫失敗之後【每一次】健康檢查都報「有紀錄無法證明完整」並持續
+# 寄信,而那時鏈其實已經完整。故:
+#   _ledger_unanchored       目前【尚未被任何 anchor 涵蓋】的筆數 → 成功即歸零
+#   _ledger_anchor_incidents 本次執行發生過幾次(只增,供 log 判斷是否常態性失敗)
+_ledger_unanchored = 0
+_ledger_anchor_incidents = 0
 # [GPT-5.6 P2-05] 交易關聯 ID:同一次 F 鍵按下(一個 subsystem run)產生的所有稽核紀錄
 # 共用一組 correlation_id,事後才回答得出「這筆 UVB 寫回和哪次 51019、哪次 F11 完成是同一
 # 個病人流程」。每次熱鍵在新 thread 跑(run_subsystem_in_thread.wrapper),故用 thread-local
@@ -1631,6 +1642,21 @@ def audit_health_check(notify: bool = True) -> dict:
     時裸讀檔案會看到「新紀錄+舊 anchor」的暫態 → 誤報竄改、寄假警報。"""
     snap = _action_ledger().health_check(dropped=_ledger_dropped,
                                          write_failures=_ledger_write_failures)
+    # [P1-04] anchor 失敗不影響 verify(鏈本身仍完好),但它代表「這幾筆無法證明
+    # 沒被截尾」—— 必須出現在摘要裡,否則使用者只會看到一切正常。
+    # 用 _ledger_unanchored(尚未被涵蓋的筆數)而非歷史次數:後來成功的 anchor
+    # 已經把先前那幾筆一起證明了,不該永遠報警。
+    if _ledger_unanchored:
+        snap = dict(snap)
+        snap["unanchored"] = _ledger_unanchored
+        snap["ok"] = False
+        # ★level 不可留在 "ok"★(外審第 1 輪):`snap.get("level") or "warn"` 會把
+        #   既有的 "ok" 原樣留下 → 設定頁顯示綠色 ✅ 卻是一次失敗的健康檢查。
+        #   已是 "error" 就保留(比 warn 嚴重),其餘一律升到 "warn"。
+        snap["level"] = "error" if snap.get("level") == "error" else "warn"
+        snap["summary"] = (
+            f"{snap.get('summary', '')}；另有 {_ledger_unanchored} 筆已寫入但"
+            f"anchor 更新失敗(該幾筆無法證明未被截尾)").lstrip("；")
     try:
         if snap["ok"]:
             logging.info("[audit-health] %s", snap["summary"])
@@ -1823,11 +1849,26 @@ def _ledger_writer_loop(q=None) -> None:
             # [GPT-5.6 第三輪] record() 回 False = 這筆稽核【沒有落地】(磁碟拒寫/硬上限)。
             # 原本丟棄回傳值 → 關機 flush 看 task_done 以為都寫完了、遺失無人知。至少要
             # 計數 + warning(完整的 audit health 面板待後續批次)。
-            if not _action_ledger().record(surface, action, ts=ts, **fields):
+            _res = _action_ledger().record(surface, action, ts=ts, **fields)
+            if not _res:
                 global _ledger_write_failures
                 _ledger_write_failures += 1
                 logging.warning("[ledger] 稽核寫入失敗(未落地,累計 %d 筆):%s %s",
                                 _ledger_write_failures, surface, action)
+            else:
+                # getattr 預設 True:測試會把 record 換成回 bool 的 stub;
+                # 「不知道 anchor 狀態」不該被算成一筆 anchor 失敗(假警報)。
+                global _ledger_unanchored, _ledger_anchor_incidents
+                if getattr(_res, "anchor_written", True):
+                    _ledger_unanchored = 0       # 這次的 anchor 把先前那幾筆也涵蓋了
+                else:
+                    _ledger_unanchored += 1
+                    _ledger_anchor_incidents += 1
+                    logging.warning(
+                        "[ledger] 稽核已寫入但 anchor 更新失敗(目前 %d 筆無法證明"
+                        "完整;本次執行累計發生 %d 次):%s %s",
+                        _ledger_unanchored, _ledger_anchor_incidents,
+                        surface, action)
             # [批次三] 回讀不符 → 即時通知維護者(醫師端警告視窗在呼叫點既有;這封信
             # 讓改版寫錯不用等人翻帳本才發現)。async 寄,不卡本寫入緒。
             if str(fields.get("outcome", "")) == _LEDGER_MISMATCH:
@@ -1986,23 +2027,17 @@ DEVELOPER_ALERT_EMAIL = _DEVELOPER_ALERT_EMAIL
 
 def _developer_alert_recipients() -> list:
     """開發者維護通知(金絲雀改版、稽核健康/mismatch)的收件人 = 開發者本人。
-    與臨床止掛提醒收件人(_load_alert_recipients)刻意分開。"""
+    與臨床止掛提醒收件人(AutomationApp.alert_email_recipients)刻意分開。
+
+    ★[2026-08-02 第二輪外審 P1-05] 這裡原本還有一支模組級的
+    `_load_alert_recipients()`,用裸 except 把任何讀取失敗都回成空 list。外審指出
+    那違反 repo 自己的規約(讀取失敗必須分 ok/missing/corrupt/error,暫時性 error
+    不可當成沒有資料)—— 機制上完全正確,但它自 2026-07-28 開發者告警拆出去之後
+    就【沒有任何呼叫端】了,是孤兒。臨床止掛提醒走的是
+    `load_threshold_settings()`(已用 load_json_dict_ex 分級,且 2026-07-26 補了
+    「本次執行曾讀不到就拒絕存檔」的閘門),不受影響。
+    所以正確處置是刪掉,不是替一支沒人用的函式加固。"""
     return _developer_alert_recipients_shared()
-
-
-def _load_alert_recipients() -> list:
-    """讀 threshold_settings.json 的 alert_email_recipients(與止掛提醒同一組收件人)。
-    模組級、不依賴 app 實例;讀不到/無設定回空 list(→ 不寄、不報錯)。"""
-    import json
-    try:
-        with open(get_conf_path('threshold_settings.json'), encoding='utf-8') as f:
-            d = json.load(f)
-        r = d.get('alert_email_recipients')
-        if isinstance(r, list):
-            return [str(x).strip() for x in r if str(x).strip()]
-    except Exception:
-        logging.debug("[金絲雀] 讀取通知收件人失敗", exc_info=True)
-    return []
 
 
 def _his_drift_current_version(verdict) -> str:

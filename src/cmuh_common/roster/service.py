@@ -1220,6 +1220,12 @@ class RosterService:
 
         定案時：以最終（含手動調整/換班）的 R/VS 排班重算帳本，確保帳本＝實況。"""
         if on:
+            # ★先預檢月檔寫得下去,再動帳本★(第二輪外審)
+            #   下面 resettle_from_duty 會先寫 ledger.json,而最後的
+            #   save_month(force=True) 現在可能因為備份失敗而拒寫 —— 那會留下
+            #   「帳本已重算、月份沒定案」的半套,而 UI 只說「定案失敗」。
+            self.storage.preflight_required_backup(
+                str(self.storage._month_path(ym)))
             m0 = self.storage.load_month(ym)
             hist = self.storage.load_ledger().get("history") or []
             settled = {h.get("scope") for h in hist if h.get("month") == ym}
@@ -1232,7 +1238,12 @@ class RosterService:
         month = self.storage.load_month(ym)
         month["finalized"] = bool(on)
         self._audit(month, "-", ym, None, f"finalized={bool(on)}", "finalize")
-        self.storage.save_month(ym, month, force=True)
+        # 定案路徑上方已經 preflight_required_backup 過（快照就在那時留下的）。
+        # 這裡若再要求一次，兩次之間檔案被鎖住就仍會留下「帳本已重算、月份沒定案」
+        # 的半套 —— 預檢的意義就沒了（外審第 10 輪）。
+        from cmuh_common.roster.storage import BEST_EFFORT_BACKUP
+        self.storage.save_month(ym, month, force=True,
+                                backup=BEST_EFFORT_BACKUP if on else None)
 
     # ── 定案 PDF 留底 ───────────────────────────────────────────────────
     def build_finalize_pdf_sections(self, ym: str) -> list:

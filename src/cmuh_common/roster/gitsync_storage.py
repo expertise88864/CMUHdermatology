@@ -39,6 +39,19 @@ import time
 from cmuh_common.roster.storage import RosterStorage
 
 
+def _is_month_filename(fn: str) -> bool:
+    """月檔的正典檔名：YYYY-MM.json（與 RosterStorage.iter_month_yms 同一套判定）。
+
+    刻意不接受任何其他 .json —— 人工解衝突時很容易在 months/ 底下留下
+    「2026-08-rescue.json」「2026-08 - 複製.json」之類的副本，那些不該被同步出去。
+    """
+    if not fn.endswith(".json"):
+        return False
+    stem = fn[:-5]
+    return (len(stem) == 7 and stem[4] == "-"
+            and stem[:4].isdigit() and stem[5:].isdigit())
+
+
 class GitSyncStorage(RosterStorage):
     def __init__(self, base_dir: str, remote_sync: bool = True,
                  push_debounce_sec: float = 3.0,
@@ -57,6 +70,9 @@ class GitSyncStorage(RosterStorage):
                      "啟用" if (self._git_ok and self._remote_sync) else "未啟用",
                      self._git_ok, self._remote_sync, self.base_dir)
         self.sync_state = "ok"
+        # .gitignore 就緒與否 —— 未就緒即不 commit（P2-05 fail-closed）。
+        # 非 git repo / 未設 remote 時不會走到 commit，維持 True 不影響純本機模式。
+        self._gitignore_ok = True
         self._push_lock = threading.Lock()        # 只管 _push_timer 欄位
         self._git_lock = threading.RLock()        # 所有 git working-tree/refs 操作
         self._push_timer: "threading.Timer | None" = None
@@ -66,7 +82,7 @@ class GitSyncStorage(RosterStorage):
             # 先 pull：若 clone 的 repo 已含（他機提交過的）.gitignore，_ensure_gitignore
             # 會偵測到而跳過，避免本機留下未追蹤的 .gitignore 撞掉之後的 ff-only merge。
             self._pull()
-            self._ensure_gitignore()
+            self._gitignore_ok = self._ensure_gitignore()
             if self._pull_interval and self._pull_interval > 0:
                 self._pull_thread = threading.Thread(
                     target=self._pull_loop, name="roster-git-pull", daemon=True)
@@ -100,10 +116,79 @@ class GitSyncStorage(RosterStorage):
     #   避免 repo 二進位膨脹，也免「PDF 直寫後遲遲沒 commit/推」的同步時序問題）。
     _GITIGNORE_LINES = ("*.bak-*", "*.corrupt-*", "*.tmp", "finalized/")
 
-    def _ensure_gitignore(self) -> None:
-        """確保 .gitignore 含必要規則（保留使用者既有內容，只補缺的標準行）。"""
+    # ★[2026-08-02 第二輪外審 P2-05] 只 stage 這些「正典資料檔」★
+    #   原本 commit 用 `git add -A`，等於「working tree 裡沒被忽略的東西全都推出去」，
+    #   而防線只有一個會寫失敗的 .gitignore。快照/壞檔備份/暫存/定案 PDF、以及
+    #   使用者為了解衝突手工留下的救援副本，都會被推進 private repo。
+    #   改成白名單之後，「哪些檔要跨機同步」是一份明確的清單，不是「除了忽略的以外
+    #   全部」——新增資料檔要同步就必須來這裡加一行（漏加會被測試抓到）。
+    _SYNC_FILES = ("config.json", "ledger.json", "biopsy.json",
+                   "week_colors.json", "holiday_duty.json",
+                   "clinic_template.json", "clerk_batches.json",
+                   "biopsy_grid.json", ".gitignore")
+    _SYNC_DIRS = ("months",)          # months/YYYY-MM.json（含刪除）
+
+    def _is_canonical_path(self, rel: str) -> bool:
+        """ls-files 吐回來的相對路徑是不是白名單認可的正典資料檔。"""
+        rel = rel.replace("\\", "/")
+        if rel in self._SYNC_FILES:
+            return True
+        head, _, tail = rel.partition("/")
+        return head in self._SYNC_DIRS and "/" not in tail             and _is_month_filename(tail)
+
+    def _ensure_gitignore(self) -> bool:
+        """確保 .gitignore 含必要規則（保留使用者既有內容，只補缺的標準行）。
+
+        回傳是否確實就緒。★寫不成功就不可以繼續同步★（見 _SYNC_FILES 的說明）：
+        白名單已經是主要防線，但 .gitignore 仍是「使用者手工放進資料夾的東西不會
+        被 git status 一直吵」的那一層，而且它本身就是要同步的檔之一。
+        """
         p = os.path.join(self.base_dir, ".gitignore")
         try:
+            existing = ""
+            if os.path.exists(p):
+                with open(p, encoding="utf-8") as f:
+                    existing = f.read()
+            have = set(existing.splitlines())
+            missing = [ln for ln in self._GITIGNORE_LINES if ln not in have]
+            if missing:
+                with open(p, "a" if existing else "w", encoding="utf-8") as f:
+                    if existing and not existing.endswith("\n"):
+                        f.write("\n")
+                    f.write("\n".join(missing) + "\n")
+        except OSError as e:
+            logging.warning("[roster.gitsync] 寫入 .gitignore 失敗：%s", e)
+            self._set_state("error", f".gitignore 無法建立/更新：{e}")
+            return False
+        self._ensure_local_exclude()
+        return True
+
+    def _gitignore_ready(self) -> bool:
+        """.gitignore 是否就緒 —— 未就緒時【當場重試一次】。
+
+        ★[外審第 11 輪] 不可只在 __init__ 判定一次★ 開程式當下若剛好被防毒/備份
+        軟體鎖住幾秒,原本就會讓整個行程永久停止 commit 與 push —— 使用者得重開
+        程式才會恢復,而畫面只說「.gitignore 未就緒」。暫時性失敗就該能自己好起來。
+        """
+        if self._gitignore_ok:
+            return True
+        self._gitignore_ok = self._ensure_gitignore()
+        if self._gitignore_ok:
+            logging.info("[roster.gitsync] .gitignore 已可寫入 → 恢復同步")
+            self._set_state("ok")
+        return self._gitignore_ok
+
+    def _ensure_local_exclude(self) -> None:
+        """第二層：.git/info/exclude（純本機、不會被同步，他機改不到也刪不掉）。
+
+        .gitignore 是【會被同步的檔】——他機若把它改壞、或合併時弄丟，本機就沒有
+        忽略規則了。exclude 補這一刀，寫不進去只記 debug（白名單才是主要防線）。
+        """
+        try:
+            d = os.path.join(self.base_dir, ".git", "info")
+            if not os.path.isdir(d):
+                return
+            p = os.path.join(d, "exclude")
             existing = ""
             if os.path.exists(p):
                 with open(p, encoding="utf-8") as f:
@@ -116,11 +201,21 @@ class GitSyncStorage(RosterStorage):
                 if existing and not existing.endswith("\n"):
                     f.write("\n")
                 f.write("\n".join(missing) + "\n")
-        except OSError as e:
-            logging.warning("[roster.gitsync] 寫入 .gitignore 失敗（略過）：%s", e)
+        except OSError:
+            logging.debug("[roster.gitsync] 寫入 .git/info/exclude 失敗（略過）",
+                          exc_info=True)
 
     def _set_state(self, state: str, detail: str = "") -> None:
-        """更新同步狀態並通知 callback（callback 在呼叫端 thread 執行）。"""
+        """更新同步狀態並通知 callback（callback 在呼叫端 thread 執行）。
+
+        ★[外審第 4 輪] `.gitignore` 未就緒時不得回報 ok★
+        fail-closed 只擋住了 commit，但一次成功的【週期性 pull】會把狀態設回
+        "ok" —— 底部狀態列顯示「已同步」，而本機的每一次存檔其實都被拒絕 commit，
+        什麼都沒推出去。使用者看到綠燈、資料卻停在本機，正是最糟的那種失效。
+        故把守衛放在這個唯一的狀態出口，而不是逐一修每個呼叫端。
+        """
+        if state == "ok" and not getattr(self, "_gitignore_ok", True):
+            state, detail = "error", detail or ".gitignore 未就緒，本機變更不會同步"
         self.sync_state = state
         if state == "ok":
             logging.info("[roster.gitsync] 同步狀態：ok")
@@ -211,12 +306,14 @@ class GitSyncStorage(RosterStorage):
                               exc_info=True)
 
     # ── 存檔攔截：本地 commit + 去抖 push ────────────────────────────────
-    def _save(self, path: str, data: dict) -> None:
-        super()._save(path, data)                # 先照常原子寫入（write-through，不卡）
+    def _save(self, path: str, data: dict, **kw) -> None:
+        # **kw 透傳（目前是 backup=REQUIRE_BACKUP/BEST_EFFORT）——本層只加 git
+        # commit/push，不干涉基底層的寫入政策；基底若拒寫會直接拋，這裡不會走到。
+        super()._save(path, data, **kw)          # 先照常原子寫入（write-through，不卡）
         if not (self._git_ok and self._remote_sync):
             return
         # 拿不到 git 鎖＝背景正在 push/pull：檔案已寫盤，這次先略過 commit，
-        # 下次存檔的 add -A 會補收；仍排一次 push 以免變更留在本機。
+        # 下次存檔的白名單 add 會補收；仍排一次 push 以免變更留在本機。
         if not self._git_lock.acquire(timeout=3.0):
             logging.warning(
                 "[roster.gitsync] git 忙碌中，本次存檔延後 commit（檔案已寫盤，"
@@ -234,11 +331,55 @@ class GitSyncStorage(RosterStorage):
 
         回傳是否可繼續推送（成功 or 乾淨無變更＝True；真失敗＝False）。
         """
+        if not self._gitignore_ready():
+            # fail-closed：沒有忽略規則就不 commit（見 _ensure_gitignore）。
+            logging.warning("[roster.gitsync] .gitignore 未就緒 → 本次不 commit")
+            return False
         try:
-            self._git("add", "-A")
+            # ★只收白名單★ `-A <pathspec>` 讓【刪除】也傳得出去（否則他機永遠
+            #   留著已被刪掉的月份）；新檔要先 add，path-limited commit 才認得。
+            paths = [n for n in self._SYNC_FILES
+                     if os.path.exists(os.path.join(self.base_dir, n))]
+            # ★逐檔列舉,不用目錄當 pathspec★ 空的 months/ 會讓 git 回
+            #   "pathspec 'months' did not match any file(s) known to git"。
+            # ★而且只收【正典檔名】YYYY-MM.json★（外審第 3 輪）：光看副檔名
+            #   .json 會把 months/2026-08-rescue.json、「2026-08 - 複製.json」
+            #   這類人工救援副本一起收進去 —— 白名單就又漏了。
+            for dname in self._SYNC_DIRS:
+                dpath = os.path.join(self.base_dir, dname)
+                if not os.path.isdir(dpath):
+                    continue
+                for fn in sorted(os.listdir(dpath)):
+                    if _is_month_filename(fn):
+                        paths.append(f"{dname}/{fn}")
+            # 已被追蹤但檔案已刪 → pathspec 仍要帶上，才能收到這筆刪除。
+            # 同樣要過濾：ls-files 會把【已經被追蹤的】非正典檔也吐回來
+            #（例如舊版 add -A 時期誤收進 repo 的救援副本），不濾就等於自動續命。
+            ls = self._git("ls-files", "--", *self._SYNC_FILES, *self._SYNC_DIRS)
+            if ls.returncode != 0:
+                logging.warning("[roster.gitsync] ls-files 失敗，本次不 commit：%s",
+                                (ls.stderr or ls.stdout).strip())
+                return False
+            for ln in (ls.stdout or "").splitlines():
+                ln = ln.strip()
+                if ln and ln not in paths and self._is_canonical_path(ln):
+                    paths.append(ln)
+            if not paths:
+                return True                      # 沒有任何正典資料 → 無事可推
+            a = self._git("add", "-A", "--", *paths)
+            if a.returncode != 0:
+                logging.warning("[roster.gitsync] add 失敗，本次不 commit：%s",
+                                (a.stderr or a.stdout).strip())
+                return False
+            # ★[外審] commit 也要限定 pathspec★ 白名單只約束 add 是不夠的：
+            #   `git commit` 提交的是【整個 index】，使用者自己 `git add` 過的
+            #   救援副本、或先前中斷留在 index 的東西，照樣會被一起推出去。
+            #   path-limited commit 只收這幾條路徑的工作區狀態，也不會動到
+            #   使用者自己 stage 的內容（不搶、不丟）。
             r = self._git("commit", "-m",
                           f"roster sync: {label} "
-                          f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+                          f"{time.strftime('%Y-%m-%d %H:%M:%S')}",
+                          "--", *paths)
         except (OSError, subprocess.SubprocessError) as e:
             logging.warning("[roster.gitsync] 本地 commit 執行失敗：%s", e)
             return False
@@ -251,6 +392,37 @@ class GitSyncStorage(RosterStorage):
             "[roster.gitsync] commit 失敗（此機可能未設 git user.name/email，"
             "本次變更未同步）：%s", (r.stderr or r.stdout).strip())
         return False
+
+    def _outgoing_non_canonical(self, remote: str, branch: str) -> list:
+        """本次 push 會【新發佈出去】的路徑裡，有哪些不是白名單認可的正典資料檔。
+
+        只看 `<remote>/<branch>..HEAD` 這個範圍：遠端既有歷史裡的髒東西不由本層
+        自動處理（那需要人工 `git rm --cached`，見模組 docstring），但也不能因此
+        把同步整個鎖死 —— 只擋「這一次會由我們推出去」的部分。
+        遠端分支還不存在（首推）→ 拿 HEAD 的整棵樹比對。
+        判定失敗（git 出錯）一律回空：這是縱深防禦，不該因為它自己壞掉而擋住同步。
+        """
+        try:
+            # ★用 log 逐 commit 掃,不是 diff 兩端★(外審第 12 輪)
+            #   淨差會漏掉「某個未推 commit 加了檔、後面另一個未推 commit 又刪掉」:
+            #   `diff base..HEAD` 什麼都看不到,但 push 會把【兩個 commit 都】送出去,
+            #   那個檔就永遠留在 git 歷史裡,任何拿得到 repo 的人都翻得出來。
+            # ★--diff-filter=ACMR:排除【刪除】★(外審第 8 輪)
+            #   否則使用者照我們自己給的指示做 `git rm --cached` 之後,那筆刪除
+            #   又被判成一條非正典路徑 → 永遠推不出去,修復被自己擋死。
+            r = self._git("log", "--format=", "--name-only",
+                          "--diff-filter=ACMR", f"{remote}/{branch}..HEAD")
+            if r.returncode != 0:
+                # 遠端分支還不存在＝首推:整條歷史都會被發佈,就整條掃。
+                r = self._git("log", "--format=", "--name-only",
+                              "--diff-filter=ACMR", "HEAD")
+                if r.returncode != 0:
+                    return []
+            return sorted({ln.strip() for ln in (r.stdout or "").splitlines()
+                           if ln.strip() and not self._is_canonical_path(ln.strip())})
+        except (OSError, subprocess.SubprocessError):
+            logging.debug("[roster.gitsync] 待推路徑檢查失敗（略過）", exc_info=True)
+            return []
 
     def _remote_name(self) -> "str | None":
         try:
@@ -312,6 +484,13 @@ class GitSyncStorage(RosterStorage):
         抽出來有兩個理由:讓通知能放在 _push 的 finally 裡(不必在每一個 return 前
         重複一次),以及讓那個旗標是【每次呼叫各自的區域值】而不是實例狀態。"""
         changed = False
+        if not self._gitignore_ready():
+            # ★[外審第 6 輪] fail-closed 不能只擋 commit★
+            #   `_push_locked_body` 原本無視 `_commit()` 的失敗照樣 push —— 而本機
+            #   可能還躺著【舊版 `git add -A` 時期】收進來的未推 commit（裡面就有
+            #   救援副本、快照、定案 PDF）。沒有忽略規則時連推都不該推。
+            self._set_state("error", ".gitignore 未就緒，暫停同步（本機變更留在本機）")
+            return False
         with self._git_lock:
             # 先補收：_save 因鎖逾時略過 commit 時只排了 push，這裡（鎖已空出）把那筆
             # 已寫盤但未 commit 的變更補 commit 進來，避免「存檔成功卻遲遲沒推、他機看到
@@ -349,6 +528,23 @@ class GitSyncStorage(RosterStorage):
                         return False
                 after = self._rev_parse("HEAD")
                 changed = bool(before and after and before != after)
+            stray = self._outgoing_non_canonical(remote, branch)
+            if stray:
+                # ★[外審第 7 輪] 白名單只管【新的】commit★
+                #   升級前若本機躺著舊版 `add -A` 造出、還沒推出去的 commit
+                #   （最典型是人工解衝突留下的 months/2026-08-rescue.json），
+                #   push 會把整條 HEAD 祖先一起發佈 —— 白名單等於沒擋到。
+                #   只看【本次會新推出去的範圍】：遠端既有的歷史髒東西不由我們
+                #   自動處理（那要人工 git rm --cached），但也不能因此把同步鎖死。
+                self._set_state(
+                    "error",
+                    "本機有尚未推出的 commit 曾加入不該同步的檔案："
+                    + "、".join(stray[:5])
+                    + ("…" if len(stray) > 5 else "")
+                    + "。（即使之後又刪掉，推出去仍會留在 git 歷史裡。）"
+                    "請於 settings/roster 以 git log 確認後，用 git rm --cached "
+                    "或整理未推的 commit，再重試。")
+                return changed
             try:
                 p = self._git("push", remote, "HEAD")
             except (OSError, subprocess.SubprocessError) as e:

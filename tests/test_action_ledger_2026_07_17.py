@@ -24,9 +24,9 @@ def _ledger(tmp_path, **kw):
 # ── 基本記錄 ────────────────────────────────────────────────────────────────
 def test_record_writes_queryable_fields(tmp_path):
     lg = _ledger(tmp_path)
-    assert lg.record(al.SURFACE_HIS_MENU, "F2 醫令代碼輸入", target="menu:219",
+    assert bool(lg.record(al.SURFACE_HIS_MENU, "F2 醫令代碼輸入", target="menu:219",
                      value="51017", his_version="1150713", canary="ok",
-                     outcome=al.OUTCOME_OK, correlation_id="abc") is True
+                     outcome=al.OUTCOME_OK, correlation_id="abc")) is True
     recs = al.read_records(lg.path)
     assert len(recs) == 1
     r = recs[0]
@@ -369,13 +369,13 @@ def test_anchor_tracks_last_record(tmp_path):
 def test_record_never_raises_on_unwritable_path(tmp_path):
     # 路徑不存在的目錄 → 寫檔失敗,但只能回 False,絕不可拋
     lg = al.ActionLedger(str(tmp_path / "no_such_dir" / "l.jsonl"))
-    assert lg.record(al.SURFACE_HIS_MENU, "F2", value="51017") is False
+    assert bool(lg.record(al.SURFACE_HIS_MENU, "F2", value="51017")) is False
 
 
 def test_record_never_raises_on_weird_values(tmp_path):
     lg = _ledger(tmp_path)
-    assert lg.record(al.SURFACE_HIS_FIELD, "F2", value=object()) is True
-    assert lg.record(al.SURFACE_HIS_FIELD, "F2", value=None) is True
+    assert bool(lg.record(al.SURFACE_HIS_FIELD, "F2", value=object())) is True
+    assert bool(lg.record(al.SURFACE_HIS_FIELD, "F2", value=None)) is True
     assert al.read_records(lg.path)[1]["value"] == ""
 
 

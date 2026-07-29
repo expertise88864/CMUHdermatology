@@ -25,6 +25,13 @@ from cmuh_common.roster.model import SCHEMA_VERSION
 
 KEEP_SNAPSHOTS = 20
 
+# ★[2026-08-02 第二輪外審 P2-04] 寫入的備份政策★
+# 「快照失敗只記 warning、照樣覆寫」對【每改一格就存一次】的月檔是合理的
+# （不能因為備份不成就讓人排不了班），但對【失去備份就再也回不來】的那幾份不是
+# 同一件事。同一份程式對兩者用同一套風險政策，本身就是不一致。
+BEST_EFFORT_BACKUP = "best_effort"   # 備份不成 → 記 warning 後照常寫
+REQUIRE_BACKUP = "require"           # 備份不成 → 拒寫（見各 save_* 的選擇理由）
+
 
 class FinalizedMonthError(RuntimeError):
     """月份已定案，未 force 不可覆寫。"""
@@ -152,7 +159,8 @@ class RosterStorage:
                 f"{os.path.basename(path)} 暫時無法讀取（可能被防毒/同步軟體鎖住），"
                 f"為保護既有資料已中止存檔，請稍後再試。") from e
 
-    def _save(self, path: str, data: dict) -> None:
+    def _save(self, path: str, data: dict, *,
+              backup: str = BEST_EFFORT_BACKUP) -> None:
         """唯一的寫入出口：守門 → 留快照 → 原子寫入。
 
         ★[2026-08-02 補審] 快照掛在這裡，不是各個 `save_*` 各自呼叫★
@@ -167,15 +175,21 @@ class RosterStorage:
         有用的歷史擠掉。`.bak-*` 已在 GitSync 的 .gitignore 內，不會同步出去。
         """
         self._guard_overwrite(path)
-        self._snapshot(path)
+        if not self._snapshot(path) and backup == REQUIRE_BACKUP:
+            raise ValueError(
+                f"{os.path.basename(path)} 的備份（.bak-）建立失敗，"
+                f"為避免這份【失去備份就無法復原】的資料被覆蓋，已中止存檔。"
+                f"請確認檔案沒有被防毒/備份軟體鎖住、磁碟仍有空間後重試。")
         data = dict(data)
         data["schema_version"] = SCHEMA_VERSION
         # atomic_write_json 回傳 None、失敗時拋例外（cmuh_common.atomic_io 介面）
         atomic_write_json(path, data)
 
-    def _snapshot(self, path: str) -> None:
+    def _snapshot(self, path: str) -> bool:
+        """複製一份 .bak-<時間戳>。回傳「是否有可用的備份」——檔案本來就不存在
+        （首次建檔，沒有東西要保護）也算 True。"""
         if not os.path.exists(path):
-            return
+            return True
         # [codex P2] 含微秒避免同秒內連續存檔互相覆蓋快照;仍碰撞則加序號
         stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
         bak = f"{path}.bak-{stamp}"
@@ -186,7 +200,8 @@ class RosterStorage:
         try:
             shutil.copy2(path, bak)
         except OSError:
-            logging.warning("[roster.storage] 快照失敗(續存): %s", path, exc_info=True)
+            logging.warning("[roster.storage] 快照失敗: %s", path, exc_info=True)
+            return False
         # 清舊快照
         snaps = sorted(glob.glob(f"{path}.bak-*"))
         for old in snaps[:-KEEP_SNAPSHOTS]:
@@ -194,6 +209,7 @@ class RosterStorage:
                 os.remove(old)
             except OSError:
                 pass
+        return True
 
     # ── config / ledger / 週色 / 年度假日表 ─────────────────────────────
     def load_config(self) -> dict:
@@ -204,7 +220,8 @@ class RosterStorage:
         # [2026-07-25 審查] config.json 存的是全部成員名單，誤刪最痛（快照見 _save）。
         self._check_schema(_load_json(self._path("config.json")), "config.json",
                            for_write=True)
-        self._save(self._path("config.json"), cfg)
+        # 全體 R/VS 成員名單 —— 失去備份就回不來。
+        self._save(self._path("config.json"), cfg, backup=REQUIRE_BACKUP)
 
     def load_ledger(self) -> dict:
         d = self._check_schema(_load_json(self._path("ledger.json")),
@@ -275,7 +292,9 @@ class RosterStorage:
             for d, mid in (table.get(scope) or {}).items():
                 key = d.isoformat() if isinstance(d, date) else str(d)
                 raw[scope][key] = str(mid)
-        self._save(self._path("holiday_duty.json"), raw)
+        # 這張表的鍵集合【就是】整年的國定假日清單，錯了之後點數與週末連休
+        # 區塊全部跟著算錯 —— 失去備份就回不來。
+        self._save(self._path("holiday_duty.json"), raw, backup=REQUIRE_BACKUP)
 
     def holidays_set(self) -> set:
         """國定假日集合 = 年度指定表 r/vs 鍵聯集（設計文件 §16.1 定案）。"""
@@ -340,7 +359,15 @@ class RosterStorage:
         d.setdefault("audit", [])
         return d
 
-    def save_month(self, ym: str, data: dict, force: bool = False) -> None:
+    def save_month(self, ym: str, data: dict, force: bool = False, *,
+                   backup: "str | None" = None) -> None:
+        """存月檔。backup=None ＝ 用預設政策（force 覆寫已定案月 → REQUIRE_BACKUP，
+        一般存檔 → BEST_EFFORT）。
+
+        ★呼叫端只有在【自己剛做過 preflight_required_backup】時才可以覆寫成
+        BEST_EFFORT★（外審第 10 輪）：否則預檢做了第一次快照、這裡又要第二次，
+        兩次之間檔案被鎖住就仍會留下半套。見 finalize()。
+        """
         path = self._month_path(ym)
         existing = _load_json(path)
         self._check_schema(existing, f"{ym}.json", for_write=True)
@@ -349,7 +376,11 @@ class RosterStorage:
         data = dict(data)
         data["month"] = ym
         data["saved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        self._save(path, data)
+        # force=True ＝ 覆寫【已定案】月份，那是留底快照本身；一般存檔維持
+        # BEST_EFFORT（每改一格就存一次，不可因備份不成而停擺）。
+        if backup is None:
+            backup = REQUIRE_BACKUP if force else BEST_EFFORT_BACKUP
+        self._save(path, data, backup=backup)
 
     def iter_month_yms(self) -> list:
         """回傳 months/ 內所有月份檔的 'YYYY-MM'（升冪）。供跨全部月份的維護作業
@@ -361,6 +392,24 @@ class RosterStorage:
                     and stem[5:].isdigit():
                 out.append(stem)
         return sorted(out)
+
+    def preflight_required_backup(self, path: str) -> None:
+        """在【還沒動任何資料之前】確認這個檔待會兒真的寫得下去。
+
+        ★[2026-08-02 第二輪外審] 多步驟落地要讓失敗發生在第一步★
+        `finalize()` 是先重算帳本(寫 ledger.json)、再 force 覆寫月檔。自從
+        force 覆寫改成 REQUIRE_BACKUP,月檔那一步可能拒寫 —— 於是 UI 報「定案失敗」
+        並把勾選還原,而帳本【已經被重新結算過了】。
+        `accept_solution` 早就用同一招處理過(「先把兩個目標都預檢過,讓失敗發生在
+        任何寫入之前」),這裡照做:守門 + 實際留一份快照,不成就在動帳本之前拋。
+        代價是定案時會多留一份 .bak-（定案很少見，可接受）。
+        """
+        self._guard_overwrite(path)
+        if not self._snapshot(path):
+            raise ValueError(
+                f"{os.path.basename(path)} 的備份（.bak-）建立失敗，"
+                f"為避免只完成一半就中止，本次操作沒有做任何變更。"
+                f"請確認檔案沒有被防毒/備份軟體鎖住、磁碟仍有空間後重試。")
 
     def assert_readable(self, name: str) -> None:
         """嚴格檢查某檔可正確解析；存在但壞掉/讀不到 → 拋 ValueError。

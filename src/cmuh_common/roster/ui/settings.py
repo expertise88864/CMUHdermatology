@@ -14,6 +14,7 @@ from tkinter import messagebox, ttk
 from cmuh_common.roster.calendar_colors import week_colors_for_year
 from cmuh_common.roster.ledger import reset_member, sync_members
 from cmuh_common.roster.model import month_dates, week_key
+from cmuh_common.roster.ui.common import guard_write
 
 _WD_CHOICES = ("無", "一", "二", "三", "四", "五", "六", "日")   # index-1 = weekday
 
@@ -505,7 +506,10 @@ class SettingsTab(ttk.Frame):
             table["vs"][d] = vs
         else:
             table["vs"].pop(d, None)
-        self.service.storage.save_holiday_duty(table)
+        if not guard_write(
+                lambda: self.service.storage.save_holiday_duty(table),
+                title="年度國定假日表", parent=self):
+            return
         self._reload_holidays()
         self._notify()
 
@@ -518,7 +522,10 @@ class SettingsTab(ttk.Frame):
             d = date.fromisoformat(iso)
             table["r"].pop(d, None)
             table["vs"].pop(d, None)
-        self.service.storage.save_holiday_duty(table)
+        if not guard_write(
+                lambda: self.service.storage.save_holiday_duty(table),
+                title="年度國定假日表", parent=self):
+            return
         self._reload_holidays()
         self._notify()
 
@@ -699,7 +706,9 @@ class SettingsTab(ttk.Frame):
         if paid:
             entry["is_self_paid"] = True
         tpl.setdefault(str(wd), {}).setdefault(session, []).append(entry)
-        self.service.storage.save_clinic_template(data)
+        if not guard_write(lambda: self.service.storage.save_clinic_template(data),
+                           title="門診週模板", parent=self):
+            return
         self._reload_template()
         self._notify()
 
@@ -714,7 +723,9 @@ class SettingsTab(ttk.Frame):
             lst.pop(int(idx))
         except (ValueError, IndexError):
             return
-        self.service.storage.save_clinic_template(data)
+        if not guard_write(lambda: self.service.storage.save_clinic_template(data),
+                           title="門診週模板", parent=self):
+            return
         self._reload_template()
         self._notify()
 
@@ -764,7 +775,9 @@ class SettingsTab(ttk.Frame):
         if dlg.result:
             batches = self.service.storage.load_clerk_batches()
             batches.append(dlg.result)
-            self.service.storage.save_clerk_batches(batches)
+            if not guard_write(lambda: self.service.storage.save_clerk_batches(batches),
+                               title="Clerk 梯次", parent=self):
+                return
             self._seed_biopsy_from_prev(dlg.result, batches)   # 預設複製上一梯次模式
             self._reload_batches()
             self._notify()
@@ -792,7 +805,9 @@ class SettingsTab(ttk.Frame):
                 seeded[(ns + timedelta(days=i)).isoformat()] = dict(pg)
         if seeded:
             grid_all[new_batch["id"]] = seeded
-            self.service.storage.save_biopsy_grid(grid_all)
+            if not guard_write(lambda: self.service.storage.save_biopsy_grid(grid_all),
+                               title="切片室開放格網", parent=self):
+                return
 
     def _batch_edit(self) -> None:
         sel = self._batch_tree.selection()
@@ -806,7 +821,9 @@ class SettingsTab(ttk.Frame):
         dlg = _ClerkBatchDialog(self, cur)
         if dlg.result:
             cur.update(dlg.result)
-            self.service.storage.save_clerk_batches(batches)
+            if not guard_write(lambda: self.service.storage.save_clerk_batches(batches),
+                               title="Clerk 梯次", parent=self):
+                return
             if cur.get("id") and cur.get("start_monday") != old_start:
                 self._shift_biopsy_grid(cur["id"], old_start, cur["start_monday"])
             self._reload_batches()
@@ -833,7 +850,9 @@ class SettingsTab(ttk.Frame):
                 continue
             shifted[nd.isoformat()] = sess
         grid_all[batch_id] = shifted
-        self.service.storage.save_biopsy_grid(grid_all)
+        if not guard_write(lambda: self.service.storage.save_biopsy_grid(grid_all),
+                           title="切片室開放格網", parent=self):
+            return
 
     def _batch_del(self) -> None:
         sel = self._batch_tree.selection()
@@ -841,7 +860,9 @@ class SettingsTab(ttk.Frame):
             return
         batches = [b for b in self.service.storage.load_clerk_batches()
                    if self._batch_key(b) != sel[0]]
-        self.service.storage.save_clerk_batches(batches)
+        if not guard_write(lambda: self.service.storage.save_clerk_batches(batches),
+                           title="Clerk 梯次", parent=self):
+            return
         self._reload_batches()
         self._notify()
 
@@ -922,8 +943,11 @@ class SettingsTab(ttk.Frame):
         else:
             manual.pop(wk, None)                            # 移除覆蓋→回自動色
         # replace=True：整組取代（否則 merge 無法真正刪掉已移除的覆蓋）
-        self.service.storage.save_week_colors(
-            self._wc_year.get(), manual, source="manual", replace=True)
+        if not guard_write(
+                lambda: self.service.storage.save_week_colors(
+                    self._wc_year.get(), manual, source="manual", replace=True),
+                title="手動週色", parent=self):
+            return
         self._reload_week_colors()
         self._notify()
 
@@ -1111,5 +1135,7 @@ class _BiopsyGridDialog(tk.Toplevel):
             if v.get():
                 newg.setdefault(iso, {})[session] = True
         grid_all[self.batch_id] = newg
-        self.service.storage.save_biopsy_grid(grid_all)
+        if not guard_write(lambda: self.service.storage.save_biopsy_grid(grid_all),
+                           title="切片室開放格網", parent=self):
+            return
         self.destroy()

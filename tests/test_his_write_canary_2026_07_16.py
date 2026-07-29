@@ -191,8 +191,9 @@ def test_canary_drift_goes_to_developer_email_only(monkeypatch):
     monkeypatch.setattr(main, "_his_drift_persist_loaded", True)
     monkeypatch.setattr(main, "_persist_his_drift_notified", lambda k: True)
     monkeypatch.setattr(main.threading, "Thread", _SyncThread)
-    # 若誤用臨床止掛收件人,這個 stub 會現形
-    monkeypatch.setattr(main, "_load_alert_recipients", lambda: ["clinical@example.com"])
+    # (原本這裡 monkeypatch 一支叫 _load_alert_recipients 的模組級函式當 tripwire;
+    #  它 2026-08-02 已因無呼叫端而刪除。真正的守衛是下面那句 sent 斷言,以及
+    #  test_dev_notifications_use_developer_email_not_clinical 的原始碼檢查。)
     sent = []
     monkeypatch.setattr(main, "_send_alert_email_via_smtp",
                         lambda s, b, r, **k: sent.append(list(r)) or True)
