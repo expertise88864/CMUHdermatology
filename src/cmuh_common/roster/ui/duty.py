@@ -21,7 +21,8 @@ from cmuh_common.roster.ui.common import (
     LINE_CHIP, OVR_FONT, OVR_STYLE, TALLY_GONE_FG, TALLY_NEG_FG, TALLY_POS_FG,
     WARN_SEVERITY_FG, WEEK_COLOR_CHIP, WEEKDAY_HEADERS, MonthSelector,
     StatusBar, archive_finalize_pdf_async, bind_hover_highlight,
-    calendar_matrix, card_body_bg, fg_for, member_color, next_in_cycle,
+    calendar_matrix, card_body_bg, fg_for, guard_write, member_color,
+    next_in_cycle,
     shade_color, tint_color, vs_member_color,
 )
 
@@ -102,20 +103,43 @@ class LeaveEditor(tk.Toplevel):
 
     def _on_member_change(self) -> None:
         # [RP3-20] 切成員前先把上一位的未存變更落檔,否則切走即遺失。
-        self._commit_current()
+        # ★[2026-08-02 補審] 落檔失敗就【不可以】把畫面切過去★
+        #   原本 _commit_current() 一拋例外,_load_member() 就不會執行,而下拉已經
+        #   顯示 B、格子與 _loaded_mid 卻還是 A。使用者以為在編輯 B,接下來勾的
+        #   每一天都會寫進 A —— 兩邊都錯:A 被塞了不該有的假、B 一天也沒進去。
+        #   請假直接餵給求解器,寫錯人＝該休的人被排班。
+        if not self._commit_current():
+            self._restore_combo()
+            return
         self._load_member()
 
-    def _commit_current(self) -> None:
-        """把目前載入成員的勾選落檔（僅在相對載入基準確有變動時才寫）。"""
+    def _restore_combo(self) -> None:
+        """把成員下拉拉回【目前畫面實際載入的那一位】,恢復「看到的＝會被寫的」。"""
+        for i, m in enumerate(self._members):
+            if str(m.get("id")) == str(self._loaded_mid):
+                self._combo.current(i)
+                return
+
+    def _commit_current(self) -> bool:
+        """把目前載入成員的勾選落檔（僅在相對載入基準確有變動時才寫）。
+
+        回傳是否可以繼續（沒東西要寫也算成功）；失敗已跳訊息。"""
         if self._loaded_mid is None or self._selected == self._loaded_baseline:
-            return
+            return True
+        label = "請假" if self.mode == "leave" else "指定值班"
         if self.mode == "leave":
-            self.service.set_leaves(self.scope, self.ym, self._loaded_mid,
-                                    self._selected)
+            def _do():
+                self.service.set_leaves(self.scope, self.ym, self._loaded_mid,
+                                        self._selected)
         else:
-            self.service.set_must(self.scope, self.ym, self._loaded_mid,
-                                  self._selected)
+            def _do():
+                self.service.set_must(self.scope, self.ym, self._loaded_mid,
+                                      self._selected)
+        if not guard_write(_do, title=f"{self._loaded_mid} 的{label}未儲存",
+                           parent=self):
+            return False
         self._loaded_baseline = set(self._selected)
+        return True
 
     def _load_member(self) -> None:
         mid = self._member_id()
@@ -143,7 +167,9 @@ class LeaveEditor(tk.Toplevel):
 
     def _save(self) -> None:
         # [RP3-20] 存目前成員(含這次)的變更後關閉;先前切換過的成員已在切換時落檔。
-        self._commit_current()
+        # 失敗不關窗——關掉等於告訴使用者「存好了」,而他其實可以重試或按取消。
+        if not self._commit_current():
+            return
         self.destroy()
 
 
@@ -628,8 +654,9 @@ class CalendarDutyTab(ttk.Frame):
             nxt = None if cur == brush else brush
         else:
             nxt = next_in_cycle(cur, self._member_ids(scope))
-        self.service.set_cell(scope, self.app.ym, d, nxt)
-        self.refresh()
+        guard_write(lambda: self.service.set_cell(scope, self.app.ym, d, nxt),
+                    title="改格", parent=self)
+        self.refresh()          # 失敗也重畫:讓畫面回到磁碟上的真實內容
 
     def _on_cell_right(self, event, d: date, scope: str) -> None:
         if self._finalized or self._busy_flag:       # RF-17：求解中不得開右鍵選單
@@ -719,11 +746,13 @@ class CalendarDutyTab(ttk.Frame):
         self.refresh()
 
     def _set_cell_and_refresh(self, d, mid, scope) -> None:
-        self.service.set_cell(scope, self.app.ym, d, mid)
+        guard_write(lambda: self.service.set_cell(scope, self.app.ym, d, mid),
+                    title="改格", parent=self)
         self.refresh()
 
     def _toggle_lock(self, d, scope) -> None:
-        self.service.toggle_lock(scope, self.app.ym, d)
+        guard_write(lambda: self.service.toggle_lock(scope, self.app.ym, d),
+                    title="切換鎖定", parent=self)
         self.refresh()
 
     def _open_leave_editor(self, mode, scope) -> None:

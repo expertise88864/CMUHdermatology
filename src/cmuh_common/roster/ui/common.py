@@ -6,7 +6,7 @@ import logging
 import threading
 import tkinter as tk
 from datetime import date
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 from cmuh_common.roster.model import month_dates
 
@@ -305,3 +305,25 @@ def archive_finalize_pdf_async(parent, service, ym) -> None:
             # 靜默略過完成通知,別讓背景緒未捕捉例外炸掉。
             logging.info("[roster.ui] 定案 PDF 完成時視窗已關閉，略過完成通知")
     threading.Thread(target=work, name="finalize-pdf", daemon=True).start()
+
+
+def guard_write(fn, *, title: str, parent=None) -> bool:
+    """執行一個會寫檔的動作；失敗就跳訊息並回 False（呼叫端據此中止後續動作）。
+
+    ★[2026-08-02 補審] 為什麼每一條寫入路徑都得包★
+    `cmuh_common.tk_exception` 刻意只把 Tk callback 例外寫進 log、不跳窗，所以
+    沒有自己攔例外的寫入失敗，在畫面上就只是「按了沒反應」。會拋的情況都不罕見：
+      * 月檔被防毒/同步軟體鎖住（roster 目錄本身就是 git repo，GitSync 背景在跑 git）
+      * 另一台電腦剛把該月定案 → FinalizedMonthError
+      * 月檔壞掉 → storage 的 schema 守門拋 ValueError
+    大動作（套用排班/清除/重算帳本/定案/匯出/停診）本來就都有 try + messagebox；
+    缺的是【最常按的那幾個互動】。這條教訓 2026-07-25 已在 settings 的 `_save_cfg`
+    寫下過（"Tk callback 例外只會進 log → 使用者以為改好了"），當時只修了設定分頁。
+    """
+    try:
+        fn()
+        return True
+    except Exception as e:  # noqa: BLE001
+        logging.exception("[roster.ui] %s 失敗", title)
+        messagebox.showerror(title, f"{title}未能完成：\n{e}", parent=parent)
+        return False

@@ -26,6 +26,7 @@ from cmuh_common.roster.ui.common import (
     CARD_HDR_WEEKEND, CARD_SEP, CARD_TODAY_BORDER, OVR_FONT, OVR_STYLE,
     WEEKDAY_HEADERS, MonthSelector, StatusBar, archive_finalize_pdf_async,
     bind_canvas_mousewheel, bind_hover_highlight, calendar_matrix, card_body_bg,
+    guard_write,
 )
 from cmuh_common.roster.ui.duty import LeaveEditor
 
@@ -412,8 +413,10 @@ class DayScheduleTab(ttk.Frame):
             if not slots:
                 messagebox.showinfo("鎖定", "此時段尚未排班，無法鎖定")
                 return
-        self.service.toggle_day_lock(self.app.ym, d, session)
-        self.refresh()
+        guard_write(
+            lambda: self.service.toggle_day_lock(self.app.ym, d, session),
+            title="切換鎖定", parent=self)
+        self.refresh()          # 失敗也重畫:讓畫面回到磁碟上的真實內容
 
     def _on_toggle_lock(self) -> None:
         if self._finalized:
@@ -474,7 +477,9 @@ class DayScheduleTab(ttk.Frame):
         val = _prompt_codes(self, "當月 PGY 人員（代號，頓號/逗號分隔）", "、".join(cur))
         if val is None:
             return
-        self.service.set_pgy_month_roster(self.app.ym, _split_codes(val))
+        guard_write(lambda: self.service.set_pgy_month_roster(
+            self.app.ym, _split_codes(val)),
+            title="當月 PGY 人員", parent=self)
         self.refresh()
 
     def _edit_apply_pref(self) -> None:
@@ -1000,6 +1005,11 @@ class _DayEditDialog(tk.Toplevel):
         # [RS-06] 一次覆寫整個時段（單次 load/save/git commit），取代逐格 set_day_slot。
         slots = {slot: _split_codes(ent.get())
                  for slot, ent in self._entries.items()}
-        self.service.set_day_session(self.ym, self.d, self.session, slots)
+        # 失敗不關窗——關掉等於告訴使用者「存好了」,而他其實可以重試或按取消。
+        if not guard_write(
+                lambda: self.service.set_day_session(
+                    self.ym, self.d, self.session, slots),
+                title="手動編輯", parent=self):
+            return
         self.destroy()
         self.on_done()
