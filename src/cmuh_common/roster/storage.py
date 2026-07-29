@@ -35,9 +35,24 @@ class NewerSchemaError(RuntimeError):
 
 
 def _load_json(path: str) -> dict:
-    """壞檔/缺檔回 {}（呼叫端補預設），絕不拋例外中斷 UI。"""
+    """壞檔/缺檔回 {}（呼叫端補預設），絕不拋例外中斷 UI。
+
+    ★[2026-08-02 補審] 一律用 utf-8-sig 讀★ 本模組的三個讀取點（本函式、
+    `_guard_overwrite`、`assert_readable`）必須用【同一套解析規則】，否則會出現
+    「守門說沒事、讀取卻回空」的縫 —— 而那正是把好資料寫成空白的那條路徑：
+    帶 BOM 的檔在 utf-8 下 `json.load` 直接 JSONDecodeError（Python 的訊息本身
+    就寫著 "Unexpected UTF-8 BOM (decode using utf-8-sig)"）→ 被下面的
+    `except Exception` 吞成 {}；而 `_guard_overwrite` 用 utf-8-sig 讀得動 →
+    放行覆寫、也不留 `.corrupt-` 備份。週色/年度假日表/門診模板/Clerk 梯次/
+    切片格網都沒有 `_snapshot`，一次存檔就永久消失。
+    這個教訓 `cmuh_common/atomic_io.py` 的 [IF-02] 已經學過（「容忍記事本另存
+    UTF-8 時加的 BOM；對無 BOM 的純 utf-8 行為完全一致，向後相容、無副作用」），
+    當時修了 atomic_io 與 `_guard_overwrite`，卻漏掉每一次讀取都會經過的這裡。
+    BOM 的來源：多機 git 衝突是設計內流程（使用者會手動修 JSON），而 PowerShell
+    的 `>` / `Out-File` 預設就寫出 UTF-8 with BOM。
+    """
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except FileNotFoundError:
@@ -60,8 +75,32 @@ class RosterStorage:
     def _month_path(self, ym: str) -> str:
         return os.path.join(self.months_dir, f"{ym}.json")
 
-    def _check_schema(self, data: dict, path: str) -> dict:
-        ver = int(data.get("schema_version", SCHEMA_VERSION) or SCHEMA_VERSION)
+    def _check_schema(self, data: dict, path: str, *,
+                      for_write: bool = False) -> dict:
+        """版本守門。**讀寬鬆、寫 fail-closed**（兩者不可混為一談）。
+
+        ★[2026-08-02 補審] 版本欄位看不懂時，讀與寫要走不同分支★
+        外部工具/人工合併可能留下 "v3" 之類的值，`int()` 會拋一個訊息毫無幫助的
+        ValueError，而本函式在【每一個】`load_*` 的路徑上 —— UI 端 Tk callback 的
+        例外只會進 log，使用者只會看到分頁沒重畫、連設定頁都打不開。
+        但反過來把寫入也一併放行就更糟（我第一版就是這樣，外審抓到）：那等於
+        拿掉降級保護——較新版本寫的檔會被靜默改寫成本版 schema、丟掉本程式不認得
+        的欄位，而 `_guard_overwrite` 只驗 JSON 結構，擋不住這件事。
+        故：讀 → 記一筆 warning 後放行；寫 → 中止，要求先處理該檔。
+        """
+        raw = data.get("schema_version", SCHEMA_VERSION)
+        try:
+            ver = int(raw or SCHEMA_VERSION)
+        except (TypeError, ValueError):
+            if for_write:
+                raise ValueError(
+                    f"{os.path.basename(path)} 的 schema_version 無法解讀"
+                    f"（{raw!r}），無法判斷是否為較新版本寫的檔；為避免降級覆寫"
+                    f"已中止存檔，請先手動處理該檔。") from None
+            logging.warning("[roster.storage] %s 的 schema_version 無法解讀（%r），"
+                            "讀取時視為本版（寫入會被擋下）",
+                            os.path.basename(path), raw)
+            return data
         if ver > SCHEMA_VERSION:
             raise NewerSchemaError(
                 f"{os.path.basename(path)} schema v{ver} 比本程式(v{SCHEMA_VERSION})新，"
@@ -150,12 +189,14 @@ class RosterStorage:
     def save_config(self, cfg: dict) -> None:
         # [2026-07-25 審查] config.json 是唯一沒有快照保護的存檔路徑（ledger/biopsy/
         # 月檔都有 _snapshot）——而它存的是全部成員名單，誤刪最痛。補上快照。
-        self._check_schema(_load_json(self._path("config.json")), "config.json")
+        self._check_schema(_load_json(self._path("config.json")), "config.json",
+                           for_write=True)
         self._snapshot(self._path("config.json"))
         self._save(self._path("config.json"), cfg)
 
     def load_ledger(self) -> dict:
-        d = self._check_schema(_load_json(self._path("ledger.json")), "ledger.json")
+        d = self._check_schema(_load_json(self._path("ledger.json")),
+                               "ledger.json")
         d.setdefault("r", {})
         d.setdefault("vs", {})
         d.setdefault("history", [])
@@ -163,7 +204,8 @@ class RosterStorage:
 
     def save_ledger(self, ledger: dict) -> None:
         # [codex P2] 寫前檢查既有檔 schema：防舊版程式把新版檔靜默降級毀損
-        self._check_schema(_load_json(self._path("ledger.json")), "ledger.json")
+        self._check_schema(_load_json(self._path("ledger.json")), "ledger.json",
+                           for_write=True)
         # [RP3-10a] 比照 save_month 先留 .bak 快照——ledger.json 記結算/欠點,
         # 遭誤寫時可回溯(誤結算/rollback 後才發現時救得回來)。
         self._snapshot(self._path("ledger.json"))
@@ -179,7 +221,8 @@ class RosterStorage:
 
     def save_biopsy(self, book: dict) -> None:
         # 比照 save_ledger：寫前 schema 檢查 + .bak 快照（計數帳本可回溯）
-        self._check_schema(_load_json(self._path("biopsy.json")), "biopsy.json")
+        self._check_schema(_load_json(self._path("biopsy.json")), "biopsy.json",
+                           for_write=True)
         self._snapshot(self._path("biopsy.json"))
         self._save(self._path("biopsy.json"), book)
 
@@ -197,7 +240,7 @@ class RosterStorage:
         replace=True：以 weeks 整組取代（UI 手動清除某週色時用，需傳完整集合）。
         """
         cur = _load_json(self._path("week_colors.json"))
-        self._check_schema(cur, "week_colors.json")   # [codex P2] 防降級毀損
+        self._check_schema(cur, "week_colors.json", for_write=True)
         merged = dict(weeks) if replace else {**(cur.get("weeks") or {}), **weeks}
         self._save(self._path("week_colors.json"),
                    {"year": year, "weeks": merged, "source": source})
@@ -217,7 +260,7 @@ class RosterStorage:
 
     def save_holiday_duty(self, table: dict) -> None:
         self._check_schema(_load_json(self._path("holiday_duty.json")),
-                           "holiday_duty.json")       # [codex P2] 防降級毀損
+                           "holiday_duty.json", for_write=True)       # [codex P2] 防降級毀損
         raw = {"r": {}, "vs": {}}
         for scope in ("r", "vs"):
             for d, mid in (table.get(scope) or {}).items():
@@ -240,7 +283,7 @@ class RosterStorage:
 
     def save_clinic_template(self, data: dict) -> None:
         self._check_schema(_load_json(self._path("clinic_template.json")),
-                           "clinic_template.json")
+                           "clinic_template.json", for_write=True)
         self._save(self._path("clinic_template.json"), data)
 
     def load_clerk_batches(self) -> list:
@@ -254,7 +297,7 @@ class RosterStorage:
 
     def save_clerk_batches(self, batches: list) -> None:
         self._check_schema(_load_json(self._path("clerk_batches.json")),
-                           "clerk_batches.json")
+                           "clerk_batches.json", for_write=True)
         self._save(self._path("clerk_batches.json"), {"batches": list(batches)})
 
     def load_biopsy_grid(self) -> dict:
@@ -265,7 +308,7 @@ class RosterStorage:
 
     def save_biopsy_grid(self, grid: dict) -> None:
         self._check_schema(_load_json(self._path("biopsy_grid.json")),
-                           "biopsy_grid.json")
+                           "biopsy_grid.json", for_write=True)
         self._save(self._path("biopsy_grid.json"), {"grid": grid})
 
     # ── 月份檔 ───────────────────────────────────────────────────────────
@@ -291,7 +334,7 @@ class RosterStorage:
     def save_month(self, ym: str, data: dict, force: bool = False) -> None:
         path = self._month_path(ym)
         existing = _load_json(path)
-        self._check_schema(existing, f"{ym}.json")
+        self._check_schema(existing, f"{ym}.json", for_write=True)
         if existing.get("finalized") and not force:
             raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能修改")
         self._snapshot(path)
@@ -322,7 +365,7 @@ class RosterStorage:
         if not os.path.exists(path):
             return
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:   # 與 _load_json 同規則
                 data = json.load(f)
         except (OSError, ValueError) as e:
             raise ValueError(
