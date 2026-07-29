@@ -321,3 +321,94 @@ def test_rp3_13_pull_timeout_degrades_offline(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "_git", boom)
     st._pull()
     assert st.sync_state == "offline"
+
+
+# ─── [2026-08-02 review] 推前同步拉進他機變更也必須通知 UI ──────────────────
+def test_push_time_sync_notifies_remote_change(tmp_path):
+    """★核心★ B 存檔 → 去抖 push 前會先同步,若因此拉進 A 的修改,
+    B 的畫面必須被通知重繪。
+
+    RF-01 的修法只在【週期性 pull】那條路徑呼叫 on_remote_change。漏掉這裡的後果
+    不是「晚一點才更新」而是【永久看不到】—— 週期 pull 是比對 HEAD 前後有沒有變,
+    而推前同步已經合併過了 → 下一輪週期 pull 是 no-op → 通知永遠不會發出。
+    """
+    _remote, a, b = _two_clones(tmp_path)
+    st_a = GitSyncStorage(str(a), pull_interval_sec=0)
+    notified = []
+    st_b = GitSyncStorage(str(b), pull_interval_sec=0,
+                          on_remote_change=lambda: notified.append(1))
+    # A 先改並推上去
+    st_a.save_month("2026-08", {"r_duty": {"2026-08-01": {"person": "A"}}})
+    st_a.flush()
+    assert notified == [], "B 還沒動作,不該有通知"
+    # B 改【別的檔】並推 → 推前同步會 ff-only 或 rebase 把 A 的變更拉進來
+    st_b.save_config({"r_members": [{"id": "B"}]})
+    st_b._push()
+    assert st_b.load_month("2026-08")["r_duty"] == {"2026-08-01": {"person": "A"}}, \
+        "B 的盤上確實已經有 A 的資料"
+    assert notified == [1], "★盤上變了就必須通知 UI,否則使用者對著舊資料繼續編輯★"
+
+
+def test_push_without_remote_change_does_not_notify(tmp_path):
+    """★不可矯枉過正★ 只有自己的變更被推出去時,不該叫 UI 重繪。"""
+    _remote, a, b = _two_clones(tmp_path)
+    notified = []
+    st_b = GitSyncStorage(str(b), pull_interval_sec=0,
+                          on_remote_change=lambda: notified.append(1))
+    st_b.save_config({"r_members": [{"id": "B"}]})
+    st_b._push()
+    assert notified == [], "本機自己的 commit 不是『他機變更』"
+
+
+def test_flush_does_not_notify(tmp_path):
+    """關閉前的 flush 不通知 —— mainloop 即將結束,通知只會撞 TclError。"""
+    _remote, a, b = _two_clones(tmp_path)
+    st_a = GitSyncStorage(str(a), pull_interval_sec=0)
+    notified = []
+    st_b = GitSyncStorage(str(b), pull_interval_sec=0,
+                          on_remote_change=lambda: notified.append(1))
+    st_a.save_month("2026-08", {"r_duty": {"2026-08-01": {"person": "A"}}})
+    st_a.flush()
+    st_b.save_config({"r_members": [{"id": "B"}]})
+    st_b.flush()
+    assert notified == [], "flush 路徑不通知"
+    assert st_b.load_month("2026-08")["r_duty"] == {"2026-08-01": {"person": "A"}}, \
+        "但資料仍要正確合併進來"
+
+
+def test_notification_happens_outside_the_git_lock():
+    """callback 會 marshal 回 UI 緒;持著 git 鎖呼叫會讓主緒存檔白等 3 秒。
+    持鎖的本體抽成 _push_locked_body(),通知放在 _push 的 finally 裡。"""
+    import inspect
+    src = inspect.getsource(GitSyncStorage._push)
+    assert "with self._git_lock" not in src, "持鎖本體已抽出去"
+    assert "self._push_locked_body()" in src
+    assert "self._on_remote_change()" in src
+    assert "finally:" in src, "通知要在 finally,才不會被早退的 return 跳過"
+
+
+def test_notification_survives_a_push_failure(tmp_path, monkeypatch):
+    """★[2026-08-02 補審] 同一機制深一層★ 合併成功但接著 push 失敗(離線)時,
+    他機的資料【已經在盤上】而早退的 return 會跳過通知;週期 pull 之後也是 no-op
+    → 永遠不通知 → 使用者繼續對著舊畫面編輯並覆蓋掉剛拉進來的變更。"""
+    _remote, a, b = _two_clones(tmp_path)
+    st_a = GitSyncStorage(str(a), pull_interval_sec=0)
+    notified = []
+    st_b = GitSyncStorage(str(b), pull_interval_sec=0,
+                          on_remote_change=lambda: notified.append(1))
+    st_a.save_month("2026-08", {"r_duty": {"2026-08-01": {"person": "A"}}})
+    st_a.flush()
+    st_b.save_config({"r_members": [{"id": "B"}]})
+
+    real_git = st_b._git
+
+    def _fail_push(*args, **kw):
+        if args and args[0] == "push":
+            raise OSError("模擬:fetch/merge 之後才斷線")
+        return real_git(*args, **kw)
+
+    monkeypatch.setattr(st_b, "_git", _fail_push)
+    st_b._push()
+    assert st_b.load_month("2026-08")["r_duty"] == {"2026-08-01": {"person": "A"}}, \
+        "前提:合併確實已經發生,資料在盤上"
+    assert notified == [1], "★push 失敗不影響『盤上變了要通知』★"

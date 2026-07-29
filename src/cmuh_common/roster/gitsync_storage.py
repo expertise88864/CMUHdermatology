@@ -268,8 +268,50 @@ class GitSyncStorage(RosterStorage):
             self._push_timer.daemon = True
             self._push_timer.start()
 
-    def _push(self) -> None:
-        """推前先同步（fetch + ff-only；分歧試 rebase）再 push。全程持 _git_lock。"""
+    def _push(self, *, notify_remote_change: bool = True) -> None:
+        """推前先同步（fetch + ff-only；分歧試 rebase）再 push。全程持 _git_lock。
+
+        ★[2026-08-02 review] 推前同步若真的拉進他機的變更,必須通知 UI★
+        RF-01 的修法只在【週期性 pull】那條路徑呼叫 on_remote_change,但推前同步
+        (ff-only merge 或 rebase)同樣會改變盤上的資料。漏掉通知的後果不是「晚一點
+        才更新」而是【永久看不到】:週期 pull 是比對 HEAD 前後有沒有變,而這裡已經
+        合併過了 → 下一輪週期 pull 是 no-op → 那次變更的通知永遠不會發出。
+        實際情境:B 機 14:00 存檔 → 3 秒後去抖 push → 推前同步把 A 機 13:50 的修改
+        合併進來 → push 成功 → **B 的畫面仍是合併前的內容**,而且再也不會自己更新。
+        使用者於是對著舊資料繼續改班 —— 正是 RF-01 要消除的那個失效模式,
+        從 RF-01 自己新增的這條路徑漏出來。
+
+        notify_remote_change:關閉前的 flush() 傳 False —— 那時 mainloop 即將結束,
+        通知只會撞上 TclError,沒有意義。
+        """
+        changed = False
+        try:
+            changed = self._push_locked_body()
+        finally:
+            # ★[2026-08-02 補審] 通知必須無條件送出★
+            #   合併成功但接著 push 失敗(離線)時,早退的 return 會跳過通知 ——
+            #   而他機的資料【已經在盤上】,週期 pull 之後也是 no-op,
+            #   於是永遠不通知。使用者繼續對著舊畫面編輯並覆蓋掉剛拉進來的變更。
+            #   這與本次修的原始 finding 是同一個機制,只是深一層。
+            # ★[2026-08-02 補審] 用回傳值,不可存在實例上★
+            #   去抖 timer 與 flush() 可能同時跑(RF-06 就是這件事);
+            #   _git_lock 在讀旗標之前就已釋放,第二個 push 會把旗標覆寫掉,
+            #   第一個的通知就此消失 —— 又回到那個「永遠看不到」的缺陷。
+            if (changed and notify_remote_change
+                    and self._on_remote_change is not None):
+                logging.info("[roster.gitsync] 推前同步拉進他機變更 → 通知 UI 重繪")
+                try:
+                    self._on_remote_change()
+                except Exception:
+                    logging.debug("[roster.gitsync] on_remote_change callback 失敗",
+                                  exc_info=True)
+
+    def _push_locked_body(self) -> bool:
+        """_push 的實作本體(持鎖)。回傳「推前同步是否拉進了他機的變更」。
+
+        抽出來有兩個理由:讓通知能放在 _push 的 finally 裡(不必在每一個 return 前
+        重複一次),以及讓那個旗標是【每次呼叫各自的區域值】而不是實例狀態。"""
+        changed = False
         with self._git_lock:
             # 先補收：_save 因鎖逾時略過 commit 時只排了 push，這裡（鎖已空出）把那筆
             # 已寫盤但未 commit 的變更補 commit 進來，避免「存檔成功卻遲遲沒推、他機看到
@@ -278,22 +320,25 @@ class GitSyncStorage(RosterStorage):
             remote = self._remote_name()
             if not remote:
                 logging.info("[roster.gitsync] 尚未設定 remote，略過 push")
-                return
+                return changed
             branch = self._current_branch()
             if not branch:
                 self._set_state("error", "detached HEAD，無法同步")
-                return
+                return changed
             # 先確認遠端是否已有此分支：不存在＝首推（無需 fetch，直接 push 建立）；
             # ls-remote 失敗＝連不到遠端（離線）。
             ls = self._git("ls-remote", "--heads", remote, branch)
             if ls.returncode != 0:
                 self._set_state("offline", (ls.stderr or ls.stdout).strip())
-                return
+                return False
             if (ls.stdout or "").strip():
+                # 在 fetch/merge/rebase 【之前】取 HEAD —— 要放在上面的
+                # _commit("背景補收") 之後,否則本機自己的 commit 會被誤判成他機變更。
+                before = self._rev_parse("HEAD")
                 f = self._git("fetch", remote, branch)
                 if f.returncode != 0:
                     self._set_state("offline", (f.stderr or f.stdout).strip())
-                    return
+                    return False
                 m = self._git("merge", "--ff-only", "FETCH_HEAD")
                 if m.returncode != 0:
                     # 分歧：先試 rebase（兩台改不同檔可自動復原）
@@ -301,23 +346,25 @@ class GitSyncStorage(RosterStorage):
                     if rb.returncode != 0:
                         self._git("rebase", "--abort")   # 同檔衝突 → 交人工
                         self._set_state("diverged", (rb.stderr or rb.stdout).strip())
-                        return
+                        return False
+                after = self._rev_parse("HEAD")
+                changed = bool(before and after and before != after)
             try:
                 p = self._git("push", remote, "HEAD")
             except (OSError, subprocess.SubprocessError) as e:
                 logging.warning(
                     "[roster.gitsync] push 執行失敗（略過，下次存檔再推）：%s", e)
                 self._set_state("offline", str(e))
-                return
+                return changed
             if p.returncode != 0:
                 detail = (p.stderr or p.stdout).strip()
                 logging.warning(
                     "[roster.gitsync] push 未成功（可能離線/遠端較新需先 pull）：%s",
                     detail)
                 self._set_state("offline", detail)
-                return
+                return changed
             self._set_state("ok")
-
+            return changed
     def flush(self) -> None:
         """立即推送（取消去抖、同步 push）；關閉程式前呼叫確保不漏推。
 
@@ -332,4 +379,4 @@ class GitSyncStorage(RosterStorage):
                 self._push_timer = None
         with self._git_lock:
             self._commit("關閉前同步")           # 補收未 commit 的變更
-            self._push()
+            self._push(notify_remote_change=False)   # mainloop 即將結束,通知無意義
