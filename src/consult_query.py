@@ -3317,6 +3317,7 @@ def _send_dedup_notice_async(senders) -> None:
                       f"本次觸發已略過（避免重複查詢）。\n\n"
                       f"如需最新清單，請於上次查詢約 {mins} 分鐘後再寄一次觸發信。"),
                 attachment_path=None,
+                category="system",      # [P2-02] 重複觸發提醒不可吃掰臨床告警額度
             )
             logging.info("[dedup] 已回告知信(重複觸發已略過)：%s",
                          ", ".join(to_notify))
@@ -3386,6 +3387,7 @@ def _note_job_failure(recipients, reason: str) -> None:
                       "（本信只寄給開發者；臨床同仁不會收到，需要時請自行轉知。）\n"
                       "（恢復正常後不會再寄；同一波故障最多 6 小時提醒一次。）"),
                 attachment_path=None,
+                category="system",      # [P2-02] 連續失敗告警走系統額度
             )
             logging.info("[health] 已寄出連續失敗告警(%d 次)", streak)
         except Exception:
@@ -3412,6 +3414,7 @@ def _send_failure_notice_async(recipients, reason: str) -> None:
                       "已解除重查限制，您可立即重寄一封觸發信再試；"
                       "若持續失敗請通知管理者查看 settings/consult_query.log。"),
                 attachment_path=None,
+                category="system",      # [P2-02] 故障通知走系統額度
             )
             logging.info("[notify] 已寄失敗通知給觸發者：%s",
                          ", ".join(str(r) for r in recipients))
@@ -4056,6 +4059,7 @@ def _send_test_email() -> None:
                       f"（寄件人：{load_credentials()['from_address']}, "
                       f"方式：SMTP / smtp.gmail.com）"),
                 attachment_path=None,
+                category="system",      # [P2-02] 測試信走系統額度
             )
             _notify("測試寄信成功", f"已寄給 {recipients[0]}（SMTP）")
         except SmtpNotConfiguredError as e:

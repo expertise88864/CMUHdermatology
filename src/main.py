@@ -1732,7 +1732,7 @@ def audit_health_check(notify: bool = True) -> dict:
                 f"層級:{snap['level']}(error=帳本無法證明完整/偵測性控制已失效;"
                 f"warn=帳本完整但本次執行有動作沒被記到)\n"
                 f"(同一問題此信只寄一次;詳見 log 與 settings/{_LEDGER_FILENAME})",
-                recipients))
+                recipients, category="system"))
 
         _AUDIT_HEALTH_ALERTS.send_once(snap["summary"], _send)
     except Exception:
@@ -2306,7 +2306,8 @@ def _notify_his_drift(verdict) -> None:
     def _bg() -> None:
         ok = False
         try:
-            ok = bool(_send_alert_email_via_smtp(subject, body, list(recipients)))
+            ok = bool(_send_alert_email_via_smtp(subject, body, list(recipients),
+                                                category="system"))
         except Exception:
             logging.debug("[金絲雀] 改版通知寄信失敗(不影響操作),稍後重試", exc_info=True)
         finally:
@@ -9485,7 +9486,8 @@ def _warn_alert_has_no_recipients(where: str, *,
 
 
 def _send_alert_email_via_smtp(subject: str, body: str,
-                                recipients: list, timeout: float = 60.0) -> bool:
+                                recipients: list, timeout: float = 60.0,
+                                category: "str | None" = None) -> bool:
     """達到門檻時透過 SMTP (Gmail) 寄信。回傳是否成功（失敗只 log，不影響主程式）。
 
     為何用 SMTP 不用 Outlook：admin 行程的 Outlook COM 會起一個 admin Outlook
@@ -9503,8 +9505,11 @@ def _send_alert_email_via_smtp(subject: str, body: str,
         logging.warning("smtp_mail 模組載入失敗，止掛信跳過", exc_info=True)
         return False
     try:
+        # [2026-07-30 外審 P2-02] category 決定吃哪一份寄信配額。不傳＝臨床
+        # （止掛提醒是這個 helper 的主要用途）；系統／除錯類的呼叫端自己標明。
+        kw = {"category": category} if category else {}
         refused = send_mail(recipients=recipients, subject=subject, body=body,
-                            attachment_path=None, timeout=timeout) or {}
+                            attachment_path=None, timeout=timeout, **kw) or {}
         if refused:
             # [2026-07-26 外審] send_mail 的回傳值【不可】丟掉:部分收件人被拒時
             # smtplib 是正常返回的,舊版一律回 True → 呼叫端把這則告警記成「已寄出」

@@ -33,7 +33,6 @@ import logging
 import smtplib
 import socket
 import ssl
-import time
 from email.mime.application import MIMEApplication
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
@@ -48,20 +47,27 @@ from cmuh_common.atomic_io import atomic_write_json, safe_load_json_ex
 CREDENTIALS_FILE = Path(get_settings_dir()) / "smtp_credentials.json"
 
 # [C] Rate limit：保護機制防 bug 觸發無窮迴圈狂寄信
-# 用 deque 追蹤過去 60 分鐘內每封信的時間戳；超過 RATE_LIMIT_MAX 就拒絕
-import collections as _collections
-import threading as _threading
-RATE_LIMIT_WINDOW_SEC = 3600   # 統計區間 1 小時
-RATE_LIMIT_MAX = 30            # 1 小時內最多 30 封
+#
+# ★[2026-07-30 第二輪外審 P2-02]★ 判斷與計數已整批搬到 cmuh_common/mail_quota.py。
+# 原本是這個模組裡的一個 deque + threading.Lock —— 只鎖得住同一個 process 的
+# thread，但 main / autoclock / consult_query / watchdog / scheduler 是五支獨立
+# 程式共用同一個 Gmail 帳號，各自以為自己有 30 封／小時。詳細取捨見該模組 docstring。
+from cmuh_common import mail_quota as _quota
+
+RATE_LIMIT_WINDOW_SEC = _quota.WINDOW_SEC   # 統計區間 1 小時
+RATE_LIMIT_MAX = _quota.TOTAL_MAX           # 1 小時內最多 30 封（跨行程合計）
 DEFAULT_MAX_RETRIES = 2
 MAX_RETRIES = 5
-_rate_limit_lock = _threading.Lock()
-_recent_send_reservations: "_collections.deque" = _collections.deque(
-    maxlen=RATE_LIMIT_MAX * 4)
 
+# 對外沿用舊名（外部 except 這個名字的地方不必改）；實體是同一個類別。
+SmtpRateLimitExceeded = _quota.MailQuotaExceeded
 
-class SmtpRateLimitExceeded(RuntimeError):
-    """寄信頻率超過 RATE_LIMIT_MAX/小時的保護性錯誤。"""
+CATEGORY_CLINICAL = _quota.CATEGORY_CLINICAL
+CATEGORY_SYSTEM = _quota.CATEGORY_SYSTEM
+
+# 行程內那層的 deque 本體（降級時唯一生效的一層）。指向 mail_quota 的同一個物件，
+# 測試沿用 `smtp_mail._recent_send_reservations` 觀察行程內狀態仍然有效。
+_recent_send_reservations = _quota._recent
 
 
 def _normalize_max_retries(value) -> int:
@@ -75,33 +81,23 @@ def _normalize_max_retries(value) -> int:
     return max(0, min(MAX_RETRIES, retries))
 
 
-def _reserve_rate_limit_slot() -> tuple[float, object]:
+def _smtp_account(cred: dict) -> str:
+    """配額鑰匙用的帳號。
+
+    用 `username`（＝真正向 Gmail 認證、真正有寄送額度的那個帳號）而不是
+    `from_address`：兩者可以不同（別名寄件），而額度綁在認證帳號上。
+    """
+    return str(cred.get("username") or cred.get("from_address") or "?")
+
+
+def _reserve_rate_limit_slot(cred: "Optional[dict]" = None,
+                             category: str = CATEGORY_CLINICAL):
     """Reserve one logical send slot. Roll it back if delivery fails."""
-    now = time.time()
-    cutoff = now - RATE_LIMIT_WINDOW_SEC
-    with _rate_limit_lock:
-        # 清掉視窗外的舊紀錄
-        while (_recent_send_reservations
-               and _recent_send_reservations[0][0] < cutoff):
-            _recent_send_reservations.popleft()
-        if len(_recent_send_reservations) >= RATE_LIMIT_MAX:
-            oldest_ago = now - _recent_send_reservations[0][0]
-            raise SmtpRateLimitExceeded(
-                f"SMTP rate limit：過去 {RATE_LIMIT_WINDOW_SEC // 60} 分鐘已寄 "
-                f"{len(_recent_send_reservations)} 封 (上限 {RATE_LIMIT_MAX})，"
-                f"請 {int((RATE_LIMIT_WINDOW_SEC - oldest_ago) // 60)} 分鐘後再試"
-            )
-        reservation = (now, object())
-        _recent_send_reservations.append(reservation)
-        return reservation
+    return _quota.reserve(account=_smtp_account(cred or {}), category=category)
 
 
-def _rollback_rate_limit_slot(reservation: tuple[float, object]) -> None:
-    with _rate_limit_lock:
-        try:
-            _recent_send_reservations.remove(reservation)
-        except ValueError:
-            pass
+def _rollback_rate_limit_slot(reservation) -> None:
+    _quota.release(reservation)
 
 DEFAULT_CREDENTIALS = {
     "host": "smtp.gmail.com",
@@ -320,7 +316,8 @@ def send_mail(recipients: list, subject: str, body: str,
               timeout: float = 60.0,
               override_credentials: Optional[dict] = None,
               max_retries: int = DEFAULT_MAX_RETRIES,
-              html_body: Optional[str] = None) -> dict:
+              html_body: Optional[str] = None,
+              category: str = CATEGORY_CLINICAL) -> dict:
     """同步寄一封信。失敗 raise；成功 log info。
 
     回傳【被拒收件人】的 dict(空 dict = 全部送達)。[2026-07-26 審查]
@@ -334,6 +331,15 @@ def send_mail(recipients: list, subject: str, body: str,
                   跑 3 次)。認證錯誤這類「不會自己好」的不會重試。
 
     Retry strategy：exponential backoff 2s → 4s → 8s → 10s (上限)。
+
+    category: 寄信配額類別（見 cmuh_common/mail_quota.py）。
+      `CATEGORY_CLINICAL`（預設）＝關於病人的信（止掛提醒、會診結果、回讀不符），
+      可用到帳號總額；`CATEGORY_SYSTEM` ＝關於程式的信（故障告警、健康檢查、
+      改版偵測、重複觸發提醒、測試信），額度較小，因此系統類就算陷入迴圈狂寄，
+      臨床告警仍有保留名額。
+      ★預設值刻意是 clinical★：漏標一個系統類呼叫端，後果是「系統信吃到臨床的
+      額度」（跟修好之前一樣）；反之若預設 system，漏標一個臨床呼叫端就會讓
+      【臨床告警在保留名額還空著的情況下被拒寄】—— 那是更糟的失敗方向。
     """
     if not recipients:
         raise RuntimeError("沒有設定收件人")
@@ -356,7 +362,7 @@ def send_mail(recipients: list, subject: str, body: str,
         html_body=html_body,
     )
     max_retries = _normalize_max_retries(max_retries)
-    reservation = _reserve_rate_limit_slot()
+    reservation = _reserve_rate_limit_slot(cred, category)
 
     import time as _time
     refused: dict = {}
