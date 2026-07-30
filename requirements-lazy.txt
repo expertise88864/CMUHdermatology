@@ -1,0 +1,24 @@
+# CMUH dermatology automation - LAZY runtime dependencies
+#
+# *** ASCII ONLY *** (same reason as requirements.txt - see that file's header)
+#
+# These are NOT in requirements.txt on purpose: they are heavy and only a subset
+# of users ever needs them, so the app installs them on demand
+# (cmuh_common.deps_runtime.ensure_dependencies) the first time the feature runs.
+#
+# But "installed on demand" still means "installed on the clinic machine", so
+# for security purposes they are production dependencies and MUST be scanned.
+# Before 2026-07-30 the security workflow only installed requirements.txt, so a
+# vulnerability in any of these would have gone unnoticed (external review P2-07).
+#
+# Declaration sites (keep in sync - tests/test_ci_gates_2026_07_30.py checks):
+#   ortools       src/cmuh_common/roster/ui/duty.py  (_ORTOOLS_DEP)
+#                 version pinned by roster/__init__.py ORTOOLS_PINNED_VERSION
+#   openpyxl      roster/ui/duty.py, roster/ui/day_tab.py  (.xlsx export)
+#   python-docx   roster/ui/duty.py, roster/ui/day_tab.py  (.docx export)
+#   reportlab     roster/ui/common.py                      (PDF export)
+
+ortools==9.15.6755
+openpyxl
+python-docx
+reportlab

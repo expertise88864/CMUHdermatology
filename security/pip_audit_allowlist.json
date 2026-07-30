@@ -1,0 +1,24 @@
+{
+  "//": "[2026-07-30 外審 P2-07] pip-audit 的例外清單 —— 見 scripts/audit_deps.py。",
+  "//1": "★每一筆被略過的都會被印出來★：安靜地濾掉 CVE 的掃描器比沒有掃描器更糟。",
+  "//dev": "dev_only_packages：CI/開發環境才有、不隨程式出貨的工具。",
+  "//dev1": "判準是【會不會進到診間那台電腦】，不是【好不好修】。",
+  "dev_only_packages": {
+    "pip": "CI 與開發機的套件管理器，不出貨",
+    "setuptools": "建置工具，不出貨",
+    "wheel": "建置工具，不出貨",
+    "pytest": "測試框架，不出貨",
+    "pytest-cov": "測試框架，不出貨",
+    "coverage": "測試框架，不出貨",
+    "ruff": "linter，不出貨",
+    "pyright": "型別檢查，不出貨",
+    "pip-audit": "本掃描器自己，不出貨",
+    "pip-api": "pip-audit 的相依，不出貨",
+    "pip-requirements-parser": "pip-audit 的相依，不出貨",
+    "cyclonedx-python-lib": "pip-audit 的相依，不出貨"
+  },
+  "//acc": "accepted_vulns：明確接受的個別弱點。★每一筆都要寫【理由】與【複查日期】★",
+  "//acc1": "空的就是最好的狀態。要加東西進來之前先問：真的不能升級嗎？",
+  "accepted_vulns": {},
+  "//dev2": "★只能放【不會裝到診間電腦上】的東西★：transitive 相依（例如 webdriver-manager 帶的 python-dotenv、ortools 帶的 protobuf）也是 production 相依 —— 把它們放進來等於把它們現在與未來的所有弱點永久靜音。（2026-07-30 外審第 1 輪抳回）"
+}

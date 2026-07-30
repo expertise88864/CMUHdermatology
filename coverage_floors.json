@@ -1,0 +1,9 @@
+{
+  "//": "[2026-07-30 外審 P2-07] 分層覆蓋率門檻 —— 見 scripts/check_coverage.py。",
+  "//1": "設在【目前值減 1 個百分點】：這是防退步的欄杆，不是追求的目標。",
+  "//2": "shared = cmuh_common/(含 roster);entrypoints = main/consult_query/autoclock/…",
+  "//3": "覆蓋率提升之後請跑 --update 把欄杆跟著提上來,否則漲上去的可以被無聲吃回去。",
+  "shared": 72.7,
+  "entrypoints": 22.5,
+  "total": 48.0
+}

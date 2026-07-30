@@ -1,24 +1,30 @@
 {
-  "include": ["src"],
-  "exclude": ["**/__pycache__", "**/node_modules", "build", "dist", "python_embed", ".wdm"],
+  "include": [
+    "src"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    "**/node_modules",
+    "build",
+    "dist",
+    "python_embed",
+    ".wdm"
+  ],
   "typeCheckingMode": "basic",
-
   "reportMissingModuleSource": "none",
   "reportMissingImports": "warning",
-
   "reportAttributeAccessIssue": "none",
   "reportArgumentType": "none",
   "reportOptionalMemberAccess": "none",
   "reportOptionalSubscript": "none",
   "reportOptionalOperand": "none",
-  "reportOptionalIterable": "none",
+  "reportOptionalIterable": "error",
   "reportIndexIssue": "none",
   "reportOperatorIssue": "none",
   "reportAssignmentType": "none",
   "reportReturnType": "none",
   "reportCallIssue": "none",
   "reportGeneralTypeIssues": "none",
-  "reportRedeclaration": "none",
-
+  "reportRedeclaration": "error",
   "reportPossiblyUnboundVariable": "warning"
 }

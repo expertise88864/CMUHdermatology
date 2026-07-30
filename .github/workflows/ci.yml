@@ -3,6 +3,10 @@ name: CI
 # 在 push 到 main 與所有 PR 時跑;也可手動觸發。
 # 用 windows-latest:本專案依賴 pywin32 / pyautogui / keyboard / pystray 等
 # Windows-only 套件,測試會 import 到它們,必須在 Windows 上跑。
+#
+# ★這個 workflow 只回答「這次的改動對不對」★
+# 相依套件弱點、秘密掃描、CodeQL 在 .github/workflows/security.yml —— 刻意分開,
+# 理由見該檔開頭(那些是「時間到了自己會紅」的東西,不該擋臨床急修)。
 on:
   push:
     branches: [main]
@@ -12,7 +16,7 @@ on:
 jobs:
   test:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30      # 加了覆蓋率與型別債棘輪之後比原本久
 
     steps:
       - name: Checkout
@@ -28,23 +32,50 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install ruff pytest pyright
-          # RF-15：CI 裝 ortools 讓 tests/test_roster_solve.py 的 22 個 solver 測試真的跑
-          # （requirements.txt 維持不含 ortools＝使用者機器 lazy 安裝設計）。
-          # 版本與 src/cmuh_common/roster/__init__.py 的 ORTOOLS_PINNED_VERSION 同步。
-          pip install "ortools==9.15.6755"
-          # [GPT-5.6 P1 2026-07-16] 匯出重依賴：CI 補裝 openpyxl/python-docx/reportlab，
-          # 讓 tests/test_roster_export.py 的 10 項真跑（匯出=每月實際用的功能，原本在 CI
-          # 靜默 skip＝等於沒測）。這三個同屬 lazy 安裝設計，requirements.txt 不含。
-          pip install openpyxl python-docx reportlab
+          pip install ruff pytest pytest-cov pyright
+          # lazy 相依（ortools / openpyxl / python-docx / reportlab）—— 使用者機器是
+          # 用到那個功能時才裝，所以不在 requirements.txt；但 CI 必須裝，否則
+          # 對應測試會【靜默 skip＝等於沒測】。
+          # ★[2026-07-30 外審第 1 輪] 改由共用 manifest 安裝★：舊版把套件名寫死在
+          # 這裡，於是 security workflow 根本沒掃到這四個（它們會裝到診間電腦上，
+          # 是實實在在的 production 相依）。兩邊現在共用 requirements-lazy.txt。
+          pip install -r requirements-lazy.txt
           # 防呆：任一重依賴裝失敗立即紅，避免對應測試退回靜默 skip 而無人察覺
           python -c "import ortools, openpyxl, docx, reportlab"
 
-      - name: Ruff (真 bug 類 lint — F/E9，規則見 ruff.toml)
+      - name: Ruff (真 bug 類 lint — F/E9/B，規則見 ruff.toml)
         run: python -m ruff check src scripts tests
 
       - name: Pyright (型別檢查 — 設定見 pyrightconfig.json)
         run: python -m pyright
 
-      - name: Pytest (全測試 + import 冒煙測試)
-        run: python -m pytest -q -p no:cacheprovider
+      # ★[2026-07-30 外審 P2-07] skip 數量守衛 + 覆蓋率★
+      # 用 `--junitxml`（結構化）而不是抓文字輸出：Windows 上 `tee` 的行為與編碼
+      # 隨 PowerShell 版本而異，抓不到時守衛會【安靜地失效】—— 而它本來就是一道
+      # 防「安靜失效」的關卡。
+      # 這個 repo 踩過兩次「靜默 skip＝等於沒測，而全套仍是綠燈」：
+      #   ① 匯出重依賴沒裝（上面的 import 防呆擋的就是這個）
+      #   ② 多加一個 Tk 測試檔就讓別檔 42 支全變 skip ← 只有數量守衛擋得住
+      - name: Pytest (全測試 + 覆蓋率)
+        run: python -m pytest -q -p no:cacheprovider --junitxml=junit.xml --cov=src --cov-report=json:cov.json --cov-report=term:skip-covered
+
+      - name: skip 數量守衛
+        # always()：測試紅燈時更要知道是不是「一批測試被靜默關掉」造成的
+        if: always()
+        env:
+          # ★[2026-07-30 外審第 1 輪] CI 上預期是【零】★
+          #   預設上限 2 是給本機用的（test_push_helper_antirevert 有兩支在工作區
+          #   有未提交變更時會 skip）。CI 的工作區永遠是乾淨的，所以不能
+          #   沿用那個寬度 —— 不然 CI 上真的有兩支被靜默關掉也不會紅。
+          CMUH_MAX_SKIPPED: "0"
+        run: python scripts/check_skips.py junit.xml
+
+      # 分層設門檻：全域 49% 幾乎完全由 main.py（10,322 行、16%）主導，
+      # 用全域門檻的話共用層掉 10 個百分點也照樣綠燈。
+      - name: 分層覆蓋率門檻 (coverage_floors.json)
+        run: python scripts/check_coverage.py cov.json
+
+      # pyright strict 實測在最乾淨的六個模組上就有 481 個錯 —— 全開只會得到一個
+      # 永遠紅燈因而被忽略的關卡。改成：被關掉的規則各記一個基線，數字變大就紅。
+      - name: 型別債棘輪 (type_debt_baseline.json)
+        run: python scripts/type_debt.py

@@ -37,3 +37,9 @@ debug_dumps/
 .updater_write.lock
 startup_crash.log
 .codex-review/
+
+# [2026-07-30 外審 P2-07] CI 關卡的中間產物（本機跑也會產生）
+cov.json
+junit.xml
+.coverage
+.pyright_type_debt.json

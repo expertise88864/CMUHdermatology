@@ -1,0 +1,76 @@
+name: Security
+
+# ★[2026-07-30 第二輪外審 P2-07] 為什麼跟 CI 分開一個 workflow★
+# 相依套件的弱點是【時間到了自己會紅】的東西：今天綠燈的 pin，明天就可能因為新
+# 公布的 CVE 變紅，跟這次改了什麼完全無關。若把它塞進主 CI，一個跟程式無關的紅燈
+# 會擋住臨床急修 —— 久了就會被習慣性略過，等於沒有這道關卡。
+#
+# 分開之後：
+#   * 主 CI（測試/型別/覆蓋率）只反映「這次的改動對不對」，可以快、可以擋。
+#   * Security 反映「這個 repo 現在的安全狀態」，每週固定跑一次，紅了要處理但不擋急修。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 每週一 02:00 UTC（台灣時間週一 10:00）—— 新 CVE 不會等人來 push 才出現
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write     # CodeQL 上傳結果需要
+
+jobs:
+  secrets:
+    name: 秘密掃描 (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # ★掃整個歷史★：秘密最危險的地方是「曾經 commit 過但後來刪掉了」——
+          # 只掃當前工作目錄的話那種完全看不到，而它其實還留在 git 物件裡。
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
+  deps:
+    name: 相依套件弱點 (pip-audit)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+      - name: 安裝相依
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # ★[2026-07-30 外審第 1 輪] lazy 相依也要掃★
+          #   ortools / openpyxl / python-docx / reportlab 是「用到才裝」，但「用到才裝」
+          #   仍然是【裝到診間電腦上】—— 它們就是 production 相依。
+          #   舊版只裝 requirements.txt，這四個（及其間接相依）的弱點完全掃不到。
+          pip install -r requirements-lazy.txt
+          pip install pip-audit
+      - name: 掃描（例外清單見 security/pip_audit_allowlist.json）
+        run: python scripts/audit_deps.py
+
+  codeql:
+    name: 靜態安全分析 (CodeQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          # security-extended 比預設多一些查詢；這個 repo 處理帳密與外部網頁輸入，
+          # 多花幾分鐘值得。
+          queries: security-extended
+      - uses: github/codeql-action/analyze@v3

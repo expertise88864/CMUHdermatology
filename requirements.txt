@@ -1,23 +1,39 @@
-# ===== 主程式 + 排班程式 =====
-# 版本上限 pin（next-major）：避免新機器或 runtime fallback 抓到破壞性新版。
-# 要升級時手動把上限往上調。0.x / date-based 套件不 pin 上限（語意化不適用）。
+# CMUH dermatology automation - runtime dependencies
+#
+# *** ASCII ONLY - DO NOT PUT NON-ASCII CHARACTERS IN THIS FILE ***
+# pip decodes requirements files with the *locale* encoding (pip's auto_decode).
+# On a machine whose locale is not UTF-8 (cp936 / cp1252 / ...) a single
+# non-ASCII byte makes `pip install -r requirements.txt` die with
+# UnicodeDecodeError - the app then cannot be installed at all.
+# Verified on 2026-07-30: the previous version of this file carried Chinese
+# comments and failed to install in a clean venv on a cp936 machine.
+# The Chinese rationale now lives in docs/requirements_rationale.md.
+#
+# Upper bounds pin the next major so a new machine (or a runtime fallback
+# install) cannot pull a breaking release. Bump them deliberately.
+# 0.x and date-based packages get no upper bound (semver does not apply).
+
+# ===== main app + roster =====
 requests>=2.31.0,<3
 beautifulsoup4>=4.12.0,<5
 lxml>=5.0.0,<7
 selenium>=4.15.0,<5
-keyboard>=0.13.5          # 0.x，穩定，不 pin 上限
-pyautogui>=0.9.54         # 0.x，不 pin 上限
+keyboard>=0.13.5
+pyautogui>=0.9.54
 schedule>=1.2.0,<2
 psutil>=5.9.0,<8
-Pillow>=10.0.0,<12
-pystray>=0.19.5           # 0.x，不 pin 上限
-pywin32>=306             # date-based 版號（306/308...），不 pin 上限
-sv-ttk>=2.6.0,<3          # Win11 風格 ttk 主題（main.py 用）
+# Pillow floor raised to 12.3.0 on 2026-07-30 (external review P2-07):
+# 11.x carries 20+ known advisories (PYSEC-2026-2250/2253/3493/...) whose fix is
+# 12.3.0 - the old `<12` cap kept the fix out of reach.
+Pillow>=12.3.0,<13
+pystray>=0.19.5
+pywin32>=306
+sv-ttk>=2.6.0,<3
 
-# ===== 打卡程式 =====
+# ===== auto clock-in =====
 webdriver-manager>=4.0.0,<5
 winotify>=1.1.0,<2
 
-# ===== 開發 / 測試（選裝，installer 不會自動裝）=====
+# ===== dev / test (optional; the installer does not install these) =====
 # pyinstaller>=6.0
 # pytest>=7.4
