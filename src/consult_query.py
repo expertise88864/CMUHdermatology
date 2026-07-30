@@ -218,6 +218,23 @@ MAIN_CLASS = "TFMNewMain"
 MULTI_INSTANCE_CLASS = "TMessageForm"        # 「請勿開啟超過兩個」提示
 MULTI_INSTANCE_TITLE = "住院醫囑系統"
 NOTICE_CLASS = "TFMShowMessage"              # 登入後的「訊息通知主畫面」
+# 同一個通知視窗最多按幾次「確認」。超過就認定「按這個沒有用」而停手 ——
+# 見 _wait_main_window_after_login 的說明(實機按了 200 次都沒關掉)。
+_MAX_CLICKS_PER_NOTICE = 5
+
+
+class LoginNotCompleted(RuntimeError):
+    """登入視窗仍在畫面上 —— ★不可自動重試★
+
+    [2026-07-30 外審] 我原本只是把錯誤訊息改對,並在說明裡寫「不自動重試登入,
+    以免把帳號鎖死」。但 `_do_full_job` 的 `except Exception` 對任何例外都會殺掉
+    systemftp、backoff、再跑一遍完整流程(retry_count 預設 3),而連續失敗告警的
+    門檻又是 3 個任務 —— 使用者收到信之前,同一組帳密可能已經被送出 9 次。
+    我聲稱在防的風險,我的修法完全沒有防到。
+
+    故獨立成一個例外類:重試迴圈認得它就【立刻停止】,不再送出登入。
+    帳密被院方停用/改過、或認證方式改版時,重試一百次也一樣,只會逼近鎖定門檻。
+    """
 CONSULT_CLASS = "TFMJoinResponse"            # 「會診通知單回覆」目標視窗
 # 選單路徑：主選單[4]病人清單及交班 → 子[8]會診清單 → 子[0]我的會診清單
 MENU_PATH = (4, 8, 0)
@@ -1926,6 +1943,14 @@ def _wait_main_window_after_login(our_pids: set, *, visible_only: bool,
     clicks = 0
     last_notice_hwnd = None
     distinct_notices = set()
+    # ★[2026-07-30 實機] 同一個通知按不掉就不要再按★
+    #   實機是 200 次點擊全打在同一個 hwnd(整整 120 秒的預算),而那個視窗根本
+    #   沒關掉。click_button 是純 PostMessage(BM_CLICK)、沒有回讀,而 Delphi 的
+    #   modal form 關閉後只是 Hide —— 在 visible_only=False 的路徑上照樣找得到。
+    #   不管是哪一種,連按 N 次沒有任何變化就代表「按這個沒有用」,繼續按只是把
+    #   時間耗完,然後回報一句無從下手的「等不到主畫面」。
+    clicks_on_same = 0
+    stuck_notice = None
     while time.time() < deadline:
         if not running.is_set():
             raise RuntimeError("流程已被中止")
@@ -1944,7 +1969,21 @@ def _wait_main_window_after_login(our_pids: set, *, visible_only: bool,
                               visible_only=visible_only)
         if notice:
             btn = find_child(notice[0], "TButton", "確認")
-            if btn:
+            if btn and notice[0] != stuck_notice:
+                if notice[0] == last_notice_hwnd:
+                    clicks_on_same += 1
+                else:
+                    clicks_on_same = 1
+                if clicks_on_same > _MAX_CLICKS_PER_NOTICE:
+                    # 不再對它出手,但也不放棄整個流程:主畫面可能自己會出來
+                    # (真正該回報的事在下面的 login 檢查與逾時訊息裡)。
+                    logging.warning(
+                        "訊息通知 hwnd=%s 按了 %d 次「確認」仍在,停止對它出手"
+                        "(PostMessage 沒有回讀;Delphi 視窗關閉後也只是 Hide)",
+                        notice[0], clicks_on_same)
+                    stuck_notice = notice[0]
+                    time.sleep(0.4)
+                    continue
                 click_button(btn)
                 clicks += 1
                 distinct_notices.add(notice[0])
@@ -1958,6 +1997,16 @@ def _wait_main_window_after_login(our_pids: set, *, visible_only: bool,
                 time.sleep(0.6)
                 continue
         time.sleep(0.4)
+    # ★登入視窗還在 = 登入沒完成,那是完全不同的一件事★
+    #   原本一律回報「等不到住院醫囑主畫面」,讓人往「主畫面被什麼擋住」的方向查;
+    #   實機真正的狀況是 TFrmLogin 還可見 —— 帳密、院方認證、或連線根本沒過。
+    #   兩者的處置差很遠,訊息就得說對。
+    if find_windows(LOGIN_CLASS, pids=our_pids, visible_only=True):
+        raise LoginNotCompleted(
+            "登入沒有完成(登入視窗仍在畫面上)—— 請確認帳號密碼是否被院方改過/"
+            "停用,以及 HIS 是否連得上。★本次不再重試登入★(避免同一組帳密被"
+            "連續送出而逼近鎖定門檻)。" + _describe_windows_for_diag(
+                our_pids, clicks, last_notice_hwnd, distinct_notices))
     raise RuntimeError(
         "登入後等不到住院醫囑主畫面 —— " + _describe_windows_for_diag(
             our_pids, clicks, last_notice_hwnd, distinct_notices))
@@ -2833,9 +2882,20 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                 return  # 成功就跳出
             except Exception as e:
                 last_err = e
-                logging.error("會診查詢任務第 %d/%d 次失敗：%s",
-                              attempt, retry_count, e, exc_info=True)
-                if attempt < retry_count:
+                # ★[2026-07-30 外審] 不可重試,但【仍要走完終局收尾】★
+                #   我第一版另開一個 except 分支直接 return —— 那會跳過下面的
+                #   `_release_trigger_dedup` 與 `_send_failure_notice_async`:
+                #   email 觸發的醫師會被去重卡住(5 分鐘內重發無效)、又收不到失敗
+                #   通知,只能乾等一個永遠不會來的結果。修一個洞不可以開另一個。
+                #   故改成沿用同一條路,只是【略過 backoff 重試】。
+                fatal = isinstance(e, LoginNotCompleted)
+                if fatal:
+                    logging.error("會診查詢:登入沒有完成 → 不重試(避免同一組帳密"
+                                  "被連續送出而逼近鎖定門檻)：%s", e)
+                else:
+                    logging.error("會診查詢任務第 %d/%d 次失敗：%s",
+                                  attempt, retry_count, e, exc_info=True)
+                if attempt < retry_count and not fatal:
                     # exponential backoff (3s, 30s, 90s)；attempt 從 1 開始
                     backoff = (BACKOFF_SCHEDULE[attempt - 1]
                                if attempt - 1 < len(BACKOFF_SCHEDULE)
@@ -2846,8 +2906,13 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                     _kill_systemftp(job_before_pids)
                     time.sleep(backoff)
                 else:
-                    logging.error("會診查詢任務已重試 %d 次仍失敗，放棄。最後錯誤：%s",
-                                  retry_count, last_err)
+                    if fatal:
+                        logging.error("會診查詢:登入沒有完成 → 放棄且不重試。"
+                                      "最後錯誤：%s", last_err)
+                    else:
+                        logging.error(
+                            "會診查詢任務已重試 %d 次仍失敗，放棄。最後錯誤：%s",
+                            retry_count, last_err)
                     # 連續失敗達門檻 → 告警。輪詢模式「沒信」是常態,故障不主動說
                     # 就沒人會發現(見 _note_job_failure)。
                     # ★[2026-08-02 使用者定案] 收件人改為【只有開發者】★
@@ -2884,6 +2949,11 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                         # 觸發醫師不知道沒成功、苦等不到結果)
                         _send_failure_notice_async(override_recipients,
                                                    str(last_err))
+                    # ★[外審第 3 輪] 收尾完就結束,不可讓迴圈再跑一輪★
+                    #   原本沒有 break 是因為 else 只在【最後一次】attempt 才進得來;
+                    #   fatal 讓它可能在第 1 次就進來 —— 沒 break 就會回頭再送一次
+                    #   帳密,而且把失敗通知再寄一遍。我上一版正是這樣。
+                    break
     finally:
         if com_initialized:            # 只有 CoInitialize 真的成功過才配對 Uninitialize
             try:
