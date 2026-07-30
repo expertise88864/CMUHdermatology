@@ -36,7 +36,7 @@ def test_pending_retrigger_drain_uses_single_delayed_worker(monkeypatch):
     monkeypatch.setattr(consult_query, "_sleep_while_running", lambda _sec: True)
     monkeypatch.setattr(
         consult_query, "trigger_job_async",
-        lambda label, override_recipients=None:
+        lambda label, override_recipients=None, from_retrigger=False:
             triggered.append((label, override_recipients)),
     )
 

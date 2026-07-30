@@ -67,7 +67,9 @@ from cmuh_common.paths import (
 from cmuh_common.paths import get_app_dir, get_settings_dir, restart_self  # noqa: E402
 from cmuh_common.platform_win import set_dpi_awareness  # noqa: E402
 from cmuh_common.single_instance import ensure_single_instance, release_single_instance  # noqa: E402
-from cmuh_common.task_gate import ActiveTaskGate  # noqa: E402
+from cmuh_common.task_gate import (  # noqa: E402
+    ActiveTaskGate, current_worker_superseded, worker_lease_scope,
+)
 from cmuh_common.version import CURRENT_VERSION  # noqa: E402
 
 try:
@@ -129,8 +131,11 @@ _exit_started = False
 log_queue: queue.Queue = queue.Queue(maxsize=5000)
 LOG_POLL_MAX_RECORDS = 200
 clock_lock = threading.RLock()  # 【穩定性 2026-05-21】RLock 避免 janitor 與 process_clock_task 重入時 deadlock
-_clock_task_gate = ActiveTaskGate(stale_after_sec=90 * 60)
-_test_login_gate = ActiveTaskGate(stale_after_sec=10 * 60)
+# [2026-07-30 外審 P2-01] label 讓「逾時接管」的 warning 講得出是哪一支。
+# 這裡沒接 on_supersede 寄信：autoclock 本身沒有寄信管道，不為了告警新發明一條。
+_clock_task_gate = ActiveTaskGate(stale_after_sec=90 * 60, label="autoclock")
+_test_login_gate = ActiveTaskGate(stale_after_sec=10 * 60,
+                                  label="autoclock/test-login")
 
 # [2026-05-22 v45 P0-1] scheduler liveness — 給 self-watchdog 用，跟 consult_query
 # 同一套 pattern。每次 scheduler_loop iteration 更新 last_tick；watchdog 偵測
@@ -1291,6 +1296,16 @@ def process_clock_task(schedule_key: str | None) -> None:
             logging.warning(
                 "任務 %s 取得 clock_lock 等了 %.0fms (上一個任務還沒結束)",
                 schedule_key, wait_ms)
+        # ★[2026-07-30 外審 P2-01] 拿到鎖的這一刻先確認「我還是現役嗎」★
+        #   等 clock_lock 可能等很久（前一個任務卡住）。等待期間 gate 的
+        #   stale_after_sec（90 分）可能已經到、把同一個 schedule key 發給了新的一輪。
+        #   若不檢查就繼續打下去 = 同一個時段打兩次卡。gate 終止不了我們，
+        #   但我們自己可以在【動作之前】退場。
+        if current_worker_superseded():
+            logging.warning(
+                "任務 %s 在等 clock_lock 期間已被逾時接管（另一輪正在處理同一個時段）"
+                "→ 本輪放棄，不重複打卡", schedule_key)
+            return
         is_in = "_in" in schedule_key
         try:
             task_type = schedule_key.split("_", 1)[1]
@@ -1434,10 +1449,13 @@ def _scheduler_tick() -> None:
         return
 
     def _worker():
-        try:
-            process_clock_task(key)
-        finally:
-            _clock_task_gate.release(key, lease)
+        # worker_lease_scope：把 lease 綁在本緒上，讓 process_clock_task 深處也查得到
+        # 自己有沒有被逾時接管（見 cmuh_common/task_gate.py）。
+        with worker_lease_scope(lease):
+            try:
+                process_clock_task(key)
+            finally:
+                _clock_task_gate.release(key, lease)
 
     # [2026-07-25 審查] lease 在 Thread.start() 之前就取得：start() 若拋例外
     # (緒耗盡/直譯器關閉中),_worker 的 finally 永遠不會跑 → lease 洩漏,該 schedule key

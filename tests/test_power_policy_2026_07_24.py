@@ -95,6 +95,9 @@ def test_startup_wiring_main_thread_state_bg_powercfg():
     assert "_keep_system_awake_display_free()" in src, \
         "execution state 應在主緒設定(ES_CONTINUOUS 綁呼叫緒壽命)"
     assert "_apply_screen_off_power_plan" in src, "powercfg 批次應丟背景執行"
+    assert "ScreenBlackout(" in src, "黑幕須在【主緒】建立（Tk 不是 thread-safe）"
+    assert "_subsystem_running" in src, \
+        "busy_fn 要接本行程的自動化旗標，否則黑幕會讓 F2/F3 的螢幕擷取 OCR 擷到全黑"
 
 
 def test_single_execution_state_call_site_without_display_bit():
@@ -130,11 +133,80 @@ def test_send_monitor_off_broadcast_with_timeout():
     assert main._SC_MONITORPOWER == 0xF170 and main._MONITOR_OFF == 2
 
 
-def test_idle_seconds_failure_returns_zero(monkeypatch):
-    """GetLastInputInfo 失敗 → 回 0（當作剛有輸入：寧可不關，絕不誤關）。"""
+def test_idle_seconds_failure_is_unknown_not_zero(monkeypatch):
+    """★[2026-07-30] 這條原本斷言「失敗回 0.0」—— 那個斷言本身就是 bug。★
+
+    回 0.0 的方向是對的（寧可不關，絕不誤關），但它讓「`GetLastInputInfo` 一直
+    失敗」跟「剛剛真的有人碰過鍵盤」長得一模一樣：螢幕永遠不會關，而 log 一行都
+    沒有 —— 使用者回報「15 分鐘後螢幕還是不關」查了兩次都查不出來。
+    現在回 None＝【查不到】，由呼叫端決定怎麼辦並且要留下 log。
+    """
     monkeypatch.setattr(main.ctypes.windll.user32, "GetLastInputInfo",
                         lambda *_a: 0, raising=False)
-    assert main._idle_seconds() == 0.0
+    assert main._idle_seconds() is None
+
+
+def test_unknown_idle_neither_closes_the_screen_nor_disarms(monkeypatch):
+    """查不到閒置時間 → 這輪不動作（絕不誤關），但【維持 armed】：
+    等查得到的那一輪仍然要能關。若順手 disarm，一次查詢失敗就會把整段閒置期的
+    關屏機會吃掉。"""
+    assert main._screen_off_due(None, True) == (False, True)
+    assert main._screen_off_due(None, False) == (False, False)
+
+
+def test_send_monitor_off_does_not_claim_the_screen_closed():
+    """★措辭鐵律★ SC_MONITORPOWER 送出後，只要系統上還有 DISPLAY power request，
+    Windows 會立刻把螢幕點回來，而我們【查不到】螢幕現在是開還是關。
+    log 只能說「已送出」——舊版說「已強制關閉螢幕」，實機沒關卻一直這樣寫。"""
+    src = inspect.getsource(main._send_monitor_off)
+    assert "已送出關閉螢幕指令" in src
+    assert "已強制關閉螢幕" not in src
+
+
+def test_the_watchdog_logs_when_it_cannot_tell_whether_anyone_is_idle():
+    """查不到閒置時間時必須留下 warning —— 否則這個功能整台機器失效而無跡可循
+    （正是這次查不出原因的直接理由）。"""
+    src = inspect.getsource(main._force_screen_off_watchdog)
+    assert "unknown_streak" in src
+    assert "查不到使用者閒置時間" in src
+
+
+def test_the_watchdog_logs_display_power_requests_before_blanking():
+    """★這是「螢幕關不掉」查了兩次都缺的那份資料★
+    螢幕該關卻沒關最常見的原因是某支程式掛著 DISPLAY wake lock，而那是【間歇性】
+    的 —— 必須在它真的發生的那一刻記下 `powercfg /requests`。"""
+    src = inspect.getsource(main._force_screen_off_watchdog)
+    assert "_log_display_power_requests" in src
+    assert "/requests" in inspect.getsource(main._log_display_power_requests)
+
+
+def test_the_watchdog_also_raises_the_blackout():
+    """SC_MONITORPOWER 無法回讀 → 使用者定案改用可回讀的全黑畫面兜底。"""
+    src = inspect.getsource(main._force_screen_off_watchdog)
+    assert "_request_blackout" in src
+
+
+def test_the_blackout_gate_never_raises_and_defaults_to_not_blacked_out(
+        monkeypatch):
+    """★這條守的是所有 F1-F12★ 閘門若因例外卡在 True，所有熱鍵會從此失效。"""
+    monkeypatch.setattr(main, "_screen_blackout", None, raising=False)
+    assert main.screen_blackout_should_eat_this_hotkey() is False
+
+    class _Broken:
+        @property
+        def active(self):
+            raise RuntimeError("炸了")
+
+    monkeypatch.setattr(main, "_screen_blackout", _Broken(), raising=False)
+    assert main.screen_blackout_should_eat_this_hotkey() is False
+
+
+def test_hotkeys_are_gated_while_the_blackout_is_up():
+    """醫師為了喚醒螢幕按的那一下可能就是 F1/F9 —— 不可在他還看不見畫面時
+    就對 HIS 寫劑量/計費。F12（中止）刻意不走這個閘門：救援鍵不可被吃掉。"""
+    src = inspect.getsource(main.AutomationApp.setup_hotkeys)
+    assert "_blackout_gate" in src
+    assert "callback = _blackout_gate(callback, key)" in src
 
 
 def test_force_off_watchdog_wired_in_startup():

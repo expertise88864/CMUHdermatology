@@ -39,7 +39,7 @@ from cmuh_common.atomic_io import atomic_write_json, safe_load_json_ex
 # -----------------------------------------------------------------------------
 # 預設 snippets（首次啟動自動寫入；不含 if，避免英文 "if " 誤觸）
 # -----------------------------------------------------------------------------
-ABBREV_CONFIG_SCHEMA_VERSION = 11  # [v11 2026-06-30] 新增 df→dermatofibroma;[v10] cert 去「曾」;[v9] 新增 inf;[v8] 移除醫師代碼預設
+ABBREV_CONFIG_SCHEMA_VERSION = 12  # [v12 2026-07-30] 新增 pih→Post-inflammatory hyperpigmentation;[v11] 新增 df;[v10] cert 去「曾」;[v9] 新增 inf;[v8] 移除醫師代碼預設
 MAX_ABBREV_LENGTH = 63
 
 DEFAULT_ITEMS: list[dict[str, str]] = [
@@ -53,6 +53,7 @@ DEFAULT_ITEMS: list[dict[str, str]] = [
     {"abbrev": "mf",   "expansion": "medication and follow up"},
     {"abbrev": "nt",   "expansion": "next time:"},
     {"abbrev": "pred", "expansion": "no DM/HBV/HCV"},
+    {"abbrev": "pih",  "expansion": "Post-inflammatory hyperpigmentation"},
     {"abbrev": "rs",   "expansion": "remove stitches and follow up"},
     {"abbrev": "sd",   "expansion": "seborrheic dermatitis"},
     {"abbrev": "se",   "expansion": "subacute eczema"},
@@ -400,6 +401,9 @@ def load_config(path: str, *, persist_migrations: bool = True) -> AbbrevConfig:
         if loaded_schema_version < 11:
             # [v11] 新增預設 df→dermatofibroma:使用者沒有同名才補,不覆蓋自訂、不動其他預設
             needs_save = _ensure_default_present(cfg.items, "df") or needs_save
+        if loaded_schema_version < 12:
+            # [v12 2026-07-30 使用者] 新增預設 pih→Post-inflammatory hyperpigmentation
+            needs_save = _ensure_default_present(cfg.items, "pih") or needs_save
         needs_save = True
     needs_save = _maybe_migrate_legacy(cfg.items) or needs_save
     cfg.items = sort_abbrev_items(cfg.items)

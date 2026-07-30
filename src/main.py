@@ -9263,24 +9263,36 @@ def _tick_delta(tick_now: int, tick_then: int) -> int:
     return (tick_now - tick_then) & 0xFFFFFFFF
 
 
-def _idle_seconds() -> float:
-    """使用者最後一次鍵盤/滑鼠輸入距今秒數。查詢失敗回 0（當作剛有輸入 →
-    寧可不關，絕不誤關）。"""
+def _idle_seconds() -> "float | None":
+    """使用者最後一次鍵盤/滑鼠輸入距今秒數。
+
+    ★[2026-07-30] 查不到回 `None`，不再回 0.0。★
+    舊版失敗回 0.0（「當作剛有輸入 → 寧可不關」），方向是對的 —— 但那讓
+    「`GetLastInputInfo` 一直失敗」跟「剛剛真的有人碰過鍵盤」長得一模一樣：
+    螢幕永遠不會關，而 log 一行都沒有。這正是本 repo 的老病灶「讀取失敗被當成
+    『沒有資料』」。呼叫端自己決定怎麼辦（仍然不關，但要講出來）。"""
     try:
         lii = _LASTINPUTINFO()
         lii.cbSize = ctypes.sizeof(lii)
         if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
-            return 0.0
+            return None
         return _tick_delta(ctypes.windll.kernel32.GetTickCount(),
                            lii.dwTime) / 1000.0
     except Exception:
-        return 0.0
+        logging.debug("[電源] GetLastInputInfo 例外", exc_info=True)
+        return None
 
 
-def _screen_off_due(idle_s: float, armed: bool) -> tuple:
-    """→ (這輪要不要送關屏, 下一輪 armed)。純函式（可測）。
+def _screen_off_due(idle_s: "float | None", armed: bool) -> tuple:
+    """→ (這輪要不要關屏, 下一輪 armed)。純函式（可測）。
     armed＝「這段閒置期還沒送過」：送一次即 disarm——避免每 30 秒重複轟炸
-    （螢幕被硬體/例外喚醒時反覆強關會閃爍）；一有輸入（閒置歸零）重新上膛。"""
+    （螢幕被硬體/例外喚醒時反覆強關會閃爍）；一有輸入（閒置歸零）重新上膛。
+
+    idle_s 為 None＝【查不到閒置時間】→ 不動作（絕不誤關），且【維持 armed】，
+    等查得到的那一輪再判。★不可把 None 當成 0★：那會讓查詢一直失敗的機器
+    永遠不關螢幕，而且完全沒有跡象。"""
+    if idle_s is None:
+        return (False, armed)
     if idle_s >= SCREEN_OFF_MINUTES * 60:
         return (armed, False)
     return (False, True)
@@ -9288,25 +9300,121 @@ def _screen_off_due(idle_s: float, armed: bool) -> tuple:
 
 def _send_monitor_off() -> None:
     """廣播 SC_MONITORPOWER=off 關螢幕。用 SendMessageTimeout(ABORTIFHUNG) 而非
-    SendMessage：HWND_BROADCAST 碰到卡死視窗會讓 watchdog 緒永久阻塞。"""
+    SendMessage：HWND_BROADCAST 碰到卡死視窗會讓 watchdog 緒永久阻塞。
+
+    ★[2026-07-30 措辭鐵律] 只能說「已送出」，不可說「已關閉」。★
+    只要系統上還有任何 DISPLAY power request，Windows 收到這個訊息後會立刻把
+    螢幕點回來，而一般行程沒有簡單的 API 查得到螢幕現在是開還是關。舊版送完就
+    log 成「已強制關閉…」，實機上螢幕根本沒關、log 卻一直說關了 —— 這個問題因此
+    查了兩次都查不出來。真正看得見的效果由 `cmuh_common.screen_blackout` 負責
+    （那個【可以回讀】）。"""
     try:
         res = ctypes.c_size_t(0)
         ctypes.windll.user32.SendMessageTimeoutW(
             _HWND_BROADCAST, _WM_SYSCOMMAND, _SC_MONITORPOWER, _MONITOR_OFF,
             _SMTO_ABORTIFHUNG, 2000, ctypes.byref(res))
-        logging.info("[電源] 閒置滿 %d 分鐘 → 已強制關閉螢幕", SCREEN_OFF_MINUTES)
+        logging.info("[電源] 閒置滿 %d 分鐘 → 已送出關閉螢幕指令"
+                     "（無法回讀螢幕是否真的關閉，另有黑幕兜底）",
+                     SCREEN_OFF_MINUTES)
     except Exception:
-        logging.warning("[電源] 強制關螢幕失敗", exc_info=True)
+        logging.warning("[電源] 送出關螢幕指令失敗", exc_info=True)
+
+
+def _log_display_power_requests() -> None:
+    """把 `powercfg /requests` 的內容記進 log（唯讀診斷）。
+
+    ★這是「螢幕關不掉」查了兩次都查不出來所缺的那份資料。★
+    螢幕該關卻沒關，最常見原因是某支程式掛著 DISPLAY power request（wake lock）。
+    以前只在人工排查時看過一次（當時乾淨），但問題是【間歇性】的 —— 要在它真的
+    發生的那一刻抓。故：每段閒置期在關屏前記一次（不是每 30 秒，避免洗版）。"""
+    try:
+        cp = subprocess.run(["powercfg", "/requests"],
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                            capture_output=True, timeout=15, check=False)
+        out = (cp.stdout or b"").decode("utf-8", "replace").strip()
+        if cp.returncode != 0 or not out:
+            logging.info("[電源] powercfg /requests 取不到內容 rc=%s", cp.returncode)
+            return
+        logging.info("[電源] 關屏前的 power requests（找 DISPLAY 區塊）:\n%s",
+                     out[:2000])
+    except Exception:
+        logging.debug("[電源] powercfg /requests 失敗（略過）", exc_info=True)
+
+
+# 黑幕（自製全黑螢幕保護）。由主緒建立、watchdog 緒只透過 root.after 排程操作 ——
+# Tk 不是 thread-safe，從 watchdog 緒直接動視窗會隨機炸掉整個 UI。
+_screen_blackout = None
+_screen_blackout_root = None
+
+
+def screen_blackout_should_eat_this_hotkey() -> bool:
+    """這一下熱鍵要不要吃掉？★熱鍵閘門用，會消耗一次性喚醒 token★
+
+    任何例外都回 False（＝放行）。絕不可能卡在 True：黑幕狀態是從視窗狀態算出來的
+    （不是記下來的旗標），而喚醒 token 是【一次性】的 —— 否則所有 F1-F12 會從此
+    失效而沒人知道原因。
+
+    ★[外審第 3 輪] 一次性★ 醫師按 F1 喚醒螢幕、馬上再按一次 F1，第二下必須正常
+    動作。舊版用「1.5 秒時間窗」會把兩下都吃掉。"""
+    bo = _screen_blackout
+    if bo is None:
+        return False
+    try:
+        # ★必須用 consume_wake_gate（純 Win32 + 一次性喚醒 token）★
+        #   這個函式是在 `keyboard` 的 hook 緒上被呼叫的，不是 Tk 主緒。
+        #   用 `bo.active`（winfo_*）會拋 `RuntimeError: main thread is not in
+        #   main loop` → 下面的 except 把它當成「沒黑幕」 → 閘門在正式環境
+        #   完全不生效（外審第 1 輪抓到）。
+        return bool(bo.consume_wake_gate())
+    except Exception:
+        return False
+
+
+def _request_blackout() -> None:
+    """從 watchdog 緒請主緒顯示黑幕（Tk 只能在主緒操作）。"""
+    bo, root = _screen_blackout, _screen_blackout_root
+    if bo is None or root is None:
+        return
+
+    def _show():
+        try:
+            if bo.show():
+                logging.info("[黑幕] 閒置滿 %d 分鐘 → 已顯示全黑畫面"
+                             "（回讀 ismapped=True）", SCREEN_OFF_MINUTES)
+        except Exception:
+            logging.warning("[黑幕] 顯示黑幕失敗", exc_info=True)
+
+    try:
+        root.after(0, _show)
+    except Exception:
+        logging.debug("[黑幕] 無法排程到主緒（略過本輪）", exc_info=True)
 
 
 def _force_screen_off_watchdog() -> None:
-    """daemon 緒：每 30 秒查一次閒置，滿 15 分鐘強制關螢幕（每段閒置期只送一次）。"""
+    """daemon 緒：每 30 秒查一次閒置，滿 15 分鐘關螢幕（每段閒置期只做一次）。
+
+    做兩件事：(1) 送 SC_MONITORPOWER（真的關掉最省電，但無法回讀）；
+    (2) 顯示黑幕（可回讀、不受 wake lock 影響 —— 使用者定案的兜底）。
+    查不到閒置時間時【不動作但要講出來】，否則這個功能整台機器失效而無跡可循。"""
     armed = True
+    unknown_streak = 0
     while True:
         time.sleep(_FORCE_OFF_POLL_SECONDS)
-        due, armed = _screen_off_due(_idle_seconds(), armed)
+        idle = _idle_seconds()
+        if idle is None:
+            unknown_streak += 1
+            # 約 10 分鐘（20 輪）仍查不到 → 這台機器的關屏功能等於沒有，要留下 log
+            if unknown_streak in (1, 20) or unknown_streak % 120 == 0:
+                logging.warning(
+                    "[電源] 查不到使用者閒置時間（GetLastInputInfo 連續失敗 %d 次）"
+                    "→ 這段期間不會自動關螢幕/黑幕", unknown_streak)
+        else:
+            unknown_streak = 0
+        due, armed = _screen_off_due(idle, armed)
         if due:
+            _log_display_power_requests()
             _send_monitor_off()
+            _request_blackout()
 
 # [O10] 拉長主院 cache TTL 120s → 300s（5 分鐘）；分院 180 → 600s（10 分鐘）
 # 院方主機自身慢（~3-7s），cache 命中時 UI 立即顯示，不必每 2 分鐘抓一次
@@ -16417,6 +16525,21 @@ class AutomationApp:
                     action_fn()
                 return _wrapped
 
+            def _blackout_gate(callback, key_name):
+                """★[2026-07-30] 黑幕蓋著時吃掉這一次熱鍵。★
+
+                醫師為了喚醒螢幕按的那一下，可能就是 F1/F9 —— 若照樣觸發，就會在他
+                【還看不見畫面】的狀態下對 HIS 寫劑量/計費。黑幕會被同一下按鍵收起，
+                所以再按一次就正常運作；代價是喚醒後要多按一次，安全遠大於便利。
+                （F12 中止不走這裡：救援鍵不可被吃掉，而且中止從不造成傷害。）"""
+                def _gated():
+                    if screen_blackout_should_eat_this_hotkey():
+                        logging.info("[hotkey] %s 在黑幕期間觸發 → 只喚醒螢幕，"
+                                     "本次不執行（請再按一次）", key_name)
+                        return
+                    callback()
+                return _gated
+
             safe_unhook_all_hotkeys()
             for key, (func, name) in hotkeys_to_register.items():
                 f_use = func
@@ -16430,6 +16553,7 @@ class AutomationApp:
                 else:
                     strict = key in STRICT_HOTKEYS
                     callback = _hotkey_guard(action, key, strict)
+                callback = _blackout_gate(callback, key)
                 hotkey_modules.keyboard.add_hotkey(
                     key,
                     callback,
@@ -16818,6 +16942,24 @@ class AutomationApp:
         # 主緒=Tk mainloop 與行程同壽命);powercfg 批次丟背景(subprocess 不卡 UI)。
         _keep_system_awake_display_free()
         _submit_startup_background("power-policy", _apply_screen_off_power_plan)
+        # [2026-07-30 使用者] 黑幕（自製全黑螢幕保護）——SC_MONITORPOWER 被 DISPLAY
+        # wake lock 壓住時螢幕根本不會關，而那件事【無法回讀】。黑幕是我們自己畫的
+        # 視窗，不受電源管理影響，而且可以回讀（見 cmuh_common/screen_blackout.py）。
+        # busy_fn 用本行程的自動化旗標：主程式有「螢幕擷取 + OCR」路徑（F2/F3 照光
+        # 卡號），topmost 黑視窗會讓它擷到全黑。
+        global _screen_blackout, _screen_blackout_root
+        try:
+            from cmuh_common.screen_blackout import ScreenBlackout
+            _screen_blackout_root = self.root
+            _screen_blackout = ScreenBlackout(
+                self.root,
+                idle_seconds_fn=_idle_seconds,
+                busy_fn=lambda: bool(getattr(self, "_subsystem_running", False)))
+        except Exception:
+            logging.warning("[黑幕] 初始化失敗（仍會送 SC_MONITORPOWER）",
+                            exc_info=True)
+            _screen_blackout = None
+            _screen_blackout_root = None
         # [2026-07-24 使用者] 強制版：閒置 15 分鐘直接關螢幕（被動電源計畫實測
         # 有機器不動作 → 不再依賴 Windows 自己關）。
         threading.Thread(target=_force_screen_off_watchdog,

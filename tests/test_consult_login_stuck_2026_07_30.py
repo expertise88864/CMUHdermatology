@@ -154,7 +154,11 @@ def test_the_retry_loop_skips_backoff_but_still_finalizes():
     import inspect
     src = inspect.getsource(cq._do_full_job)
     assert "except LoginNotCompleted" not in src,         "不可另開分支早退(會跳過終局收尾)"
-    assert "fatal = isinstance(e, LoginNotCompleted)" in src
+    # [2026-07-30 外審 P2-01] JobSuperseded 也走同一條 fatal 路徑 → 判定式從單一
+    # 型別變成 tuple。這裡守的是「fatal 由 isinstance 判定、且 LoginNotCompleted
+    # 在其中」，不是那一行的逐字長相。
+    assert "fatal = isinstance(e, (" in src
+    assert "LoginNotCompleted" in src[src.index("fatal = isinstance(e, ("):][:120]
     assert "if attempt < retry_count and not fatal:" in src,         "只略過 backoff 重試,其餘照原路走"
     # 終局收尾仍在同一個 else 分支裡
     i_else = src.index("if attempt < retry_count and not fatal:")

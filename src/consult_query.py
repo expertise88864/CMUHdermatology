@@ -93,7 +93,9 @@ from cmuh_common.win32_safe import call_with_timeout  # noqa: E402
 from cmuh_common.single_instance import (  # noqa: E402
     ensure_single_instance, release_single_instance,
 )
-from cmuh_common.task_gate import ActiveTaskGate  # noqa: E402
+from cmuh_common.task_gate import (  # noqa: E402
+    ActiveTaskGate, current_worker_superseded, worker_lease_scope,
+)
 from cmuh_common.version import CURRENT_VERSION  # noqa: E402
 
 # DPI 感知：讓 GetWindowRect 回實體像素，跨機/跨縮放比例一致
@@ -223,6 +225,17 @@ NOTICE_CLASS = "TFMShowMessage"              # 登入後的「訊息通知主畫
 _MAX_CLICKS_PER_NOTICE = 5
 
 
+class JobSuperseded(RuntimeError):
+    """本輪已被 gate 逾時接管（另一輪正在做同一件事）。
+
+    ★不可重試，但【仍要走完終局收尾】★—— 不能直接 return：
+    email 觸發的醫師會被去重卡住（5 分鐘内重發無效）又收不到任何通知，
+    只能乾等一個永遠不會來的結果（同樣的錖在 2026-07-30 已經踩過一次）。
+    沖進與 LoginNotCompleted 同一條 fatal 路徑：不 backoff、不重試，
+    但釋放去重、回信告知、清孤兒。
+    """
+
+
 class LoginNotCompleted(RuntimeError):
     """登入視窗仍在畫面上 —— ★不可自動重試★
 
@@ -253,8 +266,10 @@ _DESKTOP_GENERIC_ALL = 0x10000000
 running = threading.Event()
 running.set()
 _flow_lock = threading.Lock()
-_consult_job_gate = ActiveTaskGate(stale_after_sec=45 * 60)
-_test_email_gate = ActiveTaskGate(stale_after_sec=10 * 60)
+# [2026-07-30 外審 P2-01] label 讓「逾時接管」的 warning 講得出是哪一支。
+_consult_job_gate = ActiveTaskGate(stale_after_sec=45 * 60, label="consult")
+_test_email_gate = ActiveTaskGate(stale_after_sec=10 * 60,
+                                  label="consult/test-email")
 tray_icon_object = None
 _exit_lock = threading.Lock()
 _exit_started = False
@@ -2683,7 +2698,8 @@ def _cleanup_orphan_systemftp() -> None:
         logging.warning("[CQ-05] systemftp 孤兒清掃失敗(略過,不影響啟動)", exc_info=True)
 
 
-def _do_full_job(trigger_label: str, override_recipients=None) -> None:
+def _do_full_job(trigger_label: str, override_recipients=None, *,
+                 from_retrigger: bool = False) -> None:
     """完整一次任務：跑流程 → 寄信。供排程／手動共用，整體互斥。
 
     多機共存策略：先檢查本機 Outlook 是否可用，不可用就直接靜默跳過——
@@ -2703,6 +2719,28 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
       - 其他（排程／手動）→ 用 recipients（一般四人名單）"""
     if not _flow_lock.acquire(blocking=False):
         logging.info("已有一個會診查詢任務進行中，本次（%s）略過", trigger_label)
+        # ★[2026-07-30 外審第 1 輪] email 觸發的要排隊補跑,不可直接丟掉★
+        #   `trigger_job_async` 只在【gate 擋下】時排隊；gate 放行但 `_flow_lock`
+        #   被佔住(例如 gate 逾時接管之後,舊 worker 還握著鎖)就整筆消失 ——
+        #   email 觸發的醫師於是被去重卡住又收不到任何東西,乾等一個不會來的結果。
+        #   只補 email：poll/排程觸發本來就會自己再來一輪，補跑只會多做白工；而
+        #   `_flow_lock` 若真的永久洩漏，只補 email 也不會變成無止盡的自我重觸發。
+        #
+        # ★[2026-07-30 外審第 2 輪 finding：已驗證後 REJECT]★
+        #   外審認為這個補跑會造成「重複寄出」：舊 worker 稍後寄完之後，排隊的這筆
+        #   又會再寄一次。查證後不採納，理由三點：
+        #   ① 兩者【收件人不同、對應不同請求】。舊 worker 那一輪是 45 分鐘前開始的
+        #      （poll 或別人的觸發）；排隊這筆是某位醫師【剛剛親自寄信要的】，而他在
+        #      這之前什麼都沒收到。回覆他不是重複，是本來就該做的事。
+        #   ② 同一位醫師在去重窗過後重試也不會變成多封：`_enqueue_pending_retrigger`
+        #      以 label 為鍵合併（`_merge_retrigger_recipients`），多次觸發只會合成
+        #      【一筆】、收件人取聯集。
+        #   ③ 外審建議的替代方案「superseded 之後所有權就不可逆轉移」會直接重現
+        #      它自己在第 1 輪抓到的 bug：舊 worker 放棄、接管者拿不到 `_flow_lock`
+        #      也放棄 → 兩邊都不寄。那比現況嚴重得多。
+        if trigger_label == "email" and override_recipients:
+            _enqueue_pending_retrigger(trigger_label, override_recipients)
+            logging.info("[re-trigger] 已排隊，等目前任務結束後補跑這筆 email 觸發")
         return
     # [2026-07-25 審查] import/CoInitialize 必須在 try 內：舊版放在 acquire 與 try 之間,
     # 這兩行只要拋一次例外(自動更新正在改寫 pywin32 檔案、CoInitialize 回
@@ -2718,6 +2756,20 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
         import pythoncom       # noqa: PLC0415
         pythoncom.CoInitialize()
         com_initialized = True
+        # ★[2026-07-30 外審第 5 輪] 補跑在【拿到 _flow_lock 之後】要再確認一次★
+        #   drain 那邊的「看墓碑 → 派送」不是原子的：舊 worker 可能在那兩步之間才
+        #   寄成功。而拿到 `_flow_lock` 代表舊 worker 已經完全結束（它在最外層
+        #   finally 才釋放），此刻的墓碑才是最終狀態。
+        #   ★只對【補跑】做★：正常的新觸發是醫師的新請求，必須照跑。
+        #   ★逐人過濾而非整批放棄★：只把已經收到的人剔掉，其餘照寄。
+        #   `override_recipients` 為 None／空（解析不出寄件人）時整段跳過 —— 那時要用
+        #   設定裡的 `email_trigger_recipients`，墓碑無從逐人比對（外審第 6 輪）。
+        if from_retrigger and trigger_label == "email" and override_recipients:
+            override_recipients = _unserved_recipients(override_recipients)
+            if not override_recipients:
+                logging.info(
+                    "[re-trigger] 補跑的收件人在等鎖期間都已經收到結果了 → 不重複寄送")
+                return
         cfg = load_config()
         mail_method = str(cfg.get("mail_method", "smtp")).lower()
         # SMTP 模式：檢查 password 是否已填，沒填則靜默跳過（多機部署：只有有
@@ -2869,6 +2921,16 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                     date_str, time_str,
                     (_poll_extract_note + "\n" + body) if _poll_extract_note else body,
                     punch_html + extracted_html)
+                # ★[2026-07-30 外審 P2-01] 寄信前先確認「我還是現役嗎」★
+                #   這段流程可能跑很久（HIS 慢/凍結/登入重試）。超過 gate 的
+                #   stale_after_sec（45 分）之後，新的一輪已經接手在做同一件事；
+                #   這時才把【十幾分鐘前抓的清單】寄出去，收信人會拿到舊資料，
+                #   而且下面還會去更新「已通知病歷號」基準 → 新的那一輪反而看不到
+                #   新會診、漏寄給團隊。gate 終止不了我們，但我們可以自己退場。
+                if current_worker_superseded():
+                    raise JobSuperseded(
+                        "本輪會診查詢已執行超過逾時上限並被新的一輪接管，"
+                        "手上這份清單已經過時 → 不寄、也不更新已通知基準")
                 if mail_method == "smtp":
                     send_via_smtp(shot, subject, final_body, recipients,
                                   html_body=final_html)
@@ -2888,6 +2950,14 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                         _save_notified(_consult_signature_from_roster(roster_texts))
                     except Exception:
                         logging.debug("更新 consult_notified 失敗", exc_info=True)
+                # ★[2026-07-30 外審第 2/3 輪] 已經親自寄給這些醫師 → 撤掉補跑佇列裡
+                #   同一批收件人，否則他們會在幾秒內收到兩封幾乎一樣的清單。
+                #   詳細取捨（為何不用「所有權不可逆轉移」）見 _discard_served_retriggers。
+                if trigger_label == "email" and override_recipients:
+                    _discard_served_retriggers(trigger_label, override_recipients)
+                    # 已派出去、但還沒進 `_flow_lock` 的補跑拿不到佇列了，
+                    # 只能靠這份墩碑在它真正做事之前自己發現（外審第 4 輪）。
+                    _note_served_recipients(override_recipients)
                 logging.info("會診查詢任務成功（第 %d 次嘗試）", attempt)
                 _note_job_success()      # [2026-07-25] 清空連續失敗計數
                 return  # 成功就跳出
@@ -2899,8 +2969,12 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                 #   email 觸發的醫師會被去重卡住(5 分鐘內重發無效)、又收不到失敗
                 #   通知,只能乾等一個永遠不會來的結果。修一個洞不可以開另一個。
                 #   故改成沿用同一條路,只是【略過 backoff 重試】。
-                fatal = isinstance(e, LoginNotCompleted)
-                if fatal:
+                # ★[2026-07-30 外審 P2-01] JobSuperseded 也是 fatal：重試沒意義
+                #   （新的一輪正在做同一件事），但必須走完下面的終局收尾。
+                fatal = isinstance(e, (LoginNotCompleted, JobSuperseded))
+                if isinstance(e, JobSuperseded):
+                    logging.error("會診查詢：%s", e)
+                elif fatal:
                     logging.error("會診查詢:登入沒有完成 → 不重試(避免同一組帳密"
                                   "被連續送出而逼近鎖定門檻)：%s", e)
                 else:
@@ -2917,7 +2991,10 @@ def _do_full_job(trigger_label: str, override_recipients=None) -> None:
                     _kill_systemftp(job_before_pids)
                     time.sleep(backoff)
                 else:
-                    if fatal:
+                    if isinstance(last_err, JobSuperseded):
+                        logging.error("會診查詢：被逾時接管 → 放棄且不重試"
+                                      "（新的一輪正在跑）。%s", last_err)
+                    elif fatal:
                         logging.error("會診查詢:登入沒有完成 → 放棄且不重試。"
                                       "最後錯誤：%s", last_err)
                     else:
@@ -3018,6 +3095,96 @@ def _enqueue_pending_retrigger(trigger_label: str, override_recipients) -> None:
             existing, override_recipients)
 
 
+# ★[2026-07-30 外審第 4 輪] 已服務收件人的墓碑（tombstone）★
+#   只把人從 `_pending_retriggers` 拿掉還不夠：`_drain_pending_retriggers()` 是
+#   【先把佇列複製走並清空、才啟動補跑 worker】。若舊 worker 剛好在這個空窗裡寄成功，
+#   `_discard_served_retriggers()` 看到的是空佇列，什麼都拿不掉 → 那個已經派出去的
+#   補跑照樣執行、照樣再寄一封。故另外記一份「剛剛已經親自服務到誰」，由補跑 worker
+#   在【真正要做事之前】自己檢查。
+_SERVED_TOMBSTONE_TTL_SEC = 180.0
+_served_recipients_recent: dict = {}
+
+
+def _note_served_recipients(recipients) -> None:
+    """記下「剛剛已經親自寄給這些人」。"""
+    if not recipients:
+        return
+    now = time.time()
+    with _pending_retriggers_lock:
+        for r in recipients:
+            key = str(r).strip().lower()
+            if key:
+                _served_recipients_recent[key] = now
+        # 順手清掉過期的，不讓它無限長大
+        for key in [k for k, ts in _served_recipients_recent.items()
+                    if now - ts > _SERVED_TOMBSTONE_TTL_SEC]:
+            _served_recipients_recent.pop(key, None)
+
+
+def _unserved_recipients(recipients):
+    """把【剛剛已經親自寄過】的人溤掉，只留還沒收到的。
+
+    ★[2026-07-30 外審第 5 輪] 不可做 all-or-nothing 判斷★
+    佇列是 `[D, E]`、舊 worker 已經寄給 D 但 E 還沒收到 —— 上一版回「不是全部」
+    就拿原名單 `[D, E]` 整批補跑，D 還是收到兩封。逐人過濾才對：
+    E 照寄（少寄給等結果的醫師比多寄嚴重得多）、D 不重複。
+
+    recipients 為 None（非 email 觸發）→ 原樣回 None，不介入。
+    """
+    if recipients is None:
+        return None
+    now = time.time()
+    out = []
+    with _pending_retriggers_lock:
+        for r in recipients:
+            key = str(r).strip().lower()
+            if not key:
+                continue
+            ts = _served_recipients_recent.get(key)
+            if ts is not None and now - ts <= _SERVED_TOMBSTONE_TTL_SEC:
+                continue
+            out.append(r)
+    return out
+
+
+def _discard_served_retriggers(trigger_label: str, served_recipients) -> None:
+    """已經【親自寄給】這些收件人了 → 把他們從補跑佇列拿掉。
+
+    ★[2026-07-30 外審第 2/3 輪] 這是「同一位醫師收到兩封」的正解★
+    情境：醫師 D 在 t0 寄觸發信 → 任務卡住 45 分鐘 → D 在 t45 再寄一次 → gate 逾時
+    接管 → 接管者拿不到 `_flow_lock` 於是把 D 排進補跑佇列 → 舊 worker 這時終於寄給
+    D（回答 t0 那次）→ 佇列補跑又寄一次（回答 t45 那次）。D 在幾秒內收到兩封幾乎一樣
+    的清單。
+
+    為什麼不採用外審建議的「所有權不可逆轉移」：那會讓舊 worker 放棄、接管者又拿不到
+    `_flow_lock` 也放棄 → **兩邊都不寄，D 什麼都收不到**（外審自己在第 1 輪抓到的
+    bug）。「絕不讓醫師等一個不會來的結果」優先於「資料新鮮度」。
+
+    為什麼丟掉補跑是安全的：email 觸發【不會】更新「已通知病歷號」基準，所以這 45
+    分鐘內若真的來了新會診，下一輪 poll 仍然會照常寄給團隊 —— 沒有任何會診被吞掉。
+    """
+    if not served_recipients:
+        return
+    served = {str(r).strip().lower() for r in served_recipients if str(r).strip()}
+    if not served:
+        return
+    with _pending_retriggers_lock:
+        pending = _pending_retriggers.get(trigger_label)
+        if pending is None:
+            return
+        kept = [r for r in pending
+                if str(r).strip().lower() not in served]
+        if len(kept) == len(pending):
+            return
+        if kept:
+            _pending_retriggers[trigger_label] = kept
+        else:
+            _pending_retriggers.pop(trigger_label, None)
+        logging.info(
+            "[re-trigger] 已親自寄給 %s → 從補跑佇列移除（避免同一位醫師收到兩封）",
+            ", ".join(sorted(served)))
+
+
 def _drain_pending_retriggers() -> None:
     """release 後跑這個 — 把擋下的觸發補上。等 _RETRIGGER_DELAY_SEC 後執行。
     在背景 thread 跑，避免拖長 release 路徑。"""
@@ -3039,10 +3206,34 @@ def _drain_pending_retriggers() -> None:
                 pending = dict(_pending_retriggers)
                 _pending_retriggers.clear()
             for label, override in pending.items():
+                # ★[2026-07-30 外審第 4 輪] 派出去之前先看墩碑★
+                #   上面已經「複製佇列並清空」了，而這裡還要等
+                #   `_RETRIGGER_DELAY_SEC`。舊 worker 若在這個空窗裡寄成功，
+                #   `_discard_served_retriggers()` 面對的是空佇列、什麼都拿不掉
+                #   → 這筆補跑照樣執行、同一位醫師收到第二封。
+                #   ★只在這裡檢★：放在 `_do_full_job` 會連【正常的新觸發】也一起
+                #   擋掉（實測弄紅了四支既有測試）—— 墩碑只能管補跑。
+                send_to = override
+                # ★override is None 必須【原樣派送】★
+                #   email 觸發若解析不出寄件人（malformed From），override 就是 None，
+                #   而 `_do_full_job` 會退回設定裡的 `email_trigger_recipients`。
+                #   我上一版用 `if not send_to: continue` 一併把 None 當成「沒人要寄」
+                #   → 那批收件人永遠收不到結果，而觸發者還被去重窗卡著（外審第 6 輪）。
+                #   墓碑本來就只能對【指名的收件人】逐人比對。
+                if label == "email" and override is not None:
+                    send_to = _unserved_recipients(override)
+                    dropped = [r for r in override if r not in send_to]
+                    if dropped:
+                        logging.info(
+                            "[re-trigger] 這些人剛剛已經收到結果了，不重複補跑：%s",
+                            ", ".join(str(x) for x in dropped))
+                    if not send_to:
+                        continue
                 logging.info(
-                    "[re-trigger] 補跑被 task_gate 擋下的觸發：%s", label)
+                    "[re-trigger] 補跑被擋下的觸發：%s", label)
                 try:
-                    trigger_job_async(label, override_recipients=override)
+                    trigger_job_async(label, override_recipients=send_to,
+                                      from_retrigger=True)
                 except Exception:
                     logging.exception("[re-trigger] 補跑 %s 失敗", label)
         finally:
@@ -3061,7 +3252,8 @@ def _drain_pending_retriggers() -> None:
         logging.exception("[re-trigger] 啟動補跑 thread 失敗")
 
 
-def trigger_job_async(trigger_label: str, override_recipients=None) -> None:
+def trigger_job_async(trigger_label: str, override_recipients=None, *,
+                      from_retrigger: bool = False) -> None:
     key = "consult"
     lease = _consult_job_gate.acquire_lease(key)
     if lease is None:
@@ -3077,12 +3269,17 @@ def trigger_job_async(trigger_label: str, override_recipients=None) -> None:
         return
 
     def _worker():
-        try:
-            _do_full_job(trigger_label, override_recipients=override_recipients)
-        finally:
-            _consult_job_gate.release(key, lease)
-            # [v17] release 後檢查有沒有 pending re-trigger 需要補跑
-            _drain_pending_retriggers()
+        # worker_lease_scope：把 lease 綁在本緒上，讓 _do_full_job 深處（寄信前）也
+        # 查得到自己有沒有被逾時接管（見 cmuh_common/task_gate.py）。
+        with worker_lease_scope(lease):
+            try:
+                _do_full_job(trigger_label,
+                             override_recipients=override_recipients,
+                             from_retrigger=from_retrigger)
+            finally:
+                _consult_job_gate.release(key, lease)
+                # [v17] release 後檢查有沒有 pending re-trigger 需要補跑
+                _drain_pending_retriggers()
 
     threading.Thread(target=_worker, name="ConsultJob", daemon=True).start()
 

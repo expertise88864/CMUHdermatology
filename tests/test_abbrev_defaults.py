@@ -27,6 +27,7 @@ def test_requested_default_abbreviations_are_present():
     assert defaults["inf"] == \
         "incisional biopsy and follow up, inform post-op scar formation"
     assert defaults["df"] == "dermatofibroma"
+    assert defaults["pih"] == "Post-inflammatory hyperpigmentation"
     assert defaults["cert"] == \
         "患者因上述皮膚疾病，於da_zh至本院皮膚科門診就醫治療，建議持續追蹤。"
     # [v8] 已退役的醫師代碼縮寫不再出現在預設清單
@@ -187,6 +188,58 @@ def test_v10_config_does_not_restore_manually_deleted_df(tmp_path):
     cfg = ae.load_config(str(path))
 
     assert cfg.items == [{"abbrev": "zz", "expansion": "custom"}]
+
+
+def test_v11_config_gets_pih_default_via_migration(tmp_path):
+    """[v12 2026-07-30 使用者] 現有 v11 使用者升級自動補上新預設
+    'pih'→Post-inflammatory hyperpigmentation,不動其自訂內容,也不重跑舊版遷移。"""
+    path = tmp_path / "abbrev_settings.json"
+    path.write_text(json.dumps({
+        "schema_version": 11,
+        "enabled": True,
+        "items": [{"abbrev": "st", "expansion": "my custom"},
+                  {"abbrev": "zz", "expansion": "custom"}],
+    }), encoding="utf-8")
+
+    cfg = ae.load_config(str(path))
+    values = {item["abbrev"]: item["expansion"] for item in cfg.items}
+
+    assert values["pih"] == "Post-inflammatory hyperpigmentation"
+    assert values["st"] == "my custom"   # 自訂不被覆蓋
+    assert values["zz"] == "custom"      # 自訂保留
+    # v12 升級窗只補 pih:不重跑 v5/v8/v9/v11 遷移 → 不把使用者沒有的塞回來
+    for gone in ("inf", "nt", "se", "df"):
+        assert gone not in values
+    assert cfg.schema_version == ae.ABBREV_CONFIG_SCHEMA_VERSION
+
+
+def test_v12_config_does_not_restore_manually_deleted_pih(tmp_path):
+    """已在 v12 的使用者若自己刪掉 pih,不可又被補回(只在 v11→v12 升級窗補一次)。"""
+    path = tmp_path / "abbrev_settings.json"
+    path.write_text(json.dumps({
+        "schema_version": ae.ABBREV_CONFIG_SCHEMA_VERSION,
+        "enabled": True,
+        "items": [{"abbrev": "zz", "expansion": "custom"}],
+    }), encoding="utf-8")
+
+    cfg = ae.load_config(str(path))
+
+    assert cfg.items == [{"abbrev": "zz", "expansion": "custom"}]
+
+
+def test_a_user_defined_pih_is_not_overwritten_by_the_new_default(tmp_path):
+    """★使用者可能早就自己建了 pih★ 升級不可把他的內容改掉(哪怕只是大小寫不同)。"""
+    path = tmp_path / "abbrev_settings.json"
+    path.write_text(json.dumps({
+        "schema_version": 11,
+        "enabled": True,
+        "items": [{"abbrev": "PIH", "expansion": "我自己的 PIH 內容"}],
+    }), encoding="utf-8")
+
+    cfg = ae.load_config(str(path))
+    values = {item["abbrev"]: item["expansion"] for item in cfg.items}
+
+    assert values == {"PIH": "我自己的 PIH 內容"}
 
 
 def test_v8_config_does_not_re_remove_user_recreated_doctor_code(tmp_path):
