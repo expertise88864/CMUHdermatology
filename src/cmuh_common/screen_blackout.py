@@ -35,6 +35,7 @@
 * **三條退場路徑,任一條都夠**:(a) Tk 事件(按鍵/點擊/滾輪/滑鼠移動);
   (b) 每 250ms 輪詢 `GetLastInputInfo`,一有輸入就收(不管事件有沒有送到我們);
   (c) 自動化開始跑就收。
+  ★使用者定案：不分滑鼠鍵盤、不問移了幾 px —— 任何人在電腦前的行為都馬上收★
 * **會搶焦點(`focus_force`)**,好讓喚醒的那一下按鍵打在黑幕上而不是打進病歷;
   收起來時把焦點還給原本的前景視窗。喚醒鍵同時也被熱鍵閘門吃掉 —— 否則醫師為了
   喚醒螢幕按的那一下 F1/F9 會在他還看不見畫面時就對 HIS 寫入。
@@ -66,72 +67,19 @@ INPUT_FRESH_SEC = 2.0         # 閒置低於這個秒數 → 判定「剛剛有�
 #   這個秒數只剩失效保險：沒人來領就自動過期，不會累積到下一次黑幕。
 WAKE_GRACE_SEC = 1.5
 
-# ★[2026-07-30 外審第 2 輪] 滑鼠飄移門檻 ——【兩條路徑用同一個】★
-#   第一版只給 Tk <Motion> 用，但失效保險輪詢看 `GetLastInputInfo`，而它對任何
-#   位移（含 1px）都更新 → 門檻永遠輪不到。我第二版乾脆把門檻整個拿掉，那是
-#   【改掉需求】而不是修矛盾。現在兩條路徑都拿【實際游標位置】比對同一個門檻；
-#   鍵盤／按鍵則以「有新輸入但游標根本沒動」辨識。
-MOTION_TOLERANCE_PX = 25
-#   ★[第 3 輪] 判斷的單位是「不同的輸入事件」，不是「輪數」★
-#   `GetLastInputInfo` 在一次輸入之後會【持續兩秒都算 fresh】。我上一版按輪數計，
-#   於是一次 1px 飄移在下一輪就被當成「游標沒動 → 鍵盤輸入」而收掉黑幕 —— 門檻
-#   只是把收黑幕延後 250ms。
-#   ★[第 4 輪] 事件身分拿【原始 last-input tick】，不是推測的★
-#   第 3 輪我用「閒置秒數有沒有變小」推測，那不可靠：上一輪量到 0.05、下一個 250ms
-#   區間初有人敲鍵盤、這一輪量到 0.20 —— 0.20 不小於 0.05，那下鍵盤就被漏掉了，
-#   而 Tk 拿不到焦點正是這條輪詢存在的理由。見 `last_input_tick()`。
-#   ★硬上限★：門檻再怎麼巧，也不可出現「黑幕收不掉」——那是這支模組最不能有的
-#   失敗模式。連續這麼多個【不同事件】都判不出結果，就不再判斷，一律收起來。
-FRESH_INPUT_EVENTS_BEFORE_FORCE_HIDE = 8
-
-
-class _LASTINPUTINFO(ctypes.Structure):
-    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
-
-
-def last_input_tick() -> "int | None":
-    """`GetLastInputInfo` 的原始 `dwTime`（毫秒 tick）。查不到回 None。
-
-    ★[2026-07-30 外審第 4 輪] 為何要拿原始 tick★
-    上一版用「閒置秒數有沒有變小」推測「是不是新的輸入事件」，那不可靠：
-    上一輪量到 idle=0.05，下一個 250ms 區間初有人敲了鍵盤，這一輪量到
-    idle=0.20 —— 0.20 不小於 0.05，於是那下鍵盤被漏掉；而 Tk 拿不到焦點正是
-    這條輪詢存在的理由 → 黑幕收不掉。
-    `dwTime` 是【事件本身的時間】，只要它變了就是新事件，不需要推論。
-    """
-    try:
-        lii = _LASTINPUTINFO()
-        lii.cbSize = ctypes.sizeof(lii)
-        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
-            return None
-        return int(lii.dwTime)
-    except Exception:
-        return None
-
-
-def cursor_pos() -> "tuple | None":
-    """目前游標位置（螢幕座標）。查不到回 None。"""
-    class _P(ctypes.Structure):
-        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
-    try:
-        p = _P()
-        if not ctypes.windll.user32.GetCursorPos(ctypes.byref(p)):
-            return None
-        return (int(p.x), int(p.y))
-    except Exception:
-        return None
-
-
-def _moved_beyond(a, b, tolerance: int = MOTION_TOLERANCE_PX) -> bool:
-    """兩個游標位置是否相距超過門檻。任一個是 None（查不到）→ 視為【有移動】。
-
-    查不到時偏向「有移動」＝偏向收黑幕。反過來（查不到就當沒動）會讓一次
-    `GetCursorPos` 失敗變成「黑幕收不掉」。
-    """
-    if a is None or b is None:
-        return True
-    return abs(a[0] - b[0]) > tolerance or abs(a[1] - b[1]) > tolerance
+# ★★[2026-07-30 使用者定案] 【任何人在電腦前的行為都要馬上收黑幕】★★
+#   原話：「全黑的螢幕要能在使用者一移動滑鼠或是一動到任何鍵盤
+#   (有任何使用者有在電腦前的行為)」。
+#
+#   所以【沒有滑鼠飄移容許值、沒有事件身分推論、沒有任何「這算不算真的
+#   有人」的判斷】—— idle 一掉下來就收。
+#
+#   ★這是使用者推翻了外審第 1/2/3 輪的 P3 finding★：外審堅持要有 25px
+#   飄移門檻（把我第一版自己發明的東西當成需求），並因此衍生出一堆複雜度：
+#   游標位移比對、last-input tick 事件身分、硬上限……。使用者明確要求相反的行為，
+#   而這是他的診間機。【日後外審如果再提門檻，直接引這段拒絕。】
+#   副作用：滑鼠一直飄的機器黑幕蓋不住 —— 但那種機器連 15 分鐘閒置都走不到
+#   （上膨計時用的是同一個 `GetLastInputInfo`），根本不會黑幕。
 
 
 def virtual_screen_rect() -> tuple:
@@ -157,13 +105,11 @@ class ScreenBlackout:
     """
 
     def __init__(self, root, *, idle_seconds_fn, busy_fn,
-                 rect_fn=virtual_screen_rect,
-                 last_input_tick_fn=last_input_tick):
+                 rect_fn=virtual_screen_rect):
         self._root = root
         self._idle_seconds_fn = idle_seconds_fn
         self._busy_fn = busy_fn
         self._rect_fn = rect_fn
-        self._last_input_tick_fn = last_input_tick_fn
         self._win = None
         # 黑幕視窗的 HWND。熱鍵閘門在【非 Tk 緒】上跑，只能靠這個 + Win32
         # 查狀態（見 `active_from_any_thread`）。int 的讀寫在 CPython 是原子的。
@@ -174,14 +120,10 @@ class ScreenBlackout:
         # 消耗它，所以要上鎖（這把鎖與 Tk 無關，不會引入跨緒碰 Tk 的問題）。
         self._wake_lock = threading.Lock()
         self._wake_token = 0.0
-        self._cursor_origin = None  # 黑幕開始時的游標位置
-        self._last_cursor = None    # 上一輪輪詢看到的游標位置
-        self._last_tick = None      # 上一輪看到的 last-input tick（事件身分）
         # 這一次黑幕期間已經吃掉過熱鍵嗎（★外審第 4 輪★）。
         # hook 緒先跑的情形：第一下 F1 看到黑幕還在 → 擋下但沒消耗 token；
         # Tk 接著拆窗又發一張新 token → 第二下 F1 也被吃掉。有這個旗標就不會。
         self._eaten_this_blackout = False
-        self._fresh_events = 0      # 連續幾個【不同的】輸入事件都判不出結果
 
     # ── 狀態 ────────────────────────────────────────────────────────────────
     @property
@@ -312,14 +254,10 @@ class ScreenBlackout:
         win.geometry(f"{w}x{h}{x:+d}{y:+d}")
         win.attributes("-topmost", True)
         # ★不用 grab_set★：抓住輸入的話，黑幕若沒收乾淨會把整台機器鎖死。
-        for seq in ("<Key>", "<Button>", "<MouseWheel>"):
-            win.bind(seq, self._on_wake)          # 按鍵/點擊/滾輪＝明確的人為動作
-        win.bind("<Motion>", self._on_motion)     # 滑鼠要過門檻（見 MOTION_TOLERANCE_PX）
+        # ★使用者定案：任何一種都馬上收（滑鼠移動也一樣，不問移了幾 px）
+        for seq in ("<Key>", "<Button>", "<MouseWheel>", "<Motion>"):
+            win.bind(seq, self._on_wake)
         win.protocol("WM_DELETE_WINDOW", self._on_wake)
-        self._cursor_origin = cursor_pos()
-        self._last_cursor = self._cursor_origin
-        self._last_tick = self._last_input_tick_fn()
-        self._fresh_events = 0
         with self._wake_lock:
             self._eaten_this_blackout = False
         win.update_idletasks()
@@ -339,25 +277,6 @@ class ScreenBlackout:
     # ── 退場 ────────────────────────────────────────────────────────────────
     def _on_wake(self, _event=None) -> None:
         self.hide(reason="使用者輸入")
-
-    def _on_motion(self, event=None) -> None:
-        """滑鼠移動要超過門檻才收 —— 與失效保險輪詢用【同一個】門檻與同一個原點。
-
-        位置優先取事件裡的 `x_root/y_root`（測試可注入），沒有才問 `GetCursorPos`。
-        """
-        pos = None
-        if event is not None:
-            xr, yr = getattr(event, "x_root", None), getattr(event, "y_root", None)
-            if isinstance(xr, int) and isinstance(yr, int):
-                pos = (xr, yr)
-        if pos is None:
-            pos = cursor_pos()
-        if self._cursor_origin is None:
-            self._cursor_origin = pos
-            self._last_cursor = pos
-            return
-        if _moved_beyond(self._cursor_origin, pos):
-            self.hide(reason="滑鼠移動")
 
     def hide(self, *, reason: str = "") -> None:
         was = self.active
@@ -440,43 +359,10 @@ class ScreenBlackout:
             # 「螢幕沒關」——那就是修好之前的既有狀態，遠優於擋住臨床工作。
             self.hide(reason="查不到閒置時間")
             return
-        # ★[外審第 3/4 輪] 只在【新的輸入事件】上判斷，而事件身分拿原始 tick★
-        #   `GetLastInputInfo` 在一次輸入之後會持續兩秒都算 fresh，所以不能每輪都重新
-        #   判一次（不然一次 1px 飄移下一輪就被當成「游標沒動 ⇒ 鍵盤」）；
-        #   也不能用「閒置秒數有沒有變小」推測（上一輪 0.05、這一輪 0.20 的新鍵盤
-        #   事件會被漏掉，而 Tk 拿不到焦點正是這條輪詢存在的理由）。
-        #   `dwTime` 是事件本身的時間，變了就是新事件 —— 不需要推論。
-        tick = self._last_input_tick_fn()
-        prev_tick, self._last_tick = self._last_tick, tick
-        if tick is None or prev_tick is None:
-            # 拿不到 tick 就不推測：有新輸入就直接收黑幕（寧可多收，不可收不掉）。
-            if idle < INPUT_FRESH_SEC:
-                self.hide(reason="偵測到輸入（拿不到 last-input tick）")
-                return
-            self._schedule_poll()
-            return
-        new_event = idle < INPUT_FRESH_SEC and tick != prev_tick
-        if not new_event:
-            self._schedule_poll()
-            return
-
-        # 有新輸入 —— 是「人回來了」還是「滑鼠飄了一格」？拿實際游標位置判斷，
-        # 用的是跟 <Motion> 完全相同的門檻與同一個原點（兩條路徑一致）。
-        self._fresh_events += 1
-        now_cursor = cursor_pos()
-        moved = _moved_beyond(self._cursor_origin, now_cursor)
-        still = (self._last_cursor is not None and now_cursor is not None
-                 and self._last_cursor == now_cursor)
-        self._last_cursor = now_cursor
-        if moved:
-            self.hide(reason="滑鼠移動")
-            return
-        if still:
-            # 游標一格都沒動卻有新輸入 → 鍵盤或按鍵（沒有經過我們的 Tk 綁定）
-            self.hide(reason="鍵盤/按鍵輸入")
-            return
-        if self._fresh_events >= FRESH_INPUT_EVENTS_BEFORE_FORCE_HIDE:
-            # ★硬上限★ 判不出來就不判了 —— 絕不可出現「黑幕收不掉」。
-            self.hide(reason="持續有輸入（不再判斷是否飄移）")
+        # ★★使用者定案：任何人在電腦前的行為都馬上收★★
+        #   不分辨是滑鼠還是鍵盤、不問滑鼠移了幾 px、不推論「這算不算真的有人」。
+        #   `GetLastInputInfo` 一掉下來就是有人碰了鍵鼠 —— 收。
+        if idle < INPUT_FRESH_SEC:
+            self.hide(reason="偵測到使用者操作")
             return
         self._schedule_poll()

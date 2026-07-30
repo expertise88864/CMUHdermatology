@@ -25,22 +25,16 @@ from cmuh_common import screen_blackout as sb  # noqa: E402
 
 
 class _Idle:
-    """可調的輸入狀態：閒置秒數（None＝查不到）+ last-input tick。
-
-    ★tick 是【事件身分】★：輪詢靠它分辨「新的輸入事件」與「同一事件的後續輪」。
-    只改 `value` 不改 `tick` 就是「同一次輸入過了一點時間」；`input()` 才是新事件。
-    """
+    """可調的閒置秒數來源（None＝查不到）。"""
 
     def __init__(self, value=9999.0):
         self.value = value
-        self.tick = 100000
 
     def __call__(self):
         return self.value
 
     def input(self, seconds: float = 0.1):
-        """模擬【一次新的】鍵鼠輸入。"""
-        self.tick += 17
+        """模擬「使用者碰了鍵鼠」。"""
         self.value = seconds
 
 
@@ -60,8 +54,7 @@ def made(tk_root):
     """(blackout, idle, busy) —— 用注入的假閒置/忙碌來源，不碰真的 Win32。"""
     idle, busy = _Idle(), _Busy()
     bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=idle, busy_fn=busy,
-                           rect_fn=lambda: RECT,
-                           last_input_tick_fn=lambda: idle.tick)
+                           rect_fn=lambda: RECT)
     yield bo, idle, busy
     bo.hide()
 
@@ -120,159 +113,54 @@ def test_a_keypress_takes_it_down(made):
     assert bo.active is False
 
 
-# ─── ★外審第 2 輪★ 飄移門檻:兩條路徑用【同一個】 ─────────────────────────
-# 第 1 輪抓到「Tk 綁定有門檻、輪詢沒有 → 門檻永遠輪不到」;我第 2 版乾脆把門檻
-# 整個拿掉,那是【改掉需求】而不是修矛盾。現在兩條路徑都拿實際游標位置比對同一個
-# 門檻與同一個原點,鍵盤/按鍵則以「有新輸入但游標一格都沒動」辨識。
-def _at(pos):
-    return type("E", (), {"x_root": pos[0], "y_root": pos[1]})()
-
-
-def test_mouse_drift_below_the_threshold_does_not_take_it_down(made,
-                                                              monkeypatch):
-    """桌面震動/光學滑鼠飄移不該喚醒（否則黑幕根本蓋不住三秒）。"""
+# ─── ★★使用者定案：任何人在電腦前的行為都馬上收★★ ─────────────
+# 原話：「全黑的螢幕要能在使用者一移動滑鼠或是一動到任何鍵盤
+# (有任何使用者有在電腦前的行為)」。
+#
+# ★這推翻了外審第 1/2/3 輪的 P3 finding★：外審堅持要有 25px 飄移門檻（把我第
+# 一版自己發明的東西當成需求），並因此衍生出游標位移比對、last-input tick
+# 事件身分、硬上限……一堆複雜度。使用者明確要求相反的行為，而這是他的診間機。
+def test_any_mouse_movement_takes_it_down_however_small(made):
+    """★使用者定案★ 不問移了幾 px，滑鼠一動就收。"""
     bo, _idle, _busy = made
-    monkeypatch.setattr(sb, "cursor_pos", lambda: (500, 500))
     bo.show()
-    bo._on_motion(_at((500 + sb.MOTION_TOLERANCE_PX, 500)))
-    assert bo.active is True
-
-
-def test_mouse_movement_beyond_the_threshold_takes_it_down(made, monkeypatch):
-    bo, _idle, _busy = made
-    monkeypatch.setattr(sb, "cursor_pos", lambda: (500, 500))
-    bo.show()
-    bo._on_motion(_at((500 + sb.MOTION_TOLERANCE_PX + 1, 500)))
+    bo._on_wake(type("E", (), {"x_root": 501, "y_root": 500})())   # 移了 1px
     assert bo.active is False
 
 
-def test_the_poll_uses_the_same_threshold_as_the_motion_binding(made,
-                                                               monkeypatch):
-    """★兩條路徑一致★ 輪詢看到「有新輸入」時，也要拿游標位移比對同一個門檻。"""
+def test_there_is_no_drift_tolerance_left(made):
+    """門檻要真的不存在 —— 不只是調小。"""
+    assert not hasattr(sb, "MOTION_TOLERANCE_PX")
+    assert not hasattr(sb, "FRESH_INPUT_EVENTS_BEFORE_FORCE_HIDE")
+    assert not hasattr(sb, "cursor_pos"), "不再需要游標位置"
+    assert not hasattr(sb, "last_input_tick"), "不再需要事件身分推論"
+
+
+def test_every_input_binding_goes_straight_to_wake():
+    """四種 Tk 輸入事件都直接收黑幕，沒有任何中間判斷。"""
+    import inspect
+    src = inspect.getsource(sb.ScreenBlackout._create)
+    assert '("<Key>", "<Button>", "<MouseWheel>", "<Motion>")' in src
+    assert "_on_motion" not in src, "不可再有另一條有門檻的滑鼠路徑"
+
+
+def test_the_poll_takes_it_down_on_any_fresh_input(made):
+    """失效保險輪詢也一樣：idle 一掉下來就收，不再分辨是滑鼠還是鍵盤。"""
     bo, idle, _busy = made
-    cursor = {"pos": (500, 500)}
-    monkeypatch.setattr(sb, "cursor_pos", lambda: cursor["pos"])
     bo.show()
-    idle.input(0.5)                                         # 新輸入事件 #1
-    cursor["pos"] = (500 + sb.MOTION_TOLERANCE_PX, 501)     # 但只飄了一點
-    bo._poll()
-    assert bo.active is True, "門檻內的飄移不可收黑幕（跟 <Motion> 同一個規則）"
-
-    idle.input(0.2)                                         # tick 變了＝新輸入事件 #2
-    cursor["pos"] = (500 + sb.MOTION_TOLERANCE_PX + 5, 501)
-    bo._poll()
-    assert bo.active is False
-
-
-def test_one_sub_threshold_drift_does_not_merely_delay_dismissal(made,
-                                                                monkeypatch):
-    """★[外審第 3 輪] 門檻不可只是把收黑幕延後 250ms★
-
-    `GetLastInputInfo` 在一次輸入之後會【持續兩秒都算 fresh】。舊版按輪數計，所以
-    一次 1px 飄移在下一輪就被當成「游標沒動 ⇒ 鍵盤輸入」而收掉黑幕 —— 門檻完全白費。
-    現在以【原始 last-input tick】辨認新事件，同一個事件不重複判斷。
-    """
-    bo, idle, _busy = made
-    cursor = {"pos": (500, 500)}
-    monkeypatch.setattr(sb, "cursor_pos", lambda: cursor["pos"])
-    bo.show()
-    idle.input(0.1)                         # 一次輸入事件
-    cursor["pos"] = (501, 500)              # 1px 飄移
-    bo._poll()
-    assert bo.active is True
-    # 同一個輸入事件的後續輪：閒置秒數遞增（250ms 一輪），游標不再動
-    for extra in (0.35, 0.60, 0.85, 1.10, 1.35, 1.60, 1.85):
-        idle.value = extra
-        bo._poll()
-        assert bo.active is True, (
-            f"閒置 {extra}s 仍是同一個輸入事件，不可把它重新判成鍵盤輸入")
-
-
-def test_a_new_keypress_is_caught_even_when_the_idle_reading_went_up(made,
-                                                                    monkeypatch):
-    """★[外審第 4 輪] 不可用「閒置秒數變小」推測新事件★
-
-    上一輪量到 idle=0.05；下一個 250ms 區間【初】有人敲了鍵盤；這一輪量到 idle=0.20。
-    0.20 不小於 0.05 → 用秒數推測就會把那下鍵盤漏掉，而 Tk 拿不到焦點正是這條輪詢
-    存在的理由 → 黑幕收不掉。拿原始 `dwTime` 就不會誤判。
-    """
-    bo, idle, _busy = made
-    cursor = {"pos": (500, 500)}
-    monkeypatch.setattr(sb, "cursor_pos", lambda: cursor["pos"])
-    bo.show()
-    # 第一輪：同一個舊事件，只是建立 _last_tick 基準（idle 很小但 tick 沒變）
-    idle.value = 0.05
-    bo._poll()
-    assert bo.active is True, "測試前提：同一個事件的後續輪不該收黑幕"
-    # ★新事件，但量到的閒置秒數【比上一輪大】★——用秒數推測就會漏掉它
-    idle.input(0.20)
-    bo._poll()
-    assert bo.active is False, "★閒置秒數變大的新輸入事件也必須被抓到★"
-
-
-def test_an_unavailable_last_input_tick_errs_towards_taking_it_down(made,
-                                                                   monkeypatch):
-    """拿不到 tick 就不推測：有新輸入直接收（寧可多收，不可收不掉）。"""
-    bo, idle, _busy = made
-    monkeypatch.setattr(sb, "cursor_pos", lambda: (500, 500))
-    bo.show()
-    bo._last_input_tick_fn = lambda: None
-    idle.value = 0.5
-    bo._poll()
-    assert bo.active is False
-
-
-def test_the_poll_treats_input_without_cursor_movement_as_keyboard(made,
-                                                                  monkeypatch):
-    """★游標一格都沒動卻有新輸入 → 那是鍵盤/按鍵，一定要收★
-
-    `GetLastInputInfo` 分不出鍵盤和滑鼠，但「游標完全沒動」就足以判定不是滑鼠。
-    這條路徑很重要：`overrideredirect` 視窗可能拿不到焦點，Tk 的 <Key> 綁定收不到。
-    """
-    bo, idle, _busy = made
-    monkeypatch.setattr(sb, "cursor_pos", lambda: (500, 500))
-    bo.show()
-    bo._poll()                       # 先跑一輪，讓 _last_cursor 有值
     idle.input(0.5)
     bo._poll()
     assert bo.active is False
 
 
-def test_the_poll_gives_up_guessing_after_the_hard_cap(made, monkeypatch):
-    """★硬上限★ 判不出來就不判了 —— 絕不可出現「黑幕收不掉」。
-
-    這裡讓游標【每一輪都飄一點點但都在門檻內】：既不算移動、也不算「完全沒動」，
-    正是兩個判斷都落空的情形。撐過上限就必須無條件收起來。
-    """
+def test_the_poll_does_not_second_guess_repeated_input(made):
+    """連續有輸入時也不需要任何「硬上限」—— 第一下就收了。"""
     bo, idle, _busy = made
-    pos = {"n": 0}
-
-    def _drifting():
-        pos["n"] += 1
-        return (500 + (pos["n"] % 3), 500)     # 永遠在 25px 門檻內來回
-
-    monkeypatch.setattr(sb, "cursor_pos", _drifting)
     bo.show()
-    cap = sb.FRESH_INPUT_EVENTS_BEFORE_FORCE_HIDE
-    for i in range(cap):
-        if not bo.active:
-            break
-        idle.input(1.0 - i * 0.1)       # tick 每輪都變＝一個【新的】輸入事件
-        bo._poll()
-    assert bo.active is False, (
-        f"連續 {cap} 個不同輸入事件都判不出結果卻還黑著 → 收不掉")
-
-
-def test_an_unreadable_cursor_position_errs_towards_taking_it_down(made,
-                                                                   monkeypatch):
-    """`GetCursorPos` 失敗時偏向「有移動」＝偏向收黑幕。
-    反過來（查不到就當沒動）會讓一次 Win32 失敗變成「黑幕收不掉」。"""
-    bo, idle, _busy = made
-    monkeypatch.setattr(sb, "cursor_pos", lambda: (500, 500))
-    bo.show()
-    monkeypatch.setattr(sb, "cursor_pos", lambda: None)
-    idle.input(0.5)
-    bo._poll()
+    for v in (0.9, 0.8, 0.7):
+        idle.value = v
+        if bo.active:
+            bo._poll()
     assert bo.active is False
 
 

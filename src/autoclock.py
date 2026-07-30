@@ -103,6 +103,13 @@ try:
     DEBUG_DUMPS_DIR.mkdir(parents=True, exist_ok=True)
 except OSError:
     pass
+try:
+    # [2026-07-30 外審 P1-02] 除錯檔含帳號與完整畫面 → 同一台電腦的其他
+    # 使用者不該讀得到。收不緊只記 log（這是縱深防禦的一層）。
+    from cmuh_common.debug_privacy import restrict_dir_to_current_user
+    restrict_dir_to_current_user(DEBUG_DUMPS_DIR)
+except Exception:
+    logging.debug("[除錯檔] 目錄權限收新失敗（略過）", exc_info=True)
 
 CONFIG_FILE = SETTINGS_DIR / "autoclock_config.json"
 LOG_FILE = SETTINGS_DIR / "autoclock.log"
@@ -409,6 +416,16 @@ def _setup_clock_logging() -> None:
     # 加上 stream（保留原行為）
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     attach_stream_handler(formatter, replace_existing=True)
+    # ★[2026-07-30 外審 P1-02] 檔案 handler 改用【遮蔽 formatter】★
+    #   不可用 logging.Filter 改 record：`logging` 把同一個 LogRecord 傳給每一個
+    #   handler，filter 一改就連 UI 即時記錄窗與 console 一起被遮，多帳號
+    #   失敗時根本分不出是哪個帳號。Formatter 只產生這個 handler 要寫出去
+    #   的字串，不碰共用的 record。
+    try:
+        from cmuh_common.debug_privacy import install_log_secret_filter
+        install_log_secret_filter()
+    except Exception:
+        logging.debug("[除錯檔] 安裝遮蔽 formatter 失敗（略過）", exc_info=True)
     # 加上 queue handler 給 UI 顯示
     qh = attach_queue_handler(log_queue, replace_existing=True)
     qh.setFormatter(formatter)
@@ -436,8 +453,19 @@ def exponential_backoff_sleep(attempt_zero_based: int, *,
 from cmuh_common.date_utils import roc_to_gregorian_year, parse_roc_date_str  # noqa: E402
 
 
-def save_debug_artifacts(driver, filename_prefix: str, error_hint: str = "") -> list:
+def save_debug_artifacts(driver, filename_prefix: str, error_hint: str = "",
+                         redact=()) -> list:
+    """把失敗當下的畫面存下來 —— ★但只存能證明不含憑證的東西★（外審 P1-02）。
+
+    三個改動（詳細理由見 `cmuh_common/debug_privacy.py`）：
+      1. **截圖前先清空帳號／密碼欄，並回讀確認**。確認不了就【不存截圖】，
+         並把原因寫進 meta —— 我們無法證明它安全，就不要落地。
+      2. **整頁原始碼預設不存**（登入頁的帳號欄 value、打卡紀錄表格都在裡面）。
+         需要的人到設定頁自己打開。
+      3. 檔名用不可逆短代號，不放帳號本身（呼叫端負責，見 `_handle_clock_failure`）。
+    """
     saved: list = []
+    notes: list = []
     if driver is None:
         return saved
     try:
@@ -446,31 +474,58 @@ def save_debug_artifacts(driver, filename_prefix: str, error_hint: str = "") -> 
         pass
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     base = DEBUG_DUMPS_DIR / f"{_safe_filename_part(filename_prefix, 80)}_{ts}"
-    try:
-        png_path = base.with_suffix(".png")
-        driver.save_screenshot(str(png_path))
-        saved.append(png_path)
-        logging.info("已儲存除錯截圖: %s", png_path)
-    except Exception as e:
-        logging.warning("截圖失敗: %s", e)
-    try:
-        html_path = base.with_suffix(".html")
-        src = driver.page_source or ""
-        html_path.write_text(src, encoding="utf-8", errors="replace")
-        saved.append(html_path)
-        logging.info("已儲存頁面 HTML: %s", html_path)
-    except Exception as e:
-        logging.warning("儲存 HTML 失敗: %s", e)
-    if error_hint and saved:
+
+    from cmuh_common.debug_privacy import (
+        blank_credential_fields, store_page_source_enabled,
+    )
+    cred_ids = [LOCATORS[k][1] for k in ("username", "password") if k in LOCATORS]
+    if blank_credential_fields(driver, cred_ids):
         try:
-            meta_path = base.with_suffix(".txt")
-            meta_path.write_text(
-                f"time={datetime.now().isoformat()}\n{error_hint}\n",
-                encoding="utf-8", errors="replace",
-            )
-            saved.append(meta_path)
-        except OSError:
-            pass
+            png_path = base.with_suffix(".png")
+            driver.save_screenshot(str(png_path))
+            saved.append(png_path)
+            logging.info("已儲存除錯截圖: %s", png_path)
+        except Exception as e:
+            logging.warning("截圖失敗: %s", e)
+            notes.append(f"screenshot_failed={e}")
+    else:
+        # ★fail-closed★ 清不掉憑證欄位就不存截圖 —— 少一張截圖遠優於帳號落地。
+        notes.append("screenshot_skipped=無法確認憑證欄位已清空")
+        logging.warning("[除錯檔] 無法確認憑證欄位已清空 → 本次不存截圖")
+
+    if store_page_source_enabled():
+        try:
+            html_path = base.with_suffix(".html")
+            src = driver.page_source or ""
+            html_path.write_text(src, encoding="utf-8", errors="replace")
+            saved.append(html_path)
+            logging.info("已儲存頁面 HTML: %s（設定頁已開啟「儲存整頁原始碼」）",
+                         html_path)
+        except Exception as e:
+            logging.warning("儲存 HTML 失敗: %s", e)
+    else:
+        notes.append("page_source_skipped=預設不儲存整頁原始碼（設定頁可開啟）")
+
+    # meta 一律寫：就算截圖與 HTML 都沒存，也要留下「為什麼沒存」與錯誤訊息，
+    # 否則現場只會看到一個空資料夾，完全不知道發生過什麼。
+    try:
+        meta_path = base.with_suffix(".txt")
+        lines = [f"time={datetime.now().isoformat()}"]
+        if error_hint:
+            lines.append(str(error_hint))
+        lines.extend(notes)
+        # ★[外審第 1 輪] 在【最後的寫入邊界】一次遮完★
+        #   舊版只遮 error_hint，但 notes 裡的 `screenshot_failed={e}` 同樣是院方丟
+        #   回來的例外文字（unexpected alert 會把整段彈窗內容帶進來）。遠離「哪一行
+        #   記得要遮」這種人為判斷 —— 寫出去前整份過一次。落地前拿【實際值】取代，
+        #   不是用樣式猜（那是外審 P2-03 批評的做法）。
+        from cmuh_common.debug_privacy import redact_secrets
+        meta_path.write_text(
+            redact_secrets("\n".join(lines), redact) + "\n",
+            encoding="utf-8", errors="replace")
+        saved.append(meta_path)
+    except OSError:
+        pass
     return saved
 
 
@@ -534,8 +589,17 @@ def _handle_clock_failure(driver, username: str, task_label: str, exc, dry_run: 
     hint = str(exc) if exc else ""
     if exc and not isinstance(exc, str):
         hint = f"{type(exc).__name__}: {exc}"
-    prefix = f"{task_label}_{username}" if task_label else f"fail_{username}"
-    paths = save_debug_artifacts(driver, prefix, error_hint=hint)
+    # ★[2026-07-30 外審 P1-02] 檔名不可含帳號★
+    #   檔名會被塞進 Windows 通知（notify_clock_failure）、出現在資料夾清單、
+    #   以及任何拍到檔案總管的截圖裡。改用不可逆短代號：仍分得出「這批檔是同一個
+    #   帳號的」，但看檔名的人得不到帳號。
+    from cmuh_common.debug_privacy import account_tag
+    tag = account_tag(username)
+    prefix = f"{task_label}_{tag}" if task_label else f"fail_{tag}"
+    # 只遮帳號：密碼從來不會出現在這條路徑的例外訊息裡（它只進到瀏覽器表單，
+    # 不經過我們的字串），為了遮它而把密碼再搬運一次反而多開一個暴露點。
+    paths = save_debug_artifacts(driver, prefix, error_hint=hint,
+                                 redact=(username,))
     prune_debug_dumps()
     logging.error("打卡失敗已存除錯檔 (%s 個): %s", len(paths), paths)
     if not dry_run:
@@ -618,6 +682,17 @@ def load_config() -> list:
             logging.error("[autoclock] 設定檔暫時讀取失敗(status=error)：%s"
                           " —— 本次不視為『未設定』,並禁止覆寫存檔", CONFIG_FILE)
         accounts_data = data if isinstance(data, list) else []
+    # ★[2026-07-30 外審 P1-02 第 1 輪] 帳號不可寫進 log 檔★
+    #   診斷包會把 log 寄出去。若只在寄出前遮，就永遠要回答「當時到底有哪些
+    #   帳號」—— 使用者先刪掉一個帳號、之後才產生診斷包，那個已刪帳號仍在
+    #   log 裡卻不在遮蔽清單上，一份號稱安全的 zip 裡就有帳號。
+    #   【根本不要寫進去】就沒有這個問題。UI 即時記錄窗不受影響。
+    try:
+        from cmuh_common.debug_privacy import install_log_secret_filter
+        install_log_secret_filter(
+            *[a.get("username") for a in accounts_data if isinstance(a, dict)])
+    except Exception:
+        logging.debug("[除錯檔] 帳號 log 遮蔽安裝失敗（略過）", exc_info=True)
     _warn_config_issues(accounts_data)  # [W13] 對原始資料醒目提示設定問題(不擋啟動)
     return _sanitize_accounts(accounts_data)  # [AC-02] tick/迴圈路徑一律拿到安全資料
 
@@ -1822,12 +1897,96 @@ class ClockApp(tk.Tk):
         ttk.Button(btn_frame, text="刪除", command=self.delete_account).pack(side=tk.LEFT)
         ttk.Button(btn_frame, text="儲存並重啟(背景)", command=self.save_and_bg,
                    style="Action.TButton").pack(side=tk.RIGHT)
+        self._build_debug_privacy_panel(right_panel)
         log_frame = ttk.LabelFrame(main_container, text="執行紀錄 (Live Log)", padding="5")
         log_frame.pack(fill=tk.BOTH, expand=True)
         self.log_text = scrolledtext.ScrolledText(
             log_frame, height=8, state="disabled", font=("Consolas", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
         self.populate_listbox()
+
+    # ── 除錯檔隱私（外審 P1-02）────────────────────────────────────────────
+    def _build_debug_privacy_panel(self, parent) -> None:
+        """除錯檔的隱私控制：開關 + 一鍵刪除 + 安全診斷包。
+
+        ★為什麼「安全診斷包」與「不存整頁原始碼」要一起出現★
+        把整頁原始碼關掉之後，出事時能給的東西變少；若沒有安全的替代品，使用者遲早
+        會被迫去打開那個開關、或把含帳號的截圖整包寄出 —— 預設值的保護就被繞過去了。
+        """
+        from cmuh_common.debug_privacy import load_privacy_settings
+
+        frame = ttk.LabelFrame(parent, text="除錯檔（隱私）", padding="5")
+        frame.pack(fill=tk.X, pady=(8, 0))
+        self.store_page_source_var = tk.BooleanVar(
+            value=bool(load_privacy_settings().get("store_page_source")))
+        ttk.Checkbutton(
+            frame,
+            text="儲存整頁原始碼（含帳號欄與打卡紀錄，僅在排查問題時暫時開啟）",
+            variable=self.store_page_source_var,
+            command=self._on_toggle_page_source).pack(anchor="w")
+        row = ttk.Frame(frame)
+        row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(row, text="立即刪除所有除錯檔",
+                   command=self._purge_debug_dumps).pack(side=tk.LEFT)
+        ttk.Button(row, text="產生安全診斷包…",
+                   command=self._make_diag_bundle).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(frame,
+                  text=f"除錯檔位置：{DEBUG_DUMPS_DIR}（逾期自動清除）",
+                  foreground="#666666").pack(anchor="w", pady=(4, 0))
+
+    def _on_toggle_page_source(self) -> None:
+        from cmuh_common.debug_privacy import (
+            load_privacy_settings, save_privacy_settings,
+        )
+        want = bool(self.store_page_source_var.get())
+        if not save_privacy_settings({"store_page_source": want}):
+            messagebox.showerror("除錯檔設定", "設定沒有存起來，請看 log。")
+            # ★回讀★ 存不起來就把畫面改回磁碟上的真實值，不要讓 UI 顯示一個假狀態
+            self.store_page_source_var.set(
+                bool(load_privacy_settings().get("store_page_source")))
+            return
+        if want:
+            messagebox.showwarning(
+                "已開啟儲存整頁原始碼",
+                "整頁原始碼包含登入頁的帳號欄與打卡紀錄。\n"
+                "排查完問題請記得關掉，並用「立即刪除所有除錯檔」清乾淨。")
+
+    def _purge_debug_dumps(self) -> None:
+        from cmuh_common.debug_privacy import purge_dir
+
+        if not messagebox.askyesno(
+                "刪除除錯檔",
+                f"要刪掉 {DEBUG_DUMPS_DIR} 裡的所有除錯檔嗎？\n此動作無法復原。"):
+            return
+        gone, failed = purge_dir(DEBUG_DUMPS_DIR)
+        msg = f"已刪除 {gone} 個檔案。"
+        if failed:
+            msg += f"\n有 {failed} 個刪不掉（可能正被其他程式開啟），請稍後再試。"
+        messagebox.showinfo("刪除除錯檔", msg)
+
+    def _make_diag_bundle(self) -> None:
+        from tkinter import filedialog
+
+        from cmuh_common.debug_privacy import build_safe_diag_bundle
+
+        dest = filedialog.asksaveasfilename(
+            parent=self, title="儲存安全診斷包",
+            defaultextension=".zip", filetypes=[("Zip", "*.zip")],
+            initialfile=f"autoclock_diag_{datetime.now():%Y%m%d_%H%M%S}.zip")
+        if not dest:
+            return
+        secrets = [str(a.get("username", "")) for a in (self.accounts or [])
+                   if isinstance(a, dict)]
+        added, note = build_safe_diag_bundle(
+            dest, log_files=[str(LOG_FILE)], meta_dir=str(DEBUG_DUMPS_DIR),
+            secrets=secrets)
+        if not added:
+            messagebox.showwarning("安全診斷包", note)
+            return
+        messagebox.showinfo(
+            "安全診斷包",
+            f"{note}\n\n已存到：\n{dest}\n\n"
+            "內容只有 log 與錯誤摘要（帳號已遮蔽）；截圖與整頁原始碼刻意不放。")
 
     def poll_log_queue(self):
         lines = []
