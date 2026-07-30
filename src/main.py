@@ -1631,6 +1631,60 @@ _AUDIT_HEALTH_ALERTS = _AlertDeduper("audit-health")
 _MISMATCH_ALERTS = _AlertDeduper("audit-mismatch")
 
 
+# ─── 保留期清掃（第二輪外審 P1-03 / P1-02 / P3-02）────────────────────────
+# ★宣告了保留期卻不主動執行，等於沒有保留期★
+#   每一種落地檔原本各自清自己的，而且清理只發生在「產生那種檔案的事情再度發生」
+#   的時候、大多還只看數量不看時效。細節見 cmuh_common/retention.py 的檔頭。
+#   這裡集中宣告「什麼東西留幾天」，由啟動與每日排程各跑一次。
+#
+# ★天數與規則都在 cmuh_common/retention.py★（單一權威）——
+#   產生這些檔的模組(autoclock / consult_query)與這裡都從那邊取。兩處各寫一個
+#   數字遲早會不一致：外審第 1 輪就抓到 `.corrupt-*` 同時被宣告成 30 天
+#   (cache_cleanup)與 90 天(我新加的規則)，於是「有 90 天搶救窗」是謊話。
+#   `.corrupt-*` 因此不在本清單內，歸 cache_cleanup 管。
+
+
+def _retention_rules() -> list:
+    """本機要定期清掃的落地檔。目錄不存在的規則會被 sweep 靜默跳過。"""
+    from cmuh_common.retention import (
+        consult_shot_rule, debug_dump_rule, settings_backup_rule,
+    )
+    settings = get_settings_dir()
+    return [
+        debug_dump_rule(os.path.join(settings, "debug_dumps")),
+        consult_shot_rule(os.path.join(settings, "consult_shots")),
+        settings_backup_rule(settings),
+    ]
+
+
+def _sweep_restart_err_files() -> int:
+    """早夭子行程的 stderr 檔。`sweep_old_restart_err_files` 本來就有 TTL
+    (RESTART_ERR_KEEP_SEC = 1 天),只是原本沒有任何人定期叫它。"""
+    import tempfile
+
+    from cmuh_common.paths import sweep_old_restart_err_files
+    return int(sweep_old_restart_err_files(tempfile.gettempdir()) or 0)
+
+
+def run_retention_sweep() -> None:
+    """跑一輪保留期清掃並記 log。同步檔案 IO —— 勿在 UI/熱鍵緒直接呼叫。不拋。"""
+    try:
+        from cmuh_common.patient_locator import prune_index
+        from cmuh_common.retention import sweep
+        res = sweep(
+            _retention_rules(),
+            extra_tasks=[
+                # 定位索引是逐【列】修剪(檔案要留著),不是刪整個檔。
+                ("定位索引", lambda: prune_index(
+                    get_conf_path(_LOCATOR_INDEX_FILENAME))),
+                # 早夭 stderr 檔本來就有 TTL,只是原本沒人定期叫它。
+                ("重啟錯誤檔", _sweep_restart_err_files),
+            ])
+        logging.info("[retention] %s", res.summary())
+    except Exception:
+        logging.debug("[retention] 清掃失敗（不影響任何流程）", exc_info=True)
+
+
 def audit_health_check(notify: bool = True) -> dict:
     """[GPT-5.6 批次三] 稽核健康檢查:驗證帳本完整性 + 彙整本次執行的遺失計數。
 
@@ -16824,6 +16878,11 @@ class AutomationApp:
         self.root.after(12000, lambda: _submit_startup_background(
             "audit-health-startup", audit_health_check))
 
+        # [P1-03] 開機也清一次保留期:每天重開程式的機器不會跑到 07:15 那個排程,
+        # 只有排程就等於「這台機器永遠不清」。18s 排在稽核檢查之後,避開啟動高峰。
+        self.root.after(18000, lambda: _submit_startup_background(
+            "retention-sweep-startup", run_retention_sweep))
+
         # [GPT-5.6 P2-03] 開機把「已通知改版版本」從磁碟載回記憶體 → 重啟後同一改版不重寄。
         # 早點做(400ms),趕在使用者按第一個 F 鍵、偵測到改版之前;檔案 IO 因此不落在熱鍵路徑。
         # [codex R1 2026-07-23] 走 _if_watchdog 版:非 watchdog 機不寄改版通知,也就不需要(也
@@ -16929,6 +16988,14 @@ class AutomationApp:
                 lambda: run_named_job("audit-health-daily",
                                       lambda: self.bg_executor.submit(audit_health_check))
             ).tag("audit", "daily")
+            # [P1-03] 保留期清掃：07:15（稽核健康檢查之前，兩者都在打卡 07:31 之前
+            # 跑完）。★不可只在啟動時掃★——跨夜長駐的機器可以好幾週不重開，
+            # 那正是「宣告 30 天卻留了一年」的成因。
+            schedule.every().day.at("07:15").do(
+                lambda: run_named_job("retention-sweep-daily",
+                                      lambda: self.bg_executor.submit(
+                                          run_retention_sweep))
+            ).tag("retention", "daily")
             
             # [2026-07-15 跨夜] 加 07:40:程式放跨夜時,打卡程式 07:31 自動打卡後原本要等
             # 08:00 才第一次查詢(每天重開程式的人啟動 +3.5s 就查,反而看得到)→ 07:40 查一次,

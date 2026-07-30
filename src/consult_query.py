@@ -115,7 +115,7 @@ LOG_FILE = SETTINGS_DIR / "consult_query.log"
 SHOTS_DIR = SETTINGS_DIR / "consult_shots"
 RUNNOW_FLAG = SETTINGS_DIR / "consult_query_runnow.flag"
 RELOAD_FLAG = SETTINGS_DIR / "consult_query_reload.flag"
-MAX_SHOT_FILES = 60
+MAX_SHOT_FILES = 60          # ★容量後備,不是保留期政策★（見 _prune_old_shots）
 
 SYSTEMFTP_PATH = r"C:\admc\systemftp.exe"
 # [2026-07-25 審查] 行程名（小寫）；強制結束前重新確認身分用，避免 PID 重用時誤殺。
@@ -2366,6 +2366,17 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
 
 
 def _prune_old_shots() -> None:
+    """清掉過期(TTL)與超量(容量後備)的會診截圖。
+
+    TTL 才是保留期政策(截圖含整份病人清單);`MAX_SHOT_FILES` 只是避免爆量塞爆
+    磁碟的後備,它會刪掉還在期限內的檔。原本這裡只有數量這一關 —— 只要沒破 60 張,
+    截圖可以永久留著。詳見 `cmuh_common/retention.py` 與 autoclock 的同一段說明。
+    """
+    try:
+        from cmuh_common.retention import consult_shot_rule, sweep
+        sweep([consult_shot_rule(str(SHOTS_DIR))])
+    except Exception:
+        logging.debug("會診截圖 TTL 清理失敗(略過)", exc_info=True)
     try:
         files = sorted(SHOTS_DIR.glob("consult_*.png"),
                        key=lambda p: p.stat().st_mtime, reverse=True)

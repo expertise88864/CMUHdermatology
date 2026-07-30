@@ -95,6 +95,7 @@ except ImportError:
 BASE_DIR = Path(get_app_dir())
 SETTINGS_DIR = Path(get_settings_dir())
 DEBUG_DUMPS_DIR = SETTINGS_DIR / "debug_dumps"
+# ★容量後備,不是保留期政策★（見 prune_debug_dumps 的說明）
 MAX_DEBUG_DUMP_FILES = 40
 try:
     DEBUG_DUMPS_DIR.mkdir(parents=True, exist_ok=True)
@@ -469,6 +470,25 @@ def save_debug_artifacts(driver, filename_prefix: str, error_hint: str = "") -> 
 
 
 def prune_debug_dumps() -> None:
+    """清掉過期(TTL)與超量(容量後備)的除錯檔。
+
+    ★[2026-07-30 外審第1輪] 兩件事要分清楚★
+      * **TTL 才是保留期政策**(隱私要求:這些檔含帳號與完整畫面)。原本這裡【只有】
+        數量這一關,於是宣告的保留期從來沒有被執行過 —— 只要總數沒破 40,含帳號的
+        截圖與 page_source HTML 可以永久留著。而我第一版加了 RetentionSweeper 卻
+        沒回頭改這裡,變成同時存在兩套互相矛盾的政策(外審抓到)。
+        天數與規則都從 `cmuh_common.retention` 取,不在這裡另立標準。
+      * **MAX_DEBUG_DUMP_FILES 只是容量後備**:同一天內爆量(重試迴圈)時避免塞爆
+        磁碟。它【會刪掉還在期限內的檔】—— 那是刻意的取捨,不是保留期政策。
+
+    這裡也跑一次 TTL(而不是只靠每日排程):「剛產生新的除錯檔」正是最該把舊的清掉
+    的時機,不必等到明天 07:15。
+    """
+    try:
+        from cmuh_common.retention import debug_dump_rule, sweep
+        sweep([debug_dump_rule(str(DEBUG_DUMPS_DIR))])
+    except Exception:
+        logging.debug("除錯檔 TTL 清理失敗(略過)", exc_info=True)
     try:
         if not DEBUG_DUMPS_DIR.is_dir():
             return

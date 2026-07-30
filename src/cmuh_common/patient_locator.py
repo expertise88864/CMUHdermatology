@@ -25,9 +25,18 @@ import json
 import logging
 import os
 import re
+import tempfile
+import threading
 from datetime import datetime, timedelta
 
 INDEX_FILENAME = "patient_locator_index.jsonl"
+# ★[2026-07-30 外審] append 與 prune 必須互斥★
+#   兩者都是 read-modify-replace,而且原本都用 `{path}.tmp-{os.getpid()}` ——
+#   同一個行程 ⇒ 同一個檔名。背景清掃讀完舊內容之後,若剛好有一筆回讀不符寫進來,
+#   清掃再把它的舊快照 replace 回去,那筆【新病人就此消失】——正是這個功能存在的
+#   唯一目的。tmp 檔名也會互相踩。
+#   清掃很短(只有 30 天內的 mismatch),鎖的代價可以忽略。
+_INDEX_LOCK = threading.Lock()
 INDEX_RETAIN_DAYS = 30
 # 橫幅通常在視窗上方,不必掃到底;掃太多控件會拖慢熱鍵緒。
 MAX_CONTROLS_TO_SCAN = 400
@@ -153,6 +162,42 @@ def format_for_log(loc) -> str:
 # [使用者定案 2026-07-28] 除了寄信,另寫一份獨立索引。理由:告警信「同一功能同一天
 # 只寄一次」,同一天第二個出問題的病人根本不會有信;SMTP 掛掉時也整個遺失。
 # 索引與 hash-chain 稽核帳本【分開】—— 帳本「不存病人明文識別」的既有定案不動。
+def _atomic_write_rows(path: str, rows: list) -> None:
+    """把整份索引原子寫回。tmp 檔名用 mkstemp —— 不可用 pid 當唯一性來源
+    (append 與 prune 在【同一個行程】,pid 相同就會互相踩)。"""
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".tmp-",
+                              dir=os.path.dirname(path) or ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _read_rows(path: str) -> list:
+    rows: list = []
+    if not os.path.exists(path):
+        return rows
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue          # 壞列略過,不讓一列壞掉毀掉整份索引
+            if isinstance(obj, dict):
+                rows.append(obj)
+    return rows
+
+
 def _prune(rows: list, today: datetime, retain_days: int) -> list:
     cutoff = (today - timedelta(days=retain_days)).isoformat()
     out = []
@@ -163,12 +208,42 @@ def _prune(rows: list, today: datetime, retain_days: int) -> list:
     return out
 
 
+def prune_index(path: str, *, now: datetime | None = None,
+                retain_days: int = INDEX_RETAIN_DAYS) -> int:
+    """★[2026-07-30 外審 P1-03] 不依賴「下一次 mismatch」的獨立修剪★
+
+    原本修剪只寫在 `append_index()` 裡:宣告 `INDEX_RETAIN_DAYS = 30`,但只要這
+    30 天內沒有再發生回讀不符,某個病人的病歷號就會一直留著(實務上可以留一整年)。
+    宣告了保留期卻不主動執行,等於沒有保留期。由 RetentionSweeper 定期呼叫本函式。
+
+    ★持 _INDEX_LOCK★:與 append_index 互斥 —— 背景清掃讀完舊內容之後,若剛好有
+    一筆回讀不符寫進來,清掃再把舊快照 replace 回去,那筆新病人就此消失(外審抓到)。
+
+    回傳實際刪掉幾列。絕不拋。
+    """
+    try:
+        with _INDEX_LOCK:
+            rows = _read_rows(path)
+            if not rows:
+                return 0
+            kept = _prune(rows, now or datetime.now(), retain_days)
+            removed = len(rows) - len(kept)
+            if removed <= 0:
+                return 0
+            _atomic_write_rows(path, kept)
+            return removed
+    except Exception:
+        logging.debug("[locator] 修剪定位索引失敗(不影響臨床流程)", exc_info=True)
+        return 0
+
+
 def append_index(path: str, *, ts: str, action: str, detail: str, locator,
                  now: datetime | None = None,
                  retain_days: int = INDEX_RETAIN_DAYS) -> bool:
     """把一筆回讀不符的定位資訊寫進索引檔(順便修剪過期列)。絕不拋。
 
     回傳是否成功寫入。**在告警信的去重之前呼叫** —— 去重擋掉的是信,不是紀錄。
+    ★持 _INDEX_LOCK★:與 prune_index 互斥(見那裡的說明)。
     """
     try:
         row = {"ts": ts, "action": str(action), "detail": str(detail)}
@@ -176,26 +251,10 @@ def append_index(path: str, *, ts: str, action: str, detail: str, locator,
             v = (locator or {}).get(k)
             if v:
                 row[k] = str(v)
-        rows = []
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except ValueError:
-                        continue      # 壞列略過,不讓一列壞掉毀掉整份索引
-                    if isinstance(obj, dict):
-                        rows.append(obj)
-        rows = _prune(rows, now or datetime.now(), retain_days)
-        rows.append(row)
-        tmp = f"{path}.tmp-{os.getpid()}"
-        with open(tmp, "w", encoding="utf-8") as f:
-            for r in rows:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        os.replace(tmp, path)
+        with _INDEX_LOCK:
+            rows = _prune(_read_rows(path), now or datetime.now(), retain_days)
+            rows.append(row)
+            _atomic_write_rows(path, rows)
         return True
     except Exception:
         logging.debug("[locator] 寫入定位索引失敗(不影響臨床流程)", exc_info=True)

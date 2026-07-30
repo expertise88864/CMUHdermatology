@@ -464,10 +464,14 @@ def test_rebuild_schedule_disabled_clears_jobs(monkeypatch):
 
 def test_prune_old_shots_keeps_newest(tmp_path, monkeypatch):
     monkeypatch.setattr(cq, "SHOTS_DIR", tmp_path)
+    # [2026-07-30] mtime 原本設成 1000000（1970 年！）只為了製造遞增順序 —— 但
+    # _prune_old_shots 現在也會執行【保留期 TTL】，那些「1970 年的檔」會被全部清掉，
+    # 這支就測不到它真正要測的【數量上限】了。改成期限內的遞增時間。
+    base = time.time() - 3600
     for i in range(cq.MAX_SHOT_FILES + 3):
         p = tmp_path / f"consult_2026{i:04d}.png"
         p.write_bytes(b"x")
-        os.utime(p, (1000000 + i, 1000000 + i))  # 遞增 mtime
+        os.utime(p, (base + i, base + i))        # 遞增 mtime（都在期限內）
     cq._prune_old_shots()
     remain = sorted(tmp_path.glob("consult_*.png"))
     assert len(remain) == cq.MAX_SHOT_FILES
