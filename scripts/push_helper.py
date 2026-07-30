@@ -4,10 +4,20 @@
 流程：
   1. sanity check：settings/ 不可被追蹤、.gitignore 完整、version.py 可讀
   2. 確認有 git 變更
-  3. 品質關卡：ruff + pytest，紅燈就中止（壞 build 推不出去；尚未 bump/commit）
+  3. 品質關卡：ruff + pyright + pytest + skip 守衛 + 覆蓋率門檻
+     紅燈或【工具沒裝】就中止（壞 build 推不出去；尚未 bump/commit）
   4. bump 版本（YYYY.MM.DD.serial）
   5. 同步 manifest.json（含 SHA256）
   6. git add -A → commit → push
+
+用法：
+  python scripts/push_helper.py "commit 訊息"
+  python scripts/push_helper.py "commit 訊息" --emergency "為什麼非繞過不可"
+
+★[2026-07-30 第二輪外審 P2-08] 這個關卡是【最後一道】，不是第一道★
+push 是直推 main，而診間電腦約 5 分鐘內就會自動拉新版 —— GitHub CI 是推上去
+之後才跑的，它紅燈的時候壞版本已經在診間了。所以本機關卡缺工具時必須中止，
+不能像舊版那樣印一句「CI 仍會把關」就放行。
 """
 from __future__ import annotations
 
@@ -71,31 +81,100 @@ def step2_check_changes() -> bool:
     return True
 
 
-def step_quality_gate() -> None:
-    """ruff + pytest 品質關卡。任一紅燈即中止推送（此時尚未 bump 版本、未 commit）。
+GATE_ARTIFACTS = ("junit.xml", "cov.json")
 
-    工具未安裝時警示並略過該項（讓沒裝 dev 工具的機器仍能推），但 CI 仍會把關。
+
+def _clean_gate_artifacts() -> None:
+    for name in GATE_ARTIFACTS:
+        try:
+            (REPO_ROOT / name).unlink()
+        except OSError:
+            pass
+
+
+def step_quality_gate(emergency_reason: str = "") -> None:
+    """本機品質關卡。任一紅燈即中止推送（此時尚未 bump 版本、未 commit）。
+
+    ★[2026-07-30 第二輪外審 P2-08] 工具沒裝 →【中止】，不是略過★
+    舊版的寫法是：`find_spec(module) is None` 就印一行「已略過，CI 仍會把關」
+    然後繼續推。那句話在這個專案是錯的：
+
+      * push 是【直推 main】，CI 是推上去之後才跑的；而診間電腦的自動更新
+        大約 5 分鐘內就把新版拉下去。CI 紅燈的時候，壞版本已經在診間了。
+      * 而【工具沒裝】正是最可能發生在新機器／重灌後的情境 —— 也就是最需要
+        關卡的時候。那一刻退回「不檢查」，等於這把鎖只在不需要它的時候有效
+        （跟 P1-06 更新鎖犯過的錯完全一樣）。
+
+    真的遇到緊急狀況（診間壞掉、本機環境壞掉）用
+    `--emergency "理由"` —— 要寫理由、會大字印出來、而且會寫進 commit
+    訊息裡永久可查。有意識的繞過可以；默默地繞過不行。
     """
-    print("\n=== [3/7] 品質關卡（ruff + pytest）===")
-    checks = [
-        ("ruff", "ruff",
-         [sys.executable, "-m", "ruff", "check", "src", "scripts", "tests"]),
-        ("pytest", "pytest",
-         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]),
-    ]
+    print("\n=== [3/7] 品質關卡（ruff + pyright + pytest + 棘輪）===")
+    if emergency_reason:
+        print("  " + "!" * 56)
+        print("  !! 緊急模式：本次【跳過所有本機品質關卡】")
+        print(f"  !! 理由：{emergency_reason}")
+        print("  !! 這個理由會寫進 commit 訊息。推完請盡快回頭補跑關卡。")
+        print("  " + "!" * 56)
+        return
+
+    # ★工具齊全性先檢★：缺任何一個都直接中止，不進入部分檢查
+    needed = {"ruff": "ruff", "pyright": "pyright", "pytest": "pytest",
+              "pytest-cov": "pytest_cov"}
+    missing = [name for name, module in needed.items()
+               if importlib.util.find_spec(module) is None]
+    if missing:
+        # ★安裝指令要指名【這個】解釋器★
+        #   工具有沒有裝是用 `importlib.util.find_spec`（＝跑這支腳本的直譯器）判斷的，
+        #   檢查也全都走 `sys.executable`。本機常裝了好幾個 Python，裸的 `pip` 很可能
+        #   屬於另一個 —— 使用者照著裝完，這裡依舊查不到，於是每次 push 都被擋而且
+        #   不知道為什麼。（repo 裡 probe_ditto_ocr.py 早就是這樣寫的。）
+        fail("本機品質關卡的工具沒裝齊，【中止推送】：" + ", ".join(missing) + "\n"
+             '  請先裝："' + sys.executable + '" -m pip install '
+             + " ".join(missing) + "\n"
+             "  （要用這個解釋器的 pip：本機可能裝了好幾個 Python，裸的 `pip` 很可能\n"
+             "    屬於另一個 —— 裝完這裡依舊查不到，推不出去且不知道為什麼）\n"
+             "  ★不能因為「CI 會把關」就放行★：push 是直推 main，CI 是推上去之後\n"
+             "  才跑的，而診間電腦約 5 分鐘內就會自動拉新版 —— CI 紅燈時壞版本\n"
+             "  已經在診間了。\n"
+             '  真的緊急：python scripts/push_helper.py "訊息" '
+             '--emergency "為什麼不能先裝工具"')
+
+    _clean_gate_artifacts()
     failed = []
-    for label, module, cmd in checks:
-        if importlib.util.find_spec(module) is None:
-            print(f"  [略過] {label} 未安裝，跳過（建議 pip install {label}）。CI 仍會把關。")
-            continue
+
+    def _step(label: str, cmd: list) -> bool:
         print(f"  $ {' '.join(cmd)}")
-        if subprocess.run(cmd, cwd=REPO_ROOT).returncode != 0:
+        ok = subprocess.run(cmd, cwd=REPO_ROOT).returncode == 0
+        print(f"  [{'OK' if ok else 'FAIL'}] {label}")
+        if not ok:
             failed.append(label)
-        else:
-            print(f"  [OK] {label} 通過")
+        return ok
+
+    _step("ruff", [sys.executable, "-m", "ruff", "check", "src", "scripts", "tests"])
+    # pyright 以前只在 CI 跑 —— 型別錯誤因此都是【推上去之後】才發現。
+    _step("pyright", [sys.executable, "-m", "pyright"])
+    # 一次 pytest 同時產出 junit.xml 與 cov.json，下面兩道棘輪直接吃（不多跑一次）
+    pytest_ok = _step("pytest", [
+        sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+        "--junitxml=junit.xml", "--cov=src", "--cov-report=json:cov.json",
+        "--cov-report="])
+    if pytest_ok:
+        _step("skip 數量守衛",
+              [sys.executable, "scripts/check_skips.py", "junit.xml"])
+        _step("分層覆蓋率門檻",
+              [sys.executable, "scripts/check_coverage.py", "cov.json"])
+    else:
+        # pytest 紅燈時報告不完整，拿不完整的報告去判只會誤導
+        print("  [略過] skip 守衛與覆蓋率門檻（pytest 已紅燈，報告不完整）")
+
+    # 型別債棘輪【刻意只在 CI 跑】：它要把 11 條規則各跑一次 pyright（本機實測約
+    # 10 分鐘），每次 push 都等太久 → 會逼人想辦法繞過關卡。而它守的是「被關掉的
+    # 規則有沒有新增診斷」，不是正確性；推上去之後 CI 才發現可以接受。
+    _clean_gate_artifacts()
     if failed:
-        fail(f"品質關卡未通過（{', '.join(failed)} 紅燈），已中止推送。\n"
-             f"  尚未 bump 版本、未 commit；請修正上面紅燈後再 push。")
+        fail("品質關卡未通過（" + ", ".join(failed) + " 紅燈），已中止推送。\n"
+             "  尚未 bump 版本、未 commit；請修正上面紅燈後再 push。")
 
 
 VERSION_REL = "src/cmuh_common/version.py"
@@ -291,11 +370,21 @@ def step5_stage() -> None:
     run(["git", "add", "-A"])
 
 
-def step5_commit(commit_msg: str, new_version: str) -> None:
+def step5_commit(commit_msg: str, new_version: str,
+                 emergency_reason: str = "") -> None:
     print("")
     print("=== [8/9] Commit ===")
     if not commit_msg or commit_msg.strip() in ("", "1"):
         commit_msg = f"Update v{new_version}"
+    if emergency_reason:
+        # ★繞過關卡要留下永久紀錄★ —— 只在終端印一行，關掉視窗就沒了。
+        # 寫進 commit 訊息後，`git log --grep` 一查就知道哪幾版是未經本機關卡的。
+        commit_msg = "\n".join([
+            commit_msg,
+            "",
+            "[緊急推送] 本次跳過本機品質關卡（ruff/pyright/pytest/棘輪）",
+            f"理由：{emergency_reason}",
+        ])
     # 用 UTF-8 暫存檔 + `git commit -F`：Windows 上 subprocess 會以系統 ANSI(cp936/gbk)
     # 編碼參數，commit message 含 emoji/特殊符號(例 U+232B 退格符)時會 UnicodeEncodeError
     # 而中斷整個推送。改寫成 UTF-8 檔讓 git 自行讀取，與系統 codepage 無關，穩定不踩雷。
@@ -327,8 +416,31 @@ def step6_push() -> None:
         sys.exit(1)
 
 
+def parse_args(argv: list) -> tuple:
+    """→ (commit_msg, emergency_reason)。
+
+    ★[2026-07-30 外審 P2-08] `--emergency` 一定要帶理由★
+    一個不用寫理由的旁路開關，用起來跟「預設就跳過」沒兩樣 —— 幾次之後就變成
+    習慣動作。要求打字寫理由，而且理由會進 commit 訊息，讓每一次繞過都留下
+    可以被回頭質問的紀錄。
+    """
+    args = list(argv[1:])
+    emergency = ""
+    if "--emergency" in args:
+        idx = args.index("--emergency")
+        rest = args[idx + 1:]
+        reason = rest[0].strip() if rest else ""
+        if not reason or reason.startswith("--"):
+            fail('--emergency 一定要接理由，例如：\n'
+                 '  python scripts/push_helper.py "hotfix" '
+                 '--emergency "診間全掛，pytest 環境同時壞掉，先推修正"')
+        emergency = reason
+        args = args[:idx] + rest[1:]
+    return " ".join(args), emergency
+
+
 def main(argv: list) -> int:
-    commit_msg = " ".join(argv[1:]) if len(argv) > 1 else ""
+    commit_msg, emergency_reason = parse_args(argv)
 
     print("=" * 60)
     print("  CMUHdermatology 一鍵推送")
@@ -345,7 +457,7 @@ def main(argv: list) -> int:
     # 若 OneDrive 剛好在那個瞬間還原,舊版就成為合法基準、檢查必過 —— 基準本身被
     # 污染,後面驗什麼都沒用。關卡(ruff/pytest)不會改動 src/scripts/tests,提前取樣安全。
     fingerprint = snapshot_tracked_sources()
-    step_quality_gate()
+    step_quality_gate(emergency_reason)
     verify_unchanged_since_tests(fingerprint)
     new_ver = step3_bump_version()
     step4_sync_manifest(new_ver)
@@ -359,7 +471,7 @@ def main(argv: list) -> int:
     step5_stage()
     verify_index_matches(expected)
     verify_staged_version_consistency(new_ver)
-    step5_commit(commit_msg, new_ver)
+    step5_commit(commit_msg, new_ver, emergency_reason)
     step6_push()
 
     print("\n" + "=" * 60)

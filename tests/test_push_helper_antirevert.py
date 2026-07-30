@@ -79,7 +79,9 @@ def test_guard_runs_before_commit_in_main():
     ph = _load()
     src = inspect.getsource(ph.main)
     i_snap = src.index("fingerprint = snapshot_tracked_sources()")
-    i_gate = src.index("step_quality_gate()")
+    # [2026-07-30 外審 P2-08] 關卡多了 emergency 參數 → 用「呼叫的開頭」定位而不是
+    # 逐字比對。這條測試守的是【順序】，不是那一行長什麼樣子。
+    i_gate = src.index("step_quality_gate(")
     i_verify = src.index("verify_unchanged_since_tests(")
     i_stage = src.index("step5_stage()")
     i_index = src.index("verify_index_matches(")
