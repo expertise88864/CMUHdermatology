@@ -18,6 +18,7 @@ import hashlib
 import logging
 import os
 import re
+import sys
 import threading
 import time
 import concurrent.futures
@@ -426,6 +427,12 @@ def _download_one(file_entry: dict, app_dir: str) -> Optional[tuple]:
     return (key, local_filename, actual_version, content)
 
 
+# 部署目標平台。抽成模組層常數(而不是每次現算 sys.platform)有兩個理由:
+# 讓「Windows 上鎖機制壞掉」與「這不是 Windows」變成兩件可分辨的事,也讓測試
+# 能夠明確驗證兩條分支 —— 見 _updater_write_lock 的 fail-closed 說明。
+IS_WINDOWS = sys.platform.startswith("win")
+
+
 @contextlib.contextmanager
 def _updater_write_lock(timeout_sec: float = 30.0):
     """[IE-02 2026-07-10 + codex] 跨行程 + 跨 session 的「更新寫入」鎖。開機時 watchdog 幾乎同時拉起
@@ -440,23 +447,42 @@ def _updater_write_lock(timeout_sec: float = 30.0):
     msvcrt.locking 是 OS 鎖:持有者行程結束/crash 時 Windows【自動釋放】,不需手動判 stale,徹底
     避開該 race;鎖檔路徑固定 → 跨 session 共享;不需 Global\\ 的 SeCreateGlobalPrivilege。
 
-    yield True=可寫(拿到鎖,或非 Windows/鎖機制故障退回無鎖);False=逾時沒拿到 → caller 本輪放棄。
-    yield 在 try/finally(非 try/except)內,不吞 body 例外。"""
+    yield True=可寫(拿到鎖,或【確定不是 Windows】);False=逾時沒拿到、或 Windows 上鎖機制
+    故障 → caller 本輪放棄。yield 在 try/finally(非 try/except)內,不吞 body 例外。
+
+    ★[2026-07-30 第二輪外審 P1-06] Windows 上鎖機制故障必須 fail-closed★
+    原本四條失敗路徑(取不到 app dir、import msvcrt 失敗、開鎖檔失敗、初始化鎖檔失敗)
+    全都 `yield True` 照樣寫。但「拿不到鎖」與「鎖壞了」在後果上是同一件事 —— 而鎖壞掉
+    最可能發生的時刻正是磁碟權限/防毒出問題的時候,也正是【最需要這把鎖】的時候。
+    在那個瞬間退回無鎖,等於這把鎖只在不需要它的時候有效。
+    多支程式同時寫同一批 src/cmuh_common/*.py 與同名 .bak 的後果是「回滾還原到錯版本、
+    混 commit」—— 那比「本輪不更新、下次再說」嚴重得多,取捨很清楚。
+    只有 `not IS_WINDOWS` 才維持放行:部署目標是 Windows,CI(Linux)與開發機不可被鎖死。
+    """
+    if not IS_WINDOWS:
+        yield True                     # 確定不是 Windows → 不擋(刻意;部署目標是 Windows)
+        return
     try:
         lock_path = os.path.join(get_app_dir(), ".updater_write.lock")
     except Exception:
-        yield True
+        logging.warning("[更新] 取不到 app 目錄,無法建立更新鎖 → 本輪不寫入",
+                        exc_info=True)
+        yield False
         return
     try:
         import msvcrt
     except Exception:
-        yield True                     # 非 Windows / 無 msvcrt → 不擋(部署目標是 Windows)
+        # 在 Windows 上 import msvcrt 失敗不是「這不是 Windows」,而是執行環境壞了。
+        logging.warning("[更新] Windows 上無法 import msvcrt(執行環境異常)"
+                        " → 本輪不寫入", exc_info=True)
+        yield False
         return
     try:
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
     except OSError:
-        logging.debug("[更新] 開更新鎖檔失敗,退回無鎖", exc_info=True)
-        yield True
+        logging.warning("[更新] 開更新鎖檔失敗(可能被防毒/權限擋住)→ 本輪不寫入",
+                        exc_info=True)
+        yield False
         return
     try:
         # [codex P1] msvcrt.locking 從「目前檔位」鎖 nbytes。新建的 .updater_write.lock 是空檔;
@@ -466,12 +492,13 @@ def _updater_write_lock(timeout_sec: float = 30.0):
             os.write(fd, b"\0")
         os.lseek(fd, 0, os.SEEK_SET)
     except OSError:
-        logging.debug("[更新] 初始化鎖檔失敗,退回無鎖", exc_info=True)
+        logging.warning("[更新] 初始化鎖檔失敗(磁碟滿/權限?)→ 本輪不寫入",
+                        exc_info=True)
         try:
             os.close(fd)
         except OSError:
             pass
-        yield True
+        yield False
         return
     acquired = False
     deadline = time.time() + timeout_sec
