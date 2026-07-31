@@ -51,6 +51,7 @@ import ctypes
 import logging
 import threading
 import time
+from ctypes import wintypes
 
 # GetSystemMetrics 索引:整個虛擬桌面（含所有螢幕）。單用 -fullscreen 只蓋一個螢幕,
 # 診間有雙螢幕機器 → 另一台仍亮著顯示病歷。
@@ -349,6 +350,15 @@ class ScreenBlackout:
             #   `_create()` 拋例外 → 黑幕在【雙螢幕常見排列】下永遠不會出現。
             win.geometry(f"{w}x{h}{x:+d}{y:+d}")
             win.attributes("-topmost", True)
+            win.update_idletasks()
+            # ★[2026-07-31 使用者第二次回報] 用 Win32 擺、而且回讀驗證★
+            #   第一次改成逐螢幕之後，主螢幕好了但副螢幕只黑 1/3。那個比例就是線索：
+            #   螢幕矩形是用 Win32(`GetMonitorInfo`)查的，視窗卻是用 Tk 的
+            #   `wm geometry` 擺的 —— 本程式是 system-DPI-aware，兩台螢幕縮放不同時
+            #   這兩者**不是同一個座標空間**，擺上去就會被縮放成別的大小。
+            #   改成查與擺都走 Win32（同一個空間），然後【回讀 GetWindowRect 驗證】。
+            #   「送出去就當成功」正是這個 repo 反覆出事的形狀。
+            self._place_and_verify(win, (x, y, w, h), i)
             # ★不用 grab_set★：抓住輸入的話，黑幕若沒收乾淨會把整台機器鎖死。
             # ★使用者定案：任何一種都馬上收（滑鼠移動也一樣，不問移了幾 px）
             for seq in ("<Key>", "<Button>", "<MouseWheel>", "<Motion>"):
@@ -374,9 +384,73 @@ class ScreenBlackout:
             logging.debug("[黑幕] focus_force 失敗（仍以輪詢收場）", exc_info=True)
         # ★把實際用到的矩形記下來★ 使用者回報「蓋不滿」時，這是唯一能判斷
         #   「算錯了」還是「算對但被夾掉」的資料（回讀的是視窗真正的幾何）。
-        logging.info("[黑幕] 已建立 %d 片：要求 %s ／回讀 %s",
-                     len(wins), rects, [self._geometry_of(w) for w in wins])
+        # ★回讀的是 Win32 的 GetWindowRect，不是 Tk 的 winfo_*★
+        #   兩者在多螢幕不同縮放時會給出不同答案 —— 而使用者看到的是 Win32 那個。
+        logging.info("[黑幕] 已建立 %d 片：要求 %s ／實際 %s",
+                     len(wins), rects, self.panel_rects())
         self._schedule_poll()
+
+    def _place_and_verify(self, win, rect, index: int) -> None:
+        """用 Win32 把這一片擺到 rect，然後【回讀 GetWindowRect 驗證】。
+
+        ★為什麼不是只用 Tk 的 `wm geometry`★
+        螢幕矩形是 `GetMonitorInfo` 給的（Win32 座標空間）。本程式是
+        system-DPI-aware（見 `platform_win.set_dpi_awareness`），兩台螢幕縮放不同時，
+        Tk 的 `wm geometry` 與 Win32 座標【不是同一個空間】—— 使用者實機看到的
+        「主螢幕好了、副螢幕只黑 1/3」就是那個縮放比例。查與擺走同一個 API 才對得上。
+
+        ★為什麼一定要回讀★
+        `SetWindowPos` 回 True 只代表「呼叫成功」，不代表視窗真的在那個位置那個大小
+        （dpi 虛擬化、`wm maxsize`、視窗管理員都可能改它）。這個 repo 反覆出事的形狀
+        就是「送出去就當成功」。對不上時記 warning 並把兩組數字都寫出來 ——
+        下次使用者回報「蓋不滿」，log 直接就能判斷是算錯還是被改掉。
+        """
+        x, y, w, h = rect
+        try:
+            hwnd = int(win.winfo_id())
+        except Exception:
+            return
+        try:
+            u = ctypes.windll.user32
+            HWND_TOPMOST = -1
+            SWP_NOACTIVATE = 0x0010
+            SWP_SHOWWINDOW = 0x0040
+            u.SetWindowPos(hwnd, HWND_TOPMOST, int(x), int(y), int(w), int(h),
+                           SWP_NOACTIVATE | SWP_SHOWWINDOW)
+        except Exception:
+            logging.warning("[黑幕] 第 %d 片 SetWindowPos 失敗（沿用 Tk 的擺法）",
+                            index + 1, exc_info=True)
+            return
+        got = self._window_rect(hwnd)
+        if got is None:
+            logging.warning("[黑幕] 第 %d 片回讀 GetWindowRect 失敗 → 無法確認蓋滿",
+                            index + 1)
+            return
+        if got != (x, y, w, h):
+            logging.warning(
+                "[黑幕] ★第 %d 片沒有蓋到要求的範圍★ 要求 %s ／實際 %s"
+                "（差異多半來自螢幕縮放比例不同）", index + 1, (x, y, w, h), got)
+
+    @staticmethod
+    def _window_rect(hwnd: int):
+        """→ (x, y, w, h) 或 None。純 Win32 回讀，不經過 Tk。"""
+        try:
+            r = wintypes.RECT()
+            if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r)):
+                return None
+            return (int(r.left), int(r.top),
+                    int(r.right - r.left), int(r.bottom - r.top))
+        except Exception:
+            return None
+
+    def panel_rects(self) -> list:
+        """每一片【實際】蓋住的矩形（Win32 回讀）。診斷與測試用。"""
+        out = []
+        for hwnd in self._hwnds:
+            got = self._window_rect(hwnd)
+            if got is not None:
+                out.append(got)
+        return out
 
     @staticmethod
     def _geometry_of(win) -> str:

@@ -168,6 +168,96 @@ def test_the_gate_still_holds_if_only_one_panel_survives(tk_root):
         bo.hide()
 
 
+# ─── ★[2026-07-31 第二次回報] 查與擺要走同一個座標空間，而且要回讀★ ───────
+# 使用者：「現在變成主螢幕有黑 但是副螢幕沒有黑 或是只黑三分之一」。
+# 逐螢幕之後主螢幕對了，副螢幕還是 1/3 —— 那個比例就是縮放比。螢幕矩形是
+# `GetMonitorInfo` 給的（Win32 空間），視窗卻用 Tk 的 `wm geometry` 擺；本程式是
+# system-DPI-aware，兩台螢幕縮放不同時這兩者不是同一個空間。
+def test_each_panel_is_placed_with_win32_not_just_tk():
+    """查與擺必須走同一個 API —— 否則跨螢幕縮放時對不上。"""
+    import inspect
+    src = inspect.getsource(sb.ScreenBlackout._place_and_verify)
+    assert "SetWindowPos" in src
+    assert "GetWindowRect" in inspect.getsource(sb.ScreenBlackout._window_rect)
+
+
+def test_the_panel_geometry_is_read_back_and_verified(tk_root, caplog):
+    """★送出去就當成功，正是這個 repo 反覆出事的形狀★
+    擺完要回讀；對不上要留下【兩組數字】，下次才判斷得出是算錯還是被改掉。"""
+    import logging as _lg
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 500, 400)])
+    try:
+        with caplog.at_level(_lg.INFO):
+            assert bo.show() is True
+        assert bo.panel_rects() == [(0, 0, 500, 400)], \
+            "Win32 回讀到的矩形要等於要求的矩形"
+        assert any("要求" in r.getMessage() and "實際" in r.getMessage()
+                   for r in caplog.records), "log 要同時留下要求與實際"
+    finally:
+        bo.hide()
+
+
+def test_a_panel_that_lands_wrong_is_reported_not_swallowed(tk_root,
+                                                            monkeypatch,
+                                                            caplog):
+    """★蓋不滿要大聲★ 這正是使用者連續回報兩次的情況 ——
+    程式必須自己說得出「我要的是什麼、實際是什麼」。"""
+    import logging as _lg
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 500, 400)])
+    monkeypatch.setattr(sb.ScreenBlackout, "_window_rect",
+                        staticmethod(lambda _h: (0, 0, 166, 400)))  # 只有 1/3
+    try:
+        with caplog.at_level(_lg.WARNING):
+            bo.show()
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("沒有蓋到要求的範圍" in m for m in msgs)
+        assert any("(0, 0, 500, 400)" in m and "(0, 0, 166, 400)" in m
+                   for m in msgs), "要把要求與實際兩組數字都寫出來"
+    finally:
+        bo.hide()
+
+
+def test_a_readback_failure_is_reported_rather_than_assumed_fine(tk_root,
+                                                                 monkeypatch,
+                                                                 caplog):
+    """讀不到 ≠ 沒問題（本 repo 的老病灶）。"""
+    import logging as _lg
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 500, 400)])
+    monkeypatch.setattr(sb.ScreenBlackout, "_window_rect",
+                        staticmethod(lambda _h: None))
+    try:
+        with caplog.at_level(_lg.WARNING):
+            bo.show()
+        assert any("無法確認蓋滿" in r.getMessage() for r in caplog.records)
+    finally:
+        bo.hide()
+
+
+def test_placement_failure_does_not_prevent_the_blackout(tk_root, monkeypatch,
+                                                         caplog):
+    """★擺不動也不可以變成「完全沒有黑幕」★
+
+    Tk 已經先用 `wm geometry` 擺過一次了；Win32 那一步只是把它校正到正確的座標
+    空間。校正失敗時退回 Tk 的擺法（蓋一部分）遠優於什麼都沒有 —— 但要留 warning。
+    """
+    import logging as _lg
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 500, 400)])
+    monkeypatch.setattr(sb.ctypes.windll.user32, "SetWindowPos",
+                        lambda *_a: (_ for _ in ()).throw(OSError("掛了")),
+                        raising=False)
+    try:
+        with caplog.at_level(_lg.WARNING):
+            assert bo.show() is True, "校正失敗不可以退化成「沒有黑幕」"
+        assert any("SetWindowPos 失敗" in r.getMessage()
+                   for r in caplog.records)
+    finally:
+        bo.hide()
+
+
 def test_monitor_rects_falls_back_instead_of_returning_nothing(monkeypatch):
     """★列舉不到螢幕不可以回空清單★ 那會讓 `_create` 直接放棄，等於沒有黑幕。"""
     import cmuh_common.platform_win as pw
