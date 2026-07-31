@@ -5,6 +5,7 @@
 每次真的動到 HIS 都留一筆(值、當下 HIS 版本、金絲雀裁決、回讀結果),事後查得出。
 稽核【絕不可弄壞臨床功能】→ 所有失敗路徑都必須吞掉、回 False,不得拋例外。
 """
+import ast
 import inspect
 import json
 import os
@@ -15,23 +16,51 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import main  # noqa: E402
 from cmuh_common import action_ledger as al  # noqa: E402
+from cmuh_common.audit_events import Code as _EvCode  # noqa: E402
+from cmuh_common.audit_events import Reason as _EvReason  # noqa: E402
 
 
 def _ledger(tmp_path, **kw):
     return al.ActionLedger(str(tmp_path / "action_ledger.jsonl"), **kw)
 
 
+def _ledger_calls_in(fn) -> list:
+    """→ 該函式裡每個 `_record_his_action(...)` 的 {關鍵字: AST 節點}。
+
+    ★用 AST 而不是比對原始碼字串★ 這一輪已經被「註解/docstring 自己命中比對字串」
+    騙過好幾次;而且字串比對天生是黑名單(沒列到的寫法照樣漏)。
+    """
+    tree = ast.parse(inspect.getsource(fn))
+    out = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_record_his_action"):
+            out.append({kw.arg: kw.value for kw in node.keywords})
+    return out
+
+
+def _v(code):
+    """[2026-07-31 P2-03] 帳本的 value 只收型別化事件，不再收自由文字。
+
+    ★測試要用生產的呼叫形狀★ 這一檔多數測試在意的是鏈/輪替/anchor，不是 value
+    本身；但如果繼續餵字串，它們就會全部記成 violation —— 測的東西跟生產路徑
+    不一樣，是這個 repo 反覆踩到的坑。
+    """
+    return _EvCode("測試", str(code))
+
+
 # ── 基本記錄 ────────────────────────────────────────────────────────────────
 def test_record_writes_queryable_fields(tmp_path):
     lg = _ledger(tmp_path)
     assert bool(lg.record(al.SURFACE_HIS_MENU, "F2 醫令代碼輸入", target="menu:219",
-                     value="51017", his_version="1150713", canary="ok",
+                     value=_v("51017"), his_version="1150713", canary="ok",
                      outcome=al.OUTCOME_OK, correlation_id="abc")) is True
     recs = al.read_records(lg.path)
     assert len(recs) == 1
     r = recs[0]
     assert r["surface"] == "his_menu" and r["action"] == "F2 醫令代碼輸入"
-    assert r["target"] == "menu:219" and r["value"] == "51017"
+    assert r["target"] == "menu:219"
+    assert r["value"] == {"t": "code", "kind": "測試", "v": "51017"}
     assert r["his_version"] == "1150713" and r["canary"] == "ok"
     assert r["outcome"] == "ok" and r["correlation_id"] == "abc"
     assert r["schema_version"] == al.SCHEMA_VERSION and r["ts"]
@@ -39,7 +68,7 @@ def test_record_writes_queryable_fields(tmp_path):
 
 def test_records_append_only_and_chain_links(tmp_path):
     lg = _ledger(tmp_path)
-    lg.record(al.SURFACE_HIS_FIELD, "UVB 劑量寫回", value="680")
+    lg.record(al.SURFACE_HIS_FIELD, "UVB 劑量寫回", value=_v("680"))
     lg.record(al.SURFACE_HIS_MENU, "F11 完成不印", target="menu:277")
     recs = al.read_records(lg.path)
     assert len(recs) == 2, "append-only:第二筆不得覆蓋第一筆"
@@ -65,17 +94,20 @@ def test_submitted_unverified_distinct_from_ok():
 def test_mismatch_outcome_is_recorded(tmp_path):
     # 回讀對不上是最重要的訊號(改版寫錯病歷時就靠它)
     lg = _ledger(tmp_path)
-    lg.record(al.SURFACE_HIS_FIELD, "身份 自費", value="01",
-              outcome=al.OUTCOME_MISMATCH, detail="回讀=02")
+    lg.record(al.SURFACE_HIS_FIELD, "身份 自費", value=_v("01"),
+              outcome=al.OUTCOME_MISMATCH,
+              detail=_EvReason("readback_mismatch", readback_len=2))
     r = al.read_records(lg.path)[0]
-    assert r["outcome"] == "mismatch" and "02" in r["detail"]
+    assert r["outcome"] == "mismatch"
+    assert r["detail"] == {"t": "reason", "code": "readback_mismatch",
+                           "readback_len": 2}
 
 
 # ── 防竄改 ─────────────────────────────────────────────────────────────────
 def test_verify_chain_detects_edited_record(tmp_path):
     lg = _ledger(tmp_path)
-    lg.record(al.SURFACE_HIS_MENU, "F2", value="51017")
-    lg.record(al.SURFACE_HIS_MENU, "F3", value="51019")
+    lg.record(al.SURFACE_HIS_MENU, "F2", value=_v("51017"))
+    lg.record(al.SURFACE_HIS_MENU, "F3", value=_v("51019"))
     # 竄改第一筆的值(hash 不動)→ 應驗不過
     lines = open(lg.path, encoding="utf-8").read().splitlines()
     lines[0] = lines[0].replace('"51017"', '"99999"')
@@ -87,7 +119,7 @@ def test_verify_chain_detects_edited_record(tmp_path):
 def test_verify_chain_detects_deleted_record(tmp_path):
     lg = _ledger(tmp_path)
     for v in ("a", "b", "c"):
-        lg.record(al.SURFACE_HIS_MENU, "F2", value=v)
+        lg.record(al.SURFACE_HIS_MENU, "F2", value=_v(v))
     lines = open(lg.path, encoding="utf-8").read().splitlines()
     del lines[1]                                  # 抽掉中間一筆
     open(lg.path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
@@ -110,7 +142,7 @@ def test_verify_chain_ok_on_existing_but_empty(tmp_path):
 def test_verify_chain_fails_on_corrupt_line(tmp_path):
     # [codex P1] 驗證要嚴格解析:壞行本身就是竄改跡象,不可像 read_records 那樣跳過
     lg = _ledger(tmp_path)
-    lg.record(al.SURFACE_HIS_MENU, "F2", value="1")
+    lg.record(al.SURFACE_HIS_MENU, "F2", value=_v("1"))
     with open(lg.path, "a", encoding="utf-8") as f:
         f.write("{not json\n")
     ok, _, msg = al.verify_chain(lg.path)
@@ -121,7 +153,7 @@ def test_verify_chain_detects_seq_gap(tmp_path):
     # seq 跳號 → 就算兇手把 hash 鏈也重算過,少了一筆仍看得出來
     lg = _ledger(tmp_path)
     for v in ("a", "b"):
-        lg.record(al.SURFACE_HIS_MENU, "F2", value=v)
+        lg.record(al.SURFACE_HIS_MENU, "F2", value=_v(v))
     recs = al.read_records(lg.path)
     assert [r["seq"] for r in recs] == [1, 2], "seq 應單調遞增"
 
@@ -135,9 +167,9 @@ def test_chain_hash_is_pure_and_order_independent():
 # ── 續寫既有檔(重啟後 chain 不斷) ──────────────────────────────────────────
 def test_reopen_continues_chain(tmp_path):
     lg1 = _ledger(tmp_path)
-    lg1.record(al.SURFACE_HIS_MENU, "F2", value="1")
+    lg1.record(al.SURFACE_HIS_MENU, "F2", value=_v("1"))
     lg2 = _ledger(tmp_path)                       # 模擬程式重啟
-    lg2.record(al.SURFACE_HIS_MENU, "F3", value="2")
+    lg2.record(al.SURFACE_HIS_MENU, "F3", value=_v("2"))
     recs = al.read_records(lg1.path)
     assert recs[1]["prev"] == recs[0]["hash"], "重啟後應接上舊檔末筆"
     assert al.verify_chain(lg1.path)[0] is True
@@ -147,7 +179,7 @@ def test_reopen_continues_chain(tmp_path):
 def test_rotation_bounds_file_size(tmp_path):
     lg = _ledger(tmp_path, max_bytes=400, keep=2)
     for i in range(40):
-        lg.record(al.SURFACE_HIS_FIELD, "x" * 20, value=str(i))
+        lg.record(al.SURFACE_HIS_FIELD, "x" * 20, value=_v(str(i)))
     assert os.path.exists(lg.path + ".1"), "超過上限應輪替"
     assert not os.path.exists(lg.path + ".3"), "只保留 keep 代"
     # 輪替後仍可續寫、且新檔自身 chain 連續
@@ -161,10 +193,10 @@ def test_rotation_interruption_keeps_chain_linked(tmp_path):
     # [codex P2] 輪替把 base 改名成 .1 後、新 base 還沒寫就當機 → 重啟時若讀不到 base
     # 就從 genesis 另起,會斷鏈。應改為回頭接上 .1 的末筆。
     lg1 = _ledger(tmp_path)
-    lg1.record(al.SURFACE_HIS_MENU, "F2", value="1")
+    lg1.record(al.SURFACE_HIS_MENU, "F2", value=_v("1"))
     os.replace(lg1.path, lg1.path + ".1")          # 模擬「改名後就當機」
     lg2 = _ledger(tmp_path)                        # 重啟
-    lg2.record(al.SURFACE_HIS_MENU, "F3", value="2")
+    lg2.record(al.SURFACE_HIS_MENU, "F3", value=_v("2"))
     old = al.read_records(lg1.path + ".1")
     new = al.read_records(lg1.path)
     assert new[0]["prev"] == old[-1]["hash"], "應接上 .1 末筆,不可從 genesis 另起"
@@ -177,7 +209,7 @@ def test_hard_cap_stops_growth_when_rotation_fails(tmp_path, monkeypatch):
     lg = _ledger(tmp_path, max_bytes=300, keep=2, hard_max_bytes=600)
     monkeypatch.setattr(lg, "_rotate_if_needed", lambda: None)   # 輪替永遠失敗
     wrote = sum(1 for i in range(200)
-                if lg.record(al.SURFACE_HIS_FIELD, "x" * 20, value=str(i)))
+                if lg.record(al.SURFACE_HIS_FIELD, "x" * 20, value=_v(str(i))))
     assert os.path.getsize(lg.path) < 2000, "輪替失敗時仍須被硬上限擋住,不可無限長大"
     assert wrote < 200, "超過硬上限的紀錄應被丟棄(回 False)"
 
@@ -192,7 +224,7 @@ def test_anchor_detects_tail_truncation(tmp_path):
     # [codex P1] 鏈自己證不了「後面還有沒有」→ 砍掉最後幾筆,靠 anchor 抓出來
     lg = _ledger(tmp_path)
     for v in ("a", "b", "c"):
-        lg.record(al.SURFACE_HIS_MENU, "F2", value=v)
+        lg.record(al.SURFACE_HIS_MENU, "F2", value=_v(v))
     assert al.verify_generations(lg.path)[0] is True
     lines = open(lg.path, encoding="utf-8").read().splitlines()
     open(lg.path, "w", encoding="utf-8").write("\n".join(lines[:-1]) + "\n")  # 砍尾
@@ -205,7 +237,7 @@ def test_anchor_detects_whole_file_replaced_by_shorter(tmp_path):
     # [codex P1] verify_chain 也必須比對 anchor:它是公開 API,不可對截尾回報 True。
     lg = _ledger(tmp_path)
     for v in ("a", "b", "c", "d"):
-        lg.record(al.SURFACE_HIS_MENU, "F2", value=v)
+        lg.record(al.SURFACE_HIS_MENU, "F2", value=_v(v))
     lines = open(lg.path, encoding="utf-8").read().splitlines()
     open(lg.path, "w", encoding="utf-8").write("\n".join(lines[:2]) + "\n")
     assert al.verify_chain(lg.path)[0] is False, "verify_chain 也須靠 anchor 抓截尾"
@@ -216,7 +248,7 @@ def test_head_truncation_detected(tmp_path):
     # [codex P1] 砍掉開頭:首筆自稱 genesis 起點卻 seq!=1 → 抓得到
     lg = _ledger(tmp_path)
     for v in ("a", "b", "c"):
-        lg.record(al.SURFACE_HIS_MENU, "F2", value=v)
+        lg.record(al.SURFACE_HIS_MENU, "F2", value=_v(v))
     recs = al.read_records(lg.path)
     # 偽造:留下第 2、3 筆,並把第 2 筆的 prev 改成 genesis 假裝是起點
     recs[1]["prev"] = al.GENESIS
@@ -236,7 +268,7 @@ def test_head_truncation_detected(tmp_path):
 def test_missing_anchor_on_nonempty_ledger_fails(tmp_path):
     # [codex P1] 非空帳本卻沒 anchor → 判失敗。否則「把 anchor 一起刪掉」就能掩飾截尾。
     lg = _ledger(tmp_path)
-    lg.record(al.SURFACE_HIS_MENU, "F2", value="a")
+    lg.record(al.SURFACE_HIS_MENU, "F2", value=_v("a"))
     os.remove(lg.anchor_path)
     ok, _, msg = al.verify_generations(lg.path)
     assert ok is False and "anchor" in msg
@@ -249,7 +281,7 @@ def test_verify_chain_rejects_anchor_deleted_then_truncated(tmp_path):
     # [codex P1 pass4] 最現實的掩飾手法:砍掉尾巴 + 把 anchor 一起刪掉
     lg = _ledger(tmp_path)
     for v in ("a", "b", "c"):
-        lg.record(al.SURFACE_HIS_MENU, "F2", value=v)
+        lg.record(al.SURFACE_HIS_MENU, "F2", value=_v(v))
     lines = open(lg.path, encoding="utf-8").read().splitlines()
     open(lg.path, "w", encoding="utf-8").write("\n".join(lines[:-1]) + "\n")
     os.remove(lg.anchor_path)
@@ -262,7 +294,7 @@ def test_emptying_a_populated_ledger_is_detected(tmp_path):
     # anchor 說末筆 seq=N,卻一筆都不剩 → 兩支 verify 都必須抓到。
     lg = _ledger(tmp_path)
     for v in ("a", "b", "c"):
-        lg.record(al.SURFACE_HIS_MENU, "F2", value=v)
+        lg.record(al.SURFACE_HIS_MENU, "F2", value=_v(v))
     open(lg.path, "w", encoding="utf-8").close()      # 清空但保留檔案
     ok, _, msg = al.verify_chain(lg.path)
     assert ok is False and "清空" in msg
@@ -274,12 +306,12 @@ def test_rotation_aborts_when_boundary_cannot_be_persisted(tmp_path, monkeypatch
     # anchor 還是舊邊界 → 之後永遠誤判截頭且救不回來。
     lg = _ledger(tmp_path, max_bytes=300, keep=2)
     for i in range(40):
-        lg.record(al.SURFACE_HIS_FIELD, "x" * 20, value=str(i))
+        lg.record(al.SURFACE_HIS_FIELD, "x" * 20, value=_v(str(i)))
     assert os.path.exists(lg.path + ".2"), "先把保留代數塞滿"
     before = open(lg.path + ".2", encoding="utf-8").read()
     monkeypatch.setattr(lg, "_write_anchor", lambda *a, **k: False)   # anchor 寫入失敗
     for i in range(40):
-        lg.record(al.SURFACE_HIS_FIELD, "y" * 20, value=str(i))
+        lg.record(al.SURFACE_HIS_FIELD, "y" * 20, value=_v(str(i)))
     assert os.path.exists(lg.path + ".2"), "邊界寫不進去 → 應放棄輪替,不得刪最舊一代"
     assert open(lg.path + ".2", encoding="utf-8").read() == before
 
@@ -289,12 +321,12 @@ def test_rotation_aborts_when_boundary_cannot_be_computed(tmp_path, monkeypatch)
     # (刪掉是不可逆的;沒有耐久的新邊界就砍,會製造永久誤判截頭的狀態)。
     lg = _ledger(tmp_path, max_bytes=300, keep=2)
     for i in range(40):
-        lg.record(al.SURFACE_HIS_FIELD, "x" * 20, value=str(i))
+        lg.record(al.SURFACE_HIS_FIELD, "x" * 20, value=_v(str(i)))
     assert os.path.exists(lg.path + ".2"), "先把保留代數塞滿"
     before = open(lg.path + ".2", encoding="utf-8").read()
     monkeypatch.setattr(al, "_first_seq_of", lambda p: None)   # 邊界算不出來
     for i in range(40):
-        lg.record(al.SURFACE_HIS_FIELD, "y" * 20, value=str(i))
+        lg.record(al.SURFACE_HIS_FIELD, "y" * 20, value=_v(str(i)))
     assert os.path.exists(lg.path + ".2"), "算不出邊界 → 應放棄輪替,不得刪最舊一代"
     assert open(lg.path + ".2", encoding="utf-8").read() == before
 
@@ -302,7 +334,7 @@ def test_rotation_aborts_when_boundary_cannot_be_computed(tmp_path, monkeypatch)
 def test_verify_generations_requires_oldest_seq(tmp_path):
     # [codex P2 pass5] 只留 last_seq/last_hash、把 oldest_seq 拿掉的 anchor 不得跳過截頭檢查
     lg = _ledger(tmp_path)
-    lg.record(al.SURFACE_HIS_MENU, "F2", value="a")
+    lg.record(al.SURFACE_HIS_MENU, "F2", value=_v("a"))
     a = al.read_anchor(lg.path)
     a.pop("oldest_seq", None)
     with open(lg.anchor_path, "w", encoding="utf-8") as f:
@@ -314,7 +346,7 @@ def test_verify_generations_requires_oldest_seq(tmp_path):
 def test_malformed_anchor_is_rejected(tmp_path):
     # [codex P1 pass4] 光是「檔案存在/dict 非空」不算數;殘缺 anchor 不得放行
     lg = _ledger(tmp_path)
-    lg.record(al.SURFACE_HIS_MENU, "F2", value="a")
+    lg.record(al.SURFACE_HIS_MENU, "F2", value=_v("a"))
     for bad in ({}, {"foo": 1}, {"last_seq": 0, "last_hash": ""},
                 {"last_seq": 5}, {"last_hash": "x"}):
         with open(lg.anchor_path, "w", encoding="utf-8") as f:
@@ -327,7 +359,7 @@ def test_rotation_crash_before_delete_is_benign_not_false_truncation(tmp_path):
     # 當機 → 留存的比 anchor 宣稱的【多】,那是良性的,絕不可被誤判成截頭(否則永久卡住)。
     lg = _ledger(tmp_path, max_bytes=300, keep=2)
     for i in range(40):
-        lg.record(al.SURFACE_HIS_FIELD, "x" * 20, value=str(i))
+        lg.record(al.SURFACE_HIS_FIELD, "x" * 20, value=_v(str(i)))
     assert al.verify_generations(lg.path, keep=2)[0] is True
     # 手動把 anchor 的邊界往後推(模擬「已寫新邊界但最舊那代還沒被刪掉」)
     a = al.read_anchor(lg.path)
@@ -346,7 +378,7 @@ def test_prefix_deletion_after_rotation_detected(tmp_path):
     # 靠 anchor 記的 oldest_seq 抓。
     lg = _ledger(tmp_path, max_bytes=400, keep=2)
     for i in range(30):
-        lg.record(al.SURFACE_HIS_FIELD, "x" * 20, value=str(i))
+        lg.record(al.SURFACE_HIS_FIELD, "x" * 20, value=_v(str(i)))
     assert al.verify_generations(lg.path, keep=2)[0] is True
     # 從最舊留存段砍掉開頭幾筆
     oldest = lg.path + ".2" if os.path.exists(lg.path + ".2") else lg.path + ".1"
@@ -358,8 +390,8 @@ def test_prefix_deletion_after_rotation_detected(tmp_path):
 
 def test_anchor_tracks_last_record(tmp_path):
     lg = _ledger(tmp_path)
-    lg.record(al.SURFACE_HIS_MENU, "F2", value="a")
-    lg.record(al.SURFACE_HIS_MENU, "F3", value="b")
+    lg.record(al.SURFACE_HIS_MENU, "F2", value=_v("a"))
+    lg.record(al.SURFACE_HIS_MENU, "F3", value=_v("b"))
     a = al.read_anchor(lg.path)
     recs = al.read_records(lg.path)
     assert a["last_seq"] == 2 and a["last_hash"] == recs[-1]["hash"]
@@ -369,19 +401,22 @@ def test_anchor_tracks_last_record(tmp_path):
 def test_record_never_raises_on_unwritable_path(tmp_path):
     # 路徑不存在的目錄 → 寫檔失敗,但只能回 False,絕不可拋
     lg = al.ActionLedger(str(tmp_path / "no_such_dir" / "l.jsonl"))
-    assert bool(lg.record(al.SURFACE_HIS_MENU, "F2", value="51017")) is False
+    assert bool(lg.record(al.SURFACE_HIS_MENU, "F2", value=_v("51017"))) is False
 
 
 def test_record_never_raises_on_weird_values(tmp_path):
     lg = _ledger(tmp_path)
     assert bool(lg.record(al.SURFACE_HIS_FIELD, "F2", value=object())) is True
     assert bool(lg.record(al.SURFACE_HIS_FIELD, "F2", value=None)) is True
-    assert al.read_records(lg.path)[1]["value"] == ""
+    recs = al.read_records(lg.path)
+    # [P2-03] 未宣告型別 → 記違規(內容不落地);沒帶值 → 空 dict
+    assert recs[0]["value"]["t"] == "violation"
+    assert recs[1]["value"] == {}
 
 
 def test_read_records_skips_corrupt_lines(tmp_path):
     lg = _ledger(tmp_path)
-    lg.record(al.SURFACE_HIS_MENU, "F2", value="1")
+    lg.record(al.SURFACE_HIS_MENU, "F2", value=_v("1"))
     with open(lg.path, "a", encoding="utf-8") as f:
         f.write("{not json\n")
     assert len(al.read_records(lg.path)) == 1, "壞行跳過,不拋"
@@ -411,12 +446,13 @@ def test_version_canary_snapshot_taken_at_action_time(monkeypatch):
     assert main._his_last_sample == ("1150713.02", "ok")
 
     main._record_his_action(al.SURFACE_HIS_MENU, "F2 醫令代碼", main_hwnd=123,
-                            value="51017")
+                            value=_v("51017"))
     # [2026-07-28] 項目多了第 5 欄(病人定位資訊,刻意不進帳本 fields)
     surface, action, fields, ts = _drain_ledger_queue()[0][:4]
     # 版本已在入列時就定好(不是等背景緒)
     assert fields["his_version"] == "1150713.02" and fields["canary"] == "ok"
-    assert surface == al.SURFACE_HIS_MENU and fields["value"] == "51017"
+    assert surface == al.SURFACE_HIS_MENU
+    assert str(fields["value"]) == "測試=51017", "入列的是型別化事件本身"
     assert ts, "動作時間須在熱鍵緒當下取,不可用背景緒落檔時間"
 
     # 即使之後 HIS 升版了,已入列那筆仍保有動作當下的版本
@@ -567,8 +603,8 @@ def test_correlation_id_shared_within_hotkey_flow(monkeypatch):
     # 模擬熱鍵 wrapper 設定 thread-local
     main._his_correlation.cid = "F11#42"
     try:
-        main._record_his_action(al.SURFACE_HIS_MENU, "F11 完成不印", value="277")
-        main._record_his_action(al.SURFACE_HIS_FIELD, "F11 療程", value="2")
+        main._record_his_action(al.SURFACE_HIS_MENU, "F11 完成不印", value=_v("277"))
+        main._record_his_action(al.SURFACE_HIS_FIELD, "F11 療程", value=_v("2"))
     finally:
         main._his_correlation.cid = ""
     items = []
@@ -584,7 +620,7 @@ def test_correlation_id_absent_outside_hotkey_flow(monkeypatch):
     monkeypatch.setattr(main, "_ledger_queue", main.Queue(maxsize=8))
     monkeypatch.setattr(main, "_ensure_ledger_writer", lambda: None)
     main._his_correlation.cid = ""
-    main._record_his_action(al.SURFACE_HIS_MENU, "F2", value="51017")
+    main._record_his_action(al.SURFACE_HIS_MENU, "F2", value=_v("51017"))
     _s, _a, fields, _ts = main._ledger_queue.get_nowait()[:4]
     assert fields.get("correlation_id", "") == ""
 
@@ -678,40 +714,44 @@ def test_readback_mismatch_paths_record_mismatch():
 
 
 def test_card_number_is_not_written_in_plaintext():
-    # 卡號屬識別/計費資料 → 帳本只記回讀結果,不得寫明文(GPT P0#3/#6)
-    src = inspect.getsource(main._autofill_卡號_from_醫師上次)
-    assert "已遮罩" in src, "卡號應遮罩"
-    assert "value=result.card" not in src and "value=str(result.card)" not in src, \
-        "卡號不得以明文寫進帳本"
+    """卡號屬識別/計費資料 → 帳本只記「刻意不記錄」,不得寫明文(GPT P0#3/#6)。
+
+    [2026-07-31 P2-03] 舊版靠 `assert "已遮罩" in src`(一句人寫的字串);
+    現在是型別 `_EvRedacted("卡號")` —— 用 AST 確認傳進帳本的就是那個型別。
+    """
+    calls = _ledger_calls_in(main._autofill_卡號_from_醫師上次)
+    assert calls, "這個函式應該有帳本呼叫"
+    for kwargs in calls:
+        v = kwargs.get("value")
+        assert isinstance(v, ast.Call) and getattr(v.func, "id", "") == "_EvRedacted", \
+            "卡號的 value 必須是 _EvRedacted(不是明文、也不是自由文字)"
 
 
 def test_sampled_his_field_text_never_reaches_ledger():
-    # [codex P1] 「疑似定位錯欄」與「回讀不符」這兩條分支,採樣到的欄位原文可能正是
-    # 姓名/病歷號/卡號 —— 那是【誤抓】才觸發的分支。帳本只能記長度,絕不可記內容。
+    """[codex P1] 「疑似定位錯欄」與「回讀不符」這兩條分支,採樣到的欄位原文可能正是
+    姓名/病歷號/卡號 —— 那是【誤抓】才觸發的分支。
+
+    [2026-07-31 P2-03] 舊版列舉幾個已知的洩漏寫法(`{before!r}` 之類)去比對原始碼,
+    ★那是黑名單★:沒列到的寫法照樣漏。現在改成白名單 —— 傳給帳本的 value/detail
+    必須是型別建構子,那些型別自己就不收自由文字。
+    """
+    allowed = {"_EvCode", "_EvMeasure", "_EvObserved", "_EvReason",
+               "_EvRedacted", "_EvTransition"}
     for fn, why in ((main._set_療程_only, "療程"), (main._set_身份_自費, "身份")):
-        src = inspect.getsource(fn)
-        # 找出所有傳給帳本的 detail=,不得內插原始採樣變數
-        for leak in ("detail=f\"回讀={", "{_療程_before!r}", "{after!r}", "{before!r}"):
-            # 允許出現在 _show_uvb_warning(醫師自己的螢幕),但不得出現在 _record_his_action
-            for chunk in src.split("_record_his_action(")[1:]:
-                call = chunk.split(")\n")[0]
-                assert leak not in call, f"{why}:採樣原文 {leak} 不得進帳本({call[:80]})"
-        assert "已遮罩" in src, f"{why} 應以遮罩/長度取代原文"
-
-
-# ══ 批次三:PII 縱深防禦 + 稽核健康(GPT-5.6 第三輪)═══════════════════════════
-def test_sanitize_masks_pii_but_keeps_legit_values():
-    # 合法稽核值(醫令代碼最長 7 位、HIS 版本、劑量)不受影響
-    assert al.sanitize_text("51017") == "51017"
-    assert al.sanitize_text("1850159") == "1850159"          # 7 位醫令代碼
-    assert al.sanitize_text("1150713.02") == "1150713.02"     # 版本:7位.2位
-    assert al.sanitize_text("dose=680→700 count=10→11") == "dose=680→700 count=10→11"
-    # 病歷號(8 位)/身分證/手機 → 遮
-    assert "[REDACTED]" in al.sanitize_text("回讀=12345678")
-    assert "12345678" not in al.sanitize_text("回讀=12345678")
-    assert "[REDACTED]" in al.sanitize_text("A123456789")
-    assert "[REDACTED]" in al.sanitize_text("0912345678")
-    assert al.sanitize_text(None) == ""
+        calls = _ledger_calls_in(fn)
+        assert calls, f"{why} 應該有帳本呼叫"
+        for kwargs in calls:
+            for key in ("value", "detail"):
+                node = kwargs.get(key)
+                if node is None:
+                    continue
+                for leaf in ([node.body, node.orelse]
+                             if isinstance(node, ast.IfExp) else [node]):
+                    if isinstance(leaf, ast.Constant) and leaf.value in ("", None):
+                        continue
+                    assert (isinstance(leaf, ast.Call)
+                            and getattr(leaf.func, "id", "") in allowed), \
+                        f"{why} 的 {key} 不是型別化事件(可能夾帶採樣原文)"
 
 
 def test_record_sanitizes_value_and_detail(tmp_path):
@@ -720,9 +760,12 @@ def test_record_sanitizes_value_and_detail(tmp_path):
     lg.record(al.SURFACE_HIS_FIELD, "療程", value="回讀=87654321",
               detail="病人 A123456789 的欄位")
     r = al.read_records(lg.path)[0]
-    assert "87654321" not in r["value"] and "[REDACTED]" in r["value"]
-    assert "A123456789" not in r["detail"] and "[REDACTED]" in r["detail"]
-    assert al.verify_chain(lg.path)[0] is True, "消毒後 hash chain 仍須一致"
+    # [2026-07-31 P2-03] 舊版是「消毒後照樣寫進去」(只換掉像個資的那幾段);
+    # 現在是【整個不落地】—— 誤傳的欄位原文一個字都不留。
+    blob = json.dumps(r, ensure_ascii=False)
+    assert "87654321" not in blob and "A123456789" not in blob
+    assert r["value"]["t"] == "violation" and r["detail"]["t"] == "violation"
+    assert al.verify_chain(lg.path)[0] is True, "違規紀錄的 hash chain 仍須一致"
 
 
 def test_health_snapshot_states(tmp_path):
@@ -731,7 +774,7 @@ def test_health_snapshot_states(tmp_path):
     assert al.health_snapshot(p)["level"] == "ok"
     # 正常帳本
     lg = al.ActionLedger(p)
-    lg.record(al.SURFACE_HIS_MENU, "F2", value="51017")
+    lg.record(al.SURFACE_HIS_MENU, "F2", value=_v("51017"))
     assert al.health_snapshot(p)["level"] == "ok"
     # 有遺失計數 → warn(帳本完整但有動作沒記到)
     snap = al.health_snapshot(p, dropped=2, write_failures=1)

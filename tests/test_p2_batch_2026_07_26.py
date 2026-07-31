@@ -102,7 +102,10 @@ def test_f8_records_audit_ledger_on_both_outcomes():
     code = _code_only(inspect.getsource(main.script_F8_quick_text))
     assert code.count("_record_his_action(") == 2, "成功與失敗都要記"
     assert "_LEDGER_OK" in code and "_LEDGER_FAILED" in code
-    assert "len=" in code and "text}" not in code, "只記長度,不可把輸入內容寫進帳本"
+    # [2026-07-31 P2-03] 舊版找 `"len="`(自由文字裡的字面量)。現在是型別 —— 只記長度
+    # 這件事由 _EvObserved 保證(它的 payload 只有 len),不再靠呼叫端寫對字串。
+    assert "_EvObserved(len(text))" in code, "只記長度,不可把輸入內容寫進帳本"
+    assert "text}" not in code
 
 
 def test_f8_never_writes_quick_text_into_logs_or_ledger():

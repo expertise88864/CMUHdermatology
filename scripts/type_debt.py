@@ -20,6 +20,17 @@ CI 報告「沒有新增型別債」，跟這支腳本宣稱的事情正好相�
 互換仍然抵銷。再細分就只剩行號，而行號會讓每次編輯都變紅（→ 被忽略）。這個取捨是
 刻意的：那種情形下兩個診斷實質上是同一個缺陷樣式，混淆的代價極小。
 
+★[2026-07-31] 基線是【環境相依】的 —— 本機與 CI 的相依版本必須一致★
+這道棘輪第一次在 CI 上跑就紅了，而本機是綠的。原因不是程式碼：本機的 ortools 停在
+9.14.6206，而 `requirements-lazy.txt` 自己釘的是 9.15.6755（CI 裝的就是這個）。
+9.15 的型別介面不再對外顯示 `CpModel.NewBoolVar/Minimize/AddExactlyOne` 這些
+CamelCase 名稱（**執行期仍然可用**，roster 求解測試在兩個版本上都是綠的），於是
+CI 多出三筆診斷。
+
+判準：**基線要在「與 CI 相同的相依版本」下產生**。本機跑出來跟 CI 不一致時，
+先確認 `requirements.txt` / `requirements-lazy.txt` 的 pin 真的裝了，
+再去懷疑程式碼。（pyright 本身的版本同理。）
+
 還債流程：修好之後跑 `python scripts/type_debt.py --update`；某條規則歸零時直接把它
 從 `pyrightconfig.json` 的關閉清單移到啟用（並從基線刪掉，`tests/test_ci_gates_*`
 會檢查兩邊一致）。
@@ -270,6 +281,8 @@ def main(argv: list) -> int:
         print("\n[type-debt] ★新增了型別債★（上面 `+` 的那幾筆）")
         print("  修掉它們，或（若確有正當理由）跑 "
               "`python scripts/type_debt.py --update` 並在 PR 說明原因。")
+        print("  ※ 若本機是綠的、只有 CI 紅：先確認本機裝的相依版本與 "
+              "requirements*.txt 的 pin 一致（基線是環境相依的，見本檔開頭）。")
         annotate("型別債棘輪：新增了型別債",
                  "\n".join(f"+{k}x {fp}" for fp, k in added_detail))
         return 1

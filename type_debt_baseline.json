@@ -153,6 +153,9 @@
     "src/cmuh_common/imap_reader.py|_decode_subject|Type \"str\" is not assignable to declared type \"bytes\" \"str\" is not assignable to \"bytes\"|raw_subject = str(raw_subject)": 1
   },
   "reportAttributeAccessIssue": {
+    "src/cmuh_common/roster/solve_rvs.py|_build_and_solve|Cannot access attribute \"AddExactlyOne\" for class \"CpModel\" Attribute \"AddExactlyOne\" is unknown|model.AddExactlyOne(x[(d, m.id)] for m in ctx.members)": 1,
+    "src/cmuh_common/roster/solve_rvs.py|_build_and_solve|Cannot access attribute \"Minimize\" for class \"CpModel\" Attribute \"Minimize\" is unknown|model.Minimize(sum(var * w for var, w in objective))": 1,
+    "src/cmuh_common/roster/solve_rvs.py|_build_and_solve|Cannot access attribute \"NewBoolVar\" for class \"CpModel\" Attribute \"NewBoolVar\" is unknown|x = {(d, m.id): model.NewBoolVar(f\"x_{d.isoformat()}_{m.id}\")": 1,
     "src/cmuh_common/splash.py|StartupSplash.close|Cannot access attribute \"attributes\" for class \"Misc\" Attribute \"attributes\" is unknown|self._parent.attributes(\"-topmost\", False)": 1,
     "src/cmuh_common/tk_exception.py|install_tk_exception_handler|Cannot assign to attribute \"report_callback_exception\" for class \"object\" Attribute \"report_callback_exception\" is unknown|root.report_callback_exception = _report_callback_exception": 1,
     "src/consult_query.py|_automation_on_hidden|Cannot access attribute \"Close\" for class \"int\" Attribute \"Close\" is unknown|_h.Close()": 1,

@@ -117,6 +117,15 @@ from cmuh_common.contract_canary import (
     compare_fingerprint as _canary_compare,
     policy_action as _canary_policy_action,
 )
+from cmuh_common.audit_events import (
+    # [P2-03] 稽核帳本的 value/detail 只收這些型別 —— 自由文字進不去(理由見該模組)
+    Code as _EvCode,
+    Measure as _EvMeasure,
+    Observed as _EvObserved,
+    Reason as _EvReason,
+    Redacted as _EvRedacted,
+    Transition as _EvTransition,
+)
 from cmuh_common.action_ledger import (
     LEDGER_FILENAME as _LEDGER_FILENAME,
     OUTCOME_FAILED as _LEDGER_FAILED,
@@ -1926,8 +1935,10 @@ def _ledger_writer_loop(q=None) -> None:
             # [批次三] 回讀不符 → 即時通知維護者(醫師端警告視窗在呼叫點既有;這封信
             # 讓改版寫錯不用等人翻帳本才發現)。async 寄,不卡本寫入緒。
             if str(fields.get("outcome", "")) == _LEDGER_MISMATCH:
-                # value 依 _record_his_action 的契約必為非 PII(醫令代碼/劑量/療程數),
-                # 拿來當「預期寫入」是安全的。
+                # [P2-03] value/detail 是 audit_events 的型別;`str()` 走它們的
+                # __str__ → 人看得懂的描述(Observed 只會渲染出長度、Redacted 只會
+                # 說「刻意不記錄」)。拿來當「預期寫入」放進告警信是安全的 ——
+                # 這不再是「呼叫端的契約」,是型別本身就渲染不出原文。
                 _notify_audit_mismatch(action, str(fields.get("detail", "")),
                                        locator=locator, ts=ts,
                                        expected=str(fields.get("value", "")))
@@ -2769,12 +2780,12 @@ def _script_code_input_adaptive(code: str, label: str = "",
             # 產生錯誤安全感。
             _record_his_action(
                 _LEDGER_HIS_MENU, f"{label or '代碼輸入'} 醫令代碼", main_hwnd=hwnd,
-                target=f"menu:{MENU_ID_代碼輸入}", value=str(code),
+                target=f"menu:{MENU_ID_代碼輸入}", value=_EvCode("醫令代碼", code),
                 outcome=_LEDGER_SUBMITTED if (chars_ok and enter_ok)
                         else _LEDGER_FAILED,
-                detail="已送出,無回讀路徑可確認 HIS 已處理"
-                       if (chars_ok and enter_ok)
-                       else f"chars={chars_ok} enter={enter_ok}")
+                detail=_EvReason("no_readback") if (chars_ok and enter_ok)
+                       else _EvReason("send_failed", chars_ok=bool(chars_ok),
+                                      enter_ok=bool(enter_ok)))
         else:
             logging.warning("[%s] 等不到可信的代碼輸入焦點，停止送出 %r",
                             label, code)
@@ -2785,8 +2796,8 @@ def _script_code_input_adaptive(code: str, label: str = "",
             # 關閉/強制重啟,這筆紀錄根本不會產生 —— 帳本契約是「動作發生的當下」。
             _record_his_action(
                 _LEDGER_HIS_MENU, f"{label or '代碼輸入'} 醫令代碼", main_hwnd=hwnd,
-                target=f"menu:{MENU_ID_代碼輸入}", value=str(code),
-                outcome=_LEDGER_SKIPPED, detail="等不到可信的代碼輸入焦點,未送出")
+                target=f"menu:{MENU_ID_代碼輸入}", value=_EvCode("醫令代碼", code),
+                outcome=_LEDGER_SKIPPED, detail=_EvReason("no_focus"))
             # [2026-07-26 審查] 醫師按了 F1-F5 卻【完全沒有東西發生】——舊版只寫 log,
             # 醫師會以為醫令已下(這條路徑正是 HIS 改版把選單 id 位移時會走到的)。
             # 熱鍵的價值就在「按了就會下」,靜默失敗比跳一個窗糟糕得多。
@@ -2846,10 +2857,10 @@ def _set_療程_only(main_hwnd: int, value, label: str = "") -> bool:
         # [codex P1] 【不可】把 _療程_before 原文寫進帳本:這條分支正是「疑似抓錯欄位」時
         # 觸發的,那個欄位的內容可能是姓名/病歷號/卡號等識別資料。只記固定原因 + 長度。
         _record_his_action(_LEDGER_HIS_FIELD, f"{label or 'F'} 療程", main_hwnd=main_hwnd,
-                           target="field:療程", value=str(value),
+                           target="field:療程", value=_EvCode("療程", value),
                            outcome=_LEDGER_SKIPPED,
-                           detail=f"原值不像療程(長度={len(_療程_before)},內容已遮罩),"
-                                  f"疑似定位錯欄,未寫")
+                           detail=_EvReason("field_value_unexpected",
+                                            before_len=len(_療程_before)))
         return False
     ok = True
     try:
@@ -2879,10 +2890,11 @@ def _set_療程_only(main_hwnd: int, value, label: str = "") -> bool:
     # [codex P1] 回讀原文同樣可能是誤抓到的識別資料 → 只記長度,不記內容。
     _record_his_action(
         _LEDGER_HIS_FIELD, f"{label or 'F'} 療程", main_hwnd=main_hwnd,
-        target="field:療程", value=str(value),
+        target="field:療程", value=_EvCode("療程", value),
         outcome=_LEDGER_OK if ok else _LEDGER_MISMATCH,
         detail="" if ok else
-               f"回讀與預期不符(回讀長度={len(actual_療程 or '')},內容已遮罩)")
+               _EvReason("readback_mismatch",
+                         readback_len=len(actual_療程 or "")))
     return ok
 
 
@@ -3699,8 +3711,10 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
             f"{label} 已停止 — 處置欄未更新，請醫師確認後手動處理。{_placed_note}")
         _record_his_action(_LEDGER_HIS_FIELD, f"{label} UVB 劑量", main_hwnd=main_hwnd,
                            target="field:處置memo",
-                           value=f"dose={result.new_dose} count={result.new_count}",
-                           outcome=_LEDGER_FAILED, detail="WM_SETTEXT 寫回失敗")
+                           value=_EvMeasure(dose=result.new_dose,
+                                            count=result.new_count),
+                           outcome=_LEDGER_FAILED,
+                           detail=_EvReason("settext_failed"))
         return False
 
     # 寫回後實機 read 驗證 — Delphi onChange 可能 reformat 過
@@ -3716,8 +3730,10 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
             f"{_placed_note}")
         _record_his_action(_LEDGER_HIS_FIELD, f"{label} UVB 劑量", main_hwnd=main_hwnd,
                            target="field:處置memo",
-                           value=f"dose={result.new_dose} count={result.new_count}",
-                           outcome=_LEDGER_FAILED, detail="回讀空字串,無法驗證寫回")
+                           value=_EvMeasure(dose=result.new_dose,
+                                            count=result.new_count),
+                           outcome=_LEDGER_FAILED,
+                           detail=_EvReason("readback_empty"))
         return False
     if actual_text:
         from cmuh_common.uvb_dose import (
@@ -3747,10 +3763,11 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
             _record_his_action(
                 _LEDGER_HIS_FIELD, f"{label} UVB 劑量", main_hwnd=main_hwnd,
                 target="field:處置memo",
-                value=f"dose={result.new_dose} count={result.new_count}",
+                value=_EvMeasure(dose=result.new_dose, count=result.new_count),
                 outcome=_LEDGER_MISMATCH,
-                detail=f"回讀 dose={getattr(verify, 'dose', '?')} "
-                       f"count={getattr(verify, 'count', '?')}")
+                detail=_EvReason("readback_mismatch",
+                                 readback_dose=getattr(verify, "dose", None),
+                                 readback_count=getattr(verify, "count", None)))
             return False
         # [W7 codex review] 只在「讀回成功(actual_text 非空)且 verify 通過」時才記錄
         # 原值→新值。讀回失敗(_read_tmemo_text 逾時回空字串,跳過整個 if actual_text)
@@ -3768,8 +3785,10 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
         _record_his_action(
             _LEDGER_HIS_FIELD, f"{label} UVB 劑量", main_hwnd=main_hwnd,
             target="field:處置memo",
-            value=f"dose={getattr(result.parsed, 'dose', None)}→{result.new_dose} "
-                  f"count={getattr(result.parsed, 'count', None)}→{result.new_count}",
+            value=_EvTransition(
+                _EvMeasure(dose=getattr(result.parsed, "dose", None),
+                           count=getattr(result.parsed, "count", None)),
+                _EvMeasure(dose=result.new_dose, count=result.new_count)),
             outcome=_LEDGER_OK)
 
     # [2026-07-25 外審 F3 ★病人安全★] Step D 有 excimer 段因為「不是加量醫囑」(遞減/方向
@@ -4148,14 +4167,14 @@ def script_F8_quick_text():
         _record_his_action(
             _LEDGER_HIS_FIELD, "F8 快速輸入",
             target=f"focus:{_focus_cls or '未知'}#{_focus_hwnd}",
-            value=f"len={len(text)}", outcome=_LEDGER_OK)
+            value=_EvObserved(len(text)), outcome=_LEDGER_OK)
     except Exception:
         logging.error("F8: keyboard.write 失敗", exc_info=True)
         _record_his_action(
             _LEDGER_HIS_FIELD, "F8 快速輸入",
             target=f"focus:{_focus_cls or '未知'}#{_focus_hwnd}",
-            value=f"len={len(text)}", outcome=_LEDGER_FAILED,
-            detail="keyboard.write 例外")
+            value=_EvObserved(len(text)), outcome=_LEDGER_FAILED,
+            detail=_EvReason("write_exception"))
 
 
 # =============================================================================
@@ -5263,9 +5282,9 @@ def _f11_send_finish_no_print(main_hwnd: int, course_value: str,
             # [GPT-5.6 第三輪] 無回讀 → 記 submitted_unverified,不可記 ok。
             _record_his_action(_LEDGER_HIS_MENU, f"{label} 完成不印",
                                main_hwnd=main_hwnd, target=f"menu:{cmd_id}",
-                               value=f"療程={course_value}",
+                               value=_EvCode("療程", course_value),
                                outcome=_LEDGER_SUBMITTED,
-                               detail="已送出,無回讀路徑可確認完成動作已處理")
+                               detail=_EvReason("no_readback"))
             return True
         logging.warning("[%s] 完成不印 menu id=%s 送出失敗，嘗試下一個候選",
                         label, cmd_id)
@@ -5274,8 +5293,9 @@ def _f11_send_finish_no_print(main_hwnd: int, course_value: str,
                   label, course_value)
     _record_his_action(_LEDGER_HIS_MENU, f"{label} 完成不印", main_hwnd=main_hwnd,
                        target=f"menu:{','.join(str(i) for i in candidate_ids)}",
-                       value=f"療程={course_value}", outcome=_LEDGER_FAILED,
-                       detail="所有候選 id 都送出失敗,未完成")
+                       value=_EvCode("療程", course_value),
+                       outcome=_LEDGER_FAILED,
+                       detail=_EvReason("no_candidate_worked"))
     return False
 
 
@@ -5294,8 +5314,9 @@ def _f11_click_finish_all(main_hwnd: int, course_value: str,
         logging.warning("[%s] 找不到 全部完成 button", label)
         _record_his_action(_LEDGER_HIS_MENU, f"{label} 全部完成",
                            main_hwnd=main_hwnd, target="button:全部完成",
-                           value=f"療程={course_value}", outcome=_LEDGER_FAILED,
-                           detail="找不到 全部完成 button,未送出")
+                           value=_EvCode("療程", course_value),
+                           outcome=_LEDGER_FAILED,
+                           detail=_EvReason("control_not_found"))
         return False
     # [GPT-5.6 第三輪] 原本忽略 _post_click_to_control 的回傳、click 失敗照樣回 True →
     # 主流程當成完成成功、稽核也漏記。route B 與 route A(完成不印)同為 F11 的完成動作,
@@ -5303,10 +5324,10 @@ def _f11_click_finish_all(main_hwnd: int, course_value: str,
     click_ok = _post_click_to_control(btns[0][0])
     _record_his_action(_LEDGER_HIS_MENU, f"{label} 全部完成",
                        main_hwnd=main_hwnd, target="button:全部完成",
-                       value=f"療程={course_value}",
+                       value=_EvCode("療程", course_value),
                        outcome=_LEDGER_SUBMITTED if click_ok else _LEDGER_FAILED,
-                       detail="已送出 click,無回讀路徑可確認完成動作已處理"
-                              if click_ok else "PostMessage click 送出失敗")
+                       detail=_EvReason("no_readback") if click_ok
+                              else _EvReason("send_failed"))
     if not click_ok:
         logging.warning("[%s] 全部完成 click 送出失敗", label)
         return False
@@ -5607,9 +5628,10 @@ def _set_身份_自費(value: str = "01", label: str = "") -> bool:
             # (跳警告視窗給醫師看無妨,那是他自己的螢幕;落地成檔案才是外洩風險)。
             _record_his_action(_LEDGER_HIS_FIELD, f"{label or 'F'} 身份",
                                main_hwnd=main_hwnd, target="field:身份",
-                               value=str(value), outcome=_LEDGER_SKIPPED,
-                               detail=f"原值不像身份代碼(長度={len(before)},內容已遮罩),"
-                                      f"疑似定位錯欄,未寫")
+                               value=_EvCode("身份", value),
+                               outcome=_LEDGER_SKIPPED,
+                               detail=_EvReason("field_value_unexpected",
+                                                before_len=len(before)))
             return False
 
         ret = _wm_settext_timeout(身份_hwnd, value)
@@ -5628,7 +5650,9 @@ def _set_身份_自費(value: str = "01", label: str = "") -> bool:
                          label, before, value)
             _record_his_action(_LEDGER_HIS_FIELD, f"{label or 'F'} 身份",
                                main_hwnd=main_hwnd, target="field:身份",
-                               value=f"{before}→{value}", outcome=_LEDGER_OK)
+                               value=_EvTransition(_EvCode("身份", before),
+                                                   _EvCode("身份", value)),
+                               outcome=_LEDGER_OK)
             return True
         logging.warning("[%s][身份] 設身份失敗 期望=%r 實際=%r → 警告醫師",
                         label, value, after)
@@ -5639,8 +5663,10 @@ def _set_身份_自費(value: str = "01", label: str = "") -> bool:
         # [codex P1] 回讀原文可能是誤抓到的識別資料 → 只記長度,不記內容。
         _record_his_action(_LEDGER_HIS_FIELD, f"{label or 'F'} 身份",
                            main_hwnd=main_hwnd, target="field:身份",
-                           value=str(value), outcome=_LEDGER_MISMATCH,
-                           detail=f"回讀與預期不符(回讀長度={len(after or '')},內容已遮罩)")
+                           value=_EvCode("身份", value),
+                           outcome=_LEDGER_MISMATCH,
+                           detail=_EvReason("readback_mismatch",
+                                            readback_len=len(after or "")))
         return False
     except Exception:
         # 例外路徑也要【警告醫師】—— caller(F1/F2/F3)已跳過 51019/療程,若這裡靜默
@@ -5976,14 +6002,15 @@ def _autofill_卡號_from_醫師上次(label: str = "") -> None:
                 # [稽核 2026-07-17] 卡號屬計費/識別資料 → 帳本【不記明文】,只記回讀結果。
                 _record_his_action(_LEDGER_HIS_FIELD, f"{label} 卡號自動帶入",
                                    main_hwnd=main_hwnd, target="field:卡號",
-                                   value="(已遮罩)", outcome=_LEDGER_OK)
+                                   value=_EvRedacted("卡號"), outcome=_LEDGER_OK)
             else:
                 logging.warning("[%s 卡號] WM_SETTEXT 未生效(verify=%r),改提示手動",
                                 label, verify)
                 _record_his_action(_LEDGER_HIS_FIELD, f"{label} 卡號自動帶入",
                                    main_hwnd=main_hwnd, target="field:卡號",
-                                   value="(已遮罩)", outcome=_LEDGER_MISMATCH,
-                                   detail="WM_SETTEXT 未生效,回讀與預期不符(值已遮罩)")
+                                   value=_EvRedacted("卡號"),
+                                   outcome=_LEDGER_MISMATCH,
+                                   detail=_EvReason("readback_mismatch"))
         if not filled:
             reason = result.reason if result is not None else "讀取失敗"
             logging.warning("[%s 卡號] 未自動填:%s", label, reason)
@@ -7429,16 +7456,16 @@ def script_F9_F10_consent_form_adaptive(form_code: str,
                 label)
             _record_his_action(
                 _LEDGER_HIS_MENU, f"{label} 同意書開啟", main_hwnd=main_hwnd,
-                target=f"menu:{MENU_ID_同意書}", value=str(form_code),
-                outcome=_LEDGER_FAILED, detail="重試後仍等不到 TOrMain,未開啟同意書")
+                target=f"menu:{MENU_ID_同意書}", value=_EvCode("同意書", form_code),
+                outcome=_LEDGER_FAILED, detail=_EvReason("window_not_opened"))
             return False
         logging.info("[%s] 重試成功", label)
     logging.info("[%s] TOrMain hwnd=%s 已開啟", label, or_hwnd)
     # [稽核 2026-07-17] 同意書視窗真的開起來 = 選單 id 仍正確(隱含驗證)。記下開了哪種
     # 同意書(MO04 腫瘤手術 / MU02 切片)與當時 HIS 版本。
     _record_his_action(_LEDGER_HIS_MENU, f"{label} 同意書開啟", main_hwnd=main_hwnd,
-                       target=f"menu:{MENU_ID_同意書}", value=str(form_code),
-                       outcome=_LEDGER_OK)
+                       target=f"menu:{MENU_ID_同意書}",
+                       value=_EvCode("同意書", form_code), outcome=_LEDGER_OK)
     # 不主動推到底層 — ForegroundProtector 會在使用者切走時才保護
     _sleep_interruptible(0.3)  # 等視窗 paint 完成
 

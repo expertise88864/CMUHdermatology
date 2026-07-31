@@ -12,8 +12,12 @@
   註:本類別的 record() 是【同步】的(會鎖、會做檔案 IO)。呼叫端若在熱鍵/UI 緒上,
   必須自己丟到背景緒(見 main.py `_record_his_action` 的非阻塞佇列),否則檔案 IO 卡住
   會連帶卡住臨床流程 —— 「不拋例外」不等於「不阻塞」。
-* 【不存病人明文識別】:只記非 PII 的動作與值。呼叫端【絕不可】把採樣到的 HIS 欄位原文
-  (可能是誤抓到的姓名/病歷號/卡號)放進 value/detail —— 只放固定原因字串與長度等安全中繼資料。
+* 【不存病人明文識別】:只記非 PII 的動作與值。★這件事現在由【型別】保證,不再靠註解★
+  —— value/detail 只接受 `cmuh_common.audit_events` 的型別(Code/Measure/Observed/
+  Transition/Redacted/Reason);其他東西一律記成 violation 且【內容不落地】。
+  想描述「從 HIS 讀到什麼」的唯一表達方式是 `Observed(length=…)`,它只存長度。
+  (2026-07-31 P2-03 取代舊的 denylist regex `sanitize_text` —— 猜不準、誤遮無聲,
+  詳見 audit_events 模組開頭。)
 * 大小上限 + 輪替(保留數代);輪替失敗時有【硬上限】兜底(超過就丟紀錄不再長大,寧可少記
   也不要塞爆診間電腦磁碟)。
 
@@ -34,13 +38,16 @@ import json
 import logging
 from dataclasses import dataclass
 import os
-import re
 import threading
 from datetime import datetime
 
 from cmuh_common.atomic_io import atomic_write_json
+from cmuh_common.audit_events import to_field_payload
 
-SCHEMA_VERSION = 1
+# 2 = value/detail 由自由文字改為型別化事件(dict);1 = 舊的字串欄位。
+# ★舊紀錄仍然驗得過★ chain_hash 與 _canonical 是欄位無關的(照 rec 的實際內容重算),
+# 所以輪替中同時存在 v1/v2 的世代不影響 verify_generations。
+SCHEMA_VERSION = 2
 LEDGER_FILENAME = "action_ledger.jsonl"
 ANCHOR_SUFFIX = ".anchor.json"
 DEFAULT_MAX_BYTES = 5 * 1024 * 1024      # 5MB 後輪替
@@ -81,27 +88,16 @@ def _canonical(d: dict) -> str:
     return json.dumps(d, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-# ── PII 縱深防禦(GPT-5.6 第三輪 P2-07)────────────────────────────────────────
-# 文件說「呼叫端絕不可傳病人明文」,但只靠註解不是 enforcement:未來任何新呼叫點誤傳
-# detail=採樣原文,病歷內容就永久進帳本。故落地前統一消毒。樣式刻意保守,只遮「幾乎
-# 不可能是合法稽核值」的樣式 —— 醫令代碼最長 7 位數(1850159)、HIS 版本 1150713(.02)
-# 都是 ≤7 位段,不受影響;病歷號(8 位數)、身分證(1 字母+9 數字)、手機(09 開頭 10 位)
-# 會被遮。誤遮的代價只是稽核少一點細節,遠小於 PII 外洩。
-_PII_PATTERNS = (
-    re.compile(r"[A-Za-z][12]\d{8}"),      # 台灣身分證:1 字母 + 1/2 + 8 數字(先於長數字)
-    re.compile(r"\d{8,}"),                 # 8 位以上連續數字:病歷號/卡號/電話
-)
-
-
-def sanitize_text(s) -> str:
-    """把可能是病人識別資料的樣式換成 [REDACTED]。純函式;非字串先 str()。不拋。"""
-    try:
-        out = str(s or "")
-        for pat in _PII_PATTERNS:
-            out = pat.sub("[REDACTED]", out)
-        return out
-    except Exception:
-        return "[REDACTED]"
+# ── PII 縱深防禦 ─────────────────────────────────────────────────────────────
+# [2026-07-31 第二輪外審 P2-03] 這裡原本是 `sanitize_text` + 兩條 denylist regex
+# (台灣身分證樣式、8 位以上連續數字),在落地前猜「哪一段像個資」。已刪除,理由:
+#   * 猜不準:中文姓名/地址/7 位病歷號/生日都不符樣式,照樣落地 —— 而它宣稱防的
+#     「呼叫端誤傳採樣原文」恰好是它最擋不住的(F11 讀療程欄完全沒把關,定位漂到
+#     姓名欄時姓名就進帳本,那兩條 regex 一個字都攔不到)。
+#   * 誤遮無聲:院方哪天發 8 位醫令代碼,整欄集體變 [REDACTED] 而沒有任何訊號 ——
+#     偏偏那正是要查「改版把醫令寫錯」的時候。
+# 現在改成【型別化事件】:見 cmuh_common.audit_events。防線從「事後猜」移到
+# 「呼叫端必須宣告這個值是什麼」。
 
 
 def chain_hash(prev_hash: str, payload: dict) -> str:
@@ -307,7 +303,9 @@ class ActionLedger:
         否則會記成背景緒實際落檔的時間。省略則用現在。
 
         fields 可帶:target/value/his_version/canary/outcome/detail/correlation_id/
-        app_version。切記 value/detail 不得放病人明文識別資料或採樣到的 HIS 欄位原文。"""
+        app_version。★value/detail 必須是 `cmuh_common.audit_events` 的型別★
+        (Code/Measure/Observed/Transition/Redacted/Reason);傳字串會被記成 violation
+        且內容不落地 —— 這正是 P2-03 要的效果:誤傳的 HIS 欄位原文進不了帳本。"""
         try:
             with self._lock:
                 if self._last_hash is None:
@@ -328,11 +326,12 @@ class ActionLedger:
                     "prev": self._last_hash,
                 }
                 for k in _FIELDS:
-                    # [P2-07] value/detail 是自由文字,落地前強制消毒(縱深防禦,
-                    # 不只靠呼叫端自律);其餘欄位是受控值,原樣。
+                    # [P2-03] value/detail 只接受 audit_events 的型別,落成結構化
+                    # payload;不是型別的東西記 violation 且【內容不落地】。
+                    # 其餘欄位是受控值(常數、視窗類名、版本字串),原樣。
                     raw = fields.get(k, "") or ""
-                    payload[k] = (sanitize_text(raw) if k in ("value", "detail")
-                                  else str(raw))
+                    payload[k] = (to_field_payload(k, raw)
+                                  if k in ("value", "detail") else str(raw))
                 if not payload["outcome"]:
                     # [GPT-5.6 第三輪] 預設 unknown 而非 ok:呼叫端忘了傳 outcome 不可
                     # 自動變成「成功」紀錄(不安全預設會讓帳本失真)。
