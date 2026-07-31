@@ -8438,15 +8438,15 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                     sk_main = f"main:{doc_no}"
                     ok_main, remain_main = _source_backoff_allow(sk_main)
                     if not ok_main:
-                        stale = _cache_get(cache_main_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)
+                        stale = _cache_get(cache_main_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         if stale is not None:
-                            source_timing["backoff_skip"] += 1
+                            source_timing["backoff_skip"] += 1  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                             return stale, 0
                         raise Reg52BackoffActive(f"main source backoff active ({remain_main:.1f}s)")
                     try:
                         with _reg52_cmuh_fetch_sema:
                             with _session_http_guard(sess):
-                                response = sess.get(target_url, timeout=REG52_MAIN_TIMEOUT, verify=verify_main)
+                                response = sess.get(target_url, timeout=REG52_MAIN_TIMEOUT, verify=verify_main)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                                 response.raise_for_status()
                                 response.encoding = 'big5'
                                 hm = response.text
@@ -8458,12 +8458,12 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                             REG52_MAIN_BACKOFF_MAX_SECONDS,
                         )
                         logging.warning(f"[BACKOFF] main fetch fail {doctor_name} {doc_no}, fail={cnt}, delay={delay:.1f}s")
-                        stale = _cache_get(cache_main_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)
+                        stale = _cache_get(cache_main_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         if stale is not None:
-                            source_timing["backoff_skip"] += 1
+                            source_timing["backoff_skip"] += 1  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                             return stale, int((time.perf_counter() - t0) * 1000)
                         raise
-                    _cache_set(cache_main_key, hm)
+                    _cache_set(cache_main_key, hm)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                     return hm, int((time.perf_counter() - t0) * 1000)
 
                 def _parallel_fetch_dayoff():
@@ -8472,16 +8472,16 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                     sk_dayoff = f"dayoff:{doc_no}"
                     ok_dayoff, _ = _source_backoff_allow(sk_dayoff)
                     if not ok_dayoff:
-                        stale = _cache_get(dayoff_cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)
+                        stale = _cache_get(dayoff_cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         return (stale or ""), 0, True
                     try:
                         with _reg52_cmuh_fetch_sema:
                             with _session_http_guard(sess):
-                                dayoff_response = sess.get(dayoff_url, timeout=REG52_DAYOFF_TIMEOUT, verify=verify_dayoff)
+                                dayoff_response = sess.get(dayoff_url, timeout=REG52_DAYOFF_TIMEOUT, verify=verify_dayoff)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                                 dayoff_response.raise_for_status()
                                 dayoff_response.encoding = "big5"
                                 hd = dayoff_response.text
-                        _cache_set(dayoff_cache_key, hd)
+                        _cache_set(dayoff_cache_key, hd)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         _source_backoff_success(sk_dayoff)
                         return hd, int((time.perf_counter() - t0) * 1000), False
                     except requests.exceptions.RequestException as e:
@@ -8492,7 +8492,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                             REG52_EXTERNAL_BACKOFF_MAX_SECONDS,
                         )
                         logging.warning(f"[BACKOFF] dayoff fetch fail {doctor_name} {doc_no}, fail={cnt}, delay={delay:.1f}s")
-                        stale = _cache_get(dayoff_cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)
+                        stale = _cache_get(dayoff_cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         return (stale or ""), int((time.perf_counter() - t0) * 1000), False
 
                 with ThreadPoolExecutor(max_workers=2, thread_name_prefix="r52pair") as pool:
@@ -8592,19 +8592,19 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                 cached = _cache_get(cache_key, ttl_seconds, evict_expired=False)
                 timing_key = f"{label}_fetch_ms"
                 if cached is not None:
-                    source_timing[timing_key] = 0
-                    source_timing["cache_hit_html"] += 1
+                    source_timing[timing_key] = 0  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
+                    source_timing["cache_hit_html"] += 1  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                     return cached
                 if source_key:
                     ok_external, remain_external = _source_backoff_allow(source_key)
                     if not ok_external:
                         logging.info(f"[BACKOFF] skip {label} fetch {doctor_name} {doc_no}, remaining={remain_external:.1f}s")
-                        source_timing[timing_key] = 0
-                        source_timing["backoff_skip"] += 1
+                        source_timing[timing_key] = 0  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
+                        source_timing["backoff_skip"] += 1  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         stale = _cache_get(cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)
                         return stale or ""
                 stale = _cache_get(cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)
-                external_jobs.append((label, cache_key, fetcher, stale))
+                external_jobs.append((label, cache_key, fetcher, stale))  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                 return ""
 
             if _should_fetch_east_district_reg52(html_main, doctor_name):

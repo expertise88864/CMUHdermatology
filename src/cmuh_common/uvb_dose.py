@@ -1939,7 +1939,7 @@ def _detect_uncertain_triplets(text: str, today: date,
         rep = m.group(0)
         rep = re.sub(
             r"([\(\uFF08]\s*)" + str(old_count) + r"(\s*[\)\uFF09])",
-            lambda mo: f"{mo.group(1)}{old_count + 1}{mo.group(2)}",
+            lambda mo: f"{mo.group(1)}{old_count + 1}{mo.group(2)}",  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
             rep,
             count=1,
         )
@@ -2606,7 +2606,7 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         seg_text = m.group(0)
         seg_text = re.sub(
             r"([\(\uFF08]\s*)" + str(old_count) + r"(\s*[\)\uFF09])",
-            lambda mo: f"{mo.group(1)}{old_count + 1}{mo.group(2)}",
+            lambda mo: f"{mo.group(1)}{old_count + 1}{mo.group(2)}",  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
             seg_text,
             count=1,
         )

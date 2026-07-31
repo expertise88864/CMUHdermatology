@@ -11,13 +11,33 @@
 # [2026-07-20] 依註解預告加入 B(flake8-bugbear)——「真 bug 傾向」規則:
 #   B904 例外鏈(raise ... from)、B905 zip(strict=)、B006 可變預設參數、B012 finally 內
 #   break/return 吞例外……等。加入時一次修完當下全部命中(B904×4/B905×7/B007×6/B011×3)。
-# 唯【B023】(closure 未綁 loop 變數)全數為【誤報】故 ignore:本專案這些 closure 都在
-#   同一輪迴圈內【同步】跑完(submit 後立即 .result() join,見 main.py reg52 併發抓取),
-#   loop 變數不會在 closure 執行前改變 → 綁定與否無差,硬綁只是徒增雜訊(比照 E701 不與
-#   linter 糾纏非 bug 的立場)。★未來若把這些 closure 改成【延後/跨迴圈】執行,務必移除此
-#   ignore 並改用預設參數綁定,否則會踩到真正的 late-binding bug。★
+#
+# ─── B023(closure 未綁 loop 變數)為什麼是【逐處 noqa】而不是全域 ignore ──────
+# [2026-07-30 第二輪外審 P3-01]
+# 舊寫法是 `ignore = ["B023"]` 全域關掉,並在這裡註明「本專案這些 closure 都在同一輪
+# 迴圈內同步跑完,所以是誤報」。那個判斷【對當時的 18 處是對的】,但全域 ignore 有一個
+# 致命性質:**它把未來也一起關掉了**。
+#
+# 舊註解自己就寫著「★未來若把這些 closure 改成延後/跨迴圈執行,務必移除此 ignore★」——
+# 也就是把「記得回來拿掉」交給人的記性。而真正踩到 late-binding bug 的那一刻,正是有人
+# 新寫了一個【延後執行】的 closure 的時候,那時 linter 完全不會出聲。這跟本 repo 的
+# 老病灶(守衛靜默失效)是同一種東西。
+#
+# 現在:規則打開,現存 18 處逐行標 `# noqa: B023`。每一處都是【個別判斷過】的,而任何
+# 【新的】B023 都會讓關卡紅燈,逼人回答「這個 closure 是同步跑完的嗎」。
+#
+# 那 18 處為什麼是誤報(2026-07-30 逐處核對):
+#   * main.py reg52 併發抓取:`pool.submit(...)` 之後在【同一個 with 區塊內】立即
+#     `.result()` join;`external_jobs` 也是同一輪(for attempt in range(3))建立、
+#     同一輪 drain 完。loop 變數不可能在 closure 執行前改變。
+#   * uvb_dose.py:`re.sub(pattern, lambda mo: ..., ...)` 的 lambda 由 re.sub
+#     【同步】呼叫,根本沒有跨迭代的機會。
+#   * tests/…overwrite_guard:monkeypatch 進去的 lambda 在同一輪就被呼叫。
+#
+# ★判準★:closure 是否可能在【loop 變數已經改變之後】才被執行。會的話就是真 bug,
+# 用預設參數綁定(`lambda x, _v=v: ...`)修掉,不要標 noqa。
 line-length = 200
 
 [lint]
 select = ["F", "E9", "B"]
-ignore = ["B023"]
+ignore = []

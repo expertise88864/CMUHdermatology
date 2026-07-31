@@ -54,7 +54,7 @@ def test_missing_and_corrupt_are_not_treated_as_failure(monkeypatch, tmp_path):
     不可因為這次收緊而讓新裝機器永遠不能存設定。"""
     for st in ("missing", "corrupt"):
         aps._LOAD_FAILED_FILES.clear()
-        monkeypatch.setattr(aps, "load_json_dict_ex", lambda *a, **k: ({}, st))
+        monkeypatch.setattr(aps, "load_json_dict_ex", lambda *a, **k: ({}, st))  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
         aps.load_threshold_settings(str(tmp_path / "threshold_settings.json"))
         assert not aps.settings_load_failed(), st
     aps._LOAD_FAILED_FILES.clear()
