@@ -111,7 +111,10 @@ WAKE_GRACE_SEC = 1.5
 
 
 def virtual_screen_rect() -> tuple:
-    """(x, y, w, h) 涵蓋所有螢幕。取不到時回主螢幕大小（絕不回 0 大小）。"""
+    """(x, y, w, h) 涵蓋所有螢幕。取不到時回主螢幕大小（絕不回 0 大小）。
+
+    ★只剩「列舉不到任何螢幕」時的退路★ 正常路徑走 `monitor_rects()`（逐螢幕）。
+    """
     try:
         g = ctypes.windll.user32.GetSystemMetrics
         x, y = g(_SM_XVIRTUALSCREEN), g(_SM_YVIRTUALSCREEN)
@@ -124,24 +127,58 @@ def virtual_screen_rect() -> tuple:
         return (0, 0, 1920, 1080)
 
 
+def monitor_rects() -> list:
+    """[(x, y, w, h), …] 逐一列出每個實體螢幕。列舉不到就回虛擬桌面那一個。
+
+    ★[2026-07-31 使用者回報] 為什麼改成「一個螢幕一個視窗」★
+    使用者實機回報：按下按鈕後「只有副螢幕跟主螢幕 1/3 有黑屏，其他都沒有」。
+    原本是【一個】視窗蓋整個虛擬桌面，有兩個獨立的坑會讓它蓋不滿：
+
+      1. **Tk 的 `wm maxsize` 預設是主螢幕大小** —— 超過就被夾掉。虛擬桌面比
+         主螢幕寬是雙螢幕的常態，所以那個視窗本來就可能被截短。
+      2. **本程式刻意是 system-DPI-aware**（見 `platform_win.set_dpi_awareness`，
+         理由是 Tk 不處理 WM_DPICHANGED）。兩台螢幕縮放比例不同時，Windows 會對
+         「與系統 DPI 不同」的那台做座標虛擬化 —— 用一個涵蓋全部的矩形去算，
+         位置與大小就會對不上。
+
+    逐螢幕開視窗把兩個坑一起繞開：每個視窗都不超過它所在的那台螢幕，
+    夾不到、也不必跨越不同 DPI 的邊界。
+    （`get_active_physical_monitors()` 是 repo 既有的實作，會排除鏡像顯示驅動。）
+    """
+    try:
+        from cmuh_common.platform_win import get_active_physical_monitors
+        mons = get_active_physical_monitors()
+        rects = [(m.left, m.top, m.width, m.height) for m in mons
+                 if m.width > 0 and m.height > 0]
+        if rects:
+            return rects
+        logging.warning("[黑幕] 列舉不到任何實體螢幕 → 退回單一虛擬桌面矩形")
+    except Exception:
+        logging.warning("[黑幕] 列舉實體螢幕失敗 → 退回單一虛擬桌面矩形",
+                        exc_info=True)
+    return [virtual_screen_rect()]
+
+
 class ScreenBlackout:
     """全黑覆蓋層。★所有方法都只能在 Tk 主緒呼叫★
 
     idle_seconds_fn: () -> float | None（None＝查不到閒置時間）
     busy_fn:         () -> bool（True＝本行程正在跑自動化 → 不黑屏／立刻收起）
-    rect_fn:         () -> (x, y, w, h)（可注入，測試用）
+    rects_fn:        () -> [(x, y, w, h), …]（每個實體螢幕一個；可注入，測試用）
     """
 
     def __init__(self, root, *, idle_seconds_fn, busy_fn,
-                 rect_fn=virtual_screen_rect):
+                 rects_fn=monitor_rects):
         self._root = root
         self._idle_seconds_fn = idle_seconds_fn
         self._busy_fn = busy_fn
-        self._rect_fn = rect_fn
-        self._win = None
-        # 黑幕視窗的 HWND。熱鍵閘門在【非 Tk 緒】上跑，只能靠這個 + Win32
-        # 查狀態（見 `active_from_any_thread`）。int 的讀寫在 CPython 是原子的。
-        self._hwnd = 0
+        self._rects_fn = rects_fn
+        # ★一個實體螢幕一個視窗★（理由見 `monitor_rects` 的說明）
+        self._wins: list = []
+        # 黑幕視窗的 HWND 清單。熱鍵閘門在【非 Tk 緒】上跑，只能靠這些 + Win32
+        # 查狀態（見 `active_from_any_thread`）。list 的整體替換在 CPython 是原子的
+        # —— 一律【整條換掉】，不要就地 append/remove。
+        self._hwnds: tuple = ()
         self._poll_id = None
         self._prev_foreground = 0
         # 一次性的喚醒 token（monotonic 時間戳，0＝沒有）。熱鍵回呼在別的緒上
@@ -165,13 +202,25 @@ class ScreenBlackout:
         ★只能在 Tk 主緒問★（會呼叫 winfo_*）。熱鍵回呼那種非 Tk 緒請用
         `active_from_any_thread()`。
         """
-        win = self._win
-        if win is None:
+        wins = self._wins
+        if not wins:
             return False
         try:
-            return bool(win.winfo_exists()) and bool(win.winfo_ismapped())
+            # 有【任何一片】還蓋著就算黑幕還在：熱鍵閘門與退場判斷都必須偏保守，
+            # 剩一片沒收掉時放行熱鍵，那一下就打在使用者看不見的畫面後面。
+            return any(bool(w.winfo_exists()) and bool(w.winfo_ismapped())
+                       for w in wins)
         except Exception:
             return False
+
+    @property
+    def panel_count(self) -> int:
+        """目前蓋著幾片（＝幾個螢幕）。回讀用，不是記下來的旗標。"""
+        try:
+            return sum(1 for w in self._wins
+                       if w.winfo_exists() and w.winfo_ismapped())
+        except Exception:
+            return 0
 
     def active_from_any_thread(self) -> bool:
         """黑幕是不是正蓋著 —— ★可以從任何緒問★（純 Win32，不碰 Tk）。
@@ -193,12 +242,14 @@ class ScreenBlackout:
         回 False 是刻意的：查不到就放行熱鍵。反過來（查不到就擋）會讓一次
         Win32 失敗把所有 F1-F12 永久鎖死，那比「黑幕期間漏擋一次」嚴重得多。
         """
-        hwnd = self._hwnd
-        if not hwnd:
+        hwnds = self._hwnds
+        if not hwnds:
             return False
         try:
             u = ctypes.windll.user32
-            return bool(u.IsWindow(hwnd)) and bool(u.IsWindowVisible(hwnd))
+            # 任一片還可見就算黑幕還在（偏保守，理由同 `active`）
+            return any(bool(u.IsWindow(h)) and bool(u.IsWindowVisible(h))
+                       for h in hwnds)
         except Exception:
             logging.debug("[黑幕] IsWindowVisible 查詢失敗（視為沒有黑幕）",
                           exc_info=True)
@@ -274,39 +325,67 @@ class ScreenBlackout:
         except Exception:
             self._prev_foreground = 0
 
-        x, y, w, h = self._rect_fn()
-        win = tk.Toplevel(self._root)
-        self._win = win
-        win.overrideredirect(True)          # 無標題列，才能真正蓋滿虛擬桌面
-        win.configure(bg="black", cursor="none")
-        # ★[2026-07-30 外審第 1 輪] 偏移量必須帶正負號★
-        #   副螢幕放在主螢幕左邊/上方時，虛擬桌面原點是負的（x=-1920）。
-        #   `f"...+{x}+{y}"` 會組出 `3840x1080+-1920+0` 這種不合法的幾何字串 →
-        #   `_create()` 拋例外 → 黑幕在【雙螢幕常見排列】下永遠不會出現。
-        win.geometry(f"{w}x{h}{x:+d}{y:+d}")
-        win.attributes("-topmost", True)
-        # ★不用 grab_set★：抓住輸入的話，黑幕若沒收乾淨會把整台機器鎖死。
-        # ★使用者定案：任何一種都馬上收（滑鼠移動也一樣，不問移了幾 px）
-        for seq in ("<Key>", "<Button>", "<MouseWheel>", "<Motion>"):
-            win.bind(seq, self._on_wake)
-        win.protocol("WM_DELETE_WINDOW", self._on_wake)
+        rects = list(self._rects_fn() or [])
+        if not rects:
+            raise RuntimeError("列不出任何螢幕矩形")
+        wins, hwnds = [], []
+        for i, (x, y, w, h) in enumerate(rects):
+            win = tk.Toplevel(self._root)
+            wins.append(win)
+            self._wins = wins                 # 先掛上去，失敗時 _destroy 收得掉
+            win.overrideredirect(True)        # 無標題列，才能蓋到工作列上面
+            win.configure(bg="black", cursor="none")
+            # ★[2026-07-31 使用者回報] 先解除 Tk 的尺寸上限★
+            #   `wm maxsize` 預設是【主螢幕】大小，超過就被夾掉 —— 這正是
+            #   「只有副螢幕跟主螢幕 1/3 有黑屏」的成因之一。逐螢幕開視窗之後
+            #   單片不會超過所在螢幕，但副螢幕比主螢幕大時仍會踩到，所以照樣解除。
+            try:
+                win.maxsize(max(w, 1), max(h, 1))
+            except Exception:
+                logging.debug("[黑幕] 解除尺寸上限失敗（續行）", exc_info=True)
+            # ★[2026-07-30 外審第 1 輪] 偏移量必須帶正負號★
+            #   副螢幕放在主螢幕左邊/上方時，座標是負的（x=-1920）。
+            #   `f"...+{x}+{y}"` 會組出 `3840x1080+-1920+0` 這種不合法的幾何字串 →
+            #   `_create()` 拋例外 → 黑幕在【雙螢幕常見排列】下永遠不會出現。
+            win.geometry(f"{w}x{h}{x:+d}{y:+d}")
+            win.attributes("-topmost", True)
+            # ★不用 grab_set★：抓住輸入的話，黑幕若沒收乾淨會把整台機器鎖死。
+            # ★使用者定案：任何一種都馬上收（滑鼠移動也一樣，不問移了幾 px）
+            for seq in ("<Key>", "<Button>", "<MouseWheel>", "<Motion>"):
+                win.bind(seq, self._on_wake)
+            win.protocol("WM_DELETE_WINDOW", self._on_wake)
+            win.update_idletasks()
+            try:
+                hwnds.append(int(win.winfo_id()))
+            except Exception:
+                # 沒有 HWND 就沒有熱鍵閘門（閘門只能從非 Tk 緒用 Win32 查）→ 寧可不黑屏
+                logging.warning("[黑幕] 拿不到第 %d 片黑幕的 HWND → 熱鍵閘門會失效，"
+                                "本輪不黑屏", i + 1, exc_info=True)
+                raise
+            self._hwnds = tuple(hwnds)        # 整條換掉（跨緒讀取）
+
         with self._wake_lock:
             self._eaten_this_blackout = False
         self._shown_at = time.monotonic()
         self._armed = False              # 按鈕的那一下不算「有人回來了」
-        win.update_idletasks()
         try:
-            self._hwnd = int(win.winfo_id())
-        except Exception:
-            # 沒有 HWND 就沒有熱鍵閘門（閘門只能從非 Tk 緒用 Win32 查）→ 寧可不黑屏
-            logging.warning("[黑幕] 拿不到黑幕的 HWND → 熱鍵閘門會失效，本輪不黑屏",
-                            exc_info=True)
-            raise
-        try:
-            win.focus_force()               # 喚醒的那一下按鍵打在黑幕上，不打進病歷
+            wins[0].focus_force()        # 喚醒的那一下按鍵打在黑幕上，不打進病歷
         except Exception:
             logging.debug("[黑幕] focus_force 失敗（仍以輪詢收場）", exc_info=True)
+        # ★把實際用到的矩形記下來★ 使用者回報「蓋不滿」時，這是唯一能判斷
+        #   「算錯了」還是「算對但被夾掉」的資料（回讀的是視窗真正的幾何）。
+        logging.info("[黑幕] 已建立 %d 片：要求 %s ／回讀 %s",
+                     len(wins), rects, [self._geometry_of(w) for w in wins])
         self._schedule_poll()
+
+    @staticmethod
+    def _geometry_of(win) -> str:
+        try:
+            win.update_idletasks()
+            return (f"{win.winfo_width()}x{win.winfo_height()}"
+                    f"{win.winfo_rootx():+d}{win.winfo_rooty():+d}")
+        except Exception:
+            return "(讀不到)"
 
     # ── 待命 ────────────────────────────────────────────────────────────────
     @property
@@ -345,18 +424,21 @@ class ScreenBlackout:
 
     def _destroy(self) -> None:
         self._cancel_poll()
-        win, self._win = self._win, None
-        if win is None:
-            self._hwnd = 0
+        wins, self._wins = self._wins, []
+        if not wins:
+            self._hwnds = ()
             return
-        try:
-            win.destroy()
-        except Exception:
-            logging.debug("[黑幕] destroy 失敗（已放棄引用）", exc_info=True)
+        for win in wins:
+            # ★每一片都要各自 try★ 其中一片 destroy 失敗不可以讓其餘幾片留在
+            #   螢幕上（那就是「收不掉的黑幕」，診間機最不能發生的事）。
+            try:
+                win.destroy()
+            except Exception:
+                logging.debug("[黑幕] destroy 失敗（已放棄引用）", exc_info=True)
         # ★HWND 要在 destroy 【之後】才清★ 先清會出現「黑幕還蓋著、但熱鍵閘門
         # 已放行」的空窗，那一瞬的按鍵就會對 HIS 動作。destroy 失敗時也要清，
         # 不然閘門會卡在「黑著」（IsWindowVisible 還是 True）而熱鍵全死。
-        self._hwnd = 0
+        self._hwnds = ()
         # 發一張【一次性】的喚醒 token：HWND 沒了之後，靠它把「喚醒的那一下」熱鍵
         # 吃掉（外審第 2 輪的競態）。只有真的建過視窗才發。
         # 一次性而非時間窗：喚醒只有一下，第二下 F1 必須正常動作（外審第 3 輪）。

@@ -54,7 +54,7 @@ def made(tk_root):
     """(blackout, idle, busy) —— 用注入的假閒置/忙碌來源，不碰真的 Win32。"""
     idle, busy = _Idle(), _Busy()
     bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=idle, busy_fn=busy,
-                           rect_fn=lambda: RECT)
+                           rects_fn=lambda: [RECT])
     yield bo, idle, busy
     bo.hide()
 
@@ -86,12 +86,103 @@ def test_show_is_idempotent(made):
     assert bo.active is True
 
 
-def test_it_covers_the_whole_virtual_desktop_not_just_one_monitor(made):
+def test_it_covers_the_monitor_it_was_given(made):
     """★診間有雙螢幕機器★ 只用 -fullscreen 會只蓋一個螢幕，另一台仍亮著顯示病歷。"""
     bo, _idle, _busy = made
     bo.show()
-    bo._win.update_idletasks()
-    assert (bo._win.winfo_width(), bo._win.winfo_height()) == (800, 600)
+    win = bo._wins[0]
+    win.update_idletasks()
+    assert (win.winfo_width(), win.winfo_height()) == (800, 600)
+
+
+# ─── ★[2026-07-31 使用者回報] 一個螢幕一片，不是一片蓋全部★ ────────────
+# 使用者實機回報：「現在只有副螢幕跟主螢幕 1/3 有黑屏，其他都沒有」。
+# 原本是【一個】視窗蓋整個虛擬桌面，有兩個獨立的坑會讓它蓋不滿：
+#   1. Tk 的 `wm maxsize` 預設是【主螢幕】大小 —— 超過就被夾掉，而虛擬桌面比主螢幕
+#      寬正是雙螢幕的常態。
+#   2. 本程式刻意是 system-DPI-aware（Tk 不處理 WM_DPICHANGED）→ 兩台螢幕縮放不同時，
+#      Windows 對「與系統 DPI 不同」的那台做座標虛擬化，一個大矩形就會對不上。
+def test_one_panel_per_monitor(tk_root):
+    """每個螢幕都要有自己的一片，而且各自蓋滿【自己那台】。"""
+    rects = [(0, 0, 800, 600), (800, 0, 640, 480)]
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: rects)
+    try:
+        assert bo.show() is True
+        assert bo.panel_count == 2, "兩台螢幕就該有兩片"
+        got = []
+        for w in bo._wins:
+            w.update_idletasks()
+            got.append((w.winfo_width(), w.winfo_height()))
+        assert got == [(800, 600), (640, 480)]
+    finally:
+        bo.hide()
+
+
+def test_a_secondary_monitor_larger_than_the_primary_is_not_clipped(tk_root):
+    """★`wm maxsize` 的坑★ Tk 預設把視窗尺寸夾到主螢幕大小。
+
+    副螢幕比主螢幕大時（4K 副 + HD 主），沒有解除上限的話那一片會被截短 ——
+    正是使用者看到的「蓋不滿」。這裡用一個比 tk_root 所在螢幕還大的矩形來逼出它。
+    """
+    big = (0, 0, tk_root.winfo_screenwidth() + 600,
+           tk_root.winfo_screenheight() + 400)
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [big])
+    try:
+        assert bo.show() is True
+        win = bo._wins[0]
+        win.update_idletasks()
+        assert (win.winfo_width(), win.winfo_height()) == (big[2], big[3]), \
+            "視窗被夾到主螢幕大小了（wm maxsize 沒解除）"
+    finally:
+        bo.hide()
+
+
+def test_all_panels_come_down_together(tk_root):
+    """★收黑幕必須整組收★ 留一片在螢幕上就是「收不掉的黑幕」。"""
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 400, 300),
+                                             (400, 0, 400, 300),
+                                             (800, 0, 400, 300)])
+    try:
+        assert bo.show() is True and bo.panel_count == 3
+        bo.hide()
+        assert bo.panel_count == 0 and bo.active is False
+        assert bo.active_from_any_thread() is False
+    finally:
+        bo.hide()
+
+
+def test_the_gate_still_holds_if_only_one_panel_survives(tk_root):
+    """★偏保守★ 只剩一片沒收掉時，熱鍵閘門仍要當成「黑幕還在」——
+    否則那一下按鍵會打在使用者看不見的畫面後面。"""
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 400, 300),
+                                             (400, 0, 400, 300)])
+    try:
+        assert bo.show() is True
+        bo._wins[0].destroy()          # 模擬其中一片不見了
+        assert bo.active is True, "還有一片蓋著就不算收掉"
+    finally:
+        bo.hide()
+
+
+def test_monitor_rects_falls_back_instead_of_returning_nothing(monkeypatch):
+    """★列舉不到螢幕不可以回空清單★ 那會讓 `_create` 直接放棄，等於沒有黑幕。"""
+    import cmuh_common.platform_win as pw
+    monkeypatch.setattr(pw, "get_active_physical_monitors", lambda: [])
+    rects = sb.monitor_rects()
+    assert len(rects) == 1
+    assert rects[0][2] > 0 and rects[0][3] > 0
+
+
+def test_monitor_rects_survives_an_enumeration_failure(monkeypatch):
+    import cmuh_common.platform_win as pw
+    monkeypatch.setattr(pw, "get_active_physical_monitors",
+                        lambda: (_ for _ in ()).throw(OSError("boom")))
+    rects = sb.monitor_rects()
+    assert len(rects) == 1 and rects[0][2] > 0
 
 
 def test_the_default_rect_never_reports_a_zero_sized_desktop():
@@ -302,7 +393,7 @@ def test_it_still_appears_when_the_virtual_desktop_origin_is_negative(
     """`f"...+{x}+{y}"` 會組出 `3840x1080+-1920+0` 這種不合法的幾何字串 →
     拋例外 → 黑幕在【雙螢幕常見排列】下永遠不會出現。"""
     bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
-                           rect_fn=lambda: rect)
+                           rects_fn=lambda: [rect])
     try:
         assert bo.show() is True, f"虛擬桌面原點 {rect[:2]} 時黑幕沒出現"
     finally:
@@ -356,7 +447,7 @@ def test_the_wake_keystroke_is_still_gated_right_after_the_blackout_is_gone(
     bo, _idle, _busy = made
     bo.show()
     bo.hide()                                    # 模擬 Tk 先收掉
-    assert bo._hwnd == 0, "測試前提：HWND 已經清掉了"
+    assert bo._hwnds == (), "測試前提：HWND 已經清掉了"
     assert _cross_thread_state(bo) is True, (
         "★黑幕剛收掉的那一瞬，熱鍵仍必須被吃掉★")
 
@@ -443,7 +534,7 @@ def test_a_blackout_that_never_appeared_does_not_gate_hotkeys(tk_root,
                                                              monkeypatch):
     """沒真的黑過就不該有寬限（否則每次「本輪不黑屏」都白白吃掉一次熱鍵）。"""
     bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(),
-                           busy_fn=_Busy(True), rect_fn=lambda: RECT)
+                           busy_fn=_Busy(True), rects_fn=lambda: [RECT])
     assert bo.show() is False
     assert _cross_thread_state(bo) is False
 
@@ -526,7 +617,8 @@ def test_active_is_false_once_the_window_is_gone(made):
     """
     bo, _idle, _busy = made
     bo.show()
-    bo._win.destroy()                    # 繞過 hide()，模擬視窗被別人弄掉
+    for w in bo._wins:                   # 繞過 hide()，模擬視窗被別人弄掉
+        w.destroy()
     assert bo.active is False
 
 
@@ -538,14 +630,14 @@ def test_active_is_false_when_the_window_object_misbehaves(made):
         def winfo_exists(self):
             raise RuntimeError("Tcl 沒了")
 
-    bo._win = _Broken()
+    bo._wins = [_Broken()]
     assert bo.active is False, "問視窗狀態時炸掉也必須回 False（不可卡住熱鍵）"
 
 
 def test_it_refuses_to_stay_up_without_a_failsafe_poll(tk_root, monkeypatch):
     """★排不到 after 就不黑屏★ 沒有失效保險輪詢的黑幕是收不掉的黑幕。"""
     bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
-                           rect_fn=lambda: RECT)
+                           rects_fn=lambda: [RECT])
     monkeypatch.setattr(tk_root, "after",
                         lambda *_a, **_k: (_ for _ in ()).throw(
                             RuntimeError("排不到")))
