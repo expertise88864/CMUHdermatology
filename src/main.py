@@ -2477,29 +2477,6 @@ def _ensure_hospital_foreground(hwnd: int) -> None:
         logging.debug("_ensure_hospital_foreground 失敗", exc_info=True)
 
 
-def _get_thread_focus(target_hwnd: int) -> int:
-    """取得 target_hwnd 那個 thread 內目前焦點的 control hwnd。
-
-    cross-thread 的 GetFocus 預設回 0；要用 AttachThreadInput 把當前 thread
-    跟 target thread 連起來才能讀。用於知道「使用者鍵盤輸入會送到哪個 control」。"""
-    if not target_hwnd:
-        return 0
-    try:
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        target_tid = user32.GetWindowThreadProcessId(target_hwnd, None)
-        cur_tid = kernel32.GetCurrentThreadId()
-        if target_tid == cur_tid:
-            return user32.GetFocus()
-        user32.AttachThreadInput(cur_tid, target_tid, True)
-        try:
-            return user32.GetFocus()
-        finally:
-            user32.AttachThreadInput(cur_tid, target_tid, False)
-    except Exception:
-        return 0
-
-
 def _wait_for_code_input_focus(target_hwnd: int, *,
                                previous_focus: int = 0,
                                timeout: float = 0.6,
@@ -2610,101 +2587,6 @@ def _wm_gettext_timeout(hwnd: int, timeout_ms: int = 2500) -> str:
     理由同 _wm_settext_timeout（避免讀文字時被凍住的醫院 app 永久阻塞）。
     無法區分「讀取失敗」與「空欄位」;需要區分請用 _wm_gettext_timeout_ex。"""
     return _wm_gettext_timeout_ex(hwnd, timeout_ms)[0]
-
-
-def _send_chars_to_window(hwnd: int, text: str) -> bool:
-    """送 WM_CHAR 一字一字到目標 control。完全繞過 IME。
-
-    pyautogui.typewrite 走 OS keyboard input → IME 攔截（中文模式下「5」被當組
-    字輸入）。WM_CHAR 直接到 control，IME 沒機會攔截。
-
-    [stability] 改用 PostMessageW（非同步）取代 SendMessageW：後者對跨行程視窗
-    是同步阻塞，醫院 app 凍住時會無限期卡住 hotkey 工作緒並永久鎖死全部熱鍵。
-    PostMessage 立即返回、訊息照 FIFO 入該 control 佇列由 Delphi 依序處理。"""
-    if not hwnd or not text:
-        return False
-    WM_CHAR = 0x0102
-    try:
-        user32 = ctypes.windll.user32
-        for ch in text:
-            # [UD-12 2026-07-12] 逐字前確認視窗仍在:編輯器中途被關(hwnd 失效)即中止回 False,交
-            # caller 走警示,避免代碼欄殘留半截醫令(原本不論如何一律回 True)。
-            if not user32.IsWindow(hwnd):
-                logging.warning("[send_chars] 目標視窗中途消失,中止(已送部分字元)")
-                return False
-            # [GPT-5.6 第三輪] PostMessageW 回 0 = Windows 根本沒收(佇列滿/hwnd 失效)。
-            # 原本完全不檢查 → 送出失敗仍回 True → 稽核記成功、半截醫令沒人知道。
-            if not user32.PostMessageW(hwnd, WM_CHAR, ord(ch), 0):
-                logging.warning("[send_chars] PostMessageW 回 0(佇列滿/視窗失效),"
-                                "中止(已送部分字元)")
-                return False
-            time.sleep(0.02)  # 給 Delphi 依序處理（非同步下保險）
-        return True
-    except Exception:
-        logging.error("_send_chars_to_window 失敗", exc_info=True)
-        return False
-
-
-def _send_enter_to_window(hwnd: int) -> bool:
-    """送 VK_RETURN keydown+up 到指定 control。
-
-    [stability] 同 _send_chars_to_window：改用 PostMessageW 非同步送，避免被
-    凍住的醫院 app 同步阻塞 hotkey 工作緒。"""
-    if not hwnd:
-        return False
-    try:
-        WM_KEYDOWN = 0x0100
-        WM_KEYUP = 0x0101
-        VK_RETURN = 0x0D
-        # 只送 keydown+keyup（等同真人按「一次」Enter）。Delphi VCL 的訊息迴圈會自行
-        # TranslateMessage 把 WM_KEYDOWN(VK_RETURN) 轉成對應的 WM_CHAR(\r)，控制項
-        # 因而收到「剛好一次」Enter。
-        # [修正 2026-06-01] 原本在 keydown/keyup 之後又額外 PostMessage 一個 WM_CHAR \r，
-        # 等於控制項收到兩個 Enter 字元（keydown 被翻譯出的 \r + 這個多餘的 \r）→
-        # 醫令代碼被送出兩次 → F1/F2/F3/F4/F5 跳「資料重複確認」。移除多餘的 WM_CHAR。
-        # [GPT-5.6 第三輪 + codex P1] 檢查 PostMessageW 回傳,但要分清【提交點】:
-        # Delphi 的 TranslateMessage 是對 WM_KEYDOWN 轉出 Enter 的 WM_CHAR —— keydown
-        # 一旦被接受,醫令【可能已經提交】。此時若因 keyup 失敗回 False,呼叫端會誤判
-        # 「什麼都沒送」→ 跳過療程/記 failed、重試還可能把已提交的醫令再下一次。
-        # 故:keydown 失敗(真的沒送)→ False;keydown 成功後 keyup 失敗 → 補送一次,
-        # 無論補送成敗都回 True(提交點已過,不可走「沒送出」的重試/中止路徑)。
-        ok_down = ctypes.windll.user32.PostMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0x1C0001)
-        if not ok_down:
-            logging.warning("[send_enter] keydown PostMessageW 回 0,未送出 Enter")
-            return False
-        ok_up = ctypes.windll.user32.PostMessageW(hwnd, WM_KEYUP, VK_RETURN, 0xC01C0001)
-        if not ok_up:
-            ok_up = ctypes.windll.user32.PostMessageW(hwnd, WM_KEYUP, VK_RETURN,
-                                                      0xC01C0001)   # 補送一次
-            logging.warning("[send_enter] keyup 首送失敗(補送%s);keydown 已被接受,"
-                            "Enter 視為已提交", "成功" if ok_up else "仍失敗")
-        return True
-    except Exception:
-        return False
-
-
-def _force_ime_english(hwnd: int = 0) -> None:
-    """把當前前景視窗（或指定 hwnd）的 IME 切到英文模式（關閉 IME 轉換）。
-
-    用 ImmSetOpenStatus(himc, False) 對 IME context 設「不開」=「直接送
-    英文字」。對 Delphi VCL 應用通常立刻生效，不會像 Ctrl+Space 那樣依賴
-    使用者 IME 設定。
-    為什麼必要：使用者中文輸入法（注音/新酷音/微軟拼音）打開時，
-    pyautogui.typewrite("51017") 的 "5" 會被 IME 攔截當作組字輸入，
-    結果什麼都沒寫進輸入欄。強制切英文徹底避免這個問題。"""
-    try:
-        imm32 = ctypes.windll.imm32
-        target = hwnd or ctypes.windll.user32.GetForegroundWindow()
-        if not target:
-            return
-        himc = imm32.ImmGetContext(target)
-        if himc:
-            try:
-                imm32.ImmSetOpenStatus(himc, False)
-            finally:
-                imm32.ImmReleaseContext(target, himc)
-    except Exception:
-        logging.debug("_force_ime_english 失敗（IME 模組不可用？忽略）", exc_info=True)
 
 
 def _script_code_input_adaptive(code: str, label: str = "",
@@ -4611,25 +4493,6 @@ _APPT_GRID_HEADER_SKIP_PX = 24   # 跳過表頭(欄位標題)那一列再取樣
 _APPT_GRID_CONTENT_MIN = 12      # 內容像素 >= 此值 → 視為「有預約列」
 
 
-def _window_is_ancestor(ancestor_hwnd: int, hwnd: int) -> bool:
-    """hwnd 是否為 ancestor_hwnd 本身、或其子孫(沿 parent 鏈上溯)。"""
-    if not hwnd or not ancestor_hwnd:
-        return False
-    GA_PARENT = 1
-    cur = hwnd
-    for _ in range(64):   # 防環,最多上溯 64 層
-        if cur == ancestor_hwnd:
-            return True
-        try:
-            parent = ctypes.windll.user32.GetAncestor(cur, GA_PARENT)
-        except Exception:
-            return False
-        if not parent or parent == cur:
-            return False
-        cur = parent
-    return False
-
-
 def _screen_point_in_window(root_hwnd: int, x: int, y: int) -> bool:
     """螢幕座標 (x,y) 最上層的視窗是否屬於 root_hwnd(本身或子孫)。
     用於確認畫面取樣點沒被別的視窗(如 Chrome)遮住 —— 遮住時 WindowFromPoint 會回別視窗。"""
@@ -5787,28 +5650,6 @@ def _card_notify_async(title: str, msg: str) -> None:
         logging.debug("[卡號] 背景通知啟動失敗", exc_info=True)
 
 
-def _find_first_descendant_by_class(parent_hwnd: int, target_class: str) -> int:
-    """EnumChildWindows 找第一個 class=target_class 的子孫 hwnd。"""
-    found = [0]
-    EnumWindowsProc = ctypes.WINFUNCTYPE(
-        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-    @EnumWindowsProc
-    def cb(child, lparam):
-        try:
-            buf = ctypes.create_unicode_buffer(64)
-            ctypes.windll.user32.GetClassNameW(child, buf, 64)
-            if buf.value == target_class:
-                found[0] = child
-                return False
-        except Exception:
-            pass
-        return True
-
-    ctypes.windll.user32.EnumChildWindows(parent_hwnd, cb, 0)
-    return found[0]
-
-
 def _find_療程卡號_edit_hwnd(main_hwnd: int) -> int:
     """找頂部 header「卡號」輸入欄 hwnd = 與「療程」同一列、緊鄰其左邊的一般寬度欄。
 
@@ -5859,37 +5700,6 @@ def _find_療程卡號_edit_hwnd(main_hwnd: int) -> int:
     logging.info("[卡號] 卡號欄 hwnd=%s rel_left=%s w=%s (療程 hwnd=%s)",
                  card[0], card[1] - main_r.left, card[2], liao_hwnd)
     return card[0]
-
-
-def _bring_window_front(hwnd: int) -> None:
-    """把任意視窗叫到最前(含 AttachThreadInput)。截圖前要視窗真的顯示才有像素。"""
-    try:
-        SW_RESTORE = 9
-        if ctypes.windll.user32.IsIconic(hwnd):
-            ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
-    except Exception:
-        pass
-    try:
-        cur = ctypes.windll.kernel32.GetCurrentThreadId()
-        fg = ctypes.windll.user32.GetForegroundWindow()
-        ftid = (ctypes.windll.user32.GetWindowThreadProcessId(fg, None)
-                if fg else 0)
-        attached = False
-        if ftid and ftid != cur:
-            attached = bool(
-                ctypes.windll.user32.AttachThreadInput(ftid, cur, True))
-        try:
-            HWND_TOP = 0
-            SWP_NOMOVE, SWP_NOSIZE = 0x0002, 0x0001
-            ctypes.windll.user32.SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
-                                              SWP_NOMOVE | SWP_NOSIZE)
-            ctypes.windll.user32.BringWindowToTop(hwnd)
-            ctypes.windll.user32.SetForegroundWindow(hwnd)
-        finally:
-            if attached:
-                ctypes.windll.user32.AttachThreadInput(ftid, cur, False)
-    except Exception:
-        logging.debug("[卡號] _bring_window_front 失敗", exc_info=True)
 
 
 def _close_window(hwnd: int) -> None:
@@ -6067,88 +5877,8 @@ def _get_window_pid(hwnd: int) -> int:
         return 0
 
 
-def _find_window_by_class_title(class_name: str, title_kw: str = "",
-                                  exclude_hwnd: int = 0,
-                                  require_pid: int = 0,
-                                  exclude_hwnds: tuple = ()) -> int:
-    """全域找 class=X 且 title 含 keyword 的可見視窗。
-
-    [H1 2026-07-09] require_pid 非 0 時,只回傳【屬於該 PID(HIS 行程)】的視窗 —— 避免把
-    別的程式跳出的同 class(#32770)標準對話框誤當 HIS 警告框去自動按「是」。exclude_hwnds
-    可額外排除多個(如已處理過的第一個對話框),避免重複動作。
-
-    [2026-05-22 v38] 從 EnumWindows + Python callback 改 FindWindowExW
-    (純 Win32，不走 Python boundary)。EnumWindows + Python cb 每個 top-level
-    window 都跨 C→Python 邊界 (~0.05ms/個) — 一台 PC 通常 100-300 個
-    top-level windows = 10-30ms per call。9 popup class × 0.12s polling
-    = ~70% CPU 都在 Python callback。改 FindWindowExW 後降到 < 1ms。
-    """
-    user32 = ctypes.windll.user32
-    # FindWindowExW(hWndParent=NULL, hWndChildAfter, class, title)
-    # hWndParent=NULL + 走 prev_hwnd 鏈 = 跨所有 top-level windows
-    FindWindowExW = user32.FindWindowExW
-    FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND,
-                                wintypes.LPCWSTR, wintypes.LPCWSTR]
-    FindWindowExW.restype = wintypes.HWND
-
-    prev = 0
-    while True:
-        try:
-            hwnd = FindWindowExW(None, prev, class_name, None)
-        except Exception:
-            return 0
-        if not hwnd:
-            return 0
-        prev = hwnd
-        if hwnd == exclude_hwnd or (exclude_hwnds and hwnd in exclude_hwnds):
-            continue
-        try:
-            if not user32.IsWindowVisible(hwnd):
-                continue
-        except Exception:
-            continue
-        if require_pid:
-            try:
-                wpid = ctypes.c_ulong(0)
-                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
-                if wpid.value != require_pid:
-                    continue
-            except Exception:
-                continue
-        if title_kw:
-            try:
-                n = user32.GetWindowTextLengthW(hwnd)
-                if n <= 0:
-                    continue
-                t_buf = ctypes.create_unicode_buffer(n + 1)
-                user32.GetWindowTextW(hwnd, t_buf, n + 1)
-                if title_kw not in t_buf.value:
-                    continue
-            except Exception:
-                continue
-        return hwnd
     # [2026-05-25 v15 死碼清除] 移除舊 Python callback 路徑 (~50 行) — 上方
     # while True FindWindowExW loop 一定 return (hwnd or 0)，下面永遠到不了。
-
-
-def _collect_windows_by_class(class_name: str, title_kw: str = "",
-                              require_pid: int = 0) -> tuple:
-    """[2026-07-26 審查] 列出目前【已存在】的同 class 視窗,給呼叫端在觸發新視窗之前
-    先拍快照、之後用 exclude_hwnds 排除。
-
-    需要它的原因:`_wait_for_window` 是「找到就回傳」——上一次流程留下沒關的同意書/
-    片語視窗會讓它【立刻回傳舊視窗】,後續整段操作都打在舊視窗上,而且表面上完全正常
-    (視窗有、按鈕點得到、log 一路綠)。
-    內部重複呼叫 `_find_window_by_class_title` 並把找到的逐一排除,直到找不到為止。"""
-    found: list = []
-    for _ in range(32):        # 上限防禦:正常最多一兩個,不會無限長
-        hwnd = _find_window_by_class_title(class_name, title_kw,
-                                           require_pid=require_pid,
-                                           exclude_hwnds=tuple(found))
-        if not hwnd:
-            break
-        found.append(hwnd)
-    return tuple(found)
 
 
 def _wait_for_window(class_name: str, title_kw: str = "",
@@ -6342,102 +6072,6 @@ def _get_class_name_of(hwnd: int) -> str:
         return ""
 
 
-def _send_window_to_back(hwnd: int) -> bool:
-    """把視窗推到 z-order 最底層（不活化、不搶 focus）。
-
-    用於 F9/F10 流程：醫院系統開新視窗時預設會搶 foreground 打斷使用者，
-    用這個推到底層 → 使用者保持當前視窗。我們所有的訊息都用 PostMessage，
-    不需要視窗是 foreground 就能跑。
-
-    SWP_NOACTIVATE：不要把 hwnd 變 active
-    SWP_NOMOVE/SWP_NOSIZE：保持位置 / 大小
-    HWND_BOTTOM (=1)：z-order 最底"""
-    if not hwnd:
-        return False
-    try:
-        SWP_NOACTIVATE = 0x0010
-        SWP_NOMOVE = 0x0002
-        SWP_NOSIZE = 0x0001
-        HWND_BOTTOM = 1
-        ctypes.windll.user32.SetWindowPos(
-            hwnd, HWND_BOTTOM, 0, 0, 0, 0,
-            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE)
-        return True
-    except Exception:
-        logging.debug("_send_window_to_back 失敗", exc_info=True)
-        return False
-
-
-def _find_descendant_by_class_text(parent_hwnd: int,
-                                     target_class: str,
-                                     text_keyword: str) -> int:
-    """EnumChildWindows 找 class=X 且 text 含 keyword 的子視窗（遞迴）。"""
-    found = [0]
-
-    EnumWindowsProc = ctypes.WINFUNCTYPE(
-        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-    @EnumWindowsProc
-    def cb(child, lparam):
-        try:
-            cls_buf = ctypes.create_unicode_buffer(64)
-            ctypes.windll.user32.GetClassNameW(child, cls_buf, 64)
-            if cls_buf.value == target_class:
-                n = ctypes.windll.user32.GetWindowTextLengthW(child)
-                if n > 0:
-                    t_buf = ctypes.create_unicode_buffer(n + 1)
-                    ctypes.windll.user32.GetWindowTextW(child, t_buf, n + 1)
-                    if text_keyword in t_buf.value:
-                        found[0] = child
-                        return False
-        except Exception:
-            pass
-        return True
-
-    ctypes.windll.user32.EnumChildWindows(parent_hwnd, cb, 0)
-    return found[0]
-
-
-def _post_click_to_control(hwnd: int, client_x: Optional[int] = None,
-                             client_y: Optional[int] = None) -> bool:
-    """送 WM_LBUTTONDOWN + WM_LBUTTONUP 到目標 control，完全不動實體滑鼠。
-
-    位置用 client 座標（相對於該 control 左上角）；不指定就用該 control 的
-    client 中心。比 pyautogui.click 好處：
-      1. 不會移動實體滑鼠（不會干擾使用者）
-      2. 不會被 SetCursorPos 競賽條件影響
-      3. 訊息直接到目標 control，不會被別人攔截
-
-    對 Delphi VCL 大部分控制項都生效（TButton/TBitBtn/TGroupButton/TabCtrl
-    等都處理 WM_LBUTTONDOWN 來觸發 click event）。"""
-    if not hwnd:
-        return False
-    try:
-        if client_x is None or client_y is None:
-            r = wintypes.RECT()
-            if not ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(r)):
-                return False
-            client_x = (r.right - r.left) // 2 if client_x is None else client_x
-            client_y = (r.bottom - r.top) // 2 if client_y is None else client_y
-        lparam = ((client_y & 0xFFFF) << 16) | (client_x & 0xFFFF)
-        MK_LBUTTON = 0x0001
-        WM_LBUTTONDOWN = 0x0201
-        WM_LBUTTONUP = 0x0202
-        down_ok = bool(ctypes.windll.user32.PostMessageW(
-            hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam))
-        up_ok = bool(ctypes.windll.user32.PostMessageW(
-            hwnd, WM_LBUTTONUP, 0, lparam))
-        if not (down_ok and up_ok):
-            logging.warning("_post_click_to_control PostMessage failed: "
-                            "hwnd=%s down=%s up=%s",
-                            hwnd, down_ok, up_ok)
-            return False
-        return True
-    except Exception:
-        logging.error("_post_click_to_control 失敗", exc_info=True)
-        return False
-
-
 def _click_control_center(hwnd: int) -> bool:
     """【相容介面】等同 _post_click_to_control(hwnd) — 不動滑鼠，送訊息點擊
     control 的 client center。原本用 pyautogui.click 會閃動滑鼠，已改成訊息。"""
@@ -6628,25 +6262,6 @@ def _f9_f10_wait_consent_popup_closed(popup_hwnd: int, *, label: str = "",
         "[%s] 同意書 popup 在 %.1fs 後仍開著(hwnd=%s)→ 無法確認已送出,回報未完成。"
         "請醫師確認同意書狀態", label, timeout, popup_hwnd)
     return False
-
-
-def _enum_direct_children(parent_hwnd: int,
-                           target_class: str = "") -> list:
-    """列出 parent_hwnd 的直系子視窗（不遞迴）；可選 class 過濾。"""
-    GW_CHILD = 5
-    GW_HWNDNEXT = 2
-    children = []
-    h = ctypes.windll.user32.GetWindow(parent_hwnd, GW_CHILD)
-    while h:
-        if not target_class:
-            children.append(h)
-        else:
-            cls_buf = ctypes.create_unicode_buffer(64)
-            ctypes.windll.user32.GetClassNameW(h, cls_buf, 64)
-            if cls_buf.value == target_class:
-                children.append(h)
-        h = ctypes.windll.user32.GetWindow(h, GW_HWNDNEXT)
-    return children
 
 
 def _get_window_text(hwnd: int) -> str:
@@ -7187,43 +6802,6 @@ def _select_phrase_and_return(片語_btn_hwnd: int, row_idx: int,
     return False
 
 
-def _find_descendants_by_exact_text(parent_hwnd: int, target_class: str,
-                                       target_text: str) -> list:
-    """找所有 class+text 精確匹配的子孫；按 (top, left) 排序去重。
-
-    跟 _find_descendant_by_class_text 不同：這個比對【完整 strip 後相等】，
-    用來精確區分 '片語' vs '單張片語'（同 class、文字含子字串會混淆）。"""
-    out = []
-
-    EnumWindowsProc = ctypes.WINFUNCTYPE(
-        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-    @EnumWindowsProc
-    def cb(child, lparam):
-        try:
-            cls_buf = ctypes.create_unicode_buffer(64)
-            ctypes.windll.user32.GetClassNameW(child, cls_buf, 64)
-            if cls_buf.value != target_class:
-                return True
-            n = ctypes.windll.user32.GetWindowTextLengthW(child)
-            if n > 0:
-                t_buf = ctypes.create_unicode_buffer(n + 1)
-                ctypes.windll.user32.GetWindowTextW(child, t_buf, n + 1)
-                if t_buf.value.strip() == target_text:
-                    r = wintypes.RECT()
-                    if ctypes.windll.user32.GetWindowRect(child, ctypes.byref(r)):
-                        out.append((child, r.top, r.left))
-        except Exception:
-            pass
-        return True
-
-    ctypes.windll.user32.EnumChildWindows(parent_hwnd, cb, 0)
-    seen = set()
-    uniq = [x for x in out if not (x[0] in seen or seen.add(x[0]))]
-    uniq.sort(key=lambda x: (x[1], x[2]))
-    return uniq
-
-
 def _f9_f10_round3_phrases(popup_hwnd: int, row_所患: int, row_手術: int,
                               label: str = "") -> bool:
     """對 popup 內 2 個片語欄位依序執行選擇流程。
@@ -7278,39 +6856,6 @@ def _f9_f10_round3_phrases(popup_hwnd: int, row_所患: int, row_手術: int,
 #
 # Round 2 只做「清空 + 勾局麻」，不點 片語 也不按 開立電子（保留給 user 手動
 # 操作 + 後續 Round 3/4 加自動化）。
-
-
-def _enum_class_in_window(parent_hwnd: int, target_class: str) -> list:
-    """EnumChildWindows 抓全部 class=X 的子孫，按 (top, left) 排序。
-    回傳 list of (hwnd, rect_top, rect_left)。"""
-    out = []
-
-    EnumWindowsProc = ctypes.WINFUNCTYPE(
-        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-    @EnumWindowsProc
-    def cb(child, lparam):
-        try:
-            cls_buf = ctypes.create_unicode_buffer(64)
-            ctypes.windll.user32.GetClassNameW(child, cls_buf, 64)
-            if cls_buf.value == target_class:
-                r = wintypes.RECT()
-                if ctypes.windll.user32.GetWindowRect(child, ctypes.byref(r)):
-                    out.append((child, r.top, r.left))
-        except Exception:
-            pass
-        return True
-
-    ctypes.windll.user32.EnumChildWindows(parent_hwnd, cb, 0)
-    out.sort(key=lambda x: (x[1], x[2]))
-    # 去重複（hwnd 可能在 EnumChildWindows 出現多次）
-    seen = set()
-    uniq = []
-    for h, t, l in out:
-        if h not in seen:
-            seen.add(h)
-            uniq.append((h, t, l))
-    return uniq
 
 
 def _clear_edit_text(edit_hwnd: int) -> bool:
@@ -9484,6 +9029,30 @@ CLINIC_CLOSE_PLATEAU_SECONDS_OVERRUN = 60 * 60  # 確認拖班(最後進展在�
 
 
 from cmuh_common.reg64_utils import _reg64_tc_to_session_cn  # noqa: E402
+# [P2-06 分層第一刀 2026-07-31] HIS 視窗／控制項的 Win32 原語搬到
+# cmuh_common/his_window.py（15 個函式、427 行）。那一層正是本 repo 反覆出事的
+# 地方（IsWindow/IsWindowVisible 混用、同 class 對話框誤判、殘留舊視窗），集中
+# 之後才有一個地方可以加固，也才測得到（新模組有 _user32() 測試接縫）。
+# ★沿用舊的私有名稱★：main.py 內部有 100+ 個呼叫點、tests/ 有多支直接用
+#   `main._find_window_by_class_title` 這種名字。這一刀【只搬家、不改呼叫端】。
+from cmuh_common.his_window import (
+    find_window_by_class_title as _find_window_by_class_title,
+    collect_windows_by_class as _collect_windows_by_class,
+    enum_class_in_window as _enum_class_in_window,
+    enum_direct_children as _enum_direct_children,
+    find_descendants_by_exact_text as _find_descendants_by_exact_text,
+    find_descendant_by_class_text as _find_descendant_by_class_text,
+    find_first_descendant_by_class as _find_first_descendant_by_class,
+    window_is_ancestor as _window_is_ancestor,
+    post_click_to_control as _post_click_to_control,
+    send_enter_to_window as _send_enter_to_window,
+    send_chars_to_window as _send_chars_to_window,
+    bring_window_front as _bring_window_front,
+    # send_window_to_back 刻意不匯入：全 repo 沒有任何呼叫端（搬家時才發現，
+    # 它的舊 docstring 卻宣稱「用於 F9/F10 流程」）。見 his_window.py 的說明。
+    force_ime_english as _force_ime_english,
+    get_thread_focus as _get_thread_focus,
+)
 
 
 def _hotkey_builtin_map_for_profile(profile: str) -> dict:

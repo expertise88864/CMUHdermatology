@@ -8,18 +8,39 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _candidate_paths(source_path: Path) -> list:
+    """[2026-07-31 P2-06] 分層會把函式從 main.py 搬到 cmuh_common/。
+
+    只掃指定檔案的話，搬家會讓這些守門測試變成「找不到函式」而紅 —— 但它們守的
+    性質一點都沒變，只是換了地址。這裡讓查找【跟著函式走】。
+    仍然不 import main：它依賴 Selenium/Tk，headless 進不來（本檔開頭的既有限制）。
+    """
+    extra = sorted((ROOT / "src" / "cmuh_common").glob("*.py"))
+    return [source_path, *(p for p in extra if p != source_path)]
+
+
 def _function_node(source_path: Path, name: str) -> ast.FunctionDef:
-    tree = ast.parse(source_path.read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == name:
-            return node
-    raise AssertionError(f"function not found in {source_path.name}: {name}")
+    for path in _candidate_paths(source_path):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            # 搬家時私有名（_foo）會變成模組的公開 API（foo），兩種都認
+            if isinstance(node, ast.FunctionDef) and node.name in (
+                    name, name.lstrip("_")):
+                return node
+    raise AssertionError(
+        f"function not found in {source_path.name} nor cmuh_common/: {name}")
 
 
 def _function_source(source_path: Path, name: str) -> str:
-    source = source_path.read_text(encoding="utf-8")
-    node = _function_node(source_path, name)
-    return ast.get_source_segment(source, node) or ""
+    for path in _candidate_paths(source_path):
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in (
+                    name, name.lstrip("_")):
+                return ast.get_source_segment(source, node) or ""
+    raise AssertionError(
+        f"function not found in {source_path.name} nor cmuh_common/: {name}")
 
 
 def _first_call_line(func: ast.FunctionDef, dotted_name: str) -> int:

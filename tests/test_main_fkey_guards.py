@@ -12,13 +12,33 @@ ROOT = Path(__file__).resolve().parents[1]
 MAIN = ROOT / "src" / "main.py"
 
 
+def _search_paths() -> list:
+    """[2026-07-31 P2-06] 分層會把函式從 main.py 搬到 cmuh_common/。
+
+    只掃 main.py 的話，搬家會讓這些守門測試變成「找不到函式」而紅 —— 但它們守的
+    性質一點都沒變，只是換了地址。這裡讓查找【跟著函式走】。
+    仍然不 import main（本檔開頭說明的 headless 限制）。
+    """
+    return [MAIN, *sorted((ROOT / "src" / "cmuh_common").glob("*.py"))]
+
+
 def _func_source(name: str) -> str:
-    source = MAIN.read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == name:
-            return ast.get_source_segment(source, node) or ""
-    raise AssertionError(f"main.py 找不到函式：{name}")
+    for path in _search_paths():
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            # 搬家時私有名（_foo）會變成模組的公開 API（foo），兩種都認
+            if isinstance(node, ast.FunctionDef) and node.name in (
+                    name, name.lstrip("_")):
+                return ast.get_source_segment(source, node) or ""
+    raise AssertionError(f"main.py 與 cmuh_common/ 都找不到函式：{name}")
+
+
+def _function_exists(name: str) -> bool:
+    try:
+        return bool(_func_source(name))
+    except AssertionError:
+        return False
 
 
 # ── H1：F9/F10 只對 HIS 行程的 #32770 對話框自動按「是」──────────────────────────
@@ -81,5 +101,7 @@ def test_h5_referral_sampling_verifies_not_occluded():
 
 
 def test_h5_helpers_exist():
-    assert "def _window_is_ancestor(" in MAIN.read_text(encoding="utf-8")
-    assert "def _screen_point_in_window(" in MAIN.read_text(encoding="utf-8")
+    # [2026-07-31 P2-06] 改問「函式還在不在」而不是「main.py 的文字裡有沒有這一行」
+    # —— _window_is_ancestor 已搬到 cmuh_common/his_window.py。
+    assert _function_exists("_window_is_ancestor")
+    assert _function_exists("_screen_point_in_window")

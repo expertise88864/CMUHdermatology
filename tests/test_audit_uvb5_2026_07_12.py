@@ -15,7 +15,23 @@ def _main_src():
 
 def _func(src, name):
     start = src.find(name)
-    assert start != -1, f"找不到 {name}"
+    if start == -1:
+        # [2026-07-31 P2-06] 分層會把函式從 main.py 搬到 cmuh_common/：往那裡找，
+        # 並認「私有名搬家後變成模組公開 API」（_foo → foo）。
+        import glob
+        base = os.path.join(os.path.dirname(__file__), "..", "src",
+                            "cmuh_common", "*.py")
+        for p in sorted(glob.glob(base)):
+            with open(p, encoding="utf-8") as f:
+                other = f.read()
+            for cand in (name, name.replace("def _", "def ", 1)):
+                start = other.find(cand)
+                if start != -1:
+                    src = other
+                    break
+            if start != -1:
+                break
+    assert start != -1, f"main.py 與 cmuh_common/ 都找不到 {name}"
     nxt = src.find("\ndef ", start + 1)
     return src[start:nxt if nxt != -1 else len(src)]
 
