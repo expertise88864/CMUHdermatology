@@ -20,16 +20,21 @@ CI 報告「沒有新增型別債」，跟這支腳本宣稱的事情正好相�
 互換仍然抵銷。再細分就只剩行號，而行號會讓每次編輯都變紅（→ 被忽略）。這個取捨是
 刻意的：那種情形下兩個診斷實質上是同一個缺陷樣式，混淆的代價極小。
 
-★[2026-07-31] 基線是【環境相依】的 —— 本機與 CI 的相依版本必須一致★
-這道棘輪第一次在 CI 上跑就紅了，而本機是綠的。原因不是程式碼：本機的 ortools 停在
-9.14.6206，而 `requirements-lazy.txt` 自己釘的是 9.15.6755（CI 裝的就是這個）。
-9.15 的型別介面不再對外顯示 `CpModel.NewBoolVar/Minimize/AddExactlyOne` 這些
-CamelCase 名稱（**執行期仍然可用**，roster 求解測試在兩個版本上都是綠的），於是
-CI 多出三筆診斷。
+★[2026-07-31] 基線是【環境相依】的，而且沒辦法完全消除★
+這道棘輪第一次在 CI 上跑就紅了，而本機是綠的。原因兩次都不是程式碼：
+  * 本機 ortools 停在 9.14.6206，而 `requirements-lazy.txt` 自己釘的是 9.15.6755
+    （CI 裝的）。9.15 的型別介面不再對外顯示 `CpModel.NewBoolVar/Minimize/
+    AddExactlyOne`（**執行期仍然可用**，roster 求解測試在兩個版本上都綠）→ 多 3 筆。
+  * 本機 beautifulsoup4 停在 4.13.5，CI 裝 4.15.0 → main.py 少 15 筆
+    `NavigableString`/`PageElement` 診斷。
 
-判準：**基線要在「與 CI 相同的相依版本」下產生**。本機跑出來跟 CI 不一致時，
-先確認 `requirements.txt` / `requirements-lazy.txt` 的 pin 真的裝了，
-再去懷疑程式碼。（pyright 本身的版本同理。）
+`requirements.txt` 是**刻意**用範圍的（上界只擋下一個主版本，好讓診間電腦拿得到
+安全更新），所以 CI 與開發機的相依版本本來就不會一致、而且會各自漂移。
+結論：**指紋比對無法在兩個環境之間穩定**。因此
+  * 「新增診斷」仍然是紅燈 —— 那是這道棘輪的主要目的。
+  * 「診斷消失」降為警告（見 main() 裡的說明與代價）。
+本機跑出來跟 CI 不一致時，先看輸出開頭的「環境：」那一行對照版本，
+再去懷疑程式碼。
 
 還債流程：修好之後跑 `python scripts/type_debt.py --update`；某條規則歸零時直接把它
 從 `pyrightconfig.json` 的關閉清單移到啟用（並從基線刪掉，`tests/test_ci_gates_*`
@@ -63,18 +68,36 @@ def _make_stdout_robust() -> None:
 _make_stdout_robust()
 
 
-def annotate(title: str, body: str) -> None:
+def annotate(title: str, body: str, level: str = "error") -> None:
     """在 GitHub Actions 上輸出 annotation（理由見 scripts/check_skips.py 的同名函式：
     job log 要 repo admin 才下載得到，annotation 走 check-runs API 是公開可讀的）。"""
     if not os.environ.get("GITHUB_ACTIONS"):
         return
     esc = (str(body).replace("%", "%25")
            .replace("\r", "%0D").replace("\n", "%0A"))
-    print(f"::error title={title}::{esc}")
+    print(f"::{level} title={title}::{esc}")
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE_FILE = os.path.join(REPO_ROOT, "type_debt_baseline.json")
+
+# 這些套件會帶 type stubs → 版本不同，pyright 的診斷就可能不同。
+# 基線是環境相依的（見本檔開頭），所以每次都把環境印出來/annotate 出來，
+# 讓「本機綠、CI 紅」第一時間就能對照，而不是靠猜。
+_ENV_PACKAGES = ("pyright", "ortools", "beautifulsoup4", "selenium", "requests",
+                 "lxml", "Pillow", "psutil", "pywin32", "openpyxl", "reportlab",
+                 "python-docx", "protobuf")
+
+
+def _environment_note() -> str:
+    import importlib.metadata as _md
+    parts = [f"python={sys.version.split()[0]}"]
+    for name in _ENV_PACKAGES:
+        try:
+            parts.append(f"{name}={_md.version(name)}")
+        except Exception:                       # noqa: BLE001 - 沒裝就標明
+            parts.append(f"{name}=(未安裝)")
+    return "環境：" + " ".join(parts)
 TEMP_CONFIG = os.path.join(REPO_ROOT, ".pyright_type_debt.json")
 MAIN_CONFIG = os.path.join(REPO_ROOT, "pyrightconfig.json")
 
@@ -251,8 +274,10 @@ def main(argv: list) -> int:
     baseline = _load_baseline()
     current = {rule: _rule_diagnostics(rule) for rule in sorted(baseline)}
 
+    print(_environment_note())
     any_added = any_gone = False
     added_detail = []
+    gone_detail = []
     for rule in sorted(current):
         added, gone = diff_counts(baseline[rule], current[rule])
         n_now = sum(current[rule].values())
@@ -265,6 +290,7 @@ def main(argv: list) -> int:
             any_added = True
         for fp, k in sorted(gone.items()):
             print(f"      - {k}x {fp}")
+            gone_detail.append((fp, k))
             any_gone = True
 
     if args.update:
@@ -284,17 +310,58 @@ def main(argv: list) -> int:
         print("  ※ 若本機是綠的、只有 CI 紅：先確認本機裝的相依版本與 "
               "requirements*.txt 的 pin 一致（基線是環境相依的，見本檔開頭）。")
         annotate("型別債棘輪：新增了型別債",
-                 "\n".join(f"+{k}x {fp}" for fp, k in added_detail))
+                 _environment_note() + "\n"
+                 + "\n".join(f"+{k}x {fp}" for fp, k in added_detail))
         return 1
     if any_gone:
-        print("\n[type-debt] 有型別債被修掉了 —— 請跑 "
-              "`python scripts/type_debt.py --update` 把門檻鎖住。")
-        print("  不鎖住的話，還完的債可以被無聲地欠回去"
-              "（★這就是為什麼比對的是診斷本身而不是總數★）。")
-        return 1
+        # ★[2026-07-31] 「診斷消失」從紅燈降為警告★
+        #
+        # 原本這裡是 `return 1`，理由是「不鎖住的話，還完的債可以被無聲地欠回去」。
+        # 那個顧慮成立，但它的誤報來源壓過了它的價值：
+        #   指紋是 pyright 的診斷，而 pyright 的診斷取決於【每一個已安裝套件的
+        #   type stubs】。requirements.txt 是【刻意】用範圍的（上界只擋下一個主版本，
+        #   好讓診間電腦拿得到安全更新，例如 P2-07 把 Pillow 下限拉到 12.3.0）——
+        #   也就是說 CI 與開發機的相依版本【本來就不會一致】，而且會各自隨時間漂移。
+        #   實測：beautifulsoup4 4.13.5→4.15.0 讓 main.py 少掉 15 筆
+        #   NavigableString/PageElement 診斷；ortools 9.14→9.15 則多出 3 筆。
+        #   兩者都與被推送的改動完全無關。
+        #
+        # 而 CI 從加上這道關卡起連紅五輪、後面的步驟因此從沒跑過 —— 這正是本檔開頭
+        # 說要避免的「永遠紅燈因而被忽略的關卡」。
+        #
+        # ★誠實記下代價★：這確實削弱了「還完的債被無聲欠回去」的防護
+        #   （要同時發生：債被修好、沒人跑 --update、日後又寫回一模一樣的診斷）。
+        #   `新增` 診斷仍然是紅燈 —— 那才是這道棘輪的主要目的。
+        print("\n[type-debt] 有型別債不見了（不是紅燈，但請確認）")
+        print("  修好了就跑 `python scripts/type_debt.py --update` 把門檻鎖住；")
+        print("  若只是相依套件的 stubs 變了（見上面的環境行），一樣跑 --update。")
+        annotate("型別債棘輪：基線裡的診斷消失了（未擋，請確認）",
+                 _environment_note() + "\n"
+                 + "\n".join(f"-{k}x {fp}" for fp, k in gone_detail),
+                 level="warning")
+        return 0
     print("\n[type-debt] 沒有新增型別債。")
     return 0
 
 
+def _main_guarded(argv: list) -> int:
+    """★關卡自己爆掉時也要說得出話★
+
+    崩潰路徑（基線讀不到、pyright 跑不起來）原本只留一個 traceback 在 job log 裡，
+    而 job log 要 repo admin 才下載得到 —— 對只看得到 annotation 的人來說，
+    「棘輪爆炸」跟「棘輪判定失敗」長得一模一樣。
+    """
+    try:
+        return main(argv)
+    except Exception as e:                       # noqa: BLE001
+        import traceback
+        detail = traceback.format_exc()
+        print(detail)
+        annotate("型別債棘輪：關卡本身失敗",
+                 f"{type(e).__name__}: {e}\n{_environment_note()}\n"
+                 f"{detail[-1200:]}")
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(_main_guarded(sys.argv[1:]))

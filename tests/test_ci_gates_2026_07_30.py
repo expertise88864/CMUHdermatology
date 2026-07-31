@@ -493,6 +493,84 @@ def test_the_audit_wrapper_refuses_an_incomplete_scan():
     assert "skipped" in src, "有套件被跳過就是沒掃完"
 
 
+def _run_ratchet(monkeypatch, baseline: dict, current: dict):
+    """就地跑棘輪（把 pyright 換掉 —— 真跑要 10 分鐘）→ (returncode, stdout)。"""
+    import contextlib
+    import io as _io
+
+    import type_debt
+    monkeypatch.setattr(type_debt, "_load_baseline", lambda: baseline)
+    monkeypatch.setattr(type_debt, "_rule_diagnostics",
+                        lambda rule: current.get(rule, {}))
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = type_debt.main([])
+    return rc, buf.getvalue()
+
+
+_RULE = "reportArgumentType"
+
+
+def test_a_new_diagnostic_is_still_a_failure(monkeypatch):
+    """★棘輪的主要目的★ 新增型別債要紅 —— 這個沒有被放寬。"""
+    rc, out = _run_ratchet(monkeypatch, {_RULE: {"a.py|f|msg|code": 1}},
+                           {_RULE: {"a.py|f|msg|code": 1, "b.py|g|msg2|code2": 1}})
+    assert rc == 1
+    assert "新增了型別債" in out
+
+
+def test_a_disappearing_diagnostic_is_a_warning_not_a_failure(monkeypatch):
+    """★[2026-07-31] 從紅燈降為警告★
+
+    指紋是 pyright 的診斷，而診斷取決於每個已安裝套件的 stubs。requirements.txt
+    刻意用範圍（好讓診間電腦拿得到安全更新），所以 CI 與開發機的版本本來就不一致：
+    beautifulsoup4 4.13.5→4.15.0 就讓 main.py 少掉 15 筆診斷，與被推送的改動無關。
+    這道關卡因此連紅五輪、後面的步驟從沒跑過 —— 那正是它自己說要避免的
+    「永遠紅燈因而被忽略的關卡」。
+
+    代價（誠實記下）：「債被修好、沒人 --update、日後又寫回一模一樣的診斷」
+    這條路現在不會紅。
+    """
+    rc, out = _run_ratchet(monkeypatch,
+                           {_RULE: {"a.py|f|msg|code": 1, "b.py|g|msg2|c2": 1}},
+                           {_RULE: {"a.py|f|msg|code": 1}})
+    assert rc == 0, out
+    assert "不見了" in out
+
+
+def test_added_wins_when_both_happen(monkeypatch):
+    """同時有新增與消失時，仍然要紅（不可被「消失」的寬鬆蓋過去）。"""
+    rc, _out = _run_ratchet(monkeypatch, {_RULE: {"a.py|f|msg|code": 1}},
+                            {_RULE: {"b.py|g|msg2|c2": 1}})
+    assert rc == 1
+
+
+def test_the_ratchet_prints_the_environment_it_measured(monkeypatch):
+    """★「本機綠、CI 紅」要能一眼對照★
+
+    這道關卡紅了五輪，我卻只能用推論猜它卡在哪 —— 因為 job log 要 repo admin
+    才下載得到，而失敗分支當時根本沒發 annotation。現在每次都把量測環境印出來。
+    """
+    _rc, out = _run_ratchet(monkeypatch, {_RULE: {}}, {_RULE: {}})
+    assert "環境：" in out and "python=" in out
+    assert "beautifulsoup4=" in out and "ortools=" in out
+
+
+def test_the_ratchet_annotates_instead_of_dying_silently(monkeypatch):
+    """關卡自己爆掉時也要說得出話（不然「爆炸」跟「判定失敗」長得一樣）。"""
+    import type_debt
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setattr(type_debt, "_load_baseline",
+                        lambda: (_ for _ in ()).throw(OSError("基線讀不到")))
+    import contextlib
+    import io as _io
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = type_debt._main_guarded([])
+    assert rc == 1
+    assert "::error title=" in buf.getvalue()
+
+
 def test_the_type_debt_ratchet_compares_diagnostics_not_totals():
     """★P3：總數會被「修一個、加一個」抵銷★"""
     import type_debt
