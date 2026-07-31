@@ -1,12 +1,20 @@
 # -*- coding: utf-8 -*-
-"""2026-07-24 使用者：主程式開著時螢幕關不掉 → 電源策略寫進程式。
+"""電源策略：主機不休眠；★螢幕逾時不由本程式決定★。
 
-  目標：螢幕 15 分鐘後照常關閉、但主機不休眠。
   1. _keep_system_awake_display_free：只設 SYSTEM|CONTINUOUS、絕不含 DISPLAY(0x2)。
-  2. _apply_screen_off_power_plan：powercfg 螢幕 15 分/睡眠休眠 0/忽略 chrome·python
-     的 DISPLAY keep-awake（status driver Chrome 的 wake-lock 是螢幕關不掉主因）。
+  2. _apply_never_sleep_power_plan：powercfg 只把睡眠/休眠設 0。
   3. 啟動接線：主緒設 execution state、powercfg 丟背景。
   另附 R/VS 線別色籤高對比釘位（一線深紅/三線深藍、白字）。
+
+★[2026-07-31 使用者定案] 自動關螢幕的兩層都已刪除★
+原本有：(1) powercfg monitor-timeout 15 分鐘；(2) 閒置滿 15 分鐘的 watchdog
+（廣播 SC_MONITORPOWER + 自動蓋黑幕）。使用者要求改成【設定頁的按鈕】手動觸發，
+並明確定案兩層都刪、螢幕只由按鈕控制。
+
+因此本檔移除了 8 支只測那兩層的測試（`_screen_off_due` 上膛週期、
+`_send_monitor_off` 廣播與措辭、watchdog 的三支、啟動接線那支…）。
+★不要因為「以前有」就把它們加回來★：那是使用者明確刪掉的功能。
+黑幕本身的行為（含手動觸發的待命期）在 tests/test_screen_blackout_2026_07_30.py。
 """
 import inspect
 import os
@@ -42,11 +50,13 @@ def test_power_plan_commands(monkeypatch):
     runs = []
     monkeypatch.setattr(main.subprocess, "run",
                         lambda cmd, **k: (runs.append(list(cmd)), _CP())[1])
-    main._apply_screen_off_power_plan()
+    main._apply_never_sleep_power_plan()
     joined = [" ".join(c) for c in runs]
-    # 螢幕 15 分關（AC/DC）
-    assert "powercfg /change monitor-timeout-ac 15" in joined
-    assert "powercfg /change monitor-timeout-dc 15" in joined
+    # ★[2026-07-31 使用者定案] 不可以再碰 monitor-timeout★
+    #   使用者要求刪除 15 分鐘進入螢幕關閉的模式，並定案【兩層都刪、螢幕只由
+    #   設定頁的按鈕控制】。本程式不再設定機器的螢幕逾時。
+    assert not any("monitor-timeout" in j for j in joined), \
+        "螢幕逾時已改由使用者自己的 Windows 設定決定，本程式不得覆寫"
     # 主機永不睡/不休眠
     assert "powercfg /change standby-timeout-ac 0" in joined
     assert "powercfg /change standby-timeout-dc 0" in joined
@@ -75,7 +85,7 @@ def test_power_plan_reports_partial_failure(monkeypatch, caplog):
                         lambda cmd, **k: _CP(rc=1 if "standby-timeout-ac"
                                              in cmd else 0))
     with caplog.at_level(_lg.WARNING):
-        main._apply_screen_off_power_plan()
+        main._apply_never_sleep_power_plan()
     assert any("部分未生效" in r.message and "standby-timeout-ac" in r.message
                for r in caplog.records)
 
@@ -94,7 +104,7 @@ def test_startup_wiring_main_thread_state_bg_powercfg():
     src = inspect.getsource(main.AutomationApp.start_background_tasks)
     assert "_keep_system_awake_display_free()" in src, \
         "execution state 應在主緒設定(ES_CONTINUOUS 綁呼叫緒壽命)"
-    assert "_apply_screen_off_power_plan" in src, "powercfg 批次應丟背景執行"
+    assert "_apply_never_sleep_power_plan" in src, "powercfg 批次應丟背景執行"
     assert "ScreenBlackout(" in src, "黑幕須在【主緒】建立（Tk 不是 thread-safe）"
     assert "_subsystem_running" in src, \
         "busy_fn 要接本行程的自動化旗標，否則黑幕會讓 F2/F3 的螢幕擷取 OCR 擷到全黑"
@@ -108,29 +118,10 @@ def test_single_execution_state_call_site_without_display_bit():
     assert (main._ES_CONTINUOUS | main._ES_SYSTEM_REQUIRED) & _ES_DISPLAY_REQUIRED == 0
 
 
-def test_screen_off_due_arming_cycle():
-    """[2026-07-24 使用者] 強制關屏 watchdog：閒置到點且上膛才送、送一次即 disarm
-    （不重複轟炸→不閃爍）、一有輸入重新上膛。"""
-    limit = main.SCREEN_OFF_MINUTES * 60
-    assert main._screen_off_due(limit, True) == (True, False)
-    assert main._screen_off_due(limit + 5, False) == (False, False)
-    assert main._screen_off_due(3, False) == (False, True)
-    assert main._screen_off_due(limit - 1, True) == (False, True)
-
-
 def test_tick_delta_wraparound():
     """GetTickCount 32 位元約 49.7 天回繞 → 無號差值仍正確（不會算出負閒置）。"""
     assert main._tick_delta(5000, 1000) == 4000
     assert main._tick_delta(5, 0xFFFFFFFB) == 10
-
-
-def test_send_monitor_off_broadcast_with_timeout():
-    """HWND_BROADCAST 必須用 SendMessageTimeout(ABORTIFHUNG)——卡死視窗不得
-    永久阻塞 watchdog 緒；常數釘位（SC_MONITORPOWER/關閉）。"""
-    src = inspect.getsource(main._send_monitor_off)
-    assert "SendMessageTimeoutW" in src
-    assert "_SMTO_ABORTIFHUNG" in src
-    assert main._SC_MONITORPOWER == 0xF170 and main._MONITOR_OFF == 2
 
 
 def test_idle_seconds_failure_is_unknown_not_zero(monkeypatch):
@@ -144,46 +135,6 @@ def test_idle_seconds_failure_is_unknown_not_zero(monkeypatch):
     monkeypatch.setattr(main.ctypes.windll.user32, "GetLastInputInfo",
                         lambda *_a: 0, raising=False)
     assert main._idle_seconds() is None
-
-
-def test_unknown_idle_neither_closes_the_screen_nor_disarms(monkeypatch):
-    """查不到閒置時間 → 這輪不動作（絕不誤關），但【維持 armed】：
-    等查得到的那一輪仍然要能關。若順手 disarm，一次查詢失敗就會把整段閒置期的
-    關屏機會吃掉。"""
-    assert main._screen_off_due(None, True) == (False, True)
-    assert main._screen_off_due(None, False) == (False, False)
-
-
-def test_send_monitor_off_does_not_claim_the_screen_closed():
-    """★措辭鐵律★ SC_MONITORPOWER 送出後，只要系統上還有 DISPLAY power request，
-    Windows 會立刻把螢幕點回來，而我們【查不到】螢幕現在是開還是關。
-    log 只能說「已送出」——舊版說「已強制關閉螢幕」，實機沒關卻一直這樣寫。"""
-    src = inspect.getsource(main._send_monitor_off)
-    assert "已送出關閉螢幕指令" in src
-    assert "已強制關閉螢幕" not in src
-
-
-def test_the_watchdog_logs_when_it_cannot_tell_whether_anyone_is_idle():
-    """查不到閒置時間時必須留下 warning —— 否則這個功能整台機器失效而無跡可循
-    （正是這次查不出原因的直接理由）。"""
-    src = inspect.getsource(main._force_screen_off_watchdog)
-    assert "unknown_streak" in src
-    assert "查不到使用者閒置時間" in src
-
-
-def test_the_watchdog_logs_display_power_requests_before_blanking():
-    """★這是「螢幕關不掉」查了兩次都缺的那份資料★
-    螢幕該關卻沒關最常見的原因是某支程式掛著 DISPLAY wake lock，而那是【間歇性】
-    的 —— 必須在它真的發生的那一刻記下 `powercfg /requests`。"""
-    src = inspect.getsource(main._force_screen_off_watchdog)
-    assert "_log_display_power_requests" in src
-    assert "/requests" in inspect.getsource(main._log_display_power_requests)
-
-
-def test_the_watchdog_also_raises_the_blackout():
-    """SC_MONITORPOWER 無法回讀 → 使用者定案改用可回讀的全黑畫面兜底。"""
-    src = inspect.getsource(main._force_screen_off_watchdog)
-    assert "_request_blackout" in src
 
 
 def test_the_blackout_gate_never_raises_and_defaults_to_not_blacked_out(
@@ -201,18 +152,70 @@ def test_the_blackout_gate_never_raises_and_defaults_to_not_blacked_out(
     assert main.screen_blackout_should_eat_this_hotkey() is False
 
 
+def test_the_automatic_screen_off_layers_are_really_gone():
+    """★使用者定案：兩層都刪，螢幕只由設定頁的按鈕控制★
+
+    刪除比新增更需要守衛 —— 「以前有、看起來合理」是最容易被順手加回來的東西。
+    """
+    import ast
+
+    # ★用 AST，不要比對原始碼文字★ 這些名字會出現在說明「為什麼刪掉」的註解與
+    # docstring 裡（本輪已經被自己的說明騙過一次）。這裡只看【真的會執行到的東西】：
+    # 識別字，以及不是 docstring 的字串常數。
+    tree = ast.parse(open(main.__file__, encoding="utf-8").read())
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            body = getattr(node, "body", None)
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                docstrings.add(id(body[0].value))
+    names, literals = set(), []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)):
+            names.add(node.name)
+        elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
+              and id(node) not in docstrings):
+            literals.append(node.value)
+
+    for gone in ("_force_screen_off_watchdog", "_send_monitor_off",
+                 "_screen_off_due", "SCREEN_OFF_MINUTES", "_SC_MONITORPOWER",
+                 "_log_display_power_requests", "_request_blackout"):
+        assert gone not in names, f"{gone} 已由使用者刪除，不可再出現"
+    assert not any("monitor-timeout" in s for s in literals), \
+        "螢幕逾時已改由使用者自己的 Windows 設定決定，本程式不得覆寫"
+    assert not hasattr(main, "_force_screen_off_watchdog")
+
+
+def test_the_blackout_is_reachable_from_the_settings_page():
+    """黑幕現在唯一的入口是設定頁的按鈕 —— 按鈕掉了就等於這個功能沒了。"""
+    src = inspect.getsource(main.AutomationApp._create_settings_tab)
+    assert "self._blackout_now" in src, "設定頁要有「立即黑螢幕」按鈕"
+    assert "立即黑螢幕" in src
+
+
+def test_the_button_reports_when_the_blackout_did_not_appear():
+    """★措辭鐵律★ `show()` 回的是【回讀結果】。沒黑成功一定要告訴使用者 ——
+    否則按了按鈕、螢幕沒變黑、程式卻一聲不吭（就是舊版 SC_MONITORPOWER
+    「log 說關了、實機沒關」查了兩次都查不出來的那個形狀）。"""
+    src = inspect.getsource(main.AutomationApp._blackout_now)
+    assert "沒有顯示出來" in src
+    assert "_subsystem_running" in src, "自動化執行中要說明為什麼沒反應"
+
+
 def test_hotkeys_are_gated_while_the_blackout_is_up():
     """醫師為了喚醒螢幕按的那一下可能就是 F1/F9 —— 不可在他還看不見畫面時
     就對 HIS 寫劑量/計費。F12（中止）刻意不走這個閘門：救援鍵不可被吃掉。"""
     src = inspect.getsource(main.AutomationApp.setup_hotkeys)
     assert "_blackout_gate" in src
     assert "callback = _blackout_gate(callback, key)" in src
-
-
-def test_force_off_watchdog_wired_in_startup():
-    src = inspect.getsource(main.AutomationApp.start_background_tasks)
-    assert "_force_screen_off_watchdog" in src, \
-        "強制關屏 watchdog 應在啟動背景任務中開緒"
 
 
 def test_line_chip_high_contrast():

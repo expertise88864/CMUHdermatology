@@ -8746,13 +8746,16 @@ NOTIFY_DO_NOT_DISTURB_START_HOUR = 0
 NOTIFY_DO_NOT_DISTURB_END_HOUR = 8
 
 
-# ── 電源策略（2026-07-24 使用者：主程式開著時螢幕關不掉）────────────────────────
-# 目標：螢幕 15 分鐘後照常關閉、但主機【不休眠】（監測/止掛提醒要繼續跑）。
-# 主程式開著時螢幕關不掉的常見元兇＝status driver 的 Chrome 對系統掛 DISPLAY
-# keep-awake（wake-lock）；本程式自己【從不】設 ES_DISPLAY_REQUIRED。
+# ── 電源策略 ────────────────────────────────────────────────────────────────
+# 目標：主機【不休眠】（夜間監測/止掛提醒要繼續跑）。
+#
+# ★[2026-07-31 使用者定案] 螢幕逾時已從這裡拿掉★
+#   原本會用 powercfg 把 monitor-timeout 設成 15 分鐘。使用者要求「刪除原本 15 分鐘
+#   進入螢幕關閉的模式」，並定案【兩層都刪、螢幕只由按鈕控制】。所以現在不再碰
+#   monitor-timeout（＝沿用機器原本的設定，我們不管它），只保留睡眠/休眠停用。
+#   本程式自己【從不】設 ES_DISPLAY_REQUIRED，所以也不會反過來擋住螢幕關閉。
 _ES_CONTINUOUS = 0x80000000
 _ES_SYSTEM_REQUIRED = 0x00000001          # 只保系統不睡；【刻意不含】顯示器
-SCREEN_OFF_MINUTES = 15
 
 
 def _keep_system_awake_display_free() -> None:
@@ -8771,22 +8774,24 @@ def _keep_system_awake_display_free() -> None:
         logging.warning("[電源] SetThreadExecutionState 失敗", exc_info=True)
 
 
-def _apply_screen_off_power_plan() -> None:
-    """背景執行：以 powercfg 強制電源策略（主程式以 admin 執行，權限足夠）：
-      1. 螢幕 AC/DC 皆 15 分鐘後關閉；
-      2. 睡眠/休眠停用（=0，主機永不睡）。
+def _apply_never_sleep_power_plan() -> None:
+    """背景執行：以 powercfg 停用睡眠/休眠（主程式以 admin 執行，權限足夠）。
+
+    ★[2026-07-31 使用者定案] 只剩「主機永不睡」這一件事★
+    原本這裡還會把 monitor-timeout(AC/DC) 設成 15 分鐘。使用者要求刪除 15 分鐘
+    進入螢幕關閉的模式，並定案【兩層都刪、螢幕只由設定頁的按鈕控制】，所以
+    monitor-timeout 不再由本程式設定 —— 機器上原本是什麼就是什麼，我們不碰。
+    （函式也跟著改名：舊名 `_apply_screen_off_power_plan` 已經不描述它在做什麼了。）
+
     ★【刻意永久性——使用者定案 2026-07-24】這是診間機的「常態」電源設定，程式退出
-    後【不還原】：需求就是這批機器平常螢幕 15 分要關、主機永不睡（夜間監測/止掛
-    提醒與 watchdog 都要跑）。退出還原會把機器帶回「螢幕永不關」的問題狀態
+    後【不還原】：這批機器需要主機永不睡（夜間監測/止掛提醒與 watchdog 都要跑）。
     （codex 曾提退出還原，屬一般軟體慣例，與本機群的使用情境相反，故明文不採）。★
     Chrome wake-lock 的處理【不在這裡】：只在我們自己啟動的 status driver 關掉
     Wake Lock API（chrome_options 的 disable-blink-features=WakeLock）——[codex P1]
     不可用全機 powercfg requestsoverride 壓 chrome.exe/python.exe 的 DISPLAY
     （永久生效且波及使用者自己的 Chrome 看影片等正當 keep-awake）。
     每條各自失敗只記 log，不影響其他條與主流程。"""
-    mins = str(SCREEN_OFF_MINUTES)
     cmds = (
-        ("monitor-timeout-ac", mins), ("monitor-timeout-dc", mins),
         ("standby-timeout-ac", "0"), ("standby-timeout-dc", "0"),
         ("hibernate-timeout-ac", "0"), ("hibernate-timeout-dc", "0"),
     )
@@ -8810,20 +8815,15 @@ def _apply_screen_off_power_plan() -> None:
         logging.warning("[電源] 電源計畫【部分未生效】：%s（其餘已套用）",
                         "、".join(failed))
     else:
-        logging.info("[電源] 電源計畫已強制：螢幕 %s 分關閉、睡眠/休眠停用", mins)
+        # ★措辭鐵律★ 只講這支函式真的做過的事：它現在【不碰螢幕逾時】了。
+        logging.info("[電源] 電源計畫已強制：睡眠/休眠停用（螢幕逾時不由本程式設定）")
 
 
-# [2026-07-24 使用者] 被動版（電源計畫 15 分）實測有機器仍不關——powercfg /requests
-# DISPLAY 乾淨、逾時 900 秒正確、查無兇手 → 補【強制版】watchdog：使用者閒置
-# （GetLastInputInfo）滿 15 分鐘就直接送 SC_MONITORPOWER 關螢幕，不管任何程式/
-# 原因擋；碰鍵盤滑鼠 Windows 自動亮回。代價（使用者知情接受）：影片播放中閒置
-# 一樣照關。主機不睡由上面的 execution state + 電源計畫負責，與本 watchdog 無關。
-_WM_SYSCOMMAND = 0x0112
-_SC_MONITORPOWER = 0xF170
-_MONITOR_OFF = 2                          # lParam：2=關閉螢幕（1=省電、-1=開）
-_HWND_BROADCAST = 0xFFFF
-_SMTO_ABORTIFHUNG = 0x0002
-_FORCE_OFF_POLL_SECONDS = 30
+# ★[2026-07-31 使用者定案] 自動關螢幕【兩層都已移除】，螢幕只由設定頁的按鈕控制★
+#   原本有：(1) 電源計畫 monitor-timeout 15 分鐘；(2) 閒置滿 15 分鐘的 watchdog
+#   （廣播 SC_MONITORPOWER + 自動蓋黑幕）。使用者要求改成手動按鈕。
+#   `_idle_seconds` 留著 —— 黑幕靠它判斷「使用者回來了沒」（見 screen_blackout.py）。
+#   ★不要因為「以前有」就把 watchdog 加回來★：那是使用者明確刪掉的。
 
 
 class _LASTINPUTINFO(ctypes.Structure):
@@ -8855,64 +8855,6 @@ def _idle_seconds() -> "float | None":
         return None
 
 
-def _screen_off_due(idle_s: "float | None", armed: bool) -> tuple:
-    """→ (這輪要不要關屏, 下一輪 armed)。純函式（可測）。
-    armed＝「這段閒置期還沒送過」：送一次即 disarm——避免每 30 秒重複轟炸
-    （螢幕被硬體/例外喚醒時反覆強關會閃爍）；一有輸入（閒置歸零）重新上膛。
-
-    idle_s 為 None＝【查不到閒置時間】→ 不動作（絕不誤關），且【維持 armed】，
-    等查得到的那一輪再判。★不可把 None 當成 0★：那會讓查詢一直失敗的機器
-    永遠不關螢幕，而且完全沒有跡象。"""
-    if idle_s is None:
-        return (False, armed)
-    if idle_s >= SCREEN_OFF_MINUTES * 60:
-        return (armed, False)
-    return (False, True)
-
-
-def _send_monitor_off() -> None:
-    """廣播 SC_MONITORPOWER=off 關螢幕。用 SendMessageTimeout(ABORTIFHUNG) 而非
-    SendMessage：HWND_BROADCAST 碰到卡死視窗會讓 watchdog 緒永久阻塞。
-
-    ★[2026-07-30 措辭鐵律] 只能說「已送出」，不可說「已關閉」。★
-    只要系統上還有任何 DISPLAY power request，Windows 收到這個訊息後會立刻把
-    螢幕點回來，而一般行程沒有簡單的 API 查得到螢幕現在是開還是關。舊版送完就
-    log 成「已強制關閉…」，實機上螢幕根本沒關、log 卻一直說關了 —— 這個問題因此
-    查了兩次都查不出來。真正看得見的效果由 `cmuh_common.screen_blackout` 負責
-    （那個【可以回讀】）。"""
-    try:
-        res = ctypes.c_size_t(0)
-        ctypes.windll.user32.SendMessageTimeoutW(
-            _HWND_BROADCAST, _WM_SYSCOMMAND, _SC_MONITORPOWER, _MONITOR_OFF,
-            _SMTO_ABORTIFHUNG, 2000, ctypes.byref(res))
-        logging.info("[電源] 閒置滿 %d 分鐘 → 已送出關閉螢幕指令"
-                     "（無法回讀螢幕是否真的關閉，另有黑幕兜底）",
-                     SCREEN_OFF_MINUTES)
-    except Exception:
-        logging.warning("[電源] 送出關螢幕指令失敗", exc_info=True)
-
-
-def _log_display_power_requests() -> None:
-    """把 `powercfg /requests` 的內容記進 log（唯讀診斷）。
-
-    ★這是「螢幕關不掉」查了兩次都查不出來所缺的那份資料。★
-    螢幕該關卻沒關，最常見原因是某支程式掛著 DISPLAY power request（wake lock）。
-    以前只在人工排查時看過一次（當時乾淨），但問題是【間歇性】的 —— 要在它真的
-    發生的那一刻抓。故：每段閒置期在關屏前記一次（不是每 30 秒，避免洗版）。"""
-    try:
-        cp = subprocess.run(["powercfg", "/requests"],
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                            capture_output=True, timeout=15, check=False)
-        out = (cp.stdout or b"").decode("utf-8", "replace").strip()
-        if cp.returncode != 0 or not out:
-            logging.info("[電源] powercfg /requests 取不到內容 rc=%s", cp.returncode)
-            return
-        logging.info("[電源] 關屏前的 power requests（找 DISPLAY 區塊）:\n%s",
-                     out[:2000])
-    except Exception:
-        logging.debug("[電源] powercfg /requests 失敗（略過）", exc_info=True)
-
-
 # 黑幕（自製全黑螢幕保護）。由主緒建立、watchdog 緒只透過 root.after 排程操作 ——
 # Tk 不是 thread-safe，從 watchdog 緒直接動視窗會隨機炸掉整個 UI。
 _screen_blackout = None
@@ -8941,52 +8883,6 @@ def screen_blackout_should_eat_this_hotkey() -> bool:
     except Exception:
         return False
 
-
-def _request_blackout() -> None:
-    """從 watchdog 緒請主緒顯示黑幕（Tk 只能在主緒操作）。"""
-    bo, root = _screen_blackout, _screen_blackout_root
-    if bo is None or root is None:
-        return
-
-    def _show():
-        try:
-            if bo.show():
-                logging.info("[黑幕] 閒置滿 %d 分鐘 → 已顯示全黑畫面"
-                             "（回讀 ismapped=True）", SCREEN_OFF_MINUTES)
-        except Exception:
-            logging.warning("[黑幕] 顯示黑幕失敗", exc_info=True)
-
-    try:
-        root.after(0, _show)
-    except Exception:
-        logging.debug("[黑幕] 無法排程到主緒（略過本輪）", exc_info=True)
-
-
-def _force_screen_off_watchdog() -> None:
-    """daemon 緒：每 30 秒查一次閒置，滿 15 分鐘關螢幕（每段閒置期只做一次）。
-
-    做兩件事：(1) 送 SC_MONITORPOWER（真的關掉最省電，但無法回讀）；
-    (2) 顯示黑幕（可回讀、不受 wake lock 影響 —— 使用者定案的兜底）。
-    查不到閒置時間時【不動作但要講出來】，否則這個功能整台機器失效而無跡可循。"""
-    armed = True
-    unknown_streak = 0
-    while True:
-        time.sleep(_FORCE_OFF_POLL_SECONDS)
-        idle = _idle_seconds()
-        if idle is None:
-            unknown_streak += 1
-            # 約 10 分鐘（20 輪）仍查不到 → 這台機器的關屏功能等於沒有，要留下 log
-            if unknown_streak in (1, 20) or unknown_streak % 120 == 0:
-                logging.warning(
-                    "[電源] 查不到使用者閒置時間（GetLastInputInfo 連續失敗 %d 次）"
-                    "→ 這段期間不會自動關螢幕/黑幕", unknown_streak)
-        else:
-            unknown_streak = 0
-        due, armed = _screen_off_due(idle, armed)
-        if due:
-            _log_display_power_requests()
-            _send_monitor_off()
-            _request_blackout()
 
 # [O10] 拉長主院 cache TTL 120s → 300s（5 分鐘）；分院 180 → 600s（10 分鐘）
 # 院方主機自身慢（~3-7s），cache 命中時 UI 立即顯示，不必每 2 分鐘抓一次
@@ -10852,18 +10748,7 @@ class AutomationApp:
 
         self.links_frame = ttk.LabelFrame(self.bottom_frame, text="院內系統捷徑", style="Links.TLabelframe")
         self.links_frame.grid(row=0, column=0, sticky='ew', pady=(1, 1))
-        self.links_frame.grid_columnconfigure(0, weight=0)
-        self.links_frame.grid_columnconfigure(1, weight=0)
-        self.links_frame.grid_columnconfigure(2, weight=1)
-
-        left_frame_container = ttk.Frame(self.links_frame)
-        left_frame_container.grid(row=0, column=0, rowspan=2, padx=8, pady=1, sticky="nw")
-        local_frame_row1 = ttk.Frame(left_frame_container); local_frame_row1.grid(row=0, column=0, sticky='w')
-        local_frame_row2 = ttk.Frame(left_frame_container); local_frame_row2.grid(row=1, column=0, sticky='w', pady=(1,0))
-        ttk.Separator(self.links_frame, orient='vertical').grid(row=0, column=1, rowspan=2, sticky="ns", padx=4, pady=3)
-        right_frame_container = ttk.Frame(self.links_frame)
-        right_frame_container.grid(row=0, column=2, rowspan=2, padx=8, pady=1, sticky="nsew")
-        self._populate_link_buttons(local_frame_row1, local_frame_row2, right_frame_container)
+        self._populate_link_buttons(*self._build_links_grid(self.links_frame))
 
         self.controls_frame = ttk.Frame(self.bottom_frame)
         self.controls_frame.grid(row=1, column=0, sticky='ew', pady=(1, 0))
@@ -10931,15 +10816,64 @@ class AutomationApp:
         try: logging.info(f"Attempting to open URL: {url}"); webbrowser.open(url, new=2)
         except Exception as e: logging.error(f"Failed to open URL: {e}"); messagebox.showerror("開啟失敗", f"無法開啟網頁:\n{e}")
 
-    def _populate_link_buttons(self, local_frame_row1, local_frame_row2, right_frame_container):
+    # ★[2026-07-31 使用者] 院內系統捷徑：左右兩排按鈕的垂直間距必須用【同一個值】★
+    #   舊版左邊 pady=1、右邊 pady=0 → 第一列差 1px；左邊第二列的 frame 又多一個
+    #   pady=(1,0) → 第二列累積差到 3-4px（「電子簽章 vs 值班查詢」看起來最明顯）。
+    #   寫成一個常數，就沒有「只改了一邊」這種可能。
+    _LINK_BTN_PADY = 1
+
+    @staticmethod
+    def _build_links_grid(links_frame):
+        """「院內系統捷徑」的骨架 → (本機列1, 本機列2, 網頁列1, 網頁列2, 值班區)。
+
+        ★[2026-07-31 使用者] 左右兩排按鈕的高度要對齊★
+        舊寫法左右各自是一個 `rowspan=2` 的容器：左邊 `sticky="nw"` + 內部 pack
+        （每顆 pady=1、第二列的 frame 再多一個 pady=(1,0)），右邊 `sticky="nsew"`
+        + 內部 grid（pady=0）。**兩邊的列高沒有任何東西綁在一起**，於是
+        「排檢程式 vs 新版住院系統」差 1px、「電子簽章 vs 值班查詢」差到 3-4px。
+        右邊原本還把值班資訊放在自己容器內的 `col5, rowspan=2`，它會反過來撐開
+        右側的列高，按鈕（`sticky='ew'`，不含 ns）在變高的列裡被垂直置中，
+        再位移一次 —— 而且位移量會隨字體縮放而變。
+
+        改法：左右兩排【共用 links_frame 的同兩列】，值班資訊移到自己的欄。
+        列高由 grid 保證一致，不是靠人工對 padding —— 那種對法下次有人改字體
+        大小又會歪掉。
+
+        ★抽成獨立方法是為了【測得到】★：測試可以拿真的骨架量按鈕的實際 y 座標
+        （見 tests/test_links_alignment_2026_07_31.py），而不是去斷言 padding 數字。
+        """
+        links_frame.grid_columnconfigure(0, weight=0)   # 本機程式兩排
+        links_frame.grid_columnconfigure(1, weight=0)   # 分隔線
+        links_frame.grid_columnconfigure(2, weight=0)   # 網頁兩排
+        links_frame.grid_columnconfigure(3, weight=1)   # 值班資訊吃掉多餘寬度
+        local_row1 = ttk.Frame(links_frame)
+        local_row1.grid(row=0, column=0, padx=(8, 0), pady=0, sticky='w')
+        local_row2 = ttk.Frame(links_frame)
+        local_row2.grid(row=1, column=0, padx=(8, 0), pady=0, sticky='w')
+        ttk.Separator(links_frame, orient='vertical').grid(
+            row=0, column=1, rowspan=2, sticky="ns", padx=4, pady=3)
+        web_row1 = ttk.Frame(links_frame)
+        web_row1.grid(row=0, column=2, padx=(8, 0), pady=0, sticky='w')
+        web_row2 = ttk.Frame(links_frame)
+        web_row2.grid(row=1, column=2, padx=(8, 0), pady=0, sticky='w')
+        duty_container = ttk.Frame(links_frame)
+        duty_container.grid(row=0, column=3, rowspan=2, padx=(10, 6), pady=0,
+                            sticky="ne")
+        return (local_row1, local_row2, web_row1, web_row2, duty_container)
+
+    def _populate_link_buttons(self, local_frame_row1, local_frame_row2,
+                               web_frame_row1, web_frame_row2, duty_container):
         local_buttons_row1 = [("舊版住院系統", r"C:\admc\systemftp.exe"), ("西醫診間系統", r"C:\opdc\systemftp.exe"), ("排檢程式", r"C:\SCHDUAL\systemftp.exe")]
         local_buttons_row2 = [("急診系統", r"C:\newemr\急診系統.exe"), ("開刀房系統", r"C:\orsys\systemftp.exe"), ("電子簽章", r"C:\NewEmrSign\systemftp.exe")]
         
-        for text, path in local_buttons_row1: 
-            ttk.Button(local_frame_row1, text=text, style="Link.TButton", command=lambda p=path: self._launch_program(p)).pack(side="left", padx=3, pady=1)
-        for text, path in local_buttons_row2: 
-            ttk.Button(local_frame_row2, text=text, style="Link.TButton", command=lambda p=path: self._launch_program(p)).pack(side="left", padx=3, pady=1)
-            
+        # ★[2026-07-31 使用者] pady 兩側必須一致★ 舊版左邊 pady=1、右邊 pady=0，
+        #   再加上左邊第二列 frame 的 pady=(1,0)，第二列就累積差到 3-4px。
+        for text, path in local_buttons_row1:
+            ttk.Button(local_frame_row1, text=text, style="Link.TButton", command=lambda p=path: self._launch_program(p)).pack(side="left", padx=3, pady=self._LINK_BTN_PADY)
+        for text, path in local_buttons_row2:
+            ttk.Button(local_frame_row2, text=text, style="Link.TButton", command=lambda p=path: self._launch_program(p)).pack(side="left", padx=3, pady=self._LINK_BTN_PADY)
+
+
         web_buttons_row1 = [
             ("新版住院系統", "https://his.cmuh.org.tw/webapp/login/"),
             ("CMUH入口網站", "https://intranet.caaumed.org.tw/?BranchNo=1"),
@@ -10954,11 +10888,12 @@ class AutomationApp:
             ("Google", "https://www.google.com"),
         ]
         
-        for col, (text, url) in enumerate(web_buttons_row1):
-            ttk.Button(right_frame_container, text=text, style="Link.TButton", command=lambda u=url: self._launch_browser(u)).grid(row=0, column=col, padx=2, pady=(0, 0), sticky='ew')
+        # 左右兩排現在住在 links_frame 的【同一組列】裡，pady 也用同一個常數 ——
+        # 對齊由 grid 的列高保證，不是靠人工湊 padding（見 links_frame 那段說明）。
+        for text, url in web_buttons_row1:
+            ttk.Button(web_frame_row1, text=text, style="Link.TButton", command=lambda u=url: self._launch_browser(u)).pack(side="left", padx=2, pady=self._LINK_BTN_PADY)
 
-        duty_grid = ttk.Frame(right_frame_container)
-        duty_grid.grid(row=0, column=5, rowspan=2, padx=(10, 6), pady=0, sticky="ne")
+        duty_grid = duty_container
         for dc in range(5):
             duty_grid.columnconfigure(dc, weight=0)
         _duty_pad = {"padx": (0, 4), "pady": 0}
@@ -10973,11 +10908,8 @@ class AutomationApp:
         ttk.Label(duty_grid, textvariable=self.duty_row2_vs_lbl_var, style="SmallDuty.TLabel", anchor="e").grid(row=1, column=3, sticky="e", **_duty_pad)
         ttk.Label(duty_grid, textvariable=self.duty_row2_vs_name_var, style="SmallDuty.TLabel", anchor="w").grid(row=1, column=4, sticky="w", **_duty_pad)
 
-        for col, (text, url) in enumerate(web_buttons_row2):
-            ttk.Button(right_frame_container, text=text, style="Link.TButton", command=lambda u=url: self._launch_browser(u)).grid(row=1, column=col, padx=2, pady=0, sticky='ew')
-
-        for c in range(6):
-            right_frame_container.grid_columnconfigure(c, weight=0 if c < 5 else 1)
+        for text, url in web_buttons_row2:
+            ttk.Button(web_frame_row2, text=text, style="Link.TButton", command=lambda u=url: self._launch_browser(u)).pack(side="left", padx=2, pady=self._LINK_BTN_PADY)
 
     def _launch_scheduler_program(self):
         # [v16 2026-05-25] 改多行 + 加 creationflags=CREATE_NO_WINDOW 避免黑框閃
@@ -14198,6 +14130,19 @@ class AutomationApp:
 
         ttk.Checkbutton(mode_frame, text="開啟「醫院外模式」", variable=self.out_of_hospital_var, command=on_mode_change).pack(anchor="w", pady=2)
 
+        # ─── 螢幕（2026-07-31 使用者）───────────────────────────────────
+        # 自動關螢幕的兩層（電源計畫 monitor-timeout 15 分、閒置 watchdog）已依
+        # 使用者要求移除；螢幕只由這顆按鈕控制。
+        screen_frame = ttk.LabelFrame(left_column, text="螢幕", padding=10)
+        screen_frame.pack(fill=tk.X, pady=(0, 15))
+        ttk.Button(screen_frame, text="立即黑螢幕",
+                   command=self._blackout_now).pack(anchor="w")
+        ttk.Label(screen_frame,
+                  text="黑色畫面會蓋滿所有螢幕（含副螢幕與工作列）。"
+                       "放開滑鼠後，任何滑鼠移動或按鍵都會馬上恢復。",
+                  foreground="gray", style="Small.TLabel", wraplength=320,
+                  justify="left").pack(anchor="w", pady=(4, 0))
+
         ui_scale_frame = ttk.LabelFrame(left_column, text="介面字體", padding=10)
         ui_scale_frame.pack(fill=tk.X, pady=(0, 15))
         ttk.Label(ui_scale_frame, text="縮放 (0.85–1.45，儲存後重新啟動生效):").pack(anchor="w")
@@ -14427,6 +14372,46 @@ class AutomationApp:
 
         ttk.Button(btns, text="還原選定項目", command=_do).pack(side=tk.RIGHT)
         ttk.Button(btns, text="取消", command=win.destroy).pack(side=tk.RIGHT, padx=(0, 8))
+
+    def _blackout_now(self) -> None:
+        """[2026-07-31 使用者] 設定頁的「立即黑螢幕」按鈕。
+
+        ★只講回讀到的事★ `ScreenBlackout.show()` 回的是【視窗真的 mapped 了沒】，
+        不是「我送出了指令」。沒黑成功一定要說出來 —— 否則使用者按了按鈕、螢幕沒
+        變黑、程式卻一聲不吭（這正是舊版 SC_MONITORPOWER 「log 說關了、實機沒關」
+        查了兩次都查不出來的那個形狀）。
+
+        自動化執行中不黑屏：主程式有「螢幕擷取 + OCR」的路徑（F2/F3 照光卡號），
+        topmost 黑視窗會讓它擷到全黑。這時要告訴使用者為什麼沒反應。
+        """
+        bo = _screen_blackout
+        if bo is None:
+            messagebox.showwarning(
+                "無法黑螢幕",
+                "黑幕元件沒有初始化成功（啟動時的錯誤請見 automation_ui.log）。",
+                parent=self.root)
+            return
+        if bool(getattr(self, "_subsystem_running", False)):
+            messagebox.showinfo(
+                "暫時無法黑螢幕",
+                "目前正在執行自動化流程（螢幕擷取/OCR 會擷到全黑），"
+                "等它跑完再按一次。",
+                parent=self.root)
+            return
+        try:
+            shown = bool(bo.show())
+        except Exception:
+            logging.warning("[黑幕] 手動觸發失敗", exc_info=True)
+            shown = False
+        if shown:
+            logging.info("[黑幕] 使用者按下「立即黑螢幕」→ 已顯示（回讀 ismapped=True）")
+            return
+        logging.warning("[黑幕] 使用者按下「立即黑螢幕」→ 沒有顯示出來")
+        messagebox.showwarning(
+            "黑螢幕沒有出現",
+            "已嘗試蓋上黑色畫面，但回讀確認它【沒有顯示出來】。\n"
+            "詳細原因請見 automation_ui.log 的 [黑幕] 訊息。",
+            parent=self.root)
 
     def _restore_settings_defaults(self, keys):
         """執行還原 → 重載記憶體 → 更新畫面。失敗只回報,不讓例外炸掉 UI。"""
@@ -16537,7 +16522,7 @@ class AutomationApp:
         # SetThreadExecutionState 必須在【主緒】呼叫(ES_CONTINUOUS 綁定呼叫緒的存活,
         # 主緒=Tk mainloop 與行程同壽命);powercfg 批次丟背景(subprocess 不卡 UI)。
         _keep_system_awake_display_free()
-        _submit_startup_background("power-policy", _apply_screen_off_power_plan)
+        _submit_startup_background("power-policy", _apply_never_sleep_power_plan)
         # [2026-07-30 使用者] 黑幕（自製全黑螢幕保護）——SC_MONITORPOWER 被 DISPLAY
         # wake lock 壓住時螢幕根本不會關，而那件事【無法回讀】。黑幕是我們自己畫的
         # 視窗，不受電源管理影響，而且可以回讀（見 cmuh_common/screen_blackout.py）。
@@ -16556,10 +16541,8 @@ class AutomationApp:
                             exc_info=True)
             _screen_blackout = None
             _screen_blackout_root = None
-        # [2026-07-24 使用者] 強制版：閒置 15 分鐘直接關螢幕（被動電源計畫實測
-        # 有機器不動作 → 不再依賴 Windows 自己關）。
-        threading.Thread(target=_force_screen_off_watchdog,
-                         name="screen-off-watchdog", daemon=True).start()
+        # ★[2026-07-31 使用者定案] 閒置 15 分鐘自動關螢幕的 watchdog 已移除★
+        #   螢幕只由「設定頁 →『立即黑螢幕』按鈕」控制（`_blackout_now`）。
 
         self.startup_phase_text.set("任務排程")
 

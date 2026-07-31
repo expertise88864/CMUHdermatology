@@ -59,6 +59,19 @@ def made(tk_root):
     bo.hide()
 
 
+def _arm(bo, idle):
+    """跑一輪輪詢讓黑幕進入待命 —— ★這就是生產路徑★
+
+    [2026-07-31] 黑幕改成由設定頁的按鈕觸發。按鈕是用滑鼠按的，所以黑幕出現的
+    瞬間 `GetLastInputInfo` 的閒置是 0、游標又停在黑幕上 —— 沒有待命期的話，
+    黑幕會被自己的開啟動作立刻收掉，按鈕等於沒用。
+    待命之後的規則【一字未改】：任何輸入都馬上收。
+    """
+    idle.value = 9999.0
+    bo._poll()
+    assert bo.armed, "跑過一輪輪詢就該待命了"
+
+
 # ─── 顯示：回傳的是回讀結果 ───────────────────────────────────────────────
 def test_show_reports_the_readback_not_the_intent(made):
     bo, _idle, _busy = made
@@ -107,8 +120,9 @@ def test_the_poll_takes_it_down_when_automation_starts(made):
 
 # ─── ★收得掉★：三條退場路徑 ──────────────────────────────────────────────
 def test_a_keypress_takes_it_down(made):
-    bo, _idle, _busy = made
+    bo, idle, _busy = made
     bo.show()
+    _arm(bo, idle)
     bo._on_wake()
     assert bo.active is False
 
@@ -122,8 +136,9 @@ def test_a_keypress_takes_it_down(made):
 # 事件身分、硬上限……一堆複雜度。使用者明確要求相反的行為，而這是他的診間機。
 def test_any_mouse_movement_takes_it_down_however_small(made):
     """★使用者定案★ 不問移了幾 px，滑鼠一動就收。"""
-    bo, _idle, _busy = made
+    bo, idle, _busy = made
     bo.show()
+    _arm(bo, idle)
     bo._on_wake(type("E", (), {"x_root": 501, "y_root": 500})())   # 移了 1px
     assert bo.active is False
 
@@ -148,6 +163,7 @@ def test_the_poll_takes_it_down_on_any_fresh_input(made):
     """失效保險輪詢也一樣：idle 一掉下來就收，不再分辨是滑鼠還是鍵盤。"""
     bo, idle, _busy = made
     bo.show()
+    _arm(bo, idle)
     idle.input(0.5)
     bo._poll()
     assert bo.active is False
@@ -157,10 +173,121 @@ def test_the_poll_does_not_second_guess_repeated_input(made):
     """連續有輸入時也不需要任何「硬上限」—— 第一下就收了。"""
     bo, idle, _busy = made
     bo.show()
+    _arm(bo, idle)
     for v in (0.9, 0.8, 0.7):
         idle.value = v
         if bo.active:
             bo._poll()
+    assert bo.active is False
+
+
+# ─── ★[2026-07-31] 待命：按鈕的那一下不算「有人回來了」★ ──────────────
+def test_the_click_that_opened_it_does_not_close_it(made):
+    """★這條是「按鈕能不能用」的關鍵★
+
+    黑幕改成設定頁按鈕觸發。按鈕是用滑鼠按的 → 出現的瞬間 `GetLastInputInfo`
+    的閒置是 0，游標又停在黑幕上隨時會送 `<Motion>`。沒有待命期的話，黑幕會被
+    自己的開啟動作立刻收掉 —— 按下去畫面閃一下就沒了。
+    """
+    bo, idle, _busy = made
+    idle.value = 0.0                      # 剛剛才按了按鈕
+    bo.show()
+    assert bo.armed is False
+    bo._on_wake()                         # 游標停在黑幕上送出的 <Motion>
+    assert bo.active is True, "開啟黑幕的那一下操作不可以把它收掉"
+    bo._poll()                            # idle 仍是 0 → 還不待命
+    assert bo.active is True and bo.armed is False
+
+
+def test_it_arms_once_the_user_lets_go(made):
+    bo, idle, _busy = made
+    idle.value = 0.0
+    bo.show()
+    bo._poll()
+    assert bo.armed is False
+    idle.value = sb.ARM_IDLE_SEC          # 放手了
+    bo._poll()
+    assert bo.armed is True and bo.active is True
+    bo._on_wake()
+    assert bo.active is False, "待命之後任何輸入都要馬上收"
+
+
+def test_the_arming_threshold_cannot_be_below_the_dismiss_threshold():
+    """★這是我第一版寫錯的地方，釘住它★
+
+    收黑幕的條件是 `idle < INPUT_FRESH_SEC`。待命門檻若比它小（我寫過 0.8），
+    同一輪輪詢會先待命、再馬上收 —— 而且無論如何都留不住（輪詢間隔 250ms，
+    閒置時間不可能從 <0.8 直接跳到 ≥2.0）。按鈕會完全沒用。
+    """
+    assert sb.ARM_IDLE_SEC >= sb.INPUT_FRESH_SEC
+
+
+def test_the_blackout_survives_a_normal_button_press(made):
+    """★端到端：按下按鈕、把手放開 → 黑幕留著★
+
+    這支測的是整條路徑而不是單一門檻 —— 上面那個門檻寫錯時，這支也會紅。
+    """
+    bo, idle, _busy = made
+    idle.value = 0.0                       # 剛按下按鈕
+    assert bo.show() is True
+    for t in (0.25, 0.5, 1.0, 1.5):        # 手放開，閒置時間往上爬
+        idle.value = t
+        bo._poll()
+        assert bo.active is True, f"閒置 {t}s 時不該收（使用者還沒回來）"
+    idle.value = 30.0                      # 真的離開了
+    bo._poll()
+    assert bo.active is True and bo.armed is True
+    idle.value = 0.1                       # 回來碰了一下
+    bo._poll()
+    assert bo.active is False
+
+
+def test_it_arms_anyway_after_the_hard_cap(made, monkeypatch):
+    """★硬上限★ 手一直在動也不可以變成收不掉的全螢幕黑窗。"""
+    bo, idle, _busy = made
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(sb.time, "monotonic", lambda: clock["t"])
+    idle.value = 0.0                      # 從頭到尾都有輸入
+    bo.show()
+    bo._poll()
+    assert bo.armed is False
+    clock["t"] += sb.ARM_MAX_SEC
+    bo._poll()
+    assert bo.armed is True, "超過硬上限就要待命，不管有沒有人一直碰"
+    assert bo.active is False, "待命的同時 idle 也很新 → 這一輪就收掉"
+
+
+def test_arming_resets_for_the_next_blackout(made):
+    """每次按按鈕都要重新走一次待命 —— 不可以沿用上一次的待命狀態。"""
+    bo, idle, _busy = made
+    bo.show()
+    _arm(bo, idle)
+    bo.hide()
+    idle.value = 0.0
+    bo.show()
+    assert bo.armed is False
+
+
+def test_an_unknown_idle_time_still_takes_it_down_before_arming(made):
+    """★待命不可以變成新的卡死路徑★ 查不到閒置時間時照樣收 —— 那是
+    「我確定沒人在用」的依據沒了，繼續蓋著＝醫師回來卻看不到病歷。"""
+    bo, idle, _busy = made
+    idle.value = 0.0
+    bo.show()
+    assert bo.armed is False
+    idle.value = None
+    bo._poll()
+    assert bo.active is False
+
+
+def test_automation_still_takes_it_down_before_arming(made):
+    """自動化開始跑也一樣：待命與否都要立刻收（否則 OCR 會擷到全黑）。"""
+    bo, idle, busy = made
+    idle.value = 0.0
+    bo.show()
+    assert bo.armed is False
+    busy.value = True
+    bo._poll()
     assert bo.active is False
 
 
@@ -355,6 +482,7 @@ def test_the_poll_takes_it_down_even_when_no_tk_event_arrives(made):
     """
     bo, idle, _busy = made
     bo.show()
+    _arm(bo, idle)
     idle.input(0.5)                      # 有人碰了鍵鼠，但事件沒送到我們
     bo._poll()
     assert bo.active is False

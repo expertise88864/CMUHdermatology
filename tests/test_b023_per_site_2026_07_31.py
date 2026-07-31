@@ -132,8 +132,13 @@ def _b023_noqa_lines() -> list:
     """
     out = []
     for root, _dirs, files in os.walk(REPO_ROOT):
+        # ★[2026-07-31] `.claude` 也要排除★
+        #   spawned agent 會在 `.claude/worktrees/<名字>/` 開 git worktree ——
+        #   那是【這個 repo 的另一份完整副本】。沒排除的話掃描器會把副本裡的
+        #   noqa 當成本 repo 新增的，兩支守衛就同時誤紅（實際發生過）。
+        #   `.gitignore` 有蓋到它，但 os.walk 不看 .gitignore。
         if any(part in root for part in
-               (".git", "__pycache__", "python_embed", ".venv")):
+               (".git", ".claude", "__pycache__", "python_embed", ".venv")):
             continue
         for name in files:
             if not name.endswith(".py"):

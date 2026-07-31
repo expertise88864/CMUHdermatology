@@ -1,22 +1,27 @@
 # -*- coding: utf-8 -*-
-"""自製「全黑螢幕保護」覆蓋層。
+"""自製「全黑螢幕保護」覆蓋層 —— ★由設定頁的按鈕手動觸發★。
 
-★[2026-07-30 使用者] 為什麼需要這個★
-需求是「閒置 15 分鐘後螢幕關掉」。既有做法有兩層,兩層都【不可回讀】:
+★[2026-07-31 使用者定案] 現在只有【按鈕】一條路★
+原話：「在設定頁面做一個按鈕，按下後讓黑色畫面直接覆蓋著螢幕及副螢幕、包括系統列
+…若有偵測到有滑鼠的移動或是鍵盤的輸入就馬上恢復原狀，然後刪除原本 15 分鐘進入
+螢幕關閉的模式」。使用者另外定案：**兩層自動關螢幕都刪掉，螢幕只由按鈕控制**。
 
-  1. `powercfg /change monitor-timeout-*` 15 分鐘 —— 被任何程式的 DISPLAY
-     power request(wake lock)壓住就永遠不會關。
-  2. 閒置滿 15 分鐘廣播 `WM_SYSCOMMAND / SC_MONITORPOWER=2` —— 這個訊息送出後,
-     只要系統上仍有 DISPLAY request,Windows 會【立刻把螢幕點回來】;而 Win32
-     沒有給一般行程一個簡單的「螢幕現在是開還是關」查詢 API(要 monitor 視窗 +
-     `RegisterPowerSettingNotification` 才拿得到 `GUID_CONSOLE_DISPLAY_STATE`)。
-     舊版送完就 log「已強制關閉螢幕」—— 那是【講程式不確知的事】,而實機上螢幕
-     根本沒關,log 卻一直說關了,於是這個問題查了兩次都查不出來。
+移除的兩層（別再加回來）：
+  1. `powercfg /change monitor-timeout-*` 15 分鐘 —— 已從電源計畫拿掉
+     （同一支函式裡的「睡眠/休眠停用」保留，那是另一回事）。
+  2. 閒置滿 15 分鐘的 watchdog：送 `WM_SYSCOMMAND / SC_MONITORPOWER=2` + 自動蓋黑幕。
 
-使用者定案:「或是 15 分鐘後進入全黑的螢幕保護程式也可以」。
-一個【自己畫的全黑視窗】不依賴電源管理、不受 wake lock 影響,而且**可以回讀**
-(`winfo_ismapped()`),所以我們能誠實地說出「這次到底黑了沒有」。
-原本的 SC_MONITORPOWER 仍然照送(真的關掉更省電),只是不再假設它有效。
+★為什麼當初要自己畫一個黑視窗（這個理由仍然成立）★
+`SC_MONITORPOWER` 送出後，只要系統上仍有 DISPLAY power request（wake lock），
+Windows 會【立刻把螢幕點回來】；而 Win32 沒有給一般行程一個簡單的「螢幕現在是開
+還是關」查詢 API。舊版送完就 log「已強制關閉螢幕」—— 那是【講程式不確知的事】，
+實機上螢幕根本沒關、log 卻一直說關了，這個問題因此查了兩次都查不出來。
+自己畫的全黑視窗不依賴電源管理、不受 wake lock 影響，而且**可以回讀**
+（`winfo_ismapped()`），所以我們能誠實地說出「這次到底黑了沒有」。
+
+★誠實邊界★：這是**蓋一層黑色**，不是把顯示器斷電 —— 背光仍然亮著，省的是
+「不要一直顯示病歷」而不是電。要真的斷電只有 `SC_MONITORPOWER`，而那個
+不可回讀、又常被 wake lock 立刻點回來，正是被移除的東西。
 
 ★安全設計(這是診間機,覆蓋全螢幕的東西必須永遠能退場)★
 
@@ -56,6 +61,29 @@ _SM_CYVIRTUALSCREEN = 79
 
 POLL_MS = 250                 # 失效保險輪詢間隔
 INPUT_FRESH_SEC = 2.0         # 閒置低於這個秒數 → 判定「剛剛有人碰了」
+
+# ★[2026-07-31 使用者] 待命（arming）—— 開啟黑幕的那一下操作本身不算「有人回來了」★
+#   黑幕現在是【設定頁的按鈕】按出來的（閒置 15 分鐘自動觸發那套已依使用者要求移除）。
+#   按鈕是用滑鼠按的 → 按下的瞬間 `GetLastInputInfo` 的閒置時間是 0，而且游標就停在
+#   黑幕上，`<Motion>` 隨時會送。若沒有這段待命，黑幕會在出現的同一瞬間就被自己
+#   的開啟動作收掉 —— 按鈕等於完全沒用。
+#
+#   ★這不是「輸入門檻」，不要跟使用者否決掉的那個混為一談★
+#   使用者定案（2026-07-30）是「任何人在電腦前的行為都要馬上收黑幕」，並且明確
+#   否決了外審堅持的 25px 滑鼠飄移門檻。那條規則現在【一字不改】—— 只是它從
+#   「黑幕出現的那一刻」開始算，改成從「使用者放手之後」開始算。
+#   待命之後仍然不分滑鼠鍵盤、不問移了幾 px。
+#   ★待命門檻【必須】等於 INPUT_FRESH_SEC，不可以更小★
+#   收黑幕的條件是 `idle < INPUT_FRESH_SEC`。若待命門檻比它小（我第一版寫 0.8），
+#   同一輪輪詢會先「idle 0.8 ≥ 0.8 → 待命」再「idle 0.8 < 2.0 → 收」——
+#   黑幕在待命的那一瞬間就被收掉，而且無論如何都留不住（輪詢間隔只有 250ms，
+#   閒置時間不可能從 <0.8 直接跳到 ≥2.0）。等於按鈕永遠沒用。
+#   設成同一個值就變成乾淨的「跨過去才待命、掉下來就收」。
+ARM_IDLE_SEC = INPUT_FRESH_SEC
+ARM_MAX_SEC = 4.0             # ★硬上限★ 一直有輸入也最多等這麼久就待命,
+                              #   否則「手一直在動」會變成收不掉的全螢幕黑窗。
+                              #   （待命的同時 idle 還很新 → 那一輪就收掉，這是對的：
+                              #     手一直在動代表人就在電腦前。）
 
 # ★[2026-07-30 外審第 2 輪] 喚醒 token 的失效保險期限★
 #   熱鍵回呼（`keyboard` hook 緒）與 Tk 的 <Key> 處理是【並行】的：同一下按鍵，
@@ -124,6 +152,10 @@ class ScreenBlackout:
         # hook 緒先跑的情形：第一下 F1 看到黑幕還在 → 擋下但沒消耗 token；
         # Tk 接著拆窗又發一張新 token → 第二下 F1 也被吃掉。有這個旗標就不會。
         self._eaten_this_blackout = False
+        # 待命狀態（見模組上方 ARM_IDLE_SEC 的說明）：黑幕剛出現時是「未待命」，
+        # 使用者放手之後才開始把輸入當成「有人回來了」。
+        self._shown_at = 0.0
+        self._armed = False
 
     # ── 狀態 ────────────────────────────────────────────────────────────────
     @property
@@ -260,6 +292,8 @@ class ScreenBlackout:
         win.protocol("WM_DELETE_WINDOW", self._on_wake)
         with self._wake_lock:
             self._eaten_this_blackout = False
+        self._shown_at = time.monotonic()
+        self._armed = False              # 按鈕的那一下不算「有人回來了」
         win.update_idletasks()
         try:
             self._hwnd = int(win.winfo_id())
@@ -274,8 +308,32 @@ class ScreenBlackout:
             logging.debug("[黑幕] focus_force 失敗（仍以輪詢收場）", exc_info=True)
         self._schedule_poll()
 
+    # ── 待命 ────────────────────────────────────────────────────────────────
+    @property
+    def armed(self) -> bool:
+        """已經進入待命（＝之後任何輸入都會馬上收黑幕）嗎。"""
+        return self._armed
+
+    def _maybe_arm(self, idle: float) -> bool:
+        """→ 這一輪之後是不是待命了。見模組上方 ARM_IDLE_SEC 的說明。"""
+        if self._armed:
+            return True
+        try:
+            waited = time.monotonic() - self._shown_at
+        except Exception:
+            waited = ARM_MAX_SEC          # 算不出來就當作等夠了（絕不卡住）
+        if idle >= ARM_IDLE_SEC or waited >= ARM_MAX_SEC:
+            self._armed = True
+            logging.debug("[黑幕] 進入待命（idle=%.1fs, 已顯示 %.1fs）→ "
+                          "之後任何輸入都會馬上收起", idle, waited)
+        return self._armed
+
     # ── 退場 ────────────────────────────────────────────────────────────────
     def _on_wake(self, _event=None) -> None:
+        if not self._armed:
+            # 開啟黑幕的那一下（按鈕的點擊、游標停在黑幕上送出的 <Motion>）不算
+            # 「有人回來了」。待命之後這裡就完全照使用者定案：任何輸入馬上收。
+            return
         self.hide(reason="使用者輸入")
 
     def hide(self, *, reason: str = "") -> None:
@@ -358,6 +416,11 @@ class ScreenBlackout:
             # 一旦失去那個依據，繼續蓋著＝醫師回來卻看不到病歷。收起來的最壞後果只是
             # 「螢幕沒關」——那就是修好之前的既有狀態，遠優於擋住臨床工作。
             self.hide(reason="查不到閒置時間")
+            return
+        # ★待命之前不收★ 見模組上方 ARM_IDLE_SEC：按鈕是用滑鼠按出來的，
+        #   開啟黑幕的那一下操作本身不算「有人回來了」。
+        if not self._maybe_arm(idle):
+            self._schedule_poll()
             return
         # ★★使用者定案：任何人在電腦前的行為都馬上收★★
         #   不分辨是滑鼠還是鍵盤、不問滑鼠移了幾 px、不推論「這算不算真的有人」。
