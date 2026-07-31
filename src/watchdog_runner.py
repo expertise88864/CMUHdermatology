@@ -111,6 +111,17 @@ def main() -> int:
         return _run_once_via_core()
 
     _setup_logging()
+    # ★[P1-08 2026-08-01] 復原上一批沒走完的更新★
+    #   放在 watchdog 是刻意的：它是【獨立的行程】，被更新弄壞的那支程式啟動不了時，
+    #   應用程式自己的復原路徑就跑不到，而 watchdog 還活著。這是目前涵蓋面最大的
+    #   復原點（仍然涵蓋不到「連 watchdog 自己的相依也被換到一半」）。
+    try:
+        from cmuh_common.updater import recover_incomplete_update
+        restored = recover_incomplete_update()
+        if restored:
+            logging.warning("守護程式啟動時回滾了 %d 個未完成的更新檔", len(restored))
+    except Exception:
+        logging.debug("復原未完成更新失敗（不影響守護程式）", exc_info=True)
     # [EH-02 2026-07-12] 非 admin daemon 對 admin 權限行程 kill 會 AccessDenied → 只警告(不自動
     # 提權,避免無人在場反覆彈 UAC);schtasks /RL HIGHEST 路徑不受影響。
     try:

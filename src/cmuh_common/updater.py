@@ -15,6 +15,7 @@
 """
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import re
@@ -24,6 +25,7 @@ import time
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Callable, Optional
 
 import requests
@@ -146,6 +148,118 @@ def _resolve_target_path(app_dir: str, local_filename: str) -> str:
     if os.path.normcase(common_path) != os.path.normcase(app_root):
         raise ValueError(f"更新路徑超出程式目錄: {local_filename}")
     return target_path
+
+
+# ── 更新交易日誌（P1-08 2026-08-01）────────────────────────────────────────
+# ★既有的兩階段寫入擋不住「行程在 Phase 2 中途死掉」★
+#   `_commit_pending_writes` 已經做到「先把全部新內容寫成 .upd.tmp（含 fsync），
+#   確定都寫得出來才開始 os.replace」。那擋掉了最常見的失敗（磁碟滿、防毒鎖檔）。
+#   但 Phase 2 本身是【逐檔】replace 的 —— 行程在中途被砍（watchdog 重啟、使用者
+#   關機、斷電、更新完自我重啟）時，磁碟上就是「一部分新、一部分舊」：
+#     * `version.py` 已經是新版，它 import 的模組還是舊的 → 下次啟動 ImportError；
+#     * 而且 SHA 比對會認為「版本已經是新的」→ 不再重抓 → **程式 brick**。
+#   process 內的 rollback 幫不上忙 —— 那個 process 已經不在了。
+#
+#   所以在動第一個正式檔【之前】先落一份日誌：這一批要動哪些檔、哪些是新建的。
+#   下次啟動看到日誌還在，就代表上次那批沒有走完 → 用 .bak 全部回滾。
+#
+# ★為什麼一律回滾，不試著「往前滾完」★
+#   日誌不記「做到第幾個」（那要逐檔 fsync，代價高且仍有視窗）。回滾到一個【完整的
+#   舊版本】永遠是安全的：更新下一輪會自己再來一次。往前滾則需要那些 .upd.tmp 還在、
+#   內容還正確 —— 假設更多、錯了更慘。
+JOURNAL_FILENAME = ".updater_commit.journal"
+JOURNAL_SCHEMA = 1
+
+
+def _journal_path(app_dir: str) -> str:
+    return os.path.join(app_dir, JOURNAL_FILENAME)
+
+
+def _write_commit_journal(app_dir: str, entries: list) -> bool:
+    """在動第一個正式檔之前落日誌。回是否成功。
+
+    ★寫不出日誌就【不要開始 commit】★ 沒有日誌的中途崩潰是不可復原的（沒人知道
+    動過哪些檔）。寧可本輪不更新 —— 那只是「晚一點更新」，而 brick 是要人去現場的。
+    """
+    path = _journal_path(app_dir)
+    try:
+        payload = {
+            "schema": JOURNAL_SCHEMA,
+            "started": datetime.now().isoformat(timespec="seconds"),
+            "pid": os.getpid(),
+            "files": [{"target": t, "existed_before": bool(e)}
+                      for t, e in entries],
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())      # 斷電也要留得住，否則等於沒寫
+        return True
+    except Exception:
+        logging.warning("[更新] 寫不出交易日誌 → 本輪不進行寫入（避免無法復原的中途崩潰）",
+                        exc_info=True)
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+        return False
+
+
+def _clear_commit_journal(app_dir: str) -> None:
+    """整批 commit 成功後清掉日誌。★一定要在刪 .bak 之前★
+    先刪 .bak 再刪日誌的話，中間崩潰會留下「日誌說要回滾、但備份已經沒了」的狀態。"""
+    try:
+        path = _journal_path(app_dir)
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        logging.debug("[更新] 清除交易日誌失敗", exc_info=True)
+
+
+def recover_incomplete_update(app_dir: str = "") -> "list[str]":
+    """啟動時呼叫：上一批更新若沒走完，用 .bak 把它整批回滾。→ 已還原的檔案清單。
+
+    ★誠實邊界★ 這是在【應用程式自己的行程裡】跑的。如果上次的半套更新已經嚴重到
+    連程式都啟動不了（例如 main.py 自己被換到一半），這段就不會被執行到 ——
+    真要涵蓋那種情況需要一個獨立的啟動器。目前的實際涵蓋範圍是：
+    「壞掉的是被 import 的模組、但進入點還跑得起來」，那也是最常見的形狀。
+    watchdog 是另一個行程，它也會呼叫這裡（見 watchdog_runner），涵蓋面因此大一些。
+
+    不拋例外：復原失敗只記 error，絕不讓它擋住程式啟動。
+    """
+    restored: list[str] = []
+    try:
+        app_dir = app_dir or get_app_dir()
+        path = _journal_path(app_dir)
+        if not os.path.exists(path):
+            return restored
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        files = payload.get("files") or []
+        logging.warning(
+            "[更新] ★偵測到未完成的更新★（交易日誌 %s，%d 個檔，開始於 %s）→ 回滾到更新前的版本",
+            os.path.basename(path), len(files), payload.get("started", "?"))
+        written = [_WrittenFile(str(item.get("target") or ""),
+                                bool(item.get("existed_before")))
+                   for item in files if item.get("target")]
+        # reversed()：與 in-process 的回滾順序一致
+        errors = _rollback_written_files(written)
+        for w in written:
+            restored.append(w.target_path)
+        if errors:
+            logging.error("[更新] 回滾未完成的更新時有 %d 個錯誤：%s",
+                          len(errors), "; ".join(errors[:3]))
+        else:
+            logging.warning("[更新] 已回滾 %d 個檔案到更新前的版本"
+                            "（下一輪更新會重新套用）", len(written))
+        # ★日誌一定要清掉★ 留著會讓每次啟動都重跑一次回滾，而第二次的 .bak
+        #   已經不存在 → 每次啟動都噴一批 error，看起來像壞掉。
+        _clear_commit_journal(app_dir)
+    except Exception:
+        logging.error("[更新] 未完成更新的復原程序本身失敗（不影響啟動）",
+                      exc_info=True)
+    return restored
 
 
 def _rollback_written_files(written_files: list[_WrittenFile]) -> list[str]:
@@ -537,6 +651,14 @@ def check_and_update(
     """
     result = UpdateResult(is_frozen=is_frozen())
 
+    # ★[P1-08 2026-08-01] 先復原上一批沒走完的更新★
+    #   在【檢查/下載之前】做：否則這一輪會拿半套的磁碟狀態去比對版本，
+    #   有可能因為 version.py 已經是新的而判定「不需要更新」→ 半套狀態就這樣留著。
+    try:
+        recover_incomplete_update()
+    except Exception:
+        logging.debug("[更新] 復原未完成更新失敗（續行檢查）", exc_info=True)
+
     def _progress(stage: str, info: str = "") -> None:
         if progress_callback:
             try:
@@ -823,6 +945,29 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
         logging.warning("更新暫存階段失敗，整批不寫入（正式檔未變動）")
         return result
 
+    # ★[P1-08 2026-08-01] 動第一個正式檔之前先落交易日誌★
+    #   Phase 2 是逐檔 replace 的：行程在中途被砍（watchdog 重啟、關機、斷電）時，
+    #   磁碟上會是「一部分新、一部分舊」，而 process 內的回滾幫不上忙（那個 process
+    #   已經不在了）。日誌讓下次啟動知道「上次那批沒走完」→ 用 .bak 整批回滾。
+    #   寫不出日誌就不要開始 —— 沒有日誌的中途崩潰是不可復原的。
+    app_dir_for_journal = os.path.dirname(staged[0][1]) if staged else ""
+    try:
+        app_dir_for_journal = get_app_dir()
+    except Exception:
+        logging.debug("[更新] 取 app_dir 失敗，交易日誌改放第一個目標檔的目錄",
+                      exc_info=True)
+    if not _write_commit_journal(
+            app_dir_for_journal,
+            [(entry[1], entry[2]) for entry in staged]):
+        result.errors.append("[journal] 交易日誌寫入失敗，本批不寫入")
+        for entry in staged:
+            try:
+                if os.path.exists(entry[0]):
+                    os.remove(entry[0])
+            except OSError:
+                pass
+        return result
+
     # Phase 2：逐檔 backup→replace（同磁碟 rename，幾乎不會失敗）
     written_files: list[_WrittenFile] = []
     for tmp_path, target_path, existed_before, key, local_filename, new_ver in staged:
@@ -848,8 +993,16 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
                     os.remove(entry[0])
             except OSError:
                 pass
+        # 已經在這個 process 裡回滾完了 → 日誌沒有存在的理由（留著會讓下次啟動
+        # 再回滾一次，而那時 .bak 已經被 rollback 消耗掉 → 每次啟動噴一批 error）。
+        _clear_commit_journal(app_dir_for_journal)
         logging.warning("更新寫入失敗，已回滾 %d 個檔案", len(written_files))
         return result
+
+    # ★整批 replace 都成功了 → 先清日誌，再清 .bak★
+    #   順序不可對調：先刪 .bak 再刪日誌的話，中間崩潰會留下「日誌說要回滾、
+    #   但備份已經沒了」的狀態 —— 那比沒有日誌更糟。
+    _clear_commit_journal(app_dir_for_journal)
 
     # [stability r4] 整批已成功 commit、不再需要回滾 → 清掉本批建立的 .bak 備份，
     # 避免無人值守長跑下程式目錄持續堆積過時的 .py.bak。務必放在上面的 rollback
