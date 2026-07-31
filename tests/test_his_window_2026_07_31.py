@@ -55,6 +55,12 @@ class FakeUser32:
         self.foreground = 0
         self.focus = 0
         self.attach_calls = []
+        # 第二刀新增
+        self.sent = []                 # SendMessageTimeoutW 的呼叫紀錄
+        self.smto_returns = 1          # 0 = 逾時/失敗
+        self.smto_result = 0
+        self.shown = []                # ShowWindow 的呼叫紀錄
+        self.iconic = set()
 
     # -- 供 find_window_by_class_title 用（它會設 argtypes/restype） ----------
     @property
@@ -151,10 +157,12 @@ class FakeUser32:
         self.attach_calls.append((a, b, bool(on)))
         return 1
 
-    def IsIconic(self, _h):
-        return 0
+    def IsIconic(self, h):
+        return 1 if h in self.iconic else 0
 
-    def ShowWindow(self, *_a):
+    def ShowWindow(self, h, cmd):
+        self.shown.append((h, cmd))
+        self.iconic.discard(h)
         return 1
 
     def SetWindowPos(self, *args):
@@ -168,6 +176,39 @@ class FakeUser32:
     def SetForegroundWindow(self, h):
         self.foreground = h
         return 1
+
+    # -- 第二刀（P2-06 2026-07-31）新增的 API ------------------------------
+    def EnumWindows(self, cb, _lparam):
+        """全域列舉 top-level 視窗（parent==0 的就是）。"""
+        for w in self.win.values():
+            if not w.parent and not cb(w.hwnd, 0):
+                return 1
+        return 1
+
+    @property
+    def WindowFromPoint(self):
+        fake = self
+
+        class _W:
+            argtypes = None
+            restype = None
+
+            def __call__(self, pt):
+                for w in fake.win.values():
+                    left, top, right, bottom = w.rect
+                    if left <= pt.x < right and top <= pt.y < bottom:
+                        return w.hwnd
+                return 0
+        if not hasattr(self, "_wfp_obj"):
+            self._wfp_obj = _W()
+        return self._wfp_obj
+
+    def SendMessageTimeoutW(self, hwnd, msg, wparam, lparam, flags, timeout,
+                            out_result):
+        self.sent.append((hwnd, msg, wparam, lparam, timeout))
+        if self.smto_returns:
+            out_result._obj.value = self.smto_result
+        return self.smto_returns
 
 
 class FakeKernel32:
@@ -575,7 +616,16 @@ def test_main_still_exposes_the_old_private_names():
                  "_enum_class_in_window", "_enum_direct_children",
                  "_find_descendants_by_exact_text",
                  "_find_descendant_by_class_text",
-                 "_find_first_descendant_by_class", "_window_is_ancestor",
+                 "_find_first_descendant_by_class",
+                 # _window_is_ancestor 在第二刀之後不再由 main.py 匯入：
+                 # 唯一的呼叫端 _screen_point_in_window 也搬進 his_window 了。
+                 "_get_window_pid", "_get_class_name_of", "_get_window_text",
+                 "_screen_point_in_window", "_get_ime_focus_hwnd",
+                 "_send_key_to_window", "_send_message_timeout_ex",
+                 "_send_yiling_menu_command", "_close_window",
+                 "_click_control_center", "_click_button_by_text",
+                 "_click_button_normalized_text",
+                 "_ensure_hospital_foreground", "_scan_unknown_popups",
                  "_post_click_to_control", "_send_enter_to_window",
                  "_send_chars_to_window", "_bring_window_front",
                  "_force_ime_english", "_get_thread_focus"):
@@ -595,3 +645,257 @@ def test_rect_is_the_real_win32_struct():
     ref = ctypes.byref(r)
     ref._obj.top = 7
     assert r.top == 7
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# P2-06 第二刀（2026-07-31）：剩下的 14 個 Win32 葉子
+# ══════════════════════════════════════════════════════════════════════════
+def test_get_window_pid_reads_the_owning_process(fake):
+    fake([FakeWindow(1, "TForm", pid=4321)])
+    assert hw.get_window_pid(1) == 4321
+
+
+def test_get_window_pid_returns_zero_instead_of_raising(fake, monkeypatch):
+    """★回 0 而不是拋★ 這個值用來做「只對 HIS 行程動作」的把關，
+    查不到時呼叫端會走「不符合」的分支（保守），不可以炸掉熱鍵緒。"""
+    u = fake([FakeWindow(1, "TForm")])
+    monkeypatch.setattr(u, "GetWindowThreadProcessId",
+                        lambda *_a: (_ for _ in ()).throw(OSError("x")))
+    assert hw.get_window_pid(1) == 0
+
+
+def test_get_class_name_and_text(fake):
+    fake([FakeWindow(1, "TEdit", text="病歷內容")])
+    assert hw.get_class_name_of(1) == "TEdit"
+    assert hw.get_window_text(1) == "病歷內容"
+
+
+def test_get_window_text_is_empty_when_there_is_none(fake):
+    fake([FakeWindow(1, "TEdit", text="")])
+    assert hw.get_window_text(1) == ""
+
+
+def test_get_class_name_returns_empty_on_failure(fake, monkeypatch):
+    u = fake([FakeWindow(1, "TEdit")])
+    monkeypatch.setattr(u, "GetClassNameW",
+                        lambda *_a: (_ for _ in ()).throw(OSError("x")))
+    assert hw.get_class_name_of(1) == ""
+
+
+# ─── 取樣點有沒有被別的視窗遮住 ────────────────────────────────────────────
+def test_screen_point_in_window_detects_an_occluding_window(fake):
+    """★這是「畫面取樣點被 Chrome 蓋住」的把關★
+    被蓋住時 WindowFromPoint 回的是別的視窗 → 必須回 False，否則會對著
+    別人的畫面做 OCR/判讀。"""
+    fake([FakeWindow(1, "TForm", rect=(0, 0, 100, 100)),
+          FakeWindow(2, "TPanel", parent=1, rect=(0, 0, 50, 50)),
+          FakeWindow(9, "Chrome_WidgetWin_1", rect=(200, 200, 300, 300))])
+    assert hw.screen_point_in_window(1, 10, 10) is True    # 自己的子孫
+    assert hw.screen_point_in_window(1, 250, 250) is False  # 別人的視窗
+    assert hw.screen_point_in_window(1, 999, 999) is False  # 什麼都沒有
+
+
+def test_screen_point_in_window_returns_false_on_win32_failure(fake,
+                                                               monkeypatch):
+    u = fake([FakeWindow(1, "TForm", rect=(0, 0, 100, 100))])
+
+    class _Boom:
+        argtypes = None
+        restype = None
+
+        def __call__(self, _pt):
+            raise OSError("x")
+    monkeypatch.setattr(type(u), "WindowFromPoint", property(lambda _s: _Boom()))
+    assert hw.screen_point_in_window(1, 10, 10) is False
+
+
+# ─── IME 焦點 ──────────────────────────────────────────────────────────────
+def test_get_ime_focus_prefers_the_focused_control(fake):
+    u = fake([FakeWindow(1, "TForm"), FakeWindow(2, "TEdit", parent=1)])
+    u.foreground, u.focus = 1, 2
+    assert hw.get_ime_focus_hwnd() == 2
+    assert u.attach_calls, "跨 thread 才讀得到 GetFocus"
+
+
+def test_get_ime_focus_falls_back_to_the_foreground_window(fake):
+    u = fake([FakeWindow(1, "TForm")])
+    u.foreground, u.focus = 1, 0
+    assert hw.get_ime_focus_hwnd() == 1
+
+
+# ─── 送訊息 ────────────────────────────────────────────────────────────────
+def test_send_key_posts_down_and_up_n_times(fake, monkeypatch):
+    u = fake([FakeWindow(1, "TEdit")])
+    monkeypatch.setattr(hw.time, "sleep", lambda _s: None)
+    hw.send_key_to_window(1, 0x28, count=3)          # VK_DOWN ×3
+    assert [m for _h, m, _w, _l in u.posted] == [0x0100, 0x0101] * 3
+    assert all(w == 0x28 for _h, _m, w, _l in u.posted)
+
+
+def test_send_message_timeout_reports_failure_separately_from_the_result(fake):
+    """★ok 與 result 要分開★ 逾時的時候 result 沒有意義 ——
+    呼叫端不可以把它當成對方視窗的真實回覆。"""
+    u = fake([FakeWindow(1, "TForm")])
+    u.smto_returns, u.smto_result = 1, 42
+    assert hw.send_message_timeout_ex(1, 0x000E, 0, 0) == (True, 42)
+    u.smto_returns = 0
+    ok, _res = hw.send_message_timeout_ex(1, 0x000E, 0, 0)
+    assert ok is False
+
+
+def test_send_message_timeout_uses_abort_if_hung(fake):
+    """★HWND 卡死的視窗不可以永久阻塞呼叫緒★"""
+    u = fake([FakeWindow(1, "TForm")])
+    hw.send_message_timeout_ex(1, 0x000E, 0, 0, timeout_ms=1500)
+    assert u.sent and u.sent[0][4] == 1500
+    import inspect
+    assert "SMTO_ABORTIFHUNG" in inspect.getsource(hw.send_message_timeout_ex)
+
+
+def test_menu_command_reports_a_failed_post(fake):
+    """★PostMessage 回 0 = Windows 根本沒收★ 回 True 會讓上層以為醫令已下。"""
+    fake([FakeWindow(1, "TForm")], post_returns=0)
+    assert hw.send_yiling_menu_command(1, 219) is False
+
+
+def test_menu_command_posts_wm_command_with_the_menu_id(fake):
+    u = fake([FakeWindow(1, "TForm")])
+    assert hw.send_yiling_menu_command(1, 669) is True
+    assert u.posted == [(1, 0x0111, 669, 0)]
+
+
+def test_menu_command_rejects_a_null_hwnd(fake):
+    fake([])
+    assert hw.send_yiling_menu_command(0, 219) is False
+
+
+def test_close_window_posts_wm_close_and_never_raises(fake, monkeypatch):
+    u = fake([FakeWindow(1, "TForm")])
+    hw.close_window(1)
+    assert u.posted == [(1, 0x0010, 0, 0)]
+    monkeypatch.setattr(u, "PostMessageW",
+                        lambda *_a: (_ for _ in ()).throw(OSError("x")))
+    hw.close_window(1)                    # 不可拋
+
+
+# ─── 點按鈕 ────────────────────────────────────────────────────────────────
+def test_click_button_by_text_finds_then_clicks(fake):
+    u = fake([FakeWindow(1, "TForm"),
+              FakeWindow(2, "TButton", text="全部完成", parent=1,
+                         client=(0, 0, 20, 10))])
+    assert hw.click_button_by_text(1, "全部完成") is True
+    assert [m for _h, m, _w, _l in u.posted] == [0x0201, 0x0202]
+
+
+def test_click_button_by_text_reports_a_missing_button(fake):
+    fake([FakeWindow(1, "TForm")])
+    assert hw.click_button_by_text(1, "不存在") is False
+
+
+def test_click_control_center_is_the_same_as_post_click(fake):
+    u = fake([FakeWindow(1, "TButton", client=(0, 0, 20, 10))])
+    assert hw.click_control_center(1) is True
+    assert len(u.posted) == 2
+
+
+def test_normalized_text_matches_delphi_buttons_with_stray_spaces(fake):
+    """★Delphi 按鈕常見「完  成」這種額外空格★"""
+    fake([FakeWindow(1, "TForm"),
+          FakeWindow(2, "TButton", text="完  成", parent=1,
+                     client=(0, 0, 20, 10))])
+    assert hw.click_button_normalized_text(1, "完成") == 2
+
+
+def test_normalized_text_returns_zero_when_the_click_does_not_go_out(fake):
+    """★[2026-07-26 審查] 找得到按鈕 ≠ 點到了★
+
+    原本回傳值被丟掉：PostMessage 沒送成功（視窗剛被關、佇列滿）時仍回 hwnd，
+    呼叫端 `if _click_button_normalized_text(...)` 就當成「已點」往下走。
+    """
+    fake([FakeWindow(1, "TForm"),
+          FakeWindow(2, "TButton", text="完成", parent=1,
+                     client=(0, 0, 20, 10))],
+         post_returns=0)
+    assert hw.click_button_normalized_text(1, "完成") == 0
+
+
+def test_normalized_text_returns_zero_when_there_is_no_match(fake):
+    fake([FakeWindow(1, "TForm"),
+          FakeWindow(2, "TButton", text="取消", parent=1)])
+    assert hw.click_button_normalized_text(1, "完成") == 0
+
+
+# ─── 前景 / 掃描 ───────────────────────────────────────────────────────────
+def test_ensure_foreground_restores_a_minimised_window_first(fake):
+    u = fake([FakeWindow(1, "TForm")])
+    u.iconic.add(1)
+    hw.ensure_hospital_foreground(1)
+    assert u.shown == [(1, 9)], "最小化時要先 SW_RESTORE"
+    assert u.foreground == 1
+
+
+def test_ensure_foreground_never_raises(fake, monkeypatch):
+    u = fake([FakeWindow(1, "TForm")])
+    monkeypatch.setattr(u, "SetForegroundWindow",
+                        lambda *_a: (_ for _ in ()).throw(OSError("x")))
+    hw.ensure_hospital_foreground(1)      # 不可拋
+
+
+def test_scan_unknown_popups_only_reports_new_large_unknown_windows(fake,
+                                                                    caplog):
+    """★這支的價值在「不吵」★ 已知 class、太小的視窗、已回報過的都不該再報 ——
+    否則 log 被洗掉，真正擋住 F11 的那個就看不到了。"""
+    import logging as _lg
+    fake([FakeWindow(1, "TKnownForm", rect=(0, 0, 400, 300)),
+          FakeWindow(2, "TStrangeDialog", rect=(0, 0, 400, 300)),
+          FakeWindow(3, "TTinyThing", rect=(0, 0, 50, 20)),
+          FakeWindow(4, "THiddenOne", rect=(0, 0, 400, 300), visible=False)])
+    seen = {}
+    with caplog.at_level(_lg.WARNING):
+        hw.scan_unknown_popups({"TKnownForm"}, seen, "F11")
+    assert set(seen) == {2}, "只有『可見、夠大、未知、沒報過』的才算"
+    assert any("TStrangeDialog" in r.getMessage() for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level(_lg.WARNING):
+        hw.scan_unknown_popups({"TKnownForm"}, seen, "F11")
+    assert not caplog.records, "同一個視窗不可以每輪都報一次"
+
+
+def test_scan_unknown_popups_sends_no_cross_process_messages():
+    """★[v42] 對醫院 app 必須是【完全零訊息】★
+    GetWindowText 是跨行程的 WM_GETTEXT —— 當初特地移掉，不可以被加回來。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    # ★docstring 要拿掉再比對★ `ast.unparse` 會把 docstring 原樣印回來，而這支的
+    #   docstring 正好在解釋「GetWindowText 已經移除」—— 直接比對會被自己的說明
+    #   命中（本輪已經踩過好幾次）。
+    tree = ast.parse(textwrap.dedent(inspect.getsource(hw.scan_unknown_popups)))
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if (isinstance(body, list) and body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            body.pop(0)
+    code = ast.unparse(tree)
+    for banned in ("GetWindowText", "SendMessage", "PostMessage"):
+        assert banned not in code, f"{banned} 會對醫院 app 送訊息"
+
+
+def test_scan_unknown_popups_survives_enumeration_failure(fake, monkeypatch):
+    u = fake([FakeWindow(1, "TForm")])
+    monkeypatch.setattr(u, "EnumWindows",
+                        lambda *_a: (_ for _ in ()).throw(OSError("x")))
+    hw.scan_unknown_popups(set(), {}, "F11")   # 不可拋
+
+
+def test_the_selenium_alert_helper_stayed_in_main():
+    """★分層要對★ `_dismiss_status_driver_alert` 是 Selenium（打卡頁的 JS alert），
+    不是 Win32 —— 刻意留在 main.py，不可以因為「它也在那批清單裡」就搬進來。"""
+    assert not hasattr(hw, "dismiss_status_driver_alert")
+    import main
+    assert callable(main._dismiss_status_driver_alert)

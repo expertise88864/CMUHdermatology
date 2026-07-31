@@ -2419,33 +2419,6 @@ def _find_hospital_main_window() -> int:
                              name="find_hospital_main_window")
 
 
-def _send_yiling_menu_command(hwnd: int, menu_id: int) -> bool:
-    """對主程式視窗送 WM_COMMAND 觸發 menu 項目。
-
-    用 PostMessage (非同步)：實測 (2026-05-18 12:43 F9) 用 SendMessage 會卡 11+ 秒
-    沒回應——當 hospital app 處理 WM_COMMAND 開新 modal 視窗時，handler
-    可能 block。Post 不會 hang，主程式有空就會處理。後續用 _wait_for_window
-    poll 視窗出現。
-
-    HIWORD(wParam)=0 表示來源是 menu (不是 accelerator/control)。
-    F3/F4 觸發代碼輸入 (id=219) 用 Send 跑得通，是因為代碼輸入是輕量 UI
-    操作（focus 跳到 grid）；開 modal 同意書視窗 (id=669) 重量級。"""
-    if not hwnd:
-        return False
-    WM_COMMAND = 0x0111
-    try:
-        ok = ctypes.windll.user32.PostMessageW(hwnd, WM_COMMAND, menu_id, 0)
-        if not ok:
-            logging.warning("PostMessageW WM_COMMAND menu_id=%s 失敗 hwnd=%s",
-                            menu_id, hwnd)
-            return False
-        return True
-    except Exception:
-        logging.warning("PostMessageW WM_COMMAND menu_id=%s 例外 hwnd=%s",
-                        menu_id, hwnd, exc_info=True)
-        return False
-
-
 def _his_title_of(hwnd: int) -> str:
     """取 hwnd 視窗標題(逾時保護:HIS GUI 凍結時 GetWindowTextW 會無限阻塞,包
     call_with_timeout 讓熱鍵不被卡死)。取不到回 ""（→ 採樣 None → 裁決 UNKNOWN → 放行）。"""
@@ -2462,19 +2435,6 @@ def _his_title_of(hwnd: int) -> str:
 
     return call_with_timeout(_get, WIN_ENUM_TIMEOUT_SEC, default="",
                              name="his_title_of")
-
-
-def _ensure_hospital_foreground(hwnd: int) -> None:
-    """確保主程式視窗在前景，這樣後續 pyautogui.typewrite 才會打進去。
-    SetForegroundWindow 在 admin 行程通常能成功。"""
-    try:
-        # 若已 minimize 先還原
-        SW_RESTORE = 9
-        if ctypes.windll.user32.IsIconic(hwnd):
-            ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
-        ctypes.windll.user32.SetForegroundWindow(hwnd)
-    except Exception:
-        logging.debug("_ensure_hospital_foreground 失敗", exc_info=True)
 
 
 def _wait_for_code_input_focus(target_hwnd: int, *,
@@ -4073,48 +4033,6 @@ def script_F8_quick_text():
 #   迴圈條件：總時間上限 45s；連續 5s 沒看到任何 popup 視為完成
 # 全程 PostMessage 不動滑鼠；ForegroundProtector 支援使用者切走後背景完成。
 
-def _click_button_normalized_text(parent_hwnd: int, target_text: str) -> int:
-    """找 TButton：把 text 去除「所有」空白後 == 去除空白的 target → PostMessage 點擊。
-    解決 Delphi 按鈕常見「完  成」「確  認」這種額外空格。
-    回傳：點到的 hwnd (失敗 0)。"""
-    target_norm = "".join(target_text.split())
-    out = [0]
-
-    EnumWindowsProc = ctypes.WINFUNCTYPE(
-        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-    @EnumWindowsProc
-    def cb(child, lparam):
-        try:
-            cls_buf = ctypes.create_unicode_buffer(64)
-            ctypes.windll.user32.GetClassNameW(child, cls_buf, 64)
-            if cls_buf.value != "TButton":
-                return True
-            n = ctypes.windll.user32.GetWindowTextLengthW(child)
-            if n <= 0:
-                return True
-            t_buf = ctypes.create_unicode_buffer(n + 1)
-            ctypes.windll.user32.GetWindowTextW(child, t_buf, n + 1)
-            if "".join(t_buf.value.split()) == target_norm:
-                out[0] = child
-                return False
-        except Exception:
-            pass
-        return True
-
-    ctypes.windll.user32.EnumChildWindows(parent_hwnd, cb, 0)
-    if out[0]:
-        # [2026-07-26 審查] _post_click_to_control 的回傳值原本被丟掉 —— 找得到按鈕、
-        # 但 PostMessage 沒送成功(視窗剛被關掉、佇列滿)時仍回傳 hwnd,呼叫端
-        # `if _click_button_normalized_text(...)` 就當成「已點」往下走,實際沒點到。
-        # 送不出去就回 0,讓呼叫端走既有的失敗分支(重試/警告),不假裝成功。
-        if not _post_click_to_control(out[0]):
-            logging.warning("[F11] 找到按鈕 %r(hwnd=%s)但點擊訊息送出失敗",
-                            target_text, out[0])
-            return 0
-    return out[0]
-
-
 def _wait_window_closed(hwnd: int, timeout: float = 5.0) -> bool:
     """等視窗關閉，最多 timeout 秒。回傳 True 表示已關。"""
     end_t = time.time() + timeout
@@ -4493,19 +4411,6 @@ _APPT_GRID_HEADER_SKIP_PX = 24   # 跳過表頭(欄位標題)那一列再取樣
 _APPT_GRID_CONTENT_MIN = 12      # 內容像素 >= 此值 → 視為「有預約列」
 
 
-def _screen_point_in_window(root_hwnd: int, x: int, y: int) -> bool:
-    """螢幕座標 (x,y) 最上層的視窗是否屬於 root_hwnd(本身或子孫)。
-    用於確認畫面取樣點沒被別的視窗(如 Chrome)遮住 —— 遮住時 WindowFromPoint 會回別視窗。"""
-    try:
-        wfp = ctypes.windll.user32.WindowFromPoint
-        wfp.argtypes = [wintypes.POINT]
-        wfp.restype = wintypes.HWND
-        top = wfp(wintypes.POINT(int(x), int(y)))
-    except Exception:
-        return False
-    return _window_is_ancestor(root_hwnd, top)
-
-
 def _referral_grid_has_appointments(dialog_hwnd: int, label: str = "") -> bool:
     """轉診視窗的『本次門診預掛紀錄』(TXStringGrid)有沒有預約列。owner-drawn 讀不到內容,改用畫面
     取樣表頭以下的資料列區:有足夠『深色文字』(資料列黑字)→ True。任何失敗一律回 False → 保守走『轉回
@@ -4755,56 +4660,6 @@ _F11_POPUP_HANDLERS = [
     ("TFTunMsg",        "病人轉診",       _f11_handle_transfer_msg),
     ("TfChkSpecList",   "健保初級照護",   _f11_handle_primary_care_refer),
 ]
-
-
-def _scan_unknown_popups(known_classes: set, seen: dict, label: str) -> None:
-    """[2026-05-22 v41/v42] F11 watcher 期間掃所有 visible top-level windows，
-    若 class 不在已知清單就記下來。
-
-    [v42] 為了不對醫院 app 送任何跨 process 訊息，全程只用 kernel-only API：
-      - IsWindowVisible: kernel-only ✓
-      - GetClassName: kernel-only ✓ (Windows 維護 class atom table)
-      - GetWindowRect: kernel-only ✓
-      - GetWindowText: 跨 process WM_GETTEXT ✗ (移除，title 不取)
-    這樣 unknown scan 對醫院 app 是 **完全零訊息**。
-    User 看到 log 中的 unknown class 後可用 抓取當前視窗結構.cmd 取得詳細資訊。
-    """
-    EnumWindowsProc = ctypes.WINFUNCTYPE(
-        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-    @EnumWindowsProc
-    def cb(hwnd, lparam):
-        try:
-            if not ctypes.windll.user32.IsWindowVisible(hwnd):
-                return True
-            if hwnd in seen:
-                return True
-            cls_buf = ctypes.create_unicode_buffer(64)
-            ctypes.windll.user32.GetClassNameW(hwnd, cls_buf, 64)
-            cls = cls_buf.value
-            if cls in known_classes:
-                return True
-            r = wintypes.RECT()
-            if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r)):
-                return True
-            w, h = r.right - r.left, r.bottom - r.top
-            if w < 100 or h < 40:
-                return True
-            # [v42] 不再 GetWindowText — class + rect 已足夠識別 unknown popup
-            seen[hwnd] = (cls, "", time.time())
-            logging.warning(
-                "[%s][unknown-popup] 偵測到未知 visible 視窗: class='%s' "
-                "hwnd=%s rect=(%dx%d at %d,%d) — 若這擋住 F11 流程，請開 "
-                "抓取當前視窗結構.cmd 拍 snapshot 給開發者",
-                label, cls, hwnd, w, h, r.left, r.top)
-        except Exception:
-            pass
-        return True
-
-    try:
-        ctypes.windll.user32.EnumWindows(cb, 0)
-    except Exception:
-        pass
 
 
 def _popup_identity(hwnd: int) -> tuple:
@@ -5702,14 +5557,6 @@ def _find_療程卡號_edit_hwnd(main_hwnd: int) -> int:
     return card[0]
 
 
-def _close_window(hwnd: int) -> None:
-    try:
-        WM_CLOSE = 0x0010
-        ctypes.windll.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
-    except Exception:
-        logging.debug("[卡號] 關視窗失敗 hwnd=%s", hwnd, exc_info=True)
-
-
 def _read_card_from_ditto_window(ditto_hwnd: int):
     """醫師上次視窗已開:叫到最前 → 找格線 → 螢幕截圖 → OCR → 回 CardResult/None。"""
     import tempfile
@@ -5865,16 +5712,6 @@ def script_F4_adaptive():
 
 # 值與校正沿革在 cmuh_common.his_contract,此處為別名。
 MENU_ID_同意書 = _HIS_CONTRACT.MENU_ID_同意書
-
-
-def _get_window_pid(hwnd: int) -> int:
-    """回傳視窗所屬行程 PID(失敗回 0)。用於「只對 HIS 行程的對話框動作」的把關。"""
-    try:
-        pid = ctypes.c_ulong(0)
-        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        return int(pid.value)
-    except Exception:
-        return 0
 
 
     # [2026-05-25 v15 死碼清除] 移除舊 Python callback 路徑 (~50 行) — 上方
@@ -6062,36 +5899,6 @@ class _ForegroundProtector:
             time.sleep(POLL_SEC)
 
 
-def _get_class_name_of(hwnd: int) -> str:
-    """便捷 wrapper, 取 hwnd 的 class name。"""
-    try:
-        buf = ctypes.create_unicode_buffer(64)
-        ctypes.windll.user32.GetClassNameW(hwnd, buf, 64)
-        return buf.value
-    except Exception:
-        return ""
-
-
-def _click_control_center(hwnd: int) -> bool:
-    """【相容介面】等同 _post_click_to_control(hwnd) — 不動滑鼠，送訊息點擊
-    control 的 client center。原本用 pyautogui.click 會閃動滑鼠，已改成訊息。"""
-    return _post_click_to_control(hwnd)
-
-
-def _click_button_by_text(parent_hwnd: int, text: str) -> bool:
-    """找 TButton text 完全等於 text → 用 PostMessage WM_LBUTTONDOWN/UP 觸發。
-
-    不用 SendMessage BM_CLICK：對開啟 modal popup 的 button，BM_CLICK 是
-    synchronous，會卡在 popup 的 modal message loop 直到 user 關閉。
-    PostMessage 非同步立刻返回，popup 由 Delphi 後續處理，呼叫端用
-    _wait_for_window poll 偵測。
-    （實測 2026-05-18：SendMessage BM_CLICK 在「開立電子」卡了 73 秒）"""
-    btn = _find_descendant_by_class_text(parent_hwnd, "TButton", text)
-    if not btn:
-        return False
-    return _post_click_to_control(btn)
-
-
 # =============================================================================
 # F9/F10 Round 4 — popup 開立電子 + 警告對話框 (是)
 # =============================================================================
@@ -6264,15 +6071,6 @@ def _f9_f10_wait_consent_popup_closed(popup_hwnd: int, *, label: str = "",
     return False
 
 
-def _get_window_text(hwnd: int) -> str:
-    n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-    if n <= 0:
-        return ""
-    buf = ctypes.create_unicode_buffer(n + 1)
-    ctypes.windll.user32.GetWindowTextW(hwnd, buf, n + 1)
-    return buf.value
-
-
 def _find_page_control_by_tab_set(or_hwnd: int, expected_tabs: list) -> int:
     """找 TPageControl 的直系 TTabSheet text 集合『包含』所有 expected_tabs
     的那個。視窗裡可能有很多 nested PageControl（snapshot 顯示 29 個），
@@ -6320,22 +6118,6 @@ def _send_message_timeout(hwnd: int, msg: int, wparam: int, lparam: int,
     且與螢幕解析度無關）。用 c_size_t 對「有設/沒設 argtypes」兩種情況都正確。"""
     return _send_message_timeout_ex(hwnd, msg, wparam, lparam,
                                     timeout_ms=timeout_ms)[1]
-
-
-def _send_message_timeout_ex(hwnd: int, msg: int, wparam: int, lparam: int,
-                             timeout_ms: int = 2000):
-    """同 _send_message_timeout,但回 (ok, result)。ok=False 代表逾時/失敗 ——
-    此時 result 沒有意義(呼叫端不可把它當成對方視窗的真實回覆)。"""
-    result = ctypes.c_size_t(0)
-    SMTO_ABORTIFHUNG = 0x0002
-    SendMessageTimeoutW = ctypes.windll.user32.SendMessageTimeoutW
-    ret = SendMessageTimeoutW(hwnd, msg, wparam, lparam,
-                                SMTO_ABORTIFHUNG, timeout_ms,
-                                ctypes.byref(result))
-    if ret == 0:
-        logging.debug("SendMessageTimeout 失敗或超時 hwnd=%s msg=0x%X", hwnd, msg)
-        return False, result.value
-    return True, result.value
 
 
 # Kernel32 argtypes 顯式設定 — 64-bit Python ctypes 預設把指標當 c_int (4 bytes)
@@ -6695,18 +6477,6 @@ def _click_radio_by_text(parent_hwnd: int, text_keyword: str) -> bool:
 #     │   ├── TButton "帶回" ← 確認選擇 + 關閉 popup
 #     │   └── TButton "離開"
 #     └── TPageControl → TTabSheet → TStringAlignGrid ← phrase 列表
-
-
-def _send_key_to_window(hwnd: int, vk: int, count: int = 1,
-                         interval: float = 0.05) -> None:
-    """對指定 hwnd 送 N 次 VK 鍵 (WM_KEYDOWN + WM_KEYUP)。用 PostMessage
-    非同步，不需要 foreground，也不會被 IME 攔截。"""
-    WM_KEYDOWN = 0x0100
-    WM_KEYUP = 0x0101
-    for _ in range(count):
-        ctypes.windll.user32.PostMessageW(hwnd, WM_KEYDOWN, vk, 0)
-        ctypes.windll.user32.PostMessageW(hwnd, WM_KEYUP, vk, 0)
-        time.sleep(interval)
 
 
 def _select_phrase_and_return(片語_btn_hwnd: int, row_idx: int,
@@ -7192,19 +6962,6 @@ def script_F10_adaptive():
     logging.info("F10 (adaptive): %s", "R1-R4 done" if ok else "中斷")
     return bool(ok)
 
-
-def _get_ime_focus_hwnd():
-    """取得前景應用程式真正有焦點的控制項 handle（需 AttachThreadInput）。"""
-    try:
-        hwnd_fg  = ctypes.windll.user32.GetForegroundWindow()
-        fore_tid = ctypes.windll.user32.GetWindowThreadProcessId(hwnd_fg, None)
-        cur_tid  = ctypes.windll.kernel32.GetCurrentThreadId()
-        ctypes.windll.user32.AttachThreadInput(cur_tid, fore_tid, True)
-        hwnd_focus = ctypes.windll.user32.GetFocus()
-        ctypes.windll.user32.AttachThreadInput(cur_tid, fore_tid, False)
-        return hwnd_focus if hwnd_focus else hwnd_fg
-    except Exception:
-        return ctypes.windll.user32.GetForegroundWindow()
 
 def _ime_close() -> bool:
     """關閉前景視窗的中文輸入法，回傳原本是否開啟（供還原用）。"""
@@ -8932,6 +8689,23 @@ from cmuh_common.reg64_utils import _reg64_tc_to_session_cn  # noqa: E402
 # ★沿用舊的私有名稱★：main.py 內部有 100+ 個呼叫點、tests/ 有多支直接用
 #   `main._find_window_by_class_title` 這種名字。這一刀【只搬家、不改呼叫端】。
 from cmuh_common.his_window import (
+    # ── P2-06 第二刀（2026-07-31）：剩下的 Win32 葉子，14 個 / 216 行。
+    #   `_dismiss_status_driver_alert` 刻意留在 main.py —— 那是 Selenium
+    #   （打卡頁的 JS alert），放進 his_window 會是錯的分層。
+    get_window_pid as _get_window_pid,
+    get_class_name_of as _get_class_name_of,
+    get_window_text as _get_window_text,
+    screen_point_in_window as _screen_point_in_window,
+    get_ime_focus_hwnd as _get_ime_focus_hwnd,
+    send_key_to_window as _send_key_to_window,
+    send_message_timeout_ex as _send_message_timeout_ex,
+    send_yiling_menu_command as _send_yiling_menu_command,
+    close_window as _close_window,
+    click_control_center as _click_control_center,
+    click_button_by_text as _click_button_by_text,
+    click_button_normalized_text as _click_button_normalized_text,
+    ensure_hospital_foreground as _ensure_hospital_foreground,
+    scan_unknown_popups as _scan_unknown_popups,
     find_window_by_class_title as _find_window_by_class_title,
     collect_windows_by_class as _collect_windows_by_class,
     enum_class_in_window as _enum_class_in_window,
@@ -8939,7 +8713,8 @@ from cmuh_common.his_window import (
     find_descendants_by_exact_text as _find_descendants_by_exact_text,
     find_descendant_by_class_text as _find_descendant_by_class_text,
     find_first_descendant_by_class as _find_first_descendant_by_class,
-    window_is_ancestor as _window_is_ancestor,
+    # window_is_ancestor 第二刀後不再匯入：main.py 裡唯一的呼叫端
+    # （_screen_point_in_window）也搬進 his_window 了，那個呼叫變成模組內部的。
     post_click_to_control as _post_click_to_control,
     send_enter_to_window as _send_enter_to_window,
     send_chars_to_window as _send_chars_to_window,

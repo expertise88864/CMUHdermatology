@@ -89,10 +89,13 @@ def test_no_paste_when_backspace_failed():
 # ── F11 按鈕點擊:送不出去不可回報成功 ───────────────────────────────────────
 def test_click_helper_returns_zero_when_post_failed():
     import main
+    # [2026-07-31 P2-06 第二刀] 這個函式已搬到 cmuh_common/his_window.py，
+    # 呼叫的也從 `_post_click_to_control` 變成模組內的 `post_click_to_control`。
+    # 守的性質沒變：PostMessage 的回傳值不可丟掉。
     code = _code_only(inspect.getsource(main._click_button_normalized_text))
-    assert "if not _post_click_to_control(out[0]):" in code, \
+    assert "if not post_click_to_control(out[0]):" in code, \
         "PostMessage 的回傳值不可丟掉"
-    i = code.index("if not _post_click_to_control(out[0]):")
+    i = code.index("if not post_click_to_control(out[0]):")
     assert "return 0" in code[i:i + 300], "送不出去要回 0,讓呼叫端走失敗分支"
 
 

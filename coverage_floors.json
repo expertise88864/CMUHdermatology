@@ -3,7 +3,7 @@
   "//1": "設在【目前值減 1 個百分點】：這是防退步的欄杆，不是追求的目標。",
   "//2": "shared = cmuh_common/(含 roster);entrypoints = main/consult_query/autoclock/…",
   "//3": "覆蓋率提升之後請跑 --update 把欄杆跟著提上來,否則漲上去的可以被無聲吃回去。",
-  "shared": 73.2,
-  "entrypoints": 22.5,
-  "total": 48.9
+  "shared": 73.4,
+  "entrypoints": 22.9,
+  "total": 49.6
 }
