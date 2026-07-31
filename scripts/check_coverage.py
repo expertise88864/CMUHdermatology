@@ -39,6 +39,16 @@ def _make_stdout_robust() -> None:
 _make_stdout_robust()
 
 
+def annotate(title: str, body: str) -> None:
+    """在 GitHub Actions 上輸出 annotation（理由見 scripts/check_skips.py 的同名函式：
+    job log 要 repo admin 才下載得到，annotation 走 check-runs API 是公開可讀的）。"""
+    if not os.environ.get("GITHUB_ACTIONS"):
+        return
+    esc = (str(body).replace("%", "%25")
+           .replace("\r", "%0D").replace("\n", "%0A"))
+    print(f"::error title={title}::{esc}")
+
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FLOORS_FILE = os.path.join(REPO_ROOT, "coverage_floors.json")
 
@@ -71,8 +81,18 @@ def main(argv: list) -> int:
                     help="把目前的百分比寫回門檻（覆蓋率提升之後用）")
     args = ap.parse_args(argv)
 
-    with open(args.coverage_json, encoding="utf-8") as fh:
-        cov = json.load(fh)
+    # ★[2026-07-31] 這一步現在帶 `if: always()`★ 前面的 pytest 若紅了，cov.json
+    #   可能根本不存在。讀不到要說清楚是「沒跑成」，不是覆蓋率退步 —— 但一樣算失敗
+    #   （讀不到不等於沒問題）。
+    try:
+        with open(args.coverage_json, encoding="utf-8") as fh:
+            cov = json.load(fh)
+    except (OSError, json.JSONDecodeError) as e:
+        msg = (f"讀不到/解析不了覆蓋率報告 {args.coverage_json}：{e}\n"
+               "（pytest 沒跑完就不會有這個檔）★讀不到不等於沒問題★，視為失敗。")
+        print(f"[coverage] {msg}")
+        annotate("覆蓋率門檻：報告讀不到", msg)
+        return 1
     with open(FLOORS_FILE, encoding="utf-8") as fh:
         raw = json.load(fh)
     floors = {k: v for k, v in raw.items() if not k.startswith("//")}
@@ -113,6 +133,7 @@ def main(argv: list) -> int:
             print(f"  {line}")
         print("  補上對應的測試，或（若確有正當理由）跑 "
               "`python scripts/check_coverage.py <json> --update` 並在 PR 說明原因。")
+        annotate("覆蓋率門檻不通過", "\n".join(failed))
         return 1
     print("\n[coverage] 各層都在門檻之上。")
     return 0

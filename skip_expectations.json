@@ -1,0 +1,18 @@
+{
+  "_readme": [
+    "被 skip 的測試不會讓套件變紅，所以每一個 skip 都必須在這裡事先宣告。",
+    "沒宣告過的 skip 理由一律讓 CI 紅（不管數量多少）；宣告過的超出 max 也紅。",
+    "★不要只把 max 調大★ —— 要寫清楚 why：為什麼這是環境造成的，而不是一批測試被關掉。",
+    "max 是上限不是預期值：本機會 skip、CI 不會 skip 的條目，在 CI 上算 0 也通過。",
+    "由 scripts/check_skips.py 讀取（ci.yml 的『skip 數量守衛』步驟）。"
+  ],
+  "expected": [
+    {
+      "id": "dirty-worktree",
+      "reason_contains": "工作區有未提交變更",
+      "nodeid_contains": "test_push_helper_antirevert",
+      "max": 2,
+      "why": "這兩支比對 git index 與工作目錄的 blob id，工作區有未提交變更時兩者本來就不同，斷言不成立。開發中在本機跑會 skip；CI 的 checkout 永遠乾淨，所以 CI 上是 0。"
+    }
+  ]
+}

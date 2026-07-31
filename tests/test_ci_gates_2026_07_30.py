@@ -139,17 +139,139 @@ def test_skip_guard_counts_skips_from_junit(tmp_path):
     assert rows[0][1] == "why0"
 
 
-def test_skip_guard_passes_at_the_baseline(tmp_path):
-    cp = _run("check_skips.py", _junit(tmp_path, 2))
-    assert cp.returncode == 0, cp.stdout
+def _expectations(tmp_path, entries):
+    p = tmp_path / "skip_expectations.json"
+    p.write_text(json.dumps({"expected": entries}, ensure_ascii=False),
+                 encoding="utf-8")
+    return str(p)
 
 
-def test_skip_guard_fails_when_skips_grow(tmp_path):
+def _junit_with_reasons(tmp_path, reasons, classname="t"):
+    cases = "".join(
+        f'<testcase classname="{classname}" name="t{i}">'
+        f'<skipped message="{why}"/></testcase>'
+        for i, why in enumerate(reasons))
+    xml = (f'<?xml version="1.0"?><testsuites><testsuite name="pytest">'
+           f'<testcase classname="{classname}" name="ok"/>{cases}'
+           f'</testsuite></testsuites>')
+    p = tmp_path / "junit.xml"
+    p.write_text(xml, encoding="utf-8")
+    return str(p)
+
+
+def _guard(monkeypatch, tmp_path, reasons, entries, classname="t"):
+    """就地跑守衛（不開子行程，才能換掉宣告檔路徑）→ (returncode, stdout)。"""
+    monkeypatch.setattr(check_skips, "EXPECTATIONS_PATH",
+                        _expectations(tmp_path, entries))
+    junit = _junit_with_reasons(tmp_path, reasons, classname)
+    import io as _io
+    import contextlib
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = check_skips.main([junit])
+    return rc, buf.getvalue()
+
+
+_OK_ENTRY = {"id": "dirty", "reason_contains": "工作區有未提交變更",
+             "max": 2, "why": "本機開發中才會發生，CI 的 checkout 永遠乾淨"}
+
+
+def test_an_undeclared_skip_reason_fails_even_though_it_is_only_one(
+        monkeypatch, tmp_path):
+    """★這次改版的核心★
+
+    舊版是一個數字上限。那個數字漏算了一支平台條件 skip，CI 因此連紅四輪；
+    而紅燈時最順手的反應是「把數字調大」—— 一調大，「42 支被靜默關掉」也一起
+    放行了。現在判準改成「這個 skip 理由有沒有被宣告過」，數量多寡不是重點。
+    """
+    rc, out = _guard(monkeypatch, tmp_path, ["某個沒人宣告過的理由"], [_OK_ENTRY])
+    assert rc == 1
+    assert "未宣告" in out
+
+
+def test_a_declared_skip_passes_within_its_cap(monkeypatch, tmp_path):
+    rc, out = _guard(monkeypatch, tmp_path,
+                     ["工作區有未提交變更,index 與工作目錄本來就會不同"] * 2,
+                     [_OK_ENTRY])
+    assert rc == 0, out
+
+
+def test_a_declared_skip_fails_when_it_grows_past_its_cap(
+        monkeypatch, tmp_path):
     """★這條守的是「多加一個 Tk 測試檔就讓別檔 42 支全變 skip」★
-    那次全套仍是綠燈，而且順序一換受害者就換人。"""
-    cp = _run("check_skips.py", _junit(tmp_path, 3))
-    assert cp.returncode == 1
-    assert "超過上限" in cp.stdout
+    那次全套仍是綠燈，而且順序一換受害者就換人。理由對得上也不能無限多。"""
+    rc, out = _guard(monkeypatch, tmp_path,
+                     ["工作區有未提交變更"] * 3, [_OK_ENTRY])
+    assert rc == 1
+    assert "變多了" in out
+
+
+def test_the_nodeid_constraint_keeps_a_reason_from_covering_other_files(
+        monkeypatch, tmp_path):
+    """理由字串相同但出現在別的測試檔 → 不算被宣告過。
+
+    否則一句常見的理由（「未安裝」之類）會變成一張跨檔案的萬用通行證。
+    """
+    entry = dict(_OK_ENTRY, nodeid_contains="test_push_helper_antirevert")
+    rc, _ = _guard(monkeypatch, tmp_path, ["工作區有未提交變更"], [entry],
+                   classname="tests.test_push_helper_antirevert")
+    assert rc == 0
+    rc2, out2 = _guard(monkeypatch, tmp_path, ["工作區有未提交變更"], [entry],
+                       classname="tests.test_something_else")
+    assert rc2 == 1, out2
+
+
+def test_the_guard_fails_when_the_expectations_file_is_missing(
+        monkeypatch, tmp_path):
+    """★守衛自己失效＝失敗★
+
+    「檔案不見了」跟「沒有任何預期 skip」在磁碟上長得一樣，意義卻相反 ——
+    前者代表這道關卡失去了判準，不可以當成後者放行。
+    """
+    monkeypatch.setattr(check_skips, "EXPECTATIONS_PATH",
+                        str(tmp_path / "nope.json"))
+    import io as _io
+    import contextlib
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = check_skips.main([_junit_with_reasons(tmp_path, [])])
+    assert rc == 1
+    assert "沒有宣告檔就沒有判準" in buf.getvalue()
+
+
+def test_an_expectation_without_a_why_is_rejected(monkeypatch, tmp_path):
+    """沒寫理由的白名單條目＝小型的「把數字調大」。"""
+    rc, out = _guard(monkeypatch, tmp_path, [],
+                     [{"id": "x", "reason_contains": "隨便", "max": 1}])
+    assert rc == 1
+    assert "宣告檔" in out
+
+
+def test_the_repo_expectations_file_is_usable():
+    """repo 裡那份宣告檔本身要能解析，而且每條都有理由。"""
+    entries = check_skips.load_expectations()
+    assert entries, "至少要有一條（本機髒工作區的兩支）"
+    for e in entries:
+        assert e["why"].strip()
+        assert e["max"] >= 0
+
+
+def test_it_emits_a_github_annotation_so_the_failure_is_readable(
+        monkeypatch, tmp_path):
+    """★可觀測性★ job log 要 repo admin 才下載得到，annotation 走 check-runs API
+    是公開可讀的。這道關卡紅了四輪都看不出是哪幾支被 skip —— 關卡說不清楚自己
+    為什麼紅，跟沒有關卡差不了多少。"""
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    rc, out = _guard(monkeypatch, tmp_path, ["沒宣告過的理由"], [_OK_ENTRY])
+    assert rc == 1
+    assert "::error title=" in out
+    assert "%0A" in out, "多行訊息要轉義，否則 annotation 只會留下第一行"
+
+
+def test_no_annotation_noise_outside_github_actions(monkeypatch, tmp_path):
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    _rc, out = _guard(monkeypatch, tmp_path, ["沒宣告過的理由"], [_OK_ENTRY])
+    assert "::error" not in out
 
 
 def test_skip_guard_fails_when_it_cannot_read_the_report(tmp_path):
@@ -328,12 +450,34 @@ def test_production_transitives_are_not_labelled_dev_only():
         assert pkg not in dev_only, f"{pkg} 是 production transitive，不可標成 dev-only"
 
 
-def test_ci_expects_zero_skips():
-    """★P2：CI 工作區永遠乾淨，預期就是 0★
-    沿用本機的寬度 2 的話，CI 上真的有兩支被靜默關掉也不會紅。"""
+def test_ci_does_not_gate_skips_on_a_magic_number():
+    """★[2026-07-31] 舊版在 ci.yml 設 `CMUH_MAX_SKIPPED: "0"`★
+
+    那個 0 是推理出來的、不是量出來的（漏看了一支平台條件 skip），CI 從加上這道
+    關卡起連紅四輪。判準現在寫在 skip_expectations.json，ci.yml 不該再有數字。
+    """
     text = io.open(os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml"),
                    encoding="utf-8").read()
-    assert 'CMUH_MAX_SKIPPED: "0"' in text
+    body = "\n".join(ln for ln in text.splitlines()
+                     if not ln.lstrip().startswith("#"))
+    assert "CMUH_MAX_SKIPPED" not in body
+    assert os.path.exists(os.path.join(REPO_ROOT, "skip_expectations.json"))
+
+
+def test_every_ratchet_reports_even_when_an_earlier_one_is_red():
+    """★一輪要拿到全部棘輪的結果★
+
+    沒有 always() 時，skip 守衛一紅就整串跳過 —— 覆蓋率門檻與型別債棘輪因此
+    【從來沒有在 CI 上執行過】（2026-07-31 查 run 293-296 才發現）。修一道關卡
+    就要再等一趟 CI 才知道下一道過不過。
+    """
+    text = io.open(os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml"),
+                   encoding="utf-8").read()
+    for step in ("check_skips.py", "check_coverage.py", "type_debt.py"):
+        i = text.index(step)
+        # 往前找這一步的 `- name:`，確認區塊裡有 always()
+        block = text[text.rindex("- name:", 0, i):i]
+        assert "if: always()" in block, f"{step} 那一步少了 if: always()"
 
 
 def test_the_audit_wrapper_refuses_an_incomplete_scan():

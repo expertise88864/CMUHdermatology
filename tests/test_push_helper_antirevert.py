@@ -165,21 +165,35 @@ def test_crlf_file_would_break_a_naive_sha256():
     (Path.write_text 在 Windows 把 \n 轉成 CRLF)→ 自行 sha256(原始 bytes)
     與 index 裡的 blob 必然對不上 → 【每一次推送都誤報】。
 
-    ★CI 跑在 Linux,checkout 出來是 LF —— 前提不成立時要 skip,不是失敗★
-    (我第一版把「磁碟上是 CRLF」寫成無條件斷言,CI 一跑就紅。)
+    ★[2026-07-31] 改成不看磁碟,永遠會跑★
+    舊版要求磁碟上的 version.py 真的是 CRLF,否則 skip。但 .gitattributes 明訂
+    `*.py text eol=lf`,CI 的全新 checkout 一定是 LF —— 於是這支在 CI 上【永遠】
+    skip,這個失效情境從來沒有在 CI 上被驗證過。而且它就是讓 skip 守衛連紅四輪的
+    那一支(2026-07-31 去查 CI 才發現)。
+    「磁碟上剛好是什麼行尾」本來就不該是測試的前提:用 `git hash-object --path`
+    指定屬性查詢用的路徑,就能在【任何平台】上餵 CRLF 進去問 git「你會算成什麼」。
     """
+    import hashlib
+    import subprocess as _sp
+
     ph = _load()
     rel = "src/cmuh_common/version.py"
-    raw = (ph.REPO_ROOT / rel).read_bytes()
-    if b"\r\n" not in raw:
-        pytest.skip("本平台 checkout 是 LF(Linux/CI)→ 這個失效情境不會發生")
-    lf = raw.replace(b"\r\n", b"\n")
-    import hashlib
-    assert hashlib.sha256(raw).hexdigest() != hashlib.sha256(lf).hexdigest(), \
+    crlf = b'CURRENT_VERSION = "2026.07.31.0"\r\n'
+    lf = crlf.replace(b"\r\n", b"\n")
+
+    assert hashlib.sha256(crlf).hexdigest() != hashlib.sha256(lf).hexdigest(), \
         "CRLF 與 LF 的 sha256 不同 —— 這正是自算會對不上 index 的原因"
-    ids = ph.worktree_blob_ids(include_version=True)
-    idx = ph.index_blob_ids()
-    assert ids[rel] == idx[rel], "讓 git 自己算就不受影響"
+
+    def _blob(data: bytes) -> str:
+        # --path 只用來查 .gitattributes,檔案不必真的存在 → 不必污染工作區
+        cp = _sp.run(["git", "hash-object", "--path", rel, "--stdin"],
+                     cwd=ph.REPO_ROOT, input=data, capture_output=True)
+        assert cp.returncode == 0, cp.stderr.decode("utf-8", "replace")
+        return cp.stdout.decode().strip()
+
+    assert _blob(crlf) == _blob(lf), (
+        "讓 git 自己算就不受行尾影響 —— 若這裡不相等,代表 .gitattributes 沒有把 "
+        f"{rel} 當文字檔正規化,push_helper 的反還原檢查會在 Windows 上每次誤報")
 
 
 def test_version_consistency_guard_rejects_mismatch(capsys):

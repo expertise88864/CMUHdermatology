@@ -62,20 +62,26 @@ jobs:
       - name: skip 數量守衛
         # always()：測試紅燈時更要知道是不是「一批測試被靜默關掉」造成的
         if: always()
-        env:
-          # ★[2026-07-30 外審第 1 輪] CI 上預期是【零】★
-          #   預設上限 2 是給本機用的（test_push_helper_antirevert 有兩支在工作區
-          #   有未提交變更時會 skip）。CI 的工作區永遠是乾淨的，所以不能
-          #   沿用那個寬度 —— 不然 CI 上真的有兩支被靜默關掉也不會紅。
-          CMUH_MAX_SKIPPED: "0"
+        # ★[2026-07-31] 拿掉 CMUH_MAX_SKIPPED★
+        #   舊版在這裡設 "0"，而那個 0 是【推理】出來的、不是量出來的：只想到
+        #   test_push_helper_antirevert 有兩支在髒工作區才 skip、CI 永遠乾淨，
+        #   卻漏看同檔還有一支是平台條件 skip（.gitattributes eol=lf → CI 的
+        #   checkout 是 LF）。結果這道關卡從加上去那一次起連紅四輪，
+        #   ★連帶讓它後面的兩道棘輪從來沒有在 CI 上跑過★。
+        #   現在判準寫在 skip_expectations.json：每個 skip 都要事先宣告理由。
         run: python scripts/check_skips.py junit.xml
 
       # 分層設門檻：全域 49% 幾乎完全由 main.py（10,322 行、16%）主導，
       # 用全域門檻的話共用層掉 10 個百分點也照樣綠燈。
       - name: 分層覆蓋率門檻 (coverage_floors.json)
+        # ★always()：一輪要拿到【全部】棘輪的結果★
+        #   沒有 always() 時，前一步一紅就整串跳過 —— 於是「修好 skip 守衛」與
+        #   「發現覆蓋率也不過」變成兩趟 CI。這兩道棘輪本來就互相獨立。
+        if: always()
         run: python scripts/check_coverage.py cov.json
 
       # pyright strict 實測在最乾淨的六個模組上就有 481 個錯 —— 全開只會得到一個
       # 永遠紅燈因而被忽略的關卡。改成：被關掉的規則各記一個基線，數字變大就紅。
       - name: 型別債棘輪 (type_debt_baseline.json)
+        if: always()
         run: python scripts/type_debt.py

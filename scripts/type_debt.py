@@ -52,6 +52,16 @@ def _make_stdout_robust() -> None:
 _make_stdout_robust()
 
 
+def annotate(title: str, body: str) -> None:
+    """在 GitHub Actions 上輸出 annotation（理由見 scripts/check_skips.py 的同名函式：
+    job log 要 repo admin 才下載得到，annotation 走 check-runs API 是公開可讀的）。"""
+    if not os.environ.get("GITHUB_ACTIONS"):
+        return
+    esc = (str(body).replace("%", "%25")
+           .replace("\r", "%0D").replace("\n", "%0A"))
+    print(f"::error title={title}::{esc}")
+
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE_FILE = os.path.join(REPO_ROOT, "type_debt_baseline.json")
 TEMP_CONFIG = os.path.join(REPO_ROOT, ".pyright_type_debt.json")
@@ -231,6 +241,7 @@ def main(argv: list) -> int:
     current = {rule: _rule_diagnostics(rule) for rule in sorted(baseline)}
 
     any_added = any_gone = False
+    added_detail = []
     for rule in sorted(current):
         added, gone = diff_counts(baseline[rule], current[rule])
         n_now = sum(current[rule].values())
@@ -239,6 +250,7 @@ def main(argv: list) -> int:
         print(f"{mark}{rule:32} {n_now:4}  (基線 {n_was})")
         for fp, k in sorted(added.items()):
             print(f"      + {k}x {fp}")
+            added_detail.append((fp, k))
             any_added = True
         for fp, k in sorted(gone.items()):
             print(f"      - {k}x {fp}")
@@ -258,6 +270,8 @@ def main(argv: list) -> int:
         print("\n[type-debt] ★新增了型別債★（上面 `+` 的那幾筆）")
         print("  修掉它們，或（若確有正當理由）跑 "
               "`python scripts/type_debt.py --update` 並在 PR 說明原因。")
+        annotate("型別債棘輪：新增了型別債",
+                 "\n".join(f"+{k}x {fp}" for fp, k in added_detail))
         return 1
     if any_gone:
         print("\n[type-debt] 有型別債被修掉了 —— 請跑 "
