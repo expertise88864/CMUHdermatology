@@ -2707,3 +2707,11 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         # (那是另一行、本來就該更新),但必須讓醫師知道那一段【沒有】被自動處理。
         decrease_note=excimer_decrease,
     )
+
+
+def format_dose_and_count(dose, count) -> str:
+    """[P2-06 第三刀 2026-07-31 從 main.py 搬入] 給醫師看的「劑量/次數」描述。
+    None 有各自的說法：劑量不明是 "?"，次數不明要明講「未寫次數」。"""
+    d = "?" if dose is None else str(dose)
+    c = "（未寫次數）" if count is None else str(count)
+    return f"劑量 {d}、次數 {c}"

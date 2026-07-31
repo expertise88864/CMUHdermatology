@@ -1179,7 +1179,13 @@ def test_morning_polling_and_residual_closed_guard_wired():
     run_update 邏輯難以純單元測,以原始碼守門避免被改掉。"""
     src = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
     # Problem 1:07:00–00:00 一律 45-75 秒隨機輪詢
-    assert "random.randint(45, 75)" in src
+    # [2026-07-31 P2-06 第三刀] 這段搬到 cmuh_common/refresh_policy.py 了 ——
+    # 改成【問行為】而不是比對 main.py 的字面，區間本身也才真的被驗到。
+    from cmuh_common.refresh_policy import clinic_refresh_seconds
+    assert all(45 <= clinic_refresh_seconds(h) <= 75 for h in range(7, 24)
+               for _ in range(20))
+    assert all(180 <= clinic_refresh_seconds(h) <= 300 for h in range(0, 7)
+               for _ in range(20))
     # Problem 2a:跨日重置(記憶體 tracker 清掉昨天的關診/活動殘留)
     assert "is_new_day" in src and "tracker['date'] = today_str" in src
     # Problem 2b:殘留盤面防呆(純函式判定),且必須在 tracker 統計被本輪 data 污染【之前】就蓋 pending

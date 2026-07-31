@@ -145,3 +145,13 @@ class DailyOnce:
     def reset(self) -> None:
         with self._lock:
             self._seen.clear()
+
+
+# ── 保留期過濾（P2-06 第三刀 2026-07-31 從 main.py 搬入）────────────────────
+def filter_recent_alert_sent(data, cutoff: str) -> dict:
+    """保留 value(ISO 日期字串)>= cutoff 的項目;非 dict / 非字串鍵值一律剔除。
+    ISO 日期零補位 → 可直接字典序比較。純函式以便測試。"""
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items()
+            if isinstance(k, str) and isinstance(v, str) and v >= cutoff}

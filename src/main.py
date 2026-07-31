@@ -126,6 +126,32 @@ from cmuh_common.audit_events import (
     Redacted as _EvRedacted,
     Transition as _EvTransition,
 )
+# [P2-06 分層第三刀 2026-07-31] 11 個純函式搬回【已經擁有那個概念的模組】。
+#   不開雜物檔：分層的意義是「東西在該在的地方」，不是「main.py 變短」。
+#   照樣只搬家、不改呼叫端（沿用舊的私有名）。
+from cmuh_common.alert_dedupe import (
+    filter_recent_alert_sent as _filter_recent_alert_sent,
+)
+from cmuh_common.appt_utils import (
+    build_east_weekday_index as _build_east_weekday_index,
+    east_index_has_other as _east_index_has_other,
+    reg52_docno_for_dayoff_table as _reg52_docno_for_dayoff_table,
+    split_schbox_by_date as _split_schbox_by_date,
+)
+from cmuh_common.his_window import (
+    get_window_text_with_timeout as _his_title_of,
+)
+from cmuh_common.platform_win import (
+    tick_delta as _tick_delta,
+)
+from cmuh_common.refresh_policy import (
+    clinic_refresh_seconds as _clinic_refresh_seconds,
+    reg64_micro_ttl_seconds as _reg64_micro_ttl_seconds,
+)
+from cmuh_common.uvb_dose import (
+    format_dose_and_count as _fmt_uvb_dc,
+)
+from cmuh_common.retention import default_rules as _retention_default_rules
 from cmuh_common.action_ledger import (
     LEDGER_FILENAME as _LEDGER_FILENAME,
     OUTCOME_FAILED as _LEDGER_FAILED,
@@ -263,6 +289,16 @@ class HotkeyModules:
 
 hotkey_modules = HotkeyModules()
 
+
+
+
+def _retention_rules() -> list:
+    """[P2-06 第三刀] 內容搬到 `cmuh_common.retention.default_rules`。
+
+    那邊改成【收 settings_dir】—— 三個 rule builder 本來就都收路徑，這樣才一致，
+    也才測得到（不必去 monkeypatch 設定目錄）。這裡只負責補上本機的設定目錄。
+    """
+    return _retention_default_rules(get_settings_dir())
 
 def safe_unhook_all_hotkeys():
     try:
@@ -1653,19 +1689,6 @@ _MISMATCH_ALERTS = _AlertDeduper("audit-mismatch")
 #   `.corrupt-*` 因此不在本清單內，歸 cache_cleanup 管。
 
 
-def _retention_rules() -> list:
-    """本機要定期清掃的落地檔。目錄不存在的規則會被 sweep 靜默跳過。"""
-    from cmuh_common.retention import (
-        consult_shot_rule, debug_dump_rule, settings_backup_rule,
-    )
-    settings = get_settings_dir()
-    return [
-        debug_dump_rule(os.path.join(settings, "debug_dumps")),
-        consult_shot_rule(os.path.join(settings, "consult_shots")),
-        settings_backup_rule(settings),
-    ]
-
-
 def _sweep_restart_err_files() -> int:
     """早夭子行程的 stderr 檔。`sweep_old_restart_err_files` 本來就有 TTL
     (RESTART_ERR_KEEP_SEC = 1 天),只是原本沒有任何人定期叫它。"""
@@ -2419,24 +2442,6 @@ def _find_hospital_main_window() -> int:
                              name="find_hospital_main_window")
 
 
-def _his_title_of(hwnd: int) -> str:
-    """取 hwnd 視窗標題(逾時保護:HIS GUI 凍結時 GetWindowTextW 會無限阻塞,包
-    call_with_timeout 讓熱鍵不被卡死)。取不到回 ""（→ 採樣 None → 裁決 UNKNOWN → 放行）。"""
-    if not hwnd:
-        return ""
-
-    def _get() -> str:
-        n = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-        if n <= 0:
-            return ""
-        buf = ctypes.create_unicode_buffer(n + 1)
-        ctypes.windll.user32.GetWindowTextW(hwnd, buf, n + 1)
-        return buf.value or ""
-
-    return call_with_timeout(_get, WIN_ENUM_TIMEOUT_SEC, default="",
-                             name="his_title_of")
-
-
 def _wait_for_code_input_focus(target_hwnd: int, *,
                                previous_focus: int = 0,
                                timeout: float = 0.6,
@@ -2948,12 +2953,6 @@ def _record_uvb_write(label, old_dose, old_count, new_dose, new_count,
         "new_dose": new_dose, "new_count": new_count,
         "extra_lines": extra_lines,
     }
-
-
-def _fmt_uvb_dc(dose, count) -> str:
-    d = "?" if dose is None else str(dose)
-    c = "（未寫次數）" if count is None else str(count)
-    return f"劑量 {d}、次數 {c}"
 
 
 def _show_light_code_incomplete_warning(label: str, set_療程: int,
@@ -7043,14 +7042,6 @@ def _safe_parse_roc_date(roc_date_str):
     year_part, month_part, day_part = match.groups()
     return datetime(int(year_part) + 1911, int(month_part), int(day_part)).date()
 
-def _reg52_docno_for_dayoff_table(doc_no):
-    """reg52.cgi 的 table#dayoff 僅出現在 DocNo=D12345；純數字 DocNo 回傳的 HTML 不含休診表。"""
-    s = str(doc_no).strip()
-    if s.upper().startswith("D"):
-        return s
-    return f"D{s}"
-
-
 # _appt_dict_ext_branch / _calendar_branch_sort_rank: 抽到 cmuh_common.appt_utils
 _EXT_BRANCH_DISPLAY_SUFFIX = {
     "east": "(東區分院)",
@@ -7267,39 +7258,6 @@ def _fetch_huisheng_reg52_html(session, doc_no: str, doctor_name: str):
                             _CIRCUIT_BREAKER_THRESHOLD)
     logging.warning(f"無法自惠盛取得掛號表: {doctor_name} ({dparam})")
     return None
-
-
-# _normalize_dayoff_session: 抽到 cmuh_common.appt_utils（13 行刪除）
-# _merge_appointments_by_date: 抽到 cmuh_common.appt_utils（26 行刪除）
-# _merge_dayoff_overrides: 抽到 cmuh_common.appt_utils（21 行刪除）
-def _split_schbox_by_date(cell):
-    """把一格 schBox 依 visitDate 切開,回 (格首共用文字, {id(visitDate div): 該日期自己的文字})。
-
-    [2026-07-26 審查 ★止掛提醒★] 同一格常列出好幾個日期(同一診每週重複),而「止掛」是
-    【單一日期】的狀態 —— reg52 把它寫在該日期後面的 div。原本 `"止掛" in cell_content`
-    用【整格】文字判斷,只要其中一天止掛,同格其他日期全部被標成 is_stopped;止掛提醒掃描
-    看到 is_stopped 就 `continue`(已止掛不必再提醒)→ 那些日期的提醒信被靜默吃掉。
-    格首(第一個 visitDate 之前)的文字是整格共用的標題(診間號碼等),仍套用到所有日期
-    —— 若整格都停,「止掛」會寫在這裡,不能漏掉。
-    結構不符(visitDate 不是本格直接子節點)時回空 dict,呼叫端退回整格文字=維持既有行為。
-    """
-    header_parts = []
-    groups = {}
-    current = None
-    for child in cell.children:
-        get_attr = getattr(child, "get", None)
-        classes = child.get("class") or [] if get_attr is not None else []
-        text = (child.get_text(strip=True)
-                if hasattr(child, "get_text") else str(child).strip())
-        if "visitDate" in classes:
-            current = id(child)
-            groups[current] = [text]
-        elif current is not None:
-            if text:
-                groups[current].append(text)
-        elif text:
-            header_parts.append(text)
-    return "".join(header_parts), {k: "".join(v) for k, v in groups.items()}
 
 
 def _parse_main_hospital_schedule(soup):
@@ -8478,27 +8436,6 @@ def _priority_refresh_interval_seconds(base_seconds: int) -> int:
     return random.choice(choices) if choices else base_seconds
 
 
-def _filter_recent_alert_sent(data, cutoff: str) -> dict:
-    """保留 value(ISO 日期字串)>= cutoff 的項目;非 dict / 非字串鍵值一律剔除。
-    ISO 日期零補位 → 可直接字典序比較。純函式以便測試。"""
-    if not isinstance(data, dict):
-        return {}
-    return {k: v for k, v in data.items()
-            if isinstance(k, str) and isinstance(v, str) and v >= cutoff}
-
-
-def _clinic_refresh_seconds(hour: int) -> int:
-    """[MN-03] 診間燈號輪詢間隔(秒)。半夜監測開啟時,00-07 點放慢到 180-300 秒
-    (多機夜間負載禮貌);其餘時段維持 45-75 秒隨機。純函式以便測試。"""
-    if hour < 7:
-        return random.randint(180, 300)
-    return random.randint(45, 75)
-
-
-def _reg64_micro_ttl_seconds(hour: int) -> int:
-    """[MN-03] reg64 micro-cache TTL(秒)。夜間放寬到 170 秒配合放慢的輪詢,
-    其餘時段 50 秒。純函式以便測試。"""
-    return 170 if hour < 7 else 50
 NOTIFY_DO_NOT_DISTURB_START_HOUR = 0
 NOTIFY_DO_NOT_DISTURB_END_HOUR = 8
 
@@ -8585,11 +8522,6 @@ def _apply_never_sleep_power_plan() -> None:
 
 class _LASTINPUTINFO(ctypes.Structure):
     _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
-
-
-def _tick_delta(tick_now: int, tick_then: int) -> int:
-    """GetTickCount 為 32 位元、約 49.7 天回繞 → 無號差值（回繞後仍正確）。"""
-    return (tick_now - tick_then) & 0xFFFFFFFF
 
 
 def _idle_seconds() -> "float | None":
@@ -8985,39 +8917,6 @@ def _send_alert_email_via_outlook(subject: str, body: str,
         logging.warning("止掛提醒寄信失敗：%s", result["error"])
         return False
     return bool(result.get("ok"))
-
-
-# [perf r5] 東區休診推論索引 — 取代月曆重繪時每格×每醫師×每時段重掃整份
-# all_doctors_data(最壞 ~396 次/重繪 × 整月掃)的 _doctor_has_other_ext_on_weekday。
-# 每次 refresh 只全掃一次建索引，per-cell 查詢降為 O(1)。抽成純函式以便單元測試對拍
-# 等價性(見 tests/test_east_clinic_index.py 對 _doctor_has_other_ext_on_weekday 差分測試)。
-def _build_east_weekday_index(all_doctors_data, parse_item):
-    """建 (lookup_key, weekday, session) -> set(有東區的日期)。parse_item(item) ->
-    (session_name, ext_branch)，同時處理 dict 與舊式 str。語意對齊原方法：isinstance(date)
-    過濾、僅收 east、session 非空。"""
-    index: dict = {}
-    for lk, data in all_doctors_data.items():
-        if not isinstance(data, dict) or 'error' in data:
-            continue
-        for dkey, items in data.items():
-            if not isinstance(dkey, date):
-                continue
-            wd = dkey.weekday()
-            for item in items:
-                sn, ext = parse_item(item)
-                if ext == "east" and sn:
-                    index.setdefault((lk, wd, sn), set()).add(dkey)
-    return index
-
-
-def _east_index_has_other(index, doc_no, doc_name, weekday_idx, session_name, exclude_date):
-    """索引版查詢：是否有「其他(非 exclude_date)同 weekday」出現東區該診別。
-    doc_no/doc_name 兩鍵聯集，與 _doctor_has_other_ext_on_weekday 等價。"""
-    for lk in (doc_no, doc_name):
-        dates = index.get((lk, weekday_idx, session_name))
-        if dates and any(d != exclude_date for d in dates):
-            return True
-    return False
 
 
 # --- 9. UI 與應用程式主體 ---

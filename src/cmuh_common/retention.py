@@ -171,3 +171,17 @@ def consult_shot_rule(directory: str) -> RetentionRule:
 def settings_backup_rule(directory: str) -> RetentionRule:
     return RetentionRule("設定備份", directory, ("*.before-reset-*",),
                          SETTINGS_BACKUP_RETAIN_DAYS, sensitive=False)
+
+
+def default_rules(settings_dir: str) -> list:
+    """本機要定期清掃的落地檔。目錄不存在的規則會被 sweep 靜默跳過。
+
+    [P2-06 第三刀 2026-07-31] 從 main.py 搬入。原本在 main.py 裡自己去拿
+    `get_settings_dir()`，改成【由呼叫端傳入】—— 三個 rule builder 本來就都收路徑，
+    這樣才一致，也才測得到（不必去 monkeypatch 設定目錄）。
+    """
+    return [
+        debug_dump_rule(os.path.join(settings_dir, "debug_dumps")),
+        consult_shot_rule(os.path.join(settings_dir, "consult_shots")),
+        settings_backup_rule(settings_dir),
+    ]

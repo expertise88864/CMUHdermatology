@@ -420,3 +420,12 @@ def get_idle_duration() -> float:
     tick = ctypes.windll.kernel32.GetTickCount() & 0xFFFFFFFF
     millis = (tick - lii.dwTime) & 0xFFFFFFFF
     return millis / 1000.0
+
+
+def tick_delta(tick_now: int, tick_then: int) -> int:
+    """GetTickCount 為 32 位元、約 49.7 天回繞 → 無號差值（回繞後仍正確）。
+
+    [P2-06 第三刀 2026-07-31] 從 main.py 搬入 —— 本模組已經有
+    `get_idle_duration()`／`_LASTINPUTINFO`，同一族。
+    """
+    return (tick_now - tick_then) & 0xFFFFFFFF

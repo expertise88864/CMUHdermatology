@@ -34,6 +34,8 @@ import time
 from ctypes import wintypes
 from typing import Optional
 
+from cmuh_common.win32_safe import call_with_timeout, WIN_ENUM_TIMEOUT_SEC
+
 
 # ── 測試接縫：所有 Win32 呼叫都經過這三個取得器 ──────────────────────────────
 def _user32():
@@ -765,3 +767,26 @@ def scan_unknown_popups(known_classes: set, seen: dict, label: str) -> None:
         _user32().EnumWindows(cb, 0)
     except Exception:
         pass
+
+
+def get_window_text_with_timeout(hwnd: int) -> str:
+    """取 hwnd 視窗標題(逾時保護:HIS GUI 凍結時 GetWindowTextW 會無限阻塞,包
+    call_with_timeout 讓熱鍵不被卡死)。取不到回 ""（→ 採樣 None → 裁決 UNKNOWN → 放行）。
+
+    [P2-06 第三刀 2026-07-31] 從 main.py 的 `_his_title_of` 搬入。與同模組的
+    `get_window_text()` 的差別就是【逾時保護】—— 跨行程的 WM_GETTEXT 會被凍住的
+    視窗無限期卡住，而這支是在熱鍵路徑上跑的。
+    """
+    if not hwnd:
+        return ""
+
+    def _get() -> str:
+        n = _user32().GetWindowTextLengthW(hwnd)
+        if n <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(n + 1)
+        _user32().GetWindowTextW(hwnd, buf, n + 1)
+        return buf.value or ""
+
+    return call_with_timeout(_get, WIN_ENUM_TIMEOUT_SEC, default="",
+                             name="his_title_of")

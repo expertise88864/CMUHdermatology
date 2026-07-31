@@ -78,7 +78,9 @@ def main(argv: list) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("coverage_json")
     ap.add_argument("--update", action="store_true",
-                    help="把目前的百分比寫回門檻（覆蓋率提升之後用）")
+                    help="把目前的百分比寫回門檻（覆蓋率提升之後用；只往上轉）")
+    ap.add_argument("--allow-lower", action="store_true",
+                    help="允許 --update 把門檻【調低】(刪掉測得很好的程式碼時才用)")
     args = ap.parse_args(argv)
 
     # ★[2026-07-31] 這一步現在帶 `if: always()`★ 前面的 pytest 若紅了，cov.json
@@ -117,10 +119,28 @@ def main(argv: list) -> int:
             failed.append(f"{name}: {pct:.1f}% < 門檻 {floor:.1f}%")
 
     if args.update:
+        lowered = []
         for name in floors:
-            if name in layers:
-                # 留 1 個百分點的正常波動空間
-                raw[name] = round(max(0.0, layers[name][2] - 1.0), 1)
+            if name not in layers:
+                continue
+            # 留 1 個百分點的正常波動空間
+            new = round(max(0.0, layers[name][2] - 1.0), 1)
+            # ★[2026-08-01] 棘輪不可以往下轉★
+            #   `--update` 原本無條件寫入 `目前值 - 1`。覆蓋率只要小幅回落（例如
+            #   剛好在 1 個百分點的波動範圍內），順手跑一次 --update 就把欄杆
+            #   【調低】了 —— 而這支腳本自己的說明寫的是「覆蓋率提升之後請跑
+            #   --update 把欄杆跟著提上來」。會往下轉的棘輪不是棘輪。
+            #   真的要降（例如刪掉一批測得很好的程式碼）就用 --allow-lower，
+            #   那是一個看得見、要特別寫出來的動作。
+            if new < float(floors[name]) and not args.allow_lower:
+                lowered.append(f"{name}: {floors[name]} → {new}")
+                continue
+            raw[name] = new
+        if lowered:
+            print("\n[coverage] ★這些門檻【沒有】被調低★（--update 只往上轉）:")
+            for line in lowered:
+                print(f"  {line}")
+            print("  真的要降請加 --allow-lower，並在 PR 說明為什麼。")
         with open(FLOORS_FILE, "w", encoding="utf-8") as fh:
             json.dump(raw, fh, ensure_ascii=False, indent=2)
             fh.write("\n")

@@ -773,3 +773,54 @@ def test_the_baseline_fingerprints_all_have_the_scope_field():
             continue
         for fp in fps:
             assert fp.count("|") >= 3, f"{rule}: 指紋沒有範圍欄位：{fp[:80]}"
+
+
+# ─── ★[2026-08-01] --update 只能往上轉★ ──────────────────────────────────
+def _floors_file(tmp_path, values):
+    p = tmp_path / "coverage_floors.json"
+    p.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+    return p
+
+
+def _run_update(monkeypatch, tmp_path, floors, shared_pct, extra=()):
+    """用真的 main() 跑 --update → 回更新後的門檻 dict 與 stdout。"""
+    import contextlib
+    import io as _io
+
+    floors_p = _floors_file(tmp_path, floors)
+    monkeypatch.setattr(check_coverage, "FLOORS_FILE", str(floors_p))
+    cov = _cov_json(shared_pct, 50.0, tmp_path)
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        check_coverage.main([cov, "--update", *extra])
+    return json.loads(floors_p.read_text(encoding="utf-8")), buf.getvalue()
+
+
+def test_update_raises_the_floor_when_coverage_improved(monkeypatch, tmp_path):
+    got, _out = _run_update(monkeypatch, tmp_path,
+                            {"shared": 70.0, "entrypoints": 0.0, "total": 0.0},
+                            shared_pct=80.0)
+    assert got["shared"] == 79.0, "漲上去要把欄杆跟著提上來"
+
+
+def test_update_refuses_to_lower_the_floor(monkeypatch, tmp_path):
+    """★會往下轉的棘輪不是棘輪★
+
+    `--update` 原本無條件寫入「目前值 − 1」。覆蓋率只要小幅回落（正好在那 1 個
+    百分點的波動範圍內），順手跑一次 --update 就把欄杆【調低】了 —— 而這支腳本
+    自己的說明寫的是「覆蓋率提升之後請跑 --update 把欄杆跟著提上來」。
+    """
+    got, out = _run_update(monkeypatch, tmp_path,
+                           {"shared": 85.0, "entrypoints": 0.0, "total": 0.0},
+                           shared_pct=80)            # 只會算出 79.0
+    assert got["shared"] == 85.0, "不可以被調低"
+    assert "沒有【被調低" in out or "沒有】被調低" in out or "調低" in out
+
+
+def test_allow_lower_makes_it_an_explicit_visible_action(monkeypatch,
+                                                         tmp_path):
+    """真的要降是可以的 —— 但要特別寫出 --allow-lower。"""
+    got, _out = _run_update(monkeypatch, tmp_path,
+                            {"shared": 85.0, "entrypoints": 0.0, "total": 0.0},
+                            shared_pct=80, extra=("--allow-lower",))
+    assert got["shared"] == 79.0
