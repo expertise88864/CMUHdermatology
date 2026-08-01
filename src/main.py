@@ -112,6 +112,15 @@ from cmuh_common.contract_canary import (
     compare_fingerprint as _canary_compare,
     policy_action as _canary_policy_action,
 )
+from cmuh_common.course_value import (
+    CourseReadResult as _CourseReadResult,
+    OK_EMPTY as _COURSE_OK_EMPTY,
+    OK_VALUE as _COURSE_OK_VALUE,
+    NOT_FOUND as _COURSE_NOT_FOUND,
+    READ_FAILED as _COURSE_READ_FAILED,
+    classify_course_value as _classify_course_value,
+    normalize_course_value as _normalize_course_value,
+)
 from cmuh_common.audit_events import (
     # [P2-03] 稽核帳本的 value/detail 只收這些型別 —— 自由文字進不去(理由見該模組)
     render as _ev_render,
@@ -4786,25 +4795,60 @@ MENU_ID_FINISH_NO_PRINT = _HIS_CONTRACT.MENU_ID_FINISH_NO_PRINT
 
 
 def _f11_normalize_course_value(raw_value: str) -> str:
-    """Return the normalized 療程 value used by F11 route selection."""
-    value = str(raw_value or "").strip()
-    if not value:
-        return ""
-    return value.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    """[2026-08-01] 內容搬到 `cmuh_common.course_value.normalize_course_value`。
+
+    只做正規化、不做把關 —— 卡號檢查那條路仍需要拿到正規化後的字串來比對 2/3。
+    """
+    return _normalize_course_value(raw_value)
 
 
-def _f11_read_course_value(main_hwnd: int, label: str = "F11") -> str:
+def _f11_read_course_value(main_hwnd: int, label: str = "F11"):
+    """讀療程欄 → `CourseReadResult`（★不含原值★）。
+
+    ★[2026-08-01 外部 review P1-03] 原本回字串，而且會把原值寫進 log★
+    三種完全不同的情況都回 `""`（找不到欄位／讀取例外／真的空白），呼叫端分不出
+    「HIS 說沒有」與「我們沒讀到」；而 `logging.info("讀到療程=%r", ...)` 會把
+    讀到的東西原封不動寫進 automation_ui.log —— 定位一漂到姓名欄，病人姓名就進了
+    一個 5MB×3 輪替、沒有保存期限、常整包交給開發者除錯的檔案。
+
+    ★臨床行為不變★（使用者定案 2026-08-01）：讀到無法辨識的內容仍照舊按
+    「全部完成」，不擋不跳窗；只是改成記 violation ＋ 寄通知，而 log 只留長度。
+    """
     try:
         course_hwnd = _find_療程_edit_hwnd(main_hwnd)
         if not course_hwnd:
-            logging.info("[%s] 找不到療程欄，F11 走「全部完成」路徑", label)
-            return ""
-        course_value = _f11_normalize_course_value(_read_tmemo_text(course_hwnd))
-        logging.info("[%s] 讀到療程=%r", label, course_value or "(空白)")
-        return course_value
+            result = _CourseReadResult(_COURSE_NOT_FOUND)
+        else:
+            result = _classify_course_value(_read_tmemo_text(course_hwnd))
     except Exception:
-        logging.debug("[%s] 讀療程欄失敗，F11 走「全部完成」路徑", label, exc_info=True)
-        return ""
+        logging.debug("[%s] 讀療程欄失敗", label, exc_info=True)
+        result = _CourseReadResult(_COURSE_READ_FAILED)
+    # ★只印 describe()★ 它保證不含原值（見 course_value 模組）
+    logging.info("[%s] %s，F11 走「%s」路徑", label, result.describe(),
+                 "完成不印" if result.is_phototherapy_2_or_3 else "全部完成")
+    if result.needs_attention:
+        _f11_report_unreadable_course(result, main_hwnd, label)
+    return result
+
+
+def _f11_report_unreadable_course(result, main_hwnd: int, label: str) -> None:
+    """療程欄讀不到／讀到怪東西 → 記帳本 + 寄通知。★不改變按哪顆按鈕★
+
+    這是「疑似定位漂移」最早的訊號：F11 照舊完成，但維護者當天就會知道。
+    帳本與信件都只帶長度，不帶原值（帳本本來就明訂不存病人明文識別）。
+    """
+    try:
+        _record_his_action(
+            "his_field", f"{label} 療程讀值", main_hwnd=main_hwnd,
+            value=_EvReason("course_unreadable",
+                            length=result.observed_length),
+            detail=_EvObserved(result.observed_length),
+            outcome=_LEDGER_MISMATCH)
+    except Exception:
+        logging.debug("[%s] 療程讀值 violation 記錄失敗（不影響流程）", label,
+                      exc_info=True)
+
+
 
 
 def _f11_send_finish_no_print(main_hwnd: int, course_value: str,
@@ -4853,22 +4897,41 @@ def _f11_send_finish_no_print(main_hwnd: int, course_value: str,
     return False
 
 
-def _f11_click_finish_all(main_hwnd: int, course_value: str,
-                          label: str, started_at: float) -> bool:
+def _f11_course_ledger_value(course):
+    """把 `CourseReadResult` 轉成帳本收得下的 typed 值。★不可含原值★
+
+    ★措辭鐵律★ 讀不到時【不可以】記成 `療程=(空白)` —— 那是在宣稱「HIS 說沒有
+    療程」，而事實是「我們沒讀到」。兩者對事後查問題是完全不同的線索。
+    """
+    if course.status == _COURSE_OK_VALUE:
+        return _EvCode("療程", course.value)
+    if course.status == _COURSE_OK_EMPTY:
+        return _EvCode("療程", "")
+    return _EvReason("course_unreadable", length=course.observed_length)
+
+
+def _f11_click_finish_all(main_hwnd: int, course, label: str,
+                          started_at: float) -> bool:
     """F11 route B: non-phototherapy course -> 直接按「全部完成」。
 
     [2026-06-05] 依使用者要求移除「偵測卡號空白→自動補 IC」與卡號把關，
-    一律直接按「全部完成」（卡號交由醫院系統 / 醫師自行處理）。"""
+    一律直接按「全部完成」（卡號交由醫院系統 / 醫師自行處理）。
+
+    ★[2026-08-01] `course` 是 `CourseReadResult`，不是字串★
+    原本收字串並直接印進 timeline log —— 那是第二個把原值寫進 automation_ui.log
+    的地方（第一個在 `_f11_read_course_value`）。改收 typed 結果之後，
+    這裡只印得出 `describe()`，型別上就不可能洩漏。
+    """
     btns = _find_descendants_by_exact_text(main_hwnd, "TButton", "全部完成")
-    logging.info("[%s][timeline] route=全部完成 療程=%s，找到 button: %d 個 "
+    logging.info("[%s][timeline] route=全部完成 %s，找到 button: %d 個 "
                  "(+%.0fms total)",
-                 label, course_value or "(空白/未知)", len(btns),
+                 label, course.describe(), len(btns),
                  (time.time() - started_at) * 1000)
     if not btns:
         logging.warning("[%s] 找不到 全部完成 button", label)
         _record_his_action(_LEDGER_HIS_MENU, f"{label} 全部完成",
                            main_hwnd=main_hwnd, target="button:全部完成",
-                           value=_EvCode("療程", course_value),
+                           value=_f11_course_ledger_value(course),
                            outcome=_LEDGER_FAILED,
                            detail=_EvReason("control_not_found"))
         return False
@@ -4878,7 +4941,7 @@ def _f11_click_finish_all(main_hwnd: int, course_value: str,
     click_ok = _post_click_to_control(btns[0][0])
     _record_his_action(_LEDGER_HIS_MENU, f"{label} 全部完成",
                        main_hwnd=main_hwnd, target="button:全部完成",
-                       value=_EvCode("療程", course_value),
+                       value=_f11_course_ledger_value(course),
                        outcome=_LEDGER_SUBMITTED if click_ok else _LEDGER_FAILED,
                        detail=_EvReason("no_readback") if click_ok
                               else _EvReason("send_failed"))
@@ -4908,12 +4971,15 @@ def _f11_快速完成_main(label: str = "F11") -> bool:
     #   Route A: 療程=2/3（照光）→ 完成不印，不按「全部完成」。
     #   Route B: 療程不是 2/3 或讀不到 → 直接按「全部完成」（不再讀卡號/補 IC）。
     # 兩條路徑送出完成動作後，都進同一套 popup watcher。
-    course_value = _f11_read_course_value(main_hwnd, label=label)
-    if course_value in ("2", "3"):
-        if not _f11_send_finish_no_print(main_hwnd, course_value, label, t_f11_start):
+    # ★[2026-08-01 外部 review P1-03] 分流【行為不變】，只是判準改成 typed★
+    #   使用者定案：讀到無法辨識的內容仍照舊按「全部完成」（不擋不跳窗），
+    #   由 `_f11_read_course_value` 負責記 violation ＋ 寄通知。
+    course = _f11_read_course_value(main_hwnd, label=label)
+    if course.is_phototherapy_2_or_3:
+        if not _f11_send_finish_no_print(main_hwnd, course.value, label, t_f11_start):
             return False
     else:
-        if not _f11_click_finish_all(main_hwnd, course_value, label, t_f11_start):
+        if not _f11_click_finish_all(main_hwnd, course, label, t_f11_start):
             return False
 
     # [2026-05-22 v40] 退回 v39 的 2s → 0.5s。實測 2s 沒解決「卡死」(因為卡死是

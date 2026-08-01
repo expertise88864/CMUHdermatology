@@ -861,7 +861,12 @@ def test_f11_phototherapy_uses_finish_no_print_without_print_fallback():
     _hc_src = (ROOT / "src" / "cmuh_common" / "his_contract.py").read_text(
         encoding="utf-8")
     assert "MENU_ID_FINISH_NO_PRINT = 277" in _hc_src
-    assert 'if course_value in ("2", "3"):' in f11_main_src
+    # ★[2026-08-01 外部 review P1-03] 分流判準改成 typed，臨床行為不變★
+    #   使用者定案：讀不到／讀到怪東西仍照舊按「全部完成」。判準搬進
+    #   `CourseReadResult.is_phototherapy_2_or_3`（那裡才拿得到 status），
+    #   所以這裡改釘那個屬性，並在 course_value 模組另外釘它的定義
+    #   （見 test_review_batch_b：只有 status==OK_VALUE 且值是 2/3 才成立）。
+    assert "course.is_phototherapy_2_or_3" in f11_main_src
     assert "_f11_send_finish_no_print" in f11_main_src
     assert "_f11_click_finish_all" in f11_main_src
     assert (

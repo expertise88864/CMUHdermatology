@@ -84,6 +84,10 @@ REASONS = {
     "readback_empty": "回讀到空字串,無法驗證寫回",
     "readback_mismatch": "回讀與預期不符",
     "write_exception": "寫入過程發生例外",
+    # [2026-08-01 外部 review P1-03] F11 療程欄讀不到／讀到不像療程值的東西。
+    # ★這是「疑似定位漂移」最早的訊號★ —— 臨床行為不變（照舊按全部完成），
+    # 但要留下紀錄與通知。原值一律不記，只帶 length。
+    "course_unreadable": "療程欄讀不到或內容不像療程值,疑似定位漂移",
 }
 
 _VIOLATION = "violation"

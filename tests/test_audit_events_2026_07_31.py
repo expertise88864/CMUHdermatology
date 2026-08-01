@@ -254,13 +254,48 @@ _TYPES = {"_EvCode", "_EvMeasure", "_EvObserved", "_EvReason", "_EvRedacted",
           "_EvTransition"}
 
 
+# ★[2026-08-01] 明列的「typed 值工廠」★
+#   有些呼叫點要依讀取狀態選不同型別（例如 F11 療程讀不到時不可記成「空白」，
+#   那是在宣稱 HIS 說沒有）。那種選擇寫成 helper 比在呼叫點塞 IfExp 清楚，
+#   但 helper 是一個普通函式呼叫，本守衛看不穿。
+#   ★所以要明列，而且每一支都必須另外被證明「每條分支都回 typed 值」★
+#   （見 `test_the_typed_value_factories_really_return_typed_values`）——
+#   不可以改成「凡是函式呼叫都放行」，那等於把守衛關掉。
+_TYPED_FACTORIES = {"_f11_course_ledger_value"}
+
+
 def _typed(node) -> bool:
     if isinstance(node, ast.IfExp):
         return _typed(node.body) and _typed(node.orelse)
     if isinstance(node, ast.Constant) and node.value in ("", None):
         return True
     return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-            and node.func.id in _TYPES)
+            and node.func.id in (_TYPES | _TYPED_FACTORIES))
+
+
+def test_the_typed_value_factories_really_return_typed_values():
+    """★放行工廠的代價：它自己要被證明★
+
+    `_TYPED_FACTORIES` 讓守衛放行一個普通函式呼叫。那個豁免只有在
+    「該函式的每一條 return 都是 typed 值」時才站得住 —— 這裡就檢查那件事。
+    漏掉一條分支（例如新增一個 status 卻忘了處理）會在這裡紅，
+    而不是安靜地讓自由文字流進帳本。
+    """
+    tree = ast.parse(io.open(os.path.join(REPO_ROOT, "src", "main.py"),
+                             encoding="utf-8").read())
+    found = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef)
+                and node.name in _TYPED_FACTORIES):
+            continue
+        found.add(node.name)
+        returns = [n for n in ast.walk(node) if isinstance(n, ast.Return)]
+        assert returns, f"{node.name} 沒有任何 return"
+        for r in returns:
+            assert r.value is not None and _typed(r.value), (
+                f"{node.name} 第 {r.lineno} 行的 return 不是 typed 值")
+    assert found == _TYPED_FACTORIES, \
+        f"明列的工廠有的找不到（改名了？）：{_TYPED_FACTORIES - found}"
 
 
 def _record_call_sites():
