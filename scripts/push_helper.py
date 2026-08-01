@@ -21,7 +21,9 @@ push 是直推 main，而診間電腦約 5 分鐘內就會自動拉新版 ——
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import re
 import subprocess
 import sys
@@ -69,16 +71,52 @@ def step1_sanity() -> None:
     print("  [OK] 安全自檢通過")
 
 
+def _unpushed_commit_count() -> int:
+    """本地分支【領先 upstream】幾個 commit。查不到 upstream 時回 0。"""
+    cp = run(["git", "rev-list", "--count", "@{u}..HEAD"],
+             check=False, capture=True)
+    if cp.returncode != 0:
+        return 0                       # 沒有 upstream（新分支等）→ 不做推測
+    try:
+        return int(cp.stdout.strip() or "0")
+    except ValueError:
+        return 0
+
+
 def step2_check_changes() -> bool:
+    """→ 還有沒有東西要發佈。
+
+    ★[2026-08-05 補審 P1] 工作區乾淨【不等於】沒有東西要推★
+    原本只看 `git status --porcelain`：一乾淨就 return False 直接結束。可是
+    「先在本機 commit 幾次、最後再推」是很正常的做法（這次補審就是這樣做的：
+    每修好一輪外審 finding 就 commit 一次）。那種情況下：
+
+      * 跑 `push.bat` → 這裡直接返回 → **不 bump 版本、不同步 manifest、不推**，
+        而且畫面上寫的是「沒有變更，無需推送」，看起來像一切正常；
+      * 忍不住改用 `git push` → 原始碼上去了，manifest.json 卻還是舊的雜湊 →
+        既有機器比對後認為「檔案沒變」而【跳過下載】，等於修正根本沒送到診間；
+        全新 checkout 則會拿到與 manifest 對不上的檔案，SHA 驗證失敗、整批停更。
+
+    所以工作區乾淨時還要看「有沒有還沒推上去的 commit」。有的話照樣要走完
+    bump → 同步 manifest → commit → push（那個 release commit 只會動
+    version.py 與 manifest.json）。
+    """
     print("\n=== [2/6] Git 狀態 ===")
     cp = run(["git", "status", "--porcelain"], check=False, capture=True)
-    if not cp.stdout.strip():
-        print("\n[提示] 沒有變更，無需推送。")
-        return False
-    # 顯示簡短狀態
-    for line in cp.stdout.splitlines()[:20]:
-        print(f"  {line}")
-    return True
+    if cp.stdout.strip():
+        for line in cp.stdout.splitlines()[:20]:
+            print(f"  {line}")
+        return True
+
+    ahead = _unpushed_commit_count()
+    if ahead:
+        print(f"  工作區乾淨，但有 {ahead} 個 commit 還沒推上去 → "
+              f"仍要 bump 版本並同步 manifest 才能發佈")
+        run(["git", "log", "--oneline", "@{u}..HEAD"], check=False)
+        return True
+
+    print("\n[提示] 沒有變更，無需推送。")
+    return False
 
 
 GATE_ARTIFACTS = ("junit.xml", "cov.json")
@@ -306,6 +344,66 @@ def verify_staged_version_consistency(new_version: str) -> None:
     print(f"  [OK] version.py 與 manifest 皆為 {new_version}")
 
 
+def verify_staged_manifest_hashes() -> None:
+    """讀 index 內的 manifest，逐檔比對雜湊。★必須在 sync_manifest 之後才有意義★
+
+    （刻意【不】掛在 `verify_staged_version_consistency` 裡面：那支在品質關卡的
+      情境下也會被直接呼叫，而那個時間點 manifest 本來就還是上一版的 —— 它要到
+      `step4_sync_manifest` 才會重算。掛在一起會讓一道正確的檢查在錯誤的時機誤報。）
+    """
+    _verify_staged_manifest_hashes(
+        _git_bytes(["cat-file", "blob", f":{MANIFEST_REL}"]).decode(
+            "utf-8", "replace"))
+
+
+def _verify_staged_manifest_hashes(man_blob: str) -> None:
+    """★[2026-08-05 補審 P1] manifest 裡的每個 SHA256 要對得上【index 內的】檔案★
+
+    版本號一致還不夠。真正會傷到人的是「manifest 記的雜湊 ≠ 實際被 commit 的檔案」：
+
+      * 雜湊還是舊的 → 既有機器比對後認為「這個檔沒變」而【跳過下載】，
+        修正等於沒送到診間，而且畫面上一切正常；
+      * 雜湊對不上 → 下載後 SHA 驗證失敗 → 整批 fail-closed，全機停更。
+
+    這道檢查在【已經 staged、還沒 commit】時跑，所以中止的代價只是「這次沒推成」。
+    """
+    print("")
+    print("=== [7.6/9] manifest 雜湊 vs index 內的檔案 ===")
+    try:
+        manifest = json.loads(man_blob)
+    except ValueError as e:
+        fail(f"index 內的 manifest.json 解析不了：{e}")
+        return
+    bad, checked = [], 0
+    for entry in manifest.get("files", []):
+        # manifest 的欄位是 remote_path（repo 內路徑）/ local_filename（安裝後路徑）
+        rel = str(entry.get("remote_path")
+                  or entry.get("local_filename") or "").strip()
+        want = str(entry.get("sha256") or "").strip().lower()
+        if not rel or not want:
+            continue
+        rel_git = rel.replace("\\", "/")
+        try:
+            blob = _git_bytes(["cat-file", "blob", f":{rel_git}"])
+        except SystemExit:
+            raise
+        except Exception as e:
+            bad.append(f"{rel_git}: 讀不到 index 內的內容（{e}）")
+            continue
+        got = hashlib.sha256(blob).hexdigest()
+        checked += 1
+        if got != want:
+            bad.append(f"{rel_git}: manifest={want[:12]}… 實際={got[:12]}…")
+    if not checked:
+        fail("manifest 裡沒有任何可檢查的檔案雜湊 —— "
+             "★空集合不算通過★（欄位名改了的話這道檢查會靜默失效）")
+    if bad:
+        fail("【manifest 雜湊與即將 commit 的檔案對不上】已中止推送："
+             + "\n    " + "\n    ".join(bad[:10])
+             + "\n  多半是 sync_manifest 沒跑到，或跑完之後檔案又被改動過。")
+    print(f"  [OK] {checked} 個檔案的 SHA256 都對得上")
+
+
 def verify_unchanged_since_tests(before: dict) -> None:
     """commit 前重算指紋：與品質關卡當下不一致 → 中止推送並點名檔案。
 
@@ -471,6 +569,7 @@ def main(argv: list) -> int:
     step5_stage()
     verify_index_matches(expected)
     verify_staged_version_consistency(new_ver)
+    verify_staged_manifest_hashes()
     step5_commit(commit_msg, new_ver, emergency_reason)
     step6_push()
 

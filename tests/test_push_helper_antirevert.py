@@ -233,3 +233,114 @@ def test_unexpected_new_index_entry_is_flagged():
     expected.pop("src/cmuh_common/roster/rules.py", None)   # 模擬「取樣時還沒有這個檔」
     with pytest.raises(SystemExit):
         ph.verify_index_matches(expected)
+
+
+# ─── ★[2026-08-05 補審 P1] 乾淨的工作區不等於沒有東西要發佈★ ──────────────
+def test_a_clean_tree_with_unpushed_commits_still_needs_a_release(monkeypatch):
+    """★這條會讓修正【送不到診間】而且畫面上一切正常★
+
+    「先在本機 commit 幾次、最後再推」是很正常的做法(這次補審就是這樣做的)。
+    原本 `step2_check_changes` 只看 `git status --porcelain`,一乾淨就 return
+    False → 不 bump、不同步 manifest、不推,還印「沒有變更,無需推送」。
+    這時若改用 `git push`:原始碼上去了,manifest.json 卻還是舊雜湊 →
+    既有機器比對後認為「這個檔沒變」而【跳過下載】—— 修正等於沒發佈。
+    """
+    ph = _load()
+    calls = []
+
+    def _fake_run(cmd, check=True, capture=False, **k):
+        calls.append(list(cmd))
+
+        class _CP:
+            returncode = 0
+            stdout = ""
+        if cmd[:3] == ["git", "status", "--porcelain"]:
+            _CP.stdout = ""                      # 工作區乾淨
+        elif cmd[:3] == ["git", "rev-list", "--count"]:
+            _CP.stdout = "6\n"                   # 但有 6 個沒推的 commit
+        return _CP()
+    monkeypatch.setattr(ph, "run", _fake_run)
+
+    assert ph.step2_check_changes() is True, \
+        "有沒推的 commit 就必須繼續走 bump → 同步 manifest → push"
+
+
+def test_a_clean_tree_with_nothing_unpushed_stops(monkeypatch):
+    """反方向:真的沒事做時仍要早早結束(不可以每次都跑一輪關卡)。"""
+    ph = _load()
+
+    def _fake_run(cmd, check=True, capture=False, **k):
+        class _CP:
+            returncode = 0
+            stdout = "0\n" if cmd[:3] == ["git", "rev-list", "--count"] else ""
+        return _CP()
+    monkeypatch.setattr(ph, "run", _fake_run)
+    assert ph.step2_check_changes() is False
+
+
+def test_no_upstream_is_not_treated_as_unpushed(monkeypatch):
+    """查不到 upstream 時不做推測(回 0)—— 不可以因為 rev-list 失敗就當成有東西要推。"""
+    ph = _load()
+
+    def _fake_run(cmd, check=True, capture=False, **k):
+        class _CP:
+            returncode = 128 if cmd[:3] == ["git", "rev-list", "--count"] else 0
+            stdout = ""
+        return _CP()
+    monkeypatch.setattr(ph, "run", _fake_run)
+    assert ph._unpushed_commit_count() == 0
+
+
+# ─── ★manifest 的雜湊要對得上真正被 commit 的檔案★ ────────────────────────
+def test_manifest_hash_guard_catches_a_stale_entry(capsys):
+    """★版本號一致還不夠★
+
+    真正會傷到人的是「manifest 記的雜湊 ≠ 實際被 commit 的檔案」:
+      * 雜湊還是舊的 → 既有機器認為「這個檔沒變」而跳過下載 → 修正沒送到診間；
+      * 雜湊對不上 → 下載後 SHA 驗證失敗 → 整批 fail-closed、全機停更。
+    """
+    import json
+    ph = _load()
+    fake = {"files": [{"remote_path": "manifest.json", "sha256": "0" * 64}]}
+    with pytest.raises(SystemExit):
+        ph._verify_staged_manifest_hashes(json.dumps(fake, ensure_ascii=False))
+    assert "雜湊與即將 commit 的檔案對不上" in capsys.readouterr().out
+
+
+def test_manifest_hash_guard_passes_when_the_hashes_agree():
+    """反方向:算得出來、也對得上時不得誤報(否則這道關卡永遠紅、然後被繞過)。"""
+    import hashlib
+    import json
+    import subprocess
+    ph = _load()
+    blob = subprocess.run(["git", "cat-file", "blob", ":manifest.json"],
+                          cwd=str(ph.REPO_ROOT), capture_output=True).stdout
+    good = {"files": [{"remote_path": "manifest.json",
+                       "sha256": hashlib.sha256(blob).hexdigest()}]}
+    ph._verify_staged_manifest_hashes(json.dumps(good, ensure_ascii=False))
+
+
+def test_manifest_hash_guard_refuses_an_empty_check(capsys):
+    """★空集合不算通過★ 欄位名改掉的話,迴圈一筆都沒跑 —— 那是【靜默失效】,
+    不是「全部通過」。這個 repo 反覆出現的假綠燈形狀。
+
+    (寫這道檢查時我自己就先踩到:欄位猜成 path/local,實際是
+     remote_path/local_filename,一筆都沒比到 —— 是這條斷言把它抓出來的。)
+    """
+    ph = _load()
+    with pytest.raises(SystemExit):
+        ph._verify_staged_manifest_hashes('{"files": [{"nope": 1}]}')
+    assert "空集合不算通過" in capsys.readouterr().out
+
+
+def test_manifest_hash_guard_is_wired_before_commit():
+    """要在 commit 之前跑 —— 之後才發現就已經推出去了。"""
+    import ast
+    import inspect
+    import textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(_load().main)))
+    order = [n.func.id for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    # 要在 sync_manifest 【之後】(那時 manifest 才是新的)、commit 【之前】跑
+    assert order.index("step4_sync_manifest") < \
+        order.index("verify_staged_manifest_hashes") < order.index("step5_commit")
