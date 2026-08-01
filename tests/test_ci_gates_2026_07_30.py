@@ -783,7 +783,19 @@ def _floors_file(tmp_path, values):
 
 
 def _run_update(monkeypatch, tmp_path, floors, shared_pct, extra=()):
-    """用真的 main() 跑 --update → 回更新後的門檻 dict 與 stdout。"""
+    """用真的 main() 跑 --update → 回更新後的門檻 dict 與 stdout。
+
+    (離開碼另外由 `_update_rc()` 取 —— 見它的說明:原本這支把 main() 的回傳值
+     【丟掉】,關卡在 --update 模式下一律回 0 因此沒人發現。)
+    """
+    rc, floors_after, out = _update_rc(monkeypatch, tmp_path, floors,
+                                       shared_pct, extra)
+    del rc
+    return floors_after, out
+
+
+def _update_rc(monkeypatch, tmp_path, floors, shared_pct, extra=()):
+    """→ (離開碼, 更新後的門檻, stdout)。"""
     import contextlib
     import io as _io
 
@@ -792,8 +804,9 @@ def _run_update(monkeypatch, tmp_path, floors, shared_pct, extra=()):
     cov = _cov_json(shared_pct, 50.0, tmp_path)
     buf = _io.StringIO()
     with contextlib.redirect_stdout(buf):
-        check_coverage.main([cov, "--update", *extra])
-    return json.loads(floors_p.read_text(encoding="utf-8")), buf.getvalue()
+        rc = check_coverage.main([cov, "--update", *extra])
+    return (rc, json.loads(floors_p.read_text(encoding="utf-8")),
+            buf.getvalue())
 
 
 def test_update_raises_the_floor_when_coverage_improved(monkeypatch, tmp_path):
@@ -879,3 +892,56 @@ def test_the_guard_does_not_swallow_argparse_exits(monkeypatch):
     import type_debt
     with pytest.raises(SystemExit):
         type_debt._main_guarded(["--help"])
+
+
+# ─── ★[2026-08-05 外審 P2] --update 不可以無條件回 0★ ─────────────────────
+def test_update_still_fails_when_it_refused_to_lower_the_floor(monkeypatch,
+                                                               tmp_path):
+    """★關卡自己靜默跳成綠燈★
+
+    劇本正是使用者/CI 會走的那條:覆蓋率退步 → 關卡紅了,訊息叫人跑
+    `--update` → 棘輪(正確地)不准往下轉,所以【什麼都沒改】→ 而離開碼是 0。
+    看離開碼的人於是以為關卡過了,實際上還是不過。
+
+    這條路原本沒被測到,是因為 `_run_update` 把 `main()` 的回傳值丟掉了 ——
+    測試只看檔案與 stdout。斷言沒涵蓋的地方就等於沒有守衛。
+    """
+    rc, floors_after, out = _update_rc(
+        monkeypatch, tmp_path,
+        {"shared": 85.0, "entrypoints": 0.0, "total": 0.0}, shared_pct=80)
+    assert floors_after["shared"] == 85.0, "前提:門檻沒有被調低"
+    assert rc == 1, "沒解決就不可以回 0（--update 正是失敗訊息叫人跑的指令）"
+    assert "仍然不通過" in out
+
+
+def test_update_succeeds_when_allow_lower_actually_resolves_it(monkeypatch,
+                                                               tmp_path):
+    """★反方向:真的解決了就要回 0★ 否則這道關卡永遠紅,又變成沒人理的關卡。"""
+    rc, floors_after, _out = _update_rc(
+        monkeypatch, tmp_path,
+        {"shared": 85.0, "entrypoints": 0.0, "total": 0.0}, shared_pct=80,
+        extra=("--allow-lower",))
+    assert floors_after["shared"] == 79.0
+    assert rc == 0
+
+
+def test_update_succeeds_when_coverage_improved(monkeypatch, tmp_path):
+    """一般情況(覆蓋率提升後把欄杆跟著提上來)仍然回 0。"""
+    rc, _floors, _out = _update_rc(
+        monkeypatch, tmp_path,
+        {"shared": 50.0, "entrypoints": 0.0, "total": 0.0}, shared_pct=90)
+    assert rc == 0
+
+
+def test_update_does_not_hide_a_layer_that_vanished(monkeypatch, tmp_path):
+    """★分層消失＝分類規則跟目錄結構脫節★ --update 不可以把它一起蓋掉。
+
+    非 --update 模式早就把「這一層找不到任何檔案」當成失敗；--update 模式原本
+    直接 return 0，等於繞過它。
+    """
+    rc, _floors, out = _update_rc(
+        monkeypatch, tmp_path,
+        {"shared": 50.0, "entrypoints": 0.0, "total": 0.0, "不存在的層": 10.0},
+        shared_pct=90)
+    assert rc == 1
+    assert "不存在的層" in out

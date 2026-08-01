@@ -145,6 +145,28 @@ def main(argv: list) -> int:
             json.dump(raw, fh, ensure_ascii=False, indent=2)
             fh.write("\n")
         print(f"\n已更新門檻：{FLOORS_FILE}")
+        # ★[2026-08-05 外審 P2] --update 不可以無條件回 0★
+        #   `--update` 正是這支腳本在失敗訊息裡叫人跑的補救指令。原本它跑完一律
+        #   回 0 —— 於是「覆蓋率退步 → 照著提示跑 --update → 因為棘輪不准往下轉而
+        #   什麼都沒改 → 離開碼 0」，看離開碼的人會以為關卡過了，實際上還是不過。
+        #   關卡的失效模式是第一級問題：這是「靜默跳成綠燈」的那個形狀。
+        #   改成拿【寫回去之後的】門檻重新判一次，還不過就照常紅、照常發 annotation。
+        still = []
+        for name in sorted({k: v for k, v in raw.items()
+                            if not k.startswith("//")}):
+            if name not in layers:
+                still.append(f"{name}: 這一層在覆蓋率報告裡找不到任何檔案"
+                             f"（classify() 的規則是不是跟不上目錄搬動了？）")
+                continue
+            pct, floor = layers[name][2], float(raw[name])
+            if pct + 1e-9 < floor:
+                still.append(f"{name}: {pct:.1f}% < 門檻 {floor:.1f}%")
+        if still:
+            print("\n[coverage] ★更新過門檻之後仍然不通過★")
+            for line in still:
+                print(f"  {line}")
+            annotate("覆蓋率門檻不通過（--update 後仍未解決）", "\n".join(still))
+            return 1
         return 0
 
     if failed:
