@@ -213,22 +213,80 @@ def _parse_journal(payload):
     return files, ""
 
 
+def _atomic_write_json(path, payload) -> bool:
+    """寫 tmp → fsync → 原子換名。失敗回 False（★不留半個檔★）。"""
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception:      # noqa: BLE001
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _record_terminal(app_dir, terminal, errors) -> None:
+    """把「救不回來」記成一個【獨立的】標記檔。
+
+    ★[2026-08-02 外審第 2 輪 P2] 原本是把 journal 改名成 .failed.json★
+    那在「一部分救不回來、另一部分還可以重試」時會壞掉：改名之後就沒有 journal
+    可以留給下次重試；反過來若先改寫 journal 給重試用，terminal 那幾個檔就
+    憑空消失 —— 重試成功後日誌被清掉，磁碟仍是混版而所有警示都沒了。
+    兩者必須能【同時】存在，所以改成另存一個檔，不再動 journal 本身。
+    """
+    path = os.path.join(app_dir, JOURNAL_FILENAME + FAILED_JOURNAL_SUFFIX)
+    known = []
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                known = (json.load(f) or {}).get("files") or []
+    except Exception:      # noqa: BLE001  讀不到舊的就當成沒有，不要因此不記
+        known = []
+    merged = list(known) + [t for t in terminal if t not in known]
+    if not _atomic_write_json(path, {"schema": JOURNAL_SCHEMA,
+                                     "files": merged}):
+        errors.append("無法寫入「無法修復」標記（%s）" % os.path.basename(path))
+
+
+def _rewrite_journal_for_retry(app_dir, entries, errors) -> None:
+    """把日誌縮成「還沒還原成功」的那幾個檔，下次啟動只重試它們。
+
+    ★不縮寫會變成假的 terminal★ 已經還原成功的檔，它的 .bak 已被 os.replace
+    吃掉；把整份日誌原封不動留到下次，那些檔會因為「找不到備份」而被判成
+    救不回來 —— 一個成功的復原會在下一次開機變成永久警示。
+    """
+    payload = {"schema": JOURNAL_SCHEMA,
+               "files": [{"target": e.get("target"),
+                          "existed_before": bool(e.get("existed_before")),
+                          "staged": ""}      # 走到這裡的都確定被換過了
+                         for e in entries]}
+    if not _atomic_write_json(os.path.join(app_dir, JOURNAL_FILENAME), payload):
+        # 寫不出來就保留原日誌：全部重試一次雖然會誤判，但總比沒有標記好。
+        errors.append("改寫交易日誌失敗，保留原本的（下次會整批重試）")
+
+
 def recover_before_start(app_dir) -> RecoveryResult:
     """啟動器在 import 主程式【之前】呼叫。絕不拋例外。"""
     journal = os.path.join(app_dir, JOURNAL_FILENAME)
     try:
-        if os.path.exists(journal + FAILED_JOURNAL_SUFFIX):
-            # ★[2026-08-02 外審第 2 輪 P1] terminal 不可以只擋第一次★
-            #   原本改名之後就沒有人再看它，下一次啟動找不到 journal → CLEAN →
-            #   磁碟還是混版卻【無聲啟動】。那等於整個機制只生效一次。
-            #   這個標記由 `updater` 在「一整輪更新完全成功」之後才清掉
-            #   （見 `clear_failed_journal_marker`）—— 那時整棵樹已經被換成
-            #   一致的新版，才真的沒事了。
-            return RecoveryResult(
-                TERMINAL_FAILURE, journal_present=True,
-                errors=["上一次更新留下無法修復的紀錄（%s%s）"
-                        % (JOURNAL_FILENAME, FAILED_JOURNAL_SUFFIX)])
+        # ★[2026-08-02 外審第 2 輪 P1] 舊標記【不可以遮蔽】新的可復原交易★
+        #   第一版看到 .failed.json 就直接 return，連鎖都不拿。於是「上次有個
+        #   救不回來的檔」會讓「這次剛斷電、還救得回來的那一批」完全不被處理。
+        #   正確順序是：先把能救的救回來，最後再讓舊標記決定結論仍是 terminal。
+        had_marker = os.path.exists(journal + FAILED_JOURNAL_SUFFIX)
         if not os.path.exists(journal):
+            if had_marker:
+                return RecoveryResult(
+                    TERMINAL_FAILURE, journal_present=True,
+                    errors=["先前留下「無法修復」的紀錄（%s%s）"
+                            % (JOURNAL_FILENAME, FAILED_JOURNAL_SUFFIX)])
             return RecoveryResult(CLEAN)
     except Exception:
         return RecoveryResult(UNKNOWN, errors=["無法檢查交易日誌"])
@@ -241,7 +299,11 @@ def recover_before_start(app_dir) -> RecoveryResult:
                 return RecoveryResult(UNKNOWN, journal_present=True,
                                       errors=["另一支程式正在寫入更新"])
             if not os.path.exists(journal):
-                return RecoveryResult(CLEAN)     # 等鎖的期間對方正常結束了
+                # 等鎖的期間對方正常結束了
+                if had_marker:
+                    return RecoveryResult(TERMINAL_FAILURE, journal_present=True,
+                                          errors=["先前留下「無法修復」的紀錄"])
+                return RecoveryResult(CLEAN)
             with open(journal, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             files, why = _parse_journal(payload)
@@ -250,6 +312,7 @@ def recover_before_start(app_dir) -> RecoveryResult:
                 return RecoveryResult(UNKNOWN, journal_present=True,
                                       errors=[why])
             restored, unresolved, terminal, errors = [], [], [], []
+            retry_entries = []
             for entry in reversed(files):        # 與寫入相反的順序
                 verdict = _rollback_one(app_dir, entry, errors)
                 name = os.path.basename(str(entry.get("target") or ""))
@@ -257,34 +320,34 @@ def recover_before_start(app_dir) -> RecoveryResult:
                     restored.append(name)
                 elif verdict == "retryable":
                     unresolved.append(name)
+                    retry_entries.append(entry)
                 elif verdict == "terminal":
                     terminal.append(name)
 
+            # ★兩種失敗要能同時留下痕跡★（見 `_record_terminal` 的說明）
+            if terminal:
+                _record_terminal(app_dir, terminal, errors)
             if unresolved:
-                # 留著日誌，下次啟動再試
+                _rewrite_journal_for_retry(app_dir, retry_entries, errors)
+            else:
+                _clear_journal(journal, errors)
+
+            if terminal or had_marker:
+                # terminal 比 retryable 嚴重，結論以它為準；但上面已經把可重試
+                # 的那幾個留在日誌裡，下次啟動仍然會去試。
+                return RecoveryResult(TERMINAL_FAILURE, journal_present=True,
+                                      restored=restored,
+                                      unresolved=terminal or unresolved,
+                                      errors=errors)
+            if unresolved:
                 return RecoveryResult(RETRYABLE_FAILURE, journal_present=True,
                                       restored=restored, unresolved=unresolved,
                                       errors=errors)
-            if terminal:
-                # ★保留證據★ 不可以刪掉之後假裝乾淨：磁碟可能仍是混版，
-                #   而這個檔是唯一能證明「發生過什麼」的東西。
-                _archive_journal(journal, errors)
-                return RecoveryResult(TERMINAL_FAILURE, journal_present=True,
-                                      restored=restored, unresolved=terminal,
-                                      errors=errors)
-            _clear_journal(journal, errors)
             return RecoveryResult(RECOVERED, journal_present=True,
                                   restored=restored, errors=errors)
     except Exception as e:      # noqa: BLE001  啟動路徑，絕不可以拋出去
         return RecoveryResult(UNKNOWN, journal_present=True,
                               errors=[f"復原程序本身失敗：{e}"])
-
-
-def _archive_journal(journal, errors) -> None:
-    try:
-        os.replace(journal, journal + FAILED_JOURNAL_SUFFIX)
-    except OSError as e:
-        errors.append(f"保留失敗紀錄時出錯：{e}")
 
 
 def _clear_journal(journal, errors) -> None:

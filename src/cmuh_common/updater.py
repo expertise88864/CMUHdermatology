@@ -412,12 +412,17 @@ def _recover_locked(app_dir: str, path: str, restored: "list[str]") -> "list[str
         #   ★[2026-08-02 外審 P1-01] 「救不回來」不等於「結案」★
         #   `terminal`（備份不見了／路徑被拒）的檔重試沒有意義，所以它不在
         #   `unresolved` 裡 —— 但原本的 else 分支會因此把日誌【刪掉】，磁碟上
-        #   還是新舊混合，卻連「發生過什麼」的唯一證據也沒了。改成把日誌改名
-        #   保留：不會讓下次啟動無止盡重試，但事後查得到。
+        #   還是新舊混合，卻連「發生過什麼」的唯一證據也沒了。
+        #
+        #   ★[2026-08-02 外審第 2 輪 P2] 這兩件事必須能【同時】成立★
+        #   我上一版寫成 if/elif：一批裡若既有救不回來的、又有防毒鎖住可重試的，
+        #   `unresolved` 分支先跑並把日誌縮成只剩可重試的那幾個 —— terminal 的
+        #   檔就此蒸發；等重試成功日誌被清掉，磁碟仍是混版而所有警示都沒了。
+        #   改成先另存 terminal 標記（獨立的檔，不動日誌），再決定日誌怎麼處置。
+        if outcome.terminal or rejected:
+            _archive_failed_journal(app_dir, outcome.terminal + rejected)
         if unresolved:
             _rewrite_journal_for_retry(app_dir, unresolved)
-        elif outcome.terminal or rejected:
-            _archive_failed_journal(app_dir, outcome.terminal + rejected)
         else:
             _clear_commit_journal(app_dir)
     except Exception:
@@ -443,23 +448,44 @@ def _is_inside_app_dir(app_dir: str, path: str) -> bool:
 
 
 def _archive_failed_journal(app_dir: str, terminal: "list[str]") -> None:
-    """把救不回來的那一批日誌改名保留（不刪）。
+    """把「救不回來」記成一個【獨立的標記檔】，★不動交易日誌本身★。
 
-    保留的是【證據】，不是待辦：改了名之後 `recover_incomplete_update` 就不會再
-    找到它，所以不會每次啟動重跑一次註定失敗的回滾。
+    ★[2026-08-02 外審第 2 輪 P2] 原本是把 journal 改名成 .failed.json★
+    那讓「救不回來」與「可重試」互斥：同一批裡若兩者都有，一定會弄丟一邊。
+    改成另存標記後，日誌可以繼續縮寫給重試用，兩種狀態同時留得下來。
+
+    格式與 `bootstrap_recovery._record_terminal` 相同（那一支不能 import 這裡），
+    由 `tests/test_review_batch_f_*.py` 的往返測試釘住。
     """
-    path = _journal_path(app_dir)
+    path = _journal_path(app_dir) + FAILED_JOURNAL_SUFFIX
+    known: list = []
     try:
-        os.replace(path, path + FAILED_JOURNAL_SUFFIX)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                known = (json.load(f) or {}).get("files") or []
+    except Exception:      # noqa: BLE001  讀不到舊的就當沒有，不要因此不記
+        known = []
+    merged = list(known) + [t for t in terminal if t not in known]
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"schema": JOURNAL_SCHEMA, "files": merged}, f,
+                      ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
         logging.error("[更新] ★有 %d 個檔案永久無法還原★ 磁碟上可能是新舊混合的版本；"
-                      "交易日誌已改名保留為 %s%s 供事後追查：%s",
+                      "已記錄於 %s 供事後追查，臨床主程式啟動時會提醒：%s",
                       len(terminal), os.path.basename(path),
-                      FAILED_JOURNAL_SUFFIX, "; ".join(terminal[:3]))
-    except OSError as e:
-        # 改名失敗就把它留在原地：下次啟動會再跑一次（會噴同樣的 error），
-        # 但★絕不刪掉★ —— 沒有標記比重覆報錯更糟。
-        logging.error("[更新] 有 %d 個檔案永久無法還原，且交易日誌改名失敗（%s）→ "
-                      "保留原日誌", len(terminal), e)
+                      "; ".join(terminal[:3]))
+    except Exception as e:      # noqa: BLE001
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        logging.error("[更新] 有 %d 個檔案永久無法還原，且標記檔寫入失敗（%s）",
+                      len(terminal), e)
 
 
 def clear_failed_journal_marker(app_dir: str = "") -> bool:
@@ -1325,6 +1351,9 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
             #   「備份不見了」不會進 unresolved（重試沒意義），於是這裡走進
             #   「全部回滾完了」的分支把日誌清掉 —— 磁碟仍是混版，證據卻沒了。
             _archive_failed_journal(app_dir_for_journal, rb.terminal)
+            # 標記另存之後，日誌就沒有留著的理由（沒有可重試的項目；留著只會
+            # 讓下次啟動對已還原的檔重跑一次註定失敗的回滾）。
+            _clear_commit_journal(app_dir_for_journal)
             return result
         # 全部都回滾完了 → 日誌沒有存在的理由（留著會讓下次啟動再回滾一次，
         # 而那時 .bak 已經被 rollback 消耗掉 → 每次啟動噴一批 error）。
@@ -1361,6 +1390,7 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
         elif _rb.terminal:
             # 同上：救不回來的檔不在 unresolved 裡，不可以當成乾淨結案。
             _archive_failed_journal(app_dir_for_journal, _rb.terminal)
+            _clear_commit_journal(app_dir_for_journal)
         else:
             # 回滾用掉了 .bak；再試一次清日誌。清不掉也不致命：下次啟動會照日誌
             # 重跑一次回滾，那時檔案已經是舊版、備份也沒了 → 噴一批 error 後把

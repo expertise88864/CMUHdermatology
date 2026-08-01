@@ -677,8 +677,128 @@ def test_bootstrap_recovery_is_shipped_by_the_updater():
         f"少了 {sorted(expected - committed)}，多了 {sorted(committed - expected)}")
 
 
+def test_the_manifest_version_matches_the_code_version():
+    """★manifest 的 app_version 必須等於磁碟上的 CURRENT_VERSION★
+
+    [2026-08-02 外審第 2 輪 P1] updater 有一條明寫的假設：「同一個 app_version
+    恆指同一份已發佈 revision」——它靠這個才敢在版號相同時照 SHA 修復
+    （見 `check_and_update` 裡 codex P2 round3 那段註解）。若 manifest 內容變了
+    卻沿用舊版號，另一支拿到舊快取 manifest 的行程就會把新版「修復」成舊版。
+
+    實務上這個不變量由 `push_helper` 保證（先 bump_version、再 sync_manifest、
+    最後才 add/commit），這支測試是把它釘住，避免有人手動改 manifest 或只 bump
+    版號卻忘了重新產生。
+    """
+    from cmuh_common.version import CURRENT_VERSION
+    with io.open(os.path.join(REPO_ROOT, "manifest.json"),
+                 encoding="utf-8") as f:
+        manifest = json.load(f)
+    assert manifest["app_version"] == CURRENT_VERSION, (
+        f"manifest.json 是 v{manifest['app_version']}，"
+        f"程式是 v{CURRENT_VERSION} —— 重新跑 sync_manifest")
+
+
 class TestTheTerminalMarkerSurvivesRestarts:
     """[2026-08-02 外審第 2 輪 P1] terminal 原本只擋第一次啟動。"""
+
+    def test_an_old_marker_does_not_shadow_a_new_recoverable_journal(
+            self, tmp_path):
+        """★[2026-08-02 外審第 2 輪 P1] 這是我上一輪改出來的退步★
+
+        第一版看到 `.failed.json` 就直接 return，連鎖都不拿 —— 於是「上次有個
+        救不回來的檔」會讓「這次剛斷電、還救得回來的那一批」完全不被處理。
+        使用者按「是」啟動之後，載到的是這次中斷造成的【新】混版模組。
+        """
+        (tmp_path / (br.JOURNAL_FILENAME + br.FAILED_JOURNAL_SUFFIX)).write_text(
+            '{"schema": 1, "files": ["old.py"]}', encoding="utf-8")
+        target = tmp_path / "fresh.py"
+        target.write_text("新版（這次斷電留下的）", encoding="utf-8")
+        (tmp_path / "fresh.py.bak").write_text("舊版", encoding="utf-8")
+        _seed_journal(tmp_path, [(str(target), True, "")])
+
+        result = br.recover_before_start(str(tmp_path))
+
+        assert target.read_text(encoding="utf-8") == "舊版", (
+            "★舊標記讓這次可復原的交易完全沒被處理★")
+        assert result.restored == ["fresh.py"]
+        # 舊標記還在 → 結論仍然是不可啟動
+        assert result.status == br.TERMINAL_FAILURE
+        assert result.safe_to_start is False
+
+    def test_a_retryable_file_and_a_doomed_file_both_leave_a_trace(
+            self, tmp_path):
+        """★[2026-08-02 外審第 2 輪 P2] 兩種失敗必須能同時存在★
+
+        一個檔備份不見了（救不回來），另一個被防毒鎖住（下次可能會好）。
+        原本的 if/elif 會弄丟其中一邊：日誌縮寫給重試用之後，救不回來的那個
+        就此蒸發 —— 重試成功、日誌被清，磁碟仍混版而所有警示都沒了。
+        """
+        doomed = tmp_path / "doomed.py"
+        doomed.write_text("新版，備份不見了", encoding="utf-8")
+        locked = tmp_path / "locked.py"
+        locked.write_text("新版", encoding="utf-8")
+        (tmp_path / "locked.py.bak").write_text("舊版", encoding="utf-8")
+        _seed_journal(tmp_path, [(str(doomed), True, ""),
+                                 (str(locked), True, "")])
+
+        real_replace = os.replace
+
+        def _fail_only_the_locked_one(src, dst):
+            if str(dst).endswith("locked.py"):
+                raise OSError("[WinError 5] 防毒鎖住")
+            return real_replace(src, dst)
+
+        import unittest.mock as mock
+        with mock.patch.object(br.os, "replace", _fail_only_the_locked_one):
+            result = br.recover_before_start(str(tmp_path))
+
+        marker = tmp_path / (br.JOURNAL_FILENAME + br.FAILED_JOURNAL_SUFFIX)
+        assert marker.exists(), "★救不回來的那個沒有留下任何痕跡★"
+        assert "doomed.py" in marker.read_text(encoding="utf-8")
+
+        journal = tmp_path / br.JOURNAL_FILENAME
+        assert journal.exists(), "★可重試的那個沒有留下來給下次試★"
+        kept = json.loads(journal.read_text(encoding="utf-8"))
+        assert [os.path.basename(e["target"]) for e in kept["files"]] == \
+            ["locked.py"], "日誌應該只剩下可重試的那個"
+        assert result.safe_to_start is False
+
+    def test_a_restored_file_does_not_come_back_as_doomed_next_boot(
+            self, tmp_path):
+        """★不縮寫日誌會讓成功的復原在下次開機變成永久警示★
+
+        已還原的檔，它的 .bak 已被 os.replace 吃掉；整份日誌留到下次啟動，
+        那些檔就會因為「找不到備份」被判成救不回來。
+        """
+        ok = tmp_path / "ok.py"
+        ok.write_text("新版", encoding="utf-8")
+        (tmp_path / "ok.py.bak").write_text("舊版", encoding="utf-8")
+        locked = tmp_path / "locked.py"
+        locked.write_text("新版", encoding="utf-8")
+        (tmp_path / "locked.py.bak").write_text("舊版", encoding="utf-8")
+        _seed_journal(tmp_path, [(str(ok), True, ""), (str(locked), True, "")])
+
+        real_replace = os.replace
+        state = {"fail": True}
+
+        def _fail_the_locked_one(src, dst):
+            if state["fail"] and str(dst).endswith("locked.py"):
+                raise OSError("[WinError 5] 防毒鎖住")
+            return real_replace(src, dst)
+
+        import unittest.mock as mock
+        with mock.patch.object(br.os, "replace", _fail_the_locked_one):
+            first = br.recover_before_start(str(tmp_path))
+        assert first.status == br.RETRYABLE_FAILURE
+
+        state["fail"] = False                    # 防毒放手了
+        second = br.recover_before_start(str(tmp_path))
+
+        assert second.status == br.RECOVERED, (
+            f"第二次應該乾淨收尾，卻是 {second.status}（{second.errors}）")
+        assert not (tmp_path / (br.JOURNAL_FILENAME
+                                + br.FAILED_JOURNAL_SUFFIX)).exists()
+        assert locked.read_text(encoding="utf-8") == "舊版"
 
     def test_a_second_startup_still_reports_terminal(self, tmp_path):
         """★這是那個 finding 的核心★
@@ -869,6 +989,43 @@ class TestEveryRollbackConsumerHandlesTerminal:
                                updater.JOURNAL_FILENAME)
         assert not os.path.exists(journal + updater.FAILED_JOURNAL_SUFFIX)
         assert first.read_text(encoding="utf-8") == "舊 A", "沒有回滾成功"
+
+    def test_updater_keeps_both_traces_when_both_kinds_of_failure_happen(
+            self, tmp_path, monkeypatch):
+        """updater 的日誌復原路徑也要能同時留下兩種痕跡（外審第 2 輪 P2）。"""
+        doomed = tmp_path / "doomed.py"
+        doomed.write_text("新版，備份不見了", encoding="utf-8")
+        locked = tmp_path / "locked.py"
+        locked.write_text("新版", encoding="utf-8")
+        (tmp_path / "locked.py.bak").write_text("舊版", encoding="utf-8")
+        _seed_journal(tmp_path, [(str(doomed), True, ""),
+                                 (str(locked), True, "")])
+
+        def _fail_the_locked_one(src, dst):
+            if str(dst).endswith("locked.py"):
+                raise OSError("[WinError 5] 防毒鎖住")
+            return os.replace(src, dst)
+
+        monkeypatch.setattr(updater, "_replace_file_with_retry",
+                            _fail_the_locked_one)
+        updater.recover_incomplete_update(str(tmp_path))
+
+        journal = os.path.join(str(tmp_path), updater.JOURNAL_FILENAME)
+        marker = journal + updater.FAILED_JOURNAL_SUFFIX
+        assert os.path.exists(marker), "救不回來的那個沒有留下痕跡"
+        assert "doomed.py" in io.open(marker, encoding="utf-8").read()
+        assert os.path.exists(journal), "可重試的那個沒有留給下次"
+        with io.open(journal, encoding="utf-8") as f:
+            kept = json.load(f)
+        assert [os.path.basename(e["target"]) for e in kept["files"]] == \
+            ["locked.py"]
+
+    def test_the_two_modules_write_the_same_marker_format(self, tmp_path):
+        """★重複實作的第二個釘子★ updater 寫的標記，bootstrap 要讀得懂。"""
+        updater._archive_failed_journal(str(tmp_path), ["a.py"])
+        result = br.recover_before_start(str(tmp_path))
+        assert result.status == br.TERMINAL_FAILURE
+        assert result.safe_to_start is False
 
     def test_the_recovery_path_archives_instead_of_clearing(self, tmp_path):
         """對照：日誌復原那條路徑已經會保留證據（上面 TestTerminalFailure…）。"""
