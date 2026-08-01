@@ -6519,8 +6519,29 @@ def _select_phrase_and_return(片語_btn_hwnd: int, row_idx: int,
     # 0.2→0.08 (省 120ms)。Delphi TStringAlignGrid 對 VK_DOWN 即時反應。
     VK_DOWN = 0x28
     if row_idx > 0:
-        _send_key_to_window(grid, VK_DOWN, count=row_idx, interval=0.03)
-        logging.info("[%s] grid 已 VK_DOWN %d 次 → row %d", label, row_idx, row_idx)
+        # ★[2026-08-01 外部 review P1-05] 送鍵不可以「送出去就當成功」★
+        #   原本忽略每一次 PostMessageW 的回傳，然後無條件 log
+        #   「已 VK_DOWN N 次 → row N」再按「帶回」。少送一次就選到【上一列】的
+        #   片語，然後照樣帶回並在 Round 4 送出同意書 —— 寫錯病歷等級的後果。
+        seq = _send_key_to_window(grid, VK_DOWN, count=row_idx, interval=0.03)
+        if not seq.complete:
+            # ★不可以按「帶回」★ 現在 grid 停在哪一列是未知的。
+            #   popup 保留著不關，讓醫師看得到並自己選。
+            logging.warning("[%s] ★方向鍵沒有全部送出，選取列位置未知 → 不按「帶回」★"
+                            " %s", label, seq.describe())
+            _record_his_action(
+                _LEDGER_HIS_MENU, f"{label} 片語選列", main_hwnd=phrase_popup,
+                target="grid:TStringAlignGrid",
+                value=_EvMeasure(requested=seq.requested,
+                                 keydown=seq.keydown_posted,
+                                 keyup=seq.keyup_posted),
+                outcome=_LEDGER_FAILED, detail=_EvReason("send_failed"))
+            return False
+        # ★措辭鐵律★ 我們確知的是「N 次方向鍵都送出去了」，不是「grid 在第 N 列」——
+        #   `TStringAlignGrid` 的選取列讀不回來（Delphi owner-draw，沒有標準訊息），
+        #   所以這裡只能陳述送出的事實。
+        logging.info("[%s] grid 已送出 %d 次 VK_DOWN（選取列無法回讀，"
+                     "預期 row %d）", label, row_idx, row_idx)
         time.sleep(0.08)
     else:
         logging.info("[%s] row=0 (default highlight)，無需 VK_DOWN", label)

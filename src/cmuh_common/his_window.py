@@ -29,6 +29,7 @@ main.py 17,519 行，量過之後有 53 個頂層函式【完全不引用任何�
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import logging
 import time
 from ctypes import wintypes
@@ -38,8 +39,31 @@ from cmuh_common.win32_safe import call_with_timeout, WIN_ENUM_TIMEOUT_SEC
 
 
 # ── 測試接縫：所有 Win32 呼叫都經過這三個取得器 ──────────────────────────────
+_u32_declared = False
+
+
 def _user32():
-    return ctypes.windll.user32
+    """user32；★送鍵用到的 `PostMessageW` 要宣告好簽名★
+
+    [2026-08-01] 批次C 在黑幕那邊實測過：沒宣告 argtypes 時 `SetWindowPos` 的回傳
+    會被讀成 0（成功也一樣），而我這一刀開始【信任 `PostMessageW` 的回傳值】——
+    所以先量了一次：`PostMessageW` 無宣告與有宣告都回 1，它的回傳本身是可信的。
+    仍然宣告的理由是參數寬度：HWND 與 WPARAM/LPARAM 是指標寬度，64 位行程下
+    不宣告會被截成 32 位。目前 lparam 都傳 0 所以碰不到，但那是「現在剛好沒事」，
+    不是「不會出事」。
+    """
+    global _u32_declared
+    u = ctypes.windll.user32
+    if not _u32_declared:
+        try:
+            u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                       wintypes.WPARAM, wintypes.LPARAM]
+            u.PostMessageW.restype = wintypes.BOOL
+            _u32_declared = True
+        except Exception:
+            logging.debug("[his_window] PostMessageW argtypes 宣告失敗（沿用預設）",
+                          exc_info=True)
+    return u
 
 
 def _kernel32():
@@ -587,16 +611,60 @@ def get_ime_focus_hwnd():
 
 
 # ── 送訊息（第二刀）──────────────────────────────────────────────────────────
+@dataclasses.dataclass(frozen=True)
+class KeySequenceResult:
+    """送鍵序列的結果。★送出去就當成功，正是這個 repo 反覆出事的形狀★
+
+    [2026-08-01 外部 review P1-05] 原本這支忽略每一次 `PostMessageW` 的回傳值、
+    而且回 `None`，呼叫端只能假設「N 次都送到了」。F9/F10 選片語就是靠這個序列
+    把 grid 的選取列從 0 移到 N —— 少送一次就選到**上一列的片語**，然後照樣按
+    「帶回」並送出同意書。那是寫錯病歷等級的後果。
+    """
+    requested: int
+    keydown_posted: int
+    keyup_posted: int
+
+    @property
+    def complete(self) -> bool:
+        """★成對才算數★ KEYDOWN 送到但 KEYUP 沒送到，選取列一樣可能沒動。"""
+        return (self.keydown_posted == self.requested
+                and self.keyup_posted == self.requested)
+
+    def describe(self) -> str:
+        return (f"要求 {self.requested} 次；"
+                f"KEYDOWN 送出 {self.keydown_posted}、"
+                f"KEYUP 送出 {self.keyup_posted}")
+
+
 def send_key_to_window(hwnd: int, vk: int, count: int = 1,
-                       interval: float = 0.05) -> None:
+                       interval: float = 0.05) -> KeySequenceResult:
     """對指定 hwnd 送 N 次 VK 鍵 (WM_KEYDOWN + WM_KEYUP)。用 PostMessage
-    非同步，不需要 foreground，也不會被 IME 攔截。"""
+    非同步，不需要 foreground，也不會被 IME 攔截。
+
+    → `KeySequenceResult`。★呼叫端必須看 `complete`★：任何一次沒送出去，
+    「grid 現在停在第幾列」這件事就不成立了。
+
+    ★一送失敗就【停下來】★ 繼續送只會讓選取列停在一個誰也不知道的位置；
+    停下來至少讓呼叫端知道「移動了幾次」。
+    """
     WM_KEYDOWN = 0x0100
     WM_KEYUP = 0x0101
+    down = up = 0
+    u = _user32()
     for _ in range(count):
-        _user32().PostMessageW(hwnd, WM_KEYDOWN, vk, 0)
-        _user32().PostMessageW(hwnd, WM_KEYUP, vk, 0)
+        if not u.PostMessageW(hwnd, WM_KEYDOWN, vk, 0):
+            logging.warning("[送鍵] 第 %d 次 WM_KEYDOWN 送出失敗（hwnd=%s vk=%s）",
+                            down + 1, hwnd, vk)
+            break
+        down += 1
+        if not u.PostMessageW(hwnd, WM_KEYUP, vk, 0):
+            logging.warning("[送鍵] 第 %d 次 WM_KEYUP 送出失敗（hwnd=%s vk=%s）",
+                            up + 1, hwnd, vk)
+            break
+        up += 1
         time.sleep(interval)
+    return KeySequenceResult(requested=count, keydown_posted=down,
+                             keyup_posted=up)
 
 
 def send_message_timeout_ex(hwnd: int, msg: int, wparam: int, lparam: int,
