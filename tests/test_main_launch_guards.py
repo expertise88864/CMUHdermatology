@@ -107,17 +107,26 @@ def _constant_strings(func: ast.FunctionDef) -> set[str]:
 
 
 def _assert_mutex_is_passed(source_path: Path, func_name: str,
-                            mutex: str) -> None:
-    """呼叫端要把 mutex 名稱傳下去 —— 漏傳＝那支程式完全沒有單一實例保護。
+                            program_attr: str, mutex: str) -> None:
+    """那支程式的描述表要帶著 mutex，而按鈕要真的用那張表。
 
     ★[2026-08-05 P2-06 第五刀(a)] 這半邊是新的★
     順序檢查（先查再啟動）搬進 `launch_helper_script` 之後，光驗那邊【不夠】：
-    呼叫端只要不傳 `single_instance_mutex`，共用函式就整段跳過檢查，而順序測試
+    描述表只要沒填 `single_instance_mutex`，共用函式就整段跳過檢查，而順序測試
     照樣綠。兩半都要釘，缺一邊守衛就可以被繞過。
     """
+    import sys
+    sys.path.insert(0, str(ROOT / "src"))
+    from cmuh_common import program_launcher as pl   # 不含重量級相依，可直接 import
+
+    program = getattr(pl, program_attr)
+    assert program.single_instance_mutex == mutex, (
+        f"{program_attr} 沒帶 {mutex} → 這支程式會失去單一實例保護")
+
     func = _function_node(source_path, func_name)
-    assert mutex in _constant_strings(func), (
-        f"{func_name} 沒有把 {mutex} 傳給共用啟動器 → 這支程式會失去單一實例保護")
+    assert program_attr in _function_source(source_path, func_name), (
+        f"{func_name} 沒有用 {program_attr} 這張描述表")
+    assert func is not None
 
 
 def _assert_shared_launcher_checks_mutex_first() -> None:
@@ -139,8 +148,10 @@ def test_main_background_launches_check_mutex_before_spawn():
 
     _assert_shared_launcher_checks_mutex_first()
     _assert_mutex_is_passed(source_path, "_launch_autoclock_program",
+                            "AUTOCLOCK",
                             "Local\\CMUH_Skin_AutoClock_SingleInstance_v1")
     _assert_mutex_is_passed(source_path, "_launch_consult_query_program",
+                            "CONSULT_QUERY",
                             "Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1")
 
 

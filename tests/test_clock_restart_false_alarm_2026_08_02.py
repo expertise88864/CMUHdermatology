@@ -182,11 +182,22 @@ def test_main_button_always_expresses_intent_not_a_file_check():
     autoclock 的閘門看的是「有沒有帳號」,而檔案可能存在卻是 `[]`(使用者刪光最後
     一個帳號)。兩邊判斷不同步 → 按鈕啟動背景模式、autoclock 靜默結束,
     設定視窗再也叫不出來。「什麼算可用設定」只由 autoclock 判斷一次。
+
+    ★[2026-08-05 P2-06 第五刀(a)] 旗標搬到 `program_launcher.AUTOCLOCK.args`★
+    守的兩件事沒變，只是換了地址：(1) 打卡按鈕一定帶 --configure-if-empty；
+    (2) 呼叫端不可以自己去看設定檔。所以兩層分開釘。
     """
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    from cmuh_common import program_launcher as pl
+
+    assert "--configure-if-empty" in pl.AUTOCLOCK.args, \
+        "打卡按鈕沒帶旗標 → 沒設定的電腦會靜默結束，設定視窗再也叫不出來"
+
     code = _code_only(_src('main.py'))
     i = code.index("def _launch_autoclock_program(")
     seg = code[i:i + 1400]
-    assert '"--configure-if-empty"' in seg
+    assert "AUTOCLOCK" in seg, "按鈕沒有用 AUTOCLOCK 那張描述表"
     assert "autoclock_config.json" not in seg, "★不可在呼叫端重複判斷可用性★"
 
 

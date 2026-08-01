@@ -47,36 +47,90 @@ class LaunchOutcome:
 _OK = LaunchOutcome(True)
 
 
-def launch_helper_script(script_name: str, *, what: str,
-                         args: tuple = (), single_instance_mutex: str = "",
-                         peer: str = "該程式") -> LaunchOutcome:
+@dataclass(frozen=True)
+class HelperProgram:
+    """一支輔助程式的完整描述 —— 腳本名、單一實例鎖、給人看的字、給機器看的 log。
+
+    ★為什麼連 log 訊息都放進來★（2026-08-05 外審 P3）
+    第一版把四支收斂成一支之後，log 改成用程式名組出來（`Launching 排班程式: …`）。
+    但原本那四組訊息**不是規則的**：排班的失敗訊息是 `Failed to launch scheduler`
+    （沒有 program），其餘三支是 `Failed to launch ○○ program`；「已在執行」那句
+    也各自不同。組不回來就是組不回來 —— 而 log 是事後查問題的依據，
+    改掉會讓既有的搜尋方式失效。所以整組原字串照抄進表，一個字都沒動。
+    """
+    script_name: str
+    what: str                      # 使用者看到的名稱（「排班程式」）
+    peer: str                      # 「請確認主程式與○○在同一個資料夾中」的○○
+    args: tuple = ()
+    single_instance_mutex: str = ""
+    log_launching: str = ""        # 以下四條是原字串，%s 收 script_name / 例外
+    log_not_found: str = ""
+    log_failed: str = ""
+    log_already_running: str = ""
+
+
+SCHEDULER = HelperProgram(
+    script_name="中國醫皮膚科排班程式.pyw",
+    what="排班程式", peer="排班程式",
+    log_launching="Launching scheduler program: %s",
+    log_not_found="Scheduler script not found: %s",
+    log_failed="Failed to launch scheduler: %s",
+)
+
+AUTOCLOCK = HelperProgram(
+    script_name="中國醫皮膚科打卡程式.pyw",
+    what="打卡程式", peer="打卡程式",
+    args=("--configure-if-empty",),
+    single_instance_mutex="Local\\CMUH_Skin_AutoClock_SingleInstance_v1",
+    log_launching="Launching autoclock program: %s (--configure-if-empty)",
+    log_not_found="Autoclock script not found: %s",
+    log_failed="Failed to launch autoclock program: %s",
+    log_already_running="Autoclock program is already running; skip launch",
+)
+
+COORDINATE_DETECTOR = HelperProgram(
+    script_name="中國醫皮膚科點座標偵測程式.pyw",
+    what="座標偵測程式", peer="該程式",
+    log_launching="Launching coordinate detector program: %s",
+    log_not_found="Coordinate detector script not found: %s",
+    log_failed="Failed to launch coordinate detector program: %s",
+)
+
+CONSULT_QUERY = HelperProgram(
+    script_name="中國醫皮膚科會診查詢程式.pyw",
+    what="會診查詢程式", peer="該程式",
+    single_instance_mutex="Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1",
+    log_launching="Launching consult query program: %s",
+    log_not_found="Consult query script not found: %s",
+    log_failed="Failed to launch consult query program: %s",
+    log_already_running="Consult query program is already running; skip launch",
+)
+
+
+def launch_helper_script(program: HelperProgram) -> LaunchOutcome:
     """啟動同資料夾的輔助腳本（排班／打卡／座標偵測／會診查詢）。
 
     ★`single_instance_mutex` 必須在啟動【之前】檢查★
     否則使用者連按兩下就會有兩個實例在跑（打卡程式會重複打卡、會診查詢會重複寄信）。
     `test_main_background_launches_check_mutex_before_spawn` 釘的就是這個順序。
-
-    `what`：使用者看到的程式名稱（「排班程式」）。
-    `peer`：「請確認主程式與○○在同一個資料夾中」裡的○○ —— 原本四支的措辭
-            不完全一樣（兩支寫程式名、兩支寫「該程式」），照原樣保留。
     """
-    if single_instance_mutex and is_instance_running(single_instance_mutex):
-        logging.info("%s is already running; skip launch", what)
+    if program.single_instance_mutex and is_instance_running(
+            program.single_instance_mutex):
+        logging.info(program.log_already_running)
         return LaunchOutcome(False, already_running=True)
     try:
-        logging.info("Launching %s: %s%s", what, script_name,
-                     f" ({' '.join(args)})" if args else "")
-        launch_app_script(script_name, args=args)
+        logging.info(program.log_launching, program.script_name)
+        launch_app_script(program.script_name, args=program.args)
     except FileNotFoundError:
-        logging.error("%s script not found: %s", what, script_name)
+        logging.error(program.log_not_found, program.script_name)
         return LaunchOutcome(
             False, error_title="啟動失敗",
-            error_message=(f"找不到{what}檔案: {script_name}\n\n"
-                           f"請確認主程式與{peer}在同一個資料夾中。"))
+            error_message=(f"找不到{program.what}檔案: {program.script_name}\n\n"
+                           f"請確認主程式與{program.peer}在同一個資料夾中。"))
     except Exception as e:
-        logging.error("Failed to launch %s: %s", what, e)
+        logging.error(program.log_failed, e)
         return LaunchOutcome(False, error_title="啟動失敗",
-                             error_message=f"無法啟動{what}:\n{e}")
+                             error_message=f"無法啟動{program.what}:\n{e}")
     return _OK
 
 

@@ -31,8 +31,7 @@ def test_an_already_running_program_is_not_launched_again(monkeypatch):
     monkeypatch.setattr(pl, "launch_app_script",
                         lambda *a, **k: calls.append(a))
 
-    out = pl.launch_helper_script("打卡.pyw", what="打卡程式",
-                                  single_instance_mutex="Local\\X")
+    out = pl.launch_helper_script(pl.AUTOCLOCK)
     assert calls == [], "★已在執行就完全不可以再啟動一次★"
     assert out.already_running is True
 
@@ -45,8 +44,7 @@ def test_already_running_is_not_a_failure(monkeypatch):
     """
     monkeypatch.setattr(pl, "is_instance_running", lambda m: True)
     monkeypatch.setattr(pl, "launch_app_script", lambda *a, **k: None)
-    out = pl.launch_helper_script("x.pyw", what="打卡程式",
-                                  single_instance_mutex="Local\\X")
+    out = pl.launch_helper_script(pl.AUTOCLOCK)
     assert out.failed is False
     assert out.error_message == "", "不可以有任何要顯示給使用者的錯誤"
 
@@ -58,8 +56,7 @@ def test_the_mutex_is_checked_before_spawning(monkeypatch):
                         lambda m: order.append("check") or False)
     monkeypatch.setattr(pl, "launch_app_script",
                         lambda *a, **k: order.append("spawn"))
-    pl.launch_helper_script("x.pyw", what="打卡程式",
-                            single_instance_mutex="Local\\X")
+    pl.launch_helper_script(pl.AUTOCLOCK)
     assert order == ["check", "spawn"]
 
 
@@ -68,7 +65,7 @@ def test_no_mutex_means_no_instance_check(monkeypatch):
     monkeypatch.setattr(pl, "is_instance_running",
                         lambda m: pytest.fail("不該查 mutex"))
     monkeypatch.setattr(pl, "launch_app_script", lambda *a, **k: None)
-    assert pl.launch_helper_script("排班.pyw", what="排班程式").ok is True
+    assert pl.launch_helper_script(pl.SCHEDULER).ok is True
 
 
 def test_args_are_passed_through(monkeypatch):
@@ -81,8 +78,7 @@ def test_args_are_passed_through(monkeypatch):
     monkeypatch.setattr(pl, "is_instance_running", lambda m: False)
     monkeypatch.setattr(pl, "launch_app_script",
                         lambda name, **k: seen.update(name=name, **k))
-    pl.launch_helper_script("打卡.pyw", what="打卡程式",
-                            args=("--configure-if-empty",))
+    pl.launch_helper_script(pl.AUTOCLOCK)
     assert seen["args"] == ("--configure-if-empty",)
 
 
@@ -93,8 +89,7 @@ def test_a_missing_script_says_which_file_and_where_to_look(monkeypatch):
         raise FileNotFoundError("nope")
     monkeypatch.setattr(pl, "launch_app_script", _missing)
 
-    out = pl.launch_helper_script("中國醫皮膚科排班程式.pyw",
-                                  what="排班程式", peer="排班程式")
+    out = pl.launch_helper_script(pl.SCHEDULER)
     assert out.failed is True
     assert out.error_title == "啟動失敗"
     assert out.error_message == (
@@ -108,7 +103,7 @@ def test_the_peer_wording_defaults_to_the_generic_form(monkeypatch):
     def _missing(*a, **k):
         raise FileNotFoundError("nope")
     monkeypatch.setattr(pl, "launch_app_script", _missing)
-    out = pl.launch_helper_script("座標.pyw", what="座標偵測程式")
+    out = pl.launch_helper_script(pl.COORDINATE_DETECTOR)
     assert "請確認主程式與該程式在同一個資料夾中。" in out.error_message
 
 
@@ -116,7 +111,7 @@ def test_an_unexpected_error_is_reported_with_its_cause(monkeypatch):
     def _boom(*a, **k):
         raise PermissionError("拒絕存取")
     monkeypatch.setattr(pl, "launch_app_script", _boom)
-    out = pl.launch_helper_script("x.pyw", what="打卡程式")
+    out = pl.launch_helper_script(pl.AUTOCLOCK)
     assert out.failed is True
     assert out.error_message == "無法啟動打卡程式:\n拒絕存取"
 
@@ -141,7 +136,7 @@ def test_opening_a_url_reports_failure(monkeypatch):
 
 def test_a_successful_launch_has_nothing_to_show(monkeypatch):
     monkeypatch.setattr(pl, "launch_app_script", lambda *a, **k: None)
-    out = pl.launch_helper_script("x.pyw", what="排班程式")
+    out = pl.launch_helper_script(pl.SCHEDULER)
     assert out.ok and not out.failed and out.error_message == ""
 
 
@@ -210,3 +205,93 @@ def test_the_shared_layer_does_not_import_tkinter():
             names.append(node.module or "")
     assert not [n for n in names if n.split(".")[0] == "tkinter"], \
         f"program_launcher 不可以 import tkinter（實際: {names}）"
+
+
+# ─── ★[2026-08-05 外審 P3] log 訊息也是契約★ ─────────────────────────────
+# 第一版把四支收斂成一支之後，log 改用程式名組出來（`Launching 排班程式: …`）。
+# 但原字串**不是規則的**：排班的失敗訊息是 `Failed to launch scheduler`（沒有
+# program），其餘三支是 `Failed to launch ○○ program`；「已在執行」那句也各自不同。
+# 組不回來就是組不回來 —— 而 log 是事後查問題的依據，改掉會讓既有搜尋方式失效。
+# 而且當時的測試只驗 `LaunchOutcome` 的 UI 文字，一句 log 都沒抓，所以完全沒發現。
+_ORIGINAL_LOGS = {
+    "SCHEDULER": {
+        "log_launching": "Launching scheduler program: %s",
+        "log_not_found": "Scheduler script not found: %s",
+        "log_failed": "Failed to launch scheduler: %s",
+        "log_already_running": "",
+    },
+    "AUTOCLOCK": {
+        "log_launching": "Launching autoclock program: %s (--configure-if-empty)",
+        "log_not_found": "Autoclock script not found: %s",
+        "log_failed": "Failed to launch autoclock program: %s",
+        "log_already_running": "Autoclock program is already running; skip launch",
+    },
+    "COORDINATE_DETECTOR": {
+        "log_launching": "Launching coordinate detector program: %s",
+        "log_not_found": "Coordinate detector script not found: %s",
+        "log_failed": "Failed to launch coordinate detector program: %s",
+        "log_already_running": "",
+    },
+    "CONSULT_QUERY": {
+        "log_launching": "Launching consult query program: %s",
+        "log_not_found": "Consult query script not found: %s",
+        "log_failed": "Failed to launch consult query program: %s",
+        "log_already_running":
+            "Consult query program is already running; skip launch",
+    },
+}
+
+
+@pytest.mark.parametrize("name", sorted(_ORIGINAL_LOGS))
+def test_the_log_templates_match_the_pre_refactor_strings(name):
+    """搬家不可以改 log —— 那是事後查問題的依據。"""
+    program = getattr(pl, name)
+    for field, expected in _ORIGINAL_LOGS[name].items():
+        assert getattr(program, field) == expected, \
+            f"{name}.{field} 與搬家前不一致"
+
+
+def test_the_launch_log_renders_exactly_as_before(monkeypatch, caplog):
+    """★真的跑一次，看 log 實際長什麼樣★ 只比對模板字串還不夠：
+    參數順序接錯的話模板對、渲染出來仍然是錯的。"""
+    import logging as _lg
+    monkeypatch.setattr(pl, "launch_app_script", lambda *a, **k: None)
+    with caplog.at_level(_lg.INFO):
+        pl.launch_helper_script(pl.SCHEDULER)
+    assert ("Launching scheduler program: 中國醫皮膚科排班程式.pyw"
+            in [r.getMessage() for r in caplog.records])
+
+
+def test_the_failure_log_renders_the_exception(monkeypatch, caplog):
+    import logging as _lg
+
+    def _boom(*a, **k):
+        raise PermissionError("拒絕存取")
+    monkeypatch.setattr(pl, "launch_app_script", _boom)
+    with caplog.at_level(_lg.ERROR):
+        pl.launch_helper_script(pl.SCHEDULER)
+    assert "Failed to launch scheduler: 拒絕存取" in \
+        [r.getMessage() for r in caplog.records]
+
+
+def test_the_already_running_log_renders(monkeypatch, caplog):
+    import logging as _lg
+    monkeypatch.setattr(pl, "is_instance_running", lambda m: True)
+    with caplog.at_level(_lg.INFO):
+        pl.launch_helper_script(pl.CONSULT_QUERY)
+    assert "Consult query program is already running; skip launch" in \
+        [r.getMessage() for r in caplog.records]
+
+
+def test_every_helper_program_carries_its_own_log_strings():
+    """★空集合／漏填不算通過★ 新增一支輔助程式時，四條 log 不可以留空
+    （留空的話 `logging.info("")` 會印出空行，等於那次啟動沒有紀錄）。"""
+    programs = [v for v in vars(pl).values()
+                if isinstance(v, pl.HelperProgram)]
+    assert len(programs) == 4, f"預期 4 支輔助程式，實際 {len(programs)}"
+    for p in programs:
+        assert p.log_launching and p.log_not_found and p.log_failed, \
+            f"{p.what} 少了 log 模板"
+        if p.single_instance_mutex:
+            assert p.log_already_running, \
+                f"{p.what} 有單一實例鎖卻沒有「已在執行」的 log"

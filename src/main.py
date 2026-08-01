@@ -224,6 +224,7 @@ from cmuh_common.deps_runtime import ensure_dependencies as _ensure_deps_runtime
 from cmuh_common.single_instance import (
     ensure_single_instance, release_single_instance,
 )
+from cmuh_common import program_launcher as _pl
 from cmuh_common.program_launcher import (
     kill_orphan_chromedriver as _pl_kill_orphan_chromedriver,
     launch_helper_script as _pl_launch_helper_script,
@@ -9734,31 +9735,25 @@ class AutomationApp:
             ttk.Button(web_frame_row2, text=text, style="Link.TButton", command=lambda u=url: self._launch_browser(u)).pack(side="left", padx=2, pady=self._LINK_BTN_PADY)
 
     def _launch_scheduler_program(self):
-        _show_launch_error(_pl_launch_helper_script(
-            "中國醫皮膚科排班程式.pyw", what="排班程式", peer="排班程式"))
+        _show_launch_error(_pl_launch_helper_script(_pl.SCHEDULER))
 
     def _launch_autoclock_program(self):
         # [2026-08-02] 打卡程式在【沒有可用設定】時已改為不啟動(使用者定案:
         # 沒設定的電腦不用跑 autoclock)。這顆按鈕是「設定」那條路,所以一律帶
-        # --configure-if-empty:有設定就進背景模式,沒有就開設定視窗。
+        # --configure-if-empty(見 `_pl.AUTOCLOCK.args`):有設定就進背景模式,
+        # 沒有就開設定視窗。
         # ★不可在這裡自己判斷檔案在不在★ —— 檔案可能存在卻是 `[]`(使用者刪光最後
         #   一個帳號),那樣按鈕會啟動背景模式、autoclock 靜默結束,設定視窗再也
         #   叫不出來。「什麼算可用設定」只由 autoclock 判斷一次。
-        _show_launch_error(_pl_launch_helper_script(
-            "中國醫皮膚科打卡程式.pyw", what="打卡程式", peer="打卡程式",
-            args=("--configure-if-empty",),
-            single_instance_mutex="Local\\CMUH_Skin_AutoClock_SingleInstance_v1"))
+        _show_launch_error(_pl_launch_helper_script(_pl.AUTOCLOCK))
 
     def _launch_coordinate_detector_program(self):
-        _show_launch_error(_pl_launch_helper_script(
-            "中國醫皮膚科點座標偵測程式.pyw", what="座標偵測程式"))
+        _show_launch_error(_pl_launch_helper_script(_pl.COORDINATE_DETECTOR))
 
     def _launch_consult_query_program(self):
         # 只啟動常駐托盤（不帶 --run-now），讓使用者由托盤選單或排程觸發；
         # 已啟動則靜默結束（不彈視窗）。需要立即執行可右鍵托盤「立即執行一次」。
-        _show_launch_error(_pl_launch_helper_script(
-            "中國醫皮膚科會診查詢程式.pyw", what="會診查詢程式",
-            single_instance_mutex="Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1"))
+        _show_launch_error(_pl_launch_helper_script(_pl.CONSULT_QUERY))
 
     def _create_other_programs_tab(self, tools_tab):
         
