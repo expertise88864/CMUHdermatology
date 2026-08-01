@@ -43,6 +43,7 @@ import sys
 JOURNAL_FILENAME = ".updater_commit.journal"
 FAILED_JOURNAL_SUFFIX = ".failed.json"
 LOCK_FILENAME = ".updater_write.lock"
+JOURNAL_SCHEMA = 1
 
 # 復原結果
 CLEAN = "clean"                      # 沒有交易日誌 —— 上一批正常結束
@@ -77,6 +78,10 @@ class RecoveryResult:
             return (f"上一批更新沒有回滾完成：還有 {len(self.unresolved)} 個檔案"
                     f"沒有還原成功（可能是防毒或權限暫時鎖住）")
         if self.status == TERMINAL_FAILURE:
+            if not self.unresolved:
+                # 這一輪沒有再跑回滾，是讀到【上一次】留下的失敗標記。
+                # ★措辭鐵律★ 不能說「0 個檔案的備份不在了」——那是這次沒去數。
+                return "先前有一次更新無法自動修復，狀況尚未解除"
             return (f"上一批更新無法自動修復：{len(self.unresolved)} 個檔案的備份"
                     f"已經不在了")
         return "無法判斷上一批更新是否完成"
@@ -180,10 +185,49 @@ def _rollback_one(app_dir, entry, errors):
         return "retryable"      # 鎖住／權限 —— 下次可能就好了
 
 
+def _parse_journal(payload):
+    """→ (entries, 錯誤原因)。★看不懂就說看不懂，不要當成空的★
+
+    ★[2026-08-02 外審第 2 輪 P2] 原本是 `payload.get("files") or []`★
+    於是一個 `{}`、一個 schema 對不上的、或 `files` 被寫壞成空陣列的日誌，
+    都會安安靜靜地走完「沒有檔要還原」→ 刪掉日誌 → 回 RECOVERED。
+    磁碟明明是混版，我們卻回報「已復原」並放行 —— 那是這一整批要消滅的東西，
+    自己卻在最外層又做了一次。
+    """
+    if not isinstance(payload, dict):
+        return None, "交易日誌不是物件"
+    schema = payload.get("schema")
+    if schema != JOURNAL_SCHEMA:
+        # ★不認得的版本不要硬解★ 欄位語意可能已經變了，照舊規則動檔案更危險。
+        return None, f"交易日誌版本 {schema!r} 不是我認得的 {JOURNAL_SCHEMA}"
+    files = payload.get("files")
+    if not isinstance(files, list) or not files:
+        # updater 只在「這一批真的有檔要寫」時才落地日誌 —— 空的就是壞的。
+        return None, "交易日誌沒有任何檔案項目"
+    for entry in files:
+        if not isinstance(entry, dict) or not isinstance(
+                entry.get("target"), str) or not entry.get("target"):
+            return None, "交易日誌的項目缺少 target"
+        if not isinstance(entry.get("existed_before"), bool):
+            return None, "交易日誌的項目缺少 existed_before"
+    return files, ""
+
+
 def recover_before_start(app_dir) -> RecoveryResult:
     """啟動器在 import 主程式【之前】呼叫。絕不拋例外。"""
     journal = os.path.join(app_dir, JOURNAL_FILENAME)
     try:
+        if os.path.exists(journal + FAILED_JOURNAL_SUFFIX):
+            # ★[2026-08-02 外審第 2 輪 P1] terminal 不可以只擋第一次★
+            #   原本改名之後就沒有人再看它，下一次啟動找不到 journal → CLEAN →
+            #   磁碟還是混版卻【無聲啟動】。那等於整個機制只生效一次。
+            #   這個標記由 `updater` 在「一整輪更新完全成功」之後才清掉
+            #   （見 `clear_failed_journal_marker`）—— 那時整棵樹已經被換成
+            #   一致的新版，才真的沒事了。
+            return RecoveryResult(
+                TERMINAL_FAILURE, journal_present=True,
+                errors=["上一次更新留下無法修復的紀錄（%s%s）"
+                        % (JOURNAL_FILENAME, FAILED_JOURNAL_SUFFIX)])
         if not os.path.exists(journal):
             return RecoveryResult(CLEAN)
     except Exception:
@@ -200,7 +244,11 @@ def recover_before_start(app_dir) -> RecoveryResult:
                 return RecoveryResult(CLEAN)     # 等鎖的期間對方正常結束了
             with open(journal, "r", encoding="utf-8") as f:
                 payload = json.load(f)
-            files = payload.get("files") or []
+            files, why = _parse_journal(payload)
+            if files is None:
+                # ★保留日誌★ 我們看不懂它，但它是唯一的證據，不可以刪。
+                return RecoveryResult(UNKNOWN, journal_present=True,
+                                      errors=[why])
             restored, unresolved, terminal, errors = [], [], [], []
             for entry in reversed(files):        # 與寫入相反的順序
                 verdict = _rollback_one(app_dir, entry, errors)

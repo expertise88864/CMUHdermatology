@@ -462,6 +462,30 @@ def _archive_failed_journal(app_dir: str, terminal: "list[str]") -> None:
                       "保留原日誌", len(terminal), e)
 
 
+def clear_failed_journal_marker(app_dir: str = "") -> bool:
+    """一整輪更新【完全成功】之後，才可以把「救不回來」的標記清掉。
+
+    ★[2026-08-02 外審第 2 輪 P1] 為什麼需要這一支★
+    `.failed.json` 是給 `bootstrap_recovery` 看的長效標記：只要它還在，臨床主程式
+    每次啟動都會問人。那個狀態必須有出口，否則使用者只能每天早上按「是」。
+
+    出口就是「整棵樹被換成一致的新版」—— 一輪成功的更新會把 manifest 上每個檔
+    對到期望的 SHA（相同的跳過、不同的重寫），跑完沒有錯誤就代表混版已經被蓋掉。
+    ★只在那個時候清★ 不可以因為「這次沒偵測到問題」就清。
+    """
+    try:
+        path = _journal_path(app_dir or get_app_dir()) + FAILED_JOURNAL_SUFFIX
+        if not os.path.exists(path):
+            return False
+        os.remove(path)
+        logging.warning("[更新] 已完成一輪完整更新 → 解除先前的「無法修復」標記（%s）",
+                        os.path.basename(path))
+        return True
+    except Exception:      # noqa: BLE001
+        logging.error("[更新] 解除「無法修復」標記失敗", exc_info=True)
+        return False
+
+
 def _rewrite_journal_for_retry(app_dir: str,
                                unresolved: "list[_WrittenFile]") -> None:
     """把日誌縮成「還沒還原成功」的那幾個檔，讓下次啟動只重試它們。
@@ -1063,6 +1087,10 @@ def check_and_update(
 
     if not pending_writes:
         logging.info("[更新檢查] 所有檔案皆為最新")
+        # ★這裡是「整棵樹一致」的證明★ 走到這代表 manifest 上【每一個】檔的
+        #   磁碟 SHA 都對得上，而且沒有任何下載失敗。先前若留下「救不回來」的
+        #   標記，到此可以解除 —— 混版已經不存在了。
+        clear_failed_journal_marker(app_dir)
         return result
 
     _progress("writing")
@@ -1292,10 +1320,19 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
             logging.error("更新寫入失敗，且有 %d 個檔【沒有】回滾成功 → "
                           "已保留交易日誌，下次啟動會再試", len(unresolved))
             return result
+        if rb.terminal:
+            # ★[2026-08-02 外審第 2 輪 P2] 這一支原本也只看 `unresolved`★
+            #   「備份不見了」不會進 unresolved（重試沒意義），於是這裡走進
+            #   「全部回滾完了」的分支把日誌清掉 —— 磁碟仍是混版，證據卻沒了。
+            _archive_failed_journal(app_dir_for_journal, rb.terminal)
+            return result
         # 全部都回滾完了 → 日誌沒有存在的理由（留著會讓下次啟動再回滾一次，
         # 而那時 .bak 已經被 rollback 消耗掉 → 每次啟動噴一批 error）。
         _clear_commit_journal(app_dir_for_journal)
-        logging.warning("更新寫入失敗，已回滾 %d 個檔案", len(written_files))
+        # ★誠實計數★ 報 `restored`，不是整批的長度：崩潰點之後那些根本沒被
+        #   替換過的檔不算「回滾了」。
+        logging.warning("更新寫入失敗，已回滾 %d 個檔案（本批共 %d 個）",
+                        len(rb.restored), len(written_files))
         return result
 
     # ★整批 replace 都成功了 → 先清日誌，再清 .bak★
@@ -1321,6 +1358,9 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
         if rb_unresolved:
             logging.error("[更新] 日誌清不掉且回滾也有 %d 個檔沒成功 —— "
                           "交易日誌留著，下次啟動會再試", len(rb_unresolved))
+        elif _rb.terminal:
+            # 同上：救不回來的檔不在 unresolved 裡，不可以當成乾淨結案。
+            _archive_failed_journal(app_dir_for_journal, _rb.terminal)
         else:
             # 回滾用掉了 .bak；再試一次清日誌。清不掉也不致命：下次啟動會照日誌
             # 重跑一次回滾，那時檔案已經是舊版、備份也沒了 → 噴一批 error 後把
@@ -1344,6 +1384,11 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
     # [O8] 預編譯 .pyc：剛覆寫的 .py 立即 compile，省下次 import 時的 byte-compile 開銷
     if written_files:
         _precompile_files([written.target_path for written in written_files])
+
+    # ★整批 commit 成功 → 混版已經被整棵樹的新版蓋掉★
+    #   這是「救不回來」標記的出口（見 `clear_failed_journal_marker`）：
+    #   本批的每個檔都寫成了 manifest 上的 SHA，其餘的在下載階段就比對相符。
+    clear_failed_journal_marker(app_dir_for_journal)
 
     result.has_update = len(result.updated_files) > 0
     return result

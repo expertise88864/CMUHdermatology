@@ -12,6 +12,13 @@
       "sha256": "53ca43c0c44c0e493e691a8e9e24b60d744efd4750195a9c964a0113d877594f"
     },
     {
+      "key": "bootstrap_recovery",
+      "remote_path": "src/bootstrap_recovery.py",
+      "local_filename": "src/bootstrap_recovery.py",
+      "version": "2026.08.02.1",
+      "sha256": "420ad6c655d4e42fd4f3ea1f0cee4cee0a70f2e57c82a1992ad73aae877a38e5"
+    },
+    {
       "key": "clock.__init__",
       "remote_path": "src/clock/__init__.py",
       "local_filename": "src/clock/__init__.py",
@@ -660,7 +667,7 @@
       "remote_path": "src/cmuh_common/updater.py",
       "local_filename": "src/cmuh_common/updater.py",
       "version": "2026.08.02.1",
-      "sha256": "45803bb2728fef536dcf639ed38b95ac8b66ec06d5e62053b96d540c24914ca7"
+      "sha256": "0316d8a1e41cb0bdf3d16de84b49c8a08789aa6732b10b86a8edad0290708090"
     },
     {
       "key": "cmuh_common.uvb_dose",
@@ -737,42 +744,42 @@
       "remote_path": "中國醫皮膚科主程式.pyw",
       "local_filename": "中國醫皮膚科主程式.pyw",
       "version": "2026.08.02.1",
-      "sha256": "9e72e8eff6d20a85e713a9f2027fe5db2ba61da6646a107c6846de1426c0b5d6"
+      "sha256": "cd5eeec0d7c79c1de5a714ed35246999391d1c9f72bdb54ce835be32fbb87064"
     },
     {
       "key": "中國醫皮膚科打卡程式_pyw",
       "remote_path": "中國醫皮膚科打卡程式.pyw",
       "local_filename": "中國醫皮膚科打卡程式.pyw",
       "version": "2026.08.02.1",
-      "sha256": "b47df2af476302c87265feeb4768ebd9c7d5aeb594631bca1dc73629f5490535"
+      "sha256": "f1704b0bd185f3b8ffd2ed99f24db3b186e7adc1894d8c57cf3bce99e68639cb"
     },
     {
       "key": "中國醫皮膚科排班程式_pyw",
       "remote_path": "中國醫皮膚科排班程式.pyw",
       "local_filename": "中國醫皮膚科排班程式.pyw",
       "version": "2026.08.02.1",
-      "sha256": "caae16d79a1581213cbd4bf7c3e8573a7e220222e717f93f872d2b981549b9f4"
+      "sha256": "2074097a1fdc66ea02ef928500944dfddde1d204b24788f9d1e30ad7928b1e43"
     },
     {
       "key": "中國醫皮膚科會診查詢程式_pyw",
       "remote_path": "中國醫皮膚科會診查詢程式.pyw",
       "local_filename": "中國醫皮膚科會診查詢程式.pyw",
       "version": "2026.08.02.1",
-      "sha256": "ee84fabda0988beb0f2af4ace4a2997fb21efea29585bbf3199b35d5d3ed13af"
+      "sha256": "eb5c19b490e775492ae63052500486276c04744ce62e5ba74e68f10587de7cc6"
     },
     {
       "key": "中國醫皮膚科點座標偵測程式_pyw",
       "remote_path": "中國醫皮膚科點座標偵測程式.pyw",
       "local_filename": "中國醫皮膚科點座標偵測程式.pyw",
       "version": "2026.08.02.1",
-      "sha256": "5208a1353e5f46e725077ce1ac83f0da1b0c21b7978eba7919e6a4e41e60e11d"
+      "sha256": "f7765331b2fc2d7b709bfab3e27df9646544f81e41172870fd47e86cf66a7f7b"
     },
     {
       "key": "中國醫皮膚科守護程式_pyw",
       "remote_path": "中國醫皮膚科守護程式.pyw",
       "local_filename": "中國醫皮膚科守護程式.pyw",
       "version": "2026.08.02.1",
-      "sha256": "d1d7b51fd2901ccec45f7841902e09c2b35d455470ea33bbbcfa48bf0f8540f1"
+      "sha256": "e853a225b02947c206fa25c06e73834ccc9887491e88840a9342e1b848beedeb"
     },
     {
       "key": "安裝開機自動啟動_cmd",

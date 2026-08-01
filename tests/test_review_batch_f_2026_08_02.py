@@ -33,6 +33,19 @@ LAUNCHERS = [
 
 CLINICAL_LAUNCHER = LAUNCHERS[0]
 
+# ★分界是「這支程式會不會對 HIS 送輸入」，不是「有沒有人看著」★
+#   會送輸入的，復原沒完成就不進應用程式（主程式問人，其餘無聲退出）。
+#   不送輸入的照常啟動 —— 守護程式尤其不可以擋，它是唯一會反覆重試復原的。
+HIS_INPUT_LAUNCHERS = [
+    "中國醫皮膚科打卡程式.pyw",        # 點打卡按鈕、輸入帳密
+    "中國醫皮膚科會診查詢程式.pyw",    # PostMessage 點 systemftp 欄位/表格
+]
+NON_HIS_LAUNCHERS = [
+    "中國醫皮膚科守護程式.pyw",
+    "中國醫皮膚科排班程式.pyw",
+    "中國醫皮膚科點座標偵測程式.pyw",
+]
+
 
 def _read_launcher(name):
     with io.open(os.path.join(REPO_ROOT, name), encoding="utf-8") as f:
@@ -114,16 +127,60 @@ class TestRecoveryRunsBeforeAnythingElse:
         assert inside, "run_path 不在復原判斷的分支內"
         assert not outside, f"還有 run_path 在復原判斷之外：第 {sorted(outside)} 行"
 
-    def test_only_the_clinical_launcher_is_allowed_to_block_startup(self):
-        """★其餘五支刻意【不擋】★ 它們無人看顧，跳窗只會讓行程卡死。
-
-        這個測試把那個取捨釘住：哪天有人順手把 confirm_start_despite 加到
-        守護程式或打卡程式，會在這裡轉紅並被迫重新想一次。
-        """
+    def test_only_the_clinical_launcher_pops_a_window(self):
+        """★只有主程式跳窗★ 其餘五支無人看顧，MessageBox 會讓行程卡死。"""
         for name in LAUNCHERS[1:]:
             assert "confirm_start_despite" not in _read_launcher(name), (
                 f"{name} 是無人看顧的程式，不可以跳窗擋啟動")
         assert "confirm_start_despite" in _read_launcher(CLINICAL_LAUNCHER)
+
+    @pytest.mark.parametrize("name", HIS_INPUT_LAUNCHERS)
+    def test_programs_that_type_into_his_refuse_to_start_when_unsafe(
+            self, name):
+        """★[2026-08-02 外審第 2 輪 P1] 不跳窗 ≠ 照樣啟動★
+
+        我第一版把「無人看顧」當成「必須 fail-open」，那是兩件事：
+        不能【跳窗】成立，不能【退出】不成立 —— 排程會再叫一次，而混版模組
+        一旦載進記憶體就收不回來。
+
+        判準：`safe_to_start` 的結果必須真的用來決定要不要繼續，
+        而且要在 `run_path` 之前就有一條退出路徑。
+        """
+        src = _read_launcher(name)
+        assert "safe_to_start" in src, f"{name} 丟棄了復原結果"
+        tree = ast.parse(src)
+
+        # ★退出必須掛在【復原結果】那個判斷底下★
+        #   第一版只比「最早的 SystemExit 行號 < 最早的 run_path 行號」，
+        #   而打卡程式本來就有一個單例檢查的 `raise SystemExit(0)` 排在前面 ——
+        #   把復原那段整個刪掉，測試照樣綠。這是「拿別人的證據當自己的」。
+        guards = [n for n in ast.walk(tree) if isinstance(n, ast.If)
+                  and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                          and c.func.id == "_recover_incomplete_update"
+                          for c in ast.walk(n.test))]
+        assert guards, f"{name}：沒有把退出掛在復原結果的判斷上"
+        exits = [n for g in guards for n in ast.walk(g)
+                 if isinstance(n, ast.Raise) and isinstance(n.exc, ast.Call)
+                 and isinstance(n.exc.func, ast.Name)
+                 and n.exc.func.id == "SystemExit"]
+        assert exits, f"{name}：復原不安全時沒有退出"
+        runs = [n.lineno for n in ast.walk(tree)
+                if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "run_path"]
+        assert runs and min(e.lineno for e in exits) < min(runs), (
+            f"{name}：退出沒有排在載入應用程式之前")
+
+    @pytest.mark.parametrize("name", NON_HIS_LAUNCHERS)
+    def test_programs_that_never_touch_his_still_start(self, name):
+        """★空集合不算通過★ 上面那條規則不可以無聲擴散到所有程式。
+
+        守護程式尤其不可以擋：它是無人看顧下【唯一】會反覆重試復原的東西，
+        擋掉它等於把自我修復的路砍斷（見該檔說明）。
+        """
+        src = _read_launcher(name)
+        assert "safe_to_start" not in src, (
+            f"{name} 不碰 HIS，不應該因復原失敗而拒絕啟動")
 
     def test_bootstrap_recovery_imports_nothing_from_the_app(self):
         """★它不可以 import cmuh_common★ 那正是可能壞掉的東西。
@@ -593,17 +650,282 @@ class TestTheLockIsTheSameOneTheUpdaterUses:
 
 
 def test_bootstrap_recovery_is_shipped_by_the_updater():
-    """它必須進更新清單，否則診間永遠拿不到這支程式。"""
+    """★比對【已提交的】manifest.json，不是「重新產生會包含」★
+
+    [2026-08-02 外審第 2 輪] 第一版只呼叫 `collect_entries()`，那只證明
+    「如果重新產生就會有」。實際送到診間的是 repo 裡那份 manifest.json ——
+    新模組沒同步進去的話，updater 根本不知道有這個檔，修好的東西一輩子
+    到不了診間。這支測試比對兩邊的檔案清單。
+    """
     sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
     try:
         import sync_manifest
     finally:
         sys.path.pop(0)
-    entries = sync_manifest.collect_entries("0.0.0")
-    shipped = {e["local_filename"] for e in entries}
-    assert "src/bootstrap_recovery.py" in shipped
+    expected = {e["local_filename"] for e in sync_manifest.collect_entries("0")}
+    with io.open(os.path.join(REPO_ROOT, "manifest.json"),
+                 encoding="utf-8") as f:
+        committed = {e["local_filename"] for e in json.load(f)["files"]}
+
+    assert "src/bootstrap_recovery.py" in committed, (
+        "★新模組沒進 manifest.json → 診間收不到★"
+        "（修法：python scripts/sync_manifest.py <version>）")
     for name in LAUNCHERS:
-        assert name in shipped, f"{name} 沒有進更新清單"
+        assert name in committed, f"{name} 沒有進更新清單"
+    assert expected == committed, (
+        f"manifest.json 與 sync_manifest 產生的清單不一致，"
+        f"少了 {sorted(expected - committed)}，多了 {sorted(committed - expected)}")
+
+
+class TestTheTerminalMarkerSurvivesRestarts:
+    """[2026-08-02 外審第 2 輪 P1] terminal 原本只擋第一次啟動。"""
+
+    def test_a_second_startup_still_reports_terminal(self, tmp_path):
+        """★這是那個 finding 的核心★
+
+        改名成 .failed.json 之後就沒有人再看它 → 第二次啟動找不到 journal
+        → CLEAN → 磁碟仍是混版卻【無聲啟動】。整個機制只生效一次。
+        """
+        target = tmp_path / "lost.py"
+        target.write_text("new, backup gone", encoding="utf-8")
+        _seed_journal(tmp_path, [(str(target), True, "")])
+
+        first = br.recover_before_start(str(tmp_path))
+        assert first.status == br.TERMINAL_FAILURE
+
+        second = br.recover_before_start(str(tmp_path))
+        assert second.status == br.TERMINAL_FAILURE, "★第二次就放行了★"
+        assert second.safe_to_start is False
+
+    def test_the_marker_does_not_claim_a_file_count_it_did_not_measure(
+            self, tmp_path):
+        """★措辭鐵律★ 第二次啟動沒有再數檔案，就不可以說「0 個檔案」。"""
+        (tmp_path / (br.JOURNAL_FILENAME + br.FAILED_JOURNAL_SUFFIX)).write_text(
+            "{}", encoding="utf-8")
+        said = br.recover_before_start(str(tmp_path)).describe()
+        assert "0 個檔案" not in said
+
+    def test_a_complete_update_round_lifts_the_marker(self, tmp_path):
+        """出口：整棵樹被換成一致的新版之後才解除。"""
+        marker = (tmp_path / (updater.JOURNAL_FILENAME
+                              + updater.FAILED_JOURNAL_SUFFIX))
+        marker.write_text("{}", encoding="utf-8")
+
+        assert updater.clear_failed_journal_marker(str(tmp_path)) is True
+        assert not marker.exists()
+        assert br.recover_before_start(str(tmp_path)).status == br.CLEAN
+
+    def test_nothing_to_lift_is_not_an_error(self, tmp_path):
+        assert updater.clear_failed_journal_marker(str(tmp_path)) is False
+
+    def test_the_updater_only_lifts_it_after_proving_consistency(self):
+        """★不可以因為「這次沒偵測到問題」就清掉標記★
+
+        兩個解除點都必須是「manifest 每個檔的 SHA 都對得上」的路徑：
+        整批 commit 成功，或下載階段發現所有檔案皆為最新。
+        """
+        # ★排除它自己★ `def clear_failed_journal_marker(` 也含這個字串；
+        #   不排除的話這支測試會被自己的定義餵飽（同一輪內第 N 次踩到
+        #   「掃原始碼的測試自己命中自己」）。
+        callers = [name for name, obj in vars(updater).items()
+                   if callable(obj) and getattr(obj, "__module__", "")
+                   == updater.__name__
+                   and name != "clear_failed_journal_marker"
+                   and "clear_failed_journal_marker(" in _safe_code(obj)]
+        assert set(callers) == {"check_and_update", "_commit_pending_writes"}, (
+            f"解除標記的地方變了：{sorted(callers)}")
+
+
+def _body_without_docstring(node):
+    """把 FunctionDef 的 docstring 拿掉再 unparse。
+
+    ★又是同一個坑★ 說明文字裡提到 `bootstrap_recovery`，掃原始碼的斷言就會
+    命中自己的註解而永遠通過（或像這次一樣永遠失敗）。
+    """
+    body = node.body
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    return "\n".join(ast.unparse(n) for n in body)
+
+
+def _safe_code(obj):
+    import inspect
+    try:
+        return inspect.getsource(obj)
+    except Exception:      # noqa: BLE001  內建/C 函式沒有原始碼
+        return ""
+
+
+class TestACorruptJournalIsNeverTreatedAsSuccess:
+    """[2026-08-02 外審第 2 輪 P2] `payload.get("files") or []` 的洞。"""
+
+    @pytest.mark.parametrize("payload,why", [
+        ({}, "空物件"),
+        ({"schema": 1}, "沒有 files"),
+        ({"schema": 1, "files": []}, "files 是空的"),
+        ({"schema": 99, "files": [{"target": "x", "existed_before": True}]},
+         "schema 版本不認得"),
+        ({"schema": 1, "files": [{"existed_before": True}]}, "項目缺 target"),
+        ({"schema": 1, "files": [{"target": "x"}]}, "項目缺 existed_before"),
+        ({"schema": 1, "files": "not a list"}, "files 型別錯"),
+        ([1, 2, 3], "payload 根本不是物件"),
+    ])
+    def test_an_unreadable_journal_is_unknown_and_is_kept(self, tmp_path,
+                                                          payload, why):
+        journal = tmp_path / br.JOURNAL_FILENAME
+        journal.write_text(json.dumps(payload), encoding="utf-8")
+
+        result = br.recover_before_start(str(tmp_path))
+
+        assert result.status == br.UNKNOWN, f"{why} 卻被當成可以啟動"
+        assert result.safe_to_start is False
+        assert journal.exists(), "★看不懂的日誌是唯一證據，不可以刪★"
+
+    def test_a_well_formed_journal_is_still_accepted(self, tmp_path):
+        """★空集合不算通過★ 證明上面不是「一律拒絕」才綠的。"""
+        target = tmp_path / "ok.py"
+        target.write_text("new", encoding="utf-8")
+        (tmp_path / "ok.py.bak").write_text("old", encoding="utf-8")
+        _seed_journal(tmp_path, [(str(target), True, "")])
+        assert br.recover_before_start(str(tmp_path)).status == br.RECOVERED
+
+    def test_both_modules_agree_on_the_schema_number(self):
+        assert br.JOURNAL_SCHEMA == updater.JOURNAL_SCHEMA
+
+
+class TestEveryRollbackConsumerHandlesTerminal:
+    """[2026-08-02 外審第 2 輪 P2] 另外兩個呼叫端仍只看 unresolved。"""
+
+    def test_a_failed_commit_whose_backup_vanished_keeps_the_evidence(
+            self, tmp_path, monkeypatch):
+        """★真的跑一次 commit 失敗 → 回滾 → 備份不見★
+
+        第一版這裡是「數 `_clear_commit_journal(` 與 `.terminal` 的出現次數」，
+        而突變 `if rb.terminal:` → `if False:` 之後兩個字串都還在，測試照樣綠。
+        ★數字串不等於驗行為★ 改成把那條路徑實際走一遍。
+        """
+        first, second = tmp_path / "a.py", tmp_path / "b.py"
+        first.write_text("舊 A", encoding="utf-8")
+        second.write_text("舊 B", encoding="utf-8")
+
+        # 不做備份 → 第一個檔換掉之後就沒有 .bak 可以還原（＝救不回來）
+        monkeypatch.setattr(updater, "_make_backup_atomically", lambda p: None)
+
+        calls = []
+
+        def _replace_then_fail(src_path, dst_path):
+            calls.append(dst_path)
+            if len(calls) == 1:
+                os.replace(src_path, dst_path)
+                return
+            raise OSError("[WinError 5] 第二個檔寫不進去")
+
+        monkeypatch.setattr(updater, "_replace_file_with_retry",
+                            _replace_then_fail)
+
+        result = updater._commit_pending_writes(
+            [("k1", "a.py", "1", "新 A", str(first)),
+             ("k2", "b.py", "1", "新 B", str(second))],
+            updater.UpdateResult(is_frozen=False))
+
+        assert result.errors
+        # 交易日誌放在 get_app_dir()（不是目標檔隔壁）—— 見 updater 裡
+        # `app_dir_for_journal` 的取得方式。第一版這裡用 tmp_path，測試紅
+        # 了但紅的不是產品。
+        journal = os.path.join(updater.get_app_dir(),
+                               updater.JOURNAL_FILENAME)
+        assert not os.path.exists(journal), "日誌應該改名，不是留著重試"
+        assert os.path.exists(journal + updater.FAILED_JOURNAL_SUFFIX), (
+            "★備份不見了卻被當成乾淨結案：磁碟仍是混版，證據卻沒了★")
+        assert result.updated_files == []
+
+    def test_a_clean_rollback_after_a_failed_commit_leaves_no_marker(
+            self, tmp_path, monkeypatch):
+        """★空集合不算通過★ 有備份可還原時不可以留下「救不回來」標記。"""
+        first, second = tmp_path / "a.py", tmp_path / "b.py"
+        first.write_text("舊 A", encoding="utf-8")
+        second.write_text("舊 B", encoding="utf-8")
+
+        calls = []
+        real_replace = updater._replace_file_with_retry
+
+        def _replace_then_fail(src_path, dst_path):
+            calls.append(dst_path)
+            if len(calls) == 1:
+                return real_replace(src_path, dst_path)
+            raise OSError("[WinError 5] 第二個檔寫不進去")
+
+        monkeypatch.setattr(updater, "_replace_file_with_retry",
+                            _replace_then_fail)
+
+        updater._commit_pending_writes(
+            [("k1", "a.py", "1", "新 A", str(first)),
+             ("k2", "b.py", "1", "新 B", str(second))],
+            updater.UpdateResult(is_frozen=False))
+
+        journal = os.path.join(updater.get_app_dir(),
+                               updater.JOURNAL_FILENAME)
+        assert not os.path.exists(journal + updater.FAILED_JOURNAL_SUFFIX)
+        assert first.read_text(encoding="utf-8") == "舊 A", "沒有回滾成功"
+
+    def test_the_recovery_path_archives_instead_of_clearing(self, tmp_path):
+        """對照：日誌復原那條路徑已經會保留證據（上面 TestTerminalFailure…）。"""
+        target = tmp_path / "x.py"
+        target.write_text("new", encoding="utf-8")
+        _seed_journal(tmp_path, [(str(target), True, "")])
+        updater.recover_incomplete_update(str(tmp_path))
+        assert os.path.exists(os.path.join(
+            str(tmp_path),
+            updater.JOURNAL_FILENAME + updater.FAILED_JOURNAL_SUFFIX))
+
+
+class TestTheLauncherWithoutTheRecoveryModule:
+    """[2026-08-02 外審第 2 輪 P1] import 失敗時原本無條件放行。"""
+
+    def test_it_asks_instead_of_assuming(self):
+        src = _read_launcher(CLINICAL_LAUNCHER)
+        tree = ast.parse(src)
+        func = next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef)
+                    and n.name == "_recover_incomplete_update")
+        handlers = [h for h in ast.walk(func) if isinstance(h, ast.ExceptHandler)]
+        assert handlers, "找不到 import 失敗的處理（測試失效了）"
+        returns = [ast.unparse(n.value) for h in handlers
+                   for n in ast.walk(h) if isinstance(n, ast.Return) and n.value]
+        assert returns, "import 失敗那條路徑沒有回傳值"
+        assert not any(r == "True" for r in returns), (
+            "★載不進復原模組時無條件放行★ 那正是混版機率最高的時候")
+
+    def test_the_fallback_dialog_is_self_contained(self):
+        """它必須自給自足 —— 走到那裡就是因為 bootstrap_recovery 不能用。"""
+        tree = ast.parse(_read_launcher(CLINICAL_LAUNCHER))
+        func = next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef)
+                    and n.name == "_ask_without_the_recovery_module")
+
+        # ★用結構判，不要用字串★ 視窗文字裡【本來就會】出現
+        #   「bootstrap_recovery.py」——那是要講給使用者聽的檔名，不是依賴。
+        #   （字串斷言在這裡是誤報；同理 `0x100` 經 unparse 會變成 `256`。）
+        imported = [a.name for n in ast.walk(func)
+                    if isinstance(n, ast.Import) for a in n.names]
+        imported += [n.module or "" for n in ast.walk(func)
+                     if isinstance(n, ast.ImportFrom)]
+        used = [n.value.id for n in ast.walk(func)
+                if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)]
+        assert "bootstrap_recovery" not in imported + used, (
+            "後備視窗不可以依賴那個載不進來的模組")
+        assert imported == ["ctypes"], f"只應該用 ctypes，卻用了 {imported}"
+
+        body = _body_without_docstring(func)
+        assert "MessageBoxW" in body
+        flags = next(n for n in ast.walk(func)
+                     if isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Attribute)
+                     and n.func.attr == "MessageBoxW").args[3]
+        assert eval(ast.unparse(flags)) & 0x100, (   # noqa: S307  常數運算式
+            "沒有 MB_DEFBUTTON2 → 預設鈕會停在「是」")
 
 
 def test_the_journal_schema_written_is_the_one_bootstrap_reads(tmp_path):

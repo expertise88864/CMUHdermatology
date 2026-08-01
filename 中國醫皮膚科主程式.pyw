@@ -43,6 +43,26 @@ def _report_startup_crash(program_name):
         pass
 
 
+def _ask_without_the_recovery_module():
+    """連 bootstrap_recovery 都載不進來時的詢問視窗（★只用 ctypes★）。
+
+    刻意不共用 `bootstrap_recovery.confirm_start_despite` —— 走到這裡就是因為
+    那個模組不能用。這幾行必須自給自足。
+    """
+    text = ("主程式無法載入「更新復原」模組（bootstrap_recovery.py）。\n\n"
+            "這通常代表上一次自動更新沒有完成，程式資料夾裡可能是新舊版本混在\n"
+            "一起，行為無法預期。\n\n"
+            "建議：關掉所有本套程式後重新啟動一次；仍然不行請找開發者。\n\n"
+            "★是否仍要繼續啟動？★（風險自負；按「否」結束）")
+    try:
+        import ctypes
+        # MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_TOPMOST
+        return ctypes.windll.user32.MessageBoxW(
+            0, text, "更新未完成", 0x04 | 0x30 | 0x100 | 0x40000) == 6
+    except Exception:  # noqa: BLE001  問不到人就不要帶著未知狀態啟動
+        return False
+
+
 def _recover_incomplete_update():
     """[外審 P1-01] ★在 import 任何東西之前，把上一批沒走完的更新收乾淨★
 
@@ -57,8 +77,12 @@ def _recover_incomplete_update():
     try:
         import bootstrap_recovery
     except Exception:  # noqa: BLE001
+        # ★[2026-08-02 外審第 2 輪 P1] 這裡原本 `return True` 無條件放行★
+        #   但「復原模組自己載不進來」正是它可能被更新換到一半的樣子 —— 那時
+        #   磁碟混版的機率最高，卻反而不檢查就啟動。既然無法判斷，就照定案的
+        #   政策問人（同樣預設「否」），而不是替使用者決定。
         _report_startup_crash("主程式（更新復原模組載入失敗）")
-        return True    # ★載不到就不擋★ 擋住等於用一個未知狀態換掉診間的可用性
+        return _ask_without_the_recovery_module()
     result = bootstrap_recovery.recover_and_report(_HERE, "主程式")
     if result.safe_to_start:
         return True
