@@ -1291,3 +1291,68 @@ def test_a_failed_failsafe_schedule_does_not_eat_the_next_hotkey(tk_root,
     assert bo.show() is False
     assert bo.consume_wake_gate() is False, \
         "★沒有人按鍵，不該吃掉下一個熱鍵★"
+
+
+def test_the_eaten_flag_does_not_leak_across_two_wakes(tk_root, monkeypatch):
+    """★[2026-08-01 外審第 4 輪] 「已吃過一下」的範圍是一次喚醒，不是一整段黑幕★
+
+    平常沒差：一段黑幕只會被喚醒一次。但 survivor 卡住時黑幕會【持續存在】，
+    同一段黑幕就會有第二次喚醒 —— 而 `_eaten_this_blackout` 原本只在 `_create()`
+    重設，所以還停在第一次的 True。
+
+    交錯順序：
+      第一次 F1：hook 先跑 → 被擋、設 eaten=True；接著 teardown 卡住（survivor）。
+      第二次 F1：Tk 先跑 → 這次成功關掉 survivor。
+    此時若因為舊的 eaten=True 而不發 token，hook 隨後看到黑幕沒了、也沒有 token，
+    就會把那一下 F1 打在剛露出來的 HIS 上。
+    """
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 500, 400)])
+    bo.show()
+    state = {"alive": True}
+
+    class _Fake:
+        @staticmethod
+        def IsWindow(_h):
+            return 1 if state["alive"] else 0
+
+        @staticmethod
+        def IsWindowVisible(_h):
+            return 1 if state["alive"] else 0
+
+        @staticmethod
+        def ShowWindow(_h, _c):
+            return 0
+
+        @staticmethod
+        def DestroyWindow(_h):
+            return 0
+    monkeypatch.setattr(sb, "_u32", lambda: _Fake())
+
+    # 第一次喚醒：hook 先跑（黑幕仍在 → 擋下並標記 eaten）
+    assert bo.consume_wake_gate() is True
+    assert bo._eaten_this_blackout is True
+    bo.hide()                                   # teardown 卡住
+    assert bo._hwnds, "前提：survivor 還在"
+
+    # 第二次喚醒：Tk 先跑，而且這次真的關掉了
+    state["alive"] = False
+    bo.hide()
+    assert bo._hwnds == ()
+    assert bo.consume_wake_gate() is True, \
+        "★第二次喚醒要有自己的 token★ 舊的 eaten 狀態不可以壓過它"
+
+
+def test_the_eaten_flag_still_prevents_a_double_eat_within_one_wake(tk_root,
+                                                                    made):
+    """反方向（外審第 4 輪原本的要求不可回退）：
+    同一次喚醒裡 hook 先擋了一下，就不可以再發 token 讓下一下也被吃掉。"""
+    bo, idle, _busy = made
+    bo.show()
+    _arm(bo, idle)
+    assert bo.consume_wake_gate() is True       # hook 先跑，擋下這一下
+    idle.input()
+    bo._poll()                                  # Tk/輪詢接著收黑幕
+    assert bo.active is False
+    assert bo.consume_wake_gate() is False, \
+        "同一次喚醒不可以吃掉兩下（醫師按第二下必須有反應）"

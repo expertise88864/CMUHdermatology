@@ -789,15 +789,25 @@ class ScreenBlackout:
             with self._wake_lock:
                 self._wake_token = 0.0
             return
-        if stuck:
-            return
         with self._wake_lock:
-            if self._eaten_this_blackout:
-                # 這次黑幕期間已經有一下熱鍵被吃掉（hook 緒先跑）→ 不再發新
-                # token，否則同一次喚醒會吃掉兩下（外審第 4 輪）。
-                self._wake_token = 0.0
-            else:
-                self._wake_token = time.monotonic()
+            # ★[2026-08-01 外審第 4 輪 P1] 「已吃過一下」的範圍是【一次喚醒】，
+            #   不是【一整段黑幕】★
+            #   `_eaten_this_blackout` 原本只在 `_create()` 重設。平常沒事：一次
+            #   黑幕只會被喚醒一次。但 survivor 卡住時黑幕會【持續存在】，於是同一
+            #   段黑幕會有第二次、第三次喚醒 —— 而旗標還停在第一次的 True。
+            #   後果：第一次 F1 是 hook 先跑（被擋、設 True）、teardown 卡住；
+            #   稍後第二次 F1 換成 Tk 先跑並成功關掉 survivor，這時因為旗標還是
+            #   True 而不發 token，hook 隨後看到黑幕沒了也沒 token → 那一下 F1
+            #   就落在剛露出來的 HIS 上。
+            #   所以每一次 teardown attempt（＝一次喚醒）都把它消耗掉。
+            eaten, self._eaten_this_blackout = self._eaten_this_blackout, False
+            if stuck:
+                # 黑幕還在 → 沒有「剛剛消失」的競態，不需要 token
+                # （閘門靠 `active_from_any_thread()` 本來就還擋著）。
+                return
+            # 這一次喚醒若已經有一下熱鍵被 hook 擋掉，就不要再發 token，
+            # 否則同一次喚醒會吃掉兩下（外審第 4 輪）。
+            self._wake_token = 0.0 if eaten else time.monotonic()
 
     @staticmethod
     def _force_close_survivors(hwnds) -> list:
