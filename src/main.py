@@ -7154,7 +7154,10 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                         stale = _cache_get(cache_main_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         if stale is not None:
                             source_timing["backoff_skip"] += 1  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
-                            return stale, 0
+                            # ★三元組★ 這條 backoff-stale 分支上一版漏改，
+                            #   呼叫端解包三個值 → ValueError，整輪刷新直接爆掉。
+                            #   stale 不是新抓的 → fresh=False。
+                            return stale, 0, False
                         raise Reg52BackoffActive(f"main source backoff active ({remain_main:.1f}s)")
                     try:
                         with _reg52_cmuh_fetch_sema:
@@ -7298,8 +7301,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                 source_timing["cache_hit_parse"] += 1
             # ★[2026-08-02 外審 P1] 解析完才決定「這頁算不算數」★
             if main_fetched_fresh:
-                main_outcome = _classify_main_html(
-                    html_main, parsed_slots=len(parsed or {}))
+                main_outcome = _classify_main_html(html_main)
                 if main_outcome.ok:
                     _cache_set(cache_main_key, html_main)
                     _source_backoff_success(sk_main)

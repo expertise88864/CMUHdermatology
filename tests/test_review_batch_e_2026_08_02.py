@@ -94,11 +94,38 @@ def test_auh_uses_its_own_contract():
     assert bad.reason == "missing_booking_field"
 
 
-def test_main_needs_parsed_slots():
-    """主院要等解析完才判得出來 —— 版面看起來沒問題也可能一個時段都沒有。"""
-    assert rc.classify_main_html("x" * 600, parsed_slots=3).ok
-    got = rc.classify_main_html("x" * 600, parsed_slots=0)
-    assert got.status == rc.SEMANTIC_INVALID and got.reason == "no_slots_parsed"
+_MAIN_WITH_SLOTS = ("<html><body>" + "x" * 600
+                    + '<table class="schedule"><tr><td class="timeSlot">上午</td>'
+                    + '<td class="schBox">看診中</td></tr></table></body></html>')
+_MAIN_EMPTY_BUT_VALID = ("<html><body>" + "x" * 600
+                         + '<table class="schedule"><tr><th>日期</th></tr>'
+                         + '</table></body></html>')
+_MAIN_ALT_MARKUP = ("<html><body>" + "x" * 600
+                    + '<table><tr><td class="timeSlot">下午</td>'
+                    + '<td class="schBox">額滿</td></tr></table></body></html>')
+
+
+def test_a_main_page_with_the_schedule_table_is_valid():
+    assert rc.classify_main_html(_MAIN_WITH_SLOTS).ok
+    assert rc.classify_main_html(_MAIN_ALT_MARKUP).ok,         "沒有 table.schedule 但有 timeSlot+schBox 的相容版面也算數"
+
+
+def test_a_structurally_valid_page_with_no_slots_is_still_valid():
+    """★[外審第 2 輪 P2] 有些醫師的門診本來就只在分院／亞大★
+
+    他們的主院頁是一張【結構完整、但沒有時段】的正常頁。我第一版用
+    「解析出幾個時段」當判準，會把那些醫師的主院頁永遠判成無效：
+    不進快取、每輪累加 backoff 到 5 分鐘，而下一輪會在主院 backoff 檢查就被擋掉
+    —— **連分院都抓不到**，那些醫師的掛號數整批停在舊資料。
+    「整批完全沒資料」的判斷留在原處（合併所有來源之後的 data_count）。
+    """
+    assert rc.classify_main_html(_MAIN_EMPTY_BUT_VALID).ok,         "沒有診 ≠ 拿到的不是掛號頁"
+
+
+def test_a_main_maintenance_page_has_no_schedule_table():
+    got = rc.classify_main_html(_MAINTENANCE)
+    assert got.status == rc.SEMANTIC_INVALID
+    assert got.reason == "missing_schedule_table"
 
 
 # ─── 分院 fetcher：語意失敗要記 backoff／熔斷 ─────────────────────────────
@@ -191,16 +218,37 @@ def test_auh_maintenance_page_is_not_cached(monkeypatch, resilience):
     assert got == "", "沒有 stale 就回空字串"
 
 
-def test_auh_falls_back_to_the_last_good_cache(monkeypatch, resilience):
-    """★不可以覆蓋 good cache★ 壞頁把好資料蓋掉比抓不到還糟。"""
+def test_auh_leaves_the_stale_fallback_to_its_caller(monkeypatch, resilience):
+    """★[外審第 2 輪 P2] fetcher 自己回 stale 會讓舊資料被重新蓋上新時間戳★
+
+    呼叫端 `_run_external_job` 是「拿到非空就 `_cache_set`」。fetcher 回 stale 的話：
+      * 那份舊資料拿到【新的時間戳】→ 又壓住整整一個 TTL 不再探測；
+      * 而且會被當成剛抓回來的新鮮資料，併進 `is_live_final=True` 的結果。
+    所以語意無效時回空字串，讓呼叫端走它自己已經備好的 `stale_html` 分支
+    —— 那條路【只用不寫】。
+    """
     monkeypatch.setattr(rf, "_cache_set",
-                        lambda k, v: pytest.fail("不該寫快取"))
+                        lambda k, v: pytest.fail("語意無效不該寫快取"))
     monkeypatch.setattr(rf, "_cache_get",
                         lambda key, ttl, **k: "上一份好的 HTML"
                         if ttl == rf.REG52_STALE_CACHE_SECONDS else None)
     monkeypatch.setattr(rf, "_get_thread_local_reg52_external_session",
                         lambda: _Session(_MAINTENANCE))
-    assert rf._fetch_auh_reg52_html(None, "方心禹") == "上一份好的 HTML"
+    assert rf._fetch_auh_reg52_html(None, "方心禹") == "", \
+        "要回空字串，stale 由呼叫端提供（否則舊資料會被重新蓋時間戳）"
+
+
+def test_the_caller_uses_stale_without_recaching_it():
+    """釘住呼叫端那一半：空結果才走 stale，而且那條路不寫快取。"""
+    src = _main_src()
+    i = src.index("def _run_external_job")
+    body = src[i:i + 600]
+    assert "elif stale_html:" in body, "stale 要走 elif —— 那一支不寫快取"
+    i_cache = body.index("_cache_set")
+    i_elif = body.index("elif stale_html:")
+    assert i_cache < i_elif, "寫快取只能在 `if html:` 那一支，不可以在 stale 那支"
+    # stale 分支裡不可以再出現寫入
+    assert "_cache_set" not in body[i_elif:], "★stale 那條路只用不寫★"
 
 
 def test_auh_good_page_is_cached(monkeypatch, resilience):
@@ -253,6 +301,50 @@ def test_both_main_fetch_paths_defer_the_verdict():
     assert src.count("_cache_set(cache_main_key") == 1, \
         "主院快取只能有一個寫入點（解析後那個）"
     assert "main_fetched_fresh" in src
+
+
+def test_every_return_from_the_parallel_main_fetch_has_the_same_arity():
+    """★我把這個 closure 的回傳從二元組改成三元組，卻漏改了一條分支★
+
+    漏的是「主院 backoff 生效、但還有 stale 可用」那一支（`return stale, 0`）。
+    呼叫端解包三個值 → `ValueError: not enough values to unpack` →
+    那一輪刷新整個爆掉，連本來可用的 stale 都用不到。
+
+    ★為什麼用 AST 而不是跑一次★ 那條分支要在 `check_appointment_count` 裡湊出
+    「TTL 過期但在 stale 窗內 ＋ backoff 生效 ＋ main/dayoff 都需要」的狀態，
+    而那支函式相依極多。這裡改成直接釘住不變量：**這個 closure 的每一個 return
+    都必須是同樣長度的元組**，而且要跟解包點一致。新增分支漏改會在這裡紅。
+    """
+    tree = ast.parse(io.open(os.path.join(REPO_ROOT, "src", "main.py"),
+                             encoding="utf-8").read())
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef)
+              and n.name == "_parallel_fetch_main")
+    arities = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Tuple):
+            arities.add(len(node.value.elts))
+    assert arities, "掃不到任何元組 return —— 掃描器可能壞了"
+    assert arities == {3}, f"回傳元組長度不一致：{sorted(arities)}"
+
+    # 解包點也要是 3 個目標（用 AST，不比對字串 —— `ast.unparse` 會正規化括號）
+    unpacks = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        val = node.value
+        if not (isinstance(val, ast.Call)
+                and isinstance(val.func, ast.Attribute)
+                and val.func.attr == "result"
+                and isinstance(val.func.value, ast.Name)
+                and val.func.value.id == "fut_m"):
+            continue
+        target = node.targets[0]
+        assert isinstance(target, ast.Tuple), "解包點應該是元組"
+        unpacks.append(len(target.elts))
+    assert unpacks, "找不到 fut_m.result() 的解包點"
+    assert set(unpacks) == arities, \
+        f"解包 {unpacks} 個，但回傳 {sorted(arities)} 個 —— 執行時會 ValueError"
 
 
 def test_a_semantically_invalid_main_page_records_backoff():

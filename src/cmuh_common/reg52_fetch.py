@@ -336,7 +336,12 @@ def _fetch_auh_reg52_html(session, doctor_name):
         return hit
     source_key = f"auh:{doc_no}"
     if _circuit_is_tripped("auh"):  # [O36]
-        return _cache_get(cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False) or ""
+        # ★[2026-08-02 外審第 2 輪 P2] stale 交給呼叫端★
+        #   `_run_external_job` 是「拿到非空就 `_cache_set`」——這裡自己回
+        #   stale 的話，舊資料會被蓋上新的時間戳，又壓住整整一個 TTL 不再探測，
+        #   而且會被當成剛抓回來的新鮮資料。呼叫端已經備好 `stale_html` 分支，
+        #   那條路只用不寫。
+        return ""
     ok, remain = _source_backoff_allow(source_key)
     if not ok:
         logging.info(f"[BACKOFF] skip auh fetch {doctor_name} {doc_no}, remaining={remain:.1f}s")
@@ -367,10 +372,13 @@ def _fetch_auh_reg52_html(session, doctor_name):
                                 "之後自動半開重試",
                                 _CIRCUIT_BREAKER_THRESHOLD,
                                 _CIRCUIT_BREAKER_RESET_MIN)
-            # ★不可以覆蓋 good cache★ 壞頁把好資料蓋掉比抓不到還糟。
-            #   回上一份【語意有效】的 stale，沒有就回空字串。
-            return _cache_get(cache_key, REG52_STALE_CACHE_SECONDS,
-                              evict_expired=False) or ""
+            # ★[2026-08-02 外審第 2 輪 P2] stale 交給呼叫端★
+            #   `_run_external_job` 是「拿到非空就 `_cache_set`」——這裡自己回
+            #   stale 的話，那份舊資料會被蓋上【新的時間戳】，於是又壓住整整
+            #   一個 TTL 不再探測，而且會被當成剛抓回來的新鮮資料併進
+            #   is_live_final=True 的結果裡。呼叫端已經備好 `stale_html`
+            #   分支，那條路只用不寫。
+            return ""
         logging.info(f"已自亞大附醫取得掛號表: {doctor_name} ({doc_no})")
         _cache_set(cache_key, outcome.usable_html)
         _source_backoff_success(source_key)
@@ -387,7 +395,12 @@ def _fetch_auh_reg52_html(session, doctor_name):
         if _circuit_record_fail("auh"):  # [O36]
             logging.warning("[O36] AUH 連續失敗 %d 次 → 暫停嘗試 %d 分鐘，之後自動半開重試",
                             _CIRCUIT_BREAKER_THRESHOLD, _CIRCUIT_BREAKER_RESET_MIN)
-        return _cache_get(cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False) or ""
+        # ★[2026-08-02 外審第 2 輪 P2] stale 交給呼叫端★
+        #   `_run_external_job` 是「拿到非空就 `_cache_set`」——這裡自己回
+        #   stale 的話，舊資料會被蓋上新的時間戳，又壓住整整一個 TTL 不再探測，
+        #   而且會被當成剛抓回來的新鮮資料。呼叫端已經備好 `stale_html` 分支，
+        #   那條路只用不寫。
+        return ""
 
 
 # ── 主院 reg52 的 thread-local session（第四刀(c) 2026-08-01 搬入）──

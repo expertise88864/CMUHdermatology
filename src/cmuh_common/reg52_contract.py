@@ -115,22 +115,39 @@ def classify_auh_html(text) -> FetchOutcome:
     return FetchOutcome(SUCCESS, html=body, length=len(body))
 
 
-def classify_main_html(text, *, parsed_slots: int) -> FetchOutcome:
-    """主院掛號表 —— ★要等解析完才判得出來★
+def classify_main_html(text) -> FetchOutcome:
+    """主院掛號表 —— ★判的是【版面在不在】，不是【有沒有診】★
 
-    主院的維護頁同樣是 200、長度也可能夠，真正的判準是「解析後有沒有時段」。
-    所以這一支收的是【解析結果的數量】，由呼叫端在解析之後才呼叫。
+    ★[2026-08-02 外審第 2 輪 P2] 我第一版用「解析出幾個時段」當判準，那是錯的★
+    有些醫師的門診【本來就只在分院／亞大】（見 `reg52_branch_policy` 的靜態
+    外院來源清單與 `AUH_DOCTOR_DOCNO_MAP`）—— 他們的主院頁是一張**結構完整、
+    但沒有時段**的正常頁。把那個判成語意無效的話：
+      * 主院頁永遠不進快取；
+      * 每一輪都累加 backoff，最長退避到 5 分鐘；
+      * 而下一輪會在「主院 backoff 檢查」就被擋掉，**連分院都抓不到** ——
+        於是那些醫師的分院掛號數整批停在舊資料。
+    「這一批完全沒有資料」的判斷仍然在原處（`check_appointment_count` 合併
+    所有來源之後的 `data_count == 0`），這一支不碰它。
 
-    ★`parsed_slots == 0` 不一定是壞頁★ 醫師當週真的沒有診就是 0。
-    但主院這條路徑既有的語意就是「0 筆 → 視為失敗並重試」（見
-    `check_appointment_count` 的 `data_count == 0` 分支），這裡只是把那個判斷
-    往前挪到「要不要寫進快取」之前 —— 不改變它的寬嚴，只改變壞內容會不會被留下。
+    真正能分辨維護頁的是**版面本身**：主院解析器認的是 `table.schedule`，
+    或退而求其次一張同時有 `td.timeSlot` 與 `td.schBox` 的表格
+    （見 `reg52_parse.parse_main_hospital_schedule`）。那張表在 → 這是掛號表，
+    有沒有診是另一回事；那張表不在 → 我們拿到的根本不是掛號頁。
     """
     body = str(text or "")
     if len(body) < MIN_PAGE_CHARS:
         return FetchOutcome(SEMANTIC_INVALID, reason="page_too_short",
                             length=len(body))
-    if parsed_slots <= 0:
-        return FetchOutcome(SEMANTIC_INVALID, reason="no_slots_parsed",
+    try:
+        from bs4 import BeautifulSoup          # ★延遲載入★ 見 reg52_fetch 說明
+        soup = BeautifulSoup(body, "lxml")
+    except Exception:
+        return FetchOutcome(SEMANTIC_INVALID, reason="parser_unavailable",
                             length=len(body))
-    return FetchOutcome(SUCCESS, html=body, length=len(body))
+    if soup.select_one("table.schedule"):
+        return FetchOutcome(SUCCESS, html=body, length=len(body))
+    for tbl in soup.find_all("table"):
+        if tbl.select_one("td.timeSlot") and tbl.select_one("td.schBox"):
+            return FetchOutcome(SUCCESS, html=body, length=len(body))
+    return FetchOutcome(SEMANTIC_INVALID, reason="missing_schedule_table",
+                        length=len(body))
