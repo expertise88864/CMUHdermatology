@@ -1356,3 +1356,56 @@ def test_the_eaten_flag_still_prevents_a_double_eat_within_one_wake(tk_root,
     assert bo.active is False
     assert bo.consume_wake_gate() is False, \
         "同一次喚醒不可以吃掉兩下（醫師按第二下必須有反應）"
+
+
+@pytest.mark.parametrize("hook_first_on_the_first_wake", [True, False])
+def test_escaping_a_stuck_survivor_always_issues_a_token(
+        tk_root, monkeypatch, hook_first_on_the_first_wake):
+    """★[2026-08-01 外審第 5 輪] 兩種交錯順序都要成立★
+
+    一個布林旗標配不出「這個 eaten 屬於哪一次按鍵」—— hook 與 Tk 的先後在兩次
+    喚醒之間可以任意交錯，第 4 輪只修好其中一種。這支把【兩種】都跑一次：
+
+      hook_first=True ：第一次 F1 先問閘門（被擋、設 eaten）→ teardown 卡住
+      hook_first=False：第一次 F1 先跑 Tk teardown（卡住）→ hook 才問（被擋、設 eaten）
+
+    兩種情況下，稍後 survivor 終於關掉時都必須發 token ——
+    否則那一下 F1 會落在剛露出來的 HIS 上。
+    """
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 500, 400)])
+    bo.show()
+    state = {"alive": True}
+
+    class _Fake:
+        @staticmethod
+        def IsWindow(_h):
+            return 1 if state["alive"] else 0
+
+        @staticmethod
+        def IsWindowVisible(_h):
+            return 1 if state["alive"] else 0
+
+        @staticmethod
+        def ShowWindow(_h, _c):
+            return 0
+
+        @staticmethod
+        def DestroyWindow(_h):
+            return 0
+    monkeypatch.setattr(sb, "_u32", lambda: _Fake())
+
+    if hook_first_on_the_first_wake:
+        assert bo.consume_wake_gate() is True     # hook 先：被擋
+        bo.hide()                                 # Tk 後：卡住
+    else:
+        bo.hide()                                 # Tk 先：卡住
+        assert bo.consume_wake_gate() is True     # hook 後：仍被擋（黑幕還在）
+    assert bo._hwnds, "前提：survivor 卡著"
+
+    state["alive"] = False                        # 稍後終於關掉了
+    bo.hide()
+    assert bo._hwnds == ()
+    assert bo.consume_wake_gate() is True, (
+        "★脫困的那一刻是全新的競態，一律要發 token★"
+        f"（交錯順序 hook_first={hook_first_on_the_first_wake}）")

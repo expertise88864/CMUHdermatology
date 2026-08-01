@@ -805,7 +805,20 @@ class ScreenBlackout:
                 # 黑幕還在 → 沒有「剛剛消失」的競態，不需要 token
                 # （閘門靠 `active_from_any_thread()` 本來就還擋著）。
                 return
-            # 這一次喚醒若已經有一下熱鍵被 hook 擋掉，就不要再發 token，
+            # ★[2026-08-01 外審第 5 輪] 從 survivor 狀態脫困的那一次，一律發 token★
+            #   一個布林旗標配不出「這個 eaten 是屬於哪一次按鍵」：hook 與 Tk 的
+            #   先後在兩次喚醒之間可以任意交錯，第 4 輪只修好其中一種順序。
+            #   與其再加狀態去追身分，用一個結構上的事實把它整段消掉：
+            #   ★survivor 卡住的期間，閘門靠「看得見」擋掉【每一下】熱鍵★
+            #   —— 所以那段期間累積的 eaten 通通不屬於「剛剛把黑幕收掉」的那一下。
+            #   脫困的這一刻是全新的競態，一律發。
+            #   代價（誠實記下）：黑幕卡住又終於清掉之後，醫師的下一下熱鍵可能被
+            #   多吃一次，要再按一次。那是【安全方向】的誤差，而且前提是
+            #   Tk destroy／SW_HIDE／DestroyWindow 三個都失敗過 —— 極罕見。
+            if not wins and hwnds:
+                self._wake_token = time.monotonic()
+                return
+            # 一般路徑：這一次喚醒若已經有一下熱鍵被 hook 擋掉，就不要再發 token，
             # 否則同一次喚醒會吃掉兩下（外審第 4 輪）。
             self._wake_token = 0.0 if eaten else time.monotonic()
 
