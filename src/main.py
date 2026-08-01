@@ -186,6 +186,7 @@ from cmuh_common.http_session_registry import (
     _session_http_guard,
 )
 from cmuh_common.reg52_fetch import (
+    _get_thread_local_reg52_session,
     AUH_DOCTOR_DOCNO_MAP,
     REG52_AUH_TTL_SECONDS,
     REG52_EXTERNAL_BACKOFF_BASE_SECONDS,
@@ -195,6 +196,13 @@ from cmuh_common.reg52_fetch import (
     _fetch_east_district_reg52_html,
     _fetch_huihe_reg52_html,
     _fetch_huisheng_reg52_html,
+)
+# [P2-06 第四刀(c) 2026-08-01] 主院 session getter 併進 reg52_fetch；
+# 「該不該去分院抓」的政策獨立成 reg52_branch_policy。只搬家、不改呼叫端。
+from cmuh_common.reg52_branch_policy import (
+    _should_fetch_east_district_reg52,
+    _should_fetch_huihe_reg52,
+    _should_fetch_huisheng_reg52,
 )
 from cmuh_common.action_ledger import (
     LEDGER_FILENAME as _LEDGER_FILENAME,
@@ -542,7 +550,6 @@ import contextlib
 _dummy_lock = contextlib.nullcontext()  # fallback 鎖，供無鎖環境使用
 
 
-_reg52_tls = threading.local()
 _duty_tls = threading.local()
 _reg64_tls = threading.local()
 _reg52_cmuh_fetch_sema = threading.Semaphore(2)
@@ -681,32 +688,6 @@ except Exception:
 
 import atexit as _atexit_for_sessions
 _atexit_for_sessions.register(_atexit_clear_thread_local_sessions)
-
-
-def _get_thread_local_reg52_session():
-    """ThreadPool 每個工作執行緒獨立 Session：掛號 reg52 可並行，且不再與 forward01 值班查詢搶同一連線鎖。"""
-    s = getattr(_reg52_tls, "session", None)
-    if s is None:
-        s = requests.Session()
-        # 外層 check_appointment_count 已有醫師層級 retry；這裡不要再對 read timeout
-        # 做 urllib3 retry，避免一次院方卡頓放大成 30+ 秒阻塞。
-        rtry = Retry(
-            total=1,
-            connect=1,
-            read=0,
-            status=1,
-            backoff_factor=0.3,
-            status_forcelist=[500, 502, 503, 504],
-        )
-        s.mount("https://", HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=rtry))
-        s.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=rtry))
-        s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Connection": "keep-alive",
-        })
-        _register_reg_session(s)  # [v18] atexit cleanup
-        _reg52_tls.session = s
-    return s
 
 
 def _get_thread_local_duty_session():
@@ -6868,31 +6849,6 @@ _EXT_BRANCH_DISPLAY_SUFFIX = {
     "huihe": "(惠和醫院)",
     "huisheng": "(惠盛醫院)",
 }
-
-
-# 主院網頁未寫「東區分院」時仍應改抓東區 fh1 的醫師（與院方實際設定有關）
-EAST_FH1_DOCTOR_NAMES = frozenset({"吳伯元", "蔡李澄"})
-
-HUIHE_DOCTOR_NAMES = frozenset({"蔡李澄"})
-
-# 目前與惠和同醫師名單；若需不同請改為獨立 frozenset
-HUISHENG_DOCTOR_NAMES = HUIHE_DOCTOR_NAMES
-
-def _main_html_has_east_branch_clinic(html_text):
-    """主院 reg52 回應若提及東區分院門診，改向東區主機抓取人數／休診。"""
-    return bool(html_text) and ("東區分院" in html_text)
-
-
-def _should_fetch_east_district_reg52(html_main, doctor_name):
-    return _main_html_has_east_branch_clinic(html_main) or doctor_name in EAST_FH1_DOCTOR_NAMES
-
-
-def _should_fetch_huihe_reg52(doctor_name):
-    return doctor_name in HUIHE_DOCTOR_NAMES
-
-
-def _should_fetch_huisheng_reg52(doctor_name):
-    return doctor_name in HUISHENG_DOCTOR_NAMES
 
 
 # _strip_ext_appointments: 抽到 cmuh_common.appt_utils

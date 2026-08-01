@@ -300,3 +300,34 @@ def _fetch_auh_reg52_html(session, doctor_name):
             logging.warning("[O36] AUH 連續失敗 %d 次，本 session 不再嘗試（重啟才會重試）",
                             _CIRCUIT_BREAKER_THRESHOLD)
         return _cache_get(cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False) or ""
+
+
+# ── 主院 reg52 的 thread-local session（第四刀(c) 2026-08-01 搬入）──
+# 與上面 external 版本對稱：院內主機不必套 IPv4-only／較長 timeout 那一組設定。
+_reg52_tls = threading.local()
+
+
+def _get_thread_local_reg52_session():
+    """ThreadPool 每個工作執行緒獨立 Session：掛號 reg52 可並行，且不再與 forward01 值班查詢搶同一連線鎖。"""
+    s = getattr(_reg52_tls, "session", None)
+    if s is None:
+        s = requests.Session()
+        # 外層 check_appointment_count 已有醫師層級 retry；這裡不要再對 read timeout
+        # 做 urllib3 retry，避免一次院方卡頓放大成 30+ 秒阻塞。
+        rtry = Retry(
+            total=1,
+            connect=1,
+            read=0,
+            status=1,
+            backoff_factor=0.3,
+            status_forcelist=[500, 502, 503, 504],
+        )
+        s.mount("https://", HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=rtry))
+        s.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=rtry))
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Connection": "keep-alive",
+        })
+        _register_reg_session(s)  # [v18] atexit cleanup
+        _reg52_tls.session = s
+    return s
