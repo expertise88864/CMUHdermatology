@@ -165,6 +165,23 @@ from cmuh_common.reg52_parse import (
     parse_auh_reg52_schedule as _parse_auh_reg52_schedule,
     parse_appt_item_for_alert as _parse_appt_item_for_alert,
 )
+# [P2-06 分層第四刀(b) 2026-08-01] 外部來源的韌性層（TTL 快取／解析快取／
+# 熔斷器／來源退避節流）連同它們自己的模組級狀態搬到
+# cmuh_common/fetch_resilience.py。只搬家、不改呼叫端。
+from cmuh_common.fetch_resilience import (
+    _CIRCUIT_BREAKER_THRESHOLD,
+    _cache_get,
+    _cache_set,
+    _circuit_is_tripped,
+    _circuit_record_fail,
+    _circuit_record_success,
+    _parse_cache_get,
+    _parse_cache_set,
+    _source_backoff_allow,
+    _source_backoff_fail,
+    _source_backoff_success,
+    _source_throttle_allow,
+)
 from cmuh_common.action_ledger import (
     LEDGER_FILENAME as _LEDGER_FILENAME,
     OUTCOME_FAILED as _LEDGER_FAILED,
@@ -225,7 +242,6 @@ from cmuh_common.appt_utils import (  # noqa: E402
     _merge_appointments_by_date,
     _merge_dayoff_overrides,
 )
-from cmuh_common.memory_cache import trim_oldest_entries
 
 # === 依賴清單（與原檔一致；指紋由 deps_runtime 處理）===
 REQUIRED_LIBS = [
@@ -278,7 +294,6 @@ import schedule
 import webbrowser
 from collections import defaultdict, deque
 from copy import deepcopy
-import hashlib
 from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import date, datetime, timedelta, time as dt_time
 from queue import Empty, Queue
@@ -535,17 +550,7 @@ _reg64_tls = threading.local()
 # (不 call session.close() 避免等待未完成 request — 跟 _kill_orphan handler 同 pattern)
 _all_reg_sessions: WeakSet = WeakSet()
 _all_reg_sessions_lock = threading.Lock()
-_ttl_cache_lock = threading.Lock()
-_ttl_cache_store = {}
-_parse_cache_store = {}
-_source_backoff_state = {}
-_source_throttle_state = {}
 _reg52_cmuh_fetch_sema = threading.Semaphore(2)
-_TTL_CACHE_MAX_ENTRIES = 512
-_PARSE_CACHE_MAX_ENTRIES = 256
-_SOURCE_STATE_MAX_ENTRIES = 128
-
-
 # =============================================================================
 # [O9] IPv4-only 連線（只對院外醫療系統 host 生效）
 # 原因：Windows 預設 IPv4+IPv6 雙堆疊；院外（auh/east/huisheng）若 DNS 解析到
@@ -569,54 +574,6 @@ IPV4_ONLY_HOSTS = {
 
 _orig_create_connection = _urllib3_conn.create_connection
 _orig_getaddrinfo = _socket.getaddrinfo
-
-# =============================================================================
-# [O36] 來源級熔斷器（Circuit Breaker）
-# 同個來源（east/auh/huisheng）連續失敗 N 次後暫停嘗試，避免「每 5 分鐘重複等
-# 2 秒 timeout」的累積消耗。
-# [2026-06-16 韌性] 改為「跳閘後逾 RESET 窗(30 分鐘)自動重置、放行一次重試」——
-# 原本一旦跳閘要重啟程式才恢復:醫院端短暫維護(剛好 3 次失敗)就會讓該來源整個
-# session(可能一整個下午)都沒資料,使用者只看到「無資料」卻不知是被熔斷。改為
-# 定時自我恢復:來源復原就 success 清掉;仍掛則再累積跳閘,不會回到狂打 timeout。
-# =============================================================================
-# source_key → {"fails": int, "tripped_at": monotonic 或 None}
-_CIRCUIT_BREAKER_STATE: dict[str, dict] = {}
-_CIRCUIT_BREAKER_LOCK = threading.Lock()
-_CIRCUIT_BREAKER_THRESHOLD = 3        # 連續 3 次失敗 → tripped
-_CIRCUIT_BREAKER_RESET_SEC = 1800.0   # 跳閘逾 30 分鐘 → 自動重置,放行一次重試
-
-
-def _circuit_record_fail(source: str) -> bool:
-    """記錄失敗，回傳是否剛跳過閾值。"""
-    with _CIRCUIT_BREAKER_LOCK:
-        st = _CIRCUIT_BREAKER_STATE.setdefault(source, {"fails": 0, "tripped_at": None})
-        st["fails"] += 1
-        if st["fails"] == _CIRCUIT_BREAKER_THRESHOLD:
-            st["tripped_at"] = time.monotonic()
-            return True  # 剛跳閾
-        return False
-
-
-def _circuit_record_success(source: str) -> None:
-    """成功 → 重置計數。"""
-    with _CIRCUIT_BREAKER_LOCK:
-        _CIRCUIT_BREAKER_STATE.pop(source, None)
-
-
-def _circuit_is_tripped(source: str) -> bool:
-    """是否仍熔斷中。跳閘逾 RESET 窗 → 自動重置並放行一次重試(回 False)。"""
-    with _CIRCUIT_BREAKER_LOCK:
-        st = _CIRCUIT_BREAKER_STATE.get(source)
-        if not st or st["fails"] < _CIRCUIT_BREAKER_THRESHOLD:
-            return False
-        ta = st.get("tripped_at")
-        if ta is not None and (time.monotonic() - ta) >= _CIRCUIT_BREAKER_RESET_SEC:
-            _CIRCUIT_BREAKER_STATE.pop(source, None)
-            logging.info("[circuit] 來源 %s 熔斷逾 %d 分鐘,自動重置重試",
-                         source, int(_CIRCUIT_BREAKER_RESET_SEC // 60))
-            return False
-        return True
-
 
 def _ipv4_first_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
     """[O35 關鍵修正] 對 IPV4_ONLY_HOSTS 的 host 限制 DNS 結果為「IPv4 + 只 1 個 IP」。
@@ -725,93 +682,6 @@ try:
         _u3_conn_mod.create_connection = _ipv4_aware_create_connection
 except Exception:
     pass
-
-
-def _cache_get(cache_key, ttl_seconds, evict_expired=True):
-    now = time.time()
-    with _ttl_cache_lock:
-        row = _ttl_cache_store.get(cache_key)
-        if not row:
-            return None
-        ts, val = row
-        if now - ts > ttl_seconds:
-            if evict_expired:
-                _ttl_cache_store.pop(cache_key, None)
-            return None
-        return val
-
-
-def _cache_set(cache_key, value):
-    with _ttl_cache_lock:
-        _ttl_cache_store[cache_key] = (time.time(), value)
-        trim_oldest_entries(_ttl_cache_store, _TTL_CACHE_MAX_ENTRIES)
-
-
-def _parse_cache_get(parser_key, html_text):
-    h = hashlib.sha1(html_text.encode("utf-8", errors="ignore")).hexdigest()
-    key = (parser_key, h)
-    now = time.time()
-    with _ttl_cache_lock:
-        row = _parse_cache_store.get(key)
-        if not row:
-            return None
-        ts, val = row
-        if now - ts > PARSE_CACHE_TTL_SECONDS:
-            _parse_cache_store.pop(key, None)
-            return None
-        return val
-
-
-def _parse_cache_set(parser_key, html_text, parsed):
-    h = hashlib.sha1(html_text.encode("utf-8", errors="ignore")).hexdigest()
-    key = (parser_key, h)
-    with _ttl_cache_lock:
-        _parse_cache_store[key] = (time.time(), parsed)
-        trim_oldest_entries(_parse_cache_store, _PARSE_CACHE_MAX_ENTRIES)
-
-
-def _source_backoff_allow(source_key):
-    now = time.time()
-    with _ttl_cache_lock:
-        row = _source_backoff_state.get(source_key)
-        if not row:
-            return True, 0.0
-        next_allowed_ts, fail_count = row
-        remain = max(0.0, next_allowed_ts - now)
-        return remain <= 0.0, remain
-
-
-def _source_backoff_fail(source_key, base_seconds=None, max_seconds=None):
-    now = time.time()
-    base = SOURCE_BACKOFF_BASE_SECONDS if base_seconds is None else base_seconds
-    max_delay = SOURCE_BACKOFF_MAX_SECONDS if max_seconds is None else max_seconds
-    with _ttl_cache_lock:
-        row = _source_backoff_state.get(source_key)
-        fail_count = (row[1] + 1) if row else 1
-        delay = min(base * (2 ** (fail_count - 1)), max_delay)
-        _source_backoff_state[source_key] = (now + delay, fail_count)
-        trim_oldest_entries(_source_backoff_state, _SOURCE_STATE_MAX_ENTRIES)
-        return delay, fail_count
-
-
-def _source_backoff_success(source_key):
-    with _ttl_cache_lock:
-        _source_backoff_state.pop(source_key, None)
-
-
-def _source_throttle_allow(source_key, interval_seconds):
-    now = time.time()
-    with _ttl_cache_lock:
-        last_ts = _source_throttle_state.get(source_key, 0.0)
-        if now - last_ts < interval_seconds:
-            return False, max(0.0, interval_seconds - (now - last_ts))
-        _source_throttle_state[source_key] = now
-        trim_oldest_entries(
-            _source_throttle_state,
-            _SOURCE_STATE_MAX_ENTRIES,
-            timestamp_of=lambda stamp: stamp,
-        )
-        return True, 0.0
 
 
 def _register_reg_session(s):
@@ -8251,12 +8121,9 @@ REG52_EXTERNAL_MAX_WORKERS = 2
 REG52_STALE_CACHE_SECONDS = 15 * 60
 REG52_DAYOFF_BACKGROUND_MIN_INTERVAL_SECONDS = 30 * 60
 REG52_EXTERNAL_BACKGROUND_MIN_INTERVAL_SECONDS = 20 * 60
-PARSE_CACHE_TTL_SECONDS = 180
 DUTY_CACHE_TTL_SECONDS = 3600
 REG64_MICRO_CACHE_SECONDS = 8
 REG64_STALE_CACHE_SECONDS = 5 * 60
-SOURCE_BACKOFF_BASE_SECONDS = 2
-SOURCE_BACKOFF_MAX_SECONDS = 90
 REG52_MAIN_BACKOFF_BASE_SECONDS = 30
 REG52_MAIN_BACKOFF_MAX_SECONDS = 5 * 60
 # [O2] 院外失敗 backoff 從 60s 拉長到 300s（5 分鐘）；上限 15 分鐘 → 30 分鐘

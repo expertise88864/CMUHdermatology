@@ -316,11 +316,16 @@ def test_main_and_scheduler_schedule_cache_cleanup_for_standalone_launches():
 
 def test_main_uses_weak_http_session_registry_and_bounded_memory_caches():
     src = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
-
     assert "_all_reg_sessions: WeakSet = WeakSet()" in src
-    assert "trim_oldest_entries(_ttl_cache_store, _TTL_CACHE_MAX_ENTRIES)" in src
-    assert "trim_oldest_entries(_parse_cache_store, _PARSE_CACHE_MAX_ENTRIES)" in src
-    assert "trim_oldest_entries(_source_backoff_state, _SOURCE_STATE_MAX_ENTRIES)" in src
+
+    # [2026-08-01 P2-06 第四刀(b)] 三個記憶體快取連同它們的容量修剪搬到
+    # cmuh_common/fetch_resilience.py —— 守的性質沒變（長壽 dict 必須有上限，
+    # 否則跑幾天就吃光記憶體），只是換了地址。
+    res = (ROOT / "src" / "cmuh_common" / "fetch_resilience.py").read_text(
+        encoding="utf-8")
+    assert "trim_oldest_entries(_ttl_cache_store, _TTL_CACHE_MAX_ENTRIES)" in res
+    assert "trim_oldest_entries(_parse_cache_store, _PARSE_CACHE_MAX_ENTRIES)" in res
+    assert "trim_oldest_entries(_source_backoff_state, _SOURCE_STATE_MAX_ENTRIES)" in res
 
 
 def test_clock_query_login_anchor_tolerates_empty_table():

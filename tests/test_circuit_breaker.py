@@ -10,6 +10,11 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import main  # noqa: E402
+# [2026-08-01 P2-06 第四刀(b)] 熔斷器搬到 cmuh_common/fetch_resilience.py。
+# 函式仍由 main 匯入(呼叫端不變)，但這個常數 main 自己不用了 → 從新家取。
+from cmuh_common.fetch_resilience import (  # noqa: E402
+    _CIRCUIT_BREAKER_RESET_SEC,
+)
 
 
 def test_circuit_breaker_trips_after_threshold():
@@ -32,7 +37,7 @@ def test_circuit_breaker_auto_resets_after_window(monkeypatch):
     for _ in range(3):
         main._circuit_record_fail(src)
     assert main._circuit_is_tripped(src) is True            # 跳閘中
-    clock[0] += main._CIRCUIT_BREAKER_RESET_SEC + 1.0       # 過了重置窗
+    clock[0] += _CIRCUIT_BREAKER_RESET_SEC + 1.0       # 過了重置窗
     assert main._circuit_is_tripped(src) is False           # 自動重置放行
     # 重置後計數歸零:要再連 3 次失敗才會再次跳閘
     assert main._circuit_record_fail(src) is False
@@ -47,6 +52,6 @@ def test_circuit_breaker_stays_tripped_within_window(monkeypatch):
     monkeypatch.setattr(main.time, "monotonic", lambda: clock[0])
     for _ in range(3):
         main._circuit_record_fail(src)
-    clock[0] += main._CIRCUIT_BREAKER_RESET_SEC - 60.0      # 還沒到重置窗
+    clock[0] += _CIRCUIT_BREAKER_RESET_SEC - 60.0      # 還沒到重置窗
     assert main._circuit_is_tripped(src) is True            # 仍熔斷
     main._circuit_record_success(src)
