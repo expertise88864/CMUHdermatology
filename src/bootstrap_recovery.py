@@ -232,7 +232,7 @@ def _atomic_write_json(path, payload) -> bool:
         return False
 
 
-def _record_terminal(app_dir, terminal, errors) -> None:
+def _record_terminal(app_dir, terminal, errors) -> bool:
     """把「救不回來」記成一個【獨立的】標記檔。
 
     ★[2026-08-02 外審第 2 輪 P2] 原本是把 journal 改名成 .failed.json★
@@ -253,6 +253,8 @@ def _record_terminal(app_dir, terminal, errors) -> None:
     if not _atomic_write_json(path, {"schema": JOURNAL_SCHEMA,
                                      "files": merged}):
         errors.append("無法寫入「無法修復」標記（%s）" % os.path.basename(path))
+        return False
+    return True
 
 
 def _rewrite_journal_for_retry(app_dir, entries, errors) -> None:
@@ -298,6 +300,11 @@ def recover_before_start(app_dir) -> RecoveryResult:
                 #   我們就是不知道，所以回 UNKNOWN 讓啟動器去問人。
                 return RecoveryResult(UNKNOWN, journal_present=True,
                                       errors=["另一支程式正在寫入更新"])
+            # ★[2026-08-02 外審第 3 輪 P1] 鎖外的快照在這裡已經過期★
+            #   開機時五支程式同時起來：A 先拿到鎖、判定 terminal、寫了標記並
+            #   清掉日誌；B 在鎖外看到的 had_marker 還是 False，拿到鎖後只重看
+            #   日誌就會回 CLEAN —— 混版狀態下照樣啟動。狀態要在鎖內重讀。
+            had_marker = os.path.exists(journal + FAILED_JOURNAL_SUFFIX)
             if not os.path.exists(journal):
                 # 等鎖的期間對方正常結束了
                 if had_marker:
@@ -325,9 +332,16 @@ def recover_before_start(app_dir) -> RecoveryResult:
                     terminal.append(name)
 
             # ★兩種失敗要能同時留下痕跡★（見 `_record_terminal` 的說明）
+            marker_ok = True
             if terminal:
-                _record_terminal(app_dir, terminal, errors)
-            if unresolved:
+                marker_ok = _record_terminal(app_dir, terminal, errors)
+            if not marker_ok:
+                # ★[2026-08-02 外審第 3 輪 P1] 標記寫不出來就【不要動日誌】★
+                #   兩個都沒了 = 下次啟動一片乾淨，混版磁碟被無聲放行。
+                #   保留完整日誌雖然會讓已還原的檔下次被誤判成 terminal，
+                #   但那是「吵」；沒有任何痕跡是「靜悄悄地錯」。
+                errors.append("「無法修復」標記寫不出來 → 保留完整交易日誌")
+            elif unresolved:
                 _rewrite_journal_for_retry(app_dir, retry_entries, errors)
             else:
                 _clear_journal(journal, errors)

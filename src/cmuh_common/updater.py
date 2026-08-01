@@ -419,9 +419,15 @@ def _recover_locked(app_dir: str, path: str, restored: "list[str]") -> "list[str
         #   `unresolved` 分支先跑並把日誌縮成只剩可重試的那幾個 —— terminal 的
         #   檔就此蒸發；等重試成功日誌被清掉，磁碟仍是混版而所有警示都沒了。
         #   改成先另存 terminal 標記（獨立的檔，不動日誌），再決定日誌怎麼處置。
+        marker_ok = True
         if outcome.terminal or rejected:
-            _archive_failed_journal(app_dir, outcome.terminal + rejected)
-        if unresolved:
+            marker_ok = _archive_failed_journal(app_dir,
+                                                outcome.terminal + rejected)
+        if not marker_ok:
+            # ★[2026-08-02 外審第 3 輪 P1] 標記寫不出來就【完全不要動日誌】★
+            #   標記與日誌雙雙不在 = 下次啟動看到一片乾淨，混版被無聲放行。
+            logging.error("[更新] 「無法修復」標記寫不出來 → 保留完整交易日誌")
+        elif unresolved:
             _rewrite_journal_for_retry(app_dir, unresolved)
         else:
             _clear_commit_journal(app_dir)
@@ -447,7 +453,7 @@ def _is_inside_app_dir(app_dir: str, path: str) -> bool:
         return False
 
 
-def _archive_failed_journal(app_dir: str, terminal: "list[str]") -> None:
+def _archive_failed_journal(app_dir: str, terminal: "list[str]") -> bool:
     """把「救不回來」記成一個【獨立的標記檔】，★不動交易日誌本身★。
 
     ★[2026-08-02 外審第 2 輪 P2] 原本是把 journal 改名成 .failed.json★
@@ -478,14 +484,16 @@ def _archive_failed_journal(app_dir: str, terminal: "list[str]") -> None:
                       "已記錄於 %s 供事後追查，臨床主程式啟動時會提醒：%s",
                       len(terminal), os.path.basename(path),
                       "; ".join(terminal[:3]))
+        return True
     except Exception as e:      # noqa: BLE001
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
         except OSError:
             pass
-        logging.error("[更新] 有 %d 個檔案永久無法還原，且標記檔寫入失敗（%s）",
-                      len(terminal), e)
+        logging.error("[更新] 有 %d 個檔案永久無法還原，且標記檔寫入失敗（%s）"
+                      "→ 呼叫端必須保留交易日誌", len(terminal), e)
+        return False
 
 
 def clear_failed_journal_marker(app_dir: str = "") -> bool:
@@ -1338,6 +1346,19 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
                     os.remove(entry[0])
             except OSError:
                 pass
+        # ★[2026-08-02 外審第 3 輪 P2] terminal 必須在 unresolved 【之前】處理★
+        #   上一版把 `if rb.terminal:` 放在 `if unresolved:` 後面，而那一支會
+        #   return —— 兩種失敗同時發生時，terminal 分支永遠跑不到：日誌被縮成
+        #   只剩可重試的檔，重試成功後日誌清掉，磁碟仍混版而所有痕跡都沒了。
+        marker_ok = True
+        if rb.terminal:
+            marker_ok = _archive_failed_journal(app_dir_for_journal, rb.terminal)
+        if not marker_ok:
+            # ★[外審第 3 輪 P1] 標記沒寫成功就不准動日誌★
+            #   標記與日誌都不在＝下次啟動一片乾淨，混版被無聲放行。
+            logging.error("更新寫入失敗，且「無法修復」標記寫不出來 → "
+                          "保留完整交易日誌作為唯一證據")
+            return result
         if unresolved:
             # ★[2026-08-01 外審 P1] 回滾自己也會失敗（防毒暫時鎖住檔最常見）★
             #   原本無條件清日誌 —— 磁碟上還是半新半舊，卻再也沒有標記讓下次啟動
@@ -1345,15 +1366,6 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
             _rewrite_journal_for_retry(app_dir_for_journal, unresolved)
             logging.error("更新寫入失敗，且有 %d 個檔【沒有】回滾成功 → "
                           "已保留交易日誌，下次啟動會再試", len(unresolved))
-            return result
-        if rb.terminal:
-            # ★[2026-08-02 外審第 2 輪 P2] 這一支原本也只看 `unresolved`★
-            #   「備份不見了」不會進 unresolved（重試沒意義），於是這裡走進
-            #   「全部回滾完了」的分支把日誌清掉 —— 磁碟仍是混版，證據卻沒了。
-            _archive_failed_journal(app_dir_for_journal, rb.terminal)
-            # 標記另存之後，日誌就沒有留著的理由（沒有可重試的項目；留著只會
-            # 讓下次啟動對已還原的檔重跑一次註定失敗的回滾）。
-            _clear_commit_journal(app_dir_for_journal)
             return result
         # 全部都回滾完了 → 日誌沒有存在的理由（留著會讓下次啟動再回滾一次，
         # 而那時 .bak 已經被 rollback 消耗掉 → 每次啟動噴一批 error）。
@@ -1389,8 +1401,10 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
                           "交易日誌留著，下次啟動會再試", len(rb_unresolved))
         elif _rb.terminal:
             # 同上：救不回來的檔不在 unresolved 裡，不可以當成乾淨結案。
-            _archive_failed_journal(app_dir_for_journal, _rb.terminal)
-            _clear_commit_journal(app_dir_for_journal)
+            if _archive_failed_journal(app_dir_for_journal, _rb.terminal):
+                _clear_commit_journal(app_dir_for_journal)
+            else:
+                logging.error("[更新] 「無法修復」標記寫不出來 → 保留交易日誌")
         else:
             # 回滾用掉了 .bak；再試一次清日誌。清不掉也不致命：下次啟動會照日誌
             # 重跑一次回滾，那時檔案已經是舊版、備份也沒了 → 噴一批 error 後把

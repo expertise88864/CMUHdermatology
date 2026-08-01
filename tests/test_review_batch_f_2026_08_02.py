@@ -685,9 +685,11 @@ def test_the_manifest_version_matches_the_code_version():
     （見 `check_and_update` 裡 codex P2 round3 那段註解）。若 manifest 內容變了
     卻沿用舊版號，另一支拿到舊快取 manifest 的行程就會把新版「修復」成舊版。
 
-    實務上這個不變量由 `push_helper` 保證（先 bump_version、再 sync_manifest、
-    最後才 add/commit），這支測試是把它釘住，避免有人手動改 manifest 或只 bump
-    版號卻忘了重新產生。
+    ★這一支【只釘相等】，證明不了「不同 revision 用不同版號」★
+    真正保證那件事的是 `push_helper` 的步驟順序，由
+    `test_the_push_flow_is_what_guarantees_a_new_version_per_revision` 釘住。
+    兩支要一起看才完整：這裡防「手動改了 manifest 卻沒同步版號」，那裡防
+    「有人把 bump 或 sync 從發布流程拿掉」。
     """
     from cmuh_common.version import CURRENT_VERSION
     with io.open(os.path.join(REPO_ROOT, "manifest.json"),
@@ -696,6 +698,34 @@ def test_the_manifest_version_matches_the_code_version():
     assert manifest["app_version"] == CURRENT_VERSION, (
         f"manifest.json 是 v{manifest['app_version']}，"
         f"程式是 v{CURRENT_VERSION} —— 重新跑 sync_manifest")
+
+
+def test_the_push_flow_is_what_guarantees_a_new_version_per_revision():
+    """★updater 的版本契約靠這個順序成立，不是靠好習慣★
+
+    `check_and_update` 明寫依賴「每個不同 revision 必 bump app_version」才敢在
+    版號相同時照 SHA 修復。保證它的是 `push_helper.main()` 的順序：
+
+        bump_version → sync_manifest(新版號) → git add → 驗 staged SHA → commit → push
+
+    少了 bump，同一個版號會對應到兩份內容不同的 manifest；少了 sync_manifest，
+    版號動了而 SHA 是舊的。這支測試釘住那個順序 —— ★不比對 git 歷史★，
+    因為 CI 是 shallow clone，`HEAD~1` 不一定在。
+    """
+    import inspect
+    sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+    try:
+        import push_helper
+    finally:
+        sys.path.pop(0)
+    src = inspect.getsource(push_helper.main)
+    order = []
+    for name in ("step3_bump_version", "step4_sync_manifest", "step5_stage",
+                 "verify_staged_manifest_hashes", "step5_commit", "step6_push"):
+        assert f"{name}(" in src, f"發布流程少了 {name}"
+        order.append(src.index(f"{name}("))
+    assert order == sorted(order), (
+        f"發布步驟順序被改動了：{order}（版號必須在產生 manifest 之前 bump）")
 
 
 class TestTheTerminalMarkerSurvivesRestarts:
@@ -799,6 +829,71 @@ class TestTheTerminalMarkerSurvivesRestarts:
         assert not (tmp_path / (br.JOURNAL_FILENAME
                                 + br.FAILED_JOURNAL_SUFFIX)).exists()
         assert locked.read_text(encoding="utf-8") == "舊版"
+
+    def test_a_marker_that_could_not_be_written_keeps_the_whole_journal(
+            self, tmp_path, monkeypatch):
+        """★[2026-08-02 外審第 3 輪 P1] 標記寫失敗仍然清掉日誌 = 兩頭落空★
+
+        當次還是回 terminal（使用者被擋住），但下一次啟動什麼都找不到 →
+        CLEAN → 混版磁碟被無聲放行。
+        """
+        doomed = tmp_path / "doomed.py"
+        doomed.write_text("新版，備份不見了", encoding="utf-8")
+        _seed_journal(tmp_path, [(str(doomed), True, "")])
+
+        monkeypatch.setattr(br, "_atomic_write_json",
+                            lambda path, payload: False)
+        first = br.recover_before_start(str(tmp_path))
+        assert first.status == br.TERMINAL_FAILURE
+
+        monkeypatch.undo()
+        second = br.recover_before_start(str(tmp_path))
+        assert second.status != br.CLEAN, (
+            "★第二次啟動一片乾淨 —— 磁碟仍是混版卻放行了★")
+        assert second.safe_to_start is False
+
+    def test_the_updater_also_keeps_the_journal_when_the_marker_fails(
+            self, tmp_path, monkeypatch):
+        doomed = tmp_path / "doomed.py"
+        doomed.write_text("新版，備份不見了", encoding="utf-8")
+        journal = _seed_journal(tmp_path, [(str(doomed), True, "")])
+
+        monkeypatch.setattr(updater, "_archive_failed_journal",
+                            lambda app_dir, terminal: False)
+        updater.recover_incomplete_update(str(tmp_path))
+
+        assert os.path.exists(journal), (
+            "★標記寫不出來，日誌又被清掉 = 沒有任何痕跡★")
+
+    def test_a_marker_created_while_waiting_for_the_lock_is_noticed(
+            self, tmp_path, monkeypatch):
+        """★[2026-08-02 外審第 3 輪 P1] 鎖外的快照會過期★
+
+        開機時五支程式同時起來。A 先拿到鎖、判定 terminal、寫標記並清掉日誌；
+        B 在鎖外看到的 `had_marker` 還是 False。B 拿到鎖後若只重看日誌，
+        就會回 CLEAN —— 在混版狀態下放行。
+        """
+        target = tmp_path / "x.py"
+        target.write_text("新版", encoding="utf-8")
+        journal_path = _seed_journal(tmp_path, [(str(target), True, "")])
+
+        import contextlib
+        marker = tmp_path / (br.JOURNAL_FILENAME + br.FAILED_JOURNAL_SUFFIX)
+
+        @contextlib.contextmanager
+        def _lock_that_takes_a_while(app_dir, timeout_sec=10.0):
+            # 模擬「等鎖的期間，另一支程式把事情做完了」
+            marker.write_text('{"schema": 1, "files": ["x.py"]}',
+                              encoding="utf-8")
+            os.remove(journal_path)
+            yield True
+
+        monkeypatch.setattr(br, "_write_lock", _lock_that_takes_a_while)
+        result = br.recover_before_start(str(tmp_path))
+
+        assert result.status == br.TERMINAL_FAILURE, (
+            f"★拿到鎖後沒有重讀標記，回了 {result.status}★")
+        assert result.safe_to_start is False
 
     def test_a_second_startup_still_reports_terminal(self, tmp_path):
         """★這是那個 finding 的核心★
