@@ -11,16 +11,21 @@
 `_external_session()` 取得器：測試換掉它就能餵假的 session 進來，
 把「HTTP 500 會不會讓熔斷器跳閘」「逾時會不會記退避」這類**韌性接線**測出來 ——
 那才是這一層真正的邏輯（HTTP 本身 requests 已經測過了）。
+
+【★第三方套件一律延遲載入★】
+`requests` / `bs4` 不可以寫成 module 層的 import。`main.py` 在【第 190 行】就
+import 本模組，而修復環境的 `_ensure_deps_runtime(REQUIRED_LIBS)` 要到【第 285 行】
+才跑 —— 套件缺了或壞了的話，這裡會先 `ModuleNotFoundError`，程式根本進不去，
+**那個專門用來自動修好環境的安裝器也就永遠沒機會執行**，變成要有人到現場。
+（這是 2026-08-05 外審抓到的：搬進本模組時把 main.py 原本刻意的
+ `TYPE_CHECKING` + 執行期 None 佔位 + splash 後才載入的設計弄丟了，
+ 順帶也把 400-500ms 的 pre-splash 載入成本加了回去。）
+所以下面每支函式都在【函式內】才 import。
 """
 from __future__ import annotations
 
 import logging
 import threading
-
-import requests
-from bs4 import BeautifulSoup
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from cmuh_common.fetch_resilience import (
     _cache_get,
@@ -75,6 +80,12 @@ REG52_EXTERNAL_BACKOFF_MAX_SECONDS = 30 * 60
 
 
 def _get_thread_local_reg52_external_session():
+    # ★延遲載入★ 見模組 docstring：module 層 import 會讓相依壞掉時
+    #   連自動安裝器都跑不到（main.py 第 190 行 import 本模組，
+    #   而 _ensure_deps_runtime 在第 285 行）。
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
     s = getattr(_reg52_external_tls, "session", None)
     if s is None:
         s = requests.Session()
@@ -92,6 +103,11 @@ def _get_thread_local_reg52_external_session():
 
 def _fetch_east_district_reg52_html(session, doc_no: str, doctor_name: str):
     """東區 fh1/reg52.cgi；Docname 先試 Big5 再試 UTF-8（不同醫師連結慣例不同）。"""
+    # ★延遲載入★ 見模組 docstring：module 層 import 會讓相依壞掉時
+    #   連自動安裝器都跑不到（main.py 第 190 行 import 本模組，
+    #   而 _ensure_deps_runtime 在第 285 行）。
+    import requests
+    from bs4 import BeautifulSoup
     from urllib.parse import quote, quote_from_bytes
 
     dparam = _reg52_docno_for_dayoff_table(doc_no)
@@ -151,6 +167,11 @@ def _fetch_east_district_reg52_html(session, doc_no: str, doctor_name: str):
 
 def _fetch_huihe_reg52_html(session, doc_no: str, doctor_name: str):
     """惠和 wh1/reg52.cgi（與主院同網域）；Docname 先試 Big5 再試 UTF-8。"""
+    # ★延遲載入★ 見模組 docstring：module 層 import 會讓相依壞掉時
+    #   連自動安裝器都跑不到（main.py 第 190 行 import 本模組，
+    #   而 _ensure_deps_runtime 在第 285 行）。
+    import requests
+    from bs4 import BeautifulSoup
     from urllib.parse import quote, quote_from_bytes
 
     dparam = _reg52_docno_for_dayoff_table(doc_no)
@@ -202,6 +223,11 @@ def _fetch_huihe_reg52_html(session, doc_no: str, doctor_name: str):
 
 def _fetch_huisheng_reg52_html(session, doc_no: str, doctor_name: str):
     """惠盛 hs1/reg52.cgi（與東區同主機）；Docname 先試 Big5 再試 UTF-8。"""
+    # ★延遲載入★ 見模組 docstring：module 層 import 會讓相依壞掉時
+    #   連自動安裝器都跑不到（main.py 第 190 行 import 本模組，
+    #   而 _ensure_deps_runtime 在第 285 行）。
+    import requests
+    from bs4 import BeautifulSoup
     from urllib.parse import quote, quote_from_bytes
 
     dparam = _reg52_docno_for_dayoff_table(doc_no)
@@ -258,6 +284,10 @@ def _fetch_huisheng_reg52_html(session, doc_no: str, doctor_name: str):
 
 
 def _fetch_auh_reg52_html(session, doctor_name):
+    # ★延遲載入★ 見模組 docstring：module 層 import 會讓相依壞掉時
+    #   連自動安裝器都跑不到（main.py 第 190 行 import 本模組，
+    #   而 _ensure_deps_runtime 在第 285 行）。
+    import requests
     from urllib.parse import quote
     doc_no = AUH_DOCTOR_DOCNO_MAP.get(doctor_name)
     if not doc_no:
@@ -309,6 +339,12 @@ _reg52_tls = threading.local()
 
 def _get_thread_local_reg52_session():
     """ThreadPool 每個工作執行緒獨立 Session：掛號 reg52 可並行，且不再與 forward01 值班查詢搶同一連線鎖。"""
+    # ★延遲載入★ 見模組 docstring：module 層 import 會讓相依壞掉時
+    #   連自動安裝器都跑不到（main.py 第 190 行 import 本模組，
+    #   而 _ensure_deps_runtime 在第 285 行）。
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
     s = getattr(_reg52_tls, "session", None)
     if s is None:
         s = requests.Session()

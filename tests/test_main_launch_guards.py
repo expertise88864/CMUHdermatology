@@ -1208,3 +1208,89 @@ def test_morning_polling_and_residual_closed_guard_wired():
     # [2026-06-22] 自我修復:盤面非關診/停診且未到該時段關診時間 → 清掉殘留 actual_closing_dt
     # (解「明明在看診卻一直顯示已關診」)。
     assert "not is_closed_page and not is_stopped_page and now < boundary" in run_src
+
+
+# ─── ★[2026-08-05 外審 P1] 相依壞掉時，自動安裝器必須還跑得到★ ────────────
+def test_no_module_imports_a_heavy_dependency_before_the_installer_runs():
+    """★掃【被 import 的模組】，不是只掃 main.py 的文字★
+
+    原本只有 `test_heavy_network_imports_are_lazy_after_splash` 在看 main.py 裡有沒有
+    `import requests` —— 於是把那幾支函式搬進 `cmuh_common/reg52_fetch.py`(那裡是
+    module 層 import requests/bs4)之後，main.py 文字上乾淨、測試全綠，實際上卻：
+
+      main.py 第 190 行 import reg52_fetch → reg52_fetch 立刻 import requests
+        → 套件缺了/壞了就 ModuleNotFoundError
+          → 永遠走不到第 285 行的 `_ensure_deps_runtime(REQUIRED_LIBS)`
+            → **那個專門用來自動修好環境的安裝器沒機會執行** → 要有人到現場
+
+    所以這裡改成:把 main.py 在 `_ensure_deps_runtime` 之前 import 的每一個
+    自家模組都拆開來看，任何一個在 module 層 import 重量級第三方套件都算違規。
+    """
+    import ast
+    import os
+
+    root = os.path.join(os.path.dirname(__file__), "..", "src")
+    main_src = open(os.path.join(root, "main.py"), encoding="utf-8").read()
+    tree = ast.parse(main_src)
+
+    # 安裝器那一行的位置 —— 在它之前發生的 import 都還沒有安裝器保護
+    guard_line = None
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_ensure_deps_runtime"):
+            guard_line = node.lineno
+            break
+    assert guard_line, "找不到 _ensure_deps_runtime —— 這支測試的前提沒了"
+
+    early = []
+    for node in tree.body:                     # 只看 module 層
+        if isinstance(node, ast.ImportFrom) and node.lineno < guard_line:
+            if (node.module or "").startswith("cmuh_common"):
+                early.append(node.module)
+        elif isinstance(node, ast.Import) and node.lineno < guard_line:
+            for a in node.names:
+                if a.name.startswith("cmuh_common"):
+                    early.append(a.name)
+    assert early, "★空集合不算通過★ 一個都沒掃到代表這支測試已經失效"
+
+    HEAVY = {"requests", "bs4", "urllib3", "selenium", "pandas", "PIL",
+             "lxml", "openpyxl", "matplotlib", "numpy"}
+    bad = []
+    for mod in sorted(set(early)):
+        path = os.path.join(root, *mod.split(".")) + ".py"
+        if not os.path.exists(path):
+            continue
+        sub = ast.parse(open(path, encoding="utf-8").read())
+        for node in sub.body:                  # 只看 module 層（函式內 import 沒關係）
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                names = [node.module or ""]
+            for n in names:
+                if n.split(".")[0] in HEAVY:
+                    bad.append(f"{mod} → {n}")
+    assert not bad, (
+        "這些模組在 main.py 跑到 _ensure_deps_runtime 之前就被 import，"
+        "而它們自己又在 module 層載入重量級套件 —— 套件壞掉時連自動安裝器都跑不到：\n  "
+        + "\n  ".join(bad))
+
+
+def test_reg52_fetch_imports_without_requests_installed(monkeypatch):
+    """★直接驗那個會出事的情境★ requests 不在時，本模組仍要 import 得起來。"""
+    import builtins
+    import importlib
+    import sys
+
+    real_import = builtins.__import__
+
+    def _no_requests(name, *a, **k):
+        if name.split(".")[0] in ("requests", "bs4", "urllib3"):
+            raise ModuleNotFoundError(f"No module named {name!r}")
+        return real_import(name, *a, **k)
+
+    for mod in [m for m in sys.modules
+                if m.startswith("cmuh_common.reg52_fetch")]:
+        del sys.modules[mod]
+    monkeypatch.setattr(builtins, "__import__", _no_requests)
+    importlib.import_module("cmuh_common.reg52_fetch")     # 不得拋出
