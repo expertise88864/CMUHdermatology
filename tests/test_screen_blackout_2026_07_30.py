@@ -855,3 +855,227 @@ def test_placement_uses_the_resolved_toplevel_hwnd():
     assert "_toplevel_hwnd(win)" in _code_only(sb.ScreenBlackout._create)
     assert "winfo_id" not in _code_only(sb.ScreenBlackout._place_and_verify), \
         "擺放不可以再自己去拿 winfo_id()"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# [2026-08-01 外部 review P1-04] 成功判準 + destroy 回讀
+# ══════════════════════════════════════════════════════════════════════════
+def test_a_partially_covered_screen_is_not_success(tk_root, monkeypatch,
+                                                   caplog):
+    """★核心★ 「主螢幕全黑、副螢幕只黑 1/3」不可以回 True。
+
+    原本 `show()` 用 `self.active`，而那是 `any(...)` —— 兩片都 mapped 就成立。
+    對一個用來遮住病歷的東西，那等於宣告成功卻沒有遮住：醫師以為螢幕關了，
+    離開診間，而另一台螢幕還亮著上一個病人的病歷。
+    """
+    import logging as _lg
+    want = [(0, 0, 400, 300), (400, 0, 400, 300)]
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: want)
+    real = sb.ScreenBlackout._window_rect
+
+    def _second_panel_is_short(hwnd):
+        got = real(hwnd)
+        # 第二片只蓋 1/3（就是使用者實機回報的那個比例）
+        if got and got[0] == 400:
+            return (400, 0, 133, 300)
+        return got
+    monkeypatch.setattr(sb.ScreenBlackout, "_window_rect",
+                        staticmethod(_second_panel_is_short))
+    try:
+        with caplog.at_level(_lg.WARNING):
+            assert bo.show() is False, "★蓋不滿就不是成功★"
+        msgs = " ".join(r.getMessage() for r in caplog.records)
+        assert "沒有蓋滿" in msgs and "geometry" in msgs
+    finally:
+        bo.hide()
+
+
+def test_a_failed_batch_leaves_no_panel_behind(tk_root, monkeypatch):
+    """★不可以留下部分黑幕★ 那是最糟的狀態：
+
+    醫師看不到一半的畫面（以為關了），而熱鍵閘門又因為「還有一片蓋著」
+    把 F1-F12 全部擋住 —— 兩邊都壞掉。
+    """
+    real = sb.ScreenBlackout._window_rect
+    monkeypatch.setattr(
+        sb.ScreenBlackout, "_window_rect",
+        staticmethod(lambda h: (0, 0, 1, 1) if real(h) else None))
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 400, 300),
+                                             (400, 0, 400, 300)])
+    try:
+        assert bo.show() is False
+        assert bo.active is False, "整批都要收掉"
+        assert bo._hwnds == (), "HWND 也要清乾淨（否則熱鍵永遠被擋）"
+        assert bo._wins == []
+    finally:
+        bo.hide()
+
+
+def test_a_fully_covered_screen_is_success(tk_root):
+    """反方向：真的蓋滿就要回 True（不可矯枉過正把功能弄壞）。"""
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 500, 400)])
+    try:
+        assert bo.show() is True
+        assert all(p.fully_verified for p in bo._panels)
+    finally:
+        bo.hide()
+
+
+def test_setpos_failure_alone_does_not_fail_the_panel(tk_root, monkeypatch):
+    """★判準是【結果】不是【呼叫成不成功】★
+
+    Tk 的 `wm geometry` 已經先擺過一次，Win32 那步只是校正到正確座標空間。
+    校正呼叫失敗、但回讀顯示確實蓋滿了 —— 那就是成功，沒有理由拆掉。
+    （單螢幕機器最常見的情況；把它判成失敗會讓按鈕在那些機器上完全沒用。）
+    """
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 500, 400)])
+    monkeypatch.setattr(sb._u32(), "SetWindowPos",
+                        lambda *_a: 0, raising=False)   # 回 0＝失敗
+    try:
+        assert bo.show() is True, "回讀蓋滿了就算成功"
+        assert bo._panels[0].setpos_ok is False, "但要如實記下來（診斷用）"
+        assert bo._panels[0].fully_verified is True
+    finally:
+        bo.hide()
+
+
+def test_the_hotkey_gate_stays_conservative(tk_root):
+    """★`active` 必須維持 any(...) 的保守語意★
+
+    它回答的是「可不可以放行熱鍵」。只要還有一片蓋著就不可以放行 ——
+    這一刀改的是 `show()` 的成功判準，【不可以】把 `active` 一起改成 all(...)，
+    否則「剩一片沒收掉」就會放行熱鍵，那一下就打在看不見的畫面上。
+    """
+    import ast
+    import inspect
+    import textwrap
+    tree = ast.parse(textwrap.dedent(
+        inspect.getsource(sb.ScreenBlackout.active.fget)))
+    calls = {n.func.id for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "any" in calls, "熱鍵閘門要保守：任一片還在就算黑著"
+    assert "all" not in calls
+
+
+def test_the_coverage_state_distinguishes_partial(tk_root, monkeypatch):
+    """★bool 表達不了「蓋了一半」★ 診斷與告警要看得出 PARTIAL。"""
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 500, 400)])
+    assert bo.coverage_state() == sb.COVERAGE_HIDDEN
+    try:
+        bo.show()
+        assert bo.coverage_state() == sb.COVERAGE_FULLY_VISIBLE
+        # 假裝應該有兩片、實際只有一片 → PARTIAL
+        bo._expected_panels = 2
+        assert bo.coverage_state() == sb.COVERAGE_PARTIAL
+    finally:
+        bo.hide()
+    assert bo.coverage_state() == sb.COVERAGE_HIDDEN
+
+
+def test_an_unknown_coverage_is_not_reported_as_hidden(tk_root, monkeypatch):
+    """★查不到 ≠ 沒事★ 查詢炸掉時要回 UNKNOWN，不可以回 HIDDEN。"""
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 500, 400)])
+    try:
+        bo.show()
+        monkeypatch.setattr(sb, "_u32",
+                            lambda: (_ for _ in ()).throw(OSError("掛了")))
+        assert bo.coverage_state() == sb.COVERAGE_UNKNOWN
+    finally:
+        monkeypatch.undo()
+        bo.hide()
+
+
+# ─── destroy：關不掉的黑幕要繼續擋熱鍵，而不是假裝收好了 ──────────────────
+def test_a_window_that_survives_destroy_keeps_the_gate_closed(tk_root,
+                                                              monkeypatch,
+                                                              caplog):
+    """★這是本項最危險的分支★
+
+    原本 destroy 失敗也無條件清 `_hwnds`，理由是「不然閘門會卡在黑著而熱鍵全死」。
+    那個理由沒錯，但代價選錯了：清掉之後如果視窗其實還在螢幕上，就變成
+    **醫師看不到 HIS，而 F1-F12 全部放行** —— 自動化在一個看不見的畫面上動作。
+    熱鍵全死是看得見、而且安全的故障；在看不見的畫面上動作不是。
+    """
+    import logging as _lg
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 500, 400)])
+    bo.show()
+
+    class _Stuck:
+        """怎麼關都關不掉的視窗。"""
+        @staticmethod
+        def IsWindow(_h):
+            return 1
+
+        @staticmethod
+        def IsWindowVisible(_h):
+            return 1
+
+        @staticmethod
+        def ShowWindow(_h, _c):
+            return 0
+
+        @staticmethod
+        def DestroyWindow(_h):
+            return 0
+    monkeypatch.setattr(sb, "_u32", lambda: _Stuck())
+    with caplog.at_level(_lg.ERROR):
+        bo.hide()
+    assert bo._hwnds, "★關不掉就要保留 HWND，讓熱鍵閘門繼續擋★"
+    msgs = " ".join(r.getMessage() for r in caplog.records)
+    assert "關不掉" in msgs and "繼續被擋住" in msgs, "而且要大聲說出來"
+
+
+def test_a_window_that_hides_on_escalation_releases_the_gate(tk_root,
+                                                             monkeypatch):
+    """★逐級升高就是為了讓大多數情況能收乾淨★
+
+    Tk destroy 失敗但 `ShowWindow(SW_HIDE)` 成功 → 使用者看得到 HIS 了 →
+    危險解除 → 閘門要放行（不可以因為「視窗物件還在」就把熱鍵鎖死）。
+    """
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 500, 400)])
+    bo.show()
+    state = {"visible": True}
+
+    class _HidesEventually:
+        @staticmethod
+        def IsWindow(_h):
+            return 1
+
+        @staticmethod
+        def IsWindowVisible(_h):
+            return 1 if state["visible"] else 0
+
+        @staticmethod
+        def ShowWindow(_h, _c):
+            state["visible"] = False       # SW_HIDE 生效
+            return 1
+
+        @staticmethod
+        def DestroyWindow(_h):
+            return 1
+    monkeypatch.setattr(sb, "_u32", lambda: _HidesEventually())
+    bo.hide()
+    assert bo._hwnds == (), "已經看不見了 → 閘門要放行"
+
+
+def test_the_escalation_reads_back_instead_of_assuming(tk_root):
+    """★送出去就當成功★ 是這個 repo 反覆出事的形狀 —— 強制關閉要回讀。"""
+    import ast
+    import inspect
+    import textwrap
+    tree = ast.parse(textwrap.dedent(
+        inspect.getsource(sb.ScreenBlackout._force_close_survivors)))
+    src = ast.unparse(tree)
+    for api in ("ShowWindow", "DestroyWindow", "IsWindowVisible"):
+        assert api in src, f"少了 {api}"
+    # DestroyWindow 之後必須再問一次 IsWindowVisible
+    assert src.index("DestroyWindow") < src.rindex("IsWindowVisible"), \
+        "拆完要再回讀一次才知道到底關掉了沒"

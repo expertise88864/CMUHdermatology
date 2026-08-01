@@ -48,6 +48,7 @@ Windows 會【立刻把螢幕點回來】；而 Win32 沒有給一般行程一�
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import logging
 import os
 import threading
@@ -118,7 +119,7 @@ def virtual_screen_rect() -> tuple:
     ★只剩「列舉不到任何螢幕」時的退路★ 正常路徑走 `monitor_rects()`（逐螢幕）。
     """
     try:
-        g = ctypes.windll.user32.GetSystemMetrics
+        g = _u32().GetSystemMetrics
         x, y = g(_SM_XVIRTUALSCREEN), g(_SM_YVIRTUALSCREEN)
         w, h = g(_SM_CXVIRTUALSCREEN), g(_SM_CYVIRTUALSCREEN)
         if w > 0 and h > 0:
@@ -161,6 +162,60 @@ def monitor_rects() -> list:
     return [virtual_screen_rect()]
 
 
+_u32_lock = threading.Lock()
+_u32_ready = False
+
+
+def _u32():
+    """user32，★而且把我們用到的每一支都宣告好 argtypes/restype★。
+
+    ★[2026-08-01 實測] 不宣告的話回傳值會讀錯★
+    在這台機器上量到（同一個 HWND、同一組參數、GetLastError 都是 0）：
+
+        沒設 argtypes → SetWindowPos 回 0（看起來失敗）
+        有設 argtypes → SetWindowPos 回 1（成功）
+
+    ctypes 預設把回傳當成 C int、參數當成 32 位 —— 於是
+    「呼叫其實成功了，但我們讀到的是失敗」。這一刀新增了「SetWindowPos 回 0 就算
+    這一片沒過」的判準，若不先修好宣告，每一台機器都會判定失敗 → 整批收回 →
+    **黑幕按鈕從此完全沒有作用**。（也就是說：這個新檢查如果沒有先量一下，
+    反而會把功能整個弄壞。）
+
+    順帶也修掉 HWND 截斷：HWND 是指標寬度，在 64 位行程可能超過 32 位，
+    不宣告 argtypes 時會被截斷成無效 handle。
+    """
+    global _u32_ready
+    u = ctypes.windll.user32
+    if _u32_ready:
+        return u
+    with _u32_lock:
+        if _u32_ready:
+            return u
+        try:
+            H, B, I, U = (wintypes.HWND, wintypes.BOOL, ctypes.c_int,
+                          wintypes.UINT)
+            u.SetWindowPos.argtypes = [H, H, I, I, I, I, U]
+            u.SetWindowPos.restype = B
+            u.GetWindowRect.argtypes = [H, ctypes.POINTER(wintypes.RECT)]
+            u.GetWindowRect.restype = B
+            u.IsWindow.argtypes = [H]
+            u.IsWindow.restype = B
+            u.IsWindowVisible.argtypes = [H]
+            u.IsWindowVisible.restype = B
+            u.ShowWindow.argtypes = [H, I]
+            u.ShowWindow.restype = B
+            u.DestroyWindow.argtypes = [H]
+            u.DestroyWindow.restype = B
+            u.GetParent.argtypes = [H]
+            u.GetParent.restype = H
+            u.GetForegroundWindow.restype = H
+            _u32_ready = True
+        except Exception:
+            logging.debug("[黑幕] user32 argtypes 宣告失敗（沿用預設）",
+                          exc_info=True)
+    return u
+
+
 def _toplevel_hwnd(win) -> int:
     """Tk 視窗的【最外層】HWND —— `winfo_id()` 不是它。
 
@@ -196,7 +251,7 @@ def _toplevel_hwnd(win) -> int:
     if os.name != "nt":
         return hwnd
     try:
-        u = ctypes.windll.user32
+        u = _u32()
         for _ in range(8):          # 有上限，免得哪天 GetParent 兜成環就轉不出來
             parent = int(u.GetParent(hwnd) or 0)
             if not parent:
@@ -205,6 +260,53 @@ def _toplevel_hwnd(win) -> int:
     except Exception:
         logging.debug("[黑幕] 走不完 GetParent（沿用 winfo_id）", exc_info=True)
     return hwnd
+
+
+@dataclasses.dataclass
+class PanelState:
+    """一片黑幕的驗證結果。★「有出現」不等於「蓋滿了」★
+
+    [2026-08-01 外審 P1] 原本 `show()` 只看「有沒有任何一片 mapped」，
+    於是「主螢幕全黑、副螢幕只黑 1/3」也回 True —— 一個用來遮住病歷的東西，
+    宣告成功卻沒有遮住。現在每一片都要逐項回讀，全部通過才算數。
+    """
+    requested_rect: tuple
+    index: int
+    actual_rect: tuple = ()
+    mapped: bool = False        # Tk 說它 mapped 了
+    setpos_ok: bool = False     # SetWindowPos 回非 0
+    geometry_ok: bool = False   # GetWindowRect 回讀 == 要求的矩形
+    visible: bool = False       # IsWindowVisible
+
+    @property
+    def fully_verified(self) -> bool:
+        """★判準是【結果】，不是【呼叫成不成功】★
+
+        `setpos_ok` 刻意【不】列入。它是手段不是目的：Tk 的 `wm geometry` 已經先
+        擺過一次，Win32 那一步只是把它校正到正確的座標空間。校正呼叫失敗、
+        但回讀顯示這一片確實蓋滿了要求的矩形 —— 那就是成功，沒有理由拆掉它
+        （單螢幕機器最常見的情況）。`setpos_ok` 只留作診斷。
+
+        真正要成立的是三件可觀察的事：Tk 說它 mapped、Win32 回讀的矩形等於要求的
+        矩形、而且視窗真的可見。
+        """
+        return bool(self.mapped and self.geometry_ok and self.visible)
+
+    def describe(self) -> str:
+        if self.fully_verified:
+            return f"第{self.index + 1}片 OK"
+        bad = [n for n, ok in (("mapped", self.mapped),
+                               ("geometry", self.geometry_ok),
+                               ("visible", self.visible)) if not ok]
+        return (f"第{self.index + 1}片 未通過({'/'.join(bad)}) "
+                f"要求={self.requested_rect} 實際={self.actual_rect or '(讀不到)'}")
+
+
+# 覆蓋狀態 —— ★bool 表達不了「蓋了一半」★（外審 P1）
+COVERAGE_HIDDEN = "hidden"              # 完全沒有黑幕
+COVERAGE_FULLY_VISIBLE = "fully_visible"  # 每一片都在、而且都驗過
+COVERAGE_PARTIAL = "partial"            # 有黑幕，但不是每一片都好 ← 最危險
+COVERAGE_UNKNOWN = "unknown"            # 查不出來（查不到 ≠ 沒事）
 
 
 class ScreenBlackout:
@@ -227,6 +329,9 @@ class ScreenBlackout:
         # 查狀態（見 `active_from_any_thread`）。list 的整體替換在 CPython 是原子的
         # —— 一律【整條換掉】，不要就地 append/remove。
         self._hwnds: tuple = ()
+        # [2026-08-01 外審 P1] 逐片驗證結果與應有片數 —— show() 的成功判準
+        self._panels: tuple = ()
+        self._expected_panels = 0
         self._poll_id = None
         self._prev_foreground = 0
         # 一次性的喚醒 token（monotonic 時間戳，0＝沒有）。熱鍵回呼在別的緒上
@@ -294,7 +399,7 @@ class ScreenBlackout:
         if not hwnds:
             return False
         try:
-            u = ctypes.windll.user32
+            u = _u32()
             # 任一片還可見就算黑幕還在（偏保守，理由同 `active`）
             return any(bool(u.IsWindow(h)) and bool(u.IsWindowVisible(h))
                        for h in hwnds)
@@ -345,7 +450,19 @@ class ScreenBlackout:
 
     # ── 顯示 ────────────────────────────────────────────────────────────────
     def show(self) -> bool:
-        """顯示黑幕。★回傳的是【回讀結果】★（真的 mapped 才回 True）。"""
+        """顯示黑幕。★只有【每一個螢幕都確實蓋滿】才回 True★
+
+        ★[2026-08-01 外審 P1] 原本用 `self.active` 當成功判準★
+        而 `active` 是 `any(...)`。那個 `any` 對【熱鍵閘門】是對的、而且必須留著
+        （只要還有一片蓋著就不可以放行熱鍵，寧可保守）；但把它拿來當「黑屏成功了嗎」
+        就變成：主螢幕全黑、副螢幕只黑 1/3 —— 兩片都 mapped —— 照樣回 True。
+        一個用來遮住病歷的東西，宣告成功卻沒有遮住。
+
+        現在要求：片數等於螢幕數，而且每一片的 mapped/setpos/geometry/visible
+        四項都通過。任何一片不合格就【整批拆掉】並回 False ——
+        ★不可以留下部分黑幕★：那是最糟的狀態（醫師以為螢幕關了，其實一半的病歷
+        還亮著；而熱鍵閘門又因為「有一片蓋著」而全部擋住）。
+        """
         if self._busy_fn():
             logging.info("[黑幕] 本行程正在跑自動化 → 本輪不黑屏")
             return False
@@ -357,26 +474,55 @@ class ScreenBlackout:
             logging.warning("[黑幕] 建立黑幕視窗失敗（本輪放棄）", exc_info=True)
             self._destroy()
             return False
-        mapped = self.active
-        if not mapped:
-            # 沒 mapped 就不能留一個半死的視窗在那裡（也不能讓熱鍵閘門以為黑著）
-            logging.warning("[黑幕] 黑幕視窗沒有顯示出來（回讀 ismapped=False）→ 收回")
+        bad = [p for p in self._panels if not p.fully_verified]
+        missing = self._expected_panels - len(self._panels)
+        if bad or missing > 0:
+            logging.warning(
+                "[黑幕] ★沒有蓋滿，整批收回★ 螢幕 %d 個／建立 %d 片；未通過：%s",
+                self._expected_panels, len(self._panels),
+                "；".join(p.describe() for p in bad) or f"少了 {missing} 片")
             self._destroy()
-        return mapped
+            return False
+        logging.info("[黑幕] %d 片全部驗證通過（逐片回讀位置與可見性）",
+                     len(self._panels))
+        return True
+
+    def coverage_state(self) -> str:
+        """現在到底蓋成什麼樣子。★bool 表達不了「蓋了一半」★
+
+        `active`（bool）是給熱鍵閘門用的保守判斷，回答的是「可不可以放行熱鍵」。
+        這一支回答的是另一個問題：「畫面現在是什麼狀態」——診斷與告警要用這個。
+        """
+        hwnds = self._hwnds
+        if not hwnds:
+            return COVERAGE_HIDDEN
+        try:
+            u = _u32()
+            alive = [h for h in hwnds
+                     if bool(u.IsWindow(h)) and bool(u.IsWindowVisible(h))]
+        except Exception:
+            logging.debug("[黑幕] 查覆蓋狀態失敗", exc_info=True)
+            return COVERAGE_UNKNOWN
+        if not alive:
+            return COVERAGE_HIDDEN
+        if len(alive) == self._expected_panels and all(
+                p.fully_verified for p in self._panels):
+            return COVERAGE_FULLY_VISIBLE
+        return COVERAGE_PARTIAL
 
     def _create(self) -> None:
         import tkinter as tk
 
         try:
             self._prev_foreground = int(
-                ctypes.windll.user32.GetForegroundWindow() or 0)
+                _u32().GetForegroundWindow() or 0)
         except Exception:
             self._prev_foreground = 0
 
         rects = list(self._rects_fn() or [])
         if not rects:
             raise RuntimeError("列不出任何螢幕矩形")
-        wins, hwnds = [], []
+        wins, hwnds, panels = [], [], []
         for i, (x, y, w, h) in enumerate(rects):
             win = tk.Toplevel(self._root)
             wins.append(win)
@@ -405,7 +551,8 @@ class ScreenBlackout:
             #   這兩者**不是同一個座標空間**，擺上去就會被縮放成別的大小。
             #   改成查與擺都走 Win32（同一個空間），然後【回讀 GetWindowRect 驗證】。
             #   「送出去就當成功」正是這個 repo 反覆出事的形狀。
-            self._place_and_verify(win, (x, y, w, h), i, _toplevel_hwnd(win))
+            panel = self._place_and_verify(win, (x, y, w, h), i,
+                                           _toplevel_hwnd(win))
             # ★不用 grab_set★：抓住輸入的話，黑幕若沒收乾淨會把整台機器鎖死。
             # ★使用者定案：任何一種都馬上收（滑鼠移動也一樣，不問移了幾 px）
             for seq in ("<Key>", "<Button>", "<MouseWheel>", "<Motion>"):
@@ -420,6 +567,14 @@ class ScreenBlackout:
                                 "本輪不黑屏", i + 1, exc_info=True)
                 raise
             self._hwnds = tuple(hwnds)        # 整條換掉（跨緒讀取）
+            # Tk 自己說它 mapped 了沒 —— 與 Win32 的 visible 分開記，
+            # 兩邊都要通過才算這一片好了。
+            try:
+                panel.mapped = bool(win.winfo_ismapped())
+            except Exception:
+                logging.debug("[黑幕] 第 %d 片 winfo_ismapped 查詢失敗", i + 1,
+                              exc_info=True)
+            panels.append(panel)
 
         with self._wake_lock:
             self._eaten_this_blackout = False
@@ -435,9 +590,11 @@ class ScreenBlackout:
         #   兩者在多螢幕不同縮放時會給出不同答案 —— 而使用者看到的是 Win32 那個。
         logging.info("[黑幕] 已建立 %d 片：要求 %s ／實際 %s",
                      len(wins), rects, self.panel_rects())
+        self._panels = tuple(panels)
+        self._expected_panels = len(rects)
         self._schedule_poll()
 
-    def _place_and_verify(self, win, rect, index: int, hwnd: int) -> None:
+    def _place_and_verify(self, win, rect, index: int, hwnd: int):
         """用 Win32 把這一片擺到 rect，然後【回讀 GetWindowRect 驗證】。
 
         ★`hwnd` 必須是 `_toplevel_hwnd(win)`，不可以是 `win.winfo_id()`★
@@ -454,39 +611,61 @@ class ScreenBlackout:
         （dpi 虛擬化、`wm maxsize`、視窗管理員都可能改它）。這個 repo 反覆出事的形狀
         就是「送出去就當成功」。對不上時記 warning 並把兩組數字都寫出來 ——
         下次使用者回報「蓋不滿」，log 直接就能判斷是算錯還是被改掉。
+
+        ★[2026-08-01 外審 P1] 一定要【回傳】驗證結果★
+        原本這支只記 warning、不回傳任何東西，而 `show()` 又只看
+        「有沒有任何一片 mapped」—— 於是「主螢幕全黑、副螢幕只黑 1/3」照樣回 True。
+        對一個用來遮住病歷的東西，那等於宣告成功卻沒有遮住。
         """
         x, y, w, h = rect
+        state = PanelState(requested_rect=(x, y, w, h), index=index)
         if not hwnd:
-            logging.warning("[黑幕] 第 %d 片拿不到最外層 HWND → 沿用 Tk 的擺法",
+            logging.warning("[黑幕] 第 %d 片拿不到最外層 HWND → 無法驗證是否蓋滿",
                             index + 1)
-            return
+            return state
         try:
-            u = ctypes.windll.user32
+            u = _u32()
             HWND_TOPMOST = -1
             SWP_NOACTIVATE = 0x0010
             SWP_SHOWWINDOW = 0x0040
-            u.SetWindowPos(hwnd, HWND_TOPMOST, int(x), int(y), int(w), int(h),
-                           SWP_NOACTIVATE | SWP_SHOWWINDOW)
+            # ★SetWindowPos 的回傳值不可以丟掉★ 它回 0 就是沒擺成功；
+            #   原本沒看，於是「擺失敗」與「擺好了」在後續完全分不出來。
+            state.setpos_ok = bool(u.SetWindowPos(
+                hwnd, HWND_TOPMOST, int(x), int(y), int(w), int(h),
+                SWP_NOACTIVATE | SWP_SHOWWINDOW))
+            if not state.setpos_ok:
+                logging.warning("[黑幕] 第 %d 片 SetWindowPos 回 0（沒擺成功）",
+                                index + 1)
         except Exception:
-            logging.warning("[黑幕] 第 %d 片 SetWindowPos 失敗（沿用 Tk 的擺法）",
+            # ★不 return★ 校正失敗不代表沒蓋到：Tk 的 `wm geometry` 已經先擺過
+            #   一次，單螢幕機器那一次通常就是對的。判準是【回讀的結果】，
+            #   所以照樣往下量 —— 量完若真的蓋滿了，這一片就算成功。
+            logging.warning("[黑幕] 第 %d 片 SetWindowPos 失敗（改看回讀結果）",
                             index + 1, exc_info=True)
-            return
         got = self._window_rect(hwnd)
         if got is None:
             logging.warning("[黑幕] 第 %d 片回讀 GetWindowRect 失敗 → 無法確認蓋滿",
                             index + 1)
-            return
-        if got != (x, y, w, h):
+            return state
+        state.actual_rect = got
+        state.geometry_ok = (got == (x, y, w, h))
+        if not state.geometry_ok:
             logging.warning(
                 "[黑幕] ★第 %d 片沒有蓋到要求的範圍★ 要求 %s ／實際 %s"
                 "（差異多半來自螢幕縮放比例不同）", index + 1, (x, y, w, h), got)
+        try:
+            state.visible = bool(_u32().IsWindowVisible(hwnd))
+        except Exception:
+            logging.debug("[黑幕] 第 %d 片 IsWindowVisible 查詢失敗", index + 1,
+                          exc_info=True)
+        return state
 
     @staticmethod
     def _window_rect(hwnd: int):
         """→ (x, y, w, h) 或 None。純 Win32 回讀，不經過 Tk。"""
         try:
             r = wintypes.RECT()
-            if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r)):
+            if not _u32().GetWindowRect(hwnd, ctypes.byref(r)):
                 return None
             return (int(r.left), int(r.top),
                     int(r.right - r.left), int(r.bottom - r.top))
@@ -548,10 +727,16 @@ class ScreenBlackout:
 
     def _destroy(self) -> None:
         self._cancel_poll()
+        # ★驗證結果不可以活得比視窗久★
+        #   `_panels` 是建立當下的回讀快照。`_schedule_poll()` 排不到 after 時會
+        #   【自己】呼叫 _destroy()，若不在這裡清掉，`show()` 之後看到的就是一份
+        #   「每一片都通過」的快照，而視窗其實已經被收掉了 → 宣告成功卻沒有黑幕。
+        self._panels = ()
         wins, self._wins = self._wins, []
         if not wins:
             self._hwnds = ()
             return
+        hwnds = self._hwnds
         for win in wins:
             # ★每一片都要各自 try★ 其中一片 destroy 失敗不可以讓其餘幾片留在
             #   螢幕上（那就是「收不掉的黑幕」，診間機最不能發生的事）。
@@ -559,10 +744,20 @@ class ScreenBlackout:
                 win.destroy()
             except Exception:
                 logging.debug("[黑幕] destroy 失敗（已放棄引用）", exc_info=True)
-        # ★HWND 要在 destroy 【之後】才清★ 先清會出現「黑幕還蓋著、但熱鍵閘門
-        # 已放行」的空窗，那一瞬的按鍵就會對 HIS 動作。destroy 失敗時也要清，
-        # 不然閘門會卡在「黑著」（IsWindowVisible 還是 True）而熱鍵全死。
-        self._hwnds = ()
+        # ★[2026-08-01 外審 P1] destroy 失敗時【不可以】直接把 HWND 清掉★
+        #   原本無條件清，理由是「不然閘門會卡在黑著而熱鍵全死」。那個理由本身沒錯，
+        #   但代價選錯了：清掉之後如果視窗其實還在螢幕上，就變成
+        #   **醫師看不到 HIS，而 F1-F12 全部放行** —— 自動化在一個看不見的畫面上動作。
+        #   熱鍵全死是看得見、而且安全的故障；在看不見的畫面上動作不是。
+        #   所以改成【先真的把它弄掉】：Tk destroy → 回讀 → SW_HIDE → DestroyWindow
+        #   → 再回讀。只有到這一步還在的，才保留 HWND 讓閘門繼續擋，並大聲告警。
+        stuck = self._force_close_survivors(hwnds)
+        self._hwnds = tuple(stuck)
+        if stuck:
+            logging.error(
+                "[黑幕] ★有 %d 片黑幕關不掉★ 螢幕上可能仍蓋著黑色畫面；"
+                "為了不讓熱鍵在看不見的畫面上動作，F1-F12 會【繼續被擋住】。"
+                "請結束並重新啟動主程式。", len(stuck))
         # 發一張【一次性】的喚醒 token：HWND 沒了之後，靠它把「喚醒的那一下」熱鍵
         # 吃掉（外審第 2 輪的競態）。只有真的建過視窗才發。
         # 一次性而非時間窗：喚醒只有一下，第二下 F1 必須正常動作（外審第 3 輪）。
@@ -574,13 +769,51 @@ class ScreenBlackout:
             else:
                 self._wake_token = time.monotonic()
 
+    @staticmethod
+    def _force_close_survivors(hwnds) -> list:
+        """Tk destroy 之後仍然看得見的視窗 → 用 Win32 硬關。→ 還是關不掉的清單。
+
+        ★逐級升高，每一級都【回讀】★（送出去就當成功正是這個 repo 反覆出事的形狀）
+          1. `IsWindow` + `IsWindowVisible`：還在嗎、看得見嗎
+          2. `ShowWindow(SW_HIDE)`：先讓它看不見 —— 這一步就足以解除危險
+             （使用者看得到 HIS 了），就算視窗物件還在
+          3. `DestroyWindow`：真的拆掉
+          4. 再回讀一次，仍然可見的才算「關不掉」
+        """
+        if not hwnds:
+            return []
+        SW_HIDE = 0
+        stuck = []
+        try:
+            u = _u32()
+        except Exception:
+            logging.debug("[黑幕] 取不到 user32，無法確認黑幕是否收乾淨",
+                          exc_info=True)
+            return []
+        for hwnd in hwnds:
+            try:
+                if not u.IsWindow(hwnd) or not u.IsWindowVisible(hwnd):
+                    continue                      # 已經不見了，正常路徑
+                logging.warning("[黑幕] HWND %s 在 Tk destroy 後仍可見 → 強制關閉",
+                                hwnd)
+                u.ShowWindow(hwnd, SW_HIDE)
+                u.DestroyWindow(hwnd)
+                if u.IsWindow(hwnd) and u.IsWindowVisible(hwnd):
+                    stuck.append(hwnd)
+            except Exception:
+                # 查不出來就當它還在（★查不到 ≠ 沒事★）
+                logging.warning("[黑幕] 強制關閉 HWND %s 時失敗 → 保守視為仍在",
+                                hwnd, exc_info=True)
+                stuck.append(hwnd)
+        return stuck
+
     def _restore_foreground(self) -> None:
         hwnd, self._prev_foreground = self._prev_foreground, 0
         if not hwnd:
             return
         try:
-            if ctypes.windll.user32.IsWindow(hwnd):
-                ctypes.windll.user32.SetForegroundWindow(hwnd)
+            if _u32().IsWindow(hwnd):
+                _u32().SetForegroundWindow(hwnd)
         except Exception:
             logging.debug("[黑幕] 還原前景視窗失敗", exc_info=True)
 
