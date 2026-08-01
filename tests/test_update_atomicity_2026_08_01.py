@@ -32,6 +32,13 @@ def _crashed_state(tmp_path, n_files=3, replaced=2, new_file=False):
 
     → (app_dir, [目標檔路徑…])
     前 `replaced` 個檔已經被換成新內容、且留有 .bak；其餘還是舊的。
+
+    ★[2026-08-05] 還沒被替換的檔要留著它的 `.upd.tmp`★
+    真正的 Phase 2 是「先把整批寫成 .upd.tmp，再逐檔 backup→replace」，而
+    `os.replace(tmp, target)` 會把 tmp 消耗掉 —— 所以崩潰當下，還沒輪到的檔
+    【一定】還留著自己的 .upd.tmp。原本這個 fixture 沒有做出這件事，偽造出一個
+    真實流程不會產生的磁碟狀態，於是「還沒輪到」與「換過了但備份被刪」在測試裡
+    長得一模一樣，兩者相反的處置也就無從分辨。
     """
     app = tmp_path / "app"
     app.mkdir()
@@ -41,18 +48,27 @@ def _crashed_state(tmp_path, n_files=3, replaced=2, new_file=False):
         p = app / f"mod{i}.py"
         p.write_text(f"OLD-{i}", encoding="utf-8")
         targets.append(str(p))
-        entries.append({"target": str(p), "existed_before": True})
+        entries.append({"target": str(p), "existed_before": True,
+                        "staged": str(app / f".mod{i}.py.upd.tmp")})
     if new_file:
         p = app / "brand_new.py"      # 這一批才第一次出現的檔
         targets.append(str(p))
-        entries.append({"target": str(p), "existed_before": False})
+        entries.append({"target": str(p), "existed_before": False,
+                        "staged": str(app / ".brand_new.py.upd.tmp")})
+
+    # 整批都先 staged 過（Phase 1 的產物）
+    for entry in entries:
+        with open(entry["staged"], "w", encoding="utf-8") as f:
+            f.write("NEW")
 
     for i in range(replaced):
         p = app / f"mod{i}.py"
         (app / f"mod{i}.py.bak").write_text(f"OLD-{i}", encoding="utf-8")
         p.write_text(f"NEW-{i}", encoding="utf-8")
+        os.remove(app / f".mod{i}.py.upd.tmp")     # replace 把 tmp 吃掉了
     if new_file and replaced > 0:
         (app / "brand_new.py").write_text("NEW", encoding="utf-8")
+        os.remove(app / ".brand_new.py.upd.tmp")
 
     (app / updater.JOURNAL_FILENAME).write_text(
         json.dumps({"schema": 1, "started": "2026-08-01T09:00:00",
@@ -76,7 +92,9 @@ def test_a_half_written_update_is_rolled_back_on_startup(tmp_path):
 
     assert [open(t, encoding="utf-8").read() for t in targets] == \
         ["OLD-0", "OLD-1", "OLD-2"], "必須整批回到更新前的版本"
-    assert len(restored) == 3
+    # ★措辭鐵律★ 只算【真的動過】的：mod2 崩潰時根本還沒被替換，把它算成
+    #   「已回滾」是在誇大程式做過的事（日誌有 3 個檔，實際還原 2 個）。
+    assert set(restored) == set(targets[:2])    # 回滾是反序走的，比集合
 
 
 def test_a_file_created_by_the_batch_is_removed_on_rollback(tmp_path):
@@ -254,6 +272,11 @@ def test_a_killed_process_leaves_a_usable_journal_and_recovery_works(
     calls = {"n": 0}
 
     def _die(src, dst):
+        # ★只數「換到正式檔」那幾次★ 備份現在也是用 replace 原子換名的
+        #   （.bak.tmp → .bak），不排除的話會在【還沒換掉 a】的時候就死，
+        #   測的就不是「a 已新、b 還舊」那個半套狀態了。
+        if str(dst).endswith(".bak"):
+            return real_replace(src, dst)
         calls["n"] += 1
         if calls["n"] == 2:
             raise KeyboardInterrupt("行程被砍")      # BaseException：不被接住
@@ -306,3 +329,256 @@ def test_the_watchdog_also_recovers_on_startup():
 def test_the_journal_constants_are_public(name):
     """常數要是公開的：復原、測試、日後的排查工具都要指得到同一個檔名。"""
     assert hasattr(updater, name)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# [2026-08-05 外審] 五個 CONFIRMED P1 的回歸測試
+# ══════════════════════════════════════════════════════════════════════════
+def test_recovery_defers_while_another_process_is_writing(tmp_path,
+                                                          monkeypatch, caplog):
+    """★P1-1：復原會跟正在進行的 commit 撞在一起，撞出混版本★
+
+    開機時 watchdog 幾乎同時拉起五支程式。A 正在 Phase 2 寫到一半(日誌已落地)，
+    B 啟動 → 看到日誌 → 以為「上次崩潰了」→ 回滾 A 剛換好的檔、又把日誌清掉；
+    A 接著把剩下的換完 → 「第一個舊、其餘新」的混版本，而且再也沒有日誌能修它。
+    這正是 `_updater_write_lock` 當初要防的事，而復原當時沒有拿那把鎖。
+
+    拿不到鎖時必須【什麼都不做】——「有人正在寫」不等於「上次崩潰了」。
+    """
+    import contextlib
+    import logging as _lg
+
+    app, targets = _crashed_state(tmp_path, n_files=3, replaced=2)
+
+    @contextlib.contextmanager
+    def _busy(timeout_sec=30.0):
+        yield False                      # 模擬「另一支程式正在寫」
+    monkeypatch.setattr(updater, "_updater_write_lock", _busy)
+
+    with caplog.at_level(_lg.INFO):
+        restored = updater.recover_incomplete_update(app)
+
+    assert restored == [], "拿不到鎖就不可以動任何檔"
+    assert [open(t, encoding="utf-8").read() for t in targets] == \
+        ["NEW-0", "NEW-1", "OLD-2"], "★磁碟必須原封不動★ 不可以去回滾別人正在寫的批次"
+    assert os.path.exists(os.path.join(app, updater.JOURNAL_FILENAME)), \
+        "★更不可以把別人的交易日誌清掉★ 清掉就沒有人能修那個混版本了"
+
+
+def test_recovery_takes_the_same_lock_the_writer_takes():
+    """釘住「用的是同一把鎖」—— 換成別的鎖等於沒鎖。"""
+    import ast
+    import inspect
+    import textwrap
+    tree = ast.parse(textwrap.dedent(
+        inspect.getsource(updater.recover_incomplete_update)))
+    names = {n.func.id for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "_updater_write_lock" in names, \
+        "復原必須拿【和寫入同一把】跨行程鎖"
+
+
+def test_a_torn_backup_cannot_overwrite_an_intact_file(tmp_path, monkeypatch):
+    """★P1-2：復原程序自己製造損毀★
+
+    備份原本是 `shutil.copy2(target, target + ".bak")` —— 直接往【權威名字】寫。
+    日誌是在動第一個正式檔之前就落地的，所以復原看到 .bak 存在就當它可信。
+    在 copy 中途斷電的話:正式檔還沒被動過、是完好的舊版，.bak 卻是半截的 ——
+    下次啟動就拿半截檔覆蓋掉完好的正式檔。
+
+    現在先寫 .bak.tmp、fsync、再原子換名，所以 .bak 只會是「完整舊版」或「不存在」。
+    這支模擬「複製到一半就死」，然後驗證權威的 .bak 沒有被寫出半截。
+    """
+    target = tmp_path / "mod.py"
+    target.write_text("COMPLETE-OLD-CONTENT", encoding="utf-8")
+
+    real_copy = updater._copy_file_with_retry
+
+    def _die_midway(src, dst):
+        with open(dst, "w", encoding="utf-8") as f:
+            f.write("TRUNC")             # 只寫了一部分
+        raise KeyboardInterrupt("斷電")
+    monkeypatch.setattr(updater, "_copy_file_with_retry", _die_midway)
+
+    with pytest.raises(KeyboardInterrupt):
+        updater._make_backup_atomically(str(target))
+
+    bak = tmp_path / "mod.py.bak"
+    assert not bak.exists(), \
+        "★權威的 .bak 不可以出現半截內容★ 半截檔會在下次啟動被當成可信的還原來源"
+    monkeypatch.setattr(updater, "_copy_file_with_retry", real_copy)
+    updater._make_backup_atomically(str(target))
+    assert bak.read_text(encoding="utf-8") == "COMPLETE-OLD-CONTENT"
+
+
+def test_backup_is_published_by_rename_not_written_in_place():
+    """釘住做法本身:不可以再直接 copy 到 `.bak`。"""
+    import ast
+    import inspect
+    import textwrap
+    src = ast.unparse(ast.parse(textwrap.dedent(
+        inspect.getsource(updater._make_backup_atomically))))
+    assert ".bak.tmp" in src and "_replace_file_with_retry" in src
+    assert "fsync" in src, "沒 fsync 的話斷電後 .bak 可能根本沒落到碟上"
+
+
+def test_once_mode_also_recovers(monkeypatch):
+    """★P1-3：排程真正在跑的是 --once，而它從來不做復原★
+
+    schtasks 每 2 分鐘跑 `watchdog_runner.py --once`；daemon 是選用的。
+    復原原本只掛在 daemon 分支 —— 於是沒開 daemon 的機器(最需要靠排程自救的
+    那些)根本走不到復原。而當時的測試只是 grep 原始碼裡有沒有那個字串,
+    所以照樣綠。
+    """
+    import watchdog_runner
+    called = []
+    monkeypatch.setattr(watchdog_runner, "_recover_incomplete_update",
+                        lambda: called.append("recover"))
+    monkeypatch.setattr(watchdog_runner, "_setup_logging", lambda *a, **k: None)
+
+    class _Core:
+        @staticmethod
+        def run_one_tick(mode="outer"):
+            called.append("tick")
+            return []
+    # ★兩個都要換★ `from cmuh_common import watchdog_core` 在該模組【已經被別的
+    #   測試 import 過】時，取的是套件物件上的屬性，不是 sys.modules —— 只換
+    #   sys.modules 的話單獨跑會過、全套跑會抓到真的模組（測試互相污染）。
+    import cmuh_common
+    monkeypatch.setitem(sys.modules, "cmuh_common.watchdog_core", _Core)
+    monkeypatch.setattr(cmuh_common, "watchdog_core", _Core, raising=False)
+
+    assert watchdog_runner._run_once_via_core() == 0
+    assert called == ["recover", "tick"], \
+        "★復原要在 import/執行 watchdog_core 之前★ 那個模組正是可能被換到一半的東西"
+
+
+def test_backups_are_kept_when_the_journal_cannot_be_cleared(tmp_path,
+                                                             monkeypatch):
+    """★P1-4：「日誌先消失、才准動備份」這個不變量原本沒有被強制★
+
+    `_clear_commit_journal` 吞掉例外又不回報成敗，呼叫端照樣往下刪 .bak。
+    防毒/暫時鎖檔讓 remove 失敗時 → 日誌還在、備份卻被刪掉一半 →
+    下次啟動照日誌回滾:有備份的退回舊版、備份沒了的留在新版 → 混版本。
+    """
+    app = tmp_path / "app"
+    app.mkdir()
+    a, b = app / "a.py", app / "b.py"
+    a.write_text("OLD-A", encoding="utf-8")
+    b.write_text("OLD-B", encoding="utf-8")
+    monkeypatch.setattr(updater, "get_app_dir", lambda: str(app))
+    monkeypatch.setattr(updater, "_clear_commit_journal", lambda _d: False)
+
+    result = updater.UpdateResult()
+    updater._commit_pending_writes(
+        [("k1", "a.py", "1.0", "NEW-A", str(a)),
+         ("k2", "b.py", "1.0", "NEW-B", str(b))], result)
+
+    assert (app / "a.py.bak").exists() and (app / "b.py.bak").exists(), \
+        "★日誌沒清掉就不准刪備份★ 否則會變成「日誌說要回滾、備份卻只剩一半」"
+    assert any("交易日誌" in e for e in result.errors), "而且要說出來"
+
+
+def test_a_failed_rollback_keeps_the_journal_for_a_retry(tmp_path, monkeypatch):
+    """★P1-5：回滾自己也會失敗，而失敗時日誌被清掉＝唯一的修復機會沒了★
+
+    典型情境是防毒暫時鎖住某個檔。磁碟仍是半新半舊，卻再也沒有標記讓下次啟動重試。
+    """
+    app = tmp_path / "app"
+    app.mkdir()
+    a, b = app / "a.py", app / "b.py"
+    a.write_text("OLD-A", encoding="utf-8")
+    b.write_text("OLD-B", encoding="utf-8")
+    monkeypatch.setattr(updater, "get_app_dir", lambda: str(app))
+
+    real_replace = updater._replace_file_with_retry
+
+    def _flaky(src, dst):
+        # 往前寫與回滾都是 replace 到同一個 dst，靠 src 分辨：
+        #   前進 = 從 .upd.tmp 搬進去；回滾 = 從 .bak 搬回來。
+        if dst == str(b) and not str(src).endswith(".bak"):
+            raise OSError("b 寫入失敗 → 觸發回滾")
+        if dst == str(a) and str(src).endswith(".bak"):
+            raise PermissionError("防毒鎖住 a → 回滾也失敗")
+        return real_replace(src, dst)     # a 的前進、.bak 的搬移都照常
+    monkeypatch.setattr(updater, "_replace_file_with_retry", _flaky)
+
+    result = updater.UpdateResult()
+    updater._commit_pending_writes(
+        [("k1", "a.py", "1.0", "NEW-A", str(a)),
+         ("k2", "b.py", "1.0", "NEW-B", str(b))], result)
+
+    assert os.path.exists(os.path.join(str(app), updater.JOURNAL_FILENAME)), \
+        "★回滾沒成功就要留下日誌★ 清掉的話下次啟動不知道還有半套狀態要修"
+
+
+def test_a_permanently_unfixable_file_does_not_loop_forever(tmp_path):
+    """★反方向:不可以無限重試★
+
+    「備份根本不存在」重試一萬次也不會長回來。若把它也留在日誌裡，每次啟動都會
+    噴同一批 error —— 那正是當初無條件清日誌想避免的事。所以只有【可能會好】的
+    失敗(鎖住/權限)才留著重試。
+    """
+    app, targets = _crashed_state(tmp_path, n_files=2, replaced=2)
+    os.remove(os.path.join(app, "mod0.py.bak"))     # 換過了、備份卻沒了
+
+    updater.recover_incomplete_update(app)
+    assert not os.path.exists(os.path.join(app, updater.JOURNAL_FILENAME)), \
+        "救不回來的檔不可以讓日誌永遠留著"
+    assert updater.recover_incomplete_update(app) == [], "第二次無事可做"
+
+
+def test_a_file_not_yet_reached_is_not_reported_as_rolled_back(tmp_path,
+                                                               caplog):
+    """★分辨「還沒輪到」與「備份被刪」★ 兩者都是「沒有 .bak」，處置卻相反。
+
+    分辨依據是那個檔的 `.upd.tmp` 還在不在 —— `os.replace(tmp, target)` 會把它
+    吃掉，所以 tmp 還在就代表還沒換過(它本來就是舊版,沒事)。
+    """
+    import logging as _lg
+    app, targets = _crashed_state(tmp_path, n_files=3, replaced=1)
+    with caplog.at_level(_lg.ERROR):
+        restored = updater.recover_incomplete_update(app)
+    assert set(restored) == {targets[0]}
+    assert not [r for r in caplog.records if r.levelno >= _lg.ERROR], \
+        "還沒輪到的檔不是錯誤，不可以每次啟動噴 error(那會讓人以為壞掉)"
+
+
+def test_a_crash_while_backing_up_cannot_destroy_the_intact_file(tmp_path,
+                                                                 monkeypatch):
+    """★P1-2 的【端到端】版:走真正的 commit 路徑★
+
+    上面那兩支是直接呼叫 `_make_backup_atomically` / 讀它的原始碼 —— 突變驗證時
+    發現:把 `_commit_pending_writes` 裡的呼叫【換回舊的直接 copy】，那兩支照樣全綠。
+    測了那個函式本身，卻沒測「正式流程真的有用它」，等於守衛沒蓋到生產路徑。
+
+    這支從 `_commit_pending_writes` 進去，在【備份複製到一半】時斷電:
+      * 正式檔還沒被動過 → 它是完好的舊版
+      * 舊做法:半截內容直接落在權威的 `.bak` 上
+      * 下次啟動的復原程序把那個半截檔蓋回正式檔 → **復原自己製造了損毀**
+    """
+    app = tmp_path / "app"
+    app.mkdir()
+    target = app / "mod.py"
+    target.write_text("COMPLETE-OLD-CONTENT", encoding="utf-8")
+    monkeypatch.setattr(updater, "get_app_dir", lambda: str(app))
+
+    def _die_midway(src, dst):
+        with open(dst, "w", encoding="utf-8") as f:
+            f.write("TRUNC")             # 備份只寫了一部分
+        raise KeyboardInterrupt("斷電")
+    monkeypatch.setattr(updater, "_copy_file_with_retry", _die_midway)
+
+    with pytest.raises(KeyboardInterrupt):
+        updater._commit_pending_writes(
+            [("k", "mod.py", "1.0", "NEW", str(target))],
+            updater.UpdateResult())
+
+    assert target.read_text(encoding="utf-8") == "COMPLETE-OLD-CONTENT", \
+        "測試前提:正式檔在備份階段還沒被動過"
+
+    # 下一次啟動的復原
+    updater.recover_incomplete_update(str(app))
+    assert target.read_text(encoding="utf-8") == "COMPLETE-OLD-CONTENT", \
+        ("★復原不可以把完好的檔換成半截備份★ "
+         "備份必須先寫 .bak.tmp 再原子換名，權威的 .bak 才不會出現半截內容")

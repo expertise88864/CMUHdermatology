@@ -100,10 +100,31 @@ log_usage() {  # $1 mode $2 effort $3 base $4 pass
 # [2026-07-13 使用者定案] 取消「每 task 最多兩輪」硬上限,改為「跑到 GPT-5.6 APPROVE
 # 才能 push」。每一輪修正 confirmed findings 後 resume 同一 session 續審;pass 累加。
 if [ "$MODE" = "resume" ]; then
-  SID="${2:-}"
+  # 續審必須沿用同一 session。這裡有三個獨立的失敗模式,少一個都會讓
+  # 「每一輪都 resume 同一 session」的規則失效:
+  #   1. 沒給 SID          → 必須有紀錄可用,否則不知道要續哪一場。
+  #   2. 給了但與紀錄不符  → 會續到**別場 review**,拿它的 APPROVE 放行 push。
+  #   3. 給了但根本沒紀錄  → 無從比對,等於未經驗證就續審。
+  # 另外仍保留 UUID 格式檢查:實測 `codex exec resume <非UUID>` 不會報錯,
+  # 它會**靜默開一個全新 session**,輸出與正常 resume 完全無法區分。
+  # UUID 大小寫不敏感,但 shell 字串比較敏感。格式檢查接受 A-F,所以貼上大寫版本
+  # 的**同一個** session 會被判成「不同 session」而拒絕 —— 那會把人推去開新
+  # session,正是本守衛要防的事。兩邊都正規化成小寫再比(codex 輸出本即小寫)。
+  RECORDED_SID="$(cat "$SESSION_FILE" 2>/dev/null | tr 'A-Z' 'a-z' || true)"
+  SID="$(printf '%s' "${2:-}" | tr 'A-Z' 'a-z')"
   if [ -z "$SID" ]; then
-    [ -s "$SESSION_FILE" ] || die "找不到第一輪 session id。請:$0 resume <session-id>。不要用 --last。"
-    SID="$(cat "$SESSION_FILE")"
+    [ -n "$RECORDED_SID" ] || die "找不到第一輪 session id($SESSION_FILE 不存在)。請先在同一 repo 完成第一輪,不要用 --last(可能 resume 到別的專案)。"
+    SID="$RECORDED_SID"
+  elif [ -n "$RECORDED_SID" ] && [ "$SID" != "$RECORDED_SID" ]; then
+    die "提供的 session id 與本 repo 第一輪紀錄不符。
+  提供:$SID
+  紀錄:$RECORDED_SID
+resume 只能沿用同一 task 的 session。要重開一輪全新審查請跑第一輪,不要用 resume 指向別場。"
+  elif [ -z "$RECORDED_SID" ]; then
+    die "本 repo 沒有第一輪 session 紀錄可比對;拒絕以未經驗證的 session id resume。"
+  fi
+  if ! printf '%s' "$SID" | grep -Eq       '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
+    die "session id 格式不正確:'$SID'(需為 UUID)。不要把 task-context 檔路徑傳到這個位置。"
   fi
   PREV_PASS="$(cat "$PASS_FILE" 2>/dev/null || echo 0)"
   [ "$PREV_PASS" -ge 1 ] 2>/dev/null \

@@ -92,6 +92,10 @@ class UpdateResult:
 class _WrittenFile:
     target_path: str
     existed_before: bool
+    # 這個檔【還沒被 replace 進去】時的暫存檔路徑（只有從交易日誌復原時才有值）。
+    # 用途見 `_rollback_written_files`：分辨「.bak 不見」是「還沒換到它」還是
+    # 「換過了但備份被刪掉」—— 兩者的正確處置完全相反。
+    staged_path: str = ""
 
 
 _FILE_OP_RETRY_DELAYS_SEC = (0.05, 0.15, 0.35)
@@ -124,6 +128,37 @@ def _replace_file_with_retry(src: str, dst: str) -> None:
 def _copy_file_with_retry(src: str, dst: str) -> None:
     import shutil
     _file_op_with_retry(f"copy {src} -> {dst}", shutil.copy2, src, dst)
+
+
+def _make_backup_atomically(target_path: str) -> None:
+    """把 target 備份成 `target.bak`，而且【備份要嘛完整、要嘛不存在】。
+
+    ★[2026-08-05 外審 P1] 不可以直接 copy 到 `.bak` 這個權威名字★
+    交易日誌是在動第一個正式檔【之前】就落地的，所以復原程序看到 `.bak` 存在就會
+    當它是可信的還原來源。而原本的做法是 `shutil.copy2(target, target + ".bak")`
+    ——直接往那個權威名字寫。在這中間被砍（關機、斷電、watchdog 重啟）的話：
+    正式檔還沒被動過、是完好的舊版，`.bak` 卻是【截斷的半個檔】；下次啟動的復原
+    程序就會拿那個半截檔覆蓋掉完好的正式檔 —— **復原程序自己製造了損毀**。
+
+    改成先寫 `.bak.tmp`、fsync（斷電也要落到碟上，不是只到 OS 快取），再用
+    `os.replace` 原子換名。同磁碟的 rename 是原子的，所以 `.bak` 只會是
+    「完整的舊版」或「還不存在」，不會是半截。
+    """
+    tmp_path = target_path + ".bak.tmp"
+    try:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    except OSError:
+        logging.debug("[更新] 清除殘留的 .bak.tmp 失敗 [%s]", tmp_path,
+                      exc_info=True)
+    _copy_file_with_retry(target_path, tmp_path)
+    try:
+        with open(tmp_path, "rb") as f:
+            os.fsync(f.fileno())
+    except OSError:
+        # fsync 失敗不致命（多半是特殊檔案系統），但要說出來：此時的耐久性沒有保證
+        logging.debug("[更新] 備份檔 fsync 失敗 [%s]", tmp_path, exc_info=True)
+    _replace_file_with_retry(tmp_path, target_path + ".bak")
 
 
 def _remove_file_with_retry(path: str) -> None:
@@ -187,8 +222,14 @@ def _write_commit_journal(app_dir: str, entries: list) -> bool:
             "schema": JOURNAL_SCHEMA,
             "started": datetime.now().isoformat(timespec="seconds"),
             "pid": os.getpid(),
-            "files": [{"target": t, "existed_before": bool(e)}
-                      for t, e in entries],
+            # ★`staged` 是那個檔【還沒被 replace 進去】的暫存檔路徑★
+            #   復原時用它分辨「.bak 不見」的兩種原因，見 `_rollback_written_files`。
+            #   `os.replace(tmp, target)` 會把 tmp 消耗掉，所以 tmp 還在 ⇒ 還沒換過。
+            "files": [{"target": t, "existed_before": bool(e),
+                       "staged": s}
+                      for t, e, s in (
+                          tuple(x) + ("",) * (3 - len(tuple(x)))
+                          for x in entries)],
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
@@ -206,15 +247,30 @@ def _write_commit_journal(app_dir: str, entries: list) -> bool:
         return False
 
 
-def _clear_commit_journal(app_dir: str) -> None:
-    """整批 commit 成功後清掉日誌。★一定要在刪 .bak 之前★
-    先刪 .bak 再刪日誌的話，中間崩潰會留下「日誌說要回滾、但備份已經沒了」的狀態。"""
+def _clear_commit_journal(app_dir: str) -> bool:
+    """整批 commit 成功後清掉日誌。→ 日誌【確定不存在】才回 True。
+
+    ★一定要在刪 .bak 之前★ 先刪 .bak 再刪日誌的話，中間崩潰會留下「日誌說要回滾、
+    但備份已經沒了」的狀態。
+
+    ★[2026-08-05 外審 P1] 必須回報成敗★ 原本吞掉例外又不回傳任何東西，呼叫端
+    照樣往下刪 .bak —— 於是防毒/暫時鎖檔讓 `os.remove` 失敗時，會變成
+    「日誌還在、備份只剩一部分」：下次啟動照日誌回滾，有備份的退回舊版、
+    備份已被刪掉的留在新版 → 混版本。所謂「日誌先消失、才動備份」的不變量
+    其實沒有被強制。現在刪完【回讀確認】，沒確認到就不准碰備份。
+    """
+    path = _journal_path(app_dir)
     try:
-        path = _journal_path(app_dir)
         if os.path.exists(path):
             os.remove(path)
     except OSError:
-        logging.debug("[更新] 清除交易日誌失敗", exc_info=True)
+        logging.warning("[更新] 清除交易日誌失敗 → 保留全套備份不刪", exc_info=True)
+        return False
+    # 回讀確認：remove 沒拋例外不代表檔案真的不在了（網路磁碟/防毒都可能）
+    still_there = os.path.exists(path)
+    if still_there:
+        logging.warning("[更新] 交易日誌刪除後仍然存在 → 保留全套備份不刪")
+    return not still_there
 
 
 def recover_incomplete_update(app_dir: str = "") -> "list[str]":
@@ -226,12 +282,55 @@ def recover_incomplete_update(app_dir: str = "") -> "list[str]":
     「壞掉的是被 import 的模組、但進入點還跑得起來」，那也是最常見的形狀。
     watchdog 是另一個行程，它也會呼叫這裡（見 watchdog_runner），涵蓋面因此大一些。
 
+    ★誠實邊界之二：這套保護【保護不到引進它自己的那一次更新】★
+    （2026-08-05 外審指出，記錄下來而不是假裝修好了。）
+    套用更新的是【已經載入記憶體】的那份 updater 程式碼。把 updater.py 覆蓋掉並
+    不會改變正在跑的 `_commit_pending_writes`。所以 v2026.08.01.1 → .2 那一次
+    ——也就是引進交易日誌的那次——是由【沒有日誌機制的舊 updater】執行的：
+    它若在中途死掉，一樣會留下無法復原的混版本。要從第二次更新起才真的有保護。
+    外審建議「拆成兩個 release 先鋪 updater 再鋪其餘」；那個窗口已經過去了
+    （.2 早就上線，現在是 v2026.08.01.8），所以這裡不做假動作，只把限制寫明：
+    ★以後凡是改動 commit/回滾流程，都要記得新邏輯是從【下一次】更新才生效。★
+    要真正消除這個窗口，需要一個不在被替換檔案清單裡的獨立啟動器（尚未實作）。
+
+    ★[2026-08-05 外審 P1] 復原必須拿【和寫入同一把】跨行程鎖★
+    開機時 watchdog 幾乎同時拉起五支程式，每支都會跑到這裡。沒有鎖的話：
+    A 正在 Phase 2 寫到一半（日誌已落地），B 啟動 → 看到日誌 → 判定「上次崩潰了」
+    → 把 A 剛換好的檔回滾、對 A 還沒動到的檔報「找不到備份」，然後**把日誌清掉**；
+    A 接著把剩下的檔換完 —— 結果是「第一個檔是舊的、其餘是新的」的混版本，
+    而且日誌已經沒了，沒有任何人能修它。這正是這把鎖當初要防的事（見
+    `_updater_write_lock`：五支程式同時啟動、.bak 互踩、混 commit）。
+    拿不到鎖時【不做事】：那代表有人正在寫，不是「上次崩潰了」。
+
+    ★誠實邊界（承上）★ 拿不到鎖就跳過，代表這一輪不復原；下次啟動再試。
+    這是刻意的 —— 把「別人正在寫」誤判成「上次崩潰」比晚一輪復原危險得多。
+
     不拋例外：復原失敗只記 error，絕不讓它擋住程式啟動。
     """
     restored: list[str] = []
     try:
         app_dir = app_dir or get_app_dir()
         path = _journal_path(app_dir)
+        # 先便宜地看一眼；沒有日誌就完全不必碰鎖（絕大多數啟動都走這條）
+        if not os.path.exists(path):
+            return restored
+        with _updater_write_lock() as _acquired:
+            if not _acquired:
+                logging.info("[更新] 有另一支程式正在寫入更新 → 本輪不做復原"
+                             "（正在寫 ≠ 上次崩潰），下次啟動再檢查")
+                return restored
+            return _recover_locked(app_dir, path, restored)
+    except Exception:
+        logging.error("[更新] 未完成更新的復原程序本身失敗（不影響啟動）",
+                      exc_info=True)
+    return restored
+
+
+def _recover_locked(app_dir: str, path: str, restored: "list[str]") -> "list[str]":
+    """`recover_incomplete_update` 的內層：呼叫時必須【已持有】更新寫入鎖。"""
+    try:
+        # 拿到鎖之後【再確認一次】：等鎖的期間，剛才那個寫入者可能已經正常結束
+        # 並清掉日誌了 —— 那就沒有崩潰可復原。
         if not os.path.exists(path):
             return restored
         with open(path, "r", encoding="utf-8") as f:
@@ -241,43 +340,115 @@ def recover_incomplete_update(app_dir: str = "") -> "list[str]":
             "[更新] ★偵測到未完成的更新★（交易日誌 %s，%d 個檔，開始於 %s）→ 回滾到更新前的版本",
             os.path.basename(path), len(files), payload.get("started", "?"))
         written = [_WrittenFile(str(item.get("target") or ""),
-                                bool(item.get("existed_before")))
+                                bool(item.get("existed_before")),
+                                str(item.get("staged") or ""))
                    for item in files if item.get("target")]
         # reversed()：與 in-process 的回滾順序一致
-        errors = _rollback_written_files(written)
-        for w in written:
-            restored.append(w.target_path)
+        errors, unresolved, rolled_back = _rollback_written_files(
+            written, from_journal=True)
+        # ★措辭鐵律★ 只報【真的動過】的檔：崩潰點之後那些根本沒被替換過的
+        #   不算「已回滾」，說成回滾了是在誇大這支程式做過的事。
+        restored.extend(rolled_back)
         if errors:
             logging.error("[更新] 回滾未完成的更新時有 %d 個錯誤：%s",
                           len(errors), "; ".join(errors[:3]))
         else:
             logging.warning("[更新] 已回滾 %d 個檔案到更新前的版本"
-                            "（下一輪更新會重新套用）", len(written))
-        # ★日誌一定要清掉★ 留著會讓每次啟動都重跑一次回滾，而第二次的 .bak
-        #   已經不存在 → 每次啟動都噴一批 error，看起來像壞掉。
-        _clear_commit_journal(app_dir)
+                            "（日誌共 %d 個，其餘在崩潰時還沒被替換過；"
+                            "下一輪更新會重新套用）", len(rolled_back), len(written))
+        # ★[2026-08-05 外審 P1] 只有【全部】還原成功才可以清掉日誌★
+        #   原本無條件清。可是回滾也會失敗（防毒暫時鎖住某個檔最常見）——
+        #   一清掉，磁碟上還是半新半舊，卻再也沒有任何標記讓下次啟動重試，
+        #   等於把唯一的修復機會丟掉。改成把日誌【改寫成只剩沒還原成功的那幾個檔】：
+        #   下次啟動會只重試它們，不會重覆回滾已經還原好的（那正是當初無條件清掉
+        #   要避免的「每次啟動噴一批 error」）。
+        if unresolved:
+            _rewrite_journal_for_retry(app_dir, unresolved)
+        else:
+            _clear_commit_journal(app_dir)
     except Exception:
         logging.error("[更新] 未完成更新的復原程序本身失敗（不影響啟動）",
                       exc_info=True)
     return restored
 
 
-def _rollback_written_files(written_files: list[_WrittenFile]) -> list[str]:
-    """Restore files already replaced when a later write in the batch fails."""
-    errors = []
+def _rewrite_journal_for_retry(app_dir: str,
+                               unresolved: "list[_WrittenFile]") -> None:
+    """把日誌縮成「還沒還原成功」的那幾個檔，讓下次啟動只重試它們。
+
+    寫不出來時【保留原本的日誌】—— 全部重試一次雖然會對已還原的檔噴 error，
+    但總比完全沒有標記好（沒有標記就沒有人會再去修那個混版本）。
+    """
+    # staged 一律給 ""：能走到這裡的都是【確定換過】的檔，不需要那個判別依據。
+    if _write_commit_journal(
+            app_dir,
+            [(w.target_path, w.existed_before, "") for w in unresolved]):
+        logging.error("[更新] ★仍有 %d 個檔沒有還原成功★ 已把交易日誌縮寫成只剩它們，"
+                      "下次啟動會再試一次", len(unresolved))
+    else:
+        logging.error("[更新] 仍有 %d 個檔沒有還原成功，且改寫交易日誌也失敗 → "
+                      "保留原日誌（下次啟動會整批重試）", len(unresolved))
+
+
+def _rollback_written_files(
+        written_files: list[_WrittenFile],
+        *, from_journal: bool = False,
+) -> "tuple[list[str], list[_WrittenFile], list[str]]":
+    """把已經換掉的檔還原回去。→ (錯誤訊息, 【沒有】還原成功的檔, 真的還原了的路徑)。
+
+    ★[2026-08-05 外審 P1] 第二個回傳值是必要的★ 呼叫端要據此決定「交易日誌能不能
+    清掉」：只要還有檔沒還原成功，日誌就得留著，否則那個混版本再也沒人會去修。
+
+    ★`from_journal`：「沒有 .bak」有兩個成因，處置完全相反★
+    （外審的建議沒有分這兩者；不分的話，其中一種會變成永遠停不下來的重試。）
+      * 行程內回滾（False）：`written_files` 只放【確定已經換掉】的檔，備份一定
+        做過了。這時 .bak 不見 = 真的出事 → 算錯誤。
+      * 日誌復原（True）：日誌是在動第一個檔【之前】就落地的，列的是整批 staged
+        檔案，所以裡面本來就有「崩潰時還沒輪到」的檔。分辨方式是那個檔的
+        `.upd.tmp` 還在不在 —— `os.replace(tmp, target)` 會把 tmp 消耗掉：
+          tmp 還在  ⇒ 還沒換過 ⇒ 它就是更新前的版本，沒有東西要還原（不是錯誤）
+          tmp 不在  ⇒ 換過了，而備份卻消失了（防毒清掉／被手動刪）
+                     ⇒ 這個檔【救不回來】，要大聲報錯
+
+    ★可重試 vs 不可重試★ 只有【可能會好】的失敗才放進 `unresolved` 讓下次啟動
+    再試（典型是防毒暫時鎖住檔案）。「備份根本不存在」重試一萬次也不會出現，
+    留在日誌裡只會讓每次啟動噴同一批 error —— 那正是當初無條件清日誌想避免的事。
+    """
+    errors: list[str] = []
+    unresolved: list[_WrittenFile] = []
+    restored: list[str] = []
     for written in reversed(written_files):
+        backup_path = written.target_path + ".bak"
+        name = os.path.basename(written.target_path)
+        if not os.path.exists(backup_path):
+            untouched = (written.existed_before
+                         and bool(written.staged_path)
+                         and os.path.exists(written.staged_path))
+            if not written.existed_before and not os.path.exists(
+                    written.target_path):
+                untouched = True      # 新增檔還沒被建出來 → 也是「還沒輪到」
+            if from_journal and untouched:
+                logging.info("[更新] %s 在崩潰時還沒被替換過（暫存檔仍在）→ "
+                             "它就是更新前的版本，不需還原", name)
+                continue
+            if written.existed_before:
+                msg = (f"找不到備份: {backup_path}"
+                       "（這個檔已經被換成新版，而備份不見了 → 救不回來）")
+                logging.error("更新回滾失敗 [%s]: %s", written.target_path, msg)
+                errors.append(f"[rollback] {written.target_path}: {msg}")
+                # ★刻意【不】放進 unresolved★ 備份不會自己長回來，重試沒有意義
+                continue
         try:
             if written.existed_before:
-                backup_path = written.target_path + ".bak"
-                if not os.path.exists(backup_path):
-                    raise FileNotFoundError(f"找不到備份: {backup_path}")
                 _replace_file_with_retry(backup_path, written.target_path)
             elif os.path.exists(written.target_path):
                 _remove_file_with_retry(written.target_path)
+            restored.append(written.target_path)
         except Exception as e:
             logging.error("更新回滾失敗 [%s]: %s", written.target_path, e)
             errors.append(f"[rollback] {written.target_path}: {e}")
-    return errors
+            unresolved.append(written)   # 這類（鎖住/權限）下次可能就成功了
+    return errors, unresolved, restored
 
 
 def _commit_sha_cache_path() -> str:
@@ -958,7 +1129,7 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
                       exc_info=True)
     if not _write_commit_journal(
             app_dir_for_journal,
-            [(entry[1], entry[2]) for entry in staged]):
+            [(entry[1], entry[2], entry[0]) for entry in staged]):
         result.errors.append("[journal] 交易日誌寫入失敗，本批不寫入")
         for entry in staged:
             try:
@@ -973,7 +1144,7 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
     for tmp_path, target_path, existed_before, key, local_filename, new_ver in staged:
         try:
             if existed_before:
-                _copy_file_with_retry(target_path, target_path + ".bak")
+                _make_backup_atomically(target_path)
             _replace_file_with_retry(tmp_path, target_path)
             result.updated_files.append((local_filename, new_ver))
             written_files.append(_WrittenFile(target_path, existed_before))
@@ -983,7 +1154,8 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
             break
 
     if result.errors:
-        rollback_errors = _rollback_written_files(written_files)
+        rollback_errors, unresolved, _rolled = _rollback_written_files(
+            written_files)
         result.errors.extend(rollback_errors)
         result.updated_files.clear()
         # 清掉任何殘留、尚未 replace 的 .upd.tmp
@@ -993,8 +1165,16 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
                     os.remove(entry[0])
             except OSError:
                 pass
-        # 已經在這個 process 裡回滾完了 → 日誌沒有存在的理由（留著會讓下次啟動
-        # 再回滾一次，而那時 .bak 已經被 rollback 消耗掉 → 每次啟動噴一批 error）。
+        if unresolved:
+            # ★[2026-08-05 外審 P1] 回滾自己也會失敗（防毒暫時鎖住檔最常見）★
+            #   原本無條件清日誌 —— 磁碟上還是半新半舊，卻再也沒有標記讓下次啟動
+            #   重試，等於把唯一的修復機會丟掉。留下（縮寫成只剩沒還原成功的檔）。
+            _rewrite_journal_for_retry(app_dir_for_journal, unresolved)
+            logging.error("更新寫入失敗，且有 %d 個檔【沒有】回滾成功 → "
+                          "已保留交易日誌，下次啟動會再試", len(unresolved))
+            return result
+        # 全部都回滾完了 → 日誌沒有存在的理由（留著會讓下次啟動再回滾一次，
+        # 而那時 .bak 已經被 rollback 消耗掉 → 每次啟動噴一批 error）。
         _clear_commit_journal(app_dir_for_journal)
         logging.warning("更新寫入失敗，已回滾 %d 個檔案", len(written_files))
         return result
@@ -1002,7 +1182,13 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
     # ★整批 replace 都成功了 → 先清日誌，再清 .bak★
     #   順序不可對調：先刪 .bak 再刪日誌的話，中間崩潰會留下「日誌說要回滾、
     #   但備份已經沒了」的狀態 —— 那比沒有日誌更糟。
-    _clear_commit_journal(app_dir_for_journal)
+    #   ★[2026-08-05 外審 P1] 而且要【確認】日誌真的不在了才准動備份★
+    #   清不掉就整套備份留著：日誌還在＋備份完整 = 下次啟動能乾淨回滾（退回舊版，
+    #   下一輪再更新）；日誌還在＋備份缺一半 = 混版本，沒人修得了。
+    if not _clear_commit_journal(app_dir_for_journal):
+        result.errors.append(
+            "[journal] 交易日誌清不掉 → 保留備份不刪（下次啟動會回滾這批）")
+        return result
 
     # [stability r4] 整批已成功 commit、不再需要回滾 → 清掉本批建立的 .bak 備份，
     # 避免無人值守長跑下程式目錄持續堆積過時的 .py.bak。務必放在上面的 rollback

@@ -86,6 +86,25 @@ def _setup_logging(log_path: Path = LOG_PATH) -> None:
 
 
 # ─── Entry points ────────────────────────────────────────────────────────
+def _recover_incomplete_update() -> None:
+    """復原上一批沒走完的更新。★--once 與 daemon 兩條路都要走這裡★
+
+    放在 watchdog 是刻意的：它是【獨立的行程】，被更新弄壞的那支程式啟動不了時，
+    應用程式自己的復原路徑就跑不到，而 watchdog 還活著。這是目前涵蓋面最大的
+    復原點（仍然涵蓋不到「連 watchdog 自己的相依也被換到一半」）。
+
+    失敗只記 log，絕不擋住 watchdog 本身 —— watchdog 停掉的代價比復原失敗大。
+    """
+    try:
+        from cmuh_common.updater import recover_incomplete_update
+        restored = recover_incomplete_update()
+        if restored:
+            logging.warning("守護程式啟動時回滾了 %d 個未完成的更新檔",
+                            len(restored))
+    except Exception:
+        logging.debug("復原未完成更新失敗（不影響守護程式）", exc_info=True)
+
+
 def _run_once_via_core() -> int:
     """schtasks 每 2 分鐘呼叫 `python watchdog_runner.py --once`。
     委派給 watchdog_core 跑一輪 outer tick 即 exit。
@@ -94,6 +113,12 @@ def _run_once_via_core() -> int:
     # 輪替競態(掉 log/超 1MB)。
     _setup_logging(LOG_PATH.with_name("watchdog_once.log"))
     logging.info("=== watchdog --once v%s ===", CURRENT_VERSION)
+    # ★[2026-08-05 外審 P1] 復原必須在【匯入 watchdog_core 之前】★
+    #   --once 才是排程真正在跑的模式（schtasks 每 2 分鐘一次）；daemon 是選用的。
+    #   復原原本只放在 daemon 分支，於是「沒開 daemon 的機器」——也就是最需要靠
+    #   排程把自己救回來的那些——根本走不到復原。而且要在 import watchdog_core
+    #   之前做：那個模組正是可能被換到一半的東西。
+    _recover_incomplete_update()
     try:
         from cmuh_common import watchdog_core
         actions = watchdog_core.run_one_tick(mode="outer")
@@ -111,17 +136,8 @@ def main() -> int:
         return _run_once_via_core()
 
     _setup_logging()
-    # ★[P1-08 2026-08-01] 復原上一批沒走完的更新★
-    #   放在 watchdog 是刻意的：它是【獨立的行程】，被更新弄壞的那支程式啟動不了時，
-    #   應用程式自己的復原路徑就跑不到，而 watchdog 還活著。這是目前涵蓋面最大的
-    #   復原點（仍然涵蓋不到「連 watchdog 自己的相依也被換到一半」）。
-    try:
-        from cmuh_common.updater import recover_incomplete_update
-        restored = recover_incomplete_update()
-        if restored:
-            logging.warning("守護程式啟動時回滾了 %d 個未完成的更新檔", len(restored))
-    except Exception:
-        logging.debug("復原未完成更新失敗（不影響守護程式）", exc_info=True)
+    # [P1-08 2026-08-01] 復原上一批沒走完的更新（--once 也走同一支，見上）
+    _recover_incomplete_update()
     # [EH-02 2026-07-12] 非 admin daemon 對 admin 權限行程 kill 會 AccessDenied → 只警告(不自動
     # 提權,避免無人在場反覆彈 UAC);schtasks /RL HIGHEST 路徑不受影響。
     try:
