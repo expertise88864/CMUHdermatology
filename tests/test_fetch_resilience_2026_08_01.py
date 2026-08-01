@@ -237,9 +237,11 @@ def test_the_caches_survive_concurrent_writers():
 def test_main_still_exposes_the_old_private_names():
     """★只搬家、不改呼叫端★"""
     import main
+    # [2026-08-01 第四刀(b)-ii] 四個 fetcher 搬走之後，熔斷器那三支在 main.py
+    # 已經沒有呼叫端了（它們的使用者跟著搬進 cmuh_common/reg52_fetch.py）——
+    # 與第二刀 、第四刀(a)  同一形狀。
     for name in ("_cache_get", "_cache_set", "_parse_cache_get",
-                 "_parse_cache_set", "_circuit_is_tripped",
-                 "_circuit_record_fail", "_circuit_record_success",
+                 "_parse_cache_set",
                  "_source_backoff_allow", "_source_backoff_fail",
                  "_source_backoff_success", "_source_throttle_allow"):
         assert getattr(main, name) is getattr(fr, name), f"{name} 沒接到新模組"

@@ -315,8 +315,12 @@ def test_main_and_scheduler_schedule_cache_cleanup_for_standalone_launches():
 
 
 def test_main_uses_weak_http_session_registry_and_bounded_memory_caches():
-    src = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
-    assert "_all_reg_sessions: WeakSet = WeakSet()" in src
+    # [2026-08-01 P2-06 第四刀(b)-ii] session 註冊表搬到
+    # cmuh_common/http_session_registry.py。守的性質沒變：★必須是 WeakSet★ ——
+    # 執行緒結束、session 沒人引用時要能被回收，用普通 set 會累積死 session。
+    reg = (ROOT / "src" / "cmuh_common" / "http_session_registry.py").read_text(
+        encoding="utf-8")
+    assert "_all_reg_sessions: WeakSet = WeakSet()" in reg
 
     # [2026-08-01 P2-06 第四刀(b)] 三個記憶體快取連同它們的容量修剪搬到
     # cmuh_common/fetch_resilience.py —— 守的性質沒變（長壽 dict 必須有上限，
