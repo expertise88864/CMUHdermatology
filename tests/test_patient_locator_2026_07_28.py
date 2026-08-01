@@ -204,7 +204,7 @@ def test_alert_includes_what_it_meant_to_write():
 def test_expected_value_comes_from_the_ledger_value_field():
     """告警信的「預期寫入」要取自帳本的 value 欄位 —— 不可改抓別的欄位。
 
-    ★[2026-08-05 外審 P2] 而且要走【和帳本同一條】正規化★
+    ★[2026-08-01 外審 P2] 而且要走【和帳本同一條】正規化★
     原本這裡釘的是 `expected=str(fields.get("value", ""))`，理由是
     「value 依契約必為非 PII」。但那個契約在呼叫端【漏改】時不成立：
     傳進來的若是一段自由文字，帳本會記成 violation（內容不落地），

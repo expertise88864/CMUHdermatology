@@ -235,7 +235,7 @@ def test_unexpected_new_index_entry_is_flagged():
         ph.verify_index_matches(expected)
 
 
-# ─── ★[2026-08-05 補審 P1] 乾淨的工作區不等於沒有東西要發佈★ ──────────────
+# ─── ★[2026-08-01 補審 P1] 乾淨的工作區不等於沒有東西要發佈★ ──────────────
 def test_a_clean_tree_with_unpushed_commits_still_needs_a_release(monkeypatch):
     """★這條會讓修正【送不到診間】而且畫面上一切正常★
 

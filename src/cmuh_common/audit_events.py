@@ -43,7 +43,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-# ★[2026-08-05 外審 P1] 每一種 kind 都要宣告【自己的值域】★
+# ★[2026-08-01 外審 P1] 每一種 kind 都要宣告【自己的值域】★
 #
 # 原本只有一條共用的字元白名單(`[0-9A-Za-z._+,/-]{0,32}`)。那擋得住中文姓名，
 # 但**擋不住病歷號與身分證** —— `12345678`、`A123456789` 全都是合法字元、長度也夠短。
@@ -90,12 +90,26 @@ _VIOLATION = "violation"
 
 
 def _numbers_ok(d: dict) -> bool:
+    """★[2026-08-01 外審 P2] NaN / Infinity 不算數字★
+
+    `float("nan")` 是 `float` 的實例，所以原本的型別檢查放它過去。但
+    `json.dumps` 預設 `allow_nan=True`，會吐出 `NaN` / `Infinity` —— **那不是合法
+    JSON**。帳本是要給別的工具（verifier／SIEM／日後的分析腳本）讀的，
+    寫進去等於那一行從此解析不了，而且是整條 hash chain 裡的一行。
+    劑量回讀不到時本來就該用 `None`（見 `Measure` 的說明），不是 NaN。
+    """
+    import math
+
     for k, v in d.items():
         if not isinstance(k, str) or not k.isidentifier():
             return False
-        if v is None or isinstance(v, (int, float)) and not isinstance(v, bool):
+        if isinstance(v, bool) or v is None:
             continue
-        if isinstance(v, bool):
+        if isinstance(v, int):
+            continue
+        if isinstance(v, float):
+            if not math.isfinite(v):
+                return False
             continue
         return False
     return True
@@ -236,7 +250,7 @@ class Reason(AuditValue):
 
     def to_payload(self) -> dict:
         if self.code not in REASONS:
-            # ★[2026-08-05 外審 P2] 不可以把被拒絕的字串抄進 violation★
+            # ★[2026-08-01 外審 P2] 不可以把被拒絕的字串抄進 violation★
             #   原本寫 `_violation("unknown_reason", code=self.code)` —— 於是
             #   `Reason(採樣到的原文)` 會把那段原文完整留在帳本裡，正好違反本模組
             #   「violation 絕不攜帶原值」的契約（也就是用另一個欄位做了同一件壞事）。

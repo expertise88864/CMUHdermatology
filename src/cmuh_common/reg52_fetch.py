@@ -17,7 +17,7 @@
 import 本模組，而修復環境的 `_ensure_deps_runtime(REQUIRED_LIBS)` 要到【第 285 行】
 才跑 —— 套件缺了或壞了的話，這裡會先 `ModuleNotFoundError`，程式根本進不去，
 **那個專門用來自動修好環境的安裝器也就永遠沒機會執行**，變成要有人到現場。
-（這是 2026-08-05 外審抓到的：搬進本模組時把 main.py 原本刻意的
+（這是 2026-08-01 外審抓到的：搬進本模組時把 main.py 原本刻意的
  `TYPE_CHECKING` + 執行期 None 佔位 + splash 後才載入的設計弄丟了，
  順帶也把 400-500ms 的 pre-splash 載入成本加了回去。）
 所以下面每支函式都在【函式內】才 import。
@@ -28,6 +28,7 @@ import logging
 import threading
 
 from cmuh_common.fetch_resilience import (
+    _CIRCUIT_BREAKER_RESET_SEC,
     _cache_get,
     _cache_set,
     _circuit_is_tripped,
@@ -42,6 +43,11 @@ from cmuh_common.appt_utils import reg52_docno_for_dayoff_table as _reg52_docno_
 from cmuh_common.http_session_registry import register_session as _register_reg_session
 
 _CIRCUIT_BREAKER_THRESHOLD = 3   # 與 fetch_resilience 對齊（只用於 log 措辭）
+# ★[2026-08-01 外審 P3] log 要說得跟實際行為一樣★
+#   原本三支都寫「本 session 不再嘗試（重啟程式才會重試）」，但共用熔斷器有
+#   `_CIRCUIT_BREAKER_RESET_SEC` 冷卻，逾時會自動半開放行一次重試 —— 那句話會讓
+#   查問題的人以為「不重開就永遠不會再連」，而事實上它自己會回來。
+_CIRCUIT_BREAKER_RESET_MIN = int(_CIRCUIT_BREAKER_RESET_SEC // 60)
 
 
 _reg52_external_tls = threading.local()
@@ -126,7 +132,11 @@ def _fetch_east_district_reg52_html(session, doc_no: str, doctor_name: str):
     if not ok:
         logging.info(f"[BACKOFF] skip east fetch {doctor_name} {doc_no}, remaining={remain:.1f}s")
         return None
-    session = _get_thread_local_reg52_external_session()
+    # ★[2026-08-01 外審 P2] 只有沒帶 session 時才取 thread-local★
+    #   原本是無條件覆蓋參數 —— 呼叫端傳進來的 proxy／認證／憑證政策全部失效，
+    #   而測試又以為自己注入得進來（實際上測到的是 thread-local 那條）。
+    #   「一定會被丟掉的參數」比沒有參數更糟：它讓 API 契約騙人。
+    session = session or _get_thread_local_reg52_external_session()
     last_error = None
     for docname_q in variants:
         url = f"{EAST_DISTRICT_REG52_URL}?DocNo={dparam}&Docname={docname_q}"
@@ -159,8 +169,8 @@ def _fetch_east_district_reg52_html(session, doc_no: str, doctor_name: str):
         logging.warning(f"[BACKOFF] east fetch fail {doctor_name} {doc_no}, fail={cnt}, delay={delay:.1f}s")
         # [O36] 紀錄 session 級失敗
         if _circuit_record_fail("east"):
-            logging.warning("[O36] 東區主機連續失敗 %d 次，本 session 不再嘗試（重啟程式才會重試）",
-                            _CIRCUIT_BREAKER_THRESHOLD)
+            logging.warning("[O36] 東區主機連續失敗 %d 次 → 暫停嘗試 %d 分鐘，之後自動半開重試",
+                            _CIRCUIT_BREAKER_THRESHOLD, _CIRCUIT_BREAKER_RESET_MIN)
     logging.warning(f"無法自東區主機取得掛號表: {doctor_name} ({dparam})")
     return None
 
@@ -187,7 +197,11 @@ def _fetch_huihe_reg52_html(session, doc_no: str, doctor_name: str):
     if not ok:
         logging.info(f"[BACKOFF] skip huihe fetch {doctor_name} {doc_no}, remaining={remain:.1f}s")
         return None
-    session = _get_thread_local_reg52_external_session()
+    # ★[2026-08-01 外審 P2] 只有沒帶 session 時才取 thread-local★
+    #   原本是無條件覆蓋參數 —— 呼叫端傳進來的 proxy／認證／憑證政策全部失效，
+    #   而測試又以為自己注入得進來（實際上測到的是 thread-local 那條）。
+    #   「一定會被丟掉的參數」比沒有參數更糟：它讓 API 契約騙人。
+    session = session or _get_thread_local_reg52_external_session()
     last_error = None
     for docname_q in variants:
         url = f"{HUIHE_REG52_URL}?DocNo={dparam}&Docname={docname_q}"
@@ -245,7 +259,11 @@ def _fetch_huisheng_reg52_html(session, doc_no: str, doctor_name: str):
     if not ok:
         logging.info(f"[BACKOFF] skip huisheng fetch {doctor_name} {doc_no}, remaining={remain:.1f}s")
         return None
-    session = _get_thread_local_reg52_external_session()
+    # ★[2026-08-01 外審 P2] 只有沒帶 session 時才取 thread-local★
+    #   原本是無條件覆蓋參數 —— 呼叫端傳進來的 proxy／認證／憑證政策全部失效，
+    #   而測試又以為自己注入得進來（實際上測到的是 thread-local 那條）。
+    #   「一定會被丟掉的參數」比沒有參數更糟：它讓 API 契約騙人。
+    session = session or _get_thread_local_reg52_external_session()
     last_error = None
     for docname_q in variants:
         url = f"{HUISHENG_REG52_URL}?DocNo={dparam}&Docname={docname_q}"
@@ -277,8 +295,8 @@ def _fetch_huisheng_reg52_html(session, doc_no: str, doctor_name: str):
         )
         logging.warning(f"[BACKOFF] huisheng fetch fail {doctor_name} {doc_no}, fail={cnt}, delay={delay:.1f}s")
         if _circuit_record_fail("huisheng"):  # [O36]
-            logging.warning("[O36] 惠盛主機連續失敗 %d 次，本 session 不再嘗試",
-                            _CIRCUIT_BREAKER_THRESHOLD)
+            logging.warning("[O36] 惠盛主機連續失敗 %d 次 → 暫停嘗試 %d 分鐘，之後自動半開重試",
+                            _CIRCUIT_BREAKER_THRESHOLD, _CIRCUIT_BREAKER_RESET_MIN)
     logging.warning(f"無法自惠盛取得掛號表: {doctor_name} ({dparam})")
     return None
 
@@ -305,7 +323,7 @@ def _fetch_auh_reg52_html(session, doctor_name):
         logging.info(f"[BACKOFF] skip auh fetch {doctor_name} {doc_no}, remaining={remain:.1f}s")
         return ""
     try:
-        session = _get_thread_local_reg52_external_session()
+        session = session or _get_thread_local_reg52_external_session()
         r = session.get(url, timeout=REG52_AUH_TIMEOUT, verify=True)
         r.raise_for_status()
         r.encoding = "big5"
@@ -327,8 +345,8 @@ def _fetch_auh_reg52_html(session, doctor_name):
         )
         logging.warning(f"[BACKOFF] auh fetch fail {doctor_name} {doc_no}, fail={cnt}, delay={delay:.1f}s")
         if _circuit_record_fail("auh"):  # [O36]
-            logging.warning("[O36] AUH 連續失敗 %d 次，本 session 不再嘗試（重啟才會重試）",
-                            _CIRCUIT_BREAKER_THRESHOLD)
+            logging.warning("[O36] AUH 連續失敗 %d 次 → 暫停嘗試 %d 分鐘，之後自動半開重試",
+                            _CIRCUIT_BREAKER_THRESHOLD, _CIRCUIT_BREAKER_RESET_MIN)
         return _cache_get(cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False) or ""
 
 

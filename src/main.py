@@ -1784,7 +1784,7 @@ def _ledger_writer_loop(q=None) -> None:
             # [批次三] 回讀不符 → 即時通知維護者(醫師端警告視窗在呼叫點既有;這封信
             # 讓改版寫錯不用等人翻帳本才發現)。async 寄,不卡本寫入緒。
             if str(fields.get("outcome", "")) == _LEDGER_MISMATCH:
-                # ★[2026-08-05 外審 P2] 告警信/log/定位索引必須走【和帳本同一個】
+                # ★[2026-08-01 外審 P2] 告警信/log/定位索引必須走【和帳本同一個】
                 #   正規化★
                 #   原本這裡對【原始物件】做 `str()`，理由是「value/detail 一定是
                 #   audit_events 的型別，渲染不出原文」。但那正是呼叫端【漏改】時
@@ -7595,6 +7595,10 @@ REG64_CMUH_BACKOFF_KEY = "reg64:appointment.cmuh.org.tw"
 # 門診動態：近一月統計天數、關診判定（時段底線後連續無變動秒數）
 CLINIC_METRIC_HISTORY_DAYS = 30
 CLINIC_LIGHT_HISTORY_DAYS = 30
+
+# [2026-08-01 外審 P2] 燈號歷史連續寫失敗幾次才出聲。門診輪詢很密（每診間每輪一次），
+# 一次失敗多半是暫時鎖檔，講出來只是噪音；連續 20 次代表真的寫不進去了。
+_CLINIC_LIGHT_WRITE_FAIL_ALERT_AT = 20
 # 浮動視窗:連續「錯誤/逾時」達此次數,才把該診間【候選】視為「今天沒這個診」並隱藏。
 # 給暫時性連線異常(冷啟動、換節、院方瞬斷)幾輪緩衝,避免把其實有診的診間從 pending 誤藏。
 # 候選還要再過「有別的診間連得上(網路正常)」這關(_floating_network_seems_up 看
@@ -7695,7 +7699,7 @@ NOTIFY_DO_NOT_DISTURB_END_HOUR = 8
 #   原本會用 powercfg 把 monitor-timeout 設成 15 分鐘。使用者要求「刪除原本 15 分鐘
 #   進入螢幕關閉的模式」，並定案【兩層都刪、螢幕只由按鈕控制】。
 #
-# ★[2026-08-05 外審 P2] 「不再設定」≠「已經刪掉」★
+# ★[2026-08-01 外審 P2] 「不再設定」≠「已經刪掉」★
 #   第一版只是把那兩條指令拿掉。但 `powercfg /change` 寫進的是【電源計畫】——
 #   它留在機器上，不會因為改版或重開機而消失。於是所有已經跑過舊版的診間機，
 #   螢幕【照樣】15 分鐘自己關掉：使用者要求刪掉的東西根本還在，而當時的註解卻寫著
@@ -7730,7 +7734,7 @@ def _keep_system_awake_display_free() -> None:
 def _apply_never_sleep_power_plan() -> None:
     """背景執行：以 powercfg 停用睡眠/休眠與螢幕逾時（主程式以 admin，權限足夠）。
 
-    ★[2026-07-31 使用者定案；2026-08-05 外審 P2 修正] 螢幕逾時設 0，不是「不碰」★
+    ★[2026-07-31 使用者定案；2026-08-01 外審 P2 修正] 螢幕逾時設 0，不是「不碰」★
     原本這裡把 monitor-timeout(AC/DC) 設成 15 分鐘。使用者要求刪除 15 分鐘進入螢幕
     關閉的模式，並定案【兩層都刪、螢幕只由設定頁的按鈕控制】。第一版只是不再送那
     兩條指令 —— 但 `powercfg /change` 是寫進電源計畫的，舊版寫下的 15 分鐘會留在
@@ -11356,9 +11360,27 @@ class AutomationApp:
 
 # --- [新增] 歷史燈號樣本（三分鐘桶）---
     def _save_clinic_light_sample(self, room_code, doc_name, session_cn, light_val, now=None):
-        """[P2-06 第五刀(a)] 內容搬到 `cmuh_common.clinic_store.save_light_sample`。"""
-        _cs_save_light_sample(room_code, doc_name, session_cn, light_val,
-                              now=now, history_days=CLINIC_LIGHT_HISTORY_DAYS)
+        """[P2-06 第五刀(a)] 內容搬到 `cmuh_common.clinic_store.save_light_sample`。
+
+        ★[2026-08-01 外審 P2] 寫入結果要往上帶★
+        存取層特地回了 bool，但 wrapper 沒有 return、呼叫端也沒接 —— 那個可觀測性
+        等於沒有加。歷史檔寫不進去（磁碟滿／防毒鎖檔／權限）時不該打斷看診，
+        但**也不可以永久靜默失效**：連續失敗要累計，健康頁才看得到「歷史統計已經
+        很久沒寫成功了」，否則等到有人想查歷史均值才發現整批都沒存。
+        """
+        ok = _cs_save_light_sample(room_code, doc_name, session_cn, light_val,
+                                   now=now,
+                                   history_days=CLINIC_LIGHT_HISTORY_DAYS)
+        if ok:
+            self._clinic_light_write_fail_streak = 0
+        else:
+            n = getattr(self, "_clinic_light_write_fail_streak", 0) + 1
+            self._clinic_light_write_fail_streak = n
+            # 只在跨過門檻的那一次講話，避免每次輪詢都刷一行
+            if n == _CLINIC_LIGHT_WRITE_FAIL_ALERT_AT:
+                logging.warning("[診間燈號] 歷史檔已連續 %d 次寫不進去 —— "
+                                "看診不受影響，但歷史均值會停在舊資料", n)
+        return ok
 
     def _get_hist_avg_light(self, room_code, doc_name, session_cn, now=None):
         """[P2-06 第五刀(a)] 內容搬到 `cmuh_common.clinic_store.hist_avg_light`。"""

@@ -33,7 +33,7 @@ def _crashed_state(tmp_path, n_files=3, replaced=2, new_file=False):
     → (app_dir, [目標檔路徑…])
     前 `replaced` 個檔已經被換成新內容、且留有 .bak；其餘還是舊的。
 
-    ★[2026-08-05] 還沒被替換的檔要留著它的 `.upd.tmp`★
+    ★[2026-08-01] 還沒被替換的檔要留著它的 `.upd.tmp`★
     真正的 Phase 2 是「先把整批寫成 .upd.tmp，再逐檔 backup→replace」，而
     `os.replace(tmp, target)` 會把 tmp 消耗掉 —— 所以崩潰當下，還沒輪到的檔
     【一定】還留著自己的 .upd.tmp。原本這個 fixture 沒有做出這件事，偽造出一個
@@ -332,7 +332,7 @@ def test_the_journal_constants_are_public(name):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# [2026-08-05 外審] 五個 CONFIRMED P1 的回歸測試
+# [2026-08-01 外審] 五個 CONFIRMED P1 的回歸測試
 # ══════════════════════════════════════════════════════════════════════════
 def test_recovery_defers_while_another_process_is_writing(tmp_path,
                                                           monkeypatch, caplog):
@@ -593,7 +593,7 @@ def test_a_crash_while_backing_up_cannot_destroy_the_intact_file(tmp_path,
          "備份必須先寫 .bak.tmp 再原子換名，權威的 .bak 才不會出現半截內容")
 
 
-# ─── ★[2026-08-05 外審第 2 輪] 三個 CONFIRMED P1★ ────────────────────────
+# ─── ★[2026-08-01 外審第 2 輪] 三個 CONFIRMED P1★ ────────────────────────
 def test_a_stale_backup_cannot_downgrade_an_untouched_file(tmp_path):
     """★復原把使用者【降版】了★
 
@@ -612,7 +612,7 @@ def test_a_stale_backup_cannot_downgrade_an_untouched_file(tmp_path):
     staged = app / ".mod.py.upd.tmp"
     staged.write_text("NEW", encoding="utf-8")                     # 還沒 replace
     (app / updater.JOURNAL_FILENAME).write_text(
-        json.dumps({"schema": 1, "started": "2026-08-05T09:00:00", "pid": 1,
+        json.dumps({"schema": 1, "started": "2026-08-01T09:00:00", "pid": 1,
                     "files": [{"target": str(target), "existed_before": True,
                                "staged": str(staged)}]}, ensure_ascii=False),
         encoding="utf-8")

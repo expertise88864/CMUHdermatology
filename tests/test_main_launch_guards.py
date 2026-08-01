@@ -110,7 +110,7 @@ def _assert_mutex_is_passed(source_path: Path, func_name: str,
                             program_attr: str, mutex: str) -> None:
     """那支程式的描述表要帶著 mutex，而按鈕要真的用那張表。
 
-    ★[2026-08-05 P2-06 第五刀(a)] 這半邊是新的★
+    ★[2026-08-01 P2-06 第五刀(a)] 這半邊是新的★
     順序檢查（先查再啟動）搬進 `launch_helper_script` 之後，光驗那邊【不夠】：
     描述表只要沒填 `single_instance_mutex`，共用函式就整段跳過檢查，而順序測試
     照樣綠。兩半都要釘，缺一邊守衛就可以被繞過。
@@ -158,7 +158,7 @@ def test_main_background_launches_check_mutex_before_spawn():
 def test_main_and_scheduler_helper_launches_use_shared_launcher():
     """四支啟動按鈕都要走共用啟動器，不可以自己 spawn。
 
-    ★[2026-08-05 P2-06 第五刀(a)] 改成【追一層間接】★
+    ★[2026-08-01 P2-06 第五刀(a)] 改成【追一層間接】★
     搬家後 main.py 那四支呼叫的是 `launch_helper_script`，由它再呼叫
     `launch_app_script`。若只驗第一層、不驗它真的接到共用啟動器，
     哪天 `launch_helper_script` 改成自己 `subprocess.Popen`（繞過
@@ -566,7 +566,7 @@ def test_clinic_room_defaults_use_shared_101_102_constant():
 def test_clinic_room_settings_migrate_legacy_defaults_on_load():
     """讀設定時要把舊的診間代碼正規化，改過就寫回去。
 
-    ★[2026-08-05 P2-06 第五刀(a)] 實作搬到 `cmuh_common/clinic_store.py`★
+    ★[2026-08-01 P2-06 第五刀(a)] 實作搬到 `cmuh_common/clinic_store.py`★
     main.py 現在只剩一層轉發，而 `_function_source` 是「名字先中先得」，
     會先撞到那層轉發 —— 所以這裡直接指名實作所在的檔案，
     再另外釘住 main.py 真的有把它接上去（不然搬完就變成沒人呼叫的死碼）。
@@ -1059,7 +1059,7 @@ def test_menu_tree_dump_gated_once_per_session():
 def test_clinic_light_history_written_compact():
     """[r5] 大型純機器快取 clinic_light_history.json 用 compact(indent=None)序列化。
 
-    [2026-08-05 P2-06 第五刀(a)] 寫檔搬到 `cmuh_common/clinic_store.py`。
+    [2026-08-01 P2-06 第五刀(a)] 寫檔搬到 `cmuh_common/clinic_store.py`。
     """
     store = ROOT / "src" / "cmuh_common" / "clinic_store.py"
     src = _function_source(store, "save_light_sample")
@@ -1261,7 +1261,7 @@ def test_morning_polling_and_residual_closed_guard_wired():
     assert "not is_closed_page and not is_stopped_page and now < boundary" in run_src
 
 
-# ─── ★[2026-08-05 外審 P1] 相依壞掉時，自動安裝器必須還跑得到★ ────────────
+# ─── ★[2026-08-01 外審 P1] 相依壞掉時，自動安裝器必須還跑得到★ ────────────
 def test_no_module_imports_a_heavy_dependency_before_the_installer_runs():
     """★掃【被 import 的模組】，不是只掃 main.py 的文字★
 

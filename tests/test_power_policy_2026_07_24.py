@@ -52,7 +52,7 @@ def test_power_plan_commands(monkeypatch):
                         lambda cmd, **k: (runs.append(list(cmd)), _CP())[1])
     main._apply_never_sleep_power_plan()
     joined = [" ".join(c) for c in runs]
-    # ★[2026-07-31 使用者定案；2026-08-05 外審 P2 修正] 螢幕逾時要設 0★
+    # ★[2026-07-31 使用者定案；2026-08-01 外審 P2 修正] 螢幕逾時要設 0★
     #   使用者要求刪除 15 分鐘進入螢幕關閉的模式，定案【兩層都刪、螢幕只由設定頁的
     #   按鈕控制】。第一版把指令拿掉就算數 —— 而這支測試當時也只斷言「沒有送
     #   monitor-timeout」，於是【綠燈，但使用者要刪的東西還在機器上】：
@@ -195,7 +195,7 @@ def test_the_automatic_screen_off_layers_are_really_gone():
                  "_screen_off_due", "SCREEN_OFF_MINUTES", "_SC_MONITORPOWER",
                  "_log_display_power_requests", "_request_blackout"):
         assert gone not in names, f"{gone} 已由使用者刪除，不可再出現"
-    # ★[2026-08-05 外審 P2] 這裡原本斷言「main.py 不准出現 monitor-timeout 字樣」★
+    # ★[2026-08-01 外審 P2] 這裡原本斷言「main.py 不准出現 monitor-timeout 字樣」★
     #   那是把「不提它」當成「已經刪掉它」。實際上舊版寫進電源計畫的 15 分鐘會留在
     #   機器上，不送指令＝不會消失 —— 測試綠、而使用者要刪的東西還在。
     #   要釘的其實是「不存在任何『N 分鐘後自動關螢幕』」，所以改成:凡是

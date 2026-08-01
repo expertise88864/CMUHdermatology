@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """啟動外部程式／開檔／開網頁，以及清掉孤兒 chromedriver。
-（P2-06 分層第五刀(a) 2026-08-05，從 `AutomationApp` 搬出）
+（P2-06 分層第五刀(a) 2026-08-01，從 `AutomationApp` 搬出）
 
 【為什麼這些原本是 method 卻不碰 self】
 它們是「被誤放進類別的模組函式」—— 沒有任何實例狀態，只是剛好被寫在類別裡。
@@ -51,7 +51,7 @@ _OK = LaunchOutcome(True)
 class HelperProgram:
     """一支輔助程式的完整描述 —— 腳本名、單一實例鎖、給人看的字、給機器看的 log。
 
-    ★為什麼連 log 訊息都放進來★（2026-08-05 外審 P3）
+    ★為什麼連 log 訊息都放進來★（2026-08-01 外審 P3）
     第一版把四支收斂成一支之後，log 改成用程式名組出來（`Launching 排班程式: …`）。
     但原本那四組訊息**不是規則的**：排班的失敗訊息是 `Failed to launch scheduler`
     （沒有 program），其餘三支是 `Failed to launch ○○ program`；「已在執行」那句
@@ -152,13 +152,25 @@ def open_local_program(path: str) -> LaunchOutcome:
 
 
 def open_url(url: str) -> LaunchOutcome:
+    """用預設瀏覽器開網頁。
+
+    ★[2026-08-01 外審 P2] `webbrowser.open()` 的回傳值不可以丟掉★
+    它找不到可用的瀏覽器時**不會拋例外**，只是回 False。原本無論回什麼都當成功，
+    於是使用者按了院內系統連結、什麼都沒發生、也沒有任何訊息 —— 又是這個 repo
+    一直在修的同一個形狀：「呼叫沒有拋例外，不代表操作完成」。
+    """
     try:
         logging.info("Attempting to open URL: %s", url)
-        webbrowser.open(url, new=2)
+        opened = webbrowser.open(url, new=2)
     except Exception as e:
         logging.error("Failed to open URL: %s", e)
         return LaunchOutcome(False, error_title="開啟失敗",
                              error_message=f"無法開啟網頁:\n{e}")
+    if not opened:
+        logging.error("Failed to open URL: browser refused (%s)", url)
+        return LaunchOutcome(
+            False, error_title="開啟失敗",
+            error_message=f"無法開啟網頁:\n系統找不到可用的瀏覽器\n\n{url}")
     return _OK
 
 

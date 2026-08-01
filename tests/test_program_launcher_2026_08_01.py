@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""[2026-08-05 P2-06 第五刀(a)] 外部程式啟動層。
+"""[2026-08-01 P2-06 第五刀(a)] 外部程式啟動層。
 
 ★這一刀的價值不是「main.py 少了幾行」★
 這些函式原本是 `AutomationApp` 裡不碰 `self` 的 method —— 被誤放進類別的模組函式。
@@ -207,7 +207,7 @@ def test_the_shared_layer_does_not_import_tkinter():
         f"program_launcher 不可以 import tkinter（實際: {names}）"
 
 
-# ─── ★[2026-08-05 外審 P3] log 訊息也是契約★ ─────────────────────────────
+# ─── ★[2026-08-01 外審 P3] log 訊息也是契約★ ─────────────────────────────
 # 第一版把四支收斂成一支之後，log 改用程式名組出來（`Launching 排班程式: …`）。
 # 但原字串**不是規則的**：排班的失敗訊息是 `Failed to launch scheduler`（沒有
 # program），其餘三支是 `Failed to launch ○○ program`；「已在執行」那句也各自不同。

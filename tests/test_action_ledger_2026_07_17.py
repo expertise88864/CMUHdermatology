@@ -46,7 +46,7 @@ def _v(code):
     本身；但如果繼續餵字串，它們就會全部記成 violation —— 測的東西跟生產路徑
     不一樣，是這個 repo 反覆踩到的坑。
     """
-    # [2026-08-05 外審 P1] kind 現在要宣告值域，未宣告的一律 violation。
+    # [2026-08-01 外審 P1] kind 現在要宣告值域，未宣告的一律 violation。
     # 用真實的 kind（醫令代碼＝純數字）—— 測試也該用生產的形狀。
     digits = "".join(ch for ch in str(code) if ch.isdigit())
     return _EvCode("醫令代碼", digits[:8])

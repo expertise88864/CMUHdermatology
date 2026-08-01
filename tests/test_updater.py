@@ -300,7 +300,7 @@ def test_rollback_written_files_restores_existing_and_removes_new(tmp_path):
     assert real_atomic_write_text(str(existing), "new") is True
     assert real_atomic_write_text(str(created), "created") is True
 
-    # [2026-08-05] 回傳值擴成 (錯誤, 待重試, 真的還原了的) —— 呼叫端要靠第二個
+    # [2026-08-01] 回傳值擴成 (錯誤, 待重試, 真的還原了的) —— 呼叫端要靠第二個
     # 決定交易日誌能不能清掉，第三個才是誠實的「回滾了幾個」。
     errors, unresolved, restored = updater._rollback_written_files([
         updater._WrittenFile(str(existing), True),

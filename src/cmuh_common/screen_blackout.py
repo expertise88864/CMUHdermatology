@@ -164,7 +164,7 @@ def monitor_rects() -> list:
 def _toplevel_hwnd(win) -> int:
     """Tk 視窗的【最外層】HWND —— `winfo_id()` 不是它。
 
-    ★[2026-08-05 外審 P1；在這台機器上實測過]★
+    ★[2026-08-01 外審 P1；在這台機器上實測過]★
     `winfo_id()` 回的是 Tk 的【子】視窗，外面還包著一層 wrapper，而使用者看到、
     視窗管理員擺放的是那個 wrapper。實測（overrideredirect 的 Toplevel，先用
     `geometry("200x150+50+50")` 擺好，再對 `winfo_id()` 下

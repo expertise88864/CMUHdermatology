@@ -113,7 +113,7 @@ def _run_once_via_core() -> int:
     # 輪替競態(掉 log/超 1MB)。
     _setup_logging(LOG_PATH.with_name("watchdog_once.log"))
     logging.info("=== watchdog --once v%s ===", CURRENT_VERSION)
-    # ★[2026-08-05 外審 P1] 復原必須在【匯入 watchdog_core 之前】★
+    # ★[2026-08-01 外審 P1] 復原必須在【匯入 watchdog_core 之前】★
     #   --once 才是排程真正在跑的模式（schtasks 每 2 分鐘一次）；daemon 是選用的。
     #   復原原本只放在 daemon 分支，於是「沒開 daemon 的機器」——也就是最需要靠
     #   排程把自己救回來的那些——根本走不到復原。而且要在 import watchdog_core

@@ -84,8 +84,18 @@ _FIELDS = ("target", "value", "his_version", "canary", "outcome", "detail",
 
 
 def _canonical(d: dict) -> str:
-    """穩定序列化(排序鍵、無多餘空白)——hash chain 與寫檔共用,確保可重算。"""
-    return json.dumps(d, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    """穩定序列化(排序鍵、無多餘空白)——hash chain 與寫檔共用,確保可重算。
+
+    ★[2026-08-01 外審 P2] `allow_nan=False`★
+    預設的 `allow_nan=True` 會吐出 `NaN` / `Infinity` / `-Infinity`，那三個都**不是
+    合法 JSON**。帳本是要給別的工具讀的(verifier／日後的分析腳本)，寫進去等於那一
+    行從此解析不了 —— 而它還在 hash chain 上，後面每一行的驗證都會跟著卡住。
+    上游的 `audit_events._numbers_ok` 已經擋掉非有限浮點數，這裡是第二道：
+    ★守衛不可以只有一層，因為帳本也收得到不經過 audit_events 的 dict。★
+    真的寫不出來時寧可拋例外讓呼叫端記成失敗，也不要落一行壞資料。
+    """
+    return json.dumps(d, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"), allow_nan=False)
 
 
 # ── PII 縱深防禦 ─────────────────────────────────────────────────────────────

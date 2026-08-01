@@ -251,10 +251,22 @@ def _backup_existing(target: str) -> str:
     #   `os.path.exists(dest)` 會把那個半截檔當成有效備份而直接返回,接著就用
     #   預設值覆蓋正式檔 —— 使用者的設定實際上沒有任何可用備份。
     #   故:先寫暫存、再原子改名;失敗就把暫存清掉,絕不留下半截。
+    # ★[2026-08-01 外審 P1] 備份的「年齡」要從備份【建立時間】算，不是原檔的★
+    #   `copy2` 會連同 mtime 一起複製，`os.replace` 也不會改它 —— 於是一個 180 天
+    #   沒動過的設定檔，今天備份出來的 `.before-reset-*` mtime 仍是 180 天前。
+    #   而 RetentionSweeper 一律用 `os.path.getmtime` 判齡、這類備份的 TTL 是 90 天
+    #   → **今天備份、下一次掃描就被刪掉**，使用者按了還原預設之後其實沒有退路。
+    #   `os.utime(dest, None)` 把 mtime 設成現在，讓「備份保留 90 天」名副其實。
     tmp = f"{dest}.partial"
     try:
         shutil.copy2(target, tmp)
         os.replace(tmp, dest)
+        try:
+            os.utime(dest, None)
+        except OSError:
+            # 設不到時間不致命（備份內容還在），但要說出來：這份備份會被提早清掉
+            logging.warning("[還原預設] 備份 %s 的時間戳設定失敗 → 它可能被保留期"
+                            "掃描提早清除", os.path.basename(dest), exc_info=True)
     except OSError:
         try:
             if os.path.exists(tmp):

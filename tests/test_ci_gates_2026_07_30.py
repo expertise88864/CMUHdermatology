@@ -841,7 +841,7 @@ def test_allow_lower_makes_it_an_explicit_visible_action(monkeypatch,
 
 def test_an_unparseable_pyright_run_still_produces_an_annotation(monkeypatch,
                                                                  tmp_path):
-    """★[2026-08-05 外審 P2] 走【真正的】崩潰路徑,不是一個假造的例外★
+    """★[2026-08-01 外審 P2] 走【真正的】崩潰路徑,不是一個假造的例外★
 
     上面那支 `test_the_ratchet_annotates_instead_of_dying_silently` 讓
     `_load_baseline` 拋 `OSError` —— 它是 `Exception` 的子類,所以 guard 抓得到,
@@ -894,7 +894,7 @@ def test_the_guard_does_not_swallow_argparse_exits(monkeypatch):
         type_debt._main_guarded(["--help"])
 
 
-# ─── ★[2026-08-05 外審 P2] --update 不可以無條件回 0★ ─────────────────────
+# ─── ★[2026-08-01 外審 P2] --update 不可以無條件回 0★ ─────────────────────
 def test_update_still_fails_when_it_refused_to_lower_the_floor(monkeypatch,
                                                                tmp_path):
     """★關卡自己靜默跳成綠燈★

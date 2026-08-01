@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """診間燈號歷史／診間設定的**存取層**（誰負責讀寫哪個 JSON 檔）。
-（P2-06 分層第五刀(a) 2026-08-05，從 `AutomationApp` 搬出）
+（P2-06 分層第五刀(a) 2026-08-01，從 `AutomationApp` 搬出）
 
 【和 `clinic_light_history` 的分工】
 `clinic_light_history` 是**純函式**：給它一份 dict，它算平均、加樣本，不碰磁碟。

@@ -570,9 +570,17 @@ def get_ime_focus_hwnd():
         hwnd_fg = u.GetForegroundWindow()
         fore_tid = u.GetWindowThreadProcessId(hwnd_fg, None)
         cur_tid = _kernel32().GetCurrentThreadId()
-        u.AttachThreadInput(cur_tid, fore_tid, True)
-        hwnd_focus = u.GetFocus()
-        u.AttachThreadInput(cur_tid, fore_tid, False)
+        # ★[2026-08-01 外審 P2] Detach 一定要在 finally★
+        #   `GetFocus()`（或中間任何一步）拋例外時，原本的寫法就再也不會 detach ——
+        #   輸入佇列會一直黏在 HIS 的執行緒上，之後本程式的按鍵/焦點行為全部異常，
+        #   而且只能重開程式才會好。同檔的 `get_focused_control_hwnd` 早就用
+        #   try/finally 了，這裡是漏掉，不是刻意不同。
+        attached = bool(u.AttachThreadInput(cur_tid, fore_tid, True))
+        try:
+            hwnd_focus = u.GetFocus()
+        finally:
+            if attached:
+                u.AttachThreadInput(cur_tid, fore_tid, False)
         return hwnd_focus if hwnd_focus else hwnd_fg
     except Exception:
         return _user32().GetForegroundWindow()

@@ -183,7 +183,7 @@ def test_main_button_always_expresses_intent_not_a_file_check():
     一個帳號)。兩邊判斷不同步 → 按鈕啟動背景模式、autoclock 靜默結束,
     設定視窗再也叫不出來。「什麼算可用設定」只由 autoclock 判斷一次。
 
-    ★[2026-08-05 P2-06 第五刀(a)] 旗標搬到 `program_launcher.AUTOCLOCK.args`★
+    ★[2026-08-01 P2-06 第五刀(a)] 旗標搬到 `program_launcher.AUTOCLOCK.args`★
     守的兩件事沒變，只是換了地址：(1) 打卡按鈕一定帶 --configure-if-empty；
     (2) 呼叫端不可以自己去看設定檔。所以兩層分開釘。
     """

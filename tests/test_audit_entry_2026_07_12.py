@@ -49,7 +49,7 @@ def test_mg03_str_docno_and_get_notifications():
 
 # ── MG-04 收父行程已死的真孤兒 chromedriver ─────────────────────────────────
 def test_mg04_kills_dead_parent_orphans():
-    """[2026-08-05 P2-06 第五刀(a)] 這支函式從 main.py 搬到
+    """[2026-08-01 P2-06 第五刀(a)] 這支函式從 main.py 搬到
     `cmuh_common/program_launcher.py` —— 守的性質沒變，只是換了地址，
     所以改成【跟著函式走】而不是釘死在 main.py（見 test_main_launch_guards
     的 `_candidate_paths` 用同一個做法）。"""

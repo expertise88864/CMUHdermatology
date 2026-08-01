@@ -48,7 +48,7 @@ def test_fc01_room_card_view_keeps_real_light_and_rest():
 
 # ══ FC-02：只信「今日」的持久化早診狀態,跨午夜昨日殘留回 (False, False)═══════════════
 def _fake_app(cache, today, monkeypatch):
-    """[2026-08-05 P2-06 第五刀(a)] 「今天是哪一天」的接縫改用 monkeypatch。
+    """[2026-08-01 P2-06 第五刀(a)] 「今天是哪一天」的接縫改用 monkeypatch。
 
     原本是在 fake app 上塞 `_clinic_dynamic_today_str` / `_clinic_dynamic_state_key`
     兩個屬性 —— 那兩支只是把模組函式原封不動轉發一次的 method，第五刀把它們拆掉了。
