@@ -472,7 +472,8 @@ class ScreenBlackout:
             self._create()
         except Exception:
             logging.warning("[黑幕] 建立黑幕視窗失敗（本輪放棄）", exc_info=True)
-            self._destroy()
+            # 沒有人按任何鍵 → 不發喚醒 token（見 _destroy 的說明）
+            self._destroy(issue_wake_token=False)
             return False
         bad = [p for p in self._panels if not p.fully_verified]
         missing = self._expected_panels - len(self._panels)
@@ -481,7 +482,8 @@ class ScreenBlackout:
                 "[黑幕] ★沒有蓋滿，整批收回★ 螢幕 %d 個／建立 %d 片；未通過：%s",
                 self._expected_panels, len(self._panels),
                 "；".join(p.describe() for p in bad) or f"少了 {missing} 片")
-            self._destroy()
+            # 驗證失敗的 rollback 不是使用者輸入造成的 → 不發喚醒 token
+            self._destroy(issue_wake_token=False)
             return False
         logging.info("[黑幕] %d 片全部驗證通過（逐片回讀位置與可見性）",
                      len(self._panels))
@@ -725,7 +727,7 @@ class ScreenBlackout:
             logging.info("[黑幕] 已收起黑幕%s", f"（{reason}）" if reason else "")
         self._restore_foreground()
 
-    def _destroy(self) -> None:
+    def _destroy(self, *, issue_wake_token: bool = True) -> None:
         self._cancel_poll()
         # ★驗證結果不可以活得比視窗久★
         #   `_panels` 是建立當下的回讀快照。`_schedule_poll()` 排不到 after 時會
@@ -733,10 +735,17 @@ class ScreenBlackout:
         #   「每一片都通過」的快照，而視窗其實已經被收掉了 → 宣告成功卻沒有黑幕。
         self._panels = ()
         wins, self._wins = self._wins, []
-        if not wins:
+        hwnds = self._hwnds
+        # ★[2026-08-01 外審第 2 輪 P1] 沒有 Tk wrapper ≠ 沒有殘留視窗★
+        #   上一次 teardown 若留下了關不掉的 survivor，`_wins` 已經是空的、
+        #   `_hwnds` 卻還有東西。原本這裡「wins 是空的就把 _hwnds 清掉並返回」——
+        #   於是第二次 hide()（或殘留視窗上的一個 <Key>/<Motion> 綁定被觸發）
+        #   就會在【完全沒有回讀】的情況下把閘門打開，而黑幕還在螢幕上。
+        #   那正好把這一刀的安全保證整個反轉回去。
+        #   所以只有「兩邊都空」才是真的沒事；否則照樣走強制關閉＋回讀。
+        if not wins and not hwnds:
             self._hwnds = ()
             return
-        hwnds = self._hwnds
         for win in wins:
             # ★每一片都要各自 try★ 其中一片 destroy 失敗不可以讓其餘幾片留在
             #   螢幕上（那就是「收不掉的黑幕」，診間機最不能發生的事）。
@@ -761,6 +770,14 @@ class ScreenBlackout:
         # 發一張【一次性】的喚醒 token：HWND 沒了之後，靠它把「喚醒的那一下」熱鍵
         # 吃掉（外審第 2 輪的競態）。只有真的建過視窗才發。
         # 一次性而非時間窗：喚醒只有一下，第二下 F1 必須正常動作（外審第 3 輪）。
+        #
+        # ★[2026-08-01 外審第 2 輪 P2] 不是每一次 teardown 都該發 token★
+        #   token 存在的理由是「造成黑幕收起的那一下按鍵，不可以又落進 HIS」——
+        #   那個競態只發生在【使用者輸入】觸發的退場。而驗證失敗的 rollback
+        #   （蓋不滿 → 整批拆掉）根本沒有人按任何鍵，這時發 token 只會讓接下來
+        #   1.5 秒內第一下 F1-F11 被靜默吃掉：黑幕沒蓋成，熱鍵還莫名其妙少一下。
+        if not issue_wake_token or not wins:
+            return
         with self._wake_lock:
             if self._eaten_this_blackout:
                 # 這次黑幕期間已經有一下熱鍵被吃掉（hook 緒先跑）→ 不再發新

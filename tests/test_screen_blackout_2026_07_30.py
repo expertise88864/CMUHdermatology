@@ -1079,3 +1079,112 @@ def test_the_escalation_reads_back_instead_of_assuming(tk_root):
     # DestroyWindow 之後必須再問一次 IsWindowVisible
     assert src.index("DestroyWindow") < src.rindex("IsWindowVisible"), \
         "拆完要再回讀一次才知道到底關掉了沒"
+
+
+# ─── ★[2026-08-01 外審第 2 輪] 兩個 CONFIRMED★ ───────────────────────────
+def test_a_second_teardown_does_not_forget_a_stuck_window(tk_root,
+                                                          monkeypatch):
+    """★P1：第二次 teardown 會把閘門打開，而黑幕還在螢幕上★
+
+    第一次 hide() 留下關不掉的 survivor 之後，`_wins` 是空的、`_hwnds` 還有東西。
+    原本 `_destroy()` 開頭寫「wins 是空的 → 清掉 _hwnds 就返回」，於是：
+      * 第二次 hide()，或
+      * 殘留視窗上的 <Key>/<Motion> 綁定被觸發
+    就會在【完全沒有回讀】的情況下把閘門打開 —— 正好把這一刀的安全保證反轉回去。
+    """
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 500, 400)])
+    bo.show()
+
+    class _Stuck:
+        @staticmethod
+        def IsWindow(_h):
+            return 1
+
+        @staticmethod
+        def IsWindowVisible(_h):
+            return 1
+
+        @staticmethod
+        def ShowWindow(_h, _c):
+            return 0
+
+        @staticmethod
+        def DestroyWindow(_h):
+            return 0
+    monkeypatch.setattr(sb, "_u32", lambda: _Stuck())
+
+    bo.hide()
+    assert bo._hwnds, "前提：第一次就留下了關不掉的 survivor"
+    first = bo._hwnds
+
+    bo.hide()                     # ★第二次★
+    assert bo._hwnds == first, \
+        "★第二次 teardown 不可以在沒回讀的情況下把閘門打開★（黑幕還在螢幕上）"
+    assert bo.active_from_any_thread() is True, "閘門必須繼續擋"
+
+
+def test_a_second_teardown_releases_once_the_window_is_really_gone(tk_root,
+                                                                   monkeypatch):
+    """反方向：殘留視窗後來真的不見了 → 第二次 teardown 要放行（不可永久鎖死）。"""
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 500, 400)])
+    bo.show()
+    state = {"alive": True}
+
+    class _Fake:
+        @staticmethod
+        def IsWindow(_h):
+            return 1 if state["alive"] else 0
+
+        @staticmethod
+        def IsWindowVisible(_h):
+            return 1 if state["alive"] else 0
+
+        @staticmethod
+        def ShowWindow(_h, _c):
+            return 0
+
+        @staticmethod
+        def DestroyWindow(_h):
+            return 0
+    monkeypatch.setattr(sb, "_u32", lambda: _Fake())
+    bo.hide()
+    assert bo._hwnds, "前提：第一次卡住"
+    state["alive"] = False        # 視窗後來自己不見了（例如行程回收）
+    bo.hide()
+    assert bo._hwnds == (), "確定不見了就要放行，不可以永久鎖住熱鍵"
+
+
+def test_a_verification_rollback_does_not_eat_the_next_hotkey(tk_root,
+                                                              monkeypatch):
+    """★P2：沒有人按鍵，卻吃掉下一個熱鍵★
+
+    wake token 存在的理由是「造成黑幕收起的那一下按鍵，不可以又落進 HIS」——
+    那個競態只發生在【使用者輸入】觸發的退場。
+    驗證失敗的 rollback（蓋不滿 → 整批拆掉）根本沒有人按任何鍵；這時發 token
+    只會讓接下來 1.5 秒內第一下 F1-F11 被靜默吃掉：黑幕沒蓋成、熱鍵還少一下。
+    """
+    real = sb.ScreenBlackout._window_rect
+    monkeypatch.setattr(
+        sb.ScreenBlackout, "_window_rect",
+        staticmethod(lambda h: (0, 0, 1, 1) if real(h) else None))
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 500, 400)])
+    try:
+        assert bo.show() is False, "前提：驗證失敗而回滾"
+        assert bo.consume_wake_gate() is False, \
+            "★沒有人按鍵，不該發喚醒 token★"
+    finally:
+        bo.hide()
+
+
+def test_a_real_wake_still_eats_the_hotkey(tk_root, made):
+    """不可矯枉過正：真的由使用者輸入收起黑幕時，那一下仍要被吃掉。"""
+    bo, idle, _busy = made
+    bo.show()
+    _arm(bo, idle)
+    idle.input()                  # 使用者碰了鍵鼠
+    bo._poll()                    # → 收黑幕
+    assert bo.active is False
+    assert bo.consume_wake_gate() is True, "喚醒的那一下仍必須被吃掉"
