@@ -49,5 +49,12 @@ def test_mg03_str_docno_and_get_notifications():
 
 # ── MG-04 收父行程已死的真孤兒 chromedriver ─────────────────────────────────
 def test_mg04_kills_dead_parent_orphans():
-    src = _read_src("main.py")
+    """[2026-08-05 P2-06 第五刀(a)] 這支函式從 main.py 搬到
+    `cmuh_common/program_launcher.py` —— 守的性質沒變，只是換了地址，
+    所以改成【跟著函式走】而不是釘死在 main.py（見 test_main_launch_guards
+    的 `_candidate_paths` 用同一個做法）。"""
+    src = _read_src("cmuh_common", "program_launcher.py")
     assert "psutil.pid_exists(ppid)" in src, "MG-04 未收父行程已死的孤兒 chromedriver"
+    # 而且要真的還接在退出流程上，不然搬完就成了沒人呼叫的死碼
+    assert "_pl_kill_orphan_chromedriver()" in _read_src("main.py"), \
+        "MG-04 清理函式已經沒有被 main.py 呼叫"

@@ -106,45 +106,70 @@ def _constant_strings(func: ast.FunctionDef) -> set[str]:
     }
 
 
-def _assert_autoclock_launch_guard(source_path: Path) -> None:
-    func = _function_node(source_path, "_launch_autoclock_program")
+def _assert_mutex_is_passed(source_path: Path, func_name: str,
+                            mutex: str) -> None:
+    """呼叫端要把 mutex 名稱傳下去 —— 漏傳＝那支程式完全沒有單一實例保護。
 
+    ★[2026-08-05 P2-06 第五刀(a)] 這半邊是新的★
+    順序檢查（先查再啟動）搬進 `launch_helper_script` 之後，光驗那邊【不夠】：
+    呼叫端只要不傳 `single_instance_mutex`，共用函式就整段跳過檢查，而順序測試
+    照樣綠。兩半都要釘，缺一邊守衛就可以被繞過。
+    """
+    func = _function_node(source_path, func_name)
+    assert mutex in _constant_strings(func), (
+        f"{func_name} 沒有把 {mutex} 傳給共用啟動器 → 這支程式會失去單一實例保護")
+
+
+def _assert_shared_launcher_checks_mutex_first() -> None:
+    """共用啟動器裡，單一實例檢查必須在 spawn 之前。
+
+    （這是原本寫在四支 method 裡的順序要求，搬家後集中到一處。）
+    """
+    launcher = ROOT / "src" / "cmuh_common" / "program_launcher.py"
+    func = _function_node(launcher, "launch_helper_script")
     assert (
         _first_call_line(func, "is_instance_running")
         < _first_call_line(func, "launch_app_script")
-    )
-    assert "Local\\CMUH_Skin_AutoClock_SingleInstance_v1" in _constant_strings(func)
-
-
-def _assert_consult_launch_guard(source_path: Path) -> None:
-    func = _function_node(source_path, "_launch_consult_query_program")
-
-    assert (
-        _first_call_line(func, "is_instance_running")
-        < _first_call_line(func, "launch_app_script")
-    )
-    assert "Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1" in _constant_strings(func)
+    ), "先啟動再查 mutex 等於沒查 —— 連按兩下就會有兩個實例"
 
 
 def test_main_background_launches_check_mutex_before_spawn():
+    """★重複實例會重複打卡／重複寄信★ 所以「先查再啟動」不可以被繞過。"""
     source_path = ROOT / "src" / "main.py"
 
-    _assert_autoclock_launch_guard(source_path)
-    _assert_consult_launch_guard(source_path)
+    _assert_shared_launcher_checks_mutex_first()
+    _assert_mutex_is_passed(source_path, "_launch_autoclock_program",
+                            "Local\\CMUH_Skin_AutoClock_SingleInstance_v1")
+    _assert_mutex_is_passed(source_path, "_launch_consult_query_program",
+                            "Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1")
 
 
 def test_main_and_scheduler_helper_launches_use_shared_launcher():
-    for rel_path in ("src/main.py",):
-        source_path = ROOT / rel_path
-        for func_name in (
-            "_launch_scheduler_program",
-            "_launch_autoclock_program",
-            "_launch_coordinate_detector_program",
-            "_launch_consult_query_program",
-        ):
-            src = _function_source(source_path, func_name)
-            assert "launch_app_script(" in src
-            assert "subprocess.Popen(" not in src
+    """四支啟動按鈕都要走共用啟動器，不可以自己 spawn。
+
+    ★[2026-08-05 P2-06 第五刀(a)] 改成【追一層間接】★
+    搬家後 main.py 那四支呼叫的是 `launch_helper_script`，由它再呼叫
+    `launch_app_script`。若只驗第一層、不驗它真的接到共用啟動器，
+    哪天 `launch_helper_script` 改成自己 `subprocess.Popen`（繞過
+    `resolve_app_script` 的路徑限制與 Windows 旗標）就沒人擋得住。
+    """
+    source_path = ROOT / "src" / "main.py"
+    launcher = ROOT / "src" / "cmuh_common" / "program_launcher.py"
+
+    for func_name in (
+        "_launch_scheduler_program",
+        "_launch_autoclock_program",
+        "_launch_coordinate_detector_program",
+        "_launch_consult_query_program",
+    ):
+        src = _function_source(source_path, func_name)
+        assert "launch_helper_script(" in src, f"{func_name} 沒有走共用啟動器"
+        assert "subprocess.Popen(" not in src, f"{func_name} 自己 spawn 了"
+
+    # 第二層：共用啟動器本身也必須接到 launch_app_script，而不是自己 spawn
+    shared = _function_source(launcher, "launch_helper_script")
+    assert "launch_app_script(" in shared
+    assert "subprocess.Popen(" not in shared
 
 
 def test_main_starts_minimized_on_preferred_monitor():
@@ -528,12 +553,24 @@ def test_clinic_room_defaults_use_shared_101_102_constant():
 
 
 def test_clinic_room_settings_migrate_legacy_defaults_on_load():
-    for rel_path in ("src/main.py",):
-        src = _function_source(ROOT / rel_path, "load_clinic_settings")
+    """讀設定時要把舊的診間代碼正規化，改過就寫回去。
 
-        assert "normalize_clinic_rooms(settings.get(\"rooms\"))" in src
-        assert "_atomic_write_json(file_path, settings)" in src
-        assert "門診動態診間設定已遷移為" in src
+    ★[2026-08-05 P2-06 第五刀(a)] 實作搬到 `cmuh_common/clinic_store.py`★
+    main.py 現在只剩一層轉發，而 `_function_source` 是「名字先中先得」，
+    會先撞到那層轉發 —— 所以這裡直接指名實作所在的檔案，
+    再另外釘住 main.py 真的有把它接上去（不然搬完就變成沒人呼叫的死碼）。
+    """
+    store = ROOT / "src" / "cmuh_common" / "clinic_store.py"
+    src = _function_source(store, "load_clinic_settings")
+
+    assert 'normalize_rooms(settings.get("rooms"))' in src
+    assert "atomic_write_json(file_path, settings)" in src
+    assert "門診動態診間設定已遷移為" in src
+
+    wrapper = _function_source(ROOT / "src" / "main.py", "load_clinic_settings")
+    assert "_cs_load_clinic_settings(" in wrapper, "main.py 沒有接上存取層"
+    assert "normalize_clinic_rooms" in wrapper, \
+        "正規化規則要由 main.py 注入（存取層不該自己知道 UI 那邊的規則）"
 
 
 def test_scheduled_background_submits_detect_rejected_futures():
@@ -1009,10 +1046,13 @@ def test_menu_tree_dump_gated_once_per_session():
 
 
 def test_clinic_light_history_written_compact():
-    """[r5] 大型純機器快取 clinic_light_history.json 用 compact(indent=None)序列化。"""
-    source_path = ROOT / "src" / "main.py"
-    full = source_path.read_text(encoding="utf-8")
-    assert 'indent=None, separators=(",", ":")' in full
+    """[r5] 大型純機器快取 clinic_light_history.json 用 compact(indent=None)序列化。
+
+    [2026-08-05 P2-06 第五刀(a)] 寫檔搬到 `cmuh_common/clinic_store.py`。
+    """
+    store = ROOT / "src" / "cmuh_common" / "clinic_store.py"
+    src = _function_source(store, "save_light_sample")
+    assert 'indent=None, separators=(",", ":")' in src
 
 
 def test_startup_vacuums_old_clinic_count_rows():

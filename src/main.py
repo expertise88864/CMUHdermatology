@@ -23,7 +23,6 @@ from cmuh_common.version import CURRENT_VERSION
 from cmuh_common.paths import (
     get_app_dir, get_settings_dir, get_conf_path, restart_self,
 )
-from cmuh_common.process_launch import launch_app_script
 from cmuh_common.win32_safe import call_with_timeout, WIN_ENUM_TIMEOUT_SEC
 from cmuh_common.atomic_io import atomic_write_json as _atomic_write_json
 from cmuh_common.atomic_io import safe_load_json_ex as _safe_load_json_ex
@@ -95,10 +94,6 @@ from cmuh_common.clinic_history import (
     prev_session_closing_clock as _history_prev_session_closing_clock,
     remove_doctor_history,
     upsert_session_stat,
-)
-from cmuh_common.clinic_light_history import (
-    historical_light_average,
-    record_light_sample,
 )
 from cmuh_common.platform_win import (
     run_as_admin, set_dpi_awareness, set_app_user_model_id,
@@ -227,7 +222,18 @@ from cmuh_common.ui_messages import (
 )
 from cmuh_common.deps_runtime import ensure_dependencies as _ensure_deps_runtime
 from cmuh_common.single_instance import (
-    ensure_single_instance, is_instance_running, release_single_instance,
+    ensure_single_instance, release_single_instance,
+)
+from cmuh_common.program_launcher import (
+    kill_orphan_chromedriver as _pl_kill_orphan_chromedriver,
+    launch_helper_script as _pl_launch_helper_script,
+    open_local_program as _pl_open_local_program,
+    open_url as _pl_open_url,
+)
+from cmuh_common.clinic_store import (
+    hist_avg_light as _cs_hist_avg_light,
+    load_clinic_settings as _cs_load_clinic_settings,
+    save_light_sample as _cs_save_light_sample,
 )
 from cmuh_common.duty_summary import build_duty_summary_parts
 from cmuh_common.abbrev_engine import (
@@ -314,7 +320,6 @@ import logging
 import random
 import re
 import schedule
-import webbrowser
 from collections import defaultdict, deque
 from copy import deepcopy
 from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, as_completed, wait
@@ -340,6 +345,17 @@ class HotkeyModules:
 hotkey_modules = HotkeyModules()
 
 
+def _show_launch_error(outcome) -> None:
+    """[P2-06 第五刀(a)] 把 `LaunchOutcome` 呈現給使用者。
+
+    ★UI 只留在這裡★ `cmuh_common.program_launcher` 刻意不碰 tkinter：那些函式的
+    真正邏輯（要跑哪個腳本、單一實例怎麼判、哪種錯誤算哪種）原本只能靠開 Tk 視窗
+    才測得到，實務上等於沒測。現在那層回傳結果、這裡負責彈窗，行為不變。
+
+    `already_running` 是刻意不啟動（正常狀況）→ 靜默，跟搬家前一樣不彈窗。
+    """
+    if outcome.failed:
+        messagebox.showerror(outcome.error_title, outcome.error_message)
 
 
 def _retention_rules() -> list:
@@ -8452,56 +8468,12 @@ class AutomationApp:
         # 用 psutil 直接 SIGKILL 比 selenium driver.quit() 快 10x。同步跑是因為
         # 主流程立刻會 os._exit(0)，background thread 沒機會收尾。100ms 內完成。
         try:
-            self._kill_orphan_chromedriver()
+            _pl_kill_orphan_chromedriver()
         except Exception:
             logging.debug("taskkill chromedriver 失敗", exc_info=True)
 
         logging.info("Cleanup done: hotkeys unhooked, Chrome released, executor released.")
 
-    @staticmethod
-    def _kill_orphan_chromedriver() -> None:
-        """[O21] 結束殘留的 chromedriver.exe + 其子 chrome.exe（防止崩潰留下的孤兒）。
-
-        策略：找父進程為本程式的 chromedriver → 連帶遞迴 kill 它的所有子 chrome
-              .exe / chrome_native_messaging_host 等。比 driver.quit() 快 10x
-              (taskkill 100ms vs Chrome graceful shutdown 1-2s)。
-
-        [MG-04] kill「父進程是本程式」或「父進程已死的真孤兒」chromedriver（後者=前次崩潰殘留）;
-        父進程存活且非本程式者不動,避免誤殺其他 Chrome。
-        """
-        try:
-            import psutil
-        except ImportError:
-            return
-        try:
-            my_pid = os.getpid()
-            to_kill = []
-            for p in psutil.process_iter(['pid', 'name', 'ppid']):
-                try:
-                    n = (p.info.get('name') or '').lower()
-                    if 'chromedriver' not in n:
-                        continue
-                    ppid = p.info.get('ppid', 0)
-                    # [MG-04 2026-07-12] 除本程式直屬子 chromedriver 外,也收「父行程已不存在」的真
-                    # 孤兒(前次崩潰殘留、父已死);診間機的 chromedriver 皆來自本套件自動化,父已死者
-                    # 即洩漏行程(~150MB)。用 pid_exists 保守判定(PID 被重用→存在→不誤殺)。
-                    if ppid == my_pid or (ppid and not psutil.pid_exists(ppid)):
-                        to_kill.append(p)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-            # 對每個 chromedriver，連帶遞迴 kill 子孫 (chrome.exe / 渲染器等)
-            for cd in to_kill:
-                try:
-                    for child in cd.children(recursive=True):
-                        try:
-                            child.kill()  # kill 比 terminate 快 (immediate)
-                        except (psutil.NoSuchProcess, psutil.AccessDenied):
-                            continue
-                    cd.kill()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-        except Exception:
-            logging.debug("[O21] iter chromedriver 失敗", exc_info=True)
 
     def _restart_app(self):
         if threading.current_thread() is not threading.main_thread():
@@ -8729,26 +8701,17 @@ class AutomationApp:
         self.history_cache = load_json_list(file_path, [])
         self._avg_history_cache = {}  # [優化] 歷史資料更新，清除計算快取
 
-    def _clinic_dynamic_today_str(self):
-        return clinic_dynamic_today_str()
-
-    def _clinic_dynamic_state_key(self, room_code, time_code):
-        return clinic_dynamic_state_key(room_code, time_code)
-
-    def _new_clinic_tracker(self, curr_session_i, current_timestamp):
-        return new_clinic_tracker(curr_session_i, current_timestamp)
-
     def _load_clinic_dynamic_state_cache(self):
         file_path = get_conf_path(CLINIC_DYNAMIC_STATE_FILENAME)
         payload = load_json_dict(file_path, {}, merge_defaults=False)
-        if payload.get("date") != self._clinic_dynamic_today_str():
+        if payload.get("date") != clinic_dynamic_today_str():
             return {}
         states = payload.get("states", {})
         return states if isinstance(states, dict) else {}
 
     def _write_clinic_dynamic_state_cache(self):
         payload = {
-            "date": self._clinic_dynamic_today_str(),
+            "date": clinic_dynamic_today_str(),
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "states": self._clinic_dynamic_state_cache,
         }
@@ -8814,7 +8777,7 @@ class AutomationApp:
 
     def _clinic_dynamic_state_matches(self, state, room_code, time_code, doc_name=None, session_cn=None):
         return state_matches(
-            state, room_code, time_code, self._clinic_dynamic_today_str(),
+            state, room_code, time_code, clinic_dynamic_today_str(),
             _canonical_clinic_session_str, doc_name, session_cn)
 
     def _restore_clinic_tracker_from_state(self, state, curr_session_i, current_timestamp):
@@ -8823,7 +8786,7 @@ class AutomationApp:
             _canonical_clinic_session_str)
 
     def _get_clinic_dynamic_state(self, room_code, time_code, doc_name=None, session_cn=None):
-        key = self._clinic_dynamic_state_key(room_code, time_code)
+        key = clinic_dynamic_state_key(room_code, time_code)
         # [stability r5] persist 會整個 rebind cache(prune→新 dict)、clear 會 .pop，皆在
         # _clinic_dynamic_state_lock 下。讀取取同一鎖避免讀到過渡狀態(背景 worker 呼叫)。
         with self._clinic_dynamic_state_lock:
@@ -8837,7 +8800,7 @@ class AutomationApp:
         session_cn = _canonical_clinic_session_str(tracker.get("session_period")) or reg64_slot_cn(time_code)
         if not room_code or not time_code or not doc_name or not session_cn:
             return
-        today_s = self._clinic_dynamic_today_str()
+        today_s = clinic_dynamic_today_str()
         state = build_dynamic_state(
             today_s,
             datetime.now().isoformat(timespec="seconds"),
@@ -8853,7 +8816,7 @@ class AutomationApp:
             hist_light=hist_light,
             prev_close=prev_close,
         )
-        key = self._clinic_dynamic_state_key(room_code, time_code)
+        key = clinic_dynamic_state_key(room_code, time_code)
         try:
             with self._clinic_dynamic_state_lock:
                 self._clinic_dynamic_state_cache = prune_states_for_today(
@@ -8895,7 +8858,7 @@ class AutomationApp:
             state = self._get_clinic_dynamic_state(room_code, time_code, session_cn=session_cn)
             if not state:
                 continue
-            tracker_key = self._clinic_dynamic_state_key(room_code, time_code)
+            tracker_key = clinic_dynamic_state_key(room_code, time_code)
             tracker = self._restore_clinic_tracker_from_state(state, session_cn, time.time())
             with self._tracker_lock:
                 self.clinic_trackers.setdefault(tracker_key, tracker)
@@ -9670,13 +9633,10 @@ class AutomationApp:
         self.refresh_button = ttk.Button(manual_ops_frame, text="整理人數", style="Small.TButton", command=lambda: self._trigger_refresh(is_manual=True)); self.refresh_button.pack(side="left", pady=1, padx=(4,4))
 
     def _launch_program(self, path):
-        try: logging.info(f"Attempting to launch program at: {path}"); os.startfile(path)
-        except FileNotFoundError: logging.error(f"Program not found at: {path}"); messagebox.showerror("啟動失敗", f"找不到指定的程式！\n\n請確認路徑是否正確:\n{path}")
-        except Exception as e: logging.error(f"Failed to launch program: {e}"); messagebox.showerror("啟動失敗", f"無法啟動程式:\n{e}")
+        _show_launch_error(_pl_open_local_program(path))
 
     def _launch_browser(self, url):
-        try: logging.info(f"Attempting to open URL: {url}"); webbrowser.open(url, new=2)
-        except Exception as e: logging.error(f"Failed to open URL: {e}"); messagebox.showerror("開啟失敗", f"無法開啟網頁:\n{e}")
+        _show_launch_error(_pl_open_url(url))
 
     # ★[2026-07-31 使用者] 院內系統捷徑：左右兩排按鈕的垂直間距必須用【同一個值】★
     #   舊版左邊 pady=1、右邊 pady=0 → 第一列差 1px；左邊第二列的 frame 又多一個
@@ -9774,69 +9734,31 @@ class AutomationApp:
             ttk.Button(web_frame_row2, text=text, style="Link.TButton", command=lambda u=url: self._launch_browser(u)).pack(side="left", padx=2, pady=self._LINK_BTN_PADY)
 
     def _launch_scheduler_program(self):
-        # [v16 2026-05-25] 改多行 + 加 creationflags=CREATE_NO_WINDOW 避免黑框閃
-        scheduler_script_name = "中國醫皮膚科排班程式.pyw"
-        try:
-            logging.info(f"Launching scheduler program: {scheduler_script_name}")
-            launch_app_script(scheduler_script_name)
-        except FileNotFoundError:
-            messagebox.showerror("啟動失敗", f"找不到排班程式檔案: {scheduler_script_name}\n\n請確認主程式與排班程式在同一個資料夾中。")
-            logging.error(f"Scheduler script not found: {scheduler_script_name}")
-        except Exception as e:
-            messagebox.showerror("啟動失敗", f"無法啟動排班程式:\n{e}")
-            logging.error(f"Failed to launch scheduler: {e}")
+        _show_launch_error(_pl_launch_helper_script(
+            "中國醫皮膚科排班程式.pyw", what="排班程式", peer="排班程式"))
 
     def _launch_autoclock_program(self):
-        autoclock_script_name = "中國醫皮膚科打卡程式.pyw"
-        if is_instance_running("Local\\CMUH_Skin_AutoClock_SingleInstance_v1"):
-            logging.info("Autoclock program is already running; skip launch")
-            return
         # [2026-08-02] 打卡程式在【沒有可用設定】時已改為不啟動(使用者定案:
         # 沒設定的電腦不用跑 autoclock)。這顆按鈕是「設定」那條路,所以一律帶
         # --configure-if-empty:有設定就進背景模式,沒有就開設定視窗。
         # ★不可在這裡自己判斷檔案在不在★ —— 檔案可能存在卻是 `[]`(使用者刪光最後
         #   一個帳號),那樣按鈕會啟動背景模式、autoclock 靜默結束,設定視窗再也
         #   叫不出來。「什麼算可用設定」只由 autoclock 判斷一次。
-        try:
-            logging.info("Launching autoclock program: %s (--configure-if-empty)",
-                         autoclock_script_name)
-            launch_app_script(autoclock_script_name,
-                              args=("--configure-if-empty",))
-        except FileNotFoundError:
-            messagebox.showerror("啟動失敗", f"找不到打卡程式檔案: {autoclock_script_name}\n\n請確認主程式與打卡程式在同一個資料夾中。")
-            logging.error(f"Autoclock script not found: {autoclock_script_name}")
-        except Exception as e:
-            messagebox.showerror("啟動失敗", f"無法啟動打卡程式:\n{e}")
-            logging.error(f"Failed to launch autoclock program: {e}")
+        _show_launch_error(_pl_launch_helper_script(
+            "中國醫皮膚科打卡程式.pyw", what="打卡程式", peer="打卡程式",
+            args=("--configure-if-empty",),
+            single_instance_mutex="Local\\CMUH_Skin_AutoClock_SingleInstance_v1"))
 
     def _launch_coordinate_detector_program(self):
-        script_name = "中國醫皮膚科點座標偵測程式.pyw"
-        try:
-            logging.info(f"Launching coordinate detector program: {script_name}")
-            launch_app_script(script_name)
-        except FileNotFoundError:
-            messagebox.showerror("啟動失敗", f"找不到座標偵測程式檔案: {script_name}\n\n請確認主程式與該程式在同一個資料夾中。")
-            logging.error(f"Coordinate detector script not found: {script_name}")
-        except Exception as e:
-            messagebox.showerror("啟動失敗", f"無法啟動座標偵測程式:\n{e}")
-            logging.error(f"Failed to launch coordinate detector program: {e}")
+        _show_launch_error(_pl_launch_helper_script(
+            "中國醫皮膚科點座標偵測程式.pyw", what="座標偵測程式"))
 
     def _launch_consult_query_program(self):
         # 只啟動常駐托盤（不帶 --run-now），讓使用者由托盤選單或排程觸發；
         # 已啟動則靜默結束（不彈視窗）。需要立即執行可右鍵托盤「立即執行一次」。
-        script_name = "中國醫皮膚科會診查詢程式.pyw"
-        if is_instance_running("Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1"):
-            logging.info("Consult query program is already running; skip launch")
-            return
-        try:
-            logging.info(f"Launching consult query program: {script_name}")
-            launch_app_script(script_name)
-        except FileNotFoundError:
-            messagebox.showerror("啟動失敗", f"找不到會診查詢程式檔案: {script_name}\n\n請確認主程式與該程式在同一個資料夾中。")
-            logging.error(f"Consult query script not found: {script_name}")
-        except Exception as e:
-            messagebox.showerror("啟動失敗", f"無法啟動會診查詢程式:\n{e}")
-            logging.error(f"Failed to launch consult query program: {e}")
+        _show_launch_error(_pl_launch_helper_script(
+            "中國醫皮膚科會診查詢程式.pyw", what="會診查詢程式",
+            single_instance_mutex="Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1"))
 
     def _create_other_programs_tab(self, tools_tab):
         
@@ -10593,7 +10515,7 @@ class AutomationApp:
                                 current_timestamp,
                             )
                         else:
-                            self.clinic_trackers[tracker_key] = self._new_clinic_tracker(
+                            self.clinic_trackers[tracker_key] = new_clinic_tracker(
                                 curr_session_i,
                                 current_timestamp,
                             )
@@ -11323,7 +11245,7 @@ class AutomationApp:
         """讀持久化門診動態狀態裡某早時段的 (had_activity, closed),供 overrun 在【重啟後早上 tracker
         還沒建】時判定早診是否還在拖。cache 只含今日;讀不到/壞值 → (False, False)。純讀、取自己的鎖。"""
         try:
-            key = self._clinic_dynamic_state_key(room_code, s)
+            key = clinic_dynamic_state_key(room_code, s)
             with self._clinic_dynamic_state_lock:
                 st = self._clinic_dynamic_state_cache.get(key)
             if not isinstance(st, dict):
@@ -11333,7 +11255,7 @@ class AutomationApp:
             # 崩潰沒落 is_ended)會殘留在 cache 裡 → 今日誤判早診仍在拖班、把昨天早診當「還在看」。
             # 與權威讀取器 _get_clinic_dynamic_state → state_matches 的日期守門(clinic_state.py:105)
             # 一致:state.date != 今日 → 視同無早診狀態,回 (False, False)。
-            if st.get("date") != self._clinic_dynamic_today_str():
+            if st.get("date") != clinic_dynamic_today_str():
                 return (False, False)
             return (bool(st.get('had_any_activity')),
                     bool(st.get('is_ended') or st.get('actual_closing_dt')))
@@ -11439,50 +11361,16 @@ class AutomationApp:
 
 # --- [新增] 歷史燈號樣本（三分鐘桶）---
     def _save_clinic_light_sample(self, room_code, doc_name, session_cn, light_val, now=None):
-        """將目前燈號記錄到歷史檔案（每3分鐘一個時間桶）。"""
-        if now is None:
-            now = datetime.now()
-        session_key = _canonical_clinic_session_str(session_cn)
-        file_path = get_conf_path('clinic_light_history.json')
-        data = load_json_dict(file_path, {}, merge_defaults=False)
-        data, changed = record_light_sample(
-            data,
-            room_code=room_code,
-            doc_name=doc_name,
-            session_key=session_key,
-            light_val=light_val,
-            when=now,
-            retain_days=max(60, CLINIC_LIGHT_HISTORY_DAYS + 7),
-        )
-        if not changed:
-            return
-        try:
-            # [perf r5] clinic_light_history 是純機器讀寫的大型快取(~220KB，每次門診輪詢
-            # 每診間寫一次)，沒人會手看。改 compact(indent=None + 無空白分隔)可把 json.dump
-            # 從 ~6ms 降到 ~1ms、檔案砍近半，fsync 位元組數也減半。讀端 safe_load_json 與
-            # 格式無關，round-trip 完全等價。其餘小型人讀設定檔維持預設 indent=4。
-            _atomic_write_json(file_path, data, indent=None, separators=(",", ":"))
-        except Exception:
-            pass
+        """[P2-06 第五刀(a)] 內容搬到 `cmuh_common.clinic_store.save_light_sample`。"""
+        _cs_save_light_sample(room_code, doc_name, session_cn, light_val,
+                              now=now, history_days=CLINIC_LIGHT_HISTORY_DAYS)
 
     def _get_hist_avg_light(self, room_code, doc_name, session_cn, now=None):
-        """回傳近月同時刻門診進度均值；優先取同星期幾，樣本不足時退回全月。"""
-        if not room_code or not doc_name:
-            return "—"
-        if now is None:
-            now = datetime.now()
-        session_key = _canonical_clinic_session_str(session_cn)
-        file_path = get_conf_path('clinic_light_history.json')
-        data = load_json_dict(file_path, {}, merge_defaults=False)
-        return historical_light_average(
-            data,
-            room_code=room_code,
-            doc_name=doc_name,
-            session_key=session_key,
-            when=now,
+        """[P2-06 第五刀(a)] 內容搬到 `cmuh_common.clinic_store.hist_avg_light`。"""
+        return _cs_hist_avg_light(
+            room_code, doc_name, session_cn, now=now,
             history_days=CLINIC_LIGHT_HISTORY_DAYS,
-            window_minutes=CLINIC_LIGHT_HISTORY_WINDOW_MINUTES,
-        )
+            window_minutes=CLINIC_LIGHT_HISTORY_WINDOW_MINUTES)
 
 # --- [新增] 計算統計數據並存檔 ---
     def _submit_clinic_session_stat(self, room_code, doc_name, completed_count, durations, closing_time_str="", session_str=None, total_reg=None, phototherapy=0):
@@ -11702,19 +11590,9 @@ class AutomationApp:
 # --- [新增] 讀取門診動態設定 ---
     # --- [新增] 讀取門診動態設定 ---
     def load_clinic_settings(self):
-        # [修改] 預設更新頻率改為 60 秒 (符合您的需求)
-        default_settings = {"rooms": list(DEFAULT_CLINIC_ROOMS), "time_modes": ["auto"] * CLINIC_ROOM_COUNT}
-        file_path = get_conf_path('clinic_settings.json')
-        settings = load_json_dict(file_path, default_settings)
-        rooms, changed = normalize_clinic_rooms(settings.get("rooms"))
-        settings["rooms"] = rooms
-        if changed:
-            try:
-                _atomic_write_json(file_path, settings)
-                logging.info("門診動態診間設定已遷移為: %s", rooms)
-            except Exception:
-                logging.warning("門診動態診間設定遷移寫回失敗", exc_info=True)
-        return settings
+        """[P2-06 第五刀(a)] 內容搬到 `cmuh_common.clinic_store.load_clinic_settings`。"""
+        return _cs_load_clinic_settings(
+            DEFAULT_CLINIC_ROOMS, CLINIC_ROOM_COUNT, normalize_clinic_rooms)
 
     # --- [新增] 儲存門診動態設定 ---
     def save_clinic_settings(self):

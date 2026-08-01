@@ -47,31 +47,39 @@ def test_fc01_room_card_view_keeps_real_light_and_rest():
 
 
 # ══ FC-02：只信「今日」的持久化早診狀態,跨午夜昨日殘留回 (False, False)═══════════════
-def _fake_app(cache, today):
+def _fake_app(cache, today, monkeypatch):
+    """[2026-08-05 P2-06 第五刀(a)] 「今天是哪一天」的接縫改用 monkeypatch。
+
+    原本是在 fake app 上塞 `_clinic_dynamic_today_str` / `_clinic_dynamic_state_key`
+    兩個屬性 —— 那兩支只是把模組函式原封不動轉發一次的 method，第五刀把它們拆掉了。
+    ★接縫本身沒有消失★：現在直接換掉 main 匯入的那兩個模組函式，
+    測的還是同一件事（跨午夜昨日殘留不可當成今日仍在拖班）。
+    """
+    monkeypatch.setattr(main, "clinic_dynamic_today_str", lambda: today)
+    monkeypatch.setattr(main, "clinic_dynamic_state_key",
+                        lambda room, s: f"{room}/{s}")
     return types.SimpleNamespace(
         _clinic_dynamic_state_cache=cache,
         _clinic_dynamic_state_lock=threading.Lock(),
-        _clinic_dynamic_state_key=lambda room, s: f"{room}/{s}",
-        _clinic_dynamic_today_str=lambda: today,
     )
 
 
-def test_fc02_today_state_reports_activity():
+def test_fc02_today_state_reports_activity(monkeypatch):
     cache = {"R1/1": {"date": "2026/07/11", "had_any_activity": True, "is_ended": False}}
-    app = _fake_app(cache, "2026/07/11")
+    app = _fake_app(cache, "2026/07/11", monkeypatch)
     had, closed = main.AutomationApp._persisted_session_overrun_state(app, "R1", 1)
     assert (had, closed) == (True, False)
 
 
-def test_fc02_stale_yesterday_state_ignored():
+def test_fc02_stale_yesterday_state_ignored(monkeypatch):
     # 跨午夜:昨日早診 had_activity 但沒落 is_ended,今日不可誤判為仍在拖班
     cache = {"R1/1": {"date": "2026/07/10", "had_any_activity": True, "is_ended": False}}
-    app = _fake_app(cache, "2026/07/11")
+    app = _fake_app(cache, "2026/07/11", monkeypatch)
     assert main.AutomationApp._persisted_session_overrun_state(app, "R1", 1) == (False, False)
 
 
-def test_fc02_missing_or_nondict_state_returns_false():
-    app = _fake_app({}, "2026/07/11")
+def test_fc02_missing_or_nondict_state_returns_false(monkeypatch):
+    app = _fake_app({}, "2026/07/11", monkeypatch)
     assert main.AutomationApp._persisted_session_overrun_state(app, "R1", 1) == (False, False)
-    app2 = _fake_app({"R1/1": "not-a-dict"}, "2026/07/11")
+    app2 = _fake_app({"R1/1": "not-a-dict"}, "2026/07/11", monkeypatch)
     assert main.AutomationApp._persisted_session_overrun_state(app2, "R1", 1) == (False, False)
