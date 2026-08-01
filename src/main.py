@@ -119,6 +119,8 @@ from cmuh_common.contract_canary import (
 )
 from cmuh_common.audit_events import (
     # [P2-03] 稽核帳本的 value/detail 只收這些型別 —— 自由文字進不去(理由見該模組)
+    render as _ev_render,
+    to_field_payload as _ev_to_field_payload,
     Code as _EvCode,
     Measure as _EvMeasure,
     Observed as _EvObserved,
@@ -1765,13 +1767,24 @@ def _ledger_writer_loop(q=None) -> None:
             # [批次三] 回讀不符 → 即時通知維護者(醫師端警告視窗在呼叫點既有;這封信
             # 讓改版寫錯不用等人翻帳本才發現)。async 寄,不卡本寫入緒。
             if str(fields.get("outcome", "")) == _LEDGER_MISMATCH:
-                # [P2-03] value/detail 是 audit_events 的型別;`str()` 走它們的
-                # __str__ → 人看得懂的描述(Observed 只會渲染出長度、Redacted 只會
-                # 說「刻意不記錄」)。拿來當「預期寫入」放進告警信是安全的 ——
-                # 這不再是「呼叫端的契約」,是型別本身就渲染不出原文。
-                _notify_audit_mismatch(action, str(fields.get("detail", "")),
-                                       locator=locator, ts=ts,
-                                       expected=str(fields.get("value", "")))
+                # ★[2026-08-05 外審 P2] 告警信/log/定位索引必須走【和帳本同一個】
+                #   正規化★
+                #   原本這裡對【原始物件】做 `str()`，理由是「value/detail 一定是
+                #   audit_events 的型別，渲染不出原文」。但那正是呼叫端【漏改】時
+                #   不成立的前提：傳進來的若是一段自由文字（例如誤傳的採樣原文），
+                #   `ActionLedger.record()` 會把它記成 violation（內容不落地），
+                #   而這裡的 `str()` 卻把**原文**送進 automation_ui.log、定位索引檔
+                #   與告警信 —— 帳本守住了，旁邊三個出口全漏。
+                #   這也讓「漏改的代價只是那一筆少了 value/detail」這個宣稱不成立。
+                #   改成先過 `to_field_payload()`（與帳本同一條路）再 `render()`：
+                #   未宣告型別的東西在這裡也只會渲染成 violation 描述。
+                _notify_audit_mismatch(
+                    action,
+                    _ev_render(_ev_to_field_payload(
+                        "detail", fields.get("detail", ""))),
+                    locator=locator, ts=ts,
+                    expected=_ev_render(_ev_to_field_payload(
+                        "value", fields.get("value", ""))))
         except Exception:
             logging.debug("[ledger] 背景寫入失敗(不影響操作)", exc_info=True)
         finally:

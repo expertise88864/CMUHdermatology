@@ -289,3 +289,75 @@ def test_the_denylist_sanitizer_is_gone():
     """留著它就等於留著那條「猜」的路 —— 而它猜不準、誤遮又無聲。"""
     assert not hasattr(al, "sanitize_text")
     assert not hasattr(al, "_PII_PATTERNS")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# [2026-08-05 外審第 2 輪] 三個 CONFIRMED finding 的回歸測試
+# ══════════════════════════════════════════════════════════════════════════
+_PHI_LIKE = ["12345678", "A123456789", "0912345678", "87654321"]
+
+
+@pytest.mark.parametrize("phi", _PHI_LIKE)
+def test_a_chart_number_shaped_value_no_longer_passes_as_a_course(phi):
+    """★外審 P1：型別化之後在這條路徑上比舊 regex 更糟★
+
+    舊的 denylist（`\\d{8,}`、身分證樣式）擋得住病歷號與身分證；而第一版的
+    `Code` 只有一條共用字元白名單 —— `12345678` 全是合法字元、長度也短，
+    **照樣寫進 append-only 帳本**。
+
+    而療程值正是【從 HIS 讀回來的】：`_f11_read_course_value()` 只做 strip +
+    全形轉半形，完全沒有把關。定位一漂到病歷號欄位，病歷號就這樣進帳本。
+
+    現在每個 kind 有自己的值域（療程＝一位數），讀到八位數就是 violation ——
+    而那個 violation 本身就是「疑似定位漂移」的訊號。
+    """
+    payload = Code("療程", phi).to_payload()
+    assert payload["t"] == "violation"
+    assert phi not in json.dumps(payload, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("phi", _PHI_LIKE)
+def test_the_old_denylist_would_have_caught_these(phi):
+    """★釘住「舊做法在這一點上是對的」★
+
+    這幾個樣式正是舊 regex 唯一守得住、而第一版型別化守不住的東西。
+    留著這支是為了讓「新做法在每一個面向都不比舊的差」變成可驗證的宣稱，
+    而不是我在文件裡的說法。
+    """
+    assert "[REDACTED]" in _old_sanitize(phi)
+
+
+def test_each_kind_has_its_own_domain():
+    """療程一位數、身份三位數、醫令代碼八位數 —— 值域不可以共用一條寬鬆規則。"""
+    assert Code("療程", "2").to_payload()["t"] == "code"
+    assert Code("療程", "12").to_payload()["t"] == "violation"
+    assert Code("身份", "001").to_payload()["t"] == "code"
+    assert Code("身份", "0011").to_payload()["t"] == "violation"
+    assert Code("醫令代碼", "1850159").to_payload()["t"] == "code"
+    assert Code("同意書", "MO04").to_payload()["t"] == "code"
+    assert Code("同意書", "王小明").to_payload()["t"] == "violation"
+
+
+def test_an_undeclared_kind_is_rejected(caplog):
+    """★fail-closed★ 新增一種 kind 就必須宣告它的值域 ——
+    不可以靠一條寬鬆的共用規則矇混過去（那正是 P1 的成因）。"""
+    with caplog.at_level("ERROR"):
+        payload = Code("我沒宣告過的欄位", "12345678").to_payload()
+    assert payload["t"] == "violation" and payload["reason"] == "undeclared_kind"
+    assert "12345678" not in json.dumps(payload, ensure_ascii=False)
+    assert any("沒有宣告值域" in r.getMessage() for r in caplog.records)
+
+
+def test_an_unknown_reason_does_not_carry_its_own_text():
+    """★外審 P2：violation 自己在洩漏★
+
+    第一版寫 `_violation("unknown_reason", code=self.code)` —— 於是
+    `Reason(採樣到的原文)` 會把那段原文完整留在帳本裡，正好違反本模組
+    「violation 絕不攜帶原值」的契約（用另一個欄位做了同一件壞事）。
+    """
+    secret = "A123456789 王小明"
+    payload = Reason(secret).to_payload()
+    assert payload["t"] == "violation" and payload["reason"] == "unknown_reason"
+    blob = json.dumps(payload, ensure_ascii=False)
+    assert secret not in blob and "王小明" not in blob and "A123456789" not in blob
+    assert payload["length"] == str(len(secret)), "只留長度"

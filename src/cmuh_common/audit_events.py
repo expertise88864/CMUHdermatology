@@ -43,8 +43,31 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-# 代碼類值的字元白名單:數字、ASCII 字母與少數分隔符。中文、空白、標點一律不合格。
-_CODE_RE = re.compile(r"\A[0-9A-Za-z._+,/\-]{0,32}\Z")
+# ★[2026-08-05 外審 P1] 每一種 kind 都要宣告【自己的值域】★
+#
+# 原本只有一條共用的字元白名單(`[0-9A-Za-z._+,/-]{0,32}`)。那擋得住中文姓名，
+# 但**擋不住病歷號與身分證** —— `12345678`、`A123456789` 全都是合法字元、長度也夠短。
+# 而舊的 denylist regex（`\d{8,}`、身分證樣式）**擋得住那兩個**。也就是說在這條路徑上
+# 型別化之後比原本更糟，而我在文件裡宣稱的是相反的事。
+#
+# 為什麼特別嚴重：`kind` 相同不代表來源可信。同一個 `Code("療程", …)`
+#   * `_set_療程_only` 傳的是【我們要寫進去的值】(來自設定) → 可信；
+#   * F11 的 `_f11_read_course_value()` 傳的是【從 HIS 讀回來的值】，
+#     而那支只做 strip + 全形轉半形，**完全沒有把關** —— 定位漂到病歷號欄位時，
+#     病歷號就是這樣進帳本的。
+#
+# 所以值域要綁在 kind 上，而不是綁在「呼叫端可不可信」上：療程就是一位數，
+# 讀到八位數不管來源是誰都是異常 → violation（而那個 violation 本身就是
+# 「疑似定位漂移」的訊號，正是我們要的）。
+#
+# ★未宣告的 kind 一律 violation（fail-closed）★ —— 新增一種 kind 就必須順手宣告
+# 它的值域，不能靠一條寬鬆的共用規則矇混過去。
+_CODE_DOMAINS = {
+    "療程": re.compile(r"\A\d?\Z"),              # 單一位數(F11 路由用 2/3)，或空白
+    "身份": re.compile(r"\A\d{0,3}\Z"),          # 1-3 位數代碼(40/01/10…)，或空白
+    "醫令代碼": re.compile(r"\A\d{0,8}\Z"),      # 純數字，目前最長 7 位(1850159)
+    "同意書": re.compile(r"\A[A-Za-z0-9]{0,8}\Z"),   # MO04 / MU02
+}
 _KIND_RE = re.compile(r"\A[^\r\n]{1,24}\Z")     # 標籤是我們自己寫的字面量,只擋失控長度
 
 # `detail` 的封閉理由集。★自由文字在這裡就被擋掉了★ ——
@@ -102,8 +125,16 @@ class AuditValue:
 class Code(AuditValue):
     """一個【程式自己選定或已把關過】的短代碼:醫令代碼、療程、身份別、同意書別。
 
-    字元集白名單(數字/ASCII 字母/`._+,/-`)、長度 ≤32。空字串合法(代表「該欄是空的」,
-    那是有意義的稽核事實)。不合格 → violation,內容不落地。
+    ★把關落在 kind 上,不是落在呼叫端★ 每一種 kind 在 `_CODE_DOMAINS` 宣告自己的
+    值域(療程＝一位數、身份＝1-3 位、醫令代碼＝≤8 位數字、同意書＝≤8 位英數),
+    未宣告的 kind 一律 violation(fail-closed)。空字串合法 —— 代表「該欄是空的」,
+    那是有意義的稽核事實。不合格 → violation,內容不落地。
+
+    ★為什麼不是一條共用的寬鬆白名單★ 療程值是【從 HIS 讀回來的】
+    (`_f11_read_course_value()` 只做 strip + 全形轉半形,沒有把關)。一條「數字＋
+    ASCII 字母、長度 ≤32」的規則會讓病歷號(8 位數)、身分證號原封不動寫進
+    append-only 帳本 —— 那比它取代掉的 denylist regex 還糟。逐 kind 收窄之後,
+    讀到不該出現的東西會變成 violation,而那個 violation 本身就是定位漂移的訊號。
     """
     kind: str
     code: str
@@ -112,9 +143,19 @@ class Code(AuditValue):
         kind = str(self.kind or "")
         if not _KIND_RE.match(kind):
             return _violation("bad_kind")
+        pattern = _CODE_DOMAINS.get(kind)
+        if pattern is None:
+            # ★未宣告值域的 kind 一律拒絕（fail-closed）★
+            #   新增 kind 時必須順手宣告它的值域 —— 否則一條寬鬆的共用規則會讓
+            #   病歷號/身分證這種「合法字元、長度也短」的東西矇混過去（外審 P1）。
+            logging.error(
+                "[ledger] Code 的 kind=%r 沒有宣告值域 → 記為違規，內容不落地。"
+                "請在 cmuh_common.audit_events._CODE_DOMAINS 補上它的樣式。", kind)
+            return _violation("undeclared_kind", kind=kind)
         raw = "" if self.code is None else str(self.code)
-        if not _CODE_RE.match(raw):
-            # ★這個 violation 本身是訊號★ 讀到的值不像代碼 ＝ 疑似定位漂移
+        if not pattern.match(raw):
+            # ★這個 violation 本身是訊號★ 讀到的值不符該欄位的值域 ＝ 疑似定位漂移
+            #   （只記長度，不記內容 —— 那個內容正是可能的病歷號/姓名）
             return _violation("not_a_code", kind=kind, length=len(raw))
         return {"t": "code", "kind": kind, "v": raw}
 
@@ -195,7 +236,14 @@ class Reason(AuditValue):
 
     def to_payload(self) -> dict:
         if self.code not in REASONS:
-            return _violation("unknown_reason", code=self.code)
+            # ★[2026-08-05 外審 P2] 不可以把被拒絕的字串抄進 violation★
+            #   原本寫 `_violation("unknown_reason", code=self.code)` —— 於是
+            #   `Reason(採樣到的原文)` 會把那段原文完整留在帳本裡，正好違反本模組
+            #   「violation 絕不攜帶原值」的契約（也就是用另一個欄位做了同一件壞事）。
+            #   只留長度：足以判斷「有人傳了自由文字進來」，又不洩漏內容。
+            logging.error("[ledger] Reason 收到未宣告的理由碼(長度=%d)→ 記為違規，"
+                          "內容不落地。請在 REASONS 補上它。", len(str(self.code)))
+            return _violation("unknown_reason", length=len(str(self.code)))
         if not _numbers_ok(self.numbers):
             return _violation("not_numeric", code=self.code)
         out = {"t": "reason", "code": self.code}

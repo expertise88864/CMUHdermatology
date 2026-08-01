@@ -202,12 +202,23 @@ def test_alert_includes_what_it_meant_to_write():
 
 
 def test_expected_value_comes_from_the_ledger_value_field():
-    """value 依 _record_his_action 的契約必為非 PII(醫令代碼/劑量/療程數),
-    拿來當「預期寫入」是安全的;detail 同理。不可改抓別的欄位。"""
+    """告警信的「預期寫入」要取自帳本的 value 欄位 —— 不可改抓別的欄位。
+
+    ★[2026-08-05 外審 P2] 而且要走【和帳本同一條】正規化★
+    原本這裡釘的是 `expected=str(fields.get("value", ""))`，理由是
+    「value 依契約必為非 PII」。但那個契約在呼叫端【漏改】時不成立：
+    傳進來的若是一段自由文字，帳本會記成 violation（內容不落地），
+    而 `str()` 卻把原文送進 log／定位索引／告警信 —— 帳本守住了、旁邊三個出口全漏。
+    現在改成先過 `to_field_payload()` 再 `render()`。
+    """
     code = _code_only(_main_src())
     i = code.index("def _ledger_writer_loop(")
-    body = code[i:i + 2000]
-    assert 'expected=str(fields.get("value", ""))' in body
+    body = code[i:i + 2500]
+    assert '_ev_to_field_payload(\n' in body or '_ev_to_field_payload(' in body
+    assert '"value", fields.get("value", "")' in body
+    assert '"detail", fields.get("detail", "")' in body
+    assert 'expected=str(fields.get("value", ""))' not in body, \
+        "不可以再對原始物件直接 str()（那會繞過正規化）"
 
 
 def test_his_calibrated_version_matches_user_confirmed_build():

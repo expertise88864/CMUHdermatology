@@ -46,7 +46,10 @@ def _v(code):
     本身；但如果繼續餵字串，它們就會全部記成 violation —— 測的東西跟生產路徑
     不一樣，是這個 repo 反覆踩到的坑。
     """
-    return _EvCode("測試", str(code))
+    # [2026-08-05 外審 P1] kind 現在要宣告值域，未宣告的一律 violation。
+    # 用真實的 kind（醫令代碼＝純數字）—— 測試也該用生產的形狀。
+    digits = "".join(ch for ch in str(code) if ch.isdigit())
+    return _EvCode("醫令代碼", digits[:8])
 
 
 # ── 基本記錄 ────────────────────────────────────────────────────────────────
@@ -60,7 +63,7 @@ def test_record_writes_queryable_fields(tmp_path):
     r = recs[0]
     assert r["surface"] == "his_menu" and r["action"] == "F2 醫令代碼輸入"
     assert r["target"] == "menu:219"
-    assert r["value"] == {"t": "code", "kind": "測試", "v": "51017"}
+    assert r["value"] == {"t": "code", "kind": "醫令代碼", "v": "51017"}
     assert r["his_version"] == "1150713" and r["canary"] == "ok"
     assert r["outcome"] == "ok" and r["correlation_id"] == "abc"
     assert r["schema_version"] == al.SCHEMA_VERSION and r["ts"]
@@ -452,7 +455,7 @@ def test_version_canary_snapshot_taken_at_action_time(monkeypatch):
     # 版本已在入列時就定好(不是等背景緒)
     assert fields["his_version"] == "1150713.02" and fields["canary"] == "ok"
     assert surface == al.SURFACE_HIS_MENU
-    assert str(fields["value"]) == "測試=51017", "入列的是型別化事件本身"
+    assert str(fields["value"]) == "醫令代碼=51017", "入列的是型別化事件本身"
     assert ts, "動作時間須在熱鍵緒當下取,不可用背景緒落檔時間"
 
     # 即使之後 HIS 升版了,已入列那筆仍保有動作當下的版本
