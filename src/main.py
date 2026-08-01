@@ -4866,38 +4866,62 @@ def _notify_course_unreadable(label: str, result) -> None:
 
     與 mismatch 通知的差別（也正是它必須自己一封的理由）：
       * 這裡【沒有】任何寫入，也沒有回讀比對 —— 問題在【讀取】階段；
-      * F11 【照常】按了「全部完成」（使用者定案：不擋不跳窗）；
+      * F11 【不會因此中止】（使用者定案：不擋不跳窗）；
       * 醫師端【沒有】任何警告視窗。
     信裡只帶長度，不帶原值。同一個 label 同一天只寄一次。
+
+    ★[2026-08-01 外審第 3 輪 P1] SMTP 一定要在背景緒★
+    本函式是從熱鍵緒呼叫的。`_send_alert_email_via_smtp` 有 60 秒逾時＋重試＋退避，
+    同步跑會把 F11【以及所有其他熱鍵】卡住將近三分鐘，而 F12 打不斷 socket 等待
+    與退避 sleep。與 `_notify_audit_mismatch` 一致：同步佔去重、背景緒寄信與歸還。
     """
     key = f"{label}|{date.today().isoformat()}"
+    # 先同步佔 inflight —— 否則兩次呼叫之間會各堆一條 60 秒逾時的寄信緒
     if not _COURSE_ALERTS.claim(key):
         return
-    sent_ok = False
-    try:
-        recipients = _developer_alert_recipients()
-        if recipients:
-            sent_ok = bool(_send_alert_email_via_smtp(
-                f"[皮膚科自動化] 療程欄讀值異常:{label}",
-                f"{label} 讀療程欄時拿到無法辨識的內容，"
-                f"這通常代表 HIS 改版或欄位位移（定位漂掉）。\n\n"
-                f"狀況:{result.describe()}\n"
+
+    # ★措辭只講【已經確定】的事★（2026-08-01 外審第 3 輪 P2）
+    #   這封信是在【讀值當下】寄的，那時完成動作還沒送出去 —— F12 可能剛被按下、
+    #   「全部完成」按鈕可能找不到、click 也可能送失敗。原本寫「仍照常按了
+    #   『全部完成』」是在陳述一件尚未發生、而且不一定會發生的事。
+    #   改成描述【政策】（會照原路繼續，不因此中止），那才是這一刻確知的。
+    snapshot = (f"狀況:{result.describe()}\n"
                 f"電腦:{_machine_name_safe()}\n"
-                f"時間:{datetime.now().isoformat(timespec='seconds')}\n\n"
-                f"★這一次 {label} 仍照常按了「全部完成」★"
-                f"(依使用者定案:不擋、不跳窗，維持診間動線)。"
-                f"醫師端沒有看到任何警告。\n"
-                f"沒有任何值被寫入 HIS，也沒有做回讀比對 —— "
-                f"問題發生在【讀取】階段。\n\n"
-                f"請核對療程欄位置後於設定頁重新校正金絲雀。\n"
-                f"(讀到的內容不會被記錄在任何地方，只留長度:那可能是病人姓名或"
-                f"病歷號，不得寫進 log。)\n"
-                f"(同一功能同一天只寄一次。)",
-                recipients))
+                f"時間:{datetime.now().isoformat(timespec='seconds')}\n")
+
+    def _bg():
+        sent_ok = False
+        try:
+            recipients = _developer_alert_recipients()
+            if recipients:
+                sent_ok = bool(_send_alert_email_via_smtp(
+                    f"[皮膚科自動化] 療程欄讀值異常:{label}",
+                    f"{label} 讀療程欄時拿到無法辨識的內容，"
+                    f"這通常代表 HIS 改版或欄位位移（定位漂掉）。\n\n"
+                    f"{snapshot}\n"
+                    f"★{label} 不會因此中止★(依使用者定案:不擋、不跳窗，維持診間"
+                    f"動線) —— 讀值異常時它會照原路走「全部完成」。\n"
+                    f"醫師端沒有任何警告視窗。\n"
+                    f"沒有任何值被寫入 HIS，也沒有做回讀比對 —— "
+                    f"問題發生在【讀取】階段。\n"
+                    f"(這封信是在讀值當下寄出的:該次實際上有沒有送出完成動作，"
+                    f"請查稽核帳本那一筆的 outcome。)\n\n"
+                    f"請核對療程欄位置後於設定頁重新校正金絲雀。\n"
+                    f"(讀到的內容不會被記錄在任何地方，只留長度:那可能是病人姓名或"
+                    f"病歷號，不得寫進 log。)\n"
+                    f"(同一功能同一天只寄一次。)",
+                    recipients))
+        except Exception:
+            logging.debug("[%s] 療程讀值異常通知寄信失敗", label, exc_info=True)
+        finally:
+            _COURSE_ALERTS.release(key, sent_ok)
+
+    try:
+        threading.Thread(target=_bg, daemon=True,
+                         name="course-unreadable-mail").start()
     except Exception:
-        logging.debug("[%s] 療程讀值異常通知寄信失敗", label, exc_info=True)
-    finally:
-        _COURSE_ALERTS.release(key, sent_ok)
+        _COURSE_ALERTS.release(key, False)   # 緒沒起來 → 歸還,下次還能重試
+        logging.debug("[%s] 療程讀值異常通知緒啟動失敗", label, exc_info=True)
 
 
 def _f11_send_finish_no_print(main_hwnd: int, course_value: str,

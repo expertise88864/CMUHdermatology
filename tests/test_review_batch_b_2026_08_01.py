@@ -258,14 +258,44 @@ def test_the_unreadable_course_does_not_reuse_the_mismatch_notification():
 
 
 def test_the_dedicated_notification_states_what_actually_happened():
-    """專屬通知要講真話：沒寫入、沒回讀、F11 照常完成、醫師沒看到警告。"""
+    """專屬通知要講真話：沒寫入、沒回讀、問題在讀取階段、醫師沒看到警告。"""
     body = _code_of("_notify_course_unreadable")
-    assert "全部完成" in body, "要講明這一次仍照常按了全部完成"
     assert "讀取" in body, "要講明問題在讀取階段"
     assert "沒有任何值被寫入" in body
     # 而且不可以出現 mismatch 那套說法
     assert "回讀驗證不一致" not in body
-    assert "警告醫師" not in body or "沒有看到任何警告" in body
+
+
+def test_the_notification_does_not_claim_an_action_that_may_not_happen():
+    """★措辭鐵律★ 這封信是在【讀值當下】寄的。
+
+    那一刻完成動作還沒送出去，而且不一定會送：F12 可能剛被按下、「全部完成」
+    按鈕可能找不到、click 也可能送失敗。所以不可以寫「仍照常按了全部完成」——
+    那是在陳述一件尚未發生、也不保證會發生的事。
+    只能描述【政策】（不會因此中止），並把「實際上送出去了沒有」指向稽核帳本。
+    """
+    body = _code_of("_notify_course_unreadable")
+    assert "仍照常按了" not in body, "不可以宣稱一個尚未發生的動作"
+    assert "不會因此中止" in body, "要改成描述政策"
+    assert "請查稽核帳本" in body, "實際結果要指向帳本，而不是在信裡猜"
+
+
+def test_the_notification_sends_off_the_hotkey_thread():
+    """★SMTP 不可以擋住熱鍵★
+
+    `_send_alert_email_via_smtp` 有 60 秒逾時＋重試＋退避。同步跑會把 F11
+    【以及所有其他熱鍵】卡住將近三分鐘，而 F12 打不斷 socket 等待與退避 sleep。
+    與 `_notify_audit_mismatch` 一致：同步佔去重、背景 daemon 緒寄信與歸還。
+    """
+    src = _code_of("_notify_course_unreadable")
+    i_claim = src.index("_COURSE_ALERTS.claim(")
+    i_thread = src.index("threading.Thread(")
+    i_smtp = src.index("_send_alert_email_via_smtp(")
+    assert i_claim < i_thread, "去重要在 spawn 之前同步佔（否則會堆一串寄信緒）"
+    assert i_thread < i_smtp or "def _bg(" in src, "SMTP 必須在背景緒裡"
+    assert "daemon=True" in src, "寄信緒不可以擋住程式結束"
+    # 歸還也要在背景緒裡（寄失敗要能重試）
+    assert "_COURSE_ALERTS.release(" in src
 
 
 def test_the_dedicated_notification_is_deduped_and_carries_no_raw_value():
