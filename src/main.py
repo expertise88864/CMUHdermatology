@@ -7142,12 +7142,20 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                 external_jobs.append((label, cache_key, fetcher, stale))  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                 return ""
 
+            # ★[2026-08-01 外審] 這四支【一定要傳 None】★
+            #   下面的 external_jobs 會丟進 ThreadPoolExecutor 併行跑。傳 `session`
+            #   的話，多個 worker 會共用同一個 `requests.Session` —— 本 repo 自己在
+            #   `http_session_registry._session_http_guard` 明寫它非執行緒安全
+            #   （連線池與 cookie 會競態）；而且那是【主院】的 session，retry 設定
+            #   與院外那組（零重試）也不一樣。
+            #   傳 None → 每個 worker 各自取自己的 external thread-local session。
+            #   參數保留下來是給單獨呼叫與測試注入用的，不是給這裡用的。
             if _should_fetch_east_district_reg52(html_main, doctor_name):
                 html_east = _queue_external_html(
                     "east",
                     ("east_html", doc_no),
                     REG52_BRANCH_TTL_SECONDS,
-                    lambda: _fetch_east_district_reg52_html(session, doc_no, doctor_name),
+                    lambda: _fetch_east_district_reg52_html(None, doc_no, doctor_name),
                     f"east:{doc_no}",
                 )
 
@@ -7156,7 +7164,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                     "huihe",
                     ("huihe_html", doc_no),
                     REG52_BRANCH_TTL_SECONDS,
-                    lambda: _fetch_huihe_reg52_html(session, doc_no, doctor_name),
+                    lambda: _fetch_huihe_reg52_html(None, doc_no, doctor_name),
                     f"huihe:{doc_no}",
                 )
 
@@ -7165,7 +7173,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                     "huisheng",
                     ("huisheng_html", doc_no),
                     REG52_BRANCH_TTL_SECONDS,
-                    lambda: _fetch_huisheng_reg52_html(session, doc_no, doctor_name),
+                    lambda: _fetch_huisheng_reg52_html(None, doc_no, doctor_name),
                     f"huisheng:{doc_no}",
                 )
 
@@ -7174,7 +7182,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                     "auh",
                     ("auh_html", doctor_name, AUH_DOCTOR_DOCNO_MAP.get(doctor_name)),
                     REG52_AUH_TTL_SECONDS,
-                    lambda: _fetch_auh_reg52_html(session, doctor_name),
+                    lambda: _fetch_auh_reg52_html(None, doctor_name),
                     f"auh:{AUH_DOCTOR_DOCNO_MAP.get(doctor_name)}",
                 )
 

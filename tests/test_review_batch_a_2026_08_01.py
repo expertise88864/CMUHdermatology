@@ -258,3 +258,74 @@ def test_review_markers_do_not_claim_a_future_date():
                 if "2026-08-05" in line:
                     bad.append(f"{name}:{i}")
     assert not bad, f"src/ 仍有未來日期的標記：{bad[:10]}"
+
+
+# ─── ★[2026-08-01 外審第 2 輪] 併行的 worker 不可以共用同一個 Session★ ────
+def test_the_parallel_external_fetchers_must_not_share_a_session():
+    """★我上一版的「修好假注入」反而製造了併發 bug★
+
+    `session or _get_thread_local_...()` 本身是對的，但正式呼叫端【本來就有傳
+    session 進來】—— 而且傳的是 `main.py:6892` 那個【主院】的 thread-local
+    session。那四支 fetcher 會被丟進 `ThreadPoolExecutor(thread_name_prefix=
+    "r52ext")` 併行跑，於是多個 worker 共用同一個 `requests.Session`：
+
+      * 本 repo 自己在 `http_session_registry._session_http_guard` 明寫
+        「requests.Session 非執行緒安全」（連線池與 cookie 會競態）；
+      * 那還是【主院】的 retry 設定，不是院外那組刻意的零重試。
+
+    後果是分院掛號數可能整批抓不到 → 用舊快取 → 止掛提醒漏掉。
+    所以正式呼叫端一律傳 `None`，讓每個 worker 各自取自己的 external
+    thread-local session；參數保留給單獨呼叫與測試注入。
+
+    ★為什麼上一版的測試沒抓到★ 那些測試把一個 fake session 依序【直接】傳給
+    各 fetcher，根本沒有經過 `check_appointment_count` 的多來源 executor ——
+    又是「測了函式、沒測生產路徑」。
+    """
+    import ast
+    import os
+
+    src = open(os.path.join(os.path.dirname(__file__), "..", "src", "main.py"),
+               encoding="utf-8").read()
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef)
+              and n.name == "check_appointment_count")
+
+    external = {"_fetch_east_district_reg52_html", "_fetch_huihe_reg52_html",
+                "_fetch_huisheng_reg52_html", "_fetch_auh_reg52_html"}
+    seen = set()
+    for node in ast.walk(fn):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        if node.func.id not in external:
+            continue
+        seen.add(node.func.id)
+        first = node.args[0] if node.args else None
+        assert isinstance(first, ast.Constant) and first.value is None, (
+            f"{node.func.id} 在正式路徑上傳了 session（第 {node.lineno} 行）—— "
+            "併行 worker 會共用同一個非執行緒安全的 Session")
+    assert seen == external, f"沒掃到全部四支院外 fetcher，只看到 {seen}"
+
+
+def test_each_thread_gets_its_own_external_session():
+    """釘住「傳 None 時每個執行緒各拿各的」—— 這是上面那條成立的前提。"""
+    import threading
+
+    # ★存物件本身，不可以存 id()★ thread-local 在執行緒結束時就被釋放，
+    #   物件被回收後 id 會被下一個執行緒重用 —— 那樣測出來的「都一樣」是假的。
+    got = []
+    barrier = threading.Barrier(3)
+
+    def _grab():
+        s = rf._get_thread_local_reg52_external_session()
+        got.append(s)
+        barrier.wait(timeout=10)      # 三個都拿到之後才准結束，確保同時存活
+
+    threads = [threading.Thread(target=_grab) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert len(got) == 3, "有執行緒沒拿到 session"
+    assert len({id(s) for s in got}) == 3, \
+        "不同執行緒應該各自拿到不同的 Session 物件（共用會踩連線池/cookie 競態）"
