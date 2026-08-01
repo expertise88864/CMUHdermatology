@@ -771,12 +771,25 @@ class ScreenBlackout:
         # 吃掉（外審第 2 輪的競態）。只有真的建過視窗才發。
         # 一次性而非時間窗：喚醒只有一下，第二下 F1 必須正常動作（外審第 3 輪）。
         #
-        # ★[2026-08-01 外審第 2 輪 P2] 不是每一次 teardown 都該發 token★
+        # ★[2026-08-01 外審第 2/3 輪] 發不發 token 的判準★
         #   token 存在的理由是「造成黑幕收起的那一下按鍵，不可以又落進 HIS」——
-        #   那個競態只發生在【使用者輸入】觸發的退場。而驗證失敗的 rollback
-        #   （蓋不滿 → 整批拆掉）根本沒有人按任何鍵，這時發 token 只會讓接下來
-        #   1.5 秒內第一下 F1-F11 被靜默吃掉：黑幕沒蓋成，熱鍵還莫名其妙少一下。
-        if not issue_wake_token or not wins:
+        #   那個競態只發生在【使用者輸入觸發、而且黑幕真的剛消失】的那一刻。
+        #
+        #   第 2 輪修掉的：驗證失敗的 rollback 沒有人按鍵，不該發（`issue_wake_token`）。
+        #   第 3 輪修掉的：我當時用 `not wins` 當「有沒有黑幕」的代理，那是錯的 ——
+        #     survivor 在【第二次】teardown 才終於關掉時，`_wins` 早就是空的，
+        #     但確實有一個可見視窗剛剛消失，而那次正是使用者按鍵觸發的。
+        #     漏發 token 的後果就是那一下 F1 直接落進剛露出來的 HIS。
+        #   所以判準改成「這次有沒有真的把可見的黑幕移除掉」：
+        #     還卡著（stuck）→ 沒有消失，不必發；
+        #     清乾淨了 → 不管是靠 Tk wrapper 還是靠強制關閉，都要發。
+        if not issue_wake_token:
+            # 非輸入觸發的 rollback：順便把本次建立流程可能留下的 token 撤掉，
+            # 免得「黑幕沒蓋成」卻還吃掉下一下熱鍵。
+            with self._wake_lock:
+                self._wake_token = 0.0
+            return
+        if stuck:
             return
         with self._wake_lock:
             if self._eaten_this_blackout:
@@ -843,7 +856,9 @@ class ScreenBlackout:
             logging.warning("[黑幕] 無法排程失效保險輪詢 → 立刻收起黑幕",
                             exc_info=True)
             self._poll_id = None
-            self._destroy()
+            # ★排不到 after 不是使用者按鍵造成的★ 發 token 只會平白吃掉
+            #   下一下 F1-F11（黑幕根本沒留住）。見 _destroy 的說明。
+            self._destroy(issue_wake_token=False)
 
     def _cancel_poll(self) -> None:
         poll_id, self._poll_id = self._poll_id, None

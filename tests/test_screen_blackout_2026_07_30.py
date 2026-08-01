@@ -1188,3 +1188,106 @@ def test_a_real_wake_still_eats_the_hotkey(tk_root, made):
     bo._poll()                    # → 收黑幕
     assert bo.active is False
     assert bo.consume_wake_gate() is True, "喚醒的那一下仍必須被吃掉"
+
+
+# ─── ★[2026-08-01 外審第 3 輪] token 的判準不是「有沒有 Tk wrapper」★ ─────
+def test_a_survivor_closed_on_a_later_teardown_still_issues_the_token(
+        tk_root, monkeypatch):
+    """★P1：漏發 token，喚醒的那一下 F1 會直接落進剛露出來的 HIS★
+
+    第一次 teardown 留下關不掉的 survivor 之後，`_wins` 已經是空的。
+    使用者按 F1（殘留視窗上的 Tk binding 觸發）→ 第二次 teardown 這次成功關掉了
+    ——確實有一個可見視窗剛剛消失，正是 token 要防的那個競態。
+    但我上一輪用 `not wins` 當「有沒有黑幕」的代理，於是這次不發 token：
+    Tk callback 若先於 keyboard hook 跑完，hook 看到 `_hwnds == ()` 就放行同一下 F1。
+    """
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 500, 400)])
+    bo.show()
+    state = {"alive": True}
+
+    class _Fake:
+        @staticmethod
+        def IsWindow(_h):
+            return 1 if state["alive"] else 0
+
+        @staticmethod
+        def IsWindowVisible(_h):
+            return 1 if state["alive"] else 0
+
+        @staticmethod
+        def ShowWindow(_h, _c):
+            return 0
+
+        @staticmethod
+        def DestroyWindow(_h):
+            return 0
+    monkeypatch.setattr(sb, "_u32", lambda: _Fake())
+
+    bo.hide()                                  # 第一次：卡住
+    assert bo._hwnds, "前提：留下了 survivor"
+    assert bo._wake_token == 0.0, \
+        "還卡著時不該發 token（黑幕沒消失，閘門本來就擋著）"
+    # ★不可以在這裡呼叫 consume_wake_gate()★ 那會標記「這次黑幕已經吃過一下」，
+    #   而本測試要模擬的正是【Tk 先跑完、hook 才來問】的那個順序 —— 那時還沒有
+    #   任何熱鍵被吃掉，所以必須發 token。
+    state["alive"] = False                     # 視窗這次真的關掉了
+    bo.hide()                                  # ★第二次：使用者按鍵觸發★
+    assert bo._hwnds == ()
+    assert bo.consume_wake_gate() is True, \
+        "★可見視窗剛剛消失就要發 token★ 否則那一下 F1 會落進剛露出來的 HIS"
+
+
+def test_a_stuck_teardown_keeps_blocking_by_itself(tk_root, monkeypatch):
+    """反方向：還卡著時，擋熱鍵靠的是【黑幕仍可見】，不是 token。
+
+    `consume_wake_gate()` 在黑幕仍在時本來就回 True（把那一下吃掉）——
+    那是正確的，因為畫面確實還被蓋著。這支釘的是「擋得住」，
+    以及它不是靠一張 token 撐著（token 有 1.5 秒失效保險，會過期）。
+    """
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(0, 0, 500, 400)])
+    bo.show()
+
+    class _Stuck:
+        @staticmethod
+        def IsWindow(_h):
+            return 1
+
+        @staticmethod
+        def IsWindowVisible(_h):
+            return 1
+
+        @staticmethod
+        def ShowWindow(_h, _c):
+            return 0
+
+        @staticmethod
+        def DestroyWindow(_h):
+            return 0
+    monkeypatch.setattr(sb, "_u32", lambda: _Stuck())
+    bo.hide()
+    assert bo._hwnds, "前提：卡住了"
+    # ★先看 token 再消費閘門★ 反過來的話 consume_wake_gate() 會把 token 清掉，
+    #   於是「有沒有發過 token」就永遠測不出來（突變驗證抓到過這個假綠燈）。
+    assert bo._wake_token == 0.0, "★擋住是因為看得見，不是因為有 token★"
+    assert bo.active_from_any_thread() is True, "黑幕仍可見"
+    assert bo.consume_wake_gate() is True, "仍可見 → 這一下熱鍵要被吃掉"
+
+
+def test_a_failed_failsafe_schedule_does_not_eat_the_next_hotkey(tk_root,
+                                                                 monkeypatch):
+    """★P2：排不到 after 也不是使用者按鍵造成的★
+
+    `_schedule_poll()` 失敗時會【自己】呼叫 `_destroy()`；用預設值就會簽發 token，
+    而 `show()` 之後那次 `_destroy(issue_wake_token=False)` 撤不掉它（視窗已清空）。
+    結果：黑幕根本沒留住，下一下 F1-F11 卻被無故吃掉。
+    """
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [RECT])
+    monkeypatch.setattr(tk_root, "after",
+                        lambda *_a, **_k: (_ for _ in ()).throw(
+                            RuntimeError("排不到")))
+    assert bo.show() is False
+    assert bo.consume_wake_gate() is False, \
+        "★沒有人按鍵，不該吃掉下一個熱鍵★"
