@@ -1109,10 +1109,12 @@ def test_f11_checks_card_before_phototherapy_complete():
 def test_re_room_matches_letter_prefixed_room():
     """[2026-06-19 user] 止掛信診間:_RE_ROOM 要能配 G06診(字母前綴)+ 101診(純數字),
     否則 G06診(張廖年峰)會解析不到 → 信裡顯示「診間未提供」。"""
-    source = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
-    m = re.search(r"_RE_ROOM\s*=\s*re\.compile\(r'([^']+)'\)", source)
-    assert m, "找不到 _RE_ROOM 定義"
-    pat = re.compile(m.group(1))
+    # [2026-08-01 P2-06 第四刀] _RE_ROOM 已搬到 cmuh_common/reg52_parse.py。
+    # 改成直接拿【那條真的在用的 regex】來問行為 —— 比從原始碼挖字面更穩，
+    # 也不會因為引號寫法改了就抓不到（抓不到時這種守衛會安靜地失效）。
+    import sys as _sys
+    _sys.path.insert(0, str(ROOT / "src"))
+    from cmuh_common.reg52_parse import _RE_ROOM as pat
     assert pat.search("林某 (G06診) 已掛號").group(1) == "G06診"
     assert pat.search("王某 (101診) 已掛號").group(1) == "101診"
     assert pat.search("(自費門診)") is None

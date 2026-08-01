@@ -16,6 +16,9 @@ from bs4 import BeautifulSoup
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import main  # noqa: E402
+# [2026-08-01 P2-06 第四刀] 解析器搬到 cmuh_common/reg52_parse.py；
+# 這一支不再經由 main（main 自己也不用它了）。
+from cmuh_common.reg52_parse import safe_parse_roc_date as _safe_parse_roc_date  # noqa: E402
 
 
 def _soup(html: str) -> BeautifulSoup:
@@ -79,10 +82,10 @@ def test_dayoff_parser_keeps_per_row_guard():
 def test_safe_parse_roc_date_raises_on_garbage():
     """_safe_parse_roc_date 的 raise 契約(各解析器的防護以此為前提)。"""
     with pytest.raises(ValueError):
-        main._safe_parse_roc_date("壞掉的日期")
+        _safe_parse_roc_date("壞掉的日期")
     with pytest.raises(ValueError):
-        main._safe_parse_roc_date("")
-    assert main._safe_parse_roc_date("115/06/19").year == 2026
+        _safe_parse_roc_date("")
+    assert _safe_parse_roc_date("115/06/19").year == 2026
 
 
 def test_idle_duration_uses_unsigned_tick_arithmetic():

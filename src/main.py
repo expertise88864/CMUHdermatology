@@ -136,7 +136,6 @@ from cmuh_common.appt_utils import (
     build_east_weekday_index as _build_east_weekday_index,
     east_index_has_other as _east_index_has_other,
     reg52_docno_for_dayoff_table as _reg52_docno_for_dayoff_table,
-    split_schbox_by_date as _split_schbox_by_date,
 )
 from cmuh_common.his_window import (
     get_window_text_with_timeout as _his_title_of,
@@ -152,6 +151,20 @@ from cmuh_common.uvb_dose import (
     format_dose_and_count as _fmt_uvb_dc,
 )
 from cmuh_common.retention import default_rules as _retention_default_rules
+# [P2-06 分層第四刀 2026-08-01] reg52/院方掛號頁的 HTML 解析器搬到
+# cmuh_common/reg52_parse.py（10 個純函式 + 6 條 regex 常數）。
+# 只搬家、不改呼叫端（沿用舊的私有名）。
+from cmuh_common.reg52_parse import (
+    _RE_COUNT_DIGIT,
+    parse_main_hospital_schedule as _parse_main_hospital_schedule,
+    parse_doctor_info_dayoff as _parse_doctor_info_dayoff,
+    parse_east_fh1_schedule as _parse_east_fh1_schedule,
+    parse_huihe_schedule as _parse_huihe_schedule,
+    parse_huisheng_schedule as _parse_huisheng_schedule,
+    parse_branch_schedule as _parse_branch_schedule,
+    parse_auh_reg52_schedule as _parse_auh_reg52_schedule,
+    parse_appt_item_for_alert as _parse_appt_item_for_alert,
+)
 from cmuh_common.action_ledger import (
     LEDGER_FILENAME as _LEDGER_FILENAME,
     OUTCOME_FAILED as _LEDGER_FAILED,
@@ -209,7 +222,6 @@ from cmuh_common.appt_utils import (  # noqa: E402
     _appt_dict_ext_branch,
     _calendar_branch_sort_rank,
     _strip_ext_appointments,
-    _normalize_dayoff_session,
     _merge_appointments_by_date,
     _merge_dayoff_overrides,
 )
@@ -307,14 +319,6 @@ def safe_unhook_all_hotkeys():
     except Exception as e:
         logging.warning(f"Failed to unhook hotkeys cleanly: {e}")
 
-# --- 模組級 Regex 常數 (只 compile 一次，避免每次呼叫重複編譯) ---
-_RE_COUNT_DIGIT = re.compile(r'(\d+)')          # 用於 _update_grid_data 計算人數
-_RE_ROOM        = re.compile(r'\(([A-Za-z0-9]+診)\)')  # 診間號:含字母前綴(如 A101診)+純數字(101診)
-                                                 # [2026-06-19] 原本只配 \d+診 → 漏掉含字母前綴的診間(如 A101診)→ 止掛信顯示「診間未提供」
-_RE_COUNT_APPT  = re.compile(r'已掛號：(\d+)')   # 用於 check_appointment_count 掛號數
-_RE_PERSON      = re.compile(r'(\d+)\s*人')      # 用於 check_appointment_count 人數
-_RE_ROC_DATE    = re.compile(r'(\d{2,3})/(\d{2})/(\d{2})')
-
 # 總覽門診表「本科主診間」:A101→A102→A103→A104→A105(自家固定診間)。語意:
 #   1) 醫師列不另標這五間的診間號(免冗餘);其餘診間(他科借診/特殊)才顯示「(診間)」。
 #   2) 排序依此序在最前 → 本院其他診間 → 分院最後。
@@ -325,8 +329,6 @@ _RE_ROC_DATE    = re.compile(r'(\d{2,3})/(\d{2})/(\d{2})')
 #     故此處直接 exact match;若實機出現大小寫/全形變體再依實際字串調整(同 _RE_ROOM 維護點)。
 _OVERVIEW_PRIMARY_ROOMS = ("A101診", "A102診", "A103診", "A104診", "A105診")
 
-# [O16] reg52 hot-path 預編譯：原本散落在函式內的 inline re.search/findall，集中宣告省 compile 開銷
-_RE_REG52_DATE_CNT_PAIRS = re.compile(r'(\d{2,3}/\d{2}/\d{2})\s*已掛號[：:]\s*(\d+)')
 _RE_CLINIC_DOCTOR        = re.compile(r"醫師[：:]\s*(\S+)")
 _RE_CLINIC_CLOSED        = re.compile(r"\(已關診\)|（已關診）")
 _RE_CLINIC_CLOSE_LINE    = re.compile(r"診間目前燈號\s*[：:]\s*\d+[^\n\r]*已關診")
@@ -7035,13 +7037,6 @@ def create_master_schedule_from_web():
         logging.error(f"Failed to create master schedule from web: {e}")
         return {}
 
-def _safe_parse_roc_date(roc_date_str):
-    match = _RE_ROC_DATE.search(roc_date_str or "")
-    if not match:
-        raise ValueError(f"無法解析日期: {roc_date_str}")
-    year_part, month_part, day_part = match.groups()
-    return datetime(int(year_part) + 1911, int(month_part), int(day_part)).date()
-
 # _appt_dict_ext_branch / _calendar_branch_sort_rank: 抽到 cmuh_common.appt_utils
 _EXT_BRANCH_DISPLAY_SUFFIX = {
     "east": "(東區分院)",
@@ -7260,294 +7255,6 @@ def _fetch_huisheng_reg52_html(session, doc_no: str, doctor_name: str):
     return None
 
 
-def _parse_main_hospital_schedule(soup):
-    schedule_table = soup.select_one('table.schedule')
-    if not schedule_table:
-        # 兼容亞大/其他 reg52：無 table.schedule class，但仍有 timeSlot + schBox 結構
-        for tbl in soup.find_all('table'):
-            if tbl.select_one('td.timeSlot') and tbl.select_one('td.schBox'):
-                schedule_table = tbl
-                break
-    if not schedule_table:
-        return {}
-
-    appointments_by_date = {}
-    data_rows = schedule_table.select('tr')[1:]
-    for row in data_rows:
-        time_slot_cell = row.select_one('td.timeSlot')
-        if not time_slot_cell:
-            continue
-
-        time_slot_text = ""
-        cell_text = time_slot_cell.get_text(strip=True)
-        cell_class = time_slot_cell.get('class', [])
-
-        if 'AM' in cell_class or "上午" in cell_text:
-            time_slot_text = "上午"
-        elif 'PM' in cell_class or "下午" in cell_text:
-            time_slot_text = "下午"
-        elif 'Night' in cell_class or "晚上" in cell_text or "夜間" in cell_text:
-            time_slot_text = "晚上"
-
-        if not time_slot_text:
-            continue
-
-        for cell in row.select('td.schBox'):
-            cell_content = cell.get_text(strip=True)
-            # 東區分院/診間號碼是【整格】的屬性(同一診的所有日期共用),維持整格判斷;
-            # 止掛是【單一日期】的狀態,改在下面逐日期算(見 _split_schbox_by_date)。
-            is_external = "東區分院" in cell_content
-            header_text, date_group_texts = _split_schbox_by_date(cell)
-
-            room = ""
-            room_match = _RE_ROOM.search(cell_content)
-            if room_match:
-                room = room_match.group(1)
-
-            for date_div in cell.find_all('div', class_='visitDate'):
-                own_text = date_group_texts.get(id(date_div))
-                stop_scope = (cell_content if own_text is None
-                              else header_text + own_text)
-                is_stopped = "止掛" in stop_scope
-                date_tag = date_div.find('b')
-                if not date_tag:
-                    continue
-
-                roc_date_str = date_tag.get_text(strip=True)
-                count = -1
-                count_div = date_div.find_next_sibling('div')
-
-                if count_div:
-                    count_text = count_div.get_text()
-                    count_match = _RE_COUNT_APPT.search(count_text)
-                    if count_match:
-                        count = int(count_match.group(1))
-                    elif "已額滿" in count_text:
-                        count = "已額滿"
-
-                if count == -1:
-                    content_without_date = cell_content.replace(roc_date_str, "")
-                    fallback_match = _RE_PERSON.search(content_without_date)
-                    if fallback_match:
-                        count = int(fallback_match.group(1))
-                    elif "額滿" in cell_content:
-                        count = "已額滿"
-                    elif "截止" in cell_content or "過" in cell_content:
-                        count = "截止"
-                    else:
-                        count = 0
-
-                # [review C2 2026-06-12] 與 _parse_doctor_info_dayoff 同款防護：
-                # 單格日期解析失敗只跳過該格，不可讓整個醫師的班表解析中斷。
-                try:
-                    date_key = _safe_parse_roc_date(roc_date_str)
-                except ValueError:
-                    logging.debug("班表略過無法解析日期之格: %r", roc_date_str)
-                    continue
-                appointments_by_date.setdefault(date_key, []).append({
-                    'session': time_slot_text,
-                    'count': count if count != "截止" else "截止",
-                    'is_ext': is_external,
-                    'ext_branch': 'east' if is_external else None,
-                    'room': room,
-                    'is_stopped': is_stopped,
-                })
-    return appointments_by_date
-
-def _parse_doctor_info_dayoff(soup, assume_east_branch=False, assume_huihe_branch=False, assume_huisheng_branch=False):
-    """解析 reg52.cgi（宜使用 DocNo=D…）內之休診表：主院常用 table#dayoff；東區 fh1 常為 width=300 三欄小表。"""
-    dayoff_table = soup.select_one("table#dayoff")
-    if not dayoff_table:
-        for tbl in soup.find_all("table"):
-            if str(tbl.get("width") or "").strip() != "300":
-                continue
-            rows = tbl.find_all("tr")
-            if len(rows) < 2:
-                continue
-            first_data = rows[1].find_all(["td", "th"])
-            if len(first_data) != 3:
-                continue
-            if not _RE_ROC_DATE.search(first_data[0].get_text(" ", strip=True)):
-                continue
-            dayoff_table = tbl
-            break
-    if not dayoff_table:
-        return {}
-
-    appointments_by_date = {}
-    for row in dayoff_table.select('tr')[1:]:
-        cells = row.find_all(['td', 'th'])
-        if len(cells) < 3:
-            continue
-
-        roc_date_str = cells[0].get_text(" ", strip=True)
-        session_name = _normalize_dayoff_session(cells[1].get_text(" ", strip=True))
-        replacement_text = cells[2].get_text(" ", strip=True) or "休診"
-        if not session_name:
-            logging.debug(f"停診表略過無法辨識診別之列: {cells[1].get_text(' ', strip=True)!r} / 日期 {roc_date_str!r}")
-            continue
-
-        row_joined = " ".join(c.get_text(" ", strip=True) for c in cells)
-        if assume_east_branch:
-            ext_branch = "east"
-        elif assume_huihe_branch:
-            ext_branch = "huihe"
-        elif assume_huisheng_branch:
-            ext_branch = "huisheng"
-        else:
-            ext_branch = "east" if ("東區" in row_joined or "東區分院" in row_joined) else None
-
-        # [stability] 單列日期解析失敗只跳過該列，不要讓整個醫師的休診表解析中斷
-        # (某列 cells[0] 可能是子標題/合併格/格式異動 → _safe_parse_roc_date raise)。
-        try:
-            date_key = _safe_parse_roc_date(roc_date_str)
-        except ValueError:
-            logging.debug("停診表略過無法解析日期之列: %r", roc_date_str)
-            continue
-        appointments_by_date.setdefault(date_key, []).append({
-            'session': session_name,
-            'count': replacement_text,
-            'is_ext': ext_branch is not None,
-            'ext_branch': ext_branch,
-            'room': "",
-            'is_stopped': False,
-        })
-    return appointments_by_date
-
-def _parse_fh_like_weekly_schedule(soup, ext_branch):
-    """東區 fh1 / 惠和 wh1 / 惠盛 hs1 週表：無 table.schedule，診別常見「上 午」空格；以列首 + visitDate 解析。"""
-    appointments_by_date = {}
-    for row in soup.find_all("tr"):
-        cells = row.find_all(["td", "th"])
-        if not cells:
-            continue
-        slot_norm = cells[0].get_text(" ", strip=True).replace(" ", "").replace("\u3000", "")
-        if "上午" in slot_norm or "早診" in slot_norm:
-            session_name = "上午"
-        elif "下午" in slot_norm:
-            session_name = "下午"
-        elif "晚" in slot_norm or "夜間" in slot_norm:
-            session_name = "晚上"
-        else:
-            continue
-
-        for cell in cells[1:]:
-            cell_text = cell.get_text(" ", strip=True)
-            room_match = _RE_ROOM.search(cell_text)
-            room = room_match.group(1) if room_match else ""
-
-            for date_div in cell.find_all("div", class_="visitDate"):
-                date_tag = date_div.find("b")
-                if not date_tag:
-                    continue
-
-                roc_date_str = date_tag.get_text(strip=True)
-                count_text = date_div.get_text(" ", strip=True)
-                if "休診" in count_text or "停診" in count_text:
-                    count = "休診"
-                elif "已額滿" in count_text:
-                    count = "已額滿"
-                elif "截止" in count_text or "過" in count_text:
-                    count = "截止"
-                else:
-                    count_match = _RE_COUNT_APPT.search(count_text)
-                    count = int(count_match.group(1)) if count_match else 0
-
-                # [review C2 2026-06-12] 單格日期解析失敗只跳過該格(同 dayoff 解析防護)
-                try:
-                    date_key = _safe_parse_roc_date(roc_date_str)
-                except ValueError:
-                    logging.debug("分院週表略過無法解析日期之格: %r", roc_date_str)
-                    continue
-                appointments_by_date.setdefault(date_key, []).append({
-                    "session": session_name,
-                    "count": count if count != "截止" else "截止",
-                    "is_ext": True,
-                    "ext_branch": ext_branch,
-                    "room": room,
-                    "is_stopped": False,
-                })
-    return appointments_by_date
-
-
-def _parse_east_fh1_schedule(soup):
-    """東區 61.66.117.10 fh1/reg52 週表。"""
-    return _parse_fh_like_weekly_schedule(soup, "east")
-
-
-def _parse_huihe_schedule(soup):
-    """惠和 appointment.cmuh.org.tw wh1/reg52 週表。"""
-    return _parse_fh_like_weekly_schedule(soup, "huihe")
-
-
-def _parse_huisheng_schedule(soup):
-    """惠盛 61.66.117.10 hs1/reg52 週表。"""
-    return _parse_fh_like_weekly_schedule(soup, "huisheng")
-
-def _parse_branch_schedule(soup):
-    form = soup.find('form', attrs={'name': 'FrontPage_Form1'})
-    if not form:
-        return {}
-
-    schedule_table = None
-    for table in form.find_all('table'):
-        first_row = table.find('tr')
-        if first_row and "星期一" in table.get_text():
-            schedule_table = table
-            break
-    if not schedule_table:
-        return {}
-
-    appointments_by_date = {}
-    rows = schedule_table.find_all('tr')
-    for row in rows[1:]:
-        cells = row.find_all('td')
-        if len(cells) < 2:
-            continue
-
-        slot_label = cells[0].get_text(" ", strip=True)
-        if "上午" in slot_label or "早診" in slot_label:
-            session_name = "上午"
-        elif "下午" in slot_label:
-            session_name = "下午"
-        elif "晚" in slot_label or "夜間" in slot_label:
-            session_name = "晚上"
-        else:
-            continue
-
-        for cell in cells[1:]:
-            room_match = _RE_ROOM.search(cell.get_text(" ", strip=True))
-            room = room_match.group(1) if room_match else ""
-
-            for date_div in cell.find_all('div', class_='visitDate'):
-                date_tag = date_div.find('b')
-                if not date_tag:
-                    continue
-
-                roc_date_str = date_tag.get_text(strip=True)
-                count_text = date_div.get_text(" ", strip=True)
-                if "已額滿" in count_text:
-                    count = "已額滿"
-                else:
-                    count_match = _RE_COUNT_APPT.search(count_text)
-                    count = int(count_match.group(1)) if count_match else 0
-
-                # [review C2 2026-06-12] 單格日期解析失敗只跳過該格(同 dayoff 解析防護)
-                try:
-                    date_key = _safe_parse_roc_date(roc_date_str)
-                except ValueError:
-                    logging.debug("東區週表略過無法解析日期之格: %r", roc_date_str)
-                    continue
-                appointments_by_date.setdefault(date_key, []).append({
-                    'session': session_name,
-                    'count': count,
-                    'is_ext': True,
-                    'ext_branch': 'east',
-                    'room': room,
-                    'is_stopped': False,
-                })
-    return appointments_by_date
-
 def _fetch_auh_reg52_html(session, doctor_name):
     from urllib.parse import quote
     doc_no = AUH_DOCTOR_DOCNO_MAP.get(doctor_name)
@@ -7591,50 +7298,6 @@ def _fetch_auh_reg52_html(session, doctor_name):
             logging.warning("[O36] AUH 連續失敗 %d 次，本 session 不再嘗試（重啟才會重試）",
                             _CIRCUIT_BREAKER_THRESHOLD)
         return _cache_get(cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False) or ""
-
-def _parse_auh_reg52_schedule(soup):
-    out = {}
-    parsed = _parse_main_hospital_schedule(soup)
-    for d, rows in parsed.items():
-        for row in rows:
-            rec = dict(row)
-            rec["is_ext"] = True
-            rec["ext_branch"] = "auh"
-            out.setdefault(d, []).append(rec)
-    if out:
-        return out
-
-    # 亞大 reg52 常見版型：無 timeSlot/schBox class，改以每列文字做日期+人數擷取
-    for tr in soup.find_all("tr"):
-        txt = tr.get_text(" ", strip=True)
-        if not txt:
-            continue
-        txt_norm = txt.replace(" ", "").replace("\u3000", "")
-        if ("上午" in txt_norm) or ("早診" in txt_norm):
-            session_name = "上午"
-        elif "下午" in txt_norm:
-            session_name = "下午"
-        elif ("晚上" in txt_norm) or ("夜間" in txt_norm) or ("晚診" in txt_norm):
-            session_name = "晚上"
-        else:
-            continue
-
-        pairs = _RE_REG52_DATE_CNT_PAIRS.findall(txt_norm)  # [O16] precompiled
-        for roc_date_str, count_str in pairs:
-            try:
-                d = _safe_parse_roc_date(roc_date_str)
-            except Exception:
-                continue
-            out.setdefault(d, []).append({
-                "session": session_name,
-                "count": int(count_str),
-                "is_ext": True,
-                "ext_branch": "auh",
-                "room": "",
-                "is_stopped": False,
-            })
-    return out
-
 
 class Reg52BackoffActive(Exception):
     pass
@@ -8679,55 +8342,6 @@ def _hotkey_builtin_map_for_profile(profile: str) -> dict:
     if profile in ("1920x1080", "1280x1024", "1024x768"):
         return dict(common_adaptive)
     return {}
-
-
-# =============================================================================
-# 止掛提醒寄信（Outlook COM，在獨立執行緒+逾時，避免卡到主迴圈）
-# =============================================================================
-def _parse_appt_item_for_alert(appt_item):
-    """把快取的門診項目正規化成 (session_name, count, is_stopped, ext_branch, room)。
-
-    純函式(好測):供止掛背景掃描用,與 _update_grid_data 內的解析同源(dict 新格式 +
-    舊字串格式)。休診/停診/取不到人數 → 回 None(不是「0 人」,不可拿去比門檻)。"""
-    if isinstance(appt_item, dict):
-        session_name = str(appt_item.get("session", ""))
-        raw_count = appt_item.get("count", 0)
-        is_stopped = bool(appt_item.get("is_stopped", False))
-        ext_branch = _appt_dict_ext_branch(appt_item)
-        room = str(appt_item.get("room", "") or "")
-        status_text = str(raw_count) + ("人" if isinstance(raw_count, int) else "")
-    else:
-        text = str(appt_item)
-        parts = text.split("|")
-        status_part = parts[0]
-        ext_branch = None
-        is_stopped = False
-        room = ""
-        for p in parts[1:]:
-            if p.startswith("Ext:"):
-                val = p.split(":", 1)[1]
-                ext_branch = {"1": "east", "east": "east", "auh": "auh",
-                              "huihe": "huihe", "huisheng": "huisheng"}.get(val)
-            elif p.startswith("Rm:"):
-                room = p.split(":", 1)[1]
-            elif p.startswith("Stop:"):
-                is_stopped = (p.split(":", 1)[1] == "1")
-        if ":" not in status_part:
-            return None
-        session_name, status_text = status_part.split(":", 1)
-        status_text = status_text.strip()
-    if not session_name:
-        return None
-    if "休診" in status_text or "停診" in status_text:
-        return None
-    m = _RE_COUNT_DIGIT.search(status_text)
-    if not m:
-        return None
-    try:
-        count = int(m.group(1))
-    except ValueError:
-        return None
-    return (session_name, count, is_stopped, ext_branch, room)
 
 
 # [2026-07-26 審查 ★該來的信永遠不來★] 「觸發了止掛提醒、但收件人清單是空的」原本是

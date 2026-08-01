@@ -212,7 +212,11 @@ def test_main_still_exposes_the_old_private_names():
     """★這一刀只搬家、不改呼叫端★ 別名掉了會變成 AttributeError，
     而且多半只在實機才會炸。"""
     import main
-    for name in ("_split_schbox_by_date", "_reg52_docno_for_dayoff_table",
+    # [2026-08-01 第四刀] `_split_schbox_by_date` 不再由 main.py 匯入 ——
+    # 它在 main.py 的唯一呼叫端（`_parse_main_hospital_schedule`）也搬進
+    # cmuh_common/reg52_parse.py 了，那個呼叫變成模組之間的。
+    # 這跟第二刀的 `_window_is_ancestor` 是同一個形狀：搬家會讓別的匯入變成死碼。
+    for name in ("_reg52_docno_for_dayoff_table",
                  "_build_east_weekday_index", "_east_index_has_other",
                  "_filter_recent_alert_sent", "_clinic_refresh_seconds",
                  "_reg64_micro_ttl_seconds", "_tick_delta", "_fmt_uvb_dc",
