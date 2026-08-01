@@ -824,3 +824,58 @@ def test_allow_lower_makes_it_an_explicit_visible_action(monkeypatch,
                             {"shared": 85.0, "entrypoints": 0.0, "total": 0.0},
                             shared_pct=80, extra=("--allow-lower",))
     assert got["shared"] == 79.0
+
+
+def test_an_unparseable_pyright_run_still_produces_an_annotation(monkeypatch,
+                                                                 tmp_path):
+    """★[2026-08-05 外審 P2] 走【真正的】崩潰路徑,不是一個假造的例外★
+
+    上面那支 `test_the_ratchet_annotates_instead_of_dying_silently` 讓
+    `_load_baseline` 拋 `OSError` —— 它是 `Exception` 的子類,所以 guard 抓得到,
+    測試綠。但實際最會發生的崩潰(pyright 沒裝、跑不起來、輸出被截斷)當時
+    拋的是 `SystemExit`,那是 `BaseException`,會【直接穿過】guard 的
+    `except Exception`:CI 一樣紅,卻發不出 annotation —— 而 annotation 正是
+    這個 guard 唯一的用途。假的例外把測試變成假的信心。
+
+    這支從 subprocess 那一層灌壞掉的 stdout,讓真實路徑跑起來。
+    """
+    import contextlib
+    import io as _io
+    import subprocess as _sp
+
+    import type_debt
+
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setattr(type_debt, "MAIN_CONFIG", str(tmp_path / "cfg.json"))
+    monkeypatch.setattr(type_debt, "TEMP_CONFIG", str(tmp_path / "tmp.json"))
+    with open(tmp_path / "cfg.json", "w", encoding="utf-8") as fh:
+        fh.write("{}")
+
+    class _Broken:
+        stdout = "pyright: command not found"     # 不是 JSON
+        stderr = ""
+        returncode = 127
+
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: _Broken())
+    monkeypatch.setattr(type_debt, "_load_baseline", lambda: {"reportAny": {}})
+
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = type_debt._main_guarded([])
+    out = buf.getvalue()
+    assert rc == 1, "解析不了 ≠ 沒有型別債,必須失敗"
+    assert "::error title=" in out, \
+        "★這就是 P2★ SystemExit 會穿過 guard,CI 紅但沒人看得到原因"
+    assert "無法解析 pyright 輸出" in out
+
+
+def test_the_guard_does_not_swallow_argparse_exits(monkeypatch):
+    """★反方向★ guard 不可以改成抓 BaseException 來「順便」解決上面那件事。
+
+    `main()` 用 argparse —— `--help` 和參數錯誤本來就靠 SystemExit 正常結束。
+    一旦 guard 連 BaseException 一起抓,`--help` 會變成一則「關卡失敗」的
+    annotation 並回 1;`KeyboardInterrupt` 也會被吞掉。
+    """
+    import type_debt
+    with pytest.raises(SystemExit):
+        type_debt._main_guarded(["--help"])

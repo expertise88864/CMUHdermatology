@@ -229,7 +229,15 @@ def _rule_diagnostics(rule: str) -> dict:
         try:
             report = json.loads(cp.stdout)
         except ValueError as e:
-            raise SystemExit(
+            # ★[2026-08-05 外審 P2] 這裡【不可以】用 SystemExit★
+            #   SystemExit 繼承的是 BaseException，會直接穿過 `_main_guarded` 的
+            #   `except Exception` —— 於是 pyright 沒裝／跑不起來／輸出壞掉時，
+            #   CI 一樣紅，但**發不出 annotation**，錯誤只留在要 admin 才下載得到的
+            #   job log 裡。那正好是 `_main_guarded` 存在的理由被繞過。
+            #   反過來在 guard 裡改抓 BaseException 也不對：`main()` 用 argparse，
+            #   `--help` 與參數錯誤本來就靠 SystemExit 正常結束，抓了會把它們
+            #   一起變成「關卡失敗」。所以錯誤在這裡就該是一般例外。
+            raise RuntimeError(
                 f"[type-debt] 無法解析 pyright 輸出（規則 {rule}）：{e}\n"
                 f"  ★解析不了不等於沒有型別債★ —— 這道關卡沒跑成，視為失敗。\n"
                 f"  stdout 前 500 字：{cp.stdout[:500]}\n"
