@@ -453,13 +453,19 @@ def test_once_mode_also_recovers(monkeypatch):
         "★復原要在 import/執行 watchdog_core 之前★ 那個模組正是可能被換到一半的東西"
 
 
-def test_backups_are_kept_when_the_journal_cannot_be_cleared(tmp_path,
-                                                             monkeypatch):
-    """★P1-4：「日誌先消失、才准動備份」這個不變量原本沒有被強制★
+def test_an_unclearable_journal_rolls_the_batch_back(tmp_path, monkeypatch):
+    """★P1-4：日誌清不掉時，整批要收回去 —— 不可以就這樣回去★
 
-    `_clear_commit_journal` 吞掉例外又不回報成敗，呼叫端照樣往下刪 .bak。
-    防毒/暫時鎖檔讓 remove 失敗時 → 日誌還在、備份卻被刪掉一半 →
-    下次啟動照日誌回滾:有備份的退回舊版、備份沒了的留在新版 → 混版本。
+    兩層問題：
+      1. `_clear_commit_journal` 原本吞掉例外又不回報成敗，呼叫端照樣往下刪 .bak
+         → 日誌還在、備份只剩一半 → 下次啟動回滾成混版本。
+      2. （外審第 2 輪）只是「留著備份 + 記 error 就 return」也不夠：那樣
+         `has_update` 不會被設起來 → 呼叫端不會重啟 → 行程繼續跑【舊模組】，
+         磁碟上卻是【整批新檔】，之後任何一個延遲 import 都會載到新版 → 同一個
+         行程裡新舊混用。
+
+    此刻鎖還在手上、備份也還完整,是收乾淨最好的時機:整批回滾 → 磁碟＝舊版,
+    跟記憶體裡的舊模組一致,連重啟都不需要。
     """
     app = tmp_path / "app"
     app.mkdir()
@@ -470,12 +476,15 @@ def test_backups_are_kept_when_the_journal_cannot_be_cleared(tmp_path,
     monkeypatch.setattr(updater, "_clear_commit_journal", lambda _d: False)
 
     result = updater.UpdateResult()
-    updater._commit_pending_writes(
+    out = updater._commit_pending_writes(
         [("k1", "a.py", "1.0", "NEW-A", str(a)),
          ("k2", "b.py", "1.0", "NEW-B", str(b))], result)
 
-    assert (app / "a.py.bak").exists() and (app / "b.py.bak").exists(), \
-        "★日誌沒清掉就不准刪備份★ 否則會變成「日誌說要回滾、備份卻只剩一半」"
+    assert a.read_text(encoding="utf-8") == "OLD-A", "★磁碟要回到舊版★"
+    assert b.read_text(encoding="utf-8") == "OLD-B"
+    assert not out.has_update, \
+        "沒有成功 commit 就不可以宣告有更新（那會觸發一次沒有意義的重啟）"
+    assert not out.updated_files
     assert any("交易日誌" in e for e in result.errors), "而且要說出來"
 
 
@@ -582,3 +591,74 @@ def test_a_crash_while_backing_up_cannot_destroy_the_intact_file(tmp_path,
     assert target.read_text(encoding="utf-8") == "COMPLETE-OLD-CONTENT", \
         ("★復原不可以把完好的檔換成半截備份★ "
          "備份必須先寫 .bak.tmp 再原子換名，權威的 .bak 才不會出現半截內容")
+
+
+# ─── ★[2026-08-05 外審第 2 輪] 三個 CONFIRMED P1★ ────────────────────────
+def test_a_stale_backup_cannot_downgrade_an_untouched_file(tmp_path):
+    """★復原把使用者【降版】了★
+
+    上一批 commit 成功後清 .bak 失敗(那個清理是靜默吞錯的)→ 磁碟上留著一份
+    【更舊的】陳舊備份。本批在「複製到 .bak.tmp」的中途死掉:正式檔根本還沒被動過,
+    但復原看到 .bak 存在就拿它還原 → 把好好的檔換成上上個版本。
+
+    暫存檔還在就是「還沒 replace」的鐵證(os.replace 會把它吃掉),這個證據必須
+    【贏過】.bak 存不存在。
+    """
+    app = tmp_path / "app"
+    app.mkdir()
+    target = app / "mod.py"
+    target.write_text("CURRENT", encoding="utf-8")
+    (app / "mod.py.bak").write_text("ANCIENT", encoding="utf-8")   # 上一批的殘留
+    staged = app / ".mod.py.upd.tmp"
+    staged.write_text("NEW", encoding="utf-8")                     # 還沒 replace
+    (app / updater.JOURNAL_FILENAME).write_text(
+        json.dumps({"schema": 1, "started": "2026-08-05T09:00:00", "pid": 1,
+                    "files": [{"target": str(target), "existed_before": True,
+                               "staged": str(staged)}]}, ensure_ascii=False),
+        encoding="utf-8")
+
+    updater.recover_incomplete_update(str(app))
+    assert target.read_text(encoding="utf-8") == "CURRENT", \
+        "★不可以拿上一批的陳舊備份蓋掉沒被動過的檔★ 那是把使用者降版"
+
+
+def test_a_failed_journal_rewrite_keeps_the_original_journal(tmp_path,
+                                                             monkeypatch):
+    """★宣稱與實作要相符★
+
+    `_rewrite_journal_for_retry` 的 docstring 寫「寫不出來時保留原本的日誌」,
+    但它用的 `_write_commit_journal` 原本是 `open(path, "w")` —— 先【截斷】既有
+    日誌,失敗的處置又是把它【刪掉】。於是磁碟滿/IO 錯誤時,那份還有用的原日誌
+    連同半套磁碟的唯一線索一起沒了,跟宣稱完全相反。
+    """
+    app = tmp_path / "app"
+    app.mkdir()
+    journal = app / updater.JOURNAL_FILENAME
+    journal.write_text('{"schema":1,"files":[{"target":"x"}]}', encoding="utf-8")
+    original = journal.read_text(encoding="utf-8")
+
+    real_open = open
+
+    def _no_space(path, mode="r", *a, **k):
+        if str(path).endswith(".journal.tmp"):
+            raise OSError(28, "磁碟空間不足")
+        return real_open(path, mode, *a, **k)
+    monkeypatch.setattr("builtins.open", _no_space)
+
+    assert updater._write_commit_journal(str(app), [("y", True, "")]) is False
+    monkeypatch.undo()
+    assert journal.exists(), "★原本那份日誌不可以被毀掉★"
+    assert journal.read_text(encoding="utf-8") == original, "而且要原封不動"
+    assert not (app / (updater.JOURNAL_FILENAME + ".tmp")).exists(), \
+        "半截的 tmp 要清掉"
+
+
+def test_the_journal_is_published_by_rename():
+    """釘住原子寫法本身 —— 直接 open(path,'w') 會截斷既有日誌。"""
+    import ast
+    import inspect
+    import textwrap
+    src = ast.unparse(ast.parse(textwrap.dedent(
+        inspect.getsource(updater._write_commit_journal))))
+    assert "os.replace" in src, "日誌要用原子換名發布"
+    assert "fsync" in src

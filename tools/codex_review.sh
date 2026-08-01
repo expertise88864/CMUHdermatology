@@ -67,7 +67,9 @@ build_flags() {   # $1 = effort ; $2 = kind("exec" | "resume")
   fi
 }
 
-extract_session_id() { grep -oiE 'session id:[[:space:]]*[0-9a-f-]{36}' "$RAW_LOG" 2>/dev/null | head -1 | grep -oiE '[0-9a-f-]{36}' || true; }
+# 舊版接受「任意 36 個 hex 或連字號」,那不是 UUID 形狀 —— 全連字號也會過,
+# 然後被寫進 last_session_id 成為之後每一輪都信任的壞紀錄。改為錨定 8-4-4-4-12。
+extract_session_id() { grep -oiE 'session id:[[:space:]]*[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' "$RAW_LOG" 2>/dev/null | head -1 | grep -oiE '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' || true; }
 extract_tokens() { awk 'tolower($0) ~ /tokens used/ {found=1; next} found && $0 ~ /[0-9]/ {gsub(/[^0-9]/,"",$0); if (length($0)) {print $0; exit}}' "$RAW_LOG" 2>/dev/null || true; }
 extract_result() {
   [ -s "$LAST_MSG" ] || { echo "UNKNOWN"; return; }
@@ -123,7 +125,7 @@ resume 只能沿用同一 task 的 session。要重開一輪全新審查請跑�
   elif [ -z "$RECORDED_SID" ]; then
     die "本 repo 沒有第一輪 session 紀錄可比對;拒絕以未經驗證的 session id resume。"
   fi
-  if ! printf '%s' "$SID" | grep -Eq       '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
+  if ! printf '%s' "$SID" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
     die "session id 格式不正確:'$SID'(需為 UUID)。不要把 task-context 檔路徑傳到這個位置。"
   fi
   PREV_PASS="$(cat "$PASS_FILE" 2>/dev/null || echo 0)"
