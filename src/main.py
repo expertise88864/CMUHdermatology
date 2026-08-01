@@ -4832,10 +4832,18 @@ def _f11_read_course_value(main_hwnd: int, label: str = "F11"):
 
 
 def _f11_report_unreadable_course(result, main_hwnd: int, label: str) -> None:
-    """療程欄讀不到／讀到怪東西 → 記帳本 + 寄通知。★不改變按哪顆按鈕★
+    """療程欄讀不到／讀到怪東西 → 記帳本 + 寄【專屬】通知。★不改變按哪顆按鈕★
 
     這是「疑似定位漂移」最早的訊號：F11 照舊完成，但維護者當天就會知道。
     帳本與信件都只帶長度，不帶原值（帳本本來就明訂不存病人明文識別）。
+
+    ★[2026-08-01 外審 P2] 不可以借用 mismatch 那條通知★
+    `_LEDGER_MISMATCH` 會被 `_ledger_writer_loop` 路由到 `_notify_audit_mismatch`，
+    而那封信的固定模板寫著「自動化寫入後回讀驗證不一致（該次寫入已依既有流程
+    中止/警告醫師）」。用在這裡每一句都是假的：**沒有寫入、沒有回讀、沒有警告
+    醫師，而且 F11 是刻意繼續走「全部完成」的**。收到那封信的人會照著去查一個
+    根本不存在的寫入錯誤。改用 `_LEDGER_SKIPPED`（誠實：這一筆沒有動作可驗證）
+    ＋下面自己的一封信。
     """
     try:
         _record_his_action(
@@ -4843,12 +4851,53 @@ def _f11_report_unreadable_course(result, main_hwnd: int, label: str) -> None:
             value=_EvReason("course_unreadable",
                             length=result.observed_length),
             detail=_EvObserved(result.observed_length),
-            outcome=_LEDGER_MISMATCH)
+            outcome=_LEDGER_SKIPPED)
     except Exception:
         logging.debug("[%s] 療程讀值 violation 記錄失敗（不影響流程）", label,
                       exc_info=True)
+    _notify_course_unreadable(label, result)
 
 
+_COURSE_ALERTS = _AlertDeduper("f11-course-unreadable")
+
+
+def _notify_course_unreadable(label: str, result) -> None:
+    """療程欄讀不到的專屬通知。★措辭只講這條路真的發生的事★
+
+    與 mismatch 通知的差別（也正是它必須自己一封的理由）：
+      * 這裡【沒有】任何寫入，也沒有回讀比對 —— 問題在【讀取】階段；
+      * F11 【照常】按了「全部完成」（使用者定案：不擋不跳窗）；
+      * 醫師端【沒有】任何警告視窗。
+    信裡只帶長度，不帶原值。同一個 label 同一天只寄一次。
+    """
+    key = f"{label}|{date.today().isoformat()}"
+    if not _COURSE_ALERTS.claim(key):
+        return
+    sent_ok = False
+    try:
+        recipients = _developer_alert_recipients()
+        if recipients:
+            sent_ok = bool(_send_alert_email_via_smtp(
+                f"[皮膚科自動化] 療程欄讀值異常:{label}",
+                f"{label} 讀療程欄時拿到無法辨識的內容，"
+                f"這通常代表 HIS 改版或欄位位移（定位漂掉）。\n\n"
+                f"狀況:{result.describe()}\n"
+                f"電腦:{_machine_name_safe()}\n"
+                f"時間:{datetime.now().isoformat(timespec='seconds')}\n\n"
+                f"★這一次 {label} 仍照常按了「全部完成」★"
+                f"(依使用者定案:不擋、不跳窗，維持診間動線)。"
+                f"醫師端沒有看到任何警告。\n"
+                f"沒有任何值被寫入 HIS，也沒有做回讀比對 —— "
+                f"問題發生在【讀取】階段。\n\n"
+                f"請核對療程欄位置後於設定頁重新校正金絲雀。\n"
+                f"(讀到的內容不會被記錄在任何地方，只留長度:那可能是病人姓名或"
+                f"病歷號，不得寫進 log。)\n"
+                f"(同一功能同一天只寄一次。)",
+                recipients))
+    except Exception:
+        logging.debug("[%s] 療程讀值異常通知寄信失敗", label, exc_info=True)
+    finally:
+        _COURSE_ALERTS.release(key, sent_ok)
 
 
 def _f11_send_finish_no_print(main_hwnd: int, course_value: str,
@@ -4975,6 +5024,16 @@ def _f11_快速完成_main(label: str = "F11") -> bool:
     #   使用者定案：讀到無法辨識的內容仍照舊按「全部完成」（不擋不跳窗），
     #   由 `_f11_read_course_value` 負責記 violation ＋ 寄通知。
     course = _f11_read_course_value(main_hwnd, label=label)
+    # ★[2026-08-01 外審 P1] 送出完成動作【之前】要再確認一次 F12★
+    #   讀值異常時 `_f11_read_course_value` 會去記帳本，而那條路會呼叫
+    #   `_sample_patient_locator()` —— 那支【刻意】把 F12 的 SubsystemInterrupted
+    #   吞掉並正常返回（2026-08-02 的定案：F12 不可以讓整筆稽核紀錄消失）。
+    #   那個「吞掉」在當時是安全的，因為 mismatch 只發生在動作【之後】。
+    #   現在多了一條動作【之前】就會記帳本的路，同一個吞掉就變成：
+    #   醫師按了 F12 → 被採樣器吃掉 → 這裡照樣按下「全部完成」→ 之後的
+    #   interruptible sleep 才發現 F12，於是 UI 顯示「已由 F12 手動終止」，
+    #   而完成動作其實已經送出去了。所以這裡補一道明確的閘門。
+    check_stop()
     if course.is_phototherapy_2_or_3:
         if not _f11_send_finish_no_print(main_hwnd, course.value, label, t_f11_start):
             return False

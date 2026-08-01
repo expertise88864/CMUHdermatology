@@ -139,6 +139,22 @@ def _func(name):
                 if isinstance(n, ast.FunctionDef) and n.name == name)
 
 
+def _code_of(name) -> str:
+    """函式的原始碼，★剝掉 docstring★。
+
+    這一輪已經被自我命中騙過三次：docstring 本來就會引用「不可以用 X」來解釋
+    為什麼，不剝掉就會比對到自己的說明文字。
+    """
+    fn = _func(name) if isinstance(name, str) else name
+    stripped = ast.parse(ast.unparse(fn)).body[0]
+    body = getattr(stripped, "body", [])
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        stripped.body = body[1:] or [ast.Pass()]
+    return ast.unparse(stripped)
+
+
 @pytest.mark.parametrize("func_name", ["_f11_read_course_value",
                                        "_f11_click_finish_all"])
 def test_the_f11_path_logs_only_the_typed_description(func_name):
@@ -169,7 +185,7 @@ def test_the_unreadable_case_is_recorded_and_notified():
               if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     assert "_f11_report_unreadable_course" in called
 
-    reporter = ast.unparse(_func("_f11_report_unreadable_course"))
+    reporter = _code_of("_f11_report_unreadable_course")
     assert "observed_length" in reporter, "只能帶長度"
     assert "result.value" not in reporter, "★不可以把原值帶進帳本或信件★"
 
@@ -193,3 +209,68 @@ def test_the_ledger_value_does_not_claim_the_field_was_blank():
             cv.CourseReadResult(status, observed_length=8)).to_payload()
         assert got["t"] == "reason" and got["code"] == "course_unreadable", \
             f"{status} 被記成了 {got}"
+
+
+# ─── ★[2026-08-01 外審第 2 輪] 兩個 CONFIRMED★ ───────────────────────────
+def test_f12_is_rechecked_before_the_completion_action():
+    """★P1：F12 被採樣器吃掉，完成動作照樣送出去★
+
+    `_sample_patient_locator()` 【刻意】把 F12 的 SubsystemInterrupted 吞掉並正常
+    返回（2026-08-02 定案：F12 不可以讓整筆稽核紀錄消失）。那個吞掉在當時是安全的，
+    因為 mismatch 只發生在動作【之後】。
+
+    我這一刀新增了一條動作【之前】就會記帳本的路（療程讀值異常），於是同一個吞掉
+    變成：醫師按 F12 → 被採樣器吃掉 → 照樣按下「全部完成」→ 之後的
+    interruptible sleep 才發現 F12 → UI 顯示「已由 F12 手動終止」，
+    而完成動作其實已經送出去了。
+
+    所以送出之前必須再有一道明確的 `check_stop()`。
+    """
+    fn = _func("_f11_快速完成_main")
+    lines = _code_of(fn).splitlines()
+    i_read = next(i for i, ln in enumerate(lines)
+                  if "_f11_read_course_value(" in ln)
+    i_send = next(i for i, ln in enumerate(lines)
+                  if "_f11_send_finish_no_print(" in ln
+                  or "_f11_click_finish_all(" in ln)
+    between = [ln for ln in lines[i_read:i_send] if "check_stop()" in ln]
+    assert between, (
+        "讀療程值與送出完成動作之間沒有 check_stop() —— "
+        "F12 會被定位採樣器吃掉，然後照樣按下完成")
+
+
+def test_the_unreadable_course_does_not_reuse_the_mismatch_notification():
+    """★P2：借用 mismatch 那封信，每一句都是假的★
+
+    mismatch 信的固定模板寫著「自動化寫入後回讀驗證不一致（該次寫入已依既有流程
+    中止/警告醫師）」。用在療程讀值異常這條路上：
+      * 沒有任何寫入；
+      * 沒有回讀比對；
+      * 沒有警告醫師；
+      * F11 是【刻意】繼續按「全部完成」的。
+    收到那封信的人會去查一個根本不存在的寫入錯誤。
+    """
+    reporter = _code_of("_f11_report_unreadable_course")
+    assert "_LEDGER_MISMATCH" not in reporter, \
+        "★不可以用 mismatch★ 它會被路由到內容完全不符事實的那封信"
+    assert "_LEDGER_SKIPPED" in reporter
+    assert "_notify_course_unreadable" in reporter
+
+
+def test_the_dedicated_notification_states_what_actually_happened():
+    """專屬通知要講真話：沒寫入、沒回讀、F11 照常完成、醫師沒看到警告。"""
+    body = _code_of("_notify_course_unreadable")
+    assert "全部完成" in body, "要講明這一次仍照常按了全部完成"
+    assert "讀取" in body, "要講明問題在讀取階段"
+    assert "沒有任何值被寫入" in body
+    # 而且不可以出現 mismatch 那套說法
+    assert "回讀驗證不一致" not in body
+    assert "警告醫師" not in body or "沒有看到任何警告" in body
+
+
+def test_the_dedicated_notification_is_deduped_and_carries_no_raw_value():
+    """同一天只寄一次（不然定位漂掉時每個病人都寄一封），且只帶長度。"""
+    src = _code_of("_notify_course_unreadable")
+    assert "_COURSE_ALERTS.claim(" in src and "_COURSE_ALERTS.release(" in src
+    assert "result.describe()" in src, "只能帶 describe()（保證不含原值）"
+    assert "result.value" not in src
