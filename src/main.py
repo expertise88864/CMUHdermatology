@@ -160,6 +160,9 @@ from cmuh_common.retention import default_rules as _retention_default_rules
 # [P2-06 分層第四刀 2026-08-01] reg52/院方掛號頁的 HTML 解析器搬到
 # cmuh_common/reg52_parse.py（10 個純函式 + 6 條 regex 常數）。
 # 只搬家、不改呼叫端（沿用舊的私有名）。
+from cmuh_common.reg52_contract import (
+    classify_main_html as _classify_main_html,
+)
 from cmuh_common.reg52_parse import (
     _RE_COUNT_DIGIT,
     parse_main_hospital_schedule as _parse_main_hospital_schedule,
@@ -7106,6 +7109,12 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
             html_dayoff = _cache_get(dayoff_cache_key, REG52_DAYOFF_TTL_SECONDS, evict_expired=False)
             need_main = html_main is None
             need_dayoff = html_dayoff is None
+            # 「這一輪主表是新抓回來的」——只有新抓的才需要在解析後判定語意並寫快取。
+            # 用快取／stale 進來的不必再判一次（它們當初就是通過判定才存進去的）。
+            main_fetched_fresh = False
+            # backoff key 在兩條抓取路徑裡各自定義；解析後的判定也要用它，
+            # 所以提到這裡統一宣告（值是決定性的，不依賴走了哪一條）。
+            sk_main = f"main:{doc_no}"
             if need_main and need_dayoff and cached_count > 0:
                 # 啟動時已有門診人數快取可保底；先把主表抓回來更新人數，
                 # 休診表留給後續主表已快取的輪次，避免 dayoff 逾時拖住整批刷新。
@@ -7140,8 +7149,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                 def _parallel_fetch_main():
                     t0 = time.perf_counter()
                     sess = _get_thread_local_reg52_session()
-                    sk_main = f"main:{doc_no}"
-                    ok_main, remain_main = _source_backoff_allow(sk_main)
+                    ok_main, remain_main = _source_backoff_allow(sk_main)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                     if not ok_main:
                         stale = _cache_get(cache_main_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         if stale is not None:
@@ -7155,10 +7163,9 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                                 response.raise_for_status()
                                 response.encoding = 'big5'
                                 hm = response.text
-                        _source_backoff_success(sk_main)
                     except requests.exceptions.RequestException:
                         delay, cnt = _source_backoff_fail(
-                            sk_main,
+                            sk_main,  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                             REG52_MAIN_BACKOFF_BASE_SECONDS,
                             REG52_MAIN_BACKOFF_MAX_SECONDS,
                         )
@@ -7166,10 +7173,15 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                         stale = _cache_get(cache_main_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         if stale is not None:
                             source_timing["backoff_skip"] += 1  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
-                            return stale, int((time.perf_counter() - t0) * 1000)
+                            return stale, int((time.perf_counter() - t0) * 1000), False
                         raise
-                    _cache_set(cache_main_key, hm)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
-                    return hm, int((time.perf_counter() - t0) * 1000)
+                    # ★[2026-08-02 外審 P1] 這裡【還不能】寫快取或宣告成功★
+                    #   主院維護頁一樣是 200、長度也可能夠，真正的判準是「解析得
+                    #   出時段嗎」—— 那要等下面 parse 完才知道。原本抓完就
+                    #   `_cache_set`，於是壞頁進了快取之後三次 retry 都拿同一份重解析，
+                    #   在 TTL 內一直有效：每次都失敗，卻連一次重新連線都沒有。
+                    #   第三個回傳值 = 「這一輪是新抓的，成敗留待解析後宣告」。
+                    return hm, int((time.perf_counter() - t0) * 1000), True
 
                 def _parallel_fetch_dayoff():
                     t0 = time.perf_counter()
@@ -7203,14 +7215,14 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                 with ThreadPoolExecutor(max_workers=2, thread_name_prefix="r52pair") as pool:
                     fut_m = pool.submit(_parallel_fetch_main)
                     fut_d = pool.submit(_parallel_fetch_dayoff)
-                    html_main, source_timing["main_fetch_ms"] = fut_m.result()
+                    (html_main, source_timing["main_fetch_ms"],
+                     main_fetched_fresh) = fut_m.result()
                     html_dayoff, source_timing["dayoff_fetch_ms"], dayoff_backoff = fut_d.result()
                     if dayoff_backoff:
                         source_timing["backoff_skip"] += 1
 
             elif need_main:
                 t0 = time.perf_counter()
-                sk_main = f"main:{doc_no}"
                 ok_main, remain_main = _source_backoff_allow(sk_main)
                 if not ok_main:
                     stale = _cache_get(cache_main_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)
@@ -7229,7 +7241,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                                 response.raise_for_status()
                                 response.encoding = 'big5'
                                 html_main = response.text
-                        _source_backoff_success(sk_main)
+                        main_fetched_fresh = True   # 成敗留待解析後宣告（見上）
                     except requests.exceptions.RequestException:
                         delay, cnt = _source_backoff_fail(
                             sk_main,
@@ -7243,8 +7255,6 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                             source_timing["backoff_skip"] += 1
                         else:
                             raise
-                    else:
-                        _cache_set(cache_main_key, html_main)
                     source_timing["main_fetch_ms"] = int((time.perf_counter() - t0) * 1000)
 
             elif need_dayoff:
@@ -7286,6 +7296,25 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
             else:
                 source_timing["main_parse_ms"] = 0
                 source_timing["cache_hit_parse"] += 1
+            # ★[2026-08-02 外審 P1] 解析完才決定「這頁算不算數」★
+            if main_fetched_fresh:
+                main_outcome = _classify_main_html(
+                    html_main, parsed_slots=len(parsed or {}))
+                if main_outcome.ok:
+                    _cache_set(cache_main_key, html_main)
+                    _source_backoff_success(sk_main)
+                else:
+                    # ★不寫快取★ 讓下一輪真的重新連線，而不是重解析同一份壞頁。
+                    logging.warning("主院回應不是掛號表: %s (%s) → %s",
+                                    doctor_name, doc_no, main_outcome.describe())
+                    delay, cnt = _source_backoff_fail(
+                        sk_main,
+                        REG52_MAIN_BACKOFF_BASE_SECONDS,
+                        REG52_MAIN_BACKOFF_MAX_SECONDS,
+                    )
+                    logging.warning("[BACKOFF] main semantic-invalid %s %s, "
+                                    "fail=%s, delay=%.1fs",
+                                    doctor_name, doc_no, cnt, delay)
             if parsed:
                 _merge_appointments_by_date(appointments_by_date, parsed)
                 # 先回主院資料，分院/亞大再補齊（漸進更新）

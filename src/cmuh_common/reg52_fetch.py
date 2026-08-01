@@ -38,6 +38,10 @@ from cmuh_common.fetch_resilience import (
     _source_backoff_fail,
     _source_backoff_success,
 )
+from cmuh_common.reg52_contract import (
+    classify_auh_html as _classify_auh_html,
+    classify_branch_html as _classify_branch_html,
+)
 from cmuh_common.http_client import is_internal as _is_internal
 from cmuh_common.appt_utils import reg52_docno_for_dayoff_table as _reg52_docno_for_dayoff_table
 from cmuh_common.http_session_registry import register_session as _register_reg_session
@@ -113,7 +117,6 @@ def _fetch_east_district_reg52_html(session, doc_no: str, doctor_name: str):
     #   連自動安裝器都跑不到（main.py 第 190 行 import 本模組，
     #   而 _ensure_deps_runtime 在第 285 行）。
     import requests
-    from bs4 import BeautifulSoup
     from urllib.parse import quote, quote_from_bytes
 
     dparam = _reg52_docno_for_dayoff_table(doc_no)
@@ -138,6 +141,7 @@ def _fetch_east_district_reg52_html(session, doc_no: str, doctor_name: str):
     #   「一定會被丟掉的參數」比沒有參數更糟：它讓 API 契約騙人。
     session = session or _get_thread_local_reg52_external_session()
     last_error = None
+    last_semantic = None
     for docname_q in variants:
         url = f"{EAST_DISTRICT_REG52_URL}?DocNo={dparam}&Docname={docname_q}"
         if url in seen_urls:
@@ -147,20 +151,25 @@ def _fetch_east_district_reg52_html(session, doc_no: str, doctor_name: str):
             r = session.get(url, timeout=REG52_BRANCH_TIMEOUT, verify=True)
             r.raise_for_status()
             r.encoding = "big5"
-            text = r.text
-            if len(text) < 500:
-                continue
-            probe = BeautifulSoup(text, "lxml")
-            if probe.select_one("div.visitDate") or probe.select_one("table#dayoff"):
+            # ★[2026-08-02 外審 P1] HTTP 200 ≠ 這是掛號表★
+            #   維護頁／登入頁／改版後的空殼頁都是 200。原本這裡只是 `continue`，
+            #   於是語意失敗完全不記 backoff／熔斷 —— 每一輪都再打一次同一個壞頁。
+            outcome = _classify_branch_html(r.text)
+            if outcome.ok:
                 logging.info(f"已自東區主機取得掛號表: {doctor_name} ({dparam})")
                 _source_backoff_success(source_key)
                 _circuit_record_success("east")
-                return text
+                return outcome.usable_html
+            last_semantic = outcome
+            logging.info("東區主機回應不是掛號表: %s %s → %s",
+                         doctor_name, dparam, outcome.describe())
         except requests.exceptions.RequestException as e:
             logging.debug(f"東區 reg52 請求失敗 ({url[:64]}…): {e}")
             last_error = e
             continue
-    if last_error:
+    # ★語意失敗也是失敗★ 只認 RequestException 的話，維護頁會讓
+    #   backoff 與熔斷器永遠不動，每一輪都再打一次同一個壞頁。
+    if last_error or last_semantic:
         delay, cnt = _source_backoff_fail(
             source_key,
             REG52_EXTERNAL_BACKOFF_BASE_SECONDS,
@@ -181,7 +190,6 @@ def _fetch_huihe_reg52_html(session, doc_no: str, doctor_name: str):
     #   連自動安裝器都跑不到（main.py 第 190 行 import 本模組，
     #   而 _ensure_deps_runtime 在第 285 行）。
     import requests
-    from bs4 import BeautifulSoup
     from urllib.parse import quote, quote_from_bytes
 
     dparam = _reg52_docno_for_dayoff_table(doc_no)
@@ -203,6 +211,7 @@ def _fetch_huihe_reg52_html(session, doc_no: str, doctor_name: str):
     #   「一定會被丟掉的參數」比沒有參數更糟：它讓 API 契約騙人。
     session = session or _get_thread_local_reg52_external_session()
     last_error = None
+    last_semantic = None
     for docname_q in variants:
         url = f"{HUIHE_REG52_URL}?DocNo={dparam}&Docname={docname_q}"
         if url in seen_urls:
@@ -212,19 +221,24 @@ def _fetch_huihe_reg52_html(session, doc_no: str, doctor_name: str):
             r = session.get(url, timeout=REG52_BRANCH_TIMEOUT, verify=not _is_internal(url))
             r.raise_for_status()
             r.encoding = "big5"
-            text = r.text
-            if len(text) < 500:
-                continue
-            probe = BeautifulSoup(text, "lxml")
-            if probe.select_one("div.visitDate") or probe.select_one("table#dayoff"):
+            # ★[2026-08-02 外審 P1] HTTP 200 ≠ 這是掛號表★
+            #   維護頁／登入頁／改版後的空殼頁都是 200。原本這裡只是 `continue`，
+            #   於是語意失敗完全不記 backoff／熔斷 —— 每一輪都再打一次同一個壞頁。
+            outcome = _classify_branch_html(r.text)
+            if outcome.ok:
                 logging.info(f"已自惠和 wh1 取得掛號表: {doctor_name} ({dparam})")
                 _source_backoff_success(source_key)
-                return text
+                return outcome.usable_html
+            last_semantic = outcome
+            logging.info("惠和回應不是掛號表: %s %s → %s",
+                         doctor_name, dparam, outcome.describe())
         except requests.exceptions.RequestException as e:
             logging.debug(f"惠和 reg52 請求失敗 ({url[:64]}…): {e}")
             last_error = e
             continue
-    if last_error:
+    # ★語意失敗也是失敗★ 只認 RequestException 的話，維護頁會讓
+    #   backoff 與熔斷器永遠不動，每一輪都再打一次同一個壞頁。
+    if last_error or last_semantic:
         delay, cnt = _source_backoff_fail(
             source_key,
             REG52_EXTERNAL_BACKOFF_BASE_SECONDS,
@@ -241,7 +255,6 @@ def _fetch_huisheng_reg52_html(session, doc_no: str, doctor_name: str):
     #   連自動安裝器都跑不到（main.py 第 190 行 import 本模組，
     #   而 _ensure_deps_runtime 在第 285 行）。
     import requests
-    from bs4 import BeautifulSoup
     from urllib.parse import quote, quote_from_bytes
 
     dparam = _reg52_docno_for_dayoff_table(doc_no)
@@ -265,6 +278,7 @@ def _fetch_huisheng_reg52_html(session, doc_no: str, doctor_name: str):
     #   「一定會被丟掉的參數」比沒有參數更糟：它讓 API 契約騙人。
     session = session or _get_thread_local_reg52_external_session()
     last_error = None
+    last_semantic = None
     for docname_q in variants:
         url = f"{HUISHENG_REG52_URL}?DocNo={dparam}&Docname={docname_q}"
         if url in seen_urls:
@@ -274,20 +288,25 @@ def _fetch_huisheng_reg52_html(session, doc_no: str, doctor_name: str):
             r = session.get(url, timeout=REG52_BRANCH_TIMEOUT, verify=True)
             r.raise_for_status()
             r.encoding = "big5"
-            text = r.text
-            if len(text) < 500:
-                continue
-            probe = BeautifulSoup(text, "lxml")
-            if probe.select_one("div.visitDate") or probe.select_one("table#dayoff"):
+            # ★[2026-08-02 外審 P1] HTTP 200 ≠ 這是掛號表★
+            #   維護頁／登入頁／改版後的空殼頁都是 200。原本這裡只是 `continue`，
+            #   於是語意失敗完全不記 backoff／熔斷 —— 每一輪都再打一次同一個壞頁。
+            outcome = _classify_branch_html(r.text)
+            if outcome.ok:
                 logging.info(f"已自惠盛 hs1 取得掛號表: {doctor_name} ({dparam})")
                 _source_backoff_success(source_key)
                 _circuit_record_success("huisheng")
-                return text
+                return outcome.usable_html
+            last_semantic = outcome
+            logging.info("惠盛回應不是掛號表: %s %s → %s",
+                         doctor_name, dparam, outcome.describe())
         except requests.exceptions.RequestException as e:
             logging.debug(f"惠盛 reg52 請求失敗 ({url[:64]}…): {e}")
             last_error = e
             continue
-    if last_error:
+    # ★語意失敗也是失敗★ 只認 RequestException 的話，維護頁會讓
+    #   backoff 與熔斷器永遠不動，每一輪都再打一次同一個壞頁。
+    if last_error or last_semantic:
         delay, cnt = _source_backoff_fail(
             source_key,
             REG52_EXTERNAL_BACKOFF_BASE_SECONDS,
@@ -327,15 +346,36 @@ def _fetch_auh_reg52_html(session, doctor_name):
         r = session.get(url, timeout=REG52_AUH_TIMEOUT, verify=True)
         r.raise_for_status()
         r.encoding = "big5"
-        text = r.text
-        if "已掛號" in text or "visitDate" in text:
-            logging.info(f"已自亞大附醫取得掛號表: {doctor_name} ({doc_no})")
-        else:
-            logging.warning(f"亞大附醫頁面未含掛號數欄位: {doctor_name} ({doc_no})")
-        _cache_set(cache_key, text)
+        # ★[2026-08-02 外審 P1] 這裡原本是最嚴重的一處★
+        #   缺掛號欄位只記一行 warning，然後【照樣】_cache_set ＋
+        #   _source_backoff_success ＋ _circuit_record_success ——
+        #   維護頁被當成健康的成功頁，還把熔斷器重置了；壞頁進了快取還會在
+        #   TTL 內一直被拿來用，把上一份好資料蓋掉。
+        outcome = _classify_auh_html(r.text)
+        if not outcome.ok:
+            logging.warning("亞大附醫回應不是掛號表: %s (%s) → %s",
+                            doctor_name, doc_no, outcome.describe())
+            delay, cnt = _source_backoff_fail(
+                source_key,
+                REG52_EXTERNAL_BACKOFF_BASE_SECONDS,
+                REG52_EXTERNAL_BACKOFF_MAX_SECONDS,
+            )
+            logging.warning("[BACKOFF] auh semantic-invalid %s %s, fail=%s, "
+                            "delay=%.1fs", doctor_name, doc_no, cnt, delay)
+            if _circuit_record_fail("auh"):
+                logging.warning("[O36] AUH 連續失敗 %d 次 → 暫停嘗試 %d 分鐘，"
+                                "之後自動半開重試",
+                                _CIRCUIT_BREAKER_THRESHOLD,
+                                _CIRCUIT_BREAKER_RESET_MIN)
+            # ★不可以覆蓋 good cache★ 壞頁把好資料蓋掉比抓不到還糟。
+            #   回上一份【語意有效】的 stale，沒有就回空字串。
+            return _cache_get(cache_key, REG52_STALE_CACHE_SECONDS,
+                              evict_expired=False) or ""
+        logging.info(f"已自亞大附醫取得掛號表: {doctor_name} ({doc_no})")
+        _cache_set(cache_key, outcome.usable_html)
         _source_backoff_success(source_key)
         _circuit_record_success("auh")
-        return text
+        return outcome.usable_html
     except requests.exceptions.RequestException as e:
         logging.warning(f"亞大附醫資料抓取失敗 ({doctor_name} {doc_no}): {e}")
         delay, cnt = _source_backoff_fail(
