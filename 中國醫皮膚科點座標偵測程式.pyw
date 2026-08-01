@@ -35,6 +35,23 @@ def _report_startup_crash(program_name):
         pass
 
 
+def _recover_incomplete_update():
+    """[外審 P1-01] ★在 import 任何 cmuh_common 之前★ 把上一批沒走完的更新收乾淨。
+
+    ★這一支【不擋啟動】，與臨床主程式不同★
+    主程式是有人看著的，復原不完整會跳窗問人（見該檔）。這一支是
+    非臨床、不碰 HIS 寫入的工具程式，跳一個沒有人會按的視窗只會讓行程卡在那裡、
+    連重試的機會都沒有 —— 比帶著混版跑更糟。所以這裡只做「修磁碟 ＋ 留紀錄」。
+    """
+    try:
+        import bootstrap_recovery
+        bootstrap_recovery.recover_and_report(_HERE, "點座標偵測程式")
+    except Exception:  # noqa: BLE001  復原失敗不可以擋住本程式啟動
+        pass
+
+
+_recover_incomplete_update()
+
 try:
     runpy.run_path(os.path.join(_SRC, "coord_detector.py"), run_name="__main__")
 except Exception:  # noqa: BLE001  只攔 Exception；SystemExit（正常退出）照常穿出

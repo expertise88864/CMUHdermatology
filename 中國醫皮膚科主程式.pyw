@@ -43,8 +43,31 @@ def _report_startup_crash(program_name):
         pass
 
 
-try:
-    runpy.run_path(os.path.join(_SRC, "main.py"), run_name="__main__")
-except Exception:  # noqa: BLE001  只攔 Exception；SystemExit（正常退出）照常穿出
-    _report_startup_crash("主程式")
-    raise
+def _recover_incomplete_update():
+    """[外審 P1-01] ★在 import 任何東西之前，把上一批沒走完的更新收乾淨★
+
+    原本的復原在 `check_and_update()` 裡，那時 main.py 早就把幾十個 cmuh_common
+    模組 import 進記憶體了 —— 半套更新的模組已經在跑，復原換掉磁碟上的檔案也
+    來不及；若混到連 import 都失敗，根本走不到那一行。
+
+    bootstrap_recovery 只用標準庫、不 import cmuh_common（那正是可能壞掉的東西）。
+    它自己壞掉時回 UNKNOWN 而不是拋例外，所以這裡不需要 try —— 但仍然包起來，
+    因為「復原模組不見了」（例如它自己被更新到一半）也必須能啟動並看得到原因。
+    """
+    try:
+        import bootstrap_recovery
+    except Exception:  # noqa: BLE001
+        _report_startup_crash("主程式（更新復原模組載入失敗）")
+        return True    # ★載不到就不擋★ 擋住等於用一個未知狀態換掉診間的可用性
+    result = bootstrap_recovery.recover_and_report(_HERE, "主程式")
+    if result.safe_to_start:
+        return True
+    return bootstrap_recovery.confirm_start_despite(result, "主程式")
+
+
+if _recover_incomplete_update():
+    try:
+        runpy.run_path(os.path.join(_SRC, "main.py"), run_name="__main__")
+    except Exception:  # noqa: BLE001  只攔 Exception；SystemExit（正常退出）照常穿出
+        _report_startup_crash("主程式")
+        raise

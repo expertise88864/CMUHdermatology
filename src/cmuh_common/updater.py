@@ -98,6 +98,25 @@ class _WrittenFile:
     staged_path: str = ""
 
 
+@dataclass
+class RollbackOutcome:
+    """回滾的結果。★用具名欄位而不是 tuple★
+
+    2026-08-02：這裡本來是 3-tuple，這一批要再加一類（`terminal`）。上一批
+    （reg52）就是因為改動一個多回傳值的函式、漏改其中一條 return 而讓呼叫端
+    解包炸掉。多一個欄位不會讓任何呼叫端解包錯位，這個型別就是為此存在的。
+
+    * `restored`  真的還原回舊版的檔（★誠實計數★，不含「崩潰時還沒輪到」的）
+    * `unresolved` 這次沒還原成功、但【下次可能會成功】（防毒/權限暫時鎖住）
+    * `terminal`  救不回來的（備份不存在、或日誌路徑落在程式目錄外）
+    * `errors`    給人看的訊息，涵蓋上面兩類失敗
+    """
+    errors: list
+    unresolved: list
+    restored: list
+    terminal: list
+
+
 _FILE_OP_RETRY_DELAYS_SEC = (0.05, 0.15, 0.35)
 
 
@@ -350,13 +369,30 @@ def _recover_locked(app_dir: str, path: str, restored: "list[str]") -> "list[str
         logging.warning(
             "[更新] ★偵測到未完成的更新★（交易日誌 %s，%d 個檔，開始於 %s）→ 回滾到更新前的版本",
             os.path.basename(path), len(files), payload.get("started", "?"))
-        written = [_WrittenFile(str(item.get("target") or ""),
-                                bool(item.get("existed_before")),
-                                str(item.get("staged") or ""))
-                   for item in files if item.get("target")]
+        # ★[2026-08-02 外審 P1-01] 日誌裡的絕對路徑不可以照單全收★
+        #   正常情況下這個檔是自己寫的，但它就是磁碟上一個普通的 JSON。被改過
+        #   （或被別的東西寫壞）而程式又以管理員身分執行時，「照著日誌把 A 換成 B」
+        #   等於任意檔案覆寫／刪除。所以每一筆都要確認 target 在程式目錄底下。
+        written = []
+        rejected: list[str] = []
+        for item in files:
+            target = str(item.get("target") or "")
+            if not target:
+                continue
+            if not _is_inside_app_dir(app_dir, target):
+                rejected.append(target)
+                continue
+            written.append(_WrittenFile(target,
+                                        bool(item.get("existed_before")),
+                                        str(item.get("staged") or "")))
+        if rejected:
+            logging.error("[更新] ★交易日誌裡有 %d 筆路徑不在程式目錄內，已拒絕還原★ "
+                          "（日誌可能被竄改或寫壞）：%s",
+                          len(rejected), "; ".join(rejected[:3]))
         # reversed()：與 in-process 的回滾順序一致
-        errors, unresolved, rolled_back = _rollback_written_files(
-            written, from_journal=True)
+        outcome = _rollback_written_files(written, from_journal=True)
+        errors, unresolved, rolled_back = (
+            outcome.errors, outcome.unresolved, outcome.restored)
         # ★措辭鐵律★ 只報【真的動過】的檔：崩潰點之後那些根本沒被替換過的
         #   不算「已回滾」，說成回滾了是在誇大這支程式做過的事。
         restored.extend(rolled_back)
@@ -373,14 +409,57 @@ def _recover_locked(app_dir: str, path: str, restored: "list[str]") -> "list[str
         #   等於把唯一的修復機會丟掉。改成把日誌【改寫成只剩沒還原成功的那幾個檔】：
         #   下次啟動會只重試它們，不會重覆回滾已經還原好的（那正是當初無條件清掉
         #   要避免的「每次啟動噴一批 error」）。
+        #   ★[2026-08-02 外審 P1-01] 「救不回來」不等於「結案」★
+        #   `terminal`（備份不見了／路徑被拒）的檔重試沒有意義，所以它不在
+        #   `unresolved` 裡 —— 但原本的 else 分支會因此把日誌【刪掉】，磁碟上
+        #   還是新舊混合，卻連「發生過什麼」的唯一證據也沒了。改成把日誌改名
+        #   保留：不會讓下次啟動無止盡重試，但事後查得到。
         if unresolved:
             _rewrite_journal_for_retry(app_dir, unresolved)
+        elif outcome.terminal or rejected:
+            _archive_failed_journal(app_dir, outcome.terminal + rejected)
         else:
             _clear_commit_journal(app_dir)
     except Exception:
         logging.error("[更新] 未完成更新的復原程序本身失敗（不影響啟動）",
                       exc_info=True)
     return restored
+
+
+FAILED_JOURNAL_SUFFIX = ".failed.json"
+
+
+def _is_inside_app_dir(app_dir: str, path: str) -> bool:
+    """`path` 是否落在 `app_dir` 底下（符號連結解析後）。判不出來一律回 False。
+
+    ★查不到 ≠ 沒問題★ realpath/commonpath 會在跨磁碟機、路徑不存在等情況丟例外；
+    那時我們無法證明它是安全的，就不要動它。
+    """
+    try:
+        root = os.path.realpath(app_dir)
+        return os.path.commonpath([root, os.path.realpath(path)]) == root
+    except Exception:      # noqa: BLE001
+        return False
+
+
+def _archive_failed_journal(app_dir: str, terminal: "list[str]") -> None:
+    """把救不回來的那一批日誌改名保留（不刪）。
+
+    保留的是【證據】，不是待辦：改了名之後 `recover_incomplete_update` 就不會再
+    找到它，所以不會每次啟動重跑一次註定失敗的回滾。
+    """
+    path = _journal_path(app_dir)
+    try:
+        os.replace(path, path + FAILED_JOURNAL_SUFFIX)
+        logging.error("[更新] ★有 %d 個檔案永久無法還原★ 磁碟上可能是新舊混合的版本；"
+                      "交易日誌已改名保留為 %s%s 供事後追查：%s",
+                      len(terminal), os.path.basename(path),
+                      FAILED_JOURNAL_SUFFIX, "; ".join(terminal[:3]))
+    except OSError as e:
+        # 改名失敗就把它留在原地：下次啟動會再跑一次（會噴同樣的 error），
+        # 但★絕不刪掉★ —— 沒有標記比重覆報錯更糟。
+        logging.error("[更新] 有 %d 個檔案永久無法還原，且交易日誌改名失敗（%s）→ "
+                      "保留原日誌", len(terminal), e)
 
 
 def _rewrite_journal_for_retry(app_dir: str,
@@ -406,8 +485,8 @@ def _rewrite_journal_for_retry(app_dir: str,
 def _rollback_written_files(
         written_files: list[_WrittenFile],
         *, from_journal: bool = False,
-) -> "tuple[list[str], list[_WrittenFile], list[str]]":
-    """把已經換掉的檔還原回去。→ (錯誤訊息, 【沒有】還原成功的檔, 真的還原了的路徑)。
+) -> RollbackOutcome:
+    """把已經換掉的檔還原回去。→ `RollbackOutcome`。
 
     ★[2026-08-01 外審 P1] 第二個回傳值是必要的★ 呼叫端要據此決定「交易日誌能不能
     清掉」：只要還有檔沒還原成功，日誌就得留著，否則那個混版本再也沒人會去修。
@@ -430,6 +509,7 @@ def _rollback_written_files(
     errors: list[str] = []
     unresolved: list[_WrittenFile] = []
     restored: list[str] = []
+    terminal: list[str] = []
     for written in reversed(written_files):
         backup_path = written.target_path + ".bak"
         name = os.path.basename(written.target_path)
@@ -455,7 +535,10 @@ def _rollback_written_files(
                        "（這個檔已經被換成新版，而備份不見了 → 救不回來）")
                 logging.error("更新回滾失敗 [%s]: %s", written.target_path, msg)
                 errors.append(f"[rollback] {written.target_path}: {msg}")
-                # ★刻意【不】放進 unresolved★ 備份不會自己長回來，重試沒有意義
+                # ★刻意【不】放進 unresolved★ 備份不會自己長回來，重試沒有意義。
+                #   但它要進 `terminal`：呼叫端得知道「有檔案永久回不去了」，
+                #   才不會把交易日誌當成乾淨結案而刪掉（2026-08-02 外審 P1-01）。
+                terminal.append(written.target_path)
                 continue
         try:
             if written.existed_before:
@@ -467,7 +550,8 @@ def _rollback_written_files(
             logging.error("更新回滾失敗 [%s]: %s", written.target_path, e)
             errors.append(f"[rollback] {written.target_path}: {e}")
             unresolved.append(written)   # 這類（鎖住/權限）下次可能就成功了
-    return errors, unresolved, restored
+    return RollbackOutcome(errors=errors, unresolved=unresolved,
+                           restored=restored, terminal=terminal)
 
 
 def _commit_sha_cache_path() -> str:
@@ -844,10 +928,26 @@ def check_and_update(
     # ★[P1-08 2026-08-01] 先復原上一批沒走完的更新★
     #   在【檢查/下載之前】做：否則這一輪會拿半套的磁碟狀態去比對版本，
     #   有可能因為 version.py 已經是新的而判定「不需要更新」→ 半套狀態就這樣留著。
+    #   ★[2026-08-02 外審 P1-01] 復原沒收乾淨就【不要】再套用新的一批★
+    #   原本無論復原結果如何都繼續往下跑。可是「上一批只回滾了一半」＋「這一批
+    #   再寫進去」＝ 新版蓋在半舊的樹上，而 .bak 鏈已經斷了：出事就再也回不去。
+    #   判斷依據刻意用【磁碟上還有沒有交易日誌】而不是回傳值 —— 那是真相本身，
+    #   而且 `recover_incomplete_update` 內部已經吞掉所有例外、回傳值反映不了失敗。
+    #   註：救不回來（terminal）的情況日誌會被改名成 .failed.json，這裡就看不到它，
+    #   於是更新照常進行 —— 那是對的：整批換成新版正是修好混版最有效的辦法。
     try:
         recover_incomplete_update()
     except Exception:
-        logging.debug("[更新] 復原未完成更新失敗（續行檢查）", exc_info=True)
+        logging.error("[更新] 復原未完成更新失敗", exc_info=True)
+    try:
+        if os.path.exists(_journal_path(get_app_dir())):
+            msg = ("[journal] 上一批更新尚未完全回滾（交易日誌還在）→ "
+                   "本輪不套用新的更新，等它收乾淨再說")
+            logging.error("[更新] ★%s★", msg)
+            result.errors.append(msg)
+            return result
+    except Exception:
+        logging.error("[更新] 檢查交易日誌是否殘留時失敗", exc_info=True)
 
     def _progress(stage: str, info: str = "") -> None:
         if progress_callback:
@@ -1173,8 +1273,8 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
             break
 
     if result.errors:
-        rollback_errors, unresolved, _rolled = _rollback_written_files(
-            written_files)
+        rb = _rollback_written_files(written_files)
+        rollback_errors, unresolved = rb.errors, rb.unresolved
         result.errors.extend(rollback_errors)
         result.updated_files.clear()
         # 清掉任何殘留、尚未 replace 的 .upd.tmp
@@ -1214,8 +1314,8 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
         #   回滾完磁碟＝舊版，跟記憶體裡的舊模組一致，連重啟都不需要。
         result.errors.append(
             "[journal] 交易日誌清不掉 → 整批回滾（磁碟與記憶體都保持在舊版）")
-        rb_errors, rb_unresolved, _rb_done = _rollback_written_files(
-            written_files)
+        _rb = _rollback_written_files(written_files)
+        rb_errors, rb_unresolved = _rb.errors, _rb.unresolved
         result.errors.extend(rb_errors)
         result.updated_files.clear()
         if rb_unresolved:

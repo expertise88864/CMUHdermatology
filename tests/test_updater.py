@@ -300,16 +300,18 @@ def test_rollback_written_files_restores_existing_and_removes_new(tmp_path):
     assert real_atomic_write_text(str(existing), "new") is True
     assert real_atomic_write_text(str(created), "created") is True
 
-    # [2026-08-01] 回傳值擴成 (錯誤, 待重試, 真的還原了的) —— 呼叫端要靠第二個
-    # 決定交易日誌能不能清掉，第三個才是誠實的「回滾了幾個」。
-    errors, unresolved, restored = updater._rollback_written_files([
+    # [2026-08-02] 從 3-tuple 改成 RollbackOutcome：呼叫端要靠 `unresolved`
+    # 決定交易日誌能不能清掉、靠 `terminal` 決定要不要改名保留證據，
+    # 而 `restored` 才是誠實的「真的回滾了幾個」。
+    out = updater._rollback_written_files([
         updater._WrittenFile(str(existing), True),
         updater._WrittenFile(str(created), False),
     ])
 
-    assert errors == []
-    assert unresolved == []
-    assert set(restored) == {str(existing), str(created)}
+    assert out.errors == []
+    assert out.unresolved == []
+    assert out.terminal == []
+    assert set(out.restored) == {str(existing), str(created)}
     assert existing.read_text(encoding="utf-8") == "old"
     assert not created.exists()
 
