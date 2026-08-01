@@ -745,3 +745,113 @@ def test_it_does_not_grab_input():
     code = "\n".join(
         line.split("#", 1)[0] for line in inspect.getsource(sb).splitlines())
     assert "grab_set" not in code
+
+
+# ─── ★[2026-08-05 外審 P1] 擺錯視窗:winfo_id() 不是最外層★ ────────────────
+# 使用者連續兩次回報「副螢幕沒黑／只黑三分之一」,前兩次都改錯了地方。真正的成因是
+# `SetWindowPos` 下在 Tk 的【子】視窗上,而使用者看到的是外面那層 wrapper ——
+# 於是那一整段 Win32 擺放對畫面【毫無作用】,黑幕就停在 Tk 自己擺的位置。
+#
+# 本機實測(overrideredirect Toplevel,先 geometry 200x150+50+50,
+# 再對 winfo_id() 下 SetWindowPos 到 700,300,400,250):
+#     子視窗 rect = (750, 350, 400, 250)   ← 座標相對父視窗,所以整整差了 (50,50)
+#     最外層 rect = ( 50,  50, 200, 150)   ← 使用者看到的這個動都沒動
+#
+# ★而且回讀也讀錯視窗★ 原本回讀的同樣是 winfo_id(),它只差 50px,對真正的失敗
+# (外層完全沒動)毫無察覺 —— 守衛讀錯對象時比沒有守衛更危險,因為它讓人以為驗過了。
+@pytest.mark.skipif(os.name != "nt", reason="Tk 的 wrapper 階層是 Windows 專有")
+def test_the_outermost_hwnd_is_not_the_one_winfo_id_returns(tk_root):
+    """★這就是前兩次都沒修對的那件事★"""
+    import tkinter as tk
+    win = tk.Toplevel(tk_root)
+    try:
+        win.overrideredirect(True)
+        win.geometry("200x150+50+50")
+        win.update_idletasks()
+        outer = sb._toplevel_hwnd(win)
+        assert outer, "拿不到最外層 HWND"
+        assert outer != int(win.winfo_id()), \
+            "winfo_id() 若真的就是最外層,這個修正才會是多餘的"
+        import ctypes
+        assert int(ctypes.windll.user32.GetParent(outer) or 0) == 0, \
+            "最外層再往上不該還有父視窗"
+    finally:
+        win.destroy()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要真的 Win32 視窗")
+def test_a_panel_at_a_nonzero_origin_actually_lands_there(tk_root, caplog):
+    """非零原點(副螢幕的原點永遠不是 0)時仍要落在要求的矩形上。
+
+    ★誠實記下這支【抓不到】上面那個 P1★
+    量過了:突變回 `winfo_id()` 之後這支照樣綠。因為建立流程跑完時,Tk 會把子視窗
+    重新鋪滿 wrapper 的 client 區,子視窗與最外層完全重合 —— 單螢幕開發機上
+    Tk 的 `wm geometry` 本來就擺對了,錯的程式與對的程式看起來一模一樣。
+    真正釘住 P1 的是下面兩支(`..._holds_the_outermost_hwnds`／
+    `..._uses_the_resolved_toplevel_hwnd`),它們比對的是「動到哪個 HWND」。
+
+    那這支留著做什麼:它涵蓋的是非零原點這條路本身(副螢幕、負座標),
+    跟 P1 是兩件事,不該因為 P1 有別人釘就把它拿掉。
+    """
+    import logging as _lg
+    want = (300, 200, 500, 400)
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [want])
+    try:
+        with caplog.at_level(_lg.WARNING):
+            assert bo.show() is True
+        assert bo.panel_rects() == [want], \
+            "非零原點時仍要落在要求的矩形上(擺錯視窗的話會差一個父視窗的位移)"
+        assert not any("沒有蓋到要求的範圍" in r.getMessage()
+                       for r in caplog.records)
+    finally:
+        bo.hide()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="需要真的 Win32 視窗")
+def test_the_hotkey_gate_holds_the_outermost_hwnds(tk_root):
+    """★閘門也要拿對視窗★ `_hwnds` 是給【非 Tk 緒】用 IsWindowVisible 判斷
+    「現在黑著沒有」的唯一依據。存成子視窗的話,問的就不是使用者看到的那個。"""
+    bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
+                           rects_fn=lambda: [(300, 200, 500, 400)])
+    try:
+        assert bo.show() is True
+        assert bo._hwnds, "要記得住 HWND,否則熱鍵閘門會失效"
+        # strict=True：一片黑幕對一個 HWND，長度對不上本身就是 bug
+        for win, hwnd in zip(bo._wins, bo._hwnds, strict=True):
+            assert hwnd == sb._toplevel_hwnd(win)
+            assert hwnd != int(win.winfo_id())
+    finally:
+        bo.hide()
+
+
+def test_placement_uses_the_resolved_toplevel_hwnd():
+    """釘住呼叫端:hwnd 由 `_toplevel_hwnd()` 解析後傳進去,不是在裡面自己抓。
+
+    (原本 `_place_and_verify` 自己呼叫 `win.winfo_id()` —— 抓錯對象的地方就在那。)
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    def _code_only(fn) -> str:
+        """只看【會執行的程式碼】—— docstring 與註解不算數。
+
+        (這一支第一次就踩到:`_place_and_verify` 的 docstring 裡本來就寫著
+         「不可以是 win.winfo_id()」,於是斷言比對到自己的說明文字。
+         這個 repo 反覆出現的形狀,所以用 AST 剝掉而不是靠眼睛。)
+        """
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef, ast.Module)):
+                body = getattr(node, "body", [])
+                if (body and isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant)
+                        and isinstance(body[0].value.value, str)):
+                    node.body = body[1:] or [ast.Pass()]
+        return ast.unparse(ast.fix_missing_locations(tree))
+
+    assert "_toplevel_hwnd(win)" in _code_only(sb.ScreenBlackout._create)
+    assert "winfo_id" not in _code_only(sb.ScreenBlackout._place_and_verify), \
+        "擺放不可以再自己去拿 winfo_id()"

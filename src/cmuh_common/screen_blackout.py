@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
 import threading
 import time
 from ctypes import wintypes
@@ -158,6 +159,52 @@ def monitor_rects() -> list:
         logging.warning("[黑幕] 列舉實體螢幕失敗 → 退回單一虛擬桌面矩形",
                         exc_info=True)
     return [virtual_screen_rect()]
+
+
+def _toplevel_hwnd(win) -> int:
+    """Tk 視窗的【最外層】HWND —— `winfo_id()` 不是它。
+
+    ★[2026-08-05 外審 P1；在這台機器上實測過]★
+    `winfo_id()` 回的是 Tk 的【子】視窗，外面還包著一層 wrapper，而使用者看到、
+    視窗管理員擺放的是那個 wrapper。實測（overrideredirect 的 Toplevel，先用
+    `geometry("200x150+50+50")` 擺好，再對 `winfo_id()` 下
+    `SetWindowPos(..., 700, 300, 400, 250)`）：
+
+        winfo_id() = 28903904，GetParent → 4260118（最外層）
+        子視窗 rect  = (750, 350, 400, 250)   ← 座標是【相對父視窗】的，所以差了 (50,50)
+        最外層 rect  = ( 50,  50, 200, 150)   ← 使用者看到的這個【動都沒動】
+
+    也就是說對 `winfo_id()` 下 SetWindowPos 對畫面【毫無作用】，黑幕就停在 Tk 自己
+    用 `wm geometry` 擺的位置／大小。而「Tk 擺得不對」正是引進這段 Win32 擺放的理由
+    （多螢幕不同縮放）—— 修正等於沒有生效，使用者才會連兩次回報「副螢幕沒黑」。
+
+    ★為什麼回讀沒有抓到★（同樣是量出來的，不是推的）
+    建立流程跑完之後再量，子視窗會回到與最外層【完全重合】的位置 —— Tk 會把子視窗
+    重新鋪滿 wrapper 的 client 區，把上面那次 SetWindowPos 蓋掉。所以回讀 `winfo_id()`
+    其實讀得到「使用者看到的那個矩形」，它並不是瞎的；它讀不出來的是
+    **SetWindowPos 根本沒有生效**。單螢幕開發機上 Tk 自己就擺對了，兩邊都對得上，
+    於是這個 bug 在本機測試裡完全看不見 —— 這也是為什麼它只在實機浮現。
+
+    本 repo 早就知道這件事：`platform_win._tk_toplevel_hwnd()` 就是為了同一個理由
+    才走 GetParent 的；這裡當時漏掉了。回 0 代表拿不到（呼叫端要當成失敗處理）。
+    """
+    try:
+        hwnd = int(win.winfo_id())
+    except Exception:
+        logging.debug("[黑幕] 取不到 winfo_id()", exc_info=True)
+        return 0
+    if os.name != "nt":
+        return hwnd
+    try:
+        u = ctypes.windll.user32
+        for _ in range(8):          # 有上限，免得哪天 GetParent 兜成環就轉不出來
+            parent = int(u.GetParent(hwnd) or 0)
+            if not parent:
+                break
+            hwnd = parent
+    except Exception:
+        logging.debug("[黑幕] 走不完 GetParent（沿用 winfo_id）", exc_info=True)
+    return hwnd
 
 
 class ScreenBlackout:
@@ -358,7 +405,7 @@ class ScreenBlackout:
             #   這兩者**不是同一個座標空間**，擺上去就會被縮放成別的大小。
             #   改成查與擺都走 Win32（同一個空間），然後【回讀 GetWindowRect 驗證】。
             #   「送出去就當成功」正是這個 repo 反覆出事的形狀。
-            self._place_and_verify(win, (x, y, w, h), i)
+            self._place_and_verify(win, (x, y, w, h), i, _toplevel_hwnd(win))
             # ★不用 grab_set★：抓住輸入的話，黑幕若沒收乾淨會把整台機器鎖死。
             # ★使用者定案：任何一種都馬上收（滑鼠移動也一樣，不問移了幾 px）
             for seq in ("<Key>", "<Button>", "<MouseWheel>", "<Motion>"):
@@ -366,7 +413,7 @@ class ScreenBlackout:
             win.protocol("WM_DELETE_WINDOW", self._on_wake)
             win.update_idletasks()
             try:
-                hwnds.append(int(win.winfo_id()))
+                hwnds.append(_toplevel_hwnd(win))
             except Exception:
                 # 沒有 HWND 就沒有熱鍵閘門（閘門只能從非 Tk 緒用 Win32 查）→ 寧可不黑屏
                 logging.warning("[黑幕] 拿不到第 %d 片黑幕的 HWND → 熱鍵閘門會失效，"
@@ -390,8 +437,11 @@ class ScreenBlackout:
                      len(wins), rects, self.panel_rects())
         self._schedule_poll()
 
-    def _place_and_verify(self, win, rect, index: int) -> None:
+    def _place_and_verify(self, win, rect, index: int, hwnd: int) -> None:
         """用 Win32 把這一片擺到 rect，然後【回讀 GetWindowRect 驗證】。
+
+        ★`hwnd` 必須是 `_toplevel_hwnd(win)`，不可以是 `win.winfo_id()`★
+        見 `_toplevel_hwnd` 的說明 —— 這是使用者兩次回報「副螢幕沒黑」的真正成因。
 
         ★為什麼不是只用 Tk 的 `wm geometry`★
         螢幕矩形是 `GetMonitorInfo` 給的（Win32 座標空間）。本程式是
@@ -406,9 +456,9 @@ class ScreenBlackout:
         下次使用者回報「蓋不滿」，log 直接就能判斷是算錯還是被改掉。
         """
         x, y, w, h = rect
-        try:
-            hwnd = int(win.winfo_id())
-        except Exception:
+        if not hwnd:
+            logging.warning("[黑幕] 第 %d 片拿不到最外層 HWND → 沿用 Tk 的擺法",
+                            index + 1)
             return
         try:
             u = ctypes.windll.user32

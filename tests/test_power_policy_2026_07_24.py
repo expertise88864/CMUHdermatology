@@ -52,11 +52,17 @@ def test_power_plan_commands(monkeypatch):
                         lambda cmd, **k: (runs.append(list(cmd)), _CP())[1])
     main._apply_never_sleep_power_plan()
     joined = [" ".join(c) for c in runs]
-    # ★[2026-07-31 使用者定案] 不可以再碰 monitor-timeout★
-    #   使用者要求刪除 15 分鐘進入螢幕關閉的模式，並定案【兩層都刪、螢幕只由
-    #   設定頁的按鈕控制】。本程式不再設定機器的螢幕逾時。
-    assert not any("monitor-timeout" in j for j in joined), \
-        "螢幕逾時已改由使用者自己的 Windows 設定決定，本程式不得覆寫"
+    # ★[2026-07-31 使用者定案；2026-08-05 外審 P2 修正] 螢幕逾時要設 0★
+    #   使用者要求刪除 15 分鐘進入螢幕關閉的模式，定案【兩層都刪、螢幕只由設定頁的
+    #   按鈕控制】。第一版把指令拿掉就算數 —— 而這支測試當時也只斷言「沒有送
+    #   monitor-timeout」，於是【綠燈，但使用者要刪的東西還在機器上】：
+    #   `powercfg /change` 寫的是電源計畫，舊版寫下的 15 分鐘不會因為改版而消失。
+    #   要真的做到「只由按鈕控制」，OS 的計時器就得是關的 → 設 0。
+    assert "powercfg /change monitor-timeout-ac 0" in joined
+    assert "powercfg /change monitor-timeout-dc 0" in joined
+    assert not any("monitor-timeout" in j and not j.endswith(" 0")
+                   for j in joined), \
+        "只准設 0（永不自動關）；設成任何分鐘數都等於把 15 分鐘那層裝回來"
     # 主機永不睡/不休眠
     assert "powercfg /change standby-timeout-ac 0" in joined
     assert "powercfg /change standby-timeout-dc 0" in joined
@@ -189,8 +195,26 @@ def test_the_automatic_screen_off_layers_are_really_gone():
                  "_screen_off_due", "SCREEN_OFF_MINUTES", "_SC_MONITORPOWER",
                  "_log_display_power_requests", "_request_blackout"):
         assert gone not in names, f"{gone} 已由使用者刪除，不可再出現"
-    assert not any("monitor-timeout" in s for s in literals), \
-        "螢幕逾時已改由使用者自己的 Windows 設定決定，本程式不得覆寫"
+    # ★[2026-08-05 外審 P2] 這裡原本斷言「main.py 不准出現 monitor-timeout 字樣」★
+    #   那是把「不提它」當成「已經刪掉它」。實際上舊版寫進電源計畫的 15 分鐘會留在
+    #   機器上，不送指令＝不會消失 —— 測試綠、而使用者要刪的東西還在。
+    #   要釘的其實是「不存在任何『N 分鐘後自動關螢幕』」，所以改成:凡是
+    #   monitor-timeout 的設定值都必須是 0（永不自動關）。
+    pairs = [
+        (elt.elts[0].value, elt.elts[1].value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "cmds"
+                for t in node.targets)
+        for elt in getattr(node.value, "elts", [])
+        if isinstance(elt, ast.Tuple) and len(elt.elts) == 2
+        and all(isinstance(e, ast.Constant) for e in elt.elts)
+    ]
+    timeouts = [(k, v) for k, v in pairs if "monitor-timeout" in str(k)]
+    assert timeouts, "找不到 monitor-timeout 設定 —— 舊版寫下的 15 分鐘就沒人清掉"
+    for key, val in timeouts:
+        assert str(val) == "0", \
+            f"{key}={val} —— 只准 0（永不自動關）；任何分鐘數都等於把那層裝回來"
     assert not hasattr(main, "_force_screen_off_watchdog")
 
 
