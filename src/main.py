@@ -169,6 +169,7 @@ from cmuh_common.retention import default_rules as _retention_default_rules
 # cmuh_common/reg52_parse.py（10 個純函式 + 6 條 regex 常數）。
 # 只搬家、不改呼叫端（沿用舊的私有名）。
 from cmuh_common.reg52_contract import (
+    classify_dayoff_html as _classify_dayoff_html,
     classify_main_html as _classify_main_html,
 )
 from cmuh_common.reg52_parse import (
@@ -7095,6 +7096,24 @@ class Reg52BackoffActive(Exception):
     pass
 
 
+def _reg52_stale_fallback(cache_key, label, degraded):
+    """退回「超過 TTL 但還在容忍窗內」的舊快取，★並且記下這個來源已降級★。
+
+    [2026-08-02 外部 code review P1-04]
+    原本每個退回點都直接呼叫 `_cache_get(..., REG52_STALE_CACHE_SECONDS, ...)`，
+    拿到就當一般資料往下走 —— 呼叫端完全看不出這一筆是 15 分鐘前的。
+    整位醫師最後仍以 `is_live_final=True` 送出，而那正是止掛提醒【可以寄信】
+    的資格條件：主院是即時的、東區其實是 15 分鐘前的，系統卻當成一次
+    「完整成功的即時資料」，於是用過期的掛號數寄出止掛提醒。
+
+    ★TTL 內的快取不算降級★ 那是設計上的新鮮度；這裡專指【超過 TTL】的退路。
+    """
+    value = _cache_get(cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)
+    if value:
+        degraded.add(label)
+    return value
+
+
 def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorConfig):
     session = _get_thread_local_reg52_session()
     doctor_name = doctor_config["name"]
@@ -7146,6 +7165,10 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
             # 「這一輪主表是新抓回來的」——只有新抓的才需要在解析後判定語意並寫快取。
             # 用快取／stale 進來的不必再判一次（它們當初就是通過判定才存進去的）。
             main_fetched_fresh = False
+            # ★[2026-08-02 外審 P1-04] 哪些來源這一輪其實是舊資料★
+            #   只要有任何一個來源退回 stale，這位醫師就【不是】完整的即時資料，
+            #   不可以取得止掛提醒的寄信資格。
+            degraded_sources: set = set()
             # backoff key 在兩條抓取路徑裡各自定義；解析後的判定也要用它，
             # 所以提到這裡統一宣告（值是決定性的，不依賴走了哪一條）。
             sk_main = f"main:{doc_no}"
@@ -7185,7 +7208,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                     sess = _get_thread_local_reg52_session()
                     ok_main, remain_main = _source_backoff_allow(sk_main)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                     if not ok_main:
-                        stale = _cache_get(cache_main_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
+                        stale = _reg52_stale_fallback(cache_main_key, "main", degraded_sources)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         if stale is not None:
                             source_timing["backoff_skip"] += 1  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                             # ★三元組★ 這條 backoff-stale 分支上一版漏改，
@@ -7207,7 +7230,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                             REG52_MAIN_BACKOFF_MAX_SECONDS,
                         )
                         logging.warning(f"[BACKOFF] main fetch fail {doctor_name} {doc_no}, fail={cnt}, delay={delay:.1f}s")
-                        stale = _cache_get(cache_main_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
+                        stale = _reg52_stale_fallback(cache_main_key, "main", degraded_sources)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         if stale is not None:
                             source_timing["backoff_skip"] += 1  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                             return stale, int((time.perf_counter() - t0) * 1000), False
@@ -7226,7 +7249,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                     sk_dayoff = f"dayoff:{doc_no}"
                     ok_dayoff, _ = _source_backoff_allow(sk_dayoff)
                     if not ok_dayoff:
-                        stale = _cache_get(dayoff_cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
+                        stale = _reg52_stale_fallback(dayoff_cache_key, "dayoff", degraded_sources)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         return (stale or ""), 0, True
                     try:
                         with _reg52_cmuh_fetch_sema:
@@ -7235,6 +7258,22 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                                 dayoff_response.raise_for_status()
                                 dayoff_response.encoding = "big5"
                                 hd = dayoff_response.text
+                        # ★[2026-08-02 外審 P1-03] HTTP 200 不代表這是休診表★
+                        #   維護頁/登入頁/空殼頁都是 200。原本抓完就寫快取並清
+                        #   退避 —— 壞頁會蓋掉上一份好的休診資料，而休診覆蓋
+                        #   消失＝★停診的診次被顯示成正常門診★。
+                        _do = _classify_dayoff_html(hd)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
+                        if not _do.ok:
+                            logging.warning(
+                                "休診表回應不是 reg52 頁（%s）→ 不寫快取、記退避",
+                                _do.describe())
+                            _source_backoff_fail(
+                                sk_dayoff,  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
+                                REG52_EXTERNAL_BACKOFF_BASE_SECONDS,
+                                REG52_EXTERNAL_BACKOFF_MAX_SECONDS,
+                            )
+                            stale = _reg52_stale_fallback(dayoff_cache_key, "dayoff", degraded_sources)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
+                            return (stale or ""), int((time.perf_counter() - t0) * 1000), False
                         _cache_set(dayoff_cache_key, hd)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         _source_backoff_success(sk_dayoff)
                         return hd, int((time.perf_counter() - t0) * 1000), False
@@ -7246,7 +7285,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                             REG52_EXTERNAL_BACKOFF_MAX_SECONDS,
                         )
                         logging.warning(f"[BACKOFF] dayoff fetch fail {doctor_name} {doc_no}, fail={cnt}, delay={delay:.1f}s")
-                        stale = _cache_get(dayoff_cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
+                        stale = _reg52_stale_fallback(dayoff_cache_key, "dayoff", degraded_sources)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         return (stale or ""), int((time.perf_counter() - t0) * 1000), False
 
                 with ThreadPoolExecutor(max_workers=2, thread_name_prefix="r52pair") as pool:
@@ -7262,7 +7301,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                 t0 = time.perf_counter()
                 ok_main, remain_main = _source_backoff_allow(sk_main)
                 if not ok_main:
-                    stale = _cache_get(cache_main_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)
+                    stale = _reg52_stale_fallback(cache_main_key, "main", degraded_sources)
                     if stale is not None:
                         html_main = stale
                         source_timing["main_fetch_ms"] = 0
@@ -7286,7 +7325,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                             REG52_MAIN_BACKOFF_MAX_SECONDS,
                         )
                         logging.warning(f"[BACKOFF] main fetch fail {doctor_name} {doc_no}, fail={cnt}, delay={delay:.1f}s")
-                        stale = _cache_get(cache_main_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)
+                        stale = _reg52_stale_fallback(cache_main_key, "main", degraded_sources)
                         if stale is not None:
                             html_main = stale
                             source_timing["backoff_skip"] += 1
@@ -7306,10 +7345,24 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                                 dayoff_response.raise_for_status()
                                 dayoff_response.encoding = "big5"
                                 html_dayoff = dayoff_response.text
-                            _cache_set(dayoff_cache_key, html_dayoff)
-                            _source_backoff_success(sk_dayoff)
+                            # ★[2026-08-02 外審 P1-03] 同上：先驗語意再寫快取★
+                            _do = _classify_dayoff_html(html_dayoff)
+                            if not _do.ok:
+                                logging.warning(
+                                    "休診表回應不是 reg52 頁（%s）→ 不寫快取、記退避",
+                                    _do.describe())
+                                _source_backoff_fail(
+                                    sk_dayoff,
+                                    REG52_EXTERNAL_BACKOFF_BASE_SECONDS,
+                                    REG52_EXTERNAL_BACKOFF_MAX_SECONDS,
+                                )
+                                html_dayoff = _reg52_stale_fallback(
+                                    dayoff_cache_key, "dayoff", degraded_sources) or ""
+                            else:
+                                _cache_set(dayoff_cache_key, html_dayoff)
+                                _source_backoff_success(sk_dayoff)
                         else:
-                            stale = _cache_get(dayoff_cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)
+                            stale = _reg52_stale_fallback(dayoff_cache_key, "dayoff", degraded_sources)
                             if stale is not None:
                                 html_dayoff = stale
                             source_timing["backoff_skip"] += 1
@@ -7371,9 +7424,9 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                         logging.info(f"[BACKOFF] skip {label} fetch {doctor_name} {doc_no}, remaining={remain_external:.1f}s")
                         source_timing[timing_key] = 0  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         source_timing["backoff_skip"] += 1  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
-                        stale = _cache_get(cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)
+                        stale = _reg52_stale_fallback(cache_key, label, degraded_sources)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         return stale or ""
-                stale = _cache_get(cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)
+                stale = _reg52_stale_fallback(cache_key, label, degraded_sources)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                 external_jobs.append((label, cache_key, fetcher, stale))  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                 return ""
 
@@ -7544,8 +7597,24 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
             # [codex] 這裡才是「完整成功的即時資料」(已併休診覆蓋)→ 唯一可以解鎖遠期止掛
             # 提醒掃描的來源。其他 emit(磁碟快取 fallback / 漸進式部分結果 / 快照重播 /
             # 錯誤)一律維持 is_live_final=False,不得讓掃描拿它們去寄信。
+            #
+            # ★[2026-08-02 外審 P1-04] 「完整成功」原本是【假的】★
+            #   走到這裡只代表「合併之後有資料」，不代表每個來源都是新抓的。
+            #   任何一個分院退回 stale（最久 15 分鐘前）時，這裡照樣宣告
+            #   is_live_final=True —— 而那正是止掛提醒可以寄信的資格條件。
+            #   於是主院是即時的、東區其實是 15 分鐘前的，系統當成一次完整的
+            #   即時資料，用過期的掛號數寄出止掛提醒。
+            #   ★宣稱要對得上實際知道的事★：有來源降級就不是即時資料。
+            #   UI 照樣顯示（醫師看得到號碼），只是不取得寄信資格。
+            live_final = not degraded_sources
+            if degraded_sources:
+                logging.warning(
+                    "[SOURCE] %s 這一輪有來源退回舊資料（%s）→ 不取得止掛提醒的"
+                    "寄信資格（畫面照常顯示）", doctor_name,
+                    "、".join(sorted(degraded_sources)))
             put_ui_message(ui_queue, UiClinicDataMessage(
-                doctor_name=doc_no, data=appointments_by_date, is_live_final=True))
+                doctor_name=doc_no, data=appointments_by_date,
+                is_live_final=live_final))
             return
 
         except Reg52BackoffActive as e:

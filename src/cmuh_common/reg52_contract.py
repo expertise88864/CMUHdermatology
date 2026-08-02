@@ -115,6 +115,80 @@ def classify_auh_html(text) -> FetchOutcome:
     return FetchOutcome(SUCCESS, html=body, length=len(body))
 
 
+def _has_reg52_skeleton(soup) -> bool:
+    """這張頁面有沒有 reg52 的掛號表版面。
+
+    判準與 `reg52_parse.parse_main_hospital_schedule` 找表格的方式【完全一致】——
+    解析器認得的東西，這裡就認；解析器認不得的，這裡就不認。
+    """
+    if soup.select_one("table.schedule"):
+        return True
+    for tbl in soup.find_all("table"):
+        if tbl.select_one("td.timeSlot") and tbl.select_one("td.schBox"):
+            return True
+    return False
+
+
+def _has_east_style_dayoff_table(soup) -> bool:
+    """東區 fh1 的休診表：width=300 的三欄小表，第一欄是民國日期。
+
+    判準抄自 `reg52_parse.parse_doctor_info_dayoff` 的退路 —— 同上，
+    以「解析器讀得懂嗎」為準，不自己另立一套。
+    """
+    import re as _re
+    date_pat = _re.compile(r"(\d{2,3})/(\d{2})/(\d{2})")
+    for tbl in soup.find_all("table"):
+        if str(tbl.get("width") or "").strip() != "300":
+            continue
+        rows = tbl.find_all("tr")
+        if len(rows) < 2:
+            continue
+        cells = rows[1].find_all(["td", "th"])
+        if len(cells) != 3:
+            continue
+        if date_pat.search(cells[0].get_text(" ", strip=True)):
+            return True
+    return False
+
+
+def classify_dayoff_html(text) -> FetchOutcome:
+    """休診表頁。★它就是同一支 reg52.cgi，只是換一個 DocNo★
+    （2026-08-02 外部 code review P1-03）
+
+    【原本的問題】
+    主院掛號表已經做到「分類成功才寫快取」，但休診表這一支還是 HTTP 200 就
+    `_cache_set` ＋ `_source_backoff_success`。維護頁／登入頁／改版空殼頁全是
+    200 —— 壞頁會覆蓋掉上一份好的休診資料，退避還被清掉。
+    後果特別嚴重：★休診覆蓋消失 = 停診的診次被顯示成正常門診★。
+
+    【判準：分兩層，而且「沒有休診」是合法的】
+      1. 有 `table#dayoff` → 這就是休診表
+      2. 有東區式的 width=300 三欄表 → 同上（解析器的退路）
+      3. 兩者都沒有，但有 reg52 掛號表版面 → ★合法的「這位醫師沒有休診」★
+      4. 以上皆非 → 語意無效（維護頁／登入頁／未知版面）
+
+    ★這裡刻意【不】要求一定要有休診表★ 多數醫師多數時候就是沒有休診；
+    把「沒有休診」判成無效，會讓休診來源一路退避到停更 —— 那與壞頁覆蓋
+    造成的傷害一模一樣（停診顯示成正常門診），只是換個方向。
+    """
+    body = str(text or "")
+    if len(body) < MIN_PAGE_CHARS:
+        return FetchOutcome(SEMANTIC_INVALID, reason="page_too_short",
+                            length=len(body))
+    try:
+        from bs4 import BeautifulSoup          # ★延遲載入★ 見 reg52_fetch 說明
+        soup = BeautifulSoup(body, "lxml")
+    except Exception:
+        return FetchOutcome(SEMANTIC_INVALID, reason="parser_unavailable",
+                            length=len(body))
+    if (soup.select_one("table#dayoff")
+            or _has_east_style_dayoff_table(soup)
+            or _has_reg52_skeleton(soup)):
+        return FetchOutcome(SUCCESS, html=body, length=len(body))
+    return FetchOutcome(SEMANTIC_INVALID, reason="missing_reg52_layout",
+                        length=len(body))
+
+
 def classify_main_html(text) -> FetchOutcome:
     """主院掛號表 —— ★判的是【版面在不在】，不是【有沒有診】★
 
@@ -144,10 +218,7 @@ def classify_main_html(text) -> FetchOutcome:
     except Exception:
         return FetchOutcome(SEMANTIC_INVALID, reason="parser_unavailable",
                             length=len(body))
-    if soup.select_one("table.schedule"):
+    if _has_reg52_skeleton(soup):
         return FetchOutcome(SUCCESS, html=body, length=len(body))
-    for tbl in soup.find_all("table"):
-        if tbl.select_one("td.timeSlot") and tbl.select_one("td.schBox"):
-            return FetchOutcome(SUCCESS, html=body, length=len(body))
     return FetchOutcome(SEMANTIC_INVALID, reason="missing_schedule_table",
                         length=len(body))

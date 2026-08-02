@@ -210,15 +210,41 @@ def test_only_final_live_payload_unlocks_scanning():
 
 
 def test_only_final_payload_emit_site_sets_live_flag():
-    """實際 emit 點:只有『完整成功的即時資料』那一處帶 is_live_final=True。
-    (磁碟快取 fallback / 漸進式部分結果 / 快照重播 / 錯誤 payload 都不得帶。)"""
-    src = open(main.__file__, encoding="utf-8").read()
-    assert src.count("is_live_final=True") == 1, \
+    """實際 emit 點:只有『完整成功的即時資料』那一處帶 is_live_final。
+    (磁碟快取 fallback / 漸進式部分結果 / 快照重播 / 錯誤 payload 都不得帶。)
+
+    ★[2026-08-02 外審 P1-04] 判準從「數字串」改成 AST★
+    原本數 `src.count("is_live_final=True")`。兩件事讓它失效:
+      1. 那一處已經不再寫死 True —— 改成 `is_live_final=live_final`,
+         只有【每個來源都新鮮】時才是 True(見 `_reg52_stale_fallback`)。
+      2. 數字串會把【註解裡】提到的 `is_live_final=True` 也算進去 ——
+         測試被說明文字餵飽。
+    ★不變量沒有變★:只有一個 emit 點可以宣告自己是即時資料。改成看 AST。
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(open(main.__file__, encoding="utf-8").read())
+    emits = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == "UiClinicDataMessage"]
+    assert emits, "找不到任何 UiClinicDataMessage(測試失效了)"
+    with_flag = [n for n in emits
+                 if any(kw.arg == "is_live_final" for kw in n.keywords)]
+    assert len(with_flag) == 1, \
         "只能有一個 emit 點宣告自己是完整成功的即時資料"
+
+    # ★不可以再寫死 True★ 必須是算出來的(任一來源退回 stale 就不是即時資料)
+    value = next(kw.value for kw in with_flag[0].keywords
+                 if kw.arg == "is_live_final")
+    assert not (isinstance(value, ast.Constant) and value.value is True), \
+        "is_live_final 不可以寫死成 True"
+
     # 該處必須是 return 前的最終成功 payload(其鄰近有成功 log)
-    idx = src.index("is_live_final=True")
-    assert "successful" in src[max(0, idx - 800):idx], \
-        "is_live_final=True 應只出現在查詢成功的最終 payload"
+    body = inspect.getsource(main.check_appointment_count)
+    idx = body.index("is_live_final=live_final")
+    assert "successful" in body[max(0, idx - 2000):idx], \
+        "宣告即時的那一處應只出現在查詢成功的最終 payload"
 
 
 def test_handler_marks_live_on_final_and_clears_on_non_final():
