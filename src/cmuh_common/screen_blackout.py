@@ -467,7 +467,19 @@ class ScreenBlackout:
             logging.info("[黑幕] 本行程正在跑自動化 → 本輪不黑屏")
             return False
         if self.active:
-            return True
+            # ★[2026-08-02 外審 P1-05A] `active` 是 any(...)，不是「蓋滿了」★
+            #   殘留的 survivor、只剩一片、螢幕排列改變、視窗被移走 —— 這些狀態
+            #   `active` 都是 True。原本這裡直接 `return True`，於是再按一次
+            #   「黑幕」會宣告成功而【完全不重新檢查】：醫師以為螢幕蓋住了，
+            #   實際上一半的病歷還亮著。這正是本檔開頭那段修正想消滅的形狀，
+            #   只是它躲在「已經有黑幕」這條捷徑後面。
+            state = self.coverage_state()
+            if state == COVERAGE_FULLY_VISIBLE:
+                return True
+            logging.warning(
+                "[黑幕] 已有黑幕但不是完整覆蓋（%s）→ 整批拆掉重建", state)
+            # 不是使用者輸入造成的 → 不發喚醒 token
+            self._destroy(issue_wake_token=False)
         try:
             self._create()
         except Exception:
@@ -507,8 +519,29 @@ class ScreenBlackout:
             return COVERAGE_UNKNOWN
         if not alive:
             return COVERAGE_HIDDEN
-        if len(alive) == self._expected_panels and all(
-                p.fully_verified for p in self._panels):
+        # ★[2026-08-02 外審 P1-05B] 不可以用【建立當下】的快照回答「現在」★
+        #   `p.fully_verified` 是建立那一刻量到的。視窗後來被移動、被 resize、
+        #   或使用者插拔螢幕改變排列之後，它仍然是 True —— 於是這一支會回
+        #   FULLY_VISIBLE，而畫面上其實已經露出來了。
+        #   現在改成【當場重讀】每一片的 GetWindowRect，與【當下的】螢幕排列比對。
+        # ★用 `self._rects_fn`，不是模組級的 `monitor_rects()`★
+        #   `_create` 就是用它決定要蓋哪些矩形的（可注入，測試用）。這裡若
+        #   直接問模組級函式，比對的就是【另一組】螢幕 —— 我第一版這樣寫，
+        #   既有測試立刻轉紅（注入了 500x400 的假螢幕，卻拿真螢幕去比）。
+        try:
+            wanted = sorted(self._rects_fn() or [])
+        except Exception:
+            logging.debug("[黑幕] 查不到目前的螢幕排列", exc_info=True)
+            return COVERAGE_UNKNOWN
+        got = []
+        for hwnd in alive:
+            rect = self._window_rect(hwnd)
+            if rect is None:
+                # ★查不到 ≠ 沒事★ 量不到就不可以宣稱蓋滿。
+                logging.debug("[黑幕] HWND %s 回讀不到位置 → 覆蓋狀態未知", hwnd)
+                return COVERAGE_UNKNOWN
+            got.append(rect)
+        if sorted(got) == wanted:
             return COVERAGE_FULLY_VISIBLE
         return COVERAGE_PARTIAL
 
@@ -840,9 +873,14 @@ class ScreenBlackout:
         try:
             u = _u32()
         except Exception:
-            logging.debug("[黑幕] 取不到 user32，無法確認黑幕是否收乾淨",
-                          exc_info=True)
-            return []
+            # ★[2026-08-02 外審 P1-05C] 這裡原本回 []，意思是「都收乾淨了」★
+            #   但真相是「無法確認」。呼叫端會據此清空 `_hwnds`、開放 F1-F12、
+            #   甚至發出喚醒 token —— 而螢幕上可能仍蓋著全黑的畫面，
+            #   熱鍵就在看不見的畫面上對 HIS 動作。
+            #   查不出來時一律把【全部】HWND 當成仍卡著：閘門繼續擋、大聲告警。
+            logging.error("[黑幕] ★取不到 user32，無法確認黑幕是否收乾淨★ "
+                          "保守視為全部仍在，F1-F12 會繼續被擋住", exc_info=True)
+            return list(hwnds)
         for hwnd in hwnds:
             try:
                 if not u.IsWindow(hwnd) or not u.IsWindowVisible(hwnd):

@@ -963,15 +963,26 @@ def test_the_hotkey_gate_stays_conservative(tk_root):
 
 def test_the_coverage_state_distinguishes_partial(tk_root, monkeypatch):
     """★bool 表達不了「蓋了一半」★ 診斷與告警要看得出 PARTIAL。"""
+    screens = [(0, 0, 500, 400)]
     bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(), busy_fn=_Busy(),
-                           rects_fn=lambda: [(0, 0, 500, 400)])
+                           rects_fn=lambda: list(screens))
     assert bo.coverage_state() == sb.COVERAGE_HIDDEN
     try:
         bo.show()
         assert bo.coverage_state() == sb.COVERAGE_FULLY_VISIBLE
         # 假裝應該有兩片、實際只有一片 → PARTIAL
-        bo._expected_panels = 2
+        #
+        # ★[2026-08-02 外審 P1-05B] 模擬手法改了，意圖沒變★
+        #   原本是直接把 `_expected_panels` 撥成 2。那是【建立當下】記下的片數，
+        #   而這一支現在改成「拿當下的螢幕排列去比對回讀到的實際位置」——
+        #   因為舊寫法在視窗被移動/resize、或使用者插拔螢幕之後仍會回
+        #   FULLY_VISIBLE（畫面其實已經露出來了）。
+        #   所以改成【真的多一台螢幕】：這正是那個 finding 描述的情境，
+        #   比撥計數器更貼近實機。
+        screens.append((500, 0, 500, 400))
         assert bo.coverage_state() == sb.COVERAGE_PARTIAL
+        screens.pop()
+        assert bo.coverage_state() == sb.COVERAGE_FULLY_VISIBLE
     finally:
         bo.hide()
     assert bo.coverage_state() == sb.COVERAGE_HIDDEN
