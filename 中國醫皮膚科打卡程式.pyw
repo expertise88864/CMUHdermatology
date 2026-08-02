@@ -12,10 +12,18 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 
-def _report_startup_crash(program_name):
+def _report_startup_crash(program_name, *, show_dialog=True):
     """[EH-01] pythonw 沒有主控台：import／啟動階段的例外會靜默死亡、完全沒有 log，
     診間只看到「雙擊沒反應」。這裡只用標準庫把 traceback 寫進 startup_crash.log 並彈
     MessageBox，讓現場至少看得到錯誤。任何一步失敗都吞掉（best-effort），最後由呼叫端 re-raise。
+
+    ★[2026-08-02 外審第 2 輪 P1] `show_dialog=False` 是給【無人看顧】的路徑用的★
+    `MessageBoxW` 是同步的：這支程式是 ONLOGON 排程（而且 MultipleInstances=
+    IgnoreNew），沒有人會去按那個「確定」—— 行程就永遠停在那裡，走不到
+    `SystemExit(3)`，之後每一次排程又因為 IgnoreNew 被忽略。結果是打卡／會診
+    ★無限期停擺★，而排程紀錄上連一個非零離開碼都看不到。
+    我上一輪為了「留下痕跡」在復原失敗路徑呼叫這一支，等於把自己文件裡
+    寫明禁止的東西（無人看顧不可跳窗）加了回去。
     """
     tb = traceback.format_exc()
     exc = sys.exc_info()[1]
@@ -26,6 +34,8 @@ def _report_startup_crash(program_name):
             f.write(tb)
     except Exception:  # noqa: BLE001  寫 log 失敗不能再擋住彈窗/re-raise
         pass
+    if not show_dialog:
+        return
     try:
         import ctypes
         ctypes.windll.user32.MessageBoxW(
@@ -59,12 +69,14 @@ def _recover_incomplete_update():
     try:
         import bootstrap_recovery
     except Exception:  # noqa: BLE001
-        _report_startup_crash("打卡程式（更新復原模組載入失敗）")
+        _report_startup_crash("打卡程式（更新復原模組載入失敗）",
+                              show_dialog=False)
         return False
     try:
         return bootstrap_recovery.recover_and_report(_HERE, "打卡程式").safe_to_start
     except Exception:  # noqa: BLE001
-        _report_startup_crash("打卡程式（更新復原程序本身失敗）")
+        _report_startup_crash("打卡程式（更新復原程序本身失敗）",
+                              show_dialog=False)
         return False
 
 

@@ -77,6 +77,66 @@ class TestUnknownIsNotSafe:
                 f"{name}：例外分支沒有寫 startup_crash.log")
 
     @pytest.mark.parametrize("name", HIS_INPUT_LAUNCHERS)
+    def test_no_failure_path_pops_a_dialog(self, name):
+        """★[2026-08-02 外審第 2 輪 P1] 我把自己禁止的東西加了回去★
+
+        `_report_startup_crash` 會同步彈 `MessageBoxW`。這兩支是 ONLOGON 排程
+        （而且 MultipleInstances=IgnoreNew）—— 沒有人會按那個「確定」，行程就
+        永遠停在那裡，走不到 SystemExit(3)，之後每次排程又被 IgnoreNew 忽略。
+        結果是打卡／會診★無限期停擺★，排程紀錄上連非零離開碼都看不到。
+        """
+        func = _guard_of(name)
+        for h in [n for n in ast.walk(func)
+                  if isinstance(n, ast.ExceptHandler)]:
+            for call in [n for n in ast.walk(h)
+                         if isinstance(n, ast.Call)
+                         and isinstance(n.func, ast.Name)
+                         and n.func.id == "_report_startup_crash"]:
+                flags = {kw.arg: kw.value for kw in call.keywords}
+                assert "show_dialog" in flags, (
+                    f"{name}：復原失敗路徑沒有關掉彈窗")
+                value = flags["show_dialog"]
+                assert isinstance(value, ast.Constant) and value.value is False, (
+                    f"{name}：★無人看顧的路徑仍會跳窗★")
+
+    @pytest.mark.parametrize("name", HIS_INPUT_LAUNCHERS)
+    def test_the_reporter_actually_honours_the_flag(self, name):
+        """光是傳參數不夠 —— `_report_startup_crash` 本身要真的據此跳過彈窗。"""
+        tree = ast.parse(_read(name))
+        reporter = next(n for n in ast.walk(tree)
+                        if isinstance(n, ast.FunctionDef)
+                        and n.name == "_report_startup_crash")
+        assert any(a.arg == "show_dialog" for a in reporter.args.kwonlyargs), (
+            f"{name}：_report_startup_crash 沒有 show_dialog 參數")
+        # MessageBoxW 必須在「早退」之後才可能被呼叫
+        guards = [n for n in ast.walk(reporter) if isinstance(n, ast.If)
+                  and isinstance(n.test, ast.UnaryOp)
+                  and isinstance(n.test.op, ast.Not)
+                  and isinstance(n.test.operand, ast.Name)
+                  and n.test.operand.id == "show_dialog"
+                  and any(isinstance(x, ast.Return) for x in n.body)]
+        assert guards, f"{name}：show_dialog=False 時沒有早退"
+        boxes = [n for n in ast.walk(reporter)
+                 if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "MessageBoxW"]
+        assert boxes, f"{name}：找不到 MessageBoxW（測試失效了）"
+        assert min(b.lineno for b in boxes) > max(g.lineno for g in guards), (
+            f"{name}：彈窗排在早退之前，旗標形同虛設")
+
+    @pytest.mark.parametrize("name", NON_HIS_LAUNCHERS + [
+        "中國醫皮膚科主程式.pyw"])
+    def test_the_attended_and_untouched_programs_keep_the_dialog(self, name):
+        """★空集合不算通過★ 只有「無人看顧的復原失敗」那條路徑該關掉彈窗；
+        真正的啟動崩潰仍然要讓現場看得到。"""
+        tree = ast.parse(_read(name))
+        boxes = [n for n in ast.walk(tree)
+                 if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "MessageBoxW"]
+        assert boxes, f"{name}：啟動崩潰的彈窗不見了"
+
+    @pytest.mark.parametrize("name", HIS_INPUT_LAUNCHERS)
     def test_the_exit_code_distinguishes_did_not_run(self, name):
         """★「已有一份在跑」用 0，「這一輪沒做事」要非零★
 
