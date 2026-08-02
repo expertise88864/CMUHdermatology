@@ -205,15 +205,25 @@ def _read_rows(path: str) -> IndexRead:
     invalid = 0
     if not os.path.exists(path):
         return IndexRead(rows)
+    # ★[2026-08-02 外審第 2 輪 P1] 一定要【逐列】解碼★
+    #   原本用 text mode 一次 readlines()：只要檔案裡有【任何一列】含非 UTF-8
+    #   位元組，就會在分類之前丟 UnicodeDecodeError。那不是 OSError，所以會
+    #   一路穿到 prune_index 的外層而永遠回 PRUNE_FAILED —— 那一列裡的病歷號
+    #   於是永久留在磁碟上。★這正是本批要消滅的那個形狀，只是換成位元組層級。★
     try:
-        with open(path, encoding="utf-8") as f:
-            lines = f.readlines()
+        with open(path, "rb") as f:
+            raw_lines = f.read().split(b"\n")
     except OSError:
         # ★讀不到 ≠ 沒有資料★ 呼叫端必須知道，否則會拿空的去覆蓋整份索引。
         return IndexRead([], 0, True)
-    for line in lines:
-        line = line.strip()
-        if not line:
+    for raw in raw_lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            line = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            invalid += 1          # 位元組就壞掉了，連當成文字都做不到
             continue
         try:
             obj = json.loads(line)
@@ -377,6 +387,14 @@ def append_index(path: str, *, ts: str, action: str, detail: str, locator,
                 return False
             rows, _expired, _corrupt = _prune(read.rows,
                                               now or datetime.now(), retain_days)
+            if _corrupt or read.invalid:
+                # ★[2026-08-02 外審第 2 輪 P2] append 也會順手清掉壞列★
+                #   不講出來的話：清掃之前先發生一次 mismatch，壞列就被安靜地
+                #   清掉，下一次清掃看到的是乾淨檔案 —— 損毀事件永久不可觀測，
+                #   而「直接刪除但記錄數量」正是不做 quarantine 的前提。
+                logging.warning(
+                    "[locator] 寫入定位索引時順帶清掉 %d 列時間戳異常、"
+                    "%d 列格式損毀", _corrupt, read.invalid)
             rows.append(row)
             _atomic_write_rows(path, rows)
         return True

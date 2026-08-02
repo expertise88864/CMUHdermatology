@@ -11,8 +11,8 @@
 """
 from __future__ import annotations
 
+import io
 import json
-import os
 from datetime import datetime, timedelta
 
 import pytest
@@ -219,11 +219,104 @@ class TestTheTimestampClassifier:
         assert pl._classify_ts(aware, NOW, 30) in ("keep", "expired")
 
 
-def test_the_retention_sweeper_still_reports_it(tmp_path, monkeypatch):
-    """整條路徑：壞列 → prune → sweep 摘要。"""
-    p = tmp_path / "idx.jsonl"
-    _write(p, [_row("zzz")])
-    result = pl.prune_index(str(p), now=NOW)
-    assert result.ok is True          # 有清掉 → 不是失敗
-    assert result.removed == 1
-    assert os.path.exists(str(p))
+class TestByteLevelCorruption:
+    """[2026-08-02 外審第 2 輪 P1] 非 UTF-8 位元組是另一種壞列。"""
+
+    def test_a_line_with_invalid_utf8_does_not_wedge_the_whole_prune(
+            self, tmp_path):
+        """★這是我這批自己漏掉的同型 bug★
+
+        text mode 的 `readlines()` 只要碰到一列含非 UTF-8 位元組就丟
+        `UnicodeDecodeError` —— 那不是 OSError，會一路穿到最外層而永遠回
+        PRUNE_FAILED。那一列裡的病歷號於是永久留在磁碟上。
+        """
+        p = tmp_path / "idx.jsonl"
+        good = _row(_iso(1), chart_no="11111111").encode("utf-8")
+        broken = b'{"ts": "x", "chart_no": "24994923\xff\xfe"}'
+        p.write_bytes(good + b"\n" + broken + b"\n")
+
+        result = pl.prune_index(str(p), now=NOW)
+
+        assert result.status == pl.PRUNE_OK, (
+            f"整份修剪被一列壞位元組卡死了：{result.describe()}")
+        assert result.invalid_removed == 1
+        raw = p.read_bytes()
+        assert b"24994923" not in raw, "★壞位元組那列的病歷號還在磁碟上★"
+        assert b"11111111" in raw, "正常列不該被牽連"
+
+    def test_a_file_that_is_entirely_binary_garbage(self, tmp_path):
+        p = tmp_path / "idx.jsonl"
+        p.write_bytes(b"\x00\x01\xff\xfe 24994923\n\xff\xff\n")
+
+        result = pl.prune_index(str(p), now=NOW)
+
+        assert result.ok is True
+        assert result.corruption_detected is True
+        assert b"24994923" not in p.read_bytes()
+
+
+class TestAppendAlsoReportsCorruption:
+    """[2026-08-02 外審第 2 輪 P2] append 也會順手清掉壞列 —— 要講出來。"""
+
+    def test_append_logs_the_corruption_it_silently_removed(self, tmp_path,
+                                                            caplog):
+        """清掃之前先發生一次 mismatch，壞列就被安靜清掉；下一次清掃看到的是
+        乾淨檔案 → 損毀事件永久不可觀測。而「刪除但記錄數量」正是不做
+        quarantine 的前提。"""
+        p = tmp_path / "idx.jsonl"
+        _write(p, [_row("zzz", chart_no="24994923"), "{壞掉的}"])
+
+        with caplog.at_level("WARNING"):
+            ok = pl.append_index(str(p), ts=_iso(0), action="新", detail="",
+                                 locator={"room": "103"}, now=NOW)
+
+        assert ok is True
+        assert "24994923" not in p.read_text(encoding="utf-8")
+        text = caplog.text
+        assert "時間戳異常" in text and "格式損毀" in text, (
+            f"append 清掉壞列卻沒有留下任何紀錄：{text}")
+        assert "24994923" not in text, "★log 不可以含病歷號★"
+
+    def test_a_clean_append_does_not_warn(self, tmp_path, caplog):
+        """★空集合不算通過★"""
+        p = tmp_path / "idx.jsonl"
+        _write(p, [_row(_iso(1))])
+        with caplog.at_level("WARNING"):
+            pl.append_index(str(p), ts=_iso(0), action="新", detail="",
+                            locator={"room": "103"}, now=NOW)
+        assert "格式損毀" not in caplog.text
+
+
+def test_the_retention_adapter_surfaces_corruption(tmp_path, caplog):
+    """★真的跑 main 的 adapter + sweep，不是只跑 prune_index★
+
+    [2026-08-02 外審第 2 輪 P2] 原本這支叫 `..._sweeper_still_reports_it`
+    卻只呼叫 `prune_index()` —— 名字說的事它根本沒做。
+    `sweep` 的 extra_task 契約只收整數，摘要只會印「定位索引×N」，
+    所以損毀分類必須由 adapter 自己講出來。
+    """
+    import main
+    from cmuh_common.paths import get_conf_path
+    from cmuh_common.retention import sweep
+
+    idx = get_conf_path(main._LOCATOR_INDEX_FILENAME)
+    with io.open(idx, "w", encoding="utf-8", newline="") as f:
+        f.write(_row("zzz", chart_no="24994923") + "\n")
+
+    with caplog.at_level("WARNING"):
+        res = sweep([], extra_tasks=[("定位索引", main._prune_locator_index)])
+
+    assert res.deleted.get("定位索引") == 1
+    assert not res.failed
+
+    # ★[突變驗證抓到] 不可以只斷言「caplog 裡有這個詞」★
+    #   `prune_index` 自己也會記一行含「時間戳異常」的 warning，所以把 adapter
+    #   那一行拿掉，測試照樣綠 —— 它驗的是別人的證據。要指名 adapter 那一行。
+    from_adapter = [r.getMessage() for r in caplog.records
+                    if r.getMessage().startswith("[retention]")]
+    assert from_adapter, "清掃層完全沒有把損毀講出來（只有 locator 自己記）"
+    assert any("時間戳異常" in m for m in from_adapter), (
+        f"清掃摘要看不出有損毀：{from_adapter}")
+    assert "24994923" not in caplog.text
+    with io.open(idx, encoding="utf-8") as f:
+        assert "24994923" not in f.read()

@@ -1579,6 +1579,13 @@ def _prune_locator_index() -> int:
     result = prune_index(get_conf_path(_LOCATOR_INDEX_FILENAME))
     if not result.ok:
         raise RuntimeError(result.describe())
+    if result.corruption_detected:
+        # ★[2026-08-02 外審第 2 輪 P2] 損毀分類不能只留在 PruneResult 裡★
+        #   `sweep` 的 extra_task 契約只收一個整數，摘要因此只會印
+        #   「定位索引×N」—— 看不出那 N 列裡有幾列是時間戳異常／格式損毀。
+        #   而「直接刪除但記錄數量」正是不做 quarantine 的前提條件，
+        #   所以這裡一定要有一行把它講出來（不含任何內容）。
+        logging.warning("[retention] 定位索引：%s", result.describe())
     return result.removed
 
 
