@@ -45,6 +45,14 @@ FAILED_JOURNAL_SUFFIX = ".failed.json"
 LOCK_FILENAME = ".updater_write.lock"
 JOURNAL_SCHEMA = 1
 
+# 每一筆的處置狀態。★不要靠「.bak 還在不在」反推交易狀態★
+#   [2026-08-02 外部 code review P2-05] 回滾用掉 .bak 之後，若清除／改寫日誌
+#   失敗，殘留的日誌下一次啟動會被判成「備份不見了 → 救不回來」——那是
+#   **假的 terminal**，而且會讓整組程式從此每次啟動都要人工覆寫。
+#   狀態必須是被【記下來】的，不是被推論出來的。
+STATE_PENDING = "pending"      # 還沒處理（沒有這個欄位的舊日誌也視為 pending）
+STATE_RESTORED = "restored"    # 已經還原完成 —— 下次啟動要跳過，不可再判它
+
 # 復原結果
 CLEAN = "clean"                      # 沒有交易日誌 —— 上一批正常結束
 RECOVERED = "recovered"              # 有日誌，而且全部回滾成功
@@ -223,6 +231,10 @@ def _parse_journal(payload):
             return None, "交易日誌的項目缺少 target"
         if not isinstance(entry.get("existed_before"), bool):
             return None, "交易日誌的項目缺少 existed_before"
+        state = entry.get("state", STATE_PENDING)
+        if state not in (STATE_PENDING, STATE_RESTORED):
+            # 不認得的狀態不要硬解（同 schema 的理由）
+            return None, f"交易日誌的項目狀態 {state!r} 不認得"
     return files, ""
 
 
@@ -270,6 +282,24 @@ def _record_terminal(app_dir, terminal, errors) -> bool:
     return True
 
 
+def _rewrite_journal_states(app_dir, files, errors) -> None:
+    """把整份日誌（含每一筆的 state）原子性地寫回去。
+
+    ★[2026-08-02 外部 code review P2-05] 每還原一筆就落地一次★
+    這樣中途斷電之後，下一次啟動【看得出】哪幾筆已經做完 —— 不必也不能靠
+    「.bak 還在不在」反推：回滾本身就會把 .bak 用掉，反推只會得到假的 terminal。
+    寫不出來不是致命的（下一次頂多重做已經做過的那幾筆），所以只記一筆錯誤。
+    """
+    payload = {"schema": JOURNAL_SCHEMA,
+               "files": [{"target": e.get("target"),
+                          "existed_before": bool(e.get("existed_before")),
+                          "staged": e.get("staged") or "",
+                          "state": e.get("state", STATE_PENDING)}
+                         for e in files]}
+    if not _atomic_write_json(os.path.join(app_dir, JOURNAL_FILENAME), payload):
+        errors.append("更新交易日誌的處置狀態失敗（下次可能重做已完成的項目）")
+
+
 def _rewrite_journal_for_retry(app_dir, entries, errors) -> None:
     """把日誌縮成「還沒還原成功」的那幾個檔，下次啟動只重試它們。
 
@@ -280,7 +310,8 @@ def _rewrite_journal_for_retry(app_dir, entries, errors) -> None:
     payload = {"schema": JOURNAL_SCHEMA,
                "files": [{"target": e.get("target"),
                           "existed_before": bool(e.get("existed_before")),
-                          "staged": ""}      # 走到這裡的都確定被換過了
+                          "staged": "",      # 走到這裡的都確定被換過了
+                          "state": STATE_PENDING}   # 還沒還原成功 → 下次重試
                          for e in entries]}
     if not _atomic_write_json(os.path.join(app_dir, JOURNAL_FILENAME), payload):
         # 寫不出來就保留原日誌：全部重試一次雖然會誤判，但總比沒有標記好。
@@ -333,11 +364,25 @@ def recover_before_start(app_dir) -> RecoveryResult:
                                       errors=[why])
             restored, unresolved, terminal, errors = [], [], [], []
             retry_entries = []
-            for entry in reversed(files):        # 與寫入相反的順序
+            # ★[2026-08-02 外審 P2-05] 已經還原過的不可以再判一次★
+            #   它的 .bak 早就被 os.replace 吃掉了，再判就是「備份不見了」→
+            #   假的 terminal。這是上一輪清除／改寫日誌失敗時的必然後果。
+            todo = [e for e in files
+                    if e.get("state", STATE_PENDING) != STATE_RESTORED]
+            # 註：`todo` 空的時候（上一輪全部還原完、只是沒清掉日誌）不需要
+            #     特別處理 —— 下面的迴圈不會跑、`restored` 保持空的、
+            #     `_clear_journal` 會再試一次清除，結論就是 RECOVERED。
+            #     ★我原本在這裡加了一段早退，突變驗證顯示它與 fall-through
+            #       完全等價 —— 那是重複的分支，刪掉比替它補測試誠實。★
+            for entry in reversed(todo):         # 與寫入相反的順序
                 verdict = _rollback_one(app_dir, entry, errors)
                 name = os.path.basename(str(entry.get("target") or ""))
                 if verdict == "restored":
                     restored.append(name)
+                    # ★每還原一筆就落地一次★ 中途斷電時，下一次啟動才知道
+                    #   哪幾筆已經做完 —— 不必（也不能）靠 .bak 反推。
+                    entry["state"] = STATE_RESTORED
+                    _rewrite_journal_states(app_dir, files, errors)
                 elif verdict == "retryable":
                     unresolved.append(name)
                     retry_entries.append(entry)

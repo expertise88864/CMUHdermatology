@@ -253,7 +253,7 @@ def _write_commit_journal(app_dir: str, entries: list) -> bool:
             #   復原時用它分辨「.bak 不見」的兩種原因，見 `_rollback_written_files`。
             #   `os.replace(tmp, target)` 會把 tmp 消耗掉，所以 tmp 還在 ⇒ 還沒換過。
             "files": [{"target": t, "existed_before": bool(e),
-                       "staged": s}
+                       "staged": s, "state": "pending"}
                       for t, e, s in (
                           tuple(x) + ("",) * (3 - len(tuple(x)))
                           for x in entries)],
@@ -402,9 +402,15 @@ def _recover_locked(app_dir: str, path: str, restored: "list[str]") -> "list[str
         #   等於任意檔案覆寫／刪除。所以每一筆都要確認 target 在程式目錄底下。
         written = []
         rejected: list[str] = []
+        skipped_done = 0
         for item in files:
             target = str(item.get("target") or "")
             if not target:
+                continue
+            if item.get("state") == "restored":
+                # ★[2026-08-02 外審 P2-05] 上一輪已經還原完的不可以再判★
+                #   它的 .bak 早被用掉了，再判就是假的 terminal。
+                skipped_done += 1
                 continue
             if not _is_inside_app_dir(app_dir, target):
                 rejected.append(target)
@@ -416,6 +422,10 @@ def _recover_locked(app_dir: str, path: str, restored: "list[str]") -> "list[str
             logging.error("[更新] ★交易日誌裡有 %d 筆路徑不在程式目錄內，已拒絕還原★ "
                           "（日誌可能被竄改或寫壞）：%s",
                           len(rejected), "; ".join(rejected[:3]))
+        if skipped_done:
+            # 這代表上一輪其實還原成功了，只是清除／改寫日誌那一步沒做完。
+            logging.info("[更新] 交易日誌裡有 %d 筆上一輪已還原完成 → 跳過"
+                         "（不再判它們，避免誤判成「備份不見了」）", skipped_done)
         # reversed()：與 in-process 的回滾順序一致
         outcome = _rollback_written_files(written, from_journal=True)
         errors, unresolved, rolled_back = (
