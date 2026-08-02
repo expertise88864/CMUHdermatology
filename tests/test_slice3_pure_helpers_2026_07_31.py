@@ -216,9 +216,14 @@ def test_main_still_exposes_the_old_private_names():
     # 它在 main.py 的唯一呼叫端（`_parse_main_hospital_schedule`）也搬進
     # cmuh_common/reg52_parse.py 了，那個呼叫變成模組之間的。
     # 這跟第二刀的 `_window_is_ancestor` 是同一個形狀：搬家會讓別的匯入變成死碼。
+    # [2026-08-02 第五刀(a) 第二批] `_filter_recent_alert_sent` 從這份清單移除 ——
+    # 它在 main.py 的唯一呼叫端（`_load_alert_email_sent`）整支搬進
+    # cmuh_common/alert_state.py 了，別名跟著變成死碼。與上面第四刀的
+    # `_split_schbox_by_date` 是同一個形狀：★呼叫端搬走，別名就沒有存在的理由★
+    # （不是「守衛礙事所以拿掉」）。
     for name in ("_reg52_docno_for_dayoff_table",
                  "_build_east_weekday_index", "_east_index_has_other",
-                 "_filter_recent_alert_sent", "_clinic_refresh_seconds",
+                 "_clinic_refresh_seconds",
                  "_reg64_micro_ttl_seconds", "_tick_delta", "_fmt_uvb_dc",
                  "_his_title_of", "_retention_rules"):
         assert callable(getattr(main, name)), f"{name} 不見了"

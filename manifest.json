@@ -61,6 +61,13 @@
       "sha256": "7f8c9fc7a0f8a554b198c09410006fcabd997fdd527153c8ee0590798aba353e"
     },
     {
+      "key": "cmuh_common.alert_state",
+      "remote_path": "src/cmuh_common/alert_state.py",
+      "local_filename": "src/cmuh_common/alert_state.py",
+      "version": "2026.08.02.4",
+      "sha256": "769dd80573ec870b44a7a4558a85c86db139c3ad106f975ba46dd0ac211195e0"
+    },
+    {
       "key": "cmuh_common.app_settings",
       "remote_path": "src/cmuh_common/app_settings.py",
       "local_filename": "src/cmuh_common/app_settings.py",
@@ -642,6 +649,13 @@
       "sha256": "18704bd57e4eced6211f2a3ac225b6bcbc028d002b66ead1034f2cdee0543ba2"
     },
     {
+      "key": "cmuh_common.tk_widgets",
+      "remote_path": "src/cmuh_common/tk_widgets.py",
+      "local_filename": "src/cmuh_common/tk_widgets.py",
+      "version": "2026.08.02.4",
+      "sha256": "87eb11f2c0a497a960edd8b15ea0b40f1c764d9660b40111a889c2dca67baaa1"
+    },
+    {
       "key": "cmuh_common.ui_messages",
       "remote_path": "src/cmuh_common/ui_messages.py",
       "local_filename": "src/cmuh_common/ui_messages.py",
@@ -723,7 +737,7 @@
       "remote_path": "src/main.py",
       "local_filename": "src/main.py",
       "version": "2026.08.02.4",
-      "sha256": "6c72fd3c43707458a41a976c631bc8ed7f1fe01b7f04893969a1634c8ca45b5f"
+      "sha256": "de50c8ad2c9b3a27eb31db8a0ea3f3ff17bd87ed21244627cc4160de67fc2c40"
     },
     {
       "key": "scheduler",

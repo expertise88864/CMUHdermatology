@@ -135,8 +135,16 @@ from cmuh_common.audit_events import (
 # [P2-06 分層第三刀 2026-07-31] 11 個純函式搬回【已經擁有那個概念的模組】。
 #   不開雜物檔：分層的意義是「東西在該在的地方」，不是「main.py 變短」。
 #   照樣只搬家、不改呼叫端（沿用舊的私有名）。
-from cmuh_common.alert_dedupe import (
-    filter_recent_alert_sent as _filter_recent_alert_sent,
+# [P2-06 第五刀(a) 第二批 2026-08-02] 勿擾窗判斷與「已寄止掛信」紀錄搬出 AutomationApp
+# （兩支都完全不碰 self）。搬的過程中發現讀檔失敗會把紀錄整批覆蓋掉，一併修掉。
+from cmuh_common.alert_state import (
+    is_within_dnd_window as _is_within_dnd_window,
+    load_alert_email_sent as _load_alert_email_sent_from,
+    records_for_save as _alert_records_for_save,
+)
+from cmuh_common.tk_widgets import (
+    apply_calendar_slot_state as _apply_calendar_slot_state_to,
+    config_if_changed as _config_if_changed,
 )
 from cmuh_common.appt_utils import (
     build_east_weekday_index as _build_east_weekday_index,
@@ -8553,7 +8561,18 @@ class AutomationApp:
         self._live_clinic_data_keys = set()
         self._alert_state_lock = threading.Lock()
         # 已寄出止掛信的記錄(跨重啟去重;寄信前先查、寄成功後寫)
-        self._alert_email_sent = self._load_alert_email_sent()
+        # ★[P2-06 第五刀 2026-08-02] 記住這次到底有沒有讀成功★
+        #   讀不到時 records 是空的；若照樣拿它去覆蓋磁碟，使用者先前所有
+        #   「已寄過」的紀錄就永久消失 → 止掛提醒整批重寄。見 alert_state。
+        _alert_load = _load_alert_email_sent_from(
+            get_conf_path(ALERT_EMAIL_SENT_FILENAME),
+            ALERT_EMAIL_SENT_RETAIN_DAYS)
+        self._alert_email_sent = _alert_load.records
+        self._alert_sent_load_failed = _alert_load.unreadable
+        if _alert_load.unreadable:
+            logging.error(
+                "[ALERT] 讀不到已寄止掛信紀錄(%s，檔案仍在，可能被防毒/備份鎖住)"
+                " → 本次執行不會用空紀錄覆蓋它", ALERT_EMAIL_SENT_FILENAME)
         self._dnd_suppressed_count = 0
         # [2026-07-13 使用者] 「提醒勿擾時段」與「半夜也監測」設定已移除、不再讓使用者勾選；
         # 固定行為：止掛提醒(reg52)email 全天候照寄；夜間 00:00–08:00 只寄 email+記 log、不跳彈窗
@@ -8954,17 +8973,6 @@ class AutomationApp:
     # 問題:寄信去重原本只靠記憶體 (self.alert_frequency / _alert_popup_active),
     # 重開程式就歸零 → 同一診次當天會再寄一次。改為持久化『已寄出』的 notify_key,
     # 寄信前先讀此記錄;已寄過就跳過,確保每個診次當天只寄一封。
-    def _load_alert_email_sent(self) -> dict:
-        """讀『已寄止掛信』記錄 → {notify_key: 'YYYY-MM-DD'}。只留近 N 天避免膨脹。"""
-        try:
-            data = load_json_dict(get_conf_path(ALERT_EMAIL_SENT_FILENAME), {},
-                                  merge_defaults=False)
-        except Exception:
-            return {}
-        cutoff = (date.today()
-                  - timedelta(days=ALERT_EMAIL_SENT_RETAIN_DAYS)).isoformat()
-        return _filter_recent_alert_sent(data, cutoff)
-
     def _has_alert_email_been_sent(self, notify_key: str) -> bool:
         with self._alert_state_lock:
             return notify_key in self._alert_email_sent
@@ -9001,10 +9009,24 @@ class AutomationApp:
         寄信頻率極低(一天數次),寫檔僅 atomic rename(~毫秒),持鎖成本可忽略。"""
         with self._alert_state_lock:
             self._alert_email_sent[notify_key] = date.today().isoformat()
-            snapshot = dict(self._alert_email_sent)
+            path = get_conf_path(ALERT_EMAIL_SENT_FILENAME)
+            # ★[P2-06 第五刀 2026-08-02] 開機時讀不到就不可以直接覆蓋★
+            #   直接寫等於把磁碟上既有的「已寄過」紀錄整批抹掉 → 重複寄信。
+            #   讀得回來就合併(自我修復)，仍讀不到就這次不寫。
+            decision = _alert_records_for_save(
+                path, self._alert_email_sent,
+                load_failed=self._alert_sent_load_failed,
+                retain_days=ALERT_EMAIL_SENT_RETAIN_DAYS)
+            if not decision.should_write:
+                logging.warning("[ALERT] %s", decision.describe())
+                return
             try:
-                _atomic_write_json(get_conf_path(ALERT_EMAIL_SENT_FILENAME),
-                                   snapshot)
+                _atomic_write_json(path, decision.payload)
+                if self._alert_sent_load_failed:
+                    # 合併成功 → 記憶體那份已經含磁碟的舊紀錄，疑慮解除。
+                    self._alert_email_sent = dict(decision.payload)
+                    self._alert_sent_load_failed = False
+                    logging.info("[ALERT] 已讀回先前的止掛信紀錄並合併，解除覆蓋保護")
             except Exception:
                 logging.warning("寫入止掛信寄出記錄失敗(不影響本次提醒)", exc_info=True)
 
@@ -9475,17 +9497,11 @@ class AutomationApp:
             self._bind_mousewheel_recursive(child, callback)
 
     def _smart_widget_config(self, widget, **kwargs):
-        changed = False
-        for key, value in kwargs.items():
-            try:
-                if widget.cget(key) != value:
-                    changed = True
-                    break
-            except Exception:
-                changed = True
-                break
-        if changed:
-            widget.config(**kwargs)
+        # [P2-06 第五刀 2026-08-02] 邏輯搬到 tk_widgets.config_if_changed（可用假
+        # widget 測）。★這裡刻意留一層轉發★：全檔有 57 個呼叫點，為了拿掉一行
+        # 轉發而改 57 處，風險與雜訊都大於收穫 —— 分層要的是「東西在該在的地方」，
+        # 不是「main.py 少一個 method」。
+        _config_if_changed(widget, **kwargs)
 
     def _register_lazy_tab(self, title, builder):
         frame = ttk.Frame(self.notebook, padding=10)
@@ -9520,15 +9536,11 @@ class AutomationApp:
         # [2026-07-13 使用者] 「提醒勿擾時段」可調設定已移除，固定 00:00–08:00 為勿擾窗：此時段止掛提醒
         # 只寄 email + 記 log、【不跳彈窗】(夜間診間無人看螢幕)，其餘時段照跳。email 一律 24 小時照寄
         # (本函式只管『要不要跳彈窗』，不影響寄信偵測)。
-        start_m = NOTIFY_DO_NOT_DISTURB_START_HOUR * 60
-        end_m = NOTIFY_DO_NOT_DISTURB_END_HOUR * 60
-        now = datetime.now()
-        now_m = now.hour * 60 + now.minute
-        if start_m == end_m:
-            return True
-        if start_m < end_m:
-            return start_m <= now_m < end_m
-        return now_m >= start_m or now_m < end_m
+        # [P2-06 第五刀 2026-08-02] 跨午夜的判斷搬到 alert_state.is_within_dnd_window
+        # （原本只能靠整支 app 才驗得到）；這裡保留 method 是因為它是 UI 層的問句。
+        return _is_within_dnd_window(datetime.now(),
+                                     NOTIFY_DO_NOT_DISTURB_START_HOUR,
+                                     NOTIFY_DO_NOT_DISTURB_END_HOUR)
 
     def _on_tab_changed(self, event):
         try: selected_tab_text = self.notebook.tab(self.notebook.select(), "text")
@@ -13656,15 +13668,6 @@ class AutomationApp:
                 }
         return calendar_widgets
 
-    def _apply_calendar_slot_state(self, slot, name_text, status_text, bg_color, fg_color, font_style):
-        new_state = (name_text, status_text, bg_color, fg_color, font_style)
-        if slot.get("_state") == new_state:
-            return
-        slot["_state"] = new_state
-        slot["card"].config(bg=bg_color)
-        slot["name_lbl"].config(text=name_text, bg=bg_color, fg=fg_color)
-        slot["status_lbl"].config(text=status_text, bg=bg_color, fg=fg_color, font=font_style)
-
     @staticmethod
     def _appt_item_session_ext(appt_item):
         if isinstance(appt_item, dict):
@@ -14116,7 +14119,7 @@ class AutomationApp:
                     slots_ui = cell["sessions_ui"][session_name]
                     for i, slot_state in enumerate(prepared_session_states[session_name]):
                         slot = slots_ui[i]
-                        self._apply_calendar_slot_state(slot, *slot_state)
+                        _apply_calendar_slot_state_to(slot, *slot_state)
 
                 cell["date_label"].config(text=date_label_text, style=date_label_style)
                 if cell["frame"].cget("style") != frame_style:

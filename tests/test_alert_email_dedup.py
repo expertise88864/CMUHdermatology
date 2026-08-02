@@ -14,7 +14,13 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-import main  # noqa: E402
+# [P2-06 第五刀 2026-08-02] main.py 不再轉發這支；跟著函式走，直接向擁有
+# 這個概念的模組要（與 test_main_launch_guards 的作法一致）。
+# ★`import main` 隨之變成死 import★ 本檔另外兩支測試是直接讀 main.py 原始碼
+# （MAIN_SRC）掃 AST 的，不需要把它 import 進來。
+from cmuh_common.alert_dedupe import (  # noqa: E402
+    filter_recent_alert_sent as _filter_recent_alert_sent,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 MAIN_SRC = ROOT / "src" / "main.py"
@@ -28,7 +34,7 @@ def test_filter_recent_alert_sent_keeps_recent_drops_old_and_malformed():
         123: "2026-06-15",                            # 非字串鍵 → 丟
         "bad_value": 20260615,                        # 非字串值 → 丟
     }
-    out = main._filter_recent_alert_sent(data, "2026-06-12")
+    out = _filter_recent_alert_sent(data, "2026-06-12")
     assert out == {
         "2026-06-15_上午_張三_main": "2026-06-15",
         "2026-06-15_晚上_王五_main": "2026-06-12",
@@ -36,9 +42,9 @@ def test_filter_recent_alert_sent_keeps_recent_drops_old_and_malformed():
 
 
 def test_filter_recent_alert_sent_tolerates_non_dict():
-    assert main._filter_recent_alert_sent(None, "2026-06-12") == {}
-    assert main._filter_recent_alert_sent(["x"], "2026-06-12") == {}
-    assert main._filter_recent_alert_sent({}, "2026-06-12") == {}
+    assert _filter_recent_alert_sent(None, "2026-06-12") == {}
+    assert _filter_recent_alert_sent(["x"], "2026-06-12") == {}
+    assert _filter_recent_alert_sent({}, "2026-06-12") == {}
 
 
 def test_alert_email_send_path_is_guarded_by_persistent_dedup():

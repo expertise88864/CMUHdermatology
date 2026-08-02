@@ -22,6 +22,10 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import main  # noqa: E402
+# [P2-06 第五刀 2026-08-02] 跟著函式走：main.py 不再轉發這支。
+from cmuh_common.alert_dedupe import (  # noqa: E402
+    filter_recent_alert_sent as _filter_recent_alert_sent,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 MAIN_SRC = ROOT / "src" / "main.py"
@@ -88,10 +92,10 @@ def test_alert_sent_record_for_future_session_survives_reload():
 
     new_cutoff = (date.today()
                   - timedelta(days=main.ALERT_EMAIL_SENT_RETAIN_DAYS)).isoformat()
-    assert key in main._filter_recent_alert_sent(data, new_cutoff)
+    assert key in _filter_recent_alert_sent(data, new_cutoff)
 
     old_cutoff = (date.today() - timedelta(days=7)).isoformat()
-    assert key not in main._filter_recent_alert_sent(data, old_cutoff)
+    assert key not in _filter_recent_alert_sent(data, old_cutoff)
 
 
 # ─── MN-01:email 先寄、通知在後且優先非阻塞 winotify ─────────────────────
