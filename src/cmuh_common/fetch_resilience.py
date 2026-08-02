@@ -12,6 +12,27 @@
     （session 生命週期 / atexit 清理），main.py 還有 4 個呼叫點 —— 那是別的關切。
   * `_should_fetch_*_reg52`：那是業務設定（哪些醫師在哪個分院），不是韌性。
 
+【所有時間差都用 `time.monotonic()`，★不用 `time.time()`★】
+（2026-08-02 外部 code review P2-01）
+
+這一族存的每一個時間戳都只有一個用途：**算經過了多久**。牆上時鐘會被 NTP 校正、
+手動改時間、時區/日光節約調整往前或往後跳，而這裡的四個狀態都會因此壞掉：
+
+  * 退避（最嚴重）：`next_allowed_ts = now + delay` 存的是絕對時間。時鐘往回跳
+    兩小時，那個來源就被自己退避擋住兩小時 —— 而且沒有任何東西會提早解除。
+  * 節流：時鐘往回跳之後 `now - last_ts` 是負的，於是一直被判成「太頻繁」。
+  * TTL／解析快取：時鐘往前跳 → 全部瞬間過期（只是多打幾次，較輕）。
+
+★誠實的代價★ monotonic 在 Windows 上是 `GetTickCount64`。它在系統睡眠/休眠
+期間是否繼續前進，不同 Windows 版本的說法並不一致，我沒有在這台機器上實測過。
+若它不計睡眠時間，診間電腦過夜喚醒後，快取最多會多撐一個 TTL（解析快取 3 分鐘、
+reg52 各來源數分鐘）才更新 —— 上限是有界的。相對地，牆上時鐘往回跳造成的退避
+鎖死是**沒有上限**的。兩害相權取其輕。
+
+★時間戳不外流★ 這四個 store 的時間戳沒有任何模組外的讀者（量過），也從不顯示
+給使用者，所以換基準不會讓任何「資料時間」顯示錯亂。要顯示時間的地方請自己取
+`datetime.now()`。
+
 【狀態是模組級的，測試要自己清乾淨】
 本模組刻意維持 main.py 原本的形狀（模組級 dict + 一把鎖），沒有改成類別 ——
 這一刀是**搬家，不是重新設計**。代價是測試之間會互相污染，所以提供 `reset_all()`
@@ -101,7 +122,7 @@ def _circuit_is_tripped(source: str) -> bool:
 
 
 def _cache_get(cache_key, ttl_seconds, evict_expired=True):
-    now = time.time()
+    now = time.monotonic()
     with _ttl_cache_lock:
         row = _ttl_cache_store.get(cache_key)
         if not row:
@@ -116,14 +137,14 @@ def _cache_get(cache_key, ttl_seconds, evict_expired=True):
 
 def _cache_set(cache_key, value):
     with _ttl_cache_lock:
-        _ttl_cache_store[cache_key] = (time.time(), value)
+        _ttl_cache_store[cache_key] = (time.monotonic(), value)
         trim_oldest_entries(_ttl_cache_store, _TTL_CACHE_MAX_ENTRIES)
 
 
 def _parse_cache_get(parser_key, html_text):
     h = hashlib.sha1(html_text.encode("utf-8", errors="ignore")).hexdigest()
     key = (parser_key, h)
-    now = time.time()
+    now = time.monotonic()
     with _ttl_cache_lock:
         row = _parse_cache_store.get(key)
         if not row:
@@ -139,12 +160,12 @@ def _parse_cache_set(parser_key, html_text, parsed):
     h = hashlib.sha1(html_text.encode("utf-8", errors="ignore")).hexdigest()
     key = (parser_key, h)
     with _ttl_cache_lock:
-        _parse_cache_store[key] = (time.time(), parsed)
+        _parse_cache_store[key] = (time.monotonic(), parsed)
         trim_oldest_entries(_parse_cache_store, _PARSE_CACHE_MAX_ENTRIES)
 
 
 def _source_backoff_allow(source_key):
-    now = time.time()
+    now = time.monotonic()
     with _ttl_cache_lock:
         row = _source_backoff_state.get(source_key)
         if not row:
@@ -155,7 +176,7 @@ def _source_backoff_allow(source_key):
 
 
 def _source_backoff_fail(source_key, base_seconds=None, max_seconds=None):
-    now = time.time()
+    now = time.monotonic()
     base = SOURCE_BACKOFF_BASE_SECONDS if base_seconds is None else base_seconds
     max_delay = SOURCE_BACKOFF_MAX_SECONDS if max_seconds is None else max_seconds
     with _ttl_cache_lock:
@@ -173,10 +194,16 @@ def _source_backoff_success(source_key):
 
 
 def _source_throttle_allow(source_key, interval_seconds):
-    now = time.time()
+    now = time.monotonic()
     with _ttl_cache_lock:
-        last_ts = _source_throttle_state.get(source_key, 0.0)
-        if now - last_ts < interval_seconds:
+        # ★預設值必須是 None，不能是 0.0★
+        #   原本 `get(source_key, 0.0)` 是靠 `time.time()` 有一億七千萬那麼大才
+        #   成立的：`now - 0.0` 遠大於任何 interval，所以「沒紀錄」＝放行。
+        #   改用 monotonic 之後那個數字在 Windows 上是【開機以來的秒數】——
+        #   剛開機時可能只有幾十秒，`now - 0.0 < interval` 成真，於是每天早上
+        #   第一次抓取會被自己的節流擋掉。沒紀錄要明確地表示成「沒紀錄」。
+        last_ts = _source_throttle_state.get(source_key)
+        if last_ts is not None and now - last_ts < interval_seconds:
             return False, max(0.0, interval_seconds - (now - last_ts))
         _source_throttle_state[source_key] = now
         trim_oldest_entries(

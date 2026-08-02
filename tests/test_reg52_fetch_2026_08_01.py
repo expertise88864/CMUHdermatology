@@ -94,9 +94,11 @@ def test_a_successful_fetch_clears_the_backoff(fake, monkeypatch):
     fr._source_backoff_fail("huihe:12345",
                             fr.SOURCE_BACKOFF_BASE_SECONDS, 999)
     assert fr._source_backoff_allow("huihe:12345")[0] is False
+    # [2026-08-02 P2-01] 退避改用 time.monotonic()（牆上時鐘往回跳會把來源
+    # 鎖死，見 fetch_resilience 的說明）—— 這裡要推進的是 monotonic。
     import time as _t
-    real = _t.time()
-    monkeypatch.setattr(fr.time, "time", lambda: real + 99999)   # 退避到期
+    real = _t.monotonic()
+    monkeypatch.setattr(fr.time, "monotonic", lambda: real + 99999)  # 退避到期
     fake([_Resp(_GOOD_HTML)])
     assert rf._fetch_huihe_reg52_html(None, "12345", "王醫師") is not None
     assert "huihe:12345" not in fr._source_backoff_state,         "成功之後退避紀錄要清掉，不是等它自然過期"

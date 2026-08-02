@@ -56,13 +56,37 @@ _CIRCUIT_BREAKER_RESET_MIN = int(_CIRCUIT_BREAKER_RESET_SEC // 60)
 
 _reg52_external_tls = threading.local()
 
+# ★★★ 明文 HTTP 來源：傳輸過程不可信 ★★★
+# （2026-08-02 外部 code review P2-03）
+#
+# 東區與惠盛走 `http://61.66.117.10`：**沒有 TLS，也沒有主機名可驗證**。
+# 在院內網路上任何位於路徑上的裝置（交換器、Wi-Fi AP、被入侵的同網段機器、
+# 被投毒的 ARP/DNS）都可以【無聲地改寫】回應內容，而我們完全看不出來。
+# 惠和與亞大走 https，不在此列。
+#
+# ★威脅模型（誠實地界定，不誇大）★
+#   * 這些頁面【不會】被執行、不會進 webview、不會餵給 shell/SQL/檔案路徑。
+#     它們只被 BeautifulSoup 解析成「診次、掛號數、診間號」再顯示/寄信。
+#   * 所以可達成的傷害是**顯示與通知內容被操縱**：例如偽造「已額滿」讓人以為
+#     滿診、或塞一個荒謬的掛號數觸發假的止掛提醒。不是遠端執行。
+#   * 對應處置在 `reg52_parse`：所有從這些頁面來的數值都要**先過範圍檢查**
+#     （見 `_MAX_PLAUSIBLE_APPT_COUNT` / `_MAX_ROOM_LEN`），且頁面文字
+#     **一律不進 log／稽核帳本**（維護頁可能夾帶任何東西）。
+#
+# ★為什麼不直接改成 https★ 沒有辦法在這裡驗證院方那台主機有沒有開 443、
+# 憑證是否對得上（它用的是 IP，憑證幾乎不可能匹配）。沒實測過就改，等於把
+# 「資料可能被竄改」換成「整個來源直接不通」。要改需要在院內實測後再動。
+PLAINTEXT_REG52_SOURCES = ("east", "huisheng")
+
 # 東區分院掛號（與主院 appointment.cmuh.org.tw 不同主機）
+# ★明文 HTTP★ 見上面 PLAINTEXT_REG52_SOURCES
 EAST_DISTRICT_REG52_URL = "http://61.66.117.10/cgi-bin/fh1/reg52.cgi"
 
 # 惠和醫院掛號（與主院同網域，路徑為 wh1/reg52.cgi）
 HUIHE_REG52_URL = "https://appointment.cmuh.org.tw/cgi-bin/wh1/reg52.cgi"
 
 # 惠盛醫院掛號（與東區同主機 61.66.117.10，路徑為 hs1/reg52.cgi）
+# ★明文 HTTP★ 見上面 PLAINTEXT_REG52_SOURCES
 HUISHENG_REG52_URL = "http://61.66.117.10/cgi-bin/hs1/reg52.cgi"
 
 AUH_REG52_BASE_URL = "https://appointment.auh.org.tw/cgi-bin/as/reg52.cgi"

@@ -1539,20 +1539,37 @@ def _sweep_restart_err_files() -> int:
 def run_retention_sweep() -> None:
     """跑一輪保留期清掃並記 log。同步檔案 IO —— 勿在 UI/熱鍵緒直接呼叫。不拋。"""
     try:
-        from cmuh_common.patient_locator import prune_index
         from cmuh_common.retention import sweep
         res = sweep(
             _retention_rules(),
             extra_tasks=[
                 # 定位索引是逐【列】修剪(檔案要留著),不是刪整個檔。
-                ("定位索引", lambda: prune_index(
-                    get_conf_path(_LOCATOR_INDEX_FILENAME))),
+                ("定位索引", _prune_locator_index),
                 # 早夭 stderr 檔本來就有 TTL,只是原本沒人定期叫它。
                 ("重啟錯誤檔", _sweep_restart_err_files),
             ])
-        logging.info("[retention] %s", res.summary())
+        if res.failed:
+            # ★[2026-08-02 外審 P2-04] 保留期沒跑完不可以只是 info★
+            #   這是個資留存的控制：默默失敗＝病歷號超期留在磁碟上而沒人知道。
+            logging.error("[retention] ★有項目沒有清掃成功★ %s", res.summary())
+        else:
+            logging.info("[retention] %s", res.summary())
     except Exception:
         logging.debug("[retention] 清掃失敗（不影響任何流程）", exc_info=True)
+
+
+def _prune_locator_index() -> int:
+    """給 `retention.sweep` 的 extra_task：回「刪掉幾列」，失敗則【拋】。
+
+    ★為什麼用拋的★ `sweep` 的契約是「callable 回傳處理掉幾筆」，而它已經會把
+    例外記進 `res.failed[label]` —— 那正是我們要的呈現。回 0 反而會被當成
+    「沒有過期的列」，那就是 P2-04 要修掉的那個混淆。
+    """
+    from cmuh_common.patient_locator import prune_index
+    result = prune_index(get_conf_path(_LOCATOR_INDEX_FILENAME))
+    if not result.ok:
+        raise RuntimeError(result.describe())
+    return result.removed
 
 
 def audit_health_check(notify: bool = True) -> dict:

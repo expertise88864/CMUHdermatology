@@ -46,6 +46,17 @@ _RE_COUNT_APPT  = re.compile(r'已掛號：(\d+)')   # 用於 check_appointment_
 
 _RE_PERSON      = re.compile(r'(\d+)\s*人')      # 用於 check_appointment_count 人數
 
+# ★[2026-08-02 外部 code review P2-03] 分院週表的數值上限★
+#   東區與惠盛走【明文 HTTP】（見 `reg52_fetch.PLAINTEXT_REG52_SOURCES`），
+#   回應在院內網路上可被改寫。這兩個上限刻意訂得遠高於任何真實值 ——
+#   一診半天不可能超過 2000 人，診間號不會超過 12 個字 —— 目的不是「校正資料」，
+#   而是不讓被塞進來的荒謬值變成假的止掛提醒或撐爆版面。
+#   ★不在 regex 裡限位數★ `(\d{1,4})` 遇到 12345 會配到 1234 而【看起來成功】，
+#   那比不限制更糟：錯誤的值會安靜地通過。先照原樣抓，再檢查範圍。
+_MAX_PLAUSIBLE_APPT_COUNT = 2000
+_MAX_ROOM_LEN = 12
+
+
 _RE_ROC_DATE    = re.compile(r'(\d{2,3})/(\d{2})/(\d{2})')
 
 # [O16] reg52 hot-path 預編譯：原本散落在函式內的 inline re.search/findall，集中宣告省 compile 開銷
@@ -65,6 +76,36 @@ _RE_ROC_DATE    = re.compile(r'(\d{2,3})/(\d{2})/(\d{2})')
 #   ★這是本刀唯一的行為改變★（其餘都是原文搬家）。
 _RE_REG52_DATE_CNT_PAIRS = re.compile(
     r'(\d{2,3}/\d{2}/\d{2})\s*已掛號[：:]\s*(\d+?)(?=\d{2,3}/|\D|$)')
+
+
+def _bounded_count(digits: str, where: str):
+    """把頁面上抓到的數字字串轉成掛號數。
+
+    → int；★不可信時回 `None`，呼叫端必須略過該格★
+    刻意不回 0：0 的意思是「這一診沒有人掛號」，而我們真正知道的是「這一格的
+    數字不可信」—— 這兩件事對止掛提醒的意義正好相反。
+
+    先看位數再 `int()`：CPython 對超長數字字串的轉換有上限（>4300 位會丟
+    ValueError），先擋位數才不會在這裡爆掉。
+    """
+    if len(digits) > 4 or int(digits) > _MAX_PLAUSIBLE_APPT_COUNT:
+        # ★只記位數，不記值也不記頁面文字★（見 reg52_fetch 的威脅模型說明）
+        logging.warning("%s：略過不合理的掛號數（%d 位數）", where, len(digits))
+        return None
+    return int(digits)
+
+
+def _bounded_room(raw: str, where: str) -> str:
+    """診間號的長度上限。過長的一律當成「沒有診間」。
+
+    ★不截斷★ 截斷會生出一個看起來合理、實際上是編造的診間號，而診間號會被
+    印在止掛通知裡 —— 寧可說「未提供」，不要說一個錯的。
+    """
+    room = raw or ""
+    if len(room) > _MAX_ROOM_LEN:
+        logging.warning("%s：忽略過長的診間號（%d 字）", where, len(room))
+        return ""
+    return room
 
 
 def safe_parse_roc_date(roc_date_str):
@@ -114,10 +155,9 @@ def parse_main_hospital_schedule(soup):
             is_external = "東區分院" in cell_content
             header_text, date_group_texts = _split_schbox_by_date(cell)
 
-            room = ""
             room_match = _RE_ROOM.search(cell_content)
-            if room_match:
-                room = room_match.group(1)
+            room = _bounded_room(room_match.group(1) if room_match else "",
+                                 "主院掛號表")
 
             for date_div in cell.find_all('div', class_='visitDate'):
                 own_text = date_group_texts.get(id(date_div))
@@ -136,7 +176,9 @@ def parse_main_hospital_schedule(soup):
                     count_text = count_div.get_text()
                     count_match = _RE_COUNT_APPT.search(count_text)
                     if count_match:
-                        count = int(count_match.group(1))
+                        count = _bounded_count(count_match.group(1), "主院掛號表")
+                        if count is None:
+                            continue
                     elif "已額滿" in count_text:
                         count = "已額滿"
 
@@ -144,7 +186,10 @@ def parse_main_hospital_schedule(soup):
                     content_without_date = cell_content.replace(roc_date_str, "")
                     fallback_match = _RE_PERSON.search(content_without_date)
                     if fallback_match:
-                        count = int(fallback_match.group(1))
+                        count = _bounded_count(fallback_match.group(1),
+                                               "主院掛號表(人數)")
+                        if count is None:
+                            continue
                     elif "額滿" in cell_content:
                         count = "已額滿"
                     elif "截止" in cell_content or "過" in cell_content:
@@ -251,7 +296,8 @@ def _parse_fh_like_weekly_schedule(soup, ext_branch):
         for cell in cells[1:]:
             cell_text = cell.get_text(" ", strip=True)
             room_match = _RE_ROOM.search(cell_text)
-            room = room_match.group(1) if room_match else ""
+            room = _bounded_room(room_match.group(1) if room_match else "",
+                                 f"分院週表({ext_branch})")
 
             for date_div in cell.find_all("div", class_="visitDate"):
                 date_tag = date_div.find("b")
@@ -268,7 +314,12 @@ def _parse_fh_like_weekly_schedule(soup, ext_branch):
                     count = "截止"
                 else:
                     count_match = _RE_COUNT_APPT.search(count_text)
-                    count = int(count_match.group(1)) if count_match else 0
+                    count = 0
+                    if count_match:
+                        count = _bounded_count(count_match.group(1),
+                                               f"分院週表({ext_branch})")
+                        if count is None:
+                            continue
 
                 # [review C2 2026-06-12] 單格日期解析失敗只跳過該格(同 dayoff 解析防護)
                 try:
@@ -335,7 +386,8 @@ def parse_branch_schedule(soup):
 
         for cell in cells[1:]:
             room_match = _RE_ROOM.search(cell.get_text(" ", strip=True))
-            room = room_match.group(1) if room_match else ""
+            room = _bounded_room(room_match.group(1) if room_match else "",
+                                 "東區週表")
 
             for date_div in cell.find_all('div', class_='visitDate'):
                 date_tag = date_div.find('b')
@@ -348,7 +400,11 @@ def parse_branch_schedule(soup):
                     count = "已額滿"
                 else:
                     count_match = _RE_COUNT_APPT.search(count_text)
-                    count = int(count_match.group(1)) if count_match else 0
+                    count = 0
+                    if count_match:
+                        count = _bounded_count(count_match.group(1), "東區週表")
+                        if count is None:
+                            continue
 
                 # [review C2 2026-06-12] 單格日期解析失敗只跳過該格(同 dayoff 解析防護)
                 try:
@@ -453,8 +509,11 @@ def parse_appt_item_for_alert(appt_item):
     m = _RE_COUNT_DIGIT.search(status_text)
     if not m:
         return None
-    try:
-        count = int(m.group(1))
-    except ValueError:
+    # ★[2026-08-02 P2-03] 這一支是守衛掃出來的第四個入口★
+    #   我原本只改了三個 `_RE_COUNT_APPT` 的地方，漏了這裡（用的是
+    #   `_RE_COUNT_DIGIT`）—— 而它正是【止掛提醒】讀掛號數的那一支，
+    #   也就是被塞荒謬值最有感的地方。呼叫端本來就處理 None，語意相容。
+    count = _bounded_count(m.group(1), "止掛提醒")
+    if count is None:
         return None
     return (session_name, count, is_stopped, ext_branch, room)

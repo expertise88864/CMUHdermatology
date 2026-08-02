@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 import os
 import re
 import tempfile
@@ -208,8 +209,42 @@ def _prune(rows: list, today: datetime, retain_days: int) -> list:
     return out
 
 
+PRUNE_OK = "ok"                    # 真的刪掉了幾列
+PRUNE_NOTHING_TO_DO = "nothing"    # 檔案不存在／沒有過期列
+PRUNE_FAILED = "failed"            # 讀不到、寫不回去 —— ★保留期沒有執行★
+
+
+@dataclass(frozen=True)
+class PruneResult:
+    """★[2026-08-02 外部 code review P2-04] 不要用一個 int★
+
+    原本回傳「刪掉幾列」，而失敗時回 `0` —— 跟「沒有過期的列」長得一模一樣。
+    這是一道**保留期控制**：它默默失敗的意思是病人的病歷號留在磁碟上超過宣告的
+    30 天，而唯一的呼叫端（RetentionSweeper）看到 0 只會當成「今天沒事」。
+    宣告了保留期卻不知道它有沒有執行，等於沒有保留期。
+
+    ★`reason` 不含任何病人資料★ 這個字串會進 log 與清掃摘要。
+    """
+    status: str
+    removed: int = 0
+    kept: int = 0
+    reason: str = ""
+
+    @property
+    def ok(self) -> bool:
+        """有沒有【確定完成】這一輪修剪（沒事可做也算完成）。"""
+        return self.status in (PRUNE_OK, PRUNE_NOTHING_TO_DO)
+
+    def describe(self) -> str:
+        if self.status == PRUNE_OK:
+            return f"刪掉 {self.removed} 列(留 {self.kept} 列)"
+        if self.status == PRUNE_NOTHING_TO_DO:
+            return "沒有過期的列"
+        return f"★修剪失敗★{self.reason}"
+
+
 def prune_index(path: str, *, now: datetime | None = None,
-                retain_days: int = INDEX_RETAIN_DAYS) -> int:
+                retain_days: int = INDEX_RETAIN_DAYS) -> PruneResult:
     """★[2026-07-30 外審 P1-03] 不依賴「下一次 mismatch」的獨立修剪★
 
     原本修剪只寫在 `append_index()` 裡:宣告 `INDEX_RETAIN_DAYS = 30`,但只要這
@@ -219,22 +254,25 @@ def prune_index(path: str, *, now: datetime | None = None,
     ★持 _INDEX_LOCK★:與 append_index 互斥 —— 背景清掃讀完舊內容之後,若剛好有
     一筆回讀不符寫進來,清掃再把舊快照 replace 回去,那筆新病人就此消失(外審抓到)。
 
-    回傳實際刪掉幾列。絕不拋。
+    → `PruneResult`。絕不拋（呼叫端靠 `.ok` 分辨失敗，不是靠回傳 0）。
     """
     try:
         with _INDEX_LOCK:
             rows = _read_rows(path)
             if not rows:
-                return 0
+                return PruneResult(PRUNE_NOTHING_TO_DO)
             kept = _prune(rows, now or datetime.now(), retain_days)
             removed = len(rows) - len(kept)
             if removed <= 0:
-                return 0
+                return PruneResult(PRUNE_NOTHING_TO_DO, kept=len(kept))
             _atomic_write_rows(path, kept)
-            return removed
-    except Exception:
-        logging.debug("[locator] 修剪定位索引失敗(不影響臨床流程)", exc_info=True)
-        return 0
+            return PruneResult(PRUNE_OK, removed=removed, kept=len(kept))
+    except Exception as e:
+        # ★不要降級成 debug★ 這是保留期控制失敗，不是無關痛癢的小事。
+        logging.error("[locator] 修剪定位索引失敗 —— ★保留期本輪沒有執行★",
+                      exc_info=True)
+        # ★只放例外類別名，不放訊息★ 訊息可能含檔案路徑；路徑含使用者名稱。
+        return PruneResult(PRUNE_FAILED, reason=type(e).__name__)
 
 
 def append_index(path: str, *, ts: str, action: str, detail: str, locator,

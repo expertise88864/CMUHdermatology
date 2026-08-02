@@ -26,6 +26,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
+from cmuh_common import patient_locator as pl_mod  # noqa: E402
 from cmuh_common.patient_locator import prune_index  # noqa: E402
 from cmuh_common.retention import (  # noqa: E402
     RetentionRule, sweep,
@@ -121,9 +122,10 @@ def test_the_locator_index_is_pruned_without_a_new_mismatch(tmp_path):
     p.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows)
                  + "\n", encoding="utf-8")
 
-    removed = prune_index(str(p), now=now)
+    result = prune_index(str(p), now=now)
 
-    assert removed == 1
+    assert result.status == pl_mod.PRUNE_OK
+    assert result.removed == 1
     left = [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines()
             if x.strip()]
     assert [r["action"] for r in left] == ["新"]
@@ -132,7 +134,9 @@ def test_the_locator_index_is_pruned_without_a_new_mismatch(tmp_path):
 
 
 def test_pruning_a_missing_index_is_a_no_op(tmp_path):
-    assert prune_index(str(tmp_path / "nope.jsonl")) == 0
+    result = prune_index(str(tmp_path / "nope.jsonl"))
+    assert result.status == pl_mod.PRUNE_NOTHING_TO_DO
+    assert result.ok is True, "沒事可做算完成，不是失敗"
 
 
 def test_pruning_never_raises_and_keeps_the_file_on_error(tmp_path,
@@ -141,7 +145,11 @@ def test_pruning_never_raises_and_keeps_the_file_on_error(tmp_path,
     p.write_text('{"ts":"2020-01-01T00:00:00","action":"a"}\n', encoding="utf-8")
     monkeypatch.setattr(os, "replace",
                         lambda *_a: (_ for _ in ()).throw(OSError("鎖住")))
-    assert prune_index(str(p)) == 0
+    # [2026-08-02 P2-04] 失敗不再偽裝成 0（＝「沒有過期的列」）。
+    result = prune_index(str(p))
+    assert result.status == pl_mod.PRUNE_FAILED
+    assert result.ok is False
+    assert result.reason == "OSError"
     assert p.exists(), "失敗時原檔必須留著"
 
 
