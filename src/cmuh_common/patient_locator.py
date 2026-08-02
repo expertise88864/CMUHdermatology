@@ -181,32 +181,88 @@ def _atomic_write_rows(path: str, rows: list) -> None:
         raise
 
 
-def _read_rows(path: str) -> list:
+# 允許的時鐘偏差：超過這個幅度的「未來」時間戳當成壞掉的資料。
+# 一天足以吸收時區設定錯誤與 NTP 校正；再多就不像是誤差了。
+_MAX_FUTURE_SKEW = timedelta(days=1)
+
+
+@dataclass(frozen=True)
+class IndexRead:
+    """讀索引的結果。★壞列要有數字，不能安靜消失★
+
+    [2026-08-02 外審 P1-06] 原本 `_read_rows` 對壞列直接 `continue` —— 它們
+    既不會被計入、也永遠不會被寫回時剔除。若整份檔案都是壞列，`rows` 是空的，
+    `prune_index` 就回「沒有過期的列」而完全不重寫檔案：★那些壞列裡的病歷號
+    會永久留在磁碟上★，而保留期報告說一切正常。
+    """
+    rows: list
+    invalid: int = 0
+    read_failed: bool = False
+
+
+def _read_rows(path: str) -> IndexRead:
     rows: list = []
+    invalid = 0
     if not os.path.exists(path):
-        return rows
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except ValueError:
-                continue          # 壞列略過,不讓一列壞掉毀掉整份索引
-            if isinstance(obj, dict):
-                rows.append(obj)
-    return rows
+        return IndexRead(rows)
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        # ★讀不到 ≠ 沒有資料★ 呼叫端必須知道，否則會拿空的去覆蓋整份索引。
+        return IndexRead([], 0, True)
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            invalid += 1          # 一列壞掉不毀掉整份索引，但要記著它存在
+            continue
+        if isinstance(obj, dict):
+            rows.append(obj)
+        else:
+            invalid += 1
+    return IndexRead(rows, invalid)
 
 
-def _prune(rows: list, today: datetime, retain_days: int) -> list:
-    cutoff = (today - timedelta(days=retain_days)).isoformat()
-    out = []
+def _classify_ts(raw, today: datetime, retain_days: int) -> str:
+    """→ "keep" / "expired" / "corrupt"。
+
+    ★[2026-08-02 外審 P1-06] 原本是 ISO 字串直接比大小★ 那對格式正確的值沒問題，
+    但對壞值是災難：`"zzz" >= cutoff` 恆為真 —— 一筆 ts 是垃圾的紀錄會【永遠】
+    通過保留期。同理，一個遠在未來的時間戳（打錯、時鐘跑掉、被竄改）也永遠不過期。
+    改成真的 parse，解析不出來或明顯在未來的一律當壞資料處理。
+    """
+    text = str(raw or "")
+    if not text:
+        return "corrupt"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return "corrupt"
+    if parsed.tzinfo is not None:      # 存的一律是 naive local time
+        parsed = parsed.replace(tzinfo=None)
+    if parsed > today + _MAX_FUTURE_SKEW:
+        return "corrupt"
+    if parsed < today - timedelta(days=retain_days):
+        return "expired"
+    return "keep"
+
+
+def _prune(rows: list, today: datetime, retain_days: int) -> tuple:
+    """→ (留下的列, 過期幾列, 壞掉幾列)。"""
+    kept, expired, corrupt = [], 0, 0
     for r in rows:
-        ts = str(r.get("ts") or "")
-        if ts >= cutoff:       # ISO 字串可直接比大小;無 ts 的壞列一律丟掉
-            out.append(r)
-    return out
+        verdict = _classify_ts(r.get("ts"), today, retain_days)
+        if verdict == "keep":
+            kept.append(r)
+        elif verdict == "expired":
+            expired += 1
+        else:
+            corrupt += 1
+    return kept, expired, corrupt
 
 
 PRUNE_OK = "ok"                    # 真的刪掉了幾列
@@ -229,15 +285,26 @@ class PruneResult:
     removed: int = 0
     kept: int = 0
     reason: str = ""
+    corrupt_removed: int = 0     # 時間戳壞掉/在未來 → 無法證明它還在保留期內
+    invalid_removed: int = 0     # 根本不是合法 JSON 物件的列
 
     @property
     def ok(self) -> bool:
         """有沒有【確定完成】這一輪修剪（沒事可做也算完成）。"""
         return self.status in (PRUNE_OK, PRUNE_NOTHING_TO_DO)
 
+    @property
+    def corruption_detected(self) -> bool:
+        """這份索引裡有讀不懂的東西 —— 保留期報告必須說出來。"""
+        return bool(self.corrupt_removed or self.invalid_removed)
+
     def describe(self) -> str:
         if self.status == PRUNE_OK:
-            return f"刪掉 {self.removed} 列(留 {self.kept} 列)"
+            out = f"刪掉 {self.removed} 列(留 {self.kept} 列)"
+            if self.corruption_detected:
+                out += (f"；★其中 {self.corrupt_removed} 列時間戳異常、"
+                        f"{self.invalid_removed} 列格式損毀★")
+            return out
         if self.status == PRUNE_NOTHING_TO_DO:
             return "沒有過期的列"
         return f"★修剪失敗★{self.reason}"
@@ -258,15 +325,27 @@ def prune_index(path: str, *, now: datetime | None = None,
     """
     try:
         with _INDEX_LOCK:
-            rows = _read_rows(path)
-            if not rows:
-                return PruneResult(PRUNE_NOTHING_TO_DO)
-            kept = _prune(rows, now or datetime.now(), retain_days)
-            removed = len(rows) - len(kept)
+            read = _read_rows(path)
+            if read.read_failed:
+                # 檔案還在、只是這次讀不到 → 不可以當成「沒有資料」。
+                return PruneResult(PRUNE_FAILED, reason="OSError")
+            kept, expired, corrupt = _prune(read.rows,
+                                            now or datetime.now(), retain_days)
+            # ★重寫的條件不只是「有東西過期」★
+            #   壞列（json 解不開）與時間戳異常的列都必須被清掉，否則裡面的
+            #   病歷號會永久留在磁碟上 —— 而且原本連「整份都是壞列」都因為
+            #   `if not rows: return` 而完全不重寫。
+            removed = expired + corrupt + read.invalid
             if removed <= 0:
                 return PruneResult(PRUNE_NOTHING_TO_DO, kept=len(kept))
-            _atomic_write_rows(path, kept)
-            return PruneResult(PRUNE_OK, removed=removed, kept=len(kept))
+            _atomic_write_rows(path, kept)      # kept 可能是空的 —— 照樣要寫
+            if corrupt or read.invalid:
+                logging.warning(
+                    "[locator] 定位索引有 %d 列時間戳異常、%d 列格式損毀 →"
+                    " 已一併清除(它們無法證明仍在保留期內)", corrupt, read.invalid)
+            return PruneResult(PRUNE_OK, removed=removed, kept=len(kept),
+                               corrupt_removed=corrupt,
+                               invalid_removed=read.invalid)
     except Exception as e:
         # ★不要降級成 debug★ 這是保留期控制失敗，不是無關痛癢的小事。
         logging.error("[locator] 修剪定位索引失敗 —— ★保留期本輪沒有執行★",
@@ -290,7 +369,14 @@ def append_index(path: str, *, ts: str, action: str, detail: str, locator,
             if v:
                 row[k] = str(v)
         with _INDEX_LOCK:
-            rows = _prune(_read_rows(path), now or datetime.now(), retain_days)
+            read = _read_rows(path)
+            if read.read_failed:
+                # ★讀不到就不要寫回去★ 否則這一筆會把整份索引取代掉。
+                logging.error("[locator] 讀不到定位索引 → 本筆不寫入,"
+                              "避免把既有索引覆蓋成只剩這一筆")
+                return False
+            rows, _expired, _corrupt = _prune(read.rows,
+                                              now or datetime.now(), retain_days)
             rows.append(row)
             _atomic_write_rows(path, rows)
         return True
