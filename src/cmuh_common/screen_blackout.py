@@ -491,11 +491,25 @@ class ScreenBlackout:
         #   Tk 視窗已經 destroy、只剩 Win32 survivor 時 `active` 是 False，
         #   會整個跳過上面那段而直接走到 `_create()` —— 同樣會蓋掉 survivor。
         if self._hwnds:
-            logging.error(
-                "[黑幕] ★仍有 %d 片黑幕關不掉 → 本輪不重建★ "
-                "重建會讓那幾片從此沒有人追蹤（熱鍵可能在看不見的畫面上動作）。"
-                "請結束並重新啟動主程式。", len(self._hwnds))
-            return False
+            # ★[外審第 2 輪 P2] 但也不可以「只要有 HWND 就永遠不重建」★
+            #   C 的保守作法會在【Win32 查詢一時失敗】時留下 HWND，而 Tk 的
+            #   destroy 其實成功了。那些 handle 已經是死的；若不重新確認就一律
+            #   拒絕，使用者按「立即黑螢幕」會【永遠沒有反應】直到重開程式 ——
+            #   病歷就這樣一直亮在螢幕上。修一個 fail-open 不可以換來一個
+            #   同樣傷害病人隱私的 fail-closed。
+            state = self.coverage_state()
+            if state == COVERAGE_HIDDEN:
+                logging.info(
+                    "[黑幕] 先前保留的 %d 個 HWND 已確認不存在（當時只是查不到）"
+                    "→ 清除後照常重建", len(self._hwnds))
+                self._hwnds = ()
+            else:
+                # 還看得見（PARTIAL）或仍然查不出來（UNKNOWN）→ 不可以重建
+                logging.error(
+                    "[黑幕] ★仍有 %d 片黑幕關不掉（%s）→ 本輪不重建★ "
+                    "重建會讓那幾片從此沒有人追蹤（熱鍵可能在看不見的畫面上"
+                    "動作）。請結束並重新啟動主程式。", len(self._hwnds), state)
+                return False
         try:
             self._create()
         except Exception:

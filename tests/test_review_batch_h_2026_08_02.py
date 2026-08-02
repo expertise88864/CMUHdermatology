@@ -102,38 +102,93 @@ class TestShowDoesNotTrustAnExistingBlackout:
         看得見，重建就讓它從此沒有人追蹤 —— 之後任何一次成功的 teardown 都會
         放行 F1-F12，而畫面上還蓋著那片舊黑幕。
         """
+        import tkinter as tk
+
+        # ★survivor 必須是【真的還看得見】的視窗★
+        #   第一版只是把 `_force_close_survivors` 換成「一律回報還卡著」，
+        #   但那些 Tk 視窗其實已經被 destroy 掉了 —— 重新確認之後正確地判定
+        #   已經不在、於是照常重建。用「說謊的偵測器」當不到「拆不掉」的證據。
+        survivor = tk.Toplevel(tk_root)
+        survivor.geometry("60x60+0+0")
+        survivor.update()
+        survivor_hwnd = sb._toplevel_hwnd(survivor)
+        assert survivor_hwnd, "拿不到最外層 HWND（測試失效了）"
+
         screens = [(0, 0, 400, 300)]
         bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(),
                                busy_fn=_Busy(), rects_fn=lambda: list(screens))
         try:
             assert bo.show() is True
-            old = list(bo._hwnds)
-            # 拆不掉：強制關閉一律回報「還卡著」
+            # 拆除之後留下一片【仍然看得見】的黑幕
             monkeypatch.setattr(sb.ScreenBlackout, "_force_close_survivors",
-                                staticmethod(lambda hwnds: list(hwnds)))
+                                staticmethod(lambda hwnds: [survivor_hwnd]))
             screens.append((400, 0, 400, 300))     # 讓覆蓋變成 PARTIAL
 
             assert bo.show() is False, "★拆不掉卻照樣重建★"
-            assert list(bo._hwnds) == old, (
-                "★舊的 HWND 被新的蓋掉了 → 那片黑幕從此沒人追蹤★")
+            assert list(bo._hwnds) == [survivor_hwnd], (
+                "★關不掉的那片被新的 HWND 蓋掉了 → 它從此沒人追蹤★")
         finally:
             monkeypatch.undo()
+            bo._hwnds = ()
+            survivor.destroy()
             bo.hide()
 
-    def test_survivors_block_a_rebuild_even_when_active_is_false(self,
-                                                                 tk_root):
+    def test_a_visible_survivor_blocks_a_rebuild_even_when_active_is_false(
+            self, tk_root):
         """★判準必須是 `_hwnds` 而不是 `active`★
 
         Tk 視窗已經 destroy、只剩 Win32 survivor 時 `active` 是 False —— 會整個
         跳過「已有黑幕」那段而直接走到 `_create()`，同樣蓋掉 survivor。
+
+        ★[外審第 2 輪] 這裡要用【真的還看得見】的視窗★
+        我第一版塞了一個假 handle `0xDEAD`：那是死的，重新確認之後應該被清掉
+        並照常重建 —— 用它當「必須拒絕」的證據是錯的。
+        """
+        import tkinter as tk
+
+        extra = tk.Toplevel(tk_root)
+        extra.geometry("60x60+0+0")
+        extra.update()
+        hwnd = sb._toplevel_hwnd(extra)
+        assert hwnd, "拿不到最外層 HWND（測試失效了）"
+
+        bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(),
+                               busy_fn=_Busy(),
+                               rects_fn=lambda: [(0, 0, 400, 300)])
+        bo._hwnds = (hwnd,)            # 沒有 Tk 面板，但那個視窗確實還在
+        try:
+            assert bo.active is False
+            assert bo.coverage_state() != sb.COVERAGE_HIDDEN
+            assert bo.show() is False
+            assert bo._hwnds == (hwnd,), "survivor 被蓋掉了"
+        finally:
+            extra.destroy()
+
+    def test_a_dead_retained_handle_does_not_disable_the_blackout_forever(
+            self, tk_root, monkeypatch):
+        """★[外審第 2 輪 P2] 修 fail-open 不可以換來一個 fail-closed★
+
+        C 的保守作法會在 Win32 查詢一時失敗時留下 HWND，而 Tk 的 destroy 其實
+        成功了。若不重新確認就一律拒絕重建，使用者按「立即黑螢幕」會永遠沒有
+        反應直到重開程式 —— 病歷就這樣一直亮在螢幕上。
         """
         bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(),
                                busy_fn=_Busy(),
                                rects_fn=lambda: [(0, 0, 400, 300)])
-        bo._hwnds = (0xDEAD,)          # 沒有 Tk 視窗，只剩追蹤中的 HWND
-        assert bo.active is False
-        assert bo.show() is False
-        assert bo._hwnds == (0xDEAD,), "survivor 被蓋掉了"
+        assert bo.show() is True
+        monkeypatch.setattr(sb, "_u32",
+                            lambda: (_ for _ in ()).throw(OSError("掛了")))
+        bo.hide()
+        assert bo._hwnds, "前提：查不到時要保守留著 HWND"
+        monkeypatch.undo()
+
+        # Win32 恢復 → 那些 handle 其實已經死了 → 必須能重新黑屏
+        assert bo.coverage_state() == sb.COVERAGE_HIDDEN
+        try:
+            assert bo.show() is True, "★黑幕從此按不動了★"
+            assert bo.coverage_state() == sb.COVERAGE_FULLY_VISIBLE
+        finally:
+            bo.hide()
 
     def test_the_early_return_is_gated_on_coverage_not_on_active(self):
         """結構釘子：`show()` 裡那條捷徑必須問過 `coverage_state`。"""
