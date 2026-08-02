@@ -330,6 +330,47 @@ class TestUntrustedPlaintextSources:
         assert raw == [], (
             f"第 {raw} 行直接 int(match.group(...))，沒有過範圍檢查")
 
+    def test_the_declaration_is_actually_read_by_production_code(self):
+        """★[2026-08-02 外審第 2 輪 P2] 宣告了安全性質卻沒有對應行為 = 沒做★
+
+        我上一版只加了一個常數和一段註解，生產程式碼【一行都沒有讀它】——
+        只有註解與這份測試在引用。那是「宣稱要對得上實作」的反例。
+        """
+        import main
+        assert "is_plaintext_source" in inspect.getsource(
+            main.AutomationApp._dispatch_future_stop_alert_inner), (
+            "止掛提醒沒有用到來源信任分類")
+
+    @pytest.mark.parametrize("branch,marked", [
+        ("east", True), ("huisheng", True),
+        ("huihe", False), ("auh", False), ("", False), (None, False),
+    ])
+    def test_only_plaintext_branches_are_classified_untrusted(self, branch,
+                                                              marked):
+        assert rf.is_plaintext_source(branch) is marked
+
+    def test_a_plausible_forged_count_still_reaches_the_doctor_but_marked(self):
+        """★這是 finding 的核心情境★
+
+        攻擊者不需要塞 999999 —— 把東區某診改成 130 就能寄出一封與真的一模一樣
+        的止掛提醒。範圍檢查對此無能為力，所以信裡必須說清楚來源不可驗證。
+
+        ★標註而不是抑制★ 同時釘住「照樣寄」：抑制會讓分院的止掛提醒安靜消失。
+        """
+        html = _branch_html(count="130")
+        parsed = rp.parse_east_fh1_schedule(BeautifulSoup(html, "lxml"))
+        counts = [a["count"] for slots in parsed.values() for a in slots]
+        assert counts == [130], "看起來合理的偽造值本來就擋不住 —— 它會照樣進來"
+
+        assert rf.is_plaintext_source("east") is True
+        assert "無法驗證" in rf.UNVERIFIED_TRANSPORT_NOTE
+
+    def test_the_note_does_not_overstate_what_we_know(self):
+        """★措辭鐵律★ 我們不知道「這筆被改過」，只知道「無從分辨」。"""
+        note = rf.UNVERIFIED_TRANSPORT_NOTE
+        for overclaim in ("已被竄改", "遭到攻擊", "確定"):
+            assert overclaim not in note
+
     def test_the_threat_model_is_written_down_next_to_the_urls(self):
         """★宣稱要對得上實作★ 這個宣告是給下一個人看的，不能只有一個常數名。"""
         src = inspect.getsource(rf)

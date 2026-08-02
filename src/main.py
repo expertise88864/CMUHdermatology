@@ -196,6 +196,8 @@ from cmuh_common.http_session_registry import (
 )
 from cmuh_common.reg52_fetch import (
     _get_thread_local_reg52_session,
+    is_plaintext_source,
+    UNVERIFIED_TRANSPORT_NOTE,
     AUH_DOCTOR_DOCNO_MAP,
     REG52_AUH_TTL_SECONDS,
     REG52_EXTERNAL_BACKOFF_BASE_SECONDS,
@@ -14696,6 +14698,14 @@ class AutomationApp:
         msg = (f"{_date_str} {_sess_label}\n"
                f"{_where}\n"
                f"目前掛號 {count} 人(已達/超過止掛門檻 {full_threshold} 人)")
+        # ★[2026-08-02 外審第 2 輪 P2] 明文 HTTP 來源的數字要說清楚它不可驗證★
+        #   東區/惠盛走 http://61.66.117.10，回應在院內網路上可被無聲改寫；
+        #   `_bounded_count` 只擋得住畸形值，擋不住一個「看起來合理」的假數字
+        #   （把某診改成 130 人就能寄出一封與真的完全一樣的止掛提醒）。
+        #   ★標註而不是抑制★ 抑制等於讓分院的止掛提醒安靜消失(fail-closed)；
+        #   照樣寄，但不要讓它看起來和已驗證的來源一樣可信。
+        if is_plaintext_source(ext_branch):
+            msg += "\n\n" + UNVERIFIED_TRANSPORT_NOTE
 
         def _worker():
             # 寄送權已由呼叫端 _claim_alert_email 取得 → 這裡直接寄,寄成功才永久記號。

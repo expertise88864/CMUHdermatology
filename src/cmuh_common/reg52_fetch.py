@@ -78,6 +78,28 @@ _reg52_external_tls = threading.local()
 # 「資料可能被竄改」換成「整個來源直接不通」。要改需要在院內實測後再動。
 PLAINTEXT_REG52_SOURCES = ("east", "huisheng")
 
+# 給通知/顯示層用的一句話。★內容要說得跟實際知道的一樣★：我們不是「懷疑這筆
+# 被改過」，而是「這條線路上我們無從分辨有沒有被改過」。
+UNVERIFIED_TRANSPORT_NOTE = (
+    "※ 此筆來自未加密連線（明文 HTTP）的分院掛號頁，內容在院內網路上"
+    "無法驗證是否被改動過；止掛前請以 HIS 或分院端再確認一次。")
+
+
+def is_plaintext_source(ext_branch) -> bool:
+    """這個分院代碼的資料是不是走明文 HTTP 來的。
+
+    ★[2026-08-02 外審第 2 輪 P2] 這一支存在的理由★
+    上一版只宣告了 `PLAINTEXT_REG52_SOURCES` 這個常數，**沒有任何生產程式碼
+    讀它** —— 等於寫了一句安全性宣稱卻沒有對應行為。範圍檢查擋得住畸形值與
+    資源耗盡，擋不住「刻意改成一個看起來合理的數字」：把東區某診改成 130 人
+    就能讓系統寄出一封與真的完全一樣的止掛提醒。
+
+    ★選擇「標註」而不是「抑制」★ 抑制等於讓分院的止掛提醒安靜消失，那是對
+    臨床通知的 fail-closed 變更；使用者對金絲雀已經定案過同一件事的方向
+    （不擋、寄信通知）。所以照樣寄，但信裡說清楚這個數字的來源無法驗證。
+    """
+    return str(ext_branch or "") in PLAINTEXT_REG52_SOURCES
+
 # 東區分院掛號（與主院 appointment.cmuh.org.tw 不同主機）
 # ★明文 HTTP★ 見上面 PLAINTEXT_REG52_SOURCES
 EAST_DISTRICT_REG52_URL = "http://61.66.117.10/cgi-bin/fh1/reg52.cgi"
