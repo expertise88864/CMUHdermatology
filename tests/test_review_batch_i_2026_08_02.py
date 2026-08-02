@@ -277,6 +277,30 @@ class TestAppendAlsoReportsCorruption:
             f"append 清掉壞列卻沒有留下任何紀錄：{text}")
         assert "24994923" not in text, "★log 不可以含病歷號★"
 
+    def test_a_failed_write_does_not_claim_the_rows_were_removed(
+            self, tmp_path, caplog, monkeypatch):
+        """★[2026-08-02 外審第 3 輪 P2] 宣告清除必須在寫入成功【之後】★
+
+        磁碟滿／權限／`os.replace` 失敗時原檔完好無損，而 log 已經說「已清掉」
+        —— 對一個 PHI 保留控制來說，那是假的成功訊號。
+        """
+        p = tmp_path / "idx.jsonl"
+        _write(p, [_row("zzz", chart_no="24994923")])
+        before = p.read_text(encoding="utf-8")
+
+        def _boom(*_a, **_k):
+            raise OSError("磁碟滿了")
+
+        monkeypatch.setattr(pl, "_atomic_write_rows", _boom)
+        with caplog.at_level("WARNING"):
+            ok = pl.append_index(str(p), ts=_iso(0), action="新", detail="",
+                                 locator={"room": "103"}, now=NOW)
+
+        assert ok is False
+        assert p.read_text(encoding="utf-8") == before, "原檔應該原封不動"
+        assert "順帶清掉" not in caplog.text, (
+            "★寫入失敗卻宣告已清掉壞列★")
+
     def test_a_clean_append_does_not_warn(self, tmp_path, caplog):
         """★空集合不算通過★"""
         p = tmp_path / "idx.jsonl"

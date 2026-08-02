@@ -387,16 +387,21 @@ def append_index(path: str, *, ts: str, action: str, detail: str, locator,
                 return False
             rows, _expired, _corrupt = _prune(read.rows,
                                               now or datetime.now(), retain_days)
+            rows.append(row)
+            _atomic_write_rows(path, rows)
             if _corrupt or read.invalid:
                 # ★[2026-08-02 外審第 2 輪 P2] append 也會順手清掉壞列★
                 #   不講出來的話：清掃之前先發生一次 mismatch，壞列就被安靜地
                 #   清掉，下一次清掃看到的是乾淨檔案 —— 損毀事件永久不可觀測，
                 #   而「直接刪除但記錄數量」正是不做 quarantine 的前提。
+                #
+                #   ★[外審第 3 輪 P2] 這一行必須排在 `_atomic_write_rows` 【之後】★
+                #   我原本寫在前面：磁碟滿／權限／os.replace 失敗時，原檔完好無損，
+                #   而 log 已經宣告「已清掉」—— 對一個 PHI 保留控制而言，那是
+                #   假的成功訊號。`prune_index` 本來就是寫入成功才記，這裡對齊它。
                 logging.warning(
                     "[locator] 寫入定位索引時順帶清掉 %d 列時間戳異常、"
                     "%d 列格式損毀", _corrupt, read.invalid)
-            rows.append(row)
-            _atomic_write_rows(path, rows)
         return True
     except Exception:
         logging.debug("[locator] 寫入定位索引失敗(不影響臨床流程)", exc_info=True)
