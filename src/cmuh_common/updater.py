@@ -356,6 +356,22 @@ def recover_incomplete_update(app_dir: str = "") -> "list[str]":
     return restored
 
 
+def _strict_parse_journal(payload):
+    """→ (entries, 原因)。★與 bootstrap_recovery 共用同一支解析★
+
+    借不到那支（模組不見／自己被更新換到一半）時【不要退回寬鬆解析】——
+    那正是 drift 會重新長回來的地方。回 (None, 原因) 讓呼叫端什麼都不做。
+    """
+    try:
+        import bootstrap_recovery
+    except Exception:      # noqa: BLE001
+        return None, "取不到 bootstrap_recovery 的嚴格解析（不改用寬鬆版）"
+    try:
+        return bootstrap_recovery.parse_journal(payload)
+    except Exception as e:      # noqa: BLE001
+        return None, f"解析交易日誌時例外：{type(e).__name__}"
+
+
 def _recover_locked(app_dir: str, path: str, restored: "list[str]") -> "list[str]":
     """`recover_incomplete_update` 的內層：呼叫時必須【已持有】更新寫入鎖。"""
     try:
@@ -365,7 +381,18 @@ def _recover_locked(app_dir: str, path: str, restored: "list[str]") -> "list[str
             return restored
         with open(path, "r", encoding="utf-8") as f:
             payload = json.load(f)
-        files = payload.get("files") or []
+        # ★[2026-08-02 外審第 3 輪 P1-02] 不要維護兩套復原引擎★
+        #   這裡原本是 `payload.get("files") or []`，而 bootstrap_recovery 那邊
+        #   嚴格驗 schema 與欄位。drift 的後果很具體：bootstrap 看到結構壞掉的
+        #   日誌會回 UNKNOWN 並【保留證據】；使用者選「仍要啟動」之後，main.py
+        #   載入 updater，它把同一份 JSON 當成空陣列、判定「沒有東西要還原」→
+        #   ★把那份唯一的證據刪掉★。改成共用同一支嚴格解析。
+        files, why = _strict_parse_journal(payload)
+        if files is None:
+            # 看不懂就【什麼都不做】：不回滾、不清日誌，把證據留給人看。
+            logging.error("[更新] ★交易日誌看不懂，本輪不做任何復原★（%s）"
+                          "—— 保留原檔供追查", why)
+            return restored
         logging.warning(
             "[更新] ★偵測到未完成的更新★（交易日誌 %s，%d 個檔，開始於 %s）→ 回滾到更新前的版本",
             os.path.basename(path), len(files), payload.get("started", "?"))

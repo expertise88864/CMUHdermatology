@@ -185,6 +185,19 @@ def _rollback_one(app_dir, entry, errors):
         return "retryable"      # 鎖住／權限 —— 下次可能就好了
 
 
+def parse_journal(payload):
+    """`_parse_journal` 的公開名稱 —— ★給 `cmuh_common.updater` 共用★
+
+    [2026-08-02 外審第 3 輪 P1-02] 原本兩邊各有一套解析：這裡嚴格驗 schema 與
+    欄位，`updater._recover_locked` 卻是 `payload.get("files") or []`。
+    後果具體：bootstrap 看到結構壞掉的日誌 → 回 UNKNOWN 並【保留證據】；
+    使用者選擇「仍要啟動」之後，main.py 載入 updater，它把同一份 JSON 當成
+    空陣列、判定「沒有東西要還原」→ ★把那份唯一的證據刪掉★。
+    ★不要維護兩套復原引擎★：改成同一支解析。
+    """
+    return _parse_journal(payload)
+
+
 def _parse_journal(payload):
     """→ (entries, 錯誤原因)。★看不懂就說看不懂，不要當成空的★
 

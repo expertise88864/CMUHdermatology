@@ -50,21 +50,30 @@ def _recover_incomplete_update():
     載進記憶體就再也收不回來，那正是這一批要消滅的失敗模式。
     使用者也不會因此不知情：同一個原因會讓臨床主程式跳窗詢問。
 
-    復原模組本身載不進來時【照常啟動】：那是「查不出來」而不是「查出有問題」，
-    而在沒有任何診斷資訊的情況下讓打卡永久停擺，代價比帶著疑慮跑一輪大。
+    ★[2026-08-02 外審第 3 輪 P1] 復原模組載不進來時也【不可以】照常啟動★
+    我原本寫「那是查不出來而不是查出有問題，讓打卡永久停擺代價更大」。
+    那個理由有一個洞：**退出不等於永久停擺** —— schtasks 每隔幾分鐘就會再叫
+    一次，狀況好轉（防毒放手、更新收乾淨）就會自己接回來。而「復原模組自己
+    載不進來」正是它被更新換到一半時的樣子，也就是磁碟混版機率最高的時刻。
+    在那一刻放行，等於把「不知道安不安全」當成「安全」。
+    使用者也不會因此不知情：同一個原因會讓臨床主程式跳窗詢問。
     """
     try:
         import bootstrap_recovery
     except Exception:  # noqa: BLE001
-        return True
+        _report_startup_crash("會診查詢程式（更新復原模組載入失敗）")
+        return False
     try:
         return bootstrap_recovery.recover_and_report(_HERE, "會診查詢程式").safe_to_start
     except Exception:  # noqa: BLE001
-        return True
+        _report_startup_crash("會診查詢程式（更新復原程序本身失敗）")
+        return False
 
 
 if not _recover_incomplete_update():
-    raise SystemExit(0)
+    # ★非零離開★ 「已有一份在跑」用 0（那是正常結束）；這裡是「這一輪沒有做事」，
+    #   要讓排程紀錄看得出差別。下一輪排程會再試。
+    raise SystemExit(3)
 
 try:
     runpy.run_path(os.path.join(_SRC, "consult_query.py"), run_name="__main__")
