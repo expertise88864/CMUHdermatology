@@ -94,6 +94,47 @@ class TestShowDoesNotTrustAnExistingBlackout:
         finally:
             bo.hide()
 
+    def test_it_refuses_to_rebuild_over_a_blackout_that_would_not_close(
+            self, tk_root, monkeypatch):
+        """★[2026-08-02 外審 P1] 我修 A 的時候自己造出來的洞★
+
+        `_create()` 會把 `_hwnds` 整條換成新的一批。若拆除失敗、舊的那片仍然
+        看得見，重建就讓它從此沒有人追蹤 —— 之後任何一次成功的 teardown 都會
+        放行 F1-F12，而畫面上還蓋著那片舊黑幕。
+        """
+        screens = [(0, 0, 400, 300)]
+        bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(),
+                               busy_fn=_Busy(), rects_fn=lambda: list(screens))
+        try:
+            assert bo.show() is True
+            old = list(bo._hwnds)
+            # 拆不掉：強制關閉一律回報「還卡著」
+            monkeypatch.setattr(sb.ScreenBlackout, "_force_close_survivors",
+                                staticmethod(lambda hwnds: list(hwnds)))
+            screens.append((400, 0, 400, 300))     # 讓覆蓋變成 PARTIAL
+
+            assert bo.show() is False, "★拆不掉卻照樣重建★"
+            assert list(bo._hwnds) == old, (
+                "★舊的 HWND 被新的蓋掉了 → 那片黑幕從此沒人追蹤★")
+        finally:
+            monkeypatch.undo()
+            bo.hide()
+
+    def test_survivors_block_a_rebuild_even_when_active_is_false(self,
+                                                                 tk_root):
+        """★判準必須是 `_hwnds` 而不是 `active`★
+
+        Tk 視窗已經 destroy、只剩 Win32 survivor 時 `active` 是 False —— 會整個
+        跳過「已有黑幕」那段而直接走到 `_create()`，同樣蓋掉 survivor。
+        """
+        bo = sb.ScreenBlackout(tk_root, idle_seconds_fn=_Idle(),
+                               busy_fn=_Busy(),
+                               rects_fn=lambda: [(0, 0, 400, 300)])
+        bo._hwnds = (0xDEAD,)          # 沒有 Tk 視窗，只剩追蹤中的 HWND
+        assert bo.active is False
+        assert bo.show() is False
+        assert bo._hwnds == (0xDEAD,), "survivor 被蓋掉了"
+
     def test_the_early_return_is_gated_on_coverage_not_on_active(self):
         """結構釘子：`show()` 裡那條捷徑必須問過 `coverage_state`。"""
         src = textwrap.dedent(inspect.getsource(sb.ScreenBlackout.show))

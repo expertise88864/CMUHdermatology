@@ -480,6 +480,22 @@ class ScreenBlackout:
                 "[黑幕] 已有黑幕但不是完整覆蓋（%s）→ 整批拆掉重建", state)
             # 不是使用者輸入造成的 → 不發喚醒 token
             self._destroy(issue_wake_token=False)
+        # ★[2026-08-02 外審 P1] 還有關不掉的黑幕時【絕對不可以重建】★
+        #   `_create()` 會把 `self._hwnds` 整條換成新的一批（第 604 行）——
+        #   於是那片關不掉、而且【仍然看得見】的舊黑幕從此沒有任何人追蹤：
+        #   之後任何一次 teardown 成功清掉新的那批，閘門就會放行 F1-F12，
+        #   而畫面上還蓋著那片舊的黑幕。這正是本批要消滅的形狀，
+        #   我卻在修 A 的時候自己造了一個。
+        #
+        #   ★判準是 `_hwnds`，不是 `active`★ `active` 看的是 Tk 的 `_wins`；
+        #   Tk 視窗已經 destroy、只剩 Win32 survivor 時 `active` 是 False，
+        #   會整個跳過上面那段而直接走到 `_create()` —— 同樣會蓋掉 survivor。
+        if self._hwnds:
+            logging.error(
+                "[黑幕] ★仍有 %d 片黑幕關不掉 → 本輪不重建★ "
+                "重建會讓那幾片從此沒有人追蹤（熱鍵可能在看不見的畫面上動作）。"
+                "請結束並重新啟動主程式。", len(self._hwnds))
+            return False
         try:
             self._create()
         except Exception:
