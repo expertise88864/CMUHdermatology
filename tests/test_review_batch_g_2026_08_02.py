@@ -333,13 +333,60 @@ class TestUntrustedPlaintextSources:
     def test_the_declaration_is_actually_read_by_production_code(self):
         """★[2026-08-02 外審第 2 輪 P2] 宣告了安全性質卻沒有對應行為 = 沒做★
 
-        我上一版只加了一個常數和一段註解，生產程式碼【一行都沒有讀它】——
+        我第一版只加了一個常數和一段註解，生產程式碼【一行都沒有讀它】——
         只有註解與這份測試在引用。那是「宣稱要對得上實作」的反例。
         """
         import main
         assert "is_plaintext_source" in inspect.getsource(
             main.AutomationApp._dispatch_future_stop_alert_inner), (
             "止掛提醒沒有用到來源信任分類")
+
+    def test_every_stop_alert_message_marks_untrusted_sources(self):
+        """★[2026-08-02 外審第 3 輪 P2] 止掛提醒有【兩條】路徑★
+
+        我第二版只標註了遠期那條，本週行事曆那條原封不動 —— 同一個偽造的數字
+        換條路就又變回「看起來已驗證」。而我那支測試只看我改過的那一支，
+        所以它綠得毫無意義。
+
+        ★這支改成機械化地找【所有】建止掛訊息的地方★：任何組出含「目前掛號」
+        字樣的 f-string 的函式，都必須在同一支函式裡問過 `is_plaintext_source`。
+        以後再多一條路徑會在這裡轉紅。
+        """
+        import main
+
+        class _Finder(ast.NodeVisitor):
+            def __init__(self):
+                self.stack = []
+                self.hits = []
+
+            def visit_FunctionDef(self, node):
+                self.stack.append(node)
+                self.generic_visit(node)
+                self.stack.pop()
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_JoinedStr(self, node):
+                text = "".join(v.value for v in node.values
+                               if isinstance(v, ast.Constant)
+                               and isinstance(v.value, str))
+                if "目前掛號" in text and self.stack:
+                    self.hits.append(self.stack[-1])   # 最內層的那個函式
+                self.generic_visit(node)
+
+        finder = _Finder()
+        finder.visit(ast.parse(inspect.getsource(main)))
+        assert finder.hits, "找不到任何止掛提醒訊息（測試失效了）"
+        assert len({f.lineno for f in finder.hits}) >= 2, (
+            "應該至少有兩條止掛提醒路徑（遠期掃描 + 本週行事曆）")
+
+        missing = sorted({
+            f"{fn.name}:{fn.lineno}" for fn in finder.hits
+            if not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                       and n.func.id == "is_plaintext_source"
+                       for n in ast.walk(fn))})
+        assert missing == [], (
+            f"這些地方建了止掛提醒訊息卻沒有標註不可信來源：{missing}")
 
     @pytest.mark.parametrize("branch,marked", [
         ("east", True), ("huisheng", True),

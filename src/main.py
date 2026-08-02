@@ -13907,6 +13907,12 @@ class AutomationApp:
                                                                    f"{_date_str} {_sess_label}\n"
                                                                    f"{_where}\n"
                                                                    f"目前掛號 {count} 人")
+                                                            # ★[外審第 2 輪 P2] 止掛提醒有【兩條】路徑★
+                                                            #   我上一版只標註了遠期那條(_dispatch_future_stop_alert_inner)，
+                                                            #   本週行事曆這條原封不動 —— 同一個偽造的數字換條路
+                                                            #   就又變回「看起來已驗證」。兩條都要標。
+                                                            if is_plaintext_source(ext_branch):
+                                                                msg += "\n\n" + UNVERIFIED_TRANSPORT_NOTE
                                                             # DND 邏輯改動 (2026-05-18)：
                                                             # 原本 DND 時直接 continue → toast 跟 email 都被擋掉，導致使用者
                                                             # 醒來完全不知道半夜門檻爆掉。改成：DND 只抑制 toast (避免半夜
