@@ -203,6 +203,64 @@ class TestStaleDataDoesNotEarnAlertEligibility:
         assert got is None
         assert seen == set()
 
+    def test_a_prefetched_candidate_that_is_never_used_is_not_a_degradation(
+            self):
+        """★[2026-08-02 外審第 2 輪 P1] 我上一版把「先備好」當成「用了」★
+
+        外院來源的流程是「先把 stale 備援拿在手上，再去即時抓」。我原本在
+        【抓之前】就標記降級 —— 即使整輪都是新鮮資料，這位醫師仍會以
+        is_live_final=False 送出，掃描把他移出資格名單，★該寄的止掛提醒不會寄★。
+        對外院醫師隔 10 分鐘手動刷新一次就會踩到。
+        """
+        import main
+        seen: set = set()
+        real = main._cache_get
+        main._cache_get = lambda *a, **k: "<html>舊的備援</html>"
+        try:
+            got = main._reg52_stale_candidate(("east_html", "D1"))
+        finally:
+            main._cache_get = real
+        assert got == "<html>舊的備援</html>", "備援還是要拿得到"
+        assert seen == set(), "只是備援候選，不該記成降級"
+
+    def test_the_prefetch_site_uses_the_candidate_helper(self):
+        """結構釘子：排進 external_jobs 的那一處必須用 candidate（不標記）。"""
+        import main
+        code = _code_of(main.check_appointment_count)
+        tree = ast.parse(code)
+        appends = [n for n in ast.walk(tree)
+                   if isinstance(n, ast.Call)
+                   and isinstance(n.func, ast.Attribute)
+                   and n.func.attr == "append"
+                   and isinstance(n.func.value, ast.Name)
+                   and n.func.value.id == "external_jobs"]
+        assert appends, "找不到 external_jobs.append（測試失效了）"
+        assert "_reg52_stale_candidate" in code, (
+            "備援預取沒有改用 candidate helper")
+
+    def test_the_job_runner_marks_only_when_it_actually_falls_back(self):
+        """★標記要發生在「確實採用 stale」的那一刻★"""
+        import main
+        code = _code_of(main.check_appointment_count)
+        tree = ast.parse(code)
+        runner = next((n for n in ast.walk(tree)
+                       if isinstance(n, ast.FunctionDef)
+                       and n.name == "_run_external_job"), None)
+        assert runner is not None, "找不到 _run_external_job（測試失效了）"
+        # 標記必須在 `elif stale_html:` 那一支裡，不可以在函式一開頭
+        marks = [n for n in ast.walk(runner)
+                 if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "add"
+                 and isinstance(n.func.value, ast.Name)
+                 and n.func.value.id == "degraded_sources"]
+        assert len(marks) == 1, "採用 stale 時應該剛好標記一次"
+        in_fallback = [n for n in ast.walk(runner) if isinstance(n, ast.If)
+                       and any(m in ast.walk(n) for m in marks)
+                       and any(isinstance(x, ast.Name) and x.id == "stale_html"
+                               for x in ast.walk(n))]
+        assert in_fallback, "標記不在「改吃備援」那一支裡"
+
     def test_every_stale_fallback_goes_through_the_helper(self):
         """★機械化地掃★ 不可以有人繞過 helper 直接讀 stale 快取。
 

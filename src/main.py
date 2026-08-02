@@ -7096,6 +7096,18 @@ class Reg52BackoffActive(Exception):
     pass
 
 
+def _reg52_stale_candidate(cache_key):
+    """先把「萬一抓不到時的備援」拿在手上 —— ★這不代表這一輪用了它★。
+
+    [2026-08-02 外審第 2 輪 P1] 我上一版把這裡也算成降級，那是錯的：
+    外院來源的流程是「先備好 stale、再去即時抓」，抓成功就用新的。
+    在【抓之前】就標記降級 → 即使整輪都是新鮮資料，這位醫師仍以
+    `is_live_final=False` 送出 → 掃描把他從資格名單移除 → ★該寄的止掛提醒
+    不會寄★。真正該標記的地方是「確實採用了 stale」的那一刻。
+    """
+    return _cache_get(cache_key, REG52_STALE_CACHE_SECONDS, evict_expired=False)
+
+
 def _reg52_stale_fallback(cache_key, label, degraded):
     """退回「超過 TTL 但還在容忍窗內」的舊快取，★並且記下這個來源已降級★。
 
@@ -7426,7 +7438,8 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                         source_timing["backoff_skip"] += 1  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         stale = _reg52_stale_fallback(cache_key, label, degraded_sources)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         return stale or ""
-                stale = _reg52_stale_fallback(cache_key, label, degraded_sources)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
+                # ★只是備援候選，不是「用了舊資料」★（見 _reg52_stale_candidate）
+                stale = _reg52_stale_candidate(cache_key)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                 external_jobs.append((label, cache_key, fetcher, stale))  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                 return ""
 
@@ -7480,7 +7493,9 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                 if html:
                     _cache_set(cache_key, html)
                 elif stale_html:
+                    # ★這裡才是「確實用了舊資料」★ 即時抓取失敗、改吃備援。
                     html = stale_html
+                    degraded_sources.add(label)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                 return label, html, int((time.perf_counter() - t0) * 1000)
 
             if external_jobs:
