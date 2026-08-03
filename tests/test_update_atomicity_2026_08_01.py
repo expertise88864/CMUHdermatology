@@ -504,12 +504,17 @@ def test_a_failed_rollback_keeps_the_journal_for_a_retry(tmp_path, monkeypatch):
 
     def _flaky(src, dst):
         # 往前寫與回滾都是 replace 到同一個 dst，靠 src 分辨：
-        #   前進 = 從 .upd.tmp 搬進去；回滾 = 從 .bak 搬回來。
-        if dst == str(b) and not str(src).endswith(".bak"):
+        #   前進 = 從 .upd.tmp 搬進去；回滾 = 從 .restore.tmp 搬回來。
+        # ★2026-08-03 更新注入點★ 回滾以前是 `os.replace(.bak, target)`，
+        #   現在改成「.bak 複製到 .restore.tmp → 換名」以保留備份
+        #   （見 `_restore_keeping_backup`），所以判準從 .bak 換成 .restore.tmp。
+        #   注入點沒跟著改的話，這支測試會【安靜地測不到東西】——
+        #   回滾順利成功、日誌被正常清掉，斷言就跟著失敗。
+        if dst == str(b) and not str(src).endswith(".restore.tmp"):
             raise OSError("b 寫入失敗 → 觸發回滾")
-        if dst == str(a) and str(src).endswith(".bak"):
+        if dst == str(a) and str(src).endswith(".restore.tmp"):
             raise PermissionError("防毒鎖住 a → 回滾也失敗")
-        return real_replace(src, dst)     # a 的前進、.bak 的搬移都照常
+        return real_replace(src, dst)     # a 的前進、備份的搬移都照常
     monkeypatch.setattr(updater, "_replace_file_with_retry", _flaky)
 
     result = updater.UpdateResult()
@@ -519,6 +524,10 @@ def test_a_failed_rollback_keeps_the_journal_for_a_retry(tmp_path, monkeypatch):
 
     assert os.path.exists(os.path.join(str(app), updater.JOURNAL_FILENAME)), \
         "★回滾沒成功就要留下日誌★ 清掉的話下次啟動不知道還有半套狀態要修"
+    # 留下日誌卻沒留下備份＝下一輪看到「pending 但沒有 .bak」，會判成救不回來
+    # 而直接放棄 ——★那是假的 terminal★，重試的機會等於零。
+    assert os.path.exists(str(a) + ".bak"), \
+        "★重試要有料★ 日誌說這一筆還沒還原，備份就必須還在"
 
 
 def test_a_permanently_unfixable_file_does_not_loop_forever(tmp_path):

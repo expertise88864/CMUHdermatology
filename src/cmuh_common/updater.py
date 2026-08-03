@@ -151,10 +151,23 @@ def _restore_keeping_backup(backup: str, target: str) -> None:
     改成「複製到暫存 → 原子換名」：還原本身仍然是原子的，備份留到交易確實
     收乾淨之後才刪（見 `_drop_backups`）。中途死掉也沒關係 —— 備份還在，
     下一輪照著同一份再做一次，結果完全相同（冪等）。
+
+    ★換名前要 fsync★（2026-08-03 外審 P2）：`_make_backup_atomically` 早就
+    這樣做了，這裡卻漏掉。rename 是原子的沒錯，但那只保證【名字】的原子性，
+    不保證暫存檔的【內容】已經落到碟上。換完名之後、快取還沒刷回去之前斷電，
+    開機後看到的就是「正式檔已經改名成功、內容卻是半截」，而此時 journal 與
+    `.bak` 都已經被清掉了 ——★連重試的機會都沒有★。
     """
     tmp = target + ".restore.tmp"
     try:
         _copy_file_with_retry(backup, tmp)
+        try:
+            with open(tmp, "rb") as f:
+                os.fsync(f.fileno())
+        except OSError:
+            # fsync 失敗不致命（多半是特殊檔案系統），但要說出來：耐久性沒保證
+            logging.debug("[更新] 還原暫存檔 fsync 失敗 [%s]", tmp,
+                          exc_info=True)
         _replace_file_with_retry(tmp, target)
     except BaseException:
         try:

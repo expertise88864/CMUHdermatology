@@ -293,3 +293,68 @@ class TestStateIsNotInferredFromBackups:
 
         assert result.status == br.RECOVERED
         assert target.read_text(encoding="utf-8") == "舊版"
+
+
+class TestTheRestoreIsDurableNotJustAtomic:
+    """[2026-08-03 外審第 3 輪 P2] 換名前要 fsync。
+
+    `os.replace` 是原子的，但那只保證【名字】的原子性。暫存檔的內容還躺在
+    OS 快取裡就換名、然後斷電的話，開機後看到的是「正式檔已經是新名字、
+    內容卻是半截」——★而此時 journal 與 .bak 都已經被清掉★，連重試的機會
+    都沒有。`_make_backup_atomically` 一直都有 fsync，這兩條還原路徑漏掉了。
+
+    ★判準是【順序】不是【有沒有呼叫】★：先換名再 fsync 等於沒防到。
+    """
+
+    def _record_order(self, monkeypatch, replace_owner, replace_attr):
+        order = []
+        real_fsync = os.fsync
+        real_replace = getattr(replace_owner, replace_attr)
+
+        def _fsync(fd):
+            order.append("fsync")
+            return real_fsync(fd)
+
+        def _replace(src, dst):
+            order.append("replace")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(os, "fsync", _fsync)
+        monkeypatch.setattr(replace_owner, replace_attr, _replace)
+        return order
+
+    def test_the_updater_restore_fsyncs_before_it_renames(self, tmp_path,
+                                                          monkeypatch):
+        target = tmp_path / "a.py"
+        target.write_text("新版", encoding="utf-8")
+        backup = tmp_path / "a.py.bak"
+        backup.write_text("舊版", encoding="utf-8")
+
+        order = self._record_order(monkeypatch, updater,
+                                   "_replace_file_with_retry")
+        updater._restore_keeping_backup(str(backup), str(target))
+        monkeypatch.undo()
+
+        assert order == ["fsync", "replace"], (
+            f"還原沒有先把內容刷到碟上再換名：{order}")
+        assert target.read_text(encoding="utf-8") == "舊版"
+
+    def test_the_bootstrap_restore_fsyncs_before_it_renames(self, tmp_path,
+                                                            monkeypatch):
+        target = tmp_path / "a.py"
+        target.write_text("新版", encoding="utf-8")
+        backup = tmp_path / "a.py.bak"
+        backup.write_text("舊版", encoding="utf-8")
+
+        order = self._record_order(monkeypatch, os, "replace")
+        errors = []
+        outcome = br._rollback_one(
+            str(tmp_path),
+            {"target": str(target), "existed_before": True, "staged": ""},
+            errors)
+        monkeypatch.undo()
+
+        assert outcome == "restored", f"還原本身就沒成功：{outcome} / {errors}"
+        assert order == ["fsync", "replace"], (
+            f"還原沒有先把內容刷到碟上再換名：{order}")
+        assert target.read_text(encoding="utf-8") == "舊版"

@@ -194,9 +194,19 @@ def _rollback_one(app_dir, entry, errors):
             #   還原本身仍然是原子的，而備份留到狀態確實寫下去之後才刪
             #   （見 `_drop_backup`）。中途死掉也沒關係：備份還在，
             #   下一次啟動照著同一份備份再做一次，結果完全相同（冪等）。
+            #   ★換名前要 fsync★：rename 只保證【名字】的原子性，不保證暫存
+            #   檔的【內容】已經落到碟上。換完名、快取還沒刷回去就斷電的話，
+            #   下次開機看到的是「正式檔改名成功、內容卻是半截」，而那時候
+            #   journal 與 .bak 都已經清掉了 ——★連重試的機會都沒有★。
             tmp = target + ".restore.tmp"
             try:
                 shutil.copyfile(backup, tmp)
+                try:
+                    with open(tmp, "rb") as f:
+                        os.fsync(f.fileno())
+                except OSError:
+                    # fsync 失敗不致命（多半是特殊檔案系統），但耐久性沒保證
+                    pass
                 os.replace(tmp, target)
             except BaseException:
                 with contextlib.suppress(OSError):
