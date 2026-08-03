@@ -206,6 +206,52 @@ class TestTheBackupSurvivesUntilTheStateIsDurable:
             "★updater 還原了卻沒有記下來 → 下一輪會判成救不回來★")
 
 
+class TestTheUpdaterPathKeepsTheSameInvariant:
+    """[2026-08-03 外審第 2 輪 P2] updater 有【自己的】回滾，也不可以吃掉備份。"""
+
+    def test_the_updater_restore_does_not_consume_the_backup(self, tmp_path,
+                                                             monkeypatch):
+        """還原成功但清日誌失敗 → 備份必須還在，下一輪才救得回來。"""
+        target = tmp_path / "a.py"
+        target.write_text("新版", encoding="utf-8")
+        backup = tmp_path / "a.py.bak"
+        backup.write_text("舊版", encoding="utf-8")
+        journal = _seed(tmp_path, [(str(target), True, "")])
+
+        monkeypatch.setattr(updater, "_clear_commit_journal",
+                            lambda app_dir: False)
+        # 狀態也寫不進去 → 只剩「備份還在」這一條救命索
+        monkeypatch.setattr(updater, "_mark_restored_in_journal",
+                            lambda *a, **k: None)
+        updater.recover_incomplete_update(str(tmp_path))
+        monkeypatch.undo()
+
+        assert target.read_text(encoding="utf-8") == "舊版", "還原本身要成功"
+        assert backup.exists(), (
+            "★備份被 os.replace 吃掉了 → 下一輪會判成救不回來★")
+        assert os.path.exists(journal)
+        assert not (tmp_path / "a.py.restore.tmp").exists(), "暫存檔沒清乾淨"
+
+        # 下一輪：備份還在 → 再做一次，不是 terminal
+        updater.recover_incomplete_update(str(tmp_path))
+        assert not os.path.exists(
+            journal + updater.FAILED_JOURNAL_SUFFIX), "★假的 terminal★"
+
+    def test_the_backup_is_dropped_once_the_journal_is_cleared(self, tmp_path):
+        """★空集合不算通過★ 交易收乾淨之後備份就該清掉，不要長期堆積。"""
+        target = tmp_path / "a.py"
+        target.write_text("新版", encoding="utf-8")
+        backup = tmp_path / "a.py.bak"
+        backup.write_text("舊版", encoding="utf-8")
+        journal = _seed(tmp_path, [(str(target), True, "")])
+
+        updater.recover_incomplete_update(str(tmp_path))
+
+        assert not os.path.exists(journal), "日誌應該被清掉"
+        assert not backup.exists(), "日誌清掉了，備份也該清"
+        assert target.read_text(encoding="utf-8") == "舊版"
+
+
 class TestStateIsNotInferredFromBackups:
 
     def test_a_pending_entry_without_a_backup_is_still_terminal(self,

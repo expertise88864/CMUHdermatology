@@ -140,6 +140,42 @@ def _file_op_with_retry(label: str, func, *args):
     raise last_exc
 
 
+def _restore_keeping_backup(backup: str, target: str) -> None:
+    """從備份還原，★但不要把備份用掉★（2026-08-03 外審 P2）。
+
+    原本是 `os.replace(backup, target)` —— 一次搬移就把備份消耗掉了。
+    可是「這一筆已經還原」要等 journal 的狀態落地才算數；若接著寫狀態與清日誌
+    都失敗（防毒同時鎖住兩者），磁碟上就是「pending 而且沒有備份」，下一輪
+    直接判成救不回來 ——★那正是這一批要消滅的假 terminal★。
+
+    改成「複製到暫存 → 原子換名」：還原本身仍然是原子的，備份留到交易確實
+    收乾淨之後才刪（見 `_drop_backups`）。中途死掉也沒關係 —— 備份還在，
+    下一輪照著同一份再做一次，結果完全相同（冪等）。
+    """
+    tmp = target + ".restore.tmp"
+    try:
+        _copy_file_with_retry(backup, tmp)
+        _replace_file_with_retry(tmp, target)
+    except BaseException:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _drop_backups(targets) -> None:
+    """交易確實收乾淨之後才清備份。刪不掉不致命（只是多留著）。"""
+    for t in targets or []:
+        try:
+            bak = t + ".bak"
+            if os.path.exists(bak):
+                os.remove(bak)
+        except OSError:
+            logging.debug("[更新] 清除備份失敗 [%s]", t, exc_info=True)
+
+
 def _replace_file_with_retry(src: str, dst: str) -> None:
     _file_op_with_retry(f"replace {src} -> {dst}", os.replace, src, dst)
 
@@ -502,7 +538,10 @@ def _recover_locked(app_dir: str, path: str, restored: "list[str]") -> "list[str
         elif unresolved:
             _rewrite_journal_for_retry(app_dir, unresolved)
         else:
-            _clear_commit_journal(app_dir)
+            # ★備份要留到日誌真的清掉之後★ 清不掉就留著：下一輪照同一份再做
+            #   一次（冪等），而不是看到「pending 但沒有備份」而誤判成救不回來。
+            if _clear_commit_journal(app_dir):
+                _drop_backups(rolled_back)
     except Exception:
         logging.error("[更新] 未完成更新的復原程序本身失敗（不影響啟動）",
                       exc_info=True)
@@ -672,7 +711,7 @@ def _rollback_written_files(
                 continue
         try:
             if written.existed_before:
-                _replace_file_with_retry(backup_path, written.target_path)
+                _restore_keeping_backup(backup_path, written.target_path)
             elif os.path.exists(written.target_path):
                 _remove_file_with_retry(written.target_path)
             restored.append(written.target_path)
