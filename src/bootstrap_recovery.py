@@ -38,6 +38,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import sys
 
 JOURNAL_FILENAME = ".updater_commit.journal"
@@ -184,7 +185,24 @@ def _rollback_one(app_dir, entry, errors):
                 # 備份不見了：重試一萬次也不會長回來
                 errors.append(f"{os.path.basename(target)}：備份不存在，無法還原")
                 return "terminal"
-            os.replace(backup, target)
+            # ★[2026-08-03 外審 P2] 不可以用 os.replace(backup, target)★
+            #   那會【消耗掉】備份 —— 而「已還原」要等 journal 落地才算數。
+            #   若接著寫狀態與清日誌都失敗（防毒同時鎖住兩者），下一次啟動看到的
+            #   是「pending 而且沒有備份」→ 又變成假的 terminal，也就是這一批
+            #   本來要消滅的東西。
+            #   改成「複製到暫存 → 原子換名 → ★保留 .bak★」：
+            #   還原本身仍然是原子的，而備份留到狀態確實寫下去之後才刪
+            #   （見 `_drop_backup`）。中途死掉也沒關係：備份還在，
+            #   下一次啟動照著同一份備份再做一次，結果完全相同（冪等）。
+            tmp = target + ".restore.tmp"
+            try:
+                shutil.copyfile(backup, tmp)
+                os.replace(tmp, target)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                raise
         elif os.path.exists(target):
             os.remove(target)
         return "restored"
@@ -282,7 +300,22 @@ def _record_terminal(app_dir, terminal, errors) -> bool:
     return True
 
 
-def _rewrite_journal_states(app_dir, files, errors) -> None:
+def _drop_backup(entry, errors) -> None:
+    """狀態已經落地之後才刪掉這一筆的 `.bak`。
+
+    ★順序不可對調★ 先刪備份、後寫狀態的話，兩者之間死掉就會留下
+    「pending 而且沒有備份」——那正是假 terminal 的成因。
+    刪不掉不致命：下次啟動會發現它已經是 restored 而跳過，備份只是多留著。
+    """
+    backup = str(entry.get("target") or "") + ".bak"
+    try:
+        if os.path.exists(backup):
+            os.remove(backup)
+    except OSError as e:
+        errors.append(f"清除備份失敗（不影響復原結果）：{e}")
+
+
+def _rewrite_journal_states(app_dir, files, errors) -> bool:
     """把整份日誌（含每一筆的 state）原子性地寫回去。
 
     ★[2026-08-02 外部 code review P2-05] 每還原一筆就落地一次★
@@ -297,7 +330,11 @@ def _rewrite_journal_states(app_dir, files, errors) -> None:
                           "state": e.get("state", STATE_PENDING)}
                          for e in files]}
     if not _atomic_write_json(os.path.join(app_dir, JOURNAL_FILENAME), payload):
-        errors.append("更新交易日誌的處置狀態失敗（下次可能重做已完成的項目）")
+        # ★寫不下去就【不要刪備份】★ 下一次啟動會照著同一份備份再做一次
+        #   （冪等），而不是看到「pending 但沒有備份」而誤判成救不回來。
+        errors.append("更新交易日誌的處置狀態失敗（保留備份，下次會再做一次）")
+        return False
+    return True
 
 
 def _rewrite_journal_for_retry(app_dir, entries, errors) -> None:
@@ -382,7 +419,9 @@ def recover_before_start(app_dir) -> RecoveryResult:
                     # ★每還原一筆就落地一次★ 中途斷電時，下一次啟動才知道
                     #   哪幾筆已經做完 —— 不必（也不能）靠 .bak 反推。
                     entry["state"] = STATE_RESTORED
-                    _rewrite_journal_states(app_dir, files, errors)
+                    if _rewrite_journal_states(app_dir, files, errors):
+                        # 狀態確實落地了 → 這份備份才可以清掉
+                        _drop_backup(entry, errors)
                 elif verdict == "retryable":
                     unresolved.append(name)
                     retry_entries.append(entry)

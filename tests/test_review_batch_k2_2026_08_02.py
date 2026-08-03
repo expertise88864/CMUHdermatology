@@ -133,6 +133,79 @@ class TestAFailedCleanupDoesNotBecomeAFakeTerminal:
             "★已還原的項目被判成「備份不見了」★")
 
 
+class TestTheBackupSurvivesUntilTheStateIsDurable:
+    """[2026-08-03 外審 P2] 還原不可以在狀態落地之前就把備份用掉。"""
+
+    def test_a_failed_state_write_leaves_the_backup_for_a_retry(self,
+                                                                tmp_path,
+                                                                monkeypatch):
+        """★這是原問題的最後一個入口★
+
+        `os.replace(bak, target)` 會消耗備份。若接著寫狀態與清日誌【都】失敗，
+        磁碟上就是「pending 而且沒有備份」→ 下次啟動又是假的 terminal。
+        """
+        target = tmp_path / "a.py"
+        target.write_text("新版", encoding="utf-8")
+        backup = tmp_path / "a.py.bak"
+        backup.write_text("舊版", encoding="utf-8")
+        _seed(tmp_path, [(str(target), True, "")])
+
+        # 狀態寫不進去（防毒鎖住 journal），清日誌也失敗
+        monkeypatch.setattr(br, "_atomic_write_json", lambda *a, **k: False)
+        monkeypatch.setattr(
+            os, "remove",
+            lambda p: (_ for _ in ()).throw(OSError("清不掉")))
+        try:
+            br.recover_before_start(str(tmp_path))
+        finally:
+            monkeypatch.undo()
+
+        assert target.read_text(encoding="utf-8") == "舊版", "還原本身要成功"
+        assert backup.exists(), (
+            "★備份被用掉了 → 下次啟動會判成救不回來（假 terminal）★")
+
+        # 下一輪：備份還在 → 照著再做一次，結果相同，不是 terminal
+        second = br.recover_before_start(str(tmp_path))
+        assert second.status != br.TERMINAL_FAILURE, (
+            f"★假的 terminal★（{second.describe()}）")
+        assert target.read_text(encoding="utf-8") == "舊版"
+
+    def test_a_successful_state_write_drops_the_backup(self, tmp_path):
+        """★空集合不算通過★ 狀態落地之後備份就該清掉，不要長期堆積。"""
+        target = tmp_path / "a.py"
+        target.write_text("新版", encoding="utf-8")
+        backup = tmp_path / "a.py.bak"
+        backup.write_text("舊版", encoding="utf-8")
+        _seed(tmp_path, [(str(target), True, "")])
+
+        result = br.recover_before_start(str(tmp_path))
+
+        assert result.status == br.RECOVERED
+        assert not backup.exists(), "狀態已落地，備份應該清掉"
+        assert not (tmp_path / "a.py.restore.tmp").exists(), "暫存檔沒清乾淨"
+
+    def test_the_updater_path_also_records_what_it_restored(self, tmp_path,
+                                                            monkeypatch):
+        """[2026-08-03 外審 P2] watchdog 直接走 updater 這條，原本只讀不寫 state。
+
+        還原成功、但清日誌失敗 → 那一筆仍是 pending 且沒有備份 → 下一輪假 terminal。
+        """
+        target = tmp_path / "a.py"
+        target.write_text("新版", encoding="utf-8")
+        (tmp_path / "a.py.bak").write_text("舊版", encoding="utf-8")
+        journal = _seed(tmp_path, [(str(target), True, "")])
+
+        monkeypatch.setattr(updater, "_clear_commit_journal",
+                            lambda app_dir: False)
+        updater.recover_incomplete_update(str(tmp_path))
+        monkeypatch.undo()
+
+        assert os.path.exists(journal), "前提：日誌沒被清掉"
+        entry = _read_journal(journal)["files"][0]
+        assert entry["state"] == "restored", (
+            "★updater 還原了卻沒有記下來 → 下一輪會判成救不回來★")
+
+
 class TestStateIsNotInferredFromBackups:
 
     def test_a_pending_entry_without_a_backup_is_still_terminal(self,

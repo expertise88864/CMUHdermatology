@@ -372,6 +372,34 @@ def _strict_parse_journal(payload):
         return None, f"解析交易日誌時例外：{type(e).__name__}"
 
 
+def _mark_restored_in_journal(app_dir: str, files: list,
+                              restored_targets: list) -> None:
+    """把這一輪真的還原成功的項目標成 restored 並落地。
+
+    ★與 bootstrap 共用同一套狀態語意★（見 `bootstrap_recovery` 的 STATE_*）。
+    寫不下去只記一筆錯誤 —— 那時 `.bak` 仍在（bootstrap 的還原改成保留備份），
+    下一輪照著同一份備份再做一次即可，結果相同。
+    """
+    if not restored_targets:
+        return
+    done = {os.path.normcase(t) for t in restored_targets}
+    changed = False
+    for item in files:
+        if os.path.normcase(str(item.get("target") or "")) in done:
+            if item.get("state") != "restored":
+                item["state"] = "restored"
+                changed = True
+    if not changed:
+        return
+    try:
+        import bootstrap_recovery
+        if not bootstrap_recovery._rewrite_journal_states(app_dir, files, []):
+            raise OSError("寫入交易日誌狀態失敗")
+    except Exception as e:      # noqa: BLE001
+        logging.error("[更新] 標記已還原項目失敗（%s）→ 保留備份，下一輪會再做"
+                      "一次（結果相同）", e)
+
+
 def _recover_locked(app_dir: str, path: str, restored: "list[str]") -> "list[str]":
     """`recover_incomplete_update` 的內層：呼叫時必須【已持有】更新寫入鎖。"""
     try:
@@ -430,6 +458,13 @@ def _recover_locked(app_dir: str, path: str, restored: "list[str]") -> "list[str
         outcome = _rollback_written_files(written, from_journal=True)
         errors, unresolved, rolled_back = (
             outcome.errors, outcome.unresolved, outcome.restored)
+        # ★[2026-08-03 外審 P2] 這一條路徑原本只【讀】state，不【寫】★
+        #   watchdog 會直接呼叫 recover_incomplete_update()。它把某一筆還原成功、
+        #   用掉了 .bak，接著 `_clear_commit_journal()` 因為日誌被鎖住而失敗 ——
+        #   那一筆在磁碟上仍是 pending 而且沒有備份，下一輪就被判成 terminal，
+        #   憑空生出一個 .failed.json。跳過既有的 restored 只解決了一半。
+        #   ★在清日誌之前就把狀態寫下去★，清不掉也不會誤判。
+        _mark_restored_in_journal(app_dir, files, rolled_back)
         # ★措辭鐵律★ 只報【真的動過】的檔：崩潰點之後那些根本沒被替換過的
         #   不算「已回滾」，說成回滾了是在誇大這支程式做過的事。
         restored.extend(rolled_back)
