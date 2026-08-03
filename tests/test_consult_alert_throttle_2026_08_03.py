@@ -197,3 +197,53 @@ def test_main_actually_loads_the_state_on_startup():
               if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     assert "_load_job_fail_state" in called, (
         "main() 沒有把節流狀態讀回來 → 每次重啟冷卻都歸零（bug 原樣）")
+
+
+def test_a_clock_step_back_during_the_run_does_not_silence_the_alert(
+        monkeypatch, tmp_path):
+    """★校時是【執行期間】發生的★（2026-08-03 外審第 1 輪 P2）
+
+    機器先被設到未來 → 存下一個未來的時間戳 → NTP 把時鐘校回來 →
+    `now - last` 變成負數 → 永遠小於冷卻時間 → 告警靜音到時鐘追上為止。
+    只在啟動載入時檢查救不到：這支程式正常運作時 log 一直在更新，
+    watchdog 不會重啟它，也就不會重新載入。
+    """
+    _use_tmp_settings(monkeypatch, tmp_path)
+    sent = _sent_subjects(monkeypatch)
+    _fresh_process(monkeypatch, tmp_path)
+
+    _fail(monkeypatch, 3)
+    assert len(sent) == 1, "前提：達門檻要寄一封"
+
+    # 時鐘曾被設到 90 天後（那一封的時間戳就是未來的），現在校回來了
+    monkeypatch.setattr(cq, "_job_fail_last_alert",
+                        cq.time.time() + 90 * 86400, raising=False)
+    _fail(monkeypatch, 3)
+
+    assert len(sent) == 2, (
+        "未來的時間戳把告警靜音了 —— 冷卻判斷沒有套用時鐘偏移守衛")
+
+
+def test_the_future_timestamp_is_also_cleared_from_disk(monkeypatch,
+                                                        tmp_path):
+    """★丟掉之後要落地★ 否則下次重啟又把那個未來時間戳讀回來。
+
+    ★這裡必須走「沒有收件人」那條路★（突變驗證抓到的）：正常會寄信的路徑在
+    最後本來就會把 `now` 寫下去，所以就算守衛自己不落地，磁碟上照樣看不到未來
+    時間戳 —— 那個斷言是被【別人的】寫入餵飽的，測不到守衛。收件人為空時會在
+    寫入之前 return，守衛的落地才是唯一把它清掉的動作。
+    """
+    _use_tmp_settings(monkeypatch, tmp_path)
+    _sent_subjects(monkeypatch)
+    _fresh_process(monkeypatch, tmp_path)
+
+    future = cq.time.time() + 90 * 86400
+    monkeypatch.setattr(cq, "_job_fail_last_alert", future, raising=False)
+    for _ in range(3):
+        cq._note_job_failure([], "登入沒有完成")     # ← 沒有收件人
+
+    state = json.loads(
+        (tmp_path / "consult_alert_state.json").read_text(encoding="utf-8"))
+    assert state["last_alert_ts"] < cq.time.time() + 3600, (
+        f"磁碟上還留著未來的時間戳：{state['last_alert_ts']}"
+        " → 下次重啟讀回來又是靜音")

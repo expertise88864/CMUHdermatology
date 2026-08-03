@@ -3588,10 +3588,29 @@ def _load_job_fail_state() -> None:
     if isinstance(streak, int) and streak >= 0:
         _job_fail_streak = streak
     if isinstance(last, (int, float)) and last >= 0:
-        if last > time.time() + _JOB_FAIL_CLOCK_SKEW_SEC:
-            logging.warning("[health] 告警節流時間戳在未來 → 當作沒寄過")
-        else:
-            _job_fail_last_alert = float(last)
+        _job_fail_last_alert = float(last)
+    _forget_future_alert_ts(time.time())
+
+
+def _forget_future_alert_ts(now: float) -> bool:
+    """最後告警時間落在未來就丟掉。→ 有沒有丟掉。
+
+    ★載入與執行期必須用同一套判準★（2026-08-03 外審第 1 輪 P2）：
+    原本只在載入時檢查。可是校時是【執行期間】發生的 —— 機器先被設到未來
+    （於是存下一個未來的時間戳），之後 NTP 把時鐘校回來，`now - last` 就變成
+    負數，永遠小於冷卻時間 → ★告警被靜音到時鐘追上為止★，可能是好幾個月。
+    而這支程式在正常運作時 log 一直在更新，watchdog 不會重啟它，也就不會重新
+    載入 —— 靠載入時檢查救不到。
+
+    所以判準抽成這一個函式，載入與每次冷卻判斷都呼叫它。
+    """
+    global _job_fail_last_alert
+    if _job_fail_last_alert <= now + _JOB_FAIL_CLOCK_SKEW_SEC:
+        return False
+    logging.warning("[health] 告警節流時間戳在未來(%.0f 秒後) → 當作沒寄過",
+                    _job_fail_last_alert - now)
+    _job_fail_last_alert = 0.0
+    return True
 
 
 def _save_job_fail_state() -> None:
@@ -3632,6 +3651,10 @@ def _note_job_failure(recipients, reason: str) -> None:
         if _job_fail_streak < _JOB_FAIL_ALERT_THRESHOLD:
             return
         now = time.time()
+        # ★每次都要檢查★ 校時是執行期間發生的，只在載入時檢查救不到
+        #   （這支程式正常運作時 log 一直在更新，watchdog 不會重啟它）。
+        if _forget_future_alert_ts(now):
+            _save_job_fail_state()      # 壞掉的時間戳也要從磁碟上清掉
         if now - _job_fail_last_alert < _JOB_FAIL_ALERT_COOLDOWN_SEC:
             return
         if not recipients:
