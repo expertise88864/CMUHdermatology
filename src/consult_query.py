@@ -250,6 +250,27 @@ class LoginNotCompleted(RuntimeError):
     故獨立成一個例外類:重試迴圈認得它就【立刻停止】,不再送出登入。
     帳密被院方停用/改過、或認證方式改版時,重試一百次也一樣,只會逼近鎖定門檻。
     """
+class HISStartupBlocked(RuntimeError):
+    """住院醫囑系統【自己】起不來（例：BDE 初始化失敗）——★不可自動重試★
+
+    [2026-08-03 實機] 使用者收到「連續失敗 22 次／請確認帳號密碼是否被院方改過
+    停用」的告警，手動開程式才看到真正的畫面是：
+        住院醫囑系統 — An error occurred while attempting to initialize the
+        Borland Database Engine (error $250E)
+    也就是 HIS 根本沒起來，登入視窗因此被那個 modal 擋著（實機視窗清單正是
+    `TFrmLogin(vis=1,en=0)` ＋ 一個 enabled 的對話框）。程式看到「登入視窗還在」
+    就回報帳密問題，把人導去查完全無關的方向——帳密沒有任何問題。
+
+    這一類要與 LoginNotCompleted 分開：處置不同（重開機／清 BDE 鎖檔／找資訊室，
+    而不是去改密碼），而且【重試也沒有意義】——BDE 起不來，再登一百次也一樣。
+    """
+
+
+# 只比對這個固定英文字串與後面的錯誤碼，不記錄任何視窗文字內容（隱私邊界同
+# _describe_windows_for_diag：診斷資訊只留 class/旗標/已知錯誤碼）。
+BDE_ERROR_MARKER = "Borland Database Engine"
+BDE_ERROR_CODE_RE = re.compile(r"\$[0-9A-Fa-f]{4}")
+
 CONSULT_CLASS = "TFMJoinResponse"            # 「會診通知單回覆」目標視窗
 # 選單路徑：主選單[4]病人清單及交班 → 子[8]會診清單 → 子[0]我的會診清單
 MENU_PATH = (4, 8, 0)
@@ -1968,9 +1989,21 @@ def _wait_main_window_after_login(our_pids: set, *, visible_only: bool,
     #   時間耗完,然後回報一句無從下手的「等不到主畫面」。
     clicks_on_same = 0
     stuck_notice = None
+    next_bde_check = 0.0
     while time.time() < deadline:
         if not running.is_set():
             raise RuntimeError("流程已被中止")
+        # ★[codex P2] BDE 初始化失敗要【當場】收工，不要空等滿 120 秒★
+        #   那個對話框在啟動當下就出現，而且不會自己消失（HIS 根本沒起來）。
+        #   等滿逾時只是把每一輪都拖兩分鐘、告警也晚兩分鐘才發得出去。
+        #   節流成每 5 秒一次：偵測要列舉所有視窗與子控制項，不值得每 0.4 秒跑。
+        now = time.time()
+        if now >= next_bde_check:
+            next_bde_check = now + 5.0
+            code = detect_bde_startup_error(our_pids)
+            if code:
+                raise _bde_blocked(code, our_pids, clicks,
+                                   last_notice_hwnd, distinct_notices)
         mains = find_windows(MAIN_CLASS, pids=our_pids, visible_only=visible_only)
         if mains:
             try:
@@ -2018,6 +2051,14 @@ def _wait_main_window_after_login(our_pids: set, *, visible_only: bool,
     #   原本一律回報「等不到住院醫囑主畫面」,讓人往「主畫面被什麼擋住」的方向查;
     #   實機真正的狀況是 TFrmLogin 還可見 —— 帳密、院方認證、或連線根本沒過。
     #   兩者的處置差很遠,訊息就得說對。
+    # ★先問「HIS 自己起來了嗎」再問「登入過了嗎」★ [2026-08-03 實機]
+    #   BDE 初始化失敗時，那個 modal 會把登入視窗擋成 disabled —— 外觀與「帳密
+    #   不對」一模一樣，舊版因此叫使用者去查帳號密碼（完全無關的方向）。
+    #（迴圈內每 5 秒就查一次，這裡只是收尾補網：對話框在最後幾秒才冒出來時仍要認得）
+    bde = detect_bde_startup_error(our_pids)
+    if bde:
+        raise _bde_blocked(bde, our_pids, clicks, last_notice_hwnd,
+                           distinct_notices)
     if find_windows(LOGIN_CLASS, pids=our_pids, visible_only=True):
         raise LoginNotCompleted(
             "登入沒有完成(登入視窗仍在畫面上)—— 請確認帳號密碼是否被院方改過/"
@@ -2027,6 +2068,71 @@ def _wait_main_window_after_login(our_pids: set, *, visible_only: bool,
     raise RuntimeError(
         "登入後等不到住院醫囑主畫面 —— " + _describe_windows_for_diag(
             our_pids, clicks, last_notice_hwnd, distinct_notices))
+
+
+def bde_error_code_in(texts) -> str | None:
+    """從一組視窗文字裡認出 BDE 初始化錯誤 → 回錯誤碼（如 "$250E"）或 None。
+
+    純函式（可測）。★只回錯誤碼★——比對的是固定英文字串，取出的是十六進位碼，
+    不會把視窗內容帶進 log/告警信（隱私邊界與 _describe_windows_for_diag 一致）。
+    """
+    for t in texts:
+        if t and BDE_ERROR_MARKER in t:
+            m = BDE_ERROR_CODE_RE.search(t)
+            return m.group(0) if m else "(未知碼)"
+    return None
+
+
+def _window_texts(hwnd) -> list:
+    """視窗自身 + 直接子控制項的文字（MessageBox 的內文在 Static 子控制項裡）。"""
+    texts = []
+    try:
+        texts.append(win32gui.GetWindowText(hwnd))
+    except Exception:
+        pass
+
+    def cb(child, _):
+        try:
+            texts.append(win32gui.GetWindowText(child))
+        except Exception:
+            pass
+        return True
+    try:
+        win32gui.EnumChildWindows(hwnd, cb, None)
+    except Exception:
+        pass
+    return texts
+
+
+def detect_bde_startup_error(our_pids: set) -> str | None:
+    """掃我們自己開的那個 systemftp 的視窗，找 BDE 初始化錯誤 → 錯誤碼或 None。
+
+    ★[codex P1] 必須連【不可見】的視窗一起掃★ `_run_with_sw_hide` 的 stealth
+    thread 會把該行程所有可見視窗一律隱藏；只掃可見視窗的話，正好在實際會用到的
+    那條路徑上永遠找不到這個對話框，於是又退回誤導人的通用逾時訊息。
+    被隱藏不等於不存在——它照樣是把登入視窗擋成 disabled 的那個 modal。
+    （_describe_windows_for_diag 也是 visible_only=False，理由相同。）
+    """
+    try:
+        for hwnd in find_windows(pids=our_pids, visible_only=False):
+            code = bde_error_code_in(_window_texts(hwnd))
+            if code:
+                return code
+    except Exception:
+        logging.debug("[BDE] 偵測失敗（略過）", exc_info=True)
+    return None
+
+
+def _bde_blocked(code: str, our_pids: set, clicks: int, last_notice,
+                 distinct_notices: set) -> "HISStartupBlocked":
+    """組出 BDE 失敗的例外（兩處呼叫共用，措辭不會各改各的）。"""
+    return HISStartupBlocked(
+        f"住院醫囑系統自己沒起來:Borland Database Engine 初始化失敗"
+        f"(error {code})——★這不是帳號密碼問題★,是這台電腦的 HIS/BDE 環境問題"
+        f"(通常重開機可解;詳見 docs/會診查詢_BDE初始化失敗處理.md)。"
+        f"★本次不重試★(BDE 起不來,再登一百次也一樣)。"
+        + _describe_windows_for_diag(our_pids, clicks, last_notice,
+                                     distinct_notices))
 
 
 def _describe_windows_for_diag(our_pids: set, clicks: int, last_notice,
@@ -2973,9 +3079,15 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                 #   故改成沿用同一條路,只是【略過 backoff 重試】。
                 # ★[2026-07-30 外審 P2-01] JobSuperseded 也是 fatal：重試沒意義
                 #   （新的一輪正在做同一件事），但必須走完下面的終局收尾。
-                fatal = isinstance(e, (LoginNotCompleted, JobSuperseded))
+                # [2026-08-03] HISStartupBlocked（BDE 起不來）同樣 fatal：重試
+                # 沒有意義，而且它與帳密無關 → log 也不能沿用「帳密」那句措辭。
+                fatal = isinstance(e, (LoginNotCompleted, JobSuperseded,
+                                       HISStartupBlocked))
                 if isinstance(e, JobSuperseded):
                     logging.error("會診查詢：%s", e)
+                elif isinstance(e, HISStartupBlocked):
+                    logging.error("會診查詢:住院醫囑系統起不來 → 不重試"
+                                  "(與帳密無關)：%s", e)
                 elif fatal:
                     logging.error("會診查詢:登入沒有完成 → 不重試(避免同一組帳密"
                                   "被連續送出而逼近鎖定門檻)：%s", e)
@@ -2996,6 +3108,9 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     if isinstance(last_err, JobSuperseded):
                         logging.error("會診查詢：被逾時接管 → 放棄且不重試"
                                       "（新的一輪正在跑）。%s", last_err)
+                    elif isinstance(last_err, HISStartupBlocked):
+                        logging.error("會診查詢:住院醫囑系統起不來 → 放棄且不"
+                                      "重試(與帳密無關)。最後錯誤：%s", last_err)
                     elif fatal:
                         logging.error("會診查詢:登入沒有完成 → 放棄且不重試。"
                                       "最後錯誤：%s", last_err)

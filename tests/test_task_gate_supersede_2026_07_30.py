@@ -282,7 +282,11 @@ def test_consult_treats_a_supersede_as_fatal_but_still_finishes_the_cleanup():
     assert issubclass(cq.JobSuperseded, RuntimeError)
     src = inspect.getsource(cq._do_full_job)
     assert "raise JobSuperseded(" in src, "要 raise 走 fatal 收尾，不是 return"
-    assert "fatal = isinstance(e, (LoginNotCompleted, JobSuperseded))" in src
+    # [2026-08-03] fatal 家族會增加（新增了 HISStartupBlocked）→ 釘「JobSuperseded
+    # 在 fatal 判定裡」這個語意，而不是整行字面，否則每加一種 fatal 都會誤紅。
+    i = src.index("fatal = isinstance(")
+    fatal_expr = src[i:i + 240]
+    assert "JobSuperseded" in fatal_expr and "LoginNotCompleted" in fatal_expr
     # 收尾（釋放去重 / 失敗回信）仍在同一條路上
     assert "_release_trigger_dedup(override_recipients)" in src
     assert "_send_failure_notice_async(override_recipients" in src

@@ -23,6 +23,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from cmuh_common import program_launcher as pl  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _no_real_instance_check(monkeypatch):
+    """★[2026-08-03] 測試不可以取決於這台機器上有沒有程式在跑★
+
+    `test_an_unexpected_error_is_reported_with_its_cause` 沒有蓋掉單一實例檢查，
+    於是在【打卡程式真的在跑】的機器上，`launch_helper_script` 在還沒碰到被
+    monkeypatch 的 `launch_app_script` 之前就先回 `already_running=True` → 紅燈。
+    這種紅燈與程式碼無關、只跟開發機當下開了什麼有關（本機實測就是這樣紅的）。
+
+    預設一律「沒有在跑」；需要 True 的測試自己再 setattr 覆蓋（autouse fixture
+    先套用，測試內的 monkeypatch 後套用會贏）。
+    """
+    monkeypatch.setattr(pl, "is_instance_running", lambda _m: False)
+
+
 # ─── ★單一實例：先查再啟動★ ──────────────────────────────────────────────
 def test_an_already_running_program_is_not_launched_again(monkeypatch):
     """★重複打卡／重複寄信就是這樣來的★ 已在執行時連 spawn 都不可以呼叫。"""
