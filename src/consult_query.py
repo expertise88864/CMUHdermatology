@@ -50,9 +50,11 @@ ensure_dependencies(REQUIRED_LIBS)
 import ctypes  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 import html as _html  # noqa: E402
+import json  # noqa: E402
 import logging  # noqa: E402
 import queue  # noqa: E402
 import re  # noqa: E402
+import socket  # noqa: E402
 import subprocess  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
@@ -3537,16 +3539,84 @@ from cmuh_common.settings_defaults import (  # noqa: E402
 
 _JOB_FAIL_ALERT_THRESHOLD = 3          # 連續 3 次放棄(≈45 分鐘無法查詢)才告警,避免暫時性抖動
 _JOB_FAIL_ALERT_COOLDOWN_SEC = 6 * 3600
+_JOB_FAIL_STATE_SCHEMA = 1
+# 時鐘往前跳(NTP 校時、使用者改時間)時,存下來的時間戳可能落在未來。
+# 容忍這麼多;超過就當它壞掉 ——★不可以讓一個壞掉的時間戳把告警永久靜音★。
+_JOB_FAIL_CLOCK_SKEW_SEC = 3600
 _job_fail_streak = 0
 _job_fail_last_alert = 0.0
+_job_fail_lock = threading.Lock()
+
+# ★[2026-08-03] 節流狀態必須落地★
+#   原本 `_job_fail_streak` / `_job_fail_last_alert` 只活在記憶體裡,而這支程式
+#   【本來就會被 watchdog 重啟】(watchdog_config.json 的「會診查詢」項:log 停更
+#   180 秒就重啟)。每重啟一次,冷卻時間就歸零 → 再累積 3 次失敗就又寄一封。
+#   信裡卻寫著「同一波故障最多 6 小時提醒一次」——★宣稱與實作不符★,而使用者
+#   實際收到的是一整天的重複告警(2026-08-03 回報)。
+#   落地之後那句話才是真的。跨機器仍然各寄各的(沒有共用狀態),所以信裡要寫出
+#   是哪一台,收件人才分得出來是同一波還是多台一起壞。
+
+
+def _job_fail_state_path() -> str:
+    from cmuh_common.paths import get_settings_dir
+    return os.path.join(get_settings_dir(), "consult_alert_state.json")
+
+
+def _load_job_fail_state() -> None:
+    """開機時把節流狀態讀回來。★讀不到不等於「剛剛才寄過」★
+
+    讀失敗時保留記憶體中的預設值(streak=0、從沒寄過)——也就是【會寄】的那一邊。
+    這是刻意的:告警存在的理由就是「故障時沒人會發現」,拿一個壞掉/讀不到的
+    節流檔去把它靜音,等於用一個小問題製造一個大問題。噪音可以忍,靜音不行。
+    """
+    global _job_fail_streak, _job_fail_last_alert
+    path = _job_fail_state_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return                      # 第一次跑,不是錯誤
+    except (OSError, ValueError):
+        logging.warning("[health] 告警節流狀態讀不到 → 這一輪照原樣判斷(可能重複寄)",
+                        exc_info=True)
+        return
+    if not isinstance(data, dict) or data.get("schema") != _JOB_FAIL_STATE_SCHEMA:
+        logging.warning("[health] 告警節流狀態的 schema 不認得 → 忽略")
+        return
+    streak = data.get("streak")
+    last = data.get("last_alert_ts")
+    if isinstance(streak, int) and streak >= 0:
+        _job_fail_streak = streak
+    if isinstance(last, (int, float)) and last >= 0:
+        if last > time.time() + _JOB_FAIL_CLOCK_SKEW_SEC:
+            logging.warning("[health] 告警節流時間戳在未來 → 當作沒寄過")
+        else:
+            _job_fail_last_alert = float(last)
+
+
+def _save_job_fail_state() -> None:
+    """把節流狀態原子寫下去。寫不成不致命(頂多退回舊行為:重啟後可能重複寄)。"""
+    try:
+        from cmuh_common.atomic_io import atomic_write_json
+        atomic_write_json(_job_fail_state_path(),
+                          {"schema": _JOB_FAIL_STATE_SCHEMA,
+                           "streak": _job_fail_streak,
+                           "last_alert_ts": _job_fail_last_alert})
+    except Exception:
+        logging.debug("[health] 告警節流狀態寫不下去(略過)", exc_info=True)
 
 
 def _note_job_success() -> None:
     """任務成功跑完 → 清空連續失敗計數（並在剛從故障恢復時留一行 log）。"""
     global _job_fail_streak
-    if _job_fail_streak:
+    with _job_fail_lock:
+        if not _job_fail_streak:
+            return
         logging.info("[health] 會診查詢已恢復正常(先前連續失敗 %d 次)", _job_fail_streak)
-    _job_fail_streak = 0
+        _job_fail_streak = 0
+        # ★恢復了就要把它寫掉★ 否則下次重啟又把舊的 streak 讀回來,
+        #   第一次失敗就直接跨過門檻。
+        _save_job_fail_state()
 
 
 def _note_job_failure(recipients, reason: str) -> None:
@@ -3556,33 +3626,47 @@ def _note_job_failure(recipients, reason: str) -> None:
     不再取自 cfg —— 這封是【系統故障】告警,不是臨床通知。
     """
     global _job_fail_streak, _job_fail_last_alert
-    _job_fail_streak += 1
-    if _job_fail_streak < _JOB_FAIL_ALERT_THRESHOLD:
-        return
-    now = time.time()
-    if now - _job_fail_last_alert < _JOB_FAIL_ALERT_COOLDOWN_SEC:
-        return
-    if not recipients:
-        logging.warning("[health] 會診查詢連續失敗 %d 次,但無收件人可告警",
-                        _job_fail_streak)
-        return
-    _job_fail_last_alert = now
-    streak = _job_fail_streak
+    with _job_fail_lock:
+        _job_fail_streak += 1
+        _save_job_fail_state()      # 先把計數存起來,重啟後才接得下去
+        if _job_fail_streak < _JOB_FAIL_ALERT_THRESHOLD:
+            return
+        now = time.time()
+        if now - _job_fail_last_alert < _JOB_FAIL_ALERT_COOLDOWN_SEC:
+            return
+        if not recipients:
+            logging.warning("[health] 會診查詢連續失敗 %d 次,但無收件人可告警",
+                            _job_fail_streak)
+            return
+        _job_fail_last_alert = now
+        # ★寄之前就先把冷卻時間寫下去★ 寄信是在背景執行緒做的,而這台機器隨時
+        #   可能被 watchdog 重啟;等寄完再寫的話,重啟正好卡在中間就等於沒節流。
+        #   寧可「寫了但信沒寄成」(下一輪 6 小時後補寄)也不要洗信箱。
+        _save_job_fail_state()
+        streak = _job_fail_streak
+    host = ""
+    try:
+        host = socket.gethostname()
+    except OSError:
+        pass
 
     def _worker():
         try:
             from cmuh_common.smtp_mail import send_mail
             send_mail(
                 recipients=[str(r) for r in recipients],
-                subject="⚠ 會診查詢自動化連續失敗",
+                subject="⚠ 會診查詢自動化連續失敗"
+                        + (f"（{host}）" if host else ""),
                 body=("會診查詢的自動輪詢已連續失敗 "
                       f"{streak} 次，目前很可能查不到任何會診。\n\n"
-                      f"最後錯誤：{str(reason)[:300]}\n\n"
+                      + (f"發生在：{host}\n" if host else "")
+                      + f"最後錯誤：{str(reason)[:300]}\n\n"
                       "請注意：輪詢模式在「沒有新會診」時本來就不會寄信，因此這種故障"
                       "從外觀上與「今天沒有新會診」完全一樣——期間請以人工方式確認會診，"
                       "並查看 settings/consult_query.log。\n"
                       "（本信只寄給開發者；臨床同仁不會收到，需要時請自行轉知。）\n"
-                      "（恢復正常後不會再寄；同一波故障最多 6 小時提醒一次。）"),
+                      "（恢復正常後不會再寄；同一波故障最多 6 小時提醒一次，"
+                      "重啟也不會重來。多台電腦各自計算，所以信中會註明是哪一台。）"),
                 attachment_path=None,
                 category="system",      # [P2-02] 連續失敗告警走系統額度
             )
@@ -4396,6 +4480,11 @@ def main() -> None:
 
         # ↓ 以下只有 first_instance 才會跑 ↓
         _setup_logging()
+
+        # ★把告警節流狀態讀回來★ 這支程式會被 watchdog 重啟(log 停更 180 秒),
+        #   狀態只放記憶體的話,每重啟一次冷卻就歸零 → 同一波故障重複洗信箱。
+        #   必須在 _setup_logging 之後(讀失敗的警告要進得了 log)。
+        _load_job_fail_state()
 
         # [穩定性] health monitor — RAM/網路/時鐘/硬碟 + 記憶體 leak 自動重啟 (A/E/F)
         try:
