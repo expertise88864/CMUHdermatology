@@ -67,7 +67,20 @@ _R_DOCTOR_SETTINGS_FROM_2026_08_01 = {
     "R1": {"name": "賴奕彰"},
     "R2": {"name": "林于喬"},
     "R3": {"name": "陳翊嘉"},
+    # ★[使用者定案 2026-08-03] 補上漏掉的 R4★
+    #   升年是每個人往上一階：林于喬 R1→R2、陳翊嘉 R2→R3、蔡明洋 R3→【R4】，
+    #   賴奕彰是新的 R1。原本這組只寫到 R3 —— 蔡明洋就此從值班姓名對照裡
+    #   整個消失，8/1 起他的值班在院方值班表上比對不到。
+    "R4": {"name": "蔡明洋"},
 }
+
+# ★名單修訂版號★（2026-08-03 使用者定案：直接複寫每台電腦上的舊存檔）
+#   `r_doctor_settings.json` 一旦存在就會蓋過預設值，所以光改預設值救不了
+#   已經存過檔的機器 —— 它們會繼續顯示漏掉 R4 的舊名單。
+#   存檔裡的版號小於這個數字（或根本沒有）就以【預設名單】為準；
+#   使用者之後在設定頁改過並儲存，存檔就會帶上新版號而重新被尊重。
+R_DOCTOR_ROSTER_REVISION = 2
+_ROSTER_REVISION_KEY = "_roster_revision"
 
 
 def default_r_doctor_settings(today: date | None = None) -> dict:
@@ -123,9 +136,27 @@ def load_r_doctor_settings(path: str | None = None,
     data, _st = load_json_dict_ex(_path(path, "r_doctor_settings.json"), defaults)
     _note_load_status("r_doctor_settings.json", _st)
     out = clone_default(defaults)
+    try:
+        saved_revision = int(data.get(_ROSTER_REVISION_KEY, 0))
+    except (TypeError, ValueError):
+        saved_revision = 0
+    if saved_revision < R_DOCTOR_ROSTER_REVISION:
+        # ★存檔版本比程式舊 → 以預設名單為準（使用者定案：直接複寫）★
+        #   不在這裡寫檔：載入不該有副作用，而且「拒絕存檔」保護正是為了
+        #   避免讀到一半的狀態被寫回去。使用者按一次儲存就會帶上新版號。
+        logging.info("R 醫師名單存檔版本較舊(%s < %s) → 本次以程式內建名單為準",
+                     saved_revision, R_DOCTOR_ROSTER_REVISION)
+        return out
     for key in out:
         if isinstance(data.get(key), dict):
             out[key] = {"name": str(data[key].get("name", "")).strip()}
+    return out
+
+
+def stamp_r_doctor_revision(mapping: dict) -> dict:
+    """存檔前蓋上名單版號 —— 之後這份存檔才會被尊重。"""
+    out = dict(mapping)
+    out[_ROSTER_REVISION_KEY] = R_DOCTOR_ROSTER_REVISION
     return out
 
 

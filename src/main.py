@@ -31,6 +31,7 @@ from cmuh_common.app_settings import (
     load_doctors_settings as _load_doctors_settings,
     clear_load_failed as _clear_settings_load_failed,
     settings_load_failed as _settings_load_failed,
+    stamp_r_doctor_revision as _stamp_r_doctor_revision,
     load_r_doctor_settings as _load_r_doctor_settings,
     load_threshold_settings as _load_threshold_settings,
 )
@@ -9700,7 +9701,9 @@ class AutomationApp:
             return
         for r_key, entries in self.r_doctor_entries.items():
             self.r_doctor_map[r_key] = {"name": (entries["name_var"].get() or "").strip()}
-        _atomic_write_json(get_conf_path('r_doctor_settings.json'), self.r_doctor_map)
+        # 蓋上名單版號：之後這份存檔才會被尊重（見 app_settings 的說明）
+        _atomic_write_json(get_conf_path('r_doctor_settings.json'),
+                           _stamp_r_doctor_revision(self.r_doctor_map))
         
         for key, var in self.threshold_entries.items():
             try: self.threshold_settings[key] = int(var.get())
@@ -13239,10 +13242,12 @@ class AutomationApp:
 
         self._build_canary_settings(left_column)   # [金絲雀] 院方改版偵測狀態 + 重新校正
 
-        r_doctor_frame = ttk.LabelFrame(left_column, text="R1-R3 醫師姓名（值班對照）", padding=10)
+        r_doctor_frame = ttk.LabelFrame(left_column, text="R1-R4 醫師姓名（值班對照）", padding=10)
         r_doctor_frame.pack(fill=tk.X, pady=(0, 15))
         self.r_doctor_entries = {}
-        for i, r_key in enumerate(["R1", "R2", "R3"]):
+        # ★[使用者定案 2026-08-03] R4 補進來★ 原本硬寫到 R3，所以就算預設值
+        #   有 R4，設定頁也編不到、存檔時還會把它漏掉。
+        for i, r_key in enumerate(["R1", "R2", "R3", "R4"]):
             ttk.Label(r_doctor_frame, text=f"{r_key} 姓名:").grid(row=i, column=0, padx=5, pady=5, sticky='e')
             name_var = tk.StringVar(value=self.r_doctor_map.get(r_key, {}).get('name', ''))
             name_entry = ttk.Entry(r_doctor_frame, textvariable=name_var, width=12); name_entry.grid(row=i, column=1, padx=5, pady=5, sticky='w')
