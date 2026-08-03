@@ -163,6 +163,26 @@ def _inside(app_dir, path) -> bool:
         return False          # 判不出來就當成不在（★查不到 ≠ 沒問題★）
 
 
+def _fsync_path(path, errors):
+    """把 `path` 的內容刷到碟上。→ 成功與否（不丟例外，由呼叫端決定處置）。
+
+    ★一定要用【可寫入】的 handle★（2026-08-03 外審第 4 輪，實測）：
+    Windows 的 `os.fsync` 底層是 CRT 的 `_commit()`，對唯讀 fd 一律回
+    `EBADF`。也就是說 `open(p, "rb")` + `os.fsync` 這個寫法，在本專案唯一
+    會跑的平台上【百分之百是 no-op】，只是錯誤被吞掉、看起來像有做。實測：
+
+        rb  → OSError [Errno 9] Bad file descriptor
+        rb+ → OK
+    """
+    try:
+        with open(path, "rb+") as f:
+            os.fsync(f.fileno())
+        return True
+    except OSError as e:
+        errors.append(f"{os.path.basename(path)}：fsync 失敗（{e}）")
+        return False
+
+
 def _rollback_one(app_dir, entry, errors):
     """→ ("restored" | "untouched" | "retryable" | "terminal")。"""
     target = str(entry.get("target") or "")
@@ -196,23 +216,24 @@ def _rollback_one(app_dir, entry, errors):
             #   下一次啟動照著同一份備份再做一次，結果完全相同（冪等）。
             #   ★換名前要 fsync★：rename 只保證【名字】的原子性，不保證暫存
             #   檔的【內容】已經落到碟上。換完名、快取還沒刷回去就斷電的話，
-            #   下次開機看到的是「正式檔改名成功、內容卻是半截」，而那時候
-            #   journal 與 .bak 都已經清掉了 ——★連重試的機會都沒有★。
+            #   下次開機看到的是「正式檔改名成功、內容卻是半截」。
             tmp = target + ".restore.tmp"
             try:
                 shutil.copyfile(backup, tmp)
-                try:
-                    with open(tmp, "rb") as f:
-                        os.fsync(f.fileno())
-                except OSError:
-                    # fsync 失敗不致命（多半是特殊檔案系統），但耐久性沒保證
-                    pass
+                durable = _fsync_path(tmp, errors)
                 os.replace(tmp, target)
             except BaseException:
                 with contextlib.suppress(OSError):
                     if os.path.exists(tmp):
                         os.remove(tmp)
                 raise
+            if not durable:
+                # ★內容【已經】換回舊版了★，只是不保證寫到碟上。所以不報
+                #   restored（不會被標成已還原、備份也不會被清），改報可重試：
+                #   日誌與 .bak 都留著，下次開機原封不動再做一次（冪等）。
+                #   反過來「乾脆不換」並沒有比較安全 —— 那會讓臨床程式留在
+                #   壞掉的新版上，而斷電風險一樣要靠日誌與備份來收。
+                return "retryable"
         elif os.path.exists(target):
             os.remove(target)
         return "restored"

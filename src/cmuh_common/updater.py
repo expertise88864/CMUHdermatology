@@ -140,7 +140,35 @@ def _file_op_with_retry(label: str, func, *args):
     raise last_exc
 
 
-def _restore_keeping_backup(backup: str, target: str) -> None:
+def _fsync_path(path: str) -> bool:
+    """把 `path` 的內容刷到碟上。→ 成功與否（★不丟例外，由呼叫端決定處置★）。
+
+    ★一定要用【可寫入】的 handle★（2026-08-03 外審第 4 輪，實測）：
+    Windows 的 `os.fsync` 底層是 CRT 的 `_commit()`，而 `_commit()` 對唯讀
+    file descriptor 一律回 `EBADF`。也就是說
+
+        with open(p, "rb") as f: os.fsync(f.fileno())    # ← 在 Windows 永遠失敗
+
+    這個寫法在本專案唯一會跑的平台上【百分之百是 no-op】，只是錯誤被吞掉、
+    看起來像有做。實測：
+
+        rb  → OSError [Errno 9] Bad file descriptor
+        rb+ → OK
+
+    所以 `_make_backup_atomically`（2026-08-01 起）宣稱的「fsync（斷電也要
+    落到碟上）」其實從來沒有生效過 ——★宣稱要對得上實作★。
+    """
+    try:
+        with open(path, "rb+") as f:
+            os.fsync(f.fileno())
+        return True
+    except OSError:
+        logging.error("[更新] fsync 失敗，內容不保證已落到碟上 [%s]", path,
+                      exc_info=True)
+        return False
+
+
+def _restore_keeping_backup(backup: str, target: str) -> bool:
     """從備份還原，★但不要把備份用掉★（2026-08-03 外審 P2）。
 
     原本是 `os.replace(backup, target)` —— 一次搬移就把備份消耗掉了。
@@ -152,22 +180,28 @@ def _restore_keeping_backup(backup: str, target: str) -> None:
     收乾淨之後才刪（見 `_drop_backups`）。中途死掉也沒關係 —— 備份還在，
     下一輪照著同一份再做一次，結果完全相同（冪等）。
 
-    ★換名前要 fsync★（2026-08-03 外審 P2）：`_make_backup_atomically` 早就
-    這樣做了，這裡卻漏掉。rename 是原子的沒錯，但那只保證【名字】的原子性，
+    ★換名前要 fsync★：rename 是原子的沒錯，但那只保證【名字】的原子性，
     不保證暫存檔的【內容】已經落到碟上。換完名之後、快取還沒刷回去之前斷電，
-    開機後看到的就是「正式檔已經改名成功、內容卻是半截」，而此時 journal 與
-    `.bak` 都已經被清掉了 ——★連重試的機會都沒有★。
+    開機後看到的就是「正式檔已經改名成功、內容卻是半截」。
+
+    → 回傳「這一筆算不算收工」（fsync 成功＝True）。
+
+    ★fsync 失敗時仍然要換過去★（2026-08-03 外審第 4 輪，不採納原建議）：
+    外審建議「fsync 失敗就不要換、也不要清備份」。不清備份是對的，但
+    【不換】會把機器留在半新半舊的壞版本上，而換過去至少讓臨床程式跑在
+    完好的舊版。兩者的斷電風險其實一樣 —— 因為 fsync 沒成功這一筆就【不
+    算收工】：日誌與 `.bak` 都留著，下一輪重做一次（冪等）。也就是說
+
+        換 + 留日誌/備份 → 斷電最壞是半截檔，下一輪修得回來；程式當下可用
+        不換 + 留日誌/備份 → 斷電最壞是壞版本，下一輪修得回來；程式當下壞的
+
+    後者沒有比較安全，只是比較晚可用。★可修復性來自留著日誌與備份，不是
+    來自不動手★，所以照換，只是不報「已還原」。
     """
     tmp = target + ".restore.tmp"
     try:
         _copy_file_with_retry(backup, tmp)
-        try:
-            with open(tmp, "rb") as f:
-                os.fsync(f.fileno())
-        except OSError:
-            # fsync 失敗不致命（多半是特殊檔案系統），但要說出來：耐久性沒保證
-            logging.debug("[更新] 還原暫存檔 fsync 失敗 [%s]", tmp,
-                          exc_info=True)
+        durable = _fsync_path(tmp)
         _replace_file_with_retry(tmp, target)
     except BaseException:
         try:
@@ -176,6 +210,7 @@ def _restore_keeping_backup(backup: str, target: str) -> None:
         except OSError:
             pass
         raise
+    return durable
 
 
 def _drop_backups(targets) -> None:
@@ -220,12 +255,16 @@ def _make_backup_atomically(target_path: str) -> None:
         logging.debug("[更新] 清除殘留的 .bak.tmp 失敗 [%s]", tmp_path,
                       exc_info=True)
     _copy_file_with_retry(target_path, tmp_path)
-    try:
-        with open(tmp_path, "rb") as f:
-            os.fsync(f.fileno())
-    except OSError:
-        # fsync 失敗不致命（多半是特殊檔案系統），但要說出來：此時的耐久性沒有保證
-        logging.debug("[更新] 備份檔 fsync 失敗 [%s]", tmp_path, exc_info=True)
+    if not _fsync_path(tmp_path):
+        # ★備份這一條可以【停下來】，而且應該停★（2026-08-03 外審第 4 輪）
+        #   還原路徑不能停（停下來＝臨床程式留在壞版本上），但備份不同：
+        #   做不出可信的備份就【不要更新】—— 更新是可以延後的，備份卻是等一下
+        #   出事時唯一的退路。拿一份不保證完整的 .bak 去換掉正式檔，正是這個
+        #   函式的 docstring 說要避免的「復原程序自己製造損毀」。
+        #   丟出去 → Phase 2 中止 → 已寫的檔回滾 → 這一輪不更新，程式照跑舊版。
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
+        raise OSError(f"備份 fsync 失敗，不敢拿它換掉正式檔：{tmp_path}")
     _replace_file_with_retry(tmp_path, target_path + ".bak")
 
 
@@ -723,11 +762,25 @@ def _rollback_written_files(
                 terminal.append(written.target_path)
                 continue
         try:
+            durable = True
             if written.existed_before:
-                _restore_keeping_backup(backup_path, written.target_path)
+                durable = _restore_keeping_backup(backup_path,
+                                                  written.target_path)
             elif os.path.exists(written.target_path):
                 _remove_file_with_retry(written.target_path)
-            restored.append(written.target_path)
+            if durable:
+                restored.append(written.target_path)
+            else:
+                # ★措辭鐵律★ 內容【已經】換回舊版了，說「回滾失敗」是誣賴它。
+                #   缺的是耐久性保證，所以這一筆不算收工：不進 restored（於是
+                #   不會被標成 restored、備份也不會被清），改進 unresolved 讓
+                #   下一輪原封不動再做一次（冪等）。
+                msg = ("內容已換回舊版，但 fsync 失敗 → 不保證已寫到碟上；"
+                       "保留日誌與備份，下一輪重做一次")
+                logging.error("更新回滾尚未收工 [%s]: %s",
+                              written.target_path, msg)
+                errors.append(f"[rollback] {written.target_path}: {msg}")
+                unresolved.append(written)
         except Exception as e:
             logging.error("更新回滾失敗 [%s]: %s", written.target_path, e)
             errors.append(f"[rollback] {written.target_path}: {e}")

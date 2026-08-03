@@ -304,6 +304,11 @@ class TestTheRestoreIsDurableNotJustAtomic:
     都沒有。`_make_backup_atomically` 一直都有 fsync，這兩條還原路徑漏掉了。
 
     ★判準是【順序】不是【有沒有呼叫】★：先換名再 fsync 等於沒防到。
+
+    ★而且要看它有沒有【成功】★（2026-08-03 外審第 4 輪）：第一版只記錄
+    「fsync 被呼叫過」，而呼叫端把 OSError 吞掉了 —— 於是在 Windows 上
+    `open(p, "rb")` + `os.fsync` 每一次都拋 EBADF、每一次都被吞、測試每一次
+    都綠。★測到的是「有沒有呼叫」，不是「有沒有耐久性」★。
     """
 
     def _record_order(self, monkeypatch, replace_owner, replace_attr):
@@ -312,8 +317,8 @@ class TestTheRestoreIsDurableNotJustAtomic:
         real_replace = getattr(replace_owner, replace_attr)
 
         def _fsync(fd):
+            real_fsync(fd)          # ★先真的做★ 失敗就讓它炸，不要記成成功
             order.append("fsync")
-            return real_fsync(fd)
 
         def _replace(src, dst):
             order.append("replace")
@@ -358,3 +363,171 @@ class TestTheRestoreIsDurableNotJustAtomic:
         assert order == ["fsync", "replace"], (
             f"還原沒有先把內容刷到碟上再換名：{order}")
         assert target.read_text(encoding="utf-8") == "舊版"
+
+    def test_a_read_only_handle_cannot_fsync_at_all_on_windows(self, tmp_path):
+        """★這一條是上面那個假綠燈的根因，釘住它★
+
+        不是「理論上比較好」——是 `open(p, "rb")` + `os.fsync` 在 Windows
+        【一定失敗】。判準取自實機行為，不是推理。
+        """
+        p = tmp_path / "x.bin"
+        p.write_bytes(b"A" * 64)
+        if os.name != "nt":
+            pytest.skip("只有 Windows 的 _commit() 會拒絕唯讀 fd")
+        with pytest.raises(OSError), open(p, "rb") as f:
+            os.fsync(f.fileno())
+        with open(p, "rb+") as f:          # 可寫入的 handle 才做得到
+            os.fsync(f.fileno())
+
+
+class TestWhenFsyncFailsTheEntryIsNotFinished:
+    """[2026-08-03 外審第 4 輪] fsync 失敗 → 換過去，但【不算收工】。
+
+    外審建議「fsync 失敗就不要換」。不採納後半段：不換會把臨床程式留在半新
+    半舊的壞版本上，而斷電風險一樣得靠「留著日誌與備份」來收 —— 所以照換，
+    只是不報已還原（備份不清、日誌不清），下一輪原封不動再做一次。
+    """
+
+    def test_the_updater_replaces_but_keeps_the_backup(self, tmp_path,
+                                                       monkeypatch):
+        target = tmp_path / "a.py"
+        target.write_text("新版", encoding="utf-8")
+        backup = tmp_path / "a.py.bak"
+        backup.write_text("舊版", encoding="utf-8")
+
+        monkeypatch.setattr(updater, "_fsync_path", lambda p: False)
+        durable = updater._restore_keeping_backup(str(backup), str(target))
+        monkeypatch.undo()
+
+        assert durable is False, "fsync 失敗卻回報收工了"
+        assert target.read_text(encoding="utf-8") == "舊版", (
+            "★不換並沒有比較安全★ 內容仍然要換回舊版")
+        assert backup.exists(), "★留著備份才有下一輪★"
+        assert not (tmp_path / "a.py.restore.tmp").exists()
+
+    def test_the_updater_does_not_report_it_as_rolled_back(self, tmp_path,
+                                                           monkeypatch):
+        """不算收工 → 不進 restored（否則會被標成已還原、備份被清掉）。"""
+        target = tmp_path / "a.py"
+        target.write_text("新版", encoding="utf-8")
+        backup = tmp_path / "a.py.bak"
+        backup.write_text("舊版", encoding="utf-8")
+        journal = _seed(tmp_path, [(str(target), True, "")])
+
+        monkeypatch.setattr(updater, "_fsync_path", lambda p: False)
+        monkeypatch.setattr(updater, "get_app_dir", lambda: str(tmp_path))
+        restored = updater.recover_incomplete_update(str(tmp_path))
+        monkeypatch.undo()
+
+        assert restored == [], "fsync 沒成功不可以說「已回滾」"
+        assert backup.exists(), "★備份被清掉＝下一輪救不回來★"
+        assert os.path.exists(journal), "日誌要留著才會有下一輪"
+        entry = _read_journal(journal)["files"][0]
+        assert entry.get("state", br.STATE_PENDING) == br.STATE_PENDING, (
+            f"還沒收工卻被標成已還原：{entry.get('state')!r}")
+
+    def test_the_bootstrap_reports_retryable_not_restored(self, tmp_path,
+                                                          monkeypatch):
+        target = tmp_path / "a.py"
+        target.write_text("新版", encoding="utf-8")
+        backup = tmp_path / "a.py.bak"
+        backup.write_text("舊版", encoding="utf-8")
+
+        monkeypatch.setattr(br, "_fsync_path", lambda p, errors: False)
+        errors = []
+        outcome = br._rollback_one(
+            str(tmp_path),
+            {"target": str(target), "existed_before": True, "staged": ""},
+            errors)
+        monkeypatch.undo()
+
+        assert outcome == "retryable", f"應該留給下一輪重做：{outcome}"
+        assert target.read_text(encoding="utf-8") == "舊版", "內容仍要換回去"
+        assert backup.exists(), "★留著備份才有下一輪★"
+
+    def test_a_backup_that_cannot_be_fsynced_aborts_the_update(self, tmp_path,
+                                                               monkeypatch):
+        """★備份這一條相反：做不出可信的備份就不要更新★
+
+        更新可以延後，備份卻是等一下出事時唯一的退路。拿一份不保證完整的
+        `.bak` 去換掉正式檔，正是 `_make_backup_atomically` 要避免的事。
+        """
+        target = tmp_path / "a.py"
+        target.write_text("目前版本", encoding="utf-8")
+
+        monkeypatch.setattr(updater, "_fsync_path", lambda p: False)
+        with pytest.raises(OSError):
+            updater._make_backup_atomically(str(target))
+        monkeypatch.undo()
+
+        assert target.read_text(encoding="utf-8") == "目前版本", "正式檔沒被動"
+        assert not (tmp_path / "a.py.bak").exists(), (
+            "★不可以留下一份不保證完整的備份★ 它會被下一輪當成可信的還原來源")
+        assert not (tmp_path / "a.py.bak.tmp").exists(), "暫存檔沒清乾淨"
+
+
+def test_no_fsync_anywhere_in_src_uses_a_read_only_handle():
+    """★守衛要涵蓋【這個性質涉及的所有檔】，不是我這次改到的兩個★
+
+    這次的根因是「`open(p, "rb")` + `os.fsync` 在 Windows 是 no-op」。同樣的
+    寫法在 src 底下任何地方都一樣壞，而且它不會噴錯 —— 只會安靜地沒有耐久性。
+    所以用 AST 掃全部原始碼：凡是 `with open(...) as f:` 區塊裡出現
+    `os.fsync(f.fileno())`，那個 open 的 mode 就必須可寫入。
+
+    ★空集合不算通過★：掃不到任何 fsync 代表守衛失效（檔案搬家、寫法改變），
+    那要當成失敗，不是「沒問題」。
+    """
+    import ast
+    import pathlib
+
+    src_root = pathlib.Path(__file__).resolve().parent.parent / "src"
+    assert src_root.is_dir(), f"找不到 src（守衛失效）：{src_root}"
+
+    checked, offenders = [], []
+    for path in sorted(src_root.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError) as e:      # pragma: no cover
+            offenders.append(f"{path.name}：讀不到／解析不了（{e}）")
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.With):
+                continue
+            for item in node.items:
+                call = item.context_expr
+                if not (isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Name)
+                        and call.func.id == "open"):
+                    continue
+                var = item.optional_vars
+                if not isinstance(var, ast.Name):
+                    continue
+                # 這個 with 區塊裡有沒有 os.fsync(<var>.fileno())？
+                syncs = [n for n in ast.walk(node)
+                         if isinstance(n, ast.Call)
+                         and isinstance(n.func, ast.Attribute)
+                         and n.func.attr == "fsync"
+                         and len(n.args) == 1
+                         and isinstance(n.args[0], ast.Call)
+                         and isinstance(n.args[0].func, ast.Attribute)
+                         and n.args[0].func.attr == "fileno"
+                         and isinstance(n.args[0].func.value, ast.Name)
+                         and n.args[0].func.value.id == var.id]
+                if not syncs:
+                    continue
+                mode = "r"
+                if len(call.args) >= 2 and isinstance(call.args[1],
+                                                      ast.Constant):
+                    mode = str(call.args[1].value)
+                for kw in call.keywords:
+                    if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+                        mode = str(kw.value.value)
+                where = f"{path.name}:{syncs[0].lineno}"
+                checked.append(where)
+                if not any(c in mode for c in "wa+x"):
+                    offenders.append(f"{where} 用 mode={mode!r} 開檔")
+
+    assert checked, "★掃不到任何 fsync★ 守衛失效了（不是「沒問題」）"
+    assert offenders == [], (
+        "唯讀 handle 的 os.fsync 在 Windows 一律回 EBADF＝沒有耐久性："
+        + "；".join(offenders))
