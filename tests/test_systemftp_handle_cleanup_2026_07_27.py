@@ -33,7 +33,8 @@ def _code_only(src: str) -> str:
 
 def _hidden_fn() -> str:
     src = _src()
-    i = src.index("def _automation_on_hidden(")
+    # [2026-08-03 常駐登入] 啟動/清理搬進常駐 session 區段,不變量相同
+    i = src.index("class _PersistentSession:")
     j = src.index("\ndef _run_with_sw_hide(", i)
     return _code_only(src[i:j])
 
@@ -54,20 +55,20 @@ def test_handle_based_termination_is_the_last_resort():
     code = _hidden_fn()
     # 注意:函式內有兩個 finally(清理區段、以及關 handle 的內層),
     # 要取【含 cleanup_pids 的那一個】,不是 rindex 找到的最後一個。
-    i_fin = code.index("cleanup_pids = our_pids")
-    tail = code[i_fin:]
-    assert "WaitForSingleObject(_hproc, 0)" in tail, "要先確認它是否仍在執行"
-    assert "TerminateProcess(_hproc, 1)" in tail, "仍在執行就用 handle 強制結束"
+    i_fin = code.index("def _terminate_session_process(")
+    tail = code[i_fin:code.index("def _session_close(")]
+    assert "WaitForSingleObject(sess.hproc, 0)" in tail, "要先確認它是否仍在執行"
+    assert "TerminateProcess(sess.hproc, 1)" in tail, "仍在執行就用 handle 強制結束"
     i_close = tail.index("close_pids(")
-    i_term = tail.index("TerminateProcess(_hproc")
+    i_term = tail.index("TerminateProcess(sess.hproc")
     assert i_close < i_term, "優雅關閉優先,handle 強制結束是最後保險"
 
 
 def test_handles_are_closed():
     """handle 不關的話核心會一直保留該 PID(而且我們自己也在洩漏 handle)。"""
     code = _hidden_fn()
-    tail = code[code.index("cleanup_pids = our_pids"):]
-    assert "for _h in (_hthread, _hproc):" in code
+    tail = code[code.index("def _terminate_session_process("):]
+    assert "for _h in (sess.hthread, sess.hproc):" in code
     assert "_h.Close()" in code
     assert "_h.Close()" in tail, "關 handle 要在同一個清理區段內"
 
@@ -75,7 +76,15 @@ def test_handles_are_closed():
 def test_fallback_snapshot_path_retained():
     """不可矯枉過正:快照差集的後備路徑仍要在(handle 只是多一道保險)。"""
     code = _hidden_fn()
-    assert "cleanup_pids = our_pids or (_systemftp_pids() - before)" in code
+    # [2026-08-03] our_pids 進 try 前就含自己開的 PID(不可能為空),
+    # 失敗路徑一律走 handle 保證的清理 → 快照後備的等價保證仍在。
+    i_impl = code.index("def _cold_start_session_impl(")
+    seg = code[i_impl:]
+    assert (seg.index("our_pids: set = {_spawned_pid}")
+            < seg.index("creds_sent = False")), (
+        "our_pids 必須在進 try 前就含自己開的 PID")
+    i_exc = seg.index("except BaseException")
+    assert "_terminate_session_process(" in seg[i_exc:]
 
 
 def test_orphan_sweep_still_uses_positive_identification():

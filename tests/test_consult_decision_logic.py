@@ -402,37 +402,54 @@ def test_load_config_times_non_list_falls_back(tmp_path, monkeypatch):
 # ─── _rebuild_schedule 排程建立 ──────────────────────────────────────────
 
 def test_rebuild_schedule_creates_single_poll_job(monkeypatch):
-    """[2026-06-25] 改為每 N 分鐘輪詢(±1 隨機抖動):排程只建立 1 個 poll job;
-    .to() 讓間隔在 N-1 ~ N+1 分隨機(interval=下限14、latest=上限16)。"""
-    cfg = _base_cfg(enabled=True, poll_interval_minutes=15)
+    """[2026-08-03 常駐登入] 隱藏桌面可用 → 秒級 ±10% 抖動的單一 poll job;
+    無隱藏桌面(SW_HIDE=每輪完整登入) → 維持 ≥15 分鐘的舊節奏(防帳密鎖定)。"""
+    cfg = _base_cfg(enabled=True, poll_interval_minutes=3)
     monkeypatch.setattr(cq, "load_config", lambda: cfg)
+    monkeypatch.setattr(cq, "_ensure_hidden_desktop", lambda: 1234)
+    monkeypatch.setattr(cq._user32, "CloseDesktop", lambda h: None,
+                        raising=False)
+    cq._rebuild_schedule()
+    try:
+        jobs = cq.schedule.get_jobs()
+        assert len(jobs) == 1
+        assert jobs[0].unit == "seconds"
+        assert jobs[0].interval == 162 and jobs[0].latest == 198  # 180s ±10%
+    finally:
+        cq.schedule.clear()
+    # SW_HIDE 後備:即使設 3 分鐘也要被抬回 ≥15 分鐘的冷啟動節奏
+    monkeypatch.setattr(cq, "_ensure_hidden_desktop", lambda: None)
     cq._rebuild_schedule()
     try:
         jobs = cq.schedule.get_jobs()
         assert len(jobs) == 1
         assert jobs[0].unit == "minutes"
-        assert jobs[0].interval == 14 and jobs[0].latest == 16   # 15 ±1 隨機區間
+        assert jobs[0].interval == 14 and jobs[0].latest == 16   # 15 ±1
     finally:
         cq.schedule.clear()
 
 
 def test_rebuild_schedule_clamps_interval(monkeypatch):
-    """間隔夾在 5~120 分鐘;±1 抖動下限不低於 5;壞值退回預設 15,不可炸掉排程器。"""
+    """間隔夾在 2~120 分鐘(常駐後每輪只是按查詢再退回,2 分已保守);
+    壞值退回預設,不可炸掉排程器。"""
+    monkeypatch.setattr(cq, "_ensure_hidden_desktop", lambda: 1234)
+    monkeypatch.setattr(cq._user32, "CloseDesktop", lambda h: None,
+                        raising=False)
     monkeypatch.setattr(cq, "load_config", lambda: _base_cfg(enabled=True, poll_interval_minutes=1))
     cq._rebuild_schedule()
     j = cq.schedule.get_jobs()[0]
-    assert j.interval == 5 and j.latest == 6     # 夾到下限 5(±1 下限不低於 5)
+    assert j.interval == 108 and j.latest == 132   # 夾到下限 2 分 → 120s ±10%
     cq.schedule.clear()
     monkeypatch.setattr(cq, "load_config", lambda: _base_cfg(enabled=True, poll_interval_minutes=999))
     cq._rebuild_schedule()
     j = cq.schedule.get_jobs()[0]
-    assert j.interval == 119 and j.latest == 121  # 夾到上限 120 → 119~121
+    assert j.interval == 162 and j.latest == 198  # 999 分 → 常駐上限夾到 3 分(keepalive < 5 分登出)
     cq.schedule.clear()
     monkeypatch.setattr(cq, "load_config", lambda: _base_cfg(enabled=True, poll_interval_minutes="bad"))
     cq._rebuild_schedule()  # 不可 raise
     try:
         j = cq.schedule.get_jobs()[0]
-        assert j.interval == 14 and j.latest == 16  # 壞值→預設 15 → 14~16
+        assert j.interval == 162 and j.latest == 198  # 壞值→預設 3 分 → ±10%
     finally:
         cq.schedule.clear()
 
@@ -1229,6 +1246,6 @@ def test_load_config_normalizes_bad_poll_quiet(monkeypatch, tmp_path):
                              "quiet_start_hour": "x", "quiet_end_hour": 999}), encoding="utf-8")
     monkeypatch.setattr(cq, "CONFIG_FILE", f)
     cfg = cq.load_config()
-    assert cfg["poll_interval_minutes"] == 15        # None → 預設
+    assert cfg["poll_interval_minutes"] == 3         # None → 預設(常駐 keepalive)
     assert cfg["quiet_start_hour"] == 0              # "x" → 預設 0
     assert cfg["quiet_end_hour"] == 23               # 999 → 夾到 23

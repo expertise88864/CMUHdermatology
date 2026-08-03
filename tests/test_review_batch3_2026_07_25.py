@@ -96,7 +96,7 @@ def test_menu_command_id_verified_before_posting():
     src = inspect.getsource(cq.resolve_menu_command_id)
     assert "_find_menu_id_by_caption" in src, "非預期 ID 必須改依確切標題定位"
     assert "return None" in src, "核對不符要放棄（回 None）"
-    for fn in (cq._automation_on_hidden, cq._run_with_sw_hide):
+    for fn in (cq._query_cycle, cq._run_with_sw_hide):
         s2 = inspect.getsource(fn)
         i = s2.index("resolve_menu_command_id")
         assert "cmd_id is None" in s2[i:i + 400], \

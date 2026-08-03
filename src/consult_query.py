@@ -112,6 +112,8 @@ except Exception:
 # =============================================================================
 # 路徑與設定
 # =============================================================================
+from cmuh_common import consult_keepalive as _keepalive  # noqa: E402
+
 BASE_DIR = Path(get_app_dir())
 SETTINGS_DIR = Path(get_settings_dir())
 CONFIG_FILE = SETTINGS_DIR / "consult_query_config.json"
@@ -168,7 +170,7 @@ DEFAULT_CONFIG = {
     "weekend_times": ["12:40", "17:10"],   # 週六、週日（已停用,同上）
     # [2026-06-25] 即時偵測:每 N 分鐘輪詢「我的會診清單」,只在出現「新病歷號」時才寄信
     # (信內含目前全部未回覆清單)。已取代固定時間排程(12:40/17:10)。
-    "poll_interval_minutes": 15,
+    "poll_interval_minutes": 3,   # [2026-08-03 常駐登入] 3 分鐘=keepalive 節奏(±10% 抖動;院方 5 分鐘閒置強制登出)
     # 半夜休息時段 [start, end):此區間不輪詢、不寄信;過夜新增的會診由 end 之後第一輪一次補寄。
     "quiet_start_hour": 0,
     "quiet_end_hour": 6,
@@ -410,8 +412,28 @@ def load_config() -> dict:
         # [2026-06-25] 輪詢/休息時段數值防呆:None/壞值/超界 → 退回預設並夾範圍,
         # 避免後續 _rebuild_schedule / poll 休息判斷的 int() 直接炸掉(Codex 指出)。
         try:
-            cfg["poll_interval_minutes"] = max(
-                5, min(120, int(cfg.get("poll_interval_minutes", 15))))
+            _pim = int(cfg.get("poll_interval_minutes", 3))
+            # [2026-08-03 常駐登入] 既有部署存的是舊預設 15 → 一次性升級為 3
+            # (keepalive 節奏)。只升級「恰等於舊預設」者;升級後立旗標,使用者
+            # 之後刻意改回 15 不會被再次覆蓋。
+            # [codex P2 已評估→維持] 「值=15」無法分辨舊預設或使用者自選——本機隊
+            # 單一操作者,3 分鐘正是使用者 2026-08-03 的直接指示(「每3分鐘查詢一次」),
+            # 且現存 15 全部來自舊預設;旗標保證只遷移一次,之後改回 15 不再被動。
+            if _pim == 15 and not cfg.get("keepalive_migrated_v1"):
+                _pim = 3
+                # [codex P1 R5] 遷移值必須【寫進 cfg 再落地】——只改區域變數的話,
+                # 檔案存的是 15+旗標,下次啟動旗標擋住遷移 → 永遠退回 15,
+                # 5 分鐘閒置登出把常駐 session 整個打掉。
+                cfg["poll_interval_minutes"] = 3
+                cfg["keepalive_migrated_v1"] = True
+                try:
+                    atomic_write_json(str(CONFIG_FILE), cfg)
+                    logging.info("[migrate] 輪詢間隔 15 分鐘(舊預設)升級為 3 分鐘"
+                                 "(常駐 keepalive)")
+                except Exception:
+                    logging.warning("[migrate] 寫回升級後設定失敗(不影響本次執行)",
+                                    exc_info=True)
+            cfg["poll_interval_minutes"] = max(2, min(120, _pim))
         except (TypeError, ValueError):
             cfg["poll_interval_minutes"] = DEFAULT_CONFIG["poll_interval_minutes"]
         for _qk in ("quiet_start_hour", "quiet_end_hour"):
@@ -1953,6 +1975,8 @@ def run_consult_flow(trigger_label: str = "") -> tuple:
         return result["shot"]
 
     logging.warning("無法建立隱藏桌面，改用 SW_HIDE 後備模式（可能短暫看到視窗）")
+    # [codex P1 R17] 排程若還停在 3 分鐘常駐節奏,SW_HIDE=每輪完整登入 → 立刻降速
+    _demote_schedule_to_legacy()
     return _run_with_sw_hide(cfg, roster_label)
 
 
@@ -2155,31 +2179,171 @@ def _describe_windows_for_diag(our_pids: set, clicks: int, last_notice,
             f"最後一個 hwnd={last_notice});當下看到的視窗:{detail}")
 
 
-def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -> tuple:
-    """在隱藏桌面執行完整流程（呼叫者需已 SetThreadDesktop）。回傳 (截圖, 文字)。
+# =============================================================================
+# 常駐 session（2026-08-03 使用者定案）
+# =============================================================================
+# 背景:院方 HIS 閒置 5 分鐘強制登出;舊的「每輪開程式→登入→查→關程式」冷啟動
+# 既慢又讓登入次數逼近鎖定門檻。改為登入一次後【停在主畫面】,每輪只「按會診
+# 查詢→截圖/擷取→按『回』退回主畫面」——查詢本身就是 keepalive。
+# 純政策(間隔/冷卻/定期重啟/BDE 重開機門檻)在 cmuh_common/consult_keepalive.py。
+class _PersistentSession:
+    """一個活著的 systemftp(隱藏桌面)+ 已登入停在主畫面。"""
 
-    因為隱藏桌面上 systemftp 是唯一前景應用，不需要 stealth thread、不需要
-    show_offscreen、不會與使用者畫面衝突——程式碼相對單純。
+    def __init__(self, hproc, hthread, pid, our_pids):
+        self.hproc = hproc            # CreateProcess 的行程 handle(殺人執照)
+        self.hthread = hthread
+        self.pid = pid
+        self.our_pids = set(our_pids)
+        self.started_at = time.time() # 供 6 小時定期重啟判斷
+        # [codex P1 R12] 租約:正在被某個 worker 使用中。run_consult_flow 的 240 秒
+        # join 逾時會【棄置】worker(daemon 緒仍在跑),下一輪絕不可跟它共用同一個
+        # session(兩個 worker 對同一組 HIS 視窗送命令=截圖錯亂/互相關窗)。
+        self.in_use = False
+
+
+_session_lock = threading.Lock()      # 只保護 _psession 參照的取放
+_psession = None
+_login_cooldown_until = 0.0           # 登入失敗冷卻(見 _cold_start_session)
+
+
+def _session_pids() -> set:
+    with _session_lock:
+        return set(_psession.our_pids) if _psession else set()
+
+
+def _session_is_alive(sess) -> bool:
+    """行程還活著 + 主畫面視窗還在。★呼叫緒須在隱藏桌面上★(find_windows 只列舉
+    本緒桌面)。主畫面在但被 modal 擋住的情況這裡不驗——查詢會失敗,由恢復機制處理。"""
+    try:
+        if win32event.WaitForSingleObject(sess.hproc, 0) != win32event.WAIT_TIMEOUT:
+            return False              # 行程已結束
+    except Exception:
+        return False
+    return bool(find_windows(MAIN_CLASS, pids=sess.our_pids))
+
+
+def _terminate_session_process(sess) -> None:
+    """優雅關閉 → handle 強制結束 → 關 handle。
+
+    沿用 2026-07-27 事故的教訓:handle 綁定的必然是我們自己開的那個行程,
+    不依賴名稱/視窗列舉,資源耗盡時照樣有效、不可能誤殺使用者的醫囑系統。"""
+    try:
+        close_pids(sess.our_pids)
+    except Exception:
+        logging.debug("[session] 優雅關閉失敗(續走 handle 強制結束)", exc_info=True)
+    try:
+        still = (win32event.WaitForSingleObject(sess.hproc, 0)
+                 == win32event.WAIT_TIMEOUT)
+        if still:
+            logging.warning("[session] systemftp(pid=%s) 優雅關閉後仍在 → "
+                            "以行程 handle 強制結束", sess.pid)
+            win32process.TerminateProcess(sess.hproc, 1)
+            win32event.WaitForSingleObject(sess.hproc, 3000)
+    except Exception:
+        logging.warning("[session] 以 handle 確認/結束 systemftp 失敗", exc_info=True)
+    finally:
+        for _h in (sess.hthread, sess.hproc):
+            try:
+                _h.Close()
+            except Exception:
+                pass
+
+
+def _session_close(reason: str) -> None:
+    """收掉常駐 session(沒有 session 時靜默)。任何執行緒都可呼叫:
+    優雅關閉跨桌面可能無效,但 handle 強制結束與桌面無關,結果是確定的。"""
+    global _psession
+    with _session_lock:
+        sess = _psession
+        _psession = None
+    if sess is None:
+        return
+    logging.info("[session] 收掉常駐 systemftp(pid=%s):%s", sess.pid, reason)
+    _terminate_session_process(sess)
+
+
+def _session_release(sess) -> None:
+    """歸還租約(僅現任;已被收掉/換人則無事)。"""
+    with _session_lock:
+        if _psession is sess:
+            sess.in_use = False
+
+
+def _session_close_if_current(sess, reason: str) -> bool:
+    """[codex P1 R11] 只收掉【自己手上那個】session → 回傳「我是否仍是現任」。
+
+    逾時被接管的舊 worker 之後才走到錯誤處理時,全域 _psession 可能已是新一輪
+    建立的【替代 session】——無條件 _session_close() 會把好端端的新 session
+    一起殺掉。這裡先比對身分:是現任才清全域參照;不是就只終結自己的行程。
+    [codex P1 R12/R13] 回傳值給恢復分支當【所有權證明】:已卸任者不得重登。"""
+    global _psession
+    with _session_lock:
+        current = _psession is sess
+        if current:
+            _psession = None
+    logging.info("[session] 收掉 systemftp(pid=%s,%s):%s", sess.pid,
+                 "現任" if current else "已卸任的舊 worker 自理", reason)
+    _terminate_session_process(sess)
+    return current
+
+
+# [codex P1 R14] 冷啟動(登入)進行中的預約:worker 在登入途中被 240 秒 join 逾時
+# 棄置時,session 還沒發布(_psession=None),下一輪會看到「沒有 session」而並行
+# 再登一次 → 兩份帳密、兩個 systemftp、互相蓋掉參照。冷啟動前先在鎖內預約;
+# 預約超過 _COLD_START_STALE_SECONDS(> 登入 120s+主畫面 120s 的合法上限)視為
+# 孤兒殘留,可搶走。
+_cold_start_owner = None            # (身分 token, 開始時間)
+_COLD_START_STALE_SECONDS = 360
+
+
+def _cold_start_session(cfg: dict):
+    """冷啟動的【預約閘門】→ 實作見 _cold_start_session_impl。
+
+    同一時間只允許一個冷啟動:另一個仍在進行(未逾期)→ 本輪直接放棄,
+    絕不並行送出第二份帳密。"""
+    global _cold_start_owner
+    me = object()
+    now = time.time()
+    with _session_lock:
+        owner = _cold_start_owner
+        if owner is not None and (now - owner[1]) < _COLD_START_STALE_SECONDS:
+            raise RuntimeError(
+                "另一個冷啟動(登入)仍在進行中 → 本輪跳過,不並行送出第二份帳密")
+        if owner is not None:
+            logging.warning("[session] 發現逾期 %d 秒的冷啟動預約(孤兒殘留) → 搶走",
+                            int(now - owner[1]))
+        _cold_start_owner = (me, now)
+    try:
+        return _cold_start_session_impl(cfg, owner_token=me)
+    finally:
+        with _session_lock:
+            if _cold_start_owner is not None and _cold_start_owner[0] is me:
+                _cold_start_owner = None
+
+
+def _cold_start_session_impl(cfg: dict, owner_token=None):
+    """啟動 systemftp + 登入 + 等主畫面 → 存成常駐 session(呼叫緒須在隱藏桌面)。
+
+    登入類失敗(LoginNotCompleted / HISStartupBlocked)→ 收掉行程、設【登入冷卻】
+    後再拋:3 分鐘 keepalive 節奏絕不可把同一組帳密每 3 分鐘送一次——冷卻期取
+    15 分鐘(=舊輪詢節奏),登入壓力不高於改版前;BDE 取 30 分鐘(等重開機/人工)。
     """
+    global _psession, _login_cooldown_until
+    remaining = _keepalive.login_cooldown_remaining(_login_cooldown_until,
+                                                    time.time())
+    if remaining > 0:
+        raise RuntimeError(
+            f"登入冷卻中(前次登入失敗,剩 {remaining / 60.0:.0f} 分)——"
+            f"不重複送出帳密以免逼近鎖定門檻")
     username = cfg["username"]
     password = cfg["password"]
-
     before = _systemftp_pids()
     si = win32process.STARTUPINFO()
     si.dwFlags = win32con.STARTF_USESHOWWINDOW
     si.wShowWindow = win32con.SW_SHOW  # 隱藏桌面上正常顯示，使用者看不到
     si.lpDesktop = HIDDEN_DESKTOP_NAME
-    # [2026-07-27 實機故障根因] CreateProcess 的回傳值原本【整個被丟掉】,於是我們
-    # 不知道自己開的是哪個 PID,只能靠前後快照去猜(our_pids / _systemftp_pids()-before)。
-    # 猜的方式一旦失準(psutil 名稱查詢失敗被判成「已非 systemftp(PID 重用?)」、
-    # 或資源緊繃時列舉不到),清理就整個跳過 → 一個 systemftp 永遠留在隱藏桌面。
-    # 每輪輪詢(15 分)累積一個:先撞住院系統「最多兩個」上限(等不到登入視窗),
-    # 再撞 desktop heap/handle 耗盡(EnumWindows 記憶體不足、can't start new thread、
-    # CreateProcess 系統資源不足)——2026-07-27 早上整段收不到會診就是這樣來的。
-    # 而孤兒清掃 _cleanup_orphan_systemftp 靠【視窗列舉】做正面識別,在資源耗盡時
-    # 自己也失效 —— 復原機制被它要修的那個狀況弄壞。
-    # 修法:留住 CreateProcess 給的【行程 handle】。用 handle 終止有兩個關鍵性質:
-    #   ① 只要 handle 沒關,核心就不會回收該 PID → 不可能「PID 重用」而誤殺別人;
+    # [2026-07-27 實機故障根因] CreateProcess 的行程 handle 一定要留住:
+    #   ① handle 沒關,核心就不會回收該 PID → 不可能「PID 重用」而誤殺別人;
     #   ② handle 來自我們自己的 CreateProcess → 終止的必然是我們開的那一個,
     #      完全不需要名稱/session/視窗列舉,資源耗盡時照樣有效。
     try:
@@ -2188,14 +2352,12 @@ def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -
     except Exception as e:
         raise RuntimeError(f"在隱藏桌面啟動 systemftp.exe 失敗：{e}") from e
     logging.info("已在隱藏桌面啟動 systemftp.exe (pid=%s)", _spawned_pid)
-
-    # 自己開的 PID 直接納入,不再只靠快照差集去猜。
     our_pids: set = {_spawned_pid}
+    creds_sent = False        # [codex P1 R6] 帳密送出後的任何失敗都要進冷卻
     try:
-        # 等登入視窗（期間關多開提示）。隱藏桌面上 find_windows 自動列舉
-        # 該桌面的視窗（因為本執行緒已 SetThreadDesktop 過去）。
+        # 等登入視窗（期間關多開提示）
         login = None
-        saw_multi_instance = False   # [2026-07-17] 是否關過多開提示(用於更明確的失敗訊息)
+        saw_multi_instance = False
         deadline = time.time() + 120
         while time.time() < deadline:
             if not running.is_set():
@@ -2215,9 +2377,6 @@ def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -
                 break
             time.sleep(0.5)
         if not login:
-            # [2026-07-17] 關過多開提示卻始終等不到登入視窗＝systemftp 偵測到已達「最多兩個」
-            # 上限,新實例不進登入畫面。多因隱藏桌面累積的 systemftp 孤兒(更新重啟/硬退遺留)
-            # 佔位;放棄後 _do_full_job 會清孤兒自癒。訊息點名以便一眼判別根因。
             if saw_multi_instance:
                 raise RuntimeError(
                     "等不到登入視窗（systemftp 疑似已達『最多兩個』上限：隱藏桌面有殘留孤兒"
@@ -2227,8 +2386,7 @@ def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -
         our_pids = (_systemftp_pids() - before) | {our_pid}
         logging.info("登入視窗 hwnd=%s pid=%s", login, sorted(our_pids))
 
-        # 登入：隱藏桌面上 systemftp 是唯一前景應用，直接 SetForegroundWindow
-        # + SetFocus 完全不會干擾使用者（使用者畫面在另一個桌面）。
+        # 登入：隱藏桌面上 systemftp 是唯一前景應用,不干擾使用者
         force_foreground(login)
         edits = sorted(
             (c for c in enum_children(login) if c[1] == "TEditExt"),
@@ -2241,83 +2399,416 @@ def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -
         if not confirm:
             raise RuntimeError("找不到「確認」鈕")
         click_button(confirm)
+        creds_sent = True
         logging.info("已送出登入")
 
-        # 等主視窗（期間關訊息通知）——見 _wait_main_window_after_login 的說明
-        # helper 逾時會【自己拋出帶診斷的例外】,不再回 None ——
-        # 原本這裡的 `raise RuntimeError("等不到主畫面")` 正是那句什麼都沒說的訊息。
-        main_hwnd = _wait_main_window_after_login(our_pids, visible_only=True)
+        _wait_main_window_after_login(our_pids, visible_only=True)
         logging.info("已進入主畫面")
+        sess = _PersistentSession(_hproc, _hthread, _spawned_pid, our_pids)
+        sess.in_use = True                       # 建立者即持有租約
+        # [codex P1 R16] 發布前在鎖內驗「預約還是不是我的」——冷啟動拖過
+        # _COLD_START_STALE_SECONDS 被搶走後,本 worker 若仍走到這裡,無條件發布
+        # 會蓋掉接手者的 session → 兩個已登入的 HIS 行程、參照遺失。
+        with _session_lock:
+            stolen = (owner_token is not None
+                      and (_cold_start_owner is None
+                           or _cold_start_owner[0] is not owner_token))
+            if not stolen:
+                _psession = sess
+        if stolen:
+            logging.warning("[session] 冷啟動完成時預約已被搶走(本 worker 逾時"
+                            "被接管) → 不發布,自行收掉剛開的 systemftp")
+            _terminate_session_process(sess)
+            raise RuntimeError("冷啟動完成但已被新一輪接管 → 本輪放棄")
+        logging.info("[session] 常駐 session 已建立(pid=%s):停在主畫面,"
+                     "之後每輪只按查詢再退回", _spawned_pid)
+        return sess
+    except BaseException as e:
+        if isinstance(e, HISStartupBlocked):
+            _login_cooldown_until = time.time() + _keepalive.BDE_COOLDOWN_SECONDS
+        elif isinstance(e, LoginNotCompleted) or creds_sent:
+            # [codex P1 R6] 帳密【已送出】後的任何啟動失敗(例:登入視窗消失但
+            # 主畫面沒出現的通用 RuntimeError)都要進冷卻——不然 3 分鐘節奏會
+            # 每 3 分鐘再送一次帳密,鎖定防護只剩 LoginNotCompleted 一種等於沒防。
+            _login_cooldown_until = (time.time()
+                                     + _keepalive.LOGIN_COOLDOWN_SECONDS)
+            logging.error("[session] 登入未完成(帳密已送出) → 進入 %d 分鐘"
+                          "登入冷卻(不重複送出帳密)",
+                          _keepalive.LOGIN_COOLDOWN_SECONDS // 60)
+        _terminate_session_process(
+            _PersistentSession(_hproc, _hthread, _spawned_pid, our_pids))
+        raise
 
-        # 送選單命令：我的會診清單
-        cmd_id = resolve_menu_command_id(main_hwnd)
-        if cmd_id is None:   # [2026-07-25] 選單疑似位移且標題核對不符 → 不硬送未知命令
-            raise RuntimeError(
-                "無法確認「我的會診清單」選單命令(疑似住院醫囑系統改版),"
-                "本次中止以免對醫囑系統送出不明命令")
-        win32gui.PostMessage(main_hwnd, win32con.WM_COMMAND, cmd_id, 0)
-        logging.info("已送出選單命令（id=%s）", cmd_id)
 
-        # 等會診單
-        consult = None
-        deadline = time.time() + 60
+def _retire_session_if_no_keepalive(sess, cfg: dict) -> None:
+    """[codex P2 R21] 休息時段(00-06)的 email/手動觸發:查完【不留】session。
+
+    休息時段沒有輪詢 keepalive,留著 5 分鐘就被院方登出,已登出的 systemftp
+    呆掛到 06:00 才被下一輪收掉——查完直接收,06:00 後首輪照常冷啟動。"""
+    try:
+        if _in_quiet_hours(datetime.now(), load_config()):
+            _session_close_if_current(
+                sess, "休息時段觸發的查詢:查完即收(無 keepalive 可維持)")
+    except Exception:
+        logging.debug("[session] 休息時段收尾判斷失敗(略過)", exc_info=True)
+
+
+def _acquire_session(cfg: dict):
+    """取用常駐 session:死了/到 6 小時定期重啟 → 收掉冷啟動,否則直接重用。
+
+    [codex P1 R12] 租約制:上一輪逾時被棄置的 worker 若仍握著 session(in_use),
+    本輪【奪走並終結】後冷啟動——絕不兩個 worker 共用;被終結的舊 worker 隨後的
+    操作會失敗,由它自己的錯誤處理走 _session_close_if_current(非現任→只自理)。"""
+    global _psession
+    stale = None
+    with _session_lock:
+        sess = _psession
+        if sess is not None and sess.in_use:
+            _psession = None
+            stale, sess = sess, None
+        elif sess is not None:
+            sess.in_use = True                   # 取得租約
+    if stale is not None:
+        logging.warning("[session] 前一輪逾時的 worker 仍握著 session(pid=%s) → "
+                        "終結後冷啟動,絕不共用", stale.pid)
+        _terminate_session_process(stale)
+    if sess is not None:
+        if not _session_is_alive(sess):
+            _session_close_if_current(sess, "session 已死(行程結束或主畫面不見了)")
+            sess = None
+        elif _keepalive.session_needs_restart(sess.started_at, time.time()):
+            _session_close_if_current(
+                sess,
+                f"定期重啟(常駐已逾 {_keepalive.SESSION_MAX_AGE_HOURS:.0f} 小時,"
+                f"清 BDE/資源殘留)")
+            sess = None
+    return sess if sess is not None else _cold_start_session(cfg)
+
+
+def _return_to_main(sess, consult_hwnd) -> None:
+    """按「回」退回主畫面(後備:WM_CLOSE=右上角X)。
+
+    ★關不掉 → 收掉 session、下一輪冷啟動,但絕不拋例外★——查詢本身已成功,
+    不能因退場失敗把已到手的結果丟掉、更不能觸發整套殺掉重啟再查一次。
+    Delphi modal form 關閉後只是 Hide(e348d27 教訓)→ find_windows 預設
+    visible_only=True,用「看不見了」當關閉判準恰好正確。"""
+    try:
+        back = find_child(consult_hwnd, "TButton", "回")
+        if back:
+            click_button(back)
+        else:
+            win32gui.PostMessage(consult_hwnd, win32con.WM_CLOSE, 0, 0)
+        deadline = time.time() + 8
         while time.time() < deadline:
-            if not running.is_set():
-                raise RuntimeError("流程已被中止")
-            hits = find_windows(CONSULT_CLASS, pids=our_pids)
-            if hits:
-                consult = hits[0]
-                break
+            if not find_windows(CONSULT_CLASS, pids=sess.our_pids):
+                logging.info("[session] 已退回主畫面,session 續留")
+                return
             time.sleep(0.3)
-        if not consult:
-            raise RuntimeError("等不到會診單視窗")
-        time.sleep(1.8)
-        logging.info("會診單視窗已開啟，準備擷取")
+        win32gui.PostMessage(consult_hwnd, win32con.WM_CLOSE, 0, 0)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if not find_windows(CONSULT_CLASS, pids=sess.our_pids):
+                logging.info("[session] 以 WM_CLOSE(=右上角X) 退回主畫面,"
+                             "session 續留")
+                return
+            time.sleep(0.3)
+    except Exception:
+        logging.warning("[session] 退回主畫面時例外", exc_info=True)
+    _session_close_if_current(sess, "會診視窗關不掉(退場失敗) → 下一輪冷啟動")
 
-        # 截圖
-        SHOTS_DIR.mkdir(parents=True, exist_ok=True)
-        _prune_old_shots()
-        img = capture_window_image(consult)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        shot_path = SHOTS_DIR / f"consult_{stamp}.png"
-        img.save(shot_path)
-        logging.info("已存檔截圖：%s", shot_path)
-        # [新功能 2026-06-13] 截圖(原始畫面)存檔後才逐列點選擷取文字(fail-open)
-        extracted, extracted_html, roster_texts = _extract_consult_text(
-            consult, cfg, roster_label)
-        return shot_path, extracted, extracted_html, roster_texts
 
-    finally:
-        cleanup_pids = our_pids or (_systemftp_pids() - before)
+def _query_cycle(sess, cfg: dict, roster_label: str) -> tuple:
+    """在既有 session 上跑一輪:選單→會診單→截圖/擷取→退回主畫面。
+    回傳 (截圖路徑, 擷取文字, 擷取HTML, roster_texts);失敗拋例外
+    (呼叫端 _automation_on_hidden 會殺掉重啟、重新登入一次)。"""
+    mains = find_windows(MAIN_CLASS, pids=sess.our_pids)
+    if not mains:
+        raise RuntimeError("常駐 session 的主畫面不見了(疑似被院方強制登出)")
+    main_hwnd = mains[0]
+    cmd_id = resolve_menu_command_id(main_hwnd)
+    if cmd_id is None:
+        raise RuntimeError(
+            "無法確認「我的會診清單」選單命令(疑似住院醫囑系統改版),"
+            "本次中止以免對醫囑系統送出不明命令")
+    win32gui.PostMessage(main_hwnd, win32con.WM_COMMAND, cmd_id, 0)
+    logging.info("已送出選單命令（id=%s）", cmd_id)
+    consult = None
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if not running.is_set():
+            raise RuntimeError("流程已被中止")
+        hits = find_windows(CONSULT_CLASS, pids=sess.our_pids)
+        if hits:
+            consult = hits[0]
+            break
+        time.sleep(0.3)
+    if not consult:
+        raise RuntimeError("等不到會診單視窗")
+    time.sleep(1.8)
+    logging.info("會診單視窗已開啟，準備擷取")
+    SHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    _prune_old_shots()
+    img = capture_window_image(consult)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    shot_path = SHOTS_DIR / f"consult_{stamp}.png"
+    img.save(shot_path)
+    logging.info("已存檔截圖：%s", shot_path)
+    extracted, extracted_html, roster_texts = _extract_consult_text(
+        consult, cfg, roster_label)
+    _return_to_main(sess, consult)
+    return shot_path, extracted, extracted_html, roster_texts
+
+
+def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -> tuple:
+    """在隱藏桌面執行一輪查詢(呼叫者需已 SetThreadDesktop)。回傳
+    (截圖, 文字, HTML, roster_texts)。
+
+    [2026-08-03 使用者定案] 常駐登入:重用活著的 session,只有第一次/掉線/定期
+    重啟才冷啟動登入。掉線恢復=「整個殺掉重啟、重新登入一次;能登入就繼續常駐,
+    再失敗就放棄讓既有告警機制發信」。登入類失敗不在此重試(冷卻期見
+    _cold_start_session)。
+    """
+    sess = _acquire_session(cfg)
+    try:
+        result = _query_cycle(sess, cfg, roster_label)
+        _session_release(sess)
+        _retire_session_if_no_keepalive(sess, cfg)
+        return result
+    except (LoginNotCompleted, HISStartupBlocked, JobSuperseded):
+        _session_close_if_current(sess, "登入類/接管失敗")
+        raise
+    except Exception as e:
+        if not running.is_set():
+            _session_close_if_current(sess, "流程被中止")
+            raise
+        # 掉線恢復(使用者定案):殺掉重啟、重新登入一次;能登入就繼續常駐
+        logging.warning("[session] 查詢失敗(%s) → 殺掉重啟、重新登入一次", e)
+        was_current = _session_close_if_current(sess, "查詢失敗 → 殺掉重啟")
+        # [codex P1 R13] 已卸任(=本 worker 是逾時被接管的孤兒,新一輪已經在跑)
+        # → 不得重登:兩個 worker 各開一個 session 會互相蓋掉 _psession、
+        # 重複送帳密,單一 session/鎖定防護全破。孤兒到此為止。
+        if not was_current:
+            raise RuntimeError(
+                "本輪已被新一輪接管(session 已換代) → 不重登、不再碰 HIS") from e
+        sess = _cold_start_session(cfg)
         try:
-            close_pids(cleanup_pids)
-            logging.info("已關閉本次開啟的 systemftp 實例")
-        except Exception:
-            logging.warning("關閉 systemftp 失敗", exc_info=True)
-        # [2026-07-27] 最後保險:不論上面的優雅關閉有沒有成功(或有沒有被身分驗證
-        # 略過),都用【我們自己的行程 handle】確認它真的結束了。這一步不依賴
-        # psutil 名稱、不依賴 session、不依賴視窗列舉,所以資源耗盡時仍然有效;
-        # 而且 handle 綁定的必然是我們開的那個行程,不可能誤殺使用者的醫囑系統。
-        try:
-            _still_running = (
-                win32event.WaitForSingleObject(_hproc, 0) == win32event.WAIT_TIMEOUT)
-            if _still_running:
-                logging.warning(
-                    "[cleanup] 本次開啟的 systemftp (pid=%s) 在優雅關閉後仍在執行 → "
-                    "以行程 handle 強制結束(避免留在隱藏桌面累積)", _spawned_pid)
-                win32process.TerminateProcess(_hproc, 1)
-                win32event.WaitForSingleObject(_hproc, 3000)
-        except Exception:
-            logging.warning("[cleanup] 以 handle 確認/結束 systemftp 失敗",
-                            exc_info=True)
-        finally:
-            # handle 一定要關:不關的話核心會一直保留該 PID(且我們自己也在洩漏 handle)。
-            for _h in (_hthread, _hproc):
+            result = _query_cycle(sess, cfg, roster_label)
+            _session_release(sess)
+            _retire_session_if_no_keepalive(sess, cfg)
+            return result
+        except BaseException:
+            _session_close_if_current(sess,
+                                      "重啟重登後查詢仍失敗 → 放棄(交給告警機制)")
+            raise
+
+
+# =============================================================================
+# BDE 錯誤 → 閒置自動重開機(2026-08-03 使用者定案)
+# =============================================================================
+_bde_watch_lock = threading.Lock()
+_bde_watch_active = False
+_bde_watch_gen = 0        # [codex P2 R4] 事故世代:退場瞬間有新事故 → 接力開新看守
+_bde_shutdown_pending = False   # [codex P1 R19] 已下達 shutdown /r 且尚未取消
+_bde_reboot_cancel = threading.Event()
+
+
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+
+def _user_idle_seconds() -> float:
+    """使用者最後一次鍵盤/滑鼠輸入距今秒數(GetTickCount 回繞安全)。
+    查詢失敗回 0=當作剛有輸入 → 寧可不重開,絕不誤重開。"""
+    try:
+        lii = _LASTINPUTINFO()
+        lii.cbSize = ctypes.sizeof(lii)
+        if not _user32.GetLastInputInfo(ctypes.byref(lii)):
+            return 0.0
+        tick = ctypes.windll.kernel32.GetTickCount()
+        return ((tick - lii.dwTime) & 0xFFFFFFFF) / 1000.0
+    except Exception:
+        return 0.0
+
+
+def _bde_reboot_state_path() -> str:
+    return os.path.join(get_settings_dir(), "consult_bde_reboot_state.json")
+
+
+def _load_last_auto_reboot_ts():
+    try:
+        data = safe_load_json(_bde_reboot_state_path(), default={}) or {}
+        ts = data.get("last_auto_reboot_ts")
+        return float(ts) if ts is not None else None
+    except Exception:
+        return None
+
+
+def _save_last_auto_reboot_ts(ts: float) -> bool:
+    """→ 是否真的落地。[codex P1] 呼叫端以此決定可不可以重開機。"""
+    try:
+        atomic_write_json(_bde_reboot_state_path(),
+                          {"last_auto_reboot_ts": float(ts)})
+        return True
+    except Exception:
+        logging.warning("[BDE] 重開機狀態寫入失敗", exc_info=True)
+        return False
+
+
+def _abort_bde_shutdown_on_exit() -> None:
+    """[codex P1 R19] 使用者退出程式時,若 60 秒重開倒數還在跑 → shutdown /a 取消。
+
+    退出只是關這支程式;已下達的 OS 重開機不會跟著消失,使用者按下退出後機器
+    照樣重開會非常錯愕。時間戳【不回滾】(保守方向:寧可多等 24 小時,不迴圈)。"""
+    global _bde_shutdown_pending
+    _bde_reboot_cancel.set()
+    with _bde_watch_lock:
+        pending = _bde_shutdown_pending
+    if not pending:
+        return
+    logging.warning("[BDE] 使用者退出時仍有排定中的重開機 → shutdown /a 取消")
+    try:
+        cpa = subprocess.run(
+            ["shutdown", "/a"], capture_output=True, timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if cpa.returncode == 0:
+            with _bde_watch_lock:
+                _bde_shutdown_pending = False
+        else:
+            logging.error("[BDE] shutdown /a 失敗(rc=%s) — 機器仍將重開",
+                          cpa.returncode)
+    except Exception:
+        logging.error("[BDE] shutdown /a 例外 — 機器仍將重開", exc_info=True)
+
+
+def _schedule_bde_reboot_watch() -> None:
+    """BDE 起不來 → 開「閒置重開機」看守(singleton;已在站崗就不重複)。
+
+    使用者定案:重開機通常可修 BDE($250E),但【使用者連續 30 分鐘沒有輸入】
+    才能重開;且 24 小時內只自動重開一次(重開後仍 BDE=重開機修不了,絕不能
+    進入重開機迴圈)。HIS 恢復(_note_job_success)會解除站崗。"""
+    global _bde_watch_active, _bde_watch_gen
+    with _bde_watch_lock:
+        # [codex P2 R3] 新事故先把取消令作廢——舊看守若還沒消化掉上一次的
+        # cancel,它會在鎖內發現令已被清掉而【繼續站崗】(見 watch_loop)。
+        # [codex P2 R4] 世代 +1:舊看守若正在退場(give_up/shutdown 被拒),
+        # 它會在 finally 的鎖內發現世代前進了 → 接力開新看守,同樣無空窗。
+        _bde_reboot_cancel.clear()
+        _bde_watch_gen += 1
+        gen = _bde_watch_gen
+        if _bde_watch_active:
+            return
+        _bde_watch_active = True
+    logging.error(
+        "[BDE] 已排定自動重開機看守:使用者連續閒置滿 %d 分鐘且 24 小時內未"
+        "自動重開過 → shutdown /r 重開修復;HIS 恢復則自動解除",
+        _keepalive.BDE_REBOOT_MIN_IDLE_SECONDS // 60)
+    threading.Thread(target=_bde_reboot_watch_loop, args=(gen,),
+                     name="BDERebootWatch", daemon=True).start()
+
+
+def _bde_reboot_watch_loop(my_gen: int) -> None:
+    global _bde_watch_active
+    try:
+        while running.is_set():
+            if _bde_reboot_cancel.wait(timeout=60.0):
+                # [codex P2 R3] 解除與否必須在鎖內判定(與 schedule 原子):
+                # 令還在=真解除(HIS 恢復),在鎖內宣告退場;令被清掉=新事故
+                # 已到,本看守直接接手繼續站崗。
+                with _bde_watch_lock:
+                    if _bde_reboot_cancel.is_set():
+                        logging.info("[BDE] HIS 已恢復 → 重開機看守解除")
+                        return    # active 由 finally 的世代判定統一收尾
+                logging.info("[BDE] 舊取消令已被新事故作廢 → 看守繼續站崗")
+                continue
+            action, why = _keepalive.bde_reboot_decision(
+                _user_idle_seconds(), _load_last_auto_reboot_ts(), time.time())
+            if action == "wait":
+                continue
+            if action == "give_up":
+                logging.error("[BDE] 不再自動重開機:%s", why)
+                return
+            # ★先落地狀態、再下 shutdown★ 順序反過來的話,重開後狀態沒寫到,
+            # BDE 若沒修好會再重開 → 無限重開機迴圈。
+            # [codex P1] 落地【失敗】也一樣:狀態不在磁碟上,24 小時防護等於不存在
+            # → 直接取消自動重開機,改請人工(寧可不修,絕不迴圈)。
+            prev_ts = _load_last_auto_reboot_ts()
+            if not _save_last_auto_reboot_ts(time.time()):
+                logging.error("[BDE] 重開機狀態寫不進磁碟 → 【取消自動重開機】"
+                              "(重開後無從辨識已重開過,可能無限迴圈);請人工重開機")
+                return
+            logging.error("[BDE] %s → 60 秒後自動重開機修復(shutdown /r)", why)
+            # [codex P1 R2] shutdown 可能被拒(權限/原則,rc≠0 但不拋例外)——
+            # 那時沒有任何重開會發生,卻已寫入時間戳=白白吃掉 24 小時防護
+            # → 驗 returncode,失敗就【回滾時間戳】並改請人工。
+            rc = -1
+            try:
+                cp = subprocess.run(
+                    ["shutdown", "/r", "/t", "60", "/c",
+                     "皮膚科會診查詢:HIS BDE 初始化失敗,閒置自動重開機修復"],
+                    capture_output=True, timeout=15,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                rc = cp.returncode
+            except Exception:
+                logging.error("[BDE] shutdown 指令失敗", exc_info=True)
+            if rc == 0:
+                global _bde_shutdown_pending
+                with _bde_watch_lock:
+                    _bde_shutdown_pending = True   # [R19] 退出時據此 shutdown /a
+            # ruff B023:預設參數綁定當下的 prev_ts(本分支所有路徑都在同一輪
+            # 迭代內用完即 return,語意不變,只是把繫結寫明)。
+            def _rollback_ts(why: str, prev_ts=prev_ts) -> None:
                 try:
-                    _h.Close()
+                    atomic_write_json(
+                        _bde_reboot_state_path(),
+                        ({"last_auto_reboot_ts": prev_ts}
+                         if prev_ts is not None else {}))
+                    logging.info("[BDE] 已回滾重開機時間戳(%s)", why)
                 except Exception:
-                    pass
+                    # 回滾也失敗 → 保守方向:多等 24 小時(不迴圈),不再吵
+                    logging.warning("[BDE] 時間戳回滾失敗(保守維持 24 小時防護)",
+                                    exc_info=True)
 
+            if rc != 0:
+                logging.error("[BDE] shutdown 被拒(rc=%s) → 回滾重開機時間戳,"
+                              "請人工重開機", rc)
+                _rollback_ts("shutdown 被拒,沒有真的重開")
+                return
+            # [codex P1 R15] 60 秒倒數期間 HIS 若恢復(瞬時故障/有人手動修好),
+            # 要 shutdown /a 取消重開——不然 log 說「看守解除」機器卻照樣重開。
+            # 取消成功也要回滾時間戳(沒真的重開,別吃掉 24 小時防護)。
+            if _bde_reboot_cancel.wait(timeout=55.0):
+                logging.error("[BDE] 倒數期間 HIS 已恢復 → shutdown /a 取消重開機")
+                try:
+                    cpa = subprocess.run(
+                        ["shutdown", "/a"], capture_output=True, timeout=15,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    if cpa.returncode != 0:
+                        logging.error("[BDE] shutdown /a 失敗(rc=%s) → 照常重開機",
+                                      cpa.returncode)
+                        return
+                except Exception:
+                    logging.error("[BDE] shutdown /a 例外 → 照常重開機",
+                                  exc_info=True)
+                    return
+                with _bde_watch_lock:
+                    _bde_shutdown_pending = False
+                _rollback_ts("倒數期間取消,沒有真的重開")
+            return
+    finally:
+        # [codex P2 R4] 退場與排程必須原子:本看守決定退場(give_up/shutdown 被拒/
+        # 令仍在的真解除)到這裡之間,若有【新事故】進來,schedule 只看到 active=True
+        # 而沒開新緒——世代前進就是證據 → 接力開新看守,絕不留無人看守的事故。
+        respawn_gen = None
+        with _bde_watch_lock:
+            if _bde_watch_gen != my_gen and running.is_set():
+                respawn_gen = _bde_watch_gen
+            else:
+                _bde_watch_active = False
+        if respawn_gen is not None:
+            logging.info("[BDE] 退場期間有新事故 → 接力開新看守")
+            threading.Thread(target=_bde_reboot_watch_loop,
+                             args=(respawn_gen,),
+                             name="BDERebootWatch", daemon=True).start()
 
 def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tuple:
     """後備模式：使用者桌面上跑，配合 SW_HIDE 隱形執行緒（可能有短暫閃爍）。
@@ -2797,6 +3288,8 @@ def _cleanup_orphan_systemftp() -> None:
         if not same_session:
             return
         orphans = same_session & _hidden_desktop_pids()
+        # [2026-08-03 常駐] 活著的常駐 session 在隱藏桌面上是【常態】,不是孤兒。
+        orphans -= _session_pids()
         if orphans:
             logging.warning(
                 "[CQ-05] 清掃隱藏桌面殘留的 systemftp 孤兒(正面識別在隱藏桌面上): %s",
@@ -2879,6 +3372,19 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     "[re-trigger] 補跑的收件人在等鎖期間都已經收到結果了 → 不重複寄送")
                 return
         cfg = load_config()
+        # [2026-06-25] 輪詢 poll:00:00-06:00 休息時段 → 直接不開 systemftp、不寄
+        # (過夜新增的會診由休息結束後第一輪 poll 的「新病歷號」比對一次補寄)。
+        # [codex P2 R10] 這一段必須在寄信前置檢查【之前】:SMTP/Outlook 執行期
+        # 變成不可用時,前置檢查會提早 return,永遠走不到收 session → 已登出的
+        # systemftp 殭屍行程掛整夜。
+        if trigger_label == "poll" and _in_quiet_hours(datetime.now(), cfg):
+            logging.info("[poll] 休息時段(%02d:00-%02d:00),本次不輪詢/不寄信",
+                         int(cfg.get("quiet_start_hour", 0)),
+                         int(cfg.get("quiet_end_hour", 6)))
+            # [2026-08-03 常駐] 休息時段把常駐 session 收掉:不查詢就沒有 keepalive,
+            # 5 分鐘後會被院方強制登出,留著只是殭屍行程掛整夜;06:00 後首輪冷啟動。
+            _session_close("休息時段(00-06 不輪詢),收掉常駐 session")
+            return
         mail_method = str(cfg.get("mail_method", "smtp")).lower()
         # SMTP 模式：檢查 password 是否已填，沒填則靜默跳過（多機部署：只有有
         # 設 SMTP 的那台才寄）
@@ -2894,13 +3400,6 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                               trigger_label)
                 return
         now = datetime.now()
-        # [2026-06-25] 輪詢 poll:00:00-06:00 休息時段 → 直接不開 systemftp、不寄
-        # (過夜新增的會診由休息結束後第一輪 poll 的「新病歷號」比對一次補寄)。
-        if trigger_label == "poll" and _in_quiet_hours(now, cfg):
-            logging.info("[poll] 休息時段(%02d:00-%02d:00),本次不輪詢/不寄信",
-                         int(cfg.get("quiet_start_hour", 0)),
-                         int(cfg.get("quiet_end_hour", 6)))
-            return
         date_str = f"{now.year}/{now.month}/{now.day}"
         time_str = (trigger_label.replace(":", "")
                     if trigger_label and ":" in trigger_label
@@ -3088,6 +3587,8 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                 elif isinstance(e, HISStartupBlocked):
                     logging.error("會診查詢:住院醫囑系統起不來 → 不重試"
                                   "(與帳密無關)：%s", e)
+                    # [2026-08-03 使用者定案] BDE 起不來 → 閒置滿 30 分鐘自動重開機
+                    _schedule_bde_reboot_watch()
                 elif fatal:
                     logging.error("會診查詢:登入沒有完成 → 不重試(避免同一組帳密"
                                   "被連續送出而逼近鎖定門檻)：%s", e)
@@ -3404,7 +3905,25 @@ def trigger_job_async(trigger_label: str, override_recipients=None, *,
 # =============================================================================
 # 排程器
 # =============================================================================
+# [codex P1 R17] 目前排程節奏:"keepalive"=3 分鐘常駐、"legacy"=≥15 分鐘冷啟動。
+# run_consult_flow 執行期發現隱藏桌面失效(USER 資源耗盡等)時據此判斷要不要降速。
+_sched_mode = "legacy"
+
+
+def _demote_schedule_to_legacy() -> None:
+    """[codex P1 R17] 隱藏桌面於【執行期】失效 → 排程立刻降回冷啟動節奏。
+
+    排程建立時 probe 成功、之後才失效的話,job 仍每 162-198 秒觸發,而 SW_HIDE
+    後備是【每輪完整登入】——等於每 3 分鐘送一次帳密,鎖定防護全破。"""
+    if _sched_mode != "keepalive":
+        return
+    logging.warning("[排程] 隱藏桌面於執行期失效 → 排程降回冷啟動節奏(≥15 分鐘)")
+    _rebuild_schedule()
+
+
 def _rebuild_schedule() -> None:
+    global _sched_mode
+    _sched_mode = "legacy"
     schedule.clear()
     cfg = load_config()
     if not cfg.get("enabled", True):
@@ -3420,18 +3939,48 @@ def _rebuild_schedule() -> None:
     # [2026-06-25] 改為「每 N 分鐘輪詢會診清單」取代固定 12:40/17:10 排程。是否真的寄信由
     # _do_full_job 的 poll 邏輯決定:只有出現「新病歷號」才寄、且 00:00-06:00 休息不輪詢/不寄。
     try:
-        interval = int(cfg.get("poll_interval_minutes", 15))
+        interval = int(cfg.get("poll_interval_minutes", 3))
     except (TypeError, ValueError):
-        interval = 15
-    interval = max(5, min(120, interval))   # 夾在 5-120 分鐘,避免太密集打爆 systemftp/院方系統
-    # [2026-06-25 user] 加 ±1 分鐘隨機抖動(N-1 ~ N+1 分),避免固定節拍打院方系統(同 reg64 45-75
-    # 秒隨機的理由);schedule 的 .to() 會在每次跑完後重新隨機下一次間隔。下限不低於 5 分。
-    lo = max(5, interval - 1)
-    hi = interval + 1
-    schedule.every(lo).to(hi).minutes.do(trigger_job_async, trigger_label="poll")
-    logging.info(
-        "已排程每 %d 分鐘(±1 隨機)輪詢會診清單(有新會診才寄信;%02d:00-%02d:00 休息)",
-        interval, int(cfg.get("quiet_start_hour", 0)), int(cfg.get("quiet_end_hour", 6)))
+        interval = 3
+    # [2026-08-03 常駐登入] 3 分鐘 ±10%(使用者指定):常駐後每輪只是「按會診查詢→
+    # 擷取→按回」,不再每輪冷啟動登入;3 分鐘節奏本身就是 keepalive(院方 5 分鐘
+    # 閒置會強制登出)。
+    hdesk_probe = _ensure_hidden_desktop()
+    if hdesk_probe:
+        try:
+            _user32.CloseDesktop(hdesk_probe)
+        except Exception:
+            logging.debug("CloseDesktop(probe) 失敗", exc_info=True)
+        # [codex P1 R8/R18] 常駐節奏上限:院方 5 分鐘閒置登出,間隔從任務結束
+        # 起算,還要扣掉寄信尾段(SMTP ≤60s、Outlook 最壞 120s) → SMTP 夾 3 分、
+        # Outlook 夾 2 分。設定值更大(10/30 分)會讓 session 每輪過期=每輪冷啟動。
+        cap = (_keepalive.POLL_KEEPALIVE_CAP_OUTLOOK_MINUTES
+               if str(cfg.get("mail_method", "smtp")).lower() == "outlook"
+               else _keepalive.POLL_KEEPALIVE_CAP_MINUTES)
+        eff = min(interval, cap) if interval > 0 else cap
+        if eff != interval:
+            logging.info("[排程] 常駐模式節奏由設定的 %d 分鐘夾為 %d 分鐘"
+                         "(keepalive 須低於院方 5 分鐘閒置登出)", interval, eff)
+        lo_s, hi_s = _keepalive.poll_seconds_range(eff)
+        _sched_mode = "keepalive"
+        schedule.every(lo_s).to(hi_s).seconds.do(trigger_job_async,
+                                                 trigger_label="poll")
+        logging.info(
+            "已排程每 %d 分鐘(±10%% 隨機)輪詢會診清單(常駐登入,查完退回主畫面;"
+            "有新會診才寄信;%02d:00-%02d:00 休息)",
+            max(_keepalive.POLL_MIN_MINUTES, min(_keepalive.POLL_MAX_MINUTES,
+                                                 interval)),
+            int(cfg.get("quiet_start_hour", 0)), int(cfg.get("quiet_end_hour", 6)))
+    else:
+        # ★SW_HIDE 後備=每輪【完整登入】★ 絕不可套 3 分鐘節奏——那是每小時把
+        # 同一組帳密送出 20 次,正是登入鎖定門檻的來源。維持舊 15 分鐘冷啟動節奏。
+        legacy = max(15, interval)
+        schedule.every(max(5, legacy - 1)).to(legacy + 1).minutes.do(
+            trigger_job_async, trigger_label="poll")
+        logging.warning(
+            "無法建立隱藏桌面 → 常駐登入停用,維持每 %d 分鐘冷啟動輪詢"
+            "(SW_HIDE 後備;%02d:00-%02d:00 休息)", legacy,
+            int(cfg.get("quiet_start_hour", 0)), int(cfg.get("quiet_end_hour", 6)))
 
 
 def _empty_imap_result(err: str) -> dict:
@@ -3742,6 +4291,9 @@ def _save_job_fail_state() -> None:
 
 def _note_job_success() -> None:
     """任務成功跑完 → 清空連續失敗計數（並在剛從故障恢復時留一行 log）。"""
+    global _login_cooldown_until
+    _login_cooldown_until = 0.0          # [2026-08-03 常駐] 登入已成功 → 冷卻解除
+    _bde_reboot_cancel.set()             # HIS 已恢復 → 重開機看守站崗解除
     global _job_fail_streak
     with _job_fail_lock:
         if not _job_fail_streak:
@@ -4249,7 +4801,7 @@ class ConfigApp(tk.Tk):
         sched.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(sched, text="輪詢間隔（分鐘,5~120）:").grid(
             row=0, column=0, sticky="w", **pad)
-        self.interval_var = tk.StringVar(value=str(self.cfg.get("poll_interval_minutes", 15)))
+        self.interval_var = tk.StringVar(value=str(self.cfg.get("poll_interval_minutes", 3)))
         ttk.Entry(sched, textvariable=self.interval_var, width=10,
                   font=("Consolas", 11)).grid(row=0, column=1, sticky="w", **pad)
         ttk.Label(sched, text="半夜休息（不查不寄）起/迄時:").grid(
@@ -4327,7 +4879,9 @@ class ConfigApp(tk.Tk):
         cfg["recipients"] = list(self.rcp_list.get(0, tk.END))
         # [2026-06-25] 改存輪詢間隔 / 半夜休息時段(取代舊的 12:40/17:10 固定排程)。壞值退回預設。
         try:
-            cfg["poll_interval_minutes"] = max(5, min(120, int(self.interval_var.get().strip())))
+            # [codex P1 R5] 下限與 load_config 一致(2):舊下限 5 會讓「開設定→存檔」
+            # 把 3 夾成 5,±10% 抖動後可能超過院方 5 分鐘閒置登出 → 常駐一直斷線。
+            cfg["poll_interval_minutes"] = max(2, min(120, int(self.interval_var.get().strip())))
         except (TypeError, ValueError):
             cfg["poll_interval_minutes"] = DEFAULT_CONFIG["poll_interval_minutes"]
         try:
@@ -4402,6 +4956,8 @@ def exit_action(icon=None, item=None) -> None:
         _exit_started = True
     logging.info("使用者要求退出會診查詢程式")
     running.clear()
+    _session_close("程式結束")
+    _abort_bde_shutdown_on_exit()   # [codex P1 R19] 退出不可留下排定中的重開機
     if tray_icon_object:
         try:
             tray_icon_object.visible = False

@@ -26,7 +26,8 @@ def test_give_up_triggers_orphan_cleanup():
 
 def test_login_wait_message_names_multi_instance_cap():
     # 關過多開提示卻等不到登入 → 訊息點名疑似多開上限(便於判別根因)
-    src = inspect.getsource(cq._automation_on_hidden)
+    # [2026-08-03 常駐] 登入半段搬進 _cold_start_session,守衛跟著搬
+    src = inspect.getsource(cq._cold_start_session_impl)
     assert "saw_multi_instance" in src
     assert "最多兩個" in src, "關過多開提示的失敗訊息應點名 systemftp 多開上限"
 

@@ -94,6 +94,9 @@ def test_both_loops_were_replaced_by_the_helper():
     assert "if mains and not notice:" not in raw, \
         "★錯誤的放行條件不可再存在★"
     # def 那一行也含 "(our_pids",要用賦值形式才數得到真正的呼叫點
-    assert raw.count("= _wait_main_window_after_login(our_pids") == 2, \
-        "兩個呼叫點都要走 helper"
+    # [2026-08-03 常駐] 隱藏桌面路徑不再取用回傳值(主畫面 hwnd 每輪重找),
+    # 但仍必須走同一個 helper;def 那一行也含 "(our_pids",要扣掉。
+    calls = raw.count("_wait_main_window_after_login(our_pids") - raw.count(
+        "def _wait_main_window_after_login(")
+    assert calls == 2, "兩個呼叫點(常駐冷啟動 + SW_HIDE)都要走 helper"
     assert raw.count("def _wait_main_window_after_login(") == 1
