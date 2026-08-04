@@ -99,10 +99,17 @@ def test_notified_baseline_prunes_so_reconsult_is_detected(monkeypatch):
 
 
 def test_poll_no_new_path_prunes_baseline():
-    """源碼守門：「無新會診」的提早 return 之前必須剪枝基準。"""
+    """源碼守門：「無新會診」的提早 return 之前必須剪枝基準。
+
+    ★[2026-08-04] 錨點改成變數名，不再綁死運算式★
+    原本錨在整串 `_new = _poll_sig - _load_notified()`。外審 P1-04 把右手邊換成
+    `_new_consult_ids(_poll_sig)`（升級時要以病歷號粒度比對，否則整份重寄）之後，
+    `str.index` 直接 ValueError —— 測試紅在「找不到錨點」而不是「性質沒了」。
+    掃原始碼的守衛，程式碼一搬家就失效；至少要讓錨點不綁實作細節。
+    """
     import inspect
     src = inspect.getsource(cq._do_full_job)
-    i_new = src.index("_new = _poll_sig - _load_notified()")
+    i_new = src.index("_new = ")          # 只錨變數名，右手邊怎麼算都可以
     i_ret = src.index("return", i_new)
     seg = src[i_new:i_ret]
     assert "_save_notified(_poll_sig)" in seg, \

@@ -471,20 +471,62 @@ def _consult_signature(extracted_text: str) -> set:
     return set(_CHART_RE.findall(extracted_text or ""))
 
 
-def _consult_signature_from_roster(roster_texts) -> set:
-    """[CQ-02] 只從病人清單列(roster_texts)抓病歷號當識別集合,不看病情摘要內文。
+def _consult_id_from_row(row: str) -> str:
+    """一列清單 → 這【一張會診單】的識別字串。純函式。
 
-    逐列以 _ROSTER_ROW_RE 取 chart 欄;解析不到結構的列(外籍病人無中文姓名等)退回
+    ★[2026-08-04 外審 P1-04]★ 原本整份清單只取「病歷號集合」，那只能回答
+    「這位病人在不在清單上」，回答不了「這是不是同一位病人的【另一張】會診」。
+    同一病人的第二張會診會被集合吸收掉 —— `{"12345678", "12345678"}` 就是
+    `{"12345678"}` —— 結果是★漏寄★，臨床上最糟的方向。
+
+    識別取 `病歷號|日期|時間`。缺日期或時間時退回只用病歷號（＝舊行為），
+    所以鑑別力只會【變好或持平】，不會變差。
+
+    ★不採納外審建議把病房/床號放進識別★：病人轉床很常見，而轉床【不是新的
+    會診】。把床號放進去會在每次轉床多寄一封（誤寄）。真正屬於「這張會診單」
+    的是【申請時間】—— 它在轉床時不變，在新開一張時必然不同。
+
+    ★解析不到結構的列由呼叫端處理★，這裡回空字串。原因見
+    `_consult_signature_from_roster`：那條路必須保留「掃出該列【全部】病歷號」
+    的舊行為 —— 實機上會有整塊文字被當成一列傳進來的情況，只取第一個會把
+    後面的會診整個丟掉（★漏寄★，比識別粒度不夠更嚴重）。
+    """
+    row = (row or "").strip()
+    m = _ROSTER_ROW_RE.fullmatch(row)
+    if not m or not m.group("chart"):
+        return ""
+    chart = m.group("chart")
+    date, tm = m.group("date"), m.group("time")
+    return f"{chart}|{date}|{tm}" if (date and tm) else chart
+
+
+def _chart_of_consult_id(consult_id: str) -> str:
+    """從識別字串取回病歷號（升級時要拿它跟舊基準比對）。純函式。"""
+    return (consult_id or "").split("|", 1)[0]
+
+
+def _consult_signature_from_roster(roster_texts) -> set:
+    """[CQ-02] 只從病人清單列(roster_texts)取識別集合,不看病情摘要內文。
+
+    逐列交給 `_consult_id_from_row` → 每張會診單一個識別(`病歷號|日期|時間`,
+    缺日期/時間時退回只用病歷號)。解析不到結構的列(外籍病人無中文姓名等)退回
     掃該「單列」的 6+ 位數字(清單列只有病歷號是 6+ 位、日期是 M/D 不會誤中,故安全)。
-    roster_texts=None(擷取失敗/停用) → 回空集合(呼叫端另以 None 走 fail-open,不更新基準)。"""
+    roster_texts=None(擷取失敗/停用) → 回空集合(呼叫端另以 None 走 fail-open,不更新基準)。
+
+    ★[2026-08-04 外審 P1-04] 這裡以前只回病歷號★ —— 同一病人的第二張會診會被
+    集合吸收掉而漏寄。詳見 `_consult_id_from_row`。"""
     out: set = set()
     for row in (roster_texts or []):
-        row = (row or "").strip()
-        m = _ROSTER_ROW_RE.fullmatch(row)
-        if m and m.group("chart"):
-            out.add(m.group("chart"))
+        cid = _consult_id_from_row(row)
+        if cid:
+            out.add(cid)
         else:
-            out.update(_CHART_RE.findall(row))
+            # ★解析不到 → 保留舊行為:掃出該列【全部】病歷號★
+            #   實機上會有整塊文字被當成一列傳進來(見
+            #   test_poll_first_startup_builds_baseline_silently 的 fixture)，
+            #   只取第一個會把後面的會診整個丟掉 —— 那是漏寄，比識別粒度不夠
+            #   更嚴重。這條路沒有日期/時間可用，維持病歷號粒度。
+            out.update(_CHART_RE.findall((row or "").strip()))
     return out
 
 
@@ -495,6 +537,8 @@ _notified_memory = None
 # 基準是否「曾經建立過」。用來區分「空集合(沒人未回覆,但已建過基準)」與「從沒建過基準」——
 # 後者(第一次啟動/檔案不存在)第一輪 poll 只建基準、不寄,避免重啟收一封全清單。None=尚未載入。
 _notified_initialized = None
+# 目前記憶體裡的基準是否來自【舊格式】(只有病歷號、沒有 ids)。見 `_new_consult_ids`。
+_notified_is_legacy = False
 
 
 def _load_notified() -> set:
@@ -503,10 +547,22 @@ def _load_notified() -> set:
     global _notified_memory, _notified_initialized
     if _notified_memory is not None:
         return set(_notified_memory)
+    global _notified_is_legacy
     try:
         data = safe_load_json(str(_NOTIFIED_FILE), default=None)
         if isinstance(data, dict):
-            _notified_memory = {str(x) for x in (data.get("charts") or [])}
+            # ★[2026-08-04 外審 P1-04] 舊基準只有病歷號★
+            #   識別改成「病歷號|日期|時間」之後，若拿新識別去跟舊基準做集合相減，
+            #   升級當下【每一張既有會診都會變成「新的」】→ 整份重寄。
+            #   所以認得舊格式，並在下面的比對降級成病歷號粒度一輪；
+            #   `_save_notified` 一寫就是新格式，之後就恢復完整鑑別力。
+            ids = data.get("ids")
+            if ids is not None:
+                _notified_memory = {str(x) for x in ids}
+                _notified_is_legacy = False
+            else:
+                _notified_memory = {str(x) for x in (data.get("charts") or [])}
+                _notified_is_legacy = True
             # [Codex] 檔案存在且是合法 dict → 先前已建過基準(即使 charts 為空,也代表「已建、
             # 目前沒人未回覆」而非從沒建過)。只有「檔案不存在 / 壞掉」才算從沒建過 → 第一輪 poll
             # 才靜默建基準。避免升級(舊版只有 charts、甚至空 charts)後把當下新會診靜默吞掉漏寄。
@@ -516,7 +572,27 @@ def _load_notified() -> set:
         logging.debug("讀取 consult_notified 失敗", exc_info=True)
     _notified_memory = set()
     _notified_initialized = False
+    _notified_is_legacy = False
     return set()
+
+
+def _new_consult_ids(current_ids: set) -> set:
+    """目前清單裡【還沒通知過】的會診 → 集合。
+
+    一般情況就是集合相減。基準還是舊格式(只有病歷號)時降級成病歷號粒度比對 ——
+    ★升級那一輪絕不可以把既有會診全部當成新的整份重寄★。代價是：升級當下就已經
+    存在的「同一病人第二張會診」這一輪不會被認出來（它本來就已經通知過了），
+    下一次 `_save_notified` 之後恢復完整鑑別力。
+    """
+    base = _load_notified()
+    if not _notified_is_legacy:
+        return set(current_ids) - base
+    known_charts = {_chart_of_consult_id(x) for x in base}
+    fresh = {i for i in current_ids if _chart_of_consult_id(i) not in known_charts}
+    if fresh != (set(current_ids) - base):
+        logging.info("[會診] 基準仍是舊格式(只有病歷號) → 本輪以病歷號粒度比對，"
+                     "避免升級後整份重寄；寫入後即恢復完整鑑別力")
+    return fresh
 
 
 def _baseline_initialized() -> bool:
@@ -529,14 +605,23 @@ def _baseline_initialized() -> bool:
 
 
 def _save_notified(charts: set) -> None:
-    """把「目前清單的病歷號」設為已通知基準(寄信成功後呼叫;poll/email/手動皆更新)。
-    【先更新記憶體(權威)再寫檔】→ 即使寫檔失敗,本行程後續 poll 也絕不重寄同一批;檔案僅供跨重啟。"""
-    global _notified_memory, _notified_initialized
+    """把「目前清單的會診識別」設為已通知基準(寄信成功後呼叫;poll/email/手動皆更新)。
+    【先更新記憶體(權威)再寫檔】→ 即使寫檔失敗,本行程後續 poll 也絕不重寄同一批;檔案僅供跨重啟。
+
+    寫出 `ids`(新格式,`病歷號|日期|時間`)與 `charts`(只有病歷號)兩份:
+    `charts` 是給【舊版程式】看的 —— 診間電腦不是同時更新的,新版寫的檔可能被還沒
+    更新的舊版讀到。舊版只認得 `charts`,少了它會把整份清單當成新會診重寄。
+    """
+    global _notified_memory, _notified_initialized, _notified_is_legacy
     _notified_memory = set(charts)
     _notified_initialized = True
+    _notified_is_legacy = False        # 寫下去的就是新格式
     try:
         atomic_write_json(str(_NOTIFIED_FILE),
-                          {"charts": sorted(charts), "initialized": True})
+                          {"ids": sorted(charts),
+                           "charts": sorted(
+                               {_chart_of_consult_id(x) for x in charts}),
+                           "initialized": True})
     except Exception:
         logging.warning("寫入 consult_notified 失敗(記憶體已記住,本行程不會重寄)", exc_info=True)
 
@@ -3632,7 +3717,10 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                                          len(_poll_sig))
                             _note_job_success()   # [codex] 這是【成功】跑完的一輪
                             return
-                        _new = _poll_sig - _load_notified()
+                        # [2026-08-04 外審 P1-04] 不可以直接集合相減 —— 升級當下
+                        # 基準還是舊格式(只有病歷號)，直接相減會把每一張既有會診
+                        # 都當成新的而整份重寄。見 `_new_consult_ids`。
+                        _new = _new_consult_ids(_poll_sig)
                         if not _new:
                             # [2026-07-25 審查] 基準必須【剪枝】成目前清單,否則已回覆而
                             # 離開清單的病歷號會永遠留在基準裡 → 同一床日後【再次開會診】
