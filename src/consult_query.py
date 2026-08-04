@@ -2370,19 +2370,23 @@ def _session_death_reason(sess) -> str:
     `_cold_start_session_impl` 的 docstring 明文寫著「絕不可把同一組帳密每 3 分鐘
     送一次」。要修它就得先知道是哪個條件在觸發。
 
-    目前的推測(★尚未證實,所以本次只加診斷、不改判定★):同一份 log 裡我們每輪
-    spawn 的 pid 都不同,而真正持有視窗的是 10928 —— 我們從未啟動過它。若
-    systemftp 是啟動器型行程(起來、把工作交給既有實例、自己結束),`sess.hproc`
-    就會立刻 signaled,於是永遠判「行程結束」。下一輪的 log 會直接說出答案。
+    ★[2026-08-04 診間 log 已證實]★ 加了診斷之後的實機 log:21 次判死【100% 都是】
+    「我們啟動的 systemftp 行程已結束」，「找不到主畫面視窗」零次。也就是說
+    **systemftp.exe 是啟動器型行程** —— 起來、把工作交給既有實例、自己立刻結束。
+    `sess.hproc` 握的是那個啟動器,它一定馬上 signaled,所以舊判定永遠說「死了」。
+
+    ★所以權威訊號改成【主畫面視窗】★:session 能不能用,取決於主畫面在不在,
+    不取決於我們當初 spawn 的那個啟動器有沒有活著。行程 handle 降級成「主畫面
+    不在時，用來說明是哪一種不在」。
     """
+    if find_windows(MAIN_CLASS, pids=sess.our_pids):
+        return ""          # 主畫面還在 → 可以用(啟動器早就結束是正常的)
     try:
         if win32event.WaitForSingleObject(sess.hproc, 0) != win32event.WAIT_TIMEOUT:
-            return "我們啟動的 systemftp 行程已結束"
+            return "我們啟動的 systemftp 行程已結束,主畫面也不在"
     except Exception:
-        return "無法查詢 systemftp 行程狀態"
-    if not find_windows(MAIN_CLASS, pids=sess.our_pids):
-        return "行程還在,但找不到主畫面視窗"
-    return ""
+        return "無法查詢 systemftp 行程狀態,且主畫面不在"
+    return "行程還在,但找不到主畫面視窗"
 
 
 def _session_is_alive(sess) -> bool:

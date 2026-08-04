@@ -37,10 +37,22 @@ def _proc_state(monkeypatch, *, exited):
     monkeypatch.setattr(cq, "win32event", _E)
 
 
-def test_a_dead_process_says_so(monkeypatch):
+def test_a_dead_launcher_with_a_live_main_window_is_still_usable(monkeypatch):
+    """★這就是修正本身★（2026-08-04 診間 log 證實）
+
+    ★這支測試原本斷言相反的事★ —— 它要求「我們 spawn 的行程結束了就判死」，
+    而那正是 bug：實機 log 顯示 21 次判死【100% 都是】這個原因、「找不到主畫面」
+    零次，也就是 systemftp.exe 是【啟動器型行程】：起來、把工作交給既有實例、
+    自己立刻結束。舊判定於是每 3 分鐘判死一次 → 冷啟動 → 重新送一次帳密。
+
+    session 能不能用，取決於主畫面在不在，不取決於那個啟動器活著沒有。
+    """
     _proc_state(monkeypatch, exited=True)
     monkeypatch.setattr(cq, "find_windows", lambda *a, **k: [1])
-    assert "行程已結束" in cq._session_death_reason(_Sess())
+
+    assert cq._session_death_reason(_Sess()) == "", (
+        "★啟動器結束就判死 → 每 3 分鐘重新送一次帳密★")
+    assert cq._session_is_alive(_Sess()) is True
 
 
 def test_a_missing_main_window_says_so(monkeypatch):
@@ -49,14 +61,20 @@ def test_a_missing_main_window_says_so(monkeypatch):
     assert "找不到主畫面" in cq._session_death_reason(_Sess())
 
 
-def test_the_two_reasons_are_not_the_same_sentence(monkeypatch):
-    """★這就是實機 log 判斷不出來的原因★"""
+def test_both_the_process_and_the_window_gone_says_so(monkeypatch):
+    """行程也結束、主畫面也不在 → 這才是真的死了。"""
     _proc_state(monkeypatch, exited=True)
-    monkeypatch.setattr(cq, "find_windows", lambda *a, **k: [1])
-    dead_proc = cq._session_death_reason(_Sess())
-
-    _proc_state(monkeypatch, exited=False)
     monkeypatch.setattr(cq, "find_windows", lambda *a, **k: [])
+    reason = cq._session_death_reason(_Sess())
+    assert "行程已結束" in reason and "主畫面" in reason, reason
+
+
+def test_the_two_reasons_are_not_the_same_sentence(monkeypatch):
+    """★這就是實機 log 判斷不出來的原因★ 兩個成因要講得出差別。"""
+    monkeypatch.setattr(cq, "find_windows", lambda *a, **k: [])
+    _proc_state(monkeypatch, exited=True)
+    dead_proc = cq._session_death_reason(_Sess())
+    _proc_state(monkeypatch, exited=False)
     no_window = cq._session_death_reason(_Sess())
 
     assert dead_proc and no_window and dead_proc != no_window, (
@@ -80,7 +98,8 @@ def test_an_unqueryable_process_is_not_reported_as_exited(monkeypatch):
         def WaitForSingleObject(_h, _ms):
             raise OSError("handle 無效")
     monkeypatch.setattr(cq, "win32event", _E)
-    monkeypatch.setattr(cq, "find_windows", lambda *a, **k: [1])
+    # 主畫面不在，才會走到「查行程狀態」那一步
+    monkeypatch.setattr(cq, "find_windows", lambda *a, **k: [])
 
     reason = cq._session_death_reason(_Sess())
     assert "無法查詢" in reason and "已結束" not in reason, reason
