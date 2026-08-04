@@ -139,3 +139,53 @@ def test_the_duty_block_growing_does_not_break_the_alignment(links, tk_root):
         tops = {_top_in_frame(b, frame)
                 for b in _buttons(left_box) + _buttons(right_box)}
         assert len(tops) == 1, f"值班區變高之後又歪了：{tops}"
+
+
+# ─── ★[2026-08-04 使用者] 上下兩列的「欄」也要對齊★ ─────────────────────────
+#   使用者原話：「院內系統捷徑的按鈕仍然沒有左右對齊（病理看片跟電子刷卡,
+#   Google 跟簽核表單）」。那兩組各是【同一組內、第 3/第 4 欄】的上下兩顆。
+#   成因與 2026-07-31 那次（左右兩排的 y）是不同的軸：每一列各自
+#   `pack(side="left")`，按鈕寬度隨字數而變 → 前一欄一寬，後面每一欄就一路錯開
+#   （CMUH入口網站 比 院內分機查詢 窄，所以第 3、4 欄左緣不同）。
+#   幾何保證：同一組兩列共用一個 grid + 欄 uniform 等寬。
+def _left_in_frame(widget, frame) -> int:
+    return widget.winfo_rootx() - frame.winfo_rootx()
+
+
+def test_the_two_buttons_the_user_named_share_a_left_edge(links):
+    """★使用者指名的第一組：電子刷卡（網頁列一第3顆）vs 病理看片（列二第3顆）★"""
+    frame, _l1, _l2, web1, web2 = links
+    top = _left_in_frame(_text_of(web1, "電子刷卡"), frame)
+    bottom = _left_in_frame(_text_of(web2, "病理看片"), frame)
+    assert top == bottom, f"第 3 欄左緣不齊：上 x={top} 下 x={bottom}"
+
+
+def test_the_second_pair_the_user_named_shares_a_left_edge(links):
+    """★第二組：簽核表單（列一第4顆）vs Google（列二第4顆）★"""
+    frame, _l1, _l2, web1, web2 = links
+    top = _left_in_frame(_text_of(web1, "簽核表單"), frame)
+    bottom = _left_in_frame(_text_of(web2, "Google"), frame)
+    assert top == bottom, f"第 4 欄左緣不齊：上 x={top} 下 x={bottom}"
+
+
+def test_every_column_lines_up_in_both_groups(links):
+    """不只使用者指名的那兩欄 —— 本機組與網頁組的每一欄都要上下對齊。"""
+    frame, local1, local2, web1, web2 = links
+    for label, r1, r2 in (("本機", local1, local2), ("網頁", web1, web2)):
+        tops = [_left_in_frame(b, frame) for b in _buttons(r1)]
+        bottoms = [_left_in_frame(b, frame) for b in _buttons(r2)]
+        assert len(tops) == len(bottoms), f"{label}組兩列欄數不同"
+        assert tops == bottoms, f"{label}組欄位左緣不齊：上 {tops} 下 {bottoms}"
+
+
+def test_columns_are_bound_by_uniform_not_by_hand(links):
+    """★幾何保證而非人工湊★ 欄寬由 grid uniform 綁定；同組每一欄等寬。
+    只斷言「看起來對齊」會在字體改變時失守,這裡直接驗底層約束。"""
+    import inspect
+    src = inspect.getsource(main.AutomationApp._Row.add)
+    assert "grid_columnconfigure" in src and "uniform=self.uniform" in src
+    assert ".pack(" not in src, "改回 pack 就會再度失去欄對齊"
+    # 實際欄寬也要相等（uniform 真的生效，不只是設了參數）
+    frame, _l1, _l2, web1, _w2 = links
+    widths = {b.winfo_width() for b in _buttons(web1)}
+    assert len(widths) == 1, f"同組欄寬不一致：{widths}"

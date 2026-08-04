@@ -9977,11 +9977,38 @@ class AutomationApp:
     def _launch_browser(self, url):
         _show_launch_error(_pl_open_url(url))
 
+    # ★[2026-08-04 使用者] 一組（本機／網頁）的兩列共用同一個 grid★
+    #   見 _build_links_grid 的說明：欄用 uniform 綁等寬，第 N 欄才會上下對齊。
+    #   介面刻意只暴露 add()，填充函式不必知道底層是 grid；winfo_children() 回本列
+    #   按鈕，讓「量按鈕真實座標」的對齊測試沿用同一套寫法。
     # ★[2026-07-31 使用者] 院內系統捷徑：左右兩排按鈕的垂直間距必須用【同一個值】★
     #   舊版左邊 pady=1、右邊 pady=0 → 第一列差 1px；左邊第二列的 frame 又多一個
     #   pady=(1,0) → 第二列累積差到 3-4px（「電子簽章 vs 值班查詢」看起來最明顯）。
     #   寫成一個常數，就沒有「只改了一邊」這種可能。
     _LINK_BTN_PADY = 1
+
+    class _Row:
+        """捷徑列的一列（共用父 grid 的某一 row）。"""
+
+        def __init__(self, box, row: int, uniform: str):
+            self.box, self.row, self.uniform = box, row, uniform
+            self._col = 0
+            self._buttons: list = []
+
+        def add(self, text: str, command, padx: int, pady: int):
+            btn = ttk.Button(self.box, text=text, style="Link.TButton",
+                             command=command)
+            btn.grid(row=self.row, column=self._col, padx=padx, pady=pady,
+                     sticky="ew")
+            # uniform：同一組所有欄等寬 → 兩列的第 N 欄必然同寬同位置
+            self.box.grid_columnconfigure(self._col, weight=0,
+                                          uniform=self.uniform)
+            self._col += 1
+            self._buttons.append(btn)
+            return btn
+
+        def winfo_children(self):
+            return list(self._buttons)
 
     @staticmethod
     def _build_links_grid(links_frame):
@@ -10007,16 +10034,26 @@ class AutomationApp:
         links_frame.grid_columnconfigure(1, weight=0)   # 分隔線
         links_frame.grid_columnconfigure(2, weight=0)   # 網頁兩排
         links_frame.grid_columnconfigure(3, weight=1)   # 值班資訊吃掉多餘寬度
-        local_row1 = ttk.Frame(links_frame)
-        local_row1.grid(row=0, column=0, padx=(8, 0), pady=0, sticky='w')
-        local_row2 = ttk.Frame(links_frame)
-        local_row2.grid(row=1, column=0, padx=(8, 0), pady=0, sticky='w')
+        # ★[2026-08-04 使用者] 上下兩列的【欄】也要對齊★
+        #   原本每一列各自是一個 Frame + `pack(side="left")`：按鈕寬度隨字數而變,
+        #   兩列的欄邊界因此不可能對齊 —— 使用者指名「電子刷卡 vs 病理看片」、
+        #   「簽核表單 vs Google」左緣不同,正是這個原因(前一列的 CMUH入口網站
+        #   比 院內分機查詢 窄,後面每一欄就一路錯開)。
+        #   改法：同一組的兩列共用【同一個 grid】,欄用 uniform 綁成等寬 →
+        #   第 N 欄在兩列必然同寬同位置。這是幾何保證,不是靠人工湊 padding。
+        #   (上一版 2026-07-31 修的是左右兩排的 y 對齊,那是另一個軸,仍然有效。)
+        local_box = ttk.Frame(links_frame)
+        local_box.grid(row=0, column=0, rowspan=2, padx=(8, 0), pady=0,
+                       sticky='w')
+        web_box = ttk.Frame(links_frame)
+        local_row1 = AutomationApp._Row(local_box, 0, "lk")
+        local_row2 = AutomationApp._Row(local_box, 1, "lk")
         ttk.Separator(links_frame, orient='vertical').grid(
             row=0, column=1, rowspan=2, sticky="ns", padx=4, pady=3)
-        web_row1 = ttk.Frame(links_frame)
-        web_row1.grid(row=0, column=2, padx=(8, 0), pady=0, sticky='w')
-        web_row2 = ttk.Frame(links_frame)
-        web_row2.grid(row=1, column=2, padx=(8, 0), pady=0, sticky='w')
+        web_box.grid(row=0, column=2, rowspan=2, padx=(8, 0), pady=0,
+                     sticky='w')
+        web_row1 = AutomationApp._Row(web_box, 0, "wk")
+        web_row2 = AutomationApp._Row(web_box, 1, "wk")
         duty_container = ttk.Frame(links_frame)
         duty_container.grid(row=0, column=3, rowspan=2, padx=(10, 6), pady=0,
                             sticky="ne")
@@ -10030,9 +10067,11 @@ class AutomationApp:
         # ★[2026-07-31 使用者] pady 兩側必須一致★ 舊版左邊 pady=1、右邊 pady=0，
         #   再加上左邊第二列 frame 的 pady=(1,0)，第二列就累積差到 3-4px。
         for text, path in local_buttons_row1:
-            ttk.Button(local_frame_row1, text=text, style="Link.TButton", command=lambda p=path: self._launch_program(p)).pack(side="left", padx=3, pady=self._LINK_BTN_PADY)
+            local_frame_row1.add(text, lambda p=path: self._launch_program(p),
+                                 padx=3, pady=self._LINK_BTN_PADY)
         for text, path in local_buttons_row2:
-            ttk.Button(local_frame_row2, text=text, style="Link.TButton", command=lambda p=path: self._launch_program(p)).pack(side="left", padx=3, pady=self._LINK_BTN_PADY)
+            local_frame_row2.add(text, lambda p=path: self._launch_program(p),
+                                 padx=3, pady=self._LINK_BTN_PADY)
 
 
         web_buttons_row1 = [
@@ -10052,7 +10091,8 @@ class AutomationApp:
         # 左右兩排現在住在 links_frame 的【同一組列】裡，pady 也用同一個常數 ——
         # 對齊由 grid 的列高保證，不是靠人工湊 padding（見 links_frame 那段說明）。
         for text, url in web_buttons_row1:
-            ttk.Button(web_frame_row1, text=text, style="Link.TButton", command=lambda u=url: self._launch_browser(u)).pack(side="left", padx=2, pady=self._LINK_BTN_PADY)
+            web_frame_row1.add(text, lambda u=url: self._launch_browser(u),
+                               padx=2, pady=self._LINK_BTN_PADY)
 
         duty_grid = duty_container
         for dc in range(5):
@@ -10070,7 +10110,8 @@ class AutomationApp:
         ttk.Label(duty_grid, textvariable=self.duty_row2_vs_name_var, style="SmallDuty.TLabel", anchor="w").grid(row=1, column=4, sticky="w", **_duty_pad)
 
         for text, url in web_buttons_row2:
-            ttk.Button(web_frame_row2, text=text, style="Link.TButton", command=lambda u=url: self._launch_browser(u)).pack(side="left", padx=2, pady=self._LINK_BTN_PADY)
+            web_frame_row2.add(text, lambda u=url: self._launch_browser(u),
+                               padx=2, pady=self._LINK_BTN_PADY)
 
     def _launch_scheduler_program(self):
         _show_launch_error(_pl_launch_helper_script(_pl.SCHEDULER))
