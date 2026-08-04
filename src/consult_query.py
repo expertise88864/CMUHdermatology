@@ -47,6 +47,7 @@ REQUIRED_LIBS = [
 ensure_dependencies(REQUIRED_LIBS)
 
 # === 主要 import（依賴已就緒）===
+import contextlib  # noqa: E402
 import ctypes  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 import html as _html  # noqa: E402
@@ -86,7 +87,9 @@ _user32.SetThreadDesktop.argtypes = [ctypes.c_void_p]
 _user32.CloseDesktop.restype = ctypes.c_bool
 _user32.CloseDesktop.argtypes = [ctypes.c_void_p]
 
-from cmuh_common.atomic_io import atomic_write_json, safe_load_json  # noqa: E402
+from cmuh_common.atomic_io import (  # noqa: E402
+    atomic_write_json, safe_load_json, safe_load_json_ex,
+)
 from cmuh_common.logging_setup import attach_queue_handler, setup_logging  # noqa: E402
 from cmuh_common.paths import get_app_dir, get_settings_dir, restart_self  # noqa: E402
 from cmuh_common.platform_win import is_admin, run_as_admin  # noqa: E402
@@ -539,6 +542,45 @@ _notified_memory = None
 _notified_initialized = None
 # 目前記憶體裡的基準是否來自【舊格式】(只有病歷號、沒有 ids)。見 `_new_consult_ids`。
 _notified_is_legacy = False
+# 上一次讀基準檔的結果:"ok" | "missing" | "corrupt" | "error"(見 safe_load_json_ex)。
+# ★[2026-08-04 外審 P1-05] 這四種不可以混為一談★ 見 `_baseline_absence_reason`。
+_notified_load_status = None
+
+# 「這台機器成功建立過基準」的標記。★不是啟動時寫,是第一次成功存基準之後才寫★
+#   啟動時寫的話,真正的首次安裝在第一輪 poll 就已經有標記,會被誤判成「基準遺失」
+#   而寄出整份清單 —— 首次安裝寄整份正是當初要避免的事。
+_INSTALL_MARKER = SETTINGS_DIR / "consult_baseline_established.json"
+
+
+def _mark_baseline_established() -> None:
+    """留下「這台機器建立過基準」的痕跡。失敗不致命(下次再寫)。"""
+    try:
+        if _INSTALL_MARKER.exists():
+            return
+        atomic_write_json(str(_INSTALL_MARKER),
+                          {"first_established": datetime.now().isoformat()})
+    except Exception:
+        logging.debug("[會診] 基準標記寫入失敗(略過)", exc_info=True)
+
+
+def _baseline_absence_reason() -> str:
+    """基準不在時，這到底是什麼情況。→
+        "first_install"            真的第一次跑(沒有標記、檔案也不存在)
+        "missing_after_prior_run"  建立過基準，但檔案不見了
+        "corrupt"                  檔案在但內容壞掉
+        "read_error"               讀不到(權限/防毒暫時鎖住) —— ★原檔通常還在★
+
+    ★[2026-08-04 外審 P1-05]★ 原本這四種全部走同一條路:第一輪 poll 靜默把
+    當下【所有】未回覆會診標成「已通知」然後 return。對真正的首次安裝那是對的
+    (避免每次重裝收一封全清單)，但對後三種就是★把現有會診整批靜默吞掉★ ——
+    那些會診從此不會有人收到通知，而且沒有任何跡象。
+    """
+    if _notified_load_status == "corrupt":
+        return "corrupt"
+    if _notified_load_status == "error":
+        return "read_error"
+    return ("missing_after_prior_run" if _INSTALL_MARKER.exists()
+            else "first_install")
 
 
 def _load_notified() -> set:
@@ -549,7 +591,9 @@ def _load_notified() -> set:
         return set(_notified_memory)
     global _notified_is_legacy
     try:
-        data = safe_load_json(str(_NOTIFIED_FILE), default=None)
+        data, _status = safe_load_json_ex(str(_NOTIFIED_FILE), default=None)
+        global _notified_load_status
+        _notified_load_status = _status
         if isinstance(data, dict):
             # ★[2026-08-04 外審 P1-04] 舊基準只有病歷號★
             #   識別改成「病歷號|日期|時間」之後，若拿新識別去跟舊基準做集合相減，
@@ -616,14 +660,23 @@ def _save_notified(charts: set) -> None:
     _notified_memory = set(charts)
     _notified_initialized = True
     _notified_is_legacy = False        # 寫下去的就是新格式
+    saved = False
     try:
         atomic_write_json(str(_NOTIFIED_FILE),
                           {"ids": sorted(charts),
                            "charts": sorted(
                                {_chart_of_consult_id(x) for x in charts}),
                            "initialized": True})
+        saved = True
     except Exception:
         logging.warning("寫入 consult_notified 失敗(記憶體已記住,本行程不會重寄)", exc_info=True)
+    if saved:
+        # ★寫成功【之後】才留標記★（順序不可以反過來）
+        #   反過來的話:標記寫了、基準檔卻沒寫成 → 下次啟動看到「標記在、檔案不在」
+        #   → 判成基準遺失 → 白白對團隊重寄整份清單並發告警。那是自己製造的假警報。
+        #   另外包一層:標記只是輔助,它出事不可以把已經存好的基準這條主線也拖垮。
+        with contextlib.suppress(Exception):
+            _mark_baseline_established()
 
 
 def _in_quiet_hours(now: datetime, cfg: dict) -> bool:
@@ -3744,18 +3797,37 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                             "⚠ 會診清單自動解析失敗,本信以截圖為準,請人工核對是否有新會診。")
                     else:
                         _poll_sig = _consult_signature_from_roster(roster_texts)
+                        _lost = ""
                         if not _baseline_initialized():
-                            # [2026-06-25 user] 第一次啟動還沒建過基準 → 開機這輪只建基準、不寄,
-                            # 避免每次重啟收一封「全部未回覆清單」的信。之後才比對新病歷號。
-                            _save_notified(_poll_sig)
-                            logging.info("[poll] 首次建立會診基準(%d 筆),本輪不寄信",
-                                         len(_poll_sig))
-                            _note_job_success()   # [codex] 這是【成功】跑完的一輪
-                            return
+                            _why = _baseline_absence_reason()
+                            if _why == "first_install":
+                                # [2026-06-25 user] 第一次啟動還沒建過基準 → 開機這輪只建
+                                # 基準、不寄,避免每次重啟收一封「全部未回覆清單」的信。
+                                _save_notified(_poll_sig)
+                                logging.info("[poll] 首次建立會診基準(%d 筆),本輪不寄信",
+                                             len(_poll_sig))
+                                _note_job_success()   # [codex] 這是【成功】跑完的一輪
+                                return
+                            # ★[2026-08-04 外審 P1-05] 基準遺失/損毀不可以靜默吞掉★
+                            #   這台機器建立過基準,現在卻讀不到 —— 我們【不知道】哪些
+                            #   會診已經通知過。靜默重建等於把當下所有未回覆會診標成
+                            #   「已通知」,它們從此不會有人收到,而且沒有任何跡象。
+                            #   改成 fail-open:當作全部都是新的寄出去一次,信裡註明要
+                            #   人工核對。寧可多寄一封讓人核對,不可以無聲漏掉會診。
+                            _lost = _why
+                            logging.error(
+                                "[poll] ★會診通知基準遺失/損毀(%s)★ 無從得知哪些已通知 → "
+                                "本輪視為全新並寄出整份清單供人工核對(%d 筆)",
+                                _why, len(_poll_sig))
+                            _alert_baseline_lost(_why, len(_poll_sig))
+                            _poll_extract_note = (
+                                "⚠ 會診通知基準遺失或損毀，本程式已無從得知哪些會診先前"
+                                "通知過。本信列出【目前全部未回覆的會診】，請人工核對是否"
+                                "有新的；下一輪起恢復正常比對。")
                         # [2026-08-04 外審 P1-04] 不可以直接集合相減 —— 升級當下
                         # 基準還是舊格式(只有病歷號)，直接相減會把每一張既有會診
                         # 都當成新的而整份重寄。見 `_new_consult_ids`。
-                        _new = _new_consult_ids(_poll_sig)
+                        _new = set(_poll_sig) if _lost else _new_consult_ids(_poll_sig)
                         if not _new:
                             # [2026-07-25 審查] 基準必須【剪枝】成目前清單,否則已回覆而
                             # 離開清單的病歷號會永遠留在基準裡 → 同一床日後【再次開會診】
@@ -4560,6 +4632,49 @@ def _save_job_fail_state() -> None:
                            "last_alert_ts": _job_fail_last_alert})
     except Exception:
         logging.debug("[health] 告警節流狀態寫不下去(略過)", exc_info=True)
+
+
+def _alert_baseline_lost(reason: str, count: int) -> None:
+    """基準遺失/損毀 → 寄一封系統告警給開發者。失敗只記 log。
+
+    ★這封不是臨床通知★ 臨床端已經在同一輪收到「整份清單請人工核對」那封了；
+    這封是要讓維護的人知道那台機器的 settings 出過事(防毒隔離、磁碟、誤刪)。
+    """
+    human = {
+        "missing_after_prior_run": "基準檔不見了(建立過但檔案已不存在)",
+        "corrupt": "基準檔內容損壞(已備份壞檔)",
+        "read_error": "基準檔讀不到(權限/防毒暫時鎖住;原檔通常還在)",
+    }.get(reason, reason)
+    host = ""
+    try:
+        host = socket.gethostname()
+    except OSError:
+        pass
+
+    def _worker():
+        try:
+            from cmuh_common.smtp_mail import send_mail
+            send_mail(
+                recipients=[str(r) for r in _developer_alert_recipients()],
+                subject="⚠ 會診通知基準遺失/損毀" + (f"（{host}）" if host else ""),
+                body=(f"{human}\n\n"
+                      + (f"發生在：{host}\n" if host else "")
+                      + f"本輪目前未回覆的會診共 {count} 筆，已【全部】寄給臨床收件人"
+                      "並註明請人工核對（寧可多寄一封，不可無聲漏掉）。\n\n"
+                      "下一輪起會以本輪清單為新基準，恢復正常比對。\n"
+                      "若這是防毒或備份軟體造成的，請確認 settings 目錄的排除設定。\n"
+                      "（本信只寄給開發者；臨床同仁不會收到。）"),
+                attachment_path=None,
+                category="system",
+            )
+        except Exception:
+            logging.warning("[會診] 基準遺失告警寄送失敗", exc_info=True)
+
+    try:
+        threading.Thread(target=_worker, name="ConsultBaselineAlert",
+                         daemon=True).start()
+    except Exception:
+        logging.warning("[會診] 基準遺失告警執行緒起不來", exc_info=True)
 
 
 def _note_job_success() -> None:
