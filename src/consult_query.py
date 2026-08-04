@@ -5226,6 +5226,12 @@ def main() -> None:
                 return
 
         logging.info("=== 會診查詢程式啟動 v%s ===", CURRENT_VERSION)
+        # [2026-08-04] 自報 PID 給 watchdog 的半死救援用（見 cmuh_common/pidfile）
+        try:
+            from cmuh_common.pidfile import write_pid_file  # noqa: PLC0415
+            write_pid_file("consult_query")
+        except Exception:
+            logging.debug("[pidfile] 自報 PID 失敗（不影響會診查詢）", exc_info=True)
         # [opt B1] 啟動時建一次 SMTP 設定範本(load_credentials 已改純讀取，不再於熱路徑寫檔)
         try:
             from cmuh_common.smtp_mail import ensure_credentials_template

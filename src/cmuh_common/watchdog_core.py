@@ -70,6 +70,8 @@ DEFAULT_CONFIG = {
         {
             "name": "會診查詢",
             "log_path": "settings/consult_query.log",
+            # [2026-08-04] 半死救援優先讀 settings/<pid_name>.pid（見 pidfile）
+            "pid_name": "consult_query",
             "pyw": "中國醫皮膚科會診查詢程式.pyw",
             "process_match": "中國醫皮膚科會診查詢程式",
             "mutex_name": "Local\\CMUH_Skin_ConsultQuery_SingleInstance_v1",
@@ -81,6 +83,8 @@ DEFAULT_CONFIG = {
         {
             "name": "打卡",
             "log_path": "settings/autoclock.log",
+            # [2026-08-04] 半死救援優先讀 settings/<pid_name>.pid（見 pidfile）
+            "pid_name": "autoclock",
             "pyw": "中國醫皮膚科打卡程式.pyw",
             "process_match": "中國醫皮膚科打卡程式",
             "mutex_name": "Local\\CMUH_Skin_AutoClock_SingleInstance_v1",
@@ -589,14 +593,29 @@ def _wmic_find_pids(process_keyword: str, *, log_on_empty: bool = True) -> list:
     return []
 
 
-def _find_pids_holding_mutex(process_keyword: str, mutex_name: str = "") -> list:
-    """[2026-05-22 v36] 當 psutil 抓不到 cmdline 但已知 mutex 被持有時，
-    用 WMIC 突破 psutil 的 admin cmdline 限制。
+def _find_pids_holding_mutex(process_keyword: str, mutex_name: str = "",
+                             pid_name: str = "") -> list:
+    r"""半死救援：找出該程式的 PID。★先問 PID 檔,再退回 cmdline 比對★
 
-    保留 backward-compat 簽章 (mutex_name 參數雖未使用，外部 caller 跟 test
-    都已綁定)。實際工作委派給 _wmic_find_pids，log_on_empty=True 因為這條
-    路徑是 kill 前的 PID 查詢，找不到要警告。
+    [2026-08-04 實機] 舊版只走 cmdline 比對,在 Windows 11 上連續兩小時找不到
+    PID、救援完全失效(每 60 秒印同一組警告什麼都沒做)。三個破口同時成立:
+    WMIC 已被移除、CIM 對提權行程回傳空 CommandLine、而且實機 cmdline 是
+    `...\srcutoclock.py` 根本不含啟動器檔名關鍵字(見 cmuh_common/pidfile)。
+    PID 檔是行程【自報】的直接事實,不受這三者影響;讀回來仍會驗活著且是
+    python 行程(PID 會被重用),驗不過就退回原本的 cmdline 路徑。
+
+    保留 backward-compat 簽章(mutex_name 未使用,外部 caller 與測試都已綁定)。
     """
+    if pid_name:
+        try:
+            from cmuh_common.pidfile import read_verified_pid  # noqa: PLC0415
+            pid = read_verified_pid(pid_name)
+            if pid:
+                logging.info("[watchdog] 由 PID 檔取得 %s 的 PID=%s(不需 cmdline 比對)",
+                             process_keyword, pid)
+                return [pid]
+        except Exception:
+            logging.debug("[watchdog] 讀 PID 檔失敗,退回 cmdline 比對", exc_info=True)
     return _wmic_find_pids(process_keyword, log_on_empty=True)
 
 
@@ -876,7 +895,8 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
                     logging.warning(
                         "[watchdog] %s: mutex 持有但 log %.0fs 沒更新 (>%ds) — "
                         "process 半死，嘗試找 PID 強制 kill", name, age, max_stale)
-                    half_dead_pids = _find_pids_holding_mutex(keyword, mutex_name)
+                    half_dead_pids = _find_pids_holding_mutex(
+                        keyword, mutex_name, pid_name=prog.get("pid_name", ""))
                     if half_dead_pids:
                         if not claim_action_lock(name, action_lock_sec):
                             return (f"⏭ {name}: 半死狀態但 lock 還新，"

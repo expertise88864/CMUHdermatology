@@ -2370,6 +2370,14 @@ def main() -> None:
     try:
         _setup_clock_logging()
         logging.info("=== autoclock v%s 啟動 ===", CURRENT_VERSION)
+        # [2026-08-04] 自報 PID 給 watchdog 的半死救援用。實機曾因 cmdline 比對
+        # 三重失效(WMIC 已移除/CIM 對提權行程回傳空 CommandLine/cmdline 不含
+        # 啟動器檔名)而連續兩小時救不了半死的自己(見 cmuh_common/pidfile)。
+        try:
+            from cmuh_common.pidfile import write_pid_file  # noqa: PLC0415
+            write_pid_file("autoclock")
+        except Exception:
+            logging.debug("[pidfile] 自報 PID 失敗（不影響打卡）", exc_info=True)
 
         # [穩定性] health monitor — RAM/時鐘/硬碟 + 記憶體 leak 自動重啟 (A/E/F)
         try:
