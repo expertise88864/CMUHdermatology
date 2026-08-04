@@ -22,6 +22,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import consult_query as cq  # noqa: E402
 
 
+def _clock(step=0.25):
+    """可控 monotonic：每讀一次前進 step 秒。"""
+    t = {"v": 0.0}
+
+    def _now():
+        t["v"] += step
+        return t["v"]
+    return _now
+
+
 def _scripted(reads):
     """把一連串「每次讀到什麼」腳本化。用完後一直回最後一筆。"""
     seq = list(reads)
@@ -38,7 +48,7 @@ class TestLoadingIsNotMistakenForEmpty:
         reads = [[], [], ["甲C16(1)1111111"], ["甲C16(1)1111111"],
                  ["甲C16(1)1111111"]]
         got, stable = cq._await_stable_roster(
-            1, read=_scripted(reads), sleep=lambda _s: None)
+            1, read=_scripted(reads), sleep=lambda _s: None, now=_clock())
 
         assert stable is True
         assert got == ["甲C16(1)1111111"], f"沒等到載入完成：{got}"
@@ -49,7 +59,7 @@ class TestLoadingIsNotMistakenForEmpty:
         four = two + ["丙3333333", "丁4444444"]
         got, stable = cq._await_stable_roster(
             1, read=_scripted([two, four, four, four]),
-            sleep=lambda _s: None)
+            sleep=lambda _s: None, now=_clock())
 
         assert stable is True and got == four, f"拿到 partial roster：{got}"
 
@@ -59,7 +69,8 @@ class TestLoadingIsNotMistakenForEmpty:
         否則沒有病人的時段永遠「判斷不了」→ 每輪都 fail-open 寄信，變成天天洗信箱。
         """
         got, stable = cq._await_stable_roster(
-            1, read=_scripted([[], [], [], []]), sleep=lambda _s: None)
+            1, read=_scripted([[], [], [], []]), sleep=lambda _s: None,
+            now=_clock())
 
         assert stable is True and got == [], (
             "空清單也要能被判定成穩定，否則沒病人時每輪都會寄信")
@@ -141,3 +152,57 @@ def test_the_extraction_actually_waits():
               if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     assert "_await_stable_roster" in called, (
         "擷取仍然單次讀清單 → 載入中的空/半份清單會被當成有效資料")
+
+
+class TestAnEmptyRosterNeedsALongerLook:
+    """★[外審第 3 輪 P1-01]★「沒有變」不等於「載入完成」。
+
+    【空】剛好也是「還沒開始載入」的樣子。連續三次讀到空只要 0.5 秒就達成 ——
+    若 HIS 在 1.5 秒才開始填，那 0.5 秒的「穩定空清單」會被當成「今天真的沒有
+    會診」→ 基準被剪成空 → 下一輪整份重寄。
+
+    外審也指出我原本那支「2 秒後才有 radio」的測試沒有真的模擬時間（sleep 被
+    换成 no-op、也沒有可控時鐘），所以測不到這件事。這裡用可控時鐘補上。
+    """
+
+    def test_empty_then_patients_at_1_5s_is_not_called_empty(self):
+        """★這就是外審點名的情境★ 前 1.5 秒空，之後才出現病人。"""
+        empties = [[] for _ in range(6)]          # 0.25s × 6 = 1.5 秒
+        pt = ["甲C16(1)1111111"]
+        got, stable = cq._await_stable_roster(
+            1, read=_scripted(empties + [pt, pt, pt]),
+            sleep=lambda _s: None, now=_clock())
+
+        assert stable is True
+        assert got == pt, (
+            f"★0.5 秒就把還沒載入的空清單當成『真的沒有會診』★：{got}")
+
+    def test_a_truly_empty_roster_is_accepted_after_the_longer_look(self):
+        """★反方向:真的沒病人仍要判得出來★ 觀察夠久之後要回 stable。
+
+        否則沒有病人的時段永遠「判斷不了」→ 每輪 fail-open 寄信＝天天洗信箱。
+        """
+        got, stable = cq._await_stable_roster(
+            1, read=_scripted([[]]), sleep=lambda _s: None, now=_clock())
+
+        assert stable is True and got == [], (
+            "觀察夠久之後空清單仍要能被接受")
+
+    def test_a_nonempty_roster_does_not_wait_the_extra_window(self):
+        """有內容就不必多等 —— 資料都出現了，不可能是『還沒載入』。
+
+        多等會把每一輪都拉長 3 秒，而常駐節奏是 3 分鐘一輪、還要維持 keepalive。
+        """
+        pt = ["甲1111111"]
+        reads = {"n": 0}
+
+        def _read(_h):
+            reads["n"] += 1
+            return pt
+
+        got, stable = cq._await_stable_roster(
+            1, read=_read, sleep=lambda _s: None, now=_clock())
+
+        assert stable is True and got == pt
+        assert reads["n"] <= 4, (
+            f"有內容卻等了 {reads['n']} 次 —— 每輪都會被拖長")

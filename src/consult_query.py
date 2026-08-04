@@ -1245,6 +1245,12 @@ _PATIENT_RADIO_CLASS = "TRadioButton"
 _ROSTER_SETTLE_READS = 3        # 連續幾次讀到一樣才算穩定
 _ROSTER_SETTLE_INTERVAL = 0.25  # 每次取樣間隔(秒)
 _ROSTER_SETTLE_TIMEOUT = 6.0    # 一直在變就放棄(秒);放棄=回報「判斷不了」
+# ★空清單要多觀察一段時間才能算數★(2026-08-04 外審第 3 輪 P1-01)
+#   「沒有變」不等於「載入完成」——【空】剛好也是還沒開始載入的樣子。連續三次
+#   讀到空只要 0.5 秒就達成,若 HIS 在 1.5 秒才開始填,那 0.5 秒的「穩定空清單」
+#   會被當成「今天真的沒有會診」→ 基準被剪成空 → 下一輪整份重寄。
+#   有內容的清單不需要這道關(資料都出現了,不可能是「還沒載入」)。
+_ROSTER_EMPTY_MIN_OBSERVE = 3.0
 
 
 def _read_roster_once(consult_hwnd: int) -> list:
@@ -1255,7 +1261,8 @@ def _read_roster_once(consult_hwnd: int) -> list:
     return [t for _h, t, _r in radios]
 
 
-def _await_stable_roster(consult_hwnd: int, *, read=None, sleep=None):
+def _await_stable_roster(consult_hwnd: int, *, read=None, sleep=None,
+                         now=None):
     """等清單不再變動 → (roster_texts, stable?)。
 
     連續 `_ROSTER_SETTLE_READS` 次讀到完全相同才算穩定。逾時仍在變 → 回
@@ -1265,11 +1272,13 @@ def _await_stable_roster(consult_hwnd: int, *, read=None, sleep=None):
     一模一樣,唯一分得出來的線索就是它穩不穩定。所以空清單一樣要連續讀到相同
     才算數 —— 這正是「載入中的空清單把基準剪成空」那條路的堵法。
 
-    `read`/`sleep` 只給測試注入。
+    `read`/`sleep`/`now` 只給測試注入。
     """
     read = read or _read_roster_once
     sleep = sleep or time.sleep
-    deadline = time.monotonic() + _ROSTER_SETTLE_TIMEOUT
+    now = now or time.monotonic
+    started = now()
+    deadline = started + _ROSTER_SETTLE_TIMEOUT
     last = None
     same = 0
     while True:
@@ -1277,11 +1286,17 @@ def _await_stable_roster(consult_hwnd: int, *, read=None, sleep=None):
         if last is not None and cur == last:
             same += 1
             if same >= _ROSTER_SETTLE_READS - 1:
-                return cur, True
+                # ★空清單要多觀察一段時間★（外審第 3 輪 P1-01）
+                #   連續三次讀到空只要 0.5 秒;若 HIS 1.5 秒才開始填,那 0.5 秒的
+                #   「穩定空清單」會被當成「今天真的沒有會診」→ 基準剪成空 →
+                #   下一輪整份重寄。有內容的清單不必等(資料都出現了)。
+                if cur or (now() - started
+                           >= _ROSTER_EMPTY_MIN_OBSERVE):
+                    return cur, True
         else:
             same = 0
         last = cur
-        if time.monotonic() >= deadline:
+        if now() >= deadline:
             logging.warning("[consult-extract] 病人清單在 %.0f 秒內一直在變動"
                             "(最後看到 %d 列) → 本輪不據此判斷有無新會診",
                             _ROSTER_SETTLE_TIMEOUT, len(cur))
@@ -2498,6 +2513,50 @@ def _verified_owned_pids(root_pid: int, candidates) -> set:
     return keep
 
 
+def _close_session_windows(sess, *, find=None, close=None,
+                           sleep=None) -> bool:
+    """對這個 session 的主畫面送關閉並【回讀確認】→ 有沒有真的關掉。
+
+    ★[2026-08-04 外審第 3 輪 P1-05]★ 行程層面已經關不掉了（見呼叫端說明），
+    所以改從視窗層面關：對確切的主畫面 hwnd 送 WM_CLOSE，再回讀確認它真的不見了。
+
+    ★送了不回讀就是開迴路★——這個檔案反覆踩過那個坑。關不掉就要【說出來】，
+    不可以讓上層以為已經收乾淨（那會變成「宣稱關掉了，其實還登入著」）。
+
+    `find`/`close`/`sleep` 只給測試注入。
+    """
+    find = find or (lambda: find_windows(MAIN_CLASS, pids=sess.our_pids))
+    close = close or (lambda h: win32gui.PostMessage(
+        h, win32con.WM_CLOSE, 0, 0))
+    sleep = sleep or time.sleep
+    try:
+        mains = list(find())
+    except Exception:
+        logging.warning("[session] 收尾時列舉主畫面失敗 → 無法確認是否已關閉",
+                        exc_info=True)
+        return False
+    if not mains:
+        return True                    # 本來就沒有主畫面 → 沒東西要關
+    for hwnd in mains:
+        try:
+            close(hwnd)
+        except Exception:
+            logging.debug("[session] 送 WM_CLOSE 失敗 hwnd=%s", hwnd,
+                          exc_info=True)
+    for _ in range(6):                 # 最多等 3 秒
+        sleep(0.5)
+        try:
+            if not list(find()):
+                logging.info("[session] 主畫面已關閉(%d 個)", len(mains))
+                return True
+        except Exception:
+            return False
+    logging.error("[session] ★主畫面關不掉★(%s) —— 這個 HIS session 仍然登入中,"
+                  "本程式已經放掉它的參照,請人工確認隱藏桌面上的住院系統",
+                  sorted(mains))
+    return False
+
+
 def _terminate_session_process(sess) -> None:
     """優雅關閉 → handle 強制結束 → 關 handle。
 
@@ -2513,6 +2572,14 @@ def _terminate_session_process(sess) -> None:
         close_pids(_verified_owned_pids(sess.pid, sess.our_pids))
     except Exception:
         logging.debug("[session] 優雅關閉失敗(續走 handle 強制結束)", exc_info=True)
+    # ★[2026-08-04 外審第 3 輪 P1-05] 行程層面關不掉,要從【視窗層面】關★
+    #   實機證實 systemftp 是啟動器型行程:我們 spawn 的 root 立刻結束,於是
+    #     * `_verified_owned_pids` 只剩一個【已死的】root → close_pids 關不到東西
+    #     * `WaitForSingleObject(hproc)` 早已 signaled → 下面的 TerminateProcess 不會執行
+    #   淨結果是 teardown 只清掉 Python 這邊的參照,真正的 HIS UI 還留在隱藏桌面 ——
+    #   「6 小時定期重啟」「休息時段收掉」「接管舊 worker」全都只是說說而已。
+    #   ★這是上一批(只終止自有行程)換來的代價,必須補回來★
+    _close_session_windows(sess)
     try:
         still = (win32event.WaitForSingleObject(sess.hproc, 0)
                  == win32event.WAIT_TIMEOUT)
