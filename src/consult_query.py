@@ -2616,18 +2616,115 @@ class _LASTINPUTINFO(ctypes.Structure):
     _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
 
 
-def _user_idle_seconds() -> float:
+def _user_idle_seconds_or_none():
     """使用者最後一次鍵盤/滑鼠輸入距今秒數(GetTickCount 回繞安全)。
-    查詢失敗回 0=當作剛有輸入 → 寧可不重開,絕不誤重開。"""
+
+    → float,或 None=【查不出來】。
+    ★查不出來不可以用 0.0 冒充「剛剛有輸入」★(2026-08-04 外審 P1-06):
+    倒數期間要據此寫 log,把「量到使用者回來了」和「根本量不到」講成同一件事
+    就是在說程式不知道的事(措辭鐵律)。兩者的【處置】相同(都取消重開),但
+    【說法】必須不同,否則事後看 log 無從分辨機器為什麼沒修好。
+    """
     try:
         lii = _LASTINPUTINFO()
         lii.cbSize = ctypes.sizeof(lii)
         if not _user32.GetLastInputInfo(ctypes.byref(lii)):
-            return 0.0
+            return None
         tick = ctypes.windll.kernel32.GetTickCount()
         return ((tick - lii.dwTime) & 0xFFFFFFFF) / 1000.0
     except Exception:
-        return 0.0
+        return None
+
+
+def _user_idle_seconds() -> float:
+    """同上,但查詢失敗回 0=當作剛有輸入 → 寧可不重開,絕不誤重開。"""
+    v = _user_idle_seconds_or_none()
+    return 0.0 if v is None else v
+
+
+# 閒置秒數的「倒退」容差。沒有新輸入時它是單調成長的(每過一秒就多一秒),所以
+# 只要比先前量到的峰值小,就是有人動了鍵盤或滑鼠 —— 不需要猜一個門檻值。
+# 容差只是為了吸收取樣抖動;真的有輸入時是從 1800+ 秒直接掉回 0,差距極大。
+_IDLE_REGRESSION_TOLERANCE_SEC = 2.0
+
+
+# 倒數結束的原因 → 取消重開的理由。★沒有列在這裡的原因就是「讓它重開」★
+_COUNTDOWN_ABORT_REASONS = {
+    "cancelled": "倒數期間 HIS 已恢復",
+    "user_back": "★倒數期間使用者回來操作★",
+    "idle_unknown": "倒數期間查不出使用者閒置時間(可能有人在)",
+}
+
+
+def _abort_reboot_if_needed(outcome: str, *, rollback,
+                            run=None) -> bool:
+    """依倒數結束的原因決定要不要 `shutdown /a`。→ 有沒有真的取消掉。
+
+    ★兩個方向都要守★
+      * 該取消卻沒取消 = 在有人正在用的時候把診間電腦重開(P1-06 的原始災情)。
+      * 不該取消卻取消 = 自動修復【永遠不會發生】,BDE 壞了就一直壞著 ——
+        把一個 fail-open 修成同樣有害的 fail-closed。
+    所以 `outcome == "elapsed"`(沒有人回來、HIS 也沒好)必須原封不動讓它重開。
+
+    `run` 只給測試注入(預設真的執行 shutdown /a)。
+    """
+    global _bde_shutdown_pending
+    reason = _COUNTDOWN_ABORT_REASONS.get(outcome)
+    if reason is None:
+        return False        # 倒數走完 → 機器要重開了,那正是我們要的修復動作
+    runner = run or (lambda cmd: subprocess.run(
+        cmd, capture_output=True, timeout=15,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))
+    logging.error("[BDE] %s → shutdown /a 取消重開機", reason)
+    try:
+        cpa = runner(["shutdown", "/a"])
+        if cpa.returncode != 0:
+            # ★critical:這是「該取消卻取消不掉」——機器【仍然會重開】,而且
+            #   可能是在有人正在用的時候。log 要留得下最強的痕跡。
+            logging.critical(
+                "[BDE] shutdown /a 失敗(rc=%s) → ★機器仍會重開★(%s)",
+                cpa.returncode, reason)
+            return False
+    except Exception:
+        logging.critical("[BDE] shutdown /a 例外 → ★機器仍會重開★(%s)",
+                         reason, exc_info=True)
+        return False
+    with _bde_watch_lock:
+        _bde_shutdown_pending = False
+    rollback(f"{reason},沒有真的重開")
+    return True
+
+
+def _await_reboot_countdown(total_sec: float) -> str:
+    """重開機倒數期間的等待。→ 為什麼結束:
+
+        "cancelled"     取消令被設起來(HIS 恢復/程式退出)
+        "user_back"     ★量到使用者回來操作★
+        "idle_unknown"  查不出閒置時間 → 保守當作可能有人在
+        "elapsed"       倒數走完,機器要重開了
+
+    ★[2026-08-04 外審 P1-06]★ 原本這裡只有 `_bde_reboot_cancel.wait(55)`,而那個
+    事件只由「HIS 恢復」或「程式退出」設置 —— 倒數期間完全不再看使用者。醫師在
+    這 60 秒內回座打字,機器照樣重開。這是看診時間的實體破壞,比查不到會診嚴重。
+    """
+    deadline = time.monotonic() + total_sec
+    peak = _user_idle_seconds_or_none()
+    if peak is None:
+        return "idle_unknown"
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "elapsed"
+        if _bde_reboot_cancel.wait(timeout=min(1.0, remaining)):
+            return "cancelled"
+        idle = _user_idle_seconds_or_none()
+        if idle is None:
+            return "idle_unknown"
+        if idle < peak - _IDLE_REGRESSION_TOLERANCE_SEC:
+            logging.error("[BDE] 倒數期間偵測到使用者輸入(閒置 %.0f 秒 → %.0f 秒)",
+                          peak, idle)
+            return "user_back"
+        peak = max(peak, idle)
 
 
 def _bde_reboot_state_path() -> str:
@@ -2776,23 +2873,13 @@ def _bde_reboot_watch_loop(my_gen: int) -> None:
             # [codex P1 R15] 60 秒倒數期間 HIS 若恢復(瞬時故障/有人手動修好),
             # 要 shutdown /a 取消重開——不然 log 說「看守解除」機器卻照樣重開。
             # 取消成功也要回滾時間戳(沒真的重開,別吃掉 24 小時防護)。
-            if _bde_reboot_cancel.wait(timeout=55.0):
-                logging.error("[BDE] 倒數期間 HIS 已恢復 → shutdown /a 取消重開機")
-                try:
-                    cpa = subprocess.run(
-                        ["shutdown", "/a"], capture_output=True, timeout=15,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                    if cpa.returncode != 0:
-                        logging.error("[BDE] shutdown /a 失敗(rc=%s) → 照常重開機",
-                                      cpa.returncode)
-                        return
-                except Exception:
-                    logging.error("[BDE] shutdown /a 例外 → 照常重開機",
-                                  exc_info=True)
-                    return
-                with _bde_watch_lock:
-                    _bde_shutdown_pending = False
-                _rollback_ts("倒數期間取消,沒有真的重開")
+            #
+            # ★[2026-08-04 外審 P1-06] 使用者回來也要取消★
+            #   原本只等取消令,倒數期間完全不再看使用者 —— 醫師回座打字,機器
+            #   照重開。整個自動重開機的前提就是「沒有人在用這台電腦」,那個前提
+            #   在這 60 秒內隨時可能不成立,所以要一直驗到最後一刻。
+            _abort_reboot_if_needed(_await_reboot_countdown(55.0),
+                                    rollback=_rollback_ts)
             return
     finally:
         # [codex P2 R4] 退場與排程必須原子:本看守決定退場(give_up/shutdown 被拒/

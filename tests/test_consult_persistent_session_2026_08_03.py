@@ -339,14 +339,33 @@ def test_rejected_shutdown_rolls_back_the_timestamp(tmp_path, monkeypatch):
 
 def test_recovery_during_countdown_aborts_the_shutdown():
     """[codex P1 R15] shutdown 下達後的 60 秒倒數期間 HIS 恢復 → shutdown /a
-    取消,並回滾時間戳;/a 失敗 → 照常重開(不得假裝取消了)。"""
-    import inspect
-    src = inspect.getsource(cq._bde_reboot_watch_loop)
-    i_ok = src.index("_bde_reboot_cancel.wait(timeout=55.0)")
-    seg = src[i_ok:]
-    assert '"shutdown", "/a"' in seg.replace("[", "").replace("]", ""),         "取消要用 shutdown /a"
-    assert "_rollback_ts(" in seg, "取消成功要回滾時間戳"
-    assert seg.index('"/a"') < seg.index("_rollback_ts("),         "先確認 /a 成功才可回滾(否則機器照樣重開,時間戳卻被清掉)"
+    取消,並回滾時間戳;/a 失敗 → 照常重開(不得假裝取消了)。
+
+    ★[2026-08-04] 改成用行為驗★ 原本是掃 `_bde_reboot_watch_loop` 的原始碼字串
+    (找 `_bde_reboot_cancel.wait(timeout=55.0)` 之後的文字)。外審 P1-06 的修正
+    把取消動作抽成 `_abort_reboot_if_needed()`,那個字串就不在那個函式裡了 ——
+    測試會 ValueError 而不是紅在「性質沒了」。★掃原始碼的守衛,程式碼一搬家就
+    失效★,所以改成直接驗這三個性質本身,搬到哪裡都測得到。
+    """
+    class _CP:
+        def __init__(self, rc):
+            self.returncode = rc
+
+    # 1) 取消要用 shutdown /a，2) 取消成功要回滾時間戳
+    calls, rolled = [], []
+    ok = cq._abort_reboot_if_needed(
+        "cancelled", rollback=rolled.append,
+        run=lambda cmd: calls.append(list(cmd)) or _CP(0))
+    assert ok is True
+    assert calls == [["shutdown", "/a"]], f"取消要用 shutdown /a：{calls}"
+    assert len(rolled) == 1, "取消成功要回滾時間戳"
+
+    # 3) /a 失敗 → 照常重開，不得假裝取消了（時間戳也不可以被清掉）
+    rolled2 = []
+    ok2 = cq._abort_reboot_if_needed(
+        "cancelled", rollback=rolled2.append, run=lambda _cmd: _CP(1))
+    assert ok2 is False, "/a 失敗卻回報取消成功"
+    assert rolled2 == [], "先確認 /a 成功才可回滾(否則機器照樣重開,時間戳卻被清掉)"
 
 
 def test_exit_aborts_a_pending_reboot(monkeypatch):
