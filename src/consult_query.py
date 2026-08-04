@@ -2763,17 +2763,16 @@ def _query_cycle(sess, cfg: dict, roster_label: str) -> tuple:
         raise RuntimeError("等不到會診單視窗")
     time.sleep(1.8)
     logging.info("會診單視窗已開啟，準備擷取")
-    SHOTS_DIR.mkdir(parents=True, exist_ok=True)
-    _prune_old_shots()
+    # ★[2026-08-04 外審 P1-08] 不在這裡落地★
+    #   這裡以前無條件 `img.save()`,而且發生在解析 roster【之前】——跟有沒有新
+    #   會診完全無關。常駐模式 3 分鐘一輪 = 每小時 20 張沒寄出去、也沒有臨床用途
+    #   的完整病人畫面躺在磁碟上。改成先留在記憶體,真的要寄信時才落地
+    #   (見 `_materialize_shot`)。
     img = capture_window_image(consult)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    shot_path = SHOTS_DIR / f"consult_{stamp}.png"
-    img.save(shot_path)
-    logging.info("已存檔截圖：%s", shot_path)
     extracted, extracted_html, roster_texts = _extract_consult_text(
         consult, cfg, roster_label)
     _return_to_main(sess, consult)
-    return shot_path, extracted, extracted_html, roster_texts
+    return img, extracted, extracted_html, roster_texts
 
 
 def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -> tuple:
@@ -3267,17 +3266,12 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
         logging.info("會診通知單視窗已開啟，準備擷取")
 
         # 截圖（PrintWindow，視窗在螢幕外也能擷取）
-        SHOTS_DIR.mkdir(parents=True, exist_ok=True)
-        _prune_old_shots()
+        # ★[2026-08-04 外審 P1-08] 不在這裡落地★ 見 `_materialize_shot`
         img = capture_window_image(consult)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        shot_path = SHOTS_DIR / f"consult_{stamp}.png"
-        img.save(shot_path)
-        logging.info("已存檔截圖：%s", shot_path)
-        # [新功能 2026-06-13] 截圖(原始畫面)存檔後才逐列點選擷取文字(fail-open)
+        # [新功能 2026-06-13] 先擷取原始畫面,再逐列點選擷取文字(fail-open)
         extracted, extracted_html, roster_texts = _extract_consult_text(
             consult, cfg, roster_label)
-        return shot_path, extracted, extracted_html, roster_texts
+        return img, extracted, extracted_html, roster_texts
 
     finally:
         # 收尾：停掉隱形執行緒、關閉我們這份 systemftp、把前景還給使用者。
@@ -3300,6 +3294,35 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
                 win32gui.SetForegroundWindow(fg_before)
         except Exception:
             pass
+
+
+def _materialize_shot(img):
+    """把記憶體裡的截圖落地成檔案 → 路徑。已經是路徑就原樣回傳（相容）。
+
+    ★[2026-08-04 外審 P1-08]★ 截圖以前是在 `_query_cycle` 裡【無條件】存檔，
+    而且發生在解析 roster 之前 —— 跟有沒有新會診毫無關係。常駐模式 3 分鐘一輪
+    ＝每小時 20 張「沒寄出去、也沒有臨床用途」的完整病人畫面躺在磁碟上。
+
+    改成只有真的要寄信時才呼叫本函式。沒有新會診的輪次在更上面就 return 了，
+    磁碟上不會多出任何東西。
+
+    ★與外審建議的差異（刻意）★
+    外審建議「寄完 finally 刪掉」。這裡改成落地到既有的 `consult_shots/` 並沿用
+    既有的 TTL 保留期：那張圖【本來就已經寄給臨床收件人】了，留在本機不會擴大
+    暴露面，而出事時「當時畫面長怎樣」是最有用的線索。真正該消滅的是「沒寄出去
+    卻留著」的那 20 張/小時，那個已經消滅了。保留期本來就有上限，不會無限累積。
+    """
+    # 本檔慣例：PIL 一律區域 import（模組層不相依）
+    from PIL import Image  # noqa: PLC0415
+    if not isinstance(img, Image.Image):
+        return img                     # 已經是路徑（或 None）→ 不動
+    SHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    _prune_old_shots()
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    shot_path = SHOTS_DIR / f"consult_{stamp}.png"
+    img.save(shot_path)
+    logging.info("已存檔截圖（本輪確定要寄信）：%s", shot_path)
+    return shot_path
 
 
 def _prune_old_shots() -> None:
@@ -3883,6 +3906,10 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     raise JobSuperseded(
                         "本輪會診查詢已執行超過逾時上限並被新的一輪接管，"
                         "手上這份清單已經過時 → 不寄、也不更新已通知基準")
+                # ★[2026-08-04 外審 P1-08] 到這裡才把截圖落地★
+                #   走到這一行代表「這一輪真的要寄信」。沒有新會診的輪次在上面
+                #   就 return 了,磁碟上不會多出任何病人畫面。
+                shot = _materialize_shot(shot)
                 if mail_method == "smtp":
                     send_via_smtp(shot, subject, final_body, recipients,
                                   html_body=final_html)
