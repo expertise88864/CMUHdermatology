@@ -37,10 +37,31 @@ def test_missing_or_corrupt_file_returns_none(tmp_path, monkeypatch):
     assert pidfile.read_raw_pid("neg") is None
 
 
+def _write_record(tmp_path, name, **over):
+    """寫一份【新格式】PID 檔（預設欄位都是合法的，用 over 改單一欄位）。
+
+    ★[2026-08-04 外審 P1-07] 這個 helper 是必要的★ 底下幾支原本寫的是舊格式
+    純數字檔。新版把舊格式一律擋掉（無從驗身分），於是那些測試會【因為錯的理由】
+    通過 —— 名義上測「行程已死」「不是 python」，實際上只測到「舊格式被擋」。
+    """
+    import json
+    rec = {
+        "schema": 1,
+        "app_id": name,
+        "pid": 4321,
+        "create_time": 1_780_000_000.5,
+        "executable": r"C:\python\pythonw.exe",
+    }
+    rec.update(over)
+    (tmp_path / f"{name}.pid").write_text(
+        json.dumps(rec), encoding="utf-8")
+    return rec
+
+
 def test_dead_pid_is_rejected(tmp_path, monkeypatch):
     """★PID 會被作業系統重用★ 不驗就可能誤殺別人的行程。"""
     monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
-    (tmp_path / "gone.pid").write_text("999999", encoding="utf-8")
+    _write_record(tmp_path, "gone", pid=999999)
     assert pidfile.read_verified_pid("gone") is None
 
 
@@ -48,8 +69,142 @@ def test_non_python_pid_is_rejected(tmp_path, monkeypatch):
     """PID 活著但不是 python 行程（PID 被重用）→ 不得採用。"""
     monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
     monkeypatch.setattr(pidfile, "pid_looks_like_python", lambda _pid: False)
-    (tmp_path / "reused.pid").write_text("4321", encoding="utf-8")
+    _write_record(tmp_path, "reused")
     assert pidfile.read_verified_pid("reused") is None
+
+
+class TestPidReuseByAnotherPythonProcess:
+    """★外審 P1-07 的核心★ 本機六支 CMUH 程式全是 pythonw.exe。
+
+    只比對 process name 的話，stale PID 檔的 PID 被【自家另一支程式】重用時
+    驗證照樣通過 —— 而 watchdog 拿到的 PID 會被送去 `taskkill /F /T`。
+    這不是「找不到而不動作」，是強殺無關的自家程式。
+    """
+
+    def _fake_psutil(self, monkeypatch, *, name="pythonw.exe",
+                     create_time=1_780_000_000.5,
+                     exe=r"C:\python\pythonw.exe"):
+        import types
+
+        class _Proc:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def name(self):
+                return name
+
+            def create_time(self):
+                return create_time
+
+            def exe(self):
+                return exe
+
+        mod = types.ModuleType("psutil")
+        mod.Process = _Proc
+        mod.NoSuchProcess = type("NoSuchProcess", (Exception,), {})
+        monkeypatch.setitem(sys.modules, "psutil", mod)
+
+    def test_a_reused_pid_is_refused_even_though_it_is_also_pythonw(
+            self, tmp_path, monkeypatch):
+        """名字一樣、建立時間不同 → 必須拒絕。"""
+        monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
+        _write_record(tmp_path, "autoclock", create_time=1_780_000_000.5)
+        # 實際跑在那個 PID 上的是【後來才建立】的另一支 pythonw
+        self._fake_psutil(monkeypatch, create_time=1_780_000_900.0)
+
+        assert pidfile.read_verified_pid("autoclock") is None, (
+            "★PID 被自家另一支 pythonw 重用卻通過驗證★ watchdog 會強殺它")
+
+    def test_the_real_process_is_still_accepted(self, tmp_path, monkeypatch):
+        """★反方向:不可以變成永遠找不到★ 建立時間相符就要採用。
+
+        否則等於把這個模組修回它本來要解決的問題（救援完全失效）。
+        """
+        monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
+        _write_record(tmp_path, "autoclock", create_time=1_780_000_000.5)
+        self._fake_psutil(monkeypatch, create_time=1_780_000_000.5)
+
+        assert pidfile.read_verified_pid("autoclock") == 4321
+
+    def test_a_tiny_float_difference_is_still_the_same_process(
+            self, tmp_path, monkeypatch):
+        """浮點表示的最後一位不該決定「要不要強殺一支程式」。"""
+        monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
+        _write_record(tmp_path, "autoclock", create_time=1_780_000_000.5)
+        self._fake_psutil(monkeypatch, create_time=1_780_000_000.51)
+
+        assert pidfile.read_verified_pid("autoclock") == 4321
+
+    def test_a_record_without_a_create_time_is_refused(self, tmp_path,
+                                                       monkeypatch):
+        """沒記建立時間 → 無從驗身分 → 不採用（不可以當成「驗過了」）。"""
+        monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
+        _write_record(tmp_path, "autoclock", create_time=None)
+        self._fake_psutil(monkeypatch)
+
+        assert pidfile.read_verified_pid("autoclock") is None
+
+    def test_a_mismatched_executable_is_refused(self, tmp_path, monkeypatch):
+        """執行檔路徑不符 → 縱深防禦攔下來。"""
+        monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
+        _write_record(tmp_path, "autoclock")
+        self._fake_psutil(monkeypatch, exe=r"D:\other\pythonw.exe")
+
+        assert pidfile.read_verified_pid("autoclock") is None
+
+    def test_an_unreadable_executable_does_not_veto(self, tmp_path,
+                                                    monkeypatch):
+        """★exe 讀不到不可以否決★（實測 397 個行程中失敗 1 次）
+
+        身分已由 pid + create_time 決定；把 exe 當成必要條件，會在讀不到的機器上
+        退回那條壞掉的 cmdline 路徑 —— 等於把這個功能修回它要解決的問題。
+        """
+        monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
+        _write_record(tmp_path, "autoclock")
+
+        import types
+
+        class _Proc:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def name(self):
+                return "pythonw.exe"
+
+            def create_time(self):
+                return 1_780_000_000.5
+
+            def exe(self):
+                raise OSError("AccessDenied")
+
+        mod = types.ModuleType("psutil")
+        mod.Process = _Proc
+        monkeypatch.setitem(sys.modules, "psutil", mod)
+
+        assert pidfile.read_verified_pid("autoclock") == 4321
+
+    def test_a_record_for_another_program_is_refused(self, tmp_path,
+                                                     monkeypatch):
+        """app_id 不符 → 不採用（檔名被搬動/複製過）。"""
+        monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
+        _write_record(tmp_path, "autoclock", app_id="consult_query")
+        self._fake_psutil(monkeypatch)
+
+        assert pidfile.read_verified_pid("autoclock") is None
+
+
+def test_a_legacy_plain_number_file_is_refused(tmp_path, monkeypatch):
+    """舊格式沒有建立時間 → 無從驗身分 → 退回 cmdline 路徑（不是採用）。
+
+    這是升級後到程式重啟前的短暫狀態；退回去的行為＝這個模組出現以前，
+    可能找不到，但不會殺錯。
+    """
+    monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
+    (tmp_path / "autoclock.pid").write_text("4321", encoding="utf-8")
+
+    assert pidfile.read_verified_pid("autoclock") is None
+    # 但 read_raw_pid 仍要讀得出來，否則 clear_pid_file 認不出自己的舊檔
+    assert pidfile.read_raw_pid("autoclock") == 4321
 
 
 def test_own_pid_is_not_returned(tmp_path, monkeypatch):
@@ -123,3 +278,56 @@ def test_both_programs_self_report_at_startup():
         full = os.path.join(os.path.dirname(__file__), "..", path)
         text = open(full, encoding="utf-8").read()
         assert f'write_pid_file("{name}")' in text, f"{path} 未自報 PID"
+
+
+def test_what_we_write_is_actually_verifiable(tmp_path, monkeypatch):
+    """★寫進去的東西要驗得過★（突變驗證抓到的缺口）
+
+    原本只斷言 `read_raw_pid` 讀得回 PID —— 那不涉及任何身分欄位，所以把
+    `write_pid_file` 改成不記 create_time，測試照樣全綠，而實機上 watchdog
+    會從此永遠採用不了 PID 檔（救援靜默失效，回到這個模組要解決的問題）。
+
+    這裡直接驗「寫出來的紀錄餵給驗證器會通過」——寫方與讀方必須對得上。
+    `read_verified_pid` 會排除「自己」，所以測的是它底下的身分比對。
+    """
+    import json
+    monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
+    assert pidfile.write_pid_file("autoclock") is True
+
+    rec = json.loads((tmp_path / "autoclock.pid").read_text(encoding="utf-8"))
+    assert isinstance(rec.get("create_time"), (int, float)), (
+        f"寫出來的紀錄沒有可用的建立時間：{rec}")
+    assert rec["pid"] == os.getpid()
+    assert rec["app_id"] == "autoclock"
+    assert pidfile._identity_matches(os.getpid(), rec) is True, (
+        "★自己寫的紀錄自己驗不過★ 寫方與讀方沒對上")
+
+
+def test_a_legacy_file_is_never_treated_as_verified(tmp_path, monkeypatch):
+    """舊格式即使 PID 活著、也是 pythonw，仍然不可以被採用。
+
+    ★判準必須是「有沒有驗過身分」，不是「找不找得到 PID」★
+    """
+    import types
+    monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
+    (tmp_path / "autoclock.pid").write_text("4321", encoding="utf-8")
+
+    class _Proc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def name(self):
+            return "pythonw.exe"
+
+        def create_time(self):
+            return 1_780_000_000.5
+
+        def exe(self):
+            return r"C:\python\pythonw.exe"
+
+    mod = types.ModuleType("psutil")
+    mod.Process = _Proc
+    monkeypatch.setitem(sys.modules, "psutil", mod)
+
+    assert pidfile.read_verified_pid("autoclock") is None, (
+        "★舊格式沒有建立時間，無從驗身分，不可採用★")
