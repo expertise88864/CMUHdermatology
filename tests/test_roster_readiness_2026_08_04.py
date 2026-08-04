@@ -206,3 +206,56 @@ class TestAnEmptyRosterNeedsALongerLook:
         assert stable is True and got == pt
         assert reads["n"] <= 4, (
             f"有內容卻等了 {reads['n']} 次 —— 每輪都會被拖長")
+
+
+class TestTheControlTreeIsReReadAfterSettling:
+    """★控制項樹要在清單穩定【之後】重取★（2026-08-04 自查 P1-A）
+
+    `children` 原本是進函式當下（T0）取的，而 `roster_texts` 來自
+    `_await_stable_roster`（T0→Tn）。清單在這段期間才長出來時：
+
+        roster_texts = Tn 的 4 位   → 信裡列 4 位、基準也存 4 筆
+        radios       = T0 的 1 位   → 逐病人內文只抓得到 1 位
+
+    信與內文對不起來。★這是我加穩定性判定時引進的不一致★——改之前兩者同源。
+    """
+
+    def _tree(self, n):
+        """造出 n 位病人的控制項樹（radio 文字要能被 _ROSTER_ROW_RE 認得）。"""
+        return [(1000 + i, cq._PATIENT_RADIO_CLASS,
+                 f"病人{i}C16({i}){1000000 + i}(沈)06/25", (0, i * 20, 200, i * 20 + 18))
+                for i in range(n)]
+
+    def test_radios_come_from_the_settled_tree(self, monkeypatch):
+        settled = ["病人0C16(0)1000000(沈)06/25",
+                   "病人1C16(1)1000001(沈)06/25",
+                   "病人2C16(2)1000002(沈)06/25",
+                   "病人3C16(3)1000003(沈)06/25"]
+        calls = {"n": 0}
+
+        def _enum(_h):
+            calls["n"] += 1
+            # 第一次（T0）只有 1 位；之後（穩定後重取）有 4 位
+            return self._tree(1 if calls["n"] == 1 else 4)
+
+        monkeypatch.setattr(cq, "enum_children", _enum)
+        monkeypatch.setattr(cq, "_await_stable_roster",
+                            lambda *a, **k: (settled, True))
+        monkeypatch.setattr(cq, "_is_visible_below", lambda *a: True)
+        monkeypatch.setattr(cq, "_find_text_panes", lambda _c: [])
+
+        seen = {}
+        real = cq._find_patient_radios
+
+        def _spy(children):
+            out = real(children)
+            seen["n"] = len(out)
+            return out
+        monkeypatch.setattr(cq, "_find_patient_radios", _spy)
+
+        cq._extract_consult_text(1, {})
+
+        assert seen.get("n") == 4, (
+            f"★radios 來自 T0 的舊樹（只有 {seen.get('n')} 位）★ "
+            "信裡會列 4 位、逐病人內文卻只有 1 位")
+        assert calls["n"] >= 2, "穩定之後沒有重取控制項樹"

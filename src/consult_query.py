@@ -1914,6 +1914,13 @@ def _extract_consult_text(consult_hwnd: int, cfg: dict,
         #   不穩定 → roster_texts 回 None,走既有的「判斷不了 → fail-open 照寄、
         #   但【不更新基準】」那條路(呼叫端已經有這個通道,不需要新增處理)。
         roster_texts, _roster_stable = _await_stable_roster(consult_hwnd)
+        # ★[2026-08-04 自查] 控制項樹要在清單穩定【之後】重取★
+        #   上面那份 `children` 是進函式當下(T0)的。清單在 T0→Tn 之間才長出來時：
+        #     roster_texts = Tn 的 4 位（信裡列 4 位、基準也存 4 筆）
+        #     radios/panes = T0 的 1 位（逐病人內文只抓得到 1 位）
+        #   信與內文對不起來;若 T0 連一顆 radio 都還沒有,更會掉進舊式格線點選的
+        #   後備路徑。★這是我加穩定性判定時引進的不一致★——改之前兩者同源。
+        children = enum_children(consult_hwnd)
         radios = _find_patient_radios(
             [c for c in children if _is_visible_below(c[0], consult_hwnd)])
         roster = _format_patient_roster(roster_texts, label=roster_label)
@@ -2417,11 +2424,19 @@ def _describe_windows_for_diag(our_pids: set, clicks: int, last_notice,
 class _PersistentSession:
     """一個活著的 systemftp(隱藏桌面)+ 已登入停在主畫面。"""
 
-    def __init__(self, hproc, hthread, pid, our_pids):
+    def __init__(self, hproc, hthread, pid, our_pids, main_hwnd=None):
         self.hproc = hproc            # CreateProcess 的行程 handle(殺人執照)
         self.hthread = hthread
         self.pid = pid
         self.our_pids = set(our_pids)
+        # ★我們【確切登入的那個】主畫面★(2026-08-04 外審後自查 P0)
+        #   `our_pids` 是全機 PID 差集,實機證實會混進外來的 systemftp
+        #   (log:「pid 10928 已非 systemftp」「收尾時排除 1 個不屬於本次啟動的」)。
+        #   拿它當「哪些視窗是我的」去送 WM_CLOSE,等於把批次 P 擋掉的傷害從
+        #   視窗那道門放回來 —— 醫師的住院系統會被關掉。
+        #   `_wait_main_window_after_login()` 本來就【回傳】這個 hwnd,只是以前
+        #   被丟掉。存下來,收尾就只關這一個。
+        self.main_hwnd = main_hwnd
         self.started_at = time.time() # 供 6 小時定期重啟判斷
         # [codex P1 R12] 租約:正在被某個 worker 使用中。run_consult_flow 的 240 秒
         # join 逾時會【棄置】worker(daemon 緒仍在跑),下一輪絕不可跟它共用同一個
@@ -2513,47 +2528,69 @@ def _verified_owned_pids(root_pid: int, candidates) -> set:
     return keep
 
 
-def _close_session_windows(sess, *, find=None, close=None,
-                           sleep=None) -> bool:
-    """對這個 session 的主畫面送關閉並【回讀確認】→ 有沒有真的關掉。
+def _window_is_gone(hwnd: int) -> bool:
+    """視窗還在不在（不存在、或已不可見都算不在了）。
+
+    ★不可以只看 IsWindow★（2026-07-27 診間事故的教訓）：Delphi 的表單關閉後常常
+    只是 Hide、handle 仍有效。這裡兩個都看：任何一個成立就代表這個視窗已經不是
+    「一個活著的、我們能用的主畫面」了。
+    """
+    try:
+        if not win32gui.IsWindow(hwnd):
+            return True
+        return not win32gui.IsWindowVisible(hwnd)
+    except Exception:
+        return True                    # 查不到 handle → 當作已經不在
+
+
+def _close_session_windows(sess, *, close=None, gone=None, sleep=None) -> bool:
+    """關掉【我們自己登入的那一個】主畫面並回讀確認 → 有沒有真的關掉。
 
     ★[2026-08-04 外審第 3 輪 P1-05]★ 行程層面已經關不掉了（見呼叫端說明），
-    所以改從視窗層面關：對確切的主畫面 hwnd 送 WM_CLOSE，再回讀確認它真的不見了。
+    所以改從視窗層面關。
 
-    ★送了不回讀就是開迴路★——這個檔案反覆踩過那個坑。關不掉就要【說出來】，
-    不可以讓上層以為已經收乾淨（那會變成「宣稱關掉了，其實還登入著」）。
+    ★[同日自查 P0] 但不可以用 `our_pids` 去找「哪些視窗是我的」★
+    第一版寫成 `find_windows(MAIN_CLASS, pids=sess.our_pids)`。`our_pids` 是全機
+    PID 差集，實機已證實會混進外來的 systemftp（log：「pid 10928 已非 systemftp」、
+    「收尾時排除 1 個不屬於本次啟動的」）。拿它當授權去送 WM_CLOSE，等於把批次 P
+    擋掉的傷害從【視窗】這道門放回來 —— ★醫師的住院系統會被關掉★。
 
-    `find`/`close`/`sleep` 只給測試注入。
+    改成只關 `sess.main_hwnd`：那是 `_wait_main_window_after_login()` 回傳的、
+    我們【確切登入進去】的那一個視窗，身分由「我們自己登入它」這件事保證。
+
+    ★`main_hwnd is None` 的意思是「這個 session 從未登入成功」★，不是「不知道」：
+    `_wait_main_window_after_login()` 只有 `return mains[0]` 一條成功出口，失敗一律
+    拋例外。所以成功建立的 session 必然帶著 hwnd；只有冷啟動失敗那條路徑上、為了
+    收掉行程而臨時建的 session 才是 None —— 那時本來就沒有我們的主畫面可關。
+    （這個不變式由 `test_the_session_records_the_window_it_logged_into` 守著。）
+
+    `close`/`gone`/`sleep` 只給測試注入。
     """
-    find = find or (lambda: find_windows(MAIN_CLASS, pids=sess.our_pids))
     close = close or (lambda h: win32gui.PostMessage(
         h, win32con.WM_CLOSE, 0, 0))
+    gone = gone or _window_is_gone
     sleep = sleep or time.sleep
+
+    hwnd = getattr(sess, "main_hwnd", None)
+    if not hwnd:
+        # 登入沒成功 → 沒有屬於我們的主畫面。★也不會退回用 PID 差集去找★
+        # （那個集合含醫師的行程，見上面）。
+        logging.debug("[session] 這個 session 沒有主畫面可關(從未登入成功)")
+        return True
+    if gone(hwnd):
+        return True                    # 本來就不在了 → 沒東西要關
     try:
-        mains = list(find())
+        close(hwnd)
     except Exception:
-        logging.warning("[session] 收尾時列舉主畫面失敗 → 無法確認是否已關閉",
-                        exc_info=True)
+        logging.warning("[session] 送 WM_CLOSE 失敗 hwnd=%s", hwnd, exc_info=True)
         return False
-    if not mains:
-        return True                    # 本來就沒有主畫面 → 沒東西要關
-    for hwnd in mains:
-        try:
-            close(hwnd)
-        except Exception:
-            logging.debug("[session] 送 WM_CLOSE 失敗 hwnd=%s", hwnd,
-                          exc_info=True)
     for _ in range(6):                 # 最多等 3 秒
         sleep(0.5)
-        try:
-            if not list(find()):
-                logging.info("[session] 主畫面已關閉(%d 個)", len(mains))
-                return True
-        except Exception:
-            return False
-    logging.error("[session] ★主畫面關不掉★(%s) —— 這個 HIS session 仍然登入中,"
-                  "本程式已經放掉它的參照,請人工確認隱藏桌面上的住院系統",
-                  sorted(mains))
+        if gone(hwnd):
+            logging.info("[session] 主畫面已關閉(hwnd=%s)", hwnd)
+            return True
+    logging.error("[session] ★主畫面關不掉★(hwnd=%s) —— 這個 HIS session 仍然登入中,"
+                  "本程式已經放掉它的參照,請人工確認隱藏桌面上的住院系統", hwnd)
     return False
 
 
@@ -2751,9 +2788,12 @@ def _cold_start_session_impl(cfg: dict, owner_token=None):
         creds_sent = True
         logging.info("已送出登入")
 
-        _wait_main_window_after_login(our_pids, visible_only=True)
+        # ★接住回傳的 hwnd★ 以前這行把它丟掉,於是收尾只能靠 PID 差集猜哪個視窗
+        #   是自己的 —— 那個集合會混進醫師的行程。見 `_PersistentSession.main_hwnd`。
+        _main_hwnd = _wait_main_window_after_login(our_pids, visible_only=True)
         logging.info("已進入主畫面")
-        sess = _PersistentSession(_hproc, _hthread, _spawned_pid, our_pids)
+        sess = _PersistentSession(_hproc, _hthread, _spawned_pid, our_pids,
+                                  main_hwnd=_main_hwnd)
         sess.in_use = True                       # 建立者即持有租約
         # [codex P1 R16] 發布前在鎖內驗「預約還是不是我的」——冷啟動拖過
         # _COLD_START_STALE_SECONDS 被搶走後,本 worker 若仍走到這裡,無條件發布
