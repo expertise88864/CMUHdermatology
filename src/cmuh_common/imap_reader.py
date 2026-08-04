@@ -23,6 +23,7 @@ Gmail，任何權限都能讀。
 """
 from __future__ import annotations
 
+import hashlib
 import imaplib
 import logging
 import socket
@@ -172,6 +173,26 @@ def _message_age_seconds(conn, uid) -> Optional[float]:
         return None
 
 
+def _subject_fingerprint(subject: str) -> str:
+    """未命中信件的主旨 → 可比對但不可還原的指紋。純函式。
+
+    ★[2026-08-04 外審 P2-05，實機證實] 不可以把主旨原文寫進 log★
+    這行 debug 在診間 log 裡一天出現 3850 次。那個信箱收到的【任何】信件主旨
+    都會被寫進 `consult_query.log` —— 而其他醫療或個人信件的主旨可能含病人姓名、
+    床號。log 檔沒有跟 Email 一樣的保存政策。
+
+    ★診斷價值幾乎沒有損失★：這行的用途是「確認我的觸發信有沒有進收件匣」。
+    真正回答那件事的是 `matched` 的數字；而使用者本來就打得開那個信箱，log 不
+    需要複製一份他自己讀得到的信件內容。保留長度與雜湊是為了跨輪比對——
+    「還是原來那幾封沒動」與「有新信進來了」看得出差別。
+    """
+    text = (subject or "").strip()
+    if not text:
+        return "len=0 sha=(空主旨)"
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:8]
+    return f"len={len(text)} sha={digest}"
+
+
 def check_trigger(keyword: str, mark_read: bool = True,
                    timeout: float = 30.0,
                    sample_count: int = 3,
@@ -184,7 +205,8 @@ def check_trigger(keyword: str, mark_read: bool = True,
       matched (int)：主旨含 keyword 的未讀數
       matched_senders (list[str])：比對到的信件 From 地址（去重小寫，可能空）。
                        呼叫端可用來判斷「誰觸發的」並把結果回寄給他。
-      samples (list[str])：若 matched=0，回 sample_count 個最近未讀主旨給 debug
+      samples (list[str])：若 matched=0，回 sample_count 個最近未讀信件的
+                       ★指紋★（長度＋雜湊，不是主旨原文）給 debug
       error (str|None)：例外訊息（連線/認證失敗等），有錯時其他欄位無意義
 
     side effect：matched > 0 時把那些信標為 Read（\\Seen flag），避免重複觸發。
@@ -306,7 +328,7 @@ def check_trigger(keyword: str, mark_read: bool = True,
                         senders_seen.add(addr)
                         result["matched_senders"].append(addr)
                 elif len(result["samples"]) < sample_count:
-                    result["samples"].append(subj_str or "(空主旨)")
+                    result["samples"].append(_subject_fingerprint(subj_str))
             except Exception:
                 logging.debug("IMAP fetch 單筆失敗（忽略）", exc_info=True)
                 continue

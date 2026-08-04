@@ -4924,9 +4924,16 @@ def scheduler_loop() -> None:
                             cfg.get("sender_account", "?"),
                             r["scanned"], kw, r["matched"])
                         if r["matched"] == 0 and r["samples"]:
+                            # ★[2026-08-04 外審 P2-05] 只記指紋,不記主旨原文★
+                            #   這行一天出現 3850 次(實機 log 量到)。那個信箱收到
+                            #   的【任何】信件主旨都會進 consult_query.log，而其他
+                            #   醫療/個人信件的主旨可能含病人姓名、床號。
+                            #   要看主旨請直接開那個信箱 —— 使用者本來就讀得到,
+                            #   log 不需要複製一份。
                             logging.info(
-                                "（最近未讀主旨樣本，用來確認你的觸發信是否真的進收件匣）：%s",
-                                " | ".join(repr(s) for s in r["samples"]))
+                                "（最近未讀信件指紋，用來確認收件匣有沒有在變動；"
+                                "要看主旨請直接開該信箱）：%s",
+                                " | ".join(r["samples"]))
                     # 任何一筆 log 都重置 heartbeat（避免重複記）
                     last_heartbeat = time.time()
                     if r.get("triggered"):
