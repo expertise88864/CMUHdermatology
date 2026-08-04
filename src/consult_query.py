@@ -2307,15 +2307,35 @@ def _session_pids() -> set:
         return set(_psession.our_pids) if _psession else set()
 
 
+def _session_death_reason(sess) -> str:
+    """session 為什麼不能用了 → "" 表示還活著,否則是【單一】原因。
+
+    ★[2026-08-04 實機] 原本兩個條件共用一句話★
+    舊訊息是「session 已死(行程結束或主畫面不見了)」—— 兩個成因完全不同、修法也
+    完全不同,卻分不出是哪一個。診間 log 顯示【每一輪】都走這條路(13:44→14:29 共
+    15 輪無一例外):每 3 分鐘判死、冷啟動、★重新送一次帳密★,而
+    `_cold_start_session_impl` 的 docstring 明文寫著「絕不可把同一組帳密每 3 分鐘
+    送一次」。要修它就得先知道是哪個條件在觸發。
+
+    目前的推測(★尚未證實,所以本次只加診斷、不改判定★):同一份 log 裡我們每輪
+    spawn 的 pid 都不同,而真正持有視窗的是 10928 —— 我們從未啟動過它。若
+    systemftp 是啟動器型行程(起來、把工作交給既有實例、自己結束),`sess.hproc`
+    就會立刻 signaled,於是永遠判「行程結束」。下一輪的 log 會直接說出答案。
+    """
+    try:
+        if win32event.WaitForSingleObject(sess.hproc, 0) != win32event.WAIT_TIMEOUT:
+            return "我們啟動的 systemftp 行程已結束"
+    except Exception:
+        return "無法查詢 systemftp 行程狀態"
+    if not find_windows(MAIN_CLASS, pids=sess.our_pids):
+        return "行程還在,但找不到主畫面視窗"
+    return ""
+
+
 def _session_is_alive(sess) -> bool:
     """行程還活著 + 主畫面視窗還在。★呼叫緒須在隱藏桌面上★(find_windows 只列舉
     本緒桌面)。主畫面在但被 modal 擋住的情況這裡不驗——查詢會失敗,由恢復機制處理。"""
-    try:
-        if win32event.WaitForSingleObject(sess.hproc, 0) != win32event.WAIT_TIMEOUT:
-            return False              # 行程已結束
-    except Exception:
-        return False
-    return bool(find_windows(MAIN_CLASS, pids=sess.our_pids))
+    return not _session_death_reason(sess)
 
 
 def _verified_owned_pids(root_pid: int, candidates) -> set:
@@ -2614,8 +2634,11 @@ def _acquire_session(cfg: dict):
                         "終結後冷啟動,絕不共用", stale.pid)
         _terminate_session_process(stale)
     if sess is not None:
-        if not _session_is_alive(sess):
-            _session_close_if_current(sess, "session 已死(行程結束或主畫面不見了)")
+        death = _session_death_reason(sess)
+        if death:
+            # ★說出【哪一個】原因★(2026-08-04 實機):兩個成因的修法完全不同，
+            #   而舊訊息把它們寫成同一句，於是 45 分鐘的 log 也判斷不出來。
+            _session_close_if_current(sess, f"session 已死：{death}")
             sess = None
         elif _keepalive.session_needs_restart(sess.started_at, time.time()):
             _session_close_if_current(

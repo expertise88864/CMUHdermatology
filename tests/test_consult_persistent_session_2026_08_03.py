@@ -558,7 +558,14 @@ def test_in_use_session_is_never_shared(monkeypatch):
 
 
 def test_idle_session_reuse_takes_the_lease(monkeypatch):
-    """正常重用:取用即持有租約(in_use=True);成功一輪後歸還。"""
+    """正常重用:取用即持有租約(in_use=True);成功一輪後歸還。
+
+    ★[2026-08-04] 注入點跟著接縫走★ `_acquire_session` 改成問
+    `_session_death_reason()`（要說出【哪一個】成因，見該函式）。只 patch
+    `_session_is_alive` 的話注入不到，會掉進真實路徑去冷啟動 —— 測試會紅在
+    `KeyError: 'username'`，而不是紅在「租約沒拿到」。
+    """
+    monkeypatch.setattr(cq, "_session_death_reason", lambda s: "")
     monkeypatch.setattr(cq, "_session_is_alive", lambda s: True)
     monkeypatch.setattr(cq._keepalive, "session_needs_restart",
                         lambda a, b: False)
