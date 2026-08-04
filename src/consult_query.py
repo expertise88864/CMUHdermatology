@@ -1881,16 +1881,27 @@ def close_pids(pids: set, grace: float = 2.5) -> None:
 
 
 def _cleanup_pids_excluding_borrowed(our_pids: set, before: set,
-                                     borrowed: bool) -> set:
+                                     borrowed: bool, root_pid=None) -> set:
     """[review C2 fix 2026-06-12] SW_HIDE 後備模式收尾要關哪些 pid。
 
     borrowed=True(本次沒有出現新登入視窗、借用了「啟動前就存在」的實例 ——
     那可能是使用者自己開著的住院系統)時，排除 before 內的 pid：流程可以借
     它完成截圖，但收尾絕不可替使用者關掉他的程式。一般情況(borrowed=False)
-    維持原行為，關掉本次開啟的全部實例。"""
+    維持原行為，關掉本次開啟的全部實例。
+
+    ★[2026-08-04 外審 P1-01] `borrowed` 這個開關不足以封閉所有權★
+    它只擋掉「啟動前就存在」的行程。可是冷啟動要等最多 120 秒 —— 醫師在這
+    段期間【新開】的住院系統不在 `before` 裡，於是 borrowed=False，那個行程
+    照樣會被關掉。`before` 快照只認得「更早以前」，認不得「剛剛才開」。
+
+    有 `root_pid`（本次真正 spawn 出來的行程）時改用它做所有權驗證；
+    沒有的話維持舊行為（呼叫端還沒留住 handle 時的過渡）。
+    """
     pids = set(our_pids)
     if borrowed:
-        return pids - set(before)
+        pids -= set(before)
+    if root_pid is not None:
+        pids = _verified_owned_pids(root_pid, pids)
     return pids
 
 
@@ -2222,13 +2233,58 @@ def _session_is_alive(sess) -> bool:
     return bool(find_windows(MAIN_CLASS, pids=sess.our_pids))
 
 
+def _verified_owned_pids(root_pid: int, candidates) -> set:
+    """從候選集裡只留下【確定是我們開的】：root 自己，或可驗證的後代。
+
+    ★[2026-08-04 外審 P1-01]★ `our_pids` 是用【全機 PID 差集】算出來的
+    （`_systemftp_pids() - before`）。冷啟動要等最多 120 秒，這段期間醫師若手動
+    打開住院系統，他那個行程就會落進差集裡 —— 之後 teardown 對整個集合送
+    `WM_CLOSE`，等於【替醫師關掉他自己開的 HIS】。
+
+    ★分清楚兩件事★
+      * 「找視窗的候選集」可以寬鬆（找錯只是找不到，不會造成傷害）
+      * 「可以終止的集合」必須封閉（弄錯就是關掉別人的程式）
+    這個函式只用在後者。
+
+    驗不出後代時只認 root —— root 是我們自己 `CreateProcess`/`Popen` 出來的，
+    身分由建立行為本身保證，不需要任何列舉。代價是它的後代可能變成孤兒；
+    但孤兒有既有的清理機制（`_kill_systemftp` 的 before 快照），而關掉醫師的
+    HIS 沒有任何補救。★寧可留孤兒，不可誤關★
+    """
+    owned = {root_pid}
+    try:
+        import psutil                                     # noqa: PLC0415
+        for child in psutil.Process(root_pid).children(recursive=True):
+            owned.add(child.pid)
+    except Exception:
+        # root 可能已經結束（後代驗不出來）→ 只認 root，保守但安全
+        logging.debug("[session] 列舉 systemftp 後代失敗 → 只終止 root",
+                      exc_info=True)
+    keep = {p for p in (candidates or ()) if p in owned}
+    keep.add(root_pid)
+    dropped = {p for p in (candidates or ()) if p not in owned}
+    if dropped:
+        # ★這行就是實機證據★ 差集裡有不屬於我們的 systemftp —— 很可能是醫師
+        #   自己開的。只記數量與 PID（PID 不是病人資料），不記視窗標題。
+        logging.warning("[session] 收尾時排除 %d 個不屬於本次啟動的 systemftp"
+                        "(pid=%s) —— 那可能是使用者自己開的，不動它",
+                        len(dropped), sorted(dropped))
+    return keep
+
+
 def _terminate_session_process(sess) -> None:
     """優雅關閉 → handle 強制結束 → 關 handle。
 
     沿用 2026-07-27 事故的教訓:handle 綁定的必然是我們自己開的那個行程,
-    不依賴名稱/視窗列舉,資源耗盡時照樣有效、不可能誤殺使用者的醫囑系統。"""
+    不依賴名稱/視窗列舉,資源耗盡時照樣有效、不可能誤殺使用者的醫囑系統。
+
+    ★[2026-08-04 外審 P1-01] 上面那句話原本只對後半段成立★
+    `TerminateProcess(sess.hproc)` 確實只會結束我們開的那一個；但它前面的
+    `close_pids(sess.our_pids)` 吃的是【全機 PID 差集】，裡面可能有醫師自己開的
+    住院系統。優雅關閉那一步改成只送給驗證過的自有行程。
+    """
     try:
-        close_pids(sess.our_pids)
+        close_pids(_verified_owned_pids(sess.pid, sess.our_pids))
     except Exception:
         logging.debug("[session] 優雅關閉失敗(續走 handle 強制結束)", exc_info=True)
     try:
@@ -2908,10 +2964,16 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
     startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startup.wShowWindow = 0  # SW_HIDE
     try:
-        subprocess.Popen([SYSTEMFTP_PATH], startupinfo=startup)
+        # ★留住 Popen★（2026-08-04 外審 P1-01）：原本啟動完就把物件丟掉，
+        #   於是這條路【沒有任何直接的所有權事實】，只能靠全機 PID 差集反推
+        #   —— 而差集會把醫師在這 120 秒內新開的住院系統算成自己的。
+        #   這與 2026-07-27 事故的教訓同一條：spawn 子行程要留 handle。
+        _spawned = subprocess.Popen([SYSTEMFTP_PATH], startupinfo=startup)
     except FileNotFoundError as e:
         raise RuntimeError(f"找不到住院醫囑系統程式：{SYSTEMFTP_PATH}") from e
-    logging.info("已啟動 systemftp.exe（SW_HIDE 後備模式）")
+    spawned_root_pid = _spawned.pid
+    logging.info("已啟動 systemftp.exe（SW_HIDE 後備模式，pid=%s）",
+                 spawned_root_pid)
 
     stealth_stop = threading.Event()
     stealth_skip: set = set()
@@ -3049,7 +3111,8 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
         # [review C2 fix] 借用使用者既有實例時，排除啟動前就存在的 pid 不關。
         stealth_stop.set()
         cleanup_pids = _cleanup_pids_excluding_borrowed(
-            our_pids or (_systemftp_pids() - before), before, borrowed)
+            our_pids or (_systemftp_pids() - before), before, borrowed,
+            root_pid=spawned_root_pid)
         try:
             close_pids(cleanup_pids)
             logging.info("已關閉本次開啟的 systemftp 實例")
