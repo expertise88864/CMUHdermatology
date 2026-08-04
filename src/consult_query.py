@@ -3685,26 +3685,31 @@ def _kill_systemftp(before_pids=None) -> None:
     殘留邊界:使用者若『恰好在本任務進行中』才手動開 systemftp,會被納入(窄窗,與既有
     finally 清理同語意)。before_pids=None 時保守不動作(fail-open,不誤殺)。
     失敗時靜默(可能已結束、沒 process 可殺)。"""
+    # ★[2026-08-04 外審第 3 輪 P1-06] 全機 PID 差集不可以當成 kill 授權★
+    #   這條路完全繞過這幾輪建立的 ownership 驗證:醫師若在本次任務【執行期間】
+    #   手動開住院系統,他的行程不在 before 快照裡 → 落進差集 → 被 `taskkill /F`。
+    #   而它會在任何可重試錯誤前執行,包括【寄信失敗】—— 也就是:
+    #       會診查完 → 醫師手動開 HIS → SMTP timeout → 醫師的 HIS 被強殺
+    #   函式自己的舊 docstring 也承認了這個窄窗。
+    #
+    #   ★改成:收掉【我們自己的 session】,差集只留作證據★
+    #   session 收法已經是「對確切主畫面送 WM_CLOSE 並回讀確認」(見
+    #   `_close_session_windows`),那才是有身分依據的清理。真的清不掉時寧可讓
+    #   下一次 attempt 撞上「最多兩個」而【明確失敗】,也不要無聲強殺別人的程式
+    #   —— 前者看得見、修得了;後者醫師只會看到自己的系統忽然消失。
+    _session_close("重試前重置(不再以全機 PID 差集強殺)")
     if before_pids is None:
-        logging.debug("[cleanup] 未提供 before 快照 → 略過清理(不做全機 taskkill)")
         return
     try:
-        orphans = sorted(_systemftp_pids() - set(before_pids))
+        appeared = sorted(_systemftp_pids() - set(before_pids))
     except Exception:
-        logging.debug("[cleanup] 計算孤兒 PID 失敗", exc_info=True)
+        logging.debug("[cleanup] 計算差集失敗", exc_info=True)
         return
-    if not orphans:
-        logging.debug("[cleanup] 本任務期間無新增 systemftp,無需清理")
-        return
-    args = ["taskkill", "/F"]
-    for p in orphans:
-        args += ["/PID", str(p)]
-    try:
-        subprocess.run(args, capture_output=True, timeout=10,
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        logging.info("[cleanup] 已清本任務期間新增的 systemftp PID: %s", orphans)
-    except Exception:
-        logging.debug("taskkill 本任務 PID 失敗（可能已結束）", exc_info=True)
+    if appeared:
+        # 只記錄、不動作。這行是判斷「孤兒會不會累積」的依據(PID 非病人資料)。
+        logging.info("[cleanup] 本任務期間新出現的 systemftp:%s"
+                     "(不強殺 —— 已改由收掉自身 session 處理)", appeared)
+    return
 
 
 def _hidden_desktop_pids() -> set:

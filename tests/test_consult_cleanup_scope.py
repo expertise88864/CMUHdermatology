@@ -10,19 +10,40 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import consult_query as cq  # noqa: E402
 
 
-def test_kill_systemftp_only_new_orphans(monkeypatch):
-    """目前 {100,200,300},任務前 {100} → 只殺任務期間新增的 {200,300}(不碰 100)。"""
+def test_kill_systemftp_no_longer_kills_anything(monkeypatch):
+    """★[2026-08-04 外審第 3 輪 P1-06] 這支原本斷言「只殺新孤兒」★
+
+    它守的性質是「絕不碰任務前就存在的實例」。現在守得更強：**什麼都不殺**。
+
+    原因是「任務期間新出現」並不等於「是我們的」—— 醫師在本次任務執行中手動開的
+    住院系統也不在 before 快照裡，於是會落進差集被 `taskkill /F`。而這條路會在任何
+    可重試錯誤前執行，包括寄信失敗：
+
+        會診查完 → 醫師手動開 HIS → SMTP timeout → 醫師的 HIS 被強殺
+
+    改成收掉【我們自己的 session】（對確切主畫面送 WM_CLOSE 並回讀確認），
+    差集只留作證據。
+    """
     calls = []
     monkeypatch.setattr(cq, "_systemftp_pids", lambda: {100, 200, 300})
+    monkeypatch.setattr(cq, "_session_close", lambda _w: None)
     monkeypatch.setattr(cq.subprocess, "run",
                         lambda args, **k: calls.append(args))
+
     cq._kill_systemftp(before_pids={100})
-    assert len(calls) == 1
-    args = calls[0]
-    assert "/IM" not in args and "systemftp.exe" not in args   # 不全機掃殺
-    assert "/PID" in args
-    assert "200" in args and "300" in args
-    assert "100" not in args                                    # 使用者既有實例不動
+
+    assert calls == [], f"★仍然會強殺行程★：{calls}"
+
+
+def test_cleanup_closes_our_own_session(monkeypatch):
+    """不殺行程，但要收掉自己的 session —— 否則重試會撞上自己上一輪的 wedged 實例。"""
+    closed = []
+    monkeypatch.setattr(cq, "_systemftp_pids", lambda: {100, 200})
+    monkeypatch.setattr(cq, "_session_close", lambda why: closed.append(why))
+
+    cq._kill_systemftp(before_pids={100})
+
+    assert closed, "沒有收掉自己的 session"
 
 
 def test_kill_systemftp_noop_when_no_new(monkeypatch):
