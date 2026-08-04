@@ -1235,6 +1235,60 @@ _PATIENT_LABEL_RE = re.compile(r"\(\d+\)|\d{4,}")
 _PATIENT_RADIO_CLASS = "TRadioButton"
 
 
+# roster 穩定性判定的參數。★[2026-08-04 外審 P1-03]★
+#   `_query_cycle` 只 `time.sleep(1.8)` 就當清單載入完了。Delphi 視窗是先建立、
+#   資料再逐步填進去的,所以那一秒八【不保證】看到的是最終狀態:
+#     * 還沒載入 → 空清單被當成「成功且真的沒有病人」→ 基準被剪成空
+#                  → 下一輪所有既有會診都變「新」→ 對團隊重寄整份清單
+#     * 載入到一半 → partial roster 被存成基準 → 還沒出現的病人此後不算新 → 漏寄
+#   固定睡多久都治不了(慢的機器仍會失手),要看的是【內容有沒有還在變】。
+_ROSTER_SETTLE_READS = 3        # 連續幾次讀到一樣才算穩定
+_ROSTER_SETTLE_INTERVAL = 0.25  # 每次取樣間隔(秒)
+_ROSTER_SETTLE_TIMEOUT = 6.0    # 一直在變就放棄(秒);放棄=回報「判斷不了」
+
+
+def _read_roster_once(consult_hwnd: int) -> list:
+    """讀一次目前的病人清單列 → [文字, ...]。純 IO,不做判定。"""
+    children = enum_children(consult_hwnd)
+    radios = _find_patient_radios(
+        [c for c in children if _is_visible_below(c[0], consult_hwnd)])
+    return [t for _h, t, _r in radios]
+
+
+def _await_stable_roster(consult_hwnd: int, *, read=None, sleep=None):
+    """等清單不再變動 → (roster_texts, stable?)。
+
+    連續 `_ROSTER_SETTLE_READS` 次讀到完全相同才算穩定。逾時仍在變 → 回
+    `stable=False`,呼叫端據此回報「判斷不了」(而不是把當下這份半成品當真)。
+
+    ★空清單也要通過同一道關★:「找不到 radio」與「真的沒有病人」在畫面上長得
+    一模一樣,唯一分得出來的線索就是它穩不穩定。所以空清單一樣要連續讀到相同
+    才算數 —— 這正是「載入中的空清單把基準剪成空」那條路的堵法。
+
+    `read`/`sleep` 只給測試注入。
+    """
+    read = read or _read_roster_once
+    sleep = sleep or time.sleep
+    deadline = time.monotonic() + _ROSTER_SETTLE_TIMEOUT
+    last = None
+    same = 0
+    while True:
+        cur = read(consult_hwnd)
+        if last is not None and cur == last:
+            same += 1
+            if same >= _ROSTER_SETTLE_READS - 1:
+                return cur, True
+        else:
+            same = 0
+        last = cur
+        if time.monotonic() >= deadline:
+            logging.warning("[consult-extract] 病人清單在 %.0f 秒內一直在變動"
+                            "(最後看到 %d 列) → 本輪不據此判斷有無新會診",
+                            _ROSTER_SETTLE_TIMEOUT, len(cur))
+            return cur, False
+        sleep(_ROSTER_SETTLE_INTERVAL)
+
+
 def _find_patient_radios(children: list) -> list:
     """從控制項樹挑出病人列 → [(hwnd, text, rect)]。純函式以便測試。
 
@@ -1839,11 +1893,21 @@ def _extract_consult_text(consult_hwnd: int, cfg: dict,
         # 以「在會診視窗子樹中可見」過濾,排除非作用分頁的殘留 radio。此判定不看
         # 會診視窗本身是否被 SW_HIDE,故隱藏桌面/正常/後備三種模式皆正確 —— 作用
         # 分頁真的沒病人時清單即為空,不會誤把其他分頁的隱藏 radio 當成今日病人。
+        # ★[2026-08-04 外審 P1-03] 等清單不再變動,不要只睡固定秒數★
+        #   固定 sleep 治不了慢的機器:還沒載入的空清單會被當成「真的沒有病人」而把
+        #   基準剪成空(下一輪整份重寄),載到一半則會漏掉還沒出現的病人。
+        #   不穩定 → roster_texts 回 None,走既有的「判斷不了 → fail-open 照寄、
+        #   但【不更新基準】」那條路(呼叫端已經有這個通道,不需要新增處理)。
+        roster_texts, _roster_stable = _await_stable_roster(consult_hwnd)
         radios = _find_patient_radios(
             [c for c in children if _is_visible_below(c[0], consult_hwnd)])
-        roster_texts = [t for _h, t, _r in radios]
         roster = _format_patient_roster(roster_texts, label=roster_label)
         roster_html = _format_patient_roster_html(roster_texts, roster_label)
+        if not _roster_stable:
+            # ★顯示用與判斷用要分開★ 看到什麼照樣附在信裡(上面兩行已經用過了)，
+            #   但「有沒有新會診」這個判斷不能拿一份還在變的清單去做。
+            #   None = 既有的「判斷不了」通道 → fail-open 照寄、不更新基準。
+            roster_texts = None
 
         panes = _find_text_panes(children)
         if not panes:
