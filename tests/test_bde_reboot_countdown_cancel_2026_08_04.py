@@ -6,11 +6,21 @@
 事件只由「HIS 恢復」或「程式退出」設置 —— 倒數期間完全不再看使用者。醫師在這
 60 秒內回座打字，機器照樣重開。
 
-整個自動重開機的前提就是「沒有人在用這台電腦」。那個前提在倒數的 60 秒內隨時
-可能不成立，所以要一直驗到最後一刻，不是進入倒數前驗一次就算數。
+整個自動重開機的前提就是「沒有人在用這台電腦」。那個前提在倒數期間隨時可能不
+成立，所以要持續驗證，不是進入倒數前驗一次就算數。
 
-【判準】閒置秒數沒有新輸入時是【單調成長】的（每過一秒就多一秒），所以「比先前
-量到的峰值小」就是有人動了鍵盤或滑鼠 —— 不需要猜一個門檻值。
+【判準：絕對，不是相對】（2026-08-04 外審第 2 輪 P1-01 修正）
+第一版用「閒置秒數比執行中的峰值倒退超過容差」——那是【相對】判準，需要一個
+乾淨的 baseline，而 baseline 是進入倒數之後才取的第一個樣本。使用者若在「決定
+重開」與「第一個樣本」之間回來，baseline 本身就是低的，之後單調上升永遠看不到
+倒退 → ★初始取樣競態★。
+
+改用【絕對】判準：自動重開機的前提就是「已閒置滿 30 分鐘」，那個前提在倒數期間
+必須持續成立。任何一次量到閒置低於門檻就是有人動過 —— 不需要 baseline、不需要
+容差，也就沒有初始取樣競態。
+
+【已知且刻意的盲區】下的是 `/t 60` 但只監測 55 秒 —— 監測滿 60 秒就沒有時間執行
+`shutdown /a`。留餘裕是取捨，不是疏漏。
 """
 import os
 import sys
@@ -65,7 +75,7 @@ def test_user_moving_the_mouse_at_second_10_cancels_the_reboot(monkeypatch):
     閒置從 1800 一路長到 1845（沒人），第 46 次讀到 0.5（有人動了）。
     """
     clock = _Clock()
-    idle = [1800.0 + i for i in range(45)] + [0.5]
+    idle = [1800.0 + i for i in range(45)] + [0.5]   # 第 46 次:醫師回來了
     _install(monkeypatch, idle, clock)
     _no_cancel_event(monkeypatch, clock)
 
@@ -82,24 +92,37 @@ def test_nobody_comes_back_so_the_reboot_proceeds(monkeypatch):
     assert cq._await_reboot_countdown(55.0) == "elapsed"
 
 
-def test_a_tiny_jitter_does_not_look_like_a_user(monkeypatch):
-    """取樣抖動不可以被當成使用者回來（否則自動修復永遠不會發生）。
+def test_input_before_the_first_sample_is_still_caught(monkeypatch):
+    """★初始取樣競態★（2026-08-04 外審第 2 輪 P1-01 盲區 A）
 
-    真的有輸入時是從 1800+ 秒直接掉回 0，差距極大；容差只吸收小抖動。
+    使用者若在「決定重開」與「倒數的第一個取樣」之間回來，第一個樣本就已經是
+    0.5 秒。第一版用【相對】判準（比執行中的峰值倒退超過容差），此時 baseline
+    本身就是低的，之後閒置從 0.5 單調上升、永遠看不到倒退 —— 機器照樣重開。
 
-    ★倒退量要相對於【執行中的峰值】★（突變驗證抓到）：原本寫成每三次減 1.0，
-    但讀數本來就每次成長 1.0 —— 相對峰值的倒退其實是 0，於是把容差調成 0 也
-    不會觸發，這支測試根本沒碰到容差。改成明確做出「小於容差、但確實低於峰值」
-    的倒退。
+    改用【絕對】判準（閒置是否仍達 30 分鐘門檻）就沒有這個競態：第一個樣本
+    0.5 秒就已經低於門檻。
     """
     clock = _Clock()
-    # 峰值走到 1803，然後掉到 1801.5：倒退 1.5 秒 < 容差 2.0 → 不算使用者回來
-    idle = [1800.0, 1801.0, 1802.0, 1803.0, 1801.5] + [
-        1804.0 + i for i in range(200)]
+    idle = [0.5 + i for i in range(200)]      # 使用者已經回來了，之後才開始取樣
     _install(monkeypatch, idle, clock)
     _no_cancel_event(monkeypatch, clock)
 
-    assert cq._await_reboot_countdown(55.0) == "elapsed"
+    assert cq._await_reboot_countdown(55.0) == "user_back", (
+        "★初始取樣就是低值時偵測不到 → 機器在有人用的時候重開★")
+
+
+def test_a_user_who_returns_and_stops_touching_is_still_caught(monkeypatch):
+    """使用者回來點一下就不動了 —— 閒置從 0 重新單調上升。
+
+    相對判準在這種情況下同樣看不到倒退（審查點名的第三個情境）。
+    絕對判準只要閒置還沒重新累積到 30 分鐘，就一直算「有人在」。
+    """
+    clock = _Clock()
+    idle = [1800.0, 1801.0, 0.2] + [1.2 + i for i in range(200)]
+    _install(monkeypatch, idle, clock)
+    _no_cancel_event(monkeypatch, clock)
+
+    assert cq._await_reboot_countdown(55.0) == "user_back"
 
 
 def test_an_unreadable_idle_time_is_not_reported_as_a_user_return(monkeypatch):

@@ -2806,10 +2806,9 @@ def _user_idle_seconds() -> float:
     return 0.0 if v is None else v
 
 
-# 閒置秒數的「倒退」容差。沒有新輸入時它是單調成長的(每過一秒就多一秒),所以
-# 只要比先前量到的峰值小,就是有人動了鍵盤或滑鼠 —— 不需要猜一個門檻值。
-# 容差只是為了吸收取樣抖動;真的有輸入時是從 1800+ 秒直接掉回 0,差距極大。
-_IDLE_REGRESSION_TOLERANCE_SEC = 2.0
+# 倒數期間留給 `shutdown /a` 執行的餘裕。★不可以監測滿 60 秒★——那樣就來不及
+# 取消了。代價是最後這幾秒偵測不到使用者輸入,這是刻意的取捨,不是疏漏。
+_REBOOT_CANCEL_MARGIN_SEC = 5.0
 
 
 # 倒數結束的原因 → 取消重開的理由。★沒有列在這裡的原因就是「讓它重開」★
@@ -2870,25 +2869,32 @@ def _await_reboot_countdown(total_sec: float) -> str:
     ★[2026-08-04 外審 P1-06]★ 原本這裡只有 `_bde_reboot_cancel.wait(55)`,而那個
     事件只由「HIS 恢復」或「程式退出」設置 —— 倒數期間完全不再看使用者。醫師在
     這 60 秒內回座打字,機器照樣重開。這是看診時間的實體破壞,比查不到會診嚴重。
+
+    ★[2026-08-04 外審第 2 輪 P1-01] 判準從【相對】改成【絕對】★
+    第一版是「閒置秒數比執行中的峰值倒退超過容差就是有人回來」。那是相對判準,
+    需要一個乾淨的 baseline —— 而 baseline 是進入本函式【之後】才取的第一個樣本。
+    使用者若在「決定重開」與「第一個樣本」之間回來,第一個樣本就已經是 0～1 秒;
+    之後閒置從這個低點單調上升,永遠看不到「倒退」,機器照樣重開。★初始取樣競態★
+
+    改用絕對判準:整個自動重開機的前提就是「已經閒置滿 30 分鐘」,那個前提在倒數
+    期間必須【持續】成立。任何一次量到閒置低於門檻,就代表有人動過 —— 不需要
+    baseline、不需要容差,也就沒有初始取樣競態。
     """
+    threshold = float(_keepalive.BDE_REBOOT_MIN_IDLE_SECONDS)
     deadline = time.monotonic() + total_sec
-    peak = _user_idle_seconds_or_none()
-    if peak is None:
-        return "idle_unknown"
     while True:
+        idle = _user_idle_seconds_or_none()
+        if idle is None:
+            return "idle_unknown"
+        if idle < threshold:
+            logging.error("[BDE] 倒數期間使用者已回來操作(閒置僅 %.0f 秒,"
+                          "門檻 %.0f 秒)", idle, threshold)
+            return "user_back"
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return "elapsed"
         if _bde_reboot_cancel.wait(timeout=min(1.0, remaining)):
             return "cancelled"
-        idle = _user_idle_seconds_or_none()
-        if idle is None:
-            return "idle_unknown"
-        if idle < peak - _IDLE_REGRESSION_TOLERANCE_SEC:
-            logging.error("[BDE] 倒數期間偵測到使用者輸入(閒置 %.0f 秒 → %.0f 秒)",
-                          peak, idle)
-            return "user_back"
-        peak = max(peak, idle)
 
 
 def _bde_reboot_state_path() -> str:
@@ -3041,8 +3047,14 @@ def _bde_reboot_watch_loop(my_gen: int) -> None:
             # ★[2026-08-04 外審 P1-06] 使用者回來也要取消★
             #   原本只等取消令,倒數期間完全不再看使用者 —— 醫師回座打字,機器
             #   照重開。整個自動重開機的前提就是「沒有人在用這台電腦」,那個前提
-            #   在這 60 秒內隨時可能不成立,所以要一直驗到最後一刻。
-            _abort_reboot_if_needed(_await_reboot_countdown(55.0),
+            #   在這 60 秒內隨時可能不成立,所以要持續驗證。
+            #
+            #   ★最後幾秒偵測不到,這是刻意的★(2026-08-04 外審第 2 輪 盲區 B)
+            #   下的是 `/t 60` 卻只監測 55 秒 —— 監測滿 60 秒就沒有時間執行
+            #   `shutdown /a` 了。留餘裕是取捨,不是疏漏。舊註解寫「一直驗到最後
+            #   一刻」是不實的宣稱(實作根本沒有那個性質),已改。
+            _abort_reboot_if_needed(
+                _await_reboot_countdown(60.0 - _REBOOT_CANCEL_MARGIN_SEC),
                                     rollback=_rollback_ts)
             return
     finally:

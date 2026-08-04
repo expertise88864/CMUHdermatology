@@ -331,3 +331,93 @@ def test_a_legacy_file_is_never_treated_as_verified(tmp_path, monkeypatch):
 
     assert pidfile.read_verified_pid("autoclock") is None, (
         "★舊格式沒有建立時間，無從驗身分，不可採用★")
+
+
+class TestNonFiniteNumbersCannotBypassTheCheck:
+    """★NaN 讓「不符就拒絕」的比較永遠不成立★（2026-08-04 外審第 2 輪 P1-04）
+
+    `json.loads` 預設接受非標準的 NaN / Infinity token，而
+
+        abs(got - nan) > tolerance   →   False
+
+    於是建立時間再怎麼不符都攔不下來 —— 整個防重用驗證被一個 token 繞過。
+    實測確認過，不是推理。
+    """
+
+    def _psutil(self, monkeypatch, create_time):
+        import types
+
+        class _Proc:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def name(self):
+                return "pythonw.exe"
+
+            def create_time(self):
+                return create_time
+
+            def exe(self):
+                return r"C:\python\pythonw.exe"
+
+        mod = types.ModuleType("psutil")
+        mod.Process = _Proc
+        monkeypatch.setitem(sys.modules, "psutil", mod)
+
+    def test_the_arithmetic_really_does_bypass(self):
+        """先證明這個繞過是真的（否則下面的斷言只是在測一個不存在的問題）。"""
+        import math
+        nan = float("nan")
+        assert (abs(1_780_000_000.5 - nan) > 0.05) is False
+        assert math.isfinite(nan) is False
+
+    def test_json_nan_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
+        (tmp_path / "autoclock.pid").write_text(
+            '{"schema": 1, "app_id": "autoclock", "pid": 4321,'
+            ' "create_time": NaN, "executable": ""}', encoding="utf-8")
+        self._psutil(monkeypatch, 1_780_000_900.0)      # 明顯不符的建立時間
+
+        assert pidfile.read_verified_pid("autoclock") is None, (
+            "★NaN 繞過了建立時間驗證 → watchdog 會強殺無關行程★")
+
+    def test_infinity_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
+        (tmp_path / "autoclock.pid").write_text(
+            '{"schema": 1, "app_id": "autoclock", "pid": 4321,'
+            ' "create_time": Infinity, "executable": ""}', encoding="utf-8")
+        self._psutil(monkeypatch, 1_780_000_900.0)
+        assert pidfile.read_verified_pid("autoclock") is None
+
+    def test_true_is_not_a_creation_time(self, tmp_path, monkeypatch):
+        """`True` 是 int 的子類 → `isinstance(v,(int,float))` 會放行。"""
+        monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
+        _write_record(tmp_path, "autoclock", create_time=True)
+        self._psutil(monkeypatch, 1.0)
+        assert pidfile.read_verified_pid("autoclock") is None
+
+    def test_a_normal_record_is_still_accepted(self, tmp_path, monkeypatch):
+        """★反方向:不可以連正常的也擋掉★"""
+        monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
+        _write_record(tmp_path, "autoclock", create_time=1_780_000_000.5)
+        self._psutil(monkeypatch, 1_780_000_000.5)
+        assert pidfile.read_verified_pid("autoclock") == 4321
+
+    def test_a_nan_in_any_other_field_also_refuses_the_record(
+            self, tmp_path, monkeypatch):
+        """★第二道防線要真的承重★（突變驗證抓到）
+
+        `_is_finite_number` 只看 create_time，所以把 `parse_constant` 拿掉時
+        行為不變、突變不轉紅 —— 那道防線等於沒被測到。它宣稱的性質是
+        「別的欄位也不可能夾帶非有限數」，所以要用【別的欄位】來驗：
+        create_time 完全正常，NaN 出現在其他地方，整份紀錄仍須被拒收。
+        """
+        monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
+        (tmp_path / "autoclock.pid").write_text(
+            '{"schema": 1, "app_id": "autoclock", "pid": 4321,'
+            ' "create_time": 1780000000.5, "executable": "", "extra": NaN}',
+            encoding="utf-8")
+        self._psutil(monkeypatch, 1_780_000_000.5)     # 建立時間完全相符
+
+        assert pidfile.read_verified_pid("autoclock") is None, (
+            "★含非標準 JSON token 的 PID 檔仍被採用★")

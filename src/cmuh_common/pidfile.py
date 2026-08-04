@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 
@@ -74,6 +75,32 @@ _SCHEMA = 1
 # 容差只是不想讓浮點表示的最後一位決定「要不要強殺一支程式」。
 # 真的被重用時，兩個行程的建立時間相差【好幾秒以上】（前者死了後者才生得出來）。
 _CREATE_TIME_TOLERANCE_SEC = 0.05
+
+
+def _finite_float(v):
+    """→ float，或 None（不是數字／是 bool／不是有限數）。
+
+    ★NaN 會讓「不符就拒絕」的比較永遠不成立★：`abs(x - nan) > tol` 是 False，
+    於是建立時間再怎麼不符都攔不下來 —— 整個防重用驗證被一個 token 繞過。
+    而 `json.loads` 預設【接受】非標準的 NaN / Infinity。`bool` 也擋掉：它是
+    `int` 的子類，`isinstance(True, (int, float))` 會放行。
+
+    回傳「值或 None」而不是 bool，是為了讓呼叫端拿到已經收窄型別的 float ——
+    回 bool 的話 pyright 無法透過函式呼叫收窄，`float(want)` 會多出型別債。
+    """
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    f = float(v)
+    return f if math.isfinite(f) else None
+
+
+def _reject_non_standard_json(token: str):
+    """`json.loads(parse_constant=...)`：直接拒收 NaN / Infinity / -Infinity。
+
+    上面的 `_finite_float` 已經擋得住 `create_time`，這裡是第二道 —— 讓那種內容連
+    「被解析成 dict」都不會發生，別的欄位也就不可能夾帶非有限數。
+    """
+    raise ValueError(f"PID 檔含非標準 JSON token：{token}")
 
 
 def pid_file_path(name: str) -> str:
@@ -141,7 +168,7 @@ def _load_record(name: str):
     except OSError:
         return None
     try:
-        data = json.loads(text)
+        data = json.loads(text, parse_constant=_reject_non_standard_json)
     except ValueError:
         return None            # 舊格式（純數字）或壞檔 → 這裡不認得
     return data if isinstance(data, dict) else None
@@ -190,16 +217,23 @@ def _identity_matches(pid: int, rec: dict) -> bool:
         proc = psutil.Process(pid)
     except Exception:
         return False
-    want = rec.get("create_time")
-    if not isinstance(want, (int, float)):
-        return False           # 沒記建立時間 → 無從驗身分 → 不採用
+    want = _finite_float(rec.get("create_time"))
+    if want is None:
+        # ★NaN 會讓比較【永遠成立】★（2026-08-04 外審第 2 輪 P1-04，實測）
+        #   `json.loads` 預設接受非標準的 NaN／Infinity token，而
+        #   `abs(got - nan) > tol` 是 False —— 建立時間不符完全攔不下來，
+        #   等於整個防重用驗證被一個字繞過。`True` 也是 int 的子類，一併擋掉。
+        return False           # 沒記建立時間/不是有限數 → 無從驗身分 → 不採用
     try:
-        got = float(proc.create_time())
+        got = _finite_float(proc.create_time())
     except Exception:
         # create_time 實測從不失敗；真的失敗就是驗不了 → 保守不採用
         logging.info("[pidfile] 讀不到 PID %s 的建立時間 → 不採用", pid)
         return False
-    if abs(got - float(want)) > _CREATE_TIME_TOLERANCE_SEC:
+    if got is None:
+        logging.info("[pidfile] PID %s 的建立時間不是有限數 → 不採用", pid)
+        return False
+    if abs(got - want) > _CREATE_TIME_TOLERANCE_SEC:
         logging.warning("[pidfile] PID %s 的建立時間不符（記錄 %.3f、實際 %.3f）"
                         "→ ★PID 已被重用★，不採用", pid, want, got)
         return False
