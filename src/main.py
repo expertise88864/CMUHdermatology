@@ -51,7 +51,7 @@ from cmuh_common.threshold_policy import (
     DEFAULT_THRESHOLDS,
     build_doctor_threshold_map,
     is_near_alert_threshold,
-    normalize_threshold_entry,
+    validate_threshold_entry,
 )
 from cmuh_common import his_contract as _HIS_CONTRACT
 from cmuh_common.alert_dedupe import AlertDeduper as _AlertDeduper
@@ -8618,7 +8618,7 @@ class AutomationApp:
         self.ui_font_scale_var = tk.DoubleVar(value=max(0.85, min(1.45, _ufs)))
         # [預設關閉] 多台電腦同時跑時，若有人達到止掛門檻會重複寄信 → 預設關。
         # 想開啟止掛提醒/寄信的電腦，到設定頁勾選對應醫師即可。
-        self.alert_shen_enabled = tk.BooleanVar(value=self.threshold_settings.get("alert_shen_enabled", True))
+        self.alert_shen_enabled = tk.BooleanVar(value=self.threshold_settings.get("alert_shen_enabled", False))
         self.alert_chen_enabled = tk.BooleanVar(value=self.threshold_settings.get("alert_chen_enabled", False))
         # 止掛達門檻時要寄信通知的收件人（可多人）
         self.alert_email_recipients = list(self.threshold_settings.get(
@@ -9700,18 +9700,39 @@ class AutomationApp:
                 "請重新啟動主程式;若重啟後仍然出現此訊息,請把 log 提供給開發者。",
                 parent=self.root)
             return
+        # ★[2026-08-05 外審第 5 輪 P2-09/P2-10] 門檻要在【寫任何檔案之前】驗完★
+        #   驗證若排在後面,前面的 r_doctor_settings.json 已經寫下去了 ——
+        #   「拒絕存檔」變成「存了一半」。
+        bad_thresholds = []
+        validated_thresholds = {}
+        for key, var in self.threshold_entries.items():
+            value, err = validate_threshold_entry(key, var.get())
+            if err:
+                bad_thresholds.append(
+                    f"  {self.threshold_labels.get(key, key)} {err}")
+            else:
+                validated_thresholds[key] = value
+        if bad_thresholds:
+            logging.warning("[設定] 拒絕存檔:門檻欄位不合法 %s", bad_thresholds)
+            messagebox.showwarning(
+                "設定未儲存",
+                "下列止掛門檻欄位不合法,這次【沒有存檔】"
+                "(原本的設定都還在):\n\n"
+                + "\n".join(bad_thresholds)
+                + "\n\n請更正後再按一次儲存。\n"
+                  "(留空 = 這個診次不設門檻、不提醒)",
+                parent=self.root)
+            return
         for r_key, entries in self.r_doctor_entries.items():
             self.r_doctor_map[r_key] = {"name": (entries["name_var"].get() or "").strip()}
         # 蓋上名單版號：之後這份存檔才會被尊重（見 app_settings 的說明）
         _atomic_write_json(get_conf_path('r_doctor_settings.json'),
                            _stamp_r_doctor_revision(self.r_doctor_map))
         
-        for key, var in self.threshold_entries.items():
-            # [2026-08-05] 留空 = 這個診次不設門檻、不提醒(沈冠宇一早/一午/三午的出廠狀態)。
-            # 語意與理由都在 normalize_threshold_entry(那裡有測試釘住「不可存成 0」)。
-            value = normalize_threshold_entry(key, var.get())
+        # 上面已經驗過(不合法就不會走到這裡);留空 = 這個診次不設門檻、不提醒。
+        for key, value in validated_thresholds.items():
             self.threshold_settings[key] = value
-            var.set(value)
+            self.threshold_entries[key].set(value)
         try:
             ufs = float(self.ui_font_scale_var.get())
         except (TypeError, ValueError):
@@ -13330,6 +13351,7 @@ class AutomationApp:
         threshold_main_frame = ttk.LabelFrame(left_column, text="個別醫師止掛人數提醒設定", padding=10)
         threshold_main_frame.pack(fill=tk.X, pady=(0, 15))
         self.threshold_entries = {}
+        self.threshold_labels = {}          # key → 「沈冠宇 三晚」之類的人話標籤
 
         def on_doctor_alert_change():
             # [修正] 當 UI 變更時，同步更新影子變數
@@ -13350,6 +13372,7 @@ class AutomationApp:
             var = tk.StringVar(value=self.threshold_settings.get(key, DEFAULT_THRESHOLDS.get(key, '')))
             ttk.Entry(shen_frame, textvariable=var, width=4).pack(side=tk.LEFT, padx=0)
             self.threshold_entries[key] = var
+            self.threshold_labels[key] = f"[沈冠宇] {label.rstrip(':')}"
         
         ttk.Separator(threshold_main_frame, orient='horizontal').pack(fill='x', pady=8)
 
@@ -13361,6 +13384,7 @@ class AutomationApp:
             var = tk.StringVar(value=self.threshold_settings.get(key, DEFAULT_THRESHOLDS.get(key, '')))
             ttk.Entry(chen_frame, textvariable=var, width=4).pack(side=tk.LEFT, padx=0)
             self.threshold_entries[key] = var
+            self.threshold_labels[key] = f"[陳駿升] {label.rstrip(':')}"
 
         # 止掛達門檻時 → 用 Outlook 寄信通知（可多位收件人，留空=不寄）
         ttk.Separator(threshold_main_frame, orient='horizontal').pack(fill='x', pady=8)
@@ -13605,7 +13629,7 @@ class AutomationApp:
         for key, var in getattr(self, 'threshold_entries', {}).items():
             var.set(self.threshold_settings.get(key, DEFAULT_THRESHOLDS.get(key, '')))
         for attr, key, fallback in (
-                ('alert_shen_enabled', 'alert_shen_enabled', True),
+                ('alert_shen_enabled', 'alert_shen_enabled', False),
                 ('alert_chen_enabled', 'alert_chen_enabled', False),
                 ('out_of_hospital_var', 'out_of_hospital_mode', False),
                 ('quick_text_f8_var', 'quick_text_f8', F8_QUICK_TEXT_DEFAULT),

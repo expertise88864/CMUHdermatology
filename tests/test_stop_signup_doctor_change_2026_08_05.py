@@ -28,7 +28,7 @@ from cmuh_common.threshold_policy import (  # noqa: E402
     DEFAULT_THRESHOLDS,
     build_doctor_threshold_map,
     is_near_alert_threshold,
-    normalize_threshold_entry,
+    validate_threshold_entry,
 )
 
 _MAIN_SRC = open(main.__file__, encoding="utf-8").read()
@@ -42,14 +42,16 @@ def test_empty_box_is_saved_as_no_threshold_not_zero():
     存成 0 的話:0 - margin(10) = -10,任何人數都 >= -10 → 每一診都提醒。
     """
     for key in ("shen_mon_morning", "shen_mon_afternoon", "shen_wed_afternoon"):
-        assert normalize_threshold_entry(key, "") == ""
-        assert normalize_threshold_entry(key, "   ") == ""
-        assert normalize_threshold_entry(key, None) == ""
+        for blank in ("", "   ", None):
+            assert validate_threshold_entry(key, blank) == ("", "")
         # 沒有預設的鍵,打錯字也不可生出數字
-        assert normalize_threshold_entry(key, "abc") == ""
+        # ★[2026-08-05 外審第 5 輪 P2-10]★ 而且不再靜默退成空字串 ——
+        #   靜默退空 = 靜默把這個診次的提醒關掉。現在是【拒絕存檔】。
+        value, err = validate_threshold_entry(key, "abc")
+        assert value is None and err
 
     # 存出來的東西真的不會產生門檻
-    saved = {k: normalize_threshold_entry(k, "") for k in
+    saved = {k: validate_threshold_entry(k, "")[0] for k in
              ("shen_mon_morning", "shen_mon_afternoon", "shen_wed_afternoon")}
     assert build_doctor_threshold_map("沈冠宇", saved) == {(2, "晚上"): 100}
 
@@ -63,23 +65,20 @@ def test_clearing_a_defaulted_box_disables_that_session():
     「我把它清掉了,它還是在提醒」而且看不出原因。
     """
     assert DEFAULT_THRESHOLDS["chen_tue_night"] == 59
-    assert normalize_threshold_entry("chen_tue_night", "") == "", \
+    assert validate_threshold_entry("chen_tue_night", "") == ("", ""), \
         "清空有預設值的格子也要真的清掉(否則那格永遠關不掉)"
     assert build_doctor_threshold_map("陳駿升", {"chen_tue_night": ""}) == {
         (0, "下午"): 69, (3, "上午"): 54, (3, "下午"): 69,
     }, "被清空的診次要從門檻表消失,其餘不受影響"
 
 
-def test_normal_input_and_typo_fallback_unchanged():
-    assert normalize_threshold_entry("chen_tue_night", "88") == 88
-    assert normalize_threshold_entry("chen_tue_night", " 88 ") == 88
-    # 有原廠預設的鍵打錯字 → 沿用預設(既有行為)
-    assert normalize_threshold_entry("chen_tue_night", "abc") == \
-        DEFAULT_THRESHOLDS["chen_tue_night"]
+def test_normal_input_is_accepted():
+    assert validate_threshold_entry("chen_tue_night", "88") == (88, "")
+    assert validate_threshold_entry("chen_tue_night", " 88 ") == (88, "")
 
 
-def test_save_site_uses_the_normalizer():
-    """★接線★ 存檔那一格必須走 normalize_threshold_entry。
+def test_save_site_uses_the_validator():
+    """★接線★ 存檔那一格必須走 validate_threshold_entry。
 
     直接呼叫上面那支函式的測試,在 `save_all_settings` 改回 `int(...)` 之後
     照樣全綠 —— 這一支才是會轉紅的那一支。
@@ -88,8 +87,8 @@ def test_save_site_uses_the_normalizer():
               if isinstance(n, ast.FunctionDef) and n.name == "save_all_settings")
     calls = [n for n in ast.walk(fn)
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-             and n.func.id == "normalize_threshold_entry"]
-    assert len(calls) == 1, "門檻存檔必須經過 normalize_threshold_entry"
+             and n.func.id == "validate_threshold_entry"]
+    assert len(calls) == 1, "門檻存檔必須經過 validate_threshold_entry"
     # 且不可再有「寫死 0 當後備」的舊寫法
     for n in ast.walk(fn):
         if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
@@ -190,9 +189,16 @@ def test_only_wed_night_alerts_out_of_the_box():
     assert not is_near_alert_threshold(["下午: 999人"], 2, tmap, margin=10)
 
 
-def test_shen_alert_is_on_by_default():
-    """使用者要的是「新增提醒」,不是「新增一個要自己去勾的選項」。"""
-    assert sd.default_threshold_settings()["alert_shen_enabled"] is True
+def test_shen_alert_default_is_off_with_inheritance():
+    """★[2026-08-05 外審第 5 輪 P2-11 推翻我當天的決定]★
+
+    我原本設成 True,理由是「使用者要的是新增提醒,不是新增一個要自己去勾的
+    選項」。那是錯的 —— main.py 同一段既有註解已經定案「多台電腦同時跑會重複
+    寄信 → 預設關」,而全院每一台診間機都會載到這個新鍵。
+    改成:原廠預設關,但舊設定檔裡【原本就在做止掛提醒】的那台會繼承成開
+    (見 test_threshold_settings_safety_2026_08_05.py)。
+    """
+    assert sd.default_threshold_settings()["alert_shen_enabled"] is False
 
 
 def test_chen_thresholds_untouched():

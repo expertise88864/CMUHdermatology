@@ -181,6 +181,21 @@ def load_threshold_settings(
     # 故:先拿【原始檔案內容】做推導,最後才用預設補齊缺的鍵。
     data, _st = load_json_dict_ex(_path(path, "threshold_settings.json"), None)
     _note_load_status("threshold_settings.json", _st)
+    # ★[2026-08-05 外審第 5 輪 P2-11] 新的止掛對象要繼承「這台是不是負責寄信的機器」★
+    #   2026-08-05 把止掛提醒對象從張廖年峰換成沈冠宇,於是所有舊機器的設定檔都
+    #   【沒有】alert_shen_enabled 這個鍵 → 一律走原廠預設。兩種預設都不對:
+    #     * 預設開 → 全院每一台診間機都寄一封(既有定案:多台同時跑會重複寄信)
+    #     * 預設關 → 原本負責寄信的那台也靜悄悄不寄了,使用者要求的功能等於沒上線
+    #   真正的資訊是「這台原本有沒有在做止掛提醒」——它就記在舊鍵裡。
+    #   ★只在【檔案裡沒有新鍵】時推導★(與下面幾條同樣的 `not in data` 語意):
+    #   使用者一旦自己勾過,檔案就有這個鍵,之後永遠以他的選擇為準。
+    if "alert_shen_enabled" not in data:
+        _was_alerting = bool(data.get("alert_chang_enabled")
+                             or data.get("alert_chen_enabled"))
+        if _was_alerting:
+            data["alert_shen_enabled"] = True
+            logging.info("[設定] 這台原本就在做止掛提醒 → 沈冠宇提醒一併啟用"
+                         "(可在設定頁關閉)")
     if "ui_font_scale" not in data:
         data["ui_font_scale"] = 1.0
     if "notify_dnd_start_hour" not in data:

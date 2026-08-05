@@ -36,8 +36,17 @@ _DOCTOR_THRESHOLD_KEYS = {
 _COUNT_DIGIT_RE = re.compile(r"(\d+)")
 
 
-def normalize_threshold_entry(cfg_key: str, raw: Any):
-    """設定頁一格門檻要存進 threshold_settings.json 的值。
+# ★門檻的合理範圍★(2026-08-05 外審第 5 輪 P2-09)
+#   下限不是 1 而是 20:`is_near_alert_threshold` 的判準是 `count >= 門檻 - margin`,
+#   margin 預設 10。門檻若 ≤ 10,第一位病人掛進來就「接近門檻」——「還沒真的滿」
+#   與「快滿了」再也分不開,提醒等於恆真。門檻 0/負數更是直接恆真。
+#   上限純粹是打字防呆(多按一個 0)。實際門檻歷來落在 54–129。
+MIN_THRESHOLD = 20
+MAX_THRESHOLD = 400
+
+
+def validate_threshold_entry(cfg_key: str, raw: Any) -> tuple:
+    """設定頁一格門檻 → (要存的值, 錯誤訊息)。錯誤訊息非空 = 呼叫端必須拒絕存檔。
 
     ★留空 = 這個診次【沒有門檻】,不是 0★
       門檻 0 會讓 `is_near_alert_threshold`(count >= 0 - margin)恆真 ——
@@ -45,16 +54,27 @@ def normalize_threshold_entry(cfg_key: str, raw: Any):
       `except: DEFAULT_THRESHOLDS.get(key, 0)`,對沈冠宇那三個【刻意沒有預設】
       的診次就會存下 0。故:空字串一律存 ""(build_doctor_threshold_map 會跳過)。
 
-    看不懂的輸入(打錯字)則沿用該鍵的原廠預設;沒有原廠預設的鍵同樣退成 ""。
+    ★[2026-08-05 外審第 5 輪 P2-09/P2-10] 不合法就報錯,不要替使用者猜★
+      上一版對打錯字的處置是「沿用原廠預設,沒有預設就退成空」——兩種都是
+      **靜默改掉使用者的設定**:
+        * 原本自訂 88、手滑打成 `8O` → 存檔後悄悄變回原廠的 59
+        * 原本自訂 100、打錯 → 悄悄變成「這個診次不提醒」
+      使用者以為自己改了一個數字,實際上關掉了一個提醒。錯誤要當場說出來、
+      保留原值,由使用者自己決定。
+      同理,`0` / `-1` 這種「轉得成 int 但語意上是恆真」的輸入也必須擋下 ——
+      只防空字串變成 0、卻放行直接輸入的 0,等於只堵了一半。
     """
     text = str(raw if raw is not None else "").strip()
     if not text:
-        return ""
+        return "", ""                      # 留空 = 刻意不設門檻
     try:
-        return int(text)
+        value = int(text)
     except (TypeError, ValueError):
-        fallback = DEFAULT_THRESHOLDS.get(cfg_key)
-        return "" if fallback is None else int(fallback)
+        return None, f"「{text}」不是數字"
+    if not MIN_THRESHOLD <= value <= MAX_THRESHOLD:
+        return None, (f"{value} 不在合理範圍（{MIN_THRESHOLD}–{MAX_THRESHOLD}）"
+                      f"；留空代表這個診次不提醒")
+    return value, ""
 
 
 def build_doctor_threshold_map(doctor_name: str, threshold_settings: dict | None) -> dict:

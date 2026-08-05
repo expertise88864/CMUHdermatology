@@ -75,9 +75,14 @@ def default_threshold_settings() -> dict:
     """
     out = dict(DEFAULT_THRESHOLDS)
     out.update({
-        # [2026-08-05] 新加的止掛對象預設【開】——不然使用者要求的提醒要再去勾一次才會動。
-        # 只有三晚(預設 100)有門檻,一早/一午/三午沒填數字前不會提醒。
-        "alert_shen_enabled": True,
+        # ★[2026-08-05 外審第 5 輪 P2-11] 原廠預設是【關】★
+        #   我當天先設成 True(理由:「使用者要的是新增提醒,不是新增一個要自己去勾
+        #   的選項」)。那是錯的 —— main.py 同一段既有註解已經定案:
+        #     「多台電腦同時跑時,若有人達到止掛門檻會重複寄信 → 預設關。」
+        #   全院多台診間機都會載到這個新鍵,預設開等於每一台都寄一封。
+        #   使用者那台不會因此漏掉提醒:見 app_settings 的舊鍵繼承
+        #   (原本開著張廖或陳駿升提醒的那台 = 負責寄信的那台 → 沈冠宇跟著開)。
+        "alert_shen_enabled": False,
         "alert_chen_enabled": False,
         "out_of_hospital_mode": False,
         "ui_font_scale": 1.0,
