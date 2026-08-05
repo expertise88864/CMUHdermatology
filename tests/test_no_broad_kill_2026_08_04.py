@@ -104,3 +104,80 @@ def test_the_retry_path_still_calls_cleanup():
     called = {n.func.id for n in ast.walk(tree)
               if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     assert "_kill_systemftp" in called, "重試前不再做任何清理"
+
+
+# ── [2026-08-05 外審第 5 輪 P1-08] SW_HIDE 後備不可以借用醫師的 HIS ──────────
+def test_the_sw_hide_fallback_never_borrows_an_existing_login():
+    """★這條路跑在【使用者自己的桌面】上★
+
+    舊寫法 `pick = fresh or cands` —— 找不到新的就撿一個既有的登入視窗。
+    那極可能就是醫師剛打開、正要自己登入的住院系統。接下來我們會：
+        把自動化帳密打進去 → 把他的視窗移到螢幕外 → 開會診單
+        → 擷取全院病人資料 → 最後試著還原
+    「收尾不關掉它」只把傷害縮小到「不關窗」，前面那一串照做不誤。
+
+    ★隱藏桌面那條路徑不同★：`find_windows` 只列舉呼叫緒所在桌面，而那條已經
+    SetThreadDesktop 到我們自己建的隱藏桌面 —— 撿到的必然是我們前幾輪留下的
+    孤兒，重用它反而是對的。所以這一支只釘後備模式。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    import consult_query as cq
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(cq._run_with_sw_hide)))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(getattr(t, "id", "") == "pick" for t in node.targets):
+            continue
+        # `pick = fresh or cands` 就是那個借用寫法
+        v = node.value
+        assert not (isinstance(v, ast.BoolOp) and isinstance(v.op, ast.Or)), (
+            "★後備模式又用 `fresh or cands` 借用既有登入視窗★ "
+            "會對醫師自己開的住院系統輸入帳密")
+
+
+def test_the_hidden_desktop_path_may_still_reuse_an_orphan():
+    """★反方向：隱藏桌面那條不可以一起改成 fail-closed★
+
+    那裡撿到的必然是我們自己前幾輪留下的孤兒（醫師的 HIS 在互動桌面，
+    不可能被列舉到）。改成放棄只會讓「有孤兒佔位時永遠查不到」。
+    """
+    import inspect
+
+    import consult_query as cq
+
+    src = inspect.getsource(cq._cold_start_session_impl)
+    assert "fresh or cands" in src, (
+        "隱藏桌面那條被一起改成 fail-closed → 有孤兒佔位時會永遠查不到")
+
+
+def test_a_borrowed_pid_is_refused_not_just_logged():
+    """★第二道門也要 fail-closed★
+
+    `fresh` 的定義已經排除了「啟動前就存在的 pid」，但 pid 可能在等待期間被
+    回收（我們選中的視窗，其 pid 剛好等於某個 before 裡的死 pid）。那時身分
+    無法確定，一樣不可以拿它輸入帳密 —— 不是印一行 warning 就繼續。
+
+    突變驗證抓到的洞：把那個 raise 換成 `logging.warning(...)`，上面那支
+    「不可以用 fresh or cands」照樣全綠。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    import consult_query as cq
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(cq._run_with_sw_hide)))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        names = {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
+        if "borrowed" not in names:
+            continue
+        assert any(isinstance(n, ast.Raise) for n in ast.walk(node)), (
+            "★偵測到借用卻只寫 log 就繼續★ 會對醫師的住院系統輸入帳密")
+        return
+    raise AssertionError("找不到 borrowed 的判斷")

@@ -1456,18 +1456,27 @@ def _find_patient_radios(children: list) -> list:
 
     病人 = class 精確為 TRadioButton(排除篩選選項 —— 那些是 TRadioGroup 內的
     TGroupButton,class 不同)且文字帶病人標記結構(床號/房號/病歷號)。以結構
-    而非「含中文」判定,外籍病人(無中文姓名)也不會被漏掉。依文字去重(同列只
-    留一筆),再依畫面位置(上→下、左→右)排序 = 清單實際顯示順序。呼叫端會先以
-    「在會診視窗子樹中可見」過濾,排除非作用分頁的殘留 radio。"""
+    而非「含中文」判定,外籍病人(無中文姓名)也不會被漏掉。依畫面位置(上→下、
+    左→右)排序 = 清單實際顯示順序。呼叫端會先以「在會診視窗子樹中可見」過濾,
+    排除非作用分頁的殘留 radio。
+
+    ★[2026-08-05 外審第 5 輪 P1-09] 去重的依據是【控制項】,不是【文字】★
+    舊寫法是 `if t in seen: continue` —— 兩個【不同的 radio】只要顯示文字完全
+    相同,第二個就會在任何識別邏輯看到它之前被丟掉。而顯示文字相同不代表是同
+    一張會診單:同一位病人、同一分鐘由不同科別開的兩張會診,清單上就是兩列
+    一模一樣的字。丟掉第二列 = ★漏寄★,而且丟在最上游,下游怎麼修都救不回來。
+
+    去重原本要擋的是「同一個控制項被列舉到兩次」——那用 hwnd 判斷才對,
+    而且更精準。"""
     out = []
     seen = set()
     for hwnd, cls, txt, rect in children:
         if cls != _PATIENT_RADIO_CLASS:
             continue
         t = (txt or "").strip()
-        if not t or not _PATIENT_LABEL_RE.search(t) or t in seen:
+        if not t or not _PATIENT_LABEL_RE.search(t) or hwnd in seen:
             continue
-        seen.add(t)
+        seen.add(hwnd)
         out.append((hwnd, t, rect))
     out.sort(key=lambda it: (it[2][1], it[2][0]))
     return out
@@ -3146,7 +3155,16 @@ def _cold_start_session_impl(cfg: dict, owner_token=None):
                     logging.info("已關閉多開提示視窗")
                     time.sleep(0.6)
             cands = find_windows(LOGIN_CLASS, LOGIN_TITLE_PREFIX)
+            # ★[2026-08-05 外審第 5 輪 P1-08] 這裡的「借用」與後備模式不同★
+            #   `find_windows` 只列舉【呼叫緒所在桌面】的視窗,而這條路徑已經
+            #   SetThreadDesktop 到我們自己建立的隱藏桌面上。醫師的住院系統在
+            #   互動桌面,不可能出現在這裡 —— 撿到的必然是我們前幾輪留下的孤兒
+            #   (硬退/更新重啟遺留),重用它反而是對的。
+            #   後備模式(SW_HIDE)跑在使用者桌面上,那裡就【不可以】借用,見該處。
             fresh = [h for h in cands if _window_pid(h) not in before]
+            if cands and not fresh:
+                logging.info("隱藏桌面上只有前幾輪殘留的登入視窗 → 重用它"
+                             "(pid=%s)", sorted({_window_pid(h) for h in cands}))
             pick = fresh or cands
             if pick:
                 login = pick[0]
@@ -3842,25 +3860,43 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
                     time.sleep(0.6)
             cands = find_windows(LOGIN_CLASS, LOGIN_TITLE_PREFIX,
                                  visible_only=False)
+            # ★[2026-08-05 外審第 5 輪 P1-08] 這條路【不可以】借用既有實例★
+            #   舊寫法是 `pick = fresh or cands` —— 找不到新的就撿一個既有的。
+            #   而這條是 SW_HIDE 後備模式:它跑在【使用者自己的桌面】上,
+            #   `cands` 裡那個「既有的登入視窗」極可能就是醫師剛打開、正要自己
+            #   登入的住院系統。接下來我們會對它做的事是:
+            #       把自動化帳密打進去 → 把他的視窗移到螢幕外 → 開會診單
+            #       → 擷取全院病人資料 → 最後試著還原
+            #   「收尾不關掉它」只是把傷害縮小到「不關窗」,前面那一串照做不誤。
+            #   ★寧可本輪查不到,也不要動醫師的住院系統★
+            #   (隱藏桌面那條路徑不同:那裡 `find_windows` 只列舉我們自己的桌面,
+            #    撿到的必然是我們前一次留下的孤兒,不可能是醫師的 —— 見該處說明。)
             fresh = [h for h in cands if _window_pid(h) not in before]
-            pick = fresh or cands
-            if pick:
-                login = pick[0]
+            if fresh:
+                login = fresh[0]
                 break
+            if cands:
+                logging.warning(
+                    "[SW_HIDE 後備] 畫面上有登入視窗,但它在本次啟動【之前】就存在"
+                    "(pid=%s) —— 那可能是使用者自己開的住院系統,不碰它",
+                    sorted({_window_pid(h) for h in cands}))
             time.sleep(0.5)
         if not login:
-            raise RuntimeError("等不到登入視窗（多開提示可能未正確關閉，或網路過慢）")
+            raise RuntimeError(
+                "等不到【屬於本次啟動】的登入視窗(多開提示可能未正確關閉、網路過慢,"
+                "或 systemftp 已達『最多兩個』上限);本輪放棄 —— 不借用既有實例,"
+                "以免對使用者自己開的住院系統輸入帳密")
 
         our_pid = _window_pid(login)
-        # [review C2 fix] 借用偵測：登入視窗的 pid 在啟動前就存在 = 我們的新實例
-        # 沒有出現視窗(可能被多開限制擋下)、撿到的是「使用者自己開的」住院系統。
-        # 流程仍繼續(否則本次查詢直接失敗)，但收尾不可關掉使用者的實例。
+        # [review C2 fix → 2026-08-05 P1-08] 這裡已經不可能是借用的:上面只接受
+        # 「本次啟動之後才出現」的登入視窗。保留這個變數是因為收尾邏輯仍以它
+        # 決定要不要保留實例;現在它恆為 False,語意變成「我們永遠只關自己開的」。
         borrowed = our_pid in before
         if borrowed:
-            logging.warning(
-                "[SW_HIDE 後備] 未偵測到新登入視窗，借用既有 systemftp 實例"
-                "(pid=%s，可能是使用者開啟的住院系統)完成本次查詢；"
-                "收尾將保留該實例不關閉。", our_pid)
+            # 不該發生(fresh 的定義已排除)。真的發生代表 pid 在等待期間被回收 →
+            # 身分無法確定,一樣不碰。
+            raise RuntimeError(
+                f"登入視窗的 pid({our_pid})在本次啟動前就存在 → 身分無法確定,本輪放棄")
         our_pids = (_systemftp_pids() - before) | {our_pid}
         logging.info("登入視窗 hwnd=%s，本次實例 pid=%s", login, sorted(our_pids))
 

@@ -723,11 +723,32 @@ def test_find_patient_radios_picks_radiobuttons_only_and_sorts():
         (12, "TRadioButton", "", (9, 110, 661, 131)),             # 空 → 排除
         (13, "TRadioButton", "全部", (9, 90, 661, 111)),          # 無病人結構 → 排除
         (14, "TRadioButton", "王小明A3(101)001234", (9, 170, 661, 191)),
-        (15, "TRadioButton", "莊振銘B7(163)002958", (9, 130, 661, 151)),  # 同文字 → 去重
+        (10, "TRadioButton", "莊振銘B7(163)002958", (9, 130, 661, 151)),  # 同控制項 → 去重
     ]
     radios = cq._find_patient_radios(kids)
     assert [h for h, _t, _r in radios] == [10, 14]  # 去重後;130 在 170 之前
     assert radios[0][1] == "莊振銘B7(163)002958"
+
+
+def test_two_rows_with_identical_text_are_both_kept():
+    """★[2026-08-05 外審第 5 輪 P1-09]★ 去重的依據是【控制項】,不是【文字】。
+
+    ★這個檔案原本把缺陷釘成了通過條件★:舊 fixture 用兩個【不同 hwnd】、
+    相同文字的 radio,並斷言只留一個(註解還寫著「同文字 → 去重」)。
+
+    但顯示文字相同不代表是同一張會診單 —— 同一位病人、同一分鐘由不同科別開的
+    兩張會診,清單上就是兩列一模一樣的字。在任何識別邏輯看到它之前就丟掉第二列,
+    是★漏寄★,而且丟在最上游,下游怎麼修都救不回來。
+
+    去重原本要擋的是「同一個控制項被列舉到兩次」—— 那用 hwnd 判斷才對。
+    """
+    kids = [
+        (10, "TRadioButton", "莊振銘B7(163)002958", (9, 130, 661, 151)),
+        (11, "TRadioButton", "莊振銘B7(163)002958", (9, 152, 661, 173)),
+    ]
+    radios = cq._find_patient_radios(kids)
+    assert [h for h, _t, _r in radios] == [10, 11], (
+        "★兩列一模一樣的會診只留下一列★ 另一張從此不會被通知")
 
 
 def test_find_patient_radios_includes_foreign_names():
