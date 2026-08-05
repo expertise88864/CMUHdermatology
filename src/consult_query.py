@@ -2233,7 +2233,23 @@ def close_pids(pids: set, grace: float = 2.5) -> None:
     pids = _validated_systemftp_pids(pids)
     if not pids:
         return
-    for hwnd in find_windows(pids=pids, visible_only=False):
+    # ★[2026-08-05 外審第 5 輪 P2-06] 驗證與動手之間 PID 會被回收★
+    #   `_validated_systemftp_pids` 驗完之後,下面兩個動作(WM_CLOSE、terminate)
+    #   都是【之後】才發生的。中間該行程若結束、PID 被 Windows 發給另一支
+    #   systemftp(很可能就是醫師剛開的),我們就會關掉他的程式。
+    #   舊版只在 terminate 前補驗【名稱】—— 而回收給同一支程式時名稱一樣。
+    #   把「建立時間」一起記下來當指紋,動手前重驗一次。
+    fingerprints = {pid: _process_started_at(pid) for pid in pids}
+
+    def _still_the_same(pid) -> bool:
+        want = fingerprints.get(pid)
+        if want is None:
+            return True                    # 當初就讀不到 → 不採用這個訊號
+        now = _process_started_at(pid)
+        return now is not None and abs(now - want) <= 1.0
+
+    live = {pid for pid in pids if _still_the_same(pid)}
+    for hwnd in find_windows(pids=live, visible_only=False):
         try:
             win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
         except Exception:
@@ -2248,6 +2264,10 @@ def close_pids(pids: set, grace: float = 2.5) -> None:
             p = psutil.Process(pid)
             if (p.name() or "").lower() != SYSTEMFTP_EXE_NAME:
                 continue                   # grace 期間才被回收的極端情況,再擋一次
+            if not _still_the_same(pid):
+                logging.warning("[cleanup] pid %s 在等待期間已換成別的行程 → 不動它",
+                                pid)
+                continue                   # ★同名不代表同一個★
             p.terminate()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
@@ -2621,6 +2641,9 @@ class _PersistentSession:
         #   用之前先驗這三樣還是不是同一個。三者都對不代表宇宙唯一,但足以
         #   把「handle 被回收」這個實際會發生的情況擋掉。
         self.main_pid, self.main_class = _window_identity(main_hwnd)
+        # PID 會被回收 → 連行程的建立時間一起記(見 `_is_same_window`)。
+        # 讀不到就是 None,之後一律不採用這個訊號,不會因此判定「換人了」。
+        self.main_proc_started = _process_started_at(self.main_pid)
         self.started_at = time.time() # 供 6 小時定期重啟判斷
         # [codex P1 R12] 租約:正在被某個 worker 使用中。run_consult_flow 的 240 秒
         # join 逾時會【棄置】worker(daemon 緒仍在跑),下一輪絕不可跟它共用同一個
@@ -2730,6 +2753,25 @@ def _verified_owned_pids(root_pid: int, candidates) -> set:
     return keep
 
 
+def _process_started_at(pid):
+    """行程的建立時間 → float;查不到回 None。
+
+    ★[2026-08-05 外審第 5 輪 P1-05/P2-06] PID 會被回收★
+    Windows 會把結束行程的 PID 發給新的行程。只比對 PID(甚至「PID + 執行檔
+    名稱」)擋不住「同一支 systemftp 換了一個行程」—— 而那個新行程很可能是
+    醫師自己開的。建立時間是同一個 PID 底下唯一穩定的區分點。
+    """
+    if not pid:
+        return None
+    try:
+        import psutil  # noqa: PLC0415
+        return float(psutil.Process(int(pid)).create_time())
+    except Exception:
+        # ★查不到就是查不到,不編一個值出來★ 呼叫端一律當成「這個訊號不可用」,
+        #   而不是當成「不一樣」——後者會把讀不到權限變成每輪重登。
+        return None
+
+
 def _window_identity(hwnd) -> tuple:
     """(pid, class) —— 視窗的身分指紋。查不到回 (None, None)。"""
     if not hwnd:
@@ -2762,7 +2804,23 @@ def _is_same_window(sess) -> bool:
     want_cls = getattr(sess, "main_class", None)
     if want_pid is None or want_cls is None:
         return False
-    return _window_identity(hwnd) == (want_pid, want_cls)
+    if _window_identity(hwnd) != (want_pid, want_cls):
+        return False
+    # ★[2026-08-05 外審第 5 輪 P1-05] 連行程也可能是「同一個 PID、不同行程」★
+    #   Windows 會回收 PID。hwnd + pid + class 全對得上,底下的行程仍可能已經
+    #   換人(而且很可能就是醫師自己開的同一支程式)。建立時間是唯一穩定的區分點。
+    #
+    #   ★這個訊號是【選用】的★:登入當下若讀不到建立時間(權限/psutil 不可用),
+    #   或現在讀不到,一律【不採用這個訊號】,不是判定「不一樣」——
+    #   把「讀不到」當成「不是同一個」會讓每一輪都重登,那正是 2026-08-04
+    #   才修掉的實機故障的形狀。只有【當初記到了、現在也讀得到、而且不同】
+    #   才算換了行程。
+    want_started = getattr(sess, "main_proc_started", None)
+    if want_started is not None:
+        now_started = _process_started_at(want_pid)
+        if now_started is not None and abs(now_started - want_started) > 1.0:
+            return False
+    return True
 
 
 def _window_alive(hwnd: int) -> bool:
@@ -5654,12 +5712,36 @@ def _save_job_fail_state() -> None:
         logging.debug("[health] 告警節流狀態寫不下去(略過)", exc_info=True)
 
 
+_BASELINE_ALERT_COOLDOWN_SEC = 6 * 3600
+_baseline_alert_at = 0.0
+_baseline_alert_lock = threading.Lock()
+
+
 def _alert_baseline_lost(reason: str, count: int) -> None:
     """基準遺失/損毀 → 寄一封系統告警給開發者。失敗只記 log。
 
     ★這封不是臨床通知★ 臨床端已經在同一輪收到「整份清單請人工核對」那封了；
     這封是要讓維護的人知道那台機器的 settings 出過事(防毒隔離、磁碟、誤刪)。
+
+    ★[2026-08-05 自查 P1-B] 要節流★ 這支函式被呼叫的位置在【重試迴圈裡面】:
+      * 同一輪:寄信失敗會重試 3 次 → 最多 3 封
+      * 跨輪:基準要等到「寄信成功」才會被重建,所以只要寄不出去,
+        每 3 分鐘的下一輪又會再發現一次「基準不見了」
+    一次磁碟事故可以變成整天每 3 分鐘一封。與 `_note_job_failure`、
+    掛帳告警一致,採 6 小時冷卻。
     """
+    global _baseline_alert_at
+    with _baseline_alert_lock:
+        now = time.time()
+        # 時鐘往前跳(NTP/使用者改時間)會讓上次時間落在未來 → 直接重置,
+        # 否則會被自己鎖死到那個未來時間為止(既有 _note_job_failure 的同款坑)。
+        if _baseline_alert_at > now:
+            _baseline_alert_at = 0.0
+        if now - _baseline_alert_at < _BASELINE_ALERT_COOLDOWN_SEC:
+            logging.info("[會診] 基準遺失告警在冷卻期內(%d 小時),本次不重複寄",
+                         _BASELINE_ALERT_COOLDOWN_SEC // 3600)
+            return
+        _baseline_alert_at = now
     human = {
         "missing_after_prior_run": "基準檔不見了(建立過但檔案已不存在)",
         "corrupt": "基準檔內容損壞(已備份壞檔)",
