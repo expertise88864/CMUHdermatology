@@ -392,6 +392,37 @@ class TestTheScreenshotMatchesTheList:
 
         assert snap.stable is True
 
+    def test_a_readback_failure_must_not_update_the_baseline(self):
+        """★[2026-08-05 外審第 5 輪 P1-06]★ 讀不到 ≠ 沒有變。
+
+        ★這一支補的是我上一批親手寫下的洞★：上一版回讀失敗時把 `after`
+        冒充成 `snap.texts`，於是這份【從未被確認過】的快照照樣去更新
+        「已通知」基準。期間真的多出一位病人的話，他會被記成「已經通知過」
+        而從此不再算新的 —— 漏寄，而且沒有任何跡象。
+
+        正確處置是分成兩件事：內容照寄（它本身是穩定的），但不更新基準。
+        """
+        def _boom(_h):
+            raise OSError("列舉失敗")
+
+        _img, snap = cq._capture_with_settled_roster(
+            1, capture=lambda _h: "IMG",
+            settle=lambda _h: cq._RosterSnapshot(["甲1111111"], True, [], []),
+            read=_boom)
+
+        assert cq._may_update_baseline(snap.texts) is False, (
+            "★沒被確認過的清單卻拿去更新基準★ 期間新增的病人會被當成已通知")
+        assert list(snap.texts) == ["甲1111111"], "內容本身不該被動到(照樣要寄)"
+
+    def test_a_verified_snapshot_may_update_the_baseline(self):
+        """★反方向:確認過的就要能更新★ 否則基準永遠不動、每輪重寄。"""
+        _img, snap = cq._capture_with_settled_roster(
+            1, capture=lambda _h: "IMG",
+            settle=lambda _h: cq._RosterSnapshot(["甲1111111"], True, [], []),
+            read=lambda _h: ([], [], ["甲1111111"]))
+
+        assert cq._may_update_baseline(snap.texts) is True
+
     def test_an_already_unstable_snapshot_is_left_alone(self):
         """本來就不穩定 → 不必也不該再回讀一次（省一次列舉）。"""
         read_calls = {"n": 0}
@@ -444,3 +475,132 @@ def test_both_capture_sites_settle_before_shooting():
                 raise AssertionError(
                     f"{fn.__name__} 還留著固定 1.8 秒的等待（舊順序的殘骸）")
     assert checked == 2, f"只檢查到 {checked} 條截圖路徑（應為 2 條）"
+
+
+class TestThreeStatesNotTwo:
+    """★[2026-08-05 外審第 5 輪 P1-06]★ 「可以寄」與「可以更新基準」要分開。
+
+    以前共用 `roster_texts is None` 一個通道，中間缺了一格：
+    **內容可信、可以寄，但我無法確認它仍代表當下狀態**。
+
+        狀態              可寄信   可更新基準
+        ─────────────────────────────────────
+        確認過沒變          是        是
+        確定變過了          是        否   （走既有 fail-open 註記）
+        ★無法確認★        是        否   （這一格以前被當成第一格）
+    """
+
+    def test_a_plain_list_still_updates_the_baseline(self):
+        """既有路徑完全不受影響（沒帶旗標的普通 list = 可以更新）。"""
+        assert cq._may_update_baseline(["甲1111111"]) is True
+
+    def test_none_still_blocks_the_baseline(self):
+        """既有語意:擷取失敗/不穩定 → 不更新基準。"""
+        assert cq._may_update_baseline(None) is False
+
+    def test_an_unverified_list_blocks_the_baseline(self):
+        rows = cq._RosterTexts(["甲1111111"], baseline_eligible=False)
+        assert cq._may_update_baseline(rows) is False
+
+    def test_an_unverified_list_still_behaves_like_a_list(self):
+        """★不可以因為換了型別而讓既有消費端壞掉★
+
+        寄信、格式化、簽章計算都是把它當一般 list 用的。
+        """
+        rows = cq._RosterTexts(["甲1111111", "乙2222222"],
+                               baseline_eligible=False)
+        assert len(rows) == 2 and rows[0] == "甲1111111"
+        assert list(rows) == ["甲1111111", "乙2222222"]
+        assert rows is not None                      # 不會走 fail-open 通道
+        assert cq._consult_signature_from_roster(rows)
+
+    def test_as_unverified_keeps_stable_true(self):
+        """★與 as_unstable 的差別★ unverified 仍然是穩定的(內容可信、照寄)。"""
+        snap = cq._RosterSnapshot(["甲"], True, [1], [2]).as_unverified()
+        assert snap.stable is True
+        assert cq._may_update_baseline(snap.texts) is False
+        assert snap.children == [1] and snap.radios == [2]
+
+    def test_as_unstable_is_the_other_state(self):
+        snap = cq._RosterSnapshot(["甲"], True, [], []).as_unstable()
+        assert snap.stable is False
+
+
+def test_the_baseline_write_site_uses_the_eligibility_check():
+    """★接線★ 存基準那一處必須問 `_may_update_baseline`。
+
+    上面那些測試直接呼叫函式；若 `_do_full_job` 還是寫
+    `roster_texts is not None`，它們照樣全綠，而未確認的快照仍會更新基準。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(cq._do_full_job)))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        calls = {n.func.id for n in ast.walk(node)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        if "_save_notified" not in calls:
+            continue
+        guard = {n.func.id for n in ast.walk(node.test)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        if "_may_update_baseline" in guard:
+            return
+    raise AssertionError(
+        "★更新基準的守衛還是舊的 `roster_texts is not None`★ "
+        "未確認的快照仍會被當成「已通知」")
+
+
+class TestTheObserveWindowStartsFromTheLastChange:
+    """★[2026-08-05 外審第 5 輪 P1-07]★ 觀察窗要從【最後一次變動】起算。
+
+    從「進函式」起算的話：清單在第 1.4 秒才長出最後一位時，第 1.5 秒就已經
+    滿足「總共觀察了 1.5 秒」—— 實際上只安靜了 0.1 秒。
+    「穩定」的意思是「有一段時間沒有再變」。
+    """
+
+    def test_the_window_is_measured_after_the_change_not_from_entry(self):
+        """★差別在【時機】，不在結果★
+
+        兩種算法最後都會回傳變動後的內容，所以不能用「拿到哪一份」來分辨。
+        真正的差別是：變動之後還觀察了多久。
+
+          從進函式起算 → 變動時早就滿 1.5 秒了 → 再讀 3 次相同就收工
+          從最後變動起算 → 變動之後還要再安靜滿 1.5 秒（≈6 次讀取）
+
+        ★這一支不能寫成「清單在 2.1 秒才長出來也要接住」★——那是**做不到**的：
+        任何以時間為判準的做法，對「觀察窗結束之後才繼續載入」都會失手
+        （見 `_await_stable_roster` 的說明）。測試不可以宣稱程式有它沒有的性質。
+        """
+        two = ["甲1111111", "乙2222222"]
+        four = two + ["丙3333333", "丁4444444"]
+        change_at = 4                       # 第 5 次讀取才變成 4 位
+        state = {"reads": 0}
+
+        def _read(_h):
+            i = state["reads"]
+            state["reads"] += 1
+            return _snap(two if i < change_at else four)
+
+        def _now():
+            # 一次讀取 = 一個取樣間隔（比「每次呼叫都前進」更貼近真實迴圈）
+            return state["reads"] * cq._ROSTER_SETTLE_INTERVAL
+
+        snap = cq._await_stable_roster(
+            1, read=_read, sleep=lambda _s: None, now=_now)
+
+        assert snap.texts == four
+        need = int(cq._ROSTER_MIN_OBSERVE / cq._ROSTER_SETTLE_INTERVAL)
+        after_change = state["reads"] - change_at
+        assert after_change >= need, (
+            f"★變動之後只再觀察了 {after_change} 次（需要 {need} 次）★ "
+            "觀察窗是從進函式起算的，不是從最後一次變動起算")
+
+    def test_it_still_settles_when_nothing_changes(self):
+        """★反方向:一直沒變就要收斂★ 不可以變成永遠等到逾時。"""
+        pt = ["甲1111111"]
+        snap = cq._await_stable_roster(
+            1, read=_scripted([pt]), sleep=lambda _s: None, now=_clock())
+        assert snap.stable is True and snap.texts == pt

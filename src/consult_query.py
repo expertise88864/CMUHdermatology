@@ -1283,6 +1283,39 @@ def _read_roster_once(consult_hwnd: int) -> list:
     return _read_roster_snapshot(consult_hwnd)[2]
 
 
+class _RosterTexts(list):
+    """病人清單列 + 「這份可不可以拿去更新已通知基準」。
+
+    ★[2026-08-05 外審第 5 輪 P1-06]★ 「這封信要不要寄」與「這份清單可不可以
+    更新基準」是**兩個不同的問題**,以前共用 `roster_texts is None` 一個通道:
+      * None → fail-open 照寄、不更新基準
+      * 非 None → 照寄、更新基準
+    中間缺了一格:「內容可信、可以寄,但我無法確認它仍代表當下狀態」。
+    截圖後回讀失敗就落在這一格 —— 上一版把它當成完全正常(基準照更新),
+    等於用一份沒有被確認的清單去宣稱「這些都通知過了」。
+
+    用 list 子類別是刻意的:所有既有消費端(迭代、len、`is None` 判斷)完全不受
+    影響,只有真正要決定「能不能更新基準」的那一處會去看這個旗標。
+    """
+
+    baseline_eligible = True
+
+    def __init__(self, rows=(), *, baseline_eligible: bool = True):
+        super().__init__(rows)
+        self.baseline_eligible = baseline_eligible
+
+
+def _may_update_baseline(roster_texts) -> bool:
+    """這份清單可不可以拿去更新「已通知」基準。
+
+    None(擷取失敗/不穩定)→ 不行(既有語意)。
+    普通 list(沒有帶旗標)→ 可以(既有語意,不改變任何既有路徑)。
+    """
+    if roster_texts is None:
+        return False
+    return bool(getattr(roster_texts, "baseline_eligible", True))
+
+
 class _RosterSnapshot(tuple):
     """(texts, stable, children, radios) —— 同一次列舉的四個面向。
 
@@ -1304,6 +1337,19 @@ class _RosterSnapshot(tuple):
     def as_unstable(self):
         """同一份內容,但標記成「判斷不了」(走 fail-open 通道)。"""
         return _RosterSnapshot(self[0], False, self[2], self[3])
+
+    def as_unverified(self):
+        """內容可信、可以寄,但【無法確認】它仍代表截圖那一刻 → 不可更新基準。
+
+        與 `as_unstable` 的差別就是外審第 4 輪那張表的中間那一列:
+          穩定且已確認 → 可寄、可更新基準
+          確定變過了   → 可寄(走 fail-open 註記)、不可更新基準
+          ★無法確認★ → 可寄(內容本身是穩定的)、不可更新基準
+        把第三種當成第一種,等於用一份沒被確認的清單宣稱「這些都通知過了」。
+        """
+        return _RosterSnapshot(
+            _RosterTexts(self[0], baseline_eligible=False),
+            self[1], self[2], self[3])
 
 
 def _await_stable_roster(consult_hwnd: int, *, read=None, sleep=None,
@@ -1332,6 +1378,15 @@ def _await_stable_roster(consult_hwnd: int, *, read=None, sleep=None,
     deadline = started + _ROSTER_SETTLE_TIMEOUT
     last = None
     same = 0
+    # ★[2026-08-05 外審第 5 輪 P1-07] 觀察窗要從【最後一次變動】起算★
+    #   上一版是從「進函式」起算:清單在第 1.4 秒才長出最後一位時,第 1.5 秒就
+    #   已經滿足「總共觀察了 1.5 秒」——實際上只安靜了 0.1 秒。
+    #   「穩定」的意思是「有一段時間沒有再變」,那就該從變動的那一刻起算。
+    #   ★誠實說明它不能做到什麼★:清單若在觀察窗【之後】才繼續載入(例:2.1 秒
+    #   才出現第 3、4 位),任何以時間為判準的做法都會失手 —— 那需要 HIS 自己的
+    #   「查詢完成」訊號(loading 指示、列數標籤、dataset 狀態),目前沒有找到。
+    #   這是一道防線,不是「roster readiness 已解決」。
+    last_change_at = started
     while True:
         children, radios, cur = read(consult_hwnd)
         if last is not None and cur == last:
@@ -1339,10 +1394,12 @@ def _await_stable_roster(consult_hwnd: int, *, read=None, sleep=None,
             if same >= _ROSTER_SETTLE_READS - 1:
                 need = (_ROSTER_MIN_OBSERVE if cur
                         else _ROSTER_EMPTY_MIN_OBSERVE)
-                if now() - started >= need:
+                if now() - last_change_at >= need:
                     return _RosterSnapshot(cur, True, children, radios)
         else:
             same = 0
+            if last is not None:
+                last_change_at = now()
         last = cur
         if now() >= deadline:
             logging.warning("[consult-extract] 病人清單在 %.0f 秒內一直在變動"
@@ -1377,8 +1434,15 @@ def _capture_with_settled_roster(consult_hwnd: int, *, capture=None,
         try:
             _c, _r, after = read(consult_hwnd)
         except Exception:
-            logging.debug("[consult-extract] 截圖後回讀清單失敗", exc_info=True)
-            after = snap.texts          # 讀不到就不因此否定這份快照
+            # ★[2026-08-05 外審第 5 輪 P1-06] 讀不到 ≠ 沒有變★
+            #   上一版把 `after` 冒充成 `snap.texts`,於是這份【沒有被確認過】的
+            #   快照照樣去更新「已通知」基準 —— 期間真的多出一位病人的話,
+            #   他會被當成「已經通知過」而從此不再被視為新的 → 漏寄。
+            #   現在:內容照寄(它本身是穩定的),但不可以更新基準。
+            logging.warning("[consult-extract] 截圖後回讀清單失敗 → "
+                            "本輪不更新已通知基準(下一輪會重新比對)",
+                            exc_info=True)
+            return img, snap.as_unverified()
         if after != snap.texts:
             logging.warning("[consult-extract] 截圖後病人清單又變了"
                             "(%d 列 → %d 列) → 本輪不據此判斷有無新會診",
@@ -4611,7 +4675,11 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                 # [CQ-03] 只在「roster 擷取成功(非 None)」時才更新基準:手動觸發但擷取失敗
                 # 時,若用空集合覆寫基準,下一輪 poll 擷取恢復 → 全部未回覆會診變「新」→ 對團隊
                 # 重複寄整份清單。roster is None(解析失敗/停用)一律不動基準。
-                if trigger_label != "email" and roster_texts is not None:
+                # ★[2026-08-05 外審第 5 輪 P1-06]★ 「可以寄」與「可以更新基準」
+                #   是兩個問題。截圖後回讀失敗時內容仍可信(照寄),但我們沒有
+                #   確認過它仍代表當下 → 不可以宣稱這些都已經通知過。
+                #   見 `_may_update_baseline` / `_RosterSnapshot.as_unverified`。
+                if trigger_label != "email" and _may_update_baseline(roster_texts):
                     try:
                         _save_notified(_consult_signature_from_roster(roster_texts))
                     except Exception:
