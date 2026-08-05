@@ -3076,8 +3076,8 @@ def _alert_unmanaged_session(depth: int, reason: str) -> None:
     _unmanaged_alert_at = now
     body = (f"有 {depth} 個住院系統登入(HIS session)送出關閉命令後仍未關閉。\n"
             f"最近一次的原因:{str(reason)[:200]}\n\n"
-            "在它們關掉之前,程式【不會】再登入(避免同時存在多個登入中的 session),\n"
-            "因此會診查詢會暫停。每一輪仍會自動重試關閉,關掉後會自行恢復。\n"
+            f"程式會先暫停登入約 {_UNMANAGED_BLOCK_MAX_SEC // 60} 分鐘並重試關閉;"
+            "仍關不掉時會放行一次恢復嘗試,再重新暫停(避免臨床查詢無限期停擺)。\n"
             "若持續出現,請到該台電腦人工確認隱藏桌面上的住院系統。")
 
     def _worker():
@@ -3091,7 +3091,11 @@ def _alert_unmanaged_session(depth: int, reason: str) -> None:
                 category="system",
             )
         except Exception:
-            logging.warning("[session] 掛帳告警寄送失敗(不影響重試)",
+            # [外審第 6 輪 P2-06] 寄失敗不可沉默 6 小時:把時間戳回撥到
+            # 「10 分鐘後可再試」,讓下一輪掛帳重新觸發。
+            global _unmanaged_alert_at
+            _unmanaged_alert_at = time.time() - _UNMANAGED_ALERT_INTERVAL_SEC + 600
+            logging.warning("[session] 掛帳告警寄送失敗(10 分鐘後重試)",
                             exc_info=True)
 
     try:
@@ -3127,6 +3131,10 @@ def _retry_unclosed_sessions() -> int:
                     _unclosed_sessions.pop(i)
                     break
         return len(_unclosed_sessions)
+
+
+class DeliveryOutcomeUnknown(RuntimeError):
+    """寄信結果不明(逾時但可能已送達) → 不得自動重試,以免重複寄出。"""
 
 
 class UnmanagedSessionError(RuntimeError):
@@ -3176,9 +3184,14 @@ def _ensure_no_unmanaged_sessions(*, now=None) -> None:
         _unmanaged_since = now()
     blocked_for = now() - _unmanaged_since
     if blocked_for >= _UNMANAGED_BLOCK_MAX_SEC:
+        # ★[外審第 6 輪 P1-06] 放行【一次】,然後重新起算★
+        #   上一版超過上限後就永遠放行 —— 閘門變成只擋前 15 分鐘,之後每 3 分鐘
+        #   都冷啟動一次,掛帳清單照樣增長,連告警信裡「不會再登入」都成了謊話。
+        #   改成:每個窗口放行一次恢復嘗試,之後重新擋滿一個窗口再試。
+        _unmanaged_since = now()
         logging.error(
-            "[session] ★仍有 %d 個關不掉的 session,但已擋了 %.0f 分鐘★ → "
-            "放行本輪(臨床查詢不可以無限期停擺);請人工確認隱藏桌面上的住院系統",
+            "[session] ★仍有 %d 個關不掉的 session,已擋滿 %.0f 分鐘★ → "
+            "放行【一次】恢復嘗試,之後重新起算;請人工確認隱藏桌面上的住院系統",
             remaining, blocked_for / 60.0)
         return
     raise UnmanagedSessionError(
@@ -3696,9 +3709,20 @@ def _query_cycle(sess, cfg: dict, roster_label: str) -> tuple:
             "本次中止以免對醫囑系統送出不明命令")
     # ★命令送出【前】的既有會診視窗要先記下來★ 之後只認新出現的那一個。
     #   候選集用 `owner_pid`(我們登入的那個行程),不是 `our_pids`。
-    before_consults = set(find_windows(CONSULT_CLASS, pids={owner_pid},
-                                       visible_only=False))
-    if before_consults:
+    # ★[外審第 6 輪 P1-02] Delphi 常重用 form:同一個 hwnd 由隱藏轉可見★
+    #   只認「命令後【新出現】的 hwnd」的話,上一輪被 Hide 的那張會診單若被
+    #   HIS 重新 Show(同一個 hwnd),永遠不會被採認 → 每輪等滿 60 秒失敗。
+    #   記下命令前每個 hwnd 的可見狀態:採認條件 = 新 hwnd,或「原本不可見、
+    #   命令後轉為可見」的同一個 hwnd。
+    def _visible(h):
+        try:
+            return bool(win32gui.IsWindowVisible(h))
+        except Exception:
+            return False
+    before_consults = {h: _visible(h)
+                       for h in find_windows(CONSULT_CLASS, pids={owner_pid},
+                                             visible_only=False)}
+    if any(before_consults.values()):
         # 上一輪沒有退回主畫面。不當成本輪結果(那是舊資料),照樣往下走 ——
         # 若命令沒有生出新視窗就會逾時,交給既有的恢復路徑。
         logging.warning("[session] 送命令前已有 %d 個會診視窗(上一輪未退回主畫面)"
@@ -3712,7 +3736,8 @@ def _query_cycle(sess, cfg: dict, roster_label: str) -> tuple:
             raise RuntimeError("流程已被中止")
         hits = [h for h in find_windows(CONSULT_CLASS, pids={owner_pid},
                                         visible_only=False)
-                if h not in before_consults]
+                if h not in before_consults
+                or (not before_consults[h] and _visible(h))]
         if hits:
             consult = hits[0]
             break
@@ -4344,8 +4369,10 @@ def _materialize_shot(img):
         return img                     # 已經是路徑（或 None）→ 不動
     SHOTS_DIR.mkdir(parents=True, exist_ok=True)
     _prune_old_shots()
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    shot_path = SHOTS_DIR / f"consult_{stamp}.png"
+    # [外審第 6 輪 P2-08] 秒級檔名會在同秒兩個 delivery 時互相覆蓋,
+    # 之後 _discard_undelivered_shot 還可能刪到別人正在用的那張。微秒+pid。
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    shot_path = SHOTS_DIR / f"consult_{stamp}_{os.getpid()}.png"
     img.save(shot_path)
     logging.info("已存檔截圖（本輪確定要寄信）：%s", shot_path)
     return shot_path
@@ -4533,9 +4560,12 @@ def send_via_outlook(image_path: Path, subject: str, body: str,
     worker.start()
     worker.join(timeout)
     if worker.is_alive():
-        raise RuntimeError(
-            f"Outlook 寄信逾時（超過 {int(timeout)} 秒）——"
-            "可能是 Outlook 跳出「允許程式寄信」安全提示或忙線，請檢查 Outlook")
+        # ★[外審第 6 輪 P1-07] 逾時的 worker 沒有被終止,它可能【稍後仍寄成功】★
+        #   把這當成可重試錯誤的話,下一個 attempt 會啟動第二個 worker →
+        #   兩個都 Send 成功 → 收件人收到兩封。結果不明就不得自動重試。
+        raise DeliveryOutcomeUnknown(
+            f"Outlook 寄信逾時（超過 {int(timeout)} 秒）——原 worker 可能仍在寄,"
+            "不自動重試以免重複寄出;請檢查 Outlook 是否跳出安全提示或忙線")
     if result.get("error"):
         raise result["error"]
     if not result.get("ok"):
@@ -4558,8 +4588,11 @@ def send_via_smtp(image_path: Path, subject: str, body: str,
     Password。檔案不存在會自動建立範本，password 為空會 raise
     SmtpNotConfiguredError。"""
     from cmuh_common.smtp_mail import send_mail
+    # [外審第 6 輪 P2-02] 只留一層重試:外層 _do_full_job 已有 3 次 attempt,
+    # 內層再各自重試會變成最多 9 次提交(重複寄出的機率跟著放大)。
     send_mail(recipients=recipients, subject=subject, body=body,
               attachment_path=image_path, timeout=timeout,
+              max_retries=0,
               html_body=html_body or None,
               # ★[2026-08-05 外審第 5 輪 P1-04]★ 重試要重送【同一封】——
               #   換 Message-ID 會讓「已收下但回應逾時」變成收件人收到兩封。
@@ -5042,9 +5075,14 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                 # [2026-08-05 外審第 5 輪 P1-02] UnmanagedSessionError 也是 fatal:
                 #   帳上有關不掉的 session 時,重試三次只是再撞三次同一道閘門,
                 #   而且每次都會多等一輪 backoff。等下一輪排程重試就好。
+                # [外審第 6 輪 P1-07] DeliveryOutcomeUnknown 也是 fatal:
+                #   信可能已經送達,重試 = 可能寄第二封。
                 fatal = isinstance(e, (LoginNotCompleted, JobSuperseded,
-                                       HISStartupBlocked, UnmanagedSessionError))
-                if isinstance(e, UnmanagedSessionError):
+                                       HISStartupBlocked, UnmanagedSessionError,
+                                       DeliveryOutcomeUnknown))
+                if isinstance(e, DeliveryOutcomeUnknown):
+                    logging.error("會診查詢:寄信結果不明 → 不重試(避免重複寄出):%s", e)
+                elif isinstance(e, UnmanagedSessionError):
                     logging.error("會診查詢:%s", e)
                 elif isinstance(e, JobSuperseded):
                     logging.error("會診查詢：%s", e)

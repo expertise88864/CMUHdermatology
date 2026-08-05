@@ -403,10 +403,15 @@ def send_mail(recipients: list, subject: str, body: str,
                 _time.sleep(backoff)
                 continue
             # 用完重試次數
-            _rollback_rate_limit_slot(reservation)
+            # ★[2026-08-05 外審第 6 輪 P2-03] 逾時不退配額★
+            #   timeout 可能發生在伺服器【已經收下 DATA】之後 —— 信可能已送達。
+            #   退回配額會低估實際寄件量;結果不明時保留 reservation 是安全方向
+            #   (最壞是少寄一封的額度,不會超發)。
             if isinstance(e, socket.timeout):
                 raise RuntimeError(
-                    f"SMTP 連線/送信逾時 ({int(timeout)}s)，已重試 {max_retries} 次：{e}") from e
+                    f"SMTP 連線/送信逾時 ({int(timeout)}s)，已重試 {max_retries} 次"
+                    f"(結果不明,配額不退回)：{e}") from e
+            _rollback_rate_limit_slot(reservation)
             if isinstance(e, OSError):
                 raise RuntimeError(
                     f"SMTP 網路錯誤，已重試 {max_retries} 次：{e}") from e
