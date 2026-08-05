@@ -240,17 +240,56 @@ class TestTheDismissPredicateIsTheRightQuestion:
             "查不到卻宣稱已經退回主畫面")
 
 
-class TestMainReadiness:
+def _ticks(step=0.25):
+    t = {"v": 0.0}
 
-    def test_a_disabled_main_is_not_ready(self, monkeypatch):
+    def _now():
+        t["v"] += step
+        return t["v"]
+    return _now
+
+
+class TestMainReadiness:
+    """★[2026-08-05 實機事故] 不可以只取樣一次★
+
+    我第一版在會診單「看不見了」之後【立刻】問一次 `IsWindowEnabled`，
+    當天下午三次全部答 disabled → 三次都收掉 session → 三次都關不掉 →
+    掛帳閘門把整個會診查詢停掉，使用者重開機也一樣。
+
+        14:52:28,451 擷取完成
+        14:52:28,762 會診單已收掉,但主畫面沒回到可操作狀態:被 modal 擋住
+        14:52:31,765 ★主畫面關不掉★
+
+    相隔 311 毫秒。Delphi 的 modal form 是【先 Hide、後把 owner 重新 enable】，
+    而 `_consult_form_dismissed` 把「看不見」就算退場 —— 剛好卡在那個縫裡。
+    """
+
+    def test_a_main_that_reenables_shortly_after_is_ready(self, monkeypatch):
+        """★這就是事故的形狀★ 前幾次還是 disabled，稍後就恢復了。"""
+        monkeypatch.setattr(cq, "_session_death_reason", lambda _s: "")
+        calls = {"n": 0}
+
+        def _enabled(_h):
+            calls["n"] += 1
+            return calls["n"] > 3          # 前三次 disabled（＝那 311 毫秒）
+        monkeypatch.setattr(cq.win32gui, "IsWindowEnabled", _enabled)
+
+        assert cq._main_ready_for_next_cycle(
+            _Sess(), sleep=lambda _s: None, now=_ticks()) == "", (
+            "★只取樣一次就判定★ 健康的 session 會被收掉，然後關不掉、整個停擺")
+
+    def test_a_permanently_disabled_main_is_still_reported(self, monkeypatch):
+        """★反方向:真的一直被擋住仍要說出來★（不可以修成永遠回 OK）。"""
         monkeypatch.setattr(cq, "_session_death_reason", lambda _s: "")
         monkeypatch.setattr(cq.win32gui, "IsWindowEnabled", lambda _h: False)
-        assert "modal" in cq._main_ready_for_next_cycle(_Sess())
+        assert "modal" in cq._main_ready_for_next_cycle(
+            _Sess(), sleep=lambda _s: None, now=_ticks())
 
     def test_a_healthy_main_is_ready(self, monkeypatch):
         monkeypatch.setattr(cq, "_session_death_reason", lambda _s: "")
         monkeypatch.setattr(cq.win32gui, "IsWindowEnabled", lambda _h: True)
-        assert cq._main_ready_for_next_cycle(_Sess()) == ""
+        assert cq._main_ready_for_next_cycle(
+            _Sess(), sleep=lambda _s: None, now=_ticks()) == ""
 
     def test_a_dead_session_is_not_ready(self, monkeypatch):
         monkeypatch.setattr(cq, "_session_death_reason", lambda _s: "主畫面不在")
@@ -262,7 +301,8 @@ class TestMainReadiness:
         def _boom(_h):
             raise OSError("查不到")
         monkeypatch.setattr(cq.win32gui, "IsWindowEnabled", _boom)
-        assert cq._main_ready_for_next_cycle(_Sess()) != ""
+        assert cq._main_ready_for_next_cycle(
+            _Sess(), sleep=lambda _s: None, now=_ticks()) != ""
 
 
 def test_query_cycle_never_picks_a_main_window_by_enumeration():

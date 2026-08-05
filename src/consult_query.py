@@ -2832,6 +2832,11 @@ def _close_session_windows(sess, *, close=None, gone=None, sleep=None) -> bool:
                       hwnd, getattr(sess, "main_pid", None),
                       getattr(sess, "main_class", None), now_pid, now_cls)
         return False                   # 沒關成功,而且不可以亂關 → 交給掛帳機制
+    # ★[2026-08-05 實機事故] 先把 modal 按掉,不然 WM_CLOSE 一定沒用★
+    #   被 modal 擋住的主畫面是 disabled 的,disabled 的視窗不會處理 WM_CLOSE。
+    #   當天三次「★主畫面關不掉★」全部是這個原因(前一行 log 就寫著
+    #   「主畫面被 modal 對話框擋住」),而我卻把它當成獨立故障去掛帳。
+    _dismiss_blocking_modals(sess)
     try:
         close(hwnd)
     except Exception:
@@ -3004,34 +3009,59 @@ class UnmanagedSessionError(RuntimeError):
     """帳上還有關不掉的 HIS session → 不得再建立新的登入。"""
 
 
-def _ensure_no_unmanaged_sessions() -> None:
-    """先重試關掉帳上的 session;還有殘留就【擋下本輪】。
+# ★閘門必須有上限★(2026-08-05 實機事故)
+#   fail-closed 的前提是「這個狀況遲早會解除」。當天的實機證明前提不成立:
+#   主畫面被 modal 擋住 → disabled → 不處理 WM_CLOSE → 永遠關不掉 → 閘門
+#   把整個會診查詢停掉,而且【重開機也一樣】(重開機之後第一輪又走到同一個狀態)。
+#   臨床上「會診查詢完全停擺」比「隱藏桌面多一個登入中的 session」嚴重得多,
+#   而且後者本來就有 systemftp「最多兩個」的自然上限會讓它自己浮現。
+#   → 擋一段時間(讓真的會自己好的情況有機會恢復),超過就放行,但持續告警。
+_UNMANAGED_BLOCK_MAX_SEC = 15 * 60
+_unmanaged_since = 0.0
+
+
+def _ensure_no_unmanaged_sessions(*, now=None) -> None:
+    """先重試關掉帳上的 session;還有殘留就【擋下本輪】——但不會擋到天荒地老。
 
     ★[2026-08-05 外審第 5 輪 P1-02]★ 上一版只呼叫 `_retry_unclosed_sessions()`
     而【把回傳值丟掉】。於是掛帳機制只做到「我知道有一個關不掉的 session」,
-    做不到它自己註解宣稱的「不先收,隱藏桌面上就會同時有兩個登入中的 HIS」——
-    關不掉 → 掛帳 → 下一輪照樣冷啟動 → 第二個登入。
+    做不到它自己註解宣稱的「不先收,隱藏桌面上就會同時有兩個登入中的 HIS」。
 
-    ★為什麼是 fail-closed(停掉查詢)而不是照常再登一個★
-    兩害相權:
-      * 照常再登 → 隱藏桌面上的登入中 session 逐次累積,沒有人知道,而且
-        systemftp 本來就有「最多兩個」的上限 —— 最後照樣全面失敗,只是無聲。
-      * 停掉查詢 → 會診查詢暫停,但【會寄信告警】,而且每一輪都重試關閉,
-        關掉之後自動恢復。
-    後者是看得見、會自己好的失敗;前者是看不見、只會更壞的失敗。
+    ★[2026-08-05 實機事故] 但 fail-closed 不可以沒有上限★
+    我當天把它寫成無限期阻擋,理由是「停掉查詢會寄信告警、關掉後自動恢復」。
+    ★那個理由預設了『遲早關得掉』,而實機證明關不掉★:主畫面被 modal 擋住時
+    是 disabled 的,disabled 的視窗不會處理 WM_CLOSE —— 於是永遠掛在帳上,
+    會診查詢從下午 2:52 起全停,使用者重開機也一樣。
+    現在:擋 `_UNMANAGED_BLOCK_MAX_SEC`(給真的會自己好的情況一個機會),
+    超過就放行並持續告警 —— 寧可多一個沒收乾淨的 session,不可以讓臨床查詢
+    無聲停擺。
     """
+    global _unmanaged_since
+    now = now or time.time
     try:
         remaining = _retry_unclosed_sessions()
     except Exception:
-        # 連重試都出錯 → 帳上狀態不明,一樣不可以再登入
+        # 連重試都出錯 → 帳上狀態不明,一樣視為有殘留
         logging.warning("[session] 重試關閉掛帳 session 時出錯", exc_info=True)
         with _unclosed_lock:
             remaining = len(_unclosed_sessions)
-    if remaining:
-        raise UnmanagedSessionError(
-            f"仍有 {remaining} 個無法確認關閉的住院系統登入 → "
-            "本輪不建立新登入(避免同時多個登入中的 session);"
-            "每一輪會自動重試關閉,關掉後即自行恢復")
+    if not remaining:
+        _unmanaged_since = 0.0
+        return
+    if not _unmanaged_since:
+        _unmanaged_since = now()
+    blocked_for = now() - _unmanaged_since
+    if blocked_for >= _UNMANAGED_BLOCK_MAX_SEC:
+        logging.error(
+            "[session] ★仍有 %d 個關不掉的 session,但已擋了 %.0f 分鐘★ → "
+            "放行本輪(臨床查詢不可以無限期停擺);請人工確認隱藏桌面上的住院系統",
+            remaining, blocked_for / 60.0)
+        return
+    raise UnmanagedSessionError(
+        f"仍有 {remaining} 個無法確認關閉的住院系統登入 → "
+        f"本輪不建立新登入(已擋 {blocked_for / 60.0:.0f} 分鐘,"
+        f"最多擋 {_UNMANAGED_BLOCK_MAX_SEC // 60} 分鐘);"
+        "每一輪會自動重試關閉,關掉後即自行恢復")
 
 
 def _session_close(reason: str) -> None:
@@ -3308,24 +3338,76 @@ def _consult_form_dismissed(hwnd: int) -> bool:
         return False
 
 
-def _main_ready_for_next_cycle(sess) -> str:
+_MAIN_REENABLE_TIMEOUT = 6.0     # 等主畫面重新可操作的上限(秒)
+_MAIN_REENABLE_INTERVAL = 0.25
+
+
+def _main_ready_for_next_cycle(sess, *, sleep=None, now=None) -> str:
     """主畫面是不是回到「可以再下一次命令」的狀態 → "" 表示可以,否則是原因。
 
     ★[2026-08-05 外審第 5 輪 P2-02]★ 舊版只確認「看不到會診視窗了」就宣布
     session 續留。會診視窗收掉、但主畫面被另一個 modal 擋住時,那句「續留」是
-    錯的 —— 要等到下一輪送命令沒反應才會在更晚、更難查的地方失敗。
-    `IsWindowEnabled` 正是「被 modal 擋住」的正規訊號(見
-    `_wait_main_window_after_login` 的既有說明)。
+    錯的。`IsWindowEnabled` 正是「被 modal 擋住」的正規訊號。
+
+    ★[2026-08-05 實機事故] 但【不可以只取樣一次】★
+    我第一版在 `_consult_form_dismissed` 回 True 之後【立刻】問一次 enabled,
+    當天下午三次全部答「disabled」→ 三次都收掉 session → 三次都關不掉 →
+    掛帳閘門把整個會診查詢停掉。診間 log:
+
+        14:52:28,451 擷取完成
+        14:52:28,762 會診單已收掉,但主畫面沒回到可操作狀態:被 modal 擋住
+        14:52:31,765 ★主畫面關不掉★
+
+    相隔 311 毫秒。Delphi 的 modal form 是【先 Hide、後把 owner 重新 enable】,
+    而 `_consult_form_dismissed` 把「看不見」就算退場 —— 我剛好卡在那個縫裡問。
+    改成【輪詢】等它恢復;真的一直沒恢復才算異常。
     """
+    sleep = sleep or time.sleep
+    now = now or time.monotonic
     death = _session_death_reason(sess)
     if death:
         return death
+    deadline = now() + _MAIN_REENABLE_TIMEOUT
+    last = ""
+    while True:
+        try:
+            if win32gui.IsWindowEnabled(sess.main_hwnd):
+                return ""
+            last = "主畫面仍被 modal 對話框擋住(disabled)"
+        except Exception:
+            last = "無法查詢主畫面是否可操作"
+        if now() >= deadline:
+            return last
+        sleep(_MAIN_REENABLE_INTERVAL)
+
+
+def _dismiss_blocking_modals(sess) -> int:
+    """把擋在主畫面前面的訊息通知按掉 → 按了幾個。
+
+    ★[2026-08-05 實機事故]★ 主畫面被 modal 擋住時,它是 disabled 的 ——
+    **disabled 的視窗不會處理 WM_CLOSE**。所以「收尾關不掉主畫面」與「主畫面
+    被 modal 擋住」根本是同一件事的兩個症狀,而我當天把前者當成獨立故障、
+    還讓它去觸發一個 fail-closed 閘門,結果是整個會診查詢停擺。
+
+    要關主畫面,得先讓它能收訊息 —— 先按掉 modal。
+    只找【我們登入的那個行程】的通知視窗(`sess.main_pid`),不動別人的。
+    """
+    owner = getattr(sess, "main_pid", None)
+    if not owner:
+        return 0
+    clicked = 0
     try:
-        if not win32gui.IsWindowEnabled(sess.main_hwnd):
-            return "主畫面被 modal 對話框擋住(disabled)"
+        for hwnd in find_windows(NOTICE_CLASS, pids={owner}, visible_only=False):
+            btn = find_child(hwnd, "TButton", "確認") or find_child(
+                hwnd, "TButton", "OK")
+            if btn:
+                click_button(btn)
+                clicked += 1
     except Exception:
-        return "無法查詢主畫面是否可操作"
-    return ""
+        logging.debug("[session] 關閉主畫面前的訊息通知時出錯", exc_info=True)
+    if clicked:
+        logging.info("[session] 已按掉 %d 個擋住主畫面的訊息通知", clicked)
+    return clicked
 
 
 def _return_to_main(sess, consult_hwnd) -> None:
@@ -3367,6 +3449,15 @@ def _return_to_main(sess, consult_hwnd) -> None:
                 return
         not_ready = _main_ready_for_next_cycle(sess)
         if not_ready:
+            # ★[2026-08-05 實機事故] 先按掉 modal,不要直接收掉 session★
+            #   主畫面 disabled = 被 modal 擋住 = 它不會處理 WM_CLOSE,
+            #   所以「收掉 session」在這個狀態下【必然失敗】,只會把一個可以
+            #   自己恢復的暫態變成掛帳、然後被閘門停掉整個查詢。
+            if _dismiss_blocking_modals(sess):
+                not_ready = _main_ready_for_next_cycle(sess)
+        if not_ready:
+            # 按掉之後仍然不可操作 → 這個 session 確實不能再用了。收尾時
+            # `_close_session_windows` 會再試一次按掉 modal 才送 WM_CLOSE。
             _session_close_if_current(
                 sess, f"會診單已收掉,但主畫面沒回到可操作狀態:{not_ready}")
             return
