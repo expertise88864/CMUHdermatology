@@ -111,23 +111,55 @@ def test_only_the_ones_that_closed_are_removed(monkeypatch):
     _clear_ledger()
 
 
-def test_hitting_the_cap_does_not_discard_anything(caplog):
-    """★上限是防爆，不是丟棄的理由★
+def test_nothing_is_ever_dropped_no_matter_how_many(monkeypatch):
+    """★一筆都不丟★（外審第 5 輪 P1-03）
 
-    丟掉任何一筆就等於回到「沒人認得它」—— 那正是這整個機制要擋的事。
-    達到上限時：不再增加、並且告警，但帳上原有的一筆都不能少。
+    ★這一支原本把缺陷釘成了通過條件★
+    舊版是 `test_hitting_the_cap_does_not_discard_anything`，只驗「舊的 8 筆
+    沒被擠掉」—— 而程式碼丟掉的是【新來的第 9 筆】。註解寫著「不丟掉任何一筆」，
+    測試也只檢查了不會被丟掉的那一半，缺陷剛好落在兩者之間。
+
+    現在沒有上限：帳上只要有一筆，`_acquire_session` 就禁止冷啟動，
+    所以這個清單不可能因為我們自己再開新 session 而增長。
     """
-    import logging as _lg
+    monkeypatch.setattr(cq, "_alert_unmanaged_session", lambda *a, **k: None)
     _clear_ledger()
-    kept = [_Sess(pid=i) for i in range(cq._MAX_UNCLOSED)]
-    for s in kept:
-        cq._note_unclosed_session(s, "填滿")
-    with caplog.at_level(_lg.ERROR):
-        cq._note_unclosed_session(_Sess(pid=999), "溢位")
+    made = [_Sess(pid=i) for i in range(20)]
+    for s in made:
+        cq._note_unclosed_session(s, "測試")
 
-    assert cq._unclosed_sessions == kept, "★把舊的擠掉了★ 那個 HIS 從此無人認領"
-    assert "上限" in " ".join(r.getMessage() for r in caplog.records)
+    assert cq._unclosed_sessions == made, (
+        f"掛帳只留下 {len(cq._unclosed_sessions)}/{len(made)} 筆 —— 被丟掉的那些無人認領")
+    assert not hasattr(cq, "_MAX_UNCLOSED"), (
+        "還留著會丟棄新項目的上限")
     _clear_ledger()
+
+
+def test_the_first_failure_alerts_the_developer(monkeypatch):
+    """★[外審第 5 輪 P2-04] 不會自己好的事情要主動說★
+
+    註解一路寫著「掛帳＋告警」，實際上只有 logging.error —— 而使用者看不到
+    隱藏桌面、也不會去翻 log。
+    """
+    sent = []
+    monkeypatch.setattr(cq, "_alert_unmanaged_session",
+                        lambda depth, reason: sent.append((depth, reason)))
+    _clear_ledger()
+    cq._note_unclosed_session(_Sess(), "關不掉")
+    assert sent and sent[0][0] == 1, "第一筆掛帳沒有走告警通道"
+    _clear_ledger()
+
+
+def test_the_alert_is_throttled(monkeypatch):
+    """這種狀況不會自己好，但也不該每 3 分鐘寄一封信。"""
+    calls = []
+    monkeypatch.setattr(cq.threading, "Thread",
+                        lambda target=None, **k: type(
+                            "T", (), {"start": lambda s: calls.append(1)})())
+    monkeypatch.setattr(cq, "_unmanaged_alert_at", 0.0)
+    cq._alert_unmanaged_session(1, "第一次")
+    cq._alert_unmanaged_session(2, "馬上又一次")
+    assert len(calls) == 1, f"節流失效，寄了 {len(calls)} 封"
 
 
 # ── 接線（這個 session 反覆出事的形狀）─────────────────────────────────────
@@ -159,7 +191,7 @@ def test_teardown_records_a_failed_close():
     assert ok, "★關窗的回傳值沒被檢查★ 關不掉不會掛帳，那個 HIS 無人認領"
 
 
-def test_every_cycle_retries_the_ledger():
+def test_every_cycle_goes_through_the_gate():
     """★接線★ 掛帳了但沒有人重試 = 只是換一個地方遺忘它。"""
     import ast
     import inspect
@@ -168,5 +200,86 @@ def test_every_cycle_retries_the_ledger():
     tree = ast.parse(textwrap.dedent(inspect.getsource(cq._acquire_session)))
     called = {n.func.id for n in ast.walk(tree)
               if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-    assert "_retry_unclosed_sessions" in called, (
-        "每輪取用 session 之前沒有重試掛帳的 session")
+    assert "_ensure_no_unmanaged_sessions" in called, (
+        "每輪取用 session 之前沒有經過掛帳閘門")
+
+    gate = ast.parse(textwrap.dedent(
+        inspect.getsource(cq._ensure_no_unmanaged_sessions)))
+    gate_calls = {n.func.id for n in ast.walk(gate)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "_retry_unclosed_sessions" in gate_calls
+
+
+# ── 閘門：有殘留就不准再登入（外審第 5 輪 P1-02）────────────────────────────
+def test_a_remaining_unclosed_session_blocks_the_gate(monkeypatch):
+    """★核心★ 關不掉的 session 還在 → 不可以再開一個登入。
+
+    舊版把 `_retry_unclosed_sessions()` 的回傳值丟掉，於是掛帳只做到
+    「我知道有一個關不掉的 session」，做不到它註解宣稱的「不先收就會同時有
+    兩個登入中的 HIS」。
+    """
+    monkeypatch.setattr(cq, "_retry_unclosed_sessions", lambda: 1)
+    try:
+        cq._ensure_no_unmanaged_sessions()
+    except cq.UnmanagedSessionError as e:
+        assert "不建立新登入" in str(e)
+        return
+    raise AssertionError("★仍有關不掉的 session，閘門卻放行★ 會變成兩個登入")
+
+
+def test_a_clean_ledger_lets_the_cycle_through(monkeypatch):
+    """★反方向:不可以變成永遠擋住★ 沒有殘留就要放行。"""
+    monkeypatch.setattr(cq, "_retry_unclosed_sessions", lambda: 0)
+    cq._ensure_no_unmanaged_sessions()          # 不拋例外即通過
+
+
+def test_a_retry_that_raises_still_blocks(monkeypatch):
+    """重試本身出錯 → 帳上狀態不明 → 一樣不可以再登入（不知道不等於沒有）。"""
+    def _boom():
+        raise OSError("列舉失敗")
+    monkeypatch.setattr(cq, "_retry_unclosed_sessions", _boom)
+    monkeypatch.setattr(cq, "_alert_unmanaged_session", lambda *a, **k: None)
+    _clear_ledger()
+    cq._note_unclosed_session(_Sess(), "關不掉")
+    try:
+        cq._ensure_no_unmanaged_sessions()
+    except cq.UnmanagedSessionError:
+        _clear_ledger()
+        return
+    _clear_ledger()
+    raise AssertionError("重試出錯時閘門放行了")
+
+
+def test_no_cold_start_while_the_ledger_is_dirty(monkeypatch):
+    """★行為★ 閘門擋下時，`_cold_start_session` 必須一次都不被呼叫。
+
+    只測「閘門會拋例外」不夠 —— 要證明 `_acquire_session` 真的因此沒有去登入。
+    """
+    calls = []
+    monkeypatch.setattr(cq, "_cold_start_session",
+                        lambda cfg: calls.append(cfg))
+    monkeypatch.setattr(cq, "_retry_unclosed_sessions", lambda: 1)
+    monkeypatch.setattr(cq, "_psession", None)
+
+    try:
+        cq._acquire_session({})
+    except cq.UnmanagedSessionError:
+        pass
+    assert calls == [], "★帳上還有關不掉的 session，卻又登入了一次★"
+
+
+def test_the_job_treats_it_as_fatal():
+    """接線:這個例外不可以進 backoff 重試（三次只是再撞三次同一道閘門）。"""
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(cq._do_full_job)))
+    names = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and node.targets
+                and getattr(node.targets[0], "id", "") == "fatal"):
+            names |= {n.id for n in ast.walk(node.value)
+                      if isinstance(n, ast.Name)}
+    assert "UnmanagedSessionError" in names, (
+        "UnmanagedSessionError 沒有被列為 fatal → 會白白重試三次")

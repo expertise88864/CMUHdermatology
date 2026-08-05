@@ -2827,24 +2827,74 @@ def _terminate_session_process(sess) -> None:
 #   → 關不掉就掛在這裡,每一輪重試,並且告警(不會自己好的事情要讓人知道)。
 _unclosed_lock = threading.Lock()
 _unclosed_sessions: list = []
-_MAX_UNCLOSED = 8                   # 上限只是防爆,達到上限【不是】丟掉舊的理由
 
 
 def _note_unclosed_session(sess, reason: str) -> None:
-    """關不掉 → 掛帳。已經在帳上的不重複加。"""
+    """關不掉 → 掛帳。已經在帳上的不重複加。
+
+    ★[2026-08-05 外審第 5 輪 P1-03] 沒有上限,一筆都不丟★
+    上一版寫了 `if len >= _MAX_UNCLOSED: return` 並在註解宣稱「上限只是防爆,
+    不丟掉任何一筆」。★那句話與程式碼不符★:舊的 8 筆確實沒被擠掉,但【新來的
+    第 9 筆】被直接丟棄 —— 而那一筆同樣是一個仍然登入中、從此沒人認得的 HIS。
+    測試也只驗了「舊的沒被擠掉」,剛好避開了真正的缺陷。
+
+    現在不需要上限:帳上只要有一筆,`_acquire_session` 就【禁止冷啟動】
+    (見 `_ensure_no_unmanaged_sessions`),所以這個清單不可能因為我們自己
+    再開新 session 而增長。
+    """
     with _unclosed_lock:
         if any(s is sess for s in _unclosed_sessions):
             return
-        if len(_unclosed_sessions) >= _MAX_UNCLOSED:
-            # ★不丟掉任何一筆★ 丟掉就等於回到「沒人認得它」。只是不再長。
-            logging.error("[session] 關不掉的 session 已累積 %d 個(上限)"
-                          " —— 請人工檢查隱藏桌面上的住院系統",
-                          len(_unclosed_sessions))
-            return
         _unclosed_sessions.append(sess)
+        depth = len(_unclosed_sessions)
     logging.error("[session] ★關不掉,先掛帳待重試★(pid=%s hwnd=%s):%s"
-                  " —— 這個 HIS session 可能仍登入中",
-                  sess.pid, getattr(sess, "main_hwnd", None), reason)
+                  " —— 這個 HIS session 可能仍登入中(帳上共 %d 個)",
+                  sess.pid, getattr(sess, "main_hwnd", None), reason, depth)
+    _alert_unmanaged_session(depth, reason)
+
+
+# 告警節流:這種狀況不會自己好,但也不該每 3 分鐘寄一封信。
+_UNMANAGED_ALERT_INTERVAL_SEC = 6 * 3600
+_unmanaged_alert_at = 0.0
+
+
+def _alert_unmanaged_session(depth: int, reason: str) -> None:
+    """關不掉的 session 要走【開發者告警】通道,不能只寫 log。
+
+    ★[2026-08-05 外審第 5 輪 P2-04]★ 註解一路寫著「掛帳＋告警」,實際上只有
+    `logging.error` —— 而使用者看不到隱藏桌面、也不會去翻 log。這種狀況不會
+    自行恢復,不主動說就沒有人會知道。
+    """
+    global _unmanaged_alert_at
+    now = time.time()
+    if now - _unmanaged_alert_at < _UNMANAGED_ALERT_INTERVAL_SEC:
+        return
+    _unmanaged_alert_at = now
+    body = (f"有 {depth} 個住院系統登入(HIS session)送出關閉命令後仍未關閉。\n"
+            f"最近一次的原因:{str(reason)[:200]}\n\n"
+            "在它們關掉之前,程式【不會】再登入(避免同時存在多個登入中的 session),\n"
+            "因此會診查詢會暫停。每一輪仍會自動重試關閉,關掉後會自行恢復。\n"
+            "若持續出現,請到該台電腦人工確認隱藏桌面上的住院系統。")
+
+    def _worker():
+        try:
+            from cmuh_common.smtp_mail import send_mail  # noqa: PLC0415
+            send_mail(
+                recipients=[str(r) for r in _developer_alert_recipients()],
+                subject="會診自動化:有無法關閉的住院系統登入",
+                body=body,
+                attachment_path=None,
+                category="system",
+            )
+        except Exception:
+            logging.warning("[session] 掛帳告警寄送失敗(不影響重試)",
+                            exc_info=True)
+
+    try:
+        threading.Thread(target=_worker, name="ConsultUnmanagedAlert",
+                         daemon=True).start()
+    except Exception:
+        logging.debug("[session] 掛帳告警執行緒啟動失敗", exc_info=True)
 
 
 def _retry_unclosed_sessions() -> int:
@@ -2873,6 +2923,40 @@ def _retry_unclosed_sessions() -> int:
                     _unclosed_sessions.pop(i)
                     break
         return len(_unclosed_sessions)
+
+
+class UnmanagedSessionError(RuntimeError):
+    """帳上還有關不掉的 HIS session → 不得再建立新的登入。"""
+
+
+def _ensure_no_unmanaged_sessions() -> None:
+    """先重試關掉帳上的 session;還有殘留就【擋下本輪】。
+
+    ★[2026-08-05 外審第 5 輪 P1-02]★ 上一版只呼叫 `_retry_unclosed_sessions()`
+    而【把回傳值丟掉】。於是掛帳機制只做到「我知道有一個關不掉的 session」,
+    做不到它自己註解宣稱的「不先收,隱藏桌面上就會同時有兩個登入中的 HIS」——
+    關不掉 → 掛帳 → 下一輪照樣冷啟動 → 第二個登入。
+
+    ★為什麼是 fail-closed(停掉查詢)而不是照常再登一個★
+    兩害相權:
+      * 照常再登 → 隱藏桌面上的登入中 session 逐次累積,沒有人知道,而且
+        systemftp 本來就有「最多兩個」的上限 —— 最後照樣全面失敗,只是無聲。
+      * 停掉查詢 → 會診查詢暫停,但【會寄信告警】,而且每一輪都重試關閉,
+        關掉之後自動恢復。
+    後者是看得見、會自己好的失敗;前者是看不見、只會更壞的失敗。
+    """
+    try:
+        remaining = _retry_unclosed_sessions()
+    except Exception:
+        # 連重試都出錯 → 帳上狀態不明,一樣不可以再登入
+        logging.warning("[session] 重試關閉掛帳 session 時出錯", exc_info=True)
+        with _unclosed_lock:
+            remaining = len(_unclosed_sessions)
+    if remaining:
+        raise UnmanagedSessionError(
+            f"仍有 {remaining} 個無法確認關閉的住院系統登入 → "
+            "本輪不建立新登入(避免同時多個登入中的 session);"
+            "每一輪會自動重試關閉,關掉後即自行恢復")
 
 
 def _session_close(reason: str) -> None:
@@ -3092,11 +3176,7 @@ def _acquire_session(cfg: dict):
     # ★[2026-08-05 外審第 4 輪 P1-03] 先把上次關不掉的收乾淨★
     #   放在這裡是因為它是每一輪查詢的必經之路,而且此刻我們正要開新的 session ——
     #   不先收,隱藏桌面上就會同時有兩個登入中的 HIS。
-    try:
-        _retry_unclosed_sessions()
-    except Exception:
-        logging.debug("[session] 重試關閉掛帳 session 時出錯(不影響本輪)",
-                      exc_info=True)
+    _ensure_no_unmanaged_sessions()
     stale = None
     with _session_lock:
         sess = _psession
@@ -3125,13 +3205,59 @@ def _acquire_session(cfg: dict):
     return sess if sess is not None else _cold_start_session(cfg)
 
 
+def _consult_form_dismissed(hwnd: int) -> bool:
+    """會診單這一張表單是不是已經不在畫面上了。
+
+    ★這裡看可見性是【對的】★ 與 `_window_destroyed` 的情境相反:Delphi 的
+    modal form 關閉後只是 Hide(e348d27 教訓),所以對「這張表單還擋在畫面上嗎」
+    來說,「看不見了」就是答案。而 `_window_destroyed` 回答的是「HIS session
+    關掉了嗎」—— 那裡看不見【不能】當成關掉了。同一個 API、不同的問題。
+
+    查不到 → False(不知道就不宣稱已經退回主畫面)。
+    """
+    try:
+        if not win32gui.IsWindow(hwnd):
+            return True
+        return not win32gui.IsWindowVisible(hwnd)
+    except Exception:
+        logging.debug("[session] 查詢會診視窗狀態失敗 hwnd=%s", hwnd, exc_info=True)
+        return False
+
+
+def _main_ready_for_next_cycle(sess) -> str:
+    """主畫面是不是回到「可以再下一次命令」的狀態 → "" 表示可以,否則是原因。
+
+    ★[2026-08-05 外審第 5 輪 P2-02]★ 舊版只確認「看不到會診視窗了」就宣布
+    session 續留。會診視窗收掉、但主畫面被另一個 modal 擋住時,那句「續留」是
+    錯的 —— 要等到下一輪送命令沒反應才會在更晚、更難查的地方失敗。
+    `IsWindowEnabled` 正是「被 modal 擋住」的正規訊號(見
+    `_wait_main_window_after_login` 的既有說明)。
+    """
+    death = _session_death_reason(sess)
+    if death:
+        return death
+    try:
+        if not win32gui.IsWindowEnabled(sess.main_hwnd):
+            return "主畫面被 modal 對話框擋住(disabled)"
+    except Exception:
+        return "無法查詢主畫面是否可操作"
+    return ""
+
+
 def _return_to_main(sess, consult_hwnd) -> None:
     """按「回」退回主畫面(後備:WM_CLOSE=右上角X)。
 
     ★關不掉 → 收掉 session、下一輪冷啟動,但絕不拋例外★——查詢本身已成功,
     不能因退場失敗把已到手的結果丟掉、更不能觸發整套殺掉重啟再查一次。
-    Delphi modal form 關閉後只是 Hide(e348d27 教訓)→ find_windows 預設
-    visible_only=True,用「看不見了」當關閉判準恰好正確。"""
+
+    ★[2026-08-05 外審第 5 輪 P1-01/P2-02] 只看【我們這一張】會診單★
+    舊版判準是 `not find_windows(CONSULT_CLASS, pids=sess.our_pids)` ——
+    「污染的 PID 集合裡看不到任何會診視窗」。兩個方向都會錯:
+      * 醫師自己開著一張會診單 → 我們這張明明關掉了,卻永遠等不到「都沒有」
+        → 誤判退場失敗 → 收掉一個健康的 session、下一輪重新送帳密。
+      * 反之亦然(我們這張還在、別人的先消失)不會被發現。
+    改成只觀察 `consult_hwnd` 這一個 handle,並且確認主畫面真的回到可操作。
+    """
     try:
         back = find_child(consult_hwnd, "TButton", "回")
         if back:
@@ -3140,18 +3266,28 @@ def _return_to_main(sess, consult_hwnd) -> None:
             win32gui.PostMessage(consult_hwnd, win32con.WM_CLOSE, 0, 0)
         deadline = time.time() + 8
         while time.time() < deadline:
-            if not find_windows(CONSULT_CLASS, pids=sess.our_pids):
-                logging.info("[session] 已退回主畫面,session 續留")
-                return
+            if _consult_form_dismissed(consult_hwnd):
+                break
             time.sleep(0.3)
-        win32gui.PostMessage(consult_hwnd, win32con.WM_CLOSE, 0, 0)
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            if not find_windows(CONSULT_CLASS, pids=sess.our_pids):
-                logging.info("[session] 以 WM_CLOSE(=右上角X) 退回主畫面,"
-                             "session 續留")
+        else:
+            win32gui.PostMessage(consult_hwnd, win32con.WM_CLOSE, 0, 0)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if _consult_form_dismissed(consult_hwnd):
+                    logging.info("[session] 以 WM_CLOSE(=右上角X) 收掉會診單")
+                    break
+                time.sleep(0.3)
+            else:
+                _session_close_if_current(
+                    sess, "會診視窗關不掉(退場失敗) → 下一輪冷啟動")
                 return
-            time.sleep(0.3)
+        not_ready = _main_ready_for_next_cycle(sess)
+        if not_ready:
+            _session_close_if_current(
+                sess, f"會診單已收掉,但主畫面沒回到可操作狀態:{not_ready}")
+            return
+        logging.info("[session] 已退回主畫面,session 續留")
+        return
     except Exception:
         logging.warning("[session] 退回主畫面時例外", exc_info=True)
     _session_close_if_current(sess, "會診視窗關不掉(退場失敗) → 下一輪冷啟動")
@@ -3160,16 +3296,44 @@ def _return_to_main(sess, consult_hwnd) -> None:
 def _query_cycle(sess, cfg: dict, roster_label: str) -> tuple:
     """在既有 session 上跑一輪:選單→會診單→截圖/擷取→退回主畫面。
     回傳 (截圖路徑, 擷取文字, 擷取HTML, roster_texts);失敗拋例外
-    (呼叫端 _automation_on_hidden 會殺掉重啟、重新登入一次)。"""
-    mains = find_windows(MAIN_CLASS, pids=sess.our_pids)
-    if not mains:
-        raise RuntimeError("常駐 session 的主畫面不見了(疑似被院方強制登出)")
-    main_hwnd = mains[0]
+    (呼叫端 _automation_on_hidden 會殺掉重啟、重新登入一次)。
+
+    ★[2026-08-05 外審第 5 輪 P1-01] 操作面也必須用確切身分★
+    上一批(批次S)把【判活】與【收尾】改成用 `sess.main_hwnd`,卻把這裡漏掉了 ——
+    真正送出命令的那一行仍然是:
+
+        mains = find_windows(MAIN_CLASS, pids=sess.our_pids)
+        main_hwnd = mains[0]          # ← 列舉順序決定的「第一個」
+
+    而實機 log 已證實 `our_pids` 每一次登入都混著醫師自己的 systemftp
+    (`登入視窗 hwnd=... pid=[8036, 16276]`,三次登入三次都要在收尾時排除一個)。
+    於是可能發生:**用確切身分確認自己的 session 健康,下一行卻從污染的集合裡
+    挑出醫師正在用的那個 HIS,對它送出「我的會診清單」命令** —— 醫師畫面會
+    自己跳出會診單,我們還會把他螢幕上的病人清單擷取下來寄出去。
+
+    會診視窗同理:`hits[0]` 會撿到醫師自己已經開著的會診單。改成只認
+    【本次命令送出【之後】才出現、而且屬於我們主畫面那個行程】的視窗。
+    """
+    # ★操作之前先確認手上這個 session 還是我們那一個★(判活與操作不可脫節)
+    death = _session_death_reason(sess)
+    if death:
+        raise RuntimeError(f"開始查詢前 session 已不可用:{death}")
+    main_hwnd = sess.main_hwnd
+    owner_pid = sess.main_pid
     cmd_id = resolve_menu_command_id(main_hwnd)
     if cmd_id is None:
         raise RuntimeError(
             "無法確認「我的會診清單」選單命令(疑似住院醫囑系統改版),"
             "本次中止以免對醫囑系統送出不明命令")
+    # ★命令送出【前】的既有會診視窗要先記下來★ 之後只認新出現的那一個。
+    #   候選集用 `owner_pid`(我們登入的那個行程),不是 `our_pids`。
+    before_consults = set(find_windows(CONSULT_CLASS, pids={owner_pid},
+                                       visible_only=False))
+    if before_consults:
+        # 上一輪沒有退回主畫面。不當成本輪結果(那是舊資料),照樣往下走 ——
+        # 若命令沒有生出新視窗就會逾時,交給既有的恢復路徑。
+        logging.warning("[session] 送命令前已有 %d 個會診視窗(上一輪未退回主畫面)"
+                        " → 本輪只採認新出現的那一個", len(before_consults))
     win32gui.PostMessage(main_hwnd, win32con.WM_COMMAND, cmd_id, 0)
     logging.info("已送出選單命令（id=%s）", cmd_id)
     consult = None
@@ -3177,7 +3341,9 @@ def _query_cycle(sess, cfg: dict, roster_label: str) -> tuple:
     while time.time() < deadline:
         if not running.is_set():
             raise RuntimeError("流程已被中止")
-        hits = find_windows(CONSULT_CLASS, pids=sess.our_pids)
+        hits = [h for h in find_windows(CONSULT_CLASS, pids={owner_pid},
+                                        visible_only=False)
+                if h not in before_consults]
         if hits:
             consult = hits[0]
             break
@@ -4389,9 +4555,14 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                 #   （新的一輪正在做同一件事），但必須走完下面的終局收尾。
                 # [2026-08-03] HISStartupBlocked（BDE 起不來）同樣 fatal：重試
                 # 沒有意義，而且它與帳密無關 → log 也不能沿用「帳密」那句措辭。
+                # [2026-08-05 外審第 5 輪 P1-02] UnmanagedSessionError 也是 fatal:
+                #   帳上有關不掉的 session 時,重試三次只是再撞三次同一道閘門,
+                #   而且每次都會多等一輪 backoff。等下一輪排程重試就好。
                 fatal = isinstance(e, (LoginNotCompleted, JobSuperseded,
-                                       HISStartupBlocked))
-                if isinstance(e, JobSuperseded):
+                                       HISStartupBlocked, UnmanagedSessionError))
+                if isinstance(e, UnmanagedSessionError):
+                    logging.error("會診查詢:%s", e)
+                elif isinstance(e, JobSuperseded):
                     logging.error("會診查詢：%s", e)
                 elif isinstance(e, HISStartupBlocked):
                     logging.error("會診查詢:住院醫囑系統起不來 → 不重試"
