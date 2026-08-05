@@ -112,8 +112,11 @@ def test_poll_no_new_path_prunes_baseline():
     i_new = src.index("_new = ")          # 只錨變數名，右手邊怎麼算都可以
     i_ret = src.index("return", i_new)
     seg = src[i_new:i_ret]
-    assert "_save_notified(_poll_sig)" in seg, \
+    # [2026-08-05 外審第 6 輪 P2-01] 基準寫入統一走 eligibility 入口
+    assert "_save_notified_if_eligible(" in seg, \
         "無新會診時也要把離開清單者從基準剪除（否則再會診永不通知）"
+    assert "_save_notified(_poll_sig)" not in seg, \
+        "剪枝不可繞過 eligibility 入口(未確認的短清單會剪掉還在的會診)"
 
 
 # ── 會診：連續失敗要有人知道 ────────────────────────────────────────────────

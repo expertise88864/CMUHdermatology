@@ -506,8 +506,37 @@ def _consult_id_from_row(row: str) -> str:
 
 
 def _chart_of_consult_id(consult_id: str) -> str:
-    """從識別字串取回病歷號（升級時要拿它跟舊基準比對）。純函式。"""
-    return (consult_id or "").split("|", 1)[0]
+    """從識別字串取回病歷號（升級時要拿它跟舊基準比對）。純函式。
+
+    [2026-08-05 外審第 6 輪 P1-01] 同一識別的第 2 份會帶 "#n" 序號
+    (見 `_with_occurrence_suffixes`),取病歷號時要把它剝掉。
+    """
+    head = (consult_id or "").split("|", 1)[0]
+    return head.split("#", 1)[0]
+
+
+def _with_occurrence_suffixes(ids: list) -> set:
+    """[2026-08-05 外審第 6 輪 P1-01] 同一識別出現第 2 次起加 "#序號"。
+
+    ★兩列一模一樣的會診,集合不可以把第二張吸收掉★
+    上一批把 radio 的去重從「文字」改成「控制項」,第二列已經能活到這裡 ——
+    但這裡回傳 `set`,`{"A|8/5|10:30", "A|8/5|10:30"}` 仍然只剩一筆,
+    `_new_consult_ids` 的相減就看不到第二張 → 漏寄,而且無聲。
+
+    ★為什麼是「每個識別自己數」而不是「清單位置」★
+    位置相依的 occurrence 在任何一張會診被回覆離開清單時全體位移 → 整份誤判成
+    「新的」→ 重寄整份。以識別字串為鍵各自計數,別張會診的來去不影響這一張:
+        1 張 → {"A"}          2 張 → {"A", "A#2"}
+    第二張出現 = 差集多出 "A#2" = 一張新會診;回到 1 張 = 差集為空,剪枝自然收斂。
+    檔案格式仍是字串集合,舊基準不需要遷移。
+    """
+    counts: dict = {}
+    out = set()
+    for cid in ids:
+        n = counts.get(cid, 0) + 1
+        counts[cid] = n
+        out.add(cid if n == 1 else f"{cid}#{n}")
+    return out
 
 
 def _consult_signature_from_roster(roster_texts) -> set:
@@ -520,19 +549,20 @@ def _consult_signature_from_roster(roster_texts) -> set:
 
     ★[2026-08-04 外審 P1-04] 這裡以前只回病歷號★ —— 同一病人的第二張會診會被
     集合吸收掉而漏寄。詳見 `_consult_id_from_row`。"""
-    out: set = set()
+    ids: list = []
     for row in (roster_texts or []):
         cid = _consult_id_from_row(row)
         if cid:
-            out.add(cid)
+            ids.append(cid)
         else:
             # ★解析不到 → 保留舊行為:掃出該列【全部】病歷號★
             #   實機上會有整塊文字被當成一列傳進來(見
             #   test_poll_first_startup_builds_baseline_silently 的 fixture)，
             #   只取第一個會把後面的會診整個丟掉 —— 那是漏寄，比識別粒度不夠
             #   更嚴重。這條路沒有日期/時間可用，維持病歷號粒度。
-            out.update(_CHART_RE.findall((row or "").strip()))
-    return out
+            ids.extend(_CHART_RE.findall((row or "").strip()))
+    # ★[外審第 6 輪 P1-01] 重複的識別以 "#n" 存活★(見 _with_occurrence_suffixes)
+    return _with_occurrence_suffixes(ids)
 
 
 # 行程內的權威基準:即使檔案寫入失敗(磁碟滿/權限),記憶體仍記得已通知過誰 → 下一輪 poll 不會
@@ -648,6 +678,23 @@ def _baseline_initialized() -> bool:
     if _notified_initialized is None:
         _load_notified()   # 順帶載入 _notified_initialized
     return bool(_notified_initialized)
+
+
+def _save_notified_if_eligible(roster_texts, ids: set, *, reason: str) -> bool:
+    """★基準的唯一合法入口★(2026-08-05 外審第 6 輪 P2-01)
+
+    上一批加了 `_may_update_baseline`,但只守住「寄信成功後」那一個寫入點;
+    「首次安裝建基準」與「無新會診剪枝」兩條路仍直接呼叫 `_save_notified` ——
+    一份【沒被確認過】的清單照樣能建立/剪出基準:
+      * 首次安裝:過期清單建的基準少一筆沒關係(下一輪會補寄),但語意上
+        不該用沒確認的資料「宣稱這些都處理過了」
+      * 剪枝:用過期的短清單剪 → 還在清單上的會診被剪掉 → 之後又變「新」→ 重寄
+    """
+    if not _may_update_baseline(roster_texts):
+        logging.warning("[會診] 本輪清單未經回讀確認 → 不%s(下一輪重新比對)", reason)
+        return False
+    _save_notified(ids)
+    return True
 
 
 def _save_notified(charts: set) -> None:
@@ -4834,9 +4881,13 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                             if _why == "first_install":
                                 # [2026-06-25 user] 第一次啟動還沒建過基準 → 開機這輪只建
                                 # 基準、不寄,避免每次重啟收一封「全部未回覆清單」的信。
-                                _save_notified(_poll_sig)
-                                logging.info("[poll] 首次建立會診基準(%d 筆),本輪不寄信",
-                                             len(_poll_sig))
+                                # [外審第 6 輪 P2-01] 未經確認的清單不建基準(下輪再建)。
+                                if _save_notified_if_eligible(
+                                        roster_texts, _poll_sig,
+                                        reason="建立首次基準"):
+                                    logging.info(
+                                        "[poll] 首次建立會診基準(%d 筆),本輪不寄信",
+                                        len(_poll_sig))
                                 _note_job_success()   # [codex] 這是【成功】跑完的一輪
                                 return
                             # ★[2026-08-04 外審 P1-05] 基準遺失/損毀不可以靜默吞掉★
@@ -4869,9 +4920,13 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                             # 本來就是這樣剪枝的 → 兩條路徑語意一致,不引入新的重寄風險;
                             # 且此處必然是清單解析成功的分支(解析失敗走 fail-open 不更新基準)。
                             if _poll_sig != _load_notified():
-                                _save_notified(_poll_sig)
-                                logging.info("[poll] 已回覆離開清單的會診從基準剪除"
-                                             "(日後同一床再會診才通知得到)")
+                                # [外審第 6 輪 P2-01] 未確認的短清單不可拿來剪枝:
+                                # 還在清單上的會診被剪掉 → 之後又變「新」→ 重寄。
+                                if _save_notified_if_eligible(
+                                        roster_texts, _poll_sig, reason="剪枝"):
+                                    logging.info(
+                                        "[poll] 已回覆離開清單的會診從基準剪除"
+                                        "(日後同一床再會診才通知得到)")
                             logging.info("[poll] 目前 %d 筆會診都已通知過,無新會診 → 不寄信",
                                          len(_poll_sig))
                             # [codex] 「跑成功但沒有新會診」是【健康】的一輪,必須清零
@@ -4953,9 +5008,12 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                 #   是兩個問題。截圖後回讀失敗時內容仍可信(照寄),但我們沒有
                 #   確認過它仍代表當下 → 不可以宣稱這些都已經通知過。
                 #   見 `_may_update_baseline` / `_RosterSnapshot.as_unverified`。
-                if trigger_label != "email" and _may_update_baseline(roster_texts):
+                if trigger_label != "email":
                     try:
-                        _save_notified(_consult_signature_from_roster(roster_texts))
+                        _save_notified_if_eligible(
+                            roster_texts,
+                            _consult_signature_from_roster(roster_texts),
+                            reason="更新已通知基準")
                     except Exception:
                         logging.debug("更新 consult_notified 失敗", exc_info=True)
                 # ★[2026-07-30 外審第 2/3 輪] 已經親自寄給這些醫師 → 撤掉補跑佇列裡

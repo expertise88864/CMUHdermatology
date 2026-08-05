@@ -527,30 +527,23 @@ class TestThreeStatesNotTwo:
 
 
 def test_the_baseline_write_site_uses_the_eligibility_check():
-    """★接線★ 存基準那一處必須問 `_may_update_baseline`。
+    """★接線★ 存基準必須全部走 `_save_notified_if_eligible`。
 
-    上面那些測試直接呼叫函式；若 `_do_full_job` 還是寫
-    `roster_texts is not None`，它們照樣全綠，而未確認的快照仍會更新基準。
+    ★這支在外審第 6 輪被升級★:第一版只驗「存在至少一個受保護的寫入點」——
+    而缺陷在另外兩個寫入點(首次安裝、剪枝)。「存在一個」的判準會被
+    「修對一處」滿足;要的是【逐一盤點】。完整盤點在
+    test_consult_multiset_2026_08_05.py,這裡守住「不再有裸的寫入」。
     """
     import ast
     import inspect
     import textwrap
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(cq._do_full_job)))
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If):
-            continue
-        calls = {n.func.id for n in ast.walk(node)
-                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-        if "_save_notified" not in calls:
-            continue
-        guard = {n.func.id for n in ast.walk(node.test)
-                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-        if "_may_update_baseline" in guard:
-            return
-    raise AssertionError(
-        "★更新基準的守衛還是舊的 `roster_texts is not None`★ "
-        "未確認的快照仍會被當成「已通知」")
+    calls = {n.func.id for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "_save_notified_if_eligible" in calls
+    assert "_save_notified" not in calls, (
+        "★又出現裸的 _save_notified★ 未確認的清單能改動基準")
 
 
 class TestTheObserveWindowStartsFromTheLastChange:

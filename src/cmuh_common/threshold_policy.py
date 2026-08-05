@@ -2,6 +2,7 @@
 """Doctor alert threshold policy helpers."""
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
@@ -88,9 +89,19 @@ def build_doctor_threshold_map(doctor_name: str, threshold_settings: dict | None
     for session_key, cfg_key in pairs:
         raw = ts.get(cfg_key, DEFAULT_THRESHOLDS.get(cfg_key))
         try:
-            out[session_key] = int(raw)
+            value = int(raw)
         except (TypeError, ValueError):
             continue
+        # ★[2026-08-05 外審第 6 輪 P2-04] 執行期也要驗範圍★
+        #   設定頁的驗證只擋得住「現在存進去的」;舊版曾存下的 0、使用者手改
+        #   JSON 的 -1、損壞檔案裡的異常值,都是從這裡直接生效 —— 而門檻 ≤
+        #   margin(10) 會讓提醒恆真(count >= 門檻-10)。與 UI 用同一組界線,
+        #   不合法的當成「這個診次沒有門檻」並記 log(不靜默改成別的數字)。
+        if not MIN_THRESHOLD <= value <= MAX_THRESHOLD:
+            logging.warning("[threshold] %s=%r 不在合理範圍(%d–%d) → 本診次視為未設門檻",
+                            cfg_key, raw, MIN_THRESHOLD, MAX_THRESHOLD)
+            continue
+        out[session_key] = value
     return out
 
 
