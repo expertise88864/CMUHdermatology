@@ -4151,12 +4151,17 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
         # 第 3 次撞上恢復視窗的機率變大。三次總時長 6→8 分鐘 (僅多 2 分鐘)。
         BACKOFF_SCHEDULE = [3, 30, 90]
         for attempt in range(1, retry_count + 1):
+            # ★[2026-08-05 外審第 4 輪 P1-10]★ 這一輪的 HIS 那一段做完了沒有。
+            #   做完之後才失敗的(組信、附截圖、SMTP/Outlook)都與 HIS 無關 ——
+            #   見下面重試分支的說明。每次 attempt 都要重設。
+            his_stage_done = False
             try:
                 logging.info("會診查詢任務 第 %d/%d 次嘗試（trigger=%s, 收件人組=%s, mail=%s）",
                              attempt, retry_count, trigger_label,
                              recipients_label, mail_method)
                 shot, extracted_text, extracted_html, roster_texts = run_consult_flow(
                     trigger_label)
+                his_stage_done = True     # 這裡之後的失敗都不是 HIS 的問題
                 # [2026-06-25] 輪詢 poll:只在「出現新病歷號」時才寄;否則靜默結束
                 # (不寄、不更新基準 → 下一輪仍會再比對)。email/手動觸發不受此限,照常無條件寄。
                 _poll_extract_note = ""
@@ -4324,10 +4329,22 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     backoff = (BACKOFF_SCHEDULE[attempt - 1]
                                if attempt - 1 < len(BACKOFF_SCHEDULE)
                                else BACKOFF_SCHEDULE[-1])
-                    logging.info(
-                        "殺 systemftp.exe 後重試（sleep %d 秒，exponential backoff）",
-                        backoff)
-                    _kill_systemftp(job_before_pids)
+                    # ★[2026-08-05 外審第 4 輪 P1-10] 寄信失敗不可以重置 HIS session★
+                    #   `_kill_systemftp` 現在做的是 `_session_close(...)` —— 收掉
+                    #   常駐登入。但它掛在【所有】可重試錯誤上,包括組信/截圖/SMTP:
+                    #       會診查完(HIS 一切正常) → SMTP timeout → 收掉登入
+                    #       → 下一次 attempt 冷啟動 → ★再送一次帳密★
+                    #   帳密重送正是這幾批一路在防的事,而失敗根本不在 HIS 這一側。
+                    #   HIS 那一段做完之後才失敗 → 保留 session,只重試寄信。
+                    if his_stage_done:
+                        logging.info(
+                            "失敗發生在【寄信/組信】階段(HIS 這一段已完成) → "
+                            "保留常駐登入,只重試寄信(sleep %d 秒)", backoff)
+                    else:
+                        logging.info(
+                            "殺 systemftp.exe 後重試（sleep %d 秒，exponential backoff）",
+                            backoff)
+                        _kill_systemftp(job_before_pids)
                     time.sleep(backoff)
                 else:
                     if isinstance(last_err, JobSuperseded):
