@@ -289,3 +289,53 @@ def test_the_login_wait_clears_blockers_before_clicking_the_notice():
         "★登入等待迴圈沒有處理擋路的對話框★ 會對 disabled 的通知視窗一直按")
     assert notice_at is not None, "找不到通知視窗的處理（測試失效了）"
     assert dismiss_at < notice_at, "要先清掉擋路的對話框，再處理通知視窗"
+
+
+class TestDelphiInfrastructureWindowsAreNotDialogs:
+    """★[2026-08-05 實機] `TApplication` 不是對話框★
+
+    每個 Delphi 程式都有一個 class 為 `TApplication` 的隱形擁有者視窗：
+    有 WS_VISIBLE、永遠 enabled、**沒有任何按鈕**。第一版把它算成「擋路的
+    對話框」，於是每一輪都印一行「有擋路的對話框但沒有可按的按鈕」。
+
+    實害只有雜訊（它沒有按鈕，本來就不會被按），但 log 是我們唯一的實機診斷
+    管道 —— 2026-07-29 那次 1,568 行幾乎全是同一句的教訓還在。
+    """
+
+    def _machine(self, monkeypatch, windows):
+        by_hwnd = {h: (c, en) for h, c, en in windows}
+        monkeypatch.setattr(cq, "find_windows",
+                            lambda cls=None, pids=None, **k: list(by_hwnd))
+        monkeypatch.setattr(cq.win32gui, "IsWindowEnabled",
+                            lambda h: by_hwnd[h][1])
+        monkeypatch.setattr(cq.win32gui, "GetClassName",
+                            lambda h: by_hwnd[h][0])
+
+    def test_tapplication_is_ignored(self, monkeypatch):
+        self._machine(monkeypatch, [(1, "TApplication", True),
+                                    (2, cq.MAIN_CLASS, True)])
+        assert cq._blocking_dialogs({17288}) == [], (
+            "★Delphi 的隱形擁有者視窗被當成擋路的對話框★ 每輪都會多一行雜訊")
+
+    def test_a_real_dialog_next_to_it_is_still_found(self, monkeypatch):
+        """★反方向:不可以因此漏掉真的對話框★"""
+        self._machine(monkeypatch, [(1, "TApplication", True),
+                                    (2, cq.NOTICE_CLASS, True),
+                                    (3, cq.MAIN_CLASS, False)])
+        assert cq._blocking_dialogs({17288}) == [(2, cq.NOTICE_CLASS)]
+
+    def test_the_unknown_dialog_warning_is_throttled(self, monkeypatch,
+                                                     caplog):
+        """同一個 class 只講一次 —— 這個迴圈每 0.4 秒跑一次。"""
+        import logging as _lg
+        self._machine(monkeypatch, [(9, "TSomethingNew", True)])
+        monkeypatch.setattr(cq, "enum_children", lambda _h: [])
+        monkeypatch.setattr(cq, "_reported_unknown_dialogs", set())
+
+        with caplog.at_level(_lg.WARNING):
+            for _ in range(5):
+                cq._dismiss_blocking_modals(pids={17288})
+
+        hits = [r for r in caplog.records if "沒有可按的按鈕" in r.getMessage()]
+        assert len(hits) == 1, f"同一個 class 講了 {len(hits)} 次 → log 會被洗掉"
+        assert "TSomethingNew" in hits[0].getMessage()

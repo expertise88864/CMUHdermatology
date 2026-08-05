@@ -3401,7 +3401,18 @@ def _main_ready_for_next_cycle(sess, *, sleep=None, now=None) -> str:
 
 
 # 這些是「內容視窗」,不是擋路的對話框 —— 它們被擋住的時候是 disabled 的。
-_CONTENT_CLASSES = frozenset({MAIN_CLASS, LOGIN_CLASS, CONSULT_CLASS})
+#
+# ★TApplication 是 Delphi 的基礎建設視窗,不是對話框★(2026-08-05 實機)
+#   每個 Delphi 程式都有一個 class 為 `TApplication` 的隱形擁有者視窗,
+#   它有 WS_VISIBLE、永遠 enabled、而且【沒有任何按鈕】。第一版把它算成
+#   「擋路的對話框」,於是每一輪都印一行「有擋路的對話框但沒有可按的按鈕」——
+#   那是雜訊,而 log 正是我們唯一的實機診斷管道,不能讓它被固定雜訊淹掉。
+#   (實害只有雜訊:它沒有按鈕,所以本來就不會被按。)
+_CONTENT_CLASSES = frozenset({MAIN_CLASS, LOGIN_CLASS, CONSULT_CLASS,
+                              "TApplication"})
+
+# 「不認得的對話框」警告:同一個 class 只講一次,不要每 0.4 秒刷一行。
+_reported_unknown_dialogs: set = set()
 # 只按這些字樣的按鈕。★絕不盲按★:不認得的對話框只記下它有哪些按鈕,不出手。
 _AFFIRMATIVE_CAPTIONS = ("確認", "確定", "OK", "Ok", "是", "繼續")
 
@@ -3473,9 +3484,13 @@ def _dismiss_blocking_modals(sess=None, *, pids=None) -> int:
             continue
         target = next((h for h, t in buttons if t in _AFFIRMATIVE_CAPTIONS), None)
         if target is None:
-            logging.warning("[session] 有擋路的對話框但沒有可按的按鈕 —— "
-                            "class=%s 按鈕=%s(不盲按,請回報這一行)",
-                            cls, [t for _h, t in buttons])
+            # 同一個 class 只講一次:這個迴圈每 0.4 秒跑一次,不節流會把 log 洗掉
+            # (2026-07-29 就發生過 1,568 行幾乎全是同一句的實機 log)。
+            if cls not in _reported_unknown_dialogs:
+                _reported_unknown_dialogs.add(cls)
+                logging.warning("[session] 有擋路的對話框但沒有可按的按鈕 —— "
+                                "class=%s 按鈕=%s(不盲按,請回報這一行)",
+                                cls, [t for _h, t in buttons])
             continue
         click_button(target)
         clicked += 1
