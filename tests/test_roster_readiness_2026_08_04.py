@@ -13,6 +13,12 @@
 
 【修法】連續讀到相同才算穩定；逾時仍在變 → `roster_texts` 回 None，走既有的
 「判斷不了 → fail-open 照寄、但不更新基準」通道。
+
+★[2026-08-05 外審第 4 輪 P1-07/08/09]★ 本檔在這一輪擴充了三件事：
+  * 有內容的清單也要有最短觀察窗（原本只有空清單有）—— 見
+    `TestAPartialRosterIsNotAcceptedTooFast`
+  * 清單文字與 radio 控制項必須來自【同一次】列舉 —— 見 `TestOneSnapshot`
+  * 截圖要在清單穩定【之後】才拍 —— 見 `TestTheScreenshotMatchesTheList`
 """
 import os
 import sys
@@ -20,6 +26,18 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import consult_query as cq  # noqa: E402
+
+
+def _tree(texts):
+    """把清單文字造成一棵控制項樹（radio 文字要能被 _PATIENT_LABEL_RE 認得）。"""
+    return [(1000 + i, cq._PATIENT_RADIO_CLASS, t, (0, i * 20, 200, i * 20 + 18))
+            for i, t in enumerate(texts)]
+
+
+def _snap(texts):
+    """生產形狀的一次讀取結果：(children, radios, texts)。"""
+    children = _tree(texts)
+    return children, cq._find_patient_radios(children), list(texts)
 
 
 def _clock(step=0.25):
@@ -33,11 +51,16 @@ def _clock(step=0.25):
 
 
 def _scripted(reads):
-    """把一連串「每次讀到什麼」腳本化。用完後一直回最後一筆。"""
+    """把一連串「每次讀到什麼」腳本化。用完後一直回最後一筆。
+
+    ★回傳的是生產的形狀★（三元組），不是只有文字 —— `_await_stable_roster`
+    現在拿的是一整份快照（外審第 4 輪 P1-08）。
+    """
     seq = list(reads)
 
     def _read(_hwnd):
-        return seq.pop(0) if len(seq) > 1 else seq[0]
+        cur = seq.pop(0) if len(seq) > 1 else seq[0]
+        return _snap(cur)
     return _read
 
 
@@ -45,34 +68,35 @@ class TestLoadingIsNotMistakenForEmpty:
 
     def test_a_roster_that_appears_late_is_waited_for(self):
         """★審查點名的情境★ 視窗先出現、2 秒後才有 radio。"""
-        reads = [[], [], ["甲C16(1)1111111"], ["甲C16(1)1111111"],
-                 ["甲C16(1)1111111"]]
-        got, stable = cq._await_stable_roster(
-            1, read=_scripted(reads), sleep=lambda _s: None, now=_clock())
+        pt = ["甲C16(1)1111111"]
+        snap = cq._await_stable_roster(
+            1, read=_scripted([[], [], pt, pt, pt]),
+            sleep=lambda _s: None, now=_clock())
 
-        assert stable is True
-        assert got == ["甲C16(1)1111111"], f"沒等到載入完成：{got}"
+        assert snap.stable is True
+        assert snap.texts == pt, f"沒等到載入完成：{snap.texts}"
 
     def test_a_roster_that_grows_is_waited_for(self):
         """先出現 2 位、稍後增至 4 位 —— 不可以拿 2 位那份去更新基準。"""
         two = ["甲1111111", "乙2222222"]
         four = two + ["丙3333333", "丁4444444"]
-        got, stable = cq._await_stable_roster(
+        snap = cq._await_stable_roster(
             1, read=_scripted([two, four, four, four]),
             sleep=lambda _s: None, now=_clock())
 
-        assert stable is True and got == four, f"拿到 partial roster：{got}"
+        assert snap.stable is True and snap.texts == four, (
+            f"拿到 partial roster：{snap.texts}")
 
     def test_a_genuinely_empty_roster_is_accepted(self):
         """★反方向:真的沒有病人也要判得出來★
 
         否則沒有病人的時段永遠「判斷不了」→ 每輪都 fail-open 寄信，變成天天洗信箱。
         """
-        got, stable = cq._await_stable_roster(
+        snap = cq._await_stable_roster(
             1, read=_scripted([[], [], [], []]), sleep=lambda _s: None,
             now=_clock())
 
-        assert stable is True and got == [], (
+        assert snap.stable is True and snap.texts == [], (
             "空清單也要能被判定成穩定，否則沒病人時每輪都會寄信")
 
     def test_an_endlessly_changing_roster_is_reported_unstable(self,
@@ -82,7 +106,7 @@ class TestLoadingIsNotMistakenForEmpty:
 
         def _read(_hwnd):
             n["i"] += 1
-            return [f"病人{n['i']}"]        # 每次都不一樣
+            return _snap([f"病人{n['i']}C16(1)111111{n['i']}"])
 
         ticks = {"t": 0.0}
 
@@ -91,10 +115,9 @@ class TestLoadingIsNotMistakenForEmpty:
             return ticks["t"]
         monkeypatch.setattr(cq.time, "monotonic", _mono)
 
-        _got, stable = cq._await_stable_roster(
-            1, read=_read, sleep=lambda _s: None)
+        snap = cq._await_stable_roster(1, read=_read, sleep=lambda _s: None)
 
-        assert stable is False, "一直在變卻回報穩定"
+        assert snap.stable is False, "一直在變卻回報穩定"
 
 
 class TestTheUnstableRosterGoesDownTheFailOpenChannel:
@@ -110,11 +133,9 @@ class TestTheUnstableRosterGoesDownTheFailOpenChannel:
 
     def test_extract_returns_none_when_unstable(self, monkeypatch):
         """接線:不穩定時 `_extract_consult_text` 的第三個回傳必須是 None。"""
-        monkeypatch.setattr(cq, "_await_stable_roster",
-                            lambda *a, **k: (["甲1111111"], False))
-        monkeypatch.setattr(cq, "enum_children", lambda _h: [])
-        monkeypatch.setattr(cq, "_is_visible_below", lambda *a: True)
-        monkeypatch.setattr(cq, "_find_patient_radios", lambda _c: [])
+        monkeypatch.setattr(
+            cq, "_await_stable_roster",
+            lambda *a, **k: cq._RosterSnapshot(["甲1111111"], False, [], []))
         monkeypatch.setattr(cq, "_find_text_panes", lambda _c: [])
 
         _t, _h, roster_texts = cq._extract_consult_text(1, {})
@@ -124,11 +145,9 @@ class TestTheUnstableRosterGoesDownTheFailOpenChannel:
 
     def test_extract_returns_the_list_when_stable(self, monkeypatch):
         """★反方向:穩定時要正常回報★ 否則基準永遠不更新、每輪都重寄。"""
-        monkeypatch.setattr(cq, "_await_stable_roster",
-                            lambda *a, **k: (["甲1111111"], True))
-        monkeypatch.setattr(cq, "enum_children", lambda _h: [])
-        monkeypatch.setattr(cq, "_is_visible_below", lambda *a: True)
-        monkeypatch.setattr(cq, "_find_patient_radios", lambda _c: [])
+        monkeypatch.setattr(
+            cq, "_await_stable_roster",
+            lambda *a, **k: cq._RosterSnapshot(["甲1111111"], True, [], []))
         monkeypatch.setattr(cq, "_find_text_panes", lambda _c: [])
 
         _t, _h, roster_texts = cq._extract_consult_text(1, {})
@@ -141,17 +160,24 @@ def test_the_extraction_actually_waits():
 
     上面幾支直接呼叫 `_await_stable_roster`。若 `_extract_consult_text` 仍然
     單次讀取，它們照樣全綠 —— 而那正是 bug 還在的樣子。
+
+    ★[2026-08-05] 現在允許呼叫端把已經等好的快照傳進來★（截圖必須排在穩定
+    之後、擷取之前）。所以判準是「要嘛自己等、要嘛收下別人等好的」，
+    不可以兩者皆非。
     """
     import ast
     import inspect
     import textwrap
 
-    tree = ast.parse(textwrap.dedent(
-        inspect.getsource(cq._extract_consult_text)))
+    src = textwrap.dedent(inspect.getsource(cq._extract_consult_text))
+    tree = ast.parse(src)
     called = {n.func.id for n in ast.walk(tree)
               if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     assert "_await_stable_roster" in called, (
         "擷取仍然單次讀清單 → 載入中的空/半份清單會被當成有效資料")
+    assert "settled" in {a.arg for a in ast.walk(tree)
+                         if isinstance(a, ast.arg)}, (
+        "沒有收下呼叫端等好的快照 → 截圖與清單會是不同時刻的")
 
 
 class TestAnEmptyRosterNeedsALongerLook:
@@ -169,93 +195,252 @@ class TestAnEmptyRosterNeedsALongerLook:
         """★這就是外審點名的情境★ 前 1.5 秒空，之後才出現病人。"""
         empties = [[] for _ in range(6)]          # 0.25s × 6 = 1.5 秒
         pt = ["甲C16(1)1111111"]
-        got, stable = cq._await_stable_roster(
+        snap = cq._await_stable_roster(
             1, read=_scripted(empties + [pt, pt, pt]),
             sleep=lambda _s: None, now=_clock())
 
-        assert stable is True
-        assert got == pt, (
-            f"★0.5 秒就把還沒載入的空清單當成『真的沒有會診』★：{got}")
+        assert snap.stable is True
+        assert snap.texts == pt, (
+            f"★0.5 秒就把還沒載入的空清單當成『真的沒有會診』★：{snap.texts}")
 
     def test_a_truly_empty_roster_is_accepted_after_the_longer_look(self):
         """★反方向:真的沒病人仍要判得出來★ 觀察夠久之後要回 stable。
 
         否則沒有病人的時段永遠「判斷不了」→ 每輪 fail-open 寄信＝天天洗信箱。
         """
-        got, stable = cq._await_stable_roster(
+        snap = cq._await_stable_roster(
             1, read=_scripted([[]]), sleep=lambda _s: None, now=_clock())
 
-        assert stable is True and got == [], (
+        assert snap.stable is True and snap.texts == [], (
             "觀察夠久之後空清單仍要能被接受")
 
-    def test_a_nonempty_roster_does_not_wait_the_extra_window(self):
-        """有內容就不必多等 —— 資料都出現了，不可能是『還沒載入』。
 
-        多等會把每一輪都拉長 3 秒，而常駐節奏是 3 分鐘一輪、還要維持 keepalive。
+class TestAPartialRosterIsNotAcceptedTooFast:
+    """★[2026-08-05 外審第 4 輪 P1-07]★ 有內容的清單也需要最短觀察窗。
+
+    ★這個檔案原本有一支測試把這個缺陷釘成了通過條件★
+    `test_a_nonempty_roster_does_not_wait_the_extra_window`，理由寫著
+    「有內容就不必等，資料都出現了，不可能是『還沒載入』」。
+
+    那句話只對【完全沒載入】成立，對【載到一半】完全不成立 —— Delphi 是逐列填
+    的，4 位只填出 2 位、然後停頓超過 0.5 秒（慢機器／後端慢很常見），就會拿
+    2 位那份當成最終清單存進基準 → 另外 2 位此後永遠不算「新」→ ★漏寄★。
+    而「漏寄」正是本檔開頭列出的失敗模式之一。
+    """
+
+    def test_a_stalled_partial_roster_is_not_taken_as_final(self):
+        """2 位卡住 0.5 秒（3 次相同讀取）→ 之後才補齊 4 位。不可以只拿 2 位。"""
+        two = ["甲1111111", "乙2222222"]
+        four = two + ["丙3333333", "丁4444444"]
+        # 2 位連續讀到 4 次（＝超過「連續三次相同」那道關），才長出 4 位
+        snap = cq._await_stable_roster(
+            1, read=_scripted([two, two, two, two, four, four, four, four]),
+            sleep=lambda _s: None, now=_clock())
+
+        assert snap.texts == four, (
+            f"★把載到一半的清單當成最終清單★ 少掉的兩位此後永遠不算新：{snap.texts}")
+
+    def test_a_nonempty_roster_still_settles_well_inside_the_timeout(self):
+        """★反方向:不可以變成每輪都等到逾時★
+
+        觀察窗只是「最短」，穩定之後就該回來。這裡確認有內容的清單不會被拖到
+        逾時（那會讓每一輪都吃滿 6 秒、而且回報 unstable ＝ 每輪 fail-open 寄信）。
         """
         pt = ["甲1111111"]
         reads = {"n": 0}
 
         def _read(_h):
             reads["n"] += 1
-            return pt
+            return _snap(pt)
 
-        got, stable = cq._await_stable_roster(
+        snap = cq._await_stable_roster(
             1, read=_read, sleep=lambda _s: None, now=_clock())
 
-        assert stable is True and got == pt
-        assert reads["n"] <= 4, (
-            f"有內容卻等了 {reads['n']} 次 —— 每輪都會被拖長")
+        assert snap.stable is True and snap.texts == pt
+        assert reads["n"] <= 10, f"有內容卻讀了 {reads['n']} 次"
+
+    def test_the_nonempty_window_is_shorter_than_the_empty_one(self):
+        """空清單的風險更高（會把基準剪成空 → 整份重寄），觀察窗要更長。"""
+        assert 0 < cq._ROSTER_MIN_OBSERVE < cq._ROSTER_EMPTY_MIN_OBSERVE
+        assert cq._ROSTER_MIN_OBSERVE > _clock_step_of_three_reads(), (
+            "最短觀察窗若小於『連續三次相同』本來就會花掉的時間，等於沒有加")
 
 
-class TestTheControlTreeIsReReadAfterSettling:
-    """★控制項樹要在清單穩定【之後】重取★（2026-08-04 自查 P1-A）
+def _clock_step_of_three_reads():
+    return cq._ROSTER_SETTLE_INTERVAL * (cq._ROSTER_SETTLE_READS - 1)
 
-    `children` 原本是進函式當下（T0）取的，而 `roster_texts` 來自
-    `_await_stable_roster`（T0→Tn）。清單在這段期間才長出來時：
 
-        roster_texts = Tn 的 4 位   → 信裡列 4 位、基準也存 4 筆
-        radios       = T0 的 1 位   → 逐病人內文只抓得到 1 位
+class TestOneSnapshot:
+    """★[2026-08-05 外審第 4 輪 P1-08]★ 清單文字與 radio 必須同源。
 
-    信與內文對不起來。★這是我加穩定性判定時引進的不一致★——改之前兩者同源。
+    以前是兩次列舉：穩定判定讀一次、擷取前再讀一次。中間長出一位病人時
+    信裡列 N 位、逐病人內文卻是 N±1 位，基準也只存到其中一份。
+
+    ★修法是「結構上不可能」而不是「事後再比對」★：一次列舉同時產出
+    children / radios / texts，三者必然是同一時刻的。
     """
 
-    def _tree(self, n):
-        """造出 n 位病人的控制項樹（radio 文字要能被 _ROSTER_ROW_RE 認得）。"""
-        return [(1000 + i, cq._PATIENT_RADIO_CLASS,
-                 f"病人{i}C16({i}){1000000 + i}(沈)06/25", (0, i * 20, 200, i * 20 + 18))
-                for i in range(n)]
-
-    def test_radios_come_from_the_settled_tree(self, monkeypatch):
-        settled = ["病人0C16(0)1000000(沈)06/25",
-                   "病人1C16(1)1000001(沈)06/25",
-                   "病人2C16(2)1000002(沈)06/25",
-                   "病人3C16(3)1000003(沈)06/25"]
+    def test_one_enumeration_produces_all_three(self, monkeypatch):
         calls = {"n": 0}
+        texts = ["甲C16(1)1111111", "乙C16(2)2222222"]
 
         def _enum(_h):
             calls["n"] += 1
-            # 第一次（T0）只有 1 位；之後（穩定後重取）有 4 位
-            return self._tree(1 if calls["n"] == 1 else 4)
-
+            return _tree(texts)
         monkeypatch.setattr(cq, "enum_children", _enum)
-        monkeypatch.setattr(cq, "_await_stable_roster",
-                            lambda *a, **k: (settled, True))
         monkeypatch.setattr(cq, "_is_visible_below", lambda *a: True)
-        monkeypatch.setattr(cq, "_find_text_panes", lambda _c: [])
+
+        children, radios, got = cq._read_roster_snapshot(1)
+
+        assert calls["n"] == 1, f"讀一份快照列舉了 {calls['n']} 次"
+        assert got == texts
+        assert len(radios) == len(texts)
+        assert children == _tree(texts)
+
+    def test_extract_uses_the_snapshot_radios_not_a_fresh_read(self,
+                                                               monkeypatch):
+        """★核心★ 擷取用的 radio 必須是快照裡那一份，不可以自己再列舉一次。
+
+        再列舉一次就等於把 P1-08 放回來：那一次讀到的可能已經多／少一位。
+        """
+        settled_texts = ["甲C16(1)1111111", "乙C16(2)2222222",
+                         "丙C16(3)3333333", "丁C16(4)4444444"]
+        snap_children = _tree(settled_texts)
+        snap_radios = cq._find_patient_radios(snap_children)
+
+        def _boom(_h):
+            raise AssertionError("★擷取又自己列舉了一次★ 清單與內文會對不起來")
+        monkeypatch.setattr(cq, "enum_children", _boom)
+        monkeypatch.setattr(
+            cq, "_await_stable_roster",
+            lambda *a, **k: cq._RosterSnapshot(
+                settled_texts, True, snap_children, snap_radios))
 
         seen = {}
-        real = cq._find_patient_radios
 
-        def _spy(children):
-            out = real(children)
-            seen["n"] = len(out)
-            return out
-        monkeypatch.setattr(cq, "_find_patient_radios", _spy)
+        def _panes(children):
+            seen["n"] = len(children)
+            return []
+        monkeypatch.setattr(cq, "_find_text_panes", _panes)
 
-        cq._extract_consult_text(1, {})
+        _t, _h, roster = cq._extract_consult_text(1, {})
 
-        assert seen.get("n") == 4, (
-            f"★radios 來自 T0 的舊樹（只有 {seen.get('n')} 位）★ "
-            "信裡會列 4 位、逐病人內文卻只有 1 位")
-        assert calls["n"] >= 2, "穩定之後沒有重取控制項樹"
+        assert roster == settled_texts
+        assert seen["n"] == len(snap_children), (
+            "文字面板是從另一棵樹找的 → 又不同源了")
+
+    def test_unpacking_it_as_a_pair_fails_loudly(self):
+        """★舊寫法必須當場爆掉，不可以靜默拿到一半★
+
+        `texts, stable = _await_stable_roster(...)` 若還能跑，children/radios
+        就會被留在別的時間點 —— 那正是 P1-08。
+        """
+        snap = cq._RosterSnapshot(["甲"], True, [], [])
+        try:
+            _a, _b = snap
+        except ValueError:
+            return
+        raise AssertionError("兩元素解包居然成功了 → 舊呼叫端會靜默拿到半份資料")
+
+
+class TestTheScreenshotMatchesTheList:
+    """★[2026-08-05 外審第 4 輪 P1-09]★ 截圖要拍在清單穩定【之後】。
+
+    原本是固定 `time.sleep(1.8)` 之後截圖，而清單是在那之【後】才等到穩定的：
+    信裡的清單是 Tn 的、附圖是 T0+1.8s 的 —— 醫師收到兩份互相矛盾的證據。
+    """
+
+    def test_capture_happens_after_settling(self):
+        order = []
+
+        def _settle(_h):
+            order.append("settle")
+            return cq._RosterSnapshot(["甲1111111"], True, [], [])
+
+        def _capture(_h):
+            order.append("capture")
+            return "IMG"
+
+        img, snap = cq._capture_with_settled_roster(
+            1, capture=_capture, settle=_settle,
+            read=lambda _h: ([], [], ["甲1111111"]))
+
+        assert order == ["settle", "capture"], order
+        assert img == "IMG" and snap.stable is True
+
+    def test_a_list_that_changes_after_the_shot_is_not_trusted(self):
+        """截圖之後清單又變了 → 這份快照不代表圖上那一刻 → 走 fail-open。"""
+        _img, snap = cq._capture_with_settled_roster(
+            1, capture=lambda _h: "IMG",
+            settle=lambda _h: cq._RosterSnapshot(["甲1111111"], True, [], []),
+            read=lambda _h: ([], [], ["甲1111111", "乙2222222"]))
+
+        assert snap.stable is False, (
+            "★截圖後清單變了卻照樣更新基準★ 圖與清單對不起來，還會漏寄")
+        assert snap.texts == ["甲1111111"], "顯示用的內容不該被改掉"
+
+    def test_a_readback_failure_does_not_invalidate_the_snapshot(self):
+        """回讀失敗 ≠ 清單變了。不可以因為讀不到就把好好的一輪判成 unstable
+        （那會變成每輪 fail-open 寄信）。"""
+        def _boom(_h):
+            raise OSError("列舉失敗")
+
+        _img, snap = cq._capture_with_settled_roster(
+            1, capture=lambda _h: "IMG",
+            settle=lambda _h: cq._RosterSnapshot(["甲1111111"], True, [], []),
+            read=_boom)
+
+        assert snap.stable is True
+
+    def test_an_already_unstable_snapshot_is_left_alone(self):
+        """本來就不穩定 → 不必也不該再回讀一次（省一次列舉）。"""
+        read_calls = {"n": 0}
+
+        def _read(_h):
+            read_calls["n"] += 1
+            return ([], [], [])
+
+        _img, snap = cq._capture_with_settled_roster(
+            1, capture=lambda _h: "IMG",
+            settle=lambda _h: cq._RosterSnapshot(["甲"], False, [], []),
+            read=_read)
+
+        assert snap.stable is False and read_calls["n"] == 0
+
+
+def test_both_capture_sites_settle_before_shooting():
+    """★接線★ 兩條路徑（隱藏桌面、SW_HIDE 後備）都要走同一個順序。
+
+    只修其中一條，另一條照樣拍到半份清單 —— 而上面那些測試會全綠。
+    同時確認固定的 `time.sleep(1.8)` 已經被拿掉（它就是舊順序的殘骸）。
+
+    ★判準用 AST，不是找字串★（這個形狀在本 session 是第四次）
+    第一版寫成 `assert "time.sleep(1.8)" not in src` —— 而我在同一段程式碼的
+    【註解裡】解釋了「固定的 time.sleep(1.8) 已被取代」。測試被自己的說明文字餵飽，
+    當場誤紅。要看的是真的有沒有那個【呼叫】。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    checked = 0
+    # 兩條：常駐 session 的每輪查詢、以及建不出隱藏桌面時的 SW_HIDE 後備模式
+    for fn in (cq._query_cycle, cq._run_with_sw_hide):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+        names = {n.func.id for n in calls if isinstance(n.func, ast.Name)}
+        if not (names & {"capture_window_image", "_capture_with_settled_roster"}):
+            continue
+        checked += 1
+        assert "_capture_with_settled_roster" in names, (
+            f"{fn.__name__} 仍然先截圖再等清單")
+        assert "capture_window_image" not in names, (
+            f"{fn.__name__} 還有一個沒有等清單的截圖")
+        # 真的有沒有 `time.sleep(1.8)` 這個【呼叫】（不是註解裡提到它）
+        for n in calls:
+            if (isinstance(n.func, ast.Attribute) and n.func.attr == "sleep"
+                    and n.args and isinstance(n.args[0], ast.Constant)
+                    and n.args[0].value == 1.8):
+                raise AssertionError(
+                    f"{fn.__name__} 還留著固定 1.8 秒的等待（舊順序的殘骸）")
+    assert checked == 2, f"只檢查到 {checked} 條截圖路徑（應為 2 條）"

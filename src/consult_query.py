@@ -1251,19 +1251,62 @@ _ROSTER_SETTLE_TIMEOUT = 6.0    # 一直在變就放棄(秒);放棄=回報「判
 #   會被當成「今天真的沒有會診」→ 基準被剪成空 → 下一輪整份重寄。
 #   有內容的清單不需要這道關(資料都出現了,不可能是「還沒載入」)。
 _ROSTER_EMPTY_MIN_OBSERVE = 3.0
+# ★有內容的清單也要觀察一段時間★(2026-08-05 外審第 4 輪 P1-07)
+#   上一版的理由寫著「有內容就不必等,資料都出現了,不可能是【還沒載入】」——
+#   ★那句話只對「完全沒載入」成立,對【載到一半】完全不成立★。Delphi 是逐列填的,
+#   4 位病人只填出 2 位、然後停頓超過 0.5 秒(慢機器/後端慢很常見),就會拿 2 位那份
+#   當成最終清單存進基準 → 另外 2 位此後永遠不算「新」→ ★漏寄★。
+#   而「漏寄」正是本檔開頭第 1243 行自己列出的失敗模式 —— 程式卻不防它。
+#   1.5 秒不是白等:它取代了截圖前那個固定的 `time.sleep(1.8)`(見
+#   `_capture_with_settled_roster`),整輪的實際耗時反而略短。
+_ROSTER_MIN_OBSERVE = 1.5
+
+
+def _read_roster_snapshot(consult_hwnd: int) -> tuple:
+    """列舉【一次】→ (children, radios, texts)。三者必然同源。
+
+    ★[2026-08-05 外審第 4 輪 P1-08]★ 以前清單文字與 radio 控制項是【兩次】列舉
+    的結果(穩定判定一次、擷取前再一次)。中間長出一位病人時:信裡列 N 位、
+    逐病人內文卻是 N±1 位,基準也只存到其中一份。改成一次列舉、三個結果同源,
+    「不一致」在結構上就不可能發生,而不是靠事後再比對一次。
+    """
+    children = enum_children(consult_hwnd)
+    radios = _find_patient_radios(
+        [c for c in children if _is_visible_below(c[0], consult_hwnd)])
+    return children, radios, [t for _h, t, _r in radios]
 
 
 def _read_roster_once(consult_hwnd: int) -> list:
     """讀一次目前的病人清單列 → [文字, ...]。純 IO,不做判定。"""
-    children = enum_children(consult_hwnd)
-    radios = _find_patient_radios(
-        [c for c in children if _is_visible_below(c[0], consult_hwnd)])
-    return [t for _h, t, _r in radios]
+    return _read_roster_snapshot(consult_hwnd)[2]
+
+
+class _RosterSnapshot(tuple):
+    """(texts, stable, children, radios) —— 同一次列舉的四個面向。
+
+    刻意是四元組而不是二元組:舊呼叫端寫 `texts, stable = ...` 會當場 ValueError,
+    不會靜默地只拿到一半而把 children/radios 留在別的時間點。
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, texts, stable, children, radios):
+        return super().__new__(cls, (texts, stable, list(children),
+                                     list(radios)))
+
+    texts = property(lambda self: self[0])
+    stable = property(lambda self: self[1])
+    children = property(lambda self: self[2])
+    radios = property(lambda self: self[3])
+
+    def as_unstable(self):
+        """同一份內容,但標記成「判斷不了」(走 fail-open 通道)。"""
+        return _RosterSnapshot(self[0], False, self[2], self[3])
 
 
 def _await_stable_roster(consult_hwnd: int, *, read=None, sleep=None,
-                         now=None):
-    """等清單不再變動 → (roster_texts, stable?)。
+                         now=None) -> _RosterSnapshot:
+    """等清單不再變動 → `_RosterSnapshot`。
 
     連續 `_ROSTER_SETTLE_READS` 次讀到完全相同才算穩定。逾時仍在變 → 回
     `stable=False`,呼叫端據此回報「判斷不了」(而不是把當下這份半成品當真)。
@@ -1272,9 +1315,15 @@ def _await_stable_roster(consult_hwnd: int, *, read=None, sleep=None,
     一模一樣,唯一分得出來的線索就是它穩不穩定。所以空清單一樣要連續讀到相同
     才算數 —— 這正是「載入中的空清單把基準剪成空」那條路的堵法。
 
+    ★「不再變動」還要加上「看得夠久」★(外審第 3 輪 P1-01 + 第 4 輪 P1-07)
+    「沒有變」不等於「載入完成」——【空】是還沒開始載入的樣子,【半份】是載到
+    一半的樣子,兩者都可以連續三次讀到相同(只要 0.5 秒)。所以兩種都要一個最短
+    觀察窗:空 3.0 秒、有內容 1.5 秒。
+
+    `read` 回傳 `(children, radios, texts)`(見 `_read_roster_snapshot`);
     `read`/`sleep`/`now` 只給測試注入。
     """
-    read = read or _read_roster_once
+    read = read or _read_roster_snapshot
     sleep = sleep or time.sleep
     now = now or time.monotonic
     started = now()
@@ -1282,17 +1331,14 @@ def _await_stable_roster(consult_hwnd: int, *, read=None, sleep=None,
     last = None
     same = 0
     while True:
-        cur = read(consult_hwnd)
+        children, radios, cur = read(consult_hwnd)
         if last is not None and cur == last:
             same += 1
             if same >= _ROSTER_SETTLE_READS - 1:
-                # ★空清單要多觀察一段時間★（外審第 3 輪 P1-01）
-                #   連續三次讀到空只要 0.5 秒;若 HIS 1.5 秒才開始填,那 0.5 秒的
-                #   「穩定空清單」會被當成「今天真的沒有會診」→ 基準剪成空 →
-                #   下一輪整份重寄。有內容的清單不必等(資料都出現了)。
-                if cur or (now() - started
-                           >= _ROSTER_EMPTY_MIN_OBSERVE):
-                    return cur, True
+                need = (_ROSTER_MIN_OBSERVE if cur
+                        else _ROSTER_EMPTY_MIN_OBSERVE)
+                if now() - started >= need:
+                    return _RosterSnapshot(cur, True, children, radios)
         else:
             same = 0
         last = cur
@@ -1300,8 +1346,43 @@ def _await_stable_roster(consult_hwnd: int, *, read=None, sleep=None,
             logging.warning("[consult-extract] 病人清單在 %.0f 秒內一直在變動"
                             "(最後看到 %d 列) → 本輪不據此判斷有無新會診",
                             _ROSTER_SETTLE_TIMEOUT, len(cur))
-            return cur, False
+            return _RosterSnapshot(cur, False, children, radios)
         sleep(_ROSTER_SETTLE_INTERVAL)
+
+
+def _capture_with_settled_roster(consult_hwnd: int, *, capture=None,
+                                 settle=None, read=None):
+    """等清單穩定 → 截圖 → 回讀確認清單沒變 → (img, snapshot)。
+
+    ★[2026-08-05 外審第 4 輪 P1-09]★ 截圖以前排在固定的 `time.sleep(1.8)` 之後、
+    而清單是在那之【後】才等到穩定的。於是信裡的清單是 Tn 的、附圖是 T0+1.8s 的
+    —— 圖上可能少了幾位病人。收信的醫師拿到的是兩份互相矛盾的證據。
+
+    ★截圖不能挪到擷取【之後】★:擷取會逐位點選病人 radio,點完畫面顯示的是
+    最後一位的內容,不再是「打開時的原始清單畫面」。所以順序必須是
+    【先等穩定 → 再截圖 → 再逐位擷取】。
+
+    截圖後再讀一次:期間又變了 → 這份快照已經不代表圖上那一刻 → 標成
+    unstable,走既有的 fail-open 通道(照寄、但不更新基準)。
+    """
+    capture = capture or capture_window_image
+    settle = settle or _await_stable_roster
+    read = read or _read_roster_snapshot
+
+    snap = settle(consult_hwnd)
+    img = capture(consult_hwnd)
+    if snap.stable:
+        try:
+            _c, _r, after = read(consult_hwnd)
+        except Exception:
+            logging.debug("[consult-extract] 截圖後回讀清單失敗", exc_info=True)
+            after = snap.texts          # 讀不到就不因此否定這份快照
+        if after != snap.texts:
+            logging.warning("[consult-extract] 截圖後病人清單又變了"
+                            "(%d 列 → %d 列) → 本輪不據此判斷有無新會診",
+                            len(snap.texts), len(after))
+            snap = snap.as_unstable()
+    return img, snap
 
 
 def _find_patient_radios(children: list) -> list:
@@ -1879,7 +1960,8 @@ def _read_panes_after_change(panes: list, baseline_sig, timeout: float = 2.5,
 
 
 def _extract_consult_text(consult_hwnd: int, cfg: dict,
-                          roster_label: str = "今日會診病人") -> tuple:
+                          roster_label: str = "今日會診病人",
+                          settled: _RosterSnapshot | None = None) -> tuple:
     """主入口:從會診視窗擷取逐病人文字。回 (純文字版, HTML內容片段, roster_texts)。
 
     roster_texts(第三個回傳,CQ-01/02):病人清單「列字串」清單 —— None=擷取失敗/停用
@@ -1889,7 +1971,15 @@ def _extract_consult_text(consult_hwnd: int, cfg: dict,
     if not cfg.get("extract_text_enabled", True):
         return "", "", None
     try:
-        children = enum_children(consult_hwnd)
+        # ★[2026-08-05 外審第 4 輪 P1-08/P1-09] 清單、radio、截圖是同一份快照★
+        #   `settled` 由呼叫端在【截圖之前】等到穩定並傳進來(見
+        #   `_capture_with_settled_roster`)。沒傳就自己等一次(手動/測試路徑)。
+        #   清單文字與 radio 控制項來自【同一次】列舉,不再有「信裡 N 位、
+        #   內文 N±1 位」的可能。
+        snap = settled if settled is not None else _await_stable_roster(
+            consult_hwnd)
+        roster_texts, _roster_stable = snap.texts, snap.stable
+        children, radios = snap.children, snap.radios
         # 控制項樹 dump(每次執行記一次)：供依實機結構微調 extract_* 參數。
         # [2026-07-25 審查] 只記 class 與座標,**不再記控制項文字**——TRadioButton 的
         # 文字就是「姓名+病房+床號+病歷號」(見 _find_patient_radios 註解),而本函式每
@@ -1905,24 +1995,10 @@ def _extract_consult_text(consult_hwnd: int, cfg: dict,
                 for _h, cls, txt, r in children[:80]))
 
         # 病人清單 = TRadioButton 文字(最準確,直接來自 UI,免 OCR/像素點選)。
-        # 以「在會診視窗子樹中可見」過濾,排除非作用分頁的殘留 radio。此判定不看
-        # 會診視窗本身是否被 SW_HIDE,故隱藏桌面/正常/後備三種模式皆正確 —— 作用
-        # 分頁真的沒病人時清單即為空,不會誤把其他分頁的隱藏 radio 當成今日病人。
-        # ★[2026-08-04 外審 P1-03] 等清單不再變動,不要只睡固定秒數★
-        #   固定 sleep 治不了慢的機器:還沒載入的空清單會被當成「真的沒有病人」而把
-        #   基準剪成空(下一輪整份重寄),載到一半則會漏掉還沒出現的病人。
-        #   不穩定 → roster_texts 回 None,走既有的「判斷不了 → fail-open 照寄、
-        #   但【不更新基準】」那條路(呼叫端已經有這個通道,不需要新增處理)。
-        roster_texts, _roster_stable = _await_stable_roster(consult_hwnd)
-        # ★[2026-08-04 自查] 控制項樹要在清單穩定【之後】重取★
-        #   上面那份 `children` 是進函式當下(T0)的。清單在 T0→Tn 之間才長出來時：
-        #     roster_texts = Tn 的 4 位（信裡列 4 位、基準也存 4 筆）
-        #     radios/panes = T0 的 1 位（逐病人內文只抓得到 1 位）
-        #   信與內文對不起來;若 T0 連一顆 radio 都還沒有,更會掉進舊式格線點選的
-        #   後備路徑。★這是我加穩定性判定時引進的不一致★——改之前兩者同源。
-        children = enum_children(consult_hwnd)
-        radios = _find_patient_radios(
-            [c for c in children if _is_visible_below(c[0], consult_hwnd)])
+        # 以「在會診視窗子樹中可見」過濾,排除非作用分頁的殘留 radio(在
+        # `_read_roster_snapshot` 裡做)。此判定不看會診視窗本身是否被 SW_HIDE,
+        # 故隱藏桌面/正常/後備三種模式皆正確 —— 作用分頁真的沒病人時清單即為空,
+        # 不會誤把其他分頁的隱藏 radio 當成今日病人。
         roster = _format_patient_roster(roster_texts, label=roster_label)
         roster_html = _format_patient_roster_html(roster_texts, roster_label)
         if not _roster_stable:
@@ -3108,16 +3184,19 @@ def _query_cycle(sess, cfg: dict, roster_label: str) -> tuple:
         time.sleep(0.3)
     if not consult:
         raise RuntimeError("等不到會診單視窗")
-    time.sleep(1.8)
     logging.info("會診單視窗已開啟，準備擷取")
     # ★[2026-08-04 外審 P1-08] 不在這裡落地★
     #   這裡以前無條件 `img.save()`,而且發生在解析 roster【之前】——跟有沒有新
     #   會診完全無關。常駐模式 3 分鐘一輪 = 每小時 20 張沒寄出去、也沒有臨床用途
     #   的完整病人畫面躺在磁碟上。改成先留在記憶體,真的要寄信時才落地
     #   (見 `_materialize_shot`)。
-    img = capture_window_image(consult)
+    # ★[2026-08-05 外審第 4 輪 P1-09] 先等清單穩定再截圖★
+    #   原本是固定 `time.sleep(1.8)` 之後截圖,而清單是在那之【後】才等到穩定的
+    #   → 信裡的清單是 Tn 的、附圖是 T0+1.8s 的,醫師拿到兩份互相矛盾的證據。
+    #   固定睡的那 1.8 秒也一併拿掉(穩定判定本身就已經在等)。
+    img, _snap = _capture_with_settled_roster(consult)
     extracted, extracted_html, roster_texts = _extract_consult_text(
-        consult, cfg, roster_label)
+        consult, cfg, roster_label, settled=_snap)
     _return_to_main(sess, consult)
     return img, extracted, extracted_html, roster_texts
 
@@ -3609,15 +3688,16 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
         if borrowed:  # [CQ-06] 借用視窗 → 存原始狀態供 finally 還原
             borrowed_win_state[consult] = _save_window_state(consult)
         show_offscreen(consult)
-        time.sleep(1.8)  # 讓清單內容載入完成
         logging.info("會診通知單視窗已開啟，準備擷取")
 
         # 截圖（PrintWindow，視窗在螢幕外也能擷取）
         # ★[2026-08-04 外審 P1-08] 不在這裡落地★ 見 `_materialize_shot`
-        img = capture_window_image(consult)
+        # ★[2026-08-05 外審第 4 輪 P1-09] 先等清單穩定再截圖★(見另一個呼叫點)
+        #   固定的 `time.sleep(1.8)` 由穩定判定取代。
         # [新功能 2026-06-13] 先擷取原始畫面,再逐列點選擷取文字(fail-open)
+        img, _snap = _capture_with_settled_roster(consult)
         extracted, extracted_html, roster_texts = _extract_consult_text(
-            consult, cfg, roster_label)
+            consult, cfg, roster_label, settled=_snap)
         return img, extracted, extracted_html, roster_texts
 
     finally:
