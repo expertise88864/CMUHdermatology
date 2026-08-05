@@ -2425,9 +2425,28 @@ def _wait_main_window_after_login(our_pids: set, *, visible_only: bool,
                     logging.info("主畫面已可操作(期間關掉 %d 次訊息通知,"
                                  "不同視窗 %d 個)", clicks, len(distinct_notices))
                 return mains[0]
+        # ★[2026-08-05 實機] 先處理【真正擋住輸入】的那個對話框★
+        #   診斷傾印顯示:TFMShowMessage 自己也是 disabled 的(en=0),壓在它上面
+        #   的是 `TFMTimeOut_1`(en=1)。程式對著一個 disabled 的視窗按了 6 次
+        #   「確認」——disabled 的視窗不會處理點擊——120 秒的登入預算就這樣燒光。
+        #   判準改用 Win32 的正規訊號(可見 + enabled + 不是內容視窗),
+        #   不再猜對話框叫什麼 class。
+        if _dismiss_blocking_modals(pids=our_pids):
+            clicks += 1
+            time.sleep(0.6)
+            continue
         notice = find_windows(NOTICE_CLASS, pids=our_pids,
                               visible_only=visible_only)
         if notice:
+            try:
+                # 它自己被別的 modal 擋住時,按它沒有任何作用(實機燒掉 120 秒的
+                # 那 6 次點擊就是這樣)。等上面那個對話框先被處理掉。
+                notice_actionable = bool(win32gui.IsWindowEnabled(notice[0]))
+            except Exception:
+                notice_actionable = True
+            if not notice_actionable:
+                time.sleep(0.4)
+                continue
             btn = find_child(notice[0], "TButton", "確認")
             if btn and notice[0] != stuck_notice:
                 if notice[0] == last_notice_hwnd:
@@ -3381,32 +3400,87 @@ def _main_ready_for_next_cycle(sess, *, sleep=None, now=None) -> str:
         sleep(_MAIN_REENABLE_INTERVAL)
 
 
-def _dismiss_blocking_modals(sess) -> int:
-    """把擋在主畫面前面的訊息通知按掉 → 按了幾個。
+# 這些是「內容視窗」,不是擋路的對話框 —— 它們被擋住的時候是 disabled 的。
+_CONTENT_CLASSES = frozenset({MAIN_CLASS, LOGIN_CLASS, CONSULT_CLASS})
+# 只按這些字樣的按鈕。★絕不盲按★:不認得的對話框只記下它有哪些按鈕,不出手。
+_AFFIRMATIVE_CAPTIONS = ("確認", "確定", "OK", "Ok", "是", "繼續")
 
-    ★[2026-08-05 實機事故]★ 主畫面被 modal 擋住時,它是 disabled 的 ——
+
+def _blocking_dialogs(pids: set) -> list:
+    """找出【正在擋住輸入】的對話框 → [(hwnd, class)]。
+
+    ★[2026-08-05 實機 log 的關鍵發現]★ 診斷傾印把答案直接寫出來了:
+
+        TFrmLogin(vis=1,en=0)      ← 我們的登入視窗,被擋住
+        TFMTimeOut_1(vis=1,en=1)   ← ★唯一 enabled 的,它才是擋路的那個★
+        TFMShowMessage(vis=1,en=0) ← 通知視窗,它自己也被擋住
+        TFMNewMain(vis=1,en=0)     ← 主畫面,被擋住
+
+    而程式對著【disabled 的】TFMShowMessage 按了 6 次「確認」——
+    disabled 的視窗根本不會處理點擊,所以整整 120 秒的登入預算就這樣燒光,
+    最後回報「登入沒有完成」。`TFMTimeOut_1` 這個 class 程式從來不認得。
+
+    ★所以判準不可以是「class 是不是 NOTICE_CLASS」★ —— 那是在猜對話框長什麼樣。
+    Win32 已經有正規訊號:modal 會把其他視窗 disable,而它自己是 enabled 的。
+    改成:可見 + enabled + 不是內容視窗 = 它就是擋路的那個,不管它叫什麼名字。
+    """
+    out = []
+    if not pids:
+        return out
+    try:
+        for hwnd in find_windows(pids=set(pids), visible_only=True):
+            try:
+                if not win32gui.IsWindowEnabled(hwnd):
+                    continue            # 自己都被擋住 → 它不是擋路的那個
+                cls = win32gui.GetClassName(hwnd)
+            except Exception:
+                continue
+            if cls in _CONTENT_CLASSES:
+                continue
+            out.append((hwnd, cls))
+    except Exception:
+        logging.debug("[session] 列舉擋路對話框失敗", exc_info=True)
+    return out
+
+
+def _dismiss_blocking_modals(sess=None, *, pids=None) -> int:
+    """把擋住輸入的對話框按掉 → 按了幾個。
+
+    ★[2026-08-05 實機事故]★ 主畫面被 modal 擋住時它是 disabled 的 ——
     **disabled 的視窗不會處理 WM_CLOSE**。所以「收尾關不掉主畫面」與「主畫面
     被 modal 擋住」根本是同一件事的兩個症狀,而我當天把前者當成獨立故障、
     還讓它去觸發一個 fail-closed 閘門,結果是整個會診查詢停擺。
 
-    要關主畫面,得先讓它能收訊息 —— 先按掉 modal。
-    只找【我們登入的那個行程】的通知視窗(`sess.main_pid`),不動別人的。
+    ★只按【我們自己的行程】的對話框★,而且★只按肯定字樣的按鈕★ ——
+    不認得的對話框只把它的 class 與按鈕字樣記進 log(讓下一次知道它長什麼樣),
+    絕不盲按。在醫院系統上亂點按鈕的代價,比多停一輪查詢大得多。
     """
-    owner = getattr(sess, "main_pid", None)
+    owner = set(pids or ())
+    if not owner:
+        one = getattr(sess, "main_pid", None)
+        if one:
+            owner = {one}
     if not owner:
         return 0
     clicked = 0
-    try:
-        for hwnd in find_windows(NOTICE_CLASS, pids={owner}, visible_only=False):
-            btn = find_child(hwnd, "TButton", "確認") or find_child(
-                hwnd, "TButton", "OK")
-            if btn:
-                click_button(btn)
-                clicked += 1
-    except Exception:
-        logging.debug("[session] 關閉主畫面前的訊息通知時出錯", exc_info=True)
-    if clicked:
-        logging.info("[session] 已按掉 %d 個擋住主畫面的訊息通知", clicked)
+    for hwnd, cls in _blocking_dialogs(owner):
+        try:
+            buttons = [(h, (t or "").strip())
+                       for h, c, t, _r in enum_children(hwnd) if c == "TButton"]
+        except Exception:
+            logging.debug("[session] 列舉對話框按鈕失敗 hwnd=%s", hwnd,
+                          exc_info=True)
+            continue
+        target = next((h for h, t in buttons if t in _AFFIRMATIVE_CAPTIONS), None)
+        if target is None:
+            logging.warning("[session] 有擋路的對話框但沒有可按的按鈕 —— "
+                            "class=%s 按鈕=%s(不盲按,請回報這一行)",
+                            cls, [t for _h, t in buttons])
+            continue
+        click_button(target)
+        clicked += 1
+        logging.info("[session] 已按掉擋路的對話框 class=%s(按鈕=%s)", cls,
+                     next(t for h, t in buttons if h == target))
     return clicked
 
 

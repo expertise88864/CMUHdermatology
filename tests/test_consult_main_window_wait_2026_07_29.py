@@ -42,7 +42,12 @@ def test_uses_is_window_enabled_not_notice_absence():
     不是「找不到通知視窗」。"""
     body = _helper()
     assert "win32gui.IsWindowEnabled(mains[0])" in body
-    assert "not notice" not in body, "★不可再用『沒有通知視窗』當放行條件★"
+    # ★用字界比對★[2026-08-05]：原本寫 `"not notice" not in body`，
+    #   而後來新增的 `if not notice_actionable:`（通知視窗自己被別的 modal
+    #   擋住時不要按它）剛好含有這個子字串 → 誤紅。要擋的是【變數 notice】
+    #   本身被當成放行條件，不是任何以 notice 開頭的名字。
+    assert not re.search(r"\bnot notice\b(?!_)", body), (
+        "★不可再用『沒有通知視窗』當放行條件★")
 
 
 def test_visible_only_is_a_parameter_not_hardcoded():
@@ -100,3 +105,42 @@ def test_both_loops_were_replaced_by_the_helper():
         "def _wait_main_window_after_login(")
     assert calls == 2, "兩個呼叫點(常駐冷啟動 + SW_HIDE)都要走 helper"
     assert raw.count("def _wait_main_window_after_login(") == 1
+
+
+def test_a_disabled_notice_is_not_clicked():
+    """★[2026-08-05 實機] 按一個 disabled 的視窗是純粹的浪費★
+
+    那天 `TFMShowMessage` 自己就被 `TFMTimeOut_1` 擋住（en=0），程式對它按了
+    6 次「確認」都沒有反應，整整 120 秒的登入預算就這樣燒光，最後回報
+    「登入沒有完成」並進入 15 分鐘冷卻 —— 而真正該按的那個視窗從頭到尾沒被碰。
+
+    ★判準要看「結果有沒有被用到」，不是「有沒有呼叫」★
+    突變驗證抓到的洞：把 `if not notice_actionable: continue` 換成
+    `notice_actionable = True`，`IsWindowEnabled(notice[0])` 這個呼叫還在，
+    純粹比對字串的版本照樣全綠 —— 而程式又會去按那個 disabled 的視窗。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    import consult_query as cq
+
+    tree = ast.parse(textwrap.dedent(
+        inspect.getsource(cq._wait_main_window_after_login)))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        names = {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
+        if "notice_actionable" not in names:
+            continue
+        # 條件在「不可操作」時必須跳過這一輪（continue），不是只記個 log
+        taken = eval(  # noqa: S307 - 受控:只求值這個檔案自己的守衛條件
+            compile(ast.Expression(body=node.test), "<guard>", "eval"),
+            {"__builtins__": {}}, {"notice_actionable": False})
+        branch = node.body if taken else node.orelse
+        assert any(isinstance(n, ast.Continue) for n in ast.walk(
+            ast.Module(body=branch, type_ignores=[]))), (
+            "★確認了可不可操作，卻沒有據此跳過★ 還是會對 disabled 的視窗一直按")
+        return
+    raise AssertionError(
+        "★沒有先確認通知視窗自己是不是可操作★ 會對著 disabled 的視窗一直按")

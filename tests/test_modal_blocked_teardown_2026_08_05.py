@@ -66,18 +66,17 @@ class TestTheModalIsClearedBeforeClosing:
         assert order[:2] == ["dismiss", "close"], (
             f"★沒先按掉 modal 就送 WM_CLOSE★ 那個視窗是 disabled 的:{order}")
 
-    def test_it_only_touches_our_own_process_notices(self, monkeypatch):
-        """只按【我們登入的那個行程】的通知，不動醫師的。"""
+    def test_it_only_touches_our_own_process_dialogs(self, monkeypatch):
+        """只按【我們自己的行程】的對話框，不動醫師的。"""
         asked = {}
 
         def _find(cls=None, pids=None, **k):
-            asked["cls"], asked["pids"] = cls, pids
+            asked["pids"] = pids
             return []
         monkeypatch.setattr(cq, "find_windows", _find)
 
         cq._dismiss_blocking_modals(_Sess())
 
-        assert asked["cls"] == cq.NOTICE_CLASS
         assert asked["pids"] == {18072}, (
             f"★用了太寬的 PID 集合★ 會按到醫師自己的視窗:{asked['pids']}")
 
@@ -175,3 +174,118 @@ class TestTheGateHasACeiling:
     def test_the_ceiling_is_not_absurdly_long(self):
         """上限要是「臨床上還能接受的停擺時間」，不是形式上的無限大。"""
         assert 0 < cq._UNMANAGED_BLOCK_MAX_SEC <= 30 * 60
+
+
+class TestTheBlockerIsFoundByEnabledStateNotByClassName:
+    """★[2026-08-05 實機 log 的關鍵發現]★ 診斷傾印把答案直接寫出來了：
+
+        TFrmLogin(vis=1,en=0)      ← 我們的登入視窗，被擋住
+        TFMTimeOut_1(vis=1,en=1)   ← ★唯一 enabled 的，它才是擋路的那個★
+        TFMShowMessage(vis=1,en=0) ← 通知視窗，它自己也被擋住
+        TFMNewMain(vis=1,en=0)     ← 主畫面，被擋住
+
+    而程式對著【disabled 的】TFMShowMessage 按了 6 次「確認」——disabled 的視窗
+    根本不會處理點擊 —— 整整 120 秒的登入預算就這樣燒光，最後回報「登入沒有完成」。
+    `TFMTimeOut_1` 這個 class 程式從來不認得。
+
+    所以判準不可以是「class 是不是 NOTICE_CLASS」（那是在猜對話框長什麼樣）。
+    Win32 已經有正規訊號：modal 會把其他視窗 disable，而它自己是 enabled 的。
+    """
+
+    def _machine(self, monkeypatch, windows):
+        """windows: [(hwnd, class, enabled)] —— 模擬那台機器當下的畫面。"""
+        by_hwnd = {h: (c, en) for h, c, en in windows}
+        monkeypatch.setattr(cq, "find_windows",
+                            lambda cls=None, pids=None, **k: list(by_hwnd))
+        monkeypatch.setattr(cq.win32gui, "IsWindowEnabled",
+                            lambda h: by_hwnd[h][1])
+        monkeypatch.setattr(cq.win32gui, "GetClassName",
+                            lambda h: by_hwnd[h][0])
+        return by_hwnd
+
+    # 實機那一刻的畫面
+    _REAL = [(1, cq.LOGIN_CLASS, False),
+             (2, "TFMTimeOut_1", True),
+             (3, cq.NOTICE_CLASS, False),
+             (4, cq.MAIN_CLASS, False)]
+
+    def test_it_finds_the_unknown_dialog(self, monkeypatch):
+        self._machine(monkeypatch, self._REAL)
+        found = cq._blocking_dialogs({18072})
+        assert found == [(2, "TFMTimeOut_1")], (
+            f"★沒找到真正擋路的那個★ 找到的是:{found}")
+
+    def test_it_ignores_the_disabled_notice(self, monkeypatch):
+        """★這正是燒掉 120 秒的那個誤判★ 通知視窗自己被擋住時按它沒有用。"""
+        self._machine(monkeypatch, self._REAL)
+        assert 3 not in [h for h, _c in cq._blocking_dialogs({18072})]
+
+    def test_content_windows_are_never_treated_as_dialogs(self, monkeypatch):
+        """主畫面/登入視窗/會診單就算是 enabled 也不是「擋路的對話框」。"""
+        self._machine(monkeypatch, [(1, cq.LOGIN_CLASS, True),
+                                    (4, cq.MAIN_CLASS, True),
+                                    (5, cq.CONSULT_CLASS, True)])
+        assert cq._blocking_dialogs({18072}) == []
+
+    def test_it_clicks_an_affirmative_button(self, monkeypatch):
+        self._machine(monkeypatch, self._REAL)
+        monkeypatch.setattr(cq, "enum_children",
+                            lambda _h: [(90, "TLabel", "連線逾時", (0,) * 4),
+                                        (91, "TButton", "確認", (0,) * 4)])
+        clicked = []
+        monkeypatch.setattr(cq, "click_button", clicked.append)
+
+        assert cq._dismiss_blocking_modals(pids={18072}) == 1
+        assert clicked == [91]
+
+    def test_it_never_blind_clicks_an_unknown_dialog(self, monkeypatch, caplog):
+        """★不認得的按鈕一律不按★
+
+        在醫院系統上亂點按鈕的代價，比多停一輪查詢大得多。
+        不認得就把 class 與按鈕字樣記進 log，讓下一次知道它長什麼樣。
+        """
+        import logging as _lg
+        self._machine(monkeypatch, self._REAL)
+        monkeypatch.setattr(cq, "enum_children",
+                            lambda _h: [(92, "TButton", "刪除病歷", (0,) * 4)])
+        clicked = []
+        monkeypatch.setattr(cq, "click_button", clicked.append)
+
+        with caplog.at_level(_lg.WARNING):
+            assert cq._dismiss_blocking_modals(pids={18072}) == 0
+        assert clicked == [], "★盲按了不認得的按鈕★"
+        msgs = " ".join(r.getMessage() for r in caplog.records)
+        assert "TFMTimeOut_1" in msgs and "刪除病歷" in msgs, (
+            "沒有把不認得的對話框記下來 → 下一次還是不知道它長什麼樣")
+
+    def test_no_pids_means_no_action(self):
+        assert cq._blocking_dialogs(set()) == []
+        assert cq._dismiss_blocking_modals(pids=set()) == 0
+
+
+def test_the_login_wait_clears_blockers_before_clicking_the_notice():
+    """★接線★ 等主畫面的迴圈要先處理擋路的對話框。
+
+    那個迴圈就是燒掉 120 秒的地方：它只認得 `NOTICE_CLASS`，而那個視窗自己
+    正被別的 modal 擋住。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(
+        inspect.getsource(cq._wait_main_window_after_login)))
+    dismiss_at = notice_at = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", "")
+        if name == "_dismiss_blocking_modals" and dismiss_at is None:
+            dismiss_at = node.lineno
+        if (name == "find_windows" and notice_at is None
+                and any(getattr(a, "id", "") == "NOTICE_CLASS" for a in node.args)):
+            notice_at = node.lineno
+    assert dismiss_at is not None, (
+        "★登入等待迴圈沒有處理擋路的對話框★ 會對 disabled 的通知視窗一直按")
+    assert notice_at is not None, "找不到通知視窗的處理（測試失效了）"
+    assert dismiss_at < notice_at, "要先清掉擋路的對話框，再處理通知視窗"
