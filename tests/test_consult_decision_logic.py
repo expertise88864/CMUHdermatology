@@ -73,7 +73,8 @@ class _JobHarness:
         monkeypatch.setattr(cq, "run_consult_flow", _flow)
         monkeypatch.setattr(
             cq, "send_via_smtp",
-            lambda shot, subject, body, recipients, html_body="":
+            lambda shot, subject, body, recipients, html_body="",
+            message_id="":
                 self.sent.append((list(recipients), subject))
                 or self.bodies.append(body)
                 or self.html_bodies.append(html_body))
@@ -340,7 +341,8 @@ def test_send_failure_also_retries(monkeypatch):
     h = _JobHarness(monkeypatch, _base_cfg(retry_count=2))
     calls = {"n": 0}
 
-    def _send_fail_once(shot, subject, body, recipients, html_body=""):
+    def _send_fail_once(shot, subject, body, recipients, html_body="",
+                        message_id=""):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("smtp down")

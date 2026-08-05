@@ -489,11 +489,30 @@ def test_the_successful_send_path_discards_the_served_recipients():
     import inspect
 
     import consult_query as cq
+    # ★用 AST 找呼叫位置,不要比對參數的字面寫法★
+    #   [2026-08-05] 原本是 `src.index("send_via_smtp(shot, subject")` ——
+    #   批次W 把參數換成 `delivery.attachment, delivery.subject` 之後這一支
+    #   就 ValueError 了。它要守的不變量是【順序】,與參數怎麼寫無關。
+    import ast
+    import textwrap
     src = inspect.getsource(cq._do_full_job)
-    i_send = src.index("send_via_smtp(shot, subject")
-    i_discard = src.index("_discard_served_retriggers(trigger_label")
-    assert i_send < i_discard, "撤銷補跑要在寄出【之後】"
-    assert i_discard < src.index("return  # 成功就跳出")
+    tree = ast.parse(textwrap.dedent(src))
+    at = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            at.setdefault(node.func.id, node.lineno)
+    assert at["send_via_smtp"] < at["_discard_served_retriggers"], (
+        "撤銷補跑要在寄出【之後】")
+    assert i_return_of_success(src) > at["_discard_served_retriggers"]
+
+
+def i_return_of_success(src: str) -> int:
+    """成功路徑那個 return 的行號(相對於函式起點)。"""
+    import textwrap as _tw
+    for i, line in enumerate(_tw.dedent(src).splitlines(), 1):
+        if "return  # 成功就跳出" in line:
+            return i
+    raise AssertionError("找不到成功路徑的 return")
 
 
 def test_consult_checks_before_sending_not_after():
@@ -501,6 +520,13 @@ def test_consult_checks_before_sending_not_after():
     import inspect
 
     import consult_query as cq
-    src = inspect.getsource(cq._do_full_job)
-    assert src.index("raise JobSuperseded(") < src.index(
-        "send_via_smtp(shot, subject"), "supersede 檢查要在寄信【之前】"
+    import ast
+    import textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(cq._do_full_job)))
+    raises = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Raise)
+              and isinstance(n.exc, ast.Call)
+              and getattr(n.exc.func, "id", "") == "JobSuperseded"]
+    sends = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and getattr(n.func, "id", "") == "send_via_smtp"]
+    assert raises and sends
+    assert max(raises) < min(sends), "supersede 檢查要在寄信【之前】"

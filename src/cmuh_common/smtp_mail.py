@@ -207,7 +207,8 @@ def is_configured() -> bool:
 def _build_message(sender_address: str, sender_name: str,
                     recipients: list, subject: str, body: str,
                     attachment_path: Optional[Path] = None,
-                    html_body: Optional[str] = None) -> MIMEMultipart:
+                    html_body: Optional[str] = None,
+                    message_id: Optional[str] = None) -> MIMEMultipart:
     """組合 MIME 訊息。圖片附件用 MIMEImage（信箱有預覽），其他用 MIMEApplication。
 
     html_body 有值時內文走 multipart/alternative：同時帶純文字(fallback)與 HTML，
@@ -220,7 +221,12 @@ def _build_message(sender_address: str, sender_name: str,
     msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid(domain=sender_address.split("@")[-1])
+    # ★[2026-08-05 外審第 5 輪 P1-04] 呼叫端可以指定 Message-ID★
+    #   會診信在寄送失敗時會由呼叫端重試【同一份 payload】。若每次都換一個
+    #   Message-ID,SMTP「已收下但回應逾時」的情況會讓收件人收到兩封各自獨立
+    #   的信;沿用同一個則多數郵件客戶端會視為同一封而收斂。
+    msg["Message-ID"] = message_id or make_msgid(
+        domain=sender_address.split("@")[-1])
     if html_body:
         alt = MIMEMultipart("alternative")
         alt.attach(MIMEText(body, "plain", "utf-8"))      # fallback 在前
@@ -317,7 +323,8 @@ def send_mail(recipients: list, subject: str, body: str,
               override_credentials: Optional[dict] = None,
               max_retries: int = DEFAULT_MAX_RETRIES,
               html_body: Optional[str] = None,
-              category: str = CATEGORY_CLINICAL) -> dict:
+              category: str = CATEGORY_CLINICAL,
+              message_id: Optional[str] = None) -> dict:
     """同步寄一封信。失敗 raise；成功 log info。
 
     回傳【被拒收件人】的 dict(空 dict = 全部送達)。[2026-07-26 審查]
@@ -360,6 +367,7 @@ def send_mail(recipients: list, subject: str, body: str,
         subject=subject, body=body,
         attachment_path=attachment_path,
         html_body=html_body,
+        message_id=message_id,
     )
     max_retries = _normalize_max_retries(max_retries)
     reservation = _reserve_rate_limit_slot(cred, category)

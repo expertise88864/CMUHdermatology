@@ -61,9 +61,11 @@ import threading  # noqa: E402
 import time  # noqa: E402
 import traceback  # noqa: E402
 import tkinter as tk  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
 from datetime import datetime, time as dt_time  # noqa: E402
 from pathlib import Path  # noqa: E402
 from tkinter import messagebox, scrolledtext, ttk  # noqa: E402
+from typing import Any  # noqa: E402
 
 import psutil  # noqa: E402
 import schedule  # noqa: E402
@@ -3889,6 +3891,52 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
             pass
 
 
+@dataclass(frozen=True)
+class _DeliveryArtifact:
+    """一封【已經組好、不會再變】的信。
+
+    ★[2026-08-05 外審第 5 輪 P1-04]★ 寄信重試必須是「重送同一封」,不是
+    「重查一次再組一封新的」。舊寫法每個 attempt 都重跑整個流程,於是:
+      * HIS 被重複操作(再開一次會診畫面、再點選一次每位病人)
+      * 第二次查到的清單可能已經不同 → 兩次寄出去的內容不一樣
+      * 每次都新的 Message-ID → SMTP 若是「已收下但回應逾時」,收件人會收到兩封
+      * 每次都多落地一張病人截圖
+    frozen=True 讓「組好之後不再變」這件事由型別系統保證,而不是靠紀律。
+    """
+
+    recipients: tuple
+    subject: str
+    text_body: str
+    html_body: str
+    attachment: Any
+    message_id: str
+
+
+def _new_message_id() -> str:
+    """產生一個 Message-ID,整份 delivery 共用(重試也用同一個)。"""
+    from email.utils import make_msgid  # noqa: PLC0415
+    return make_msgid()
+
+
+def _discard_undelivered_shot(delivery) -> None:
+    """整輪放棄之後,把【沒有寄出去】的那張截圖刪掉。
+
+    ★[2026-08-05 外審第 5 輪 P2-05 / 自查 P1-C]★
+    `_materialize_shot` 的既有取捨是「已經寄給臨床收件人的圖留著當線索」——
+    那個理由**只對寄成功的情況成立**。寄失敗的那張病人畫面既沒有臨床用途、
+    也沒有人看過,卻會留在磁碟上等 TTL 到期。這是純粹多出來的 PHI 暴露面。
+    """
+    path = getattr(delivery, "attachment", None)
+    if not isinstance(path, Path):
+        return
+    try:
+        if path.exists():
+            path.unlink()
+            logging.info("[privacy] 本輪沒有寄出 → 已刪除未送達的截圖")
+    except Exception:
+        logging.warning("[privacy] 刪除未送達的截圖失敗:%s", path, exc_info=True)
+
+
 def _materialize_shot(img):
     """把記憶體裡的截圖落地成檔案 → 路徑。已經是路徑就原樣回傳（相容）。
 
@@ -4113,7 +4161,7 @@ def send_via_outlook(image_path: Path, subject: str, body: str,
 
 def send_via_smtp(image_path: Path, subject: str, body: str,
                   recipients: list, timeout: float = 60.0,
-                  html_body: str = "") -> None:
+                  html_body: str = "", message_id: str = "") -> None:
     """用 SMTP 直接寄（Gmail / smtp.gmail.com）。
 
     為何不用 Outlook：admin 行程的 Outlook COM 會起一個 admin Outlook 實例，
@@ -4127,7 +4175,10 @@ def send_via_smtp(image_path: Path, subject: str, body: str,
     from cmuh_common.smtp_mail import send_mail
     send_mail(recipients=recipients, subject=subject, body=body,
               attachment_path=image_path, timeout=timeout,
-              html_body=html_body or None)
+              html_body=html_body or None,
+              # ★[2026-08-05 外審第 5 輪 P1-04]★ 重試要重送【同一封】——
+              #   換 Message-ID 會讓「已收下但回應逾時」變成收件人收到兩封。
+              message_id=message_id or None)
 
 
 def _kill_systemftp(before_pids=None) -> None:
@@ -4396,18 +4447,34 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
         # 改 [3, 30, 90] 秒：給 server 越來越長的恢復時間。
         # 第 3 次撞上恢復視窗的機率變大。三次總時長 6→8 分鐘 (僅多 2 分鐘)。
         BACKOFF_SCHEDULE = [3, 30, 90]
+        # ★[2026-08-05 外審第 5 輪 P1-04] 查詢與寄送分成兩段★
+        #   `his_result` 一旦有值就不再重查 HIS;`delivery` 一旦組好就不再重組。
+        #   寄信重試 = 重送【同一份】payload、同一個 Message-ID、同一張附件。
+        his_result = None
+        delivery = None
         for attempt in range(1, retry_count + 1):
             # ★[2026-08-05 外審第 4 輪 P1-10]★ 這一輪的 HIS 那一段做完了沒有。
             #   做完之後才失敗的(組信、附截圖、SMTP/Outlook)都與 HIS 無關 ——
             #   見下面重試分支的說明。每次 attempt 都要重設。
-            his_stage_done = False
+            his_stage_done = his_result is not None
             try:
                 logging.info("會診查詢任務 第 %d/%d 次嘗試（trigger=%s, 收件人組=%s, mail=%s）",
                              attempt, retry_count, trigger_label,
                              recipients_label, mail_method)
-                shot, extracted_text, extracted_html, roster_texts = run_consult_flow(
-                    trigger_label)
-                his_stage_done = True     # 這裡之後的失敗都不是 HIS 的問題
+                # ★[2026-08-05 外審第 5 輪 P1-04] HIS 只查一次★
+                #   上一版每個 attempt 都重跑 `run_consult_flow`,於是 SMTP timeout
+                #   會導致:再開一次會診畫面、再擷取一次、再點選一次每位病人、
+                #   再產生一張截圖、再組一封【內容可能不同】的信。log 卻寫著
+                #   「只重試寄信」—— 措辭與行為不符。
+                #   而且 SMTP 可能【已經收下第一封】只是回應逾時,第二次 attempt
+                #   會用新的 Message-ID 再寄一封 → 收件人收到兩封不一樣的清單。
+                #   查詢成功之後就把結果釘住,之後的 attempt 只重試寄送。
+                if his_result is None:
+                    his_result = run_consult_flow(trigger_label)
+                    his_stage_done = True   # 這裡之後的失敗都不是 HIS 的問題
+                else:
+                    logging.info("沿用上一次 attempt 已查到的會診結果(HIS 不重查)")
+                shot, extracted_text, extracted_html, roster_texts = his_result
                 # [2026-06-25] 輪詢 poll:只在「出現新病歷號」時才寄;否則靜默結束
                 # (不寄、不更新基準 → 下一輪仍會再比對)。email/手動觸發不受此限,照常無條件寄。
                 _poll_extract_note = ""
@@ -4509,17 +4576,34 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     raise JobSuperseded(
                         "本輪會診查詢已執行超過逾時上限並被新的一輪接管，"
                         "手上這份清單已經過時 → 不寄、也不更新已通知基準")
-                # ★[2026-08-04 外審 P1-08] 到這裡才把截圖落地★
-                #   走到這一行代表「這一輪真的要寄信」。沒有新會診的輪次在上面
-                #   就 return 了,磁碟上不會多出任何病人畫面。
-                shot = _materialize_shot(shot)
+                # ★[2026-08-05 外審第 5 輪 P1-04] payload 只組一次★
+                #   組好之後就固定:同一份主旨/內文/附件/Message-ID。重試 = 重送
+                #   同一封信,而不是「再查一次、再組一封新的」。
+                #   截圖也只落地一次 —— 舊寫法每個 attempt 都 `_materialize_shot`,
+                #   三次 attempt 就是三張病人畫面躺在磁碟上。
+                if delivery is None:
+                    # ★[2026-08-04 外審 P1-08] 到這裡才把截圖落地★
+                    #   走到這一行代表「這一輪真的要寄信」。沒有新會診的輪次在
+                    #   上面就 return 了,磁碟上不會多出任何病人畫面。
+                    delivery = _DeliveryArtifact(
+                        recipients=tuple(recipients),
+                        subject=subject,
+                        text_body=final_body,
+                        html_body=final_html,
+                        attachment=_materialize_shot(shot),
+                        message_id=_new_message_id(),
+                    )
                 if mail_method == "smtp":
-                    send_via_smtp(shot, subject, final_body, recipients,
-                                  html_body=final_html)
+                    send_via_smtp(delivery.attachment, delivery.subject,
+                                  delivery.text_body, list(delivery.recipients),
+                                  html_body=delivery.html_body,
+                                  message_id=delivery.message_id)
                 else:
-                    send_via_outlook(shot, subject, final_body, recipients,
-                                      sender_account=sender,
-                                      html_body=final_html)
+                    send_via_outlook(delivery.attachment, delivery.subject,
+                                     delivery.text_body,
+                                     list(delivery.recipients),
+                                     sender_account=sender,
+                                     html_body=delivery.html_body)
                 # [2026-06-25] 寄出成功 → 更新「已通知病歷號」基準,下一輪 poll 不再重複寄同一批。
                 # 【只在寄給一般收件人時更新】(poll / 手動):email 觸發是寄給「觸發醫師本人」、
                 # 不是團隊一般名單,若也更新基準會害下一輪 poll 看不到這筆新會診而漏寄給團隊
@@ -4621,6 +4705,11 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     #   原本的兩個坑因此自然消失:①email 觸發時 recipients 已被改寫成
                     #   觸發醫師本人(沿用會讓他同一次失敗收兩封);②團隊名單為空時
                     #   不可 `or recipients` 當後備(codex R2)。現在收件人與 cfg 無關。
+                    # ★[2026-08-05 外審第 5 輪 P2-05] 沒寄出去的截圖不留在磁碟上★
+                    #   `_materialize_shot` 的「留著當線索」取捨只對【寄成功】成立。
+                    #   這張圖沒有任何人看過、也沒有臨床用途,留著純粹是多出來的
+                    #   PHI 暴露面。
+                    _discard_undelivered_shot(delivery)
                     try:
                         _note_job_failure(_developer_alert_recipients(),
                                           str(last_err))

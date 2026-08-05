@@ -31,44 +31,49 @@ def _retry_branch_ifs():
     return [n for n in ast.walk(_TREE) if isinstance(n, ast.If)]
 
 
-def test_the_his_stage_is_marked_done_right_after_the_flow():
-    """★旗標要立在正確的位置★
-
-    必須是「`run_consult_flow` 回來之後、其他事情之前」。立太早（迴圈外／
-    呼叫之前）等於永遠是 True → 連 HIS 真的壞掉都不重置；立太晚（寄信之後）
-    等於永遠是 False → 這個修正沒有作用。
-    """
-    body = None
+def _loop():
+    """attempt 迴圈節點。"""
     for node in ast.walk(_TREE):
-        if not isinstance(node, ast.Try):
+        if isinstance(node, ast.For) and getattr(node.target, "id", "") == "attempt":
+            return node
+    raise AssertionError("找不到 attempt 迴圈")
+
+
+def test_the_his_stage_is_marked_done_when_the_query_already_succeeded():
+    """★旗標語意★ 迴圈開頭要反映「HIS 這段【之前的 attempt】已經做完了」。
+
+    立太早（無條件 True）→ 連 HIS 真的壞掉都不重置 session；
+    立太晚（永遠 False）→ 寄信失敗照樣收掉登入。
+    """
+    first = _loop().body[0]
+    assert isinstance(first, ast.Assign), ast.dump(first)[:200]
+    assert first.targets[0].id == "his_stage_done"
+    # his_result is not None —— 上一輪查成功就算做完
+    v = first.value
+    assert isinstance(v, ast.Compare), ast.dump(v)[:200]
+    assert isinstance(v.ops[0], ast.IsNot), ast.dump(v)[:200]
+    assert getattr(v.left, "id", "") == "his_result"
+
+
+def test_the_flag_is_set_right_after_a_successful_query():
+    """查成功的下一行就要標記 —— 之後的失敗都不是 HIS 的問題。"""
+    found = False
+    for node in ast.walk(_TREE):
+        if not isinstance(node, ast.If):
             continue
         stmts = node.body
         for i, st in enumerate(stmts):
-            call_names = {n.func.id for n in ast.walk(st)
-                          if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-            if "run_consult_flow" in call_names:
-                body = stmts[i + 1] if i + 1 < len(stmts) else None
-    assert body is not None, "找不到 run_consult_flow 之後的那一行"
-    assert isinstance(body, ast.Assign), ast.dump(body)[:200]
-    assert body.targets[0].id == "his_stage_done"
-    assert body.value.value is True, "run_consult_flow 之後必須立刻標記 HIS 這段已完成"
-
-
-def test_the_flag_is_reset_every_attempt():
-    """★每個 attempt 都要重設★
-
-    不重設的話：第 1 次 attempt 寄信失敗（旗標 True）→ 第 2 次 attempt 的
-    HIS 階段炸掉 → 旗標還是 True → 不重置 session → 一個壞掉的 session
-    會被一路重用到放棄。
-    """
-    for node in ast.walk(_TREE):
-        if isinstance(node, ast.For) and getattr(node.target, "id", "") == "attempt":
-            first = node.body[0]
-            assert isinstance(first, ast.Assign), ast.dump(first)[:200]
-            assert first.targets[0].id == "his_stage_done"
-            assert first.value.value is False
-            return
-    raise AssertionError("找不到 attempt 迴圈")
+            calls = {n.func.id for n in ast.walk(st)
+                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+            if "run_consult_flow" not in calls:
+                continue
+            nxt = stmts[i + 1] if i + 1 < len(stmts) else None
+            msg = "查成功之後沒有立刻標記 HIS 這段已完成"
+            assert isinstance(nxt, ast.Assign), msg
+            assert nxt.targets[0].id == "his_stage_done", msg
+            assert nxt.value.value is True, msg
+            found = True
+    assert found, "找不到 run_consult_flow 的呼叫"
 
 
 def _kill_runs_when(flag_value: bool) -> bool:
