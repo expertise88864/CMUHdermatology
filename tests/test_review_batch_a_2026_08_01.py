@@ -242,9 +242,19 @@ def test_review_markers_do_not_claim_a_future_date():
 
     2026-08-01 這一天的工作我全寫成了 2026-08-05。這條擋的是「日期標記寫到未來」
     這個形狀本身：本 repo 的 review 標記一律用當天日期。
-    （roster／day_course 測試裡的 2026-08-05 是**測試資料**（8/5 是週三），
-      所以只掃 src/ 的註解，不掃 tests/。）
+    （roster／day_course 測試裡的日期是**測試資料**，所以只掃 src/ 的註解，不掃 tests/。）
+
+    ★[2026-08-05] 判準從「寫死 2026-08-05」改成「跟今天比」★
+    原本這條把 2026-08-05 這個字串本身當成「未來」——那是寫這條的當天（8/1）
+    才成立的事。時間走到 8/5 之後，當天的正常標記就被自己的守衛擋下來，
+    而真正寫到未來的日期（8/6、9/1…）反而照樣通過。守衛的判準要是宣告式的
+    「不得晚於今天」，不是某一個當時剛好在未來的字面值。
     """
+    import re
+    from datetime import date
+
+    today = date.today()
+    iso = re.compile(r"\b(20\d{2})-(\d{2})-(\d{2})\b")
     root = os.path.join(os.path.dirname(__file__), "..", "src")
     bad = []
     for dirpath, _dirs, files in os.walk(root):
@@ -255,8 +265,13 @@ def test_review_markers_do_not_claim_a_future_date():
                 continue
             path = os.path.join(dirpath, name)
             for i, line in enumerate(io.open(path, encoding="utf-8"), 1):
-                if "2026-08-05" in line:
-                    bad.append(f"{name}:{i}")
+                for y, m, d in iso.findall(line):
+                    try:
+                        stamped = date(int(y), int(m), int(d))
+                    except ValueError:
+                        continue
+                    if stamped > today:
+                        bad.append(f"{name}:{i} → {stamped}")
     assert not bad, f"src/ 仍有未來日期的標記：{bad[:10]}"
 
 

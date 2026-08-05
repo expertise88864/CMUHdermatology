@@ -102,7 +102,7 @@ def test_threshold_defaults_cover_everything_save_writes():
     一半舊值」。這裡逐一列出 save_all_settings 實際寫進 threshold_settings.json
     的鍵,要求預設宣告全部涵蓋。"""
     written_by_save = {
-        "alert_chang_enabled", "alert_chen_enabled", "out_of_hospital_mode",
+        "alert_shen_enabled", "alert_chen_enabled", "out_of_hospital_mode",
         "ui_font_scale", "quick_text_f8", "alert_email_recipients",
     }
     defaults = sd.default_threshold_settings()

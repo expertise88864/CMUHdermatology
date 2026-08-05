@@ -5,7 +5,9 @@
 錨在【本週一 + 2 週】→ 可提前偵測的天數隨週內遞減(週一 13 天、週五 9 天、週日 7 天);更遠
 的診次只出現在「未來週次」分頁,那裡傳 is_future=True 直接關掉寄信、資料還只在分頁被點開時
 才更新。結果:兩三週前就掛滿的熱門診次【永遠不會提醒】——使用者實例:2026-07-17(週五)時
-7/30(週四)晚上張廖年峰已 >129 人(門檻 chang_thu_night=129)卻沒收到信。
+7/30(週四)晚上該醫師已超過門檻卻沒收到信。
+[2026-08-05] 止掛提醒對象改為沈冠宇(週三晚上,門檻 shen_wed_night=100),
+本檔的情境隨之改成「今天週五、12 天後的週三晚上」——不變量與當初完全一樣。
 
 【修法】改用不依賴 UI 的背景掃描 _scan_future_stop_signup_alerts:固定「今天起
 STOP_SIGNUP_SCAN_DAYS(28)天」,純讀既有 all_doctors_data 快取(reg52 早就抓進來、未來分頁
@@ -45,13 +47,13 @@ class _FakeVar:
         return self._v
 
 
-def _app(monkeypatch, by_date, chang_on=True, recipients=("me@example.com",)):
+def _app(monkeypatch, by_date, shen_on=True, recipients=("me@example.com",)):
     """組一個只帶掃描所需欄位的 app(不建 Tk)。"""
     app = main.AutomationApp.__new__(main.AutomationApp)
-    app.alert_chang_enabled = _FakeVar(chang_on)
+    app.alert_shen_enabled = _FakeVar(shen_on)
     app.alert_chen_enabled = _FakeVar(False)
     app.alert_email_recipients = list(recipients)
-    app.doctors_list = [{"name": "張廖年峰", "doc_no": "D12345"}]
+    app.doctors_list = [{"name": "沈冠宇", "doc_no": "D12345"}]
     app.all_doctors_data = {"D12345": by_date}
     app._doctor_data_lock = main.threading.Lock()
     app._alert_state_lock = main.threading.Lock()
@@ -82,11 +84,11 @@ def _dispatch_sync(monkeypatch, app):
 
 
 def test_user_case_thursday_clinic_13_days_out_now_alerts(monkeypatch):
-    """使用者實例:今天週五,13 天後的週四晚上已 130 人(門檻 129)→ 必須寄信。
+    """使用者實例:今天週五,12 天後的週三晚上已 130 人(門檻 100)→ 必須寄信。
     修正前這一天落在主行事曆(本週一+2 週)之外 → 完全不會寄。"""
     today = date(2026, 7, 17)                      # 週五
-    target = date(2026, 7, 30)                     # 週四(13 天後)
-    assert target.weekday() == 3 and (target - today).days == 13
+    target = date(2026, 7, 29)                     # 週三(12 天後)
+    assert target.weekday() == 2 and (target - today).days == 12
     app, sent = _app(monkeypatch, {target: [
         {"session": "晚上", "count": 130, "is_stopped": False, "room": "101診"}]})
     mails = _dispatch_sync(monkeypatch, app)
@@ -94,20 +96,20 @@ def test_user_case_thursday_clinic_13_days_out_now_alerts(monkeypatch):
     assert len(mails) == 1, "7/30 晚上已超過門檻 → 應寄出止掛提醒"
     subj, body, rcpts = mails[0]
     assert "止掛提醒" in subj and "130 人" in subj
-    assert "2026/7/30(週四)" in subj and "張廖年峰醫師" in subj
+    assert "2026/7/29(週三)" in subj and "沈冠宇醫師" in subj
     # [使用者定案 2026-07-20] 內文不再有「提前提醒/距此診次還有 N 天」與結尾附註
     assert "提前提醒" not in body and "還有" not in body
     assert "此診次只會通知這一封" not in body
-    assert "已達/超過止掛門檻 89 人" not in body   # 門檻是 129,顯示的是實際門檻
-    assert "已達/超過止掛門檻 129 人" in body and "目前掛號 130 人" in body
-    assert sent == [f"{target}_晚上_張廖年峰_main"], "須以 notify_key 記錄已寄(跨重啟去重)"
+    assert "已達/超過止掛門檻 90 人" not in body   # 門檻是 100,顯示的是實際門檻
+    assert "已達/超過止掛門檻 100 人" in body and "目前掛號 130 人" in body
+    assert sent == [f"{target}_晚上_沈冠宇_main"], "須以 notify_key 記錄已寄(跨重啟去重)"
 
 
 def test_scan_covers_whole_28_day_horizon_regardless_of_weekday(monkeypatch):
     # 視窗必須固定「今天起 28 天」,不再隨日曆週縮短(舊 bug 的根因)
     today = date(2026, 7, 19)                      # 週日 → 舊做法只剩 7 天
     far = today + timedelta(days=27)
-    while far.weekday() != 3:                      # 挑一個在門檻表內的週四
+    while far.weekday() != 2:                      # 挑一個在門檻表內的週三
         far -= timedelta(days=1)
     app, _ = _app(monkeypatch, {far: [
         {"session": "晚上", "count": 200, "is_stopped": False}]})
@@ -132,7 +134,7 @@ def test_scan_ignores_beyond_horizon_and_past(monkeypatch):
 def test_already_stopped_clinic_is_not_alerted(monkeypatch):
     # 已止掛 → 不會再增號,提醒無意義(與 threshold_policy 既有的 is_stopped 邏輯一致)
     today = date(2026, 7, 17)
-    target = date(2026, 7, 30)
+    target = date(2026, 7, 29)
     app, _ = _app(monkeypatch, {target: [
         {"session": "晚上", "count": 140, "is_stopped": True}]})
     mails = _dispatch_sync(monkeypatch, app)
@@ -142,19 +144,19 @@ def test_already_stopped_clinic_is_not_alerted(monkeypatch):
 
 def test_below_threshold_not_alerted(monkeypatch):
     today = date(2026, 7, 17)
-    target = date(2026, 7, 30)
+    target = date(2026, 7, 29)
     app, _ = _app(monkeypatch, {target: [
-        {"session": "晚上", "count": 128, "is_stopped": False}]})   # 門檻 129
+        {"session": "晚上", "count": 99, "is_stopped": False}]})    # 門檻 100
     mails = _dispatch_sync(monkeypatch, app)
     app._scan_future_stop_signup_alerts(today=today)
-    assert mails == [], "未達門檻不寄(129 才是門檻)"
+    assert mails == [], "未達門檻不寄(100 才是門檻)"
 
 
 def test_disabled_doctor_toggle_blocks_alert(monkeypatch):
     today = date(2026, 7, 17)
-    target = date(2026, 7, 30)
+    target = date(2026, 7, 29)
     app, _ = _app(monkeypatch, {target: [
-        {"session": "晚上", "count": 200}]}, chang_on=False)
+        {"session": "晚上", "count": 200}]}, shen_on=False)
     mails = _dispatch_sync(monkeypatch, app)
     app._scan_future_stop_signup_alerts(today=today)
     assert mails == [], "該醫師提醒開關關閉時不寄"
@@ -163,7 +165,7 @@ def test_disabled_doctor_toggle_blocks_alert(monkeypatch):
 def test_no_duplicate_email_for_same_clinic(monkeypatch):
     # 每輪 refresh 都會掃 → 同一診次只能寄一次(靠 notify_key 持久化去重)
     today = date(2026, 7, 17)
-    target = date(2026, 7, 30)
+    target = date(2026, 7, 29)
     app, sent = _app(monkeypatch, {target: [
         {"session": "晚上", "count": 130, "is_stopped": False}]})
     mails = _dispatch_sync(monkeypatch, app)
@@ -174,7 +176,7 @@ def test_no_duplicate_email_for_same_clinic(monkeypatch):
 
 def test_no_recipients_sends_nothing(monkeypatch):
     today = date(2026, 7, 17)
-    app, _ = _app(monkeypatch, {date(2026, 7, 30): [
+    app, _ = _app(monkeypatch, {date(2026, 7, 29): [
         {"session": "晚上", "count": 200}]}, recipients=())
     mails = _dispatch_sync(monkeypatch, app)
     app._scan_future_stop_signup_alerts(today=today)
@@ -186,7 +188,7 @@ def test_stale_startup_cache_is_not_alerted(monkeypatch):
     用舊資料寄提醒會寄錯,而且會把該診次【永久】標記已寄 → 之後真的爆掉反而不提醒。
     故:沒收到該醫師的即時資料前不掃。"""
     today = date(2026, 7, 17)
-    target = date(2026, 7, 30)
+    target = date(2026, 7, 29)
     app, _ = _app(monkeypatch, {target: [{"session": "晚上", "count": 200}]})
     app._live_clinic_data_keys = set()          # 尚未收到任何即時資料(開機當下)
     mails = _dispatch_sync(monkeypatch, app)
@@ -262,7 +264,7 @@ def test_handler_marks_live_on_final_and_clears_on_non_final():
 def test_eligibility_follows_currently_stored_payload(monkeypatch):
     """行為:final 解鎖 → 掃描會寄;之後 partial/fallback 覆蓋 → 資格取消 → 不再寄。"""
     today = date(2026, 7, 17)
-    target = date(2026, 7, 30)
+    target = date(2026, 7, 29)
     app, _ = _app(monkeypatch, {target: [
         {"session": "晚上", "count": 130, "is_stopped": False}]})
     mails = _dispatch_sync(monkeypatch, app)
@@ -286,11 +288,11 @@ def test_calendar_and_scan_cannot_both_send_same_clinic(monkeypatch):
     持久化的「已寄」記號是【寄成功後】才寫的,所以要靠共用的原子 claim 擋住。
     這裡模擬:行事曆那邊已取得寄送權、SMTP 還在飛,此時掃描跑起來 → 必須不寄。"""
     today = date(2026, 7, 17)
-    target = date(2026, 7, 30)
+    target = date(2026, 7, 29)
     app, _ = _app(monkeypatch, {target: [
         {"session": "晚上", "count": 130, "is_stopped": False}]})
     mails = _dispatch_sync(monkeypatch, app)
-    nk = f"{target}_晚上_張廖年峰_main"
+    nk = f"{target}_晚上_沈冠宇_main"
     assert app._claim_alert_email(nk) is True    # 行事曆先搶到寄送權(信還在寄)
     app._scan_future_stop_signup_alerts(today=today)
     assert mails == [], "另一條路徑正在寄 → 掃描不得再寄一封"
@@ -303,7 +305,7 @@ def test_calendar_and_scan_cannot_both_send_same_clinic(monkeypatch):
 
 def test_claim_is_atomic_and_released_on_failure(monkeypatch):
     app, _ = _app(monkeypatch, {})
-    nk = "2026-07-30_晚上_張廖年峰_main"
+    nk = "2026-07-29_晚上_沈冠宇_main"
     assert app._claim_alert_email(nk) is True
     assert app._claim_alert_email(nk) is False, "同一 key 不得重複取得寄送權"
     app._release_alert_email_claim(nk)
@@ -318,7 +320,7 @@ def test_claim_released_when_dispatch_body_raises(monkeypatch):
     → 外層掃描的 catch 會吞掉,但寄送權必須釋放,否則該診次永久卡在 in-flight、
     本次執行再也不寄。"""
     today = date(2026, 7, 17)
-    target = date(2026, 7, 30)
+    target = date(2026, 7, 29)
     app, _ = _app(monkeypatch, {target: [
         {"session": "晚上", "count": 130, "is_stopped": False}]})
     _dispatch_sync(monkeypatch, app)
@@ -341,7 +343,7 @@ def test_claim_released_when_dispatch_body_raises(monkeypatch):
 def test_claim_released_when_thread_start_raises(monkeypatch):
     # Thread 啟動失敗(執行緒耗盡)也必須釋放寄送權
     today = date(2026, 7, 17)
-    target = date(2026, 7, 30)
+    target = date(2026, 7, 29)
     app, _ = _app(monkeypatch, {target: [
         {"session": "晚上", "count": 130, "is_stopped": False}]})
     monkeypatch.setattr(main, "_send_alert_email_via_smtp",
@@ -356,7 +358,7 @@ def test_claim_released_when_thread_start_raises(monkeypatch):
 def test_failed_send_can_retry_next_scan(monkeypatch):
     # 寄失敗(SMTP 暫時故障)→ 沒有永久記號 → 下一輪掃描應重試
     today = date(2026, 7, 17)
-    target = date(2026, 7, 30)
+    target = date(2026, 7, 29)
     app, sent = _app(monkeypatch, {target: [
         {"session": "晚上", "count": 130, "is_stopped": False}]})
     attempts = []
@@ -377,7 +379,7 @@ def test_malformed_date_value_skipped_not_aborting_scan(monkeypatch):
     # [codex P2] 某日的值不是 list(None/int/壞物件)→ 只跳過該日,不炸掉整輪;同醫師其他
     # 日期仍正常寄。原本 list(v) 會拋例外被外層 catch → 全部醫師都不寄。
     today = date(2026, 7, 17)
-    good = date(2026, 7, 30)
+    good = date(2026, 7, 29)
     bad = date(2026, 7, 28)
     app, _ = _app(monkeypatch, {
         bad: None,                                   # 畸形:非 list
@@ -396,18 +398,18 @@ def test_one_bad_doctor_does_not_block_other_doctor(monkeypatch):
     app, _ = _app(monkeypatch, {})
     app.alert_chen_enabled = _FakeVar(True)       # 兩位都啟用
     app.doctors_list = [
-        {"name": "張廖年峰", "doc_no": "D12345"},
+        {"name": "沈冠宇", "doc_no": "D12345"},
         {"name": "陳駿升", "doc_no": "D67890"},
     ]
     app._live_clinic_data_keys = {"D12345", "D67890"}
     app.all_doctors_data = {
-        "D12345": "整塊不是 dict",                 # 張廖:畸形 → 該位跳過
+        "D12345": "整塊不是 dict",                 # 沈:畸形 → 該位跳過
         "D67890": {tue: [{"session": "晚上", "count": 100, "is_stopped": False}]},
     }
     mails = _dispatch_sync(monkeypatch, app)
     app._scan_future_stop_signup_alerts(today=today)
     assert len(mails) == 1 and "陳駿升" in mails[0][0], \
-        "張廖快取畸形不得害陳駿升的提醒不寄"
+        "沈冠宇快取畸形不得害陳駿升的提醒不寄"
 
 
 def test_scan_swallows_errors(monkeypatch):

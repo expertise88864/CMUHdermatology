@@ -5,33 +5,56 @@ from __future__ import annotations
 import re
 from typing import Any
 
+# ★[2026-08-05 使用者定案] 止掛提醒對象改為 陳駿升 + 沈冠宇★
+#   張廖年峰不再做止掛提醒(整套止掛邏輯保留,只是不再有他的門檻)。
+#   沈冠宇的一早/一午/三午【刻意不給預設值】—— 沒有預設就不會有門檻,
+#   `build_doctor_threshold_map` 會跳過那些診次(int(None)/int("") 都落到 except),
+#   等使用者自己在設定頁填上數字才開始提醒。只有三晚預設 100 人。
 DEFAULT_THRESHOLDS = {
-    "chang_mon_night": 129,
-    "chang_thu_morning": 109,
-    "chang_thu_night": 129,
-    "chang_fri_afternoon": 89,
     "chen_mon_afternoon": 69,
     "chen_tue_night": 59,
     "chen_thu_morning": 54,
     "chen_thu_afternoon": 69,
+    "shen_wed_night": 100,
 }
 
 _DOCTOR_THRESHOLD_KEYS = {
-    "張廖年峰": (
-        ((0, "晚上"), "chang_mon_night"),
-        ((3, "上午"), "chang_thu_morning"),
-        ((3, "晚上"), "chang_thu_night"),
-        ((4, "下午"), "chang_fri_afternoon"),
-    ),
     "陳駿升": (
         ((0, "下午"), "chen_mon_afternoon"),
         ((1, "晚上"), "chen_tue_night"),
         ((3, "上午"), "chen_thu_morning"),
         ((3, "下午"), "chen_thu_afternoon"),
     ),
+    "沈冠宇": (
+        ((0, "上午"), "shen_mon_morning"),      # 一早：無預設
+        ((0, "下午"), "shen_mon_afternoon"),    # 一午：無預設
+        ((2, "下午"), "shen_wed_afternoon"),    # 三午：無預設
+        ((2, "晚上"), "shen_wed_night"),        # 三晚：預設 100
+    ),
 }
 
 _COUNT_DIGIT_RE = re.compile(r"(\d+)")
+
+
+def normalize_threshold_entry(cfg_key: str, raw: Any):
+    """設定頁一格門檻要存進 threshold_settings.json 的值。
+
+    ★留空 = 這個診次【沒有門檻】,不是 0★
+      門檻 0 會讓 `is_near_alert_threshold`(count >= 0 - margin)恆真 ——
+      「還沒設定」會變成「每一診都提醒」,方向完全相反。這一格原本的寫法是
+      `except: DEFAULT_THRESHOLDS.get(key, 0)`,對沈冠宇那三個【刻意沒有預設】
+      的診次就會存下 0。故:空字串一律存 ""(build_doctor_threshold_map 會跳過)。
+
+    看不懂的輸入(打錯字)則沿用該鍵的原廠預設;沒有原廠預設的鍵同樣退成 ""。
+    """
+    text = str(raw if raw is not None else "").strip()
+    if not text:
+        return ""
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        fallback = DEFAULT_THRESHOLDS.get(cfg_key)
+        return "" if fallback is None else int(fallback)
 
 
 def build_doctor_threshold_map(doctor_name: str, threshold_settings: dict | None) -> dict:

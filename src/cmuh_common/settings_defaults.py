@@ -75,7 +75,9 @@ def default_threshold_settings() -> dict:
     """
     out = dict(DEFAULT_THRESHOLDS)
     out.update({
-        "alert_chang_enabled": False,
+        # [2026-08-05] 新加的止掛對象預設【開】——不然使用者要求的提醒要再去勾一次才會動。
+        # 只有三晚(預設 100)有門檻,一早/一午/三午沒填數字前不會提醒。
+        "alert_shen_enabled": True,
         "alert_chen_enabled": False,
         "out_of_hospital_mode": False,
         "ui_font_scale": 1.0,

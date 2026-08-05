@@ -51,6 +51,7 @@ from cmuh_common.threshold_policy import (
     DEFAULT_THRESHOLDS,
     build_doctor_threshold_map,
     is_near_alert_threshold,
+    normalize_threshold_entry,
 )
 from cmuh_common import his_contract as _HIS_CONTRACT
 from cmuh_common.alert_dedupe import AlertDeduper as _AlertDeduper
@@ -8617,7 +8618,7 @@ class AutomationApp:
         self.ui_font_scale_var = tk.DoubleVar(value=max(0.85, min(1.45, _ufs)))
         # [預設關閉] 多台電腦同時跑時，若有人達到止掛門檻會重複寄信 → 預設關。
         # 想開啟止掛提醒/寄信的電腦，到設定頁勾選對應醫師即可。
-        self.alert_chang_enabled = tk.BooleanVar(value=self.threshold_settings.get("alert_chang_enabled", False))
+        self.alert_shen_enabled = tk.BooleanVar(value=self.threshold_settings.get("alert_shen_enabled", True))
         self.alert_chen_enabled = tk.BooleanVar(value=self.threshold_settings.get("alert_chen_enabled", False))
         # 止掛達門檻時要寄信通知的收件人（可多人）
         self.alert_email_recipients = list(self.threshold_settings.get(
@@ -8632,7 +8633,7 @@ class AutomationApp:
         # [2026-07-13 使用者] 外院/分院診次固定顯示（設定已移除、不再讓使用者勾選）。
         self.show_external_clinics = tk.BooleanVar(value=True)
 
-        self.val_alert_chang = self.alert_chang_enabled.get()
+        self.val_alert_shen = self.alert_shen_enabled.get()
         self.val_alert_chen = self.alert_chen_enabled.get()
         self.val_out_of_hospital = self.out_of_hospital_var.get()
 
@@ -9706,17 +9707,18 @@ class AutomationApp:
                            _stamp_r_doctor_revision(self.r_doctor_map))
         
         for key, var in self.threshold_entries.items():
-            try: self.threshold_settings[key] = int(var.get())
-            except (ValueError, TypeError):
-                self.threshold_settings[key] = DEFAULT_THRESHOLDS.get(key, 0)
-                var.set(self.threshold_settings[key])
+            # [2026-08-05] 留空 = 這個診次不設門檻、不提醒(沈冠宇一早/一午/三午的出廠狀態)。
+            # 語意與理由都在 normalize_threshold_entry(那裡有測試釘住「不可存成 0」)。
+            value = normalize_threshold_entry(key, var.get())
+            self.threshold_settings[key] = value
+            var.set(value)
         try:
             ufs = float(self.ui_font_scale_var.get())
         except (TypeError, ValueError):
             ufs = 1.0
         self.threshold_settings['ui_font_scale'] = max(0.85, min(1.45, ufs))
         
-        self.threshold_settings['alert_chang_enabled'] = self.alert_chang_enabled.get()
+        self.threshold_settings['alert_shen_enabled'] = self.alert_shen_enabled.get()
         self.threshold_settings['alert_chen_enabled'] = self.alert_chen_enabled.get()
         self.threshold_settings['out_of_hospital_mode'] = self.out_of_hospital_var.get()
         # [2026-07-13 使用者] show_external_clinics / notify_dnd / clinic_night_monitor 設定已移除；
@@ -13331,19 +13333,22 @@ class AutomationApp:
 
         def on_doctor_alert_change():
             # [修正] 當 UI 變更時，同步更新影子變數
-            self.val_alert_chang = self.alert_chang_enabled.get()
+            self.val_alert_shen = self.alert_shen_enabled.get()
             self.val_alert_chen = self.alert_chen_enabled.get()
             
             self.status_text.set("狀態: 設定變更，正在重新整理...")
             self._trigger_refresh(True)
 
-        chang_frame = ttk.Frame(threshold_main_frame); chang_frame.pack(fill=tk.X, pady=5)
-        ttk.Checkbutton(chang_frame, text="啟用 [張廖年峰]", variable=self.alert_chang_enabled, command=on_doctor_alert_change).pack(side=tk.LEFT, padx=(0, 10))
-        chang_labels = {'chang_mon_night': '一晚:', 'chang_thu_morning': '四早:', 'chang_thu_night': '四晚:', 'chang_fri_afternoon': '五午:'}
-        for key, label in chang_labels.items():
-            ttk.Label(chang_frame, text=label).pack(side=tk.LEFT, padx=(5, 2))
+        # [2026-08-05 使用者定案] 張廖年峰不再做止掛提醒;改為沈冠宇。
+        #   一早/一午/三午【刻意留空】——沒填數字就不會有門檻、不會提醒,
+        #   等使用者自己決定要不要設。只有三晚預設 100 人。
+        shen_frame = ttk.Frame(threshold_main_frame); shen_frame.pack(fill=tk.X, pady=5)
+        ttk.Checkbutton(shen_frame, text="啟用 [沈冠宇]    ", variable=self.alert_shen_enabled, command=on_doctor_alert_change).pack(side=tk.LEFT, padx=(0, 10))
+        shen_labels = {'shen_mon_morning': '一早:', 'shen_mon_afternoon': '一午:', 'shen_wed_afternoon': '三午:', 'shen_wed_night': '三晚:'}
+        for key, label in shen_labels.items():
+            ttk.Label(shen_frame, text=label).pack(side=tk.LEFT, padx=(5, 2))
             var = tk.StringVar(value=self.threshold_settings.get(key, DEFAULT_THRESHOLDS.get(key, '')))
-            ttk.Entry(chang_frame, textvariable=var, width=4).pack(side=tk.LEFT, padx=0)
+            ttk.Entry(shen_frame, textvariable=var, width=4).pack(side=tk.LEFT, padx=0)
             self.threshold_entries[key] = var
         
         ttk.Separator(threshold_main_frame, orient='horizontal').pack(fill='x', pady=8)
@@ -13600,7 +13605,7 @@ class AutomationApp:
         for key, var in getattr(self, 'threshold_entries', {}).items():
             var.set(self.threshold_settings.get(key, DEFAULT_THRESHOLDS.get(key, '')))
         for attr, key, fallback in (
-                ('alert_chang_enabled', 'alert_chang_enabled', False),
+                ('alert_shen_enabled', 'alert_shen_enabled', True),
                 ('alert_chen_enabled', 'alert_chen_enabled', False),
                 ('out_of_hospital_var', 'out_of_hospital_mode', False),
                 ('quick_text_f8_var', 'quick_text_f8', F8_QUICK_TEXT_DEFAULT),
@@ -13609,7 +13614,7 @@ class AutomationApp:
             if var is not None:
                 var.set(self.threshold_settings.get(key, fallback))
         # 影子變數要跟著走,否則止掛提醒仍沿用還原前的開關
-        self.val_alert_chang = self.alert_chang_enabled.get()
+        self.val_alert_shen = self.alert_shen_enabled.get()
         self.val_alert_chen = self.alert_chen_enabled.get()
 
         if getattr(self, 'alert_mail_listbox', None) is not None:
@@ -13851,7 +13856,7 @@ class AutomationApp:
         FIXED_SLOTS = 4
 
         doctor_threshold_maps = {
-            "張廖年峰": self._get_doctor_threshold_map("張廖年峰"),
+            "沈冠宇": self._get_doctor_threshold_map("沈冠宇"),
             "陳駿升": self._get_doctor_threshold_map("陳駿升"),
         }
 
@@ -13987,9 +13992,9 @@ class AutomationApp:
                                                 full_threshold = None
                                                 session_key = (weekday_idx, session_name)
                                                 
-                                                if doc_name == "張廖年峰" and self.alert_chang_enabled.get():
-                                                    if session_key in doctor_threshold_maps["張廖年峰"]: 
-                                                        full_threshold = int(doctor_threshold_maps["張廖年峰"][session_key])
+                                                if doc_name == "沈冠宇" and self.alert_shen_enabled.get():
+                                                    if session_key in doctor_threshold_maps["沈冠宇"]: 
+                                                        full_threshold = int(doctor_threshold_maps["沈冠宇"][session_key])
                                                         alert_threshold = full_threshold - 10
                                                 elif doc_name == "陳駿升" and self.alert_chen_enabled.get():
                                                     if session_key in doctor_threshold_maps["陳駿升"]: 
@@ -14718,8 +14723,8 @@ class AutomationApp:
         附近的診次)。與行事曆共用同一組 notify_key 持久化去重 → 不會重複寄。"""
         try:
             enabled = {}
-            if self.alert_chang_enabled.get():
-                enabled["張廖年峰"] = self._get_doctor_threshold_map("張廖年峰")
+            if self.alert_shen_enabled.get():
+                enabled["沈冠宇"] = self._get_doctor_threshold_map("沈冠宇")
             if self.alert_chen_enabled.get():
                 enabled["陳駿升"] = self._get_doctor_threshold_map("陳駿升")
             enabled = {k: v for k, v in enabled.items() if v}
