@@ -2428,6 +2428,13 @@ class _PersistentSession:
         self.hproc = hproc            # CreateProcess 的行程 handle(殺人執照)
         self.hthread = hthread
         self.pid = pid
+        # ★`our_pids` 只能拿來【找】東西,不可以拿來判定身分★(2026-08-05 實機證據)
+        #   診間 log 三次登入、三次都在收尾時排除掉一個外來的 systemftp
+        #   (pid 15056 / 8036 / 18748),而且 `登入視窗 hwnd=... pid=[8036, 16276]`
+        #   顯示【登入當下】這個集合就已經含著別人的行程。它是全機 PID 差集,
+        #   冷啟動那 120 秒內醫師自己開一次住院系統就會混進來。
+        #   找視窗找錯只是找不到;判身分弄錯是關掉別人的程式 / 把別人的視窗
+        #   當成自己還活著。後者一律改用 `main_*` 這組確切身分。
         self.our_pids = set(our_pids)
         # ★我們【確切登入的那個】主畫面★(2026-08-04 外審後自查 P0)
         #   `our_pids` 是全機 PID 差集,實機證實會混進外來的 systemftp
@@ -2437,6 +2444,13 @@ class _PersistentSession:
         #   `_wait_main_window_after_login()` 本來就【回傳】這個 hwnd,只是以前
         #   被丟掉。存下來,收尾就只關這一個。
         self.main_hwnd = main_hwnd
+        # ★hwnd 自己不足以當身分★(2026-08-05 外審第 4 輪 P1-04)
+        #   視窗銷毀後 handle 值會被 Windows 回收再發給別人。只憑 hwnd 就送
+        #   WM_CLOSE,可能關到「剛好拿到同一個號碼」的另一個視窗;只憑 hwnd 判活,
+        #   也可能把別人的視窗當成我們還活著。連 class 與 pid 一起記下來,
+        #   用之前先驗這三樣還是不是同一個。三者都對不代表宇宙唯一,但足以
+        #   把「handle 被回收」這個實際會發生的情況擋掉。
+        self.main_pid, self.main_class = _window_identity(main_hwnd)
         self.started_at = time.time() # 供 6 小時定期重啟判斷
         # [codex P1 R12] 租約:正在被某個 worker 使用中。run_consult_flow 的 240 秒
         # join 逾時會【棄置】worker(daemon 緒仍在跑),下一輪絕不可跟它共用同一個
@@ -2472,20 +2486,38 @@ def _session_death_reason(sess) -> str:
     ★所以權威訊號改成【主畫面視窗】★:session 能不能用,取決於主畫面在不在,
     不取決於我們當初 spawn 的那個啟動器有沒有活著。行程 handle 降級成「主畫面
     不在時，用來說明是哪一種不在」。
+
+    ★[2026-08-05 外審第 4 輪 P1-05 + 實機證據] 但不可以問 `our_pids`★
+    上一版寫的是 `find_windows(MAIN_CLASS, pids=sess.our_pids)`。診間 log 顯示
+    這個集合【每一次登入】都含著外來的 systemftp(`登入視窗 hwnd=... pid=[8036,
+    16276]`,三次登入三次都要在收尾時排除一個)。於是這個判定會因為**醫師自己那個
+    住院系統的主畫面還開著**而回答「我們的 session 還活著」——我們接著對一個
+    早就不存在的 session 送查詢、失敗、走恢復路徑;更糟的是誤以為手上有東西。
+    改問我們【確切登入的那一個】視窗:`sess.main_hwnd` + 身分指紋。
     """
-    if find_windows(MAIN_CLASS, pids=sess.our_pids):
-        return ""          # 主畫面還在 → 可以用(啟動器早就結束是正常的)
+    hwnd = getattr(sess, "main_hwnd", None)
+    if not hwnd:
+        return "這個 session 從未登入成功(沒有記到主畫面)"
+    if _window_alive(hwnd):
+        # ★存在 ≠ 還是我們那一個★ handle 被回收後會指向別人的視窗
+        if _is_same_window(sess):
+            return ""      # 主畫面還在 → 可以用(啟動器早就結束是正常的)
+        return "主畫面 hwnd 已被回收給別的視窗(不再是我們登入的那一個)"
     try:
         if win32event.WaitForSingleObject(sess.hproc, 0) != win32event.WAIT_TIMEOUT:
             return "我們啟動的 systemftp 行程已結束,主畫面也不在"
     except Exception:
         return "無法查詢 systemftp 行程狀態,且主畫面不在"
-    return "行程還在,但找不到主畫面視窗"
+    return "行程還在,但我們登入的主畫面已經不存在"
 
 
 def _session_is_alive(sess) -> bool:
-    """行程還活著 + 主畫面視窗還在。★呼叫緒須在隱藏桌面上★(find_windows 只列舉
-    本緒桌面)。主畫面在但被 modal 擋住的情況這裡不驗——查詢會失敗,由恢復機制處理。"""
+    """我們登入的那個主畫面還在不在(身分要對得上)。
+
+    ★[2026-08-05] 不再依賴呼叫緒的桌面★ 舊版用 `find_windows`(只列舉本緒桌面)
+    所以要求呼叫緒必須在隱藏桌面上;現在只對一個已知 hwnd 做 IsWindow /
+    GetWindowThreadProcessId / GetClassName,這三個不受呼叫緒桌面影響。
+    主畫面在但被 modal 擋住的情況這裡不驗——查詢會失敗,由恢復機制處理。"""
     return not _session_death_reason(sess)
 
 
@@ -2528,19 +2560,77 @@ def _verified_owned_pids(root_pid: int, candidates) -> set:
     return keep
 
 
-def _window_is_gone(hwnd: int) -> bool:
-    """視窗還在不在（不存在、或已不可見都算不在了）。
+def _window_identity(hwnd) -> tuple:
+    """(pid, class) —— 視窗的身分指紋。查不到回 (None, None)。"""
+    if not hwnd:
+        return (None, None)
+    pid = cls = None
+    try:
+        _tid, pid = win32process.GetWindowThreadProcessId(hwnd)
+    except Exception:
+        logging.debug("[session] 取視窗 pid 失敗 hwnd=%s", hwnd, exc_info=True)
+    try:
+        cls = win32gui.GetClassName(hwnd)
+    except Exception:
+        logging.debug("[session] 取視窗 class 失敗 hwnd=%s", hwnd, exc_info=True)
+    return (pid, cls)
 
-    ★不可以只看 IsWindow★（2026-07-27 診間事故的教訓）：Delphi 的表單關閉後常常
-    只是 Hide、handle 仍有效。這裡兩個都看：任何一個成立就代表這個視窗已經不是
-    「一個活著的、我們能用的主畫面」了。
+
+def _is_same_window(sess) -> bool:
+    """`sess.main_hwnd` 現在指的還是不是【當初登入的那一個】視窗。
+
+    handle 值會被回收再發給別人,所以「IsWindow 為真」只證明這個號碼現在有主,
+    不證明主人還是我們。比對登入當下記下的 (pid, class)。
+
+    ★沒有記到身分(舊 session/查不到)時回 False★ —— 「不知道」不可以當成
+    「是」:下游會拿它去送 WM_CLOSE。寧可少關一個(有告警),不可關錯一個。
+    """
+    hwnd = getattr(sess, "main_hwnd", None)
+    if not hwnd:
+        return False
+    want_pid = getattr(sess, "main_pid", None)
+    want_cls = getattr(sess, "main_class", None)
+    if want_pid is None or want_cls is None:
+        return False
+    return _window_identity(hwnd) == (want_pid, want_cls)
+
+
+def _window_alive(hwnd: int) -> bool:
+    """這個視窗還存在嗎 —— 給【判活/要不要重登】用。
+
+    ★這裡刻意【不看】可見性★:`_stealth()` 的 SW_HIDE 後備模式會主動把視窗藏起來
+    (見 `_wait_main_window_after_login` 的既有說明「那條路徑上可見性根本不是有效
+    訊號」)。把「被我們自己藏起來」讀成「死了」,結果就是每一輪重登、每 3 分鐘重送
+    一次帳密 —— 那正是 2026-08-04 才剛修掉的實機故障。
+
+    查不到 → False(當作不能用):判活的安全方向是「寧可重登」。
     """
     try:
-        if not win32gui.IsWindow(hwnd):
-            return True
-        return not win32gui.IsWindowVisible(hwnd)
+        return bool(win32gui.IsWindow(hwnd))
     except Exception:
-        return True                    # 查不到 handle → 當作已經不在
+        logging.debug("[session] 查詢視窗存在與否失敗 hwnd=%s", hwnd, exc_info=True)
+        return False
+
+
+def _window_destroyed(hwnd: int) -> bool:
+    """這個視窗是不是【真的被銷毀了】—— 給【收尾確認】用。
+
+    ★與 `_window_alive` 不是互為反面★,兩者對「不知道」的處置刻意相反:
+      * 判活問「還能用嗎」→ 不知道就當不能用(重登,代價是多一次登入)
+      * 收尾問「關掉了嗎」→ 不知道就當【沒關掉】(告警,代價是多一次人工確認)
+    兩個問題若共用一個述詞,其中一邊必然是錯的方向。這正是外審第 4 輪 P1-01/P1-02
+    指出的:舊的 `_window_is_gone` 把「隱藏」與「API 例外」都算成「已經關掉了」——
+    於是 HIS 明明還登入著,程式卻回報收尾成功、還把參照丟掉。
+
+    ★也不看可見性★:Delphi 的表單關閉後常常只是 Hide(2026-07-27 事故),
+    所以「看不見」【更不能】拿來當「已經關掉」的證據。只有 handle 真的失效才算。
+    """
+    try:
+        return not win32gui.IsWindow(hwnd)
+    except Exception:
+        logging.warning("[session] 無法確認視窗是否已關閉 hwnd=%s → 一律視為【尚未關閉】",
+                        hwnd, exc_info=True)
+        return False                   # 不知道 ≠ 關掉了
 
 
 def _close_session_windows(sess, *, close=None, gone=None, sleep=None) -> bool:
@@ -2568,7 +2658,7 @@ def _close_session_windows(sess, *, close=None, gone=None, sleep=None) -> bool:
     """
     close = close or (lambda h: win32gui.PostMessage(
         h, win32con.WM_CLOSE, 0, 0))
-    gone = gone or _window_is_gone
+    gone = gone or _window_destroyed
     sleep = sleep or time.sleep
 
     hwnd = getattr(sess, "main_hwnd", None)
@@ -2578,7 +2668,19 @@ def _close_session_windows(sess, *, close=None, gone=None, sleep=None) -> bool:
         logging.debug("[session] 這個 session 沒有主畫面可關(從未登入成功)")
         return True
     if gone(hwnd):
+        logging.info("[session] 主畫面已不存在(hwnd=%s) → 無需關閉", hwnd)
         return True                    # 本來就不在了 → 沒東西要關
+    # ★送 WM_CLOSE 之前先確認這個號碼還是當初那個視窗★(外審第 4 輪 P1-04)
+    #   handle 會被回收:原視窗銷毀後,同一個數值可能已經是別的視窗 —— 極可能
+    #   就是醫師自己開的住院系統(同一支程式、同一個 class)。比對 (pid, class)。
+    if not _is_same_window(sess):
+        now_pid, now_cls = _window_identity(hwnd)
+        logging.error("[session] ★hwnd=%s 已不是我們登入的那個視窗★"
+                      "(當初 pid=%s class=%s,現在 pid=%s class=%s) → 不送 WM_CLOSE。"
+                      "我們的 HIS session 可能仍登入中,請人工確認隱藏桌面",
+                      hwnd, getattr(sess, "main_pid", None),
+                      getattr(sess, "main_class", None), now_pid, now_cls)
+        return False                   # 沒關成功,而且不可以亂關 → 交給掛帳機制
     try:
         close(hwnd)
     except Exception:
@@ -2616,7 +2718,11 @@ def _terminate_session_process(sess) -> None:
     #   淨結果是 teardown 只清掉 Python 這邊的參照,真正的 HIS UI 還留在隱藏桌面 ——
     #   「6 小時定期重啟」「休息時段收掉」「接管舊 worker」全都只是說說而已。
     #   ★這是上一批(只終止自有行程)換來的代價,必須補回來★
-    _close_session_windows(sess)
+    # ★[2026-08-05 外審第 4 輪 P1-03] 關不掉要掛帳★ 呼叫端已經把 `_psession`
+    #   清成 None 了,這裡是最後一個還認得這個 session 的地方。不掛帳就等於
+    #   讓一個【仍然登入中】的 HIS 從此無人認領。
+    if not _close_session_windows(sess):
+        _note_unclosed_session(sess, "teardown 時主畫面沒有關掉")
     try:
         still = (win32event.WaitForSingleObject(sess.hproc, 0)
                  == win32event.WAIT_TIMEOUT)
@@ -2633,6 +2739,64 @@ def _terminate_session_process(sess) -> None:
                 _h.Close()
             except Exception:
                 pass
+
+
+# ★關不掉的 session 要【掛帳】,不可以連參照一起丟★(2026-08-05 外審第 4 輪 P1-03)
+#   `_session_close` 是先 `_psession = None` 再去關。關失敗時(HIS 沒回應 WM_CLOSE、
+#   hwnd 身分對不上、modal 擋著)我們已經丟掉唯一的參照 —— 那個【仍然登入中】的 HIS
+#   從此沒有任何程式碼認得它,下一輪看到「沒有 session」就再冷啟動登入一次。
+#   而 systemftp 是啟動器型行程(實機證實),`TerminateProcess` 那條後路對它無效,
+#   `_kill_systemftp` 也已經不再 taskkill。淨結果:隱藏桌面上逐次累積登入中的 HIS,
+#   沒有任何一段程式碼會再去收它。
+#   → 關不掉就掛在這裡,每一輪重試,並且告警(不會自己好的事情要讓人知道)。
+_unclosed_lock = threading.Lock()
+_unclosed_sessions: list = []
+_MAX_UNCLOSED = 8                   # 上限只是防爆,達到上限【不是】丟掉舊的理由
+
+
+def _note_unclosed_session(sess, reason: str) -> None:
+    """關不掉 → 掛帳。已經在帳上的不重複加。"""
+    with _unclosed_lock:
+        if any(s is sess for s in _unclosed_sessions):
+            return
+        if len(_unclosed_sessions) >= _MAX_UNCLOSED:
+            # ★不丟掉任何一筆★ 丟掉就等於回到「沒人認得它」。只是不再長。
+            logging.error("[session] 關不掉的 session 已累積 %d 個(上限)"
+                          " —— 請人工檢查隱藏桌面上的住院系統",
+                          len(_unclosed_sessions))
+            return
+        _unclosed_sessions.append(sess)
+    logging.error("[session] ★關不掉,先掛帳待重試★(pid=%s hwnd=%s):%s"
+                  " —— 這個 HIS session 可能仍登入中",
+                  sess.pid, getattr(sess, "main_hwnd", None), reason)
+
+
+def _retry_unclosed_sessions() -> int:
+    """重試帳上關不掉的 session → 回傳仍未關掉的數量。每輪查詢前呼叫。"""
+    with _unclosed_lock:
+        pending = list(_unclosed_sessions)
+    if not pending:
+        return 0
+    still = []
+    for sess in pending:
+        try:
+            ok = _close_session_windows(sess)
+        except Exception:
+            logging.debug("[session] 重試關閉掛帳 session 失敗", exc_info=True)
+            ok = False
+        if ok:
+            logging.info("[session] 掛帳的 session 已關掉(pid=%s)", sess.pid)
+        else:
+            still.append(sess)
+    with _unclosed_lock:
+        # 只移除這一輪確認關掉的,期間新掛上來的不動
+        closed = [s for s in pending if not any(s is t for t in still)]
+        for s in closed:
+            for i, t in enumerate(_unclosed_sessions):
+                if t is s:
+                    _unclosed_sessions.pop(i)
+                    break
+        return len(_unclosed_sessions)
 
 
 def _session_close(reason: str) -> None:
@@ -2849,6 +3013,14 @@ def _acquire_session(cfg: dict):
     本輪【奪走並終結】後冷啟動——絕不兩個 worker 共用;被終結的舊 worker 隨後的
     操作會失敗,由它自己的錯誤處理走 _session_close_if_current(非現任→只自理)。"""
     global _psession
+    # ★[2026-08-05 外審第 4 輪 P1-03] 先把上次關不掉的收乾淨★
+    #   放在這裡是因為它是每一輪查詢的必經之路,而且此刻我們正要開新的 session ——
+    #   不先收,隱藏桌面上就會同時有兩個登入中的 HIS。
+    try:
+        _retry_unclosed_sessions()
+    except Exception:
+        logging.debug("[session] 重試關閉掛帳 session 時出錯(不影響本輪)",
+                      exc_info=True)
     stale = None
     with _session_lock:
         sess = _psession

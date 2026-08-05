@@ -21,9 +21,27 @@ import consult_query as cq  # noqa: E402
 
 
 class _Sess:
-    def __init__(self):
+    """★[2026-08-05] our_pids 刻意含一個外來 pid★
+
+    實機三次登入三次都含著醫師自己的 systemftp(`登入視窗 hwnd=... pid=[8036,
+    16276]`)。判活若還問這個集合,就會因為【醫師那個住院系統的主畫面還開著】
+    而回答「我們的 session 還活著」。用生產的形狀,不用乾淨的假資料。
+    """
+
+    def __init__(self, main_hwnd=555):
         self.hproc = object()
-        self.our_pids = {123}
+        self.our_pids = {123, 8036}
+        self.main_hwnd = main_hwnd
+        self.main_pid = 123
+        self.main_class = cq.MAIN_CLASS
+
+
+def _our_window(monkeypatch, *, alive, same=True):
+    """我們登入的那個主畫面:還在不在 / 還是不是同一個。"""
+    monkeypatch.setattr(cq, "_window_alive", lambda _h: alive)
+    monkeypatch.setattr(
+        cq, "_window_identity",
+        lambda _h: (123, cq.MAIN_CLASS) if same else (8036, cq.MAIN_CLASS))
 
 
 def _proc_state(monkeypatch, *, exited):
@@ -48,7 +66,7 @@ def test_a_dead_launcher_with_a_live_main_window_is_still_usable(monkeypatch):
     session 能不能用，取決於主畫面在不在，不取決於那個啟動器活著沒有。
     """
     _proc_state(monkeypatch, exited=True)
-    monkeypatch.setattr(cq, "find_windows", lambda *a, **k: [1])
+    _our_window(monkeypatch, alive=True)
 
     assert cq._session_death_reason(_Sess()) == "", (
         "★啟動器結束就判死 → 每 3 分鐘重新送一次帳密★")
@@ -57,21 +75,54 @@ def test_a_dead_launcher_with_a_live_main_window_is_still_usable(monkeypatch):
 
 def test_a_missing_main_window_says_so(monkeypatch):
     _proc_state(monkeypatch, exited=False)
-    monkeypatch.setattr(cq, "find_windows", lambda *a, **k: [])
-    assert "找不到主畫面" in cq._session_death_reason(_Sess())
+    _our_window(monkeypatch, alive=False)
+    assert "主畫面" in cq._session_death_reason(_Sess())
+
+
+def test_someone_elses_main_window_does_not_keep_us_alive(monkeypatch):
+    """★[2026-08-05 外審第 4 輪 P1-05 + 實機證據]★ 判活不可以問 `our_pids`。
+
+    舊版是 `find_windows(MAIN_CLASS, pids=sess.our_pids)`。診間 log 顯示這個集合
+    每一次登入都含著外來的 systemftp —— 醫師自己開的住院系統主畫面還在，
+    我們就會回答「還活著」，然後對一個早就不存在的 session 繼續送查詢。
+
+    這裡讓 `find_windows` 一被呼叫就炸，證明那條路根本沒被走。
+    """
+    _proc_state(monkeypatch, exited=False)
+    _our_window(monkeypatch, alive=False)
+
+    def _boom(*_a, **_k):
+        raise AssertionError("★判活又去問 PID 集合了★ 會把別人的視窗當成我們的")
+    monkeypatch.setattr(cq, "find_windows", _boom)
+
+    assert cq._session_death_reason(_Sess()) != "", "我們的主畫面不在 → 必須判死"
+
+
+def test_a_recycled_handle_is_not_our_session(monkeypatch):
+    """★P1-04★ hwnd 還在、但已經是別人的視窗 → 不是我們的 session。"""
+    _proc_state(monkeypatch, exited=False)
+    _our_window(monkeypatch, alive=True, same=False)
+    reason = cq._session_death_reason(_Sess())
+    assert "回收" in reason, reason
+
+
+def test_a_session_without_a_window_says_it_never_logged_in(monkeypatch):
+    _proc_state(monkeypatch, exited=False)
+    reason = cq._session_death_reason(_Sess(main_hwnd=None))
+    assert "從未登入成功" in reason, reason
 
 
 def test_both_the_process_and_the_window_gone_says_so(monkeypatch):
     """行程也結束、主畫面也不在 → 這才是真的死了。"""
     _proc_state(monkeypatch, exited=True)
-    monkeypatch.setattr(cq, "find_windows", lambda *a, **k: [])
+    _our_window(monkeypatch, alive=False)
     reason = cq._session_death_reason(_Sess())
     assert "行程已結束" in reason and "主畫面" in reason, reason
 
 
 def test_the_two_reasons_are_not_the_same_sentence(monkeypatch):
     """★這就是實機 log 判斷不出來的原因★ 兩個成因要講得出差別。"""
-    monkeypatch.setattr(cq, "find_windows", lambda *a, **k: [])
+    _our_window(monkeypatch, alive=False)
     _proc_state(monkeypatch, exited=True)
     dead_proc = cq._session_death_reason(_Sess())
     _proc_state(monkeypatch, exited=False)
@@ -84,7 +135,7 @@ def test_the_two_reasons_are_not_the_same_sentence(monkeypatch):
 def test_a_healthy_session_reports_nothing(monkeypatch):
     """★反方向:不可以把活著的 session 判死★ 那正是每 3 分鐘重送帳密的來源。"""
     _proc_state(monkeypatch, exited=False)
-    monkeypatch.setattr(cq, "find_windows", lambda *a, **k: [1])
+    _our_window(monkeypatch, alive=True)
     assert cq._session_death_reason(_Sess()) == ""
     assert cq._session_is_alive(_Sess()) is True
 
@@ -99,7 +150,7 @@ def test_an_unqueryable_process_is_not_reported_as_exited(monkeypatch):
             raise OSError("handle 無效")
     monkeypatch.setattr(cq, "win32event", _E)
     # 主畫面不在，才會走到「查行程狀態」那一步
-    monkeypatch.setattr(cq, "find_windows", lambda *a, **k: [])
+    _our_window(monkeypatch, alive=False)
 
     reason = cq._session_death_reason(_Sess())
     assert "無法查詢" in reason and "已結束" not in reason, reason
