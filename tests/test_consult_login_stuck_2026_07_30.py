@@ -179,5 +179,14 @@ def test_the_give_up_branch_breaks_out_of_the_loop():
     src = inspect.getsource(cq._do_full_job)
     give_up = src[src.index("已重試 %d 次仍失敗"):]
     assert "break" in give_up, "放棄分支結束時必須 break"
-    # break 要在收尾之後,不可搶在前面
-    assert give_up.index("_send_failure_notice_async") < give_up.index("break")
+    # break 要在收尾之後,不可搶在前面。
+    # [2026-08-06 外審 P1-04] 這一段現在有【兩條】收尾:先分流出「寄信結果不明」
+    # (它有自己的收尾 + break),再走一般失敗收尾。所以不能用「第一個 break」判斷,
+    # 要看【一般失敗那條】的通知之後是否仍有 break。
+    i_notice = give_up.index("_send_failure_notice_async")
+    assert "break" in give_up[i_notice:], (
+        "一般失敗收尾(寄失敗通知)之後必須 break,否則會回頭再送一次帳密")
+    # 「結果不明」那條也必須自己 break(不可掉進一般失敗收尾)
+    i_unknown = give_up.index("DeliveryOutcomeUnknown")
+    assert "break" in give_up[i_unknown:i_notice], (
+        "「寄信結果不明」分支沒有 break → 會掉進一般失敗收尾(釋放去重、叫使用者重試)")

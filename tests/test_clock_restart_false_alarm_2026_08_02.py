@@ -211,14 +211,24 @@ def test_configure_if_empty_opens_the_window_when_no_accounts():
     assert "ClockApp(" in seg[i_flag:i_silent]
 
 
-def test_internal_restart_always_carries_the_flag():
-    """★內部重啟一律帶旗標★ 使用者在設定視窗刪光最後一個帳號並存檔後,新行程
-    若靜默消失,使用者會以為打卡還在跑。冷啟動(捷徑)才該直接不啟動。"""
+def test_internal_restart_carries_the_flag_only_when_this_pc_does_clocking():
+    """內部重啟帶旗標 —— 但【僅限本機有打卡帳號】。
+
+    原意(2026-08-02):使用者在設定視窗刪光最後一個帳號並存檔後,新行程若靜默
+    消失,使用者會以為打卡還在跑 → 所以要把設定視窗開回來。
+
+    ★[2026-08-06 使用者第二次回報] 那個情境的前提是「本來有帳號」★
+    本來就沒有帳號的電腦不屬於它:無條件帶旗標會讓【自動更新重啟】在一台根本
+    不做打卡的電腦上彈出打卡設定視窗,而且那個視窗被關掉還可能被判成
+    「新版本無法啟動」——正是使用者抱怨的噪音來源。
+    """
     code = _code_only(_src('autoclock.py'))
     i = code.index("def restart_program(")
     seg = code[i:i + 2500]
-    assert "if CONFIGURE_IF_EMPTY_FLAG not in extra:" in seg
+    assert "CONFIGURE_IF_EMPTY_FLAG not in extra" in seg
     assert "extra.append(CONFIGURE_IF_EMPTY_FLAG)" in seg
+    assert "_machine_has_clock_accounts()" in seg, (
+        "★又變回無條件帶旗標★ 沒設定打卡的電腦會被彈出設定視窗")
 
 
 def test_launch_app_script_forwards_args():

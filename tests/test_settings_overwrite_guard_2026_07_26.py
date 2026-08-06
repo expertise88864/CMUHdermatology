@@ -76,11 +76,19 @@ def test_doctors_repair_write_skipped_on_transient_error(monkeypatch, tmp_path):
 
 
 def test_save_all_settings_refuses_when_load_failed():
-    """★寫入咽喉★ 只要本次執行曾讀不到,存檔一律拒絕並告訴使用者為什麼。"""
+    """★寫入咽喉★ 只要本次執行曾讀不到,存檔一律拒絕並告訴使用者為什麼。
+
+    [2026-08-06 外審 P1-07] 寫入改成 `_atomic_write_json_multi`(三檔一起 commit),
+    故這裡改用 regex 找「任何一種寫檔呼叫」的第一次出現,不綁死函式名。
+    """
+    import re
+
     import main
     code = _code_only(inspect.getsource(main.AutomationApp.save_all_settings))
     i_guard = code.index("_settings_load_failed()")
-    i_write = code.index("_atomic_write_json(")
+    m = re.search(r"_atomic_write_json\w*\(", code)
+    assert m, "save_all_settings 裡找不到任何寫檔呼叫(測試失效了)"
+    i_write = m.start()
     assert i_guard < i_write, "檢查要在任何寫檔之前"
     seg = code[i_guard:i_write]
     assert "return" in seg, "有失敗就要直接 return,不可繼續寫"

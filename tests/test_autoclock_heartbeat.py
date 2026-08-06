@@ -136,6 +136,10 @@ def test_restart_program_releases_mutex_before_respawn(monkeypatch):
             on_confirmed() if on_confirmed else None),
     )
     monkeypatch.setattr(sys, "argv", ["autoclock.py", "--configure"])
+    # [2026-08-06] --configure-if-empty 現在只在【本機有打卡帳號】時才附加
+    # (沒帳號的電腦不該被自動更新重啟彈出設定視窗)。本測試的主題是 mutex 順序,
+    # 故模擬一台真的在打卡的機器。
+    monkeypatch.setattr(autoclock, "_machine_has_clock_accounts", lambda: True)
     autoclock.running.set()
 
     autoclock.restart_program()
@@ -163,6 +167,7 @@ def test_restart_program_passes_hard_exit_code_for_background_restart(monkeypatc
             on_confirmed() if on_confirmed else None),
     )
     monkeypatch.setattr(sys, "argv", ["autoclock.py"])
+    monkeypatch.setattr(autoclock, "_machine_has_clock_accounts", lambda: True)
     autoclock.running.set()
 
     autoclock.restart_program(hard_exit_code=1)

@@ -116,6 +116,11 @@ def test_check_trigger_skips_stale_but_triggers_fresh(monkeypatch):
         def select(self, *a):
             return ("OK", [])
 
+        def uid(self, command, *args):
+            # [2026-08-06 外審 P2-02] imap_reader 改用 UID API(避免 EXPUNGE 位移
+            # 導致讀錯/標錯信)。假 IMAP 依樣分派到既有的實作。
+            return getattr(self, command.lower())(*args)
+
         def search(self, charset, *criteria):
             return ("OK", [b"1 2 3"])
 
@@ -171,6 +176,11 @@ def test_check_trigger_no_age_filter_by_default(monkeypatch):
         def select(self, *a):
             return ("OK", [])
 
+        def uid(self, command, *args):
+            # [2026-08-06 外審 P2-02] imap_reader 改用 UID API(避免 EXPUNGE 位移
+            # 導致讀錯/標錯信)。假 IMAP 依樣分派到既有的實作。
+            return getattr(self, command.lower())(*args)
+
         def search(self, charset, *criteria):
             return ("OK", [b"1"])
 
@@ -202,3 +212,159 @@ def test_load_imap_settings_replaces_invalid_port(monkeypatch, bad_port):
 
     assert imap_reader._load_imap_settings()["port"] == \
         imap_reader.DEFAULT_IMAP_PORT
+
+
+# ── [2026-08-06 外審] IMAP 觸發的正確性與可信授權 ────────────────────────────
+
+def test_folded_headers_are_parsed(monkeypatch):
+    """★P2-04★ RFC 5322 允許 header 折行(長 display name / 多段 encoded-word)。
+
+    舊版逐行 `startswith(b"subject:")` 只拿得到第一行 → 主旨關鍵字漏判、
+    From 變空字串 → 白名單寄件人被誤拒、觸發【靜默】失效。
+    """
+    # 主旨與 From 都折成兩行(第二行以空白起始 = RFC 5322 的 folding)
+    raw = (b"Subject: CMUH derm consult\r\n"
+           b" trigger keyword\r\n"
+           b"From: A Very Long Doctor Display Name\r\n"
+           b" <Doctor@Example.COM>\r\n")
+    subj, frm, _auth = imap_reader._parse_trigger_headers(raw)
+    # 折行後半段必須被接起來(舊版逐行比對只拿得到第一行 → 關鍵字漏判)
+    assert "trigger keyword" in subj, f"折行主旨沒接起來:{subj!r}"
+    assert "Doctor@Example.COM" in frm, f"折行 From 沒接起來:{frm!r}"
+
+    # 中文(RFC 2047 encoded-word)折行也要還原成同一個字串
+    import base64
+    b1 = base64.b64encode("皮膚科".encode()).decode()
+    b2 = base64.b64encode("會診觸發".encode()).decode()
+    raw2 = (f"Subject: =?UTF-8?B?{b1}?=\r\n"
+            f" =?UTF-8?B?{b2}?=\r\n"
+            "From: <dr@example.com>\r\n").encode()
+    subj2, _f2, _a2 = imap_reader._parse_trigger_headers(raw2)
+    assert "皮膚科" in subj2 and "會診觸發" in subj2, \
+        f"折行的中文 encoded-word 沒接起來:{subj2!r}"
+
+
+def test_parse_headers_never_raises_on_garbage():
+    for raw in (b"", b"\x00\xff not a header", b"Subject:\r\n"):
+        assert isinstance(imap_reader._parse_trigger_headers(raw), tuple)
+
+
+# ── P1-05:寄件人驗證(From 可偽造,要看 Authentication-Results)────────────────
+def test_dmarc_pass_counts_as_authenticated():
+    ar = "mx.google.com; dkim=pass header.d=example.com; spf=pass; dmarc=pass"
+    assert imap_reader._from_is_authenticated(ar, "dr@example.com") is True
+
+
+def test_missing_header_is_not_authenticated():
+    """沒有證據 ≠ 通過(fail-closed)。"""
+    assert imap_reader._from_is_authenticated("", "dr@example.com") is False
+    assert imap_reader._from_is_authenticated(None, "dr@example.com") is False
+
+
+def test_all_fail_is_not_authenticated():
+    ar = "mx.google.com; dkim=fail header.d=evil.tw; spf=fail; dmarc=fail"
+    assert imap_reader._from_is_authenticated(ar, "dr@example.com") is False
+
+
+def test_spf_pass_for_a_different_domain_is_not_enough():
+    """★關鍵★ spf=pass 只證明【信封】寄件者,不證明 From。網域對不上不算通過
+    —— 否則攻擊者用自己網域通過 SPF、把 From 偽造成白名單醫師就過關了。"""
+    ar = "mx.google.com; spf=pass smtp.mailfrom=attacker.tw; dkim=none"
+    assert imap_reader._from_is_authenticated(ar, "dr@example.com") is False
+
+
+def test_dkim_pass_with_matching_domain_is_authenticated():
+    ar = "mx.google.com; dkim=pass header.d=example.com; spf=none"
+    assert imap_reader._from_is_authenticated(ar, "dr@example.com") is True
+
+
+def test_check_trigger_reports_authenticated_senders(monkeypatch):
+    """行為:結果要分成「命中的寄件人」與「其中通過驗證的」兩份清單。"""
+    hdr = (b"Subject: TRIG\r\n"
+           b"From: Dr <dr@example.com>\r\n"
+           b"Authentication-Results: mx.google.com; dmarc=pass\r\n")
+
+    class _FakeIMAP:
+        def login(self, u, p):
+            return ("OK", [])
+
+        def select(self, box):
+            return ("OK", [])
+
+        def uid(self, command, *args):
+            return getattr(self, command.lower())(*args)
+
+        def search(self, charset, *criteria):
+            return ("OK", [b"7"])
+
+        def fetch(self, uid, parts):
+            return ("OK", [(b"x", hdr), b")"])
+
+        def store(self, ids, op, flags):
+            return ("OK", [])
+
+    monkeypatch.setattr(imap_reader.imaplib, "IMAP4_SSL",
+                        lambda *a, **k: _FakeIMAP())
+    monkeypatch.setattr(
+        imap_reader, "_load_imap_settings",
+        lambda: {"host": "h", "port": 993, "username": "u", "password": "p"})
+
+    r = imap_reader.check_trigger("TRIG")
+    assert r["matched_senders"] == ["dr@example.com"]
+    assert r["authenticated_senders"] == ["dr@example.com"]
+
+
+def test_forged_from_is_matched_but_not_authenticated(monkeypatch):
+    """★P1-05 核心★ 偽造 From(驗證失敗)仍會命中主旨,但不可進 authenticated 清單。
+
+    呼叫端要做可信授權時看 authenticated_senders,而不是只比對可偽造的 From。
+    """
+    hdr = (b"Subject: TRIG\r\n"
+           b"From: Dr <dr@example.com>\r\n"
+           b"Authentication-Results: mx.google.com; spf=fail; dkim=none; "
+           b"dmarc=fail\r\n")
+
+    class _FakeIMAP:
+        def login(self, u, p):
+            return ("OK", [])
+
+        def select(self, box):
+            return ("OK", [])
+
+        def uid(self, command, *args):
+            return getattr(self, command.lower())(*args)
+
+        def search(self, charset, *criteria):
+            return ("OK", [b"7"])
+
+        def fetch(self, uid, parts):
+            return ("OK", [(b"x", hdr), b")"])
+
+        def store(self, ids, op, flags):
+            return ("OK", [])
+
+    monkeypatch.setattr(imap_reader.imaplib, "IMAP4_SSL",
+                        lambda *a, **k: _FakeIMAP())
+    monkeypatch.setattr(
+        imap_reader, "_load_imap_settings",
+        lambda: {"host": "h", "port": 993, "username": "u", "password": "p"})
+
+    r = imap_reader.check_trigger("TRIG")
+    assert r["matched_senders"] == ["dr@example.com"]
+    assert r["authenticated_senders"] == [], \
+        "★驗證失敗的偽造寄件人被當成已驗證★"
+
+
+# ── P2-02:必須用 UID API(序號會因其他 client EXPUNGE 而位移)────────────────
+def test_uses_uid_api_not_sequence_numbers():
+    import inspect
+    src = inspect.getsource(imap_reader.check_trigger)
+    for bad in ("conn.search(", "conn.fetch(", "conn.store("):
+        assert bad not in src, (
+            f"★仍在用序號 API {bad}★ 其他 client EXPUNGE 後序號會位移 → "
+            "可能讀錯信、甚至把另一封標成已讀")
+    # 呼叫可能跨行寫,故用 regex 容許中間的空白/換行
+    import re
+    for cmd in ("search", "fetch", "store"):
+        assert re.search(r'conn\.uid\(\s*"' + cmd + '"', src), \
+            f'缺少 conn.uid("{cmd}", ...)'

@@ -110,6 +110,21 @@ DEFAULT_CREDENTIALS = {
 }
 
 
+class DeliveryOutcomeUnknown(RuntimeError):
+    """寄信結果不明(逾時,但伺服器可能【已經收下】) → 不得自動重試,以免重複寄出。
+
+    ★[2026-08-06 外審 P1-03]★ 這個類別原本只存在於 consult_query,而且只有
+    Outlook 逾時會用；SMTP 逾時走的是普通 `RuntimeError`,於是外層 `_do_full_job`
+    把它當成【可重試】→ 同一封 MIME 可能再提交一次 → 收件人收到兩封。
+    但兩者的語意完全一樣:timeout 可能發生在伺服器收下 DATA 之後(smtp_mail 自己的
+    註解就寫著「信可能已送達,配額不退回」)。現在統一由這裡定義,兩條寄信路徑共用,
+    consult_query 直接 import —— isinstance 檢查才會同時涵蓋兩者。
+
+    固定 Message-ID 只可能幫助部分郵件系統收斂顯示,不是 exactly-once 保證,
+    所以【不重試】才是唯一安全的選擇。
+    """
+
+
 class SmtpNotConfiguredError(RuntimeError):
     """SMTP 設定不完整（通常是 password 為空）。"""
 
@@ -408,9 +423,12 @@ def send_mail(recipients: list, subject: str, body: str,
             #   退回配額會低估實際寄件量;結果不明時保留 reservation 是安全方向
             #   (最壞是少寄一封的額度,不會超發)。
             if isinstance(e, socket.timeout):
-                raise RuntimeError(
+                # ★[2026-08-06 外審 P1-03] 結果不明 ≠ 失敗★
+                #   逾時可能發生在伺服器【已收下 DATA】之後 —— 重試就是寄第二封。
+                #   用專屬例外讓呼叫端(_do_full_job)能與「確定失敗」分流處理。
+                raise DeliveryOutcomeUnknown(
                     f"SMTP 連線/送信逾時 ({int(timeout)}s)，已重試 {max_retries} 次"
-                    f"(結果不明,配額不退回)：{e}") from e
+                    f"(結果不明,信可能已送達 → 不自動重試,配額不退回)：{e}") from e
             _rollback_rate_limit_slot(reservation)
             if isinstance(e, OSError):
                 raise RuntimeError(

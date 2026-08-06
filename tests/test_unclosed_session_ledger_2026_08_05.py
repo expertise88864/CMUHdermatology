@@ -268,6 +268,81 @@ def test_no_cold_start_while_the_ledger_is_dirty(monkeypatch):
     assert calls == [], "★帳上還有關不掉的 session，卻又登入了一次★"
 
 
+# ── 閘門的邊界:擋「新登入」,不擋「重用健康 session」(外審 2026-08-06 P1-02)──
+def _healthy_session(monkeypatch, retries_remaining=1):
+    """裝一個【健康、未被租用】的常駐 session,外加一本髒帳。"""
+    sess = _Sess()
+    sess.in_use = False
+    sess.started_at = 1000.0
+    monkeypatch.setattr(cq, "_psession", sess)
+    monkeypatch.setattr(cq, "_session_death_reason", lambda s: "")
+    monkeypatch.setattr(cq._keepalive, "session_needs_restart",
+                        lambda started, now: False)
+    monkeypatch.setattr(cq, "_retry_unclosed_sessions",
+                        lambda: retries_remaining)      # 髒帳:還有關不掉的
+    monkeypatch.setattr(cq, "_cold_start_session",
+                        lambda cfg: (_ for _ in ()).throw(
+                            AssertionError("健康 session 還在,不該冷啟動")))
+    return sess
+
+
+def test_healthy_session_is_reusable_even_with_a_dirty_ledger(monkeypatch):
+    """★核心(P1-02)★ 帳上還有關不掉的舊 session,但常駐 session 本身健康 →
+    必須能直接重用,不可以被閘門擋掉。
+
+    【為什麼是 P1】閘門要防的是「在有未管理 session 時【再開一個】新登入」。
+    舊版把它放在 `_acquire_session` 最前面,於是 15 分鐘窗口放行一次、冷啟動成功、
+    新 session 健康地留在主畫面之後,下一輪(3 分鐘後)還沒檢查那個健康 session
+    就先撞閘門 → 拿不到 keepalive → 很可能在院方 5 分鐘閒置上限後被登出,
+    使那次好不容易的恢復完全白費。
+    """
+    cq._unmanaged_since = 0.0
+    sess = _healthy_session(monkeypatch)
+    got = cq._acquire_session({})               # 不可拋 UnmanagedSessionError
+    assert got is sess, "健康的常駐 session 必須被重用"
+    assert got.in_use is True, "重用時必須取得租約"
+    cq._unmanaged_since = 0.0
+
+
+def test_reuse_path_still_retries_closing_the_ledger(monkeypatch):
+    """重用路徑【只是不擋】,清理不可以跟著消失 —— 否則有健康 session 期間
+    那些關不掉的殘留永遠不會再被嘗試關閉,會一直留在隱藏桌面上。"""
+    cq._unmanaged_since = 0.0
+    tries = []
+    sess = _Sess()
+    sess.in_use = False
+    sess.started_at = 1000.0
+    monkeypatch.setattr(cq, "_psession", sess)
+    monkeypatch.setattr(cq, "_session_death_reason", lambda s: "")
+    monkeypatch.setattr(cq._keepalive, "session_needs_restart",
+                        lambda started, now: False)
+    monkeypatch.setattr(cq, "_retry_unclosed_sessions",
+                        lambda: (tries.append(1), 1)[1])
+    cq._acquire_session({})
+    assert tries, "★重用路徑沒有重試關閉殘留★ 殘留會永遠留在隱藏桌面"
+    cq._unmanaged_since = 0.0
+
+
+def test_cold_start_is_still_blocked_after_a_dead_session(monkeypatch):
+    """反方向:session 死了要冷啟動時,閘門【仍然】必須擋(這才是它的職責)。"""
+    cq._unmanaged_since = 0.0
+    calls = []
+    sess = _Sess()
+    sess.in_use = False
+    sess.started_at = 1000.0
+    monkeypatch.setattr(cq, "_psession", sess)
+    monkeypatch.setattr(cq, "_session_death_reason", lambda s: "主畫面不見了")
+    monkeypatch.setattr(cq, "_session_close_if_current", lambda s, r: None)
+    monkeypatch.setattr(cq, "_retry_unclosed_sessions", lambda: 1)
+    monkeypatch.setattr(cq, "_cold_start_session", lambda cfg: calls.append(cfg))
+    try:
+        cq._acquire_session({})
+    except cq.UnmanagedSessionError:
+        pass
+    assert calls == [], "★session 已死要開新登入,帳上仍髒 → 必須擋★"
+    cq._unmanaged_since = 0.0
+
+
 def test_the_job_treats_it_as_fatal():
     """接線:這個例外不可以進 backoff 重試（三次只是再撞三次同一道閘門）。"""
     import ast

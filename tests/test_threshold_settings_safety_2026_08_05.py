@@ -100,7 +100,9 @@ def test_save_rejects_before_writing_anything():
             continue
         if node.func.id == "validate_threshold_entry" and first_validate is None:
             first_validate = node.lineno
-        if node.func.id == "_atomic_write_json" and first_write is None:
+        # [2026-08-06 外審 P1-07] 寫檔改成 _atomic_write_json_multi(三檔一起 commit)
+        # → 這裡認任何 _atomic_write_json* 的呼叫,不綁死單一函式名。
+        if node.func.id.startswith("_atomic_write_json") and first_write is None:
             first_write = node.lineno
     assert first_validate is not None, "存檔沒有經過門檻驗證"
     assert first_write is not None, "找不到寫檔點（測試失效了）"

@@ -185,13 +185,23 @@ def test_smtp_timeout_does_not_roll_back_the_quota():
     退回配額會低估實際寄件量;結果不明時保留 reservation(最壞是少一封額度,
     不會超發)。判準:timeout 那條 raise 的路徑上不可有 rollback 呼叫。
     """
+    import re
+
     import cmuh_common.smtp_mail as sm
     src = inspect.getsource(sm.send_mail)
     i = src.index("# 用完重試次數")
-    seg = src[i:src.index("raise RuntimeError", i)]
+    # [2026-08-06 外審 P1-03] timeout 那條改拋 DeliveryOutcomeUnknown(不再是
+    # RuntimeError),故切到「第一個 raise」而不是綁死例外類別名。
+    m = re.search(r"\braise\s+\w+", src[i:])
+    assert m, "找不到 timeout 的 raise（測試失效了）"
+    seg = src[i:i + m.start()]
     assert "_rollback_rate_limit_slot" not in seg, (
         "★逾時仍退配額★ 已送達的信不會被計入額度")
     assert "socket.timeout" in seg
+    # 逾時必須拋「結果不明」專屬例外(才不會被外層當可重試 → 重複寄出)
+    assert m.group(0).split()[-1] == "DeliveryOutcomeUnknown", (
+        f"★SMTP 逾時拋的是 {m.group(0).split()[-1]}★ "
+        "必須是 DeliveryOutcomeUnknown,否則外層會重試 → 可能寄兩封")
 
 
 # ── P2-06:告警寄失敗要短期重試 ──────────────────────────────────────────

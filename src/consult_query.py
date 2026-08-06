@@ -168,6 +168,13 @@ DEFAULT_CONFIG = {
         "wesjefflee1111@gmail.com",
         "mbpushowo@gmail.com",
     ],
+    # [2026-08-06 外審 P1-05] 只接受【通過 SPF/DKIM/DMARC 驗證】的觸發信。
+    #   白名單比對的 From 是寄件者自填、可偽造的字串;開啟本項後,還要 Gmail 在
+    #   Authentication-Results 標記通過才觸發(fail-closed)。
+    #   預設 False:貿然開啟可能讓正在用的觸發功能靜默失效(某些寄送路徑不帶該
+    #   header)。先看 consult_query.log 的「未通過驗證」warning,確認自己的觸發
+    #   信長期都通過之後再改成 true。
+    "require_authenticated_trigger": False,
     # [2026-06-16] 每天 12:40 + 17:10 都跑（不分平假日）。打卡系統於 7:31/12:31/17:01
     # 才登入打卡，故延後到 12:40 / 17:10 再查詢寄信，確保中午(12:31)上班與下午(17:01)
     # 下班打卡都「已完成並寫入紀錄」後才查，不會還沒打卡就先寄出誤判未打卡。
@@ -1481,7 +1488,12 @@ def _image_is_blank(img) -> bool:
 
 
 def _capture_nonblank(consult_hwnd: int, capture, *, sleep=None):
-    """截圖;整張單色就等視窗繪製後重截(最多 _CAPTURE_BLANK_RETRIES 次)。"""
+    """截圖;整張單色就等視窗繪製後重截(最多 _CAPTURE_BLANK_RETRIES 次)。
+
+    ★仍為 fail-open★ 重截用盡仍單色時照樣回傳那張圖(有圖可寄勝過沒信),
+    但呼叫端必須知道「這張沒有參考價值」—— 見 `_capture_with_settled_roster`
+    把它降級為【不可更新基準】(2026-08-06 外審 P1-08)。
+    """
     sleep = sleep or time.sleep
     img = capture(consult_hwnd)
     for _ in range(_CAPTURE_BLANK_RETRIES):
@@ -1493,7 +1505,8 @@ def _capture_nonblank(consult_hwnd: int, capture, *, sleep=None):
         img = capture(consult_hwnd)
     if _image_is_blank(img):
         logging.warning("[consult-extract] 重截 %d 次後截圖仍整張單色 → "
-                        "沿用(附圖可能無參考價值)", _CAPTURE_BLANK_RETRIES)
+                        "沿用但降級為【不可更新基準】(附圖無參考價值)",
+                        _CAPTURE_BLANK_RETRIES)
     return img
 
 
@@ -1524,6 +1537,15 @@ def _capture_with_settled_roster(consult_hwnd: int, *, capture=None,
     for round_no in range(_SETTLED_RETRY_ROUNDS + 1):
         snap = settle(consult_hwnd)
         img = _capture_nonblank(consult_hwnd, capture, sleep=sleep)
+        # ★[2026-08-06 外審 P1-08] 重截用盡仍是整張單色 → 不可當成正常成功★
+        #   附圖零資訊,收信的人什麼都核對不了。舊版只寫一行 warning 就照常回傳,
+        #   於是這一輪照樣更新「已通知基準」—— 等於用一張黑圖宣稱「這些都通知過
+        #   了」,下一輪就不會再補寄那些病人。改走既有的 as_unverified 通道:
+        #   信照寄(有圖總比沒信好),但【不更新基準】,下一輪會重新比對並補寄。
+        if _image_is_blank(img):
+            logging.warning("[consult-extract] 截圖仍為單色 → 本輪不更新已通知"
+                            "基準(下一輪會重新比對並補寄)")
+            return img, snap.as_unverified()
         if not snap.stable:
             return img, snap
         try:
@@ -3203,8 +3225,11 @@ def _retry_unclosed_sessions() -> int:
         return len(_unclosed_sessions)
 
 
-class DeliveryOutcomeUnknown(RuntimeError):
-    """寄信結果不明(逾時但可能已送達) → 不得自動重試,以免重複寄出。"""
+# ★[2026-08-06 外審 P1-03] 與 SMTP 共用【同一個】類別★
+#   舊版在這裡自己定義一份,只有 Outlook 逾時會拋;SMTP 逾時走普通 RuntimeError
+#   → 被外層當可重試 → 同一封信可能再提交一次。改成 import 之後,兩條寄信路徑
+#   拋的是同一個類別,下面 `isinstance(e, DeliveryOutcomeUnknown)` 才涵蓋得到 SMTP。
+from cmuh_common.smtp_mail import DeliveryOutcomeUnknown  # noqa: E402
 
 
 class UnmanagedSessionError(RuntimeError):
@@ -3222,8 +3247,18 @@ _UNMANAGED_BLOCK_MAX_SEC = 15 * 60
 _unmanaged_since = 0.0
 
 
-def _ensure_no_unmanaged_sessions(*, now=None) -> None:
+def _ensure_no_unmanaged_sessions(*, now=None, block: bool = True) -> None:
     """先重試關掉帳上的 session;還有殘留就【擋下本輪】——但不會擋到天荒地老。
+
+    ★[2026-08-06 外審 P1-02] block=False:只清理、不擋★
+    這道閘門要擋的是「在已有未管理 session 時【再開一個新登入】」,而不是
+    「使用一個已經存在、身分精確相符、還活著的 session」。舊版把它放在
+    `_acquire_session()` 最前面,於是:15 分鐘窗口放行一次 → 冷啟動成功 →
+    新 session 健康地留在主畫面 → 3 分鐘後下一輪【還沒檢查那個健康 session】
+    就先撞閘門 → UnmanagedSessionError → 剛恢復的 session 拿不到 keepalive →
+    很可能在院方 5 分鐘閒置上限後被登出,白白浪費那次恢復。
+    現在重用路徑用 block=False:照樣每輪重試關閉殘留、照樣累計窗口,只是不擋;
+    真正要冷啟動前才用預設的 block=True。
 
     ★[2026-08-05 外審第 5 輪 P1-02]★ 上一版只呼叫 `_retry_unclosed_sessions()`
     而【把回傳值丟掉】。於是掛帳機制只做到「我知道有一個關不掉的 session」,
@@ -3253,6 +3288,11 @@ def _ensure_no_unmanaged_sessions(*, now=None) -> None:
     if not _unmanaged_since:
         _unmanaged_since = now()
     blocked_for = now() - _unmanaged_since
+    if not block:
+        # 重用既有健康 session 的路徑:清理與記帳照做,但不擋(見 docstring P1-02)。
+        logging.debug("[session] 仍有 %d 個掛帳 session(已 %.0f 分鐘);"
+                      "本輪重用既有 session,不擋", remaining, blocked_for / 60.0)
+        return
     if blocked_for >= _UNMANAGED_BLOCK_MAX_SEC:
         # ★[外審第 6 輪 P1-06] 放行【一次】,然後重新起算★
         #   上一版超過上限後就永遠放行 —— 閘門變成只擋前 15 分鐘,之後每 3 分鐘
@@ -3495,9 +3535,12 @@ def _acquire_session(cfg: dict):
     操作會失敗,由它自己的錯誤處理走 _session_close_if_current(非現任→只自理)。"""
     global _psession
     # ★[2026-08-05 外審第 4 輪 P1-03] 先把上次關不掉的收乾淨★
-    #   放在這裡是因為它是每一輪查詢的必經之路,而且此刻我們正要開新的 session ——
-    #   不先收,隱藏桌面上就會同時有兩個登入中的 HIS。
-    _ensure_no_unmanaged_sessions()
+    #   每一輪查詢都是必經之路,所以清理放這裡(不清,隱藏桌面上會累積登入中的 HIS)。
+    # ★[2026-08-06 外審 P1-02] 但這裡【只清不擋】★
+    #   此刻還不知道要不要開新 session ——「重用一個已存在且健康的 session」不該被
+    #   擋(擋了會害剛恢復的 session 拿不到 keepalive、5 分鐘後被院方登出)。
+    #   真正的阻擋移到下方冷啟動前。
+    _ensure_no_unmanaged_sessions(block=False)
     stale = None
     with _session_lock:
         sess = _psession
@@ -3523,7 +3566,13 @@ def _acquire_session(cfg: dict):
                 f"定期重啟(常駐已逾 {_keepalive.SESSION_MAX_AGE_HOURS:.0f} 小時,"
                 f"清 BDE/資源殘留)")
             sess = None
-    return sess if sess is not None else _cold_start_session(cfg)
+    if sess is not None:
+        return sess                      # 重用既有健康 session:不經過阻擋閘門
+    # ★[2026-08-06 外審 P1-02] 只有【確定要開新登入】時才擋★
+    #   上面的 teardown 若失敗會把該 session 掛帳,所以這裡再查一次是對的:
+    #   剛剛沒收乾淨就不該再開一個。
+    _ensure_no_unmanaged_sessions()
+    return _cold_start_session(cfg)
 
 
 def _consult_form_dismissed(hwnd: int) -> bool:
@@ -5233,6 +5282,25 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     #   `_materialize_shot` 的「留著當線索」取捨只對【寄成功】成立。
                     #   這張圖沒有任何人看過、也沒有臨床用途,留著純粹是多出來的
                     #   PHI 暴露面。
+                    # ★[2026-08-06 外審 P1-04] 「結果不明」不可以走一般失敗收尾★
+                    #   UNKNOWN 的定義就是「原信可能【稍後仍會送達】」。一般收尾會
+                    #   刪截圖、釋放 email 觸發去重、並回信告訴觸發者「可立即重試」
+                    #   —— 使用者照做 → 原信隨後送達 → 他收到【兩封】。
+                    #   故另走一條:保留截圖、不釋放去重、明確請他先不要重發。
+                    if isinstance(last_err, DeliveryOutcomeUnknown):
+                        logging.error(
+                            "會診查詢:寄信結果不明 → 保留截圖、不釋放觸發去重、"
+                            "不建議重試(原信可能稍後送達):%s", last_err)
+                        if trigger_label == "email" and override_recipients:
+                            _send_delivery_unknown_notice_async(
+                                override_recipients, str(last_err))
+                        try:
+                            _note_job_failure(_developer_alert_recipients(),
+                                              f"[寄信結果不明] {last_err}")
+                        except Exception:
+                            logging.debug("結果不明告警處理失敗（略過）",
+                                          exc_info=True)
+                        break
                     _discard_undelivered_shot(delivery)
                     try:
                         _note_job_failure(_developer_alert_recipients(),
@@ -6068,6 +6136,42 @@ def _send_failure_notice_async(recipients, reason: str) -> None:
                      daemon=True).start()
 
 
+def _send_delivery_unknown_notice_async(recipients, reason: str) -> None:
+    """[2026-08-06 外審 P1-04] 寄信「結果不明」時回信告知觸發者 —— 措辭必須與
+    「失敗」相反:請他【先不要】重發。
+
+    一般失敗通知會說「已解除重查限制,您可立即重寄一封觸發信再試」。對 UNKNOWN
+    照抄那句話會直接製造重複寄送:原信稍後送達 + 使用者重發又送一封。
+    這裡也【不】釋放 `_release_trigger_dedup` —— 去重窗自然過期前擋住重發。"""
+    if not recipients:
+        return
+
+    def _worker():
+        try:
+            from cmuh_common.smtp_mail import send_mail
+            send_mail(
+                recipients=[str(r) for r in recipients],
+                subject="會診查詢：寄送結果尚未確認",
+                body=("您的會診查詢已執行完成，但【寄送結果尚未確認】"
+                      "（送信過程逾時，伺服器可能已經收下）。\n\n"
+                      f"詳細：{str(reason)[:300]}\n\n"
+                      "請先檢查信箱：\n"
+                      "  • 若已收到會診通知信 → 一切正常，不需要做任何事。\n"
+                      "  • 若過幾分鐘仍未收到 → 再重寄一封觸發信。\n\n"
+                      "為避免您收到兩封相同的會診通知，本次【不會自動重寄】。"),
+                attachment_path=None,
+                category="system",
+            )
+            logging.info("[notify] 已寄「結果不明」通知給觸發者：%s",
+                         ", ".join(str(r) for r in recipients))
+        except Exception:
+            logging.warning("[notify] 結果不明通知寄送失敗(不影響流程)",
+                            exc_info=True)
+
+    threading.Thread(target=_worker, name="ConsultUnknownNotice",
+                     daemon=True).start()
+
+
 def _hard_exit(reason: str, code: int = 1) -> None:
     """[2026-05-22 v34] 強制終止 process，不走 logging.shutdown (會 deadlock)。
 
@@ -6345,6 +6449,34 @@ def scheduler_loop() -> None:
                             logging.warning(
                                 "收到觸發信但寄件人不在白名單，已忽略：%s",
                                 ", ".join(blocked))
+                        # ★[2026-08-06 外審 P1-05] 白名單比對的是可偽造的 From★
+                        #   `From:` 是寄件者自填的純文字。imap_reader 現在會一併回
+                        #   `authenticated_senders`(通過 SPF/DKIM/DMARC 者)。
+                        #   開啟 require_authenticated_trigger 後,未通過驗證的一律
+                        #   不觸發(fail-closed)。
+                        #   ★預設 False 的理由★:若使用者的觸發信路徑剛好不帶
+                        #   Authentication-Results(例如同帳號自寄),貿然預設開啟會讓
+                        #   臨床上正在用的觸發功能【靜默失效】。未通過驗證時一律
+                        #   記 warning,確認 log 都是 pass 之後再把這個開關打開。
+                        #   風險註記:觸發結果是回寄給【From 那個位址】,所以偽造
+                        #   From 不會把病人資料送到攻擊者手上(只會騷擾該位醫師)。
+                        authed = {str(s).lower()
+                                  for s in (r.get("authenticated_senders") or [])}
+                        unverified = [s for s in allowed if s.lower() not in authed]
+                        if unverified:
+                            if cfg.get("require_authenticated_trigger", False):
+                                logging.error(
+                                    "★觸發信未通過寄件人驗證 → 不觸發★(From 可偽造;"
+                                    "require_authenticated_trigger=True):%s",
+                                    ", ".join(unverified))
+                                allowed = [s for s in allowed
+                                           if s.lower() in authed]
+                            else:
+                                logging.warning(
+                                    "觸發信寄件人未通過 SPF/DKIM/DMARC 驗證(From 可"
+                                    "偽造),仍照舊觸發:%s —— 確認 log 長期都通過後,"
+                                    "可在設定加 require_authenticated_trigger=true "
+                                    "改為只接受已驗證的觸發信", ", ".join(unverified))
                         if allowed:
                             # [B] Dedup：同一 sender 5 分鐘內重複觸發 → 跳過
                             dedup_skipped = [s for s in allowed

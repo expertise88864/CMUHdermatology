@@ -2159,9 +2159,37 @@ def _cleanup_orphan_chromedrivers_at_startup() -> None:
         logging.debug("[autoclock] 清掃孤兒 chromedriver 例外", exc_info=True)
 
 
+def _machine_has_clock_accounts() -> bool:
+    """本機到底有沒有設定打卡帳號(判斷「這台要不要跑打卡」的唯一依據)。
+
+    讀不到/壞檔 → True(保守:當成有設定,才不會把真正的重啟失敗吞掉)。
+    """
+    try:
+        data = safe_load_json(CONFIG_FILE, [])
+    except Exception:
+        return True
+    if not isinstance(data, list):
+        return True
+    return any(isinstance(a, dict) and str(a.get("username", "")).strip()
+               for a in data)
+
+
 def _notify_restart_failed() -> None:
     """重啟失敗的告知。[codex] notify_clock_failure 在沒安裝 winotify 時會靜默 return,
-    故再加一層 MessageBox 後備——這種事必須讓使用者確實知道。"""
+    故再加一層 MessageBox 後備——這種事必須讓使用者確實知道。
+
+    ★[2026-08-06 使用者再次回報]★「我這台電腦沒有執行打卡程式,卻一直跳
+    『更新後重啟失敗』」。2026-08-02 已經修過一次(exit=0 且無 crash 痕跡就不示警),
+    但那道判斷擋不住所有情況:子行程只要留下任何一條 crash marker、或結束碼非 0
+    (帶 --configure-if-empty 時會開設定視窗,使用者直接關掉、Tk 初始化失敗…),
+    就又會跳。
+    ★根本判準:這台機器【有沒有打卡帳號】★ 沒有帳號 = 本機根本不做打卡 =
+    「打卡中斷」對他毫無意義,那句警告 100% 是噪音。改成沒帳號就只記 log。
+    """
+    if not _machine_has_clock_accounts():
+        logging.info("[autoclock restart] 本機沒有打卡帳號 → 重啟失敗不打擾使用者"
+                     "(這台不做打卡,沒有任何打卡會中斷)")
+        return
     try:
         notify_clock_failure(
             "更新後重啟失敗",
@@ -2221,11 +2249,17 @@ def restart_program(args_add=None, hard_exit_code=None) -> None:
             extra.append(a)
     if args_add:
         extra.append(args_add)
-    # ★內部重啟一律帶上旗標★ 走到這裡表示程式本來就在跑;若新行程發現設定變成空的
+    # ★內部重啟帶旗標★ 走到這裡表示程式本來就在跑;若新行程發現設定變成空的
     #   (例如使用者剛在設定視窗刪光最後一個帳號並存檔),應該把設定視窗開回來,
     #   而不是靜默消失 —— 那會讓使用者以為打卡還在跑。
     #   冷啟動(捷徑/啟動資料夾,argv 沒有旗標)才是使用者要的「直接不啟動」。
-    if CONFIGURE_IF_EMPTY_FLAG not in extra:
+    # ★[2026-08-06 使用者回報] 但【本機從來就沒有帳號】時不可以帶★
+    #   帶了的話,自動更新重啟會在一台根本不做打卡的電腦上【彈出打卡設定視窗】,
+    #   而且那個視窗被關掉還可能被判成「新版本無法啟動」。
+    #   上面那個「刪光最後一個帳號」的情境,前提是【本來有帳號】—— 本來就沒有的
+    #   機器不屬於它。
+    if (CONFIGURE_IF_EMPTY_FLAG not in extra
+            and _machine_has_clock_accounts()):
         extra.append(CONFIGURE_IF_EMPTY_FLAG)
     outcome = restart_self(extra, hard_exit_code=hard_exit_code,
                            on_confirmed=_teardown_for_handover)

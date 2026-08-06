@@ -114,54 +114,54 @@ def test_no_chang_threshold_wiring_left_in_main():
     assert "alert_chang_enabled" not in sd.default_threshold_settings()
 
 
-def test_every_alert_gate_reads_the_shen_toggle():
-    """三條止掛路徑(行事曆比門檻、遠期背景掃描、設定頁同步影子變數)都要接上新開關。
+def test_alert_doctor_registry_is_the_single_source_of_truth():
+    """★[2026-08-06 外審 P1-01 改寫]★ 止掛提醒對象＝ALERT_DOCTORS 註冊表,唯一來源。
 
-    以 AST 找 `self.alert_shen_enabled` 的讀取點,數量要與陳駿升那支一致 ——
-    兩位醫師走的是同一組程式碼路徑,少一處就是少一條路徑沒接上。
+    【為什麼改寫】舊版兩支測試是數 `self.alert_shen_enabled` 的 AST 讀取次數、
+    以及蒐集寫死的醫師名字串。它們擋不住真正發生的事故:2026-08-06 加入黃建仁/
+    謝佳陵時,九處接線都補了、當週行事曆也有他們的名字 → 這兩支測試【全綠】,
+    但【遠期背景掃描】那條路徑漏掉,勾了開關也永遠收不到遠期提醒。
+    名字出現在某處 ≠ 每條通知路徑都涵蓋他。
+
+    現在的不變量:註冊表是唯一來源,每位有門檻的醫師都必須在裡面、都必須有開關。
     """
-    def _reads(attr):
-        return [n for n in ast.walk(_MAIN_TREE)
-                if isinstance(n, ast.Attribute) and n.attr == attr
-                and isinstance(n.value, ast.Name) and n.value.id == "self"]
+    from cmuh_common.threshold_policy import _DOCTOR_THRESHOLD_KEYS
 
-    shen = _reads("alert_shen_enabled")
-    chen = _reads("alert_chen_enabled")
-    assert len(shen) == len(chen), \
-        f"沈冠宇的開關接線數({len(shen)})與陳駿升({len(chen)})不一致 → 有路徑沒接上"
-    assert len(shen) >= 5, "至少:宣告、影子變數×2、設定頁 checkbox、比門檻、遠期掃描"
+    assert set(main.ALERT_DOCTORS) == set(_DOCTOR_THRESHOLD_KEYS), (
+        "有門檻表的醫師與註冊表不一致 → 有人只設了門檻卻沒有開關(或反之):"
+        f"註冊表={sorted(main.ALERT_DOCTORS)} 門檻表={sorted(_DOCTOR_THRESHOLD_KEYS)}")
+    # 每位的開關鍵都要真的存在於預設設定,否則存檔/還原會靜默漏掉他
+    defaults = sd.default_threshold_settings()
+    for doctor, flag_key in main.ALERT_DOCTORS.items():
+        assert flag_key in defaults, f"{doctor} 的開關 {flag_key} 不在預設設定"
+        assert defaults[flag_key] is False, f"{doctor} 的提醒開關預設必須關(多台會重複寄)"
 
 
-def test_threshold_lookups_name_exactly_the_two_doctors():
-    """★接線★ 「拿誰的門檻表」與「拿來比對的醫師名」必須都是沈冠宇+陳駿升。
+def test_no_per_doctor_hardcoded_alert_branches_remain():
+    """★防回歸★ 不可以再出現 `doc_name == "某醫師"` 這種逐位寫死的止掛分支。
 
-    上一支只數開關的讀取次數 —— 把 `doc_name == "沈冠宇"` 改回舊名字,次數不變、
-    照樣全綠,但實機再也不會提醒。這裡改成看實際用到的醫師名字串本身。
+    那正是 P1-01 的病灶:每加一位醫師就要手動複製一條 if 到四條路徑,漏一條就
+    靜默不提醒。改用註冊表查表後,這類比較應該一條都不剩。
     """
-    names = set()
-    for n in ast.walk(_MAIN_TREE):
-        # self._get_doctor_threshold_map("<名字>")
-        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                and n.func.attr == "_get_doctor_threshold_map"
-                and n.args and isinstance(n.args[0], ast.Constant)
-                and isinstance(n.args[0].value, str)):
-            names.add(n.args[0].value)
-        # doctor_threshold_maps["<名字>"]
-        if (isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name)
-                and n.value.id == "doctor_threshold_maps"
-                and isinstance(n.slice, ast.Constant)
-                and isinstance(n.slice.value, str)):
-            names.add(n.slice.value)
-    # [2026-08-06 使用者] 新增黃建仁(三早60)/謝佳陵(四早/四晚/五午75) → 四位
-    assert names == {"沈冠宇", "陳駿升", "黃建仁", "謝佳陵"},         f"止掛門檻查詢用到的醫師名:{sorted(names)}"
+    hardcoded = {c.value for n in ast.walk(_MAIN_TREE)
+                 if isinstance(n, ast.Compare)
+                 and isinstance(n.left, ast.Name) and n.left.id == "doc_name"
+                 for c in n.comparators
+                 if isinstance(c, ast.Constant) and isinstance(c.value, str)}
+    leaked = hardcoded & set(main.ALERT_DOCTORS)
+    assert not leaked, (
+        f"止掛判斷又出現寫死的醫師名分支:{sorted(leaked)} —— "
+        "請改走 _is_doctor_alert_enabled()/_enabled_doctor_threshold_maps()")
 
-    # 比門檻的分支條件裡拿來跟 doc_name 比的名字,也必須是同兩位
-    compared = {c.value for n in ast.walk(_MAIN_TREE)
-                if isinstance(n, ast.Compare)
-                and isinstance(n.left, ast.Name) and n.left.id == "doc_name"
-                for c in n.comparators
-                if isinstance(c, ast.Constant) and isinstance(c.value, str)}
-    assert compared == {"沈冠宇", "陳駿升", "黃建仁", "謝佳陵"},         f"與 doc_name 比對的名字:{sorted(compared)}"
+    # 門檻表查詢也不該再逐位寫死名字(除了測試自己)
+    literal_lookups = {n.args[0].value for n in ast.walk(_MAIN_TREE)
+                       if isinstance(n, ast.Call)
+                       and isinstance(n.func, ast.Attribute)
+                       and n.func.attr == "_get_doctor_threshold_map"
+                       and n.args and isinstance(n.args[0], ast.Constant)
+                       and isinstance(n.args[0].value, str)}
+    assert not literal_lookups, (
+        f"還有寫死名字的門檻查詢:{sorted(literal_lookups)} → 改用註冊表迴圈")
 
 
 def test_settings_page_shows_shen_row_with_four_sessions():

@@ -25,6 +25,9 @@ from cmuh_common.paths import (
 )
 from cmuh_common.win32_safe import call_with_timeout, WIN_ENUM_TIMEOUT_SEC
 from cmuh_common.atomic_io import atomic_write_json as _atomic_write_json
+from cmuh_common.atomic_io import (  # noqa: E402
+    MultiWriteError, atomic_write_json_multi as _atomic_write_json_multi,
+)
 from cmuh_common.atomic_io import safe_load_json_ex as _safe_load_json_ex
 from cmuh_common.config_io import load_json_dict, load_json_list
 from cmuh_common.app_settings import (
@@ -7954,6 +7957,24 @@ ALERT_EMAIL_SENT_FILENAME = "alert_email_sent.json"
 ALERT_EMAIL_SENT_RETAIN_DAYS = STOP_SIGNUP_SCAN_DAYS + 14
 
 
+# ── 止掛提醒醫師註冊表(單一真實來源)──────────────────────────────────────────
+# 【為何存在:2026-08-06 外審 P1-01 的教訓】
+# 舊做法把「哪些醫師要止掛提醒」用一條條 `if doc_name == "X" and self.alert_x_enabled`
+# 散在【四條互不相干的路徑】:當週行事曆上色/通知、遠期背景掃描、優先刷新分級、設定頁。
+# 2026-08-06 新增黃建仁/謝佳陵時接了門檻表、開關、存檔、UI、當週行事曆共九處,唯獨漏了
+# 【遠期背景掃描】—— 於是使用者勾了開關,兩三週前就掛滿的診次永遠不寄提醒,而那正是遠期
+# 掃描當初存在的唯一理由。最惡劣的是它【靜默】:UI 一切正常,信就是不來。
+# 【修法】名字→開關屬性名 的註冊表當單一來源;所有通知路徑一律走
+# `_enabled_doctor_threshold_maps()` / `_is_doctor_alert_enabled()`,不再各自 if。
+# 【新增醫師只要改兩個地方】:這裡 + threshold_policy.DEFAULT_THRESHOLDS(與設定頁欄位)。
+ALERT_DOCTORS = {
+    "沈冠宇": "alert_shen_enabled",
+    "陳駿升": "alert_chen_enabled",
+    "黃建仁": "alert_huang_enabled",
+    "謝佳陵": "alert_hsieh_enabled",
+}
+
+
 # ── 個別醫師止掛「優先刷新」分級（2026-07-13 使用者需求）───────────────────────
 # 越接近門檻刷越密（只刷【該醫師】、不連動其他醫師）：
 #   門檻-10(near)→ 30 分、門檻-5(mid)→ 15 分、門檻-3(critical)→ 10 分。
@@ -8629,17 +8650,17 @@ class AutomationApp:
             ["expertise88864@gmail.com",
              "chilly840724@gmail.com",
              "mbpushowo@gmail.com"]))
-        # 止掛提醒信的寄件人帳號（必須先在 Outlook 設定此 SMTP 帳號）
-        self.alert_email_sender = str(self.threshold_settings.get(
-            "alert_email_sender", "cmuhdermatology@gmail.com"))
+        # [2026-08-06 外審] 移除 self.alert_email_sender —— 它只被賦值、全檔沒有任何
+        # 讀取點(死設定)。止掛提醒信實際走 _send_alert_email_via_smtp,寄件人一律取
+        # settings/smtp_credentials.json 的 from_address;留著這個欄位只會讓維護者
+        # 誤以為可以在 threshold_settings 指定寄件帳號。
         self.out_of_hospital_var = tk.BooleanVar(value=self.threshold_settings.get("out_of_hospital_mode", False))
         # [2026-07-13 使用者] 外院/分院診次固定顯示（設定已移除、不再讓使用者勾選）。
         self.show_external_clinics = tk.BooleanVar(value=True)
 
-        self.val_alert_shen = self.alert_shen_enabled.get()
-        self.val_alert_chen = self.alert_chen_enabled.get()
-        self.val_alert_huang = self.alert_huang_enabled.get()
-        self.val_alert_hsieh = self.alert_hsieh_enabled.get()
+        # [2026-08-06 外審] 各醫師止掛開關 → 背景執行緒可安全讀取的純 bool 快照
+        # (取代原本只寫不讀的 val_alert_shen/chen/huang/hsieh 死碼)。
+        self._sync_alert_enabled_snapshot()
         self.val_out_of_hospital = self.out_of_hospital_var.get()
 
         self.r_doctor_map = self.load_r_doctor_settings()
@@ -9730,10 +9751,15 @@ class AutomationApp:
             return
         for r_key, entries in self.r_doctor_entries.items():
             self.r_doctor_map[r_key] = {"name": (entries["name_var"].get() or "").strip()}
+        # ★[2026-08-06 外審 P1-07] 三個設定檔改成【兩階段一起 commit】★
+        #   舊做法是這裡先寫 r_doctor_settings.json、後面再各寫 threshold_settings
+        #   與 doctors.json —— 單檔各自原子,但三檔之間不是:第二/三個寫失敗時第一個
+        #   早就生效了,使用者只看到例外,不知道設定卡在「R 醫師已更新、醫師清單還是
+        #   舊的」這種半套狀態。現在把 payload 全部備好,最後一起寫(見下方 commit)。
         # 蓋上名單版號：之後這份存檔才會被尊重（見 app_settings 的說明）
-        _atomic_write_json(get_conf_path('r_doctor_settings.json'),
-                           _stamp_r_doctor_revision(self.r_doctor_map))
-        
+        _pending_writes = [(get_conf_path('r_doctor_settings.json'),
+                            _stamp_r_doctor_revision(self.r_doctor_map))]
+
         # 上面已經驗過(不合法就不會走到這裡);留空 = 這個診次不設門檻、不提醒。
         for key, value in validated_thresholds.items():
             self.threshold_settings[key] = value
@@ -9748,6 +9774,9 @@ class AutomationApp:
         self.threshold_settings['alert_chen_enabled'] = self.alert_chen_enabled.get()
         self.threshold_settings['alert_huang_enabled'] = self.alert_huang_enabled.get()
         self.threshold_settings['alert_hsieh_enabled'] = self.alert_hsieh_enabled.get()
+        # [2026-08-06 外審] 存檔＝設定確定生效的時點,順手同步背景執行緒讀的快照
+        # (checkbox 的 command 已同步過;這裡兜底,例如程式化 .set() 不觸發 command)。
+        self._sync_alert_enabled_snapshot()
         self.threshold_settings['out_of_hospital_mode'] = self.out_of_hospital_var.get()
         # [2026-07-13 使用者] show_external_clinics / notify_dnd / clinic_night_monitor 設定已移除；
         # 行為固定（外院分院固定顯示、勿擾窗固定 00–08 只不跳彈窗、reg64 固定 00–07 暫停），不再存這幾個鍵。
@@ -9768,7 +9797,58 @@ class AutomationApp:
                 logging.debug("讀取止掛提醒收件人 Listbox 失敗", exc_info=True)
         self.threshold_settings['alert_email_recipients'] = list(self.alert_email_recipients)
 
-        _atomic_write_json(get_conf_path('threshold_settings.json'), self.threshold_settings)
+        _pending_writes.append(
+            (get_conf_path('threshold_settings.json'), self.threshold_settings))
+
+        new_doctors_list = []
+        for item_id in self.doctors_tree.get_children():
+            item = self.doctors_tree.item(item_id)
+            doc_no, name = item['values']
+            existing_doctor = next((doc for doc in self.doctors_list if doc['name'] == name), None)
+            # [MG-03 2026-07-12] Treeview 對純數字代號回 int → str() 統一;notifications 缺鍵改 .get
+            # 兜底(原本下標缺鍵 KeyError 會讓 doctors.json 沒寫成,但 r_doctor/threshold 已寫=半套且無提示)。
+            notifications = existing_doctor.get('notifications', False) if existing_doctor else False
+            new_doctors_list.append({"name": name, "doc_no": str(doc_no), "notifications": notifications})
+        _pending_writes.append((get_conf_path('doctors.json'), new_doctors_list))
+
+        # ★[2026-08-06 外審 P1-07] 三個檔一起 commit(兩階段:全部寫 tmp → 全部 replace)★
+        #   失敗時要【講清楚】哪些生效了,不可以只丟一個例外讓使用者以為全存了。
+        #   記憶體與磁碟的同步(self.doctors_list / DOCTORS)與所有副作用都排在
+        #   commit 成功【之後】,避免「畫面已套用、磁碟沒存到」。
+        try:
+            _atomic_write_json_multi(_pending_writes)
+        except MultiWriteError as e:
+            logging.error("[設定] 存檔失敗(phase=%s;已生效=%s;未生效=%s)",
+                          e.phase, e.written, e.pending, exc_info=True)
+            if e.phase == "stage":
+                messagebox.showerror(
+                    "設定未儲存",
+                    "寫入設定檔失敗,這次【一個檔都沒有變更】"
+                    "(原本的設定都還在):\n\n"
+                    f"{e}\n\n"
+                    "常見原因:磁碟空間不足、檔案被防毒/備份軟體鎖住。\n"
+                    "請排除後再按一次儲存。",
+                    parent=self.root)
+            else:
+                messagebox.showerror(
+                    "設定只存了一部分",
+                    "存檔中途失敗,設定目前處於【不一致】狀態:\n\n"
+                    "已寫入:\n  "
+                    + ("\n  ".join(os.path.basename(p) for p in e.written) or "(無)")
+                    + "\n未寫入:\n  "
+                    + ("\n  ".join(os.path.basename(p) for p in e.pending) or "(無)")
+                    + f"\n\n{e}\n\n"
+                    "請排除原因後再按一次儲存,讓三個檔回到一致。",
+                    parent=self.root)
+            return
+        except Exception as e:                       # 非預期例外也不可宣稱已儲存
+            logging.error("[設定] 存檔發生非預期錯誤", exc_info=True)
+            messagebox.showerror("設定未儲存",
+                                 f"寫入設定檔時發生非預期錯誤:\n{e}",
+                                 parent=self.root)
+            return
+
+        self.doctors_list = new_doctors_list
 
         # [2026-07-04] 設定變更後立即讓門診監測套用新的「半夜監測」設定：取消可能仍
         # 停在 07:00 的排程、立刻重跑一次（否則在 00–07 點重新開啟時要等到 07:00）。
@@ -9780,19 +9860,6 @@ class AutomationApp:
                 self.clinic_loop_id = self.root.after(1000, self._update_clinic_lights_loop)
         except Exception:
             logging.debug("設定變更後重啟門診監測迴圈失敗", exc_info=True)
-
-        new_doctors_list = []
-        for item_id in self.doctors_tree.get_children():
-            item = self.doctors_tree.item(item_id)
-            doc_no, name = item['values'] 
-            existing_doctor = next((doc for doc in self.doctors_list if doc['name'] == name), None)
-            # [MG-03 2026-07-12] Treeview 對純數字代號回 int → str() 統一;notifications 缺鍵改 .get
-            # 兜底(原本下標缺鍵 KeyError 會讓 doctors.json 沒寫成,但 r_doctor/threshold 已寫=半套且無提示)。
-            notifications = existing_doctor.get('notifications', False) if existing_doctor else False
-            new_doctors_list.append({"name": name, "doc_no": str(doc_no), "notifications": notifications})
-        
-        self.doctors_list = new_doctors_list
-        _atomic_write_json(get_conf_path('doctors.json'), self.doctors_list)
 
         self._show_notice("設定已儲存", "所有設定已寫入檔案。\n若變更「介面字體縮放」，請重新啟動程式後才會套用。", level="info", auto_close_ms=4500)
         global DOCTORS, DOCTOR_NAMES
@@ -13361,12 +13428,9 @@ class AutomationApp:
         self.threshold_labels = {}          # key → 「沈冠宇 三晚」之類的人話標籤
 
         def on_doctor_alert_change():
-            # [修正] 當 UI 變更時，同步更新影子變數
-            self.val_alert_shen = self.alert_shen_enabled.get()
-            self.val_alert_chen = self.alert_chen_enabled.get()
-            self.val_alert_huang = self.alert_huang_enabled.get()
-            self.val_alert_hsieh = self.alert_hsieh_enabled.get()
-            
+            # [修正] 當 UI 變更時，同步更新影子快照（背景執行緒讀這份）
+            self._sync_alert_enabled_snapshot()
+
             self.status_text.set("狀態: 設定變更，正在重新整理...")
             self._trigger_refresh(True)
 
@@ -13672,11 +13736,8 @@ class AutomationApp:
             var = getattr(self, attr, None)
             if var is not None:
                 var.set(self.threshold_settings.get(key, fallback))
-        # 影子變數要跟著走,否則止掛提醒仍沿用還原前的開關
-        self.val_alert_shen = self.alert_shen_enabled.get()
-        self.val_alert_chen = self.alert_chen_enabled.get()
-        self.val_alert_huang = self.alert_huang_enabled.get()
-        self.val_alert_hsieh = self.alert_hsieh_enabled.get()
+        # 影子快照要跟著走,否則止掛提醒仍沿用還原前的開關
+        self._sync_alert_enabled_snapshot()
 
         if getattr(self, 'alert_mail_listbox', None) is not None:
             self.alert_mail_listbox.delete(0, tk.END)
@@ -13916,12 +13977,10 @@ class AutomationApp:
         base_font_size = self.f_sm - 1 if is_low_res else self.f_sm
         FIXED_SLOTS = 4
 
-        doctor_threshold_maps = {
-            "沈冠宇": self._get_doctor_threshold_map("沈冠宇"),
-            "陳駿升": self._get_doctor_threshold_map("陳駿升"),
-            "黃建仁": self._get_doctor_threshold_map("黃建仁"),
-            "謝佳陵": self._get_doctor_threshold_map("謝佳陵"),
-        }
+        # [2026-08-06 外審 P1-01] 只取【已啟用】的醫師門檻表(共用註冊表,與遠期
+        # 背景掃描、優先刷新同一份來源)。舊版在這裡硬列四位、又在下面各寫一條
+        # `elif doc_name == "X" and self.alert_x_enabled.get()`,新增醫師必漏。
+        doctor_threshold_maps = self._enabled_doctor_threshold_maps()
 
         time_morning_end = dt_time(12, 0)
         time_afternoon_end = dt_time(17, 0)
@@ -14055,22 +14114,12 @@ class AutomationApp:
                                                 full_threshold = None
                                                 session_key = (weekday_idx, session_name)
                                                 
-                                                if doc_name == "沈冠宇" and self.alert_shen_enabled.get():
-                                                    if session_key in doctor_threshold_maps["沈冠宇"]: 
-                                                        full_threshold = int(doctor_threshold_maps["沈冠宇"][session_key])
-                                                        alert_threshold = full_threshold - 10
-                                                elif doc_name == "陳駿升" and self.alert_chen_enabled.get():
-                                                    if session_key in doctor_threshold_maps["陳駿升"]: 
-                                                        full_threshold = int(doctor_threshold_maps["陳駿升"][session_key])
-                                                        alert_threshold = full_threshold - 10
-                                                elif doc_name == "黃建仁" and self.alert_huang_enabled.get():
-                                                    if session_key in doctor_threshold_maps["黃建仁"]: 
-                                                        full_threshold = int(doctor_threshold_maps["黃建仁"][session_key])
-                                                        alert_threshold = full_threshold - 10
-                                                elif doc_name == "謝佳陵" and self.alert_hsieh_enabled.get():
-                                                    if session_key in doctor_threshold_maps["謝佳陵"]: 
-                                                        full_threshold = int(doctor_threshold_maps["謝佳陵"][session_key])
-                                                        alert_threshold = full_threshold - 10
+                                                # [2026-08-06 外審 P1-01] 由註冊表查表取代逐位 if/elif。
+                                                # doctor_threshold_maps 已只含【啟用】的醫師,查得到就是該提醒。
+                                                _tmap = doctor_threshold_maps.get(doc_name)
+                                                if _tmap and session_key in _tmap:
+                                                    full_threshold = int(_tmap[session_key])
+                                                    alert_threshold = full_threshold - 10
                                                 
                                                 if full_threshold is not None and count >= full_threshold: 
                                                     tag = 'full'
@@ -14793,12 +14842,9 @@ class AutomationApp:
         【只寄 email、不跳彈窗】:幾週後的診次不該在看診中打斷醫師(彈窗仍由行事曆負責today
         附近的診次)。與行事曆共用同一組 notify_key 持久化去重 → 不會重複寄。"""
         try:
-            enabled = {}
-            if self.alert_shen_enabled.get():
-                enabled["沈冠宇"] = self._get_doctor_threshold_map("沈冠宇")
-            if self.alert_chen_enabled.get():
-                enabled["陳駿升"] = self._get_doctor_threshold_map("陳駿升")
-            enabled = {k: v for k, v in enabled.items() if v}
+            # [2026-08-06 外審 P1-01] 走共用註冊表 —— 舊版在這裡手寫沈/陳兩條 if,
+            # 新增黃建仁/謝佳陵時漏掉這裡,害「勾了開關卻收不到遠期提醒」。
+            enabled = self._enabled_doctor_threshold_maps()
             if not enabled:
                 return
             recipients = list(self.alert_email_recipients)
@@ -15611,6 +15657,63 @@ class AutomationApp:
     def _get_doctor_threshold_map(self, doctor_name):
         return build_doctor_threshold_map(doctor_name, self.threshold_settings)
 
+    def _sync_alert_enabled_snapshot(self) -> None:
+        """把各醫師止掛提醒開關讀成【純 bool 快照】,供背景執行緒安全讀取。
+
+        ★必須在 UI 執行緒呼叫★(這裡才會碰 tk BooleanVar)。呼叫時機:建構、開關被
+        勾選/取消、還原預設 —— 與舊的 val_alert_* 賦值點完全相同。
+
+        [2026-08-06 外審] 舊的 self.val_alert_shen/chen/huang/hsieh 是【只寫不讀】的
+        死碼(12 個賦值、0 個讀取),卻被源碼字串測試保護著。改成這份真的會被
+        `_is_doctor_alert_enabled()` 讀取的快照 —— 同 val_out_of_hospital 的既有理由:
+        排程執行緒的 dynamic_cl_checker 不可以直接 .get() tk 變數。"""
+        snapshot = {}
+        for doctor_name, attr in ALERT_DOCTORS.items():
+            flag = getattr(self, attr, None)
+            try:
+                snapshot[doctor_name] = bool(flag is not None and flag.get())
+            except Exception:
+                logging.debug("[ALERT] 讀取 %s 開關失敗,視為關閉", attr, exc_info=True)
+                snapshot[doctor_name] = False
+        self._alert_enabled = snapshot
+
+    def _is_doctor_alert_enabled(self, doctor_name) -> bool:
+        """該醫師的止掛提醒開關是否開著。不在 ALERT_DOCTORS 註冊表 → False。
+
+        [2026-08-06 外審 P1-01] 所有通知路徑共用此判斷,不再各自寫
+        `doc_name == "X" and self.alert_x_enabled.get()`(那正是漏接的根源)。
+        優先讀 `_sync_alert_enabled_snapshot()` 建立的純 bool 快照(背景執行緒安全);
+        快照尚未建立時(建構中途)才退回直接讀開關。狀態不明一律當關閉(fail-closed):
+        寧可不寄,也不要在狀態不明時寄錯信。"""
+        attr = ALERT_DOCTORS.get(doctor_name)
+        if not attr:
+            return False
+        snapshot = getattr(self, "_alert_enabled", None)
+        if isinstance(snapshot, dict) and doctor_name in snapshot:
+            return bool(snapshot[doctor_name])
+        flag = getattr(self, attr, None)
+        if flag is None:
+            return False
+        try:
+            return bool(flag.get())
+        except Exception:
+            logging.debug("[ALERT] 讀取 %s 開關失敗,視為關閉", attr, exc_info=True)
+            return False
+
+    def _enabled_doctor_threshold_maps(self) -> dict:
+        """{醫師: 門檻表} —— 只含【開關已開且有門檻】者。通知路徑的單一入口。
+
+        當週行事曆、遠期背景掃描、優先刷新分級都用這個,確保「新增一位醫師」不可能
+        只有部分路徑生效(2026-08-06 P1-01)。"""
+        result = {}
+        for doctor_name in ALERT_DOCTORS:
+            if not self._is_doctor_alert_enabled(doctor_name):
+                continue
+            threshold_map = self._get_doctor_threshold_map(doctor_name)
+            if threshold_map:
+                result[doctor_name] = threshold_map
+        return result
+
     def _get_all_doctors_data_snapshot(self):
         with self._doctor_data_lock:
             return deepcopy(self.all_doctors_data)
@@ -15647,8 +15750,15 @@ class AutomationApp:
           'mid'      已達門檻-5  → 每 15 分刷新該醫師一次（±10-20% 抖動）
           'near'     已達門檻-10 → 每 30 分刷新該醫師一次（±10-20% 抖動）
           None       皆非        → 不納入優先刷新（走一般 3 小時全體刷新）
-        純讀當前快取，只刷該醫師、不連動其他醫師。"""
+        純讀當前快取，只刷該醫師、不連動其他醫師。
+
+        [2026-08-06 外審 P2-01] 提醒開關關閉的醫師一律回 None ——「這台不負責該醫師
+        的止掛監測」時，把他升到 10/15/30 分高頻刷新只是白白增加院方請求（行事曆
+        上色與寄信同樣受開關管控，不刷也不影響顯示）。黃建仁/謝佳陵有原廠門檻，
+        若不擋，即使開關預設關也會被拉進高頻刷新。"""
         if not doctor_name:
+            return None
+        if not self._is_doctor_alert_enabled(doctor_name):
             return None
         threshold_map = self._get_doctor_threshold_map(doctor_name)
         if not threshold_map:
@@ -15875,6 +15985,11 @@ class AutomationApp:
                     for doc in DOCTORS:
                         doc_name = doc.get("name")
                         if not doc_name:
+                            continue
+                        # [2026-08-06 外審 P2-01] 提醒開關關閉 → 不納入優先刷新
+                        # (不寄信也不上色的醫師,高頻刷新只是白增院方請求)。
+                        if not self._is_doctor_alert_enabled(doc_name):
+                            self._priority_refresh_plan.pop(doc_name, None)
                             continue
                         threshold_map = self._get_doctor_threshold_map(doc_name)
                         if not threshold_map:

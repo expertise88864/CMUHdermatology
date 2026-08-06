@@ -98,6 +98,98 @@ def atomic_write_json(file_path: str, data, **kwargs) -> None:
         raise
 
 
+class MultiWriteError(OSError):
+    """多檔寫入失敗。written/pending 讓呼叫端能【精確】告訴使用者存了哪些。
+
+    phase：
+      "stage"  —— 還在寫暫存檔就失敗 → 一個目標檔都沒動(written 必為空)。
+      "commit" —— 暫存檔都寫好了,replace 到一半失敗 → written 是已生效的檔。
+    """
+
+    def __init__(self, message: str, *, phase: str, written: list,
+                 pending: list, cause: BaseException | None = None):
+        super().__init__(message)
+        self.phase = phase
+        self.written = list(written)
+        self.pending = list(pending)
+        self.cause = cause
+
+
+def atomic_write_json_multi(items, **kwargs) -> None:
+    """把多個 JSON 檔【要嘛都生效、要嘛都不生效】地寫下去。
+
+    items: [(file_path, data), ...]，依序 commit。
+
+    【為什麼需要它:2026-08-06 外審 P1-07】
+    設定頁的「儲存」要寫 r_doctor_settings / threshold_settings / doctors 三個檔。
+    舊做法是連續三次 `atomic_write_json`——單檔各自原子，但【三檔之間不是】：
+    第二個檔寫失敗時第一個早就生效了，使用者只看到一個例外，不知道自己的設定
+    處於「R 醫師已更新、醫師清單還是舊的」這種半套狀態。
+
+    做法(兩階段)：
+      Phase 1 stage  : 全部寫進同目錄的 .tmp + fsync。任一失敗 → 清掉所有 tmp、
+                       拋 MultiWriteError(phase="stage")，目標檔【一個都沒動】。
+      Phase 2 commit : 依序 os.replace(同磁區的 rename，成功機率極高)。
+                       萬一中途失敗 → 拋 MultiWriteError(phase="commit") 並附上
+                       「已生效」與「未生效」清單，讓 UI 能講清楚。
+    註：Windows 沒有跨檔案的原子 rename，Phase 2 理論上仍可能部分完成；但把所有
+    可能失敗的重活(序列化、磁碟寫入、空間不足)都擋在 Phase 1，已經把真實世界的
+    半套風險壓到極低，而且失敗時是【可精確描述】的，不再是無聲半套。
+    """
+    items = [(str(p), d) for p, d in items]
+    dump_kwargs = {"ensure_ascii": False, "indent": 4}
+    dump_kwargs.update(kwargs)
+
+    staged: list = []          # [(tmp_path, target_path), ...]
+    try:
+        for target_path, data in items:
+            fd, tmp_path = _make_temp_path(target_path)
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, **dump_kwargs)
+                    _flush_and_fsync(f)
+            except Exception:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+                if os.path.exists(tmp_path):
+                    try:
+                        _remove_with_retry(tmp_path)
+                    except Exception:
+                        logging.debug("[atomic_io] 清除 tmp 失敗", exc_info=True)
+                raise
+            staged.append((tmp_path, target_path))
+    except Exception as e:
+        for tmp_path, _ in staged:
+            try:
+                if os.path.exists(tmp_path):
+                    _remove_with_retry(tmp_path)
+            except Exception:
+                logging.debug("[atomic_io] 清除 tmp 失敗", exc_info=True)
+        raise MultiWriteError(
+            f"寫入暫存檔失敗，未變更任何設定檔：{e}",
+            phase="stage", written=[], pending=[p for p, _ in items],
+            cause=e) from e
+
+    written: list = []
+    for idx, (tmp_path, target_path) in enumerate(staged):
+        try:
+            _replace_with_retry(tmp_path, target_path)
+        except Exception as e:
+            for leftover_tmp, _ in staged[idx:]:
+                try:
+                    if os.path.exists(leftover_tmp):
+                        _remove_with_retry(leftover_tmp)
+                except Exception:
+                    logging.debug("[atomic_io] 清除 tmp 失敗", exc_info=True)
+            raise MultiWriteError(
+                f"設定只寫入了一部分（{target_path} 失敗）：{e}",
+                phase="commit", written=written,
+                pending=[t for _, t in staged[idx:]], cause=e) from e
+        written.append(target_path)
+
+
 def safe_load_json_ex(file_path: str, default=None, *,
                       backup_on_corrupt: bool = True):
     """同 safe_load_json，但額外回傳「載入狀態」以便呼叫端決策。回 (value, status)：

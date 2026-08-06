@@ -7,9 +7,13 @@
 """
 import os
 import sys
+from datetime import date
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import main  # noqa: E402
 from cmuh_common.settings_defaults import default_threshold_settings  # noqa: E402
 from cmuh_common.threshold_policy import (  # noqa: E402
     DEFAULT_THRESHOLDS, build_doctor_threshold_map,
@@ -57,14 +61,14 @@ def _main_src() -> str:
 
 
 def test_main_wires_both_doctors_end_to_end():
-    """九處接線的源碼守衛：漏任何一處，勾了開關也不會有提醒（或存不進檔）。"""
+    """接線守衛（存檔／設定頁 UI）。
+
+    ★[2026-08-06 外審 P1-01]★ 原本這支還檢查「判斷點寫死 doc_name == 姓名」與
+    「影子變數 val_alert_* 出現 3 次」。那些字串已被【註冊表】取代（逐位 if 正是
+    漏接的病灶、val_alert_* 是只寫不讀的死碼），改由
+    test_stop_signup_doctor_change 的註冊表不變量 + 下面的遠期掃描行為測試守住。
+    """
     src = _main_src()
-    # 判斷點
-    assert 'doc_name == "黃建仁" and self.alert_huang_enabled.get()' in src
-    assert 'doc_name == "謝佳陵" and self.alert_hsieh_enabled.get()' in src
-    # threshold map 集合
-    assert '"黃建仁": self._get_doctor_threshold_map("黃建仁")' in src
-    assert '"謝佳陵": self._get_doctor_threshold_map("謝佳陵")' in src
     # 存檔
     assert "self.threshold_settings['alert_huang_enabled']" in src
     assert "self.threshold_settings['alert_hsieh_enabled']" in src
@@ -74,8 +78,124 @@ def test_main_wires_both_doctors_end_to_end():
     assert "'hsieh_thu_morning': '四早:'" in src
     assert "'hsieh_thu_night': '四晚:'" in src
     assert "'hsieh_fri_afternoon': '五午:'" in src
-    # 還原預設對照 + 影子變數
+    # 還原預設對照
     assert "('alert_huang_enabled', 'alert_huang_enabled', False)" in src
     assert "('alert_hsieh_enabled', 'alert_hsieh_enabled', False)" in src
-    assert src.count("self.val_alert_huang = self.alert_huang_enabled.get()") >= 3
-    assert src.count("self.val_alert_hsieh = self.alert_hsieh_enabled.get()") >= 3
+    # 兩位都必須在註冊表內（唯一來源）
+    assert main.ALERT_DOCTORS["黃建仁"] == "alert_huang_enabled"
+    assert main.ALERT_DOCTORS["謝佳陵"] == "alert_hsieh_enabled"
+
+
+# ── ★行為測試★ 遠期背景掃描必須涵蓋新醫師（P1-01 實際發生的事故）─────────────
+# 舊版只有源碼字串守衛：九處接線全綠、但 _scan_future_stop_signup_alerts 的
+# enabled map 仍只有沈冠宇/陳駿升 → 勾了開關也永遠收不到遠期提醒，而遠期掃描
+# 正是「兩三週前就掛滿的診次」唯一的提醒來源。以下改測真的會不會寄。
+
+class _FakeVar:
+    def __init__(self, v):
+        self._v = v
+
+    def get(self):
+        return self._v
+
+
+def _scan_app(monkeypatch, doctor, doc_no, by_date, enabled=True,
+              recipients=("me@example.com",)):
+    """組一個只帶遠期掃描所需欄位的 app（不建 Tk）。"""
+    app = main.AutomationApp.__new__(main.AutomationApp)
+    for name, attr in main.ALERT_DOCTORS.items():
+        setattr(app, attr, _FakeVar(enabled and name == doctor))
+    app.alert_email_recipients = list(recipients)
+    app.doctors_list = [{"name": doctor, "doc_no": doc_no}]
+    app.all_doctors_data = {doc_no: by_date}
+    app._doctor_data_lock = main.threading.Lock()
+    app._alert_state_lock = main.threading.Lock()
+    app._reg64_cache_lock = main.threading.Lock()
+    app._reg64_public_snapshot = {}
+    app._alert_email_inflight = set()
+    app._live_clinic_data_keys = {doc_no}
+    app.threshold_settings = {}
+    app._alert_email_sent = {}
+    monkeypatch.setattr(app, "_mark_alert_email_sent",
+                        lambda nk: app._alert_email_sent.__setitem__(nk, "d"))
+    mails = []
+    monkeypatch.setattr(main, "_send_alert_email_via_smtp",
+                        lambda subj, body, rcpts, **k:
+                        mails.append((subj, body)) or True)
+    monkeypatch.setattr(main.threading, "Thread",
+                        lambda target=None, **k: type(
+                            "T", (), {"start": lambda s: target()})())
+    return app, mails
+
+
+def test_huang_far_future_wednesday_morning_alerts(monkeypatch):
+    """黃建仁：三週後的週三上午已達 60 人 → 遠期掃描必須寄出一封。"""
+    today = date(2026, 8, 6)                       # 週四
+    target = date(2026, 8, 26)                     # 週三（20 天後，>2 週）
+    assert target.weekday() == 2 and (target - today).days == 20
+    app, mails = _scan_app(monkeypatch, "黃建仁", "D90001", {target: [
+        {"session": "上午", "count": 60, "is_stopped": False, "room": "101診"}]})
+    app._scan_future_stop_signup_alerts(today=today)
+    assert len(mails) == 1, "黃建仁週三上午已達門檻 60 → 遠期掃描應寄提醒"
+    assert "黃建仁醫師" in mails[0][0] and "60 人" in mails[0][0]
+
+
+@pytest.mark.parametrize("target,session", [
+    (date(2026, 8, 27), "上午"),                   # 週四早
+    (date(2026, 8, 27), "晚上"),                   # 週四晚
+    (date(2026, 8, 28), "下午"),                   # 週五午
+])
+def test_hsieh_each_far_future_slot_alerts(monkeypatch, target, session):
+    """謝佳陵三個診次各自都要能在遠期被提醒（門檻皆 75）。"""
+    today = date(2026, 8, 6)
+    app, mails = _scan_app(monkeypatch, "謝佳陵", "D90002", {target: [
+        {"session": session, "count": 75, "is_stopped": False}]})
+    app._scan_future_stop_signup_alerts(today=today)
+    assert len(mails) == 1, f"謝佳陵 {target}({session}) 已達 75 → 應寄提醒"
+    assert "謝佳陵醫師" in mails[0][0]
+
+
+@pytest.mark.parametrize("doctor,doc_no,target,session,count", [
+    ("黃建仁", "D90001", date(2026, 8, 26), "上午", 60),
+    ("謝佳陵", "D90002", date(2026, 8, 27), "晚上", 75),
+])
+def test_disabled_toggle_blocks_far_future_alert(
+        monkeypatch, doctor, doc_no, target, session, count):
+    """開關關閉 → 遠期掃描不得寄（多台同跑的重複寄信防線）。"""
+    app, mails = _scan_app(monkeypatch, doctor, doc_no,
+                           {target: [{"session": session, "count": count}]},
+                           enabled=False)
+    app._scan_future_stop_signup_alerts(today=date(2026, 8, 6))
+    assert mails == [], f"{doctor} 開關關閉時不得寄提醒"
+
+
+def test_below_threshold_not_alerted_for_new_doctors(monkeypatch):
+    """未達門檻不寄（確認比對的是各自的門檻，不是別人的）。"""
+    app, mails = _scan_app(monkeypatch, "黃建仁", "D90001",
+                           {date(2026, 8, 26): [{"session": "上午", "count": 59}]})
+    app._scan_future_stop_signup_alerts(today=date(2026, 8, 6))
+    assert mails == [], "59 < 門檻 60 → 不寄"
+
+
+def test_registry_covers_every_doctor_with_thresholds(monkeypatch):
+    """★核心不變量★ 每一位有門檻表的醫師，遠期掃描都必須真的會寄。
+
+    這支才是 P1-01 的正解：不是檢查「名字有沒有出現在原始碼」，而是逐位跑一遍
+    掃描。日後再加醫師時若只補門檻表卻忘了註冊表，這支立刻紅。
+    """
+    slot_to_date = {  # weekday → 2026-08 月內該星期幾且距 8/6 夠遠的日期
+        0: date(2026, 8, 24), 1: date(2026, 8, 25), 2: date(2026, 8, 26),
+        3: date(2026, 8, 27), 4: date(2026, 8, 28),
+    }
+    for doctor in main.ALERT_DOCTORS:
+        tmap = build_doctor_threshold_map(doctor, {})
+        if not tmap:
+            continue                                # 無預設門檻者（如沈冠宇部分診次）
+        (weekday, session), threshold = sorted(tmap.items())[0]
+        target = slot_to_date[weekday]
+        app, mails = _scan_app(monkeypatch, doctor, f"DOC{weekday}", {target: [
+            {"session": session, "count": int(threshold), "is_stopped": False}]})
+        app._scan_future_stop_signup_alerts(today=date(2026, 8, 6))
+        assert len(mails) == 1, (
+            f"{doctor} {target}({session}) 達門檻 {threshold} 卻沒寄 → "
+            "該醫師沒被接進遠期背景掃描（P1-01 事故重演）")

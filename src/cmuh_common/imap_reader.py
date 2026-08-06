@@ -193,6 +193,64 @@ def _subject_fingerprint(subject: str) -> str:
     return f"len={len(text)} sha={digest}"
 
 
+def _parse_trigger_headers(header_raw: bytes) -> tuple:
+    """(subject, from, authentication-results) —— 用標準 parser 解，支援折行 header。
+
+    ★[2026-08-06 外審 P2-04]★ 舊版逐行 `line.startswith(b"subject:")`。RFC 5322
+    允許 header 折行(長 display name、多段 RFC 2047 encoded-word 幾乎必折)，逐行
+    比對只會拿到第一行 → 主旨關鍵字漏判、From 變空 → 白名單寄件人被誤拒。
+    解析失敗一律回三個空字串(呼叫端的既有行為:不命中)。
+    """
+    if not header_raw:
+        return "", "", ""
+    try:
+        from email import policy
+        from email.parser import BytesParser
+        msg = BytesParser(policy=policy.default).parsebytes(header_raw)
+        def _get(name):
+            try:
+                v = msg.get(name)
+                return str(v) if v is not None else ""
+            except Exception:
+                # 極少數畸形 encoded-word 會讓 policy.default 在取值時拋
+                raw = msg.get_raw(name) if hasattr(msg, "get_raw") else None
+                return str(raw or "")
+        return _get("Subject"), _get("From"), _get("Authentication-Results")
+    except Exception:
+        logging.debug("[IMAP] header 解析失敗", exc_info=True)
+        return "", "", ""
+
+
+def _from_is_authenticated(auth_results: str, from_addr: str) -> bool:
+    """Authentication-Results 是否證明這封信的 From 通過驗證。
+
+    ★[2026-08-06 外審 P1-05]★ `From:` 是寄件者自填的純文字,可以偽造;只比對它
+    等於沒有授權驗證。Gmail 收信時會把 SPF/DKIM/DMARC 判定寫進這個 header。
+
+    判準(保守):dmarc=pass 就算通過(DMARC 本身即要求 SPF 或 DKIM 通過【且與 From
+    對齊】);沒有 dmarc 時,要 dkim=pass 或 spf=pass 且該項的網域與 From 的網域一致
+    —— 只有 spf=pass 而網域不符不算(那只證明信封寄件者,不是 From)。
+    沒有這個 header(例如自己寄給自己、或郵件服務不加)→ False(無證據 ≠ 通過)。
+    """
+    text = (auth_results or "").lower()
+    if not text:
+        return False
+    if "dmarc=pass" in text:
+        return True
+    domain = (from_addr or "").rsplit("@", 1)[-1].strip().lower()
+    if not domain:
+        return False
+    for mech in ("dkim", "spf"):
+        idx = text.find(f"{mech}=pass")
+        if idx < 0:
+            continue
+        # 取該機制後面那一小段找 header.d= / header.from= / smtp.mailfrom=
+        seg = text[idx:idx + 200]
+        if domain in seg:
+            return True
+    return False
+
+
 def check_trigger(keyword: str, mark_read: bool = True,
                    timeout: float = 12.0,
                    sample_count: int = 3,
@@ -216,6 +274,10 @@ def check_trigger(keyword: str, mark_read: bool = True,
         "scanned": 0,
         "matched": 0,
         "matched_senders": [],
+        # [2026-08-06 外審 P1-05] matched_senders 的子集:From 有通過
+        # SPF/DKIM/DMARC 驗證者。呼叫端要做「可信授權」時看這個,不要只看
+        # matched_senders(那裡的 From 是可偽造的純文字)。
+        "authenticated_senders": [],
         "samples": [],
         "error": None,
     }
@@ -247,16 +309,22 @@ def check_trigger(keyword: str, mark_read: bool = True,
         # 用 IMAP SEARCH 直接過濾「未讀 + 主旨含 keyword」，避免拉全部
         # 注意：IMAP SEARCH 對非 ASCII 主旨要用 LITERAL+CHARSET UTF-8
         # imaplib 支援：search(charset, *criteria)
+        # ★[2026-08-06 外審 P2-02] 一律用 UID API,不用 message sequence number★
+        #   舊版用 conn.search/fetch/store —— 那是【序號】API。序號會因為其他
+        #   client(手機 Gmail App、網頁版)在我們 SEARCH 與 FETCH/STORE 之間
+        #   EXPUNGE 而整批位移 → 可能讀到另一封信、甚至把【另一封】標成已讀。
+        #   UID 在同一個 mailbox 內穩定不變(UIDVALIDITY 不變時),既正確也才能
+        #   當持久化的去重鍵。
         try:
             # ASCII 主旨 → server-side SEARCH(高效);中文主旨會在 imaplib ASCII 編碼階段先拋
             # UnicodeEncodeError → 落 except 後備「全 UNSEEN client 端比對」。
             # [IF-05 2026-07-12] 移除原「typ!=OK 改 UTF-8 mode」死碼:中文走的是【例外】路徑而非
             # typ!=OK,該 UTF-8 retry 永不執行(kw_bytes 一併移除)。
-            typ, data = conn.search(None, "UNSEEN", "SUBJECT",
-                                     f'"{keyword}"')
+            typ, data = conn.uid("search", None, "UNSEEN", "SUBJECT",
+                                 f'"{keyword}"')
         except Exception:
             # 後備：撈 UNSEEN 後 client 端比對
-            typ, data = conn.search(None, "UNSEEN")
+            typ, data = conn.uid("search", None, "UNSEEN")
             if typ != "OK":
                 # 後備搜尋本身回了非 OK → 這是新的失敗條件(訊息已自足),與觸發後備的
                 # 原例外無因果關係 → from None 明示不接續原鏈。
@@ -288,7 +356,10 @@ def check_trigger(keyword: str, mark_read: bool = True,
         senders_seen = set()
         for uid in ids:
             try:
-                typ, fetch = conn.fetch(uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])")
+                typ, fetch = conn.uid(
+                    "fetch", uid,
+                    "(BODY.PEEK[HEADER.FIELDS "
+                    "(SUBJECT FROM AUTHENTICATION-RESULTS)])")
                 if typ != "OK" or not fetch:
                     continue
                 # fetch 結構：[(b'1 (BODY...', b'Subject: ...\r\nFrom: ...\r\n'), b')']
@@ -297,17 +368,11 @@ def check_trigger(keyword: str, mark_read: bool = True,
                     if isinstance(part, tuple) and len(part) >= 2:
                         header_raw = part[1]
                         break
-                subj_str = ""
-                from_str = ""
-                if header_raw:
-                    for line in header_raw.splitlines():
-                        low = line.lower()
-                        if low.startswith(b"subject:"):
-                            subj_str = _decode_subject(
-                                line.split(b":", 1)[1].strip())
-                        elif low.startswith(b"from:"):
-                            from_str = _decode_subject(
-                                line.split(b":", 1)[1].strip())
+                # ★[2026-08-06 外審 P2-04] 用 email 標準 parser,不要逐行 startswith★
+                #   RFC 5322 的 header 可以【折行】(長 display name、多段 RFC 2047
+                #   encoded-word 都會折)。舊版逐行比對只會拿到第一行 → 主旨關鍵字
+                #   漏判、From 變空字串 → 白名單寄件人被誤拒、觸發靜默失效。
+                subj_str, from_str, auth_str = _parse_trigger_headers(header_raw)
                 if keyword in subj_str:
                     # [會診2 2026-06-11] 觸發信時效過濾：程式停機數天(或長期標已讀
                     # 失敗)累積的舊未讀觸發信，恢復後第一輪 poll 會全部命中 → 把幾天
@@ -328,9 +393,22 @@ def check_trigger(keyword: str, mark_read: bool = True,
                     # parseaddr 解 "Name <foo@bar.com>" → ("Name", "foo@bar.com")
                     _, addr = parseaddr(from_str)
                     addr = (addr or "").strip().lower()
+                    # ★[2026-08-06 外審 P1-05] 記錄寄件人驗證結果★
+                    #   From: 是寄件者自己填的字串,可以偽造。Gmail 會在收下時把
+                    #   SPF/DKIM/DMARC 的判定寫進 Authentication-Results。這裡把
+                    #   「這封信的 From 有沒有通過驗證」一併回報,呼叫端才有可信的
+                    #   授權依據(而不是只比對一個可偽造的字串)。
+                    auth_ok = _from_is_authenticated(auth_str, addr)
+                    if not auth_ok:
+                        logging.warning(
+                            "[IMAP] 觸發信寄件人未通過 SPF/DKIM/DMARC 驗證"
+                            "(From 可偽造):%r;Authentication-Results=%r",
+                            addr, (auth_str or "")[:200])
                     if addr and addr not in senders_seen:
                         senders_seen.add(addr)
                         result["matched_senders"].append(addr)
+                        if auth_ok:
+                            result["authenticated_senders"].append(addr)
                 elif len(result["samples"]) < sample_count:
                     result["samples"].append(_subject_fingerprint(subj_str))
             except Exception:
@@ -348,7 +426,9 @@ def check_trigger(keyword: str, mark_read: bool = True,
             # 一次標記多封為已讀
             try:
                 id_list = b",".join(ids_to_mark).decode("ascii")
-                conn.store(id_list, "+FLAGS", "(\\Seen)")
+                # [外審 P2-02] UID STORE —— 與上面的 UID SEARCH/FETCH 一致,
+                # 否則會用序號去標記,可能標到另一封信。
+                conn.uid("store", id_list, "+FLAGS", "(\\Seen)")
             except Exception:
                 logging.warning("標已讀失敗（不影響觸發）", exc_info=True)
 
