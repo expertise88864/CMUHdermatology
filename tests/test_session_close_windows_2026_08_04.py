@@ -215,19 +215,26 @@ class TestHandleRecycling:
     """★P1-04★ hwnd 值會被 Windows 回收再發給別的視窗。"""
 
     def test_a_recycled_handle_is_not_closed(self, monkeypatch, caplog):
-        """身分對不上 → 不送 WM_CLOSE（那可能是醫師自己的住院系統）。"""
+        """身分對不上 → 不送 WM_CLOSE（那可能是醫師自己的住院系統）。
+
+        ★[2026-08-06 深度穩定] 回傳語意修正★ 原本斷言 ok is False(留帳);
+        但 handle 只有在原視窗【銷毀後】才會被回收 → 結論性身分不符=我們的
+        視窗早已不存在=session 已結束。回 False 會讓它永遠掛帳:每輪重試
+        永遠失敗、每 6 小時假告警、每 15 分鐘擋一次新登入。
+        「不關別人的視窗」的保護不變(closed 必須仍是空)。
+        """
         import logging as _lg
         # 現在這個 hwnd 屬於別的行程（醫師自己開的 systemftp，class 一模一樣）
         monkeypatch.setattr(cq, "_window_identity",
                             lambda _h: (18748, cq.MAIN_CLASS))
         closed = []
-        with caplog.at_level(_lg.ERROR):
+        with caplog.at_level(_lg.INFO):
             ok = cq._close_session_windows(
                 _Sess(main_hwnd=111, main_pid=1860), close=closed.append,
                 gone=lambda _h: False, sleep=lambda _s: None)
         assert closed == [], "★關到別人的視窗了★"
-        assert ok is False, "沒關成功就不可以回報成功"
-        assert "不是我們登入的那個視窗" in " ".join(
+        assert ok is True, "結論性身分不符=我們的視窗已銷毀 → 應剪帳,不得永久掛帳"
+        assert "已被回收成別的視窗" in " ".join(
             r.getMessage() for r in caplog.records)
 
     def test_identity_is_unknown_means_not_same(self):

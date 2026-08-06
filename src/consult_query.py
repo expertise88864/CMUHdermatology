@@ -2950,11 +2950,27 @@ def _close_session_windows(sess, *, close=None, gone=None, sleep=None) -> bool:
     #   就是醫師自己開的住院系統(同一支程式、同一個 class)。比對 (pid, class)。
     if not _is_same_window(sess):
         now_pid, now_cls = _window_identity(hwnd)
-        logging.error("[session] ★hwnd=%s 已不是我們登入的那個視窗★"
+        want_pid = getattr(sess, "main_pid", None)
+        want_cls = getattr(sess, "main_class", None)
+        # ★[2026-08-06 深度穩定] 讀得到現任身分、也記過自己的身分 → 判定是
+        #   【結論性】的:handle 只有在原視窗銷毀之後才會被回收給別人;身分驗證
+        #   不過(不論是 pid/class 換人、還是行程建立時間對不上)都代表我們登入的
+        #   那個視窗/行程早已不存在 —— session 已結束,沒有東西要關。
+        #   舊行為把這種情況回 False → 永遠掛在帳上:每輪重試永遠失敗、每 6 小時
+        #   告警一次、還要每 15 分鐘擋一次新登入 —— 一次 handle 回收換來永久假故障。
+        if (now_pid is not None and now_cls is not None
+                and want_pid is not None and want_cls is not None):
+            logging.info("[session] hwnd=%s 已被回收成別的視窗(當初 pid=%s "
+                         "class=%s,現在 pid=%s class=%s) → 我們的主畫面早已銷毀,"
+                         "session 視為已結束", hwnd, want_pid, want_cls,
+                         now_pid, now_cls)
+            return True
+        # 讀不到現任身分/當初沒記到身分 → 「不知道」不可以當成「已結束」,
+        # 也不可以送 WM_CLOSE(可能關到醫師的視窗) → 保守留帳,下一輪再驗。
+        logging.error("[session] ★hwnd=%s 身分無法確認★"
                       "(當初 pid=%s class=%s,現在 pid=%s class=%s) → 不送 WM_CLOSE。"
                       "我們的 HIS session 可能仍登入中,請人工確認隱藏桌面",
-                      hwnd, getattr(sess, "main_pid", None),
-                      getattr(sess, "main_class", None), now_pid, now_cls)
+                      hwnd, want_pid, want_cls, now_pid, now_cls)
         return False                   # 沒關成功,而且不可以亂關 → 交給掛帳機制
     # ★[2026-08-05 實機事故] 先把 modal 按掉,不然 WM_CLOSE 一定沒用★
     #   被 modal 擋住的主畫面是 disabled 的,disabled 的視窗不會處理 WM_CLOSE。
@@ -3603,8 +3619,14 @@ def _dismiss_blocking_modals(sess=None, *, pids=None) -> int:
     clicked = 0
     for hwnd, cls in _blocking_dialogs(owner):
         try:
+            # ★[2026-08-06 深度穩定,實機 log 09:06]★ class=#32770 按鈕=[]:
+            #   原生 Win32 對話框(MessageBox/驅動程式跳窗)的按鈕 class 是
+            #   "Button",不是 Delphi 的 "TButton" —— 只列 TButton 等於原生
+            #   對話框【永遠】按不掉,擋住就只能等 15 分鐘放行。
+            #   字樣白名單不變,原生的「確定/OK」一樣只按肯定鈕。
             buttons = [(h, (t or "").strip())
-                       for h, c, t, _r in enum_children(hwnd) if c == "TButton"]
+                       for h, c, t, _r in enum_children(hwnd)
+                       if c in ("TButton", "Button")]
         except Exception:
             logging.debug("[session] 列舉對話框按鈕失敗 hwnd=%s", hwnd,
                           exc_info=True)

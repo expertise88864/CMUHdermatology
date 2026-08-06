@@ -194,7 +194,7 @@ def _subject_fingerprint(subject: str) -> str:
 
 
 def check_trigger(keyword: str, mark_read: bool = True,
-                   timeout: float = 30.0,
+                   timeout: float = 12.0,
                    sample_count: int = 3,
                    max_age_sec: Optional[float] = None) -> dict:
     """掃描 IMAP 收件匣未讀信，主旨含 keyword 的就回報、抓 From 地址、並標為已讀。
@@ -231,6 +231,10 @@ def check_trigger(keyword: str, mark_read: bool = True,
 
     # 【穩定性 2026.05.20】不用 socket.setdefaulttimeout — 那是 process-global，
     # 會污染同 process 的 SMTP / selenium / requests。IMAP4_SSL(timeout=...) 已夠。
+    # [2026-08-06 深度穩定] 單操作逾時 30→12 秒:一次檢查有多個 socket 操作
+    # (login/select/search/逐封 fetch),各 30 秒的話兩三個停滯就撞上外層 watchdog
+    # 的 60 秒強制砍 socket(3 天 12 次,還伴隨 daemon thread 收不回來)。Gmail 正常
+    # 每操作 <2 秒;12 秒已是十倍餘裕,單點卡住改為快速失敗、走正常重試路徑。
     conn: Optional[imaplib.IMAP4_SSL] = None
     try:
         context = ssl.create_default_context()
