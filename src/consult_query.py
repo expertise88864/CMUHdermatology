@@ -1456,8 +1456,49 @@ def _await_stable_roster(consult_hwnd: int, *, read=None, sleep=None,
         sleep(_ROSTER_SETTLE_INTERVAL)
 
 
+_CAPTURE_BLANK_RETRIES = 2      # 整張單色(全黑)截圖的重截次數
+_CAPTURE_BLANK_WAIT_SEC = 1.0   # 每次重截前給視窗繪製的時間
+_SETTLED_RETRY_ROUNDS = 1       # 「截圖後清單又變了」整輪重來的次數
+
+
+def _image_is_blank(img) -> bool:
+    """整張圖每個色版都只有單一個值(全黑/全白/單色) → 零資訊。
+
+    ★[2026-08-06 15:23 實機]★ HIS 忙著向後端要資料時視窗還沒繪製任何內容,
+    PrintWindow(WM_PRINT) 印出來就是整張黑 —— 那封「以截圖為準」的信附了
+    一張全黑的圖,收信的人什麼都核對不了。單色不可能是真實視窗畫面(至少有
+    標題列/邊框/文字)。非 PIL 影像(測試樁)一律視為非單色。
+    """
+    try:
+        extrema = img.getextrema()
+        if not extrema:
+            return False
+        if not isinstance(extrema[0], (tuple, list)):   # 單色版(L)模式
+            extrema = (extrema,)
+        return all(lo == hi for lo, hi in extrema)
+    except Exception:
+        return False
+
+
+def _capture_nonblank(consult_hwnd: int, capture, *, sleep=None):
+    """截圖;整張單色就等視窗繪製後重截(最多 _CAPTURE_BLANK_RETRIES 次)。"""
+    sleep = sleep or time.sleep
+    img = capture(consult_hwnd)
+    for _ in range(_CAPTURE_BLANK_RETRIES):
+        if not _image_is_blank(img):
+            return img
+        logging.warning("[consult-extract] 截圖整張單色(視窗尚未繪製?) → "
+                        "%.0f 秒後重截", _CAPTURE_BLANK_WAIT_SEC)
+        sleep(_CAPTURE_BLANK_WAIT_SEC)
+        img = capture(consult_hwnd)
+    if _image_is_blank(img):
+        logging.warning("[consult-extract] 重截 %d 次後截圖仍整張單色 → "
+                        "沿用(附圖可能無參考價值)", _CAPTURE_BLANK_RETRIES)
+    return img
+
+
 def _capture_with_settled_roster(consult_hwnd: int, *, capture=None,
-                                 settle=None, read=None):
+                                 settle=None, read=None, sleep=None):
     """等清單穩定 → 截圖 → 回讀確認清單沒變 → (img, snapshot)。
 
     ★[2026-08-05 外審第 4 輪 P1-09]★ 截圖以前排在固定的 `time.sleep(1.8)` 之後、
@@ -1468,16 +1509,23 @@ def _capture_with_settled_roster(consult_hwnd: int, *, capture=None,
     最後一位的內容,不再是「打開時的原始清單畫面」。所以順序必須是
     【先等穩定 → 再截圖 → 再逐位擷取】。
 
-    截圖後再讀一次:期間又變了 → 這份快照已經不代表圖上那一刻 → 標成
-    unstable,走既有的 fail-open 通道(照寄、但不更新基準)。
+    截圖後再讀一次:期間又變了 → 這份快照已經不代表圖上那一刻。
+    ★[2026-08-06 15:23 實機] 對不上先重來一輪,不要直接認輸★ 後端慢時清單
+    可以在空清單觀察窗(3 秒)【之後】才載入(這次 ~6 秒):settle 在 0 列時判
+    「穩定」、截圖全黑、回讀才看到 2 列 → 白白寄了一封附全黑截圖的 fail-open
+    信,而 3 分鐘後的下一輪其實完全正常。「回讀對不上」= 資料【剛剛已經到了】,
+    整輪重來(重新等穩定+重截+重驗)幾乎必然成功;重來仍對不上才標 unstable
+    走既有的 fail-open 通道(照寄、但不更新基準)。
     """
     capture = capture or capture_window_image
     settle = settle or _await_stable_roster
     read = read or _read_roster_snapshot
 
-    snap = settle(consult_hwnd)
-    img = capture(consult_hwnd)
-    if snap.stable:
+    for round_no in range(_SETTLED_RETRY_ROUNDS + 1):
+        snap = settle(consult_hwnd)
+        img = _capture_nonblank(consult_hwnd, capture, sleep=sleep)
+        if not snap.stable:
+            return img, snap
         try:
             _c, _r, after = read(consult_hwnd)
         except Exception:
@@ -1490,12 +1538,18 @@ def _capture_with_settled_roster(consult_hwnd: int, *, capture=None,
                             "本輪不更新已通知基準(下一輪會重新比對)",
                             exc_info=True)
             return img, snap.as_unverified()
-        if after != snap.texts:
-            logging.warning("[consult-extract] 截圖後病人清單又變了"
-                            "(%d 列 → %d 列) → 本輪不據此判斷有無新會診",
-                            len(snap.texts), len(after))
-            snap = snap.as_unstable()
-    return img, snap
+        if after == snap.texts:
+            return img, snap
+        if round_no < _SETTLED_RETRY_ROUNDS:
+            logging.info("[consult-extract] 截圖後病人清單又變了(%d 列 → "
+                         "%d 列)=資料剛載入完成 → 重新等穩定+重截(第 %d 次"
+                         "重試)", len(snap.texts), len(after), round_no + 1)
+            continue
+        logging.warning("[consult-extract] 截圖後病人清單又變了"
+                        "(%d 列 → %d 列) → 本輪不據此判斷有無新會診",
+                        len(snap.texts), len(after))
+        return img, snap.as_unstable()
+    raise AssertionError("unreachable")
 
 
 def _find_patient_radios(children: list) -> list:

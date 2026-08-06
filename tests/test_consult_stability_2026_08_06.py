@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """[2026-08-06 深度穩定] 依近三日實機 log 統計(150+49 次擋登入、12 次 IMAP 砍
-socket、#32770 按鈕列舉不到)修的三個穩定性缺陷。"""
+socket、#32770 按鈕列舉不到)修的三個穩定性缺陷;④ 為同日 15:23 實機事件
+(慢載入誤判+全黑截圖)追加的兩個修正。"""
 import os
 import sys
 
@@ -96,6 +97,75 @@ def test_native_dialog_still_never_blind_clicks(monkeypatch):
     cq._reported_unknown_dialogs.discard("#32770")
     assert cq._dismiss_blocking_modals(pids={999}) == 0
     assert clicked == []
+
+
+# ─── ④ 15:23 實機:慢載入誤判 + 全黑截圖 ────────────────────────────────────
+# 時序:視窗開了但後端 ~6 秒才回資料 → settle 在 0 列時判「穩定」→ 截圖全黑
+# → 回讀才看到 2 列 → 直接 fail-open 寄了一封附全黑截圖的信;3 分鐘後下一輪
+# 完全正常。修法:(a) 回讀對不上=資料剛到 → 整輪重來一次;(b) 單色截圖重截。
+def _rgb(color):
+    from PIL import Image
+    return Image.new("RGB", (8, 6), color)
+
+
+def test_a_black_image_is_recognized_as_blank():
+    from PIL import Image
+    assert cq._image_is_blank(_rgb((0, 0, 0))) is True
+    assert cq._image_is_blank(_rgb((118, 218, 41))) is True  # 單色=零資訊
+    real = _rgb((0, 0, 0))
+    real.putpixel((3, 3), (255, 255, 255))
+    assert cq._image_is_blank(real) is False
+    assert cq._image_is_blank(Image.new("L", (4, 4), 0)) is True  # 單色版模式
+    assert cq._image_is_blank("IMG") is False, "非影像(測試樁)不可誤判"
+
+
+def test_a_blank_capture_is_retried_until_the_window_paints():
+    shots = [_rgb((0, 0, 0)), _rgb((0, 0, 0))]
+    good = _rgb((0, 0, 0))
+    good.putpixel((1, 1), (255, 0, 0))
+    shots.append(good)
+    img = cq._capture_nonblank(1, lambda h: shots.pop(0),
+                               sleep=lambda s: None)
+    assert img is good, "重截後拿到有內容的那張"
+
+
+def test_a_stubbornly_blank_capture_is_kept_after_bounded_retries():
+    calls = {"n": 0}
+
+    def _cap(_h):
+        calls["n"] += 1
+        return _rgb((0, 0, 0))
+    img = cq._capture_nonblank(1, _cap, sleep=lambda s: None)
+    assert cq._image_is_blank(img), "重截失敗仍要有圖可寄(fail-open)"
+    assert calls["n"] == 1 + cq._CAPTURE_BLANK_RETRIES, "重截必須有上限"
+
+
+def test_late_loading_roster_gets_one_full_retry(monkeypatch):
+    """15:23 劇本:settle 判空清單穩定,回讀才看到 2 列 → 重來一輪就正常,
+    不該直接 fail-open 寄信。"""
+    two = ["張01234567", "林07654321"]
+    settles = [cq._RosterSnapshot([], True, [], []),
+               cq._RosterSnapshot(list(two), True, [], [])]
+    img, snap = cq._capture_with_settled_roster(
+        1, capture=lambda h: "IMG",
+        settle=lambda h: settles.pop(0),
+        read=lambda h: ([], [], list(two)))
+    assert snap.stable is True and list(snap.texts) == two
+    assert cq._may_update_baseline(snap.texts) is True, "重來成功=正常一輪"
+
+
+def test_endless_churn_still_fails_open_after_bounded_retries():
+    """清單真的一直在變 → 重試有上限,最後仍走 fail-open(既有語意不變)。"""
+    settle_calls = {"n": 0}
+
+    def _settle(_h):
+        settle_calls["n"] += 1
+        return cq._RosterSnapshot(["甲1111111"], True, [], [])
+    _img, snap = cq._capture_with_settled_roster(
+        1, capture=lambda h: "IMG", settle=_settle,
+        read=lambda h: ([], [], ["甲1111111", "乙2222222"]))
+    assert snap.stable is False, "重試耗盡仍對不上 → fail-open"
+    assert settle_calls["n"] == 1 + cq._SETTLED_RETRY_ROUNDS, "重試必須有上限"
 
 
 # ─── ③ IMAP 單操作逾時要遠小於外層 60s 砍 socket ────────────────────────────
