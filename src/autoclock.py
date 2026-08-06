@@ -2162,11 +2162,27 @@ def _cleanup_orphan_chromedrivers_at_startup() -> None:
 def _machine_has_clock_accounts() -> bool:
     """本機到底有沒有設定打卡帳號(判斷「這台要不要跑打卡」的唯一依據)。
 
-    讀不到/壞檔 → True(保守:當成有設定,才不會把真正的重啟失敗吞掉)。
+    ★[2026-08-06 外審 P2-01] 必須用 safe_load_json_ex,不能用 safe_load_json★
+    `safe_load_json` 會把 PermissionError/OSError/壞 JSON【全部吞掉並回 default】
+    (見它自己的 docstring),所以上一版寫的 `try/except → return True` 是【永遠
+    走不到】的死路:防毒鎖住設定檔時它拿到的是 `[]` → 判定「沒有帳號」→ 把一台
+    真的在打卡的電腦的重啟失敗告警【靜默吞掉】,恰恰與註解宣稱的保守相反。
+    (而且當時的測試 monkeypatch 讓它 raise —— 測到一條 production 不存在的路徑。)
+
+    現在明確區分四種狀態:
+      missing        → 沒設定過 → False(本機不做打卡)
+      ok 且清單為空  → 使用者刪光了 → False
+      ok 且有帳號    → True
+      error/corrupt  → True(保守:讀不到不等於沒有,寧可多提醒也不可吞掉真失敗)
     """
     try:
-        data = safe_load_json(CONFIG_FILE, [])
+        data, status = safe_load_json_ex(CONFIG_FILE, [])
     except Exception:
+        logging.debug("[autoclock] 讀取打卡設定檔失敗,保守視為有帳號", exc_info=True)
+        return True
+    if status not in ("ok", "missing"):
+        logging.warning("[autoclock] 打卡設定檔狀態=%s(讀不到/損壞)→ 保守視為"
+                        "有帳號,不吞掉重啟失敗告警", status)
         return True
     if not isinstance(data, list):
         return True

@@ -78,7 +78,16 @@ def test_message_age_seconds_parses_internaldate():
     import time as _time
 
     class _Conn:
+        # ★[2026-08-06 外審] 序號 API 不可以被呼叫★
+        #   check_trigger 傳進來的是 UID SEARCH 拿到的【UID】。用 conn.fetch()
+        #   會被當成序號 —— Gmail 的 UID 通常遠大於信件數 → 查無 → 回 None →
+        #   呼叫端 fail-open 把每封陳舊觸發信都當新信重跑。
         def fetch(self, uid, parts):
+            raise AssertionError(
+                "★用了序號 fetch★ _message_age_seconds 必須走 conn.uid('fetch', ...)")
+
+        def uid(self, command, uid, parts):
+            assert command.lower() == "fetch", command
             return ("OK", [_internaldate_raw(_time.time() - 7200)])
 
     age = imap_reader._message_age_seconds(_Conn(), b"1")
@@ -86,13 +95,25 @@ def test_message_age_seconds_parses_internaldate():
     assert 7000 < age < 7400  # 約 2 小時(留時鐘/時區換算餘裕)
 
 
+def test_message_age_seconds_uses_uid_api_not_sequence_numbers():
+    """★防回歸★ 只要碰到序號 API 就算失敗（上面那支已內建，這支明說不變量）。"""
+    import inspect
+    src = inspect.getsource(imap_reader._message_age_seconds)
+    # 只看【程式碼】—— 註解裡會提到 conn.fetch() 來說明為何不能用它
+    code = "\n".join(ln.split("#", 1)[0]
+                     for ln in src.splitlines())
+    assert "conn.fetch(" not in code, (
+        "★_message_age_seconds 又用回序號 fetch★ 陳舊觸發信保護會整個 fail-open")
+    assert 'conn.uid("fetch"' in code
+
+
 def test_message_age_seconds_fails_open():
     class _Boom:
-        def fetch(self, uid, parts):
+        def uid(self, command, uid, parts):
             raise RuntimeError("network")
 
     class _BadResp:
-        def fetch(self, uid, parts):
+        def uid(self, command, uid, parts):
             return ("OK", [b"1 (FLAGS ())"])  # 無 INTERNALDATE
 
     assert imap_reader._message_age_seconds(_Boom(), b"1") is None
@@ -368,3 +389,41 @@ def test_uses_uid_api_not_sequence_numbers():
     for cmd in ("search", "fetch", "store"):
         assert re.search(r'conn\.uid\(\s*"' + cmd + '"', src), \
             f'缺少 conn.uid("{cmd}", ...)'
+
+
+# ── [2026-08-06 外審] 網域對齊必須是精確比對，不可 substring ──────────────────
+def test_lookalike_domain_is_rejected():
+    """★核心★ `"gmail.com" in "attacker-gmail.com"` 是 True —— 舊版的 substring
+    比對讓攻擊者只要用自己能通過 DKIM 的 attacker-gmail.com，再把 From 偽造成
+    doctor@gmail.com 就會被判定「已對齊」。"""
+    ar = "mx.google.com; dkim=pass header.d=attacker-gmail.com; dmarc=fail"
+    assert imap_reader._from_is_authenticated(ar, "doctor@gmail.com") is False
+
+
+def test_suffix_confusion_is_rejected():
+    ar = "mx.google.com; spf=pass smtp.mailfrom=evilexample.com; dmarc=fail"
+    assert imap_reader._from_is_authenticated(ar, "dr@example.com") is False
+
+
+def test_exact_domain_is_accepted():
+    ar = "mx.google.com; dkim=pass header.d=example.com; dmarc=fail"
+    assert imap_reader._from_is_authenticated(ar, "dr@example.com") is True
+
+
+def test_legit_subdomain_is_accepted():
+    """mail.example.com 是 example.com 的子網域 → 視為對齊。"""
+    ar = "mx.google.com; dkim=pass header.d=mail.example.com; dmarc=fail"
+    assert imap_reader._from_is_authenticated(ar, "dr@example.com") is True
+
+
+def test_parent_domain_does_not_authenticate_a_subdomain_from():
+    """反方向：header.d=example.com 不足以證明 From 是 sub.example.com。"""
+    ar = "mx.google.com; dkim=pass header.d=example.com; dmarc=fail"
+    assert imap_reader._from_is_authenticated(ar, "dr@sub.example.com") is False
+
+
+def test_domain_of_a_different_mechanism_does_not_count():
+    """dkim=fail 但 spf=pass 且網域不符 → 不算通過。"""
+    ar = ("mx.google.com; dkim=fail header.d=example.com; "
+          "spf=pass smtp.mailfrom=bounce.attacker.tw; dmarc=fail")
+    assert imap_reader._from_is_authenticated(ar, "dr@example.com") is False

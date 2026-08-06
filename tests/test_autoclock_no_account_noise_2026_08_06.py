@@ -29,33 +29,33 @@ import autoclock as ac  # noqa: E402
 
 # ── 判準本身 ────────────────────────────────────────────────────────────────
 def test_empty_config_means_no_accounts(monkeypatch):
-    monkeypatch.setattr(ac, "safe_load_json", lambda *a, **k: [])
+    monkeypatch.setattr(ac, "safe_load_json_ex", lambda *a, **k: ([], "ok"))
     assert ac._machine_has_clock_accounts() is False
 
 
 @pytest.mark.parametrize("bad", [None, "not-a-list", 42])
 def test_malformed_config_is_conservative(monkeypatch, bad):
     """壞檔/型別不對 → 保守當成「有設定」，才不會吞掉真正的重啟失敗告警。"""
-    monkeypatch.setattr(ac, "safe_load_json", lambda *a, _b=bad, **k: _b)
+    monkeypatch.setattr(ac, "safe_load_json_ex", lambda *a, _b=bad, **k: (_b, "ok"))
     assert ac._machine_has_clock_accounts() is True
 
 
 def test_blank_username_rows_do_not_count(monkeypatch):
-    monkeypatch.setattr(ac, "safe_load_json",
-                        lambda *a, **k: [{"username": "   "}, {"password": "x"}])
+    monkeypatch.setattr(ac, "safe_load_json_ex",
+                        lambda *a, **k: ([{"username": "   "}, {"password": "x"}], "ok"))
     assert ac._machine_has_clock_accounts() is False
 
 
 def test_a_real_account_counts(monkeypatch):
-    monkeypatch.setattr(ac, "safe_load_json",
-                        lambda *a, **k: [{"username": "D12345", "password": "p"}])
+    monkeypatch.setattr(ac, "safe_load_json_ex",
+                        lambda *a, **k: ([{"username": "D12345", "password": "p"}], "ok"))
     assert ac._machine_has_clock_accounts() is True
 
 
 def test_load_failure_is_conservative(monkeypatch):
     def _boom(*a, **k):
         raise OSError("locked by antivirus")
-    monkeypatch.setattr(ac, "safe_load_json", _boom)
+    monkeypatch.setattr(ac, "safe_load_json_ex", _boom)
     assert ac._machine_has_clock_accounts() is True, \
         "讀不到時要保守當成有設定(否則會吞掉真正的重啟失敗告警)"
 
@@ -63,7 +63,7 @@ def test_load_failure_is_conservative(monkeypatch):
 # ── ★核心★ 沒帳號的機器不可以跳「更新後重啟失敗」 ──────────────────────────
 def test_no_notification_on_a_machine_without_clock_accounts(monkeypatch):
     shown = []
-    monkeypatch.setattr(ac, "safe_load_json", lambda *a, **k: [])
+    monkeypatch.setattr(ac, "safe_load_json_ex", lambda *a, **k: ([], "ok"))
     monkeypatch.setattr(ac, "notify_clock_failure",
                         lambda *a, **k: shown.append(a))
     monkeypatch.setattr(ac, "WINOTIFY_AVAILABLE", True)
@@ -74,8 +74,8 @@ def test_no_notification_on_a_machine_without_clock_accounts(monkeypatch):
 def test_notification_still_fires_when_accounts_exist(monkeypatch):
     """反方向：真的在打卡的機器，重啟失敗仍必須大聲告知（不可被這次修法吞掉）。"""
     shown = []
-    monkeypatch.setattr(ac, "safe_load_json",
-                        lambda *a, **k: [{"username": "D12345"}])
+    monkeypatch.setattr(ac, "safe_load_json_ex",
+                        lambda *a, **k: ([{"username": "D12345"}], "ok"))
     monkeypatch.setattr(ac, "notify_clock_failure",
                         lambda *a, **k: shown.append(a))
     monkeypatch.setattr(ac, "WINOTIFY_AVAILABLE", True)
@@ -102,3 +102,27 @@ def test_notify_helper_checks_accounts_before_anything_else():
     i_check = src.index("_machine_has_clock_accounts()")
     i_notify = src.index("notify_clock_failure(")
     assert i_check < i_notify, "要先確認本機有沒有打卡帳號，才決定要不要打擾使用者"
+
+
+@pytest.mark.parametrize("status", ["error", "corrupt"])
+def test_unreadable_or_corrupt_config_is_treated_as_having_accounts(
+        monkeypatch, status):
+    """★[2026-08-06 外審 P2-01] 這才是真正的 production 路徑★
+
+    `safe_load_json` 會把 PermissionError/OSError/壞 JSON 全部吞掉並回 default，
+    所以舊版的 `try/except → return True` 永遠走不到：防毒鎖住設定檔時它拿到 []，
+    判成「沒有帳號」→ 把一台【真的在打卡】的電腦的重啟失敗告警靜默吞掉。
+    改用 safe_load_json_ex 取 status 才分得出「沒設定」與「讀不到」。
+    """
+    monkeypatch.setattr(ac, "safe_load_json_ex",
+                        lambda *a, _s=status, **k: ([], _s))
+    assert ac._machine_has_clock_accounts() is True, \
+        f"status={status}(讀不到/損壞)必須保守視為有帳號"
+
+
+def test_helper_does_not_use_the_error_swallowing_loader():
+    """防回歸：不可以再用 safe_load_json —— 它吞掉所有錯誤、分不出讀不到與空清單。"""
+    src = inspect.getsource(ac._machine_has_clock_accounts)
+    assert "safe_load_json_ex" in src
+    assert "safe_load_json(" not in src, \
+        "★又用回會吞錯誤的 safe_load_json★ 讀不到會被誤判成『沒有帳號』"

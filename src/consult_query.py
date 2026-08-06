@@ -6505,7 +6505,17 @@ def scheduler_loop() -> None:
                             # UNSEEN 信會每輪 IMAP poll(~20s)重新命中→每 20s 重跑完整 consult
                             # flow+寄信，直到撞 SMTP rate-limit。用固定哨兵 key 套用與 allowed
                             # 路徑一致的去重，把「每 20s」壓成「最多每 dedup 窗一次」。
-                            if _trigger_is_duplicate("__no_sender__"):
+                            # ★[2026-08-06 外審] strict 模式下這條 fallback 必須關死★
+                            #   它完全繞過白名單與寄件人驗證:任何人只要寄一封主旨
+                            #   帶關鍵字、且 From 解析不出來的信,就能遠端啟動 HIS 查詢
+                            #   與 PHI 郵件。開了 require_authenticated_trigger 卻留著
+                            #   這個洞,等於沒開。
+                            if cfg.get("require_authenticated_trigger", False):
+                                logging.error(
+                                    "★收到無法解析 From 的觸發信 → 不觸發★"
+                                    "(require_authenticated_trigger=True;"
+                                    "此路徑無從驗證寄件人身分)")
+                            elif _trigger_is_duplicate("__no_sender__"):
                                 logging.warning(
                                     "[dedup] 無法解析 From 的觸發信在 %ds 內已處理過 → "
                                     "略過避免重複寄信", _TRIGGER_DEDUP_WINDOW_SEC)

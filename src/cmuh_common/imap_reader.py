@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import imaplib
 import logging
+import re
 import socket
 import ssl
 import threading
@@ -149,7 +150,13 @@ def _message_age_seconds(conn, uid) -> Optional[float]:
     任何失敗(fetch 失敗/格式解析不出)一律回 None → 呼叫端 fail-open 視為新信照常觸發
     (寧可多觸發、不可漏掉會診請求)。Internaldate2tuple 回本地時間 struct，配 mktime。"""
     try:
-        typ, fetch = conn.fetch(uid, "(INTERNALDATE)")
+        # ★[2026-08-06 外審] 必須用 UID FETCH★
+        #   check_trigger 已改用 `conn.uid("search", ...)`,傳進來的是【UID】;
+        #   但這裡先前仍用 `conn.fetch()` —— 那是【序號】API。Gmail 的 UID 通常
+        #   遠大於 mailbox 內的信件數 → 幾乎必然查無此序號 → 回 None → 呼叫端
+        #   fail-open 把每一封陳舊觸發信都當成新信。結果:程式停機數日後恢復,
+        #   幾天前的觸發信會被當成現在的請求全部重跑。(UID 遷移時漏改的一處。)
+        typ, fetch = conn.uid("fetch", uid, "(INTERNALDATE)")
         if typ != "OK" or not fetch:
             return None
         raw = b""
@@ -228,26 +235,47 @@ def _from_is_authenticated(auth_results: str, from_addr: str) -> bool:
     等於沒有授權驗證。Gmail 收信時會把 SPF/DKIM/DMARC 判定寫進這個 header。
 
     判準(保守):dmarc=pass 就算通過(DMARC 本身即要求 SPF 或 DKIM 通過【且與 From
-    對齊】);沒有 dmarc 時,要 dkim=pass 或 spf=pass 且該項的網域與 From 的網域一致
-    —— 只有 spf=pass 而網域不符不算(那只證明信封寄件者,不是 From)。
+    對齊】);沒有 dmarc 時,要 dkim=pass 或 spf=pass 且該項的網域與 From 的網域
+    【完整相等或為其子網域】。只有 spf=pass 而網域不符不算(那只證明信封寄件者)。
     沒有這個 header(例如自己寄給自己、或郵件服務不加)→ False(無證據 ≠ 通過)。
+
+    ★[2026-08-06 外審] 網域比對不可以用 substring★
+    上一版寫 `if domain in seg` —— `"gmail.com" in "attacker-gmail.com"` 是 True,
+    於是攻擊者只要用自己完全控制、能通過 DKIM 的 `attacker-gmail.com`,再把 From
+    偽造成 `doctor@gmail.com` 就會被判定為「已對齊」。改成解析出實際網域再比對。
     """
     text = (auth_results or "").lower()
     if not text:
         return False
+    domain = (from_addr or "").rsplit("@", 1)[-1].strip().lower().rstrip(".")
     if "dmarc=pass" in text:
         return True
-    domain = (from_addr or "").rsplit("@", 1)[-1].strip().lower()
     if not domain:
         return False
-    for mech in ("dkim", "spf"):
+
+    def _aligned(value: str) -> bool:
+        """value 是 header.d= / smtp.mailfrom= 取出的網域(可能帶 email)。"""
+        v = value.strip().strip('"<>').rstrip(".").lower()
+        if "@" in v:
+            v = v.rsplit("@", 1)[-1]
+        # 完全相等,或 value 是 from 網域的子網域(mail.example.com vs example.com)
+        return bool(v) and (v == domain or v.endswith("." + domain))
+
+    for mech, keys in (("dkim", ("header.d=", "header.i=")),
+                       ("spf", ("smtp.mailfrom=", "envelope-from="))):
         idx = text.find(f"{mech}=pass")
         if idx < 0:
             continue
-        # 取該機制後面那一小段找 header.d= / header.from= / smtp.mailfrom=
-        seg = text[idx:idx + 200]
-        if domain in seg:
-            return True
+        seg = text[idx:idx + 300]
+        for key in keys:
+            k = seg.find(key)
+            if k < 0:
+                continue
+            # 取該 key 之後、到下一個分隔字元為止的值
+            raw = seg[k + len(key):]
+            value = re.split(r"[;\s,()]", raw, maxsplit=1)[0]
+            if _aligned(value):
+                return True
     return False
 
 

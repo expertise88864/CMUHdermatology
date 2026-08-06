@@ -410,6 +410,16 @@ def send_mail(recipients: list, subject: str, body: str,
                 _rollback_rate_limit_slot(reservation)
                 raise RuntimeError(
                     f"SMTP 永久性錯誤(5xx),不重試：{type(e).__name__}: {e}") from e
+            # ★[2026-08-06 外審] 逾時要在【重試判斷之前】就分流★
+            #   上一版把 DeliveryOutcomeUnknown 放在「用完重試次數」之後,於是
+            #   max_retries=2 時是:逾時→重送→逾時→重送→逾時→才說結果不明。
+            #   若逾時發生在伺服器已收下 DATA 之後,那就是【送出三封】才承認不明。
+            #   會診端有傳 max_retries=0 所以沒事,但止掛提醒走預設值 2 —— 正是
+            #   會重複寄的那條路。逾時＝結果不明,第一次發生就不可以再送。
+            if isinstance(e, socket.timeout):
+                raise DeliveryOutcomeUnknown(
+                    f"SMTP 連線/送信逾時 ({int(timeout)}s) —— 結果不明,伺服器"
+                    f"可能已收下;不重試以免重複寄出(配額不退回)：{e}") from e
             if attempt < max_retries:
                 backoff = min(10, 2 * (2 ** attempt))  # 2s, 4s, 8s, 10s (capped)
                 logging.warning(
@@ -417,18 +427,8 @@ def send_mail(recipients: list, subject: str, body: str,
                     attempt + 1, type(e).__name__, e, backoff)
                 _time.sleep(backoff)
                 continue
-            # 用完重試次數
-            # ★[2026-08-05 外審第 6 輪 P2-03] 逾時不退配額★
-            #   timeout 可能發生在伺服器【已經收下 DATA】之後 —— 信可能已送達。
-            #   退回配額會低估實際寄件量;結果不明時保留 reservation 是安全方向
-            #   (最壞是少寄一封的額度,不會超發)。
-            if isinstance(e, socket.timeout):
-                # ★[2026-08-06 外審 P1-03] 結果不明 ≠ 失敗★
-                #   逾時可能發生在伺服器【已收下 DATA】之後 —— 重試就是寄第二封。
-                #   用專屬例外讓呼叫端(_do_full_job)能與「確定失敗」分流處理。
-                raise DeliveryOutcomeUnknown(
-                    f"SMTP 連線/送信逾時 ({int(timeout)}s)，已重試 {max_retries} 次"
-                    f"(結果不明,信可能已送達 → 不自動重試,配額不退回)：{e}") from e
+            # 用完重試次數（逾時已在上面提前分流，不會走到這裡）
+            # ★[2026-08-05 外審第 6 輪 P2-03] 逾時不退配額★ —— 見上方分流處。
             _rollback_rate_limit_slot(reservation)
             if isinstance(e, OSError):
                 raise RuntimeError(

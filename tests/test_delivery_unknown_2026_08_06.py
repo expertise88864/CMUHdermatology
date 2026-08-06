@@ -200,3 +200,88 @@ def test_good_capture_still_updates_the_baseline():
         sleep=lambda *_a: None)
     assert cq._may_update_baseline(snap.texts) is True, (
         "正常截圖不該被降級(否則永遠不更新基準 → 每輪重複寄同一批病人)")
+
+
+# ── [2026-08-06 外審] 逾時不可以先重試才說「結果不明」──────────────────────
+def test_timeout_does_not_resend_before_declaring_unknown(monkeypatch):
+    """★核心★ 預設 max_retries=2 時，第一次 timeout 就要停手。
+
+    舊版把 DeliveryOutcomeUnknown 放在「用完重試次數」之後 → 逾時→重送→逾時→
+    重送→逾時→才說不明。若逾時發生在伺服器已收下 DATA 之後，那是【送出三封】
+    才承認不明。會診端有傳 max_retries=0 所以沒事，但 main.py 的止掛提醒走的
+    就是預設值 2 —— 正是會重複寄的那條路。
+    """
+    attempts = []
+    monkeypatch.setattr(sm, "_reserve_rate_limit_slot", lambda *a, **k: object())
+    monkeypatch.setattr(sm, "_rollback_rate_limit_slot", lambda *a, **k: None)
+
+    def _boom(cred, msg, timeout):
+        attempts.append(1)
+        raise socket.timeout("timed out waiting for 250")
+
+    monkeypatch.setattr(sm, "_send_once", _boom)
+
+    with pytest.raises(sm.DeliveryOutcomeUnknown):
+        sm.send_mail(recipients=["a@b.c"], subject="s", body="b",
+                     attachment_path=None,           # max_retries 用預設值
+                     override_credentials={
+                         "host": "smtp.example.com", "port": 465,
+                         "use_ssl": True, "username": "u", "password": "p",
+                         "from_address": "u@example.com", "from_name": "T"})
+    assert len(attempts) == 1, (
+        f"★逾時後又送了 {len(attempts) - 1} 次★ 伺服器可能每次都收下 = 重複寄出")
+
+
+def test_non_timeout_transient_errors_still_retry(monkeypatch):
+    """反方向：非逾時的暫時性錯誤(連線被拒等)仍要照舊重試，不可被這次修法擋掉。"""
+    attempts = []
+    monkeypatch.setattr(sm, "_reserve_rate_limit_slot", lambda *a, **k: object())
+    monkeypatch.setattr(sm, "_rollback_rate_limit_slot", lambda *a, **k: None)
+    # send_mail 內部是 `import time as _time`，故直接 patch time 模組本身
+    import time as _t
+    monkeypatch.setattr(_t, "sleep", lambda *_a: None)
+
+    def _boom(cred, msg, timeout):
+        attempts.append(1)
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(sm, "_send_once", _boom)
+
+    with pytest.raises(RuntimeError):
+        sm.send_mail(recipients=["a@b.c"], subject="s", body="b",
+                     attachment_path=None, max_retries=2,
+                     override_credentials={
+                         "host": "smtp.example.com", "port": 465,
+                         "use_ssl": True, "username": "u", "password": "p",
+                         "from_address": "u@example.com", "from_name": "T"})
+    assert len(attempts) == 3, f"暫時性錯誤應重試到 3 次，實際 {len(attempts)}"
+
+
+# ── [2026-08-06 外審] strict 模式不可被「無法解析 From」的 fallback 繞過 ────────
+def test_strict_mode_closes_the_no_sender_fallback():
+    """★安全核心★ 主旨命中但 From 解析不出來時，有一條 fallback 會直接觸發並改寄
+    給設定的 recipients。它完全繞過白名單與寄件人驗證：任何人寄一封主旨帶關鍵字、
+    From 畸形的信，就能遠端啟動 HIS 查詢與 PHI 郵件。
+    開了 require_authenticated_trigger 卻留著這個洞，等於沒開。
+    """
+    import inspect
+    src = inspect.getsource(cq.run_email_trigger_loop) \
+        if hasattr(cq, "run_email_trigger_loop") else _imap_loop_src()
+    i = src.index("__no_sender__")
+    head = src[max(0, i - 900):i]
+    assert "require_authenticated_trigger" in head, (
+        "★strict 模式下仍會走無 From 的 fallback★ 白名單與驗證被整條繞過")
+
+
+def _imap_loop_src() -> str:
+    """觸發迴圈不是獨立函式時，退而取整份模組原始碼。"""
+    import inspect
+    return inspect.getsource(cq)
+
+
+def test_strict_mode_check_comes_before_triggering():
+    """strict 檢查必須排在 trigger_job_async 之前（不可先跑再說）。"""
+    src = _imap_loop_src()
+    i_guard = src.index('require_authenticated_trigger", False):\n                                logging.error(\n                                    "★收到無法解析 From')
+    i_trigger = src.index('trigger_job_async("email")', i_guard)
+    assert i_guard < i_trigger, "strict 檢查要排在觸發之前"
