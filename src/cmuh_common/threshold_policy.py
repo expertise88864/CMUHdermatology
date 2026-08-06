@@ -17,6 +17,12 @@ DEFAULT_THRESHOLDS = {
     "chen_thu_morning": 54,
     "chen_thu_afternoon": 69,
     "shen_wed_night": 100,
+    # [2026-08-06 使用者] 黃建仁:週三早 60;謝佳陵:週四早/週四晚/週五午都 75。
+    # 兩位的提醒開關預設皆關(alert_huang/hsieh_enabled,見 settings_defaults)。
+    "huang_wed_morning": 60,
+    "hsieh_thu_morning": 75,
+    "hsieh_thu_night": 75,
+    "hsieh_fri_afternoon": 75,
 }
 
 _DOCTOR_THRESHOLD_KEYS = {
@@ -31,6 +37,14 @@ _DOCTOR_THRESHOLD_KEYS = {
         ((0, "下午"), "shen_mon_afternoon"),    # 一午：無預設
         ((2, "下午"), "shen_wed_afternoon"),    # 三午：無預設
         ((2, "晚上"), "shen_wed_night"),        # 三晚：預設 100
+    ),
+    "黃建仁": (
+        ((2, "上午"), "huang_wed_morning"),     # 三早：預設 60
+    ),
+    "謝佳陵": (
+        ((3, "上午"), "hsieh_thu_morning"),     # 四早：預設 75
+        ((3, "晚上"), "hsieh_thu_night"),       # 四晚：預設 75
+        ((4, "下午"), "hsieh_fri_afternoon"),   # 五午：預設 75
     ),
 }
 

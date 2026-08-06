@@ -3533,6 +3533,15 @@ _CONTENT_CLASSES = frozenset({MAIN_CLASS, LOGIN_CLASS, CONSULT_CLASS,
 _reported_unknown_dialogs: set = set()
 # 只按這些字樣的按鈕。★絕不盲按★:不認得的對話框只記下它有哪些按鈕,不出手。
 _AFFIRMATIVE_CAPTIONS = ("確認", "確定", "OK", "Ok", "是", "繼續")
+# ★class 專屬按鈕★(2026-08-06 實機回報,正是「請回報這一行」等的那筆):
+#   TFMTimeOut_1 = 院方【閒置逾時】對話框,按鈕=繼續使用/離開系統/重新簽入。
+#   「繼續使用」不在泛用肯定字樣裡(精確比對,"繼續"≠"繼續使用") → 整個上午
+#   每輪收尾都被它擋住:modal 擋住的主畫面是 disabled,不吃 WM_CLOSE,
+#   於是 session 關不掉、掛帳累積、每輪告警。
+#   一律按「繼續使用」:只把 modal 收掉、讓主畫面恢復 enabled——常駐要續命
+#   靠它,收尾也要主畫面先恢復 enabled 才關得掉。★絕不按「離開系統/重新簽入」★
+#   (會改變 session 狀態;收尾該怎麼關由 teardown 自己的流程決定)。
+_CLASS_SPECIFIC_CAPTIONS = {"TFMTimeOut_1": ("繼續使用",)}
 
 
 def _blocking_dialogs(pids: set) -> list:
@@ -3600,7 +3609,8 @@ def _dismiss_blocking_modals(sess=None, *, pids=None) -> int:
             logging.debug("[session] 列舉對話框按鈕失敗 hwnd=%s", hwnd,
                           exc_info=True)
             continue
-        target = next((h for h, t in buttons if t in _AFFIRMATIVE_CAPTIONS), None)
+        wanted = _CLASS_SPECIFIC_CAPTIONS.get(cls, _AFFIRMATIVE_CAPTIONS)
+        target = next((h for h, t in buttons if t in wanted), None)
         if target is None:
             # 同一個 class 只講一次:這個迴圈每 0.4 秒跑一次,不節流會把 log 洗掉
             # (2026-07-29 就發生過 1,568 行幾乎全是同一句的實機 log)。

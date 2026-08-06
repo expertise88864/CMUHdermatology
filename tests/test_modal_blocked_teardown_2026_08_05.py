@@ -229,6 +229,10 @@ class TestTheBlockerIsFoundByEnabledStateNotByClassName:
 
     def test_it_clicks_an_affirmative_button(self, monkeypatch):
         self._machine(monkeypatch, self._REAL)
+        # [2026-08-06] TFMTimeOut_1 已升格為「已知 class」有專屬按鈕(繼續使用),
+        # 本測試守的是【泛用肯定字樣】路徑 → 改用中性的未知 class 來驗。
+        monkeypatch.setattr(cq, "_blocking_dialogs",
+                            lambda pids: [(2, "TFMConnLost")])
         monkeypatch.setattr(cq, "enum_children",
                             lambda _h: [(90, "TLabel", "連線逾時", (0,) * 4),
                                         (91, "TButton", "確認", (0,) * 4)])
@@ -246,6 +250,10 @@ class TestTheBlockerIsFoundByEnabledStateNotByClassName:
         """
         import logging as _lg
         self._machine(monkeypatch, self._REAL)
+        # [2026-08-06] 同上:TFMTimeOut_1 已是已知 class → 未知路徑改用中性 class。
+        monkeypatch.setattr(cq, "_blocking_dialogs",
+                            lambda pids: [(2, "TFMConnLost")])
+        cq._reported_unknown_dialogs.discard("TFMConnLost")
         monkeypatch.setattr(cq, "enum_children",
                             lambda _h: [(92, "TButton", "刪除病歷", (0,) * 4)])
         clicked = []
@@ -255,7 +263,7 @@ class TestTheBlockerIsFoundByEnabledStateNotByClassName:
             assert cq._dismiss_blocking_modals(pids={18072}) == 0
         assert clicked == [], "★盲按了不認得的按鈕★"
         msgs = " ".join(r.getMessage() for r in caplog.records)
-        assert "TFMTimeOut_1" in msgs and "刪除病歷" in msgs, (
+        assert "TFMConnLost" in msgs and "刪除病歷" in msgs, (
             "沒有把不認得的對話框記下來 → 下一次還是不知道它長什麼樣")
 
     def test_no_pids_means_no_action(self):
@@ -339,3 +347,60 @@ class TestDelphiInfrastructureWindowsAreNotDialogs:
         hits = [r for r in caplog.records if "沒有可按的按鈕" in r.getMessage()]
         assert len(hits) == 1, f"同一個 class 講了 {len(hits)} 次 → log 會被洗掉"
         assert "TSomethingNew" in hits[0].getMessage()
+
+
+# ─── ★[2026-08-06 實機回報] TFMTimeOut_1 閒置逾時框★ ────────────────────────
+#   「請回報這一行」等到的第一筆:class=TFMTimeOut_1
+#   按鈕=['繼續使用', '離開系統', '重新簽入', '繼續使用']。
+#   「繼續使用」不在泛用肯定字樣(精確比對,"繼續"≠"繼續使用") → 整個上午每輪
+#   收尾都被它擋住,session 關不掉、掛帳累積到 4、每 3 分鐘告警一次。
+def test_timeout_dialog_presses_keep_using(monkeypatch):
+    """TFMTimeOut_1 → 按「繼續使用」(把 modal 收掉,主畫面恢復 enabled)。"""
+    clicked = []
+    monkeypatch.setattr(cq, "_blocking_dialogs",
+                        lambda pids: [(111, "TFMTimeOut_1")])
+    monkeypatch.setattr(cq, "enum_children", lambda hwnd: [
+        (1, "TButton", "繼續使用", (0, 0, 0, 0)),
+        (2, "TButton", "離開系統", (0, 0, 0, 0)),
+        (3, "TButton", "重新簽入", (0, 0, 0, 0)),
+        (4, "TButton", "繼續使用", (0, 0, 0, 0)),
+    ])
+    monkeypatch.setattr(cq, "click_button", lambda h: clicked.append(h))
+    assert cq._dismiss_blocking_modals(pids={999}) == 1
+    assert clicked == [1], "只按第一顆「繼續使用」"
+
+
+def test_timeout_dialog_never_presses_leave_or_resignin(monkeypatch):
+    """★絕不按「離開系統/重新簽入」★——那兩顆會改變 session 狀態。
+    對話框上就算只剩那兩顆(繼續使用不見了=改版),也要回到不盲按。"""
+    clicked = []
+    monkeypatch.setattr(cq, "_blocking_dialogs",
+                        lambda pids: [(111, "TFMTimeOut_1")])
+    monkeypatch.setattr(cq, "enum_children", lambda hwnd: [
+        (2, "TButton", "離開系統", (0, 0, 0, 0)),
+        (3, "TButton", "重新簽入", (0, 0, 0, 0)),
+    ])
+    monkeypatch.setattr(cq, "click_button", lambda h: clicked.append(h))
+    cq._reported_unknown_dialogs.discard("TFMTimeOut_1")
+    assert cq._dismiss_blocking_modals(pids={999}) == 0
+    assert clicked == [], "泛用肯定字樣也不含這兩顆 → 必須不出手"
+
+
+def test_class_specific_map_does_not_weaken_generic_dialogs(monkeypatch):
+    """泛用對話框(如 TFMShowMessage 的「確認」)行為不變。"""
+    clicked = []
+    monkeypatch.setattr(cq, "_blocking_dialogs",
+                        lambda pids: [(222, "TFMShowMessage")])
+    monkeypatch.setattr(cq, "enum_children", lambda hwnd: [
+        (7, "TButton", "確認", (0, 0, 0, 0)),
+    ])
+    monkeypatch.setattr(cq, "click_button", lambda h: clicked.append(h))
+    assert cq._dismiss_blocking_modals(pids={999}) == 1
+    assert clicked == [7]
+
+
+def test_keep_using_is_class_scoped_not_global():
+    """「繼續使用」只綁在 TFMTimeOut_1,不進泛用清單——別的對話框上這四個字
+    可能是完全不同的語意,不可全域放行。"""
+    assert "繼續使用" not in cq._AFFIRMATIVE_CAPTIONS
+    assert cq._CLASS_SPECIFIC_CAPTIONS == {"TFMTimeOut_1": ("繼續使用",)}

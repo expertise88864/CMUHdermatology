@@ -8620,6 +8620,9 @@ class AutomationApp:
         # 想開啟止掛提醒/寄信的電腦，到設定頁勾選對應醫師即可。
         self.alert_shen_enabled = tk.BooleanVar(value=self.threshold_settings.get("alert_shen_enabled", False))
         self.alert_chen_enabled = tk.BooleanVar(value=self.threshold_settings.get("alert_chen_enabled", False))
+        # [2026-08-06 使用者] 黃建仁/謝佳陵止掛提醒(同規則:預設關,自己那台手動勾開)
+        self.alert_huang_enabled = tk.BooleanVar(value=self.threshold_settings.get("alert_huang_enabled", False))
+        self.alert_hsieh_enabled = tk.BooleanVar(value=self.threshold_settings.get("alert_hsieh_enabled", False))
         # 止掛達門檻時要寄信通知的收件人（可多人）
         self.alert_email_recipients = list(self.threshold_settings.get(
             "alert_email_recipients",
@@ -8635,6 +8638,8 @@ class AutomationApp:
 
         self.val_alert_shen = self.alert_shen_enabled.get()
         self.val_alert_chen = self.alert_chen_enabled.get()
+        self.val_alert_huang = self.alert_huang_enabled.get()
+        self.val_alert_hsieh = self.alert_hsieh_enabled.get()
         self.val_out_of_hospital = self.out_of_hospital_var.get()
 
         self.r_doctor_map = self.load_r_doctor_settings()
@@ -9741,6 +9746,8 @@ class AutomationApp:
         
         self.threshold_settings['alert_shen_enabled'] = self.alert_shen_enabled.get()
         self.threshold_settings['alert_chen_enabled'] = self.alert_chen_enabled.get()
+        self.threshold_settings['alert_huang_enabled'] = self.alert_huang_enabled.get()
+        self.threshold_settings['alert_hsieh_enabled'] = self.alert_hsieh_enabled.get()
         self.threshold_settings['out_of_hospital_mode'] = self.out_of_hospital_var.get()
         # [2026-07-13 使用者] show_external_clinics / notify_dnd / clinic_night_monitor 設定已移除；
         # 行為固定（外院分院固定顯示、勿擾窗固定 00–08 只不跳彈窗、reg64 固定 00–07 暫停），不再存這幾個鍵。
@@ -13357,6 +13364,8 @@ class AutomationApp:
             # [修正] 當 UI 變更時，同步更新影子變數
             self.val_alert_shen = self.alert_shen_enabled.get()
             self.val_alert_chen = self.alert_chen_enabled.get()
+            self.val_alert_huang = self.alert_huang_enabled.get()
+            self.val_alert_hsieh = self.alert_hsieh_enabled.get()
             
             self.status_text.set("狀態: 設定變更，正在重新整理...")
             self._trigger_refresh(True)
@@ -13385,6 +13394,30 @@ class AutomationApp:
             ttk.Entry(chen_frame, textvariable=var, width=4).pack(side=tk.LEFT, padx=0)
             self.threshold_entries[key] = var
             self.threshold_labels[key] = f"[陳駿升] {label.rstrip(':')}"
+
+        # [2026-08-06 使用者] 黃建仁:三早預設 60;謝佳陵:四早/四晚/五午預設 75。
+        # 開關預設關(多台同跑會重複寄信),要提醒的那台自己勾開。
+        ttk.Separator(threshold_main_frame, orient='horizontal').pack(fill='x', pady=8)
+        huang_frame = ttk.Frame(threshold_main_frame); huang_frame.pack(fill=tk.X, pady=5)
+        ttk.Checkbutton(huang_frame, text="啟用 [黃建仁]    ", variable=self.alert_huang_enabled, command=on_doctor_alert_change).pack(side=tk.LEFT, padx=(0, 10))
+        huang_labels = {'huang_wed_morning': '三早:'}
+        for key, label in huang_labels.items():
+            ttk.Label(huang_frame, text=label).pack(side=tk.LEFT, padx=(5, 2))
+            var = tk.StringVar(value=self.threshold_settings.get(key, DEFAULT_THRESHOLDS.get(key, '')))
+            ttk.Entry(huang_frame, textvariable=var, width=4).pack(side=tk.LEFT, padx=0)
+            self.threshold_entries[key] = var
+            self.threshold_labels[key] = f"[黃建仁] {label.rstrip(':')}"
+
+        ttk.Separator(threshold_main_frame, orient='horizontal').pack(fill='x', pady=8)
+        hsieh_frame = ttk.Frame(threshold_main_frame); hsieh_frame.pack(fill=tk.X, pady=5)
+        ttk.Checkbutton(hsieh_frame, text="啟用 [謝佳陵]    ", variable=self.alert_hsieh_enabled, command=on_doctor_alert_change).pack(side=tk.LEFT, padx=(0, 10))
+        hsieh_labels = {'hsieh_thu_morning': '四早:', 'hsieh_thu_night': '四晚:', 'hsieh_fri_afternoon': '五午:'}
+        for key, label in hsieh_labels.items():
+            ttk.Label(hsieh_frame, text=label).pack(side=tk.LEFT, padx=(5, 2))
+            var = tk.StringVar(value=self.threshold_settings.get(key, DEFAULT_THRESHOLDS.get(key, '')))
+            ttk.Entry(hsieh_frame, textvariable=var, width=4).pack(side=tk.LEFT, padx=0)
+            self.threshold_entries[key] = var
+            self.threshold_labels[key] = f"[謝佳陵] {label.rstrip(':')}"
 
         # 止掛達門檻時 → 用 Outlook 寄信通知（可多位收件人，留空=不寄）
         ttk.Separator(threshold_main_frame, orient='horizontal').pack(fill='x', pady=8)
@@ -13631,6 +13664,8 @@ class AutomationApp:
         for attr, key, fallback in (
                 ('alert_shen_enabled', 'alert_shen_enabled', False),
                 ('alert_chen_enabled', 'alert_chen_enabled', False),
+                ('alert_huang_enabled', 'alert_huang_enabled', False),
+                ('alert_hsieh_enabled', 'alert_hsieh_enabled', False),
                 ('out_of_hospital_var', 'out_of_hospital_mode', False),
                 ('quick_text_f8_var', 'quick_text_f8', F8_QUICK_TEXT_DEFAULT),
                 ('ui_font_scale_var', 'ui_font_scale', 1.0)):
@@ -13640,6 +13675,8 @@ class AutomationApp:
         # 影子變數要跟著走,否則止掛提醒仍沿用還原前的開關
         self.val_alert_shen = self.alert_shen_enabled.get()
         self.val_alert_chen = self.alert_chen_enabled.get()
+        self.val_alert_huang = self.alert_huang_enabled.get()
+        self.val_alert_hsieh = self.alert_hsieh_enabled.get()
 
         if getattr(self, 'alert_mail_listbox', None) is not None:
             self.alert_mail_listbox.delete(0, tk.END)
@@ -13882,6 +13919,8 @@ class AutomationApp:
         doctor_threshold_maps = {
             "沈冠宇": self._get_doctor_threshold_map("沈冠宇"),
             "陳駿升": self._get_doctor_threshold_map("陳駿升"),
+            "黃建仁": self._get_doctor_threshold_map("黃建仁"),
+            "謝佳陵": self._get_doctor_threshold_map("謝佳陵"),
         }
 
         time_morning_end = dt_time(12, 0)
@@ -14023,6 +14062,14 @@ class AutomationApp:
                                                 elif doc_name == "陳駿升" and self.alert_chen_enabled.get():
                                                     if session_key in doctor_threshold_maps["陳駿升"]: 
                                                         full_threshold = int(doctor_threshold_maps["陳駿升"][session_key])
+                                                        alert_threshold = full_threshold - 10
+                                                elif doc_name == "黃建仁" and self.alert_huang_enabled.get():
+                                                    if session_key in doctor_threshold_maps["黃建仁"]: 
+                                                        full_threshold = int(doctor_threshold_maps["黃建仁"][session_key])
+                                                        alert_threshold = full_threshold - 10
+                                                elif doc_name == "謝佳陵" and self.alert_hsieh_enabled.get():
+                                                    if session_key in doctor_threshold_maps["謝佳陵"]: 
+                                                        full_threshold = int(doctor_threshold_maps["謝佳陵"][session_key])
                                                         alert_threshold = full_threshold - 10
                                                 
                                                 if full_threshold is not None and count >= full_threshold: 

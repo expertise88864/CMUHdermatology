@@ -84,6 +84,10 @@ def default_threshold_settings() -> dict:
         #   (原本開著張廖或陳駿升提醒的那台 = 負責寄信的那台 → 沈冠宇跟著開)。
         "alert_shen_enabled": False,
         "alert_chen_enabled": False,
+        # [2026-08-06 使用者定案] 黃建仁/謝佳陵同規則:預設關(多台同跑會重複寄信),
+        # 使用者只在自己那台手動勾開。
+        "alert_huang_enabled": False,
+        "alert_hsieh_enabled": False,
         "out_of_hospital_mode": False,
         "ui_font_scale": 1.0,
         "notify_dnd_start_hour": DEFAULT_NOTIFY_DND_START_HOUR,

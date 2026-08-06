@@ -152,7 +152,8 @@ def test_threshold_lookups_name_exactly_the_two_doctors():
                 and isinstance(n.slice, ast.Constant)
                 and isinstance(n.slice.value, str)):
             names.add(n.slice.value)
-    assert names == {"沈冠宇", "陳駿升"}, f"止掛門檻查詢用到的醫師名:{sorted(names)}"
+    # [2026-08-06 使用者] 新增黃建仁(三早60)/謝佳陵(四早/四晚/五午75) → 四位
+    assert names == {"沈冠宇", "陳駿升", "黃建仁", "謝佳陵"},         f"止掛門檻查詢用到的醫師名:{sorted(names)}"
 
     # 比門檻的分支條件裡拿來跟 doc_name 比的名字,也必須是同兩位
     compared = {c.value for n in ast.walk(_MAIN_TREE)
@@ -160,7 +161,7 @@ def test_threshold_lookups_name_exactly_the_two_doctors():
                 and isinstance(n.left, ast.Name) and n.left.id == "doc_name"
                 for c in n.comparators
                 if isinstance(c, ast.Constant) and isinstance(c.value, str)}
-    assert compared == {"沈冠宇", "陳駿升"}, f"與 doc_name 比對的名字:{sorted(compared)}"
+    assert compared == {"沈冠宇", "陳駿升", "黃建仁", "謝佳陵"},         f"與 doc_name 比對的名字:{sorted(compared)}"
 
 
 def test_settings_page_shows_shen_row_with_four_sessions():
