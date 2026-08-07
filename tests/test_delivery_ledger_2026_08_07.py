@@ -210,3 +210,46 @@ def test_prune_keeps_unresolved_forever(tmp_path):
 
     assert led.get(old_unknown), "★UNKNOWN 被剪掉了★ 之後會重寄"
     assert not led.get(old_done), "已收斂的舊紀錄應該被剪掉(避免無限膨脹)"
+
+
+# ── 接線：會診寄送路徑 ─────────────────────────────────────────────────────
+def test_consult_send_no_longer_discards_refused():
+    """★AW 核心★ send_via_smtp 不可以再丟掉 send_mail 的被拒收件人回傳值。
+
+    smtplib 只有【全部】被拒才拋例外；部分被拒是正常返回。舊版整句丟掉 →
+    四人裡有一位收不到，這一輪仍算完全成功、基準照樣更新 → 那位永遠不補寄。
+    """
+    import inspect
+    import consult_query as cq
+    src = inspect.getsource(cq.send_via_smtp)
+    assert "refused = send_mail(" in src, "★又把 send_mail 的回傳值丟掉了★"
+    assert "return refused" in src
+
+
+def test_consult_records_every_send_in_the_ledger():
+    """寄送前 begin、寄送後 settle —— 送出當下斷電也留得下待查紀錄。"""
+    import inspect
+    import consult_query as cq
+    src = inspect.getsource(cq._do_full_job)
+    i_begin = src.index("_delivery_begin(")
+    i_send = src.index("send_via_smtp(")
+    i_settle = src.index("_delivery_settle(")
+    assert i_begin < i_send < i_settle, "順序必須是 begin → 送出 → settle"
+
+
+def test_unknown_is_recorded_for_later_verification():
+    import inspect
+    import consult_query as cq
+    src = inspect.getsource(cq._do_full_job)
+    i = src.index("isinstance(last_err, DeliveryOutcomeUnknown)")
+    assert "_delivery_settle(_did, unknown=True)" in src[i:i + 600], \
+        "★結果不明沒進帳本★ 重啟後就再也不知道有一筆待查"
+
+
+def test_ledger_failures_never_block_sending():
+    """★fail-open★ 帳本是觀測用的，壞掉不可以害信寄不出去。"""
+    import inspect
+    import consult_query as cq
+    for fn in (cq._get_ledger, cq._delivery_begin, cq._delivery_settle):
+        assert "except Exception" in inspect.getsource(fn), \
+            f"{fn.__name__} 必須吞掉自己的錯誤（帳本不可阻擋寄信）"

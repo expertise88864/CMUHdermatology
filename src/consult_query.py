@@ -4709,9 +4709,66 @@ def send_via_outlook(image_path: Path, subject: str, body: str,
     logging.info("已透過 Outlook 寄出給：%s%s", ", ".join(recipients), sender_note)
 
 
+# ── 寄送帳本接線（2026-08-07 外審 AT/AW）────────────────────────────────────
+# 帳本是【觀測】用的,不可以因為它壞掉就寄不出信 —— 所有接點都 fail-open。
+_ledger_lock = threading.Lock()
+_ledger_obj = None
+
+
+def _get_ledger():
+    """取共用帳本（第一次使用才建；失敗回 None，呼叫端自然略過）。"""
+    global _ledger_obj
+    with _ledger_lock:
+        if _ledger_obj is None:
+            try:
+                from cmuh_common.delivery_ledger import DeliveryLedger
+                _ledger_obj = DeliveryLedger()
+            except Exception:
+                logging.warning("[delivery] 帳本初始化失敗(寄信不受影響)",
+                                exc_info=True)
+                return None
+        return _ledger_obj
+
+
+def _delivery_begin(delivery, trigger_label: str) -> str:
+    """送出【之前】登記一筆。回 delivery_id（失敗回空字串）。"""
+    led = _get_ledger()
+    if led is None:
+        return ""
+    try:
+        did = led.begin(
+            business_key=f"consult:{delivery.subject}",
+            category="consult",
+            recipients=list(delivery.recipients),
+            subject=delivery.subject,
+            message_id=delivery.message_id or "")
+        led.mark_submitting(did)
+        return did
+    except Exception:
+        logging.debug("[delivery] 登記寄送失敗(略過)", exc_info=True)
+        return ""
+
+
+def _delivery_settle(delivery_id: str, *, refused=None,
+                     unknown: bool = False, failed: bool = False) -> None:
+    """把結果寫回帳本（含逐位收件人狀態）。"""
+    if not delivery_id:
+        return
+    led = _get_ledger()
+    if led is None:
+        return
+    try:
+        state = led.settle(delivery_id, refused=refused or {},
+                           unknown=unknown, failed=failed)
+        if state != "confirmed":
+            logging.warning("[delivery] 本次寄送狀態=%s(id=%s)", state, delivery_id)
+    except Exception:
+        logging.debug("[delivery] 寫回寄送結果失敗(略過)", exc_info=True)
+
+
 def send_via_smtp(image_path: Path, subject: str, body: str,
                   recipients: list, timeout: float = 60.0,
-                  html_body: str = "", message_id: str = "") -> None:
+                  html_body: str = "", message_id: str = "") -> dict:
     """用 SMTP 直接寄（Gmail / smtp.gmail.com）。
 
     為何不用 Outlook：admin 行程的 Outlook COM 會起一個 admin Outlook 實例，
@@ -4725,13 +4782,24 @@ def send_via_smtp(image_path: Path, subject: str, body: str,
     from cmuh_common.smtp_mail import send_mail
     # [外審第 6 輪 P2-02] 只留一層重試:外層 _do_full_job 已有 3 次 attempt,
     # 內層再各自重試會變成最多 9 次提交(重複寄出的機率跟著放大)。
-    send_mail(recipients=recipients, subject=subject, body=body,
-              attachment_path=image_path, timeout=timeout,
-              max_retries=0,
-              html_body=html_body or None,
-              # ★[2026-08-05 外審第 5 輪 P1-04]★ 重試要重送【同一封】——
-              #   換 Message-ID 會讓「已收下但回應逾時」變成收件人收到兩封。
-              message_id=message_id or None)
+    # ★[2026-08-07 外審 AW] 回傳值(被拒收件人)不可以再丟掉★
+    #   smtplib 只有【全部】收件人被拒才拋例外;部分被拒是【正常返回】並把
+    #   那些人放在回傳值裡。舊版整句丟掉 → 四個人裡有一位收不到,這一輪仍被
+    #   判為完全成功、基準照樣更新 → 那位【永遠】不會補寄,而且無跡可循。
+    #   現在把逐位結果寫進寄送帳本,由 needs_recipient_retry() 挑出該補的人。
+    refused = send_mail(recipients=recipients, subject=subject, body=body,
+                        attachment_path=image_path, timeout=timeout,
+                        max_retries=0,
+                        html_body=html_body or None,
+                        # ★[2026-08-05 外審第 5 輪 P1-04]★ 重試要重送【同一封】——
+                        #   換 Message-ID 會讓「已收下但回應逾時」變成收件人收到兩封。
+                        message_id=message_id or None) or {}
+    if refused:
+        logging.error(
+            "[consult] ★有收件人沒收到會診通知★:%s(其餘已送達)。"
+            "已記入寄送帳本,暫時性拒收會在後續補寄;永久性(位址錯誤)請修設定。",
+            ", ".join(sorted(str(r) for r in refused)))
+    return refused
 
 
 def _kill_systemftp(before_pids=None) -> None:
@@ -5010,6 +5078,9 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
             #   做完之後才失敗的(組信、附截圖、SMTP/Outlook)都與 HIS 無關 ——
             #   見下面重試分支的說明。每次 attempt 都要重設。
             his_stage_done = his_result is not None
+            # [2026-08-07 外審 AT] 本次 attempt 的寄送帳本 id（每輪重設,
+            # 免得上一輪的 id 被這一輪的失敗收尾誤用）。
+            _did = ""
             try:
                 logging.info("會診查詢任務 第 %d/%d 次嘗試（trigger=%s, 收件人組=%s, mail=%s）",
                              attempt, retry_count, trigger_label,
@@ -5155,10 +5226,16 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                         message_id=_new_message_id(),
                     )
                 if mail_method == "smtp":
-                    send_via_smtp(delivery.attachment, delivery.subject,
-                                  delivery.text_body, list(delivery.recipients),
-                                  html_body=delivery.html_body,
-                                  message_id=delivery.message_id)
+                    # ★[2026-08-07 外審 AT/AW] 每一次寄送都進帳本★
+                    #   begin 在【送出之前】——這樣即使送出當下斷電,重啟後看到的
+                    #   是一筆 SUBMITTING(待查),而不是「什麼都沒發生」。
+                    _did = _delivery_begin(delivery, trigger_label)
+                    _refused = send_via_smtp(
+                        delivery.attachment, delivery.subject,
+                        delivery.text_body, list(delivery.recipients),
+                        html_body=delivery.html_body,
+                        message_id=delivery.message_id)
+                    _delivery_settle(_did, refused=_refused)
                 else:
                     send_via_outlook(delivery.attachment, delivery.subject,
                                      delivery.text_body,
@@ -5288,9 +5365,13 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     #   —— 使用者照做 → 原信隨後送達 → 他收到【兩封】。
                     #   故另走一條:保留截圖、不釋放去重、明確請他先不要重發。
                     if isinstance(last_err, DeliveryOutcomeUnknown):
+                        # [2026-08-07 外審 AT] 記進帳本(跨重啟仍知道有一筆待查),
+                        # 之後可用 Message-ID 回查寄件備份收斂成送達/未送達。
+                        _delivery_settle(_did, unknown=True)
                         logging.error(
                             "會診查詢:寄信結果不明 → 保留截圖、不釋放觸發去重、"
-                            "不建議重試(原信可能稍後送達):%s", last_err)
+                            "不建議重試(原信可能稍後送達);已記入寄送帳本待回查:%s",
+                            last_err)
                         if trigger_label == "email" and override_recipients:
                             _send_delivery_unknown_notice_async(
                                 override_recipients, str(last_err))
