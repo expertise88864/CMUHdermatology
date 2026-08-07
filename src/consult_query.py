@@ -3853,11 +3853,15 @@ def _query_cycle(sess, cfg: dict, roster_label: str) -> tuple:
         try:
             return bool(win32gui.IsWindowVisible(h))
         except Exception:
-            return False
+            # ★[2026-08-06 外審第 7 輪 P1-05] 查不到是第三態,不是「明確隱藏」★
+            #   回 False 的話,一張【命令前就可見】的舊表單只要那一刻查詢失敗,
+            #   就會在命令後被誤判成「hidden → visible」而被採認。
+            #   這是這幾天一路在修的同一個病灶:「讀不到」被當成某個確定的答案。
+            return None                    # UNKNOWN
     before_consults = {h: _visible(h)
                        for h in find_windows(CONSULT_CLASS, pids={owner_pid},
                                              visible_only=False)}
-    if any(before_consults.values()):
+    if any(v is not False for v in before_consults.values()):
         # 上一輪沒有退回主畫面。不當成本輪結果(那是舊資料),照樣往下走 ——
         # 若命令沒有生出新視窗就會逾時,交給既有的恢復路徑。
         logging.warning("[session] 送命令前已有 %d 個會診視窗(上一輪未退回主畫面)"
@@ -3869,10 +3873,15 @@ def _query_cycle(sess, cfg: dict, roster_label: str) -> tuple:
     while time.time() < deadline:
         if not running.is_set():
             raise RuntimeError("流程已被中止")
+        # ★採認條件(外審第 7 輪 P1-05)★ 兩種都要求【現在明確可見】:
+        #   * 命令後才出現的新視窗 —— Delphi 常「先建立 → 載入資料 → 最後才
+        #     Show」,在它 Show 之前就開始擷取,會拿到一張還沒填好的表單。
+        #   * 命令前【明確隱藏】、現在轉為可見的同一個視窗(form 重用)。
+        #   命令前已可見、或可見性未知的,一律不採認。
         hits = [h for h in find_windows(CONSULT_CLASS, pids={owner_pid},
                                         visible_only=False)
-                if h not in before_consults
-                or (not before_consults[h] and _visible(h))]
+                if _visible(h) is True
+                and (h not in before_consults or before_consults[h] is False)]
         if hits:
             consult = hits[0]
             break

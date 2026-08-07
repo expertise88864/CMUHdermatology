@@ -109,11 +109,20 @@ class TestTheMenuCommandGoesToOurOwnWindow:
 
 class TestTheConsultWindowIsBoundToThisCommand:
 
-    def _run(self, monkeypatch, consult_windows_over_time):
-        """consult_windows_over_time：每次 find_windows(CONSULT_CLASS) 回什麼。"""
+    def _run(self, monkeypatch, consult_windows_over_time, visible=None):
+        """consult_windows_over_time：每次 find_windows(CONSULT_CLASS) 回什麼。
+
+        ★[2026-08-06 外審第 7 輪 P1-05] 可見性要用生產的形狀模擬★
+        採認條件現在要求「現在明確可見」；不模擬 `IsWindowVisible` 的話，
+        真實 API 對假 hwnd 會拋例外 → 可見性 UNKNOWN → 一律不採認。
+        `visible`：{hwnd: 是否可見}，未列出者預設可見。
+        """
         _healthy(monkeypatch)
         seq = list(consult_windows_over_time)
         seen = {"n": 0}
+        vis = dict(visible or {})
+        monkeypatch.setattr(cq.win32gui, "IsWindowVisible",
+                            lambda h: vis.get(h, True))
 
         def _find(cls=None, pids=None, **k):
             if cls == cq.MAIN_CLASS:
@@ -150,7 +159,9 @@ class TestTheConsultWindowIsBoundToThisCommand:
         """
         stale, ours = 7001, 7002
         globals()["_OWNERS"] = {stale: OUR_PID, ours: OUR_PID}
-        picked = self._run(monkeypatch, [[stale], [stale], [stale, ours]])
+        # stale 命令前就【可見】（醫師自己開著的那張）→ 不可被採認
+        picked = self._run(monkeypatch, [[stale], [stale], [stale, ours]],
+                           visible={stale: True, ours: True})
         assert picked == ours, (
             f"★撿到命令送出前就存在的那張會診單★(hwnd={picked})")
 
@@ -158,7 +169,8 @@ class TestTheConsultWindowIsBoundToThisCommand:
         """屬於別的行程（醫師那個 HIS）的會診視窗不可以被採用。"""
         doc_consult, ours = 7101, 7102
         globals()["_OWNERS"] = {doc_consult: DOC_PID, ours: OUR_PID}
-        picked = self._run(monkeypatch, [[], [doc_consult], [doc_consult, ours]])
+        picked = self._run(monkeypatch, [[], [doc_consult], [doc_consult, ours]],
+                           visible={doc_consult: True, ours: True})
         assert picked == ours, f"採用了別的行程的會診視窗(hwnd={picked})"
 
 
