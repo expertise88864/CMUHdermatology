@@ -63,7 +63,7 @@ def test_menu_ids_are_declared_literally_in_one_place():
                             'cmuh_common', 'his_contract.py'),
                encoding='utf-8').read()
     for line in ("MENU_ID_代碼輸入 = 219", "MENU_ID_FINISH_NO_PRINT = 277",
-                 "MENU_ID_同意書 = 670", 'CALIBRATED_VERSION = "1150722"'):
+                 "MENU_ID_同意書 = 670", 'CALIBRATED_VERSION = "1150805"'):
         assert line in src, f"缺少字面宣告:{line}"
 
 

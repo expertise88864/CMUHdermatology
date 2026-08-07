@@ -225,7 +225,7 @@ def test_his_calibrated_version_matches_user_confirmed_build():
     """[2026-07-28 使用者實測] V.1150722.01 全部熱鍵功能正常 → 校正版本必須跟上,
     否則每台沒有自訂基線的機器都會一直收到「疑似改版」通知。"""
     from cmuh_common import his_contract as hc
-    assert hc.CALIBRATED_VERSION == "1150722"
+    assert hc.CALIBRATED_VERSION == "1150805"
     # main 的別名要真的指向單一宣告處(不可又有一份自己的字面值)
     import main
     assert main._HIS_CALIBRATED_VERSION == hc.CALIBRATED_VERSION

@@ -28,7 +28,7 @@ from dataclasses import dataclass
 # ── 目前校正對應的 HIS 版本 ────────────────────────────────────────────────
 # 只取主版本(6-8 位數字),不含尾碼 .01 —— 隱性基線刻意不比對尾碼,免得一開機就把
 # F 鍵全判成改版(見 main.sample_his_current_fp 的說明)。
-CALIBRATED_VERSION = "1150722"
+CALIBRATED_VERSION = "1150805"
 
 # ── 選單 command id ────────────────────────────────────────────────────────
 # 醫令 子選單(F1~F5 都走「代碼輸入」)
@@ -53,6 +53,10 @@ class Calibration:
 
 # 由新到舊。下次改版在最前面插一列。
 CALIBRATION_HISTORY: tuple = (
+    Calibration(
+        version="1150805", date="2026-08-07",
+        evidence="使用者實機回報「現在主程式版本 v.1150805.01」+「我已經驗證熱鍵沒問題」",
+        changes="無 —— 選單 id 未位移(熱鍵全部實測正常),只把版本守門基線跟上"),
     Calibration(
         version="1150722", date="2026-07-28",
         evidence="使用者實機回報「我已確定目前版本可以使用所有熱鍵功能 V.1150722.01」",
