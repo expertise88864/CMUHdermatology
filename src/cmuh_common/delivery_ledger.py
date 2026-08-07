@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from contextlib import contextmanager
 import time
 import uuid
 from typing import Optional
@@ -134,6 +135,9 @@ class DeliveryLedger:
         self._retain_days = retain_days
         self._lock = threading.RLock()
         self._records: dict = {}
+        # ★[2026-08-07 外審第 8 輪 P1-01] 本 process 自己動過的紀錄★
+        #   寫回時只寫這些,其餘從磁碟重讀後合併 —— 見 `_save_locked`。
+        self._dirty: set = set()
         self._load_failed = False
         self._load()
 
@@ -154,15 +158,95 @@ class DeliveryLedger:
         if isinstance(data, dict):
             self._records = {k: v for k, v in data.items() if isinstance(v, dict)}
 
+    @contextmanager
+    def _interprocess_lock(self):
+        """跨 process 檔案鎖(sidecar `.lock`)。
+
+        ★[2026-08-07 外審第 8 輪 P1-01]★ `threading.RLock` 只鎖得住同一個
+        process 裡的執行緒。但這本帳是【主程式與會診程式共用】的 —— 兩個
+        不同的 process。舊寫法是「把本 process 記憶體裡的整份紀錄覆蓋整個檔案」,
+        於是:
+
+            main    讀到 {A}          consult 讀到 {A}
+            main    寫回 {A,B}
+            consult 寫回 {A,C}        ← B 永久消失
+
+        `os.replace` 是原子的,但它保證的是「不會寫出半個 JSON」,
+        擋不住 lost update。
+
+        ★取不到鎖時仍然寫(fail-open)★:鎖不到就不寫,等於為了避免「可能覆蓋」
+        而造成「一定丟失」。退化成舊行為 + 一行警告,比靜默丟資料好。
+
+        ★只實作 Windows★:本產品(systemftp/win32gui/隱藏桌面)只跑在 Windows,
+        CI 也是。加一條永遠不會被執行的 POSIX 分支,是「看起來比較周全」的死路 ——
+        它無法被任何測試涵蓋,只會帶進型別債與假的安心感。非 Windows 環境
+        直接退化成只有執行緒鎖(見下面的 fail-open 說明)。
+        """
+        import os as _os
+        lock_path = self.path + ".lock"
+        fh = None
+        locked = False
+        try:
+            try:
+                import msvcrt  # noqa: PLC0415  (Windows-only,見上面說明)
+                _os.makedirs(_os.path.dirname(lock_path) or ".", exist_ok=True)
+                fh = open(lock_path, "a+b")
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                locked = True
+            except ImportError:
+                logging.debug("[delivery] 非 Windows 環境 → 沒有跨 process 檔案鎖")
+            except Exception:
+                logging.warning("[delivery] 取不到帳本檔案鎖 → 本次仍寫入"
+                                "(可能與另一個程式互相覆蓋)", exc_info=True)
+            yield
+        finally:
+            if fh is not None:
+                if locked:
+                    try:
+                        import msvcrt  # noqa: PLC0415
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    except Exception:
+                        logging.debug("[delivery] 釋放帳本檔案鎖失敗", exc_info=True)
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+
     def _save_locked(self) -> None:
         if self._load_failed:
             logging.warning("[delivery] 本次執行曾讀不到帳本 → 不寫回"
                             "(避免用不完整的內容覆蓋磁碟)")
             return
-        try:
-            atomic_write_json(self.path, self._records)
-        except Exception:
-            logging.warning("[delivery] 帳本寫入失敗(記憶體仍有紀錄)", exc_info=True)
+        with self._interprocess_lock():
+            # ★鎖內重讀 → 合併 → 寫★(外審第 8 輪 P1-01)
+            #   只把【本 process 動過的】紀錄蓋上去;其餘一律以磁碟為準。
+            #   delivery_id 是全域唯一的,所以兩個 process 不可能改到同一筆 ——
+            #   衝突只會是「用我手上的舊副本蓋掉對方的新版本」,而這個合併
+            #   剛好精確地避開它。順帶讓本 process 看得到對方新增的紀錄。
+            disk, status = safe_load_json_ex(self.path, {},
+                                             backup_on_corrupt=False)
+            merged = {}
+            if status == "ok" and isinstance(disk, dict):
+                merged = {k: v for k, v in disk.items() if isinstance(v, dict)}
+            elif status in ("error", "corrupt"):
+                # 這一刻讀不到磁碟 → 不能合併,也不能拿記憶體整份去蓋。
+                logging.warning("[delivery] 寫回前讀不到磁碟內容 → 本次不寫回"
+                                "(避免覆蓋掉別的程式的紀錄)")
+                return
+            for did in self._dirty:
+                rec = self._records.get(did)
+                if rec is not None:
+                    merged[did] = rec
+            self._records = merged
+            self._prune_locked()
+            try:
+                atomic_write_json(self.path, self._records)
+                self._dirty.clear()
+            except Exception:
+                logging.warning("[delivery] 帳本寫入失敗(記憶體仍有紀錄)",
+                                exc_info=True)
 
     # ── 生命週期 ───────────────────────────────────────────────────────────
     def begin(self, *, business_key: str, category: str, recipients: list,
@@ -190,7 +274,7 @@ class DeliveryLedger:
                 "attempts": 0,
                 "note": "",
             }
-            self._prune_locked()
+            self._dirty.add(did)
             self._save_locked()
         return did
 
@@ -202,6 +286,7 @@ class DeliveryLedger:
             rec["state"] = SUBMITTING
             rec["attempts"] = int(rec.get("attempts", 0)) + 1
             rec["updated_at"] = _now()
+            self._dirty.add(delivery_id)
             self._save_locked()
 
     def settle(self, delivery_id: str, *, refused: "Optional[dict]" = None,
@@ -239,6 +324,7 @@ class DeliveryLedger:
             if note:
                 rec["note"] = str(note)[:300]
             rec["updated_at"] = _now()
+            self._dirty.add(delivery_id)
             self._save_locked()
             return rec["state"]
 
@@ -257,6 +343,7 @@ class DeliveryLedger:
             rec["state"] = summarize(states)
             rec["note"] = (note or ("寄件備份查到" if delivered else "寄件備份查無"))[:300]
             rec["updated_at"] = _now()
+            self._dirty.add(delivery_id)
             self._save_locked()
             return rec["state"]
 

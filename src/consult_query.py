@@ -5239,12 +5239,34 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     #   begin 在【送出之前】——這樣即使送出當下斷電,重啟後看到的
                     #   是一筆 SUBMITTING(待查),而不是「什麼都沒發生」。
                     _did = _delivery_begin(delivery, trigger_label)
-                    _refused = send_via_smtp(
-                        delivery.attachment, delivery.subject,
-                        delivery.text_body, list(delivery.recipients),
-                        html_body=delivery.html_body,
-                        message_id=delivery.message_id)
+                    # ★[2026-08-07 外審第 8 輪 P1-03] 每一筆都要有終局狀態★
+                    #   舊寫法只在【成功】與【結果不明】兩條路 settle。連不上、
+                    #   認證失敗、5xx、SMTP 未設定這些「確定沒送出去」的錯誤直接
+                    #   往上拋 —— 那一筆就永遠停在 SUBMITTING,而 prune 不會清掉
+                    #   SUBMITTING。三次 attempt 就留下兩筆假的「可能送到一半」。
+                    #   現在還無害(帳本純寫入、沒有當閘門),但等 has_live_delivery
+                    #   接上寄送決策,這些假 SUBMITTING 會永久擋住該筆會診。
+                    #   ★不變式:begin 之後,每一條出口都必須 settle★
+                    try:
+                        _refused = send_via_smtp(
+                            delivery.attachment, delivery.subject,
+                            delivery.text_body, list(delivery.recipients),
+                            html_body=delivery.html_body,
+                            message_id=delivery.message_id)
+                    except DeliveryOutcomeUnknown:
+                        # 可能已送達 → 待查(留給 Message-ID 回查收斂)
+                        _delivery_settle(_did, unknown=True)
+                        _did = ""              # 已結案,終局分支不要再 settle 一次
+                        raise
+                    except Exception:
+                        # 確定沒送出去(連不上/認證/5xx/未設定)→ FAILED,不是待查。
+                        # 若哪天 SMTP 層把「DATA 之後斷線」也改判成結果不明,
+                        # 它會走上面那條,不會被誤記成 FAILED。
+                        _delivery_settle(_did, failed=True)
+                        _did = ""
+                        raise
                     _delivery_settle(_did, refused=_refused)
+                    _did = ""
                 else:
                     send_via_outlook(delivery.attachment, delivery.subject,
                                      delivery.text_body,
