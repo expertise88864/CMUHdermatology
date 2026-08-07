@@ -51,7 +51,10 @@ def test_smtp_timeout_raises_delivery_unknown(monkeypatch):
     monkeypatch.setattr(sm, "_rollback_rate_limit_slot", lambda *a, **k: None)
 
     def _boom(cred, msg, timeout):
-        raise socket.timeout("timed out waiting for 250")
+        # 模擬【DATA 已提交、等最終 250 時】逾時 —— 這才是「結果不明」
+        e = socket.timeout("timed out waiting for 250")
+        e._cmuh_submitted = True
+        raise e
 
     monkeypatch.setattr(sm, "_send_once", _boom)
 
@@ -217,7 +220,9 @@ def test_timeout_does_not_resend_before_declaring_unknown(monkeypatch):
 
     def _boom(cred, msg, timeout):
         attempts.append(1)
-        raise socket.timeout("timed out waiting for 250")
+        e = socket.timeout("timed out waiting for 250")
+        e._cmuh_submitted = True          # 已提交後逾時 = 不可重試
+        raise e
 
     monkeypatch.setattr(sm, "_send_once", _boom)
 
@@ -285,3 +290,48 @@ def test_strict_mode_check_comes_before_triggering():
     i_guard = src.index('require_authenticated_trigger", False):\n                                logging.error(\n                                    "★收到無法解析 From')
     i_trigger = src.index('trigger_job_async("email")', i_guard)
     assert i_guard < i_trigger, "strict 檢查要排在觸發之前"
+
+
+# ── [2026-08-07 外審 P1-02] 連線階段逾時 ≠ 結果不明 ─────────────────────────
+def test_connect_phase_timeout_still_retries(monkeypatch):
+    """★核心★ 連線/登入階段逾時 → 伺服器【確定】沒收到任何郵件內容 → 可安全重試。
+
+    上一版把所有 socket.timeout 一律當 UNKNOWN 不重試，雖然堵住了重複寄送，
+    卻讓「連不上」這種最常見的暫時故障也不再重試。階段由 _send_once 標在
+    例外身上（_cmuh_submitted）。
+    """
+    attempts = []
+    monkeypatch.setattr(sm, "_reserve_rate_limit_slot", lambda *a, **k: object())
+    monkeypatch.setattr(sm, "_rollback_rate_limit_slot", lambda *a, **k: None)
+    import time as _t
+    monkeypatch.setattr(_t, "sleep", lambda *_a: None)
+
+    def _boom(cred, msg, timeout):
+        attempts.append(1)
+        raise socket.timeout("timed out connecting")   # 未標記 = 尚未提交
+
+    monkeypatch.setattr(sm, "_send_once", _boom)
+
+    with pytest.raises(RuntimeError) as ei:
+        sm.send_mail(recipients=["a@b.c"], subject="s", body="b",
+                     attachment_path=None, max_retries=2,
+                     override_credentials={
+                         "host": "smtp.example.com", "port": 465,
+                         "use_ssl": True, "username": "u", "password": "p",
+                         "from_address": "u@example.com", "from_name": "T"})
+    assert len(attempts) == 3, f"連線逾時應重試到 3 次，實際 {len(attempts)}"
+    assert not isinstance(ei.value, sm.DeliveryOutcomeUnknown), (
+        "★連線階段逾時被當成『結果不明』★ 明明什麼都沒送出，卻不再重試")
+    assert "確定沒有寄出" in str(ei.value)
+
+
+def test_submit_phase_marks_the_exception():
+    """_send_once 必須在真正交出郵件的那一步標記例外（階段判斷的來源）。"""
+    src = inspect.getsource(sm._send_once)
+    assert "setattr(e, SUBMITTED_ATTR, True)" in src, \
+        "提交那一步必須把階段標記掛到例外上（逾時分流的依據）"
+    i_mark = src.index("setattr(e, SUBMITTED_ATTR, True)")
+    i_send = src.index("send_message(msg)")
+    assert i_send < i_mark, "標記必須包住 send_message（提交那一步）"
+    # 常數本身要存在（send_mail 讀它來判斷是否重試）
+    assert sm.SUBMITTED_ATTR == "_cmuh_submitted"

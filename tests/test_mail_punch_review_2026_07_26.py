@@ -58,10 +58,17 @@ def test_all_delivered_keeps_original_message(monkeypatch, caplog):
 
 
 def test_send_once_returns_refused_dict():
-    """來源守門:兩條寄送路徑(465 SSL / 587 STARTTLS)都要把回傳值傳出來。"""
+    """來源守門:兩條寄送路徑(465 SSL / 587 STARTTLS)都要把回傳值傳出來。
+
+    [2026-08-07 外審 P1-02] 兩處重複的 `return server.send_message(msg) or {}`
+    已抽成共用的 `_submit(server)`(它同時負責標記「已提交」階段,供逾時分流用)。
+    不變量沒變:兩條路徑都必須把被拒清單傳回去。
+    """
     code = _code_only(inspect.getsource(sm._send_once))
-    assert code.count("return server.send_message(msg) or {}") == 2, \
+    assert code.count("return _submit(server)") == 2, \
         "兩條路徑都要回傳被拒清單,不可丟掉"
+    assert "return server.send_message(msg) or {}" in code, \
+        "_submit 必須真的回傳 send_message 的被拒清單"
 
 
 # ── smtp:帳密檔暫時讀不到 ≠ 沒設定 ──────────────────────────────────────────

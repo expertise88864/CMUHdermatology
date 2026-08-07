@@ -2176,7 +2176,14 @@ def _machine_has_clock_accounts() -> bool:
       error/corrupt  → True(保守:讀不到不等於沒有,寧可多提醒也不可吞掉真失敗)
     """
     try:
-        data, status = safe_load_json_ex(str(CONFIG_FILE), [])
+        # ★[2026-08-07 外審 P2-01] 唯讀判斷不可以有破壞性副作用★
+        #   `backup_on_corrupt` 預設 True → 壞檔會被 rename 成 .corrupt-<ts>。
+        #   而一次 restart 流程會呼叫本函式【兩次】(決定要不要帶 --configure-if-empty、
+        #   以及 _notify_restart_failed 決定要不要通知):第一次把壞檔搬走回 True,
+        #   第二次看到「檔案不存在」回 False → 真正的重啟失敗告警又被吞掉。
+        #   這是個 predicate,只讀不動檔案。
+        data, status = safe_load_json_ex(str(CONFIG_FILE), [],
+                                         backup_on_corrupt=False)
     except Exception:
         logging.debug("[autoclock] 讀取打卡設定檔失敗,保守視為有帳號", exc_info=True)
         return True

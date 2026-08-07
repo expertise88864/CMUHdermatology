@@ -272,7 +272,8 @@ def test_parse_headers_never_raises_on_garbage():
 
 # ── P1-05:寄件人驗證(From 可偽造,要看 Authentication-Results)────────────────
 def test_dmarc_pass_counts_as_authenticated():
-    ar = "mx.google.com; dkim=pass header.d=example.com; spf=pass; dmarc=pass"
+    ar = ("mx.google.com; dkim=pass header.d=example.com; spf=pass; "
+          "dmarc=pass header.from=example.com")
     assert imap_reader._from_is_authenticated(ar, "dr@example.com") is True
 
 
@@ -303,7 +304,8 @@ def test_check_trigger_reports_authenticated_senders(monkeypatch):
     """行為:結果要分成「命中的寄件人」與「其中通過驗證的」兩份清單。"""
     hdr = (b"Subject: TRIG\r\n"
            b"From: Dr <dr@example.com>\r\n"
-           b"Authentication-Results: mx.google.com; dmarc=pass\r\n")
+           b"Authentication-Results: mx.google.com; "
+           b"dmarc=pass header.from=example.com\r\n")
 
     class _FakeIMAP:
         def login(self, u, p):
@@ -427,3 +429,25 @@ def test_domain_of_a_different_mechanism_does_not_count():
     ar = ("mx.google.com; dkim=fail header.d=example.com; "
           "spf=pass smtp.mailfrom=bounce.attacker.tw; dmarc=fail")
     assert imap_reader._from_is_authenticated(ar, "dr@example.com") is False
+
+
+def test_dmarc_pass_for_a_different_header_from_is_rejected():
+    """★[2026-08-07 外審]★ dmarc=pass 不可以無條件通過。
+
+    上一版寫 `if "dmarc=pass" in text: return True` —— 攻擊者只要用自己完全控制、
+    能通過 DMARC 的網域寄信（得到 dmarc=pass header.from=attacker.example），
+    再把 From 偽造成白名單醫師，舊版就直接放行。
+    """
+    ar = "mx.google.com; dmarc=pass header.from=attacker.example"
+    assert imap_reader._from_is_authenticated(ar, "doctor@gmail.com") is False
+
+
+def test_dmarc_pass_without_header_from_is_rejected():
+    """連 header.from 都沒有 → 無從核對 → fail-closed。"""
+    assert imap_reader._from_is_authenticated(
+        "mx.google.com; dmarc=pass", "doctor@gmail.com") is False
+
+
+def test_dmarc_pass_with_matching_header_from_is_accepted():
+    ar = "mx.google.com; dmarc=pass header.from=example.com"
+    assert imap_reader._from_is_authenticated(ar, "dr@example.com") is True

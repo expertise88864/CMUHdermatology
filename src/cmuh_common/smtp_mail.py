@@ -110,6 +110,12 @@ DEFAULT_CREDENTIALS = {
 }
 
 
+# 例外身上的階段標記:True = 郵件內容【已經提交】給伺服器(在等最終回應)。
+# 沒有這個標記 = 還在連線/STARTTLS/登入階段,伺服器確定沒收到任何內容。
+# 逾時要不要重試完全取決於它(見 send_mail 的兩條 socket.timeout 分支)。
+SUBMITTED_ATTR = "_cmuh_submitted"
+
+
 class DeliveryOutcomeUnknown(RuntimeError):
     """寄信結果不明(逾時,但伺服器可能【已經收下】) → 不得自動重試,以免重複寄出。
 
@@ -275,13 +281,31 @@ def _send_once(cred: dict, msg, timeout: float) -> dict:
     """
     host, port = cred["host"], cred["port"]
     use_tls = cred["use_tls"]
+
+    def _submit(server):
+        """真正把信交出去的那一步 —— 從這裡開始「結果不明」才成立。
+
+        ★[2026-08-07 外審 P1-02]★ 在此之前(連線/STARTTLS/登入)發生的逾時,
+        伺服器【確定】還沒收到任何郵件內容 → 那是可以安全重試的暫時性失敗。
+        上一版把所有 socket.timeout 一律當成 UNKNOWN 不重試,雖然堵住了重複
+        寄送,卻讓「連不上」這種最常見的暫時故障也不再重試。用例外身上的標記
+        把階段傳給呼叫端(不改 _send_once 簽名,既有的 monkeypatch 測試不受影響)。
+        """
+        try:
+            return server.send_message(msg) or {}
+        except BaseException as e:
+            # 已進 DATA/等最終回應 → 結果不明。用 setattr 掛在例外身上,
+            # 不改 _send_once 簽名(既有 monkeypatch 測試不受影響)。
+            setattr(e, SUBMITTED_ATTR, True)
+            raise
+
     if port == 465:
         # 純 SSL（少數人用）
         context = ssl.create_default_context()
         with smtplib.SMTP_SSL(host, port, timeout=timeout,
                                context=context) as server:
             server.login(cred["username"], cred["password"])
-            return server.send_message(msg) or {}
+            return _submit(server)
     else:
         # 587 STARTTLS（Gmail 推薦）或 25 明文（不建議）
         with smtplib.SMTP(host, port, timeout=timeout) as server:
@@ -297,7 +321,7 @@ def _send_once(cred: dict, msg, timeout: float) -> dict:
                     "拒絕在無 TLS 下對非本機 SMTP 傳送帳密(use_tls=False);"
                     "請改用 587+STARTTLS 或 465 SSL。")
             server.login(cred["username"], cred["password"])
-            return server.send_message(msg) or {}
+            return _submit(server)
 
 
 def _is_loopback_host(host) -> bool:
@@ -416,6 +440,23 @@ def send_mail(recipients: list, subject: str, body: str,
             #   若逾時發生在伺服器已收下 DATA 之後,那就是【送出三封】才承認不明。
             #   會診端有傳 max_retries=0 所以沒事,但止掛提醒走預設值 2 —— 正是
             #   會重複寄的那條路。逾時＝結果不明,第一次發生就不可以再送。
+            # ★[2026-08-07 外審 P1-02] 但只有【已提交之後】的斷線才算不明★
+            #   連線/STARTTLS/登入階段的逾時,伺服器確定還沒收到任何郵件內容,
+            #   那是最常見的暫時性故障,必須照常重試(上一版一律當 UNKNOWN,
+            #   把「連不上」也變成不重試)。階段由 _send_once 標在例外身上。
+            if isinstance(e, socket.timeout) and not getattr(
+                    e, SUBMITTED_ATTR, False):
+                if attempt < max_retries:
+                    backoff = min(10, 2 * (2 ** attempt))
+                    logging.warning(
+                        "SMTP 連線階段逾時(尚未送出任何內容,可安全重試) "
+                        "第 %d 次,%.0fs 後重試…", attempt + 1, backoff)
+                    _time.sleep(backoff)
+                    continue
+                _rollback_rate_limit_slot(reservation)
+                raise RuntimeError(
+                    f"SMTP 連線逾時 ({int(timeout)}s)，已重試 {max_retries} 次"
+                    f"(尚未送出郵件內容,確定沒有寄出)：{e}") from e
             if isinstance(e, socket.timeout):
                 raise DeliveryOutcomeUnknown(
                     f"SMTP 連線/送信逾時 ({int(timeout)}s) —— 結果不明,伺服器"

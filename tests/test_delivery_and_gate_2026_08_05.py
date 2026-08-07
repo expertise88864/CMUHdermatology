@@ -189,9 +189,10 @@ def test_smtp_timeout_does_not_roll_back_the_quota():
 
     import cmuh_common.smtp_mail as sm
     src = inspect.getsource(sm.send_mail)
-    # [2026-08-06 外審] timeout 現在在【重試判斷之前】就分流(見 P1-03 修正),
-    # 所以錨點改成 socket.timeout 那一條分支本身,而不是「用完重試次數」。
-    i = src.index("isinstance(e, socket.timeout)")
+    # [2026-08-06 外審] timeout 在【重試判斷之前】就分流(見 P1-03 修正)。
+    # [2026-08-07 外審 P1-02] 又再分成兩條:連線階段(可重試、要退配額)與
+    # 【已提交後】(結果不明、不退配額)。本測試管的是後者,故錨到那一條。
+    i = src.index("if isinstance(e, socket.timeout):")
     m = re.search(r"\braise\s+\w+", src[i:])
     assert m, "找不到 timeout 的 raise（測試失效了）"
     seg = src[i:i + m.start()]
@@ -201,11 +202,12 @@ def test_smtp_timeout_does_not_roll_back_the_quota():
     assert m.group(0).split()[-1] == "DeliveryOutcomeUnknown", (
         f"★SMTP 逾時拋的是 {m.group(0).split()[-1]}★ "
         "必須是 DeliveryOutcomeUnknown,否則外層會重試 → 可能寄兩封")
-    # ★不可以先重試再說結果不明★ timeout 分支必須排在 `if attempt < max_retries`
-    # 之前 —— 否則預設 max_retries=2 時會先送出第二、三封才承認不明(止掛提醒
-    # 走的正是預設值)。
-    assert i < src.index("if attempt < max_retries"), (
-        "★逾時排在重試之後★ 預設重試會在宣告『結果不明』前多送兩封")
+    # ★不可以先重試再說結果不明★ 從「已提交後逾時」分支到它的 raise 之間,
+    # 不得出現任何重試動作 —— 否則預設 max_retries=2 時會先送出第二、三封才
+    # 承認不明(止掛提醒走的正是預設值)。
+    # (連線階段那條【應該】重試,所以不能只數全檔有沒有 max_retries。)
+    assert "continue" not in seg and "max_retries" not in seg, (
+        "★『已提交後逾時』分支裡有重試★ 那會在宣告結果不明前多送幾封")
 
 
 # ── P2-06:告警寄失敗要短期重試 ──────────────────────────────────────────

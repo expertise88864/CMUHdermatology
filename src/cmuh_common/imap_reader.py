@@ -235,9 +235,9 @@ def _from_is_authenticated(auth_results: str, from_addr: str) -> bool:
     ★[2026-08-06 外審 P1-05]★ `From:` 是寄件者自填的純文字,可以偽造;只比對它
     等於沒有授權驗證。Gmail 收信時會把 SPF/DKIM/DMARC 判定寫進這個 header。
 
-    判準(保守):dmarc=pass 就算通過(DMARC 本身即要求 SPF 或 DKIM 通過【且與 From
-    對齊】);沒有 dmarc 時,要 dkim=pass 或 spf=pass 且該項的網域與 From 的網域
-    【完整相等或為其子網域】。只有 spf=pass 而網域不符不算(那只證明信封寄件者)。
+    判準(保守):dmarc / dkim / spf 任一 =pass,【且】該機制標示的網域與實際 From 的
+    網域完整相等或為其子網域,才算通過。只有 =pass 而網域對不上不算(spf 只證明信封
+    寄件者;dmarc/dkim 的網域也可能根本是別人的)。
     沒有這個 header(例如自己寄給自己、或郵件服務不加)→ False(無證據 ≠ 通過)。
 
     ★[2026-08-06 外審] 網域比對不可以用 substring★
@@ -249,8 +249,6 @@ def _from_is_authenticated(auth_results: str, from_addr: str) -> bool:
     if not text:
         return False
     domain = (from_addr or "").rsplit("@", 1)[-1].strip().lower().rstrip(".")
-    if "dmarc=pass" in text:
-        return True
     if not domain:
         return False
 
@@ -262,7 +260,15 @@ def _from_is_authenticated(auth_results: str, from_addr: str) -> bool:
         # 完全相等,或 value 是 from 網域的子網域(mail.example.com vs example.com)
         return bool(v) and (v == domain or v.endswith("." + domain))
 
-    for mech, keys in (("dkim", ("header.d=", "header.i=")),
+    # ★[2026-08-07 外審] dmarc=pass 也必須核對 header.from★
+    #   上一版寫 `if "dmarc=pass" in text: return True` —— 無條件通過。理由當時
+    #   寫成「DMARC 本身即要求對齊」,但那只保證【該封信自己的 From】與它自己的
+    #   驗證網域對齊;這個 header 是文字,可能來自轉寄上游、也可能整段是攻擊者
+    #   塞進信裡的。攻擊者只要用自己完全控制、能通過 DMARC 的網域寄信,得到
+    #   `dmarc=pass header.from=attacker.example`,再把 From 偽造成白名單醫師,
+    #   舊版就直接放行。現在 dmarc 與 dkim/spf 走同一套 header.from 對齊檢查。
+    for mech, keys in (("dmarc", ("header.from=",)),
+                       ("dkim", ("header.d=", "header.i=")),
                        ("spf", ("smtp.mailfrom=", "envelope-from="))):
         idx = text.find(f"{mech}=pass")
         if idx < 0:
