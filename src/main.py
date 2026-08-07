@@ -8365,7 +8365,7 @@ def _send_alert_email_via_smtp(subject: str, body: str,
         return False
     try:
         from cmuh_common.smtp_mail import (
-            SmtpNotConfiguredError, send_mail,
+            DeliveryOutcomeUnknown, SmtpNotConfiguredError, send_mail,
         )
     except Exception:
         logging.warning("smtp_mail 模組載入失敗，止掛信跳過", exc_info=True)
@@ -8393,6 +8393,25 @@ def _send_alert_email_via_smtp(subject: str, body: str,
     except SmtpNotConfiguredError as e:
         logging.warning("止掛提醒寄信跳過（SMTP 尚未設定）：%s", e)
         return False
+    except DeliveryOutcomeUnknown as e:
+        # ★[2026-08-07 外審] 「結果不明」不可以當成失敗★
+        #   舊版讓它掉進下面的 `except Exception` → 回 False → 呼叫端釋放 claim
+        #   → 下一輪掃描再寄一次。但 UNKNOWN 的定義正是「伺服器可能已經收下」,
+        #   於是醫師收到兩封(甚至每輪一封)同樣的止掛提醒。
+        #
+        #   ★為什麼回 True(視為已寄)★ 經過 2026-08-07 的階段分流之後,
+        #   UNKNOWN 只在【DATA 已提交、等最終 250 逾時】時才成立 —— 那個時點
+        #   Gmail 幾乎必然已經收下。相較之下:
+        #     回 False → 幾乎一定重複寄(而且會每輪重複);
+        #     回 True  → 只有在「真的沒送到」的少數情況才會漏一則。
+        #   兩害相權取其輕,並且用 error 級別把它講清楚,讓人可以事後查證。
+        #   (真正的解法是持久化 delivery ledger + Message-ID 回查 Gmail Sent,
+        #    屬於還沒做的架構項;在那之前這是最不傷人的選擇。)
+        logging.error(
+            "[ALERT] 「%s」寄送結果不明(伺服器可能已收下,逾時沒看到最終回應)"
+            " → 本則【視為已寄、不重寄】以免醫師收到重複提醒;"
+            "請到 Gmail 寄件備份確認是否送達:%s", subject, e)
+        return True
     except Exception as e:
         logging.warning("止掛提醒 SMTP 寄信失敗：%s", e)
         return False

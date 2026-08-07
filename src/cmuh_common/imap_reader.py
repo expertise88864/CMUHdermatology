@@ -200,6 +200,25 @@ def _subject_fingerprint(subject: str) -> str:
     return f"len={len(text)} sha={digest}"
 
 
+# 可信的 authserv-id（Authentication-Results 開頭那個「是誰做的驗證」）。
+# 只有【我方收件伺服器】加的那一段才算數:同一封信可以有很多個 Authentication-Results,
+# 上游轉寄站會加,攻擊者也能自己在信裡塞一段假的。信箱是 Gmail → 只信 Google 那組。
+# 換信箱服務商時要改這裡（否則所有觸發信都會被判定「未驗證」）。
+TRUSTED_AUTHSERV_IDS = ("mx.google.com", "google.com")
+
+
+def _authserv_is_trusted(auth_results: str) -> bool:
+    """這一段 Authentication-Results 是不是【我方收件伺服器】加的。
+
+    格式:`authserv-id; method=result ...`,authserv-id 在第一個分號之前。
+    """
+    head = str(auth_results or "").split(";", 1)[0].strip().lower()
+    # authserv-id 後面可能跟 version（RFC 8601: `mx.google.com 1;`）
+    head = head.split()[0] if head.split() else ""
+    head = head.rstrip(".")
+    return any(head == t or head.endswith("." + t) for t in TRUSTED_AUTHSERV_IDS)
+
+
 def _parse_trigger_headers(header_raw: bytes) -> tuple:
     """(subject, from, authentication-results) —— 用標準 parser 解，支援折行 header。
 
@@ -223,7 +242,24 @@ def _parse_trigger_headers(header_raw: bytes) -> tuple:
                 # 該欄視為空(呼叫端的既有行為:主旨不命中/From 解不出)。
                 logging.debug("[IMAP] header %s 取值失敗", name, exc_info=True)
                 return ""
-        return _get("Subject"), _get("From"), _get("Authentication-Results")
+        # ★[2026-08-07 外審] Authentication-Results 只能採信【我方收件伺服器】那一段★
+        #   這個 header 可以有很多個:上游轉寄站會加、而攻擊者也可以直接把一段
+        #   假的塞進自己寄的信裡(那就變成信件內容的一部分)。只取 msg.get() 拿到
+        #   的第一個 → 攻擊者只要把假的排在前面就通過了。
+        #   規則:收件伺服器加的那一段一定在【最上方】(每經一跳就 prepend),而且
+        #   authserv-id 是我們自己的信箱服務商。用 get_all() 取全部,只採信
+        #   authserv-id 在信任清單內的那些。
+        try:
+            all_ar = [str(v) for v in (msg.get_all("Authentication-Results") or [])]
+        except Exception:
+            logging.debug("[IMAP] Authentication-Results 取值失敗", exc_info=True)
+            all_ar = []
+        trusted = [ar for ar in all_ar if _authserv_is_trusted(ar)]
+        if all_ar and not trusted:
+            logging.warning(
+                "[IMAP] 這封信的 Authentication-Results 都不是可信收件伺服器加的"
+                "(可能是轉寄或偽造),一律不採信:%r", all_ar[:2])
+        return _get("Subject"), _get("From"), "\n".join(trusted)
     except Exception:
         logging.debug("[IMAP] header 解析失敗", exc_info=True)
         return "", "", ""

@@ -335,3 +335,36 @@ def test_submit_phase_marks_the_exception():
     assert i_send < i_mark, "標記必須包住 send_message（提交那一步）"
     # 常數本身要存在（send_mail 讀它來判斷是否重試）
     assert sm.SUBMITTED_ATTR == "_cmuh_submitted"
+
+
+# ── [2026-08-07 外審] 止掛提醒也要認得 DeliveryOutcomeUnknown ────────────────
+def test_stop_signup_alert_treats_unknown_as_sent(monkeypatch, caplog):
+    """★核心★ 止掛提醒收到「結果不明」時不可回 False。
+
+    回 False → 呼叫端釋放 claim → 下一輪掃描再寄 → 醫師收到重複(甚至每輪一封)
+    的止掛提醒。經過階段分流後 UNKNOWN 只在【DATA 已提交、等最終 250 逾時】才
+    成立，那個時點 Gmail 幾乎必然已收下，重寄的傷害大於漏寄。
+    """
+    import logging as _lg
+    import main
+
+    def _boom(**kwargs):
+        raise sm.DeliveryOutcomeUnknown("timeout waiting for 250")
+
+    monkeypatch.setattr(sm, "send_mail", _boom)
+    with caplog.at_level(_lg.ERROR):
+        ok = main._send_alert_email_via_smtp("三晚 100 人", "body", ["a@b.c"])
+    assert ok is True, "★結果不明被當成失敗★ 下一輪會重寄 → 醫師收到重複提醒"
+    assert any("結果不明" in r.getMessage() for r in caplog.records), \
+        "必須用 error 級別留下可查證的紀錄"
+
+
+def test_stop_signup_alert_still_reports_real_failures(monkeypatch):
+    """反方向：真正的失敗仍要回 False（才會在下一輪重試）。"""
+    import main
+
+    def _boom(**kwargs):
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(sm, "send_mail", _boom)
+    assert main._send_alert_email_via_smtp("x", "b", ["a@b.c"]) is False

@@ -451,3 +451,43 @@ def test_dmarc_pass_without_header_from_is_rejected():
 def test_dmarc_pass_with_matching_header_from_is_accepted():
     ar = "mx.google.com; dmarc=pass header.from=example.com"
     assert imap_reader._from_is_authenticated(ar, "dr@example.com") is True
+
+
+# ── [2026-08-07 外審] 只採信「我方收件伺服器」加的 Authentication-Results ──────
+def test_authserv_id_trust():
+    ok = imap_reader._authserv_is_trusted
+    assert ok("mx.google.com; dmarc=pass header.from=example.com") is True
+    assert ok("mx.google.com 1; dmarc=pass") is True          # RFC 8601 版本號
+    assert ok("MX.GOOGLE.COM; spf=pass") is True              # 大小寫不敏感
+    assert ok("attacker.example; dmarc=pass") is False
+    assert ok("mx.google.com.evil.tw; dmarc=pass") is False   # 尾綴混淆
+    assert ok("") is False
+
+
+def test_forged_authentication_results_inside_the_message_is_ignored():
+    """★核心★ 攻擊者可以直接把一段假的 Authentication-Results 塞進自己寄的信裡。
+
+    收件伺服器加的那一段一定在最上方(每經一跳 prepend)，且 authserv-id 是我們自己
+    的服務商。舊版只取 msg.get() 拿到的第一個 → 攻擊者把假的排前面就通過。
+    """
+    raw = (b"Subject: TRIG\r\n"
+           b"From: <doctor@example.com>\r\n"
+           b"Authentication-Results: attacker.example; "
+           b"dmarc=pass header.from=example.com\r\n")
+    _s, _f, auth = imap_reader._parse_trigger_headers(raw)
+    assert auth == "", "★採信了信件內自帶的偽造 Authentication-Results★"
+    assert imap_reader._from_is_authenticated(auth, "doctor@example.com") is False
+
+
+def test_trusted_result_is_kept_even_with_a_forged_one_present():
+    """同時有偽造與可信兩段時，只留可信那一段（且驗證仍然通過）。"""
+    raw = (b"Subject: TRIG\r\n"
+           b"From: <doctor@example.com>\r\n"
+           b"Authentication-Results: mx.google.com; "
+           b"dmarc=pass header.from=example.com\r\n"
+           b"Authentication-Results: attacker.example; "
+           b"dmarc=pass header.from=example.com\r\n")
+    _s, _f, auth = imap_reader._parse_trigger_headers(raw)
+    assert "mx.google.com" in auth
+    assert "attacker.example" not in auth
+    assert imap_reader._from_is_authenticated(auth, "doctor@example.com") is True
