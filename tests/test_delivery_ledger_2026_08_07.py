@@ -253,3 +253,53 @@ def test_ledger_failures_never_block_sending():
     for fn in (cq._get_ledger, cq._delivery_begin, cq._delivery_settle):
         assert "except Exception" in inspect.getsource(fn), \
             f"{fn.__name__} 必須吞掉自己的錯誤（帳本不可阻擋寄信）"
+
+
+# ── 接線：止掛提醒路徑 ─────────────────────────────────────────────────────
+def test_alert_send_records_into_the_ledger():
+    """止掛提醒也要 begin→settle（與會診共用同一本帳、同一套 contract）。"""
+    import inspect
+    import main
+    src = inspect.getsource(main._send_alert_email_via_smtp)
+    i_begin = src.index("_led.begin(")
+    i_send = src.index("send_mail(")
+    assert i_begin < i_send, "begin 必須在真正送出之前"
+    assert "_settle(refused=refused)" in src, "成功路徑要寫回逐位收件人結果"
+
+
+def test_alert_unknown_and_failure_are_distinguished_in_the_ledger():
+    """★核心★ 「結果不明」與「確定失敗」在帳本裡必須是不同狀態。
+
+    兩者都回 False/True 給呼叫端是舊的二元世界；帳本要留下可回查的第三態，
+    否則永遠沒辦法用 Message-ID 把它收斂。
+    """
+    import inspect
+    import main
+    src = inspect.getsource(main._send_alert_email_via_smtp)
+    i_unknown = src.index("except DeliveryOutcomeUnknown")
+    assert "_settle(unknown=True)" in src[i_unknown:i_unknown + 300], \
+        "★結果不明沒記成 UNKNOWN★ 之後無從回查"
+    i_generic = src.index("except Exception as e:")
+    assert "_settle(failed=True)" in src[i_generic:i_generic + 200], \
+        "確定失敗要記成 FAILED（才允許重寄）"
+
+
+def test_alert_ledger_is_fail_open():
+    """帳本壞掉不可以害止掛提醒寄不出去。"""
+    import inspect
+    import main
+    assert "except Exception" in inspect.getsource(main._get_alert_ledger)
+    src = inspect.getsource(main._send_alert_email_via_smtp)
+    assert "if _led is not None" in src, "帳本不可用時要能繼續寄信"
+
+
+def test_both_senders_share_one_ledger_file():
+    """會診與止掛必須寫同一本帳（否則 business_key 各自為政、無從彙總）。"""
+    import consult_query as cq
+    import main
+    from cmuh_common.delivery_ledger import DeliveryLedger
+    import inspect
+    assert "DeliveryLedger()" in inspect.getsource(cq._get_ledger)
+    assert "DeliveryLedger()" in inspect.getsource(main._get_alert_ledger)
+    # 預設路徑一致（都落在 settings/delivery_ledger.json）
+    assert DeliveryLedger.__init__.__defaults__[0] is None

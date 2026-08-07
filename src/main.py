@@ -8351,9 +8351,33 @@ def _warn_alert_has_no_recipients(where: str, *,
         where, what)
 
 
+_alert_ledger_lock = threading.Lock()
+_alert_ledger_obj = None
+
+
+def _get_alert_ledger():
+    """止掛/系統信共用的寄送帳本（第一次用才建；失敗回 None → 呼叫端略過）。
+
+    ★[2026-08-07 外審 AT/AW]★ 帳本是【觀測】用的,絕不可因為它壞掉就寄不出信,
+    所以所有接點都 fail-open。與 consult_query 用的是同一個檔案、同一套 contract。
+    """
+    global _alert_ledger_obj
+    with _alert_ledger_lock:
+        if _alert_ledger_obj is None:
+            try:
+                from cmuh_common.delivery_ledger import DeliveryLedger
+                _alert_ledger_obj = DeliveryLedger()
+            except Exception:
+                logging.warning("[delivery] 帳本初始化失敗(寄信不受影響)",
+                                exc_info=True)
+                return None
+        return _alert_ledger_obj
+
+
 def _send_alert_email_via_smtp(subject: str, body: str,
                                 recipients: list, timeout: float = 60.0,
-                                category: "str | None" = None) -> bool:
+                                category: "str | None" = None,
+                                business_key: str = "") -> bool:
     """達到門檻時透過 SMTP (Gmail) 寄信。回傳是否成功（失敗只 log，不影響主程式）。
 
     為何用 SMTP 不用 Outlook：admin 行程的 Outlook COM 會起一個 admin Outlook
@@ -8370,12 +8394,37 @@ def _send_alert_email_via_smtp(subject: str, body: str,
     except Exception:
         logging.warning("smtp_mail 模組載入失敗，止掛信跳過", exc_info=True)
         return False
+    # ★[2026-08-07 外審 AT/AW] 每一則通知都進寄送帳本★
+    #   begin 在送出【之前】：送出當下斷電時，重啟後看到的是一筆待查的
+    #   SUBMITTING，而不是「什麼都沒發生」。business_key 預設用主旨
+    #   （止掛的主旨已含日期/診次/醫師，足以識別同一則事件）。
+    _led = _get_alert_ledger()
+    _did = ""
+    if _led is not None:
+        try:
+            _did = _led.begin(business_key=business_key or f"alert:{subject}",
+                              category=category or "clinical",
+                              recipients=list(recipients), subject=subject)
+            _led.mark_submitting(_did)
+        except Exception:
+            logging.debug("[delivery] 登記止掛寄送失敗(略過)", exc_info=True)
+            _did = ""
+
+    def _settle(**kw_settle):
+        if not (_led is not None and _did):
+            return
+        try:
+            _led.settle(_did, **kw_settle)
+        except Exception:
+            logging.debug("[delivery] 寫回止掛寄送結果失敗(略過)", exc_info=True)
+
     try:
         # [2026-07-30 外審 P2-02] category 決定吃哪一份寄信配額。不傳＝臨床
         # （止掛提醒是這個 helper 的主要用途）；系統／除錯類的呼叫端自己標明。
         kw = {"category": category} if category else {}
         refused = send_mail(recipients=recipients, subject=subject, body=body,
                             attachment_path=None, timeout=timeout, **kw) or {}
+        _settle(refused=refused)
         if refused:
             # [2026-07-26 外審] send_mail 的回傳值【不可】丟掉:部分收件人被拒時
             # smtplib 是正常返回的,舊版一律回 True → 呼叫端把這則告警記成「已寄出」
@@ -8391,9 +8440,11 @@ def _send_alert_email_via_smtp(subject: str, body: str,
                 subject, ", ".join(sorted(str(r) for r in refused)))
         return True
     except SmtpNotConfiguredError as e:
+        _settle(failed=True)
         logging.warning("止掛提醒寄信跳過（SMTP 尚未設定）：%s", e)
         return False
     except DeliveryOutcomeUnknown as e:
+        _settle(unknown=True)
         # ★[2026-08-07 外審] 「結果不明」不可以當成失敗★
         #   舊版讓它掉進下面的 `except Exception` → 回 False → 呼叫端釋放 claim
         #   → 下一輪掃描再寄一次。但 UNKNOWN 的定義正是「伺服器可能已經收下」,
@@ -8413,6 +8464,7 @@ def _send_alert_email_via_smtp(subject: str, body: str,
             "請到 Gmail 寄件備份確認是否送達:%s", subject, e)
         return True
     except Exception as e:
+        _settle(failed=True)
         logging.warning("止掛提醒 SMTP 寄信失敗：%s", e)
         return False
 
