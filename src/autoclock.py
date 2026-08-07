@@ -2176,7 +2176,7 @@ def _machine_has_clock_accounts() -> bool:
       error/corrupt  → True(保守:讀不到不等於沒有,寧可多提醒也不可吞掉真失敗)
     """
     try:
-        data, status = safe_load_json_ex(CONFIG_FILE, [])
+        data, status = safe_load_json_ex(str(CONFIG_FILE), [])
     except Exception:
         logging.debug("[autoclock] 讀取打卡設定檔失敗,保守視為有帳號", exc_info=True)
         return True

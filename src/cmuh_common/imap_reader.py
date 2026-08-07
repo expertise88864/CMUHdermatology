@@ -219,9 +219,10 @@ def _parse_trigger_headers(header_raw: bytes) -> tuple:
                 v = msg.get(name)
                 return str(v) if v is not None else ""
             except Exception:
-                # 極少數畸形 encoded-word 會讓 policy.default 在取值時拋
-                raw = msg.get_raw(name) if hasattr(msg, "get_raw") else None
-                return str(raw or "")
+                # 極少數畸形 encoded-word 會讓 policy.default 在取值時拋 →
+                # 該欄視為空(呼叫端的既有行為:主旨不命中/From 解不出)。
+                logging.debug("[IMAP] header %s 取值失敗", name, exc_info=True)
+                return ""
         return _get("Subject"), _get("From"), _get("Authentication-Results")
     except Exception:
         logging.debug("[IMAP] header 解析失敗", exc_info=True)
@@ -348,11 +349,13 @@ def check_trigger(keyword: str, mark_read: bool = True,
             # UnicodeEncodeError → 落 except 後備「全 UNSEEN client 端比對」。
             # [IF-05 2026-07-12] 移除原「typ!=OK 改 UTF-8 mode」死碼:中文走的是【例外】路徑而非
             # typ!=OK,該 UTF-8 retry 永不執行(kw_bytes 一併移除)。
-            typ, data = conn.uid("search", None, "UNSEEN", "SUBJECT",
+            # 註:`IMAP4.search(charset, ...)` 的第一個參數是 charset;UID SEARCH
+            # 這裡是直接傳命令參數,不需要(也不該)傳 charset 的 None 佔位。
+            typ, data = conn.uid("search", "UNSEEN", "SUBJECT",
                                  f'"{keyword}"')
         except Exception:
             # 後備：撈 UNSEEN 後 client 端比對
-            typ, data = conn.uid("search", None, "UNSEEN")
+            typ, data = conn.uid("search", "UNSEEN")
             if typ != "OK":
                 # 後備搜尋本身回了非 OK → 這是新的失敗條件(訊息已自足),與觸發後備的
                 # 原例外無因果關係 → from None 明示不接續原鏈。

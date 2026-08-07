@@ -9757,8 +9757,10 @@ class AutomationApp:
         #   早就生效了,使用者只看到例外,不知道設定卡在「R 醫師已更新、醫師清單還是
         #   舊的」這種半套狀態。現在把 payload 全部備好,最後一起寫(見下方 commit)。
         # 蓋上名單版號：之後這份存檔才會被尊重（見 app_settings 的說明）
-        _pending_writes = [(get_conf_path('r_doctor_settings.json'),
-                            _stamp_r_doctor_revision(self.r_doctor_map))]
+        # 型別註記:三個 payload 分別是 dict / dict / list,故值型別為 object。
+        _pending_writes: list[tuple[str, object]] = [
+            (get_conf_path('r_doctor_settings.json'),
+             _stamp_r_doctor_revision(self.r_doctor_map))]
 
         # 上面已經驗過(不合法就不會走到這裡);留空 = 這個診次不設門檻、不提醒。
         for key, value in validated_thresholds.items():

@@ -142,7 +142,7 @@ def test_check_trigger_skips_stale_but_triggers_fresh(monkeypatch):
             # 導致讀錯/標錯信)。假 IMAP 依樣分派到既有的實作。
             return getattr(self, command.lower())(*args)
 
-        def search(self, charset, *criteria):
+        def search(self, *criteria):
             return ("OK", [b"1 2 3"])
 
         def fetch(self, uid, parts):
@@ -202,7 +202,7 @@ def test_check_trigger_no_age_filter_by_default(monkeypatch):
             # 導致讀錯/標錯信)。假 IMAP 依樣分派到既有的實作。
             return getattr(self, command.lower())(*args)
 
-        def search(self, charset, *criteria):
+        def search(self, *criteria):
             return ("OK", [b"1"])
 
         def fetch(self, uid, parts):
@@ -315,7 +315,7 @@ def test_check_trigger_reports_authenticated_senders(monkeypatch):
         def uid(self, command, *args):
             return getattr(self, command.lower())(*args)
 
-        def search(self, charset, *criteria):
+        def search(self, *criteria):
             return ("OK", [b"7"])
 
         def fetch(self, uid, parts):
@@ -355,7 +355,7 @@ def test_forged_from_is_matched_but_not_authenticated(monkeypatch):
         def uid(self, command, *args):
             return getattr(self, command.lower())(*args)
 
-        def search(self, charset, *criteria):
+        def search(self, *criteria):
             return ("OK", [b"7"])
 
         def fetch(self, uid, parts):
