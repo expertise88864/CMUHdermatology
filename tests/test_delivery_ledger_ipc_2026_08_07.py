@@ -149,8 +149,20 @@ class TestCrossProcessSafety:
                      and isinstance(n.func, ast.Attribute)}
             if "_save_locked" not in calls:
                 continue
+            # ★判準要是「有沒有改到紀錄」,不是「有沒有存檔」★
+            #   `flush()` 只是把【已經標記過】的 dirty 再寫一次,它自己不改
+            #   任何紀錄。把它也要求標記 dirty,守衛就從「檢查性質」退化成
+            #   「檢查長相」—— 而且逼人為了過關寫出無意義的 add。
+            #   會改到紀錄 = 對 `rec[...]` 或 `self._records[...]` 做指派。
+            mutates = any(
+                isinstance(t, ast.Subscript)
+                for n in ast.walk(fn) if isinstance(n, ast.Assign)
+                for t in n.targets)
+            if not mutates:
+                continue
             assert "add" in calls, (
-                f"★{fn.name} 會存檔但沒有標記 dirty★ 那次變更不會被合併寫入")
+                f"★{fn.name} 會改紀錄又存檔,卻沒有標記 dirty★ "
+                "那次變更不會被合併寫入")
 
 
 class TestEveryDeliveryReachesATerminalState:

@@ -73,7 +73,11 @@ def test_begin_then_confirm(tmp_path):
     led = _led(tmp_path)
     did = led.begin(business_key="bk1", category="clinical",
                     recipients=["A@X.tw", " b@x.tw "])
-    assert led.get(did)["state"] == dl.PREPARED
+    # ★[2026-08-08 外審第 10 輪第 3 回] 登記當下就是 SUBMITTING★
+    #   落地的 PREPARED 之所以被拿掉:`mark_submitting` 的寫回是 fail-open 的,
+    #   它只改到記憶體、信卻寄出去了,磁碟上留下的一樣是 PREPARED —— 於是
+    #   「停在 PREPARED = 確定沒寄出」這個推論不成立,卻會被拿去判死。
+    assert led.get(did)["state"] == dl.SUBMITTING
     assert set(led.get(did)["recipients"]) == {"a@x.tw", "b@x.tw"}, "收件人要正規化"
     led.mark_submitting(did)
     assert led.get(did)["attempts"] == 1

@@ -1880,6 +1880,26 @@ _LEDGER_FLUSH_TIMEOUT_SEC = 2.0
 _ledger_shutting_down = False
 
 
+def _flush_delivery_ledger_before_exit() -> None:
+    """關閉前把【寄送帳本】還沒落地的變更補寫一次。
+
+    ★[2026-08-08 外審第 10 輪第 3 回 P2-2]★ 這裡原本只排空【動作稽核】帳本
+    (`_flush_ledger_before_exit`),寄送帳本完全沒被收尾 —— 而主程式是走
+    `os._exit(0)` 結束的,`atexit` 不會跑。寫回失敗用完有界重試之後,
+    那筆終局狀態就只留在記憶體,磁碟上還是 SUBMITTING。
+    """
+    try:
+        led = _alert_ledger_obj
+    except Exception:
+        return
+    if led is None:
+        return
+    try:
+        led.flush()
+    except Exception:
+        logging.debug("[delivery] 關閉前補寫寄送帳本失敗(忽略)", exc_info=True)
+
+
 def _flush_ledger_before_exit(timeout: float = _LEDGER_FLUSH_TIMEOUT_SEC) -> bool:
     """[codex P2] os._exit(0) 前把佇列中的稽核紀錄盡量寫完(daemon 緒會被直接砍掉)。
 
@@ -8398,17 +8418,39 @@ def _send_alert_email_via_smtp(subject: str, body: str,
     #   begin 在送出【之前】：送出當下斷電時，重啟後看到的是一筆待查的
     #   SUBMITTING，而不是「什麼都沒發生」。business_key 預設用主旨
     #   （止掛的主旨已含日期/診次/醫師，足以識別同一則事件）。
+    # ★[2026-08-08 外審第 10 輪 P2-07] Message-ID 要在寄之前就決定★
+    #   舊寫法完全不傳:`_build_message` 每次自己 `make_msgid()`,而帳本記的
+    #   `message_id` 是空字串。於是「結果不明」那一筆根本沒有東西可以拿去
+    #   Gmail 寄件備份回查 —— 而「回查收斂」正是我們對 UNKNOWN 的整套說法。
+    #   宣稱要對得上實作:先產生、同時交給帳本與信本身。
+    try:
+        from email.utils import make_msgid as _make_msgid
+        _msgid = _make_msgid()
+    except Exception:
+        _msgid = ""
     _led = _get_alert_ledger()
     _did = ""
     if _led is not None:
+        # ★business_key 要是【事件】的識別,不是主旨★
+        #   主旨含「目前人數」,人數一變就成了另一件事;而呼叫端本來就有一把
+        #   跨重啟去重用的 `notify_key`(含日期/診次/醫師)。兩邊用同一把鑰匙,
+        #   帳本才有機會跟去重機制對得起來。
         try:
             _did = _led.begin(business_key=business_key or f"alert:{subject}",
                               category=category or "clinical",
-                              recipients=list(recipients), subject=subject)
-            _led.mark_submitting(_did)
+                              recipients=list(recipients), subject=subject,
+                              message_id=_msgid)
         except Exception:
             logging.debug("[delivery] 登記止掛寄送失敗(略過)", exc_info=True)
             _did = ""
+        if _did:
+            try:
+                _led.mark_submitting(_did)
+            except Exception:
+                # 紀錄已經落地了 —— 不可以把 _did 丟掉,否則沒人會結案它,
+                # 磁碟上會留一筆永遠 PREPARED、其實已寄出的孤兒。
+                logging.warning("[delivery] 標記止掛 SUBMITTING 失敗(仍會結案)",
+                                exc_info=True)
 
     def _settle(**kw_settle):
         if not (_led is not None and _did):
@@ -8422,6 +8464,8 @@ def _send_alert_email_via_smtp(subject: str, body: str,
         # [2026-07-30 外審 P2-02] category 決定吃哪一份寄信配額。不傳＝臨床
         # （止掛提醒是這個 helper 的主要用途）；系統／除錯類的呼叫端自己標明。
         kw = {"category": category} if category else {}
+        if _msgid:
+            kw["message_id"] = _msgid
         refused = send_mail(recipients=recipients, subject=subject, body=body,
                             attachment_path=None, timeout=timeout, **kw) or {}
         _settle(refused=refused)
@@ -8450,9 +8494,15 @@ def _send_alert_email_via_smtp(subject: str, body: str,
         #   → 下一輪掃描再寄一次。但 UNKNOWN 的定義正是「伺服器可能已經收下」,
         #   於是醫師收到兩封(甚至每輪一封)同樣的止掛提醒。
         #
-        #   ★為什麼回 True(視為已寄)★ 經過 2026-08-07 的階段分流之後,
-        #   UNKNOWN 只在【DATA 已提交、等最終 250 逾時】時才成立 —— 那個時點
-        #   Gmail 幾乎必然已經收下。相較之下:
+        #   ★為什麼回 True(視為已寄)★
+        #   ★[2026-08-08 外審第 10 輪 P1-03] 這裡原本寫著「UNKNOWN 只在
+        #    【DATA 已提交】時才成立」—— 那句話當時【是假的】★:smtp_mail 的
+        #    `_submit` 包住的是整個 `send_message()`,連 MAIL FROM / RCPT TO
+        #    階段的逾時都被蓋上「已提交」的章,然後在這裡被當成已寄、永久去重。
+        #    現在 `_submit` 改用低階流程,ambiguous 的邊界真的落在 `data()` 上,
+        #    這句話才第一次成立。留著這段歷史,是因為「註解宣稱的性質，實作
+        #    未必真的有」正是這個專案反覆踩到的那個坑。
+        #   那個時點 Gmail 幾乎必然已經收下。相較之下:
         #     回 False → 幾乎一定重複寄(而且會每輪重複);
         #     回 True  → 只有在「真的沒送到」的少數情況才會漏一則。
         #   兩害相權取其輕,並且用 error 級別把它講清楚,讓人可以事後查證。
@@ -8957,6 +9007,7 @@ class AutomationApp:
                 # [codex P2] 稽核寫入緒是 daemon,行程退出會直接砍掉 → 重啟前剛入列的
                 # 動作紀錄會憑空消失。自動更新重啟很頻繁,這不是罕見路徑。
                 _flush_ledger_before_exit()
+                _flush_delivery_ledger_before_exit()
             except Exception:
                 logging.debug("[ledger] 重啟前排空例外(忽略)", exc_info=True)
             try:
@@ -9031,8 +9082,10 @@ class AutomationApp:
         # 寧可少等一下也不要丟稽核;但絕不可拖延關閉,故有硬逾時。
         try:
             _flush_ledger_before_exit()
+            _flush_delivery_ledger_before_exit()
         except Exception:
             logging.debug("[ledger] 關閉前排空例外(忽略)", exc_info=True)
+        _flush_delivery_ledger_before_exit()
         try:
             release_single_instance()
         except Exception:
@@ -14302,7 +14355,8 @@ class AutomationApp:
                                                                                 _warn_alert_has_no_recipients("行事曆止掛通知")
                                                                             if rcpts:
                                                                                 if _send_alert_email_via_smtp(
-                                                                                        subj, m, rcpts):
+                                                                                        subj, m, rcpts,
+                                                                                        business_key=f"alert:{nk}"):
                                                                                     self._mark_alert_email_sent(nk)
                                                                         except Exception:
                                                                             logging.warning("止掛提醒寄信例外", exc_info=True)
@@ -15051,7 +15105,8 @@ class AutomationApp:
         def _worker():
             # 寄送權已由呼叫端 _claim_alert_email 取得 → 這裡直接寄,寄成功才永久記號。
             try:
-                if _send_alert_email_via_smtp(subject, msg, list(recipients)):
+                if _send_alert_email_via_smtp(subject, msg, list(recipients),
+                                              business_key=f"alert:{nk}"):
                     self._mark_alert_email_sent(nk)
                     logging.info("[ALERT] 已寄遠期止掛提醒 %s(還有 %d 天,%d 人)",
                                  nk, days_left, count)
@@ -16385,7 +16440,9 @@ if __name__ == "__main__":
                     f"約 {eta_min} 分鐘後將自動重啟以釋放記憶體,請先存檔。")
             except Exception:
                 logging.debug("RAM 重啟前通知失敗", exc_info=True)
-        start_health_monitor("main", ram_warn_mb=500, ram_crit_mb=900,
+        start_health_monitor("main",
+                             pre_exit_callback=_flush_delivery_ledger_before_exit,
+                             ram_warn_mb=500, ram_crit_mb=900,
                               interval_sec=300, network_check=False,
                               auto_restart_on_crit=True,
                               crit_persistence_ticks=6,

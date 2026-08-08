@@ -4510,6 +4510,7 @@ class _DeliveryArtifact:
     html_body: str
     attachment: Any
     message_id: str
+    business_key: str = ""
 
 
 def _new_message_id() -> str:
@@ -4563,7 +4564,28 @@ def _materialize_shot(img):
     # 之後 _discard_undelivered_shot 還可能刪到別人正在用的那張。微秒+pid。
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     shot_path = SHOTS_DIR / f"consult_{stamp}_{os.getpid()}.png"
-    img.save(shot_path)
+    # ★[2026-08-08 外審第 10 輪 P1-04] 先寫暫存檔,成功才改名★
+    #   `img.save()` 是【先建檔再逐段寫入】。磁碟滿/IO 錯誤/編碼失敗時,
+    #   一個寫到一半的 PNG 已經留在磁碟上了 —— 而此刻 `_DeliveryArtifact`
+    #   還沒建立,`delivery` 仍是 None,收尾的 `_discard_undelivered_shot`
+    #   根本不知道有這個路徑可以刪。那是一張沒寄出去、沒人知道存在、
+    #   還原得出病人清單的畫面。
+    #   暫存檔用 `.part` 後綴:既有的 TTL 清掃只認 `consult_*.png`,
+    #   萬一連刪除都失敗,它也不會被誤認成一張正常截圖。
+    #   ★格式要明講★ PIL 是從【副檔名】推格式的,`.part` 它不認識,
+     #   會直接 ValueError —— 那會讓每一張截圖都存不了,比原本的問題嚴重
+     #   得多。(修正本身開了一個更大的洞,是這個專案反覆踩到的坑。)
+    part_path = shot_path.with_suffix(".png.part")
+    try:
+        img.save(part_path, format="PNG")
+        os.replace(part_path, shot_path)
+    except BaseException:
+        try:
+            part_path.unlink(missing_ok=True)
+        except Exception:
+            logging.warning("[shot] 截圖寫入失敗,殘檔也刪不掉:%s", part_path,
+                            exc_info=True)
+        raise
     logging.info("已存檔截圖（本輪確定要寄信）：%s", shot_path)
     return shot_path
 
@@ -4785,23 +4807,348 @@ def _get_ledger():
         return _ledger_obj
 
 
-def _delivery_begin(delivery, trigger_label: str) -> str:
-    """送出【之前】登記一筆。回 delivery_id（失敗回空字串）。"""
+def _flush_delivery_ledger() -> None:
+    """結束前把還沒落地的帳本變更補寫一次。
+
+    ★[2026-08-08 外審第 10 輪第 2 回 P2-3] atexit 在這裡不夠★
+    會診程式有兩條 `os._exit()` 出口(self-watchdog 強制重啟、托盤結束),
+    而 `os._exit` 不跑 atexit —— 帳本的「程式結束時會再試一次」在這支程式上
+    本來是一句空話。兩條出口各自明呼叫這裡。
+    """
+    try:
+        led = _ledger_obj
+    except Exception:
+        return
+    if led is None:
+        return
+    try:
+        led.flush()
+    except Exception:
+        logging.debug("[delivery] 結束前補寫帳本失敗", exc_info=True)
+
+
+def _consult_business_key(roster_texts, recipients, subject="") -> str:
+    """這一次寄送對應的【事件識別】。同一件事要得到同一把鑰匙。
+
+    ★[2026-08-08 外審第 10 輪 P2-07]★ 舊的 key 是 `consult:{主旨}`。
+    主旨裡有會變的東西(時間/筆數),同一批會診在另一分鐘重跑就成了另一件事;
+    反過來,兩天的主旨若剛好一樣又會撞在一起。改用【清單內容】當識別。
+
+    ★寄給誰也是識別的一部分★ 同一份清單寄給團隊、寄給 email 觸發的醫師本人,
+    是兩件不同的寄送(所以更新已通知基準的規則也不同)。
+
+    ★★不可以把病歷號寫進磁碟★★
+    `_consult_signature_from_roster` 回的是 `病歷號|日期|時間` 的集合 ——
+    那是病人識別資料,而帳本是會落地的 JSON 檔。所以這裡取的是它的雜湊:
+    「同一批會診會得到同一把鑰匙」這個性質完全保留,而檔案裡沒有任何一個
+    病歷號。收件人同理(那是內部信箱,但沒有理由多存一份)。
+
+    ★退化路徑也必須能分辨不同的事件★(外審第 10 輪第 2 回 P2-6)
+    上一版的退化 key 只有收件人雜湊 —— 於是【每一次】解析失敗的寄送,
+    不分日期、不分主旨,通通得到同一把鑰匙。稽核紀錄把不同事件混成一筆;
+    將來接成閘門的話,第一次寄送會把之後每一次「解析失敗」都擋掉。
+    (而且上一版的 docstring 寫著「退回主旨」,函式卻根本沒有 subject 參數 ——
+     宣稱與實作不符,又一次。)
+    現在退化 key = 主旨 + 日期的雜湊:同一個工作重試會得到同一把鑰匙,
+    不同日/不同主旨則分得開。主旨一樣雜湊(它不該含病人資料,但沒有理由
+    在會落地的檔案裡多留一份可讀文字)。
+    """
+    import hashlib  # noqa: PLC0415
+    audience = hashlib.sha256(json.dumps(
+        sorted(str(r) for r in (recipients or [])),
+        ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+    sig = None
+    try:
+        sig = _consult_signature_from_roster(roster_texts)
+    except Exception:
+        logging.debug("[delivery] 取會診簽章失敗 → business_key 退回主旨",
+                      exc_info=True)
+    if sig:
+        digest = hashlib.sha256(json.dumps(
+            sorted(str(x) for x in sig),
+            ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+        return f"consult:{digest}|{audience}"
+    stamp = hashlib.sha256(json.dumps(
+        [str(subject), datetime.now().strftime("%Y-%m-%d")],
+        ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+    return f"consult-unsigned:{stamp}|{audience}"
+
+
+_REFUSAL_RESEND_ATTEMPTS = 2      # 同一輪之內,最多再補寄兩次
+# ★跨輪的退避排程★(外審第 10 輪第 3 回 P1-1)
+#   信箱滿、greylisting 這類 4xx 不會在毫秒之間好起來,所以「同一輪連按兩次」
+#   幾乎必然全部失敗 —— 而失敗之後主流程照樣把已通知基準往前推,那位收件人
+#   就永久收不到這則臨床通知了。改成排進退避佇列,由後續輪次接手。
+_REFUSAL_RETRY_BACKOFF_SEC = (120.0, 600.0, 1800.0)   # 2 分 / 10 分 / 30 分
+_pending_refusal_retries: list = []
+_pending_refusal_lock = threading.Lock()
+
+
+def _schedule_refusal_retry(delivery, refused: dict, trigger_label: str,
+                            origin_did: str = "") -> None:
+    """把仍未送達的暫時性拒收排進退避佇列(由後續輪次的 `_drain_...` 處理)。
+
+    ★為什麼是記憶體佇列,不是持久化★(刻意,不是疏漏)
+    要跨重啟續傳就得把【信件內文】寫到磁碟上,而會診信的內文就是病人清單。
+    本專案的紅線是「不得存放病人明文」,所以這裡停在記憶體。程式重啟會忘掉
+    這些待補寄 —— 那不是無聲的:給不出去的時候會用 error 級別把「誰沒收到」
+    講清楚(見 `_give_up_on_refusals`),而不是假裝寄成功了。
+    """
+    with _pending_refusal_lock:
+        _pending_refusal_retries.append({
+            "delivery": delivery, "refused": dict(refused),
+            "trigger": trigger_label, "attempt": 0, "origin": origin_did,
+            "due_at": time.time() + _REFUSAL_RETRY_BACKOFF_SEC[0],
+        })
+    logging.warning("[delivery] %d 位收件人仍暫時被拒 → 排入退避重試(%.0f 分後)",
+                    len(refused), _REFUSAL_RETRY_BACKOFF_SEC[0] / 60.0)
+
+
+def _give_up_on_refusals(item) -> None:
+    """退避重試用完了。不可以無聲吞掉 —— 講清楚誰沒收到,並寄開發者告警。"""
+    who = sorted(str(a) for a in (item["refused"] or {}))
+    logging.error(
+        "[delivery] ★這幾位收件人始終沒收到會診通知★:%s(主旨:%s)。"
+        "已用完 %d 次退避重試;請確認對方信箱狀態(信箱滿/被暫時封鎖)",
+        ", ".join(who), item["delivery"].subject,
+        len(_REFUSAL_RETRY_BACKOFF_SEC))
+    _alert_missed_recipients(who, item["delivery"].subject, "退避重試用盡")
+
+
+_MISSED_ALERT_INTERVAL_SEC = 3600.0
+_missed_alert_at = 0.0
+
+
+def _alert_missed_recipients(who: list, subject: str, why: str) -> None:
+    """有人始終沒收到臨床通知 → 走【開發者告警】通道,不能只寫 log。
+
+    ★[2026-08-08 外審第 10 輪第 4 回 P1-1]★ 使用者不會去翻 log;
+    「沒收到」這件事不主動說,就永遠沒有人會知道。
+    """
+    global _missed_alert_at
+    now = time.time()
+    if now - _missed_alert_at < _MISSED_ALERT_INTERVAL_SEC:
+        return
+    _missed_alert_at = now
+    body = (f"以下收件人沒有收到會診通知:\n  {', '.join(who)}"
+            f"\n\n信件主旨:{subject}\n原因:{why}\n\n"
+            "SMTP 端是暫時性拒收(4xx,例如信箱容量已滿、被暫時封鎖),"
+            "程式已經重試過並放棄。請確認對方信箱狀態,必要時人工轉寄。")
+
+    def _worker():
+        global _missed_alert_at
+        try:
+            from cmuh_common.smtp_mail import send_mail  # noqa: PLC0415
+            send_mail(recipients=[str(r) for r in _developer_alert_recipients()],
+                      subject="會診自動化:有收件人沒收到會診通知",
+                      body=body, attachment_path=None, category="system")
+        except Exception:
+            _missed_alert_at = time.time() - _MISSED_ALERT_INTERVAL_SEC + 600
+            logging.warning("[delivery] 漏收告警寄送失敗(10 分鐘後重試)",
+                            exc_info=True)
+    try:
+        threading.Thread(target=_worker, name="ConsultMissedAlert",
+                         daemon=True).start()
+    except Exception:
+        logging.debug("[delivery] 漏收告警執行緒啟動失敗", exc_info=True)
+
+
+def _confirm_on_origin(origin_did: str, delivered: list) -> None:
+    """補寄送達了 → 把初次那一筆對應的收件人結成已送達。"""
+    if not origin_did or not delivered:
+        return
+    led = _get_ledger()
+    if led is None:
+        return
+    try:
+        done = led.confirm_recipients(origin_did, delivered)
+        if done:
+            logging.info("[delivery] 補寄成功,已回寫初次紀錄:%s",
+                         ", ".join(done))
+    except Exception:
+        logging.warning("[delivery] 回寫初次紀錄失敗(這幾位可能被誤報漏收):%s",
+                        ", ".join(sorted(delivered)), exc_info=True)
+
+
+_ABANDON_RETRY_AFTER_SEC = 3600.0     # 帳上掛超過一小時 → 明確結案 + 告警
+
+
+def _close_out_stale_recipient_retries(now=None) -> None:
+    """★重啟之後的那一半★(外審第 10 輪第 4 回 P1-1)
+
+    退避佇列在記憶體裡,程式一重啟就忘光 —— 那正是外審指出的缺口:
+    連「講清楚誰沒收到」的告警都不會執行,因為佇列已經隨 process 消失了。
+    但【帳本是落地的】:重啟之後 `needs_recipient_retry()` 仍然看得到
+    「這幾位還沒收到」。所以這裡負責把那一半接回來:掛太久的,明確結案
+    (帳本上改記成不再補寄)並告警。
+
+    ★為什麼不是重新把信寄出去★ 要重建那封信就得把【病人清單】寫到磁碟上,
+    而本專案不存病人明文。所以重啟後能做、也應該做的事是:讓人知道。
+    「送不到」變成一則有人看得到的告警,而不是一件沒有人知道的事。
+    """
+    led = _get_ledger()
+    if led is None:
+        return
+    now = now or time.time()
+    try:
+        pending = led.needs_recipient_retry()
+    except Exception:
+        logging.debug("[delivery] 讀取待補寄清單失敗", exc_info=True)
+        return
+    for did, _todo in pending:
+        try:
+            rec = led.get(did) or {}
+            if now - float(rec.get("created_at") or 0) < _ABANDON_RETRY_AFTER_SEC:
+                continue                       # 還在退避窗口內,交給佇列
+            gone = led.abandon_recipient_retry(
+                did, note="補寄未成功(可能跨越程式重啟)→ 已告警")
+            if gone:
+                logging.error("[delivery] ★帳上有始終沒收到的收件人★:%s(主旨:%s)",
+                              ", ".join(gone), rec.get("subject", ""))
+                _alert_missed_recipients(gone, str(rec.get("subject") or ""),
+                                         "補寄未成功(可能跨越程式重啟)")
+        except Exception:
+            logging.debug("[delivery] 結案待補寄 %s 失敗", did, exc_info=True)
+
+
+def _drain_pending_refusal_retries(now=None) -> None:
+    """到期的補寄各做一次。每一輪查詢開始時呼叫。
+
+    ★這是 `_resend_transient_refusals` 的跨輪版本★ 一樣只寄給被拒的那幾位、
+    一樣每次自己一筆帳與自己的 Message-ID。
+    """
+    now = now or time.time()
+    with _pending_refusal_lock:
+        due = [i for i in _pending_refusal_retries if i["due_at"] <= now]
+        for i in due:
+            _pending_refusal_retries.remove(i)
+    for item in due:
+        left = _resend_transient_refusals(item["delivery"], item["refused"],
+                                          item["trigger"],
+                                          origin_did=item.get("origin", ""))
+        if not left:
+            logging.info("[delivery] 退避重試成功,補寄完成")
+            continue
+        nxt = item["attempt"] + 1
+        if nxt >= len(_REFUSAL_RETRY_BACKOFF_SEC):
+            item["refused"] = left
+            _give_up_on_refusals(item)
+            continue
+        with _pending_refusal_lock:
+            _pending_refusal_retries.append({
+                **item, "refused": left, "attempt": nxt,
+                "due_at": now + _REFUSAL_RETRY_BACKOFF_SEC[nxt],
+            })
+
+
+def _resend_transient_refusals(delivery, refused: dict,
+                               trigger_label: str = "",
+                               origin_did: str = "") -> dict:
+    """把【暫時性】拒收的收件人補寄。回傳最後仍未送達的拒收 dict。
+
+    ★為什麼不是往上拋讓外層重試★ 外層重試會把整封信重寄給【所有】收件人,
+    已經收到的人就收到第二封。要補的是那幾個人,不是那封信。
+
+    ★永久拒收(5xx:位址打錯、帳號不存在)不補寄★ —— 重寄一百次也不會變好,
+    只是浪費配額;那要靠人去改收件人設定,所以留給既有的 error log 講清楚。
+
+    ★每一次補寄是【自己一筆】,有自己的 Message-ID★
+    (外審第 10 輪第 2 回 P2-7)上一版沿用初次的 Message-ID,理由是「對那些人
+    來說這是同一封信」。但那些人【一封都沒收到】,所以沒有重複的問題;
+    而沿用的代價是:將來拿這個 Message-ID 去 Gmail 寄件備份回查,找到的會是
+    初次寄送(它成功送達了 A),於是把 B 誤判成也送到了。
+    每一次補寄自己登記一筆、自己一個 Message-ID,回查才問得出正確答案。
+    """
+    from dataclasses import replace as _replace  # noqa: PLC0415
+    # ★常數要從那個模組拿★ 這裡原本寫死字面值 "transient",而
+    #   `classify_refusal` 回的是 `R_TRANSIENT`(= "transient_refused")——
+    #   永遠不相等,於是「補寄」這段程式碼一次都不會執行。守衛靜默失效,
+    #   而且測試若只驗「helper 存在」也照樣全綠。
+    from cmuh_common.delivery_ledger import (  # noqa: PLC0415
+        R_TRANSIENT, classify_refusal,
+    )
+    for _n in range(_REFUSAL_RESEND_ATTEMPTS):
+        targets = [addr for addr, info in (refused or {}).items()
+                   if classify_refusal(_refusal_code(info)) == R_TRANSIENT]
+        if not targets:
+            return refused
+        logging.warning("[delivery] 暫時性拒收 %d 位 → 只對這幾位補寄一次:%s",
+                        len(targets), ", ".join(sorted(targets)))
+        attempt = _replace(
+            delivery, recipients=tuple(sorted(targets)),
+            message_id=_new_message_id(),
+            business_key=f"{delivery.business_key}|retry{_n + 1}")
+        _rid = _delivery_begin(attempt, trigger_label, parent_id=origin_did)
+        try:
+            again = send_via_smtp(
+                attempt.attachment, attempt.subject, attempt.text_body,
+                list(attempt.recipients), html_body=attempt.html_body,
+                message_id=attempt.message_id) or {}
+        except DeliveryOutcomeUnknown:
+            _delivery_settle(_rid, unknown=True)
+            # ★不可以往上拋★ 初次那一筆的已知結果已經落地了;往上拋會讓
+            #   整個工作失敗、下一輪重跑整份清單,已收到的人再收一次。
+            logging.error("[delivery] 補寄結果不明(%d 位)→ 留在拒收清單待查",
+                          len(targets))
+            return refused
+        except Exception:
+            _delivery_settle(_rid, failed=True)
+            logging.warning("[delivery] 補寄暫時性拒收失敗,保留原拒收清單",
+                            exc_info=True)
+            return refused
+        _delivery_settle(_rid, refused=again)
+        # ★回寫初次那一筆★(外審第 10 輪第 5 回)
+        #   補寄是自己一筆,但「這位到底收到了沒有」的答案要回到【初次】。
+        #   不回寫的話,初次紀錄永遠掛著暫時被拒 → 一小時後
+        #   `_close_out_stale_recipient_retries` 把它判成始終漏收、寄告警 →
+        #   人工照著告警轉寄 = 醫師收到重複的臨床通知。
+        #   ★修正本身開的洞比原本的問題更難發現,所以特別記在這裡。★
+        _confirm_on_origin(origin_did, [a for a in targets if a not in again])
+        # 這一輪送達的人要從拒收清單裡拿掉;仍被拒的換成新的原因。
+        refused = {a: i for a, i in (refused or {}).items()
+                   if a not in targets}
+        refused.update(again)
+    return refused
+
+
+def _refusal_code(info):
+    """smtplib 的拒收值是 (code, msg);容錯地取出 code。"""
+    if isinstance(info, (tuple, list)) and info:
+        return info[0]
+    return info
+
+
+def _delivery_begin(delivery, trigger_label: str, parent_id: str = "") -> str:
+    """送出【之前】登記一筆。回 delivery_id（失敗回空字串）。
+
+    ★[2026-08-08 外審第 10 輪 P2-08] `mark_submitting` 失敗仍要回傳 did★
+    舊寫法把 begin 與 mark 包在同一個 try 裡,mark 失敗就回空字串 —— 那筆
+    【已經落地的 PREPARED】從此沒有人會去 settle 它,而信照樣寄出去了。
+    於是磁碟上留著一筆永遠停在 PREPARED、其實已送達的孤兒。
+    現在 mark 失敗只記 log,did 照樣回傳,終局狀態仍會寫回那一筆。
+    這也讓「陳舊的 PREPARED」有了單一明確的含意:**在送出之前就死了**,
+    因此可以安全地收斂成 FAILED（見 `converge_stale_prepared`）。
+    """
     led = _get_ledger()
     if led is None:
         return ""
     try:
         did = led.begin(
-            business_key=f"consult:{delivery.subject}",
+            business_key=delivery.business_key or f"consult:{delivery.subject}",
             category="consult",
             recipients=list(delivery.recipients),
             subject=delivery.subject,
-            message_id=delivery.message_id or "")
-        led.mark_submitting(did)
-        return did
+            message_id=delivery.message_id or "",
+            parent_id=parent_id)
     except Exception:
         logging.debug("[delivery] 登記寄送失敗(略過)", exc_info=True)
         return ""
+    try:
+        led.mark_submitting(did)
+    except Exception:
+        # 已經有一筆落地的紀錄了 —— 一定要把 did 交出去,否則沒人會結案它。
+        logging.warning("[delivery] 標記 SUBMITTING 失敗(仍會結案)", exc_info=True)
+    return did
 
 
 def _delivery_settle(delivery_id: str, *, refused=None,
@@ -4989,6 +5336,16 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
       - trigger_label == "email" 且無 override → 用 email_trigger_recipients
         （fallback，例如手動觸發或寄件人解析失敗）
       - 其他（排程／手動）→ 用 recipients（一般四人名單）"""
+    # ★到期的「補寄給被暫時拒收的收件人」先做★(外審第 10 輪第 3 回 P1-1)
+    #   放在拿 `_flow_lock` 之前:補寄不碰 HIS,不需要那把鎖,而且被鎖擋下的
+    #   輪次也應該讓補寄有機會發生(它跟這一輪查不查得到會診無關)。
+    try:
+        _drain_pending_refusal_retries()
+        # 帳上掛太久的(多半是跨越了程式重啟,記憶體佇列已消失)→ 明確結案 + 告警
+        _close_out_stale_recipient_retries()
+    except Exception:
+        logging.warning("[delivery] 處理待補寄時出錯(不影響本輪查詢)",
+                        exc_info=True)
     if not _flow_lock.acquire(blocking=False):
         logging.info("已有一個會診查詢任務進行中，本次（%s）略過", trigger_label)
         # ★[2026-07-30 外審第 1 輪] email 觸發的要排隊補跑,不可直接丟掉★
@@ -5279,6 +5636,8 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                         html_body=final_html,
                         attachment=_materialize_shot(shot),
                         message_id=_new_message_id(),
+                        business_key=_consult_business_key(
+                            roster_texts, recipients, subject),
                     )
                 if mail_method == "smtp":
                     # ★[2026-08-07 外審 AT/AW] 每一次寄送都進帳本★
@@ -5311,8 +5670,32 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                         _delivery_settle(_did, failed=True)
                         _did = ""
                         raise
+                    # ★先把【已知的】結果落地,再去補寄★
+                    #   (外審第 10 輪第 2 回 P2-7)舊寫法是補寄完才 settle,
+                    #   於是「補寄給 B 時結果不明」會讓整筆變成 UNKNOWN ——
+                    #   連【已經確定送達 A】這個事實都一起丟掉了。
+                    #   已知的事實要先寫下來,不能被後面的不確定性吃掉。
+                    _origin_did = _did
                     _delivery_settle(_did, refused=_refused)
                     _did = ""
+                    # ★[2026-08-08 外審第 10 輪 P1-01] 暫時性拒收要真的補寄★
+                    #   舊寫法把 refused 記進帳本就繼續往下走:更新已通知基準、
+                    #   任務記成功。那幾位收件人不但這一輪沒收到,下一輪也不會
+                    #   再寄(基準已經前進)——一則臨床通知就這樣永久消失,
+                    #   而 log 上是一次成功的寄送。
+                    _refused = _resend_transient_refusals(
+                        delivery, _refused, trigger_label,
+                        origin_did=_origin_did)
+                    # ★同一輪補不完的,不可以就這樣走人★(第 3 回 P1-1)
+                    #   下面馬上要更新「已通知基準」,一旦推進,這批會診就再也
+                    #   不會被寄給任何人了 —— 那幾位等於永久收不到。
+                    from cmuh_common.delivery_ledger import (  # noqa: PLC0415
+                        R_TRANSIENT as _RT, classify_refusal as _cls,
+                    )
+                    if any(_cls(_refusal_code(_i)) == _RT
+                           for _i in (_refused or {}).values()):
+                        _schedule_refusal_retry(delivery, _refused,
+                                                trigger_label, _origin_did)
                 else:
                     send_via_outlook(delivery.attachment, delivery.subject,
                                      delivery.text_body,
@@ -6370,6 +6753,7 @@ def _hard_exit(reason: str, code: int = 1) -> None:
                         pass
     except Exception:
         pass
+    _flush_delivery_ledger()
     _os._exit(code)
 
 
@@ -6948,6 +7332,7 @@ def exit_action(icon=None, item=None) -> None:
             pass
 
     def _shutdown() -> None:
+        _flush_delivery_ledger()
         try:
             release_single_instance()
         except Exception:
@@ -7162,7 +7547,10 @@ def main() -> None:
         # [穩定性] health monitor — RAM/網路/時鐘/硬碟 + 記憶體 leak 自動重啟 (A/E/F)
         try:
             from cmuh_common.health import start_health_monitor
-            start_health_monitor("consult", ram_warn_mb=200, ram_crit_mb=500,
+            # ★[外審第 10 輪第 3 回 P2-2] RAM 保護會直接 os._exit(1)★
+            #   那條路不跑 atexit —— 帳本裡還沒落地的終局狀態會消失。
+            start_health_monitor("consult", pre_exit_callback=_flush_delivery_ledger,
+                                 ram_warn_mb=200, ram_crit_mb=500,
                                   interval_sec=300, network_check=True,
                                   auto_restart_on_crit=True,  # [A] 連續 6 次 (~30 分) RAM 超 crit → os._exit
                                   crit_persistence_ticks=6)

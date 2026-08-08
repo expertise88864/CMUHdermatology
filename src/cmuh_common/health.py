@@ -185,7 +185,8 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
                   auto_restart_on_crit: bool,
                   crit_persistence_ticks: int,
                   disk_check_path: str,
-                  restart_callback=None, warn_callback=None) -> None:
+                  restart_callback=None, warn_callback=None,
+                  pre_exit_callback=None) -> None:
     """背景監看迴圈。"""
     logging.info(
         "[health/%s] monitor 啟動 — RAM warn=%dMB crit=%dMB interval=%ds "
@@ -271,6 +272,20 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
                         # 連續失敗達上限就停止自動重啟,只留一則 critical 交人工處理
                         # (本行程繼續跑 —— RAM 高雖差,但活著比消失好,這是既有取捨)。
                         restart_attempts += 1
+                        # ★[2026-08-08 外審第 10 輪第 4 回 P2-2]★
+                        #   `restart_callback` 成功時會【自己 os._exit】——
+                        #   所以下面那個 `pre_exit_callback` 分支永遠走不到。
+                        #   有帶 restart_callback 的行程(主程式)於是完全沒有
+                        #   收尾機會:寄送帳本的終局狀態留成 SUBMITTING。
+                        #   收尾要放在【呼叫 restart_callback 之前】。
+                        #   重啟失敗而繼續跑也無妨:flush 只寫還沒落地的東西。
+                        if pre_exit_callback is not None:
+                            try:
+                                pre_exit_callback()
+                            except Exception:
+                                logging.debug(
+                                    "[health/%s] pre_exit_callback 失敗", tag,
+                                    exc_info=True)
                         try:
                             restart_callback()   # 成功會自己結束本行程
                         except Exception:
@@ -290,6 +305,20 @@ def _health_loop(tag: str, ram_warn_mb: float, ram_crit_mb: float,
                                 tag, restart_attempts, _MAX_AUTO_RESTART_ATTEMPTS,
                                 crit_persistence_ticks)
                     else:
+                        # ★[2026-08-08 外審第 10 輪第 3 回 P2-2] 強制結束前先讓
+                        #   呼叫端收個尾★ `os._exit` 不跑 atexit,而這條路是
+                        #   「RAM 連續 critical → 直接砍掉本 process」——
+                        #   記在記憶體裡還沒落地的東西(例如寄送帳本的終局狀態)
+                        #   會就這樣消失。回呼自己要有上限,這裡只負責不讓它擋住結束。
+                        # ★`os._exit(1)` 必須留在 if 外面★ 沒有回呼時照樣要結束,
+                        #   否則 RAM 洩漏防護就整個失效了。
+                        if pre_exit_callback is not None:
+                            try:
+                                pre_exit_callback()
+                            except Exception:
+                                logging.debug(
+                                    "[health/%s] pre_exit_callback 失敗", tag,
+                                    exc_info=True)
                         os._exit(1)   # 無 callback:由外層 watchdog 接手重啟
             elif rss_mb >= ram_warn_mb:
                 consecutive_high_ram, consecutive_critical_ram = _next_ram_streaks(
@@ -376,7 +405,8 @@ def start_health_monitor(tag: str,
                           auto_restart_on_crit: bool = False,
                           crit_persistence_ticks: int = 6,
                           disk_check_path: Optional[str] = None,
-                          restart_callback=None, warn_callback=None) -> bool:
+                          restart_callback=None, warn_callback=None,
+                          pre_exit_callback=None) -> bool:
     """啟動 daemon thread 監看本 process 的健康度。
 
     tag: log 標籤 (e.g. "main", "consult", "autoclock")
@@ -405,7 +435,7 @@ def start_health_monitor(tag: str,
             target=_health_loop,
             args=(tag, ram_warn_mb, ram_crit_mb, interval_sec, network_check,
                   auto_restart_on_crit, crit_persistence_ticks, disk_check_path,
-                  restart_callback, warn_callback),
+                  restart_callback, warn_callback, pre_exit_callback),
             name=f"HealthMonitor-{tag}",
             daemon=True,
         )

@@ -58,17 +58,74 @@ def test_all_delivered_keeps_original_message(monkeypatch, caplog):
 
 
 def test_send_once_returns_refused_dict():
-    """來源守門:兩條寄送路徑(465 SSL / 587 STARTTLS)都要把回傳值傳出來。
+    """★行為★ 部分收件人被拒時,那份清單必須回到呼叫端手上。
 
-    [2026-08-07 外審 P1-02] 兩處重複的 `return server.send_message(msg) or {}`
-    已抽成共用的 `_submit(server)`(它同時負責標記「已提交」階段,供逾時分流用)。
-    不變量沒變:兩條路徑都必須把被拒清單傳回去。
+    ★[2026-08-08] 這個測試原本釘的是實作的【字串長相】★
+    它斷言原始碼裡有 `return server.send_message(msg) or {}`。於是外審第 10 輪
+    把 `_submit` 改成可觀測階段的低階流程(MAIL/RCPT/DATA 分開,才分得出
+    「伺服器還沒收到內容」與「已收到但沒回應」)之後,這個測試轉紅 ——
+    但它要守的那個不變量其實完全沒有被破壞。
+    測試釘住的應該是性質,不是實作長什麼樣子。改成【真的跑一次】。
     """
-    code = _code_only(inspect.getsource(sm._send_once))
-    assert code.count("return _submit(server)") == 2, \
-        "兩條路徑都要回傳被拒清單,不可丟掉"
-    assert "return server.send_message(msg) or {}" in code, \
-        "_submit 必須真的回傳 send_message 的被拒清單"
+    class _FakeServer:
+        """只長出 `_send_once` 真的會用到的那幾個方法。"""
+
+        def __init__(self):
+            self.data_called = False
+
+        def ehlo(self):
+            pass
+
+        def starttls(self, **kw):
+            pass
+
+        def login(self, *a):
+            pass
+
+        def ehlo_or_helo_if_needed(self):
+            pass
+
+        def mail(self, addr, opts):
+            return (250, b"ok")
+
+        def rcpt(self, addr, opts):
+            # 452 = 信箱滿(暫時性)。smtplib 對「只有一部分被拒」是正常返回。
+            return (452, b"mailbox full") if addr == "bad@x.com" else (250, b"ok")
+
+        def data(self, payload):
+            self.data_called = True
+            return (250, b"queued")
+
+    class _CtxOf:
+        """包成 `with smtplib.SMTP(...) as server` 的形狀。"""
+
+        def __init__(self, server):
+            self._s = server
+
+        def __enter__(self):
+            return self._s
+
+        def __exit__(self, *e):
+            return False
+
+    msg = sm._build_message("me@x.com", "我", ["ok@x.com", "bad@x.com"],
+                            "主旨", "內文")
+    cred = {"host": "h", "use_tls": True, "username": "u", "password": "p"}
+    for port, attr in ((465, "SMTP_SSL"), (587, "SMTP")):
+        srv = _FakeServer()
+        real = getattr(sm.smtplib, attr)
+        # 用預設引數把這一圈的 srv 綁進去(late binding 會讓每一圈都指到最後一個)
+        setattr(sm.smtplib, attr, lambda *a, _s=srv, **k: _CtxOf(_s))
+        try:
+            refused = sm._send_once(dict(cred, port=port), msg, 30.0)
+        finally:
+            setattr(sm.smtplib, attr, real)
+        assert srv.data_called, f"port={port}: 沒有真的送出郵件內容"
+        assert "bad@x.com" in refused, (
+            f"port={port}: ★部分被拒的收件人沒有回到呼叫端手上★ "
+            "那些人一封都沒收到，而 log 會寫「已寄出」")
+        assert "ok@x.com" not in refused, (
+            f"port={port}: 送達的人不該在拒收清單裡")
 
 
 # ── smtp:帳密檔暫時讀不到 ≠ 沒設定 ──────────────────────────────────────────

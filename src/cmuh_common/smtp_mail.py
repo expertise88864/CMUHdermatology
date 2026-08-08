@@ -283,21 +283,89 @@ def _send_once(cred: dict, msg, timeout: float) -> dict:
     use_tls = cred["use_tls"]
 
     def _submit(server):
-        """真正把信交出去的那一步 —— 從這裡開始「結果不明」才成立。
+        """把信交出去,而且【知道自己走到哪一步】。
 
-        ★[2026-08-07 外審 P1-02]★ 在此之前(連線/STARTTLS/登入)發生的逾時,
-        伺服器【確定】還沒收到任何郵件內容 → 那是可以安全重試的暫時性失敗。
-        上一版把所有 socket.timeout 一律當成 UNKNOWN 不重試,雖然堵住了重複
-        寄送,卻讓「連不上」這種最常見的暫時故障也不再重試。用例外身上的標記
-        把階段傳給呼叫端(不改 _send_once 簽名,既有的 monkeypatch 測試不受影響)。
+        ★[2026-08-08 外審第 10 輪 P1-03] 上一版把整段都當成「已提交」★
+        `server.send_message(msg)` 內部依序做 MAIL FROM → RCPT TO → DATA,
+        但它是一個黑盒:例外拋出來時無從得知走到哪一步。上一版對它的【任何】
+        例外都蓋上「已提交」的章,於是 MAIL/RCPT 階段的逾時 —— 伺服器【確定】
+        還沒收到任何郵件內容 —— 也變成「結果不明」。止掛提醒收到 UNKNOWN 的
+        處理是「視為已寄、不重寄」並永久去重,於是那則提醒這輩子都不會寄出。
+        (main.py 當時的註解甚至寫著「UNKNOWN 只在 DATA 已提交時才成立」——
+         那句話從來就不成立,因為這裡包住的是整個 send_message。)
+
+        改用 smtplib 的低階流程,ambiguous 的邊界就明確落在 `data()` 上,
+        而且逐位 RCPT 的拒收資訊也保留得下來(部分拒收補寄要靠它)。
+
+        ★仍然存在的一個保守面(誠實說明,不要當成已解決)★
+        `server.data()` 內部是「送 DATA 指令 → 等 354 → 送內容 → 等 250」。
+        等 354 時逾時的話,伺服器其實還沒收到內容,但從這一層分不出來,
+        所以一律當成結果不明。往「可能重複」的反方向壓,是因為漏寄一則
+        臨床通知比重複寄一則嚴重。
         """
+        from email import utils as _eutils  # noqa: PLC0415
+        from email.generator import BytesGenerator  # noqa: PLC0415
+        import io as _io  # noqa: PLC0415
+
+        from_addr = _eutils.parseaddr(msg["From"] or "")[1]
+        to_addrs = [a for _n, a in
+                    _eutils.getaddresses(msg.get_all("To", [])) if a]
+        if not from_addr or not to_addrs:
+            raise RuntimeError("信件缺少寄件者或收件人,拒絕送出")
+        buf = _io.BytesIO()
+        BytesGenerator(buf).flatten(msg, linesep="\r\n")
+        payload = buf.getvalue()
+
+        # ── 階段一:MAIL / RCPT ── 伺服器確定還沒收到郵件內容,失敗可安全重試
+        server.ehlo_or_helo_if_needed()
+        code, resp = server.mail(from_addr, [])
+        if code != 250:
+            try:
+                server.rset()
+            except Exception:
+                pass
+            raise smtplib.SMTPSenderRefused(code, resp, from_addr)
+        refused = {}
+        for addr in to_addrs:
+            code, resp = server.rcpt(addr, [])
+            if code not in (250, 251):
+                refused[addr] = (code, resp)
+        if len(refused) == len(to_addrs):
+            try:
+                server.rset()
+            except Exception:
+                pass
+            raise smtplib.SMTPRecipientsRefused(refused)
+
+        # ── 階段二:DATA ──
+        # `smtplib.SMTP.data()` 有三種結局,而且【形狀不一樣】:
+        #   ① 對 DATA 指令的回應不是 354 → raise SMTPDataError,
+        #      內容【還沒送出去】。這是確定失敗,4xx 可以安全重試。
+        #   ② 送完內容之後的最終回應不是 250 → 它【回傳】那個 tuple,
+        #      不會 raise。★上一版把回傳值丟掉了★ —— 伺服器明確拒絕
+        #      (554 / 451),我們卻回報成功、還把已通知基準往前推。
+        #   ③ 傳輸中斷(逾時/斷線)→ 其他例外。這一種才是真的結果不明。
+        # ★上一版把 ① 也蓋上「已提交」的章★ —— 止掛提醒於是把一封
+        #   【確定沒寄出】的信當成已寄、永久去重。那正是這一輪 P1-03
+        #   要修掉的病灶,我在修它的時候換個位置又做了一次。
         try:
-            return server.send_message(msg) or {}
+            code, resp = server.data(payload)
+        except smtplib.SMTPDataError:
+            raise                       # ① 內容還沒送出 → 不標記,可重試
         except BaseException as e:
-            # 已進 DATA/等最終回應 → 結果不明。用 setattr 掛在例外身上,
-            # 不改 _send_once 簽名(既有 monkeypatch 測試不受影響)。
-            setattr(e, SUBMITTED_ATTR, True)
+            setattr(e, SUBMITTED_ATTR, True)   # ③ 只有這一種是結果不明
             raise
+        if code != 250:
+            # ② 明確被拒。與 smtplib.sendmail 一致:421 就關掉,其餘 rset。
+            try:
+                if code == 421:
+                    server.close()
+                else:
+                    server.rset()
+            except Exception:
+                pass
+            raise smtplib.SMTPDataError(code, resp)
+        return refused
 
     if port == 465:
         # 純 SSL（少數人用）
@@ -461,6 +529,16 @@ def send_mail(recipients: list, subject: str, body: str,
                 raise DeliveryOutcomeUnknown(
                     f"SMTP 連線/送信逾時 ({int(timeout)}s) —— 結果不明,伺服器"
                     f"可能已收下;不重試以免重複寄出(配額不退回)：{e}") from e
+            # ★[2026-08-08 外審第 10 輪 P1-02] 不只逾時會落在 DATA 之後★
+            #   上一版只在 `isinstance(e, socket.timeout)` 那條分支裡看這個標記。
+            #   於是 DATA 送出後的 `SMTPServerDisconnected` / `ConnectionResetError`
+            #   (伺服器已收下、只是連線斷了)掉進下面的一般重試 —— 醫師會收到
+            #   兩封同樣的臨床通知。標記代表的是「走到哪一步」,與例外的型別無關。
+            if getattr(e, SUBMITTED_ATTR, False):
+                raise DeliveryOutcomeUnknown(
+                    f"SMTP 已送出郵件內容,但沒有收到最終回應就中斷 —— 結果不明,"
+                    f"伺服器可能已收下;不重試以免重複寄出(配額不退回):"
+                    f"{type(e).__name__}: {e}") from e
             if attempt < max_retries:
                 backoff = min(10, 2 * (2 ** attempt))  # 2s, 4s, 8s, 10s (capped)
                 logging.warning(
