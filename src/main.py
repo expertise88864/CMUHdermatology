@@ -12036,6 +12036,10 @@ class AutomationApp:
                 stopped=stopped,
                 error=error,
                 fetched=True,  # 已從 reg64 查到資料 → 浮動視窗才會依「有無醫師」決定隱藏
+                # ★[2026-08-09 #22] 這一筆是不是上次的快取★
+                #   主表格早就用同一個旗標顯示「已載入上次快取，等待更新」
+                #   (line 11752),浮窗卻把快取畫得跟即時的一模一樣。
+                stale=bool(result.get("from_cache")),
             )
         except Exception:
             logging.debug("[浮動門診] 擷取狀態失敗", exc_info=True)

@@ -230,10 +230,16 @@ def test_the_other_branches_behave_the_same(monkeypatch, _no_penalties,
     assert _no_penalties["circuit"] == [], f"{name}：本機問題卻記熔斷"
 
 
-# ★惠和【本來就】沒有熔斷器★（`_circuit_record_fail` 只出現在 east／huisheng／
-#   auh 三處）。那是這次修改【之前】就存在的不對稱，不是本批造成的 —— 這裡照
-#   實寫成期望值，不假裝它有；另開待辦追。把它寫成「應該有」會讓這支測試從第一
-#   天就紅，然後被加 skip，那道守衛就永遠不會再看一眼。
+# ★惠和沒有熔斷器是【刻意】的，不是漏抄★（2026-08-09 查證，原本我以為是漏抄）
+#   熔斷器來自 `d555f5c`「加 O36 **院外**熔斷器」。看四個來源的 host 就清楚了：
+#       東區   http://61.66.117.10/cgi-bin/fh1/…
+#       惠盛   http://61.66.117.10/cgi-bin/hs1/…   ← 與東區同一台
+#       亞大   https://appointment.auh.org.tw/…
+#       惠和   https://appointment.cmuh.org.tw/…   ← ★主院自己那台★
+#   有熔斷器的正好是三台【非主院】主機。惠和跑在主院自己的伺服器上，而主院已經
+#   有自己的 `sk_main` 退避 —— 給惠和加熔斷器等於讓一條 CGI 路徑去壓制主院自家
+#   主機的請求。**動守衛前先查前人是不是刻意不做**：這次查了 git log 與 URL 常數，
+#   結論是照現況釘住，不要「補齊」。
 _HAS_CIRCUIT = {"_fetch_huihe_reg52_html": False,
                 "_fetch_huisheng_reg52_html": True}
 

@@ -540,7 +540,15 @@ class DeliveryLedger:
         """卡在 SUBMITTING 超過一段時間的紀錄 —— 多半是上次送到一半就被砍。
 
         它們與 UNKNOWN 同樣需要回查，不可以直接當失敗重寄。
+
+        ★[2026-08-09] 與 `unresolved()` 同一套：先重讀、讀不到就拋★
+        帳本跨 process 共用，只讀自己的快照會漏掉別的 process 寫的紀錄；
+        而回空清單等於說「沒有卡住的」—— 把讀不到講成一個確定的答案。
         """
+        if not self._refresh_locked():
+            raise LedgerUnavailable(
+                "這一刻讀不到寄送帳本 → 列不出卡住的 SUBMITTING；"
+                "空清單會被誤解成「沒有卡住的」")
         cutoff = _now() - older_than_sec
         with self._lock:
             out = [dict(r) for r in self._records.values()
@@ -664,7 +672,19 @@ class DeliveryLedger:
         【初次】那一筆上已經記著了。兩邊都列的話,同一位收件人會被重複
         結案、重複告警,而帳上的待辦數也會隨補寄次數膨脹。
         初次那一筆才是這位收件人的權威狀態;補寄紀錄留作嘗試的軌跡。
+
+        ★[2026-08-09] 先從磁碟重讀★
+        帳本是【跨 process 共用】的:`main.py` 也會把「這幾位還沒收到」寫進同一
+        個檔。只讀自己記憶體裡的快照,別的 process 記下的待補寄收件人就永遠
+        不會被結案、也永遠不會告警 —— 那正是這個方法存在的理由。
+        (在會診程式裡它剛好排在 `unresolved()` 之後,於是「碰巧」是新的;
+         但那是靠另一個方法的副作用,不是這個方法自己的性質。)
+        讀不到就拋,不回空清單:空清單會被讀成「沒有人在等補寄」。
         """
+        if not self._refresh_locked():
+            raise LedgerUnavailable(
+                "這一刻讀不到寄送帳本 → 列不出待補寄的收件人；"
+                "空清單會被誤解成「沒有人在等補寄」")
         with self._lock:
             out = []
             for did, rec in self._records.items():

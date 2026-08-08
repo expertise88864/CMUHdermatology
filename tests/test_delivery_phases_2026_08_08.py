@@ -781,7 +781,13 @@ class TestAMissedRecipientSurvivesARestart:
         did = led.begin(business_key="k1", category="consult",
                         recipients=["ok@x.tw", "bad@x.tw"], subject="會診清單")
         led.settle(did, refused={"bad@x.tw": (452, b"full")})
+        # ★老化必須【落地】★（2026-08-09）
+        #   `needs_recipient_retry()` 現在會先從磁碟重讀（帳本跨 process 共用）。
+        #   只改記憶體裡的 `created_at` 會被重讀蓋回原值，這個 fixture 就等於
+        #   沒有老化 —— 測試量到的不是「掛太久的那一筆」。
         led._records[did]["created_at"] = dl._now() - age_sec
+        led._dirty.add(did)
+        led.flush()
         monkeypatch.setattr(cq, "_get_ledger", lambda: led)
         return led, did
 

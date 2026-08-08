@@ -345,3 +345,54 @@ class TestUnresolvedIsCrossProcess:
         n = cq._reconcile_unknown_deliveries(
             now=10_000.0, finder=lambda m: called.append(m) or False)
         assert (n, called) == (0, []), "讀不到帳本卻還是去回查/收斂了"
+
+
+    def test_the_other_readers_are_cross_process_too(self, tmp_path):
+        """★[2026-08-09] 同一個形狀的另外兩個讀取方法★
+
+        `needs_recipient_retry()` 被 `_close_out_stale_recipient_retries()` 用來
+        找「還沒收到的收件人」。只讀自己 process 的快照 → `main.py` 記下的
+        待補寄收件人永遠不會被結案、也永遠不會告警 —— 那正是那個方法存在的理由。
+
+        （在會診程式裡它剛好排在 `unresolved()` 之後而「碰巧」是新的，
+         但那是靠另一個方法的副作用，不是它自己的性質。）
+        """
+        path = str(tmp_path / "ledger.json")
+        a = self._led(path)
+        assert a.needs_recipient_retry() == []
+        b = self._led(path)
+        did = b.begin(business_key="k9", category="test",
+                      recipients=["ok@x.tw", "bad@x.tw"], subject="s")
+        b.mark_submitting(did)
+        b.settle(did, refused={"bad@x.tw": (452, b"full")})
+        assert [d for d, _ in b.needs_recipient_retry()] == [did]
+        assert [d for d, _ in a.needs_recipient_retry()] == [did], (
+            "★A 只看自己的記憶體快照★ 別的 process 記下的待補寄收件人"
+            "永遠不會被結案、也永遠不會告警")
+
+    def test_the_other_readers_raise_instead_of_returning_empty(
+            self, tmp_path, monkeypatch):
+        """★讀不到就拋★ 空清單會被讀成「沒有人在等補寄／沒有卡住的」。"""
+        from cmuh_common.delivery_ledger import LedgerUnavailable
+        led = self._led(str(tmp_path / "ledger.json"))
+        monkeypatch.setattr(type(led), "_refresh_locked", lambda self: False)
+        for fn in (led.needs_recipient_retry, led.stuck_submitting):
+            with pytest.raises(LedgerUnavailable):
+                fn()
+
+    def test_the_closeout_does_nothing_when_the_ledger_is_unreadable(
+            self, tmp_path, monkeypatch):
+        """★端對端★ 拋出去要被結案流程接住 —— 不可以變成未捕捉例外。"""
+        from cmuh_common.delivery_ledger import LedgerUnavailable
+        led = self._led(str(tmp_path / "ledger.json"))
+
+        def _boom(self):
+            raise LedgerUnavailable("讀不到")
+
+        monkeypatch.setattr(type(led), "needs_recipient_retry", _boom)
+        monkeypatch.setattr(cq, "_get_ledger", lambda: led)
+        alerts = []
+        monkeypatch.setattr(cq, "_alert_missed_recipients",
+                            lambda *a, **k: alerts.append(a))
+        cq._close_out_stale_recipient_retries()      # 不可以往上拋
+        assert alerts == [], "讀不到帳本卻還是告警了（會誤報漏收）"

@@ -60,9 +60,18 @@ class RoomStatus:
     stopped: bool = False          # 未開診
     error: bool = False            # 查詢失敗 / 連線錯誤
     fetched: bool = False          # 是否已從 reg64 查到過資料(False=還沒輪到)
+    # ★[2026-08-09 任務 #22] 這一筆是不是【上次的快取】★
+    #   浮動視窗原本沒有「快取／即時」的概念:主表格早就用 `result["from_cache"]`
+    #   標了「已載入上次快取，等待更新」,而浮窗把快取的燈號畫得跟即時的一模一樣。
+    #   醫師瞥一眼看到的是一個【看起來就是現在】的號碼,實際可能是幾分鐘前、
+    #   甚至是上一節門診留下的。★宣稱要對得上實際知道的事★。
+    stale: bool = False
 
 
 _PLACEHOLDER_LIGHT = {"--", "—", "休", "0", ""}
+
+# 「這一筆是上次的快取」的卡片警語(寬度量測與繪製共用同一個字串)
+_STALE_NOTE = "· 上次快取，等待更新"
 
 # [2026-06-25 user] 各時段「未開診(stopped)」過了開診時間還沒開 → 視為今天這診不會開了 → 隱藏。
 # 在那之前先顯示「未開診」,讓使用者知道今天有排這診。取不到時段對照(空/未知時段)→ 不靠這條藏。
@@ -127,9 +136,14 @@ def slot_color(slot: str) -> str:
 
 
 def room_card_view(s: RoomStatus) -> dict:
-    """RoomStatus → 卡片顯示字串 dict(title/doctor/light/waiting/state)。純函式。
+    """RoomStatus → 卡片顯示字串 dict(title/doctor/light/waiting/state/stale)。純函式。
 
     state: open / closed / stopped / error — 決定燈號區塊的文字與顏色。
+    stale: 這一筆是上次的快取(不是這一輪查到的)→ 顯示層要讓人看得出來。
+
+    ★[2026-08-09 #22] `stale` 只在真的有燈號可看時才有意義★
+    「離線／未開診／關診」本來就沒有在宣稱一個即時號碼,再標一次「舊資料」
+    只是雜訊。所以只有 `state == "open"` 時才把它傳下去。
     """
     if s.error:
         light, waiting, state = "離線", "—", "error"
@@ -153,6 +167,7 @@ def room_card_view(s: RoomStatus) -> dict:
         "light": light,
         "waiting": waiting,
         "state": state,
+        "stale": bool(s.stale) and state == "open",
     }
 
 
@@ -285,6 +300,16 @@ class ClinicFloatingWindow:
     _DEFAULT_W = 242
     _MIN_W = 206            # 要夠寬讓「燈號 + 待診 pill」不重疊(舊版太窄 → 格式跑掉)
     _CARD_H_OPEN = 90      # 看診中卡片高(燈號放大)
+    # ★[2026-08-09 外審 P2] 「上次快取」那行要有自己的一列★
+    #   第一版把它畫在 (pad, 74),而 32pt 的燈號畫在 (pad, 58)、同一個 x ——
+    #   兩者的字框重疊,而且燈號【後畫】會蓋掉警語開頭;高 DPI 只會更糟。
+    #   ★正好在最需要它的時候被蓋掉★。所以:排版數字全部由下面這幾個常數
+    #   算出來(不是各處手寫),而且卡片為它長高。
+    _LIGHT_ROW_Y = 58          # 燈號(hero)的垂直中心
+    # 32pt 字在 96dpi 約 43px 高;取 34 當【半高上界】,涵蓋 150% DPI 縮放。
+    _LIGHT_HALF_H = 34
+    _STALE_ROW_Y = _LIGHT_ROW_Y + _LIGHT_HALF_H + 4     # 警語列的垂直中心
+    _CARD_H_OPEN_STALE = _STALE_ROW_Y + 14              # 看診中 + 警語列的卡片高
     _CARD_H_DIM = 68       # 未開診/關診/離線卡片高(要夠高,否則狀態字會疊到上排)
     _CARD_PADY = 7         # 卡片間距
     _TIME_ROW_H = 78       # 目前時間列高度【後備值】(日期 + 時:分:秒兩行);實際以 winfo_reqheight 量測
@@ -546,6 +571,16 @@ class ClinicFloatingWindow:
             pass
         return self._TIME_ROW_H
 
+    def _card_h(self, v: dict) -> int:
+        """這張卡片要多高。★只有這一個地方算★
+
+        `_build_card` 與 `_content_height` 以前各寫一次三元式 —— 一改就會漂,
+        而漂掉的樣子是「視窗高度與卡片總高對不上」:最後一張被裁掉或多一塊黑。
+        """
+        if v["state"] != "open":
+            return self._CARD_H_DIM
+        return self._CARD_H_OPEN_STALE if v.get("stale") else self._CARD_H_OPEN
+
     def _content_height(self, visible: list) -> int:
         """依顯示的卡片數【直接算】內容高(不靠整窗 winfo_reqheight,更穩、不會虛高/被裁)。
         含最上方「目前時間」列(_time_row_height 量測);無開診時也保留時間列。"""
@@ -554,8 +589,7 @@ class ClinicFloatingWindow:
             return 64 + time_h
         total = 2 + 12 + time_h  # 外框(1+1) + body pady(6+6) + 時間列
         for s in visible:
-            is_open = room_card_view(s)["state"] == "open"
-            total += (self._CARD_H_OPEN if is_open else self._CARD_H_DIM) + self._CARD_PADY
+            total += self._card_h(room_card_view(s)) + self._CARD_PADY
         return total
 
     def _content_width(self, visible: list) -> int:
@@ -579,6 +613,9 @@ class ClinicFloatingWindow:
             else:
                 bottom = pad + f["light_sm"].measure(v["light"]) + pad
             need = max(need, int(top) + 14, int(bottom) + 14)  # +14 = 卡片→視窗
+            if v["stale"]:
+                # 警語自己一列 → 它的寬度也要算進去,否則會被視窗右緣裁掉
+                need = max(need, pad + int(f["tag"].measure(_STALE_NOTE)) + pad + 14)
         return int(need)
 
     def _render(self) -> None:
@@ -711,7 +748,7 @@ class ClinicFloatingWindow:
         is_open = state == "open"
         slot = (s.slot or "").strip()
         cw = self._card_width()
-        ch = self._CARD_H_OPEN if is_open else self._CARD_H_DIM
+        ch = self._card_h(v)
         pad = 13
 
         cv = tk.Canvas(parent, width=cw, height=ch, bg=_WIN_BG,
@@ -741,8 +778,10 @@ class ClinicFloatingWindow:
         # 燈號用 anchor="w"(左、垂直置中)固定在上排【下方】,不會疊到上排(舊版用
         # 底部對齊在矮卡片上會與上排重疊 → 排版跑掉)。
         light_fg = accent if is_open else (_ERR_FG if state == "error" else _LIGHT_DIM)
+        if v["stale"]:
+            light_fg = _LIGHT_DIM      # 舊資料不用飽和色，見上面的說明
         if is_open:
-            ly = 58
+            ly = self._LIGHT_ROW_Y
             cv.create_text(pad, ly, text=v["light"], fill=light_fg,
                            anchor="w", font=f["light_big"])
             lbl_w = f["wait_lbl"].measure("待診")
@@ -758,3 +797,8 @@ class ClinicFloatingWindow:
         else:
             cv.create_text(pad, 47, text=v["light"], fill=light_fg,
                            anchor="w", font=f["light_sm"])
+        if v["stale"]:
+            # ★舊資料要看得出來★ 燈號照樣顯示(有總比沒有好),但要有一行說它是
+            #   什麼時候的;畫在【自己的一列】,不會被 32pt 的燈號蓋掉。
+            cv.create_text(pad, self._STALE_ROW_Y, text=_STALE_NOTE,
+                           fill=_SUB, anchor="w", font=f["tag"])
