@@ -188,6 +188,7 @@ def _fetch_east_district_reg52_html(session, doc_no: str, doctor_name: str):
     session = session or _get_thread_local_reg52_external_session()
     last_error = None
     last_semantic = None
+    local_fault = None
     for docname_q in variants:
         url = f"{EAST_DISTRICT_REG52_URL}?DocNo={dparam}&Docname={docname_q}"
         if url in seen_urls:
@@ -206,7 +207,14 @@ def _fetch_east_district_reg52_html(session, doc_no: str, doctor_name: str):
                 _source_backoff_success(source_key)
                 _circuit_record_success("east")
                 return outcome.usable_html
-            last_semantic = outcome
+            # ★[2026-08-08 外審 P2-01] 只有該算在遠端頭上的才進 last_semantic★
+            #   LOCAL_ERROR(我們自己的 bs4/lxml 壞掉)不記 backoff、不記熔斷:
+            #   否則本機環境一壞,健康的遠端主機會被擋掉數十分鐘,而 log 上
+            #   寫的是「主機連續失敗」—— 查的人會往遠端查。
+            if outcome.blames_remote:
+                last_semantic = outcome
+            else:
+                local_fault = outcome
             logging.info("東區主機回應不是掛號表: %s %s → %s",
                          doctor_name, dparam, outcome.describe())
         except requests.exceptions.RequestException as e:
@@ -226,6 +234,9 @@ def _fetch_east_district_reg52_html(session, doc_no: str, doctor_name: str):
         if _circuit_record_fail("east"):
             logging.warning("[O36] 東區主機連續失敗 %d 次 → 暫停嘗試 %d 分鐘，之後自動半開重試",
                             _CIRCUIT_BREAKER_THRESHOLD, _CIRCUIT_BREAKER_RESET_MIN)
+    if local_fault is not None and last_semantic is None and last_error is None:
+        logging.error("[本機] 東區掛號表無法判定:%s —— ★這是本機環境的問題★,"
+                      "不記遠端 backoff/熔斷", local_fault.describe())
     logging.warning(f"無法自東區主機取得掛號表: {doctor_name} ({dparam})")
     return None
 
@@ -258,6 +269,7 @@ def _fetch_huihe_reg52_html(session, doc_no: str, doctor_name: str):
     session = session or _get_thread_local_reg52_external_session()
     last_error = None
     last_semantic = None
+    local_fault = None
     for docname_q in variants:
         url = f"{HUIHE_REG52_URL}?DocNo={dparam}&Docname={docname_q}"
         if url in seen_urls:
@@ -275,7 +287,14 @@ def _fetch_huihe_reg52_html(session, doc_no: str, doctor_name: str):
                 logging.info(f"已自惠和 wh1 取得掛號表: {doctor_name} ({dparam})")
                 _source_backoff_success(source_key)
                 return outcome.usable_html
-            last_semantic = outcome
+            # ★[2026-08-08 外審 P2-01] 只有該算在遠端頭上的才進 last_semantic★
+            #   LOCAL_ERROR(我們自己的 bs4/lxml 壞掉)不記 backoff、不記熔斷:
+            #   否則本機環境一壞,健康的遠端主機會被擋掉數十分鐘,而 log 上
+            #   寫的是「主機連續失敗」—— 查的人會往遠端查。
+            if outcome.blames_remote:
+                last_semantic = outcome
+            else:
+                local_fault = outcome
             logging.info("惠和回應不是掛號表: %s %s → %s",
                          doctor_name, dparam, outcome.describe())
         except requests.exceptions.RequestException as e:
@@ -291,6 +310,9 @@ def _fetch_huihe_reg52_html(session, doc_no: str, doctor_name: str):
             REG52_EXTERNAL_BACKOFF_MAX_SECONDS,
         )
         logging.warning(f"[BACKOFF] huihe fetch fail {doctor_name} {doc_no}, fail={cnt}, delay={delay:.1f}s")
+    if local_fault is not None and last_semantic is None and last_error is None:
+        logging.error("[本機] 惠和掛號表無法判定:%s —— ★這是本機環境的問題★,"
+                      "不記遠端 backoff/熔斷", local_fault.describe())
     logging.warning(f"無法自惠和取得掛號表: {doctor_name} ({dparam})")
     return None
 
@@ -325,6 +347,7 @@ def _fetch_huisheng_reg52_html(session, doc_no: str, doctor_name: str):
     session = session or _get_thread_local_reg52_external_session()
     last_error = None
     last_semantic = None
+    local_fault = None
     for docname_q in variants:
         url = f"{HUISHENG_REG52_URL}?DocNo={dparam}&Docname={docname_q}"
         if url in seen_urls:
@@ -343,7 +366,14 @@ def _fetch_huisheng_reg52_html(session, doc_no: str, doctor_name: str):
                 _source_backoff_success(source_key)
                 _circuit_record_success("huisheng")
                 return outcome.usable_html
-            last_semantic = outcome
+            # ★[2026-08-08 外審 P2-01] 只有該算在遠端頭上的才進 last_semantic★
+            #   LOCAL_ERROR(我們自己的 bs4/lxml 壞掉)不記 backoff、不記熔斷:
+            #   否則本機環境一壞,健康的遠端主機會被擋掉數十分鐘,而 log 上
+            #   寫的是「主機連續失敗」—— 查的人會往遠端查。
+            if outcome.blames_remote:
+                last_semantic = outcome
+            else:
+                local_fault = outcome
             logging.info("惠盛回應不是掛號表: %s %s → %s",
                          doctor_name, dparam, outcome.describe())
         except requests.exceptions.RequestException as e:
@@ -362,6 +392,9 @@ def _fetch_huisheng_reg52_html(session, doc_no: str, doctor_name: str):
         if _circuit_record_fail("huisheng"):  # [O36]
             logging.warning("[O36] 惠盛主機連續失敗 %d 次 → 暫停嘗試 %d 分鐘，之後自動半開重試",
                             _CIRCUIT_BREAKER_THRESHOLD, _CIRCUIT_BREAKER_RESET_MIN)
+    if local_fault is not None and last_semantic is None and last_error is None:
+        logging.error("[本機] 惠盛掛號表無法判定:%s —— ★這是本機環境的問題★,"
+                      "不記遠端 backoff/熔斷", local_fault.describe())
     logging.warning(f"無法自惠盛取得掛號表: {doctor_name} ({dparam})")
     return None
 
@@ -403,6 +436,14 @@ def _fetch_auh_reg52_html(session, doctor_name):
         #   維護頁被當成健康的成功頁，還把熔斷器重置了；壞頁進了快取還會在
         #   TTL 內一直被拿來用，把上一份好資料蓋掉。
         outcome = _classify_auh_html(r.text)
+        if not outcome.ok and not outcome.blames_remote:
+            # ★[2026-08-08 外審 P2-01] 錯在本機,不記遠端★
+            #   `parser_unavailable`(bs4/lxml 壞掉)以前走下面那條 → 指數退避
+            #   加熔斷把一台健康的主機擋掉數十分鐘,而且 log 指向遠端。
+            logging.error("[本機] 亞大掛號表無法判定: %s (%s) → %s"
+                          " —— ★這是本機環境的問題★,不記遠端 backoff/熔斷",
+                          doctor_name, doc_no, outcome.describe())
+            return ""
         if not outcome.ok:
             logging.warning("亞大附醫回應不是掛號表: %s (%s) → %s",
                             doctor_name, doc_no, outcome.describe())

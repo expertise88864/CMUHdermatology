@@ -7301,14 +7301,26 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                         #   消失＝★停診的診次被顯示成正常門診★。
                         _do = _classify_dayoff_html(hd)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         if not _do.ok:
-                            logging.warning(
-                                "休診表回應不是 reg52 頁（%s）→ 不寫快取、記退避",
-                                _do.describe())
-                            _source_backoff_fail(
-                                sk_dayoff,  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
-                                REG52_EXTERNAL_BACKOFF_BASE_SECONDS,
-                                REG52_EXTERNAL_BACKOFF_MAX_SECONDS,
-                            )
+                            # ★[2026-08-08 外審 P1] 本機的錯不記在遠端頭上★
+                            #   `parser_unavailable`(bs4/lxml 壞掉)是 LOCAL_ERROR:
+                            #   一樣不寫快取、一樣退回 stale,但【不累加退避】——
+                            #   否則我們自己的環境壞掉會把健康的主機擋掉數十分鐘,
+                            #   而 log 指向遠端。
+                            if _do.blames_remote:
+                                logging.warning(
+                                    "休診表回應不是 reg52 頁（%s）→ 不寫快取、記退避",
+                                    _do.describe())
+                                _source_backoff_fail(
+                                    sk_dayoff,  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
+                                    REG52_EXTERNAL_BACKOFF_BASE_SECONDS,
+                                    REG52_EXTERNAL_BACKOFF_MAX_SECONDS,
+                                )
+                            else:
+                                degraded_sources.add("dayoff")  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
+                                logging.error(
+                                    "[本機] 休診表無法判定（%s）→ 不寫快取、"
+                                    "★不取得止掛寄信資格★（不記遠端退避）",
+                                    _do.describe())
                             stale = _reg52_stale_fallback(dayoff_cache_key, "dayoff", degraded_sources)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                             return (stale or ""), int((time.perf_counter() - t0) * 1000), False
                         _cache_set(dayoff_cache_key, hd)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
@@ -7385,14 +7397,22 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                             # ★[2026-08-02 外審 P1-03] 同上：先驗語意再寫快取★
                             _do = _classify_dayoff_html(html_dayoff)
                             if not _do.ok:
-                                logging.warning(
-                                    "休診表回應不是 reg52 頁（%s）→ 不寫快取、記退避",
-                                    _do.describe())
-                                _source_backoff_fail(
-                                    sk_dayoff,
-                                    REG52_EXTERNAL_BACKOFF_BASE_SECONDS,
-                                    REG52_EXTERNAL_BACKOFF_MAX_SECONDS,
-                                )
+                                # ★[2026-08-08 外審 P1] 同上:本機的錯不記遠端★
+                                if _do.blames_remote:
+                                    logging.warning(
+                                        "休診表回應不是 reg52 頁（%s）→ 不寫快取、記退避",
+                                        _do.describe())
+                                    _source_backoff_fail(
+                                        sk_dayoff,
+                                        REG52_EXTERNAL_BACKOFF_BASE_SECONDS,
+                                        REG52_EXTERNAL_BACKOFF_MAX_SECONDS,
+                                    )
+                                else:
+                                    degraded_sources.add("dayoff")
+                                    logging.error(
+                                        "[本機] 休診表無法判定（%s）→ 不寫快取、"
+                                        "★不取得止掛寄信資格★（不記遠端退避）",
+                                        _do.describe())
                                 html_dayoff = _reg52_stale_fallback(
                                     dayoff_cache_key, "dayoff", degraded_sources) or ""
                             else:
@@ -7413,22 +7433,49 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                         logging.warning(f"[BACKOFF] dayoff fetch fail {doctor_name} {doc_no}, fail={cnt}, delay={delay:.1f}s")
                 source_timing["dayoff_fetch_ms"] = int((time.perf_counter() - t_dayoff) * 1000)
 
-            soup_main = BeautifulSoup(html_main, 'lxml')
+            # ★[2026-08-08 外審 P1] 解析器壞掉不可以繞過 LOCAL_ERROR★
+            #   這一行原本是【無條件、而且排在分類之前】的:lxml 裝壞時它先丟
+            #   例外,於是 `_classify_main_html` 的 LOCAL_ERROR 判定、以及
+            #   「這是本機問題」的 log,一個都跑不到 —— 例外往上被當成一般抓取
+            #   失敗處理(而那條路是會記遠端退避的)。
+            #   壞掉時 `soup_main = None`,兩個使用點各自守住。
+            try:
+                soup_main = BeautifulSoup(html_main, 'lxml')
+            except Exception:
+                # ★同上★ 主表沒解析成功 = 這一輪不是完整的即時資料。
+                degraded_sources.add("main")
+                logging.error("[本機] 主院頁面解析器不可用 → 本輪不解析主院、"
+                              "★不取得止掛寄信資格★（不記遠端退避）",
+                              exc_info=True)
+                soup_main = None
             parsed = _parse_cache_get("main", html_main)
-            if parsed is None:
+            if parsed is not None:
+                source_timing["main_parse_ms"] = 0
+                source_timing["cache_hit_parse"] += 1
+            elif soup_main is not None:
                 t_parse = time.perf_counter()
                 parsed = _parse_main_hospital_schedule(soup_main)
                 _parse_cache_set("main", html_main, parsed)
                 source_timing["main_parse_ms"] = int((time.perf_counter() - t_parse) * 1000)
             else:
+                # ★不可以記成 cache_hit★ 沒命中快取，也沒解析 —— 是本機解析器
+                #   不可用。把它算進命中率會讓那個數字說謊。
                 source_timing["main_parse_ms"] = 0
-                source_timing["cache_hit_parse"] += 1
             # ★[2026-08-02 外審 P1] 解析完才決定「這頁算不算數」★
             if main_fetched_fresh:
                 main_outcome = _classify_main_html(html_main)
                 if main_outcome.ok:
                     _cache_set(cache_main_key, html_main)
                     _source_backoff_success(sk_main)
+                elif not main_outcome.blames_remote:
+                    # ★[2026-08-08 外審 P1] 本機的錯不記在遠端頭上★
+                    #   一樣不寫快取(下一輪重新連線),但不累加退避 ——
+                    #   主院的退避還會連帶擋掉後面的分院抓取。
+                    degraded_sources.add("main")
+                    logging.error("[本機] 主院掛號表無法判定: %s (%s) → %s"
+                                  " → 不寫快取、★不取得止掛寄信資格★"
+                                  "（不記遠端退避）",
+                                  doctor_name, doc_no, main_outcome.describe())
                 else:
                     # ★不寫快取★ 讓下一輪真的重新連線，而不是重解析同一份壞頁。
                     logging.warning("主院回應不是掛號表: %s (%s) → %s",
@@ -7441,6 +7488,51 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                     logging.warning("[BACKOFF] main semantic-invalid %s %s, "
                                     "fail=%s, delay=%.1fs",
                                     doctor_name, doc_no, cnt, delay)
+            # ★[2026-08-08 外審第 3 輪 P1] 休診表要在「漸進式送出」之【前】解析★
+            #   UI 端有 `[CACHE_PROTECT]`:錯誤結果遇到已有資料會被略過。所以只要
+            #   先送出這份【還沒併休診覆蓋】的半套班表,後面再送錯誤結果也蓋不掉它
+            #   —— ★停診的診次就這樣留在畫面上被顯示成正常門診★。
+            #   解析放到送出之前:補不完的那一輪在【還沒發布任何東西】時就收手。
+            # ★[2026-08-08 外審 P1] 同一個形狀:解析器不可用時不要炸在這裡★
+            #   休診表【走快取進來】的輪次不會再分類一次(它當初就是通過判定才
+            #   存進去的),所以 LOCAL_ERROR 那條路擋不到這一行。lxml 壞掉時
+            #   `BeautifulSoup` 是 None → TypeError 往上竄,被當成一般抓取失敗。
+            #   休診資料拿不到就當「沒有休診覆蓋」——與這一行原本 `html_dayoff`
+            #   為空時的行為一致。
+            dayoff_data = {}
+            if html_dayoff:
+                try:
+                    dayoff_data = _parse_doctor_info_dayoff(
+                        BeautifulSoup(html_dayoff, "lxml"))
+                except Exception:
+                    # ★[2026-08-08 外審第 2 輪 P1] 這是我上一回修出來的新問題★
+                    #   上一版只是 log 一句就往下走,`dayoff_data` 留在 `{}` ——
+                    #   於是「解析不了休診表」被當成「這位醫師沒有休診」,而且
+                    #   結果照樣以 `is_live_final=True` 發布:
+                    #     ★停診的診次被顯示成正常門診★,而且取得止掛寄信資格。
+                    #   把漏報換成假平安,比原本的誤罰遠端更糟。
+                    #   ① 標記降級 → 這一輪絕不可能是 live_final;
+                    #   ② 有上一份完整快取就用它(那份是併過休診覆蓋的),
+                    #      不要拿這一輪半套的東西去覆蓋畫面。
+                    # ★[2026-08-08 外審第 3 輪 P1] 只擋寄信資格【還不夠】★
+                    #   上一版沒有完整快取時仍然往下走,把【沒有休診覆蓋】的
+                    #   班表發到畫面上 —— 止掛提醒是不寄了,但★停診的診次照樣
+                    #   被顯示成正常門診★,醫師看到的是錯的。
+                    #   這一輪的班表【不完整而且無法補全】,所以:
+                    #     ① 有上一份併過休診覆蓋的完整快取 → 用它;
+                    #     ② 沒有 → 送錯誤結果,不發布這份半套班表。
+                    #   兩條路都不記遠端退避(錯在本機)。
+                    degraded_sources.add("dayoff")
+                    logging.error("[本機] 休診表解析器不可用 → ★不套用休診覆蓋、"
+                                  "不發布這一輪的班表★（不記遠端退避）",
+                                  exc_info=True)
+                    if _emit_cached_appointments("休診表解析器不可用"):
+                        return
+                    put_ui_message(ui_queue, UiClinicDataMessage(
+                        doctor_name=doc_no,
+                        data={"error": "休診表解析失敗（本機），暫無完整班表"}))
+                    return
+
             if parsed:
                 _merge_appointments_by_date(appointments_by_date, parsed)
                 # 先回主院資料，分院/亞大再補齊（漸進更新）
@@ -7560,7 +7652,9 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                     _merge_appointments_by_date(appointments_by_date, parsed_east)
             else:
                 # 東區主機失敗時仍嘗試主院內嵌週表（FrontPage_Form1）
-                parsed_branch = _parse_branch_schedule(soup_main)
+                # soup_main 可能是 None(本機解析器不可用) —— 見上面的說明
+                parsed_branch = (_parse_branch_schedule(soup_main)
+                                 if soup_main is not None else None)
                 if parsed_branch:
                     _merge_appointments_by_date(appointments_by_date, parsed_branch)
 
@@ -7607,7 +7701,6 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                 # dict-changed-size 月曆重繪炸掉/畫出合併到一半的休診。與 6719 對齊:交出 deepcopy 快照。
                 put_ui_message(ui_queue, UiClinicDataMessage(doctor_name=doc_no, data=deepcopy(appointments_by_date)))
 
-            dayoff_data = _parse_doctor_info_dayoff(BeautifulSoup(html_dayoff, "lxml")) if html_dayoff else {}
             if dayoff_data:
                 _merge_dayoff_overrides(appointments_by_date, dayoff_data)
 

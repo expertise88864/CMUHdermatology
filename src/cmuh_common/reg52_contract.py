@@ -37,6 +37,15 @@ from dataclasses import dataclass
 SUCCESS = "success"
 TRANSPORT_ERROR = "transport_error"
 SEMANTIC_INVALID = "semantic_invalid"
+# ★[2026-08-08 外審 P2-01] 第四態：錯在【我們自己】,不是遠端★
+#   `parser_unavailable`(bs4/lxml 載不進來、解析器炸掉)以前回 SEMANTIC_INVALID,
+#   而呼叫端據此累加 backoff、記熔斷 —— **我們自己的環境壞了,卻去懲罰一台
+#   完全健康的遠端主機**:指數退避把它擋掉數十分鐘、熔斷器跳閘,整個 reg52
+#   功能變暗,而 log 上寫的是「東區主機連續失敗」。原本的註解自己就寫著
+#   「解析器壞掉不代表頁面壞掉」—— 宣稱與實作不符。
+#   LOCAL_ERROR 一樣【不可以用那份 html】(ok 仍是 False、usable_html 仍是空),
+#   只是不記在遠端頭上。
+LOCAL_ERROR = "local_error"
 
 # 低於這個長度一定不是掛號表（原本各處散落的 `len(text) < 500`）
 MIN_PAGE_CHARS = 500
@@ -61,6 +70,17 @@ class FetchOutcome:
         return self.status == SUCCESS
 
     @property
+    def blames_remote(self) -> bool:
+        """這次失敗該不該算在遠端頭上（backoff／熔斷器只看這個）。
+
+        ★兩個方向都要守★
+          * 該記卻不記 → 維護頁每一輪都再打一次（P1-02 修過的那個洞）。
+          * 不該記卻記 → 我們自己的解析器壞掉會把健康的主機擋掉數十分鐘,
+            而且 log 指向錯的地方,查的人往遠端查。
+        """
+        return self.status in (TRANSPORT_ERROR, SEMANTIC_INVALID)
+
+    @property
     def usable_html(self) -> str:
         """只有 SUCCESS 的 html 可以拿去用／進快取。"""
         return self.html if self.status == SUCCESS else ""
@@ -70,6 +90,8 @@ class FetchOutcome:
             return f"語意有效（{self.length} 字）"
         if self.status == TRANSPORT_ERROR:
             return f"連線失敗（{self.reason}）"
+        if self.status == LOCAL_ERROR:
+            return f"★本機環境問題,不是遠端的錯★（{self.reason}）"
         return f"★內容不是掛號表★（{self.reason}，{self.length} 字）"
 
 
@@ -94,8 +116,9 @@ def classify_branch_html(text) -> FetchOutcome:
         probe = BeautifulSoup(body, "lxml")
     except Exception:
         # 解析器壞掉不代表頁面壞掉 —— 但我們也就無法確認它是不是掛號表。
-        # ★查不到 ≠ 沒問題★：當成語意無效，寧可用上一份好的。
-        return FetchOutcome(SEMANTIC_INVALID, reason="parser_unavailable",
+        # ★查不到 ≠ 沒問題★：不採用這一份，寧可用上一份好的。
+        # ★但也不可以記在遠端頭上★（LOCAL_ERROR，見模組頂端 P2-01 說明）。
+        return FetchOutcome(LOCAL_ERROR, reason="parser_unavailable",
                             length=len(body))
     if not any(probe.select_one(sel) for sel in BRANCH_REQUIRED_SELECTORS):
         return FetchOutcome(SEMANTIC_INVALID, reason="missing_schedule_markup",
@@ -179,7 +202,7 @@ def classify_dayoff_html(text) -> FetchOutcome:
         from bs4 import BeautifulSoup          # ★延遲載入★ 見 reg52_fetch 說明
         soup = BeautifulSoup(body, "lxml")
     except Exception:
-        return FetchOutcome(SEMANTIC_INVALID, reason="parser_unavailable",
+        return FetchOutcome(LOCAL_ERROR, reason="parser_unavailable",
                             length=len(body))
     if (soup.select_one("table#dayoff")
             or _has_east_style_dayoff_table(soup)
@@ -216,7 +239,7 @@ def classify_main_html(text) -> FetchOutcome:
         from bs4 import BeautifulSoup          # ★延遲載入★ 見 reg52_fetch 說明
         soup = BeautifulSoup(body, "lxml")
     except Exception:
-        return FetchOutcome(SEMANTIC_INVALID, reason="parser_unavailable",
+        return FetchOutcome(LOCAL_ERROR, reason="parser_unavailable",
                             length=len(body))
     if _has_reg52_skeleton(soup):
         return FetchOutcome(SUCCESS, html=body, length=len(body))
