@@ -381,6 +381,81 @@ def mark_uids_seen(uids) -> bool:
         _force_close_conn(conn)
 
 
+# 寄件備份可能叫什麼名字（Gmail 中英文介面、以及一般 IMAP 伺服器）。
+# ★選不到就回 None，不可以回 False★ ——「找不到信箱」不等於「信沒寄出去」。
+_SENT_MAILBOXES = (
+    '"[Gmail]/Sent Mail"', '"[Gmail]/&Xn9uRZR-"',   # 英文 / 中文「寄件備份」
+    '"[Google Mail]/Sent Mail"', '"Sent"', '"Sent Items"', '"INBOX.Sent"',
+)
+
+
+def _message_id_is_safe(message_id: str) -> bool:
+    """能不能安全地放進 IMAP SEARCH 的加引號字串。
+
+    ★這是注入防線★ Message-ID 進了 IMAP 指令列。雙引號/反斜線會提前結束
+    字串，CR/LF 會直接多送一整條 IMAP 指令。合法的 Message-ID 本來就不含
+    這些字元 —— 含了就是不對勁，寧可回報「查不出來」。
+    """
+    if not message_id or len(message_id) > 300:
+        return False
+    return not any(ch in message_id for ch in ('"', chr(92), chr(13), chr(10)))
+
+
+def find_message_in_sent(message_id: str, timeout: float = 12.0):
+    """這封信在寄件備份裡嗎？→ True 有／False 確定沒有／**None 查不出來**。
+
+    ★三態，而且 None 絕對不可以被當成 False★
+    這是 `delivery_ledger` 那套 UNKNOWN 收斂的最後一塊：SMTP 逾時的時候
+    「伺服器可能已經收下了」，只有回查寄件備份才問得出答案。
+    把「查不出來」摺成「沒寄出去」就會重寄一封已經送到的信；摺成「有寄到」
+    則會把真正的漏寄無聲吞掉。兩個方向都錯，所以它必須是三態。
+
+    只有【選得到寄件備份、SEARCH 也成功回 OK】才給得出 True/False。
+    """
+    if not _message_id_is_safe(message_id):
+        logging.warning("[IMAP] Message-ID 不適合放進 SEARCH → 回報查不出來")
+        return None
+    s = _load_imap_settings()
+    if not (s["host"] and s["username"] and s["password"]):
+        return None
+    conn = None
+    try:
+        context = ssl.create_default_context()
+        conn = imaplib.IMAP4_SSL(s["host"], s["port"], ssl_context=context,
+                                 timeout=timeout)
+        _set_active(conn)
+        conn.login(s["username"], s["password"])
+        selected = ""
+        for box in _SENT_MAILBOXES:
+            try:
+                typ, _d = conn.select(box, readonly=True)
+            except Exception:
+                continue
+            if typ == "OK":
+                selected = box
+                break
+        if not selected:
+            logging.warning("[IMAP] 找不到寄件備份信箱 → 回報查不出來(不是查無)")
+            return None
+        # ★不傳 charset 的 None★ imaplib 的 `_command` 會跳過 None,所以它
+        #   在執行期可用,但那是靠實作細節;`UID SEARCH HEADER ...` 本來
+        #   就不需要 charset,直接不傳最乾淨(也不會多一筆型別債)。
+        typ, data = conn.uid("search", "HEADER", "Message-ID",
+                             '"%s"' % message_id)
+        if typ != "OK":
+            logging.warning("[IMAP] 寄件備份 SEARCH 未回 OK(%s) → 查不出來", typ)
+            return None
+        hits = (data[0] or b"").split() if data else []
+        return bool(hits)
+    except Exception:
+        logging.warning("[IMAP] 回查寄件備份失敗 → 回報查不出來", exc_info=True)
+        return None
+    finally:
+        # 與本檔其他連線同一套收尾：不呼叫 logout（socket 半死會 hang 住）。
+        _clear_active(conn)
+        _force_close_conn(conn)
+
+
 def check_trigger(keyword: str, mark_read: bool = True,
                    timeout: float = 12.0,
                    sample_count: int = 3,

@@ -514,7 +514,23 @@ class DeliveryLedger:
                        for r in self._records.values())
 
     def unresolved(self) -> list:
-        """所有還是 UNKNOWN 的紀錄（給回查流程用），舊的排前面。"""
+        """所有還是 UNKNOWN 的紀錄（給回查流程用），舊的排前面。
+
+        ★[2026-08-08 外審 P2] 先從磁碟重讀★
+        這本帳是【跨 process 共用】的（見本檔 `_save_locked` 的說明）：`main.py`
+        那支程式也會把 UNKNOWN 寫進同一個檔。只讀自己記憶體裡的快照，別的
+        process 建立的 UNKNOWN 就【永遠不會】被挑去回查 —— 它一直停在
+        UNKNOWN，而 UNKNOWN 屬於 `LIVE_STATES`，於是那個 business_key 也
+        永遠不會再寄。`has_live_delivery()` 早就會重讀，這裡漏了。
+
+        ★讀不到就拋例外，不回答★（與 `has_live_delivery()` 同一個立場）
+        回空清單等於說「沒有待回查的」—— 那是把「讀不到」講成一個確定的答案，
+        而且是往「安靜地什麼都不做」的方向。
+        """
+        if not self._refresh_locked():
+            raise LedgerUnavailable(
+                "這一刻讀不到寄送帳本 → 列不出待回查的 UNKNOWN；"
+                "空清單會被誤解成「沒有待回查的」")
         with self._lock:
             out = [dict(r) for r in self._records.values()
                    if r.get("state") == UNKNOWN]

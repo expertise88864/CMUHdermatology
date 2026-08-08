@@ -4152,16 +4152,44 @@ def _finish_bde_reboot(outcome: str, *, rollback, run=None) -> None:
                       else f"使用者已回來(閒置僅 {idle:.0f} 秒)")
         _bde_rollback_after_abort(rollback, "最後一刻確認到有人/查不出閒置")
         return
-    try:
-        cp = runner(["shutdown", "/r", "/t", "0", "/c",
-                     "皮膚科會診查詢:HIS BDE 初始化失敗,閒置自動重開機修復"])
-        if cp.returncode != 0:
-            logging.error("[BDE] 立即重開下達失敗(rc=%s)→ 本次不重開,"
-                          "交給下一輪", cp.returncode)
-            _bde_rollback_after_abort(rollback, "立即重開下達失敗")
-    except Exception:
-        logging.error("[BDE] 立即重開下達失敗 → 本次不重開", exc_info=True)
-        _bde_rollback_after_abort(rollback, "立即重開下達例外")
+    # ★[2026-08-08 外審 P2-01] 這一段必須與「退出時取消重開」互斥★
+    #   上面那個 `shutdown /a` 已經把排定的重開取消掉了 —— 從那一刻到下面
+    #   `/r /t 0` 之間,作業系統其實【沒有】排定中的重開機。使用者若剛好在這
+    #   個窗口按退出:`_abort_bde_shutdown_on_exit` 會看到 `pending=True`、
+    #   跑一個取消不到任何東西的 `shutdown /a`(rc!=0,log 寫「機器仍將重開」),
+    #   然後這裡照樣下 `/r /t 0` —— **使用者剛剛關掉程式,機器立刻重開**。
+    #   `_bde_reboot_cancel` 是退出時一定會設的旗標,所以:
+    #     ① 拿鎖,讓「檢查旗標 → 下重開令」與退出那側的 `/a` 不能交錯;
+    #     ② 拿到鎖之後【再看一次】旗標,設了就不重開。
+    #   拿不到鎖(退出那側正在跑 `/a`)也一樣不重開:那正是「程式要收掉了」。
+    #   不重開不等於放棄修復 —— 時間戳會回滾,下一輪重新判定。
+    cancel_why = ""
+    if not _bde_watch_lock.acquire(timeout=20):
+        cancel_why = "取不到重開機鎖(退出流程正在取消)"
+    else:
+        try:
+            if _bde_reboot_cancel.is_set():
+                cancel_why = "下達前偵測到取消令(使用者退出/HIS 恢復)"
+            else:
+                try:
+                    cp = runner(
+                        ["shutdown", "/r", "/t", "0", "/c",
+                         "皮膚科會診查詢:HIS BDE 初始化失敗,閒置自動重開機修復"])
+                    if cp.returncode != 0:
+                        logging.error("[BDE] 立即重開下達失敗(rc=%s)→ 本次不重開,"
+                                      "交給下一輪", cp.returncode)
+                        cancel_why = "立即重開下達失敗"
+                except Exception:
+                    logging.error("[BDE] 立即重開下達失敗 → 本次不重開",
+                                  exc_info=True)
+                    cancel_why = "立即重開下達例外"
+        finally:
+            # ★一定要先放掉再回滾★ `_bde_rollback_after_abort` 自己會拿同一把
+            #   鎖,而 threading.Lock 不可重入 —— 在鎖裡呼叫它會死鎖。
+            _bde_watch_lock.release()
+    if cancel_why:
+        logging.error("[BDE] %s → 不重開", cancel_why)
+        _bde_rollback_after_abort(rollback, cancel_why)
 
 
 def _bde_rollback_after_abort(rollback, why: str) -> None:
@@ -4290,26 +4318,38 @@ def _abort_bde_shutdown_on_exit() -> None:
     """[codex P1 R19] 使用者退出程式時,若 60 秒重開倒數還在跑 → shutdown /a 取消。
 
     退出只是關這支程式;已下達的 OS 重開機不會跟著消失,使用者按下退出後機器
-    照樣重開會非常錯愕。時間戳【不回滾】(保守方向:寧可多等 24 小時,不迴圈)。"""
+    照樣重開會非常錯愕。時間戳【不回滾】(保守方向:寧可多等 24 小時,不迴圈)。
+
+    ★[2026-08-08 外審 P2-01]★ 這裡整段(含 `shutdown /a`)都在 `_bde_watch_lock`
+    裡,而且旗標【先於】任何動作設起來 —— 見 `_finish_bde_reboot` 的說明:
+    收尾那側在「取消排定的重開」與「下立即重開」之間有一段沒有排定中的重開,
+    退出若在那時插進來,會下一個取消不到任何東西的 `/a`,然後機器照樣重開。
+    """
     global _bde_shutdown_pending
-    _bde_reboot_cancel.set()
-    with _bde_watch_lock:
-        pending = _bde_shutdown_pending
-    if not pending:
-        return
-    logging.warning("[BDE] 使用者退出時仍有排定中的重開機 → shutdown /a 取消")
+    _bde_reboot_cancel.set()        # ★先設★ 收尾那側的第二次檢查才看得到
+    acquired = _bde_watch_lock.acquire(timeout=20)
+    if not acquired:
+        # 收尾那側正持鎖(它只在「下立即重開」那一瞬間持鎖)→ 機器已經在重開了,
+        # `/a` 對 `/t 0` 也無效。照舊往下跑,至少留下 log。
+        logging.warning("[BDE] 退出時取不到重開機鎖 → 收尾流程可能正在下重開令")
     try:
-        cpa = subprocess.run(
-            ["shutdown", "/a"], capture_output=True, timeout=15,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        if cpa.returncode == 0:
-            with _bde_watch_lock:
+        if not _bde_shutdown_pending:
+            return
+        logging.warning("[BDE] 使用者退出時仍有排定中的重開機 → shutdown /a 取消")
+        try:
+            cpa = subprocess.run(
+                ["shutdown", "/a"], capture_output=True, timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if cpa.returncode == 0:
                 _bde_shutdown_pending = False
-        else:
-            logging.error("[BDE] shutdown /a 失敗(rc=%s) — 機器仍將重開",
-                          cpa.returncode)
-    except Exception:
-        logging.error("[BDE] shutdown /a 例外 — 機器仍將重開", exc_info=True)
+            else:
+                logging.error("[BDE] shutdown /a 失敗(rc=%s) — 機器仍將重開",
+                              cpa.returncode)
+        except Exception:
+            logging.error("[BDE] shutdown /a 例外 — 機器仍將重開", exc_info=True)
+    finally:
+        if acquired:
+            _bde_watch_lock.release()
 
 
 def _schedule_bde_reboot_watch() -> None:
@@ -5133,6 +5173,84 @@ def _confirm_on_origin(origin_did: str, delivered: list) -> None:
                         ", ".join(sorted(delivered)), exc_info=True)
 
 
+# ── UNKNOWN 回查(outbox reconciliation)────────────────────────────────────
+# 寄件備份要一點時間才會出現;太早查到「沒有」會誤判成沒寄出去。
+_RECONCILE_MIN_AGE_SEC = 600.0        # 帳上這筆至少要滿 10 分鐘才值得回查
+_RECONCILE_EVERY_SEC = 600.0          # 兩次回查之間至少隔這麼久(它要開 IMAP 連線)
+_RECONCILE_MAX_PER_PASS = 5           # 一次最多查幾筆(慢查詢不要拖住查詢輪次)
+_last_reconcile_ts = 0.0
+
+
+def _reconcile_unknown_deliveries(now=None, finder=None) -> int:
+    """把帳本上的 UNKNOWN 拿 Message-ID 去寄件備份回查。→ 收斂了幾筆。
+
+    ★這是 `delivery_ledger` 一直宣稱、但從來沒有人呼叫的那條路★
+    模組 docstring 寫「UNKNOWN 就誠實地記成 UNKNOWN,之後用 Message-ID 回查
+    寄件備份把它收斂成 CONFIRMED 或 FAILED」,而 `resolve_unknown()` 在生產
+    程式碼裡【一個呼叫端都沒有】—— 於是每一筆 UNKNOWN 都永遠停在 UNKNOWN:
+      * `has_live_delivery()` 把它算成「還沒被否證」→ 同一批會診【永遠不會再寄】
+      * 也永遠不會有人知道那封信到底送到了沒有
+    宣稱與實作不符,而且是往「安靜地漏寄」的方向。
+
+    ★三態必須原封不動地傳下去★ `find_message_in_sent` 回 None = 查不出來。
+    查不出來就【什麼都不做】,下一輪再試 —— 把它摺成「沒寄到」會重寄一封
+    已經送達的信,摺成「有寄到」會把真正的漏寄吞掉。
+    """
+    global _last_reconcile_ts
+    led = _get_ledger()
+    if led is None:
+        return 0
+    now = float(now if now is not None else time.time())
+    try:
+        pending = led.unresolved()
+    except Exception:
+        logging.debug("[delivery] 讀取待回查清單失敗", exc_info=True)
+        return 0
+    # ★先看有沒有事做,再看節流★ 沒事做的時候不該把節流時間戳往前推。
+    ripe = [r for r in pending
+            if now - float(r.get("created_at") or 0) >= _RECONCILE_MIN_AGE_SEC
+            and str(r.get("message_id") or "")]
+    if not ripe:
+        return 0
+    if now - _last_reconcile_ts < _RECONCILE_EVERY_SEC:
+        return 0
+    _last_reconcile_ts = now
+    if finder is None:
+        # 與本檔其他 IMAP 用法同一套：在函式裡 import（避免啟動時就拉進 ssl/imaplib）
+        from cmuh_common.imap_reader import find_message_in_sent  # noqa: PLC0415
+        finder = find_message_in_sent
+    look_up = finder
+    settled = 0
+    for rec in ripe[:_RECONCILE_MAX_PER_PASS]:
+        did = str(rec.get("delivery_id") or "")
+        msgid = str(rec.get("message_id") or "")
+        if not did:
+            continue
+        try:
+            found = look_up(msgid)
+        except Exception:
+            logging.warning("[delivery] 回查 %s 失敗 → 維持 UNKNOWN", did,
+                            exc_info=True)
+            continue
+        if found is None:
+            logging.info("[delivery] %s 回查不出結果 → 維持 UNKNOWN,下輪再試", did)
+            continue
+        try:
+            state = led.resolve_unknown(did, delivered=bool(found))
+        except Exception:
+            logging.warning("[delivery] 收斂 %s 失敗", did, exc_info=True)
+            continue
+        settled += 1
+        if found:
+            logging.info("[delivery] %s 在寄件備份查到 → 收斂為 %s", did, state)
+        else:
+            # 確定沒寄出去。信的內容重建不了(不存病人明文),所以這裡不重寄,
+            # 交給既有的補寄/結案路徑去處理與告警。
+            logging.error("[delivery] ★%s 在寄件備份【查無】→ 這封信沒有寄出去★"
+                          "(主旨:%s)", did, rec.get("subject", ""))
+    return settled
+
+
 _ABANDON_RETRY_AFTER_SEC = 3600.0     # 帳上掛超過一小時 → 明確結案 + 告警
 
 
@@ -5505,6 +5623,9 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
     #   輪次也應該讓補寄有機會發生(它跟這一輪查不查得到會診無關)。
     try:
         _drain_pending_refusal_retries()
+        # 帳上的 UNKNOWN 先拿 Message-ID 去寄件備份回查(自帶節流)——
+        # 排在結案之前:結案要用的是【收斂之後】的狀態。
+        _reconcile_unknown_deliveries()
         # 帳上掛太久的(多半是跨越了程式重啟,記憶體佇列已消失)→ 明確結案 + 告警
         _close_out_stale_recipient_retries()
     except Exception:

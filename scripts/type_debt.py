@@ -214,41 +214,46 @@ def _rule_diagnostics(rule: str) -> dict:
     with open(MAIN_CONFIG, encoding="utf-8") as fh:
         cfg = json.load(fh)
     cfg[rule] = "error"
+    return _count_by_rule(_run_pyright(cfg, f"規則 {rule}"), [rule])[rule]
+
+
+def _count_by_rule(report: dict, rules) -> dict:
+    """把一份 pyright 報告拆成 {規則: {指紋: 次數}}。
+
+    ★只認 `severity == "error"`★ 而且只認【被要求的那些規則】——
+    設定檔裡本來就是 error 的其他規則不屬於這道棘輪。
+    """
+    out = {r: {} for r in rules}
+    for diag in report.get("generalDiagnostics", []):
+        if diag.get("severity") != "error":
+            continue
+        rule = diag.get("rule")
+        bucket = out.get(rule)
+        if bucket is None:
+            continue
+        fp = fingerprint(diag)
+        bucket[fp] = bucket.get(fp, 0) + 1
+    return out
+
+
+def _run_pyright(cfg: dict, what: str) -> dict:
+    """用 `cfg` 跑一趟 pyright,回傳解析好的報告(解析不了就丟例外)。"""
     with open(TEMP_CONFIG, "w", encoding="utf-8") as fh:
         json.dump(cfg, fh)
     try:
-        # ★[2026-07-30 外審第 2 輪] 必須明寫 encoding="utf-8"★
-        #   `text=True` 是拿【系統 locale】解碼。pyright 吐的是 UTF-8，而它的診斷
-        #   訊息用 U+00A0（不斷行空白）做縮排 —— 在 cp936 的機器上那個位元組會
-        #   被解成「聽」。基線裡 273 個指紋裡有 83 個中鐡，而 CI runner 的代碼頁不同
-        #   → 每一個指紋都算「新的」→ 棘輪紅燈上線 → 被忽略。
+        # ★[2026-07-30 外審第 2 輪] 必須明寫 encoding="utf-8"★（見 _rule_diagnostics）
         cp = subprocess.run(
             [sys.executable, "-m", "pyright", "-p", TEMP_CONFIG, "--outputjson"],
             cwd=REPO_ROOT, capture_output=True,
             encoding="utf-8", errors="replace", check=False)
         try:
-            report = json.loads(cp.stdout)
+            return json.loads(cp.stdout)
         except ValueError as e:
-            # ★[2026-08-05 外審 P2] 這裡【不可以】用 SystemExit★
-            #   SystemExit 繼承的是 BaseException，會直接穿過 `_main_guarded` 的
-            #   `except Exception` —— 於是 pyright 沒裝／跑不起來／輸出壞掉時，
-            #   CI 一樣紅，但**發不出 annotation**，錯誤只留在要 admin 才下載得到的
-            #   job log 裡。那正好是 `_main_guarded` 存在的理由被繞過。
-            #   反過來在 guard 裡改抓 BaseException 也不對：`main()` 用 argparse，
-            #   `--help` 與參數錯誤本來就靠 SystemExit 正常結束，抓了會把它們
-            #   一起變成「關卡失敗」。所以錯誤在這裡就該是一般例外。
             raise RuntimeError(
-                f"[type-debt] 無法解析 pyright 輸出（規則 {rule}）：{e}\n"
+                f"[type-debt] 無法解析 pyright 輸出（{what}）：{e}\n"
                 f"  ★解析不了不等於沒有型別債★ —— 這道關卡沒跑成，視為失敗。\n"
                 f"  stdout 前 500 字：{cp.stdout[:500]}\n"
                 f"  stderr 前 500 字：{cp.stderr[:500]}") from e
-        counts: dict = {}
-        for diag in report.get("generalDiagnostics", []):
-            if diag.get("severity") != "error" or diag.get("rule") != rule:
-                continue
-            fp = fingerprint(diag)
-            counts[fp] = counts.get(fp, 0) + 1
-        return counts
     finally:
         try:
             os.remove(TEMP_CONFIG)
@@ -256,8 +261,49 @@ def _rule_diagnostics(rule: str) -> dict:
             pass
 
 
+def _all_rule_diagnostics(rules: list) -> dict:
+    """★--fast★ 把所有規則【一次】打開跑一趟 → {規則: {指紋: 次數}}。
+
+    pyright 的每一筆診斷都帶 `rule` 欄位,所以一趟就能分回各規則。
+    2026-08-08 實測（本機、這個 repo）:逐條 11 趟 70.5 秒、一次 6.3 秒,
+    而且**11 條規則的指紋計數逐一比對完全一致**。
+
+    ★為什麼 CI 仍然走逐條那條路★
+    「一次打開」理論上有規則互相遮蔽的風險(同一個運算式只報一筆)。真的發生
+    的話,診斷會【變少】—— 而變少在這道關卡只是警告,不會紅燈,也就是**安靜地
+    變弱**。所以:本機用 --fast 當早期警報,CI 用逐條當權威判定。
+    """
+    with open(MAIN_CONFIG, encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    for rule in rules:
+        cfg[rule] = "error"
+    return _count_by_rule(_run_pyright(cfg, "--fast 一次跑完"), rules)
+
+
+def _without_scope(fp: str) -> str:
+    """把指紋裡的「所在函式/類別」拿掉 → `檔案|訊息|那一行`。
+
+    ★[2026-08-08] 抽出函式時,同一筆診斷的指紋會整批改變★
+    指紋含 `scope`(所在函式)是為了分辨「同一個檔案裡兩行字面相同的程式碼」。
+    但它的副作用是:把一段程式碼搬進新函式(extract function)時,裡面每一筆
+    既有診斷的 scope 都變了 —— 棘輪把它們同時報成「消失 N 筆 + 新增 N 筆」,
+    而新增就是紅燈。**純粹搬家不該算成新的技術債。**
+    """
+    parts = fp.split("|")
+    if len(parts) < 4:
+        return fp
+    return "|".join([parts[0]] + parts[2:])
+
+
 def diff_counts(baseline: dict, current: dict) -> tuple:
-    """→ (新增的 {指紋: 多幾個}, 消失的 {指紋: 少幾個})。"""
+    """→ (真正新增的 {指紋: 多幾個}, 消失的 {指紋: 少幾個})。
+
+    ★搬家不算新增★ 先用完整指紋算差,再把「只是 scope 變了」的那些對消:
+    一筆新增若在「消失」那一側找得到【檔案/訊息/那一行都相同】的對象,
+    它就是同一筆診斷換了位置,不是新的債。
+    (仍然對得起原本的目的:同一檔案裡兩行字面相同的程式碼,一個修掉、
+     另一處新寫一個,`檔案|訊息|那一行` 的計數會增加 → 照樣抓得到。)
+    """
     added, gone = {}, {}
     for fp in set(baseline) | set(current):
         delta = current.get(fp, 0) - baseline.get(fp, 0)
@@ -265,6 +311,27 @@ def diff_counts(baseline: dict, current: dict) -> tuple:
             added[fp] = delta
         elif delta < 0:
             gone[fp] = -delta
+    if added and gone:
+        pool: dict = {}
+        for fp, k in gone.items():
+            pool[_without_scope(fp)] = pool.get(_without_scope(fp), 0) + k
+        moved: dict = {}
+        for fp in sorted(added):
+            key = _without_scope(fp)
+            take = min(added[fp], pool.get(key, 0))
+            if take:
+                pool[key] -= take
+                added[fp] -= take
+                moved[fp] = take
+                if added[fp] == 0:
+                    del added[fp]
+        if moved:
+            print("  (以下是同一筆診斷換了所在函式,不算新債:"
+                  # ★索引要防呆★ 指紋格式若異常(欄位不足),這裡不可以炸掉 ——
+                  #   關卡自己的例外會變成 CI 紅燈,但原因跟型別債無關。
+                  + ", ".join("%dx %s" % (k, (fp.split("|") + ["?", "?"])[1])
+                              for fp, k in list(moved.items())[:3])
+                  + (" …" if len(moved) > 3 else "") + ")")
     return added, gone
 
 
@@ -277,10 +344,21 @@ def main(argv: list) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--update", action="store_true",
                     help="把目前的診斷寫回基線（還完債之後用）")
+    ap.add_argument("--fast", action="store_true",
+                    help="所有規則一次跑完（本機早期警報用；CI 請用預設的逐條）")
     args = ap.parse_args(argv)
 
     baseline = _load_baseline()
-    current = {rule: _rule_diagnostics(rule) for rule in sorted(baseline)}
+    rules = sorted(baseline)
+    if args.fast:
+        # ★--fast 不可以拿來 --update★ 基線是 CI 判定的依據，必須由權威路徑產生。
+        if args.update:
+            print("[type-debt] --fast 不能和 --update 併用："
+                  "基線要由逐條（CI 用的那條路）產生。")
+            return 2
+        current = _all_rule_diagnostics(rules)
+    else:
+        current = {rule: _rule_diagnostics(rule) for rule in rules}
 
     print(_environment_note())
     any_added = any_gone = False
