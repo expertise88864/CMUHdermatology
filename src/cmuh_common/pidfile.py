@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
 import math
 import os
 import sys
@@ -71,10 +72,22 @@ from cmuh_common.paths import get_settings_dir
 
 _PY_NAMES = ("python.exe", "pythonw.exe", "python", "pythonw")
 _SCHEMA = 1
-# 建立時間的比對容差。psutil 對同一行程回傳的值是穩定的，JSON round-trip 也不失真；
-# 容差只是不想讓浮點表示的最後一位決定「要不要強殺一支程式」。
-# 真的被重用時，兩個行程的建立時間相差【好幾秒以上】（前者死了後者才生得出來）。
-_CREATE_TIME_TOLERANCE_SEC = 0.05
+# 建立時間的比對容差。
+#
+# ★[2026-08-08 外審] 0.05 秒太寬★
+#   原本的理由是「真的被重用時兩者相差好幾秒」—— 但那個前提在 Windows 上
+#   不成立:PID 是可以在幾十毫秒內被回收再配出去的。而本專案好幾支程式都是
+#   同一個 `pythonw.exe`,所以名稱檢查與 executable 檢查都會一起通過 ——
+#   最後真正在分辨身分的就只有這個數字。50ms 的窗口配上下游的
+#   `taskkill /F /T`,代價是【強殺一支無關的自家程式(連同它的子行程)】。
+#
+#   psutil 的 `create_time()` 對同一個行程回傳的是同一個值(它讀的是核心的
+#   建立時間),JSON 的 float round-trip 在 Python 也是精確的。所以容差只需要
+#   擋掉浮點表示的最後一位,不需要 50 毫秒。
+#
+#   ★收緊的代價是什麼★ 萬一真的判成「不是同一個行程」,結果是【不去 kill】
+#   —— 那條路本來就有處理(視為 stale)。誤放過遠比誤殺安全。
+_CREATE_TIME_TOLERANCE_SEC = 1e-6
 
 
 def _finite_float(v):
@@ -250,6 +263,67 @@ def _identity_matches(pid: int, rec: dict) -> bool:
                             "→ 不採用", pid, want_exe, got_exe)
             return False
     return True
+
+
+@contextmanager
+def pinned_verified_pid(name: str):
+    """驗過身分、而且在 `with` 區塊期間【PID 不會被回收給別人】的 PID。
+
+    ★[2026-08-08 外審] 光是「驗證時是對的」不夠★
+    `read_verified_pid()` 回的是一個裸 PID。從它回傳到下游真的執行
+    `taskkill /F /T` 之間,那個行程可能已經結束、而 PID 被作業系統配給
+    另一支程式 —— 於是我們強殺的是一支無關的自家程式(連同它的子行程)。
+    收緊建立時間的容差只縮小了「驗證當下」的窗口,擋不住「驗證之後」。
+
+    ★做法:開一個 process handle 把 PID 釘住★
+    Windows 只要還有人握著該行程的 handle,就不會把它的 PID 配給別人
+    (行程結束後變成 zombie,PID 保留到最後一個 handle 關閉)。
+    所以:先開 handle → 再驗建立時間 → 在 handle 還開著的時候動手。
+    順序不可以反過來:先驗再開的話,中間那一瞬間仍然可能被換掉。
+
+    (這與 2026-07-27 事故的教訓是同一條:spawn 子行程要留 handle。)
+
+    用法:
+        with pinned_verified_pid("autoclock") as pid:
+            if pid:
+                kill_pid(pid)
+
+    拿不到 handle(權限不足/行程已消失)時 yield None —— 寧可不殺,
+    也不要在無法保證身分的情況下動手。
+    """
+    pid = read_verified_pid(name)
+    if pid is None:
+        yield None
+        return
+    handle = None
+    try:
+        try:
+            import ctypes  # noqa: PLC0415
+            # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION —— 只要能持有,
+            # 不需要 PROCESS_TERMINATE(真正動手的是 taskkill)。
+            handle = ctypes.windll.kernel32.OpenProcess(
+                0x00100000 | 0x00001000, False, int(pid))
+        except Exception:
+            handle = None
+        if not handle:
+            logging.info("[pidfile] 取不到 PID %s 的 handle → 無法保證期間不被"
+                         "回收,本次不採用", pid)
+            yield None
+            return
+        # ★handle 開好【之後】再驗一次★ —— 這一次驗過,就代表「我們釘住的
+        #   這個 PID」與「記錄裡那個行程」是同一個,而且釘住期間不會變。
+        if read_verified_pid(name) != pid:
+            logging.warning("[pidfile] 取得 handle 後身分不符(%s)→ 不採用", pid)
+            yield None
+            return
+        yield pid
+    finally:
+        if handle:
+            try:
+                import ctypes  # noqa: PLC0415
+                ctypes.windll.kernel32.CloseHandle(handle)
+            except Exception:
+                logging.debug("[pidfile] 關閉 handle 失敗", exc_info=True)
 
 
 def read_verified_pid(name: str):

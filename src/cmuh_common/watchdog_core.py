@@ -613,13 +613,76 @@ def _find_pids_holding_mutex(process_keyword: str, mutex_name: str = "",
             if pid:
                 logging.info("[watchdog] 由 PID 檔取得 %s 的 PID=%s(不需 cmdline 比對)",
                              process_keyword, pid)
+                _PID_FROM_PIDFILE[pid_name] = pid      # ★記下來源★
                 return [pid]
+            _PID_FROM_PIDFILE.pop(pid_name, None)      # 這次是 cmdline 後備
         except Exception:
+            _PID_FROM_PIDFILE.pop(pid_name, None)
             logging.debug("[watchdog] 讀 PID 檔失敗,退回 cmdline 比對", exc_info=True)
     return _wmic_find_pids(process_keyword, log_on_empty=True)
 
 
 # ─── Kill + start ───────────────────────────────────────────────────────
+# 查詢當下記下「這個 PID 是從 PID 檔驗來的」——供 kill 階段判斷來源。
+# (外審第 4 回:事後重讀 PID 檔推不出來源,因為 PID 可能已經被回收。)
+_PID_FROM_PIDFILE: dict = {}
+
+
+def kill_pids_verified(pids: list, pid_name: str = "") -> list:
+    """殺掉這幾個 PID;若它們是從 PID 檔驗來的,期間把身分【釘住】。
+
+    ★[2026-08-08 外審]★ `read_verified_pid()` 回的是裸 PID。從驗證到這裡
+    真正執行 `taskkill /F /T` 之間,那個行程可能已結束、PID 被配給另一支
+    自家程式 —— 我們就會連同它的子行程一起強殺。
+    `pinned_verified_pid()` 在整個 kill 期間握著該行程的 handle,
+    Windows 不會在那段時間把 PID 配給別人。
+
+    ★[外審第 3 回] 但不可以因此把「cmdline 後備」那條路整個關掉★
+    `_find_pids_holding_mutex()` 回的 PID 可能來自【PID 檔】,也可能來自
+    【cmdline 比對後備】—— 後者正是在「PID 檔不存在/舊格式/驗不過」時啟用的。
+    我第一版不管來源一律要求釘住,於是那些情況下 pin 必然失敗、PID 永遠殺不掉:
+    半死救援在那條路上整個停擺。修一個競態卻關掉一整條救援路徑,比原本的問題嚴重。
+    現在先問「這個 PID 是不是驗得出來的那一個」:
+      * 是 → 走釘住的路(釘不住就【不殺】,fail-closed);
+      * 不是(PID 檔不可用 → 這是 cmdline 後備來的)→ 維持既有行為直接殺。
+        那條路本來就沒有可驗證的身分,不是這次要修的東西,也不該被順手廢掉。
+    """
+    if not pid_name:
+        return [pid for pid in pids if kill_pid(pid)]
+    try:
+        from cmuh_common.pidfile import (  # noqa: PLC0415
+            pinned_verified_pid,
+        )
+    except Exception:
+        # ★[外審第 3 回] 安全機制載入不了 → 不要退回不安全的路★
+        #   那等於「保護消失的時候剛好把保護關掉」。少殺一次的代價是
+        #   這一輪不重啟(下一輪會再來);誤殺的代價是砍掉一支無關的程式。
+        logging.error("[watchdog] 載入 pinned_verified_pid 失敗 → 本輪不 kill"
+                      "(避免在無法驗證身分的情況下 /F /T)", exc_info=True)
+        return []
+    # ★[外審第 4 回] 來源要【帶著走】,不可以事後再讀一次去推★
+    #   我上一版在這裡重讀 PID 檔:若那個行程剛好在查詢之後結束、PID 被回收,
+    #   重讀會回 None —— 而我把 None 解讀成「這是 cmdline 後備來的」,
+    #   於是直接 kill 了那個【已經被換掉的】PID。判斷來源的證據必須來自
+    #   查詢當下,不是來自一次新的觀測(那正是這一輪要修的競態本身)。
+    verified = _PID_FROM_PIDFILE.get(pid_name)
+    killed = []
+    for pid in pids:
+        if verified != pid:
+            # 這個 PID 不是從 PID 檔驗來的(cmdline 後備)→ 維持既有行為。
+            if kill_pid(pid):
+                killed.append(pid)
+            continue
+        with pinned_verified_pid(pid_name) as pinned:
+            if pinned != pid:
+                logging.warning("[watchdog] PID %s 已無法確認身分(可能已結束或"
+                                "被回收)→ 不殺", pid)
+                continue
+            if kill_pid(pid):
+                killed.append(pid)
+    return killed
+
+
 def kill_pid(pid: int) -> bool:
     """taskkill /F /T /PID — 需 admin 才砍得了 admin process。
     [v16 2026-05-25] 加 CREATE_NO_WINDOW 避免閃 console。
@@ -910,7 +973,8 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
                             remain = max(0, int(until - time.time()))
                             return (f"⛔ {name}: 半死且 crash loop，暫停 {remain // 60} "
                                     f"分鐘（保留現有 process、不 kill）[{mode}]")
-                        killed = [pid for pid in half_dead_pids if kill_pid(pid)]
+                        killed = kill_pids_verified(
+                            half_dead_pids, prog.get("pid_name", ""))
                         if not killed:
                             return (f"⚠ {name}: 半死狀態 PID {half_dead_pids} "
                                     f"kill 失敗，未啟動新 instance 以避免重複 [{mode}]")
@@ -966,7 +1030,7 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
                 remain = max(0, int(until - time.time()))
                 return (f"⛔ {name}: stale 且 crash loop 中，暫停 {remain // 60} "
                         f"分鐘（保留現有 process、不 kill）[{mode}]")
-            killed = [pid for pid in pids if kill_pid(pid)]
+            killed = kill_pids_verified(pids, prog.get("pid_name", ""))
             if not killed:
                 return (f"⚠ {name}: log {age:.0f}s 沒更新但 PID {pids} "
                         f"kill 失敗，未啟動新 instance 以避免重複 [{mode}]")

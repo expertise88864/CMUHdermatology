@@ -25,6 +25,8 @@
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import consult_query as cq  # noqa: E402
@@ -303,3 +305,137 @@ class TestBothDirectionsOfTheAbortDecision:
         did = cq._abort_reboot_if_needed(
             "user_back", rollback=rolled.append, run=_boom)
         assert did is False and rolled == []
+
+
+class TestThereIsNoUnwatchedWindow:
+    """★[2026-08-08 外審]★ 舊版下 `/t 60` 卻只監測 55 秒 —— 最後 5 秒不再讀
+    idle time。醫師若在那時回座打字，機器照重開。
+
+    那是一個「用停止偵測換來的安全窗」，而它換掉的正是這個功能唯一的前提：
+    沒有人在用這台電腦。餘裕要從【OS 的倒數】拿，不是從【監測時間】扣。
+    """
+
+    def test_the_os_countdown_is_longer_than_the_watch(self):
+        assert (cq._REBOOT_COUNTDOWN_SEC
+                == cq._REBOOT_WATCH_SEC + cq._REBOOT_CANCEL_MARGIN_SEC)
+        assert cq._REBOOT_CANCEL_MARGIN_SEC > 0, "還是要留時間執行 shutdown /a"
+
+    def test_the_whole_watch_window_is_monitored(self):
+        """★核心★ 監測秒數不可以再從倒數裡扣 —— 那就是那個盲區。"""
+        import ast
+        import inspect
+        import textwrap
+        src = textwrap.dedent(inspect.getsource(cq))
+        tree = ast.parse(src)
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                    and n.func.id == "_await_reboot_countdown"):
+                arg = n.args[0] if n.args else None
+                assert isinstance(arg, ast.Name) and arg.id == "_REBOOT_WATCH_SEC", (
+                    "★監測時間又被扣掉餘裕了★ 最後那幾秒偵測不到使用者")
+                return
+        pytest.fail("找不到 _await_reboot_countdown 呼叫")
+
+    def test_no_shutdown_command_hardcodes_the_countdown(self):
+        """★排定的那一次必須用常數★(立即重開的 `/t 0` 例外)
+
+        ★這個測試第一版是「找到第一個 shutdown 就 return」★ —— 而檔案裡有
+        三條 shutdown 指令(排定重開／取消／立即重開)。第一版先撞到取消指令,
+        後來又先撞到立即重開,兩次都在量錯的東西。改成檢查【全部】。
+        """
+        import ast
+        import inspect
+        import textwrap
+        src = textwrap.dedent(inspect.getsource(cq))
+        found = 0
+        for n in ast.walk(ast.parse(src)):
+            if not isinstance(n, ast.List):
+                continue
+            consts = [e.value for e in n.elts if isinstance(e, ast.Constant)]
+            if "shutdown" not in consts or "/t" not in consts:
+                continue
+            found += 1
+            dump = ast.dump(n)
+            assert ("_REBOOT_COUNTDOWN_SEC" in dump
+                    or "/t', ctx=Load()), Constant(value='0')" in dump
+                    or "value='0'" in dump), (
+                f"★shutdown 的倒數秒數寫死了★:{consts}")
+        assert found >= 2, (
+            f"預期至少兩條帶 /t 的 shutdown(排定 + 立即),只找到 {found}")
+
+    def test_the_final_decision_happens_after_cancelling(self):
+        """★核心(第 2 回)★ 把 OS 倒數拉長只是把盲區搬家 —— 第 60~65 秒
+        一樣沒有人在看。真正消滅它:監測期滿【先取消】排定的重開,
+        再取最後一次 idle 樣本,確認仍然沒人才下立即重開。
+        """
+        import ast
+        import inspect
+        import textwrap
+        src = textwrap.dedent(inspect.getsource(cq._finish_bde_reboot))
+        tree = ast.parse(src)
+        cancel_line = idle_line = None
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.List)
+                    and [e.value for e in n.elts
+                         if isinstance(e, ast.Constant)] == ["shutdown", "/a"]):
+                cancel_line = n.lineno
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                    and n.func.id == "_user_idle_seconds_or_none"):
+                idle_line = n.lineno
+        assert cancel_line and idle_line, f"{cancel_line} {idle_line}"
+        assert cancel_line < idle_line, (
+            "★最後一次 idle 取樣排在取消之前★ 那代表取樣之後仍有一段"
+            "沒有人看守的時間,使用者在那時回來照樣被重開")
+
+    def test_an_unknown_idle_at_the_last_moment_does_not_reboot(self,
+                                                               monkeypatch):
+        """★查不出來就當作有人★(與倒數期間同一個保守方向)
+
+        ★stub 要用生產的呼叫形狀★(外審第 3 回抓到)生產的回呼是
+        `_rollback_ts(why, ...)` —— 單引數。我第一版用 `lambda: None`,
+        於是「呼叫端漏傳引數」這個缺陷被測試自己蓋掉了:實際上會 TypeError、
+        被吞掉、時間戳沒回滾,自動修復被壓住 24 小時。
+        """
+        cmds = []
+        _rb = []
+        monkeypatch.setattr(cq, "_user_idle_seconds_or_none", lambda: None)
+        cq._finish_bde_reboot(
+            "elapsed", rollback=_rb.append,
+            run=lambda cmd: cmds.append(cmd) or type("R", (), {"returncode": 0})())
+        assert cmds == [["shutdown", "/a"]], (
+            f"★最後一刻查不出閒置時間卻仍然重開★:{cmds}")
+
+    def test_a_user_returning_at_the_last_moment_does_not_reboot(self,
+                                                                 monkeypatch):
+        cmds = []
+        _rb = []
+        monkeypatch.setattr(cq, "_user_idle_seconds_or_none", lambda: 3.0)
+        cq._finish_bde_reboot(
+            "elapsed", rollback=_rb.append,
+            run=lambda cmd: cmds.append(cmd) or type("R", (), {"returncode": 0})())
+        assert cmds == [["shutdown", "/a"]], (
+            f"★使用者在最後一刻回來卻仍然重開★:{cmds}")
+
+    def test_a_still_idle_machine_reboots_immediately(self, monkeypatch):
+        """★反方向★ 一路都沒人 → 仍然要重開(否則 BDE 壞了就一直壞著)。"""
+        cmds = []
+        _rb = []
+        monkeypatch.setattr(cq, "_user_idle_seconds_or_none", lambda: 99999.0)
+        cq._finish_bde_reboot(
+            "elapsed", rollback=_rb.append,
+            run=lambda cmd: cmds.append(cmd) or type("R", (), {"returncode": 0})())
+        assert cmds[0] == ["shutdown", "/a"]
+        assert cmds[1][:4] == ["shutdown", "/r", "/t", "0"], (
+            f"★沒有下立即重開★:{cmds}")
+
+    def test_the_timestamp_is_rolled_back_with_a_reason(self, monkeypatch):
+        """★核心(第 3 回)★ 生產的回呼是 `_rollback_ts(why, ...)` —— 單引數。
+        用 `rollback()` 呼叫會 TypeError,而它又被吞掉:時間戳沒回滾,
+        自動修復被壓住 24 小時(BDE 壞了就一直壞著)。"""
+        rolled = []
+        monkeypatch.setattr(cq, "_user_idle_seconds_or_none", lambda: 3.0)
+        cq._finish_bde_reboot(
+            "elapsed", rollback=lambda why: rolled.append(why),
+            run=lambda cmd: type("R", (), {"returncode": 0})())
+        assert rolled and isinstance(rolled[0], str), (
+            f"★沒有回滾時間戳(或沒帶原因)★:{rolled}")

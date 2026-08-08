@@ -1087,6 +1087,25 @@ def _poll_harness(monkeypatch, cfg, extracted_text, notified=None, now=None,
     monkeypatch.setattr(cq, "_load_notified", lambda: set(store["charts"]))
     monkeypatch.setattr(cq, "_save_notified", _save)
     monkeypatch.setattr(cq, "_baseline_initialized", lambda: store["init"])
+    # ★[2026-08-08 外審第 4 回] 標記也要模擬★
+    #   「首次基準建立成功」的判準現在包含「標記確實落地」—— 標記沒落地就
+    #   不宣稱成功、改 fail-open 照常寄信(否則基準檔一旦遺失會被判成首次安裝
+    #   而靜默吞掉一批會診)。harness 沒有模擬標記的話,每一輪首次啟動都會走到
+    #   那條 fail-open —— 量到的就不是原本要測的行為。
+    # ★[2026-08-08 外審第 5 回] 標記是【建基準之前】的 gate★
+    #   順序是「先確認標記能落地 → 才建基準」(標記落不了地就連基準都不建,
+    #   改走 fail-open,由「寄成功才更新基準」那條路接手)。
+    #   harness 不模擬它的話,每一輪首次啟動都會走 fail-open —— 量到的
+    #   就不是原本要測的行為。
+    store["marker"] = False
+
+    def _mark():
+        store["marker"] = True
+        return True
+    monkeypatch.setattr(cq, "_mark_baseline_established", _mark)
+    monkeypatch.setattr(
+        cq, "_INSTALL_MARKER",
+        _types.SimpleNamespace(exists=lambda: store["marker"]), raising=False)
     if now is not None:
         monkeypatch.setattr(cq, "datetime", _types.SimpleNamespace(now=lambda: now))
     return h, store
@@ -1272,3 +1291,72 @@ def test_load_config_normalizes_bad_poll_quiet(monkeypatch, tmp_path):
     assert cfg["poll_interval_minutes"] == 3         # None → 預設(常駐 keepalive)
     assert cfg["quiet_start_hour"] == 0              # "x" → 預設 0
     assert cfg["quiet_end_hour"] == 23               # 999 → 夾到 23
+
+
+def test_poll_first_startup_with_an_unwritable_marker_sends_instead(monkeypatch):
+    """★[2026-08-08 外審第 5 回]★ 首次啟動、但「建立過基準」的標記寫不進去。
+
+    不可以照樣建基準然後靜默不寄：基準一旦 commit，而 fail-open 那封信若寄不
+    出去，下一輪就認為所有會診都通知過而什麼都不寄 —— 那批會診永遠送不出去。
+    正確行為：**不建基準**、改為 fail-open 照常寄整份清單（由既有的
+    「寄成功才更新基準」那條路接手）。
+    """
+    cfg = _base_cfg(quiet_start_hour=0, quiet_end_hour=6)
+    txt = "會診清單(2 位):\n1. 甲C16(1)1111111(沈)06/25\n2. 乙C16(2)2222222(許)06/25"
+    h, store = _poll_harness(monkeypatch, cfg, txt, notified=set(),
+                             now=_DT(2026, 6, 25, 9, 0), initialized=False)
+    monkeypatch.setattr(cq, "_mark_baseline_established", lambda: False)
+    monkeypatch.setattr(cq, "_alert_baseline_lost", lambda *a, **k: None)
+    cq._do_full_job("poll")
+    assert len(h.sent) == 1, (
+        f"★標記寫不進去卻靜默不寄★ 已寄={len(h.sent)}")
+    # 寄成功 → 基準前進是【對的】(既有的「寄成功才更新基準」那條路)。
+    assert store["init"] is True
+
+
+def test_poll_marker_failure_plus_send_failure_keeps_the_baseline(monkeypatch):
+    """★核心(第 5 回)★ 標記寫不進去 + 那封 fail-open 的信也寄不出去。
+
+    基準【絕對不可以】前進 —— 否則下一輪會認為所有會診都通知過而什麼都不寄,
+    那批會診永遠送不出去。這正是「基準只能在送達之後才前進」的理由。
+    """
+    cfg = _base_cfg(quiet_start_hour=0, quiet_end_hour=6)
+    txt = ("會診清單(2 位):" + chr(10)
+           + "1. 甲C16(1)1111111(沈)06/25" + chr(10)
+           + "2. 乙C16(2)2222222(許)06/25")
+    h, store = _poll_harness(monkeypatch, cfg, txt, notified=set(),
+                             now=_DT(2026, 6, 25, 9, 0), initialized=False)
+    monkeypatch.setattr(cq, "_mark_baseline_established", lambda: False)
+    monkeypatch.setattr(cq, "_alert_baseline_lost", lambda *a, **k: None)
+
+    def _boom(*a, **k):
+        raise RuntimeError("SMTP 掛了")
+    monkeypatch.setattr(cq, "send_via_smtp", _boom)
+    try:
+        cq._do_full_job("poll")
+    except Exception:
+        pass
+    assert h.sent == []
+    assert store["init"] is False and store["charts"] == set(), (
+        "★寄不出去卻把基準 commit 了★ —— 下一輪會認為全部都通知過而什麼都不寄")
+
+
+def test_poll_first_startup_with_an_unverified_roster_leaves_nothing(monkeypatch):
+    """★[2026-08-08 外審第 6 回]★ 首輪清單未經回讀確認 → 標記與基準都不留。
+
+    只留標記的話，下一輪會看到「有標記、沒基準」→ 判成基準遺失 →
+    把整份既有清單寄出去 + 一封假的遺失告警。
+    """
+    cfg = _base_cfg(quiet_start_hour=0, quiet_end_hour=6)
+    txt = ("會診清單(1 位):" + chr(10)
+           + "1. 甲C16(1)1111111(沈)06/25")
+    h, store = _poll_harness(monkeypatch, cfg, txt, notified=set(),
+                             now=_DT(2026, 6, 25, 9, 0), initialized=False)
+    marked = []
+    monkeypatch.setattr(cq, "_may_update_baseline", lambda r: False)
+    monkeypatch.setattr(cq, "_mark_baseline_established",
+                        lambda: marked.append(1) or True)
+    cq._do_full_job("poll")
+    assert marked == [], "★清單不合格卻仍然寫了標記★ 下一輪會誤報基準遺失"
+    assert store["init"] is False and store["charts"] == set()
+    assert h.sent == [], "首輪不合格 → 這一輪什麼都不做,下一輪重新比對"

@@ -47,7 +47,6 @@ REQUIRED_LIBS = [
 ensure_dependencies(REQUIRED_LIBS)
 
 # === 主要 import（依賴已就緒）===
-import contextlib  # noqa: E402
 import ctypes  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 import html as _html  # noqa: E402
@@ -638,15 +637,25 @@ _notified_load_status = None
 _INSTALL_MARKER = SETTINGS_DIR / "consult_baseline_established.json"
 
 
-def _mark_baseline_established() -> None:
-    """留下「這台機器建立過基準」的痕跡。失敗不致命(下次再寫)。"""
+def _mark_baseline_established() -> bool:
+    """留下「這台機器建立過基準」的痕跡。回傳是否【確定落地】。
+
+    ★[2026-08-08 外審] 成敗要說出來★ 舊版把例外吞掉、回 None。
+    但這個標記是「基準遺失」與「首次安裝」的唯一分辨依據 —— 它沒寫成,
+    之後基準檔一旦遺失就會被判成 `first_install`,而 first_install 的處理是
+    【把當下所有未回覆會診靜默記成已通知然後不寄】。那批會診從此沒有人
+    收到通知,也沒有任何跡象。
+    """
     try:
         if _INSTALL_MARKER.exists():
-            return
+            return True
         atomic_write_json(str(_INSTALL_MARKER),
                           {"first_established": datetime.now().isoformat()})
+        return True
     except Exception:
-        logging.debug("[會診] 基準標記寫入失敗(略過)", exc_info=True)
+        logging.warning("[會診] 基準標記寫入失敗 —— 若基準檔之後遺失,"
+                        "會被誤判成首次安裝而靜默吞掉現有會診", exc_info=True)
+        return False
 
 
 def _baseline_absence_reason() -> str:
@@ -665,8 +674,17 @@ def _baseline_absence_reason() -> str:
         return "corrupt"
     if _notified_load_status == "error":
         return "read_error"
-    return ("missing_after_prior_run" if _INSTALL_MARKER.exists()
-            else "first_install")
+    if _INSTALL_MARKER.exists():
+        return "missing_after_prior_run"
+    # ★[2026-08-08 外審第 4 回] 不要用「產物痕跡」去猜★
+    #   我前兩版試圖從 log／截圖目錄／去重檔推斷「這台機器跑過沒有」。
+    #   那個啟發式在【兩個方向】都會錯:
+    #     * `--configure` 開個設定就留下 log → 全新機器被誤判成跑過;
+    #     * email 觸發會建出去重檔與截圖,但它【明確不更新團隊基準】
+    #       → 沒有基準卻被當成有過基準。
+    #   基準到底建立過沒有,只有那個標記說得準。標記寫不成的補救不在這裡,
+    #   而在【建立基準的那一刻就不要宣稱成功】(見下面 `first_install` 的處理)。
+    return "first_install"
 
 
 def _load_notified() -> set:
@@ -778,8 +796,21 @@ def _save_notified(charts: set) -> None:
         #   反過來的話:標記寫了、基準檔卻沒寫成 → 下次啟動看到「標記在、檔案不在」
         #   → 判成基準遺失 → 白白對團隊重寄整份清單並發告警。那是自己製造的假警報。
         #   另外包一層:標記只是輔助,它出事不可以把已經存好的基準這條主線也拖垮。
-        with contextlib.suppress(Exception):
-            _mark_baseline_established()
+        # ★標記出事不可以把已經存好的基準這條主線拖垮★
+        #   (helper 自己已經吞例外並回 False,這裡再包一層是防它日後被改壞 ——
+        #    第一版拿掉這層保護,測試立刻抓到主線被拖垮。)
+        try:
+            _marked = _mark_baseline_established()
+        except Exception:
+            logging.warning("[會診] 基準標記寫入拋出例外(主線不受影響)",
+                            exc_info=True)
+            _marked = False
+        if not _marked:
+            # 標記沒落地 → 下次基準檔一旦遺失就會被誤判成首次安裝。
+            # 這裡只能記錄與告警(基準本身已經存好了,不該回滾)。
+            logging.error("[會診] 基準已存檔,但「建立過基準」的標記沒能寫入 —— "
+                          "請確認 settings 目錄可寫;否則基準檔遺失時會被當成"
+                          "首次安裝而靜默吞掉一批會診")
 
 
 def _in_quiet_hours(now: datetime, cfg: dict) -> bool:
@@ -4058,9 +4089,17 @@ def _user_idle_seconds() -> float:
     return 0.0 if v is None else v
 
 
-# 倒數期間留給 `shutdown /a` 執行的餘裕。★不可以監測滿 60 秒★——那樣就來不及
-# 取消了。代價是最後這幾秒偵測不到使用者輸入,這是刻意的取捨,不是疏漏。
+# 倒數期間留給 `shutdown /a` 執行的餘裕。
+#
+# ★[2026-08-08 外審] 餘裕要從【OS 的倒數】拿,不可以從【監測時間】扣★
+#   舊做法是下 `/t 60` 卻只監測 55 秒 —— 最後 5 秒不再讀 idle time,
+#   醫師若在那時回座打字,機器照重開。那是一個「用停止偵測換來的安全窗」,
+#   而它換掉的正是這個功能唯一的前提:沒有人在用這台電腦。
+#   現在:OS 倒數下 `_REBOOT_COUNTDOWN_SEC`(65 秒),監測完整
+#   `_REBOOT_WATCH_SEC`(60 秒),餘裕仍是 5 秒 —— 兩邊都拿到,不用互相犧牲。
 _REBOOT_CANCEL_MARGIN_SEC = 5.0
+_REBOOT_WATCH_SEC = 60.0                                   # 要監測滿的秒數
+_REBOOT_COUNTDOWN_SEC = _REBOOT_WATCH_SEC + _REBOOT_CANCEL_MARGIN_SEC
 
 
 # 倒數結束的原因 → 取消重開的理由。★沒有列在這裡的原因就是「讓它重開」★
@@ -4069,6 +4108,80 @@ _COUNTDOWN_ABORT_REASONS = {
     "user_back": "★倒數期間使用者回來操作★",
     "idle_unknown": "倒數期間查不出使用者閒置時間(可能有人在)",
 }
+
+
+def _finish_bde_reboot(outcome: str, *, rollback, run=None) -> None:
+    """倒數監測結束後的收尾。★這裡才是「要不要真的重開」的決定點★
+
+    ★[2026-08-08 外審第 2 回]★ 舊做法是「監測 N 秒 → 剩下的交給 OS 倒數」,
+    於是監測結束到 OS 重開之間必然有一段沒有人在看的時間 —— 不管那段是
+    5 秒還是 1 秒,使用者在那時回來都會被重開。把餘裕從監測時間裡扣、
+    或把 OS 倒數拉長,都只是把那個窗口搬到別的位置。
+
+    現在:
+      1. 監測期間有人回來/HIS 恢復/查不出 → 照舊 `shutdown /a` 取消。
+      2. 監測滿了而且一路都沒人 → **先取消排定的重開**,再取最後一次 idle 樣本;
+         仍然沒人才下 `shutdown /r /t 0`(立即)。
+         最後一次觀測與重開之間不再有無人看守的時間。
+      3. 取消不掉 → 原本排定的重開仍會發生(那是既有行為,而且是安全的:
+         它本來就要重開)。
+    """
+    if outcome != "elapsed":
+        _abort_reboot_if_needed(outcome, rollback=rollback, run=run)
+        return
+    runner = run or (lambda cmd: subprocess.run(
+        cmd, capture_output=True, timeout=15,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))
+    # 先把排定的那一次取消掉,才有辦法「看完最後一眼再決定」。
+    try:
+        cpa = runner(["shutdown", "/a"])
+        if cpa.returncode != 0:
+            logging.warning("[BDE] 監測期滿但取消不掉排定的重開(rc=%s)→ "
+                            "讓原本排定的重開發生", cpa.returncode)
+            return                      # 排定的重開仍會來,結果一樣是重開
+    except Exception:
+        logging.warning("[BDE] 監測期滿但 shutdown /a 失敗 → "
+                        "讓原本排定的重開發生", exc_info=True)
+        return
+    # ★最後一眼★ 查不出來就當作有人(與倒數期間同一個保守方向)。
+    idle = _user_idle_seconds_or_none()
+    threshold = float(_keepalive.BDE_REBOOT_MIN_IDLE_SECONDS)
+    if idle is None or idle < threshold:
+        logging.error("[BDE] 監測期滿後的最後一次確認:%s → 不重開",
+                      "查不出閒置時間" if idle is None
+                      else f"使用者已回來(閒置僅 {idle:.0f} 秒)")
+        _bde_rollback_after_abort(rollback, "最後一刻確認到有人/查不出閒置")
+        return
+    try:
+        cp = runner(["shutdown", "/r", "/t", "0", "/c",
+                     "皮膚科會診查詢:HIS BDE 初始化失敗,閒置自動重開機修復"])
+        if cp.returncode != 0:
+            logging.error("[BDE] 立即重開下達失敗(rc=%s)→ 本次不重開,"
+                          "交給下一輪", cp.returncode)
+            _bde_rollback_after_abort(rollback, "立即重開下達失敗")
+    except Exception:
+        logging.error("[BDE] 立即重開下達失敗 → 本次不重開", exc_info=True)
+        _bde_rollback_after_abort(rollback, "立即重開下達例外")
+
+
+def _bde_rollback_after_abort(rollback, why: str) -> None:
+    """取消重開之後把時間戳回滾(沒真的重開就別吃掉 24 小時防護)。
+
+    ★[2026-08-08 外審第 3 回] `rollback` 是【單引數】的★
+    生產的回呼是 `_rollback_ts(why, ...)`。我第一版用 `rollback()` 呼叫,
+    TypeError 又被 `except Exception` 吞掉 —— 時間戳沒回滾,於是
+    「最後一刻使用者回來」或「立即重開下達失敗」會把自動修復壓住 24 小時。
+    而我的測試用 `lambda: None` 當 stub,剛好把這個錯蓋過去。
+    """
+    global _bde_shutdown_pending
+    with _bde_watch_lock:
+        _bde_shutdown_pending = False
+    try:
+        if callable(rollback):
+            rollback(why)
+    except Exception:
+        logging.warning("[BDE] 回滾時間戳失敗 → 自動修復可能被壓住 24 小時",
+                        exc_info=True)
 
 
 def _abort_reboot_if_needed(outcome: str, *, rollback,
@@ -4262,7 +4375,8 @@ def _bde_reboot_watch_loop(my_gen: int) -> None:
             rc = -1
             try:
                 cp = subprocess.run(
-                    ["shutdown", "/r", "/t", "60", "/c",
+                    ["shutdown", "/r", "/t", str(int(_REBOOT_COUNTDOWN_SEC)),
+                     "/c",
                      "皮膚科會診查詢:HIS BDE 初始化失敗,閒置自動重開機修復"],
                     capture_output=True, timeout=15,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -4301,13 +4415,15 @@ def _bde_reboot_watch_loop(my_gen: int) -> None:
             #   照重開。整個自動重開機的前提就是「沒有人在用這台電腦」,那個前提
             #   在這 60 秒內隨時可能不成立,所以要持續驗證。
             #
-            #   ★最後幾秒偵測不到,這是刻意的★(2026-08-04 外審第 2 輪 盲區 B)
-            #   下的是 `/t 60` 卻只監測 55 秒 —— 監測滿 60 秒就沒有時間執行
-            #   `shutdown /a` 了。留餘裕是取捨,不是疏漏。舊註解寫「一直驗到最後
-            #   一刻」是不實的宣稱(實作根本沒有那個性質),已改。
-            _abort_reboot_if_needed(
-                _await_reboot_countdown(60.0 - _REBOOT_CANCEL_MARGIN_SEC),
-                                    rollback=_rollback_ts)
+            #   ★[2026-08-08 外審第 2 回] 盲區不能只是「搬家」★
+            #   我第一版把 OS 倒數拉長到 65 秒、監測 60 秒 —— 第 60~65 秒
+            #   仍然沒有人在看,使用者在那時回來一樣會被重開。窗口只是換了位置。
+            #   真正消滅它的做法:監測期滿之後【先取消排定的重開】,
+            #   再取最後一次 idle 樣本,確認仍然沒人才下【立即】重開。
+            #   這樣「最後一次觀測」與「重開」之間不再有任何無人看守的時間。
+            #   排定的 65 秒仍然有意義:它是我們自己掛掉時的保險。
+            _finish_bde_reboot(_await_reboot_countdown(_REBOOT_WATCH_SEC),
+                               rollback=_rollback_ts)
             return
     finally:
         # [codex P2 R4] 退場與排程必須原子:本看守決定退場(give_up/shutdown 被拒/
@@ -5585,14 +5701,46 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                                 # [2026-06-25 user] 第一次啟動還沒建過基準 → 開機這輪只建
                                 # 基準、不寄,避免每次重啟收一封「全部未回覆清單」的信。
                                 # [外審第 6 輪 P2-01] 未經確認的清單不建基準(下輪再建)。
-                                if _save_notified_if_eligible(
+                                # ★[2026-08-08 外審第 5 回] 順序:先確認標記能
+                                #   落地,再建基準★
+                                #   我上一版是「先建基準 → 發現標記沒落地 →
+                                #   改走 fail-open 寄信」。但基準【已經 commit
+                                #   了】(記憶體 + initialized + 可能已存檔),
+                                #   而 fail-open 那封信如果寄不出去,下一輪就會
+                                #   認為所有會診都通知過而什麼都不寄 ——
+                                #   那批會診永遠送不出去。
+                                #   基準只能在【送達之後】才可以前進,所以標記
+                                #   落不了地時,連基準都不要建:走 fail-open,
+                                #   由既有的「寄成功才更新基準」那條路接手。
+                                # ★[外審第 6 回] 先做【不變動狀態】的合格檢查★
+                                #   `_may_update_baseline()` 是純判斷。上一版
+                                #   直接先寫標記,而清單若是「未經回讀確認」的,
+                                #   後面就不會建基準 —— 於是留下「有標記、沒基準」
+                                #   → 下一輪判成基準遺失,把整份清單寄出去 + 假告警。
+                                #   不合格的清單必須讓標記與基準【都不要出現】。
+                                if not _may_update_baseline(roster_texts):
+                                    logging.warning(
+                                        "[poll] 首輪清單未經回讀確認 → 這一輪不建"
+                                        "基準也不留標記(下一輪重新比對)")
+                                    _note_job_success()
+                                    return
+                                if not _mark_baseline_established():
+                                    logging.error(
+                                        "[poll] ★「建立過基準」的標記無法寫入★ "
+                                        "→ 本輪不建基準、改為 fail-open 照常寄信"
+                                        "並告警;請確認 settings 目錄可寫")
+                                    _why = "marker_not_durable"
+                                elif _save_notified_if_eligible(
                                         roster_texts, _poll_sig,
                                         reason="建立首次基準"):
                                     logging.info(
                                         "[poll] 首次建立會診基準(%d 筆),本輪不寄信",
                                         len(_poll_sig))
-                                _note_job_success()   # [codex] 這是【成功】跑完的一輪
-                                return
+                                    _note_job_success()
+                                    return
+                                else:
+                                    _note_job_success()
+                                    return
                             # ★[2026-08-04 外審 P1-05] 基準遺失/損毀不可以靜默吞掉★
                             #   這台機器建立過基準,現在卻讀不到 —— 我們【不知道】哪些
                             #   會診已經通知過。靜默重建等於把當下所有未回覆會診標成
@@ -5606,9 +5754,10 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                                 _why, len(_poll_sig))
                             _alert_baseline_lost(_why, len(_poll_sig))
                             _poll_extract_note = (
-                                "⚠ 會診通知基準遺失或損毀，本程式已無從得知哪些會診先前"
-                                "通知過。本信列出【目前全部未回覆的會診】，請人工核對是否"
-                                "有新的；下一輪起恢復正常比對。")
+                                "⚠ 會診通知基準遺失／損毀，或首次基準無法可靠留存，"
+                                "本程式已無從得知哪些會診先前通知過。本信列出"
+                                "【目前全部未回覆的會診】，請人工核對是否有新的；"
+                                "下一輪起恢復正常比對。")
                         # [2026-08-04 外審 P1-04] 不可以直接集合相減 —— 升級當下
                         # 基準還是舊格式(只有病歷號)，直接相減會把每一張既有會診
                         # 都當成新的而整份重寄。見 `_new_consult_ids`。

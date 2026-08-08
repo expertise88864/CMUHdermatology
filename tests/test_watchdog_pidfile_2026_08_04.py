@@ -126,14 +126,37 @@ class TestPidReuseByAnotherPythonProcess:
 
         assert pidfile.read_verified_pid("autoclock") == 4321
 
-    def test_a_tiny_float_difference_is_still_the_same_process(
+    def test_a_last_bit_float_difference_is_still_the_same_process(
             self, tmp_path, monkeypatch):
-        """浮點表示的最後一位不該決定「要不要強殺一支程式」。"""
+        """浮點表示的最後一位不該決定「要不要強殺一支程式」。
+
+        ★[2026-08-08 外審] 這個測試原本用 10 毫秒的差距★ —— 那不是「浮點的
+        最後一位」,那是一個真實的時間差,足以塞進一次 PID 回收再配發。
+        它等於把「快速 PID 重用」這個情境明確斷言成「同一個行程」,
+        把缺陷釘成通過條件。改成真正的最後一位(`math.nextafter`)。
+        """
+        import math
+        monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
+        t = 1_780_000_000.5
+        _write_record(tmp_path, "autoclock", create_time=t)
+        self._fake_psutil(monkeypatch,
+                          create_time=math.nextafter(t, math.inf))
+
+        assert pidfile.read_verified_pid("autoclock") == 4321
+
+    def test_a_ten_millisecond_difference_is_a_different_process(
+            self, tmp_path, monkeypatch):
+        """★核心★ 本專案好幾支程式都是同一個 `pythonw.exe`,名稱與 executable
+        檢查都會一起通過 —— 最後真正在分辨身分的就只有建立時間。
+        Windows 的 PID 可以在幾十毫秒內被回收再配出去,而下游是
+        `taskkill /F /T`:認錯的代價是強殺一支無關的自家程式連同它的子行程。"""
         monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
         _write_record(tmp_path, "autoclock", create_time=1_780_000_000.5)
         self._fake_psutil(monkeypatch, create_time=1_780_000_000.51)
 
-        assert pidfile.read_verified_pid("autoclock") == 4321
+        assert pidfile.read_verified_pid("autoclock") is None, (
+            "★10 毫秒的建立時間差被當成同一個行程★ "
+            "那正是快速 PID 重用的樣子,而下游會 taskkill /F /T")
 
     def test_a_record_without_a_create_time_is_refused(self, tmp_path,
                                                        monkeypatch):
@@ -421,3 +444,195 @@ class TestNonFiniteNumbersCannotBypassTheCheck:
 
         assert pidfile.read_verified_pid("autoclock") is None, (
             "★含非標準 JSON token 的 PID 檔仍被採用★")
+
+
+class TestTheVerifyToKillRaceIsClosed:
+    """★[2026-08-08 外審第 2 回]★ 收緊建立時間容差只縮小了「驗證當下」的窗口，
+    擋不住「驗證之後」：`read_verified_pid()` 回的是裸 PID，從它回傳到下游真的
+    執行 `taskkill /F /T` 之間，那個行程可能已結束、PID 被配給另一支自家程式。
+
+    做法是開一個 process handle 把 PID 釘住 —— Windows 只要還有人握著 handle，
+    就不會把那個 PID 配給別人。（與 2026-07-27 事故同一條教訓：spawn 子行程要留
+    handle。）
+    """
+
+    def test_it_pins_before_verifying(self):
+        """★順序不可以反過來★ 先驗再開 handle 的話，中間那一瞬間仍可能被換掉。"""
+        import ast
+        import inspect
+        import textwrap
+        src = textwrap.dedent(inspect.getsource(pidfile.pinned_verified_pid))
+        tree = ast.parse(src)
+        open_line = verify_lines = None
+        verifies = []
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "OpenProcess"):
+                open_line = n.lineno
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                    and n.func.id == "read_verified_pid"):
+                verifies.append(n.lineno)
+        assert open_line and len(verifies) >= 2, (
+            f"open={open_line} verifies={verifies}")
+        verify_lines = [ln for ln in verifies if ln > open_line]
+        assert verify_lines, (
+            "★開 handle 之後沒有再驗一次★ 那樣釘住的可能不是我們要的那個行程")
+
+    def test_no_handle_means_no_kill(self, tmp_path, monkeypatch):
+        """★拿不到 handle 就不要動手★ 寧可不殺，也不要在無法保證身分時強殺。"""
+        monkeypatch.setattr(pidfile, "get_settings_dir", lambda: str(tmp_path))
+        _write_record(tmp_path, "autoclock", create_time=1_780_000_000.5)
+        self_ = self
+        del self_
+        import ctypes
+        monkeypatch.setattr(pidfile, "read_verified_pid", lambda name: 4321)
+
+        class _K:
+            @staticmethod
+            def OpenProcess(*a):
+                return 0            # 取不到 handle
+
+            @staticmethod
+            def CloseHandle(*a):
+                return 1
+        monkeypatch.setattr(ctypes, "windll",
+                            type("W", (), {"kernel32": _K})(), raising=False)
+        with pidfile.pinned_verified_pid("autoclock") as pid:
+            assert pid is None, "★取不到 handle 卻仍然交出 PID★"
+
+    def test_the_watchdog_uses_the_pinned_path(self):
+        """★接線★ helper 存在但沒人用 = 競態照舊。"""
+        import ast
+        import inspect
+        import textwrap
+        from cmuh_common import watchdog_core as wc
+        src = textwrap.dedent(inspect.getsource(wc))
+        names = {n.func.id for n in ast.walk(ast.parse(src))
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        assert "kill_pids_verified" in names, "kill 路徑沒有走釘住身分的版本"
+        pinned = textwrap.dedent(inspect.getsource(wc.kill_pids_verified))
+        assert "pinned_verified_pid" in pinned
+        # ★兩個 kill 點都要走★(突變驗證抓到的:只改其中一個,
+        #   「名字有出現」的檢查照樣綠 —— 而漏掉的那一個競態原封不動)
+        tree = ast.parse(src)
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            if fn.name == "kill_pids_verified":
+                continue          # 它自己就是那個包裝
+            for comp in ast.walk(fn):
+                if not isinstance(comp, ast.ListComp):
+                    continue
+                calls = {c.func.id for c in ast.walk(comp)
+                         if isinstance(c, ast.Call)
+                         and isinstance(c.func, ast.Name)}
+                assert "kill_pid" not in calls, (
+                    f"★{fn.name} 還留著裸的 kill_pid 迴圈★ "
+                    "那條路的「驗證到 kill」競態沒有被關掉")
+
+
+class TestTheCmdlineFallbackCanStillBeKilled:
+    """★[2026-08-08 外審第 3 回]★ `_find_pids_holding_mutex()` 回的 PID 可能
+    來自【PID 檔】，也可能來自【cmdline 比對後備】—— 後者正是在「PID 檔不存在／
+    舊格式／驗不過」時啟用的。
+
+    我第一版不管來源一律要求釘住，於是那些情況下 pin 必然失敗、PID 永遠殺不掉：
+    **半死救援在那條路上整個停擺**。修一個競態卻關掉一整條救援路徑，
+    比原本的問題嚴重。
+    """
+
+    def test_a_fallback_pid_is_still_killed(self, monkeypatch):
+        from cmuh_common import watchdog_core as wc
+        killed = []
+        monkeypatch.setattr(wc, "kill_pid", lambda p: killed.append(p) or True)
+        # ★來源是查詢當下記下的★(外審第 4 回)不是事後重讀 PID 檔推的。
+        monkeypatch.setattr(wc, "_PID_FROM_PIDFILE", {}, raising=False)
+        out = wc.kill_pids_verified([777], "autoclock")
+        assert out == [777] and killed == [777], (
+            "★PID 檔不可用時,cmdline 後備找到的 PID 也殺不掉了★ "
+            "半死救援在那條路上整個停擺")
+
+    def test_a_verified_pid_that_cannot_be_pinned_is_not_killed(self,
+                                                                monkeypatch):
+        """★反方向★ 驗得出來卻釘不住 → 不殺(fail-closed)。"""
+        from contextlib import contextmanager
+
+        from cmuh_common import watchdog_core as wc
+        killed = []
+        monkeypatch.setattr(wc, "kill_pid", lambda p: killed.append(p) or True)
+        monkeypatch.setattr(wc, "_PID_FROM_PIDFILE", {"autoclock": 777},
+                            raising=False)
+        import cmuh_common.pidfile as pf
+
+        @contextmanager
+        def _no_pin(name):
+            yield None
+        monkeypatch.setattr(pf, "pinned_verified_pid", _no_pin)
+        assert wc.kill_pids_verified([777], "autoclock") == []
+        assert killed == [], "★釘不住卻仍然 /F /T★"
+
+    def test_an_import_failure_is_fail_closed(self, monkeypatch):
+        """★[外審第 3 回] 保護機制載入不了時,不可以退回不安全的路★
+        那等於「保護消失的時候剛好把保護關掉」。"""
+        import builtins
+
+        from cmuh_common import watchdog_core as wc
+        killed = []
+        monkeypatch.setattr(wc, "kill_pid", lambda p: killed.append(p) or True)
+        real_import = builtins.__import__
+
+        def _boom(name, *a, **k):
+            if name == "cmuh_common.pidfile":
+                raise ImportError("simulated partial deployment")
+            return real_import(name, *a, **k)
+        monkeypatch.setattr(builtins, "__import__", _boom)
+        out = wc.kill_pids_verified([777], "autoclock")
+        monkeypatch.undo()
+        assert out == [] and killed == [], (
+            "★安全機制載入失敗卻仍然執行未驗證的 /F /T★")
+
+
+    def test_provenance_comes_from_the_lookup_not_a_later_read(self,
+                                                              monkeypatch):
+        """★核心(第 4 回)★ 上一版在 kill 之前【重讀】PID 檔來判斷來源。
+        若那個行程剛好在查詢之後結束、PID 被回收,重讀會回 None ——
+        而 None 被解讀成「這是 cmdline 後備」→ 直接 kill 了那個【已經被換掉】
+        的 PID。判斷來源的證據必須來自查詢當下,不是一次新的觀測。
+        """
+        from contextlib import contextmanager
+
+        from cmuh_common import watchdog_core as wc
+        killed = []
+        monkeypatch.setattr(wc, "kill_pid", lambda p: killed.append(p) or True)
+        # 查詢當下:確實是從 PID 檔驗來的
+        monkeypatch.setattr(wc, "_PID_FROM_PIDFILE", {"autoclock": 777},
+                            raising=False)
+        import cmuh_common.pidfile as pf
+        # 之後那個行程沒了 → 重讀會回 None(上一版就是被這個騙的)
+        monkeypatch.setattr(pf, "read_verified_pid", lambda name: None)
+
+        @contextmanager
+        def _no_pin(name):
+            yield None
+        monkeypatch.setattr(pf, "pinned_verified_pid", _no_pin)
+        assert wc.kill_pids_verified([777], "autoclock") == []
+        assert killed == [], (
+            "★把「重讀不到」當成「這是後備來的」而直接強殺★ "
+            "那個 PID 已經是別人的了")
+
+    def test_the_lookup_records_provenance(self):
+        """★接線★ 查詢那一端要真的記下來源,否則 kill 端永遠看不到。"""
+        import ast
+        import inspect
+        import textwrap
+
+        from cmuh_common import watchdog_core as wc
+        src = textwrap.dedent(inspect.getsource(wc._find_pids_holding_mutex))
+        assert "_PID_FROM_PIDFILE" in src, "查詢時沒有記下 PID 的來源"
+        tree = ast.parse(src)
+        writes = [n for n in ast.walk(tree)
+                  if isinstance(n, ast.Assign)
+                  for t in n.targets
+                  if isinstance(t, ast.Subscript)
+                  and getattr(t.value, "id", "") == "_PID_FROM_PIDFILE"]
+        assert writes, "沒有把「來自 PID 檔」記下來"
