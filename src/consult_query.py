@@ -169,12 +169,21 @@ DEFAULT_CONFIG = {
         "mbpushowo@gmail.com",
     ],
     # [2026-08-06 外審 P1-05] 只接受【通過 SPF/DKIM/DMARC 驗證】的觸發信。
-    #   白名單比對的 From 是寄件者自填、可偽造的字串;開啟本項後,還要 Gmail 在
+    #   白名單比對的 From 是寄件者自填、可偽造的字串;本項要求 Gmail 在
     #   Authentication-Results 標記通過才觸發(fail-closed)。
-    #   預設 False:貿然開啟可能讓正在用的觸發功能靜默失效(某些寄送路徑不帶該
-    #   header)。先看 consult_query.log 的「未通過驗證」warning,確認自己的觸發
-    #   信長期都通過之後再改成 true。
-    "require_authenticated_trigger": False,
+    #
+    # ★[2026-08-08 外審] 預設改為 True★
+    #   之前預設 False,理由是「貿然開啟可能讓正在用的觸發功能靜默失效」。
+    #   但那個預設的實際意義是:**任何能寄信到這個信箱的人,都可以遠端啟動
+    #   一次 HIS 會診查詢,並讓一封含全院會診清單的信被寄出去。**
+    #   只要把 From 偽造成白名單醫師就成立 —— 而 From 本來就是寄件者自填的。
+    #   一個預設就開著的未授權遠端觸發,比「功能可能要調一次設定」嚴重得多。
+    #
+    #   ★原本那個顧慮用另一種方式解掉:不讓它「靜默」★
+    #   白名單來信但驗證不過時,除了 log 之外還會寄一封開發者告警
+    #   (見 `_alert_trigger_rejected`)。所以若真的是我們的判定太嚴,
+    #   第一次就會有人知道,而不是等到有人抱怨「寄了信卻沒收到」。
+    "require_authenticated_trigger": True,
     # [2026-06-16] 每天 12:40 + 17:10 都跑（不分平假日）。打卡系統於 7:31/12:31/17:01
     # 才登入打卡，故延後到 12:40 / 17:10 再查詢寄信，確保中午(12:31)上班與下午(17:01)
     # 下班打卡都「已完成並寫入紀錄」後才查，不會還沒打卡就先寄出誤判未打卡。
@@ -371,6 +380,43 @@ def _has_his_credentials(cfg: dict) -> bool:
                 and str(cfg.get("password") or "").strip())
 
 
+_TRIGGER_AUTHZ_MIGRATION_KEY = "trigger_authz_migrated_2026_08"
+
+
+def _migrate_trigger_authz(saved: dict) -> None:
+    """把既有設定檔裡的 `require_authenticated_trigger=false` 一次性打開。
+
+    ★[2026-08-08 外審第 2 回 F1]★ 只改 `DEFAULT_CONFIG` 保護不到【已經存在的
+    設定檔】—— 而診間那台一定有(設定頁存過檔就會把整份寫下來)。
+    那個 false 的實際意義是「任何能寄信到這個信箱的人都可以遠端啟動 HIS 查詢」,
+    所以這不是使用者的偏好設定,是一個不該留著的舊預設。
+
+    ★仍然留一條明確的 opt-out★ 遷移只做一次(用 `trigger_authz_migrated_2026_08`
+    記號)。使用者若在遷移【之後】自己把它關掉,那是他知情的選擇,不會再被改回來。
+    """
+    if saved.get(_TRIGGER_AUTHZ_MIGRATION_KEY):
+        return
+    saved[_TRIGGER_AUTHZ_MIGRATION_KEY] = True
+    changed = saved.get("require_authenticated_trigger") is False
+    if changed:
+        saved["require_authenticated_trigger"] = True
+        logging.warning(
+            "[trigger] 舊設定檔的 require_authenticated_trigger=false 已自動打開"
+            " —— 那個值讓任何能寄信到觸發信箱的人都能遠端啟動 HIS 查詢。"
+            "若確定要關,請在設定頁/設定檔改回 false(遷移只做一次,不會再動它)")
+    # ★[第 3 回] marker 與新值要【寫回磁碟】★
+    #   上一版只改記憶體:每次啟動都重新遷移一次,而註解承諾的
+    #   「遷移後可以明確 opt-out」根本不成立 —— 使用者改回 false,
+    #   下次開機又被打開。宣稱與實作不符,又一次。
+    #   ★寫回失敗仍然維持本次 fail-closed★:安全姿態不因存檔失敗而退讓。
+    try:
+        from cmuh_common.atomic_io import atomic_write_json  # noqa: PLC0415
+        atomic_write_json(str(CONFIG_FILE), saved)
+    except Exception:
+        logging.warning("[trigger] 授權遷移寫回設定檔失敗(本次仍要求驗證,"
+                        "下次啟動會再遷移一次)", exc_info=True)
+
+
 def load_config() -> dict:
     with _config_lock:
         cfg = dict(DEFAULT_CONFIG)
@@ -378,6 +424,7 @@ def load_config() -> dict:
             if CONFIG_FILE.exists():
                 saved = safe_load_json(str(CONFIG_FILE), default={})
                 if isinstance(saved, dict):
+                    _migrate_trigger_authz(saved)
                     cfg.update(saved)
         except Exception:
             logging.warning("讀取設定檔失敗，使用預設值", exc_info=True)
@@ -5318,7 +5365,8 @@ def _cleanup_orphan_systemftp() -> None:
 
 
 def _do_full_job(trigger_label: str, override_recipients=None, *,
-                 from_retrigger: bool = False) -> None:
+                 from_retrigger: bool = False,
+                 trigger_uids=(), requeued_out=None) -> None:
     """完整一次任務：跑流程 → 寄信。供排程／手動共用，整體互斥。
 
     多機共存策略：先檢查本機 Outlook 是否可用，不可用就直接靜默跳過——
@@ -5368,7 +5416,11 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
         #      它自己在第 1 輪抓到的 bug：舊 worker 放棄、接管者拿不到 `_flow_lock`
         #      也放棄 → 兩邊都不寄。那比現況嚴重得多。
         if trigger_label == "email" and override_recipients:
-            _enqueue_pending_retrigger(trigger_label, override_recipients)
+            _enqueue_pending_retrigger(trigger_label, override_recipients,
+                                       trigger_uids)
+            # ★交還 uid:這筆工作【還沒做】,呼叫端不可以把 journal 結案★
+            if requeued_out is not None:
+                requeued_out.extend(trigger_uids)
             logging.info("[re-trigger] 已排隊，等目前任務結束後補跑這筆 email 觸發")
         return
     # [2026-07-25 審查] import/CoInitialize 必須在 try 內：舊版放在 acquire 與 try 之間,
@@ -5919,12 +5971,25 @@ def _merge_retrigger_recipients(existing, incoming):
     return merged
 
 
-def _enqueue_pending_retrigger(trigger_label: str, override_recipients) -> None:
-    """記下一筆 pending re-trigger；同 label 合併 email 收件人，不無限堆積。"""
+_pending_retrigger_uids: dict = {}
+
+
+def _enqueue_pending_retrigger(trigger_label: str, override_recipients,
+                               trigger_uids=()) -> None:
+    """記下一筆 pending re-trigger；同 label 合併 email 收件人，不無限堆積。
+
+    ★uid 也要合併★(外審第 11 輪第 2 回 F3)同 label 的多筆會被併成一筆,
+    對應的觸發信 uid 自然也不只一個 —— 補跑做完要把【全部】結案,
+    少結一個就會在下次開機被補跑、醫師收到第二封。
+    """
     with _pending_retriggers_lock:
         existing = _pending_retriggers.get(trigger_label)
         _pending_retriggers[trigger_label] = _merge_retrigger_recipients(
             existing, override_recipients)
+        if trigger_uids:
+            cur = set(_pending_retrigger_uids.get(trigger_label) or ())
+            cur |= set(trigger_uids)
+            _pending_retrigger_uids[trigger_label] = cur
 
 
 # ★[2026-07-30 外審第 4 輪] 已服務收件人的墓碑（tombstone）★
@@ -6036,7 +6101,9 @@ def _drain_pending_retriggers() -> None:
                 return
             with _pending_retriggers_lock:
                 pending = dict(_pending_retriggers)
+                pending_uids = dict(_pending_retrigger_uids)
                 _pending_retriggers.clear()
+                _pending_retrigger_uids.clear()
             for label, override in pending.items():
                 # ★[2026-07-30 外審第 4 輪] 派出去之前先看墩碑★
                 #   上面已經「複製佇列並清空」了，而這裡還要等
@@ -6060,12 +6127,22 @@ def _drain_pending_retriggers() -> None:
                             "[re-trigger] 這些人剛剛已經收到結果了，不重複補跑：%s",
                             ", ".join(str(x) for x in dropped))
                     if not send_to:
+                        # ★這裡不 continue 掉 uid★ 那幾封信的請求【已經被服務】
+                        #   (剛剛那一輪就是寄給他們的),所以要結案,
+                        #   否則下次開機會補跑一次、醫師收到第二封。
+                        for _u in (pending_uids.get(label) or ()):
+                            try:
+                                _trigger_journal_done(_u)
+                            except Exception:
+                                logging.debug("[trigger] 結案失敗", exc_info=True)
                         continue
                 logging.info(
                     "[re-trigger] 補跑被擋下的觸發：%s", label)
                 try:
-                    trigger_job_async(label, override_recipients=send_to,
-                                      from_retrigger=True)
+                    trigger_job_async(
+                        label, override_recipients=send_to,
+                        from_retrigger=True,
+                        trigger_uids=tuple(pending_uids.get(label) or ()))
                 except Exception:
                     logging.exception("[re-trigger] 補跑 %s 失敗", label)
         finally:
@@ -6084,8 +6161,232 @@ def _drain_pending_retriggers() -> None:
         logging.exception("[re-trigger] 啟動補跑 thread 失敗")
 
 
+_TRIGGER_REJECT_ALERT_INTERVAL_SEC = 3600.0
+_trigger_reject_alert_at = 0.0
+
+
+def _alert_trigger_rejected(senders: list) -> None:
+    """白名單醫師的觸發信被擋下來 → 主動說。
+
+    ★[2026-08-08 外審 F1]★ `require_authenticated_trigger` 之所以一直不敢
+    預設打開,是怕「功能靜默失效」。那個顧慮的正確解法不是把門開著,而是
+    【不讓它靜默】:這封告警一寄出,就有兩種可能都被涵蓋 ——
+      * 我們的驗證判定太嚴 → 第一次就有人知道要調整;
+      * 真的有人在偽造這位醫師的位址 → 那更該讓人知道。
+    """
+    global _trigger_reject_alert_at
+    now = time.time()
+    if now - _trigger_reject_alert_at < _TRIGGER_REJECT_ALERT_INTERVAL_SEC:
+        return
+    _trigger_reject_alert_at = now
+    body = (
+        "以下白名單寄件人寄來了觸發信,但沒有通過 SPF/DKIM/DMARC 驗證,"
+        "因此【沒有觸發】會診查詢:\n"
+        f"  {', '.join(sorted(str(x) for x in senders))}\n\n"
+        "兩種可能:\n"
+        "  (1) 這位醫師的寄送路徑不帶可信的 Authentication-Results ——\n"
+        "      那要調整判定,否則他會一直以為寄了信卻沒下文;\n"
+        "  (2) 有人偽造這位醫師的 From 想遠端觸發 —— 那這次擋對了。\n\n"
+        "請看 consult_query.log 中同一時間的「未通過寄件人驗證」那幾行。")
+
+    def _worker():
+        global _trigger_reject_alert_at
+        try:
+            from cmuh_common.smtp_mail import send_mail  # noqa: PLC0415
+            send_mail(recipients=[str(x) for x in _developer_alert_recipients()],
+                      subject="會診自動化:觸發信未通過寄件人驗證(未觸發)",
+                      body=body, attachment_path=None, category="system")
+        except Exception:
+            _trigger_reject_alert_at = (time.time()
+                                        - _TRIGGER_REJECT_ALERT_INTERVAL_SEC + 600)
+            logging.warning("[trigger] 未驗證告警寄送失敗(10 分鐘後重試)",
+                            exc_info=True)
+    try:
+        threading.Thread(target=_worker, name="ConsultTriggerRejectAlert",
+                         daemon=True).start()
+    except Exception:
+        logging.debug("[trigger] 未驗證告警執行緒啟動失敗", exc_info=True)
+
+
+def _handoff_email_triggers(matched_uids, senders,
+                            require_auth: bool = True) -> None:
+    """先落地、再標已讀、最後觸發 —— 順序就是這個修正的全部內容。
+
+    ★[2026-08-08 外審 F3]★ 舊流程是「標已讀 → 回到排程器 → 起 worker」,
+    中間任何中止都讓那封信永久消失(它已經不是 UNSEEN,再也掃不到)。
+    現在:journal 落地失敗就【不標已讀】—— 信留在 UNSEEN,下一輪重來,
+    寧可多觸發一次也不要漏掉一次會診請求。
+    """
+    want = {str(x).strip().lower() for x in (senders or [])}
+    todo = []
+    for _row in (matched_uids or []):
+        _uid, _addr = str(_row[0]), str(_row[1] or "").strip().lower()
+        _ok = bool(_row[2]) if len(_row) > 2 else False
+        # ★只處理【通過驗證】的那幾封★(外審)同一位寄件人可能同時有一封合法
+        #   已驗證信與一封偽造未驗證信;把兩封都拿去觸發等於讓偽造那封也生效。
+        # ★但「被接受」的定義要跟著 strict 設定走★(外審第 2 回)
+        #   使用者明確關掉 `require_authenticated_trigger` 時,未驗證的信【是】
+        #   被接受的。上一版仍然把它們全部濾掉 → 掉到下面「找不到 uid」的
+        #   後備路徑直接觸發(沒有 journal),而 `_final(only_unauth=True)` 又把
+        #   那封信標成已讀 —— 中途一中止,請求就消失了。
+        if _addr in want and (_ok or not require_auth):
+            todo.append((_uid, _addr))
+    if not todo:
+        # 沒有配對到 uid(理論上不會)→ 退回舊行為,至少不要漏掉請求。
+        logging.warning("[trigger] 找不到觸發信的 uid → 直接觸發(信會留在未讀)")
+        for addr in sorted(want):
+            trigger_job_async("email", override_recipients=[addr])
+        return
+    landed = []
+    _failed_addrs: set = set()
+    for uid, addr in todo:
+        if _trigger_journal_add(uid, addr):
+            landed.append((uid, addr))
+        else:
+            _failed_addrs.add(addr)
+            # ★[外審] 去重預約也要一起撤銷★
+            #   `_trigger_is_duplicate()` 在這之前就把「這位五分鐘內處理過」
+            #   寫下去了。journal 沒落地時信會留在未讀 —— 但下一輪它會撞上
+            #   去重分支,而去重是【終局處置】會把信標成已讀。
+            #   結果:工作沒做、journal 沒紀錄、信卻永久消失。
+            #   兩個各自正確的修正組合出來的洞。
+            logging.error("[trigger] 工作沒能落地 → 不標已讀,下一輪重來:%s",
+                          addr)
+    # ★只有【這位寄件人一封都沒落地】時才撤銷去重★(外審第 2 回)
+    #   同一位可能有兩封:一封落地了、工作正在跑,另一封沒落地。
+    #   這時撤銷去重,那封沒落地的下一輪就會再開一個工作 —— 同一位醫師
+    #   同時被服務兩次,正是去重要防的事。
+    _landed_addrs = {a for _u, a in landed}
+    for _a in sorted(_failed_addrs - _landed_addrs):
+        _undo_trigger_dedup(_a)
+    if not landed:
+        return
+    try:
+        from cmuh_common.imap_reader import mark_uids_seen  # noqa: PLC0415
+        mark_uids_seen([u for u, _ in landed])
+    except Exception:
+        # 標不掉只是會重複命中,而重複命中有 dedup 擋著;工作已經落地了。
+        logging.warning("[trigger] 標已讀失敗(工作已落地,不影響)", exc_info=True)
+    for uid, addr in landed:
+        trigger_job_async("email", override_recipients=[addr],
+                          trigger_uids=(uid,))
+
+
+# ═══════════ 觸發信的持久化接手(外審第 11 輪 F3)═══════════
+#   舊流程:`check_trigger` 在回傳【之前】就把命中信標成 \Seen,
+#   之後才回到排程器、才起 worker。這中間程式結束/重啟的話,那封信
+#   已經不是 UNSEEN,永遠不會再被掃到 —— 醫師乾等一個不會來的結果。
+#   新流程:先把「這個 uid 對應的工作」寫進 journal(落地) → 才標 \Seen
+#   → 才觸發。任一步之前中止,重啟後都補得回來:
+#     * journal 之前中止  → 信還是 UNSEEN,下一輪照樣掃到;
+#     * journal 之後中止  → journal 記得,開機補跑(標沒標到都一樣)。
+#   ★journal 只存 uid 與寄件人位址★ —— 那是醫師的公務信箱,不是病人資料。
+_TRIGGER_JOURNAL_NAME = "consult_trigger_journal.json"
+_trigger_journal_lock = threading.Lock()
+
+
+def _trigger_journal_path() -> str:
+    from cmuh_common.paths import get_settings_dir  # noqa: PLC0415
+    return os.path.join(get_settings_dir(), _TRIGGER_JOURNAL_NAME)
+
+
+def _trigger_journal_load() -> tuple:
+    """回 (內容, 是否讀得到)。
+
+    ★[2026-08-08 外審第 2 回 F2] 「讀不到」必須是一個【可分辨的答案】★
+    上一版讀不到就回空字典,而 `_trigger_journal_add` 拿著那個空字典加上
+    新的 uid 就寫回去 —— 帳上原本那幾筆【已經標成已讀、再也掃不到】的待辦
+    就這樣被覆蓋掉、永久消失。這正是這個專案一路在修的同一個病灶:
+    把「讀不到」當成某個確定的答案。
+    """
+    from cmuh_common.atomic_io import safe_load_json_ex  # noqa: PLC0415
+    data, status = safe_load_json_ex(_trigger_journal_path(), {},
+                                     backup_on_corrupt=False)
+    if status not in ("ok", "missing") or not isinstance(data, dict):
+        logging.error("[trigger] 讀不到觸發 journal(status=%s)", status)
+        return {}, False
+    return {k: v for k, v in data.items() if isinstance(v, dict)}, True
+
+
+def _trigger_journal_save(data: dict) -> bool:
+    from cmuh_common.atomic_io import atomic_write_json  # noqa: PLC0415
+    try:
+        atomic_write_json(_trigger_journal_path(), data)
+        return True
+    except Exception:
+        logging.error("[trigger] 寫入觸發 journal 失敗 → 不標已讀,留給下一輪",
+                      exc_info=True)
+        return False
+
+
+def _trigger_journal_add(uid: str, sender: str) -> bool:
+    """登記一筆待處理的觸發。回傳是否【確定落地】。
+
+    讀不到既有內容時一律失敗 —— 寫回去會把別的待辦蓋掉,而那些待辦對應的信
+    已經標成已讀、再也掃不到了。回 False 讓這封新的信留在 UNSEEN,下一輪重來。
+    """
+    with _trigger_journal_lock:
+        data, ok = _trigger_journal_load()
+        if not ok:
+            logging.error("[trigger] 讀不到 journal → 不寫入(避免蓋掉既有待辦),"
+                          "這封信留在未讀,下一輪再處理")
+            return False
+        data[str(uid)] = {"sender": str(sender or ""), "at": time.time()}
+        return _trigger_journal_save(data)
+
+
+def _trigger_journal_done(uid: str) -> None:
+    with _trigger_journal_lock:
+        data, ok = _trigger_journal_load()
+        if not ok:
+            # 讀不到就不要寫。這一筆留著會在下次開機被補跑一次(重複寄一封),
+            # 比把別人的待辦蓋掉好。
+            logging.warning("[trigger] 讀不到 journal → 不結案 %s(可能重複補跑)",
+                            uid)
+            return
+        if data.pop(str(uid), None) is not None:
+            _trigger_journal_save(data)
+
+
+def _trigger_journal_pending() -> dict:
+    with _trigger_journal_lock:
+        data, _ok = _trigger_journal_load()
+        return data
+
+
+_TRIGGER_JOURNAL_MAX_AGE_SEC = 6 * 3600.0
+
+
+def resume_pending_triggers() -> int:
+    """開機補跑 journal 裡還沒完成的觸發。回傳補跑幾筆。
+
+    ★太舊的不補跑★ 會診清單是「現在」的狀態,補寄一份六小時前的請求
+    只會讓醫師拿到與當下不符的資料(這與 IMAP 的陳舊觸發信過濾同一個道理)。
+    太舊的就結案並留 error log。
+    """
+    n = 0
+    now = time.time()
+    for uid, rec in list(_trigger_journal_pending().items()):
+        sender = str((rec or {}).get("sender") or "")
+        age = now - float((rec or {}).get("at") or 0)
+        if age > _TRIGGER_JOURNAL_MAX_AGE_SEC:
+            logging.error("[trigger] 待補觸發已過時(%.1f 小時)→ 不補跑:%s",
+                          age / 3600.0, sender or "(無寄件人)")
+            _trigger_journal_done(uid)
+            continue
+        if not sender:
+            _trigger_journal_done(uid)
+            continue
+        logging.warning("[trigger] 補跑上次沒做完的 email 觸發:%s", sender)
+        trigger_job_async("email", override_recipients=[sender],
+                          trigger_uids=(uid,))
+        n += 1
+    return n
+
+
 def trigger_job_async(trigger_label: str, override_recipients=None, *,
-                      from_retrigger: bool = False) -> None:
+                      from_retrigger: bool = False,
+                      trigger_uids=()) -> None:
     key = "consult"
     lease = _consult_job_gate.acquire_lease(key)
     if lease is None:
@@ -6097,19 +6398,47 @@ def trigger_job_async(trigger_label: str, override_recipients=None, *,
             trigger_label,
         )
         # [v17] 排隊：當前 job release 後補跑這個 trigger
-        _enqueue_pending_retrigger(trigger_label, override_recipients)
+        #   ★uid 要一起帶走★(第 2 回 F3)否則補跑成功也不會結案,
+        #   下次開機又補跑一次 = 醫師收到第二封。
+        _enqueue_pending_retrigger(trigger_label, override_recipients,
+                                   trigger_uids)
         return
+
+    _requeued: list = []
 
     def _worker():
         # worker_lease_scope：把 lease 綁在本緒上，讓 _do_full_job 深處（寄信前）也
         # 查得到自己有沒有被逾時接管（見 cmuh_common/task_gate.py）。
         with worker_lease_scope(lease):
+            _completed = False
             try:
                 _do_full_job(trigger_label,
                              override_recipients=override_recipients,
-                             from_retrigger=from_retrigger)
+                             from_retrigger=from_retrigger,
+                             trigger_uids=tuple(trigger_uids),
+                             requeued_out=_requeued)
+                _completed = True
             finally:
                 _consult_job_gate.release(key, lease)
+                # ★做完了才把 journal 那幾筆結案★(外審第 11 輪 F3)
+                #   ★[第 2 回] 但「被排進補跑佇列」不算做完★
+                #   `_do_full_job` 拿不到 `_flow_lock` 時會把這筆 email 觸發
+                #   排進 pending queue 然後 return。那時工作【還沒做】,
+                #   結案的話:補跑前當機 → 信早就標成已讀、journal 也空了 →
+                #   永久漏信。所以只結案「沒有被重新排隊」的那幾個。
+                # ★[第 3 回] 例外時也不可以結案★
+                #   `_do_full_job` 非預期拋錯(例如 CoInitialize 失敗)時,
+                #   信【已經標成已讀】而工作沒做完 —— 結案的話重啟也補不回來,
+                #   醫師既收不到結果、也收不到失敗通知。
+                #   `finally` 會在成功與例外兩種情況都跑,所以要自己記住走到哪。
+                _still_queued = set(_requeued)
+                for _u in (trigger_uids if _completed else ()):
+                    if _u in _still_queued:
+                        continue
+                    try:
+                        _trigger_journal_done(_u)
+                    except Exception:
+                        logging.debug("[trigger] journal 結案失敗", exc_info=True)
                 # [v17] release 後檢查有沒有 pending re-trigger 需要補跑
                 _drain_pending_retriggers()
 
@@ -6242,7 +6571,10 @@ def _run_imap_check_with_timeout(kw: str, timeout: float = 60.0,
 
     def _worker():
         try:
-            box["r"] = check_trigger(kw, max_age_sec=max_age_sec or None)
+            # ★命中信延後標記★ 由 `_handoff_email_triggers` 在工作落地之後
+            #   才標(陳舊命中信仍然照舊標掉清乾淨)。
+            box["r"] = check_trigger(kw, max_age_sec=max_age_sec or None,
+                                     defer_mark_matched=True)
         except Exception as e:  # noqa: BLE001
             box["r"] = _empty_imap_result(f"imap thread exception: {e!r}")
 
@@ -6328,6 +6660,18 @@ def load_trigger_dedup_state() -> None:
                          loaded)
     except Exception:
         logging.debug("[dedup] 去重狀態載入失敗(忽略)", exc_info=True)
+
+
+def _undo_trigger_dedup(sender: str) -> None:
+    """撤銷剛剛那筆去重預約(工作沒能落地時)。
+
+    ★[2026-08-08 外審]★ 去重是「這位五分鐘內已經處理過」的宣稱。工作根本
+    沒有被接手的話,那個宣稱就是假的 —— 而它會讓下一輪把這封信當成
+    「已處理過」而標成已讀(去重是終局處置)。信就這樣沒了。
+    """
+    with _trigger_dedup_lock:
+        if _recent_trigger_senders.pop(str(sender or "").lower(), None) is not None:
+            _persist_trigger_dedup_locked()
 
 
 def _trigger_is_duplicate(sender: str) -> bool:
@@ -6865,6 +7209,15 @@ def _ensure_scheduler_self_watchdog() -> None:
 def scheduler_loop() -> None:
     logging.info("=== 會診查詢排程器啟動 v%s ===", CURRENT_VERSION)
     _rebuild_schedule()
+    # ★開機先補跑上次沒做完的 email 觸發★(外審第 11 輪 F3)
+    #   那些觸發信已經被標成已讀了 —— 不從 journal 補跑的話,IMAP 那邊
+    #   再也掃不到它們,醫師會乾等一個不會來的結果。
+    #   接在這裡而不是留成一個沒人呼叫的 API:「有 API」不等於「會發生」。
+    try:
+        resume_pending_triggers()
+    except Exception:
+        logging.warning("[trigger] 補跑待處理觸發時出錯(不影響排程)",
+                        exc_info=True)
 
     # [穩定性] 啟動 self-watchdog 子 thread (獨立監看 scheduler 是否還活著)
     _ensure_scheduler_self_watchdog()
@@ -6991,34 +7344,84 @@ def scheduler_loop() -> None:
                             logging.warning(
                                 "收到觸發信但寄件人不在白名單，已忽略：%s",
                                 ", ".join(blocked))
+                        # ★[2026-08-08 外審第 2 回 F4] 終局處置的信要標已讀★
+                        #   命中信改成【延後】標記之後,只有被接受的那幾封會走
+                        #   handoff。被白名單/驗證拒絕的、以及去重略過的,
+                        #   沒有任何人去 acknowledge 它們 —— 拒絕信於是每 20 秒
+                        #   被重掃一次(每輪都寫一行 warning),而被去重的合法信
+                        #   在五分鐘窗過後又會變成可執行,把「已略過」的請求
+                        #   延後重跑一次。收集起來,在這一輪結束時一起標掉。
+                        _final_uids: list = []
+                        # ★一位寄件人可能寄了【好幾封】★(第 3 回)
+                        #   上一版用 dict 以寄件人為鍵,同一位的多封只留下最後
+                        #   一個 uid —— 其餘那幾封沒有人 acknowledge,
+                        #   會一直被重掃、或在去重窗過後再觸發一次完整查詢。
+                        _uid_of: dict = {}
+                        for _row in (r.get("matched_uids") or []):
+                            _u, _a = _row[0], _row[1]
+                            _ok = bool(_row[2]) if len(_row) > 2 else False
+                            _uid_of.setdefault(
+                                str(_a or "").strip().lower(),
+                                []).append((str(_u), _ok))
+
+                        def _final(addrs, _dst=_final_uids, _map=_uid_of,
+                                   only_unauth=False):
+                            # 預設引數把這一圈的 list/dict 綁進來(迴圈裡定義的
+                            # 函式若用外層名字,late binding 會指到最後一圈)。
+                            for _x in (addrs or []):
+                                for _u, _ok in (
+                                        _map.get(str(_x).strip().lower()) or []):
+                                    if only_unauth and _ok:
+                                        continue
+                                    _dst.append(_u)
+                        _final(blocked)
                         # ★[2026-08-06 外審 P1-05] 白名單比對的是可偽造的 From★
                         #   `From:` 是寄件者自填的純文字。imap_reader 現在會一併回
                         #   `authenticated_senders`(通過 SPF/DKIM/DMARC 者)。
-                        #   開啟 require_authenticated_trigger 後,未通過驗證的一律
-                        #   不觸發(fail-closed)。
-                        #   ★預設 False 的理由★:若使用者的觸發信路徑剛好不帶
-                        #   Authentication-Results(例如同帳號自寄),貿然預設開啟會讓
-                        #   臨床上正在用的觸發功能【靜默失效】。未通過驗證時一律
-                        #   記 warning,確認 log 都是 pass 之後再把這個開關打開。
+                        #   未通過驗證的一律不觸發(fail-closed,2026-08-08 起
+                        #   `require_authenticated_trigger` 預設就是 True)。
+                        #
+                        #   ★「不可以靜默失效」這個顧慮怎麼解★
+                        #   舊版把預設留成 False,理由是怕使用者的觸發信路徑不帶
+                        #   Authentication-Results、開了之後功能靜默失效。
+                        #   但那個預設的代價是「任何人都能遠端觸發」。
+                        #   現在改成:照樣擋下來,但【擋下來這件事會被主動說出來】
+                        #   —— 白名單醫師的信被擋時寄一封開發者告警。
+                        #   要嘛它從來不觸發(表示我們的判定沒問題),
+                        #   要嘛第一次就有人知道要調整,不會等到有人抱怨。
+                        #
                         #   風險註記:觸發結果是回寄給【From 那個位址】,所以偽造
-                        #   From 不會把病人資料送到攻擊者手上(只會騷擾該位醫師)。
+                        #   From 不會把病人資料送到攻擊者手上(只會騷擾該位醫師)——
+                        #   但那仍然是一次未授權的 HIS 操作與一封 PHI 郵件。
                         authed = {str(s).lower()
                                   for s in (r.get("authenticated_senders") or [])}
                         unverified = [s for s in allowed if s.lower() not in authed]
                         if unverified:
-                            if cfg.get("require_authenticated_trigger", False):
+                            if cfg.get("require_authenticated_trigger", True):
                                 logging.error(
-                                    "★觸發信未通過寄件人驗證 → 不觸發★(From 可偽造;"
-                                    "require_authenticated_trigger=True):%s",
+                                    "★觸發信未通過寄件人驗證 → 不觸發★(From 可偽造):%s",
                                     ", ".join(unverified))
                                 allowed = [s for s in allowed
                                            if s.lower() in authed]
+                                # ★未通過驗證也是【終局處置】★(第 3 回)
+                                #   不標已讀的話,同一封偽造信會每 20 秒被重掃
+                                #   一次、每輪寫一行 error,把 log 洗掉。
+                                _final(unverified)
+                                _alert_trigger_rejected(unverified)
                             else:
                                 logging.warning(
                                     "觸發信寄件人未通過 SPF/DKIM/DMARC 驗證(From 可"
-                                    "偽造),仍照舊觸發:%s —— 確認 log 長期都通過後,"
-                                    "可在設定加 require_authenticated_trigger=true "
-                                    "改為只接受已驗證的觸發信", ", ".join(unverified))
+                                    "偽造),仍照舊觸發:%s —— 這個設定"
+                                    "(require_authenticated_trigger=false)讓任何人"
+                                    "都能遠端觸發,強烈建議改回 true",
+                                    ", ".join(unverified))
+                        # 通過的寄件人若還有【沒通過驗證的其他信】,
+                        # 那幾封也是終局處置 —— 不標掉會一直被重掃。
+                        # ★只在 strict 模式下才算終局★(外審第 2 回)
+                        #   關掉 strict 時那些信【是要被處理的】,標成已讀等於
+                        #   把一封已被接受、卻還沒登記的請求丟掉。
+                        if cfg.get("require_authenticated_trigger", True):
+                            _final(allowed, only_unauth=True)
                         if allowed:
                             # [B] Dedup：同一 sender 5 分鐘內重複觸發 → 跳過
                             dedup_skipped = [s for s in allowed
@@ -7033,13 +7436,18 @@ def scheduler_loop() -> None:
                                 # [會診3 2026-06-11] 回告知信(原本靜默忽略，醫師重發
                                 # 查詢卻苦等不到結果也不知道被略過)
                                 _send_dedup_notice_async(dedup_skipped)
+                                # 去重＝【本輪的終局處置】(已經回了一封告知信),
+                                # 不標掉的話五分鐘後它會變成可執行、重跑一次。
+                                _final(dedup_skipped)
                             if dedup_proceed:
                                 logging.info(
                                     "收到觸發信（IMAP），立即執行 consult flow；"
                                     "結果將回寄給觸發者：%s",
                                     ", ".join(dedup_proceed))
-                                trigger_job_async("email",
-                                                  override_recipients=dedup_proceed)
+                                _handoff_email_triggers(
+                                    r.get("matched_uids") or [], dedup_proceed,
+                                    require_auth=bool(cfg.get(
+                                        "require_authenticated_trigger", True)))
                         elif not blocked:
                             # 比對到主旨但完全沒抓到 From → fallback 用設定的 recipients
                             # [opt A1] 此 fallback 分支原本沒去重：若觸發信 From 解析不出
@@ -7052,20 +7460,35 @@ def scheduler_loop() -> None:
                             #   帶關鍵字、且 From 解析不出來的信,就能遠端啟動 HIS 查詢
                             #   與 PHI 郵件。開了 require_authenticated_trigger 卻留著
                             #   這個洞,等於沒開。
-                            if cfg.get("require_authenticated_trigger", False):
-                                logging.error(
-                                    "★收到無法解析 From 的觸發信 → 不觸發★"
-                                    "(require_authenticated_trigger=True;"
-                                    "此路徑無從驗證寄件人身分)")
-                            elif _trigger_is_duplicate("__no_sender__"):
+                            # ★[2026-08-08 外審] 這條路一律關死,不看設定★
+                            #   它完全繞過白名單與寄件人驗證:任何人只要寄一封
+                            #   主旨帶關鍵字、且 From 解析不出來的信,就能遠端
+                            #   啟動 HIS 查詢與 PHI 郵件。
+                            #   上一版把它綁在 `require_authenticated_trigger` 上,
+                            #   而那個開關預設是 False —— 等於這個洞預設開著。
+                            #   「解析不出寄件人」永遠不可能通過授權,所以這裡
+                            #   沒有任何合法情況需要保留。
+                            logging.error(
+                                "★收到無法解析 From 的觸發信 → 不觸發★"
+                                "(無從驗證寄件人身分;此路徑已永久關閉)")
+                            # ★[外審] 這也是終局處置★ 不標已讀的話,同一封畸形
+                            #   信會每 20 秒被重新 FETCH + INTERNALDATE 查詢
+                            #   並寫一行 error,直到六小時過時 —— 持續投遞就能
+                            #   把有效的診斷訊息洗掉。
+                            _final([""])
+                        # ★放在整個 if/elif 之後★ 夾在 `if allowed:` 與
+                        #   `elif not blocked:` 中間的話,那個 elif 會接到
+                        #   新的 if 上,整條分支的意思就變了(我第一版就是這樣)。
+                        if _final_uids:
+                            try:
+                                from cmuh_common.imap_reader import (  # noqa: PLC0415
+                                    mark_uids_seen,
+                                )
+                                mark_uids_seen(_final_uids)
+                            except Exception:
                                 logging.warning(
-                                    "[dedup] 無法解析 From 的觸發信在 %ds 內已處理過 → "
-                                    "略過避免重複寄信", _TRIGGER_DEDUP_WINDOW_SEC)
-                            else:
-                                logging.info(
-                                    "收到觸發信但無法解析 From，fallback 用 "
-                                    "email_trigger_recipients")
-                                trigger_job_async("email")
+                                    "[trigger] 標記終局處置信失敗(會重複掃到)",
+                                    exc_info=True)
             # ★ Heartbeat：每 60s 一定寫一筆 log。下次再卡住 1 分鐘內就能發現。
             if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL:
                 next_poll_in = "-"

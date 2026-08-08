@@ -263,33 +263,38 @@ def test_non_timeout_transient_errors_still_retry(monkeypatch):
 
 
 # ── [2026-08-06 外審] strict 模式不可被「無法解析 From」的 fallback 繞過 ────────
-def test_strict_mode_closes_the_no_sender_fallback():
-    """★安全核心★ 主旨命中但 From 解析不出來時，有一條 fallback 會直接觸發並改寄
-    給設定的 recipients。它完全繞過白名單與寄件人驗證：任何人寄一封主旨帶關鍵字、
-    From 畸形的信，就能遠端啟動 HIS 查詢與 PHI 郵件。
-    開了 require_authenticated_trigger 卻留著這個洞，等於沒開。
-    """
-    import inspect
-    src = inspect.getsource(cq.run_email_trigger_loop) \
-        if hasattr(cq, "run_email_trigger_loop") else _imap_loop_src()
-    i = src.index("__no_sender__")
-    head = src[max(0, i - 900):i]
-    assert "require_authenticated_trigger" in head, (
-        "★strict 模式下仍會走無 From 的 fallback★ 白名單與驗證被整條繞過")
-
-
 def _imap_loop_src() -> str:
     """觸發迴圈不是獨立函式時，退而取整份模組原始碼。"""
     import inspect
     return inspect.getsource(cq)
 
 
-def test_strict_mode_check_comes_before_triggering():
-    """strict 檢查必須排在 trigger_job_async 之前（不可先跑再說）。"""
+def test_an_unparseable_sender_can_never_trigger():
+    """★安全核心 —— 而且這兩個測試原本都問錯了問題★
+
+    舊的兩個測試問的是「strict 模式下這條 fallback 有沒有被關掉」、
+    「strict 檢查有沒有排在觸發之前」。兩者都預設了「不 strict 時可以觸發」
+    是合理的 —— 但 `require_authenticated_trigger` 當時【預設就是 False】,
+    所以那條路預設是開著的:任何人寄一封主旨帶關鍵字、From 解析不出來的信,
+    就能遠端啟動一次 HIS 會診查詢,並讓一封含全院會診清單的信寄出去。
+
+    「解析不出寄件人」永遠不可能通過授權,所以沒有任何合法情況需要保留它。
+    2026-08-08 起整條移除,問題也跟著換成:它有沒有真的不見了。
+    """
+    import ast as _ast
     src = _imap_loop_src()
-    i_guard = src.index('require_authenticated_trigger", False):\n                                logging.error(\n                                    "★收到無法解析 From')
-    i_trigger = src.index('trigger_job_async("email")', i_guard)
-    assert i_guard < i_trigger, "strict 檢查要排在觸發之前"
+    assert "__no_sender__" not in src, (
+        "★無法解析 From 的 fallback 觸發又出現了★")
+    for n in _ast.walk(_ast.parse(src)):
+        if (isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)
+                and n.func.id == "trigger_job_async"):
+            consts = [a.value for a in n.args if isinstance(a, _ast.Constant)]
+            # 合法的 email 觸發一定帶 `override_recipients=`(寄回給那位醫師)。
+            # 只有【什麼都不帶】的那一種才是舊 fallback:它改寄給設定的
+            # recipients,而寄件人身分根本沒驗過。
+            assert not (len(n.args) == 1 and consts == ["email"]
+                        and not n.keywords), (
+                "★沒有帶收件人的 email 觸發又回來了★ 那條路繞過白名單與驗證")
 
 
 # ── [2026-08-07 外審 P1-02] 連線階段逾時 ≠ 結果不明 ─────────────────────────

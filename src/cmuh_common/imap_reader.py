@@ -216,7 +216,10 @@ def _authserv_is_trusted(auth_results: str) -> bool:
     # authserv-id 後面可能跟 version（RFC 8601: `mx.google.com 1;`）
     head = head.split()[0] if head.split() else ""
     head = head.rstrip(".")
-    return any(head == t or head.endswith("." + t) for t in TRUSTED_AUTHSERV_IDS)
+    # ★只接受完全相同的 authserv-id★(外審 2026-08-08)
+    #   `endswith("." + t)` 會讓 `anything.mx.google.com` 也算可信 ——
+    #   而這整個字串就是攻擊者自己寫進 header 的文字,不是我們驗證過的。
+    return head in TRUSTED_AUTHSERV_IDS
 
 
 def _parse_trigger_headers(header_raw: bytes) -> tuple:
@@ -254,12 +257,29 @@ def _parse_trigger_headers(header_raw: bytes) -> tuple:
         except Exception:
             logging.debug("[IMAP] Authentication-Results 取值失敗", exc_info=True)
             all_ar = []
-        trusted = [ar for ar in all_ar if _authserv_is_trusted(ar)]
+        # ★[2026-08-08 外審] 只採信【最上方】那一段,而且不能有第二段冒用★
+        #   上一版把「authserv-id 看起來可信」的【每一段】都留下來再串接。
+        #   但 authserv-id 也只是文字:攻擊者可以在自己的信裡直接寫
+        #   `Authentication-Results: mx.google.com; dmarc=pass header.from=…`,
+        #   它就混進 trusted、被下游的關鍵字搜尋找到 —— 真正 Gmail 那一段
+        #   寫著 fail 也沒用,因為兩段是串在一起搜的。
+        #   收件伺服器加的那一段【一定在最上方】(每經一跳就 prepend),
+        #   所以只看 all_ar[0];而且若下方還有別段自稱同樣可信的 authserv-id,
+        #   那是偽造的明確跡象 → 整封信一律不採信(fail-closed)。
+        trusted = []
+        if all_ar and _authserv_is_trusted(all_ar[0]):
+            impostors = [ar for ar in all_ar[1:] if _authserv_is_trusted(ar)]
+            if impostors:
+                logging.warning(
+                    "[IMAP] 信中有第二段自稱可信收件伺服器的 Authentication-"
+                    "Results(偽造跡象)→ 整封不採信:%r", impostors[:1])
+            else:
+                trusted = [all_ar[0]]
         if all_ar and not trusted:
             logging.warning(
-                "[IMAP] 這封信的 Authentication-Results 都不是可信收件伺服器加的"
-                "(可能是轉寄或偽造),一律不採信:%r", all_ar[:2])
-        return _get("Subject"), _get("From"), "\n".join(trusted)
+                "[IMAP] 這封信最上方的 Authentication-Results 不是可信收件"
+                "伺服器加的(可能是轉寄或偽造),一律不採信:%r", all_ar[:1])
+        return _get("Subject"), _get("From"), "".join(trusted)
     except Exception:
         logging.debug("[IMAP] header 解析失敗", exc_info=True)
         return "", "", ""
@@ -322,10 +342,50 @@ def _from_is_authenticated(auth_results: str, from_addr: str) -> bool:
     return False
 
 
+def mark_uids_seen(uids) -> bool:
+    """把這幾封信標成已讀(獨立連線)。回傳是否成功。
+
+    ★[2026-08-08 外審]★ 與 `check_trigger` 分開,是為了讓呼叫端可以
+    「先把工作持久化、再標已讀」。順序反過來的話,兩者之間中止就等於
+    那封觸發信永遠消失。
+    """
+    ids = [str(u).strip() for u in (uids or []) if str(u).strip()]
+    if not ids:
+        return True
+    s = _load_imap_settings()
+    if not s["password"]:
+        logging.warning("[IMAP] 未設定密碼,無法標已讀")
+        return False
+    # ★[2026-08-08 外審第 2 回] 這條連線也要納入既有的 active/watchdog 機制★
+    #   上一版直接在 scheduler thread 開一條新連線,而且用了本檔註解
+    #   明確禁止的 blocking `logout()` —— socket 半死時它會等在那裡,
+    #   而 `force_close_active()` 找不到這條連線,救不了它。
+    #   結果就是排程器整個停住(它是這支程式的心跳)。
+    conn = None
+    try:
+        context = ssl.create_default_context()
+        conn = imaplib.IMAP4_SSL(s["host"], s["port"], ssl_context=context,
+                                 timeout=12.0)
+        _set_active(conn)
+        conn.login(s["username"], s["password"])
+        conn.select("INBOX")
+        conn.uid("store", ",".join(ids), "+FLAGS", "(\\Seen)")
+        return True
+    except Exception:
+        logging.warning("[IMAP] 標已讀失敗(uids=%s)", ids[:5], exc_info=True)
+        return False
+    finally:
+        # 與 `check_trigger` 收尾同一套:不呼叫 logout(它會等回應、
+        # socket 死了就 hang 住整個 finally),直接砍底層 socket。
+        _clear_active(conn)
+        _force_close_conn(conn)
+
+
 def check_trigger(keyword: str, mark_read: bool = True,
                    timeout: float = 12.0,
                    sample_count: int = 3,
-                   max_age_sec: Optional[float] = None) -> dict:
+                   max_age_sec: Optional[float] = None,
+                   defer_mark_matched: bool = False) -> dict:
     """掃描 IMAP 收件匣未讀信，主旨含 keyword 的就回報、抓 From 地址、並標為已讀。
 
     回傳 dict：
@@ -345,6 +405,10 @@ def check_trigger(keyword: str, mark_read: bool = True,
         "scanned": 0,
         "matched": 0,
         "matched_senders": [],
+        # [2026-08-08 外審] (uid, 寄件人, 是否通過驗證)。呼叫端要先把「這個 uid
+        # 對應的工作」持久化,才可以呼叫 mark_uids_seen() —— 順序反過來
+        # 的話,兩者之間中止就等於那封觸發信永遠消失。
+        "matched_uids": [],
         # [2026-08-06 外審 P1-05] matched_senders 的子集:From 有通過
         # SPF/DKIM/DMARC 驗證者。呼叫端要做「可信授權」時看這個,不要只看
         # matched_senders(那裡的 From 是可偽造的純文字)。
@@ -427,6 +491,7 @@ def check_trigger(keyword: str, mark_read: bool = True,
         matched_ids = []
         stale_ids = []  # [會診2] 主旨命中但太舊的觸發信(只清掉、不觸發)
         senders_seen = set()
+        authed_seen = set()
         for uid in ids:
             try:
                 typ, fetch = conn.uid(
@@ -463,6 +528,9 @@ def check_trigger(keyword: str, mark_read: bool = True,
                                 subj_str[:60], from_str[:60])
                             continue
                     matched_ids.append(uid)
+                    # ★[2026-08-08 外審] 把 uid 與寄件人配起來回報★
+                    #   呼叫端要先把「這個 uid 對應的工作」持久化,才可以標
+                    #   \Seen —— 沒有 uid 就做不到(見 `defer_mark_matched`)。
                     # parseaddr 解 "Name <foo@bar.com>" → ("Name", "foo@bar.com")
                     _, addr = parseaddr(from_str)
                     addr = (addr or "").strip().lower()
@@ -477,11 +545,24 @@ def check_trigger(keyword: str, mark_read: bool = True,
                             "[IMAP] 觸發信寄件人未通過 SPF/DKIM/DMARC 驗證"
                             "(From 可偽造):%r;Authentication-Results=%r",
                             addr, (auth_str or "")[:200])
+                    # ★[2026-08-08 外審] 驗證結果要綁在【每一封信】上★
+                    #   `senders_seen` 以地址去重:同一輪先掃到一封偽造的未驗證
+                    #   信,後面那封【合法且已驗證】的就不會被加進
+                    #   `authenticated_senders` —— 攻擊者只要持續寄較早的偽造信,
+                    #   就能讓那位醫師的授權觸發長期失效。
+                    #   逐封記 auth_ok;寄件人清單只用來顯示與合併收件人。
+                    try:
+                        result["matched_uids"].append(
+                            (uid.decode("ascii", "replace"), addr,
+                             bool(auth_ok)))
+                    except Exception:
+                        logging.debug("[IMAP] 記錄 uid 失敗", exc_info=True)
                     if addr and addr not in senders_seen:
                         senders_seen.add(addr)
                         result["matched_senders"].append(addr)
-                        if auth_ok:
-                            result["authenticated_senders"].append(addr)
+                    if addr and auth_ok and addr not in authed_seen:
+                        authed_seen.add(addr)
+                        result["authenticated_senders"].append(addr)
                 elif len(result["samples"]) < sample_count:
                     result["samples"].append(_subject_fingerprint(subj_str))
             except Exception:
@@ -492,7 +573,15 @@ def check_trigger(keyword: str, mark_read: bool = True,
         result["triggered"] = result["matched"] > 0
 
         # [會診2] 陳舊命中信一併標已讀(清掉，避免之後每輪 poll 重複命中+重複 log)
-        ids_to_mark = list(matched_ids) if mark_read else []
+        # ★[2026-08-08 外審] 命中信可以【延後】標記★
+        #   舊寫法在 `check_trigger` 回傳之前就標了 \Seen。之後才回到排程器、
+        #   才起 worker —— 這中間程式若結束/重啟,那封信已經不是 UNSEEN,
+        #   永遠不會再被掃到,醫師乾等一個不會來的結果。
+        #   `defer_mark_matched=True` 時由呼叫端在【工作已持久化之後】自己
+        #   呼叫 `mark_uids_seen()`。陳舊命中信不受影響(它們不會被觸發,
+        #   標掉只是清乾淨)。
+        ids_to_mark = ([] if defer_mark_matched
+                       else (list(matched_ids) if mark_read else []))
         if mark_read:
             ids_to_mark += stale_ids
         if ids_to_mark:

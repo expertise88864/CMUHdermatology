@@ -9873,8 +9873,15 @@ class AutomationApp:
                   "(留空 = 這個診次不設門檻、不提醒)",
                 parent=self.root)
             return
+        # ★[2026-08-08 外審] payload 一律建在【副本】上★
+        #   舊寫法直接改 `self.r_doctor_map` / `self.threshold_settings`,而
+        #   commit 可能失敗 —— 那時 UI 會顯示「一個檔都沒有變更」,背景執行緒
+        #   卻已經在用沒存進去的新門檻與新開關。畫面說沒改、行為卻改了,
+        #   是最難查的那種不一致。
+        _new_r_doctor_map = dict(self.r_doctor_map)
         for r_key, entries in self.r_doctor_entries.items():
-            self.r_doctor_map[r_key] = {"name": (entries["name_var"].get() or "").strip()}
+            _new_r_doctor_map[r_key] = {
+                "name": (entries["name_var"].get() or "").strip()}
         # ★[2026-08-06 外審 P1-07] 三個設定檔改成【兩階段一起 commit】★
         #   舊做法是這裡先寫 r_doctor_settings.json、後面再各寫 threshold_settings
         #   與 doctors.json —— 單檔各自原子,但三檔之間不是:第二/三個寫失敗時第一個
@@ -9884,26 +9891,25 @@ class AutomationApp:
         # 型別註記:三個 payload 分別是 dict / dict / list,故值型別為 object。
         _pending_writes: list[tuple[str, object]] = [
             (get_conf_path('r_doctor_settings.json'),
-             _stamp_r_doctor_revision(self.r_doctor_map))]
+             _stamp_r_doctor_revision(_new_r_doctor_map))]
+        _new_thresholds = dict(self.threshold_settings)
 
         # 上面已經驗過(不合法就不會走到這裡);留空 = 這個診次不設門檻、不提醒。
         for key, value in validated_thresholds.items():
-            self.threshold_settings[key] = value
-            self.threshold_entries[key].set(value)
+            _new_thresholds[key] = value
         try:
             ufs = float(self.ui_font_scale_var.get())
         except (TypeError, ValueError):
             ufs = 1.0
-        self.threshold_settings['ui_font_scale'] = max(0.85, min(1.45, ufs))
+        _new_thresholds['ui_font_scale'] = max(0.85, min(1.45, ufs))
         
-        self.threshold_settings['alert_shen_enabled'] = self.alert_shen_enabled.get()
-        self.threshold_settings['alert_chen_enabled'] = self.alert_chen_enabled.get()
-        self.threshold_settings['alert_huang_enabled'] = self.alert_huang_enabled.get()
-        self.threshold_settings['alert_hsieh_enabled'] = self.alert_hsieh_enabled.get()
-        # [2026-08-06 外審] 存檔＝設定確定生效的時點,順手同步背景執行緒讀的快照
-        # (checkbox 的 command 已同步過;這裡兜底,例如程式化 .set() 不觸發 command)。
-        self._sync_alert_enabled_snapshot()
-        self.threshold_settings['out_of_hospital_mode'] = self.out_of_hospital_var.get()
+        _new_thresholds['alert_shen_enabled'] = self.alert_shen_enabled.get()
+        _new_thresholds['alert_chen_enabled'] = self.alert_chen_enabled.get()
+        _new_thresholds['alert_huang_enabled'] = self.alert_huang_enabled.get()
+        _new_thresholds['alert_hsieh_enabled'] = self.alert_hsieh_enabled.get()
+        # 快照同步移到 commit 成功之後(見下方)——存檔失敗時不可以讓背景緒
+        # 用一份沒存進去的開關。
+        _new_thresholds['out_of_hospital_mode'] = self.out_of_hospital_var.get()
         # [2026-07-13 使用者] show_external_clinics / notify_dnd / clinic_night_monitor 設定已移除；
         # 行為固定（外院分院固定顯示、勿擾窗固定 00–08 只不跳彈窗、reg64 固定 00–07 暫停），不再存這幾個鍵。
         # F8 快速輸入文字 — 空字串不存（讓 _load_f8_quick_text 回 default）
@@ -9911,20 +9917,21 @@ class AutomationApp:
             qt = str(self.quick_text_f8_var.get())
         except Exception:
             qt = F8_QUICK_TEXT_DEFAULT
-        self.threshold_settings['quick_text_f8'] = qt if qt else F8_QUICK_TEXT_DEFAULT
+        _new_thresholds['quick_text_f8'] = qt if qt else F8_QUICK_TEXT_DEFAULT
         # 從 Listbox 同步止掛提醒收件人（若 UI 已建立）
+        _new_alert_recipients = list(self.alert_email_recipients)
         if hasattr(self, 'alert_mail_listbox') and self.alert_mail_listbox is not None:
             try:
-                self.alert_email_recipients = [
+                _new_alert_recipients = [
                     a for a in self.alert_mail_listbox.get(0, tk.END)
                     if str(a).strip()
                 ]
             except Exception:
                 logging.debug("讀取止掛提醒收件人 Listbox 失敗", exc_info=True)
-        self.threshold_settings['alert_email_recipients'] = list(self.alert_email_recipients)
+        _new_thresholds['alert_email_recipients'] = list(_new_alert_recipients)
 
         _pending_writes.append(
-            (get_conf_path('threshold_settings.json'), self.threshold_settings))
+            (get_conf_path('threshold_settings.json'), _new_thresholds))
 
         new_doctors_list = []
         for item_id in self.doctors_tree.get_children():
@@ -9974,6 +9981,16 @@ class AutomationApp:
                                  parent=self.root)
             return
 
+        # ★[2026-08-08 外審] 到這一行才算「設定確定生效」★
+        #   三個檔都已經 replace 成功。副本現在可以指派回 instance,背景執行緒
+        #   讀的快照也在這時才同步 —— 上面任何一條 return 都代表磁碟沒改完,
+        #   那些路徑不可以留下任何已套用的新值。
+        self.r_doctor_map = _new_r_doctor_map
+        self.threshold_settings = _new_thresholds
+        self.alert_email_recipients = _new_alert_recipients
+        for _k, _v in validated_thresholds.items():
+            self.threshold_entries[_k].set(_v)
+        self._sync_alert_enabled_snapshot()
         self.doctors_list = new_doctors_list
 
         # [2026-07-04] 設定變更後立即讓門診監測套用新的「半夜監測」設定：取消可能仍
@@ -13554,10 +13571,13 @@ class AutomationApp:
         self.threshold_labels = {}          # key → 「沈冠宇 三晚」之類的人話標籤
 
         def on_doctor_alert_change():
-            # [修正] 當 UI 變更時，同步更新影子快照（背景執行緒讀這份）
-            self._sync_alert_enabled_snapshot()
-
-            self.status_text.set("狀態: 設定變更，正在重新整理...")
+            # ★[2026-08-08 外審] 勾選【不是】設定生效的時點★
+            #   舊版在這裡就同步影子快照(背景掃描讀那一份)。於是使用者只是
+            #   勾一下看看、還沒按儲存,背景就可能立刻寄出一封原設定不允許的
+            #   止掛信;取消勾選則會立刻停掉本來該有的提醒。存檔失敗時更糟:
+            #   UI 說「一個檔都沒有變更」,行為卻已經改了。
+            #   同步移到 `save_all_settings` 的 commit 成功之後。
+            self.status_text.set("狀態: 已變更（按「儲存設定」後生效）")
             self._trigger_refresh(True)
 
         # [2026-08-05 使用者定案] 張廖年峰不再做止掛提醒;改為沈冠宇。

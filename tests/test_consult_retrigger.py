@@ -64,7 +64,7 @@ def test_pending_retrigger_enqueue_and_drain(monkeypatch):
     triggered = []
     monkeypatch.setattr(consult_query, "trigger_job_async",
                         lambda label, override_recipients=None,
-                        from_retrigger=False:
+                        from_retrigger=False, **_kw:
                             triggered.append((label, override_recipients)))
     # 把 delay 改 0 讓 test 不要等
     monkeypatch.setattr(consult_query, "_RETRIGGER_DELAY_SEC", 0.01)
@@ -130,7 +130,7 @@ def test_drain_with_empty_queue_does_nothing(monkeypatch):
     triggered = []
     monkeypatch.setattr(consult_query, "trigger_job_async",
                         lambda label, override_recipients=None,
-                        from_retrigger=False:
+                        from_retrigger=False, **_kw:
                             triggered.append(label))
 
     consult_query._drain_pending_retriggers()
@@ -156,7 +156,7 @@ def test_pending_retrigger_drain_skips_when_app_is_stopping(monkeypatch):
     monkeypatch.setattr(consult_query.threading, "Thread", ImmediateThread)
     monkeypatch.setattr(consult_query, "trigger_job_async",
                         lambda label, override_recipients=None,
-                        from_retrigger=False:
+                        from_retrigger=False, **_kw:
                             triggered.append((label, override_recipients)))
 
     consult_query._enqueue_pending_retrigger("email", ["a@example.com"])

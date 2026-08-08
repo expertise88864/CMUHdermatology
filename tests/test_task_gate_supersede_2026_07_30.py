@@ -11,6 +11,8 @@ tick —— 但舊的 worker 沒有被終止、沒有被通知、也不知道自
 在【動作之前】退場。真正終止跑掉的工作需要子行程化,列為另案(見模組 docstring)。
 """
 import logging
+import ast
+import textwrap
 import os
 import sys
 import threading
@@ -305,7 +307,13 @@ def test_consult_requeues_an_email_trigger_blocked_by_the_flow_lock():
     import consult_query as cq
     src = inspect.getsource(cq._do_full_job)
     head = src[:src.index("pythoncom = None")]
-    assert "_enqueue_pending_retrigger(trigger_label, override_recipients)" in head
+    # ★[2026-08-08] 呼叫多了一個 `trigger_uids` 參數★(補跑做完才結案觸發信)
+    #   這個守衛要守的是「有沒有把 email 觸發排隊」,不是那一行長什麼樣子。
+    #   用 AST 找呼叫,重構就不會誤報。
+    _calls = [n for n in ast.walk(ast.parse(textwrap.dedent(src)))
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+              and n.func.id == "_enqueue_pending_retrigger"]
+    assert _calls, "★拿不到 _flow_lock 時沒有把 email 觸發排隊★"
     assert 'trigger_label == "email"' in head, \
         "只補 email —— poll/排程本來就會自己再來，補跑只是白工"
 
@@ -467,7 +475,8 @@ def test_the_tombstone_never_blocks_a_fresh_trigger_only_a_retrigger():
         "_do_full_job 裡的墩碑檢查必須以 from_retrigger 為前提")
     drain = inspect.getsource(cq._drain_pending_retriggers)
     assert "_unserved_recipients(override)" in drain
-    assert drain.index("_unserved_recipients(override)") <         drain.index("trigger_job_async(label"), "要在派出去【之前】檢查"
+    assert (drain.index("_unserved_recipients(override)")
+            < drain.index("trigger_job_async(")), "要在派出去【之前】檢查"
 
 
 def test_the_retrigger_worker_rechecks_after_taking_the_flow_lock():

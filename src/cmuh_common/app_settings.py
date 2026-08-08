@@ -160,6 +160,26 @@ def stamp_r_doctor_revision(mapping: dict) -> dict:
     return out
 
 
+
+def _recover_interrupted_settings_write() -> None:
+    """把上次中途被中止的多檔設定交易還原(只做一次,失敗不影響載入)。"""
+    global _settings_recovery_done
+    if _settings_recovery_done:
+        return
+    _settings_recovery_done = True
+    try:
+        from cmuh_common.atomic_io import (  # noqa: PLC0415
+            recover_interrupted_multiwrite,
+        )
+        from cmuh_common.paths import get_settings_dir  # noqa: PLC0415
+        recover_interrupted_multiwrite(get_settings_dir())
+    except Exception:
+        logging.debug("[設定] 還原未完成的設定交易失敗(略過)", exc_info=True)
+
+
+_settings_recovery_done = False
+
+
 def load_threshold_settings(
     path: str | None = None,
     default_thresholds: dict | None = None,
@@ -168,6 +188,11 @@ def load_threshold_settings(
     dnd_end_hour: int = DEFAULT_NOTIFY_DND_END_HOUR,
 ) -> dict:
     """Load threshold settings and fill legacy notification defaults."""
+    # ★開機先把上次沒做完的多檔設定交易還原★(外審第 11 輪第 2 回 F7)
+    #   行程被砍/斷電時 Python 的 rollback 不會執行,磁碟會停在半新半舊。
+    #   接在設定載入這裡:那是開機一定會走到的地方,
+    #   而不是一個沒人呼叫的 API(這一輪外審已經點名過兩次)。
+    _recover_interrupted_settings_write()
     # [2026-07-27] 預設值改由 settings_defaults 統一宣告(門檻 + 收件人 + F8 + 介面),
     # 這樣「新增一個設定鍵」只要動那一份 dict,載入/還原預設/摘要三件事自動涵蓋。
     # 呼叫端仍可用 default_thresholds 覆寫(測試用)。
@@ -189,13 +214,21 @@ def load_threshold_settings(
     #   真正的資訊是「這台原本有沒有在做止掛提醒」——它就記在舊鍵裡。
     #   ★只在【檔案裡沒有新鍵】時推導★(與下面幾條同樣的 `not in data` 語意):
     #   使用者一旦自己勾過,檔案就有這個鍵,之後永遠以他的選擇為準。
+    # ★[2026-08-08 外審] 只遷移【被取代的那一位】,不從別人的開關推測★
+    #   上一版是 `chang or chen`:一台原本設定成「只提醒陳駿升」的機器,
+    #   會被自動打開沈冠宇提醒 —— 那是使用者從來沒有做過的選擇。
+    #   每位醫師一個獨立開關,遷移就該是一對一:沈冠宇接的是張廖年峰的位置。
+    #   (代價是「原本沒開過張廖年峰」的機器不會自動有沈冠宇提醒。所以
+    #    下面補一行 log 把這件事講清楚,而不是替使用者決定。)
     if "alert_shen_enabled" not in data:
-        _was_alerting = bool(data.get("alert_chang_enabled")
-                             or data.get("alert_chen_enabled"))
-        if _was_alerting:
+        if data.get("alert_chang_enabled"):
             data["alert_shen_enabled"] = True
-            logging.info("[設定] 這台原本就在做止掛提醒 → 沈冠宇提醒一併啟用"
+            logging.info("[設定] 原本啟用的張廖年峰提醒 → 由沈冠宇接手"
                          "(可在設定頁關閉)")
+        elif data.get("alert_chen_enabled"):
+            logging.info("[設定] 這台有在做止掛提醒(陳駿升),但沒有啟用過"
+                         "張廖年峰 → 沈冠宇提醒【預設不開】;"
+                         "需要的話請到設定頁勾選")
     if "ui_font_scale" not in data:
         data["ui_font_scale"] = 1.0
     if "notify_dnd_start_hour" not in data:

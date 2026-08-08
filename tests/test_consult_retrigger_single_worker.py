@@ -36,7 +36,7 @@ def test_pending_retrigger_drain_uses_single_delayed_worker(monkeypatch):
     monkeypatch.setattr(consult_query, "_sleep_while_running", lambda _sec: True)
     monkeypatch.setattr(
         consult_query, "trigger_job_async",
-        lambda label, override_recipients=None, from_retrigger=False:
+        lambda label, override_recipients=None, from_retrigger=False, **_kw:
             triggered.append((label, override_recipients)),
     )
 
@@ -218,8 +218,15 @@ def test_fallback_dedup_and_cooldown_throttle_present():
     """原始碼守門：A1 fallback 用哨兵 key 去重；B3 cooldown log 改時間節流(非 %60 modulo)。"""
     import pathlib
     src = pathlib.Path(consult_query.__file__).read_text(encoding="utf-8")
-    # A1: malformed-From fallback 分支套用哨兵 key 去重
-    assert '_trigger_is_duplicate("__no_sender__")' in src
+    # ★[2026-08-08 外審] A1 那條 fallback【整條移除】了★
+    #   原本是「主旨命中但 From 解析不出來 → 用設定的 recipients 觸發」,
+    #   它完全繞過白名單與寄件人驗證 —— 任何人寄一封主旨帶關鍵字、From 畸形
+    #   的信就能遠端啟動 HIS 查詢與 PHI 郵件。既然這條路永遠不可能通過授權,
+    #   就沒有任何合法情況需要保留它,連帶那個哨兵去重也不再需要。
+    #   守門改成:確認它真的沒有回來。
+    assert '_trigger_is_duplicate("__no_sender__")' not in src, (
+        "★無法解析 From 的 fallback 觸發又出現了★ 那是未授權遠端觸發")
+    assert "無從驗證寄件人身分;此路徑已永久關閉" in src
     # B3: cooldown 進度 log 改時間節流，移除永遠命中不到的 %60 modulo
     # (用 "if int(...)" 比對實際程式碼，避免誤抓說明此修正的註解)
     assert "last_cooldown_log >= 60" in src

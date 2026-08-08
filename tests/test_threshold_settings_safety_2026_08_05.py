@@ -166,8 +166,23 @@ class TestTheNewAlertKeyInheritsWhoWasAlerting:
         assert got["alert_shen_enabled"] is True, (
             "★原本負責寄信的那台升級後不寄了★ 使用者要求的提醒等於沒上線")
 
-    def test_chen_only_machine_also_inherits(self, tmp_path):
+    def test_chen_only_machine_does_not_get_shen_turned_on(self, tmp_path):
+        """★[2026-08-08 外審] 這個測試原本把錯誤語意釘成通過條件★
+
+        沈冠宇接的是【張廖年峰】的位置,遷移就該是一對一。
+        從「這台有沒有在提醒陳駿升」推導出「要不要提醒沈冠宇」,
+        等於替使用者做了一個他從來沒做過的逐醫師選擇 ——
+        一台設定成「只提醒陳駿升」的機器會被自動打開沈冠宇提醒。
+        (代價是這台不會自動有沈冠宇提醒;程式會在 log 講清楚要去勾選,
+         而不是替他決定。)
+        """
         got = self._load(tmp_path, {"alert_chen_enabled": True})
+        assert got.get("alert_shen_enabled") is not True, (
+            "★從別位醫師的開關推導出沈冠宇提醒★ 那不是使用者做過的選擇")
+
+    def test_the_retired_doctors_switch_is_migrated_one_to_one(self, tmp_path):
+        """★正方向★ 原本啟用張廖年峰的機器,要由沈冠宇接手。"""
+        got = self._load(tmp_path, {"alert_chang_enabled": True})
         assert got["alert_shen_enabled"] is True
 
     def test_a_machine_that_was_not_alerting_stays_quiet(self, tmp_path):

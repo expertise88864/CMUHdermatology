@@ -5,6 +5,7 @@
 兩位（連同既有的沈冠宇）提醒開關【預設關】——多台電腦同跑會重複寄信，
 使用者只在自己那台手動勾開（沿用 2026-08-05 外審 P2-11 的定案）。
 """
+import ast
 import os
 import sys
 from datetime import date
@@ -70,8 +71,32 @@ def test_main_wires_both_doctors_end_to_end():
     """
     src = _main_src()
     # 存檔
-    assert "self.threshold_settings['alert_huang_enabled']" in src
-    assert "self.threshold_settings['alert_hsieh_enabled']" in src
+    # ★[2026-08-08 外審] 這裡原本比對 `self.threshold_settings[...]` 的字面樣子★
+    #   而外審要求 payload 必須建在【副本】上、commit 成功才指派回 instance
+    #   (存檔失敗時不可以讓背景緒用一份沒存進去的開關)。一改名這個守衛就轉紅,
+    #   但它要守的東西 —— 「這兩位的開關有沒有被寫進要存的內容」 —— 完全沒變。
+    #   改成用 AST 找【被寫進 threshold_settings.json 那份 payload】的鍵,
+    #   不管那個 dict 目前叫什麼名字。
+    payload_name = None
+    tree = ast.parse(src)
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Tuple) and len(n.elts) == 2
+                and isinstance(n.elts[0], ast.Call)
+                and getattr(n.elts[0].func, "id", "") == "get_conf_path"
+                and n.elts[0].args
+                and getattr(n.elts[0].args[0], "value", "")
+                == "threshold_settings.json"
+                and isinstance(n.elts[1], ast.Name)):
+            payload_name = n.elts[1].id
+    assert payload_name, "找不到 threshold_settings.json 的 payload 變數"
+    keys = {t.slice.value for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            for t in node.targets
+            if isinstance(t, ast.Subscript)
+            and getattr(t.value, "id", "") == payload_name
+            and isinstance(t.slice, ast.Constant)}
+    assert "alert_huang_enabled" in keys, keys
+    assert "alert_hsieh_enabled" in keys, keys
     # 設定頁 UI
     assert "啟用 [黃建仁]" in src and "啟用 [謝佳陵]" in src
     assert "'huang_wed_morning': '三早:'" in src
