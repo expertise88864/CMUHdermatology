@@ -2085,7 +2085,15 @@ class ClockApp(tk.Tk):
                             "請查看 settings\\autoclock.log 後重試。")
             return
         _config_restart_requested = True    # 已主動重啟,mainloop 返回後別再重啟
-        restart_program()
+        # ★[2026-08-08 外審] 從設定視窗離開一定要帶旗標★
+        #   舊寫法靠 `restart_program()` 裡的 `_machine_has_clock_accounts()`
+        #   去判斷「本機本來有沒有帳號」—— 但那個判斷是在 `save_config()` 把
+        #   帳號存成 `[]` 之【後】才做的,讀到的是刪除【後】的狀態。
+        #   於是「刪光最後一個帳號 → 存檔 → 重啟」時不會帶旗標,新行程讀到空設定
+        #   就靜默結束:設定視窗與 tray 一起消失,使用者以為打卡還在跑。
+        #   這裡本來就知道「我是從設定視窗離開的」——直接講出來,不要用一個
+        #   答的是別的問題的 predicate 去猜。
+        restart_program(CONFIGURE_IF_EMPTY_FLAG)
 
     def on_closing(self):
         if messagebox.askyesno("關閉", "離開前儲存設定?") and not save_config():
@@ -2279,8 +2287,12 @@ def restart_program(args_add=None, hard_exit_code=None) -> None:
     # ★[2026-08-06 使用者回報] 但【本機從來就沒有帳號】時不可以帶★
     #   帶了的話,自動更新重啟會在一台根本不做打卡的電腦上【彈出打卡設定視窗】,
     #   而且那個視窗被關掉還可能被判成「新版本無法啟動」。
-    #   上面那個「刪光最後一個帳號」的情境,前提是【本來有帳號】—— 本來就沒有的
-    #   機器不屬於它。
+    #
+    # ★[2026-08-08 外審] 這個 predicate 只回答「【現在】設定檔裡有沒有帳號」★
+    #   它答不了「本來有沒有」—— 從設定視窗離開時,`save_config()` 已經先把
+    #   帳號存成 `[]` 了。所以那兩條路徑改成【自己明講】帶旗標(見
+    #   `save_and_bg` 與設定視窗關閉處),這裡只服務自動更新/health 重啟:
+    #   那些情境沒有人剛剛在編輯設定,「現在有沒有帳號」正好就是要問的問題。
     if (CONFIGURE_IF_EMPTY_FLAG not in extra
             and _machine_has_clock_accounts()):
         extra.append(CONFIGURE_IF_EMPTY_FLAG)
@@ -2489,7 +2501,8 @@ def main() -> None:
             # 使用者以為還在打卡卻早已沒在跑(漏打卡)。
             if not _config_restart_requested:
                 logging.info("[autoclock] 設定視窗關閉，回背景模式繼續自動打卡")
-                restart_program()
+                # ★同上★ 這條路也可能是「刪光帳號後直接按 X」。
+                restart_program(CONFIGURE_IF_EMPTY_FLAG)
             return
         if "--test-login" in _flags:
             _run_test_ui()
