@@ -48,6 +48,11 @@ class _Sess:
 
 def _healthy(monkeypatch):
     monkeypatch.setattr(cq, "_session_death_reason", lambda _s: "")
+    # ★[2026-08-08 外審第 9 輪 P2-01] 送命令前要判「可操作」★
+    #   `_query_cycle` 現在走 `_main_ready_for_next_cycle`(判活 + enabled),
+    #   不再只問 `_session_death_reason` —— 不裝這一個,測試會停在
+    #   真實的 `IsWindowEnabled` 上,量到的不是本來要量的東西。
+    monkeypatch.setattr(cq.win32gui, "IsWindowEnabled", lambda _h: True)
 
 
 def _fast_clock(monkeypatch, step=0.5):
@@ -94,6 +99,11 @@ class TestTheMenuCommandGoesToOurOwnWindow:
         """身分對不上／已死 → 當場停手，不可以退回用 PID 集合找一個來用。"""
         monkeypatch.setattr(cq, "_session_death_reason",
                             lambda _s: "主畫面 hwnd 已被回收給別的視窗")
+        # ★[2026-08-08 外審第 9 輪 P2-01] 送命令前要判「可操作」★
+        #   `_query_cycle` 現在走 `_main_ready_for_next_cycle`(判活 + enabled)。
+        #   這裡刻意讓 enabled=True:要證明擋下來的是【身分不符】,不是「剛好
+        #   被 modal 擋住」—— 兩個原因都會中止,反例要只靠被測那一條分勝負。
+        monkeypatch.setattr(cq.win32gui, "IsWindowEnabled", lambda _h: True)
         posted = []
         monkeypatch.setattr(cq.win32gui, "PostMessage",
                             lambda h, m, w, l: posted.append(h))
@@ -101,7 +111,11 @@ class TestTheMenuCommandGoesToOurOwnWindow:
         try:
             cq._query_cycle(_Sess(), {}, "今日會診病人")
         except RuntimeError as e:
-            assert "session 已不可用" in str(e)
+            # ★比對【原因本身】,不是包在外面那句話★ 外層訊息在 2026-08-08
+            #   改過一次(「不可用」→「不可操作」),而測試真正在乎的是:
+            #   究竟為什麼停手,有沒有一路傳到錯誤訊息裡(45 分鐘的 log 判斷不出
+            #   成因,就是因為兩個原因寫成同一句)。
+            assert "hwnd 已被回收給別的視窗" in str(e), str(e)
             assert posted == [], "身分不明卻還是送了命令"
             return
         raise AssertionError("身分不明卻照常執行查詢")
@@ -279,6 +293,11 @@ class TestMainReadiness:
     def test_a_main_that_reenables_shortly_after_is_ready(self, monkeypatch):
         """★這就是事故的形狀★ 前幾次還是 disabled，稍後就恢復了。"""
         monkeypatch.setattr(cq, "_session_death_reason", lambda _s: "")
+        # ★[2026-08-08 外審第 9 輪 P2-01] 送命令前要判「可操作」★
+        #   `_query_cycle` 現在走 `_main_ready_for_next_cycle`(判活 + enabled),
+        #   不再只問 `_session_death_reason` —— 不裝這一個,測試會停在
+        #   真實的 `IsWindowEnabled` 上,量到的不是本來要量的東西。
+        monkeypatch.setattr(cq.win32gui, "IsWindowEnabled", lambda _h: True)
         calls = {"n": 0}
 
         def _enabled(_h):
@@ -293,22 +312,42 @@ class TestMainReadiness:
     def test_a_permanently_disabled_main_is_still_reported(self, monkeypatch):
         """★反方向:真的一直被擋住仍要說出來★（不可以修成永遠回 OK）。"""
         monkeypatch.setattr(cq, "_session_death_reason", lambda _s: "")
+        # ★[2026-08-08 外審第 9 輪 P2-01] 送命令前要判「可操作」★
+        #   `_query_cycle` 現在走 `_main_ready_for_next_cycle`(判活 + enabled),
+        #   不再只問 `_session_death_reason` —— 不裝這一個,測試會停在
+        #   真實的 `IsWindowEnabled` 上,量到的不是本來要量的東西。
+        monkeypatch.setattr(cq.win32gui, "IsWindowEnabled", lambda _h: True)
         monkeypatch.setattr(cq.win32gui, "IsWindowEnabled", lambda _h: False)
         assert "modal" in cq._main_ready_for_next_cycle(
             _Sess(), sleep=lambda _s: None, now=_ticks())
 
     def test_a_healthy_main_is_ready(self, monkeypatch):
         monkeypatch.setattr(cq, "_session_death_reason", lambda _s: "")
+        # ★[2026-08-08 外審第 9 輪 P2-01] 送命令前要判「可操作」★
+        #   `_query_cycle` 現在走 `_main_ready_for_next_cycle`(判活 + enabled),
+        #   不再只問 `_session_death_reason` —— 不裝這一個,測試會停在
+        #   真實的 `IsWindowEnabled` 上,量到的不是本來要量的東西。
+        monkeypatch.setattr(cq.win32gui, "IsWindowEnabled", lambda _h: True)
         monkeypatch.setattr(cq.win32gui, "IsWindowEnabled", lambda _h: True)
         assert cq._main_ready_for_next_cycle(
             _Sess(), sleep=lambda _s: None, now=_ticks()) == ""
 
     def test_a_dead_session_is_not_ready(self, monkeypatch):
         monkeypatch.setattr(cq, "_session_death_reason", lambda _s: "主畫面不在")
+        # ★[2026-08-08 外審第 9 輪 P2-01] 送命令前要判「可操作」★
+        #   `_query_cycle` 現在走 `_main_ready_for_next_cycle`(判活 + enabled),
+        #   不再只問 `_session_death_reason` —— 不裝這一個,測試會停在
+        #   真實的 `IsWindowEnabled` 上,量到的不是本來要量的東西。
+        monkeypatch.setattr(cq.win32gui, "IsWindowEnabled", lambda _h: True)
         assert cq._main_ready_for_next_cycle(_Sess()) == "主畫面不在"
 
     def test_unknown_enabled_state_is_not_ready(self, monkeypatch):
         monkeypatch.setattr(cq, "_session_death_reason", lambda _s: "")
+        # ★[2026-08-08 外審第 9 輪 P2-01] 送命令前要判「可操作」★
+        #   `_query_cycle` 現在走 `_main_ready_for_next_cycle`(判活 + enabled),
+        #   不再只問 `_session_death_reason` —— 不裝這一個,測試會停在
+        #   真實的 `IsWindowEnabled` 上,量到的不是本來要量的東西。
+        monkeypatch.setattr(cq.win32gui, "IsWindowEnabled", lambda _h: True)
 
         def _boom(_h):
             raise OSError("查不到")

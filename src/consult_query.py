@@ -3362,8 +3362,20 @@ def _cold_start_session(cfg: dict):
     """冷啟動的【預約閘門】→ 實作見 _cold_start_session_impl。
 
     同一時間只允許一個冷啟動:另一個仍在進行(未逾期)→ 本輪直接放棄,
-    絕不並行送出第二份帳密。"""
+    絕不並行送出第二份帳密。
+
+    ★[2026-08-08 外審第 9 輪 P1-01] UNMANAGED 閘門也放這裡★
+    舊寫法把閘門接在 `_acquire_session()` 的冷啟動分支上,而【掉線恢復】那條路
+    (`_automation_on_hidden` 的 except:teardown 失敗會掛帳 → 立刻重登)是
+    直接呼叫本函式的,完全繞過閘門 —— 偏偏那正是「剛剛才關不掉一個 session」
+    的時刻,是閘門最該生效的一刻。啟動器 handle 又終止不了實際 UI,於是登入
+    會累積、撞上 systemftp「最多兩個」上限。
+    ★閘門只能查一次★:超過 15 分鐘上限的那條分支會【放行一次並重新起算】,
+    連查兩次的話第二次 `blocked_for≈0` 反而會擋下剛剛放行的那一次。所以
+    `_acquire_session` 冷啟動前的那一次已移除,這裡是唯一的阻擋點。
+    """
     global _cold_start_owner
+    _ensure_no_unmanaged_sessions()
     me = object()
     now = time.time()
     with _session_lock:
@@ -3568,10 +3580,10 @@ def _acquire_session(cfg: dict):
             sess = None
     if sess is not None:
         return sess                      # 重用既有健康 session:不經過阻擋閘門
-    # ★[2026-08-06 外審 P1-02] 只有【確定要開新登入】時才擋★
-    #   上面的 teardown 若失敗會把該 session 掛帳,所以這裡再查一次是對的:
-    #   剛剛沒收乾淨就不該再開一個。
-    _ensure_no_unmanaged_sessions()
+    # ★[2026-08-08 外審第 9 輪 P1-01] 阻擋已移進 `_cold_start_session`★
+    #   上面的 teardown 若失敗會把該 session 掛帳,而阻擋要涵蓋【每一條】冷啟動
+    #   路徑(還有掉線恢復那條),所以放在唯一的冷啟動入口,不放這裡 ——
+    #   兩邊都查的話,15 分鐘上限「放行一次」會被第二次查詢立刻擋回去。
     return _cold_start_session(cfg)
 
 
@@ -3831,10 +3843,21 @@ def _query_cycle(sess, cfg: dict, roster_label: str) -> tuple:
     會診視窗同理:`hits[0]` 會撿到醫師自己已經開著的會診單。改成只認
     【本次命令送出【之後】才出現、而且屬於我們主畫面那個行程】的視窗。
     """
-    # ★操作之前先確認手上這個 session 還是我們那一個★(判活與操作不可脫節)
-    death = _session_death_reason(sess)
-    if death:
-        raise RuntimeError(f"開始查詢前 session 已不可用:{death}")
+    # ★操作之前先確認手上這個 session 還是我們那一個、而且【可以操作】★
+    # ★[2026-08-08 外審第 9 輪 P2-01] 只判「活著」不夠★
+    #   `_session_death_reason` 只看 hwnd 還在、身分相符。主畫面被閒置提示
+    #   (實機見過的 `TFMTimeOut_1`)擋住時它是 disabled 的 —— 判活會過,
+    #   但 disabled 的視窗不會處理我們 PostMessage 過去的 WM_COMMAND。
+    #   於是:命令送出去像是成功了 → 等滿 60 秒等不到會診視窗 → 走恢復路徑
+    #   拆掉一個【只要按一下「繼續使用」就好】的 session。這與 2026-08-05
+    #   實機事故是同一個形狀,只是換了一個位置(那次在退場、這次在進場)。
+    #   退場路徑已經有「按掉 modal → 輪詢重新 enabled」,進場也要有,而且要在
+    #   【送命令之前】就中止,不能把命令送進一個不會處理它的視窗。
+    not_ready = _main_ready_for_next_cycle(sess)
+    if not_ready and _dismiss_blocking_modals(sess):
+        not_ready = _main_ready_for_next_cycle(sess)
+    if not_ready:
+        raise RuntimeError(f"開始查詢前主畫面不可操作:{not_ready}")
     main_hwnd = sess.main_hwnd
     owner_pid = sess.main_pid
     cmd_id = resolve_menu_command_id(main_hwnd)
@@ -4283,7 +4306,10 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
     def _stealth() -> None:
         while not stealth_stop.is_set():
             try:
-                for h in find_windows(pids=_systemftp_pids() - before,
+                # ★[2026-08-08 外審第 9 輪 P1-02] 只藏【我們自己那個行程】的視窗★
+                #   舊寫法用全機差集,於是醫師在這 120 秒內自己開的住院系統
+                #   會被我們每 80 毫秒藏一次,他根本沒辦法用。
+                for h in find_windows(pids={spawned_root_pid},
                                       visible_only=True):
                     if h not in stealth_skip:
                         hide_window(h)
@@ -4312,6 +4338,14 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
                     click_button(ok_btn)
                     logging.info("已關閉多開提示視窗")
                     time.sleep(0.6)
+            if _spawned.poll() is not None:
+                # ★我們啟動的那個行程已經結束★ = 啟動器把工作交給既有 instance
+                #   (實機契約),或它自己失敗了。兩種情況都代表【接下來畫面上
+                #   任何登入視窗都不能證明是我們的】,而且 PID 可能被回收重用。
+                raise RuntimeError(
+                    f"SW_HIDE 後備模式:我們啟動的 systemftp(pid={spawned_root_pid})"
+                    "已結束(啟動器把工作交給既有實例)→ 無法證明畫面上的登入視窗"
+                    "是我們的,本輪放棄 —— 不對醫師自己的住院系統輸入帳密")
             cands = find_windows(LOGIN_CLASS, LOGIN_TITLE_PREFIX,
                                  visible_only=False)
             # ★[2026-08-05 外審第 5 輪 P1-08] 這條路【不可以】借用既有實例★
@@ -4325,21 +4359,26 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
             #   ★寧可本輪查不到,也不要動醫師的住院系統★
             #   (隱藏桌面那條路徑不同:那裡 `find_windows` 只列舉我們自己的桌面,
             #    撿到的必然是我們前一次留下的孤兒,不可能是醫師的 —— 見該處說明。)
-            fresh = [h for h in cands if _window_pid(h) not in before]
-            if fresh:
-                login = fresh[0]
+            # ★[2026-08-08 外審第 9 輪 P1-02] 「本次啟動之後才出現」證明不了所有權★
+            #   上一版的 `fresh = pid not in before` 只說明那個行程比我們晚出現,
+            #   醫師在這 120 秒內自己按下住院系統也完全符合。真正能證明的只有
+            #   一件事:那個視窗屬於【我們用 Popen 開的那個 pid】。
+            #   (上面的 poll() 已保證它還活著 → pid 不可能是回收重用來的。)
+            ours = [h for h in cands if _window_pid(h) == spawned_root_pid]
+            if ours:
+                login = ours[0]
                 break
             if cands:
                 logging.warning(
-                    "[SW_HIDE 後備] 畫面上有登入視窗,但它在本次啟動【之前】就存在"
-                    "(pid=%s) —— 那可能是使用者自己開的住院系統,不碰它",
-                    sorted({_window_pid(h) for h in cands}))
+                    "[SW_HIDE 後備] 畫面上有登入視窗,但它不屬於我們啟動的行程"
+                    "(pid=%s,我們的是 %s)—— 那可能是使用者自己開的住院系統,不碰它",
+                    sorted({_window_pid(h) for h in cands}), spawned_root_pid)
             time.sleep(0.5)
         if not login:
             raise RuntimeError(
-                "等不到【屬於本次啟動】的登入視窗(多開提示可能未正確關閉、網路過慢,"
-                "或 systemftp 已達『最多兩個』上限);本輪放棄 —— 不借用既有實例,"
-                "以免對使用者自己開的住院系統輸入帳密")
+                "等不到【屬於我們這個行程】的登入視窗(多開提示可能未正確關閉、"
+                "網路過慢,或 systemftp 已達『最多兩個』上限);本輪放棄 —— "
+                "不借用既有實例,以免對使用者自己開的住院系統輸入帳密")
 
         our_pid = _window_pid(login)
         # [review C2 fix → 2026-08-05 P1-08] 這裡已經不可能是借用的:上面只接受
@@ -4351,7 +4390,11 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
             # 身分無法確定,一樣不碰。
             raise RuntimeError(
                 f"登入視窗的 pid({our_pid})在本次啟動前就存在 → 身分無法確定,本輪放棄")
-        our_pids = (_systemftp_pids() - before) | {our_pid}
+        # ★[2026-08-08 外審第 9 輪 P1-02] 不再用全機差集★
+        #   這條路跑在【醫師自己的桌面】上,差集裡的外來 pid 會真的貢獻出視窗
+        #   (隱藏桌面那條路不會,因為 `find_windows` 只列舉我們自己的桌面)。
+        #   主畫面、會診視窗一路都只認這一個經過證明的 pid。
+        our_pids = {our_pid}
         logging.info("登入視窗 hwnd=%s，本次實例 pid=%s", login, sorted(our_pids))
 
         # 登入：TEditExt 是 Delphi 自訂控制項，必須有「真實鍵盤焦點」才收得到字，
@@ -4426,8 +4469,11 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
         # 收尾：停掉隱形執行緒、關閉我們這份 systemftp、把前景還給使用者。
         # [review C2 fix] 借用使用者既有實例時，排除啟動前就存在的 pid 不關。
         stealth_stop.set()
+        # ★[2026-08-08 外審第 9 輪 P1-02] 沒認出登入視窗就只關我們自己那個★
+        #   舊的 fallback 是全機差集 —— 提早中止時(例如上面判定啟動器已把工作
+        #   交出去)會把醫師剛開的住院系統一起關掉。
         cleanup_pids = _cleanup_pids_excluding_borrowed(
-            our_pids or (_systemftp_pids() - before), before, borrowed,
+            our_pids or {spawned_root_pid}, before, borrowed,
             root_pid=spawned_root_pid)
         try:
             close_pids(cleanup_pids)

@@ -256,8 +256,12 @@ def test_no_cold_start_while_the_ledger_is_dirty(monkeypatch):
     只測「閘門會拋例外」不夠 —— 要證明 `_acquire_session` 真的因此沒有去登入。
     """
     calls = []
-    monkeypatch.setattr(cq, "_cold_start_session",
-                        lambda cfg: calls.append(cfg))
+    # ★stub 的深度要在閘門【裡面】★(2026-08-08 外審第 9 輪 P1-01)
+    #   閘門已移進 `_cold_start_session` —— 那是唯一涵蓋得到「掉線恢復」
+    #   那條路的位置。把整個 `_cold_start_session` 換掉的話,連閘門一起換掉了,
+    #   這個測試就會變成「stub 沒被呼叫」的同義反覆。
+    monkeypatch.setattr(cq, "_cold_start_session_impl",
+                        lambda cfg, **k: calls.append(cfg))
     monkeypatch.setattr(cq, "_retry_unclosed_sessions", lambda: 1)
     monkeypatch.setattr(cq, "_psession", None)
 
@@ -280,8 +284,8 @@ def _healthy_session(monkeypatch, retries_remaining=1):
                         lambda started, now: False)
     monkeypatch.setattr(cq, "_retry_unclosed_sessions",
                         lambda: retries_remaining)      # 髒帳:還有關不掉的
-    monkeypatch.setattr(cq, "_cold_start_session",
-                        lambda cfg: (_ for _ in ()).throw(
+    monkeypatch.setattr(cq, "_cold_start_session_impl",
+                        lambda cfg, **k: (_ for _ in ()).throw(
                             AssertionError("健康 session 還在,不該冷啟動")))
     return sess
 
@@ -334,7 +338,8 @@ def test_cold_start_is_still_blocked_after_a_dead_session(monkeypatch):
     monkeypatch.setattr(cq, "_session_death_reason", lambda s: "主畫面不見了")
     monkeypatch.setattr(cq, "_session_close_if_current", lambda s, r: None)
     monkeypatch.setattr(cq, "_retry_unclosed_sessions", lambda: 1)
-    monkeypatch.setattr(cq, "_cold_start_session", lambda cfg: calls.append(cfg))
+    monkeypatch.setattr(cq, "_cold_start_session_impl",
+                        lambda cfg, **k: calls.append(cfg))
     try:
         cq._acquire_session({})
     except cq.UnmanagedSessionError:

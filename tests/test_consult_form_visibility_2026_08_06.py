@@ -43,6 +43,11 @@ def _drive(monkeypatch, windows_per_call, visibility):
     visibility: {hwnd: [每次查詢回什麼]}，元素 True / False / 'boom'。
     回傳被採認的 hwnd（沒有採認到就是 None）。"""
     monkeypatch.setattr(cq, "_session_death_reason", lambda _s: "")
+    # ★[2026-08-08 外審第 9 輪 P2-01] 送命令前要判「可操作」★
+    #   `_query_cycle` 現在走 `_main_ready_for_next_cycle`(判活 + enabled),
+    #   不再只問 `_session_death_reason` —— 不裝這一個,測試會停在
+    #   真實的 `IsWindowEnabled` 上,量到的不是本來要量的東西。
+    monkeypatch.setattr(cq.win32gui, "IsWindowEnabled", lambda _h: True)
     monkeypatch.setattr(cq, "resolve_menu_command_id", lambda _h: 42)
     monkeypatch.setattr(cq.win32gui, "PostMessage", lambda *a: None)
     n = {"i": -1}
