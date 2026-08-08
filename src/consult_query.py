@@ -6662,6 +6662,22 @@ def load_trigger_dedup_state() -> None:
         logging.debug("[dedup] 去重狀態載入失敗(忽略)", exc_info=True)
 
 
+def _collect_final_uids(addrs, uid_map, only_unauth: bool = False) -> list:
+    """這幾位寄件人的信,哪些 uid 屬於【本輪終局處置】(要標成已讀)。
+
+    `uid_map`: 寄件人 → [(uid, 是否通過驗證), ...]
+    `only_unauth=True`: 只取【沒通過驗證】的那幾封(用在「寄件人整體通過、
+    但他還有別的偽造信」的情況)。純函式。
+    """
+    out: list = []
+    for x in (addrs or []):
+        for uid, ok in (uid_map.get(str(x).strip().lower()) or []):
+            if only_unauth and ok:
+                continue
+            out.append(uid)
+    return out
+
+
 def _undo_trigger_dedup(sender: str) -> None:
     """撤銷剛剛那筆去重預約(工作沒能落地時)。
 
@@ -7364,17 +7380,13 @@ def scheduler_loop() -> None:
                                 str(_a or "").strip().lower(),
                                 []).append((str(_u), _ok))
 
-                        def _final(addrs, _dst=_final_uids, _map=_uid_of,
-                                   only_unauth=False):
-                            # 預設引數把這一圈的 list/dict 綁進來(迴圈裡定義的
-                            # 函式若用外層名字,late binding 會指到最後一圈)。
-                            for _x in (addrs or []):
-                                for _u, _ok in (
-                                        _map.get(str(_x).strip().lower()) or []):
-                                    if only_unauth and _ok:
-                                        continue
-                                    _dst.append(_u)
-                        _final(blocked)
+                        # ★不要在迴圈裡定義巢狀函式★
+                        #   原本這裡有一個 `_final(...)` 包住整段邏輯。pyright 對
+                        #   它判定「refers to itself」而算成一筆型別債(CI 的棘輪
+                        #   會紅,本機 `pyright src` 卻是 0 —— 那是兩道不同的關卡);
+                        #   而為了避開 late binding 加的預設引數又觸發 ruff B023。
+                        #   直接呼叫 module-level 的純函式,兩個問題一起消失。
+                        _final_uids.extend(_collect_final_uids(blocked, _uid_of))
                         # ★[2026-08-06 外審 P1-05] 白名單比對的是可偽造的 From★
                         #   `From:` 是寄件者自填的純文字。imap_reader 現在會一併回
                         #   `authenticated_senders`(通過 SPF/DKIM/DMARC 者)。
@@ -7406,7 +7418,8 @@ def scheduler_loop() -> None:
                                 # ★未通過驗證也是【終局處置】★(第 3 回)
                                 #   不標已讀的話,同一封偽造信會每 20 秒被重掃
                                 #   一次、每輪寫一行 error,把 log 洗掉。
-                                _final(unverified)
+                                _final_uids.extend(
+                                    _collect_final_uids(unverified, _uid_of))
                                 _alert_trigger_rejected(unverified)
                             else:
                                 logging.warning(
@@ -7421,7 +7434,8 @@ def scheduler_loop() -> None:
                         #   關掉 strict 時那些信【是要被處理的】,標成已讀等於
                         #   把一封已被接受、卻還沒登記的請求丟掉。
                         if cfg.get("require_authenticated_trigger", True):
-                            _final(allowed, only_unauth=True)
+                            _final_uids.extend(_collect_final_uids(
+                                allowed, _uid_of, only_unauth=True))
                         if allowed:
                             # [B] Dedup：同一 sender 5 分鐘內重複觸發 → 跳過
                             dedup_skipped = [s for s in allowed
@@ -7438,7 +7452,8 @@ def scheduler_loop() -> None:
                                 _send_dedup_notice_async(dedup_skipped)
                                 # 去重＝【本輪的終局處置】(已經回了一封告知信),
                                 # 不標掉的話五分鐘後它會變成可執行、重跑一次。
-                                _final(dedup_skipped)
+                                _final_uids.extend(
+                                    _collect_final_uids(dedup_skipped, _uid_of))
                             if dedup_proceed:
                                 logging.info(
                                     "收到觸發信（IMAP），立即執行 consult flow；"
@@ -7475,7 +7490,8 @@ def scheduler_loop() -> None:
                             #   信會每 20 秒被重新 FETCH + INTERNALDATE 查詢
                             #   並寫一行 error,直到六小時過時 —— 持續投遞就能
                             #   把有效的診斷訊息洗掉。
-                            _final([""])
+                            _final_uids.extend(
+                                _collect_final_uids([""], _uid_of))
                         # ★放在整個 if/elif 之後★ 夾在 `if allowed:` 與
                         #   `elif not blocked:` 中間的話,那個 elif 會接到
                         #   新的 if 上,整條分支的意思就變了(我第一版就是這樣)。

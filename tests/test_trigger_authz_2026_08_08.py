@@ -492,7 +492,7 @@ class TestEveryTerminalUidIsAcknowledged:
         tree = ast.parse(inspect.getsource(cq))
         args = {a.id for n in ast.walk(tree)
                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                and n.func.id == "_final"
+                and n.func.id == "_collect_final_uids"
                 for a in n.args if isinstance(a, ast.Name)}
         for name in ("blocked", "unverified", "dedup_skipped"):
             assert name in args, (
@@ -626,7 +626,7 @@ class TestAnUnparseableSenderIsAlsoAcknowledged:
         tree = ast.parse(inspect.getsource(cq))
         for n in ast.walk(tree):
             if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                    and n.func.id == "_final" and n.args
+                    and n.func.id == "_collect_final_uids" and n.args
                     and isinstance(n.args[0], ast.List)
                     and [getattr(e, "value", None) for e in n.args[0].elts] == [""]):
                 return
@@ -727,7 +727,30 @@ class TestPartialJournalFailureKeepsTheDedup:
                 continue
             for c in ast.walk(n):
                 if (isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
-                        and c.func.id == "_final"
+                        and c.func.id == "_collect_final_uids"
                         and any(k.arg == "only_unauth" for k in c.keywords)):
                     return
         pytest.fail("★終局標記沒有被 strict 設定管住★ 關掉 strict 時會丟掉請求")
+
+
+class TestCollectFinalUids:
+    """★純函式,直接測★ 它從巢狀函式抽出來之後才測得到
+    (突變驗證抓到的:`only_unauth` 失效時,上面那些接線測試全都照樣綠)。"""
+
+    MAP = {"a@x.tw": [("1", True), ("2", False)],
+           "b@x.tw": [("3", False)]}
+
+    def test_it_takes_every_uid_by_default(self):
+        assert cq._collect_final_uids(["a@x.tw"], self.MAP) == ["1", "2"]
+
+    def test_only_unauth_skips_the_authenticated_ones(self):
+        """★核心★ 「這位寄件人整體通過、但他還有別的偽造信」時,只有偽造那幾封
+        是終局處置。把已驗證那封也標成已讀 = 把一封【要被處理的】請求丟掉。"""
+        assert cq._collect_final_uids(["a@x.tw"], self.MAP,
+                                      only_unauth=True) == ["2"], (
+            "★only_unauth 失效★ 已驗證的信被一起標成已讀了")
+
+    def test_it_is_case_insensitive_and_tolerates_junk(self):
+        assert cq._collect_final_uids(["A@X.TW "], self.MAP) == ["1", "2"]
+        assert cq._collect_final_uids(["nobody@x.tw"], self.MAP) == []
+        assert cq._collect_final_uids(None, self.MAP) == []
