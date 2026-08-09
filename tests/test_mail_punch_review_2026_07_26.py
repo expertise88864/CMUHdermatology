@@ -224,5 +224,6 @@ def test_alert_wrapper_does_not_ignore_refused_recipients():
     assert "if refused:" in code and "logging.error(" in code, \
         "有人沒收到就要用 error 級別講清楚是誰"
     i_check = code.index("if refused:")
-    i_return = code.index("return True", i_check)
+    # ★[#71] 回傳值從 `return True` 換成 `return SendResult(True)`
+    i_return = code.index("return SendResult(True)", i_check)
     assert "logging.error(" in code[i_check:i_return], "log 要在回傳之前"

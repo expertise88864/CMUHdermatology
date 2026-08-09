@@ -141,6 +141,11 @@ def _scan_app(monkeypatch, doctor, doc_no, by_date, enabled=True,
     app._live_clinic_data_keys = {doc_no}
     app.threshold_settings = {}
     app._alert_email_sent = {}
+    # ★[#71] 生產的 __init__ 一定會設這兩個★ 假 app 少一個,
+    #   去重述詞就會拋 AttributeError 而被外層 except 吞掉 ——
+    #   測到的是「掃描整個中止」，不是被測的行為。
+    app._alert_email_pending = {}
+    app._alert_pending_load_failed = False
     monkeypatch.setattr(app, "_mark_alert_email_sent",
                         lambda nk: app._alert_email_sent.__setitem__(nk, "d"))
     mails = []

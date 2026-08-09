@@ -583,6 +583,27 @@ class DeliveryLedger:
                        and r.get("state") in LIVE_STATES
                        for r in self._records.values())
 
+    def state_of(self, delivery_id: str) -> str:
+        """某一筆的目前狀態。**查不到／讀不到一律回空字串**。
+
+        ★[#71] 為什麼不用 `get()`★ `get()` 只讀本 process 的記憶體快照。
+        收斂那一筆的可能是【另一支程式】(會診查詢)的回查 worker —— 不重讀磁碟
+        就永遠看不到它的結果,抑制會一路掛到逾期為止。
+
+        ★空字串 = 不知道,不是「沒送到」★ 呼叫端(`decide_pending`)靠這個
+        區分三態:讀不到就繼續等,不可以拿它當作「可以重寄」的證據。
+        紀錄被 prune 掉也回空字串 —— 同樣是「查不出來」,由逾期那條路收尾。
+        """
+        did = str(delivery_id or "")
+        if not did:
+            return ""
+        if not self._refresh_locked():
+            logging.debug("[delivery] 這一刻讀不到帳本 → 無法回答 %s 的狀態", did)
+            return ""
+        with self._lock:
+            rec = self._records.get(did)
+            return str((rec or {}).get("state") or "")
+
     def unresolved(self) -> list:
         """所有還是 UNKNOWN 的紀錄（給回查流程用），舊的排前面。
 

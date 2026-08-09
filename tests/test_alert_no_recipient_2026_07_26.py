@@ -24,7 +24,9 @@ def test_empty_recipients_is_warned(caplog):
     main._ALERT_NO_RECIPIENT_WARNED_DAY[0] = ""
     with caplog.at_level(logging.WARNING):
         ok = main._send_alert_email_via_smtp("主旨", "內文", [])
-    assert ok is False
+    # ★[#71] 回傳型別改成 SendResult(仍然是布林語意)★
+    #   斷言要問「會不會被當成已寄」，不是同一性比對。
+    assert not ok, ok
     msgs = [r.getMessage() for r in caplog.records]
     assert any("收件人清單是空的" in m for m in msgs), "不可靜默"
     assert any("設定頁" in m for m in msgs), "要告訴使用者怎麼修"
@@ -56,8 +58,9 @@ def test_warning_does_not_change_send_behaviour():
     """只加提示,不可改變「沒有收件人就不寄」的既有行為。"""
     code = _code_only(inspect.getsource(main._send_alert_email_via_smtp))
     i_guard = code.index("if not recipients:")
-    seg = code[i_guard:i_guard + 200]
-    assert "return False" in seg
+    seg = code[i_guard:i_guard + 250]
+    # ★[#71] 回傳值從裸 bool 換成 SendResult —— 語意必須一樣：不寄。
+    assert "return SendResult(False)" in seg, seg
 
 
 def test_scan_entry_message_does_not_claim_threshold_reached(caplog):

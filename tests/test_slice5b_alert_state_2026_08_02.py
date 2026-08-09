@@ -189,11 +189,32 @@ class TestSavingTheSentRecord:
 class TestTheAppIsWiredToTheGuard:
 
     def test_the_writer_asks_before_overwriting(self):
-        """★守衛要在寫入咽喉上，不是只存在於模組裡★"""
+        """★守衛要在寫入咽喉上，不是只存在於模組裡★
+
+        ★[2026-08-09] 不可以只掃一支寫死的方法名★
+        第一版掃 `_mark_alert_email_sent`。把它的本體抽成
+        `_mark_alert_email_sent_locked`（#71 為了消除升級時的空窗）之後，
+        這條守衛就**靜默失效**了 —— 掃到的是一個只剩兩行的殼，
+        而真正的寫入路徑完全沒有被檢查。
+        改成：找出【所有真的寫這個檔的方法】，逐一檢查。
+        """
+        import ast as _ast
         import main
-        src = inspect.getsource(main.AutomationApp._mark_alert_email_sent)
-        assert "_alert_records_for_save" in src, "寫回前沒有問過磁碟現況"
-        assert "should_write" in src, "沒有理會「不要寫」的判定"
+        cls = _ast.parse(inspect.getsource(main.AutomationApp)).body[0]
+        writers = []
+        for node in cls.body:
+            if not isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                continue
+            body = _ast.get_source_segment(
+                inspect.getsource(main.AutomationApp), node) or ""
+            if "ALERT_EMAIL_SENT_FILENAME" in body and                     "_atomic_write_json" in body:
+                writers.append((node.name, body))
+        assert writers, (
+            "★找不到任何寫入 alert_email_sent 的方法 —— 空集合不算通過★"
+            "（檔名或寫法變了，這條守衛已經失效）")
+        for name, body in writers:
+            assert "_alert_records_for_save" in body,                 f"{name} 寫回前沒有問過磁碟現況"
+            assert "should_write" in body, f"{name} 沒有理會「不要寫」的判定"
 
     def test_the_load_failure_flag_comes_from_the_loader_not_a_constant(self):
         """★[突變驗證抓到] 第一版只斷言字串出現過，那證明不了任何事★

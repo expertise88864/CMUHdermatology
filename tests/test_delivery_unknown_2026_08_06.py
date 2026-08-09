@@ -359,7 +359,12 @@ def test_stop_signup_alert_treats_unknown_as_sent(monkeypatch, caplog):
     monkeypatch.setattr(sm, "send_mail", _boom)
     with caplog.at_level(_lg.ERROR):
         ok = main._send_alert_email_via_smtp("三晚 100 人", "body", ["a@b.c"])
-    assert ok is True, "★結果不明被當成失敗★ 下一輪會重寄 → 醫師收到重複提醒"
+    assert ok, "★結果不明被當成失敗★ 下一輪會重寄 → 醫師收到重複提醒"
+    # ★[#71] 但「不重寄」不等於「已送達」★
+    #   舊版把 UNKNOWN 壓成裸 True，呼叫端就寫下【永久】去重記號；
+    #   而批次 U 之後回查會把它收斂成「其實沒寄到」—— 兩個真相來源
+    #   打架，而錯的那個(永久記號)贏 → 那一則永遠不會再寄。
+    assert ok.unknown is True, "UNKNOWN 沒被標示 → 呼叫端分不出來"
     assert any("結果不明" in r.getMessage() for r in caplog.records), \
         "必須用 error 級別留下可查證的紀錄"
 
@@ -372,4 +377,6 @@ def test_stop_signup_alert_still_reports_real_failures(monkeypatch):
         raise RuntimeError("connection refused")
 
     monkeypatch.setattr(sm, "send_mail", _boom)
-    assert main._send_alert_email_via_smtp("x", "b", ["a@b.c"]) is False
+    res = main._send_alert_email_via_smtp("x", "b", ["a@b.c"])
+    assert not res, res
+    assert res.unknown is False, "真正的失敗不可以被標成『結果不明』"

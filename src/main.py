@@ -143,8 +143,19 @@ from cmuh_common.audit_events import (
 # [P2-06 第五刀(a) 第二批 2026-08-02] 勿擾窗判斷與「已寄止掛信」紀錄搬出 AutomationApp
 # （兩支都完全不碰 self）。搬的過程中發現讀檔失敗會把紀錄整批覆蓋掉，一併修掉。
 from cmuh_common.alert_state import (
+    PENDING_EXPIRE as _PENDING_EXPIRE,
+    PENDING_FILENAME as _ALERT_PENDING_FILENAME,
+    PENDING_MAX_AGE_SEC as _ALERT_PENDING_MAX_AGE_SEC,
+    PENDING_PROMOTE as _PENDING_PROMOTE,
+    PENDING_RELEASE as _PENDING_RELEASE,
+    decide_pending as _decide_alert_pending,
     is_within_dnd_window as _is_within_dnd_window,
+    is_suppressing as _alert_pending_is_suppressing,
     load_alert_email_sent as _load_alert_email_sent_from,
+    load_alert_pending as _load_alert_pending_from,
+    new_pending_entry as _new_alert_pending_entry,
+    pending_for_save as _alert_pending_for_save,
+    same_pending_generation as _same_alert_pending_gen,
     records_for_save as _alert_records_for_save,
 )
 from cmuh_common.tk_widgets import (
@@ -1905,7 +1916,7 @@ _alert_reconciler_lock = threading.Lock()
 _alert_reconcile_inflight = False
 
 
-def _kick_off_alert_reconcile() -> bool:
+def _kick_off_alert_reconcile(after=None) -> bool:
     """在背景跑一輪止掛信回查。→ 有沒有真的開起來（single-flight）。
 
     ★[外審第 2 輪 #3] 絕不可以串在刷新的關鍵路徑上★
@@ -1928,9 +1939,21 @@ def _kick_off_alert_reconcile() -> bool:
     def _worker():
         global _alert_reconcile_inflight
         try:
-            _reconcile_alert_deliveries()
-        except Exception:
-            logging.debug("[delivery] 背景回查失敗(不影響任何事)", exc_info=True)
+            try:
+                _reconcile_alert_deliveries()
+            except Exception:
+                logging.debug("[delivery] 背景回查失敗(不影響任何事)",
+                              exc_info=True)
+            # ★[#71] 掃描【一定要在回查之後】★ 它要用的是收斂【之後】的
+            #   帳本狀態；排在前面的話，每一輪看到的都是上一輪的結果。
+            # ★而且回查失敗時照樣要跑★ 逾期解除抑制那條路不可以依賴
+            #   回查成功 —— 那正是「出口依賴一個會壞的東西」。
+            #   所以它在【外層】try 裡、自己再包一層，不是接在 except 後面。
+            if after is not None:
+                try:
+                    after()
+                except Exception:
+                    logging.debug("[ALERT] 抑制紀錄掃描失敗", exc_info=True)
         finally:
             with _alert_reconciler_lock:
                 _alert_reconcile_inflight = False
@@ -8561,10 +8584,42 @@ def _get_alert_ledger():
         return _alert_ledger_obj
 
 
+class SendResult:
+    """止掛信的寄送結果。★是布林、但不只是布林★（#71 批次 Z 下半）
+
+    四個既有呼叫端都寫 `bool(_send_alert_email_via_smtp(...))`，兩個止掛呼叫端
+    寫 `if _send_alert_email_via_smtp(...)` —— 所以這個物件必須在 `if` 底下
+    表現得跟舊的 `True`/`False` 一模一樣，否則就是偷偷改掉六個地方的行為。
+
+    ★但「結果不明」不可以繼續假裝成「已送達」★
+    回 True 讓呼叫端寫下【永久】去重記號；而批次 U 之後回查會把它收斂成
+    「其實沒寄到」—— 兩個真相來源打架，且錯的那個(永久記號)贏，
+    那一則止掛提醒就永遠不會再寄。`unknown` 讓呼叫端改寫**暫時性**抑制。
+    """
+
+    __slots__ = ("sent", "unknown", "delivery_id", "message_id", "business_key")
+
+    def __init__(self, sent: bool, *, unknown: bool = False,
+                 delivery_id: str = "", message_id: str = "",
+                 business_key: str = ""):
+        self.sent = bool(sent)
+        self.unknown = bool(unknown)
+        self.delivery_id = delivery_id
+        self.message_id = message_id
+        self.business_key = business_key
+
+    def __bool__(self) -> bool:
+        """★不重寄★ —— 送達與「結果不明」都回 True（與舊行為相同）。"""
+        return self.sent
+
+    def __repr__(self) -> str:                       # pragma: no cover
+        return "SendResult(sent=%r, unknown=%r)" % (self.sent, self.unknown)
+
+
 def _send_alert_email_via_smtp(subject: str, body: str,
                                 recipients: list, timeout: float = 60.0,
                                 category: "str | None" = None,
-                                business_key: str = "") -> bool:
+                                business_key: str = "") -> "SendResult":
     """達到門檻時透過 SMTP (Gmail) 寄信。回傳是否成功（失敗只 log，不影響主程式）。
 
     為何用 SMTP 不用 Outlook：admin 行程的 Outlook COM 會起一個 admin Outlook
@@ -8573,14 +8628,14 @@ def _send_alert_email_via_smtp(subject: str, body: str,
     地獄，admin/user 任何權限都能寄。設定見 settings/smtp_credentials.json。"""
     if not recipients:
         _warn_alert_has_no_recipients("SMTP 寄信")
-        return False
+        return SendResult(False)
     try:
         from cmuh_common.smtp_mail import (
             DeliveryOutcomeUnknown, SmtpNotConfiguredError, send_mail,
         )
     except Exception:
         logging.warning("smtp_mail 模組載入失敗，止掛信跳過", exc_info=True)
-        return False
+        return SendResult(False)
     # ★[2026-08-07 外審 AT/AW] 每一則通知都進寄送帳本★
     #   begin 在送出【之前】：送出當下斷電時，重啟後看到的是一筆待查的
     #   SUBMITTING，而不是「什麼都沒發生」。business_key 預設用主旨
@@ -8649,11 +8704,11 @@ def _send_alert_email_via_smtp(subject: str, body: str,
                 "[ALERT] 「%s」有收件人沒收到信:%s —— 請檢查收件人設定(位址打錯/"
                 "信箱已滿);其餘收件人已送達,本則不會重寄以免重複轟炸",
                 subject, ", ".join(sorted(str(r) for r in refused)))
-        return True
+        return SendResult(True)
     except SmtpNotConfiguredError as e:
         _settle(failed=True)
         logging.warning("止掛提醒寄信跳過（SMTP 尚未設定）：%s", e)
-        return False
+        return SendResult(False)
     except DeliveryOutcomeUnknown as e:
         _settle(unknown=True)
         # ★[2026-08-07 外審] 「結果不明」不可以當成失敗★
@@ -8679,11 +8734,13 @@ def _send_alert_email_via_smtp(subject: str, body: str,
             "[ALERT] 「%s」寄送結果不明(伺服器可能已收下,逾時沒看到最終回應)"
             " → 本則【視為已寄、不重寄】以免醫師收到重複提醒;"
             "請到 Gmail 寄件備份確認是否送達:%s", subject, e)
-        return True
+        return SendResult(True, unknown=True, delivery_id=_did,
+                          message_id=_msgid,
+                          business_key=business_key)
     except Exception as e:
         _settle(failed=True)
         logging.warning("止掛提醒 SMTP 寄信失敗：%s", e)
-        return False
+        return SendResult(False)
 
 
 def _send_alert_email_via_outlook(subject: str, body: str,
@@ -8980,6 +9037,24 @@ class AutomationApp:
             logging.error(
                 "[ALERT] 讀不到已寄止掛信紀錄(%s，檔案仍在，可能被防毒/備份鎖住)"
                 " → 本次執行不會用空紀錄覆蓋它", ALERT_EMAIL_SENT_FILENAME)
+        # ★[#71] 「結果不明」的暫時性抑制★（與上面的【永久】記號分開兩個檔）
+        #   永久記號的值是日期字串、走 `records_for_save` 那條已驗證過的
+        #   「讀不到不可以覆蓋」路徑。改它的值結構會牽動那條路徑，所以另開一檔。
+        #   ★跨重啟要活得下來★ 否則重啟就等於解除抑制 → 重複寄。
+        _pending_load = _load_alert_pending_from(
+            get_conf_path(_ALERT_PENDING_FILENAME))
+        self._alert_email_pending = _pending_load.records
+        self._alert_pending_load_failed = _pending_load.unreadable
+        self._alert_pending_dirty = False
+        if _pending_load.unreadable:
+            # ★讀不到【不可以】當成「沒有 pending」★ 那會讓一則結果不明的
+            #   提醒立刻被重寄；也不可以當成「有 pending」全部擋住。
+            #   這裡的選擇：這次執行【不寫回】(不覆蓋磁碟)，但抑制以記憶體
+            #   為準(空的)→ 最多重寄一則，且下面會明講。
+            logging.error(
+                "[ALERT] 讀不到止掛信的『結果不明』抑制紀錄(%s，檔案仍在)"
+                " → 本次執行不覆蓋它；期間可能重寄一則結果不明的提醒",
+                _ALERT_PENDING_FILENAME)
         self._dnd_suppressed_count = 0
         # [2026-07-13 使用者] 「提醒勿擾時段」與「半夜也監測」設定已移除、不再讓使用者勾選；
         # 固定行為：止掛提醒(reg52)email 全天候照寄；夜間 00:00–08:00 只寄 email+記 log、不跳彈窗
@@ -9175,6 +9250,11 @@ class AutomationApp:
                 # 動作紀錄會憑空消失。自動更新重啟很頻繁,這不是罕見路徑。
                 _flush_ledger_before_exit()
                 _flush_delivery_ledger_before_exit()
+                # ★[外審第 2 輪 #2] 抑制紀錄上次沒落地的，這裡最後再試一次★
+                #   只在掃描裡重試的話，「寫失敗 → 磁碟恢復 → 還沒輪到下一次
+                #   掃描就重啟」這條路上，抑制只活在記憶體 → 重啟後那則
+                #   結果不明的信會被重寄。自動更新重啟很頻繁，不是罕見路徑。
+                self._retry_alert_pending_save()
             except Exception:
                 logging.debug("[ledger] 重啟前排空例外(忽略)", exc_info=True)
             try:
@@ -9250,6 +9330,8 @@ class AutomationApp:
         try:
             _flush_ledger_before_exit()
             _flush_delivery_ledger_before_exit()
+            # ★[外審第 2 輪 #2] 見重啟路徑同一段說明★
+            self._retry_alert_pending_save()
         except Exception:
             logging.debug("[ledger] 關閉前排空例外(忽略)", exc_info=True)
         _flush_delivery_ledger_before_exit()
@@ -9385,7 +9467,21 @@ class AutomationApp:
     # 寄信前先讀此記錄;已寄過就跳過,確保每個診次當天只寄一封。
     def _has_alert_email_been_sent(self, notify_key: str) -> bool:
         with self._alert_state_lock:
-            return notify_key in self._alert_email_sent
+            return self._alert_dedup_hit_locked(notify_key)
+
+    def _alert_dedup_hit_locked(self, notify_key: str) -> bool:
+        """這一則現在算不算「已經寄過」。★呼叫端必須已持有 _alert_state_lock★
+
+        兩個來源：
+          * **永久記號**：確定寄出去了。
+          * **暫時性抑制**（#71）：結果不明，還在等 Message-ID 回查的結果。
+            逾期就不再抑制 —— 見 `alert_state.is_suppressing` 的說明
+            （出口不可以依賴掃描有沒有跑）。
+        """
+        if notify_key in self._alert_email_sent:
+            return True
+        entry = self._alert_email_pending.get(notify_key)
+        return bool(entry) and _alert_pending_is_suppressing(entry, time.time())
 
     def _claim_alert_email(self, notify_key: str) -> bool:
         """[codex 2026-07-17] 原子取得某止掛信的【寄送權】。
@@ -9398,7 +9494,9 @@ class AutomationApp:
         回 True = 你可以寄(且已登記為寄送中,寄完【務必】呼叫 _release_alert_email_claim)。
         回 False = 已經寄過、或另一條路徑正在寄 → 不要寄。"""
         with self._alert_state_lock:
-            if notify_key in self._alert_email_sent:
+            # ★[#71] 這裡也要看暫時性抑制★ 只看永久記號的話，「結果不明」
+            #   那一則會在下一輪被當成沒寄過而重寄 —— 正是這個機制要避免的事。
+            if self._alert_dedup_hit_locked(notify_key):
                 return False
             if notify_key in self._alert_email_inflight:
                 return False
@@ -9411,6 +9509,162 @@ class AutomationApp:
         with self._alert_state_lock:
             self._alert_email_inflight.discard(notify_key)
 
+    def _mark_alert_email_pending(self, notify_key: str, result) -> None:
+        """記下「這一則的寄送結果不明」。★這【不是】永久去重記號★（#71）
+
+        以前 UNKNOWN 直接寫永久記號，於是回查把它收斂成「其實沒寄到」之後，
+        兩個真相來源打架而錯的那個贏 —— 那一則永遠不會再寄。
+        改記成暫時性抑制：不重寄，但也不宣稱已送達；由
+        `_sweep_alert_pending()` 依帳本結果升級或解除。
+        """
+        entry = _new_alert_pending_entry(
+            delivery_id=getattr(result, "delivery_id", "") or "",
+            message_id=getattr(result, "message_id", "") or "",
+            business_key=getattr(result, "business_key", "") or "",
+            now=time.time())
+        with self._alert_state_lock:
+            self._alert_email_pending[notify_key] = entry
+            self._save_alert_pending_locked()
+        logging.error(
+            "[ALERT] 「%s」寄送結果不明 → 【暫時】抑制重寄 %.0f 小時，"
+            "期間會用 Message-ID 回查寄件備份；查無就會解除抑制並重寄，"
+            "查不出來則逾期後解除並告警", notify_key,
+            _ALERT_PENDING_MAX_AGE_SEC / 3600.0)
+
+    def _save_alert_pending_locked(self) -> None:
+        """把抑制紀錄落地。★呼叫端必須已持有 _alert_state_lock★
+
+        ★[外審 2026-08-09 #2] 寫失敗不可以就這樣算了★
+        抑制只活在記憶體的話，重啟後既沒有永久記號、也沒有 pending ——
+        那一則結果不明的提醒會被重寄，即使帳本裡那筆仍是 UNKNOWN。
+        失敗就留下 dirty 旗標，由下一次異動或每一輪掃描再試。
+        （防毒掃到檔案、備份鎖住都是幾秒鐘的事，重試幾乎一定會成功。）
+        """
+        path = get_conf_path(_ALERT_PENDING_FILENAME)
+        decision = _alert_pending_for_save(
+            path, self._alert_email_pending,
+            load_failed=self._alert_pending_load_failed)
+        if not decision.should_write:
+            logging.warning("[ALERT] %s", decision.describe())
+            self._alert_pending_dirty = True
+            return
+        try:
+            _atomic_write_json(path, decision.payload)
+            self._alert_pending_dirty = False
+            if self._alert_pending_load_failed:
+                self._alert_email_pending = dict(decision.payload)
+                self._alert_pending_load_failed = False
+                logging.info("[ALERT] 已讀回先前的抑制紀錄並合併，解除覆蓋保護")
+        except Exception:
+            self._alert_pending_dirty = True
+            logging.warning("[ALERT] 寫入止掛信抑制紀錄失敗(下一輪會再試)",
+                            exc_info=True)
+
+    def _retry_alert_pending_save(self) -> bool:
+        """上次沒落地就再試一次。→ 這一輪有沒有需要重試。"""
+        with self._alert_state_lock:
+            if not getattr(self, "_alert_pending_dirty", False):
+                return False
+            logging.info("[ALERT] 抑制紀錄上次沒落地 → 再試一次")
+            self._save_alert_pending_locked()
+            return True
+
+    def _sweep_alert_pending(self, now=None) -> dict:
+        """把每一筆抑制拿去問帳本，該升級的升級、該解除的解除。→ 各發生幾次。
+
+        ★這是抑制的【出口】★
+        IMAP 長期不可用時回查永遠拿不到答案。沒有出口的話，這個機制會從
+        「防重複」變成**永久靜默漏寄** —— 2026-08-05 事故那個形狀。
+        所以逾期一律解除 + 告警：
+        **寧可讓人收到一則重複，也不要讓一則該寄的永遠不寄而且沒人知道。**
+
+        ★整段 fail-open★ 問不到帳本就維持原狀，下一輪再問（逾期那條路仍在）。
+        """
+        now = float(now if now is not None else time.time())
+        # ★[外審 #2] 上次沒落地的先補寫★ 抑制只活在記憶體＝重啟就重寄。
+        self._retry_alert_pending_save()
+        led = _get_alert_ledger()
+        with self._alert_state_lock:
+            items = list(self._alert_email_pending.items())
+        counts = {"promote": 0, "release": 0, "expire": 0, "keep": 0}
+        for nk, entry in items:
+            state = ""
+            did = str((entry or {}).get("delivery_id") or "")
+            if led is not None and did:
+                try:
+                    state = led.state_of(did)
+                except Exception:
+                    # ★問不到 ≠ 沒送到★ 留空字串 → decide 會回 KEEP 或 EXPIRE
+                    logging.debug("[ALERT] 問不到 %s 的寄送狀態", did,
+                                  exc_info=True)
+                    state = ""
+            action = _decide_alert_pending(entry, state, now)
+            # ★把【當初看到的那一筆】帶下去★（外審 2026-08-09 #1）
+            #   下面的 I/O 期間，同一個 notify_key 可能已經逾期、被重寄、
+            #   又寫了一筆【新的】抑制。照 key 無條件刪的話刪到的是新的
+            #   那一筆 → 抑制消失 → 下一輪再寄，而且會一直循環。
+            if action == _PENDING_PROMOTE:
+                self._promote_alert_pending(nk, entry)
+            elif action == _PENDING_RELEASE:
+                self._release_alert_pending(
+                    nk, entry, "寄件備份查無 → 這封沒有寄出去，解除抑制讓它重寄")
+            elif action == _PENDING_EXPIRE:
+                self._release_alert_pending(
+                    nk, entry,
+                    "超過 %.0f 小時仍查不出結果 → ★解除抑制★，"
+                    "下一輪會重寄；若醫師其實已經收到，會收到第二封 —— "
+                    "那比永遠不寄好" % (_ALERT_PENDING_MAX_AGE_SEC / 3600.0))
+            counts[action] = counts.get(action, 0) + 1
+        return counts
+
+    def _promote_alert_pending(self, notify_key: str, entry) -> None:
+        """帳本確認送達 → 升級成永久記號，抑制紀錄功成身退。
+
+        ★只有在【還是同一筆】時才動它★（外審 2026-08-09 第 1 輪 #1）
+
+        ★★兩件事必須在同一個臨界區、而且順序不能反★★（第 2 輪 #1）
+        上一版是「先刪 pending（一次上鎖）→ 再寫永久記號（另一次上鎖）」。
+        那兩次上鎖之間，通知掃描緒若呼叫 `_claim_alert_email()`，
+        **兩個去重來源都看不到這一則** → 它取得寄送權 → 重寄一封
+        帳本已經確認送達的信。修正抑制漏寄，卻換來重複寄送。
+        先立記號、再刪抑制：任何時刻至少有一個來源擋著。
+        """
+        with self._alert_state_lock:
+            current = self._alert_email_pending.get(notify_key)
+            if current is None or not _same_alert_pending_gen(current, entry):
+                logging.info("[ALERT] 「%s」在掃描期間已被換成新的一筆 → 不動它",
+                             notify_key)
+                return
+            # ★順序★ 先永久記號（新的擋路者就位），才拆掉舊的擋路者。
+            self._mark_alert_email_sent_locked(notify_key)
+            self._alert_email_pending.pop(notify_key, None)
+            self._save_alert_pending_locked()
+        logging.info("[ALERT] 「%s」已在寄件備份查到 → 轉為永久去重記號",
+                     notify_key)
+
+    def _release_alert_pending(self, notify_key: str, entry, why: str) -> None:
+        """解除抑制：下一輪的掃描／通知就可以再寄一次。"""
+        if not self._drop_alert_pending_if_same(notify_key, entry):
+            logging.info("[ALERT] 「%s」在掃描期間已被換成新的一筆 → 不解除",
+                         notify_key)
+            return
+        logging.error("[ALERT] 「%s」解除重寄抑制：%s", notify_key, why)
+
+    def _drop_alert_pending_if_same(self, notify_key: str, entry) -> bool:
+        """在鎖內刪掉那一筆 —— 但**只有它還是我看到的那一筆**時。
+
+        ★分不出來就不刪★ 少刪一次只是下一輪再處理；錯刪會直接造成重複寄信。
+        """
+        with self._alert_state_lock:
+            current = self._alert_email_pending.get(notify_key)
+            if current is None:
+                return False
+            if not _same_alert_pending_gen(current, entry):
+                return False
+            self._alert_email_pending.pop(notify_key, None)
+            self._save_alert_pending_locked()
+            return True
+
     def _mark_alert_email_sent(self, notify_key: str) -> None:
         """記錄某止掛信已寄出並持久化(僅在『確實寄出成功』後呼叫)。
 
@@ -9418,27 +9672,38 @@ class AutomationApp:
         以不同順序寫入 → 較舊的快照後到、覆蓋掉較新的(漏記 key → 重啟後重寄)。
         寄信頻率極低(一天數次),寫檔僅 atomic rename(~毫秒),持鎖成本可忽略。"""
         with self._alert_state_lock:
-            self._alert_email_sent[notify_key] = date.today().isoformat()
-            path = get_conf_path(ALERT_EMAIL_SENT_FILENAME)
-            # ★[P2-06 第五刀 2026-08-02] 開機時讀不到就不可以直接覆蓋★
-            #   直接寫等於把磁碟上既有的「已寄過」紀錄整批抹掉 → 重複寄信。
-            #   讀得回來就合併(自我修復)，仍讀不到就這次不寫。
-            decision = _alert_records_for_save(
-                path, self._alert_email_sent,
-                load_failed=self._alert_sent_load_failed,
-                retain_days=ALERT_EMAIL_SENT_RETAIN_DAYS)
-            if not decision.should_write:
-                logging.warning("[ALERT] %s", decision.describe())
-                return
-            try:
-                _atomic_write_json(path, decision.payload)
-                if self._alert_sent_load_failed:
-                    # 合併成功 → 記憶體那份已經含磁碟的舊紀錄，疑慮解除。
-                    self._alert_email_sent = dict(decision.payload)
-                    self._alert_sent_load_failed = False
-                    logging.info("[ALERT] 已讀回先前的止掛信紀錄並合併，解除覆蓋保護")
-            except Exception:
-                logging.warning("寫入止掛信寄出記錄失敗(不影響本次提醒)", exc_info=True)
+            self._mark_alert_email_sent_locked(notify_key)
+
+    def _mark_alert_email_sent_locked(self, notify_key: str) -> None:
+        """同上，但★呼叫端必須已持有 `_alert_state_lock`★。
+
+        抽出來的理由見 `_promote_alert_pending`：升級那條路必須把
+        「立永久記號」與「刪抑制紀錄」放進同一個臨界區，否則兩者之間
+        會出現一個【兩個去重來源都看不到】的空窗 → 重複寄信。
+        （`_alert_state_lock` 是 `threading.Lock`，不可重入，所以不能直接
+        在鎖內呼叫上面那支。）
+        """
+        self._alert_email_sent[notify_key] = date.today().isoformat()
+        path = get_conf_path(ALERT_EMAIL_SENT_FILENAME)
+        # ★[P2-06 第五刀 2026-08-02] 開機時讀不到就不可以直接覆蓋★
+        #   直接寫等於把磁碟上既有的「已寄過」紀錄整批抹掉 → 重複寄信。
+        #   讀得回來就合併(自我修復)，仍讀不到就這次不寫。
+        decision = _alert_records_for_save(
+            path, self._alert_email_sent,
+            load_failed=self._alert_sent_load_failed,
+            retain_days=ALERT_EMAIL_SENT_RETAIN_DAYS)
+        if not decision.should_write:
+            logging.warning("[ALERT] %s", decision.describe())
+            return
+        try:
+            _atomic_write_json(path, decision.payload)
+            if self._alert_sent_load_failed:
+                # 合併成功 → 記憶體那份已經含磁碟的舊紀錄，疑慮解除。
+                self._alert_email_sent = dict(decision.payload)
+                self._alert_sent_load_failed = False
+                logging.info("[ALERT] 已讀回先前的止掛信紀錄並合併，解除覆蓋保護")
+        except Exception:
+            logging.warning("寫入止掛信寄出記錄失敗(不影響本次提醒)", exc_info=True)
 
     def _clinic_dynamic_state_matches(self, state, room_code, time_code, doc_name=None, session_cn=None):
         return state_matches(
@@ -12612,7 +12877,7 @@ class AutomationApp:
             #   回查會開 IMAP 連線（每筆 12 秒 timeout、一輪最多 5 筆）。
             #   同步等它 = IMAP 掛掉時，掛號資料在送出第一個查詢前先卡 60 秒。
             try:
-                _kick_off_alert_reconcile()
+                _kick_off_alert_reconcile(after=self._sweep_alert_pending)
             except Exception:
                 logging.debug("[delivery] 止掛信回查點火失敗(不影響刷新)",
                               exc_info=True)
@@ -14556,9 +14821,15 @@ class AutomationApp:
                                                                             if not rcpts:
                                                                                 _warn_alert_has_no_recipients("行事曆止掛通知")
                                                                             if rcpts:
-                                                                                if _send_alert_email_via_smtp(
-                                                                                        subj, m, rcpts,
-                                                                                        business_key=f"alert:{nk}"):
+                                                                                _res = _send_alert_email_via_smtp(
+                                                                                    subj, m, rcpts,
+                                                                                    business_key=f"alert:{nk}")
+                                                                                # ★[#71] 「結果不明」不可以寫【永久】記號★
+                                                                                #   回查會把它收斂成「其實沒寄到」,而永久記號會贏
+                                                                                #   → 那一則永遠不會再寄。改記暫時性抑制。
+                                                                                if _res and getattr(_res, "unknown", False):
+                                                                                    self._mark_alert_email_pending(nk, _res)
+                                                                                elif _res:
                                                                                     self._mark_alert_email_sent(nk)
                                                                         except Exception:
                                                                             logging.warning("止掛提醒寄信例外", exc_info=True)
@@ -15307,8 +15578,16 @@ class AutomationApp:
         def _worker():
             # 寄送權已由呼叫端 _claim_alert_email 取得 → 這裡直接寄,寄成功才永久記號。
             try:
-                if _send_alert_email_via_smtp(subject, msg, list(recipients),
-                                              business_key=f"alert:{nk}"):
+                _res = _send_alert_email_via_smtp(
+                    subject, msg, list(recipients),
+                    business_key=f"alert:{nk}")
+                # ★[#71] 見行事曆那條路徑的說明:UNKNOWN → 暫時性抑制★
+                #   用 getattr:呼叫端被 stub 成回布林時要退回舊行為,
+                #   而不是拋 AttributeError 被外層 except 吞掉(那會靜默
+                #   漏記【已寄】→ 每一輪重寄)。回傳型別另有測試釘住。
+                if _res and getattr(_res, "unknown", False):
+                    self._mark_alert_email_pending(nk, _res)
+                elif _res:
                     self._mark_alert_email_sent(nk)
                     logging.info("[ALERT] 已寄遠期止掛提醒 %s(還有 %d 天,%d 人)",
                                  nk, days_left, count)
