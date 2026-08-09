@@ -59,6 +59,15 @@ jobs:
       - name: Pytest (全測試 + 覆蓋率)
         run: python -m pytest -q -p no:cacheprovider --junitxml=junit.xml --cov=src --cov-report=json:cov.json --cov-report=term:skip-covered
 
+      # ★[2026-08-09] 讓「哪一支測試壞了」讀得到★
+      #   `check-runs/<id>/annotations` 匿名讀得到，`actions/jobs/<id>/logs` 是
+      #   403（要 admin）。所以 CI 紅了而本機全綠時，失敗原因等於只有點進網頁
+      #   才看得到 —— 一道看不到原因的紅燈最後就是被忽略的紅燈。
+      #   這一步只在 pytest 紅時跑，而且【不改變成敗】（它自己一律 exit 0）。
+      - name: pytest 失敗細節（轉成 annotation）
+        if: failure()
+        run: python scripts/ci_pytest_annotations.py junit.xml
+
       - name: skip 數量守衛
         # always()：測試紅燈時更要知道是不是「一批測試被靜默關掉」造成的
         if: always()

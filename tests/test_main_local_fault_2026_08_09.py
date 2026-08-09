@@ -83,6 +83,18 @@ def harness(monkeypatch):
     monkeypatch.setattr(main, "_source_backoff_success",
                         lambda k: seen["ok_backoff"].append(k))
     seen["ui"] = []
+    # ★★測試絕對不可以碰網路★★（2026-08-09：CI 紅、本機綠的第一嫌疑）
+    #   `check_appointment_count` 會依這三個述詞決定要不要抓東區／惠和／惠盛，
+    #   亞大則看醫師在不在 `AUH_DOCTOR_DOCNO_MAP` 裡。抓取走的是【另一條】
+    #   thread-local session（`_get_thread_local_reg52_external_session`），
+    #   不是上面換掉的那條 —— 也就是說，只換主院那條 session 的話，這支測試
+    #   在 CI 上會真的對 61.66.117.10 與 appointment.cmuh.org.tw 發請求：
+    #   逾時長短、DNS、代理都會變成測試結果的一部分。
+    #   這裡把四個入口一律關掉：本批要測的是「失敗歸因」，不是分院抓取。
+    for pred in ("_should_fetch_east_district_reg52", "_should_fetch_huihe_reg52",
+                 "_should_fetch_huisheng_reg52"):
+        monkeypatch.setattr(main, pred, lambda *a, **k: False)
+    monkeypatch.setattr(main, "AUH_DOCTOR_DOCNO_MAP", {})
     monkeypatch.setattr(main, "put_ui_message",
                         lambda q, m, *a, **k: seen["ui"].append(m))
     monkeypatch.setattr(main, "_reg52_stale_fallback", lambda *a, **k: "")
@@ -420,3 +432,57 @@ def test_the_contract_really_can_return_local_error(monkeypatch):
     assert out.status == contract.LOCAL_ERROR, (
         f"契約層在 bs4 壞掉時沒有回 LOCAL_ERROR：{out.status}/{out.reason}")
     assert out.blames_remote is False
+
+
+def test_the_harness_leaves_no_way_out_to_the_network(harness, monkeypatch):
+    """★守衛自己也要被守★
+
+    這支測試檔真的執行 `check_appointment_count` —— 那條路上有四個對外抓取的
+    入口。哪天有人加第五個、或改了述詞的名字，上面的 fixture 就會安靜地
+    失效，測試變成「有時候會連外網」：在本機通常失敗得很快看不出來，在 CI 上
+    卻可能變成逾時、間歇紅燈，或更糟 —— 對醫院主機發出真實請求。
+    """
+    import ast
+    import inspect
+    import textwrap
+    src = textwrap.dedent(inspect.getsource(main.check_appointment_count))
+    gates = set()
+    for n in ast.walk(ast.parse(src)):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id.startswith("_should_fetch_")):
+            gates.add(n.func.id)
+    assert gates == {"_should_fetch_east_district_reg52",
+                     "_should_fetch_huihe_reg52",
+                     "_should_fetch_huisheng_reg52"}, (
+        f"對外抓取的入口變了，fixture 要同步關掉：{sorted(gates)}")
+    # 亞大沒有述詞，是看醫師在不在名單裡 —— fixture 把名單清空
+    assert main.AUH_DOCTOR_DOCNO_MAP == {}, "亞大那條路沒有被關掉"
+    for g in gates:
+        assert getattr(main, g)("x", "y") is False, f"{g} 沒有被 fixture 關掉"
+
+
+def test_stubbing_main_does_not_reach_the_real_backoff_state(harness):
+    """★為什麼「關掉入口」比「換掉 main 的 stub」重要★
+
+    分院／亞大的抓取函式住在 `cmuh_common.reg52_fetch`，它用的是**自己 import
+    的** `_source_backoff_fail` / `_circuit_record_fail` —— 不是上面 fixture 換
+    掉的 `main.*`。所以只要那些抓取真的跑起來，就會：
+      ① 對 61.66.117.10 與 appointment.cmuh.org.tw 發出真實請求；
+      ② 把真實的 `fetch_resilience._source_backoff_state` 寫進 `east:0001` 之類
+         的鍵 —— **污染同一輪其他測試看到的全域狀態**。
+    Windows 上連線瞬間失敗、Linux runner 上時序完全不同，於是「本機綠、CI 紅」。
+
+    這條測試釘住那個結構事實：換掉 `main.X` 動不到 `reg52_fetch` 裡的同名東西。
+    """
+    import cmuh_common.fetch_resilience as fr
+    import cmuh_common.reg52_fetch as rf
+    assert rf._source_backoff_fail is fr._source_backoff_fail, (
+        "reg52_fetch 改成別的來源了 —— 上面的說明要重寫")
+    assert main._source_backoff_fail is not rf._source_backoff_fail, (
+        "fixture 換掉 main 的 stub 竟然也換到了 reg52_fetch —— "
+        "那表示這條測試量錯了東西")
+    before = dict(fr._source_backoff_state)
+    _run()
+    assert dict(fr._source_backoff_state) == before, (
+        "★這一輪測試動到了真實的退避狀態★ —— 代表有對外抓取真的跑起來了，"
+        "它會污染同一輪的其他測試，而且會對醫院主機發出真實請求")
