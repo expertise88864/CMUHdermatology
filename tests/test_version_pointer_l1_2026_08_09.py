@@ -616,3 +616,111 @@ def test_the_stub_checks_the_same_pointer_name_as_the_resolver():
     """★兩邊要指同一個檔名★ 名字漂掉的話,這個偵測就永遠不會觸發。"""
     assert vp.POINTER_NAME in _stub_block(_STUBS[0]), (
         "stub 檢查的檔名跟 version_pointer.POINTER_NAME 不一致 → 偵測失效")
+
+
+# ── 外審 P1-01：復原模組不可以從【版本解析後的】那棵樹載入 ────────────────
+class TestRecoveryComesFromTheFixedTree:
+    """★拿壞掉的東西去修壞掉的東西★
+
+    舊寫法是 `import bootstrap_recovery`，而那時 `sys.path` 開頭已經是
+    **版本解析後**的 `_SRC`。復原模組存在的理由正是「上一批更新沒走完、
+    磁碟上新舊混版」—— 它卻從那棵可能正壞掉的樹裡載進來。
+    這正是本專案記過的病灶：復原不可以依賴正在出問題的那個東西。
+    """
+
+    @pytest.mark.parametrize("path", _STUBS, ids=lambda p: os.path.basename(p))
+    def test_no_stub_imports_it_through_sys_path(self, path):
+        """★核心★ 六支都不可以再出現裸的 `import bootstrap_recovery`。"""
+        import ast
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        bad = [n.lineno for n in ast.walk(tree)
+               if isinstance(n, ast.Import)
+               for a in n.names if a.name == "bootstrap_recovery"]
+        assert not bad, (
+            f"{os.path.basename(path)} 第 {bad} 行仍走 sys.path 匯入復原模組 —— "
+            "那棵樹正是可能壞掉的那一棵")
+
+    @pytest.mark.parametrize("path", _STUBS, ids=lambda p: os.path.basename(p))
+    def test_every_stub_uses_the_fixed_loader(self, path):
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        assert "_load_bootstrap_recovery()" in src, "沒有接上固定路徑載入器"
+
+    def test_the_loader_reads_from_the_app_src(self, tmp_path):
+        """★固定的家是 `<app>/src`★ 復原處理的就是就地更新那棵樹的殘局。"""
+        ns = _stub_ns(_STUBS[0], tmp_path)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "bootstrap_recovery.py").write_text(
+            "MARKER = 'from-app-src'", encoding="utf-8")
+        mod = ns["_load_bootstrap_recovery"]()
+        assert mod.MARKER == "from-app-src"
+
+    def test_a_versioned_tree_is_never_used(self, tmp_path):
+        """★核心反例★ 版本樹裡那一份不可以被拿來用（那正是可能壞掉的那份）。
+
+        ★反例必須讓兩條路真的分歧★ 只把版本樹塞進 sys.path 是不夠的：
+        沒有 `current.txt` 時 `_resolve_src()` 本來就回 `<app>/src`，
+        兩條路的答案一樣 → 突變「改讀 `_resolve_src()`」照樣全綠。
+        這裡用真的指標機制造出分歧：`<app>/src` 與 `versions/<V>/src`
+        各放一份**內容不同**的復原模組。
+        """
+        import shutil
+        ns = _stub_ns(_STUBS[0], tmp_path)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "bootstrap_recovery.py").write_text(
+            "MARKER = 'from-app-src'", encoding="utf-8")
+        # ★要有真的 version_pointer.py，解析才會走版本樹★
+        #   （少了它，resolver 安靜退回 <app>/src，兩條路又一樣了）
+        shutil.copy2(os.path.join(REPO_ROOT, "version_pointer.py"),
+                     str(tmp_path / "version_pointer.py"))
+        # 讓 version_pointer 真的解析到版本樹（完整、且有 version.py）
+        v = tmp_path / vp.VERSIONS_DIRNAME / "9.9.9.9" / "src"
+        (v / "cmuh_common").mkdir(parents=True)
+        (v / "cmuh_common" / "version.py").write_text(
+            "CURRENT_VERSION='9.9.9.9'", encoding="utf-8")
+        (v / "bootstrap_recovery.py").write_text(
+            "MARKER = 'from-version-tree'", encoding="utf-8")
+        (tmp_path / vp.VERSIONS_DIRNAME / "9.9.9.9"
+         / vp.COMPLETE_MARKER).write_text("", encoding="utf-8")
+        (tmp_path / vp.POINTER_NAME).write_text("9.9.9.9", encoding="utf-8")
+        # 前提：兩條路確實不同（否則這條測試證明不了任何事）
+        resolved = ns["_resolve_src"]()
+        assert resolved == str(v), f"測試前提沒成立：{resolved}"
+        mod = ns["_load_bootstrap_recovery"]()
+        assert mod.MARKER == "from-app-src", (
+            "★復原模組是從【版本解析後】的那棵樹載進來的 —— "
+            "而那正是可能壞掉的那一棵★")
+
+    def test_a_missing_module_raises_instead_of_returning_none(self, tmp_path):
+        """★要拋，不可以回 None★
+
+        呼叫端是 `try: … except Exception:` 的形狀，而 `_report_startup_crash()`
+        靠【當下有活的例外】才寫得出 traceback。回 None 會讓它記成
+        `NoneType: None`、對話框變成「啟動失敗：None」——
+        診斷資訊比修正前更差。
+        """
+        ns = _stub_ns(_STUBS[0], tmp_path)
+        with pytest.raises(FileNotFoundError):
+            ns["_load_bootstrap_recovery"]()
+
+    def test_a_broken_module_raises_too(self, tmp_path):
+        ns = _stub_ns(_STUBS[0], tmp_path)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "bootstrap_recovery.py").write_text(
+            "def broken(  # 括號沒關", encoding="utf-8")
+        with pytest.raises(SyntaxError):
+            ns["_load_bootstrap_recovery"]()
+
+    def test_the_loader_block_is_still_byte_identical(self):
+        """載入器也在那個六份逐字相同的區塊裡（分岔＝有幾支從錯的地方載）。"""
+        blocks = {os.path.basename(p): _stub_block(p) for p in _STUBS}
+        assert len(set(blocks.values())) == 1
+        assert "_load_bootstrap_recovery" in next(iter(blocks.values()))
+
+
+def _stub_ns(path, app_dir):
+    """把 stub 的解析區塊 exec 出來，拿到裡面的函式。"""
+    ns = {"os": os, "_HERE": str(app_dir), "_PROGRAM": "t"}
+    exec(_stub_block(path), ns)      # noqa: S102
+    return ns

@@ -95,6 +95,40 @@ def _resolve_src():
         return fallback
 
 
+def _load_bootstrap_recovery():
+    """載入更新復原模組。★一定要從固定的 `<app>/src` 載，不可以走 sys.path★
+
+    ★[外審 2026-08-09 P1-01]★ 舊寫法是 `import bootstrap_recovery`,
+    而那時 `sys.path` 開頭已經是【版本解析後】的 `_SRC`。於是:
+
+      * 復原模組本身來自那棵【可能正壞掉的】樹 ——
+        它存在的理由正是「上一批更新沒走完、磁碟上新舊混版」;
+      * 拿壞掉的東西去修壞掉的東西,是這個專案記過的病灶
+        (「復原不可以依賴正在耗盡的資源」)。
+
+    復原處理的是【就地更新】`<app>/src` 的殘局,所以它的家就是那裡。
+    ★L2 版本化目錄落地時,`<app>/src/bootstrap_recovery.py` 必須繼續存在★
+    —— 找不到就走各支自己的「復原模組不可用」路徑(主程式問人、
+    背景程式放行),而不是偷偷改用版本樹裡那一份。
+
+    → 模組物件。★載不進來就【拋例外】★:呼叫端本來就是
+    `try: … except Exception:` 的形狀,而 `_report_startup_crash()`
+    要靠【當下有活的例外】才寫得出 traceback。回 None 會讓它記成
+    `NoneType: None`、對話框變成「啟動失敗：None」——
+    診斷資訊比修正前更差。
+    """
+    import importlib.util
+    _p = os.path.join(_HERE, "src", "bootstrap_recovery.py")
+    os.lstat(_p)          # 不在 → FileNotFoundError(由呼叫端接)
+    _spec = importlib.util.spec_from_file_location(
+        "_cmuh_bootstrap_recovery", _p)
+    if _spec is None or _spec.loader is None:
+        raise ImportError("bootstrap_recovery 的 spec 建不起來:%s" % _p)
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    return _mod
+
+
 _SRC = _resolve_src()
 # ★[批次L L1 外審 P1] 把「固定的根目錄」與「固定的啟動器」釘進環境★
 #   `runpy.run_path` 會把 `sys.argv[0]` 換成被執行的那支源碼（版本化之後是
@@ -141,7 +175,8 @@ def _recover_incomplete_update():
     連重試的機會都沒有 —— 比帶著混版跑更糟。所以這裡只做「修磁碟 ＋ 留紀錄」。
     """
     try:
-        import bootstrap_recovery
+        # ★[外審 P1-01] 走固定的 `<app>/src`，不走版本解析後的 sys.path★
+        bootstrap_recovery = _load_bootstrap_recovery()
         bootstrap_recovery.recover_and_report(_HERE, "排班程式")
     except Exception:  # noqa: BLE001  復原失敗不可以擋住本程式啟動
         pass
