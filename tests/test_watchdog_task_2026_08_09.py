@@ -357,26 +357,61 @@ def test_a_utf16_bom_payload_is_decoded(monkeypatch):
     assert reason == "" and "守護.pyw" in (action or ""), action
 
 
-def test_an_oem_codepage_payload_is_decoded(monkeypatch):
-    """★本機實測就是這一種★ cp936 單位元組，不是 UTF-16。
+def _host_codepage_sample():
+    """挑一個【這台機器的 code page 編得出來】的非 ASCII 字串 → (編碼, 字串)。
 
-    2026-08-09 在本機（GetACP=GetOEMCP=936）對真實 schtasks 量到：
-    `/XML` 導到 pipe 時吐的是單位元組的 code page 內容，**不是**
+    ★不可以把 cp936 寫死★（CI 教的：v2026.08.09.7 就是這樣紅的）
+    開發機是 cp936（繁中 Windows），CI runner 是 cp437（US-English）。
+    寫死 cp936 的話，CI 上等於「拿 A 機器的位元組去用 B 機器的解碼器解」——
+    **那不是生產會發生的事**：位元組與解碼器都來自【同一台機器】的 schtasks。
+
+    而且錯得很安靜：單位元組 code page 對任何位元組都解得出東西，
+    **永遠不會拋 UnicodeDecodeError**，只會產生一堆亂碼。
+    所以測試要問的是真正的性質 ——
+    「主機自己 code page 的非 ASCII 位元組必須原封不動地回來」。
+    """
+    for enc in wt._decode_candidates()[2:]:        # 跳過 utf-8-sig / utf-8
+        for sample in (wt.LAUNCHER_NAME, "café", "naïve"):
+            try:
+                sample.encode(enc)
+            except (UnicodeEncodeError, LookupError):
+                continue
+            return enc, sample
+    return "", ""
+
+
+def test_a_host_codepage_payload_is_decoded(monkeypatch):
+    """★本機實測就是這一種★ 單位元組 code page，不是 UTF-16。
+
+    2026-08-09 在開發機（GetACP=GetOEMCP=936）對真實 schtasks 量到：
+    `/XML` 導到 pipe 時吐的是單位元組 code page 的內容，**不是**
     BOM 標示的 UTF-16（雖然 XML 宣告寫著 `encoding="UTF-16"`）。
-    用 `encoding="utf-8", errors="replace"` 解，中文整片變成 U+FFFD ——
+    用 `encoding="utf-8", errors="replace"` 解，非 ASCII 整片變成 U+FFFD ——
     而我們的排程名與 launcher **每一個字都是中文**。
     後果不是「偶爾解錯」：action 永遠對不上 `desired_action()`，
     於是每兩分鐘改寫一次排程、回讀又永遠不符，舊排程一次也遷移不成功。
     """
-    xml = _XML % ("pythonw.exe", '"C:\\App\\' + wt.LAUNCHER_NAME + '" --once')
-    try:
-        payload = xml.encode("cp936")
-    except UnicodeEncodeError:                     # pragma: no cover
-        pytest.skip("這台機器的 cp936 編不了這些字")
-    monkeypatch.setattr(wt.subprocess, "run", lambda *a, **k: _cp(out=payload))
+    enc, sample = _host_codepage_sample()
+    assert enc, "這台機器的 code page 一個非 ASCII 樣本都編不出來（測試自己失效了）"
+    xml = _XML % ("pythonw.exe", '"C:\\App\\%s.pyw" --once' % sample)
+    monkeypatch.setattr(wt.subprocess, "run",
+                        lambda *a, **k: _cp(out=xml.encode(enc)))
     action, _r = wt.query_action()
-    assert "\ufffd" not in (action or ""), "★中文被解成替換字元★：%r" % (action,)
-    assert wt.LAUNCHER_NAME in (action or ""), action
+    assert "\ufffd" not in (action or ""), (
+        "★%s 的非 ASCII 被解成替換字元★：%r" % (enc, action))
+    assert sample in (action or ""), (enc, action)
+
+
+def test_the_host_codepage_is_actually_tried(monkeypatch):
+    """★守衛★ 候選清單要真的含主機的 code page，不是只有 utf-8。"""
+    import ctypes
+    cands = wt._decode_candidates()
+    assert cands[:2] == ["utf-8-sig", "utf-8"], cands
+    try:
+        oem = "cp%d" % ctypes.windll.kernel32.GetOEMCP()   # type: ignore[attr-defined]
+    except Exception:                                      # pragma: no cover
+        pytest.skip("拿不到 OEM code page")
+    assert oem in cands, f"{oem} 不在候選清單裡：{cands}"
 
 
 def test_a_utf8_payload_still_works(monkeypatch):
