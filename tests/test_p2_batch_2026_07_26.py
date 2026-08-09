@@ -214,7 +214,9 @@ def test_refresh_check_enqueue_and_claim_share_one_critical_section():
     import main
     code = _code_only(inspect.getsource(main.AutomationApp._trigger_refresh))
     i_lock = code.index("with self._refresh_queue_lock:")
-    i_check = code.index("if not self._refresh_worker_running:")
+    # [2026-08-10 批次SB #3] gate 加了 age takeover,條件變成
+    # `if not ... or _stale_takeover:` —— 錨點跟著更新,性質不變。
+    i_check = code.index("if not self._refresh_worker_running or _stale_takeover:")
     i_append = code.index("self._queued_refresh_requests.append(")
     i_claim = code.index("self._refresh_worker_running = True")
     assert i_lock < i_check < i_claim, "檢查與搶旗標都要在鎖內"

@@ -6816,6 +6816,7 @@ def _run_imap_check_with_timeout(kw: str, timeout: float = 60.0,
 
 
 # [穩定性] scheduler liveness — 給 self-watchdog thread 用
+# ★[2026-08-10 批次SB #6] 兩個時間戳都是 monotonic★(理由見 autoclock 同名處)
 _SCHEDULER_LIVENESS = {"last_tick": 0.0, "last_imap_success": 0.0}
 
 # [2026-05-22 v34] scheduler thread 引用 — self-watchdog 用 is_alive() 直接偵測
@@ -7373,7 +7374,7 @@ def _scheduler_self_watchdog() -> None:
             last = _SCHEDULER_LIVENESS.get("last_tick", 0.0)
             if last == 0.0:
                 continue  # 還沒第一次 tick，給它時間 init
-            age = time.time() - last
+            age = time.monotonic() - last
 
             # Stage 1：偵測卡死 → force_close socket
             if age > DEAD_THRESHOLD and force_closed_at == 0.0:
@@ -7386,25 +7387,25 @@ def _scheduler_self_watchdog() -> None:
                     force_close_active()
                 except Exception:
                     logging.exception("[self-watchdog] force_close 例外")
-                force_closed_at = time.time()
+                force_closed_at = time.monotonic()
                 continue
 
             # [I] scheduler 半死：tick 正常但 IMAP 一直失敗
             #   (e.g. cooldown 中, 或網路斷)
             last_ok = _SCHEDULER_LIVENESS.get("last_imap_success", 0.0)
             if last_ok > 0:
-                imap_age = time.time() - last_ok
+                imap_age = time.monotonic() - last_ok
                 if imap_age > HALF_DEAD_THRESHOLD:
-                    if time.time() - last_half_dead_log > 600:
+                    if time.monotonic() - last_half_dead_log > 600:
                         logging.warning(
                             "[half-dead] scheduler tick 正常但 IMAP 已 %.0f 秒"
                             "沒成功 poll (>%.0fs)。網路問題或 IMAP 認證失效？",
                             imap_age, HALF_DEAD_THRESHOLD)
-                        last_half_dead_log = time.time()
+                        last_half_dead_log = time.monotonic()
 
             # Stage 2：force_close 沒救活 → _hard_exit 強制重啟
             if force_closed_at > 0:
-                since_force = time.time() - force_closed_at
+                since_force = time.monotonic() - force_closed_at
                 if last > force_closed_at:
                     # scheduler 復活了，重置
                     logging.info(
@@ -7466,7 +7467,7 @@ def scheduler_loop() -> None:
     cfg_loaded_at = 0.0
     while running.is_set():
         # [穩定性] 每次迴圈頂端打卡 — self-watchdog 用這個判斷 scheduler 活著
-        _SCHEDULER_LIVENESS["last_tick"] = time.time()
+        _SCHEDULER_LIVENESS["last_tick"] = time.monotonic()  # [批次SB #6]
         try:
             schedule.run_pending()
             # 「立即執行」旗標檔（由 --run-now 的第二個實例、或設定視窗寫入）
@@ -7544,7 +7545,7 @@ def scheduler_loop() -> None:
                             logging.info("[IMAP] 連續失敗已恢復 (之前 %d 次)",
                                           consecutive_imap_errors)
                         consecutive_imap_errors = 0
-                        _SCHEDULER_LIVENESS["last_imap_success"] = time.time()
+                        _SCHEDULER_LIVENESS["last_imap_success"] = time.monotonic()  # [批次SB #6]
                         logging.info(
                             "檢查觸發信 [IMAP/%s]：未讀 %d 封，主旨含 %r 的 %d 封",
                             cfg.get("sender_account", "?"),

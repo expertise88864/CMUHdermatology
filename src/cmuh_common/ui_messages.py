@@ -24,6 +24,11 @@ class UiRefreshTickMessage:
 class UiClinicDataMessage:
     doctor_name: str
     data: Any
+    # ★[2026-08-10 外審 SB #2] 這筆資料屬於哪一輪 refresh★
+    #   殭屍 worker(被 age takeover 接管的那一輪)醒來後仍會把【舊的】
+    #   掛號數丟進 ui_queue —— 沒有世代戳的話,舊資料會蓋掉新資料,
+    #   連帶改變止掛提醒的判定。None = 非 refresh 來源(快照重播等),照收。
+    refresh_gen: Any = None
     # [codex 2026-07-17] 這個訊息有多種來源:磁碟舊快取 fallback、漸進式部分結果(還沒併
     # 休診覆蓋)、快照重播、錯誤payload,以及【最後那筆完整成功的即時資料】。遠期止掛提醒
     # 只能用最後這種來判斷要不要寄信(拿舊/半套資料寄會寄錯,而且會把該診次永久標記已寄,

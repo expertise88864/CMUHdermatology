@@ -614,7 +614,98 @@ _dummy_lock = contextlib.nullcontext()  # fallback 鎖，供無鎖環境使用
 
 _duty_tls = threading.local()
 _reg64_tls = threading.local()
-_reg52_cmuh_fetch_sema = threading.Semaphore(2)
+# ★[2026-08-10 外審 SB #2/#3輪] reg52 fetch 容量:有界取得 + 世代隔離回收★
+#
+# 問題一(第2輪):兩個許可若都被卡在 native 呼叫的 worker 抱走(requests
+# timeout 管不到的那種),age takeover 開出的新 worker 會在【無限期的
+# acquire】上排隊 —— 接管等於沒接管。→ 有界等待(45s ≪ 900s 接管門檻)。
+#
+# 問題二(第3輪):等不到之後呢?
+# ① 逾時不可以拋 RequestException:那會走進 `_source_backoff_fail`,把
+#   【本地容量問題】記成【遠端失敗】—— 許可恢復後還被自己加的 backoff
+#   拖延。改拋 `Reg52BackoffActive`(既有語意=「這一刻不該打遠端,走快取」,
+#   它的 handler 不記 backoff)。
+# ② 許可被抱死的話,每一輪 takeover 都只能退化成快取,容量永遠回不來。
+#   → 偵測「有持有者超過 _REG52_SLOT_WEDGED_SEC」就【棄置整個 semaphore
+#   換新的】:殭屍之後 release 到被棄置的舊物件上,不影響新容量。
+#   代價:換代瞬間對掛號站的併發上限暫時 2+2 —— 有界(換代條件要求
+#   持有 >5 分鐘,新 holders 表是空的,不會連環換代)。
+_REG52_FETCH_SLOT_TIMEOUT_SEC = 45.0
+_REG52_SLOT_WEDGED_SEC = 300.0
+# ★[外審 SB 第4輪] 換代要有上限★ 卡死的根因(DNS/防毒掛鉤)若持續存在,
+# 每次換代 = 再棄置 2 條 native thread + 佔死 1 個 bg_executor worker
+# (共 10 個)—— 無上限的話幾小時就把 executor 吃光,回到「永久舊資料但
+# UI/heartbeat 都活著」。到頂就不再換,改升級到既有的重啟路徑
+# (重啟是唯一能終結 native-wedged thread 的手段)。
+_REG52_SLOT_EPOCH_CAP = 3
+_reg52_slot_lock = threading.Lock()
+_reg52_slot_state: dict = {
+    "sema": threading.Semaphore(2),
+    "holders": {},        # token(object) -> 取得時的 monotonic
+    "epoch": 0,
+}
+
+
+def _reg52_slot_reclaim_if_wedged() -> bool:
+    """有持有者抱著許可超過門檻 → 棄置舊 semaphore、換新容量。→ 有沒有換。
+
+    ★呼叫端必須已持有 _reg52_slot_lock★
+    """
+    now = time.monotonic()
+    holders = _reg52_slot_state["holders"]
+    wedged = [t0 for t0 in holders.values()
+              if (now - t0) > _REG52_SLOT_WEDGED_SEC]
+    if not wedged:
+        return False
+    if _reg52_slot_state["epoch"] >= _REG52_SLOT_EPOCH_CAP:
+        # ★到頂★ 根因還在,再換只是多洩兩條 native thread。標記起來,
+        #   由主緒的 takeover 路徑升級到重啟(這裡是模組層,拿不到 self)。
+        if not _reg52_slot_state.get("exhausted"):
+            _reg52_slot_state["exhausted"] = True
+            logging.critical(
+                "[refresh] reg52 容量已換代 %d 次仍持續被抱死 → 不再換代"
+                "(避免 native thread 無上限堆積);等待重啟升級",
+                _reg52_slot_state["epoch"])
+        return False
+    _reg52_slot_state["sema"] = threading.Semaphore(2)
+    _reg52_slot_state["holders"] = {}
+    _reg52_slot_state["epoch"] += 1
+    logging.error(
+        "[refresh] reg52 fetch 許可被抱死 >%.0fs(%d 個)→ 棄置舊 semaphore、"
+        "換第 %d 代新容量(殭屍恢復後 release 到舊物件,無影響)",
+        _REG52_SLOT_WEDGED_SEC, len(wedged), _reg52_slot_state["epoch"])
+    return True
+
+
+@contextlib.contextmanager
+def _acquire_reg52_fetch_slot(timeout: float = _REG52_FETCH_SLOT_TIMEOUT_SEC):
+    with _reg52_slot_lock:
+        sema = _reg52_slot_state["sema"]
+    acquired = sema.acquire(timeout=timeout)
+    if not acquired:
+        with _reg52_slot_lock:
+            if sema is _reg52_slot_state["sema"]:
+                replaced = _reg52_slot_reclaim_if_wedged()
+            else:
+                replaced = True          # 別人剛換過 → 直接用新的再試
+            sema = _reg52_slot_state["sema"]
+        acquired = replaced and sema.acquire(timeout=timeout)
+        if not acquired:
+            # ★本地容量問題,不是遠端失敗★ 不可以進 backoff 記帳。
+            raise Reg52BackoffActive(
+                f"reg52 fetch slot 等不到(>{timeout:.0f}s,無被抱死的許可"
+                "可回收)→ 本輪走快取,不打遠端、不記遠端 backoff")
+    token = object()
+    with _reg52_slot_lock:
+        if sema is _reg52_slot_state["sema"]:
+            _reg52_slot_state["holders"][token] = time.monotonic()
+    try:
+        yield
+    finally:
+        sema.release()
+        with _reg52_slot_lock:
+            _reg52_slot_state["holders"].pop(token, None)
+
 # =============================================================================
 # [O9] IPv4-only 連線（只對院外醫療系統 host 生效）
 # 原因：Windows 預設 IPv4+IPv6 雙堆疊；院外（auh/east/huisheng）若 DNS 解析到
@@ -955,6 +1046,15 @@ _STATUS_DRIVER_IDLE_TIMEOUT = 10 * 60
 _STATUS_DRIVER_PAGELOAD_TIMEOUT = 30
 # 打卡查詢「正在查詢」旗標的年齡上限(秒)。超過視為上一輪卡死、允許強制開新一輪(自癒雙保險)。
 _CLOCK_WORKER_MAX_AGE_SEC = 180
+
+# ★[2026-08-10 批次SB #3] refresh worker 的年齡上限★
+#   `_refresh_worker_running` 只在 worker 的 finally 清 —— worker 若卡在
+#   requests timeout 管不到的地方(原生 DNS 解析、防毒掛鉤),旗標永遠是
+#   True → 之後所有刷新永久被去重跳過:掛號數/門檻掃描/止掛提醒全部
+#   停在舊資料,而 Tk 與 heartbeat 都活著,watchdog 不會自癒。
+#   與 `_CLOCK_WORKER_MAX_AGE_SEC` 同一套解法(那裡已經修過同形狀的坑)。
+#   上限取激進刷新輪次worst case(多批×3次重試×逾時)的 3 倍以上。
+_REFRESH_WORKER_MAX_AGE_SEC = 900
 
 # ── 打卡查詢錯誤分類（2026-07-16）──────────────────────────────────────────────
 # [GPT-5.6 架構審查 P1] 登入/帳密錯原本與逾時同走「灰燈 + 自動重試」→ 錯密碼會被
@@ -7257,6 +7357,8 @@ def _reg52_stale_fallback(cache_key, label, degraded):
 
 def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorConfig):
     session = _get_thread_local_reg52_session()
+    # ★[外審 SB #2] 這一輪的世代戳,跟著每一筆 UiClinicDataMessage 走★
+    _rgen = doctor_config.get("_refresh_gen")
     doctor_name = doctor_config["name"]
     doc_no = str(doctor_config["doc_no"])
     target_url = f"https://appointment.cmuh.org.tw/cgi-bin/reg52.cgi?DocNo={doc_no}"
@@ -7272,7 +7374,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
             f"[CACHE_FALLBACK] {doctor_name} ({doc_no}) 使用已載入門診人數快取，原因: {reason}; slots={cached_count}"
         )
         put_ui_message(ui_queue, UiRefreshTickMessage(doctor_name=doctor_name))
-        put_ui_message(ui_queue, UiClinicDataMessage(doctor_name=doc_no, data=deepcopy(cached_appointments)))
+        put_ui_message(ui_queue, UiClinicDataMessage(doctor_name=doc_no, data=deepcopy(cached_appointments), refresh_gen=_rgen))
         return True
 
     for attempt in range(3):
@@ -7358,7 +7460,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                             return stale, 0, False
                         raise Reg52BackoffActive(f"main source backoff active ({remain_main:.1f}s)")
                     try:
-                        with _reg52_cmuh_fetch_sema:
+                        with _acquire_reg52_fetch_slot():
                             with _session_http_guard(sess):
                                 response = sess.get(target_url, timeout=REG52_MAIN_TIMEOUT, verify=verify_main)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                                 response.raise_for_status()
@@ -7393,7 +7495,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                         stale = _reg52_stale_fallback(dayoff_cache_key, "dayoff", degraded_sources)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                         return (stale or ""), 0, True
                     try:
-                        with _reg52_cmuh_fetch_sema:
+                        with _acquire_reg52_fetch_slot():
                             with _session_http_guard(sess):
                                 dayoff_response = sess.get(dayoff_url, timeout=REG52_DAYOFF_TIMEOUT, verify=verify_dayoff)  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
                                 dayoff_response.raise_for_status()
@@ -7464,7 +7566,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                         raise Reg52BackoffActive(f"main source backoff active ({remain_main:.1f}s)")
                 if need_main:
                     try:
-                        with _reg52_cmuh_fetch_sema:
+                        with _acquire_reg52_fetch_slot():
                             with _session_http_guard(session):
                                 response = session.get(target_url, timeout=REG52_MAIN_TIMEOUT, verify=verify_main)
                                 response.raise_for_status()
@@ -7493,7 +7595,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                         sk_dayoff = f"dayoff:{doc_no}"
                         ok_dayoff, _ = _source_backoff_allow(sk_dayoff)
                         if ok_dayoff:
-                            with _reg52_cmuh_fetch_sema:
+                            with _acquire_reg52_fetch_slot():
                                 dayoff_response = session.get(dayoff_url, timeout=REG52_DAYOFF_TIMEOUT, verify=verify_dayoff)
                                 dayoff_response.raise_for_status()
                                 dayoff_response.encoding = "big5"
@@ -7634,13 +7736,14 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                         return
                     put_ui_message(ui_queue, UiClinicDataMessage(
                         doctor_name=doc_no,
-                        data={"error": "休診表解析失敗（本機），暫無完整班表"}))
+                        data={"error": "休診表解析失敗（本機），暫無完整班表"},
+                        refresh_gen=_rgen))
                     return
 
             if parsed:
                 _merge_appointments_by_date(appointments_by_date, parsed)
                 # 先回主院資料，分院/亞大再補齊（漸進更新）
-                put_ui_message(ui_queue, UiClinicDataMessage(doctor_name=doc_no, data=deepcopy(appointments_by_date)))
+                put_ui_message(ui_queue, UiClinicDataMessage(doctor_name=doc_no, data=deepcopy(appointments_by_date), refresh_gen=_rgen))
 
             external_jobs = []
 
@@ -7803,7 +7906,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                 # 會【原地】改寫同一個 appointments_by_date;若原樣把活 dict 交給 UI,UI 緒存進
                 # all_doctors_data、主緒 _update_grid_data 無鎖迭代時 worker 正在原地合併 → 偶發
                 # dict-changed-size 月曆重繪炸掉/畫出合併到一半的休診。與 6719 對齊:交出 deepcopy 快照。
-                put_ui_message(ui_queue, UiClinicDataMessage(doctor_name=doc_no, data=deepcopy(appointments_by_date)))
+                put_ui_message(ui_queue, UiClinicDataMessage(doctor_name=doc_no, data=deepcopy(appointments_by_date), refresh_gen=_rgen))
 
             if dayoff_data:
                 _merge_dayoff_overrides(appointments_by_date, dayoff_data)
@@ -7851,7 +7954,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                     "、".join(sorted(degraded_sources)))
             put_ui_message(ui_queue, UiClinicDataMessage(
                 doctor_name=doc_no, data=appointments_by_date,
-                is_live_final=live_final))
+                is_live_final=live_final, refresh_gen=_rgen))
             return
 
         except Reg52BackoffActive as e:
@@ -7876,7 +7979,8 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
     put_ui_message(ui_queue, UiRefreshTickMessage(doctor_name=doctor_name))
     put_ui_message(
         ui_queue,
-        UiClinicDataMessage(doctor_name=doc_no, data={"error": f"查詢失敗 ({error_type})"}),
+        UiClinicDataMessage(doctor_name=doc_no, data={"error": f"查詢失敗 ({error_type})"},
+                            refresh_gen=doctor_config.get("_refresh_gen")),
     )
 
 def load_master_schedule_in_background(ui_queue: "Queue[UiMessage]", *, force: bool = False):
@@ -8880,6 +8984,7 @@ class AutomationApp:
         self._save_cache_latest = {}
         self._avg_history_cache = {}  # [優化] 快取歷史平均，避免每次重算
         self._refresh_worker_running = False
+        self._refresh_worker_started_at = 0.0
         # [2026-07-26 外審] refresh 世代:worker 完成後的 UI 收尾(root.after 排到
         # main thread 才跑)必須確認「我還是最新的那一輪」,否則舊 worker 的 callback
         # 會在新 worker 執行中把 UI 顯示成『閒置』並重新啟用按鈕。
@@ -9281,27 +9386,51 @@ class AutomationApp:
         # 不打斷使用者當下操作。此方法是所有 app 端重啟（自動更新 / 閒置熱鍵恢復）的匯流點。
         restart_self(["--background"], on_confirmed=_teardown_for_handover)
 
-    def _restart_when_hotkey_idle(self, attempts: int = 0):
+    def _restart_when_hotkey_idle(self, attempts: int = 0,
+                                  force_after_max: bool = True):
         """[MG-02] 自動更新需重啟時的閘門:熱鍵自動化進行中【不可】重啟(見 _UPDATE_RESTART_* 常數旁
         說明)。等『無 subsystem 在跑且距最後一次熱鍵動作 ≥N 秒』才 _restart_app;忙碌則每隔幾秒重查。
-        到延後上限仍未閒置就重啟(旗標卡死由熱鍵 watchdog 兜底,不讓更新永不生效)。只在主緒操作。"""
+        到延後上限仍未閒置就重啟(旗標卡死由熱鍵 watchdog 兜底,不讓更新永不生效)。只在主緒操作。
+
+        ★[外審 SB 第5輪] `force_after_max` 是兩種呼叫端的分界★
+        自動更新(True):15 分鐘後強制重啟 —— 不重啟的代價是更新永不生效,
+        且旗標卡死另有熱鍵 watchdog 兜底。
+        reg52 容量升級(False):【絕不強制】。強制重啟可能腰斬進行中的 HIS
+        寫入(殘單、同意書半開 —— 見 _UPDATE_RESTART_* 常數旁的事故註)。
+        容量耗盡的代價只是掛號數走快取,遠小於寫壞病歷;熱鍵一閒置就會重啟,
+        持續忙碌就無限期等(attempts 不再往上數,免得 log 溢位)。
+        """
         if threading.current_thread() is not threading.main_thread():
-            self.root.after(0, lambda: self._restart_when_hotkey_idle(attempts))
+            self.root.after(0, lambda: self._restart_when_hotkey_idle(
+                attempts, force_after_max))
             return
         busy = bool(getattr(self, "_subsystem_running", False))
         idle_gap = time.time() - getattr(_runner_1280, "last_action_time", 0.0)
         if attempts >= _UPDATE_RESTART_MAX_DEFER_ATTEMPTS:
-            logging.warning("[更新] 熱鍵仍忙但已達重啟延後上限(%d),仍執行重啟(busy=%s, idle_gap=%.1fs)",
-                            attempts, busy, idle_gap)
-            self._restart_app()
-            return
+            if force_after_max:
+                logging.warning("[更新] 熱鍵仍忙但已達重啟延後上限(%d),仍執行重啟(busy=%s, idle_gap=%.1fs)",
+                                attempts, busy, idle_gap)
+                self._restart_app()
+                return
+            # ★不強制★ 停在上限值繼續等閒置。提醒用時間戳節流
+            #   (attempts 已凍結,拿它取模的話提醒只會出現一次)。
+            _last = getattr(self, "_reg52_restart_wait_last_log", 0.0)
+            if time.monotonic() - _last > 600.0:
+                self._reg52_restart_wait_last_log = time.monotonic()
+                logging.warning(
+                    "[refresh] 重啟升級持續等待熱鍵閒置(busy=%s, idle_gap=%.1fs)"
+                    " —— 不強制重啟,避免腰斬 HIS 寫入", busy, idle_gap)
         if not busy and idle_gap >= _UPDATE_RESTART_IDLE_GAP_SEC:
             self._restart_app()
             return
-        logging.info("[更新] 熱鍵自動化進行中,延後重啟(busy=%s, idle_gap=%.1fs, 第 %d 次重查)",
-                     busy, idle_gap, attempts + 1)
+        if attempts < _UPDATE_RESTART_MAX_DEFER_ATTEMPTS:
+            logging.info("[更新] 熱鍵自動化進行中,延後重啟(busy=%s, idle_gap=%.1fs, 第 %d 次重查)",
+                         busy, idle_gap, attempts + 1)
+        # 非強制模式:attempts 凍結在上限(維持「已到頂」的分支,不無限成長)
+        next_attempts = attempts + 1 if force_after_max else             min(attempts + 1, _UPDATE_RESTART_MAX_DEFER_ATTEMPTS)
         self.root.after(_UPDATE_RESTART_RECHECK_MS,
-                        lambda: self._restart_when_hotkey_idle(attempts + 1))
+                        lambda: self._restart_when_hotkey_idle(
+                            next_attempts, force_after_max))
 
     def shutdown_app(self):
         """關閉時不可在主執行緒上 executor.shutdown(wait=True)，否則會卡到背景 HTTP／排程結束。
@@ -12836,12 +12965,51 @@ class AutomationApp:
         _queued_size = None
         _my_refresh_gen = 0      # 只有搶到旗標的那條路徑會用到(見下方 return)
         with self._refresh_queue_lock:
-            if not self._refresh_worker_running:
+            _stale_takeover = (
+                self._refresh_worker_running
+                and (time.time() - self._refresh_worker_started_at)
+                > _REFRESH_WORKER_MAX_AGE_SEC)
+            if _stale_takeover:
+                # ★[外審 SB 第4輪] 容量換代到頂 → 升級到重啟★
+                #   重啟是唯一能終結 native-wedged thread 的手段。走既有的
+                #   `_restart_when_hotkey_idle`(熱鍵忙碌時延後,與自動更新
+                #   同一條路);每次執行只升級一次,重啟後從乾淨狀態重來。
+                if (_reg52_slot_state.get("exhausted")
+                        and not getattr(self, "_reg52_restart_requested", False)):
+                    self._reg52_restart_requested = True
+                    logging.critical(
+                        "[refresh] reg52 容量耗盡且換代到頂 → 排入閒置時重啟"
+                        "(native-wedged thread 只有重啟能終結)")
+                    try:
+                        # ★force_after_max=False:絕不腰斬進行中的 HIS 寫入★
+                        self.root.after(0, lambda: self._restart_when_hotkey_idle(
+                            force_after_max=False))
+                    except Exception:
+                        logging.exception("[refresh] 重啟升級排程失敗")
+                # ★[2026-08-10 批次SB #3] 上一輪 worker 疑似卡死 → 接管★
+                #   不接管的話,一次卡死 = 掛號/止掛提醒永久停在舊資料,
+                #   而程式看起來活得好好的(Tk 與 heartbeat 都在動)。
+                #   generation +1 讓殭屍 worker 之後醒來時失去擁有權:
+                #   它的 finally 與完成 callback 都驗 gen,不會動到新一輪的狀態。
+                logging.error(
+                    "[refresh] 上一輪刷新 worker 已卡住 >%d 秒 → 接管並開新一輪"
+                    "(殭屍 worker 醒來後會因 generation 不符而放棄清理)",
+                    _REFRESH_WORKER_MAX_AGE_SEC)
+            if not self._refresh_worker_running or _stale_takeover:
+                if _stale_takeover and req_signature in self._queued_refresh_signatures:
+                    # ★[外審 SB #2輪 #3] 接管的這一輪就是要跑這個簽名 ——
+                    #   排隊裡同簽名的那筆要合併掉,否則接管完成後佇列接力
+                    #   會把同一個刷新再跑一次(對掛號站送雙倍請求)。
+                    self._queued_refresh_signatures.discard(req_signature)
+                    self._queued_refresh_requests = deque(
+                        r for r in self._queued_refresh_requests
+                        if r[2] != req_signature)
                 self._active_refresh_signature = req_signature
                 # [stability r4] 同步搶下單飛旗標(原本只在 worker 內才設)。否則 submit 後、
                 # worker 設旗標前的空窗內,下一個 _trigger_refresh 讀到 False→跳過去重→
                 # 重複 submit 同一刷新,對掛號站送雙倍請求、惡化 backoff。
                 self._refresh_worker_running = True
+                self._refresh_worker_started_at = time.time()
                 self._refresh_generation += 1
                 _my_refresh_gen = self._refresh_generation
             else:
@@ -12937,6 +13105,8 @@ class AutomationApp:
                                 if _appointments_data_count(cached_data) > 0:
                                     worker_config["_cached_appointments"] = deepcopy(cached_data)
                             worker_config["_is_manual_refresh"] = bool(is_manual)
+                            # [外審 SB #2] 世代戳:殭屍的過期資料不得覆蓋新資料
+                            worker_config["_refresh_gen"] = _my_refresh_gen
                             future = refresh_pool.submit(check_appointment_count, self.ui_queue, worker_config)
                             futures.append(future)
                         wait(futures, return_when=ALL_COMPLETED)
@@ -12955,12 +13125,27 @@ class AutomationApp:
                 # 接著本 worker 才進鎖把【B 的】signature 清成 None →
                 # B 執行期間的同款請求無法去重(重複打掛號站)、本 worker 的完成 callback
                 # 還會把仍在刷新中的 UI 顯示成「閒置」並重新啟用按鈕。
+                _is_zombie = False
                 with self._refresh_queue_lock:
-                    self._active_refresh_signature = None
-                    queued_request = self._queued_refresh_requests.popleft() if self._queued_refresh_requests else None
-                    if queued_request is not None:
-                        self._queued_refresh_signatures.discard(queued_request[2])
-                    self._refresh_worker_running = False
+                    # ★[2026-08-10 批次SB #3] 只有【擁有者】才可以清狀態★
+                    #   被接管過的殭屍 worker 醒來走到這裡時,running 旗標與
+                    #   signature 已經屬於新一輪 —— 清掉等於把正在跑的那一輪
+                    #   的去重與單飛整個拆掉(重複打掛號站+假閒置)。
+                    #   ★不可以在 finally 裡 return★(會吞掉 in-flight 例外),
+                    #   用旗標把後面的收尾整段跳掉。
+                    _is_zombie = (_my_refresh_gen != self._refresh_generation)
+                    if _is_zombie:
+                        logging.warning(
+                            "[refresh] 殭屍 worker(gen=%d)醒來,現任 gen=%d →"
+                            " 不清狀態、不接力佇列", _my_refresh_gen,
+                            self._refresh_generation)
+                        queued_request = None
+                    else:
+                        self._active_refresh_signature = None
+                        queued_request = self._queued_refresh_requests.popleft() if self._queued_refresh_requests else None
+                        if queued_request is not None:
+                            self._queued_refresh_signatures.discard(queued_request[2])
+                        self._refresh_worker_running = False
                 refresh_time = datetime.now().strftime('%H:%M:%S')
 
                 def _on_refresh_worker_done(rt=refresh_time, qr=queued_request,
@@ -12993,7 +13178,8 @@ class AutomationApp:
                         self._startup_defer_full_until_priority_done = False
                         self._trigger_refresh(False)
 
-                self.root.after(0, _on_refresh_worker_done)
+                if not _is_zombie:
+                    self.root.after(0, _on_refresh_worker_done)
 
         def _handle_refresh_submit_rejected(fut):
             if fut.cancelled():
@@ -13011,6 +13197,9 @@ class AutomationApp:
                 # [2026-07-26 外審] 同上:running 旗標要在鎖內、且【最後】才清,
                 # 否則會清掉下一個 refresh 剛寫入的 signature。
                 with self._refresh_queue_lock:
+                    # [2026-08-10 批次SB #3] 擁有權驗證(理由見 worker 的 finally)
+                    if _my_refresh_gen != self._refresh_generation:
+                        return
                     self._active_refresh_signature = None
                     queued_request = self._queued_refresh_requests.popleft() if self._queued_refresh_requests else None
                     if queued_request is not None:
@@ -15111,6 +15300,15 @@ class AutomationApp:
                         self._show_notice(title, emsg, level="error", auto_close_ms=7000)
                     case UiClinicDataMessage(doctor_name=doctor_name, data=appointment_data,
                                             is_live_final=is_live_final):
+                        # ★[外審 SB #2] 殭屍 worker 的過期資料不得覆蓋新資料★
+                        #   被 age takeover 接管的那一輪醒來後仍會把舊掛號數丟進
+                        #   佇列;世代不符就整筆丟棄(None=非 refresh 來源,照收)。
+                        _mgen = getattr(msg, "refresh_gen", None)
+                        if _mgen is not None and _mgen != self._refresh_generation:
+                            logging.info(
+                                "[refresh] 丟棄過期世代的資料(gen=%s,現任=%s,%s)",
+                                _mgen, self._refresh_generation, doctor_name)
+                            continue
                         if doctor_name and appointment_data is not None:
                             with self._doctor_data_lock:
                                 if (

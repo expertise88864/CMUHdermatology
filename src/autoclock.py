@@ -147,6 +147,9 @@ _test_login_gate = ActiveTaskGate(stale_after_sec=10 * 60,
 # [2026-05-22 v45 P0-1] scheduler liveness — 給 self-watchdog 用，跟 consult_query
 # 同一套 pattern。每次 scheduler_loop iteration 更新 last_tick；watchdog 偵測
 # > 180s 沒 tick 視為 thread 卡死，> 20s 沒解套就 os._exit(1) 讓 process 重啟。
+# ★[2026-08-10 批次SB #6] last_tick 是 monotonic★
+#   wall clock 被回撥時,age 變負 → scheduler 真卡死也要等時鐘追上
+#   舊時間戳才會被發現(回撥十分鐘=多停十分鐘)。寫入端與比較端同步換。
 _AUTOCLOCK_LIVENESS = {"last_tick": 0.0}
 _scheduler_thread_ref: threading.Thread | None = None
 _self_watchdog_thread_ref: threading.Thread | None = None
@@ -1678,23 +1681,23 @@ def _autoclock_self_watchdog() -> None:
             last = _AUTOCLOCK_LIVENESS.get("last_tick", 0.0)
             if last == 0.0:
                 continue
-            age = time_module.time() - last
+            age = time_module.monotonic() - last
             if age > DEAD_THRESHOLD and dead_detected_at == 0.0:
                 logging.critical(
                     "[autoclock/self-watchdog] scheduler 已 %.0f 秒沒 tick "
                     "(>%.0fs 視為死亡)，準備 hard_exit",
                     age, DEAD_THRESHOLD)
-                dead_detected_at = time_module.time()
+                dead_detected_at = time_module.monotonic()
                 continue
             if dead_detected_at > 0:
                 if last > dead_detected_at:
                     logging.info("[autoclock/self-watchdog] scheduler 已恢復 tick，取消重啟")
                     dead_detected_at = 0.0
-                elif time_module.time() - dead_detected_at > KILL_THRESHOLD:
+                elif time_module.monotonic() - dead_detected_at > KILL_THRESHOLD:
                     logging.critical(
                         "[autoclock/self-watchdog] dead 偵測後 %.0fs 仍沒 tick "
                         "→ _hard_exit(1) 強制重啟 (外層 watchdog 會接手)",
-                        time_module.time() - dead_detected_at)
+                        time_module.monotonic() - dead_detected_at)
                     _autoclock_hard_exit("scheduler stuck", code=1)
         except Exception:
             logging.exception("[autoclock/self-watchdog] tick 例外")
@@ -1751,7 +1754,8 @@ def scheduler_loop() -> None:
     while running.is_set():
         # [P0-1] heartbeat — 給 self-watchdog 偵測
         now = time_module.time()
-        _AUTOCLOCK_LIVENESS["last_tick"] = now
+        # [批次SB #6] liveness 用 monotonic(見宣告處);heartbeat 照舊用 wall。
+        _AUTOCLOCK_LIVENESS["last_tick"] = time_module.monotonic()
 
         # [P0 emergency] 每 60s 印一行 log 讓 InnerWatchdog 看到 process 活著
         last_heartbeat_log = _maybe_emit_heartbeat(now, last_heartbeat_log)
