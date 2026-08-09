@@ -18,11 +18,16 @@
 `find_message_in_sent` 回 None＝查不出來。摺成「沒寄到」→ 重寄一封已經送達的
 信；摺成「有寄到」→ 把真正的漏寄吞掉。兩個方向都錯。
 """
+import ast
 import importlib
+import io
+import os
 
 import pytest
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 cq = importlib.import_module("consult_query")
+dr = importlib.import_module("cmuh_common.delivery_reconcile")
 imap_reader = importlib.import_module("cmuh_common.imap_reader")
 
 
@@ -62,9 +67,9 @@ def _rec(did="d1", msgid="<a@b>", age=3600.0, now=10_000.0, subject="會診"):
 
 @pytest.fixture(autouse=True)
 def _reset_throttle():
-    cq._last_reconcile_ts = 0.0
+    cq._RECONCILER.last_ts = 0.0
     yield
-    cq._last_reconcile_ts = 0.0
+    cq._RECONCILER.last_ts = 0.0
 
 
 def _run(monkeypatch, led, answers, now=10_000.0, recs=None):
@@ -115,7 +120,7 @@ def test_an_exception_from_the_lookup_changes_nothing(monkeypatch):
 
 def test_a_young_record_is_not_looked_up(monkeypatch):
     """寄件備份要一點時間才出現；太早查到「沒有」會誤判成沒寄出去。"""
-    led = _Led([_rec(age=cq._RECONCILE_MIN_AGE_SEC - 1)])
+    led = _Led([_rec(age=dr.MIN_AGE_SEC - 1)])
     n, seen = _run(monkeypatch, led, [False])
     assert (n, seen, led.resolved) == (0, [], [])
 
@@ -135,7 +140,7 @@ def test_the_throttle_does_not_tick_when_there_is_nothing_to_do(monkeypatch):
     """
     led = _Led([_rec(age=1.0)])          # 還沒成熟
     _run(monkeypatch, led, [True])
-    assert cq._last_reconcile_ts == 0.0, "沒事做卻推進了節流時間戳"
+    assert cq._RECONCILER.last_ts == 0.0, "沒事做卻推進了節流時間戳"
     led2 = _Led([_rec()])
     n, _s = _run(monkeypatch, led2, [True])
     assert n == 1, "上一輪的空轉把這一輪擋掉了"
@@ -156,14 +161,14 @@ def test_the_throttle_lets_a_later_pass_through(monkeypatch):
     _run(monkeypatch, led, [True])
     led2 = _Led([_rec(did="d2")])
     n2, _s = _run(monkeypatch, led2, [True],
-                  now=10_000.0 + cq._RECONCILE_EVERY_SEC + 1)
+                  now=10_000.0 + dr.EVERY_SEC + 1)
     assert n2 == 1
 
 
 def test_only_a_few_are_looked_up_per_pass(monkeypatch):
     led = _Led([_rec(did="d%d" % i) for i in range(20)])
     n, seen = _run(monkeypatch, led, [True] * 20)
-    assert len(seen) == cq._RECONCILE_MAX_PER_PASS == n
+    assert len(seen) == dr.MAX_PER_PASS == n
 
 
 def test_a_ledger_that_cannot_be_read_is_not_an_answer(monkeypatch):
@@ -455,7 +460,10 @@ def test_the_worker_asks_for_aged_submitting_only():
     import ast
     import inspect
     import textwrap
-    src = textwrap.dedent(inspect.getsource(cq._reconcile_unknown_deliveries))
+    # ★實作搬到共用模組了（外審 P1-04）→ 要檢查【真的那一份】★
+    #   繼續掃 `cq._reconcile_unknown_deliveries`（現在只是個轉呼叫）的話，
+    #   這條測試會靜默地變成「掃一個永遠不含 stuck_submitting 的殼」。
+    src = textwrap.dedent(inspect.getsource(dr.Reconciler.run_once))
     calls = [n for n in ast.walk(ast.parse(src))
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
              and n.func.attr == "stuck_submitting"]
@@ -485,7 +493,7 @@ def test_a_stuck_record_is_not_starved_by_many_unknowns(monkeypatch):
     stuck = [_rec(did="s1", age=9000.0, now=now)]
     led = _Led(unknowns, stuck=stuck)
     n, seen = _run(monkeypatch, led, [True] * 9, now=now)
-    assert n == cq._RECONCILE_MAX_PER_PASS
+    assert n == dr.MAX_PER_PASS
     assert "s1" in {d for d, _ok in led.resolved}, (
         "★最舊的 SUBMITTING 被一堆較新的 UNKNOWN 餓死★")
 
@@ -499,3 +507,469 @@ def test_the_oldest_records_are_queried_first(monkeypatch):
     assert n == 2
     assert [d for d, _ok in led.resolved][0] == "old_s", (
         "最舊的沒有先被查 —— 排序沒生效")
+
+
+# ══ 外審 2026-08-09 P1-04：主程式也必須自己收斂 ═══════════════════════════
+class TestBothProgramsReconcile:
+    """★寫進這本帳的有兩支程式，收斂的卻只有一支★
+
+    止掛提醒信是【主程式】寄的，走的是同一個 `DeliveryLedger`、同一個檔。
+    回查原本只寫在 `consult_query.py` —— 只跑主程式、沒裝會診查詢的診間電腦，
+    那些 UNKNOWN 與卡住的 SUBMITTING **永遠不會有人去收斂**。
+    一旦把帳本接成寄送閘門，它們會永久擋住同一個 business key 的重寄。
+    """
+
+    @staticmethod
+    def _main_src(name):
+        import ast
+        import io
+        import os
+        path = os.path.join(REPO_ROOT, "src", "main.py")
+        return ast.parse(io.open(path, encoding="utf-8").read())
+
+    def test_main_has_a_reconciler_driver(self):
+        import ast
+        tree = self._main_src("main.py")
+        fns = {n.name for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        assert "_reconcile_alert_deliveries" in fns, (
+            "★主程式沒有回查驅動 → 只跑主程式的機器永遠不收斂★")
+
+    def test_main_actually_calls_it(self):
+        """★有函式不算數，要有呼叫端★（wired-up-or-it-does-not-exist）"""
+        import ast
+        tree = self._main_src("main.py")
+        called = {n.func.id for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        assert "_reconcile_alert_deliveries" in called, (
+            "★定義了卻沒有人呼叫 —— 那個 docstring 的宣稱是假的★")
+
+    def test_main_uses_the_shared_implementation(self):
+        """兩邊必須是【同一份】實作，不可以各寫一份（會漂）。"""
+        import io
+        import os
+        text = io.open(os.path.join(REPO_ROOT, "src", "main.py"),
+                       encoding="utf-8").read()
+        assert "delivery_reconcile" in text, "主程式沒有用共用模組"
+
+    def test_the_consult_wrapper_delegates(self):
+        """會診端只剩轉呼叫 —— 實作不可以又長回本檔（兩份會漂）。"""
+        import ast
+        import inspect
+        import textwrap
+        src = textwrap.dedent(inspect.getsource(cq._reconcile_unknown_deliveries))
+        attrs = {n.func.attr for n in ast.walk(ast.parse(src))
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+        assert attrs == {"run_once"}, f"沒有單純轉呼叫共用實作：{attrs}"
+
+
+class TestCrossProcessThrottle:
+    """★節流必須跨 process★
+
+    兩支程式各拿一個記憶體時間戳的話，同一台機器上兩邊會【同時】對同一批
+    紀錄開 IMAP、同時 `resolve_unknown()`。而 `_save_once_locked()` 的合併
+    規則明文寫著「delivery_id 是全域唯一的，所以兩個 process 不可能改到
+    同一筆」—— 兩邊都回查會直接推翻那個前提。
+    """
+
+    class _Claimy(_Led):
+        def __init__(self, records, claims):
+            super().__init__(records)
+            self._claims = list(claims)
+            self.claim_calls = []
+
+        def claim_reconcile_pass(self, *, now, every_sec):
+            self.claim_calls.append((now, every_sec))
+            return self._claims.pop(0) if self._claims else False
+
+    def test_a_lost_claim_skips_the_pass(self, monkeypatch):
+        led = self._Claimy([_rec()], claims=[False])
+        n, seen = _run(monkeypatch, led, [True])
+        assert (n, seen) == (0, []), "★沒搶到宣告卻還是去回查了★"
+        assert led.claim_calls, "根本沒有去搶跨 process 的宣告"
+
+    def test_a_won_claim_runs_the_pass(self, monkeypatch):
+        led = self._Claimy([_rec()], claims=[True])
+        n, _seen = _run(monkeypatch, led, [True])
+        assert n == 1
+
+    def test_the_claim_is_not_asked_when_there_is_nothing_to_do(self,
+                                                                monkeypatch):
+        """★沒事做就不要碰跨 process 的鎖★（也不該推進時間戳）"""
+        led = self._Claimy([], claims=[True])
+        _run(monkeypatch, led, [True])
+        assert led.claim_calls == []
+
+    def test_a_broken_claim_falls_back_instead_of_going_silent(self,
+                                                              monkeypatch):
+        """★宣告壞掉不可以變成永久沉默★
+
+        「搶不到就永遠不回查」會把一個看得見的競態換成一個安靜的漏收斂 ——
+        那正是 2026-08-05 事故的形狀（沒有出口的 fail-closed）。
+        """
+        class _Boom(_Led):
+            def claim_reconcile_pass(self, *, now, every_sec):
+                raise RuntimeError("鎖壞了")
+
+        led = _Boom([_rec()])
+        n, _seen = _run(monkeypatch, led, [True])
+        assert n == 1, "★宣告壞掉就完全不回查 —— 沒有出口的 fail-closed★"
+
+    def test_an_old_ledger_without_the_method_still_reconciles(self,
+                                                               monkeypatch):
+        """舊版帳本（沒有 claim 方法）→ 退回本行程節流，不是停擺。"""
+        led = _Led([_rec()])
+        assert not hasattr(led, "claim_reconcile_pass")
+        n, _seen = _run(monkeypatch, led, [True])
+        assert n == 1
+
+
+class TestClaimOnTheRealLedger:
+    """`claim_reconcile_pass` 自己的契約（用真的帳本、真的檔案）。"""
+
+    @staticmethod
+    def _led(tmp_path):
+        from cmuh_common.delivery_ledger import DeliveryLedger
+        return DeliveryLedger(path=str(tmp_path / "delivery.json"))
+
+    def test_the_first_pass_is_claimed(self, tmp_path):
+        led = self._led(tmp_path)
+        assert led.claim_reconcile_pass(now=1000.0, every_sec=600.0) is True
+
+    def test_a_second_pass_too_soon_is_refused(self, tmp_path):
+        led = self._led(tmp_path)
+        led.claim_reconcile_pass(now=1000.0, every_sec=600.0)
+        assert led.claim_reconcile_pass(now=1100.0, every_sec=600.0) is False
+
+    def test_a_later_pass_is_allowed(self, tmp_path):
+        led = self._led(tmp_path)
+        led.claim_reconcile_pass(now=1000.0, every_sec=600.0)
+        assert led.claim_reconcile_pass(now=1700.0, every_sec=600.0) is True
+
+    def test_a_second_process_sees_the_first_ones_claim(self, tmp_path):
+        """★核心★ 這正是「跨 process」的意思：另一個【物件】也要被擋下。"""
+        a, b = self._led(tmp_path), self._led(tmp_path)
+        assert a.claim_reconcile_pass(now=1000.0, every_sec=600.0) is True
+        assert b.claim_reconcile_pass(now=1001.0, every_sec=600.0) is False, (
+            "★另一支程式沒有被擋下 → 兩邊會同時覆蓋彼此的收斂結果★")
+
+    def test_an_unreadable_stamp_means_never_run_not_just_ran(self, tmp_path):
+        """★讀不到＝當成沒跑過★
+
+        當成「剛剛才跑過」的話，檔案永久壞掉時就變成【永遠不回查】，
+        而且一個字都不會說。寧可多跑一輪。
+        """
+        led = self._led(tmp_path)
+        import io
+        io.open(led.path + ".reconcile", "w", encoding="utf-8").write("壞掉的內容")
+        assert led.claim_reconcile_pass(now=1000.0, every_sec=600.0) is True
+
+    def test_an_unwritable_stamp_still_lets_the_pass_run(self, tmp_path,
+                                                        monkeypatch):
+        """寫不進去也要讓這一輪跑掉（沒有出口的 fail-closed 更糟）。"""
+        led = self._led(tmp_path)
+        import builtins
+        real_open = builtins.open
+
+        def _open(path, mode="r", *a, **k):
+            if str(path).endswith(".reconcile") and "w" in mode:
+                raise OSError("唯讀")
+            return real_open(path, mode, *a, **k)
+
+        monkeypatch.setattr(builtins, "open", _open)
+        assert led.claim_reconcile_pass(now=1000.0, every_sec=600.0) is True
+
+
+class TestMalformedRecordsDoNotKillThePass:
+    """★外審 2026-08-09 P2-01★ 一筆壞資料不可以讓整輪回查中止。"""
+
+    def test_a_broken_timestamp_does_not_abort_the_pass(self, monkeypatch):
+        """原本 `float()` 在 try 之外 → 一筆壞的把【每一輪】都打掉。"""
+        led = _Led([_rec(did="bad") | {"created_at": "不是數字"},
+                    _rec(did="good")])
+        n, seen = _run(monkeypatch, led, [True, True])
+        assert n >= 1, "★一筆壞掉的時間戳把整輪都打掉了★"
+        assert "<a@b>" in seen
+        assert ("good", True) in led.resolved, "好的那一筆被壞的那一筆連累了"
+
+    @pytest.mark.parametrize("bad", ["不是數字", "2026-08-09", [], {"a": 1}])
+    def test_a_broken_timestamp_is_treated_as_old_not_young(self, monkeypatch,
+                                                            bad):
+        """★方向★ 當成「很新」的話，壞掉的那一筆會被年齡門檻永遠濾掉。
+
+        ★測試資料必須真的走進那個 except★ 第一版用 `None` —— 但
+        `rec.get(...) or 0` 會先把 None 變成 0，`float(0)` 不會拋例外，
+        於是這條測試根本沒有踩到被測的那一行（突變驗證抓到的）。
+        """
+        led = _Led([_rec(did="bad") | {"created_at": bad}])
+        n, _seen = _run(monkeypatch, led, [True])
+        assert n == 1, "看不懂的時間戳被當成『剛剛才建立』→ 永遠不會被收斂"
+
+    def test_a_broken_timestamp_does_not_block_the_giveup_path(self,
+                                                               monkeypatch):
+        """沒有 Message-ID + 時間戳壞掉 → 一樣要有出口（不可以卡在年齡判定）。"""
+        led = _Led([_rec(did="d1", msgid="") | {"created_at": "壞"}])
+        # 壞掉的時間戳被當成 epoch（很舊）→ 用真實量級的 now 才看得出差別。
+        # 假的 now=10_000 只有 2.8 小時，還沒到 24 小時門檻。
+        _run(monkeypatch, led, [True], now=200_000.0)
+        assert led.resolved == [("d1", False)]
+
+    def test_a_missing_created_at_is_still_reconciled(self, monkeypatch):
+        led = _Led([{"delivery_id": "d1", "message_id": "<a@b>"}])
+        n, _seen = _run(monkeypatch, led, [True])
+        assert n == 1
+
+
+class TestRecordsWithoutAMessageIdHaveAnExit:
+    """★外審 2026-08-09 P2-03★ 查不出來的紀錄不可以永遠掛著。
+
+    回查完全靠 Message-ID。沒有它的紀錄永遠進不了 `ripe` —— 於是永遠停在
+    LIVE_STATES，一接上寄送閘門就永久擋住那個 business key，而且沒有任何
+    地方會說出來（沒有出口的 fail-closed）。
+    """
+
+    def test_a_young_record_without_a_message_id_is_left_alone(self,
+                                                               monkeypatch):
+        """還早 → 不動它（`make_msgid()` 之後也許補得回來）。"""
+        led = _Led([_rec(msgid="", age=60.0)])
+        _run(monkeypatch, led, [True])
+        assert led.resolved == []
+
+    def test_an_aged_record_without_a_message_id_is_closed_out(self,
+                                                               monkeypatch):
+        led = _Led([_rec(msgid="", age=dr.NO_MESSAGE_ID_GIVE_UP_SEC + 1)])
+        _run(monkeypatch, led, [True])
+        assert led.resolved == [("d1", False)], (
+            "★永遠查不出結果的紀錄沒有出口 → 永久擋住那個 business key★")
+
+    def test_the_closeout_direction_is_resendable(self, monkeypatch):
+        """★方向要選會被人發現的那一邊★
+
+        結成「沒送到」＝可能重複寄一封；放著不管＝該寄的永遠不寄且沒人知道。
+        """
+        led = _Led([_rec(msgid="", age=dr.NO_MESSAGE_ID_GIVE_UP_SEC + 1)])
+        _run(monkeypatch, led, [True])
+        assert led.resolved and led.resolved[0][1] is False
+
+    def test_the_closeout_does_not_burn_the_throttle_window(self, monkeypatch):
+        """結案不需要 IMAP → 不該因此把回查的節流窗口用掉。"""
+        led = _Led([_rec(msgid="", age=dr.NO_MESSAGE_ID_GIVE_UP_SEC + 1)])
+        _run(monkeypatch, led, [True])
+        assert cq._RECONCILER.last_ts == 0.0, "沒開 IMAP 卻推進了節流時間戳"
+
+    def test_a_closeout_failure_does_not_abort_the_pass(self, monkeypatch):
+        class _Grumpy(_Led):
+            def resolve_unknown(self, did, *, delivered, note=""):
+                if did == "nomsg":
+                    raise RuntimeError("寫不進去")
+                return super().resolve_unknown(did, delivered=delivered,
+                                               note=note)
+
+        led = _Grumpy([_rec(did="nomsg", msgid="",
+                            age=dr.NO_MESSAGE_ID_GIVE_UP_SEC + 1),
+                       _rec(did="good")])
+        n, _seen = _run(monkeypatch, led, [True])
+        assert n == 1 and ("good", True) in led.resolved
+
+
+# ══ 外審第 2 輪 ═══════════════════════════════════════════════════════════
+class TestTheLedgerItselfSurvivesBadTimestamps:
+    """★#2★ `Reconciler` 的容錯是在 `unresolved()` 回傳【之後】才跑的。
+
+    帳本自己那三個查詢方法本來直接拿原始欄位當 sort key。磁碟上的 JSON
+    只要有【一筆】`created_at` 是字串，`sorted()` 比較 str 與 float 就拋
+    `TypeError` —— 整份清單列不出來，呼叫端捕捉後回 0，
+    **所有正常的紀錄也從此永遠不收斂**。一筆壞資料害死全部。
+    """
+
+    @staticmethod
+    def _led(tmp_path, records):
+        import json
+        from cmuh_common.delivery_ledger import DeliveryLedger
+        p = tmp_path / "delivery_ledger.json"
+        with io.open(str(p), "w", encoding="utf-8") as fh:
+            json.dump(records, fh)
+        return DeliveryLedger(path=str(p))
+
+    def _mixed(self, tmp_path, bad_created):
+        return self._led(tmp_path, {
+            "bad": {"delivery_id": "bad", "state": "unknown",
+                    "message_id": "<b@x>", "created_at": bad_created,
+                    "recipients": {"a@b": "unknown"}},
+            "good": {"delivery_id": "good", "state": "unknown",
+                     "message_id": "<g@x>", "created_at": 1.0,
+                     "recipients": {"a@b": "unknown"}},
+        })
+
+    def test_unresolved_does_not_raise_on_a_string_timestamp(self, tmp_path):
+        led = self._mixed(tmp_path, "2026-08-09")
+        got = {r["delivery_id"] for r in led.unresolved()}
+        assert got == {"bad", "good"}, (
+            "★一筆字串時間戳讓整份待回查清單列不出來★")
+
+    def test_unresolved_does_not_raise_on_a_dict_timestamp(self, tmp_path):
+        led = self._mixed(tmp_path, {"nested": 1})
+        assert len(led.unresolved()) == 2
+
+    def test_stuck_submitting_does_not_raise_either(self, tmp_path):
+        led = self._led(tmp_path, {
+            "s1": {"delivery_id": "s1", "state": "submitting",
+                   "created_at": "壞", "updated_at": "壞",
+                   "recipients": {"a@b": "unknown"}},
+        })
+        assert len(led.stuck_submitting(older_than_sec=1.0)) == 1, (
+            "壞掉的 updated_at 讓卡住的紀錄永遠不算卡住")
+
+    def test_a_whole_pass_still_settles_the_good_record(self, tmp_path,
+                                                        monkeypatch):
+        """★端到端★ 用真的帳本跑一輪，好的那一筆要收斂。"""
+        led = self._mixed(tmp_path, "2026-08-09")
+        monkeypatch.setattr(cq, "_get_ledger", lambda: led)
+        n = cq._reconcile_unknown_deliveries(now=1e9, finder=lambda m: True)
+        assert n == 2, "壞資料把整輪打掉了"
+
+
+class TestNonFiniteTimestamps:
+    """★#5★ `json.load()` 接受 NaN／Infinity，而 `float()` 不會拋。
+
+    NaN 參與的比較【永遠是 False】，於是同一個壞值在兩條路上往
+    **相反** 方向出錯：
+      * 年齡門檻 `now - nan >= MIN_AGE` → False → 永遠進不了回查清單；
+      * 放棄門檻 `nan < 24h` → False → 反而【立刻】被結案，跳過保護期。
+    """
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"),
+                                     float("-inf")])
+    def test_a_nonfinite_timestamp_is_treated_as_old(self, monkeypatch, bad):
+        led = _Led([_rec(did="d1") | {"created_at": bad}])
+        n, _seen = _run(monkeypatch, led, [True])
+        assert n == 1, "★非有限數的時間戳讓紀錄永遠卡在 LIVE★"
+
+    def test_a_nan_record_without_a_message_id_keeps_its_grace_period(
+            self, monkeypatch):
+        """★反方向★ NaN 不可以讓它跳過 24 小時保護期被提早結案。
+
+        `_created_at` 把 NaN 當成 epoch(0.0)，所以在【假的】小 now 之下
+        年齡還不夠 —— 保護期仍然成立。
+        """
+        led = _Led([_rec(did="d1", msgid="") | {"created_at": float("nan")}])
+        _run(monkeypatch, led, [True], now=1000.0)
+        assert led.resolved == [], "NaN 讓紀錄跳過保護期被立刻結案"
+
+    def test_the_ledger_helper_rejects_nonfinite(self):
+        from cmuh_common.delivery_ledger import _as_epoch
+        for bad in (float("nan"), float("inf"), "x", [], {}, None):
+            assert _as_epoch(bad) == 0.0, bad
+        assert _as_epoch(12.5) == 12.5
+
+
+class TestReconcileIsOffTheClinicalPath:
+    """★#3★ 回查會開 IMAP（每筆 12 秒 timeout、一輪最多 5 筆）。
+
+    同步串在刷新 worker 上 = IMAP 不可達時，掛號資料在送出第一個查詢
+    之前就先卡 60 秒以上，而且每 10 分鐘重來一次。
+    為了觀測寄信結果而延後臨床資料，方向完全反了。
+    """
+
+    @staticmethod
+    def _main():
+        import importlib
+        return importlib.import_module("main")
+
+    def test_the_refresh_worker_only_kicks_it_off(self):
+        """刷新路徑上只可以出現【點火】，不可以出現同步呼叫。"""
+        tree = ast.parse(io.open(os.path.join(REPO_ROOT, "src", "main.py"),
+                                 encoding="utf-8").read())
+        worker = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "run_parallel_checks":
+                worker = n
+                break
+        assert worker is not None, "找不到刷新 worker（測試自己失效了）"
+        called = {c.func.id for c in ast.walk(worker)
+                  if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+        assert "_kick_off_alert_reconcile" in called, "刷新路徑沒有點火回查"
+        assert "_reconcile_alert_deliveries" not in called, (
+            "★同步呼叫回查 → IMAP 掛掉時掛號資料要等它★")
+
+    def test_the_kickoff_returns_without_waiting(self, monkeypatch):
+        """★核心★ finder 慢的時候，點火本身必須立刻返回。"""
+        import threading
+        import time as _t
+        m = self._main()
+        started = threading.Event()
+        release = threading.Event()
+
+        def _slow(now=None, finder=None):
+            started.set()
+            release.wait(5.0)
+            return 0
+
+        monkeypatch.setattr(m, "_reconcile_alert_deliveries", _slow)
+        t0 = _t.monotonic()
+        assert m._kick_off_alert_reconcile() is True
+        elapsed = _t.monotonic() - t0
+        try:
+            assert elapsed < 1.0, f"點火等了 {elapsed:.2f} 秒 —— 那就是同步的"
+            assert started.wait(5.0), "背景那條根本沒開起來"
+        finally:
+            release.set()
+
+    def test_a_second_kickoff_is_refused_while_one_is_running(self,
+                                                              monkeypatch):
+        """★single-flight★ IMAP 慢的時候，每次刷新各開一條會累積成一堆卡住的連線。"""
+        import threading
+        m = self._main()
+        release = threading.Event()
+        started = threading.Event()
+
+        def _slow(now=None, finder=None):
+            started.set()
+            release.wait(5.0)
+            return 0
+
+        monkeypatch.setattr(m, "_reconcile_alert_deliveries", _slow)
+        try:
+            assert m._kick_off_alert_reconcile() is True
+            assert started.wait(5.0)
+            assert m._kick_off_alert_reconcile() is False, (
+                "★上一輪還在跑就又開了一條★")
+        finally:
+            release.set()
+
+    def test_the_flag_is_released_after_the_worker_finishes(self, monkeypatch):
+        """★旗標一定要放掉★ 卡住的話回查就永遠不再發生（安靜地）。"""
+        import threading
+        m = self._main()
+        done = threading.Event()
+
+        def _quick(now=None, finder=None):
+            done.set()
+            return 0
+
+        monkeypatch.setattr(m, "_reconcile_alert_deliveries", _quick)
+        assert m._kick_off_alert_reconcile() is True
+        assert done.wait(5.0)
+        for _ in range(200):
+            if m._kick_off_alert_reconcile():
+                return
+            threading.Event().wait(0.02)
+        raise AssertionError("★旗標沒有放掉 → 回查從此永遠不會再跑★")
+
+    def test_a_crashing_worker_still_releases_the_flag(self, monkeypatch):
+        import threading
+        m = self._main()
+        hit = threading.Event()
+
+        def _boom(now=None, finder=None):
+            hit.set()
+            raise RuntimeError("炸了")
+
+        monkeypatch.setattr(m, "_reconcile_alert_deliveries", _boom)
+        assert m._kick_off_alert_reconcile() is True
+        assert hit.wait(5.0)
+        for _ in range(200):
+            if m._kick_off_alert_reconcile():
+                return
+            threading.Event().wait(0.02)
+        raise AssertionError("★worker 拋例外後旗標卡住★")

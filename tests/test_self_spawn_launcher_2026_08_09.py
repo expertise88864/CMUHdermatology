@@ -173,3 +173,55 @@ def test_tray_configure_uses_self_entry():
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     assert "self_entry_path" in names, (
         "托盤設定沒有走固定 launcher —— 會用舊版 UI 寫新版 settings")
+
+
+# ══ 外審 2026-08-09 P2-02：位置對 ≠ 身分對 ═══════════════════════════════
+class TestLauncherAllowlist:
+    """`CMUH_LAUNCHER` 是【會被繼承】的環境變數，而它的值會被拿去【執行】。
+
+    只驗「存在 + 在 app 根第一層」的話，app 根裡任何一個檔都能通過 ——
+    更新器剛下載的檔、被放進來的 `.pyw`、`manifest.json` 都算。
+    而 `build_restart_command()` 會執行它，UAC 那條路還會提權。
+    """
+
+    @staticmethod
+    def _root(tmp_path, monkeypatch):
+        root = tmp_path / "app"
+        root.mkdir()
+        (root / "src").mkdir()
+        (root / "src" / "cmuh_common").mkdir()
+        (root / "src" / "cmuh_common" / "version.py").write_text(
+            "CURRENT_VERSION='0'", encoding="utf-8")
+        monkeypatch.setenv(cpaths.APP_DIR_ENV, str(root))
+        return root
+
+    def test_a_real_launcher_is_accepted(self, tmp_path, monkeypatch):
+        root = self._root(tmp_path, monkeypatch)
+        good = root / cpaths.LAUNCHER_NAMES[0]
+        good.write_text("", encoding="utf-8")
+        monkeypatch.setenv(cpaths.LAUNCHER_ENV, str(good))
+        assert cpaths.pinned_launcher() == os.path.realpath(str(good))
+
+    @pytest.mark.parametrize("name", [
+        "隨便一支.pyw", "manifest.json", "更新暫存.exe", "main.py",
+    ])
+    def test_another_file_in_the_same_folder_is_rejected(self, tmp_path,
+                                                         monkeypatch, name):
+        """★核心★ 這些都在 app 根第一層、都真的存在 —— 位置檢查全部放行。"""
+        root = self._root(tmp_path, monkeypatch)
+        bogus = root / name
+        bogus.write_text("", encoding="utf-8")
+        monkeypatch.setenv(cpaths.LAUNCHER_ENV, str(bogus))
+        assert cpaths.pinned_launcher() == "", (
+            f"★{name} 通過了 → 我們會去執行(甚至提權執行)它★")
+
+    def test_every_shipped_launcher_is_on_the_allowlist(self):
+        """★白名單漂掉就等於全部拒絕★ 要跟 repo 裡真的有的那幾支對得上。"""
+        import glob
+        shipped = {os.path.basename(p)
+                   for p in glob.glob(os.path.join(REPO_ROOT, "*.pyw"))}
+        assert shipped, "找不到任何 .pyw（測試自己失效了）"
+        assert shipped == set(cpaths.LAUNCHER_NAMES), (
+            "白名單與實際出貨的啟動器不一致："
+            f"少了 {sorted(shipped - set(cpaths.LAUNCHER_NAMES))}，"
+            f"多了 {sorted(set(cpaths.LAUNCHER_NAMES) - shipped)}")

@@ -71,7 +71,21 @@ def _resolve_src():
     try:
         os.lstat(_p)
     except FileNotFoundError:
-        return fallback          # 這個檔還沒送到這台機器 —— 過渡期正常
+        # ★[外審 P1-02] 只有【兩個都不在】才是過渡期的正常狀態★
+        #   `current.txt` 在、resolver 不在 = 更新【只送到一半】:
+        #   指標說要跑某個版本,而這裡安靜地跑 `<app>\src`。
+        #   **實際跑的版本跟指標說的不一樣,而且沒有任何地方講得出來**
+        #   —— 人看版本號沒變只會以為更新還沒下來。
+        try:
+            os.lstat(os.path.join(_HERE, "current.txt"))
+        except FileNotFoundError:
+            return fallback      # 兩個都不在 —— 過渡期正常,安靜
+        except OSError as _e2:
+            # 連指標在不在都查不出來 → 一樣要留紀錄(不知道 ≠ 沒事)
+            _note_resolver_failure("pointer_check_" + type(_e2).__name__)
+            return fallback
+        _note_resolver_failure("pointer_without_resolver")
+        return fallback
     except OSError as _e:
         _note_resolver_failure(type(_e).__name__)
         return fallback

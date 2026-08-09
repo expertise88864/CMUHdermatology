@@ -30,6 +30,7 @@ PERMANENT_REFUSED / UNKNOWN，`recipients_needing_retry()` 只挑出該補的人
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from contextlib import contextmanager
 import time
@@ -138,6 +139,32 @@ def permanently_refused(recipient_states: dict) -> list:
     """位址設定有問題、需要人工修正的收件人。純函式。"""
     return sorted(addr for addr, st in recipient_states.items()
                   if st == R_PERMANENT)
+
+
+def _as_epoch(value) -> float:
+    """把帳本裡的時間欄位轉成【可比較的】秒數。看不懂 → 0.0(很舊)。
+
+    ★[外審第 2 輪 #2] 排序不可以直接吃原始值★
+    這幾個查詢方法本來都是直接拿原始欄位當 sort key(`r.get("created_at") or 0`)。
+    帳本是磁碟上的 JSON:只要有【一筆】的 `created_at` 是字串(手動編輯、
+    舊格式、寫到一半),Python 比較 `str` 與 `float` 會拋 `TypeError` ——
+    整份清單列不出來,呼叫端捕捉之後回 0,於是**所有正常的紀錄也永遠不收斂**。
+    `Reconciler` 那邊的容錯是在 `unresolved()` 回傳【之後】才跑的,救不到這裡。
+
+    ★[外審第 2 輪 #5] NaN / Infinity 也是壞值★
+    `json.load()` 接受這兩個非標準 token(`atomic_io` 沒有給 `parse_constant`,
+    同 repo 的 `pidfile.py` 就特地擋掉了),而 `float()` 對它們不會拋例外。
+    NaN 參與的比較【永遠是 False】:`updated_at < cutoff` 不成立 → 永遠不算卡住;
+    年齡門檻也永遠不成立 → 永遠進不了回查清單。一筆安靜卡死的紀錄。
+
+    ★方向:看不懂 = 很舊★ 當成「很新」的話,壞掉的那一筆會被年齡門檻永遠濾掉
+    —— 又是把一個看得見的壞變成安靜的壞。
+    """
+    try:
+        f = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return f if math.isfinite(f) else 0.0
 
 
 class DeliveryLedger:
@@ -451,6 +478,49 @@ class DeliveryLedger:
             self._save_locked()
             return rec["state"]
 
+    def claim_reconcile_pass(self, *, now: float, every_sec: float) -> bool:
+        """跨 process 宣告「這一輪回查由我跑」。搶到才回 True。
+
+        ★為什麼節流不能只在記憶體裡(外審 2026-08-09 P1-04)★
+        這本帳是【主程式與會診程式共用】的,而現在兩邊都會回查。各拿一個
+        記憶體時間戳的話,同一台機器上兩支程式會【同時】對同一批紀錄開 IMAP、
+        同時呼叫 `resolve_unknown()`。而上面 `_save_once_locked()` 的合併規則
+        明文寫著「delivery_id 是全域唯一的,所以兩個 process 不可能改到同一筆」
+        —— 讓兩邊都回查會直接推翻那個前提,退化成
+        「用我手上的舊副本蓋掉對方的新版本」。
+
+        時間戳存在 sidecar `.reconcile` 檔,整段讀-比-寫都在跨 process 檔案鎖裡。
+
+        ★讀不到就當成「還沒有人跑過」★ 不是把它當成「剛剛才跑過」——
+        後者會在檔案永久壞掉時變成【永遠不回查】,而且一個字都不會說。
+        寧可多跑一輪(代價是一次 IMAP 查詢),也不要安靜地停掉整個收斂機制。
+        """
+        import os as _os
+        stamp_path = self.path + ".reconcile"
+        with self._interprocess_lock():
+            prev = 0.0
+            try:
+                with open(stamp_path, encoding="utf-8") as fh:
+                    prev = float((fh.read() or "0").strip() or 0)
+            except FileNotFoundError:
+                prev = 0.0                       # 還沒有人跑過 —— 正常
+            except (OSError, ValueError):
+                logging.warning("[delivery] 回查時間戳讀不到/看不懂 → 當成沒跑過"
+                                "(寧可多跑一輪,也不要安靜地停掉收斂)")
+                prev = 0.0
+            if now - prev < float(every_sec):
+                return False
+            try:
+                _os.makedirs(_os.path.dirname(stamp_path) or ".", exist_ok=True)
+                with open(stamp_path, "w", encoding="utf-8") as fh:
+                    fh.write("%.3f" % now)
+            except OSError:
+                # 寫不進去 → 下一輪還是會搶。★仍然回 True★:讓這一輪跑掉,
+                # 總比因為寫不了時間戳就永遠不回查好(那是沒有出口的 fail-closed)。
+                logging.warning("[delivery] 回查時間戳寫不進去 → 這一輪照跑,"
+                                "節流退化成每輪都可能重跑", exc_info=True)
+            return True
+
     # ── 查詢 ───────────────────────────────────────────────────────────────
     def get(self, delivery_id: str) -> dict:
         with self._lock:
@@ -534,7 +604,7 @@ class DeliveryLedger:
         with self._lock:
             out = [dict(r) for r in self._records.values()
                    if r.get("state") == UNKNOWN]
-        return sorted(out, key=lambda r: r.get("created_at") or 0)
+        return sorted(out, key=lambda r: _as_epoch(r.get("created_at")))
 
     def stuck_submitting(self, older_than_sec: float = 600.0) -> list:
         """卡在 SUBMITTING 超過一段時間的紀錄 —— 多半是上次送到一半就被砍。
@@ -553,8 +623,8 @@ class DeliveryLedger:
         with self._lock:
             out = [dict(r) for r in self._records.values()
                    if r.get("state") == SUBMITTING
-                   and (r.get("updated_at") or 0) < cutoff]
-        return sorted(out, key=lambda r: r.get("created_at") or 0)
+                   and _as_epoch(r.get("updated_at")) < cutoff]
+        return sorted(out, key=lambda r: _as_epoch(r.get("created_at")))
 
     def confirm_recipients(self, delivery_id: str, addrs: list) -> list:
         """把這幾位收件人在【這一筆】上的狀態改成已送達。回傳真的改到的。
@@ -626,8 +696,8 @@ class DeliveryLedger:
         with self._lock:
             out = [dict(r) for r in self._records.values()
                    if r.get("state") == PREPARED
-                   and (r.get("updated_at") or 0) < cutoff]
-        return sorted(out, key=lambda r: r.get("created_at") or 0)
+                   and _as_epoch(r.get("updated_at")) < cutoff]
+        return sorted(out, key=lambda r: _as_epoch(r.get("created_at")))
 
     def converge_stale_prepared(self, older_than_sec: float = 900.0) -> int:
         """把舊格式留下的陳舊 PREPARED 收斂成 UNKNOWN。回傳收斂了幾筆。
@@ -651,7 +721,7 @@ class DeliveryLedger:
         with self._lock:
             for did, rec in self._records.items():
                 if (rec.get("state") == PREPARED
-                        and (rec.get("updated_at") or 0) < cutoff):
+                        and _as_epoch(rec.get("updated_at")) < cutoff):
                     rec["state"] = UNKNOWN
                     rec["updated_at"] = _now()
                     rec["note"] = ("舊格式的陳舊 PREPARED:無法確定是否寄出"
@@ -705,7 +775,7 @@ class DeliveryLedger:
             if rec.get("state") in (UNKNOWN, SUBMITTING, PREPARED):
                 keep[did] = rec
                 continue
-            if (rec.get("updated_at") or 0) >= cutoff:
+            if _as_epoch(rec.get("updated_at")) >= cutoff:
                 keep[did] = rec
         dropped = len(self._records) - len(keep)
         if dropped:

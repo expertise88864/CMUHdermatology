@@ -578,3 +578,41 @@ def test_the_existence_probe_does_not_follow_links():
             f"{os.path.basename(path)} 的存在性探測沒有用 lstat")
         assert "stat" not in probes, (
             f"{os.path.basename(path)} 仍在用會跟隨連結的 stat")
+
+
+# ── 外審 P1-02：半套部署（指標在、resolver 不在）不可以安靜 ────────────────
+@pytest.mark.parametrize("path", _STUBS, ids=lambda p: os.path.basename(p))
+def test_a_pointer_without_a_resolver_is_never_silent(path, tmp_path):
+    """★核心（外審 P1-02）★ `current.txt` 在、`version_pointer.py` 不在。
+
+    這【不是】過渡期的正常狀態,而是更新只送到一半:
+    指標說要跑 `versions/<V>/src`,而 stub 安靜地跑了 `<app>/src`。
+    **實際跑的版本跟指標說的不一樣,而且沒有任何地方講得出來** ——
+    人看版本號沒變只會以為更新還沒下來,跟 8/5 那次一模一樣的形狀。
+
+    ★同一個病灶的第五次★:把一個【看得見的壞】摺進【安靜的正常】。
+    """
+    (tmp_path / "src").mkdir()
+    (tmp_path / vp.POINTER_NAME).write_text("2026.08.09.7", encoding="utf-8")
+    got = _run_stub_block(path, tmp_path)
+    assert got == os.path.join(str(tmp_path), "src"), "還是要開得起來"
+    log = os.path.join(str(tmp_path), vp.LOG_NAME)
+    assert os.path.exists(log), "★指標在、resolver 不在,卻一個字都沒留★"
+    assert "不是】新版本" in open(log, encoding="utf-8").read()
+
+
+@pytest.mark.parametrize("path", _STUBS, ids=lambda p: os.path.basename(p))
+def test_neither_file_present_is_still_quiet(path, tmp_path):
+    """★反方向★ 兩個都不在才是真的過渡期 —— 不可以因為上面那條就開始吵。
+
+    這一條沒有的話,「安靜」的判準可以被改成「永遠不安靜」而測試照樣全綠。
+    """
+    (tmp_path / "src").mkdir()
+    _run_stub_block(path, tmp_path)
+    assert not os.path.exists(os.path.join(str(tmp_path), vp.LOG_NAME))
+
+
+def test_the_stub_checks_the_same_pointer_name_as_the_resolver():
+    """★兩邊要指同一個檔名★ 名字漂掉的話,這個偵測就永遠不會觸發。"""
+    assert vp.POINTER_NAME in _stub_block(_STUBS[0]), (
+        "stub 檢查的檔名跟 version_pointer.POINTER_NAME 不一致 → 偵測失效")

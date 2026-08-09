@@ -193,13 +193,29 @@ def sweep_old_restart_err_files(tmpdir: str,
     return removed
 
 
+#: ★六支 launcher 的封閉集合★(外審 2026-08-09 P2-02)
+#   `CMUH_LAUNCHER` 是【會被子行程繼承】的環境變數。只驗「檔案存在 + 在 app
+#   根目錄第一層」的話,app 根目錄裡【任何一個檔】都能通過 —— 包含更新器
+#   剛下載的檔、被放進來的 `.pyw`、甚至 `manifest.json`。而 `self_entry_path()`
+#   的結果會被 `build_restart_command()` 拿去執行,UAC 那條路還會把它提權。
+#   位置對不代表身分對:再加一層名字的白名單。
+LAUNCHER_NAMES = (
+    "中國醫皮膚科主程式.pyw",
+    "中國醫皮膚科守護程式.pyw",
+    "中國醫皮膚科打卡程式.pyw",
+    "中國醫皮膚科排班程式.pyw",
+    "中國醫皮膚科會診查詢程式.pyw",
+    "中國醫皮膚科點座標偵測程式.pyw",
+)
+
+
 def pinned_launcher() -> str:
-    """啟動器釘住的固定 `.pyw`;沒釘住／檔案不在／不在 app 根目錄第一層 → 空字串。
+    """啟動器釘住的固定 `.pyw`;沒釘住／檔案不在／不在白名單 → 空字串。
 
     ★[外審 P2-02] 不可以只驗『檔案存在』★
     環境變數是會被繼承的。只驗存在的話,一個指向別處的值就能讓我們去重啟
     另一支程式。所以要求它【就在釘住的 app 根目錄底下、而且是第一層】——
-    那正是六支 launcher 真正的位置。
+    那正是六支 launcher 真正的位置 —— 而且【檔名要在封閉集合裡】。
     """
     import os as _os
     v = _os.environ.get(LAUNCHER_ENV, "").strip()
@@ -218,6 +234,10 @@ def pinned_launcher() -> str:
         if not root:
             return ""
         if _os.path.dirname(v) != _os.path.realpath(root):
+            return ""
+        # ★位置對 ≠ 身分對★(外審 2026-08-09 P2-02)
+        #   app 根目錄裡不是只有那六支;更新器會在那裡放檔案。
+        if _os.path.basename(v) not in LAUNCHER_NAMES:
             return ""
     except OSError:
         return ""

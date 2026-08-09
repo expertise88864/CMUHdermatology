@@ -5174,99 +5174,23 @@ def _confirm_on_origin(origin_did: str, delivered: list) -> None:
 
 
 # ── UNKNOWN 回查(outbox reconciliation)────────────────────────────────────
-# 寄件備份要一點時間才會出現;太早查到「沒有」會誤判成沒寄出去。
-_RECONCILE_MIN_AGE_SEC = 600.0        # 帳上這筆至少要滿 10 分鐘才值得回查
-_RECONCILE_EVERY_SEC = 600.0          # 兩次回查之間至少隔這麼久(它要開 IMAP 連線)
-_RECONCILE_MAX_PER_PASS = 5           # 一次最多查幾筆(慢查詢不要拖住查詢輪次)
-# 卡在 SUBMITTING 超過這麼久 → 多半是送到一半就被砍,與 UNKNOWN 一樣需要回查。
-# 比 `_RECONCILE_MIN_AGE_SEC` 寬鬆一點:正常的 SUBMITTING 只會存在幾秒鐘。
-_STUCK_SUBMITTING_AFTER_SEC = 900.0
-_last_reconcile_ts = 0.0
+# ★實作在 `cmuh_common/delivery_reconcile.py`★(外審 2026-08-09 P1-04)
+#   寫進這本帳的有【兩支程式】:會診通知(這裡)與主程式的止掛提醒。
+#   回查原本只寫在本檔 —— 只跑主程式、沒裝會診查詢的診間電腦,止掛信的
+#   UNKNOWN 與卡住的 SUBMITTING 就【永遠沒有人收斂】。實作搬到共用模組,
+#   兩邊都驅動它;節流改成跨 process(不然同一台機器兩支會互相覆蓋收斂結果)。
+from cmuh_common.delivery_reconcile import Reconciler as _Reconciler  # noqa: E402
+
+# ★用 lambda 做【延遲查找】,不要把函式物件綁死★
+#   直接傳 `_get_ledger` 會把 import 當下的那個物件釘住,之後任何對
+#   `consult_query._get_ledger` 的取代(測試的 seam、未來的注入)都不再生效 ——
+#   而且是【安靜地】不生效:測試照跑,只是測到的是舊的取得器。
+_RECONCILER = _Reconciler(lambda: _get_ledger(), tag="delivery")
 
 
 def _reconcile_unknown_deliveries(now=None, finder=None) -> int:
-    """把帳本上的 UNKNOWN 拿 Message-ID 去寄件備份回查。→ 收斂了幾筆。
-
-    ★這是 `delivery_ledger` 一直宣稱、但從來沒有人呼叫的那條路★
-    模組 docstring 寫「UNKNOWN 就誠實地記成 UNKNOWN,之後用 Message-ID 回查
-    寄件備份把它收斂成 CONFIRMED 或 FAILED」,而 `resolve_unknown()` 在生產
-    程式碼裡【一個呼叫端都沒有】—— 於是每一筆 UNKNOWN 都永遠停在 UNKNOWN:
-      * `has_live_delivery()` 把它算成「還沒被否證」→ 同一批會診【永遠不會再寄】
-      * 也永遠不會有人知道那封信到底送到了沒有
-    宣稱與實作不符,而且是往「安靜地漏寄」的方向。
-
-    ★三態必須原封不動地傳下去★ `find_message_in_sent` 回 None = 查不出來。
-    查不出來就【什麼都不做】,下一輪再試 —— 把它摺成「沒寄到」會重寄一封
-    已經送達的信,摺成「有寄到」會把真正的漏寄吞掉。
-    """
-    global _last_reconcile_ts
-    led = _get_ledger()
-    if led is None:
-        return 0
-    now = float(now if now is not None else time.time())
-    try:
-        # ★[2026-08-09 外審 P1-04] 卡住的 SUBMITTING 也要回查★
-        #   `begin()` 已經把 SUBMITTING 落地;SMTP 送出之後、settle 之前 crash,
-        #   那一筆就【永久】停在 SUBMITTING。而 SUBMITTING 屬於 `LIVE_STATES`
-        #   —— 一旦把帳本接成寄送閘門,它會【永久擋住同一批會診】。
-        #   ★所以這是接閘門的前置條件★:兩者都靠同一個 Message-ID 回查收斂,
-        #   本來就該走同一個 worker。
-        pending = list(led.unresolved()) + list(
-            led.stuck_submitting(older_than_sec=_STUCK_SUBMITTING_AFTER_SEC))
-    except Exception:
-        logging.debug("[delivery] 讀取待回查清單失敗", exc_info=True)
-        return 0
-    # ★先看有沒有事做,再看節流★ 沒事做的時候不該把節流時間戳往前推。
-    ripe = [r for r in pending
-            if now - float(r.get("created_at") or 0) >= _RECONCILE_MIN_AGE_SEC
-            and str(r.get("message_id") or "")]
-    # ★[2026-08-09 外審 P2] 兩個來源要【合併後依年齡排序】再切上限★
-    #   `unresolved() + stuck_submitting()` 直接切 [:5] 的話,只要有 5 筆以上
-    #   的 UNKNOWN,SUBMITTING 就【永遠輪不到】—— 而 UNKNOWN 產生的速度可能
-    #   超過每 10 分鐘 5 筆的消化率。餓死的那一筆一旦接上寄送閘門,
-    #   會永久擋住它的 business key。
-    #   兩個 ledger 方法各自只排序自己那一份,合起來沒有全域順序。
-    #   依 `created_at` 由舊到新排 → 最久沒收斂的先查,兩個來源自然公平。
-    ripe.sort(key=lambda r: float(r.get("created_at") or 0))
-    if not ripe:
-        return 0
-    if now - _last_reconcile_ts < _RECONCILE_EVERY_SEC:
-        return 0
-    _last_reconcile_ts = now
-    if finder is None:
-        # 與本檔其他 IMAP 用法同一套：在函式裡 import（避免啟動時就拉進 ssl/imaplib）
-        from cmuh_common.imap_reader import find_message_in_sent  # noqa: PLC0415
-        finder = find_message_in_sent
-    look_up = finder
-    settled = 0
-    for rec in ripe[:_RECONCILE_MAX_PER_PASS]:
-        did = str(rec.get("delivery_id") or "")
-        msgid = str(rec.get("message_id") or "")
-        if not did:
-            continue
-        try:
-            found = look_up(msgid)
-        except Exception:
-            logging.warning("[delivery] 回查 %s 失敗 → 維持 UNKNOWN", did,
-                            exc_info=True)
-            continue
-        if found is None:
-            logging.info("[delivery] %s 回查不出結果 → 維持 UNKNOWN,下輪再試", did)
-            continue
-        try:
-            state = led.resolve_unknown(did, delivered=bool(found))
-        except Exception:
-            logging.warning("[delivery] 收斂 %s 失敗", did, exc_info=True)
-            continue
-        settled += 1
-        if found:
-            logging.info("[delivery] %s 在寄件備份查到 → 收斂為 %s", did, state)
-        else:
-            # 確定沒寄出去。信的內容重建不了(不存病人明文),所以這裡不重寄,
-            # 交給既有的補寄/結案路徑去處理與告警。
-            logging.error("[delivery] ★%s 在寄件備份【查無】→ 這封信沒有寄出去★"
-                          "(主旨:%s)", did, rec.get("subject", ""))
-    return settled
+    """把帳本上的 UNKNOWN／卡住的 SUBMITTING 拿去寄件備份回查。→ 收斂幾筆。"""
+    return _RECONCILER.run_once(now=now, finder=finder)
 
 
 _ABANDON_RETRY_AFTER_SEC = 3600.0     # 帳上掛超過一小時 → 明確結案 + 告警

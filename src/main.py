@@ -1900,6 +1900,80 @@ def _flush_delivery_ledger_before_exit() -> None:
         logging.debug("[delivery] 關閉前補寫寄送帳本失敗(忽略)", exc_info=True)
 
 
+_alert_reconciler = None
+_alert_reconciler_lock = threading.Lock()
+_alert_reconcile_inflight = False
+
+
+def _kick_off_alert_reconcile() -> bool:
+    """在背景跑一輪止掛信回查。→ 有沒有真的開起來（single-flight）。
+
+    ★[外審第 2 輪 #3] 絕不可以串在刷新的關鍵路徑上★
+    第一版直接在刷新 worker 裡同步呼叫。一輪最多回查 5 筆，每一筆
+    `find_message_in_sent()` 各自開一條 IMAP 連線、socket timeout 12 秒 ——
+    IMAP 主機不可達時，**掛號資料在送出第一個查詢之前就先卡 60 秒以上**，
+    而且每 10 分鐘重來一次。止掛提醒本身就會跟著延遲。
+    為了觀測寄信結果而延後臨床資料，方向完全反了。
+
+    ★single-flight★ 上一輪還沒跑完就不要再開一條：IMAP 慢的時候，
+    每次刷新各開一條執行緒會累積成一堆卡住的連線（而它們正是慢的原因）。
+    """
+    global _alert_reconcile_inflight
+    with _alert_reconciler_lock:
+        if _alert_reconcile_inflight:
+            logging.debug("[delivery] 上一輪回查還沒結束 → 這次不另開")
+            return False
+        _alert_reconcile_inflight = True
+
+    def _worker():
+        global _alert_reconcile_inflight
+        try:
+            _reconcile_alert_deliveries()
+        except Exception:
+            logging.debug("[delivery] 背景回查失敗(不影響任何事)", exc_info=True)
+        finally:
+            with _alert_reconciler_lock:
+                _alert_reconcile_inflight = False
+
+    try:
+        threading.Thread(target=_worker, name="AlertReconcile",
+                         daemon=True).start()
+        return True
+    except Exception:
+        # 開不出執行緒(資源耗盡)→ 放掉旗標，下一輪再試。★不可以留著卡住★
+        with _alert_reconciler_lock:
+            _alert_reconcile_inflight = False
+        logging.debug("[delivery] 開不出回查執行緒", exc_info=True)
+        return False
+
+
+def _reconcile_alert_deliveries(now=None, finder=None) -> int:
+    """把【止掛信】帳上的 UNKNOWN／卡住的 SUBMITTING 拿去寄件備份回查。
+
+    ★[2026-08-09 外審 P1-04] 主程式也必須自己收斂★
+    回查原本只寫在 `consult_query.py` 裡,但寫進這本帳的有兩支程式 ——
+    止掛提醒信是【主程式】寄的。只跑主程式、沒裝會診查詢的診間電腦,
+    那些 UNKNOWN 與卡住的 SUBMITTING **永遠不會有人去收斂**;
+    一旦把帳本接成寄送閘門,它們會永久擋住同一個 business key 的重寄。
+
+    實作與會診端共用 `cmuh_common.delivery_reconcile`,節流是跨 process 的
+    (同一台機器上兩支程式不會同時回查同一批)。fail-open:壞掉不影響刷新。
+    """
+    global _alert_reconciler
+    try:
+        with _alert_reconciler_lock:
+            if _alert_reconciler is None:
+                from cmuh_common.delivery_reconcile import Reconciler
+                # lambda = 延遲查找（見 consult_query 同一處的說明）
+                _alert_reconciler = Reconciler(lambda: _get_alert_ledger(),
+                                               tag="delivery/alert")
+            rec = _alert_reconciler
+        return rec.run_once(now=now, finder=finder)
+    except Exception:
+        logging.debug("[delivery] 止掛信回查失敗(不影響刷新)", exc_info=True)
+        return 0
+
+
 def _flush_ledger_before_exit(timeout: float = _LEDGER_FLUSH_TIMEOUT_SEC) -> bool:
     """[codex P2] os._exit(0) 前把佇列中的稽核紀錄盡量寫完(daemon 緒會被直接砍掉)。
 
@@ -12531,6 +12605,17 @@ class AutomationApp:
                 and specific_doctors is not None
             )
             self._refresh_worker_running = True  # 冪等：旗標已在 main thread 同步設過(見上)
+            # ★[2026-08-09 外審 P1-04] 止掛信帳本的回查在這裡驅動★
+            #   這是主程式唯一固定會跑的背景輪次。自帶跨 process 節流
+            #   （10 分鐘一次），所以放在這裡不會變成每次刷新都開 IMAP。
+            # ★[外審第 2 輪 #3] 只是【點火】，不等它★
+            #   回查會開 IMAP 連線（每筆 12 秒 timeout、一輪最多 5 筆）。
+            #   同步等它 = IMAP 掛掉時，掛號資料在送出第一個查詢前先卡 60 秒。
+            try:
+                _kick_off_alert_reconcile()
+            except Exception:
+                logging.debug("[delivery] 止掛信回查點火失敗(不影響刷新)",
+                              exc_info=True)
             try:
                 batches = partition_doctors_for_refresh_batches(doctors_to_check)
                 for bi, batch in enumerate(batches):
