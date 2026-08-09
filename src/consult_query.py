@@ -5178,6 +5178,9 @@ def _confirm_on_origin(origin_did: str, delivered: list) -> None:
 _RECONCILE_MIN_AGE_SEC = 600.0        # 帳上這筆至少要滿 10 分鐘才值得回查
 _RECONCILE_EVERY_SEC = 600.0          # 兩次回查之間至少隔這麼久(它要開 IMAP 連線)
 _RECONCILE_MAX_PER_PASS = 5           # 一次最多查幾筆(慢查詢不要拖住查詢輪次)
+# 卡在 SUBMITTING 超過這麼久 → 多半是送到一半就被砍,與 UNKNOWN 一樣需要回查。
+# 比 `_RECONCILE_MIN_AGE_SEC` 寬鬆一點:正常的 SUBMITTING 只會存在幾秒鐘。
+_STUCK_SUBMITTING_AFTER_SEC = 900.0
 _last_reconcile_ts = 0.0
 
 
@@ -5202,7 +5205,14 @@ def _reconcile_unknown_deliveries(now=None, finder=None) -> int:
         return 0
     now = float(now if now is not None else time.time())
     try:
-        pending = led.unresolved()
+        # ★[2026-08-09 外審 P1-04] 卡住的 SUBMITTING 也要回查★
+        #   `begin()` 已經把 SUBMITTING 落地;SMTP 送出之後、settle 之前 crash,
+        #   那一筆就【永久】停在 SUBMITTING。而 SUBMITTING 屬於 `LIVE_STATES`
+        #   —— 一旦把帳本接成寄送閘門,它會【永久擋住同一批會診】。
+        #   ★所以這是接閘門的前置條件★:兩者都靠同一個 Message-ID 回查收斂,
+        #   本來就該走同一個 worker。
+        pending = list(led.unresolved()) + list(
+            led.stuck_submitting(older_than_sec=_STUCK_SUBMITTING_AFTER_SEC))
     except Exception:
         logging.debug("[delivery] 讀取待回查清單失敗", exc_info=True)
         return 0
@@ -5210,6 +5220,14 @@ def _reconcile_unknown_deliveries(now=None, finder=None) -> int:
     ripe = [r for r in pending
             if now - float(r.get("created_at") or 0) >= _RECONCILE_MIN_AGE_SEC
             and str(r.get("message_id") or "")]
+    # ★[2026-08-09 外審 P2] 兩個來源要【合併後依年齡排序】再切上限★
+    #   `unresolved() + stuck_submitting()` 直接切 [:5] 的話,只要有 5 筆以上
+    #   的 UNKNOWN,SUBMITTING 就【永遠輪不到】—— 而 UNKNOWN 產生的速度可能
+    #   超過每 10 分鐘 5 筆的消化率。餓死的那一筆一旦接上寄送閘門,
+    #   會永久擋住它的 business key。
+    #   兩個 ledger 方法各自只排序自己那一份,合起來沒有全域順序。
+    #   依 `created_at` 由舊到新排 → 最久沒收斂的先查,兩個來源自然公平。
+    ripe.sort(key=lambda r: float(r.get("created_at") or 0))
     if not ripe:
         return 0
     if now - _last_reconcile_ts < _RECONCILE_EVERY_SEC:

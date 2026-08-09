@@ -29,8 +29,9 @@ imap_reader = importlib.import_module("cmuh_common.imap_reader")
 class _Led:
     """只實作這個流程用得到的那幾個方法。"""
 
-    def __init__(self, records):
+    def __init__(self, records, stuck=None):
         self._recs = list(records)
+        self._stuck = list(stuck or [])
         self.resolved = []
         self.raise_on_unresolved = False
 
@@ -38,6 +39,16 @@ class _Led:
         if self.raise_on_unresolved:
             raise RuntimeError("讀不到")
         return list(self._recs)
+
+    def stuck_submitting(self, older_than_sec=600.0):
+        """★[2026-08-09] 假帳本要跟上生產介面★
+
+        回查 worker 現在同時消費 `unresolved()` 與 `stuck_submitting()`。
+        假帳本少一個方法，測到的就是 AttributeError 而不是被測的行為。
+        """
+        if self.raise_on_unresolved:
+            raise RuntimeError("讀不到")
+        return list(self._stuck)
 
     def resolve_unknown(self, did, *, delivered, note=""):
         self.resolved.append((did, delivered))
@@ -396,3 +407,95 @@ class TestUnresolvedIsCrossProcess:
                             lambda *a, **k: alerts.append(a))
         cq._close_out_stale_recipient_retries()      # 不可以往上拋
         assert alerts == [], "讀不到帳本卻還是告警了（會誤報漏收）"
+
+
+# ── [批次 Z / 外審 P1-04] 卡住的 SUBMITTING 也要回查 ─────────────────────
+# `begin()` 已經把 SUBMITTING 落地；SMTP 送出之後、settle 之前 crash，那一筆就
+# **永久**停在 SUBMITTING。而 SUBMITTING 屬於 `LIVE_STATES` —— 一旦把帳本接成
+# 寄送閘門，它會**永久擋住同一批會診**。★所以這是接閘門的前置條件★。
+def test_a_stuck_submitting_record_is_reconciled(monkeypatch):
+    """★核心★ 卡住的 SUBMITTING 與 UNKNOWN 走同一個回查 worker。"""
+    led = _Led([], stuck=[_rec(did="s1")])
+    n, seen = _run(monkeypatch, led, [True])
+    assert (n, seen) == (1, ["<a@b>"])
+    assert led.resolved == [("s1", True)]
+
+
+def test_both_sources_are_reconciled_together(monkeypatch):
+    led = _Led([_rec(did="u1")], stuck=[_rec(did="s1")])
+    n, seen = _run(monkeypatch, led, [True, True])
+    assert n == 2 and len(seen) == 2
+    assert {d for d, _ok in led.resolved} == {"u1", "s1"}
+
+
+def test_a_stuck_record_that_is_absent_from_sent_is_settled_as_failed(
+        monkeypatch):
+    """確定查無 → 收斂成「沒寄出去」，否則它永遠卡在 SUBMITTING。"""
+    led = _Led([], stuck=[_rec(did="s1")])
+    n, _seen = _run(monkeypatch, led, [False])
+    assert (n, led.resolved) == (1, [("s1", False)])
+
+
+def test_an_unknown_answer_leaves_a_stuck_record_alone(monkeypatch):
+    """★三態不可以摺成兩態★ 查不出來就維持現狀，下一輪再試。"""
+    led = _Led([], stuck=[_rec(did="s1")])
+    n, _seen = _run(monkeypatch, led, [None])
+    assert (n, led.resolved) == (0, [])
+
+
+def test_a_young_submitting_record_is_left_alone(monkeypatch):
+    """正常的 SUBMITTING 只存在幾秒鐘 —— 太新的不可以當成卡住。"""
+    led = _Led([], stuck=[])          # 生產由 older_than_sec 過濾
+    n, seen = _run(monkeypatch, led, [True])
+    assert (n, seen) == (0, [])
+
+
+def test_the_worker_asks_for_aged_submitting_only():
+    """★要真的傳 `older_than_sec`★ 不傳就會拿到剛剛才建立的那些。"""
+    import ast
+    import inspect
+    import textwrap
+    src = textwrap.dedent(inspect.getsource(cq._reconcile_unknown_deliveries))
+    calls = [n for n in ast.walk(ast.parse(src))
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "stuck_submitting"]
+    assert calls, "★回查 worker 沒有消費 stuck_submitting★ —— 那個 API 等於不存在"
+    kws = {k.arg for c in calls for k in c.keywords}
+    assert "older_than_sec" in kws, "沒有指定年齡門檻，會拿到剛建立的 SUBMITTING"
+
+
+def test_an_unreadable_ledger_still_does_nothing(monkeypatch):
+    """兩個來源都讀不到時，一樣什麼都不做（不可以只擋一個來源）。"""
+    led = _Led([_rec()], stuck=[_rec(did="s1")])
+    led.raise_on_unresolved = True
+    n, seen = _run(monkeypatch, led, [False])
+    assert (n, seen, led.resolved) == (0, [], [])
+
+
+def test_a_stuck_record_is_not_starved_by_many_unknowns(monkeypatch):
+    """★[外審 P2] 餓死★ 兩個來源直接接起來再切上限，SUBMITTING 永遠輪不到。
+
+    UNKNOWN 產生的速度可能超過「每 10 分鐘 5 筆」的消化率。餓死的那一筆
+    一旦接上寄送閘門，會**永久擋住它的 business key**。
+    ★依年齡全域排序★ 最久沒收斂的先查，兩個來源自然公平。
+    """
+    now = 10_000.0
+    # 8 筆比較新的 UNKNOWN + 1 筆最舊的 SUBMITTING
+    unknowns = [_rec(did="u%d" % i, age=1000.0, now=now) for i in range(8)]
+    stuck = [_rec(did="s1", age=9000.0, now=now)]
+    led = _Led(unknowns, stuck=stuck)
+    n, seen = _run(monkeypatch, led, [True] * 9, now=now)
+    assert n == cq._RECONCILE_MAX_PER_PASS
+    assert "s1" in {d for d, _ok in led.resolved}, (
+        "★最舊的 SUBMITTING 被一堆較新的 UNKNOWN 餓死★")
+
+
+def test_the_oldest_records_are_queried_first(monkeypatch):
+    """全域依年齡排序 —— 不是「先 UNKNOWN 再 SUBMITTING」。"""
+    now = 10_000.0
+    led = _Led([_rec(did="new_u", age=700.0, now=now)],
+               stuck=[_rec(did="old_s", age=8000.0, now=now)])
+    n, _seen = _run(monkeypatch, led, [True, True], now=now)
+    assert n == 2
+    assert [d for d, _ok in led.resolved][0] == "old_s", (
+        "最舊的沒有先被查 —— 排序沒生效")
