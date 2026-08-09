@@ -202,7 +202,13 @@ foreach ($p in $programs) {
             # 會真的寫進註冊的 task。所以對 Periodic 走 schtasks.exe CLI；
             # ONLOGON 維持原本 PowerShell cmdlet 即可。）
             if ($p.PSObject.Properties.Name -contains 'Periodic' -and $p.Periodic) {
-                $scriptFullPath = Join-Path $scriptDir $p.ScriptRelPath
+                # ★[2026-08-09 外審 P1-01] 排程也要走固定的 .pyw 啟動器★
+                #   以前這裡用 ScriptRelPath 直接跑 src\watchdog_runner.py ——
+                #   那條路【不經過 launcher】,所以 current.txt 切版之後,
+                #   其他五支跑新版、watchdog 每兩分鐘永遠跑 <app>\src 的舊版,
+                #   而且 CMUH_APP_DIR / CMUH_LAUNCHER 根本沒被設過。
+                #   最後一道復原防線自己停在舊版,還沒有任何地方會說出來。
+                $scriptFullPath = $pywPath
                 $tr = '"' + $pythonw + '" "' + $scriptFullPath + '" ' + $p.ScriptArgs
                 # 先清掉同名舊 task (允許 trigger 類型整個換新)
                 $existing = Get-ScheduledTask -TaskName $p.TaskName -ErrorAction SilentlyContinue

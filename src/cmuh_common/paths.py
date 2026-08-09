@@ -193,6 +193,49 @@ def sweep_old_restart_err_files(tmpdir: str,
     return removed
 
 
+def pinned_launcher() -> str:
+    """啟動器釘住的固定 `.pyw`;沒釘住／檔案不在／不在 app 根目錄第一層 → 空字串。
+
+    ★[外審 P2-02] 不可以只驗『檔案存在』★
+    環境變數是會被繼承的。只驗存在的話,一個指向別處的值就能讓我們去重啟
+    另一支程式。所以要求它【就在釘住的 app 根目錄底下、而且是第一層】——
+    那正是六支 launcher 真正的位置。
+    """
+    import os as _os
+    v = _os.environ.get(LAUNCHER_ENV, "").strip()
+    if not v:
+        return ""
+    try:
+        v = _os.path.realpath(v)
+        if not _os.path.isfile(v):
+            return ""
+        # ★[外審 P2] `if root and ...` 會讓守衛 no-op★
+        #   沒有(或無效的)`CMUH_APP_DIR` 時,整個 containment 檢查被跳過,
+        #   於是【任何存在的檔】都被接受 —— 繼承來的陳舊值就能讓我們
+        #   去重啟別的程式,而 UAC 那條路還會把它提權。
+        #   兩個值是【一組】的:沒有可信的根,就沒有可信的 launcher。
+        root = pinned_app_dir()
+        if not root:
+            return ""
+        if _os.path.dirname(v) != _os.path.realpath(root):
+            return ""
+    except OSError:
+        return ""
+    return v
+
+
+def self_entry_path() -> str:
+    """「要再開一次自己」時應該執行哪一支檔。★單一真相來源★
+
+    `runpy.run_path` 會把 `sys.argv[0]` 換成被執行的那支源碼;版本化之後
+    那是 `versions/<V1>/src/xxx.py`。任何拿它去重新啟動的地方(restart、
+    UAC 提權、托盤另開設定)都會【鎖在舊版本、而且不再讀 current.txt】。
+    ★所以自我重啟一律走固定的 `.pyw`★;沒釘住(過渡期、直接跑 src)才照舊。
+    """
+    launcher = pinned_launcher()
+    return launcher or os.path.abspath(sys.argv[0])
+
+
 def build_restart_command(extra_args=None) -> list:
     """組出「重新啟動自己」的命令列。★抽成純函式是為了測得到★
 
@@ -211,12 +254,7 @@ def build_restart_command(extra_args=None) -> list:
     args = list(extra_args) if extra_args else []
     if is_frozen():
         return [sys.executable] + args
-    launcher = os.environ.get(LAUNCHER_ENV, "").strip()
-    if launcher:
-        launcher = os.path.abspath(launcher)
-        if os.path.isfile(launcher):
-            return [sys.executable, launcher] + args
-    return [sys.executable, os.path.abspath(sys.argv[0])] + args
+    return [sys.executable, self_entry_path()] + args
 
 
 def restart_self(extra_args=None, hard_exit_code=None,

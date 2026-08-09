@@ -117,6 +117,21 @@ def _admin_relaunch_params(argv=None, *, frozen=None) -> str:
     (目前 repo 沒有 .spec / 打包腳本，實務上跑 .pyw；此為與既有模式對齊的一致性修正。)
     """
     args = list(argv if argv is not None else sys.argv)
+    # ★[外審 P1-02] UAC 提權也要走固定 launcher★
+    #   `sys.argv[0]` 在 runpy 之後是 `versions/<V1>/src/main.py`。
+    #   使用者按下「是」的那一刻若 current.txt 已切到 V2,提權後的行程
+    #   仍然跑 V1,而且不會再讀一次指標、也不會重跑開機復原。
+    #   這與已修好的 `restart_self()` 是同一個問題,只是漏了這條路。
+    #   ★只有拿到【通過驗證的】固定 launcher 才替換★ 沒釘住(過渡期、直接跑
+    #   src、測試明確傳 argv)一律照舊 —— 否則會把呼叫端指定的第一個引數蓋掉。
+    if args and not (is_frozen() if frozen is None else frozen):
+        try:
+            from cmuh_common.paths import pinned_launcher
+            _pinned = pinned_launcher()
+            if _pinned:
+                args[0] = _pinned
+        except Exception:  # noqa: BLE001  取不到就照舊,不可以擋住提權
+            pass
     if is_frozen() if frozen is None else frozen:
         args = args[1:]
     return subprocess.list2cmdline(args)

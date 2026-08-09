@@ -11,6 +11,31 @@ _PROGRAM = "點座標偵測程式"
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+def _note_resolver_failure(why):
+    """[外審 P1-03] ★「resolver 壞了」不可以摺進「沒有指標」那個安靜的正常狀態★
+
+    `version_pointer.py` 對【壞掉的指標】會寫 log,但 stub 這一層以前對
+    「resolver 自己載不進來」(語法錯、import 失敗、exec 失敗)只是
+    `except Exception: return fallback` —— 一個字都沒留。
+    那正是最糟的組合:**實際在跑舊版,而且沒有任何地方說得出來**,
+    人看到版本號沒變只會以為更新還沒下來。
+    (檔案不存在是另一回事:那是過渡期的正常狀態,見上面的 FileNotFoundError。)
+
+    純標準庫、best-effort;寫不進去也不能擋住開機。
+    """
+    try:
+        import datetime
+        _line = ("%s [%s] ★version_pointer 載入失敗(%s)→ 退回舊的 "
+                 "<app>\\src★ 這一輪【不是】新版本"
+                 % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    _PROGRAM, why))
+        with open(os.path.join(_HERE, "version_pointer.log"), "a",
+                  encoding="utf-8") as _f:
+            _f.write(_line + chr(10))
+    except Exception:  # noqa: BLE001  留不下紀錄也不能擋住開機
+        pass
+
+
 def _resolve_src():
     """[批次L L1] 讀 `current.txt` 決定要載入哪一棵 src。
 
@@ -22,16 +47,37 @@ def _resolve_src():
     根目錄進了 sys.path 就會永久參與所有 import 解析。
     """
     fallback = os.path.join(_HERE, "src")
+    _p = os.path.join(_HERE, "version_pointer.py")
+    # ★[外審] 只有【這個檔不存在】才是安靜的正常狀態★
+    #   ① 用 `except FileNotFoundError` 包住整段是錯的:resolver 存在但
+    #      執行時自己去開別的檔失敗,丟的也是 FileNotFoundError ——
+    #      一個【壞掉的】resolver 會被當成【還沒送到】而靜默跑舊版。
+    #   ② 改用 `isfile()` 也不對(外審第 2 輪):它對【同名目錄】、
+    #      【壞掉的連結】一律回 False —— 而那些正是【部署失敗的痕跡】,
+    #      卻同樣被當成「還沒送到」。★又把一個看得見的壞變成安靜的壞★。
+    #   ③ `os.stat()` 也還不夠(外審第 3 輪):它【會跟隨符號連結】——
+    #      一個壞掉的連結照樣丟 FileNotFoundError,於是又被當成
+    #      「還沒送到」。而上面②才剛把壞連結歸類成部署失敗的痕跡。
+    #   所以用 `os.lstat()`:只有【目錄項目真的不存在】才安靜;
+    #   壞掉的連結能被 lstat 到 → 往下走、由載入器失敗、留下紀錄。
+    try:
+        os.lstat(_p)
+    except FileNotFoundError:
+        return fallback          # 這個檔還沒送到這台機器 —— 過渡期正常
+    except OSError as _e:
+        _note_resolver_failure(type(_e).__name__)
+        return fallback
     try:
         import importlib.util
-        _p = os.path.join(_HERE, "version_pointer.py")
         _spec = importlib.util.spec_from_file_location("_cmuh_version_pointer", _p)
         if _spec is None or _spec.loader is None:
+            _note_resolver_failure("spec_none")
             return fallback
         _mod = importlib.util.module_from_spec(_spec)
         _spec.loader.exec_module(_mod)
         return _mod.resolve_src(_HERE, _PROGRAM).src_dir
-    except Exception:  # noqa: BLE001  版本解析失敗絕不可以擋住開機
+    except Exception as _e:  # noqa: BLE001  版本解析失敗絕不可以擋住開機
+        _note_resolver_failure(type(_e).__name__)
         return fallback
 
 

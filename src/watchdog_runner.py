@@ -111,6 +111,31 @@ def _recover_incomplete_update() -> None:
         logging.debug("復原未完成更新失敗（不影響守護程式）", exc_info=True)
 
 
+def _migrate_scheduled_task_if_legacy() -> str:
+    """[2026-08-09 外審 P1-01] 把舊的排程改寫成走固定 `.pyw` 啟動器。
+
+    ★改 installer 不夠★ 已部署的電腦不會再跑一次安裝腳本,舊 task 會一直
+    指著 `src/watchdog_runner.py` —— 那條路不經 launcher,切版之後
+    **watchdog 永遠跑舊版**。所以每一輪 `--once` 都順手檢查一次。
+
+    ★這裡不可以擋住本輪的 watchdog 工作★ 改寫失敗就記 log 繼續跑;
+    但**不可以安靜**:失敗代表這台機器的 watchdog 之後仍是舊版。
+    """
+    try:
+        from cmuh_common import watchdog_task
+        result = watchdog_task.migrate_if_legacy(str(_ROOT))
+    except Exception:  # noqa: BLE001  遷移失敗不可以擋住 watchdog 本身
+        logging.warning("[watchdog-task] 排程遷移檢查失敗", exc_info=True)
+        return "error"
+    if result == watchdog_task.FAILED:
+        logging.error("[watchdog-task] ★排程仍指向 src/watchdog_runner.py★ "
+                      "→ 切版之後這台機器的 watchdog 會跑舊版")
+    elif result == watchdog_task.UNREADABLE:
+        logging.warning("[watchdog-task] 查不到排程現況 —— ★這不等於「已經是"
+                        "對的」★,下一輪再試")
+    return result
+
+
 def _run_once_via_core() -> int:
     """schtasks 每 2 分鐘呼叫 `python watchdog_runner.py --once`。
     委派給 watchdog_core 跑一輪 outer tick 即 exit。
@@ -125,6 +150,7 @@ def _run_once_via_core() -> int:
     #   排程把自己救回來的那些——根本走不到復原。而且要在 import watchdog_core
     #   之前做：那個模組正是可能被換到一半的東西。
     _recover_incomplete_update()
+    _migrate_scheduled_task_if_legacy()
     try:
         from cmuh_common import watchdog_core
         actions = watchdog_core.run_one_tick(mode="outer")

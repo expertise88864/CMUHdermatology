@@ -8064,8 +8064,13 @@ def _tray_configure(icon=None, item=None) -> None:
     """用獨立行程開啟設定視窗，常駐的托盤程式不中斷（先前用 restart 重啟，
     在某些情況下重啟後設定視窗沒出現，且托盤也消失了）。"""
     try:
+        # ★[外審 P2-01] 另開設定程式也要走固定 launcher★
+        #   版本化之後 `sys.argv[0]` 是 `versions/<V1>/src/consult_query.py`。
+        #   常駐的還是 V1、而 current.txt 已切到 V2 時,點「設定」會開出
+        #   【舊版的設定 UI】去寫【新版的 settings】—— 舊預設值覆寫新欄位。
+        from cmuh_common.paths import self_entry_path  # noqa: PLC0415
         launch_python_script(
-            os.path.abspath(sys.argv[0]),
+            self_entry_path(),
             args=["--configure"],
             cwd=get_app_dir(),
         )

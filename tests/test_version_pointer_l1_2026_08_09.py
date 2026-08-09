@@ -166,7 +166,10 @@ def test_there_are_six_stubs():
 def _stub_block(path):
     with open(path, encoding="utf-8") as fh:
         src = fh.read()
-    start = src.index("def _resolve_src():")
+    # ★區塊從 `_note_resolver_failure` 開始★（外審 P1-03 之後 resolver 會呼叫它）
+    #   只從 `_resolve_src` 開始擷取的話，exec 這段會 NameError —— 測到的是
+    #   我的擷取範圍，不是被測的行為。
+    start = src.index("def _note_resolver_failure(")
     end = src.index("_SRC = _resolve_src()", start)
     return src[start:end]
 
@@ -324,7 +327,11 @@ def test_restart_goes_through_the_fixed_launcher(versioned, monkeypatch):
     後者結尾會 `os._exit()` —— 在測試裡呼叫它會【殺掉整個 pytest 行程】
     （我第一版就是這樣寫的：輸出停在 `FF.F` 之後什麼都沒有）。
     """
-    _app, entry, launcher, _r = versioned
+    app, entry, launcher, _r = versioned
+    # ★[外審 P2] 兩個值是【一組】的★ 這條測試原本只設 LAUNCHER_ENV，
+    #   把「沒有可信的根也接受 launcher」這個缺陷【釘成了通過條件】——
+    #   守衛後來改成 fail-closed 時，紅的是這條測試而不是程式。
+    monkeypatch.setenv(cpaths.APP_DIR_ENV, str(app))
     monkeypatch.setenv(cpaths.LAUNCHER_ENV, str(launcher))
     cmd = cpaths.build_restart_command()
     assert str(launcher) in cmd, f"重啟走的不是固定啟動器：{cmd}"
@@ -448,3 +455,126 @@ def test_watchdog_root_lands_on_the_app_dir(tmp_path, monkeypatch):
     finally:
         monkeypatch.delenv(cpaths.APP_DIR_ENV, raising=False)
         importlib.reload(watchdog_core)
+
+
+# ── 外審 P1-03：resolver 自己壞掉不可以是靜默的 ───────────────────────────
+def _run_stub_block(path, app_dir):
+    src = _stub_block(path)
+    ns = {"os": os, "_HERE": str(app_dir), "_PROGRAM": "t"}
+    exec(src + chr(10) + "_SRC = _resolve_src()" + chr(10), ns)   # noqa: S102
+    return ns["_SRC"]
+
+
+@pytest.mark.parametrize("path", _STUBS, ids=lambda p: os.path.basename(p))
+def test_a_missing_pointer_module_stays_quiet(path, tmp_path):
+    """★過渡期的正常狀態★ 這個檔還沒送到這台機器 → 不留警告紀錄。"""
+    (tmp_path / "src").mkdir()
+    assert _run_stub_block(path, tmp_path) == os.path.join(str(tmp_path), "src")
+    assert not os.path.exists(os.path.join(str(tmp_path), vp.LOG_NAME)), (
+        "檔案還沒送到就吵，久了 log 就沒人看")
+
+
+@pytest.mark.parametrize("path", _STUBS, ids=lambda p: os.path.basename(p))
+def test_a_broken_pointer_module_is_never_silent(path, tmp_path):
+    """★核心（外審 P1-03）★ resolver 自己壞掉 → 一定要留下紀錄。
+
+    我在 `version_pointer.py` 的文件裡寫著「『沒有指標』與『指標壞了』不可以
+    摺成一種」，然後在 stub 這一層把「resolver 載不進來」摺進了那個安靜的
+    正常狀態 —— **實際在跑舊版，而且沒有任何地方說得出來**，
+    人看到版本號沒變只會以為更新還沒下來。宣稱與實作不符，而且是我自己的原則。
+    """
+    (tmp_path / "src").mkdir()
+    (tmp_path / "version_pointer.py").write_text(
+        "def resolve_src(  # 括號沒關 → 語法錯", encoding="utf-8")
+    assert _run_stub_block(path, tmp_path) == os.path.join(str(tmp_path), "src")
+    log = os.path.join(str(tmp_path), vp.LOG_NAME)
+    assert os.path.exists(log), "★resolver 壞掉卻一個字都沒留★"
+    text = open(log, encoding="utf-8").read()
+    assert "載入失敗" in text and "不是】新版本" in text, text
+
+
+@pytest.mark.parametrize("path", _STUBS, ids=lambda p: os.path.basename(p))
+def test_an_unwritable_log_still_starts(path, tmp_path):
+    """留不下紀錄也不能擋住開機（六支程式的共同單點）。
+
+    ★用真實的檔案系統條件，不要攔 `builtins.open`★
+    攔 `open` 會連 `exec_module` 讀原始碼那一步一起弄壞 —— 那樣測到的是
+    「import 機制被我打壞了」，不是「log 寫不進去」。這裡把 log 的路徑做成
+    一個【目錄】，開檔寫入必然失敗，而其餘一切照常。
+    """
+    (tmp_path / "src").mkdir()
+    (tmp_path / "version_pointer.py").write_text("raise RuntimeError()",
+                                                 encoding="utf-8")
+    (tmp_path / vp.LOG_NAME).mkdir()          # 同名目錄 → 寫入必然失敗
+    assert _run_stub_block(path, tmp_path) == os.path.join(str(tmp_path), "src")
+
+
+def test_a_launcher_without_a_trusted_root_is_rejected(versioned, monkeypatch):
+    """★[外審 P2] 守衛不可以 no-op★
+
+    `if root and ...` 在沒有（或無效的）`CMUH_APP_DIR` 時會把整個 containment
+    檢查跳過，於是【任何存在的檔】都被接受 —— 繼承來的陳舊值就能讓我們去
+    重啟別的程式，而 UAC 那條路還會把它提權。
+    """
+    app, entry, launcher, _r = versioned
+    monkeypatch.setenv(cpaths.LAUNCHER_ENV, str(launcher))
+    monkeypatch.delenv(cpaths.APP_DIR_ENV, raising=False)
+    assert cpaths.pinned_launcher() == "", "沒有可信的根卻接受了 launcher"
+    assert str(entry) in cpaths.build_restart_command(), "應該退回照舊行為"
+    monkeypatch.setenv(cpaths.APP_DIR_ENV, str(app / "不存在"))
+    assert cpaths.pinned_launcher() == "", "無效的根卻接受了 launcher"
+
+
+@pytest.mark.parametrize("path", _STUBS, ids=lambda p: os.path.basename(p))
+def test_a_resolver_raising_filenotfound_is_not_silent(path, tmp_path):
+    """★[外審 P1] 用 `except FileNotFoundError` 當「還沒送到」的判準是錯的★
+
+    resolver 存在、但執行時自己去開別的檔失敗，丟的也是 FileNotFoundError。
+    那樣一個【壞掉的】resolver 會被當成【還沒送到】，靜默跑舊版。
+    """
+    (tmp_path / "src").mkdir()
+    (tmp_path / "version_pointer.py").write_text(
+        "open('絕對不存在的檔案.txt')", encoding="utf-8")
+    assert _run_stub_block(path, tmp_path) == os.path.join(str(tmp_path), "src")
+    log = os.path.join(str(tmp_path), vp.LOG_NAME)
+    assert os.path.exists(log), (
+        "★resolver 壞掉卻被當成『還沒送到』而靜默★")
+    assert "FileNotFoundError" in open(log, encoding="utf-8").read()
+
+
+@pytest.mark.parametrize("path", _STUBS, ids=lambda p: os.path.basename(p))
+def test_a_directory_named_like_the_resolver_is_never_silent(path, tmp_path):
+    """★[外審第 2 輪] `isfile()` 把【部署失敗的痕跡】當成【還沒送到】★
+
+    同名目錄、壞掉的連結 —— `isfile()` 一律回 False。那些正是部署失敗留下的
+    東西，卻被摺進「這個檔還沒送到」那個安靜的正常狀態。
+    **又一次把看得見的壞變成安靜的壞**，而且是我上一輪的修法造成的。
+    """
+    (tmp_path / "src").mkdir()
+    (tmp_path / "version_pointer.py").mkdir()      # ← 同名目錄
+    assert _run_stub_block(path, tmp_path) == os.path.join(str(tmp_path), "src")
+    log = os.path.join(str(tmp_path), vp.LOG_NAME)
+    assert os.path.exists(log), (
+        "★同名目錄（部署失敗的痕跡）被當成『還沒送到』而靜默★")
+
+
+def test_the_existence_probe_does_not_follow_links():
+    """★[外審第 3 輪] `os.stat()` 會跟隨符號連結★
+
+    壞掉的連結照樣丟 `FileNotFoundError` → 又被當成「還沒送到」而靜默，
+    而註解才剛把壞連結歸類成【部署失敗的痕跡】。宣稱與實作不符。
+
+    ★這裡用結構性斷言，不做真的 symlink★ Windows 建 symlink 需要權限，
+    在沒有權限的機器上那條測試會 skip —— 一條會 skip 的測試守不住任何東西。
+    `lstat` vs `stat` 是這個修正的全部內容，直接釘住它。
+    """
+    import ast
+    for path in _STUBS:
+        tree = ast.parse(_stub_block(path))
+        probes = {n.func.attr for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                  and n.func.attr in ("stat", "lstat")}
+        assert "lstat" in probes, (
+            f"{os.path.basename(path)} 的存在性探測沒有用 lstat")
+        assert "stat" not in probes, (
+            f"{os.path.basename(path)} 仍在用會跟隨連結的 stat")
