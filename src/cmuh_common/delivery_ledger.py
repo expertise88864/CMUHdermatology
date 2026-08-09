@@ -267,8 +267,22 @@ class DeliveryLedger:
                 _os.makedirs(_os.path.dirname(lock_path) or ".", exist_ok=True)
                 fh = open(lock_path, "a+b")
                 fh.seek(0)
-                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
-                locked = True
+                # ★[2026-08-10 CI] LK_LOCK 是「每秒 1 次、共 10 次」的輪詢★
+                #   對方若連續背靠背地持鎖(慢磁碟上每次 fsync 數百 ms、
+                #   幾十次連寫),等待方的 10 個整秒採樣點可能全部落在
+                #   「對方持鎖中」→ OSError → 掉進下面的 fail-open 無鎖寫入
+                #   → 互相覆蓋(CI 的 IPC 測試就是這樣紅的)。
+                #   有界重試 + 依 pid 錯開的小睡,打散輪詢相位;三輪都失敗
+                #   才 fail-open(語意不變:寧可可能覆蓋,不要一定丟失)。
+                for _attempt in range(3):
+                    try:
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                        locked = True
+                        break
+                    except OSError:
+                        if _attempt == 2:
+                            raise
+                        time.sleep(0.2 + (_os.getpid() % 5) * 0.13)
             except ImportError:
                 logging.debug("[delivery] 非 Windows 環境 → 沒有跨 process 檔案鎖")
             except Exception:

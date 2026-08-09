@@ -251,9 +251,14 @@ def test_review_markers_do_not_claim_a_future_date():
     「不得晚於今天」，不是某一個當時剛好在未來的字面值。
     """
     import re
-    from datetime import date
+    from datetime import date, datetime, timedelta, timezone
 
-    today = date.today()
+    # ★[2026-08-10] 比對基準是【台灣的今天】,不是主機的今天★
+    #   這個 repo 的日期慣例(版本號、review 標記)一律是台灣時間。
+    #   CI runner 是 UTC:台灣的每天 00:00–08:00,當天的正常標記在 CI 上
+    #   會被 `date.today()` 判成「未來」→ 全綠的本機、紅的 CI。
+    #   守衛要驗的性質是「不得宣稱未來」,基準就要用 repo 自己的時區。
+    today = (datetime.now(timezone.utc) + timedelta(hours=8)).date()
     iso = re.compile(r"\b(20\d{2})-(\d{2})-(\d{2})\b")
     root = os.path.join(os.path.dirname(__file__), "..", "src")
     bad = []

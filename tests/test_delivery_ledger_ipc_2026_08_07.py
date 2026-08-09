@@ -208,3 +208,58 @@ class TestEveryDeliveryReachesATerminalState:
                     kinds |= {kw.arg for kw in n.keywords}
         assert {"unknown", "failed"} <= kinds, (
             f"★確定失敗與結果不明沒有分開★ 只看到 {kinds}")
+
+
+class TestLockAcquisitionRetries:
+    """★[2026-08-10 CI] LK_LOCK 是「每秒 1 次、共 10 次」的輪詢★
+
+    對方連續背靠背持鎖（慢磁碟 fsync 數百 ms × 幾十次連寫）時，等待方的
+    10 個整秒採樣點可能全部落在「對方持鎖中」→ OSError → fail-open 無鎖
+    寫入 → 互相覆蓋。鎖要有界重試把輪詢相位打散；三輪都失敗才 fail-open
+    （語意不變：寧可可能覆蓋，不要一定丟失）。
+    """
+
+    @staticmethod
+    def _led(tmp_path):
+        return DeliveryLedger(path=str(tmp_path / "l.json"))
+
+    def test_a_transient_lock_failure_is_retried(self, tmp_path, monkeypatch):
+        import msvcrt
+        calls = {"n": 0}
+        real = msvcrt.locking
+
+        def _flaky(fd, mode, nbytes):
+            if mode == msvcrt.LK_LOCK:
+                calls["n"] += 1
+                if calls["n"] <= 2:
+                    raise OSError("鎖被佔住(前兩次)")
+            return real(fd, mode, nbytes)
+
+        monkeypatch.setattr(msvcrt, "locking", _flaky)
+        monkeypatch.setattr(
+            "cmuh_common.delivery_ledger.time.sleep", lambda s: None)
+        led = self._led(tmp_path)
+        with led._interprocess_lock():
+            pass
+        assert calls["n"] == 3, f"★暫時性的鎖失敗沒有被重試★:{calls['n']}"
+
+    def test_three_failures_still_fail_open(self, tmp_path, monkeypatch,
+                                            caplog):
+        """★反方向★ 重試不可以變成永遠等（fail-open 的語意要保留）。"""
+        import logging as _lg
+
+        import msvcrt
+
+        def _always(fd, mode, nbytes):
+            if mode == msvcrt.LK_LOCK:
+                raise OSError("永遠鎖不到")
+
+        monkeypatch.setattr(msvcrt, "locking", _always)
+        monkeypatch.setattr(
+            "cmuh_common.delivery_ledger.time.sleep", lambda s: None)
+        led = self._led(tmp_path)
+        with caplog.at_level(_lg.WARNING):
+            with led._interprocess_lock():
+                pass                      # ★仍然要走得進來（fail-open）★
+        assert any("取不到帳本檔案鎖" in r.getMessage()
+                   for r in caplog.records), "fail-open 沒有留下警告"
