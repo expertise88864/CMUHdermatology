@@ -17,6 +17,26 @@ import os
 import sys
 
 
+#: ★[批次L L1] 由六支 `.pyw` 啟動器釘住的固定值★（見 `get_app_dir` / `restart_self`）
+#:   啟動器是固定路徑、切版本救不回來的檔;它們知道真正的 app 根目錄與自己的路徑。
+APP_DIR_ENV = "CMUH_APP_DIR"
+LAUNCHER_ENV = "CMUH_LAUNCHER"
+
+
+def pinned_app_dir() -> str:
+    """啟動器釘住的固定 app 根目錄;沒釘住／釘到不存在的目錄 → 回空字串。
+
+    ★單一讀取點★ `get_app_dir()`、watchdog 兩支都走這裡 —— 驗證邏輯只寫一次,
+    不會有「某一處忘了驗存在」那種漂移。
+    """
+    import os as _os
+    v = _os.environ.get(APP_DIR_ENV, "").strip()
+    if not v:
+        return ""
+    v = _os.path.abspath(v)
+    return v if _os.path.isdir(v) else ""
+
+
 def is_frozen() -> bool:
     """是否在 PyInstaller 打包後的 .exe 模式下執行。"""
     return getattr(sys, 'frozen', False)
@@ -42,6 +62,19 @@ def get_app_dir() -> str:
     if is_frozen():
         return os.path.dirname(os.path.abspath(sys.executable))
 
+    # ★[批次L L1 外審 P1] 固定的 app 根目錄由【啟動器】釘住★
+    #   `runpy.run_path` 會把 `sys.argv[0]` 換成被執行的那支檔（CPython 的
+    #   `_ModifiedArgv0`）。版本化之後那是 `<app>/versions/<V>/src/main.py`,
+    #   於是下面「src 的父層」推出來的是 `<app>/versions/<V>` —— settings、
+    #   log、assets 全部會跑到版本目錄底下，而設計明訂 settings 不隨版本走。
+    #   後果:切一次版就等於「所有設定都不見了」（帳密、門檻、已寄紀錄）。
+    #   六支 `.pyw` 是固定路徑，它們知道真正的根目錄 → 由它們釘進環境變數;
+    #   子行程繼承得到（watchdog 啟動的那些也算）。
+    #   ★只信「真的存在的目錄」★ 讀不到就往下走既有的推導，不可以因為一個
+    #   壞掉的環境變數讓整支程式找不到設定。
+    pinned = pinned_app_dir()
+    if pinned:
+        return pinned
     main_script = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else __file__
     script_dir = os.path.dirname(main_script)
 
@@ -160,6 +193,32 @@ def sweep_old_restart_err_files(tmpdir: str,
     return removed
 
 
+def build_restart_command(extra_args=None) -> list:
+    """組出「重新啟動自己」的命令列。★抽成純函式是為了測得到★
+
+    `restart_self()` 結尾會 `os._exit()` —— 在測試裡呼叫它會【殺掉整個 pytest
+    行程】（我第一版就是這樣寫的，輸出直接被截斷）。真正要釘住的性質只有
+    「組出來的是哪一條命令」，所以把它抽出來。
+
+    ★[批次L L1 外審 P1] 重啟要走【固定的啟動器】，不是目前這支源碼★
+    `runpy.run_path` 會把 `sys.argv[0]` 換成被執行的那支檔（CPython 的
+    `_ModifiedArgv0`）。版本化之後那是 `versions/<V1>/src/xxx.py` —— 直接拿它
+    重啟，新行程仍然跑 V1，而且【完全不會再讀一次 `current.txt`】:
+    更新之後的重啟會永遠停在舊版（而且可能一直重試）。
+    走 `.pyw` 啟動器才會重新解析指標，也才會重跑開機復原。
+    ★只信真的存在的檔★ 沒釘住（過渡期、直接跑 src）就照舊行為。
+    """
+    args = list(extra_args) if extra_args else []
+    if is_frozen():
+        return [sys.executable] + args
+    launcher = os.environ.get(LAUNCHER_ENV, "").strip()
+    if launcher:
+        launcher = os.path.abspath(launcher)
+        if os.path.isfile(launcher):
+            return [sys.executable, launcher] + args
+    return [sys.executable, os.path.abspath(sys.argv[0])] + args
+
+
 def restart_self(extra_args=None, hard_exit_code=None,
                  on_confirmed=None) -> None:
     """雙軌重啟。
@@ -192,11 +251,7 @@ def restart_self(extra_args=None, hard_exit_code=None,
     import subprocess
     import logging
 
-    args = list(extra_args) if extra_args else []
-    if is_frozen():
-        cmd = [sys.executable] + args
-    else:
-        cmd = [sys.executable, os.path.abspath(sys.argv[0])] + args
+    cmd = build_restart_command(extra_args)
 
     # Windows: DETACHED_PROCESS=0x08, CREATE_NEW_PROCESS_GROUP=0x200
     # 讓新進程完全脫離父 console / process group，舊 process 退出不影響。

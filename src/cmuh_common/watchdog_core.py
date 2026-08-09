@@ -27,13 +27,20 @@ from pathlib import Path
 
 from cmuh_common.atomic_io import (atomic_write_json, safe_load_json,
                                    safe_load_json_ex)
+from cmuh_common.paths import pinned_app_dir
 from cmuh_common.process_launch import launch_python_script
 from cmuh_common.update_policy import suspend_auto_updates
 
 # ─── 路徑 ────────────────────────────────────────────────────────────────
 _HERE = Path(__file__).resolve().parent
 # repo root：src/cmuh_common/.. = src，..再上一層 = root
-_ROOT = _HERE.parent.parent
+# ★[批次L L1 外審第 2 輪 P1] 版本化之後 `__file__` 推不出根目錄★
+#   版本化時這支檔在 `<app>/versions/<V>/src/cmuh_common/`,推出來的是
+#   `<app>/versions/<V>` —— 於是 watchdog 讀到【另一份】設定與鎖，
+#   而且到版本目錄底下找六支 `.pyw`(那裡沒有)。
+#   ★後果是 watchdog 再也救不回任何一支臨床程式★,而它正是最後一道防線。
+#   啟動器釘住的值優先;沒釘住(過渡期、直接跑 src)就照舊。
+_ROOT = Path(pinned_app_dir() or _HERE.parent.parent)
 SETTINGS_DIR = _ROOT / "settings"
 CONFIG_PATH = SETTINGS_DIR / "watchdog_config.json"
 LOCK_DIR = SETTINGS_DIR / ".watchdog_locks"

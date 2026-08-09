@@ -20,13 +20,19 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import os
 import sys
 import time
 from pathlib import Path
 
 # ─── 路徑 + sys.path（讓 import cmuh_common 起作用） ──────────────────────
 _HERE = Path(__file__).resolve().parent
-_ROOT = _HERE.parent
+# ★[批次L L1 外審第 2 輪 P1] 同上：版本化之後 `__file__` 推不出根目錄★
+#   這一段跑在 `cmuh_common` 可以 import 之前（下面才 sys.path.insert），
+#   所以直接讀環境變數。★字串必須與 `paths.APP_DIR_ENV` 一致★（有測試釘住）。
+_PINNED_ROOT = os.environ.get("CMUH_APP_DIR", "").strip()
+_ROOT = (Path(os.path.abspath(_PINNED_ROOT))
+         if _PINNED_ROOT and os.path.isdir(_PINNED_ROOT) else _HERE.parent)
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 

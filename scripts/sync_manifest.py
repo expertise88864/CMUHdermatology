@@ -62,6 +62,10 @@ def collect_entries(version: str) -> list:
     # 只列「純文字」可被 updater 處理的檔案。binary 圖示 (.ico/.png) 不放這
     # 裡（updater 走 text 路徑會 UTF-8 decode 失敗）。
     extra_files = [
+        # ★[批次L L1] 版本指標解析器★ 六支 .pyw 會用 spec_from_file_location
+        #   直接讀它。★沒放進 extras 的話它永遠不會送到診間★ —— stub 每一次
+        #   都走 fallback，功能等於不存在（而且沒有任何地方會說出來）。
+        "version_pointer.py",
         # 啟動 shim（6 個 .pyw — 含守護程式）
         "中國醫皮膚科主程式.pyw",
         "中國醫皮膚科打卡程式.pyw",
