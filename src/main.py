@@ -158,6 +158,10 @@ from cmuh_common.alert_state import (
     same_pending_generation as _same_alert_pending_gen,
     records_for_save as _alert_records_for_save,
 )
+from cmuh_common.tk_stability import (
+    ThrottledExceptionLog as _ThrottledExceptionLog,
+    pump_log_records as _pump_log_records,
+)
 from cmuh_common.tk_widgets import (
     apply_calendar_slot_state as _apply_calendar_slot_state_to,
     config_if_changed as _config_if_changed,
@@ -1910,6 +1914,9 @@ def _flush_delivery_ledger_before_exit() -> None:
     except Exception:
         logging.debug("[delivery] 關閉前補寫寄送帳本失敗(忽略)", exc_info=True)
 
+
+# [2026-08-10 穩定性] 診間燈號迴圈例外的節流器(5 秒重排=不節流會洗版)
+_CLINIC_LOOP_THROTTLE = _ThrottledExceptionLog()
 
 _alert_reconciler = None
 _alert_reconciler_lock = threading.Lock()
@@ -10096,18 +10103,6 @@ class AutomationApp:
                     bg = "#FFF8E1"
                     fg = "#E65100"
 
-                frame = tk.Frame(notice, bg=bg, padx=12, pady=10)
-                frame.pack(fill="both", expand=True)
-                tk.Label(frame, text=title, bg=bg, fg=fg, font=("Microsoft JhengHei UI", 10, "bold"), anchor="w").pack(fill="x")
-                tk.Label(frame, text=message, bg=bg, fg=fg, justify="left", anchor="w", font=("Microsoft JhengHei UI", 9), wraplength=360).pack(fill="x", pady=(6, 0))
-                ttk.Button(frame, text="關閉", command=notice.destroy).pack(anchor="e", pady=(10, 0))
-
-                base_x = self.root.winfo_rootx() + self.root.winfo_width() - 420
-                base_y = self.root.winfo_rooty() + 80 + (len(self._active_notices) * 110)
-                notice.geometry(f"400x110+{max(base_x, 40)}+{max(base_y, 40)}")
-
-                self._active_notices.append(notice)
-
                 def cleanup():
                     if notice in self._active_notices:
                         self._active_notices.remove(notice)
@@ -10115,6 +10110,23 @@ class AutomationApp:
                         notice.destroy()
                     except Exception:
                         pass
+
+                frame = tk.Frame(notice, bg=bg, padx=12, pady=10)
+                frame.pack(fill="both", expand=True)
+                tk.Label(frame, text=title, bg=bg, fg=fg, font=("Microsoft JhengHei UI", 10, "bold"), anchor="w").pack(fill="x")
+                tk.Label(frame, text=message, bg=bg, fg=fg, justify="left", anchor="w", font=("Microsoft JhengHei UI", 9), wraplength=360).pack(fill="x", pady=(6, 0))
+                # ★[2026-08-10 穩定性] 關閉鈕必須走 cleanup，不是裸 destroy★
+                #   `command=notice.destroy` 不會把自己從 `_active_notices` 移掉：
+                #   每按一次就留一個死 Toplevel 在清單裡，而新通知的位置是
+                #   `len(_active_notices) * 110` —— 幾次之後通知全部疊到螢幕
+                #   外面，「熱鍵忙碌中」「更新失敗」這類提示變成永遠看不到。
+                ttk.Button(frame, text="關閉", command=cleanup).pack(anchor="e", pady=(10, 0))
+
+                base_x = self.root.winfo_rootx() + self.root.winfo_width() - 420
+                base_y = self.root.winfo_rooty() + 80 + (len(self._active_notices) * 110)
+                notice.geometry(f"400x110+{max(base_x, 40)}+{max(base_y, 40)}")
+
+                self._active_notices.append(notice)
 
                 notice.protocol("WM_DELETE_WINDOW", cleanup)
                 if auto_close_ms:
@@ -11381,6 +11393,32 @@ class AutomationApp:
 
 # --- [新增] 門診燈號更新迴圈 ---
     def _update_clinic_lights_loop(self):
+        """reg64 診間燈號輪詢的【駕駛座】：本體丟例外也不可以讓迴圈死掉。
+
+        ★[2026-08-10 穩定性] 這是自我重排的 after 迴圈★
+        本體有近 600 行、重排在最後一行 —— 任何一個例外（Tcl 在關閉瞬間、
+        設定檔壞掉、tracker 資料異常）都會讓「做事 → 重排」走不到重排，
+        整條 reg64 管線（燈號/浮動視窗/現場人數）**永久凍結**，而且在
+        pythonw 下完全無聲。所以：本體放 `_body`，例外時記 log（有節流，
+        別以每小時 720 條灌爆輪替）並以固定 5 秒重排，迴圈永遠活著。
+
+        ★不會重複排程★ 本體內部的重排全部都是「排完立刻 return」的
+        early-return；會走到這裡 except 的，必然還沒排過這一輪。
+        """
+        try:
+            self._update_clinic_lights_loop_body()
+        except Exception:
+            if getattr(self, "_shutting_down", False):
+                return
+            _CLINIC_LOOP_THROTTLE.log("主程式(_update_clinic_lights_loop)",
+                                      *sys.exc_info())
+            try:
+                self.clinic_loop_id = self.root.after(
+                    5_000, self._update_clinic_lights_loop)
+            except Exception:  # noqa: BLE001  root 已死 → 程式本身在收了
+                logging.debug("診間燈號迴圈重排失敗", exc_info=True)
+
+    def _update_clinic_lights_loop_body(self):
         if getattr(self, "_shutting_down", False):
             return
         if not hasattr(self, 'clinic_trackers'):
@@ -15176,21 +15214,13 @@ class AutomationApp:
                     self._log_backlog = self._log_backlog[-300:]
             elif not self.log_queue.empty():
                 had_work = True
-                try:
-                    self.log_text_widget.configure(state='normal')
-                    for _ in range(20):
-                        try:
-                            record = self.log_queue.get_nowait()
-                        except Empty:
-                            break
-                        self.log_text_widget.insert(tk.END, self.format_log_record(record) + '\n')
-                    line_count = int(self.log_text_widget.index('end-1c').split('.')[0])
-                    if line_count > 500:
-                        self.log_text_widget.delete('1.0', f'{line_count - 400}.0')
-                    self.log_text_widget.see(tk.END)
-                    self.log_text_widget.configure(state='disabled')
-                except Exception:
-                    logging.debug("Log 視窗更新失敗", exc_info=True)
+                # [2026-08-10 穩定性] 三支程式各寫一份 log 幫浦，其中兩份沒有
+                # 行數上限。統一走 cmuh_common.tk_stability（單筆格式化各自
+                # try、截 500 行、widget 例外不外洩）。
+                _pump_log_records(
+                    self.log_text_widget, self.log_queue,
+                    formatter=lambda r: self.format_log_record(r) + '\n',
+                    max_records=20, max_lines=500)
         except Exception:
             logging.debug("Log 輪詢失敗", exc_info=True)
 
@@ -16866,7 +16896,8 @@ if __name__ == "__main__":
     # consult_query / autoclock 三支也用同一份 handler。
     try:
         from cmuh_common.tk_exception import install_tk_exception_handler
-        install_tk_exception_handler(main_root)
+        # [2026-08-10 批次SA] handler 內部已改為節流實作(tk_stability)。
+        install_tk_exception_handler(main_root, program="主程式")
     except Exception:
         logging.debug("Tk callback exception hook 失敗", exc_info=True)
 

@@ -261,6 +261,11 @@ def main() -> None:
                      name="CoordUpdateChecker", daemon=True).start()
     try:
         root = tk.Tk()
+        # ★[2026-08-10 穩定性] 這支原本【什麼都沒裝】:pythonw 下
+        #   Tk 回呼例外印到不存在的 stderr = 完全無聲。走共用 API。
+        from cmuh_common.tk_exception import (  # noqa: PLC0415
+            install_tk_exception_handler)
+        install_tk_exception_handler(root, program="點座標偵測")
         try:
             from cmuh_common.window_icon import apply_tk_window_icon
             apply_tk_window_icon(root)

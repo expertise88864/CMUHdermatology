@@ -7762,7 +7762,7 @@ class ConfigApp(tk.Tk):
         # [v18 2026-05-25] 攔截 Tk callback 例外進 log (原本進 stderr 黑洞)
         try:
             from cmuh_common.tk_exception import install_tk_exception_handler
-            install_tk_exception_handler(self)
+            install_tk_exception_handler(self, program="會診查詢")
         except Exception:
             logging.debug("Tk callback exception hook 失敗", exc_info=True)
         self.cfg = load_config()
@@ -7935,21 +7935,21 @@ class ConfigApp(tk.Tk):
                                     "請稍候至收件匣確認。")
 
     def _poll_log(self) -> None:
-        lines = []
-        for _ in range(LOG_POLL_MAX_RECORDS):
-            try:
-                rec = log_queue.get_nowait()
-                lines.append(
-                    f"{datetime.fromtimestamp(rec.created).strftime('%H:%M:%S')} "
-                    f"[{rec.levelname}] {rec.getMessage()}\n"
-                )
-            except queue.Empty:
-                break
-        if lines:
-            self.log_text.configure(state="normal")
-            self.log_text.insert(tk.END, "".join(lines))
-            self.log_text.see(tk.END)
-            self.log_text.configure(state="disabled")
+        """log 視窗幫浦。★[2026-08-10 穩定性] 兩個潛伏很久的問題★
+
+        ① 舊版沒有任何 try：`rec.getMessage()` 對格式錯誤的 log 呼叫
+           （`logging.warning("%d", "x")` 這種）是【在這裡】才爆的 ——
+           一筆壞紀錄就讓幫浦死掉、再也不重排，log 視窗從此凍結且無聲。
+        ② 舊版只插入、從不刪除：常駐數週後 Text widget 抱著幾十萬行。
+        改走共用的 `pump_log_records`（單筆各自 try、截 500 行）；
+        重排無條件執行。
+        """
+        try:
+            from cmuh_common.tk_stability import pump_log_records  # noqa: PLC0415
+            pump_log_records(self.log_text, log_queue,
+                             max_records=LOG_POLL_MAX_RECORDS)
+        except Exception:  # noqa: BLE001  幫浦壞掉也不可以殺掉重排
+            logging.debug("[UI] log 幫浦失敗", exc_info=True)
         self.after(150, self._poll_log)
 
 

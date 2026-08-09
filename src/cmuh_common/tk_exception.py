@@ -15,19 +15,46 @@ import logging
 from typing import Optional
 
 
+# ★[2026-08-10 批次SA] 單一真相來源★
+# 這個模組原本自己 logging.error(無節流)。批次SA 在 tk_stability 做了
+# 【每簽名節流】的實作(5 秒自我重排的迴圈一直炸 = 每小時 720 條完整
+# traceback,幾小時就把 5MB 輪替灌爆),第一版卻是【另外裝一套】——
+# 結果被這裡的舊 handler 蓋掉(外審抓到)。現在:舊 API 保留(四支程式
+# 的生產 root 都接在它上面),內部委派給節流實作;不再有第二套。
+_THROTTLED = None
+_PROGRAM_LABEL = ["Tk"]
+
+
+def _get_throttled():
+    global _THROTTLED
+    if _THROTTLED is None:
+        from cmuh_common.tk_stability import ThrottledExceptionLog
+        _THROTTLED = ThrottledExceptionLog()
+    return _THROTTLED
+
+
 def _report_callback_exception(*args) -> None:
-    """Tk override hook — 把 callback 例外寫進 logging instead of stderr。
+    """Tk override hook — callback 例外 → logging(有節流)。
 
     [IF-01] 用 *args 相容兩條指派路徑,否則 class-attr 路徑被呼叫必拋 TypeError、原始例外遺失:
       - 設成 instance attr(root.report_callback_exception=...)→ Tk 呼叫傳 (exc, val, tb) 3 個;
       - 設成 class attr(tk.Tk.report_callback_exception=...)→ 變 descriptor,instance 呼叫會綁定
         self → (self, exc, val, tb) 4 個。取最後三個即為 (exc, val, tb),兩路徑都不炸。
+
+    ★這個函式自己絕不可以拋★ 它是最後一道網。
     """
-    exc, val, tb = args[-3:]
-    logging.error("Uncaught Tk callback exception", exc_info=(exc, val, tb))
+    try:
+        exc, val, tb = args[-3:]
+        _get_throttled().log(_PROGRAM_LABEL[0], exc, val, tb)
+    except Exception:  # noqa: BLE001  最後一道網的失敗只能吞
+        try:
+            logging.error("Uncaught Tk callback exception(節流器自身失敗)")
+        except Exception:  # noqa: BLE001
+            pass
 
 
-def install_tk_exception_handler(root: Optional[object] = None) -> bool:
+def install_tk_exception_handler(root: Optional[object] = None,
+                                 program: str = "") -> bool:
     """安裝 Tk callback exception handler。
 
     root: 已建立的 Tk root instance (主程式 main_root / 設定視窗 self)。
@@ -35,8 +62,14 @@ def install_tk_exception_handler(root: Optional[object] = None) -> bool:
           (讓後續 Toplevel 自動繼承)。
           None → 只 patch class，給「import 時就先設好」場景用。
 
+    program: 程式名(進 log 用,例如「主程式」)。多支程式共用 class-attr
+             hook,標籤是全域的 —— 最後一個裝的贏;同一個 process 只有
+             一支程式,所以這樣就夠了。
+
     回傳：True 安裝成功，False 例外吞掉 (不阻擋呼叫端流程)。
     """
+    if program:
+        _PROGRAM_LABEL[0] = str(program)
     try:
         import tkinter as tk  # noqa: F401 — late import 避免無 Tk 環境炸
         if root is not None:

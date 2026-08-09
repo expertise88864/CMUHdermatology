@@ -66,6 +66,8 @@ def test_dnd_window_hardcoded_not_from_settings():
 
 
 def test_reg64_quiet_hours_unconditional():
-    src = __import__("inspect").getsource(main.AutomationApp._update_clinic_lights_loop)
+    # [2026-08-10] 迴圈拆成駕駛座+本體(例外不可殺迴圈);內容在本體。
+    src = __import__("inspect").getsource(
+        main.AutomationApp._update_clinic_lights_loop_body)
     assert "if _reg64_clinic_quiet_hours(now_gate):" in src, "reg64 應固定 00–07 暫停"
     assert "_monitor_night" not in src, "不應再依賴已移除的半夜監測開關"

@@ -462,7 +462,7 @@ def test_refresh_submit_rejection_restores_ui_state():
 
 def test_clinic_worker_submit_rejection_clears_running_flag():
     for rel_path in ("src/main.py",):
-        src = _function_source(ROOT / rel_path, "_update_clinic_lights_loop")
+        src = _function_source(ROOT / rel_path, "_update_clinic_lights_loop_body")
 
         assert "RejectedExecutionError" in src
         assert "clinic_future = self.bg_executor.submit(guarded_run_update, rooms_to_check)" in src
@@ -473,7 +473,7 @@ def test_clinic_worker_submit_rejection_clears_running_flag():
 def test_clinic_stat_submit_is_deduplicated_and_retries_rejected_closing_save():
     for rel_path in ("src/main.py",):
         full_src = (ROOT / rel_path).read_text(encoding="utf-8")
-        loop_src = _function_source(ROOT / rel_path, "_update_clinic_lights_loop")
+        loop_src = _function_source(ROOT / rel_path, "_update_clinic_lights_loop_body")
         submit_src = _function_source(ROOT / rel_path, "_submit_clinic_session_stat")
 
         assert "self._clinic_stat_pending_keys = set()" in full_src
@@ -521,7 +521,7 @@ def test_clinic_error_path_hides_no_clinic_room_only_when_network_proven_up():
     # 逐診間可達狀態:非 backoff(沒用 stale fallback)且非錯誤/逾時(cache 命中算可達);且必須
     # 在排任何「錯誤診間隱藏」callback 之前就把【所有診間】本輪可達設好(每輪逐診間覆寫),否則
     # UI 執行緒可能搶在 worker 設好前跑隱藏判斷,連不上的診間排在前面時讀到上一輪殘留(Codex r5 race)。
-    loop = _function_source(ROOT / "src/main.py", "_update_clinic_lights_loop")
+    loop = _function_source(ROOT / "src/main.py", "_update_clinic_lights_loop_body")
     assert "self._reg64_room_reachable[_room_pk] = (" in loop
     assert 'not _bs_pk and "錯誤" not in _st and "逾時" not in _st' in loop
     assert (loop.index("self._reg64_room_reachable[_room_pk]")
@@ -547,7 +547,7 @@ def test_refresh_entrypoint_reroutes_to_tk_thread():
 
 def test_clinic_polling_snapshots_tk_modes_before_background_work():
     for rel_path in ("src/main.py",):
-        src = _function_source(ROOT / rel_path, "_update_clinic_lights_loop")
+        src = _function_source(ROOT / rel_path, "_update_clinic_lights_loop_body")
         mode_read = "self.clinic_display_mode_vars[i].get()"
 
         assert src.count(mode_read) == 1
@@ -1257,7 +1257,7 @@ def test_morning_polling_and_residual_closed_guard_wired():
     assert "is_new_day" in src and "tracker['date'] = today_str" in src
     # Problem 2b:殘留盤面防呆(純函式判定),且必須在 tracker 統計被本輪 data 污染【之前】就蓋 pending
     assert "is_residual_stale_closed(" in src
-    run_src = _function_source(ROOT / "src" / "main.py", "_update_clinic_lights_loop")
+    run_src = _function_source(ROOT / "src" / "main.py", "_update_clinic_lights_loop_body")
     # 殘留判定要早於「current_completed_set 取自 data」(否則昨天的看診號會先被寫進今天 tracker)
     assert (run_src.index("is_residual_stale_closed(")
             < run_src.index("current_completed_set = data.get(")), "殘留防呆必須在 tracker 污染前"

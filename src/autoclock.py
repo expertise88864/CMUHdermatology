@@ -1810,7 +1810,7 @@ class ClockApp(tk.Tk):
         # [v18 2026-05-25] 攔截 Tk callback 例外進 log (原本進 stderr 黑洞)
         try:
             from cmuh_common.tk_exception import install_tk_exception_handler
-            install_tk_exception_handler(self)
+            install_tk_exception_handler(self, program="打卡程式")
         except Exception:
             logging.debug("Tk callback exception hook 失敗", exc_info=True)
         self.accounts = loaded_data
@@ -1989,22 +1989,17 @@ class ClockApp(tk.Tk):
             "內容只有 log 與錯誤摘要（帳號已遮蔽）；截圖與整頁原始碼刻意不放。")
 
     def poll_log_queue(self):
-        lines = []
-        for _ in range(LOG_POLL_MAX_RECORDS):
-            try:
-                record = log_queue.get_nowait()
-                msg = (
-                    f"{datetime.fromtimestamp(record.created).strftime('%H:%M:%S')} "
-                    f"[{record.levelname}]: {record.getMessage()}"
-                )
-                lines.append(msg + "\n")
-            except queue.Empty:
-                break
-        if lines:
-            self.log_text.configure(state="normal")
-            self.log_text.insert(tk.END, "".join(lines))
-            self.log_text.see(tk.END)
-            self.log_text.configure(state="disabled")
+        """log 視窗幫浦。★[2026-08-10 穩定性] 見 consult_query._poll_log★
+
+        舊版：無 try（一筆格式錯誤的 log 在 getMessage() 這裡爆 → 幫浦
+        死掉不再重排）、無行數上限（常駐數週 Text 抱著幾十萬行）。
+        """
+        try:
+            from cmuh_common.tk_stability import pump_log_records  # noqa: PLC0415
+            pump_log_records(self.log_text, log_queue,
+                             max_records=LOG_POLL_MAX_RECORDS)
+        except Exception:  # noqa: BLE001  幫浦壞掉也不可以殺掉重排
+            logging.debug("[UI] log 幫浦失敗", exc_info=True)
         self.after(100, self.poll_log_queue)
 
     def populate_listbox(self):
