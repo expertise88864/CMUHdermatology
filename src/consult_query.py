@@ -1081,7 +1081,7 @@ def settext_safe(hwnd: int, text: str) -> None:
         logging.debug("settext_safe 失敗", exc_info=True)
 
 
-def type_via_focus(edit_hwnd: int, top_hwnd: int, text: str) -> None:
+def type_via_focus(edit_hwnd: int, top_hwnd: int, text: str) -> bool:
     """讓 Delphi TEditExt 真正取得鍵盤焦點，再逐字 PostMessage WM_CHAR。
 
     隱藏桌面上 SetForegroundWindow 經常失敗、SetFocus 跟著失敗 → 帳密沒打進去
@@ -1090,7 +1090,12 @@ def type_via_focus(edit_hwnd: int, top_hwnd: int, text: str) -> None:
           焦點搶到該欄位（不動真實滑鼠，因為是直接送訊息給控制項，不經過
           系統 cursor）。對 Delphi 自訂編輯框最可靠。
       (2) SetForegroundWindow + SetFocus 最多重試 5 次並驗證 GetFocus。
-      (3) WM_CHAR 逐字輸入。"""
+      (3) WM_CHAR 逐字輸入。
+
+    → 回傳「焦點有沒有被確認落在該欄位」。★這是登入失敗時的第二個關鍵證據★
+    (2026-08-10 實機):HIS 跳出錯誤對話框 = 帳密真的送出去而被拒絕;
+    沒有任何對話框而登入視窗還在 = 很可能字根本沒打進欄位。
+    兩者的處置完全不同,而舊版把這個訊號只寫進 log、沒有帶進告警信。"""
     cur = ctypes.windll.kernel32.GetCurrentThreadId()
     tgt = win32process.GetWindowThreadProcessId(top_hwnd)[0]
     attached = False
@@ -1144,6 +1149,7 @@ def type_via_focus(edit_hwnd: int, top_hwnd: int, text: str) -> None:
             win32gui.PostMessage(edit_hwnd, win32con.WM_CHAR, ord(ch), 0)
             time.sleep(0.03)
         time.sleep(0.2)
+        return focus_ok
     finally:
         if attached:
             try:
@@ -2720,6 +2726,12 @@ def _wait_main_window_after_login(our_pids: set, *, visible_only: bool,
     clicks = 0
     last_notice_hwnd = None
     distinct_notices = set()
+    # ★[2026-08-10 實機 A01-11106-001]★ 登入途中的對話框寫了什麼要留下來 ——
+    #   那台連續失敗六小時,而診斷只留下「按了 1 次確認」,連是不是密碼錯誤
+    #   都分辨不出來。清空:診斷要講的是【這一輪】看到什麼。
+    # ★`visible_only=False` = SW_HIDE 後備模式★(隱藏桌面那條傳 True)——
+    #   那個模式的隱形執行緒會把對話框藏掉,「沒攔到」在那裡不是證據。
+    _reset_login_dialog_texts(stealth=not visible_only)
     # ★[2026-07-30 實機] 同一個通知按不掉就不要再按★
     #   實機是 200 次點擊全打在同一個 hwnd(整整 120 秒的預算),而那個視窗根本
     #   沒關掉。click_button 是純 PostMessage(BM_CLICK)、沒有回讀,而 Delphi 的
@@ -2760,7 +2772,7 @@ def _wait_main_window_after_login(our_pids: set, *, visible_only: bool,
         #   「確認」——disabled 的視窗不會處理點擊——120 秒的登入預算就這樣燒光。
         #   判準改用 Win32 的正規訊號(可見 + enabled + 不是內容視窗),
         #   不再猜對話框叫什麼 class。
-        if _dismiss_blocking_modals(pids=our_pids):
+        if _dismiss_blocking_modals(pids=our_pids, record_text=True):
             clicks += 1
             time.sleep(0.6)
             continue
@@ -2893,9 +2905,120 @@ def _bde_blocked(code: str, our_pids: set, clicks: int, last_notice,
                                      distinct_notices))
 
 
+# ══ 登入階段對話框的文字（2026-08-10 實機 A01-11106-001）═════════════════
+#
+# ★為什麼原本不記,以及為什麼這一段是例外★
+# `_describe_windows_for_diag` 的既有原則是「只記 class 與旗標,不記任何視窗
+# 文字」—— 那是對的,因為登入之後畫面上就是病人清單。
+#
+# 但 2026-08-10 那台(A01-11106-001)連續失敗六小時,診斷只留下
+#     「期間按了 1 次確認(不同通知視窗 0 個,最後一個 hwnd=None)」
+# 這一行的意思是:那一下按的不是「登入後訊息通知」,而是
+# `_dismiss_blocking_modals` 在登入途中抓到、按掉之後就消失的一個對話框。
+# ★那個對話框寫了什麼,是整件事最有價值的一行字,而我們把它丟掉了★ ——
+# 於是只能在「密碼被改過」「帳號被鎖」「帳密沒打進欄位」之間用猜的。
+#
+# ★邊界(結構上保證,不是靠紀律)★
+# 只有 `_wait_main_window_after_login` 會傳 `record_text=True`,而那個函式
+# 【在主畫面可操作之前就會返回】:此刻 HIS 連主畫面都還沒交出來,更沒有送出
+# 任何查詢,畫面上不可能有病人資料。它能出現的只有認證/連線類訊息。
+# 會診單、主畫面、以及登入完成之後的任何路徑一律沿用舊原則(預設 False)。
+_LOGIN_DIALOG_TEXT_MAX = 200      # 單筆截斷(認證訊息很短;長的必然不是我們要的)
+_LOGIN_DIALOG_KEEP = 5            # 最多留幾筆(同一輪內)
+_login_dialog_texts: list = []    # [(class, text)]
+# 帳號/密碼欄位的焦點有沒有被確認。★這是【另一半】的證據★:
+#   有錯誤對話框 → 帳密真的送出去而被拒絕(去查密碼/鎖定);
+#   沒有對話框、焦點又沒確認 → 字很可能根本沒打進欄位(去查隱藏桌面的焦點)。
+#   舊版把這個訊號只寫進 log,沒有帶進告警信 —— 於是收到信的人分不出是哪一種。
+_login_focus_report: list = []    # [(欄位, 是否確認)]
+# 本輪登入跑在 SW_HIDE 後備模式嗎。★這會改變「沒攔到對話框」的意義★:
+#   那個模式的隱形執行緒每 80ms 就把新出現的視窗 SW_HIDE,而對話框偵測
+#   (`_blocking_dialogs`)只認【可見】的視窗 —— 於是「一個都沒攔到」在那裡
+#   完全不能當成「HIS 沒有跳訊息」的證據。不講清楚的話,這一批新加的那句
+#   「往『字沒打進欄位』的方向查」反而會把人指向錯的方向。
+_login_stealth_mode = [False]
+
+
+def _reset_login_dialog_texts(stealth: bool = False) -> None:
+    """每一次登入等待開始時清空 —— 診斷要講的是【這一輪】看到什麼。
+
+    ★只清對話框,不清焦點回報★:焦點是在【呼叫本函式之前】就打好的,
+    一起清掉的話那半邊證據永遠是空的。
+    """
+    _login_dialog_texts.clear()
+    _login_stealth_mode[0] = bool(stealth)
+
+
+def _note_login_focus(field: str, ok: bool) -> None:
+    """記下某個登入欄位的焦點有沒有被確認(每次登入覆寫,不累積)。"""
+    _login_focus_report[:] = [x for x in _login_focus_report if x[0] != field]
+    _login_focus_report.append((str(field), bool(ok)))
+
+
+def _note_login_dialog(hwnd: int, cls: str, buttons) -> None:
+    """記下一個【登入階段】對話框的文字（去重、截斷、有上限）。
+
+    去重不只是省空間:那個迴圈每 0.4 秒跑一次,不去重的話同一句話會把 log
+    洗掉(本檔已經因為這件事吃過兩次虧,見 `_reported_unknown_dialogs` 與
+    「已關閉訊息通知主畫面」的節流)。
+    """
+    try:
+        raw = call_with_timeout(lambda: _window_texts(hwnd), 3.0, default=[],
+                                name="login-dialog-text") or []
+    except Exception:
+        return
+    text = " / ".join(t.strip() for t in raw if t and t.strip())
+    text = " ".join(text.split())[:_LOGIN_DIALOG_TEXT_MAX]
+    if not text:
+        return
+    item = (str(cls), text)
+    if item in _login_dialog_texts:
+        return                          # 同一句只講一次
+    if len(_login_dialog_texts) >= _LOGIN_DIALOG_KEEP:
+        return                          # 到上限就不再收(不擠掉先出現的那幾筆)
+    _login_dialog_texts.append(item)
+    logging.warning(
+        "[login] ★登入途中出現對話框★ class=%s 按鈕=%s 內容=%r "
+        "—— 這是判斷「帳密被改/帳號被鎖/帳密沒打進去」的關鍵證據",
+        cls, [str(b) for b in (buttons or [])], text)
+
+
+def _login_dialog_digest() -> str:
+    """這一輪登入的證據摘要（★要排在診斷字串的最前面★）。
+
+    ★[外審 SG 第 1 輪 P1] 告警信只保留前 300 字★
+    `_note_job_failure` / `_send_failure_notice_async` 都是 `str(reason)[:300]`。
+    實機那封信光是「前言 + 視窗清單」就已經逼近上限 —— 這一批要送出去的東西
+    如果接在視窗清單後面,正好會被剪掉,整個修正等於沒做。
+    視窗清單是這串裡最不重要的部分,讓它去當被剪掉的那一段。
+    """
+    parts = []
+    if _login_stealth_mode[0]:
+        # 哪一種模式會改變後續判讀(後備模式是每輪完整登入,節奏也不同)。
+        parts.append("模式=SW_HIDE後備")
+    if _login_focus_report:
+        parts.append("輸入欄位焦點:" + "、".join(
+            f"{f}={'確認' if ok else '★未確認★'}"
+            for f, ok in _login_focus_report))
+    if _login_dialog_texts:
+        parts.append("登入途中的對話框:" + "、".join(
+            f"[{c}] {t}" for c, t in _login_dialog_texts))
+    else:
+        # ★「一個都沒有」在兩種模式下都算數★(外審 SG 第 2 輪 P2 修正之後):
+        #   隱形執行緒現在會【放過】擋路的對話框,不再把偵測要找的東西藏掉。
+        parts.append("登入途中沒有攔到任何對話框"
+                     "(帳密若被拒,HIS 通常會跳一個 —— 一個都沒有時,"
+                     "要往「字沒打進欄位」的方向查)")
+    return ";".join(parts) + ";"
+
+
 def _describe_windows_for_diag(our_pids: set, clicks: int, last_notice,
                                distinct_notices: set) -> str:
-    """逾時時把「當下看到什麼」寫清楚。只有 class/旗標,不含任何視窗文字內容。"""
+    """逾時時把「當下看到什麼」寫清楚。
+
+    視窗清單一律只有 class/旗標、不含文字內容;唯一的例外是登入階段收集到的
+    對話框文字(見上面那段說明的邊界)。
+    """
     try:
         seen = []
         for hwnd in find_windows(pids=our_pids, visible_only=False):
@@ -2909,8 +3032,11 @@ def _describe_windows_for_diag(our_pids: set, clicks: int, last_notice,
         detail = "、".join(seen[:12]) or "(列舉不到任何視窗)"
     except Exception:
         detail = "(視窗列舉失敗)"
-    return (f"期間按了 {clicks} 次「確認」(不同通知視窗 {len(distinct_notices)} 個,"
-            f"最後一個 hwnd={last_notice});當下看到的視窗:{detail}")
+    # ★證據在前、視窗清單在後★(外審 SG 第 1 輪 P1:告警信只留前 300 字)
+    return (_login_dialog_digest()
+            + f"期間按了 {clicks} 次「確認」"
+            f"(不同通知視窗 {len(distinct_notices)} 個,最後一個 hwnd={last_notice});"
+            f"當下看到的視窗:{detail}")
 
 
 # =============================================================================
@@ -3662,8 +3788,9 @@ def _cold_start_session_impl(cfg: dict, owner_token=None):
             key=lambda c: c[3][1])
         if len(edits) < 2:
             raise RuntimeError(f"登入視窗只找到 {len(edits)} 個輸入框")
-        type_via_focus(edits[0][0], login, username)
-        type_via_focus(edits[1][0], login, password)
+        # ★焦點有沒有真的落在欄位上,是登入失敗時的另一半證據★(2026-08-10 實機)
+        _note_login_focus("帳號", type_via_focus(edits[0][0], login, username))
+        _note_login_focus("密碼", type_via_focus(edits[1][0], login, password))
         confirm = find_child(login, "TButton", "確認")
         if not confirm:
             raise RuntimeError("找不到「確認」鈕")
@@ -3861,6 +3988,22 @@ _AFFIRMATIVE_CAPTIONS = ("確認", "確定", "OK", "Ok", "是", "繼續")
 _CLASS_SPECIFIC_CAPTIONS = {"TFMTimeOut_1": ("繼續使用",)}
 
 
+def _is_blocking_dialog(hwnd: int) -> bool:
+    """單一視窗:它是不是「擋路的對話框」(可見性另外判)。
+
+    ★抽出來是為了讓兩個地方【不可能各自漂移】★(外審 SG 第 2 輪 P2):
+    `_blocking_dialogs` 用它來【找】,`_run_with_sw_hide` 的隱形執行緒用它來
+    【放過】。兩邊若各寫一份判準,隱形執行緒就會把偵測要找的東西藏掉 ——
+    那正是這條 finding 的內容。
+    """
+    try:
+        if not win32gui.IsWindowEnabled(hwnd):
+            return False            # 自己都被擋住 → 它不是擋路的那個
+        return win32gui.GetClassName(hwnd) not in _CONTENT_CLASSES
+    except Exception:
+        return False
+
+
 def _blocking_dialogs(pids: set) -> list:
     """找出【正在擋住輸入】的對話框 → [(hwnd, class)]。
 
@@ -3884,22 +4027,25 @@ def _blocking_dialogs(pids: set) -> list:
         return out
     try:
         for hwnd in find_windows(pids=set(pids), visible_only=True):
+            if not _is_blocking_dialog(hwnd):
+                continue
             try:
-                if not win32gui.IsWindowEnabled(hwnd):
-                    continue            # 自己都被擋住 → 它不是擋路的那個
-                cls = win32gui.GetClassName(hwnd)
+                out.append((hwnd, win32gui.GetClassName(hwnd)))
             except Exception:
                 continue
-            if cls in _CONTENT_CLASSES:
-                continue
-            out.append((hwnd, cls))
     except Exception:
         logging.debug("[session] 列舉擋路對話框失敗", exc_info=True)
     return out
 
 
-def _dismiss_blocking_modals(sess=None, *, pids=None) -> int:
+def _dismiss_blocking_modals(sess=None, *, pids=None,
+                             record_text: bool = False) -> int:
     """把擋住輸入的對話框按掉 → 按了幾個。
+
+    `record_text=True` 只由 `_wait_main_window_after_login` 傳入 ——
+    ★那是唯一一條「主畫面都還沒交出來」的路徑★,畫面上不可能有病人資料
+    (邊界的完整說明見 `_note_login_dialog` 上方)。其餘所有呼叫端一律維持
+    「不記任何視窗文字」的既有原則,預設就是 False。
 
     ★[2026-08-05 實機事故]★ 主畫面被 modal 擋住時它是 disabled 的 ——
     **disabled 的視窗不會處理 WM_CLOSE**。所以「收尾關不掉主畫面」與「主畫面
@@ -3934,6 +4080,10 @@ def _dismiss_blocking_modals(sess=None, *, pids=None) -> int:
             continue
         wanted = _CLASS_SPECIFIC_CAPTIONS.get(cls, _AFFIRMATIVE_CAPTIONS)
         target = next((h for h, t in buttons if t in wanted), None)
+        if record_text:
+            # ★按掉之前就要記★ 按下去之後那個視窗通常就消失了 ——
+            #   2026-08-10 那台正是「按了一下、然後永遠不知道它寫什麼」。
+            _note_login_dialog(hwnd, cls, [t for _h, t in buttons])
         if target is None:
             # 同一個 class 只講一次:這個迴圈每 0.4 秒跑一次,不節流會把 log 洗掉
             # (2026-07-29 就發生過 1,568 行幾乎全是同一句的實機 log)。
@@ -4622,8 +4772,20 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
                 #   會被我們每 80 毫秒藏一次,他根本沒辦法用。
                 for h in find_windows(pids={spawned_root_pid},
                                       visible_only=True):
-                    if h not in stealth_skip:
-                        hide_window(h)
+                    if h in stealth_skip:
+                        continue
+                    # ★[外審 SG 第 2 輪 P2] 擋路的對話框【不藏】★
+                    #   藏掉的話,登入迴圈的 `_blocking_dialogs`(只認可見視窗)
+                    #   永遠看不到它 —— 於是認證錯誤訊息既不會被記下來、也不會
+                    #   被按掉,登入就這樣空等滿 120 秒,而診斷還會說「一個對話框
+                    #   都沒攔到」。★隱形執行緒把偵測要找的東西藏掉了★。
+                    #   代價是後備模式下那個對話框會短暫可見(它隨即會被按掉),
+                    #   而這條路本來就已經警告「可能短暫看到視窗」。
+                    #   ★這裡不新增任何點擊面★:判準與偵測共用同一個函式,
+                    #   而隱形執行緒本來就只掃我們自己 spawn 的那個 pid。
+                    if _is_blocking_dialog(h):
+                        continue
+                    hide_window(h)
             except Exception:
                 pass
             time.sleep(0.08)
@@ -4724,8 +4886,9 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
         )
         if len(edits) < 2:
             raise RuntimeError(f"登入視窗只找到 {len(edits)} 個輸入框（預期 2）")
-        type_via_focus(edits[0][0], login, username)
-        type_via_focus(edits[1][0], login, password)
+        # ★焦點有沒有真的落在欄位上,是登入失敗時的另一半證據★(2026-08-10 實機)
+        _note_login_focus("帳號", type_via_focus(edits[0][0], login, username))
+        _note_login_focus("密碼", type_via_focus(edits[1][0], login, password))
         confirm = find_child(login, "TButton", "確認")
         if not confirm:
             raise RuntimeError("登入視窗找不到「確認」鈕")
