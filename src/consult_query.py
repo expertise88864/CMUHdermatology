@@ -4995,6 +4995,58 @@ def _outlook_send_worker(image_path, subject, body, recipients, result,
             pass
 
 
+# ★[2026-08-10 批次SE #9] 上一條被放生的 Outlook COM worker★
+#
+# `worker.join(timeout)` 到期只是放棄等待 —— COM apartment、MailItem 與
+# 可能延遲送出的那封信都還活著。呼叫端正確地【不重試同一封】
+# (DeliveryOutcomeUnknown),但**後續不同的會診事件仍可各開一條新 worker**。
+# Outlook 忙線/跳安全提示是持續性的,於是 COM apartment 與 MailItem
+# 逐條堆積,長期可能拖垮 Outlook,並產生很晚才送達的舊通知。
+#
+# 與隱藏桌面 worker、IMAP check 同一套立場:上一條還卡著就不再疊加。
+# ★這條路徑只在 mail_method="outlook" 備援模式才會走到★
+_last_outlook_worker = None
+# ★[外審 SE 第1輪] 這個狀態轉移必須有自己的鎖★
+#   `send_via_outlook` 有【兩條各自 gate 的呼叫路徑】:一般會診寄送
+#   (`_flow_lock`)與托盤的測試信(`_test_email_gate`)—— 它們是不同的守衛,
+#   可以真的併行。沒有鎖的 check-then-set 會讓兩邊都看到 None、各開一條
+#   COM worker;而無條件的清除還會把【別人】還活著的引用清掉 →
+#   single-flight 形同虛設。(同一形狀本輪已在 win32_safe 犯過一次。)
+_outlook_worker_lock = threading.Lock()
+
+
+def _outlook_worker_occupies_slot(t) -> bool:
+    """這條 worker 還占不占位。
+
+    ★不可以只看 is_alive()★ 佔位發生在 `start()` 之前(檢查與佔位要在
+    同一個臨界區),而【還沒 start 的 thread】`is_alive()` 也是 False ——
+    併發窗內別條呼叫會把它當成死的而一起佔位,single-flight 又被繞過。
+    `ident is None` = 還沒 start = 仍占位;started 且不 alive 才是真結束。
+    (win32_safe 的放生上限踩過同一個坑,同一個修法。)
+    """
+    if t is None:
+        return False
+    return t.ident is None or t.is_alive()
+
+
+def _claim_outlook_worker(worker):
+    """原子地佔位。→ 佔到了嗎(False = 上一條還占著)。"""
+    global _last_outlook_worker
+    with _outlook_worker_lock:
+        if _outlook_worker_occupies_slot(_last_outlook_worker):
+            return False
+        _last_outlook_worker = worker
+        return True
+
+
+def _release_outlook_worker(worker):
+    """釋放佔位 —— ★只有當它還是我那一條時★(別清掉別人的)。"""
+    global _last_outlook_worker
+    with _outlook_worker_lock:
+        if _last_outlook_worker is worker:
+            _last_outlook_worker = None
+
+
 def send_via_outlook(image_path: Path, subject: str, body: str,
                      recipients: list, timeout: float = 120.0,
                      sender_account: str = "", html_body: str = "") -> None:
@@ -5016,15 +5068,33 @@ def send_via_outlook(image_path: Path, subject: str, body: str,
               html_body),
         name="OutlookSend", daemon=True,
     )
-    worker.start()
+    # ★[批次SE #9] 上一條放生的 COM worker 仍卡著 → 不疊加★
+    #   (Outlook 忙線/安全提示是持續性的;每個新事件再開一條 =
+    #    COM apartment 與 MailItem 堆積、很晚才送達的舊通知。)
+    #   ★檢查與佔位在同一個臨界區★(外審 SE 第1輪:兩條呼叫路徑各有各的
+    #   gate,可以真的併行 —— 沒鎖的 check-then-set 會讓兩邊都開一條)。
+    if not _claim_outlook_worker(worker):
+        raise DeliveryOutcomeUnknown(
+            "上一封 Outlook 寄信仍未結束(疑似 Outlook 忙線或跳安全提示)——"
+            "本封不再疊加新的 COM worker;結果不明,不自動重試以免重複寄出")
+    try:
+        worker.start()
+    except Exception:
+        # ★start 失敗要釋放佔位★ 否則這條永遠不會 alive、也永遠不被清掉,
+        #   Outlook 備援從此永久停擺(win32_safe 記過同一個坑)。
+        _release_outlook_worker(worker)
+        raise
     worker.join(timeout)
     if worker.is_alive():
+        # ★引用留著★ 下一封會看到它還活著而跳過(見上面的 single-flight)。
         # ★[外審第 6 輪 P1-07] 逾時的 worker 沒有被終止,它可能【稍後仍寄成功】★
         #   把這當成可重試錯誤的話,下一個 attempt 會啟動第二個 worker →
         #   兩個都 Send 成功 → 收件人收到兩封。結果不明就不得自動重試。
         raise DeliveryOutcomeUnknown(
             f"Outlook 寄信逾時（超過 {int(timeout)} 秒）——原 worker 可能仍在寄,"
             "不自動重試以免重複寄出;請檢查 Outlook 是否跳出安全提示或忙線")
+    # 正常結束 → 釋放佔位(只有還是我那一條時才清)
+    _release_outlook_worker(worker)
     if result.get("error"):
         raise result["error"]
     if not result.get("ok"):

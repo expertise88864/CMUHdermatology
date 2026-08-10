@@ -237,3 +237,131 @@ class TestHiddenWorkerSingleFlight:
         seg = _fn_src("consult_query.py", "run_consult_flow")
         assert "_HIDDEN_WORKER_TIMEOUT_SEC" in seg
         assert "t.join(timeout=240)" not in seg
+
+
+# ══ [批次SE #9] Outlook COM worker single-flight ══════════════════════════
+class TestOutlookWorkerSingleFlight:
+    """★外部第二意見 #9★ `join(timeout)` 到期只是放棄等待 —— COM
+    apartment、MailItem 與可能延遲送出的那封信都還活著。呼叫端正確地
+    不重試同一封，但**後續不同的會診事件仍可各開一條新 worker**。
+    Outlook 忙線／安全提示是持續性的 → COM apartment 逐條堆積。
+    （只在 mail_method="outlook" 備援模式才會走到。）
+    """
+
+    def setup_method(self):
+        cq._last_outlook_worker = None
+
+    teardown_method = setup_method
+
+    def test_a_live_previous_worker_blocks_a_new_send(self, monkeypatch):
+        release = threading.Event()
+        stuck = threading.Thread(target=lambda: release.wait(30), daemon=True)
+        stuck.start()
+        cq._last_outlook_worker = stuck
+        started = []
+        monkeypatch.setattr(cq, "_outlook_send_worker",
+                            lambda *a, **k: started.append(1))
+        try:
+            with pytest.raises(cq.DeliveryOutcomeUnknown, match="不再疊加"):
+                cq.send_via_outlook(None, "s", "b", ["a@x.tw"], timeout=1.0)
+            assert not started, "★上一條還卡著卻又開了一條 COM worker★"
+        finally:
+            release.set()
+            stuck.join(5)
+
+    def test_the_block_is_outcome_unknown_not_a_retryable_error(self):
+        """★不可以報成可重試的失敗★ 那會讓呼叫端重寄 → 重複寄出。"""
+        assert issubclass(cq.DeliveryOutcomeUnknown, Exception)
+        seg = _fn_src("consult_query.py", "send_via_outlook")
+        i = seg.index("_claim_outlook_worker(worker)")
+        assert "DeliveryOutcomeUnknown" in seg[i:i + 500]
+
+    def test_a_timed_out_worker_keeps_the_reference(self, monkeypatch):
+        release = threading.Event()
+        monkeypatch.setattr(cq, "_outlook_send_worker",
+                            lambda *a, **k: release.wait(30))
+        try:
+            with pytest.raises(cq.DeliveryOutcomeUnknown):
+                cq.send_via_outlook(None, "s", "b", ["a@x.tw"], timeout=0.1)
+            assert cq._last_outlook_worker is not None, (
+                "★逾時清掉引用 → 下一封照樣疊加★")
+            assert cq._last_outlook_worker.is_alive()
+        finally:
+            release.set()
+
+    def test_a_concurrent_burst_cannot_start_two_workers(self, monkeypatch):
+        """★外審 SE 第1輪★ 兩條呼叫路徑各有各的 gate(`_flow_lock` 與
+        `_test_email_gate`)—— 它們可以真的併行。沒鎖的 check-then-set
+        會讓兩邊都看到 None、各開一條 COM worker。"""
+        release = threading.Event()
+        entered = []
+        entered_lock = threading.Lock()
+
+        def _slow(image_path, subject, body, recipients, result,
+                  sender_account, html_body):
+            with entered_lock:
+                entered.append(1)
+            release.wait(30)
+
+        monkeypatch.setattr(cq, "_outlook_send_worker", _slow)
+        gate = threading.Event()
+        outcomes = []
+
+        def _caller():
+            gate.wait(10)
+            try:
+                cq.send_via_outlook(None, "s", "b", ["a@x.tw"], timeout=0.4)
+                outcomes.append("ok")
+            except Exception as e:               # noqa: BLE001
+                outcomes.append(type(e).__name__)
+
+        callers = [threading.Thread(target=_caller, daemon=True)
+                   for _ in range(8)]
+        try:
+            for c in callers:
+                c.start()
+            gate.set()                            # ★同時衝進去★
+            for c in callers:
+                c.join(15)
+            assert len(entered) <= 1, (
+                f"★併發下開出了 {len(entered)} 條 COM worker —— "
+                "檢查與佔位沒有原子化★")
+        finally:
+            release.set()
+
+    def test_a_stale_completion_does_not_clear_someone_elses_slot(self):
+        """★清除要有條件★ 無條件清除會把【別人】還活著的引用清掉。"""
+        release = threading.Event()
+        live = threading.Thread(target=lambda: release.wait(30), daemon=True)
+        live.start()
+        try:
+            cq._last_outlook_worker = live
+            other = threading.Thread(target=lambda: None, daemon=True)
+            cq._release_outlook_worker(other)     # 別人的 worker 完成了
+            assert cq._last_outlook_worker is live, (
+                "★別人完成時把還活著的那條清掉了 → single-flight 失效★")
+        finally:
+            release.set()
+            live.join(5)
+
+    def test_a_failed_start_releases_the_slot(self, monkeypatch):
+        """start 失敗的佔位永遠不會 alive、也不會被清 → 永久停擺。"""
+        def _boom(self):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(threading.Thread, "start", _boom)
+        with pytest.raises(RuntimeError):
+            cq.send_via_outlook(None, "s", "b", ["a@x.tw"], timeout=1.0)
+        monkeypatch.undo()
+        assert cq._last_outlook_worker is None, (
+            "★start 失敗的佔位沒釋放 → Outlook 備援永久停擺★")
+
+    def test_a_successful_send_clears_the_reference(self, monkeypatch):
+        def _ok(image_path, subject, body, recipients, result,
+                sender_account, html_body):
+            result["ok"] = True
+
+        monkeypatch.setattr(cq, "_outlook_send_worker", _ok)
+        cq.send_via_outlook(None, "s", "b", ["a@x.tw"], timeout=5.0)
+        assert cq._last_outlook_worker is None, (
+            "★正常寄完沒清引用 → Outlook 備援永久停擺★")
