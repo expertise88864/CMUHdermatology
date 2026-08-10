@@ -7,9 +7,47 @@ Tk 的 iconbitmap 在 Windows 常只套用 16x16，工作列/Alt+Tab 依 WM_SETI
 import ctypes
 import logging
 import os
+import threading
 import tkinter as tk
 
 from cmuh_common.icons import ensure_cmuh_app_icon_path
+
+# ★[2026-08-10 批次SD #8] 我們自己載的 HICON 要自己釋放★
+# `LoadImageW(..., LR_LOADFROMFILE)`(無 LR_SHARED)回傳的是 owned handle。
+# 舊版每次套用載 2 個、加上兩次延遲 redo = 每開一個視窗洩 6 個 USER 物件,
+# 高頻開縮寫編輯器等 Toplevel 會讓 handle 計數單向上升,最後建不出圖示/
+# 視窗/對話框。
+# ★只釋放【自己上一次載的】★ WM_SETICON 回傳的「前一個」可能是 Tk 自己
+# 管理的 handle(iconbitmap 也走 WM_SETICON)—— 摧毀別人的 handle 比洩漏
+# 更糟。所以用 per-hwnd 登記表:設好新的之後,釋放我們上一次為同一個
+# hwnd 載的那一對。
+_owned_icons: dict = {}          # hwnd -> (hicon_small, hicon_big)
+_owned_icons_lock = threading.Lock()
+_OWNED_ICONS_MAX = 64
+
+
+def _destroy_icons(*handles) -> None:
+    for h in handles:
+        if not h:
+            continue
+        try:
+            ctypes.windll.user32.DestroyIcon(h)
+        except Exception:
+            logging.debug("DestroyIcon 失敗(忽略)", exc_info=True)
+
+
+def _remember_owned(hwnd, small, big) -> None:
+    """登記這一輪載的 handle,並釋放上一輪為同一個 hwnd 載的。"""
+    with _owned_icons_lock:
+        prev = _owned_icons.pop(hwnd, None)
+        _owned_icons[hwnd] = (small, big)
+        if len(_owned_icons) > _OWNED_ICONS_MAX:
+            # 最舊的視窗多半早就 destroy 了 —— 釋放其 handle 後除名。
+            oldest = next(iter(_owned_icons))
+            old_pair = _owned_icons.pop(oldest)
+            _destroy_icons(*old_pair)
+    if prev:
+        _destroy_icons(*prev)
 
 
 def _apply_windows_wm_seticon_from_ico(root: tk.Misc, ico_path: str) -> None:
@@ -66,8 +104,11 @@ def _apply_windows_wm_seticon_from_ico(root: tk.Misc, ico_path: str) -> None:
             SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
         if hicon_big:
             SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_big)
+        # [批次SD #8] 設好新的 → 釋放我們上一輪為這個 hwnd 載的那一對。
+        _remember_owned(int(hwnd), hicon_small, hicon_big)
     except Exception as e:
         logging.debug("WM_SETICON 設定圖示失敗: %s", e)
+        _destroy_icons(hicon_small, hicon_big)
 
 
 def apply_tk_window_icon(root: tk.Misc) -> None:

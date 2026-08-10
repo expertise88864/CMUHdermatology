@@ -121,6 +121,43 @@ def upsert_session_stat(
     return out, True
 
 
+#: [2026-08-10 批次SD #10] 歷史列保留天數。
+#   這個檔原本【無上限成長】且每次更新都整檔載入-複製-重寫:常駐數月後
+#   每次診次更新的鎖持有時間、記憶體配置與磁碟寫入線性變慢。
+#   730 天遠大於目前產品年齡(現在是零行為差異),但讓成長有界;
+#   兩年前的診次對「歷來平均」的貢獻已是雜訊。
+HISTORY_RETAIN_DAYS = 730
+
+
+def prune_history_rows(history: list, *, today, retain_days: int = HISTORY_RETAIN_DAYS) -> list:
+    """丟掉超過保留期的列。★看不懂日期的列【保留】★
+
+    date 欄位格式是 "%Y/%m/%d"。解析不出來的列可能是舊格式或手改 ——
+    丟掉它等於安靜地改變歷史統計;保留的代價只是幾列垃圾。
+
+    ★[外審 SD 第1輪] 一定要【真的解析】,不可以用字串比對當替身★
+    第一版是 `len(d) == 10 and d < cutoff`:那是「可解析且很舊」的方便
+    述詞,但 `"2020-01-01"`(舊格式/手改)長度也是 10,而且字串序也小於
+    斜線格式的 cutoff(`-` 0x2D < `/` 0x2F)—— 於是它被靜靜刪掉,
+    正好違反這個函式自己寫下的契約。同一個病灶(便利述詞 ≠ 語意狀態)
+    這個 repo 已經記過好幾次。
+    """
+    from datetime import datetime, timedelta
+    cutoff_date = today - timedelta(days=int(retain_days))
+    out = []
+    for row in history:
+        d = str((row or {}).get("date") or "")
+        try:
+            parsed = datetime.strptime(d, "%Y/%m/%d").date()
+        except (TypeError, ValueError):
+            out.append(row)          # 解析不出來 → 保留(見上面的契約)
+            continue
+        if parsed < cutoff_date:
+            continue
+        out.append(row)
+    return out
+
+
 def remove_doctor_history(history: list, doc_name: str) -> list:
     """Return history rows excluding one doctor and malformed rows."""
     return [

@@ -98,6 +98,7 @@ from cmuh_common.clinic_history import (
     monthly_slot_metric_avgs as _history_monthly_slot_metric_avgs,
     prev_session_closing_clock as _history_prev_session_closing_clock,
     remove_doctor_history,
+    prune_history_rows as _prune_history_rows,
     upsert_session_stat,
 )
 from cmuh_common.platform_win import (
@@ -9476,7 +9477,32 @@ class AutomationApp:
         except Exception:
             pass
         try:
-            logging.shutdown()  # flush + close 所有 handler
+            # ★[2026-08-10 批次SD #7] 不可以呼叫 logging.shutdown()★
+            #   它會對每個 handler 拿 lock 再 close;若某條背景緒正持有
+            #   handler lock(正在 emit/rotation),這裡就【無限期等】——
+            #   視窗已經消失、單例已釋放,舊 process 卻變成看不見的殭屍;
+            #   使用者重開程式會出現兩個行程並存,「關掉重開」這條最重要的
+            #   人工恢復路徑反而失效。consult 的 _hard_exit 在 2026-05-22
+            #   就修過同一個坑:只做【非阻塞】flush,lock 拿不到就跳過,
+            #   反正下一行就 os._exit 了,close 不 close 沒有差別。
+            _root_logger = logging.getLogger()
+            for _h in list(_root_logger.handlers):
+                _hlock = getattr(_h, "lock", None)
+                _got = False
+                try:
+                    if _hlock is not None:
+                        _got = _hlock.acquire(blocking=False)
+                        if not _got:
+                            continue
+                    _h.flush()
+                except Exception:
+                    pass
+                finally:
+                    if _hlock is not None and _got:
+                        try:
+                            _hlock.release()
+                        except Exception:
+                            pass
         except Exception:
             pass
 
@@ -12682,6 +12708,10 @@ class AutomationApp:
             )
             if not changed:
                 return
+
+            # [2026-08-10 批次SD #10] 寫回前套保留期(730 天):
+            # 這個檔原本無上限成長,常駐數月後每次更新線性變慢。
+            history_data = _prune_history_rows(history_data, today=date.today())
 
             try:
                 _atomic_write_json(file_path, history_data)
