@@ -239,26 +239,42 @@ def test_tray_test_email_skips_duplicate_until_worker_finishes(monkeypatch):
 
 
 def test_exit_action_starts_only_one_shutdown_thread(monkeypatch):
-    targets = []
+    """按兩次「退出」只能有一條收尾緒（以及一個退場硬性期限）。
+
+    ★[2026-08-10 批次SF]★ `exit_action` 現在會先掛一個硬性期限
+    （`ConsultExitDeadline`）才做可能永久阻塞的收尾 —— 所以要數的是
+    【各自的名字】，不是 thread 總數：用總數的話，加一條保險絲就把測試
+    弄紅，而它想守的「不可以開兩條 shutdown」根本沒被驗到。
+    """
+    started = []
 
     class FakeThread:
         def __init__(self, *, target, name=None, daemon=None):
-            targets.append(target)
+            self.name = name
+            self.target = target
 
         def start(self):
-            pass
+            started.append((self.name, self.target))
 
     monkeypatch.setattr(consult_query, "_exit_started", False)
     monkeypatch.setattr(consult_query, "tray_icon_object", None)
     monkeypatch.setattr(consult_query.threading, "Thread", FakeThread)
     consult_query.running.set()
 
-    consult_query.exit_action()
-    consult_query.exit_action()
+    try:
+        consult_query.exit_action()
+        consult_query.exit_action()
 
-    assert len(targets) == 1
-    assert not consult_query.running.is_set()
-    consult_query.running.set()
+        names = [n for n, _t in started]
+        assert names.count("ConsultShutdown") == 1, names
+        assert names.count("ConsultExitDeadline") == 1, names
+        assert len(started) == 2, names
+        assert not consult_query.running.is_set()
+    finally:
+        # ★不論斷言過不過都要還原★ 這是全域狀態:上一版把還原寫在斷言之後,
+        #   斷言一紅就沒還原 → 之後每一個用到 `running` 的測試跟著紅
+        #   (實際發生過:1 個失敗變成 6 個)。
+        consult_query.running.set()
 
 
 def test_configure_mode_has_dedicated_single_instance_guard():

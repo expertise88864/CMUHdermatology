@@ -276,7 +276,7 @@ class TestATriggerSurvivesARestart:
         是與當下不符的資料(與 IMAP 的陳舊觸發信過濾同一個道理)。"""
         self._isolate(tmp_path, monkeypatch)
         cq._trigger_journal_add("42", "doc@x.tw")
-        data = cq._trigger_journal_pending()
+        data, _ok = cq._trigger_journal_pending()
         data["42"]["at"] = 0.0
         cq._trigger_journal_save(data)
         got = []
@@ -284,14 +284,14 @@ class TestATriggerSurvivesARestart:
                             lambda *a, **k: got.append(k))
         assert cq.resume_pending_triggers() == 0
         assert not got
-        assert not cq._trigger_journal_pending(), "過時的沒有被結案"
+        assert not cq._trigger_journal_pending()[0], "過時的沒有被結案"
 
     def test_a_finished_job_clears_the_journal_entry(self, tmp_path,
                                                     monkeypatch):
         self._isolate(tmp_path, monkeypatch)
         cq._trigger_journal_add("42", "doc@x.tw")
         cq._trigger_journal_done("42")
-        assert not cq._trigger_journal_pending()
+        assert not cq._trigger_journal_pending()[0]
 
     def test_the_scheduler_actually_resumes(self):
         """★接線★ 沒人呼叫的話,那些被標成已讀的觸發信就永遠消失了
@@ -358,7 +358,7 @@ class TestTheJournalNeverOverwritesOnReadFailure:
             "★讀不到卻照樣寫★ 會把既有待辦蓋掉")
         monkeypatch.undo()
         monkeypatch.setattr(paths, "get_settings_dir", lambda: str(tmp_path))
-        assert "1" in cq._trigger_journal_pending(), "既有待辦被蓋掉了"
+        assert "1" in cq._trigger_journal_pending()[0], "既有待辦被蓋掉了"
 
     def test_done_does_not_write_on_read_failure(self, tmp_path, monkeypatch):
         """結案也一樣:讀不到就不要寫。多補跑一次(重複一封)遠比把別人的
@@ -380,7 +380,7 @@ class TestTheJournalNeverOverwritesOnReadFailure:
         cq._trigger_journal_done("1")
         monkeypatch.undo()
         monkeypatch.setattr(paths, "get_settings_dir", lambda: str(tmp_path))
-        assert set(cq._trigger_journal_pending()) == {"1", "2"}
+        assert set(cq._trigger_journal_pending()[0]) == {"1", "2"}
 
 
 class TestARequeuedJobKeepsItsUid:

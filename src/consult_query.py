@@ -311,6 +311,30 @@ _DESKTOP_GENERIC_ALL = 0x10000000
 running = threading.Event()
 running.set()
 _flow_lock = threading.Lock()
+# ★[2026-08-10 批次SF] `_flow_lock` 卡住 = 會診查詢永久停擺,而且完全無聲★
+#   這把鎖是 non-blocking acquire,所以不會像 autoclock 的 clock_lock 那樣堆積
+#   等待中的緒 —— 它的失效模式更安靜:持鎖者永遠不釋放,之後【每一輪】都只印
+#   一行 INFO「已有任務進行中」然後跳過。heartbeat 照常、scheduler tick 照常、
+#   self-watchdog 也照常 —— 所有觀測點都說一切正常,而會診查詢再也不會執行。
+#   本檔 5719 行的註解早就寫著「ActiveTaskGate 45 分鐘會自癒,_flow_lock 不會」,
+#   卻從來沒有人在旁邊量它有沒有真的卡住。
+#
+#   ★可達路徑(不是理論)★ 休息時段(00-06)那條 `_session_close(...)` 是在
+#   【持鎖的工作緒】上跑的,而它會走到
+#     `_terminate_session_process` → `_close_session_windows`
+#     → `_dismiss_blocking_modals` → `enum_children` → raw `GetWindowText()`
+#   —— 那是【送 WM_GETTEXT 給目標視窗】,systemftp 凍結時永久不返回
+#   (本檔 1240 行與 win32_safe 的模組說明講的就是同一件事)。
+#   於是 `_do_full_job` 的 `finally: _flow_lock.release()` 永遠走不到。
+#
+#   對策與 autoclock 的 `bounded_clock_lock` 同一套:量持有時間,超過上限就
+#   升級成重啟 —— 重啟是唯一能終結 native-wedged thread 的手段。
+#   ★門檻要高於 gate 的 45 分鐘接管★:系統本來就認定超過 45 分鐘的工作已死,
+#   所以持鎖滿 60 分鐘的那一條不可能還在做有用的事。合法上限遠低於此
+#   (3 次 attempt × (240s 自動化 + 90s backoff + 60s SMTP) ≈ 20 分鐘)。
+_FLOW_LOCK_WEDGED_SEC = 3600.0
+_flow_lock_held_since = [0.0]          # monotonic;0.0 = 目前沒有人持有
+_flow_wedge_restart_requested = [False]
 # [2026-07-30 外審 P2-01] label 讓「逾時接管」的 warning 講得出是哪一支。
 _consult_job_gate = ActiveTaskGate(stale_after_sec=45 * 60, label="consult")
 _test_email_gate = ActiveTaskGate(stale_after_sec=10 * 60,
@@ -2542,6 +2566,26 @@ _last_hidden_worker = None
 #: 隱藏桌面 worker 的硬上限(秒)。
 _HIDDEN_WORKER_TIMEOUT_SEC = 240
 
+# ★[2026-08-10 批次SF #4] single-flight 把「資源爆炸」換成了「永久服務拒絕」★
+#
+#   ★這是批次SC(今天上午)那個修正自己開的洞,不是舊債★
+#   加了守衛之後的行為是:worker 卡在 raw `GetWindowText` 永不返回 →
+#   `_last_hidden_worker` 永遠 alive → 之後每一輪都拿得到 `_flow_lock`
+#   (它有正常釋放)、進來、被守衛擋掉、正常釋放鎖。於是:
+#     * 資源不再爆炸 ✓(守衛達成了它的目的)
+#     * 但會診查詢【永遠】不會再執行,而且 ★`_flow_lock` 卡死判定永遠不成立★
+#       —— 那道剛加的升級機制對這個情況完全無效(鎖每輪都好好地放掉了);
+#     * scheduler tick、heartbeat 一切正常。
+#   唯一能終結一條 native-blocked thread 的手段是【重啟行程】,而在守衛加上去
+#   之後,已經沒有任何一條路會走到重啟。
+#
+#   ★「一個修正的正確性不能只看它自己」★ —— 守衛必須自帶出口:
+#   放生滿這個上限就升級成重啟,讓外層 watchdog 換一個乾淨的行程來跑。
+#   上限取 1 小時:遠高於 240 秒的正常上限,而 HIS 若只是暫時忙,那條 worker
+#   自己的迴圈 deadline 到期就會結束並解除守衛(那時不會走到這裡)。
+_HIDDEN_WORKER_STRANDED_MAX_SEC = 3600.0
+_last_hidden_worker_since = [0.0]        # monotonic;0.0 = 目前沒有放生中的
+
 
 def _set_thread_desktop(hdesk) -> bool:
     """把目前執行緒切到指定桌面。回傳是否成功。"""
@@ -2580,10 +2624,26 @@ def run_consult_flow(trigger_label: str = "") -> tuple:
     global _last_hidden_worker
     prev = _last_hidden_worker
     if prev is not None and prev.is_alive():
+        # ★守衛自己要有出口★(批次SF #4)不然它只是把「資源爆炸」換成
+        #   「永久服務拒絕」——而且是連 `_flow_lock` 卡死判定都看不見的那種。
+        since = _last_hidden_worker_since[0]
+        stranded = (time.monotonic() - since) if since else 0.0
+        if since and stranded >= _HIDDEN_WORKER_STRANDED_MAX_SEC:
+            # ★不可以在這裡先 logging★(外審 SF 第 1 輪 P1-1)
+            #   handler lock 可能正被卡死的那條緒持有 —— 那樣連升級都做不到。
+            #   `_force_exit` 會先掛保險絲才去寫 log。
+            _force_exit(
+                f"放生的自動化 worker 已卡住 {stranded / 60.0:.0f} 分鐘"
+                "(raw GetWindowText 送給凍結的 systemftp,永遠不返回)。"
+                "守衛擋住了資源累積,但會診查詢也【永遠】不會再執行 —— "
+                "而且鎖每輪都正常釋放,流程鎖卡死判定對這個情況完全無效。"
+                "重啟行程是唯一能終結它的手段", code=1)
         logging.error(
             "[consult] 上一條 ConsultAutomationHidden 仍未結束(卡在凍結的"
-            " systemftp)→ 本輪不再開新的自動化(含 SW_HIDE 後備),避免累積"
-            " daemon thread、HDESK 與互相衝突的 HIS session")
+            " systemftp,已 %.0f 分鐘)→ 本輪不再開新的自動化(含 SW_HIDE 後備),"
+            "避免累積 daemon thread、HDESK 與互相衝突的 HIS session;"
+            "滿 %.0f 分鐘會強制重啟", stranded / 60.0,
+            _HIDDEN_WORKER_STRANDED_MAX_SEC / 60.0)
         raise RuntimeError(
             "上一輪自動化仍在執行(疑似 systemftp 凍結)，本輪略過")
 
@@ -2619,8 +2679,12 @@ def run_consult_flow(trigger_label: str = "") -> tuple:
         if t.is_alive():
             # ★引用留著★ 下一輪會看到它還活著而跳過,直到它自己的迴圈
             #   deadline 到期結束(那時 finally 會 CloseDesktop)。
+            # ★同時記下「從什麼時候開始放生」★(批次SF #4)守衛需要一個出口,
+            #   而出口要有年齡才量得出來。
+            _last_hidden_worker_since[0] = time.monotonic()
             raise RuntimeError("自動化執行超過 4 分鐘，已放棄（可能網路異常）")
         _last_hidden_worker = None      # 正常結束 → 不擋下一輪
+        _last_hidden_worker_since[0] = 0.0
         if result.get("error"):
             raise result["error"]
         return result["shot"]
@@ -4864,40 +4928,53 @@ def _prune_old_shots() -> None:
 # =============================================================================
 # 寄信（Outlook COM）
 # =============================================================================
+def _outlook_probe() -> bool:
+    """實際的 Outlook 可用性探測（在 worker 緒執行，自己 CoInitialize）。"""
+    import pythoncom          # noqa: PLC0415
+    pythoncom.CoInitialize()
+    try:
+        import win32com.client        # noqa: PLC0415
+        try:
+            win32com.client.GetActiveObject("Outlook.Application")
+            return True
+        except Exception:
+            pass
+        try:
+            win32com.client.DispatchEx("Outlook.Application")
+            return True
+        except Exception:
+            return False
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
 def _outlook_available(timeout: float = 5.0) -> bool:
     """快速檢查本機 Outlook 是否可用：能 GetActiveObject 或 DispatchEx 成功就回 True。
     用於「多台電腦只有一台登入 Outlook」情境——沒 Outlook 的機就靜默跳過排程，
-    不再啟動 systemftp、不寄信、不跳任何提示。"""
-    result: dict = {}
+    不再啟動 systemftp、不寄信、不跳任何提示。
 
-    def w() -> None:
-        import pythoncom
-        pythoncom.CoInitialize()
-        try:
-            import win32com.client
-            try:
-                win32com.client.GetActiveObject("Outlook.Application")
-                result["ok"] = True
-                return
-            except Exception:
-                pass
-            try:
-                win32com.client.DispatchEx("Outlook.Application")
-                result["ok"] = True
-            except Exception:
-                result["ok"] = False
-        finally:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
+    ★[2026-08-10 批次SF] 改走共用的 `call_with_timeout`★
+    舊版自己開 thread + `join(timeout)`,逾時就回 False —— 那條 worker 沒有被
+    取消,它【已經 CoInitialize 過】而且卡在 `DispatchEx` 裡。Outlook 忙線/跳
+    安全提示/正在修復是持續性的,於是:
 
-    t = threading.Thread(target=w, name="OutlookAvailCheck", daemon=True)
-    t.start()
-    t.join(timeout)
-    if t.is_alive():
-        return False
-    return bool(result.get("ok"))
+      * 每一輪 poll(2-3 分鐘)都再開一條 `OutlookAvailCheck` + 一個 COM
+        apartment,一天累積數百條,永遠不會收斂;
+      * ★而且它是 `send_via_outlook` 的【門】★ —— 批次SE 才剛給那邊加了
+        single-flight,但 Outlook 一卡住,`_do_full_job` 在這裡就 return 了,
+        根本走不到 SE 的守衛。把門留著漏,等於後面那道鎖沒有意義。
+
+    `call_with_timeout` 已經備齊這一組:有界等待、檢查與佔位同一個臨界區、
+    未 start 也算佔位、start 失敗釋放、同名上限(4 條)到頂就不再疊加。
+    ★不必再手寫第三份 single-flight★(本檔已經有兩份;`capture_window_image`
+    早就是這個寫法)。逾時/到頂一律回 `False` —— 探測不出來時 Outlook 對我們
+    來說就是不可用,語意正確。
+    """
+    return bool(call_with_timeout(_outlook_probe, timeout, default=False,
+                                  name="OutlookAvailCheck"))
 
 
 def _connect_outlook():
@@ -5654,6 +5731,29 @@ def _cleanup_orphan_systemftp() -> None:
         logging.warning("[CQ-05] systemftp 孤兒清掃失敗(略過,不影響啟動)", exc_info=True)
 
 
+def _note_flow_lock_skipped(trigger_label: str) -> None:
+    """本輪被 `_flow_lock` 擋下 —— 順便量【持鎖者卡了多久】。
+
+    ★這是這把鎖唯一的觀測點★ 被擋下來是它唯一會被外界看見的時刻;不在這裡量,
+    「持鎖者已經死了」這件事就永遠沒有人知道(見鎖定義處的說明)。
+    """
+    since = _flow_lock_held_since[0]
+    held = (time.monotonic() - since) if since else 0.0
+    logging.info("已有一個會診查詢任務進行中，本次（%s）略過(持鎖已 %.0f 分鐘)",
+                 trigger_label, held / 60.0)
+    if not since or held < _FLOW_LOCK_WEDGED_SEC:
+        return
+    if _flow_wedge_restart_requested[0]:
+        return                              # 已經要求過重啟,不重複
+    _flow_wedge_restart_requested[0] = True
+    # ★不可以在這裡先 logging★(外審 SF 第 1 輪 P1-1,理由見 `_force_exit`)
+    _force_exit(
+        f"會診查詢的流程鎖已被持有 {held / 60.0:.0f} 分鐘 → 判定持鎖者卡死"
+        "(多半卡在凍結的 systemftp 視窗:raw GetWindowText 永久不返回)。"
+        "這把鎖不會自癒 —— 放著不管的話之後每一輪都只是靜默略過,"
+        "而 heartbeat/tick 全部正常,沒有人會發現會診查詢已經停了", code=1)
+
+
 def _do_full_job(trigger_label: str, override_recipients=None, *,
                  from_retrigger: bool = False,
                  trigger_uids=(), requeued_out=None) -> None:
@@ -5688,7 +5788,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
         logging.warning("[delivery] 處理待補寄時出錯(不影響本輪查詢)",
                         exc_info=True)
     if not _flow_lock.acquire(blocking=False):
-        logging.info("已有一個會診查詢任務進行中，本次（%s）略過", trigger_label)
+        _note_flow_lock_skipped(trigger_label)
         # ★[2026-07-30 外審第 1 輪] email 觸發的要排隊補跑,不可直接丟掉★
         #   `trigger_job_async` 只在【gate 擋下】時排隊；gate 放行但 `_flow_lock`
         #   被佔住(例如 gate 逾時接管之後,舊 worker 還握著鎖)就整筆消失 ——
@@ -5724,6 +5824,9 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
     # [codex] 兩個哨兵缺一不可：pythoncom 只代表 import 成功,不代表 CoInitialize 成功。
     # CoInitialize 若拋例外(如 RPC_E_CHANGED_MODE——該緒早被別處初始化成別種 apartment)
     # 卻仍在 finally 呼叫 CoUninitialize,等於去拆別人的 apartment,之後該緒的 COM 會壞掉。
+    # ★[批次SF] 記下「從什麼時候開始持有」★ 這是被擋下的那一輪唯一能據以
+    #   判斷「持鎖者是不是已經死了」的證據(見 `_note_flow_lock_skipped`)。
+    _flow_lock_held_since[0] = time.monotonic()
     pythoncom = None
     com_initialized = False
     try:
@@ -6258,6 +6361,10 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                 pythoncom.CoUninitialize()
             except Exception:
                 pass
+        # ★清空必須在 release【之前】★ 反過來的話,下一條緒可能已經拿到鎖並
+        #   寫入自己的起始時間,我們接著把它抹成 0 —— 那條的持有時間就永遠
+        #   量不到,卡死判定對它完全失效。
+        _flow_lock_held_since[0] = 0.0
         _flow_lock.release()           # ★無論如何都要釋放（見上方鎖洩漏註解）
 
 
@@ -6674,13 +6781,52 @@ def _trigger_journal_done(uid: str) -> None:
             _trigger_journal_save(data)
 
 
-def _trigger_journal_pending() -> dict:
+def _trigger_journal_pending() -> tuple:
+    """→ (待辦, 讀得到嗎)。
+
+    ★[2026-08-10 批次SF #7] 「讀不到」必須傳下去★
+    上一版把 `_ok` 丟掉、只回 `data` —— 於是 journal 損毀/被鎖住時,開機補跑
+    看到的是一個空字典,結論是「沒有待辦」。而那些 uid 對應的觸發信【已經標成
+    \\Seen】,IMAP 再也掃不到它們:醫師的會診請求就這樣永久消失,而且開機
+    log 上完全正常。
+    `_trigger_journal_load` 早就把這件事分辨出來了(它自己的 docstring 就在講
+    這個病灶),只是這一層又把答案壓回成「空的」。
+    """
     with _trigger_journal_lock:
-        data, _ok = _trigger_journal_load()
-        return data
+        return _trigger_journal_load()
 
 
 _TRIGGER_JOURNAL_MAX_AGE_SEC = 6 * 3600.0
+
+
+def _alert_trigger_journal_unreadable() -> None:
+    """journal 讀不到 → 開發者告警（不會自己好的事情要讓人知道）。
+
+    ★沒有節流★:這只在【開機補跑】那一次呼叫,一次啟動最多一封。
+    """
+    body = ("開機補跑時讀不到會診觸發 journal"
+            f"（settings/{_TRIGGER_JOURNAL_NAME}）。\n\n"
+            "這代表:如果先前有醫師寄了觸發信、工作已登記但還沒做完,那幾筆\n"
+            "請求現在無法被補跑 —— 而對應的觸發信【已經標成已讀】,IMAP 不會\n"
+            "再掃到它們。醫師會乾等一個不會來的結果。\n\n"
+            "請確認該檔是否損毀、被防毒鎖住或權限有變;並請需要結果的醫師\n"
+            "重寄一次觸發信。")
+
+    def _worker():
+        try:
+            from cmuh_common.smtp_mail import send_mail  # noqa: PLC0415
+            send_mail(recipients=[str(x) for x in _developer_alert_recipients()],
+                      subject="會診自動化:觸發 journal 讀不到(可能遺失請求)",
+                      body=body, attachment_path=None, category="system")
+        except Exception:
+            logging.warning("[trigger] journal 讀不到的告警寄送失敗",
+                            exc_info=True)
+
+    try:
+        threading.Thread(target=_worker, name="ConsultJournalAlert",
+                         daemon=True).start()
+    except Exception:
+        logging.debug("[trigger] journal 告警執行緒啟動失敗", exc_info=True)
 
 
 def resume_pending_triggers() -> int:
@@ -6692,7 +6838,18 @@ def resume_pending_triggers() -> int:
     """
     n = 0
     now = time.time()
-    for uid, rec in list(_trigger_journal_pending().items()):
+    pending, readable = _trigger_journal_pending()
+    if not readable:
+        # ★不可以當成「沒有待辦」★(批次SF #7)那些觸發信已經是 \Seen,
+        #   IMAP 再也掃不到 —— 讀不到就是「可能有請求正在消失」,要說出來。
+        logging.critical(
+            "★開機補跑讀不到觸發 journal★ 可能有醫師的會診請求正在遺失"
+            "(對應的觸發信已標成已讀,IMAP 不會再掃到)。請檢查 settings 目錄下的"
+            " %s 是否損毀或被鎖住;修好之前,那幾筆請求需要請醫師重寄一次觸發信",
+            _TRIGGER_JOURNAL_NAME)
+        _alert_trigger_journal_unreadable()
+        return 0
+    for uid, rec in list(pending.items()):
         sender = str((rec or {}).get("sender") or "")
         age = now - float((rec or {}).get("at") or 0)
         if age > _TRIGGER_JOURNAL_MAX_AGE_SEC:
@@ -6850,6 +7007,48 @@ def _rebuild_schedule() -> None:
             "無法建立隱藏桌面 → 常駐登入停用,維持每 %d 分鐘冷啟動輪詢"
             "(SW_HIDE 後備;%02d:00-%02d:00 休息)", legacy,
             int(cfg.get("quiet_start_hour", 0)), int(cfg.get("quiet_end_hour", 6)))
+
+
+_FLAG_CLAIM_WARN_INTERVAL_SEC = 300.0
+_flag_claim_warned_at: dict = {}
+
+
+def _claim_flag_file(path) -> bool:
+    """把旗標檔【拿走】→ 這一次要求是不是我收到的。
+
+    ★[2026-08-10 批次SF #1]★ 舊寫法是
+        `if FLAG.exists(): try: FLAG.unlink() except OSError: pass` 然後照樣執行。
+    防毒鎖檔、唯讀屬性、ACL 變動時 `unlink()` 會【持續】失敗,而旗標還在 ——
+    於是排程迴圈的每一次 tick(0.5~5 秒)都把它當成一次全新的要求:
+
+      * `RUNNOW` → 每一輪都排一次完整 HIS 查詢 + 寄一封信。被 gate 擋下的
+        還會排進補跑佇列,做完再跑一次 —— 持續的 HIS 負載與寄信,
+        直到郵件配額耗盡。手動觸發【不看有沒有新會診】,所以每一封都寄得出去。
+      * `RELOAD` → 每一輪都 `schedule.clear()` + 重建。而重建會把輪詢 job 的
+        下次執行時間一併重設 —— 重建週期(≤5 秒)遠短於輪詢週期(162~198 秒),
+        ★輪詢 job 於是永遠不會到期、永遠不會執行★,而 log 上只有一行
+        「偵測到設定變更」在重複,看不出會診查詢已經停了。
+
+    「觀察到」不等於「取得」。取不走就不可以消費它 —— 而且要說出來
+    (節流,否則這行本身會把 log 洗掉)。
+    """
+    try:
+        os.unlink(str(path))
+        return True
+    except FileNotFoundError:
+        return False          # 別人(或上一次 tick)已經拿走了 → 不是我的
+    except OSError:
+        key = str(path)
+        now = time.monotonic()
+        last = _flag_claim_warned_at.get(key, 0.0)
+        if now - last >= _FLAG_CLAIM_WARN_INTERVAL_SEC:
+            _flag_claim_warned_at[key] = now
+            logging.error(
+                "★旗標檔刪不掉,本次要求【不執行】★:%s —— 刪不掉卻照做的話,"
+                "每一次排程 tick 都會重做一次(立即執行=不斷寄信;設定變更="
+                "排程被反覆重建,輪詢永遠不會觸發)。請確認防毒/唯讀屬性/權限",
+                key, exc_info=True)
+        return False
 
 
 def _empty_imap_result(err: str) -> dict:
@@ -7585,19 +7784,12 @@ def scheduler_loop() -> None:
         try:
             schedule.run_pending()
             # 「立即執行」旗標檔（由 --run-now 的第二個實例、或設定視窗寫入）
-            if RUNNOW_FLAG.exists():
-                try:
-                    RUNNOW_FLAG.unlink()
-                except OSError:
-                    pass
+            # ★要「取得」旗標才算收到要求★(批次SF #1,見 `_claim_flag_file`)
+            if RUNNOW_FLAG.exists() and _claim_flag_file(RUNNOW_FLAG):
                 logging.info("收到立即執行要求")
                 trigger_job_async("手動")
             # 「設定已變更」旗標檔（由設定視窗存檔後寫入）→ 重建排程 + 重 load cfg
-            if RELOAD_FLAG.exists():
-                try:
-                    RELOAD_FLAG.unlink()
-                except OSError:
-                    pass
+            if RELOAD_FLAG.exists() and _claim_flag_file(RELOAD_FLAG):
                 logging.info("偵測到設定變更，重新建立排程")
                 _rebuild_schedule()
                 cfg = load_config()  # RELOAD_FLAG 觸發時重讀
@@ -8071,6 +8263,108 @@ class ConfigApp(tk.Tk):
 # =============================================================================
 # 托盤
 # =============================================================================
+# ★[2026-08-10 批次SF] 退場的硬性期限★
+#
+# `exit_action` 在建立那條唯一會 `os._exit` 的 `_shutdown` 緒【之前】,先做了
+# `_session_close(...)` 與 `_abort_bde_shutdown_on_exit()`。而 `_session_close`
+# 的收尾路徑是:
+#     `_terminate_session_process` → `_close_session_windows`
+#     → `_dismiss_blocking_modals` → `enum_children` → raw `GetWindowText()`
+# 最後那個是【送 WM_GETTEXT 給目標視窗】,systemftp 凍結時永久不返回
+# (本檔 `capture_window_image` 與 `win32_safe` 的模組說明講的就是同一件事)。
+#
+# 於是:托盤回呼那條緒卡死 → `tray_icon_object.stop()` 沒跑到(圖示還在,
+# 選單再也沒有反應)→ `_shutdown` 根本沒有被建立 → ★行程永遠不會結束★。
+# 而 `running` 在更前面就已經清掉了:scheduler 停了、log 不再更新 →
+# 外層 watchdog 判定它死了而啟動新實例 → 新實例撞上舊實例仍持有的單例 mutex
+# → 依設計【完全沉默】地退出(見 `main()` 裡那段刻意不寫 log 的說明)
+# → 會診查詢從此停擺,而且沒有任何一行 log 說得出原因。
+#
+# 對策:退場的第一件事就是掛上這個期限。之後不論卡在哪一個 Win32 呼叫上,
+# 行程都會死 —— 而「行程死掉」正是 watchdog 認得、也救得回來的狀態。
+_EXIT_HARD_DEADLINE_SEC = 25.0
+#: 「盡力留證據」的寬限:超過就不再等它,直接硬退。
+_FORCE_EXIT_GRACE_SEC = 5.0
+
+
+def _exit_now(code: int = 0) -> None:
+    """★真正無條件的退場★ —— 不 logging、不取任何鎖、不碰檔案系統。
+
+    ★[外審 SF 第 1 輪 P1-1]★ 我第一版的「保證退場」自己就會卡住:
+    * 升級點都先 `logging.critical(...)` —— 那要拿 handler lock,而 lock 很可能
+      正被【卡死的那條緒】持有(`_hard_exit` 自己的 docstring 就在講這件事);
+    * `_hard_exit` 雖然已經把 handler flush 改成非阻塞,但它接著會
+      `_flush_delivery_ledger()` → `DeliveryLedger.flush()` 會【無界】等一把
+      RLock 並寫檔。
+    於是「保證會死」的那條路上有兩件會等別人的事 —— 它一件都不能有。
+    """
+    os._exit(code)
+
+
+def _exit_now_after(delay_sec: float, code: int) -> None:
+    """保險絲:睡飽就無條件退場（不做任何其他事）。"""
+    try:
+        time.sleep(delay_sec)
+    except BaseException:       # noqa: BLE001  這條路上不可以有任何理由不死
+        pass
+    _exit_now(code)
+
+
+def _force_exit(reason: str, code: int = 1) -> None:
+    """卡死時的升級退場 —— ★保證會死★，但盡量先留下證據。
+
+    順序就是這個 helper 的全部內容:
+      ① 先掛一條「`_FORCE_EXIT_GRACE_SEC` 秒後無條件 `os._exit`」的保險絲;
+      ② 才去做那些【可能永遠不返回】的事(寫 log、補寫帳本)。
+    保險絲開不出來(thread 耗盡 —— 那正是本批在處理的情境之一)就【立刻】硬退,
+    連試都不要試:試了而卡住的話,這個函式承諾的保證就沒有了。
+    """
+    try:
+        threading.Thread(target=_exit_now_after,
+                         args=(_FORCE_EXIT_GRACE_SEC, code),
+                         name="ConsultForceExit", daemon=True).start()
+    except BaseException:       # noqa: BLE001
+        _exit_now(code)
+        return                  # ★到此為止★ `_exit_now` 不會返回,但「不再往下
+        #                         做任何會等別人的事」這件事要由程式結構保證,
+        #                         不是靠「它應該不會返回」這個假設。
+    try:
+        logging.critical("[exit] ★強制結束行程★:%s", reason)
+    except BaseException:       # noqa: BLE001  留證據失敗也不可以擋住退場
+        pass
+    _hard_exit(reason, code=code)
+
+
+def _arm_exit_deadline(deadline_sec: float = _EXIT_HARD_DEADLINE_SEC) -> bool:
+    """掛上「無論如何都會退場」的硬性期限 → 掛上了嗎。
+
+    ★[外審 SF 第 1 輪 P1-2] 回傳值是有意義的★ 掛不上(thread 耗盡)時
+    呼叫端【不可以】再走進可能永久阻塞的收尾 —— 那等於這個承諾根本不存在。
+    """
+
+    def _guard() -> None:
+        # ★不可以用 `_sleep_while_running`★ 呼叫端在這之後就會把 `running`
+        #   清掉,那個 helper 會立刻返回 —— 期限等於沒掛(它是為了「程式還活著
+        #   的時候可被中止」設計的,而這裡要的正好相反)。
+        try:
+            time.sleep(deadline_sec)
+        except BaseException:   # noqa: BLE001
+            pass
+        # 使用者要求的退出 → code=0(與 `_shutdown` 的正常路徑一致)。
+        _force_exit(
+            f"退出收尾超過 {deadline_sec:.0f} 秒仍未結束"
+            "(多半卡在凍結的 systemftp 視窗:raw GetWindowText 永久不返回)。"
+            "不強制的話托盤沒收掉、單例 mutex 沒放掉,watchdog 起的新實例會被"
+            "靜默擋退,會診查詢從此停擺", code=0)
+
+    try:
+        threading.Thread(target=_guard, name="ConsultExitDeadline",
+                         daemon=True).start()
+        return True
+    except BaseException:       # noqa: BLE001
+        return False
+
+
 def exit_action(icon=None, item=None) -> None:
     """[v19 2026-05-26] 修 tray 退出關不掉 bug — 跟 autoclock.exit_action 同 pattern。
 
@@ -8083,6 +8377,29 @@ def exit_action(icon=None, item=None) -> None:
         if _exit_started:
             return
         _exit_started = True
+    # ★保證退場★ 一切收尾之前先掛上硬性期限(理由見 `_arm_exit_deadline`):
+    #   下面的 `_session_close` 會走到可能永久阻塞的 raw Win32 呼叫。
+    if not _arm_exit_deadline():
+        # ★[外審 SF 第 2 輪 P1] 沒有保險絲就【連 log 都不可以寫】★
+        #   我第一版只跳過 `_session_close`,卻仍然照走 `logging.info` /
+        #   `logging.error` —— 而 handler lock 同樣可能正被卡死的那條緒持有。
+        #   那等於把卡點從 Win32 換到 logging,原本的殭屍行程照樣發生。
+        #   沒有保險絲的時候,唯一安全的動作就是「不做任何會等別人的事」。
+        #
+        #   ★唯一的例外,而且它是有界的★:已排定的 OS 重開機。不取消的話,
+        #   使用者按了退出、機器卻照樣重開,那非常錯愕。`shutdown /a` 是
+        #   subprocess + timeout,不碰任何鎖、不寫 log,15 秒必然返回。
+        #   (走的是這個直接呼叫,不是 `_abort_bde_shutdown_on_exit` ——
+        #    後者要拿 `_bde_watch_lock` 並寫 log。)
+        try:
+            if _bde_shutdown_pending:
+                subprocess.run(
+                    ["shutdown", "/a"], capture_output=True, timeout=15,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except BaseException:   # noqa: BLE001
+            pass
+        _exit_now(0)
+        return
     logging.info("使用者要求退出會診查詢程式")
     running.clear()
     _session_close("程式結束")
@@ -8107,10 +8424,19 @@ def exit_action(icon=None, item=None) -> None:
             time.sleep(0.5)
         except Exception:
             pass
-        os._exit(0)
+        # ★走同一個原語★ 裸的 `os._exit` 只留在 `_exit_now` 一處:
+        #   散落各處的話,測試攔不住它 —— 而一條測試緒真的把 pytest
+        #   殺掉的話,結果會變成【假綠】(本批實際發生過兩次)。
+        _exit_now(0)
 
-    threading.Thread(target=_shutdown, daemon=True,
-                     name="ConsultShutdown").start()
+    try:
+        threading.Thread(target=_shutdown, daemon=True,
+                         name="ConsultShutdown").start()
+    except BaseException:       # noqa: BLE001
+        # ★收尾緒也開不出來 → 直接死★(外審 SF 第 1 輪 P1-2)
+        #   舊寫法讓這個例外冒到 pystray 的 dispatcher 被吞掉,而
+        #   `os._exit` 只寫在 `_shutdown` 裡面 —— 於是行程永遠不會結束。
+        _exit_now(0)
 
 
 def _tray_run_now(icon=None, item=None) -> None:
