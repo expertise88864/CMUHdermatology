@@ -2522,6 +2522,27 @@ def _ensure_hidden_desktop():
         return None
 
 
+# ★[2026-08-10 批次SC #2] 上一條被放生的隱藏桌面 worker★
+#
+# 240 秒的 `join()` 到期只是【放棄等待】—— worker 本身沒有被取消:凍結的
+# Delphi/systemftp 讓 raw `GetWindowText()` / `EnumWindows` callback 永久
+# 不返回,那條 daemon thread 與它的 HDESK 就一直活著(`CloseDesktop` 只有
+# worker 自己走到 finally 才會執行)。
+#
+# 沒有 single-flight 的話:每次重試或下一輪查詢都再開一條
+# `ConsultAutomationHidden` + 新的 desktop handle + 新的 systemftp 自動化。
+# 持續故障下會累積 daemon threads、HDESK/視窗資源與互相衝突的 HIS session,
+# 最後會診輪詢與整個 Win32 GUI 子系統都可能失效。
+#
+# 對策與 `_run_imap_check_with_timeout` 完全相同:記住上一條;它還活著就
+# 【不再疊加】,直接回報本輪失敗(排程下一輪會再試;它自己的迴圈 deadline
+# 到了會結束並釋放 HDESK)。只由持有 `_flow_lock` 的那條緒讀寫,無並發。
+_last_hidden_worker = None
+
+#: 隱藏桌面 worker 的硬上限(秒)。
+_HIDDEN_WORKER_TIMEOUT_SEC = 240
+
+
 def _set_thread_desktop(hdesk) -> bool:
     """把目前執行緒切到指定桌面。回傳是否成功。"""
     try:
@@ -2546,6 +2567,25 @@ def run_consult_flow(trigger_label: str = "") -> tuple:
     logging.info("=== 開始會診查詢流程（觸發：%s）===", trigger_label or "手動")
     # 清單標題依寄送時段:12:30→昨晚今早會診清單、17:30→下午會診清單
     roster_label = _consult_slot_label(trigger_label, datetime.now())
+
+    # ★[批次SC #2] single-flight 必須在【開任何資源之前】★
+    #   (外審第 1 輪抓到)第一版擺在 `_ensure_hidden_desktop()` 之後:
+    #     * 上一條還卡著時,每一輪 poll 照樣先開一個新的 HDESK 才拋 ——
+    #       洩漏一模一樣,守衛等於沒加;
+    #     * 更糟的是 `_ensure_hidden_desktop()` 回 None 的後備路徑
+    #       (SW_HIDE)【完全繞過守衛】,直接與卡住的 worker 併行操作
+    #       同一套 systemftp → 互相衝突的 HIS session。
+    #   守衛保護的是「不可以再開一輪自動化」,不是「不可以開隱藏桌面」,
+    #   所以位置要在所有路徑的共同上游。
+    global _last_hidden_worker
+    prev = _last_hidden_worker
+    if prev is not None and prev.is_alive():
+        logging.error(
+            "[consult] 上一條 ConsultAutomationHidden 仍未結束(卡在凍結的"
+            " systemftp)→ 本輪不再開新的自動化(含 SW_HIDE 後備),避免累積"
+            " daemon thread、HDESK 與互相衝突的 HIS session")
+        raise RuntimeError(
+            "上一輪自動化仍在執行(疑似 systemftp 凍結)，本輪略過")
 
     hdesk = _ensure_hidden_desktop()
     if hdesk:
@@ -2573,10 +2613,14 @@ def run_consult_flow(trigger_label: str = "") -> tuple:
 
         t = threading.Thread(target=worker, name="ConsultAutomationHidden",
                               daemon=True)
+        _last_hidden_worker = t
         t.start()
-        t.join(timeout=240)  # 4 分鐘硬上限
+        t.join(timeout=_HIDDEN_WORKER_TIMEOUT_SEC)  # 4 分鐘硬上限
         if t.is_alive():
+            # ★引用留著★ 下一輪會看到它還活著而跳過,直到它自己的迴圈
+            #   deadline 到期結束(那時 finally 會 CloseDesktop)。
             raise RuntimeError("自動化執行超過 4 分鐘，已放棄（可能網路異常）")
+        _last_hidden_worker = None      # 正常結束 → 不擋下一輪
         if result.get("error"):
             raise result["error"]
         return result["shot"]

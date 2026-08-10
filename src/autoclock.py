@@ -159,6 +159,57 @@ _self_watchdog_lock = threading.Lock()
 # scheduler 仍每分鐘 tick,但單一 Selenium 打卡任務可能 hang;原本 watchdog 只看
 # scheduler tick、看不到卡住的任務)。started 為 monotonic 秒;0=無任務在跑。
 import contextlib as _contextlib  # noqa: E402
+
+
+class ClockLockBusy(RuntimeError):
+    """等不到 `clock_lock`(持鎖者疑似卡在 chromedriver)。本輪放棄。"""
+
+
+# ★[2026-08-10 批次SC #1] clock_lock 不可以無界取得★
+#
+# 一個打卡任務整段都持有 `clock_lock`(登入→讀刷卡表→點擊→回讀驗證)。
+# 其中的 Selenium transport command(`window_handles`、`quit`、任何
+# WebDriver 呼叫)在 chromedriver wedge 時【永久不返回】—— page-load /
+# script timeout 管不到它們。於是:
+#
+#   * 持鎖者永遠不放 → 之後每個 schedule key、每次 gate 逾時接管開出的
+#     新 worker,全部堵在無界的 `with clock_lock` 上;
+#   * scheduler 本身照常 tick、log 照常更新 → self-watchdog 與外層
+#     watchdog 都認為一切正常 → **打卡從此永久失效,而且沒有人知道**;
+#   * 每個時段再堆一條等待中的 daemon thread。
+#
+# 對策(與 reg52 fetch slot 同一套):有界等待 → 等不到就【本輪放棄】,
+# 不留下永久阻塞的緒。連續逾時代表持鎖者真的死了 → 升級到 hard_exit,
+# 讓外層 watchdog 重啟(重啟是唯一能終結 native-wedged thread 的手段;
+# 打卡本身是冪等的 —— 每次動作前都先讀刷卡表,重啟不會造成重複打卡)。
+_CLOCK_LOCK_WAIT_SEC = 600.0        # 正常任務(5 次重試×各自逾時)的數倍
+_CLOCK_LOCK_TIMEOUT_STREAK_MAX = 3  # 連續 3 次等不到 → 視為持鎖者已死
+_clock_lock_timeout_streak = [0]
+
+
+@_contextlib.contextmanager
+def bounded_clock_lock(schedule_key: str | None = None,
+                       timeout: float = _CLOCK_LOCK_WAIT_SEC):
+    """有界地取得 `clock_lock`。等不到 → 拋 `ClockLockBusy`(呼叫端放棄本輪)。"""
+    if not clock_lock.acquire(timeout=timeout):
+        _clock_lock_timeout_streak[0] += 1
+        streak = _clock_lock_timeout_streak[0]
+        logging.critical(
+            "[autoclock] 任務 %s 等 clock_lock 超過 %.0fs → 本輪放棄"
+            "(持鎖者疑似卡在 chromedriver;連續第 %d 次)",
+            schedule_key, timeout, streak)
+        if streak >= _CLOCK_LOCK_TIMEOUT_STREAK_MAX:
+            logging.critical(
+                "[autoclock] clock_lock 連續 %d 次等不到 → 持鎖者已死,"
+                "hard_exit 讓外層 watchdog 重啟(打卡是冪等的:每次動作前都先"
+                "讀刷卡表,重啟不會重複打卡)", streak)
+            _autoclock_hard_exit("clock_lock wedged", code=1)
+        raise ClockLockBusy(f"clock_lock busy > {timeout:.0f}s")
+    _clock_lock_timeout_streak[0] = 0
+    try:
+        yield
+    finally:
+        clock_lock.release()
 _active_clock_task = {"started": 0.0, "label": ""}
 _active_clock_task_lock = threading.Lock()
 # 單一打卡任務跑超過這個秒數即視為異常(driver 逾時 30s×步驟 + 5 次重試,正常遠低於此)。
@@ -1368,7 +1419,8 @@ def process_clock_task(schedule_key: str | None) -> None:
     # 避免第二個 process_clock_task(如 UI 測試 dry-run 與排程並行)在等鎖時覆蓋標記、
     # 或第一個任務 finally 清掉還在跑的第二個任務的標記(codex review)。clock_lock 已
     # 序列化執行,故同時最多一個 scope 生效。
-    with clock_lock, _active_clock_task_scope(schedule_key):
+    with bounded_clock_lock(schedule_key), \
+            _active_clock_task_scope(schedule_key):
         wait_ms = (time_module.time() - t_wait_start) * 1000
         if wait_ms > 100:
             logging.warning(
@@ -1532,6 +1584,11 @@ def _scheduler_tick() -> None:
         with worker_lease_scope(lease):
             try:
                 process_clock_task(key)
+            except ClockLockBusy:
+                # [批次SC #1] 等不到 clock_lock:helper 已記 CRITICAL 並做過
+                # 升級判斷。這裡安靜結束本輪 —— 排程每分鐘 re-fire,
+                # 打卡窗結束後另有 _missed_clock_check 通知。
+                pass
             finally:
                 _clock_task_gate.release(key, lease)
 
