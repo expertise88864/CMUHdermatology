@@ -264,10 +264,22 @@ def test_exit_closes_the_session():
 
 
 def test_job_success_clears_cooldown_and_cancels_reboot_watch():
+    """★[2026-08-11 批次SH] 兩處都改了寫法，性質不變★
+
+    * 冷卻改走 `_set_login_cooldown_until()` —— 直接指派全域變數的話那一次
+      就不會落地，而重啟正是防鎖定保護最沒有防備的時刻。
+    * 取消令改成【只結掉自己那一個原因】：BDE 的恢復訊號就是查詢成功；
+      但資源耗盡那條不是（SW_HIDE 後備模式下查詢照樣成功，USER object
+      還是耗盡的）。共用的取消 Event 只有在【所有原因都好了】時才會被設起來，
+      由 `_clear_reboot_reason` 統一負責 —— 這裡不可以自己去動它。
+    """
     import inspect
     src = inspect.getsource(cq._note_job_success)
-    assert "_login_cooldown_until = 0.0" in src
-    assert "_bde_reboot_cancel.set()" in src
+    assert "_set_login_cooldown_until(0.0)" in src
+    assert "_login_cooldown_until = 0.0" not in src, "直接指派就不會落地"
+    assert '_clear_reboot_reason("BDE")' in src
+    assert "_bde_reboot_cancel.set()" not in src, (
+        "★不可以直接動共用的取消令★ 那會把還沒好的別的原因一起解除")
 
 
 # ─── BDE 閒置重開機接線 ─────────────────────────────────────────────────────
@@ -417,10 +429,17 @@ def test_new_bde_failure_wins_the_cancel_race():
     """[codex P2 R3] 成功→cancel set→新 BDE 事故(cancel 還沒被舊看守消化)：
     schedule 在鎖內先清令;舊看守醒來發現令已作廢 → 繼續站崗,不得退場。"""
     import inspect
-    src = inspect.getsource(cq._schedule_bde_reboot_watch)
+    # [批次SH] 邏輯搬到泛用的 `_schedule_reboot_watch`（BDE 與資源耗盡共用），
+    #   守衛要跟著指向真正持有那段邏輯的函式，否則它會靜默失效。
+    src = inspect.getsource(cq._schedule_reboot_watch)
     i_clear = src.index("_bde_reboot_cancel.clear()")
-    i_active = src.index("if _bde_watch_active:")
-    assert i_clear < i_active, "清令必須在 active 檢查之前(同一把鎖內)"
+    # [批次SH 第 2 輪] 早退 `return` 已取消,整段合併成【單一臨界區】
+    #   （登記原因 + 清令 + 世代 + active 判定）。要守的性質不變：
+    #   清令必須無條件執行、且發生在「要不要開緒」的判定之前。
+    i_active = src.index("spawn = not _bde_watch_active")
+    assert i_clear < i_active, "清令必須在 active 判定之前(同一把鎖內)"
+    head = src[:i_active]
+    assert "return" not in head, "清令/世代之前不可以有任何早退"
     loop = inspect.getsource(cq._bde_reboot_watch_loop)
     i_wait = loop.index("_bde_reboot_cancel.wait(")
     i_recheck = loop.index("if _bde_reboot_cancel.is_set():")
@@ -438,11 +457,11 @@ def test_teardown_race_respawns_for_new_incident():
     tail = src[i_fin:]
     assert "_bde_watch_gen != my_gen" in tail, "退場前要在鎖內驗世代"
     assert "threading.Thread" in tail, "世代前進 → 接力開新看守"
-    sched = inspect.getsource(cq._schedule_bde_reboot_watch)
+    sched = inspect.getsource(cq._schedule_reboot_watch)   # [批次SH] 見上
     assert "_bde_watch_gen += 1" in sched
     i_gen = sched.index("_bde_watch_gen += 1")
-    i_act = sched.index("if _bde_watch_active:")
-    assert i_gen < i_act, "世代要在 active 檢查前(同一把鎖內)遞增"
+    i_act = sched.index("spawn = not _bde_watch_active")   # [批次SH 第 2 輪]
+    assert i_gen < i_act, "世代要在 active 判定前(同一把鎖內)遞增"
 
 
 def test_stale_worker_never_kills_the_replacement_session():

@@ -2534,8 +2534,100 @@ def _cleanup_pids_excluding_borrowed(our_pids: set, before: set,
 # =============================================================================
 # 隱藏桌面（systemftp 完全在使用者看不到的虛擬桌面上跑，零干擾）
 # =============================================================================
+# ══ 資源耗盡 → 閒置重開機（2026-08-11 使用者定案）═══════════════════════
+#
+# 建不出隱藏桌面幾乎只有兩個原因，而它們的處置完全相反：
+#   * ★USER object 配額被耗光★ —— 累積出來的，★重開機真的會修好★；
+#   * 群組原則/權限不允許建立桌面 —— 永久性的，重開一百次也一樣。
+# 分辨方法不必猜：★本行程之內曾經成功過嗎★。曾經成功、現在連續失敗
+# ＝耗盡；從頭到尾沒成功過＝那台就是不給建，重開機只會變成每天無謂重開一次
+# （`bde_reboot_decision` 的 24 小時上限擋得住迴圈，但擋不住「每天一次」）。
+# 分辨不出來時保守不重開。
+#
+# 現況（不加這段的話）：建不出來就降級到 SW_HIDE ——「每輪完整登入」，
+# 那正是登入鎖定門檻的來源；查詢還在跑，所以既有告警也不會響。
+# 換句話說這是一個會自己惡化、而且沒有人會發現的狀態。
+_HIDDEN_DESKTOP_FAIL_STREAK_MAX = 3       # 連續幾輪建不出來才算數
+_hidden_desktop_state = {"streak": 0, "ever_ok": False}
+_hidden_desktop_lock = threading.Lock()
+
+
+def _hidden_desktop_exhausted() -> bool:
+    """★重開機前再驗一次★ —— 現在還是建不出來嗎（順手把 handle 收掉）。
+
+    看守可能在半夜開火，而最後一次觀測可能是幾小時前（休息時段不輪詢）。
+    「在動手的那一刻確認條件仍然成立」比「相信一個舊結論」重要。
+
+    ★[外審 SH 第 1 輪 P2-3] 建得起來就要【當成一次恢復】★
+    上一版只是回 False 就走人，沒有重置 streak —— 於是那一波故障之後的
+    每一次失敗都從 4、5、6 往上加，再也不會等於門檻，★整段故障期間永遠
+    不會重新排定重開機★。恢復就是恢復，走同一條路。
+    """
+    h = _ensure_hidden_desktop()
+    if not h:
+        return True
+    try:
+        _user32.CloseDesktop(h)
+    except Exception:
+        logging.debug("CloseDesktop(recheck) 失敗", exc_info=True)
+    _note_hidden_desktop_ok()
+    return False
+
+
+def _note_hidden_desktop_ok() -> None:
+    """隱藏桌面（又）建得起來 → 重置 streak，並結掉 RESOURCE 這個原因。"""
+    with _hidden_desktop_lock:
+        _hidden_desktop_state["ever_ok"] = True
+        had = _hidden_desktop_state["streak"]
+        _hidden_desktop_state["streak"] = 0
+    if had:
+        logging.info("[資源] 隱藏桌面又建得起來了(先前連續失敗 %d 次)", had)
+    # ★只結掉自己這一個原因★(外審 SH 第 1 輪 P2-2):共用的取消令若在這裡
+    #   無條件 set,會把一個【還沒好】的 BDE 看守一起解除掉。
+    _clear_reboot_reason("RESOURCE")
+
+
+def _note_hidden_desktop_result(ok: bool) -> None:
+    """記下這一次建隱藏桌面的結果；連續失敗到門檻就排重開機看守。"""
+    if ok:
+        _note_hidden_desktop_ok()
+        return
+    with _hidden_desktop_lock:
+        _hidden_desktop_state["streak"] += 1
+        streak = _hidden_desktop_state["streak"]
+        ever_ok = _hidden_desktop_state["ever_ok"]
+        # ★決定要不要重開機的地方【只有這一行】★
+        #   我第一版把「曾經成功過」寫成兩道(這裡一道、下面再一道 early
+        #   return)。突變驗證當場量出來:拿掉其中一道,測試【全綠】——
+        #   兩道守衛表達同一件事,就沒有任何測試真的在守它。
+        # ★`>=` 而不是 `==`★(外審 SH 第 1 輪 P3):看守可能因為別的理由退場
+        #   (24 小時 give_up、shutdown 被拒),那時 streak 早就超過門檻 ——
+        #   用 `==` 的話這個事故從此再也沒有人看著。排程本身是冪等的
+        #   (已在站崗就只是續命,不會重複開緒、也不會重複刷 log)。
+        arm = ever_ok and streak >= _HIDDEN_DESKTOP_FAIL_STREAK_MAX
+    if ever_ok:
+        logging.error(
+            "[資源] ★建不出隱藏桌面,連續第 %d 次(本行程先前成功過)★ → "
+            "判為 USER object 配額耗盡。後備模式是【每輪完整登入】,"
+            "那正是登入鎖定門檻的來源,而查詢還在跑所以不會有人發現", streak)
+    else:
+        # 從來沒成功過 → 多半是群組原則,重開機修不了 → 只降級,不重開。
+        logging.warning(
+            "[資源] 建不出隱藏桌面(第 %d 次;本行程從未成功過 → 判為權限/原則"
+            "限制,不自動重開機),本輪走 SW_HIDE 後備", streak)
+    if arm:
+        _schedule_reboot_watch(
+            "RESOURCE",
+            f"連續 {_HIDDEN_DESKTOP_FAIL_STREAK_MAX} 輪建不出隱藏桌面"
+            "(USER object 配額耗盡;重開機可修復)")
+
+
 def _ensure_hidden_desktop():
-    """建立或開啟隱藏桌面；回傳 HDESK（整數位址）或 None 表失敗。"""
+    """建立或開啟隱藏桌面；回傳 HDESK（整數位址）或 None 表失敗。
+
+    ★不在這裡記結果★:本函式自己被 `_hidden_desktop_exhausted()`(重開機前的
+    再驗)呼叫,在那裡記一次會把 streak 重複累加。記錄由真正的使用端負責。
+    """
     try:
         h = _user32.OpenDesktopW(HIDDEN_DESKTOP_NAME, 0, False,
                                   _DESKTOP_GENERIC_ALL)
@@ -2654,6 +2746,7 @@ def run_consult_flow(trigger_label: str = "") -> tuple:
             "上一輪自動化仍在執行(疑似 systemftp 凍結)，本輪略過")
 
     hdesk = _ensure_hidden_desktop()
+    _note_hidden_desktop_result(bool(hdesk))     # [批次SH] 資源耗盡的觀測點
     if hdesk:
         logging.info("使用隱藏桌面執行（systemftp 不會出現在你的畫面）")
         result: dict = {}
@@ -3089,6 +3182,19 @@ class _PersistentSession:
 _session_lock = threading.Lock()      # 只保護 _psession 參照的取放
 _psession = None
 _login_cooldown_until = 0.0           # 登入失敗冷卻(見 _cold_start_session)
+
+
+def _set_login_cooldown_until(ts: float, *, persist: bool = True) -> None:
+    """設定登入冷卻到期時間（並落地）。
+
+    ★[2026-08-11 批次SH] 一定要走這個函式★ 直接指派全域變數的話那次冷卻
+    就不會落地，而重啟正是這個防護最沒有防備的時刻（見 `_load_job_fail_state`）。
+    `persist=False` 只給【載入】用：剛從檔案讀出來的東西不需要再寫回去。
+    """
+    global _login_cooldown_until
+    _login_cooldown_until = float(ts)
+    if persist:
+        _save_job_fail_state()
 
 
 def _session_pids() -> set:
@@ -3714,7 +3820,7 @@ def _cold_start_session_impl(cfg: dict, owner_token=None):
     後再拋:3 分鐘 keepalive 節奏絕不可把同一組帳密每 3 分鐘送一次——冷卻期取
     15 分鐘(=舊輪詢節奏),登入壓力不高於改版前;BDE 取 30 分鐘(等重開機/人工)。
     """
-    global _psession, _login_cooldown_until
+    global _psession
     remaining = _keepalive.login_cooldown_remaining(_login_cooldown_until,
                                                     time.time())
     if remaining > 0:
@@ -3824,13 +3930,14 @@ def _cold_start_session_impl(cfg: dict, owner_token=None):
         return sess
     except BaseException as e:
         if isinstance(e, HISStartupBlocked):
-            _login_cooldown_until = time.time() + _keepalive.BDE_COOLDOWN_SECONDS
+            _set_login_cooldown_until(
+                time.time() + _keepalive.BDE_COOLDOWN_SECONDS)
         elif isinstance(e, LoginNotCompleted) or creds_sent:
             # [codex P1 R6] 帳密【已送出】後的任何啟動失敗(例:登入視窗消失但
             # 主畫面沒出現的通用 RuntimeError)都要進冷卻——不然 3 分鐘節奏會
             # 每 3 分鐘再送一次帳密,鎖定防護只剩 LoginNotCompleted 一種等於沒防。
-            _login_cooldown_until = (time.time()
-                                     + _keepalive.LOGIN_COOLDOWN_SECONDS)
+            _set_login_cooldown_until(
+                time.time() + _keepalive.LOGIN_COOLDOWN_SECONDS)
             logging.error("[session] 登入未完成(帳密已送出) → 進入 %d 分鐘"
                           "登入冷卻(不重複送出帳密)",
                           _keepalive.LOGIN_COOLDOWN_SECONDS // 60)
@@ -4611,13 +4718,96 @@ def _abort_bde_shutdown_on_exit() -> None:
 
 
 def _schedule_bde_reboot_watch() -> None:
-    """BDE 起不來 → 開「閒置重開機」看守(singleton;已在站崗就不重複)。
+    """BDE 起不來 → 開「閒置重開機」看守。HIS 恢復會解除站崗。"""
+    _schedule_reboot_watch("BDE", "住院醫囑系統的 BDE 初始化失敗($250E)")
 
-    使用者定案:重開機通常可修 BDE($250E),但【使用者連續 30 分鐘沒有輸入】
-    才能重開;且 24 小時內只自動重開一次(重開後仍 BDE=重開機修不了,絕不能
-    進入重開機迴圈)。HIS 恢復(_note_job_success)會解除站崗。"""
+
+# ★[外審 SH 第 1 輪 P1]★ 站崗的「原因」是一個【集合】,不是一個槽位。
+#
+#   我第一版用單一變數 `_reboot_watch_reason`,而 BDE 與資源耗盡是兩個
+#   各自獨立、可以同時存在的事故。後果:
+#     * 後到的事故把前一個的原因【覆寫】掉,但看守只有一條 →
+#       之後 BDE 恢復會把一個【還沒好】的 RESOURCE 看守一起解除;
+#     * 反過來,RESOURCE 再驗成功會終止一個【還在壞】的 BDE 看守;
+#     * 而 RESOURCE 一旦錯過排程時機就再也不會重排 → 永久失去看守。
+#   ★恢復訊號只能結掉【自己那一個】原因;還有任何原因沒好就繼續站崗。★
+_reboot_reasons: set = set()          # 由 `_bde_watch_lock` 保護
+
+
+def _clear_reboot_reason(reason: str) -> None:
+    """某一個原因恢復了 → 只移除它；★全部都好了才解除站崗★。
+
+    ★[外審 SH 第 2 輪 P1] 移除原因與下取消令必須在【同一個臨界區】★
+    我上一版是「鎖內移除 → 放鎖 → 下取消令」。那中間新事故若剛好完成
+    「登記原因 + 清令 + 世代 +1」，我們接著把令又 set 回去 ——
+    看守醒來看到令還在就退場，接力的那條也立刻看到同一個令而退場，
+    最後 `_reboot_reasons` 還有東西、`_bde_watch_active` 卻是 False：
+    ★事故完全失去看守★，而休息時段根本不會有下一輪觀測把它救回來。
+    """
+    with _bde_watch_lock:
+        if reason not in _reboot_reasons:
+            return                      # 本來就沒為它站崗
+        _reboot_reasons.discard(reason)
+        remaining = sorted(_reboot_reasons)
+        if not remaining:
+            _bde_reboot_cancel.set()    # ★在同一個臨界區內★
+    # log 不影響狀態,放到鎖外(它可能很慢)。
+    if remaining:
+        logging.info("[重開機看守] %s 已恢復,但仍有未恢復的原因 %s → 繼續站崗",
+                     reason, remaining)
+    else:
+        logging.info("[重開機看守] %s 已恢復,沒有其他未恢復的原因 → 解除站崗",
+                     reason)
+
+
+def _reboot_all_conditions_cleared() -> bool:
+    """★動手前再驗一次：還掛著的原因，現在是不是都已經恢復了★
+
+    看守可能在半夜開火，而最後一次觀測可能是幾小時前（休息時段 00-06 根本
+    不輪詢，不會有新的觀測進來）。「相信一個舊結論」與「在動手的那一刻確認」
+    的差別，是一台好好的診間電腦會不會被白白重開。
+
+    能重驗的就重驗（RESOURCE）；不能重驗的（BDE 的恢復是事件式的，由取消令
+    表達）一律當成「還在」—— 保守方向是重開，因為那條路已經被
+    「閒置 30 分鐘」與「24 小時一次」保護著。
+    """
+    with _bde_watch_lock:
+        reasons = sorted(_reboot_reasons)
+    if not reasons:
+        return True
+    for r in reasons:
+        if r != "RESOURCE":
+            return False                # 無法重驗 → 視為仍在
+        if _hidden_desktop_exhausted():
+            return False
+        # 建得起來了 → `_hidden_desktop_exhausted` 已經把它當成一次恢復
+        #   (重置 streak + 結掉這個原因)。
+    with _bde_watch_lock:
+        return not _reboot_reasons
+
+
+def _schedule_reboot_watch(reason: str, detail: str) -> None:
+    """開「閒置重開機」看守(singleton;已在站崗就只是登記原因,不重複開緒)。
+
+    使用者定案:重開機通常可修 BDE($250E)與 USER object 耗盡,但
+    【使用者連續 30 分鐘沒有輸入】才能重開;且 24 小時內只自動重開一次
+    (重開後仍壞＝重開機修不了,絕不能進入重開機迴圈)。
+
+    ★每個原因的「什麼算恢復」不一樣★
+      * BDE      —— HIS 查詢成功就是恢復(`_note_job_success`);
+      * RESOURCE —— ★不可以用「查詢成功」當恢復★:SW_HIDE 後備模式下查詢
+        照樣會成功,而 USER object 還是耗盡的、每輪還是在送帳密。
+        它的恢復訊號是「隱藏桌面又建得起來」(`_note_hidden_desktop_ok`)。
+      這正是「便利的判斷式不等於那個狀態」。
+    """
     global _bde_watch_active, _bde_watch_gen
     with _bde_watch_lock:
+        # ★[外審 SH 第 2 輪 P1] 登記原因 + 清令 + 世代 + active 判定要在
+        #   【同一個臨界區】★ 分成兩段的話,恢復訊號會擠在中間,
+        #   把新事故剛清掉的令又 set 回去 —— 事故從此沒有人看著。
+        # 冪等:重複呼叫(例如 streak 4、5、6…)只是續命,不重複開緒也不刷 log。
+        known = str(reason) in _reboot_reasons
+        _reboot_reasons.add(str(reason))
         # [codex P2 R3] 新事故先把取消令作廢——舊看守若還沒消化掉上一次的
         # cancel,它會在鎖內發現令已被清掉而【繼續站崗】(見 watch_loop)。
         # [codex P2 R4] 世代 +1:舊看守若正在退場(give_up/shutdown 被拒),
@@ -4625,15 +4815,16 @@ def _schedule_bde_reboot_watch() -> None:
         _bde_reboot_cancel.clear()
         _bde_watch_gen += 1
         gen = _bde_watch_gen
-        if _bde_watch_active:
-            return
+        spawn = not _bde_watch_active
         _bde_watch_active = True
-    logging.error(
-        "[BDE] 已排定自動重開機看守:使用者連續閒置滿 %d 分鐘且 24 小時內未"
-        "自動重開過 → shutdown /r 重開修復;HIS 恢復則自動解除",
-        _keepalive.BDE_REBOOT_MIN_IDLE_SECONDS // 60)
-    threading.Thread(target=_bde_reboot_watch_loop, args=(gen,),
-                     name="BDERebootWatch", daemon=True).start()
+    if spawn or not known:
+        logging.error(
+            "[重開機看守] 已排定:%s → 使用者連續閒置滿 %d 分鐘且 24 小時內未"
+            "自動重開過就 shutdown /r;狀況恢復則自動解除",
+            detail, _keepalive.BDE_REBOOT_MIN_IDLE_SECONDS // 60)
+    if spawn:
+        threading.Thread(target=_bde_reboot_watch_loop, args=(gen,),
+                         name="BDERebootWatch", daemon=True).start()
 
 
 def _bde_reboot_watch_loop(my_gen: int) -> None:
@@ -4657,6 +4848,15 @@ def _bde_reboot_watch_loop(my_gen: int) -> None:
             if action == "give_up":
                 logging.error("[BDE] 不再自動重開機:%s", why)
                 return
+            # ★[批次SH] 動手前再驗一次:當初那個狀況現在還在嗎★
+            #   看守可能在半夜開火,而最後一次觀測可能是幾小時前 ——
+            #   休息時段(00-06)根本不輪詢,不會有任何新的觀測進來。
+            #   「相信一個舊結論」與「在動手的那一刻確認」的差別,
+            #   是一台好好的診間電腦會不會被白白重開。
+            if _reboot_all_conditions_cleared():
+                logging.info("[重開機看守] 動手前再驗:掛著的原因都已經恢復"
+                             " → 取消自動重開機")
+                return
             # ★先落地狀態、再下 shutdown★ 順序反過來的話,重開後狀態沒寫到,
             # BDE 若沒修好會再重開 → 無限重開機迴圈。
             # [codex P1] 落地【失敗】也一樣:狀態不在磁碟上,24 小時防護等於不存在
@@ -4675,7 +4875,9 @@ def _bde_reboot_watch_loop(my_gen: int) -> None:
                 cp = subprocess.run(
                     ["shutdown", "/r", "/t", str(int(_REBOOT_COUNTDOWN_SEC)),
                      "/c",
-                     "皮膚科會診查詢:HIS BDE 初始化失敗,閒置自動重開機修復"],
+                     "皮膚科會診查詢:偵測到重開機可修復的狀況("
+                     + ",".join(sorted(_reboot_reasons))
+                     + "),閒置自動重開機"],
                     capture_output=True, timeout=15,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 rc = cp.returncode
@@ -7135,6 +7337,7 @@ def _rebuild_schedule() -> None:
     # 擷取→按回」,不再每輪冷啟動登入;3 分鐘節奏本身就是 keepalive(院方 5 分鐘
     # 閒置會強制登出)。
     hdesk_probe = _ensure_hidden_desktop()
+    _note_hidden_desktop_result(bool(hdesk_probe))   # [批次SH] 這也是一次觀測
     if hdesk_probe:
         try:
             _user32.CloseDesktop(hdesk_probe)
@@ -7516,6 +7719,19 @@ def _load_job_fail_state() -> None:
         _job_fail_streak = streak
     if isinstance(last, (int, float)) and last >= 0:
         _job_fail_last_alert = float(last)
+    # ★[2026-08-11 批次SH] 登入冷卻也要跨重啟★
+    #   `_login_cooldown_until` 原本只在記憶體裡 —— 任何一次行程重啟
+    #   (自動更新、使用者手動、卡死升級重啟、watchdog)都把 15 分鐘的
+    #   防鎖定冷卻清成 0,下一輪立刻又送一次帳密。防護的用意正是
+    #   「同一組帳密不要密集送出」,而重啟恰好是它最沒有防備的時刻。
+    #   ★沒讀到就維持 0★:讀不到是「不知道有沒有冷卻」,而這裡 fail-open
+    #   的代價只是早一點重試一次登入(既有的 `login_cooldown_remaining`
+    #   也是這個方向),不是無限重試。
+    cooldown = data.get("login_cooldown_until")
+    # ★`>= 0` 而不是 `> 0`★:0 是一個【有意義的值】(登入成功後的解除),
+    #   磁碟上的狀態要在兩個方向都算數,不然「已解除」這件事就落不了地。
+    if isinstance(cooldown, (int, float)) and cooldown >= 0:
+        _set_login_cooldown_until(float(cooldown), persist=False)
     _forget_future_alert_ts(time.time())
 
 
@@ -7547,7 +7763,11 @@ def _save_job_fail_state() -> None:
         atomic_write_json(_job_fail_state_path(),
                           {"schema": _JOB_FAIL_STATE_SCHEMA,
                            "streak": _job_fail_streak,
-                           "last_alert_ts": _job_fail_last_alert})
+                           "last_alert_ts": _job_fail_last_alert,
+                           # [批次SH] 登入冷卻:跨重啟仍然有效(見載入處說明)。
+                           #   多一個鍵不必動 schema —— 舊版讀到會忽略它,
+                           #   新版讀到舊檔則因為缺這個鍵而維持 0,兩邊都安全。
+                           "login_cooldown_until": _login_cooldown_until})
     except Exception:
         logging.debug("[health] 告警節流狀態寫不下去(略過)", exc_info=True)
 
@@ -7621,9 +7841,15 @@ def _alert_baseline_lost(reason: str, count: int) -> None:
 
 def _note_job_success() -> None:
     """任務成功跑完 → 清空連續失敗計數（並在剛從故障恢復時留一行 log）。"""
-    global _login_cooldown_until
-    _login_cooldown_until = 0.0          # [2026-08-03 常駐] 登入已成功 → 冷卻解除
-    _bde_reboot_cancel.set()             # HIS 已恢復 → 重開機看守站崗解除
+    # [2026-08-03 常駐] 登入已成功 → 冷卻解除(★也要落地★,否則重啟後
+    #   又把舊的冷卻讀回來,白白多等 15 分鐘不做事)。
+    _set_login_cooldown_until(0.0)
+    # ★查詢成功只證明【BDE 這一個原因】恢復了★(批次SH)
+    #   SW_HIDE 後備模式下查詢照樣會成功,而 USER object 還是耗盡的、
+    #   每輪還是在送帳密(那正是要修的事)。RESOURCE 的恢復訊號是
+    #   「隱藏桌面又建得起來」(`_note_hidden_desktop_ok`)。
+    #   ★所以這裡只結掉自己那一個,不可以動共用的取消令。★
+    _clear_reboot_reason("BDE")
     global _job_fail_streak
     with _job_fail_lock:
         if not _job_fail_streak:
