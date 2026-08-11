@@ -74,31 +74,45 @@ def _strip_comments(text):
 
 
 class TestTheSubjectIsParsedStrictly:
-    def test_the_three_actions(self):
-        for word, code in (("重啟會診", "restart_consult"),
-                           ("重啟打卡", "restart_autoclock"),
-                           ("重開機", "reboot")):
+    def test_the_three_phrases(self):
+        for word, code in (("皮膚科會診重啟", "restart_consult"),
+                           ("皮膚科打卡重啟", "restart_autoclock"),
+                           ("皮膚科會診重開", "reboot")):
             assert cq.parse_remote_command(
-                f"[皮膚科遠端指令] {word} PC-1") == (code, "PC-1")
+                "%s PC-1" % word) == (code, "PC-1")
+
+    def test_the_machine_may_be_omitted(self):
+        """★使用者定案 2026-08-11★ 不填機器＝每一台【正在跑會診查詢】的
+        電腦都做。會去收這個信箱的就是那支程式，沒在跑的看不到那封信。
+        """
+        assert cq.parse_remote_command("皮膚科會診重開") == ("reboot", "")
+        assert cq.parse_remote_command(
+            "皮膚科會診重啟") == ("restart_consult", "")
 
     def test_a_reply_prefix_and_extra_spaces_still_parse(self):
         """郵件客戶端會插 `Re:`、多餘空白、全形空格。"""
         assert cq.parse_remote_command(
-            "Re: 　[皮膚科遠端指令]　 重開機   PC-1 ") == ("reboot", "PC-1")
+            "Re: 　皮膚科會診重開　  PC-1 ") == ("reboot", "PC-1")
+        assert cq.parse_remote_command("Re: 皮膚科會診重開") == ("reboot", "")
 
-    def test_a_missing_machine_is_not_a_command(self):
-        """★機器是必填★ 少了它，一封信會讓每一台診間電腦都動作。"""
-        assert cq.parse_remote_command("[皮膚科遠端指令] 重開機") == (None, "")
+    def test_a_phrase_glued_to_more_text_is_not_a_command(self):
+        """★短語後面必須是空白或結束★
 
-    def test_an_unknown_action_is_not_a_command(self):
-        assert cq.parse_remote_command(
-            "[皮膚科遠端指令] 關機 PC-1") == (None, "")
+        `皮膚科會診重開機` 不是「皮膚科會診重開」加一台叫「機」的電腦 ——
+        那種主旨不執行任何東西。
+        """
+        assert cq.parse_remote_command("皮膚科會診重開機") == (None, "")
+        assert cq.parse_remote_command("皮膚科會診重啟動") == (None, "")
 
-    def test_actions_are_matched_exactly_not_fuzzily(self):
-        """★「重開機」與「重啟會診」差一個字，代價差很多★ —— 絕不模糊比對。"""
-        for bad in ("重開", "重開機器", "重啟", "重啟會診查詢"):
+    def test_an_unknown_phrase_is_not_a_command(self):
+        assert cq.parse_remote_command("皮膚科會診關機 PC-1") == (None, "")
+        assert cq.parse_remote_command("會診重開") == (None, "")
+
+    def test_phrases_are_matched_exactly_not_fuzzily(self):
+        """★「重開」與「重啟」差一個字，代價差很多★ —— 絕不模糊比對。"""
+        for bad in ("皮膚科會診", "皮膚科重開", "會診重開", "皮膚科打卡重開"):
             assert cq.parse_remote_command(
-                f"[皮膚科遠端指令] {bad} PC-1") == (None, ""), bad
+                "%s PC-1" % bad) == (None, ""), bad
 
     def test_a_normal_mail_is_not_a_command(self):
         for subj in ("", "皮膚科會診觸發", "重開機 PC-1", None):
@@ -108,25 +122,27 @@ class TestTheSubjectIsParsedStrictly:
         monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-1")
         assert cq._remote_command_is_for_me("PC-1") is True
         assert cq._remote_command_is_for_me("PC-2") is False
-        assert cq._remote_command_is_for_me("") is False
+        # ★沒指定機器 → 這一台要做★（收得到信＝正在跑會診查詢）
+        assert cq._remote_command_is_for_me("") is True
 
-    def test_there_is_no_broadcast_target(self):
-        """★[外審 SI 第 1 輪 P1-1] 沒有「全部」★
+    def test_dedup_is_not_the_seen_flag(self):
+        """★機器可省略之後，已讀旗標就不能當去重★
 
-        已讀旗標是【信箱全域】的狀態：第一台處理完就把信標掉，其他還沒
-        SEARCH 的機器再也看不到那封 UNSEEN —— 廣播根本沒有廣播到。
-        要做對得另外設計「UID+主機名的本機收據」，而那是為了一個
-        「一封信重開所有診間電腦」的高風險功能再加一套機器。直接拿掉。
+        `\\Seen` 是【信箱全域】的狀態：第一台標掉之後其他台再也搜不到那封
+        UNSEEN —— 於是只有一台會動作。所以改用【本機收據】。
         """
-        assert not hasattr(cq, "_REMOTE_CMD_ALL")
-        code = _fn_body_code(SRC, "_remote_command_is_for_me")
-        assert "全部" not in code
+        body = _strip_comments(_fn_src(SRC, "_poll_remote_commands"))
+        i = body.index("_claim_remote_command(")
+        j = body.index("_run_remote_command(")
+        assert i < j, "★要先把收據落地才可以執行★"
 
-    def test_an_unknown_hostname_never_matches(self, monkeypatch):
-        """取不到自己的名字時，不可以「猜」自己就是目標。"""
+    def test_an_unknown_hostname_never_matches_a_named_target(self,
+                                                              monkeypatch):
+        """取不到自己的名字時，不可以「猜」自己就是【被指名】的那一台。
+        （沒有指名的那種本來就與名字無關。）"""
         monkeypatch.setattr(cq, "_this_machine_name", lambda: "")
         assert cq._remote_command_is_for_me("PC-1") is False
-        assert cq._remote_command_is_for_me("") is False
+        assert cq._remote_command_is_for_me("") is True
 
 
 class TestAuthorizationIsFailClosed:
@@ -134,29 +150,30 @@ class TestAuthorizationIsFailClosed:
     def _poll(monkeypatch, item, allow=("doc@x.tw",)):
         ran, marked = [], []
         monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-1")
-        monkeypatch.setattr(
-            ir, "check_commands",
-            lambda *a, **k: {"items": [item], "error": None})
         monkeypatch.setattr(ir, "mark_uids_seen",
                             lambda uids: marked.append(list(uids)) or True)
+        monkeypatch.setattr(cq, "_claim_remote_command", lambda key: True)
         monkeypatch.setattr(cq, "_run_remote_command",
                             lambda action, sender: ran.append(action))
         monkeypatch.setattr(cq, "_alert_trigger_rejected", lambda s: None)
         cq._poll_remote_commands({"allowed_trigger_senders": list(allow)},
-                                 {"items": [item], "error": None})
+                                 {"items": [item], "error": None,
+                                  "uidvalidity": "9"})
         return ran, marked
 
     @staticmethod
     def _item(**kw):
         base = {"uid": "7", "sender": "doc@x.tw", "authenticated": True,
-                "subject": "[皮膚科遠端指令] 重啟打卡 PC-1", "age_sec": 10.0}
+                "subject": "皮膚科打卡重啟 PC-1", "age_sec": 10.0}
         base.update(kw)
         return base
 
     def test_an_authorised_command_runs(self, monkeypatch):
         ran, marked = self._poll(monkeypatch, self._item())
         assert ran == ["restart_autoclock"]
-        assert marked == [["7"]]
+        # ★要執行的那一封【不標已讀】★:已讀是信箱全域的,標掉之後其他
+        #   正在跑會診查詢的電腦就再也看不到這封信了(去重改用本機收據)。
+        assert marked == [], "把要執行的指令標成已讀 → 別台再也收不到"
 
     def test_an_unauthenticated_sender_is_refused(self, monkeypatch):
         """★From 是可偽造的純文字★ —— 沒通過 SPF/DKIM/DMARC 就不算數。
@@ -176,7 +193,7 @@ class TestAuthorizationIsFailClosed:
     def test_a_command_for_another_machine_is_ignored(self, monkeypatch):
         ran, marked = self._poll(
             monkeypatch,
-            self._item(subject="[皮膚科遠端指令] 重開機 PC-2"))
+            self._item(subject="皮膚科會診重開 PC-2"))
         assert not ran
         assert not marked, "不是給這台的,連標已讀都不該做(那台還沒收到)"
 
@@ -196,35 +213,41 @@ class TestAuthorizationIsFailClosed:
         assert "_run_imap_commands_with_timeout()" in loop
 
 
-class TestMarkFirstThenExecute:
-    def test_a_command_that_cannot_be_marked_is_not_executed(self,
-                                                             monkeypatch):
-        """★這是與查詢觸發【相反】的取捨★
+class TestClaimFirstThenExecute:
+    """★這是與查詢觸發【相反】的取捨★
 
-        標不掉還執行的話，每一輪(20 秒)都會再重啟一次 —— 無限重啟迴圈，
-        而那正是「程式一直不對勁」時最可能發生的狀況。
-        指令遺失只要重寄一次；指令重複沒有人救得回來。
-        """
+    收據寫不下去還執行的話，每一輪（20 秒）都會再做一次 —— 無限重啟／
+    重開機迴圈，而那正是「程式一直不對勁」時最可能發生的狀況。
+    指令遺失只要重寄一次；指令重複沒有人救得回來。
+    """
+
+    @staticmethod
+    def _poll(monkeypatch, claim_ok):
         ran = []
         monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-1")
-        monkeypatch.setattr(ir, "check_commands", lambda *a, **k: {
-            "items": [{"uid": "7", "sender": "doc@x.tw", "authenticated": True,
-                       "subject": "[皮膚科遠端指令] 重開機 PC-1",
-                       "age_sec": 1.0}], "error": None})
-        monkeypatch.setattr(ir, "mark_uids_seen", lambda uids: False)
+        monkeypatch.setattr(cq, "_claim_remote_command", lambda key: claim_ok)
+        monkeypatch.setattr(ir, "mark_uids_seen", lambda uids: True)
         monkeypatch.setattr(cq, "_run_remote_command",
                             lambda a, s: ran.append(a))
         cq._poll_remote_commands(
             {"allowed_trigger_senders": ["doc@x.tw"]},
             {"items": [{"uid": "7", "sender": "doc@x.tw",
                         "authenticated": True, "expired": False,
-                        "subject": "[皮膚科遠端指令] 重開機 PC-1",
-                        "age_sec": 1.0}], "error": None})
-        assert not ran
+                        "subject": "皮膚科會診重開 PC-1",
+                        "age_sec": 1.0}], "error": None,
+             "uidvalidity": "9"})
+        return ran
 
-    def test_marking_happens_before_running(self):
+    def test_a_command_whose_receipt_cannot_be_written_is_not_executed(
+            self, monkeypatch):
+        assert not self._poll(monkeypatch, False)
+
+    def test_a_claimed_command_runs(self, monkeypatch):
+        assert self._poll(monkeypatch, True) == ["reboot"]
+
+    def test_claiming_happens_before_running(self):
         body = _strip_comments(_fn_src(SRC, "_poll_remote_commands"))
-        assert body.index("_ack_command_mail(") < body.index(
+        assert body.index("_claim_remote_command(") < body.index(
             "_run_remote_command(")
 
 
@@ -375,8 +398,8 @@ class TestTheCommandScanKeepsThePrivacyBoundary:
             io.open(os.path.join(REPO_ROOT, "src", "cmuh_common",
                                  "imap_reader.py"), encoding="utf-8").read(),
             "check_commands")
-        assert "startswith(prefix)" in code
-        i = code.index("startswith(prefix)")
+        assert "startswith(h)" in code
+        i = code.index("startswith(h)")
         j = code.index("'subject'")
         assert i < j, "★先確認是我們的指令信,才可以把主旨交出去★"
 
@@ -418,14 +441,14 @@ class TestTerminalDispositionsAreAcknowledged:
     def test_a_malformed_command_is_acknowledged(self, monkeypatch):
         assert self._poll(monkeypatch, {
             "uid": "7", "sender": "doc@x.tw", "authenticated": True,
-            "subject": "[皮膚科遠端指令] 亂寫", "age_sec": 1.0,
+            "subject": "皮膚科會診重開 PC-1 亂寫", "age_sec": 1.0,
             "expired": False}) == [["7"]]
 
     def test_an_expired_command_is_acknowledged(self, monkeypatch):
         """過期是【絕對】的（依伺服器收信時刻）→ 誰看到誰結案。"""
         assert self._poll(monkeypatch, {
             "uid": "7", "sender": "doc@x.tw", "authenticated": True,
-            "subject": "[皮膚科遠端指令] 重開機 PC-1", "age_sec": 99999.0,
+            "subject": "皮膚科會診重開 PC-1", "age_sec": 99999.0,
             "expired": True}) == [["7"]]
 
     def test_an_expired_command_tells_the_sender_why_nothing_happened(
@@ -446,15 +469,11 @@ class TestTerminalDispositionsAreAcknowledged:
             {"allowed_trigger_senders": ["doc@x.tw"]},
             {"items": [{"uid": "7", "sender": "doc@x.tw",
                         "authenticated": True, "expired": True,
-                        "subject": "[皮膚科遠端指令] 重開機 全部",
+                        "subject": "皮膚科會診重開",
                         "age_sec": 99999.0}], "error": None})
         assert replies, "★過期＝沒有任何機器接手,卻沒有告訴使用者★"
-        # ★不可以只驗「全部」這兩個字★:回信本來就會把目標原樣回聲一次,
-        #   那個斷言會被【回聲】滿足而不是被指引滿足(突變驗證量到:把那句
-        #   指引整行刪掉,測試照樣綠)。要驗指引本身獨有的字。
-        assert "不支援" in replies[0], "要講出「不支援全部」這個常見誤解"
-        assert "一次只能指定一台" in replies[0]
-        assert "沒有在跑" in replies[0]
+        assert "沒有指定" in replies[0], "要說出這封信是「不指定機器」那一種"
+        assert "沒有任何一台在跑會診查詢" in replies[0]
 
     def test_an_expired_command_from_a_stranger_gets_no_reply(self,
                                                               monkeypatch):
@@ -469,7 +488,7 @@ class TestTerminalDispositionsAreAcknowledged:
             {"allowed_trigger_senders": ["doc@x.tw"]},
             {"items": [{"uid": "7", "sender": "evil@x.tw",
                         "authenticated": False, "expired": True,
-                        "subject": "[皮膚科遠端指令] 重開機 PC-1",
+                        "subject": "皮膚科會診重開 PC-1",
                         "age_sec": 99999.0}], "error": None})
 
     def test_a_command_for_another_machine_is_left_unread(self, monkeypatch):
@@ -477,7 +496,7 @@ class TestTerminalDispositionsAreAcknowledged:
         它不會永遠留著：半小時後會變成「已過期」而被結掉。"""
         assert self._poll(monkeypatch, {
             "uid": "7", "sender": "doc@x.tw", "authenticated": True,
-            "subject": "[皮膚科遠端指令] 重開機 PC-9", "age_sec": 1.0,
+            "subject": "皮膚科會診重開 PC-9", "age_sec": 1.0,
             "expired": False}) == []
 
 
@@ -546,6 +565,27 @@ class TestTheScanIsBounded:
         assert not out.get("error"), (
             "★放生的指令掃描把臨床觸發檢查一起擋掉了★:" + str(out.get("error")))
         assert out["scanned"] == 5
+
+    def test_the_scan_asks_for_every_phrase(self):
+        """★少傳一個短語＝那個指令永遠收不到★（掃描只回主旨開頭符合的信）。
+        突變驗證量到：寫死成單一短語，其他測試全綠。
+        """
+        code = _fn_body_code(SRC, "_run_imap_commands_with_timeout")
+        assert "list(_REMOTE_CMD_PHRASES)" in code
+
+    def test_the_scanner_returns_uidvalidity(self):
+        """★收據的鍵要含 UIDVALIDITY★ 沒回傳的話鍵就只剩 uid ——
+        信箱被重建過之後，舊收據會壓住一封剛好撞到同號的新指令。
+        """
+        ir_src = io.open(os.path.join(REPO_ROOT, "src", "cmuh_common",
+                                      "imap_reader.py"), encoding="utf-8").read()
+        code = _fn_body_code(ir_src, "check_commands")
+        # ★要驗「有沒有把它【指派】進回傳值」★:只驗字面出現的話,
+        #   `out` 的初始化與 `conn.response("UIDVALIDITY")` 都含那些字 ——
+        #   把指派那一行刪掉,測試照樣綠(突變驗證量到)。
+        assert "out['uidvalidity'] =" in code, (
+            "沒有把伺服器回的 UIDVALIDITY 放進回傳值")
+        assert "response('UIDVALIDITY')" in code
 
     def test_the_scanner_never_calls_logout(self):
         """★同檔註解明文禁止★：`logout()` 送 LOGOUT + 等回應，socket 半死
@@ -642,7 +682,7 @@ class TestRejectionIsGloballyDeterministic:
         acked, ran = self._poll(monkeypatch, [{
             "uid": "7", "sender": "evil@x.tw", "authenticated": False,
             "expired": False, "age_sec": 1.0,
-            "subject": "[皮膚科遠端指令] 重開機 NOSUCHPC"}])
+            "subject": "皮膚科會診重開 NOSUCHPC"}])
         assert not ran
         assert acked == [["7"]], (
             "★未授權又不是給這台的 → 留著不動半小時,可被拿來塞滿掃描視窗★")
@@ -653,7 +693,7 @@ class TestRejectionIsGloballyDeterministic:
         acked, ran = self._poll(monkeypatch, [{
             "uid": "7", "sender": "doc@x.tw", "authenticated": True,
             "expired": False, "age_sec": 1.0,
-            "subject": "[皮膚科遠端指令] 重開機 PC-9"}])
+            "subject": "皮膚科會診重開 PC-9"}])
         assert not ran
         assert acked == [], "把別台的指令結案掉了"
 
@@ -685,7 +725,7 @@ class TestAFailedAckSuppressesTheReply:
             {"items": [{"uid": "7", "sender": "doc@x.tw",
                         "authenticated": True, "expired": True,
                         "age_sec": 99999.0,
-                        "subject": "[皮膚科遠端指令] 重開機 PC-1"}],
+                        "subject": "皮膚科會診重開 PC-1"}],
              "error": None})
         return replies
 
@@ -714,30 +754,32 @@ class TestAcknowledgementIsBatchedAndBounded:
         monkeypatch.setattr(cq, "_reply_remote_command", lambda *a, **k: None)
         items = [{"uid": str(i), "sender": "evil@x.tw", "authenticated": False,
                   "expired": False, "age_sec": 1.0,
-                  "subject": "[皮膚科遠端指令] 重開機 PC-1"} for i in range(20)]
+                  "subject": "皮膚科會診重開 PC-1"} for i in range(20)]
         cq._poll_remote_commands({"allowed_trigger_senders": ["doc@x.tw"]},
                                  {"items": items, "error": None})
         assert len(calls) == 1, f"開了 {len(calls)} 次連線(應該合併成一次)"
         assert len(calls[0]) == 20
 
-    def test_actionable_commands_are_still_marked_one_by_one(self,
-                                                             monkeypatch):
-        """★mark-before-execute 不可以批次★:一封標失敗會讓另一封被誤判成
-        已結案 —— 那封就會在下一輪再執行一次。"""
-        calls, ran = [], []
+    def test_actionable_commands_are_claimed_one_by_one(self, monkeypatch):
+        """★claim-before-execute 不可以批次★:一封寫失敗會讓另一封被誤判成
+        已記錄 —— 那封就會在下一輪再執行一次。"""
+        keys, ran = [], []
         monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-1")
+        monkeypatch.setattr(cq, "_claim_remote_command",
+                            lambda key: keys.append(key) or True)
         monkeypatch.setattr(cq, "_ack_command_mail",
-                            lambda uids, why, **k: calls.append(list(uids)) or True)
+                            lambda uids, why, **k: True)
         monkeypatch.setattr(cq, "_run_remote_command",
                             lambda a, s: ran.append(a))
         monkeypatch.setattr(cq, "_reply_remote_command", lambda *a, **k: None)
         items = [{"uid": str(i), "sender": "doc@x.tw", "authenticated": True,
                   "expired": False, "age_sec": 1.0,
-                  "subject": "[皮膚科遠端指令] 重啟打卡 PC-1"} for i in range(3)]
+                  "subject": "皮膚科打卡重啟 PC-1"} for i in range(3)]
         cq._poll_remote_commands({"allowed_trigger_senders": ["doc@x.tw"]},
-                                 {"items": items, "error": None})
+                                 {"items": items, "error": None,
+                                  "uidvalidity": "9"})
         assert len(ran) == 3
-        assert calls == [["0"], ["1"], ["2"]], calls
+        assert keys == ["9:0", "9:1", "9:2"], keys
 
     def test_the_ack_itself_is_bounded_and_force_closes(self):
         code = _fn_body_code(SRC, "_ack_command_mail")
@@ -777,7 +819,343 @@ class TestTheSubjectMustHaveExactlyThreeParts:
 
     def test_exactly_two_tokens_still_parse(self):
         assert cq.parse_remote_command(
-            "[皮膚科遠端指令] 重開機 PC-1") == ("reboot", "PC-1")
+            "皮膚科會診重開 PC-1") == ("reboot", "PC-1")
+
+
+class TestTheLocalReceiptIsTheDedup:
+    """★機器名稱可省略之後，去重只能靠本機收據★（使用者定案 2026-08-11）
+
+    已讀旗標是【信箱全域】的：第一台標掉之後其他台再也搜不到那封 UNSEEN，
+    於是只有一台會動作。改成每台自己記「這封我做過了」，信件留到過期才標掉。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _iso(self, tmp_path, monkeypatch):
+        import cmuh_common.paths as paths
+        monkeypatch.setattr(paths, "get_settings_dir", lambda: str(tmp_path))
+        yield
+
+    def test_the_same_command_is_claimed_only_once(self):
+        assert cq._claim_remote_command("9:7") is True
+        assert cq._claim_remote_command("9:7") is False
+        assert cq._claim_remote_command("9:8") is True
+
+    def test_the_receipt_survives_a_restart(self):
+        """★這一條就是「不會變成重開機迴圈」的關鍵★
+
+        重開機之後那封信通常【還沒過期】，會再被掃到一次。收據沒有落地的話
+        就會再重開一次，然後再一次…
+        """
+        assert cq._claim_remote_command("9:7") is True
+        importlib.reload(cq)              # 模擬行程重啟（記憶體全清）
+        try:
+            assert cq._claim_remote_command("9:7") is False
+        finally:
+            importlib.reload(cq)
+
+    def test_a_different_uidvalidity_is_a_different_command(self):
+        """UID 只在 UIDVALIDITY 不變時才穩定；信箱重建過就可能撞號。"""
+        assert cq._claim_remote_command("9:7") is True
+        assert cq._claim_remote_command("10:7") is True
+
+    def test_an_unwritable_receipt_means_do_not_execute(self, monkeypatch):
+        import cmuh_common.atomic_io as aio
+        monkeypatch.setattr(
+            aio, "atomic_write_json",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("readonly")))
+        assert cq._claim_remote_command("9:7") is False
+
+    def test_an_unreadable_receipt_means_do_not_execute(self, monkeypatch):
+        """★讀不到＝不知道做過沒有★ → 寧可不做（指令一律 fail-closed）。
+
+        ★[外審 SJ 第 1 輪 P1-2]★ 上一版用 `safe_load_json` 並把它 patch 成
+        【會拋例外】—— 而生產的那個 helper 把讀取錯誤吞掉、回傳 default，
+        永遠不拋。等於在測一個不存在的情境，而真實情況（讀壞→當成空的→
+        照樣執行）沒有任何測試。改用會回報狀態的 `safe_load_json_ex`，
+        並用它真正的回傳形狀來測。
+        """
+        import cmuh_common.atomic_io as aio
+        for status in ("error", "corrupt"):
+            monkeypatch.setattr(aio, "safe_load_json_ex",
+                                lambda *a, _s=status, **k: ({}, _s))
+            assert cq._claim_remote_command("9:7") is False, status
+
+    def test_a_receipt_file_that_is_not_a_dict_means_do_not_execute(
+            self, monkeypatch):
+        import cmuh_common.atomic_io as aio
+        monkeypatch.setattr(aio, "safe_load_json_ex",
+                            lambda *a, **k: (["不是字典"], "ok"))
+        assert cq._claim_remote_command("9:7") is False
+
+    def test_old_receipts_are_pruned(self):
+        old = cq.time.time() - cq._REMOTE_RECEIPT_TTL_SEC - 60
+        assert cq._claim_remote_command("9:old", now=old) is True
+        assert cq._claim_remote_command("9:new") is True
+        import json
+        with open(cq._remote_receipt_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        assert "9:old" not in data, "過期收據沒有被剪掉 → 檔案無限成長"
+        assert "9:new" in data
+
+    def test_the_retention_outlives_the_command_window(self):
+        """收據保留期必須遠大於指令時效，否則過期前收據就先被剪掉→重做。"""
+        assert cq._REMOTE_RECEIPT_TTL_SEC > cq._REMOTE_CMD_MAX_AGE_SEC * 10
+
+    def test_a_corrupt_timestamp_is_dropped_not_kept(self):
+        """★壞掉的時間戳要丟掉，不是留著★
+
+        留著的話它會永遠壓住那個 uid，而 uid 會隨 UIDVALIDITY 重用。
+        """
+        assert cq._remote_receipt_is_fresh("壞掉", 1000.0) is False
+        assert cq._remote_receipt_is_fresh(None, 1000.0) is False
+        assert cq._remote_receipt_is_fresh(0, 1000.0) is False
+        # ★時間戳在【未來】也是壞資料★:時鐘被往前調過,那筆會活很久很久。
+        assert cq._remote_receipt_is_fresh(2000.0, 1000.0) is False
+        # 剛寫下的(age=0)當然還新鮮
+        assert cq._remote_receipt_is_fresh(1000.0, 1000.0) is True
+        assert cq._remote_receipt_is_fresh(999.0, 1000.0) is True
+        assert cq._remote_receipt_is_fresh(
+            1000.0 - cq._REMOTE_RECEIPT_TTL_SEC - 1, 1000.0) is False
+
+
+class TestNoTargetMeansEveryConsultMachine:
+    def test_a_command_with_no_machine_runs_here(self, monkeypatch):
+        """★使用者定案★「皮膚科會診重開」不填機器 → 這一台就要做。
+        會去收這個信箱的就是會診查詢那支程式，沒在跑的看不到那封信。
+        """
+        ran, claimed = [], []
+        monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-1")
+        monkeypatch.setattr(cq, "_claim_remote_command",
+                            lambda key: claimed.append(key) or True)
+        monkeypatch.setattr(cq, "_ack_command_mail", lambda uids, why, **k: True)
+        monkeypatch.setattr(cq, "_run_remote_command",
+                            lambda a, s: ran.append(a))
+        cq._poll_remote_commands(
+            {"allowed_trigger_senders": ["doc@x.tw"]},
+            {"items": [{"uid": "7", "sender": "doc@x.tw",
+                        "authenticated": True, "expired": False,
+                        "subject": "皮膚科會診重開", "age_sec": 1.0}],
+             "error": None, "uidvalidity": "9"})
+        assert ran == ["reboot"]
+        assert claimed == ["9:7"]
+
+    def test_it_is_not_marked_seen_so_other_machines_still_see_it(
+            self, monkeypatch):
+        """★執行過的那一封不可以標已讀★ —— 標掉之後其他正在跑會診查詢的
+        電腦就再也搜不到它了（那正是「不填機器」要涵蓋的那些機器）。"""
+        marked = []
+        monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-1")
+        monkeypatch.setattr(cq, "_claim_remote_command", lambda key: True)
+        monkeypatch.setattr(cq, "_ack_command_mail",
+                            lambda uids, why, **k: marked.append(list(uids)) or True)
+        monkeypatch.setattr(cq, "_run_remote_command", lambda a, s: None)
+        cq._poll_remote_commands(
+            {"allowed_trigger_senders": ["doc@x.tw"]},
+            {"items": [{"uid": "7", "sender": "doc@x.tw",
+                        "authenticated": True, "expired": False,
+                        "subject": "皮膚科會診重開", "age_sec": 1.0}],
+             "error": None, "uidvalidity": "9"})
+        assert marked == []
+
+
+class TestAnExecutedCommandDoesNotLaterClaimNobodyRanIt:
+    """★[外審 SJ 第 1 輪 P1-1]★ 執行過的信【刻意不標已讀】（要留給其他也在
+    跑會診查詢的電腦看），所以 30 分鐘後它會再被掃到一次並走到「已過期」。
+    無條件回信的話，使用者先收到成功信、再收到一封說沒人執行 ——
+    他會再寄一次，於是多一次重啟／重開機。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _iso(self, tmp_path, monkeypatch):
+        import cmuh_common.paths as paths
+        monkeypatch.setattr(paths, "get_settings_dir", lambda: str(tmp_path))
+        yield
+
+    @staticmethod
+    def _expire(monkeypatch, replies):
+        monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-1")
+        monkeypatch.setattr(cq, "_ack_command_mail", lambda uids, why, **k: True)
+        monkeypatch.setattr(cq, "_run_remote_command", lambda a, s: None)
+        monkeypatch.setattr(cq, "_reply_remote_command",
+                            lambda s, subj, body, **k: replies.append(
+                                (subj, body)))
+        cq._poll_remote_commands(
+            {"allowed_trigger_senders": ["doc@x.tw"]},
+            {"items": [{"uid": "7", "sender": "doc@x.tw",
+                        "authenticated": True, "expired": True,
+                        "subject": "皮膚科會診重開", "age_sec": 99999.0}],
+             "error": None, "uidvalidity": "9"})
+
+    @staticmethod
+    def _run_it(monkeypatch, *, crash=False):
+        """跑完一次正常的執行路徑（或在執行途中掛掉）。"""
+        monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-1")
+        monkeypatch.setattr(cq, "_ack_command_mail", lambda uids, why, **k: True)
+
+        def _boom(action, sender):
+            raise RuntimeError("執行途中掛掉")
+
+        monkeypatch.setattr(cq, "_run_remote_command",
+                            _boom if crash else (lambda a, s: None))
+        scan = {"items": [{"uid": "7", "sender": "doc@x.tw",
+                           "authenticated": True, "expired": False,
+                           "subject": "皮膚科會診重開", "age_sec": 1.0}],
+                "error": None, "uidvalidity": "9"}
+        cfg = {"allowed_trigger_senders": ["doc@x.tw"]}
+        if crash:
+            with pytest.raises(RuntimeError):
+                cq._poll_remote_commands(cfg, scan)
+        else:
+            cq._poll_remote_commands(cfg, scan)
+
+    def test_a_command_we_already_ran_gets_no_failure_reply(self, monkeypatch):
+        self._run_it(monkeypatch)
+        replies = []
+        self._expire(monkeypatch, replies)
+        assert not replies, "★做過了卻回信說沒人做★ 使用者會再寄一次"
+
+    def test_a_command_nobody_ran_still_gets_the_reply(self, monkeypatch):
+        replies = []
+        self._expire(monkeypatch, replies)
+        assert replies, "真的沒人做的時候要講"
+
+    def test_claiming_another_command_does_not_drop_the_earlier_receipt(self):
+        """★剪枝不可以把還在保留期內的別筆丟掉★ → 那就是重開機迴圈。
+
+        `_claim_remote_command` 是「先看鍵在不在，再剪枝、再寫回」。舊收據
+        被剪掉不會當場出事 —— 出事的是【下一封指令進來之後】：那一封把檔案
+        重寫成只剩它自己，於是前一封（信還沒過期、還在信箱裡）又變成沒做過，
+        下一輪再重開一次。收據的值換形狀時，剪枝那一段最容易忘了跟著換。
+        """
+        assert cq._claim_remote_command("9:7") is True
+        assert cq._claim_remote_command("9:8") is True
+        assert cq._claim_remote_command("9:7") is False, (
+            "★第一封被剪掉了★ 它的信還在信箱裡,會被再執行一次")
+
+    def test_claiming_is_not_the_same_as_having_run_it(self, monkeypatch):
+        """★[外審 SJ 第 2 輪 P1]★ 收據是【執行之前】就落地的（不然重開機之後
+        會再重開一次）。只看「鍵在不在」的話，claim 到執行之間掛掉會被講成
+        執行過 —— 連帶把過期通知也吃掉，使用者兩頭落空：既沒做，也沒人告訴他。
+        """
+        assert cq._claim_remote_command("9:7") is True
+        assert cq._remote_command_was_done("9:7") is False, (
+            "★claim ≠ 做完★")
+        cq._mark_remote_command_done("9:7")
+        assert cq._remote_command_was_done("9:7") is True
+
+    def test_a_crash_midway_still_lets_the_user_know(self, monkeypatch):
+        self._run_it(monkeypatch, crash=True)
+        assert cq._claim_remote_command("9:7") is False, (
+            "claim 還在 → 不會重複執行")
+        replies = []
+        self._expire(monkeypatch, replies)
+        assert replies, "★沒做完就要講★ 不然使用者以為做好了"
+
+
+class TestTheExpiryReplyOnlySpeaksForThisMachine:
+    """★[外審 SJ 第 2 輪 P1]★ 一台機器沒有「全體有沒有做」的資訊。
+
+    不指定機器的信要留給每一台看，所以永遠 UNSEEN —— 晚開機、或 IMAP 斷了
+    半小時的那一台，第一眼看到的就是「已過期」，它身上當然沒有收據。
+    舊文案讓它代表全體宣告「沒有被任何機器執行」，而別台可能早就做完並寄了
+    成功信；使用者於是再寄一次，門診中多一次重開機。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _iso(self, tmp_path, monkeypatch):
+        import cmuh_common.paths as paths
+        monkeypatch.setattr(paths, "get_settings_dir", lambda: str(tmp_path))
+        yield
+
+    @staticmethod
+    def _reply(monkeypatch):
+        sent = []
+        monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-2")
+        monkeypatch.setattr(cq, "_ack_command_mail", lambda uids, why, **k: True)
+        monkeypatch.setattr(cq, "_run_remote_command", lambda a, s: None)
+        monkeypatch.setattr(cq, "_reply_remote_command",
+                            lambda s, subj, body, **k: sent.append((subj, body)))
+        cq._poll_remote_commands(
+            {"allowed_trigger_senders": ["doc@x.tw"]},
+            {"items": [{"uid": "7", "sender": "doc@x.tw",
+                        "authenticated": True, "expired": True,
+                        "subject": "皮膚科會診重開 PC-1", "age_sec": 99999.0}],
+             "error": None, "uidvalidity": "9"})
+        assert len(sent) == 1
+        return sent[0]
+
+    def test_it_does_not_claim_to_speak_for_every_machine(self, monkeypatch):
+        subj, body = self._reply(monkeypatch)
+        assert "沒有被任何機器執行" not in body, (
+            "★這台機器不知道別台做了沒有★")
+        assert "任何機器" not in subj
+
+    def test_it_names_the_machine_that_did_not_run_it(self, monkeypatch):
+        subj, body = self._reply(monkeypatch)
+        assert "PC-2" in body, "要講清楚是哪一台在說話"
+        assert "本機沒有執行" in subj
+
+    def test_it_tells_the_user_not_to_resend(self, monkeypatch):
+        _subj, body = self._reply(monkeypatch)
+        assert "不要再寄一次" in body, (
+            "★沒有這一句就等於叫他再寄一次★（別台可能早就做完了）")
+
+
+class TestAMissingUidvalidityIsFailClosed:
+    """★[外審 SJ 第 1 輪 P2-3]★ 收據的鍵會變成 `":<uid>"`；下一輪拿到真的
+    UIDVALIDITY 之後鍵就不一樣了，同一封未讀信會【再執行一次】。
+    """
+
+    def test_nothing_is_executed_without_uidvalidity(self, monkeypatch):
+        ran, marked = [], []
+        monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-1")
+        monkeypatch.setattr(cq, "_claim_remote_command", lambda key: True)
+        monkeypatch.setattr(cq, "_ack_command_mail",
+                            lambda uids, why, **k: marked.append(list(uids)) or True)
+        monkeypatch.setattr(cq, "_run_remote_command",
+                            lambda a, s: ran.append(a))
+        cq._poll_remote_commands(
+            {"allowed_trigger_senders": ["doc@x.tw"]},
+            {"items": [{"uid": "7", "sender": "doc@x.tw",
+                        "authenticated": True, "expired": False,
+                        "subject": "皮膚科會診重開", "age_sec": 1.0}],
+             "error": None, "uidvalidity": ""})
+        assert not ran
+        assert marked == [], "不執行的也不可以標已讀(它要能自然過期)"
+
+
+class TestReplyPrefixesSurviveTheScanner:
+    """★[外審 SJ 第 1 輪 P2-4]★ 掃描端原本是 `subj.startswith(短語)`，而解析端
+    是在任意位置 `find` —— 於是 `Re: 皮膚科會診重開` 在掃描端就被濾掉，
+    根本到不了解析端，而契約明明說允許 `Re:`。★兩邊各寫一套判準，
+    就會有一邊靜默失效。★
+    """
+
+    def test_the_two_sides_share_one_normaliser(self):
+        scan = _fn_body_code(
+            io.open(os.path.join(REPO_ROOT, "src", "cmuh_common",
+                                 "imap_reader.py"), encoding="utf-8").read(),
+            "check_commands")
+        assert "normalize_subject(subj)" in scan
+        assert "normalize_subject(subject)" in _fn_body_code(
+            SRC, "parse_remote_command")
+
+    def test_reply_prefixes_are_stripped(self):
+        assert ir.normalize_subject("Re: 皮膚科會診重開") == "皮膚科會診重開"
+        assert ir.normalize_subject("RE: Re: 皮膚科會診重開") == "皮膚科會診重開"
+        assert ir.normalize_subject("Fwd: 　皮膚科會診重開 PC-1") == (
+            "皮膚科會診重開 PC-1")
+        assert ir.normalize_subject("回覆: 皮膚科會診重開") == "皮膚科會診重開"
+        assert ir.normalize_subject(None) == ""
+
+    def test_a_replied_command_still_parses(self):
+        assert cq.parse_remote_command(
+            "Re: 皮膚科會診重開") == ("reboot", "")
+
+    def test_the_phrase_must_be_at_the_start(self):
+        """★不可以用 `find`★:那會讓「請不要寄 皮膚科會診重開」也變成指令。"""
+        assert cq.parse_remote_command(
+            "請不要寄 皮膚科會診重開") == (None, "")
 
 
 if __name__ == "__main__":       # pragma: no cover

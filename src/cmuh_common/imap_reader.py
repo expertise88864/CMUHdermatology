@@ -482,9 +482,32 @@ def command_is_expired(age_sec, max_age_sec) -> bool:
     return age_sec is None or age_sec > max_age_sec
 
 
-def check_commands(prefix: str, timeout: float = 12.0,
+_REPLY_PREFIX_RE = re.compile(r"^\s*(re|fw|fwd|回覆|轉寄)\s*:\s*",
+                              re.IGNORECASE)
+
+
+def normalize_subject(subject) -> str:
+    """主旨正規化（全形空白→半形、剝掉 `Re:`/`Fwd:` 之類的前綴）。純函式。
+
+    ★[外審 SJ 第 1 輪 P2-4] 掃描端與解析端必須用【同一個】正規化★
+    掃描端原本是 `subj.startswith(短語)`，而解析端是在任意位置 `find`。
+    於是 `Re: 皮膚科會診重開` 在掃描端就被濾掉，根本到不了解析端 ——
+    契約明明說允許 `Re:`。兩邊各寫一套判準，就會有一邊靜默失效。
+    """
+    text = str(subject or "").replace("　", " ").strip()
+    for _ in range(4):          # 有些客戶端會疊好幾層 `Re: Re:`
+        stripped = _REPLY_PREFIX_RE.sub("", text).strip()
+        if stripped == text:
+            break
+        text = stripped
+    return text
+
+
+def check_commands(prefixes, timeout: float = 12.0,
                    max_age_sec: Optional[float] = None) -> dict:
-    """掃未讀信裡【主旨以 prefix 開頭】的遠端指令信。→ {"items": [...], "error": ...}
+    """掃未讀信裡【主旨以其中一個短語開頭】的遠端指令信。
+
+    → `{"items": [...], "error": ..., "uidvalidity": "..."}`
 
     每個 item：`{"uid", "sender", "authenticated", "subject", "age_sec"}`。
 
@@ -498,9 +521,10 @@ def check_commands(prefix: str, timeout: float = 12.0,
     ★本函式【不改任何 flag】★：要不要標已讀由呼叫端決定（指令的取捨與查詢
     觸發相反，見 consult_query 的說明）。
     """
-    out: dict = {"items": [], "error": None}
-    if not prefix:
-        out["error"] = "prefix 為空"
+    out: dict = {"items": [], "error": None, "uidvalidity": ""}
+    heads = [str(p) for p in (prefixes or []) if str(p)]
+    if not heads:
+        out["error"] = "沒有給任何指令短語"
         return out
     s = _load_imap_settings()
     if not s["password"]:
@@ -514,6 +538,18 @@ def check_commands(prefix: str, timeout: float = 12.0,
         _set_active(conn)
         conn.login(s["username"], s["password"])
         conn.select("INBOX")
+        # ★UIDVALIDITY★ 呼叫端拿它跟 uid 一起當【本機收據】的鍵:
+        #   UID 只在 UIDVALIDITY 不變時才穩定。信箱被重建過的話,
+        #   舊收據可能壓住一封剛好撞到同一個 uid 的新指令。
+        try:
+            uv = conn.response("UIDVALIDITY")[1]
+            if uv and uv[0]:
+                out["uidvalidity"] = (
+                    uv[0].decode() if isinstance(uv[0], bytes)
+                    else str(uv[0]))
+        except Exception:
+            logging.debug("[IMAP] 取 UIDVALIDITY 失敗(用空字串)",
+                          exc_info=True)
         # 中文前綴在 imaplib 的 ASCII 編碼階段就會拋 → 一律走「撈 UNSEEN 後
         # client 端比對」，與 `check_trigger` 的後備路徑同一個做法。
         typ, data = conn.uid("search", "UNSEEN")
@@ -538,7 +574,8 @@ def check_commands(prefix: str, timeout: float = 12.0,
                         header_raw = part[1]
                         break
                 subj, from_str, auth_str = _parse_trigger_headers(header_raw)
-                if not subj.strip().startswith(prefix):
+                if not any(normalize_subject(subj).startswith(h)
+                           for h in heads):
                     continue        # ★不是我們的指令信 → 主旨連交出去都不交★
                 addr = (parseaddr(from_str)[1] or "").strip().lower()
                 out["items"].append({

@@ -7375,43 +7375,50 @@ def _rebuild_schedule() -> None:
             int(cfg.get("quiet_start_hour", 0)), int(cfg.get("quiet_end_hour", 6)))
 
 
-# ══ 遠端指令（2026-08-11 使用者定案）═══════════════════════════════════════
+# ══ 遠端指令（2026-08-11 使用者定案；短語與去重於同日改版）══════════════
 #
-# 主旨格式：`[皮膚科遠端指令] <動作> <機器>`
-#   動作：重啟會診 / 重啟打卡 / 重開機
-#   機器：電腦名稱（告警信裡的「發生在：」那個）—— ★一律必填、一次一台★
+# 主旨【開頭】是下面其中一句就算數（不用括號、不用填機器）：
+#     皮膚科會診重開   → 重開那台電腦
+#     皮膚科會診重啟   → 只重啟會診查詢程式
+#     皮膚科打卡重啟   → 只重啟打卡程式
+# 想指定單一台時，在後面加一個空白 + 電腦名稱（告警信「發生在：」那個）。
 #
-# ★為什麼「機器」是【必填】★
-#   所有診間電腦共用同一個信箱、各自輪詢。不指定的話一封信會讓【每一台】
-#   都動作 —— 對「重開機」那條尤其危險。對不上本機名稱的一律忽略
-#   （也不回信，否則一封信會收到 N 封回覆）。
+# ★不填機器＝所有【正在跑會診查詢】的電腦★（使用者定案 2026-08-11）
+#   這不是「廣播到全部電腦」——會去收這個信箱的只有會診查詢那支程式，
+#   所以「收得到指令」與「正在執行會診程式」是同一件事。沒在跑的電腦
+#   根本看不到那封信，自然不會動作。
+#
+# ★去重不可以用已讀旗標★（這是機器可省略之後的必然結果）
+#   `\Seen` 是【信箱全域】的狀態：第一台標掉之後，其他台再也搜不到那封
+#   UNSEEN —— 於是只有一台會動作。改用【本機收據】：每台自己記下
+#   「這封信我做過了」，信件本身留到過期才標掉。
+#   收據以 (UIDVALIDITY, uid) 為鍵並【落地】—— ★重開機之後那封信通常
+#   還沒過期，沒有落地的收據就會再重開一次，變成重開機迴圈。★
 #
 # ★指令一律強制驗證，不看 `require_authenticated_trigger`★
 #   那個設定是給查詢觸發的（誤觸發的代價是多寄一封信）。指令的代價是重啟
 #   臨床自動化、甚至重開一台診間電腦 —— 沒有任何情況值得為它開後門。
 #   From 是可偽造的純文字，所以必須通過 SPF/DKIM/DMARC 才算數。
 #
-# ★順序與查詢觸發【相反】：先標已讀，再執行★
+# ★先寫收據、再執行★（與查詢觸發的順序相反）
 #   查詢觸發是「先落地 journal 再標已讀」，因為漏掉一次查詢＝醫師乾等。
-#   指令反過來：標不掉就別執行。理由是失敗模式不對稱 ——
+#   指令反過來：收據寫不下去就別執行。失敗模式不對稱 ——
 #     * 指令遺失：使用者沒收到回信，重寄一次就好（可恢復）；
-#     * 指令重複：標已讀一直失敗的話，每一輪都重啟一次 → ★無限重啟迴圈★，
-#       而且那正是「程式一直沒好」時最可能發生的狀況。
-_REMOTE_CMD_PREFIX = "[皮膚科遠端指令]"
+#     * 指令重複：每一輪都重啟一次 → ★無限重啟/重開機迴圈★，
+#       而那正是「程式一直沒好」時最可能發生的狀況。
+#: 主旨開頭的固定短語 → 內部代號。★完全比對開頭，絕不模糊比對★
+#   （「重開」與「重啟」差一個字，代價差很多）。
+_REMOTE_CMD_PHRASES = {
+    "皮膚科會診重開": "reboot",
+    "皮膚科會診重啟": "restart_consult",
+    "皮膚科打卡重啟": "restart_autoclock",
+}
 _REMOTE_CMD_MAX_AGE_SEC = 30 * 60.0      # 半小時前的指令不再執行
 _REMOTE_REPLY_WAIT_SEC = 30.0            # 要重啟時,等回信寄完的上限
-# ★[外審 SI 第 1 輪 P1-1] 沒有「全部」這個目標★
-#   我原本設計了 `全部`,但 `\Seen` 是【信箱全域】的狀態:第一台處理完就把信
-#   標掉,其他還沒 SEARCH 的機器再也看不到那封 UNSEEN —— 廣播根本沒有廣播到。
-#   要做對得另外設計「UID+主機名的本機收據」,而那等於為了一個
-#   「一封信重開所有診間電腦」的高風險功能再加一套機器。
-#   ★直接拿掉★:機器名稱一律必填,一次一台。
-#: 動作字樣 → 內部代號。只認完全比對的字樣，絕不模糊比對。
-_REMOTE_CMD_ACTIONS = {
-    "重啟會診": "restart_consult",
-    "重啟打卡": "restart_autoclock",
-    "重開機": "reboot",
-}
+#: 收據保留多久（必須遠大於指令時效，否則過期前收據就先被剪掉→重做）。
+_REMOTE_RECEIPT_TTL_SEC = 24 * 3600.0
+_REMOTE_RECEIPT_FILE = "consult_remote_receipts.json"
+_remote_receipt_lock = threading.Lock()
 
 
 def _this_machine_name() -> str:
@@ -7424,29 +7431,154 @@ def _this_machine_name() -> str:
 def parse_remote_command(subject: str) -> tuple:
     """主旨 → (動作代號, 目標機器)；不是合法指令回 (None, "")。純函式。
 
+    目標為空字串＝沒有指定機器＝每一台【正在跑會診查詢】的電腦都做。
+
     ★寬鬆的地方只有空白★：郵件客戶端會插入 `Re:`、多餘空白、全形空格。
-    動作與機器名稱本身一律【完全比對】—— 模糊比對在這種地方是災難
-    （「重開機」與「重啟會診」差一個字，代價差很多）。
+    短語與機器名稱本身一律【完全比對】。
+    ★短語後面必須是空白或結束★：`皮膚科會診重開機` 不是「皮膚科會診重開」
+    加一個叫「機」的電腦 —— 那種主旨不執行任何東西。
     """
-    text = str(subject or "").replace("　", " ").strip()
-    i = text.find(_REMOTE_CMD_PREFIX)
-    if i < 0:
-        return None, ""
-    rest = text[i + len(_REMOTE_CMD_PREFIX):].split()
-    if len(rest) != 2:
-        # ★剛好兩段★:機器必填(少了會讓每一台都動作),而多出來的字
-        #   代表這封信不是我們約定的格式 —— `重開機 PC-1 順便清一下`
-        #   不可以被當成「重開機 PC-1」執行。寬鬆的地方只有空白。
-        return None, ""
-    action = _REMOTE_CMD_ACTIONS.get(rest[0])
-    if action is None:
-        return None, ""
-    return action, rest[1]
+    from cmuh_common.imap_reader import normalize_subject  # noqa: PLC0415
+    # ★與掃描端共用同一個正規化★(外審 SJ 第 1 輪 P2-4):兩邊各寫一套
+    #   的話會有一邊靜默失效 —— `Re: 皮膚科會診重開` 曾經在掃描端就被
+    #   濾掉,根本到不了這裡。
+    text = normalize_subject(subject)
+    for phrase, action in _REMOTE_CMD_PHRASES.items():
+        if not text.startswith(phrase):
+            # ★必須在【開頭】★:`find` 會讓「請不要寄 皮膚科會診重開」
+            #   也被當成指令。
+            continue
+        rest = text[len(phrase):]
+        if rest and not rest[:1].isspace():
+            continue        # 短語後面直接接別的字 → 不是這一句
+        parts = rest.split()
+        if len(parts) > 1:
+            # 多出來的字代表這封信不是我們約定的格式 ——
+            # 「皮膚科會診重開 PC-1 順便清一下」不可以被當成指令執行。
+            return None, ""
+        return action, (parts[0] if parts else "")
+    return None, ""
 
 
 def _remote_command_is_for_me(target: str) -> bool:
+    """這封指令要不要由本機執行。
+
+    ★沒有指定機器 → 要★（見檔頭：會去收信的就是正在跑會診查詢的電腦）。
+    有指定就必須完全相符；取不到自己的電腦名稱時不可以「猜」自己是目標。
+    """
+    if not target:
+        return True
     me = _this_machine_name()
-    return bool(target) and bool(me) and target == me
+    return bool(me) and target == me
+
+
+def _remote_receipt_path() -> str:
+    from cmuh_common.paths import get_settings_dir  # noqa: PLC0415
+    return os.path.join(get_settings_dir(), _REMOTE_RECEIPT_FILE)
+
+
+def _remote_command_was_done(key: str) -> bool:
+    """這封指令【本機】確實執行完了嗎（純查詢，不寫入）。
+
+    給「過期時要不要回信」用：執行過的信刻意不標已讀（要留給其他也在跑
+    會診查詢的電腦看），所以它 30 分鐘後會再被掃到一次。
+    讀不到就回 False —— 這裡 fail-open 的方向是「多回一封信」，無害。
+
+    ★[外審 SJ 第 2 輪 P1] 收據存在 ≠ 執行過★
+    收據是【執行之前】就落地的（claim-before-execute，不然重開機之後會
+    再重開一次）。claim 到 `_run_remote_command` 之間掛掉的話，收據還在，
+    卻什麼都沒做 —— 只看「鍵在不在」會把它講成執行過，連帶把過期通知也
+    吃掉，使用者兩頭落空。所以拆兩段：claim 擋重複執行，done 才代表做完。
+    """
+    from cmuh_common.atomic_io import safe_load_json_ex  # noqa: PLC0415
+    with _remote_receipt_lock:
+        data, status = safe_load_json_ex(_remote_receipt_path(), {},
+                                         backup_on_corrupt=False)
+    if status not in ("ok", "missing") or not isinstance(data, dict):
+        return False
+    rec = data.get(key)
+    return isinstance(rec, dict) and bool(rec.get("done"))
+
+
+def _mark_remote_command_done(key: str) -> None:
+    """執行完成才蓋這一章（見 `_remote_command_was_done`）。
+
+    盡力而為：寫不下去只會多一封誠實的過期通知，不影響「不重複執行」——
+    那一條靠的是 claim 那一筆，早就落地了。
+    """
+    from cmuh_common.atomic_io import (  # noqa: PLC0415
+        atomic_write_json, safe_load_json_ex,
+    )
+    path = _remote_receipt_path()
+    with _remote_receipt_lock:
+        data, status = safe_load_json_ex(path, {}, backup_on_corrupt=False)
+        if status not in ("ok", "missing") or not isinstance(data, dict):
+            return
+        rec = data.get(key)
+        if not isinstance(rec, dict):
+            return
+        rec["done"] = True
+        try:
+            atomic_write_json(path, data)
+        except Exception:
+            logging.warning("[遠端] 執行完成的收據寫不下去"
+                            "（只會多一封過期通知）", exc_info=True)
+
+
+def _claim_remote_command(key: str, now=None) -> bool:
+    """★做之前先把收據落地★ → 這一封是不是「我還沒做過、而且已經記下來了」。
+
+    回 False 有兩種情況，兩種都不可以執行：
+      * 收據裡已經有它 → 我做過了（重開機之後那封信通常還沒過期，
+        靠的就是這一條，★不然會變成重開機迴圈★）；
+      * 寫不下去 → 不知道下次還認不認得它 → 寧可不做。
+    """
+    from cmuh_common.atomic_io import (  # noqa: PLC0415
+        atomic_write_json, safe_load_json_ex,
+    )
+    now = now or time.time()
+    path = _remote_receipt_path()
+    with _remote_receipt_lock:
+        # ★[外審 SJ 第 1 輪 P1-2] 要用會【回報狀態】的那一個★
+        #   `safe_load_json` 把讀取錯誤吞掉並回 default —— 於是
+        #   「讀不到就不執行」那句話從來沒有生效過(那個 except 永遠不會
+        #   進去),損毀的收據會被當成空的,然後照樣執行。
+        #   而我的測試把它 monkeypatch 成【會拋例外】—— 那是生產函式
+        #   不會有的行為,等於在測一個不存在的情境。
+        data, status = safe_load_json_ex(path, {}, backup_on_corrupt=False)
+        if status not in ("ok", "missing") or not isinstance(data, dict):
+            logging.warning("[遠端] 讀不到/讀壞執行收據(status=%s) → "
+                            "本封不執行(不知道做過沒有)", status)
+            return False
+        if key in data:
+            return False
+        kept = {k: v for k, v in data.items()
+                if _remote_receipt_is_fresh(v, now)}
+        kept[key] = {"at": now, "done": False}   # done 由執行完成才蓋
+        try:
+            atomic_write_json(path, kept)
+        except Exception:
+            logging.error("[遠端] 執行收據寫不下去 → 本封不執行"
+                          "(執行了的話重開之後會再做一次)", exc_info=True)
+            return False
+    return True
+
+
+def _remote_receipt_is_fresh(rec, now: float) -> bool:
+    """收據還在保留期內嗎。壞掉的時間戳一律【丟掉】(不是留著)。
+
+    留著壞資料的話它會永遠壓住那個 uid;而 uid 會隨 UIDVALIDITY 重用。
+    """
+    ts = rec.get("at") if isinstance(rec, dict) else rec
+    if ts is None:
+        return False
+    try:
+        at = float(ts)
+    except (TypeError, ValueError):
+        return False
+    return 0 < at <= now and (now - at) <= _REMOTE_RECEIPT_TTL_SEC
+
+
 
 
 _FLAG_CLAIM_WARN_INTERVAL_SEC = 300.0
@@ -7619,7 +7751,8 @@ def _run_imap_commands_with_timeout(timeout: float = 30.0) -> dict:
 
     def _worker():
         try:
-            box["r"] = check_commands(_REMOTE_CMD_PREFIX, timeout=12.0,
+            box["r"] = check_commands(list(_REMOTE_CMD_PHRASES),
+                                      timeout=12.0,
                                       max_age_sec=_REMOTE_CMD_MAX_AGE_SEC)
         except Exception as e:  # noqa: BLE001
             box["r"] = {"items": [], "error": f"command scan exception: {e!r}"}
@@ -7720,6 +7853,14 @@ def _poll_remote_commands(cfg: dict, scan: dict) -> None:
     if r.get("error"):
         logging.warning("[遠端] 掃描指令信失敗:%s", r["error"])
         return
+    uv = str(r.get("uidvalidity") or "")
+    # ★[外審 SJ 第 1 輪 P2-3] 取不到 UIDVALIDITY 就不執行★
+    #   收據的鍵會變成 ":<uid>";下一輪拿到真的 UIDVALIDITY 之後鍵就
+    #   不一樣了,同一封未讀信會【再執行一次】。信箱重建時,那個空鍵
+    #   的舊收據也可能反過來壓住一封新指令。不標已讀,讓它自然過期。
+    if not uv:
+        logging.error("★取不到 UIDVALIDITY → 本輪不執行任何遠端指令★"
+                      "(收據的鍵會不穩定,可能重複執行)")
     allow = {str(x).lower() for x in (cfg.get("allowed_trigger_senders") or [])}
     terminal: list = []       # 沒有人會再處理的 → 一次標掉
     actionable: list = []     # (uid, action, sender)
@@ -7731,15 +7872,15 @@ def _poll_remote_commands(cfg: dict, scan: dict) -> None:
         action, target = parse_remote_command(str(it.get("subject") or ""))
         if action is None:
             logging.warning(
-                "[遠端] 指令信格式不對(要「%s <動作> <機器>」)→ 不執行",
-                _REMOTE_CMD_PREFIX)
+                "[遠端] 指令信格式不對(主旨開頭要是 %s,後面最多再加一個"
+                "電腦名稱)→ 不執行", "/".join(_REMOTE_CMD_PHRASES))
             terminal.append(uid)
             continue
         # ★授權要在【目標比對之前】★(外審 SI-2 第 1 輪 P1)
         #   授權與「這封是給誰的」無關,對每一台機器的答案都一樣 ——
         #   所以它是【全域確定】的終局處置,誰看到誰就可以結案。
         #   放在目標比對後面的話:一封未授權、又指向不存在主機的信
-        #   會在每一台都走到 `不是給這台的` 而留著不動,整整半小時。
+        #   會在每一台都走到「不是給這台的」而留著不動,整整半小時。
         #   掃描一次只看最新 50 封 —— 持續投遞就能把掃描視窗占滿,
         #   ★把合法指令餓死★,而且不需要通過任何驗證。
         if sender not in allow or not it.get("authenticated"):
@@ -7753,46 +7894,63 @@ def _poll_remote_commands(cfg: dict, scan: dict) -> None:
             logging.warning("[遠端] 指令信已過期(超過 %.0f 分鐘)→ 不執行",
                             _REMOTE_CMD_MAX_AGE_SEC / 60.0)
             terminal.append(uid)
+            # ★[外審 SJ 第 1 輪 P1-1] 自己做過的不可以說「沒人做」★
+            #   執行過的信【刻意不標已讀】(要留給別台看),所以 30 分鐘
+            #   後它會再被掃到一次並走到這裡。無條件回信的話,使用者
+            #   先收到成功信、再收到一封說沒人執行 —— 他會再寄一次,
+            #   於是多一次重啟/重開機。
+            if uv and _remote_command_was_done(f"{uv}:{uid}"):
+                logging.info("[遠端] 這封指令本機已執行過,過期後不再回信")
+                continue
             expired_replies.append((sender, target))
             continue
         if not _remote_command_is_for_me(target):
             # ★這一種【不可以】標已讀★:那台機器還沒收到。
             #   它不會永遠留著 —— 半小時後會走上面那條「已過期」。
             continue
+        if not uv:
+            continue        # 見上面:鍵不穩定就不執行(也不標已讀)
         actionable.append((uid, action, sender))
     if rejected:
         _alert_trigger_rejected(rejected)
     terminal_acked = True
     if terminal:
-        # ★一次標掉★(見 docstring)。要執行的那幾封不受這裡影響
-        #   (它們在下面各自先標再執行)。
+        # ★一次標掉★:終局處置那一批合併成一次 STORE(一封一條連線的話,
+        #   一次掃描最多 50 封 → 50 條序列 TLS 連線跑在 scheduler 緒上)。
         terminal_acked = _ack_command_mail(terminal, "終局處置")
-    # ★標不掉就不要回信★(外審 SI-2 第 2 輪 P1:這是我批次化時開的回歸)
-    #   上一版的回信有 gate 在 `acked` 上,批次化之後變成無條件。
+    # ★標不掉就不要回信★(外審 SI-2 第 2 輪 P1)
     #   標不掉代表那封信還是 UNSEEN —— 下一輪、以及【每一台】機器
     #   都會再回一封,直到把寄信配額耗光,而且會把真正的通知洗掉。
+    # ★[外審 SJ 第 2 輪 P1] 一封信只能講【本機】知道的事★
+    #   一台機器沒有「全體有沒有做」的資訊：不指定機器的信要留給每一台看，
+    #   所以永遠 UNSEEN —— 晚開機、或 IMAP 斷了半小時的那一台，第一眼看到
+    #   的就是「已過期」，它身上當然沒有收據。舊文案讓它代表全體宣告
+    #   「沒有被任何機器執行」，而別台可能早就做完並寄了成功信 ——
+    #   使用者於是再寄一次，多一次重開機。
+    me = _this_machine_name() or "(這一台)"
     for sender, target in (expired_replies if terminal_acked else ()):
-        # ★對不上任何機器不可以是靜默無效★ 過期＝沒有任何機器接手的確定
-        #   答案。只回給通過授權的寄件人(上面已經濾掉未授權的了)。
         _reply_remote_command(
-            sender, "會診自動化:遠端指令未被執行(已過期)",
-            f"你寄的遠端指令在 {_REMOTE_CMD_MAX_AGE_SEC / 60.0:.0f} "
-            "分鐘內沒有被任何機器執行,已作廢。\n"
-            f"信裡指定的目標:{target}\n\n"
-            "常見原因:\n"
-            "  * 機器名稱打錯 —— 請用告警信裡「發生在：」的那一個;\n"
-            "  * ★不支援「全部」★:一次只能指定一台電腦;\n"
-            "  * 那台電腦的會診查詢程式沒有在跑"
-            "(它就是負責收信的那一支)。\n")
+            sender, "會診自動化:遠端指令已過期作廢(本機沒有執行)",
+            f"你寄的遠端指令超過 {_REMOTE_CMD_MAX_AGE_SEC / 60.0:.0f} "
+            f"分鐘,已作廢。★{me} 沒有執行它。★\n"
+            f"信裡指定的目標:{target or '(沒有指定,每一台跑會診查詢的都要做)'}\n\n"
+            "★這封信只講得出這一台的狀況★ —— 收指令的每一台各自判斷,\n"
+            "所以【如果你已經收到過「已執行」的通知信,那就是別台做掉了,\n"
+            "請忽略這封,不要再寄一次】。\n\n"
+            "都沒收到成功通知的話,常見原因:\n"
+            "  * 有指定機器但名稱打錯 —— 請用告警信裡「發生在：」的那一個;\n"
+            "  * 當下沒有任何一台在跑會診查詢程式"
+            "(收指令的就是那一支)。\n")
     for uid, action, sender in actionable:
-        # ★先標已讀,標不掉就不執行★(逐封,不可以批次 —— 批次的話一封
-        #   標失敗會讓另一封被誤判成已結案)。
-        if not _ack_command_mail([uid], "(執行前)"):
-            logging.error(
-                "★指令信標不成已讀 → 不執行★ 執行了的話,每一輪都會"
-                "再執行一次(重啟迴圈)。請確認信箱狀態後重寄一封")
+        # ★先把收據落地、再執行★(不是靠已讀旗標 —— 那是信箱全域的,
+        #   第一台標掉別台就看不到了,見檔頭說明)。
+        #   ★重開機之後那封信通常還沒過期,靠這張收據才不會再重開一次。★
+        if not _claim_remote_command(f"{uv}:{uid}"):
             continue
         _run_remote_command(action, sender)
+        # ★做完才蓋章★（外審 SJ 第 2 輪 P1）：claim 那一筆只代表「開始做了、
+        #   不要再做一次」，不代表做完了。
+        _mark_remote_command_done(f"{uv}:{uid}")
 
 
 def _empty_imap_result(err: str) -> dict:
