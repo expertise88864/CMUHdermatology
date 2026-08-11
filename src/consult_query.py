@@ -7375,6 +7375,80 @@ def _rebuild_schedule() -> None:
             int(cfg.get("quiet_start_hour", 0)), int(cfg.get("quiet_end_hour", 6)))
 
 
+# ══ 遠端指令（2026-08-11 使用者定案）═══════════════════════════════════════
+#
+# 主旨格式：`[皮膚科遠端指令] <動作> <機器>`
+#   動作：重啟會診 / 重啟打卡 / 重開機
+#   機器：電腦名稱（告警信裡的「發生在：」那個）—— ★一律必填、一次一台★
+#
+# ★為什麼「機器」是【必填】★
+#   所有診間電腦共用同一個信箱、各自輪詢。不指定的話一封信會讓【每一台】
+#   都動作 —— 對「重開機」那條尤其危險。對不上本機名稱的一律忽略
+#   （也不回信，否則一封信會收到 N 封回覆）。
+#
+# ★指令一律強制驗證，不看 `require_authenticated_trigger`★
+#   那個設定是給查詢觸發的（誤觸發的代價是多寄一封信）。指令的代價是重啟
+#   臨床自動化、甚至重開一台診間電腦 —— 沒有任何情況值得為它開後門。
+#   From 是可偽造的純文字，所以必須通過 SPF/DKIM/DMARC 才算數。
+#
+# ★順序與查詢觸發【相反】：先標已讀，再執行★
+#   查詢觸發是「先落地 journal 再標已讀」，因為漏掉一次查詢＝醫師乾等。
+#   指令反過來：標不掉就別執行。理由是失敗模式不對稱 ——
+#     * 指令遺失：使用者沒收到回信，重寄一次就好（可恢復）；
+#     * 指令重複：標已讀一直失敗的話，每一輪都重啟一次 → ★無限重啟迴圈★，
+#       而且那正是「程式一直沒好」時最可能發生的狀況。
+_REMOTE_CMD_PREFIX = "[皮膚科遠端指令]"
+_REMOTE_CMD_MAX_AGE_SEC = 30 * 60.0      # 半小時前的指令不再執行
+_REMOTE_REPLY_WAIT_SEC = 30.0            # 要重啟時,等回信寄完的上限
+# ★[外審 SI 第 1 輪 P1-1] 沒有「全部」這個目標★
+#   我原本設計了 `全部`,但 `\Seen` 是【信箱全域】的狀態:第一台處理完就把信
+#   標掉,其他還沒 SEARCH 的機器再也看不到那封 UNSEEN —— 廣播根本沒有廣播到。
+#   要做對得另外設計「UID+主機名的本機收據」,而那等於為了一個
+#   「一封信重開所有診間電腦」的高風險功能再加一套機器。
+#   ★直接拿掉★:機器名稱一律必填,一次一台。
+#: 動作字樣 → 內部代號。只認完全比對的字樣，絕不模糊比對。
+_REMOTE_CMD_ACTIONS = {
+    "重啟會診": "restart_consult",
+    "重啟打卡": "restart_autoclock",
+    "重開機": "reboot",
+}
+
+
+def _this_machine_name() -> str:
+    try:
+        return (socket.gethostname() or "").strip()
+    except Exception:
+        return ""
+
+
+def parse_remote_command(subject: str) -> tuple:
+    """主旨 → (動作代號, 目標機器)；不是合法指令回 (None, "")。純函式。
+
+    ★寬鬆的地方只有空白★：郵件客戶端會插入 `Re:`、多餘空白、全形空格。
+    動作與機器名稱本身一律【完全比對】—— 模糊比對在這種地方是災難
+    （「重開機」與「重啟會診」差一個字，代價差很多）。
+    """
+    text = str(subject or "").replace("　", " ").strip()
+    i = text.find(_REMOTE_CMD_PREFIX)
+    if i < 0:
+        return None, ""
+    rest = text[i + len(_REMOTE_CMD_PREFIX):].split()
+    if len(rest) != 2:
+        # ★剛好兩段★:機器必填(少了會讓每一台都動作),而多出來的字
+        #   代表這封信不是我們約定的格式 —— `重開機 PC-1 順便清一下`
+        #   不可以被當成「重開機 PC-1」執行。寬鬆的地方只有空白。
+        return None, ""
+    action = _REMOTE_CMD_ACTIONS.get(rest[0])
+    if action is None:
+        return None, ""
+    return action, rest[1]
+
+
+def _remote_command_is_for_me(target: str) -> bool:
+    me = _this_machine_name()
+    return bool(target) and bool(me) and target == me
+
+
 _FLAG_CLAIM_WARN_INTERVAL_SEC = 300.0
 _flag_claim_warned_at: dict = {}
 
@@ -7415,6 +7489,310 @@ def _claim_flag_file(path) -> bool:
                 "排程被反覆重建,輪詢永遠不會觸發)。請確認防毒/唯讀屬性/權限",
                 key, exc_info=True)
         return False
+
+
+#: 打卡程式的「請重啟」命令檔（會診查詢是信差，打卡自己看到就重啟自己）。
+AUTOCLOCK_RESTART_REQUEST = "autoclock_restart_request.json"
+
+
+def _write_autoclock_restart_request(why: str) -> bool:
+    """請打卡程式重啟自己 → 有沒有寫成功。
+
+    ★不是直接去 kill 它★：那會在它正在按打卡按鈕的當下把它砍掉。
+    打卡自己在迴圈裡看到這個檔就【選一個安全的時點】重啟。
+    """
+    try:
+        from cmuh_common.atomic_io import atomic_write_json  # noqa: PLC0415
+        from cmuh_common.paths import get_settings_dir       # noqa: PLC0415
+        atomic_write_json(
+            os.path.join(get_settings_dir(), AUTOCLOCK_RESTART_REQUEST),
+            {"at": time.time(), "why": str(why)[:200],
+             "by": _this_machine_name()})
+        return True
+    except Exception:
+        logging.error("[遠端] 寫入打卡重啟請求失敗", exc_info=True)
+        return False
+
+
+def _reply_remote_command(sender: str, subject_line: str, body: str,
+                          wait_sec: float = 0.0) -> None:
+    """把指令結果回給【寄指令的那個人】（不寄給別人）。
+
+    ★[外審 SI 第 1 輪 P2-4] `wait_sec` 是給「馬上要重啟」的動作用的★
+    回信是背景 daemon 緒,而 `restart_consult` 隨即讓舊行程退出 ——
+    行程一死,那條緒就跟著沒了。指令做了、使用者卻沒收到回覆,
+    於是他重寄一次 → 多一次重啟。等它寄完再走(有上限,不會卡死)。
+    """
+
+    def _worker():
+        try:
+            from cmuh_common.smtp_mail import send_mail  # noqa: PLC0415
+            send_mail(recipients=[str(sender)], subject=subject_line,
+                      body=body, attachment_path=None, category="system")
+        except Exception:
+            logging.warning("[遠端] 指令回覆寄送失敗(指令本身已執行)",
+                            exc_info=True)
+
+    try:
+        t = threading.Thread(target=_worker, name="ConsultRemoteReply",
+                             daemon=True)
+        t.start()
+    except Exception:
+        logging.debug("[遠端] 回覆執行緒啟動失敗", exc_info=True)
+        return
+    if wait_sec > 0:
+        t.join(wait_sec)
+        if t.is_alive():
+            logging.warning("[遠端] 回覆在 %.0f 秒內沒寄完 → 仍照常執行指令"
+                            "(使用者可能收不到回覆)", wait_sec)
+
+
+def _run_remote_command(action: str, sender: str) -> None:
+    """執行一個【已經授權、已經標成已讀】的遠端指令。"""
+    me = _this_machine_name() or "(不明)"
+    if action == "restart_consult":
+        logging.warning("[遠端] %s 要求重啟會診查詢 → 執行", sender)
+        _reply_remote_command(
+            sender, f"會診自動化:已重啟會診查詢({me})",
+            f"收到你的遠端指令,{me} 上的會診查詢程式正在重啟。\n"
+            "重啟後它會自動抓最新版(常駐中的實例只在啟動時檢查更新)。\n"
+            "★注意★:重啟會把記憶體裡的登入冷卻清掉,所以它會很快再試一次登入;"
+            "若你懷疑帳號已被鎖定,請先人工確認帳密。",
+            # ★等它寄完★ 下一行就讓這個行程退出了(外審 SI 第 1 輪 P2-4)。
+            wait_sec=_REMOTE_REPLY_WAIT_SEC)
+        # 走與自動更新完全相同的乾淨重啟路徑(收托盤 → main thread 重啟),
+        # 不可以在這條背景緒直接 restart —— 那會留下舊行程 + 兩個托盤圖示。
+        _request_restart_for_update()
+        return
+    if action == "restart_autoclock":
+        ok = _write_autoclock_restart_request(f"遠端指令({sender})")
+        logging.warning("[遠端] %s 要求重啟打卡 → 已寫入請求=%s", sender, ok)
+        _reply_remote_command(
+            sender, f"會診自動化:已{'轉達' if ok else '★無法轉達★'}重啟打卡({me})",
+            (f"{me} 上的打卡程式已收到重啟請求,它會在下一個安全時點重啟"
+             "(不會在正在打卡的當下被砍掉)。\n"
+             if ok else
+             f"★寫入重啟請求失敗★({me}) —— 打卡程式不會重啟,請看 log。\n"))
+        return
+    if action == "reboot":
+        logging.warning("[遠端] %s 要求重開機 → 排入閒置重開機看守", sender)
+        _reply_remote_command(
+            sender, f"會診自動化:已排定重開機({me})",
+            f"{me} 已排入自動重開機看守。\n\n"
+            "★不會立刻重開★:必須使用者連續閒置滿 "
+            f"{_keepalive.BDE_REBOOT_MIN_IDLE_SECONDS // 60} 分鐘、"
+            "且 24 小時內沒有自動重開過,才會真的下 shutdown /r。\n"
+            "有人在用那台電腦的話它會一直等;倒數期間有人回來也會取消。\n"
+            "要取消這個排定,把那台的會診查詢程式重啟一次即可。")
+        _schedule_reboot_watch("REMOTE", f"遠端指令要求重開機({sender})")
+        return
+    logging.error("[遠端] 不認得的動作代號:%r(不執行)", action)
+
+
+# [外審 SI 第 4 輪] 指令掃描【自己】的放生引用。
+#   ★不可以跟觸發檢查共用 worker★:指令掃描卡在 DNS/connect/TLS(還沒有
+#   socket,`force_close_active()` 救不了)時,共用的 single-flight 會讓之後
+#   每一輪都回「上一條還在跑」而【完全不做 check_trigger】——
+#   一個附屬功能就這樣把臨床的信件觸發永久關掉。各自一條、互不擋。
+_last_imap_cmd_thread = None
+
+
+def _run_imap_commands_with_timeout(timeout: float = 30.0) -> dict:
+    """在自己的 daemon thread 掃遠端指令信；逾時就砍 socket 並回空結果。
+
+    與 `_run_imap_check_with_timeout` 同一套保護（逾時 force_close、再等 2 秒、
+    仍活著就 clear、保留引用讓下一輪不疊加），但★狀態完全獨立★。
+
+    註：`force_close_active()` 會關掉當下所有活動連線。這兩個掃描在
+    `scheduler_loop` 裡是【前後呼叫】的，同一時間只有一個在真的做 IMAP；
+    另一條若還在，那就是已經放生、本來就該被關掉的那一條。
+    """
+    from cmuh_common.imap_reader import check_commands, force_close_active
+    global _last_imap_cmd_thread
+
+    prev = _last_imap_cmd_thread
+    if prev is not None and prev.is_alive():
+        logging.warning("[遠端] 上一條指令掃描仍未結束,本輪跳過(不疊加)")
+        return {"items": [], "error": "previous command scan still running"}
+
+    box: dict = {}
+
+    def _worker():
+        try:
+            box["r"] = check_commands(_REMOTE_CMD_PREFIX, timeout=12.0,
+                                      max_age_sec=_REMOTE_CMD_MAX_AGE_SEC)
+        except Exception as e:  # noqa: BLE001
+            box["r"] = {"items": [], "error": f"command scan exception: {e!r}"}
+
+    t = threading.Thread(target=_worker, name="IMAPCommands", daemon=True)
+    _last_imap_cmd_thread = t
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        logging.warning("[遠端] 指令掃描超過 %.0fs 無回應,強制砍 socket", timeout)
+        force_close_active()
+        t.join(timeout=2.0)
+        if t.is_alive():
+            logging.warning("[遠端] 指令掃描緒仍未結束,已放棄;保留引用,"
+                            "下一輪不疊加新 thread")
+            force_close_active(clear=True)
+        return {"items": [], "error": f"command scan timeout > {timeout:.0f}s"}
+    _last_imap_cmd_thread = None
+    return box.get("r") or {"items": [], "error": "command result missing"}
+
+
+#: 標已讀的放生引用（與掃描各自一條，互不擋）。
+_last_imap_ack_thread = None
+
+
+def _ack_command_mail(uids, why: str, timeout: float = 30.0) -> bool:
+    """★終局處置要標已讀★（外審 SI 第 1 輪 P2-5）→ 有沒有標成功。
+
+    不標的話那封信永遠停在 UNSEEN —— 每一輪（20 秒）都要為它 FETCH header
+    + FETCH INTERNALDATE 並寫一行 warning，而且每一台共用信箱的機器各做
+    一份。那是一個★不需要通過驗證★就能發動的資源與 log DoS。
+    （`check_trigger` 那邊 2026-08-08 外審 F4 記過同一件事。）
+
+    ★收【清單】而不是單一 uid★（外審 SI-2 第 1 輪 P2）：一封一次連線的話，
+    一次掃描最多 50 封 → 50 條序列 TLS 連線跑在 scheduler 緒上。
+    終局處置那一批可以合併成一次 STORE；要執行的那幾封才逐封標
+    （mark-before-execute 不能批次：一封失敗會讓另一封被誤判成已結案）。
+
+    ★整段有界★：`mark_uids_seen` 自己的 socket timeout 蓋不到 DNS/connect，
+    而這裡是 scheduler 緒（程式的心跳）。逾時就 force-close 並放生，
+    放生的那一條只擋下一次標記，不擋掃描、也不擋臨床觸發。
+    """
+    from cmuh_common.imap_reader import (  # noqa: PLC0415
+        force_close_active, mark_uids_seen,
+    )
+    global _last_imap_ack_thread
+
+    ids = [str(u) for u in (uids or []) if str(u)]
+    if not ids:
+        return True
+    prev = _last_imap_ack_thread
+    if prev is not None and prev.is_alive():
+        logging.warning("[遠端] 上一次標已讀仍未結束 → 本次不執行(不疊加)")
+        return False
+    box: dict = {}
+
+    def _worker():
+        try:
+            box["ok"] = bool(mark_uids_seen(ids))
+        except Exception:
+            box["ok"] = False
+            logging.warning("[遠端] 標記指令信已讀時例外", exc_info=True)
+
+    t = threading.Thread(target=_worker, name="IMAPCommandAck", daemon=True)
+    _last_imap_ack_thread = t
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        logging.warning("[遠端] 標已讀超過 %.0fs 無回應,強制砍 socket", timeout)
+        force_close_active()
+        t.join(timeout=2.0)
+        if t.is_alive():
+            force_close_active(clear=True)
+        return False
+    _last_imap_ack_thread = None
+    ok = bool(box.get("ok"))
+    if not ok:
+        logging.warning("[遠端] %s 的指令信標不成已讀(下一輪會再看到)", why)
+    return ok
+
+
+def _poll_remote_commands(cfg: dict, scan: dict) -> None:
+    """處理【已經抓好的】遠端指令信（授權不通過就只是忽略＋告警）。
+
+    ★`scan` 由 `_run_imap_commands_with_timeout` 帶進來★ —— 本函式不自己
+    開 IMAP 掃描:那個 worker 才有「逾時就 force_close socket + single-flight」
+    的完整保護。
+
+    ★流程是「先分類、再結案」★(外審 SI-2 第 1 輪 P2)
+    上一版每一封都各自呼叫一次 `mark_uids_seen`,而那是【一條新的 TLS
+    連線 + login + select + store】。一次掃描最多 50 封 → 50 條序列連線,
+    全部跑在 scheduler 緒上;而連線還沒建立時 `force_close_active()` 也
+    救不了它 —— 心跳停掉,watchdog 反而會把臨床程式重啟。
+    改成:終局處置的 uid 收集起來【一次】標掉;要執行的那幾封才各自
+    先標再執行(mark-before-execute 必須逐封,不能批次)。
+    """
+    r = scan or {}
+    if r.get("error"):
+        logging.warning("[遠端] 掃描指令信失敗:%s", r["error"])
+        return
+    allow = {str(x).lower() for x in (cfg.get("allowed_trigger_senders") or [])}
+    terminal: list = []       # 沒有人會再處理的 → 一次標掉
+    actionable: list = []     # (uid, action, sender)
+    expired_replies: list = []  # (sender, target)
+    rejected: list = []
+    for it in (r.get("items") or []):
+        uid = str(it.get("uid") or "")
+        sender = str(it.get("sender") or "")
+        action, target = parse_remote_command(str(it.get("subject") or ""))
+        if action is None:
+            logging.warning(
+                "[遠端] 指令信格式不對(要「%s <動作> <機器>」)→ 不執行",
+                _REMOTE_CMD_PREFIX)
+            terminal.append(uid)
+            continue
+        # ★授權要在【目標比對之前】★(外審 SI-2 第 1 輪 P1)
+        #   授權與「這封是給誰的」無關,對每一台機器的答案都一樣 ——
+        #   所以它是【全域確定】的終局處置,誰看到誰就可以結案。
+        #   放在目標比對後面的話:一封未授權、又指向不存在主機的信
+        #   會在每一台都走到 `不是給這台的` 而留著不動,整整半小時。
+        #   掃描一次只看最新 50 封 —— 持續投遞就能把掃描視窗占滿,
+        #   ★把合法指令餓死★,而且不需要通過任何驗證。
+        if sender not in allow or not it.get("authenticated"):
+            logging.error(
+                "★遠端指令未通過授權 → 不執行★(白名單=%s、通過驗證=%s):%s",
+                sender in allow, bool(it.get("authenticated")), sender)
+            rejected.append(sender or "(解析不出寄件人)")
+            terminal.append(uid)      # 已告警;不結案就能被拿來洗 log
+            continue
+        if it.get("expired"):
+            logging.warning("[遠端] 指令信已過期(超過 %.0f 分鐘)→ 不執行",
+                            _REMOTE_CMD_MAX_AGE_SEC / 60.0)
+            terminal.append(uid)
+            expired_replies.append((sender, target))
+            continue
+        if not _remote_command_is_for_me(target):
+            # ★這一種【不可以】標已讀★:那台機器還沒收到。
+            #   它不會永遠留著 —— 半小時後會走上面那條「已過期」。
+            continue
+        actionable.append((uid, action, sender))
+    if rejected:
+        _alert_trigger_rejected(rejected)
+    terminal_acked = True
+    if terminal:
+        # ★一次標掉★(見 docstring)。要執行的那幾封不受這裡影響
+        #   (它們在下面各自先標再執行)。
+        terminal_acked = _ack_command_mail(terminal, "終局處置")
+    # ★標不掉就不要回信★(外審 SI-2 第 2 輪 P1:這是我批次化時開的回歸)
+    #   上一版的回信有 gate 在 `acked` 上,批次化之後變成無條件。
+    #   標不掉代表那封信還是 UNSEEN —— 下一輪、以及【每一台】機器
+    #   都會再回一封,直到把寄信配額耗光,而且會把真正的通知洗掉。
+    for sender, target in (expired_replies if terminal_acked else ()):
+        # ★對不上任何機器不可以是靜默無效★ 過期＝沒有任何機器接手的確定
+        #   答案。只回給通過授權的寄件人(上面已經濾掉未授權的了)。
+        _reply_remote_command(
+            sender, "會診自動化:遠端指令未被執行(已過期)",
+            f"你寄的遠端指令在 {_REMOTE_CMD_MAX_AGE_SEC / 60.0:.0f} "
+            "分鐘內沒有被任何機器執行,已作廢。\n"
+            f"信裡指定的目標:{target}\n\n"
+            "常見原因:\n"
+            "  * 機器名稱打錯 —— 請用告警信裡「發生在：」的那一個;\n"
+            "  * ★不支援「全部」★:一次只能指定一台電腦;\n"
+            "  * 那台電腦的會診查詢程式沒有在跑"
+            "(它就是負責收信的那一支)。\n")
+    for uid, action, sender in actionable:
+        # ★先標已讀,標不掉就不執行★(逐封,不可以批次 —— 批次的話一封
+        #   標失敗會讓另一封被誤判成已結案)。
+        if not _ack_command_mail([uid], "(執行前)"):
+            logging.error(
+                "★指令信標不成已讀 → 不執行★ 執行了的話,每一輪都會"
+                "再執行一次(重啟迴圈)。請確認信箱狀態後重寄一封")
+            continue
+        _run_remote_command(action, sender)
 
 
 def _empty_imap_result(err: str) -> dict:
@@ -8222,6 +8600,16 @@ def scheduler_loop() -> None:
                     r = _run_imap_check_with_timeout(
                         kw, timeout=IMAP_HARD_TIMEOUT,
                         max_age_sec=max(0.0, _max_age_h) * 3600)
+                    # ★遠端指令與查詢觸發同一個節奏★(批次SI)
+                    #   接在這裡而不是另開一個排程:兩者都要在【信件觸發啟用】
+                    #   時才動,而且共用同一組白名單與驗證管線。
+                    #   本身 fail-open 到「不執行」,不會影響下面的觸發處理。
+                    try:
+                        _poll_remote_commands(
+                            cfg, _run_imap_commands_with_timeout())
+                    except Exception:
+                        logging.warning("[遠端] 指令輪詢出錯(不影響會診查詢)",
+                                        exc_info=True)
                     if r.get("error"):
                         consecutive_imap_errors += 1
                         logging.warning("檢查觸發信失敗 (%d/%d): %s",

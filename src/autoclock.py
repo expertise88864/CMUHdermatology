@@ -239,6 +239,66 @@ def _active_clock_task_age():
     return label, time_module.monotonic() - started
 
 
+# ══ 遠端重啟請求（2026-08-11 批次SI）═══════════════════════════════════════
+#
+# 打卡程式沒有收信能力，所以會診查詢當信差：它把「請重啟」寫成一個檔，
+# 由【打卡自己】在安全時點重啟。★不是讓外面直接 kill★ —— 那可能砍在正在
+# 按打卡按鈕的當下，而打卡是有臨床意義的外部動作。
+#
+# 「安全時點」＝目前沒有打卡任務在跑。真的有任務在跑就這一輪先不重啟，
+# 下一輪（5 秒後）再看 —— 請求檔還在，不會漏掉。
+AUTOCLOCK_RESTART_REQUEST = "autoclock_restart_request.json"
+#: 太舊的請求不執行（例如程式停機好幾天之後才開起來）。
+_RESTART_REQUEST_MAX_AGE_SEC = 30 * 60.0
+
+
+def _restart_request_path() -> str:
+    from cmuh_common.paths import get_settings_dir  # noqa: PLC0415
+    return os.path.join(get_settings_dir(), AUTOCLOCK_RESTART_REQUEST)
+
+
+def _check_restart_request() -> bool:
+    """有遠端重啟請求就重啟自己 → 有沒有真的動手（純供測試判讀）。
+
+    ★先把請求檔【拿走】才動手★：刪不掉就不執行 —— 否則每一輪都會再重啟
+    一次（無限重啟迴圈），而那正是「程式一直不對勁」時最可能的狀況。
+    （會診查詢的旗標檔踩過同一個坑，見它的 `_claim_flag_file`。）
+    """
+    path = _restart_request_path()
+    if not os.path.exists(path):
+        return False
+    label, _age = _active_clock_task_age()
+    if label:
+        logging.info("[autoclock] 收到重啟請求,但 %s 正在執行 → 等它做完再重啟",
+                     label)
+        return False
+    try:
+        from cmuh_common.atomic_io import safe_load_json  # noqa: PLC0415
+        data = safe_load_json(path, default={}) or {}
+    except Exception:
+        data = {}
+    try:
+        at = float(data.get("at") or 0)
+    except (TypeError, ValueError):
+        at = 0.0
+    age = time_module.time() - at if at else None
+    try:
+        os.unlink(path)          # ★先拿走★ 拿不走就不執行
+    except OSError:
+        logging.error("[autoclock] 重啟請求檔刪不掉 → 本次不重啟"
+                      "(執行了的話每一輪都會再重啟一次);請檢查防毒/權限",
+                      exc_info=True)
+        return False
+    if age is None or age > _RESTART_REQUEST_MAX_AGE_SEC:
+        logging.warning("[autoclock] 重啟請求已過期或時間不明(age=%s) → 不重啟",
+                        age)
+        return False
+    logging.warning("[autoclock] ★收到遠端重啟請求(%s)→ 重啟打卡程式★",
+                    str(data.get("why") or "")[:100])
+    restart_program()
+    return True
+
+
 def _sleep_while_running(seconds: float, step: float = 0.5) -> bool:
     """Sleep up to seconds, but return quickly after running.clear()."""
     deadline = time_module.monotonic() + max(0.0, float(seconds))
@@ -1817,6 +1877,14 @@ def scheduler_loop() -> None:
         # [P0 emergency] 每 60s 印一行 log 讓 InnerWatchdog 看到 process 活著
         last_heartbeat_log = _maybe_emit_heartbeat(now, last_heartbeat_log)
 
+        # ★[2026-08-11 批次SI] 遠端重啟請求★ 會診查詢是信差(它才有收信能力),
+        #   它把請求寫成一個檔,由【打卡自己】挑安全時點重啟 —— 直接被外面
+        #   kill 的話,可能砍在正在按打卡按鈕的當下。
+        try:
+            _check_restart_request()
+        except Exception:
+            logging.warning("[autoclock] 檢查遠端重啟請求時出錯(不影響打卡)",
+                            exc_info=True)
         try:
             schedule.run_pending()
         except Exception:

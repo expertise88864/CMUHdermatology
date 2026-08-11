@@ -369,7 +369,15 @@ def mark_uids_seen(uids) -> bool:
         _set_active(conn)
         conn.login(s["username"], s["password"])
         conn.select("INBOX")
-        conn.uid("store", ",".join(ids), "+FLAGS", "(\\Seen)")
+        # ★[外審 SI 第 1 輪 P1-2] 要看 `typ`★ IMAP 可以【正常返回】
+        #   NO/BAD(配額、權限、mailbox 唯讀…)而不拋例外。本函式的契約是
+        #   「回傳是否成功」,而呼叫端拿它做 fail-closed 判斷:無條件回 True
+        #   等於「標不掉卻說標好了」→ 指令每一輪重跑一次(無限重啟迴圈)。
+        typ, data = conn.uid("store", ",".join(ids), "+FLAGS", "(\\Seen)")
+        if typ != "OK":
+            logging.error("[IMAP] 標已讀被拒(typ=%s data=%s uids=%s)",
+                          typ, data, ids[:5])
+            return False
         return True
     except Exception:
         logging.warning("[IMAP] 標已讀失敗(uids=%s)", ids[:5], exc_info=True)
@@ -452,6 +460,118 @@ def find_message_in_sent(message_id: str, timeout: float = 12.0):
         return None
     finally:
         # 與本檔其他連線同一套收尾：不呼叫 logout（socket 半死會 hang 住）。
+        _clear_active(conn)
+        _force_close_conn(conn)
+
+
+def command_is_expired(age_sec, max_age_sec) -> bool:
+    """指令信算不算過期。純函式（抽出來才測得到）。
+
+    ★時間不明（`age_sec is None`）一律算過期★ —— 指令 fail-closed。
+    查詢觸發是【相反】的 fail-open（`_message_age_seconds` 讀不到就照常
+    觸發），因為多跑一次查詢無害、漏掉一次會診請求有害；指令反過來:
+    多重啟一次不是無害的。
+
+    ★[外審 SI 第 1 輪之後補]★ 這段本來寫在 `check_commands` 裡面，
+    而測試又把整個 `check_commands` 假掉、直接餵 `expired` 旗標 ——
+    突變驗證量出來：把它改成永遠 False，測試【全綠】。
+    測試要用生產的那段程式，不是自己另外算一次。
+    """
+    if not max_age_sec or max_age_sec <= 0:
+        return False        # 沒設時效上限 → 不做這個判斷
+    return age_sec is None or age_sec > max_age_sec
+
+
+def check_commands(prefix: str, timeout: float = 12.0,
+                   max_age_sec: Optional[float] = None) -> dict:
+    """掃未讀信裡【主旨以 prefix 開頭】的遠端指令信。→ {"items": [...], "error": ...}
+
+    每個 item：`{"uid", "sender", "authenticated", "subject", "age_sec"}`。
+
+    ★為什麼另開一個函式，而不是擴充 `check_trigger`★
+    `check_trigger` 刻意【不把主旨交出去】（見 `_subject_fingerprint`：那個信箱
+    收到的任何信件主旨都可能含病人姓名、床號，而 log 沒有跟 Email 一樣的保存
+    政策）。遠端指令卻必須讀主旨才知道要做什麼、對哪一台做。
+    ★邊界靠「只回傳主旨以我們自己的固定前綴開頭的信」★ —— 那種主旨是我們
+    自己的約定格式，不可能是別人寄來的臨床郵件。其他信件連主旨都不會被讀出來。
+
+    ★本函式【不改任何 flag】★：要不要標已讀由呼叫端決定（指令的取捨與查詢
+    觸發相反，見 consult_query 的說明）。
+    """
+    out: dict = {"items": [], "error": None}
+    if not prefix:
+        out["error"] = "prefix 為空"
+        return out
+    s = _load_imap_settings()
+    if not s["password"]:
+        out["error"] = "SMTP/IMAP password 未設定"
+        return out
+    conn: Optional[imaplib.IMAP4_SSL] = None
+    try:
+        context = ssl.create_default_context()
+        conn = imaplib.IMAP4_SSL(s["host"], s["port"], ssl_context=context,
+                                  timeout=timeout)
+        _set_active(conn)
+        conn.login(s["username"], s["password"])
+        conn.select("INBOX")
+        # 中文前綴在 imaplib 的 ASCII 編碼階段就會拋 → 一律走「撈 UNSEEN 後
+        # client 端比對」，與 `check_trigger` 的後備路徑同一個做法。
+        typ, data = conn.uid("search", "UNSEEN")
+        if typ != "OK" or not data:
+            out["error"] = f"IMAP SEARCH 異常回應：{typ}"
+            return out
+        ids = data[0].split() if data[0] else []
+        if len(ids) > _MAX_SCAN_IDS:
+            ids = ids[-_MAX_SCAN_IDS:]
+        from email.utils import parseaddr
+        for uid in ids:
+            try:
+                typ, fetch = conn.uid(
+                    "fetch", uid,
+                    "(BODY.PEEK[HEADER.FIELDS "
+                    "(SUBJECT FROM AUTHENTICATION-RESULTS)])")
+                if typ != "OK" or not fetch:
+                    continue
+                header_raw = b""
+                for part in fetch:
+                    if isinstance(part, tuple) and len(part) >= 2:
+                        header_raw = part[1]
+                        break
+                subj, from_str, auth_str = _parse_trigger_headers(header_raw)
+                if not subj.strip().startswith(prefix):
+                    continue        # ★不是我們的指令信 → 主旨連交出去都不交★
+                addr = (parseaddr(from_str)[1] or "").strip().lower()
+                out["items"].append({
+                    "uid": uid.decode() if isinstance(uid, bytes) else str(uid),
+                    "sender": addr,
+                    "authenticated": _from_is_authenticated(auth_str, addr),
+                    "subject": subj.strip(),
+                    "age_sec": _message_age_seconds(conn, uid),
+                })
+            except Exception:
+                logging.debug("[IMAP] 指令信解析失敗(略過這一封)", exc_info=True)
+                continue
+        # 時效過濾放在這裡而不是呼叫端:讀不到 INTERNALDATE 時 `age_sec` 是 None,
+        # ★指令要 fail-closed★(與查詢觸發相反:多跑一次查詢無害,多重啟一次不是)。
+        # ★[外審 SI 第 1 輪 P2-5] 過期的【不可以直接丟掉】★
+        #   丟掉的話呼叫端連 uid 都拿不到,那封信就永遠停在 UNSEEN ——
+        #   每一輪(20 秒)都要為它 FETCH header + FETCH INTERNALDATE 並寫
+        #   一行 warning。50 封就是每 20 秒約 100 次 round-trip,而且每一台
+        #   共用信箱的機器各做一份。那是一個【不需要通過驗證】就能發動的
+        #   資源與 log DoS。改成標記 `expired`,由呼叫端做終局處置。
+        for it in out["items"]:
+            it["expired"] = command_is_expired(it.get("age_sec"),
+                                             max_age_sec)
+        return out
+    except Exception as e:      # noqa: BLE001
+        out["error"] = f"{type(e).__name__}: {e}"
+        return out
+    finally:
+        # ★[外審 SI 第 1 輪 P1-3]★ 本檔第 782 行的註解【明文禁止】
+        #   `logout()`(它 send LOGOUT + 等回應,socket 半死就 hang 住整個
+        #   finally),而我還是寫了 —— 更糟的是先 `_clear_active`,連
+        #   self-watchdog 的 `force_close_active()` 都找不到這條連線來救它。
+        #   排程器是這支程式的心跳,卡在這裡等於整支停住。
         _clear_active(conn)
         _force_close_conn(conn)
 
