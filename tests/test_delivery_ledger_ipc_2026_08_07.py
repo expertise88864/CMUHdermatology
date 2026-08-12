@@ -44,10 +44,17 @@ def _writer(path, tag, n):
 
 class TestCrossProcessSafety:
 
+    @staticmethod
+    def _keys(tmp_path) -> set:
+        import sqlite3
+        with sqlite3.connect(str(tmp_path / "ledger.sqlite3")) as c:
+            return {r[0] for r in
+                    c.execute("SELECT business_key FROM deliveries")}
+
     def test_two_processes_do_not_erase_each_other(self, tmp_path):
         """★核心★ 兩個 process 各寫 N 筆，最後兩邊的紀錄都要在。"""
         path = str(tmp_path / "ledger.json")
-        DeliveryLedger(path=path)              # 先建立檔案
+        DeliveryLedger(path=path)              # 先建立資料庫
         procs = [mp.Process(target=_writer, args=(path, tag, 12))
                  for tag in ("main", "consult")]
         for p in procs:
@@ -56,8 +63,7 @@ class TestCrossProcessSafety:
             p.join(60)
             assert p.exitcode == 0, f"writer 失敗 exitcode={p.exitcode}"
 
-        fresh = DeliveryLedger(path=path)
-        keys = {r["business_key"] for r in fresh._records.values()}
+        keys = self._keys(tmp_path)
         missing_main = [f"main:{i}" for i in range(12) if f"main:{i}" not in keys]
         missing_consult = [f"consult:{i}" for i in range(12)
                            if f"consult:{i}" not in keys]
@@ -66,103 +72,100 @@ class TestCrossProcessSafety:
 
     def test_a_stale_copy_must_not_revert_another_processes_update(self,
                                                                    tmp_path):
-        """★lost update 的精確形狀★（突變驗證教我的）
+        """★lost update 的精確形狀★
 
-        我第一版寫成「A 載入 → B 新增一筆 → A 再寫」——那抓不到缺陷，因為
-        `dict.update()` 只會【新增】，B 的新紀錄不會被移除。
-
-        真正的 lost update 是：**A 手上有一份【B 後來改過的那筆】的舊副本**。
-        A 一寫回，B 的更新就被自己的舊副本蓋回去。
+        A 手上有一份【B 後來改過的那筆】的舊副本;A 再寫別的東西時,
+        不可以把 B 的更新蓋回去。[SQLite 版] 每筆讀-改-寫都在自己的
+        IMMEDIATE 交易裡、沒有整份覆寫 —— 這條性質仍要有測試釘著,
+        防止日後有人加回「記憶體快照 → 整份寫回」。
         """
         path = str(tmp_path / "ledger.json")
         a = DeliveryLedger(path=path)
         shared = a.begin(business_key="shared", category="t",
-                         recipients=["a@x.tw"])          # PREPARED，落地
+                         recipients=["a@x.tw"])          # SUBMITTING,落地
 
-        b = DeliveryLedger(path=path)                    # B 載入(看到 PREPARED)
+        b = DeliveryLedger(path=path)
         b.settle(shared)                                 # B 把它結案 → CONFIRMED
 
-        # A 手上那筆仍是 PREPARED。它寫別的東西時，不可以把 B 的結案蓋回去。
         other = a.begin(business_key="a:2", category="t", recipients=["a@x.tw"])
         a.settle(other)
 
         fresh = DeliveryLedger(path=path)
-        state = fresh._records[shared]["state"]
-        assert state != "prepared", (
-            "★B 的結案被 A 的舊副本蓋回去了★ 這就是 lost update")
-        keys = {r["business_key"] for r in fresh._records.values()}
-        assert {"shared", "a:2"} <= keys, keys
+        assert fresh.state_of(shared) == "confirmed", (
+            "★B 的結案被 A 蓋回去了★ 這就是 lost update")
+        assert {"shared", "a:2"} <= self._keys(tmp_path)
 
-    def test_it_does_not_overwrite_when_the_disk_is_unreadable(self, tmp_path):
-        """★寫回前讀不到磁碟 → 不寫★（不能拿記憶體整份去蓋）。
-
-        ★情境要讓「記憶體」與「磁碟」真的不同★（突變驗證教我的）：
-        我第一版只有一個 ledger 物件，它的記憶體本來就含有磁碟上那筆，
-        所以「拿記憶體去蓋」看起來沒有損失。要有【另一個 process 寫的、
-        而我記憶體裡沒有的】那一筆，才看得出差別。
-        """
+    def test_one_instances_writes_never_remove_anothers_rows(self, tmp_path):
+        """A 的任何寫入都不可以清掉 B 寫的紀錄(舊版的整份覆寫已不存在,
+        這條測試釘住它不會回來)。"""
         path = str(tmp_path / "ledger.json")
         a = DeliveryLedger(path=path)
-        did_a = a.begin(business_key="a:1", category="t", recipients=["a@x.tw"])
-        a.settle(did_a)
-
         b = DeliveryLedger(path=path)
-        did_b = b.begin(business_key="b:1", category="t", recipients=["b@x.tw"])
-        b.settle(did_b)                                  # 磁碟上有 a:1 + b:1
+        b.settle(b.begin(business_key="b:1", category="t",
+                         recipients=["b@x.tw"]))
+        for i in range(5):
+            a.settle(a.begin(business_key=f"a:{i}", category="t",
+                             recipients=["a@x.tw"]))
+        assert "b:1" in self._keys(tmp_path), (
+            "★A 的寫入把 B 的紀錄清掉了★")
+
+    def test_an_unavailable_db_refuses_loudly_instead_of_writing(
+            self, tmp_path, monkeypatch):
+        """★[外審 2026-08-12 P1-02/03] fail-open 的路已經拆掉★
+
+        舊版「鎖不到就照寫」;現在資料庫不可用時 `begin()` 必須
+        ★拋 LedgerUnavailable★ —— 絕不回一個沒有落地的 id,
+        也絕不退化成無鎖寫入。
+        """
+        import sqlite3 as _sq
 
         import cmuh_common.delivery_ledger as dl
-        real = dl.safe_load_json_ex
-        dl.safe_load_json_ex = lambda *a, **k: ({}, "error")
-        try:
-            # A 記憶體裡【沒有】b:1。此刻磁碟讀不到 → 不可以拿記憶體去蓋。
-            a.begin(business_key="a:2", category="t", recipients=["a@x.tw"])
-        finally:
-            dl.safe_load_json_ex = real
-
-        fresh = DeliveryLedger(path=path)
-        keys = {r["business_key"] for r in fresh._records.values()}
-        assert "b:1" in keys, (
-            f"★讀不到磁碟時仍用記憶體覆寫,把別的程式的紀錄清掉了★:{keys}")
-
-    def test_a_lock_failure_still_writes(self, tmp_path, monkeypatch):
-        """★fail-open 是刻意的★ 鎖不到就不寫 = 為了避免「可能覆蓋」而造成
-        「一定丟失」。退化成舊行為 + 警告，比靜默丟資料好。"""
         path = str(tmp_path / "ledger.json")
         led = DeliveryLedger(path=path)
-        monkeypatch.setattr("builtins.open",
-                            lambda *a, **k: (_ for _ in ()).throw(OSError("no")))
-        try:
-            did = led.begin(business_key="z", category="t", recipients=["a@x.tw"])
-        finally:
-            monkeypatch.undo()
-        assert did, "鎖不到就整個不寫 → 這一筆消失了"
+        led._close_quietly()                       # 斷開既有連線
+        monkeypatch.setattr(
+            dl.sqlite3, "connect",
+            lambda *a, **k: (_ for _ in ()).throw(_sq.OperationalError("鎖死")))
+        import pytest as _pytest
+        with _pytest.raises(dl.LedgerUnavailable):
+            led.begin(business_key="z", category="t", recipients=["a@x.tw"])
 
-    def test_every_mutator_marks_itself_dirty(self):
-        """★接線★ 合併只寫「本 process 動過的」—— 忘記標記就等於那次變更不會落地。"""
+    def test_every_write_happens_inside_a_transaction(self):
+        """★接線★ [SQLite 版] 任何 INSERT/UPDATE/DELETE 都必須在
+        `_txn`(BEGIN IMMEDIATE)裡 —— 在交易外寫,跨 process 的互斥
+        就名存實亡(這正是舊版 sidecar lock fail-open 的翻版)。
+
+        ★空集合不算通過★:一定要真的找到有寫入的方法,守衛才算跑過。
+        """
         src = textwrap.dedent(inspect.getsource(DeliveryLedger))
         tree = ast.parse(src)
+        # `_insert_locked`/`_prune_locked` 的契約是「在呼叫端的交易裡執行」
+        # (docstring 寫明),呼叫它們的方法必須自己有 _txn —— 由下面的檢查
+        # 涵蓋。`_connect_locked` 是 idempotent 的 schema bootstrap
+        # (CREATE TABLE / INSERT OR IGNORE 一筆常數),autocommit 即可。
+        in_callers_txn = {"_insert_locked", "_prune_locked", "_connect_locked"}
+        checked = 0
         for fn in ast.walk(tree):
             if not isinstance(fn, ast.FunctionDef):
+                continue
+            writes = [n for n in ast.walk(fn)
+                      if isinstance(n, ast.Call)
+                      and isinstance(n.func, ast.Attribute)
+                      and n.func.attr in ("execute", "executemany")
+                      and n.args and isinstance(n.args[0], ast.Constant)
+                      and isinstance(n.args[0].value, str)
+                      and n.args[0].value.lstrip().upper().startswith(
+                          ("INSERT", "UPDATE", "DELETE"))]
+            if not writes or fn.name in in_callers_txn:
                 continue
             calls = {n.func.attr for n in ast.walk(fn)
                      if isinstance(n, ast.Call)
                      and isinstance(n.func, ast.Attribute)}
-            if "_save_locked" not in calls:
-                continue
-            # ★判準要是「有沒有改到紀錄」,不是「有沒有存檔」★
-            #   `flush()` 只是把【已經標記過】的 dirty 再寫一次,它自己不改
-            #   任何紀錄。把它也要求標記 dirty,守衛就從「檢查性質」退化成
-            #   「檢查長相」—— 而且逼人為了過關寫出無意義的 add。
-            #   會改到紀錄 = 對 `rec[...]` 或 `self._records[...]` 做指派。
-            mutates = any(
-                isinstance(t, ast.Subscript)
-                for n in ast.walk(fn) if isinstance(n, ast.Assign)
-                for t in n.targets)
-            if not mutates:
-                continue
-            assert "add" in calls, (
-                f"★{fn.name} 會改紀錄又存檔,卻沒有標記 dirty★ "
-                "那次變更不會被合併寫入")
+            assert "_txn" in calls, (
+                f"★{fn.name} 在交易外寫資料庫★ 跨 process 互斥失效")
+            checked += 1
+        assert checked >= 4, (
+            f"守衛只掃到 {checked} 個寫入方法 —— 判準可能失效了(空集合不算過)")
 
 
 class TestEveryDeliveryReachesATerminalState:
@@ -210,56 +213,36 @@ class TestEveryDeliveryReachesATerminalState:
             f"★確定失敗與結果不明沒有分開★ 只看到 {kinds}")
 
 
-class TestLockAcquisitionRetries:
-    """★[2026-08-10 CI] LK_LOCK 是「每秒 1 次、共 10 次」的輪詢★
+class TestContentionIsFailClosed:
+    """★[外審 2026-08-12 P1-02] 鎖競爭不可以退化成無鎖寫入★
 
-    對方連續背靠背持鎖（慢磁碟 fsync 數百 ms × 幾十次連寫）時，等待方的
-    10 個整秒採樣點可能全部落在「對方持鎖中」→ OSError → fail-open 無鎖
-    寫入 → 互相覆蓋。鎖要有界重試把輪詢相位打散；三輪都失敗才 fail-open
-    （語意不變：寧可可能覆蓋，不要一定丟失）。
+    舊版 sidecar lock 等不到就 fail-open 照寫(互相覆蓋)。SQLite 版:
+    等不到寫鎖(busy_timeout 用完)→ `LedgerUnavailable` ——
+    integrity-critical 的變更【寧可失敗,不可靜默對撞】。
+    settle 失敗的出口是既有的 stuck_submitting 回查,不是重寄。
     """
 
-    @staticmethod
-    def _led(tmp_path):
-        return DeliveryLedger(path=str(tmp_path / "l.json"))
+    def test_a_wedged_writer_makes_mutations_raise_not_corrupt(
+            self, tmp_path, monkeypatch):
+        import sqlite3 as _sq
 
-    def test_a_transient_lock_failure_is_retried(self, tmp_path, monkeypatch):
-        import msvcrt
-        calls = {"n": 0}
-        real = msvcrt.locking
+        import cmuh_common.delivery_ledger as dl
+        monkeypatch.setattr(dl, "_BUSY_TIMEOUT_MS", 300)   # 別等 5 秒
+        path = str(tmp_path / "ledger.json")
+        led = DeliveryLedger(path=path)
+        did = led.begin(business_key="bk", category="t",
+                        recipients=["a@x.tw"])
 
-        def _flaky(fd, mode, nbytes):
-            if mode == msvcrt.LK_LOCK:
-                calls["n"] += 1
-                if calls["n"] <= 2:
-                    raise OSError("鎖被佔住(前兩次)")
-            return real(fd, mode, nbytes)
-
-        monkeypatch.setattr(msvcrt, "locking", _flaky)
-        monkeypatch.setattr(
-            "cmuh_common.delivery_ledger.time.sleep", lambda s: None)
-        led = self._led(tmp_path)
-        with led._interprocess_lock():
-            pass
-        assert calls["n"] == 3, f"★暫時性的鎖失敗沒有被重試★:{calls['n']}"
-
-    def test_three_failures_still_fail_open(self, tmp_path, monkeypatch,
-                                            caplog):
-        """★反方向★ 重試不可以變成永遠等（fail-open 的語意要保留）。"""
-        import logging as _lg
-
-        import msvcrt
-
-        def _always(fd, mode, nbytes):
-            if mode == msvcrt.LK_LOCK:
-                raise OSError("永遠鎖不到")
-
-        monkeypatch.setattr(msvcrt, "locking", _always)
-        monkeypatch.setattr(
-            "cmuh_common.delivery_ledger.time.sleep", lambda s: None)
-        led = self._led(tmp_path)
-        with caplog.at_level(_lg.WARNING):
-            with led._interprocess_lock():
-                pass                      # ★仍然要走得進來（fail-open）★
-        assert any("取不到帳本檔案鎖" in r.getMessage()
-                   for r in caplog.records), "fail-open 沒有留下警告"
+        # 另一條連線握住寫鎖不放(模擬另一個 process 卡在交易中)
+        wedge = _sq.connect(str(tmp_path / "ledger.sqlite3"),
+                            isolation_level=None)
+        wedge.execute("BEGIN IMMEDIATE")
+        try:
+            import pytest as _pytest
+            with _pytest.raises(dl.LedgerUnavailable):
+                led.settle(did)            # ★不可以靜默寫入,也不可以卡死★
+        finally:
+            wedge.execute("ROLLBACK")
+            wedge.close()
+        # 鎖放掉之後同一筆要能正常結案(競爭是暫時的,不是永久故障)
+        assert led.settle(did) == "confirmed"

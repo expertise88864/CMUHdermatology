@@ -338,10 +338,15 @@ class TestUnresolvedIsCrossProcess:
 
     def test_a_ledger_that_cannot_be_refreshed_raises(self, tmp_path, monkeypatch):
         """★讀不到就拋,不回空清單★ 空清單會被讀成「沒有待回查的」。"""
+        import cmuh_common.delivery_ledger as _dl
         from cmuh_common.delivery_ledger import LedgerUnavailable
         path = str(tmp_path / "ledger.json")
         led = self._led(path)
-        monkeypatch.setattr(type(led), "_refresh_locked", lambda self: False)
+        led._close_quietly()             # [SQLite 版] 資料庫這一刻開不起來
+        monkeypatch.setattr(
+            _dl.sqlite3, "connect",
+            lambda *a, **k: (_ for _ in ()).throw(
+                _dl.sqlite3.OperationalError("db locked")))
         with pytest.raises(LedgerUnavailable):
             led.unresolved()
 
@@ -389,9 +394,14 @@ class TestUnresolvedIsCrossProcess:
     def test_the_other_readers_raise_instead_of_returning_empty(
             self, tmp_path, monkeypatch):
         """★讀不到就拋★ 空清單會被讀成「沒有人在等補寄／沒有卡住的」。"""
+        import cmuh_common.delivery_ledger as _dl
         from cmuh_common.delivery_ledger import LedgerUnavailable
         led = self._led(str(tmp_path / "ledger.json"))
-        monkeypatch.setattr(type(led), "_refresh_locked", lambda self: False)
+        led._close_quietly()             # [SQLite 版] 資料庫這一刻開不起來
+        monkeypatch.setattr(
+            _dl.sqlite3, "connect",
+            lambda *a, **k: (_ for _ in ()).throw(
+                _dl.sqlite3.OperationalError("db locked")))
         for fn in (led.needs_recipient_retry, led.stuck_submitting):
             with pytest.raises(LedgerUnavailable):
                 fn()

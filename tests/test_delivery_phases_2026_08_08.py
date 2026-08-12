@@ -194,8 +194,11 @@ class TestTheLedgerCanSeeTheDisk:
         led = dl.DeliveryLedger(path=path)
         led.settle(led.begin(business_key="k1", category="t",
                              recipients=["x@y.tw"]))
-        monkeypatch.setattr(dl, "safe_load_json_ex",
-                            lambda *a, **k: ({}, "error"))
+        led._close_quietly()             # [SQLite 版] 資料庫這一刻開不起來
+        monkeypatch.setattr(
+            dl.sqlite3, "connect",
+            lambda *a, **k: (_ for _ in ()).throw(
+                dl.sqlite3.OperationalError("db locked")))
         with pytest.raises(dl.LedgerUnavailable):
             led.has_live_delivery("k1")
 
@@ -204,42 +207,40 @@ class TestTerminalStateEventuallyLands:
 
     def test_a_transient_write_failure_is_retried(self, tmp_path,
                                                   monkeypatch):
-        """★P2-06★ 防毒鎖住檔案那一瞬間不可以就這樣算了 —— 終局狀態只留在
-        記憶體,而磁碟上還寫著 SUBMITTING。"""
+        """★P2-06 的 SQLite 版★ 交易失敗不可以把終局狀態只留在記憶體:
+        settle 要嘛落地、要嘛 LedgerUnavailable —— 磁碟上【誠實地】留著
+        SUBMITTING,等 stuck_submitting() 撿去回查;競爭解除後重試要成功。"""
+        import sqlite3 as _sq
+        monkeypatch.setattr(dl, "_BUSY_TIMEOUT_MS", 300)
         path = str(tmp_path / "l.json")
         led = dl.DeliveryLedger(path=path)
         did = led.begin(business_key="k1", category="t", recipients=["x@y.tw"])
-        led.mark_submitting(did)
-        n = {"i": 0}
-        real = dl.safe_load_json_ex
-
-        def _flaky(*a, **k):
-            n["i"] += 1
-            return ({}, "error") if n["i"] == 1 else real(*a, **k)
-        monkeypatch.setattr(dl, "safe_load_json_ex", _flaky)
-        monkeypatch.setattr(dl.time, "sleep", lambda _s: None)
-        led.settle(did)
-        monkeypatch.undo()
+        wedge = _sq.connect(str(tmp_path / "l.sqlite3"), isolation_level=None)
+        wedge.execute("BEGIN IMMEDIATE")
+        try:
+            with pytest.raises(dl.LedgerUnavailable):
+                led.settle(did)              # ★不可以假裝成功★
+        finally:
+            wedge.execute("ROLLBACK")
+            wedge.close()
         fresh = dl.DeliveryLedger(path=path)
-        assert fresh._records[did]["state"] != dl.SUBMITTING, (
-            "★一次暫時失敗就讓終局狀態永遠留在記憶體★ 磁碟上還是 SUBMITTING")
+        assert fresh.state_of(did) == dl.SUBMITTING, (
+            "交易失敗後磁碟上要誠實留著 SUBMITTING(等回查),不是半套狀態")
+        assert led.settle(did) == dl.CONFIRMED, "競爭解除後重試要能成功"
 
-    def test_flush_writes_what_is_still_pending(self, tmp_path, monkeypatch):
-        """★沒有『下一次異動』時的出口★ 重試也失敗、而且之後再也沒有人動
-        帳本 —— `flush()` 是最後一次機會。"""
+    def test_flush_writes_what_is_still_pending(self, tmp_path):
+        """[SQLite 版] ★沒有「還沒落地的變更」這種東西★:settle 回來的那一刻
+        就已經 COMMIT+fsync(durable begin/settle 的契約)。flush() 只剩
+        WAL checkpoint,而且在關機路徑上永遠不可以拋。"""
         path = str(tmp_path / "l.json")
         led = dl.DeliveryLedger(path=path)
         did = led.begin(business_key="k1", category="t", recipients=["x@y.tw"])
-        led.mark_submitting(did)
-        monkeypatch.setattr(dl, "safe_load_json_ex",
-                            lambda *a, **k: ({}, "error"))
-        monkeypatch.setattr(dl.time, "sleep", lambda _s: None)
-        led.settle(did)                      # 落不了地
-        monkeypatch.undo()
-        led.flush()                          # 磁碟好了 → 補寫
+        led.settle(did)                      # 回來=已落地,不需要 flush
         fresh = dl.DeliveryLedger(path=path)
-        assert fresh._records[did]["state"] != dl.SUBMITTING, (
-            "flush() 沒有把還沒落地的終局狀態補寫上去")
+        assert fresh.state_of(did) == dl.CONFIRMED, (
+            "settle 回來卻沒落地 —— durable 契約破了")
+        led._close_quietly()
+        led.flush()                          # 連線已關也不可以拋
 
 
 class TestStalePreparedHasAnExit:
@@ -254,12 +255,14 @@ class TestStalePreparedHasAnExit:
         #   只能收斂成 UNKNOWN,理由見 TestStalePreparedIsNotDeclaredFailed。
         led = dl.DeliveryLedger(path=path)
         did = led.begin(business_key="k1", category="t", recipients=["x@y.tw"])
-        with led._lock:                      # 手動塞一筆舊格式的 PREPARED
-            led._records[did]["state"] = dl.PREPARED
-            led._records[did]["updated_at"] = dl._now() - 3600
+        import sqlite3 as _sq
+        with _sq.connect(led.path) as _c:    # 手動塞一筆舊格式的 PREPARED
+            _c.execute("UPDATE deliveries SET state=?, updated_at=?"
+                       " WHERE delivery_id=?",
+                       (dl.PREPARED, dl._now() - 3600, did))
         assert [r["delivery_id"] for r in led.stale_prepared()] == [did]
         assert led.converge_stale_prepared() == 1
-        assert led._records[did]["state"] == dl.UNKNOWN
+        assert led.get(did)["state"] == dl.UNKNOWN
 
     def test_a_submitting_record_is_never_converged(self, tmp_path):
         """★反方向★ SUBMITTING 代表「已經交出去了」,只能靠 Message-ID 回查。
@@ -268,9 +271,12 @@ class TestStalePreparedHasAnExit:
         led = dl.DeliveryLedger(path=path)
         did = led.begin(business_key="k1", category="t", recipients=["x@y.tw"])
         led.mark_submitting(did)
-        led._records[did]["updated_at"] = dl._now() - 86400
+        import sqlite3 as _sq
+        with _sq.connect(led.path) as _c:
+            _c.execute("UPDATE deliveries SET updated_at=? WHERE delivery_id=?",
+                       (dl._now() - 86400, did))
         assert led.converge_stale_prepared() == 0
-        assert led._records[did]["state"] == dl.SUBMITTING
+        assert led.get(did)["state"] == dl.SUBMITTING
 
 
 # ===========================================================================
@@ -510,32 +516,21 @@ class TestTheThreeOutcomesOfDATA:
 class TestTheLedgerLockOrderMatchesTheWriters:
 
     def test_refresh_takes_the_same_lock_order_as_mutators(self):
-        """★死結★ 所有 mutator 都是「先 self._lock、再檔案鎖」
-        (`settle()` 在 `with self._lock:` 裡呼叫 `_save_locked()`)。
-        `_refresh_locked` 反過來拿的話,兩個執行緒對撞就互等。"""
-        src = textwrap.dedent(inspect.getsource(dl.DeliveryLedger._refresh_locked))
-        tree = ast.parse(src)
-        order = []
-        for n in ast.walk(tree):
-            if isinstance(n, ast.With):
-                for item in n.items:
-                    e = item.context_expr
-                    if isinstance(e, ast.Attribute) and e.attr == "_lock":
-                        order.append("thread")
-                    elif (isinstance(e, ast.Call)
-                          and isinstance(e.func, ast.Attribute)
-                          and e.func.attr == "_interprocess_lock"):
-                        order.append("file")
-        assert order[:2] == ["thread", "file"], (
-            f"★鎖序與寫入端相反★:{order} —— 兩個執行緒對撞會互等")
+        """[SQLite 版] 舊的「thread lock → file lock」鎖序死結結構性消失
+        (只剩一把 RLock + 資料庫交易)。改驗:讀查詢也走同一把 self._lock
+        —— 共用同一條 sqlite 連線,裸用會與寄送緒對撞。"""
+        for name in ("has_live_delivery", "state_of", "_select", "get"):
+            src = textwrap.dedent(
+                inspect.getsource(getattr(dl.DeliveryLedger, name)))
+            assert "self._lock" in src, f"{name} 沒有拿 self._lock"
 
     def test_a_concurrent_write_is_not_lost_to_a_stale_snapshot(self, tmp_path):
-        """重讀不可以把【本執行緒剛寫進記憶體】的那筆蓋掉。"""
+        """自己剛寫的那筆,寫完立刻要查得到(read-your-writes)。"""
         led = dl.DeliveryLedger(path=str(tmp_path / "l.json"))
         did = led.begin(business_key="k1", category="t", recipients=["a@x.tw"])
         led.settle(did)
         assert led.has_live_delivery("k1")
-        assert did in led._records, "重讀把自己剛寫的那筆弄丟了"
+        assert led.get(did), "剛寫的那筆查不到了"
 
 
 class TestRecoveryIsWiredNotJustAvailable:
@@ -546,13 +541,13 @@ class TestRecoveryIsWiredNotJustAvailable:
         path = str(tmp_path / "l.json")
         a = dl.DeliveryLedger(path=path)
         did = a.begin(business_key="k1", category="t", recipients=["a@x.tw"])
-        with a._lock:                        # 舊格式:磁碟上是 PREPARED
-            a._records[did]["state"] = dl.PREPARED
-            a._records[did]["updated_at"] = dl._now() - 3600
-            a._dirty.add(did)
-            a._save_locked()
+        import sqlite3 as _sq
+        with _sq.connect(a.path) as _c:      # 舊格式:磁碟上是 PREPARED
+            _c.execute("UPDATE deliveries SET state=?, updated_at=?"
+                       " WHERE delivery_id=?",
+                       (dl.PREPARED, dl._now() - 3600, did))
         fresh = dl.DeliveryLedger(path=path)         # 開機
-        assert fresh._records[did]["state"] == dl.UNKNOWN, (
+        assert fresh.get(did)["state"] == dl.UNKNOWN, (
             "★開機沒有自動收斂舊格式的陳舊 PREPARED★ 它會永遠留著、把 key 擋住")
 
     def test_flush_is_registered_for_process_exit(self):
@@ -668,18 +663,11 @@ class TestAPersistentTransientRefusalIsNotAbandoned:
 class TestFlushHoldsTheLock:
 
     def test_flush_saves_while_holding_the_lock(self):
-        """★關機緒與寄送緒會同時動這本帳★ `_dirty` 在迭代中被改、或剛加進來
-        的標記被 clear() 一起清掉卻沒落地。"""
+        """[SQLite 版] flush 只剩 WAL checkpoint;它仍要拿 self._lock
+        (與寄送緒共用同一條連線),而且在關機路徑上永遠不可以拋。"""
         src = textwrap.dedent(inspect.getsource(dl.DeliveryLedger.flush))
-        tree = ast.parse(src)
-        for n in ast.walk(tree):
-            if isinstance(n, ast.With):
-                inner = {c.func.attr for c in ast.walk(n)
-                         if isinstance(c, ast.Call)
-                         and isinstance(c.func, ast.Attribute)}
-                if "_save_locked" in inner:
-                    return
-        pytest.fail("★flush() 在鎖外面存檔★ 併發變更會遺失或炸掉")
+        assert "self._lock" in src, "flush 沒有拿 self._lock(裸用共用連線)"
+        assert "except" in src, "flush 在關機路徑上,不可以把例外丟出去"
 
 
 class TestStalePreparedIsNotDeclaredFailed:
@@ -699,9 +687,11 @@ class TestStalePreparedIsNotDeclaredFailed:
         接成閘門後還會放行重寄。UNKNOWN 才是誠實的答案。"""
         led = dl.DeliveryLedger(path=str(tmp_path / "l.json"))
         did = led.begin(business_key="k", category="t", recipients=["a@x.tw"])
-        with led._lock:                      # 手動塞一筆舊格式的 PREPARED
-            led._records[did]["state"] = dl.PREPARED
-            led._records[did]["updated_at"] = dl._now() - 3600
+        import sqlite3 as _sq
+        with _sq.connect(led.path) as _c:    # 手動塞一筆舊格式的 PREPARED
+            _c.execute("UPDATE deliveries SET state=?, updated_at=?"
+                       " WHERE delivery_id=?",
+                       (dl.PREPARED, dl._now() - 3600, did))
         assert led.converge_stale_prepared() == 1
         assert led.get(did)["state"] == dl.UNKNOWN, (
             "★被判成確定沒寄出★ 但寫回是 fail-open 的,這推論不成立")
@@ -782,12 +772,12 @@ class TestAMissedRecipientSurvivesARestart:
                         recipients=["ok@x.tw", "bad@x.tw"], subject="會診清單")
         led.settle(did, refused={"bad@x.tw": (452, b"full")})
         # ★老化必須【落地】★（2026-08-09）
-        #   `needs_recipient_retry()` 現在會先從磁碟重讀（帳本跨 process 共用）。
-        #   只改記憶體裡的 `created_at` 會被重讀蓋回原值，這個 fixture 就等於
-        #   沒有老化 —— 測試量到的不是「掛太久的那一筆」。
-        led._records[did]["created_at"] = dl._now() - age_sec
-        led._dirty.add(did)
-        led.flush()
+        #   `needs_recipient_retry()` 讀的是資料庫（帳本跨 process 共用）。
+        #   [SQLite 版] 沒有記憶體快照可改 —— 直接改資料庫。
+        import sqlite3 as _sq
+        with _sq.connect(led.path) as _c:
+            _c.execute("UPDATE deliveries SET created_at=? WHERE delivery_id=?",
+                       (dl._now() - age_sec, did))
         monkeypatch.setattr(cq, "_get_ledger", lambda: led)
         return led, did
 
@@ -902,8 +892,10 @@ class TestASuccessfulRetryClosesTheOriginalRecord:
         monkeypatch.setattr(cq, "send_via_smtp", lambda *a, **k: {})
         cq._resend_transient_refusals(
             _Art(), {"bad@x.tw": (452, b"full")}, "poll", origin_did=origin)
-        kids = [r for r in led._records.values()
-                if r.get("parent_id") == origin]
+        import sqlite3 as _sq
+        with _sq.connect(led.path) as _c:
+            kids = _c.execute("SELECT delivery_id FROM deliveries"
+                              " WHERE parent_id=?", (origin,)).fetchall()
         assert kids, "補寄那一筆沒有指回初次紀錄"
 
     def test_the_send_path_passes_the_origin(self):

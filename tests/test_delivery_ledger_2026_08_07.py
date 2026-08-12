@@ -177,23 +177,27 @@ def test_submitting_left_over_after_a_crash_is_surfaced(tmp_path):
         == [did]
 
 
-def test_unreadable_ledger_never_overwrites_disk(tmp_path, monkeypatch):
+def test_unreadable_ledger_never_overwrites_disk(tmp_path):
     """★與 alert_email_sent 同樣的教訓★ 讀不到 ≠ 沒有紀錄。
 
-    直接當空的 → 所有 business_key 看起來都沒寄過 → 整批重寄；
-    再把空的寫回去 → 磁碟上真正的紀錄被永久抹掉。
+    [SQLite 版] 資料庫檔壞掉時:所有讀寫一律 `LedgerUnavailable`
+    (不把「讀不到」講成「沒有」),而且★絕不覆寫那個檔★ ——
+    直接當空的 → 所有 business_key 看起來都沒寄過 → 整批重寄。
     """
-    path = str(tmp_path / "ledger.json")
-    led = dl.DeliveryLedger(path)
-    led.begin(business_key="bk", category="clinical", recipients=["a@x.tw"])
-    before = open(path, encoding="utf-8").read()
+    path = str(tmp_path / "delivery_ledger.sqlite3")
+    with open(path, "wb") as f:
+        f.write(b"this is not a database " * 40)
+    before = open(path, "rb").read()
 
-    monkeypatch.setattr(dl, "safe_load_json_ex", lambda *a, **k: ({}, "error"))
     hurt = dl.DeliveryLedger(path)
-    hurt.begin(business_key="bk2", category="clinical", recipients=["b@x.tw"])
-
-    assert open(path, encoding="utf-8").read() == before, \
-        "★讀不到卻把空紀錄寫回去★ 磁碟上的已寄紀錄被抹掉 → 大量重寄"
+    with pytest.raises(dl.LedgerUnavailable):
+        hurt.begin(business_key="bk2", category="clinical",
+                   recipients=["b@x.tw"])
+    with pytest.raises(dl.LedgerUnavailable):
+        hurt.has_live_delivery("bk2")
+    assert hurt.state_of("whatever") == "", "state_of 讀不到=空字串(不知道)"
+    assert open(path, "rb").read() == before, \
+        "★讀不到卻把檔案覆寫掉★ 磁碟上的已寄紀錄被抹掉 → 大量重寄"
 
 
 # ── 修剪 ───────────────────────────────────────────────────────────────────
@@ -207,8 +211,10 @@ def test_prune_keeps_unresolved_forever(tmp_path):
                          recipients=["b@x.tw"])
     led.settle(old_done, refused={})
     # 把兩筆都推到「很久以前」，再觸發一次 prune
-    for rec in led._records.values():
-        rec["updated_at"] = 0.0
+    # [SQLite 版] 沒有記憶體快照可改 —— 直接改資料庫(模擬時間流逝)
+    import sqlite3
+    with sqlite3.connect(led.path) as _c:
+        _c.execute("UPDATE deliveries SET updated_at=0.0")
     led.begin(business_key="trigger-prune", category="clinical",
               recipients=["c@x.tw"])
 
