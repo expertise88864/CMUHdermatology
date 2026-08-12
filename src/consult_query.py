@@ -54,6 +54,7 @@ import json  # noqa: E402
 import logging  # noqa: E402
 import queue  # noqa: E402
 import re  # noqa: E402
+import shutil  # noqa: E402
 import socket  # noqa: E402
 import subprocess  # noqa: E402
 import threading  # noqa: E402
@@ -3040,6 +3041,98 @@ def _reset_login_dialog_texts(stealth: bool = False) -> None:
     """
     _login_dialog_texts.clear()
     _login_stealth_mode[0] = bool(stealth)
+    _login_dialog_shot_done[0] = False      # 新的一輪 → 可以再截一張
+
+
+# ══ 登入階段對話框的【截圖】(2026-08-12 使用者要求)═══════════════════════
+#
+# 為什麼光有上面的文字還不夠:Delphi 訊息框的內文是 TLabel(TGraphicControl,
+# ★沒有 HWND★),`_window_texts` 拿不到 —— 實機告警只看得到
+# 「[TMessageForm] 住院醫囑系統 / OK」,HIS 到底說了什麼仍然要用猜的。
+# 截「那個對話框視窗本身」的圖(PrintWindow,不是全螢幕)就能看到內文,
+# 而且畫面上只有那個視窗的範圍。
+#
+# 邊界與 record_text 完全相同(見上面那段):只在登入階段、主畫面交出來之前,
+# 畫面上不可能有病人資料。另外再加一道尺寸上限當第二道防線 ——
+# 對話框不會有整個螢幕那麼大,太大代表抓錯視窗,寧可不存。
+_LOGIN_DIALOG_SHOT_FILE = "login_dialog_evidence.png"
+_LOGIN_DIALOG_SHOT_TIMEOUT_SEC = 5.0    # 比一般截圖短:這是在登入迴圈裡順手做的
+_LOGIN_DIALOG_SHOT_MAX_W = 1600         # 大於這個尺寸就當成抓錯視窗,不存
+_LOGIN_DIALOG_SHOT_MAX_H = 1200
+# 告警信寄出時,截圖比這更舊就不附 —— 舊事故的截圖會把診斷帶錯方向
+# (告警最多 6 小時一封;故障期間每一輪登入都會重截,新鮮的一定跟得上)。
+_LOGIN_DIALOG_SHOT_MAX_AGE_SEC = 12 * 3600.0
+# 本輪已經截過了嗎。★一輪只截第一個★:第一個對話框通常就是拒絕原因,
+# 之後的多半是連鎖噪音;之後不同的對話框文字仍會被上面的機制記到。
+_login_dialog_shot_done = [False]
+
+
+def _login_dialog_shot_path() -> str:
+    from cmuh_common.paths import get_settings_dir  # noqa: PLC0415
+    return os.path.join(get_settings_dir(), _LOGIN_DIALOG_SHOT_FILE)
+
+
+def _login_dialog_shot_sending_path() -> str:
+    """寄信當下用的【不可變快照】路徑(★外審 SK 第 1 輪 P2★)。
+
+    正式檔會被兩條路動到:每輪登入的重截(os.replace)與恢復時的清理
+    (os.remove)。告警 worker 決定「要附」到 SMTP 真正開檔之間,正式檔
+    被刪的話,信會「說有附卻沒附」,或整封寄失敗 —— 而告警 6 小時才一封。
+    所以寄信前先 copy 成這個快照、附快照;寄完(成敗都)刪掉。
+    保留 .png 副檔名:附件的 MIME 型別是靠副檔名判斷的。
+    """
+    from cmuh_common.paths import get_settings_dir  # noqa: PLC0415
+    return os.path.join(get_settings_dir(), "login_dialog_evidence_sending.png")
+
+
+def _capture_login_dialog_shot(hwnd: int, cls: str) -> None:
+    """把登入途中的對話框【本身】截圖存檔。整條路 fail-open ——
+    截圖是診斷的錦上添花,任何失敗都不可以影響登入流程本身。
+    """
+    try:
+        if _login_dialog_shot_done[0]:
+            return
+        img = call_with_timeout(
+            lambda: _capture_window_image_impl(hwnd),
+            _LOGIN_DIALOG_SHOT_TIMEOUT_SEC, default=None,
+            name="login-dialog-shot")
+        if img is None:
+            logging.warning("[login] 對話框截圖失敗/逾時(class=%s)"
+                            "—— 告警信將只有文字證據", cls)
+            return
+        w, h = img.size
+        if w > _LOGIN_DIALOG_SHOT_MAX_W or h > _LOGIN_DIALOG_SHOT_MAX_H:
+            logging.warning("[login] 對話框截圖尺寸異常(%dx%d,class=%s)"
+                            "—— 對話框不該這麼大,可能抓錯視窗,不存", w, h, cls)
+            return
+        path = _login_dialog_shot_path()
+        tmp = path + ".tmp"
+        # ★先寫暫存再原子換名★:告警是背景執行緒在讀這個檔,
+        #   直接寫的話它可能讀到半張圖。
+        img.save(tmp, "PNG")
+        os.replace(tmp, path)
+        _login_dialog_shot_done[0] = True
+        logging.info("[login] 已把登入對話框截圖存檔(class=%s,%dx%d)"
+                     "—— 會附在下一封連續失敗告警信裡", cls, w, h)
+    except Exception:
+        logging.warning("[login] 對話框截圖存檔失敗(class=%s)", cls,
+                        exc_info=True)
+
+
+def _login_dialog_shot_for_alert():
+    """告警信要不要附截圖 → 附哪一個檔(str),或 None。
+
+    ★夠新鮮才附★:mtime 在未來(被校時過)或太舊的一律不附 ——
+    附一張舊事故的圖比不附更糟,它會把人帶去查一個已經不存在的原因。
+    """
+    try:
+        path = _login_dialog_shot_path()
+        age = time.time() - os.path.getmtime(path)
+        if 0 <= age <= _LOGIN_DIALOG_SHOT_MAX_AGE_SEC:
+            return path
+    except OSError:
+        pass
+    return None
 
 
 def _note_login_focus(field: str, ok: bool) -> None:
@@ -3055,6 +3148,10 @@ def _note_login_dialog(hwnd: int, cls: str, buttons) -> None:
     洗掉(本檔已經因為這件事吃過兩次虧,見 `_reported_unknown_dialogs` 與
     「已關閉訊息通知主畫面」的節流)。
     """
+    # ★截圖要排在所有 early-return 之前★:內文是 TLabel 時 `_window_texts`
+    #   常常只拿得到標題+按鈕,甚至整個是空的 —— 文字記不到的那幾種,
+    #   正是最需要截圖的(截圖自己有「一輪一張」的去重,不怕重複進來)。
+    _capture_login_dialog_shot(hwnd, cls)
     try:
         raw = call_with_timeout(lambda: _window_texts(hwnd), 3.0, default=[],
                                 name="login-dialog-text") or []
@@ -8395,6 +8492,12 @@ def _note_job_success() -> None:
         # ★恢復了就要把它寫掉★ 否則下次重啟又把舊的 streak 讀回來,
         #   第一次失敗就直接跨過門檻。
         _save_job_fail_state()
+    # 恢復了 → 對話框截圖代表的那個原因已經不存在,清掉(盡力而為;
+    # 刪不掉也沒關係,告警那邊還有 12 小時的新鮮度檢查擋著)。
+    try:
+        os.remove(_login_dialog_shot_path())
+    except OSError:
+        pass
 
 
 def _note_job_failure(recipients, reason: str) -> None:
@@ -8433,8 +8536,29 @@ def _note_job_failure(recipients, reason: str) -> None:
         pass
 
     def _worker():
+        snap = None
         try:
             from cmuh_common.smtp_mail import send_mail
+            # ★附件與內文那一句由同一個判斷決定★:說有附就真的有附,
+            #   說沒有就真的沒有 —— 兩者分開判斷的話,遲早一邊先改而另一邊
+            #   還在講舊話(宣稱要與實作一致)。
+            # ★而且附的是不可變快照★(外審 SK 第 1 輪 P2):正式檔隨時會被
+            #   「恢復清理」刪掉、被下一輪重截換掉 —— 快照失敗就當成沒有
+            #   截圖(不附、也不宣稱),不能讓附件問題弄丟整封告警。
+            shot = None
+            src = _login_dialog_shot_for_alert()
+            if src:
+                try:
+                    snap = _login_dialog_shot_sending_path()
+                    shutil.copyfile(src, snap)
+                    shot = snap
+                except OSError:
+                    logging.warning("[health] 截圖快照失敗 → 本封告警不附截圖"
+                                    "(告警本身照寄)", exc_info=True)
+                    snap = None
+            shot_line = ("已附上登入途中攔到的對話框截圖 —— "
+                         "它通常就是 HIS 拒絕登入的原因(內文是畫在視窗上的,"
+                         "文字抓不到,只能用看的)。\n" if shot else "")
             send_mail(
                 recipients=[str(r) for r in recipients],
                 subject="⚠ 會診查詢自動化連續失敗"
@@ -8442,19 +8566,29 @@ def _note_job_failure(recipients, reason: str) -> None:
                 body=("會診查詢的自動輪詢已連續失敗 "
                       f"{streak} 次，目前很可能查不到任何會診。\n\n"
                       + (f"發生在：{host}\n" if host else "")
-                      + f"最後錯誤：{str(reason)[:300]}\n\n"
-                      "請注意：輪詢模式在「沒有新會診」時本來就不會寄信，因此這種故障"
+                      + f"最後錯誤：{str(reason)[:300]}\n"
+                      + shot_line +
+                      "\n請注意：輪詢模式在「沒有新會診」時本來就不會寄信，因此這種故障"
                       "從外觀上與「今天沒有新會診」完全一樣——期間請以人工方式確認會診，"
                       "並查看 settings/consult_query.log。\n"
                       "（本信只寄給開發者；臨床同仁不會收到，需要時請自行轉知。）\n"
                       "（恢復正常後不會再寄；同一波故障最多 6 小時提醒一次，"
                       "重啟也不會重來。多台電腦各自計算，所以信中會註明是哪一台。）"),
-                attachment_path=None,
+                attachment_path=Path(shot) if shot else None,
                 category="system",      # [P2-02] 連續失敗告警走系統額度
             )
-            logging.info("[health] 已寄出連續失敗告警(%d 次)", streak)
+            logging.info("[health] 已寄出連續失敗告警(%d 次,截圖=%s)",
+                         streak, "有附" if shot else "無")
         except Exception:
             logging.warning("[health] 連續失敗告警寄送失敗", exc_info=True)
+        finally:
+            # 快照是一次性的,寄完(成敗都)清掉;刪不掉也只是留一個小檔,
+            # 下一封會直接覆蓋它。
+            if snap:
+                try:
+                    os.remove(snap)
+                except OSError:
+                    pass
 
     threading.Thread(target=_worker, name="ConsultHealthAlert",
                      daemon=True).start()
