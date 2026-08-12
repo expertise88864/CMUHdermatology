@@ -100,9 +100,13 @@ class TestRecoveryRunsBeforeAnythingElse:
             f"第 {min(guarded_lines)} 行之前")
 
     def test_the_clinical_launcher_can_actually_refuse_to_start(self):
-        """主程式的 `run_path` 必須在「復原結果」的 if 底下 —— 不是只呼叫一下。
+        """主程式必須【看】復原的回傳值,沒通過就走不到 `run_path`。
 
         只呼叫不看回傳值，就等於「復原沒完成照樣啟動」，那正是要修的東西。
+        ★[批次AD-1 之後的形狀]★ 版本解析移到復原之後,gate 攤平成
+        「`if not _recover_incomplete_update(): raise SystemExit(0)` → 解析 →
+        run_path」—— 驗的性質不變:gate 存在、gate 裡真的會離開、
+        而且所有 run_path 都在 gate 之後(被它擋住)。
         """
         tree = ast.parse(_read_launcher(CLINICAL_LAUNCHER))
         guard = None
@@ -116,16 +120,28 @@ class TestRecoveryRunsBeforeAnythingElse:
                     guard = node
                     break
         assert guard is not None, "主程式沒有把啟動包在復原結果的判斷底下"
+        run_paths = {n.lineno for n in ast.walk(tree)
+                     if isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Attribute)
+                     and n.func.attr == "run_path"}
+        assert run_paths, "主程式裡找不到 run_path"
         inside = {n.lineno for n in ast.walk(guard)
                   if isinstance(n, ast.Call)
                   and isinstance(n.func, ast.Attribute)
                   and n.func.attr == "run_path"}
-        outside = {n.lineno for n in ast.walk(tree)
-                   if isinstance(n, ast.Call)
-                   and isinstance(n.func, ast.Attribute)
-                   and n.func.attr == "run_path"} - inside
-        assert inside, "run_path 不在復原判斷的分支內"
-        assert not outside, f"還有 run_path 在復原判斷之外：第 {sorted(outside)} 行"
+        if inside:
+            # 舊形狀:run_path 縮在 if 底下 → 不可以有漏在外面的
+            assert run_paths == inside, (
+                f"還有 run_path 在復原判斷之外：第 {sorted(run_paths - inside)} 行")
+        else:
+            # 新形狀:gate 是「沒通過就離開」的早退 —— gate 裡必須真的 raise,
+            # 而且所有 run_path 都在 gate 之後(否則 gate 擋不到它)。
+            raises = [n for n in guard.body for m in ast.walk(n)
+                      if isinstance(m, ast.Raise)]
+            assert raises, "★gate 沒有出口★ 沒通過也只是繼續往下走"
+            end = getattr(guard, "end_lineno", guard.lineno)
+            early = sorted(ln for ln in run_paths if ln <= end)
+            assert not early, f"有 run_path 在復原 gate 之前：第 {early} 行"
 
     def test_only_the_clinical_launcher_pops_a_window(self):
         """★只有主程式跳窗★ 其餘五支無人看顧，MessageBox 會讓行程卡死。"""

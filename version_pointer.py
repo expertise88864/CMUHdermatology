@@ -44,9 +44,11 @@ _MAX_VERSION_LEN = 64
 PINNED = "pinned"                      # 真的用了版本化目錄
 NO_POINTER = "no_pointer"              # ★過渡期的正常狀態★
 POINTER_UNREADABLE = "pointer_unreadable"
+POINTER_MALFORMED = "pointer_malformed"    # 讀得出來,但不是「恰好一行」
 UNSAFE_VERSION = "unsafe_version"
 VERSION_MISSING = "version_missing"
 INCOMPLETE = "incomplete"
+ESCAPES_VERSIONS = "escapes_versions_dir"  # 實體位置跑出 versions/ 外(junction)
 
 #: 只有這一個 reason 是「本來就預期會發生」的,其餘都要留紀錄。
 EXPECTED_REASONS = frozenset({PINNED, NO_POINTER})
@@ -69,11 +71,20 @@ def is_safe_version(text) -> bool:
 
 
 def read_pointer(app_dir: str):
-    """→ (版本字串 或 None, reason)。★「沒有指標」與「讀不出來」是兩件事★"""
+    """→ (版本字串 或 None, reason)。★「沒有指標」與「讀不出來」是兩件事★
+
+    ★[外審 2026-08-12 P2-02] 格式是【恰好一個邏輯行】★
+    這個檔是原子版本選擇器 —— 寫入端一次只會寫一行。多出來的任何非空白
+    內容(`V2\\nTHIS_FILE_IS_CORRUPTED`)都代表寫入被打斷或被別的東西動過:
+    「第一行剛好還像版本號」不能當成沒事,那正是壞了一半的樣子。
+    同理,檔案大到超過讀取上限(指標不該有這種大小)也一律當壞掉。
+    用 utf-8-sig:有些編輯器會補 BOM,BOM 不該讓指標失效。
+    """
     path = os.path.join(app_dir, POINTER_NAME)
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             raw = fh.read(_MAX_VERSION_LEN * 4)
+            beyond_cap = fh.read(1)
     except FileNotFoundError:
         return None, NO_POINTER
     except OSError:
@@ -81,9 +92,14 @@ def read_pointer(app_dir: str):
         return None, POINTER_UNREADABLE
     except Exception:                                   # noqa: BLE001
         return None, POINTER_UNREADABLE
-    version = raw.strip().splitlines()[0].strip() if raw.strip() else ""
+    if beyond_cap:
+        return None, POINTER_MALFORMED
+    lines = raw.splitlines()
+    version = lines[0].strip() if lines else ""
     if not version:
         return None, POINTER_UNREADABLE
+    if any(ln.strip() for ln in lines[1:]):
+        return None, POINTER_MALFORMED
     if not is_safe_version(version):
         return None, UNSAFE_VERSION
     return version, PINNED
@@ -94,12 +110,78 @@ def version_src_dir(app_dir: str, version: str) -> str:
 
 
 def is_complete(app_dir: str, version: str) -> bool:
-    """裝到一半的版本目錄絕對不可以被指到。"""
+    """裝到一半的版本目錄絕對不可以被指到。
+
+    ★用 `isfile` 不用 `exists`★(外審 2026-08-12 P2-01):`.complete` 是
+    部署流程最後一步【寫的檔案】—— 同名的目錄不是部署流程留的,是別的
+    東西弄出來的,不能當成「裝完了」的證明。
+    """
     marker = os.path.join(app_dir, VERSIONS_DIRNAME, version, COMPLETE_MARKER)
     try:
-        return os.path.exists(marker)
+        return os.path.isfile(marker)
     except Exception:                                   # noqa: BLE001
         return False
+
+
+def _stays_inside_versions(app_dir: str, src: str) -> bool:
+    """★實體位置必須留在 `<app>/versions/` 底下★(外審 2026-08-12 P2-01)
+
+    版本字串的字元白名單擋得掉 `..` 與磁碟機代號,但擋不掉【junction /
+    符號連結】:`versions/V2` 若是指到別處的 junction,字串層看起來完全
+    合法,實際載入的卻是任意目錄。realpath 會把連結展開 —— 展開後不在
+    versions/ 底下就拒絕。分不出來(不同磁碟機、realpath 失敗)也拒絕。
+
+    ★而且要看整棵樹,不是只看 `src` 那一層★(外審 AD-1 第 1 輪 P2)
+    只 realpath 頂端目錄的話,`src/cmuh_common` 或入口檔本身是指到外面的
+    連結時照樣逸出。政策從「展開後留在裡面」收緊成
+    ★版本樹內部不允許任何 reparse point★ —— 我們自己的部署流程只會
+    複製檔案,永遠不會建連結;樹裡出現連結本身就是「不是部署流程放的」
+    的證據,不必分辨它指到哪裡。掃不動(權限、AV 鎖住)也拒絕:
+    這條路的回退是大聲走 `<app>/src`,不是擋住開機。
+    """
+    try:
+        root = os.path.normcase(
+            os.path.realpath(os.path.join(app_dir, VERSIONS_DIRNAME)))
+        real = os.path.normcase(os.path.realpath(src))
+        if os.path.commonpath([root, real]) != root or real == root:
+            return False
+        version_dir = os.path.dirname(src)      # <app>/versions/<version>
+        return not _tree_has_reparse_points(version_dir)
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
+def _tree_has_reparse_points(top: str) -> bool:
+    """整棵樹(含 `top` 自己)有沒有任何 reparse point。查不動=有(fail-closed)。
+
+    `entry.is_symlink()` 看不到 junction(那是目錄的 reparse point,不是
+    symlink),所以用 `st_file_attributes` 的 FILE_ATTRIBUTE_REPARSE_POINT ——
+    junction、symlink、mount point 一網打盡。非 Windows 退回 lstat/islink。
+    """
+    import stat as _stat
+    attr = getattr(_stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+
+    def _is_reparse(path: str) -> bool:
+        st = os.lstat(path)
+        if attr and getattr(st, "st_file_attributes", 0) & attr:
+            return True
+        return _stat.S_ISLNK(st.st_mode)
+
+    # ★[外審 AD-1 第 2 輪 P2] os.walk 預設會【靜默跳過】列舉失敗的子樹★
+    #   沒給 onerror 的話,一個拒絕列目錄的子樹就讓掃描「沒看到=沒有」——
+    #   守衛自己 no-op 掉了。onerror 一律 raise,由呼叫端的 except 收成
+    #   「查不動=拒絕」(大聲回退 <app>/src,不擋開機)。
+    def _refuse_to_skip(err):
+        raise err
+
+    if _is_reparse(top):
+        return True
+    for dirpath, dirnames, filenames in os.walk(top, followlinks=False,
+                                                onerror=_refuse_to_skip):
+        for name in dirnames + filenames:
+            if _is_reparse(os.path.join(dirpath, name)):
+                return True
+    return False
 
 
 def resolve_src(app_dir: str, program_name: str = "") -> Resolution:
@@ -125,6 +207,9 @@ def resolve_src(app_dir: str, program_name: str = "") -> Resolution:
     if not ok:
         _note(app_dir, program_name, VERSION_MISSING, version)
         return Resolution(_legacy_src(app_dir), "", VERSION_MISSING)
+    if not _stays_inside_versions(app_dir, src):
+        _note(app_dir, program_name, ESCAPES_VERSIONS, version)
+        return Resolution(_legacy_src(app_dir), "", ESCAPES_VERSIONS)
     return Resolution(src, version, PINNED)
 
 

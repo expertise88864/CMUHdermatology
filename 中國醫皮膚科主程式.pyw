@@ -137,18 +137,6 @@ def _load_bootstrap_recovery():
     return _mod
 
 
-_SRC = _resolve_src()
-# ★[批次L L1 外審 P1] 把「固定的根目錄」與「固定的啟動器」釘進環境★
-#   `runpy.run_path` 會把 `sys.argv[0]` 換成被執行的那支源碼（版本化之後是
-#   `versions/<V>/src/...`）。沒有這兩個值的話:
-#     * `get_app_dir()` 會把 `<app>/versions/<V>` 當成根 → settings/log/assets
-#       全部跑進版本目錄（切一次版＝所有設定都不見了）;
-#     * `restart_self()` 會直接重跑 V1 的源碼 → 永遠不再讀 `current.txt`。
-#   子行程會繼承這兩個值（watchdog 啟動的那些也算）。
-os.environ["CMUH_APP_DIR"] = _HERE
-os.environ["CMUH_LAUNCHER"] = os.path.abspath(__file__)
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
 
 
 def _report_startup_crash(program_name):
@@ -223,9 +211,30 @@ def _recover_incomplete_update():
     return bootstrap_recovery.confirm_start_despite(result, "主程式")
 
 
-if _recover_incomplete_update():
-    try:
-        runpy.run_path(os.path.join(_SRC, "main.py"), run_name="__main__")
-    except Exception:  # noqa: BLE001  只攔 Exception；SystemExit（正常退出）照常穿出
-        _report_startup_crash("主程式")
-        raise
+if not _recover_incomplete_update():
+    # 與原本「if 通過才跑」同義:沒通過就結束(維持離開碼 0)。
+    raise SystemExit(0)
+
+# ★[外審 2026-08-12 P1-01] 版本解析必須排在復原【之後】★
+#   復原收的是上一批沒走完的更新殘局 —— 包括 version_pointer.py /
+#   current.txt 本身。舊順序是「先解析、再復原、然後跑解析時選到的
+#   那棵」:復原把指標修好了,這一次卻仍跑修復【前】選到的 <app>/src。
+#   ★復原成功 ≠ 本次啟動用的是復原後的狀態★ —— 解析一定要在復原
+#   之後才做。
+_SRC = _resolve_src()
+# ★[批次L L1 外審 P1] 把「固定的根目錄」與「固定的啟動器」釘進環境★
+#   `runpy.run_path` 會把 `sys.argv[0]` 換成被執行的那支源碼（版本化之後是
+#   `versions/<V>/src/...`）。沒有這兩個值的話:
+#     * `get_app_dir()` 會把 `<app>/versions/<V>` 當成根 → settings/log/assets
+#       全部跑進版本目錄（切一次版＝所有設定都不見了）;
+#     * `restart_self()` 會直接重跑 V1 的源碼 → 永遠不再讀 `current.txt`。
+#   子行程會繼承這兩個值（watchdog 啟動的那些也算）。
+os.environ["CMUH_APP_DIR"] = _HERE
+os.environ["CMUH_LAUNCHER"] = os.path.abspath(__file__)
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+try:
+    runpy.run_path(os.path.join(_SRC, "main.py"), run_name="__main__")
+except Exception:  # noqa: BLE001  只攔 Exception；SystemExit（正常退出）照常穿出
+    _report_startup_crash("主程式")
+    raise

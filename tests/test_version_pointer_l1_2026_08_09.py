@@ -110,7 +110,8 @@ def test_safe_versions_are_accepted(ok):
 def test_the_reason_set_is_closed():
     """`reason` 是封閉集合 —— 呼叫端才能分流，不必比對字串長相。"""
     known = {vp.PINNED, vp.NO_POINTER, vp.POINTER_UNREADABLE,
-             vp.UNSAFE_VERSION, vp.VERSION_MISSING, vp.INCOMPLETE}
+             vp.POINTER_MALFORMED, vp.UNSAFE_VERSION, vp.VERSION_MISSING,
+             vp.INCOMPLETE, vp.ESCAPES_VERSIONS}
     assert vp.EXPECTED_REASONS <= known
     assert vp.EXPECTED_REASONS == {vp.PINNED, vp.NO_POINTER}, (
         "只有『用了版本目錄』與『過渡期沒有指標』是預期狀態")
@@ -151,7 +152,7 @@ def test_it_imports_nothing_from_the_project():
             mods.update(a.name.split(".")[0] for a in n.names)
         elif isinstance(n, ast.ImportFrom) and n.module:
             mods.add(n.module.split(".")[0])
-    assert mods <= {"__future__", "datetime", "os", "collections"}, (
+    assert mods <= {"__future__", "datetime", "os", "collections", "stat"}, (
         f"引入了非標準庫或專案模組：{sorted(mods)}")
 
 
@@ -169,8 +170,12 @@ def _stub_block(path):
     # ★區塊從 `_note_resolver_failure` 開始★（外審 P1-03 之後 resolver 會呼叫它）
     #   只從 `_resolve_src` 開始擷取的話，exec 這段會 NameError —— 測到的是
     #   我的擷取範圍，不是被測的行為。
+    # ★結尾錨改成 `_report_startup_crash`★（外審 2026-08-12 P1-01 之後
+    #   `_SRC = _resolve_src()` 移到復原【之後】—— 舊錨會把六支各自的
+    #   復原段落也框進來，那些本來就允許不同（程式名稱不同）。
+    #   `_load_bootstrap_recovery` 仍要留在區塊內（分岔＝有幾支從錯的地方載）。
     start = src.index("def _note_resolver_failure(")
-    end = src.index("_SRC = _resolve_src()", start)
+    end = src.index("def _report_startup_crash(", start)
     return src[start:end]
 
 

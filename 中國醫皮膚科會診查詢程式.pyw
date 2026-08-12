@@ -129,18 +129,6 @@ def _load_bootstrap_recovery():
     return _mod
 
 
-_SRC = _resolve_src()
-# ★[批次L L1 外審 P1] 把「固定的根目錄」與「固定的啟動器」釘進環境★
-#   `runpy.run_path` 會把 `sys.argv[0]` 換成被執行的那支源碼（版本化之後是
-#   `versions/<V>/src/...`）。沒有這兩個值的話:
-#     * `get_app_dir()` 會把 `<app>/versions/<V>` 當成根 → settings/log/assets
-#       全部跑進版本目錄（切一次版＝所有設定都不見了）;
-#     * `restart_self()` 會直接重跑 V1 的源碼 → 永遠不再讀 `current.txt`。
-#   子行程會繼承這兩個值（watchdog 啟動的那些也算）。
-os.environ["CMUH_APP_DIR"] = _HERE
-os.environ["CMUH_LAUNCHER"] = os.path.abspath(__file__)
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
 
 
 def _report_startup_crash(program_name, *, show_dialog=True):
@@ -220,6 +208,25 @@ if not _recover_incomplete_update():
     # ★非零離開★ 「已有一份在跑」用 0（那是正常結束）；這裡是「這一輪沒有做事」，
     #   要讓排程紀錄看得出差別。下一輪排程會再試。
     raise SystemExit(3)
+
+# ★[外審 2026-08-12 P1-01] 版本解析必須排在復原【之後】★
+#   復原收的是上一批沒走完的更新殘局 —— 包括 version_pointer.py /
+#   current.txt 本身。舊順序是「先解析、再復原、然後跑解析時選到的
+#   那棵」:復原把指標修好了,這一次卻仍跑修復【前】選到的 <app>/src。
+#   ★復原成功 ≠ 本次啟動用的是復原後的狀態★ —— 解析一定要在復原
+#   之後才做。
+_SRC = _resolve_src()
+# ★[批次L L1 外審 P1] 把「固定的根目錄」與「固定的啟動器」釘進環境★
+#   `runpy.run_path` 會把 `sys.argv[0]` 換成被執行的那支源碼（版本化之後是
+#   `versions/<V>/src/...`）。沒有這兩個值的話:
+#     * `get_app_dir()` 會把 `<app>/versions/<V>` 當成根 → settings/log/assets
+#       全部跑進版本目錄（切一次版＝所有設定都不見了）;
+#     * `restart_self()` 會直接重跑 V1 的源碼 → 永遠不再讀 `current.txt`。
+#   子行程會繼承這兩個值（watchdog 啟動的那些也算）。
+os.environ["CMUH_APP_DIR"] = _HERE
+os.environ["CMUH_LAUNCHER"] = os.path.abspath(__file__)
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
 try:
     runpy.run_path(os.path.join(_SRC, "consult_query.py"), run_name="__main__")
