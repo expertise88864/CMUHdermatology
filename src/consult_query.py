@@ -4179,6 +4179,87 @@ _CONTENT_CLASSES = frozenset({MAIN_CLASS, LOGIN_CLASS, CONSULT_CLASS,
 
 # 「不認得的對話框」警告:同一個 class 只講一次,不要每 0.4 秒刷一行。
 _reported_unknown_dialogs: set = set()
+
+# ★[批次AE-2/#89 P2-06 觀測版] owner 鏈證據:只記、不改行為★
+#   enforcement(「dialog 的 owner 鏈要通到我們的主畫面才可以按」)在沒有
+#   實機數據前就上,會重演 2026-08-05 的「fail-closed 無出口」——
+#   Delphi modal 的 owner 常是 TApplication 隱藏視窗,不一定是主畫面。
+#   先把每種擋路對話框的鏈記下來,有數據再定 enforcement 規則。
+#   同一種形狀只記一次(dismiss 迴圈每 0.4 秒跑一次;2026-07-29 曾有
+#   1,568 行幾乎同一句的實機 log)。
+_reported_owner_chains: set = set()
+_OWNER_CHAIN_MAX_HOPS = 8
+
+
+def _owner_chain_evidence(hwnd, main_hwnd) -> tuple:
+    """hwnd 的 GW_OWNER 鏈 → (鏈描述, 形狀鍵)。★永不拋、不讀視窗文字★
+
+    只記 class/hwnd/可見/enabled —— 病人資料在視窗【文字】裡;class 名
+    (TFMTimeOut_1 等)是程式結構,不是 PHI。迴圈防呆:owner 成環就停
+    (visited 集合),另有 _OWNER_CHAIN_MAX_HOPS 跳上限(超長鏈=截斷,
+    觀測夠用)。
+    """
+    hops: list = []
+    shape: list = []
+    seen: set = set()
+    try:
+        cur = int(hwnd or 0)
+        for _ in range(_OWNER_CHAIN_MAX_HOPS):
+            if not cur or cur in seen:
+                break                    # 0=到頂;重複=owner 成環
+            seen.add(cur)
+            try:
+                cls = win32gui.GetClassName(cur) or "?"
+            except Exception:
+                cls = "?"
+            try:
+                vis = int(bool(win32gui.IsWindowVisible(cur)))
+                en = int(bool(win32gui.IsWindowEnabled(cur)))
+            except Exception:
+                vis = en = -1
+            hops.append("%s(%s,vis=%s,en=%s)" % (hex(cur), cls, vis, en))
+            shape.append(str(cls))
+            try:
+                cur = int(win32gui.GetWindow(cur, win32con.GW_OWNER) or 0)
+            except Exception:
+                break
+        main = int(main_hwnd or 0)
+        # ★沒有 main handle=「不知道」,不是 False★(外審 AE-2 第 1 輪 P2):
+        #   登入路徑呼叫時不帶 session —— 把 unknown 記成 main_in_chain=False
+        #   會留下錯誤的候選判準。main 狀態也要進【節流形狀】:同一種
+        #   class 鏈從 unknown 變成 known(或 in-chain/disabled 改變)是
+        #   ★新的★證據,不可以被第一筆壓掉;狀態值是有限集合,節流仍有界。
+        if not main:
+            main_state = "main=unknown"
+        else:
+            main_dis: "object" = None
+            try:
+                main_dis = not win32gui.IsWindowEnabled(main)
+            except Exception:
+                main_dis = None
+            main_state = ("main_in_chain=%s main_disabled=%s"
+                          % (main in seen, main_dis))
+        desc = " → ".join(hops) + " | " + main_state
+        return desc, "|".join(shape) + ";" + main_state
+    except Exception:
+        return "", ""
+
+
+def _note_modal_owner_evidence(hwnd, cls, sess) -> None:
+    """觀測版:把擋路對話框的 owner 鏈記進 log。★任何失敗都不影響按鈕流程★"""
+    try:
+        desc, shape = _owner_chain_evidence(hwnd,
+                                            getattr(sess, "main_hwnd", 0))
+        if not desc:
+            return
+        key = (str(cls), shape)
+        if key in _reported_owner_chains:
+            return
+        _reported_owner_chains.add(key)
+        logging.info("[modal-evidence] class=%s 鏈=%s(P2-06 觀測版:"
+                     "只記不擋,每種形狀記一次)", cls, desc)
+    except Exception:
+        logging.debug("[modal-evidence] 記錄失敗(不影響流程)", exc_info=True)
 # 只按這些字樣的按鈕。★絕不盲按★:不認得的對話框只記下它有哪些按鈕,不出手。
 _AFFIRMATIVE_CAPTIONS = ("確認", "確定", "OK", "Ok", "是", "繼續")
 # ★class 專屬按鈕★(2026-08-06 實機回報,正是「請回報這一行」等的那筆):
@@ -4269,6 +4350,9 @@ def _dismiss_blocking_modals(sess=None, *, pids=None,
         return 0
     clicked = 0
     for hwnd, cls in _blocking_dialogs(owner):
+        # ★觀測版(#89)★ 在按之前記 owner 鏈證據 —— 按下去視窗就消失了。
+        #   只記不擋;它自己吞掉一切失敗,不影響下面的按鈕流程。
+        _note_modal_owner_evidence(hwnd, cls, sess)
         try:
             # ★[2026-08-06 深度穩定,實機 log 09:06]★ class=#32770 按鈕=[]:
             #   原生 Win32 對話框(MessageBox/驅動程式跳窗)的按鈕 class 是
@@ -7690,7 +7774,10 @@ def _remote_receipt_path() -> str:
 
 
 def _ambiguous_legacy_receipt(data: dict, key: str):
-    """新鍵查不到時,找同 `{uv}:{uid}` 的【未標身分】舊收據。→ rec 或 None。
+    """新鍵查不到時,找同 `{uv}:{uid}` 的【舊命名空間】收據。→ rec 或 None。
+
+    蓋兩代舊格式:未標身分的裸鍵(AD-4 之前)與「只 hash 帳號」的舊身分鍵
+    (v2026.08.13.4~.7,批次AE-2 把 host/port 納入公式後成為舊格式)。
 
     ★[外審 AD-4 第 2 輪 P1] 舊收據不可以改綁到「目前」帳號★
     舊版收據沒記帳號;收據檔與憑證共用 settings 目錄,換帳號不會清收據 ——
@@ -7705,10 +7792,27 @@ def _ambiguous_legacy_receipt(data: dict, key: str):
     """
     if "|" not in key:
         return None
-    bare = key.split("|", 1)[1]
+    ident, bare = key.split("|", 1)
+    now = _now_receipt()
     rec = data.get(bare)
-    if rec is not None and _remote_receipt_is_fresh(rec, _now_receipt()):
+    if rec is not None and _remote_receipt_is_fresh(rec, now):
         return rec
+    # ★[批次AE-2] 身分公式改版(納入 host)後的舊命名空間★
+    #   v2026.08.13.4~.7 的鍵是「只 hash 帳號」的舊身分 —— 從目前設定
+    #   推算得出來:同一台機器部署前一刻剛執行過的指令,不可以在改版後
+    #   再跑一次。同樣【不認領、不改綁】:比對到新鮮舊收據就 fail-closed,
+    #   出口是既有的 24 小時 TTL(claim 的剪枝與 fresh 檢查蓋得到它)。
+    try:
+        from cmuh_common.imap_reader import (  # noqa: PLC0415
+            legacy_mailbox_identity,
+        )
+        old_ident = legacy_mailbox_identity()
+    except Exception:
+        old_ident = ""
+    if old_ident and old_ident != ident:
+        rec = data.get(f"{old_ident}|{bare}")
+        if rec is not None and _remote_receipt_is_fresh(rec, now):
+            return rec
     return None
 
 

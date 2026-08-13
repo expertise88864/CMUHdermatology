@@ -369,9 +369,36 @@ def _identity_from_settings(s) -> str:
     掃描之後另外重載憑證的話,兩次載入之間換了帳號,A 連線掃到的 UID 會
     被掛在 B 的身分下 —— 身分與 UID 世代必須描述【同一個】掃描情境。
     掃描函式用自己那份 `s` 呼叫這裡,並把結果放進回傳值。
+
+    ★[外審 2026-08-13 P2-01] 指紋要含 host/port/mailbox 整組★
+    設定允許覆寫 IMAP 主機:同一個帳號名掛在兩台伺服器上,UIDVALIDITY+UID
+    可能撞號 —— 只 hash 帳號的話兩邊身分相同,收據/journal 又會互認。
+    mailbox 目前固定 INBOX,一併寫進雜湊基底(日後開放再變成參數)。
+    分隔用 0x1f(unit separator):欄位值不可能含它,拼接不會歧義。
     """
     import hashlib
-    user = str((s or {}).get("username") or "").strip().lower()
+    s = s or {}
+    user = str(s.get("username") or "").strip().lower()
+    if not user:
+        return ""
+    host = str(s.get("host") or "").strip().lower()
+    port = str(s.get("port") or "")
+    basis = chr(31).join((host, port, user, "INBOX"))
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:12] + ":INBOX"
+
+
+def legacy_mailbox_identity() -> str:
+    """v2026.08.13.4~.7 的舊格式身分(只 hash 帳號)。
+
+    ★只給遠端指令收據的曖昧比對用★(批次AE-2):身分公式改版後,
+    部署前一刻剛執行過的指令,收據掛在舊命名空間下 —— 新鍵查不到就再跑
+    一次是 AD-4 P1-1 的原病灶。舊身分從目前設定推算得出來,拿去【比對】
+    (不認領、不改綁,fail-closed + 既有 24h TTL 出口,與 AD-4 第 2 輪
+    的裸鍵處理同一個立場)。取不到帳號 → 空字串。
+    """
+    import hashlib
+    user = str((_load_imap_settings() or {}).get("username")
+               or "").strip().lower()
     if not user:
         return ""
     return hashlib.sha256(user.encode("utf-8")).hexdigest()[:12] + ":INBOX"

@@ -376,7 +376,9 @@ class TestMarkSeenVerifiesTheAccount:
         monkeypatch.setattr(
             ir.imaplib, "IMAP4_SSL",
             lambda *a, **k: pytest.fail("帳號不符還去連線"))
-        ident_a = ir._identity_from_settings({"username": "a@x.tw"})
+        # 掃描端的身分:同一台伺服器、另一個帳號(生產形狀=完整設定)
+        ident_a = ir._identity_from_settings(
+            {"host": "h", "port": 993, "username": "a@x.tw"})
         assert ir.mark_uids_seen(["7"], expect_uidvalidity="9",
                                  expect_identity=ident_a) is False
 
@@ -390,7 +392,9 @@ class TestMarkSeenVerifiesTheAccount:
         monkeypatch.setattr(ir, "_set_active", lambda c, tag="": None)
         monkeypatch.setattr(ir, "_clear_active", lambda c: None)
         monkeypatch.setattr(ir, "_force_close_conn", lambda c: None)
-        ident_a = ir._identity_from_settings({"username": "a@x.tw"})
+        # ★身分要用掃描當下的【完整】設定算★(host 也在指紋裡,批次AE-2)
+        ident_a = ir._identity_from_settings(
+            {"host": "h", "port": 993, "username": "a@x.tw"})
         assert ir.mark_uids_seen(["7"], expect_uidvalidity="9",
                                  expect_identity=ident_a) is True
 
@@ -421,6 +425,89 @@ class TestReplaySurvivesEveryBadTimestampShape:
         pending, _ = cq._trigger_journal_pending()
         assert set(pending) == {"T|9|4"}, (
             "壞的三筆要走過時結案出口,不可以留著")
+
+
+class TestIdentityCoversTheWholeEndpoint:
+    """★[批次AE-2,外審 2026-08-13 P2-01]★ 指紋要含 host/port/mailbox
+    整組:同一個帳號名掛在兩台伺服器上,UIDVALIDITY+UID 可能撞號 ——
+    只 hash 帳號的話兩邊身分相同,收據/journal 會互認。"""
+
+    @staticmethod
+    def _ident(monkeypatch, **s):
+        monkeypatch.setattr(ir, "_load_imap_settings", lambda: dict(s))
+        return ir.mailbox_identity()
+
+    def test_the_host_is_part_of_the_identity(self, monkeypatch):
+        a = self._ident(monkeypatch, host="server-a.example", port=993,
+                        username="doctor@example.com")
+        b = self._ident(monkeypatch, host="server-b.example", port=993,
+                        username="doctor@example.com")
+        assert a and b and a != b, (
+            "★同帳號、不同伺服器 → 身分相同★ 撞號的 UID 會互認收據")
+
+    def test_the_port_is_part_of_the_identity(self, monkeypatch):
+        a = self._ident(monkeypatch, host="h", port=993, username="u")
+        b = self._ident(monkeypatch, host="h", port=143, username="u")
+        assert a != b
+
+    def test_host_case_and_whitespace_are_normalized(self, monkeypatch):
+        a = self._ident(monkeypatch, host=" IMAP.X.tw ", port=993,
+                        username="u")
+        b = self._ident(monkeypatch, host="imap.x.tw", port=993,
+                        username="u")
+        assert a == b, "host 大小寫/空白不可以變成不同身分"
+
+    def test_legacy_identity_is_the_old_username_only_formula(
+            self, monkeypatch):
+        """★舊公式要逐字釘住★ —— 對不上就比對不到部署前寫下的收據,
+        「剛執行過的指令再跑一次」就會復發(AD-4 P1-1 的形狀)。"""
+        import hashlib
+        monkeypatch.setattr(ir, "_load_imap_settings",
+                            lambda: {"host": "h", "port": 993,
+                                     "username": "Doc@X.tw "})
+        want = hashlib.sha256(b"doc@x.tw").hexdigest()[:12] + ":INBOX"
+        assert ir.legacy_mailbox_identity() == want
+        assert ir.mailbox_identity() != want, (
+            "新舊公式一樣的話,這批什麼都沒改")
+
+
+class TestOldNamespaceReceiptsStayAmbiguous:
+    """★[批次AE-2]★ 身分公式改版後,部署前一刻剛執行過的遠端指令
+    (收據在舊命名空間)不可以再執行一次 —— 曖昧 fail-closed + 24h TTL
+    出口,與 AD-4 第 2 輪的裸鍵處理同一個立場。"""
+
+    @staticmethod
+    def _idents(monkeypatch):
+        monkeypatch.setattr(ir, "_load_imap_settings",
+                            lambda: {"host": "h", "port": 993,
+                                     "username": "u"})
+        return ir.mailbox_identity(), ir.legacy_mailbox_identity()
+
+    @staticmethod
+    def _seed_receipts(data):
+        io.open(cq._remote_receipt_path(), "w",
+                encoding="utf-8").write(json.dumps(data))
+
+    def test_a_fresh_old_identity_receipt_blocks_execution(self, monkeypatch):
+        new_i, old_i = self._idents(monkeypatch)
+        self._seed_receipts({f"{old_i}|9:7": {"at": time.time()}})
+        assert cq._claim_remote_command(f"{new_i}|9:7") is False, (
+            "★部署前剛執行過的指令,改版後又跑了一次★")
+
+    def test_the_ttl_is_still_the_exit(self, monkeypatch):
+        """抑制要有出口:過期的舊收據不再擋(真的換了端點也最多擋 24h)。"""
+        new_i, old_i = self._idents(monkeypatch)
+        self._seed_receipts({f"{old_i}|9:7": {
+            "at": time.time() - cq._REMOTE_RECEIPT_TTL_SEC - 60}})
+        assert cq._claim_remote_command(f"{new_i}|9:7") is True
+
+    def test_done_under_the_old_identity_suppresses_the_expiry_reply(
+            self, monkeypatch):
+        new_i, old_i = self._idents(monkeypatch)
+        self._seed_receipts({f"{old_i}|9:7": {"at": time.time(),
+                                              "done": True}})
+        assert cq._remote_command_was_done(f"{new_i}|9:7") is True, (
+            "舊命名空間的 done 也要壓掉過期回信 —— 不然使用者收到假的過期通知")
 
 
 if __name__ == "__main__":       # pragma: no cover
