@@ -170,7 +170,7 @@ class TestMarkSeenVerifiesTheGeneration:
                                      "username": "u", "password": "p"})
         monkeypatch.setattr(ir.imaplib, "IMAP4_SSL",
                             lambda *a, **k: conn)
-        monkeypatch.setattr(ir, "_set_active", lambda c: None)
+        monkeypatch.setattr(ir, "_set_active", lambda c, tag="": None)
         monkeypatch.setattr(ir, "_clear_active", lambda c: None)
         monkeypatch.setattr(ir, "_force_close_conn", lambda c: None)
         assert ir.mark_uids_seen(["7"], expect_uidvalidity="9") is False
@@ -183,7 +183,7 @@ class TestMarkSeenVerifiesTheGeneration:
                                      "username": "u", "password": "p"})
         monkeypatch.setattr(ir.imaplib, "IMAP4_SSL",
                             lambda *a, **k: conn)
-        monkeypatch.setattr(ir, "_set_active", lambda c: None)
+        monkeypatch.setattr(ir, "_set_active", lambda c, tag="": None)
         monkeypatch.setattr(ir, "_clear_active", lambda c: None)
         monkeypatch.setattr(ir, "_force_close_conn", lambda c: None)
         assert ir.mark_uids_seen(["7"], expect_uidvalidity="9") is True
@@ -387,7 +387,7 @@ class TestMarkSeenVerifiesTheAccount:
                             lambda: {"host": "h", "port": 993,
                                      "username": "a@x.tw", "password": "p"})
         monkeypatch.setattr(ir.imaplib, "IMAP4_SSL", lambda *a, **k: conn)
-        monkeypatch.setattr(ir, "_set_active", lambda c: None)
+        monkeypatch.setattr(ir, "_set_active", lambda c, tag="": None)
         monkeypatch.setattr(ir, "_clear_active", lambda c: None)
         monkeypatch.setattr(ir, "_force_close_conn", lambda c: None)
         ident_a = ir._identity_from_settings({"username": "a@x.tw"})

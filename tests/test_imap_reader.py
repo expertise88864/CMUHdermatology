@@ -60,7 +60,7 @@ def test_force_close_active_clear_discards_dead_conn():
     # clear=True：關閉後從 set 移除
     assert imap_reader.force_close_active(clear=True) is True
     assert conn not in imap_reader._active_conns
-    assert imap_reader._active_conns == set()
+    assert imap_reader._active_conns == {}   # [P2-05 之後是 dict]
 
     # 無 active 連線時回 False
     assert imap_reader.force_close_active(clear=True) is False

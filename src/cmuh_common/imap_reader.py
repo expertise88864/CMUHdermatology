@@ -45,35 +45,44 @@ _MAX_SCAN_IDS = 50
 # 用途：如果 check_trigger 在 socket 上卡住 > N 秒，呼叫端可從另一個 thread
 # 呼叫 force_close_active() 強制砍 socket，讓卡住的 thread 立刻 unblock。
 _active_conn_lock = threading.Lock()
-_active_conns: set[imaplib.IMAP4_SSL] = set()
+#: conn → 用途標籤("trigger"/"commands"/"ack"/"sent")。
+#: ★[外審 2026-08-12 P2-05] 不再是單連線集合★:回查的 Sent 查詢可能與
+#: 掃描重疊 —— 全域斬殺會把健康的那一條一起砍掉。
+_active_conns: dict = {}
 
 
-def _set_active(conn: Optional[imaplib.IMAP4_SSL]) -> None:
+def _set_active(conn: Optional[imaplib.IMAP4_SSL], tag: str = "") -> None:
     if conn is None:
         return
     with _active_conn_lock:
-        _active_conns.add(conn)
+        _active_conns[conn] = str(tag or "")
 
 
 def _clear_active(conn: Optional[imaplib.IMAP4_SSL]) -> None:
     if conn is None:
         return
     with _active_conn_lock:
-        _active_conns.discard(conn)
+        _active_conns.pop(conn, None)
 
 
-def force_close_active(clear: bool = False) -> bool:
-    """從另一個 thread 緊急砍掉目前活動的 IMAP socket，讓 hang 的 recv 立即拋例外。
-    回傳 True 表示有試著關（不保證 socket 確實已斷）；False 表示沒有 active 連線。
+def force_close_active(clear: bool = False, tag: "Optional[str]" = None) -> bool:
+    """從另一個 thread 緊急砍掉活動中的 IMAP socket，讓 hang 的 recv 立即拋例外。
+    回傳 True 表示有試著關（不保證 socket 確實已斷）；False 表示沒有目標連線。
 
-    [opt B2] clear=True：關閉後一併把這些 conn 從 _active_conns 移除。供「worker thread
-    被放生、永遠走不到 finally 的 _clear_active」的逾時路徑使用，避免已死連線物件永久留在
-    set 內(socket/fd 已由上面 _force_close_conn 釋放，但 Python 物件仍被 set 強引用無法 GC)。
-    預設 False 維持原語意(force_close 不負責 discard)。
-    注意：目前為單連線設計(consult_query single-flight)，clear=True 等同清掉當下唯一那條；
-    若未來改成多連線並發，必須改成只清「逾時的那一條」而非全部，否則會誤清仍在用的健康連線。"""
+    ★[外審 2026-08-12 P2-05] `tag` 只砍那一種用途的連線★
+    以前是「單連線設計」的全域斬殺;現在回查的 Sent 查詢("sent")可能與
+    指令掃描("commands")/觸發掃描("trigger")在不同執行緒上重疊 ——
+    指令掃描逾時卻把健康的 Sent 查詢一起砍掉,收斂就白跑一輪。
+    呼叫端一律帶自己那個 worker 的 tag;`tag=None` 保留全砍
+    (self-watchdog 的「整個排程器卡死」情境本來就該全砍)。
+
+    [opt B2] clear=True:關閉後一併移出 registry。供「worker thread 被放生、
+    永遠走不到 finally 的 _clear_active」的逾時路徑使用,避免已死連線物件
+    被 registry 強引用無法 GC。
+    """
     with _active_conn_lock:
-        conns = list(_active_conns)
+        conns = [c for c, t in _active_conns.items()
+                 if tag is None or t == tag]
     if not conns:
         return False
     for conn in conns:
@@ -81,7 +90,7 @@ def force_close_active(clear: bool = False) -> bool:
     if clear:
         with _active_conn_lock:
             for conn in conns:
-                _active_conns.discard(conn)
+                _active_conns.pop(conn, None)
     return True
 
 
@@ -411,7 +420,7 @@ def mark_uids_seen(uids, expect_uidvalidity: str = "",
         context = ssl.create_default_context()
         conn = imaplib.IMAP4_SSL(s["host"], s["port"], ssl_context=context,
                                  timeout=12.0)
-        _set_active(conn)
+        _set_active(conn, "ack")
         conn.login(s["username"], s["password"])
         conn.select("INBOX")
         # ★世代要對得上★(外審 2026-08-12 P1-06):這是一條【新的】連線,
@@ -487,7 +496,7 @@ def find_message_in_sent(message_id: str, timeout: float = 12.0):
         context = ssl.create_default_context()
         conn = imaplib.IMAP4_SSL(s["host"], s["port"], ssl_context=context,
                                  timeout=timeout)
-        _set_active(conn)
+        _set_active(conn, "sent")
         conn.login(s["username"], s["password"])
         selected = ""
         for box in _SENT_MAILBOXES:
@@ -592,7 +601,7 @@ def check_commands(prefixes, timeout: float = 12.0,
         context = ssl.create_default_context()
         conn = imaplib.IMAP4_SSL(s["host"], s["port"], ssl_context=context,
                                   timeout=timeout)
-        _set_active(conn)
+        _set_active(conn, "commands")
         conn.login(s["username"], s["password"])
         conn.select("INBOX")
         out["mailbox_identity"] = _identity_from_settings(s)
@@ -732,7 +741,7 @@ def check_trigger(keyword: str, mark_read: bool = True,
         context = ssl.create_default_context()
         conn = imaplib.IMAP4_SSL(s["host"], s["port"], ssl_context=context,
                                   timeout=timeout)
-        _set_active(conn)
+        _set_active(conn, "trigger")
         conn.login(s["username"], s["password"])
         conn.select("INBOX")
         result["uidvalidity"] = read_uidvalidity(conn)

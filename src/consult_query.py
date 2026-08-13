@@ -4362,6 +4362,48 @@ def _return_to_main(sess, consult_hwnd) -> None:
     _session_close_if_current(sess, "會診視窗關不掉(退場失敗) → 下一輪冷啟動")
 
 
+def _sole_stable_window(poll, *, deadline_sec: float, what: str,
+                        confirm_rounds: int = 3,
+                        sleep_sec: float = 0.3) -> int:
+    """輪詢到【恰好一個、且連續 confirm_rounds 次都是同一個】的視窗 → hwnd。
+
+    ★[外審 AD-5 第 1 輪 P1] 第一眼的單一候選不算數★
+    視窗列舉是一個時間點的快照:HIS 重複處理命令時 A 先出現、B 在下一個
+    UI dispatch 才出現 —— 第一次看到 [A] 就 break 的話,`>1` 的分支永遠
+    走不到,照樣擷取到錯的一張。所以:
+      * 同一個候選要連續 confirm_rounds 次(約一秒)都是【唯一】的
+        才採認 —— 最後一次列舉就是「擷取前的再確認」;
+      * 期間任何時刻 ≥2 個 → raise(fail-closed,本輪重試);
+      * 候選換人 → 重新計數;消失 → 歸零。
+    `poll()` 由呼叫端提供(含它自己的過濾與中止檢查,中止用 raise 傳出)。
+    證據只記 hwnd 數量與代號,不記病人文字。
+    """
+    cand, streak = 0, 0
+    deadline = time.time() + deadline_sec
+    while time.time() < deadline:
+        hits = list(poll() or [])
+        if len(hits) > 1:
+            # ★[外審 2026-08-12 P1-07] 兩個以上合格候選 → fail-closed★
+            #   沒有任何理由證明 hits[0] 是對的那一張(HIS 重複處理命令、
+            #   上一輪 form 的轉場延遲、Delphi 同時建兩個同 class form…)。
+            #   ★擷取錯的一張會診單會被寄出去★ —— 寧可本輪失敗重試,不猜。
+            logging.error("★同時出現 %d 個合格的%s → 本輪不擷取★(hwnd=%s)",
+                          len(hits), what, [hex(h) for h in hits])
+            raise RuntimeError(f"同時出現多個{what},無法辨別哪一張是"
+                               "這次命令開出來的(本輪重試)")
+        if len(hits) == 1:
+            if hits[0] == cand:
+                streak += 1
+                if streak >= confirm_rounds:
+                    return hits[0]
+            else:
+                cand, streak = hits[0], 1
+        else:
+            cand, streak = 0, 0
+        time.sleep(sleep_sec)
+    raise RuntimeError(f"等不到{what}")
+
+
 def _query_cycle(sess, cfg: dict, roster_label: str) -> tuple:
     """在既有 session 上跑一輪:選單→會診單→截圖/擷取→退回主畫面。
     回傳 (截圖路徑, 擷取文字, 擷取HTML, roster_texts);失敗拋例外
@@ -4431,9 +4473,7 @@ def _query_cycle(sess, cfg: dict, roster_label: str) -> tuple:
                         " → 本輪只採認新出現的那一個", len(before_consults))
     win32gui.PostMessage(main_hwnd, win32con.WM_COMMAND, cmd_id, 0)
     logging.info("已送出選單命令（id=%s）", cmd_id)
-    consult = None
-    deadline = time.time() + 60
-    while time.time() < deadline:
+    def _poll_new_visible_consults():
         if not running.is_set():
             raise RuntimeError("流程已被中止")
         # ★採認條件(外審第 7 輪 P1-05)★ 兩種都要求【現在明確可見】:
@@ -4441,16 +4481,13 @@ def _query_cycle(sess, cfg: dict, roster_label: str) -> tuple:
         #     Show」,在它 Show 之前就開始擷取,會拿到一張還沒填好的表單。
         #   * 命令前【明確隱藏】、現在轉為可見的同一個視窗(form 重用)。
         #   命令前已可見、或可見性未知的,一律不採認。
-        hits = [h for h in find_windows(CONSULT_CLASS, pids={owner_pid},
+        return [h for h in find_windows(CONSULT_CLASS, pids={owner_pid},
                                         visible_only=False)
                 if _visible(h) is True
                 and (h not in before_consults or before_consults[h] is False)]
-        if hits:
-            consult = hits[0]
-            break
-        time.sleep(0.3)
-    if not consult:
-        raise RuntimeError("等不到會診單視窗")
+
+    consult = _sole_stable_window(_poll_new_visible_consults,
+                                  deadline_sec=60, what="會診單視窗")
     logging.info("會診單視窗已開啟，準備擷取")
     # ★[2026-08-04 外審 P1-08] 不在這裡落地★
     #   這裡以前無條件 `img.save()`,而且發生在解析 roster【之前】——跟有沒有新
@@ -5209,18 +5246,16 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
         logging.info("已送出選單命令（我的會診清單，id=%s）", cmd_id)
 
         # 等「會診通知單回覆」視窗（隱形執行緒會把它 SW_HIDE，用 visible_only=False）
-        consult = None
-        deadline = time.time() + 60
-        while time.time() < deadline:
+        def _poll_consults():
             if not running.is_set():
                 raise RuntimeError("流程已被中止")
-            hits = find_windows(CONSULT_CLASS, pids=our_pids, visible_only=False)
-            if hits:
-                consult = hits[0]
-                break
-            time.sleep(0.3)
-        if not consult:
-            raise RuntimeError("等不到會診通知單視窗")
+            return find_windows(CONSULT_CLASS, pids=our_pids,
+                                visible_only=False)
+
+        # ★同一條「恰好一個+穩定確認」規則★(這是我們自己剛開的 systemftp,
+        #   正常只會有一張會診單;兩邊各寫一套判準就會有一邊靜默失效)
+        consult = _sole_stable_window(_poll_consults, deadline_sec=60,
+                                      what="會診通知單視窗")
         # 主執行緒接手：別讓隱形執行緒藏它，解除最大化移到螢幕外顯示後 PrintWindow
         stealth_skip.add(consult)
         if borrowed:  # [CQ-06] 借用視窗 → 存原始狀態供 finally 還原
@@ -7943,12 +7978,12 @@ def _run_imap_commands_with_timeout(timeout: float = 30.0) -> dict:
     t.join(timeout=timeout)
     if t.is_alive():
         logging.warning("[遠端] 指令掃描超過 %.0fs 無回應,強制砍 socket", timeout)
-        force_close_active()
+        force_close_active(tag="commands")
         t.join(timeout=2.0)
         if t.is_alive():
             logging.warning("[遠端] 指令掃描緒仍未結束,已放棄;保留引用,"
                             "下一輪不疊加新 thread")
-            force_close_active(clear=True)
+            force_close_active(clear=True, tag="commands")
         return {"items": [], "error": f"command scan timeout > {timeout:.0f}s"}
     _last_imap_cmd_thread = None
     return box.get("r") or {"items": [], "error": "command result missing"}
@@ -8006,10 +8041,10 @@ def _ack_command_mail(uids, why: str, timeout: float = 30.0,
     t.join(timeout=timeout)
     if t.is_alive():
         logging.warning("[遠端] 標已讀超過 %.0fs 無回應,強制砍 socket", timeout)
-        force_close_active()
+        force_close_active(tag="ack")
         t.join(timeout=2.0)
         if t.is_alive():
-            force_close_active(clear=True)
+            force_close_active(clear=True, tag="ack")
         return False
     _last_imap_ack_thread = None
     ok = bool(box.get("ok"))
@@ -8213,16 +8248,17 @@ def _run_imap_check_with_timeout(kw: str, timeout: float = 60.0,
     if t.is_alive():
         logging.warning(
             "[watchdog] IMAP check 超過 %.0fs 無回應，強制砍 socket", timeout)
-        force_close_active()
+        force_close_active(tag="trigger")
         # 再給 2 秒讓 daemon thread 收尾（finally 會跑）
         t.join(timeout=2.0)
         if t.is_alive():
             logging.warning(
                 "[watchdog] daemon thread 仍未結束，已放棄；保留引用，下一輪不疊加新 thread")
             # [opt B2] worker 被放生、永遠走不到 finally 的 _clear_active → 主動把這條已關閉
-            # 的連線從 _active_conns 移除，避免死連線物件被 set 永久強引用無法 GC。
-            # single-flight 保證此刻 set 內只有這條(不會誤清新連線)。
-            force_close_active(clear=True)
+            # 的連線移出 registry,避免死連線物件被永久強引用無法 GC。
+            # ★tag 只清自己這種用途的★(外審 2026-08-12 P2-05):
+            # 回查的 Sent 查詢可能同時在跑,不可以誤砍健康的那一條。
+            force_close_active(clear=True, tag="trigger")
         # 維持 _last_imap_thread = t（仍 alive），下一輪會看到並跳過直到它自己結束
         return _empty_imap_result(
             f"IMAP check timeout > {timeout:.0f}s (socket 已強制關閉)")

@@ -522,8 +522,8 @@ class TestTheScanIsBounded:
         #   當下所有活動連線」這句話 —— 用字面掃的話，把那一行程式碼刪掉
         #   測試照樣綠（突變驗證當場量到，今天第八次踩這個坑）。
         code = _fn_body_code(SRC, "_run_imap_commands_with_timeout")
-        assert "force_close_active()" in code
-        assert "force_close_active(clear=True)" in code
+        assert "force_close_active(tag=" in code
+        assert "force_close_active(clear=True, tag=" in code
         assert "_last_imap_cmd_thread" in code
         # 觸發檢查那條不可以再碰指令掃描(否則兩者又綁在一起)
         worker = _fn_body_code(SRC, "_run_imap_check_with_timeout")
@@ -796,8 +796,8 @@ class TestAcknowledgementIsBatchedAndBounded:
 
     def test_the_ack_itself_is_bounded_and_force_closes(self):
         code = _fn_body_code(SRC, "_ack_command_mail")
-        assert "force_close_active()" in code
-        assert "force_close_active(clear=True)" in code
+        assert "force_close_active(tag=" in code
+        assert "force_close_active(clear=True, tag=" in code
         assert "_last_imap_ack_thread" in code
 
     def test_a_stranded_ack_does_not_pile_up(self, monkeypatch):
