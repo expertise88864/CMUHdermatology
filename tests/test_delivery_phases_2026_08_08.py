@@ -72,8 +72,20 @@ class _Server:
     def rset(self):
         pass
 
-    def data(self, payload):
-        self._maybe("data")
+    # ── DATA 的三段(外審 2026-08-12 P1-04 之後,生產自己拆) ────────────
+    #   docmd("data") 等 354 → send(內容) → getreply() 等最終回應。
+    #   fake 要跟生產的呼叫形狀一致,不然測到的是一條不存在的路。
+    def docmd(self, cmd, args=""):
+        assert cmd.lower() == "data", f"非預期的指令 {cmd!r}"
+        self._maybe("data_cmd")          # 等 354 的階段(內容還沒送)
+        return (354, b"go ahead")
+
+    def send(self, payload):
+        self._maybe("data_send")         # 內容傳輸階段
+        self.sent = getattr(self, "sent", b"") + payload
+
+    def getreply(self):
+        self._maybe("data_final")        # 等最終回應(內容已送完)
         return (250, b"queued")
 
 
@@ -107,13 +119,44 @@ class TestTheSubmittedMarkMeansWhatItSays:
             "★MAIL 階段的逾時被標成『已提交』★ 伺服器根本還沒收到內容,"
             "這則通知會被當成已寄而永久不再寄")
 
+    def test_a_timeout_waiting_for_354_is_not_marked_submitted(
+            self, monkeypatch):
+        """★[外審 2026-08-12 P1-04 的核心]★ DATA 指令送出、等 354 時逾時:
+        內容【一個 byte 都還沒送】,可以安全重試。舊版把整個 data() 當黑箱,
+        socket.timeout 不是 SMTPDataError → 被蓋上「已提交」→ 一封確定
+        可重試的信被冤成 UNKNOWN(不重試、等回查)。"""
+        srv = _Server(fail_at="data_cmd", exc=socket.timeout("timed out"))
+        with pytest.raises(BaseException) as ei:
+            _run_send_once(monkeypatch, srv)
+        assert not getattr(ei.value, sm.SUBMITTED_ATTR, False), (
+            "★等 354 的逾時被標成『已提交』★ 內容根本還沒開始送")
+
     def test_a_failure_during_data_is_marked_submitted(self, monkeypatch):
-        """反方向:真的走到 DATA 才算結果不明(不可以連這個也一起放掉)。"""
-        srv = _Server(fail_at="data", exc=socket.timeout("timed out"))
+        """反方向:內容【開始送出】之後才算結果不明(不可以連這個也放掉)。"""
+        srv = _Server(fail_at="data_send", exc=socket.timeout("timed out"))
         with pytest.raises(BaseException) as ei:
             _run_send_once(monkeypatch, srv)
         assert getattr(ei.value, sm.SUBMITTED_ATTR, False), (
-            "DATA 之後的中斷沒有被標成『已提交』→ 會被重送,收件人收到兩封")
+            "內容送出中的中斷沒有被標成『已提交』→ 會被重送,收件人收到兩封")
+
+    def test_a_timeout_on_the_final_reply_is_marked_submitted(
+            self, monkeypatch):
+        """內容送完、等最終 250 時逾時 —— 伺服器很可能已收下,結果不明。"""
+        srv = _Server(fail_at="data_final", exc=socket.timeout("timed out"))
+        with pytest.raises(BaseException) as ei:
+            _run_send_once(monkeypatch, srv)
+        assert getattr(ei.value, sm.SUBMITTED_ATTR, False)
+
+    def test_the_payload_is_dot_stuffed_and_terminated(self, monkeypatch):
+        """自己送內容就要自己做 dot-stuffing:行首的 "." 不疊成 ".."
+        的話,內文一行單獨的 "." 會提早結束 DATA(截斷+協定錯亂)。"""
+        assert sm._dot_stuff(b"a\r\n.b\r\n") == b"a\r\n..b\r\n.\r\n"
+        assert sm._dot_stuff(b".x") == b"..x\r\n.\r\n", "開頭第一行也要疊"
+        assert sm._dot_stuff(b"a") == b"a\r\n.\r\n", "沒有 CRLF 結尾要補"
+        srv = _Server()
+        _run_send_once(monkeypatch, srv)
+        assert srv.sent.endswith(b"\r\n.\r\n"), (
+            "★沒有送出結尾的 .<CRLF>★ 伺服器會永遠等下去")
 
     def test_partial_refusals_survive_the_low_level_flow(self, monkeypatch):
         """逐位 RCPT 的拒收資訊要保留下來(補寄要靠它)。"""
@@ -466,40 +509,49 @@ class TestTheThreeOutcomesOfDATA:
     """
 
     class _Srv(_Server):
-        def __init__(self, data_result=(250, b"queued"), data_exc=None):
+        """[外審 2026-08-12 P1-04 之後] 生產自己拆 DATA:fake 也照那個形狀。"""
+
+        def __init__(self, data_reply=(354, b"go ahead"),
+                     final=(250, b"queued"), send_exc=None):
             super().__init__()
-            self._res, self._exc = data_result, data_exc
+            self._data_reply, self._final = data_reply, final
+            self._send_exc = send_exc
             self.reset_called = False
 
         def rset(self):
             self.reset_called = True
 
-        def data(self, payload):
-            if self._exc:
-                raise self._exc
-            return self._res
+        def docmd(self, cmd, args=""):
+            return self._data_reply
+
+        def send(self, payload):
+            if self._send_exc:
+                raise self._send_exc
+
+        def getreply(self):
+            return self._final
 
     def test_a_final_rejection_is_not_reported_as_success(self, monkeypatch):
         """★核心(②)★ 伺服器明確拒絕(554),我們卻回報成功、還把已通知基準
         往前推 —— 那批會診從此不會再寄給任何人。"""
-        srv = self._Srv(data_result=(554, b"rejected"))
+        srv = self._Srv(final=(554, b"rejected"))
         with pytest.raises(sm.smtplib.SMTPDataError):
             _run_send_once(monkeypatch, srv)
         assert srv.reset_called, "被拒之後要 rset,不可以讓連線留在半途"
 
     def test_a_final_rejection_is_definite_not_unknown(self, monkeypatch):
         """明確被拒 = 確定沒送出,不是「可能送到一半」。"""
-        srv = self._Srv(data_result=(451, b"try later"))
+        srv = self._Srv(final=(451, b"try later"))
         with pytest.raises(BaseException) as ei:
             _run_send_once(monkeypatch, srv)
         assert not getattr(ei.value, sm.SUBMITTED_ATTR, False), (
             "★明確的拒絕被標成『結果不明』★ 它會變成不重試、而且被當成已寄")
 
     def test_a_pre_content_4xx_stays_retryable(self, monkeypatch):
-        """★核心(①)★ 對 DATA 指令回 451 → smtplib 在【送出內容之前】就
+        """★核心(①)★ 對 DATA 指令回 451 → 內容【還沒送出】就要
         SMTPDataError。止掛提醒若把它當成 UNKNOWN,會永久去重一封確定
-        沒寄出的信 —— 正是上一回要修的那個病灶,換個位置又做了一次。"""
-        srv = self._Srv(data_exc=sm.smtplib.SMTPDataError(451, b"busy"))
+        沒寄出的信 —— 正是上上一回要修的那個病灶,換個位置又做了一次。"""
+        srv = self._Srv(data_reply=(451, b"busy"))
         with pytest.raises(sm.smtplib.SMTPDataError) as ei:
             _run_send_once(monkeypatch, srv)
         assert not getattr(ei.value, sm.SUBMITTED_ATTR, False), (
@@ -507,7 +559,7 @@ class TestTheThreeOutcomesOfDATA:
 
     def test_a_transport_loss_is_still_unknown(self, monkeypatch):
         """③ 不可以連真正的結果不明也一起放掉(那會變成重複寄送)。"""
-        srv = self._Srv(data_exc=sm.smtplib.SMTPServerDisconnected("gone"))
+        srv = self._Srv(send_exc=sm.smtplib.SMTPServerDisconnected("gone"))
         with pytest.raises(BaseException) as ei:
             _run_send_once(monkeypatch, srv)
         assert getattr(ei.value, sm.SUBMITTED_ATTR, False)

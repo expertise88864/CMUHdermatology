@@ -8731,7 +8731,8 @@ class SendResult:
 def _send_alert_email_via_smtp(subject: str, body: str,
                                 recipients: list, timeout: float = 60.0,
                                 category: "str | None" = None,
-                                business_key: str = "") -> "SendResult":
+                                business_key: str = "",
+                                durable_body: bool = False) -> "SendResult":
     """達到門檻時透過 SMTP (Gmail) 寄信。回傳是否成功（失敗只 log，不影響主程式）。
 
     為何用 SMTP 不用 Outlook：admin 行程的 Outlook COM 會起一個 admin Outlook
@@ -8773,7 +8774,13 @@ def _send_alert_email_via_smtp(subject: str, body: str,
             _did = _led.begin(business_key=business_key or f"alert:{subject}",
                               category=category or "clinical",
                               recipients=list(recipients), subject=subject,
-                              message_id=_msgid)
+                              message_id=_msgid,
+                              # ★落地與否由呼叫端【明確】決定★(外審 AD-3 第 1
+                              #   輪 P1-3):這是共用 helper,別的呼叫端(讀回
+                              #   稽核不符等)的內文含病歷號 —— 預設不落地,
+                              #   只有止掛那兩條臨床路徑 opt-in(它們的補寄
+                              #   價值明確,且帳本另有獨立的 body 保留期)。
+                              body_text=(body or "") if durable_body else "")
         except Exception:
             logging.debug("[delivery] 登記止掛寄送失敗(略過)", exc_info=True)
             _did = ""
@@ -15080,7 +15087,8 @@ class AutomationApp:
                                                                             if rcpts:
                                                                                 _res = _send_alert_email_via_smtp(
                                                                                     subj, m, rcpts,
-                                                                                    business_key=f"alert:{nk}")
+                                                                                    business_key=f"alert:{nk}",
+                                                                                    durable_body=True)
                                                                                 # ★[#71] 「結果不明」不可以寫【永久】記號★
                                                                                 #   回查會把它收斂成「其實沒寄到」,而永久記號會贏
                                                                                 #   → 那一則永遠不會再寄。改記暫時性抑制。
@@ -15838,7 +15846,8 @@ class AutomationApp:
             try:
                 _res = _send_alert_email_via_smtp(
                     subject, msg, list(recipients),
-                    business_key=f"alert:{nk}")
+                    business_key=f"alert:{nk}",
+                    durable_body=True)
                 # ★[#71] 見行事曆那條路徑的說明:UNKNOWN → 暫時性抑制★
                 #   用 getattr:呼叫端被 stub 成回布林時要退回舊行為,
                 #   而不是拋 AttributeError 被外層 except 吞掉(那會靜默

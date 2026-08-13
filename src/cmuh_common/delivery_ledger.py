@@ -64,7 +64,16 @@ from cmuh_common.paths import get_settings_dir
 
 LEDGER_FILENAME = "delivery_ledger.json"        # 舊格式(只讀,匯入用)
 DB_FILENAME = "delivery_ledger.sqlite3"
-_SCHEMA_VERSION = 1
+# v2(2026-08-13 批次AD-3):新增 body_text —— UNKNOWN 查無後要拿什麼補寄。
+# ★使用者定案:只落地文字★ 附件是 PHI 截圖,依既有隱私定案不落地。
+_SCHEMA_VERSION = 2
+_BODY_TEXT_MAX = 100_000        # 信的文字內容上限(夠放最長的會診清單)
+# ★body 有自己的保留期,與紀錄本身(45 天)分開★(外審 AD-3 第 1 輪 P1-3)
+#   內文可能含臨床資訊 —— 只在「還可能需要補寄」的窗口裡保留:
+#   終局狀態一到就清;沒到終局的(卡死的 UNKNOWN)最多留 3 天
+#   (補寄的臨床價值早就衰減完了)。清除不依賴「之後還有信要寄」:
+#   啟動時也掃(見 _connect_locked)。
+BODY_RETAIN_SEC = 3 * 86400.0
 
 # ── 整筆寄送的狀態 ──────────────────────────────────────────────────────────
 PREPARED = "prepared"        # 舊格式遺留（新版 begin 直接落地成 SUBMITTING）
@@ -201,7 +210,7 @@ def _clean_recipients(value) -> dict:
 
 _COLUMNS = ("delivery_id", "business_key", "parent_id", "category", "subject",
             "message_id", "attachment_hash", "state", "recipients",
-            "created_at", "updated_at", "attempts", "note")
+            "created_at", "updated_at", "attempts", "note", "body_text")
 
 
 class DeliveryLedger:
@@ -267,16 +276,28 @@ class DeliveryLedger:
                 " created_at REAL NOT NULL,"
                 " updated_at REAL NOT NULL,"
                 " attempts INTEGER NOT NULL DEFAULT 0,"
-                " note TEXT NOT NULL DEFAULT '')")
+                " note TEXT NOT NULL DEFAULT '',"
+                " body_text TEXT NOT NULL DEFAULT '')")
+            # ── v1 → v2:補 body_text 欄(批次AD-3 durable outbox)──
+            #   CREATE IF NOT EXISTS 對【既有的】v1 資料庫不會補欄位,
+            #   要自己 ALTER;新建的資料庫上面就有了。
+            cols = {r[1] for r in
+                    conn.execute("PRAGMA table_info(deliveries)").fetchall()}
+            if "body_text" not in cols:
+                conn.execute("ALTER TABLE deliveries ADD COLUMN"
+                             " body_text TEXT NOT NULL DEFAULT ''")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_bk"
                          " ON deliveries(business_key)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_state"
                          " ON deliveries(state)")
             # ★schema version 是人維護的帳,不是推導出來的★(外審 2026-08-12)
+            #   升級是冪等的(上面的 ALTER 保證欄位在)→ 直接標到目前版本。
             conn.execute("CREATE TABLE IF NOT EXISTS meta ("
                          " key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES"
-                         " ('schema_version', ?)", (str(_SCHEMA_VERSION),))
+            conn.execute("INSERT INTO meta(key, value) VALUES"
+                         " ('schema_version', ?) ON CONFLICT(key)"
+                         " DO UPDATE SET value=excluded.value",
+                         (str(_SCHEMA_VERSION),))
         except Exception:
             try:
                 conn.close()
@@ -284,6 +305,12 @@ class DeliveryLedger:
                 pass
             raise
         self._conn = conn
+        try:
+            with self._txn(conn):
+                self._scrub_stale_bodies_locked(conn)
+        except Exception:
+            logging.warning("[delivery] 啟動時清逾期內文失敗(下次再試)",
+                            exc_info=True)
         try:
             self._import_legacy_locked(conn)
         except Exception:
@@ -339,6 +366,7 @@ class DeliveryLedger:
                 _as_epoch(rec.get("updated_at")),
                 _as_attempts(rec.get("attempts")),
                 str(rec.get("note") or "")[:300],
+                "",                     # 舊格式沒有 body_text(補寄自然沒得補)
             ))
         if not rows:
             return
@@ -447,7 +475,8 @@ class DeliveryLedger:
     # ── 生命週期 ───────────────────────────────────────────────────────────
     def begin(self, *, business_key: str, category: str, recipients: list,
               subject: str = "", message_id: str = "",
-              attachment_hash: str = "", parent_id: str = "") -> str:
+              attachment_hash: str = "", parent_id: str = "",
+              body_text: str = "") -> str:
         """登記一次即將寄出的信。回傳 delivery_id。
 
         ★必須在真正送出【之前】呼叫★ —— 這樣即使送出當下斷電，重啟後看到的是
@@ -463,18 +492,19 @@ class DeliveryLedger:
         """
         did = new_delivery_id()
         rec = self._new_rec(did, business_key, category, recipients, subject,
-                            message_id, attachment_hash, parent_id)
+                            message_id, attachment_hash, parent_id, body_text)
         with self._lock:
             conn = self._ensure_conn_locked()
             with self._txn(conn):
                 self._insert_locked(conn, rec)
                 self._prune_locked(conn)
+                self._scrub_stale_bodies_locked(conn)
         return did
 
     def begin_if_no_live(self, *, business_key: str, category: str,
                          recipients: list, subject: str = "",
                          message_id: str = "", attachment_hash: str = "",
-                         parent_id: str = "") -> str:
+                         parent_id: str = "", body_text: str = "") -> str:
         """★原子版的「沒有 live 才登記」★(外審 2026-08-12 P1-08)。
 
         `has_live_delivery()` + `begin()` 是兩個操作 —— 接成閘門就是 TOCTOU:
@@ -486,7 +516,7 @@ class DeliveryLedger:
         """
         did = new_delivery_id()
         rec = self._new_rec(did, business_key, category, recipients, subject,
-                            message_id, attachment_hash, parent_id)
+                            message_id, attachment_hash, parent_id, body_text)
         with self._lock:
             conn = self._ensure_conn_locked()
             with self._txn(conn):
@@ -502,7 +532,8 @@ class DeliveryLedger:
 
     @staticmethod
     def _new_rec(did, business_key, category, recipients, subject,
-                 message_id, attachment_hash, parent_id) -> dict:
+                 message_id, attachment_hash, parent_id,
+                 body_text: str = "") -> dict:
         return {
             "delivery_id": did,
             "business_key": str(business_key),
@@ -523,6 +554,10 @@ class DeliveryLedger:
             "updated_at": _now(),
             "attempts": 0,
             "note": "",
+            # ★只落地文字★(批次AD-3,使用者定案 2026-08-13):附件是 PHI
+            #   截圖,不落地 —— Sent 查無後的自動補寄只有文字,並註明
+            #   請至 HIS 查看。
+            "body_text": str(body_text or "")[:_BODY_TEXT_MAX],
         }
 
     def _insert_locked(self, conn, rec: dict) -> None:
@@ -557,12 +592,18 @@ class DeliveryLedger:
                 states = dict(rec.get("recipients") or {})
                 out = fn(states)
                 new_state = summarize(states)
+                # ★到了終局狀態就把 body 清掉★(外審 AD-3 第 1 輪 P1-3)
+                #   body 只為「補寄」而存在;收斂之後留著只是多一份
+                #   臨床資訊的暴露面。
+                keep_body = (rec.get("body_text") or ""
+                             if new_state in (SUBMITTING, UNKNOWN, PREPARED)
+                             else "")
                 conn.execute(
                     "UPDATE deliveries SET recipients=?, state=?, note=?,"
-                    " updated_at=? WHERE delivery_id=?",
+                    " updated_at=?, body_text=? WHERE delivery_id=?",
                     (json.dumps(states, ensure_ascii=False), new_state,
                      (str(note)[:300] if note else rec.get("note") or ""),
-                     _now(), rec["delivery_id"]))
+                     _now(), keep_body, rec["delivery_id"]))
                 return new_state, out
 
     def settle(self, delivery_id: str, *, refused: "Optional[dict]" = None,
@@ -736,6 +777,58 @@ class DeliveryLedger:
                 "這一刻讀不到寄送帳本 → 無法判斷是否已經寄過;"
                 "呼叫端必須自己決定要擋還是要放(不可以把讀不到當成沒有)") from e
 
+    def claim_resend_child(self, parent_id: str, *, business_key: str,
+                           category: str, recipients: list,
+                           subject: str = "", message_id: str = "") -> str:
+        """★「查子紀錄 + 登記補寄」在同一筆交易裡★(外審 AD-3 第 1 輪 P1-2)
+
+        兩支程式的回查可能同時走到補寄:SELECT 與 INSERT 拆兩筆交易就是
+        TOCTOU —— 兩邊都查到「沒補過」,各寄一封重複的臨床通知。
+        BEGIN IMMEDIATE 讓「有沒有任何子紀錄」與「登記」原子化。
+        回傳新 delivery_id;已有子紀錄(含收件人補寄產生的)回 ""(不補,
+        方向安全)。★補寄紀錄自己不落地 body★:它永不再自動補寄,
+        留著只是多一份臨床資訊暴露面。落不了地就拋 LedgerUnavailable
+        (呼叫端不寄:沒有帳的補寄會破壞「最多一次」)。
+        """
+        pid = str(parent_id or "")
+        if not pid:
+            return ""
+        did = new_delivery_id()
+        rec = self._new_rec(did, business_key, category, recipients, subject,
+                            message_id, "", pid, "")
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            with self._txn(conn):
+                cur = conn.execute(
+                    "SELECT 1 FROM deliveries WHERE parent_id=? LIMIT 1",
+                    (pid,))
+                if cur.fetchone():
+                    return ""
+                self._insert_locked(conn, rec)
+        return did
+
+    def has_resend_child(self, delivery_id: str) -> bool:
+        """這筆原信有沒有(任何狀態的)補寄子紀錄。查不出來 → True。
+
+        ★方向:查不出來=「已經補過」★ 這個方法守的是「每筆原信最多自動
+        補寄一次」—— 答錯成 False 的代價是【重複寄臨床通知】,答錯成 True
+        的代價只是這一輪不補(告警 log 還在)。
+        """
+        did = str(delivery_id or "")
+        if not did:
+            return True
+        try:
+            with self._lock:
+                conn = self._ensure_conn_locked()
+                cur = conn.execute(
+                    "SELECT 1 FROM deliveries WHERE parent_id=? LIMIT 1",
+                    (did,))
+                return cur.fetchone() is not None
+        except (LedgerUnavailable, sqlite3.Error):
+            logging.warning("[delivery] 查不出 %s 有沒有補寄過 → 當成有"
+                            "(寧可不補,不可重複寄)", did)
+            return True
+
     def state_of(self, delivery_id: str) -> str:
         """某一筆的目前狀態。**查不到／讀不到一律回空字串**。
 
@@ -811,6 +904,35 @@ class DeliveryLedger:
         return sorted(out)
 
     # ── 維護 ───────────────────────────────────────────────────────────────
+    def scrub_stale_bodies(self) -> int:
+        """把超過保留期的 body 清掉(公開、自帶交易)。→ 清了幾筆。
+
+        ★[外審 AD-3 第 2 輪 P1] 要掛在【保證週期性】的路徑上★
+        啟動時+begin 交易裡的掃除,對「常駐好幾週、不再寄信」的行程
+        永遠不會跑 —— 內文就超過宣稱的 3 天保留期。回查
+        (`Reconciler.run_once`)在兩支程式都是排程驅動、與寄信量無關,
+        每一輪開頭呼叫這裡。
+        """
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            with self._txn(conn):
+                return self._scrub_stale_bodies_locked(conn)
+
+    def _scrub_stale_bodies_locked(self, conn) -> int:
+        """把超過保留期的 body 清掉(狀態不動)。★獨立於「之後還有沒有信」★
+
+        (在呼叫端的交易裡執行)終局清除靠 `_mutate_recipients_locked`;
+        這裡收的是卡死在 UNKNOWN/SUBMITTING 的 —— 它們永不被 prune,
+        body 卻不可以跟著永存。
+        """
+        cur = conn.execute(
+            "UPDATE deliveries SET body_text='' WHERE body_text!=''"
+            " AND created_at<?", (_now() - BODY_RETAIN_SEC,))
+        if cur.rowcount:
+            logging.info("[delivery] 清掉 %d 筆逾 %.0f 天的信件內文",
+                         cur.rowcount, BODY_RETAIN_SEC / 86400.0)
+        return cur.rowcount
+
     def _prune_locked(self, conn) -> None:
         """剪掉太舊的【已收斂】紀錄。UNKNOWN / SUBMITTING / PREPARED 一律保留
         —— 還沒查清楚的東西不可以因為過期就被當成沒發生過。(在呼叫端的

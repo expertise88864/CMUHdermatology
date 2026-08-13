@@ -92,8 +92,15 @@ def test_send_once_returns_refused_dict():
             # 452 = 信箱滿(暫時性)。smtplib 對「只有一部分被拒」是正常返回。
             return (452, b"mailbox full") if addr == "bad@x.com" else (250, b"ok")
 
-        def data(self, payload):
-            self.data_called = True
+        # [外審 2026-08-12 P1-04 之後] 生產自己拆 DATA 成三段呼叫
+        def docmd(self, cmd, args=""):
+            self.data_called = True          # 走到 DATA 了
+            return (354, b"go ahead")
+
+        def send(self, payload):
+            pass
+
+        def getreply(self):
             return (250, b"queued")
 
     class _CtxOf:

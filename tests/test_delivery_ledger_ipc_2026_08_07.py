@@ -143,7 +143,8 @@ class TestCrossProcessSafety:
         # (docstring 寫明),呼叫它們的方法必須自己有 _txn —— 由下面的檢查
         # 涵蓋。`_connect_locked` 是 idempotent 的 schema bootstrap
         # (CREATE TABLE / INSERT OR IGNORE 一筆常數),autocommit 即可。
-        in_callers_txn = {"_insert_locked", "_prune_locked", "_connect_locked"}
+        in_callers_txn = {"_insert_locked", "_prune_locked",
+                          "_scrub_stale_bodies_locked", "_connect_locked"}
         checked = 0
         for fn in ast.walk(tree):
             if not isinstance(fn, ast.FunctionDef):

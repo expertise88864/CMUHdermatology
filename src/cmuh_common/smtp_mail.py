@@ -30,6 +30,7 @@ App Password 取得（一次性）：
 from __future__ import annotations
 
 import logging
+import re
 import smtplib
 import socket
 import ssl
@@ -114,6 +115,19 @@ DEFAULT_CREDENTIALS = {
 # 沒有這個標記 = 還在連線/STARTTLS/登入階段,伺服器確定沒收到任何內容。
 # 逾時要不要重試完全取決於它(見 send_mail 的兩條 socket.timeout 分支)。
 SUBMITTED_ATTR = "_cmuh_submitted"
+
+
+def _dot_stuff(payload: bytes) -> bytes:
+    """RFC 5321 dot-stuffing + 結尾 ".<CRLF>"。純函式。
+
+    smtplib.data() 內部的等價物(它用的 `_quote_periods` 是模組私有,
+    不依賴):行首的 "." 要疊成 ".." —— 不疊的話,內文裡一行單獨的 "."
+    會【提早結束 DATA】,後面的內容變成 SMTP 指令(截斷+協定錯亂)。
+    """
+    q = re.sub(br"(?m)^\.", b"..", payload)
+    if q[-2:] != b"\r\n":
+        q += b"\r\n"
+    return q + b".\r\n"
 
 
 class DeliveryOutcomeUnknown(RuntimeError):
@@ -297,11 +311,13 @@ def _send_once(cred: dict, msg, timeout: float) -> dict:
         改用 smtplib 的低階流程,ambiguous 的邊界就明確落在 `data()` 上,
         而且逐位 RCPT 的拒收資訊也保留得下來(部分拒收補寄要靠它)。
 
-        ★仍然存在的一個保守面(誠實說明,不要當成已解決)★
+        ★[外審 2026-08-12 P1-04] DATA 也拆開,不再當黑箱★
         `server.data()` 內部是「送 DATA 指令 → 等 354 → 送內容 → 等 250」。
-        等 354 時逾時的話,伺服器其實還沒收到內容,但從這一層分不出來,
-        所以一律當成結果不明。往「可能重複」的反方向壓,是因為漏寄一則
-        臨床通知比重複寄一則嚴重。
+        等 354 時逾時,伺服器其實【一個 byte 的內容都還沒收到】,但它拋的是
+        socket.timeout(不是 SMTPDataError)—— 舊版把它蓋上「已提交」的章,
+        一封確定可以安全重試的信就被冤成 UNKNOWN(不重試、等回查)。
+        現在自己拆:354 之前的任何失敗=可重試;內容開始送出之後才是
+        「已提交」的範圍。
         """
         from email import utils as _eutils  # noqa: PLC0415
         from email.generator import BytesGenerator  # noqa: PLC0415
@@ -337,26 +353,28 @@ def _send_once(cred: dict, msg, timeout: float) -> dict:
                 pass
             raise smtplib.SMTPRecipientsRefused(refused)
 
-        # ── 階段二:DATA ──
-        # `smtplib.SMTP.data()` 有三種結局,而且【形狀不一樣】:
-        #   ① 對 DATA 指令的回應不是 354 → raise SMTPDataError,
-        #      內容【還沒送出去】。這是確定失敗,4xx 可以安全重試。
-        #   ② 送完內容之後的最終回應不是 250 → 它【回傳】那個 tuple,
-        #      不會 raise。★上一版把回傳值丟掉了★ —— 伺服器明確拒絕
-        #      (554 / 451),我們卻回報成功、還把已通知基準往前推。
-        #   ③ 傳輸中斷(逾時/斷線)→ 其他例外。這一種才是真的結果不明。
-        # ★上一版把 ① 也蓋上「已提交」的章★ —— 止掛提醒於是把一封
-        #   【確定沒寄出】的信當成已寄、永久去重。那正是這一輪 P1-03
-        #   要修掉的病灶,我在修它的時候換個位置又做了一次。
+        # ── 階段二:DATA,拆成三個網路階段(外審 2026-08-12 P1-04)──
+        #   ②a 送 "DATA" 指令、等 354 —— 這一段的任何失敗(含逾時),
+        #      內容【一個 byte 都還沒送】,與 MAIL/RCPT 同級,可安全重試。
+        #      ★舊版在這裡逾時會被蓋上「已提交」★:socket.timeout 不是
+        #      SMTPDataError,黑箱分不出它發生在 354 之前還是之後。
+        #   ②b 送內容、等最終回應 —— 從內容開始送出的那一刻起,
+        #      任何失敗都是真的結果不明(SUBMITTED_ATTR)。
+        #   ②c 最終回應不是 250 → 伺服器明確拒絕(確定失敗,不是 UNKNOWN)。
+        code, resp = server.docmd("data")
+        if code != 354:
+            # 與 smtplib.data() 的 ① 同形狀:內容還沒送出 → 可重試。
+            raise smtplib.SMTPDataError(code, resp)
         try:
-            code, resp = server.data(payload)
-        except smtplib.SMTPDataError:
-            raise                       # ① 內容還沒送出 → 不標記,可重試
+            server.send(_dot_stuff(payload))
+            code, resp = server.getreply()
         except BaseException as e:
-            setattr(e, SUBMITTED_ATTR, True)   # ③ 只有這一種是結果不明
+            setattr(e, SUBMITTED_ATTR, True)   # ②b 只有這一段是結果不明
             raise
         if code != 250:
-            # ② 明確被拒。與 smtplib.sendmail 一致:421 就關掉,其餘 rset。
+            # ②c 明確被拒。與 smtplib.sendmail 一致:421 就關掉,其餘 rset。
+            #   ★上上一版把這個回傳值丟掉★ —— 伺服器明確拒絕(554/451),
+            #   我們卻回報成功、還把已通知基準往前推。
             try:
                 if code == 421:
                     server.close()

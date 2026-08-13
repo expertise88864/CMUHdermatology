@@ -6015,7 +6015,10 @@ def _delivery_begin(delivery, trigger_label: str, parent_id: str = "") -> str:
             recipients=list(delivery.recipients),
             subject=delivery.subject,
             message_id=delivery.message_id or "",
-            parent_id=parent_id)
+            parent_id=parent_id,
+            # ★只落地文字★(批次AD-3,使用者定案):Sent 查無後自動補寄
+            #   要拿什麼重建 —— PHI 截圖依既有隱私定案不落地。
+            body_text=delivery.text_body or "")
     except Exception:
         logging.debug("[delivery] 登記寄送失敗(略過)", exc_info=True)
         return ""

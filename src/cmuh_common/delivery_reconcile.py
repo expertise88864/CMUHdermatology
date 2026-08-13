@@ -104,6 +104,14 @@ class Reconciler:
         if led is None:
             return 0
         now = float(now if now is not None else time.time())
+        # ★逾期內文的掃除掛在這裡★(外審 AD-3 第 2 輪 P1):回查在兩支程式
+        #   都是排程驅動、與寄信量無關 —— 常駐好幾週、不再寄信的行程,
+        #   靠啟動掃除與 begin 交易永遠掃不到,內文就超過宣稱的保留期。
+        try:
+            led.scrub_stale_bodies()
+        except Exception:
+            logging.debug("[%s] 清逾期內文失敗(下輪再試)", self._tag,
+                          exc_info=True)
         try:
             # ★卡住的 SUBMITTING 也要回查★
             #   `begin()` 已經把 SUBMITTING 落地;SMTP 送出之後、settle 之前
@@ -208,12 +216,117 @@ class Reconciler:
         if found:
             logging.info("[%s] %s 在寄件備份查到 → 收斂為 %s",
                          self._tag, did, state)
+            # ★補寄子紀錄查到=原信的那幾位其實收到了★(外審 AD-3 第 1 輪
+            #   P1-1 下半):補寄當下結果不明的,現在有答案了 —— 不回寫的話
+            #   原信仍掛著暫時被拒,照樣誤報漏收。
+            parent = str(rec.get("parent_id") or "")
+            if parent:
+                try:
+                    led.confirm_recipients(
+                        parent, list(rec.get("recipients") or {}))
+                except Exception:
+                    logging.warning("[%s] 回寫原信 %s 失敗(可能誤報漏收)",
+                                    self._tag, parent, exc_info=True)
         else:
-            # 確定沒寄出去。信的內容重建不了(不存病人明文),所以這裡不重寄,
-            # 交給既有的補寄/結案路徑去處理與告警。
             logging.error("[%s] ★%s 在寄件備份【查無】→ 這封信沒有寄出去★"
                           "(主旨:%s)", self._tag, did, rec.get("subject", ""))
+            # ★[外審 2026-08-12 P1-05] 知道沒寄到之後,拿落地的文字補寄★
+            #   (收斂已經成功落地才走到這裡 —— 補寄失敗也不會重複,
+            #    原信誠實地停在 FAILED + 上面那行告警。)
+            self._resend_from_body_text(led, rec)
         return 1
+
+    def _resend_from_body_text(self, led, rec) -> str:
+        """Sent 查無 → 用帳上落地的文字內容自動補寄一封。→ 新 delivery_id 或 ""。
+
+        ★只有文字,沒有附件★(使用者定案 2026-08-13):會診通知的附件是
+        PHI 截圖,依既有隱私定案【不落地】—— 信裡註明請至 HIS 查看。
+
+        有界性(不可能變成補寄迴圈):
+        * 補寄紀錄自己(有 parent_id)★永不★再被自動補寄;
+        * 原信已有子紀錄(任何狀態)就不再補 → 每筆原信最多一次,
+          跨重啟也算得出來(子紀錄在資料庫裡);
+        * `body_text` 空(舊版寫的紀錄)→ 沒得補,維持告警即止的舊行為。
+        """
+        did = str(rec.get("delivery_id") or "")
+        if str(rec.get("parent_id") or ""):
+            return ""                    # 補寄的補寄 → 不做(有界)
+        body = str(rec.get("body_text") or "")
+        if not body:
+            return ""                    # 舊紀錄沒有落地文字 → 沒得補
+        # 只補給【還沒確認送達】的人 —— 已送達的再寄一次就是重複的臨床通知
+        addrs = sorted(a for a, st in (rec.get("recipients") or {}).items()
+                       if st != "confirmed")
+        if not addrs:
+            return ""
+        from email.utils import make_msgid  # noqa: PLC0415
+        from cmuh_common.smtp_mail import (  # noqa: PLC0415
+            DeliveryOutcomeUnknown, send_mail,
+        )
+        subject = str(rec.get("subject") or "")
+        try:
+            new_msgid = make_msgid()
+        except Exception:
+            new_msgid = ""
+        note = ("\n\n——\n本封為【自動補寄】:原信經寄件備份查證未送達。\n"
+                "原信附件依隱私政策未保留 —— 如需會診單畫面,請逕至 HIS 查看。")
+        try:
+            # ★「查子紀錄+登記」是同一筆交易★(外審 AD-3 第 1 輪 P1-2):
+            #   兩支程式的回查同時走到這裡時,拆兩步就是 TOCTOU ——
+            #   兩邊都查到「沒補過」,各寄一封重複的臨床通知。
+            new_did = led.claim_resend_child(
+                did, business_key=str(rec.get("business_key") or ""),
+                category=str(rec.get("category") or ""),
+                recipients=list(addrs), subject=subject,
+                message_id=new_msgid)
+        except Exception:
+            # 登記不了就不寄:沒有帳的補寄,查無時會再補一次 → 破壞有界性。
+            logging.warning("[%s] 補寄 %s 登記失敗 → 本輪不補(下輪也不會重複,"
+                            "原信已收斂為 FAILED)", self._tag, did,
+                            exc_info=True)
+            return ""
+        if not new_did:
+            return ""                    # 已補過一次(可能是另一支程式補的)
+        try:
+            refused = send_mail(
+                recipients=list(addrs), subject=subject, body=body + note,
+                category=("system" if rec.get("category") == "system"
+                          else "clinical"),
+                message_id=new_msgid)
+        except DeliveryOutcomeUnknown:
+            self._settle_quietly(led, new_did, unknown=True)
+            logging.warning("[%s] 補寄 %s 結果不明 → 交給下一輪回查",
+                            self._tag, new_did)
+            return new_did
+        except Exception:
+            self._settle_quietly(led, new_did, failed=True)
+            logging.error("[%s] ★補寄 %s 也失敗★(原信 %s,主旨:%s)",
+                          self._tag, new_did, did, subject, exc_info=True)
+            return new_did
+        self._settle_quietly(led, new_did, refused=refused or {})
+        # ★把補寄成功的人回寫到【原信】★(外審 AD-3 第 1 輪 P1-1)
+        #   不回寫的話,原信的收件人停在暫時被拒 → 一小時後被
+        #   「始終沒收到」的結案路徑誤報漏收 → 人工照著轉寄 = 重複通知。
+        delivered = [a for a in addrs if a not in (refused or {})]
+        if delivered:
+            try:
+                led.confirm_recipients(did, delivered)
+            except Exception:
+                logging.warning("[%s] 補寄成功但回寫原信 %s 失敗"
+                                "(可能誤報漏收)", self._tag, did,
+                                exc_info=True)
+        logging.warning("[%s] ★已自動補寄★ %s(原信 %s 查無,主旨:%s,"
+                        "收件人 %d 位,只有文字、無附件)",
+                        self._tag, new_did, did, subject, len(addrs))
+        return new_did
+
+    def _settle_quietly(self, led, did, **kw) -> None:
+        """補寄的結果照常入帳;入不了帳也不可以打斷回查輪。"""
+        try:
+            led.settle(did, **kw)
+        except Exception:
+            logging.warning("[%s] 補寄 %s 的結果入帳失敗(停在 SUBMITTING,"
+                            "由回查收斂)", self._tag, did, exc_info=True)
 
     # ── 節流／宣告 ────────────────────────────────────────────────────────
     def _claim(self, led, now: float) -> bool:
