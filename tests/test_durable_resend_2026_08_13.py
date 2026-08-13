@@ -6,9 +6,10 @@
 請至 HIS 查看」。醫師仍會收到通知不漏接,隱私姿態不變。
 
 ★有界性是本批的安全核心★:補寄不可能變成迴圈 ——
-補寄紀錄(有 parent_id)永不再補;原信已有子紀錄就不再補(跨重啟
-也算得出來,子紀錄在資料庫裡);登記不了就不寄(沒有帳的補寄,
-查無時會再補一次,破壞有界性)。
+補寄紀錄(有 parent_id)永不再補(欠的在親紀錄上);同時最多一封
+in-flight、自動補寄最多 RESEND_MAX_AUTO 次(批次AE-1 改版,跨重啟
+也算得出來 —— 子紀錄與 kind 都在資料庫裡);登記不了就不寄。
+crash 恢復與欠補寄掃描的測試在 test_resend_recovery_2026_08_13.py。
 """
 import importlib
 import io
@@ -137,15 +138,17 @@ class TestTheResendIsBounded:
         assert dr.Reconciler(lambda: led)._resend_from_body_text(
             led, child) == ""
 
-    def test_an_original_is_resent_at_most_once(self, tmp_path, monkeypatch):
+    def test_a_successful_resend_closes_the_chain(self, tmp_path, monkeypatch):
+        """補寄送達 → 回寫讓原信全數送達 → 鏈關、body 清 → 不會再補。"""
         led, did = _aged_unknown(tmp_path)
         sent = _capture_send(monkeypatch)
-        rec = led.get(did)
         r = dr.Reconciler(lambda: led)
-        assert r._resend_from_body_text(led, rec) != ""
-        assert r._resend_from_body_text(led, rec) == "", (
-            "★同一筆原信補寄了兩次★ 子紀錄在資料庫裡,跨重啟也要算得出來")
+        led.resolve_unknown(did, delivered=False)   # 生產順序:先查無收斂
+        assert r._resend_from_body_text(led, led.get(did)) != ""
+        assert r._resend_from_body_text(led, led.get(did)) == "", (
+            "★鏈已關還在補★ 已送達的人會收到第二封臨床通知")
         assert len(sent) == 1
+        assert led.get(did)["body_text"] == "", "鏈關了 payload 就該清"
 
     def test_the_claim_is_one_transaction(self):
         """★查子紀錄+登記要在同一筆交易★(外審 AD-3 第 1 輪 P1-2)
@@ -155,7 +158,8 @@ class TestTheResendIsBounded:
         src = textwrap.dedent(
             inspect.getsource(dl.DeliveryLedger.claim_resend_child))
         i = src.index("_txn")
-        assert src.index("SELECT 1 FROM deliveries WHERE parent_id=?") > i, (
+        assert src.index(
+            "SELECT state, kind FROM deliveries WHERE parent_id=?") > i, (
             "查子紀錄在交易外 —— TOCTOU")
 
     def test_a_second_claim_for_the_same_parent_is_refused(self, tmp_path):
@@ -194,8 +198,9 @@ class TestResendOutcomesAreHonest:
         import cmuh_common.smtp_mail as sm
         led, did = _aged_unknown(tmp_path)
         _capture_send(monkeypatch, exc=sm.DeliveryOutcomeUnknown("逾時"))
-        rec = led.get(did)
-        new_did = dr.Reconciler(lambda: led)._resend_from_body_text(led, rec)
+        led.resolve_unknown(did, delivered=False)   # 生產順序:先查無收斂
+        new_did = dr.Reconciler(lambda: led)._resend_from_body_text(
+            led, led.get(did))
         assert new_did
         assert led.state_of(new_did) == dl.UNKNOWN, (
             "補寄結果不明就要誠實記 UNKNOWN,交給下一輪回查")
@@ -203,8 +208,9 @@ class TestResendOutcomesAreHonest:
     def test_a_failed_resend_is_recorded_failed(self, tmp_path, monkeypatch):
         led, did = _aged_unknown(tmp_path)
         _capture_send(monkeypatch, exc=RuntimeError("SMTP 掛了"))
-        rec = led.get(did)
-        new_did = dr.Reconciler(lambda: led)._resend_from_body_text(led, rec)
+        led.resolve_unknown(did, delivered=False)   # 生產順序:先查無收斂
+        new_did = dr.Reconciler(lambda: led)._resend_from_body_text(
+            led, led.get(did))
         assert new_did
         assert led.state_of(new_did) == dl.FAILED
 
@@ -301,10 +307,11 @@ class TestSchemaV2Migration:
                         recipients=["a@x.tw"], body_text="新格式的內容")
         assert led.get(did)["body_text"] == "新格式的內容"
         assert led.get("old1")["body_text"] == "", "舊列的預設要是空字串"
+        assert led.get("old1")["kind"] == "", "v3 的 kind 欄也要補上"
         with sqlite3.connect(db) as c:
             v = c.execute("SELECT value FROM meta WHERE"
                           " key='schema_version'").fetchone()[0]
-        assert v == "2", "schema_version 要跟著升(人維護的帳)"
+        assert v == str(dl._SCHEMA_VERSION), "schema_version 要跟著升(人維護的帳)"
 
 
 class TestTheCallersActuallyStoreTheBody:

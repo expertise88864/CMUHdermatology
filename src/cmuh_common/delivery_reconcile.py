@@ -41,6 +41,12 @@ MAX_PER_PASS = 5
 STUCK_SUBMITTING_AFTER_SEC = 900.0
 #: 沒有 Message-ID 的紀錄掛超過這麼久 → 放棄查證、明確結案 + 告警(見下)。
 NO_MESSAGE_ID_GIVE_UP_SEC = 86400.0
+#: 欠補寄的親紀錄要「沉」這麼久才由回查接手 —— 讓呼叫端的記憶體退避佇列
+#: (2/10/30 分)先跑完它的快路徑,兩邊不會對同一批收件人同時補寄。
+#: 重啟後佇列消失,這個門檻就是 durable 補寄的接手時間。
+RESEND_OWED_MIN_AGE_SEC = 3600.0
+#: 一輪最多驅動幾筆欠補寄(每筆都可能開一次 SMTP)。
+MAX_OWED_PER_PASS = 3
 
 
 def _created_at(rec) -> float:
@@ -91,9 +97,13 @@ class Reconciler:
     已經送達的信,摺成「有寄到」會把真正的漏寄吞掉。
     """
 
-    def __init__(self, ledger_getter, tag: str = ""):
+    def __init__(self, ledger_getter, tag: str = "", missed_alert=None):
         self._get_ledger = ledger_getter
         self._tag = tag or "delivery"
+        #: 自動補寄【明確放棄】時的告警管道(who, subject, why)。
+        #: 使用者不翻 log —— 「有人始終沒收到」只寫 log 等於沒說。
+        #: 沒接的(主程式)至少有 error log。
+        self._missed_alert = missed_alert
         #: 本 process 的節流時間戳。★只是跨 process 宣告失效時的後備★
         self.last_ts = 0.0
 
@@ -140,11 +150,20 @@ class Reconciler:
         #   消化率。餓死的那一筆一旦接上寄送閘門,會永久擋住它的 business key。
         #   兩個 ledger 方法各自只排序自己那一份,合起來沒有全域順序。
         ripe.sort(key=_created_at)
-        if not ripe:
+        # ★「還欠補寄」的清單由資料庫回答★(外審 2026-08-13 P1-01/02)
+        #   舊版只在「這一輪剛好查無」的 call-stack 上補寄 —— resolve 落地後、
+        #   補寄建立前 crash,那筆 FAILED 就永遠沒有人再看它一眼。
+        try:
+            owed = list(led.resends_owed(min_age_sec=RESEND_OWED_MIN_AGE_SEC))
+        except Exception:
+            owed = []
+            logging.debug("[%s] 讀取欠補寄清單失敗(下輪再試)", self._tag,
+                          exc_info=True)
+        if not ripe and not owed:
             return 0
         if not self._claim(led, now):
             return 0
-        if finder is None:
+        if finder is None and ripe:
             # 與其他 IMAP 用法同一套：在函式裡 import
             # （避免啟動時就把 ssl/imaplib 拉進來）
             from cmuh_common.imap_reader import (  # noqa: PLC0415
@@ -154,6 +173,13 @@ class Reconciler:
         settled = 0
         for rec in ripe[:MAX_PER_PASS]:
             settled += self._settle_one(led, rec, finder)
+        for rec in owed[:MAX_OWED_PER_PASS]:
+            try:
+                self._resend_owed_one(led, rec)
+            except Exception:
+                logging.warning("[%s] 驅動欠補寄 %s 失敗(下輪再試)",
+                                self._tag, rec.get("delivery_id"),
+                                exc_info=True)
         return settled
 
     def _give_up_on_unverifiable(self, led, pending, now: float) -> int:
@@ -230,33 +256,172 @@ class Reconciler:
         else:
             logging.error("[%s] ★%s 在寄件備份【查無】→ 這封信沒有寄出去★"
                           "(主旨:%s)", self._tag, did, rec.get("subject", ""))
-            # ★[外審 2026-08-12 P1-05] 知道沒寄到之後,拿落地的文字補寄★
-            #   (收斂已經成功落地才走到這裡 —— 補寄失敗也不會重複,
-            #    原信誠實地停在 FAILED + 上面那行告警。)
-            self._resend_from_body_text(led, rec)
+            # ★[外審 2026-08-13 P1-01] 用資料庫的最新狀態決定下一步★
+            #   resolve 已 COMMIT(body 依新規則保留)—— 這之後 crash 的話,
+            #   `resends_owed` 掃描會接手;立即補寄只是縮短等待,
+            #   兩條路走的是【同一個】決策函式。任何失敗都不可打斷回查輪。
+            try:
+                fresh = led.get(did) or {}
+                if str(fresh.get("parent_id") or ""):
+                    # ★子紀錄被否證 → 欠的在【親】那一筆★(P1-02):親的
+                    #   payload 還在(鏈未關)。不在這裡立刻補 —— 親可能是
+                    #   PARTIAL、記憶體退避佇列還在跑它的快路徑,立即出手
+                    #   會跟佇列對同一位收件人同時補寄;欠補寄掃描會照
+                    #   in-flight/上限/較新同 key 的規則接手。
+                    logging.warning("[%s] 補寄 %s 查無 → 親紀錄 %s 仍欠補寄,"
+                                    "由欠補寄掃描接手", self._tag, did,
+                                    fresh.get("parent_id"))
+                else:
+                    # 親紀錄查無:整封結果不明才會走到這裡,退避佇列從未
+                    #   接手過這封 → 立即嘗試,不必等年齡門檻。
+                    self._resend_owed_one(led, fresh)
+            except Exception:
+                logging.warning("[%s] 查無後的補寄驅動失敗(交給欠補寄掃描)",
+                                self._tag, exc_info=True)
         return 1
 
+    def _resend_owed_one(self, led, rec) -> str:
+        """一筆欠補寄的【親】紀錄 → 補寄/等待/結鏈/放棄。→ 新 id 或 ""。
+
+        ★這是欠補寄的唯一決策點★(外審 2026-08-13 P1-01/02/03):
+        「查無後立即補」與「crash 後掃描接手」都走這裡 —— 兩邊各寫一套
+        判準就會有一邊靜默失效。全部以資料庫的當下狀態為準,不吃快照。
+        """
+        from cmuh_common.delivery_ledger import (  # noqa: PLC0415
+            CONFIRMED, KIND_AUTO_RESEND, PARTIAL, PREPARED, R_CONFIRMED,
+            RESEND_MAX_AUTO, SUBMITTING, UNKNOWN, recipients_needing_retry,
+        )
+        did = str(rec.get("delivery_id") or "")
+        if not did or str(rec.get("parent_id") or ""):
+            return ""
+        try:
+            children = list(led.resend_children(did))
+        except Exception:
+            logging.warning("[%s] 讀不出 %s 的補寄子紀錄 → 本輪不補"
+                            "(寧可不補,不可重複寄)", self._tag, did,
+                            exc_info=True)
+            return ""
+        # 1) 自癒:已收斂子紀錄的送達先回寫親紀錄(冪等)。
+        #    「子紀錄已確認、回寫親紀錄之前 crash」的窗口靠這裡收 ——
+        #    不回寫的話親紀錄還掛著暫時被拒,會再補一次=重複的臨床通知。
+        for c in children:
+            if str(c.get("state")) not in (CONFIRMED, PARTIAL):
+                continue
+            got = sorted(a for a, st in (c.get("recipients") or {}).items()
+                         if st == R_CONFIRMED)
+            if not got:
+                continue
+            try:
+                led.confirm_recipients(did, got)
+            except Exception:
+                logging.warning("[%s] 回寫 %s 的已送達收件人失敗",
+                                self._tag, did, exc_info=True)
+        rec = led.get(did) or {}
+        body = str(rec.get("body_text") or "")
+        if not body or str(rec.get("state") or "") == CONFIRMED:
+            return ""                   # 鏈已關(全數送達或 payload 已清)
+        targets = recipients_needing_retry(rec.get("recipients") or {})
+        if not targets:
+            # 剩下的是永久被拒/已送達 → 沒有可自動補的人,結鏈。
+            try:
+                led.clear_body(did, note="無暫時性待補收件人,補寄鏈結案")
+            except Exception:
+                logging.warning("[%s] 結鏈 %s 失敗(下輪再試)", self._tag,
+                                did, exc_info=True)
+            return ""
+        # 2) ★同一把 key 只留最新一條鏈★(外審 AE-1 第 1 輪 P1-1):
+        #    工作層每次重試都 begin 新的一筆 —— 三次確定失敗=三個 FAILED
+        #    親紀錄,每筆各自補寄的話,同一份通知會寄三次。較新者(不論
+        #    收斂與否)是 canonical,舊鏈結束;欠補寄由最新那筆自己扛。
+        bk = str(rec.get("business_key") or "")
+        if bk:
+            try:
+                newer = led.has_newer_sibling(
+                    bk, than_created_at=_created_at(rec))
+            except Exception:
+                # ★查不出 ≠ 有較新★(外審 AE-1 第 1 輪 P1-2):結鏈會刪掉
+                #   唯一的 payload,不可逆 —— 讀取失敗只能【跳過本輪】,
+                #   body 原封不動,下輪再試。
+                logging.warning("[%s] 查不出 %s 的較新同 key 紀錄 → 本輪"
+                                "不補也不結鏈(結鏈不可逆)", self._tag, did,
+                                exc_info=True)
+                return ""
+            if newer:
+                try:
+                    led.clear_body(did, note="同 business_key 已有較新的"
+                                             "紀錄接手,本鏈結案")
+                except Exception:
+                    logging.warning("[%s] 結鏈 %s 失敗(下輪再試)",
+                                    self._tag, did, exc_info=True)
+                logging.info("[%s] %s 的同 key 已有較新紀錄 → 本鏈結案"
+                             "(欠補寄由最新那筆扛)", self._tag, did)
+                return ""
+        # 3) in-flight 互斥(claim 交易內會再驗;這裡只是省一次 send 準備)。
+        if any(str(c.get("state")) in (SUBMITTING, PREPARED, UNKNOWN)
+               for c in children):
+            return ""
+        # 4) ★抑制的出口★ 上限一到就明確放棄+告警,不無聲、不無限追打。
+        autos = sum(1 for c in children
+                    if str(c.get("kind") or "") == KIND_AUTO_RESEND)
+        if autos >= RESEND_MAX_AUTO:
+            subject = str(rec.get("subject") or "")
+            try:
+                gone = led.abandon_recipient_retry(
+                    did, note="自動補寄已達 %d 次上限仍未送達 → 明確放棄"
+                              % RESEND_MAX_AUTO)
+            except Exception:
+                logging.warning("[%s] 放棄 %s 的補寄失敗(下輪再試)",
+                                self._tag, did, exc_info=True)
+                return ""
+            if gone:
+                logging.error("[%s] ★自動補寄已達 %d 次上限,明確放棄★:"
+                              "%s 始終沒收到(主旨:%s)—— 請人工確認/轉寄",
+                              self._tag, RESEND_MAX_AUTO, ", ".join(gone),
+                              subject)
+                if self._missed_alert is not None:
+                    try:
+                        self._missed_alert(gone, subject,
+                                           "自動補寄已達 %d 次上限"
+                                           % RESEND_MAX_AUTO)
+                    except Exception:
+                        logging.warning("[%s] 漏收告警管道失敗", self._tag,
+                                        exc_info=True)
+            return ""
+        return self._resend_from_body_text(led, rec)
+
     def _resend_from_body_text(self, led, rec) -> str:
-        """Sent 查無 → 用帳上落地的文字內容自動補寄一封。→ 新 delivery_id 或 ""。
+        """用帳上落地的文字內容自動補寄一封。→ 新 delivery_id 或 ""。
 
         ★只有文字,沒有附件★(使用者定案 2026-08-13):會診通知的附件是
         PHI 截圖,依既有隱私定案【不落地】—— 信裡註明請至 HIS 查看。
 
-        有界性(不可能變成補寄迴圈):
-        * 補寄紀錄自己(有 parent_id)★永不★再被自動補寄;
-        * 原信已有子紀錄(任何狀態)就不再補 → 每筆原信最多一次,
-          跨重啟也算得出來(子紀錄在資料庫裡);
-        * `body_text` 空(舊版寫的紀錄)→ 沒得補,維持告警即止的舊行為。
+        有界性(不可能變成補寄迴圈;外審 2026-08-13 P1-02 改版):
+        * 補寄紀錄自己(有 parent_id)★永不★再被自動補寄 —— 欠的永遠
+          記在【親】紀錄上;
+        * 同時最多一封 in-flight、自動補寄最多 RESEND_MAX_AUTO 次:
+          由 `claim_resend_child` 在交易內仲裁(跨重啟、跨 process 都
+          算得出來 —— 子紀錄與 kind 都在資料庫裡);
+        * `body_text` 空(舊版寫的紀錄/鏈已關)→ 沒得補,告警即止。
         """
         did = str(rec.get("delivery_id") or "")
+        if not did:
+            return ""
+        # ★重新讀資料庫,不用呼叫端手上的快照★(外審 2026-08-13 P1-01):
+        #   快照跨越了 resolve 的 COMMIT —— crash 之後重來時只剩資料庫;
+        #   平時與 crash 後要走同一條路,才是同一個被測行為。
+        rec = led.get(did) or {}
         if str(rec.get("parent_id") or ""):
-            return ""                    # 補寄的補寄 → 不做(有界)
+            return ""                    # 補寄的補寄 → 不做(欠的在親紀錄)
         body = str(rec.get("body_text") or "")
         if not body:
-            return ""                    # 舊紀錄沒有落地文字 → 沒得補
-        # 只補給【還沒確認送達】的人 —— 已送達的再寄一次就是重複的臨床通知
-        addrs = sorted(a for a, st in (rec.get("recipients") or {}).items()
-                       if st != "confirmed")
+            return ""                    # 沒有落地文字 → 沒得補(或鏈已關)
+        # ★只補給【暫時性被拒】的人★ 已送達的再寄一次是重複的臨床通知;
+        #   永久被拒(5xx)重寄也不會變好(要人工改設定,告警已在);
+        #   UNKNOWN 的要先回查,不可盲寄。
+        from cmuh_common.delivery_ledger import (  # noqa: PLC0415
+            recipients_needing_retry,
+        )
+        addrs = recipients_needing_retry(rec.get("recipients") or {})
         if not addrs:
             return ""
         from email.utils import make_msgid  # noqa: PLC0415

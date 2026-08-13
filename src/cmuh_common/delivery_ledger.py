@@ -66,14 +66,25 @@ LEDGER_FILENAME = "delivery_ledger.json"        # 舊格式(只讀,匯入用)
 DB_FILENAME = "delivery_ledger.sqlite3"
 # v2(2026-08-13 批次AD-3):新增 body_text —— UNKNOWN 查無後要拿什麼補寄。
 # ★使用者定案:只落地文字★ 附件是 PHI 截圖,依既有隱私定案不落地。
-_SCHEMA_VERSION = 2
+# v3(2026-08-13 批次AE-1):新增 kind —— 區分「回查驅動的自動補寄」與
+# 佇列補寄/初次寄送;自動補寄的次數上限要能跨重啟算得出來。
+_SCHEMA_VERSION = 3
 _BODY_TEXT_MAX = 100_000        # 信的文字內容上限(夠放最長的會診清單)
 # ★body 有自己的保留期,與紀錄本身(45 天)分開★(外審 AD-3 第 1 輪 P1-3)
-#   內文可能含臨床資訊 —— 只在「還可能需要補寄」的窗口裡保留:
-#   終局狀態一到就清;沒到終局的(卡死的 UNKNOWN)最多留 3 天
-#   (補寄的臨床價值早就衰減完了)。清除不依賴「之後還有信要寄」:
-#   啟動時也掃(見 _connect_locked)。
+#   內文可能含臨床資訊 —— 只在「還可能需要補寄」的窗口裡保留。
+#   ★[外審 2026-08-13 P1-01] 不可以在 FAILED/PARTIAL 的當下就清★
+#   「原信 FAILED、body 已刪、補寄還沒 durable 建立」之間 crash,那封信
+#   就永久消失 —— 所以 body 保留到【補寄鏈關閉】:全數送達(CONFIRMED)、
+#   明確放棄(abandon,有告警)、或本上限(3 天,隱私天花板;補寄的臨床
+#   價值早就衰減完了)。清除不依賴「之後還有信要寄」:啟動時也掃
+#   (見 _connect_locked),回查每輪也掃(scrub_stale_bodies)。
 BODY_RETAIN_SEC = 3 * 86400.0
+# ★補寄鏈的界線★(外審 2026-08-13 P1-01/02):「這筆還欠一次補寄」必須由
+#   資料庫自己表達(resends_owed),不靠 call-stack 的順序 —— 只要還欠著,
+#   durable payload(body_text)就必須還在。
+KIND_AUTO_RESEND = "auto_resend"    # 回查驅動的自動補寄子紀錄(kind 欄)
+RESEND_MAX_AUTO = 2                 # 每筆原信最多幾次自動補寄(抑制的出口:
+#   上限一到就明確放棄+告警;沒有上限的話,收不了信的信箱會被每輪追打)
 
 # ── 整筆寄送的狀態 ──────────────────────────────────────────────────────────
 PREPARED = "prepared"        # 舊格式遺留（新版 begin 直接落地成 SUBMITTING）
@@ -210,7 +221,8 @@ def _clean_recipients(value) -> dict:
 
 _COLUMNS = ("delivery_id", "business_key", "parent_id", "category", "subject",
             "message_id", "attachment_hash", "state", "recipients",
-            "created_at", "updated_at", "attempts", "note", "body_text")
+            "created_at", "updated_at", "attempts", "note", "body_text",
+            "kind")
 
 
 class DeliveryLedger:
@@ -262,6 +274,24 @@ class DeliveryLedger:
             #   契約。寄信頻率是每小時個位數,fsync 的成本可以忽略。
             conn.execute("PRAGMA synchronous=FULL")
             conn.execute("PRAGMA busy_timeout=%d" % _BUSY_TIMEOUT_MS)
+            # ★前向版本守衛★(外審 2026-08-13 P2-02):資料庫比本程式【新】
+            #   → 拒開,而且★不可以把 meta 降版★ —— rollback 到舊程式後把
+            #   v4 資料庫改寫成「schema=3」,之後的新程式會以為不用遷移,
+            #   forward-incompatible 的內容就被當成已相容。守衛要在任何
+            #   CREATE/ALTER 之前:對太新的資料庫連 schema 都不該碰。
+            conn.execute("CREATE TABLE IF NOT EXISTS meta ("
+                         " key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            try:
+                existing_ver = int(row[0]) if row else 0
+            except (TypeError, ValueError):
+                existing_ver = 0
+            if existing_ver > _SCHEMA_VERSION:
+                raise RuntimeError(
+                    "寄送帳本資料庫的 schema(v%d)比本程式支援的(v%d)新 ——"
+                    " 這台在跑舊版程式;拒絕開啟(降版改寫會讓新程式誤以為"
+                    "不用遷移)" % (existing_ver, _SCHEMA_VERSION))
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS deliveries ("
                 " delivery_id TEXT PRIMARY KEY,"
@@ -277,23 +307,26 @@ class DeliveryLedger:
                 " updated_at REAL NOT NULL,"
                 " attempts INTEGER NOT NULL DEFAULT 0,"
                 " note TEXT NOT NULL DEFAULT '',"
-                " body_text TEXT NOT NULL DEFAULT '')")
-            # ── v1 → v2:補 body_text 欄(批次AD-3 durable outbox)──
-            #   CREATE IF NOT EXISTS 對【既有的】v1 資料庫不會補欄位,
+                " body_text TEXT NOT NULL DEFAULT '',"
+                " kind TEXT NOT NULL DEFAULT '')")
+            # ── v1→v2:補 body_text;v2→v3:補 kind(批次AE-1)──
+            #   CREATE IF NOT EXISTS 對【既有的】舊版資料庫不會補欄位,
             #   要自己 ALTER;新建的資料庫上面就有了。
             cols = {r[1] for r in
                     conn.execute("PRAGMA table_info(deliveries)").fetchall()}
             if "body_text" not in cols:
                 conn.execute("ALTER TABLE deliveries ADD COLUMN"
                              " body_text TEXT NOT NULL DEFAULT ''")
+            if "kind" not in cols:
+                conn.execute("ALTER TABLE deliveries ADD COLUMN"
+                             " kind TEXT NOT NULL DEFAULT ''")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_bk"
                          " ON deliveries(business_key)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_state"
                          " ON deliveries(state)")
             # ★schema version 是人維護的帳,不是推導出來的★(外審 2026-08-12)
-            #   升級是冪等的(上面的 ALTER 保證欄位在)→ 直接標到目前版本。
-            conn.execute("CREATE TABLE IF NOT EXISTS meta ("
-                         " key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            #   升級是冪等的(上面的 ALTER 保證欄位在)→ 同版/舊版標到目前
+            #   版本;比目前新的在上面已經拒開了,走不到這裡。
             conn.execute("INSERT INTO meta(key, value) VALUES"
                          " ('schema_version', ?) ON CONFLICT(key)"
                          " DO UPDATE SET value=excluded.value",
@@ -367,6 +400,7 @@ class DeliveryLedger:
                 _as_attempts(rec.get("attempts")),
                 str(rec.get("note") or "")[:300],
                 "",                     # 舊格式沒有 body_text(補寄自然沒得補)
+                "",                     # 舊格式沒有 kind
             ))
         if not rows:
             return
@@ -533,7 +567,7 @@ class DeliveryLedger:
     @staticmethod
     def _new_rec(did, business_key, category, recipients, subject,
                  message_id, attachment_hash, parent_id,
-                 body_text: str = "") -> dict:
+                 body_text: str = "", kind: str = "") -> dict:
         return {
             "delivery_id": did,
             "business_key": str(business_key),
@@ -557,7 +591,15 @@ class DeliveryLedger:
             # ★只落地文字★(批次AD-3,使用者定案 2026-08-13):附件是 PHI
             #   截圖,不落地 —— Sent 查無後的自動補寄只有文字,並註明
             #   請至 HIS 查看。
-            "body_text": str(body_text or "")[:_BODY_TEXT_MAX],
+            # ★子紀錄(有 parent_id)一律不落地 body★(外審 AE-1 第 1 輪
+            #   P2-4):payload 的權威在親紀錄上,補寄從不讀子紀錄的 body ——
+            #   佇列補寄傳進來的內文只是親紀錄的重複 PHI 副本,卻會依
+            #   保留規則活到 3 天 scrub。在資料層強制,所有建立者一起管住。
+            "body_text": ("" if parent_id
+                          else str(body_text or "")[:_BODY_TEXT_MAX]),
+            # ""=初次寄送或佇列補寄;KIND_AUTO_RESEND=回查驅動的自動補寄
+            #   (次數上限只數這一種 —— 佇列自己有退避與用盡告警)。
+            "kind": str(kind or ""),
         }
 
     def _insert_locked(self, conn, rec: dict) -> None:
@@ -576,7 +618,8 @@ class DeliveryLedger:
                     " updated_at=? WHERE delivery_id=?",
                     (SUBMITTING, _now(), str(delivery_id or "")))
 
-    def _mutate_recipients_locked(self, delivery_id: str, fn, note: str = ""):
+    def _mutate_recipients_locked(self, delivery_id: str, fn, note: str = "",
+                                  clear_body: bool = False):
         """讀一筆 → 讓 `fn(states)` 改收件人狀態 → summarize → 寫回。
 
         整段在同一筆 IMMEDIATE 交易裡:兩個 process 對同一筆的讀-改-寫
@@ -592,12 +635,14 @@ class DeliveryLedger:
                 states = dict(rec.get("recipients") or {})
                 out = fn(states)
                 new_state = summarize(states)
-                # ★到了終局狀態就把 body 清掉★(外審 AD-3 第 1 輪 P1-3)
-                #   body 只為「補寄」而存在;收斂之後留著只是多一份
-                #   臨床資訊的暴露面。
-                keep_body = (rec.get("body_text") or ""
-                             if new_state in (SUBMITTING, UNKNOWN, PREPARED)
-                             else "")
+                # ★body 保留到補寄鏈關閉★(外審 2026-08-13 P1-01,取代
+                #   AD-3 的「終局即清」):FAILED/PARTIAL 還欠補寄 ——
+                #   在「補寄 durable 建立」之前把 payload 刪掉,中間 crash
+                #   那封信就永久消失。只有【全數送達】(CONFIRMED)或
+                #   【明確放棄】(clear_body=True,呼叫端已告警)才清;
+                #   隱私天花板是 3 天的 scrub(獨立於狀態)。
+                keep_body = ("" if (clear_body or new_state == CONFIRMED)
+                             else rec.get("body_text") or "")
                 conn.execute(
                     "UPDATE deliveries SET recipients=?, state=?, note=?,"
                     " updated_at=?, body_text=? WHERE delivery_id=?",
@@ -683,6 +728,9 @@ class DeliveryLedger:
 
         補寄佇列在記憶體、重啟就忘;帳本是落地的 —— 真正的收尾要嘛補寄成功,
         要嘛在帳上明確結案並告警(外審第 10 輪第 4 回 P1-1)。
+        ★放棄=補寄鏈明確關閉★ → body 一併清掉(它只為補寄而存在;
+        呼叫端在這之後要告警,見 `_resend_owed_one` /
+        `_close_out_stale_recipient_retries`)。
         """
         def _apply(states: dict):
             gone = sorted(a for a, st in states.items() if st == R_TRANSIENT)
@@ -691,7 +739,8 @@ class DeliveryLedger:
             return gone
 
         _state, gone = self._mutate_recipients_locked(
-            delivery_id, _apply, note=(str(note) or "補寄已放棄"))
+            delivery_id, _apply, note=(str(note) or "補寄已放棄"),
+            clear_body=True)
         return gone or []
 
     def claim_reconcile_pass(self, *, now: float, every_sec: float) -> bool:
@@ -784,50 +833,114 @@ class DeliveryLedger:
 
         兩支程式的回查可能同時走到補寄:SELECT 與 INSERT 拆兩筆交易就是
         TOCTOU —— 兩邊都查到「沒補過」,各寄一封重複的臨床通知。
-        BEGIN IMMEDIATE 讓「有沒有任何子紀錄」與「登記」原子化。
-        回傳新 delivery_id;已有子紀錄(含收件人補寄產生的)回 ""(不補,
-        方向安全)。★補寄紀錄自己不落地 body★:它永不再自動補寄,
-        留著只是多一份臨床資訊暴露面。落不了地就拋 LedgerUnavailable
-        (呼叫端不寄:沒有帳的補寄會破壞「最多一次」)。
+        BEGIN IMMEDIATE 讓「查 + 登記」原子化。回傳新 delivery_id;
+        不該補時回 ""。交易內的判準(★這裡是最終仲裁,外面的預檢只是
+        省工★,外審 2026-08-13 P1-02):
+
+        * 有【結果未定】的子紀錄(SUBMITTING/PREPARED/UNKNOWN)→ 不補:
+          那封可能已送達,先等回查收斂(同時最多一封 in-flight)。
+          已收斂的子紀錄(CONFIRMED/PARTIAL/FAILED)★不擋★ —— 舊版
+          「有任何子紀錄就永不再補」讓「claim 之後、send 之前 crash」
+          變成兩封都證明沒寄出卻永遠不再寄。
+        * 自動補寄(kind=KIND_AUTO_RESEND)已達 RESEND_MAX_AUTO → 不補
+          (呼叫端負責明確放棄+告警;佇列補寄的子紀錄不計入 ——
+          它們自己有退避上限與用盡告警)。
+
+        ★補寄紀錄自己不落地 body★:payload 的權威在【親紀錄】上,
+        鏈沒關閉之前它都在(P1-01 的保留規則)。落不了地就拋
+        LedgerUnavailable(呼叫端不寄:沒有帳的補寄會破壞有界性)。
         """
         pid = str(parent_id or "")
         if not pid:
             return ""
         did = new_delivery_id()
         rec = self._new_rec(did, business_key, category, recipients, subject,
-                            message_id, "", pid, "")
+                            message_id, "", pid, "", kind=KIND_AUTO_RESEND)
         with self._lock:
             conn = self._ensure_conn_locked()
             with self._txn(conn):
-                cur = conn.execute(
-                    "SELECT 1 FROM deliveries WHERE parent_id=? LIMIT 1",
-                    (pid,))
-                if cur.fetchone():
+                rows = conn.execute(
+                    "SELECT state, kind FROM deliveries WHERE parent_id=?",
+                    (pid,)).fetchall()
+                if any(str(st) in (SUBMITTING, PREPARED, UNKNOWN)
+                       for st, _k in rows):
+                    return ""
+                autos = sum(1 for _st, k in rows
+                            if str(k) == KIND_AUTO_RESEND)
+                if autos >= RESEND_MAX_AUTO:
                     return ""
                 self._insert_locked(conn, rec)
         return did
 
-    def has_resend_child(self, delivery_id: str) -> bool:
-        """這筆原信有沒有(任何狀態的)補寄子紀錄。查不出來 → True。
+    def resend_children(self, parent_id: str) -> list:
+        """這筆原信的所有補寄子紀錄(含佇列補寄)。讀不到 → LedgerUnavailable
+        (空清單會被讀成「沒補過」→ 重複寄)。"""
+        return self._select("parent_id=?", (str(parent_id or ""),))
 
-        ★方向:查不出來=「已經補過」★ 這個方法守的是「每筆原信最多自動
-        補寄一次」—— 答錯成 False 的代價是【重複寄臨床通知】,答錯成 True
-        的代價只是這一輪不補(告警 log 還在)。
+    def resends_owed(self, *, min_age_sec: float) -> list:
+        """★「還欠一次補寄」由資料庫自己回答★(外審 2026-08-13 P1-01/02)
+
+        = 親紀錄(parent_id='')+ payload 還在(body_text≠'')+ 已被否證
+        (FAILED)或部分未達(PARTIAL)+ 距上次變動超過 min_age_sec。
+        呼叫端(`Reconciler._resend_owed_one`)再做 in-flight/上限/較新
+        同 key 的判斷。年齡門檻讓記憶體退避佇列先跑完它的快路徑。
+        讀不到 → LedgerUnavailable(空清單=「沒有人欠補寄」,不可假裝)。
+        """
+        return self._select(
+            "parent_id='' AND body_text!='' AND state IN (?,?)"
+            " AND updated_at<?", (FAILED, PARTIAL, _now() - float(min_age_sec)))
+
+    def clear_body(self, delivery_id: str, note: str = "") -> bool:
+        """補寄鏈明確關閉(不經收件人狀態變動)→ 清掉 payload。→ 有清到嗎。
+
+        給「同 business_key 已有較新的存活寄送」「已無暫時性待補收件人」
+        這類【不改收件人狀態、只結鏈】的出口用;失敗拋 LedgerUnavailable。
         """
         did = str(delivery_id or "")
         if not did:
-            return True
+            return False
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            with self._txn(conn):
+                if note:
+                    cur = conn.execute(
+                        "UPDATE deliveries SET body_text='', note=?,"
+                        " updated_at=? WHERE delivery_id=? AND body_text!=''",
+                        (str(note)[:300], _now(), did))
+                else:
+                    cur = conn.execute(
+                        "UPDATE deliveries SET body_text='', updated_at=?"
+                        " WHERE delivery_id=? AND body_text!=''", (_now(), did))
+                return bool(cur.rowcount)
+
+    def has_newer_sibling(self, business_key: str, *,
+                          than_created_at: float) -> bool:
+        """同 business_key、比 than_created_at 新的【初次】紀錄存在嗎
+        (★任何狀態★,不只存活者)。
+
+        ★同一把 key 只留最新一條補寄鏈★(外審 AE-1 第 1 輪 P1-1):
+        工作層每次重試都 begin 新的一筆 —— 三次確定失敗就是三個 FAILED
+        親紀錄;每筆各自走 resends_owed 的話,SMTP 恢復後同一份通知會寄
+        三次。較新者(不論收斂與否)是 canonical:舊鏈一律結束,最新那筆
+        自己有 body 與額度,欠補寄由它扛。
+
+        ★讀不到 → raise,不回 True★(外審 AE-1 第 1 輪 P1-2):呼叫端把
+        True 當成「可以結鏈」的證據,而結鏈會刪掉唯一的 durable payload,
+        不可逆 —— 讀取失敗答成 True,一次暫時的資料庫抖動就把該補的信
+        永久丟掉。「跳過本輪」必須由呼叫端自己明寫。
+        """
         try:
             with self._lock:
                 conn = self._ensure_conn_locked()
                 cur = conn.execute(
-                    "SELECT 1 FROM deliveries WHERE parent_id=? LIMIT 1",
-                    (did,))
+                    "SELECT 1 FROM deliveries WHERE business_key=?"
+                    " AND parent_id='' AND created_at>? LIMIT 1",
+                    (str(business_key), float(than_created_at)))
                 return cur.fetchone() is not None
-        except (LedgerUnavailable, sqlite3.Error):
-            logging.warning("[delivery] 查不出 %s 有沒有補寄過 → 當成有"
-                            "(寧可不補,不可重複寄)", did)
-            return True
+        except sqlite3.Error as e:
+            raise LedgerUnavailable(
+                "這一刻查不出 %s 有沒有較新的同 key 紀錄" % business_key
+            ) from e
 
     def state_of(self, delivery_id: str) -> str:
         """某一筆的目前狀態。**查不到／讀不到一律回空字串**。
@@ -921,13 +1034,26 @@ class DeliveryLedger:
     def _scrub_stale_bodies_locked(self, conn) -> int:
         """把超過保留期的 body 清掉(狀態不動)。★獨立於「之後還有沒有信」★
 
-        (在呼叫端的交易裡執行)終局清除靠 `_mutate_recipients_locked`;
-        這裡收的是卡死在 UNKNOWN/SUBMITTING 的 —— 它們永不被 prune,
-        body 卻不可以跟著永存。
+        (在呼叫端的交易裡執行)全數送達的清除靠 `_mutate_recipients_locked`,
+        明確放棄靠 `abandon_recipient_retry`/`clear_body`;這裡是隱私天花板:
+        不管鏈開著沒有,body 最多留 3 天。
+        ★清到「鏈還開著」的要大聲講★(抑制的出口不可以是無聲的):
+        body 一清,`resends_owed` 就不再回報它 —— 那等於放棄補寄,
+        不能只有一行 info。只記 id/state/category,不記內文與收件人。
         """
+        cutoff = _now() - BODY_RETAIN_SEC
+        rows = conn.execute(
+            "SELECT delivery_id, state, category FROM deliveries"
+            " WHERE body_text!='' AND created_at<?", (cutoff,)).fetchall()
         cur = conn.execute(
             "UPDATE deliveries SET body_text='' WHERE body_text!=''"
-            " AND created_at<?", (_now() - BODY_RETAIN_SEC,))
+            " AND created_at<?", (cutoff,))
+        for did, state, category in rows:
+            if str(state) != CONFIRMED:
+                logging.error(
+                    "[delivery] ★%s(state=%s,category=%s)的內文到 3 天"
+                    "保留上限仍未收斂 → 已清除,不再自動補寄★(到期放棄)",
+                    did, state, category)
         if cur.rowcount:
             logging.info("[delivery] 清掉 %d 筆逾 %.0f 天的信件內文",
                          cur.rowcount, BODY_RETAIN_SEC / 86400.0)

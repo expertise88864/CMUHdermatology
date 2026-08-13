@@ -5779,11 +5779,14 @@ def _schedule_refusal_retry(delivery, refused: dict, trigger_label: str,
                             origin_did: str = "") -> None:
     """把仍未送達的暫時性拒收排進退避佇列(由後續輪次的 `_drain_...` 處理)。
 
-    ★為什麼是記憶體佇列,不是持久化★(刻意,不是疏漏)
-    要跨重啟續傳就得把【信件內文】寫到磁碟上,而會診信的內文就是病人清單。
-    本專案的紅線是「不得存放病人明文」,所以這裡停在記憶體。程式重啟會忘掉
-    這些待補寄 —— 那不是無聲的:給不出去的時候會用 error 級別把「誰沒收到」
-    講清楚(見 `_give_up_on_refusals`),而不是假裝寄成功了。
+    ★佇列在記憶體=快路徑;跨重啟的那一半在帳本★(批次AE-1 更新)
+    這裡的退避佇列(2/10/30 分)只活在本 process —— 它手上有完整的
+    delivery 物件(含附件),補得最快最全。重啟之後佇列消失,但 AD-3 起
+    信件【文字】內文已依使用者定案落地(3 天保留):
+    `delivery_reconcile` 的欠補寄掃描(`resends_owed`)會在帳上的
+    PARTIAL/FAILED 沉超過一小時後接手,用落地文字補寄(無附件,註明至
+    HIS 查看)。兩邊靠資料庫仲裁不重複:佇列的補寄有 parent_id,
+    是 in-flight 子紀錄時 durable 補寄不出手。
     """
     with _pending_refusal_lock:
         _pending_refusal_retries.append({
@@ -5873,7 +5876,11 @@ from cmuh_common.delivery_reconcile import Reconciler as _Reconciler  # noqa: E4
 #   直接傳 `_get_ledger` 會把 import 當下的那個物件釘住,之後任何對
 #   `consult_query._get_ledger` 的取代(測試的 seam、未來的注入)都不再生效 ——
 #   而且是【安靜地】不生效:測試照跑,只是測到的是舊的取得器。
-_RECONCILER = _Reconciler(lambda: _get_ledger(), tag="delivery")
+#   missed_alert:自動補寄達上限【明確放棄】時走開發者告警信 ——
+#   使用者不翻 log,「有人始終沒收到」只寫 log 等於沒說(批次AE-1)。
+_RECONCILER = _Reconciler(lambda: _get_ledger(), tag="delivery",
+                          missed_alert=lambda who, subject, why:
+                          _alert_missed_recipients(who, subject, why))
 
 
 def _reconcile_unknown_deliveries(now=None, finder=None) -> int:
@@ -5885,17 +5892,18 @@ _ABANDON_RETRY_AFTER_SEC = 3600.0     # 帳上掛超過一小時 → 明確結�
 
 
 def _close_out_stale_recipient_retries(now=None) -> None:
-    """★重啟之後的那一半★(外審第 10 輪第 4 回 P1-1)
+    """★重啟之後的收尾★(外審第 10 輪第 4 回 P1-1;批次AE-1 更新)
 
-    退避佇列在記憶體裡,程式一重啟就忘光 —— 那正是外審指出的缺口:
-    連「講清楚誰沒收到」的告警都不會執行,因為佇列已經隨 process 消失了。
-    但【帳本是落地的】:重啟之後 `needs_recipient_retry()` 仍然看得到
-    「這幾位還沒收到」。所以這裡負責把那一半接回來:掛太久的,明確結案
-    (帳本上改記成不再補寄)並告警。
+    退避佇列在記憶體裡,程式一重啟就忘光;但【帳本是落地的】:重啟之後
+    `needs_recipient_retry()` 仍然看得到「這幾位還沒收到」。
 
-    ★為什麼不是重新把信寄出去★ 要重建那封信就得把【病人清單】寫到磁碟上,
-    而本專案不存病人明文。所以重啟後能做、也應該做的事是:讓人知道。
-    「送不到」變成一則有人看得到的告警,而不是一件沒有人知道的事。
+    ★AE-1 之後,結案要先讓路給 durable 補寄★(外審 2026-08-13 P1-03):
+    有落地內文、自動補寄額度也還沒用完的,`delivery_reconcile` 的欠補寄
+    掃描會【重新把文字寄出去】—— 這裡搶先把人改成永久被拒,等於把補寄的
+    目標清空,重啟後又退化成「只剩告警」。所以只收兩種尾巴:
+    * 沒有落地內文可補的(舊紀錄/內文已過 3 天保留);
+    * 自動補寄額度已用盡的(掃描那邊自己也會放棄+告警,誰先到誰收)。
+    讓路不會變成永遠沉默:額度用盡或內文到期後,這裡照樣結案+告警。
     """
     led = _get_ledger()
     if led is None:
@@ -5911,6 +5919,29 @@ def _close_out_stale_recipient_retries(now=None) -> None:
             rec = led.get(did) or {}
             if now - float(rec.get("created_at") or 0) < _ABANDON_RETRY_AFTER_SEC:
                 continue                       # 還在退避窗口內,交給佇列
+            from cmuh_common.delivery_ledger import (  # noqa: PLC0415
+                KIND_AUTO_RESEND, PREPARED, RESEND_MAX_AUTO, SUBMITTING,
+                UNKNOWN,
+            )
+            try:
+                kids = led.resend_children(did)
+            except Exception:
+                # 查不出來就不讓路(結案有告警,看得見;讓路才是無聲的)
+                kids = None
+            if kids:
+                # ★最後一次嘗試結果未明就不可結案★(外審 AE-1 第 1 輪
+                #   P1-3):子紀錄還在 SUBMITTING/UNKNOWN,那封可能已經
+                #   送達 —— 現在結案+告警,人工照著轉寄=重複的臨床通知。
+                #   有出口:in-flight 子紀錄必被回查收斂(卡住的 SUBMITTING
+                #   → Sent 查證;查無 Message-ID 的 24 小時逾期結案)。
+                if any(str(c.get("state") or "") in
+                       (SUBMITTING, PREPARED, UNKNOWN) for c in kids):
+                    continue
+            if str(rec.get("body_text") or "") and kids is not None:
+                autos = sum(1 for c in kids
+                            if str(c.get("kind") or "") == KIND_AUTO_RESEND)
+                if autos < RESEND_MAX_AUTO:
+                    continue                   # durable 補寄還有額度,先讓它做
             gone = led.abandon_recipient_retry(
                 did, note="補寄未成功(可能跨越程式重啟)→ 已告警")
             if gone:
