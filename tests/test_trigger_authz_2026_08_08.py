@@ -229,16 +229,18 @@ class TestATriggerSurvivesARestart:
         self._isolate(tmp_path, monkeypatch)
         order = []
         monkeypatch.setattr(cq, "_trigger_journal_add",
-                            lambda uid, s: order.append("journal") or True)
+                            lambda uid, s, uv, ident:
+                            (order.append("journal") or f"{ident}|{uv}|{uid}"))
         import cmuh_common.imap_reader as _ir
+        monkeypatch.setattr(_ir, "mailbox_identity", lambda: "T:INBOX")
         monkeypatch.setattr(_ir, "mark_uids_seen",
-                            lambda uids: order.append("seen") or True)
+                            lambda uids, **kw: order.append("seen") or True)
         monkeypatch.setattr(cq, "trigger_job_async",
                             lambda *a, **k: order.append("trigger"))
         # ★生產的形狀是 (uid, 寄件人, 是否通過驗證)★ 少了第三欄,
         #   handoff 會把它當成未驗證而整批跳過。
         cq._handoff_email_triggers([("11", "doc@x.tw", True)],
-                                   ["doc@x.tw"])
+                                   ["doc@x.tw"], uidvalidity="9", identity="T:INBOX")
         assert order == ["journal", "seen", "trigger"], (
             f"★順序錯了★:{order} —— 標已讀不可以早於工作落地")
 
@@ -248,10 +250,12 @@ class TestATriggerSurvivesARestart:
         寧可多觸發一次,也不要漏掉一次會診請求。"""
         self._isolate(tmp_path, monkeypatch)
         marked = []
-        monkeypatch.setattr(cq, "_trigger_journal_add", lambda uid, s: False)
+        monkeypatch.setattr(cq, "_trigger_journal_add",
+                            lambda uid, s, uv, ident: "")
         import cmuh_common.imap_reader as _ir
+        monkeypatch.setattr(_ir, "mailbox_identity", lambda: "T:INBOX")
         monkeypatch.setattr(_ir, "mark_uids_seen",
-                            lambda uids: marked.append(uids))
+                            lambda uids, **kw: marked.append(uids))
         monkeypatch.setattr(cq, "trigger_job_async",
                             lambda *a, **k: marked.append("trigger"))
         # ★生產的形狀是 (uid, 寄件人, 是否通過驗證)★ 少了第三欄,
@@ -263,21 +267,21 @@ class TestATriggerSurvivesARestart:
     def test_a_pending_entry_is_resumed_on_startup(self, tmp_path,
                                                    monkeypatch):
         self._isolate(tmp_path, monkeypatch)
-        assert cq._trigger_journal_add("42", "doc@x.tw")
+        assert cq._trigger_journal_add("42", "doc@x.tw", "9", "T:INBOX")
         got = []
         monkeypatch.setattr(cq, "trigger_job_async",
                             lambda *a, **k: got.append((a, k)))
         assert cq.resume_pending_triggers() == 1
         assert got and got[0][1]["override_recipients"] == ["doc@x.tw"]
-        assert got[0][1]["trigger_uids"] == ("42",)
+        assert got[0][1]["trigger_uids"] == ("T:INBOX|9|42",)
 
     def test_a_stale_pending_entry_is_not_resumed(self, tmp_path, monkeypatch):
         """★會診清單是「現在」的狀態★ 補寄一份六小時前的請求,醫師拿到的
         是與當下不符的資料(與 IMAP 的陳舊觸發信過濾同一個道理)。"""
         self._isolate(tmp_path, monkeypatch)
-        cq._trigger_journal_add("42", "doc@x.tw")
+        cq._trigger_journal_add("42", "doc@x.tw", "9", "T:INBOX")
         data, _ok = cq._trigger_journal_pending()
-        data["42"]["at"] = 0.0
+        data["T:INBOX|9|42"]["at"] = 0.0
         cq._trigger_journal_save(data)
         got = []
         monkeypatch.setattr(cq, "trigger_job_async",
@@ -289,8 +293,8 @@ class TestATriggerSurvivesARestart:
     def test_a_finished_job_clears_the_journal_entry(self, tmp_path,
                                                     monkeypatch):
         self._isolate(tmp_path, monkeypatch)
-        cq._trigger_journal_add("42", "doc@x.tw")
-        cq._trigger_journal_done("42")
+        cq._trigger_journal_add("42", "doc@x.tw", "9", "T:INBOX")
+        cq._trigger_journal_done("T:INBOX|9|42")
         assert not cq._trigger_journal_pending()[0]
 
     def test_the_scheduler_actually_resumes(self):
@@ -350,15 +354,15 @@ class TestTheJournalNeverOverwritesOnReadFailure:
         又是「讀不到被當成確定的答案」。"""
         import cmuh_common.paths as paths
         monkeypatch.setattr(paths, "get_settings_dir", lambda: str(tmp_path))
-        assert cq._trigger_journal_add("1", "a@x.tw")
+        assert cq._trigger_journal_add("1", "a@x.tw", "9", "T:INBOX")
         import cmuh_common.atomic_io as aio
         monkeypatch.setattr(aio, "safe_load_json_ex",
                             lambda *a, **k: ({}, "error"))
-        assert cq._trigger_journal_add("2", "b@x.tw") is False, (
+        assert cq._trigger_journal_add("2", "b@x.tw", "9", "T:INBOX") == "", (
             "★讀不到卻照樣寫★ 會把既有待辦蓋掉")
         monkeypatch.undo()
         monkeypatch.setattr(paths, "get_settings_dir", lambda: str(tmp_path))
-        assert "1" in cq._trigger_journal_pending()[0], "既有待辦被蓋掉了"
+        assert "T:INBOX|9|1" in cq._trigger_journal_pending()[0], "既有待辦被蓋掉了"
 
     def test_done_does_not_write_on_read_failure(self, tmp_path, monkeypatch):
         """結案也一樣:讀不到就不要寫。多補跑一次(重複一封)遠比把別人的
@@ -372,15 +376,15 @@ class TestTheJournalNeverOverwritesOnReadFailure:
         """
         import cmuh_common.paths as paths
         monkeypatch.setattr(paths, "get_settings_dir", lambda: str(tmp_path))
-        cq._trigger_journal_add("1", "a@x.tw")
-        cq._trigger_journal_add("2", "b@x.tw")
+        cq._trigger_journal_add("1", "a@x.tw", "9", "T:INBOX")
+        cq._trigger_journal_add("2", "b@x.tw", "9", "T:INBOX")
         import cmuh_common.atomic_io as aio
         monkeypatch.setattr(aio, "safe_load_json_ex",
                             lambda *a, **k: ({}, "error"))
-        cq._trigger_journal_done("1")
+        cq._trigger_journal_done("T:INBOX|9|1")
         monkeypatch.undo()
         monkeypatch.setattr(paths, "get_settings_dir", lambda: str(tmp_path))
-        assert set(cq._trigger_journal_pending()[0]) == {"1", "2"}
+        assert set(cq._trigger_journal_pending()[0]) == {"T:INBOX|9|1", "T:INBOX|9|2"}
 
 
 class TestARequeuedJobKeepsItsUid:
@@ -553,10 +557,14 @@ class TestAJournalFailureAlsoUndoesTheDedupReservation:
         monkeypatch.setattr(paths, "get_settings_dir", lambda: str(tmp_path))
         monkeypatch.setattr(cq, "_persist_trigger_dedup_locked", lambda: None)
         assert cq._trigger_is_duplicate("doc@x.tw") is False   # 建立預約
-        monkeypatch.setattr(cq, "_trigger_journal_add", lambda uid, s: False)
+        monkeypatch.setattr(cq, "_trigger_journal_add",
+                            lambda uid, s, uv, ident: "")
         import cmuh_common.imap_reader as _ir
-        monkeypatch.setattr(_ir, "mark_uids_seen", lambda uids: True)
-        cq._handoff_email_triggers([("11", "doc@x.tw", True)], ["doc@x.tw"])
+        monkeypatch.setattr(_ir, "mailbox_identity", lambda: "T:INBOX")
+        monkeypatch.setattr(_ir, "mark_uids_seen",
+                            lambda uids, **kw: True)
+        cq._handoff_email_triggers([("11", "doc@x.tw", True)], ["doc@x.tw"],
+                                   uidvalidity="9", identity="T:INBOX")
         assert cq._trigger_is_duplicate("doc@x.tw") is False, (
             "★去重預約沒有撤銷★ 下一輪會把這封信當成『已處理過』而標成已讀,"
             "工作卻從來沒有執行")
@@ -568,11 +576,15 @@ class TestAJournalFailureAlsoUndoesTheDedupReservation:
         monkeypatch.setattr(paths, "get_settings_dir", lambda: str(tmp_path))
         monkeypatch.setattr(cq, "_persist_trigger_dedup_locked", lambda: None)
         cq._trigger_is_duplicate("doc2@x.tw")
-        monkeypatch.setattr(cq, "_trigger_journal_add", lambda uid, s: True)
+        monkeypatch.setattr(cq, "_trigger_journal_add",
+                            lambda uid, s, uv, ident: f"{ident}|{uv}|{uid}")
         import cmuh_common.imap_reader as _ir
-        monkeypatch.setattr(_ir, "mark_uids_seen", lambda uids: True)
+        monkeypatch.setattr(_ir, "mailbox_identity", lambda: "T:INBOX")
+        monkeypatch.setattr(_ir, "mark_uids_seen",
+                            lambda uids, **kw: True)
         monkeypatch.setattr(cq, "trigger_job_async", lambda *a, **k: None)
-        cq._handoff_email_triggers([("12", "doc2@x.tw", True)], ["doc2@x.tw"])
+        cq._handoff_email_triggers([("12", "doc2@x.tw", True)], ["doc2@x.tw"],
+                                   uidvalidity="9", identity="T:INBOX")
         assert cq._trigger_is_duplicate("doc2@x.tw") is True
 
 
@@ -607,15 +619,19 @@ class TestAnEarlierForgedMailCannotBlockALaterGenuineOne:
         import cmuh_common.paths as paths
         monkeypatch.setattr(paths, "get_settings_dir", lambda: str(tmp_path))
         got = []
-        monkeypatch.setattr(cq, "_trigger_journal_add", lambda uid, s: True)
+        monkeypatch.setattr(cq, "_trigger_journal_add",
+                            lambda uid, s, uv, ident: f"{ident}|{uv}|{uid}")
         import cmuh_common.imap_reader as _ir
-        monkeypatch.setattr(_ir, "mark_uids_seen", lambda uids: True)
+        monkeypatch.setattr(_ir, "mailbox_identity", lambda: "T:INBOX")
+        monkeypatch.setattr(_ir, "mark_uids_seen",
+                            lambda uids, **kw: True)
         monkeypatch.setattr(cq, "trigger_job_async",
                             lambda *a, **k: got.append(k.get("trigger_uids")))
         cq._handoff_email_triggers(
             [("bad", "doc@x.tw", False), ("good", "doc@x.tw", True)],
-            ["doc@x.tw"])
-        assert got == [("good",)], f"★偽造那封也被拿去觸發了★:{got}"
+            ["doc@x.tw"], uidvalidity="9", identity="T:INBOX")
+        assert got == [("T:INBOX|9|good",)], (
+            f"★偽造那封也被拿去觸發了★:{got}")
 
 
 class TestAnUnparseableSenderIsAlsoAcknowledged:
@@ -668,12 +684,15 @@ class TestOptOutStillGetsTheDurableHandoff:
         monkeypatch.setattr(paths, "get_settings_dir", lambda: str(tmp_path))
         added, seen = [], []
         monkeypatch.setattr(cq, "_trigger_journal_add",
-                            lambda uid, s: added.append(uid) or True)
+                            lambda uid, s, uv, ident:
+                            (added.append(uid) or f"{ident}|{uv}|{uid}"))
         import cmuh_common.imap_reader as _ir
-        monkeypatch.setattr(_ir, "mark_uids_seen", lambda uids: seen.append(uids))
+        monkeypatch.setattr(_ir, "mailbox_identity", lambda: "T:INBOX")
+        monkeypatch.setattr(_ir, "mark_uids_seen",
+                            lambda uids, **kw: seen.append(uids))
         monkeypatch.setattr(cq, "trigger_job_async", lambda *a, **k: None)
         cq._handoff_email_triggers([("5", "doc@x.tw", False)], ["doc@x.tw"],
-                                   require_auth=False)
+                                   require_auth=False, uidvalidity="9", identity="T:INBOX")
         assert added == ["5"], (
             "★關掉 strict 時,被接受的信沒有走持久化接手★ 中止就永久消失")
 
@@ -684,12 +703,15 @@ class TestOptOutStillGetsTheDurableHandoff:
         monkeypatch.setattr(paths, "get_settings_dir", lambda: str(tmp_path))
         added = []
         monkeypatch.setattr(cq, "_trigger_journal_add",
-                            lambda uid, s: added.append(uid) or True)
+                            lambda uid, s, uv, ident:
+                            (added.append(uid) or f"{ident}|{uv}|{uid}"))
         import cmuh_common.imap_reader as _ir
-        monkeypatch.setattr(_ir, "mark_uids_seen", lambda uids: True)
+        monkeypatch.setattr(_ir, "mailbox_identity", lambda: "T:INBOX")
+        monkeypatch.setattr(_ir, "mark_uids_seen",
+                            lambda uids, **kw: True)
         monkeypatch.setattr(cq, "trigger_job_async", lambda *a, **k: None)
         cq._handoff_email_triggers([("5", "doc@x.tw", False)], ["doc@x.tw"],
-                                   require_auth=True)
+                                   require_auth=True, uidvalidity="9", identity="T:INBOX")
         assert added == []
 
 
@@ -704,13 +726,16 @@ class TestPartialJournalFailureKeepsTheDedup:
         monkeypatch.setattr(cq, "_persist_trigger_dedup_locked", lambda: None)
         cq._trigger_is_duplicate("doc3@x.tw")          # 建立預約
         monkeypatch.setattr(cq, "_trigger_journal_add",
-                            lambda uid, s: uid == "ok")
+                            lambda uid, s, uv, ident:
+                            (f"{ident}|{uv}|{uid}" if uid == "ok" else ""))
         import cmuh_common.imap_reader as _ir
-        monkeypatch.setattr(_ir, "mark_uids_seen", lambda uids: True)
+        monkeypatch.setattr(_ir, "mailbox_identity", lambda: "T:INBOX")
+        monkeypatch.setattr(_ir, "mark_uids_seen",
+                            lambda uids, **kw: True)
         monkeypatch.setattr(cq, "trigger_job_async", lambda *a, **k: None)
         cq._handoff_email_triggers(
             [("ok", "doc3@x.tw", True), ("bad", "doc3@x.tw", True)],
-            ["doc3@x.tw"])
+            ["doc3@x.tw"], uidvalidity="9", identity="T:INBOX")
         assert cq._trigger_is_duplicate("doc3@x.tw") is True, (
             "★有一封落地了卻撤銷了去重★ 下一輪會為同一位再開一個工作")
 

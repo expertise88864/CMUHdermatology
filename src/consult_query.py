@@ -7107,7 +7107,9 @@ def _alert_trigger_rejected(senders: list) -> None:
 
 
 def _handoff_email_triggers(matched_uids, senders,
-                            require_auth: bool = True) -> None:
+                            require_auth: bool = True,
+                            uidvalidity: str = "",
+                            identity: str = "") -> None:
     """先落地、再標已讀、最後觸發 —— 順序就是這個修正的全部內容。
 
     ★[2026-08-08 外審 F3]★ 舊流程是「標已讀 → 回到排程器 → 起 worker」,
@@ -7116,6 +7118,19 @@ def _handoff_email_triggers(matched_uids, senders,
     寧可多觸發一次也不要漏掉一次會診請求。
     """
     want = {str(x).strip().lower() for x in (senders or [])}
+    # ★世代/身分取不到 → 整批不接手★(外審 2026-08-12 P1-06)
+    #   journal 鍵要靠它們才穩定。不接手=不落地、不標已讀,信留在 UNSEEN,
+    #   下一輪重掃(去重窗要撤銷,否則五分鐘後那封信會被去重的終局處置
+    #   標掉 —— 工作沒做、信卻消失,見下面 _failed_addrs 的說明)。
+    # ★身分由掃描結果帶進來★(外審 AD-4 第 1 輪 P1-3):在這裡另外載
+    #   憑證算的話,掃描與此刻之間換了帳號,A 的 UID 會掛在 B 的身分下。
+    _ident = str(identity or "")
+    if not uidvalidity or not _ident:
+        logging.error("[trigger] 取不到 UIDVALIDITY/帳號身分 → 本輪不接手"
+                      "email 觸發(信留未讀,下一輪重來)")
+        for addr in sorted(want):
+            _undo_trigger_dedup(addr)
+        return
     todo = []
     for _row in (matched_uids or []):
         _uid, _addr = str(_row[0]), str(_row[1] or "").strip().lower()
@@ -7138,8 +7153,9 @@ def _handoff_email_triggers(matched_uids, senders,
     landed = []
     _failed_addrs: set = set()
     for uid, addr in todo:
-        if _trigger_journal_add(uid, addr):
-            landed.append((uid, addr))
+        _jkey = _trigger_journal_add(uid, addr, uidvalidity, _ident)
+        if _jkey:
+            landed.append((uid, addr, _jkey))
         else:
             _failed_addrs.add(addr)
             # ★[外審] 去重預約也要一起撤銷★
@@ -7154,20 +7170,24 @@ def _handoff_email_triggers(matched_uids, senders,
     #   同一位可能有兩封:一封落地了、工作正在跑,另一封沒落地。
     #   這時撤銷去重,那封沒落地的下一輪就會再開一個工作 —— 同一位醫師
     #   同時被服務兩次,正是去重要防的事。
-    _landed_addrs = {a for _u, a in landed}
+    _landed_addrs = {a for _u, a, _k in landed}
     for _a in sorted(_failed_addrs - _landed_addrs):
         _undo_trigger_dedup(_a)
     if not landed:
         return
     try:
         from cmuh_common.imap_reader import mark_uids_seen  # noqa: PLC0415
-        mark_uids_seen([u for u, _ in landed])
+        # ★帶著掃描時的 UIDVALIDITY★:標已讀是一條新連線,世代變了
+        #   同一個 uid 可能已指向別封信(imap_reader 那邊會拒標)。
+        mark_uids_seen([u for u, _a, _k in landed],
+                       expect_uidvalidity=uidvalidity,
+                       expect_identity=_ident)
     except Exception:
         # 標不掉只是會重複命中,而重複命中有 dedup 擋著;工作已經落地了。
         logging.warning("[trigger] 標已讀失敗(工作已落地,不影響)", exc_info=True)
-    for uid, addr in landed:
+    for _uid, addr, jkey in landed:
         trigger_job_async("email", override_recipients=[addr],
-                          trigger_uids=(uid,))
+                          trigger_uids=(jkey,))
 
 
 # ═══════════ 觸發信的持久化接手(外審第 11 輪 F3)═══════════
@@ -7217,20 +7237,32 @@ def _trigger_journal_save(data: dict) -> bool:
         return False
 
 
-def _trigger_journal_add(uid: str, sender: str) -> bool:
-    """登記一筆待處理的觸發。回傳是否【確定落地】。
+def _trigger_journal_add(uid: str, sender: str, uidvalidity: str,
+                         identity: str) -> str:
+    """登記一筆待處理的觸發。回傳【確定落地】的 journal 鍵;失敗回空字串。
+
+    ★鍵是世代化的★(外審 2026-08-12 P1-06):`帳號指紋|UIDVALIDITY|uid`。
+    只用 uid 的話,信箱重建(UIDVALIDITY 改變)或換 IMAP 帳號後,新的一封信
+    可能拿到同一個 uid —— add 蓋掉舊待辦、done 結掉錯的世代、開機補跑
+    分不出哪一封。世代/身分取不到 → 不落地(呼叫端 fail-closed,信留未讀)。
 
     讀不到既有內容時一律失敗 —— 寫回去會把別的待辦蓋掉,而那些待辦對應的信
-    已經標成已讀、再也掃不到了。回 False 讓這封新的信留在 UNSEEN,下一輪重來。
+    已經標成已讀、再也掃不到了。回空讓這封新的信留在 UNSEEN,下一輪重來。
     """
+    if not uidvalidity or not identity:
+        logging.error("[trigger] 取不到 UIDVALIDITY/帳號身分 → 不落地"
+                      "(鍵會不穩定);信留在未讀,下一輪重來")
+        return ""
+    key = f"{identity}|{uidvalidity}|{uid}"
     with _trigger_journal_lock:
         data, ok = _trigger_journal_load()
         if not ok:
             logging.error("[trigger] 讀不到 journal → 不寫入(避免蓋掉既有待辦),"
                           "這封信留在未讀,下一輪再處理")
-            return False
-        data[str(uid)] = {"sender": str(sender or ""), "at": time.time()}
-        return _trigger_journal_save(data)
+            return ""
+        data[key] = {"sender": str(sender or ""), "at": time.time(),
+                     "uid": str(uid), "uidvalidity": str(uidvalidity)}
+        return key if _trigger_journal_save(data) else ""
 
 
 def _trigger_journal_done(uid: str) -> None:
@@ -7316,7 +7348,21 @@ def resume_pending_triggers() -> int:
         return 0
     for uid, rec in list(pending.items()):
         sender = str((rec or {}).get("sender") or "")
-        age = now - float((rec or {}).get("at") or 0)
+        # ★[外審 2026-08-12 P2-04] 一筆壞資料不可以讓整輪補跑中止★
+        #   `float("bad")` 直接拋的話,後面所有正常的待辦都補不了。
+        #   看不懂=很舊(會走過時結案+告警),不是當成很新。
+        try:
+            _at = float((rec or {}).get("at") or 0)
+        except (TypeError, ValueError, OverflowError):
+            # ★OverflowError 也要接★(外審 AD-4 第 1 輪 P2-4):JSON 裡的
+            #   巨大整數 float() 時拋的是它,不是 ValueError。
+            logging.warning("[trigger] %s 的時間戳看不懂 → 當成過時", uid)
+            _at = 0.0
+        # NaN 的比較永遠 False、Infinity/未來時間會被當成「很新」——
+        # 一律收成「很舊」,走過時結案+告警的既有出口。
+        if not 0 < _at <= now:
+            _at = 0.0
+        age = now - _at
         if age > _TRIGGER_JOURNAL_MAX_AGE_SEC:
             logging.error("[trigger] 待補觸發已過時(%.1f 小時)→ 不補跑:%s",
                           age / 3600.0, sender or "(無寄件人)")
@@ -7577,6 +7623,33 @@ def _remote_receipt_path() -> str:
     return os.path.join(get_settings_dir(), _REMOTE_RECEIPT_FILE)
 
 
+def _ambiguous_legacy_receipt(data: dict, key: str):
+    """新鍵查不到時,找同 `{uv}:{uid}` 的【未標身分】舊收據。→ rec 或 None。
+
+    ★[外審 AD-4 第 2 輪 P1] 舊收據不可以改綁到「目前」帳號★
+    舊版收據沒記帳號;收據檔與憑證共用 settings 目錄,換帳號不會清收據 ——
+    盲目綁到掃描當下的帳號,A 的收據會變成 B 的:B 的一封合法新指令
+    剛好撞上同一個 `{uv}:{uid}` 時,會被當成執行過而永遠不跑、
+    done=True 還會壓掉它的過期通知。
+    ★沒有證據就不認領,當成【曖昧】fail-closed★:比對到就不執行、
+    不回信、不標已讀 —— 等它走既有的 24 小時 TTL 被剪掉(claim 的剪枝
+    與 `_remote_receipt_is_fresh` 蓋得到它,抑制自帶出口)。
+    同帳號(絕大多數情況):剛執行過的指令一樣被擋住,P1-1 的目的達成;
+    真的換了帳號:代價只是那把撞號的鍵最多 24 小時不執行(有告警 log)。
+    """
+    if "|" not in key:
+        return None
+    bare = key.split("|", 1)[1]
+    rec = data.get(bare)
+    if rec is not None and _remote_receipt_is_fresh(rec, _now_receipt()):
+        return rec
+    return None
+
+
+def _now_receipt() -> float:
+    return time.time()
+
+
 def _remote_command_was_done(key: str) -> bool:
     """這封指令【本機】確實執行完了嗎（純查詢，不寫入）。
 
@@ -7597,7 +7670,10 @@ def _remote_command_was_done(key: str) -> bool:
     if status not in ("ok", "missing") or not isinstance(data, dict):
         return False
     rec = data.get(key)
-    return isinstance(rec, dict) and bool(rec.get("done"))
+    if isinstance(rec, dict) and bool(rec.get("done")):
+        return True
+    legacy = _ambiguous_legacy_receipt(data, key)
+    return isinstance(legacy, dict) and bool(legacy.get("done"))
 
 
 def _mark_remote_command_done(key: str) -> None:
@@ -7651,6 +7727,10 @@ def _claim_remote_command(key: str, now=None) -> bool:
                             "本封不執行(不知道做過沒有)", status)
             return False
         if key in data:
+            return False
+        if _ambiguous_legacy_receipt(data, key) is not None:
+            logging.warning("[遠端] ★發現未標身分的舊收據(過渡期)→ 本封不執行★"
+                            "(不改綁、不猜帳號;它最多 24 小時後過期)")
             return False
         kept = {k: v for k, v in data.items()
                 if _remote_receipt_is_fresh(v, now)}
@@ -7878,7 +7958,9 @@ def _run_imap_commands_with_timeout(timeout: float = 30.0) -> dict:
 _last_imap_ack_thread = None
 
 
-def _ack_command_mail(uids, why: str, timeout: float = 30.0) -> bool:
+def _ack_command_mail(uids, why: str, timeout: float = 30.0,
+                      expect_uidvalidity: str = "",
+                      expect_identity: str = "") -> bool:
     """★終局處置要標已讀★（外審 SI 第 1 輪 P2-5）→ 有沒有標成功。
 
     不標的話那封信永遠停在 UNSEEN —— 每一輪（20 秒）都要為它 FETCH header
@@ -7911,7 +7993,9 @@ def _ack_command_mail(uids, why: str, timeout: float = 30.0) -> bool:
 
     def _worker():
         try:
-            box["ok"] = bool(mark_uids_seen(ids))
+            box["ok"] = bool(mark_uids_seen(
+                ids, expect_uidvalidity=expect_uidvalidity,
+                expect_identity=expect_identity))
         except Exception:
             box["ok"] = False
             logging.warning("[遠端] 標記指令信已讀時例外", exc_info=True)
@@ -7953,7 +8037,14 @@ def _poll_remote_commands(cfg: dict, scan: dict) -> None:
     if r.get("error"):
         logging.warning("[遠端] 掃描指令信失敗:%s", r["error"])
         return
-    uv = str(r.get("uidvalidity") or "")
+    raw_uv = str(r.get("uidvalidity") or "")
+    # ★收據鍵要含帳號身分★(外審 2026-08-12 P2-07):換 IMAP 帳號後,
+    #   相同的 UIDVALIDITY+UID 可能撞號 —— 舊收據會把新指令認成執行過的。
+    #   ★身分用【掃描那條連線】自己算好帶回來的★(外審 AD-4 第 1 輪
+    #   P1-3):事後另外載入憑證的話,掃描與此刻之間換了帳號,A 的 UID 會
+    #   被掛在 B 的身分下。取不到身分與取不到 UIDVALIDITY 同一個處置。
+    _rident = str(r.get("mailbox_identity") or "")
+    uv = f"{_rident}|{raw_uv}" if (_rident and raw_uv) else ""
     # ★[外審 SJ 第 1 輪 P2-3] 取不到 UIDVALIDITY 就不執行★
     #   收據的鍵會變成 ":<uid>";下一輪拿到真的 UIDVALIDITY 之後鍵就
     #   不一樣了,同一封未讀信會【再執行一次】。信箱重建時,那個空鍵
@@ -8017,7 +8108,17 @@ def _poll_remote_commands(cfg: dict, scan: dict) -> None:
     if terminal:
         # ★一次標掉★:終局處置那一批合併成一次 STORE(一封一條連線的話,
         #   一次掃描最多 50 封 → 50 條序列 TLS 連線跑在 scheduler 緒上)。
-        terminal_acked = _ack_command_mail(terminal, "終局處置")
+        if raw_uv and _rident:
+            terminal_acked = _ack_command_mail(
+                terminal, "終局處置",
+                expect_uidvalidity=raw_uv, expect_identity=_rident)
+        else:
+            # ★[外審 AD-4 第 1 輪 P1-2] 取不到世代/身分就【不標】★
+            #   世代變了,同一個 uid 可能指向另一封不相干的信 ——
+            #   STORE 會把它永久跳過。下輪重掃(有界的噪音,誠實)。
+            terminal_acked = False
+            logging.error("[遠端] 取不到 UIDVALIDITY/身分 → 終局處置不標已讀"
+                          "(下輪重掃;也不回過期信)")
     # ★標不掉就不要回信★(外審 SI-2 第 2 輪 P1)
     #   標不掉代表那封信還是 UNSEEN —— 下一輪、以及【每一台】機器
     #   都會再回一封,直到把寄信配額耗光,而且會把真正的通知洗掉。
@@ -9053,7 +9154,13 @@ def scheduler_loop() -> None:
                                 _handoff_email_triggers(
                                     r.get("matched_uids") or [], dedup_proceed,
                                     require_auth=bool(cfg.get(
-                                        "require_authenticated_trigger", True)))
+                                        "require_authenticated_trigger", True)),
+                                    # ★journal 鍵的世代來源★(外審 2026-08-12
+                                    #   P1-06):掃描當下的 UIDVALIDITY。
+                                    uidvalidity=str(
+                                        r.get("uidvalidity") or ""),
+                                    identity=str(
+                                        r.get("mailbox_identity") or ""))
                         elif not blocked:
                             # 比對到主旨但完全沒抓到 From → fallback 用設定的 recipients
                             # [opt A1] 此 fallback 分支原本沒去重：若觸發信 From 解析不出
@@ -9091,7 +9198,21 @@ def scheduler_loop() -> None:
                                 from cmuh_common.imap_reader import (  # noqa: PLC0415
                                     mark_uids_seen,
                                 )
-                                mark_uids_seen(_final_uids)
+                                _fuv = str(r.get("uidvalidity") or "")
+                                _fid = str(r.get("mailbox_identity") or "")
+                                if _fuv and _fid:
+                                    mark_uids_seen(
+                                        _final_uids,
+                                        expect_uidvalidity=_fuv,
+                                        expect_identity=_fid)
+                                else:
+                                    # ★缺世代/身分就不標★(外審 AD-4 第 1
+                                    #   輪 P1-2):世代變了,同 uid 可能是
+                                    #   另一封不相干的信。下輪重掃,
+                                    #   去重窗擋重複。
+                                    logging.warning(
+                                        "[trigger] 取不到世代/身分 → 終局處置"
+                                        "不標已讀(下輪重掃)")
                             except Exception:
                                 logging.warning(
                                     "[trigger] 標記終局處置信失敗(會重複掃到)",

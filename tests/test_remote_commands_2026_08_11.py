@@ -151,14 +151,14 @@ class TestAuthorizationIsFailClosed:
         ran, marked = [], []
         monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-1")
         monkeypatch.setattr(ir, "mark_uids_seen",
-                            lambda uids: marked.append(list(uids)) or True)
+                            lambda uids, **kw: marked.append(list(uids)) or True)
         monkeypatch.setattr(cq, "_claim_remote_command", lambda key: True)
         monkeypatch.setattr(cq, "_run_remote_command",
                             lambda action, sender: ran.append(action))
         monkeypatch.setattr(cq, "_alert_trigger_rejected", lambda s: None)
         cq._poll_remote_commands({"allowed_trigger_senders": list(allow)},
                                  {"items": [item], "error": None,
-                                  "uidvalidity": "9"})
+                                  "uidvalidity": "9", "mailbox_identity": "T:INBOX"})
         return ran, marked
 
     @staticmethod
@@ -226,7 +226,7 @@ class TestClaimFirstThenExecute:
         ran = []
         monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-1")
         monkeypatch.setattr(cq, "_claim_remote_command", lambda key: claim_ok)
-        monkeypatch.setattr(ir, "mark_uids_seen", lambda uids: True)
+        monkeypatch.setattr(ir, "mark_uids_seen", lambda uids, **kw: True)
         monkeypatch.setattr(cq, "_run_remote_command",
                             lambda a, s: ran.append(a))
         cq._poll_remote_commands(
@@ -235,7 +235,7 @@ class TestClaimFirstThenExecute:
                         "authenticated": True, "expired": False,
                         "subject": "皮膚科會診重開 PC-1",
                         "age_sec": 1.0}], "error": None,
-             "uidvalidity": "9"})
+             "uidvalidity": "9", "mailbox_identity": "T:INBOX"})
         return ran
 
     def test_a_command_whose_receipt_cannot_be_written_is_not_executed(
@@ -428,14 +428,18 @@ class TestTerminalDispositionsAreAcknowledged:
         acked = []
         monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-1")
         monkeypatch.setattr(ir, "check_commands",
-                            lambda *a, **k: {"items": [item], "error": None})
+                            lambda *a, **k: {"items": [item], "error": None,
+                                  "uidvalidity": "9",
+                                  "mailbox_identity": "T:INBOX"})
         monkeypatch.setattr(ir, "mark_uids_seen",
-                            lambda uids: acked.append(list(uids)) or True)
+                            lambda uids, **kw: acked.append(list(uids)) or True)
         monkeypatch.setattr(cq, "_run_remote_command",
                             lambda a, s: pytest.fail("不該執行"))
         monkeypatch.setattr(cq, "_alert_trigger_rejected", lambda s: None)
         cq._poll_remote_commands({"allowed_trigger_senders": ["doc@x.tw"]},
-                                 {"items": [item], "error": None})
+                                 {"items": [item], "error": None,
+                                  "uidvalidity": "9",
+                                  "mailbox_identity": "T:INBOX"})
         return acked
 
     def test_a_malformed_command_is_acknowledged(self, monkeypatch):
@@ -460,7 +464,7 @@ class TestTerminalDispositionsAreAcknowledged:
         """
         replies = []
         monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-1")
-        monkeypatch.setattr(ir, "mark_uids_seen", lambda uids: True)
+        monkeypatch.setattr(ir, "mark_uids_seen", lambda uids, **kw: True)
         monkeypatch.setattr(cq, "_run_remote_command",
                             lambda a, s: pytest.fail("過期的不該執行"))
         monkeypatch.setattr(cq, "_reply_remote_command",
@@ -470,7 +474,8 @@ class TestTerminalDispositionsAreAcknowledged:
             {"items": [{"uid": "7", "sender": "doc@x.tw",
                         "authenticated": True, "expired": True,
                         "subject": "皮膚科會診重開",
-                        "age_sec": 99999.0}], "error": None})
+                        "age_sec": 99999.0}], "error": None,
+             "uidvalidity": "9", "mailbox_identity": "T:INBOX"})
         assert replies, "★過期＝沒有任何機器接手,卻沒有告訴使用者★"
         assert "沒有指定" in replies[0], "要說出這封信是「不指定機器」那一種"
         assert "沒有任何一台在跑會診查詢" in replies[0]
@@ -479,7 +484,7 @@ class TestTerminalDispositionsAreAcknowledged:
                                                               monkeypatch):
         """不對偽造／未授權的位址回信（那會變成一個回信放大器）。"""
         monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-1")
-        monkeypatch.setattr(ir, "mark_uids_seen", lambda uids: True)
+        monkeypatch.setattr(ir, "mark_uids_seen", lambda uids, **kw: True)
         monkeypatch.setattr(cq, "_run_remote_command",
                             lambda a, s: pytest.fail("不該執行"))
         monkeypatch.setattr(cq, "_reply_remote_command",
@@ -489,7 +494,8 @@ class TestTerminalDispositionsAreAcknowledged:
             {"items": [{"uid": "7", "sender": "evil@x.tw",
                         "authenticated": False, "expired": True,
                         "subject": "皮膚科會診重開 PC-1",
-                        "age_sec": 99999.0}], "error": None})
+                        "age_sec": 99999.0}], "error": None,
+             "uidvalidity": "9", "mailbox_identity": "T:INBOX"})
 
     def test_a_command_for_another_machine_is_left_unread(self, monkeypatch):
         """★這一種不可以結案★ —— 那台機器還沒收到。
@@ -674,7 +680,9 @@ class TestRejectionIsGloballyDeterministic:
         monkeypatch.setattr(cq, "_alert_trigger_rejected", lambda s: None)
         monkeypatch.setattr(cq, "_reply_remote_command", lambda *a, **k: None)
         cq._poll_remote_commands({"allowed_trigger_senders": ["doc@x.tw"]},
-                                 {"items": items, "error": None})
+                                 {"items": items, "error": None,
+                                  "uidvalidity": "9",
+                                  "mailbox_identity": "T:INBOX"})
         return acked, ran
 
     def test_an_unauthenticated_off_target_command_is_finalized(
@@ -726,7 +734,8 @@ class TestAFailedAckSuppressesTheReply:
                         "authenticated": True, "expired": True,
                         "age_sec": 99999.0,
                         "subject": "皮膚科會診重開 PC-1"}],
-             "error": None})
+             "error": None, "uidvalidity": "9",
+             "mailbox_identity": "T:INBOX"})
         return replies
 
     def test_a_successful_ack_still_replies(self, monkeypatch):
@@ -756,7 +765,9 @@ class TestAcknowledgementIsBatchedAndBounded:
                   "expired": False, "age_sec": 1.0,
                   "subject": "皮膚科會診重開 PC-1"} for i in range(20)]
         cq._poll_remote_commands({"allowed_trigger_senders": ["doc@x.tw"]},
-                                 {"items": items, "error": None})
+                                 {"items": items, "error": None,
+                                  "uidvalidity": "9",
+                                  "mailbox_identity": "T:INBOX"})
         assert len(calls) == 1, f"開了 {len(calls)} 次連線(應該合併成一次)"
         assert len(calls[0]) == 20
 
@@ -764,6 +775,8 @@ class TestAcknowledgementIsBatchedAndBounded:
         """★claim-before-execute 不可以批次★:一封寫失敗會讓另一封被誤判成
         已記錄 —— 那封就會在下一輪再執行一次。"""
         keys, ran = [], []
+        import cmuh_common.imap_reader as _ir
+        monkeypatch.setattr(_ir, "mailbox_identity", lambda: "T:INBOX")
         monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-1")
         monkeypatch.setattr(cq, "_claim_remote_command",
                             lambda key: keys.append(key) or True)
@@ -777,9 +790,9 @@ class TestAcknowledgementIsBatchedAndBounded:
                   "subject": "皮膚科打卡重啟 PC-1"} for i in range(3)]
         cq._poll_remote_commands({"allowed_trigger_senders": ["doc@x.tw"]},
                                  {"items": items, "error": None,
-                                  "uidvalidity": "9"})
+                                  "uidvalidity": "9", "mailbox_identity": "T:INBOX"})
         assert len(ran) == 3
-        assert keys == ["9:0", "9:1", "9:2"], keys
+        assert keys == ["T:INBOX|9:0", "T:INBOX|9:1", "T:INBOX|9:2"], keys
 
     def test_the_ack_itself_is_bounded_and_force_closes(self):
         code = _fn_body_code(SRC, "_ack_command_mail")
@@ -795,7 +808,7 @@ class TestAcknowledgementIsBatchedAndBounded:
         calls = []
         monkeypatch.setattr(
             ir, "mark_uids_seen",
-            lambda uids: calls.append(list(uids)) or block.wait(20) or True)
+            lambda uids, **kw: calls.append(list(uids)) or block.wait(20) or True)
         old = cq._last_imap_ack_thread
         cq._last_imap_ack_thread = None
         try:
@@ -924,6 +937,8 @@ class TestNoTargetMeansEveryConsultMachine:
         會去收這個信箱的就是會診查詢那支程式，沒在跑的看不到那封信。
         """
         ran, claimed = [], []
+        import cmuh_common.imap_reader as _ir
+        monkeypatch.setattr(_ir, "mailbox_identity", lambda: "T:INBOX")
         monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-1")
         monkeypatch.setattr(cq, "_claim_remote_command",
                             lambda key: claimed.append(key) or True)
@@ -935,9 +950,9 @@ class TestNoTargetMeansEveryConsultMachine:
             {"items": [{"uid": "7", "sender": "doc@x.tw",
                         "authenticated": True, "expired": False,
                         "subject": "皮膚科會診重開", "age_sec": 1.0}],
-             "error": None, "uidvalidity": "9"})
+             "error": None, "uidvalidity": "9", "mailbox_identity": "T:INBOX"})
         assert ran == ["reboot"]
-        assert claimed == ["9:7"]
+        assert claimed == ["T:INBOX|9:7"]
 
     def test_it_is_not_marked_seen_so_other_machines_still_see_it(
             self, monkeypatch):
@@ -954,7 +969,7 @@ class TestNoTargetMeansEveryConsultMachine:
             {"items": [{"uid": "7", "sender": "doc@x.tw",
                         "authenticated": True, "expired": False,
                         "subject": "皮膚科會診重開", "age_sec": 1.0}],
-             "error": None, "uidvalidity": "9"})
+             "error": None, "uidvalidity": "9", "mailbox_identity": "T:INBOX"})
         assert marked == []
 
 
@@ -984,11 +999,13 @@ class TestAnExecutedCommandDoesNotLaterClaimNobodyRanIt:
             {"items": [{"uid": "7", "sender": "doc@x.tw",
                         "authenticated": True, "expired": True,
                         "subject": "皮膚科會診重開", "age_sec": 99999.0}],
-             "error": None, "uidvalidity": "9"})
+             "error": None, "uidvalidity": "9", "mailbox_identity": "T:INBOX"})
 
     @staticmethod
     def _run_it(monkeypatch, *, crash=False):
         """跑完一次正常的執行路徑（或在執行途中掛掉）。"""
+        import cmuh_common.imap_reader as _ir
+        monkeypatch.setattr(_ir, "mailbox_identity", lambda: "T:INBOX")
         monkeypatch.setattr(cq, "_this_machine_name", lambda: "PC-1")
         monkeypatch.setattr(cq, "_ack_command_mail", lambda uids, why, **k: True)
 
@@ -1000,7 +1017,7 @@ class TestAnExecutedCommandDoesNotLaterClaimNobodyRanIt:
         scan = {"items": [{"uid": "7", "sender": "doc@x.tw",
                            "authenticated": True, "expired": False,
                            "subject": "皮膚科會診重開", "age_sec": 1.0}],
-                "error": None, "uidvalidity": "9"}
+                "error": None, "uidvalidity": "9", "mailbox_identity": "T:INBOX"}
         cfg = {"allowed_trigger_senders": ["doc@x.tw"]}
         if crash:
             with pytest.raises(RuntimeError):
@@ -1045,7 +1062,7 @@ class TestAnExecutedCommandDoesNotLaterClaimNobodyRanIt:
 
     def test_a_crash_midway_still_lets_the_user_know(self, monkeypatch):
         self._run_it(monkeypatch, crash=True)
-        assert cq._claim_remote_command("9:7") is False, (
+        assert cq._claim_remote_command("T:INBOX|9:7") is False, (
             "claim 還在 → 不會重複執行")
         replies = []
         self._expire(monkeypatch, replies)
@@ -1080,7 +1097,7 @@ class TestTheExpiryReplyOnlySpeaksForThisMachine:
             {"items": [{"uid": "7", "sender": "doc@x.tw",
                         "authenticated": True, "expired": True,
                         "subject": "皮膚科會診重開 PC-1", "age_sec": 99999.0}],
-             "error": None, "uidvalidity": "9"})
+             "error": None, "uidvalidity": "9", "mailbox_identity": "T:INBOX"})
         assert len(sent) == 1
         return sent[0]
 

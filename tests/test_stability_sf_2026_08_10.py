@@ -680,7 +680,7 @@ class TestAnUnreadableJournalIsNotAnEmptyOne:
         """反面:正常情況照樣補跑（守衛不可以把功能一起關掉）。"""
         import cmuh_common.paths as paths
         monkeypatch.setattr(paths, "get_settings_dir", lambda: str(tmp_path))
-        cq._trigger_journal_add("42", "doc@x.tw")
+        cq._trigger_journal_add("42", "doc@x.tw", "9", "T:INBOX")
         fired = []
         monkeypatch.setattr(cq, "trigger_job_async",
                             lambda *a, **k: fired.append(k))

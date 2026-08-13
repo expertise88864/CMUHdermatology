@@ -342,7 +342,45 @@ def _from_is_authenticated(auth_results: str, from_addr: str) -> bool:
     return False
 
 
-def mark_uids_seen(uids) -> bool:
+def mailbox_identity() -> str:
+    """帳號+信箱的指紋 —— journal/收據的鍵要用它當命名空間。
+
+    ★[外審 2026-08-12 P1-06/P2-07]★ UID 只在【同一個帳號、同一個 mailbox、
+    同一個 UIDVALIDITY 世代】裡才有意義:換 IMAP 帳號後,相同的
+    UIDVALIDITY+UID 可能剛好撞號 —— 舊收據會把新指令/新觸發認成處理過的。
+    取不到帳號 → 空字串(呼叫端一律 fail-closed:不執行、不落地)。
+    指紋用雜湊:鍵會進磁碟上的 journal,不要把帳號明文散出去。
+    """
+    return _identity_from_settings(_load_imap_settings())
+
+
+def _identity_from_settings(s) -> str:
+    """★身分要跟連線用同一份設定算★(外審 AD-4 第 1 輪 P1-3)
+
+    掃描之後另外重載憑證的話,兩次載入之間換了帳號,A 連線掃到的 UID 會
+    被掛在 B 的身分下 —— 身分與 UID 世代必須描述【同一個】掃描情境。
+    掃描函式用自己那份 `s` 呼叫這裡,並把結果放進回傳值。
+    """
+    import hashlib
+    user = str((s or {}).get("username") or "").strip().lower()
+    if not user:
+        return ""
+    return hashlib.sha256(user.encode("utf-8")).hexdigest()[:12] + ":INBOX"
+
+
+def read_uidvalidity(conn) -> str:
+    """SELECT 之後把 UIDVALIDITY 讀出來。讀不到 → 空字串(呼叫端 fail-closed)。"""
+    try:
+        uv = conn.response("UIDVALIDITY")[1]
+        if uv and uv[0]:
+            return (uv[0].decode() if isinstance(uv[0], bytes) else str(uv[0]))
+    except Exception:
+        logging.debug("[IMAP] 取 UIDVALIDITY 失敗(用空字串)", exc_info=True)
+    return ""
+
+
+def mark_uids_seen(uids, expect_uidvalidity: str = "",
+                   expect_identity: str = "") -> bool:
     """把這幾封信標成已讀(獨立連線)。回傳是否成功。
 
     ★[2026-08-08 外審]★ 與 `check_trigger` 分開,是為了讓呼叫端可以
@@ -355,6 +393,13 @@ def mark_uids_seen(uids) -> bool:
     s = _load_imap_settings()
     if not s["password"]:
         logging.warning("[IMAP] 未設定密碼,無法標已讀")
+        return False
+    # ★帳號也要對得上★(外審 AD-4 第 1 輪 P1-3):這裡又重載了一次設定 ——
+    #   掃描之後憑證被換掉的話,同一個 uid(甚至同一個 UIDVALIDITY)在
+    #   【另一個帳號】可能指向不相干的信。不符就不連線、不 STORE。
+    if expect_identity and _identity_from_settings(s) != expect_identity:
+        logging.error("[IMAP] ★帳號已改變 → 不標已讀★(掃描時=%s)",
+                      expect_identity)
         return False
     # ★[2026-08-08 外審第 2 回] 這條連線也要納入既有的 active/watchdog 機制★
     #   上一版直接在 scheduler thread 開一條新連線,而且用了本檔註解
@@ -369,6 +414,17 @@ def mark_uids_seen(uids) -> bool:
         _set_active(conn)
         conn.login(s["username"], s["password"])
         conn.select("INBOX")
+        # ★世代要對得上★(外審 2026-08-12 P1-06):這是一條【新的】連線,
+        #   掃描到現在之間信箱可能被重建過 —— UIDVALIDITY 變了,同一個 uid
+        #   已經指向【另一封信】,STORE 會把不相干的信標成已讀。
+        #   不符就不標(信留在未讀,下一輪重掃;去重靠 journal 的世代化鍵)。
+        if expect_uidvalidity:
+            cur_uv = read_uidvalidity(conn)
+            if cur_uv != expect_uidvalidity:
+                logging.error("[IMAP] ★UIDVALIDITY 已改變(%s→%s)→ 不標已讀★"
+                              "同一個 uid 可能已指向別封信", expect_uidvalidity,
+                              cur_uv)
+                return False
         # ★[外審 SI 第 1 輪 P1-2] 要看 `typ`★ IMAP 可以【正常返回】
         #   NO/BAD(配額、權限、mailbox 唯讀…)而不拋例外。本函式的契約是
         #   「回傳是否成功」,而呼叫端拿它做 fail-closed 判斷:無條件回 True
@@ -521,7 +577,8 @@ def check_commands(prefixes, timeout: float = 12.0,
     ★本函式【不改任何 flag】★：要不要標已讀由呼叫端決定（指令的取捨與查詢
     觸發相反，見 consult_query 的說明）。
     """
-    out: dict = {"items": [], "error": None, "uidvalidity": ""}
+    out: dict = {"items": [], "error": None, "uidvalidity": "",
+                 "mailbox_identity": ""}
     heads = [str(p) for p in (prefixes or []) if str(p)]
     if not heads:
         out["error"] = "沒有給任何指令短語"
@@ -538,6 +595,7 @@ def check_commands(prefixes, timeout: float = 12.0,
         _set_active(conn)
         conn.login(s["username"], s["password"])
         conn.select("INBOX")
+        out["mailbox_identity"] = _identity_from_settings(s)
         # ★UIDVALIDITY★ 呼叫端拿它跟 uid 一起當【本機收據】的鍵:
         #   UID 只在 UIDVALIDITY 不變時才穩定。信箱被重建過的話,
         #   舊收據可能壓住一封剛好撞到同一個 uid 的新指令。
@@ -647,6 +705,11 @@ def check_trigger(keyword: str, mark_read: bool = True,
         "authenticated_senders": [],
         "samples": [],
         "error": None,
+        # ★呼叫端拿它與 uid 一起組【世代化】的 journal 鍵★(外審 2026-08-12
+        #   P1-06);也是 mark_uids_seen 的世代驗證依據。空=取不到,fail-closed。
+        "uidvalidity": "",
+        # ★與這條連線同一份設定算出來的帳號身分★(外審 AD-4 第 1 輪 P1-3)
+        "mailbox_identity": "",
     }
     if not keyword:
         result["error"] = "keyword 為空"
@@ -672,6 +735,8 @@ def check_trigger(keyword: str, mark_read: bool = True,
         _set_active(conn)
         conn.login(s["username"], s["password"])
         conn.select("INBOX")
+        result["uidvalidity"] = read_uidvalidity(conn)
+        result["mailbox_identity"] = _identity_from_settings(s)
 
         # 用 IMAP SEARCH 直接過濾「未讀 + 主旨含 keyword」，避免拉全部
         # 注意：IMAP SEARCH 對非 ASCII 主旨要用 LITERAL+CHARSET UTF-8
@@ -822,7 +887,12 @@ def check_trigger(keyword: str, mark_read: bool = True,
                 id_list = b",".join(ids_to_mark).decode("ascii")
                 # [外審 P2-02] UID STORE —— 與上面的 UID SEARCH/FETCH 一致,
                 # 否則會用序號去標記,可能標到另一封信。
-                conn.uid("store", id_list, "+FLAGS", "(\\Seen)")
+                # ★[外審 2026-08-12 P2-03] 要看 typ★ NO/BAD 是正常返回不拋 ——
+                #   當成功的話,陳舊觸發信一直 UNSEEN,每輪重掃、重發告警。
+                typ, _d = conn.uid("store", id_list, "+FLAGS", "(\\Seen)")
+                if typ != "OK":
+                    logging.warning("標已讀被拒(typ=%s)—— 這些信下輪會再掃到",
+                                    typ)
             except Exception:
                 logging.warning("標已讀失敗（不影響觸發）", exc_info=True)
 
