@@ -50,7 +50,7 @@ def test_smtp_timeout_raises_delivery_unknown(monkeypatch):
     monkeypatch.setattr(sm, "_reserve_rate_limit_slot", lambda *a, **k: object())
     monkeypatch.setattr(sm, "_rollback_rate_limit_slot", lambda *a, **k: None)
 
-    def _boom(cred, msg, timeout):
+    def _boom(cred, msg, timeout, **kw):
         # 模擬【DATA 已提交、等最終 250 時】逾時 —— 這才是「結果不明」
         e = socket.timeout("timed out waiting for 250")
         e._cmuh_submitted = True
@@ -218,7 +218,7 @@ def test_timeout_does_not_resend_before_declaring_unknown(monkeypatch):
     monkeypatch.setattr(sm, "_reserve_rate_limit_slot", lambda *a, **k: object())
     monkeypatch.setattr(sm, "_rollback_rate_limit_slot", lambda *a, **k: None)
 
-    def _boom(cred, msg, timeout):
+    def _boom(cred, msg, timeout, **kw):
         attempts.append(1)
         e = socket.timeout("timed out waiting for 250")
         e._cmuh_submitted = True          # 已提交後逾時 = 不可重試
@@ -246,7 +246,7 @@ def test_non_timeout_transient_errors_still_retry(monkeypatch):
     import time as _t
     monkeypatch.setattr(_t, "sleep", lambda *_a: None)
 
-    def _boom(cred, msg, timeout):
+    def _boom(cred, msg, timeout, **kw):
         attempts.append(1)
         raise OSError("connection refused")
 
@@ -311,7 +311,7 @@ def test_connect_phase_timeout_still_retries(monkeypatch):
     import time as _t
     monkeypatch.setattr(_t, "sleep", lambda *_a: None)
 
-    def _boom(cred, msg, timeout):
+    def _boom(cred, msg, timeout, **kw):
         attempts.append(1)
         raise socket.timeout("timed out connecting")   # 未標記 = 尚未提交
 

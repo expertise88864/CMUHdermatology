@@ -58,14 +58,26 @@ def _led(tmp_path, name="ledger.sqlite3"):
 
 
 def _capture_send(monkeypatch, result=None, exc=None):
+    """假的 send_mail —— ★要用生產的呼叫形狀★:真的 SMTP 在 RCPT 全部
+    回答完、DATA 之前會呼叫 `on_rcpt_result`(嘗試邊界+逐位拒收落地都在
+    那裡)。假的不呼叫的話,額度永遠不會遞增 —— 測試量到的是一個生產
+    不會發生的情境。"""
     import cmuh_common.smtp_mail as sm
     sent = []
 
     def _fake(**kw):
         sent.append(kw)
+        refused = dict(result or {})
+        cb = kw.get("on_rcpt_result")
+        if cb is not None:
+            ok = cb(accepted=[a for a in (kw.get("recipients") or [])
+                              if a not in refused],
+                    refused=dict(refused))
+            if not ok and kw.get("require_durable_rcpt"):
+                raise sm.RcptResultNotDurable("逐位結果落不了地 → 不送")
         if exc is not None:
             raise exc
-        return dict(result or {})
+        return refused
 
     monkeypatch.setattr(sm, "send_mail", _fake)
     return sent

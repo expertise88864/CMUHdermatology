@@ -5859,6 +5859,66 @@ _pending_refusal_retries: list = []
 _pending_refusal_lock = threading.Lock()
 
 
+def _initial_rcpt_recorder(delivery_id: str):
+    """初次寄送用的 RCPT callback:把逐位拒收落地到【這一筆】。→ callback。
+
+    ★[外審 2026-08-17 P1-01]★ 這是唯一能在「信已經進寄件備份、但某位
+    被明確 4xx/5xx 拒收」之後,還證明得了他沒收到的東西 —— 整封
+    Message-ID 回查只知道「這封信寄出去了」。落不了地時回 False;
+    初次通知不因此中止(availability-first),但呼叫端會走既有的兩層備援。
+    """
+    did = str(delivery_id or "")
+
+    def _record(accepted, refused):
+        if not did:
+            return False
+        if not refused:
+            return True
+        led = _get_ledger()
+        if led is None:
+            return False
+        try:
+            led.record_refusals(did, refused)
+            return True
+        except Exception:
+            logging.warning("[delivery] 逐位 RCPT 結果落不了地(初次寄送"
+                            "照常送出;拒收另有佇列與寄存處備援)",
+                            exc_info=True)
+            return False
+    return _record
+
+
+def _recipients_refused_map(exc) -> dict:
+    """SMTP 例外裡的【逐位拒收碼】。沒有就回空 dict。
+
+    ★[外審 2026-08-17 P2-02]★ smtplib 只有在【全部】收件人被拒時才拋
+    `SMTPRecipientsRefused`,而那個例外身上就帶著逐位的碼(550 查無此人 /
+    421 暫時忙碌)。把它摺成 generic `failed=True` 會讓所有拒收都被記成
+    暫時性 —— 一個確定不存在的信箱會一路吃完退避與補寄額度,最後的告警
+    還用「暫時性拒收」的語氣描述。
+    """
+    # ★單一實作★(外審 AE-4 第 1 輪):回查端也要用同一把尺 ——
+    #   兩邊各寫一份,遲早有一邊漏掉「包了一層」的情況。
+    from cmuh_common.smtp_mail import (  # noqa: PLC0415
+        recipients_refused_map as _map,
+    )
+    return _map(exc)
+
+
+def _record_refusals_on(delivery_id: str, refused: dict) -> None:
+    """把逐位拒收記到指定的那一筆(盡力而為;失敗只記 log)。"""
+    if not delivery_id or not refused:
+        return
+    led = _get_ledger()
+    if led is None:
+        return
+    try:
+        led.record_refusals(delivery_id, refused)
+    except Exception:
+        logging.debug("[delivery] 逐位拒收寫入 %s 失敗", delivery_id,
+                      exc_info=True)
+
+
 def _persist_known_refusals(origin_did: str, refused: dict) -> bool:
     """把【已知的逐位拒收】落地到初次那一筆。盡力而為,失敗只記 log。
 
@@ -6243,21 +6303,25 @@ def _resend_transient_refusals(delivery, refused: dict,
             if set(claimed) != set(targets):
                 targets = claimed       # 交易縮小了名單(有人剛被送達)
             attempt = _replace(attempt, recipients=tuple(claimed))
-            try:
-                led.mark_submitting(_rid)   # SMTP 嘗試邊界(與 durable 同規)
-            except Exception:
-                logging.warning("[delivery] 佇列補寄 %s 劃不了嘗試邊界 →"
-                                " 這一輪不寄", _rid, exc_info=True)
-                return refused
+            # ★嘗試邊界改由 RCPT callback 劃★(外審 2026-08-17 P1-01/P2-03):
+            #   跨過 RCPT 才算真正進了 SMTP;逐位拒收也在 DATA 之前落地。
+            from cmuh_common.delivery_reconcile import (  # noqa: PLC0415
+                Reconciler as _Rec,
+            )
+            _rcpt_cb = _Rec._rcpt_recorder(led, _rid, origin_did)
+            _need_durable = True
         else:
             # 沒有初次紀錄可仲裁(舊路徑)→ 維持原本的直接登記
             _rid = _delivery_begin(attempt, trigger_label,
                                    parent_id=origin_did)
+            _rcpt_cb, _need_durable = None, False
         try:
             again = send_via_smtp(
                 attempt.attachment, attempt.subject, attempt.text_body,
                 list(attempt.recipients), html_body=attempt.html_body,
-                message_id=attempt.message_id) or {}
+                message_id=attempt.message_id,
+                on_rcpt_result=_rcpt_cb,
+                require_durable_rcpt=_need_durable) or {}
         except DeliveryOutcomeUnknown:
             _delivery_settle(_rid, unknown=True)
             # ★不可以往上拋★ 初次那一筆的已知結果已經落地了;往上拋會讓
@@ -6265,8 +6329,23 @@ def _resend_transient_refusals(delivery, refused: dict,
             logging.error("[delivery] 補寄結果不明(%d 位)→ 留在拒收清單待查",
                           len(targets))
             return refused
-        except Exception:
-            _delivery_settle(_rid, failed=True)
+        except Exception as e:
+            # ★永久被拒要保留逐位的碼,不要摺成 generic failed★
+            #   (外審 2026-08-17 P2-02):全部收件人被 550 拒時 smtplib 拋
+            #   SMTPRecipientsRefused,裡面就有逐位的碼 —— 摺成 failed=True
+            #   會把「查無此人」記成暫時被拒,那個信箱會一路吃完退避與
+            #   補寄額度,最後的告警還用「暫時性拒收」的語氣描述。
+            _bad = _recipients_refused_map(e)
+            # ★只有涵蓋【全部】收件人時才用逐位結果★:`settle(refused=…)`
+            #   會把不在 map 裡的人標成【已送達】—— 整封都沒送出去的時候
+            #   那是憑空的宣稱(不涵蓋=拿到殘缺資訊,寧可 generic failed,
+            #   它永不推翻已有的 PERMANENT)。
+            if _bad and set(_bad) == {str(a).strip().lower()
+                                      for a in attempt.recipients}:
+                _delivery_settle(_rid, refused=_bad)
+                _record_refusals_on(origin_did, _bad)
+            else:
+                _delivery_settle(_rid, failed=True)
             logging.warning("[delivery] 補寄暫時性拒收失敗,保留原拒收清單",
                             exc_info=True)
             return refused
@@ -6347,7 +6426,9 @@ def _delivery_settle(delivery_id: str, *, refused=None,
 
 def send_via_smtp(image_path: Path, subject: str, body: str,
                   recipients: list, timeout: float = 60.0,
-                  html_body: str = "", message_id: str = "") -> dict:
+                  html_body: str = "", message_id: str = "",
+                  on_rcpt_result=None,
+                  require_durable_rcpt: bool = False) -> dict:
     """用 SMTP 直接寄（Gmail / smtp.gmail.com）。
 
     為何不用 Outlook：admin 行程的 Outlook COM 會起一個 admin Outlook 實例，
@@ -6372,7 +6453,13 @@ def send_via_smtp(image_path: Path, subject: str, body: str,
                         html_body=html_body or None,
                         # ★[2026-08-05 外審第 5 輪 P1-04]★ 重試要重送【同一封】——
                         #   換 Message-ID 會讓「已收下但回應逾時」變成收件人收到兩封。
-                        message_id=message_id or None) or {}
+                        message_id=message_id or None,
+                        # ★逐位 RCPT 結果在 DATA 之前落地★(外審 2026-08-17
+                        #   P1-01):不然「A 收 B 拒」這個事實要等 send 回來
+                        #   才寫帳,中間 crash 就只剩「信在寄件備份裡」——
+                        #   整封回查會把 B 也判成已送達。
+                        on_rcpt_result=on_rcpt_result,
+                        require_durable_rcpt=require_durable_rcpt) or {}
     if refused:
         logging.error(
             "[consult] ★有收件人沒收到會診通知★:%s(其餘已送達)。"
@@ -6901,7 +6988,17 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                             delivery.attachment, delivery.subject,
                             delivery.text_body, list(delivery.recipients),
                             html_body=delivery.html_body,
-                            message_id=delivery.message_id)
+                            message_id=delivery.message_id,
+                            # ★逐位 RCPT 結果在 DATA 之前落地★(外審
+                            #   2026-08-17 P1-01):「A 收 B 拒」若要等
+                            #   send 回來才寫帳,中間 crash 就只剩「信在
+                            #   寄件備份裡」—— 整封回查會把 B 也判成已送達,
+                            #   從此沒有補寄義務也沒有告警。
+                            #   ★初次臨床通知不強制 durable★:落不了地照樣
+                            #   寄(availability-first 的既有政策),拒收會
+                            #   再走記憶體佇列與跨 process 寄存處兩層備援。
+                            on_rcpt_result=_initial_rcpt_recorder(_did),
+                            require_durable_rcpt=False)
                     except DeliveryOutcomeUnknown:
                         # 可能已送達 → 待查(留給 Message-ID 回查收斂)
                         _delivery_settle(_did, unknown=True)

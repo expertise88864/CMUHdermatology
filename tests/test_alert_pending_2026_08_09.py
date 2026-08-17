@@ -392,8 +392,24 @@ class TestItIsActuallyWired:
         import inspect
         import textwrap
         src = textwrap.dedent(inspect.getsource(m._send_alert_email_via_smtp))
-        returns = [n for n in _ast.walk(_ast.parse(src))
-                   if isinstance(n, _ast.Return) and n.value is not None]
+        fn = _ast.parse(src).body[0]
+
+        def _own_returns(node):
+            """★只算【這個函式自己】的 return★:巢狀的 helper(例如
+            RCPT 落地 callback)回 True/False 是它自己的契約,不是這裡
+            要守的那條 —— `ast.walk` 整包掃會把它們一起算進來,守衛就
+            從「釘住回傳型別」變成「禁止任何巢狀函式」。"""
+            out = []
+            for child in _ast.iter_child_nodes(node):
+                if isinstance(child, (_ast.FunctionDef, _ast.AsyncFunctionDef,
+                                      _ast.Lambda)):
+                    continue
+                if isinstance(child, _ast.Return) and child.value is not None:
+                    out.append(child)
+                out.extend(_own_returns(child))
+            return out
+
+        returns = _own_returns(fn)
         assert returns, "找不到任何 return（測試自己失效了）"
         for r in returns:
             assert isinstance(r.value, _ast.Call) and \

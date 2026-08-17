@@ -8744,7 +8744,8 @@ def _send_alert_email_via_smtp(subject: str, body: str,
         return SendResult(False)
     try:
         from cmuh_common.smtp_mail import (
-            DeliveryOutcomeUnknown, SmtpNotConfiguredError, send_mail,
+            CATEGORY_CLINICAL, DeliveryOutcomeUnknown, SmtpNotConfiguredError,
+            send_mail,
         )
     except Exception:
         logging.warning("smtp_mail 模組載入失敗，止掛信跳過", exc_info=True)
@@ -8804,11 +8805,34 @@ def _send_alert_email_via_smtp(subject: str, body: str,
     try:
         # [2026-07-30 外審 P2-02] category 決定吃哪一份寄信配額。不傳＝臨床
         # （止掛提醒是這個 helper 的主要用途）；系統／除錯類的呼叫端自己標明。
-        kw = {"category": category} if category else {}
-        if _msgid:
-            kw["message_id"] = _msgid
+        # ★具名參數,不用 `**kw`★:那個 dict 是 `dict[str, str]`,展開時
+        #   pyright 會拿 str 去比對【每一個】關鍵字參數的型別(含新加的
+        #   bool/int 參數)—— 每加一個參數就多一筆假的型別債。
+        def _rcpt_landed(accepted, refused) -> bool:
+            """★逐位 RCPT 結果在 DATA 之前落地★(外審 2026-08-17 P1-01)。
+
+            止掛信也走同一條路:「A 收 B 拒」若等 send 回來才寫帳,中間
+            crash 就只剩「信在寄件備份裡」—— 整封 Message-ID 回查會把 B
+            也判成已送達。落不了地不中止(臨床通知 availability-first),
+            只是那一封退回舊的風險等級。
+            """
+            if not (_led is not None and _did and refused):
+                return True
+            try:
+                _led.record_refusals(_did, refused)
+                return True
+            except Exception:
+                logging.debug("[delivery] 止掛信逐位拒收落地失敗",
+                              exc_info=True)
+                return False
+
         refused = send_mail(recipients=recipients, subject=subject, body=body,
-                            attachment_path=None, timeout=timeout, **kw) or {}
+                            attachment_path=None, timeout=timeout,
+                            # 不傳＝臨床(止掛提醒是這個 helper 的主要用途);
+                            # 系統／除錯類的呼叫端自己標明(外審 P2-02)。
+                            category=(category or CATEGORY_CLINICAL),
+                            message_id=(_msgid or None),
+                            on_rcpt_result=_rcpt_landed) or {}
         _settle(refused=refused)
         if refused:
             # [2026-07-26 外審] send_mail 的回傳值【不可】丟掉:部分收件人被拒時

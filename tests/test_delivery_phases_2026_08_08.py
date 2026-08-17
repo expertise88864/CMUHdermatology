@@ -171,7 +171,7 @@ class TestADisconnectAfterDataIsNotRetried:
     def _drive(self, monkeypatch, exc, submitted):
         calls = {"n": 0}
 
-        def _once(cred, msg, timeout):
+        def _once(cred, msg, timeout, **kw):
             calls["n"] += 1
             if submitted:
                 setattr(exc, sm.SUBMITTED_ATTR, True)

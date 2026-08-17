@@ -284,7 +284,41 @@ def _build_message(sender_address: str, sender_name: str,
     return msg
 
 
-def _send_once(cred: dict, msg, timeout: float) -> dict:
+class RcptResultNotDurable(RuntimeError):
+    """逐位 RCPT 結果落不了地,而呼叫端要求「落不了地就不要送」。
+
+    ★[外審 2026-08-17 P1-01]★ RCPT 階段伺服器已經逐位回答「A 收、B 拒」,
+    但那個事實直到 send 回來、呼叫端寫帳本才變成 durable。中間 crash 的話:
+    帳上兩位都還是 UNKNOWN,而信【確實進了寄件備份】(A 收到了)——
+    重啟後 Message-ID 回查查到這封信,就把所有 UNKNOWN 判成已送達,
+    B 那筆明確的 421 從此消失,不重試也不告警。
+    所以逐位結果要在 ★DATA 之前★ 落地;補寄路徑落不了地就不送(拋這個),
+    此時內容一個 byte 都還沒送出去 —— 與 MAIL/RCPT 階段同級,可安全重試。
+    """
+
+
+def recipients_refused_map(exc) -> dict:
+    """SMTP 例外裡的【逐位拒收碼】。沒有就回空 dict。
+
+    ★[外審 2026-08-17 P2-02 / AE-4 第 1 輪 P2]★ smtplib 只有在【全部】
+    收件人被拒時才拋 `SMTPRecipientsRefused`,而那個例外身上就帶著逐位的
+    碼(550 查無此人 / 421 暫時忙碌)。把它摺成 generic「失敗」會讓所有
+    拒收都被記成暫時性 —— 一個確定不存在的信箱會一路吃完退避與補寄額度,
+    最後的告警還用「暫時性拒收」的語氣描述。包在 RuntimeError 裡也找得到
+    (`send_mail` 對永久性錯誤會轉包一層)。
+    """
+    e = exc
+    for _ in range(3):
+        if isinstance(e, smtplib.SMTPRecipientsRefused):
+            return dict(getattr(e, "recipients", {}) or {})
+        e = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
+        if e is None:
+            break
+    return {}
+
+
+def _send_once(cred: dict, msg, timeout: float, on_rcpt_result=None,
+               require_durable_rcpt: bool = False) -> dict:
     """單次 SMTP 寄送嘗試 — 失敗會 raise 給 caller 判斷是否重試。
 
     [2026-07-26 審查 ★假成功★] 回傳 `send_message` 的【被拒收件人 dict】。
@@ -346,6 +380,37 @@ def _send_once(cred: dict, msg, timeout: float) -> dict:
             code, resp = server.rcpt(addr, [])
             if code not in (250, 251):
                 refused[addr] = (code, resp)
+        # ── ★逐位結果先落地,再進 DATA★(外審 2026-08-17 P1-01)──
+        #   到這一行為止,伺服器已經逐位回答完畢,而信【還沒送出去】。
+        #   呼叫端在這裡把「誰收了、誰被拒」寫成 durable 事實(COMMIT+fsync);
+        #   之後就算 DATA 成功後立刻斷電,重啟時 Message-ID 回查也不會把
+        #   被明確拒收的那位一起判成已送達。
+        #   落不了地時:補寄路徑(require_durable_rcpt=True)★不送★ ——
+        #   內容還沒送出,可安全重試;初次臨床通知則照送(availability-first
+        #   的既有政策),呼叫端會另外把拒收存進跨 process 寄存處。
+        if on_rcpt_result is not None:
+            accepted = [a for a in to_addrs if a not in refused]
+            try:
+                durable = bool(on_rcpt_result(accepted=list(accepted),
+                                              refused=dict(refused)))
+            except Exception:
+                logging.error("[mail] 逐位 RCPT 結果落地時拋例外", exc_info=True)
+                durable = False
+            if not durable and require_durable_rcpt:
+                try:
+                    server.rset()
+                except Exception:
+                    pass
+                raise RcptResultNotDurable(
+                    "逐位 RCPT 結果落不了地 → 這一次不送(內容尚未送出,"
+                    "可安全重試)")
+
+        # ★全部被拒的判斷要在 callback【之後】★(外審 AE-4 第 1 輪 P2):
+        #   放在前面的話,「唯一收件人回 550」這條最重要的路完全不會呼叫
+        #   callback —— 逐位的碼丟掉(被上層記成暫時失敗、繼續追打一個
+        #   不存在的信箱),而且這次確實跨過了 RCPT 卻沒有劃下嘗試邊界
+        #   (attempts=0 → 額度繞過)。RCPT 全部回答完就是同一個事實,
+        #   不管接受幾個。
         if len(refused) == len(to_addrs):
             try:
                 server.rset()
@@ -449,8 +514,18 @@ def send_mail(recipients: list, subject: str, body: str,
               max_retries: int = DEFAULT_MAX_RETRIES,
               html_body: Optional[str] = None,
               category: str = CATEGORY_CLINICAL,
-              message_id: Optional[str] = None) -> dict:
+              message_id: Optional[str] = None,
+              on_rcpt_result=None,
+              require_durable_rcpt: bool = False) -> dict:
     """同步寄一封信。失敗 raise；成功 log info。
+
+    on_rcpt_result: `f(accepted: list, refused: dict) -> bool`,在【RCPT 全部
+      回答完、DATA 之前】被呼叫(外審 2026-08-17 P1-01)。呼叫端在這裡把
+      逐位結果寫成 durable 事實;回 False(或拋例外)代表沒落地。
+      ★每一次 SMTP 嘗試都會呼叫一次★(重試時會再叫),所以它必須冪等。
+    require_durable_rcpt: 落不了地就【不要送】(拋 `RcptResultNotDurable`;
+      內容尚未送出,可安全重試)。補寄路徑用 True(正確性優先);
+      初次臨床通知用 False(availability-first,既有政策)。
 
     回傳【被拒收件人】的 dict(空 dict = 全部送達)。[2026-07-26 審查]
     smtplib 只在【全部】收件人被拒時才拋例外,部分被拒是正常返回 —— 呼叫端若要
@@ -501,10 +576,18 @@ def send_mail(recipients: list, subject: str, body: str,
     refused: dict = {}
     for attempt in range(max_retries + 1):
         try:
-            refused = _send_once(cred, msg, timeout) or {}
+            refused = _send_once(cred, msg, timeout,
+                                 on_rcpt_result=on_rcpt_result,
+                                 require_durable_rcpt=require_durable_rcpt
+                                 ) or {}
             if attempt > 0:
                 logging.info("SMTP 第 %d 次重試成功", attempt)
             break  # success
+        except RcptResultNotDurable:
+            # ★落不了地就不送★ 內容一個 byte 都還沒送出去(確定沒寄出)。
+            #   立刻重試也不會讓帳本變得可用 → 交回呼叫端排到下一輪。
+            _rollback_rate_limit_slot(reservation)
+            raise
         except smtplib.SMTPAuthenticationError as e:
             # 認證錯不會自己好 → 不重試
             _rollback_rate_limit_slot(reservation)

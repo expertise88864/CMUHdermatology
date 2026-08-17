@@ -74,7 +74,7 @@ class _JobHarness:
         monkeypatch.setattr(
             cq, "send_via_smtp",
             lambda shot, subject, body, recipients, html_body="",
-            message_id="":
+            message_id="", **kw:
                 self.sent.append((list(recipients), subject))
                 or self.bodies.append(body)
                 or self.html_bodies.append(html_body))
@@ -342,7 +342,7 @@ def test_send_failure_also_retries(monkeypatch):
     calls = {"n": 0}
 
     def _send_fail_once(shot, subject, body, recipients, html_body="",
-                        message_id=""):
+                        message_id="", **kw):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("smtp down")

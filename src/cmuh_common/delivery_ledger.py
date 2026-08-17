@@ -68,7 +68,12 @@ DB_FILENAME = "delivery_ledger.sqlite3"
 # ★使用者定案:只落地文字★ 附件是 PHI 截圖,依既有隱私定案不落地。
 # v3(2026-08-13 批次AE-1):新增 kind —— 區分「回查驅動的自動補寄」與
 # 佇列補寄/初次寄送;自動補寄的次數上限要能跨重啟算得出來。
-_SCHEMA_VERSION = 3
+# v4(2026-08-17 批次AE-4):新增 superseded_by —— ★「補寄鏈已由較新紀錄
+# 接手」必須是顯式狀態★:舊版只把 body 清掉,而 `body_text == ""` 同時
+# 代表【已送達】【已放棄】【已被接手】三件完全不同的事 —— 結案路徑看到
+# 「還有暫時被拒的人 + 沒有 payload」就誤報「始終沒收到,請人工轉寄」,
+# 而那封信其實剛剛已經由較新的紀錄送到了(誘導人工重寄=重複通知)。
+_SCHEMA_VERSION = 4
 _BODY_TEXT_MAX = 100_000        # 信的文字內容上限(夠放最長的會診清單)
 # ★body 有自己的保留期,與紀錄本身(45 天)分開★(外審 AD-3 第 1 輪 P1-3)
 #   內文可能含臨床資訊 —— 只在「還可能需要補寄」的窗口裡保留。
@@ -233,7 +238,7 @@ def _clean_recipients(value) -> dict:
 _COLUMNS = ("delivery_id", "business_key", "parent_id", "category", "subject",
             "message_id", "attachment_hash", "state", "recipients",
             "created_at", "updated_at", "attempts", "note", "body_text",
-            "kind")
+            "kind", "superseded_by")
 
 
 class DeliveryLedger:
@@ -319,8 +324,10 @@ class DeliveryLedger:
                 " attempts INTEGER NOT NULL DEFAULT 0,"
                 " note TEXT NOT NULL DEFAULT '',"
                 " body_text TEXT NOT NULL DEFAULT '',"
-                " kind TEXT NOT NULL DEFAULT '')")
-            # ── v1→v2:補 body_text;v2→v3:補 kind(批次AE-1)──
+                " kind TEXT NOT NULL DEFAULT '',"
+                " superseded_by TEXT NOT NULL DEFAULT '')")
+            # ── v1→v2:補 body_text;v2→v3:補 kind;v3→v4:補
+            #   superseded_by(批次AE-4)──
             #   CREATE IF NOT EXISTS 對【既有的】舊版資料庫不會補欄位,
             #   要自己 ALTER;新建的資料庫上面就有了。
             cols = {r[1] for r in
@@ -331,6 +338,9 @@ class DeliveryLedger:
             if "kind" not in cols:
                 conn.execute("ALTER TABLE deliveries ADD COLUMN"
                              " kind TEXT NOT NULL DEFAULT ''")
+            if "superseded_by" not in cols:
+                conn.execute("ALTER TABLE deliveries ADD COLUMN"
+                             " superseded_by TEXT NOT NULL DEFAULT ''")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_bk"
                          " ON deliveries(business_key)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_state"
@@ -412,6 +422,7 @@ class DeliveryLedger:
                 str(rec.get("note") or "")[:300],
                 "",                     # 舊格式沒有 body_text(補寄自然沒得補)
                 "",                     # 舊格式沒有 kind
+                "",                     # 舊格式沒有 superseded_by
             ))
         if not rows:
             return
@@ -611,6 +622,9 @@ class DeliveryLedger:
             # ""=初次寄送或佇列補寄;KIND_AUTO_RESEND=回查驅動的自動補寄
             #   (次數上限只數這一種 —— 佇列自己有退避與用盡告警)。
             "kind": str(kind or ""),
+            # 非空 = 這條補寄鏈已由那一筆較新的紀錄接手(顯式狀態,
+            #   不再用「body 是空的」去暗示三件不同的事)。
+            "superseded_by": "",
         }
 
     def _insert_locked(self, conn, rec: dict) -> None:
@@ -749,6 +763,30 @@ class DeliveryLedger:
                     states[addr] = st
                     done.append(addr)
             return sorted(done)
+
+        _state, done = self._mutate_recipients_locked(delivery_id, _apply)
+        return done or []
+
+    def mark_permanently_refused(self, delivery_id: str, addrs: list) -> list:
+        """把這幾位在【這一筆】上升級成永久被拒。→ 真的改到的人。
+
+        ★[外審 2026-08-17 P2-02] 結論要單調地往上傳★:補寄時對方回 550
+        (查無此人),那是比「暫時被拒」更強的結論 —— 不往上傳的話,親紀錄
+        永遠停在 TRANSIENT,那個不存在的信箱會一路吃完佇列退避、durable
+        補寄額度,最後的告警還用「暫時性拒收」的語氣描述。
+        ★絕不推翻 CONFIRMED★:那是「真的送達了」,比任何拒收都強。
+        """
+        want = {str(a).strip().lower() for a in (addrs or [])}
+        if not want:
+            return []
+
+        def _apply(states: dict):
+            done = sorted(a for a in states
+                          if a in want and states[a] not in (R_CONFIRMED,
+                                                             R_PERMANENT))
+            for a in done:
+                states[a] = R_PERMANENT
+            return done
 
         _state, done = self._mutate_recipients_locked(delivery_id, _apply)
         return done or []
@@ -921,6 +959,9 @@ class DeliveryLedger:
                        for st, _k, _a, _r in rows):
                     return ""
                 delivered_by_children: set = set()
+                # ★永久被拒也是結論★(外審 2026-08-17 P2-02):補寄時收到
+                #   550 的那位不該再寄 —— 就算親紀錄上還來不及升級。
+                concluded_by_children: set = set()
                 for _st, _k, _a, raw in rows:
                     try:
                         child_states = _clean_recipients(json.loads(raw or "{}"))
@@ -929,8 +970,11 @@ class DeliveryLedger:
                     delivered_by_children.update(
                         a for a, st in child_states.items()
                         if st == R_CONFIRMED)
+                    concluded_by_children.update(
+                        a for a, st in child_states.items()
+                        if st == R_PERMANENT)
                 prow = conn.execute(
-                    "SELECT recipients, business_key FROM deliveries"
+                    "SELECT recipients, business_key, created_at FROM deliveries"
                     " WHERE delivery_id=?", (pid,)).fetchone()
                 try:
                     parent_states = _clean_recipients(
@@ -954,9 +998,35 @@ class DeliveryLedger:
                         delivered_by_children.update(
                             a for a, st in states.items()
                             if st == R_CONFIRMED)
+                        concluded_by_children.update(
+                            a for a, st in states.items()
+                            if st == R_PERMANENT)
+                    # ★同一事件已經有【較新的存活初次寄送】就不要補★
+                    #   (外審 2026-08-17 P1-02 的最低限度):工作層新一輪
+                    #   剛 begin 的那一筆此刻全是 UNKNOWN —— 只看「已送達」
+                    #   擋不住它,兩封會同時跨過 SMTP 邊界 = 重複的臨床通知。
+                    #   ★這個檢查必須在【同一筆交易】裡★:掃描端的
+                    #   `newer_sibling_takeover` 與這裡之間有 TOCTOU 窗口。
+                    #   (完整的 event-level 寄送閘門仍是待定案的政策題;
+                    #    這裡先關掉補寄側可以自己關的那一半。)
+                    #   ★只擋【還在飛】的那種★(SUBMITTING/PREPARED/
+                    #   UNKNOWN):它可能正要送給同一批人。已收斂的較新
+                    #   紀錄(CONFIRMED/PARTIAL/FAILED)不擋 —— 它送到的人
+                    #   已經在上面的已送達集合裡排除,沒送到的人本來就該由
+                    #   這條鏈補(或由 takeover 收掉整條鏈)。
+                    _pat = _as_epoch(prow[2]) if prow else 0.0
+                    _inflight = (SUBMITTING, PREPARED, UNKNOWN)
+                    live_newer = conn.execute(
+                        "SELECT 1 FROM deliveries WHERE business_key=?"
+                        " AND parent_id='' AND delivery_id!=? AND created_at>?"
+                        " AND state IN (?,?,?) LIMIT 1",
+                        (pbk, pid, _pat, *_inflight)).fetchone()
+                    if live_newer:
+                        return ""
                 targets = [a for a in want
                            if parent_states.get(a) == R_TRANSIENT
-                           and a not in delivered_by_children]
+                           and a not in delivered_by_children
+                           and a not in concluded_by_children]
                 if not targets:
                     return ""
                 if str(kind) == KIND_AUTO_RESEND:
@@ -989,8 +1059,34 @@ class DeliveryLedger:
         讀不到 → LedgerUnavailable(空清單=「沒有人欠補寄」,不可假裝)。
         """
         return self._select(
-            "parent_id='' AND body_text!='' AND state IN (?,?)"
-            " AND updated_at<?", (FAILED, PARTIAL, _now() - float(min_age_sec)))
+            "parent_id='' AND superseded_by='' AND body_text!=''"
+            " AND state IN (?,?) AND updated_at<?",
+            (FAILED, PARTIAL, _now() - float(min_age_sec)))
+
+    def supersede(self, delivery_id: str, *, by: str, note: str = "") -> bool:
+        """這條補寄鏈由 `by` 那一筆接手 → 記下顯式狀態並清 payload。→ 有改到嗎。
+
+        ★[外審 2026-08-17 P2-01]★ 舊版接手時只 `clear_body()`,而
+        `body_text == ""` 同時代表【已送達】【已放棄】【已被接手】三件事:
+        結案路徑看到「還有暫時被拒的人 + 沒有 payload」就判定「durable 補寄
+        已無能為力」→ 明確結案 + 寄出「這幾位始終沒收到,請人工確認/轉寄」
+        —— 但那封信剛剛已經由較新的紀錄送到了,告警反而誘導人工重寄。
+        收件人狀態刻意【不動】(沒有證據說這一筆送到了);排除靠
+        `superseded_by`,見 `needs_recipient_retry`。
+        """
+        did = str(delivery_id or "")
+        if not did:
+            return False
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            with self._txn(conn):
+                cur = conn.execute(
+                    "UPDATE deliveries SET body_text='', superseded_by=?,"
+                    " note=?, updated_at=? WHERE delivery_id=?",
+                    (str(by or "")[:64],
+                     (str(note)[:300] if note else "補寄鏈已由較新紀錄接手"),
+                     _now(), did))
+                return bool(cur.rowcount)
 
     def clear_body(self, delivery_id: str, note: str = "") -> bool:
         """補寄鏈明確關閉(不經收件人狀態變動)→ 清掉 payload。→ 有清到嗎。
@@ -1018,7 +1114,7 @@ class DeliveryLedger:
     def newer_sibling_takeover(self, business_key: str, *,
                                than_created_at: float) -> tuple:
         """同 business_key、較新的【初次】紀錄能不能接走補寄義務。
-        → (verdict, 較新紀錄裡已確認送達的收件人 list)。
+        → (verdict, 較新紀錄裡已確認送達的收件人 list, 接手者 delivery_id)。
         verdict: "takeover"(可,舊鏈結案)/"wait"(等它收斂)/
         ""(沒有/沒本錢,舊鏈續扛)。
 
@@ -1050,28 +1146,29 @@ class DeliveryLedger:
             with self._lock:
                 conn = self._ensure_conn_locked()
                 rows = conn.execute(
-                    "SELECT state, body_text, recipients FROM deliveries"
-                    " WHERE business_key=? AND parent_id='' AND created_at>?",
+                    "SELECT state, body_text, recipients, delivery_id FROM"
+                    " deliveries WHERE business_key=? AND parent_id=''"
+                    " AND created_at>?",
                     (str(business_key), float(than_created_at))).fetchall()
         except sqlite3.Error as e:
             raise LedgerUnavailable(
                 "這一刻查不出 %s 有沒有較新的同 key 紀錄" % business_key
             ) from e
         delivered: set = set()
-        for _st, _b, raw in rows:
+        for _st, _b, raw, _id in rows:
             try:
                 states = _clean_recipients(json.loads(raw or "{}"))
             except (TypeError, ValueError):
                 states = {}
             delivered.update(a for a, st in states.items()
                              if st == R_CONFIRMED)
-        if any(str(st) == CONFIRMED or str(b or "")
-               for st, b, _r in rows):
-            return "takeover", sorted(delivered)
+        able = [r for r in rows if str(r[0]) == CONFIRMED or str(r[1] or "")]
+        if able:
+            return "takeover", sorted(delivered), str(able[0][3])
         if any(str(st) in (SUBMITTING, PREPARED, UNKNOWN)
-               for st, _b, _r in rows):
-            return "wait", sorted(delivered)
-        return "", sorted(delivered)
+               for st, _b, _r, _id in rows):
+            return "wait", sorted(delivered), ""
+        return "", sorted(delivered), ""
 
     def state_of(self, delivery_id: str) -> str:
         """某一筆的目前狀態。**查不到／讀不到一律回空字串**。
@@ -1137,9 +1234,12 @@ class DeliveryLedger:
 
         ★補寄產生的紀錄不列★(有 `parent_id` 的):同一位收件人的權威狀態在
         【初次】那一筆上,兩邊都列會重複結案、重複告警。
+        ★已被接手的鏈(superseded_by 非空)也不列★(外審 2026-08-17 P2-01):
+        它的義務已經轉給較新的那一筆,再列就會對【已經送達的事】發出
+        「始終沒收到」的告警,誘導人工重寄。
         讀不到就拋 —— 空清單會被讀成「沒有人在等補寄」。
         """
-        rows = self._select("parent_id=''", ())
+        rows = self._select("parent_id='' AND superseded_by=''", ())
         out = []
         for rec in rows:
             todo = recipients_needing_retry(rec.get("recipients") or {})

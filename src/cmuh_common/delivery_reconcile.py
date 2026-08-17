@@ -455,9 +455,29 @@ class Reconciler:
             #   原信仍掛著暫時被拒,照樣誤報漏收。
             parent = str(rec.get("parent_id") or "")
             if parent:
+                # ★用【收斂後】的子紀錄狀態,不是當初嘗試的名單★
+                #   (外審 2026-08-17 P1-01 下半):嘗試名單裡可能有被
+                #   SMTP 明確 4xx/5xx 拒收的人 —— 整封回查只證明「這封信
+                #   進了寄件備份」,證不了他收到了。拿舊名單回寫等於把
+                #   明確的拒收洗成已送達,那位從此沒有補寄義務。
+                from cmuh_common.delivery_ledger import (  # noqa: PLC0415
+                    R_CONFIRMED as _RC,
+                    R_PERMANENT as _RP,
+                )
+                fresh = led.get(did) or {}
+                got = sorted(a for a, st in
+                             (fresh.get("recipients") or {}).items()
+                             if st == _RC)
+                gone = sorted(a for a, st in
+                              (fresh.get("recipients") or {}).items()
+                              if st == _RP)
                 try:
-                    led.confirm_recipients(
-                        parent, list(rec.get("recipients") or {}))
+                    if got:
+                        led.confirm_recipients(parent, got)
+                    if gone:
+                        # ★永久被拒單調往上傳★(P2-02):不然那個不存在的
+                        #   信箱會一路吃完退避與補寄額度。
+                        led.mark_permanently_refused(parent, gone)
                 except Exception:
                     logging.warning("[%s] 回寫原信 %s 失敗(可能誤報漏收)",
                                     self._tag, parent, exc_info=True)
@@ -496,8 +516,9 @@ class Reconciler:
         判準就會有一邊靜默失效。全部以資料庫的當下狀態為準,不吃快照。
         """
         from cmuh_common.delivery_ledger import (  # noqa: PLC0415
-            CONFIRMED, KIND_AUTO_RESEND, PARTIAL, PREPARED, R_CONFIRMED,
-            RESEND_MAX_AUTO, SUBMITTING, UNKNOWN, recipients_needing_retry,
+            CONFIRMED, FAILED, KIND_AUTO_RESEND, PARTIAL, PREPARED,
+            R_CONFIRMED, R_PERMANENT, RESEND_MAX_AUTO, SUBMITTING, UNKNOWN,
+            recipients_needing_retry,
         )
         did = str(rec.get("delivery_id") or "")
         if not did or str(rec.get("parent_id") or ""):
@@ -513,16 +534,23 @@ class Reconciler:
         #    「子紀錄已確認、回寫親紀錄之前 crash」的窗口靠這裡收 ——
         #    不回寫的話親紀錄還掛著暫時被拒,會再補一次=重複的臨床通知。
         for c in children:
-            if str(c.get("state")) not in (CONFIRMED, PARTIAL):
+            if str(c.get("state")) not in (CONFIRMED, PARTIAL, FAILED):
                 continue
             got = sorted(a for a, st in (c.get("recipients") or {}).items()
                          if st == R_CONFIRMED)
-            if not got:
+            # ★永久被拒也要往上傳★(外審 2026-08-17 P2-02):FAILED 的子紀錄
+            #   也可能帶著 550(查無此人)—— 那是比暫時被拒更強的結論。
+            gone = sorted(a for a, st in (c.get("recipients") or {}).items()
+                          if st == R_PERMANENT)
+            if not got and not gone:
                 continue
             try:
-                led.confirm_recipients(did, got)
+                if got:
+                    led.confirm_recipients(did, got)
+                if gone:
+                    led.mark_permanently_refused(did, gone)
             except Exception:
-                logging.warning("[%s] 回寫 %s 的已送達收件人失敗",
+                logging.warning("[%s] 回寫 %s 的收件人結論失敗",
                                 self._tag, did, exc_info=True)
         rec = led.get(did) or {}
         body = str(rec.get("body_text") or "")
@@ -544,7 +572,7 @@ class Reconciler:
         bk = str(rec.get("business_key") or "")
         if bk:
             try:
-                verdict, sib_delivered = led.newer_sibling_takeover(
+                verdict, sib_delivered, newer_id = led.newer_sibling_takeover(
                     bk, than_created_at=_created_at(rec))
             except Exception:
                 # ★查不出 ≠ 可接手★(外審 AE-1 第 1 輪 P1-2):結鏈會刪掉
@@ -555,9 +583,14 @@ class Reconciler:
                                 exc_info=True)
                 return ""
             if verdict == "takeover":
+                # ★接手要記成顯式狀態★(外審 2026-08-17 P2-01):只清 body
+                #   的話,結案路徑會看到「還有暫時被拒的人 + 沒有 payload」
+                #   而寄出「始終沒收到,請人工轉寄」—— 但那封信剛剛已經由
+                #   較新的紀錄送到了,告警反而誘導人工重寄。
                 try:
-                    led.clear_body(did, note="同 business_key 已有較新的"
-                                             "紀錄接手,本鏈結案")
+                    led.supersede(did, by=newer_id,
+                                  note="同 business_key 已有較新的紀錄接手,"
+                                       "本鏈結案")
                 except Exception:
                     logging.warning("[%s] 結鏈 %s 失敗(下輪再試)",
                                     self._tag, did, exc_info=True)
@@ -590,8 +623,9 @@ class Reconciler:
                     rec.get("recipients") or {})
                 if not targets:
                     try:
-                        led.clear_body(did, note="較新紀錄已送達所有待補"
-                                                 "收件人,補寄鏈結案")
+                        led.supersede(did, by=newer_id,
+                                      note="較新紀錄已送達所有待補收件人,"
+                                           "補寄鏈結案")
                     except Exception:
                         logging.warning("[%s] 結鏈 %s 失敗(下輪再試)",
                                         self._tag, did, exc_info=True)
@@ -715,30 +749,45 @@ class Reconciler:
                             self._tag, new_did)
             return ""
         try:
-            # ★SMTP 嘗試邊界★(外審 R3 P1-01):跨過這裡才算一次嘗試
-            #   (attempts+1,synchronous=FULL 已 fsync)。額度數的是
-            #   這個,不是 claim 次數 —— claim 後 crash 的子紀錄
-            #   attempts=0,由卡住收斂收掉,不扣額度。劃不了邊界就不寄:
-            #   帳不可信時出手,額度又變回約略值。
-            led.mark_submitting(new_did)
-        except Exception:
-            logging.warning("[%s] 補寄 %s 劃不了 SMTP 嘗試邊界 → 本輪不寄"
-                            "(子紀錄由卡住收斂路徑收掉,不扣額度)",
-                            self._tag, new_did, exc_info=True)
-            return ""
-        try:
             refused = send_mail(
                 recipients=list(addrs), subject=subject, body=body + note,
                 category=("system" if rec.get("category") == "system"
                           else "clinical"),
-                message_id=new_msgid)
+                message_id=new_msgid,
+                # ★只留一層重試★(外審 AE-4 第 2 輪 P2):內層預設會再試
+                #   兩次 —— 全部 421 時一個子紀錄就做了 3 次 RCPT,兩個
+                #   auto 子紀錄=6 次,`RESEND_MAX_AUTO=2` 形同虛設。
+                #   補寄的重試機制在【外層】(claim + 額度 + 退避)。
+                max_retries=0,
+                # ★逐位結果在 DATA 之前落地,同時劃下嘗試邊界★
+                #   (外審 2026-08-17 P1-01/P2-03):跨過 RCPT 才算一次
+                #   真正的 SMTP 嘗試(額度數這個);而被拒的那幾位在信送出
+                #   之前就成為 durable 事實 —— 之後就算立刻斷電,整封回查
+                #   也不會把他們一起判成已送達。
+                on_rcpt_result=self._rcpt_recorder(led, new_did, did),
+                require_durable_rcpt=True)
         except DeliveryOutcomeUnknown:
             self._settle_quietly(led, new_did, unknown=True)
             logging.warning("[%s] 補寄 %s 結果不明 → 交給下一輪回查",
                             self._tag, new_did)
             return new_did
-        except Exception:
-            self._settle_quietly(led, new_did, failed=True)
+        except Exception as e:
+            # ★縱深:逐位的碼要保留★(外審 AE-4 第 1 輪 P2)——「全部收件人
+            #   被拒」是 SMTPRecipientsRefused,例外身上就帶著 550/421;
+            #   摺成 generic failed 會把「查無此人」記成暫時被拒,那個信箱
+            #   會一路吃完額度,最後的告警還說它是暫時性的。
+            from cmuh_common.smtp_mail import (  # noqa: PLC0415
+                recipients_refused_map,
+            )
+            _bad = recipients_refused_map(e)
+            # ★只有涵蓋【全部】收件人時才用逐位結果★:`settle(refused=…)`
+            #   會把不在 map 裡的人標成【已送達】—— 這裡明明整封都沒送出去。
+            #   SMTPRecipientsRefused 依定義涵蓋全部,不涵蓋就是拿到殘缺的
+            #   資訊,那寧可用 generic failed(它永不推翻已有的 PERMANENT)。
+            if _bad and set(_bad) == {str(a).strip().lower() for a in addrs}:
+                self._settle_quietly(led, new_did, refused=_bad)
+            else:
+                self._settle_quietly(led, new_did, failed=True)
             logging.error("[%s] ★補寄 %s 也失敗★(原信 %s,主旨:%s)",
                           self._tag, new_did, did, subject, exc_info=True)
             return new_did
@@ -758,6 +807,34 @@ class Reconciler:
                         "收件人 %d 位,只有文字、無附件)",
                         self._tag, new_did, did, subject, len(addrs))
         return new_did
+
+    @staticmethod
+    def _rcpt_recorder(led, child_id: str, parent_id: str = ""):
+        """做出「RCPT 全部回答完、DATA 之前」要落地的那筆事實。→ callback。
+
+        ★[外審 2026-08-17 P1-01/P2-03]★ 落地順序有意義:
+        (1) 先把逐位拒收寫進子紀錄與親紀錄 —— 這是 crash 之後唯一能證明
+            「他沒收到」的東西(整封 Message-ID 回查證不了逐位);
+        (2) 都成功了才 `mark_submitting`(attempts+1)= ★真正跨過 SMTP
+            protocol boundary 的嘗試★,額度數的是它。順序反過來的話,
+            拒收沒寫成功卻先扣掉額度,等於用額度換沉默。
+        任何一步失敗回 False → 呼叫端(補寄路徑)在 DATA 之前中止,
+        信一個 byte 都沒送出,子紀錄 attempts 仍是 0(不扣額度)。
+        冪等:同一次寄送重試時會被再呼叫一次。
+        """
+        def _record(accepted, refused):
+            try:
+                if refused:
+                    led.record_refusals(child_id, refused)
+                    if parent_id:
+                        led.record_refusals(parent_id, refused)
+                led.mark_submitting(child_id)
+                return True
+            except Exception:
+                logging.warning("[delivery] 逐位 RCPT 結果落不了地 →"
+                                " 這一次不送(內容尚未送出)", exc_info=True)
+                return False
+        return _record
 
     def _settle_quietly(self, led, did, **kw) -> None:
         """補寄的結果照常入帳;入不了帳也不可以打斷回查輪。"""
