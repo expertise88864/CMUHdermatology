@@ -654,27 +654,99 @@ class DeliveryLedger:
         with self._lock:
             conn = self._ensure_conn_locked()
             with self._txn(conn):
-                rec = self._get_row_locked(conn, delivery_id)
-                if rec is None:
-                    return FAILED, None
-                states = dict(rec.get("recipients") or {})
-                out = fn(states)
-                new_state = summarize(states)
-                # ★body 保留到補寄鏈關閉★(外審 2026-08-13 P1-01,取代
-                #   AD-3 的「終局即清」):FAILED/PARTIAL 還欠補寄 ——
-                #   在「補寄 durable 建立」之前把 payload 刪掉,中間 crash
-                #   那封信就永久消失。只有【全數送達】(CONFIRMED)或
-                #   【明確放棄】(clear_body=True,呼叫端已告警)才清;
-                #   隱私天花板是 3 天的 scrub(獨立於狀態)。
-                keep_body = ("" if (clear_body or new_state == CONFIRMED)
-                             else rec.get("body_text") or "")
-                conn.execute(
-                    "UPDATE deliveries SET recipients=?, state=?, note=?,"
-                    " updated_at=?, body_text=? WHERE delivery_id=?",
-                    (json.dumps(states, ensure_ascii=False), new_state,
-                     (str(note)[:300] if note else rec.get("note") or ""),
-                     _now(), keep_body, rec["delivery_id"]))
-                return new_state, out
+                return self._mutate_states_in_txn(conn, delivery_id, fn,
+                                                  note=note,
+                                                  clear_body=clear_body)
+
+    def _mutate_states_in_txn(self, conn, delivery_id: str, fn,
+                              note: str = "", clear_body: bool = False):
+        """`_mutate_recipients_locked` 的內層(★在呼叫端的交易裡執行★)。
+
+        抽出來是為了讓「一次 RCPT 的結果」可以把【子紀錄拒收 + 親紀錄
+        分類升級 + 嘗試邊界】寫在★同一筆交易★裡(外審 AE-5 第 1 輪 P2):
+        拆成三筆的話,子已 permanent、親還是 transient 的中間狀態會被
+        別的路徑讀到,做出前後不一致的決定。
+        """
+        rec = self._get_row_locked(conn, delivery_id)
+        if rec is None:
+            return FAILED, None
+        states = dict(rec.get("recipients") or {})
+        out = fn(states)
+        new_state = summarize(states)
+        # ★body 保留到補寄鏈關閉★(外審 2026-08-13 P1-01,取代
+        #   AD-3 的「終局即清」):FAILED/PARTIAL 還欠補寄 ——
+        #   在「補寄 durable 建立」之前把 payload 刪掉,中間 crash
+        #   那封信就永久消失。只有【全數送達】(CONFIRMED)或
+        #   【明確放棄】(clear_body=True,呼叫端已告警)才清;
+        #   隱私天花板是 3 天的 scrub(獨立於狀態)。
+        keep_body = ("" if (clear_body or new_state == CONFIRMED)
+                     else rec.get("body_text") or "")
+        conn.execute(
+            "UPDATE deliveries SET recipients=?, state=?, note=?,"
+            " updated_at=?, body_text=? WHERE delivery_id=?",
+            (json.dumps(states, ensure_ascii=False), new_state,
+             (str(note)[:300] if note else rec.get("note") or ""),
+             _now(), keep_body, rec["delivery_id"]))
+        return new_state, out
+
+    def record_rcpt_outcome(self, child_id: str, parent_id: str,
+                            refused: dict) -> bool:
+        """★一次 RCPT 的結果,一筆交易★(外審 AE-5 第 1 輪 P2)。→ 成功嗎。
+
+        同一筆 BEGIN IMMEDIATE 裡做完三件事:
+          (1) 子紀錄記下逐位拒收(它剛建立,收件人都還是 UNKNOWN);
+          (2) 親紀錄★分類★升級 —— 永久被拒(550)不論原本是 UNKNOWN 或
+              TRANSIENT 都升(單調,絕不推翻 CONFIRMED);暫時性只補
+              還沒有結論的(不動既有的 TRANSIENT/PERMANENT);
+          (3) 子紀錄 attempts+1 = 真正跨過 SMTP protocol boundary。
+        拆成三筆的話會出現「子已 permanent、親還是 transient」的中間狀態:
+        claim 交易看子紀錄而拒絕補寄,佇列的終局判斷只看親紀錄而繼續退避,
+        最後用「暫時性拒收用盡」的語氣對一個【確定不存在】的信箱告警。
+        任何一步失敗 → 整筆回捲 → 呼叫端(補寄路徑)在 DATA 之前中止。
+        """
+        cid = str(child_id or "")
+        if not cid:
+            return False
+        bad = {}
+        for addr, info in (refused or {}).items():
+            code = info[0] if isinstance(info, (tuple, list)) and info else info
+            bad[str(addr).strip().lower()] = classify_refusal(code)
+
+        def _child(states: dict):
+            for addr, st in bad.items():
+                if states.get(addr) == R_UNKNOWN:
+                    states[addr] = st
+            return None
+
+        def _parent(states: dict):
+            for addr, st in bad.items():
+                cur = states.get(addr)
+                if cur is None or cur == R_CONFIRMED:
+                    continue            # 沒這個人 / 已送達(更強的結論)
+                if st == R_PERMANENT:
+                    states[addr] = R_PERMANENT      # 單調升級
+                elif cur == R_UNKNOWN:
+                    states[addr] = st               # 只補沒有結論的
+            return None
+
+        try:
+            with self._lock:
+                conn = self._ensure_conn_locked()
+                with self._txn(conn):
+                    if bad:
+                        self._mutate_states_in_txn(conn, cid, _child)
+                        if str(parent_id or ""):
+                            self._mutate_states_in_txn(conn, str(parent_id),
+                                                       _parent)
+                    conn.execute(
+                        "UPDATE deliveries SET state=?, attempts=attempts+1,"
+                        " updated_at=? WHERE delivery_id=?",
+                        (SUBMITTING, _now(), cid))
+            return True
+        except Exception:
+            logging.warning("[delivery] 逐位 RCPT 結果落不了地(整筆回捲)",
+                            exc_info=True)
+            return False
 
     def settle(self, delivery_id: str, *, refused: "Optional[dict]" = None,
                unknown: bool = False, failed: bool = False,
@@ -974,8 +1046,18 @@ class DeliveryLedger:
                         a for a, st in child_states.items()
                         if st == R_PERMANENT)
                 prow = conn.execute(
-                    "SELECT recipients, business_key, created_at FROM deliveries"
-                    " WHERE delivery_id=?", (pid,)).fetchone()
+                    "SELECT recipients, business_key, created_at,"
+                    " superseded_by FROM deliveries WHERE delivery_id=?",
+                    (pid,)).fetchone()
+                if prow is None:
+                    return ""
+                # ★已被接手的鏈不得再產生任何工作★(外審第五輪 P1-03):
+                #   `superseded_by` 宣稱的是 durable 的 ownership transfer,
+                #   那就必須是【資料層】的 fence —— 只擋掃描端的話,還活在
+                #   記憶體裡的舊佇列項照樣能從已交棒的親紀錄開新子紀錄,
+                #   與接手者的補寄同時寄給同一個人。
+                if str(prow[3] or ""):
+                    return ""
                 try:
                     parent_states = _clean_recipients(
                         json.loads((prow[0] if prow else "") or "{}"))
@@ -1073,6 +1155,13 @@ class DeliveryLedger:
         —— 但那封信剛剛已經由較新的紀錄送到了,告警反而誘導人工重寄。
         收件人狀態刻意【不動】(沒有證據說這一筆送到了);排除靠
         `superseded_by`,見 `needs_recipient_retry`。
+
+        ★有 in-flight 子紀錄時不准交棒★(外審 AE-5 第 1 輪 P1):
+        claim 交易已經擋掉「先交棒、後 claim」,但反過來的交錯 ——
+        舊佇列先 claim 出 SUBMITTING 子紀錄、另一個 process 才 supersede
+        —— 舊鏈仍會把那封寄出去,與接手者同時寄給同一個人。兩邊都在
+        BEGIN IMMEDIATE 裡檢查對方的存在,誰先拿到寫鎖誰成立。
+        交棒被拒時回 False:呼叫端下一輪再試(那個子紀錄一定會收斂)。
         """
         did = str(delivery_id or "")
         if not did:
@@ -1080,6 +1169,12 @@ class DeliveryLedger:
         with self._lock:
             conn = self._ensure_conn_locked()
             with self._txn(conn):
+                inflight = conn.execute(
+                    "SELECT 1 FROM deliveries WHERE parent_id=? AND state IN"
+                    " (?,?,?) LIMIT 1",
+                    (did, SUBMITTING, PREPARED, UNKNOWN)).fetchone()
+                if inflight:
+                    return False
                 cur = conn.execute(
                     "UPDATE deliveries SET body_text='', superseded_by=?,"
                     " note=?, updated_at=? WHERE delivery_id=?",

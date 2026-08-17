@@ -588,14 +588,20 @@ class Reconciler:
                 #   而寄出「始終沒收到,請人工轉寄」—— 但那封信剛剛已經由
                 #   較新的紀錄送到了,告警反而誘導人工重寄。
                 try:
-                    led.supersede(did, by=newer_id,
-                                  note="同 business_key 已有較新的紀錄接手,"
-                                       "本鏈結案")
+                    if led.supersede(did, by=newer_id,
+                                     note="同 business_key 已有較新的紀錄"
+                                          "接手,本鏈結案"):
+                        logging.info("[%s] %s 的同 key 已有較新紀錄接手 →"
+                                     " 本鏈結案", self._tag, did)
+                    else:
+                        # ★有 in-flight 子紀錄 → 這一輪還不能交棒★
+                        #   (外審 AE-5 第 1 輪 P1):那封可能正在寄,
+                        #   交棒會讓兩條鏈同時對同一個人出手。
+                        logging.info("[%s] %s 還有結果未定的補寄 → 這一輪"
+                                     "先不交棒(下輪再試)", self._tag, did)
                 except Exception:
                     logging.warning("[%s] 結鏈 %s 失敗(下輪再試)",
                                     self._tag, did, exc_info=True)
-                logging.info("[%s] %s 的同 key 已有較新紀錄接手 → 本鏈結案",
-                             self._tag, did)
                 return ""
             if verdict == "wait":
                 # 較新的 bodyless 紀錄結果未定 —— 它可能已送達;現在補是
@@ -823,17 +829,14 @@ class Reconciler:
         冪等:同一次寄送重試時會被再呼叫一次。
         """
         def _record(accepted, refused):
-            try:
-                if refused:
-                    led.record_refusals(child_id, refused)
-                    if parent_id:
-                        led.record_refusals(parent_id, refused)
-                led.mark_submitting(child_id)
-                return True
-            except Exception:
-                logging.warning("[delivery] 逐位 RCPT 結果落不了地 →"
-                                " 這一次不送(內容尚未送出)", exc_info=True)
-                return False
+            # ★三件事同一筆交易★(外審 AE-5 第 1 輪 P2):子紀錄拒收 +
+            #   親紀錄分類升級(550 單調升、421 只補沒有結論的)+ 嘗試
+            #   邊界。拆開寫的話會出現「子已 permanent、親還是 transient」
+            #   的中間狀態 —— claim 看子紀錄拒絕補寄、佇列看親紀錄繼續
+            #   退避,最後用「暫時性拒收用盡」的語氣告警一個確定不存在的
+            #   信箱。落不了地 → 整筆回捲 → 呼叫端在 DATA 之前中止。
+            return bool(led.record_rcpt_outcome(child_id, parent_id,
+                                                dict(refused or {})))
         return _record
 
     def _settle_quietly(self, led, did, **kw) -> None:

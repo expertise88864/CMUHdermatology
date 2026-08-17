@@ -570,6 +570,18 @@ def send_mail(recipients: list, subject: str, body: str,
         message_id=message_id,
     )
     max_retries = _normalize_max_retries(max_retries)
+    # ★RCPT 證據的壽命是【一次 SMTP 嘗試】,不是跨 safe retry 累積★
+    #   (外審 2026-08-17 第五輪 P1-01)內層重試會對每一次嘗試重跑
+    #   `_send_once` → callback 被呼叫多次:第一次 B 被 421、第二次 B
+    #   收下了,但呼叫端只在「有拒收」時寫帳 —— 第一次留下的 TRANSIENT
+    #   永遠沒被作廢,之後 durable 補寄會再寄一封給【已經收到的人】。
+    #   ★所以有 callback 就必須只做一次嘗試★:重試的所有權在外層的
+    #   durable 狀態機(claim + 額度 + 退避)。這裡直接擋下來,
+    #   不靠每個呼叫端自己記得(守衛不可以有靜默失效的形狀)。
+    if on_rcpt_result is not None and max_retries > 0:
+        raise ValueError(
+            "帶 on_rcpt_result 的寄送必須 max_retries=0 —— RCPT 逐位證據"
+            "只描述【這一次】嘗試,跨重試累積會把已送達的人記成待補寄")
     reservation = _reserve_rate_limit_slot(cred, category)
 
     import time as _time

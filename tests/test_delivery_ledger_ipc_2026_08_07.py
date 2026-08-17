@@ -143,8 +143,12 @@ class TestCrossProcessSafety:
         # (docstring 寫明),呼叫它們的方法必須自己有 _txn —— 由下面的檢查
         # 涵蓋。`_connect_locked` 是 idempotent 的 schema bootstrap
         # (CREATE TABLE / INSERT OR IGNORE 一筆常數),autocommit 即可。
+        # `_mutate_states_in_txn` 同樣是「在呼叫端的交易裡執行」的內層
+        # (批次AE-5:一次 RCPT 的結果要把子紀錄拒收+親紀錄升級+嘗試邊界
+        #  寫在【同一筆】交易裡,所以這一段必須能被別人的交易包起來)。
         in_callers_txn = {"_insert_locked", "_prune_locked",
-                          "_scrub_stale_bodies_locked", "_connect_locked"}
+                          "_scrub_stale_bodies_locked", "_connect_locked",
+                          "_mutate_states_in_txn"}
         checked = 0
         for fn in ast.walk(tree):
             if not isinstance(fn, ast.FunctionDef):

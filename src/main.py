@@ -8815,6 +8815,12 @@ def _send_alert_email_via_smtp(subject: str, body: str,
             crash 就只剩「信在寄件備份裡」—— 整封 Message-ID 回查會把 B
             也判成已送達。落不了地不中止(臨床通知 availability-first),
             只是那一封退回舊的風險等級。
+
+            ★帳本寫不進去時,在 DATA 之前改存跨 process 寄存處★
+            (外審第五輪 P1-02):`LedgerUnavailable` 是這套設計明確要處理
+            的故障,而寄存處是純檔案 —— 帳本掛了照樣寫得進去。舊寫法要等
+            SMTP 回來、呼叫端跑到 `_persist_known_refusals()` 才會存;
+            中間斷電就什麼證據都沒有,回查把被拒的那位判成已送達。
             """
             if not (_led is not None and _did and refused):
                 return True
@@ -8824,7 +8830,20 @@ def _send_alert_email_via_smtp(subject: str, body: str,
             except Exception:
                 logging.debug("[delivery] 止掛信逐位拒收落地失敗",
                               exc_info=True)
-                return False
+            try:
+                from cmuh_common.delivery_reconcile import (  # noqa: PLC0415
+                    stash_refusal,
+                )
+                if stash_refusal(_did, refused):
+                    logging.warning("[delivery] 止掛信逐位拒收改存寄存處"
+                                    "(帳本此刻不可用)")
+                    return True
+            except Exception:
+                logging.debug("[delivery] 止掛信拒收寄存也失敗", exc_info=True)
+            logging.error("[delivery] ★這一封止掛信沒有 durable 的逐位證據★"
+                          " —— 帳本與寄存處都寫不進去;若中途斷電,"
+                          "被拒的收件人可能被回查誤判成已送達")
+            return False
 
         refused = send_mail(recipients=recipients, subject=subject, body=body,
                             attachment_path=None, timeout=timeout,
@@ -8832,6 +8851,12 @@ def _send_alert_email_via_smtp(subject: str, body: str,
                             # 系統／除錯類的呼叫端自己標明(外審 P2-02)。
                             category=(category or CATEGORY_CLINICAL),
                             message_id=(_msgid or None),
+                            # ★只留一層重試★(外審第五輪 P1-01):內層重試
+                            #   會讓 RCPT 證據跨嘗試累積(第一次被拒、第二次
+                            #   收下 → 帳上還留著 TRANSIENT → 補寄再寄一封
+                            #   給已經收到的人)。失敗不記去重,下一輪掃描
+                            #   本來就會再寄,所以不會因此漏掉這則提醒。
+                            max_retries=0,
                             on_rcpt_result=_rcpt_landed) or {}
         _settle(refused=refused)
         if refused:

@@ -415,9 +415,11 @@ class TestEverySendSiteIsWired:
     def test_the_alert_send_passes_the_recorder(self):
         src = self._src("main.py")
         i = src.index("refused = send_mail(recipients=recipients")
-        block = src[i:i + 600]
+        block = src[i:i + 900]
         assert "on_rcpt_result=_rcpt_landed" in block, (
             "★止掛信沒接上逐位落地★ 它走的是同一條回查路")
+        assert "max_retries=0" in block, (
+            "★止掛信仍用內層重試★ RCPT 證據會跨嘗試累積(第五輪 P1-01)")
 
 
 class TestPermanentPropagation:

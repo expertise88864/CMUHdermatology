@@ -5875,16 +5875,29 @@ def _initial_rcpt_recorder(delivery_id: str):
         if not refused:
             return True
         led = _get_ledger()
-        if led is None:
-            return False
-        try:
-            led.record_refusals(did, refused)
+        if led is not None:
+            try:
+                led.record_refusals(did, refused)
+                return True
+            except Exception:
+                logging.warning("[delivery] 逐位 RCPT 結果寫不進帳本",
+                                exc_info=True)
+        # ★帳本寫不進去 → 在 DATA 之前改存跨 process 寄存處★
+        #   (外審第五輪 P1-02):舊寫法要等 SMTP 回來、呼叫端跑到
+        #   `_persist_known_refusals()` 才存 —— 中間斷電就什麼證據都沒有,
+        #   回查把被明確拒收的那位判成已送達(沉默漏寄)。寄存處是純檔案,
+        #   帳本掛了照樣寫得進去,兩支程式的回查都會來補記。
+        from cmuh_common.delivery_reconcile import (  # noqa: PLC0415
+            stash_refusal,
+        )
+        if stash_refusal(did, refused):
+            logging.warning("[delivery] 逐位拒收改存寄存處(帳本此刻不可用;"
+                            "初次通知照常送出)")
             return True
-        except Exception:
-            logging.warning("[delivery] 逐位 RCPT 結果落不了地(初次寄送"
-                            "照常送出;拒收另有佇列與寄存處備援)",
-                            exc_info=True)
-            return False
+        logging.error("[delivery] ★這一封沒有 durable 的逐位證據★ —— 帳本與"
+                      "寄存處都寫不進去;若中途斷電,被拒的收件人可能被回查"
+                      "誤判成已送達")
+        return False
     return _record
 
 
@@ -6256,7 +6269,7 @@ def _resend_transient_refusals(delivery, refused: dict,
             #   (排程卡住超過一小時醒來的舊佇列項,不看帳直接寄的話,
             #    durable 補寄早已送達的人會再收到一封。)
             from cmuh_common.delivery_ledger import (  # noqa: PLC0415
-                KIND_QUEUE_RETRY, R_CONFIRMED,
+                KIND_QUEUE_RETRY, R_CONFIRMED, R_PERMANENT,
             )
             try:
                 _rid = led.claim_resend_child(
@@ -6271,25 +6284,39 @@ def _resend_transient_refusals(delivery, refused: dict,
                                 exc_info=True)
                 return refused
             if not _rid:
-                # 沒 claim 到:別的 sender 正 in-flight,或目標其實已送達。
-                # ★只有【明確記著已送達】才可以把拒收結案★(外審 AE-3
-                #   第 1 輪 F1):舊寫法用「親紀錄已無 TRANSIENT」當送達的
-                #   證據 —— 但 settle 寫不進帳時,那幾位會停在 UNKNOWN
-                #   (也不是 TRANSIENT),於是【明確被 SMTP 拒收】的人被
-                #   靜靜地從拒收清單移除:不重試、不告警,之後 Sent 回查
-                #   還會把整筆 UNKNOWN 一起判成已送達。不確定就留著。
+                # 沒 claim 到:別的 sender 正 in-flight、目標已有結論,
+                # 或這條鏈已經交棒。
+                # ★只有【明確的終局結論】才可以把拒收結案★(外審 AE-3
+                #   第 1 輪 F1 + 第五輪 P1-03/P2-01):舊寫法用「親紀錄已無
+                #   TRANSIENT」當送達的證據 —— 但 settle 寫不進帳時那幾位
+                #   停在 UNKNOWN,【明確被拒】的人就被靜靜移除:不重試、
+                #   不告警,之後回查還把整筆 UNKNOWN 判成已送達。
+                #   終局有三種,語意不同但都不該再排退避:
+                #     已送達(R_CONFIRMED)/ 永久被拒(R_PERMANENT)/
+                #     這條鏈已交棒(superseded_by)。
                 try:
                     prec = led.get(origin_did) or {}
                     pstates = prec.get("recipients") or {}
+                    superseded = str(prec.get("superseded_by") or "")
                     got = [a for a in targets
                            if pstates.get(a) == R_CONFIRMED]
+                    gone = [a for a in targets
+                            if pstates.get(a) == R_PERMANENT]
                 except Exception:
-                    got = []
-                if got:
-                    logging.info("[delivery] 佇列補寄的目標已由其他 sender"
-                                 " 送達 → 這幾位結案:%s", ", ".join(got))
+                    got, gone, superseded = [], [], ""
+                if superseded:
+                    # ★責任已在接手的那一筆★:再排退避就是兩個 sender
+                    #   同時對同一位收件人出手;用盡告警也會歸錯帳。
+                    logging.info("[delivery] 這條補寄鏈已由 %s 接手 →"
+                                 " 佇列項結案(不再退避、不告警)", superseded)
+                    return {}
+                if gone:
+                    logging.error("[delivery] ★這幾位是永久被拒(位址錯誤/"
+                                  "查無此人),不再重試★:%s", ", ".join(gone))
+                if got or gone:
+                    _done = set(got) | set(gone)
                     return {a: i for a, i in (refused or {}).items()
-                            if a not in got}
+                            if a not in _done}
                 return refused          # in-flight/不確定 → 下一輪退避
             # ★讀不到就不跨 SMTP 邊界★(外審 AE-3 第 1 輪 F3):交易可能
             #   已把名單縮小,讀取失敗時沿用手上的舊名單會寄給【剛被別人
