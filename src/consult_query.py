@@ -5859,6 +5859,71 @@ _pending_refusal_retries: list = []
 _pending_refusal_lock = threading.Lock()
 
 
+def _persist_known_refusals(origin_did: str, refused: dict) -> bool:
+    """把【已知的逐位拒收】落地到初次那一筆。盡力而為,失敗只記 log。
+
+    ★[外審 AE-3 第 2 輪 P1] 搶在粗粒度回查之前★
+    送出當下的 `settle` 若寫不進帳(帳本暫時不可用),「B 被 4xx 拒收」
+    就只活在記憶體的退避佇列裡,帳上 B 還是 UNKNOWN。而 Message-ID 回查
+    是【整封】粒度 —— 它在寄件備份查到這封信(A 確實收到了)會把所有
+    UNKNOWN 收件人一起判成已送達,B 的拒收被永久覆蓋,補寄路徑之後看到
+    CONFIRMED 就結案 = 沉默的漏寄。所以每一條「我們知道有人被拒」的
+    路徑都先把它落地(冪等;帳本只覆蓋仍 UNKNOWN 的,不會推翻已送達)。
+    """
+    if not origin_did or not refused:
+        return True
+    led = _get_ledger()
+    if led is None:
+        return False
+    try:
+        done = led.record_refusals(origin_did, refused)
+        if done:
+            logging.info("[delivery] 已把逐位拒收落地到初次紀錄:%s",
+                         ", ".join(done))
+        return True
+    except Exception:
+        # ★跨 process 的備援★(外審 AE-3 第 4 輪 P1):主程式跑的是同一本帳
+        #   的回查,它不知道我們手上有沒落地的 4xx —— 寫進共用的寄存處
+        #   (純檔案,帳本掛了照樣寫得進去),兩邊的回查都會先來補記。
+        from cmuh_common.delivery_reconcile import (  # noqa: PLC0415
+            stash_refusal,
+        )
+        stashed = stash_refusal(origin_did, refused)
+        logging.warning("[delivery] 逐位拒收落地失敗(已存進寄存處=%s;"
+                        "沒存進去的話回查可能把它覆蓋成已送達)", stashed,
+                        exc_info=True)
+        return False
+
+
+def _persist_pending_refusals_now() -> set:
+    """把【所有】待補寄項的已知拒收落地(不管到期沒)。→ 落不了地的 origin。
+
+    ★[外審 AE-3 第 3 輪 P1] 回查會搶在退避到期之前★
+    第一次退避是兩分鐘後、回查的年齡門檻是十分鐘,看起來來得及 ——
+    但帳本停機的那段時間裡,送出當下與排入佇列時的落地【都失敗了】,
+    那個 4xx 事實只留在記憶體佇列。等帳本恢復、佇列還沒到期,
+    整封粒度的回查就先把那位 UNKNOWN 收件人判成已送達,而落地規則
+    (只覆蓋 UNKNOWN)之後永遠救不回來 = 沉默的漏寄。
+    所以每一輪回查【之前】把所有待補寄項的拒收再落地一次;
+    仍落不了地的 origin,這一輪不准被回查收斂(它的證據還在記憶體裡,
+    帳本上是不完整的)。
+    """
+    with _pending_refusal_lock:
+        items = [(str(i.get("origin") or ""), dict(i.get("refused") or {}))
+                 for i in _pending_refusal_retries]
+    blocked = set()
+    for origin, refused in items:
+        if not origin or not refused:
+            continue
+        if not _persist_known_refusals(origin, refused):
+            blocked.add(origin)
+    if blocked:
+        logging.warning("[delivery] %d 筆待補寄的拒收還沒落地 → 這一輪"
+                        "不讓回查收斂它們(整封回查會把拒收覆蓋成已送達)",
+                        len(blocked))
+    return blocked
+
+
 def _schedule_refusal_retry(delivery, refused: dict, trigger_label: str,
                             origin_did: str = "") -> None:
     """把仍未送達的暫時性拒收排進退避佇列(由後續輪次的 `_drain_...` 處理)。
@@ -5872,6 +5937,10 @@ def _schedule_refusal_retry(delivery, refused: dict, trigger_label: str,
     HIS 查看)。兩邊靠資料庫仲裁不重複:佇列的補寄有 parent_id,
     是 in-flight 子紀錄時 durable 補寄不出手。
     """
+    # ★排進佇列的同時就把拒收落地★(外審 AE-3 第 2 輪 P1):第一次退避是
+    #   兩分鐘後,而回查的年齡門檻是十分鐘 —— 但那只是「通常來得及」,
+    #   排程被卡住或 drain 沒跑到就來不及了。知道的當下就寫。
+    _persist_known_refusals(origin_did, refused)
     with _pending_refusal_lock:
         _pending_refusal_retries.append({
             "delivery": delivery, "refused": dict(refused),
@@ -5968,8 +6037,15 @@ _RECONCILER = _Reconciler(lambda: _get_ledger(), tag="delivery",
 
 
 def _reconcile_unknown_deliveries(now=None, finder=None) -> int:
-    """把帳本上的 UNKNOWN／卡住的 SUBMITTING 拿去寄件備份回查。→ 收斂幾筆。"""
-    return _RECONCILER.run_once(now=now, finder=finder)
+    """把帳本上的 UNKNOWN／卡住的 SUBMITTING 拿去寄件備份回查。→ 收斂幾筆。
+
+    ★回查之前先把記憶體裡的拒收落地★(外審 AE-3 第 3 輪 P1):
+    整封粒度的回查會把所有 UNKNOWN 收件人一起判成已送達 —— 沒落地的
+    4xx 就此消失。落不了地的那幾筆這一輪不收斂(見
+    `_persist_pending_refusals_now`)。
+    """
+    return _RECONCILER.run_once(now=now, finder=finder,
+                                skip_ids=_persist_pending_refusals_now())
 
 
 _ABANDON_RETRY_AFTER_SEC = 3600.0     # 帳上掛超過一小時 → 明確結案 + 告警
@@ -6004,8 +6080,8 @@ def _close_out_stale_recipient_retries(now=None) -> None:
             if now - float(rec.get("created_at") or 0) < _ABANDON_RETRY_AFTER_SEC:
                 continue                       # 還在退避窗口內,交給佇列
             from cmuh_common.delivery_ledger import (  # noqa: PLC0415
-                KIND_AUTO_RESEND, PREPARED, RESEND_MAX_AUTO, SUBMITTING,
-                UNKNOWN,
+                KIND_AUTO_RESEND, PREPARED, RESEND_MAX_AUTO,
+                RESEND_MAX_CLAIMS, SUBMITTING, UNKNOWN, _as_attempts,
             )
             try:
                 kids = led.resend_children(did)
@@ -6022,9 +6098,14 @@ def _close_out_stale_recipient_retries(now=None) -> None:
                        (SUBMITTING, PREPARED, UNKNOWN) for c in kids):
                     continue
             if str(rec.get("body_text") or "") and kids is not None:
-                autos = sum(1 for c in kids
-                            if str(c.get("kind") or "") == KIND_AUTO_RESEND)
-                if autos < RESEND_MAX_AUTO:
+                # ★額度=實際進入 SMTP 的嘗試★(外審 R3 P1-01,與回查端
+                #   同一把尺):claim 後 crash 的子紀錄不算用掉額度。
+                autos = [c for c in kids
+                         if str(c.get("kind") or "") == KIND_AUTO_RESEND]
+                started = sum(1 for c in autos
+                              if _as_attempts(c.get("attempts")) > 0)
+                if (started < RESEND_MAX_AUTO
+                        and len(autos) < RESEND_MAX_CLAIMS):
                     continue                   # durable 補寄還有額度,先讓它做
             gone = led.abandon_recipient_retry(
                 did, note="補寄未成功(可能跨越程式重啟)→ 已告警")
@@ -6093,6 +6174,7 @@ def _resend_transient_refusals(delivery, refused: dict,
     from cmuh_common.delivery_ledger import (  # noqa: PLC0415
         R_TRANSIENT, classify_refusal,
     )
+    _persist_known_refusals(origin_did, refused)
     for _n in range(_REFUSAL_RESEND_ATTEMPTS):
         targets = [addr for addr, info in (refused or {}).items()
                    if classify_refusal(_refusal_code(info)) == R_TRANSIENT]
@@ -6104,7 +6186,73 @@ def _resend_transient_refusals(delivery, refused: dict,
             delivery, recipients=tuple(sorted(targets)),
             message_id=_new_message_id(),
             business_key=f"{delivery.business_key}|retry{_n + 1}")
-        _rid = _delivery_begin(attempt, trigger_label, parent_id=origin_did)
+        led = _get_ledger()
+        if origin_did and led is not None:
+            # ★[批次AE-3,外審 R3 P1-02] 佇列補寄不再自己開帳★
+            #   與 durable 補寄走同一個 claim 仲裁:交易內重驗「此刻仍
+            #   暫時被拒、且沒有任何子紀錄已送達過」,有 in-flight 子紀錄
+            #   就這一輪不寄。佇列從 sender 降級成 scheduler ——
+            #   什麼時候去 claim 由它排;能不能寄、寄給誰,帳本說了算。
+            #   (排程卡住超過一小時醒來的舊佇列項,不看帳直接寄的話,
+            #    durable 補寄早已送達的人會再收到一封。)
+            from cmuh_common.delivery_ledger import (  # noqa: PLC0415
+                KIND_QUEUE_RETRY, R_CONFIRMED,
+            )
+            try:
+                _rid = led.claim_resend_child(
+                    origin_did,
+                    business_key=f"{delivery.business_key}|retry{_n + 1}",
+                    category="consult", recipients=list(targets),
+                    subject=delivery.subject,
+                    message_id=attempt.message_id, kind=KIND_QUEUE_RETRY)
+            except Exception:
+                logging.warning("[delivery] 佇列補寄 claim 失敗 → 這一輪不寄"
+                                "(退避會再排;沒有仲裁的補寄可能重複)",
+                                exc_info=True)
+                return refused
+            if not _rid:
+                # 沒 claim 到:別的 sender 正 in-flight,或目標其實已送達。
+                # ★只有【明確記著已送達】才可以把拒收結案★(外審 AE-3
+                #   第 1 輪 F1):舊寫法用「親紀錄已無 TRANSIENT」當送達的
+                #   證據 —— 但 settle 寫不進帳時,那幾位會停在 UNKNOWN
+                #   (也不是 TRANSIENT),於是【明確被 SMTP 拒收】的人被
+                #   靜靜地從拒收清單移除:不重試、不告警,之後 Sent 回查
+                #   還會把整筆 UNKNOWN 一起判成已送達。不確定就留著。
+                try:
+                    prec = led.get(origin_did) or {}
+                    pstates = prec.get("recipients") or {}
+                    got = [a for a in targets
+                           if pstates.get(a) == R_CONFIRMED]
+                except Exception:
+                    got = []
+                if got:
+                    logging.info("[delivery] 佇列補寄的目標已由其他 sender"
+                                 " 送達 → 這幾位結案:%s", ", ".join(got))
+                    return {a: i for a, i in (refused or {}).items()
+                            if a not in got}
+                return refused          # in-flight/不確定 → 下一輪退避
+            # ★讀不到就不跨 SMTP 邊界★(外審 AE-3 第 1 輪 F3):交易可能
+            #   已把名單縮小,讀取失敗時沿用手上的舊名單會寄給【剛被別人
+            #   送達】的人,而且那位根本不在子紀錄的帳上。子紀錄留給
+            #   卡住收斂路徑處理(attempts=0,不扣額度)。
+            claimed = sorted((led.get(_rid) or {}).get("recipients") or {})
+            if not claimed:
+                logging.warning("[delivery] 佇列補寄 %s claim 後讀不回名單"
+                                " → 這一輪不寄(交給卡住收斂)", _rid)
+                return refused
+            if set(claimed) != set(targets):
+                targets = claimed       # 交易縮小了名單(有人剛被送達)
+            attempt = _replace(attempt, recipients=tuple(claimed))
+            try:
+                led.mark_submitting(_rid)   # SMTP 嘗試邊界(與 durable 同規)
+            except Exception:
+                logging.warning("[delivery] 佇列補寄 %s 劃不了嘗試邊界 →"
+                                " 這一輪不寄", _rid, exc_info=True)
+                return refused
+        else:
+            # 沒有初次紀錄可仲裁(舊路徑)→ 維持原本的直接登記
+            _rid = _delivery_begin(attempt, trigger_label,
+                                   parent_id=origin_did)
         try:
             again = send_via_smtp(
                 attempt.attachment, attempt.subject, attempt.text_body,

@@ -219,7 +219,9 @@ class TestCrashRecoveryIsDbDriven:
 
     def test_the_claim_itself_enforces_the_cap(self, tmp_path, clock):
         """★上限的最終仲裁在 claim 交易內★(跨 process 的競態下,回查端的
-        預檢讀到的子紀錄清單可能已經過時)—— 直接對 claim 量。"""
+        預檢讀到的子紀錄清單可能已經過時)—— 直接對 claim 量。
+        ★額度=實際進入 SMTP 的嘗試★(外審 R3 P1-01):生產形狀是
+        claim → mark_submitting(嘗試邊界)→ send → settle。"""
         led = _led(tmp_path)
         did = _failed_parent(led, clock)
         for i in range(dl.RESEND_MAX_AUTO):
@@ -228,6 +230,7 @@ class TestCrashRecoveryIsDbDriven:
                                          recipients=["a@x.tw"],
                                          message_id=f"<c{i}@x>")
             assert kid
+            led.mark_submitting(kid)         # 跨過 SMTP 邊界才扣額度
             led.settle(kid, failed=True)
         assert led.claim_resend_child(did, business_key="bk", category="t",
                                       recipients=["a@x.tw"],
@@ -383,7 +386,7 @@ class TestNewerSiblingClosesTheChain:
         led = _led(tmp_path)
         did = _failed_parent(led, clock)
         monkeypatch.setattr(
-            led, "has_newer_sibling",
+            led, "newer_sibling_takeover",
             lambda *a, **k: (_ for _ in ()).throw(
                 dl.LedgerUnavailable("資料庫抖動")))
         sent = _capture_send(monkeypatch)
@@ -492,11 +495,12 @@ class TestCloseoutDefersToTheDurablePath:
         cq = importlib.import_module("consult_query")
         led = _led(tmp_path)
         did = self._partial(led, clock)
-        for i in range(dl.RESEND_MAX_AUTO):      # 額度已用盡(全失敗)
+        for i in range(dl.RESEND_MAX_AUTO):      # 額度已用盡(全實際嘗試過)
             kid = led.claim_resend_child(did, business_key="bk",
                                          category="consult",
                                          recipients=["miss@x.tw"],
                                          message_id=f"<c{i}@x>")
+            led.mark_submitting(kid)             # 跨過 SMTP 邊界才算額度
             led.settle(kid, failed=True)
         monkeypatch.setattr(cq, "_get_ledger", lambda: led)
         alerted = []

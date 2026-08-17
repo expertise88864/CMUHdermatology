@@ -83,8 +83,19 @@ BODY_RETAIN_SEC = 3 * 86400.0
 #   資料庫自己表達(resends_owed),不靠 call-stack 的順序 —— 只要還欠著,
 #   durable payload(body_text)就必須還在。
 KIND_AUTO_RESEND = "auto_resend"    # 回查驅動的自動補寄子紀錄(kind 欄)
-RESEND_MAX_AUTO = 2                 # 每筆原信最多幾次自動補寄(抑制的出口:
+KIND_QUEUE_RETRY = "queue_retry"    # 退避佇列的補寄子紀錄(批次AE-3:佇列
+#   也走 claim,與自動補寄共用同一套 recipient 仲裁;不吃 auto 額度 ——
+#   佇列自己有退避上限與用盡告警)
+# ★額度數的是「真正跨過 SMTP 邊界」的嘗試,不是 claim 次數★
+#   (外審 R3 P1-01):claim COMMIT 之後、send 之前 crash 的子紀錄
+#   attempts=0 —— 連續兩次這種 crash 就把臨床通知 abandon,等於
+#   「durable at-most-N-claims」而不是 durable work。邊界=呼叫端在
+#   send 之前 mark_submitting(attempts+1,已 fsync)。
+RESEND_MAX_AUTO = 2                 # 實際進入 SMTP 的自動補寄上限(出口:
 #   上限一到就明確放棄+告警;沒有上限的話,收不了信的信箱會被每輪追打)
+RESEND_MAX_CLAIMS = 6               # auto claim 總數的硬背擋:機器反覆在
+#   claim 與 send 之間中斷(每輪要 15+ 分鐘的收斂才會再 claim)也不可以
+#   無限開子紀錄 —— 到頂就放棄+告警(那台機器本身壞了,補寄修不了它)
 
 # ── 整筆寄送的狀態 ──────────────────────────────────────────────────────────
 PREPARED = "prepared"        # 舊格式遺留（新版 begin 直接落地成 SUBMITTING）
@@ -704,6 +715,44 @@ class DeliveryLedger:
             note=(note or ("寄件備份查到" if delivered else "寄件備份查無")))
         return state
 
+    def record_refusals(self, delivery_id: str, refused: dict) -> list:
+        """把【已知的 SMTP 逐位拒收】落地。→ 真的改到的人。
+
+        ★存在的理由(外審 AE-3 第 2 輪 P1)★ `settle` 寫不進帳的那一刻,
+        「B 被 4xx 拒收」只活在記憶體的退避佇列裡,帳上 B 還是 UNKNOWN。
+        而 Message-ID 回查是【整封】粒度:它在寄件備份查到這封信(因為
+        A 確實收到了)就把【所有】UNKNOWN 收件人一起判成已送達 ——
+        B 那筆明確的拒收被永久覆蓋,補寄路徑之後看到 CONFIRMED 就結案,
+        變成沉默的漏寄。所以已知的拒收要盡快落地,搶在粗粒度回查之前。
+
+        ★只有仍 R_UNKNOWN 的會被改★(外審 AE-3 第 3 輪 P1):
+        * CONFIRMED:那是「後來真的送達了」的權威結論(補寄成功會這樣
+          寫),推翻它會讓已經收到的人再收一封;
+        * ★PERMANENT:那是【已經結束】的狀態★ —— 5xx 位址錯誤、或補寄
+          上限用盡後的明確放棄(`abandon_recipient_retry`)。被延遲的
+          佇列項手上還握著一張舊的 421,重新把它打開就是繞過那些上限
+          再寄一次(抑制的出口被自己的復原機制拆掉);
+        * TRANSIENT:已經是「待補寄」了,不需要也不應該再翻動時間戳。
+        這個原語只做一件事:把【還沒有結論】的收件人補上已知的拒收。
+        """
+        bad = {}
+        for addr, info in (refused or {}).items():
+            code = info[0] if isinstance(info, (tuple, list)) and info else info
+            bad[str(addr).strip().lower()] = classify_refusal(code)
+        if not bad:
+            return []
+
+        def _apply(states: dict):
+            done = []
+            for addr, st in bad.items():
+                if states.get(addr) == R_UNKNOWN:
+                    states[addr] = st
+                    done.append(addr)
+            return sorted(done)
+
+        _state, done = self._mutate_recipients_locked(delivery_id, _apply)
+        return done or []
+
     def confirm_recipients(self, delivery_id: str, addrs: list) -> list:
         """把這幾位收件人在【這一筆】上的狀態改成已送達。回傳真的改到的。
 
@@ -828,23 +877,27 @@ class DeliveryLedger:
 
     def claim_resend_child(self, parent_id: str, *, business_key: str,
                            category: str, recipients: list,
-                           subject: str = "", message_id: str = "") -> str:
-        """★「查子紀錄 + 登記補寄」在同一筆交易裡★(外審 AD-3 第 1 輪 P1-2)
+                           subject: str = "", message_id: str = "",
+                           kind: str = KIND_AUTO_RESEND) -> str:
+        """★「查 + 驗 + 登記補寄」在同一筆交易裡★(AD-3 P1-2/R3 P1-01/02)
 
-        兩支程式的回查可能同時走到補寄:SELECT 與 INSERT 拆兩筆交易就是
-        TOCTOU —— 兩邊都查到「沒補過」,各寄一封重複的臨床通知。
-        BEGIN IMMEDIATE 讓「查 + 登記」原子化。回傳新 delivery_id;
-        不該補時回 ""。交易內的判準(★這裡是最終仲裁,外面的預檢只是
-        省工★,外審 2026-08-13 P1-02):
+        這裡是所有補寄 sender(回查的自動補寄【與】退避佇列)共用的
+        recipient 仲裁 —— 外面的預檢只是省工,正確性在交易內。
+        回傳新 delivery_id;不該補時回 ""(呼叫端用 `get()` 讀子紀錄的
+        recipients 當實際寄送對象 —— 交易可能把名單縮小)。判準:
 
-        * 有【結果未定】的子紀錄(SUBMITTING/PREPARED/UNKNOWN)→ 不補:
-          那封可能已送達,先等回查收斂(同時最多一封 in-flight)。
-          已收斂的子紀錄(CONFIRMED/PARTIAL/FAILED)★不擋★ —— 舊版
-          「有任何子紀錄就永不再補」讓「claim 之後、send 之前 crash」
-          變成兩封都證明沒寄出卻永遠不再寄。
-        * 自動補寄(kind=KIND_AUTO_RESEND)已達 RESEND_MAX_AUTO → 不補
-          (呼叫端負責明確放棄+告警;佇列補寄的子紀錄不計入 ——
-          它們自己有退避上限與用盡告警)。
+        * 有【結果未定】的子紀錄(SUBMITTING/PREPARED/UNKNOWN,任何
+          kind)→ 不補:那封可能已送達,同一時刻只有一個 sender。
+        * ★目標只留「此刻仍暫時性被拒、且沒有任何子紀錄已送達過」的人★
+          (外審 R3 P1-02):佇列的子紀錄送達了、還沒回寫親紀錄的瞬間,
+          另一個 executor 讀親紀錄仍看到 TRANSIENT —— 已送達集合要在
+          【同一筆交易裡】從子紀錄算出來,不能只信親紀錄。名單空 → ""。
+        * auto 額度(外審 R3 P1-01):已【實際進入 SMTP】(attempts>0,
+          呼叫端在 send 前 mark_submitting)的 auto 子紀錄 ≥
+          RESEND_MAX_AUTO → 不補;auto claim 總數 ≥ RESEND_MAX_CLAIMS
+          → 不補(硬背擋)。★claim 本身不扣額度★ —— claim 後、send 前
+          crash 的子紀錄(attempts=0)只佔 claim 背擋,不佔嘗試額度。
+          佇列(kind=KIND_QUEUE_RETRY)不計入兩者。
 
         ★補寄紀錄自己不落地 body★:payload 的權威在【親紀錄】上,
         鏈沒關閉之前它都在(P1-01 的保留規則)。落不了地就拋
@@ -853,22 +906,71 @@ class DeliveryLedger:
         pid = str(parent_id or "")
         if not pid:
             return ""
+        want = [str(a).strip().lower() for a in (recipients or [])
+                if str(a).strip()]
+        if not want:
+            return ""
         did = new_delivery_id()
-        rec = self._new_rec(did, business_key, category, recipients, subject,
-                            message_id, "", pid, "", kind=KIND_AUTO_RESEND)
         with self._lock:
             conn = self._ensure_conn_locked()
             with self._txn(conn):
                 rows = conn.execute(
-                    "SELECT state, kind FROM deliveries WHERE parent_id=?",
-                    (pid,)).fetchall()
+                    "SELECT state, kind, attempts, recipients FROM deliveries"
+                    " WHERE parent_id=?", (pid,)).fetchall()
                 if any(str(st) in (SUBMITTING, PREPARED, UNKNOWN)
-                       for st, _k in rows):
+                       for st, _k, _a, _r in rows):
                     return ""
-                autos = sum(1 for _st, k in rows
-                            if str(k) == KIND_AUTO_RESEND)
-                if autos >= RESEND_MAX_AUTO:
+                delivered_by_children: set = set()
+                for _st, _k, _a, raw in rows:
+                    try:
+                        child_states = _clean_recipients(json.loads(raw or "{}"))
+                    except (TypeError, ValueError):
+                        child_states = {}
+                    delivered_by_children.update(
+                        a for a, st in child_states.items()
+                        if st == R_CONFIRMED)
+                prow = conn.execute(
+                    "SELECT recipients, business_key FROM deliveries"
+                    " WHERE delivery_id=?", (pid,)).fetchone()
+                try:
+                    parent_states = _clean_recipients(
+                        json.loads((prow[0] if prow else "") or "{}"))
+                except (TypeError, ValueError):
+                    parent_states = {}
+                # ★同 business_key 底下任何一筆的已送達也要看★(外審 AE-3
+                #   第 1 輪 F2):工作層重跑的較新 sibling(可能 bodyless
+                #   PARTIAL)把 A 送到了,舊親紀錄還掛著 TRANSIENT ——
+                #   只看自己的子紀錄,A 會再收一封。
+                pbk = str(prow[1]) if prow else ""
+                if pbk:
+                    for (raw,) in conn.execute(
+                            "SELECT recipients FROM deliveries WHERE"
+                            " business_key=? AND delivery_id!=?", (pbk, pid)):
+                        try:
+                            states = _clean_recipients(
+                                json.loads(raw or "{}"))
+                        except (TypeError, ValueError):
+                            states = {}
+                        delivered_by_children.update(
+                            a for a, st in states.items()
+                            if st == R_CONFIRMED)
+                targets = [a for a in want
+                           if parent_states.get(a) == R_TRANSIENT
+                           and a not in delivered_by_children]
+                if not targets:
                     return ""
+                if str(kind) == KIND_AUTO_RESEND:
+                    autos = [(st, a) for st, k, a, _r in rows
+                             if str(k) == KIND_AUTO_RESEND]
+                    started = sum(1 for _st, a in autos
+                                  if _as_attempts(a) > 0)
+                    if started >= RESEND_MAX_AUTO:
+                        return ""
+                    if len(autos) >= RESEND_MAX_CLAIMS:
+                        return ""
+                rec = self._new_rec(did, business_key, category, targets,
+                                    subject, message_id, "", pid, "",
+                                    kind=str(kind))
                 self._insert_locked(conn, rec)
         return did
 
@@ -913,34 +1015,63 @@ class DeliveryLedger:
                         " WHERE delivery_id=? AND body_text!=''", (_now(), did))
                 return bool(cur.rowcount)
 
-    def has_newer_sibling(self, business_key: str, *,
-                          than_created_at: float) -> bool:
-        """同 business_key、比 than_created_at 新的【初次】紀錄存在嗎
-        (★任何狀態★,不只存活者)。
+    def newer_sibling_takeover(self, business_key: str, *,
+                               than_created_at: float) -> tuple:
+        """同 business_key、較新的【初次】紀錄能不能接走補寄義務。
+        → (verdict, 較新紀錄裡已確認送達的收件人 list)。
+        verdict: "takeover"(可,舊鏈結案)/"wait"(等它收斂)/
+        ""(沒有/沒本錢,舊鏈續扛)。
+
+        ★已送達名單一併帶回★(外審 AE-3 第 1 輪 F2):bodyless PARTIAL
+        sibling 送達了 A、暫時被拒 B —— verdict 是 ""(它沒本錢扛),
+        但 A 已經收到了:呼叫端要先把 A 回寫舊親紀錄再補,不然 A 會
+        再收一封。
 
         ★同一把 key 只留最新一條補寄鏈★(外審 AE-1 第 1 輪 P1-1):
-        工作層每次重試都 begin 新的一筆 —— 三次確定失敗就是三個 FAILED
-        親紀錄;每筆各自走 resends_owed 的話,SMTP 恢復後同一份通知會寄
-        三次。較新者(不論收斂與否)是 canonical:舊鏈一律結束,最新那筆
-        自己有 body 與額度,欠補寄由它扛。
+        工作層每次重試都 begin 新的一筆 —— 每筆各自走 resends_owed 的話,
+        SMTP 恢復後同一份通知會寄多次。但【接走義務】要有本錢
+        (外審 R3 P1-03):舊 JSON 匯入的紀錄天生沒有 body ——
+        混版部署期,舊程式寫下的較新 bodyless 紀錄若光憑「較新」就讓
+        舊鏈 clear_body,唯一的 durable payload 就被刪掉,兩筆都不再
+        actionable = 永久漏寄。所以:
 
-        ★讀不到 → raise,不回 True★(外審 AE-1 第 1 輪 P1-2):呼叫端把
-        True 當成「可以結鏈」的證據,而結鏈會刪掉唯一的 durable payload,
-        不可逆 —— 讀取失敗答成 True,一次暫時的資料庫抖動就把該補的信
-        永久丟掉。「跳過本輪」必須由呼叫端自己明寫。
+        * 較新者已 CONFIRMED、或自己有 body(能扛補寄)→ "takeover"。
+        * 較新者 bodyless 且結果未定(SUBMITTING/PREPARED/UNKNOWN)→
+          "wait":它可能已送達,先等回查收斂 —— 收斂成 CONFIRMED 就
+          takeover,收斂成 FAILED 就落到下一條。
+        * 其餘(bodyless 且已收斂 FAILED/PARTIAL)→ "":沒本錢也沒送達,
+          舊的 payload-bearing 鏈繼續扛。
+
+        ★讀不到 → raise,不回 takeover★(外審 AE-1 第 1 輪 P1-2):
+        呼叫端把 takeover 當成「可以結鏈」的證據,而結鏈會刪掉唯一的
+        durable payload,不可逆。「跳過本輪」必須由呼叫端自己明寫。
         """
         try:
             with self._lock:
                 conn = self._ensure_conn_locked()
-                cur = conn.execute(
-                    "SELECT 1 FROM deliveries WHERE business_key=?"
-                    " AND parent_id='' AND created_at>? LIMIT 1",
-                    (str(business_key), float(than_created_at)))
-                return cur.fetchone() is not None
+                rows = conn.execute(
+                    "SELECT state, body_text, recipients FROM deliveries"
+                    " WHERE business_key=? AND parent_id='' AND created_at>?",
+                    (str(business_key), float(than_created_at))).fetchall()
         except sqlite3.Error as e:
             raise LedgerUnavailable(
                 "這一刻查不出 %s 有沒有較新的同 key 紀錄" % business_key
             ) from e
+        delivered: set = set()
+        for _st, _b, raw in rows:
+            try:
+                states = _clean_recipients(json.loads(raw or "{}"))
+            except (TypeError, ValueError):
+                states = {}
+            delivered.update(a for a, st in states.items()
+                             if st == R_CONFIRMED)
+        if any(str(st) == CONFIRMED or str(b or "")
+               for st, b, _r in rows):
+            return "takeover", sorted(delivered)
+        if any(str(st) in (SUBMITTING, PREPARED, UNKNOWN)
+               for st, _b, _r in rows):
+            return "wait", sorted(delivered)
+        return "", sorted(delivered)
 
     def state_of(self, delivery_id: str) -> str:
         """某一筆的目前狀態。**查不到／讀不到一律回空字串**。

@@ -47,6 +47,26 @@ NO_MESSAGE_ID_GIVE_UP_SEC = 86400.0
 RESEND_OWED_MIN_AGE_SEC = 3600.0
 #: 一輪最多驅動幾筆欠補寄(每筆都可能開一次 SMTP)。
 MAX_OWED_PER_PASS = 3
+#: ★跨 process 的「這筆還有沒落地的逐位拒收」寄存處★(外審 AE-3 第 4 輪 P1)
+#: 帳本停機時 `record_refusals()` 寫不進去,那個 4xx 只在【會診程式的】
+#: 記憶體佇列裡。但主程式跑的是同一本帳的回查 —— 它不知道這件事,
+#: 帳本一恢復就可能先把那位 UNKNOWN 收件人判成已送達(整封粒度),
+#: 逐位證據永久消失。所以落地失敗時把它寫進這個 sidecar(不需要
+#: SQLite,帳本掛了照樣寫得進去),★兩支程式的回查都會先來這裡收斂★:
+#: 補記成功就移除,仍失敗就把那筆列入本輪不准收斂。
+#: 內容只有 delivery_id / 收件人信箱 / SMTP 碼 —— ★沒有病人資料★。
+#: ★每筆一個檔,不是一份共用 JSON★(外審 AE-3 第 5 輪 P1):共用檔的
+#: 「讀-改-寫」跨 process 沒有序列化 —— 主程式讀到 A、會診同時寫入
+#: A+B、主程式再寫回它的殘餘就把 B 刪掉了(`atomic_write_json` 只保證
+#: 替換是原子的,不提供跨 process 的互斥)。各寫各的檔就沒有這個問題:
+#: 寫入者只碰自己那個檔,drain 只刪它真的補記成功的那幾個。
+REFUSAL_STASH_DIRNAME = "pending_refusals"
+_STASH_MAX = 200                    # 有界:壞掉的機器不可以把它撐爆
+_STASH_TTL_SEC = 7 * 86400.0        # 出口:七天還補不上就不再擋(有告警)
+#: 讀不懂的寄存檔(寫到一半斷電/被改壞):不知道它指哪一筆 → 只能全部
+#: 擋住;但那樣的封鎖半徑很大,所以給它一天的出口(比 TTL 短),
+#: 到期就刪掉並大聲講(不是安靜丟掉)。
+_STASH_UNREADABLE_TTL_SEC = 86400.0
 
 
 def _created_at(rec) -> float:
@@ -81,6 +101,113 @@ def _created_at(rec) -> float:
     return f
 
 
+def _stash_dir() -> str:
+    import os  # noqa: PLC0415
+    from cmuh_common.paths import get_settings_dir  # noqa: PLC0415
+    return os.path.join(get_settings_dir(), REFUSAL_STASH_DIRNAME)
+
+
+def _stash_file_for(delivery_id: str) -> str:
+    """delivery_id → 它專屬的寄存檔路徑。
+
+    ★檔名用雜湊,不用 id 原文★:id 多半是 uuid4 的 hex(安全),但舊
+    JSON 匯入的紀錄可以是任何字串 —— 直接當檔名就可能出現路徑分隔字元。
+    真正的 id 存在檔案內容裡。
+    """
+    import hashlib  # noqa: PLC0415
+    import os  # noqa: PLC0415
+    name = hashlib.sha256(str(delivery_id).encode("utf-8")).hexdigest()[:32]
+    return os.path.join(_stash_dir(), name + ".json")
+
+
+def _load_stash_entries() -> tuple:
+    """讀寄存處 → ([(path, rec 或 None), …], 列舉得到嗎)。
+
+    ★列舉不到要回 False★:當成空的話,這一輪就會放行那些本該被擋住的
+    收斂。個別檔讀不懂 → rec=None(呼叫端另外處理,見 drain)。
+    """
+    import os  # noqa: PLC0415
+    from cmuh_common.atomic_io import safe_load_json_ex  # noqa: PLC0415
+    d = _stash_dir()
+    try:
+        if not os.path.isdir(d):
+            return [], True                 # 從來沒存過東西
+        names = sorted(os.listdir(d))
+    except OSError:
+        logging.error("[delivery] 列舉逐位拒收寄存處失敗(設定目錄有問題?)",
+                      exc_info=True)
+        return [], False
+    out = []
+    for n in names:
+        if not n.endswith(".json"):
+            continue
+        p = os.path.join(d, n)
+        data, status = safe_load_json_ex(p, {}, backup_on_corrupt=False)
+        if status == "missing":
+            continue                        # 別人剛補記完刪掉了
+        if status != "ok" or not isinstance(data, dict) \
+                or not str(data.get("delivery_id") or ""):
+            out.append((p, None))           # 讀不懂/沒有 id
+            continue
+        out.append((p, data))
+    return out, True
+
+
+def _prune_stash_locked(now: float) -> None:
+    """有界:超過上限就砍最舊的(只砍自己看得懂的那些)。"""
+    import os  # noqa: PLC0415
+    entries, ok = _load_stash_entries()
+    if not ok or len(entries) <= _STASH_MAX:
+        return
+    aged = sorted(((_as_float((r or {}).get("at")), p) for p, r in entries),
+                  reverse=True)
+    for _at, p in aged[_STASH_MAX:]:
+        try:
+            os.remove(p)
+            logging.error("[delivery] ★寄存處超過 %d 筆,砍掉最舊的一筆★"
+                          "(%s)—— 那筆拒收之後可能被誤判成已送達",
+                          _STASH_MAX, p)
+        except OSError:
+            logging.debug("[delivery] 砍寄存檔失敗 %s", p, exc_info=True)
+
+
+def stash_refusal(delivery_id: str, refused: dict, now=None) -> bool:
+    """★落地失敗時的跨 process 備援★(外審 AE-3 第 4 輪 P1)。→ 寫進去了嗎。
+
+    帳本停機時這裡照樣寫得進去(純檔案);兩支程式的回查都會先來這裡
+    補記,補不上的那一輪誰都不准收斂那一筆。
+    ★每筆寫自己那個檔★(第 5 輪 P1):共用檔的讀-改-寫跨 process 會
+    丟更新(A 的 drain 把同時寫入的 B 蓋掉)—— 各寫各的就沒有交集。
+    """
+    did = str(delivery_id or "")
+    if not did or not refused:
+        return True
+    now = float(now if now is not None else time.time())
+    try:
+        import os  # noqa: PLC0415
+        from cmuh_common.atomic_io import atomic_write_json  # noqa: PLC0415
+        os.makedirs(_stash_dir(), exist_ok=True)
+        atomic_write_json(_stash_file_for(did), {
+            "delivery_id": did, "at": now,
+            "refused": {str(a): (r[0] if isinstance(r, (tuple, list)) and r
+                                 else r)
+                        for a, r in dict(refused).items()}})
+        _prune_stash_locked(now)
+        return True
+    except Exception:
+        logging.error("[delivery] ★逐位拒收既寫不進帳本、也存不進寄存處★ —— "
+                      "回查可能把它覆蓋成已送達(%s)", did, exc_info=True)
+        return False
+
+
+def _as_float(v) -> float:
+    try:
+        f = float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return f if math.isfinite(f) else 0.0
+
+
 class Reconciler:
     """把帳本上的 UNKNOWN 與卡住的 SUBMITTING 用 Message-ID 回查寄件備份。
 
@@ -108,8 +235,14 @@ class Reconciler:
         self.last_ts = 0.0
 
     # ── 一輪 ──────────────────────────────────────────────────────────────
-    def run_once(self, now=None, finder=None) -> int:
-        """跑一輪回查。→ 收斂了幾筆。任何一步壞掉都只 log,不往上丟。"""
+    def run_once(self, now=None, finder=None, skip_ids=()) -> int:
+        """跑一輪回查。→ 收斂了幾筆。任何一步壞掉都只 log,不往上丟。
+
+        `skip_ids`:這一輪【不准收斂】的 delivery_id(外審 AE-3 第 3 輪
+        P1)—— 呼叫端手上還有沒落地的逐位拒收時,整封粒度的回查會把
+        那位收件人一起判成已送達,把證據永久蓋掉。帳本上的紀錄不完整
+        就先不要下結論,下一輪再說。
+        """
         led = self._get_ledger()
         if led is None:
             return 0
@@ -134,6 +267,17 @@ class Reconciler:
         except Exception:
             logging.debug("[%s] 讀取待回查清單失敗", self._tag, exc_info=True)
             return 0
+        skip = {str(s) for s in (skip_ids or ()) if str(s)}
+        skip |= self._drain_refusal_stash(led, now)
+        if "*" in skip:
+            # 寄存處讀不到 = 不知道有哪幾筆的帳面不完整 → 這一輪全部不碰
+            logging.warning("[%s] 這一輪跳過所有收斂(見上一行)", self._tag)
+            return 0
+        if skip:
+            # ★整封粒度的結論會蓋掉逐位的證據★ —— 帳本上還不完整的那幾筆
+            #   本輪一律不碰(收斂、逾期結案、補寄都不碰)。
+            pending = [r for r in pending
+                       if str(r.get("delivery_id") or "") not in skip]
         # ★沒有 Message-ID 的先處理掉★(外審 2026-08-09 P2-03)
         #   它們【永遠】查不出結果 —— 回查靠的就是那個 ID。放著不管的話:
         #   `has_live_delivery()` 會把它們算成「還沒被否證」,一接上寄送閘門
@@ -159,6 +303,9 @@ class Reconciler:
             owed = []
             logging.debug("[%s] 讀取欠補寄清單失敗(下輪再試)", self._tag,
                           exc_info=True)
+        if skip:
+            owed = [r for r in owed
+                    if str(r.get("delivery_id") or "") not in skip]
         if not ripe and not owed:
             return 0
         if not self._claim(led, now):
@@ -181,6 +328,67 @@ class Reconciler:
                                 self._tag, rec.get("delivery_id"),
                                 exc_info=True)
         return settled
+
+    def _drain_refusal_stash(self, led, now: float) -> set:
+        """把寄存處裡的逐位拒收補記進帳本。→ 補不上、本輪不准收斂的 id。
+
+        ★兩支程式的回查都會跑這裡★(外審 AE-3 第 4 輪 P1):寫下這筆
+        拒收的是【會診程式】的記憶體佇列,但主程式跑的是同一本帳的回查 ——
+        排除清單若只活在會診那個 process,主程式照樣會用整封粒度的結論
+        把逐位證據蓋掉。寄存處是檔案,兩邊都看得到。
+        ★讀不到寄存處 → 這一輪誰都不收斂★(空的當成「沒有待補記」會直接
+        放行本該被擋的那幾筆);補記成功就移除;七天還補不上就放它過去
+        (抑制要有出口),但大聲講。
+        """
+        import os  # noqa: PLC0415
+        entries, ok = _load_stash_entries()
+        if not ok:
+            logging.warning("[%s] 讀不到逐位拒收寄存處 → 這一輪不收斂任何"
+                            "紀錄(帳面可能不完整)", self._tag)
+            return {"*"}            # 見下:'*' = 全部跳過的哨符
+        blocked = set()
+        for path, rec in entries:
+            if rec is None:
+                # 讀不懂:不知道它指哪一筆 → 只能全部擋住;一天後的出口。
+                try:
+                    age = now - os.path.getmtime(path)
+                except OSError:
+                    age = 0.0
+                if age > _STASH_UNREADABLE_TTL_SEC:
+                    self._drop_stash_file(path, "讀不懂且已過一天")
+                    continue
+                logging.error("[%s] ★寄存處有讀不懂的檔(%s)→ 這一輪不收斂"
+                              "任何紀錄★(不知道它指哪一筆)", self._tag, path)
+                return {"*"}
+            did = str(rec.get("delivery_id") or "")
+            refused = rec.get("refused") or {}
+            try:
+                led.record_refusals(did, refused)
+                # ★只刪自己這一個檔★(第 5 輪 P1):共用檔的寫回會把
+                #   別的 process 同時寫入的新項目一起蓋掉。
+                self._drop_stash_file(path, "已補記進帳本")
+                continue
+            except Exception:
+                pass
+            if now - _as_float(rec.get("at")) > _STASH_TTL_SEC:
+                # ★出口★:七天補不上就不再擋(否則一筆補不上的拒收會讓
+                #   整台機器的收斂永遠停擺)。
+                logging.error("[%s] ★%s 的逐位拒收七天補不進帳本 → 放棄"
+                              "阻擋收斂(帳面不完整,可能誤報已送達)★",
+                              self._tag, did)
+                self._drop_stash_file(path, "逾期放棄")
+                continue
+            blocked.add(did)
+        return blocked
+
+    def _drop_stash_file(self, path: str, why: str) -> None:
+        import os  # noqa: PLC0415
+        try:
+            os.remove(path)
+        except OSError:
+            logging.debug("[%s] 移除寄存檔失敗(%s)%s —— 下輪會再補記一次"
+                          "(record_refusals 是冪等的)", self._tag, why, path,
+                          exc_info=True)
 
     def _give_up_on_unverifiable(self, led, pending, now: float) -> int:
         """沒有 Message-ID 又掛很久的 → 明確結案 + 大聲講。→ 結掉幾筆。
@@ -329,60 +537,104 @@ class Reconciler:
                 logging.warning("[%s] 結鏈 %s 失敗(下輪再試)", self._tag,
                                 did, exc_info=True)
             return ""
-        # 2) ★同一把 key 只留最新一條鏈★(外審 AE-1 第 1 輪 P1-1):
-        #    工作層每次重試都 begin 新的一筆 —— 三次確定失敗=三個 FAILED
-        #    親紀錄,每筆各自補寄的話,同一份通知會寄三次。較新者(不論
-        #    收斂與否)是 canonical,舊鏈結束;欠補寄由最新那筆自己扛。
+        # 2) ★同一把 key 只留最新一條鏈,但接手要有本錢★(AE-1 R1 P1-1 +
+        #    R3 P1-03):較新者已送達或自己有 body 才能接走義務;混版部署
+        #    匯入的 bodyless 較新紀錄若光憑「較新」就讓這裡 clear_body,
+        #    唯一的 durable payload 就被刪掉 = 永久漏寄。
         bk = str(rec.get("business_key") or "")
         if bk:
             try:
-                newer = led.has_newer_sibling(
+                verdict, sib_delivered = led.newer_sibling_takeover(
                     bk, than_created_at=_created_at(rec))
             except Exception:
-                # ★查不出 ≠ 有較新★(外審 AE-1 第 1 輪 P1-2):結鏈會刪掉
+                # ★查不出 ≠ 可接手★(外審 AE-1 第 1 輪 P1-2):結鏈會刪掉
                 #   唯一的 payload,不可逆 —— 讀取失敗只能【跳過本輪】,
                 #   body 原封不動,下輪再試。
                 logging.warning("[%s] 查不出 %s 的較新同 key 紀錄 → 本輪"
                                 "不補也不結鏈(結鏈不可逆)", self._tag, did,
                                 exc_info=True)
                 return ""
-            if newer:
+            if verdict == "takeover":
                 try:
                     led.clear_body(did, note="同 business_key 已有較新的"
                                              "紀錄接手,本鏈結案")
                 except Exception:
                     logging.warning("[%s] 結鏈 %s 失敗(下輪再試)",
                                     self._tag, did, exc_info=True)
-                logging.info("[%s] %s 的同 key 已有較新紀錄 → 本鏈結案"
-                             "(欠補寄由最新那筆扛)", self._tag, did)
+                logging.info("[%s] %s 的同 key 已有較新紀錄接手 → 本鏈結案",
+                             self._tag, did)
                 return ""
+            if verdict == "wait":
+                # 較新的 bodyless 紀錄結果未定 —— 它可能已送達;現在補是
+                #   潛在重複、現在結鏈是潛在漏寄。等回查把它收斂。
+                logging.info("[%s] %s 的較新同 key 紀錄結果未定 → 本輪等待",
+                             self._tag, did)
+                return ""
+            if sib_delivered:
+                # ★沒本錢接手,但它送到的人要先回寫★(外審 AE-3 第 1 輪
+                #   F2):bodyless PARTIAL sibling 送達了 A、暫時被拒 B ——
+                #   舊鏈接回義務時若不回寫,A 會再收一封臨床通知。
+                #   (claim 交易內也擋得住;這裡讓帳面誠實,不靠縱深。)
+                try:
+                    done = led.confirm_recipients(did, list(sib_delivered))
+                    if done:
+                        logging.info("[%s] 較新同 key 紀錄已送達 %s → 回寫"
+                                     "%s(這幾位不再補寄)", self._tag,
+                                     ", ".join(done), did)
+                    rec = led.get(did) or rec
+                except Exception:
+                    logging.warning("[%s] 回寫較新紀錄的已送達收件人失敗"
+                                    "(claim 交易仍會擋)", self._tag,
+                                    exc_info=True)
+                targets = recipients_needing_retry(
+                    rec.get("recipients") or {})
+                if not targets:
+                    try:
+                        led.clear_body(did, note="較新紀錄已送達所有待補"
+                                                 "收件人,補寄鏈結案")
+                    except Exception:
+                        logging.warning("[%s] 結鏈 %s 失敗(下輪再試)",
+                                        self._tag, did, exc_info=True)
+                    return ""
         # 3) in-flight 互斥(claim 交易內會再驗;這裡只是省一次 send 準備)。
         if any(str(c.get("state")) in (SUBMITTING, PREPARED, UNKNOWN)
                for c in children):
             return ""
         # 4) ★抑制的出口★ 上限一到就明確放棄+告警,不無聲、不無限追打。
-        autos = sum(1 for c in children
-                    if str(c.get("kind") or "") == KIND_AUTO_RESEND)
-        if autos >= RESEND_MAX_AUTO:
+        #    ★額度只數真正進入 SMTP 的嘗試(attempts>0)★(外審 R3
+        #    P1-01):claim 後、send 前 crash 的子紀錄不扣額度 —— 不然
+        #    連續兩次這種 crash 就能在【零次 SMTP】的情況下 abandon 一封
+        #    臨床通知。claim 總數另有硬背擋(反覆 claim=那台機器壞了)。
+        from cmuh_common.delivery_ledger import (  # noqa: PLC0415
+            RESEND_MAX_CLAIMS, _as_attempts,
+        )
+        autos = [c for c in children
+                 if str(c.get("kind") or "") == KIND_AUTO_RESEND]
+        started = sum(1 for c in autos
+                      if _as_attempts(c.get("attempts")) > 0)
+        why = ""
+        if started >= RESEND_MAX_AUTO:
+            why = "自動補寄已達 %d 次(實際進入 SMTP)上限仍未送達" \
+                  % RESEND_MAX_AUTO
+        elif len(autos) >= RESEND_MAX_CLAIMS:
+            why = ("自動補寄 claim 已達 %d 次硬背擋 —— 反覆在 claim 與"
+                   " send 之間中斷,這台機器需要人工檢查" % RESEND_MAX_CLAIMS)
+        if why:
             subject = str(rec.get("subject") or "")
             try:
                 gone = led.abandon_recipient_retry(
-                    did, note="自動補寄已達 %d 次上限仍未送達 → 明確放棄"
-                              % RESEND_MAX_AUTO)
+                    did, note=why + " → 明確放棄")
             except Exception:
                 logging.warning("[%s] 放棄 %s 的補寄失敗(下輪再試)",
                                 self._tag, did, exc_info=True)
                 return ""
             if gone:
-                logging.error("[%s] ★自動補寄已達 %d 次上限,明確放棄★:"
-                              "%s 始終沒收到(主旨:%s)—— 請人工確認/轉寄",
-                              self._tag, RESEND_MAX_AUTO, ", ".join(gone),
-                              subject)
+                logging.error("[%s] ★%s,明確放棄★:%s 始終沒收到"
+                              "(主旨:%s)—— 請人工確認/轉寄",
+                              self._tag, why, ", ".join(gone), subject)
                 if self._missed_alert is not None:
                     try:
-                        self._missed_alert(gone, subject,
-                                           "自動補寄已達 %d 次上限"
-                                           % RESEND_MAX_AUTO)
+                        self._missed_alert(gone, subject, why)
                     except Exception:
                         logging.warning("[%s] 漏收告警管道失敗", self._tag,
                                         exc_info=True)
@@ -451,7 +703,29 @@ class Reconciler:
                             exc_info=True)
             return ""
         if not new_did:
-            return ""                    # 已補過一次(可能是另一支程式補的)
+            return ""            # in-flight/已送達/額度已盡(交易內仲裁)
+        # ★寄給交易核定的名單★(外審 R3 P1-02):claim 可能把名單縮小
+        #   (這一瞬間有人被別的 sender 送達了)—— 手上的 addrs 是舊的。
+        #   ★讀不到就不寄★(外審 AE-3 第 1 輪 F3):`get()` 讀不到回 {},
+        #   沿用舊名單會寄給剛被別人送達的人,而且那位不在子紀錄的帳上。
+        addrs = sorted((led.get(new_did) or {}).get("recipients") or {})
+        if not addrs:
+            logging.warning("[%s] 補寄 %s claim 後讀不回名單 → 本輪不寄"
+                            "(子紀錄交給卡住收斂,不扣額度)",
+                            self._tag, new_did)
+            return ""
+        try:
+            # ★SMTP 嘗試邊界★(外審 R3 P1-01):跨過這裡才算一次嘗試
+            #   (attempts+1,synchronous=FULL 已 fsync)。額度數的是
+            #   這個,不是 claim 次數 —— claim 後 crash 的子紀錄
+            #   attempts=0,由卡住收斂收掉,不扣額度。劃不了邊界就不寄:
+            #   帳不可信時出手,額度又變回約略值。
+            led.mark_submitting(new_did)
+        except Exception:
+            logging.warning("[%s] 補寄 %s 劃不了 SMTP 嘗試邊界 → 本輪不寄"
+                            "(子紀錄由卡住收斂路徑收掉,不扣額度)",
+                            self._tag, new_did, exc_info=True)
+            return ""
         try:
             refused = send_mail(
                 recipients=list(addrs), subject=subject, body=body + note,

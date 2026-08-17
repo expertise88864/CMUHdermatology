@@ -159,11 +159,12 @@ class TestTheResendIsBounded:
             inspect.getsource(dl.DeliveryLedger.claim_resend_child))
         i = src.index("_txn")
         assert src.index(
-            "SELECT state, kind FROM deliveries WHERE parent_id=?") > i, (
+            "SELECT state, kind, attempts, recipients FROM deliveries") > i, (
             "查子紀錄在交易外 —— TOCTOU")
 
     def test_a_second_claim_for_the_same_parent_is_refused(self, tmp_path):
         led, did = _aged_unknown(tmp_path)
+        led.resolve_unknown(did, delivered=False)   # 生產順序:先查無收斂
         a = led.claim_resend_child(did, business_key="bk", category="t",
                                    recipients=["a@x.tw"])
         assert a
