@@ -41,6 +41,15 @@ MAX_PER_PASS = 5
 STUCK_SUBMITTING_AFTER_SEC = 900.0
 #: 沒有 Message-ID 的紀錄掛超過這麼久 → 放棄查證、明確結案 + 告警(見下)。
 NO_MESSAGE_ID_GIVE_UP_SEC = 86400.0
+#: ★有 Message-ID 但【持續查不出來】的也要有出口★(外審 2026-08-18 第七輪 P1)
+#:   回查的三態裡,`None` = 查不出來,而它有一大堆完全合法的來源:
+#:   ★IMAP 根本沒設定★(那台機器的每一次回查【永遠】回 None)、找不到
+#:   寄件備份信箱、SEARCH 沒回 OK、連線/認證/逾時。這些情況下
+#:   UNKNOWN / 卡住的 SUBMITTING 永遠不會收斂 —— 在 AE-6 之前那只是帳面
+#:   髒;接上事件所有權之後,它會【永久】擋掉同一個 business_key 的臨床
+#:   通知(醫師再寄一次 email 觸發也一樣被擋),而且沒有任何地方會說。
+#:   與上面同一個 24 小時政策:寧可重複寄一封,不可以永遠不寄。
+UNVERIFIABLE_GIVE_UP_SEC = 86400.0
 #: 欠補寄的親紀錄要「沉」這麼久才由回查接手 —— 讓呼叫端的記憶體退避佇列
 #: (2/10/30 分)先跑完它的快路徑,兩邊不會對同一批收件人同時補寄。
 #: 重啟後佇列消失,這個門檻就是 durable 補寄的接手時間。
@@ -318,8 +327,18 @@ class Reconciler:
             )
             finder = find_message_in_sent
         settled = 0
+        # ★放棄之前一定要【剛剛才查過一次、而且查不出結果】★
+        #   (外審第七輪 P1 的第一版自測 + 第 1 輪 P2)
+        #   * 純看年齡:IMAP 壞了一天、剛剛才修好的那一刻,下一輪會在
+        #     「連查都沒查」的情況下把它判成未送達 —— 已收到的人會再收一封;
+        #   * 只看「這一輪查過」也不夠:查到了 True/False 卻因為 SQLite 忙碌
+        #     而寫不進帳本的那一筆,狀態仍是 UNKNOWN —— 第二次寫入若剛好
+        #     恢復,就會把【已確認送達】改寫成未送達。
+        #   所以只收 finder 真的沒有結論的那幾筆。
+        unverifiable: list = []
         for rec in ripe[:MAX_PER_PASS]:
-            settled += self._settle_one(led, rec, finder)
+            settled += self._settle_one(led, rec, finder, unverifiable)
+        self._release_unverifiable(led, unverifiable, now)
         for rec in owed[:MAX_OWED_PER_PASS]:
             try:
                 self._resend_owed_one(led, rec)
@@ -391,13 +410,22 @@ class Reconciler:
                           exc_info=True)
 
     def _give_up_on_unverifiable(self, led, pending, now: float) -> int:
-        """沒有 Message-ID 又掛很久的 → 明確結案 + 大聲講。→ 結掉幾筆。
+        """查不出結果又掛很久的 → 明確結案 + 大聲講。→ 結掉幾筆。
 
         ★為什麼一定要有這個出口(外審 2026-08-09 P2-03)★
         回查完全靠 Message-ID。沒有它的紀錄(舊版寫的、`make_msgid()` 當下
         失敗的)**永遠不會被挑進 `ripe`** —— 於是永遠停在 LIVE_STATES,
         一接上寄送閘門就永久擋住那個 business key,而且沒有任何地方會說。
         那是「沒有出口的 fail-closed」,正是 2026-08-05 事故的形狀。
+
+        ★★有 Message-ID 的也一樣要有出口★★(外審 2026-08-18 第七輪 P1)
+        上一版把「有 Message-ID」當成「查得出來」而直接跳過 —— 但
+        `find_message_in_sent()` 的 `None`(查不出來)有一大堆合法來源,
+        其中★IMAP 根本沒設定的機器,每一次回查都回 None★:那一筆會永遠
+        停在 UNKNOWN / SUBMITTING。AE-6 之後那不只是帳面髒 —— 事件所有權
+        會讓同一個 business_key 的臨床通知【永久寄不出去】(醫師重寄
+        email 觸發也照樣被擋,而且觸發 journal 還會被結案)。
+        所以兩種「查不出來」都給同一個 24 小時出口,只是訊息要分得開。
 
         ★方向要選會被人發現的那一邊★
         結成「沒送到」的代價是【可能重複寄一封】;放著不管的代價是
@@ -406,7 +434,7 @@ class Reconciler:
         done = 0
         for rec in pending:
             if str(rec.get("message_id") or ""):
-                continue
+                continue          # 有 ID 的走 `_release_unverifiable`(見下)
             age = now - _created_at(rec)
             if age < NO_MESSAGE_ID_GIVE_UP_SEC:
                 continue
@@ -427,7 +455,73 @@ class Reconciler:
                           self._tag, did, age / 3600.0, rec.get("subject", ""))
         return done
 
-    def _settle_one(self, led, rec, finder) -> int:
+    def _release_unverifiable(self, led, attempted, now: float) -> int:
+        """★這一輪真的查過、仍然查不出來、而且已經掛太久 → 結案 + 解除封鎖★
+
+        (外審 2026-08-18 第七輪 P1)`find_message_in_sent()` 的 `None` 有
+        一大堆合法來源,其中【IMAP 根本沒設定的機器每一次都回 None】——
+        那一筆就永遠停在 UNKNOWN/SUBMITTING。AE-6 之後,那等於同一個
+        business_key 的臨床通知【永久寄不出去】,連醫師重寄 email 觸發都
+        被擋掉,而且沒有任何地方會說。
+
+        ★兩個條件缺一不可★
+        * ★這一輪剛剛查過、而且【查證本身沒有結論】★:純看年齡的話,
+          「IMAP 壞了一天、剛修好」的下一輪會在【連查都沒查】的情況下判成
+          未送達 —— 已收到的人會再收一封。而「查到了、只是寫不進帳本」
+          (SQLite 忙碌 → `LedgerUnavailable`)也不算沒有結論:那一筆的
+          答案已經有了,只是這一刻落不了地,下一輪重寫即可
+          —— 混進來的話會把【已確認送達】覆寫成未送達(外審第 1 輪 P2)。
+          呼叫端只把 finder 回 `None`/拋錯的那幾筆傳進來。
+        * 年齡超過 `UNVERIFIABLE_GIVE_UP_SEC`:偶爾一次查不出來很正常
+          (網路抖一下),要的是「持續」查不出來。
+
+        結成「未送達」的代價是【可能重複寄一封】(而且原信會由 durable
+        補寄鏈真的送出去);放著不管的代價是【該寄的永遠不寄,沒人知道】。
+        """
+        from cmuh_common.delivery_ledger import SUBMITTING, UNKNOWN  # noqa: PLC0415
+        done = 0
+        for rec in attempted:
+            did = str(rec.get("delivery_id") or "")
+            if not did or not str(rec.get("message_id") or ""):
+                continue
+            age = now - _created_at(rec)
+            if age < UNVERIFIABLE_GIVE_UP_SEC:
+                continue
+            try:
+                if led.state_of(did) not in (UNKNOWN, SUBMITTING):
+                    continue          # 這一輪已經查出結果了 → 不必釋放
+            except Exception:
+                logging.warning("[%s] 讀不出 %s 的狀態 → 本輪不釋放",
+                                self._tag, did, exc_info=True)
+                continue
+            try:
+                led.resolve_unknown(
+                    did, delivered=False,
+                    note="有 Message-ID 但回查持續查不出來,逾期結案")
+            except Exception:
+                logging.warning("[%s] 結案 %s 失敗", self._tag, did,
+                                exc_info=True)
+                continue
+            done += 1
+            logging.error("[%s] ★%s 有 Message-ID,但已掛 %.0f 小時、剛剛"
+                          "又查不出結果 → 回查這條路可能根本沒通"
+                          "(IMAP 未設定/連不上/找不到寄件備份)。結案為"
+                          "【未送達】並解除事件封鎖(主旨:%s)★ 對方若其實"
+                          "已收到會收到第二封 —— 那比【這個事件從此再也寄不"
+                          "出去】好;請檢查 IMAP 設定",
+                          self._tag, did, age / 3600.0, rec.get("subject", ""))
+        return done
+
+    def _settle_one(self, led, rec, finder, unverifiable_out=None) -> int:
+        """回查一筆並寫回結論。→ 收斂了幾筆(0/1)。
+
+        `unverifiable_out`:★只有【查證本身沒有結論】的紀錄會被放進來★
+        (finder 回 None、或 finder 自己拋錯)。查到了 True/False 卻寫不進
+        帳本的【不算】—— 那一筆已經有答案,只是這一刻落不了地,下一輪
+        重寫即可。混進去的話,逾期釋放會拿 `delivered=False` 覆蓋掉一個
+        【已經確認送達】的結論,補寄鏈就對收到的人再寄一封
+        (外審 AE-7 第 1 輪 P2)。
+        """
         did = str(rec.get("delivery_id") or "")
         msgid = str(rec.get("message_id") or "")
         if not did:
@@ -437,10 +531,14 @@ class Reconciler:
         except Exception:
             logging.warning("[%s] 回查 %s 失敗 → 維持原狀", self._tag, did,
                             exc_info=True)
+            if unverifiable_out is not None:
+                unverifiable_out.append(rec)
             return 0
         if found is None:
             logging.info("[%s] %s 回查不出結果 → 維持原狀,下輪再試",
                          self._tag, did)
+            if unverifiable_out is not None:
+                unverifiable_out.append(rec)
             return 0
         try:
             state = led.resolve_unknown(did, delivered=bool(found))

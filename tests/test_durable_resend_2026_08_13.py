@@ -243,8 +243,11 @@ class TestTheBodyHasItsOwnRetention:
         begin 交易永遠不會跑 —— 掃除要掛在回查(排程驅動、與寄信量無關)
         的每一輪開頭。★同一個實例、不重開、不寄新信★。"""
         led = dl.DeliveryLedger(path=str(tmp_path / "ledger.json"))
-        # 要有 Message-ID:沒有的話會被「無法查證,逾期結案」那條路收掉,
-        # 反例就量不到掃除本身(狀態變了是別條規則做的)。
+        # 要有 Message-ID:沒有的話會走「無法查證,逾期結案」那條路。
+        # ★[批次AE-7]★ 有 Message-ID 的現在【也】有出口(查不出來 24 小時
+        # 就釋放,見 `_release_unverifiable`)—— 而 body 保留期本來就是
+        # 3 天,所以走到這一行的紀錄一定同時滿足兩條規則。這條測試量的是
+        # 【掃除有沒有發生】,狀態的部分改成明講兩者的交互作用。
         did = led.begin(business_key="bk", category="t",
                         recipients=["a@x.tw"], message_id="<keep@x>",
                         body_text="臨床內文")
@@ -257,7 +260,9 @@ class TestTheBodyHasItsOwnRetention:
         assert n == 0
         assert led.get(did)["body_text"] == "", (
             "★不重啟、不寄新信的常駐行程永遠不掃★ 內文超過宣稱的保留期")
-        assert led.state_of(did) == dl.UNKNOWN
+        # 已經掛了 3 天又查不出結果 → 這一輪也會被釋放(批次AE-7):
+        # 事件所有權不可以被一筆永遠查不出來的紀錄永久佔住。
+        assert led.state_of(did) == dl.FAILED
 
     def test_startup_scrubs_stale_bodies_without_needing_new_mail(
             self, tmp_path):

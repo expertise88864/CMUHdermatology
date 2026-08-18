@@ -612,8 +612,13 @@ class DeliveryLedger:
         符合 2026-08-05 定案的 availability-first。
 
         ★抑制自帶出口★:卡住的 SUBMITTING/UNKNOWN 會被回查收斂
-        (Sent 查證 → CONFIRMED/FAILED;沒有 Message-ID 的 24 小時逾期
-        結案),收斂成 FAILED 之後同一事件就能再寄。
+        (Sent 查證 → CONFIRMED/FAILED),★而查不出來的那些【也有】上限★
+        —— 沒有 Message-ID、以及有 Message-ID 但持續查不出來(IMAP 未設定
+        /連不上/找不到寄件備份)的,掛滿 24 小時就明確結案 + 大聲告警
+        (`Reconciler._give_up_on_unverifiable`)。收斂成 FAILED 之後同一
+        事件就能再寄,而且原信會由 durable 補寄鏈重送。
+        ★這句話是本方法能不能用的前提★:少了那個上限,IMAP 一沒設定就會
+        讓一個 business_key 從此再也寄不出去(外審 2026-08-18 第七輪 P1)。
         """
         did = new_delivery_id()
         rec = self._new_rec(did, business_key, category, recipients, subject,
