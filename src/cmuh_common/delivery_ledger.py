@@ -129,6 +129,10 @@ OWNED_STATES = (PREPARED, SUBMITTING, UNKNOWN)
 #   在這裡」的那種交錯。到期就放行:寧可多一封,不可讓 20:00 的提醒或
 #   醫師手動的那一次靜默消失。
 _HANDOVER_FENCE_SEC = 120.0
+# ★沿 `superseded_by` 追接手者的跳數上限★(外審第九輪 P1-02)
+#   那是一個自由文字欄位:壞資料(自己指自己、成環)不可以讓帳本卡在
+#   無窮迴圈裡 —— 那會讓整支程式停在「查一下寄過了沒」這一步。
+_SUPERSEDE_MAX_HOPS = 32
 
 
 class LedgerUnavailable(RuntimeError):
@@ -685,7 +689,11 @@ class DeliveryLedger:
                     #   (FAILED)」之外的任何狀態都代表這次機會已經被服務過
                     #   或正在被服務。不需要時間租約,也不必分 CONFIRMED /
                     #   PARTIAL —— 下一次機會有它自己的 key。
-                    if self._served_occurrences_locked(conn, occs):
+                    _owners = self._occurrence_owners_locked(conn, occs)
+                    if _owners:
+                        # 沿 supersession 鏈才查到的所有權,順手補成 mapping
+                        # (自我修復,見 `_backfill_occurrence_owners_locked`)
+                        self._backfill_occurrence_owners_locked(conn, _owners)
                         return ""
                     # ★★遷移圍籬:舊 schema 的紀錄沒有機會鑰匙★★
                     #   (外審 2026-08-18 第八輪 P1-01)v4 的紀錄不可能有
@@ -700,8 +708,8 @@ class DeliveryLedger:
                     #   ★自帶出口★:那些紀錄會被回查收斂(查不出來也有 24
                     #   小時上限,見 AE-7),收斂後不再擋;而新版寫的每一筆都
                     #   有 mapping —— 這個圍籬只在遷移期間有作用。
-                    legacy = self._legacy_unmapped_owner_locked(
-                        conn, business_key)
+                    legacy = self._legacy_current_owner_locked(
+                        conn, business_key, unmapped_only=True)
                     if legacy:
                         logging.warning(
                             "[delivery] 同 business_key 還有【舊 schema 沒有"
@@ -731,30 +739,13 @@ class DeliveryLedger:
                 #   有子紀錄之後由既有的 in-flight 子紀錄檢查接手;
                 #   租約到期(擁有者死了、沒人接手)就放行 —— 靜默最多
                 #   `_HANDOVER_FENCE_SEC`,而且只擋內容完全相同的那一則。
-                owners = conn.execute(
-                    "SELECT delivery_id FROM deliveries d"
-                    " WHERE business_key=? AND parent_id='' AND (state IN (%s)"
-                    "  OR (state=? AND body_text!='' AND updated_at>?"
-                    "      AND NOT EXISTS (SELECT 1 FROM deliveries c"
-                    "                      WHERE c.parent_id=d.delivery_id)))"
-                    % ",".join("?" * len(OWNED_STATES)),
-                    (str(business_key), *OWNED_STATES, PARTIAL,
-                     _now() - _HANDOVER_FENCE_SEC)).fetchall()
-                if owners:
+                # ★三條判準只有一份實作★(外審第九輪 P1-01):這裡與遷移
+                #   圍籬問的是同一件事「這一把內容識別現在有沒有主人」,
+                #   差別只在圍籬多一個「沒有自己的機會鑰匙」的限定。
+                #   抄成兩份的必然結果就是那一輪的缺陷:圍籬那一份少了
+                #   上面說的【交棒中】那一條。
+                if self._legacy_current_owner_locked(conn, business_key):
                     return ""
-                # 同事件的補寄子紀錄:用 parent_id 串(business_key 會被
-                # 衍生成 `K|retry1`,字串比對抓不到)。
-                initials = conn.execute(
-                    "SELECT delivery_id FROM deliveries WHERE business_key=?"
-                    " AND parent_id=''", (str(business_key),)).fetchall()
-                for (pid,) in initials:
-                    busy = conn.execute(
-                        "SELECT 1 FROM deliveries WHERE parent_id=? AND"
-                        " state IN (%s) LIMIT 1"
-                        % ",".join("?" * len(OWNED_STATES)),
-                        (pid, *OWNED_STATES)).fetchone()
-                    if busy:
-                        return ""
                 self._insert_locked(conn, rec)
                 self._prune_locked(conn)
         return did
@@ -786,36 +777,133 @@ class DeliveryLedger:
                 " LIMIT 1", (pid, FAILED)).fetchone()
             if busy:
                 owners.setdefault(str(key), str(pid))
+                continue
+            # ★接手者是【兄弟】,不是子紀錄★(外審第九輪 P1-02):
+            #   `supersede()` 直到 AE-10(v2026.08.18.9)才開始把機會鑰匙
+            #   複製給接手者 —— 而 AE-9 世代【已經寫在磁碟上】的紀錄不會
+            #   因為程式更新而長出 mapping。那個形狀是:舊那一筆 FAILED、
+            #   `superseded_by=新id`、鑰匙只在舊那一筆身上;接手者還在飛
+            #   但沒有鑰匙。上面兩個判準都看不到接手者(它既不是持有者、
+            #   也不是子紀錄)→ 判成「沒人服務」→ 重播就開出第三筆,與
+            #   接手者同時寄給同一位醫師。所以要沿 `superseded_by` 走。
+            heir = self._live_successor_locked(conn, str(pid))
+            if heir:
+                owners.setdefault(str(key), heir)
         return owners
 
-    def _legacy_unmapped_owner_locked(self, conn, business_key: str) -> str:
-        """同 business_key、★沒有機會鑰匙★、而且【還在飛】的初次紀錄。→ id。
+    def _live_successor_locked(self, conn, delivery_id: str) -> str:
+        """沿 `superseded_by` 找出★還在負責的接手者★。→ id;沒有回 ""。
 
-        只有舊 schema(v4 以前)寫的紀錄會沒有 mapping —— 新版每一次 claim
-        都會把鑰匙寫進 `delivery_occurrences`。這是 v4→v5 混版期間的縱深
-        防禦,理由見 `claim_initial_delivery`(外審第八輪 P1-01)。
-        判準與別處一致:結果未定(`OWNED_STATES`)、或底下有結果未定的補寄。
+        接手者自己也可能再被接手(P0→P1→P2),所以要走鏈。「還在負責」與
+        別處同一個判準:不是 FAILED,或 FAILED 但底下有非 FAILED 的子紀錄。
+        ★環與斷鏈都要有出口★:`superseded_by` 是自由文字欄位,`visited`
+        加上 `_SUPERSEDE_MAX_HOPS` 保證停得下來;走完沒找到就回 ""
+        (=沒人服務,那一把鑰匙可以再寄)—— 失效方向是【多寄一封】,
+        與 2026-08-05 的 availability-first 定案一致,而不是靜默漏寄。
+        """
+        seen = {str(delivery_id)}
+        cur = str(delivery_id)
+        for _hop in range(_SUPERSEDE_MAX_HOPS):
+            row = conn.execute(
+                "SELECT superseded_by FROM deliveries WHERE delivery_id=?",
+                (cur,)).fetchone()
+            nxt = str(row[0] or "") if row else ""
+            if not nxt or nxt in seen:
+                if nxt:
+                    logging.warning("[delivery] superseded_by 成環(%s → %s)"
+                                    " → 當成沒有接手者", cur, nxt)
+                return ""
+            seen.add(nxt)
+            row2 = conn.execute(
+                "SELECT state FROM deliveries WHERE delivery_id=?",
+                (nxt,)).fetchone()
+            if row2 is None:
+                logging.warning("[delivery] superseded_by 指向不存在的紀錄"
+                                "(%s → %s)→ 當成沒有接手者", cur, nxt)
+                return ""
+            if str(row2[0]) != FAILED:
+                return nxt
+            busy = conn.execute(
+                "SELECT 1 FROM deliveries WHERE parent_id=? AND state!=?"
+                " LIMIT 1", (nxt, FAILED)).fetchone()
+            if busy:
+                return nxt
+            cur = nxt
+        logging.warning("[delivery] superseded_by 鏈超過 %d 跳 → 當成沒有"
+                        "接手者", _SUPERSEDE_MAX_HOPS)
+        return ""
+
+    def _backfill_occurrence_owners_locked(self, conn, owners: dict) -> None:
+        """把「沿鏈才查得到的所有權」順手寫成 mapping(`inherited=1`)。
+
+        ★只在寫交易裡做★(claim 這條路)—— 唯讀查詢不寫東西。
+        這是自我修復:AE-9 世代留下的形狀補上 mapping 之後,後續每一次
+        查詢都直接命中,不必再走鏈;歷史也查得回來。★不刪舊 mapping★,
+        兩邊都持有 → 任一方還在飛就擋得住,兩邊都確定失敗時「沒人服務」
+        仍然成立,出口判準完全不用改(與 AE-10 的交棒複製同一個理由)。
+        """
+        rows = [(str(k), str(v)) for k, v in (owners or {}).items() if v]
+        if not rows:
+            return
+        try:
+            conn.executemany(
+                "INSERT OR IGNORE INTO delivery_occurrences"
+                " (occurrence_key, delivery_id, inherited) VALUES (?,?,1)",
+                rows)
+        except Exception:                               # noqa: BLE001
+            # 補登記失敗不可以改變仲裁結果(擋/不擋已經算出來了)。
+            logging.warning("[delivery] 補寫機會鑰匙 mapping 失敗(不影響本次"
+                            "仲裁)", exc_info=True)
+
+    def _legacy_current_owner_locked(self, conn, business_key: str, *,
+                                     unmapped_only: bool = False) -> str:
+        """這一把★內容識別★上,此刻有沒有人在負責。→ 擁有者 id;沒有回 ""。
+
+        ★只有一份實作★(外審 2026-08-18 第九輪 P1-01):判準是三條的聯集,
+        少一條就是漏擋 —— 而它原本被抄成兩份,遷移圍籬那一份剛好少了
+        【交棒中】那一條:
+          ① 初次紀錄還在 `OWNED_STATES`(PREPARED/SUBMITTING/UNKNOWN
+             = 結果未定)→ 有人在飛;
+          ② 或「settle 成 PARTIAL、payload 還在、★還沒有任何子紀錄★、
+             而且是【剛剛】才動過的(`_HANDOVER_FENCE_SEC` 短租約)」——
+             settle 與 `claim_resend_child` 是兩筆交易,交棒剛好落在中間
+             的話新 generation 會把整封再寄一次,而收件人剛剛才收到。
+             ★只擋短租約★:`body_text` 代表的是「還欠一次補寄」的義務,
+             拿它的整個壽命當所有權會把 20:00 的排程提醒、醫師手動再按
+             一次通通靜默丟掉 —— 漏寄比重複嚴重,方向會錯;
+          ③ 或任一初次紀錄底下有★結果未定的補寄子紀錄★:子紀錄的
+             business_key 是 `K|retry1` 這種衍生字串,只能靠 parent_id 串。
+
+        `unmapped_only=True` 是 v4→v5 混版期間的遷移圍籬(外審第八輪
+        P1-01 + 其第 1 輪 P1):只看★沒有【自己的】機會鑰匙★的紀錄
+        (`inherited=0` 的 mapping 不存在)—— 交棒繼承來的鑰匙不算「這一筆
+        是新版寫的」。★圍籬自帶出口★:那些紀錄會被回查收斂(查不出來也有
+        24 小時上限,見 AE-7),收斂後不再擋;新版寫的每一筆都有 native
+        mapping —— 圍籬只在遷移期間有作用。
         """
         bk = str(business_key or "")
         if not bk:
             return ""
-        rows = conn.execute(
-            "SELECT d.delivery_id, d.state FROM deliveries d"
+        owned = ",".join("?" * len(OWNED_STATES))
+        unmapped = ("   AND NOT EXISTS (SELECT 1 FROM delivery_occurrences o"
+                    "                   WHERE o.delivery_id=d.delivery_id"
+                    "                     AND o.inherited=0)"
+                    if unmapped_only else "")
+        row = conn.execute(
+            "SELECT d.delivery_id FROM deliveries d"
             " WHERE d.business_key=? AND d.parent_id=''"
-            "   AND NOT EXISTS (SELECT 1 FROM delivery_occurrences o"
-            "                   WHERE o.delivery_id=d.delivery_id"
-            "                     AND o.inherited=0)",
-            (bk,)).fetchall()
-        for pid, st in rows:
-            if str(st) in OWNED_STATES:
-                return str(pid)
-            busy = conn.execute(
-                "SELECT 1 FROM deliveries WHERE parent_id=? AND state IN (%s)"
-                " LIMIT 1" % ",".join("?" * len(OWNED_STATES)),
-                (pid, *OWNED_STATES)).fetchone()
-            if busy:
-                return str(pid)
-        return ""
+            + unmapped +
+            "   AND (d.state IN (%s)"
+            "        OR (d.state=? AND d.body_text!='' AND d.updated_at>?"
+            "            AND NOT EXISTS (SELECT 1 FROM deliveries c"
+            "                            WHERE c.parent_id=d.delivery_id))"
+            "        OR EXISTS (SELECT 1 FROM deliveries c2"
+            "                   WHERE c2.parent_id=d.delivery_id"
+            "                     AND c2.state IN (%s)))"
+            " LIMIT 1" % (owned, owned),
+            (bk, *OWNED_STATES, PARTIAL, _now() - _HANDOVER_FENCE_SEC,
+             *OWNED_STATES)).fetchone()
+        return str(row[0]) if row else ""
 
     def _served_occurrences_locked(self, conn, keys) -> set:
         """這幾把機會鑰匙裡,哪幾把★已經被服務過或正在被服務★。

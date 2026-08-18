@@ -146,9 +146,17 @@ class TestCrossProcessSafety:
         # `_mutate_states_in_txn` 同樣是「在呼叫端的交易裡執行」的內層
         # (批次AE-5:一次 RCPT 的結果要把子紀錄拒收+親紀錄升級+嘗試邊界
         #  寫在【同一筆】交易裡,所以這一段必須能被別人的交易包起來)。
+        # `_backfill_occurrence_owners_locked`(批次AE-11)同樣是內層:
+        #  沿 supersession 鏈查到的所有權要與那一次仲裁寫在【同一筆】交易裡。
         in_callers_txn = {"_insert_locked", "_prune_locked",
-                          "_scrub_stale_bodies_locked", "_connect_locked",
-                          "_mutate_states_in_txn"}
+                          "_scrub_stale_bodies_locked",
+                          "_mutate_states_in_txn",
+                          "_backfill_occurrence_owners_locked"}
+        # `_connect_locked` 是另一種豁免:idempotent 的 schema bootstrap
+        # (CREATE TABLE / INSERT OR IGNORE 一筆常數),autocommit 即可 ——
+        # 它【不】要求呼叫端有交易,所以不能混進上面那一組(見下面的
+        # 呼叫端檢查)。
+        autocommit_ok = {"_connect_locked"}
         checked = 0
         for fn in ast.walk(tree):
             if not isinstance(fn, ast.FunctionDef):
@@ -161,7 +169,8 @@ class TestCrossProcessSafety:
                       and isinstance(n.args[0].value, str)
                       and n.args[0].value.lstrip().upper().startswith(
                           ("INSERT", "UPDATE", "DELETE"))]
-            if not writes or fn.name in in_callers_txn:
+            if not writes or fn.name in in_callers_txn \
+                    or fn.name in autocommit_ok:
                 continue
             calls = {n.func.attr for n in ast.walk(fn)
                      if isinstance(n, ast.Call)
@@ -171,6 +180,29 @@ class TestCrossProcessSafety:
             checked += 1
         assert checked >= 4, (
             f"守衛只掃到 {checked} 個寫入方法 —— 判準可能失效了(空集合不算過)")
+
+        # ★豁免不可以是一張白紙★:「在呼叫端的交易裡執行」只有在【呼叫端
+        #   真的有交易】時才成立,而上面那條規則掃不到「自己沒有直接寫入、
+        #   只呼叫這些內層 helper」的方法(它只看直接的 INSERT/UPDATE/DELETE)。
+        #   註解一直宣稱「由下面的檢查涵蓋」,但其實沒有人在檢查 ——
+        #   批次AE-11 施工時發現,順手把那個前提也變成守衛。
+        callers = 0
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef) \
+                    or fn.name in in_callers_txn:
+                continue
+            calls = {n.func.attr for n in ast.walk(fn)
+                     if isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Attribute)}
+            used = calls & in_callers_txn
+            if not used:
+                continue
+            assert "_txn" in calls, (
+                f"★{fn.name} 呼叫了內層寫入 {sorted(used)} 卻沒有自己的交易★"
+                " 那些 helper 的契約是「在呼叫端的交易裡執行」")
+            callers += 1
+        assert callers >= 3, (
+            f"呼叫端守衛只掃到 {callers} 個 —— 判準可能失效了(空集合不算過)")
 
 
 class TestEveryDeliveryReachesATerminalState:
