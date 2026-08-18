@@ -984,7 +984,9 @@ def _download_one(file_entry: dict, app_dir: str) -> Optional[tuple]:
     if not expected_sha:
         raise ValueError(f"[{key}] manifest 缺 sha256,拒絕不校驗寫入(整批暫不更新)")
 
-    local_path = _resolve_target_path(app_dir, local_filename)
+    # ★比對的對象是【現在真的在跑的那一份】★(外審 L2 第 1 輪 P1-01):
+    #   L2 之後 `<app>/src` 是回退點、不再更新 —— 拿它比會永遠判定落後。
+    local_path = _local_read_path(app_dir, local_filename)
 
     # [O1] SHA256 短路：本地內容已是 manifest 期望版 → 直接跳過（最常見路徑）
     if expected_sha and os.path.exists(local_path):
@@ -1302,6 +1304,24 @@ def check_and_update(
         #   磁碟 SHA 都對得上，而且沒有任何下載失敗。先前若留下「救不回來」的
         #   標記，到此可以解除 —— 混版已經不存在了。
         clear_failed_journal_marker(app_dir)
+        # ★「磁碟已是最新」不等於「我正在跑的是最新」★(外審 L2 第 2 輪 P2)
+        #   L2 之後 SHA 比對的對象是【指標指著的那一棵】:另一支程式可能在
+        #   我開始檢查之前就裝好新版並切了指標,於是我這一輪零筆待寫、從這裡
+        #   直接回 has_update=False —— 而下面那個「別人已更新 → 我要重啟」的
+        #   判斷在持鎖分支裡,零筆待寫【永遠走不到】。結果是這支程式一直跑
+        #   舊碼(六支程式各自更新、卻沒有一支真的換版),正是 L2 要解決的事。
+        _inst_ver, _inst_status = _read_ondisk_app_version_ex(app_dir)
+        # ★版本號相同也可能不是同一棵樹★(外審 L2 第 3 輪 P1):同版 SHA
+        #   修復會把指標從 `versions/V` 切到 `V.r2`,兩邊 version.py 都是 V。
+        if ((_inst_status == "ok" and _inst_ver
+             and parse_version(_inst_ver) > parse_version(CURRENT_VERSION))
+                or _installed_tree_differs_from_running(app_dir)):
+            logging.info("[更新] 磁碟上是 v%s、本行程跑 v%s(來源樹 %s)→ "
+                         "需重啟才會載到指標指著的那一棵", _inst_ver or "?",
+                         CURRENT_VERSION, _running_src_dir())
+            result.has_update = True
+            result.updated_files.append(
+                ("(另一程式已更新，本程式需重啟)", _inst_ver or CURRENT_VERSION))
         return result
 
     _progress("writing")
@@ -1384,7 +1404,69 @@ def check_and_update(
                 result.has_update = True
                 result.updated_files.append(("(另一程式已更新，本程式需重啟)", _disk_ver))
             return result
+        # ★同一批內容別人已經裝好了 → 不要再造一棵一模一樣的變體樹★
+        #   (外審 L2 第 2 輪 P1)我下載時磁碟還缺這些檔,但等我拿到鎖時
+        #   另一支程式可能已經裝好【同版】並切了指標。此時再走一次版本化
+        #   安裝,只會因為「完整目錄不可變」而開出 `V.r2`、把指標切到另一棵
+        #   內容相同的樹 —— 純粹的邊際成本與擾動。這一輪什麼都不用寫,
+        #   但如果磁碟上那一版比我正在跑的新,我要重啟才會載到它。
+        if _installed_batch_is_current(app_dir, prepared_writes):
+            logging.info("[更新] 取得鎖後發現本批內容【已經在磁碟上生效】"
+                         "(另一程式剛裝好)→ 不重複安裝")
+            # 同上:版本號一樣但不是同一棵樹(同版修復)也要重啟。
+            if ((_disk_ver
+                 and parse_version(_disk_ver) > parse_version(CURRENT_VERSION))
+                    or _installed_tree_differs_from_running(app_dir)):
+                result.has_update = True
+                result.updated_files.append(
+                    ("(另一程式已更新，本程式需重啟)",
+                     _disk_ver or CURRENT_VERSION))
+            return result
         return _commit_pending_writes(prepared_writes, result)
+
+
+def _installed_tree_differs_from_running(app_dir: str) -> bool:
+    """指標指著的那一棵,和我★現在真的在跑的★那一棵,是不是不同棵。
+
+    ★版本號相同不代表是同一棵★(外審 L2 第 3 輪 P1):同版 SHA 修復會把
+    指標從 `versions/V` 切到 `versions/V.r2` —— 兩邊的 `version.py` 都寫著
+    V,只比版本號的話沒有人會要求重啟,那支程式就繼續跑在【損壞的】舊樹上
+    (它正是因為損壞才被修的)。第一次切換也是同一回事:`<app>/src` 與
+    `versions/V/src` 的內容可能一模一樣,但要跑到新樹上仍得重啟。
+
+    ★重啟會解決它,不會變成迴圈★:自我重啟一律走固定的 launcher(批次X),
+    launcher 重新解析指標 —— 重啟之後兩者必然一致。查不出來就回 False
+    (不吵),那一輪仍有版本號比較可用。
+    """
+    try:
+        inst = os.path.normcase(os.path.abspath(_installed_src_dir(app_dir)))
+        run = os.path.normcase(os.path.abspath(_running_src_dir()))
+    except Exception:                                   # noqa: BLE001
+        logging.debug("[更新] 比對執行中/指標樹失敗", exc_info=True)
+        return False
+    return inst != run
+
+
+def _installed_batch_is_current(app_dir: str, prepared_writes: list) -> bool:
+    """這一批的每一個檔,磁碟上★現在會被載入的那一份★是否已經是這個內容。
+
+    只有在「全部都已經相同」時才回 True —— 讀不到、比不出來、或有任何一個
+    不同,都回 False(照舊安裝)。失效方向刻意選「多裝一次」:漏裝會讓這台
+    機器停在舊版,而多裝一次只是多一棵版本目錄。
+    """
+    if not prepared_writes:
+        return False
+    try:
+        for _key, local_filename, _nv, content, _t in prepared_writes:
+            path = _local_read_path(app_dir, local_filename)
+            if not os.path.exists(path):
+                return False
+            if _sha256_local_file(path) != _sha256_text(content):
+                return False
+    except Exception:                                   # noqa: BLE001
+        logging.debug("[更新] 比對磁碟現況失敗 → 照常安裝", exc_info=True)
+        return False
+    return True
 
 
 def _read_ondisk_app_version_ex(app_dir: str) -> tuple:
@@ -1404,7 +1486,10 @@ def _read_ondisk_app_version_ex(app_dir: str) -> tuple:
     區分之後:missing/unparsable 代表磁碟上【沒有可信版本可比】,寫下去是修復(照舊放行);
     "error" 代表原檔完好只是讀不到 → 呼叫端必須放棄本批,下一輪再更新。
     """
-    vp = os.path.join(app_dir, "src", "cmuh_common", "version.py")
+    # ★讀【正在跑的那一棵樹】的 version.py★(外審 L2 第 1 輪 P1-03):
+    #   降版守衛就是靠這個值判斷「本批會不會把磁碟降版」。L2 之後
+    #   `<app>/src` 停在回退點,拿它比會允許把指標切回更舊的版本。
+    vp = _local_read_path(app_dir, "src/cmuh_common/version.py")
     try:
         with open(vp, "r", encoding="utf-8") as f:
             content = f.read()
@@ -1432,6 +1517,369 @@ def _read_ondisk_app_version(app_dir: str) -> str:
     return _read_ondisk_app_version_ex(app_dir)[0]
 
 
+# ── 批次L・L2:版本化安裝目錄 + 原子切換 ──────────────────────────────────
+#   設計見 `docs/批次L_版本化目錄與原子切換_設計_2026-08-03.md`。
+#   L1(已上線)做的是【讀取】:`current.txt` 不存在就走 `<app>/src`。
+#   L2 在這裡:`src/` 底下的檔改成★裝進一個全新的 versions/<V>/★,
+#   驗完 SHA 才寫 `.complete`,最後把指標原子切過去。
+#   ★六支 .pyw 與 version_pointer.py 不走這條路★(設計 §4):它們是
+#   Task Scheduler 指的固定路徑,是「切版本救不回來」的唯一單點,
+#   仍然就地更新(既有的交易日誌 + .bak 路徑)。
+KEEP_VERSIONS = 3
+
+
+def _load_version_pointer(app_dir: str):
+    """把 app 根目錄的 `version_pointer.py` 載進來(單一事實來源)。→ 模組或 None。
+
+    ★不重寫一份安全字元/目錄名的判準★:那會漂移。載不進來就回 None,
+    呼叫端退回既有的就地更新 —— 行為與 L1 之前完全相同。
+    """
+    import importlib.util  # noqa: PLC0415
+    path = os.path.join(app_dir, "version_pointer.py")
+    try:
+        os.lstat(path)
+    except OSError:
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_updater_version_pointer", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        # ★載得進來 ≠ 介面完整★(外審 L2 第 1 輪 P2):截斷或版本不相容的
+        #   resolver 語法可能合法,少了某個函式/常數 —— 那時 AttributeError
+        #   會從 `_commit_pending_writes` 逸出,而不是依約退化成就地更新。
+        #   ★名字在 ≠ 叫得動★(外審 L2 第 2 輪 P2):`is_safe_version` 可能
+        #   被寫成一個字串、或一呼叫就拋 —— 只驗 `hasattr` 的話那個例外
+        #   照樣從 commit 路徑逸出。所以這裡驗到「真的能用」為止:
+        #   函式要 callable、常數要非空字串,再★實際問一次判準★(安全的
+        #   版本字串要說 True、跑出目錄的要說 False)。這一段就是那個
+        #   「fail-to-in-place」的單一邊界 —— 任何例外都在這裡變成 None。
+        for name in ("is_safe_version", "resolve_src", "is_complete"):
+            if not callable(getattr(mod, name, None)):
+                logging.warning("[更新] version_pointer 的 %s 不可呼叫 →"
+                                " 這一輪走就地更新", name)
+                return None
+        for name in ("VERSIONS_DIRNAME", "COMPLETE_MARKER", "POINTER_NAME"):
+            val = getattr(mod, name, None)
+            if not isinstance(val, str) or not val:
+                logging.warning("[更新] version_pointer 的 %s 不是有效字串 →"
+                                " 這一輪走就地更新", name)
+                return None
+        if not (mod.is_safe_version("2026.01.01.1") is True
+                and mod.is_safe_version("../跑出去") is False):
+            logging.warning("[更新] version_pointer.is_safe_version 判準不對"
+                            " → 這一輪走就地更新")
+            return None
+        # ★`resolve_src` 也要【實際解析一次】並驗回傳契約★(外審 L2 第 3 輪
+        #   P2):它是整個機制的核心,而 callable 只說得出「叫得動」。
+        #   這一次解析與 stub 開機時做的是同一件事 —— 它在這台機器上會不會
+        #   拋、回傳的是不是 `Resolution(src_dir=…)`,現在就問得出來。
+        #   壞掉時 stub 那一側會退回 `<app>/src`(它自己的 fallback),所以
+        #   更新器也必須退回就地更新,兩側才會落在同一棵樹上。
+        probe = mod.resolve_src(app_dir, "updater")
+        probe_src = str(getattr(probe, "src_dir", "") or "")
+        if not probe_src:
+            logging.warning("[更新] version_pointer.resolve_src 的回傳不符契約"
+                            "(沒有 src_dir)→ 這一輪走就地更新")
+            return None
+        return mod
+    except Exception:                                   # noqa: BLE001
+        logging.warning("[更新] 載入 version_pointer 失敗 → 這一輪走就地更新",
+                        exc_info=True)
+        return None
+
+
+def _local_read_path(app_dir: str, local_filename: str) -> str:
+    """這個 manifest 目標在磁碟上【現在真正被載入】的那一份在哪裡。
+
+    ★L2 之後「跑的那一棵樹」會移動★(外審 L2 第 1 輪 P1-01/03):
+    `<app>/src` 在 L2 期間刻意不再被覆蓋 —— 它是一鍵回退點,內容停在
+    L2 上線那天。如果比對 SHA / 讀磁碟版本還看它:
+      * 每一輪都判定「落後」→ 反覆重新下載、重新安裝;
+      * 反過來,現行版本樹壞掉而舊副本剛好符合 SHA 時,更新器會宣稱
+        「已是最新」而不去修復它;
+      * 取得寫入鎖後的降版守衛也會拿一個【更舊】的版本去比,於是允許
+        把 `current.txt` 從別的 process 剛切上去的新版切回舊版。
+    所以:`src/` 底下的目標一律解析到 `_installed_src_dir()`(=指標指著的
+    那一棵);根目錄那幾個固定檔(六支 .pyw、version_pointer.py、
+    manifest.json)不受指標影響,仍在 `<app>`。
+    """
+    if _is_src_relative(local_filename):
+        rel = str(local_filename).replace("\\", "/").split("/", 1)[1]
+        return _resolve_target_path(_installed_src_dir(app_dir), rel)
+    return _resolve_target_path(app_dir, local_filename)
+
+
+def _installed_src_dir(app_dir: str) -> str:
+    """這個 app 目錄★下次啟動會載入★的那一棵 src。
+
+    問的是【版本指標】,不是「這個 process 現在跑哪一棵」:切換之後、重啟
+    之前,兩者會不一樣,而更新器要維護的是【磁碟上會被載入的那一份】。
+    指標不存在/壞掉/版本目錄不完整時 `resolve_src` 本來就回 `<app>/src`
+    —— 過渡期與退化路徑因此自動維持舊行為(單一事實來源,不另寫判準)。
+    """
+    vp = _load_version_pointer(app_dir)
+    if vp is None:
+        return os.path.join(app_dir, "src")
+    try:
+        return vp.resolve_src(app_dir).src_dir
+    except Exception:                                   # noqa: BLE001
+        logging.warning("[更新] 解析版本指標失敗 → 讀取端退回 <app>/src",
+                        exc_info=True)
+        return os.path.join(app_dir, "src")
+
+
+def _is_src_relative(local_filename: str) -> bool:
+    """manifest 的目標是不是 `src/` 底下的檔(那些才進版本目錄)。"""
+    parts = str(local_filename or "").replace("\\", "/").split("/")
+    return len(parts) > 1 and parts[0] == "src"
+
+
+def _running_src_dir() -> str:
+    """這一支程式此刻真的在跑的那一棵 `src`(= 本模組的上上層)。
+
+    ★用執行中的位置,不是 `<app>/src`★:上一版可能已經切到
+    `versions/<V-1>/src`,新版本要以【現在跑的這一棵】為底,否則會拿一棵
+    更舊的樹來疊(混版)。
+    """
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _is_reparse_point(path: str) -> bool:
+    """這個目錄項目本身是不是 reparse point(junction/symlink)。查不動=是。
+
+    ★junction 不是 symlink★:`os.path.islink` 對它回 False,要看
+    `st_file_attributes` 的 FILE_ATTRIBUTE_REPARSE_POINT(與
+    `version_pointer._tree_has_reparse_points` 同一套判準)。
+    """
+    import stat as _stat  # noqa: PLC0415
+    flag = getattr(_stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True                      # 查不動 → 當成不安全
+    if not flag:
+        return bool(os.path.islink(path))
+    return bool(getattr(st, "st_file_attributes", 0) & flag)
+
+
+def _safe_versions_root(app_dir: str, vp) -> str:
+    """可以安全建立/列舉/刪除的 `versions` 根。→ 路徑;不安全回 ""。
+
+    ★這裡會 rmtree,而主程式可能是提權執行的★(外審 L2 第 1 輪 P1-05):
+    使用者可寫的 `<app>` 底下若被放成指向別處的 junction,安裝會寫到那個
+    外部位置、而清舊版會遞迴刪除那裡的目錄。所以動它之前要確認:
+    根目錄本身不是 reparse point,而且 realpath 仍落在 realpath(app_dir)
+    之內。查不動一律當不安全(fail-closed) —— 這條路徑的代價是刪錯東西。
+    """
+    root = os.path.join(app_dir, vp.VERSIONS_DIRNAME)
+    try:
+        if os.path.exists(root):
+            if _is_reparse_point(root):
+                logging.error("[更新] ★versions 根是 reparse point★ 拒絕使用"
+                              "(%s)", root)
+                return ""
+            real_root = os.path.realpath(root)
+            real_app = os.path.realpath(app_dir)
+            common = os.path.commonpath([real_app, real_root])
+            if os.path.normcase(common) != os.path.normcase(real_app):
+                logging.error("[更新] ★versions 根的實體位置跑出程式目錄★"
+                              "(%s)", real_root)
+                return ""
+    except Exception:                                   # noqa: BLE001
+        logging.error("[更新] 檢查 versions 根失敗 → 這一輪不做版本化安裝",
+                      exc_info=True)
+        return ""
+    return root
+
+
+def _strict_installed_src_dir(vp, app_dir: str) -> str:
+    """問 resolver「這個 app 目錄下次會載入哪一棵」——★不吞任何例外★。
+
+    (外審 L2 第 3/4 輪 P2)`_installed_src_dir` 刻意寬容:讀取端與 stub 的
+    fallback 對齊,resolver 壞了就一起看 `<app>/src`。但★決定要不要版本化
+    安裝★的時候寬容是錯的 —— 那會裝進版本目錄、切一個【stub 跟不動】的
+    指標,而 stub 那側退回未更新的 `<app>/src`:更新於是靜默地永遠不生效。
+    所以這條路徑用這個 strict 版本:拋錯、或回傳不符契約(`src_dir` 空/None
+    —— 寬容版會把它變成字串 `"None"` 這種假路徑),一律讓例外往外傳,由
+    commit 的單一 fail-to-in-place 邊界接住,整批明確走就地更新。
+    """
+    res = vp.resolve_src(app_dir)
+    src = str(getattr(res, "src_dir", "") or "")
+    if not src:
+        raise ValueError("version_pointer.resolve_src 回傳不符契約"
+                         "(沒有 src_dir)")
+    return src
+
+
+def _pick_version_dir(app_dir: str, version: str, vp,
+                      installed_src: str = "") -> str:
+    """這一次要裝進哪一個版本目錄名。→ 目錄名;找不到安全的回 ""。
+
+    ★絕不重用「正在用」或「正在跑」的那一個★(外審 L2 第 1 輪 P1-02):
+    同一個版本號也會需要重裝(SHA 修復),而安裝的第一步是把目標目錄整個
+    刪掉重建 —— 若那正是現行版本樹,等於把自己的來源刪掉:安裝失敗,而
+    `current.txt` 指著一個不存在的版本,現行行程之後的 lazy import 也會
+    當場失敗。所以同名衝突時換一個不可變的識別碼(`V.r2`、`V.r3`…)。
+    """
+    root = os.path.join(app_dir, vp.VERSIONS_DIRNAME)
+    # ★這裡【不】走會吞例外的 `_installed_src_dir`★(理由見
+    #   `_strict_installed_src_dir`):呼叫端(commit 的保護區)通常已經解析
+    #   過並把結果傳進來 —— 那樣「resolver 在保護區【裡面】被實際呼叫」在
+    #   流程上就看得見,不必讀進這個函式才知道。沒傳的話在這裡 strict
+    #   解析一次(同樣不吞例外)。
+    inst_src = str(installed_src or "") or _strict_installed_src_dir(
+        vp, app_dir)
+    # ★誠實紀錄★:自從「完整目錄不可變」那條規則加進來(外審第 2 輪 P1),
+    #   `inst_src` 這一半在版本目錄上其實已經被涵蓋了 —— 指標只會指向
+    #   【完整】的版本目錄,而那些候選在下面就先被跳過了。留著是縱深防禦
+    #   (萬一日後 resolver 的完整性判準改變),不是承重的那一層;
+    #   ★承重的是這一句會【實際呼叫 resolver】★:它壞掉時例外要往外傳。
+    busy = {os.path.normcase(os.path.abspath(inst_src)),
+            os.path.normcase(os.path.abspath(_running_src_dir()))}
+    for n in range(1, 20):
+        name = version if n == 1 else f"{version}.r{n}"
+        if not vp.is_safe_version(name):
+            continue
+        # ★【完整】的版本目錄一律不可變★(外審 L2 第 2 輪 P1):這台機器上
+        #   有六支共用更新器的程式,寫入鎖只序列化「誰在部署」,不代表別人
+        #   已經停止使用舊目錄。第三支程式可能正跑在 `versions/V` 上,而它
+        #   既不是我的樹、也不是指標現在指的那一棵 —— 只避開這兩者的話,
+        #   同版重裝就會把它腳下的來源樹 rmtree 掉。裝好且標了 `.complete`
+        #   的目錄只能被讀,要重裝就換一個識別碼;沒有 `.complete` 的是
+        #   半成品(指標不可能指過去、沒有人跑得起來),可以安全重建。
+        if vp.is_complete(app_dir, name):
+            continue
+        cand_src = os.path.normcase(
+            os.path.abspath(os.path.join(root, name, "src")))
+        if cand_src in busy:
+            continue
+        return name
+    logging.error("[更新] 找不到可用的版本目錄名(%s)→ 這一輪不做版本化安裝",
+                  version)
+    return ""
+
+
+def _install_versioned_src(app_dir: str, version: str, src_writes: list,
+                           vp, result: UpdateResult) -> bool:
+    """把整棵 src 裝進 `versions/<V>/src`(全新目錄)。→ 成功嗎。
+
+    ★更新器只下載【有變的】檔,所以版本目錄必須先以現行整棵樹為底再疊★
+    —— 只放變更檔的話那個版本目錄根本跑不起來。
+    裝完【逐檔回讀驗 SHA256】,全過才寫 `.complete`(最後一步)。
+    失敗:整個版本目錄丟掉,`current.txt` 一個位元組都沒動。
+    """
+    import shutil  # noqa: PLC0415
+    root = _safe_versions_root(app_dir, vp)
+    if not root:
+        result.errors.append("[versions] versions 根不安全(reparse/跑出程式"
+                             "目錄)→ 這一批不寫入")
+        return False
+    vroot = os.path.join(root, version)
+    base_src = _running_src_dir()
+    try:
+        if os.path.isdir(vroot):
+            # 半成品(沒有 .complete)或重裝 —— 整個丟掉重來,不要疊。
+            shutil.rmtree(vroot)
+        os.makedirs(vroot, exist_ok=True)
+        shutil.copytree(base_src, os.path.join(vroot, "src"),
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        for key, local_filename, _new_ver, content, _target in src_writes:
+            dst = _resolve_target_path(vroot, local_filename)
+            os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+            with open(dst, "w", encoding="utf-8") as fh:
+                fh.write(content)
+                fh.flush()
+                os.fsync(fh.fileno())
+            if _sha256_local_file(dst) != _sha256_text(content):
+                raise RuntimeError(f"[{key}] 版本目錄回讀 SHA 不符")
+        # ★`.complete` 是最後一步★:沒有它的版本目錄一律是半成品,
+        #   `version_pointer.is_complete()` 不會讓指標指過去。
+        marker = os.path.join(vroot, vp.COMPLETE_MARKER)
+        with open(marker, "w", encoding="utf-8") as fh:
+            fh.write(f"{version}\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        return True
+    except Exception as e:                              # noqa: BLE001
+        result.errors.append(f"[versions] 版本目錄安裝失敗: {e}")
+        logging.warning("[更新] 版本目錄 %s 安裝失敗 → 整個丟掉,指標不動",
+                        vroot, exc_info=True)
+        try:
+            if os.path.isdir(vroot):
+                shutil.rmtree(vroot)
+        except OSError:
+            logging.debug("[更新] 清掉半成品版本目錄失敗", exc_info=True)
+        return False
+
+
+def _switch_version_pointer(app_dir: str, version: str, vp) -> bool:
+    """★原子切換★:`current.txt` ← 版本字串(同磁碟 rename)。→ 切成功嗎。"""
+    pointer = os.path.join(app_dir, vp.POINTER_NAME)
+    tmp = pointer + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(f"{version}\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, pointer)
+        _fsync_path(pointer)
+        logging.info("[更新] 版本指標已切到 %s(下次啟動生效)", version)
+        return True
+    except Exception:                                   # noqa: BLE001
+        logging.error("[更新] ★切換版本指標失敗★ 新版已裝好但沒有生效 ——"
+                      "仍跑舊版(下一輪會再試)", exc_info=True)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _prune_old_versions(app_dir: str, keep_version: str, vp) -> None:
+    """只留最近 `KEEP_VERSIONS` 個版本目錄,★現用的那個永遠不刪★。"""
+    import shutil  # noqa: PLC0415
+    root = _safe_versions_root(app_dir, vp)
+    if not root:
+        return                       # 不安全就不要在那裡遞迴刪東西
+    try:
+        names = [n for n in os.listdir(root)
+                 if os.path.isdir(os.path.join(root, n))]
+    except OSError:
+        return
+    # 依 mtime 由新到舊(版本字串排序在跨年/補號時不可靠)
+    def _mtime(n):
+        try:
+            return os.path.getmtime(os.path.join(root, n))
+        except OSError:
+            return 0.0
+    names.sort(key=_mtime, reverse=True)
+    keep = {str(keep_version)}
+    # ★正在跑的、以及指標現在指著的那一棵,都不可以刪★:指標切過去之後
+    #   現行行程仍然從【舊】那一棵 lazy import,一路用到重啟為止 ——
+    #   把它刪掉不是「下次啟動起不來」,是【現在】就當掉。
+    _root_nc = os.path.normcase(os.path.abspath(root))
+    for _d in (_running_src_dir(), _installed_src_dir(app_dir)):
+        _parent = os.path.dirname(os.path.abspath(_d))
+        if os.path.normcase(os.path.dirname(_parent)) == _root_nc:
+            keep.add(os.path.basename(_parent))
+    for n in names[:KEEP_VERSIONS]:
+        keep.add(n)
+    for n in names:
+        if n in keep:
+            continue
+        try:
+            shutil.rmtree(os.path.join(root, n))
+            logging.info("[更新] 清掉舊版本目錄 %s", n)
+        except OSError:
+            logging.debug("[更新] 清舊版本目錄失敗 %s", n, exc_info=True)
+
+
 def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> UpdateResult:
     """[IE-02/IE-04 抽出] 兩階段批次寫入。由 check_and_update 在【持有跨行程更新鎖、且再次確認未被
     suspend】之後呼叫。
@@ -1444,6 +1892,65 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
     比原本逐檔 atomic_write_text 更安全:把最可能失敗的「寫內容/fsync」(磁碟滿、AV 鎖檔)全部擋在任何
     os.replace 之前。"""
     import tempfile
+
+    # ── 批次L・L2:`src/` 底下的檔改走版本化目錄 ──────────────────────────
+    #   ★順序刻意是「先裝版本目錄 → 再就地寫 stub → 最後才切指標」★
+    #   * 版本目錄裝到一半失敗:整個丟掉,指標沒動 —— 磁碟上的正式檔一個
+    #     位元組都沒被碰過(這正是版本化要換掉「就地覆蓋」的理由);
+    #   * stub 就地寫失敗:走既有的 .bak 回滾,而指標【還沒切】—— 舊 stub
+    #     配舊 src,仍然一致;
+    #   * 指標切失敗:新版裝好了但沒生效,下一輪再切(仍跑舊版,不是壞版)。
+    versioned_ok = False
+    versioned_ver = ""
+    vp_mod = None
+    try:
+        _app_dir_now = get_app_dir()
+    except Exception:                                   # noqa: BLE001
+        _app_dir_now = ""
+    src_writes = [w for w in prepared_writes if _is_src_relative(w[1])]
+    if src_writes and _app_dir_now:
+        vp_mod = _load_version_pointer(_app_dir_now)
+        _app_ver = str(result.manifest_app_version or "")
+        # ★resolver 的實際呼叫全部收在這一個 fail-to-in-place 邊界裡★
+        #   (外審 L2 第 2 輪 P2):`_load_version_pointer` 已經驗過介面,
+        #   但「驗過的那一刻能用」不等於「每一次呼叫都不拋」(磁碟上的檔
+        #   可能同時被換掉、實作可能對某些輸入炸掉)。契約是【完全退化成
+        #   舊路徑】,所以這裡把例外一律翻譯成「這一輪不做版本化安裝」,
+        #   而不是讓它從 commit 逸出、把整批更新變成不明失敗。
+        try:
+            if vp_mod is not None and _app_ver \
+                    and vp_mod.is_safe_version(_app_ver):
+                # ★resolver 就在這個保護區【裡面】被實際呼叫★:strict 版本
+                #   會把「拋錯 / 回傳不符契約」直接送到下面那個 except,
+                #   整批走就地更新(外審 L2 第 4 輪 P2)。
+                _inst_src = _strict_installed_src_dir(vp_mod, _app_dir_now)
+                # ★不可以裝進「現在正在用/正在跑/別人跑著」的那個目錄★:
+                #   安裝第一步是把目標整個刪掉重建。
+                versioned_ver = _pick_version_dir(
+                    _app_dir_now, _app_ver, vp_mod, _inst_src)
+        except Exception:                               # noqa: BLE001
+            logging.warning("[更新] 版本指標判斷失敗 → 這一輪走就地更新",
+                            exc_info=True)
+            versioned_ver = ""
+        if versioned_ver and vp_mod is not None:
+            versioned_ok = _install_versioned_src(
+                _app_dir_now, versioned_ver, src_writes, vp_mod, result)
+            if not versioned_ok:
+                # ★整批放棄,正式檔一個位元組都沒動★
+                #   (承重的是上面那句 `result.errors.append` —— 既有的
+                #    「有 error 就整批放棄」不變量本來就會擋住 Phase 1;
+                #    這個 return 是把意圖寫明的第二層,不是唯一的防線。)
+                return result
+            # 這一批的 src 檔已經進了版本目錄 → 就地階段只處理其餘的檔
+            # (六支 .pyw、version_pointer.py 這些「切版本救不回來」的)。
+            prepared_writes = [w for w in prepared_writes
+                               if not _is_src_relative(w[1])]
+            for _k, _lf, _nv, _c, _t in src_writes:
+                result.updated_files.append((_lf, _nv))
+        else:
+            logging.info("[更新] 版本化安裝條件不足(resolver=%s, 版本=%r)→"
+                         " 這一輪走就地更新(行為與 L1 之前相同)",
+                         "有" if vp_mod is not None else "無", _app_ver)
 
     staged: list = []  # (tmp, target, existed_before, key, local_filename, new_ver)
     for key, local_filename, new_ver, content, target_path in prepared_writes:
@@ -1610,6 +2117,26 @@ def _commit_pending_writes(prepared_writes: list, result: UpdateResult) -> Updat
     #   這是「救不回來」標記的出口（見 `clear_failed_journal_marker`）：
     #   本批的每個檔都寫成了 manifest 上的 SHA，其餘的在下載階段就比對相符。
     clear_failed_journal_marker(app_dir_for_journal)
+
+    # ── 批次L・L2:★最後一步才切指標★ ────────────────────────────────────
+    #   走到這裡代表:版本目錄已裝好並驗過 SHA(含 `.complete`)、就地那幾個
+    #   「切版本救不回來」的檔也已經成功寫入。切換是單一個 `os.replace`,
+    #   同磁碟 rename 是原子的:成功 = 下次啟動整棵樹一起換過去;
+    #   失敗 = 新版裝好但沒生效,仍跑舊版(下一輪再切),不是壞版。
+    #   ★切不過去不算整批失敗★:磁碟上是【兩個都完整】的版本,只是指標
+    #   還指著舊的 —— 這是安全的一邊,不需要回滾已經寫好的 stub。
+    if versioned_ok and vp_mod is not None and _app_dir_now:
+        if _switch_version_pointer(_app_dir_now, versioned_ver, vp_mod):
+            _prune_old_versions(_app_dir_now, versioned_ver, vp_mod)
+        else:
+            result.errors.append(
+                "[versions] 版本指標切換失敗(新版已裝好,這一輪仍跑舊版)")
+            # ★指標沒切成功就【不可以】說「有更新、請重啟」★:呼叫端
+            #   (打卡/會診/座標)只看 `need_restart_after_update`,不看
+            #   errors —— 重啟後 stub 讀到的還是舊指標、跑的還是同一份
+            #   程式碼;失敗若持續(指標被防毒鎖住)就成了重啟迴圈。
+            #   這一輪確實沒有任何東西生效,所以據實回報「沒有更新」。
+            result.updated_files.clear()
 
     result.has_update = len(result.updated_files) > 0
     return result
