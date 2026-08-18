@@ -6290,6 +6290,51 @@ def _drain_pending_refusal_retries(now=None) -> None:
             })
 
 
+def _adopt_unledgered_send(delivery, refused: dict) -> str:
+    """帳本停機時寄出去的那一封,恢復後補登記。→ 親紀錄 id(補不了回 "")。
+
+    ★已知的事實才寫★:被拒的照 SMTP 碼分類,沒被拒的就是【送達了】——
+    那一封真的寄出去了(availability-first 的既有定案)。整筆狀態由帳本
+    自己 summarize。補登記之後,佇列補寄與 durable 補寄、以及別的 process
+    的事件所有權,就重新走同一套仲裁。
+
+    ★補不了就維持舊行為★(回 ""):呼叫端會退回「直接登記一筆」的舊路徑
+    —— 帳本這一刻仍不可用時,不寄反而是漏寄。
+    """
+    led = _get_ledger()
+    if led is None:
+        return ""
+    from cmuh_common.delivery_ledger import (  # noqa: PLC0415
+        R_CONFIRMED, classify_refusal as _cls,
+    )
+    bad = {str(a).strip().lower(): _cls(_refusal_code(i))
+           for a, i in (refused or {}).items() if str(a).strip()}
+    states = {}
+    for addr in (delivery.recipients or ()):
+        key = str(addr).strip().lower()
+        if key:
+            states[key] = bad.get(key, R_CONFIRMED)
+    if not states:
+        return ""
+    try:
+        did = led.adopt_initial_delivery(
+            business_key=delivery.business_key or "",
+            category="consult", recipient_states=states,
+            subject=delivery.subject, message_id=delivery.message_id or "",
+            body_text=delivery.text_body or "",
+            occurrence_keys=tuple(
+                getattr(delivery, "occurrence_keys", ()) or ()),
+            note="帳本停機期間寄出,補寄前補登記")
+    except Exception:
+        logging.warning("[delivery] 補登記失敗 → 這一輪走舊的直接登記路徑",
+                        exc_info=True)
+        return ""
+    if did:
+        logging.warning("[delivery] 帳本恢復 → 把停機期間寄出的那一封補登記"
+                        "(%s),補寄改走既有仲裁", did)
+    return did
+
+
 def _resend_transient_refusals(delivery, refused: dict,
                                trigger_label: str = "",
                                origin_did: str = "") -> dict:
@@ -6329,6 +6374,13 @@ def _resend_transient_refusals(delivery, refused: dict,
             message_id=_new_message_id(),
             business_key=f"{delivery.business_key}|retry{_n + 1}")
         led = _get_ledger()
+        if not origin_did and led is not None:
+            # ★帳本停機期間寄出去的那一封:恢復後【補登記】★
+            #   (外審 2026-08-18 第七輪 P2-02)沒有 `origin_did` 的佇列項
+            #   走舊路徑會直接 `begin()` 一筆孤兒紀錄 —— 繞過
+            #   `claim_resend_child` 的仲裁,也繞過事件所有權:另一個
+            #   process 同時 claim 整封,同一批人就收到兩封。
+            origin_did = _adopt_unledgered_send(delivery, refused)
         if origin_did and led is not None:
             # ★[批次AE-3,外審 R3 P1-02] 佇列補寄不再自己開帳★
             #   與 durable 補寄走同一個 claim 仲裁:交易內重驗「此刻仍

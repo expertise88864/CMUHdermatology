@@ -722,6 +722,35 @@ class DeliveryLedger:
                 self._prune_locked(conn)
         return did
 
+    def _occurrence_owners_locked(self, conn, keys) -> dict:
+        """這幾把機會鑰匙裡,★已經被服務過或正在被服務★的 → 擁有者 id。
+
+        判準見 `_served_occurrences_locked`(它就是這個的鍵集合)——
+        ★只有一份實作★:所有權、「算不算被服務過」、補登記要不要沿用既有
+        親紀錄,三處都問同一個函式。各寫一套的必然結果是判準漂移
+        (外審 AE-9 第 1 輪 P1-1 就是這樣:補登記用了「任何同鑰匙的親紀錄」,
+         把【確定沒送出】的舊紀錄當成擁有者)。
+        """
+        keys = sorted({str(k) for k in (keys or ()) if str(k)})
+        if not keys:
+            return {}
+        rows = conn.execute(
+            "SELECT o.occurrence_key, d.delivery_id, d.state FROM deliveries d"
+            " JOIN delivery_occurrences o ON o.delivery_id=d.delivery_id"
+            " WHERE o.occurrence_key IN (%s) AND d.parent_id=''"
+            % ",".join("?" * len(keys)), tuple(keys)).fetchall()
+        owners = {}
+        for key, pid, st in rows:
+            if str(st) != FAILED:
+                owners[str(key)] = str(pid)
+                continue
+            busy = conn.execute(
+                "SELECT 1 FROM deliveries WHERE parent_id=? AND state!=?"
+                " LIMIT 1", (pid, FAILED)).fetchone()
+            if busy:
+                owners.setdefault(str(key), str(pid))
+        return owners
+
     def _served_occurrences_locked(self, conn, keys) -> set:
         """這幾把機會鑰匙裡,哪幾把★已經被服務過或正在被服務★。
 
@@ -737,25 +766,7 @@ class DeliveryLedger:
         第 2 輪 P1):兩邊各寫一套的話,擋下來的那一輪會把【還沒被服務的】
         觸發也一起結案 —— 醫師的請求沉默消失。(在呼叫端的交易/鎖裡執行。)
         """
-        keys = sorted({str(k) for k in (keys or ()) if str(k)})
-        if not keys:
-            return set()
-        rows = conn.execute(
-            "SELECT o.occurrence_key, d.delivery_id, d.state FROM deliveries d"
-            " JOIN delivery_occurrences o ON o.delivery_id=d.delivery_id"
-            " WHERE o.occurrence_key IN (%s) AND d.parent_id=''"
-            % ",".join("?" * len(keys)), tuple(keys)).fetchall()
-        served = set()
-        for key, pid, st in rows:
-            if str(st) != FAILED:
-                served.add(str(key))
-                continue
-            busy = conn.execute(
-                "SELECT 1 FROM deliveries WHERE parent_id=? AND state!=?"
-                " LIMIT 1", (pid, FAILED)).fetchone()
-            if busy:
-                served.add(str(key))
-        return served
+        return set(self._occurrence_owners_locked(conn, keys))
 
     def served_occurrence_keys(self, keys) -> set:
         """對外版本:這幾把鑰匙裡哪幾把已經有人服務。讀不到就拋
@@ -763,6 +774,60 @@ class DeliveryLedger:
         with self._lock:
             conn = self._ensure_conn_locked()
             return self._served_occurrences_locked(conn, keys)
+
+    def adopt_initial_delivery(self, *, business_key: str, category: str,
+                               recipient_states: dict, subject: str = "",
+                               message_id: str = "", body_text: str = "",
+                               occurrence_keys=(), note: str = "") -> str:
+        """★帳本停機期間【已經寄出去】的那一封,事後補登記★(批次AE-9)。
+
+        → 那一筆的 delivery_id;★這個事件已經有人擁有 → 回【他】的 id★
+        (呼叫端就把補寄掛在正確的親紀錄下,走既有仲裁)。落不了地拋
+        `LedgerUnavailable`。
+
+        ★為什麼需要★(外審 2026-08-18 第七輪 P2-02):帳本不可用時,依既有
+        的 availability-first 定案照樣寄出去 —— 那一封沒有帳。之後有人被
+        4xx 暫時拒收,退避佇列會在【帳本恢復後】補寄;但它手上沒有
+        `origin_did`,舊路徑於是直接 `begin()` 一筆孤兒紀錄:繞過
+        `claim_resend_child` 的仲裁,也繞過事件所有權 —— 另一個 process
+        同時 `claim_initial_delivery()` 就會把整封再寄一次給同一批人。
+        補登記把「已經發生的事」寫回帳上,之後兩邊都走同一套仲裁。
+
+        `recipient_states` 是【已知的事實】:被拒的照 SMTP 碼分類、沒被拒
+        的就是送達了(那一封真的寄出去了)。整筆狀態由 `summarize` 推出。
+        """
+        states = _clean_recipients(recipient_states)
+        if not states:
+            return ""
+        occs = sorted({str(k) for k in (occurrence_keys or ()) if str(k)})
+        did = new_delivery_id()
+        rec = self._new_rec(did, business_key, category, list(states),
+                            subject, message_id, "", "", body_text)
+        rec["recipients"] = dict(states)
+        rec["state"] = summarize(states)
+        rec["note"] = str(note or "帳本停機期間寄出,事後補登記")[:300]
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            with self._txn(conn):
+                owners = self._occurrence_owners_locked(conn, occs)
+                fresh = [k for k in occs if k not in owners]
+                if occs and not fresh and len(set(owners.values())) == 1:
+                    # 這次機會【整個】都已經有人負責(而且是同一筆)→ 用他,
+                    # 不要再開一筆平行的親紀錄(補寄仲裁會分裂)。
+                    return str(next(iter(owners.values())))
+                # 否則就把「已經發生的事」寫成自己一筆:
+                #   * 舊紀錄是【確定沒送出】的 → 它不是擁有者(判準同 claim),
+                #     這一封停機期間真的寄出去了,facts 要有地方放;
+                #   * 併批只有一部分被服務 → 沒被服務的那幾把要有人佔住,
+                #     而且補寄要掛在【有這幾位收件人事實】的那一筆上。
+                self._insert_locked(conn, rec)
+                if fresh:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO delivery_occurrences"
+                        " (occurrence_key, delivery_id) VALUES (?,?)",
+                        [(k, did) for k in fresh])
+                self._prune_locked(conn)
+        return did
 
     def begin_if_no_live(self, *, business_key: str, category: str,
                          recipients: list, subject: str = "",
