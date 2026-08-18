@@ -365,7 +365,23 @@ class DeliveryLedger:
                 "CREATE TABLE IF NOT EXISTS delivery_occurrences ("
                 " occurrence_key TEXT NOT NULL,"
                 " delivery_id TEXT NOT NULL,"
+                # 0 = 這一筆自己 claim 到的(native);1 = 交棒時繼承來的。
+                # ★遷移圍籬要分得出來★(外審第八輪第 1 輪 P1):繼承來的
+                #   鑰匙不代表「這一筆是新版寫的」—— 舊 schema 的紀錄當上
+                #   接手者之後就會有繼承鍵,若因此被圍籬排除,它還在飛的
+                #   時候別人就能再寄一封。
+                " inherited INTEGER NOT NULL DEFAULT 0,"
                 " PRIMARY KEY (occurrence_key, delivery_id))")
+            # ★加欄位【不】bump schema_version★:有預設值,舊版程式照樣
+            #   開得起來也用得起來(它們的 SELECT/INSERT 都明列欄位)。
+            #   bump 會讓還在跑的舊 generation 依前向守衛拒開帳本 → 它們
+            #   會走 availability-first 寄出「沒有帳的信」—— 那正是本輪
+            #   P1-01 要消滅的東西。
+            occ_cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(delivery_occurrences)").fetchall()}
+            if occ_cols and "inherited" not in occ_cols:
+                conn.execute("ALTER TABLE delivery_occurrences ADD COLUMN"
+                             " inherited INTEGER NOT NULL DEFAULT 0")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_occ_delivery"
                          " ON delivery_occurrences(delivery_id)")
             # ★schema version 是人維護的帳,不是推導出來的★(外審 2026-08-12)
@@ -671,6 +687,27 @@ class DeliveryLedger:
                     #   PARTIAL —— 下一次機會有它自己的 key。
                     if self._served_occurrences_locked(conn, occs):
                         return ""
+                    # ★★遷移圍籬:舊 schema 的紀錄沒有機會鑰匙★★
+                    #   (外審 2026-08-18 第八輪 P1-01)v4 的紀錄不可能有
+                    #   `delivery_occurrences` 的 mapping —— 而所有權查詢是
+                    #   JOIN,查不到就等於「沒人負責」。於是★這次 v4→v5 的
+                    #   更新本身★就是觸發條件:舊 generation 的 SMTP 還在飛
+                    #   (帳上 SUBMITTING、沒有 mapping),新 generation 一
+                    #   claim 就過 —— 同一則臨床通知兩封同時跨 SMTP,正好把
+                    #   AE-6 關掉的那個交棒重複又打開(只是限定在混版期間)。
+                    #   所以機會鑰匙這條路上仍要看一次【同 business_key 的
+                    #   無鑰匙舊紀錄】:還在飛(或底下有結果未定的補寄)就擋。
+                    #   ★自帶出口★:那些紀錄會被回查收斂(查不出來也有 24
+                    #   小時上限,見 AE-7),收斂後不再擋;而新版寫的每一筆都
+                    #   有 mapping —— 這個圍籬只在遷移期間有作用。
+                    legacy = self._legacy_unmapped_owner_locked(
+                        conn, business_key)
+                    if legacy:
+                        logging.warning(
+                            "[delivery] 同 business_key 還有【舊 schema 沒有"
+                            "機會鑰匙】的紀錄在飛(%s)→ 這一輪不寄"
+                            "(v4→v5 混版期間的遷移圍籬)", legacy)
+                        return ""
                     self._insert_locked(conn, rec)
                     conn.executemany(
                         "INSERT OR IGNORE INTO delivery_occurrences"
@@ -750,6 +787,35 @@ class DeliveryLedger:
             if busy:
                 owners.setdefault(str(key), str(pid))
         return owners
+
+    def _legacy_unmapped_owner_locked(self, conn, business_key: str) -> str:
+        """同 business_key、★沒有機會鑰匙★、而且【還在飛】的初次紀錄。→ id。
+
+        只有舊 schema(v4 以前)寫的紀錄會沒有 mapping —— 新版每一次 claim
+        都會把鑰匙寫進 `delivery_occurrences`。這是 v4→v5 混版期間的縱深
+        防禦,理由見 `claim_initial_delivery`(外審第八輪 P1-01)。
+        判準與別處一致:結果未定(`OWNED_STATES`)、或底下有結果未定的補寄。
+        """
+        bk = str(business_key or "")
+        if not bk:
+            return ""
+        rows = conn.execute(
+            "SELECT d.delivery_id, d.state FROM deliveries d"
+            " WHERE d.business_key=? AND d.parent_id=''"
+            "   AND NOT EXISTS (SELECT 1 FROM delivery_occurrences o"
+            "                   WHERE o.delivery_id=d.delivery_id"
+            "                     AND o.inherited=0)",
+            (bk,)).fetchall()
+        for pid, st in rows:
+            if str(st) in OWNED_STATES:
+                return str(pid)
+            busy = conn.execute(
+                "SELECT 1 FROM deliveries WHERE parent_id=? AND state IN (%s)"
+                " LIMIT 1" % ",".join("?" * len(OWNED_STATES)),
+                (pid, *OWNED_STATES)).fetchone()
+            if busy:
+                return str(pid)
+        return ""
 
     def _served_occurrences_locked(self, conn, keys) -> set:
         """這幾把機會鑰匙裡,哪幾把★已經被服務過或正在被服務★。
@@ -1494,6 +1560,20 @@ class DeliveryLedger:
                     (str(by or "")[:64],
                      (str(note)[:300] if note else "補寄鏈已由較新紀錄接手"),
                      _now(), did))
+                # ★交棒要連【機會所有權】一起交★(外審第八輪 P1-02)
+                #   只轉補寄義務的話:接手者還在飛(SUBMITTING)的期間,舊那
+                #   一筆已是 FAILED 而且沒有 in-flight 子紀錄 —— 它持有的
+                #   機會鑰匙於是被判成「沒人服務」,那一把被重播就會開出
+                #   第三筆,與接手者同時寄給同一位醫師。
+                #   ★不刪舊 mapping★:兩邊都持有,任一方還在飛就擋得住;
+                #   兩邊都確定失敗時「沒人服務」仍然成立 —— 出口不變。
+                if cur.rowcount and str(by or ""):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO delivery_occurrences"
+                        " (occurrence_key, delivery_id, inherited)"
+                        " SELECT occurrence_key, ?, 1 FROM"
+                        " delivery_occurrences WHERE delivery_id=?",
+                        (str(by), did))
                 return bool(cur.rowcount)
 
     def clear_body(self, delivery_id: str, note: str = "") -> bool:
