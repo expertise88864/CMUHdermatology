@@ -73,7 +73,7 @@ DB_FILENAME = "delivery_ledger.sqlite3"
 # 代表【已送達】【已放棄】【已被接手】三件完全不同的事 —— 結案路徑看到
 # 「還有暫時被拒的人 + 沒有 payload」就誤報「始終沒收到,請人工轉寄」,
 # 而那封信其實剛剛已經由較新的紀錄送到了(誘導人工重寄=重複通知)。
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _BODY_TEXT_MAX = 100_000        # 信的文字內容上限(夠放最長的會診清單)
 # ★body 有自己的保留期,與紀錄本身(45 天)分開★(外審 AD-3 第 1 輪 P1-3)
 #   內文可能含臨床資訊 —— 只在「還可能需要補寄」的窗口裡保留。
@@ -337,7 +337,8 @@ class DeliveryLedger:
                 " kind TEXT NOT NULL DEFAULT '',"
                 " superseded_by TEXT NOT NULL DEFAULT '')")
             # ── v1→v2:補 body_text;v2→v3:補 kind;v3→v4:補
-            #   superseded_by(批次AE-4)──
+            #   superseded_by(批次AE-4)。v4→v5 沒有新欄位,
+            #   只多一張 `delivery_occurrences`(見下)──
             #   CREATE IF NOT EXISTS 對【既有的】舊版資料庫不會補欄位,
             #   要自己 ALTER;新建的資料庫上面就有了。
             cols = {r[1] for r in
@@ -355,6 +356,18 @@ class DeliveryLedger:
                          " ON deliveries(business_key)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_state"
                          " ON deliveries(state)")
+            # ★寄送機會的所有權索引★(schema v5,批次AE-8):一筆寄送
+            #   可以持有【好幾把】機會鑰匙 —— 佇列會把多封 email 觸發併成
+            #   一次工作,而重啟後的補跑是【逐筆】重播的:每一把鑰匙都要
+            #   被那一筆保住,否則單筆重播算出來的鑰匙沒人擁有,同一位
+            #   醫師就會收到第二封(外審 AE-8 第 1 輪 P1)。
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS delivery_occurrences ("
+                " occurrence_key TEXT NOT NULL,"
+                " delivery_id TEXT NOT NULL,"
+                " PRIMARY KEY (occurrence_key, delivery_id))")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_occ_delivery"
+                         " ON delivery_occurrences(delivery_id)")
             # ★schema version 是人維護的帳,不是推導出來的★(外審 2026-08-12)
             #   升級是冪等的(上面的 ALTER 保證欄位在)→ 同版/舊版標到目前
             #   版本;比目前新的在上面已經拒開了,走不到這裡。
@@ -571,7 +584,8 @@ class DeliveryLedger:
                                recipients: list, subject: str = "",
                                message_id: str = "",
                                attachment_hash: str = "",
-                               body_text: str = "") -> str:
+                               body_text: str = "",
+                               occurrence_keys=()) -> str:
         """★一次臨床事件只有一個 sender 可以開始★(外審 2026-08-18 P1-01)。
 
         回傳 delivery_id;★同一事件已經有人在負責 → 回空字串(不要寄)★;
@@ -586,6 +600,29 @@ class DeliveryLedger:
         去重檔還沒寫),新 generation 就已經可以掃到同一個事件並
         `begin()` 一筆新的 —— 同一則臨床通知寄兩封,不需要任何異常。
 
+        ★★`occurrence_keys` = 這一次【寄送機會】的識別★★(批次AE-8)
+        給得出來的話,仲裁就用它們,而且判準乾脆得多:
+        ★同一次機會只該有一次初次寄送★ —— 同一把鑰匙的初次紀錄
+        只要不是【確定沒送出(FAILED)】就拒,連 CONFIRMED/PARTIAL 也拒。
+        ★是「一組」不是「一把」★(外審 AE-8 第 1 輪 P1):佇列會把多封
+        email 觸發併成一次工作,而重啟後的補跑是【逐筆】重播的 ——
+        那一次寄送必須把【每一個】構成它的機會鑰匙都佔住,否則單筆重播
+        算出來的鑰匙沒有人擁有,那位醫師就收到第二封。
+        因為那不是「這個內容寄過了」,而是「這一次請求已經被服務過了」:
+        交棒後重跑同一個排程時段、重播同一封 email 觸發,都是同一次機會;
+        17:00 與 20:00 是兩次機會,各寄各的,誰也不擋誰。
+        這同時讓 PARTIAL 的交接不必再靠時間租約去猜(見下)。
+        ★來源(呼叫端)★:email 觸發 = 每一個 `帳號指紋|UIDVALIDITY|uid`
+        各一把(重播同一封信天生同 key、醫師另寄一封就是新 key);
+        排程 = 日期+時段標籤;poll = 日期+這一輪【新出現】的病歷號集合
+        雜湊;手動 = 每次按下都給新的(人明確要求的那一次,寧可重複也不
+        可以靜默丟掉);止掛信 = 既有的 notify_key。
+        ★收件人不屬於機會識別★(外審 AE-8 第 1 輪 P2):設定改過、或兩台
+        機器的收件人清單不同,同一次機會就會算出不同的鑰匙 → 交棒時第二次
+        整封照寄,共同收件人收到重複。收件人只留在 `business_key`(內容
+        識別與補寄仲裁本來就要它)。
+
+        `occurrence_key` 為空(呼叫端給不出來)時退回舊判準,如下 ——
         同一筆 BEGIN IMMEDIATE 裡仲裁 ——【正在寄】才算有人負責:
           * 同 business_key 的【初次】紀錄還在 `OWNED_STATES`
             (PREPARED/SUBMITTING/UNKNOWN = 結果未定)→ 拒;
@@ -621,11 +658,26 @@ class DeliveryLedger:
         讓一個 business_key 從此再也寄不出去(外審 2026-08-18 第七輪 P1)。
         """
         did = new_delivery_id()
+        occs = sorted({str(k) for k in (occurrence_keys or ()) if str(k)})
         rec = self._new_rec(did, business_key, category, recipients, subject,
                             message_id, attachment_hash, "", body_text)
         with self._lock:
             conn = self._ensure_conn_locked()
             with self._txn(conn):
+                if occs:
+                    # ★同一次寄送機會只有一次初次寄送★:除了「確定沒送出
+                    #   (FAILED)」之外的任何狀態都代表這次機會已經被服務過
+                    #   或正在被服務。不需要時間租約,也不必分 CONFIRMED /
+                    #   PARTIAL —— 下一次機會有它自己的 key。
+                    if self._served_occurrences_locked(conn, occs):
+                        return ""
+                    self._insert_locked(conn, rec)
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO delivery_occurrences"
+                        " (occurrence_key, delivery_id) VALUES (?,?)",
+                        [(k, did) for k in occs])
+                    self._prune_locked(conn)
+                    return did
                 # ★★只 fence「settle 完、子紀錄還沒開」那一個轉換★★
                 #   (外審 AE-6 第 1 輪 P1-1 + 第 2 輪 P1-1)
                 #   `settle(refused=…)` 寫成 PARTIAL 與 `claim_resend_child`
@@ -669,6 +721,48 @@ class DeliveryLedger:
                 self._insert_locked(conn, rec)
                 self._prune_locked(conn)
         return did
+
+    def _served_occurrences_locked(self, conn, keys) -> set:
+        """這幾把機會鑰匙裡,哪幾把★已經被服務過或正在被服務★。
+
+        判準只有一條:持有那把鑰匙的【初次】紀錄不是「確定沒送出
+        (FAILED)」——除了 FAILED 以外的任何狀態都代表這次機會有人負責。
+        FAILED 但底下有★任何非 FAILED 的子紀錄★也算:
+          * 還在飛(SUBMITTING/PREPARED/UNKNOWN)—— 那封正要送給同一批人;
+          * 已經送達而親紀錄還沒被回寫 —— 回寫是下一輪回查才做的,中間
+            這一段親紀錄仍是 FAILED,只看「還在飛」的話會再寄一次。
+        反過來,子紀錄也 FAILED = 那次補寄也沒送出去 → 這次機會還沒被服務。
+
+        ★claim 與「這封請求算不算被服務過」用同一個判準★(外審 AE-8
+        第 2 輪 P1):兩邊各寫一套的話,擋下來的那一輪會把【還沒被服務的】
+        觸發也一起結案 —— 醫師的請求沉默消失。(在呼叫端的交易/鎖裡執行。)
+        """
+        keys = sorted({str(k) for k in (keys or ()) if str(k)})
+        if not keys:
+            return set()
+        rows = conn.execute(
+            "SELECT o.occurrence_key, d.delivery_id, d.state FROM deliveries d"
+            " JOIN delivery_occurrences o ON o.delivery_id=d.delivery_id"
+            " WHERE o.occurrence_key IN (%s) AND d.parent_id=''"
+            % ",".join("?" * len(keys)), tuple(keys)).fetchall()
+        served = set()
+        for key, pid, st in rows:
+            if str(st) != FAILED:
+                served.add(str(key))
+                continue
+            busy = conn.execute(
+                "SELECT 1 FROM deliveries WHERE parent_id=? AND state!=?"
+                " LIMIT 1", (pid, FAILED)).fetchone()
+            if busy:
+                served.add(str(key))
+        return served
+
+    def served_occurrence_keys(self, keys) -> set:
+        """對外版本:這幾把鑰匙裡哪幾把已經有人服務。讀不到就拋
+        (空集合會被讀成「都還沒服務」→ 把已經寄過的再寄一次)。"""
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            return self._served_occurrences_locked(conn, keys)
 
     def begin_if_no_live(self, *, business_key: str, category: str,
                          recipients: list, subject: str = "",
@@ -1550,3 +1644,9 @@ class DeliveryLedger:
         if cur.rowcount:
             logging.info("[delivery] 剪掉 %d 筆逾 %d 天的已收斂紀錄",
                          cur.rowcount, self._retain_days)
+        # ★機會索引跟著走★(批次AE-8):紀錄被剪掉之後,那幾把鑰匙的擁有者
+        #   已經不在(仲裁是 JOIN,查不到就等於沒人擁有 —— 方向是安全的),
+        #   但孤兒列不清會無限成長。
+        conn.execute(
+            "DELETE FROM delivery_occurrences WHERE delivery_id NOT IN"
+            " (SELECT delivery_id FROM deliveries)")

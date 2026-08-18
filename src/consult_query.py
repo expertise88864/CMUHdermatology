@@ -58,6 +58,7 @@ import shutil  # noqa: E402
 import socket  # noqa: E402
 import subprocess  # noqa: E402
 import threading  # noqa: E402
+import uuid  # noqa: E402
 import time  # noqa: E402
 import traceback  # noqa: E402
 import tkinter as tk  # noqa: E402
@@ -5403,6 +5404,11 @@ class _DeliveryArtifact:
     attachment: Any
     message_id: str
     business_key: str = ""
+    #: ★這一次寄送機會的識別★(批次AE-8;≠ business_key 的內容識別)。
+    #   ★是一組★:佇列會把多封 email 觸發併成一次工作,而補跑是逐筆重播的
+    #   —— 每一把都要被這一筆佔住。與 payload 一起固定 → 同一個 job 的
+    #   三次 attempt 共用同一次機會。
+    occurrence_keys: tuple = ()
 
 
 def _new_message_id() -> str:
@@ -5800,6 +5806,69 @@ def _flush_delivery_ledger() -> None:
         led.flush()
     except Exception:
         logging.debug("[delivery] 結束前補寫帳本失敗", exc_info=True)
+
+
+def _unserved_trigger_uids(trigger_uids, served_keys) -> tuple:
+    """這一批觸發裡,★哪幾封還沒有人服務★(用機會鑰匙反推回 uid)。
+
+    ★為什麼需要它★(外審 AE-8 第 2 輪 P1):佇列會把多封觸發併成一次
+    工作,而其中一把鑰匙可能【已經】被別人服務過(例如上一輪寄成功、
+    journal 還沒結案就重啟)。整批被拒的時候,如果照舊把 `_completed`
+    當成真、把【全部】journal 結案,那位【新請求】的醫師就沉默地消失了。
+    純函式:鑰匙是 `trigger:{uid}`,反推回 uid 只是字串運算。
+    """
+    served = {str(k) for k in (served_keys or ())}
+    out = []
+    for u in (trigger_uids or ()):
+        if f"trigger:{u}" not in served:
+            out.append(u)
+    return tuple(out)
+
+
+def _consult_occurrence_keys(trigger_label: str, trigger_uids=(),
+                             new_ids=()) -> tuple:
+    """這一次【寄送機會】的識別 —— ★與內容識別是兩回事★(批次AE-8)。
+
+    `_consult_business_key()` 回答的是「這是哪一份未簽清單、寄給誰」;同一份
+    未簽清單 17:00 報過、20:00 沒簽完還要再報,兩次的內容識別一模一樣,
+    但那是【兩次機會】。所有權要問的是後者:同一次機會只該有一次初次
+    寄送,不同機會誰也不擋誰。
+
+    ★回傳的是一組鑰匙,不是一把★(外審 AE-8 第 1 輪 P1):佇列會把多封
+    email 觸發併成一次工作(`_enqueue_pending_retrigger` 把 uid 併集),
+    而重啟後的補跑是【逐筆】重播的(`resume_pending_triggers` 每筆各送一次
+    `trigger_uids=(uid,)`)—— 那一次寄送必須把每一個構成它的鑰匙都佔住,
+    否則單筆重播算出來的鑰匙沒有人擁有,那位醫師會收到第二封。
+
+    ★收件人不進機會識別★(同輪 P2):設定改過、或兩台機器的收件人清單
+    不同,同一次機會就會算出不同的鑰匙 —— 交棒時第二次整封照寄,共同
+    收件人收到重複。收件人只留在內容識別那一邊。
+
+    各觸發的機會識別:
+    * ★email 觸發★:每個 `帳號指紋|UIDVALIDITY|uid` 各一把 —— 交棒後重播
+      【同一封】觸發信天生同鑰匙;醫師另外寄一封是新的 uid = 新的機會。
+    * 排程(label 是 HH:MM):日期 + 時段。同一個時段被新 generation 重跑
+      是同一次機會;20:00 是另一次。
+    * poll:日期 + 這一輪【新出現】的病歷號集合。重啟後基準還沒推進,
+      算出來的新集合一樣 → 同一次機會。★病歷號只放雜湊★(帳本會落地)。
+    * 手動與其他:每次一個新的隨機值 —— 人明確按下的那一次,寧可重複寄
+      也不可以被靜默丟掉。(仍然有用:同一個 job 的三次 attempt 共用它,
+      所以「第一次結果不明」照樣擋得住第二次 attempt 重寄。)
+    """
+    import hashlib  # noqa: PLC0415
+    uids = sorted({str(u) for u in (trigger_uids or ()) if str(u)})
+    if uids:
+        return tuple(f"trigger:{u}" for u in uids)
+    label = str(trigger_label or "")
+    today = datetime.now().strftime("%Y-%m-%d")
+    if ":" in label:                       # 排程時刻(12:40 / 17:10 …)
+        return (f"sched:{today}|{label}",)
+    ids = sorted({str(i) for i in (new_ids or ()) if str(i)})
+    if ids:
+        d = hashlib.sha256(json.dumps(ids, ensure_ascii=False)
+                           .encode("utf-8")).hexdigest()[:16]
+        return (f"poll:{today}|{d}",)
+    return (f"once:{uuid.uuid4().hex}",)
 
 
 def _consult_business_key(roster_texts, recipients, subject="") -> str:
@@ -6404,6 +6473,55 @@ def _refusal_code(info):
 _CLAIM_TAKEN = "__claim_taken__"
 
 
+def _trigger_senders_for(uids) -> list:
+    """這幾封觸發各自的寄件人(uid → sender,問觸發 journal)。→ 去重後的名單。
+
+    ★為什麼不能沿用整批的收件人★(外審 AE-8 第 3 輪 P1):佇列把收件人與
+    uid 存成兩個【各自的併集】,對應關係早就掉了。併批被拒、只退回其中
+    幾封的時候若沿用整批名單,下一輪就把結果再寄給【已經收到的那位】。
+
+    ★查不到就回空★:呼叫端會退回沿用原名單(可能重複一封)並記 log ——
+    重複比「請求消失」好,但要看得見。
+    """
+    want = {str(u) for u in (uids or ()) if str(u)}
+    if not want:
+        return []
+    data, ok = _trigger_journal_load()
+    if not ok:
+        logging.warning("[trigger] 讀不出 journal → 問不到這幾封觸發的寄件人")
+        return []
+    out = []
+    for uid, rec in (data or {}).items():
+        if str(uid) not in want:
+            continue
+        sender = str((rec or {}).get("sender") or "").strip()
+        if sender and sender not in out:
+            out.append(sender)
+    return out
+
+
+def _unserved_after_claim(delivery, trigger_uids) -> tuple:
+    """claim 被拒之後,這一批觸發裡還沒有人服務的那幾封。→ uid 們。
+
+    ★讀不到帳本 → 全部當成「還沒被服務」★:結案是不可逆的(信已標已讀、
+    journal 一清就再也補不回來),而多跑一輪只是重複一次查詢。
+    """
+    keys = tuple(getattr(delivery, "occurrence_keys", ()) or ())
+    uids = tuple(trigger_uids or ())
+    if not uids:
+        return ()
+    led = _get_ledger()
+    if led is None:
+        return uids
+    try:
+        served = led.served_occurrence_keys(keys)
+    except Exception:
+        logging.warning("[consult] 查不出哪幾封觸發已被服務 → 全部退回佇列"
+                        "(寧可重跑,不可以靜默結案)", exc_info=True)
+        return uids
+    return _unserved_trigger_uids(uids, served)
+
+
 def _delivery_begin(delivery, trigger_label: str, parent_id: str = "", *,
                     claim_event: bool = False) -> str:
     """送出【之前】登記一筆。回 delivery_id（失敗回空字串）。
@@ -6453,7 +6571,12 @@ def _delivery_begin(delivery, trigger_label: str, parent_id: str = "", *,
                 recipients=list(delivery.recipients),
                 subject=delivery.subject,
                 message_id=delivery.message_id or "",
-                body_text=delivery.text_body or "")
+                body_text=delivery.text_body or "",
+                # ★所有權問的是「這一次機會」★(批次AE-8):交棒後重跑
+                #   同一個排程時段/重播同一封觸發信 = 同一次機會;
+                #   17:00 與 20:00 是兩次,誰也不擋誰。
+                occurrence_keys=tuple(
+                    getattr(delivery, "occurrence_keys", ()) or ()))
             if not did:
                 logging.warning("[delivery] ★同一事件已有 sender 在負責 →"
                                 " 這一輪不寄★(business_key=%s)", _bk)
@@ -6689,6 +6812,8 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
       - trigger_label == "email" 且無 override → 用 email_trigger_recipients
         （fallback，例如手動觸發或寄件人解析失敗）
       - 其他（排程／手動）→ 用 recipients（一般四人名單）"""
+    #: poll 這一輪【新出現】的病歷號(給寄送機會識別用;非 poll 路徑留空)
+    _occ_new_ids: set = set()
     # ★到期的「補寄給被暫時拒收的收件人」先做★(外審第 10 輪第 3 回 P1-1)
     #   放在拿 `_flow_lock` 之前:補寄不碰 HIS,不需要那把鎖,而且被鎖擋下的
     #   輪次也應該讓補寄有機會發生(它跟這一輪查不查得到會診無關)。
@@ -6957,6 +7082,9 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                         # 基準還是舊格式(只有病歷號)，直接相減會把每一張既有會診
                         # 都當成新的而整份重寄。見 `_new_consult_ids`。
                         _new = set(_poll_sig) if _lost else _new_consult_ids(_poll_sig)
+                        # ★這一輪的「機會」= 新出現的那幾張會診★(批次AE-8)
+                        #   重啟後基準還沒推進 → 算出來的集合一樣 → 同一次機會。
+                        _occ_new_ids = set(_new)
                         if not _new:
                             # [2026-07-25 審查] 基準必須【剪枝】成目前清單,否則已回覆而
                             # 離開清單的病歷號會永遠留在基準裡 → 同一床日後【再次開會診】
@@ -7034,6 +7162,8 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                         message_id=_new_message_id(),
                         business_key=_consult_business_key(
                             roster_texts, recipients, subject),
+                        occurrence_keys=_consult_occurrence_keys(
+                            trigger_label, trigger_uids, _occ_new_ids),
                     )
                 if mail_method == "smtp":
                     # ★[2026-08-07 外審 AT/AW] 每一次寄送都進帳本★
@@ -7054,6 +7184,28 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                         #   (自查 P1-C 的同一條規則:`_materialize_shot`
                         #   「留著當線索」的理由只對【寄出去的】成立)
                         _discard_undelivered_shot(delivery)
+                        # ★只結案【真的被服務過】的那幾封觸發★
+                        #   (外審 AE-8 第 2 輪 P1):併批裡可能有一把鑰匙
+                        #   早被服務、另一把是【全新的請求】—— 整批被拒
+                        #   之後若照樣把 journal 全部結案,那位醫師的請求
+                        #   就沉默消失了。查不出來時一律當「還沒被服務」
+                        #   (寧可下一輪重跑,不可以靜默丟掉)。
+                        _left = _unserved_after_claim(delivery, trigger_uids)
+                        if _left:
+                            # ★只退回【那幾封的寄件人】★(外審 AE-8 第 3 輪
+                            #   P1):佇列把收件人與 uid 各自併集,對應關係
+                            #   早就掉了 —— 沿用整批的名單,下一輪會把信再
+                            #   寄給【已經收到的那位】。uid→寄件人的對應
+                            #   在觸發 journal 上本來就有,回去問它。
+                            _left_to = _trigger_senders_for(_left)
+                            logging.warning("[consult] 併批裡有 %d 封觸發還沒"
+                                            "被服務 → 退回佇列下輪再跑(%d 位"
+                                            "寄件人)", len(_left), len(_left_to))
+                            if requeued_out is not None:
+                                requeued_out.extend(_left)
+                            _enqueue_pending_retrigger(
+                                trigger_label, _left_to or override_recipients,
+                                _left)
                         # ★這是【健康】的一輪★(與「沒有新會診」同理,
                         #   見上面 6970 行):HIS 流程整段跑完好好的,
                         #   只是這一則通知由別人負責。不清零的話,零星

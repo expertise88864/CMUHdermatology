@@ -8789,7 +8789,13 @@ def _send_alert_email_via_smtp(subject: str, body: str,
                 #   稽核不符等)的內文含病歷號 —— 預設不落地,
                 #   只有止掛那兩條臨床路徑 opt-in(它們的補寄
                 #   價值明確,且帳本另有獨立的 body 保留期)。
-                body_text=(body or "") if durable_body else "")
+                body_text=(body or "") if durable_body else "",
+                # ★只有【呼叫端明講】的 key 才拿來當寄送機會識別★
+                #   (批次AE-8):止掛信傳進來的 `notify_key` 本來就是
+                #   「哪一天、哪一診次、哪位醫師」= 一次機會。而退化用的
+                #   `alert:{主旨}` 不是 —— 開發者告警的主旨天天一樣,
+                #   拿它當機會識別會讓第一封成功之後【再也不會有第二封】。
+                occurrence_keys=((business_key,) if business_key else ()))
             if not _did:
                 logging.warning("[delivery] ★同一則通知已有其他寄送者負責 →"
                                 " 本輪不寄★(business_key=%s)",

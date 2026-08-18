@@ -528,9 +528,12 @@ def test_extracted_text_appended_to_mail_body(monkeypatch):
     assert h.bodies[0].startswith("本文")
     assert "蜂窩性組織炎" in h.bodies[0]
 
+    # ★第二次要用【另一個排程時段】★(批次AE-8):同一天同一個時段是
+    #   【同一次寄送機會】,重跑它會被事件所有權擋下(那正是交棒重複寄的
+    #   修正)。這條測的是內文組裝,不是機會仲裁 —— 給它自己的機會。
     h2 = _JobHarness(monkeypatch, _base_cfg(body_template="本文"),
                      extracted_text="")
-    cq._do_full_job("17:00")
+    cq._do_full_job("20:00")
     assert h2.bodies[0] == "本文"
 
 
