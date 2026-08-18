@@ -145,6 +145,34 @@ def _redirect_cached_consts(monkeypatch, app_dir: str) -> None:
                 monkeypatch.setattr(mod, attr, new, raising=False)
 
 
+def _drop_cached_ledgers() -> None:
+    """把 src/ 模組層快取住的 DeliveryLedger 單例關掉並清成 None。
+
+    ★為什麼一定要清★：`consult_query._get_ledger()` / `main._get_alert_ledger()`
+    是【模組層單例】——第一支碰到它的測試會建一個指向【那一支測試】tmp
+    settings 目錄的 DB，之後每一支測試都繼續用同一個物件、同一個檔案。
+    路徑常數被 `_redirect_cached_consts` 導向了，這個【已經建好的物件】卻不會
+    —— 於是帳本狀態跨測試累積。以前只是髒；自從初次寄送要向帳本
+    `claim_initial_delivery()` 要所有權之後，前一支測試留下的同 business_key
+    紀錄會讓後面的測試【一封都寄不出去】（實際發生：7 支 consult 決策測試
+    集體變紅，且只在特定檔案順序下重現）。
+
+    用【型別】掃描而不是硬列 (模組, 屬性) 名單：第三支程式日後也接帳本、
+    或屬性改名時，這裡不會靜默失效。"""
+    from cmuh_common.delivery_ledger import DeliveryLedger
+    for mod in list(sys.modules.values()):
+        f = getattr(mod, "__file__", None)
+        if not f or not os.path.normcase(os.path.abspath(f)).startswith(_SRC_NORM):
+            continue
+        for attr, val in list(vars(mod).items()):
+            if isinstance(val, DeliveryLedger):
+                try:
+                    val._close_quietly()
+                except Exception:                    # noqa: BLE001,S110
+                    pass                             # 關不掉也要清指標
+                setattr(mod, attr, None)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_settings_dir(tmp_path, monkeypatch):
     """每個測試把 get_settings_dir() 導向本測試專屬的 tmp 目錄，互相隔離、零污染。"""
@@ -154,7 +182,9 @@ def _isolate_settings_dir(tmp_path, monkeypatch):
     # 只換 holder 指向 → 所有綁定穩定函式的 by-name get_app_dir 立刻拿到本測試目錄。
     monkeypatch.setitem(_APP_DIR_HOLDER, "app", str(app_dir))
     _redirect_cached_consts(monkeypatch, str(app_dir))
+    _drop_cached_ledgers()          # 進場前先清掉別的測試留下的單例
     yield
+    _drop_cached_ledgers()          # 離場再清一次（本測試自己建的那一個）
 
 
 # ── Tk：全 session 共用【唯一一個】root ────────────────────────────────────

@@ -90,8 +90,11 @@ def test_unknown_branch_exists_and_bails_before_generic_cleanup():
     """★核心★ UNKNOWN 要在一般收尾【之前】分流，並且直接結束那一輪。"""
     src = inspect.getsource(cq._do_full_job)
     i_unknown = src.index("isinstance(last_err, DeliveryOutcomeUnknown)")
-    i_discard = src.index("_discard_undelivered_shot(delivery)")
-    i_release = src.index("_release_trigger_dedup(override_recipients)")
+    # ★從 UNKNOWN 分支往後找★:函式前段（寄送區）也會出現丟棄截圖
+    #   （事件所有權被別人拿走時就地收尾，2026-08-18），用「全函式第一個」
+    #   會比到那一處，於是這條守衛量的就不是「終局收尾的順序」了。
+    i_discard = src.index("_discard_undelivered_shot(delivery)", i_unknown)
+    i_release = src.index("_release_trigger_dedup(override_recipients)", i_unknown)
     assert i_unknown < i_discard < i_release, "UNKNOWN 分流必須排在一般收尾之前"
     seg = src[i_unknown:i_discard]
     assert "break" in seg, "UNKNOWN 分支要 break，不可掉進一般失敗收尾"

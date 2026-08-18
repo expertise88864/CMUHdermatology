@@ -8772,18 +8772,36 @@ def _send_alert_email_via_smtp(subject: str, body: str,
         #   跨重啟去重用的 `notify_key`(含日期/診次/醫師)。兩邊用同一把鑰匙,
         #   帳本才有機會跟去重機制對得起來。
         try:
-            _did = _led.begin(business_key=business_key or f"alert:{subject}",
-                              category=category or "clinical",
-                              recipients=list(recipients), subject=subject,
-                              message_id=_msgid,
-                              # ★落地與否由呼叫端【明確】決定★(外審 AD-3 第 1
-                              #   輪 P1-3):這是共用 helper,別的呼叫端(讀回
-                              #   稽核不符等)的內文含病歷號 —— 預設不落地,
-                              #   只有止掛那兩條臨床路徑 opt-in(它們的補寄
-                              #   價值明確,且帳本另有獨立的 body 保留期)。
-                              body_text=(body or "") if durable_body else "")
+            # ★同一個事件只有一個 sender 可以開始★(外審 2026-08-18 P1-01)
+            #   自動更新交棒【刻意】先放開單例互斥、才收背景工作:舊
+            #   generation 的 SMTP 還在飛(帳上是 SUBMITTING、去重檔還沒
+            #   寫),新 generation 掃到同一則止掛事件就會再寄一封。
+            #   同一筆交易仲裁「同 key 還活著的初次紀錄 + 它底下結果未定的
+            #   補寄」;拿不到就這一輪不寄(那位 sender 的結果會自己入帳,
+            #   失敗的話下一輪就 claim 得到)。
+            _did = _led.claim_initial_delivery(
+                business_key=business_key or f"alert:{subject}",
+                category=category or "clinical",
+                recipients=list(recipients), subject=subject,
+                message_id=_msgid,
+                # ★落地與否由呼叫端【明確】決定★(外審 AD-3 第 1
+                #   輪 P1-3):這是共用 helper,別的呼叫端(讀回
+                #   稽核不符等)的內文含病歷號 —— 預設不落地,
+                #   只有止掛那兩條臨床路徑 opt-in(它們的補寄
+                #   價值明確,且帳本另有獨立的 body 保留期)。
+                body_text=(body or "") if durable_body else "")
+            if not _did:
+                logging.warning("[delivery] ★同一則通知已有其他寄送者負責 →"
+                                " 本輪不寄★(business_key=%s)",
+                                business_key or subject)
+                # ★回 False:呼叫端不會記去重★ —— 那位 sender 若失敗,
+                #   下一輪掃描會重新嘗試(不會因此漏掉這則提醒)。
+                return SendResult(False)
         except Exception:
-            logging.debug("[delivery] 登記止掛寄送失敗(略過)", exc_info=True)
+            # 帳本這一刻不可用 → ★依既有定案照寄★(availability-first,
+            #   2026-08-05 事故後的產品政策:帳本壞掉不停臨床通知)。
+            logging.warning("[delivery] 取得事件所有權失敗 → 照既有政策仍寄出"
+                            "(這一封沒有帳)", exc_info=True)
             _did = ""
         if _did:
             try:

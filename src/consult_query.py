@@ -6398,8 +6398,23 @@ def _refusal_code(info):
     return info
 
 
-def _delivery_begin(delivery, trigger_label: str, parent_id: str = "") -> str:
+#: `_delivery_begin` 的第三態:★帳本說「這個事件已經有人負責」★。
+#: 空字串沿用既有語意(沒有帳,但照寄 —— availability-first);
+#: 這個哨符則是【明確不要寄】,兩者不可以再壓成同一格。
+_CLAIM_TAKEN = "__claim_taken__"
+
+
+def _delivery_begin(delivery, trigger_label: str, parent_id: str = "", *,
+                    claim_event: bool = False) -> str:
     """送出【之前】登記一筆。回 delivery_id（失敗回空字串）。
+
+    `claim_event=True` = ★這是一則臨床【事件】的初次寄送★:先向帳本要
+    這個事件的所有權,拿不到就回 `_CLAIM_TAKEN`(呼叫端這一輪不寄)。
+    ★不可以用「`parent_id` 是空的」當這個判準★:佇列補寄在拿不到
+    `origin_did` 時也是空的 parent_id 走這裡登記一筆退避重試
+    (`business_key` 是 `K|retryN`)—— 那不是新事件的初次寄送,把它當成
+    初次來仲裁會讓呼叫端收到一個它不認得的 `_CLAIM_TAKEN` 當 delivery_id,
+    然後拿它去 settle 一筆不存在的紀錄。所以由呼叫端【明講】。
 
     ★[2026-08-08 外審第 10 輪 P2-08] `mark_submitting` 失敗仍要回傳 did★
     舊寫法把 begin 與 mark 包在同一個 try 裡,mark 失敗就回空字串 —— 那筆
@@ -6412,19 +6427,42 @@ def _delivery_begin(delivery, trigger_label: str, parent_id: str = "") -> str:
     led = _get_ledger()
     if led is None:
         return ""
+    _bk = delivery.business_key or f"consult:{delivery.subject}"
+    if claim_event and parent_id:
+        # 結構性:子紀錄不是事件的擁有者(它的仲裁在 claim_resend_child)。
+        raise ValueError("補寄子紀錄不可以宣稱事件所有權")
     try:
-        did = led.begin(
-            business_key=delivery.business_key or f"consult:{delivery.subject}",
-            category="consult",
-            recipients=list(delivery.recipients),
-            subject=delivery.subject,
-            message_id=delivery.message_id or "",
-            parent_id=parent_id,
-            # ★只落地文字★(批次AD-3,使用者定案):Sent 查無後自動補寄
-            #   要拿什麼重建 —— PHI 截圖依既有隱私定案不落地。
-            body_text=delivery.text_body or "")
+        if not claim_event:
+            # 補寄子紀錄 / 佇列退避的直登記後備:仲裁在
+            # `claim_resend_child`(見 `_resend_transient_refusals`)。
+            did = led.begin(
+                business_key=_bk, category="consult",
+                recipients=list(delivery.recipients),
+                subject=delivery.subject,
+                message_id=delivery.message_id or "",
+                parent_id=parent_id,
+                # ★只落地文字★(批次AD-3,使用者定案):Sent 查無後自動
+                #   補寄要拿什麼重建 —— PHI 截圖依既有隱私定案不落地。
+                body_text=delivery.text_body or "")
+        else:
+            # ★初次寄送要先取得這個事件的所有權★(外審 2026-08-18 P1-01)
+            #   自動更新交棒時,舊 generation 的 SMTP 可能還在飛而去重檔
+            #   還沒寫 —— 新 generation 掃到同一事件就會再寄一封。
+            did = led.claim_initial_delivery(
+                business_key=_bk, category="consult",
+                recipients=list(delivery.recipients),
+                subject=delivery.subject,
+                message_id=delivery.message_id or "",
+                body_text=delivery.text_body or "")
+            if not did:
+                logging.warning("[delivery] ★同一事件已有 sender 在負責 →"
+                                " 這一輪不寄★(business_key=%s)", _bk)
+                return _CLAIM_TAKEN
     except Exception:
-        logging.debug("[delivery] 登記寄送失敗(略過)", exc_info=True)
+        # 帳本這一刻不可用 —— ★依既有定案照寄★(availability-first,
+        #   2026-08-05 事故後的產品政策):那一封沒有帳,但臨床通知不停。
+        logging.warning("[delivery] 登記/取得事件所有權失敗 → 照既有政策"
+                        "仍寄出(這一封沒有帳)", exc_info=True)
         return ""
     try:
         led.mark_submitting(did)
@@ -7001,7 +7039,27 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     # ★[2026-08-07 外審 AT/AW] 每一次寄送都進帳本★
                     #   begin 在【送出之前】——這樣即使送出當下斷電,重啟後看到的
                     #   是一筆 SUBMITTING(待查),而不是「什麼都沒發生」。
-                    _did = _delivery_begin(delivery, trigger_label)
+                    _did = _delivery_begin(delivery, trigger_label,
+                                           claim_event=True)
+                    if _did == _CLAIM_TAKEN:
+                        # ★同一事件已有 sender 在負責 → 這一輪不寄★
+                        #   (外審 2026-08-18 P1-01)最典型的是自動更新
+                        #   交棒:舊 generation 的 SMTP 還在飛、去重檔還
+                        #   沒寫,新 generation 掃到同一事件。不寄也不推
+                        #   基準 —— 那一位 sender 的結果會自己入帳;
+                        #   它若失敗(FAILED),下一輪就 claim 得到。
+                        logging.warning("[consult] 這一則會診通知已有其他"
+                                        "寄送者負責 → 本輪跳過(不重複寄)")
+                        # ★沒寄出去的病人畫面不可以留在磁碟上★
+                        #   (自查 P1-C 的同一條規則:`_materialize_shot`
+                        #   「留著當線索」的理由只對【寄出去的】成立)
+                        _discard_undelivered_shot(delivery)
+                        # ★這是【健康】的一輪★(與「沒有新會診」同理,
+                        #   見上面 6970 行):HIS 流程整段跑完好好的,
+                        #   只是這一則通知由別人負責。不清零的話,零星
+                        #   失敗會被累加成假的「連續故障」而誤報。
+                        _note_job_success()
+                        return
                     # ★[2026-08-07 外審第 8 輪 P1-03] 每一筆都要有終局狀態★
                     #   舊寫法只在【成功】與【結果不明】兩條路 settle。連不上、
                     #   認證失敗、5xx、SMTP 未設定這些「確定沒送出去」的錯誤直接

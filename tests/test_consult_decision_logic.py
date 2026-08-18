@@ -1360,3 +1360,49 @@ def test_poll_first_startup_with_an_unverified_roster_leaves_nothing(monkeypatch
     assert marked == [], "★清單不合格卻仍然寫了標記★ 下一輪會誤報基準遺失"
     assert store["init"] is False and store["charts"] == set()
     assert h.sent == [], "首輪不合格 → 這一輪什麼都不做,下一輪重新比對"
+
+
+# ─── 事件所有權:同一則通知同時只有一個 sender(外審 2026-08-18 P1-01) ─────
+
+def test_a_second_job_does_not_resend_while_the_first_is_unresolved(monkeypatch):
+    """★行為級反例★ 第一次寄送逾時(結果不明,可能已送達)→ 同一事件的
+    下一個 job【不可以】再寄一封。
+
+    這正是自動更新交棒的形狀:舊 generation 的寄送還沒有結論、去重檔也
+    還沒寫,新 generation 起來後掃到同一批未簽會診。舊寫法的初次寄送
+    只 `begin()` 一筆新紀錄、從來不問可不可以寄 —— 於是同一則臨床通知
+    寄兩封,不需要任何異常。
+    """
+    txt = "王小明1234567"          # 有病歷號 → business_key 走簽章路徑
+    h1 = _JobHarness(monkeypatch, _base_cfg(), extracted_text=txt)
+
+    def _timeout(*a, **k):
+        raise cq.DeliveryOutcomeUnknown("SMTP 逾時,可能已送達")
+    monkeypatch.setattr(cq, "send_via_smtp", _timeout)
+    cq._do_full_job("17:00")
+    assert h1.sent == []            # 逾時 → 這一輪沒有成功紀錄
+
+    h2 = _JobHarness(monkeypatch, _base_cfg(), extracted_text=txt)
+    cq._do_full_job("17:00")
+    assert h2.sent == [], (
+        "★同一則會診通知寄了兩封★ 前一次的結果還沒有結論(可能已送達),"
+        "這一輪必須跳過")
+
+
+def test_the_next_job_sends_once_the_first_is_known_to_have_failed(monkeypatch):
+    """★出口存在★ 前一次確定沒送出(FAILED)→ 下一個 job 必須照寄。
+
+    (反方向:所有權若擋過頭,漏寄比重複寄更嚴重。)
+    """
+    txt = "王小明1234567"
+    h1 = _JobHarness(monkeypatch, _base_cfg(), extracted_text=txt)
+
+    def _boom(*a, **k):
+        raise RuntimeError("連不上 SMTP —— 確定沒送出")
+    monkeypatch.setattr(cq, "send_via_smtp", _boom)
+    cq._do_full_job("17:00")
+    assert h1.sent == []
+
+    h2 = _JobHarness(monkeypatch, _base_cfg(), extracted_text=txt)
+    cq._do_full_job("17:00")
+    assert len(h2.sent) == 1, "★前一次確定失敗卻不准寄★ 這則通知就漏掉了"

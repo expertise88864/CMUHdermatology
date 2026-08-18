@@ -119,6 +119,16 @@ R_UNKNOWN = "unknown"
 # 「還沒被否證」= 不可以再寄一次的狀態。UNKNOWN 也算——重寄的風險大於漏寄，
 # 要等 Message-ID 回查把它否證成 FAILED 之後才可以重送。
 LIVE_STATES = (PREPARED, SUBMITTING, CONFIRMED, PARTIAL, UNKNOWN)
+# ★「這一刻有沒有人正在寄這個事件」★(claim_initial_delivery 用)——
+#   只有【結果未定】才算有人負責。CONFIRMED/PARTIAL 是已經結案的
+#   過去式,不代表現在有 sender 在飛(理由見 claim_initial_delivery)。
+OWNED_STATES = (PREPARED, SUBMITTING, UNKNOWN)
+# ★交接中的短租約★(claim_initial_delivery;外審 AE-6 第 2 輪 P1-1)
+#   只涵蓋「settle 成 PARTIAL → 開出補寄子紀錄」這一個轉換。正常情況它
+#   短到量不出來(同一個函式的下一行),租約存在只是為了「擁有者剛好死
+#   在這裡」的那種交錯。到期就放行:寧可多一封,不可讓 20:00 的提醒或
+#   醫師手動的那一次靜默消失。
+_HANDOVER_FENCE_SEC = 120.0
 
 
 class LedgerUnavailable(RuntimeError):
@@ -555,6 +565,104 @@ class DeliveryLedger:
                 self._insert_locked(conn, rec)
                 self._prune_locked(conn)
                 self._scrub_stale_bodies_locked(conn)
+        return did
+
+    def claim_initial_delivery(self, *, business_key: str, category: str,
+                               recipients: list, subject: str = "",
+                               message_id: str = "",
+                               attachment_hash: str = "",
+                               body_text: str = "") -> str:
+        """★一次臨床事件只有一個 sender 可以開始★(外審 2026-08-18 P1-01)。
+
+        回傳 delivery_id;★同一事件已經有人在負責 → 回空字串(不要寄)★;
+        帳本這一刻不可用 → 拋 `LedgerUnavailable`(呼叫端依既有的
+        availability-first 政策決定,見 `begin` 的說明 —— 那是產品定案,
+        而「帳本正常時有沒有 event ownership」是正確性,不是政策)。
+
+        ★為什麼 `begin()` 不夠★:補寄側的仲裁(claim_resend_child /
+        supersede / newer sibling)全是「補寄在問可不可以寄」,初次寄送
+        自己從來不問。而正常的自動更新交棒【刻意】先放開單例互斥、才收
+        背景工作:舊 generation 的 SMTP 還在飛(紀錄還是 SUBMITTING、
+        去重檔還沒寫),新 generation 就已經可以掃到同一個事件並
+        `begin()` 一筆新的 —— 同一則臨床通知寄兩封,不需要任何異常。
+
+        同一筆 BEGIN IMMEDIATE 裡仲裁 ——【正在寄】才算有人負責:
+          * 同 business_key 的【初次】紀錄還在 `OWNED_STATES`
+            (PREPARED/SUBMITTING/UNKNOWN = 結果未定)→ 拒;
+          * 或者那筆是 PARTIAL【而且補寄鏈還開著】(body_text 非空)→ 拒:
+            settle 成 PARTIAL 與建立補寄子紀錄是兩筆交易,中間的空隙裡
+            「結果未定」已不成立、子紀錄還沒出現(見下方 SQL 的說明);
+          * 那些初次紀錄底下★結果未定的補寄子紀錄★(同三個狀態)→ 拒。
+            子紀錄的 business_key 是 `K|retry1` 這種衍生字串,單看字串
+            比不到,要靠 parent_id 串。
+
+        ★★為什麼不是 `LIVE_STATES`(不含 CONFIRMED/PARTIAL)★★
+        business_key 是【內容識別】(未簽會診清單的雜湊 + 收件人),不是
+        「這一次寄送機會」的識別 —— 17:00 排程報過一次(CONFIRMED)、
+        20:00 那批還沒簽完的照樣要再報一次,兩者的 key 一模一樣。
+        把已結案的紀錄也當成「有人負責」,等於★一天只准通知一次★:
+        20:00 的提醒、醫師手動再按一次、止掛信下一輪掃描,通通被靜默
+        丟掉(而止掛那條路更慘 —— 沒寄成就不寫去重,於是每一輪都重來、
+        每一輪都被擋,那個提醒從此再也不會出現)。
+        本方法要擋的是【同一則通知同時有兩個 sender 在飛】,不是
+        「這個內容今天寄過了」;內容層級的去重另有既有機制(已通知基準 /
+        去重檔),而且那些機制知道「什麼時候該再寄一次」。
+        殘留的重複窗口只剩「舊 generation 已 CONFIRMED、卻在寫去重檔
+        之前硬死」——毫秒級,且失效方向是【多寄一封】而不是漏寄,
+        符合 2026-08-05 定案的 availability-first。
+
+        ★抑制自帶出口★:卡住的 SUBMITTING/UNKNOWN 會被回查收斂
+        (Sent 查證 → CONFIRMED/FAILED;沒有 Message-ID 的 24 小時逾期
+        結案),收斂成 FAILED 之後同一事件就能再寄。
+        """
+        did = new_delivery_id()
+        rec = self._new_rec(did, business_key, category, recipients, subject,
+                            message_id, attachment_hash, "", body_text)
+        with self._lock:
+            conn = self._ensure_conn_locked()
+            with self._txn(conn):
+                # ★★只 fence「settle 完、子紀錄還沒開」那一個轉換★★
+                #   (外審 AE-6 第 1 輪 P1-1 + 第 2 輪 P1-1)
+                #   `settle(refused=…)` 寫成 PARTIAL 與 `claim_resend_child`
+                #   是兩筆交易:中間那一瞬間「結果未定」已不成立、子紀錄
+                #   還不存在 —— 交棒剛好落在這裡的話,新 generation 會把
+                #   整封再寄一次,而 A 剛剛才收到。
+                #   ★但補寄鏈的【整個壽命】不是所有權★:`body_text` 代表的
+                #   是「還欠一次補寄」的義務(成功/放棄/回查/到期才消失),
+                #   拿它當 fence 會把 20:00 的排程提醒、醫師手動再按一次
+                #   通通靜默丟掉 —— 漏寄比重複更嚴重,方向錯了。
+                #   所以三個條件同時成立才算「這個事件正在交接中」:
+                #     PARTIAL + payload 還在 + ★還沒有任何子紀錄★
+                #     + 這一筆是【剛剛】才動過的(短租約,見下)。
+                #   有子紀錄之後由既有的 in-flight 子紀錄檢查接手;
+                #   租約到期(擁有者死了、沒人接手)就放行 —— 靜默最多
+                #   `_HANDOVER_FENCE_SEC`,而且只擋內容完全相同的那一則。
+                owners = conn.execute(
+                    "SELECT delivery_id FROM deliveries d"
+                    " WHERE business_key=? AND parent_id='' AND (state IN (%s)"
+                    "  OR (state=? AND body_text!='' AND updated_at>?"
+                    "      AND NOT EXISTS (SELECT 1 FROM deliveries c"
+                    "                      WHERE c.parent_id=d.delivery_id)))"
+                    % ",".join("?" * len(OWNED_STATES)),
+                    (str(business_key), *OWNED_STATES, PARTIAL,
+                     _now() - _HANDOVER_FENCE_SEC)).fetchall()
+                if owners:
+                    return ""
+                # 同事件的補寄子紀錄:用 parent_id 串(business_key 會被
+                # 衍生成 `K|retry1`,字串比對抓不到)。
+                initials = conn.execute(
+                    "SELECT delivery_id FROM deliveries WHERE business_key=?"
+                    " AND parent_id=''", (str(business_key),)).fetchall()
+                for (pid,) in initials:
+                    busy = conn.execute(
+                        "SELECT 1 FROM deliveries WHERE parent_id=? AND"
+                        " state IN (%s) LIMIT 1"
+                        % ",".join("?" * len(OWNED_STATES)),
+                        (pid, *OWNED_STATES)).fetchone()
+                    if busy:
+                        return ""
+                self._insert_locked(conn, rec)
+                self._prune_locked(conn)
         return did
 
     def begin_if_no_live(self, *, business_key: str, category: str,
@@ -1067,11 +1175,23 @@ class DeliveryLedger:
                 #   第 1 輪 F2):工作層重跑的較新 sibling(可能 bodyless
                 #   PARTIAL)把 A 送到了,舊親紀錄還掛著 TRANSIENT ——
                 #   只看自己的子紀錄,A 會再收一封。
+                #   ★★只看【比本筆新】的兄弟★★(外審 AE-6 第 1 輪 P1-2):
+                #   同一份未簽清單 17:00 報過、20:00 還要再報一次 —— 兩者
+                #   business_key 相同。沒有方向限制的話,17:00 那筆的「已送達」
+                #   會被寫進 20:00 這筆:20:00 的紀錄變成 CONFIRMED、payload
+                #   被清掉、補寄與漏收告警一起消失 —— 而 SMTP 的證據明明說
+                #   那位【沒有】收到 20:00 這一封。舊事件的結果不能拿來替
+                #   新事件背書;反向(較新的送達了)才是 AE-3 F2 要處理的。
+                #   ★嚴格大於★(外審 AE-6 第 2 輪 P2):時間戳相同(粗解析度
+                #   時鐘、匯入的舊資料)時,`>=` 會把同一刻的舊紀錄放進來,
+                #   缺陷就原樣復發;旁邊的 live_newer 檢查本來就是嚴格的。
                 pbk = str(prow[1]) if prow else ""
+                _pcreated = _as_epoch(prow[2]) if prow else 0.0
                 if pbk:
                     for (raw,) in conn.execute(
                             "SELECT recipients FROM deliveries WHERE"
-                            " business_key=? AND delivery_id!=?", (pbk, pid)):
+                            " business_key=? AND delivery_id!=?"
+                            " AND created_at>?", (pbk, pid, _pcreated)):
                         try:
                             states = _clean_recipients(
                                 json.loads(raw or "{}"))
@@ -1096,7 +1216,7 @@ class DeliveryLedger:
                     #   紀錄(CONFIRMED/PARTIAL/FAILED)不擋 —— 它送到的人
                     #   已經在上面的已送達集合裡排除,沒送到的人本來就該由
                     #   這條鏈補(或由 takeover 收掉整條鏈)。
-                    _pat = _as_epoch(prow[2]) if prow else 0.0
+                    _pat = _pcreated
                     _inflight = (SUBMITTING, PREPARED, UNKNOWN)
                     live_newer = conn.execute(
                         "SELECT 1 FROM deliveries WHERE business_key=?"
@@ -1105,6 +1225,35 @@ class DeliveryLedger:
                         (pbk, pid, _pat, *_inflight)).fetchone()
                     if live_newer:
                         return ""
+                # ★同事件的結論要【回寫】,不能只當送出閘門★
+                #   (外審 2026-08-18 P2-01):只拿來縮 targets 的話,
+                #   親紀錄會永遠停在 TRANSIENT —— 掃描端說「還欠補寄」、
+                #   claim 說「不准補,他已經收到」、親紀錄說「他沒收到」,
+                #   三天後 body 到期被清,結案就對【已經送到的事】發出
+                #   「始終沒收到,請人工確認/轉寄」的告警(誘導人工重寄)。
+                # ★兩邊的結論衝突時,【已送達】最大★(外審 AE-6 第 1 輪 P2)
+                #   同一個位址在某一筆是 CONFIRMED、在另一筆是 550
+                #   (信箱設定改過就會這樣):兩個迴圈各寫各的,後跑的那個
+                #   會把 CONFIRMED 蓋成 PERMANENT —— 明明有送達的證據,帳上
+                #   卻寫「查無此人」,而且鏈不會結案(payload 留到過期才清)。
+                #   `record_rcpt_outcome` 早就定了「CONFIRMED 不可被推翻」,
+                #   這裡必須用同一個優先序:先把已送達的從結論集合裡拿掉。
+                concluded_by_children -= delivered_by_children
+                heal = {}
+                for a in list(concluded_by_children):
+                    if parent_states.get(a) not in (None, R_CONFIRMED,
+                                                    R_PERMANENT):
+                        heal[a] = R_PERMANENT
+                for a in list(delivered_by_children):
+                    if parent_states.get(a) not in (None, R_CONFIRMED):
+                        heal[a] = R_CONFIRMED
+                if heal:
+                    def _heal(states: dict):
+                        for a, st in heal.items():
+                            states[a] = st
+                        return None
+                    self._mutate_states_in_txn(conn, pid, _heal)
+                    parent_states.update(heal)
                 targets = [a for a in want
                            if parent_states.get(a) == R_TRANSIENT
                            and a not in delivered_by_children

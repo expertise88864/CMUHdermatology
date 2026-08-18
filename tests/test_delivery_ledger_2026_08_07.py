@@ -271,9 +271,14 @@ def test_alert_send_records_into_the_ledger():
     import inspect
     import main
     src = inspect.getsource(main._send_alert_email_via_smtp)
-    i_begin = src.index("_led.begin(")
+    # 登記的方法名會變（begin → claim_initial_delivery，2026-08-18 事件所有權），
+    # 被守的性質不變:★真正送出之前，這一封在帳本裡已經有一筆★。
+    regs = [src.index(c) for c in ("_led.begin(", "_led.claim_initial_delivery(")
+            if c in src]
+    assert regs, "止掛提醒必須先在帳本登記一筆（begin 或 claim_initial_delivery）"
+    i_begin = min(regs)
     i_send = src.index("send_mail(")
-    assert i_begin < i_send, "begin 必須在真正送出之前"
+    assert i_begin < i_send, "登記必須在真正送出之前"
     assert "_settle(refused=refused)" in src, "成功路徑要寫回逐位收件人結果"
 
 
