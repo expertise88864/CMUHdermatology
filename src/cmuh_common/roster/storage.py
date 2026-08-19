@@ -219,26 +219,43 @@ class RosterStorage:
         if name not in self.CANONICAL_FILES:
             raise KeyError(f"{name} 不是正典檔(要走 CAS 請先登記到 "
                            f"CANONICAL_FILES)")
-        path = self._path(name)
+        data, rev = self._strict_snapshot(self._path(name))
+        return self._canonical_loader(name)(_parsed=data), rev
+
+    def _strict_snapshot(self, path: str) -> "tuple[dict, str]":
+        """★這條規則只有這一份實作★:讀一次位元組 → 用它算 revision、也嚴格
+        解析它。壞檔/暫時讀不到直接拋(不是靜默回空);缺檔 → ({}, "")。
+
+        月檔與正典檔共用 —— 兩邊各寫一次的話,遲早只有一邊被修好。
+        """
         raw = _read_bytes(path)
         if raw is None:                       # 被鎖住 != 不存在(見 _read_bytes)
             raise ValueError(
                 f"{os.path.basename(path)} 暫時無法讀取（被鎖住？），"
                 f"為避免用空白覆蓋已中止這次編輯")
         rev = _revision_of(raw)
-        if raw:
-            try:
-                data = json.loads(raw.decode("utf-8-sig"))
-            except ValueError as e:           # 含 UnicodeDecodeError
+        if not raw:
+            # ★「存在但是空的」不是「還沒有這一份」★(外審排班 RS-6 第 1 輪 P2):
+            #   零位元組的月檔/設定檔是壞掉的(寫入被中斷、同步軟體的中間態),
+            #   而它的 revision 剛好也是 "" —— 當成「首次建檔」的話 CAS 兩邊
+            #   都對得上,窄改動就這樣寫成一份【只有這次改動】的檔案,而且
+            #   使用者永遠不會知道那個月/那份名單原本有東西。
+            if os.path.exists(path):
                 raise ValueError(
-                    f"{os.path.basename(path)} 損壞或無法讀取（{e}）") from e
-            if not isinstance(data, dict):    # [] 也能 parse,但寬鬆載入回 {}
-                raise ValueError(
-                    f"{os.path.basename(path)} 頂層不是 JSON 物件"
-                    f"（{type(data).__name__}）")
-        else:
-            data = {}                         # 還沒有這一份(首次建檔也能 CAS)
-        return self._canonical_loader(name)(_parsed=data), rev
+                    f"{os.path.basename(path)} 是空檔（0 位元組，通常是寫入或"
+                    f"同步被中斷）—— 為避免用空白覆蓋已中止這次編輯，"
+                    f"請先確認該檔內容。")
+            return {}, rev                    # 還沒有這一份(首次建檔也能 CAS)
+        try:
+            data = json.loads(raw.decode("utf-8-sig"))
+        except ValueError as e:               # 含 UnicodeDecodeError
+            raise ValueError(
+                f"{os.path.basename(path)} 損壞或無法讀取（{e}）") from e
+        if not isinstance(data, dict):        # [] 也能 parse,但寬鬆載入回 {}
+            raise ValueError(
+                f"{os.path.basename(path)} 頂層不是 JSON 物件"
+                f"（{type(data).__name__}）")
+        return data, rev
 
     def quiesce_local(self) -> None:
         """關閉前收斂本機狀態。基底層沒有背景同步 → 無事可做(見 GitSync)。"""
@@ -636,14 +653,33 @@ class RosterStorage:
         """
         path = self._month_path(ym)
         raw = _read_bytes(path)
-        d = self._check_schema(_parse_json_bytes(raw, path), f"{ym}.json")
+        return (self._normalize_month(_parse_json_bytes(raw, path), ym),
+                _revision_of(raw))
+
+    def _normalize_month(self, d: dict, ym: str) -> dict:
+        """月檔的預設值/schema 檢查(寬鬆與嚴格兩條讀取路徑共用一份)。"""
+        d = self._check_schema(d, f"{ym}.json")
         d.setdefault("month", ym)
         d.setdefault("finalized", False)
         for k in ("r_duty", "vs_duty", "leaves", "must_duty",
                   "day_slots", "grid_overrides"):
             d.setdefault(k, {})
         d.setdefault("audit", [])
-        return d, _revision_of(raw)
+        return d
+
+    def load_month_snapshot(self, ym: str) -> "tuple[dict, str]":
+        """→ (月檔, revision),★嚴格★:壞檔/暫時讀不到直接拋 ValueError。
+
+        ★要編輯,就必須先證明基底是可信的★(2026-07-25 的教訓,外審排班 RS-6):
+        `load_month_with_revision` 對壞檔一律靜默回一份預設空月檔,而
+        `update_month` 拿它當基底把窄改動寫回去,整月的值班/請假/報告就這樣
+        被清成只剩這一次的改動 —— `_guard_overwrite` 只會替壞檔留一份
+        `.corrupt-` 備份然後【放行】覆寫,擋不住這件事。
+        顯示路徑仍用寬鬆的 `load_month`(讀不到就顯示空,不該讓 UI 開不起來);
+        ★會寫回去的路徑一律用這個★。
+        """
+        d, rev = self._strict_snapshot(self._month_path(ym))
+        return self._normalize_month(d, ym), rev
 
     def save_month(self, ym: str, data: dict, force: bool = False, *,
                    backup: "str | None" = None,

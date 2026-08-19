@@ -136,15 +136,19 @@ class TestTheReconcileIsWiredUp:
 
     def test_finalize_marks_and_clears(self):
         import inspect
-        src = inspect.getsource(RosterService.finalize)
+        # ★錨在【性質】上,不是某個函式名★(RS-6 把 finalize 的本體搬進
+        #   `_finalize_locked` 之後,只看 `finalize` 的舊錨當場失效):
+        #   定案這條路徑上,只要有動帳本的那一步就要有意圖紀錄。
+        src = chr(10).join(inspect.getsource(fn) for fn in (
+            RosterService.finalize, RosterService._finalize_locked))
         assert "mark_pending_settle" in src and "clear_pending_settle" in src
-        # ★錨在【它保護的那個寫入】上★:finalize 這裡真正會動帳本的是
-        #   `resettle_from_duty`,不是最後那個 `save_month`。拿 save_month
-        #   當錨的話,「意圖記在重算【之後】」照樣排在它前面 —— 量不到東西
+        # ★錨在【它保護的那個寫入】上★:finalize 這裡真正會動帳本的是重算
+        #   那一步,不是最後那個 `save_month`。拿 save_month 當錨的話,
+        #   「意圖記在重算【之後】」照樣排在它前面 —— 量不到東西
         #   (而且 docstring 裡也有 save_month,第一版連錨都打在註解上)。
         assert (src.index("self.storage.mark_pending_settle(")
-                < src.index("self.resettle_from_duty(")), \
-            "★意圖要記在【它保護的那次寫入】之前★ 記在後面等於沒記"
+                < src.index("self._resettle_locked(")), (
+            "★意圖要記在【它保護的那次寫入】之前★ 記在後面等於沒記")
 
 
 class TestTheIntentRecordItself:

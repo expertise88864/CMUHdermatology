@@ -20,6 +20,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import logging
 import os
 import time
@@ -55,6 +57,21 @@ from cmuh_common.roster.storage import (
 
 _SCOPE_LABEL = {"r": "R 排班", "vs": "VS 排班"}
 _SPECIAL_SLOTS = frozenset((PHOTO, TREATMENT, BIOPSY, REST))   # 非跟診房的特殊格
+
+
+def _duty_digest(month: dict, scope: str) -> str:
+    """這一份月檔的【該 scope 值班格】的識別 —— 帳本的點數就是從它算出來的。
+
+    (外審排班 RS-6)`finalize` 要「先用月檔重算帳本、再把月檔標成唯讀」,
+    兩步之間月檔若換了版本,就會留下「帳本＝A 版班表、被定案的是 B 版」——
+    而定案之後是唯讀的,只能靠解除定案才救得回來。所以標定案之前要回頭確認
+    它就是剛剛算過的那一份。只取 person(鎖定/來源不影響點數)。
+    """
+    duty = month.get(f"{scope}_duty") or {}
+    canon = json.dumps({str(k): (v or {}).get("person")
+                        for k, v in duty.items()},
+                       ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
 def _now() -> str:
@@ -93,14 +110,19 @@ class RosterService:
         self.storage = storage
 
     # ── 讀取組裝 ────────────────────────────────────────────────────────
-    def build_context(self, scope: str, ym: str) -> SolveContext:
+    def build_context(self, scope: str, ym: str, *,
+                      month: "dict | None" = None) -> SolveContext:
         """讀 config/ledger/holiday_duty/week_colors/month 檔 → 已 prepare 且已套
         跨月銜接（boundary_fix）的 SolveContext。
 
         boundary_fix 在此就補（不只 solve_duty 內）→ 求解/驗證/過期檢查看到的
-        directive 一致；solve_duty 會再冪等呼叫一次，無害。"""
+        directive 一致；solve_duty 會再冪等呼叫一次，無害。
+
+        `month=` 傳入已載入的月檔 → ★用【呼叫端手上那一份】,不另外再讀一次★
+        (外審排班 RS-6):重算帳本時「算點數用的 duty」與「被標定案的月檔」
+        必須是同一份,分開讀就可能是兩個版本。"""
         cfg = self.storage.load_config()
-        month = self.storage.load_month(ym)
+        month = self.storage.load_month(ym) if month is None else month
         y, m = int(ym[:4]), int(ym[5:7])
 
         members = [Member.from_dict(d)
@@ -317,6 +339,10 @@ class RosterService:
         梯次/停診/名單都會讓這個舊解變成錯的。
         ★revision 在 build 之前先取★:build 期間月檔若被換掉,寧可判成過期
         (要使用者重排一次),也不要拿一份對不上的識別去放行。
+        ★這裡刻意用寬鬆載入★:求解本身不寫任何檔,壞檔的代價是「算出一份
+        沒意義的預覽」,而按下套用時 `_accept_day_locked` 會用嚴格快照擋下來;
+        在預覽階段就丟例外只會讓使用者連畫面都打不開(2026-07-25 的分界:
+        讀給人看的寬鬆、要寫回去的嚴格)。
         """
         _m, rev = self.storage.load_month_with_revision(ym)
         inp = self.build_day_input(ym)
@@ -357,7 +383,7 @@ class RosterService:
     def _accept_day_locked(self, ym: str, day_slots: dict,
                            report: "str | None", expect) -> None:
         """`accept_day_solution` 的本體。★呼叫端必須持有 `write_barrier`★"""
-        month, rev = self.storage.load_month_with_revision(ym)
+        month, rev = self.storage.load_month_snapshot(ym)
         if month.get("finalized"):
             raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能套用")
         # ★求解之後、按下套用之前,輸入可能已經變了★(外審排班第 1 輪 P1-02)
@@ -420,7 +446,7 @@ class RosterService:
         # ★「沒有變動就不要存檔」仍然成立★:先試算一次(在最新月檔上),
         #   真的有變動才進 CAS 迴圈 —— 否則每次開關對話框都會寫一次檔、
         #   commit 一次 git。試算與落地都由 `_mut` 決定,不是兩套判準。
-        probe, _rev = self.storage.load_month_with_revision(ym)
+        probe, _rev = self.storage.load_month_snapshot(ym)
         if not _mut(probe):
             return 0
         return self.update_month(ym, _mut)
@@ -531,9 +557,13 @@ class RosterService:
         (它拿到的永遠是當下最新的月檔,可能被呼叫不只一次);會改到別的檔案
         或有其他副作用的動作,放在這個呼叫【之後】做,不要放進 mutator。
         """
+        # ★窄改動的基底必須是可信的★(外審排班 RS-6):寬鬆載入對壞檔會回一份
+        #   預設空月檔,拿它當基底把這一次的改動寫回去 = 整月的值班/請假/報告
+        #   被清成只剩這一格(`_guard_overwrite` 只留一份 `.corrupt-` 備份就
+        #   放行,擋不住)。`_update_canonical` 早就是這樣做的,月檔不能例外。
         last: "StaleRosterDataError | None" = None
         for _ in range(max(1, int(retries))):
-            month, rev = self.storage.load_month_with_revision(ym)
+            month, rev = self.storage.load_month_snapshot(ym)
             out = mutator(month)
             try:
                 self.storage.save_month(ym, month, expected_revision=rev)
@@ -936,7 +966,10 @@ class RosterService:
         own = month is None
         _own_rev = None
         if own:
-            month, _own_rev = self.storage.load_month_with_revision(ym)
+            # ★編輯基底一律用嚴格快照★(外審排班 RS-6):寬鬆載入對壞檔回一份
+            #   預設空月檔,而它的 revision 就取自那份壞內容 —— CAS 兩邊對得上
+            #   就放行,整月被寫成只剩這次重排的結果。
+            month, _own_rev = self.storage.load_month_snapshot(ym)
         # ★切片帳本也要 CAS★(外審排班 RS-5 第 1 輪 P1-2):兩台同時改 R 值班或
         #   手動指定切片時,月檔各自被 `update_month` 保住了,但最後的
         #   `save_biopsy` 沒有 revision —— 後寫的會整份蓋掉先寫的切片計數與
@@ -1034,7 +1067,7 @@ class RosterService:
         #   (下面的 `_result_stale_reason` 擋的是【輸入】變了;CAS 擋的是
         #   【月檔本身】被換過 —— 兩者不是同一件事:他機改的可能是日排班、
         #   停診、audit 這些不進 SolveContext 的欄位。)
-        month, _month_rev = self.storage.load_month_with_revision(ym)
+        month, _month_rev = self.storage.load_month_snapshot(ym)
         if month.get("finalized"):
             raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能套用排班")
 
@@ -1268,7 +1301,7 @@ class RosterService:
                         "[roster.service] clear_unlocked 週六切片重排失敗（略過）")
             return True
 
-        probe, _rev = self.storage.load_month_with_revision(ym)
+        probe, _rev = self.storage.load_month_snapshot(ym)
         if not _mut(probe):                    # 試算:沒有東西可清就不要寫檔
             return
         # ★月檔與切片帳本在同一個臨界區內★(見 set_cell 的同一條說明)
@@ -1296,7 +1329,7 @@ class RosterService:
                         f"locked={cell['locked']}", "lock")
             return cell["locked"]
 
-        probe, _rev = self.storage.load_month_with_revision(ym)
+        probe, _rev = self.storage.load_month_snapshot(ym)
         _mut(probe)
         if _holder.get("empty"):               # 空格不可鎖 → 不寫檔
             return False
@@ -1369,7 +1402,7 @@ class RosterService:
         ledger = self.storage.load_ledger()
         holiday = self.storage.load_holiday_duty()
         biopsy = self.storage.load_biopsy() if scope == "r" else None
-        _loaded = {ym: self.storage.load_month_with_revision(ym)
+        _loaded = {ym: self.storage.load_month_snapshot(ym)
                    for ym in yms}
         months = {ym: mr[0] for ym, mr in _loaded.items()}
         month_revs = {ym: mr[1] for ym, mr in _loaded.items()}
@@ -1565,23 +1598,60 @@ class RosterService:
                             "%s %s", scope, ym)
         return out
 
-    def resettle_from_duty(self, scope: str, ym: str) -> dict:
+    def resettle_from_duty(self, scope: str, ym: str, *,
+                           retries: int = 4) -> dict:
         """以目前月檔『實際排班』（含手動調整/換班）重算該 scope 帳本。
 
         自動回滾同月同 scope 舊分錄再重記 → 帳本永遠反映最終排班（accept 之後
         又手改的格也算進去）。回傳每人本月點數。
 
         名單清空時仍會 settle（points 空 → 回滾該月舊分錄、不留殘餘）。已定案
-        月份唯讀，拒絕重算。"""
-        # [2026-07-25 審查/codex] 先確認【來源】月檔讀得到才計算：_load_json 對壞檔/
-        # 鎖檔一律回 {}，此處會因此算出「全月 0 點」，settle_month 回滾掉真正的舊分錄，
-        # 而 save_ledger 寫的是另一個檔（守門看不到來源有問題）→ 帳本被清成零、UI 還
-        # 報成功。定案判斷本身也會因為讀到 finalized=False 而失效。
-        self.storage.assert_readable(self.storage._month_path(ym))
-        if self.storage.load_month(ym).get("finalized"):
+        月份唯讀，拒絕重算。
+
+        ★整段在同一個臨界區內,而且月檔只讀一次★(外審排班 RS-6 / 第 2 輪
+        P1-03):定案判斷、算點數用的 duty、建 context 用的月檔原本是三次
+        獨立讀取 —— 中間被背景同步換掉的話,會用 A 版的班表算出帳本、卻對著
+        B 版做決定,而兩邊都「看起來成功」。
+
+        ★臨界區只鎖得住這一個行程★(RS-6 第 1 輪 P1):跨機的那一半靠 CAS ——
+        所以這裡不是「鎖起來就沒事」,而是「整批用同一份月檔算完,再用它的
+        revision 把月檔寫回去」;寫回時被搶先就★整批重來★(帳本的結算本身
+        是冪等的:`settle_month` 會先回滾同月同 scope 的舊分錄)。
+        """
+        last: "StaleRosterDataError | None" = None
+        with self.storage.write_barrier():
+            for _ in range(max(1, int(retries))):
+                # [2026-07-25 審查/codex] 來源月檔讀不到就不可以算:寬鬆載入回
+                # 空會算出「全月 0 點」,settle_month 把真正的舊分錄回滾掉,而
+                # save_ledger 寫的是另一個檔(守門看不到來源有問題)→ 帳本被清
+                # 成零、UI 還報成功;定案判斷也會因為讀到 finalized=False 而
+                # 失效。★嚴格快照把「確認讀得到」與「拿來用的內容」變成同一次
+                # 讀取★
+                month, rev = self.storage.load_month_snapshot(ym)
+                try:
+                    return self._resettle_locked(scope, ym, month, rev)[0]
+                except StaleRosterDataError as e:
+                    last = e
+                    logging.info("[roster] %s 重算帳本時盤上已更新 → 整批重來",
+                                 ym)
+                    continue
+        assert last is not None
+        raise last
+
+    def _resettle_locked(self, scope: str, ym: str, month: dict,
+                         month_rev) -> "tuple[dict, str]":
+        """→ (每人點數, ★算它用的那份 duty 的識別★)。呼叫端必須持有臨界區。
+
+        回傳識別是給 `finalize` 用的:它要在標定案之前確認「被標成唯讀的
+        那一份月檔」就是「剛剛拿來算帳本的那一份」。
+        ★切片重排也用【這一份】月檔★:讓它自行 load 的話,它讀到的可能是
+        他機剛寫進來的另一版 —— 帳本結算自 A 版、月檔與切片帳本卻存成 B 版,
+        而整個操作還回報成功(RS-6 第 1 輪 P1)。
+        """
+        if month.get("finalized"):
             raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能重算帳本")
-        ctx = self.build_context(scope, ym)
-        duty = (self.storage.load_month(ym).get(f"{scope}_duty") or {})
+        ctx = self.build_context(scope, ym, month=month)
+        duty = (month.get(f"{scope}_duty") or {})
         points = {m.id: 0 for m in ctx.members}
         y, m = int(ym[:4]), int(ym[5:7])
         for iso, cell in duty.items():
@@ -1601,30 +1671,53 @@ class RosterService:
                                 ym, iso)
                 continue
             points[p] += day_point(dt, ctx.holidays, ctx.params)
-        ledger = self.storage.load_ledger()
-        settle_month(ledger, scope, ym, points)
-        self.storage.save_ledger(ledger)
         # [週六切片] 重算帳本＝以最終實排為準 → 切片同步重排(含 finalize 前重算)
+        #   ★用手上這一份月檔重排,不讓它自己再讀一次★(見 docstring)。
+        book = book_rev = None
         if scope == "r":
             try:
-                self.recompute_saturday_biopsy(ym)
+                _a, _n, book, book_rev = self.recompute_saturday_biopsy(
+                    ym, month)
             except Exception:
+                book = book_rev = None
                 logging.exception("[roster.service] resettle 週六切片重排失敗（略過）")
-        return points
+        # ★寫入順序:月檔 → 帳本 → 切片帳本★(RS-4 定下的可收斂方向);
+        #   月檔的 CAS 是這一批的閘門 —— 被搶先就在這裡失敗,呼叫端整批重來,
+        #   帳本與切片帳本都還沒動。
+        self.storage.mark_pending_settle(scope, ym)
+        self.storage.save_month(ym, month, expected_revision=month_rev)
+        # ★帳本也要 CAS★:他機剛結算完的別月分錄不可以被這份舊快照吃掉。
+        self.update_ledger(lambda led: settle_month(led, scope, ym, points))
+        if book is not None:
+            self.storage.save_biopsy(book, expected_revision=book_rev)
+        self.storage.clear_pending_settle(scope, ym)
+        return points, _duty_digest(month, scope)
 
     def finalize(self, ym: str, on: bool) -> None:
         """定案/解除定案。解除需覆寫已定案月檔 → 一律 force=True。
 
-        定案時：以最終（含手動調整/換班）的 R/VS 排班重算帳本，確保帳本＝實況。"""
+        定案時：以最終（含手動調整/換班）的 R/VS 排班重算帳本，確保帳本＝實況。
+
+        ★整段在同一個臨界區,而且「算帳本用的月檔」與「被標定案的月檔」要是
+        同一份★(外審排班 RS-6 / 第 2 輪 P1-03):兩者分開讀的話,他機在中間
+        存進來的班表會變成「帳本＝舊班表、定案的是新班表」—— 而定案之後是
+        唯讀的,只能靠解除定案才救得回來。臨界區擋住背景同步,標定案之前再
+        用 duty 的識別回頭確認一次(★守衛不能只靠推理★)。
+        """
+        with self.storage.write_barrier():
+            self._finalize_locked(ym, on)
+
+    def _finalize_locked(self, ym: str, on: bool) -> None:
+        _digests: dict = {}
+        _resettled: list = []
         if on:
             # ★先預檢月檔寫得下去,再動帳本★(第二輪外審)
-            #   下面 resettle_from_duty 會先寫 ledger.json,而最後的
+            #   下面 _resettle_locked 會先寫 ledger.json,而最後的
             #   save_month(force=True) 現在可能因為備份失敗而拒寫 —— 那會留下
             #   「帳本已重算、月份沒定案」的半套,而 UI 只說「定案失敗」。
             self.storage.preflight_required_backup(
                 str(self.storage._month_path(ym)))
-            m0 = self.storage.load_month(ym)
-            _resettled: list = []
+            m0, _m0_rev = self.storage.load_month_snapshot(ym)
             hist = self.storage.load_ledger().get("history") or []
             settled = {h.get("scope") for h in hist if h.get("month") == ym}
             for scope in ("r", "vs"):
@@ -1638,9 +1731,20 @@ class RosterService:
                     #   留一筆意圖,下次開程式用月檔重建(見
                     #   `reconcile_pending_settles`)。
                     self.storage.mark_pending_settle(scope, ym)
-                    self.resettle_from_duty(scope, ym)
+                    # ★每個 scope 各自取最新快照★:前一個 scope 的重算會把月檔
+                    #   寫回去(切片/報告),沿用 m0 的 revision 會被自己的寫入
+                    #   擋下來。最後的識別比對仍會確認兩個 scope 的班表都沒變。
+                    m, rev = self.storage.load_month_snapshot(ym)
+                    _digests[scope] = self._resettle_locked(scope, ym, m, rev)[1]
                     _resettled.append(scope)
-        month, _rev = self.storage.load_month_with_revision(ym)
+        # 重讀是必要的:上面的切片重排會把 saturday_biopsy/報告寫進月檔。
+        month, _rev = self.storage.load_month_snapshot(ym)
+        for scope, dig in _digests.items():
+            if _duty_digest(month, scope) != dig:
+                raise StaleRosterDataError(
+                    f"{ym} 的 {scope.upper()} 班表在重算帳本之後又變動了，"
+                    f"已中止定案（否則會定案在一份與帳本不符的班表上）。"
+                    f"請重新整理後再試一次。")
         month["finalized"] = bool(on)
         self._audit(month, "-", ym, None, f"finalized={bool(on)}", "finalize")
         # 定案路徑上方已經 preflight_required_backup 過（快照就在那時留下的）。

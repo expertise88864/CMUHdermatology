@@ -47,7 +47,7 @@ class TestTheOtherMachinesChangesSurvive:
         svc = RosterService(st)
 
         fired = []
-        real = st.load_month_with_revision
+        real = st.load_month_snapshot
 
         def _load_then_remote_write(y):
             out = real(y)
@@ -59,11 +59,11 @@ class TestTheOtherMachinesChangesSurvive:
                         {"上午": {"101": ["PGY1"]}}))
             return out
 
-        st.load_month_with_revision = _load_then_remote_write   # type: ignore
+        st.load_month_snapshot = _load_then_remote_write        # type: ignore
         try:
             svc.set_cell("r", ym, date(2026, 9, 1), "K")
         finally:
-            st.load_month_with_revision = real                  # type: ignore
+            st.load_month_snapshot = real                       # type: ignore
 
         after = st.load_month(ym)
         assert after["r_duty"]["2026-09-01"]["person"] == "K", \
@@ -78,7 +78,7 @@ class TestTheOtherMachinesChangesSurvive:
         st.save_month(ym, {"r_duty": {}, "vs_duty": {}})
         svc = RosterService(st)
         fired = []
-        real = st.load_month_with_revision
+        real = st.load_month_snapshot
 
         def _hook(y):
             out = real(y)
@@ -89,11 +89,11 @@ class TestTheOtherMachinesChangesSurvive:
                         {"2026-09-05": {"person": "VS1", "locked": False}}))
             return out
 
-        st.load_month_with_revision = _hook                     # type: ignore
+        st.load_month_snapshot = _hook                          # type: ignore
         try:
             svc.set_cell("r", ym, date(2026, 9, 1), "K")
         finally:
-            st.load_month_with_revision = real                  # type: ignore
+            st.load_month_snapshot = real                       # type: ignore
         after = st.load_month(ym)
         assert after["r_duty"]["2026-09-01"]["person"] == "K"
         assert after["vs_duty"]["2026-09-05"]["person"] == "VS1"
@@ -104,7 +104,7 @@ class TestTheOtherMachinesChangesSurvive:
         st.save_month(ym, {"leaves": {}})
         svc = RosterService(st)
         fired = []
-        real = st.load_month_with_revision
+        real = st.load_month_snapshot
 
         def _hook(y):
             out = real(y)
@@ -115,11 +115,11 @@ class TestTheOtherMachinesChangesSurvive:
                         {"P9": ["2026-09-20"]}))
             return out
 
-        st.load_month_with_revision = _hook                     # type: ignore
+        st.load_month_snapshot = _hook                          # type: ignore
         try:
             svc.set_leaves("r", ym, "K", {date(2026, 9, 10)})
         finally:
-            st.load_month_with_revision = real                  # type: ignore
+            st.load_month_snapshot = real                       # type: ignore
         after = st.load_month(ym)
         assert after["leaves"]["r"]["K"] == ["2026-09-10"]
         assert after["leaves"]["pgy"]["P9"] == ["2026-09-20"], \
@@ -214,14 +214,14 @@ class TestThePrecomputedPathsRefuseInsteadOfRetrying:
         _remote_write(st, ym, lambda m: m.setdefault("day_slots", {}).update(
             {"2026-09-03": {"上午": {"101": ["PGY9"]}}}))
 
-        real = st.load_month_with_revision
-        st.load_month_with_revision = lambda y: (month, rev)     # type: ignore
+        real = st.load_month_snapshot
+        st.load_month_snapshot = lambda y: (month, rev)          # type: ignore
         try:
             with pytest.raises(StaleRosterDataError):
                 svc.accept_day_solution(
                     ym, {"2026-09-04": {"上午": {"101": ["PGY1"]}}})
         finally:
-            st.load_month_with_revision = real                   # type: ignore
+            st.load_month_snapshot = real                        # type: ignore
         after = st.load_month(ym)
         assert after["day_slots"] == {
             "2026-09-03": {"上午": {"101": ["PGY9"]}}}, \
@@ -243,7 +243,7 @@ class TestTheProbeResultNeverLeaksIntoTheRealRun:
         books: list = []
         monkeypatch.setattr(st, "save_biopsy",
                             lambda book: books.append(book))
-        real = st.load_month_with_revision
+        real = st.load_month_snapshot
         fired = []
 
         def _hook(y):
@@ -253,11 +253,11 @@ class TestTheProbeResultNeverLeaksIntoTheRealRun:
                 _remote_write(st, ym, lambda m: m.update({"r_duty": {}}))
             return out
 
-        st.load_month_with_revision = _hook                     # type: ignore
+        st.load_month_snapshot = _hook                          # type: ignore
         try:
             svc.clear_unlocked("r", ym)
         finally:
-            st.load_month_with_revision = real                  # type: ignore
+            st.load_month_snapshot = real                       # type: ignore
         assert not books, \
             "★正式那次什麼都沒清,卻把試算時算出來的切片帳本寫出去了★"
 
