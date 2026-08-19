@@ -113,6 +113,10 @@ def _parse_json_bytes(raw: "bytes | None", path: str) -> dict:
         return {}
 
 
+def _now_stamp() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _load_json(path: str) -> dict:
     """壞檔/缺檔回 {}（呼叫端補預設），絕不拋例外中斷 UI。
 
@@ -364,6 +368,36 @@ class RosterStorage:
         d.setdefault("counts", {})
         d.setdefault("history", [])
         return d
+
+    # ── 未完成的結算意圖(跨檔交易的補救紀錄;外審排班 P2-01)──────────────
+    def load_pending_settles(self) -> list:
+        """還沒確認完成的「月檔+帳本」寫入意圖。→ [{"scope","ym","ts"}]。
+
+        ★為什麼只記意圖、不記內容★:帳本是【可以從月檔重算出來的衍生物】
+        (`resettle_from_duty` 就是做這件事)。所以中斷後不需要重放整份 payload,
+        只要知道「哪一個 (scope, 月份) 的結算沒有確認完成」,就能用月檔這個
+        真相來源把帳本重建到一致。記內容反而會有「重放的內容自己就是舊的」
+        這種新問題。
+        """
+        raw = _load_json(self._path("pending_settle.json")).get("pending")
+        return [x for x in (raw or []) if isinstance(x, dict)]
+
+    def mark_pending_settle(self, scope: str, ym: str) -> None:
+        """落地之前記下意圖(冪等:同 scope+月份不重複記)。"""
+        cur = self.load_pending_settles()
+        if any(x.get("scope") == scope and x.get("ym") == ym for x in cur):
+            return
+        cur.append({"scope": str(scope), "ym": str(ym), "ts": _now_stamp()})
+        self._save(self._path("pending_settle.json"), {"pending": cur})
+
+    def clear_pending_settle(self, scope: str, ym: str) -> None:
+        """兩個檔都寫成功之後清掉那一筆意圖。"""
+        cur = self.load_pending_settles()
+        left = [x for x in cur
+                if not (x.get("scope") == scope and x.get("ym") == ym)]
+        if len(left) == len(cur):
+            return
+        self._save(self._path("pending_settle.json"), {"pending": left})
 
     def save_biopsy(self, book: dict) -> None:
         # 比照 save_ledger：寫前 schema 檢查（.bak 快照由 _save 統一留）

@@ -143,7 +143,13 @@ class GitSyncStorage(RosterStorage):
     _SYNC_FILES = ("config.json", "ledger.json", "biopsy.json",
                    "week_colors.json", "holiday_duty.json",
                    "clinic_template.json", "clerk_batches.json",
-                   "biopsy_grid.json", ".gitignore")
+                   "biopsy_grid.json",
+                   # ★未完成的結算意圖也要同步★(外審排班 RS-4 第 1 輪 P2):
+                   #   它就是「這個月的帳本可能落後,請用月檔重算」這件事本身。
+                   #   只留在寫壞的那台的話,B 機拉到新月檔配舊帳本卻毫不知情;
+                   #   而那台若剛好壞掉/沒再開,帳本就永遠停在舊值,之後每個月的
+                   #   公平結算都以錯的餘額為基礎。
+                   "pending_settle.json", ".gitignore")
     _SYNC_DIRS = ("months",)          # months/YYYY-MM.json（含刪除）
 
     def _is_canonical_path(self, rel: str) -> bool:

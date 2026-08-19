@@ -140,13 +140,15 @@ def test_the_canonical_data_files_are_all_still_synced(repo):
     st.save_clerk_batches([{"id": "b1", "start_monday": "2026-08-03"}])
     st.save_biopsy_grid({"b1": {}})
     st.save_month("2026-08", {"r_duty": {}})
+    st.mark_pending_settle("r", "2026-08")   # 未完成的結算意圖也要同步
     st.flush()
 
     tracked = _tracked(repo)
     for name in ("config.json", "ledger.json", "biopsy.json",
                  "week_colors.json", "holiday_duty.json",
                  "clinic_template.json", "clerk_batches.json",
-                 "biopsy_grid.json", "months/2026-08.json", ".gitignore"):
+                 "biopsy_grid.json", "pending_settle.json",
+                 "months/2026-08.json", ".gitignore"):
         assert name in tracked, f"★{name} 沒有被同步★（他機會看到殘缺設定）"
 
 

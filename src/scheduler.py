@@ -163,6 +163,13 @@ class ScheduleApp:
             on_sync_state=self._on_sync_state,
             on_remote_change=self._on_remote_change)
         self.service = RosterService(self.storage)
+        # ★上次沒完成的結算,開程式就用月檔收斂★(外審排班 P2-01):
+        #   跨檔寫入無法原子,所以順序選成「月檔先、帳本後」——中斷後帳本只會
+        #   落後,而它可以從月檔重算。這裡把它做掉,不必靠人記得。
+        try:
+            self.service.reconcile_pending_settles()
+        except Exception:
+            logging.exception("[roster] 收斂未完成的結算失敗（不擋開啟）")
         # [2026-07-13 使用者] 打開就預設【下個月】——通常打開排班程式就是要排下個月的班
         # （7 月開 → 顯示 8 月；12 月開 → 顯示隔年 1 月）。R/VS/PGY/Clerk 共用此月份。
         today = date.today()

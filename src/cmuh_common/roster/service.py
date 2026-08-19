@@ -940,18 +940,32 @@ class RosterService:
                                   "（值班照常落地，切片請手動處理）")
         month[f"report_{scope}"] = report
 
-        # [2026-07-25 審查/codex] 帳本先寫、月檔後寫：月檔若在守門處被擋（壞檔/鎖檔）
-        # 就會留下「帳本已結算、月檔還是舊班表」的半套狀態。先把兩個目標都預檢過，
-        # 讓失敗發生在任何寫入之前（無法做到真正的跨檔交易，但可消掉最常見的半套）。
+        # 兩個檔都先預檢,讓最常見的失敗(壞檔/鎖檔)發生在任何寫入之前。
         month_path = self.storage._month_path(ym)
         self.storage.assert_readable(month_path)
         self.storage._guard_overwrite(str(month_path))
-        ledger = self.storage.load_ledger()
-        settle_month(ledger, scope, ym, result.points_by_person)
-        self.storage.save_ledger(ledger)
-        self.storage.save_month(ym, month, expected_revision=_month_rev)
-        if biopsy_book is not None:
-            self.storage.save_biopsy(biopsy_book)
+
+        # ★跨檔不可能真的原子,所以要選對【順序】與【可收斂性】★
+        #   (外審排班 P2-01)舊寫法是「帳本先、月檔後」,中斷會留下
+        #   「帳本已結算、月檔還是舊班表」—— 那個方向★沒有辦法自動收斂★:
+        #   誰也說不出帳上多出來的那筆該不該退。
+        #   反過來「月檔先、帳本後」中斷,留下的是「帳本還沒記上」——
+        #   而帳本是【可以從月檔重算出來的衍生物】(`resettle_from_duty`),
+        #   所以那個方向永遠救得回來。再配一筆意圖紀錄,下次開程式就自動
+        #   收斂(見 `reconcile_pending_settles`),不必靠人記得。
+        self.storage.mark_pending_settle(scope, ym)
+        try:
+            self.storage.save_month(ym, month, expected_revision=_month_rev)
+            ledger = self.storage.load_ledger()
+            settle_month(ledger, scope, ym, result.points_by_person)
+            self.storage.save_ledger(ledger)
+            if biopsy_book is not None:
+                self.storage.save_biopsy(biopsy_book)
+        except Exception:
+            # 意圖留著 → 下次開程式會用月檔把帳本重建到一致。
+            raise
+        else:
+            self.storage.clear_pending_settle(scope, ym)
 
     # ── 手動編輯（每次立即存檔 + 審計）──────────────────────────────────
     def set_cell(self, scope: str, ym: str, d: date,
@@ -1348,6 +1362,41 @@ class RosterService:
                      scope, old_id, new_id, changed)
         return changed
 
+    def reconcile_pending_settles(self) -> list:
+        """開程式時把「沒確認完成的結算」用月檔重建到一致。→ 已收斂的清單。
+
+        (外審排班 P2-01)`accept_solution` / `finalize` 要寫月檔與帳本兩個檔,
+        中斷會留下不一致。順序刻意是「月檔先、帳本後」,所以中斷後帳本只會
+        【落後】—— 用 `resettle_from_duty`(以月檔的實際排班重算)就能救回來。
+        已定案的月份仍是唯讀,重算會被拒 → ★那一筆意圖留著並記 error★,
+        不可以靜默清掉(清掉就等於宣稱已經一致了)。
+        """
+        out: list = []
+        for item in self.storage.load_pending_settles():
+            scope = str(item.get("scope") or "")
+            ym = str(item.get("ym") or "")
+            if not scope or not ym:
+                self.storage.clear_pending_settle(scope, ym)
+                continue
+            try:
+                # ★整段在臨界區內★(外審排班 RS-4 第 1 輪 P2):`resettle_from_duty`
+                #   會「讀帳本 → 依月檔重算 → 寫回」,而開程式的當下 GitSync 正在
+                #   做啟動 pull/補推 —— 中間被 merge 換掉帳本的話,寫回去的是手上
+                #   那份舊的,他機剛同步進來的結算就靜默消失(而且我們接著還把意圖
+                #   清掉,等於宣稱已經一致)。
+                with self.storage.write_barrier():
+                    self.resettle_from_duty(scope, ym)
+                    self.storage.clear_pending_settle(scope, ym)
+            except Exception:
+                logging.exception(
+                    "[roster.service] ★%s %s 的結算無法自動收斂★ 帳本可能仍與"
+                    "月檔不一致,意圖紀錄保留,請人工確認", scope, ym)
+                continue
+            out.append((scope, ym))
+            logging.warning("[roster.service] 上次未完成的結算已用月檔重建:"
+                            "%s %s", scope, ym)
+        return out
+
     def resettle_from_duty(self, scope: str, ym: str) -> dict:
         """以目前月檔『實際排班』（含手動調整/換班）重算該 scope 帳本。
 
@@ -1407,6 +1456,7 @@ class RosterService:
             self.storage.preflight_required_backup(
                 str(self.storage._month_path(ym)))
             m0 = self.storage.load_month(ym)
+            _resettled: list = []
             hist = self.storage.load_ledger().get("history") or []
             settled = {h.get("scope") for h in hist if h.get("month") == ym}
             for scope in ("r", "vs"):
@@ -1414,7 +1464,14 @@ class RosterService:
                 # 重算失敗即讓例外上拋 → 中止定案（不留「已定案但帳本沒更新」的
                 # 半套狀態）；UI 會攔截顯示錯誤並還原定案勾選。
                 if m0.get(f"{scope}_duty") or scope in settled:
+                    # ★意圖紀錄★(外審排班 P2-01):這裡帳本先寫、月檔(定案旗標)
+                    #   後寫,中途中斷會留下「帳本已重算、月份沒定案」。定案本身
+                    #   不是資料損壞,但帳本與月檔的一致性仍要能自動收斂 ——
+                    #   留一筆意圖,下次開程式用月檔重建(見
+                    #   `reconcile_pending_settles`)。
+                    self.storage.mark_pending_settle(scope, ym)
                     self.resettle_from_duty(scope, ym)
+                    _resettled.append(scope)
         month, _rev = self.storage.load_month_with_revision(ym)
         month["finalized"] = bool(on)
         self._audit(month, "-", ym, None, f"finalized={bool(on)}", "finalize")
@@ -1428,6 +1485,12 @@ class RosterService:
         self.storage.save_month(ym, month, force=True,
                                 backup=BEST_EFFORT_BACKUP if on else None,
                                 expected_revision=_rev)
+        if on:
+            # ★只清【自己真的重算過】的那幾個 scope★:無條件清掉會把別人
+            #   (例如上一次中斷的 accept)留下的意圖一起抹掉 —— 那等於宣稱
+            #   「已經一致了」,而我們並沒有為它做任何事。
+            for scope in _resettled:
+                self.storage.clear_pending_settle(scope, ym)
 
     # ── 定案 PDF 留底 ───────────────────────────────────────────────────
     def build_finalize_pdf_sections(self, ym: str) -> list:
