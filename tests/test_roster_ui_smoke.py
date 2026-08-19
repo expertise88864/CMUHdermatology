@@ -130,7 +130,9 @@ def test_rf21_param_save_is_debounced(root, tmp_path, monkeypatch):
     tab.pack(fill="both", expand=True)
     root.update()
     calls = []
-    monkeypatch.setattr(svc.storage, "save_config", lambda cfg: calls.append(1))
+    # **kw:生產端現在會傳 expected_revision(CAS)——替身要跟著生產的呼叫形狀走
+    monkeypatch.setattr(svc.storage, "save_config",
+                        lambda cfg, **kw: calls.append(1))
     tab._p_wd.set(2)
     tab._p_wd.set(3)
     tab._p_wd.set(4)                                # 模擬三次鍵擊

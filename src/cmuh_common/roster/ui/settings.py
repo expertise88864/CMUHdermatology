@@ -14,6 +14,7 @@ from tkinter import messagebox, ttk
 from cmuh_common.roster.calendar_colors import week_colors_for_year
 from cmuh_common.roster.ledger import reset_member, sync_members
 from cmuh_common.roster.model import month_dates, week_key
+from cmuh_common.roster.storage import StaleRosterDataError
 from cmuh_common.roster.ui.common import guard_write
 
 _WD_CHOICES = ("無", "一", "二", "三", "四", "五", "六", "日")   # index-1 = weekday
@@ -109,6 +110,7 @@ class SettingsTab(ttk.Frame):
         self.service = service
         self.on_changed = on_changed
         self._cfg = self.service.storage.load_config()
+        self._cfg_rev = self.service.storage.canonical_revision("config.json")
         self._param_after_id = None                      # RF-21 參數存檔去抖 timer id
         # ★[2026-08-02 補審] 重讀 config 時 IntVar.set 會觸發 trace → 又存一次檔★
         self._suspend_param_save = False
@@ -149,7 +151,22 @@ class SettingsTab(ttk.Frame):
         故：失敗時【絕不動 self._cfg】（記憶體仍是使用者的編輯，反正沒寫出去），
         只有在檔案確實可嚴格解析時才重讀重畫；並回 False 讓呼叫端停手。"""
         try:
-            self.service.storage.save_config(self._cfg)
+            self.service.storage.save_config(
+                self._cfg, expected_revision=getattr(self, "_cfg_rev", None))
+        except StaleRosterDataError:
+            # 他機在這段期間改過設定 —— ★不可以靜默覆蓋★:把畫面拉回磁碟真值,
+            #   請使用者在最新內容上重做這一次修改。
+            logging.info("[roster.ui] 設定已被其他電腦更新 → 這次修改未套用")
+            messagebox.showwarning(
+                "設定已被其他電腦更新",
+                "這份設定在你編輯期間被另一台電腦改過。\n"
+                "為避免蓋掉對方的修改，這次的變更沒有寫入；\n"
+                "畫面已更新為最新內容，請再改一次。")
+            self._refresh_cfg_from_disk()
+            for scope in self._member_trees:
+                self._reload_members(scope)
+            self.on_shown()
+            return False
         except Exception as e:  # noqa: BLE001
             logging.exception("[roster.ui] 設定存檔失敗")
             messagebox.showerror(
@@ -197,6 +214,11 @@ class SettingsTab(ttk.Frame):
         """
         try:
             self.service.storage.assert_readable("config.json")
+            # ★連 revision 一起記下★(外審排班 RS-5 第 1 輪 P1-3):`_save_cfg`
+            #   寫的是整份 `self._cfg`(參數/PGY 預設那些是整份快照語意),
+            #   帶著這個 revision 才能在他機改過時【拒絕】而不是靜默覆蓋。
+            self._cfg_rev = self.service.storage.canonical_revision(
+                "config.json")
             self._cfg = self.service.storage.load_config()
             return True
         except Exception:
@@ -339,20 +361,39 @@ class SettingsTab(ttk.Frame):
             return
         # ★[2026-08-02 補審] 先與磁碟對齊再改★ 否則這次存檔會把他機剛同步進來的
         #   名單變更整包蓋掉（順帶讓重複代號檢查也看得到他機新增的同代號）。
-        if not self._sync_cfg_before_edit():
+        # ★把「新增這一位」當成窄改動送出去★(外審排班第 2 輪 P1-01):
+        #   舊寫法是「先與磁碟對齊 → 改記憶體整份 → 整份寫回」,而對齊與寫回
+        #   之間背景 pull 仍可能換掉檔案(TOCTOU)—— 他機剛新增的人被靜默移除,
+        #   接著 `_sync_ledger` 還會把那個人的餘額/歷史當成離職作廢。
+        #   `update_config` 會在【當下最新的】名單上 append,被搶先就重讀重套。
+        dup = {"hit": False}
+        new_member = dict(dlg.result)      # closure 用區域值(型別/語意都明確)
+
+        def _add(cfg):
+            members = cfg.setdefault(f"{scope}_members", [])
+            if any(str(m.get("id")) == str(new_member["id"]) for m in members):
+                dup["hit"] = True          # 他機也剛新增同一個代號
+                return
+            dup["hit"] = False
+            members.append(new_member)
+
+        try:
+            self.service.change_members_and_sync_ledger(scope, _add)
+        except Exception as e:  # noqa: BLE001
+            logging.exception("[roster.ui] 新增成員失敗")
+            messagebox.showerror(
+                "設定未儲存",
+                f"新增成員未能寫入（檔案可能損壞或被防毒/同步軟體鎖住）：\n{e}")
+            self._refresh_cfg_from_disk()
+            self._reload_members(scope)
             return
-        if any(m.get("id") == dlg.result["id"] for m in self._members(scope)):
+        self._refresh_cfg_from_disk()
+        if dup["hit"]:
             messagebox.showwarning("重複", f"代號 {dlg.result['id']} 已存在")
             self._reload_members(scope)
             return
-        self._members(scope).append(dlg.result)
-        # [codex R2] 存檔失敗 → 立刻停手：後面的 _sync_ledger 會拿目前名單去
-        # sync_members,若因存檔失敗而名單不可信,會把帳本餘額/歷史永久刪掉。
-        if not self._save_cfg():
-            self._reload_members(scope)
-            return
         self._reload_members(scope)
-        self._sync_ledger(scope)
+        self._reload_ledger()          # 帳本同步已在 service 的臨界區內做完
 
     def _member_edit(self, scope) -> None:
         tree, with_level, with_wd = self._member_trees[scope]
@@ -429,21 +470,31 @@ class SettingsTab(ttk.Frame):
                 "刪除成員",
                 f"刪除 {sel[0]}？該員在 {scope.upper()} 的帳本餘額將一併作廢。"):
             return
-        if not self._sync_cfg_before_edit():      # ★同上：寫入前先對齊磁碟★
-            return
-        self._cfg[f"{scope}_members"] = [
-            m for m in self._members(scope) if m.get("id") != sel[0]]
-        if not self._save_cfg():          # [codex R2] 同上：失敗不得動帳本
+        # ★同上:把「移除這一位」當成窄改動,不要整份寫回★
+        def _remove(cfg):
+            cfg[f"{scope}_members"] = [
+                m for m in (cfg.get(f"{scope}_members") or [])
+                if str(m.get("id")) != str(sel[0])]
+
+        try:
+            self.service.change_members_and_sync_ledger(scope, _remove)
+        except Exception as e:  # noqa: BLE001
+            logging.exception("[roster.ui] 刪除成員失敗")
+            messagebox.showerror(
+                "設定未儲存",
+                f"刪除成員未能寫入（檔案可能損壞或被防毒/同步軟體鎖住）：\n{e}")
+            self._refresh_cfg_from_disk()
             self._reload_members(scope)
             return
+        self._refresh_cfg_from_disk()
         self._reload_members(scope)
-        self._sync_ledger(scope)
+        self._reload_ledger()          # 帳本同步已在 service 的臨界區內做完
 
     def _sync_ledger(self, scope) -> None:
         """名單變動 → 帳本同步（新人補 0、離開者作廢）。"""
-        ledger = self.service.storage.load_ledger()
-        sync_members(ledger, scope, [m.get("id") for m in self._members(scope)])
-        self.service.storage.save_ledger(ledger)
+        ids = [m.get("id") for m in self._members(scope)]
+        # ★帳本同樣不可以整份寫回★:他機剛結算完的分錄會被這份舊快照吃掉。
+        self.service.update_ledger(lambda led: sync_members(led, scope, ids))
         self._reload_ledger()
 
     # ── 區塊 3：年度國定假日指定表 ───────────────────────────────────────
@@ -496,19 +547,21 @@ class SettingsTab(ttk.Frame):
         except ValueError:
             messagebox.showwarning("日期格式", "請輸入 YYYY-MM-DD")
             return
-        table = self._load_holiday_map()
         r, vs = self._hol_r.get().strip(), self._hol_vs.get().strip()
-        if r:
-            table["r"][d] = r
-        else:
-            table["r"].pop(d, None)
-        if vs:
-            table["vs"][d] = vs
-        else:
-            table["vs"].pop(d, None)
-        if not guard_write(
-                lambda: self.service.storage.save_holiday_duty(table),
-                title="年度國定假日表", parent=self):
+        # ★把這一天的指定當成窄改動送出去★(外審排班 RS-5 第 1 輪 P1-3):
+        #   整份 table 寫回去會把他機剛加的其他假日一起抹掉。
+        def _mut(tbl):
+            if r:
+                tbl["r"][d] = r
+            else:
+                tbl["r"].pop(d, None)
+            if vs:
+                tbl["vs"][d] = vs
+            else:
+                tbl["vs"].pop(d, None)
+
+        if not guard_write(lambda: self.service.update_holiday_duty(_mut),
+                           title="年度國定假日表", parent=self):
             return
         self._reload_holidays()
         self._notify()
@@ -517,14 +570,14 @@ class SettingsTab(ttk.Frame):
         sel = self._hol_tree.selection()
         if not sel:
             return
-        table = self._load_holiday_map()
-        for iso in sel:
-            d = date.fromisoformat(iso)
-            table["r"].pop(d, None)
-            table["vs"].pop(d, None)
-        if not guard_write(
-                lambda: self.service.storage.save_holiday_duty(table),
-                title="年度國定假日表", parent=self):
+        def _mut(tbl):                     # 同上:只移除選到的那幾天
+            for iso in sel:
+                dd = date.fromisoformat(iso)
+                tbl["r"].pop(dd, None)
+                tbl["vs"].pop(dd, None)
+
+        if not guard_write(lambda: self.service.update_holiday_duty(_mut),
+                           title="年度國定假日表", parent=self):
             return
         self._reload_holidays()
         self._notify()
@@ -700,13 +753,15 @@ class SettingsTab(ttk.Frame):
         if not dlg.result:
             return
         wd, session, room, doctor, paid = dlg.result
-        data = self._load_template()
-        tpl = data.setdefault("template", {})
         entry = {"room": room, "doctor": doctor}
         if paid:
             entry["is_self_paid"] = True
-        tpl.setdefault(str(wd), {}).setdefault(session, []).append(entry)
-        if not guard_write(lambda: self.service.storage.save_clinic_template(data),
+
+        def _mut(data):                    # 只加這一筆(不整份寫回)
+            (data.setdefault("template", {}).setdefault(str(wd), {})
+             .setdefault(session, []).append(entry))
+
+        if not guard_write(lambda: self.service.update_clinic_template(_mut),
                            title="門診週模板", parent=self):
             return
         self._reload_template()
@@ -717,14 +772,20 @@ class SettingsTab(ttk.Frame):
         if not sel or "|" not in sel[0]:
             return
         wd, session, idx = sel[0].split("|")
-        data = self._load_template()
-        lst = ((data.get("template") or {}).get(wd) or {}).get(session) or []
-        try:
-            lst.pop(int(idx))
-        except (ValueError, IndexError):
-            return
-        if not guard_write(lambda: self.service.storage.save_clinic_template(data),
+        gone = {"hit": False}
+
+        def _mut(data):                    # 只移除這一筆
+            lst = ((data.get("template") or {}).get(wd) or {}).get(session) or []
+            try:
+                lst.pop(int(idx))
+            except (ValueError, IndexError):
+                gone["hit"] = True         # 他機已經刪掉了 → 不算失敗
+
+        if not guard_write(lambda: self.service.update_clinic_template(_mut),
                            title="門診週模板", parent=self):
+            return
+        if gone["hit"]:
+            self._reload_template()
             return
         self._reload_template()
         self._notify()
@@ -773,11 +834,13 @@ class SettingsTab(ttk.Frame):
     def _batch_add(self) -> None:
         dlg = _ClerkBatchDialog(self, {})
         if dlg.result:
-            batches = self.service.storage.load_clerk_batches()
-            batches.append(dlg.result)
-            if not guard_write(lambda: self.service.storage.save_clerk_batches(batches),
-                               title="Clerk 梯次", parent=self):
+            # 只加這一梯(整份寫回會抹掉他機剛新增的梯次)
+            if not guard_write(
+                    lambda: self.service.update_clerk_batches(
+                        lambda bs: bs.append(dlg.result)),
+                    title="Clerk 梯次", parent=self):
                 return
+            batches = self.service.storage.load_clerk_batches()
             self._seed_biopsy_from_prev(dlg.result, batches)   # 預設複製上一梯次模式
             self._reload_batches()
             self._notify()
@@ -804,9 +867,11 @@ class SettingsTab(ttk.Frame):
             if pg:
                 seeded[(ns + timedelta(days=i)).isoformat()] = dict(pg)
         if seeded:
-            grid_all[new_batch["id"]] = seeded
-            if not guard_write(lambda: self.service.storage.save_biopsy_grid(grid_all),
-                               title="切片室開放格網", parent=self):
+            if not guard_write(
+                    lambda: self.service.update_biopsy_grid(
+                        lambda g_all: g_all.__setitem__(
+                            new_batch["id"], seeded)),
+                    title="切片室開放格網", parent=self):
                 return
 
     def _batch_edit(self) -> None:
@@ -820,10 +885,15 @@ class SettingsTab(ttk.Frame):
         old_start = cur.get("start_monday")
         dlg = _ClerkBatchDialog(self, cur)
         if dlg.result:
-            cur.update(dlg.result)
-            if not guard_write(lambda: self.service.storage.save_clerk_batches(batches),
+            def _mut(bs):              # 在【最新】清單上找同一梯再套欄位
+                for b in bs:
+                    if self._batch_key(b) == sel[0]:
+                        b.update(dlg.result)
+                        return
+            if not guard_write(lambda: self.service.update_clerk_batches(_mut),
                                title="Clerk 梯次", parent=self):
                 return
+            cur.update(dlg.result)     # 本地顯示用
             if cur.get("id") and cur.get("start_monday") != old_start:
                 self._shift_biopsy_grid(cur["id"], old_start, cur["start_monday"])
             self._reload_batches()
@@ -849,18 +919,20 @@ class SettingsTab(ttk.Frame):
             except ValueError:
                 continue
             shifted[nd.isoformat()] = sess
-        grid_all[batch_id] = shifted
-        if not guard_write(lambda: self.service.storage.save_biopsy_grid(grid_all),
-                           title="切片室開放格網", parent=self):
+        if not guard_write(
+                lambda: self.service.update_biopsy_grid(
+                    lambda g_all: g_all.__setitem__(batch_id, shifted)),
+                title="切片室開放格網", parent=self):
             return
 
     def _batch_del(self) -> None:
         sel = self._batch_tree.selection()
         if not sel or not messagebox.askyesno("刪除梯次", f"刪除梯次 {sel[0]}？"):
             return
-        batches = [b for b in self.service.storage.load_clerk_batches()
-                   if self._batch_key(b) != sel[0]]
-        if not guard_write(lambda: self.service.storage.save_clerk_batches(batches),
+        def _mut(bs):                  # 只移除選到的那一梯
+            bs[:] = [b for b in bs if self._batch_key(b) != sel[0]]
+
+        if not guard_write(lambda: self.service.update_clerk_batches(_mut),
                            title="Clerk 梯次", parent=self):
             return
         self._reload_batches()
@@ -936,16 +1008,12 @@ class SettingsTab(ttk.Frame):
         if not sel:
             return
         wk = sel[0]
-        manual = self.service.storage.load_week_colors()   # 全年度攤平覆蓋集
-        nxt = {None: "pink", "pink": "green", "green": None}[manual.get(wk)]
-        if nxt:
-            manual[wk] = nxt
-        else:
-            manual.pop(wk, None)                            # 移除覆蓋→回自動色
-        # replace=True：整組取代（否則 merge 無法真正刪掉已移除的覆蓋）
+        # ★只切【這一週】,不要整組取代★(外審排班 RS-5 第 1 輪 P1-3):
+        #   replace=True 是「整份覆蓋集寫回去」—— 他機剛設的別週覆蓋會消失。
+        #   顏色的下一狀態也要用【最新】的值算,不然會照著畫面上的舊值跳。
         if not guard_write(
-                lambda: self.service.storage.save_week_colors(
-                    self._wc_year.get(), manual, source="manual", replace=True),
+                lambda: self.service.toggle_week_color(
+                    self._wc_year.get(), wk),
                 title="手動週色", parent=self):
             return
         self._reload_week_colors()
@@ -984,9 +1052,9 @@ class SettingsTab(ttk.Frame):
         scope, mid = sel[0].split(":", 1)
         if not messagebox.askyesno("歸零", f"將 {scope.upper()}/{mid} 帳本歸零？"):
             return
-        ledger = self.service.storage.load_ledger()
-        reset_member(ledger, scope, mid)
-        self.service.storage.save_ledger(ledger)
+        # 只歸零這一位(整份寫回會吃掉他機剛結算的分錄)
+        self.service.update_ledger(
+            lambda led: reset_member(led, scope, mid))
         self._reload_ledger()
         logging.info("[roster.ui] 帳本歸零 %s/%s", scope, mid)
 
@@ -1129,13 +1197,14 @@ class _BiopsyGridDialog(tk.Toplevel):
         self.wait_window(self)
 
     def _save(self):
-        grid_all = self.service.storage.load_biopsy_grid()
         newg: dict = {}
         for (iso, session), v in self._vars.items():
             if v.get():
                 newg.setdefault(iso, {})[session] = True
-        grid_all[self.batch_id] = newg
-        if not guard_write(lambda: self.service.storage.save_biopsy_grid(grid_all),
-                           title="切片室開放格網", parent=self):
+        # 只換【這一梯】的格網,別梯由他機維護(整份寫回會蓋掉)
+        if not guard_write(
+                lambda: self.service.update_biopsy_grid(
+                    lambda g_all: g_all.__setitem__(self.batch_id, newg)),
+                title="切片室開放格網", parent=self):
             return
         self.destroy()

@@ -148,6 +148,98 @@ class RosterStorage:
         #   (跨機由 revision 本身擋;同機雙開由單例互斥擋。)
         self._write_lock = threading.RLock()
 
+    #: 走 CAS 的正典檔(檔名 → 給人看的名稱)。★新增正典檔要來這裡加一行★
+    #:  —— 漏加就沒有跨機保護(有守衛測試會抓)。
+    CANONICAL_FILES = {
+        "config.json": "成員名單/參數",
+        "ledger.json": "點數帳本",
+        "biopsy.json": "切片計數帳本",
+        "week_colors.json": "週色",
+        "holiday_duty.json": "年度假日指定",
+        "clinic_template.json": "門診週模板",
+        "clerk_batches.json": "Clerk 梯次",
+        "biopsy_grid.json": "切片室開放格網",
+    }
+
+    def canonical_revision(self, name: str) -> str:
+        """這個正典檔【現在】盤上的版本識別(給 CAS 用)。
+
+        ★月檔以外的正典檔一樣會被整份覆寫★(外審排班第 2 輪 P1-01):
+        設定頁的每一次編輯都是「讀整份 config → 改 → 寫整份回去」,而背景
+        pull 會在中間把它換成他機的新版本 —— 於是他機剛新增的成員被靜默
+        移除,接著 `_sync_ledger` 還會把那個人的點數/歷史當成「已離職」作廢。
+        Git 看到的同樣是「pull 之後產生的合法新變更」,擋不住。
+        """
+        if name not in self.CANONICAL_FILES:
+            raise KeyError(f"{name} 不是正典檔(要走 CAS 請先登記到 "
+                           f"CANONICAL_FILES)")
+        return _file_revision(self._path(name))
+
+    def _parsed_or_read(self, name: str, parsed: "dict | None") -> dict:
+        """載入器的內容來源:已解析好的就用它,否則自己讀檔(既有行為)。
+
+        ★正規化只能有一份★:`canonical_snapshot` 若自己再寫一套預設值/排序,
+        兩邊遲早會漂移 —— 而漂移的那一刻,窄改動就是在一個與程式其他地方
+        不一樣的基底上做的,誰也看不出來。
+        """
+        return _load_json(self._path(name)) if parsed is None else parsed
+
+    def _canonical_loader(self, name: str):
+        """正典檔【窄改動時】用的形狀 —— 與 CANONICAL_FILES 一一對應。
+
+        週色故意用 raw:攤平版會遺失年份/來源,改一格再寫回就把它們弄丟。
+        """
+        loaders = {
+            "config.json": self.load_config,
+            "ledger.json": self.load_ledger,
+            "biopsy.json": self.load_biopsy,
+            "week_colors.json": self.load_week_colors_raw,
+            "holiday_duty.json": self.load_holiday_duty,
+            "clinic_template.json": self.load_clinic_template,
+            "clerk_batches.json": self.load_clerk_batches,
+            "biopsy_grid.json": self.load_biopsy_grid,
+        }
+        if set(loaders) != set(self.CANONICAL_FILES):
+            raise AssertionError(
+                "正典檔登記表與載入表不一致（新增正典檔要兩邊都補）")
+        return loaders[name]
+
+    def canonical_snapshot(self, name: str):
+        """→ (窄改動用的形狀, revision)。★位元組只讀一次★
+
+        (外審排班 RS-5 第 2 輪 P2)「先嚴格檢查、再算 revision、再 load()」是
+        三次各自獨立的讀取。通過檢查之後、算 revision 之前背景同步換入損壞
+        JSON 的話,revision 與寬鬆 `load_*` 都取自【那份壞的】內容 —— CAS 兩邊
+        對得上而放行,一次編輯就把整份設定改成只剩這一筆。每輪重做檢查、
+        讀完再比一次 revision,都封不住這個窗口:它們各自又是一次新的讀取。
+        要的是【讀一次位元組,嚴格解析它、也用它算 revision】,
+        與 `load_month_with_revision` 同一套道理。
+        壞檔/暫時讀不到 → 拋 ValueError,中止這次編輯,磁碟原封不動。
+        """
+        if name not in self.CANONICAL_FILES:
+            raise KeyError(f"{name} 不是正典檔(要走 CAS 請先登記到 "
+                           f"CANONICAL_FILES)")
+        path = self._path(name)
+        raw = _read_bytes(path)
+        if raw is None:                       # 被鎖住 != 不存在(見 _read_bytes)
+            raise ValueError(
+                f"{os.path.basename(path)} 暫時無法讀取（被鎖住？），"
+                f"為避免用空白覆蓋已中止這次編輯")
+        rev = _revision_of(raw)
+        if raw:
+            try:
+                data = json.loads(raw.decode("utf-8-sig"))
+            except ValueError as e:           # 含 UnicodeDecodeError
+                raise ValueError(
+                    f"{os.path.basename(path)} 損壞或無法讀取（{e}）") from e
+            if not isinstance(data, dict):    # [] 也能 parse,但寬鬆載入回 {}
+                raise ValueError(
+                    f"{os.path.basename(path)} 頂層不是 JSON 物件"
+                    f"（{type(data).__name__}）")
+        else:
+            data = {}                         # 還沒有這一份(首次建檔也能 CAS)
+        return self._canonical_loader(name)(_parsed=data), rev
+
     def quiesce_local(self) -> None:
         """關閉前收斂本機狀態。基底層沒有背景同步 → 無事可做(見 GitSync)。"""
 
@@ -335,36 +427,38 @@ class RosterStorage:
         return True
 
     # ── config / ledger / 週色 / 年度假日表 ─────────────────────────────
-    def load_config(self) -> dict:
-        return self._check_schema(_load_json(self._path("config.json")),
-                                  "config.json")
+    def load_config(self, *, _parsed: "dict | None" = None) -> dict:
+        return self._check_schema(
+            self._parsed_or_read("config.json", _parsed), "config.json")
 
-    def save_config(self, cfg: dict) -> None:
+    def save_config(self, cfg: dict, *, expected_revision=_UNSET) -> None:
         # [2026-07-25 審查] config.json 存的是全部成員名單，誤刪最痛（快照見 _save）。
         self._check_schema(_load_json(self._path("config.json")), "config.json",
                            for_write=True)
         # 全體 R/VS 成員名單 —— 失去備份就回不來。
-        self._save(self._path("config.json"), cfg, backup=REQUIRE_BACKUP)
+        self._save(self._path("config.json"), cfg, backup=REQUIRE_BACKUP,
+                   expected_revision=expected_revision)
 
-    def load_ledger(self) -> dict:
-        d = self._check_schema(_load_json(self._path("ledger.json")),
-                               "ledger.json")
+    def load_ledger(self, *, _parsed: "dict | None" = None) -> dict:
+        d = self._check_schema(
+            self._parsed_or_read("ledger.json", _parsed), "ledger.json")
         d.setdefault("r", {})
         d.setdefault("vs", {})
         d.setdefault("history", [])
         return d
 
-    def save_ledger(self, ledger: dict) -> None:
+    def save_ledger(self, ledger: dict, *, expected_revision=_UNSET) -> None:
         # [codex P2] 寫前檢查既有檔 schema：防舊版程式把新版檔靜默降級毀損
         self._check_schema(_load_json(self._path("ledger.json")), "ledger.json",
                            for_write=True)
         # [RP3-10a] ledger.json 記結算/欠點,遭誤寫時可回溯 —— 快照由 _save 統一留。
-        self._save(self._path("ledger.json"), ledger)
+        self._save(self._path("ledger.json"), ledger,
+                   expected_revision=expected_revision)
 
-    def load_biopsy(self) -> dict:
+    def load_biopsy(self, *, _parsed: "dict | None" = None) -> dict:
         """週六切片計數帳本 {"counts":{mid:int}, "history":[{month, assign}]}。"""
-        d = self._check_schema(_load_json(self._path("biopsy.json")),
-                               "biopsy.json")
+        d = self._check_schema(
+            self._parsed_or_read("biopsy.json", _parsed), "biopsy.json")
         d.setdefault("counts", {})
         d.setdefault("history", [])
         return d
@@ -399,11 +493,21 @@ class RosterStorage:
             return
         self._save(self._path("pending_settle.json"), {"pending": left})
 
-    def save_biopsy(self, book: dict) -> None:
+    def save_biopsy(self, book: dict, *, expected_revision=_UNSET) -> None:
         # 比照 save_ledger：寫前 schema 檢查（.bak 快照由 _save 統一留）
         self._check_schema(_load_json(self._path("biopsy.json")), "biopsy.json",
                            for_write=True)
-        self._save(self._path("biopsy.json"), book)
+        self._save(self._path("biopsy.json"), book,
+                   expected_revision=expected_revision)
+
+    def load_week_colors_raw(self, *, _parsed: "dict | None" = None) -> dict:
+        """週色檔的原始結構 {"year","weeks","source"}(給窄改動用;
+        `load_week_colors` 只回攤平後的 weeks,改一格再寫回會遺失年份/來源)。"""
+        d = self._check_schema(
+            self._parsed_or_read("week_colors.json", _parsed),
+            "week_colors.json")
+        d.setdefault("weeks", {})
+        return d
 
     def load_week_colors(self) -> dict:
         """{"2026-W31": "pink", ...}（攤平所有年度檔內容）。"""
@@ -412,7 +516,8 @@ class RosterStorage:
         return dict(d.get("weeks") or {})
 
     def save_week_colors(self, year: int, weeks: dict, source: str = "manual",
-                         replace: bool = False) -> None:
+                         replace: bool = False, *,
+                         expected_revision=_UNSET) -> None:
         """weeks: {week_key: "pink"/"green"}。
 
         replace=False（預設）：併入既有（只增/改，無法刪）。
@@ -422,12 +527,14 @@ class RosterStorage:
         self._check_schema(cur, "week_colors.json", for_write=True)
         merged = dict(weeks) if replace else {**(cur.get("weeks") or {}), **weeks}
         self._save(self._path("week_colors.json"),
-                   {"year": year, "weeks": merged, "source": source})
+                   {"year": year, "weeks": merged, "source": source},
+                   expected_revision=expected_revision)
 
-    def load_holiday_duty(self) -> dict:
+    def load_holiday_duty(self, *, _parsed: "dict | None" = None) -> dict:
         """{"r": {date: member_id}, "vs": {...}}；鍵集合即國定假日清單（§16.1）。"""
-        raw = self._check_schema(_load_json(self._path("holiday_duty.json")),
-                                 "holiday_duty.json")
+        raw = self._check_schema(
+            self._parsed_or_read("holiday_duty.json", _parsed),
+            "holiday_duty.json")
         out = {"r": {}, "vs": {}}
         for scope in ("r", "vs"):
             for k, v in (raw.get(scope) or {}).items():
@@ -437,7 +544,8 @@ class RosterStorage:
                     logging.warning("[roster.storage] holiday_duty 壞日期略過: %r", k)
         return out
 
-    def save_holiday_duty(self, table: dict) -> None:
+    def save_holiday_duty(self, table: dict, *,
+                          expected_revision=_UNSET) -> None:
         self._check_schema(_load_json(self._path("holiday_duty.json")),
                            "holiday_duty.json", for_write=True)       # [codex P2] 防降級毀損
         raw = {"r": {}, "vs": {}}
@@ -447,7 +555,9 @@ class RosterStorage:
                 raw[scope][key] = str(mid)
         # 這張表的鍵集合【就是】整年的國定假日清單，錯了之後點數與週末連休
         # 區塊全部跟著算錯 —— 失去備份就回不來。
-        self._save(self._path("holiday_duty.json"), raw, backup=REQUIRE_BACKUP)
+        self._save(self._path("holiday_duty.json"), raw,
+                   backup=REQUIRE_BACKUP,
+                   expected_revision=expected_revision)
 
     def holidays_set(self) -> set:
         """國定假日集合 = 年度指定表 r/vs 鍵聯集（設計文件 §16.1 定案）。"""
@@ -455,42 +565,52 @@ class RosterStorage:
         return set(t["r"]) | set(t["vs"])
 
     # ── 門診週模板 / Clerk 梯次 / 切片室開放格網（Phase 3）─────────────────
-    def load_clinic_template(self) -> dict:
+    def load_clinic_template(self, *, _parsed: "dict | None" = None) -> dict:
         """{"template": {weekday: {session: [{room,doctor,is_self_paid}]}}}。"""
-        d = self._check_schema(_load_json(self._path("clinic_template.json")),
-                               "clinic_template.json")
+        d = self._check_schema(
+            self._parsed_or_read("clinic_template.json", _parsed),
+            "clinic_template.json")
         d.setdefault("template", {})
         return d
 
-    def save_clinic_template(self, data: dict) -> None:
+    def save_clinic_template(self, data: dict, *,
+                             expected_revision=_UNSET) -> None:
         self._check_schema(_load_json(self._path("clinic_template.json")),
                            "clinic_template.json", for_write=True)
-        self._save(self._path("clinic_template.json"), data)
+        self._save(self._path("clinic_template.json"), data,
+                   expected_revision=expected_revision)
 
-    def load_clerk_batches(self) -> list:
+    def load_clerk_batches(self, *, _parsed: "dict | None" = None) -> list:
         """[{"id","start_monday","members":[...]}]（依起始日升冪）。"""
-        d = self._check_schema(_load_json(self._path("clerk_batches.json")),
-                               "clerk_batches.json")
+        d = self._check_schema(
+            self._parsed_or_read("clerk_batches.json", _parsed),
+            "clerk_batches.json")
         # [codex] 非 dict 項（多機合併後可能出現 null/字串）在這裡就會讓 b.get 拋
         # AttributeError —— 比 from_dict 更早,連讓它回 None 的機會都沒有 → 先濾掉。
         items = [b for b in (d.get("batches") or []) if isinstance(b, dict)]
         return sorted(items, key=lambda b: str(b.get("start_monday", "")))
 
-    def save_clerk_batches(self, batches: list) -> None:
+    def save_clerk_batches(self, batches: list, *,
+                           expected_revision=_UNSET) -> None:
         self._check_schema(_load_json(self._path("clerk_batches.json")),
                            "clerk_batches.json", for_write=True)
-        self._save(self._path("clerk_batches.json"), {"batches": list(batches)})
+        self._save(self._path("clerk_batches.json"),
+                   {"batches": list(batches)},
+                   expected_revision=expected_revision)
 
-    def load_biopsy_grid(self) -> dict:
+    def load_biopsy_grid(self, *, _parsed: "dict | None" = None) -> dict:
         """{batch_id: {iso_date: {"上午":bool,"下午":bool}}}。"""
-        d = self._check_schema(_load_json(self._path("biopsy_grid.json")),
-                               "biopsy_grid.json")
+        d = self._check_schema(
+            self._parsed_or_read("biopsy_grid.json", _parsed),
+            "biopsy_grid.json")
         return dict(d.get("grid") or {})
 
-    def save_biopsy_grid(self, grid: dict) -> None:
+    def save_biopsy_grid(self, grid: dict, *,
+                         expected_revision=_UNSET) -> None:
         self._check_schema(_load_json(self._path("biopsy_grid.json")),
                            "biopsy_grid.json", for_write=True)
-        self._save(self._path("biopsy_grid.json"), {"grid": grid})
+        self._save(self._path("biopsy_grid.json"), {"grid": grid},
+                   expected_revision=expected_revision)
 
     # ── 月份檔 ───────────────────────────────────────────────────────────
     def month_exists(self, ym: str) -> bool:

@@ -50,7 +50,7 @@ def test_first_of_month_saturday_sees_previous_month_friday(tmp_path):
     svc, st = _svc(tmp_path)
     st.save_month("2026-07", _month_with_duty({date(2026, 7, 31): R3}))
     st.save_month("2026-08", _month_with_duty({date(2026, 8, 1): R1}))
-    assign, _notes, _book = svc.recompute_saturday_biopsy("2026-08")
+    assign, _notes, _book, _rev = svc.recompute_saturday_biopsy("2026-08")
     cell = assign[date(2026, 8, 1)]
     assert cell["person"] == R3, "應由上月最後一天(週五)的值班人決定"
     assert "週五連動" in cell["reason"]
@@ -60,7 +60,7 @@ def test_missing_previous_month_file_does_not_break_recompute(tmp_path):
     """沒有上月資料 → 連動單純不生效,不可讓整個切片重排失敗。"""
     svc, st = _svc(tmp_path)
     st.save_month("2026-08", _month_with_duty({date(2026, 8, 1): R1}))
-    assign, _notes, _book = svc.recompute_saturday_biopsy("2026-08")
+    assign, _notes, _book, _rev = svc.recompute_saturday_biopsy("2026-08")
     assert assign[date(2026, 8, 1)]["person"] in (R2, R3)
 
 

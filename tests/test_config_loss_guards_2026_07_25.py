@@ -282,10 +282,15 @@ def test_settings_save_failure_never_wipes_cfg_or_ledger():
         "_save_cfg 必須回傳成功與否,讓呼叫端能停手"
 
     # 會動帳本的兩個呼叫端必須在存檔失敗時中止,不得走到 _sync_ledger
+    # ★錨在【性質】上,不是在某個寫法上★(2026-08-19 RS-5):這兩處已改用
+    #   `change_members_and_sync_ledger(mutator)`(名單+帳本在同一個臨界區內,
+    #   而且 ids 由寫成功後重讀的 config 推導),舊錨 `if not self._save_cfg()`
+    #   因此消失 —— 但要守的規則沒變:先寫成功,才可以動帳本;寫失敗要 return。
     for fn in (SettingsTab._member_add, SettingsTab._member_del):
         body = inspect.getsource(fn)
-        i_guard = body.index("if not self._save_cfg()")
-        i_sync = body.index("self._sync_ledger(")   # 實際呼叫（非註解提及）
-        assert i_guard < i_sync, f"{fn.__name__} 必須先確認存檔成功再同步帳本"
-        assert "return" in body[i_guard:i_sync], \
+        i_write = body.index("change_members_and_sync_ledger(")
+        i_sync = body.index("self._reload_ledger()")   # 寫入之後才重畫
+        assert i_write < i_sync, f"{fn.__name__} 必須先確認存檔成功再同步帳本"
+        seg = body[i_write:i_sync]
+        assert "except Exception" in seg and "return" in seg, \
             f"{fn.__name__} 存檔失敗必須 return,不可繼續改帳本"

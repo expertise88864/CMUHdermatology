@@ -28,7 +28,7 @@ from typing import NamedTuple
 
 from cmuh_common.roster.calendar_colors import week_colors_for_year
 from cmuh_common.roster.clinic_grid import month_grid
-from cmuh_common.roster.ledger import settle_month
+from cmuh_common.roster.ledger import settle_month, sync_members
 from cmuh_common.roster.model import (
     ClerkBatch, Member, RosterParams, SolveContext, batches_covering, day_point,
     roc,
@@ -545,6 +545,125 @@ class RosterService:
         assert last is not None
         raise last
 
+    def _update_canonical(self, name: str, save, mutator, *,
+                          retries: int = 4):
+        """讀最新的正典檔 → 套上【這一個窄改動】→ CAS 寫回;被搶先就重讀重套。
+
+        ★`update_month` 的同一套道理,擴到月檔以外的正典檔★
+        (外審排班第 2 輪 P1-01):設定頁的每一次編輯都是整份 read-modify-write,
+        而背景 pull 會在中間換掉檔案 —— 他機剛新增的成員因此被靜默移除,
+        接著 `_sync_ledger` 還會把那個人的點數/歷史當成「已離職」作廢。
+        「存檔前再讀一次」不夠(那只是把窗口縮小);要的是【比對-交換】。
+
+        `mutator(data)` 的回傳值原樣回傳。★mutator 必須可重跑★。
+        """
+        # ★窄改動的【基底】必須是可信的,而且要與 revision 是同一份位元組★
+        #   `load_*` 對壞檔/鎖檔一律靜默回空,拿它當基底再寫回去,一次新增成員
+        #   就會把整份設定清成只剩那一個人(2026-07-25 已經學過這條)。
+        #   而「先嚴格檢查、再算 revision、再 load」是三次獨立的讀取 ——
+        #   中間換入損壞內容時,revision 與空資料都取自那份壞的,CAS 兩邊對得上
+        #   就放行(外審排班 RS-5 第 2 輪 P2)。故一律走 `canonical_snapshot`:
+        #   讀一次位元組,嚴格解析它、也用它算 revision;壞檔直接拋、磁碟不動。
+        last: "StaleRosterDataError | None" = None
+        for _ in range(max(1, int(retries))):
+            data, rev = self.storage.canonical_snapshot(name)
+            out = mutator(data)
+            try:
+                save(data, rev)
+            except StaleRosterDataError as e:
+                last = e
+                logging.info("[roster] %s 存檔時發現盤上已更新 → 重讀後重套",
+                             name)
+                continue
+            return out
+        assert last is not None
+        raise last
+
+    def change_members_and_sync_ledger(self, scope: str, mutator) -> None:
+        """名單變更 + 帳本同步是★一件事★,整段在同一個臨界區內完成。
+
+        (外審排班 RS-5 第 1 輪 P1-1)分開做的話會這樣壞:名單那一步已經走 CAS
+        (他機新增的 F 因此保住了),但接著的帳本同步若拿【呼叫端事先算好的】
+        舊 ids 去 `sync_members`,F 不在那份名單裡 → ★它的餘額與所有 history
+        delta 被永久刪除★。所以 ids 必須從【剛剛寫成功的、受保護的最新
+        config】重新推導,而且兩步之間不可以讓背景同步插進來。
+        """
+        with self.storage.write_barrier():
+            self.update_config(mutator)
+            cfg = self.storage.load_config()      # ★重讀最新版再推導名單★
+            ids = [m.get("id") for m in (cfg.get(f"{scope}_members") or [])]
+            self.update_ledger(lambda led: sync_members(led, scope, ids))
+
+    def update_config(self, mutator, *, retries: int = 4):
+        """對 config.json 做一個窄改動(名單/參數),CAS 保護。"""
+        return self._update_canonical(
+            "config.json",
+            lambda d, rev: self.storage.save_config(d, expected_revision=rev),
+            mutator, retries=retries)
+
+    def update_ledger(self, mutator, *, retries: int = 4):
+        return self._update_canonical(
+            "ledger.json",
+            lambda d, rev: self.storage.save_ledger(d, expected_revision=rev),
+            mutator, retries=retries)
+
+    def update_clerk_batches(self, mutator, *, retries: int = 4):
+        return self._update_canonical(
+            "clerk_batches.json",
+            lambda d, rev: self.storage.save_clerk_batches(
+                d, expected_revision=rev),
+            mutator, retries=retries)
+
+    def update_clinic_template(self, mutator, *, retries: int = 4):
+        return self._update_canonical(
+            "clinic_template.json",
+            lambda d, rev: self.storage.save_clinic_template(
+                d, expected_revision=rev),
+            mutator, retries=retries)
+
+    def update_biopsy_grid(self, mutator, *, retries: int = 4):
+        return self._update_canonical(
+            "biopsy_grid.json",
+            lambda d, rev: self.storage.save_biopsy_grid(
+                d, expected_revision=rev),
+            mutator, retries=retries)
+
+    def toggle_week_color(self, year: int, week: str) -> "str | None":
+        """把某一週的手動覆蓋色切到下一個狀態(粉→綠→取消)。→ 新的值。
+
+        ★只動這一週★(外審排班 RS-5 第 1 輪 P1-3):UI 原本是「讀整份覆蓋集 →
+        改一格 → `replace=True` 整組寫回」,他機剛設的別週覆蓋會被抹掉;而且
+        下一個狀態要用【當下最新的】值去算,不是畫面上的舊值。
+        """
+        out: dict = {}
+
+        def _mut(cur):
+            weeks = cur.setdefault("weeks", {})
+            nxt = {None: "pink", "pink": "green", "green": None}.get(
+                weeks.get(week))
+            if nxt:
+                weeks[week] = nxt
+            else:
+                weeks.pop(week, None)
+            cur["year"] = int(year)
+            cur["source"] = "manual"
+            out["value"] = nxt
+
+        self._update_canonical(
+            "week_colors.json",
+            lambda d, rev: self.storage.save_week_colors(
+                int(year), d.get("weeks") or {}, source="manual",
+                replace=True, expected_revision=rev),
+            _mut)
+        return out.get("value")
+
+    def update_holiday_duty(self, mutator, *, retries: int = 4):
+        return self._update_canonical(
+            "holiday_duty.json",
+            lambda d, rev: self.storage.save_holiday_duty(
+                d, expected_revision=rev),
+            mutator, retries=retries)
+
     def set_pgy_month_roster(self, ym: str, codes) -> None:
         def _mut(month):
             month["pgy_month_roster"] = [str(c) for c in codes]
@@ -799,13 +918,30 @@ class RosterService:
         """依月檔現況（r_duty）重排週六切片並結算計數帳本。
 
         month 傳入 → 就地更新 month["saturday_biopsy"]、【不寫任何檔】，回
-        (assign, notes, book)——呼叫端 save_month 成功後再 save_biopsy(book)
+        (assign, notes, book, book_rev)——呼叫端 save_month 成功後再
+        save_biopsy(book, expected_revision=book_rev)
         （月檔是 gate：定案擋下時計數帳本不得先行落地）。
-        month=None → 自行 load；save_month 成功後 save_biopsy。"""
+        month=None → 自行 load；save_month 成功後 save_biopsy。
+
+        ★整段在同一個臨界區內★(外審排班 RS-5 第 2 輪 P1-2):自行 load 的那條
+        路要寫【月檔與切片帳本兩個檔】,兩者之間他機更新 biopsy.json 的話,
+        CAS 正確擋下切片帳本、月檔卻已經落地 —— 兩個檔當場互相矛盾,而且
+        沒有任何人會發現(之後的切片平衡全部以錯的次數為基礎)。
+        傳入 month 的那條路由呼叫端持有同一個臨界區(RLock,可重入)。"""
+        with self.storage.write_barrier():
+            return self._recompute_saturday_biopsy_locked(ym, month)
+
+    def _recompute_saturday_biopsy_locked(self, ym: str,
+                                          month: "dict | None") -> tuple:
         own = month is None
         _own_rev = None
         if own:
             month, _own_rev = self.storage.load_month_with_revision(ym)
+        # ★切片帳本也要 CAS★(外審排班 RS-5 第 1 輪 P1-2):兩台同時改 R 值班或
+        #   手動指定切片時,月檔各自被 `update_month` 保住了,但最後的
+        #   `save_biopsy` 沒有 revision —— 後寫的會整份蓋掉先寫的切片計數與
+        #   結算歷史,之後的切片平衡全部以錯的次數為基礎。
+        book_rev = self.storage.canonical_revision("biopsy.json")
         # ★[2026-08-02 補審 第1輪] 要拒絕就得在【改動 month 之前】拒絕★
         #   settle_biopsy 的守門原本要到函式尾端才拋,那時 month["saturday_biopsy"]
         #   與 report_r 都已經改過了;而呼叫端(set_cell / set_biopsy_person /
@@ -851,8 +987,8 @@ class RosterService:
             # 沿用舊快照寫回會把他機在重算期間的修改一起退回去。
             self.storage.save_month(ym, month,
                                     expected_revision=_own_rev)
-            self.storage.save_biopsy(book)
-        return assign, notes, book
+            self.storage.save_biopsy(book, expected_revision=book_rev)
+        return assign, notes, book, book_rev
 
     def render_report(self, scope: str, ym: str, result: SolveResult) -> str:
         """以目前 storage 狀態重建 ctx，產生 result 的四段式決策報告（純字串）。
@@ -927,12 +1063,13 @@ class RosterService:
         # [週六切片 2026-07-13] R 排班落地 → 以最終月檔 duty（含保留的鎖定格）
         # 重排週六切片並附報告段；biopsy.json 於 save_month 成功後才寫。
         biopsy_book = None
+        _bio_rev = None                        # 重排失敗時也要有值(見下方守衛)
         if scope == "r":
             try:
                 # 先寫入本次 report(recompute 會在其上刷新/附加[週六切片]段)
                 month["report_r"] = report
-                assign, notes, biopsy_book = self.recompute_saturday_biopsy(
-                    ym, month)
+                assign, notes, biopsy_book, _bio_rev = (
+                    self.recompute_saturday_biopsy(ym, month))
                 report = month["report_r"]
             except Exception:
                 biopsy_book = None
@@ -960,7 +1097,8 @@ class RosterService:
             settle_month(ledger, scope, ym, result.points_by_person)
             self.storage.save_ledger(ledger)
             if biopsy_book is not None:
-                self.storage.save_biopsy(biopsy_book)
+                self.storage.save_biopsy(biopsy_book,
+                                         expected_revision=_bio_rev)
         except Exception:
             # 意圖留著 → 下次開程式會用月檔把帳本重建到一致。
             raise
@@ -1007,15 +1145,24 @@ class RosterService:
             #   互相對不上(而且沒有人看得出來)。
             if scope == "r" and (d.weekday() == 5 or _same_month_friday):
                 try:
-                    _a, _n, _holder["book"] = self.recompute_saturday_biopsy(
+                    (_a, _n, _holder["book"],
+                     _holder["rev"]) = self.recompute_saturday_biopsy(
                         ym, month)
                 except Exception:
                     logging.exception(
                         "[roster.service] set_cell 週六切片重排失敗（略過）")
 
-        self.update_month(ym, _mut)
-        if _holder.get("book") is not None:
-            self.storage.save_biopsy(_holder["book"])
+        # ★月檔與切片帳本要在同一個臨界區內★(外審排班 RS-5 第 2 輪 P1-2):
+        #   分開做的話,兩者之間他機更新了 biopsy.json → CAS 正確擋下切片帳本
+        #   的寫入,但月檔的新值班/saturday_biopsy 早就落地了 —— 兩個檔當場
+        #   互相矛盾,而且沒有任何人會發現(之後的切片平衡全部以錯的次數算)。
+        #   臨界區內別人寫不進 biopsy.json,重排時取的 revision 到寫入為止
+        #   都還有效,CAS 因此不會在這裡被觸發。
+        with self.storage.write_barrier():
+            self.update_month(ym, _mut)
+            if _holder.get("book") is not None:
+                self.storage.save_biopsy(
+                    _holder["book"], expected_revision=_holder.get("rev"))
         # 月底週五(翌日是下月 1 號且為週六)→ 重排【下個月】。本月月檔已存好,
         # 這裡才動下月,兩者互不影響;下月沒有月檔就什麼都不做。
         if scope == "r" and _cross_month_friday:
@@ -1066,16 +1213,22 @@ class RosterService:
             if not ov:
                 month.pop("biopsy_override", None)
             self._audit(month, "r", f"biopsy:{iso}", old, person, "manual")
-            try:
-                _a, _n, _holder["book"] = self.recompute_saturday_biopsy(
-                    ym, month)
-            except Exception:
-                logging.exception(
-                    "[roster.service] 手動指定切片後重排失敗（略過）")
+            # ★這裡不可以吞例外★(外審排班 RS-5 第 2 輪 P1-1):本函式的目的
+            #   就是切片,重排做不到就整個拒絕(上面的守門已經是這個結論)。
+            #   吞掉的話 override 照樣存進月檔,而 saturday_biopsy / biopsy.json
+            #   停在舊人選 —— 留下一個永遠不會生效、也沒有人看得出來的指定。
+            #   ★解包的個數要跟著回傳值走★:少解一個會拋 ValueError,若又被
+            #   這裡吞掉,「手動指定」就變成【必然】只寫半套(這一輪我自己
+            #   把 3 改成 4 時漏掉這一處,外審當場抓到)。
+            (_a, _n, _holder["book"],
+             _holder["rev"]) = self.recompute_saturday_biopsy(ym, month)
 
-        self.update_month(ym, _mut)            # 定案 → 拋例外,帳本不落地
-        if _holder.get("book") is not None:
-            self.storage.save_biopsy(_holder["book"])
+        # ★月檔與切片帳本在同一個臨界區內★(見 set_cell 的同一條說明)
+        with self.storage.write_barrier():
+            self.update_month(ym, _mut)        # 定案 → 拋例外,帳本不落地
+            if _holder.get("book") is not None:
+                self.storage.save_biopsy(
+                    _holder["book"], expected_revision=_holder.get("rev"))
         return self.quick_validate("r", ym)
 
     def clear_unlocked(self, scope: str, ym: str) -> None:
@@ -1107,7 +1260,8 @@ class RosterService:
             # [週六切片] R 值班清除 → 切片依殘餘(鎖定)值班+次數平衡重排,與月檔同批
             if scope == "r":
                 try:
-                    _a, _n, _holder["book"] = self.recompute_saturday_biopsy(
+                    (_a, _n, _holder["book"],
+                     _holder["rev"]) = self.recompute_saturday_biopsy(
                         ym, month)
                 except Exception:
                     logging.exception(
@@ -1117,9 +1271,12 @@ class RosterService:
         probe, _rev = self.storage.load_month_with_revision(ym)
         if not _mut(probe):                    # 試算:沒有東西可清就不要寫檔
             return
-        self.update_month(ym, _mut)
-        if _holder.get("book") is not None:
-            self.storage.save_biopsy(_holder["book"])
+        # ★月檔與切片帳本在同一個臨界區內★(見 set_cell 的同一條說明)
+        with self.storage.write_barrier():
+            self.update_month(ym, _mut)
+            if _holder.get("book") is not None:
+                self.storage.save_biopsy(
+                    _holder["book"], expected_revision=_holder.get("rev"))
 
     def toggle_lock(self, scope: str, ym: str, d: date) -> bool:
         """切換鎖定（空格不可鎖）。回傳切換後的鎖定狀態。"""
@@ -1172,6 +1329,17 @@ class RosterService:
         後不可空、不可撞現有成員，且不可已存在於任何「以 id 為鍵」的歷史資料（帳本餘額/分錄/切片
         計數/請假/指定）→ 避免蓋掉離職者的歷史紀錄。
         """
+        # ★整段包在同一個臨界區內★(外審排班第 2 輪 P1-01):改名一次要動
+        #   config + 帳本 + 假日指定 + 切片帳本 + 所有月份 —— Phase 1「全部
+        #   載入」到 Phase 3「逐檔寫入」之間,背景 pull 隨時可以換掉其中任何
+        #   一個檔,而只有月檔那幾筆有 CAS。臨界區讓「載入 → 改 → 逐檔寫 →
+        #   需要時回滾」整段看見同一份盤面。
+        with self.storage.write_barrier():
+            return self._rename_member_locked(scope, old_id, new_id)
+
+    def _rename_member_locked(self, scope: str, old_id: str,
+                              new_id: str) -> int:
+        """`rename_member` 的本體。★呼叫端必須持有 `write_barrier`★"""
         old_id = str(old_id)
         new_id = str(new_id).strip()
         if not new_id:
