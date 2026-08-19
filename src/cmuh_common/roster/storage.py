@@ -12,10 +12,12 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import logging
 import os
 import shutil
+import threading
 import time
 from datetime import date, datetime
 from typing import Optional
@@ -24,6 +26,10 @@ from cmuh_common.atomic_io import atomic_write_json
 from cmuh_common.roster.model import SCHEMA_VERSION
 
 KEEP_SNAPSHOTS = 20
+
+#: `expected_revision` 的「沒有帶」哨兵 —— `None` 不能用:它是【檔案還不存在】
+#: 這個有意義的期望值(首次建檔要能 CAS 成 "")。
+_UNSET = object()
 
 # ★[2026-08-02 第二輪外審 P2-04] 寫入的備份政策★
 # 「快照失敗只記 warning、照樣覆寫」對【每改一格就存一次】的月檔是合理的
@@ -39,6 +45,71 @@ class FinalizedMonthError(RuntimeError):
 
 class NewerSchemaError(RuntimeError):
     """檔案 schema_version 比程式新（另一台較新版本寫的）→ 拒絕寫入。"""
+
+
+class StaleRosterDataError(RuntimeError):
+    """要寫回的內容是【從舊版本讀出來的】——盤上這一份已經被別人改過。
+
+    ★這是跨機同步的正常結果,不是錯誤狀態★(外審排班第 1 輪 P1-01):
+    GitSync 的背景 pull 會在使用者「讀出來 → 改 → 存回去」的中間把月檔換成
+    他機的新版本;整份寫回就會把對方剛同步成功的欄位靜默退回舊值(Git 看到的
+    是一個 pull 之後產生的合法新變更,幫不上忙)。
+    呼叫端要嘛重讀最新版再把【同一個窄改動】套上去(`RosterService.update_month`),
+    要嘛明確拒絕(帶著預先算好的結果落地的路徑:套用排班、定案)。
+    """
+
+
+#: 「這一刻讀不到」的版本識別。★不可以摺進 ""(=還沒有這一份)★:
+#: 檔案被防毒/同步軟體暫時鎖住時,把它當成「不存在」會讓 CAS 拿 "" 比 "" 而
+#: 通過 —— 於是一份【從讀不到的檔推導出來的空月檔】被整份寫回去。這正是
+#: `_guard_overwrite` 早就分開處理過的兩件事(見其 docstring)。
+#: 這個值永遠不會等於任何 sha256 十六進位字串。
+_UNREADABLE_REV = "<unreadable>"
+
+
+def _revision_of(raw) -> str:
+    """這一份內容的版本識別。b""→ ""(還沒有這一份);None → 讀不到。"""
+    if raw is None:
+        return _UNREADABLE_REV
+    if not raw:
+        return ""
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _read_bytes(path: str) -> "bytes | None":
+    """讀原始位元組。缺檔 → b"";★暫時讀不到 → None★(與缺檔是兩件事)。"""
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return b""
+    except OSError:
+        logging.warning("[roster.storage] 讀取失敗(暫時讀不到): %s", path,
+                        exc_info=True)
+        return None
+
+
+def _file_revision(path: str) -> str:
+    """盤上這一份檔案【現在】的版本識別。"""
+    return _revision_of(_read_bytes(path))
+
+
+def _parse_json_bytes(raw: "bytes | None", path: str) -> dict:
+    """把已讀進來的位元組解析成 dict。★解析規則只有這一份★
+
+    `_load_json` 也走這裡 —— 讀檔與「讀檔並記下版本」若各自解析,兩邊對
+    BOM/壞檔的判定就會漂移,而那正是「守門說沒事、讀取卻回空」的那道縫
+    (見 `_load_json` 的說明)。
+    """
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logging.warning("[roster.storage] 解析失敗(視為空): %s", path,
+                        exc_info=True)
+        return {}
 
 
 def _load_json(path: str) -> dict:
@@ -58,15 +129,7 @@ def _load_json(path: str) -> dict:
     BOM 的來源：多機 git 衝突是設計內流程（使用者會手動修 JSON），而 PowerShell
     的 `>` / `Out-File` 預設就寫出 UTF-8 with BOM。
     """
-    try:
-        with open(path, "r", encoding="utf-8-sig") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except FileNotFoundError:
-        return {}
-    except Exception:
-        logging.warning("[roster.storage] 讀取失敗(視為空): %s", path, exc_info=True)
-        return {}
+    return _parse_json_bytes(_read_bytes(path), path)
 
 
 class RosterStorage:
@@ -74,6 +137,11 @@ class RosterStorage:
         self.base_dir = base_dir
         self.months_dir = os.path.join(base_dir, "months")
         os.makedirs(self.months_dir, exist_ok=True)
+        # ★CAS 不是原子的話就不是 CAS★:兩條執行緒可以同時讀到同一個
+        #   revision、同時通過比對,然後後寫的那個把先寫的整份蓋掉 ——
+        #   正是這一批要消滅的失效模式,只是換成同一個 process 內。
+        #   (跨機由 revision 本身擋;同機雙開由單例互斥擋。)
+        self._write_lock = threading.RLock()
 
     # ── 內部共用 ─────────────────────────────────────────────────────────
     def _path(self, name: str) -> str:
@@ -160,7 +228,8 @@ class RosterStorage:
                 f"為保護既有資料已中止存檔，請稍後再試。") from e
 
     def _save(self, path: str, data: dict, *,
-              backup: str = BEST_EFFORT_BACKUP) -> None:
+              backup: str = BEST_EFFORT_BACKUP,
+              expected_revision=_UNSET) -> None:
         """唯一的寫入出口：守門 → 留快照 → 原子寫入。
 
         ★[2026-08-02 補審] 快照掛在這裡，不是各個 `save_*` 各自呼叫★
@@ -174,6 +243,35 @@ class RosterStorage:
         順序：守門在前，被拒寫時不留快照——什麼都沒改卻佔掉保留額度，會把真正
         有用的歷史擠掉。`.bak-*` 已在 GitSync 的 .gitignore 內，不會同步出去。
         """
+        # ★全程持鎖:比對與寫入之間不可以有縫★(見 `_write_lock` 的說明)
+        with self._write_lock:
+            self._save_body(path, data, backup=backup,
+                            expected_revision=expected_revision)
+
+    def _save_body(self, path: str, data: dict, *,
+                   backup: str = BEST_EFFORT_BACKUP,
+                   expected_revision=_UNSET) -> None:
+        """`_save` 的本體。★呼叫端(只有 `_save`)必須持有 `_write_lock`★"""
+        # ★CAS:要覆蓋的必須還是我讀到的那一份★(外審排班第 1 輪 P1-01)
+        #   比對放在【寫入之前、同一個臨界區內】—— GitSync 覆寫的 `_save` 會
+        #   持有工作樹鎖,所以「比對 → 寫入」中間不會被背景 merge 插進來。
+        #   `expected_revision` 沒帶 ＝ 呼叫端沒有「先讀後寫」的語意(例如首次
+        #   建檔、整批重建),維持原行為。
+        if expected_revision is not _UNSET:
+            current = _file_revision(path)
+            # ★兩個原因的處置不同,訊息就不可以共用★:「被別人搶先」重讀一次
+            #   就好;「這一刻讀不到」是防毒/同步軟體鎖住,重讀也沒用,而且
+            #   在讀不到的情況下【無法判斷】會不會蓋掉別人的修改 → fail-closed。
+            if current == _UNREADABLE_REV or expected_revision == _UNREADABLE_REV:
+                raise ValueError(
+                    f"{os.path.basename(path)} 暫時無法讀取（可能被防毒/同步"
+                    f"軟體鎖住），無法確認這次存檔會不會蓋掉其他電腦的修改，"
+                    f"已中止存檔，請稍後再試。")
+            if current != expected_revision:
+                raise StaleRosterDataError(
+                    f"{os.path.basename(path)} 已被其他電腦(或另一個視窗)更新，"
+                    f"為避免蓋掉對方剛同步進來的內容，這次存檔已中止。"
+                    f"請重新載入最新資料後再改一次。")
         self._guard_overwrite(path)
         if not self._snapshot(path) and backup == REQUIRE_BACKUP:
             raise ValueError(
@@ -350,17 +448,31 @@ class RosterStorage:
         return os.path.exists(self._month_path(ym))
 
     def load_month(self, ym: str) -> dict:
-        d = self._check_schema(_load_json(self._month_path(ym)), f"{ym}.json")
+        return self.load_month_with_revision(ym)[0]
+
+    def load_month_with_revision(self, ym: str) -> "tuple[dict, str]":
+        """→ (月檔, revision)。revision 是【這一份內容】的識別,回寫時交給
+        `save_month(expected_revision=…)` 做 CAS。
+
+        ★位元組只讀一次★:先算 revision 再解析【同一份位元組】—— 分兩次讀
+        的話,兩次之間背景 pull 換掉檔案就會得到一個「配不上手中內容」的
+        revision,CAS 於是會放行那份其實已經過期的快照(正是要防的事)。
+        檔案不存在 → revision 為 ""(首次建檔也能 CAS)。
+        """
+        path = self._month_path(ym)
+        raw = _read_bytes(path)
+        d = self._check_schema(_parse_json_bytes(raw, path), f"{ym}.json")
         d.setdefault("month", ym)
         d.setdefault("finalized", False)
         for k in ("r_duty", "vs_duty", "leaves", "must_duty",
                   "day_slots", "grid_overrides"):
             d.setdefault(k, {})
         d.setdefault("audit", [])
-        return d
+        return d, _revision_of(raw)
 
     def save_month(self, ym: str, data: dict, force: bool = False, *,
-                   backup: "str | None" = None) -> None:
+                   backup: "str | None" = None,
+                   expected_revision=_UNSET) -> None:
         """存月檔。backup=None ＝ 用預設政策（force 覆寫已定案月 → REQUIRE_BACKUP，
         一般存檔 → BEST_EFFORT）。
 
@@ -380,7 +492,8 @@ class RosterStorage:
         # BEST_EFFORT（每改一格就存一次，不可因備份不成而停擺）。
         if backup is None:
             backup = REQUIRE_BACKUP if force else BEST_EFFORT_BACKUP
-        self._save(path, data, backup=backup)
+        self._save(path, data, backup=backup,
+                   expected_revision=expected_revision)
 
     def iter_month_yms(self) -> list:
         """回傳 months/ 內所有月份檔的 'YYYY-MM'（升冪）。供跨全部月份的維護作業

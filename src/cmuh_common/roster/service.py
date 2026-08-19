@@ -45,7 +45,11 @@ from cmuh_common.roster.saturday_biopsy import (
 from cmuh_common.roster.solve_rvs import (
     SolveResult, apply_boundary_from_prev, solve_duty,
 )
-from cmuh_common.roster.storage import FinalizedMonthError, RosterStorage
+from cmuh_common.roster.storage import (
+    FinalizedMonthError,
+    RosterStorage,
+    StaleRosterDataError,
+)
 
 _SCOPE_LABEL = {"r": "R 排班", "vs": "VS 排班"}
 _SPECIAL_SLOTS = frozenset((PHOTO, TREATMENT, BIOPSY, REST))   # 非跟診房的特殊格
@@ -301,53 +305,60 @@ class RosterService:
 
     def accept_day_solution(self, ym: str, day_slots: dict,
                             report: "str | None" = None) -> None:
-        month = self.storage.load_month(ym)
+        """★這條路徑【不重試】★(外審排班第 1 輪 P1-01):`day_slots` 是先前
+        求解算出來的整批結果,盤上若已被他機換過,重讀後把同一批舊結果再套一次
+        只是把對方的修改蓋掉 —— 語意上該做的是拒絕、請使用者重排。"""
+        month, rev = self.storage.load_month_with_revision(ym)
         if month.get("finalized"):
             raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能套用")
         month["day_slots"] = self._overlay_locked_sessions(month, day_slots)
         month["day_report"] = report or ""      # 供「報告」鈕顯示落地當下的報告
-        self.storage.save_month(ym, month)
+        self.storage.save_month(ym, month, expected_revision=rev)
 
     def set_day_slot(self, ym: str, d: date, session: str, slot: str,
                      people) -> None:
         """手動改某日某時段某格（slot＝照光/治療室/切片室/房號/放假；people 空→移除）。"""
-        month = self.storage.load_month(ym)
-        sess = (month.setdefault("day_slots", {})
-                .setdefault(d.isoformat(), {}).setdefault(session, {}))
-        old = sess.get(slot)
-        if people:
-            sess[slot] = list(people)
-        else:
-            sess.pop(slot, None)
-        self._audit(month, "day", f"{d.isoformat()} {session} {slot}",
-                    old, people, "manual")
-        self.storage.save_month(ym, month)
+        def _mut(month):
+            sess = (month.setdefault("day_slots", {})
+                    .setdefault(d.isoformat(), {}).setdefault(session, {}))
+            old = sess.get(slot)
+            if people:
+                sess[slot] = list(people)
+            else:
+                sess.pop(slot, None)
+            self._audit(month, "day", f"{d.isoformat()} {session} {slot}",
+                        old, people, "manual")
+        self.update_month(ym, _mut)
 
     def set_day_session(self, ym: str, d: date, session: str, slots: dict) -> int:
         """[RS-06] 一次覆寫某(日,時段)的所有格（slots＝{slot: [人]}；空清單→移除該格）。
         一次 load、逐格 diff 才記 audit、一次 save。回傳實際變動的格數。取代
         _DayEditDialog 逐格呼叫 set_day_slot（每格各一次 load/save/git commit）。"""
-        month = self.storage.load_month(ym)
-        sess = (month.setdefault("day_slots", {})
-                .setdefault(d.isoformat(), {}).setdefault(session, {}))
-        changed = 0
-        for slot, people in slots.items():
-            old = sess.get(slot)
-            new = list(people) if people else None
-            if (old or None) == (new or None):
-                continue                          # 無變化 → 不記 audit、不算入變動
-            changed += 1
-            if new:
-                sess[slot] = new
-            else:
-                sess.pop(slot, None)
-            self._audit(month, "day", f"{d.isoformat()} {session} {slot}",
-                        old, people, "manual")
-        if changed:
-            # 與逐格 set_day_slot 行為一致（清空後留空殼 {}，不另做空殼清理，
-            # 避免下游直接索引 day_slots[iso][session] 的路徑 KeyError）。
-            self.storage.save_month(ym, month)
-        return changed
+        def _mut(month):
+            sess = (month.setdefault("day_slots", {})
+                    .setdefault(d.isoformat(), {}).setdefault(session, {}))
+            changed = 0
+            for slot, people in slots.items():
+                old = sess.get(slot)
+                new = list(people) if people else None
+                if (old or None) == (new or None):
+                    continue                      # 無變化 → 不記 audit、不算入變動
+                changed += 1
+                if new:
+                    sess[slot] = new
+                else:
+                    sess.pop(slot, None)
+                self._audit(month, "day", f"{d.isoformat()} {session} {slot}",
+                            old, people, "manual")
+            return changed
+
+        # ★「沒有變動就不要存檔」仍然成立★:先試算一次(在最新月檔上),
+        #   真的有變動才進 CAS 迴圈 —— 否則每次開關對話框都會寫一次檔、
+        #   commit 一次 git。試算與落地都由 `_mut` 決定,不是兩套判準。
+        probe, _rev = self.storage.load_month_with_revision(ym)
+        if not _mut(probe):
+            return 0
+        return self.update_month(ym, _mut)
 
     def quick_validate_day(self, ym: str) -> list:
         """[RS-07] PGY/Clerk 日排班快速檢查（warn 不擋存，符合設計 §16.4）。回傳訊息清單：
@@ -440,10 +451,39 @@ class RosterService:
         return {"pgy": {"roster": list(inp.pgy_roster), "stats": pgy_stats},
                 "batches": batches_out}
 
+    def update_month(self, ym: str, mutator, *, retries: int = 4):
+        """讀最新月檔 → 套上【這一個窄改動】→ CAS 寫回;被搶先就重讀重套。
+
+        ★整份寫回一個舊快照會靜默吃掉他機的修改★(外審排班第 1 輪 P1-01):
+        月檔一個檔案裝著 R/VS 值班、日排班、請假、指定、停診…… 跨機同步的
+        背景 pull 會在「讀出來 → 改 → 存回去」中間把它換成他機的新版本,
+        而整份 `save_month(舊快照)` 會把對方剛同步成功的欄位一起退回去 ——
+        從 Git 看來那是 pull 之後產生的合法新變更,擋不住,也看不出來。
+        所以窄改動一律走這裡:CAS 失敗就【重讀最新版、把同一個改動再套一次】,
+        對方的欄位因此保留。
+
+        `mutator(month)` 的回傳值原樣回傳給呼叫端。★mutator 必須可重跑★
+        (它拿到的永遠是當下最新的月檔,可能被呼叫不只一次);會改到別的檔案
+        或有其他副作用的動作,放在這個呼叫【之後】做,不要放進 mutator。
+        """
+        last: "StaleRosterDataError | None" = None
+        for _ in range(max(1, int(retries))):
+            month, rev = self.storage.load_month_with_revision(ym)
+            out = mutator(month)
+            try:
+                self.storage.save_month(ym, month, expected_revision=rev)
+            except StaleRosterDataError as e:
+                last = e
+                logging.info("[roster] %s 存檔時發現盤上已更新 → 重讀後重套", ym)
+                continue
+            return out
+        assert last is not None
+        raise last
+
     def set_pgy_month_roster(self, ym: str, codes) -> None:
-        month = self.storage.load_month(ym)
-        month["pgy_month_roster"] = [str(c) for c in codes]
-        self.storage.save_month(ym, month)
+        def _mut(month):
+            month["pgy_month_roster"] = [str(c) for c in codes]
+        self.update_month(ym, _mut)
 
     def set_pgy_apply_pref(self, ym: str, codes) -> None:
         """[2026-07-23 使用者] 設定本月「Apply 本科」PGY（至多 2 位）：自動排班時，
@@ -452,27 +492,30 @@ class RosterService:
         codes = [str(c) for c in codes]
         if len(codes) > 2:
             raise ValueError("Apply 本科優先最多選 2 位")
-        month = self.storage.load_month(ym)
-        old = month.get("pgy_apply_pref")
-        month["pgy_apply_pref"] = codes
-        self._audit(month, "pgy", f"{ym} apply_pref", old, codes, "manual")
-        self.storage.save_month(ym, month)
+        def _mut(month):
+            old = month.get("pgy_apply_pref")
+            month["pgy_apply_pref"] = codes
+            self._audit(month, "pgy", f"{ym} apply_pref", old, codes, "manual")
+        self.update_month(ym, _mut)
 
     def toggle_day_lock(self, ym: str, d: date, session: str) -> bool:
         """鎖定/解鎖某日某時段（鎖定後自動排班不重排該時段）。回傳新狀態。"""
-        month = self.storage.load_month(ym)
-        if month.get("finalized"):
-            raise FinalizedMonthError(f"{ym} 已定案（唯讀）")
-        locks = month.setdefault("day_locks", {}).setdefault(d.isoformat(), {})
-        new = not locks.get(session)
-        if new:
-            locks[session] = True
-        else:
-            locks.pop(session, None)
-            if not locks:
-                month["day_locks"].pop(d.isoformat(), None)
-        self.storage.save_month(ym, month)
-        return new
+        def _mut(month):
+            if month.get("finalized"):
+                raise FinalizedMonthError(f"{ym} 已定案（唯讀）")
+            locks = month.setdefault("day_locks", {}).setdefault(
+                d.isoformat(), {})
+            # ★狀態由【當下最新的月檔】決定★:重試時他機可能已經改過鎖定,
+            #   沿用第一次算出來的 new 會把對方的狀態原封蓋回去。
+            turn_on = not locks.get(session)
+            if turn_on:
+                locks[session] = True
+            else:
+                locks.pop(session, None)
+                if not locks:
+                    month["day_locks"].pop(d.isoformat(), None)
+            return turn_on
+        return self.update_month(ym, _mut)
 
     def is_day_locked(self, ym: str, d: date, session: str) -> bool:
         month = self.storage.load_month(ym)
@@ -481,18 +524,18 @@ class RosterService:
 
     def clear_unlocked_day(self, ym: str) -> None:
         """清除未鎖定的日排班時段（保留鎖定時段）。"""
-        month = self.storage.load_month(ym)
-        if month.get("finalized"):
-            raise FinalizedMonthError(f"{ym} 已定案（唯讀）")
-        day_locks = month.get("day_locks") or {}
-        kept: dict = {}
-        for iso, sessions in (month.get("day_slots") or {}).items():
-            for session, slots in sessions.items():
-                if (day_locks.get(iso) or {}).get(session):
-                    kept.setdefault(iso, {})[session] = slots
-        month["day_slots"] = kept
-        month["day_report"] = ""       # 舊報告已與清除後不符 → 一併清掉，避免誤導
-        self.storage.save_month(ym, month)
+        def _mut(month):
+            if month.get("finalized"):
+                raise FinalizedMonthError(f"{ym} 已定案（唯讀）")
+            day_locks = month.get("day_locks") or {}
+            kept: dict = {}
+            for iso, sessions in (month.get("day_slots") or {}).items():
+                for session, slots in sessions.items():
+                    if (day_locks.get(iso) or {}).get(session):
+                        kept.setdefault(iso, {})[session] = slots
+            month["day_slots"] = kept
+            month["day_report"] = ""   # 舊報告已與清除後不符 → 一併清掉，避免誤導
+        self.update_month(ym, _mut)
 
     # ── 本月門診停診（某診 VS 請假 → 該診間該期間不開）──────────────────
     def clinic_rooms_for_month(self, ym: str) -> list:
@@ -518,7 +561,7 @@ class RosterService:
         return out
 
     def set_clinic_closed(self, ym: str, room: str, start: date, end: date,
-                          sessions, closed: bool = True) -> None:
+                          sessions, closed: bool = True) -> dict:
         """在 [start, end] 的每個工作日、指定時段，將某跟診診間標記停診/恢復。
 
         寫入月檔 grid_overrides[iso][session]['closed_rooms']；month_grid 會據此把
@@ -532,59 +575,64 @@ class RosterService:
         cleared>0 時已一併清空 day_report（RS-03，舊報告已與清除後不符）；skipped_locked
         為停診撞到鎖定、未自動移除的時段（RS-05），交呼叫端提示使用者自行處理。
         """
-        month = self.storage.load_month(ym)
-        if month.get("finalized"):
-            raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能改門診")
         room = str(room)
         sessions = [s for s in (sessions or []) if s]
         # 以「模板原始開診」判斷該室哪些日/時段真的有開，只對那些寫 override，
         # 避免對本來就沒開這室的日子（週末/假日/非該診週幾/週三下午）塞垃圾。
         template = self.storage.load_clinic_template().get("template") or {}
         base = month_grid(ym, template, self.storage.holidays_set())
-        ov = month.setdefault("grid_overrides", {})
-        day_slots = month.get("day_slots") or {}
-        day_locks = month.get("day_locks") or {}
-        cleared = 0                 # [RS-03] 實際清掉的既有指派數
-        skipped_locked: list = []   # [RS-05] 撞到鎖定、未自動移除的停診時段
-        for d, day in base.items():
-            if d < start or d > end:
-                continue
-            iso = d.isoformat()
-            for session in sessions:
-                if room not in (day.get(session) or []):
-                    continue                      # 該日該時段本來就沒開這室 → 跳過
-                sess = ov.setdefault(iso, {}).setdefault(session, {})
-                lst = sess.setdefault("closed_rooms", [])
-                if closed and room not in lst:
-                    lst.append(room)
-                elif not closed and room in lst:
-                    lst.remove(room)
-                if not lst:                       # 清理空殼，grid_overrides 不留垃圾
-                    sess.pop("closed_rooms", None)
-                if not sess:
-                    ov[iso].pop(session, None)
-                # 停診 → 清掉既有班表中該診間的人。未鎖定才動(尊重鎖定契約);鎖定時段
-                # 若正排著該診間的人,不無聲刪除 → 收集回報使用者自行處理(RS-05)。
-                if closed:
-                    slots = (day_slots.get(iso) or {}).get(session)
-                    if slots and room in slots:
-                        if (day_locks.get(iso) or {}).get(session):
-                            skipped_locked.append((iso, session))
-                        else:
-                            slots.pop(room, None)
-                            cleared += 1
-            if iso in ov and not ov[iso]:
-                ov.pop(iso, None)
-        if cleared:
-            # [RS-03] 有清掉指派 → 舊 day_report 已與現況不符,一併清空避免幽靈化。
-            month["day_report"] = ""
-        # [RS-05] 停診/恢復是影響班表的動作,留 audit 痕跡。
-        self._audit(month, "day",
-                    f"closure:{room} {start.isoformat()}~{end.isoformat()} "
-                    f"{sorted(sessions)}",
-                    None, "closed" if closed else "open", "closure")
-        self.storage.save_month(ym, month)
-        return {"cleared": cleared, "skipped_locked": skipped_locked}
+
+        def _mut(month) -> dict:
+            if month.get("finalized"):
+                raise FinalizedMonthError(
+                    f"{ym} 已定案（唯讀）；解除定案後才能改門診")
+            ov = month.setdefault("grid_overrides", {})
+            day_slots = month.get("day_slots") or {}
+            day_locks = month.get("day_locks") or {}
+            cleared = 0                 # [RS-03] 實際清掉的既有指派數
+            skipped_locked: list = []   # [RS-05] 撞到鎖定、未自動移除的停診時段
+            for d, day in base.items():
+                if d < start or d > end:
+                    continue
+                iso = d.isoformat()
+                for session in sessions:
+                    if room not in (day.get(session) or []):
+                        continue                  # 該日該時段本來就沒開這室 → 跳過
+                    sess = ov.setdefault(iso, {}).setdefault(session, {})
+                    lst = sess.setdefault("closed_rooms", [])
+                    if closed and room not in lst:
+                        lst.append(room)
+                    elif not closed and room in lst:
+                        lst.remove(room)
+                    if not lst:                   # 清理空殼，grid_overrides 不留垃圾
+                        sess.pop("closed_rooms", None)
+                    if not sess:
+                        ov[iso].pop(session, None)
+                    # 停診 → 清掉既有班表中該診間的人。未鎖定才動(尊重鎖定契約);
+                    # 鎖定時段若正排著該診間的人,不無聲刪除 → 收集回報使用者
+                    # 自行處理(RS-05)。
+                    if closed:
+                        slots = (day_slots.get(iso) or {}).get(session)
+                        if slots and room in slots:
+                            if (day_locks.get(iso) or {}).get(session):
+                                skipped_locked.append((iso, session))
+                            else:
+                                slots.pop(room, None)
+                                cleared += 1
+                if iso in ov and not ov[iso]:
+                    ov.pop(iso, None)
+            if cleared:
+                # [RS-03] 有清掉指派 → 舊 day_report 已與現況不符,一併清空
+                # 避免幽靈化。
+                month["day_report"] = ""
+            # [RS-05] 停診/恢復是影響班表的動作,留 audit 痕跡。
+            self._audit(month, "day",
+                        f"closure:{room} {start.isoformat()}~{end.isoformat()} "
+                        f"{sorted(sessions)}",
+                        None, "closed" if closed else "open", "closure")
+            return {"cleared": cleared, "skipped_locked": skipped_locked}
+
+        return self.update_month(ym, _mut)
 
     def get_leaves(self, scope: str, ym: str, member_id: str) -> set:
         """讀某人某月請假日集合（適用任一 scope：r/vs/pgy/clerk）。"""
@@ -690,8 +738,9 @@ class RosterService:
         （月檔是 gate：定案擋下時計數帳本不得先行落地）。
         month=None → 自行 load；save_month 成功後 save_biopsy。"""
         own = month is None
+        _own_rev = None
         if own:
-            month = self.storage.load_month(ym)
+            month, _own_rev = self.storage.load_month_with_revision(ym)
         # ★[2026-08-02 補審 第1輪] 要拒絕就得在【改動 month 之前】拒絕★
         #   settle_biopsy 的守門原本要到函式尾端才拋,那時 month["saturday_biopsy"]
         #   與 report_r 都已經改過了;而呼叫端(set_cell / set_biopsy_person /
@@ -733,7 +782,10 @@ class RosterService:
                                  if base_rpt else section)
         settle_biopsy(book, ym, assign)
         if own:
-            self.storage.save_month(ym, month)   # 定案 → 拋例外,帳本不落地
+            # 自行 load 的那條路:寫回時 CAS —— 這份是【整份重算後的月檔】,
+            # 沿用舊快照寫回會把他機在重算期間的修改一起退回去。
+            self.storage.save_month(ym, month,
+                                    expected_revision=_own_rev)
             self.storage.save_biopsy(book)
         return assign, notes, book
 
@@ -765,7 +817,13 @@ class RosterService:
             raise ValueError(
                 f"排班結果 scope={result.scope!r} 與欲套用的 {scope!r} 不符，"
                 f"請用對應分頁的結果")
-        month = self.storage.load_month(ym)
+        # ★這條路徑【不重試】★(外審排班第 1 輪 P1-01):result 是照【當時的】
+        #   名單/請假/指定/鎖定算出來的整批結果,還會連動結算計數帳本 ——
+        #   盤上被他機換過之後重讀重套只會蓋掉對方,語意上該做的是拒絕重排。
+        #   (下面的 `_result_stale_reason` 擋的是【輸入】變了;CAS 擋的是
+        #   【月檔本身】被換過 —— 兩者不是同一件事:他機改的可能是日排班、
+        #   停診、audit 這些不進 SolveContext 的欄位。)
+        month, _month_rev = self.storage.load_month_with_revision(ym)
         if month.get("finalized"):
             raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能套用排班")
 
@@ -816,7 +874,7 @@ class RosterService:
         ledger = self.storage.load_ledger()
         settle_month(ledger, scope, ym, result.points_by_person)
         self.storage.save_ledger(ledger)
-        self.storage.save_month(ym, month)
+        self.storage.save_month(ym, month, expected_revision=_month_rev)
         if biopsy_book is not None:
             self.storage.save_biopsy(biopsy_book)
 
@@ -825,17 +883,7 @@ class RosterService:
                  person: "str | None", via: str = "manual") -> list:
         """改格（person=None → 清空並移除該格）。回傳改後 quick_validate 警告
         （不阻止儲存，設計文件 §16.4）。"""
-        month = self.storage.load_month(ym)
-        duty = month.setdefault(f"{scope}_duty", {})
         iso = d.isoformat()
-        old = duty.get(iso)
-        old_person = old.get("person") if old else None
-        if person is None:
-            duty.pop(iso, None)
-        else:
-            locked = bool(old.get("locked")) if old else False
-            duty[iso] = {"person": person, "locked": locked, "source": via}
-        self._audit(month, scope, iso, old_person, person, via)
         # [週六切片] 手改 R 週六值班 → 值班連動可能改變,同批重排(月檔存檔成功
         # 才寫計數帳本;重排失敗不擋手動改格)。
         # ★[2026-08-02 補審 P2] 週五也要觸發★ 2026-07-27 起切片人選在「次數平手」時
@@ -846,21 +894,39 @@ class RosterService:
         #   _biopsy_compute 會用到它(見 _prev_month_friday_duty)——只跳過不做,
         #   下月月檔/帳本/報告就會停在舊人選。我第一版只寫「不影響本月」就跳過,
         #   與同一批的跨月修正自相矛盾(補審第 2 輪抓到)。
-        biopsy_book = None
+        _holder: dict = {}
         _next_day = d + timedelta(days=1)
         _same_month_friday = d.weekday() == 4 and _next_day.month == d.month
         # ★週五的隔天【永遠】是週六 —— 要檢查的是跨月,不是星期幾。
         #   寫成 `_next_day.weekday() == 5` 會讓每一次月內的週五修改都額外重排並
         #   再存一次【本月】(_next_ym 就是本月)→ 重複快照與多餘 IO。★
         _cross_month_friday = d.weekday() == 4 and _next_day.month != d.month
-        if scope == "r" and (d.weekday() == 5 or _same_month_friday):
-            try:
-                _a, _n, biopsy_book = self.recompute_saturday_biopsy(ym, month)
-            except Exception:
-                logging.exception("[roster.service] set_cell 週六切片重排失敗（略過）")
-        self.storage.save_month(ym, month)
-        if biopsy_book is not None:
-            self.storage.save_biopsy(biopsy_book)
+
+        def _mut(month):
+            _holder.clear()                    # ★所有早退之前★(見 clear_unlocked)
+            duty = month.setdefault(f"{scope}_duty", {})
+            old = duty.get(iso)
+            old_person = old.get("person") if old else None
+            if person is None:
+                duty.pop(iso, None)
+            else:
+                locked = bool(old.get("locked")) if old else False
+                duty[iso] = {"person": person, "locked": locked, "source": via}
+            self._audit(month, scope, iso, old_person, person, via)
+            # ★切片重排也要在 mutator 裡★:它吃的是【這一份】月檔的 r_duty ——
+            #   放在外面就會拿第一次讀到的舊快照去算,重試之後月檔與切片帳本
+            #   互相對不上(而且沒有人看得出來)。
+            if scope == "r" and (d.weekday() == 5 or _same_month_friday):
+                try:
+                    _a, _n, _holder["book"] = self.recompute_saturday_biopsy(
+                        ym, month)
+                except Exception:
+                    logging.exception(
+                        "[roster.service] set_cell 週六切片重排失敗（略過）")
+
+        self.update_month(ym, _mut)
+        if _holder.get("book") is not None:
+            self.storage.save_biopsy(_holder["book"])
         # 月底週五(翌日是下月 1 號且為週六)→ 重排【下個月】。本月月檔已存好,
         # 這裡才動下月,兩者互不影響;下月沒有月檔就什麼都不做。
         if scope == "r" and _cross_month_friday:
@@ -897,25 +963,30 @@ class RosterService:
                 f"{ym} 早於切片帳本保留的最舊月份，該月的切片已無法重算，"
                 f"因此無法指定切片人選（指定了也不會生效）。"
                 f"如需調整請直接編輯 biopsy.json。")
-        month = self.storage.load_month(ym)
-        ov = month.setdefault("biopsy_override", {})
         iso = d.isoformat()
-        old = ov.get(iso)
-        if person is None:
-            ov.pop(iso, None)
-        else:
-            ov[iso] = str(person)
-        if not ov:
-            month.pop("biopsy_override", None)
-        self._audit(month, "r", f"biopsy:{iso}", old, person, "manual")
-        biopsy_book = None
-        try:
-            _a, _n, biopsy_book = self.recompute_saturday_biopsy(ym, month)
-        except Exception:
-            logging.exception("[roster.service] 手動指定切片後重排失敗（略過）")
-        self.storage.save_month(ym, month)     # 定案 → 拋例外,帳本不落地
-        if biopsy_book is not None:
-            self.storage.save_biopsy(biopsy_book)
+        _holder: dict = {}
+
+        def _mut(month):
+            _holder.clear()                    # ★所有早退之前★(見 clear_unlocked)
+            ov = month.setdefault("biopsy_override", {})
+            old = ov.get(iso)
+            if person is None:
+                ov.pop(iso, None)
+            else:
+                ov[iso] = str(person)
+            if not ov:
+                month.pop("biopsy_override", None)
+            self._audit(month, "r", f"biopsy:{iso}", old, person, "manual")
+            try:
+                _a, _n, _holder["book"] = self.recompute_saturday_biopsy(
+                    ym, month)
+            except Exception:
+                logging.exception(
+                    "[roster.service] 手動指定切片後重排失敗（略過）")
+
+        self.update_month(ym, _mut)            # 定案 → 拋例外,帳本不落地
+        if _holder.get("book") is not None:
+            self.storage.save_biopsy(_holder["book"])
         return self.quick_validate("r", ym)
 
     def clear_unlocked(self, scope: str, ym: str) -> None:
@@ -924,43 +995,66 @@ class RosterService:
         RF-20：取代 UI 逐格 set_cell（避免整月最多 31 次 load/save + 驗證 +
         GitSync commit 造成 UI 凍結與 commit 洪水）。
         """
-        month = self.storage.load_month(ym)
-        if month.get("finalized"):
-            raise FinalizedMonthError(f"{ym} 已定案（唯讀）")
-        duty = month.get(f"{scope}_duty") or {}
-        # 與逐格迴圈語意等價：只清「有 person 且未鎖」的格，保留鎖定格與無 person 殘格。
-        kept = {iso: c for iso, c in duty.items()
-                if c.get("locked") or not c.get("person")}
-        if kept == duty:                       # 沒有未鎖已排格 → 不 save，免空 commit
+        _holder: dict = {}
+
+        def _mut(month) -> bool:
+            # ★holder 一律在最前面清空★(外審排班 RS-1 第 1 輪 P1):試算那次
+            #   算出來的切片帳本若留在 holder 裡,而正式那次因為他機已經清完
+            #   而早退,最後就會把【試算時的】帳本寫進 biopsy.json —— 月檔是
+            #   他機的新狀態、切片次數卻退回舊的,之後的平衡全部歪掉。
+            #   清空要在【每一個早退之前】,不是在重排之前。
+            _holder.clear()
+            if month.get("finalized"):
+                raise FinalizedMonthError(f"{ym} 已定案（唯讀）")
+            duty = month.get(f"{scope}_duty") or {}
+            # 與逐格迴圈語意等價：只清「有 person 且未鎖」的格，保留鎖定格與無 person 殘格。
+            kept = {iso: c for iso, c in duty.items()
+                    if c.get("locked") or not c.get("person")}
+            if kept == duty:                   # 沒有未鎖已排格 → 不 save，免空 commit
+                return False
+            month[f"{scope}_duty"] = kept
+            month[f"report_{scope}"] = ""      # 舊報告已與清除後不符 → 一併清掉
+            self._audit(month, scope, "clear_unlocked", None, None, "clear")
+            # [週六切片] R 值班清除 → 切片依殘餘(鎖定)值班+次數平衡重排,與月檔同批
+            if scope == "r":
+                try:
+                    _a, _n, _holder["book"] = self.recompute_saturday_biopsy(
+                        ym, month)
+                except Exception:
+                    logging.exception(
+                        "[roster.service] clear_unlocked 週六切片重排失敗（略過）")
+            return True
+
+        probe, _rev = self.storage.load_month_with_revision(ym)
+        if not _mut(probe):                    # 試算:沒有東西可清就不要寫檔
             return
-        month[f"{scope}_duty"] = kept
-        month[f"report_{scope}"] = ""          # 舊報告已與清除後不符 → 一併清掉
-        self._audit(month, scope, "clear_unlocked", None, None, "clear")
-        # [週六切片] R 值班清除 → 切片依殘餘(鎖定)值班+次數平衡重排,與月檔同批
-        biopsy_book = None
-        if scope == "r":
-            try:
-                _a, _n, biopsy_book = self.recompute_saturday_biopsy(ym, month)
-            except Exception:
-                logging.exception("[roster.service] clear_unlocked 週六切片重排失敗（略過）")
-        self.storage.save_month(ym, month)
-        if biopsy_book is not None:
-            self.storage.save_biopsy(biopsy_book)
+        self.update_month(ym, _mut)
+        if _holder.get("book") is not None:
+            self.storage.save_biopsy(_holder["book"])
 
     def toggle_lock(self, scope: str, ym: str, d: date) -> bool:
         """切換鎖定（空格不可鎖）。回傳切換後的鎖定狀態。"""
-        month = self.storage.load_month(ym)
-        duty = month.setdefault(f"{scope}_duty", {})
         iso = d.isoformat()
-        cell = duty.get(iso)
-        if not cell or not cell.get("person"):
+        _holder: dict = {}
+
+        def _mut(month) -> bool:
+            _holder.clear()                    # ★所有早退之前★(見 clear_unlocked)
+            duty = month.setdefault(f"{scope}_duty", {})
+            cell = duty.get(iso)
+            if not cell or not cell.get("person"):
+                _holder["empty"] = True
+                return False
+            cell["locked"] = not cell.get("locked", False)
+            self._audit(month, scope, iso,
+                        f"locked={not cell['locked']}",
+                        f"locked={cell['locked']}", "lock")
+            return cell["locked"]
+
+        probe, _rev = self.storage.load_month_with_revision(ym)
+        _mut(probe)
+        if _holder.get("empty"):               # 空格不可鎖 → 不寫檔
             return False
-        cell["locked"] = not cell.get("locked", False)
-        self._audit(month, scope, iso,
-                    f"locked={not cell['locked']}",
-                    f"locked={cell['locked']}", "lock")
-        self.storage.save_month(ym, month)
-        return cell["locked"]
+        return self.update_month(ym, _mut)
 
     def set_leaves(self, scope: str, ym: str, member_id: str, dates) -> None:
         self._set_date_map(scope, ym, "leaves", member_id, dates)
@@ -1018,7 +1112,10 @@ class RosterService:
         ledger = self.storage.load_ledger()
         holiday = self.storage.load_holiday_duty()
         biopsy = self.storage.load_biopsy() if scope == "r" else None
-        months = {ym: self.storage.load_month(ym) for ym in yms}
+        _loaded = {ym: self.storage.load_month_with_revision(ym)
+                   for ym in yms}
+        months = {ym: mr[0] for ym, mr in _loaded.items()}
+        month_revs = {ym: mr[1] for ym, mr in _loaded.items()}
 
         # [codex] new_id 必須是「全新」代號：不可已出現在任何歷史資料——無論當【鍵】(帳本/切片
         # 計數/請假指定，覆蓋會蓋掉離職者紀錄) 或當【值】(值班/國定假日/last_weekend/週六切片/切片
@@ -1135,25 +1232,33 @@ class RosterService:
                 touched_months.append(ym)
 
         # ── Phase 3：逐檔寫入；任一失敗即回滾已寫的檔（不留半套改名）──────────────────
-        writes = [("config", cfg, snap["config"],
-                   lambda d: self.storage.save_config(d)),
-                  ("ledger", ledger, snap["ledger"],
-                   lambda d: self.storage.save_ledger(d))]
+        # 每一筆:(標籤, 新資料, 舊資料, 寫入函式, ★還原函式★)。
+        # ★還原不可以帶 CAS★:回滾時盤上那一份【就是我們剛寫進去的】,
+        #   拿原始 revision 去比一定不符 —— 那會讓回滾自己失敗、留下半套改名。
+        _cfg = lambda d: self.storage.save_config(d)          # noqa: E731
+        _led = lambda d: self.storage.save_ledger(d)          # noqa: E731
+        writes = [("config", cfg, snap["config"], _cfg, _cfg),
+                  ("ledger", ledger, snap["ledger"], _led, _led)]
         if holiday_changed:
-            writes.append(("holiday", holiday, snap["holiday"],
-                           lambda d: self.storage.save_holiday_duty(d)))
+            _hol = lambda d: self.storage.save_holiday_duty(d)  # noqa: E731
+            writes.append(("holiday", holiday, snap["holiday"], _hol, _hol))
         if biopsy_changed:
-            writes.append(("biopsy", biopsy, snap["biopsy"],
-                           lambda d: self.storage.save_biopsy(d)))
+            _bio = lambda d: self.storage.save_biopsy(d)      # noqa: E731
+            writes.append(("biopsy", biopsy or {}, snap["biopsy"],
+                           _bio, _bio))
         for ym in touched_months:
-            writes.append((f"month:{ym}", months[ym], snap["months"][ym],
-                           (lambda y: lambda d: self.storage.save_month(
-                               y, d, force=True))(ym)))
+            writes.append((
+                f"month:{ym}", months[ym], snap["months"][ym],
+                (lambda y, rev: lambda d: self.storage.save_month(
+                    y, d, force=True, expected_revision=rev))(
+                        ym, month_revs.get(ym, "")),
+                (lambda y: lambda d: self.storage.save_month(
+                    y, d, force=True))(ym)))
         done = []
         try:
-            for _label, new_data, old_data, save_fn in writes:
+            for _label, new_data, old_data, save_fn, restore_fn in writes:
                 save_fn(new_data)
-                done.append((old_data, save_fn))
+                done.append((old_data, restore_fn))
         except Exception:
             logging.exception("[roster.service] 改名寫入失敗，回滾已寫的 %d 檔", len(done))
             for old_data, save_fn in reversed(done):
@@ -1235,15 +1340,19 @@ class RosterService:
                 # 半套狀態）；UI 會攔截顯示錯誤並還原定案勾選。
                 if m0.get(f"{scope}_duty") or scope in settled:
                     self.resettle_from_duty(scope, ym)
-        month = self.storage.load_month(ym)
+        month, _rev = self.storage.load_month_with_revision(ym)
         month["finalized"] = bool(on)
         self._audit(month, "-", ym, None, f"finalized={bool(on)}", "finalize")
         # 定案路徑上方已經 preflight_required_backup 過（快照就在那時留下的）。
         # 這裡若再要求一次，兩次之間檔案被鎖住就仍會留下「帳本已重算、月份沒定案」
         # 的半套 —— 預檢的意義就沒了（外審第 10 輪）。
         from cmuh_common.roster.storage import BEST_EFFORT_BACKUP
+        # ★定案也要 CAS★:它把整份月檔寫回去(含 duty/day_slots/…),
+        #   他機在這中間存進來的修改會被一起蓋掉,而定案的結果是唯讀 ——
+        #   之後只能靠解除定案才救得回來。被搶先就拒絕,重來一次即可。
         self.storage.save_month(ym, month, force=True,
-                                backup=BEST_EFFORT_BACKUP if on else None)
+                                backup=BEST_EFFORT_BACKUP if on else None,
+                                expected_revision=_rev)
 
     # ── 定案 PDF 留底 ───────────────────────────────────────────────────
     def build_finalize_pdf_sections(self, ym: str) -> list:
@@ -1408,16 +1517,17 @@ class RosterService:
 
     # ── 內部 ────────────────────────────────────────────────────────────
     def _set_date_map(self, scope, ym, key, member_id, dates) -> None:
-        month = self.storage.load_month(ym)
-        table = month.setdefault(key, {}).setdefault(scope, {})
         days = sorted(d.isoformat() for d in (dates or set()))
-        if days:
-            table[str(member_id)] = days
-        else:
-            table.pop(str(member_id), None)
-        self._audit(month, scope, f"{key}:{member_id}", None,
-                    ",".join(days) or "（清空）", key)
-        self.storage.save_month(ym, month)
+
+        def _mut(month):
+            table = month.setdefault(key, {}).setdefault(scope, {})
+            if days:
+                table[str(member_id)] = days
+            else:
+                table.pop(str(member_id), None)
+            self._audit(month, scope, f"{key}:{member_id}", None,
+                        ",".join(days) or "（清空）", key)
+        self.update_month(ym, _mut)
 
     def _weekend_integrity(self, ctx: SolveContext, scope: str, ym: str) -> list:
         """對每個值班區塊，檢查現有排班是否「同一人、無遺漏」。破了 → warn。"""

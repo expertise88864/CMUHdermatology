@@ -75,6 +75,15 @@ class GitSyncStorage(RosterStorage):
         self._gitignore_ok = True
         self._push_lock = threading.Lock()        # 只管 _push_timer 欄位
         self._git_lock = threading.RLock()        # 所有 git working-tree/refs 操作
+        # ★工作樹【內容】的鎖★(外審排班第 1 輪 P1-01):存檔的
+        #   「比對 revision → 寫入」必須與 merge/rebase 互斥,否則
+        #   CAS 通過之後、寫入之前,背景 pull 還是能把檔案換掉。
+        #   ★刻意不是 `_git_lock`★:那把鎖也涵蓋 fetch/push 這些網路
+        #   動作(可能 30 秒),存檔不該被網路卡住 —— 那正是現行
+        #   「拿不到鎖就先寫盤、延後 commit」設計要避免的事。
+        #   鎖序固定:pull/push 先 `_git_lock` 再 `_tree_lock`;存檔只在
+        #   寫入時持 `_tree_lock`,放掉之後才去拿 `_git_lock` commit。
+        self._tree_lock = threading.RLock()
         self._push_timer: "threading.Timer | None" = None
         self._stop_evt = threading.Event()
         self._pull_thread: "threading.Thread | None" = None
@@ -292,7 +301,8 @@ class GitSyncStorage(RosterStorage):
             if f.returncode != 0:
                 self._set_state("offline", (f.stderr or f.stdout).strip())
                 return
-            m = self._git("merge", "--ff-only", "FETCH_HEAD")
+            with self._tree_lock:               # 換工作樹內容 → 與存檔互斥
+                m = self._git("merge", "--ff-only", "FETCH_HEAD")
             if m.returncode == 0:
                 self._set_state("ok")
                 after = self._rev_parse("HEAD")
@@ -309,7 +319,10 @@ class GitSyncStorage(RosterStorage):
     def _save(self, path: str, data: dict, **kw) -> None:
         # **kw 透傳（目前是 backup=REQUIRE_BACKUP/BEST_EFFORT）——本層只加 git
         # commit/push，不干涉基底層的寫入政策；基底若拒寫會直接拋，這裡不會走到。
-        super()._save(path, data, **kw)          # 先照常原子寫入（write-through，不卡）
+        # ★CAS 與寫入同在工作樹鎖內★:比對「盤上還是不是我讀到的那一份」
+        #   之後,背景 merge 不可以插進來把檔案換掉再讓我覆寫。
+        with self._tree_lock:
+            super()._save(path, data, **kw)      # 原子寫入（write-through，不卡網路）
         if not (self._git_ok and self._remote_sync):
             return
         # 拿不到 git 鎖＝背景正在 push/pull：檔案已寫盤，這次先略過 commit，
@@ -518,12 +531,17 @@ class GitSyncStorage(RosterStorage):
                 if f.returncode != 0:
                     self._set_state("offline", (f.stderr or f.stdout).strip())
                     return False
-                m = self._git("merge", "--ff-only", "FETCH_HEAD")
+                with self._tree_lock:           # 換工作樹內容 → 與存檔互斥
+                    m = self._git("merge", "--ff-only", "FETCH_HEAD")
+                    if m.returncode != 0:
+                        # 分歧：先試 rebase（兩台改不同檔可自動復原）
+                        rb = self._git("pull", "--rebase", remote, branch)
+                    else:
+                        rb = None
                 if m.returncode != 0:
-                    # 分歧：先試 rebase（兩台改不同檔可自動復原）
-                    rb = self._git("pull", "--rebase", remote, branch)
-                    if rb.returncode != 0:
-                        self._git("rebase", "--abort")   # 同檔衝突 → 交人工
+                    if rb is not None and rb.returncode != 0:
+                        with self._tree_lock:
+                            self._git("rebase", "--abort")   # 同檔衝突 → 交人工
                         self._set_state("diverged", (rb.stderr or rb.stdout).strip())
                         return False
                 after = self._rev_parse("HEAD")

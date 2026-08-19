@@ -579,7 +579,9 @@ def test_rename_member_rolls_back_on_write_failure(tmp_path, monkeypatch):
     # 讓「寫月檔」那一步炸（config/ledger 已寫），驗證兩者被回滾
     real_save_month = st.save_month
 
-    def boom(ym, data, force=False):
+    def boom(ym, data, force=False, **kw):
+        # **kw:生產端現在會傳 expected_revision(CAS)——替身要跟著生產的
+        # 呼叫形狀走,否則它擋下的是 TypeError,不是被測的那條回滾路徑。
         raise OSError("disk full (simulated)")
     monkeypatch.setattr(st, "save_month", boom)
 

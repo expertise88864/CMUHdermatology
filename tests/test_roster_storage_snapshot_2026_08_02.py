@@ -103,7 +103,13 @@ def test_snapshot_lives_in_the_single_write_exit(st):
     import inspect
 
     from cmuh_common.roster import storage as mod
-    assert "self._snapshot(" in inspect.getsource(mod.RosterStorage._save)
+    # ★守衛要跟著「寫入出口」走,不要被重構打敗★:`_save` 現在持鎖後把本體
+    #   交給 `_save_body`(CAS 與寫入必須在同一個臨界區)—— 兩者合起來【就是】
+    #   那個唯一出口,所以在兩者的原始碼聯集裡找。
+    _exit_src = (inspect.getsource(mod.RosterStorage._save)
+                 + inspect.getsource(mod.RosterStorage._save_body))
+    assert "self._snapshot(" in _exit_src
+    assert "self._save_body(" in inspect.getsource(mod.RosterStorage._save),         "★_save 必須仍是唯一入口★ 本體換名字就要跟著改這條守衛"
     for name, fn in vars(mod.RosterStorage).items():
         if name.startswith("save_") and callable(fn):
             assert "_snapshot(" not in inspect.getsource(fn), \
