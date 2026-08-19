@@ -493,13 +493,20 @@ class RosterStorage:
         raw = _load_json(self._path("pending_settle.json")).get("pending")
         return [x for x in (raw or []) if isinstance(x, dict)]
 
-    def mark_pending_settle(self, scope: str, ym: str) -> None:
-        """落地之前記下意圖(冪等:同 scope+月份不重複記)。"""
+    def mark_pending_settle(self, scope: str, ym: str) -> bool:
+        """落地之前記下意圖(冪等:同 scope+月份不重複記)。
+
+        → ★這一筆是不是【這一次】記下的★(外審排班 RS-10 第 1 輪 P1):
+        冪等表示「已經有了就不再記」,而那筆既有的意圖屬於【另一個還沒完成的
+        操作】。呼叫端如果不分青紅皂白把它清掉,就等於替別人宣稱「已經一致
+        了」—— 那個未完成的結算從此不會再被收斂。
+        """
         cur = self.load_pending_settles()
         if any(x.get("scope") == scope and x.get("ym") == ym for x in cur):
-            return
+            return False
         cur.append({"scope": str(scope), "ym": str(ym), "ts": _now_stamp()})
         self._save(self._path("pending_settle.json"), {"pending": cur})
+        return True
 
     def clear_pending_settle(self, scope: str, ym: str) -> None:
         """兩個檔都寫成功之後清掉那一筆意圖。"""

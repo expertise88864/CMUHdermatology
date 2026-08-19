@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import json
@@ -677,6 +678,37 @@ class RosterService:
         assert last is not None
         raise last
 
+    @contextlib.contextmanager
+    def settle_intent(self, scope: str, ym: str):
+        """★兩個檔的寫入之間斷電/當掉,要留得下線索★(外審排班 RS-10 / P2-02)
+
+        月檔與 `biopsy.json`(或帳本)是兩個檔。同一個 `write_barrier` 擋得住
+        背景 Git merge 與其他執行緒,★擋不住行程被砍、停電、或第二次寫入的
+        I/O 失敗★ —— 那會留下「月檔已換成新的 saturday_biopsy、biopsy.json
+        還是舊的」,而且沒有任何紀錄。
+        意圖只記 (scope, 月份):帳本與切片計數都是【可以從月檔重算出來的
+        衍生物】,下次開程式的 `reconcile_pending_settles` 會用月檔把它們
+        重建到一致(收斂不了就保留意圖並告警,不可以靜默清掉)。
+
+        ★離開時只有在沒有例外的情況下才清★:所以這裡刻意不寫 try/finally。
+        ★而且只清掉【這一次記下的】那一筆★(外審排班 RS-10 第 1 輪 P1):
+        `mark_pending_settle` 是冪等的 —— 已經有一筆的話它不會再記,而那一筆
+        屬於【另一個還沒完成的操作】(例如上一次 accept 寫完月檔、帳本卻寫失敗)。
+        這條手動路徑★只重算切片,不會重算帳本★,把別人的意圖一併清掉等於替它
+        宣稱「已經一致了」,開程式時的收斂從此不會再跑,而帳本就一直錯下去
+        (它還是下個月公平目標的基準)。
+        """
+        mine = self.storage.mark_pending_settle(scope, ym)
+        yield
+        if mine:
+            self.storage.clear_pending_settle(scope, ym)
+
+    def _biopsy_intent(self, scope: str, ym: str):
+        """R 才會寫切片帳本 → 只有 R 需要這一筆意圖(見 `settle_intent`)。"""
+        if scope != "r":
+            return contextlib.nullcontext()
+        return self.settle_intent("r", ym)
+
     def _update_canonical(self, name: str, save, mutator, *,
                           retries: int = 4):
         """讀最新的正典檔 → 套上【這一個窄改動】→ CAS 寫回;被搶先就重讀重套。
@@ -1200,9 +1232,14 @@ class RosterService:
         if own:
             # 自行 load 的那條路:寫回時 CAS —— 這份是【整份重算後的月檔】,
             # 沿用舊快照寫回會把他機在重算期間的修改一起退回去。
-            self.storage.save_month(ym, month,
-                                    expected_revision=_own_rev)
-            self.storage.save_biopsy(book, expected_revision=book_rev)
+            # ★兩個檔之間留一筆意圖★(RS-10):中間被砍掉的話,月檔已經是新的
+            #   saturday_biopsy、biopsy.json 還是舊的 —— 而這條路的呼叫端
+            #   (請假變動、重新結算、跨月連動)還會把例外整個吞掉,不留紀錄
+            #   就等於那個不一致永遠留在磁碟上。
+            with self.settle_intent("r", ym):
+                self.storage.save_month(ym, month,
+                                        expected_revision=_own_rev)
+                self.storage.save_biopsy(book, expected_revision=book_rev)
         return assign, notes, book, book_rev
 
     def render_report(self, scope: str, ym: str, result: SolveResult) -> str:
@@ -1394,13 +1431,17 @@ class RosterService:
                     logging.exception(
                         "[roster.service] set_cell 週六切片重排失敗（略過）")
 
+        # ★只有 R 會寫切片帳本★(外審排班 RS-10 第 1 輪 P1):VS 改格不碰
+        #   biopsy.json,記一筆 "r" 的意圖只會讓開程式時去重算一個沒有壞掉的
+        #   東西;更重要的是,意圖的鍵是 (scope, 月份),張冠李戴會讓「誰的義務」
+        #   說不清楚。
         # ★月檔與切片帳本要在同一個臨界區內★(外審排班 RS-5 第 2 輪 P1-2):
         #   分開做的話,兩者之間他機更新了 biopsy.json → CAS 正確擋下切片帳本
         #   的寫入,但月檔的新值班/saturday_biopsy 早就落地了 —— 兩個檔當場
         #   互相矛盾,而且沒有任何人會發現(之後的切片平衡全部以錯的次數算)。
         #   臨界區內別人寫不進 biopsy.json,重排時取的 revision 到寫入為止
         #   都還有效,CAS 因此不會在這裡被觸發。
-        with self.storage.write_barrier():
+        with self.storage.write_barrier(), self._biopsy_intent(scope, ym):
             self.update_month(ym, _mut)
             if _holder.get("book") is not None:
                 self.storage.save_biopsy(
@@ -1466,7 +1507,7 @@ class RosterService:
              _holder["rev"]) = self.recompute_saturday_biopsy(ym, month)
 
         # ★月檔與切片帳本在同一個臨界區內★(見 set_cell 的同一條說明)
-        with self.storage.write_barrier():
+        with self.storage.write_barrier(), self.settle_intent("r", ym):
             self.update_month(ym, _mut)        # 定案 → 拋例外,帳本不落地
             if _holder.get("book") is not None:
                 self.storage.save_biopsy(
@@ -1513,8 +1554,9 @@ class RosterService:
         probe, _rev = self.storage.load_month_snapshot(ym)
         if not _mut(probe):                    # 試算:沒有東西可清就不要寫檔
             return
-        # ★月檔與切片帳本在同一個臨界區內★(見 set_cell 的同一條說明)
-        with self.storage.write_barrier():
+        # ★月檔與切片帳本在同一個臨界區內★(見 set_cell 的同一條說明);
+        #   ★而且兩個檔之間要留一筆意圖★(RS-10):臨界區擋不住行程被砍。
+        with self.storage.write_barrier(), self._biopsy_intent(scope, ym):
             self.update_month(ym, _mut)
             if _holder.get("book") is not None:
                 self.storage.save_biopsy(
