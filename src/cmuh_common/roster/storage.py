@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import glob
 import hashlib
 import json
@@ -142,6 +143,23 @@ class RosterStorage:
         #   正是這一批要消滅的失效模式,只是換成同一個 process 內。
         #   (跨機由 revision 本身擋;同機雙開由單例互斥擋。)
         self._write_lock = threading.RLock()
+
+    @contextlib.contextmanager
+    def write_barrier(self):
+        """在這個區塊內,★盤上的資料不會被背景同步換掉★。
+
+        (外審排班 RS-2 第 1 輪 P1)月檔的 CAS 只看得到月檔;而「求解結果還配不
+        配得上現況」還要看月檔【之外】的檔案(config 名單、門診模板、Clerk 梯次、
+        年度假日、上月檔)。驗證與寫入之間若讓背景 pull 插進來合併那些檔,
+        指紋比對用的是合併前的資料、月檔 revision 又沒變 —— 兩道關卡都通過,
+        舊解照樣落地(請假的人被排上、剛停診的診間又有人)。
+        所以「重建輸入 → 比指紋 → CAS 寫入」要整段在同一個臨界區內。
+
+        基底層沒有背景同步,持寫入鎖即可;GitSync 覆寫它,另外持工作樹鎖,
+        並把 git commit 延到★離開臨界區之後★(維持既有鎖序,見該處說明)。
+        """
+        with self._write_lock:
+            yield
 
     # ── 內部共用 ─────────────────────────────────────────────────────────
     def _path(self, name: str) -> str:

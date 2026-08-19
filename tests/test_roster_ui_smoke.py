@@ -347,7 +347,9 @@ def test_day_tab_auto_accept_flow(root, tmp_path):
     tab = DayScheduleTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
     root.update()
-    ds, _log, _w = svc.run_day_solve(YM)
+    _res = svc.run_day_solve(YM)
+    ds, _log, _w = (
+        _res.day_slots, _res.log, _res.warnings)
     svc.accept_day_solution(YM, ds)
     tab.refresh()                                          # 重繪不炸
     mon = svc.storage.load_month(YM)["day_slots"]["2026-08-03"]["上午"]

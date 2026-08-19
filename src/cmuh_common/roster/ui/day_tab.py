@@ -346,12 +346,12 @@ class DayScheduleTab(ttk.Frame):
         if self._finalized:
             return
         try:
-            day_slots, log, warnings = self.service.run_day_solve(self.app.ym)
+            res = self.service.run_day_solve(self.app.ym)
         except Exception as e:  # noqa: BLE001
             logging.exception("[roster.ui] 日排班失敗")
             messagebox.showerror("排班失敗", f"排班時發生錯誤：\n{e}")
             return
-        self._preview_and_accept(day_slots, log, warnings)
+        self._preview_and_accept(res)
 
     def _format_report(self, log, warnings, day_slots=None) -> str:
         base = ("【警告】\n" + ("\n".join(f"  ⚠ {w}" for w in warnings) or "  （無）")
@@ -366,7 +366,11 @@ class DayScheduleTab(ttk.Frame):
             logging.debug("[roster.ui] 報告統計段生成失敗（略過）", exc_info=True)
         return base
 
-    def _preview_and_accept(self, day_slots, log, warnings) -> None:
+    def _preview_and_accept(self, res) -> None:
+        # ★整個 res 都要帶進來(不是只帶 day_slots)★:套用時要用它問
+        #   一句「這份結果還配得上現在的資料嗎」—— 預覽視窗可以開很久,
+        #   期間他機的請假/梯次/停診/名單都可能已經同步進來(外審 P1-02)。
+        day_slots, log, warnings = res.day_slots, res.log, res.warnings
         # [codex P2] 統計用「鎖定合併後」的內容——與 accept_day_solution 落地的完全一致
         # (鎖定日掉出開診格網時 solver 輸出可能缺該時段,accept 會補回)。
         try:
@@ -389,7 +393,8 @@ class DayScheduleTab(ttk.Frame):
         def apply():
             try:
                 # 落地時一併存下當下報告，供「報告」鈕顯示（與畫面/存檔一致）
-                self.service.accept_day_solution(self.app.ym, day_slots, report)
+                self.service.accept_day_solution(
+                    self.app.ym, day_slots, report, expect=res)
             except Exception as e:  # noqa: BLE001
                 messagebox.showerror("套用失敗", str(e), parent=win)
                 return

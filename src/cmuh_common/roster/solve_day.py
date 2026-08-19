@@ -399,6 +399,48 @@ class DaySolveInput:
     apply_pref: set = field(default_factory=set)  # Apply 本科 PGY（101 週二/五平手優先）
 
 
+def day_input_fingerprint(inp: "DaySolveInput") -> str:
+    """這一次求解【吃到的全部輸入】的識別。內容一樣就一樣,任一項變了就不同。
+
+    ★逐欄列舉會腐爛,所以走 dataclass 的欄位本身★(外審排班第 1 輪 P1-02):
+    PGY/Clerk 的求解結果在預覽視窗裡可能停留很久,期間他機同步進來的請假、
+    Clerk 梯次、停診、門診模板、PGY 名單、已鎖定時段…… 任何一項變了,舊解
+    再套用下去就是把最新狀態整批蓋掉(請假的人又被排上、剛停診的診間又有人)。
+    R/VS 那一側是重建 context 後逐項驗(`_result_stale_reason`);日排班的輸入
+    是一個 dataclass,直接對【整個】輸入取指紋更難漏 —— 日後有人加一個新欄位,
+    它自動被涵蓋,不必記得回來改這裡。
+
+    ★不認得的型別要出聲★:靜默塞個 `repr()` 會讓指紋要嘛不穩定(每次不同 →
+    永遠說過期),要嘛盲目(看不到那一欄的變化 → 這條守衛等於不存在)。
+    """
+    import dataclasses  # noqa: PLC0415
+    import hashlib      # noqa: PLC0415
+    import json         # noqa: PLC0415
+
+    def _norm(v):
+        if v is None or isinstance(v, (str, int, float, bool)):
+            return v
+        if isinstance(v, date):
+            return v.isoformat()
+        if isinstance(v, dict):
+            return {str(k): _norm(x)
+                    for k, x in sorted(v.items(), key=lambda kv: str(kv[0]))}
+        if isinstance(v, (set, frozenset)):
+            return sorted(json.dumps(_norm(x), ensure_ascii=False,
+                                     sort_keys=True) for x in v)
+        if isinstance(v, (list, tuple)):
+            return [_norm(x) for x in v]
+        if dataclasses.is_dataclass(v) and not isinstance(v, type):
+            return {f.name: _norm(getattr(v, f.name))
+                    for f in dataclasses.fields(v)}
+        raise TypeError(
+            f"求解輸入含無法正規化的型別 {type(v).__name__} —— 指紋不可以"
+            f"靜默略過它(那等於這一欄的變動看不見)")
+
+    payload = json.dumps(_norm(inp), ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _avail(roster: list, leave_map: dict, d: date) -> list:
     return sorted(p for p in roster if d not in (leave_map.get(p) or set()))
 

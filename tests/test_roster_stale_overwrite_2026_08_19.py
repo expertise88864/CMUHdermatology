@@ -411,3 +411,178 @@ class TestConcurrentWritersDoNotLoseUpdates:
         for d in (1, 2, 3, 4):
             iso = f"2026-09-0{d}"
             assert iso in duty, f"★{iso} 的修改在併發下不見了★ {sorted(duty)}"
+
+
+class TestTheDaySolveResultCannotBeAppliedStale:
+    """[批次RS-2 / 排班審 P1-02] PGY/Clerk 的求解結果沒有 stale gate 時,預覽
+    視窗開著的期間他機同步進來的變更會被舊解整批蓋掉:請假的人又被排上、
+    剛加入的 Clerk 消失、剛停診的診間又有人、他機手動調整的未鎖時段被洗掉。
+    R/VS 那一側早就會「套用前重建 context 再驗」——這裡補上同一個模式。"""
+
+    def _svc(self, st):
+        st.save_clinic_template({"template": {
+            "一": {"上午": ["101"], "下午": ["101"]},
+            "二": {"上午": ["101"], "下午": ["101"]},
+            "三": {"上午": ["101"], "下午": []},
+            "四": {"上午": ["101"], "下午": ["101"]},
+            "五": {"上午": ["101"], "下午": ["101"]},
+        }})
+        st.save_config({"r_members": [], "vs_members": [],
+                        "pgy_members": [{"id": "P1"}, {"id": "P2"}],
+                        "clerk_members": [{"id": "C1"}]})
+        return RosterService(st)
+
+    def _solved(self, svc, ym="2026-09"):
+        svc.storage.save_month(ym, {"pgy_month_roster": ["P1", "P2"]})
+        return svc.run_day_solve(ym)
+
+    def test_a_remote_leave_change_rejects_the_apply(self, st):
+        svc = self._svc(st)
+        res = self._solved(svc)
+        svc.set_leaves("pgy", "2026-09", "P1", {date(2026, 9, 3)})
+        with pytest.raises(ValueError, match="已過期"):
+            svc.accept_day_solution("2026-09", res.day_slots, expect=res)
+
+    def test_a_remote_pgy_roster_change_rejects_the_apply(self, st):
+        svc = self._svc(st)
+        res = self._solved(svc)
+        svc.set_pgy_month_roster("2026-09", ["P1"])
+        with pytest.raises(ValueError, match="已過期"):
+            svc.accept_day_solution("2026-09", res.day_slots, expect=res)
+
+    def test_a_remote_clinic_closure_rejects_the_apply(self, st):
+        svc = self._svc(st)
+        res = self._solved(svc)
+        svc.set_clinic_closed("2026-09", "101", date(2026, 9, 7),
+                              date(2026, 9, 7), ["上午"])
+        with pytest.raises(ValueError, match="已過期"):
+            svc.accept_day_solution("2026-09", res.day_slots, expect=res)
+
+    def test_a_remote_clerk_batch_change_rejects_the_apply(self, st):
+        svc = self._svc(st)
+        res = self._solved(svc)
+        st.save_clerk_batches([{"id": "B1", "start_monday": "2026-08-31",
+                                "members": ["C1"]}])
+        with pytest.raises(ValueError, match="已過期"):
+            svc.accept_day_solution("2026-09", res.day_slots, expect=res)
+
+    def test_a_remote_unlocked_day_slot_change_rejects_the_apply(self, st):
+        """他機【手動】調整了未鎖定的時段 —— 舊解會把它洗掉。
+        (這一項不在 solver 輸入的指紋裡,是靠月檔 revision 擋下來的。)"""
+        svc = self._svc(st)
+        res = self._solved(svc)
+        svc.set_day_slot("2026-09", date(2026, 9, 10), "上午", "101", ["P2"])
+        with pytest.raises(ValueError, match="已過期"):
+            svc.accept_day_solution("2026-09", res.day_slots, expect=res)
+
+    def test_an_unchanged_state_still_applies(self, st):
+        """★反方向★:什麼都沒變就要套得下去 —— 否則這個閘門等於停用排班。"""
+        svc = self._svc(st)
+        res = self._solved(svc)
+        svc.accept_day_solution("2026-09", res.day_slots, expect=res)
+        assert st.load_month("2026-09")["day_slots"] == res.day_slots
+
+    def test_the_ui_passes_the_result_to_the_gate(self):
+        """★沒有呼叫端就等於沒有這個閘門★:UI 的「套用」必須把 result 傳進去
+        (只在 service 有參數、UI 不傳,是最容易靜默退化的形狀)。"""
+        import inspect
+
+        from cmuh_common.roster.ui import day_tab
+        src = inspect.getsource(day_tab.DayScheduleTab)
+        i = src.index("accept_day_solution(")
+        assert "expect=" in src[i:i + 200], \
+            "★UI 套用時沒有把求解結果交給 stale gate★"
+
+
+class TestTheValidationAndTheWriteAreOneCriticalSection:
+    """[RS-2 第 1 輪 P1] 月檔的 CAS 只看得到月檔;而「求解結果配不配得上現況」
+    還要看月檔【以外】的檔案(名單/模板/Clerk 梯次/假日)。驗證與寫入之間若讓
+    背景同步插進來合併那些檔,指紋比的是合併前的資料、月檔 revision 又沒變 ——
+    兩道關卡都通過,舊解照樣落地。"""
+
+    def test_an_external_file_cannot_change_between_check_and_write(self, st):
+        """★用真的執行緒量★:臨界區持有期間,他機的外部檔更新必須進不來。"""
+        done: list = []
+        started = threading.Event()
+
+        def _other_machine():
+            started.set()
+            st.save_clerk_batches([{"id": "B9", "start_monday": "2026-08-31",
+                                    "members": ["C9"]}])
+            done.append(True)
+
+        with st.write_barrier():
+            t = threading.Thread(target=_other_machine)
+            t.start()
+            assert started.wait(timeout=5)
+            t.join(timeout=0.6)
+            assert not done, \
+                "★臨界區內,月檔以外的輸入仍然被換掉了(驗證與寫入之間有縫)★"
+        t.join(timeout=10)
+        assert done, "臨界區結束後,對方的寫入要能完成(不是被永久擋住)"
+
+    def test_both_accept_paths_run_inside_the_barrier(self):
+        """★結構守衛★:兩條 accept 都必須把「驗證+寫入」放進臨界區 ——
+        只在其中一條做,另一條就是同一個缺陷的複製品。"""
+        import inspect
+
+        from cmuh_common.roster.service import RosterService
+        for name in ("accept_day_solution", "accept_solution"):
+            src = inspect.getsource(getattr(RosterService, name))
+            assert "self.storage.write_barrier()" in src, \
+                f"★{name} 沒有在臨界區內驗證+寫入★"
+
+    def test_the_git_commit_happens_after_the_barrier_is_released(
+            self, tmp_path):
+        """★鎖序不可以反過來★:臨界區持有工作樹鎖,若在裡面去拿 git 鎖,就會
+        與正在 pull 的背景執行緒(先 git 鎖、再工作樹鎖)互相等待 —— 死鎖。
+
+        ★量的是行為,不是原始碼裡有沒有那個字串★:條件被改成 `if False:` 時
+        字串照樣還在,那種守衛什麼都保證不了(第一版就是這樣寫的)。
+        """
+        import subprocess
+
+        from cmuh_common.roster.gitsync_storage import GitSyncStorage
+        work = tmp_path / "work"
+        subprocess.run(["git", "init", str(work)], capture_output=True,
+                       check=True)
+        for k, v in (("user.email", "t@t"), ("user.name", "tester")):
+            subprocess.run(["git", "-C", str(work), "config", k, v],
+                           capture_output=True, check=True)
+        gst = GitSyncStorage(str(work), pull_interval_sec=0)
+
+        real_lock = gst._git_lock
+        state = {"in_barrier": False, "bad": False}
+
+        class _Watch:
+            def acquire(self, *a, **kw):
+                if state["in_barrier"]:
+                    state["bad"] = True
+                return real_lock.acquire(*a, **kw)
+
+            def release(self):
+                return real_lock.release()
+
+            def __enter__(self):
+                self.acquire()
+                return self
+
+            def __exit__(self, *a):
+                self.release()
+
+        gst._git_lock = _Watch()                     # type: ignore
+        try:
+            with gst.write_barrier():
+                state["in_barrier"] = True
+                gst.save_config({"r_members": [{"id": "X"}]})
+                state["in_barrier"] = False
+            assert not state["bad"], \
+                "★臨界區內就去拿 git 鎖 —— 與 pull 反序,會死鎖★"
+        finally:
+            gst._git_lock = real_lock                # type: ignore
+        # 離開臨界區之後,那一筆變更仍要真的進 git(不可以被吞掉)
+        log = subprocess.run(["git", "-C", str(work), "log", "--name-only",
+                              "--pretty=format:"], capture_output=True,
+                             text=True)
+        assert "config.json" in (log.stdout or ""), \
+            "★延後的 commit 沒有補上 —— 變更留在本機、永遠不會同步出去★"

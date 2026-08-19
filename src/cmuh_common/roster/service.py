@@ -24,6 +24,7 @@ import logging
 import os
 import time
 from datetime import date, timedelta
+from typing import NamedTuple
 
 from cmuh_common.roster.calendar_colors import week_colors_for_year
 from cmuh_common.roster.clinic_grid import month_grid
@@ -33,6 +34,7 @@ from cmuh_common.roster.model import (
     roc,
 )
 from cmuh_common.roster.solve_day import (
+    day_input_fingerprint,
     BIOPSY, PHOTO, REST, TREATMENT, DaySolveInput, month_solve_day,
     person_course_stats,
 )
@@ -71,6 +73,19 @@ def _parse_date_map(raw: dict) -> dict:
                 logging.warning("[roster.service] 壞日期略過 %s=%r", mid, iso)
         out[str(mid)] = days
     return out
+
+
+class DaySolveResult(NamedTuple):
+    """一次日排班求解的結果★與它所依據的輸入的識別★。
+
+    前三個欄位是原本的回傳值;後兩個讓 `accept_day_solution` 能問一句
+    「這份結果還配得上現在的資料嗎」——沒有它們,舊解可以在任何時候被套用。
+    """
+    day_slots: dict
+    log: list
+    warnings: list
+    fingerprint: str
+    month_revision: str
 
 
 class RosterService:
@@ -281,9 +296,20 @@ class RosterService:
             prior_sessions=prior_sessions, prior_pgy=prior_pgy,
             apply_pref={str(c) for c in (month.get("pgy_apply_pref") or [])})
 
-    def run_day_solve(self, ym: str) -> tuple:
-        """build_day_input → month_solve_day。回 (day_slots, log, warnings)，不落地。"""
-        return month_solve_day(self.build_day_input(ym))
+    def run_day_solve(self, ym: str) -> "DaySolveResult":
+        """build_day_input → month_solve_day。不落地。
+
+        回傳除了結果本身,還帶著★這次求解吃到的輸入的識別★(見
+        `accept_day_solution`):預覽視窗可以開很久,期間他機同步進來的請假/
+        梯次/停診/名單都會讓這個舊解變成錯的。
+        ★revision 在 build 之前先取★:build 期間月檔若被換掉,寧可判成過期
+        (要使用者重排一次),也不要拿一份對不上的識別去放行。
+        """
+        _m, rev = self.storage.load_month_with_revision(ym)
+        inp = self.build_day_input(ym)
+        day_slots, log, warnings = month_solve_day(inp)
+        return DaySolveResult(day_slots, log, warnings,
+                              day_input_fingerprint(inp), rev)
 
     @staticmethod
     def _overlay_locked_sessions(month: dict, day_slots: dict) -> dict:
@@ -304,13 +330,39 @@ class RosterService:
         return self._overlay_locked_sessions(self.storage.load_month(ym), day_slots)
 
     def accept_day_solution(self, ym: str, day_slots: dict,
-                            report: "str | None" = None) -> None:
+                            report: "str | None" = None, *,
+                            expect: "DaySolveResult | None" = None) -> None:
         """★這條路徑【不重試】★(外審排班第 1 輪 P1-01):`day_slots` 是先前
         求解算出來的整批結果,盤上若已被他機換過,重讀後把同一批舊結果再套一次
         只是把對方的修改蓋掉 —— 語意上該做的是拒絕、請使用者重排。"""
+        # ★整段在同一個臨界區內★(外審 RS-2 第 1 輪 P1):驗證與寫入之間若讓
+        #   背景 pull 合併月檔【以外】的檔案(名單/模板/梯次/假日),指紋比的是
+        #   合併前的資料、月檔 revision 又沒變 —— 兩道關卡都通過,舊解照樣落地。
+        with self.storage.write_barrier():
+            self._accept_day_locked(ym, day_slots, report, expect)
+
+    def _accept_day_locked(self, ym: str, day_slots: dict,
+                           report: "str | None", expect) -> None:
+        """`accept_day_solution` 的本體。★呼叫端必須持有 `write_barrier`★"""
         month, rev = self.storage.load_month_with_revision(ym)
         if month.get("finalized"):
             raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能套用")
+        # ★求解之後、按下套用之前,輸入可能已經變了★(外審排班第 1 輪 P1-02)
+        #   R/VS 那一側早就這樣做(`accept_solution` 重建 ctx 再驗);日排班原本
+        #   只重疊「鎖定時段」,其餘一律整批覆蓋 —— 於是預覽開著的期間,他機
+        #   同步進來的請假/梯次/停診/名單/未鎖時段全部被舊解蓋回去(請假的人
+        #   又被排上、剛停診的診間又有人),而畫面可能已經先刷新成新版,更難察覺。
+        #   ★政策:任何 solver 相關狀態變動 → 一律拒絕、要求重排★
+        #   (不去猜哪些差異可以安全合併:日排班的輸入彼此影響公平計數。)
+        if expect is not None:
+            if expect.month_revision != rev:
+                raise ValueError(
+                    "排班結果已過期（月檔已被其他電腦更新），請重新排班")
+            if expect.fingerprint != day_input_fingerprint(
+                    self.build_day_input(ym)):
+                raise ValueError(
+                    "排班結果已過期（名單／請假／Clerk 梯次／停診／門診模板等"
+                    "輸入已變動），請重新排班")
         month["day_slots"] = self._overlay_locked_sessions(month, day_slots)
         month["day_report"] = report or ""      # 供「報告」鈕顯示落地當下的報告
         self.storage.save_month(ym, month, expected_revision=rev)
@@ -817,6 +869,16 @@ class RosterService:
             raise ValueError(
                 f"排班結果 scope={result.scope!r} 與欲套用的 {scope!r} 不符，"
                 f"請用對應分頁的結果")
+        # ★整段在同一個臨界區內★(外審 RS-2 第 1 輪 P1 的同一個病灶):
+        #   `build_context` 讀的是月檔【以外】的名單/假日/年度指定,驗證與
+        #   寫入之間被背景 pull 換掉的話,`_result_stale_reason` 驗的是舊資料
+        #   而月檔 CAS 又看不到那些檔 —— 兩道關卡一起失效。
+        with self.storage.write_barrier():
+            self._accept_solution_locked(scope, ym, result)
+
+    def _accept_solution_locked(self, scope: str, ym: str,
+                                result: SolveResult) -> None:
+        """`accept_solution` 的本體。★呼叫端必須持有 `write_barrier`★"""
         # ★這條路徑【不重試】★(外審排班第 1 輪 P1-01):result 是照【當時的】
         #   名單/請假/指定/鎖定算出來的整批結果,還會連動結算計數帳本 ——
         #   盤上被他機換過之後重讀重套只會蓋掉對方,語意上該做的是拒絕重排。

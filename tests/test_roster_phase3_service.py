@@ -79,7 +79,8 @@ def test_build_day_input_with_clerk_and_biopsy(tmp_path):
 
 def test_run_and_accept_day_solution(tmp_path):
     svc = _svc(tmp_path)
-    day_slots, log, warnings = svc.run_day_solve(YM)
+    _res = svc.run_day_solve(YM)
+    day_slots, log = _res.day_slots, _res.log
     mon = day_slots["2026-08-03"]["上午"]
     assert mon[TREATMENT]                               # 週一早有治療室
     assert log
@@ -119,8 +120,10 @@ def test_set_day_slot_manual_and_finalize_guard(tmp_path):
 
 def test_run_day_solve_deterministic(tmp_path):
     svc = _svc(tmp_path)
-    assert svc.run_day_solve(YM)[0] == svc.run_day_solve(YM)[0]
-    _ds, _log, warnings = svc.run_day_solve(YM)
+    assert svc.run_day_solve(YM).day_slots == svc.run_day_solve(YM).day_slots
+    # ★同樣的輸入 → 同樣的指紋★(否則每次求解都會被自己判成過期)
+    assert (svc.run_day_solve(YM).fingerprint
+            == svc.run_day_solve(YM).fingerprint)
     assert REST is not None                             # 匯入正常
 
 
@@ -133,7 +136,9 @@ def test_day_lock_toggle_and_preserved_on_resolve(tmp_path):
     locked_slots = svc.storage.load_month(YM)["day_slots"]["2026-08-03"]["上午"]
     assert svc.build_day_input(YM).locked["2026-08-03"]["上午"] == locked_slots
     # 重排 → 鎖定時段不變
-    ds2, _l, _w = svc.run_day_solve(YM)
+    _res = svc.run_day_solve(YM)
+    ds2, _l, _w = (
+        _res.day_slots, _res.log, _res.warnings)
     assert ds2["2026-08-03"]["上午"] == locked_slots
     assert svc.toggle_day_lock(YM, d, "上午") is False      # 解鎖
     assert not svc.is_day_locked(YM, d, "上午")
@@ -179,7 +184,9 @@ def test_clinic_closure_removes_room_for_range(tmp_path):
     assert "103" in grid[date(2026, 8, 3)]["上午"]          # 其他診照常
     assert "101" in grid[date(2026, 8, 17)]["上午"]         # 範圍外照常開
     assert svc.clinic_closures(YM)["2026-08-03"]["上午"] == ["101"]
-    ds, _l, _w = svc.run_day_solve(YM)                      # 自動排班不排人進停診診間
+    _res = svc.run_day_solve(YM)
+    ds, _l, _w = (
+        _res.day_slots, _res.log, _res.warnings)                      # 自動排班不排人進停診診間
     assert "101" not in ds.get("2026-08-03", {}).get("上午", {})
     # 恢復開診 → 清乾淨
     svc.set_clinic_closed(YM, "101", date(2026, 8, 3), date(2026, 8, 10),
@@ -219,7 +226,9 @@ def test_rf04_locked_preserved_when_day_becomes_holiday(tmp_path):
     locked_slots = svc.storage.load_month(YM)["day_slots"]["2026-08-03"]["上午"]
     # 事後把 8/3 加進國定假日表 → month_grid 排除該日
     svc.storage.save_holiday_duty({"r": {d: "X"}, "vs": {}})
-    ds2, _l, _w = svc.run_day_solve(YM)
+    _res = svc.run_day_solve(YM)
+    ds2, _l, _w = (
+        _res.day_slots, _res.log, _res.warnings)
     # 模擬掉出格網的 stale 預覽（漏掉 8/3）→ 直接餵給 accept 測 service 層防線
     stale = {iso: sess for iso, sess in ds2.items() if iso != "2026-08-03"}
     assert "2026-08-03" not in stale
@@ -231,7 +240,9 @@ def test_rf04_locked_preserved_when_day_becomes_holiday(tmp_path):
 def test_wed_pm_photo_present_treatment_absent(tmp_path):
     """週三下午：照光照排、治療室休診（day_slots 有照光、無治療室、無房）。"""
     svc = _svc(tmp_path)
-    day_slots, _log, _w = svc.run_day_solve(YM)
+    _res = svc.run_day_solve(YM)
+    day_slots, _log, _w = (
+        _res.day_slots, _res.log, _res.warnings)
     wed_pm = day_slots["2026-08-05"]["下午"]            # 8/5 週三
     assert PHOTO in wed_pm and TREATMENT not in wed_pm
     assert not any(k.isdigit() for k in wed_pm)         # 無房號格
@@ -240,7 +251,9 @@ def test_wed_pm_photo_present_treatment_absent(tmp_path):
 def test_photo_every_session_treatment_skips_wed_pm(tmp_path):
     """照光每個時段一律有人；治療室只在非週三下午的時段有人。"""
     svc = _svc(tmp_path)                                # pgy A,B,C
-    day_slots, _log, _w = svc.run_day_solve(YM)
+    _res = svc.run_day_solve(YM)
+    day_slots, _log, _w = (
+        _res.day_slots, _res.log, _res.warnings)
     for iso, sessions in day_slots.items():
         wd = date.fromisoformat(iso).weekday()
         for session, slots in sessions.items():

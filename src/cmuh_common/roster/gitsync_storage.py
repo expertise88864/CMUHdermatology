@@ -30,6 +30,7 @@ git 併發：所有會動到 working tree / index / refs 的操作（commit、pu
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import subprocess
@@ -84,6 +85,8 @@ class GitSyncStorage(RosterStorage):
         #   鎖序固定:pull/push 先 `_git_lock` 再 `_tree_lock`;存檔只在
         #   寫入時持 `_tree_lock`,放掉之後才去拿 `_git_lock` commit。
         self._tree_lock = threading.RLock()
+        # 臨界區內延後的 commit(每執行緒各自一份;見 `write_barrier`)
+        self._local = threading.local()
         self._push_timer: "threading.Timer | None" = None
         self._stop_evt = threading.Event()
         self._pull_thread: "threading.Thread | None" = None
@@ -316,6 +319,41 @@ class GitSyncStorage(RosterStorage):
                               exc_info=True)
 
     # ── 存檔攔截：本地 commit + 去抖 push ────────────────────────────────
+    @contextlib.contextmanager
+    def write_barrier(self):
+        """基底的臨界區 + 工作樹鎖;★commit 延到離開臨界區之後★。
+
+        鎖序是固定的:pull/push 先 `_git_lock` 再 `_tree_lock`。若在持有
+        `_tree_lock` 的期間去拿 `_git_lock`(commit 會做的事),就會與正在
+        pull 的背景執行緒互相等待 —— 死鎖。所以臨界區內的存檔只寫盤並把
+        檔名記下來,等鎖放掉之後再一次 commit + 排 push。
+        """
+        pending = getattr(self._local, "deferred", None)
+        outermost = pending is None
+        if outermost:
+            self._local.deferred = []
+        try:
+            with self._tree_lock:
+                with super().write_barrier():
+                    yield
+        finally:
+            if outermost:
+                names = self._local.deferred or []
+                self._local.deferred = None
+                if names and self._git_ok and self._remote_sync:
+                    # 已經離開 `_tree_lock` → 這裡拿 `_git_lock` 不會反序。
+                    if self._git_lock.acquire(timeout=3.0):
+                        try:
+                            if self._commit("、".join(sorted(set(names))[:5])):
+                                self._schedule_push()
+                        finally:
+                            self._git_lock.release()
+                    else:
+                        logging.warning(
+                            "[roster.gitsync] git 忙碌中，臨界區的變更延後 "
+                            "commit（檔案已寫盤，下次存檔補收）")
+                        self._schedule_push()
+
     def _save(self, path: str, data: dict, **kw) -> None:
         # **kw 透傳（目前是 backup=REQUIRE_BACKUP/BEST_EFFORT）——本層只加 git
         # commit/push，不干涉基底層的寫入政策；基底若拒寫會直接拋，這裡不會走到。
@@ -324,6 +362,12 @@ class GitSyncStorage(RosterStorage):
         with self._tree_lock:
             super()._save(path, data, **kw)      # 原子寫入（write-through，不卡網路）
         if not (self._git_ok and self._remote_sync):
+            return
+        pending = getattr(self._local, "deferred", None)
+        if pending is not None:
+            # 在 `write_barrier` 的臨界區內:此刻拿 `_git_lock` 會與 pull 反序
+            # → 死鎖。記下來,等臨界區結束再 commit。
+            pending.append(os.path.basename(path))
             return
         # 拿不到 git 鎖＝背景正在 push/pull：檔案已寫盤，這次先略過 commit，
         # 下次存檔的白名單 add 會補收；仍排一次 push 以免變更留在本機。
