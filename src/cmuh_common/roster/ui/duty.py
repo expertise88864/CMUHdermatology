@@ -127,14 +127,19 @@ class LeaveEditor(tk.Toplevel):
         if self._loaded_mid is None or self._selected == self._loaded_baseline:
             return True
         label = "請假" if self.mode == "leave" else "指定值班"
+        # ★送出的是「我加了這幾天、拿掉了這幾天」★(外審排班第 2 輪 P1-02):
+        #   `_loaded_baseline` 是開窗/切換成員時載入的那一份 —— 整份勾選原封
+        #   送回去的話,視窗開著的期間他機同步進來的請假會被靜默覆蓋,而請假
+        #   直接餵給求解器:該休的人會被排班。
+        base = set(self._loaded_baseline)
         if self.mode == "leave":
             def _do():
                 self.service.set_leaves(self.scope, self.ym, self._loaded_mid,
-                                        self._selected)
+                                        self._selected, baseline=base)
         else:
             def _do():
                 self.service.set_must(self.scope, self.ym, self._loaded_mid,
-                                      self._selected)
+                                      self._selected, baseline=base)
         if not guard_write(_do, title=f"{self._loaded_mid} 的{label}未儲存",
                            parent=self):
             return False
@@ -209,6 +214,8 @@ class CalendarDutyTab(ttk.Frame):
         self._status.set(_IDLE_HINT)     # [2026-07-24] 閒置時顯示操作提示
 
     # ── 版面 ─────────────────────────────────────────────────────────────
+        #: 畫面上每一格【顯示的】鎖定狀態(右鍵選單照它算目標狀態)
+        self._shown_locked: dict = {}
     def _build_toolbar(self) -> None:
         bar = ttk.Frame(self, padding=(6, 4))
         bar.pack(fill="x")
@@ -324,6 +331,9 @@ class CalendarDutyTab(ttk.Frame):
 
     def refresh(self) -> None:
         """重畫整個分頁（月曆格＝一線+三線 + 兩個結算 + 警告 + 定案狀態）。"""
+        # ★每次重畫前清掉上一輪的顯示狀態★:格子可能不再存在,留著舊值
+        #   會讓右鍵選單照一個畫面上已經沒有的狀態算目標。
+        self._shown_locked = {}
         ym = self.app.ym
         month = self.service.storage.load_month(ym)
         self._finalized = bool(month.get("finalized"))
@@ -514,6 +524,11 @@ class CalendarDutyTab(ttk.Frame):
             cell_data = (duty[scope].get(iso)) or {}
             pid = cell_data.get("person")
             locked = bool(cell_data.get("locked"))
+            # ★記下【畫面上這一格顯示的】鎖定狀態★(外審排班 RS-8 第 2 輪 P2):
+            #   右鍵選單的動作要照使用者【看到的】去算目標狀態;在按下去的
+            #   當下再讀一次磁碟,就又變回「對他看不到的最新值取反」——
+            #   他機剛鎖起來時,按「鎖定」照樣把它解開。
+            self._shown_locked[(iso, scope)] = locked
             info = members[scope].get(pid)
             chip_bg, chip_fg, line = LINE_CHIP[scope]
             row = tk.Frame(card, bg=body_bg)
@@ -686,8 +701,9 @@ class CalendarDutyTab(ttk.Frame):
                       + (f"　{LEAVE_MARK}當天請假" if on_leave else ""),
                 command=lambda mm=mid: self._set_cell_and_refresh(d, mm, scope))
         menu.add_cascade(label=f"指定{line}人選", menu=pick)
-        menu.add_command(label=f"切換{line}鎖定 🔒",
-                         command=lambda: self._toggle_lock(d, scope))
+        shown = bool(self._shown_locked.get((d.isoformat(), scope)))
+        menu.add_command(label=f"{'解鎖' if shown else '鎖定'}{line} 🔒",
+                         command=lambda: self._set_lock(d, scope, not shown))
         menu.add_separator()
         menu.add_command(label=f"{line}請假…",
                          command=lambda: self._open_leave_editor("leave", scope))
@@ -750,9 +766,13 @@ class CalendarDutyTab(ttk.Frame):
                     title="改格", parent=self)
         self.refresh()
 
-    def _toggle_lock(self, d, scope) -> None:
-        guard_write(lambda: self.service.toggle_lock(scope, self.app.ym, d),
-                    title="切換鎖定", parent=self)
+    def _set_lock(self, d, scope, want: bool) -> None:
+        """★送「想要的狀態」★(外審排班第 2 輪 P2-02):`want` 由呼叫端依
+        【畫面上顯示的】狀態算好 —— 在這裡再讀一次磁碟取反的話,等於把同一個
+        缺陷往上搬一層:他機剛鎖起來時,使用者按「鎖定」照樣把它解開。"""
+        guard_write(lambda: self.service.set_lock(scope, self.app.ym, d,
+                                                  bool(want)),
+                    title="鎖定" if want else "解鎖", parent=self)
         self.refresh()
 
     def _open_leave_editor(self, mode, scope) -> None:

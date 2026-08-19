@@ -65,7 +65,7 @@ class TestTheWhitelistCannotSeeTheseHardConstraints:
 
     def test_a_changed_week_color_makes_the_result_stale(self, svc):
         res = _result(svc)
-        svc.toggle_week_color(2026, "2026-W33")   # 他機手動改了某週的顏色
+        svc.set_week_color(2026, "2026-W33", "pink")   # 他機改了某週顏色
         with pytest.raises(ValueError, match="已過期"):
             svc.accept_solution("r", YM, res)
 

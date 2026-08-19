@@ -15,6 +15,10 @@ from datetime import date
 
 import pytest
 
+from roster_edit_helpers import (  # noqa: E402
+    edit_leaves, edit_pgy_roster,
+)
+
 from cmuh_common.roster.service import RosterService
 from cmuh_common.roster.storage import (
     RosterStorage,
@@ -117,7 +121,7 @@ class TestTheOtherMachinesChangesSurvive:
 
         st.load_month_snapshot = _hook                          # type: ignore
         try:
-            svc.set_leaves("r", ym, "K", {date(2026, 9, 10)})
+            edit_leaves(svc, "r", ym, "K", {date(2026, 9, 10)})
         finally:
             st.load_month_snapshot = real                       # type: ignore
         after = st.load_month(ym)
@@ -439,14 +443,14 @@ class TestTheDaySolveResultCannotBeAppliedStale:
     def test_a_remote_leave_change_rejects_the_apply(self, st):
         svc = self._svc(st)
         res = self._solved(svc)
-        svc.set_leaves("pgy", "2026-09", "P1", {date(2026, 9, 3)})
+        edit_leaves(svc, "pgy", "2026-09", "P1", {date(2026, 9, 3)})
         with pytest.raises(ValueError, match="已過期"):
             svc.accept_day_solution("2026-09", res.day_slots, expect=res)
 
     def test_a_remote_pgy_roster_change_rejects_the_apply(self, st):
         svc = self._svc(st)
         res = self._solved(svc)
-        svc.set_pgy_month_roster("2026-09", ["P1"])
+        edit_pgy_roster(svc, "2026-09", ["P1"])
         with pytest.raises(ValueError, match="已過期"):
             svc.accept_day_solution("2026-09", res.day_slots, expect=res)
 

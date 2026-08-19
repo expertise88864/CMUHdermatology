@@ -10,6 +10,10 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from cmuh_common.roster.model import ClerkBatch, batches_covering  # noqa: E402
+from roster_edit_helpers import (  # noqa: E402
+    edit_day_session, edit_leaves, edit_pgy_roster, flip_day_lock,
+)
+
 from cmuh_common.roster.service import RosterService  # noqa: E402
 from cmuh_common.roster.solve_day import BIOPSY, PHOTO, REST, TREATMENT  # noqa: E402
 from cmuh_common.roster.storage import (  # noqa: E402
@@ -90,7 +94,7 @@ def test_run_and_accept_day_solution(tmp_path):
 
 def test_pgy_roster_override_and_leaves(tmp_path):
     svc = _svc(tmp_path)
-    svc.set_pgy_month_roster(YM, ["A", "B"])           # 當月只有 A,B
+    edit_pgy_roster(svc, YM, ["A", "B"])           # 當月只有 A,B
     inp = svc.build_day_input(YM)
     assert inp.pgy_roster == ["A", "B"]
     # PGY 請假反映到 avail（透過 month leaves）
@@ -131,7 +135,7 @@ def test_day_lock_toggle_and_preserved_on_resolve(tmp_path):
     svc = _svc(tmp_path)
     svc.accept_day_solution(YM, svc.run_day_solve(YM)[0])   # 先套用一次
     d = date(2026, 8, 3)
-    assert svc.toggle_day_lock(YM, d, "上午") is True
+    assert flip_day_lock(svc, YM, d, "上午") is True
     assert svc.is_day_locked(YM, d, "上午")
     locked_slots = svc.storage.load_month(YM)["day_slots"]["2026-08-03"]["上午"]
     assert svc.build_day_input(YM).locked["2026-08-03"]["上午"] == locked_slots
@@ -140,14 +144,14 @@ def test_day_lock_toggle_and_preserved_on_resolve(tmp_path):
     ds2, _l, _w = (
         _res.day_slots, _res.log, _res.warnings)
     assert ds2["2026-08-03"]["上午"] == locked_slots
-    assert svc.toggle_day_lock(YM, d, "上午") is False      # 解鎖
+    assert flip_day_lock(svc, YM, d, "上午") is False      # 解鎖
     assert not svc.is_day_locked(YM, d, "上午")
 
 
 def test_clear_unlocked_day_keeps_locked(tmp_path):
     svc = _svc(tmp_path)
     svc.accept_day_solution(YM, svc.run_day_solve(YM)[0])
-    svc.toggle_day_lock(YM, date(2026, 8, 3), "上午")
+    flip_day_lock(svc, YM, date(2026, 8, 3), "上午")
     svc.clear_unlocked_day(YM)
     remaining = svc.storage.load_month(YM)["day_slots"]
     assert "上午" in remaining.get("2026-08-03", {})          # 鎖定保留
@@ -200,7 +204,7 @@ def test_clinic_closure_clears_existing_assignments(tmp_path):
     svc = _svc(tmp_path)
     svc.set_day_slot(YM, date(2026, 8, 3), "上午", "101", ["A"])
     svc.set_day_slot(YM, date(2026, 8, 10), "上午", "101", ["B"])
-    svc.toggle_day_lock(YM, date(2026, 8, 10), "上午")     # 鎖定 8/10 上午
+    flip_day_lock(svc, YM, date(2026, 8, 10), "上午")      # 鎖定 8/10 上午
     svc.set_clinic_closed(YM, "101", date(2026, 8, 3), date(2026, 8, 10), ["上午"])
     m = svc.storage.load_month(YM)
     assert "101" not in m["day_slots"]["2026-08-03"]["上午"]      # 未鎖 → 一併清掉
@@ -222,7 +226,7 @@ def test_rf04_locked_preserved_when_day_becomes_holiday(tmp_path):
     svc = _svc(tmp_path)
     svc.accept_day_solution(YM, svc.run_day_solve(YM)[0])
     d = date(2026, 8, 3)
-    svc.toggle_day_lock(YM, d, "上午")
+    flip_day_lock(svc, YM, d, "上午")
     locked_slots = svc.storage.load_month(YM)["day_slots"]["2026-08-03"]["上午"]
     # 事後把 8/3 加進國定假日表 → month_grid 排除該日
     svc.storage.save_holiday_duty({"r": {d: "X"}, "vs": {}})
@@ -282,7 +286,7 @@ def test_rs05_closure_skipped_locked_and_audit(tmp_path):
     """[RS-05] 停診撞到鎖定時段：不清該指派、回報 skipped_locked；且寫 closure audit。"""
     svc = _svc(tmp_path)
     svc.set_day_slot(YM, date(2026, 8, 10), "上午", "101", ["B"])
-    svc.toggle_day_lock(YM, date(2026, 8, 10), "上午")
+    flip_day_lock(svc, YM, date(2026, 8, 10), "上午")
     res = svc.set_clinic_closed(YM, "101", date(2026, 8, 10), date(2026, 8, 10),
                                 ["上午"])
     assert res["cleared"] == 0
@@ -301,11 +305,11 @@ def test_rs06_set_day_session_single_save_and_noop(tmp_path, monkeypatch):
     monkeypatch.setattr(svc.storage, "save_month",
                         lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1),
                                          orig(*a, **k))[1])
-    n = svc.set_day_session(YM, date(2026, 8, 3), "上午",
+    n = edit_day_session(svc, YM, date(2026, 8, 3), "上午",
                             {PHOTO: ["A"], TREATMENT: ["B"], "101": ["C"]})
     assert n == 3 and calls["n"] == 1                    # 三格變動、僅一次落檔
     calls["n"] = 0
-    n2 = svc.set_day_session(YM, date(2026, 8, 3), "上午",
+    n2 = edit_day_session(svc, YM, date(2026, 8, 3), "上午",
                              {PHOTO: ["A"], TREATMENT: ["B"], "101": ["C"]})
     assert n2 == 0 and calls["n"] == 0                   # 無變化 → 不 save
     slots = svc.storage.load_month(YM)["day_slots"]["2026-08-03"]["上午"]
@@ -315,8 +319,8 @@ def test_rs06_set_day_session_single_save_and_noop(tmp_path, monkeypatch):
 def test_rs06_set_day_session_clears_slot_content(tmp_path):
     """清空某格 → 該格不再有內容（與逐格 set_day_slot 一致，空殼留否為實作細節）。"""
     svc = _svc(tmp_path)
-    svc.set_day_session(YM, date(2026, 8, 3), "上午", {PHOTO: ["A"]})
-    svc.set_day_session(YM, date(2026, 8, 3), "上午", {PHOTO: []})   # 清空該格
+    edit_day_session(svc, YM, date(2026, 8, 3), "上午", {PHOTO: ["A"]})
+    edit_day_session(svc, YM, date(2026, 8, 3), "上午", {PHOTO: []})   # 清空該格
     sess = (((svc.storage.load_month(YM).get("day_slots") or {})
              .get("2026-08-03") or {}).get("上午") or {})
     assert PHOTO not in sess
@@ -326,7 +330,7 @@ def test_rs06_set_day_session_clears_slot_content(tmp_path):
 def test_rs07_quick_validate_flags_leave_and_wed_pm(tmp_path):
     """[RS-07] 手排請假者 → 警告；週三下午治療室有人 → 警告。"""
     svc = _svc(tmp_path)
-    svc.set_leaves("pgy", YM, "A", {date(2026, 8, 3)})
+    edit_leaves(svc, "pgy", YM, "A", {date(2026, 8, 3)})
     svc.set_day_slot(YM, date(2026, 8, 3), "上午", PHOTO, ["A"])   # 請假者被排
     svc.set_day_slot(YM, date(2026, 8, 5), "下午", TREATMENT, ["B"])  # 週三下午治療室
     warns = svc.quick_validate_day(YM)

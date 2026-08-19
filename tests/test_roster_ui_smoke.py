@@ -17,6 +17,10 @@ try:                        # 模組層 import 不可在無 tkinter 的環境變
 except Exception:           # noqa: BLE001
     tk = ttk = None         # type: ignore[assignment]
 
+from roster_edit_helpers import (  # noqa: E402
+    ui_flip_lock, edit_leaves, flip_day_lock,
+)
+
 from cmuh_common.roster.service import RosterService  # noqa: E402
 from cmuh_common.roster.storage import RosterStorage  # noqa: E402
 from cmuh_common.roster.ui import day_tab as day_mod  # noqa: E402
@@ -202,7 +206,7 @@ def test_duty_tab_manual_edit_and_lock(root, tmp_path):
     cell = svc.storage.load_month(YM)["r_duty"]["2026-08-03"]
     assert cell["person"] == "A" and cell["locked"] is False
 
-    tab._toggle_lock(d, "r")
+    ui_flip_lock(tab, d, "r")
     assert svc.storage.load_month(YM)["r_duty"]["2026-08-03"]["locked"] is True
     assert svc.build_context("r", YM).locks == {d: "A"}
 
@@ -217,7 +221,7 @@ def test_duty_tab_clear_unlocked_keeps_locked(root, tmp_path):
     root.update()
     tab._set_cell_and_refresh(date(2026, 8, 5), "A", "r")
     tab._set_cell_and_refresh(date(2026, 8, 6), "B", "r")
-    tab._toggle_lock(date(2026, 8, 5), "r")         # 鎖定 8/5
+    ui_flip_lock(tab, date(2026, 8, 5), "r")        # 鎖定 8/5
     m = svc.storage.load_month(YM)             # RF-20：塞舊報告，清除後應一併清空
     m["report_r"] = "OLD"
     svc.storage.save_month(YM, m)
@@ -409,7 +413,7 @@ def test_day_tab_can_unlock_empty_session(root, tmp_path):
     tab.pack(fill="both", expand=True)
     root.update()
     svc.accept_day_solution(YM, svc.run_day_solve(YM)[0])
-    svc.toggle_day_lock(YM, date(2026, 8, 3), "上午")
+    flip_day_lock(svc, YM, date(2026, 8, 3), "上午")
     m = svc.storage.load_month(YM)                    # 清空該鎖定時段內容
     m["day_slots"]["2026-08-03"]["上午"] = {}
     svc.storage.save_month(YM, m)
@@ -651,7 +655,7 @@ def test_compute_tally_counts_holiday_as_weekend(root, tmp_path):
 def test_leave_mark_shown_in_cell(root, tmp_path):
     """值班者當天請假 → 月曆格顯示 ⚠（手動指派誤點當場看得見）。"""
     svc = _svc(tmp_path)
-    svc.set_leaves("r", YM, "A", {date(2026, 8, 3)})
+    edit_leaves(svc, "r", YM, "A", {date(2026, 8, 3)})
     svc.set_cell("r", YM, date(2026, 8, 3), "A")
     tab = CalendarDutyTab(root, svc, _app())
     tab.pack(fill="both", expand=True)
@@ -699,7 +703,7 @@ def _split_codes_ui(text):
 def test_day_edit_dialog_marks_leave_and_other_slot(root, tmp_path):
     """＋選人選單的資訊：當天請假、已排本時段其他格 —— 供判斷,不阻擋指派。"""
     svc = _svc(tmp_path)
-    svc.set_leaves("pgy", YM, "A", {date(2026, 8, 3)})
+    edit_leaves(svc, "pgy", YM, "A", {date(2026, 8, 3)})
     dlg = day_mod._DayEditDialog(root, svc, YM, date(2026, 8, 3), "上午",
                                  lambda: None)
     root.update()

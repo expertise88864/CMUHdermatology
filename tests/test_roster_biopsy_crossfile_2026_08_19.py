@@ -23,6 +23,10 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from roster_edit_helpers import (  # noqa: E402
+    edit_leaves,
+)
+
 from cmuh_common.roster.service import RosterService  # noqa: E402
 from cmuh_common.roster.storage import RosterStorage  # noqa: E402
 
@@ -162,7 +166,7 @@ class TestTheMonthAndTheBookAreWrittenTogether:
 
         st.save_month = _hooked                # type: ignore
         try:
-            svc.set_leaves("r", "2026-08", "r2", [date(2026, 8, 10)])
+            edit_leaves(svc, "r", "2026-08", "r2", [date(2026, 8, 10)])
         finally:
             st.save_month = real               # type: ignore
         once[-1].join(timeout=10)

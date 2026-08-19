@@ -26,6 +26,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
+from roster_edit_helpers import ui_flip_lock  # noqa: E402
+
 from cmuh_common.roster.service import RosterService  # noqa: E402
 from cmuh_common.roster.solve_day import PHOTO  # noqa: E402
 from cmuh_common.roster.storage import RosterStorage  # noqa: E402
@@ -191,7 +193,7 @@ def test_toggle_lock_reports_a_failed_write(root, tmp_path, monkeypatch, noblock
     root.update()
     _break_saving(monkeypatch, svc)
 
-    _as_tk_would(lambda: tab._toggle_lock(date(2026, 8, 5), "r"))
+    _as_tk_would(lambda: ui_flip_lock(tab, date(2026, 8, 5), "r"))
 
     assert noblock["error"]
 

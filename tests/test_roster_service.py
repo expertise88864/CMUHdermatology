@@ -10,6 +10,10 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from cmuh_common.roster.model import day_point  # noqa: E402
+from roster_edit_helpers import (  # noqa: E402
+    edit_leaves, edit_must, flip_lock,
+)
+
 from cmuh_common.roster.service import RosterService  # noqa: E402
 from cmuh_common.roster.solve_rvs import (
     SolveResult, rvs_input_fingerprint,
@@ -224,7 +228,7 @@ def test_rf20_clear_unlocked_keeps_locked_and_clears_report(tmp_path):
     svc.set_cell("r", YM, date(2026, 8, 5), "A")
     svc.set_cell("r", YM, date(2026, 8, 6), "B")
     svc.set_cell("r", YM, date(2026, 8, 7), "A")
-    svc.toggle_lock("r", YM, date(2026, 8, 5))         # 鎖 8/5
+    flip_lock(svc, "r", YM, date(2026, 8, 5))          # 鎖 8/5
     m = svc.storage.load_month(YM)
     m["report_r"] = "OLD REPORT"
     svc.storage.save_month(YM, m)
@@ -265,7 +269,7 @@ def test_accept_rejects_stale_after_leave_change(tmp_path):
     """預覽後才有人請假（非鎖定變動）→ 舊 result 把請假者排上 → 拒絕。"""
     svc = _svc(tmp_path)
     res = _result_for(svc, YM, _cover(svc, YM, "A"))
-    svc.set_leaves("r", YM, "A", {date(2026, 8, 5)})   # 預覽後才請假
+    edit_leaves(svc, "r", YM, "A", {date(2026, 8, 5)})  # 預覽後才請假
     with pytest.raises(ValueError):
         svc.accept_solution("r", YM, res)              # 8/5 排 A 但 A 已請假
     assert svc.storage.load_ledger()["r"] == {}
@@ -343,29 +347,29 @@ def test_set_cell_clear_removes(tmp_path):
 
 def test_toggle_lock(tmp_path):
     svc = _svc(tmp_path)
-    assert svc.toggle_lock("r", YM, date(2026, 8, 5)) is False   # 空格不可鎖
+    assert flip_lock(svc, "r", YM, date(2026, 8, 5)) is False    # 空格不可鎖
     svc.set_cell("r", YM, date(2026, 8, 5), "A")
-    assert svc.toggle_lock("r", YM, date(2026, 8, 5)) is True
+    assert flip_lock(svc, "r", YM, date(2026, 8, 5)) is True
     assert svc.build_context("r", YM).locks == {date(2026, 8, 5): "A"}
-    assert svc.toggle_lock("r", YM, date(2026, 8, 5)) is False
+    assert flip_lock(svc, "r", YM, date(2026, 8, 5)) is False
 
 
 def test_set_leaves_and_must_roundtrip(tmp_path):
     svc = _svc(tmp_path)
-    svc.set_leaves("r", YM, "A", {date(2026, 8, 10), date(2026, 8, 11)})
-    svc.set_must("r", YM, "B", {date(2026, 8, 20)})
+    edit_leaves(svc, "r", YM, "A", {date(2026, 8, 10), date(2026, 8, 11)})
+    edit_must(svc, "r", YM, "B", {date(2026, 8, 20)})
     ctx = svc.build_context("r", YM)
     assert ctx.leaves["A"] == {date(2026, 8, 10), date(2026, 8, 11)}
     assert ctx.must_duty["B"] == {date(2026, 8, 20)}
 
-    svc.set_leaves("r", YM, "A", set())          # 清空 → 移除
+    edit_leaves(svc, "r", YM, "A", set())        # 清空 → 移除
     assert "A" not in svc.build_context("r", YM).leaves
 
 
 def test_quick_validate_flags_invalid_manual_cell(tmp_path):
     """未鎖定手排把請假者/非名單者排上 → quick_validate 要抓到（§3.1 缺口）。"""
     svc = _svc(tmp_path)
-    svc.set_leaves("r", YM, "A", {date(2026, 8, 5)})
+    edit_leaves(svc, "r", YM, "A", {date(2026, 8, 5)})
     checks = svc.set_cell("r", YM, date(2026, 8, 5), "A")     # A 請假卻排 A
     assert any(c.rule_id == "manual_cell" for c in checks)
 

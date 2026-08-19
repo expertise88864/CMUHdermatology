@@ -429,10 +429,14 @@ class SettingsTab(ttk.Frame):
                 n = self.service.rename_member(scope, old_id, new_id)
             except Exception as e:  # noqa: BLE001
                 messagebox.showerror("改代號失敗", str(e))
-                self._cfg = self.service.storage.load_config()   # 與磁碟同步（未變動）
+                self._refresh_cfg_from_disk()   # 與磁碟同步（未變動）
                 self._reload_members(scope)
                 return
-            self._cfg = self.service.storage.load_config()       # rename 改了 config → 重讀
+            # ★內容與 revision 必須一起更新★(外審排班 RS-8 第 1 輪 P2-01):
+            #   只重讀內容而 `_cfg_rev` 停在改名【之前】的版本,接下來套用
+            #   姓名/級職/固定星期的那次存檔一定會被自己的改名判成過期 ——
+            #   使用者看到「設定已被另一台電腦更新」,而那台就是他自己。
+            self._refresh_cfg_from_disk()                        # rename 改了 config
             eff_id = new_id
             self._notify()                                        # 通知排班分頁重載
             messagebox.showinfo(
@@ -883,17 +887,23 @@ class SettingsTab(ttk.Frame):
         if cur is None:
             return
         old_start = cur.get("start_monday")
+        before = dict(cur)             # ★開窗當時的那一份＝這次編輯的基準★
         dlg = _ClerkBatchDialog(self, cur)
         if dlg.result:
-            def _mut(bs):              # 在【最新】清單上找同一梯再套欄位
-                for b in bs:
-                    if self._batch_key(b) == sel[0]:
-                        b.update(dlg.result)
-                        return
-            if not guard_write(lambda: self.service.update_clerk_batches(_mut),
-                               title="Clerk 梯次", parent=self):
+            # ★UI 只負責交出「開窗那一份」與「現在畫面上的值」★
+            #   delta 與衝突判定在服務層(只有一份實作,而且測得到);
+            #   整包寫回去會把他機剛改的起始日還原成舊值 —— 那等於改變
+            #   「這個梯次存在於哪些日期」:求解候選人、切片格網覆蓋範圍、
+            #   跨月統計全部跟著錯,而畫面上看不出來。
+            applied: dict = {}
+
+            def _do():
+                applied.update(self.service.update_clerk_batch_fields(
+                    sel[0], before, dlg.result))
+            if not guard_write(_do, title="Clerk 梯次", parent=self):
                 return
-            cur.update(dlg.result)     # 本地顯示用
+            edits = applied
+            cur.update(edits)          # 本地顯示用
             if cur.get("id") and cur.get("start_monday") != old_start:
                 self._shift_biopsy_grid(cur["id"], old_start, cur["start_monday"])
             self._reload_batches()
@@ -994,6 +1004,10 @@ class SettingsTab(ttk.Frame):
         year = self._wc_year.get()
         auto = week_colors_for_year(year)
         manual = self.service.storage.load_week_colors()
+        # ★記下【這次畫上去的】手動覆蓋★(外審排班 RS-8 第 2 輪 P2):
+        #   雙擊時的下一個顏色要照使用者看到的算;在那當下再讀一次磁碟,
+        #   等於照他看不到的最新值跳 —— 會跳到一個他沒有要求的顏色。
+        self._wc_shown = dict(manual)
         label = {"pink": "粉", "green": "綠"}
         for wk, lo, hi in self._year_weeks(year):
             eff = manual.get(wk, auto.get(wk, ""))
@@ -1010,10 +1024,13 @@ class SettingsTab(ttk.Frame):
         wk = sel[0]
         # ★只切【這一週】,不要整組取代★(外審排班 RS-5 第 1 輪 P1-3):
         #   replace=True 是「整份覆蓋集寫回去」—— 他機剛設的別週覆蓋會消失。
-        #   顏色的下一狀態也要用【最新】的值算,不然會照著畫面上的舊值跳。
+        # ★下一個顏色由【畫面上的值】算,再把「想要的顏色」送出去★
+        #   (第 2 輪 P2-02):使用者看著粉色雙擊,他要的就是綠色;對他看不到
+        #   的最新值取下一個狀態,會跳到一個他沒有要求的顏色。
+        want = self.service.WEEK_COLOR_CYCLE.get(self._wc_shown.get(wk))
         if not guard_write(
-                lambda: self.service.toggle_week_color(
-                    self._wc_year.get(), wk),
+                lambda: self.service.set_week_color(
+                    self._wc_year.get(), wk, want),
                 title="手動週色", parent=self):
             return
         self._reload_week_colors()

@@ -11,6 +11,10 @@ from cmuh_common.roster.model import Member, day_point  # noqa: E402
 from cmuh_common.roster.saturday_biopsy import (  # noqa: E402
     assign_saturday_biopsy, biopsy_pair, format_biopsy_section,
     last_assigned_before, month_saturdays, rollback_biopsy, settle_biopsy)
+from roster_edit_helpers import (  # noqa: E402
+    edit_leaves,
+)
+
 from cmuh_common.roster.service import RosterService  # noqa: E402
 from cmuh_common.roster.solve_rvs import (
     SolveResult, rvs_input_fingerprint,
@@ -227,7 +231,7 @@ def test_set_leaves_recomputes_biopsy(tmp_path):
     svc.accept_solution("r", YM, _result_for(svc, YM, a))
     sb0 = svc.storage.load_month(YM)["saturday_biopsy"]
     victim = sb0["2026-08-01"]["person"]           # 8/1 原切片人
-    svc.set_leaves("r", YM, victim, [date(2026, 8, 1)])
+    edit_leaves(svc, "r", YM, victim, [date(2026, 8, 1)])
     sb = svc.storage.load_month(YM)["saturday_biopsy"]
     assert sb["2026-08-01"]["person"] != victim    # 請假者被換掉
     # 無「切片人請假」警告殘留

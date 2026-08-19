@@ -16,6 +16,10 @@ from datetime import date, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from roster_edit_helpers import (  # noqa: E402
+    edit_apply_pref,
+)
+
 from cmuh_common.roster.service import RosterService  # noqa: E402
 from cmuh_common.roster.solve_day import (  # noqa: E402
     BIOPSY, PHOTO, REST, STAT_KEYS, TREATMENT, DaySolveInput, FairCounters,
@@ -218,10 +222,10 @@ def test_overview_cell_rows_empty():
 def test_set_pgy_apply_pref_roundtrip_and_limit(tmp_path):
     import pytest
     svc, st = _svc(tmp_path)
-    svc.set_pgy_apply_pref("2026-08", ["P1", "P2"])
+    edit_apply_pref(svc, "2026-08", ["P1", "P2"])
     assert st.load_month("2026-08")["pgy_apply_pref"] == ["P1", "P2"]
     assert svc.build_day_input("2026-08").apply_pref == {"P1", "P2"}
     with pytest.raises(ValueError, match="最多選 2"):
-        svc.set_pgy_apply_pref("2026-08", ["P1", "P2", "P3"])
-    svc.set_pgy_apply_pref("2026-08", [])                    # 清空
+        edit_apply_pref(svc, "2026-08", ["P1", "P2", "P3"])
+    edit_apply_pref(svc, "2026-08", [])                    # 清空
     assert svc.build_day_input("2026-08").apply_pref == set()

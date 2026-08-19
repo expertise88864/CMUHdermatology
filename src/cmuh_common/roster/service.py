@@ -74,6 +74,53 @@ def _duty_digest(month: dict, scope: str) -> str:
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
+def merge_set_edit(current, baseline, edited) -> set:
+    """把使用者【真的做過的】增減套到盤上最新的集合上(3-way)。
+
+    ★對話框送回來的整份勾選不是「使用者的意圖」★(外審排班第 2 輪 P1-02):
+    視窗開著的期間他機同步進來的請假/名單變動,會被那份開窗當時的快照整包
+    覆蓋掉 —— 而且是【合法地】覆蓋:月檔的 CAS 只看得到「整份月檔有沒有被
+    換過」,看不到「這個欄位的值是誰的意圖」。使用者按下確定時的意思是
+    「我加了這幾天、拿掉了這幾天」,不是「這個月只有這幾天」。
+
+    衝突在集合上不會發生(逐元素獨立):使用者沒碰過的元素保留盤上的;
+    使用者拿掉的就拿掉(他看見它、而且明確取消了它)。
+    """
+    cur, base, new = set(current or ()), set(baseline or ()), set(edited or ())
+    return (cur - (base - new)) | (new - base)
+
+
+def changed_entries(baseline: dict, edited: dict) -> dict:
+    """→ 使用者【真的改過】的那幾格(值與 baseline 不同的)。
+
+    沒改過的格子不可以寫回去:輸入框裡顯示的是開窗當時的值,原封送回等於
+    把他機在這段期間的修改靜默退回舊值。
+    """
+    base = dict(baseline or {})
+    out = {}
+    for k, v in (edited or {}).items():
+        if (base.get(k) or None) != (v or None):
+            out[k] = v
+    return out
+
+
+def field_changed(new, old) -> bool:
+    """這個欄位是不是真的被使用者改動過。
+
+    對話框對「沒填」一律回空字串或 None,而原紀錄可能根本沒有那個鍵 ——
+    兩邊都算「沒填」,不可視為一次變更(否則每次按確定都會塞一堆空欄位進去,
+    而且會被誤判成與他機衝突)。
+    """
+    if new in ("", None) and old in ("", None):
+        return False
+    return new != old
+
+
+def clerk_batch_key(b: dict) -> str:
+    """梯次的查找鍵(id 缺失的舊資料退回 start_monday,UI 與服務層共用一份)。"""
+    return str((b or {}).get("id") or (b or {}).get("start_monday") or "")
+
+
 def _now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -421,16 +468,32 @@ class RosterService:
                         old, people, "manual")
         self.update_month(ym, _mut)
 
-    def set_day_session(self, ym: str, d: date, session: str, slots: dict) -> int:
-        """[RS-06] 一次覆寫某(日,時段)的所有格（slots＝{slot: [人]}；空清單→移除該格）。
-        一次 load、逐格 diff 才記 audit、一次 save。回傳實際變動的格數。取代
-        _DayEditDialog 逐格呼叫 set_day_slot（每格各一次 load/save/git commit）。"""
+    def set_day_session(self, ym: str, d: date, session: str, slots: dict, *,
+                        baseline: dict) -> int:
+        """[RS-06] 改某(日,時段)的格（slots＝{slot: [人]}；空清單→移除該格）。
+        一次 load、逐格 diff 才記 audit、一次 save。回傳實際變動的格數。
+
+        ★只寫使用者【真的改過】的格★(外審排班第 2 輪 P1-02):`baseline` 是
+        開窗時各格的內容。沒改過的格子原封送回去,等於把他機在這段期間的
+        修改靜默退回舊值(輸入框裡顯示的本來就是開窗當時的值)。
+        改過的格子若在盤上也被別人改過 → ★明確拒絕★:那一格有兩個互相衝突
+        的意圖,程式沒有立場替使用者選一個。
+        """
+        wanted = changed_entries(baseline, slots)
+
         def _mut(month):
             sess = (month.setdefault("day_slots", {})
                     .setdefault(d.isoformat(), {}).setdefault(session, {}))
             changed = 0
-            for slot, people in slots.items():
+            for slot, people in wanted.items():
                 old = sess.get(slot)
+                base = (baseline or {}).get(slot)
+                if (old or None) != (base or None):
+                    shown = "、".join(old or []) or "（空）"
+                    raise StaleRosterDataError(
+                        f"{d.month}/{d.day} {session} 的「{slot}」已被其他電腦"
+                        f"改成 {shown}，與你這次的修改衝突。"
+                        f"請重新整理後再改一次。")
                 new = list(people) if people else None
                 if (old or None) == (new or None):
                     continue                      # 無變化 → 不記 audit、不算入變動
@@ -637,6 +700,41 @@ class RosterService:
             lambda d, rev: self.storage.save_ledger(d, expected_revision=rev),
             mutator, retries=retries)
 
+    def update_clerk_batch_fields(self, key: str, before: dict,
+                                  edited: dict) -> dict:
+        """把使用者【真的改過的】梯次欄位套到最新的那一筆上。→ 實際套用的欄位。
+
+        ★對話框回的是整份預填紀錄,不是意圖★(外審排班 RS-8 第 1 輪 P1-01-C):
+        整包寫回去的話,開窗期間他機改的欄位會被使用者沒動過的舊值悄悄還原 ——
+        起始日被改回去就等於改變「這個梯次存在於哪些日期」:求解候選人、切片
+        格網覆蓋範圍、跨月統計全部跟著錯,而畫面上看不出來。
+        使用者真的改過、而盤上也被改過的欄位 → ★明確拒絕★(不猜誰贏)。
+        """
+        edits = {k: v for k, v in (edited or {}).items()
+                 if field_changed(v, (before or {}).get(k))}
+        if not edits:
+            return {}
+
+        def _mut(bs):
+            for b in bs:
+                if clerk_batch_key(b) != key:
+                    continue
+                clash = [k for k in edits
+                         if field_changed(b.get(k), (before or {}).get(k))]
+                if clash:
+                    raise StaleRosterDataError(
+                        f"這個梯次的「{'、'.join(clash)}」在你編輯期間也被另一台"
+                        f"電腦改過，為避免把對方的修改改回去，這次變更已中止。"
+                        f"請重新整理後再改一次。")
+                b.update(edits)
+                return
+            raise StaleRosterDataError(
+                f"這個梯次（{key}）已不在清單中（可能已在另一台電腦刪除），"
+                f"本次變更未套用。")
+
+        self.update_clerk_batches(_mut)
+        return edits
+
     def update_clerk_batches(self, mutator, *, retries: int = 4):
         return self._update_canonical(
             "clerk_batches.json",
@@ -658,26 +756,33 @@ class RosterService:
                 d, expected_revision=rev),
             mutator, retries=retries)
 
-    def toggle_week_color(self, year: int, week: str) -> "str | None":
-        """把某一週的手動覆蓋色切到下一個狀態(粉→綠→取消)。→ 新的值。
+    #: 週色手動覆蓋的循環順序(UI 依畫面上的值算下一個,再送過來)
+    WEEK_COLOR_CYCLE = {None: "pink", "pink": "green", "green": None}
+
+    def set_week_color(self, year: int, week: str,
+                       color: "str | None") -> "str | None":
+        """把某一週的手動覆蓋色設成 color(None＝移除覆蓋、回歸自動色)。→ 新的值。
 
         ★只動這一週★(外審排班 RS-5 第 1 輪 P1-3):UI 原本是「讀整份覆蓋集 →
-        改一格 → `replace=True` 整組寫回」,他機剛設的別週覆蓋會被抹掉;而且
-        下一個狀態要用【當下最新的】值去算,不是畫面上的舊值。
+        改一格 → `replace=True` 整組寫回」,他機剛設的別週覆蓋會被抹掉。
+        ★而且送的是【想要的顏色】,不是「切到下一個」★(第 2 輪 P2-02):
+        使用者看著粉色雙擊,他要的就是綠色;由程式對【他看不到的最新值】取
+        下一個狀態,會跳到一個他沒有要求的顏色。下一個狀態由 UI 依畫面上的
+        值算好(`WEEK_COLOR_CYCLE`)再送過來。
         """
+        if color not in (None, "pink", "green"):
+            raise ValueError(f"週色只能是 pink/green/None，收到 {color!r}")
         out: dict = {}
 
         def _mut(cur):
             weeks = cur.setdefault("weeks", {})
-            nxt = {None: "pink", "pink": "green", "green": None}.get(
-                weeks.get(week))
-            if nxt:
-                weeks[week] = nxt
+            if color:
+                weeks[week] = color
             else:
                 weeks.pop(week, None)
             cur["year"] = int(year)
             cur["source"] = "manual"
-            out["value"] = nxt
+            out["value"] = color
 
         self._update_canonical(
             "week_colors.json",
@@ -694,41 +799,77 @@ class RosterService:
                 d, expected_revision=rev),
             mutator, retries=retries)
 
-    def set_pgy_month_roster(self, ym: str, codes) -> None:
-        def _mut(month):
-            month["pgy_month_roster"] = [str(c) for c in codes]
-        self.update_month(ym, _mut)
+    def set_pgy_month_roster(self, ym: str, codes, *, baseline) -> None:
+        """`baseline`＝開窗時畫面上的那一份(必填)。★整份覆蓋會吃掉他機剛加
+        的人★:那個人明天就不會出現在日排班的候選名單裡,而畫面上看不出來。"""
+        base = [str(c) for c in (baseline or [])]
+        edited = [str(c) for c in codes]
 
-    def set_pgy_apply_pref(self, ym: str, codes) -> None:
+        def _mut(month):
+            cur = month.get("pgy_month_roster")
+            if cur is None:
+                # ★沒有月度覆蓋 ≠ 沒有「目前的名單」★(外審排班 RS-8 第 1 輪
+                #   P1):`None` 的語意是「沿用 config 的 PGY 名單」(對話框顯示
+                #   的也正是它)。當成空集合的話,他機剛加進 config 的人會在這次
+                #   存檔變成一份【明確排除他】的月度覆蓋 —— 他從此不在候選名單
+                #   裡,而畫面上完全看不出來。
+                cfg = self.storage.load_config()
+                cur = [str(m.get("id"))
+                       for m in (cfg.get("pgy_members") or [])]
+            keep = merge_set_edit([str(c) for c in cur], base, edited)
+            # 順序:使用者這一份的順序優先,他機新增的接在後面(去重)
+            merged = [c for c in edited if c in keep]
+            merged += [str(c) for c in cur
+                       if str(c) in keep and str(c) not in merged]
+            month["pgy_month_roster"] = merged
+        # ★config 與月檔的讀寫要在同一個臨界區★:兩者之間背景同步換掉 config
+        #   的話,合併用的「目前名單」與寫進去的月檔不是同一個盤面。
+        with self.storage.write_barrier():
+            self.update_month(ym, _mut)
+
+    def set_pgy_apply_pref(self, ym: str, codes, *, baseline) -> None:
         """[2026-07-23 使用者] 設定本月「Apply 本科」PGY（至多 2 位）：自動排班時，
         週二/週五早午的 101 診跟診在【座位次數平手時】優先排這些人（公平最優先，
         偏好只是最後的平手決勝）。"""
         codes = [str(c) for c in codes]
         if len(codes) > 2:
             raise ValueError("Apply 本科優先最多選 2 位")
+        base = [str(c) for c in (baseline or [])]
+
         def _mut(month):
             old = month.get("pgy_apply_pref")
-            month["pgy_apply_pref"] = codes
-            self._audit(month, "pgy", f"{ym} apply_pref", old, codes, "manual")
+            merged = merge_set_edit([str(c) for c in (old or [])], base, codes)
+            # ★合併之後要重新驗一次上限★:他機也剛加了一位的話,兩邊各自
+            #   合法、合起來就超過 2 位 —— 那時要明確拒絕,不可以自己挑掉一個。
+            if len(merged) > 2:
+                raise ValueError(
+                    f"其他電腦已經把 Apply 本科設成 {sorted(old or [])}，"
+                    f"與你這次的選擇合併後超過 2 位。請重新整理後再選一次。")
+            month["pgy_apply_pref"] = [c for c in codes if c in merged] + [
+                c for c in sorted(merged) if c not in codes]
+            self._audit(month, "pgy", f"{ym} apply_pref", old,
+                        month["pgy_apply_pref"], "manual")
         self.update_month(ym, _mut)
 
-    def toggle_day_lock(self, ym: str, d: date, session: str) -> bool:
-        """鎖定/解鎖某日某時段（鎖定後自動排班不重排該時段）。回傳新狀態。"""
+    def set_day_lock(self, ym: str, d: date, session: str, on: bool) -> bool:
+        """把某(日,時段)設成鎖定/解鎖(鎖定後自動排班不重排該時段)。回傳新狀態。
+
+        ★送的是【想要的狀態】,不是「反過來」★(見 `set_lock` 的同一條說明)。
+        """
+        want = bool(on)
+
         def _mut(month):
             if month.get("finalized"):
                 raise FinalizedMonthError(f"{ym} 已定案（唯讀）")
             locks = month.setdefault("day_locks", {}).setdefault(
                 d.isoformat(), {})
-            # ★狀態由【當下最新的月檔】決定★:重試時他機可能已經改過鎖定,
-            #   沿用第一次算出來的 new 會把對方的狀態原封蓋回去。
-            turn_on = not locks.get(session)
-            if turn_on:
+            if want:
                 locks[session] = True
             else:
                 locks.pop(session, None)
                 if not locks:
                     month["day_locks"].pop(d.isoformat(), None)
-            return turn_on
+            return want
         return self.update_month(ym, _mut)
 
     def is_day_locked(self, ym: str, d: date, session: str) -> bool:
@@ -1330,9 +1471,16 @@ class RosterService:
                 self.storage.save_biopsy(
                     _holder["book"], expected_revision=_holder.get("rev"))
 
-    def toggle_lock(self, scope: str, ym: str, d: date) -> bool:
-        """切換鎖定（空格不可鎖）。回傳切換後的鎖定狀態。"""
+    def set_lock(self, scope: str, ym: str, d: date, locked: bool) -> bool:
+        """把某格設成「鎖定/未鎖定」(空格不可鎖)。回傳設定後的狀態。
+
+        ★送的是【想要的狀態】,不是「反過來」★(外審排班第 2 輪 P2-02):
+        取反的話,他機剛把這一格鎖起來時,使用者按下畫面上寫著「鎖定」的動作
+        反而幫忙解鎖 —— 而且畫面刷新後看起來一切正常。使用者的意圖是絕對的
+        (「我要它鎖住」),不是相對於某個他早就看不到的舊值。
+        """
         iso = d.isoformat()
+        want = bool(locked)
         _holder: dict = {}
 
         def _mut(month) -> bool:
@@ -1342,20 +1490,27 @@ class RosterService:
             if not cell or not cell.get("person"):
                 _holder["empty"] = True
                 return False
-            cell["locked"] = not cell.get("locked", False)
+            if bool(cell.get("locked", False)) == want:
+                _holder["noop"] = True         # 盤上已經是這個狀態 → 不寫檔
+                return want
             self._audit(month, scope, iso,
-                        f"locked={not cell['locked']}",
-                        f"locked={cell['locked']}", "lock")
-            return cell["locked"]
+                        f"locked={cell.get('locked', False)}",
+                        f"locked={want}", "lock")
+            cell["locked"] = want
+            return want
 
         probe, _rev = self.storage.load_month_snapshot(ym)
         _mut(probe)
         if _holder.get("empty"):               # 空格不可鎖 → 不寫檔
             return False
+        if _holder.get("noop"):                # 已經是想要的狀態 → 不寫檔
+            return want
         return self.update_month(ym, _mut)
 
-    def set_leaves(self, scope: str, ym: str, member_id: str, dates) -> None:
-        self._set_date_map(scope, ym, "leaves", member_id, dates)
+    def set_leaves(self, scope: str, ym: str, member_id: str, dates, *,
+                   baseline) -> None:
+        """`baseline`＝開窗時的那一份(必填,見 `_set_date_map`)。"""
+        self._set_date_map(scope, ym, "leaves", member_id, dates, baseline)
         # [codex P2] R 請假變動影響週六切片（平衡候選排除/值班連動的請假優先）
         # → 同步重排＋刷新報告段；定案月 _set_date_map 已先拋,不會走到這裡。
         if scope == "r":
@@ -1365,8 +1520,9 @@ class RosterService:
                 logging.exception(
                     "[roster.service] set_leaves 週六切片重排失敗（略過）")
 
-    def set_must(self, scope: str, ym: str, member_id: str, dates) -> None:
-        self._set_date_map(scope, ym, "must_duty", member_id, dates)
+    def set_must(self, scope: str, ym: str, member_id: str, dates, *,
+                 baseline) -> None:
+        self._set_date_map(scope, ym, "must_duty", member_id, dates, baseline)
 
     def rename_member(self, scope: str, old_id: str, new_id: str) -> int:
         """把某 scope 成員的代號 old_id 連動改成 new_id（跨所有資料一次到位）。回傳異動處數。
@@ -1945,11 +2101,21 @@ class RosterService:
         return checks
 
     # ── 內部 ────────────────────────────────────────────────────────────
-    def _set_date_map(self, scope, ym, key, member_id, dates) -> None:
-        days = sorted(d.isoformat() for d in (dates or set()))
+    def _set_date_map(self, scope, ym, key, member_id, dates, baseline) -> None:
+        """把「這幾天加上去、那幾天拿掉」套到盤上最新的表上(不是整份覆蓋)。
+
+        `baseline`＝開窗時畫面上顯示的那一份 —— ★它是判斷【使用者做了什麼】
+        的依據★(外審排班第 2 輪 P1-02)。合併在 mutator 裡做:`update_month`
+        重試時會重讀月檔,合併必須對著【那一次】的內容重算。
+        """
+        base = {d.isoformat() for d in (baseline or set())}
+        edited = {d.isoformat() for d in (dates or set())}
 
         def _mut(month):
             table = month.setdefault(key, {}).setdefault(scope, {})
+            cur = set(table.get(str(member_id)) or ())
+            merged = merge_set_edit(cur, base, edited)
+            days = sorted(merged)
             if days:
                 table[str(member_id)] = days
             else:

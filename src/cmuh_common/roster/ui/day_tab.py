@@ -406,12 +406,18 @@ class DayScheduleTab(ttk.Frame):
         ttk.Button(bar, text="取消", command=win.destroy).pack(side="right")
         win.grab_set()
 
-    def _toggle_lock_session(self, d: date, session: str) -> None:
-        """鎖定/解鎖某(日,時段)。解鎖一律允許；只有「要新鎖定空時段」才擋
-        （避免鎖住無內容的格後無法解）。列表選取與月曆格選單共用。"""
+    def _set_lock_session(self, d: date, session: str, want: bool) -> None:
+        """把某(日,時段)設成鎖定/解鎖。解鎖一律允許；只有「要新鎖定空時段」才擋
+        （避免鎖住無內容的格後無法解）。列表選取與月曆格選單共用。
+
+        ★`want` 由呼叫端依【畫面上顯示的】狀態算好★(外審排班 RS-8 第 2 輪
+        P2):在這裡再讀一次磁碟取反,等於把同一個缺陷往上搬一層 —— 他機剛
+        鎖起來時,使用者按下標著「鎖定」的動作照樣把它解開。
+        """
         if self._finalized:
             return
-        if not self.service.is_day_locked(self.app.ym, d, session):
+        want = bool(want)
+        if want:
             slots = ((self.service.storage.load_month(self.app.ym)
                       .get("day_slots") or {}).get(d.isoformat())
                      or {}).get(session)
@@ -419,8 +425,8 @@ class DayScheduleTab(ttk.Frame):
                 messagebox.showinfo("鎖定", "此時段尚未排班，無法鎖定")
                 return
         guard_write(
-            lambda: self.service.toggle_day_lock(self.app.ym, d, session),
-            title="切換鎖定", parent=self)
+            lambda: self.service.set_day_lock(self.app.ym, d, session, want),
+            title="鎖定" if want else "解鎖", parent=self)
         self.refresh()          # 失敗也重畫:讓畫面回到磁碟上的真實內容
 
     def _on_toggle_lock(self) -> None:
@@ -434,7 +440,9 @@ class DayScheduleTab(ttk.Frame):
                             "或按「切換列表檢視」在列表中選取時段後再按本鈕")
             return
         iso, session = sel[0].split("|", 1)
-        self._toggle_lock_session(date.fromisoformat(iso), session)
+        # ★意圖取自列表上顯示的那一格★(🔒 欄就是使用者看到的狀態)
+        shown = bool(str(self._tree.set(sel[0], "lock") or "").strip())
+        self._set_lock_session(date.fromisoformat(iso), session, not shown)
 
     def _on_clear(self) -> None:
         if self._finalized:
@@ -482,8 +490,11 @@ class DayScheduleTab(ttk.Frame):
         val = _prompt_codes(self, "當月 PGY 人員（代號，頓號/逗號分隔）", "、".join(cur))
         if val is None:
             return
+        # ★`cur` 是對話框顯示給使用者看的那一份★ → 用它當基準算出「他加了誰、
+        #   刪了誰」;整份送回去會把他機剛加的人靜默移除(那個人明天就不會
+        #   出現在日排班的候選名單裡,而畫面上看不出來)。
         guard_write(lambda: self.service.set_pgy_month_roster(
-            self.app.ym, _split_codes(val)),
+            self.app.ym, _split_codes(val), baseline=list(cur)),
             title="當月 PGY 人員", parent=self)
         self.refresh()
 
@@ -520,7 +531,9 @@ class DayScheduleTab(ttk.Frame):
                 messagebox.showwarning("Apply本科", "最多選 2 位", parent=dlg)
                 return
             try:
-                self.service.set_pgy_apply_pref(self.app.ym, picked)
+                # 勾選框顯示的是 `cur` → 它就是這次編輯的基準。
+                self.service.set_pgy_apply_pref(self.app.ym, picked,
+                                                baseline=sorted(cur))
             except Exception as e:  # noqa: BLE001
                 messagebox.showerror("儲存失敗", str(e), parent=dlg)
                 return
@@ -617,10 +630,13 @@ class DayScheduleTab(ttk.Frame):
                         self, self.service, self.app.ym, d, s, self.refresh))
             m.add_separator()
             for session in ("上午", "下午"):
+                # ★標籤與動作要出自【同一次】判讀★:標籤寫「鎖定」而按下去
+                #   才重讀磁碟的話,兩者可能指向相反的事。
                 locked = self.service.is_day_locked(self.app.ym, d, session)
                 m.add_command(
                     label=f"{'解鎖' if locked else '鎖定'}{session} 🔒",
-                    command=lambda s=session: self._toggle_lock_session(d, s))
+                    command=lambda s=session, w=not locked:
+                        self._set_lock_session(d, s, w))
             m.tk_popup(event.x_root, event.y_root)
 
         def _bind_tree(w):
@@ -904,6 +920,9 @@ class _DayEditDialog(tk.Toplevel):
         # 併入「已存但已從模板移除/被關閉」的房號 → 殘留指派才可編輯/清除
         stale = [k for k in slots if k not in _SPECIAL_SLOTS and k not in rooms]
         self._slots = [PHOTO, TREATMENT, BIOPSY, *sorted({*rooms, *stale}), REST]
+        # ★開窗時各格的內容＝這次編輯的基準★(外審排班第 2 輪 P1-02):
+        #   沒動過的輸入框原封送回去,等於把他機這段期間的修改退回舊值。
+        self._baseline = {slot: list(slots.get(slot) or []) for slot in self._slots}
         self._cands, self._leaves = self._load_candidates()
         self._entries: dict = {}
         for i, slot in enumerate(self._slots):
@@ -1013,7 +1032,8 @@ class _DayEditDialog(tk.Toplevel):
         # 失敗不關窗——關掉等於告訴使用者「存好了」,而他其實可以重試或按取消。
         if not guard_write(
                 lambda: self.service.set_day_session(
-                    self.ym, self.d, self.session, slots),
+                    self.ym, self.d, self.session, slots,
+                    baseline=self._baseline),
                 title="手動編輯", parent=self):
             return
         self.destroy()
