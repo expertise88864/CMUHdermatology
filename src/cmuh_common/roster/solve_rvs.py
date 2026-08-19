@@ -93,6 +93,10 @@ class SolveResult:
     prechecks: list = field(default_factory=list)
     diagnosis: list = field(default_factory=list)     # infeasible 時的人話診斷
     last_weekend: Optional[dict] = None               # {"saturday": iso, "person": id}
+    #: ★這一批結果是照【哪一份輸入】算出來的★(外審排班第 2 輪 P1-04)。
+    #: 套用時重建 ctx 再比一次:不同就拒絕。空字串＝來源不明,一律拒絕
+    #: (沒有指紋就無從確認,而「無從確認」不可以當成「沒問題」)。
+    input_fingerprint: str = ""
 
 
 def _lazy_cp_model():
@@ -167,6 +171,17 @@ def _reasons_for(ctx: SolveContext, scope: str, assignments: dict) -> dict:
     return out
 
 
+def rvs_input_fingerprint(ctx: SolveContext) -> str:
+    """R/VS 求解【吃到的全部輸入】的識別(見 `roster.fingerprint`)。
+
+    ★取指紋的時機必須與套用時重建的那一刻對齊★:`prepare()` 與
+    `apply_boundary_from_prev()` 之後 —— `build_context` 就是做完這兩步才
+    回傳的,兩邊的階段不一樣就永遠不會相等(於是守衛變成「永遠說過期」)。
+    """
+    from cmuh_common.roster.fingerprint import input_fingerprint  # noqa: PLC0415
+    return input_fingerprint(ctx)
+
+
 def solve_duty(ctx: SolveContext, allow_disable_color: bool = False) -> SolveResult:
     """主入口。ctx 需已 prepare()；scope 取 ctx.scope（"r"/"vs"）。"""
     scope = ctx.scope
@@ -177,6 +192,9 @@ def solve_duty(ctx: SolveContext, allow_disable_color: bool = False) -> SolveRes
         # [codex P2] 跨月銜接在此自動套用：呼叫端只需設 prev_last_weekend,
         # 不必記得另呼叫 helper（重複呼叫等冪,已設同值無害）。
         apply_boundary_from_prev(ctx)
+        # ★指紋在【求解之前】就記下來★:這一批結果的來源是此刻這份輸入。
+        #   放在 return 之前的話,求解過程若動到 ctx 就會記成別的東西。
+        res.input_fingerprint = rvs_input_fingerprint(ctx)
         res.prechecks = run_prechecks(ctx, scope)
         if any(c.severity == "error" for c in res.prechecks):
             res.status = "precheck_failed"

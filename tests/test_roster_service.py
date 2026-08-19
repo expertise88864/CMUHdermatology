@@ -11,7 +11,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from cmuh_common.roster.model import day_point  # noqa: E402
 from cmuh_common.roster.service import RosterService  # noqa: E402
-from cmuh_common.roster.solve_rvs import SolveResult  # noqa: E402
+from cmuh_common.roster.solve_rvs import (
+    SolveResult, rvs_input_fingerprint,
+)  # noqa: E402
 from cmuh_common.roster.storage import (  # noqa: E402
     FinalizedMonthError, RosterStorage,
 )
@@ -55,10 +57,13 @@ def _result_for(svc, ym, assignments, last_weekend=None):
     for d, mid in assignments.items():
         if mid in pts:
             pts[mid] += day_point(d, ctx.holidays, ctx.params)
+    # ★測試要用生產的呼叫形狀★:求解器產出的結果一定帶輸入指紋,
+    #   accept 會拿它跟重建的 ctx 比。少了它就是在測一個生產不會出現的物件。
     return SolveResult(
         status="ok", scope="r", level_used=0, level_name="L0",
         assignments=dict(assignments), points_by_person=pts,
-        last_weekend=last_weekend)
+        last_weekend=last_weekend,
+        input_fingerprint=rvs_input_fingerprint(ctx))
 
 
 # ─── build_context ────────────────────────────────────────────────────────
@@ -291,11 +296,19 @@ def test_accept_rejects_stale_after_point_change(tmp_path):
 
 
 def test_double_accept_no_double_count(tmp_path):
+    """同一批結果套用第二次 → ★被判過期而拒絕★,帳本一動也不動。
+
+    [批次RS-7] 帳本是求解的輸入之一(它決定每個人的目標點數),所以第一次
+    套用之後,那批結果算的就已經不是「現在這份輸入」了 —— 全輸入指紋因此
+    擋下第二次。帳本不加倍這個性質仍然成立,而且現在有兩層:上面這道閘門,
+    以及 `settle_month` 本身的同月回滾(見 test_roster_core 的帳本測試)。
+    """
     svc = _svc(tmp_path)
     res = _result_for(svc, YM, _cover(svc, YM, "A"))
     svc.accept_solution("r", YM, res)
     a1 = svc.storage.load_ledger()["r"]["A"]
-    svc.accept_solution("r", YM, res)          # 同月二次 → 內含回滾
+    with pytest.raises(ValueError, match="已過期"):
+        svc.accept_solution("r", YM, res)      # 同月二次
 
     ledger = svc.storage.load_ledger()
     assert ledger["r"]["A"] == a1              # 不因二次而加倍

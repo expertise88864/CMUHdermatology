@@ -47,7 +47,7 @@ from cmuh_common.roster.saturday_biopsy import (
     assign_saturday_biopsy, biopsy_pair, can_rollback as biopsy_can_rollback,
     format_biopsy_section, last_assigned_before, settle_biopsy)
 from cmuh_common.roster.solve_rvs import (
-    SolveResult, apply_boundary_from_prev, solve_duty,
+    SolveResult, apply_boundary_from_prev, rvs_input_fingerprint, solve_duty,
 )
 from cmuh_common.roster.storage import (
     FinalizedMonthError,
@@ -1075,6 +1075,25 @@ class RosterService:
         # 任一改動，舊 result 可能把請假者排上或違反新 directive，settle 出的帳本/
         # 報告就與實況脫節。以重建的 ctx 驗證，不符即拒絕、要求重排（寫入前）。
         ctx = self.build_context(scope, ym)
+        # ★判準是【整份輸入的指紋】,不是一張手工白名單★(外審排班第 2 輪
+        #   P1-04):`_result_stale_reason` 逐項列舉的那六七件事會腐爛 ——
+        #   `fixed_weekday`(固定星期)與 `week_colors`(色塊連週)都是 CP-SAT 的
+        #   ★硬約束★,卻從來沒被它看過;duty_min/max、帳本、上月尾端也一樣。
+        #   預覽開著的期間他機改了其中任一項,舊解照樣落地成一份【違反目前
+        #   硬限制】的班表,而且畫面上看不出來。指紋走 dataclass 的欄位本身,
+        #   日後有人加一個新輸入欄位,它自動被涵蓋。
+        if not result.input_fingerprint:
+            raise ValueError(
+                "排班結果沒有輸入指紋（可能來自舊版程式或未經求解器產生），"
+                "無從確認它是否仍符合目前的名單/請假/固定星期/週色等設定，"
+                "請重新排班")
+        if result.input_fingerprint != rvs_input_fingerprint(ctx):
+            # 白名單降級成★第二層診斷★:能講清楚是哪一項就講,講不出來也照樣
+            # 擋下(守衛的判準是指紋,不是「我找不找得到理由」)。
+            why = self._result_stale_reason(ctx, result) or "輸入設定已變動"
+            raise ValueError(f"排班結果已過期（{why}），請重新排班")
+        # 指紋相同 ⇒ 輸入沒變;這一層驗的是【結果與輸入自不自洽】(涵蓋日期、
+        # 指定有沒有被採用、點數對不對……),那是另一件事,不可以一起省掉。
         stale = self._result_stale_reason(ctx, result)
         if stale:
             raise ValueError(f"排班結果已過期（{stale}），請重新排班")

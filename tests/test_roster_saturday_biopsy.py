@@ -12,7 +12,9 @@ from cmuh_common.roster.saturday_biopsy import (  # noqa: E402
     assign_saturday_biopsy, biopsy_pair, format_biopsy_section,
     last_assigned_before, month_saturdays, rollback_biopsy, settle_biopsy)
 from cmuh_common.roster.service import RosterService  # noqa: E402
-from cmuh_common.roster.solve_rvs import SolveResult  # noqa: E402
+from cmuh_common.roster.solve_rvs import (
+    SolveResult, rvs_input_fingerprint,
+)  # noqa: E402
 from cmuh_common.roster.storage import RosterStorage  # noqa: E402
 
 YM = "2026-08"   # 2026/8 週六 = 1, 8, 15, 22, 29
@@ -172,7 +174,8 @@ def _result_for(svc, ym, assignments):
         if mid in pts:
             pts[mid] += day_point(d, ctx.holidays, ctx.params)
     return SolveResult(status="ok", scope="r", level_used=0, level_name="L0",
-                       assignments=dict(assignments), points_by_person=pts)
+                       assignments=dict(assignments), points_by_person=pts,
+                       input_fingerprint=rvs_input_fingerprint(ctx))
 
 
 def test_accept_writes_biopsy_and_counts(tmp_path):
