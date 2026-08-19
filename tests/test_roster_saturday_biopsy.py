@@ -172,7 +172,10 @@ def _cover(svc, ym, person, overrides=None):
 
 
 def _result_for(svc, ym, assignments):
-    ctx = svc.build_context("r", ym)
+    # ★測試要用生產的呼叫形狀★:結果來自 `solve_duty`,而它的 ctx 是
+    #   `for_solve=True`(帳本＝本月結算之前)。用顯示端的 ctx 蓋指紋的話,
+    #   accept 重建時比的是另一份輸入 —— 會得到一個生產不會出現的「已過期」。
+    ctx = svc.build_context("r", ym, for_solve=True)
     pts = {m.id: 0 for m in ctx.members}
     for d, mid in assignments.items():
         if mid in pts:

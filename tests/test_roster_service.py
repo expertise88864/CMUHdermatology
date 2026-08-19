@@ -56,7 +56,10 @@ def _cover(svc, ym, person="A", overrides=None):
 def _result_for(svc, ym, assignments, last_weekend=None):
     """依當前 ctx 的點數規則，由 assignments 算出「一致的」points_by_person
     的 ok 結果（accept 會用當前 ctx 重算點數核對，不一致會被判過期）。"""
-    ctx = svc.build_context("r", ym)
+    # ★測試要用生產的呼叫形狀★:結果來自 `solve_duty`,而它的 ctx 是
+    #   `for_solve=True`(帳本＝本月結算之前)。用顯示端的 ctx 蓋指紋的話,
+    #   accept 重建時比的是另一份輸入 —— 會得到一個生產不會出現的「已過期」。
+    ctx = svc.build_context("r", ym, for_solve=True)
     pts = {m.id: 0 for m in ctx.members}
     for d, mid in assignments.items():
         if mid in pts:
@@ -300,24 +303,25 @@ def test_accept_rejects_stale_after_point_change(tmp_path):
 
 
 def test_double_accept_no_double_count(tmp_path):
-    """同一批結果套用第二次 → ★被判過期而拒絕★,帳本一動也不動。
+    """同一批結果套用第二次＝冪等的 no-op:帳本不加倍、也不會被誤判過期。
 
-    [批次RS-7] 帳本是求解的輸入之一(它決定每個人的目標點數),所以第一次
-    套用之後,那批結果算的就已經不是「現在這份輸入」了 —— 全輸入指紋因此
-    擋下第二次。帳本不加倍這個性質仍然成立,而且現在有兩層:上面這道閘門,
-    以及 `settle_month` 本身的同月回滾(見 test_roster_core 的帳本測試)。
+    [RS-7 → RS-9] RS-7 加了全輸入指紋之後,這裡一度變成「第二次會被拒絕」——
+    因為當時 `build_context` 讀的是【含本月結算】的帳本,第一次套用就把輸入
+    改掉了。RS-9 讓求解一律以【本月結算之前】的餘額為基準(記憶體回滾,
+    磁碟不動),那個差異隨之消失:輸入沒變,指紋自然相同。
+    ★不加倍★由 `settle_month` 的同月回滾保證(見 test_roster_core 的帳本測試)。
     """
     svc = _svc(tmp_path)
     res = _result_for(svc, YM, _cover(svc, YM, "A"))
     svc.accept_solution("r", YM, res)
     a1 = svc.storage.load_ledger()["r"]["A"]
-    with pytest.raises(ValueError, match="已過期"):
-        svc.accept_solution("r", YM, res)      # 同月二次
+    svc.accept_solution("r", YM, res)          # 同月二次 → 內含回滾
 
     ledger = svc.storage.load_ledger()
     assert ledger["r"]["A"] == a1              # 不因二次而加倍
     assert len([h for h in ledger["history"]
                 if h["month"] == YM and h["scope"] == "r"]) == 1
+
 
 
 # ─── 手動編輯 ─────────────────────────────────────────────────────────────

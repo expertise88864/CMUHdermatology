@@ -30,7 +30,9 @@ from typing import NamedTuple
 
 from cmuh_common.roster.calendar_colors import week_colors_for_year
 from cmuh_common.roster.clinic_grid import month_grid
-from cmuh_common.roster.ledger import settle_month, sync_members
+from cmuh_common.roster.ledger import (
+    can_rollback, rollback_month, settle_month, sync_members,
+)
 from cmuh_common.roster.model import (
     ClerkBatch, Member, RosterParams, SolveContext, batches_covering, day_point,
     roc,
@@ -157,8 +159,36 @@ class RosterService:
         self.storage = storage
 
     # ── 讀取組裝 ────────────────────────────────────────────────────────
+    def solver_ledger(self, scope: str, ym: str) -> dict:
+        """求解要看的是【本月結算之前】的餘額。→ {member_id: 餘額}
+
+        (外審排班 RS-9 / 新一輪 P1-02)`ledger.py` 的契約寫得很清楚:正值＝
+        之前多值、目標調低,而且「同月重排 = 先 rollback 該月舊分錄再重記」。
+        直接讀當下的帳本的話,同一個月按第二次「自動排班」時,solver 看到的是
+        【本月第一次班表造成的暫時差額】(例如 A +5 / B -5)—— 它會刻意排出
+        一份反向傾斜的新班表去補償;而接受時 `settle_month` 又會把第一次那筆
+        rollback 掉,最後反而留下一筆方向相反的欠帳。
+        ★只在記憶體裡回滾,磁碟不動★:這裡是求解的輸入,不是結算。
+        """
+        led_all = copy.deepcopy(self.storage.load_ledger())
+        if not can_rollback(led_all, ym):
+            # 該月分錄可能已被修剪 → 無從確認「本月之前」是多少。寧可擋下
+            # 並說清楚(硬猜一個基準會讓之後每個月的公平目標都跟著錯)。
+            raise ValueError(
+                f"{ym} 比帳本保留的最舊月份還早，無法確認本月結算之前的餘額，"
+                f"因此不能重新排班（重排會以錯誤的公平基準計算）。"
+                f"如確實需要，請直接調整 ledger.json。")
+        rollback_month(led_all, scope, ym)
+        # ★餘額 0 與「這個人還沒有分錄」對求解是同一件事★:回滾之後會留下
+        #   一堆值為 0 的鍵,而原本那些鍵根本不存在 —— 兩者的求解結果完全
+        #   相同,指紋卻不一樣(RS-7 的過期判準會因此誤報「輸入設定已變動」)。
+        #   求解端一律 `ledger.get(mid, 0.0)`,所以這裡去掉 0 是等價的正規化。
+        return {k: v for k, v in (led_all.get(scope) or {}).items()
+                if round(float(v or 0.0), 4) != 0.0}
+
     def build_context(self, scope: str, ym: str, *,
-                      month: "dict | None" = None) -> SolveContext:
+                      month: "dict | None" = None,
+                      for_solve: bool = False) -> SolveContext:
         """讀 config/ledger/holiday_duty/week_colors/month 檔 → 已 prepare 且已套
         跨月銜接（boundary_fix）的 SolveContext。
 
@@ -167,7 +197,15 @@ class RosterService:
 
         `month=` 傳入已載入的月檔 → ★用【呼叫端手上那一份】,不另外再讀一次★
         (外審排班 RS-6):重算帳本時「算點數用的 duty」與「被標定案的月檔」
-        必須是同一份,分開讀就可能是兩個版本。"""
+        必須是同一份,分開讀就可能是兩個版本。
+
+        `for_solve=True` → 帳本改用★本月結算之前★的餘額(見 `solver_ledger`)。
+        ★只有求解那條路要這樣★(外審排班 RS-9 第 1 輪):同一個 context 也
+        餵給顯示(結算面板)、報告與驗證 —— 那些地方要的是【帳本現在的實際
+        餘額】。一律回滾的話,使用者套用排班之後打開分頁只會看到 0/0,
+        而設定頁直接讀帳本又顯示 +5/-5,兩邊自相矛盾;更糟的是,那個
+        「分錄可能已被修剪」的 fail-closed 會讓【單純想看一個舊月份】的人
+        連分頁都打不開。"""
         cfg = self.storage.load_config()
         month = self.storage.load_month(ym) if month is None else month
         y, m = int(ym[:4]), int(ym[5:7])
@@ -190,7 +228,8 @@ class RosterService:
                 except (ValueError, TypeError):
                     logging.warning("[roster.service] 鎖定格壞日期略過 %r", iso)
 
-        ledger = dict((self.storage.load_ledger().get(scope)) or {})
+        ledger = (self.solver_ledger(scope, ym) if for_solve
+                  else dict(self.storage.load_ledger().get(scope) or {}))
         # 週色：決定性自動套色（依 115 行事曆 4 週交替邏輯，涵蓋跨年邊界的
         # y-1/y/y+1）為基底 → 使用者於設定頁的手動覆蓋優先蓋上。
         week_colors: dict = {}
@@ -1005,7 +1044,9 @@ class RosterService:
     def run_solve(self, scope: str, ym: str,
                   allow_disable_color: bool = False) -> SolveResult:
         """build_context → solve_duty。不落地（UI 先預覽，接受後才 accept）。"""
-        ctx = self.build_context(scope, ym)
+        # ★求解與套用時的重建必須是【同一種】context★:指紋比對只在兩邊
+        #   看到同一份輸入時才有意義(見 `solver_ledger`)。
+        ctx = self.build_context(scope, ym, for_solve=True)
         return solve_duty(ctx, allow_disable_color=allow_disable_color)
 
     # ── 週六切片（R2/R3 輪排，2026-07-13）────────────────────────────────
@@ -1166,8 +1207,16 @@ class RosterService:
 
     def render_report(self, scope: str, ym: str, result: SolveResult) -> str:
         """以目前 storage 狀態重建 ctx，產生 result 的四段式決策報告（純字串）。
-        R 排班另附「週六切片」預覽段（依 result 的值班連動＋次數平衡，未落地）。"""
-        ctx = self.build_context(scope, ym)
+        R 排班另附「週六切片」預覽段（依 result 的值班連動＋次數平衡，未落地）。
+
+        ★報告描述的是【這一份 result】,所以要用它的基準★(外審排班 RS-9
+        第 2 輪 P1):報告的「新帳本」是 `ctx.ledger + (點數 - 公平份額)`。
+        同月第二次求解時,求解看的是本月結算之前的餘額,報告若用顯示端的
+        帳本(已含第一次結算),印出來的結轉與新帳本就與接受後的實際結果
+        對不上 —— 而接受時 `settle_month` 會先把第一次那筆回滾掉。
+        (已存進月檔的舊報告是當時的字串,直接讀月檔即可,不受此影響。)
+        """
+        ctx = self.build_context(scope, ym, for_solve=True)
         base = build_report(ctx, result, _SCOPE_LABEL.get(scope, scope))
         if scope == "r" and result.status == "ok":
             try:
@@ -1215,7 +1264,7 @@ class RosterService:
         # result 必須仍符合「當前」輸入才落地：預覽後若 請假/指定/鎖定/名單/假日
         # 任一改動，舊 result 可能把請假者排上或違反新 directive，settle 出的帳本/
         # 報告就與實況脫節。以重建的 ctx 驗證，不符即拒絕、要求重排（寫入前）。
-        ctx = self.build_context(scope, ym)
+        ctx = self.build_context(scope, ym, for_solve=True)   # 與求解同一種
         # ★判準是【整份輸入的指紋】,不是一張手工白名單★(外審排班第 2 輪
         #   P1-04):`_result_stale_reason` 逐項列舉的那六七件事會腐爛 ——
         #   `fixed_weekday`(固定星期)與 `week_colors`(色塊連週)都是 CP-SAT 的
