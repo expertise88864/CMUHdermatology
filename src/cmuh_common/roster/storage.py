@@ -144,6 +144,9 @@ class RosterStorage:
         #   (跨機由 revision 本身擋;同機雙開由單例互斥擋。)
         self._write_lock = threading.RLock()
 
+    def quiesce_local(self) -> None:
+        """關閉前收斂本機狀態。基底層沒有背景同步 → 無事可做(見 GitSync)。"""
+
     @contextlib.contextmanager
     def write_barrier(self):
         """在這個區塊內,★盤上的資料不會被背景同步換掉★。

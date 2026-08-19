@@ -35,7 +35,8 @@ from cmuh_common.platform_win import set_dpi_awareness, set_app_user_model_id
 from cmuh_common.window_icon import apply_tk_window_icon
 from cmuh_common.logging_setup import setup_logging
 from cmuh_common.single_instance import (
-    ensure_single_instance, release_single_instance,
+    INSTANCE_ALREADY_RUNNING, INSTANCE_UNKNOWN,
+    acquire_single_instance, release_single_instance,
 )
 from cmuh_common.deps_runtime import ensure_dependencies
 
@@ -65,8 +66,12 @@ setup_logging(LOG_FILE)
 SINGLE_INSTANCE_MUTEX = "Local\\CMUH_Skin_Scheduler_SingleInstance_v1"
 WINDOW_TITLE = "中國醫皮膚科排班程式"
 
+#: 「這次關閉是因為自動更新要重啟」——收尾時據此決定 push 交給誰
+#: (外審排班 P2-02;`_run_app` 的 finally 讀它)。
+_HANDING_OVER = False
 
-def _check_updates_in_background(root: tk.Tk) -> None:
+
+def _check_updates_in_background(root: tk.Tk, app: "ScheduleApp") -> None:
     """背景執行緒檢查線上更新；若套用了需重啟的更新，回主執行緒重啟程式。
 
     與主程式共用同一套 manifest.json 更新機制（平行下載 + SHA256 + 原子寫入）。
@@ -82,9 +87,45 @@ def _check_updates_in_background(root: tk.Tk) -> None:
             return
         if _updater_mod.need_restart_after_update(result):
             logging.info("[update] 已套用自動更新，將重新啟動。")
-            root.after(0, restart_self)
+            root.after(0, lambda: _handover_and_restart(app))
 
     threading.Thread(target=_worker, name="update-check", daemon=True).start()
+
+
+def _handover_and_restart(app: "ScheduleApp") -> None:
+    """把 git repo 交給接班的新行程,然後重啟(在主執行緒跑)。
+
+    ★順序是有預算的★(外審排班 RS-3 第 1 輪 P1):新行程搶單例 mutex 只重試
+    1.5 秒,而 `restart_self` 為了確認它沒早夭已經先等掉約 0.6 秒 —— 也就是
+    釋放 mutex 只剩下不到 1 秒的窗口。把 `quiesce_local()`(可能要等 git 鎖、
+    join 背景執行緒)放進那個窗口,新行程會判定「已在執行中」而自行退出,
+    舊行程稍後也退出 → ★整個排班程式消失★。
+    所以:
+      ① ★先在 spawn 之前★把本機收斂完(commit;不碰網路,不搶 mutex);
+      ② `on_confirmed`(確認接班者活著、本行程即將退出時才呼叫)裡★第一件事★
+         就是釋放 mutex —— 這是 `restart_self` 文件明訂的用法;
+      ③ 接班沒成立(spawn 失敗/新行程早夭)→ 舊行程會繼續活著,把同步收回來,
+         而且交棒旗標不設 → 之後的一般關閉仍會照舊 push。
+    """
+    quiesced = False
+    try:
+        app.storage.quiesce_local()          # ①(不碰網路,慢也不佔 mutex 窗口)
+        quiesced = True
+    except Exception:
+        logging.debug("交棒前本機 git 收斂失敗", exc_info=True)
+
+    def _on_confirmed() -> None:
+        globals()["_HANDING_OVER"] = True    # ★只有確認接班成功才算交棒★
+        release_single_instance()            # ②★最前面★
+
+    restart_self(on_confirmed=_on_confirmed)
+    # 走到這裡代表【沒有】重啟(Popen 失敗或新行程早夭,restart_self 保留舊行程)
+    if quiesced and not _HANDING_OVER:
+        logging.warning("[update] 重啟未成立 → 把背景同步收回來(本機仍可用)")
+        try:
+            app.storage.resume_sync()        # ③
+        except Exception:
+            logging.debug("恢復背景同步失敗", exc_info=True)
 
 
 class ScheduleApp:
@@ -274,11 +315,32 @@ def main() -> None:
     set_dpi_awareness()
     set_app_user_model_id()
 
-    # 單例：防雙開搶 log rotate / 之後的排班檔寫入撞檔。
-    if not ensure_single_instance(SINGLE_INSTANCE_MUTEX):
+    # 單例：防雙開搶 log rotate / 排班檔寫入撞檔。
+    # ★三態★(外審排班 P2-03):以前 mutex API 壞掉時一律當成「拿到了」——
+    #   那是把【不知道】說成【安全】。排班程式是整批 whole-file writer 加一個
+    #   git working tree,雙開的後果比一般 UI app 嚴重。
+    #   ★這裡不 fail-closed★:單例壞掉時把使用者完全擋在門外(排不了班)代價
+    #   更大,而「同時兩個 instance 各自整份覆寫」那條路已由 RS-1 的 CAS 擋住
+    #   (寫回時會發現盤上不是自己讀到的那一份 → 重讀重套 / 拒絕)。
+    #   所以:明確告訴使用者現在無法確認、附上復原指引,由人決定要不要繼續。
+    _state = acquire_single_instance(SINGLE_INSTANCE_MUTEX)
+    if _state == INSTANCE_ALREADY_RUNNING:
         ctypes.windll.user32.MessageBoxW(
             0, "排班程式已在執行中。", WINDOW_TITLE, 0x40 | 0x1000)
         sys.exit(0)
+    if _state == INSTANCE_UNKNOWN:
+        logging.error("[單例] 無法確認是否已有另一個排班程式在執行"
+                      "（mutex 機制異常）")
+        if ctypes.windll.user32.MessageBoxW(
+                0,
+                "無法確認是否已經有另一個排班程式在執行（系統的單例機制異常）。"
+                "\n\n若你確定沒有另一個視窗開著，可以按「確定」繼續；"
+                "\n不確定的話請按「取消」，先關掉所有排班程式視窗、重開機後再試。"
+                "\n\n"
+                "（跨機同步的資料保護仍然有效：存檔時若發現內容已被別人改過，"
+                "會重讀最新版再套用你的修改，不會直接覆蓋。）",
+                WINDOW_TITLE, 0x30 | 0x1 | 0x1000) != 1:      # 1 = IDOK
+            sys.exit(0)
     atexit.register(release_single_instance)
 
     root = tk.Tk()
@@ -319,7 +381,7 @@ def main() -> None:
         except Exception:
             logging.debug("排班初始化失敗錯誤框顯示失敗", exc_info=True)
         sys.exit(1)
-    _check_updates_in_background(root)
+    _check_updates_in_background(root, app)
 
     logging.info("--- 排班程式骨架啟動 (v%s) ---", CURRENT_VERSION)
     _run_app(root, app)
@@ -327,19 +389,36 @@ def main() -> None:
 
 def _run_app(root: tk.Tk, app: "ScheduleApp") -> None:
     """跑 mainloop，並在任何離開路徑（正常關閉 / KeyboardInterrupt / 自動更新
-    restart_self 的 SystemExit 穿出 mainloop）都收尾：先釋放單例 mutex 讓重啟的
-    新行程能啟動，再 flush 把去抖中的 push 推完（跨機同步，非 git repo 時為 no-op）。
+    restart_self 的 SystemExit 穿出 mainloop）都收尾。
+
+    ★收尾方式取決於「有沒有接班的人」★——見下方註解(外審排班 P2-02)。
     """
     try:
         root.mainloop()
     finally:
-        # restart_self 已 spawn 新行程；flush 的 git push 可能卡到 30s（離線 timeout），
-        # 新行程 ensure_single_instance 只重試 1.5s，必須先釋放 mutex 讓它能啟動。
-        release_single_instance()   # 冪等；atexit 再跑一次是 no-op
-        try:
-            app.storage.flush()
-        except Exception:
-            logging.debug("關閉前 git 同步 flush 失敗", exc_info=True)
+        # ★兩種關閉要分開處理★(外審排班 P2-02)
+        #   ① 因更新而重啟:`restart_self` 已經 spawn 了新行程,它只等 mutex
+        #      1.5 秒。舊寫法「先放 mutex 再 flush」會讓新一代在舊的還在
+        #      fetch/merge/push(離線可達 30 秒)時就開始 startup pull ——
+        #      ★兩代同時操作同一個 `.git`★(working tree/index/HEAD),症狀是
+        #      index.lock / pull failed / push 延遲。
+        #      → 只做 `quiesce_local()`(停背景 pull + 本機 commit,不碰網路),
+        #        放掉 mutex,剩下的 push 由新一代開機時補推。
+        #   ② 一般關閉(使用者關視窗):★沒有接班的人★ —— 這時若不 push,本機
+        #      的變更要等到下次有人打開這台的排班程式才會出去,他機看不到。
+        #      → 照舊 `flush()` 推完再放 mutex。
+        handing_over = bool(globals().get("_HANDING_OVER"))
+        if handing_over:
+            # 交棒的收斂與釋放已經在 `_handover_and_restart` 做完(而且順序
+            # 有時間預算,見那裡的說明)——這裡不要再碰 git,repo 現在是新
+            # 行程的。`release_single_instance` 冪等,再叫一次是 no-op。
+            release_single_instance()
+        else:
+            try:
+                app.storage.flush()
+            except Exception:
+                logging.debug("關閉前 git 同步 flush 失敗", exc_info=True)
+            release_single_instance()
         logging.info("--- Script Finished ---")
 
 

@@ -164,7 +164,20 @@ class RosterService:
 
         duty 值為 {date: person_id}（只取有排班者）；names 為 {id: 顯示名}
         （R 用姓名、VS 用代號）；leaves 為 {id: [date,...]}。
+
+        ★整份匯出必須來自【同一個版本】★(外審排班 P2-04):本函式依序讀
+        config → 月檔 → 年度假日 → 帳本,之後 `build_day_input` 又各自再讀
+        一次模板/梯次/切片格網/上月檔。背景同步隨時可以插在任何兩次讀之間,
+        於是一份 Excel/PDF 可能是「R/VS 值班＝舊版、PGY 格網＝新版、帳本
+        ＝舊版」的拼裝品 —— 它不會毀壞資料,但那是要發出去的正式班表。
+        在同一個 `write_barrier()` 內讀完就沒有這個縫(同時也擋住自己人:
+        匯出期間別的執行緒的存檔會排在後面)。
         """
+        with self.storage.write_barrier():
+            return self._build_export_locked(ym)
+
+    def _build_export_locked(self, ym: str) -> dict:
+        """`build_export` 的本體。★呼叫端必須持有 `write_barrier`★"""
         cfg = self.storage.load_config()
         month = self.storage.load_month(ym)
         y, m = int(ym[:4]), int(ym[5:7])

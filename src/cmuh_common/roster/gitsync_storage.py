@@ -95,6 +95,12 @@ class GitSyncStorage(RosterStorage):
             # 會偵測到而跳過，避免本機留下未追蹤的 .gitignore 撞掉之後的 ff-only merge。
             self._pull()
             self._gitignore_ok = self._ensure_gitignore()
+            # ★接手上一代沒推出去的 commit★(外審排班 P2-02):更新重啟時,
+            #   舊 generation 只把變更 commit 到本機就把 mutex 交出來(它不能
+            #   在新一代已經啟動的情況下還去碰同一個 .git —— index.lock/
+            #   pull failed 都是這樣來的)。那些 commit 由這裡補推;沒有本機
+            #   領先時 `_schedule_push` 推出去的是 no-op,成本可以忽略。
+            self._schedule_push()
             if self._pull_interval and self._pull_interval > 0:
                 self._pull_thread = threading.Thread(
                     target=self._pull_loop, name="roster-git-pull", daemon=True)
@@ -623,6 +629,49 @@ class GitSyncStorage(RosterStorage):
                 return changed
             self._set_state("ok")
             return changed
+    def quiesce_local(self) -> None:
+        """停掉背景同步並把本機變更 commit 完 —— ★完全不碰網路★。
+
+        (外審排班 P2-02)更新重啟的交棒:舊 generation 若照舊先放 mutex 再
+        `flush()`,新一代會在 1.5 秒後拿到 mutex 並開始 startup pull,而舊的
+        還在 fetch/merge/push 同一個 `.git`(push 可能等 30 秒)—— 兩代同時碰
+        working tree/index/HEAD,最典型的症狀是 index.lock 與 pull failed。
+        所以交棒順序改成:★先 quiesce(本機 commit 一定要做完)→ 放 mutex →
+        剩下的 push 交給新一代開機時補★。
+        """
+        if not self._git_ok:
+            return
+        self._stop_evt.set()                     # 收掉週期 pull 執行緒
+        with self._push_lock:
+            if self._push_timer is not None:
+                self._push_timer.cancel()
+                self._push_timer = None
+        t = self._pull_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=5.0)                  # 等它跑完手上那一輪再動 git
+        with self._git_lock:
+            self._commit("關閉前本機同步")
+
+    def resume_sync(self) -> None:
+        """把 `quiesce_local()` 停掉的背景同步收回來。
+
+        (外審排班 RS-3 第 1 輪 P1)交棒是「先收斂本機,再確認接班」——
+        ★接班沒成功時舊行程會繼續活著★(`restart_self` 確認新行程早夭就保留
+        舊的),那時如果不把週期 pull 收回來,這台機器從此不再自動同步,而且
+        使用者完全看不出來(只會覺得「別台的班表怎麼都沒進來」)。
+        """
+        if not (self._git_ok and self._remote_sync):
+            return
+        if not self._stop_evt.is_set():
+            return                               # 沒有停過 → 不重複起執行緒
+        self._stop_evt.clear()
+        if self._pull_interval and self._pull_interval > 0:
+            t = threading.Thread(target=self._pull_loop, daemon=True,
+                                 name="roster-git-pull")
+            self._pull_thread = t
+            t.start()
+        self._schedule_push()                    # 補推 quiesce 時已 commit 的
+
     def flush(self) -> None:
         """立即推送（取消去抖、同步 push）；關閉程式前呼叫確保不漏推。
 
