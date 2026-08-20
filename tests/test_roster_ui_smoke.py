@@ -714,3 +714,72 @@ def test_day_edit_dialog_marks_leave_and_other_slot(root, tmp_path):
     # 仍可把已排他格的人加到別格（只標示、不阻擋）
     dlg._toggle_code("治療室", "B")
     assert dlg._entries["治療室"].get() == "B"
+
+
+def test_biopsy_skip_menu_and_chip(root, tmp_path):
+    """[RS-12] 週六切片右鍵「本週不切片」:選單狀態與月曆紫籤都要看得出來。
+
+    ★"" 是有效的指定★:「改回自動排」在不切片狀態下必須仍可按(用 truthiness
+    判會變灰,使用者就改不回自動);紫籤要顯示「不切片」而不是「—」
+    (後者跟「還沒排到人」長得一樣)。
+    """
+    st = RosterStorage(str(tmp_path))
+    st.save_config({"r_members": [{"id": "r1", "level": "R1"},
+                                  {"id": "r2", "level": "R2"},
+                                  {"id": "r3", "level": "R3"}],
+                    "vs_members": []})
+    sat = date(2026, 8, 15)
+    st.save_month(YM, {"r_duty": {sat.isoformat(): {"person": "r1"}}})
+    svc = RosterService(st)
+    svc.recompute_saturday_biopsy(YM)
+    tab = CalendarDutyTab(root, svc, _app())
+    tab.pack(fill="both", expand=True)
+    root.update()
+
+    svc.set_biopsy_person(YM, sat, "")            # 右鍵選「本週不切片」做的事
+    tab.refresh()
+    root.update()
+
+    # 紫籤:收集週六卡片上所有 Label 文字,要出現「不切片」
+    texts = []
+    def _walk(w):
+        for ch in w.winfo_children():
+            if isinstance(ch, tk.Label):
+                texts.append(str(ch.cget("text")))
+            _walk(ch)
+    _walk(tab)
+    assert any("不切片" in t for t in texts), \
+        f"★月曆上看不出這週被指定不切片★ {[t for t in texts if '切片' in t]}"
+
+    # 選單:pinned == ""(哨兵)時,「改回自動排」必須是 normal
+    menus = []
+    real_popup = tk.Menu.tk_popup
+    real_menu_init = tk.Menu.__init__
+    def _capture_init(self, *a, **k):
+        real_menu_init(self, *a, **k)
+        menus.append(self)
+    try:
+        tk.Menu.__init__ = _capture_init
+        tk.Menu.tk_popup = lambda self, *a, **k: None
+        ev = type("E", (), {"x_root": 0, "y_root": 0})()
+        tab._on_biopsy_right(ev, sat)
+    finally:
+        tk.Menu.__init__ = real_menu_init
+        tk.Menu.tk_popup = real_popup
+    labels = {}
+    for m in menus:
+        try:
+            end = m.index("end")
+        except tk.TclError:
+            continue
+        if end is None:
+            continue
+        for i in range(end + 1):
+            if m.type(i) == "command":
+                labels[m.entrycget(i, "label")] = m.entrycget(i, "state")
+    skip_lbl = next((k for k in labels if "本週不切片" in k), None)
+    assert skip_lbl and skip_lbl.startswith("✓"), \
+        f"★選單要對「本週不切片」打勾★ {labels}"
+    restore = next((k for k in labels if "改回自動排" in k), None)
+    assert restore and str(labels[restore]) == "normal", \
+        f"★不切片狀態下「改回自動排」被變灰,使用者改不回自動★ {labels}"

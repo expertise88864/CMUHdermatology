@@ -345,6 +345,10 @@ class CalendarDutyTab(ttk.Frame):
         members = {"r": self._member_map("r"), "vs": self._member_map("vs")}
         duty = {"r": month.get("r_duty") or {}, "vs": month.get("vs_duty") or {}}
         biopsy = month.get("saturday_biopsy") or {}
+        # [RS-12] 「本週不切片」的哨兵集合 → 紫籤明示(與「還沒排到」區分)
+        biopsy_skips = {iso for iso, mid in
+                        (month.get("biopsy_override") or {}).items()
+                        if mid == ""}
         # [2026-07-24] 請假表：格內 ⚠ 標記 + 右鍵選單標示（手動排班看得到限制）
         leaves = {"r": (ctx_r.leaves or {}), "vs": (ctx_vs.leaves or {})}
         ctxs = {"r": ctx_r, "vs": ctx_vs}
@@ -378,7 +382,7 @@ class CalendarDutyTab(ttk.Frame):
             for c, d in enumerate(week):
                 self._make_cell(r, c, d, duty, holidays, params, members,
                                 biopsy, week_colors=ctx_r.week_colors,
-                                leaves=leaves)
+                                leaves=leaves, biopsy_skips=biopsy_skips)
         # [2026-07-24 易讀性] uniform＝七欄等寬、各週等高：最大化視窗時月曆平均撐滿,
         # 不再依內容擠出寬窄不一的欄列。
         for c in range(7):
@@ -482,7 +486,8 @@ class CalendarDutyTab(ttk.Frame):
         return _IDLE_HINT
 
     def _make_cell(self, r, c, d, duty, holidays, params, members,
-                   biopsy=None, week_colors=None, leaves=None) -> None:
+                   biopsy=None, week_colors=None, leaves=None,
+                   biopsy_skips=None) -> None:
         """[2026-07-23 整合] 每格同時顯示一線(R)/三線(VS)兩列：線別色籤＋值班者
         成員色塊＋各自 🔒；R 週六另有切片紫籤列。各列可獨立左鍵輪換/右鍵選單；
         滑鼠懸停藍框回饋（duty=members={"r":…, "vs":…}）。
@@ -576,14 +581,18 @@ class CalendarDutyTab(ttk.Frame):
         bp = ((biopsy or {}).get(iso) or {}).get("person")
         if d.weekday() == 5:
             manual = ((biopsy or {}).get(iso) or {}).get("reason") == "手動指定"
+            # [RS-12] "" 哨兵＝這週指定不切片 → 籤上明示,不能只顯示「—」
+            #   (那跟「還沒排到人」長得一樣,使用者看不出自己設過什麼)。
+            skipped = iso in (biopsy_skips or ())
             brow = tk.Frame(card, bg=body_bg)
             brow.pack(fill="x", padx=3, pady=(0, 2))
             cbg, cfg2 = OVR_STYLE["biopsy"]
             tk.Label(brow, text="切片", bg=cbg, fg=cfg2, padx=3,
                      font=(OVR_FONT, 8, "bold")).pack(side="left")
             tk.Label(brow,
-                     text=(self._who_label(bp, members["r"].get(bp)) if bp
-                           else "—") + ("　📌" if manual else ""),
+                     text=("不切片　📌" if skipped else
+                           (self._who_label(bp, members["r"].get(bp)) if bp
+                            else "—") + ("　📌" if manual else "")),
                      bg=body_bg, fg="#1A1A1A" if bp else "#BBBBBB", padx=3,
                      width=9, wraplength=84, justify="left", anchor="w",
                      font=(OVR_FONT, 9, "bold")).pack(side="left")
@@ -748,9 +757,15 @@ class CalendarDutyTab(ttk.Frame):
             menu.add_cascade(label="指定切片人選", menu=pick)
         else:
             menu.add_command(label="（本月無 R2/R3，無法指定）", state="disabled")
+        # [2026-08-20 使用者] 不是每個週六早上都要切片 → 可指定「本週不切片」
+        #   (存 "" 哨兵:不排人、不累計次數、不影響輪替)。
+        menu.add_command(label=("✓ " if pinned == "" else "　") + "本週不切片",
+                         command=lambda: self._set_biopsy(d, ""))
+        # ★"" 也是有效的指定★:用 truthiness 判會讓「不切片」狀態下這個
+        #   選項變灰,使用者就改不回自動了。
         menu.add_command(label="改回自動排（清除指定）",
                          command=lambda: self._set_biopsy(d, None),
-                         state=("normal" if pinned else "disabled"))
+                         state=("normal" if pinned is not None else "disabled"))
         menu.tk_popup(event.x_root, event.y_root)
 
     def _set_biopsy(self, d, mid) -> None:

@@ -1123,9 +1123,12 @@ class RosterService:
         壞鍵略過（與其他讀取容錯一致）。"""
         out: dict = {}
         for iso, mid in (month.get("biopsy_override") or {}).items():
-            if not mid:
+            if mid is None:
                 continue
             try:
+                # ★"" 是「這個週六不切片」的哨兵,要保留★(RS-12)——
+                #   用 truthiness 過濾會把它跟 None 一起丟掉,不切片的指定
+                #   就永遠到不了排程函式。
                 out[date.fromisoformat(iso)] = str(mid)
             except (ValueError, TypeError):
                 continue
@@ -1499,7 +1502,9 @@ class RosterService:
     def set_biopsy_person(self, ym: str, d: date,
                           person: "str | None") -> list:
         """[2026-07-27 使用者] 右鍵強制指定某週六的切片人選（person=None → 清除
-        指定、改回自動排）。回改後 quick_validate("r") 警告（不阻止儲存）。
+        指定、改回自動排；★person="" → 這個週六不切片★[2026-08-20 使用者:
+        不是每個週六早上都要切片]——該週不排人、不累計次數、不影響輪替）。
+        回改後 quick_validate("r") 警告（不阻止儲存）。
 
         指定存在月檔 biopsy_override，之後任何重排（手改值班、請假變動、重跑自動
         排班）都會沿用——否則 set_cell 的連動重排會立刻把手動指定洗掉。

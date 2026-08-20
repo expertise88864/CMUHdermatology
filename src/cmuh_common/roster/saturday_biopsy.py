@@ -67,6 +67,9 @@ def assign_saturday_biopsy(*, year: int, month: int, members, duty: dict,
         最高優先，蓋過值班連動與次數平衡；名單外代號忽略並附註；當日請假仍照排
         （與鎖定格同語意：使用者明確指定為準，只附註提醒）。指定者照樣累計次數，
         後續週六的次數平衡會把它算進去。
+        ★值為空字串 "" ＝ 這個週六【不切片】★(2026-08-20 使用者:不是每個
+        週六早上都要切片)——該週不排人、不累計任何人的次數、也不影響輪替
+        (run/last 都不動,之後的次數平衡就當這週不存在)。
 
     assign: {date: {"person": mid,
                     "reason": "手動指定"|"值班連動"|"次數平衡"}}
@@ -85,6 +88,9 @@ def assign_saturday_biopsy(*, year: int, month: int, members, duty: dict,
         on_leave = {mid for mid in pair_ids
                     if sat in (leaves.get(mid) or set())}
         ov = ov_map.get(sat)
+        if ov == "":                          # ★手動指定:這個週六不切片★
+            notes.append(f"{sat.month}/{sat.day}(六) 手動指定不切片")
+            continue
         if ov is not None and ov not in pair_ids:
             notes.append(f"{sat.month}/{sat.day}(六) 手動指定的切片人選 "
                          f"'{ov}' 不是本月 R2/R3 → 忽略，改自動排")
