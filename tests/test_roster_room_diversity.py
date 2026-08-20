@@ -138,11 +138,14 @@ def test_rf09_cross_month_room_continuity():
     prior = {}
     for day in (24, 25, 26, 27):                             # 8/24~8/27 早診
         prior[f"2026-08-{day}"] = {"上午": {"101": ["c1"], "102": ["c2"]}}
+    # [RS-15] 9/1 是週二早 —— 兩位 PGY 月的「只排照光」時段,P2 會被釋出
+    # 先入座,蓋掉本測試要驗的 Clerk 房延續。本測試的主旨與 PGY 人數無關,
+    # 改用週三早(照光+治療室仍吃光兩位 PGY,行為與 RS-15 之前相同)。
     inp = DaySolveInput(ym="2026-09",
-                        grid={date(2026, 9, 1): {"上午": ["101", "102"]}},
+                        grid={date(2026, 9, 2): {"上午": ["101", "102"]}},
                         pgy_roster=["P1", "P2"],             # 照光+治療室吃光 PGY
                         clerk_batches=[b], prior_sessions=prior)
     day_slots, _log, _w = month_solve_day(inp)
-    slots = day_slots["2026-09-01"]["上午"]
+    slots = day_slots["2026-09-02"]["上午"]
     assert slots["101"] == ["c2"] and slots["102"] == ["c1"], \
         f"上月房計數未延續: {slots}"

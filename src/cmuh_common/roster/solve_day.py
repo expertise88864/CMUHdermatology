@@ -2,12 +2,15 @@
 """PGY/Clerk 逐時段填充器（設計文件 §3.6；純函式、決定性）。
 
 每時段輸入：跟診診間(房號升冪)、可用 PGY、可用 Clerk、診間容量、切片室是否開。
-七步驟（各為一個可替換 FillStep，順序 = PIPELINE）：
+八步驟（各為一個可替換 FillStep，順序 = PIPELINE）：
   1 照光Step     ← 1 位 PGY（**每個時段一律要 1 位**，含週三下午；最優先；照光總次數
                   最少者，週三下午另計 photo_wed_pm 公平）
-  2 治療室Step   ← 1 位 PGY（**週三下午休診不排**；其餘時段皆排；治療室總次數最少者）
+  2 治療室Step   ← 1 位 PGY（**週三下午休診不排**；其餘時段皆排；治療室總次數最少者；
+                  [RS-15] 兩位 PGY 月的二早/四下/五早也不排 → 該位改優先跟診）
   3 切片室Step   ← 1 位 Clerk（僅切片室開；[2026-07-24 修訂] 開放就排好排滿，
                   本梯切片次數最少者優先＝每人至少一次、次數差 ≤1、同日早午不連切）
+  3.5 TwoPgySeat [RS-15] 兩位 PGY 月:照光/治療室之外仍空著的 PGY 先入座
+                  （優先權>Clerk;非兩位 PGY 月為 no-op）
   4 ClerkSeed    每個開診診間各放 1 位 Clerk（房序=決定性洗牌、就座公平輪轉）
   5 PgyMix       逐欄補 PGY（先補到「有 1 人的診間」形成 1C+1P；無 Clerk 月直接填診）
   6 ClerkOverflow 剩 Clerk 補進剩餘容量
@@ -64,6 +67,15 @@ WED = 2
 # 整月跟診次數 spread ≤1 性質不變；請假者本來就不在候選內。
 APPLY_PREF_ROOM = "101"
 APPLY_PREF_WEEKDAYS = (1, 4)          # 週二、週五（早午時段皆適用）
+
+# [2026-08-21 使用者·RS-15] 該月恰有【兩位】PGY 時的特別規則:照光/治療室
+# 每時段各吃 1 位,兩人整月互卡、完全跟不到診(像打雜的)。故:照光仍然
+# 每時段必排(最優先、性質不變);但下列時段【治療室不排】,被釋出的那位
+# PGY 優先入座跟診,而且優先權>Clerk(TwoPgySeatStep,座位不足時 Clerk
+# 讓位)。★僅恰為 2 位時啟用★:1 位月釋出治療室也沒有第二人可跟診,
+# 3 位以上月本來就輪得開 —— 判準是【該月 PGY 名單】,不是當日可用人數
+# (請假造成的臨時 2 人不算)。
+TWO_PGY_PHOTO_ONLY = ((1, "上午"), (3, "下午"), (4, "上午"))  # 二早/四下/五早
 
 
 def _jitter(d: date, session: str, purpose: str, code: str) -> int:
@@ -138,10 +150,17 @@ class SessionCtx:
     seat_ck: dict = field(default_factory=dict)
     batch_key: str = ""               # 切片輪替以「梯次」為單位（代號跨梯會重用）
     apply_pref: frozenset = frozenset()   # Apply 本科 PGY（101 診週二/週五平手優先）
+    two_pgy_mode: bool = False        # [RS-15] 該月 PGY 名單恰 2 位
 
     @property
     def wed_pm(self) -> bool:
         return self.d.weekday() == WED and self.session == "下午"
+
+    @property
+    def two_pgy_photo_only(self) -> bool:
+        """[RS-15] 兩位 PGY 月的「只排照光」時段(二早/四下/五早)。"""
+        return (self.two_pgy_mode
+                and (self.d.weekday(), self.session) in TWO_PGY_PHOTO_ONLY)
 
     def room_pref(self, room) -> frozenset:
         """該房此時段的「平手優先」集合：僅 101 診且週二/週五時＝apply_pref，其餘空。"""
@@ -186,6 +205,10 @@ class TreatmentStep(FillStep):
 
     def run(self, ctx, slots, log):
         if ctx.wed_pm:                          # 週三下午治療室休診（照光另開）
+            return
+        if ctx.two_pgy_photo_only:              # [RS-15] 兩位 PGY 月:只排照光
+            log.append(f"{ctx.session} 治療室不排（兩位 PGY 月，"
+                       f"另一位優先跟診）")
             return
         if not ctx.pgy:
             log.append(f"⚠ {ctx.session} 治療室無 PGY 可排（全請假？）")
@@ -306,12 +329,37 @@ def _room_order(ctx, pref_first: bool = False) -> list:
     return rooms
 
 
+class TwoPgySeatStep(FillStep):
+    """[RS-15] 兩位 PGY 月:照光/治療室之外仍空著的 PGY 先入座(優先權>Clerk)。
+
+    必須放在 ClerkSeedStep ★之前★才成立:座位=房數×容量,容量 1 或房少時
+    Clerk 先坐滿,PgyMixStep 就沒有位子可補 —— 使用者定案 PGY 跟診優先權
+    >Clerk。非兩位 PGY 月完全不動(既有 1C+1P 混搭順序照舊);兩位 PGY 月的
+    其他時段照光+治療室已把兩人占滿 → 此步自然無事可做,實際只在「只排照光」
+    時段(二早/四下/五早)與治療室本就休診的時段釋出人力時生效。
+    座位輪選走同一個 `_seat`(公平/房多樣性/同伴多樣性/Apply 偏好全沿用)。
+    """
+
+    def run(self, ctx, slots, log):
+        if not ctx.two_pgy_mode:
+            return
+        for r in _room_order(ctx, pref_first=True):
+            if not ctx.pgy:
+                return
+            if len(ctx.room_slots[r]) < ctx.capacity:
+                _seat(ctx, ctx.pgy, r, _pgy_ck, prefer=ctx.room_pref(r))
+
+
 class ClerkSeedStep(FillStep):
     def run(self, ctx, slots, log):
         for r in _room_order(ctx):
             if not ctx.clerk:
                 break
-            _seat(ctx, ctx.clerk, r, _clerk_ck)
+            # [RS-15] 容量檢查:TwoPgySeatStep 可能已先坐了 PGY —— 本步原本
+            # 假設自己是第一個入座者(房必空),盲塞會把容量 1 的房坐成 2 人。
+            # 非兩位 PGY 月時房仍為空,此檢查恆真、行為不變。
+            if len(ctx.room_slots[r]) < ctx.capacity:
+                _seat(ctx, ctx.clerk, r, _clerk_ck)
 
 
 class PgyMixStep(FillStep):
@@ -358,21 +406,21 @@ class RestStep(FillStep):
         log.append(f"{ctx.session} 放假：{'、'.join(rest_people)}")
 
 
-PIPELINE = [PhotoStep(), TreatmentStep(), BiopsyStep(), ClerkSeedStep(),
-            PgyMixStep(), ClerkOverflowStep(), RestStep()]
+PIPELINE = [PhotoStep(), TreatmentStep(), BiopsyStep(), TwoPgySeatStep(),
+            ClerkSeedStep(), PgyMixStep(), ClerkOverflowStep(), RestStep()]
 
 
 def solve_session(d: date, session: str, rooms: list, pgy_avail: list,
                   clerk_avail: list, biopsy_open: bool, fc: FairCounters,
                   capacity: int = 2, pipeline=None, batch_key: str = "",
-                  apply_pref=frozenset()) -> tuple:
+                  apply_pref=frozenset(), two_pgy_mode: bool = False) -> tuple:
     """單一時段填充 → (slots, log)。slots: {房/治療室/切片室/放假: [代號,...]}。"""
     ctx = SessionCtx(
         d=d, session=session, rooms=sorted(rooms),
         pgy=sorted(pgy_avail), clerk=sorted(clerk_avail),
         biopsy_open=biopsy_open, capacity=capacity, fc=fc,
         room_slots={r: [] for r in sorted(rooms)}, batch_key=batch_key,
-        apply_pref=frozenset(apply_pref))
+        apply_pref=frozenset(apply_pref), two_pgy_mode=two_pgy_mode)
     slots: dict = {}
     log: list = []
     for step in (pipeline or PIPELINE):
@@ -502,7 +550,8 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
     """整月逐（工作日×早/午）填充 → (day_slots, log, warnings)。
 
     day_slots: {iso: {session: {slot: [代號]}}}；warnings: 人話警告清單。
-    - 治療室每個非假日工作日每時段都需 1 PGY（含週三下午，即使跟診關閉）。
+    - 治療室每個非假日工作日每時段都需 1 PGY(週三下午休診除外;
+      [RS-15] 兩位 PGY 月的二早/四下/五早亦不排,該位改優先跟診)。
     - Clerk 逐日只取「當日所屬兩週梯次」的成員（跨梯不互相借人）。
 
     ★[使用者定案 2026-08-02] 週三下午照光的「補半天假」機制已整個取消★
@@ -526,6 +575,9 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
     warnings: list = []
     pgy_leave = (inp.leaves.get("pgy") or {})
     clerk_leave = (inp.leaves.get("clerk") or {})
+    # [RS-15] 判準=該月 PGY 名單恰 2 位(去重;不看當日可用人數 —— 請假造成
+    # 的臨時 2 人不算,名單就是 2 人的月份整月一致啟用,行為可預期)。
+    two_pgy = len({str(p) for p in inp.pgy_roster}) == 2
 
     # RF-09：先把上月跨月梯次的既存班表餵進 fc（只餵切片室與 clerk 座位/放假；跳過
     # 治療室與上月 PGY，避免污染本月 PGY 月度公平），讓「本梯未輪過切片」的判定與月底
@@ -594,7 +646,7 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
                 _avail(inp.pgy_roster, pgy_leave, d),
                 _avail(clerk_members, clerk_leave, d),
                 biopsy, fc, inp.capacity, batch_key=batch_key,
-                apply_pref=inp.apply_pref)
+                apply_pref=frozenset(inp.apply_pref), two_pgy_mode=two_pgy)
             day_slots.setdefault(iso, {})[session] = slots
             log.append(f"{d.month}/{d.day}({'一二三四五六日'[d.weekday()]}) "
                        + "；".join(slog))
