@@ -878,18 +878,22 @@ class _ClinicClosureDialog(tk.Toplevel):
             messagebox.showerror("失敗", str(e), parent=self)
             return
         # [RS-03/RS-05] 回報:清掉多少既有指派、以及撞到鎖定未自動移除的時段。
+        # ★成功也一定要看得到★(2026-08-20 使用者回報「按了沒反應」):
+        #   原本沒清到指派就一句話都不說、直接關窗 —— 與「整段被跳過」無法
+        #   分辨。現在成功一律先講做了幾個時段。
         res = res or {}
         cleared = res.get("cleared", 0)
         skipped = res.get("skipped_locked") or []
-        msgs = []
+        msgs = [f"已{'停診' if closed else '恢復開診'} "
+                f"{res.get('changed', 0)} 個時段。"]
         if cleared:
             msgs.append(f"已自現有班表移除 {cleared} 個指派，請重新自動排班。")
         if skipped:
             spans = "、".join(f"{iso} {sess}" for iso, sess in skipped)
             msgs.append(f"下列鎖定時段有停診診間的人，未自動移除（尊重鎖定），"
                         f"請自行處理：\n{spans}")
-        if msgs:
-            messagebox.showinfo("停診完成", "\n\n".join(msgs), parent=self)
+        messagebox.showinfo("停診完成" if closed else "恢復完成",
+                            "\n\n".join(msgs), parent=self)
         self.destroy()
 
 

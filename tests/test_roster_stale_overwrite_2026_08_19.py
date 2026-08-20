@@ -424,13 +424,15 @@ class TestTheDaySolveResultCannotBeAppliedStale:
     R/VS 那一側早就會「套用前重建 context 再驗」——這裡補上同一個模式。"""
 
     def _svc(self, st):
+        # ★fixture 要用生產的資料形狀★:第一版把週幾寫成中文鍵、房號寫成
+        #   裸字串 —— `month_grid` 根本讀不到,「停診」那條測試其實從來沒有
+        #   真的停診,只是靠 audit 動了月檔 revision 這個★副作用★過關
+        #   (RS-11 讓無效停診改成明確拒絕,巧合當場現形)。
         st.save_clinic_template({"template": {
-            "一": {"上午": ["101"], "下午": ["101"]},
-            "二": {"上午": ["101"], "下午": ["101"]},
-            "三": {"上午": ["101"], "下午": []},
-            "四": {"上午": ["101"], "下午": ["101"]},
-            "五": {"上午": ["101"], "下午": ["101"]},
-        }})
+            str(wd): {"上午": [{"room": "101", "doctor": "醫"}],
+                      "下午": ([] if wd == 2
+                               else [{"room": "101", "doctor": "醫"}])}
+            for wd in range(5)}})
         st.save_config({"r_members": [], "vs_members": [],
                         "pgy_members": [{"id": "P1"}, {"id": "P2"}],
                         "clerk_members": [{"id": "C1"}]})

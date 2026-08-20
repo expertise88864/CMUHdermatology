@@ -20,8 +20,16 @@ WED = 2   # 週三（weekday 0=一）
 
 
 def _template_rooms(entries: list) -> list:
-    """模板某(weekday,session)的 entries → 跟診房號清單（排除自費、升冪去重）。"""
-    rooms = {e.get("room") for e in (entries or [])
+    """模板某(weekday,session)的 entries → 跟診房號清單（排除自費、升冪去重）。
+
+    ★房號在這個邊界一律轉成字串★(2026-08-20 使用者回報停診沒反應):
+    UI 建的模板房號是字串,但多機人工改 JSON 是設計內流程,編輯器/人手很容易
+    把 "101" 存成數字 101。下游【全部】用字串比對 —— 停診的
+    `if room not in day.get(session)`、月檔 day_slots 的鍵(JSON 寫回後必為
+    字串)、驗證的停診集合 —— 型別不一致時每一處都是★靜默跳過★:
+    停診按了沒反應、沒有紀錄、也沒有錯誤,而排班本身看起來一切正常。
+    """
+    rooms = {str(e.get("room")) for e in (entries or [])
              if e.get("room") and not e.get("is_self_paid")}
     return sorted(rooms)
 
@@ -44,12 +52,13 @@ def month_grid(ym: str, template: dict, holidays: set,
                 continue
             rooms = list(_template_rooms((template.get(wd) or {}).get(session)))
             sov = ov.get(session) or {}
+            # override 同樣正規化:人工編輯過的月檔可能存數字(見 _template_rooms)
             for r in (sov.get("closed_rooms") or []):
-                if r in rooms:
-                    rooms.remove(r)
+                if str(r) in rooms:
+                    rooms.remove(str(r))
             for r in (sov.get("added_rooms") or []):
-                if r not in rooms:
-                    rooms.append(r)
+                if str(r) not in rooms:
+                    rooms.append(str(r))
             day[session] = sorted(rooms)
         grid[d] = day
     return grid

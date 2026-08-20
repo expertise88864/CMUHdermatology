@@ -580,6 +580,7 @@ class RosterService:
             leavers |= {mid for mid, ds in (inp.leaves.get("clerk") or {}).items()
                         if d in ds}
             for session, slots in (day_slots.get(iso) or {}).items():
+                # 房號型別由 `clinic_closures` 統一正規化(規則只有一份)
                 closed = set((closures.get(iso) or {}).get(session) or [])
                 for slot, members in (slots or {}).items():
                     members = members or []
@@ -981,7 +982,11 @@ class RosterService:
         out: dict = {}
         for iso, sess_map in ov.items():
             for session, sov in (sess_map or {}).items():
-                closed = list((sov or {}).get("closed_rooms") or [])
+                # ★回傳一律字串★(外審 RS-11 第 1 輪 P2):人工編輯的數字形狀
+                #   會讓停診對話框的 "、".join(rooms) 直接 TypeError,連窗都開
+                #   不起來。
+                closed = sorted({str(r) for r in
+                                 ((sov or {}).get("closed_rooms") or [])})
                 if closed:
                     out.setdefault(iso, {})[session] = closed
         return out
@@ -1017,6 +1022,8 @@ class RosterService:
             day_locks = month.get("day_locks") or {}
             cleared = 0                 # [RS-03] 實際清掉的既有指派數
             skipped_locked: list = []   # [RS-05] 撞到鎖定、未自動移除的停診時段
+            candidates = 0              # 模板上該室有開的 (日,時段) 數
+            changed = 0                 # 真的改了停診狀態的 (日,時段) 數
             for d, day in base.items():
                 if d < start or d > end:
                     continue
@@ -1024,12 +1031,22 @@ class RosterService:
                 for session in sessions:
                     if room not in (day.get(session) or []):
                         continue                  # 該日該時段本來就沒開這室 → 跳過
+                    candidates += 1
                     sess = ov.setdefault(iso, {}).setdefault(session, {})
-                    lst = sess.setdefault("closed_rooms", [])
+                    # ★既有清單先正規化★(外審 RS-11 第 1 輪 P1):人工編輯過的
+                    #   月檔可能存數字 [101] —— 不正規化的話,恢復比不中而說
+                    #   「沒有停診紀錄」;先停再恢復更慘:清單變 [101, "101"],
+                    #   恢復只移掉字串那個,★回報成功、診間卻仍然停診★。
+                    lst = sorted({str(r) for r in
+                                  (sess.get("closed_rooms") or [])})
                     if closed and room not in lst:
                         lst.append(room)
+                        lst.sort()
+                        changed += 1
                     elif not closed and room in lst:
                         lst.remove(room)
+                        changed += 1
+                    sess["closed_rooms"] = lst
                     if not lst:                   # 清理空殼，grid_overrides 不留垃圾
                         sess.pop("closed_rooms", None)
                     if not sess:
@@ -1047,6 +1064,23 @@ class RosterService:
                                 cleared += 1
                 if iso in ov and not ov[iso]:
                     ov.pop(iso, None)
+            # ★一天都沒動到就不可以「看起來成功」★(2026-08-20 使用者回報:
+            #   停診按了沒反應、沒有紀錄、恢復也一樣)。原本這裡什麼都不說,
+            #   audit 照記、對話框照關 —— 使用者無從分辨「成功」與「整段被
+            #   跳過」。而且★訊息要分得出處置不同的原因★:「模板上沒開」要去
+            #   改模板/日期;「已經是這個狀態」則什麼都不用做。
+            #   拋例外＝中止 update_month 的存檔,不留誤導的 audit。
+            if candidates == 0:
+                raise ValueError(
+                    f"依門診週模板，{room} 在 {start.isoformat()}～"
+                    f"{end.isoformat()} 的選定時段沒有開診，"
+                    f"沒有可{'停診' if closed else '恢復'}的日子。"
+                    f"請確認診間、日期範圍與時段（週三下午一律不開診）。")
+            if changed == 0:
+                raise ValueError(
+                    f"{room} 在選定範圍內已全部是停診狀態，無需再停。"
+                    if closed else
+                    f"選定範圍內沒有 {room} 的停診紀錄，無需恢復。")
             if cleared:
                 # [RS-03] 有清掉指派 → 舊 day_report 已與現況不符,一併清空
                 # 避免幽靈化。
@@ -1056,7 +1090,8 @@ class RosterService:
                         f"closure:{room} {start.isoformat()}~{end.isoformat()} "
                         f"{sorted(sessions)}",
                         None, "closed" if closed else "open", "closure")
-            return {"cleared": cleared, "skipped_locked": skipped_locked}
+            return {"cleared": cleared, "skipped_locked": skipped_locked,
+                    "changed": changed}
 
         return self.update_month(ym, _mut)
 
