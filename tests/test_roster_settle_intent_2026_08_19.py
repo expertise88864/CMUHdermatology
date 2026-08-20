@@ -28,8 +28,9 @@ def svc(tmp_path):
 
 
 def _result(svc):
-    from cmuh_common.roster.solve_rvs import solve_duty
-    out = solve_duty(svc.build_context("r", YM))
+    # ★生產的呼叫形狀★:run_solve 會蓋 month_revision(RS-13),直接呼叫
+    # solve_duty 的結果 accept 會以「沒有月檔版本標記」拒絕。
+    out = svc.run_solve("r", YM)
     assert out.status == "ok", out.status
     return out
 

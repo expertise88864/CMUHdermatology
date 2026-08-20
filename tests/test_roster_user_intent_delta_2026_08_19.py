@@ -173,7 +173,11 @@ class TestNoCallerCanSkipTheBaseline:
     """★機械化守衛★:漏一個呼叫端,那個欄位就等於沒有這個保護。"""
 
     OPS = ("set_leaves", "set_must", "set_day_session",
-           "set_pgy_month_roster", "set_pgy_apply_pref")
+           "set_pgy_month_roster", "set_pgy_apply_pref",
+           # [RS-14] 全審次輪 P1-02:這兩個 prefilled editor 原本漏在名單外
+           # (名單列舉會腐爛 —— 架構性守衛見
+           #  test_roster_prefilled_editor_guard_2026_08_20.py)
+           "set_biopsy_cells", "set_pgy_default_members")
 
     def test_the_service_ops_require_a_baseline(self):
         for name in self.OPS:

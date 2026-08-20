@@ -185,12 +185,22 @@ def test_biopsy_seed_from_prev_batch(root, tmp_path):
 
 
 def test_shift_biopsy_grid_on_start_change(root, tmp_path):
-    """改梯次起始日 → 切片格網整組平移，不遺失（codex P2）。"""
+    """改梯次起始日 → 切片格網整組平移，不遺失（codex P2）。
+
+    [RS-14] 平移已收進服務層:`update_clerk_batch_fields` 在同一個呼叫內
+    以【最新】格網為底平移,UI 的 `_shift_biopsy_grid` 已刪(它吃開窗時讀
+    的舊 payload,會把他機剛改的格子蓋掉)。這裡改走與 `_batch_edit` 相同
+    的服務入口;stale-payload 反例見 test_roster_prefilled_editor_guard。"""
     svc = _svc(tmp_path)
+    svc.storage.save_clerk_batches(
+        [{"id": "b1", "start_monday": "2026-08-03", "members": ["1"]}])
     svc.storage.save_biopsy_grid({"b1": {"2026-08-03": {"上午": True}}})
     tab = SettingsTab(root, svc)
     root.update()
-    tab._shift_biopsy_grid("b1", "2026-08-03", "2026-08-10")   # 後移一週
+    assert not hasattr(tab, "_shift_biopsy_grid")      # UI 版已移除
+    before = {"id": "b1", "start_monday": "2026-08-03", "members": ["1"]}
+    svc.update_clerk_batch_fields(
+        "b1", before, dict(before, start_monday="2026-08-10"))  # 後移一週
     g = svc.storage.load_biopsy_grid()
     assert "2026-08-03" not in g["b1"] and g["b1"]["2026-08-10"]["上午"] is True
 

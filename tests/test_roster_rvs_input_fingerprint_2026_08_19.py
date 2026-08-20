@@ -48,7 +48,8 @@ def _result(svc, person="A"):
         pts[mid] += day_point(d, ctx.holidays, ctx.params)
     return SolveResult(status="ok", scope="r", level_used=0, level_name="L0",
                        assignments=assignments, points_by_person=pts,
-                       input_fingerprint=rvs_input_fingerprint(ctx))
+                       input_fingerprint=rvs_input_fingerprint(ctx),
+                       month_revision=svc.storage.load_month_snapshot(YM)[1])
 
 
 class TestTheWhitelistCannotSeeTheseHardConstraints:

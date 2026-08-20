@@ -97,6 +97,16 @@ class SolveResult:
     #: 套用時重建 ctx 再比一次:不同就拒絕。空字串＝來源不明,一律拒絕
     #: (沒有指紋就無從確認,而「無從確認」不可以當成「沒問題」)。
     input_fingerprint: str = ""
+    #: ★這份解是從【哪一版月檔】算出來的★(RS-13,全審次輪 P1-01;與
+    #: `DaySolveResult.month_revision` 對稱)。指紋只涵蓋 SolveContext 的
+    #: 輸入 —— 「未鎖定格現在排誰」不是 solver 輸入,他機在預覽期間的手動
+    #: 修改對指紋隱形,套用時整份重建 `{scope}_duty` 會把它靜默退回。
+    #: 判準保守:月檔【任何】變動都拒(不猜哪些欄位無害,寧可重排)。
+    #: ★哨兵是 None 不是空字串★:`""` 是「月檔還不存在」的【合法】身分
+    #: (首次排一個全新月份,`load_month_snapshot` 缺檔回 `({}, "")`,CAS 也
+    #: 認它)—— 拿它當「來源不明」用,新月份就永遠套用不了。None=物件沒被
+    #: 求解器蓋過章,一律拒絕(與 input_fingerprint 的空字串同規)。
+    month_revision: "str | None" = None
 
 
 def _lazy_cp_model():

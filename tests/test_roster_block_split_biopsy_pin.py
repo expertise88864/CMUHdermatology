@@ -107,7 +107,8 @@ def test_split_result_can_be_accepted(tmp_path):
                                 "2026-09-27": "Z", "2026-09-28": "K"},
                           "vs": {}})
     ym = "2026-09"
-    res = solve_duty(svc.build_context("r", ym))
+    # ★生產的呼叫形狀★:run_solve 蓋 month_revision(RS-13)
+    res = svc.run_solve("r", ym)
     assert res.status == "ok"
     svc.accept_solution("r", ym, res)              # 不得拋「排班結果已過期」
     duty = st.load_month(ym)["r_duty"]
@@ -122,7 +123,7 @@ def test_split_does_not_warn_pair_broken(tmp_path):
                                 "2026-09-27": "Z", "2026-09-28": "K"},
                           "vs": {}})
     ym = "2026-09"
-    svc.accept_solution("r", ym, solve_duty(svc.build_context("r", ym)))
+    svc.accept_solution("r", ym, svc.run_solve("r", ym))
     msgs = [c.msg for c in svc.quick_validate("r", ym)]
     assert not any("成對被改破" in m for m in msgs), msgs
     assert not any("成對不完整" in m for m in msgs), msgs

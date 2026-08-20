@@ -709,14 +709,29 @@ class SettingsTab(ttk.Frame):
         ttk.Button(lf, text="儲存", command=self._save_pgy_defaults
                    ).pack(side="left")
 
+    @staticmethod
+    def _pgy_codes(text: str) -> list:
+        return [c.strip() for c in (text or "").replace("，", ",")
+                .replace("、", ",").split(",") if c.strip()]
+
     def _save_pgy_defaults(self) -> None:
-        codes = [c.strip() for c in self._pgy_entry.get().replace("，", ",")
-                 .replace("、", ",").split(",") if c.strip()]
-        if not self._sync_cfg_before_edit():      # ★同上：寫入前先對齊磁碟★
+        # ★送 delta 不送整串★(RS-14):欄位顯示的是開窗/重載時預填的整份
+        #   名單,不是意圖 —— 「先對齊磁碟再整份覆寫」對齊的只是 revision,
+        #   欄位開著期間他機加進 config 的人照樣被這串舊值明確排除。
+        #   基準=上次載入的內容(`_pgy_loaded`,與「未儲存編輯」判定同源)。
+        codes = self._pgy_codes(self._pgy_entry.get())
+        baseline = self._pgy_codes(self._pgy_loaded)
+        if not guard_write(
+                lambda: self.service.set_pgy_default_members(
+                    codes, baseline=baseline),
+                title="PGY 預設代號", parent=self):
             return
-        self._cfg["pgy_members"] = [{"id": c} for c in codes]
-        if self._save_cfg():
-            self._pgy_loaded = self._pgy_entry.get()   # 已存檔 → 不再算「未儲存的編輯」
+        # 存檔成功 → 以【合併後】的磁碟真值刷新欄位與基準(合併結果可能
+        # 與使用者打的字不同:他機的新增會留在名單裡)。
+        if self._refresh_cfg_from_disk():
+            self._pgy_loaded = self._pgy_text()
+            self._pgy_entry.delete(0, "end")
+            self._pgy_entry.insert(0, self._pgy_loaded)
 
     # ── 門診週模板（開診格網來源）─────────────────────────────────────────
     def _build_clinic_template(self) -> None:
@@ -871,9 +886,13 @@ class SettingsTab(ttk.Frame):
             if pg:
                 seeded[(ns + timedelta(days=i)).isoformat()] = dict(pg)
         if seeded:
+            # ★setdefault 不是 __setitem__★(RS-14):上面的「已有設定就不覆蓋」
+            #   檢查讀的是進 mutator 之前的一份 —— 兩機同時建梯時,後到的
+            #   整包會蓋掉先到的。setdefault 讓「只在還沒有時才寫」這件事
+            #   發生在最新版正典檔上,守衛與寫入同一次。
             if not guard_write(
                     lambda: self.service.update_biopsy_grid(
-                        lambda g_all: g_all.__setitem__(
+                        lambda g_all: g_all.setdefault(
                             new_batch["id"], seeded)),
                     title="切片室開放格網", parent=self):
                 return
@@ -886,7 +905,6 @@ class SettingsTab(ttk.Frame):
         cur = next((b for b in batches if self._batch_key(b) == sel[0]), None)
         if cur is None:
             return
-        old_start = cur.get("start_monday")
         before = dict(cur)             # ★開窗當時的那一份＝這次編輯的基準★
         dlg = _ClerkBatchDialog(self, cur)
         if dlg.result:
@@ -904,36 +922,11 @@ class SettingsTab(ttk.Frame):
                 return
             edits = applied
             cur.update(edits)          # 本地顯示用
-            if cur.get("id") and cur.get("start_monday") != old_start:
-                self._shift_biopsy_grid(cur["id"], old_start, cur["start_monday"])
+            # 切片格網的平移已併入 update_clerk_batch_fields(RS-14):
+            # 服務層在同一個呼叫內以【最新】格網為底平移 —— UI 不再自己讀
+            # 一份舊格網算好整包丟回去(那會把他機剛改的格子吃掉)。
             self._reload_batches()
             self._notify()
-
-    def _shift_biopsy_grid(self, batch_id, old_start, new_start) -> None:
-        """改梯次起始日 → 把切片格網整組平移相同天數（否則新窗覆蓋不到、資料失效）。"""
-        grid_all = self.service.storage.load_biopsy_grid()
-        g = grid_all.get(batch_id)
-        if not g or not old_start or not new_start:
-            return
-        try:
-            delta = (date.fromisoformat(new_start)
-                     - date.fromisoformat(old_start)).days
-        except ValueError:
-            return
-        if delta == 0:
-            return
-        shifted: dict = {}
-        for iso, sess in g.items():
-            try:
-                nd = date.fromisoformat(iso) + timedelta(days=delta)
-            except ValueError:
-                continue
-            shifted[nd.isoformat()] = sess
-        if not guard_write(
-                lambda: self.service.update_biopsy_grid(
-                    lambda g_all: g_all.__setitem__(batch_id, shifted)),
-                title="切片室開放格網", parent=self):
-            return
 
     def _batch_del(self) -> None:
         sel = self._batch_tree.selection()
@@ -1185,6 +1178,13 @@ class _BiopsyGridDialog(tk.Toplevel):
         self.transient(master)
         cur = service.storage.load_biopsy_grid().get(self.batch_id) or {}
         self._vars: dict = {}
+        # ★開窗當時每一格的值＝這次編輯的基準★(RS-14):存檔只送「相對它
+        #   改過的格子」,沒動的格子以盤上現值為準 —— 整梯替換會把他機在
+        #   視窗開著期間改的格子悄悄蓋回去。
+        self._baseline: dict = {}
+        # ★這些格子被顯示時所依據的起始日★(deep R1-1):格子的絕對日期
+        #   只有相對它才有意義;他機改了起始日,服務層要能據此拒絕。
+        self._start_monday = batch["start_monday"]
         ttk.Label(self, text="勾選＝該時段切片室開放（週三下午恆關）",
                   padding=6).grid(row=0, column=0, columnspan=3)
         row = 1
@@ -1205,6 +1205,7 @@ class _BiopsyGridDialog(tk.Toplevel):
                     row=row, column=c, padx=4)
                 if not wed_pm:
                     self._vars[(iso, session)] = v
+                    self._baseline[(iso, session)] = bool(sess_cur.get(session))
             row += 1
         bar = ttk.Frame(self)
         bar.grid(row=row, column=0, columnspan=3, pady=8)
@@ -1214,14 +1215,13 @@ class _BiopsyGridDialog(tk.Toplevel):
         self.wait_window(self)
 
     def _save(self):
-        newg: dict = {}
-        for (iso, session), v in self._vars.items():
-            if v.get():
-                newg.setdefault(iso, {})[session] = True
-        # 只換【這一梯】的格網,別梯由他機維護(整份寫回會蓋掉)
+        # ★送 delta 不送整梯★(RS-14):UI 只交出「開窗那一份」與「現在畫面
+        #   上的值」,合併與衝突判定在服務層(只有一份實作,而且測得到)。
+        edited = {k: v.get() for k, v in self._vars.items()}
         if not guard_write(
-                lambda: self.service.update_biopsy_grid(
-                    lambda g_all: g_all.__setitem__(self.batch_id, newg)),
+                lambda: self.service.set_biopsy_cells(
+                    self.batch_id, edited, baseline=self._baseline,
+                    batch_start=self._start_monday),
                 title="切片室開放格網", parent=self):
             return
         self.destroy()

@@ -766,6 +766,36 @@ class RosterService:
             lambda d, rev: self.storage.save_config(d, expected_revision=rev),
             mutator, retries=retries)
 
+    def set_pgy_default_members(self, codes: list, *, baseline) -> list:
+        """儲存設定頁的 PGY 預設代號 —— 只套【相對 baseline 的增刪】。→ 存後名單。
+
+        (RS-14,全審次輪 P1-02-C)文字欄是開窗/重載時預填的整串;整份覆寫的
+        話,欄位開著的期間他機加進 config 的人會被這次存檔【明確排除】——
+        從此不在候選名單,而畫面看不出來。集合語意與 `set_leaves` 同規:
+        增與刪都是使用者的意圖,合併到【現在的】名單上。
+        ★純調順序要尊重★:集合沒變且盤上沒被動過 → 照使用者排的順序整份採用
+        (set delta 看不見順序,這裡是唯一能保住它的分支)。
+        """
+        codes = [str(c) for c in codes]
+        base = [str(c) for c in (baseline or [])]
+        out: dict = {}
+
+        def _mut(cfg):
+            cur = [str(m.get("id")) for m in (cfg.get("pgy_members") or [])]
+            by_id = {str(m.get("id")): m
+                     for m in (cfg.get("pgy_members") or [])}
+            if cur == base:
+                merged = list(dict.fromkeys(codes))
+            else:
+                removes = {c for c in base if c not in codes}
+                adds = [c for c in codes if c not in base]
+                merged = [c for c in cur if c not in removes]
+                merged += [c for c in adds if c not in merged]
+            cfg["pgy_members"] = [by_id.get(c, {"id": c}) for c in merged]
+            out["merged"] = merged
+        self.update_config(_mut)
+        return out.get("merged") or []
+
     def update_ledger(self, mutator, *, retries: int = 4):
         return self._update_canonical(
             "ledger.json",
@@ -786,6 +816,7 @@ class RosterService:
                  if field_changed(v, (before or {}).get(k))}
         if not edits:
             return {}
+        _batch_id: dict = {}
 
         def _mut(bs):
             for b in bs:
@@ -799,12 +830,26 @@ class RosterService:
                         f"電腦改過，為避免把對方的修改改回去，這次變更已中止。"
                         f"請重新整理後再改一次。")
                 b.update(edits)
+                _batch_id["id"] = b.get("id")
                 return
             raise StaleRosterDataError(
                 f"這個梯次（{key}）已不在清單中（可能已在另一台電腦刪除），"
                 f"本次變更未套用。")
 
-        self.update_clerk_batches(_mut)
+        # ★兩個正典檔的寫入包在同一個 write_barrier 內★(deep R1-2):
+        #   梯次檔落地與格網平移之間若讓背景 pull 插進來合併一份更新的
+        #   batch+grid,平移就會拿【舊的位移量】去搬【新的格網】。barrier
+        #   擋住同步換檔;crash 殘留(半套)另計,見 _shift_biopsy_grid。
+        with self.storage.write_barrier():
+            self.update_clerk_batches(_mut)
+            # ★起始日改了 → 切片格網在【同一個服務呼叫】內跟著平移★(RS-14):
+            #   原本由 UI 在存檔後另外呼叫,而且 payload 是開窗時讀的舊格網。
+            #   old 取 before 的值 —— 上面的 clash 守衛已保證盤上此欄與
+            #   before 一致,才輪得到這次 edits 落地。
+            if "start_monday" in edits:
+                self._shift_biopsy_grid(_batch_id.get("id"),
+                                        (before or {}).get("start_monday"),
+                                        edits["start_monday"])
         return edits
 
     def update_clerk_batches(self, mutator, *, retries: int = 4):
@@ -827,6 +872,100 @@ class RosterService:
             lambda d, rev: self.storage.save_biopsy_grid(
                 d, expected_revision=rev),
             mutator, retries=retries)
+
+    def set_biopsy_cells(self, batch_id: str, edited: dict, *,
+                         baseline, batch_start) -> dict:
+        """把切片格網對話框裡【使用者真的改過的】格子套到最新格網。→ 套用的 delta。
+
+        edited/baseline 形狀:{(iso, session): bool}(對話框可見的格子);
+        batch_start=開窗當時的梯次起始日(這些格子被顯示時所依據的身分)。
+        ★整梯替換不是意圖★(RS-14,全審次輪 P1-02-A):對話框開著的期間他機改
+        的同梯其他格,會被開窗快照整包蓋回去 —— 而且是合法地蓋(mutation 在
+        最新版正典檔上執行,但 payload 是開窗時算好的舊整梯)。
+        使用者改過、而盤上也被他機改過的格子 → ★明確拒絕★(與 Clerk 欄位
+        delta 同規,不猜誰贏);沒動過的格子一律以盤上現值為準、絕不寫。
+
+        ★格子的絕對日期只有相對起始日才有意義★(deep R1-1):他機改了起始日
+        (格網已整組平移)或刪了梯次之後,舊日期的 delta 寫下去是一格
+        「窗外孤兒」—— `build_day_input` 只看目前 14 天覆蓋範圍,直接忽略它,
+        而畫面回報成功。梯次身分驗證與格網寫入包在同一個 write_barrier 內
+        (背景同步不得在兩讀之間換檔)。
+        """
+        delta = {k: bool(v) for k, v in (edited or {}).items()
+                 if bool(v) != bool((baseline or {}).get(k))}
+        if not delta:
+            return {}
+
+        def _mut(g_all):
+            g = {iso: dict(sess)
+                 for iso, sess in (g_all.get(batch_id) or {}).items()}
+            clash = [f"{iso} {sess}" for (iso, sess) in delta
+                     if bool((g.get(iso) or {}).get(sess))
+                     != bool((baseline or {}).get((iso, sess)))]
+            if clash:
+                raise StaleRosterDataError(
+                    f"這一梯的「{'、'.join(sorted(clash))}」在你編輯期間也被"
+                    f"另一台電腦改過，為避免把對方的修改改回去，這次變更已"
+                    f"中止。請重新開啟視窗後再改一次。")
+            for (iso, sess), want in sorted(delta.items()):
+                if want:
+                    g.setdefault(iso, {})[sess] = True
+                else:
+                    day = g.get(iso)
+                    if day is not None:
+                        day.pop(sess, None)
+                        if not day:
+                            g.pop(iso, None)
+            g_all[batch_id] = g
+
+        with self.storage.write_barrier():
+            cur = next((b for b in self.storage.load_clerk_batches()
+                        if str(b.get("id")) == str(batch_id)), None)
+            if cur is None:
+                raise StaleRosterDataError(
+                    f"這個梯次（{batch_id}）已不在清單中（可能已在另一台電腦"
+                    f"刪除），切片格網的這次變更未套用。")
+            if str(cur.get("start_monday") or "") != str(batch_start or ""):
+                raise StaleRosterDataError(
+                    "這個梯次的起始日在你編輯期間被另一台電腦改過（切片格網"
+                    "已整組平移到新日期）。為避免把格子寫到已失效的舊日期，"
+                    "這次變更已中止，請重新開啟視窗後再改一次。")
+            self.update_biopsy_grid(_mut)
+        return delta
+
+    def _shift_biopsy_grid(self, batch_id, old_start, new_start) -> None:
+        """梯次起始日改了 → 切片格網整組平移相同天數。
+
+        ★平移量算在 mutator 裡、以【最新】格網為底★(RS-14,全審次輪
+        P1-02-B):原本 UI 先讀一份格網、算好 shifted 整包,再丟進 CAS ——
+        CAS 看到的是最新版,payload 卻是開窗時那份,他機剛改的格子照樣被吃。
+        已知殘留(外審同輪判 P2):梯次檔與格網檔是兩個正典檔,兩寫之間
+        crash 仍會留下「起始日已改、格網未移」的半套 —— 待後續批次補
+        transaction intent。
+        """
+        if not batch_id or not old_start or not new_start:
+            return
+        try:
+            delta = (date.fromisoformat(str(new_start))
+                     - date.fromisoformat(str(old_start))).days
+        except (ValueError, TypeError):
+            return
+        if delta == 0:
+            return
+
+        def _mut(g_all):
+            g = g_all.get(batch_id)
+            if not g:
+                return
+            shifted: dict = {}
+            for iso, sess in g.items():
+                try:
+                    nd = date.fromisoformat(iso) + timedelta(days=delta)
+                except (ValueError, TypeError):
+                    continue
+                shifted[nd.isoformat()] = sess
+            g_all[batch_id] = shifted
+        self.update_biopsy_grid(_mut)
 
     #: 週色手動覆蓋的循環順序(UI 依畫面上的值算下一個,再送過來)
     WEEK_COLOR_CYCLE = {None: "pink", "pink": "green", "green": None}
@@ -1113,8 +1252,19 @@ class RosterService:
         """build_context → solve_duty。不落地（UI 先預覽，接受後才 accept）。"""
         # ★求解與套用時的重建必須是【同一種】context★:指紋比對只在兩邊
         #   看到同一份輸入時才有意義(見 `solver_ledger`)。
-        ctx = self.build_context(scope, ym, for_solve=True)
-        return solve_duty(ctx, allow_disable_color=allow_disable_color)
+        # ★月檔身分在【求解當下】捕捉,且與其餘輸入同一個臨界區讀★(RS-13,
+        #   全審次輪 P1-01):revision 等到套用才讀的話,讀到的是「按下套用
+        #   那一刻」的版本 —— 預覽開著的期間他機改的【未鎖定值班格】不是
+        #   SolveContext 的輸入,指紋看不見它,而套用會整份重建 `{scope}_duty`
+        #   把它退回舊解,CAS 還會判定一切正常。快照與 config/帳本/假日/週色
+        #   包在同一個 write_barrier 內讀,擋住讀到一半被換檔;CP-SAT 在
+        #   barrier 外跑(可能數十秒,不可扣住所有寫入)。
+        with self.storage.write_barrier():
+            month, month_rev = self.storage.load_month_snapshot(ym)
+            ctx = self.build_context(scope, ym, month=month, for_solve=True)
+        res = solve_duty(ctx, allow_disable_color=allow_disable_color)
+        res.month_revision = month_rev
+        return res
 
     # ── 週六切片（R2/R3 輪排，2026-07-13）────────────────────────────────
     @staticmethod
@@ -1362,6 +1512,23 @@ class RosterService:
         stale = self._result_stale_reason(ctx, result)
         if stale:
             raise ValueError(f"排班結果已過期（{stale}），請重新排班")
+
+        # ★第三層:月檔本身的身分★(RS-13,全審次輪 P1-01)。上面兩層看的都
+        #   是 SolveContext 的輸入;「未鎖定格現在排誰」不是輸入 —— 他機在
+        #   預覽期間手動改的未鎖值班格,指紋看不見,而下面整份重建
+        #   `{scope}_duty` 會把它退回舊解。判準=【求解當下】的月檔 revision
+        #   (`run_solve` 捕捉);保守政策:他 scope/日排班等無關變動也拒 ——
+        #   寧可要求重排,不猜「哪些月檔欄位無害」。
+        #   ★None 才是「沒標記」;空字串是「求解時月檔還不存在」的合法身分★
+        if result.month_revision is None:
+            raise ValueError(
+                "排班結果沒有月檔版本標記（可能來自舊版程式或未經求解器產生），"
+                "無從確認預覽期間月檔是否被其他電腦修改過，請重新排班")
+        if result.month_revision != _month_rev:
+            raise ValueError(
+                "預覽期間這個月的月檔已被修改（可能是另一台電腦同步了值班／"
+                "日排班等變動）。為避免把那些修改蓋回舊的排班結果，本次未套用，"
+                "請重新排班")
 
         existing = month.get(f"{scope}_duty") or {}
         new_duty: dict = {}

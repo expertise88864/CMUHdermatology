@@ -70,7 +70,8 @@ def _result_for(svc, ym, assignments, last_weekend=None):
         status="ok", scope="r", level_used=0, level_name="L0",
         assignments=dict(assignments), points_by_person=pts,
         last_weekend=last_weekend,
-        input_fingerprint=rvs_input_fingerprint(ctx))
+        input_fingerprint=rvs_input_fingerprint(ctx),
+        month_revision=svc.storage.load_month_snapshot(ym)[1])
 
 
 # ─── build_context ────────────────────────────────────────────────────────
@@ -302,23 +303,25 @@ def test_accept_rejects_stale_after_point_change(tmp_path):
     assert svc.storage.load_ledger()["r"] == {}
 
 
-def test_double_accept_no_double_count(tmp_path):
-    """同一批結果套用第二次＝冪等的 no-op:帳本不加倍、也不會被誤判過期。
+def test_double_accept_is_refused_and_never_double_counts(tmp_path):
+    """同一份預覽套用第二次 → ★拒絕★,而且帳本絕不加倍。
 
-    [RS-7 → RS-9] RS-7 加了全輸入指紋之後,這裡一度變成「第二次會被拒絕」——
-    因為當時 `build_context` 讀的是【含本月結算】的帳本,第一次套用就把輸入
-    改掉了。RS-9 讓求解一律以【本月結算之前】的餘額為基準(記憶體回滾,
-    磁碟不動),那個差異隨之消失:輸入沒變,指紋自然相同。
-    ★不加倍★由 `settle_month` 的同月回滾保證(見 test_roster_core 的帳本測試)。
+    [RS-7 → RS-9] 這裡一度是「冪等 no-op」:RS-9 之後指紋確實不因第一次
+    套用而變。[RS-13] 契約再改:第一次套用本身就換了月檔 revision ——
+    同一份 preview 的第二次套用與「開著預覽期間他機改了格子」在資料上
+    不可區分(兩次套用之間完全可能有人手動改過未鎖格,重套會把它蓋掉),
+    所以一律當過期拒絕。原本的關切(帳本不加倍)仍然成立:被拒=什麼都
+    沒發生。要重套,重新排班拿新 revision 即可。
     """
     svc = _svc(tmp_path)
     res = _result_for(svc, YM, _cover(svc, YM, "A"))
     svc.accept_solution("r", YM, res)
     a1 = svc.storage.load_ledger()["r"]["A"]
-    svc.accept_solution("r", YM, res)          # 同月二次 → 內含回滾
+    with pytest.raises(ValueError, match="月檔已被修改"):
+        svc.accept_solution("r", YM, res)      # 同一份 preview 二次 → 過期
 
     ledger = svc.storage.load_ledger()
-    assert ledger["r"]["A"] == a1              # 不因二次而加倍
+    assert ledger["r"]["A"] == a1              # 被拒 → 不加倍
     assert len([h for h in ledger["history"]
                 if h["month"] == YM and h["scope"] == "r"]) == 1
 

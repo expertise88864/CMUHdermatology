@@ -125,7 +125,8 @@ class TestTheFingerprintIsStableAcrossAnAccept:
         return ctx, SolveResult(
             status="ok", scope="r", level_used=0, level_name="L0",
             assignments=assignments, points_by_person=pts,
-            input_fingerprint=rvs_input_fingerprint(ctx))
+            input_fingerprint=rvs_input_fingerprint(ctx),
+            month_revision=svc.storage.load_month_snapshot(YM)[1])
 
     def test_zero_balances_are_canonicalized_away(self, svc):
         _settle(svc, {"A": 5.0, "B": -5.0})
@@ -236,7 +237,8 @@ class TestOnlyTheSolverPathRollsBack:
                           weekday_counts={"A": 0, "B": 0},
                           weekend_counts={"A": 0, "B": 0},
                           targets={"A": share, "B": share},
-                          input_fingerprint=rvs_input_fingerprint(ctx))
+                          input_fingerprint=rvs_input_fingerprint(ctx),
+                          month_revision=svc.storage.load_month_snapshot(YM)[1])
         _settle(svc, {"A": 5.0, "B": -5.0})       # 本月已經排過一次
         txt = svc.render_report("r", YM, res)
         line = next(ln for ln in txt.splitlines() if ln.strip().startswith("B"))
