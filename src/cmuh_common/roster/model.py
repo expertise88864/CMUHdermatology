@@ -55,6 +55,35 @@ class Member:
 
 
 # ─── Clerk 梯次 ───────────────────────────────────────────────────────────
+def duplicated_codes(codes) -> list:
+    """→ 出現超過一次的代號(依首次出現順序)。空清單＝沒有重複。
+
+    ★名單的成員必須唯一★(外審 2026-08-21 P1-01):日填充器把 list 的每一個
+    occurrence 當成一個人 —— `PhotoStep` 選中後只 `remove` 掉一個,於是同一個
+    代號還留在池子裡,下一步(治療室/跟診)可以再選到他。結果是一份
+    ★物理上不可能執行★的班表(同一人同一時段照光又在治療室),而容量、
+    請假、名單三道檢查全部合法 → 0 warning 一路通到定案與匯出。
+    """
+    seen, dup = set(), []
+    for c in (codes or []):
+        k = str(c)
+        if k in seen and k not in dup:
+            dup.append(k)
+        seen.add(k)
+    return dup
+
+
+def dedupe_codes(codes) -> list:
+    """去重、保序(防禦性正規化用;歷史資料可能已經帶著重複)。"""
+    out, seen = [], set()
+    for c in (codes or []):
+        k = str(c)
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
 @dataclass
 class ClerkBatch:
     """Clerk 兩週一梯次（起始必為週一，不綁月份，可跨月）。"""
@@ -85,10 +114,22 @@ class ClerkBatch:
             logging.warning("[roster.model] 梯次 members 不是陣列，已略過：%r", dd)
             return None
         try:
+            members = [str(x) for x in raw_members]
+            # ★歷史資料可能帶著重複★(外審 2026-08-21 P1-01):不可以原樣送進
+            #   solver —— 重複的 occurrence 會讓同一位 Clerk 在同一時段被排進
+            #   切片室又進診間。這裡是【最後一道】防禦:寫入端已經拒絕,
+            #   但外部工具/人工合併留下的舊檔仍可能長這樣。
+            dup = duplicated_codes(members)
+            if dup:
+                logging.warning(
+                    "[roster.model] 梯次 %s 的成員有重複代號 %s → 已去重"
+                    "(請到設定頁修正該梯次名單)",
+                    str(dd.get("id", "")), "、".join(dup))
+                members = dedupe_codes(members)
             return ClerkBatch(
                 id=str(dd.get("id", "")),
                 start_monday=date.fromisoformat(str(dd["start_monday"])),
-                members=[str(x) for x in raw_members])
+                members=members)
         except (KeyError, TypeError, ValueError, AttributeError):
             logging.warning("[roster.model] 梯次資料無法解析，已略過：%r", dd)
             return None

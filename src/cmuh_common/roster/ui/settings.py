@@ -850,9 +850,10 @@ class SettingsTab(ttk.Frame):
         dlg = _ClerkBatchDialog(self, {})
         if dlg.result:
             # 只加這一梯(整份寫回會抹掉他機剛新增的梯次)
+            # 唯一性守門在服務層(外審 2026-08-21 P1-01):重複代號會讓
+            # 同一位 Clerk 在同一時段被排進切片室又進診間。
             if not guard_write(
-                    lambda: self.service.update_clerk_batches(
-                        lambda bs: bs.append(dlg.result)),
+                    lambda: self.service.add_clerk_batch(dlg.result),
                     title="Clerk 梯次", parent=self):
                 return
             batches = self.service.storage.load_clerk_batches()

@@ -53,7 +53,9 @@ import zlib
 from dataclasses import dataclass, field
 from datetime import date
 
-from cmuh_common.roster.model import STUDENT_SESSIONS, is_weekend
+from cmuh_common.roster.model import (
+    STUDENT_SESSIONS, dedupe_codes, is_weekend,
+)
 
 PHOTO = "照光"        # 每時段必排 1 PGY（含週三下午），最優先
 TREATMENT = "治療室"  # 每時段 1 PGY，但週三下午休診不排
@@ -415,14 +417,39 @@ def solve_session(d: date, session: str, rooms: list, pgy_avail: list,
                   capacity: int = 2, pipeline=None, batch_key: str = "",
                   apply_pref=frozenset(), two_pgy_mode: bool = False) -> tuple:
     """單一時段填充 → (slots, log)。slots: {房/治療室/切片室/放假: [代號,...]}。"""
+    # ★同一個人不可以在池子裡出現兩次★(外審 2026-08-21 P1-01):每一步都是
+    #   「選一個 → remove 一個 occurrence」,重複的代號因此可以在同一時段被
+    #   排進兩個工作(照光+治療室、切片+跟診)。寫入邊界與 build_day_input
+    #   都已經擋,這裡是【求解器自己的】最後一道 —— 任何呼叫端(含測試)
+    #   都不該有辦法用重複名單解出班表。
+    _pgy = dedupe_codes(pgy_avail)
+    _clerk = dedupe_codes(clerk_avail)
+    _log_pre: list = []
+    if len(_pgy) != len(list(pgy_avail)) or len(_clerk) != len(list(clerk_avail)):
+        _log_pre.append(
+            f"⚠ {session} 可用名單有重複代號 → 已去重"
+            f"(請修正 PGY 名單/梯次成員)")
+    # ★跨池重疊也是同一件事★(外審 RS-17 R1-1):同一個代號同時出現在 PGY
+    #   名單與 Clerk 梯次時,逐池去重各自都「合法」—— 照光排 PGY A、切片排
+    #   Clerk A,存檔與匯出裡就是同一個代號出現在兩格,誰也分不出那是兩個人
+    #   還是一個人被排了兩件事。★留 PGY、把他從 Clerk 池移除★:照光/治療室
+    #   是每時段硬性需求,切片/跟診可略;並且明講是誰,不能只寫進 log
+    #   (使用者看得到的只有 warnings 面板)。
+    _cross = [c for c in _clerk if c in set(_pgy)]
+    if _cross:
+        _clerk = [c for c in _clerk if c not in set(_cross)]
+        _log_pre.append(
+            f"⚠ {session} 代號 {'、'.join(_cross)} 同時在 PGY 名單與 Clerk "
+            f"梯次中 → 本時段只當 PGY 排(請修正其中一邊的名單)")
     ctx = SessionCtx(
         d=d, session=session, rooms=sorted(rooms),
-        pgy=sorted(pgy_avail), clerk=sorted(clerk_avail),
+        pgy=sorted(_pgy),
+        clerk=sorted(_clerk),
         biopsy_open=biopsy_open, capacity=capacity, fc=fc,
         room_slots={r: [] for r in sorted(rooms)}, batch_key=batch_key,
         apply_pref=frozenset(apply_pref), two_pgy_mode=two_pgy_mode)
     slots: dict = {}
-    log: list = []
+    log: list = list(_log_pre)             # 名單問題要進使用者看得到的警告
     for step in (pipeline or PIPELINE):
         step.run(ctx, slots, log)
     for r in ctx.rooms:                          # 房間格（含空房不輸出）
@@ -530,6 +557,18 @@ def _warn_locked_content(warnings: list, d: date, session: str, locked_slots: di
                          pgy_set: set, clerk_set: set,
                          pgy_leave: dict, clerk_leave: dict) -> None:
     """RF-10：鎖定內容原樣保留，但檢核當日請假者 / 非名單代號並人話警告（不改內容）。"""
+    # ★鎖定內容也要檢查「同一個人同時段兩件事」★(外審 RS-17 R1-2):
+    #   鎖定時段原樣保留、不重排 —— 手動編輯或人工改 JSON 造出的雙排會原封
+    #   不動地落地,而預覽/報告完全不提。使用者按下套用之前就該看到。
+    _where: dict = {}
+    for slot_name, people in (locked_slots or {}).items():
+        for p in (people or []):
+            _where.setdefault(str(p), []).append(str(slot_name))
+    for p, places in sorted(_where.items()):
+        if len(places) > 1:
+            warnings.append(
+                f"{d.month}/{d.day} {session} 🔒鎖定時段內 {p} 同時被排在 "
+                f"{'、'.join(places)}——同一個人同一時段只能做一件事,請解鎖修正")
     warned_leave: set = set()
     for slot_name, people in locked_slots.items():
         for p in people:

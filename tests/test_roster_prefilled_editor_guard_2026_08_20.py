@@ -199,10 +199,14 @@ class TestPgyDefaultsAreASetDelta:
 
 
 # ══ D. 架構性守衛:所有 UI 寫入端都必須被分類 ═════════════════════════════
+#: ★動詞清單本身也會腐爛★(2026-08-22):`add_clerk_batch` 因為開頭是
+#: `add_` 而整個逃過分類 —— 而它正是外審 2026-08-21 P1-01 的守門點之一。
+#: 新增寫入端時若用了這裡沒有的動詞,請一起補進來。
 _WRITER_PREFIXES = ("set_", "update_", "save_", "accept_", "clear_",
                     "finalize", "unfinalize", "resettle", "rename_",
                     "change_", "archive_", "mark_", "delete_", "remove_",
-                    "move_", "seed_", "reconcile_", "shift_")
+                    "move_", "seed_", "reconcile_", "shift_", "add_",
+                    "retype_", "insert_", "append_", "apply_", "import_")
 
 #: UI 允許呼叫的 service 寫入端 → 它的併發政策。★沒分類的寫入端先紅★。
 #: 政策的意義(審這張表時逐一對照實作):
@@ -225,6 +229,9 @@ _CLASSIFIED = {
     # [外審次輪 P2-04] 門診模板改用穩定身分:新增由服務層配 id、刪除以
     # id(舊資料退回完整內容)比對 —— UI 不再交出「畫面上的第幾列」。
     "add_clinic_template_entry": "narrow-mutator",
+    # [外審 2026-08-21 P1-01] 新增梯次要先過唯一性守門(重複代號會讓同一位
+    # Clerk 在同一時段被排進切片室又進診間)→ 走服務層,不再 UI 直接 append。
+    "add_clerk_batch": "narrow-mutator",
     "delete_clinic_template_entry": "stable-identity",
     "set_cell": "desired-state", "set_lock": "desired-state",
     "set_day_lock": "desired-state", "set_week_color": "desired-state",

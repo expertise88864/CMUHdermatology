@@ -36,7 +36,7 @@ from cmuh_common.roster.ledger import (
 )
 from cmuh_common.roster.model import (
     ClerkBatch, Member, RosterParams, SolveContext, batches_covering, day_point,
-    roc,
+    dedupe_codes, duplicated_codes, roc,
 )
 from cmuh_common.roster.solve_day import (
     day_input_fingerprint,
@@ -145,6 +145,41 @@ def _shifted_keys_digest(grid: dict, back_delta: int) -> str:
         except (ValueError, TypeError):
             return ""
     return _grid_keys_digest(dict.fromkeys(keys))
+
+
+def assert_unique_codes(codes, label: str) -> list:
+    """名單寫入前的唯一性守門 → 正規化後的名單;有重複就★明確拒絕★。
+
+    (外審 2026-08-21 P1-01)日填充器把 list 的每一個 occurrence 當成一個人:
+    `PhotoStep` 只 remove 掉一個 occurrence,同一個代號還留在池子裡,下一步
+    就能再選到他 —— 產出「同一人同一時段照光又在治療室」這種【物理上不可能
+    執行】的班表,而請假/名單/容量三道檢查全部合法,一路通到定案與匯出。
+    ★正常 UI 就打得出來★(輸入「P1、P1」),所以不能只靠 assert:要在存檔的
+    邊界擋下並說人話。
+    """
+    dup = duplicated_codes(codes)
+    if dup:
+        raise ValueError(
+            f"{label}有重複的代號:{'、'.join(dup)}。"
+            f"同一個人不能在名單裡出現兩次(排班會把他當成兩個人,"
+            f"排出同一時段既照光又在治療室的班表)。請移除重複項目後再存檔。")
+    return [str(c) for c in (codes or [])]
+
+
+def assert_no_cross_roster(codes, others, label: str, other_label: str) -> None:
+    """PGY 與 Clerk 的代號★不可交集★(外審 RS-17 R1-1)。
+
+    逐邊唯一還不夠:同一個代號同時出現在 PGY 名單與 Clerk 梯次時,兩邊各自
+    都「合法」—— 照光排 PGY A、切片排 Clerk A,存檔與匯出裡就是同一個代號
+    出現在同一時段的兩格,誰也分不出那是兩個人還是一個人被排了兩件事。
+    """
+    clash = [c for c in dedupe_codes(codes) if str(c) in {str(o) for o in
+                                                         (others or [])}]
+    if clash:
+        raise ValueError(
+            f"{label}的代號 {'、'.join(clash)} 已經出現在{other_label}。"
+            f"同一個代號不能兩邊都有(排班會把他同時排進兩種工作,"
+            f"而且存檔之後分不出是誰)。請改掉其中一邊的代號。")
 
 
 def clerk_batch_key(b: dict) -> str:
@@ -396,6 +431,14 @@ class RosterService:
         pgy_roster = month.get("pgy_month_roster")
         if pgy_roster is None:                     # 未指定當月人員 → 用 config 預設代號
             pgy_roster = [str(mm.get("id")) for mm in (cfg.get("pgy_members") or [])]
+        # ★不可以把重複的名單原樣送進 solver★(外審 2026-08-21 P1-01):
+        #   寫入端已經擋下,但外部工具/人工合併/舊檔仍可能留著重複代號。
+        _dup = duplicated_codes(pgy_roster)
+        if _dup:
+            logging.warning(
+                "[roster.service] %s 的 PGY 名單有重複代號 %s → 已去重"
+                "(請到設定頁或當月人員修正)", ym, "、".join(_dup))
+            pgy_roster = dedupe_codes(pgy_roster)
 
         # [2026-07-25 審查] from_dict 對壞梯次回 None（不再拋例外）→ 濾掉
         batches = [b for b in (ClerkBatch.from_dict(x)
@@ -617,6 +660,20 @@ class RosterService:
             leavers |= {mid for mid, ds in (inp.leaves.get("clerk") or {}).items()
                         if d in ds}
             for session, slots in (day_slots.get(iso) or {}).items():
+                # ★同一個人同一時段只能有一個工作★(外審 2026-08-21 P1-01):
+                #   名單重複、手改 JSON、手動編輯時段都可能造出「照光又在
+                #   治療室」這種物理上做不到的班表 —— 而請假/名單/容量三道
+                #   檢查全部合法,不點名的話它會一路通到定案與匯出。
+                #   放假格不算工作,但「又放假又有工作」同樣是矛盾 → 一起看。
+                _where: dict = {}
+                for slot, members in (slots or {}).items():
+                    for c in (members or []):
+                        _where.setdefault(str(c), []).append(str(slot))
+                for c, places in sorted(_where.items()):
+                    if len(places) > 1:
+                        out.append(f"{iso} {session}:{c} 同時被排在 "
+                                   f"{'、'.join(places)} —— 同一個人同一時段"
+                                   f"只能做一件事,請確認名單是否有重複代號")
                 # 房號型別由 `clinic_closures` 統一正規化(規則只有一份)
                 closed = set((closures.get(iso) or {}).get(session) or [])
                 for slot, members in (slots or {}).items():
@@ -845,7 +902,10 @@ class RosterService:
         ★純調順序要尊重★:集合沒變且盤上沒被動過 → 照使用者排的順序整份採用
         (set delta 看不見順序,這裡是唯一能保住它的分支)。
         """
-        codes = [str(c) for c in codes]
+        codes = assert_unique_codes(codes, "PGY 預設代號")
+        assert_no_cross_roster(codes, self._clerk_codes_where_default_applies(),
+                               "PGY 預設代號",
+                               "會用到這份預設名單的 Clerk 梯次成員")
         base = [str(c) for c in (baseline or [])]
         out: dict = {}
 
@@ -885,6 +945,8 @@ class RosterService:
                  if field_changed(v, (before or {}).get(k))}
         if not edits:
             return {}
+        if "members" in edits:                 # 外審 2026-08-21 P1-01
+            assert_unique_codes(edits["members"], "這個梯次的成員")
         _batch_id: dict = {}
 
         def _mut(bs):
@@ -913,6 +975,23 @@ class RosterService:
         #   涵蓋範圍外的格子會被 `build_day_input` 直接忽略(切片室看起來
         #   整梯沒開),沒有任何紀錄。
         with self.storage.write_barrier():
+            # ★跨池檢查要看【成員】也要看【日期】★(外審 RS-17 R3):
+            #   時間範圍變成不變量的一部分之後,「成員沒動、只把梯次搬到
+            #   另一個月」同樣能造出重疊 —— 守衛原本掛在 members 底下,
+            #   那條路直接繞過去,落地成一份有效衝突(solver 之後只會把那位
+            #   Clerk 丟掉並警告,等於他整梯沒班)。
+            #   成員取【盤上最新的那一份】(這次沒改就是它),日期取這次要
+            #   落地的值;整段在臨界區內,與稍後的 CAS 寫入看同一個盤面。
+            if "members" in edits or "start_monday" in edits:
+                _cur_b = next((b for b in self.storage.load_clerk_batches()
+                               if clerk_batch_key(b) == key), None) or before
+                _eff_members = edits.get(
+                    "members", (_cur_b or {}).get("members") or [])
+                _eff_start = edits.get(
+                    "start_monday", (_cur_b or {}).get("start_monday"))
+                assert_no_cross_roster(
+                    _eff_members, self._pgy_codes_during_batch(_eff_start),
+                    "這個梯次的成員", "這一梯期間的 PGY 名單")
             _shift = None
             if "start_monday" in edits:
                 # 格網以【梯次 id】為鍵 → 意圖也要用 id(舊資料沒有 id 就沒有
@@ -948,6 +1027,85 @@ class RosterService:
                 self._shift_biopsy_grid(_shift[0], _shift[1], _shift[2])
                 self.storage.clear_pending_grid_shift(_shift[0])
         return edits
+
+    # ── 跨池檢查的【時間範圍】(外審 RS-17 R2)────────────────────────────
+    #   ★同一個代號在不同時間屬於不同人是正常的★:七月的 PGY 代號 A 之後
+    #   變成八月梯次的 Clerk A —— 兩者從來不會在同一個時段同時在場,擋掉它
+    #   等於禁止合法的重複使用(repo 自己的 `prior_pgy` 契約就是為了這件事
+    #   而存在)。所以只比對【時間上真的重疊】的那一段。
+    @staticmethod
+    def _months_of_batch(start_monday) -> list:
+        """一梯(起始日起 14 天)涵蓋到的月份 'YYYY-MM'(可能跨月)。"""
+        try:
+            d0 = date.fromisoformat(str(start_monday))
+        except (ValueError, TypeError):
+            return []
+        out = []
+        for i in range(14):
+            d = d0 + timedelta(days=i)
+            ym = f"{d.year:04d}-{d.month:02d}"
+            if ym not in out:
+                out.append(ym)
+        return out
+
+    def _effective_pgy_codes(self, ym: str) -> list:
+        """某個月【實際會用到】的 PGY 名單:月度覆蓋優先,否則 config 預設。"""
+        try:
+            cur = self.storage.load_month(ym).get("pgy_month_roster")
+        except Exception:                # 壞月檔不該擋住名單編輯
+            cur = None
+        if cur is None:
+            cur = [str(m.get("id"))
+                   for m in (self.storage.load_config().get("pgy_members")
+                             or [])]
+        return dedupe_codes([str(c) for c in (cur or [])])
+
+    def _pgy_codes_during_batch(self, start_monday) -> list:
+        """這一梯涵蓋期間會在場的 PGY 代號(逐月取實際名單後聯集)。"""
+        out: list = []
+        for ym in self._months_of_batch(start_monday):
+            out += self._effective_pgy_codes(ym)
+        return dedupe_codes(out)
+
+    def _clerk_codes_in_month(self, ym: str) -> list:
+        """涵蓋到這個月的梯次成員(只有這些人會與該月 PGY 同時在場)。"""
+        out: list = []
+        for b in self.storage.load_clerk_batches():
+            if ym in self._months_of_batch((b or {}).get("start_monday")):
+                out += [str(c) for c in ((b or {}).get("members") or [])]
+        return dedupe_codes(out)
+
+    def _clerk_codes_where_default_applies(self) -> list:
+        """會與【config 預設 PGY 名單】碰頭的梯次成員。
+
+        預設名單適用於「沒有月度覆蓋」的月份 → 只要某一梯涵蓋到的月份裡有
+        任何一個沒有覆蓋,那一梯的成員就會與預設名單同時在場。
+        """
+        out: list = []
+        for b in self.storage.load_clerk_batches():
+            months = self._months_of_batch((b or {}).get("start_monday"))
+            uses_default = False
+            for ym in months:
+                try:
+                    if self.storage.load_month(ym).get("pgy_month_roster")                             is None:
+                        uses_default = True
+                        break
+                except Exception:
+                    uses_default = True   # 讀不到 → 保守視為會用到預設
+                    break
+            if uses_default:
+                out += [str(c) for c in ((b or {}).get("members") or [])]
+        return dedupe_codes(out)
+
+    def add_clerk_batch(self, batch: dict) -> None:
+        """新增一梯(唯一性在這裡守門;整份寫回仍走 narrow mutator)。"""
+        members = assert_unique_codes((batch or {}).get("members") or [],
+                                      "這個梯次的成員")
+        assert_no_cross_roster(
+            members, self._pgy_codes_during_batch(
+                (batch or {}).get("start_monday")),
+            "這個梯次的成員", "這一梯期間的 PGY 名單")
+        self.update_clerk_batches(lambda bs: bs.append(dict(batch)))
 
     def update_clerk_batches(self, mutator, *, retries: int = 4):
         return self._update_canonical(
@@ -1175,7 +1333,9 @@ class RosterService:
         """`baseline`＝開窗時畫面上的那一份(必填)。★整份覆蓋會吃掉他機剛加
         的人★:那個人明天就不會出現在日排班的候選名單裡,而畫面上看不出來。"""
         base = [str(c) for c in (baseline or [])]
-        edited = [str(c) for c in codes]
+        edited = assert_unique_codes(codes, "當月 PGY 人員")
+        assert_no_cross_roster(edited, self._clerk_codes_in_month(ym),
+                               "當月 PGY 人員", f"涵蓋 {ym} 的 Clerk 梯次成員")
 
         def _mut(month):
             cur = month.get("pgy_month_roster")

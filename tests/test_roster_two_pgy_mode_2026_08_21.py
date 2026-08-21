@@ -130,7 +130,25 @@ class TestTheMonthLevelBehaviour:
                 assert TREATMENT in slots, (iso, session)
 
     def test_a_duplicated_roster_code_does_not_fake_the_mode(self):
-        """名單打錯成 ["P1","P1"] 只有一個人 —— 不得因 len==2 誤啟用。"""
+        """名單打錯成 ["P1","P1"] 只有一個人 —— 不得因 len==2 誤啟用。
+
+        ★這一條原本把盲點固化住了★(外審 2026-08-21 P1-01):它只斷言
+        「治療室有人」,而當時的填充器會把兩個 occurrence 當成兩個人 ——
+        照光 P1、治療室【也是】P1 照樣讓這條測試綠燈。現在同時要求:
+        (a) 這個月不是兩位 PGY 模式;(b) ★同一個人不會在同一時段做兩件事★。
+        """
         day_slots, _log, _warn = month_solve_day(self._input(["P1", "P1"]))
-        d_iso = "2026-08-04"
-        assert TREATMENT in day_slots[d_iso]["上午"], "去重後 1 人不是兩位 PGY 月"
+        # ★重複名單 ≡ 去重後的名單★:這才是「不把 occurrence 當人」的性質。
+        #   (舊斷言是「治療室有人」—— 那個「人」正是照光的同一位 P1,
+        #    也就是說它只在缺陷存在時才成立。)
+        same, _l2, _w2 = month_solve_day(self._input(["P1"]))
+        assert day_slots == same, "★重複代號被當成了第二個人★"
+        for iso, sessions in day_slots.items():
+            for session, ss in sessions.items():
+                seen: dict = {}
+                for slot, people in (ss or {}).items():
+                    for p in (people or []):
+                        seen.setdefault(p, []).append(slot)
+                dupes = {p: w for p, w in seen.items() if len(w) > 1}
+                assert not dupes, (
+                    f"★{iso} {session} 同一個人被排了兩件事★ {dupes}")

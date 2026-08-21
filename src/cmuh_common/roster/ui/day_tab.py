@@ -399,8 +399,20 @@ class DayScheduleTab(ttk.Frame):
                 messagebox.showerror("套用失敗", str(e), parent=win)
                 return
             win.destroy()
-            self.refresh()
-            self._refresh_warnings(warnings)
+            self.refresh()           # ← 這一步已經跑過 quick_validate_day
+            # ★不可以用求解當下的警告蓋掉剛跑出來的檢查★(外審 RS-17 R1-2):
+            #   `refresh()` 填的是【落地後】的 quick_validate_day 結果(例如
+            #   鎖定時段裡同一個人被排了兩件事);拿求解時的 warnings 整份覆蓋
+            #   等於把它擦掉,而畫面看起來一切正常,接著就能定案/匯出。
+            #   兩邊都要留:求解警告在前(它解釋這次排班),檢查結果在後。
+            try:
+                fresh = self.service.quick_validate_day(self.app.ym)
+            except Exception:
+                logging.debug("[roster.ui] quick_validate_day 失敗",
+                              exc_info=True)
+                fresh = []
+            merged = list(warnings) + [w for w in fresh if w not in warnings]
+            self._refresh_warnings(merged)
             self._show_view("cal")   # [2026-07-23 使用者] 套用後直接顯示月曆總覽
         ttk.Button(bar, text="套用", command=apply).pack(side="right", padx=6)
         ttk.Button(bar, text="取消", command=win.destroy).pack(side="right")
