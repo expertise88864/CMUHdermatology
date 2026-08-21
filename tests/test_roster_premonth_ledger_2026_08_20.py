@@ -93,8 +93,13 @@ class TestTheSolverSeesThePreMonthBalance:
         「本月還沒結算」的樣子。
         """
         _settle(svc, {"A": 5.0, "B": -5.0})
+        # ★探針要打在生產真的用的那次讀取上★:求解基準改走嚴格快照
+        # (外審次輪 P2-01) —— 還盯著 `load_ledger` 的話,這條就量不到了。
         shared = svc.storage.load_ledger()
-        svc.storage.load_ledger = lambda: shared          # type: ignore
+        svc.storage.canonical_snapshot = (                # type: ignore
+            lambda name, *a, **k: (shared, "rev")
+            if name == "ledger.json" else
+            RosterStorage.canonical_snapshot(svc.storage, name, *a, **k))
         svc.build_context("r", YM, for_solve=True)
         assert shared["r"] == {"A": 5.0, "B": -5.0},             f"★求解把呼叫端手上的那份帳本就地回滾了★ {shared['r']}"
         assert [h["month"] for h in shared["history"]] == [YM]

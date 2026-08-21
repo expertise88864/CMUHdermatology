@@ -493,29 +493,135 @@ class RosterStorage:
         raw = _load_json(self._path("pending_settle.json")).get("pending")
         return [x for x in (raw or []) if isinstance(x, dict)]
 
-    def mark_pending_settle(self, scope: str, ym: str) -> bool:
-        """落地之前記下意圖(冪等:同 scope+月份不重複記)。
+    #: 意圖的種類＝★哪一個衍生物還沒被重建★(外審次輪 P2-02)。
+    #:   "ledger" 點數帳本 / "biopsy" 切片計數帳本 / "all" 兩者都要
+    #: 舊版紀錄沒有這個欄位 → 一律視為 "all"(兩個都重建成功才算收斂;
+    #: 把它當成某一種的話,另一種的義務會被靜默丟掉)。
+    PENDING_KINDS = ("ledger", "biopsy", "all")
+
+    @classmethod
+    def pending_kind(cls, item: dict) -> str:
+        """一筆意圖紀錄的種類(不認得的值一律回 "all",寧可多重建一次)。"""
+        k = str((item or {}).get("kind") or "all")
+        return k if k in cls.PENDING_KINDS else "all"
+
+    def mark_pending_settle(self, scope: str, ym: str,
+                            kind: str = "all") -> bool:
+        """落地之前記下意圖(冪等:同 scope+月份+種類不重複記)。
 
         → ★這一筆是不是【這一次】記下的★(外審排班 RS-10 第 1 輪 P1):
         冪等表示「已經有了就不再記」,而那筆既有的意圖屬於【另一個還沒完成的
         操作】。呼叫端如果不分青紅皂白把它清掉,就等於替別人宣稱「已經一致
         了」—— 那個未完成的結算從此不會再被收斂。
+
+        ★種類★(外審次輪 P2-02):意圖代表「這個衍生物還沒重建成功」,
+        而切片帳本與點數帳本是兩個獨立的義務 —— 手動改格那條路只重建切片,
+        把整筆意圖(含帳本)清掉等於替帳本宣稱一致。已存在的 "all" 涵蓋
+        任何一種,此時回 False(義務是別人的,我不得清它)。
         """
+        kind = kind if kind in self.PENDING_KINDS else "all"
         cur = self.load_pending_settles()
-        if any(x.get("scope") == scope and x.get("ym") == ym for x in cur):
-            return False
-        cur.append({"scope": str(scope), "ym": str(ym), "ts": _now_stamp()})
+        for x in cur:
+            if x.get("scope") != scope or x.get("ym") != ym:
+                continue
+            k = self.pending_kind(x)
+            if k == kind or k == "all":      # 已有一筆涵蓋我的義務
+                return False
+        cur.append({"scope": str(scope), "ym": str(ym), "kind": kind,
+                    "ts": _now_stamp()})
         self._save(self._path("pending_settle.json"), {"pending": cur})
         return True
 
-    def clear_pending_settle(self, scope: str, ym: str) -> None:
-        """兩個檔都寫成功之後清掉那一筆意圖。"""
+    def clear_pending_settle(self, scope: str, ym: str,
+                             kind: str = "all") -> None:
+        """該種類的衍生物確實重建成功之後,清掉【那一筆】意圖。
+
+        ★只清同種類的那一筆★:清掉 "all" 等於連同別人未完成的義務一起
+        宣稱一致(RS-10 的教訓,種類化之後同樣成立)。
+        """
+        kind = kind if kind in self.PENDING_KINDS else "all"
         cur = self.load_pending_settles()
         left = [x for x in cur
-                if not (x.get("scope") == scope and x.get("ym") == ym)]
+                if not (x.get("scope") == scope and x.get("ym") == ym
+                        and self.pending_kind(x) == kind)]
         if len(left) == len(cur):
             return
         self._save(self._path("pending_settle.json"), {"pending": left})
+
+    def retype_pending_settle(self, scope: str, ym: str,
+                              old_kind: str, new_kind: str) -> bool:
+        """把一筆意圖★原子地★改成另一個種類。→ 是否真的改到。
+
+        (外審 RS-16 R1-1)「先 mark(新種類) 再 clear(舊種類)」在這裡是行不通
+        的:`mark_pending_settle` 的涵蓋規則會判定「已有一筆 all 涵蓋你了」而
+        回 False —— 於是新的那筆根本沒記上,接著 clear 又把 all 拿掉,義務整個
+        消失。降級必須是【一次寫入】:accept/重算時帳本確實重建好了、只剩切片
+        沒有,紀錄就該原地變成 biopsy。
+        """
+        old_kind = old_kind if old_kind in self.PENDING_KINDS else "all"
+        new_kind = new_kind if new_kind in self.PENDING_KINDS else "all"
+        cur = self.load_pending_settles()
+        hit = False
+        out = []
+        for x in cur:
+            if (not hit and x.get("scope") == scope and x.get("ym") == ym
+                    and self.pending_kind(x) == old_kind):
+                y = dict(x)
+                y["kind"] = new_kind
+                y["ts"] = _now_stamp()
+                out.append(y)
+                hit = True
+                continue
+            out.append(x)
+        if not hit:
+            return False
+        self._save(self._path("pending_settle.json"), {"pending": out})
+        return True
+
+    # ── 梯次起始日 → 切片格網平移的意圖(外審次輪 P2-05)──────────────────
+    def load_pending_grid_shifts(self) -> list:
+        """未確認完成的「梯次移動 → 切片格網平移」。
+
+        `clerk_batches.json` 與 `biopsy_grid.json` 是兩個檔:同一個
+        `write_barrier` 擋得住背景同步與其他執行緒,★擋不住行程被砍/停電/
+        第二次寫入的 I/O 失敗★ —— 那會留下「梯次已經是新日期、格網還在舊
+        日期」,而格網日期落在梯次涵蓋範圍外時 `build_day_input` 直接忽略它
+        (切片室整梯看起來沒開),沒有任何紀錄。
+        意圖記 (batch_id, 舊起始日, 新起始日) 三者:★平移不是冪等的★,
+        收斂時必須先看格網現在對齊哪一邊才能決定要不要搬(見
+        `RosterService.reconcile_pending_grid_shifts`)。
+        """
+        raw = _load_json(self._path("pending_grid_shift.json")).get("pending")
+        return [x for x in (raw or []) if isinstance(x, dict)]
+
+    def mark_pending_grid_shift(self, batch_id: str, old_start: str,
+                                new_start: str, pre_digest: str = "") -> bool:
+        """平移之前記下意圖。→ 是不是【這一次】記下的。
+
+        同一梯次已有未收斂的平移意圖時回 False:呼叫端必須★拒絕★這次變更
+        (連續兩次平移疊起來之後,收斂端再也分不出格網停在哪一段)。
+        """
+        cur = self.load_pending_grid_shifts()
+        if any(str(x.get("batch_id")) == str(batch_id) for x in cur):
+            return False
+        cur.append({"batch_id": str(batch_id), "old_start": str(old_start),
+                    "new_start": str(new_start),
+                    # ★平移前那份格網的身分★(外審 RS-16 R1-2):位移 < 14 天時
+                    #   新舊視窗會重疊,只看「日期落在哪個窗」分不出搬過沒有
+                    #   (8/3→8/10 的格網若只剩 8/10 這一格,兩個窗都符合)。
+                    #   記下鍵集的雜湊,收斂時比對就能明確判定。
+                    "pre_digest": str(pre_digest or ""),
+                    "ts": _now_stamp()})
+        self._save(self._path("pending_grid_shift.json"), {"pending": cur})
+        return True
+
+    def clear_pending_grid_shift(self, batch_id: str) -> None:
+        """格網確實平移完成(或確認無需平移)之後清掉那一筆意圖。"""
+        cur = self.load_pending_grid_shifts()
+        left = [x for x in cur if str(x.get("batch_id")) != str(batch_id)]
+        if len(left) == len(cur):
+            return
+        self._save(self._path("pending_grid_shift.json"), {"pending": left})
 
     def save_biopsy(self, book: dict, *, expected_revision=_UNSET) -> None:
         # 比照 save_ledger：寫前 schema 檢查（.bak 快照由 _save 統一留）

@@ -214,12 +214,18 @@ _WRITER_PREFIXES = ("set_", "update_", "save_", "accept_", "clear_",
 #:                    既有 subtree★(那是 delta 的工作)
 #:   create-if-absent mutator 用 setdefault:只在還沒有時建立,絕不覆蓋
 #:   explicit-command 使用者明確下令的整區操作(UI 有確認對話框)
+#:   stable-identity  以【那一筆的身分】(穩定 id;舊資料退回完整內容)增刪,
+#:                    ★不得用畫面上的行號/index 當持久身分★(外審次輪 P2-04)
 #:   artifact-export  產出衍生檔(PDF/快照),不觸碰正典資料
 _CLASSIFIED = {
     "set_leaves": "delta", "set_must": "delta", "set_day_session": "delta",
     "set_pgy_month_roster": "delta", "set_pgy_apply_pref": "delta",
     "set_biopsy_cells": "delta", "set_pgy_default_members": "delta",
     "update_clerk_batch_fields": "delta-fields",
+    # [外審次輪 P2-04] 門診模板改用穩定身分:新增由服務層配 id、刪除以
+    # id(舊資料退回完整內容)比對 —— UI 不再交出「畫面上的第幾列」。
+    "add_clinic_template_entry": "narrow-mutator",
+    "delete_clinic_template_entry": "stable-identity",
     "set_cell": "desired-state", "set_lock": "desired-state",
     "set_day_lock": "desired-state", "set_week_color": "desired-state",
     "set_biopsy_person": "desired-state", "set_clinic_closed": "desired-state",

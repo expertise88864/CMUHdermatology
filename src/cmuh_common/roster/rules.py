@@ -599,12 +599,31 @@ class FridayBiopsyLinkRule(Rule):
         if not biopsy_members:
             return []
         terms = []
+        # ★手動指定與「本週不切片」會改變【誰在切片】★(外審次輪 P2-03):
+        #   本規則原本一律假設「週六值班的 R2/R3 就是切片者」——那是
+        #   `assign_saturday_biopsy` 的【預設】分支,而手動指定(RS-10)與
+        #   「本週不切片」(RS-12)都排在它之前。不看的話:不切片的那一週仍
+        #   會為了不存在的切片去調週五值班;手動指定的那一週更會獎勵錯的人。
+        ov_map = dict(getattr(ctx, "biopsy_override", None) or {})
+        pair_ids = {m.id for m in biopsy_members}
         for sat in ctx.days:
             if sat.weekday() != 5:
                 continue
             fri = sat - timedelta(days=1)
             if fri not in day_set:
                 continue          # 月初週六 → 週五在上月，本次求解管不到
+            ov = ov_map.get(sat)
+            if ov == "":
+                continue          # ★這個週六不切片★ → 沒有人要被連動
+            if ov is not None and str(ov) in pair_ids:
+                # ★切片者已經固定★ → 直接獎勵「他也值週五」(不必再與週六
+                #   值班連動:誰值週六都不會改變切片人選)。
+                if ctx.on_leave(str(ov), fri):
+                    continue
+                terms.append((mc.x[(fri, str(ov))], -self.LINK_WEIGHT))
+                continue
+            # 其餘(沒有指定、或指定的代號不在 R2/R3 名單 → 被忽略改自動排)
+            # 走原本的值班連動語意。
             for m in biopsy_members:
                 if ctx.on_leave(m.id, fri) or ctx.on_leave(m.id, sat):
                     continue

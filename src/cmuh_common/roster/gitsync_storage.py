@@ -149,7 +149,11 @@ class GitSyncStorage(RosterStorage):
                    #   只留在寫壞的那台的話,B 機拉到新月檔配舊帳本卻毫不知情;
                    #   而那台若剛好壞掉/沒再開,帳本就永遠停在舊值,之後每個月的
                    #   公平結算都以錯的餘額為基礎。
-                   "pending_settle.json", ".gitignore")
+                   "pending_settle.json",
+                   # ★梯次平移的意圖同理★(外審次輪 P2-05):它是「這一梯的
+                   #   切片格網可能還停在舊日期,請對齊」這件事本身;只留在
+                   #   中斷的那台機器,別台拉到新起始日配舊格網卻毫不知情。
+                   "pending_grid_shift.json", ".gitignore")
     _SYNC_DIRS = ("months",)          # months/YYYY-MM.json（含刪除）
 
     def _is_canonical_path(self, rel: str) -> bool:

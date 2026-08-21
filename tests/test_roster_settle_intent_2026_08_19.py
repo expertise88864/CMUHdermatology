@@ -66,7 +66,7 @@ class TestTheOrderIsChosenForRecoverability:
         """帳本寫失敗 → 月檔是新的、帳本落後,而且★留著意圖紀錄★。"""
         real_ledger = svc.storage.save_ledger
 
-        def _boom(_book):
+        def _boom(_book, **_kw):   # ★生產形狀★:accept 會帶 expected_revision
             raise OSError("磁碟這一刻不給寫")
 
         svc.storage.save_ledger = _boom                  # type: ignore
@@ -84,7 +84,7 @@ class TestTheOrderIsChosenForRecoverability:
 
     def test_the_next_start_reconciles_it_from_the_month(self, svc):
         real_ledger = svc.storage.save_ledger
-        svc.storage.save_ledger = lambda _b: (_ for _ in ()).throw(
+        svc.storage.save_ledger = lambda _b, **_k: (_ for _ in ()).throw(
             OSError("x"))                                # type: ignore
         try:
             with pytest.raises(OSError):
@@ -196,7 +196,7 @@ class TestTheIntentTravelsToTheOtherMachine:
         st_a.save_month(YM, {"r_duty": {}})
         svc_a = RosterService(st_a)
         real = st_a.save_ledger
-        st_a.save_ledger = lambda _b: (_ for _ in ()).throw(  # type: ignore
+        st_a.save_ledger = lambda _b, **_k: (_ for _ in ()).throw(  # type: ignore
             OSError("A 機這一刻寫不進帳本"))
         try:
             with pytest.raises(OSError):

@@ -758,12 +758,19 @@ class SettingsTab(ttk.Frame):
 
     def _reload_template(self) -> None:
         self._tpl_tree.delete(*self._tpl_tree.get_children())
+        # ★畫面上的第幾列不是持久身分★(外審次輪 P2-04):他機在前面插一筆,
+        #   同一個 index 就指到別人。這裡記下每列的【真實身分】(新資料=id、
+        #   舊資料=內容),刪除時交給服務層比對。
+        self._tpl_rows: dict = {}
         tpl = (self._load_template().get("template") or {})
         for wd in sorted(tpl):
             for session in ("上午", "下午"):
                 for i, e in enumerate(tpl[wd].get(session) or []):
-                    self._tpl_tree.insert("", "end", iid=f"{wd}|{session}|{i}",
-                                          values=(
+                    iid = f"{wd}|{session}|{i}"
+                    self._tpl_rows[iid] = (
+                        wd, session, str(e.get("id") or ""),
+                        self.service.clinic_template_identity(e))
+                    self._tpl_tree.insert("", "end", iid=iid, values=(
                         _WD_CHOICES[int(wd) + 1], session, e.get("room", ""),
                         e.get("doctor", ""), "✓" if e.get("is_self_paid") else ""))
 
@@ -772,38 +779,27 @@ class SettingsTab(ttk.Frame):
         if not dlg.result:
             return
         wd, session, room, doctor, paid = dlg.result
-        entry = {"room": room, "doctor": doctor}
-        if paid:
-            entry["is_self_paid"] = True
-
-        def _mut(data):                    # 只加這一筆(不整份寫回)
-            (data.setdefault("template", {}).setdefault(str(wd), {})
-             .setdefault(session, []).append(entry))
-
-        if not guard_write(lambda: self.service.update_clinic_template(_mut),
-                           title="門診週模板", parent=self):
+        # 新增的列由服務層配一個穩定 id(見 P2-04);UI 不自己組 entry。
+        if not guard_write(
+                lambda: self.service.add_clinic_template_entry(
+                    wd, session, room, doctor, bool(paid)),
+                title="門診週模板", parent=self):
             return
         self._reload_template()
         self._notify()
 
     def _template_del(self) -> None:
         sel = self._tpl_tree.selection()
-        if not sel or "|" not in sel[0]:
+        row = getattr(self, "_tpl_rows", {}).get(sel[0] if sel else "")
+        if row is None:
             return
-        wd, session, idx = sel[0].split("|")
-        gone = {"hit": False}
-
-        def _mut(data):                    # 只移除這一筆
-            lst = ((data.get("template") or {}).get(wd) or {}).get(session) or []
-            try:
-                lst.pop(int(idx))
-            except (ValueError, IndexError):
-                gone["hit"] = True         # 他機已經刪掉了 → 不算失敗
-
-        if not guard_write(lambda: self.service.update_clinic_template(_mut),
-                           title="門診週模板", parent=self):
-            return
-        if gone["hit"]:
+        wd, session, entry_id, identity = row
+        # ★交出身分,不交出行號★(外審次輪 P2-04):服務層以 id(舊資料退回
+        #   完整內容)找那一筆;找不到就明說已被他機刪改,絕不按行號猜。
+        if not guard_write(
+                lambda: self.service.delete_clinic_template_entry(
+                    wd, session, entry_id=entry_id, identity=identity),
+                title="門診週模板", parent=self):
             self._reload_template()
             return
         self._reload_template()

@@ -285,6 +285,12 @@ class SolveContext:
     # 或未排=空)。連續值班軟限制需要看跨月尾端,否則上月底連休鏈接本月初的 4/5 連
     # 看不見。僅供軟規則當常數使用,不產生任何硬約束。
     prev_tail: dict = field(default_factory=dict)
+    # [外審次輪 P2-03] 手動指定的週六切片人選 {date: member_id};★空字串＝
+    # 這個週六不切片★(RS-12)。週五連動的軟規則要看它 —— 不看的話,不切片的
+    # 那一週仍會為了「不存在的切片」去調週五值班,手動指定的那一週更會獎勵
+    # 錯的人(獎勵週六值班者,而真正切片的是被指定的另一位)。
+    # 它同時是 solver 的輸入 → 自動進 `input_fingerprint`(走 dataclass 欄位)。
+    biopsy_override: dict = field(default_factory=dict)
     params: RosterParams = field(default_factory=RosterParams)
 
     # 建構後由 prepare() 填入
