@@ -44,6 +44,7 @@ from cmuh_common.roster.solve_day import (
     person_course_stats,
 )
 from cmuh_common.roster.report import (
+    build_final_biopsy_state_report, build_final_day_state_report,
     build_final_state_report, build_report,
 )
 from cmuh_common.roster.rules import (
@@ -393,14 +394,23 @@ class RosterService:
         led_all = (src.load_ledger() if src is not None
                    else copy.deepcopy(
                        self.storage.canonical_snapshot("ledger.json")[0]))
-        if not can_rollback(led_all, ym):
-            # 該月分錄可能已被修剪 → 無從確認「本月之前」是多少。寧可擋下
-            # 並說清楚(硬猜一個基準會讓之後每個月的公平目標都跟著錯)。
-            raise ValueError(
-                f"{ym} 比帳本保留的最舊月份還早，無法確認本月結算之前的餘額，"
-                f"因此不能重新排班（重排會以錯誤的公平基準計算）。"
-                f"如確實需要，請直接調整 ledger.json。")
-        rollback_month(led_all, scope, ym)
+        # ★「本月之前」＝本月與【所有更晚的月份】都要回滾★(外審 RS-20 R1-2):
+        #   先手動編輯 12 月一格(現在會立刻結算),再回頭自動排 11 月 ——
+        #   只回滾 11 月的話,12 月的差額會被當成 11 月的 carry-in,公平目標
+        #   整個歪掉。帳本是累計的,而「未來」不可能是「之前」的一部分。
+        _later = sorted({str(e.get("month") or "")
+                         for e in (led_all.get("history") or [])
+                         if e.get("scope") == scope
+                         and str(e.get("month") or "") >= ym})
+        for _m in [ym, *[x for x in _later if x != ym]]:
+            if not can_rollback(led_all, _m):
+                # 分錄可能已被修剪 → 無從確認「本月之前」是多少。寧可擋下
+                # 並說清楚(硬猜一個基準會讓之後每個月的公平目標都跟著錯)。
+                raise ValueError(
+                    f"{_m} 比帳本保留的最舊月份還早，無法確認 {ym} 結算之前的"
+                    f"餘額，因此不能重新排班（重排會以錯誤的公平基準計算）。"
+                    f"如確實需要，請直接調整 ledger.json。")
+            rollback_month(led_all, scope, _m)
         # ★餘額 0 與「這個人還沒有分錄」對求解是同一件事★:回滾之後會留下
         #   一堆值為 0 的鍵,而原本那些鍵根本不存在 —— 兩者的求解結果完全
         #   相同,指紋卻不一樣(RS-7 的過期判準會因此誤報「輸入設定已變動」)。
@@ -1105,7 +1115,10 @@ class RosterService:
         #   讀一次位元組,嚴格解析它、也用它算 revision;壞檔直接拋、磁碟不動。
         last: "StaleRosterDataError | None" = None
         for _ in range(max(1, int(retries))):
-            data, rev = self.storage.canonical_snapshot(name)
+            # ★會整份寫回去的路徑也要驗內容★(外審 RS-20 R1-4):typed loader
+            #   會把壞掉的項目先濾掉,接著這裡把「濾掉之後」的整份存回去 ——
+            #   ★那是永久刪除★,而使用者只是在設定頁改了另一筆資料。
+            data, rev = self.storage.canonical_snapshot(name, validate=True)
             out = mutator(data)
             try:
                 save(data, rev)
@@ -1906,7 +1919,24 @@ class RosterService:
             month, month_rev = src.month_snapshot(ym)
             ctx = self.build_context(scope, ym, month=month, for_solve=True,
                                      src=src)
+            # ★結轉進來的帳本要與它所描述的那些月份一致★(外審 RS-20 P1-02)
+            _stale, _unknown = self.stale_settlements(scope, ym, src=src)
+            if _stale:
+                raise ValueError(
+                    f"{'、'.join(_stale)} 的帳本結算與該月實際排班不一致"
+                    f"（班表改過之後沒有重算，或上一次結算沒有完成）；"
+                    f"直接排 {ym} 會用錯誤的公平目標（帳本結轉是下個月的"
+                    f"基準）。請先到那個月按「重算帳本」（或重開排班程式，"
+                    f"開啟時會自動收斂），再回來排班。"
+                    f"（若該月早於帳本保留期而無法重算，"
+                    f"請直接調整 ledger.json 的餘額。）")
         res = solve_duty(ctx, allow_disable_color=allow_disable_color)
+        if _unknown:
+            # ★查不出來要講出來★:舊版程式記的分錄沒有識別,月檔被刪的也查不到。
+            res.diagnosis = list(res.diagnosis) + [
+                f"{'、'.join(_unknown)} 的帳本結算沒有可比對的識別"
+                f"（舊版程式所記或月檔已不在），無法確認它是否仍與該月實際"
+                f"排班一致；若那幾個月曾手動換班，請先按「重算帳本」。"]
         res.month_revision = month_rev
         return res
 
@@ -2213,6 +2243,10 @@ class RosterService:
                 new_duty[iso] = {"person": result.assignments[d],
                                  "locked": False, "source": "auto"}
         month[f"{scope}_duty"] = new_duty
+        # ★這一份只是【診斷用的快照】,不是任何人的輸入★(外審 RS-20 P1-01):
+        #   下個月的跨月連休鏈改由上月 canonical duty 推導
+        #   (`storage.last_weekend_of`)—— 手動換班之後這個欄位就過期了,
+        #   當初正是它讓 11 月把跨月週日固定給「換班前」的那個人。
         month.setdefault("last_weekend", {})[scope] = result.last_weekend
         report = build_report(ctx, result, _SCOPE_LABEL.get(scope, scope))
 
@@ -2261,7 +2295,8 @@ class RosterService:
             #   結果是「幾乎只剩本月」的新帳本蓋掉整份餘額與歷史,而且畫面
             #   回報成功。無 revision 的寫入同樣會吃掉他機剛結算的別月分錄。
             ledger, _led_rev = src.snapshot("ledger.json")
-            settle_month(ledger, scope, ym, result.points_by_person)
+            settle_month(ledger, scope, ym, result.points_by_person,
+                         duty_digest=_duty_digest(month, scope))
             self.storage.save_ledger(ledger, expected_revision=_led_rev)
             if biopsy_book is not None:
                 self.storage.save_biopsy(biopsy_book,
@@ -2400,6 +2435,9 @@ class RosterService:
                             logging.exception(
                                 "[roster.service] set_cell 跨月週六切片重排"
                                 "失敗（留待收斂）")
+        # ★換班＝帳本也變了★(外審 RS-20 P1-02):不同步的話,下個月的公平
+        #   目標會用換班前的結轉算(而使用者不會知道要按「重算帳本」)。
+        self._converge_ledger_after_manual_edit(scope, ym)
         return self.quick_validate(scope, ym)
 
     def set_biopsy_person(self, ym: str, d: date,
@@ -2518,6 +2556,9 @@ class RosterService:
                     _holder["book"], expected_revision=_holder.get("rev"))
             if _holder.get("failed"):
                 _intent.keep(f"週六切片重排失敗:{_holder['failed']}")
+        # ★清除也是手動改動班表★(外審 RS-20 P1-02):走到這裡代表真的清掉了
+        #   東西(上面的試算沒東西可清就早退了)—— 帳本要跟著實排走。
+        self._converge_ledger_after_manual_edit(scope, ym)
 
     def set_lock(self, scope: str, ym: str, d: date, locked: bool) -> bool:
         """把某格設成「鎖定/未鎖定」(空格不可鎖)。回傳設定後的狀態。
@@ -2634,9 +2675,13 @@ class RosterService:
         # ★改名要把這些檔整份寫回去 → 來源一律用嚴格快照★(外審次輪 P2-01):
         #   壞檔的寬鬆載入回空,改名「成功」之後帳本/切片計數就只剩這一次
         #   改寫的殘骸(回滾用的 snap 也是同一份空的,救不回來)。
-        ledger = self.storage.canonical_snapshot("ledger.json")[0]
-        holiday = self.storage.load_holiday_duty()
-        biopsy = (self.storage.canonical_snapshot("biopsy.json")[0]
+        # 三份都會被整份寫回去 → 一律驗內容(見 `_update_canonical` 的說明)。
+        ledger = self.storage.canonical_snapshot("ledger.json",
+                                                 validate=True)[0]
+        holiday = self.storage.canonical_snapshot("holiday_duty.json",
+                                                  validate=True)[0]
+        biopsy = (self.storage.canonical_snapshot("biopsy.json",
+                                                  validate=True)[0]
                   if scope == "r" else None)
         _loaded = {ym: self.storage.load_month_snapshot(ym)
                    for ym in yms}
@@ -2823,7 +2868,11 @@ class RosterService:
                 #   那份舊的,他機剛同步進來的結算就靜默消失(而且我們接著還把意圖
                 #   清掉,等於宣稱已經一致)。
                 with self.storage.write_barrier():
-                    if kind == "biopsy":
+                    if kind == "ledger":
+                        # ★只欠帳本就只補帳本★(外審 RS-20 R1-3):走
+                        #   `resettle_from_duty` 會連切片一起重排並改寫月檔。
+                        self._settle_ledger_only_locked(scope, ym)
+                    elif kind == "biopsy":
                         # ★只欠切片★:帳本已經是對的,`resettle_from_duty` 會
                         #   連帶重寫它 —— 沒有必要,而且已定案的月份會被它擋下
                         #   (切片其實還重建得回來)。只重建欠的那一個。
@@ -2916,7 +2965,8 @@ class RosterService:
                 "也不是新值(%s)★ 不猜測、不搬動,意圖保留請人工確認",
                 bid, cur_start, old_start.isoformat(), new_start.isoformat())
             return False
-        grid_all, rev = self.storage.canonical_snapshot("biopsy_grid.json")
+        grid_all, rev = self.storage.canonical_snapshot("biopsy_grid.json",
+                                                        validate=True)
         g = grid_all.get(bid) or {}
         if not g:                              # 沒有格網 → 沒有義務
             self.storage.clear_pending_grid_shift(bid)
@@ -3046,26 +3096,7 @@ class RosterService:
         #   已經寫過月檔/帳本/切片帳本,沿用上一輪的快照會拿到過期的版本。
         src = self._sources(ym, SRC_SETTLE)
         ctx = self.build_context(scope, ym, month=month, src=src)
-        duty = (month.get(f"{scope}_duty") or {})
-        points = {m.id: 0 for m in ctx.members}
-        y, m = int(ym[:4]), int(ym[5:7])
-        for iso, cell in duty.items():
-            p = cell.get("person")
-            if p not in points:
-                continue
-            try:
-                dt = date.fromisoformat(iso)
-            except (ValueError, TypeError):
-                continue
-            # [2026-07-25 審查/RP3-07] 非當月鍵不計入結算：跨機人工合併/外部編輯可能在
-            # 月檔留下鄰月日期,算進去會虛增該人點數 → fair_share 與每人 delta 一起偏掉,
-            # 錯誤帳本還會結轉到下個月的排班目標。build_export / recompute_saturday_biopsy
-            # / day_course_stats 都有這道過濾,只有這條【真正寫進 ledger.json】的路徑漏了。
-            if (dt.year, dt.month) != (y, m):
-                logging.warning("[roster.service] %s 月檔含非當月鍵 %s，重算帳本時略過",
-                                ym, iso)
-                continue
-            points[p] += day_point(dt, ctx.holidays, ctx.params)
+        points = self._points_from_duty(month, scope, ctx, ym)
         # [週六切片] 重算帳本＝以最終實排為準 → 切片同步重排(含 finalize 前重算)
         #   ★用手上這一份月檔重排,不讓它自己再讀一次★(見 docstring)。
         book = book_rev = None
@@ -3085,7 +3116,9 @@ class RosterService:
         self.storage.mark_pending_settle(scope, ym)
         self.storage.save_month(ym, month, expected_revision=month_rev)
         # ★帳本也要 CAS★:他機剛結算完的別月分錄不可以被這份舊快照吃掉。
-        self.update_ledger(lambda led: settle_month(led, scope, ym, points))
+        _dig = _duty_digest(month, scope)
+        self.update_ledger(lambda led: settle_month(led, scope, ym, points,
+                                                    duty_digest=_dig))
         if book is not None:
             self.storage.save_biopsy(book, expected_revision=book_rev)
         if _bio_failed:                        # 見 accept 的同一條說明
@@ -3096,6 +3129,133 @@ class RosterService:
         else:
             self.storage.clear_pending_settle(scope, ym)
         return points, _duty_digest(month, scope)
+
+    def stale_settlements(self, scope: str, ym: str, *,
+                          src: "StrictSources | None" = None) -> tuple:
+        """比 `ym` 早、而且帳本裡那筆結算已經對不上該月班表的月份。
+
+        → (已證實不一致, 無從查證)
+
+        (外審 RS-20 P1-02)帳本餘額是【下個月公平目標的基準】:
+          10 月 Auto Accept → 帳本 A +5 / B -5
+          使用者手動把幾天換給 B(真值應變成 +2 / -2),但沒有按「重算帳本」
+          → 11 月自動排班看到的仍是 +5 / -5 → ★公平目標本身就是錯的★
+        RS-7 的全輸入指紋救不了這條:它只能證明「解與當時 persisted 的帳本
+        一致」,證明不了「那份帳本與 10 月的實排一致」。
+
+        ★已證實不一致 → 擋;查不出來 → 講出來但不擋★:舊版程式記的分錄沒有
+        識別(升級當下每一筆都是這樣),月檔被刪掉的月份也查不到 —— 一律擋的話,
+        使用者升級後連一個月都排不了,而那是個一定會發生的狀態。
+        """
+        led = src.load_ledger() if src is not None else self.storage.load_ledger()
+        stale, unknown = set(), set()
+        for e in (led.get("history") or []):
+            if e.get("scope") != scope:
+                continue
+            m = str(e.get("month") or "")
+            if not m or m >= ym:
+                continue          # 本月的舊分錄求解時本來就會被回滾(RS-9)
+            dig = e.get("duty_digest")
+            if not dig or not self.storage.month_exists(m):
+                unknown.add(m)
+                continue
+            try:
+                # ★嚴格讀★:壞檔在這裡回一份「空班表」的話,它與任何識別都
+                #   對不上 —— 那會把「讀不到」誤報成「被改過」,而兩者的處置
+                #   完全不同(一個要修檔,一個要按重算帳本)。
+                if _duty_digest(self.storage.load_month_snapshot(m)[0],
+                                scope) != dig:
+                    stale.add(m)
+            except Exception:     # 壞檔/新版 schema → 查不出來,不是「沒問題」
+                logging.warning("[roster.service] %s 的月檔讀不到,無法確認帳本"
+                                "是否仍與它一致", m, exc_info=True)
+                unknown.add(m)
+        # ★還沒結算完成的月份也不可以當結轉★(外審 RS-20 R1-1):
+        #   純手動排的月份根本還沒有分錄,識別比對看不見它 —— 那筆意圖是
+        #   唯一的線索(切片義務不算:它不影響點數)。
+        for x in self.storage.load_pending_settles():
+            if str(x.get("scope") or "") != scope:
+                continue
+            m = str(x.get("ym") or "")
+            if m and m < ym and self.storage.pending_kind(x) in ("ledger",
+                                                                 "all"):
+                stale.add(m)
+        return sorted(stale), sorted(unknown)
+
+    def _converge_ledger_after_manual_edit(self, scope: str, ym: str) -> None:
+        """手動換班之後,帳本要跟著實排走(外審 RS-20 P1-02)。
+
+        ★不可以擋住這次編輯★:使用者要的是「改一格就是改一格」。收斂失敗
+        (例如該月早於帳本保留期)時只記 log —— 帳本裡那筆結算的識別就會與
+        月檔對不上,而求解【下個月】之前的閘門會擋下來並說清楚是哪一個月。
+        ★也不可以只靠使用者記得按「重算帳本」★:那是一個隱形的維護義務,
+        而它保護的是下個月的公平性。
+
+        ★只做帳本,不走完整的 `resettle_from_duty`★:那條路會連切片一起重排、
+        並且清掉 (scope, 月份) 的結算意圖 —— 而呼叫端(set_cell / clear_unlocked)
+        剛剛才為切片留下一筆義務,也可能有【別人】未完成的義務在那裡。
+        用它來收斂帳本會替那些義務宣稱「已經一致了」(RS-10 的教訓),而且
+        同一次編輯會白白重排兩次切片。
+        """
+        try:
+            with self.storage.write_barrier():
+                # ★意圖要在【任何一個可能失敗的步驟之前】記下★(外審 RS-20
+                #   R1-1):純手動排的月份還沒有任何結算分錄,所以
+                #   `stale_settlements` 的「識別對不上」查不到它 —— 收斂若在
+                #   讀檔/建 context 就失敗,那個月的結轉會整個消失,而下個月
+                #   照樣排得出來。意圖是這種「從未結算過」的唯一線索。
+                # ★來源(月檔)在進來之前就已經落地 → 進場即負債★
+                with self.settle_intent(scope, ym, kind="ledger",
+                                        witness_ym=None):
+                    self._settle_ledger_only_locked(scope, ym)
+        except Exception:
+            logging.exception(
+                "[roster.service] ★%s %s 手動換班後帳本未能同步重算★ ——"
+                "求解下個月之前會被閘門擋下(見 stale_settlements)", scope, ym)
+
+    def _settle_ledger_only_locked(self, scope: str, ym: str) -> None:
+        """只把帳本結算到與這一份月檔的實排一致 —— ★不碰切片、不寫月檔★。
+
+        ★手動編輯後的收斂與開程式的補救共用同一份實作★(外審 RS-20 R1-3):
+        `resettle_from_duty` 會連切片一起重排並改寫月檔,拿它來補一筆
+        「只欠帳本」的義務,可能意外改派週六切片(別的月份/次數已經變了)。
+        ★呼叫端必須持有 `write_barrier`★
+        """
+        month, _rev = self.storage.load_month_snapshot(ym)
+        if month.get("finalized"):
+            return                # 定案月的結算在定案時已驗過,不必也不能動
+        src = self._sources(ym, SRC_RVS)
+        ctx = self.build_context(scope, ym, month=month, src=src)
+        points = self._points_from_duty(month, scope, ctx, ym)
+        dig = _duty_digest(month, scope)
+        self.update_ledger(lambda led: settle_month(led, scope, ym, points,
+                                                    duty_digest=dig))
+
+    @staticmethod
+    def _points_from_duty(month: dict, scope: str, ctx, ym: str) -> dict:
+        """這一份月檔的實排 → {member_id: 本月點數}。
+
+        ★非當月鍵一律不算★:跨機人工合併/外部編輯會在月檔留下鄰月日期,
+        算進去就虛增那個人的點數 —— 而它是下個月公平目標的基準。
+        ★只有一份實作★:重算帳本與手動編輯後的收斂共用(兩邊各寫一次的話,
+        遲早只有一邊被修好,而它們算的是同一件事)。
+        """
+        y, m = int(ym[:4]), int(ym[5:7])
+        points = {mm.id: 0 for mm in ctx.members}
+        for iso, cell in (month.get(f"{scope}_duty") or {}).items():
+            p = (cell or {}).get("person")
+            if p not in points:
+                continue
+            try:
+                dt = date.fromisoformat(iso)
+            except (ValueError, TypeError):
+                continue
+            if (dt.year, dt.month) != (y, m):
+                logging.warning(
+                    "[roster.service] %s 月檔含非當月鍵 %s，結算時略過", ym, iso)
+                continue
+            points[p] += day_point(dt, ctx.holidays, ctx.params)
+        return points
 
     def finalize(self, ym: str, on: bool) -> list:
         """定案/解除定案 → ★定案當下的留底段落★(解除定案回 [])。
@@ -3243,6 +3403,17 @@ class RosterService:
                 year=y, month=m, scope_label=label, members=members,
                 duty=duty, holidays=holidays, params=params,
                 ledger=dict(ledger_all.get(scope) or {}))))
+        # ★PGY/Clerk 與週六切片也是正式排班內容★(外審 RS-20 P1-03):
+        #   它們原本只出現在【當初求解】的報告裡 —— 手動改過、或整個月純手動
+        #   排(根本沒有報告)的話,留底文件就少了那一段,而封面寫的是
+        #   「定案當下的排班快照」。一律由月檔的正典欄位重建。
+        _r_names = {mm.get("id"): (mm.get("name") or mm.get("id"))
+                    for mm in (cfg.get("r_members") or [])}
+        sections.append(("PGY・Clerk 最終日排班", build_final_day_state_report(
+            year=y, month=m, day_slots=month.get("day_slots") or {})))
+        sections.append(("週六切片最終名單", build_final_biopsy_state_report(
+            year=y, month=m, names=_r_names,
+            saturday_biopsy=month.get("saturday_biopsy") or {})))
         for scope, label in (("r", "R 排班決策報告"), ("vs", "VS 排班決策報告"),
                              ("day", "PGY / Clerk 日排班報告")):
             rpt = month.get(report_key(scope))

@@ -156,8 +156,8 @@ class TestResettleReadsTheMonthOnce:
         fired: list = []
         real = st.canonical_snapshot
 
-        def _hook(name):
-            out = real(name)
+        def _hook(name, **kw):        # ★形狀要跟生產一樣★(現在會帶 validate=)
+            out = real(name, **kw)
             if name == "ledger.json" and not fired:
                 fired.append(True)
                 led = st.load_ledger()

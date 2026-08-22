@@ -6,7 +6,10 @@ automation_ui.log。使用者要求「清楚了解排班的邏輯、哪些人沒
 """
 from __future__ import annotations
 
-from cmuh_common.roster.model import SolveContext, day_point, is_weekend
+from datetime import date
+
+from cmuh_common.roster.model import (SolveContext, day_point, is_weekend,
+)
 from cmuh_common.roster.ledger import fair_share
 
 _WD = "一二三四五六日"
@@ -151,4 +154,67 @@ def build_final_state_report(*, year: int, month: int, scope_label: str,
             f"  {names.get(mid, mid):<8}"
             f"{len(days_m) - we:>4}{we:>6}{len(days_m):>6}{pts:>6}"
             f"{float(ledger.get(mid, 0.0)):>+11.2f}{tail}")
+    return "\n".join(lines)
+
+
+def build_final_day_state_report(*, year: int, month: int,
+                                 day_slots: dict) -> str:
+    """PGY/Clerk 的【最終日排班】—— 由月檔 `day_slots` 直接重建。
+
+    (外審 RS-20 P1-03)留底 PDF 原本只有 R/VS 的最終班表,PGY/Clerk 那一段
+    仍然只放 `day_report`(自動排班【當初】的紀錄)。可是:
+      * 套用之後手動改一格 → `day_slots` 才是最終真相,而 day_report 過期;
+      * 整個月純手動排 → 根本沒有 day_report,留底文件就完全沒有日排班。
+    而封面寫的是「本檔為定案當下的排班快照」。
+
+    day_slots: {iso: {時段: {格位: [人, ...]}}}(格位＝房號/照光/治療室/
+    切片室/放假)。空的月份也要明講,不可以靜靜地少一段。
+    """
+    lines = [f"═══ {year}/{month:02d} PGY・Clerk 最終日排班（定案留底）═══",
+             "（依定案當下的月檔 day_slots 重建；含自動排班後的人工調整）"]
+    rows = []
+    for iso in sorted(day_slots or {}):
+        try:
+            d = date.fromisoformat(iso)
+        except (ValueError, TypeError):
+            continue
+        if (d.year, d.month) != (year, month):
+            continue                 # 非當月鍵不列(與結算/匯出同一道過濾)
+        for session in ("上午", "下午"):
+            slots = (day_slots.get(iso) or {}).get(session) or {}
+            if not slots:
+                continue
+            body = "  ".join(
+                f"{slot}:{'、'.join(str(x) for x in (people or []))}"
+                for slot, people in sorted(slots.items()) if people)
+            if body:
+                rows.append(f"  {_fmt_day(d):>12} {session}  {body}")
+    lines.extend(rows or ["  （本月沒有任何日排班紀錄）"])
+    return "\n".join(lines)
+
+
+def build_final_biopsy_state_report(*, year: int, month: int,
+                                    saturday_biopsy: dict,
+                                    names: dict) -> str:
+    """週六切片的【最終名單】—— 由月檔 `saturday_biopsy` 直接重建。
+
+    (外審 RS-20 P1-03)它原本只在 R 的求解報告裡以 [週六切片] 段呈現 ——
+    沒有 `report_r` 的月份(純手動排、或報告被清掉)留底文件就沒有切片名單,
+    而那同樣是正式排班內容。
+    """
+    lines = [f"═══ {year}/{month:02d} 週六切片最終名單（定案留底）═══",
+             "（依定案當下的月檔 saturday_biopsy 重建）"]
+    rows = []
+    for iso in sorted(saturday_biopsy or {}):
+        cell = saturday_biopsy.get(iso) or {}
+        mid = str((cell or {}).get("person") or "")
+        try:
+            d = date.fromisoformat(iso)
+        except (ValueError, TypeError):
+            continue
+        if (d.year, d.month) != (year, month) or not mid:
+            continue
+        tail = "" if mid in names else "  ← 已不在目前名單"
+        rows.append(f"  {_fmt_day(d):>12} {names.get(mid, mid)}{tail}")
+    lines.extend(rows or ["  （本月沒有排週六切片）"])
     return "\n".join(lines)

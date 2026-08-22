@@ -25,7 +25,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from cmuh_common.atomic_io import atomic_write_json
-from cmuh_common.roster.model import SCHEMA_VERSION
+from cmuh_common.roster.model import SCHEMA_VERSION, month_dates
 
 KEEP_SNAPSHOTS = 20
 
@@ -146,18 +146,122 @@ def prev_ym(ym: str) -> str:
     return f"{py:04d}-{pm:02d}"
 
 
-def last_weekend_of(prev_month: dict, scope: str) -> Optional[tuple]:
-    """月檔的「最後週末」摘要 -> (saturday_date, member_id) 或 None。
+def last_weekend_of(month_data: dict, scope: str, ym: str) -> Optional[tuple]:
+    """這個月「最後一個週末」是誰值的 -> (saturday_date, member_id) 或 None。
+
+    ★由 canonical duty 推導,不看 `month["last_weekend"]` 那份快取★
+    (外審 RS-20 P1-01):那份快取是 Auto Accept 當下寫的,而之後的手動換班
+    【不會】更新它 —— 它卻是下個月跨月連休鏈的【硬約束】來源:
+      10/31(週六)自動排給 A → 套用 → 使用者手動改成 B
+      → 11 月自動排班仍把跨月的 11/1(週日)固定給 A
+    這不是 soft fairness、也不是報告問題,而是 solver 的硬輸入錯了,而且完全
+    正常的操作就重現得出來。衍生資料只有兩種安全的活法:使用前重新推導,
+    或帶新鮮度識別 —— 這裡選前者(推導很便宜,而且不可能忘記更新)。
+
+    ★判準用「這個月的最後一個週六」,不是「有人的最後一個週六」★:
+    solver 取的是最後一個【週末區塊】的週六(`weekend_blocks[-1].saturday`)。
+    改成「往前找到有人的那一個」會把跨月連休鏈接到兩週前的那個週末,
+    在下個月固定給一個根本不相鄰的人。沒有人 -> None(＝沒有銜接資料),
+    `apply_boundary_from_prev` 與色塊連週規則本來就對 None 有正確處理。
 
     ★解讀規則只有一份★:寬鬆讀取(`RosterStorage.prev_month_last_weekend`)與
-    嚴格快照(`StrictSources`)都走這裡 —— 兩邊各寫一次的話,對缺欄位/壞日期的
-    判定會漂移,而那正是「求解與套用看到不同輸入」的縫。
+    嚴格快照(`StrictSources`)都走這裡。
     """
-    info = ((prev_month.get("last_weekend") or {}).get(scope)) or {}
-    try:
-        return (date.fromisoformat(info["saturday"]), str(info["person"]))
-    except (KeyError, ValueError, TypeError):
+    y, m = int(ym[:4]), int(ym[5:7])
+    sats = [d for d in month_dates(y, m) if d.weekday() == 5]
+    if not sats:
         return None
+    last = sats[-1]
+    cell = ((month_data.get(f"{scope}_duty") or {}).get(last.isoformat())) or {}
+    person = str(cell.get("person") or "")
+    return (last, person) if person else None
+
+
+def _iso_or_none(k):
+    try:
+        return date.fromisoformat(str(k))
+    except (ValueError, TypeError):
+        return None
+
+
+def validate_authoritative_shape(name: str, raw: dict) -> None:
+    """權威計算之前的【內容】檢查 —— 壞在裡面的東西不可以被靜靜濾掉。
+
+    (外審 RS-20 P2-01)`_strict_snapshot` 擋的是「讀不到 / 0 位元組 / 不是
+    JSON / 頂層不是物件」;但 typed loader 本身是【給顯示用】的寬鬆設計:
+      * `load_holiday_duty` 對壞掉的日期鍵只記 warning 然後跳過
+        → 整年國定假日可以只剩幾天,而 solver 完全看不出來;
+      * `load_clerk_batches` 直接濾掉非 dict 的項目 → 一整梯 Clerk 消失;
+      * `load_config` 不看成員項目的形狀 → 少一個人也算「成功載入」。
+    正常 UI 不會產生這些形狀,要人工合併/外部編輯/舊檔損壞才會 —— 但那正是
+    這一批要處理的那種情境:★它是合法 JSON,所以每一道既有守衛都會放行★。
+
+    顯示路徑不走這裡(讀不到就顯示空,不該讓視窗打不開);
+    ★會寫回去的路徑一律先過這一關★(見 `StrictSources`)。
+    """
+    def bad(why: str):
+        raise ValueError(f"{name} 的內容不適合用來排班/結算：{why}。"
+                         f"請修正該檔之後再試（顯示不受影響）。")
+
+    if name == "holiday_duty.json":
+        for scope in ("r", "vs"):
+            # ★先看原值的型別,不要先用 `or` 正規化★(外審 RS-20 R1-5):
+            #   `{"r": []}` 這種【錯型別但 falsey】的值會被 `or {}` 變成合法的
+            #   空表 —— 整年國定假日就這樣消失,而每一道守衛都放行。
+            if raw.get(scope) is not None and not isinstance(raw[scope], dict):
+                bad(f"{scope} 不是物件（{type(raw[scope]).__name__}）")
+            for k in (raw.get(scope) or {}):
+                if _iso_or_none(k) is None:
+                    bad(f"{scope} 有不是日期的鍵 {k!r}（整批國定假日會少掉它）")
+    elif name == "clerk_batches.json":
+        items = raw.get("batches")
+        if items is not None and not isinstance(items, list):
+            bad("batches 不是清單")
+        for i, b in enumerate(items or []):
+            if not isinstance(b, dict):
+                bad(f"第 {i + 1} 筆梯次不是物件（{type(b).__name__}）")
+            if not str(b.get("id") or "").strip():
+                bad(f"第 {i + 1} 筆梯次沒有 id")
+            if _iso_or_none(b.get("start_monday")) is None:
+                bad(f"梯次 {b.get('id')} 的 start_monday 不是日期"
+                    f"（{b.get('start_monday')!r}）")
+            if b.get("members") is not None and not isinstance(
+                    b.get("members"), list):                     # 見上一段
+                bad(f"梯次 {b.get('id')} 的 members 不是清單"
+                    f"（{type(b.get('members')).__name__}）")
+    elif name == "config.json":
+        for key in ("r_members", "vs_members", "pgy_members"):
+            lst = raw.get(key)
+            if lst is not None and not isinstance(lst, list):
+                bad(f"{key} 不是清單")
+            for i, mm in enumerate(lst or []):
+                if not isinstance(mm, dict):
+                    bad(f"{key} 第 {i + 1} 位不是物件（{type(mm).__name__}）")
+                if not str(mm.get("id") or "").strip():
+                    bad(f"{key} 第 {i + 1} 位沒有代號(id)")
+    elif name == "clinic_template.json":
+        tpl = raw.get("template")
+        if tpl is not None and not isinstance(tpl, dict):
+            bad("template 不是物件")
+        for wd, sess in (tpl or {}).items():
+            if not isinstance(sess, dict):
+                bad(f"週{wd} 的內容不是物件")
+            for session, entries in sess.items():
+                if not isinstance(entries, list):
+                    bad(f"週{wd} {session} 的門診清單不是陣列")
+                for e in entries:
+                    if not isinstance(e, dict):
+                        bad(f"週{wd} {session} 有一筆門診不是物件")
+    elif name == "biopsy_grid.json":
+        grid = raw.get("grid")
+        if grid is not None and not isinstance(grid, dict):
+            bad("grid 不是物件")
+        for bid, days in (grid or {}).items():
+            if not isinstance(days, dict):
+                bad(f"梯次 {bid} 的格網不是物件")
+            for k in days:
+                if _iso_or_none(k) is None:
+                    bad(f"梯次 {bid} 有不是日期的鍵 {k!r}")
 
 
 class RosterStorage:
@@ -227,7 +331,7 @@ class RosterStorage:
                 "正典檔登記表與載入表不一致（新增正典檔要兩邊都補）")
         return loaders[name]
 
-    def canonical_snapshot(self, name: str):
+    def canonical_snapshot(self, name: str, *, validate: bool = False):
         """→ (窄改動用的形狀, revision)。★位元組只讀一次★
 
         (外審排班 RS-5 第 2 輪 P2)「先嚴格檢查、再算 revision、再 load()」是
@@ -243,6 +347,11 @@ class RosterStorage:
             raise KeyError(f"{name} 不是正典檔(要走 CAS 請先登記到 "
                            f"CANONICAL_FILES)")
         data, rev = self._strict_snapshot(self._path(name))
+        if validate:
+            # ★會寫回去的路徑要連【內容】都檢查★(外審 RS-20 P2-01):
+            #   typed loader 是給顯示用的寬鬆設計,壞掉的日期鍵/梯次項目會被
+            #   靜靜濾掉 —— 合法 JSON,所以既有守衛全部放行。
+            validate_authoritative_shape(name, data)
         return self._canonical_loader(name)(_parsed=data), rev
 
     def _strict_snapshot(self, path: str) -> "tuple[dict, str]":
@@ -920,13 +1029,14 @@ class RosterStorage:
 
     # ── 跨月銜接輔助 ─────────────────────────────────────────────────────
     def prev_month_last_weekend(self, ym: str, scope: str) -> Optional[tuple]:
-        """讀上月檔的「最後週末」摘要 → (saturday_date, member_id) 或 None。
+        """上月「最後一個週末」是誰值的 → (saturday_date, member_id) 或 None。
 
-        由 save 端在成功排班後寫入 data["last_weekend"][scope] =
-        {"saturday": iso, "person": id}；此處只讀。缺 → None（precheck 會警告）。
+        ★由上月的 canonical duty 推導★(見 `last_weekend_of`):月檔裡的
+        `last_weekend` 欄位是 Auto Accept 當下的快照,手動換班不會更新它,
+        而這個回傳值是下個月跨月連休的硬約束。缺 → None（precheck 會警告）。
         """
-        prev = _load_json(self._month_path(prev_ym(ym)))
-        return last_weekend_of(prev, scope)
+        pym = prev_ym(ym)
+        return last_weekend_of(_load_json(self._month_path(pym)), scope, pym)
 
 
 class StrictSources:
@@ -960,7 +1070,8 @@ class StrictSources:
         self._shapes: dict = {}
         self._revs: dict = {}
         for n in sorted(set(names)):
-            self._shapes[n], self._revs[n] = storage.canonical_snapshot(n)
+            self._shapes[n], self._revs[n] = storage.canonical_snapshot(
+                n, validate=True)
         self._months: dict = {}
         for ym in sorted(set(months)):
             data, rev = storage.load_month_snapshot(ym)
@@ -1037,4 +1148,5 @@ class StrictSources:
         return self._months[ym][2]
 
     def prev_month_last_weekend(self, ym: str, scope: str) -> Optional[tuple]:
-        return last_weekend_of(self.load_month(prev_ym(ym)), scope)
+        pym = prev_ym(ym)
+        return last_weekend_of(self.load_month(pym), scope, pym)

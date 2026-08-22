@@ -165,3 +165,52 @@ def test_a_barrier_write_that_cannot_commit_is_published_too(tmp_path):
         release.set()
         t.join(timeout=10)
     assert st.sync_state != "ok", "★畫面停在「已同步」,而變更還沒 commit★"
+
+
+def test_a_month_file_created_after_the_pathspec_is_still_measured(tmp_path):
+    """★量測範圍是【量的當下】所有的正典檔★(外審 RS-20 P2-02)。
+
+    背景 push 先列 pathspec(那一刻 months/2026-11.json 還不存在)→ UI 在那
+    之後第一次建立該月檔卻拿不到 git 鎖 → 標記為未 commit;背景這邊量測時
+    若只看舊 pathspec,就會回報「乾淨」把標記清掉,接著推舊 HEAD → 顯示
+    「已同步」,而新月檔只在工作樹裡。
+    """
+    _remote, work = _repo(tmp_path)
+    st = GitSyncStorage(str(work), push_debounce_sec=30.0, pull_interval_sec=0)
+    st.save_config({"r_members": [{"id": "A"}]})
+    st._last_pathspec = ["config.json"]        # commit 開始時列出來的那一份
+    (work / "months").mkdir(exist_ok=True)
+    (work / "months" / "2026-11.json").write_text("{}", encoding="utf-8")
+    dirt = st._canonical_dirt(st._measure_paths())
+    assert "2026-11.json" in dirt, f"★新月檔沒有被量到★ {dirt!r}"
+
+
+def test_the_commit_measures_the_current_tree_not_the_old_pathspec(
+        tmp_path, monkeypatch):
+    """★接上去了才存在★:量測範圍算對了,`_commit` 卻仍拿舊 pathspec 去量的話,
+    這條規則等於沒有(外審 RS-20 P2-02)。"""
+    _remote, work = _repo(tmp_path)
+    st = GitSyncStorage(str(work), push_debounce_sec=30.0, pull_interval_sec=0)
+    st.save_config({"r_members": [{"id": "A"}]})
+
+    def _body(_label):                 # commit 進行中,UI 建立了新月檔
+        st._last_pathspec = ["config.json"]
+        (work / "months").mkdir(exist_ok=True)
+        (work / "months" / "2026-11.json").write_text("{}", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(st, "_commit_body", _body)
+    st._commit("測試")
+    assert "2026-11.json" in st._uncommitted,         f"★量的是 commit 開始時的那一份清單★ {st._uncommitted!r}"
+
+
+def test_an_unknown_pathspec_is_never_reported_as_clean(tmp_path):
+    """★「不敢說乾淨」就要真的說不出來★(外審 RS-20 R1-6):`ls-files` 失敗
+    時,盤上現存的檔列得出來,【已追蹤但被刪掉】的那些卻列不出來 —— 回傳
+    現存清單會讓「刪掉一個月份」量成乾淨。"""
+    _remote, work = _repo(tmp_path)
+    st = GitSyncStorage(str(work), push_debounce_sec=30.0, pull_interval_sec=0)
+    st.save_config({"r_members": [{"id": "A"}]})
+    st._last_pathspec = None                  # ls-files 失敗的樣子
+    assert st._measure_paths() is None
+    assert st._canonical_dirt(st._measure_paths()), "★量不到卻說乾淨★"

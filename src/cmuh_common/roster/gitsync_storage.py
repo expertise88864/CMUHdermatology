@@ -454,11 +454,45 @@ class GitSyncStorage(RosterStorage):
         結果交給 `_set_state` 的守衛。
         """
         ok = self._commit_body(label)
-        self._uncommitted = self._canonical_dirt(self._last_pathspec)
+        self._uncommitted = self._canonical_dirt(self._measure_paths())
         if self._uncommitted:
             logging.warning("[roster.gitsync] ★本機變更尚未 commit★：%s",
                             self._uncommitted)
         return ok
+
+    def _measure_paths(self) -> "list | None":
+        """量髒污時要看的範圍＝【量的當下】盤上所有的正典檔 ∪ 這次 commit 的
+        pathspec。
+
+        (外審 RS-20 P2-02)只看「這次 commit 開始時列出來的那一份」會有一個
+        窗口:背景 push 先列了 pathspec(那時 months/2026-11.json 還不存在),
+        UI 在那之後第一次建立該月檔卻拿不到 git 鎖 → 標記為未 commit;
+        背景這邊 commit 完舊 pathspec、量測時因為新月檔不在清單裡而回報
+        「乾淨」,把剛才的標記清掉,接著推舊 HEAD → 顯示「已同步」。
+        (去抖 push 幾秒後會補收,所以不是永久資料遺失 —— 但那段期間畫面說的
+        是假的。)聯集也保住「已追蹤但檔案已刪」那一類(只在 pathspec 裡)。
+        """
+        try:
+            fresh = [n for n in self._SYNC_FILES
+                     if os.path.exists(os.path.join(self.base_dir, n))]
+            for dname in self._SYNC_DIRS:
+                dpath = os.path.join(self.base_dir, dname)
+                if not os.path.isdir(dpath):
+                    continue
+                for fn in sorted(os.listdir(dpath)):
+                    if _is_month_filename(fn):
+                        fresh.append(f"{dname}/{fn}")
+        except OSError:
+            logging.warning("[roster.gitsync] 列舉正典檔失敗（視為無法確認）",
+                            exc_info=True)
+            return None
+        prev = self._last_pathspec
+        if prev is None:
+            # ★「不敢說乾淨」就要真的說不出來★(外審 RS-20 R1-6):`ls-files`
+            #   失敗時,盤上現存的檔案列得出來,【已追蹤但被刪掉】的那些卻列
+            #   不出來 —— 回傳現存清單會讓「刪掉一個月份」量成乾淨。
+            return None
+        return sorted(set(fresh) | set(prev))
 
     def _canonical_dirt(self, paths: "list | None") -> str:
         """工作樹裡還有沒有【尚未 commit 的正典資料】→ 說明字串(空＝乾淨)。

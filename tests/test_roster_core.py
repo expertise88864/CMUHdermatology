@@ -263,9 +263,14 @@ def test_storage_week_colors_replace_can_delete(tmp_path):
 
 
 def test_storage_prev_month_last_weekend(tmp_path):
+    """★由上月的 canonical duty 推導,不看 last_weekend 快取★(外審 RS-20
+    P1-01):快取是 Auto Accept 當下寫的,手動換班不會更新它 —— 而它是下個月
+    跨月連休的硬約束來源。2026-07 的最後一個週六是 7/25。"""
     st = RosterStorage(str(tmp_path))
-    st.save_month("2026-07", {"last_weekend": {
-        "r": {"saturday": "2026-07-25", "person": "r_b"}}})
+    st.save_month("2026-07", {
+        "r_duty": {"2026-07-25": {"person": "r_b", "locked": False}},
+        # 過期的快照(指向另一個人)—— 不可以被採信
+        "last_weekend": {"r": {"saturday": "2026-07-25", "person": "舊的人"}}})
     assert st.prev_month_last_weekend("2026-08", "r") == (date(2026, 7, 25), "r_b")
     assert st.prev_month_last_weekend("2026-08", "vs") is None
     assert st.prev_month_last_weekend("2026-01", "r") is None  # 上月=去年12月,無檔

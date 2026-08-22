@@ -204,13 +204,16 @@ class TestTheIntentMeansTheDerivedStateIsRebuilt:
         #   帳本被改寫也看不出來 —— 勝負靠巧合的反例什麼都量不到。
         for d in (3, 4, 5):                              # A 多值三個平日
             svc.set_cell("r", YM, date(2026, 8, d), "A")
-        svc.update_ledger(
-            lambda led: led.setdefault("r", {}).update({"A": 9.0}))
         self._boom_recompute(svc, monkeypatch)
         svc.set_cell("r", YM, date(2026, 8, 8), "B")     # 意圖由這條路留下
+        # ★基準取【收斂之前】的帳本★(RS-20 P1-02 之後,手動改格本身就會把
+        #   帳本結算到與實排一致 —— 事先手工塞一個值再比對,量到的是那次
+        #   合法的結算,不是收斂有沒有多改)。
+        before = dict(svc.storage.load_ledger()["r"])
+        assert len(set(before.values())) > 1,             "反例要不對稱,否則整份重算改寫帳本也看不出來"
         monkeypatch.undo()
         svc.reconcile_pending_settles()
-        assert svc.storage.load_ledger()["r"]["A"] == 9.0,             "★只欠切片,收斂卻整份重算而改寫了帳本★"
+        assert dict(svc.storage.load_ledger()["r"]) == before,             "★只欠切片,收斂卻整份重算而改寫了帳本★"
         assert not svc.storage.load_pending_settles()
 
     def test_accept_downgrades_the_obligation_instead_of_erasing_it(

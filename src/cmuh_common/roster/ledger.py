@@ -70,10 +70,15 @@ def fair_share(total_points: float, n_members: int) -> float:
 
 
 def settle_month(ledger: dict, scope: str, month: str,
-                 points_by_person: dict) -> dict:
+                 points_by_person: dict, *, duty_digest: str = "") -> dict:
     """把該月結果記入帳本（會先自動回滾同月同 scope 舊分錄）。
 
     points_by_person: {member_id: 本月實得點數}
+    duty_digest: ★這筆結算是照【哪一份班表】算出來的★(外審 RS-20 P1-02)。
+        帳本餘額是下個月公平目標的基準,而手動換班之後它就不再反映實排 ——
+        沒有這個識別的話,「這份帳本跟那個月的班表一不一致」根本查不出來
+        (指紋只能證明「解與當時 persisted 的帳本一致」,證明不了帳本本身對)。
+        舊分錄沒有這個欄位 → 一律當成【無從查證】(不是「沒問題」)。
     回傳更新後 ledger（就地修改並回傳，呼叫端負責 save）。
 
     ★[2026-08-02 補審] 分錄已被修剪的月份一律拒絕結算★
@@ -96,8 +101,10 @@ def settle_month(ledger: dict, scope: str, month: str,
         delta = round(pts - share, 4)
         book[pid] = round(book.get(pid, 0.0) + delta, 4)
         deltas[pid] = delta
-    ledger.setdefault("history", []).append(
-        {"month": month, "scope": scope, "deltas": deltas})
+    entry = {"month": month, "scope": scope, "deltas": deltas}
+    if duty_digest:
+        entry["duty_digest"] = str(duty_digest)
+    ledger.setdefault("history", []).append(entry)
     _trim_history(ledger)      # [OPT-4] 舊分錄不再被回滾 → 限制 history 大小
     return ledger
 

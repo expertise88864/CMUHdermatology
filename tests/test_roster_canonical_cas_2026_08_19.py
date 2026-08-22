@@ -38,8 +38,8 @@ def _remote_write_after_read(st, name, remote):
     fired: list = []
     real = st.canonical_snapshot
 
-    def _hook(n):
-        out = real(n)
+    def _hook(n, **kw):          # ★形狀要跟生產一樣★(現在會帶 validate=)
+        out = real(n, **kw)
         if n == name and not fired:
             fired.append(True)
             remote()
