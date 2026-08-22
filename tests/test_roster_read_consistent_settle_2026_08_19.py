@@ -297,7 +297,7 @@ class TestTheCrossMachineHalfIsTheCas:
         i_book = src.index("recompute_saturday_biopsy(")
         i_month = src.index("save_month(")
         i_led = src.index("update_ledger(")
-        assert src.index("ym, month)", i_book) > i_book, \
+        assert src.index("ym, month", i_book) > i_book, \
             "★切片重排要用手上這一份月檔(不可以讓它自己再讀一次)★"
         assert i_month < i_led, "★月檔先寫(可收斂方向),它的 CAS 就是閘門★"
         assert "expected_revision=month_rev" in src

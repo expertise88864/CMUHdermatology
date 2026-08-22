@@ -274,9 +274,14 @@ class StatusBar(ttk.Frame):
         self._var.set(text)
 
 
-def archive_finalize_pdf_async(parent, service, ym) -> None:
+def archive_finalize_pdf_async(parent, service, ym, sections=None) -> None:
     """定案後於背景 lazy 安裝 reportlab 並輸出定案 PDF 留底，完成以 messagebox 告知。
-    非阻塞（背景執行緒）；reportlab 已在 → 直接產生；未安裝 → 下載後產生。"""
+    非阻塞（背景執行緒）；reportlab 已在 → 直接產生；未安裝 → 下載後產生。
+
+    `sections`＝★定案當下就取好的內容★(由 `service.finalize()` 回傳)。
+    這個背景工作可能要先下載安裝 reportlab,期間帳本會被別的月份/別台電腦
+    改動 —— 讓它自己事後重組的話,文件上的餘額就不是定案那一刻的
+    (外審 RS-19 R1-2)。"""
     from tkinter import messagebox
 
     from cmuh_common.deps_runtime import ensure_dependencies
@@ -288,7 +293,7 @@ def archive_finalize_pdf_async(parent, service, ym) -> None:
                 import reportlab  # noqa: F401,PLC0415
             except ImportError:
                 ensure_dependencies([("reportlab", "reportlab")])
-            path = service.archive_finalize_pdf(ym)
+            path = service.archive_finalize_pdf(ym, sections)
         except (Exception, SystemExit) as e:  # noqa: BLE001
             logging.exception("[roster.ui] 定案 PDF 留底失敗")
             err = str(e) or "已取消或安裝失敗"

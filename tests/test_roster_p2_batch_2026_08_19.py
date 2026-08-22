@@ -40,14 +40,14 @@ class TestTheExportIsOneConsistentSnapshot:
 
         real_ledger = st.load_ledger
 
-        def _slow_ledger():
+        def _slow_ledger(*_a, **_kw):    # ★形狀要跟生產一樣★(會帶 _parsed=)
             # 匯出讀到一半 —— 這一刻他機想寫進來
             seen_inside.append(True)
             t = threading.Thread(target=_writer)
             t.start()
             started.wait(timeout=5)
             t.join(timeout=0.6)
-            return real_ledger()
+            return real_ledger(*_a, **_kw)
 
         def _writer():
             started.set()

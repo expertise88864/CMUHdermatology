@@ -74,6 +74,15 @@ class GitSyncStorage(RosterStorage):
         # .gitignore 就緒與否 —— 未就緒即不 commit（P2-05 fail-closed）。
         # 非 git repo / 未設 remote 時不會走到 commit，維持 True 不影響純本機模式。
         self._gitignore_ok = True
+        # ★「推成功」不等於「已同步」★(外審 2026-08-22 P2):canonical 檔是
+        #   先寫工作樹、再 local commit、再排 push。commit 失敗(此機沒設
+        #   git user.name/email、hook 擋下、index.lock…)時最新資料只在工作樹,
+        #   而背景 push 仍會把【舊的 HEAD】推成功並回報 ok —— 畫面顯示
+        #   「已同步」,他機卻永遠收不到這次修改。空字串＝乾淨。
+        self._uncommitted = ""
+        #: `_commit_body` 這一次用的 pathspec(給 commit 後量測用;
+        #: 只在持有 `_git_lock` 時讀寫)。None ＝ 無法判定。
+        self._last_pathspec: "list | None" = None
         self._push_lock = threading.Lock()        # 只管 _push_timer 欄位
         self._git_lock = threading.RLock()        # 所有 git working-tree/refs 操作
         # ★工作樹【內容】的鎖★(外審排班第 1 輪 P1-01):存檔的
@@ -244,6 +253,11 @@ class GitSyncStorage(RosterStorage):
         """
         if state == "ok" and not getattr(self, "_gitignore_ok", True):
             state, detail = "error", detail or ".gitignore 未就緒，本機變更不會同步"
+        # ★同一個道理(外審 2026-08-22 P2):本機還有沒 commit 的正典變更時,
+        #   一次成功的 push/pull 不可以把狀態說成 ok —— 那次 push 推的是舊的
+        #   HEAD,最新資料還躺在工作樹裡。守衛放在這個唯一的狀態出口。
+        if state == "ok" and getattr(self, "_uncommitted", ""):
+            state, detail = "error", self._uncommitted_detail()
         self.sync_state = state
         if state == "ok":
             logging.info("[roster.gitsync] 同步狀態：ok")
@@ -256,6 +270,22 @@ class GitSyncStorage(RosterStorage):
             except Exception:
                 logging.debug("[roster.gitsync] on_sync_state callback 失敗",
                               exc_info=True)
+
+    def _uncommitted_detail(self) -> str:
+        """「本機變更還沒進 commit」要說的話 —— ★只有這一份★(狀態守衛與
+        存檔後的即時回報共用;兩邊各寫一次的話遲早只有一邊被修好)。"""
+        return (f"本機變更尚未 commit，因此未同步：{self._uncommitted}"
+                f"（常見原因：此機未設定 git user.name / user.email）")
+
+    def _publish_uncommitted(self) -> None:
+        """量到髒的就★立刻★告訴 UI(外審 RS-19 R1-3)。
+
+        原本只把 `_uncommitted` 記在身上,等下一次 pull/push/存檔經過
+        `_set_state` 才會反映出來 —— 週期 pull 關掉時就是「永遠」。
+        這段期間畫面顯示的是上一次成功同步留下的 ok,而資料躺在工作樹裡。
+        """
+        if self._uncommitted:
+            self._set_state("error", self._uncommitted_detail())
 
     def _current_branch(self) -> "str | None":
         try:
@@ -360,14 +390,21 @@ class GitSyncStorage(RosterStorage):
                     # 已經離開 `_tree_lock` → 這裡拿 `_git_lock` 不會反序。
                     if self._git_lock.acquire(timeout=3.0):
                         try:
-                            if self._commit("、".join(sorted(set(names))[:5])):
-                                self._schedule_push()
+                            self._commit("、".join(sorted(set(names))[:5]))
+                            self._schedule_push()      # 見 `_save` 的同一段
                         finally:
                             self._git_lock.release()
+                        self._publish_uncommitted()
                     else:
                         logging.warning(
                             "[roster.gitsync] git 忙碌中，臨界區的變更延後 "
                             "commit（檔案已寫盤，下次存檔補收）")
+                        self._uncommitted = (
+                            "、".join(sorted(set(names))[:5]) + "（尚未 commit）")
+                        # ★這條路也要立刻發出去★(外審 RS-19 R2-2):accept /
+                        #   finalize 這些權威寫入正是走臨界區,而它們留下的
+                        #   未 commit 變更最不該被顯示成「已同步」。
+                        self._publish_uncommitted()
                         self._schedule_push()
 
     def _save(self, path: str, data: dict, **kw) -> None:
@@ -384,6 +421,9 @@ class GitSyncStorage(RosterStorage):
             # 在 `write_barrier` 的臨界區內:此刻拿 `_git_lock` 會與 pull 反序
             # → 死鎖。記下來,等臨界區結束再 commit。
             pending.append(os.path.basename(path))
+            # ★這一刻起,工作樹領先 HEAD★:臨界區結束前若有人把狀態設成 ok
+            #   (例如週期 pull),畫面就會在資料還沒 commit 時說「已同步」。
+            self._uncommitted = f"{os.path.basename(path)}（尚未 commit）"
             return
         # 拿不到 git 鎖＝背景正在 push/pull：檔案已寫盤，這次先略過 commit，
         # 下次存檔的白名單 add 會補收；仍排一次 push 以免變更留在本機。
@@ -391,19 +431,62 @@ class GitSyncStorage(RosterStorage):
             logging.warning(
                 "[roster.gitsync] git 忙碌中，本次存檔延後 commit（檔案已寫盤，"
                 "下次存檔補收）：%s", os.path.basename(path))
+            self._uncommitted = f"{os.path.basename(path)}（尚未 commit）"
+            self._publish_uncommitted()
             self._schedule_push()
             return
         try:
-            if self._commit(os.path.basename(path)):
-                self._schedule_push()
+            self._commit(os.path.basename(path))
+            # ★補收的機會不可以只在成功時給★:`_push_locked_body` 會先做一次
+            #   「背景補收」commit,失敗常常是暫時的(index.lock、鎖檔)。
+            self._schedule_push()
         finally:
             self._git_lock.release()
+        self._publish_uncommitted()
 
     def _commit(self, label: str) -> bool:
-        """本地 commit（呼叫端須持 _git_lock）。
+        """本地 commit（呼叫端須持 _git_lock）+ ★commit 之後回頭量工作樹★。
 
-        回傳是否可繼續推送（成功 or 乾淨無變更＝True；真失敗＝False）。
+        (外審 2026-08-22 P2)回傳值只說「這次 commit 有沒有成功」,而 UI 的
+        「已同步」要的是另一件事:★工作樹裡的正典資料是不是都已經進了
+        commit★。兩者在 commit 失敗時會分岔 —— 而分岔的那一刻,後面的
+        push 仍可能把舊 HEAD 推成功並把狀態設成 ok。所以這裡量一次(不推理),
+        結果交給 `_set_state` 的守衛。
         """
+        ok = self._commit_body(label)
+        self._uncommitted = self._canonical_dirt(self._last_pathspec)
+        if self._uncommitted:
+            logging.warning("[roster.gitsync] ★本機變更尚未 commit★：%s",
+                            self._uncommitted)
+        return ok
+
+    def _canonical_dirt(self, paths: "list | None") -> str:
+        """工作樹裡還有沒有【尚未 commit 的正典資料】→ 說明字串(空＝乾淨)。
+
+        ★量,不要推理★:靠「commit 回傳 True」推斷已經同步,會漏掉 pathspec
+        算不出來、add 失敗、或這次根本沒進到 commit 的那些路徑。
+        ★量不到一律當成髒的★:「查不出來」不可以顯示成「已同步」。
+        """
+        if paths is None:
+            return "無法確認要同步哪些檔案"
+        if not paths:
+            return ""                        # 沒有任何正典資料 → 無事可推
+        try:
+            r = self._git("status", "--porcelain", "--", *paths)
+        except (OSError, subprocess.SubprocessError) as e:
+            return f"無法確認本機是否已 commit（{e}）"
+        if r.returncode != 0:
+            return "無法確認本機是否已 commit（git status 失敗）"
+        names = [ln[3:].strip() for ln in (r.stdout or "").splitlines()
+                 if ln.strip()]
+        if not names:
+            return ""
+        return "、".join(names[:5]) + ("…" if len(names) > 5 else "")
+
+    def _commit_body(self, label: str) -> bool:
+        """`_commit` 的本體。回傳是否可繼續推送（成功 or 乾淨無變更＝True；
+        真失敗＝False）。★pathspec 一併留給外殼量測用★"""
+        self._last_pathspec = None
         if not self._gitignore_ready():
             # fail-closed：沒有忽略規則就不 commit（見 _ensure_gitignore）。
             logging.warning("[roster.gitsync] .gitignore 未就緒 → 本次不 commit")
@@ -437,6 +520,7 @@ class GitSyncStorage(RosterStorage):
                 ln = ln.strip()
                 if ln and ln not in paths and self._is_canonical_path(ln):
                     paths.append(ln)
+            self._last_pathspec = list(paths)
             if not paths:
                 return True                      # 沒有任何正典資料 → 無事可推
             a = self._git("add", "-A", "--", *paths)

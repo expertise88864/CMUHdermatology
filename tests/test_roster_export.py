@@ -47,7 +47,12 @@ def test_build_finalize_pdf_sections(tmp_path):
     titles = [t for t, _ in secs]
     bodies = [b for _, b in secs]
     assert any("定案留底" in t for t in titles)          # 封面
-    assert "RR報告" in bodies and "VV報告" in bodies and "DD日報告" in bodies
+    # ★報告段前面可能多一句說明★(RS-19 P1-03):月檔是手工塞的、沒有識別 →
+    #   會被標成「無法確認是否仍與最終班表相符」,原文照樣在裡面。
+    assert all(any(x in b for b in bodies)
+               for x in ("RR報告", "VV報告", "DD日報告"))
+    assert any("最終班表" in t for t in titles), (
+        "★留底文件要有一段【由正典狀態重建】的最終班表★")
 
 
 def test_archive_finalize_pdf_writes_pdf(tmp_path):

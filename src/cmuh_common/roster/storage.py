@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import glob
 import hashlib
 import json
@@ -137,6 +138,28 @@ def _load_json(path: str) -> dict:
     return _parse_json_bytes(_read_bytes(path), path)
 
 
+def prev_ym(ym: str) -> str:
+    """上一個月的 YYYY-MM(跨年)。★這個推導只有一份★ —— 求解、切片跨月週五、
+    公平計數回放、跨月銜接各自寫一次的話,遲早有一處在 1 月時算成同一年。"""
+    y, m = int(ym[:4]), int(ym[5:7])
+    py, pm = (y - 1, 12) if m == 1 else (y, m - 1)
+    return f"{py:04d}-{pm:02d}"
+
+
+def last_weekend_of(prev_month: dict, scope: str) -> Optional[tuple]:
+    """月檔的「最後週末」摘要 -> (saturday_date, member_id) 或 None。
+
+    ★解讀規則只有一份★:寬鬆讀取(`RosterStorage.prev_month_last_weekend`)與
+    嚴格快照(`StrictSources`)都走這裡 —— 兩邊各寫一次的話,對缺欄位/壞日期的
+    判定會漂移,而那正是「求解與套用看到不同輸入」的縫。
+    """
+    info = ((prev_month.get("last_weekend") or {}).get(scope)) or {}
+    try:
+        return (date.fromisoformat(info["saturday"]), str(info["person"]))
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
 class RosterStorage:
     def __init__(self, base_dir: str):
         self.base_dir = base_dir
@@ -256,6 +279,16 @@ class RosterStorage:
                 f"{os.path.basename(path)} 頂層不是 JSON 物件"
                 f"（{type(data).__name__}）")
         return data, rev
+
+    def strict_sources(self, names=(), months=()) -> "StrictSources":
+        """權威計算的輸入,★一次嚴格讀完★ -> `StrictSources`(見該類說明)。
+
+        ★呼叫端必須持有 `write_barrier`★:這裡讀的是好幾個檔,臨界區外的話
+        它們彼此就不是同一個時間點的內容(而「整批一致」正是這個包裝的用意)。
+        任何一個壞掉/暫時讀不到就在這裡拋 —— 權威計算寧可整批不做,也不要拿
+        一份被靜默正規化成合法空值的輸入去算(見 `StrictSources`)。
+        """
+        return StrictSources(self, names, months)
 
     def quiesce_local(self) -> None:
         """關閉前收斂本機狀態。基底層沒有背景同步 → 無事可做(見 GitSync)。"""
@@ -752,6 +785,22 @@ class RosterStorage:
         """
         return os.path.exists(self._month_path(ym))
 
+    def month_revision(self, ym: str) -> str:
+        """月檔【現在】盤上的版本識別 —— 給「來源到底有沒有被改到」的量測用。
+
+        (外審 2026-08-22 P2)意圖要在來源寫入【之前】記下(否則中途斷電就沒有
+        線索),於是來源自己失敗時會留下一筆其實不存在的債。要分辨這兩件事
+        只能★量★:進場時記下這一份的識別,失敗時再量一次 —— 內容沒變就代表
+        什麼都沒落地。讀不到時回 `_UNREADABLE_REV`(見 `revision_is_readable`),
+        ★「量不到」不可以被當成「沒事發生」★。
+        """
+        return _file_revision(self._month_path(ym))
+
+    @staticmethod
+    def revision_is_readable(rev: str) -> bool:
+        """這個版本識別是不是真的量到了(而不是「此刻讀不到」)。"""
+        return rev != _UNREADABLE_REV
+
     def load_month(self, ym: str) -> dict:
         return self.load_month_with_revision(ym)[0]
 
@@ -876,11 +925,116 @@ class RosterStorage:
         由 save 端在成功排班後寫入 data["last_weekend"][scope] =
         {"saturday": iso, "person": id}；此處只讀。缺 → None（precheck 會警告）。
         """
-        y, m = int(ym[:4]), int(ym[5:7])
-        py, pm = (y - 1, 12) if m == 1 else (y, m - 1)
-        prev = _load_json(self._month_path(f"{py:04d}-{pm:02d}"))
-        info = ((prev.get("last_weekend") or {}).get(scope)) or {}
-        try:
-            return (date.fromisoformat(info["saturday"]), str(info["person"]))
-        except (KeyError, ValueError, TypeError):
-            return None
+        prev = _load_json(self._month_path(prev_ym(ym)))
+        return last_weekend_of(prev, scope)
+
+
+class StrictSources:
+    """權威計算(求解/套用/結算/定案/匯出)的輸入 —— ★一次讀完,而且嚴格解析★。
+
+    (外審 2026-08-22 P1-01/P1-02)寬鬆載入器對【暫時讀不到/損壞】的 JSON 回
+    預設空值。那對「顯示」是好的 UX(讀不到就顯示空,不該讓 UI 開不起來),
+    對【會寫回去的計算】卻是 fail-open,而且錯得很安靜:
+      * `holiday_duty.json` 讀不到 -> 假日表變空 -> 整年國定假日與年度指定
+        消失 -> solver 當普通平日排,預覽看起來完全正常。
+      * `config.json` 讀不到 -> members=[] -> `resettle`/`finalize` 算出一份
+        空的點數表,而 `settle_month` 會先回滾本月舊分錄再記上它 ——
+        ★正式帳本就這樣被改寫★,畫面還回報成功。
+      * `clinic_template.json` / `clerk_batches.json` 讀不到 -> 診間或 Clerk
+        整批消失 -> 日排班仍然算得完,匯出的正式班表少人少班。
+
+    ★指紋擋不住這一種★:套用時重建 context 若讀到【同一個】壞狀態,兩次
+    指紋都是「同樣錯的空語意」,比對相等就放行 —— 全輸入指紋(RS-7)抓得到
+    stale input,抓不到被靜默正規化成合法空值的 invalid input。
+
+    介面刻意與 `RosterStorage` 的載入器同名:builder 只要
+    `st = src or self.storage` 就換得過去,不必在每個讀取點分岔 ——
+    ★分岔一定會漏,而漏掉的那一個讀取就是整個包裝的破口★。
+    ★沒有宣告的來源一律拋★:宣告不足會當場失敗,不會靜默退回寬鬆讀取
+    (所以「這條路徑到底吃哪些檔」是被測試釘住的,不是註解裡的宣稱)。
+    ★每次存取回深拷貝★:呼叫端會就地改月檔/帳本(`settle_biopsy` 就是這樣),
+    共用同一個物件的話,「這一次讀到的輸入」會被上一次的計算改掉。
+    """
+
+    def __init__(self, storage: "RosterStorage", names=(), months=()):
+        self._shapes: dict = {}
+        self._revs: dict = {}
+        for n in sorted(set(names)):
+            self._shapes[n], self._revs[n] = storage.canonical_snapshot(n)
+        self._months: dict = {}
+        for ym in sorted(set(months)):
+            data, rev = storage.load_month_snapshot(ym)
+            # ★「月檔存不存在」要在同一次臨界區裡定案★:`load_month_snapshot`
+            #   對不存在的月份回一份預設月檔(刻意如此),所以存在與否要另外記,
+            #   否則跨月連動會憑空生出一份月檔(見 `RosterStorage.month_exists`)。
+            self._months[ym] = (data, rev, storage.month_exists(ym))
+
+    # ── 正典檔 ───────────────────────────────────────────────────────────
+    def _shape(self, name: str):
+        if name not in self._shapes:
+            raise KeyError(
+                f"{name} 不在這條路徑宣告的權威輸入裡。權威計算不得臨時讀檔"
+                f"（那會退回寬鬆載入，壞檔就變成合法的空值）——"
+                f"請把它加進這條路徑的來源宣告。")
+        return copy.deepcopy(self._shapes[name])
+
+    def revision(self, name: str) -> str:
+        """這一份內容的版本識別(要 CAS 寫回去的呼叫端用)。"""
+        self._shape(name)                    # 未宣告 -> 同一句錯誤訊息
+        return self._revs[name]
+
+    def snapshot(self, name: str):
+        """-> (形狀, revision)。★版本與內容同源★:兩者都出自建構時的那一次讀取,
+        呼叫端不必(也不可以)再讀一次去取 revision。"""
+        return self._shape(name), self._revs[name]
+
+    def load_config(self) -> dict:
+        return self._shape("config.json")
+
+    def load_ledger(self) -> dict:
+        return self._shape("ledger.json")
+
+    def load_biopsy(self) -> dict:
+        return self._shape("biopsy.json")
+
+    def load_week_colors_raw(self) -> dict:
+        return self._shape("week_colors.json")
+
+    def load_week_colors(self) -> dict:
+        return dict(self._shape("week_colors.json").get("weeks") or {})
+
+    def load_holiday_duty(self) -> dict:
+        return self._shape("holiday_duty.json")
+
+    def holidays_set(self) -> set:
+        t = self.load_holiday_duty()
+        return set(t["r"]) | set(t["vs"])
+
+    def load_clinic_template(self) -> dict:
+        return self._shape("clinic_template.json")
+
+    def load_clerk_batches(self) -> list:
+        return self._shape("clerk_batches.json")
+
+    def load_biopsy_grid(self) -> dict:
+        return self._shape("biopsy_grid.json")
+
+    # ── 月檔 ─────────────────────────────────────────────────────────────
+    def month_snapshot(self, ym: str):
+        """-> (月檔, revision),與 `RosterStorage.load_month_snapshot` 同義。"""
+        if ym not in self._months:
+            raise KeyError(
+                f"{ym} 的月檔不在這條路徑宣告的權威輸入裡（同上，"
+                f"請把它加進來源宣告）。")
+        data, rev, _exists = self._months[ym]
+        return copy.deepcopy(data), rev
+
+    def load_month(self, ym: str) -> dict:
+        return self.month_snapshot(ym)[0]
+
+    def month_exists(self, ym: str) -> bool:
+        self.month_snapshot(ym)              # 未宣告 -> 同一句錯誤訊息
+        return self._months[ym][2]
+
+    def prev_month_last_weekend(self, ym: str, scope: str) -> Optional[tuple]:
+        return last_weekend_of(self.load_month(prev_ym(ym)), scope)

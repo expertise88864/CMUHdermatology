@@ -151,7 +151,7 @@ def test_report_preview_matches_what_gets_persisted(tmp_path):
                encoding='utf-8').read()
     i = src.index("def _biopsy_compute(")
     j = src.index("def recompute_saturday_biopsy(", i)
-    assert "_prev_month_friday_duty(y, m)" in src[i:j],         "跨月週五要收在唯一入口 _biopsy_compute"
+    assert "_prev_month_friday_duty(" in src[i:j],         "跨月週五要收在唯一入口 _biopsy_compute"
     i2 = src.index("def recompute_saturday_biopsy(")
     j2 = src.index("def render_report(", i2)
     assert "_prev_month_friday_duty" not in src[i2:j2],         "不可再由呼叫端各自補一次(那正是預覽會不一致的原因)"

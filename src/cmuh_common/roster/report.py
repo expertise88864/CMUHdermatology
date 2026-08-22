@@ -6,7 +6,7 @@ automation_ui.log。使用者要求「清楚了解排班的邏輯、哪些人沒
 """
 from __future__ import annotations
 
-from cmuh_common.roster.model import SolveContext, day_point
+from cmuh_common.roster.model import SolveContext, day_point, is_weekend
 from cmuh_common.roster.ledger import fair_share
 
 _WD = "一二三四五六日"
@@ -107,4 +107,48 @@ def build_report(ctx: SolveContext, result, scope_label: str) -> str:
             lines.append(f"  ✗ 本次狀態: {result.status}")
     else:
         lines.append("  （無）")
+    return "\n".join(lines)
+
+
+def build_final_state_report(*, year: int, month: int, scope_label: str,
+                             members, duty: dict, holidays: set, params,
+                             ledger: dict) -> str:
+    """★定案留底要的是「最終狀態」,不是「當初怎麼求解的」★(外審 2026-08-22
+    P1-03)。
+
+    `build_report` 描述的是【那一次自動求解】:哪天誰值班、各人幾點、新帳本
+    多少。Auto Accept 之後只要有人手動換一天班,那份報告就與事實不符 ——
+    而定案 PDF 直接印它,於是留底文件裡的班表/點數與月檔、帳本互相矛盾,
+    ★而且它看起來完全正常★。這個函式改從【正典狀態】重建:月檔的 duty、
+    設定的點數規則、帳本現在的餘額。
+
+    duty: {date: member_id}(只含本月、真的有人的格);ledger: {mid: 餘額}。
+    ★名單外的人也要列出來★:換班換給已離開名單的人時,靜靜略過會讓留底
+    文件少一天班 —— 那正是這一條 finding 要消滅的東西。
+    """
+    names = {m.id: (m.name or m.id) for m in members}
+    lines = [f"═══ {year}/{month:02d} {scope_label}最終班表（定案留底）═══",
+             "（依定案當下的月檔排班與帳本重建；含自動排班後的人工調整）"]
+    lines.append("[最終班表]")
+    if not duty:
+        lines.append("  （本月沒有任何值班紀錄）")
+    for d in sorted(duty):
+        mid = duty[d]
+        pts = day_point(d, holidays, params)
+        mark = "" if mid in names else "  ← 已不在目前名單"
+        lines.append(f"  {_fmt_day(d):>12} {names.get(mid, mid):<8}"
+                     f" {pts}點{mark}")
+    lines.append("[結算]")
+    lines.append("  成員      平日  假日  總班  點數    帳本餘額")
+    listed = [m.id for m in members]
+    extra = [mid for mid in sorted(set(duty.values())) if mid not in listed]
+    for mid in listed + extra:
+        days_m = [d for d, x in duty.items() if x == mid]
+        we = sum(1 for d in days_m if is_weekend(d) or d in holidays)
+        pts = sum(day_point(d, holidays, params) for d in days_m)
+        tail = "  ← 已不在目前名單" if mid in extra else ""
+        lines.append(
+            f"  {names.get(mid, mid):<8}"
+            f"{len(days_m) - we:>4}{we:>6}{len(days_m):>6}{pts:>6}"
+            f"{float(ledger.get(mid, 0.0)):>+11.2f}{tail}")
     return "\n".join(lines)

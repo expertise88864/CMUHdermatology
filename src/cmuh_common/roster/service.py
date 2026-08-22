@@ -43,7 +43,9 @@ from cmuh_common.roster.solve_day import (
     BIOPSY, PHOTO, REST, TREATMENT, DaySolveInput, month_solve_day,
     person_course_stats,
 )
-from cmuh_common.roster.report import build_report
+from cmuh_common.roster.report import (
+    build_final_state_report, build_report,
+)
 from cmuh_common.roster.rules import (
     Precheck, collect_directives, run_prechecks, split_block_runs)
 from cmuh_common.roster.saturday_biopsy import (
@@ -56,7 +58,26 @@ from cmuh_common.roster.storage import (
     FinalizedMonthError,
     RosterStorage,
     StaleRosterDataError,
+    StrictSources,
+    prev_ym,
 )
+
+#: ★權威路徑的輸入宣告★(外審 2026-08-22 P1-01/P1-02;見 storage.StrictSources)
+#:   會【寫回去】的計算(求解/套用/結算/定案/切片重排/匯出)一律先把這些檔
+#:   在同一個臨界區內嚴格讀完 —— 寬鬆載入把「暫時讀不到」變成合法的空值,
+#:   而空值算得出一份看起來正常的班表/帳本/正式文件。
+#:   ★宣告不足不會靜默退回寬鬆讀取,而是當場拋★(未宣告的來源存取即錯誤),
+#:   所以這幾行是被測試釘住的事實,不是註解裡的宣稱。
+SRC_RVS = ("config.json", "holiday_duty.json", "week_colors.json",
+           "ledger.json")
+SRC_BIOPSY = ("config.json", "biopsy.json")
+SRC_DAY = ("config.json", "holiday_duty.json", "clinic_template.json",
+           "clerk_batches.json", "biopsy_grid.json")
+SRC_CLOSURE = ("clinic_template.json", "holiday_duty.json")
+#: 結算/定案:重算帳本(RVS)之外還會重排週六切片(BIOPSY)。
+SRC_SETTLE = tuple(sorted(set(SRC_RVS) | set(SRC_BIOPSY)))
+#: 匯出:R/VS 與日排班必須來自【同一份】快照(否則正式文件是拼裝品)。
+SRC_EXPORT = tuple(sorted(set(SRC_RVS) | set(SRC_DAY)))
 
 _SCOPE_LABEL = {"r": "R 排班", "vs": "VS 排班"}
 _SPECIAL_SLOTS = frozenset((PHOTO, TREATMENT, BIOPSY, REST))   # 非跟診房的特殊格
@@ -75,6 +96,125 @@ def _duty_digest(month: dict, scope: str) -> str:
                         for k, v in duty.items()},
                        ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def _day_digest(month: dict) -> str:
+    """日排班內容(day_slots)的識別 —— `day_report` 描述的就是它。"""
+    canon = json.dumps(month.get("day_slots") or {},
+                       ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+#: 決策報告與現況的關係(見 `report_state`)。
+REPORT_FRESH = "fresh"
+REPORT_STALE = "stale"
+REPORT_UNVERIFIABLE = "unverifiable"
+
+#: ★決策報告永遠要講的一句話★(外審 RS-19 R1-1):它描述的是【那一次自動
+#: 求解】,而其中的點數/目標/帳本數字反映的是求解當時的設定。改點數規則、
+#: 改國定假日、改名單、或別的月份結算過之後,這些數字就不再成立 —— 而值班格
+#: 的識別看不見那些改動(見 `report_content_digest`)。無條件講,才不會有
+#: 「查得到的那幾種原因講了、查不到的那幾種被當成沒事」的縫。
+REPORT_HISTORICAL_NOTE = (
+    "※ 本段是【當初自動求解】的紀錄:其中的點數、目標與帳本數字反映求解"
+    "當時的設定(點數規則／國定假日／成員名單／帳本結轉)。"
+    "最終班表與結算請以上方「最終班表」段為準。")
+
+#: 另外【查得出來】的兩種原因。★處置不同,不可以壓成同一句★:
+#:  stale 是「已知班表被改過」,unverifiable 是「舊版程式沒留識別,查不出來」。
+REPORT_NOTE = {
+    REPORT_STALE: (
+        "⚠ 這是【初次自動求解】當時的紀錄。之後這個月的值班有過人工調整，"
+        "本段不代表最終班表；最終班表與結算請看上方「最終班表」段。"),
+    REPORT_UNVERIFIABLE: (
+        "⚠ 這份報告由舊版程式產生，沒有留下可比對的識別，"
+        "無法確認它是否仍與最終班表相符；最終班表與結算請看上方「最終班表」段。"),
+}
+
+
+def _month_duty(month: dict, scope: str, y: int, m: int) -> dict:
+    """月檔的該 scope 值班 -> {date: member_id}(只取本月、真的有人的格)。
+
+    ★非當月鍵一律不算★:跨機人工合併/外部編輯會在月檔留下鄰月日期,算進去
+    就虛增那個人的班數與點數(`_resettle_locked` / `build_export` 都有這道
+    過濾,留底文件不能是唯一的例外)。
+    """
+    out: dict = {}
+    for iso, cell in (month.get(f"{scope}_duty") or {}).items():
+        p = (cell or {}).get("person")
+        if not p:
+            continue
+        try:
+            dt = date.fromisoformat(iso)
+        except (ValueError, TypeError):
+            continue
+        if (dt.year, dt.month) == (y, m):
+            out[dt] = str(p)
+    return out
+
+
+def report_content_digest(month: dict, scope: str) -> str:
+    """報告所描述的那份內容的識別(r/vs＝值班格;day＝日排班格)。
+
+    ★它只證明【班表】沒被改過★(外審 RS-19 R1-1):`build_report` 的結算數字
+    還依賴點數規則、國定假日、成員名單與帳本結轉 —— 只改設定、不動班表時
+    這個識別仍然相符。那些輸入沒有被涵蓋,是因為要比對它們就得重建一次
+    `for_solve` 的 context,而那條路對【分錄已被修剪的舊月份】會 fail-closed
+    (RS-9 的教訓:單純想看一個舊月份的人會連視窗都打不開)。
+    所以改成另一個方向:報告的結算★一律★標明是求解當時的數字
+    (見 `REPORT_HISTORICAL_NOTE`),不去宣稱它現在還成立。
+    """
+    return _day_digest(month) if scope == "day" else _duty_digest(month, scope)
+
+
+def report_key(scope: str) -> str:
+    return "day_report" if scope == "day" else f"report_{scope}"
+
+
+def report_digest_key(scope: str) -> str:
+    return f"report_digest_{scope}"
+
+
+def stamp_report_digest(month: dict, scope: str) -> None:
+    """存報告時一併蓋上它所描述的那份內容的識別(見 `report_state`)。"""
+    month[report_digest_key(scope)] = report_content_digest(month, scope)
+
+
+def report_notice(month: dict, scope: str) -> str:
+    """這份報告要附的說明(空＝沒有報告)。
+
+    ★歷史性那一句無條件講★;班表另外被改過/無從查證時再加上那一句
+    (見 `REPORT_HISTORICAL_NOTE` 與 `REPORT_NOTE`)。
+    """
+    state = report_state(month, scope)
+    if not state:
+        return ""
+    extra = REPORT_NOTE.get(state, "")
+    return REPORT_HISTORICAL_NOTE + (chr(10) + extra if extra else "")
+
+
+def report_state(month: dict, scope: str) -> str:
+    """這份已存的決策報告,還配不配得上月檔現在的班表?
+
+    (外審 2026-08-22 P1-03)`build_report` 印的是【那一次自動求解】的具體
+    班表與結算 —— 日期、誰值班、幾點、各人平日/假日班數、新帳本餘額。
+    Auto Accept 之後只要有人手動換一天班,`set_cell` 會正確更新 duty、audit
+    與切片,★卻不會動到那份報告★;定案時 `finalize` 用最新 duty 重算帳本,
+    也不會重新產生報告。於是定案 PDF 裡的班表=舊版、帳本=新版,互相矛盾。
+
+    ★判準用「內容的識別」而不是逐一在每個編輯路徑清報告★:清報告要窮舉
+    所有會改到 duty 的路徑(現在有 set_cell/set_lock 之外還會再長出來),
+    漏一條就又回到同一個缺陷;識別是【衍生的】,任何路徑改了 duty,下一次
+    讀取自然就對不上。
+    """
+    if not (month.get(report_key(scope)) or ""):
+        return ""
+    dig = month.get(report_digest_key(scope))
+    if not dig:
+        # 舊版程式存的報告沒有識別 —— ★查不出來就不可以宣稱它是最終的★
+        return REPORT_UNVERIFIABLE
+    return (REPORT_FRESH if dig == report_content_digest(month, scope)
+            else REPORT_STALE)
 
 
 def merge_set_edit(current, baseline, edited) -> set:
@@ -223,7 +363,19 @@ class RosterService:
         self.storage = storage
 
     # ── 讀取組裝 ────────────────────────────────────────────────────────
-    def solver_ledger(self, scope: str, ym: str) -> dict:
+    def _sources(self, ym: str, names) -> StrictSources:
+        """這條權威路徑的輸入,一次嚴格讀完(本月 + 上月)。
+
+        ★呼叫端必須持有 `write_barrier`★:一次讀好幾個檔,臨界區外的話它們
+        彼此就不是同一個時間點的內容 —— 而「整批一致」正是這個包裝的用意。
+        ★上月一律納入★:跨月銜接(last_weekend)、連續值班尾端、跨月週五的
+        切片連動、Clerk 跨月公平計數回放都要讀它,而它讀不到的後果與本月
+        讀不到一樣是【安靜地少一段限制】。
+        """
+        return self.storage.strict_sources(names, (prev_ym(ym), ym))
+
+    def solver_ledger(self, scope: str, ym: str, *,
+                      src: "StrictSources | None" = None) -> dict:
         """求解要看的是【本月結算之前】的餘額。→ {member_id: 餘額}
 
         (外審排班 RS-9 / 新一輪 P1-02)`ledger.py` 的契約寫得很清楚:正值＝
@@ -238,8 +390,9 @@ class RosterService:
         #   寬鬆載入對壞檔回一份空帳本 —— 於是預覽會用「大家都是 0」算出一份
         #   看起來很正常的班表,使用者按下套用之後 `settle_month` 就把那份空的
         #   當成基準寫回去。嚴格快照讓壞檔在【求解之前】就明講,fail closed。
-        led_all = copy.deepcopy(
-            self.storage.canonical_snapshot("ledger.json")[0])
+        led_all = (src.load_ledger() if src is not None
+                   else copy.deepcopy(
+                       self.storage.canonical_snapshot("ledger.json")[0]))
         if not can_rollback(led_all, ym):
             # 該月分錄可能已被修剪 → 無從確認「本月之前」是多少。寧可擋下
             # 並說清楚(硬猜一個基準會讓之後每個月的公平目標都跟著錯)。
@@ -257,7 +410,8 @@ class RosterService:
 
     def build_context(self, scope: str, ym: str, *,
                       month: "dict | None" = None,
-                      for_solve: bool = False) -> SolveContext:
+                      for_solve: bool = False,
+                      src: "StrictSources | None" = None) -> SolveContext:
         """讀 config/ledger/holiday_duty/week_colors/month 檔 → 已 prepare 且已套
         跨月銜接（boundary_fix）的 SolveContext。
 
@@ -275,14 +429,18 @@ class RosterService:
         而設定頁直接讀帳本又顯示 +5/-5,兩邊自相矛盾;更糟的是,那個
         「分錄可能已被修剪」的 fail-closed 會讓【單純想看一個舊月份】的人
         連分頁都打不開。"""
-        cfg = self.storage.load_config()
-        month = self.storage.load_month(ym) if month is None else month
+        # ★`src` 給的是【權威輸入】(見 SRC_* 與 storage.StrictSources)★:
+        #   有它就整批走嚴格快照,沒有它維持既有的寬鬆載入(顯示路徑)。
+        #   換的是【來源物件】而不是逐個讀取點加 if —— 分岔一定會漏一個。
+        st = src if src is not None else self.storage
+        cfg = st.load_config()
+        month = st.load_month(ym) if month is None else month
         y, m = int(ym[:4]), int(ym[5:7])
 
         members = [Member.from_dict(d)
                    for d in (cfg.get(f"{scope}_members") or [])]
 
-        holiday_table = self.storage.load_holiday_duty()
+        holiday_table = st.load_holiday_duty()
         holidays = set(holiday_table["r"]) | set(holiday_table["vs"])
         annual = dict(holiday_table.get(scope) or {})
 
@@ -301,32 +459,33 @@ class RosterService:
         #   (FridayBiopsyLinkRule 要看它);VS 沒有切片,給空的。
         biopsy_override = (self._biopsy_overrides(month) if scope == "r"
                            else {})
-        ledger = (self.solver_ledger(scope, ym) if for_solve
-                  else dict(self.storage.load_ledger().get(scope) or {}))
+        ledger = (self.solver_ledger(scope, ym, src=src) if for_solve
+                  else dict(st.load_ledger().get(scope) or {}))
         # 週色：決定性自動套色（依 115 行事曆 4 週交替邏輯，涵蓋跨年邊界的
         # y-1/y/y+1）為基底 → 使用者於設定頁的手動覆蓋優先蓋上。
         week_colors: dict = {}
         for yr in (y - 1, y, y + 1):
             week_colors.update(week_colors_for_year(yr))
-        week_colors.update(self.storage.load_week_colors())
-        prev = self.storage.prev_month_last_weekend(ym, scope)
+        week_colors.update(st.load_week_colors())
+        prev = st.prev_month_last_weekend(ym, scope)
 
         # [2026-07-13 連續值班] 上月最後 4 天已排值班 → prev_tail(連續值班軟限制
         # 的跨月常數;5 日窗最多需要往前看 4 天)。上月檔不存在時 load_month 回預設
         # (duty 空)→ prev_tail 空,規則自動退化成只看本月。
         prev_tail: dict = {}
         first = date(y, m, 1)
-        prev_ym = f"{y - 1}-12" if m == 1 else f"{y}-{m - 1:02d}"
+        # ★讀檔要在 try 之外★:`src` 那條路徑的讀取失敗代表【上月檔壞了/讀不到】,
+        #   吞掉它就等於「連續值班限制安靜地只看本月」—— 正是這一批要消滅的
+        #   fail-open。下面的 try 只負責容忍【內容裡的壞日期】。
+        prev_duty = (st.load_month(prev_ym(ym)).get(f"{scope}_duty") or {})
         try:
-            prev_duty = (self.storage.load_month(prev_ym)
-                         .get(f"{scope}_duty") or {})
             for k in range(1, 5):
                 dd = first - timedelta(days=k)
                 cell = prev_duty.get(dd.isoformat()) or {}
                 if cell.get("person"):
                     prev_tail[dd] = str(cell["person"])
         except Exception:
-            logging.exception("[roster.service] 讀上月值班尾端失敗（略過，"
+            logging.exception("[roster.service] 上月值班尾端有壞資料（略過，"
                               "連續值班限制只看本月）")
 
         ctx = SolveContext(
@@ -358,13 +517,20 @@ class RosterService:
             return self._build_export_locked(ym)
 
     def _build_export_locked(self, ym: str) -> dict:
-        """`build_export` 的本體。★呼叫端必須持有 `write_barrier`★"""
-        cfg = self.storage.load_config()
-        month = self.storage.load_month(ym)
+        """`build_export` 的本體。★呼叫端必須持有 `write_barrier`★
+
+        ★正式文件寧可匯不出來,也不可以少一半還說成功★(外審 2026-08-22
+        P1-02):月檔/名單/假日/模板任一暫時讀不到時,寬鬆載入回空 —— xlsx/docx
+        writer 相信 service 給的 payload,於是使用者拿到一份【格式正常、
+        少班少姓名少日排班】的正式班表,而且看不出哪裡不對。
+        """
+        src = self._sources(ym, SRC_EXPORT)
+        cfg = src.load_config()
+        month = src.load_month(ym)
         y, m = int(ym[:4]), int(ym[5:7])
-        holiday_table = self.storage.load_holiday_duty()
+        holiday_table = src.load_holiday_duty()
         holidays = set(holiday_table["r"]) | set(holiday_table["vs"])
-        ledger = self.storage.load_ledger()
+        ledger = src.load_ledger()
 
         def scope_block(scope: str) -> dict:
             members = [Member.from_dict(d)
@@ -388,12 +554,10 @@ class RosterService:
                     "ledger": dict((ledger.get(scope)) or {})}
 
         # [RS-01] 供 PGY/Clerk 日排班匯出：帶上 day_slots（已排內容）與開診格網。
-        try:
-            day_grid = self.build_day_input(ym).grid
-        except Exception:
-            logging.warning("build_export 取日排班格網失敗（仍照常匯出 R/VS）",
-                            exc_info=True)
-            day_grid = {}
+        # ★這裡原本把失敗吞掉照樣匯出★(外審 2026-08-22 P1-02):門診模板讀不到
+        #   時 day_grid={} —— 匯出的月曆整片空白,而「真的沒有開診」與「剛好
+        #   讀失敗」在文件上長得一模一樣。正式文件不接受這種 partial success。
+        day_grid = self.build_day_input(ym, src=src).grid
         # [週六切片] 匯出月曆的週六格附註（人名用 r names 對照）
         sat_biopsy: dict = {}
         for iso, cell in (month.get("saturday_biopsy") or {}).items():
@@ -418,13 +582,22 @@ class RosterService:
         }
 
     # ── PGY/Clerk 日排班（Phase 3）──────────────────────────────────────
-    def build_day_input(self, ym: str) -> DaySolveInput:
-        """組裝 PGY/Clerk 日填充器輸入（開診格網 + 名單 + 切片開放 + 請假）。"""
-        cfg = self.storage.load_config()
-        month = self.storage.load_month(ym)
+    def build_day_input(self, ym: str, *,
+                        src: "StrictSources | None" = None) -> DaySolveInput:
+        """組裝 PGY/Clerk 日填充器輸入（開診格網 + 名單 + 切片開放 + 請假）。
+
+        `src`＝權威輸入(見 `SRC_DAY`)。★會寫回去的路徑一律要帶★:門診模板
+        讀不到 → 診間整批消失、Clerk 梯次讀不到 → 學生整批消失,而日填充器
+        照樣算得完一份「合法」的班表,匯出的正式文件就少人少班。
+        預覽(`run_day_solve`)刻意維持寬鬆 —— 它不寫任何檔,而套用時
+        `_accept_day_locked` 會用權威輸入擋下來。
+        """
+        st = src if src is not None else self.storage
+        cfg = st.load_config()
+        month = st.load_month(ym)
         y, m = int(ym[:4]), int(ym[5:7])
-        holidays = self.storage.holidays_set()
-        template = self.storage.load_clinic_template().get("template") or {}
+        holidays = st.holidays_set()
+        template = st.load_clinic_template().get("template") or {}
         grid = month_grid(ym, template, holidays,
                           month.get("grid_overrides") or {})
 
@@ -442,10 +615,10 @@ class RosterService:
 
         # [2026-07-25 審查] from_dict 對壞梯次回 None（不再拋例外）→ 濾掉
         batches = [b for b in (ClerkBatch.from_dict(x)
-                               for x in self.storage.load_clerk_batches())
+                               for x in st.load_clerk_batches())
                    if b is not None]
         covering = batches_covering(batches, y, m)     # 逐日在 solve 時再依 covers 分配
-        bio_all = self.storage.load_biopsy_grid()
+        bio_all = st.load_biopsy_grid()
         biopsy_open: dict = {}
         for b in covering:
             for iso, sess in (bio_all.get(b.id) or {}).items():
@@ -476,8 +649,7 @@ class RosterService:
         first = date(y, m, 1)
         cross = [b for b in covering if b.start_monday < first]
         if cross:
-            py, pm = (y - 1, 12) if m == 1 else (y, m - 1)
-            prev = self.storage.load_month(f"{py:04d}-{pm:02d}")
+            prev = st.load_month(prev_ym(ym))
             prev_slots = prev.get("day_slots") or {}
             for iso, sessions in prev_slots.items():
                 try:
@@ -550,7 +722,11 @@ class RosterService:
     def _accept_day_locked(self, ym: str, day_slots: dict,
                            report: "str | None", expect) -> None:
         """`accept_day_solution` 的本體。★呼叫端必須持有 `write_barrier`★"""
-        month, rev = self.storage.load_month_snapshot(ym)
+        # ★驗證用的輸入也要是權威的★(外審 2026-08-22 P1-01):門診模板/梯次/
+        #   名單任一讀不到時,寬鬆載入會回空 —— 求解那次若讀到同一個空狀態,
+        #   兩邊指紋相等就放行,而那份班表少了整批診間或整批 Clerk。
+        src = self._sources(ym, SRC_DAY)
+        month, rev = src.month_snapshot(ym)
         if month.get("finalized"):
             raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能套用")
         # ★求解之後、按下套用之前,輸入可能已經變了★(外審排班第 1 輪 P1-02)
@@ -565,12 +741,13 @@ class RosterService:
                 raise ValueError(
                     "排班結果已過期（月檔已被其他電腦更新），請重新排班")
             if expect.fingerprint != day_input_fingerprint(
-                    self.build_day_input(ym)):
+                    self.build_day_input(ym, src=src)):
                 raise ValueError(
                     "排班結果已過期（名單／請假／Clerk 梯次／停診／門診模板等"
                     "輸入已變動），請重新排班")
         month["day_slots"] = self._overlay_locked_sessions(month, day_slots)
         month["day_report"] = report or ""      # 供「報告」鈕顯示落地當下的報告
+        stamp_report_digest(month, "day")       # 見 accept_solution 的同一段
         self.storage.save_month(ym, month, expected_revision=rev)
 
     def set_day_slot(self, ym: str, d: date, session: str, slot: str,
@@ -797,7 +974,8 @@ class RosterService:
             return bool(self.kept_reason)
 
     @contextlib.contextmanager
-    def settle_intent(self, scope: str, ym: str, kind: str = "all"):
+    def settle_intent(self, scope: str, ym: str, kind: str = "all", *,
+                      witness_ym: "str | None"):
         """★兩個檔的寫入之間斷電/當掉,要留得下線索★(外審排班 RS-10 / P2-02)
 
         月檔與 `biopsy.json`(或帳本)是兩個檔。同一個 `write_barrier` 擋得住
@@ -817,8 +995,25 @@ class RosterService:
         (它還是下個月公平目標的基準)。
         """
         mine = self.storage.mark_pending_settle(scope, ym, kind)
+        # ★意圖要在來源寫入之前記下,所以來源自己失敗時會留下一筆不存在的債★
+        #   (外審 2026-08-22 P2)`witness_ym` 指的是【這個區塊會改到的那份
+        #   來源月檔】:進場先量它的識別,例外時再量一次 —— 內容沒變就代表
+        #   什麼都沒落地,那筆意圖是誤報,清掉它(否則它會擋住定案,而其實
+        #   沒有任何東西需要收斂)。★量不到一律當作有債★(見 `_source_unchanged`)。
+        #   `witness_ym=None` ＝【來源在進場之前就已經落地】(跨月週五那條),
+        #   此時進場即負債,失敗一律保留。
+        _w0 = (self.storage.month_revision(witness_ym)
+               if witness_ym else None)
         state = RosterService._DerivedIntent()
-        yield state
+        try:
+            yield state
+        except BaseException:
+            if mine and self._source_unchanged(witness_ym, _w0):
+                logging.info(
+                    "[roster.service] %s %s 的來源沒有任何變動（%s）→ "
+                    "撤掉這次記下的意圖", scope, ym, kind)
+                self.storage.clear_pending_settle(scope, ym, kind)
+            raise
         if mine and state.kept:
             logging.warning(
                 "[roster.service] ★%s %s 的%s尚未重建成功★(%s)—— 意圖保留,"
@@ -827,12 +1022,29 @@ class RosterService:
         if mine:
             self.storage.clear_pending_settle(scope, ym, kind)
 
+    def _source_unchanged(self, witness_ym: "str | None", rev0) -> bool:
+        """那一份來源月檔的內容,從進場到現在【證明得了】沒有變過嗎?
+
+        ★量,不要推理★:靠「例外的型別看起來像是寫入前拋的」去猜,遲早會
+        猜錯一個路徑,而猜錯的方向是【靜默丟掉一筆真的債】。
+        量不到(檔案暫時讀不到)或本來就沒有 witness 一律回 False ——
+        「查不出來」不可以被當成「沒事發生」;多留一筆意圖的代價只是下次
+        開程式重算一次已經正確的衍生物。
+        """
+        if not witness_ym or rev0 is None:
+            return False
+        if not RosterStorage.revision_is_readable(rev0):
+            return False
+        now = self.storage.month_revision(witness_ym)
+        return RosterStorage.revision_is_readable(now) and now == rev0
+
     @contextlib.contextmanager
-    def biopsy_obligation(self, ym: str, what: str = "週六切片重排"):
+    def biopsy_obligation(self, ym: str, what: str = "週六切片重排", *,
+                          witness_ym: "str | None"):
         """「先改來源、再重建切片衍生物」的★唯一★包裝(外審 2026-08-22 P2-01)。
 
         用法:
-            with self.biopsy_obligation(ym) as ob:
+            with self.biopsy_obligation(ym, witness_ym=ym) as ob:
                 mutate_source()                # 請假/值班/梯次…
                 try:
                     self.recompute_saturday_biopsy(ym)
@@ -843,8 +1055,13 @@ class RosterService:
         原本只 log 就算了 —— 請假已經落地、`saturday_biopsy`/`biopsy.json`
         還停在舊狀態,而且沒有任何人負責收斂(使用者只看到「請假成功」)。
         ★重建成功時什麼都不留★:意圖只在真的失敗時保留。
+        ★`witness_ym` 沒有預設值★(外審 2026-08-22 P2):它決定「來源自己
+        失敗時要不要撤掉這筆意圖」,而兩種答案各自對得起某些呼叫端 ——
+        給它預設值的話,寫錯的那一端會安靜地丟掉一筆真的債(跨月連動就是
+        這種:來源是【本月】的週五值班,義務卻記在下個月頭上)。
         """
-        with self.settle_intent("r", ym, kind="biopsy") as state:
+        with self.settle_intent("r", ym, kind="biopsy",
+                                witness_ym=witness_ym) as state:
             try:
                 yield state
             finally:
@@ -853,7 +1070,8 @@ class RosterService:
                         "[roster.service] ★%s 的%s未完成★(%s)—— 意圖保留",
                         ym, what, state.kept_reason)
 
-    def _biopsy_intent(self, scope: str, ym: str):
+    def _biopsy_intent(self, scope: str, ym: str, *,
+                       witness_ym: "str | None"):
         """R 才會寫切片帳本 → 只有 R 需要這一筆意圖(見 `settle_intent`)。
 
         ★種類是 biopsy★(外審次輪 P2-02):這條路只重建切片計數,帳本沒動 ——
@@ -863,7 +1081,8 @@ class RosterService:
             # ★仍然吐一個狀態物件★:呼叫端不必為了 VS 分岔寫 if,
             #   對它 .keep() 是無害的(沒有意圖可保留)。
             return contextlib.nullcontext(RosterService._DerivedIntent())
-        return self.settle_intent("r", ym, kind="biopsy")
+        return self.settle_intent("r", ym, kind="biopsy",
+                                  witness_ym=witness_ym)
 
     def _update_canonical(self, name: str, save, mutator, *,
                           retries: int = 4):
@@ -1499,6 +1718,7 @@ class RosterService:
                         kept.setdefault(iso, {})[session] = slots
             month["day_slots"] = kept
             month["day_report"] = ""   # 舊報告已與清除後不符 → 一併清掉，避免誤導
+            month.pop(report_digest_key("day"), None)   # 識別跟著報告一起走
         self.update_month(ym, _mut)
 
     # ── 本月門診停診（某診 VS 請假 → 該診間該期間不開）──────────────────
@@ -1547,8 +1767,27 @@ class RosterService:
         sessions = [s for s in (sessions or []) if s]
         # 以「模板原始開診」判斷該室哪些日/時段真的有開，只對那些寫 override，
         # 避免對本來就沒開這室的日子（週末/假日/非該診週幾/週三下午）塞垃圾。
-        template = self.storage.load_clinic_template().get("template") or {}
-        base = month_grid(ym, template, self.storage.holidays_set())
+        # ★展開與寫入必須在同一個臨界區★(外審 2026-08-22 P1-04):停診存的是
+        #   【展開後的每一天】,而「哪些天有開」是在這裡依當時的模板算的 ——
+        #   算完到寫入之間背景 pull 把他機新增的場次(例如同期間多了週四上午
+        #   101 診)合併進來的話,那些新場次不在 base 裡,不會被寫 closed_rooms,
+        #   而 UI 回報「整段停診成功」。之後自動排班讀的是【現在的】模板 ——
+        #   週四上午 101 是開的,學生就被排進去了。
+        # ★而且要用權威輸入★:模板/假日表暫時讀不到時,寬鬆載入回空 ->
+        #   base 全空 -> candidates==0 -> 使用者看到的是「模板上沒開診」,
+        #   一個與事實無關卻很有說服力的錯誤訊息。
+        with self.storage.write_barrier():
+            src = self._sources(ym, SRC_CLOSURE)
+            template = src.load_clinic_template().get("template") or {}
+            base = month_grid(ym, template, src.holidays_set())
+            return self._set_clinic_closed_locked(
+                ym, room, start, end, sessions, closed, base)
+
+    def _set_clinic_closed_locked(self, ym: str, room: str, start: date,
+                                  end: date, sessions, closed: bool,
+                                  base: dict) -> dict:
+        """`set_clinic_closed` 的本體(展開結果 `base` 由呼叫端在臨界區內算好)。
+        ★呼叫端必須持有 `write_barrier`★"""
 
         def _mut(month) -> dict:
             if month.get("finalized"):
@@ -1622,6 +1861,7 @@ class RosterService:
                 # [RS-03] 有清掉指派 → 舊 day_report 已與現況不符,一併清空
                 # 避免幽靈化。
                 month["day_report"] = ""
+                month.pop(report_digest_key("day"), None)
             # [RS-05] 停診/恢復是影響班表的動作,留 audit 痕跡。
             self._audit(month, "day",
                         f"closure:{room} {start.isoformat()}~{end.isoformat()} "
@@ -1658,8 +1898,14 @@ class RosterService:
         #   包在同一個 write_barrier 內讀,擋住讀到一半被換檔;CP-SAT 在
         #   barrier 外跑(可能數十秒,不可扣住所有寫入)。
         with self.storage.write_barrier():
-            month, month_rev = self.storage.load_month_snapshot(ym)
-            ctx = self.build_context(scope, ym, month=month, for_solve=True)
+            # ★整批權威輸入一次嚴格讀完★(外審 2026-08-22 P1-01):假日表/名單/
+            #   週色任一暫時讀不到時,寬鬆載入會把它變成合法的空值 —— solver
+            #   按平日排、預覽完全正常,而套用時重建 context 若讀到同一個壞
+            #   狀態,兩次指紋都是【同樣錯的空語意】,比對相等就放行。
+            src = self._sources(ym, SRC_RVS)
+            month, month_rev = src.month_snapshot(ym)
+            ctx = self.build_context(scope, ym, month=month, for_solve=True,
+                                     src=src)
         res = solve_duty(ctx, allow_disable_color=allow_disable_color)
         res.month_revision = month_rev
         return res
@@ -1682,36 +1928,45 @@ class RosterService:
                 continue
         return out
 
-    def _prev_month_friday_duty(self, year: int, month: int) -> dict:
+    def _prev_month_friday_duty(self, year: int, month: int, *,
+                                src: "StrictSources | None" = None) -> dict:
         """月初 1 號是週六時,回 {上月最後一天(週五): 值班人};其餘情況回空 dict。
 
-        只在真的需要時才去讀上月月檔(避免每次重排都多一次磁碟 IO);讀不到就回空 ——
-        沒有上月資料時「週五連動」單純不生效,不可因此讓整個切片重排失敗。
+        只在真的需要時才去讀上月月檔(避免每次重排都多一次磁碟 IO)。
+        ★寬鬆路徑讀不到就回空★ —— 沒有上月資料時「週五連動」單純不生效,
+        不可因此讓整個切片重排失敗;★權威路徑(`src`)不吞★:那條路要寫回
+        biopsy.json,少一個週五連動就是把切片排給錯的人並記進計數帳本。
         """
         first = date(year, month, 1)
         if first.weekday() != 5:            # 1 號不是週六 → 週五在本月,不必跨月
             return {}
         fri = first - timedelta(days=1)
-        prev_ym = f"{fri.year:04d}-{fri.month:02d}"
-        try:
-            prev = self.storage.load_month(prev_ym)
-        except Exception:
-            logging.debug("[roster.service] 讀上月月檔失敗(週五連動略過)", exc_info=True)
-            return {}
+        pym = f"{fri.year:04d}-{fri.month:02d}"
+        if src is not None:
+            prev = src.load_month(pym)
+        else:
+            try:
+                prev = self.storage.load_month(pym)
+            except Exception:
+                logging.debug("[roster.service] 讀上月月檔失敗(週五連動略過)",
+                              exc_info=True)
+                return {}
         cell = ((prev.get("r_duty") or {}).get(fri.isoformat()) or {})
         person = cell.get("person")
         return {fri: str(person)} if person else {}
 
     def _biopsy_compute(self, ym: str, duty_by_date: dict,
                         book: "dict | None" = None,
-                        month: "dict | None" = None) -> tuple:
+                        month: "dict | None" = None, *,
+                        src: "StrictSources | None" = None) -> tuple:
         """以指定值班表計算該月週六切片
         → (assign, notes, pair, counts_after, names)。
 
         counts 基底＝biopsy.json 回滾本月舊分錄後的累計（同月重排不重複累計；
         在副本上回滾，不動傳入的 book）。純計算，不寫任何檔。"""
         from cmuh_common.roster.saturday_biopsy import rollback_biopsy
-        cfg = self.storage.load_config()
+        st = src if src is not None else self.storage
+        cfg = st.load_config()
         members = [Member.from_dict(d) for d in (cfg.get("r_members") or [])]
         y, m = int(ym[:4]), int(ym[5:7])
         # ★[2026-08-02 補審] 跨月週五收攏在這裡,而不是各呼叫端自己補★
@@ -1719,14 +1974,14 @@ class RosterService:
         #   於是「月初 1 號是週六」的月份會出現【預覽的切片人選與定案後不同】。
         #   本函式是所有切片計算的唯一入口,補在這裡才不會有人漏掉。
         duty_by_date = dict(duty_by_date)
-        duty_by_date.update(self._prev_month_friday_duty(y, m))
+        duty_by_date.update(self._prev_month_friday_duty(y, m, src=src))
         # [2026-07-27] month 可由呼叫端傳入【記憶體中尚未存檔的月檔】——手動指定
         # 切片後若這裡自行重讀磁碟，會讀到舊的 override 而把指定吃掉。
         if month is None:
-            month = self.storage.load_month(ym)
+            month = st.load_month(ym)
         leaves = _parse_date_map((month.get("leaves") or {}).get("r") or {})
         if book is None:
-            book = self.storage.load_biopsy()
+            book = st.load_biopsy()
         base = {"counts": dict(book.get("counts") or {}),
                 "history": [dict(e) for e in (book.get("history") or [])]}
         rollback_biopsy(base, ym)
@@ -1744,7 +1999,8 @@ class RosterService:
         return assign, notes, pair, counts_after, names
 
     def recompute_saturday_biopsy(self, ym: str,
-                                  month: "dict | None" = None) -> tuple:
+                                  month: "dict | None" = None, *,
+                                  src: "StrictSources | None" = None) -> tuple:
         """依月檔現況（r_duty）重排週六切片並結算計數帳本。
 
         month 傳入 → 就地更新 month["saturday_biopsy"]、【不寫任何檔】，回
@@ -1759,11 +2015,19 @@ class RosterService:
         沒有任何人會發現(之後的切片平衡全部以錯的次數為基礎)。
         傳入 month 的那條路由呼叫端持有同一個臨界區(RLock,可重入)。"""
         with self.storage.write_barrier():
-            return self._recompute_saturday_biopsy_locked(ym, month)
+            return self._recompute_saturday_biopsy_locked(
+                ym, month, src=src if src is not None
+                else self._sources(ym, SRC_BIOPSY))
 
-    def _recompute_saturday_biopsy_locked(self, ym: str,
-                                          month: "dict | None") -> tuple:
+    def _recompute_saturday_biopsy_locked(
+            self, ym: str, month: "dict | None", *,
+            src: "StrictSources | None" = None) -> tuple:
+        """★切片重排是【會寫回去】的計算,一律走權威輸入★(外審 P1-01):
+        `config.json` 讀不到就沒有 R 成員 → 切片一個人都排不出來,而
+        `settle_biopsy` 照樣把「本月沒有人切片」寫進計數帳本。"""
         own = month is None
+        if src is None:                       # 呼叫端沒帶 → 自己宣告(仍在臨界區內)
+            src = self._sources(ym, SRC_BIOPSY)
         _own_rev = None
         if own:
             # ★編輯基底一律用嚴格快照★(外審排班 RS-6):寬鬆載入對壞檔回一份
@@ -1778,7 +2042,7 @@ class RosterService:
         #   `canonical_revision` 之後再 `load_biopsy()` 是兩次獨立讀取,中間
         #   被換入壞內容時兩邊都取自那份壞的,CAS 對得上就放行(RS-5 第 2 輪
         #   已在別處修過同一個形狀,這一條漏了)。
-        book, book_rev = self.storage.canonical_snapshot("biopsy.json")
+        book, book_rev = src.snapshot("biopsy.json")
         # ★[2026-08-02 補審 第1輪] 要拒絕就得在【改動 month 之前】拒絕★
         #   settle_biopsy 的守門原本要到函式尾端才拋,那時 month["saturday_biopsy"]
         #   與 report_r 都已經改過了;而呼叫端(set_cell / set_biopsy_person /
@@ -1805,7 +2069,7 @@ class RosterService:
         #   週五連動在「月初 1 號是週六」的月份完全失效。
         #   (我原本的測試直接把 7/31 塞進純函式的 duty,沒走服務層,因此沒抓到。)
         assign, notes, pair, after, names = self._biopsy_compute(
-            ym, duty_by_date, book, month=month)
+            ym, duty_by_date, book, month=month, src=src)
         month["saturday_biopsy"] = {
             d.isoformat(): dict(cell) for d, cell in assign.items()}
         # [codex P2] 已存決策報告的[週六切片]段同步刷新——否則手改週六格/請假後,
@@ -1825,7 +2089,8 @@ class RosterService:
             #   saturday_biopsy、biopsy.json 還是舊的 —— 而這條路的呼叫端
             #   (請假變動、重新結算、跨月連動)還會把例外整個吞掉,不留紀錄
             #   就等於那個不一致永遠留在磁碟上。
-            with self.settle_intent("r", ym, kind="biopsy"):
+            # 來源就是這一份月檔:save_month 沒成功 → 什麼都沒落地 → 沒有債。
+            with self.settle_intent("r", ym, kind="biopsy", witness_ym=ym):
                 self.storage.save_month(ym, month,
                                         expected_revision=_own_rev)
                 self.storage.save_biopsy(book, expected_revision=book_rev)
@@ -1883,14 +2148,20 @@ class RosterService:
         #   (下面的 `_result_stale_reason` 擋的是【輸入】變了;CAS 擋的是
         #   【月檔本身】被換過 —— 兩者不是同一件事:他機改的可能是日排班、
         #   停診、audit 這些不進 SolveContext 的欄位。)
-        month, _month_rev = self.storage.load_month_snapshot(ym)
+        # ★驗證用的輸入也必須是權威的★(外審 2026-08-22 P1-01):這裡重建
+        #   context 是為了證明「舊結果仍符合現況」——若它讀到的是被寬鬆載入
+        #   正規化成空值的壞檔,求解那次也讀到同一個空值時兩邊指紋相等,
+        #   守衛就替一份【依錯誤輸入算出來的班表】背書並寫進帳本。
+        src = self._sources(ym, SRC_SETTLE)
+        month, _month_rev = src.month_snapshot(ym)
         if month.get("finalized"):
             raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能套用排班")
 
         # result 必須仍符合「當前」輸入才落地：預覽後若 請假/指定/鎖定/名單/假日
         # 任一改動，舊 result 可能把請假者排上或違反新 directive，settle 出的帳本/
         # 報告就與實況脫節。以重建的 ctx 驗證，不符即拒絕、要求重排（寫入前）。
-        ctx = self.build_context(scope, ym, for_solve=True)   # 與求解同一種
+        ctx = self.build_context(scope, ym, for_solve=True,   # 與求解同一種
+                                 src=src)
         # ★判準是【整份輸入的指紋】,不是一張手工白名單★(外審排班第 2 輪
         #   P1-04):`_result_stale_reason` 逐項列舉的那六七件事會腐爛 ——
         #   `fixed_weekday`(固定星期)與 `week_colors`(色塊連週)都是 CP-SAT 的
@@ -1955,7 +2226,7 @@ class RosterService:
                 # 先寫入本次 report(recompute 會在其上刷新/附加[週六切片]段)
                 month["report_r"] = report
                 assign, notes, biopsy_book, _bio_rev = (
-                    self.recompute_saturday_biopsy(ym, month))
+                    self.recompute_saturday_biopsy(ym, month, src=src))
                 report = month["report_r"]
             except Exception as e:  # noqa: BLE001
                 biopsy_book = None
@@ -1963,6 +2234,10 @@ class RosterService:
                 logging.exception("[roster.service] 週六切片重排失敗"
                                   "（值班照常落地，切片留待收斂）")
         month[f"report_{scope}"] = report
+        # ★報告要能證明自己描述的是哪一份班表★(外審 2026-08-22 P1-03):
+        #   之後任何一次手動換班都會讓它對不上,定案 PDF 才不會把舊報告
+        #   當成最終班表印出去(見 `report_state`)。
+        stamp_report_digest(month, scope)
 
         # 兩個檔都先預檢,讓最常見的失敗(壞檔/鎖檔)發生在任何寫入之前。
         month_path = self.storage._month_path(ym)
@@ -1985,7 +2260,7 @@ class RosterService:
             #   `_guard_overwrite` 只替壞檔留 `.corrupt-` 備份然後放行 ——
             #   結果是「幾乎只剩本月」的新帳本蓋掉整份餘額與歷史,而且畫面
             #   回報成功。無 revision 的寫入同樣會吃掉他機剛結算的別月分錄。
-            ledger, _led_rev = self.storage.canonical_snapshot("ledger.json")
+            ledger, _led_rev = src.snapshot("ledger.json")
             settle_month(ledger, scope, ym, result.points_by_person)
             self.storage.save_ledger(ledger, expected_revision=_led_rev)
             if biopsy_book is not None:
@@ -2081,7 +2356,7 @@ class RosterService:
         #   臨界區內別人寫不進 biopsy.json,重排時取的 revision 到寫入為止
         #   都還有效,CAS 因此不會在這裡被觸發。
         with (self.storage.write_barrier(),
-              self._biopsy_intent(scope, ym) as _intent):
+              self._biopsy_intent(scope, ym, witness_ym=ym) as _intent):
             self.update_month(ym, _mut)
             if _holder.get("book") is not None:
                 self.storage.save_biopsy(
@@ -2101,8 +2376,12 @@ class RosterService:
                 #   略過的話,下月的 saturday_biopsy/報告/切片計數會繼續反映
                 #   舊的週五值班,而且完全沒有紀錄 —— 正好違反這一批要建立的
                 #   「定案＝資料一致」契約。留著義務,收斂端會請使用者先解除定案。
+                # ★這裡沒有 witness★:來源是【本月】的週五值班,而且它在
+                #   進入這個區塊之前就已經存好了 —— 下月月檔沒變不代表沒有債,
+                #   正好相反,那就是「下月的切片還沒跟上」本身。
                 with self.biopsy_obligation(
-                        _next_ym, "跨月週五連動的切片重排") as ob:
+                        _next_ym, "跨月週五連動的切片重排",
+                        witness_ym=None) as ob:
                     # ★這個分支只是【診斷】★:走 else 讓它自己拋
                     #   FinalizedMonthError 的話,義務照樣會留下來(例外路徑
                     #   本來就不清)—— 差別在 log 是一句話還是一整串 traceback。
@@ -2172,7 +2451,10 @@ class RosterService:
 
         # ★月檔與切片帳本在同一個臨界區內★(見 set_cell 的同一條說明)
         # 種類=biopsy:這條路只重建切片計數,不碰點數帳本(外審次輪 P2-02)
-        with self.storage.write_barrier(), self._biopsy_intent("r", ym):
+        # witness＝這一份月檔:定案/被搶先而整個 update_month 失敗時,盤上什麼
+        # 都沒動 → 那筆意圖是誤報,撤掉(外審 2026-08-22 P2)。
+        with (self.storage.write_barrier(),
+              self._biopsy_intent("r", ym, witness_ym=ym)):
             self.update_month(ym, _mut)        # 定案 → 拋例外,帳本不落地
             if _holder.get("book") is not None:
                 self.storage.save_biopsy(
@@ -2204,6 +2486,7 @@ class RosterService:
                 return False
             month[f"{scope}_duty"] = kept
             month[f"report_{scope}"] = ""      # 舊報告已與清除後不符 → 一併清掉
+            month.pop(report_digest_key(scope), None)   # 識別跟著報告一起走
             self._audit(month, scope, "clear_unlocked", None, None, "clear")
             # [週六切片] R 值班清除 → 切片依殘餘(鎖定)值班+次數平衡重排,與月檔同批
             if scope == "r":
@@ -2228,7 +2511,7 @@ class RosterService:
         # ★月檔與切片帳本在同一個臨界區內★(見 set_cell 的同一條說明);
         #   ★而且兩個檔之間要留一筆意圖★(RS-10):臨界區擋不住行程被砍。
         with (self.storage.write_barrier(),
-              self._biopsy_intent(scope, ym) as _intent):
+              self._biopsy_intent(scope, ym, witness_ym=ym) as _intent):
             self.update_month(ym, _mut)
             if _holder.get("book") is not None:
                 self.storage.save_biopsy(
@@ -2282,7 +2565,9 @@ class RosterService:
         # → 同步重排＋刷新報告段；定案月 _set_date_map 已先拋,不會走到這裡。
         # ★來源已改、衍生物沒跟上,就要留下義務★(外審 2026-08-22 P2-01):
         #   原本只 log —— 請假成功落地、切片停在舊人選,沒有人會去收斂。
-        with self.biopsy_obligation(ym, "請假變動後的週六切片重排") as ob:
+        # 來源＝這個月的月檔(請假寫在裡面);請假本身被擋下時不留債。
+        with self.biopsy_obligation(ym, "請假變動後的週六切片重排",
+                                    witness_ym=ym) as ob:
             self._set_date_map(scope, ym, "leaves", member_id, dates, baseline)
             try:
                 self.recompute_saturday_biopsy(ym)
@@ -2753,7 +3038,14 @@ class RosterService:
         """
         if month.get("finalized"):
             raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能重算帳本")
-        ctx = self.build_context(scope, ym, month=month)
+        # ★重算帳本是最危險的那一條★(外審 2026-08-22 P1-01):`config.json`
+        #   暫時讀不到時,寬鬆載入回空 → members=[] → points 全空,而
+        #   `settle_month` 會先回滾本月舊分錄再記上這份空的 —— ★正式帳本被
+        #   改寫,而畫面回報成功★。權威輸入在這裡當場拒絕,磁碟原封不動。
+        #   ★每次呼叫各自宣告★:定案會對 r/vs 各跑一次,前一個 scope 的重算
+        #   已經寫過月檔/帳本/切片帳本,沿用上一輪的快照會拿到過期的版本。
+        src = self._sources(ym, SRC_SETTLE)
+        ctx = self.build_context(scope, ym, month=month, src=src)
         duty = (month.get(f"{scope}_duty") or {})
         points = {m.id: 0 for m in ctx.members}
         y, m = int(ym[:4]), int(ym[5:7])
@@ -2781,7 +3073,7 @@ class RosterService:
         if scope == "r":
             try:
                 _a, _n, book, book_rev = self.recompute_saturday_biopsy(
-                    ym, month)
+                    ym, month, src=src)
             except Exception as e:  # noqa: BLE001
                 book = book_rev = None
                 _bio_failed = str(e) or e.__class__.__name__
@@ -2805,8 +3097,15 @@ class RosterService:
             self.storage.clear_pending_settle(scope, ym)
         return points, _duty_digest(month, scope)
 
-    def finalize(self, ym: str, on: bool) -> None:
-        """定案/解除定案。解除需覆寫已定案月檔 → 一律 force=True。
+    def finalize(self, ym: str, on: bool) -> list:
+        """定案/解除定案 → ★定案當下的留底段落★(解除定案回 [])。
+
+        ★快照要在【定案的同一個臨界區】裡取★(外審 RS-19 R1-2):留底 PDF 是
+        背景執行緒產生的,而它可能要先下載安裝 reportlab —— 等它回過頭來組
+        內容時,帳本(全域累計,別的月份/別台電腦都會動)早就不是定案當下那一
+        份了。月檔本身因為已定案而唯讀,班表不會變,★但餘額會★,於是一份
+        寫著「定案當下的排班快照」的文件印著之後才發生的結算。
+        解除定案不需要留底 → 回空 list。
 
         定案時：以最終（含手動調整/換班）的 R/VS 排班重算帳本，確保帳本＝實況。
 
@@ -2817,9 +3116,9 @@ class RosterService:
         用 duty 的識別回頭確認一次(★守衛不能只靠推理★)。
         """
         with self.storage.write_barrier():
-            self._finalize_locked(ym, on)
+            return self._finalize_locked(ym, on)
 
-    def _finalize_locked(self, ym: str, on: bool) -> None:
+    def _finalize_locked(self, ym: str, on: bool) -> list:
         _digests: dict = {}
         _resettled: list = []
         if on:
@@ -2879,6 +3178,14 @@ class RosterService:
                     f"請重新整理後再試一次。")
         month["finalized"] = bool(on)
         self._audit(month, "-", ym, None, f"finalized={bool(on)}", "finalize")
+        # ★留底段落要在【寫下定案旗標之前】組好★(外審 RS-19 R2-1):
+        #   組不出來(某個正典檔讀不到)就讓它在這裡上拋 —— 月檔還沒被改成
+        #   唯讀,整批中止是乾淨的。反過來的話,例外會讓 UI 說「定案失敗」
+        #   並把勾選還原,而磁碟上其實已經定案 —— ★假失敗比原本的 bug 更糟★
+        #   (使用者會再按一次,而第二次面對的是一個已經唯讀的月份)。
+        #   用手上這一份月檔,不再讀一次(它就是即將被寫下去的那一份)。
+        sections = (self.build_finalize_pdf_sections(ym, month=month)
+                    if on else [])
         # 定案路徑上方已經 preflight_required_backup 過（快照就在那時留下的）。
         # 這裡若再要求一次，兩次之間檔案被鎖住就仍會留下「帳本已重算、月份沒定案」
         # 的半套 —— 預檢的意義就沒了（外審第 10 輪）。
@@ -2895,32 +3202,87 @@ class RosterService:
             #   「已經一致了」,而我們並沒有為它做任何事。
             for scope in _resettled:
                 self.storage.clear_pending_settle(scope, ym)
-
-    # ── 定案 PDF 留底 ───────────────────────────────────────────────────
-    def build_finalize_pdf_sections(self, ym: str) -> list:
-        """組裝定案 PDF 內容：封面 + R/VS/日排班決策報告（純資料，可測）。"""
-        month = self.storage.load_month(ym)
-        y, m = int(ym[:4]), int(ym[5:7])
-        sections = [(f"{roc(y)}年{m:02d}月 排班定案留底",
-                     f"月份：{ym}\n產生時間：{_now()}\n"
-                     f"（本檔為定案當下的排班快照，供存證留底）")]
-        for scope, label in (("r", "R 排班決策報告"), ("vs", "VS 排班決策報告")):
-            rpt = month.get(f"report_{scope}")
-            if rpt:
-                sections.append((label, rpt))
-        if month.get("day_report"):
-            sections.append(("PGY / Clerk 日排班報告", month["day_report"]))
         return sections
 
-    def archive_finalize_pdf(self, ym: str) -> str:
+    # ── 定案 PDF 留底 ───────────────────────────────────────────────────
+    def build_finalize_pdf_sections(self, ym: str, *,
+                                    month: "dict | None" = None) -> list:
+        """組裝定案 PDF 內容:封面 + ★最終班表(由正典狀態重建)★ + 決策報告。
+
+        (外審 2026-08-22 P1-03)舊版直接印 `report_r`/`report_vs` —— 那是
+        【初次自動求解】的紀錄,Auto Accept 之後手動換過班就與事實不符,
+        而 `finalize` 只重算帳本、不重新產生報告。於是留底 PDF 會出現
+        「班表=舊版、帳本=新版」的自相矛盾,★而且它看起來完全正常★。
+        現在最終班表與結算一律從正典狀態(月檔 duty + 設定 + 帳本)重建;
+        求解報告仍保留(它說明的是「當初為什麼這樣排」),但會標明它與
+        最終班表的關係(見 `report_state`)。
+
+        ★整段在同一個臨界區、而且用權威輸入★(P1-01/P1-02):留底文件不接受
+        「某個檔剛好讀不到 → 少一段 → 照樣成功」。
+        """
+        with self.storage.write_barrier():
+            src = self._sources(ym, SRC_RVS)
+            # `month=` 傳入 → ★用呼叫端手上那一份★(定案時它就是即將寫下去的
+            #   那一份;另外再讀一次就可能是兩個版本 —— RS-6 的同一條道理)。
+            month = src.load_month(ym) if month is None else month
+            cfg = src.load_config()
+            holidays = src.holidays_set()
+            ledger_all = src.load_ledger()
+        y, m = int(ym[:4]), int(ym[5:7])
+        params = RosterParams.from_config(cfg)
+        sections = [(f"{roc(y)}年{m:02d}月 排班定案留底",
+                     f"月份：{ym}\n產生時間：{_now()}\n"
+                     "（本檔為定案當下的排班快照，供存證留底）")]
+        for scope, label in (("r", "R 排班"), ("vs", "VS 排班")):
+            members = [Member.from_dict(d)
+                       for d in (cfg.get(f"{scope}_members") or [])]
+            duty = _month_duty(month, scope, y, m)
+            if not duty and not members:
+                continue                       # 這個 scope 本月完全沒東西
+            sections.append((f"{label}最終班表與結算", build_final_state_report(
+                year=y, month=m, scope_label=label, members=members,
+                duty=duty, holidays=holidays, params=params,
+                ledger=dict(ledger_all.get(scope) or {}))))
+        for scope, label in (("r", "R 排班決策報告"), ("vs", "VS 排班決策報告"),
+                             ("day", "PGY / Clerk 日排班報告")):
+            rpt = month.get(report_key(scope))
+            if not rpt:
+                continue
+            # ★這一段是「當初為什麼這樣排」的診斷紀錄,不是最終班表★
+            #   (見 `report_notice`:歷史性無條件講,查得出來的原因再加一句)
+            note = report_notice(month, scope)
+            sections.append((label,
+                             (note + "\n" * 2 + rpt) if note else rpt))
+        return sections
+
+    def report_for_display(self, scope: str, ym: str) -> str:
+        """給「報告」鈕看的文字＝報告內容 + ★它與現況的關係★。
+
+        (外審 2026-08-22 P1-03)使用者看報告是為了知道「現在這個月是怎麼排的」,
+        而 Auto Accept 之後手動換過班的話,這份文字講的是舊班表 —— 不講清楚
+        的話,畫面上的月曆與報告內容互相矛盾,而且看不出誰才是對的。
+        顯示路徑刻意用寬鬆載入(讀不到就顯示空,不該讓視窗開不起來)。
+        """
+        month = self.storage.load_month(ym)
+        text = month.get(report_key(scope)) or ""
+        if not text:
+            return ""
+        note = report_notice(month, scope)
+        return (note + "\n\n" + text) if note else text
+
+    def archive_finalize_pdf(self, ym: str, sections=None) -> str:
         """把該月定案排班報告輸出成 PDF 存到 <roster>/finalized/。回傳路徑。
-        reportlab 未安裝 → RuntimeError（呼叫端 UI 負責 lazy 安裝後重試）。"""
+        reportlab 未安裝 → RuntimeError（呼叫端 UI 負責 lazy 安裝後重試）。
+
+        `sections`＝★定案當下就取好的那一份★(見 `finalize`)。沒帶的話才
+        現場重組 —— 那是給「事後補印」用的,不是定案流程該走的路。"""
         from cmuh_common.roster import export_pdf
         y, m = int(ym[:4]), int(ym[5:7])
         out_dir = os.path.join(self.storage.base_dir, "finalized")
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, f"{roc(y)}年{m:02d}月定案.pdf")
-        export_pdf.export(path, self.build_finalize_pdf_sections(ym))
+        export_pdf.export(path, (self.build_finalize_pdf_sections(ym)
+                                 if sections is None else sections))
         return path
 
     # ── 驗證（不求解）────────────────────────────────────────────────────

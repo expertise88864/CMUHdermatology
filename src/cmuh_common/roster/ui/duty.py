@@ -941,7 +941,16 @@ class CalendarDutyTab(ttk.Frame):
     def _on_export(self) -> None:
         """匯出整月班表（R+VS）。副檔名決定 Excel/Word；重依賴 lazy 安裝。"""
         from cmuh_common.roster.export_common import default_filename
-        data = self.service.build_export(self.app.ym)
+        # ★見 day_tab 的同一段★(外審 2026-08-22 P1-02):來源 fail-closed 之後
+        #   要有人話提示,不然只剩一個 Tk traceback。
+        try:
+            data = self.service.build_export(self.app.ym)
+        except Exception as e:  # noqa: BLE001
+            logging.exception("[roster.ui] 匯出:讀取排班資料失敗")
+            messagebox.showerror(
+                "無法匯出",
+                f"讀取排班資料時發生問題，為避免輸出不完整的班表已中止：{chr(10)}{e}")
+            return
         path = filedialog.asksaveasfilename(
             title="匯出班表", defaultextension=".xlsx",
             initialfile=default_filename(data, ".xlsx"),
@@ -997,8 +1006,10 @@ class CalendarDutyTab(ttk.Frame):
                             f"已依目前 {_SCOPE_TITLE[scope]} 排班重算帳本結轉。")
 
     def _on_report(self, scope: str) -> None:
-        month = self.service.storage.load_month(self.app.ym)
-        text = month.get(f"report_{scope}") or "（本月尚未排班，無報告）"
+        # ★Accept 之後手改過班的話,這份報告講的是舊班表★ → 服務層會在最前面
+        #   標明它與現況的關係(外審 2026-08-22 P1-03)。
+        text = (self.service.report_for_display(scope, self.app.ym)
+                or "（本月尚未排班，無報告）")
         self._show_report_text(text, title=f"{_SCOPE_TITLE[scope]} 決策報告")
 
     def _show_report_text(self, text, title) -> None:
@@ -1015,7 +1026,9 @@ class CalendarDutyTab(ttk.Frame):
     def _on_finalize(self) -> None:
         on = bool(self._final_var.get())
         try:
-            self.service.finalize(self.app.ym, on)
+            # ★留底內容在定案的同一個臨界區裡取★(外審 RS-19 R1-2):交給背景
+            #   工作自己事後重組的話,帳本餘額已經不是定案那一刻的了。
+            sections = self.service.finalize(self.app.ym, on)
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("定案失敗", str(e))
             self._final_var.set(not on)
@@ -1024,7 +1037,8 @@ class CalendarDutyTab(ttk.Frame):
         self._apply_finalized_state()
         self.refresh()
         if on:                              # 定案 → 背景輸出 PDF 留底
-            archive_finalize_pdf_async(self, self.service, self.app.ym)
+            archive_finalize_pdf_async(self, self.service, self.app.ym,
+                                       sections)
 
     def _apply_finalized_state(self) -> None:
         # RF-17：求解中（_busy_flag）也要保持停用——refresh（切月/切分頁/設定變更）

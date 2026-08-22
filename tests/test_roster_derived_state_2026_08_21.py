@@ -113,10 +113,19 @@ class TestWriteIntentPathsUseAStrictSource:
     def test_the_biopsy_book_is_read_once(self):
         """版本與內容同源:`canonical_revision` + `load_biopsy` 是兩次讀取,
         中間被換入壞內容時兩邊都取自那份壞的,CAS 對得上就放行。"""
-        calls = self._storage_calls(
-            RosterService._recompute_saturday_biopsy_locked)
-        assert "canonical_snapshot" in calls
-        assert "load_biopsy" not in calls and "canonical_revision" not in calls
+        import ast
+        import inspect
+        import textwrap
+        # (RS-19)這一份改由權威輸入 `StrictSources.snapshot("biopsy.json")`
+        # 提供 —— 仍是【讀一次位元組、版本與內容同源】,只是來源物件換了。
+        # 「兩次讀取」的那個形狀照樣不准出現。
+        fn = RosterService._recompute_saturday_biopsy_locked
+        calls = self._storage_calls(fn)
+        names = [n.func.attr for n in ast.walk(
+            ast.parse(textwrap.dedent(inspect.getsource(fn))))
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+        assert "snapshot" in names or "canonical_snapshot" in calls
+        assert "load_biopsy" not in names and "canonical_revision" not in names
 
     def test_rename_reads_its_sources_strictly(self):
         """改名會把帳本/切片計數整份寫回去 → 來源不可以是寬鬆載入。"""

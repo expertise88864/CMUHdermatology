@@ -571,9 +571,11 @@ class DayScheduleTab(ttk.Frame):
                        date.fromisoformat(iso), session, self.refresh)
 
     def _on_report(self) -> None:
-        # 顯示「已落地/存檔」的日排班報告（非重新求解），與畫面一致
-        month = self.service.storage.load_month(self.app.ym)
-        text = month.get("day_report") or "（本月尚未套用日排班，無報告）"
+        # 顯示「已落地/存檔」的日排班報告（非重新求解），與畫面一致。
+        # ★套用之後手改過格子的話,報告講的是舊的★ → 由服務層在文字最前面
+        #   標明它與現況的關係(外審 2026-08-22 P1-03)。
+        text = (self.service.report_for_display("day", self.app.ym)
+                or "（本月尚未套用日排班，無報告）")
         win = tk.Toplevel(self)
         win.title(f"{_TITLE} 報告/警告 · {self.app.ym}")
         t = tk.Text(win, wrap="none", width=70, height=30, font=("Consolas", 10))
@@ -714,7 +716,17 @@ class DayScheduleTab(ttk.Frame):
         """[RS-01] 匯出整月班表（R/VS 月曆 + PGY/Clerk 日排班）。副檔名決定 Excel/Word；
         重依賴 lazy 安裝；沿用 duty.py 的背景執行緒 + after 回主緒模式。"""
         from cmuh_common.roster.export_common import default_filename
-        data = self.service.build_export(self.app.ym)
+        # ★正式文件寧可匯不出來,也不可以少一半還說成功★(外審 2026-08-22
+        #   P1-02):資料來源改成 fail-closed 之後,這裡要把它翻成人話,
+        #   否則使用者按了匯出只會得到一個沒有訊息的 Tk traceback。
+        try:
+            data = self.service.build_export(self.app.ym)
+        except Exception as e:  # noqa: BLE001
+            logging.exception("[roster.ui] 日排班匯出:讀取排班資料失敗")
+            messagebox.showerror(
+                "無法匯出",
+                f"讀取排班資料時發生問題，為避免輸出不完整的班表已中止：{chr(10)}{e}")
+            return
         path = filedialog.asksaveasfilename(
             title="匯出班表", defaultextension=".xlsx",
             initialfile=default_filename(data, ".xlsx"),
@@ -757,7 +769,9 @@ class DayScheduleTab(ttk.Frame):
     def _on_finalize(self) -> None:
         on = bool(self._final_var.get())
         try:
-            self.service.finalize(self.app.ym, on)
+            # ★留底內容在定案的同一個臨界區裡取★(外審 RS-19 R1-2):交給背景
+            #   工作自己事後重組的話,帳本餘額已經不是定案那一刻的了。
+            sections = self.service.finalize(self.app.ym, on)
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("定案失敗", str(e))
             self._final_var.set(not on)
@@ -765,7 +779,8 @@ class DayScheduleTab(ttk.Frame):
         self._finalized = on
         self._apply_finalized_state()
         if on:                              # 定案 → 背景輸出 PDF 留底
-            archive_finalize_pdf_async(self, self.service, self.app.ym)
+            archive_finalize_pdf_async(self, self.service, self.app.ym,
+                                       sections)
 
     def _apply_finalized_state(self) -> None:
         state = "disabled" if self._finalized else "normal"
