@@ -105,13 +105,51 @@ class TestTheOrderIsChosenForRecoverability:
 
     def test_an_unrecoverable_entry_is_kept_not_silently_cleared(self, svc):
         """★收斂不了就不可以清掉★:清掉等於宣稱「已經一致了」。
-        (定案月是唯讀,重算會被拒 —— 這是真的會發生的情況。)"""
-        svc.storage.mark_pending_settle("r", YM)
+        (定案月是唯讀,重算會被拒 —— 這是真的會發生的情況。)
+
+        ★順序反映新契約★(外審 2026-08-22 P2-02):定案現在會先要求所有
+        未完成的義務清零,所以「帶著義務去定案」已經不可能發生;這種狀態
+        只會來自舊資料(定案在前、義務在後)。反例照著那個形狀擺。
+        """
         svc.finalize(YM, True)                           # 之後就唯讀
+        svc.storage.mark_pending_settle("r", YM)         # 舊資料留下的義務
         done = svc.reconcile_pending_settles()
         assert done == [], done
         assert svc.storage.load_pending_settles(), \
             "★收斂失敗卻把意圖清掉了(從此沒有人知道帳本可能不一致)★"
+
+
+class TestFinalizeRequiresAConsistentMonth:
+    """★定案＝所有正典/衍生資料都已經一致★(外審 2026-08-22 P2-02)。
+
+    帶著未完成的義務定案的話,月檔從此唯讀 —— 而收斂端要寫月檔才能重建
+    切片,於是那筆義務永遠留著、也永遠做不完。
+    """
+
+    def test_finalize_is_refused_while_an_obligation_is_open(self, svc):
+        svc.storage.mark_pending_settle("r", YM, kind="biopsy")
+        with pytest.raises(Exception, match="尚未重建完成"):
+            svc.finalize(YM, True)
+        assert not svc.storage.load_month(YM).get("finalized"),             "★被拒卻已經定案了★"
+
+    def test_finalize_works_once_the_obligation_is_gone(self, svc):
+        svc.storage.mark_pending_settle("r", YM, kind="biopsy")
+        svc.storage.clear_pending_settle("r", YM, kind="biopsy")
+        svc.finalize(YM, True)
+        assert svc.storage.load_month(YM)["finalized"] is True
+
+    def test_unfinalizing_is_never_blocked(self, svc):
+        """★出口不可以被同一條規則鎖住★:解除定案正是收斂的前置動作。"""
+        svc.finalize(YM, True)
+        svc.storage.mark_pending_settle("r", YM, kind="biopsy")
+        svc.finalize(YM, False)                          # 不得被擋
+        assert not svc.storage.load_month(YM).get("finalized")
+
+    def test_the_reconcile_says_what_to_do_on_a_finalized_month(self, svc):
+        svc.finalize(YM, True)
+        svc.storage.mark_pending_settle("r", YM, kind="biopsy")
+        assert svc.reconcile_pending_settles() == []
+        assert svc.storage.load_pending_settles(), "收斂不了就要留著"
 
 
 class TestTheReconcileIsWiredUp:

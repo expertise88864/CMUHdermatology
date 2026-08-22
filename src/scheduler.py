@@ -177,6 +177,13 @@ class ScheduleApp:
             self.service.reconcile_pending_grid_shifts()
         except Exception:
             logging.exception("[roster] 收斂未完成的格網平移失敗（不擋開啟）")
+        # 跨機合併後才成立的名單衝突(兩台各改一個檔,git 乾淨合併但結果違規)
+        # —— 開程式時記一筆,日排班分頁的警告面板也會顯示(外審 P2-03)。
+        try:
+            for _msg in self.service.validate_roster_identity_invariants():
+                logging.warning("[roster] ★名單身分衝突★ %s", _msg)
+        except Exception:
+            logging.exception("[roster] 名單不變量檢查失敗（不擋開啟）")
         # [2026-07-13 使用者] 打開就預設【下個月】——通常打開排班程式就是要排下個月的班
         # （7 月開 → 顯示 8 月；12 月開 → 顯示隔年 1 月）。R/VS/PGY/Clerk 共用此月份。
         today = date.today()

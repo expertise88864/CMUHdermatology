@@ -637,8 +637,11 @@ class RosterService:
     def quick_validate_day(self, ym: str) -> list:
         """[RS-07] PGY/Clerk 日排班快速檢查（warn 不擋存，符合設計 §16.4）。回傳訊息清單：
         (a)請假者被排、(b)代號不在當日名單/梯次、(c)週三下午治療室/切片有人、
-        (d)房容量超標、(e)停診房仍有人（兜 RS-03/05 殘留）。"""
-        out: list = []
+        (d)房容量超標、(e)停診房仍有人（兜 RS-03/05 殘留）、
+        (f)★合併後才成立的名單身分衝突★(外審 2026-08-22 P2-03:兩台各改
+        一個檔,git 乾淨合併但結果違規)—— 它不屬於某一天,卻會讓每一天都
+        少一個人,放在同一個警告面板使用者才有機會修。"""
+        out: list = list(self.validate_roster_identity_invariants())
         month = self.storage.load_month(ym)
         day_slots = month.get("day_slots") or {}
         if not day_slots:
@@ -824,6 +827,32 @@ class RosterService:
         if mine:
             self.storage.clear_pending_settle(scope, ym, kind)
 
+    @contextlib.contextmanager
+    def biopsy_obligation(self, ym: str, what: str = "週六切片重排"):
+        """「先改來源、再重建切片衍生物」的★唯一★包裝(外審 2026-08-22 P2-01)。
+
+        用法:
+            with self.biopsy_obligation(ym) as ob:
+                mutate_source()                # 請假/值班/梯次…
+                try:
+                    self.recompute_saturday_biopsy(ym)
+                except Exception as e:
+                    ob.keep(str(e))            # 來源已改、衍生物沒跟上
+
+        ★不要靠每個呼叫端自己記得補意圖★:`set_leaves` 與跨月週五那兩條路
+        原本只 log 就算了 —— 請假已經落地、`saturday_biopsy`/`biopsy.json`
+        還停在舊狀態,而且沒有任何人負責收斂(使用者只看到「請假成功」)。
+        ★重建成功時什麼都不留★:意圖只在真的失敗時保留。
+        """
+        with self.settle_intent("r", ym, kind="biopsy") as state:
+            try:
+                yield state
+            finally:
+                if state.kept:
+                    logging.warning(
+                        "[roster.service] ★%s 的%s未完成★(%s)—— 意圖保留",
+                        ym, what, state.kept_reason)
+
     def _biopsy_intent(self, scope: str, ym: str):
         """R 才會寫切片帳本 → 只有 R 需要這一筆意圖(見 `settle_intent`)。
 
@@ -903,9 +932,6 @@ class RosterService:
         (set delta 看不見順序,這裡是唯一能保住它的分支)。
         """
         codes = assert_unique_codes(codes, "PGY 預設代號")
-        assert_no_cross_roster(codes, self._clerk_codes_where_default_applies(),
-                               "PGY 預設代號",
-                               "會用到這份預設名單的 Clerk 梯次成員")
         base = [str(c) for c in (baseline or [])]
         out: dict = {}
 
@@ -922,7 +948,11 @@ class RosterService:
                 merged += [c for c in adds if c not in merged]
             cfg["pgy_members"] = [by_id.get(c, {"id": c}) for c in merged]
             out["merged"] = merged
-        self.update_config(_mut)
+        with self.storage.write_barrier():     # 見 set_pgy_month_roster 的說明
+            assert_no_cross_roster(
+                codes, self._clerk_codes_where_default_applies(),
+                "PGY 預設代號", "會用到這份預設名單的 Clerk 梯次成員")
+            self.update_config(_mut)
         return out.get("merged") or []
 
     def update_ledger(self, mutator, *, retries: int = 4):
@@ -1028,6 +1058,48 @@ class RosterService:
                 self.storage.clear_pending_grid_shift(_shift[0])
         return edits
 
+    def validate_roster_identity_invariants(self) -> list:
+        """→ 目前資料裡★已經存在★的名單身分衝突(人話清單;空＝沒問題)。
+
+        (外審 2026-08-22 P2-03)寫入邊界只擋得住【這一台】的編輯:兩台分別
+        改 `months/YYYY-MM.json` 與 `clerk_batches.json` 時,git 會乾淨地把
+        兩邊合起來 —— 誰都沒有違規,合併後的結果卻違反不變量。跨檔交易做
+        不到,所以改成「事後一定看得到」:開程式時記一筆、日排班分頁的警告
+        面板也顯示(solver 端仍有 fail-safe,不會真的雙排)。
+        """
+        out: list = []
+        for b in self.storage.load_clerk_batches():
+            bid = str((b or {}).get("id")
+                      or (b or {}).get("start_monday") or "?")
+            members = [str(c) for c in ((b or {}).get("members") or [])]
+            dup = duplicated_codes(members)
+            if dup:
+                out.append(f"Clerk 梯次 {bid} 的成員有重複代號:"
+                           f"{'、'.join(dup)} —— 請到設定頁修正")
+            during = set(self._pgy_codes_during_batch(
+                (b or {}).get("start_monday")))
+            clash = [c for c in dedupe_codes(members) if c in during]
+            if clash:
+                out.append(
+                    f"代號 {'、'.join(clash)} 同時是 Clerk 梯次 {bid} 的成員與"
+                    f"該期間的 PGY —— 排班時只會當 PGY 排,請修正其中一邊")
+        for ym in self.storage.iter_month_yms():
+            try:
+                cur = self.storage.load_month(ym).get("pgy_month_roster")
+            except Exception:                  # 壞月檔另有守衛,不在這裡吵
+                continue
+            dup = duplicated_codes([str(c) for c in (cur or [])])
+            if dup:
+                out.append(f"{ym} 的當月 PGY 名單有重複代號:"
+                           f"{'、'.join(dup)} —— 請到 PGY 分頁修正")
+        cfg_dup = duplicated_codes(
+            [str(m.get("id"))
+             for m in (self.storage.load_config().get("pgy_members") or [])])
+        if cfg_dup:
+            out.append(f"PGY 預設代號有重複:{'、'.join(cfg_dup)}"
+                       f" —— 請到設定頁修正")
+        return out
+
     # ── 跨池檢查的【時間範圍】(外審 RS-17 R2)────────────────────────────
     #   ★同一個代號在不同時間屬於不同人是正常的★:七月的 PGY 代號 A 之後
     #   變成八月梯次的 Clerk A —— 兩者從來不會在同一個時段同時在場,擋掉它
@@ -1101,11 +1173,12 @@ class RosterService:
         """新增一梯(唯一性在這裡守門;整份寫回仍走 narrow mutator)。"""
         members = assert_unique_codes((batch or {}).get("members") or [],
                                       "這個梯次的成員")
-        assert_no_cross_roster(
-            members, self._pgy_codes_during_batch(
-                (batch or {}).get("start_monday")),
-            "這個梯次的成員", "這一梯期間的 PGY 名單")
-        self.update_clerk_batches(lambda bs: bs.append(dict(batch)))
+        with self.storage.write_barrier():     # 見 set_pgy_month_roster 的說明
+            assert_no_cross_roster(
+                members, self._pgy_codes_during_batch(
+                    (batch or {}).get("start_monday")),
+                "這個梯次的成員", "這一梯期間的 PGY 名單")
+            self.update_clerk_batches(lambda bs: bs.append(dict(batch)))
 
     def update_clerk_batches(self, mutator, *, retries: int = 4):
         return self._update_canonical(
@@ -1334,8 +1407,6 @@ class RosterService:
         的人★:那個人明天就不會出現在日排班的候選名單裡,而畫面上看不出來。"""
         base = [str(c) for c in (baseline or [])]
         edited = assert_unique_codes(codes, "當月 PGY 人員")
-        assert_no_cross_roster(edited, self._clerk_codes_in_month(ym),
-                               "當月 PGY 人員", f"涵蓋 {ym} 的 Clerk 梯次成員")
 
         def _mut(month):
             cur = month.get("pgy_month_roster")
@@ -1356,7 +1427,13 @@ class RosterService:
             month["pgy_month_roster"] = merged
         # ★config 與月檔的讀寫要在同一個臨界區★:兩者之間背景同步換掉 config
         #   的話,合併用的「目前名單」與寫進去的月檔不是同一個盤面。
+        #   ★跨池檢查也要在裡面★(外審 2026-08-22 P2-03):在外面查的話,
+        #   背景 pull 可以在「查完 Clerk 名單」與「寫進月檔」之間把他機新增
+        #   的 Clerk 拉進來,寫出一個當場就違反不變量的月檔。
         with self.storage.write_barrier():
+            assert_no_cross_roster(
+                edited, self._clerk_codes_in_month(ym),
+                "當月 PGY 人員", f"涵蓋 {ym} 的 Clerk 梯次成員")
             self.update_month(ym, _mut)
 
     def set_pgy_apply_pref(self, ym: str, codes, *, baseline) -> None:
@@ -2015,15 +2092,35 @@ class RosterService:
         # 這裡才動下月,兩者互不影響;下月沒有月檔就什麼都不做。
         if scope == "r" and _cross_month_friday:
             _next_ym = f"{_next_day.year:04d}-{_next_day.month:02d}"
-            try:
-                # 下月沒排過 → 不做(不可憑空生出一份月檔);
-                # 已定案 → 唯讀,save_month 會丟 FinalizedMonthError,先跳過免噪音。
-                if (self.storage.month_exists(_next_ym)
-                        and not self.storage.load_month(_next_ym).get("finalized")):
-                    self.recompute_saturday_biopsy(_next_ym)
-            except Exception:
-                logging.exception(
-                    "[roster.service] set_cell 跨月週六切片重排失敗（略過）")
+            # 下月沒排過 → 不做(不可憑空生出一份月檔,也沒有東西會不一致)。
+            if self.storage.month_exists(_next_ym):
+                # ★跨月這條同樣要留義務★(外審 2026-08-22 P2-01):本月的週五
+                #   值班已經改了,下月月初那個週六的切片人選卻可能沒跟上。
+                # ★下月已定案 → 更要留義務,不可以靜默略過★(外審 RS-18 R1-1):
+                #   定案只是「那份月檔唯讀」,不是「它已經與新的週五值班一致」。
+                #   略過的話,下月的 saturday_biopsy/報告/切片計數會繼續反映
+                #   舊的週五值班,而且完全沒有紀錄 —— 正好違反這一批要建立的
+                #   「定案＝資料一致」契約。留著義務,收斂端會請使用者先解除定案。
+                with self.biopsy_obligation(
+                        _next_ym, "跨月週五連動的切片重排") as ob:
+                    # ★這個分支只是【診斷】★:走 else 讓它自己拋
+                    #   FinalizedMonthError 的話,義務照樣會留下來(例外路徑
+                    #   本來就不清)—— 差別在 log 是一句話還是一整串 traceback。
+                    #   誠實標註:它的突變不會轉紅,因為它不決定義務的存廢。
+                    if self.storage.load_month(_next_ym).get("finalized"):
+                        ob.keep(f"{_next_ym} 已定案（唯讀），無法重建切片；"
+                                f"請先解除該月定案")
+                        logging.warning(
+                            "[roster.service] %s 已定案 → 跨月切片重排留待"
+                            "解除定案後收斂", _next_ym)
+                    else:
+                        try:
+                            self.recompute_saturday_biopsy(_next_ym)
+                        except Exception as e:  # noqa: BLE001
+                            ob.keep(str(e) or e.__class__.__name__)
+                            logging.exception(
+                                "[roster.service] set_cell 跨月週六切片重排"
+                                "失敗（留待收斂）")
         return self.quick_validate(scope, ym)
 
     def set_biopsy_person(self, ym: str, d: date,
@@ -2178,15 +2275,22 @@ class RosterService:
     def set_leaves(self, scope: str, ym: str, member_id: str, dates, *,
                    baseline) -> None:
         """`baseline`＝開窗時的那一份(必填,見 `_set_date_map`)。"""
-        self._set_date_map(scope, ym, "leaves", member_id, dates, baseline)
+        if scope != "r":
+            self._set_date_map(scope, ym, "leaves", member_id, dates, baseline)
+            return
         # [codex P2] R 請假變動影響週六切片（平衡候選排除/值班連動的請假優先）
         # → 同步重排＋刷新報告段；定案月 _set_date_map 已先拋,不會走到這裡。
-        if scope == "r":
+        # ★來源已改、衍生物沒跟上,就要留下義務★(外審 2026-08-22 P2-01):
+        #   原本只 log —— 請假成功落地、切片停在舊人選,沒有人會去收斂。
+        with self.biopsy_obligation(ym, "請假變動後的週六切片重排") as ob:
+            self._set_date_map(scope, ym, "leaves", member_id, dates, baseline)
             try:
                 self.recompute_saturday_biopsy(ym)
-            except Exception:
+            except Exception as e:  # noqa: BLE001
+                ob.keep(str(e) or e.__class__.__name__)
                 logging.exception(
-                    "[roster.service] set_leaves 週六切片重排失敗（略過）")
+                    "[roster.service] set_leaves 週六切片重排失敗"
+                    "（請假照常落地,切片留待收斂）")
 
     def set_must(self, scope: str, ym: str, member_id: str, dates, *,
                  baseline) -> None:
@@ -2457,7 +2561,16 @@ class RosterService:
 
         `recompute_saturday_biopsy(ym)` 自行 load 的那條路會寫月檔+切片帳本,
         兩者同批、同臨界區,而且它自己也留意圖 —— 收斂失敗時那一筆會接手。
+
+        ★已定案的月份收斂不了,而且要說得出下一步★(外審 2026-08-22 P2-02):
+        重建要寫月檔,而定案月唯讀。新的定案閘門已經不允許帶著未完成的義務
+        定案,但舊資料仍可能是這個狀態 —— 明講「請先解除定案」,不要只留下
+        一句泛用的例外訊息(意圖保留,不會被清掉)。
         """
+        if self.storage.load_month(ym).get("finalized"):
+            raise FinalizedMonthError(
+                f"{ym} 已定案（唯讀），無法自動重建週六切片資料。"
+                f"請先解除該月定案,程式會在下次啟動時自動收斂。")
         self.recompute_saturday_biopsy(ym)
 
     def reconcile_pending_grid_shifts(self) -> list:
@@ -2740,6 +2853,22 @@ class RosterService:
                     m, rev = self.storage.load_month_snapshot(ym)
                     _digests[scope] = self._resettle_locked(scope, ym, m, rev)[1]
                     _resettled.append(scope)
+        # ★定案的語意是「所有正典/衍生資料都已經一致」★(外審 2026-08-22
+        #   P2-02):切片重建失敗時 `_resettle_locked` 會把義務降級成 biopsy
+        #   並繼續 —— 若就這樣定案,月檔從此唯讀,而收斂端要寫月檔才能重建
+        #   切片(`recompute_saturday_biopsy` 會被 finalized 守衛擋下)→
+        #   那筆義務永遠留著、也永遠做不完。所以定案前先要求它清零。
+        if on:
+            _left = [x for x in self.storage.load_pending_settles()
+                     if str(x.get("ym")) == ym]
+            if _left:
+                _kinds = "、".join(sorted({self.storage.pending_kind(x)
+                                          for x in _left}))
+                raise StaleRosterDataError(
+                    f"{ym} 還有尚未重建完成的資料({_kinds}），不能定案。"
+                    f"定案之後月檔唯讀,那些資料就再也補不回來了。"
+                    f"請重新開啟排班程式讓它自動收斂(或先處理錯誤訊息裡的"
+                    f"檔案問題)之後再定案。")
         # 重讀是必要的:上面的切片重排會把 saturday_biopsy/報告寫進月檔。
         month, _rev = self.storage.load_month_snapshot(ym)
         for scope, dig in _digests.items():

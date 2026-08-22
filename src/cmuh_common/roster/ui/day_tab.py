@@ -466,8 +466,11 @@ class DayScheduleTab(ttk.Frame):
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("清除失敗", str(e))
             return
+        # ★不可以清空警告面板★(外審 RS-18 R1-2):`refresh()` 剛剛才用
+        #   `quick_validate_day()` 填進【現況】的問題(例如 PGY/Clerk 身分
+        #   衝突)—— 這裡無條件清掉,使用者會在衝突還在時看到一片空白。
+        #   清除未鎖定本來就不會產生新的求解警告,讓 refresh 的結果留著即可。
         self.refresh()
-        self._refresh_warnings([])
 
     def _on_leave(self, scope: str) -> None:
         if self._finalized:
