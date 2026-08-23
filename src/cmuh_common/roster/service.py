@@ -2700,6 +2700,12 @@ class RosterService:
                    for ym in yms}
         months = {ym: mr[0] for ym, mr in _loaded.items()}
         month_revs = {ym: mr[1] for ym, mr in _loaded.items()}
+        # ★改名之前先記下「這一筆本來是不是 fresh」★(外審 RS-22 P2-01):
+        #   改名後無條件重算識別的話,一個【本來就對不上】的結算會被洗成
+        #   fresh —— 而那正是閘門用來擋下「拿舊帳排下個月」的唯一證據。
+        _was_fresh = {ym: (_duty_digest(m, scope)
+                           if m is not None else "")
+                      for ym, m in months.items()}
 
         # [codex] new_id 必須是「全新」代號：不可已出現在任何歷史資料——無論當【鍵】(帳本/切片
         # 計數/請假指定，覆蓋會蓋掉離職者紀錄) 或當【值】(值班/國定假日/last_weekend/週六切片/切片
@@ -2826,9 +2832,18 @@ class RosterService:
             if e.get("scope") != scope or "duty_digest" not in e:
                 continue
             _hym = str(e.get("month") or "")
-            if _hym in months:
+            if _hym not in months:
+                e.pop("duty_digest", None)     # 月檔不在了 → 無從查證
+            elif e.get("duty_digest") == _was_fresh.get(_hym):
                 e["duty_digest"] = _duty_digest(months[_hym], scope)
             else:
+                # ★本來就對不上 → 絕不洗成 fresh★(外審 RS-22 P2-01)。
+                #   也不留舊識別:改名之後它永遠不可能再相符,那會變成一個
+                #   沒有出口的封鎖(定案月連「重算帳本」都做不到)——
+                #   退回「無從查證」,由使用者到那個月按重算帳本。
+                logging.warning(
+                    "[roster.service] %s 的帳本結算在改名之前就與班表對不上"
+                    " → 退回「無從查證」(請到該月按「重算帳本」)", _hym)
                 e.pop("duty_digest", None)
 
         # ── Phase 3：逐檔寫入；任一失敗即回滾已寫的檔（不留半套改名）──────────────────
@@ -2989,17 +3004,47 @@ class RosterService:
         以 batch id 當鍵的 —— 兩梯都是 "" 就會互相覆蓋。補 id 之後那些資料才
         各自分得開。
         ★不可以用隨機 UUID★:兩台電腦各自跑一次遷移會產生兩個不同的 id,
-        git 合併之後就變成兩梯 —— 用 `legacy-<起始日>` 這種從內容推導出來的
-        穩定值,兩邊算出來的結果一模一樣(重複跑也是冪等的)。
+        git 合併之後就變成兩梯 —— 用從內容推導出來的穩定值,兩邊算出來的
+        結果一模一樣(重複跑也是冪等的)。
         ★驗證不得依賴這次遷移★:他機可能還沒升級(見
         `validate_authoritative_shape`)。
+
+        ★改主鍵就要改外鍵★(外審 RS-22 P1-01):`biopsy_grid.json` 是
+        `{batch_id: {日期: {時段: bool}}}`,而 `build_day_input` 讀的正是
+        `grid[batch.id]` —— 只改 `clerk_batches.json` 的話,原本設定好的整梯
+        「切片室開放」在下一次自動排班就靜靜地不見了:JSON 正常、驗證正常、
+        排班跑完也沒有例外,使用者只會發現切片班沒人排。
+        ★順序是「先複製、再換、最後清」★(不是 move):
+          * 中途斷在複製之後 → 梯次還是舊 id,舊鍵仍在,照樣讀得到;
+          * 斷在換 id 之後   → 新 id 已經有對應的格網;
+          * 任何一刻都不會出現「梯次指向一個不存在的格網」。
+        ★多梯共用舊鍵時複製給每一梯★:舊資料本來就是大家讀同一份,無從得知
+        當初想分給誰 —— 挑一梯等於替使用者決定。
         """
         fixed: list = []
+        plan: dict = {}                # 舊鍵 → [新 id, ...]
+        grid_now: dict = {}            # 規劃時要看得到現有的格網(見下)
 
-        def _mut(batches):
+        def _plan(batches):
             fixed.clear()              # ★每一輪重試都要從頭算★(CAS 會重跑)
+            plan.clear()
             taken = {str(b.get("id") or "").strip()
                      for b in batches if str(b.get("id") or "").strip()}
+
+            def _free(cand: str, src) -> bool:
+                """這個新 id 真的可以用嗎?
+
+                ★不是只看「有沒有梯次在用」★(外審 RS-22 R1-1):切片格網那一
+                邊也可能已經有這個鍵 —— 刪掉梯次時格網不會跟著刪,所以盤上
+                會有孤兒格網;巧合同名的 `legacy-<日期>` 也可能存在。
+                沿用一個【內容不一樣】的目的地 = 這一梯換到別人的切片開放,
+                而它自己原本那份接著被清理刪掉。內容相同才可以沿用
+                (那是上一次跑到一半留下的同一份,重跑要冪等)。
+                """
+                if cand in taken:
+                    return False
+                cur = grid_now.get(cand)
+                return cur is None or cur == src
             for b in batches:
                 if str(b.get("id") or "").strip():
                     continue
@@ -3009,35 +3054,87 @@ class RosterService:
                 # ★同一個起始日可以有兩梯(repo 明文保留這個舊案例)★
                 #   (外審 RS-21 R1-2):只用起始日的話兩梯會拿到同一個 id,
                 #   而那份檔接著就會被唯一性驗證擋下 —— 遷移自己造出一份
-                #   排不了班的資料。用內容再區分,而且要避開已經被用掉的 id。
+                #   排不了班的資料。用內容再區分,而且要避開已經用掉的 id。
+                src = grid_now.get(str(b.get("id") or ""))
                 cand = f"legacy-{start}"
-                if cand in taken:
+                if not _free(cand, src):
                     seed = json.dumps(b.get("members") or [],
                                       ensure_ascii=False, sort_keys=True)
                     cand = (f"legacy-{start}-"
                             + hashlib.sha256(seed.encode("utf-8"))
                             .hexdigest()[:8])
-                if cand in taken:
+                if not _free(cand, src):
                     # ★分不出來就不要動★:寧可留著沒有 id(仍然排得了班),
                     #   也不要寫出一份會被唯一性驗證擋下的檔。
                     logging.warning(
                         "[roster.service] 梯次(起始日 %s)無法產生唯一 id,"
                         "維持沒有 id", start)
                     continue
-                b["id"] = cand
                 taken.add(cand)
+                plan.setdefault(str(b.get("id") or ""), []).append(cand)
                 fixed.append(cand)
             return batches
 
         try:
-            self.update_clerk_batches(_mut)
+            with self.storage.write_barrier():
+                # 1) 先算出對應(不寫任何檔)。★規劃時就要看現有的格網★:
+                #    新 id 若已經有一份【別的】格網,它就不是空位。
+                grid_now = self.storage.load_biopsy_grid()
+                self.update_clerk_batches(_plan)
+                if not fixed:
+                    return []
+                # 2) ★先把格網複製到新鍵★(舊鍵留著 → 中斷也讀得到)
+                self.update_biopsy_grid(
+                    lambda g: self._copy_grid_keys(g, plan))
+                # 3) 再把梯次換成新 id
+                self.update_clerk_batches(lambda bs: self._apply_ids(bs, plan))
+                # 4) 最後清掉沒有任何梯次在用的舊鍵
+                self.update_biopsy_grid(
+                    lambda g: self._drop_unused_grid_keys(g))
         except Exception:
             logging.exception("[roster.service] 舊梯次補 id 失敗（不擋開啟）")
             return []
-        if fixed:
-            logging.warning("[roster.service] 已為舊版梯次補上穩定 id:%s",
-                            "、".join(fixed))
+        logging.warning("[roster.service] 已為舊版梯次補上穩定 id:%s",
+                        "、".join(fixed))
         return fixed
+
+    @staticmethod
+    def _copy_grid_keys(grid: dict, plan: dict) -> dict:
+        """把舊鍵的切片格網複製到每一個新 id(舊鍵保留)。"""
+        for old_key, new_ids in plan.items():
+            src = grid.get(old_key)
+            if not src:
+                continue
+            for nid in new_ids:
+                cur = grid.get(nid)
+                # 規劃時已經確認過:目的地要嘛是空的,要嘛就是同一份
+                # (上一次跑到一半留下的)。這裡再確認一次才寫 —— 兩者之間
+                # 只有本行程持著臨界區,但「證明得了」比「推理得出」可靠。
+                if cur is None or cur == src:
+                    grid[nid] = copy.deepcopy(src)
+        return grid
+
+    @staticmethod
+    def _apply_ids(batches: list, plan: dict) -> list:
+        """把計畫好的新 id 套到還沒有 id 的梯次上(順序即配對順序)。"""
+        pending = {k: list(v) for k, v in plan.items()}
+        for b in batches:
+            key = str(b.get("id") or "")
+            if str(b.get("id") or "").strip():
+                continue
+            queue = pending.get(key) or []
+            if queue:
+                b["id"] = queue.pop(0)
+        return batches
+
+    def _drop_unused_grid_keys(self, grid: dict) -> dict:
+        """清掉沒有任何梯次在用的舊鍵。★沒有梯次用它才清★:遷移不完全時
+        (例如撞名而留著沒有 id 的那一梯)舊鍵還要繼續給它用。"""
+        live = {str(b.get("id") or "")
+                for b in self.storage.load_clerk_batches()}
+        for key in [k for k in grid if k not in live and not str(k).strip()]:
+            grid.pop(key, None)
+        return grid
 
     def reconcile_pending_settles(self) -> list:
         """開程式時把「沒確認完成的結算」用月檔重建到一致。→ 已收斂的清單。
@@ -3112,7 +3209,7 @@ class RosterService:
             不猜、也不硬搬(搬錯會把格子丟到誰也用不到的日期)。
         """
         out: list = []
-        for rec in self.storage.load_pending_grid_shifts():
+        for rec in self.storage.load_pending_grid_shifts_strict():
             bid = str(rec.get("batch_id") or "")
             try:
                 old_start = date.fromisoformat(str(rec.get("old_start")))
@@ -3663,7 +3760,37 @@ class RosterService:
         checks.extend(self._manual_cell_checks(ctx, scope, ym))
         if scope == "r":
             checks.extend(self._biopsy_checks(ctx, ym))
+        checks.extend(self._carry_in_checks(scope, ym))
         return checks
+
+    def _carry_in_checks(self, scope: str, ym: str) -> list:
+        """結轉進來的帳本可不可信 —— ★在分頁的警告面板就要看得到★
+        (外審 RS-22 P2-04)。
+
+        升級前的舊分錄沒有識別。我們刻意★不擋★:擋了的話升級之後連一個月
+        都排不了,而那個狀態每一台都會經過一次。但它會影響下個月的公平目標
+        —— 所以至少要講在使用者看得到的地方,而不是等到按下自動排班之後、
+        在報告的最底下才出現一行。
+        """
+        try:
+            stale, unknown = self.stale_settlements(scope, ym)
+        except Exception:                      # 顯示路徑不因此打不開
+            logging.debug("[roster.service] 帳本新鮮度檢查失敗（略過）",
+                          exc_info=True)
+            return []
+        out = []
+        for m in stale:
+            out.append(Precheck(
+                "error", "LEDGER-STALE",
+                f"{m} 的帳本結算與該月班表不一致 —— 請到該月按「重算帳本」"
+                f"（否則本月的公平目標會用錯的結轉計算）"))
+        for m in unknown:
+            out.append(Precheck(
+                "warn", "LEDGER-UNKNOWN",
+                f"{m} 的帳本結算沒有可比對的識別（舊版程式所記，或月檔已不在），"
+                f"無法確認它是否仍與該月實際排班一致；若那個月曾手動換班，"
+                f"請先到該月按「重算帳本」"))
+        return out
 
     def _biopsy_checks(self, ctx: SolveContext, ym: str) -> list:
         """[週六切片] 驗證層安全網：缺 R2/R3 級提示；值班連動不符警告

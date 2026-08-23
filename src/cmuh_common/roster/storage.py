@@ -177,6 +177,34 @@ def last_weekend_of(month_data: dict, scope: str, ym: str) -> Optional[tuple]:
     return (last, person) if person else None
 
 
+#: 合法的週色(`calendar_colors` 的 PINK/GREEN;UI 也只產生這兩種)。
+_WEEK_COLORS = ("pink", "green")
+
+
+def _strict_pending(data: dict, name: str, what: str) -> list:
+    """意圖檔的嚴格讀取(兩份共用一套規則)。
+
+    ★「沒有這個鍵」與「這個鍵是 null / 壞掉的元素」是兩件事★
+    (外審 RS-22 R1-2):前者是「這份檔還沒有任何待辦」,後者是【讀不懂】——
+    而兩者都被正規化成空清單的話,收斂不會跑、閘門看不到,接下來的一次寫入
+    還會把那些認不得的義務整份覆寫掉。這正是這兩個嚴格讀取要消滅的行為,
+    只是換到更裡面一層。
+    """
+    if "pending" not in data:
+        return []                              # 還沒有任何待辦(合法)
+    raw = data["pending"]
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"{name} 的 pending 不是清單（{type(raw).__name__}）"
+            f"—— 無法確認還有沒有未完成的{what}")
+    for i, x in enumerate(raw):
+        if not isinstance(x, dict):
+            raise ValueError(
+                f"{name} 第 {i + 1} 筆不是物件（{type(x).__name__}）"
+                f"—— 認不得的義務不可以被當成不存在")
+    return list(raw)
+
+
 def _iso_or_none(k):
     try:
         return date.fromisoformat(str(k))
@@ -271,6 +299,10 @@ def validate_authoritative_shape(name: str, raw: dict) -> None:
         for k, v in (weeks or {}).items():
             if not isinstance(v, str):
                 bad(f"{k} 的顏色不是字串（{type(v).__name__}）")
+            # ★色塊連週是比對兩週的字串相不相等★:拼錯的 "gren" 會被當成
+            #   「不同色」,於是本該被禁止的連值兩個週末就這樣放行了。
+            elif v not in _WEEK_COLORS:
+                bad(f"{k} 的顏色 {v!r} 不是 {'／'.join(sorted(_WEEK_COLORS))}")
     elif name == "ledger.json":
         for scope in ("r", "vs"):
             book = raw.get(scope)
@@ -308,9 +340,18 @@ def validate_authoritative_shape(name: str, raw: dict) -> None:
         for bid, days in (grid or {}).items():
             if not isinstance(days, dict):
                 bad(f"梯次 {bid} 的格網不是物件")
-            for k in days:
+            for k, sess in days.items():
                 if _iso_or_none(k) is None:
                     bad(f"梯次 {bid} 有不是日期的鍵 {k!r}")
+                if sess is not None and not isinstance(sess, dict):
+                    bad(f"梯次 {bid} 的 {k} 不是物件"
+                        f"（{type(sess).__name__}）")
+                for session, on in (sess or {}).items():
+                    # ★時段值是 bool★:`[]` 之類的 falsey 錯型別會被靜靜當成
+                    #   「切片室沒開」—— 整梯的切片班就這樣不見了。
+                    if not isinstance(on, bool):
+                        bad(f"梯次 {bid} 的 {k}/{session} 不是布林值"
+                            f"（{type(on).__name__}）")
 
 
 def validate_authoritative_month(ym: str, raw: dict) -> None:
@@ -338,6 +379,18 @@ def validate_authoritative_month(ym: str, raw: dict) -> None:
                 bad(f"{scope}_duty 有不是日期的鍵 {k!r}")
             if cell is not None and not isinstance(cell, dict):
                 bad(f"{scope}_duty {k} 不是物件（{type(cell).__name__}）")
+            # ★鎖定是用 truthiness 判的★(外審 RS-22 P2-02):`"locked": []`
+            #   會被當成「沒鎖」,那一格於是可以被自動排班覆蓋掉 —— 而鎖定的
+            #   意思正是「不要動它」。person/source 同理(空字串≠沒排人)。
+            for fld, typ in (("person", str), ("locked", bool),
+                             ("source", str)):
+                if isinstance(cell, dict) and fld in cell \
+                        and not isinstance(cell[fld], typ):
+                    bad(f"{scope}_duty {k} 的 {fld} 型別不對"
+                        f"（{type(cell[fld]).__name__}）")
+    if "finalized" in raw and not isinstance(raw["finalized"], bool):
+        # 定案＝唯讀。錯型別的 falsey 值會讓那份月檔又可以被整份覆寫。
+        bad(f"finalized 不是布林值（{type(raw['finalized']).__name__}）")
     for mapkey in ("leaves", "must_duty"):
         block = raw.get(mapkey)
         if block is not None and not isinstance(block, dict):
@@ -787,12 +840,7 @@ class RosterStorage:
         顯示路徑仍用寬鬆的 `load_pending_settles`。
         """
         data, _rev = self._strict_snapshot(self._path("pending_settle.json"))
-        raw = data.get("pending")
-        if raw is not None and not isinstance(raw, list):
-            raise ValueError(
-                f"pending_settle.json 的 pending 不是清單"
-                f"（{type(raw).__name__}）—— 無法確認還有沒有未完成的結算")
-        return [x for x in (raw or []) if isinstance(x, dict)]
+        return _strict_pending(data, "pending_settle.json", "結算")
 
     #: 意圖的種類＝★哪一個衍生物還沒被重建★(外審次輪 P2-02)。
     #:   "ledger" 點數帳本 / "biopsy" 切片計數帳本 / "all" 兩者都要
@@ -891,6 +939,22 @@ class RosterStorage:
         return True
 
     # ── 梯次起始日 → 切片格網平移的意圖(外審次輪 P2-05)──────────────────
+    def load_pending_grid_shifts_strict(self) -> list:
+        """同 `load_pending_grid_shifts`,★但壞檔/讀不到就拋★
+        (外審 RS-22 P2-03;與 `load_pending_settles_strict` 同一個道理)。
+
+        梯次起始日已經落地、切片格網還沒跟著平移時,這份檔是【唯一】的線索;
+        寬鬆載入把「讀不到」變成「沒有待辦」,收斂就不會跑,而下一次有人移動
+        另一梯時還會把它整份覆寫掉 —— 那筆義務就永遠消失了。
+        """
+        data, _rev = self._strict_snapshot(
+            self._path("pending_grid_shift.json"))
+        return _strict_pending(data, "pending_grid_shift.json", "平移")
+
+    def _pending_grid_for_write(self) -> list:
+        """改這份檔之前一定要先嚴格讀(見 `_pending_for_write`)。"""
+        return self.load_pending_grid_shifts_strict()
+
     def load_pending_grid_shifts(self) -> list:
         """未確認完成的「梯次移動 → 切片格網平移」。
 
@@ -913,7 +977,7 @@ class RosterStorage:
         同一梯次已有未收斂的平移意圖時回 False:呼叫端必須★拒絕★這次變更
         (連續兩次平移疊起來之後,收斂端再也分不出格網停在哪一段)。
         """
-        cur = self.load_pending_grid_shifts()
+        cur = self._pending_grid_for_write()   # ★改它之前一定要嚴格讀★
         if any(str(x.get("batch_id")) == str(batch_id) for x in cur):
             return False
         cur.append({"batch_id": str(batch_id), "old_start": str(old_start),
@@ -929,7 +993,7 @@ class RosterStorage:
 
     def clear_pending_grid_shift(self, batch_id: str) -> None:
         """格網確實平移完成(或確認無需平移)之後清掉那一筆意圖。"""
-        cur = self.load_pending_grid_shifts()
+        cur = self._pending_grid_for_write()   # ★改它之前一定要嚴格讀★
         left = [x for x in cur if str(x.get("batch_id")) != str(batch_id)]
         if len(left) == len(cur):
             return
