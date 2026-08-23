@@ -84,6 +84,12 @@ _SCOPE_LABEL = {"r": "R 排班", "vs": "VS 排班"}
 _SPECIAL_SLOTS = frozenset((PHOTO, TREATMENT, BIOPSY, REST))   # 非跟診房的特殊格
 
 
+def _deltas_of(entry: dict) -> dict:
+    """一筆結算分錄的差額(正規化到小數第 4 位;比對只有這一份實作)。"""
+    return {str(k): round(float(v or 0.0), 4)
+            for k, v in ((entry or {}).get("deltas") or {}).items()}
+
+
 def _duty_digest(month: dict, scope: str) -> str:
     """這一份月檔的【該 scope 值班格】的識別 —— 帳本的點數就是從它算出來的。
 
@@ -2390,7 +2396,12 @@ class RosterService:
         #   互相矛盾,而且沒有任何人會發現(之後的切片平衡全部以錯的次數算)。
         #   臨界區內別人寫不進 biopsy.json,重排時取的 revision 到寫入為止
         #   都還有效,CAS 因此不會在這裡被觸發。
+        # ★帳本的意圖要包住【月檔的寫入】★(外審 RS-21 P2-01):在月檔落地
+        #   之後才記,中間被砍就留下一個沒有分錄也沒有意圖的月份。
+        #   witness=本月:月檔根本沒改成功時,那筆意圖是誤報,要撤掉。
         with (self.storage.write_barrier(),
+              self.settle_intent(scope, ym, kind="ledger",
+                                 witness_ym=ym) as _led,
               self._biopsy_intent(scope, ym, witness_ym=ym) as _intent):
             self.update_month(ym, _mut)
             if _holder.get("book") is not None:
@@ -2398,6 +2409,9 @@ class RosterService:
                     _holder["book"], expected_revision=_holder.get("rev"))
             if _holder.get("failed"):
                 _intent.keep(f"週六切片重排失敗:{_holder['failed']}")
+            # ★換班＝帳本也變了★:不同步的話,下個月的公平目標會用換班前的
+            #   結轉算(而使用者不會知道要按「重算帳本」)。
+            self._converge_ledger_locked(scope, ym, _led)
         # 月底週五(翌日是下月 1 號且為週六)→ 重排【下個月】。本月月檔已存好,
         # 這裡才動下月,兩者互不影響;下月沒有月檔就什麼都不做。
         if scope == "r" and _cross_month_friday:
@@ -2435,9 +2449,6 @@ class RosterService:
                             logging.exception(
                                 "[roster.service] set_cell 跨月週六切片重排"
                                 "失敗（留待收斂）")
-        # ★換班＝帳本也變了★(外審 RS-20 P1-02):不同步的話,下個月的公平
-        #   目標會用換班前的結轉算(而使用者不會知道要按「重算帳本」)。
-        self._converge_ledger_after_manual_edit(scope, ym)
         return self.quick_validate(scope, ym)
 
     def set_biopsy_person(self, ym: str, d: date,
@@ -2548,7 +2559,11 @@ class RosterService:
             return
         # ★月檔與切片帳本在同一個臨界區內★(見 set_cell 的同一條說明);
         #   ★而且兩個檔之間要留一筆意圖★(RS-10):臨界區擋不住行程被砍。
+        # ★清除也是手動改動班表★:帳本要跟著實排走,而且意圖要包住月檔的
+        #   寫入(見 set_cell 的同一段)。
         with (self.storage.write_barrier(),
+              self.settle_intent(scope, ym, kind="ledger",
+                                 witness_ym=ym) as _led,
               self._biopsy_intent(scope, ym, witness_ym=ym) as _intent):
             self.update_month(ym, _mut)
             if _holder.get("book") is not None:
@@ -2556,9 +2571,7 @@ class RosterService:
                     _holder["book"], expected_revision=_holder.get("rev"))
             if _holder.get("failed"):
                 _intent.keep(f"週六切片重排失敗:{_holder['failed']}")
-        # ★清除也是手動改動班表★(外審 RS-20 P1-02):走到這裡代表真的清掉了
-        #   東西(上面的試算沒東西可清就早退了)—— 帳本要跟著實排走。
-        self._converge_ledger_after_manual_edit(scope, ym)
+            self._converge_ledger_locked(scope, ym, _led)
 
     def set_lock(self, scope: str, ym: str, d: date, locked: bool) -> bool:
         """把某格設成「鎖定/未鎖定」(空格不可鎖)。回傳設定後的狀態。
@@ -2802,6 +2815,22 @@ class RosterService:
             if touched:
                 touched_months.append(ym)
 
+        # ★新鮮度識別也是要跟著改名走的資料★(外審 RS-21 P1-01):
+        #   `duty_digest` 記的是「這筆結算是照哪一份班表算的」,而改代號會
+        #   【合法地】把班表裡的 person 全部換掉 —— 識別於是對不上,求解下一個
+        #   月就被永久擋下,而帳本與班表其實完全一致。更糟的是改名連【已定案】
+        #   的月份都會 force 改,而定案月不能重算帳本 → 使用者無路可走。
+        #   ★只重算【手上真的有那份月檔】的★(`yms` 是全部月檔);月檔已經不在
+        #   的話就把識別拿掉(退回「無從查證」)—— 不可以留一個已知是錯的識別。
+        for e in (ledger.get("history") or []):
+            if e.get("scope") != scope or "duty_digest" not in e:
+                continue
+            _hym = str(e.get("month") or "")
+            if _hym in months:
+                e["duty_digest"] = _duty_digest(months[_hym], scope)
+            else:
+                e.pop("duty_digest", None)
+
         # ── Phase 3：逐檔寫入；任一失敗即回滾已寫的檔（不留半套改名）──────────────────
         # 每一筆:(標籤, 新資料, 舊資料, 寫入函式, ★還原函式★)。
         # ★還原不可以帶 CAS★:回滾時盤上那一份【就是我們剛寫進去的】,
@@ -2844,6 +2873,172 @@ class RosterService:
                      scope, old_id, new_id, changed)
         return changed
 
+    def migrate_legacy_ledger_digests(self) -> list:
+        """升級前的舊分錄沒有識別 → ★只認證【證明得了】的那些★。→ 認證清單。
+
+        (外審 RS-21 P2-05 / R1-1)RS-20 之後的結算都帶識別,但升級當下每一筆
+        舊分錄都沒有,於是永遠停在「無從查證」。
+        ★不可以自動重算歷史★:重算會用【現在的】點數規則、國定假日與成員
+        名單 —— 而那些都是可以獨立修改的設定。改過點數之後重算一個舊月份,
+        算出來的差額本來就與當初不同;新加入的成員甚至會被記上一筆他還沒到
+        職那個月的負債。★接著那顆新識別還會把改寫後的結果認證成 fresh★。
+        (我上一版就是這樣寫的,而且註解宣稱「本來就對的話結果一模一樣」——
+        那句話在點數/名單/假日變過之後是假的。)
+
+        所以這裡改成【只量、不改】:在副本上用現在的輸入結算一次,拿它的
+        分錄與帳本裡記著的那一筆逐項比對 ——
+          * 完全相同 → 那筆帳本與該月的班表確實一致(在現行規則下也成立)
+            → 補上識別(★只寫識別,餘額一個字都不動★),之後的閘門就守得住它;
+          * 不同     → 可能是舊版換班沒重算,也可能只是規則變過 —— ★分不出來
+            就不要動★:留在「無從查證」並記一筆 warning,由使用者決定要不要
+            到那個月按「重算帳本」(那是一個明確的、他知道自己在做什麼的決定)。
+        """
+        out: list = []
+        try:
+            led, rev = self.storage.canonical_snapshot("ledger.json",
+                                                       validate=True)
+        except Exception:
+            logging.exception("[roster.service] 讀帳本失敗（略過舊分錄認證）")
+            return out
+        targets = sorted({(str(e.get("scope") or ""), str(e.get("month") or ""))
+                          for e in (led.get("history") or [])
+                          if isinstance(e, dict) and "duty_digest" not in e})
+        proven: dict = {}
+        # ★證明與蓋章要在同一個交易裡★(外審 RS-21 R2-1):每個月份各開一次
+        #   臨界區的話,證明完到蓋章之間背景同步可以把那一筆分錄換成他機的
+        #   版本 —— 蓋上去的就變成「用舊證據認證新內容」。整段一個臨界區,
+        #   而且蓋章前再逐項比對一次分錄(下面的 `_stamp`)。
+        with self.storage.write_barrier():
+          for scope, ym in targets:
+            if scope not in ("r", "vs") or not ym:
+                continue
+            if not self.storage.month_exists(ym):
+                continue           # 月檔不在了 → 沒有真相可比,保持「無從查證」
+            try:
+                dig = self._prove_settlement_matches(scope, ym, led)
+            except Exception:
+                logging.warning(
+                    "[roster.service] %s %s 的舊分錄無法查證（維持「無從查證」）",
+                    scope, ym, exc_info=True)
+                continue
+            if dig:
+                old = next((e for e in (led.get("history") or [])
+                            if e.get("scope") == scope
+                            and e.get("month") == ym), {})
+                proven[(scope, ym)] = (dig, _deltas_of(old))
+                out.append((scope, ym))
+            else:
+                logging.warning(
+                    "[roster.service] ★%s %s 的帳本分錄與該月班表對不上★ ——"
+                    "可能是舊版換班後沒有重算,也可能只是點數/名單/假日改過。"
+                    "分不出來就不代為改寫:請到該月按「重算帳本」再決定。",
+                    scope, ym)
+          if not proven:
+            return out
+
+          # ★只補識別★:餘額與分錄一個字都不動;而且蓋章前再確認一次
+          #   「這一筆還是我證明過的那一筆」(★量,不要推理★:臨界區擋得住
+          #   背景同步,但這一句才是真正證明得了的部分)。
+          def _stamp(cur):
+            for e in (cur.get("history") or []):
+                key = (str(e.get("scope") or ""), str(e.get("month") or ""))
+                if key not in proven or "duty_digest" in e:
+                    continue
+                dig, deltas = proven[key]
+                if _deltas_of(e) != deltas:
+                    logging.warning(
+                        "[roster.service] %s %s 的分錄在查證之後又變了 → "
+                        "不蓋識別", key[0], key[1])
+                    continue
+                e["duty_digest"] = dig
+            return cur
+
+          try:
+            self.update_ledger(_stamp)
+          except Exception:
+            logging.exception("[roster.service] 舊分錄補識別失敗（不擋開啟）")
+            return []
+        logging.warning("[roster.service] 已認證升級前的舊分錄:%s",
+                        "、".join(f"{sc}/{ym}" for sc, ym in out))
+        return out
+
+    def _prove_settlement_matches(self, scope: str, ym: str,
+                                  led: dict) -> str:
+        """帳本裡那筆結算,與這個月的班表【現在】算起來一不一樣?
+        一樣 → 回它的班表識別;不一樣 → 回 ""。★呼叫端持 `write_barrier`★
+
+        ★在副本上算,磁碟一個字都不動★(外審 RS-21 R1-1)。
+        """
+        month, _rev = self.storage.load_month_snapshot(ym, validate=True)
+        src = self._sources(ym, SRC_RVS)
+        ctx = self.build_context(scope, ym, month=month, src=src)
+        points = self._points_from_duty(month, scope, ctx, ym)
+        probe = copy.deepcopy(led)
+        settle_month(probe, scope, ym, points)
+        fresh = next((e for e in reversed(probe.get("history") or [])
+                      if e.get("scope") == scope and e.get("month") == ym), {})
+        old = next((e for e in (led.get("history") or [])
+                    if e.get("scope") == scope and e.get("month") == ym), {})
+        return (_duty_digest(month, scope)
+                if _deltas_of(old) == _deltas_of(fresh) else "")
+
+    def migrate_legacy_clerk_batch_ids(self) -> list:
+        """舊版寫出來的梯次沒有 id → 補上一個【確定性】的 id。→ 補過的清單。
+
+        (外審 RS-21 P1-02)沒有 id 的梯次是舊版正式支援的形狀,但切片格網是
+        以 batch id 當鍵的 —— 兩梯都是 "" 就會互相覆蓋。補 id 之後那些資料才
+        各自分得開。
+        ★不可以用隨機 UUID★:兩台電腦各自跑一次遷移會產生兩個不同的 id,
+        git 合併之後就變成兩梯 —— 用 `legacy-<起始日>` 這種從內容推導出來的
+        穩定值,兩邊算出來的結果一模一樣(重複跑也是冪等的)。
+        ★驗證不得依賴這次遷移★:他機可能還沒升級(見
+        `validate_authoritative_shape`)。
+        """
+        fixed: list = []
+
+        def _mut(batches):
+            fixed.clear()              # ★每一輪重試都要從頭算★(CAS 會重跑)
+            taken = {str(b.get("id") or "").strip()
+                     for b in batches if str(b.get("id") or "").strip()}
+            for b in batches:
+                if str(b.get("id") or "").strip():
+                    continue
+                start = str(b.get("start_monday") or "").strip()
+                if not start:
+                    continue           # 連起始日都沒有 → 本來就用不了,不亂補
+                # ★同一個起始日可以有兩梯(repo 明文保留這個舊案例)★
+                #   (外審 RS-21 R1-2):只用起始日的話兩梯會拿到同一個 id,
+                #   而那份檔接著就會被唯一性驗證擋下 —— 遷移自己造出一份
+                #   排不了班的資料。用內容再區分,而且要避開已經被用掉的 id。
+                cand = f"legacy-{start}"
+                if cand in taken:
+                    seed = json.dumps(b.get("members") or [],
+                                      ensure_ascii=False, sort_keys=True)
+                    cand = (f"legacy-{start}-"
+                            + hashlib.sha256(seed.encode("utf-8"))
+                            .hexdigest()[:8])
+                if cand in taken:
+                    # ★分不出來就不要動★:寧可留著沒有 id(仍然排得了班),
+                    #   也不要寫出一份會被唯一性驗證擋下的檔。
+                    logging.warning(
+                        "[roster.service] 梯次(起始日 %s)無法產生唯一 id,"
+                        "維持沒有 id", start)
+                    continue
+                b["id"] = cand
+                taken.add(cand)
+                fixed.append(cand)
+            return batches
+
+        try:
+            self.update_clerk_batches(_mut)
+        except Exception:
+            logging.exception("[roster.service] 舊梯次補 id 失敗（不擋開啟）")
+            return []
+        if fixed:
+            logging.warning("[roster.service] 已為舊版梯次補上穩定 id:%s",
+                            "、".join(fixed))
+        return fixed
+
     def reconcile_pending_settles(self) -> list:
         """開程式時把「沒確認完成的結算」用月檔重建到一致。→ 已收斂的清單。
 
@@ -2854,7 +3049,7 @@ class RosterService:
         不可以靜默清掉(清掉就等於宣稱已經一致了)。
         """
         out: list = []
-        for item in self.storage.load_pending_settles():
+        for item in self.storage.load_pending_settles_strict():
             scope = str(item.get("scope") or "")
             ym = str(item.get("ym") or "")
             kind = self.storage.pending_kind(item)
@@ -3173,7 +3368,7 @@ class RosterService:
         # ★還沒結算完成的月份也不可以當結轉★(外審 RS-20 R1-1):
         #   純手動排的月份根本還沒有分錄,識別比對看不見它 —— 那筆意圖是
         #   唯一的線索(切片義務不算:它不影響點數)。
-        for x in self.storage.load_pending_settles():
+        for x in self.storage.load_pending_settles_strict():
             if str(x.get("scope") or "") != scope:
                 continue
             m = str(x.get("ym") or "")
@@ -3182,36 +3377,32 @@ class RosterService:
                 stale.add(m)
         return sorted(stale), sorted(unknown)
 
-    def _converge_ledger_after_manual_edit(self, scope: str, ym: str) -> None:
+    def _converge_ledger_locked(self, scope: str, ym: str, intent) -> None:
         """手動換班之後,帳本要跟著實排走(外審 RS-20 P1-02)。
 
+        ★呼叫端必須持有 `write_barrier` 與 kind="ledger" 的意圖★
+        (外審 RS-21 P2-01):意圖必須在【改月檔之前】就 durable —— 否則
+        「月檔已落地、行程在收斂之前被砍」會留下一個沒有分錄也沒有意圖的
+        月份:識別比對看不到它(沒有分錄可比)、收斂也不知道要補,而下個月
+        照樣排得出來、結轉整個消失。這正是切片義務早就在用的交易形狀。
+
         ★不可以擋住這次編輯★:使用者要的是「改一格就是改一格」。收斂失敗
-        (例如該月早於帳本保留期)時只記 log —— 帳本裡那筆結算的識別就會與
-        月檔對不上,而求解【下個月】之前的閘門會擋下來並說清楚是哪一個月。
+        (例如該月早於帳本保留期)時把意圖留著並記 log —— 開程式會收斂,
+        求解【下個月】之前的閘門也會擋下來並說清楚是哪一個月。
         ★也不可以只靠使用者記得按「重算帳本」★:那是一個隱形的維護義務,
         而它保護的是下個月的公平性。
 
         ★只做帳本,不走完整的 `resettle_from_duty`★:那條路會連切片一起重排、
-        並且清掉 (scope, 月份) 的結算意圖 —— 而呼叫端(set_cell / clear_unlocked)
-        剛剛才為切片留下一筆義務,也可能有【別人】未完成的義務在那裡。
-        用它來收斂帳本會替那些義務宣稱「已經一致了」(RS-10 的教訓),而且
-        同一次編輯會白白重排兩次切片。
+        並且清掉 (scope, 月份) 的結算意圖 —— 而呼叫端剛剛才為切片留下一筆
+        義務,也可能有【別人】未完成的義務在那裡(RS-10 的教訓)。
         """
         try:
-            with self.storage.write_barrier():
-                # ★意圖要在【任何一個可能失敗的步驟之前】記下★(外審 RS-20
-                #   R1-1):純手動排的月份還沒有任何結算分錄,所以
-                #   `stale_settlements` 的「識別對不上」查不到它 —— 收斂若在
-                #   讀檔/建 context 就失敗,那個月的結轉會整個消失,而下個月
-                #   照樣排得出來。意圖是這種「從未結算過」的唯一線索。
-                # ★來源(月檔)在進來之前就已經落地 → 進場即負債★
-                with self.settle_intent(scope, ym, kind="ledger",
-                                        witness_ym=None):
-                    self._settle_ledger_only_locked(scope, ym)
-        except Exception:
+            self._settle_ledger_only_locked(scope, ym)
+        except Exception as e:  # noqa: BLE001
+            intent.keep(str(e) or e.__class__.__name__)
             logging.exception(
                 "[roster.service] ★%s %s 手動換班後帳本未能同步重算★ ——"
-                "求解下個月之前會被閘門擋下(見 stale_settlements)", scope, ym)
+                "意圖保留,求解下個月之前也會被閘門擋下", scope, ym)
 
     def _settle_ledger_only_locked(self, scope: str, ym: str) -> None:
         """只把帳本結算到與這一份月檔的實排一致 —— ★不碰切片、不寫月檔★。
@@ -3318,7 +3509,9 @@ class RosterService:
         #   切片(`recompute_saturday_biopsy` 會被 finalized 守衛擋下)→
         #   那筆義務永遠留著、也永遠做不完。所以定案前先要求它清零。
         if on:
-            _left = [x for x in self.storage.load_pending_settles()
+            # ★這裡也要嚴格★(外審 RS-21 P2-02):讀不到就當成「沒有未完成
+            #   的事」的話,定案閘門會在最需要它的時候放行。
+            _left = [x for x in self.storage.load_pending_settles_strict()
                      if str(x.get("ym")) == ym]
             if _left:
                 _kinds = "、".join(sorted({self.storage.pending_kind(x)

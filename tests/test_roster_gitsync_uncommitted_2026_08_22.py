@@ -214,3 +214,38 @@ def test_an_unknown_pathspec_is_never_reported_as_clean(tmp_path):
     st._last_pathspec = None                  # ls-files 失敗的樣子
     assert st._measure_paths() is None
     assert st._canonical_dirt(st._measure_paths()), "★量不到卻說乾淨★"
+
+
+def test_the_measurement_sees_one_working_tree_snapshot(tmp_path):
+    """★列舉與量測之間不可以讓存檔插進來★(外審 RS-21 P2-04)。
+
+    `_measure_paths()`(列出有哪些正典檔)與 `git status`(量它們髒不髒)是兩個
+    動作 —— 中間 UI 只要拿到 `_tree_lock` 就能建立一個新的月檔,那一份不在剛
+    列出來的清單裡,於是量出「乾淨」。所以量測整段要持工作樹鎖。
+    (鎖序是 `_git_lock → _tree_lock`,`_commit` 本來就持著前者。)
+    """
+    _remote, work = _repo(tmp_path)
+    st = GitSyncStorage(str(work), push_debounce_sec=30.0, pull_interval_sec=0)
+    st.save_config({"r_members": [{"id": "A"}]})
+    done, held, release = threading.Event(), threading.Event(), threading.Event()
+
+    def _hold():
+        with st._tree_lock:           # 存檔正在寫工作樹的樣子
+            held.set()
+            release.wait(20)
+
+    t = threading.Thread(target=_hold, daemon=True)
+    t.start()
+    assert held.wait(5), "前提不成立:沒有真的佔住工作樹鎖"
+
+    def _commit():
+        st._commit("測試")
+        done.set()
+
+    c = threading.Thread(target=_commit, daemon=True)
+    c.start()
+    assert not done.wait(1.5), "★量測沒有與存檔互斥(列舉與 status 之間可插入)★"
+    release.set()
+    assert done.wait(10)
+    t.join(timeout=5)
+    c.join(timeout=5)

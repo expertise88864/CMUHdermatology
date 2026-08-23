@@ -219,7 +219,8 @@ class TestThePrecomputedPathsRefuseInsteadOfRetrying:
             {"2026-09-03": {"上午": {"101": ["PGY9"]}}}))
 
         real = st.load_month_snapshot
-        st.load_month_snapshot = lambda y: (month, rev)          # type: ignore
+        st.load_month_snapshot = (                              # type: ignore
+            lambda y, **kw: (month, rev))     # ★形狀要跟生產一樣★(會帶 validate=)
         try:
             with pytest.raises(StaleRosterDataError):
                 svc.accept_day_solution(

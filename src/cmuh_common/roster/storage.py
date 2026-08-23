@@ -214,14 +214,25 @@ def validate_authoritative_shape(name: str, raw: dict) -> None:
                 if _iso_or_none(k) is None:
                     bad(f"{scope} 有不是日期的鍵 {k!r}（整批國定假日會少掉它）")
     elif name == "clerk_batches.json":
+        _seen_ids: set = set()
         items = raw.get("batches")
         if items is not None and not isinstance(items, list):
             bad("batches 不是清單")
         for i, b in enumerate(items or []):
             if not isinstance(b, dict):
                 bad(f"第 {i + 1} 筆梯次不是物件（{type(b).__name__}）")
-            if not str(b.get("id") or "").strip():
-                bad(f"第 {i + 1} 筆梯次沒有 id")
+            # ★不可以要求 id★(外審 RS-21 P1-02):`ClerkBatch.from_dict`
+            #   與 `clerk_batch_key()` 都明文支援「舊資料沒有 id → 退回
+            #   start_monday」——把它判成非法,升級之後 PGY/Clerk 自動排班與
+            #   正式匯出會對一份【舊版程式自己寫出來的合法檔】整批失敗。
+            #   (開程式時的 `migrate_legacy_clerk_batch_ids()` 會補上穩定 id,
+            #   但驗證不可以依賴那次遷移已經跑過 —— 它是另一台機器的事。)
+            #   要擋的是【同一個 id 指到兩梯】:那會讓切片格網互相覆蓋。
+            _bid = str(b.get("id") or "").strip()
+            if _bid and _bid in _seen_ids:
+                bad(f"梯次 id {_bid!r} 重複(切片格網會互相覆蓋)")
+            if _bid:
+                _seen_ids.add(_bid)
             if _iso_or_none(b.get("start_monday")) is None:
                 bad(f"梯次 {b.get('id')} 的 start_monday 不是日期"
                     f"（{b.get('start_monday')!r}）")
@@ -252,6 +263,44 @@ def validate_authoritative_shape(name: str, raw: dict) -> None:
                 for e in entries:
                     if not isinstance(e, dict):
                         bad(f"週{wd} {session} 有一筆門診不是物件")
+    elif name == "week_colors.json":
+        weeks = raw.get("weeks")
+        if weeks is not None and not isinstance(weeks, dict):
+            bad(f"weeks 不是物件（{type(weeks).__name__}）—— 色塊連週是 CP-SAT "
+                f"的硬限制,整組週色靜靜消失會排出違反規則的班")
+        for k, v in (weeks or {}).items():
+            if not isinstance(v, str):
+                bad(f"{k} 的顏色不是字串（{type(v).__name__}）")
+    elif name == "ledger.json":
+        for scope in ("r", "vs"):
+            book = raw.get(scope)
+            if book is not None and not isinstance(book, dict):
+                bad(f"{scope} 不是物件（{type(book).__name__}）")
+            for mid, val in (book or {}).items():
+                if isinstance(val, bool) or not isinstance(val, (int, float)):
+                    bad(f"{scope}/{mid} 的餘額不是數字（{val!r}）")
+        hist = raw.get("history")
+        if hist is not None and not isinstance(hist, list):
+            bad(f"history 不是清單（{type(hist).__name__}）")
+        for i, e in enumerate(hist or []):
+            if not isinstance(e, dict):
+                bad(f"history 第 {i + 1} 筆不是物件")
+            deltas = e.get("deltas")
+            if deltas is not None and not isinstance(deltas, dict):
+                bad(f"history 第 {i + 1} 筆的 deltas 不是物件")
+            for mid, val in (deltas or {}).items():
+                if isinstance(val, bool) or not isinstance(val, (int, float)):
+                    bad(f"history 第 {i + 1} 筆 {mid} 的分錄不是數字（{val!r}）")
+    elif name == "biopsy.json":
+        counts = raw.get("counts")
+        if counts is not None and not isinstance(counts, dict):
+            bad(f"counts 不是物件（{type(counts).__name__}）")
+        for mid, val in (counts or {}).items():
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                bad(f"{mid} 的切片次數不是數字（{val!r}）")
+        hist = raw.get("history")
+        if hist is not None and not isinstance(hist, list):
+            bad(f"history 不是清單（{type(hist).__name__}）")
     elif name == "biopsy_grid.json":
         grid = raw.get("grid")
         if grid is not None and not isinstance(grid, dict):
@@ -262,6 +311,99 @@ def validate_authoritative_shape(name: str, raw: dict) -> None:
             for k in days:
                 if _iso_or_none(k) is None:
                     bad(f"梯次 {bid} 有不是日期的鍵 {k!r}")
+
+
+def validate_authoritative_month(ym: str, raw: dict) -> None:
+    """月檔的【內容】檢查 —— 會被靜靜濾掉的那些形狀(外審 RS-21 P2-03)。
+
+    月檔的日期鍵幾乎全部走「壞的就 warning + 跳過」:
+      * `leaves` 少一天 → ★請假的人被排上班★;
+      * `must_duty` 少一天 → 指定沒生效;
+      * `grid_overrides` 少一天 → 已經停診的診間又被排人;
+      * `{scope}_duty` 少一格 → 點數/結算/跨月銜接全部跟著錯。
+    這些都是合法 JSON,所以嚴格快照(讀得到、解析得動)照樣放行。
+    顯示路徑不走這裡(讀得到多少就顯示多少);★會寫回去/會拿來算的路徑一律
+    先過這一關★(見 `StrictSources`)。
+    """
+    def bad(why: str):
+        raise ValueError(f"{ym}.json 的內容不適合用來排班/結算：{why}。"
+                         f"請修正該月檔之後再試（顯示不受影響）。")
+
+    for scope in ("r", "vs"):
+        duty = raw.get(f"{scope}_duty")
+        if duty is not None and not isinstance(duty, dict):
+            bad(f"{scope}_duty 不是物件（{type(duty).__name__}）")
+        for k, cell in (duty or {}).items():
+            if _iso_or_none(k) is None:
+                bad(f"{scope}_duty 有不是日期的鍵 {k!r}")
+            if cell is not None and not isinstance(cell, dict):
+                bad(f"{scope}_duty {k} 不是物件（{type(cell).__name__}）")
+    for mapkey in ("leaves", "must_duty"):
+        block = raw.get(mapkey)
+        if block is not None and not isinstance(block, dict):
+            bad(f"{mapkey} 不是物件（{type(block).__name__}）")
+        for scope, per_member in (block or {}).items():
+            if per_member is not None and not isinstance(per_member, dict):
+                bad(f"{mapkey}/{scope} 不是物件")
+            for mid, days in (per_member or {}).items():
+                if days is not None and not isinstance(days, list):
+                    bad(f"{mapkey}/{scope}/{mid} 不是清單")
+                for k in (days or []):
+                    if _iso_or_none(k) is None:
+                        bad(f"{mapkey}/{scope}/{mid} 有不是日期的項目 {k!r}")
+    # ★巢狀的形狀也要驗★(外審 RS-21 R1-4):日期鍵對、值卻是 `[]` 的話,
+    #   下游一律 `or {}` —— 那一天的日排班/切片人選就這樣從正式文件裡消失,
+    #   而它是合法 JSON、日期也沒問題,每一道守衛都放行。
+    for key in ("saturday_biopsy", "biopsy_override", "grid_overrides",
+                "day_slots", "day_locks"):
+        block = raw.get(key)
+        if block is not None and not isinstance(block, dict):
+            bad(f"{key} 不是物件（{type(block).__name__}）")
+        for k, v in (block or {}).items():
+            if _iso_or_none(k) is None:
+                bad(f"{key} 有不是日期的鍵 {k!r}")
+            if v is None:
+                continue
+            if key == "biopsy_override":
+                if not isinstance(v, str):
+                    bad(f"{key} {k} 不是代號字串（{type(v).__name__}）")
+                continue
+            if not isinstance(v, dict):
+                bad(f"{key} {k} 不是物件（{type(v).__name__}）")
+            if key == "saturday_biopsy":
+                # ★葉節點也要驗★(外審 RS-21 R2-2):`"person": []` 是 falsey,
+                #   下游 `cell.get("person")` 取到之後直接當「沒排人」跳過 ——
+                #   正式留底文件就少了那一格。
+                for fld in ("person", "reason"):
+                    if fld in v and not isinstance(v[fld], str):
+                        bad(f"{key} {k} 的 {fld} 不是字串"
+                            f"（{type(v[fld]).__name__}）")
+                continue
+            for session, inner in v.items():
+                if inner is None:
+                    continue
+                if key == "day_locks":
+                    # 內層是 bool。★錯型別的 falsey 值會被靜靜當成「沒鎖」★,
+                    #   而鎖定的意思正是「不要動它」—— 那些格子會被自動排班
+                    #   覆蓋掉(見 `_overlay_locked_sessions`)。
+                    if not isinstance(inner, bool):
+                        bad(f"{key} {k}/{session} 不是布林值"
+                            f"（{type(inner).__name__}）")
+                    continue
+                if not isinstance(inner, dict):
+                    bad(f"{key} {k}/{session} 不是物件"
+                        f"（{type(inner).__name__}）")
+                for slot, people in inner.items():
+                    if people is None:
+                        continue
+                    if key == "grid_overrides":
+                        if not isinstance(people, list):
+                            bad(f"{key} {k}/{session}/{slot} 不是清單"
+                                f"（{type(people).__name__}）")
+                        continue
+                    if not isinstance(people, list):
+                        bad(f"{key} {k}/{session}/{slot} 不是清單"
+                            f"（{type(people).__name__}）")
 
 
 class RosterStorage:
@@ -635,6 +777,23 @@ class RosterStorage:
         raw = _load_json(self._path("pending_settle.json")).get("pending")
         return [x for x in (raw or []) if isinstance(x, dict)]
 
+    def load_pending_settles_strict(self) -> list:
+        """同上,★但壞檔/暫時讀不到就拋★(外審 RS-21 P2-02)。
+
+        這份檔已經不只是 log:開程式的收斂、求解前的帳本閘門、定案閘門都靠
+        它判斷「還有沒有未完成的結算」。寬鬆載入把「讀不到」正規化成「沒有
+        任何未完成的事」—— 於是收斂不跑、閘門看不到、定案照過,而那正是
+        RS-19 已經修過一次的同一個形狀(只是換一個檔)。
+        顯示路徑仍用寬鬆的 `load_pending_settles`。
+        """
+        data, _rev = self._strict_snapshot(self._path("pending_settle.json"))
+        raw = data.get("pending")
+        if raw is not None and not isinstance(raw, list):
+            raise ValueError(
+                f"pending_settle.json 的 pending 不是清單"
+                f"（{type(raw).__name__}）—— 無法確認還有沒有未完成的結算")
+        return [x for x in (raw or []) if isinstance(x, dict)]
+
     #: 意圖的種類＝★哪一個衍生物還沒被重建★(外審次輪 P2-02)。
     #:   "ledger" 點數帳本 / "biopsy" 切片計數帳本 / "all" 兩者都要
     #: 舊版紀錄沒有這個欄位 → 一律視為 "all"(兩個都重建成功才算收斂;
@@ -646,6 +805,17 @@ class RosterStorage:
         """一筆意圖紀錄的種類(不認得的值一律回 "all",寧可多重建一次)。"""
         k = str((item or {}).get("kind") or "all")
         return k if k in cls.PENDING_KINDS else "all"
+
+    def _pending_for_write(self) -> list:
+        """改這份檔之前一定要先【嚴格】讀它(外審 RS-21 R1-3)。
+
+        寬鬆讀取把「壞檔/暫時讀不到」變成空清單 —— 接著這一次寫入就把那份
+        壞檔換成「只有我這一筆」的新檔;等這次操作成功、意圖被清掉之後,
+        ★所有先前未完成的義務就永久消失了★,而之後的閘門會看到一份健康的
+        空檔案並放行。它已經是閘門的權威輸入(見 `load_pending_settles_strict`),
+        就不可以再用「讀不到＝沒有」的方式去改它。
+        """
+        return self.load_pending_settles_strict()
 
     def mark_pending_settle(self, scope: str, ym: str,
                             kind: str = "all") -> bool:
@@ -662,7 +832,7 @@ class RosterStorage:
         任何一種,此時回 False(義務是別人的,我不得清它)。
         """
         kind = kind if kind in self.PENDING_KINDS else "all"
-        cur = self.load_pending_settles()
+        cur = self._pending_for_write()   # ★改它之前一定要嚴格讀★
         for x in cur:
             if x.get("scope") != scope or x.get("ym") != ym:
                 continue
@@ -682,7 +852,7 @@ class RosterStorage:
         宣稱一致(RS-10 的教訓,種類化之後同樣成立)。
         """
         kind = kind if kind in self.PENDING_KINDS else "all"
-        cur = self.load_pending_settles()
+        cur = self._pending_for_write()   # ★改它之前一定要嚴格讀★
         left = [x for x in cur
                 if not (x.get("scope") == scope and x.get("ym") == ym
                         and self.pending_kind(x) == kind)]
@@ -702,7 +872,7 @@ class RosterStorage:
         """
         old_kind = old_kind if old_kind in self.PENDING_KINDS else "all"
         new_kind = new_kind if new_kind in self.PENDING_KINDS else "all"
-        cur = self.load_pending_settles()
+        cur = self._pending_for_write()   # ★改它之前一定要嚴格讀★
         hit = False
         out = []
         for x in cur:
@@ -938,7 +1108,8 @@ class RosterStorage:
         d.setdefault("audit", [])
         return d
 
-    def load_month_snapshot(self, ym: str) -> "tuple[dict, str]":
+    def load_month_snapshot(self, ym: str, *,
+                            validate: bool = False) -> "tuple[dict, str]":
         """→ (月檔, revision),★嚴格★:壞檔/暫時讀不到直接拋 ValueError。
 
         ★要編輯,就必須先證明基底是可信的★(2026-07-25 的教訓,外審排班 RS-6):
@@ -950,6 +1121,8 @@ class RosterStorage:
         ★會寫回去的路徑一律用這個★。
         """
         d, rev = self._strict_snapshot(self._month_path(ym))
+        if validate:
+            validate_authoritative_month(ym, d)
         return self._normalize_month(d, ym), rev
 
     def save_month(self, ym: str, data: dict, force: bool = False, *,
@@ -1074,7 +1247,7 @@ class StrictSources:
                 n, validate=True)
         self._months: dict = {}
         for ym in sorted(set(months)):
-            data, rev = storage.load_month_snapshot(ym)
+            data, rev = storage.load_month_snapshot(ym, validate=True)
             # ★「月檔存不存在」要在同一次臨界區裡定案★:`load_month_snapshot`
             #   對不存在的月份回一份預設月檔(刻意如此),所以存在與否要另外記,
             #   否則跨月連動會憑空生出一份月檔(見 `RosterStorage.month_exists`)。

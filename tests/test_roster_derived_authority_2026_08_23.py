@@ -155,8 +155,9 @@ class TestTheCarryInLedgerMatchesTheRealRoster:
         """收斂失敗(例如該月早於帳本保留期)時不擋這次編輯,但★下個月的
         求解要擋下來並說清楚是哪一個月★ —— 不可以靜靜地用舊帳排班。"""
         _accept_oct(svc)
-        monkeypatch.setattr(svc, "_converge_ledger_after_manual_edit",
-                            lambda *a, **k: None)          # 收斂失敗的樣子
+        monkeypatch.setattr(
+            RosterService, "_settle_ledger_only_locked",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("收斂壞了")))
         svc.set_cell("r", OCT, date(2026, 10, 6), "B")
         stale, _unknown = svc.stale_settlements("r", NOV)
         assert stale == [OCT]

@@ -266,8 +266,8 @@ class TestTheCrossMachineHalfIsTheCas:
         fired: list = []
         real = st.load_month_snapshot
 
-        def _hook(ym):
-            out = real(ym)
+        def _hook(ym, **kw):      # ★形狀要跟生產一樣★(現在會帶 validate=)
+            out = real(ym, **kw)
             if not fired:                      # 讀完之後,他機換上另一版班表
                 fired.append(True)
                 m = st.load_month(ym)

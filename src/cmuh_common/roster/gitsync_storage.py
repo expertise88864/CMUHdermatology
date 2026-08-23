@@ -454,7 +454,12 @@ class GitSyncStorage(RosterStorage):
         結果交給 `_set_state` 的守衛。
         """
         ok = self._commit_body(label)
-        self._uncommitted = self._canonical_dirt(self._measure_paths())
+        # ★列舉與量測要看同一個工作樹快照★(外審 RS-21 P2-04):兩者之間 UI
+        #   只要拿到 `_tree_lock` 就能建立一個新的月檔 —— 那一份不在剛列出來
+        #   的清單裡,於是量出「乾淨」。鎖序是 `_git_lock → _tree_lock`,而
+        #   這裡本來就持著 `_git_lock`,往內再拿工作樹鎖不會反序。
+        with self._tree_lock:
+            self._uncommitted = self._canonical_dirt(self._measure_paths())
         if self._uncommitted:
             logging.warning("[roster.gitsync] ★本機變更尚未 commit★：%s",
                             self._uncommitted)

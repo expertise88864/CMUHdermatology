@@ -166,10 +166,22 @@ class ScheduleApp:
         # ★上次沒完成的結算,開程式就用月檔收斂★(外審排班 P2-01):
         #   跨檔寫入無法原子,所以順序選成「月檔先、帳本後」——中斷後帳本只會
         #   落後,而它可以從月檔重算。這裡把它做掉,不必靠人記得。
+        # 舊版寫出來的梯次沒有 id(切片格網以 id 當鍵 → 兩梯會互相覆蓋);
+        # 補一個【確定性】的 id,兩台各自跑會得到同一份內容(外審 RS-21 P1-02)。
+        try:
+            self.service.migrate_legacy_clerk_batch_ids()
+        except Exception:
+            logging.exception("[roster] 舊梯次補 id 失敗（不擋開啟）")
         try:
             self.service.reconcile_pending_settles()
         except Exception:
             logging.exception("[roster] 收斂未完成的結算失敗（不擋開啟）")
+        # 升級前就已經與實排不一致的帳本不會自己好 —— 用月檔重建一次
+        # (外審 RS-21 P2-05;不是「蓋一顆識別上去」,見該方法說明)。
+        try:
+            self.service.migrate_legacy_ledger_digests()
+        except Exception:
+            logging.exception("[roster] 舊帳本分錄重建失敗（不擋開啟）")
         # 同理:梯次起始日改了、切片格網還沒跟著平移(外審次輪 P2-05)。
         # 格網若停在舊日期,那些格子會落在梯次涵蓋範圍外而被直接忽略 ——
         # 切片室整梯看起來沒開,而畫面上完全看不出來。
