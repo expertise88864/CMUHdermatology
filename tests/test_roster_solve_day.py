@@ -441,7 +441,7 @@ def test_rf09_cross_month_biopsy_continuity():
     b = ClerkBatch("b", date(2026, 7, 27), ["1", "2"])       # 7/27 起跨進 8 月
     inp = DaySolveInput(
         ym="2026-08", grid=grid, pgy_roster=["A"], clerk_batches=[b],
-        biopsy_open={"2026-08-03": {"上午": True}},
+        biopsy_open={"b": {"2026-08-03": {"上午": True}}},   # 依梯次 id
         prior_sessions={"2026-07-30": {"上午": {BIOPSY: ["1"]}}})
     day_slots, _log, _w = month_solve_day(inp)
     assert day_slots["2026-08-03"]["上午"][BIOPSY] == ["2"]   # "1" 上月已輪 → 選 "2"

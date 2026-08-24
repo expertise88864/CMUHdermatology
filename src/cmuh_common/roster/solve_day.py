@@ -588,7 +588,15 @@ class DaySolveInput:
     grid: dict                    # {date: {session: [rooms]}}（clinic_grid.month_grid）
     pgy_roster: list              # 該月 PGY 代號
     clerk_batches: list = field(default_factory=list)  # ClerkBatch 樣（.covers/.members/.id）
-    biopsy_open: dict = field(default_factory=dict)   # {iso: {session: bool}}
+    # ★只給 RF-08 仲裁用的完整梯次順序★(外審 RS-26 R3):`clerk_batches` 的
+    #   契約是「涵蓋本月的梯次」(統計/側欄/報告照它列人),不可以為了仲裁把
+    #   鄰居塞進去。而勝者是【逐日】判定的,配額的定義域又是整梯 —— 上個月
+    #   某一天的勝者可能是一個本月開始前就結束的梯次。空 = 退回
+    #   `clerk_batches`(直接呼叫求解器的測試/工具)。
+    batch_order: list = field(default_factory=list)
+    # ★依梯次★(外審 2026-08-24 P2-01):壓平成全域 map 的話,重疊梯次的敗者
+    #   設定會污染勝者(RF-08 只採原始順序第一個)。{batch_id: {iso: {時段: bool}}}
+    biopsy_open: dict = field(default_factory=dict)
     leaves: dict = field(default_factory=dict)        # {"pgy":{c:set},"clerk":{c:set}}
     capacity: int = 2
     locked: dict = field(default_factory=dict)        # {iso: {session: slots}} 鎖定不重排
@@ -599,6 +607,9 @@ class DaySolveInput:
     #   允許勾選所有平日,不會因為後來變成假日而自動取消;而那一天在該月的
     #   `month_grid` 裡根本不存在,永遠排不到)。
     holidays: set = field(default_factory=set)
+    # [RS-26] 整梯真正開診的日子(本月 + 下個月的格網;`build_day_input` 算)。
+    #   空集合 = 呼叫端沒算 → 退回「只用假日/週末過濾」的舊行為。
+    course_days: set = field(default_factory=set)
     apply_pref: set = field(default_factory=set)  # Apply 本科 PGY（101 週二/五平手優先）
 
 
@@ -736,6 +747,12 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
 
 def _solve_month_once(inp: DaySolveInput) -> tuple:
     """單趟整月填充 → (day_slots, log, warnings, fc)。fc 供測試檢視公平計數。"""
+    # ★仲裁只有一份順序★:★凡是要問「這一天由哪一梯做主」的地方都用它★
+    #   (主迴圈、可排時段序列、配額分母、鎖定掃描、RF-09 上月回放…)——
+    #   免得「哪些梯次參與仲裁」在不同地方各有一套。
+    #   ☆這裡刻意不寫「共 N 個地方」☆:數字會隨程式演進而錯,性質不會
+    #   (外審 RS-26 R4 就是漏掉了第五個)。
+    _order = list(inp.batch_order or inp.clerk_batches)
     fc = FairCounters()
     day_slots: dict = {}
     log: list = []
@@ -754,7 +771,12 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
             d = date.fromisoformat(iso)
         except (ValueError, TypeError):
             continue
-        batch = next((b for b in inp.clerk_batches if b.covers(d)), None)
+        # ★回放的梯次也要由完整的勝者順序決定★(外審 RS-26 R4):那一天的
+        #   勝者可能是【只供仲裁的鄰居梯次】—— 而 Clerk 代號跨梯會重用,
+        #   把屬於 b0/C1 的既存切片記進 b1/C1 的話,本月會多扣他一次配額
+        #   (公平計數刻意用 `(梯次, 代號)` 隔開,選錯梯次等於繞過那道隔離)。
+        #   勝者是鄰居時就用【它自己】的命名空間回放:本月不排它,計數互不干擾。
+        batch = next((b for b in _order if b.covers(d)), None)
         if batch is None:
             continue
         members = set(batch.members)
@@ -787,7 +809,7 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
         if is_weekend(_d):
             continue
         _iso = _d.isoformat()
-        _cov = [b for b in inp.clerk_batches if b.covers(_d)]
+        _cov = [b for b in _order if b.covers(_d)]
         if not _cov:
             continue
         for _s in STUDENT_SESSIONS:
@@ -795,7 +817,8 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
                 continue
             if _d.weekday() == WED and _s == "下午":
                 continue
-            if not (inp.biopsy_open.get(_iso) or {}).get(_s):
+            if not ((inp.biopsy_open.get(_cov[0].id) or {}).get(_iso)
+                    or {}).get(_s):
                 continue
             _bio_seq.append((_iso, _s, _cov[0].id))
     _bio_pos: dict = {}
@@ -815,25 +838,40 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
     #   跨月梯次到了第二個月一定看得到上個月的日期,若拿「有沒有格網外的
     #   日期」當判準,最終那一次的差異就永遠不會被點名。要看的是【未來】。
     _batch_more: dict = {}
-    for _iso, _sess in (inp.biopsy_open or {}).items():
-        try:
-            _bd = date.fromisoformat(_iso)
-        except (ValueError, TypeError):
+    for _bid, _days in (inp.biopsy_open or {}).items():
+        _bat = next((b for b in inp.clerk_batches if b.id == _bid), None)
+        if _bat is None:
             continue
-        if is_weekend(_bd) or _bd in (inp.holidays or set()):
-            continue        # ★假日不會出現在任何月份的格網裡 → 不是可排的量★
-        _bcov = [b for b in inp.clerk_batches if b.covers(_bd)]
-        if not _bcov:
-            continue
-        for _s, _on in (_sess or {}).items():
-            if not _on or _s not in STUDENT_SESSIONS:
+        for _iso, _sess in (_days or {}).items():
+            try:
+                _bd = date.fromisoformat(_iso)
+            except (ValueError, TypeError):
                 continue
-            if _bd.weekday() == WED and _s == "下午":
-                continue                # 週三下午恆關
-            _bio_slots.setdefault(_bcov[0].id, set()).add((_iso, _s))
-            if (_iso not in _grid_days and _grid_last is not None
-                    and _bd > _grid_last):
-                _batch_more[_bcov[0].id] = True
+            if not _bat.covers(_bd):
+                continue
+            # ★分母也要套 RF-08 的勝者判準★(外審 RS-26 R1 P2):重疊日只有
+            #   原始順序第一個梯次排得到人 —— 敗者在那些日子的開放是它
+            #   【永遠排不到】的量,算進它自己的分母會把配額撐大。
+            _wins = [b for b in _order if b.covers(_bd)]
+            if not _wins or _wins[0].id != _bid:
+                continue
+            if is_weekend(_bd) or _bd in (inp.holidays or set()):
+                continue    # ★假日不會出現在任何月份的格網裡 → 不是可排的量★
+            # ★「那一天到底開不開診」要用該月的格網★(外審 2026-08-24 P1-01):
+            #   切片格網的 UI 允許勾選所有平日,而下個月那一天可能整天停診 ——
+            #   算進分母就撐出一個補不完的配額。`course_days` 是本月 + 下個月
+            #   真正開診的日子;呼叫端沒算(空集合)時退回舊行為。
+            if inp.course_days and _iso not in inp.course_days:
+                continue
+            for _s, _on in (_sess or {}).items():
+                if not _on or _s not in STUDENT_SESSIONS:
+                    continue
+                if _bd.weekday() == WED and _s == "下午":
+                    continue            # 週三下午恆關
+                _bio_slots.setdefault(_bid, set()).add((_iso, _s))
+                if (_iso not in _grid_days and _grid_last is not None
+                        and _bd > _grid_last):
+                    _batch_more[_bid] = True
     # ★鎖定時段已經指派的切片要算數★(外審 Codex RS-24 P2):它不在 `_bio_seq`
     #   裡(鎖定時段不重排),但那個人【確實會】切到 —— 不排除的話,期限會把
     #   一個已經有著落的人再補一次,還可能因此擠掉真正沒輪到的人。
@@ -847,6 +885,10 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
     #   把這些時段算進去(它們確實有人切)。
     _locked_bx: dict = {}               # {(梯次, 代號): [(順序, 日期)…]}
     _locked_n: dict = {}                # {梯次: 鎖定時段的切片總數}
+    #   ★鎖定時段【不是】還能分給別人的容量★(外審 RS-26 R1 P2):它算進配額
+    #   分母(那一格確實有人切),但可行性匹配若把它當成「之後還排得到」的
+    #   機會,就會虛構出一個不存在的未來 → 今天挑錯人。
+    _locked_keys: dict = {}             # {梯次: {(日期, 時段)}}
     #   ★鎖定時段一律先從分母拿掉★(外審 Codex 配額版 R2):它不重排,所以
     #   「本來標示開放」不代表排得到人 —— 只有那一格【確實指派給本梯成員】
     #   時才把它加回去(那個人真的會切一次)。空的鎖定格、或指派給未知/
@@ -860,7 +902,7 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
             _ld = date.fromisoformat(_iso)
         except (ValueError, TypeError):
             continue
-        _lcov = [b for b in inp.clerk_batches if b.covers(_ld)]
+        _lcov = [b for b in _order if b.covers(_ld)]
         if not _lcov:
             continue
         if _iso not in _grid_days:
@@ -872,6 +914,7 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
         for _s, _slots in (_sessions or {}).items():
             if _s not in STUDENT_SESSIONS:
                 continue
+            _locked_keys.setdefault(_lcov[0].id, set()).add((_iso, _s))
             _bio_slots.setdefault(_lcov[0].id, set()).discard((_iso, _s))
             for _c in ((_slots or {}).get(BIOPSY) or []):
                 if str(_c) not in _lmembers:
@@ -893,7 +936,7 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
         # RF-08：同日可能被多個梯次涵蓋（設定允許同週一多梯、或起始日打錯部分重疊）。
         # 維持與原 next() 相同的決定性勝者＝原始順序第一個；其餘梯次成員該日不排，
         # 累積重疊區間於迴圈後一次示警（點名被忽略的梯次與實際重疊日期）。
-        covering_today = [b for b in inp.clerk_batches if b.covers(d)]
+        covering_today = [b for b in _order if b.covers(d)]
         batch = covering_today[0] if covering_today else None
         for loser in covering_today[1:]:
             rng = overlap_days.setdefault((batch.id, loser.id), [d, d])
@@ -916,7 +959,9 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
                 continue
             rooms = (inp.grid.get(d) or {}).get(session) or []
             # 週三下午跟診關閉但治療室照開 → 該時段仍需跑（rooms 為 []）
-            biopsy = bool((inp.biopsy_open.get(iso) or {}).get(session))
+            # ★向勝者梯次拿它自己的切片開放★(外審 2026-08-24 P2-01)
+            biopsy = bool(((inp.biopsy_open.get(batch_key) or {}).get(iso)
+                           or {}).get(session))
             # [RS-24] 配額:整梯開放時段數 ÷ 人數(取整)。★每個人切一樣多★,
             #   多出來的時段留空。開放數少於人數時取 1(排得到的人先輪,
             #   輪不到的由月底警告點名 —— 設計文件 C4 的語意)。
@@ -941,8 +986,19 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
                 # ★還缺的次數★(每人重複出現他還缺的次數)——請假會讓某些人的
                 #   機會被吃掉,判準是「放掉這一格之後還配不配得完」。
                 _todo = [c for c in _members for _ in range(_quota.get(c, 0))]
-                _later = [i2 for i2, s2, b2 in _bio_seq[_pos + 1:]
-                          if b2 == batch_key]
+                # ★可行性的視野要跟配額的視野一樣長★(外審 2026-08-24 P1-01):
+                #   只看本月剩下的時段,跨月梯次在本月最後一格會誤判成「誰去
+                #   都行」—— 而下個月那一格他可能請假。用整梯的時段集合,
+                #   取【這一格之後】的部分(含下個月),請假由 `free` 判斷。
+                _now_key = (iso, STUDENT_SESSIONS.index(session)
+                            if session in STUDENT_SESSIONS else 0)
+                #   ★鎖定時段要扣掉★:它在分母裡(有人切),但不是還能分給
+                #   別人的機會 —— 當成未來容量會高估可行性、今天挑錯人。
+                _free_slots = (_bio_slots.get(batch_key, set())
+                               - _locked_keys.get(batch_key, set()))
+                _later = [i2 for i2, s2 in sorted(_free_slots)
+                          if (i2, STUDENT_SESSIONS.index(s2)
+                              if s2 in STUDENT_SESSIONS else 0) > _now_key]
                 _force = _biopsy_forced_today(
                     _todo, _later,
                     # ★今天排得到他嗎★要跟正式排班同一個條件

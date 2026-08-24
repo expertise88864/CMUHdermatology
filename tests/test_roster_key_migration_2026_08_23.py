@@ -60,7 +60,13 @@ def _legacy_grid(svc, key="", iso="2026-10-06"):
 
 
 def _biopsy_open(svc, ym=OCT):
-    return svc.build_day_input(ym).biopsy_open
+    """整梯的切片開放內容(★不含梯次 id★:遷移本來就會換 id,這裡要比的是
+    「那些開放時段有沒有跟著搬過去」——身分本身由別的測試釘)。"""
+    out: dict = {}
+    for _bid, days in (svc.build_day_input(ym).biopsy_open or {}).items():
+        for iso, sess in (days or {}).items():
+            out.setdefault(iso, {}).update(sess)
+    return out
 
 
 # ══ P1-01 改主鍵就要改外鍵 ═══════════════════════════════════════════════

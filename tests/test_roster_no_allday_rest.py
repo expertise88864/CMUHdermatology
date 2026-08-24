@@ -142,7 +142,7 @@ def test_month_allday_rest_only_on_closed_afternoons():
     batch = ClerkBatch("b1", date(2026, 8, 3), ["1", "2", "3", "4", "5"])
     day_slots, _log, _w = month_solve_day(DaySolveInput(
         ym="2026-08", grid=grid, pgy_roster=["A", "B", "C", "D"],
-        clerk_batches=[batch], biopsy_open=bio))
+        clerk_batches=[batch], biopsy_open={batch.id: bio}))
     photo, tx, biopsy, seat = {}, {}, {}, {}
     for iso in sorted(day_slots):
         d = date.fromisoformat(iso)

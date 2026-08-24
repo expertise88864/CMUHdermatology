@@ -138,6 +138,13 @@ def _load_json(path: str) -> dict:
     return _parse_json_bytes(_read_bytes(path), path)
 
 
+def next_ym(ym: str) -> str:
+    """下一個月份字串。★Clerk 梯次是兩週、可以跨月★——排本月時,梯次的
+    後半段在下個月,而那半段的請假/停診決定了「配額補不補得完」。"""
+    y, m = int(ym[:4]), int(ym[5:7])
+    return f"{y + 1}-01" if m == 12 else f"{y}-{m + 1:02d}"
+
+
 def prev_ym(ym: str) -> str:
     """上一個月的 YYYY-MM(跨年)。★這個推導只有一份★ —— 求解、切片跨月週五、
     公平計數回放、跨月銜接各自寫一次的話,遲早有一處在 1 月時算成同一年。"""

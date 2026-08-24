@@ -60,6 +60,7 @@ from cmuh_common.roster.storage import (
     RosterStorage,
     StaleRosterDataError,
     StrictSources,
+    next_ym,
     prev_ym,
 )
 
@@ -462,8 +463,8 @@ class RosterService:
         self.storage = storage
 
     # ── 讀取組裝 ────────────────────────────────────────────────────────
-    def _sources(self, ym: str, names) -> StrictSources:
-        """這條權威路徑的輸入,一次嚴格讀完(本月 + 上月)。
+    def _sources(self, ym: str, names, *, months=()) -> StrictSources:
+        """這條權威路徑的輸入,一次嚴格讀完(本月 + 上月 + `months`)。
 
         ★呼叫端必須持有 `write_barrier`★:一次讀好幾個檔,臨界區外的話它們
         彼此就不是同一個時間點的內容 —— 而「整批一致」正是這個包裝的用意。
@@ -471,7 +472,11 @@ class RosterService:
         切片連動、Clerk 跨月公平計數回放都要讀它,而它讀不到的後果與本月
         讀不到一樣是【安靜地少一段限制】。
         """
-        return self.storage.strict_sources(names, (prev_ym(ym), ym))
+        # ★`months` 只給真的需要的路徑加★(外審 2026-08-24 P1-01):日排班的
+        #   Clerk 梯次是兩週、可以跨月,所以它要多讀下個月;其他路徑不該因此
+        #   多一個 fail-closed 的來源(下個月的月檔壞掉不該擋住本月結算)。
+        return self.storage.strict_sources(
+            names, (prev_ym(ym), ym) + tuple(months))
 
     def solver_ledger(self, scope: str, ym: str, *,
                       src: "StrictSources | None" = None) -> dict:
@@ -632,7 +637,10 @@ class RosterService:
         writer 相信 service 給的 payload,於是使用者拿到一份【格式正常、
         少班少姓名少日排班】的正式班表,而且看不出哪裡不對。
         """
-        src = self._sources(ym, SRC_EXPORT)
+        # ★匯出也會走 `build_day_input`(要開診格網)→ 它現在需要下個月★
+        #   (RS-26:Clerk 梯次是兩週、可以跨月;宣告不足會當場拋,不會靜默
+        #    退回寬鬆讀取 —— 那正是 `StrictSources` 的用意)。
+        src = self._sources(ym, SRC_EXPORT, months=(next_ym(ym),))
         cfg = src.load_config()
         month = src.load_month(ym)
         y, m = int(ym[:4]), int(ym[5:7])
@@ -706,6 +714,7 @@ class RosterService:
         y, m = int(ym[:4]), int(ym[5:7])
         holidays = st.holidays_set()
         template = st.load_clinic_template().get("template") or {}
+
         grid = month_grid(ym, template, holidays,
                           month.get("grid_overrides") or {})
 
@@ -726,6 +735,29 @@ class RosterService:
                                for x in st.load_clerk_batches())
                    if b is not None]
         covering = batches_covering(batches, y, m)     # 逐日在 solve 時再依 covers 分配
+        # ★勝者判準要看得到鄰居★(外審 RS-26 R2 P2):RF-08 的「原始順序第一個」
+        #   是【逐日】判定的,而配額的分母涵蓋整梯(含上個月那半段)——
+        #   上個月某一天的勝者可能是一個【本月開始前就結束】的梯次。只送
+        #   `covering` 的話,求解器看不到它就誤以為自己勝出,把那些永遠排不到
+        #   的時段算進自己的配額。
+        #   ★只加「與 active 梯次的整梯範圍重疊」的鄰居★:全部送進去會讓
+        #   毫不相干的梯次也進指紋(改 12 月的梯次讓 8 月的預覽過期)。
+        #   ★順序要照原始清單★:勝者判準本身就是「原始順序第一個」。
+        #   ★不可以借用 `clerk_batches`★(外審 RS-26 R3):那個欄位有既有契約
+        #   ——「涵蓋本月的梯次」,`day_course_stats`/側欄/報告都照它列人。
+        #   把鄰居塞進去會讓本月的統計多出一個上個月就結束的梯次。
+        _cov_ids = {b.id for b in covering}
+        _spans = [(b.start_monday, b.start_monday + timedelta(days=13))
+                  for b in covering]
+        batch_order = [
+            b for b in batches
+            if b.id in _cov_ids
+            or any(b.start_monday <= e and s0 <= b.start_monday +
+                   timedelta(days=13) for s0, e in _spans)]
+        # ★切片開放要保留「是哪一梯的」★(外審 2026-08-24 P2-01):壓平成全域
+        #   map 之後,重疊梯次(RF-08 只採原始順序第一個)的敗者設定會污染勝者
+        #   —— 勝者的 Clerk 會被叫去一個其實只替敗者開的切片室,或者反過來
+        #   被敗者關掉。勝者政策要貫穿【所有】輸入維度,不只人員名單。
         bio_all = st.load_biopsy_grid()
         biopsy_open: dict = {}
         for b in covering:
@@ -735,12 +767,37 @@ class RosterService:
                         continue
                 except (ValueError, TypeError):
                     continue
-                biopsy_open.setdefault(iso, {}).update(sess)
+                biopsy_open.setdefault(b.id, {}).setdefault(iso, {}).update(sess)
 
+        # ★請假的視野要跟梯次一樣長★(外審 2026-08-24 P1-01):配額的分母是
+        #   【整梯】的開放時段,而「補不補得完」要看每個人哪幾天在 —— 下個月
+        #   那半段的請假存在下個月的月檔裡。只讀本月的話,求解會在【存在可行
+        #   解】時排出補不完的結果(跨月梯次的最後一格挑錯人),而套用時的過期
+        #   閘門也看不到那筆請假(它根本不在這次求解的輸入裡)。
+        _nxt = next_ym(ym)
+        # ★沒有月檔 ≠ 沒有開診★:月檔只提供 override/請假,開診日由門診模板
+        #   與年度假日決定 —— 讀不到就當「沒有 override」,不是「整月沒診」。
+        #   (`load_month` 對不存在的月份回一份預設月檔,刻意如此。)
+        _nxt_month = st.load_month(_nxt)
         leaves = {
             "pgy": _parse_date_map((month.get("leaves") or {}).get("pgy") or {}),
             "clerk": _parse_date_map((month.get("leaves") or {}).get("clerk") or {}),
         }
+        for _c, _ds in _parse_date_map(
+                (_nxt_month.get("leaves") or {}).get("clerk") or {}).items():
+            leaves["clerk"].setdefault(_c, set()).update(_ds)
+        # ★「那一天到底開不開診」也要看得到★:切片格網的 UI 允許勾選所有平日,
+        #   而那一天可能是假日或整天停診 —— 那不是可分配的量,算進分母會撐出
+        #   一個補不完的配額。
+        #   ★三個月都要★(外審 RS-26 R1 P1):梯次是兩週,它可以【從上個月開始】
+        #   也可以【延到下個月】—— 只放本月+下月的話,求解 9 月時 8/31 起的
+        #   那一梯會被腰斬成只剩 9 月,配額算出來遠低於整梯的正解。
+        course_days: set = {d.isoformat() for d in grid}
+        for _om in (prev_ym(ym), _nxt):
+            course_days |= {
+                d.isoformat() for d in month_grid(
+                    _om, template, holidays,
+                    st.load_month(_om).get("grid_overrides") or {})}
         # 鎖定時段：以「目前 day_slots 內容」為鎖定值（自動排班時保留、只重排其餘）
         day_slots = month.get("day_slots") or {}
         locked: dict = {}
@@ -773,10 +830,14 @@ class RosterService:
 
         return DaySolveInput(
             ym=ym, grid=grid, pgy_roster=list(pgy_roster),
-            clerk_batches=covering, biopsy_open=biopsy_open, leaves=leaves,
+            clerk_batches=covering, batch_order=batch_order,
+            biopsy_open=biopsy_open, leaves=leaves,
             # [RS-24] 整梯配額的分子要濾掉假日(切片格網含跨月日期,而那些
             #   日子在該月的 `month_grid` 裡可能根本不存在)。
             holidays=set(holidays),
+            # [RS-26] 整梯真正開診的日子(本月 + 下個月的格網)——配額的分母與
+            #   「之後還補不補得完」都用它,不再只憑切片格網的勾選。
+            course_days=course_days,
             capacity=RosterParams.from_config(cfg).room_capacity, locked=locked,
             prior_sessions=prior_sessions, prior_pgy=prior_pgy,
             apply_pref={str(c) for c in (month.get("pgy_apply_pref") or [])})
@@ -836,7 +897,7 @@ class RosterService:
         # ★驗證用的輸入也要是權威的★(外審 2026-08-22 P1-01):門診模板/梯次/
         #   名單任一讀不到時,寬鬆載入會回空 —— 求解那次若讀到同一個空狀態,
         #   兩邊指紋相等就放行,而那份班表少了整批診間或整批 Clerk。
-        src = self._sources(ym, SRC_DAY)
+        src = self._sources(ym, SRC_DAY, months=(next_ym(ym),))
         month, rev = src.month_snapshot(ym)
         if month.get("finalized"):
             raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能套用")

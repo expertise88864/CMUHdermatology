@@ -38,8 +38,9 @@ MON = date(2026, 8, 3)          # 週一(梯次起始)
 
 
 def _grid(start: date, days: int, rooms_am, rooms_pm, open_cap=None,
-          am_only: bool = False) -> tuple:
-    """→ (grid, biopsy_open):平日早/午都開診;切片室開 `open_cap` 個時段
+          am_only: bool = False, bid: str = "b1") -> tuple:
+    """→ (grid, {梯次: {iso: {時段: bool}}}):平日早/午都開診;切片室開
+    `open_cap` 個時段
     (None = 全開;週三下午恆關,不計入)。
 
     `am_only`＝每天只開上午那一個切片時段 —— ★同日早+午不得同一人★,
@@ -62,7 +63,9 @@ def _grid(start: date, days: int, rooms_am, rooms_pm, open_cap=None,
                         left -= 1
             bio[d.isoformat()] = day
         d += timedelta(days=1)
-    return grid, bio
+    # ★切片開放是【依梯次】的★(外審 2026-08-24 P2-01):重疊梯次時,壓平的
+    #   全域 map 會讓敗者的設定污染勝者。
+    return grid, {bid: bio}
 
 
 def _counts(day_slots: dict) -> tuple:
@@ -301,8 +304,8 @@ class TestTheWholeBatchOutcome:
         """
         grid, _bio = _grid(MON, 12, ["101", "102"], ["101", "102"])
         tue = MON + timedelta(days=1)
-        bio = {MON.isoformat(): {"上午": True},      # 只開兩個時段,分在兩天
-               tue.isoformat(): {"上午": True}}
+        bio = {"b1": {MON.isoformat(): {"上午": True},   # 只開兩個時段,分在兩天
+                      tue.isoformat(): {"上午": True}}}
         away = {MON + timedelta(days=i) for i in range(1, 12)}
         day_slots, _log, warns = month_solve_day(DaySolveInput(
             ym="2026-08", grid=grid, pgy_roster=["P1"],
@@ -341,6 +344,10 @@ class TestTheWholeBatchOutcome:
         「已經有著落」而永遠不補。"""
         grid, bio = _grid(MON, 26, ["101", "102", "103"],
                           ["101", "102", "103"])
+        bio = {"b1": {iso: v for iso, v in bio["b1"].items()
+                      if date.fromisoformat(iso) < MON + timedelta(days=14)},
+               "b2": {iso: v for iso, v in bio["b1"].items()
+                      if date.fromisoformat(iso) >= MON + timedelta(days=14)}}
         b2_day = [d for d in sorted(grid) if d >= MON + timedelta(days=14)][2]
         locked = {b2_day.isoformat(): {"下午": {BIOPSY: ["C1"]}}}
         day_slots, _log, warns = month_solve_day(DaySolveInput(
@@ -368,7 +375,7 @@ class TestTheWholeBatchOutcome:
         """
         # 本月的格網只涵蓋梯次的前半(第一週),後半的開放時段在格網外。
         grid, _b = _grid(MON, 5, ["101", "102", "103"], ["101", "102", "103"])
-        bio: dict = {}
+        flat: dict = {}
         opened = 0
         d = MON
         while d < MON + timedelta(days=12) and opened < 16:
@@ -377,10 +384,11 @@ class TestTheWholeBatchOutcome:
                     if d.weekday() == 2 and sess == "下午":
                         continue
                     if opened < 16:
-                        bio.setdefault(d.isoformat(), {})[sess] = True
+                        flat.setdefault(d.isoformat(), {})[sess] = True
                         opened += 1
             d += timedelta(days=1)
-        in_grid = sum(1 for iso, ss in bio.items() if date.fromisoformat(iso)
+        bio = {"b1": flat}
+        in_grid = sum(1 for iso, ss in flat.items() if date.fromisoformat(iso)
                       in grid for _s, on in ss.items() if on)
         assert (opened, in_grid) == (16, 9), (opened, in_grid)
         members = ["C1", "C2", "C3", "C4", "C5"]
@@ -402,7 +410,8 @@ class TestTheWholeBatchOutcome:
         """
         grid, bio = _grid(MON, 12, ["101", "102", "103"],
                           ["101", "102", "103"], open_cap=4, am_only=True)
-        days = [d for d in sorted(grid) if bio.get(d.isoformat())][:4]
+        days = [d for d in sorted(grid)
+                if bio["b1"].get(d.isoformat())][:4]
         day_slots, _log, warns = month_solve_day(DaySolveInput(
             ym="2026-08", grid=grid, pgy_roster=["P1"],
             clerk_batches=[ClerkBatch("b1", MON, ["C1", "C2"])],
@@ -441,7 +450,8 @@ class TestTheWholeBatchOutcome:
         """
         grid, bio = _grid(MON, 12, ["101", "102", "103"],
                           ["101", "102", "103"], open_cap=4, am_only=True)
-        days = [d for d in sorted(grid) if bio.get(d.isoformat())]
+        days = [d for d in sorted(grid)
+                if bio["b1"].get(d.isoformat())]
         locked = {days[0].isoformat(): {"上午": {BIOPSY: ["XX"]}}}
         day_slots, _log, _warns = month_solve_day(DaySolveInput(
             ym="2026-08", grid=grid, pgy_roster=["P1"],
@@ -461,12 +471,13 @@ class TestTheWholeBatchOutcome:
         把 2 個假日也算進去的話 cap 變 `7//2 = 3` → 5 格全填 → 3/2 不一致。
         """
         grid, _b = _grid(MON, 8, ["101", "102"], ["101", "102"])
-        bio: dict = {}
+        flat: dict = {}
         for d in sorted(grid)[:5]:
-            bio[d.isoformat()] = {"上午": True}
+            flat[d.isoformat()] = {"上午": True}
         hol = [MON + timedelta(days=7), MON + timedelta(days=8)]
         for d in hol:
-            bio[d.isoformat()] = {"上午": True}
+            flat[d.isoformat()] = {"上午": True}
+        bio = {"b1": flat}
         day_slots, _log, _warns = month_solve_day(DaySolveInput(
             ym="2026-08", grid=grid, pgy_roster=["P1"],
             clerk_batches=[ClerkBatch("b1", MON, ["C1", "C2"])],
@@ -487,8 +498,9 @@ class TestTheWholeBatchOutcome:
         grid, _b = _grid(MON, 8, ["101", "102"], ["101", "102"])
         hol = MON + timedelta(days=7)
         grid.pop(hol, None)                       # 假日不在格網裡
-        bio = {d.isoformat(): {"上午": True} for d in sorted(grid)[:3]}
-        bio[hol.isoformat()] = {"上午": True}
+        flat = {d.isoformat(): {"上午": True} for d in sorted(grid)[:3]}
+        flat[hol.isoformat()] = {"上午": True}
+        bio = {"b1": flat}
         locked = {hol.isoformat(): {"上午": {BIOPSY: ["C1"]}}}
         day_slots, _log, _warns = month_solve_day(DaySolveInput(
             ym="2026-08", grid=grid, pgy_roster=["P1"],
@@ -510,12 +522,13 @@ class TestTheWholeBatchOutcome:
         """
         start = MON - timedelta(days=7)           # 梯次從上週一開始
         grid, _b = _grid(MON, 5, ["101", "102"], ["101", "102"])
-        bio: dict = {}
+        flat: dict = {}
         for d in (start, start + timedelta(days=1)):
-            bio[d.isoformat()] = {"上午": True}   # 上月那半段(格網外、已過去)
+            flat[d.isoformat()] = {"上午": True}  # 上月那半段(格網外、已過去)
         days = sorted(grid)[:3]
         for d in days:
-            bio[d.isoformat()] = {"上午": True}
+            flat[d.isoformat()] = {"上午": True}
+        bio = {"b1": flat}
         day_slots, _log, warns = month_solve_day(DaySolveInput(
             ym="2026-08", grid=grid, pgy_roster=["P1"],
             clerk_batches=[ClerkBatch("b1", start, ["C1", "C2"])],

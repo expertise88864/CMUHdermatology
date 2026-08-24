@@ -78,7 +78,8 @@ def test_build_day_input_defaults_pgy_from_config(tmp_path):
 def test_build_day_input_with_clerk_and_biopsy(tmp_path):
     inp = _svc(tmp_path, with_clerk=True).build_day_input(YM)
     assert [b.members for b in inp.clerk_batches] == [["1", "2"]]
-    assert inp.biopsy_open["2026-08-03"]["上午"] is True
+    # [RS-26] 切片開放依梯次(勝者政策要貫穿所有輸入維度)
+    assert inp.biopsy_open["b1"]["2026-08-03"]["上午"] is True
 
 
 def test_run_and_accept_day_solution(tmp_path):
