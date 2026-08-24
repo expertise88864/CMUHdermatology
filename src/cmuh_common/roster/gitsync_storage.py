@@ -162,7 +162,8 @@ class GitSyncStorage(RosterStorage):
                    # ★梯次平移的意圖同理★(外審次輪 P2-05):它是「這一梯的
                    #   切片格網可能還停在舊日期,請對齊」這件事本身;只留在
                    #   中斷的那台機器,別台拉到新起始日配舊格網卻毫不知情。
-                   "pending_grid_shift.json", ".gitignore")
+                   "pending_grid_shift.json",
+        "pending_rename.json", ".gitignore")
     _SYNC_DIRS = ("months",)          # months/YYYY-MM.json（含刪除）
 
     def _is_canonical_path(self, rel: str) -> bool:

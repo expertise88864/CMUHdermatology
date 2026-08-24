@@ -179,9 +179,14 @@ class TestRenameDoesNotLaunderAStaleSettlement:
             input_fingerprint=rvs_input_fingerprint(ctx),
             month_revision=svc.storage.load_month_snapshot(OCT)[1]))
 
-    def test_a_pre_existing_mismatch_is_not_washed_away(self, svc):
-        """★反例本體★:改名前那筆結算就已經對不上(人工合併/舊版狀態),
-        改名之後無條件重算識別 = 把唯一的證據抹掉,下個月照樣用舊帳排。"""
+    def test_a_pre_existing_mismatch_stays_blocking(self, svc):
+        """★反例本體★:改名前那筆結算就已經對不上(人工合併/舊版狀態)。
+
+        改名不可以把它洗成 fresh(RS-22),★也不可以降級成「無從查證」★
+        (外審 RS-23 P2-01)—— 那一級只出警告、不擋求解,而系統在改名之前
+        已經【證明】過它與班表不一致;改名沒有提供任何新證據說它突然安全了。
+        證據改成一筆 durable 的義務:閘門照樣擋,而且收斂端修得掉(有出口)。
+        """
         self._accept(svc)
         m = svc.storage.load_month(OCT)          # 繞過自動收斂,造出 stale
         m["r_duty"]["2026-10-06"] = {"person": "B", "locked": False,
@@ -189,9 +194,68 @@ class TestRenameDoesNotLaunderAStaleSettlement:
         svc.storage.save_month(OCT, m)
         assert svc.stale_settlements("r", NOV)[0] == [OCT], "前提不成立"
         svc.rename_member("r", "A", "R1")
-        stale, unknown = svc.stale_settlements("r", NOV)
-        assert stale == [] and unknown == [OCT], \
-            f"★本來對不上的結算被改名洗成 fresh★ {stale} {unknown}"
+        stale, _unknown = svc.stale_settlements("r", NOV)
+        assert stale == [OCT], f"★已知是錯的被降級成警告★ {stale} {_unknown}"
+        assert [(x["ym"], svc.storage.pending_kind(x))
+                for x in svc.storage.load_pending_settles()] == [
+                    (OCT, "ledger")]
+
+    def test_that_blocking_state_has_an_exit(self, svc):
+        """★擋下來就要修得掉★:開程式的收斂用月檔把帳本重建到一致,
+        然後才清掉義務。"""
+        self._accept(svc)
+        m = svc.storage.load_month(OCT)
+        m["r_duty"]["2026-10-06"] = {"person": "B", "locked": False,
+                                     "source": "manual"}
+        svc.storage.save_month(OCT, m)
+        svc.rename_member("r", "A", "R1")
+        svc.reconcile_pending_settles()
+        assert svc.stale_settlements("r", NOV) == ([], [])
+        assert not svc.storage.load_pending_settles()
+
+    def _stale_after_finalize(self, svc):
+        """定案 → 之後才被改掉的班表(人工合併/外部編輯)→ 結算對不上。"""
+        self._accept(svc)
+        svc.finalize(OCT, True)
+        m = svc.storage.load_month(OCT)
+        m["r_duty"]["2026-10-06"] = {"person": "B", "locked": False,
+                                     "source": "manual"}
+        svc.storage.save_month(OCT, m, force=True)
+        assert svc.stale_settlements("r", NOV)[0] == [OCT], "前提不成立"
+        svc.storage.mark_pending_settle("r", OCT, kind="ledger")
+
+    def _entry(self, svc):
+        return [e for e in svc.storage.load_ledger()["history"]
+                if e.get("month") == OCT and e.get("scope") == "r"][0]
+
+    def test_a_finalized_month_is_not_rewritten_with_todays_rules(self, svc):
+        """★班表凍結不等於結算語意凍結★(外審 Codex RS-23 P1-03)。
+
+        自動重算是用【現在】的名單/點數規則算的:`fair_share` 的分母是目前
+        的成員數 —— 定案之後才到職的人會被算進那個月的公平分母,還沒到職
+        就先背一筆負債,而餘額是之後每個月公平目標的基準。
+        (而且它不可以像最早那版那樣靜默 return:收斂端會把意圖清掉,等於替
+        一份已知對不上的帳本宣稱一致。)
+        """
+        self._stale_after_finalize(svc)
+        cfg = svc.storage.load_config()          # 定案之後才到職
+        cfg["r_members"] = list(cfg["r_members"]) + [{"id": "NEW",
+                                                      "name": "新來的"}]
+        svc.storage.save_config(cfg)
+        svc.reconcile_pending_settles()
+        assert "NEW" not in self._entry(svc)["deltas"],             "★用今天的名單改寫了已定案月份的歷史★"
+        assert [(x["ym"], svc.storage.pending_kind(x))
+                for x in svc.storage.load_pending_settles()] == [
+                    (OCT, "ledger")], "★義務被清掉了(等於宣稱已經一致)★"
+
+    def test_the_exit_is_to_unfinalize(self, svc):
+        """★擋下來就要修得掉★:解除定案是使用者的明示決定(可以用今天的規則
+        重算那個月),之後收斂就修得掉、也清得掉。"""
+        self._stale_after_finalize(svc)
+        svc.finalize(OCT, False)
+        svc.reconcile_pending_settles()
+        assert svc.stale_settlements("r", NOV) == ([], [])
+        assert not svc.storage.load_pending_settles()
 
     def test_a_fresh_settlement_is_still_migrated(self, svc):
         """守衛不得因此讓正常的改名又回到「永久擋住下個月」。"""

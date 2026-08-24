@@ -168,6 +168,12 @@ class ScheduleApp:
         #   落後,而它可以從月檔重算。這裡把它做掉,不必靠人記得。
         # 舊版寫出來的梯次沒有 id(切片格網以 id 當鍵 → 兩梯會互相覆蓋);
         # 補一個【確定性】的 id,兩台各自跑會得到同一份內容(外審 RS-21 P1-02)。
+        # 上一次改名做到一半(斷電/被砍)→ 盤上一半舊一半新;往前做完
+        # (改名對每個檔都是冪等的,見 `reconcile_pending_renames`)。
+        try:
+            self.service.reconcile_pending_renames()
+        except Exception:
+            logging.exception("[roster] 收斂未完成的改名失敗（不擋開啟）")
         try:
             self.service.migrate_legacy_clerk_batch_ids()
         except Exception:

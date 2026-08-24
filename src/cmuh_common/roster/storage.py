@@ -181,6 +181,60 @@ def last_weekend_of(month_data: dict, scope: str, ym: str) -> Optional[tuple]:
 _WEEK_COLORS = ("pink", "green")
 
 
+def _ym_or_none(v):
+    """`YYYY-MM` → (年, 月);不是就回 None。"""
+    try:
+        y, m = str(v).split("-")
+        if len(y) == 4 and len(m) == 2 and 1 <= int(m) <= 12:
+            return int(y), int(m)
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+
+#: 意圖的種類(模組層級,讓嚴格讀取也用得到同一份定義)。
+PENDING_KINDS = ("ledger", "biopsy", "all")
+
+
+def _validate_pending_record(rec: dict, name: str, i: int) -> None:
+    """一筆意圖記錄自己也要看得懂(外審 RS-23 P2-02)。
+
+    ★「認不得的義務」不可以等於「沒有義務」★:`{}` 或 scope/ym 是空字串的
+    記錄以前照樣通過「是 dict」這一關,而收斂端看到缺欄位就【把它清掉】——
+    那是這整套 fail-closed 設計裡最不該有的一個出口。壞掉的記錄要留在檔案裡
+    並且明講,由人決定。
+    """
+    def bad(why: str):
+        raise ValueError(
+            f"{name} 第 {i + 1} 筆看不懂({why})—— 認不得的義務不可以被當成"
+            f"不存在。請人工確認該檔之後再繼續。")
+
+    if name == "pending_rename.json":
+        for fld in ("scope", "old_id", "new_id"):
+            if not str(rec.get(fld) or "").strip():
+                bad(f"沒有 {fld}")
+        if rec.get("scope") not in ("r", "vs"):
+            bad(f"scope={rec.get('scope')!r}")
+        if rec.get("old_id") == rec.get("new_id"):
+            bad("old_id 與 new_id 相同")
+    elif name == "pending_settle.json":
+        if rec.get("scope") not in ("r", "vs"):
+            bad(f"scope={rec.get('scope')!r}")
+        if _ym_or_none(rec.get("ym")) is None:
+            bad(f"ym={rec.get('ym')!r}")
+        # 舊版沒有 kind → 一律當成 "all"(見 `pending_kind`),合法。
+        if "kind" in rec and rec.get("kind") not in PENDING_KINDS:
+            bad(f"kind={rec.get('kind')!r}")
+    else:
+        if not str(rec.get("batch_id") or "").strip():
+            bad("沒有 batch_id")
+        for fld in ("old_start", "new_start"):
+            if _iso_or_none(rec.get(fld)) is None:
+                bad(f"{fld}={rec.get(fld)!r}")
+        if "pre_digest" in rec and not isinstance(rec["pre_digest"], str):
+            bad(f"pre_digest 型別是 {type(rec['pre_digest']).__name__}")
+
+
 def _strict_pending(data: dict, name: str, what: str) -> list:
     """意圖檔的嚴格讀取(兩份共用一套規則)。
 
@@ -202,6 +256,7 @@ def _strict_pending(data: dict, name: str, what: str) -> list:
             raise ValueError(
                 f"{name} 第 {i + 1} 筆不是物件（{type(x).__name__}）"
                 f"—— 認不得的義務不可以被當成不存在")
+        _validate_pending_record(x, name, i)
     return list(raw)
 
 
@@ -273,11 +328,23 @@ def validate_authoritative_shape(name: str, raw: dict) -> None:
             lst = raw.get(key)
             if lst is not None and not isinstance(lst, list):
                 bad(f"{key} 不是清單")
+            seen_ids: set = set()
             for i, mm in enumerate(lst or []):
                 if not isinstance(mm, dict):
                     bad(f"{key} 第 {i + 1} 位不是物件（{type(mm).__name__}）")
                 if not str(mm.get("id") or "").strip():
                     bad(f"{key} 第 {i + 1} 位沒有代號(id)")
+                # ★同一份名單裡代號必須唯一★(外審 RS-23 P2-03):CP-SAT 是用
+                #   `{(日期, m.id): BoolVar}` 建變數的 —— 重複的代號只會產生
+                #   【一顆】變數,而 `AddExactlyOne` 又把它枚舉兩次,約束就變成
+                #   `2*A + B == 1`:A 從此不可能值班,只有重複那一位時甚至無解。
+                #   ★不可以靜默去重★:兩筆同代號可能有不同 level/固定星期/姓名,
+                #   程式沒有資格猜哪一筆才是真的。
+                mid = str(mm.get("id") or "").strip()
+                if mid in seen_ids:
+                    bad(f"{key} 有重複的代號 {mid!r}"
+                        f"（會讓求解模型的語意改變,請先確認要保留哪一筆）")
+                seen_ids.add(mid)
     elif name == "clinic_template.json":
         tpl = raw.get("template")
         if tpl is not None and not isinstance(tpl, dict):
@@ -314,9 +381,19 @@ def validate_authoritative_shape(name: str, raw: dict) -> None:
         hist = raw.get("history")
         if hist is not None and not isinstance(hist, list):
             bad(f"history 不是清單（{type(hist).__name__}）")
+        seen_months: set = set()
         for i, e in enumerate(hist or []):
             if not isinstance(e, dict):
                 bad(f"history 第 {i + 1} 筆不是物件")
+            # ★同一個 (scope, 月份) 只能有一筆結算★(外審 RS-23 P2-03):
+            #   `settle_month` 是「先回滾同月舊分錄再重記」,兩筆的話回滾只
+            #   拿掉一筆,另一筆的差額就永遠留在餘額裡(而餘額是下個月公平
+            #   目標的基準)。人工合併很容易造出這種形狀。
+            key = (str(e.get("scope") or ""), str(e.get("month") or ""))
+            if key in seen_months:
+                bad(f"{key[0]}/{key[1]} 有兩筆結算分錄"
+                    f"（回滾只會拿掉一筆,另一筆的差額會永遠留在餘額裡）")
+            seen_months.add(key)
             deltas = e.get("deltas")
             if deltas is not None and not isinstance(deltas, dict):
                 bad(f"history 第 {i + 1} 筆的 deltas 不是物件")
@@ -846,7 +923,7 @@ class RosterStorage:
     #:   "ledger" 點數帳本 / "biopsy" 切片計數帳本 / "all" 兩者都要
     #: 舊版紀錄沒有這個欄位 → 一律視為 "all"(兩個都重建成功才算收斂;
     #: 把它當成某一種的話,另一種的義務會被靜默丟掉)。
-    PENDING_KINDS = ("ledger", "biopsy", "all")
+    PENDING_KINDS = PENDING_KINDS
 
     @classmethod
     def pending_kind(cls, item: dict) -> str:
@@ -880,17 +957,24 @@ class RosterStorage:
         任何一種,此時回 False(義務是別人的,我不得清它)。
         """
         kind = kind if kind in self.PENDING_KINDS else "all"
-        cur = self._pending_for_write()   # ★改它之前一定要嚴格讀★
-        for x in cur:
-            if x.get("scope") != scope or x.get("ym") != ym:
-                continue
-            k = self.pending_kind(x)
-            if k == kind or k == "all":      # 已有一筆涵蓋我的義務
-                return False
-        cur.append({"scope": str(scope), "ym": str(ym), "kind": kind,
-                    "ts": _now_stamp()})
-        self._save(self._path("pending_settle.json"), {"pending": cur})
-        return True
+        # ★讀 → 改 → 寫必須是一個交易★(外審 RS-23 P1-01):嚴格讀取只保證
+        #   「讀到的那一份是完整的」,擋不住【讀完之後、寫回之前】背景 Git
+        #   merge 把他機的義務合併進來 —— 這一次寫入就用手上那份舊清單整份
+        #   覆蓋,對方的 recovery obligation 合法地消失(不是衝突、不是壞檔、
+        #   CAS 也看不到,從 git 看來只是一個正常的 post-merge commit)。
+        #   ★`write_barrier` 可重入★:已經在臨界區裡的呼叫端不受影響。
+        with self.write_barrier():
+            cur = self._pending_for_write()   # ★改它之前一定要嚴格讀★
+            for x in cur:
+                if x.get("scope") != scope or x.get("ym") != ym:
+                    continue
+                k = self.pending_kind(x)
+                if k == kind or k == "all":      # 已有一筆涵蓋我的義務
+                    return False
+            cur.append({"scope": str(scope), "ym": str(ym), "kind": kind,
+                        "ts": _now_stamp()})
+            self._save(self._path("pending_settle.json"), {"pending": cur})
+            return True
 
     def clear_pending_settle(self, scope: str, ym: str,
                              kind: str = "all") -> None:
@@ -900,13 +984,14 @@ class RosterStorage:
         宣稱一致(RS-10 的教訓,種類化之後同樣成立)。
         """
         kind = kind if kind in self.PENDING_KINDS else "all"
-        cur = self._pending_for_write()   # ★改它之前一定要嚴格讀★
-        left = [x for x in cur
-                if not (x.get("scope") == scope and x.get("ym") == ym
-                        and self.pending_kind(x) == kind)]
-        if len(left) == len(cur):
-            return
-        self._save(self._path("pending_settle.json"), {"pending": left})
+        with self.write_barrier():        # ★讀改寫是一個交易★(見 mark)
+            cur = self._pending_for_write()   # ★改它之前一定要嚴格讀★
+            left = [x for x in cur
+                    if not (x.get("scope") == scope and x.get("ym") == ym
+                            and self.pending_kind(x) == kind)]
+            if len(left) == len(cur):
+                return
+            self._save(self._path("pending_settle.json"), {"pending": left})
 
     def retype_pending_settle(self, scope: str, ym: str,
                               old_kind: str, new_kind: str) -> bool:
@@ -920,23 +1005,81 @@ class RosterStorage:
         """
         old_kind = old_kind if old_kind in self.PENDING_KINDS else "all"
         new_kind = new_kind if new_kind in self.PENDING_KINDS else "all"
-        cur = self._pending_for_write()   # ★改它之前一定要嚴格讀★
-        hit = False
-        out = []
-        for x in cur:
-            if (not hit and x.get("scope") == scope and x.get("ym") == ym
-                    and self.pending_kind(x) == old_kind):
-                y = dict(x)
-                y["kind"] = new_kind
-                y["ts"] = _now_stamp()
-                out.append(y)
-                hit = True
-                continue
-            out.append(x)
-        if not hit:
-            return False
-        self._save(self._path("pending_settle.json"), {"pending": out})
-        return True
+        with self.write_barrier():        # ★讀改寫是一個交易★(見 mark)
+            cur = self._pending_for_write()   # ★改它之前一定要嚴格讀★
+            hit = False
+            out = []
+            for x in cur:
+                if (not hit and x.get("scope") == scope and x.get("ym") == ym
+                        and self.pending_kind(x) == old_kind):
+                    y = dict(x)
+                    y["kind"] = new_kind
+                    y["ts"] = _now_stamp()
+                    out.append(y)
+                    hit = True
+                    continue
+                out.append(x)
+            if not hit:
+                return False
+            self._save(self._path("pending_settle.json"), {"pending": out})
+            return True
+
+    # ── 改名的交易意圖(外審 RS-23 P2-04)──────────────────────────────
+    def load_pending_renames(self) -> list:
+        """還沒確認完成的改名(顯示用,寬鬆)。"""
+        raw = _load_json(self._path("pending_rename.json")).get("pending")
+        return [x for x in (raw or []) if isinstance(x, dict)]
+
+    def load_pending_renames_strict(self) -> list:
+        """★壞檔/讀不到就拋★(與另外兩份意圖檔同一套規則)。
+
+        改名是跨 config/帳本/假日/切片/所有月檔的多檔交易,而回滾只存在
+        記憶體裡 —— 斷電/被砍時盤上會留下【一半舊、一半新】,而下次開程式
+        沒有任何線索知道那次改名做到哪裡。這份檔就是那個線索。
+        """
+        data, _rev = self._strict_snapshot(self._path("pending_rename.json"))
+        return _strict_pending(data, "pending_rename.json", "改名")
+
+    def mark_pending_rename(self, scope: str, old_id: str, new_id: str, *,
+                            config_rev: str = "",
+                            config_digest: str = "") -> bool:
+        """改名【落地之前】記下意圖(冪等)。→ 這一筆是不是這次記的。
+
+        `config_rev`＝★交易開始【之前】config.json 的 revision★
+        (外審 Codex RS-23 P1-02):config 是第一個被寫的檔,所以
+        「它還是這個 revision」就★證明★這次交易一個檔都還沒動 ——
+        收斂端可以據此把盤上判定為完整的舊狀態(而不是靠猜)。
+
+        `config_digest`＝★我這次要把 config 寫成什麼樣子★的語意識別
+        (外審 Codex RS-23 第 3 輪 P2):證明「盤上這份 config 是我寫的」。
+        ★兩個識別都必須在寫第一個檔【之前】就落地★——原本是等 config 寫完
+        再讀回它的 revision 補記,那麼「config 已寫、證據還沒落地」之間被斷電
+        就永遠證明不了,而那正是這批要涵蓋的任意中斷窗口。
+        """
+        with self.write_barrier():        # ★讀改寫是一個交易★(見 mark_settle)
+            cur = self.load_pending_renames_strict()
+            for x in cur:
+                if (x.get("scope") == scope and x.get("old_id") == old_id
+                        and x.get("new_id") == new_id):
+                    return False
+            cur.append({"scope": str(scope), "old_id": str(old_id),
+                        "new_id": str(new_id), "ts": _now_stamp(),
+                        "config_rev": str(config_rev or ""),
+                        "config_digest_after": str(config_digest or "")})
+            self._save(self._path("pending_rename.json"), {"pending": cur})
+            return True
+
+    def clear_pending_rename(self, scope: str, old_id: str,
+                             new_id: str) -> None:
+        with self.write_barrier():
+            cur = self.load_pending_renames_strict()
+            left = [x for x in cur
+                    if not (x.get("scope") == scope
+                            and x.get("old_id") == old_id
+                            and x.get("new_id") == new_id)]
+            if len(left) == len(cur):
+                return
+            self._save(self._path("pending_rename.json"), {"pending": left})
 
     # ── 梯次起始日 → 切片格網平移的意圖(外審次輪 P2-05)──────────────────
     def load_pending_grid_shifts_strict(self) -> list:
@@ -977,6 +1120,14 @@ class RosterStorage:
         同一梯次已有未收斂的平移意圖時回 False:呼叫端必須★拒絕★這次變更
         (連續兩次平移疊起來之後,收斂端再也分不出格網停在哪一段)。
         """
+        with self.write_barrier():        # ★讀改寫是一個交易★(見
+            #   `mark_pending_settle`:背景 merge 會在讀與寫之間插進來)
+            return self._mark_grid_shift_locked(batch_id, old_start,
+                                                new_start, pre_digest)
+
+    def _mark_grid_shift_locked(self, batch_id, old_start, new_start,
+                                pre_digest) -> bool:
+        """`mark_pending_grid_shift` 的本體。★呼叫端必須持有 write_barrier★"""
         cur = self._pending_grid_for_write()   # ★改它之前一定要嚴格讀★
         if any(str(x.get("batch_id")) == str(batch_id) for x in cur):
             return False
@@ -993,11 +1144,14 @@ class RosterStorage:
 
     def clear_pending_grid_shift(self, batch_id: str) -> None:
         """格網確實平移完成(或確認無需平移)之後清掉那一筆意圖。"""
-        cur = self._pending_grid_for_write()   # ★改它之前一定要嚴格讀★
-        left = [x for x in cur if str(x.get("batch_id")) != str(batch_id)]
-        if len(left) == len(cur):
-            return
-        self._save(self._path("pending_grid_shift.json"), {"pending": left})
+        with self.write_barrier():        # ★讀改寫是一個交易★(見 mark)
+            cur = self._pending_grid_for_write()  # ★改之前一定要嚴格讀★
+            left = [x for x in cur
+                    if str(x.get("batch_id")) != str(batch_id)]
+            if len(left) == len(cur):
+                return
+            self._save(self._path("pending_grid_shift.json"),
+                       {"pending": left})
 
     def save_biopsy(self, book: dict, *, expected_revision=_UNSET) -> None:
         # 比照 save_ledger：寫前 schema 檢查（.bak 快照由 _save 統一留）

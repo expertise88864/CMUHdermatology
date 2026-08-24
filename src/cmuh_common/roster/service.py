@@ -365,6 +365,98 @@ class DaySolveResult(NamedTuple):
     month_revision: str
 
 
+def _config_intent_digest(cfg: dict) -> str:
+    """這一份設定內容的★語意識別★(與序列化格式無關)。
+
+    用途:改名的意圖在★寫第一個檔之前★就記下「我要把 config 寫成什麼樣子」;
+    復原時把盤上的 config 解析回來算同一個識別,相符就證明那一份是我們寫的
+    (而不是他機獨立把 old 移除、加進一位同代號的合法成員 —— 那個盤面的
+    「名單只剩 new」長得一模一樣)。
+
+    ★不預測位元組★(外審 Codex 第 3 輪 P2):比對的兩邊都是【解析後的資料】,
+    不依賴 writer 的縮排/編碼/鍵序;`schema_version` 由寫入路徑自己補,排除。
+    """
+    d = {k: v for k, v in (cfg or {}).items() if k != "schema_version"}
+    blob = json.dumps(d, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _files_with_both_ids(scope: str, old_id: str, new_id: str, ledger: dict,
+                         holiday: dict, biopsy, months: dict) -> list:
+    """→ ★同一個檔案裡同時出現 old_id 與 new_id★ 的檔名清單。
+
+    改名對每一個檔都是「整份把 old 換成 new」的原子寫入,所以未完成的交易
+    留下的每一個檔只會是【全舊】或【全新】。★判準要逐檔算★:不同月檔一個
+    全舊、一個全新是合法的中間狀態,把它們併在一起算會誤擋真正的續作。
+    """
+    def _led(who) -> bool:
+        if who in (ledger.get(scope) or {}):
+            return True
+        return any(e.get("scope") == scope and who in (e.get("deltas") or {})
+                   for e in (ledger.get("history") or []))
+
+    def _hol(who) -> bool:
+        return who in (holiday.get(scope) or {}).values()
+
+    def _bio(who) -> bool:
+        b = biopsy or {}
+        if who in (b.get("counts") or {}):
+            return True
+        return any(who in (e.get("assign") or {}).values()
+                   for e in (b.get("history") or []))
+
+    def _mon(m: dict, who) -> bool:
+        for mk in ("leaves", "must_duty"):
+            if who in ((m.get(mk) or {}).get(scope) or {}):
+                return True
+        if any((c or {}).get("person") == who
+               for c in (m.get(f"{scope}_duty") or {}).values()):
+            return True
+        if ((m.get("last_weekend") or {}).get(scope) or {}).get(
+                "person") == who:
+            return True
+        if scope == "r" and who in (m.get("biopsy_override") or {}).values():
+            # ★判準要涵蓋「改名真的會改寫」的每一個欄位★(外審 Codex 第 3 輪
+            #   P1):手動指定的切片人選也是以代號為值,漏掉它就會把兩位醫師的
+            #   週六切片指定混成一個人。
+            return True
+        return scope == "r" and any(
+            (c or {}).get("person") == who
+            for c in (m.get("saturday_biopsy") or {}).values())
+
+    out = []
+    if _led(old_id) and _led(new_id):
+        out.append("ledger.json")
+    if _hol(old_id) and _hol(new_id):
+        out.append("holiday_duty.json")
+    if scope == "r" and _bio(old_id) and _bio(new_id):
+        out.append("biopsy.json")
+    for ym, m in sorted(months.items()):
+        if m is not None and _mon(m, old_id) and _mon(m, new_id):
+            out.append(f"{ym} 月檔")
+    return out
+
+
+def _rename_intents_collide(rec: dict, all_recs: list) -> bool:
+    """這一筆改名意圖有沒有跟別筆牽扯在一起(共用目標/首尾相接)。
+
+    ★收斂順序不可以決定誰的歷史被誰覆蓋★:`A→B` 與 `C→B` 共用目標,
+    先跑的那一筆會讓後跑的那一筆把它的餘額蓋掉;`A→B` 與 `B→C` 首尾相接,
+    順序不同結果不同。兩種都不是程式有資格挑的 —— 保留並請人確認。
+    """
+    scope = str(rec.get("scope") or "")
+    old_id, new_id = str(rec.get("old_id") or ""), str(rec.get("new_id") or "")
+    for other in all_recs:
+        if other is rec or str(other.get("scope") or "") != scope:
+            continue
+        o_old = str(other.get("old_id") or "")
+        o_new = str(other.get("new_id") or "")
+        if (o_new == new_id or o_old == old_id      # 共用目標/共用來源
+                or o_new == old_id or o_old == new_id):   # 首尾相接
+            return True
+    return False
+
+
 class RosterService:
     def __init__(self, storage: RosterStorage):
         self.storage = storage
@@ -2635,7 +2727,8 @@ class RosterService:
                  baseline) -> None:
         self._set_date_map(scope, ym, "must_duty", member_id, dates, baseline)
 
-    def rename_member(self, scope: str, old_id: str, new_id: str) -> int:
+    def rename_member(self, scope: str, old_id: str, new_id: str, *,
+                      resume: bool = False) -> int:
         """把某 scope 成員的代號 old_id 連動改成 new_id（跨所有資料一次到位）。回傳異動處數。
 
         代號是帳本/值班/請假/切片計數的主鍵，單改名單會讓其餘資料仍指向舊鍵而斷鏈，故集中在本層
@@ -2654,10 +2747,101 @@ class RosterService:
         #   一個檔,而只有月檔那幾筆有 CAS。臨界區讓「載入 → 改 → 逐檔寫 →
         #   需要時回滾」整段看見同一份盤面。
         with self.storage.write_barrier():
-            return self._rename_member_locked(scope, old_id, new_id)
+            # ★多檔交易要有 durable 的意圖★(外審 RS-23 P2-04)——
+            #   記在【前置檢查通過之後、開始寫檔之前】(見
+            #   `_rename_member_locked`):同號的 no-op、空白代號、撞名等
+            #   根本不會動到任何檔,替它們記一筆改名意圖是誤報。
+            return self._rename_member_locked(scope, old_id, new_id,
+                                              resume=resume)
+
+    def _rename_never_started(self, rec: dict) -> bool:
+        """這一筆改名意圖是不是【一個檔都還沒寫】就中斷了。
+
+        config 是改名的第一個寫入,而正典檔是整份原子寫入 —— 所以
+        「config.json 的 revision 還是交易開始前那一個」就證明後面每一個檔
+        都還沒被動過。★沒有記 revision 的舊意圖★退回同一個道理的推理:
+        名單裡還是 old_id、而 new_id 不在 —— 我們自己的交易不可能停在這裡
+        (它第一步就會把名單換掉)。
+        """
+        scope = str(rec.get("scope") or "")
+        pre = str(rec.get("config_rev") or "")
+        cfg, rev = self.storage.canonical_snapshot("config.json")
+        if pre:
+            return pre == rev
+        ids = {str(m.get("id")) for m in (cfg.get(f"{scope}_members") or [])}
+        return (str(rec.get("old_id")) in ids
+                and str(rec.get("new_id")) not in ids)
+
+    def reconcile_pending_renames(self) -> list:
+        """開程式時把「做到一半的改名」做完(finish-forward)。→ 收斂清單。
+
+        ★方向是往前做完,不是回頭★:回滾需要當初那份記憶體快照,重開之後
+        沒有了;而「把 old_id 改成 new_id」對每一個檔案都是冪等的 —— 已經
+        改過的檔不含 old_id,再跑一次就是 0 個異動。所以往前做完是唯一
+        deterministic 的收斂方向,也正是使用者本來要的結果。
+        """
+        out: list = []
+        recs = self.storage.load_pending_renames_strict()
+        for rec in recs:
+            scope = str(rec.get("scope") or "")
+            old_id = str(rec.get("old_id") or "")
+            new_id = str(rec.get("new_id") or "")
+            if _rename_intents_collide(rec, recs):
+                # ★互相牽扯的意圖不可以自動續作★(外審 Codex RS-23 P1-02):
+                #   A→B 與 C→B 共用目標、A→B 與 B→C 首尾相接 —— 收斂順序
+                #   會決定誰的歷史被誰覆蓋,而程式沒有資格挑。
+                logging.error(
+                    "[roster.service] ★%s 的改名意圖互相牽扯(%s → %s)★ "
+                    "保留,請人工確認 pending_rename.json", scope, old_id,
+                    new_id)
+                continue
+            try:
+                with self.storage.write_barrier():
+                    if self._rename_never_started(rec):
+                        # ★證明盤上是完整的舊狀態 → 收斂方向是「全舊」★:
+                        #   交易一個檔都沒動,沒有東西要做完(這也是外審
+                        #   允許的兩個終點之一:全舊或全新,不能半套)。
+                        self.storage.clear_pending_rename(scope, old_id,
+                                                          new_id)
+                        logging.warning(
+                            "[roster.service] 上次的改名(%s %s → %s)還沒動到"
+                            "任何檔就中斷了 → 維持原狀", scope, old_id, new_id)
+                        continue
+                    proof = str(rec.get("config_digest_after") or "")
+                    if proof != _config_intent_digest(
+                            self.storage.canonical_snapshot("config.json")[0]):
+                        # ★名單的形狀是必要條件、不是充分條件★(外審 Codex
+                        #   第 2 輪 P1):他機可能獨立把 old 移除、加進一位
+                        #   合法的同代號成員 —— 那個盤面與我們的半套長得
+                        #   一模一樣。要有「這份 config 是我們寫的」的證據
+                        #   (寫完當下讀回來的 revision)才准續作;沒有記到
+                        #   (剛好崩在那兩個寫入之間)或後來被別人動過,一律
+                        #   保留意圖交給人。
+                        logging.error(
+                            "[roster.service] ★%s 的改名(%s → %s)沒有可證明"
+                            "的半套狀態★(config 不是這次交易寫的 revision)"
+                            " —— 保留意圖,請人工確認 pending_rename.json",
+                            scope, old_id, new_id)
+                        continue
+                    # (revision 相符就【蘊含】名單只剩 new_id —— 那份
+                    #  config 就是我們寫出去的那一份。所以這裡不再另外檢查
+                    #  名單形狀:一個永遠不可能成立的判斷等於沒有判斷,
+                    #  它只會讓人以為多了一層保護。名單同時有 old/new 的
+                    #  形狀由 `_rename_member_locked` 自己擋 —— 那一層才是
+                    #  公開 API 的入口。)
+                    self.rename_member(scope, old_id, new_id, resume=True)
+            except Exception:
+                logging.exception(
+                    "[roster.service] ★%s 的改名(%s → %s)無法收斂★ "
+                    "意圖保留,請人工確認", scope, old_id, new_id)
+                continue
+            out.append((scope, old_id, new_id))
+            logging.warning("[roster.service] 上次未完成的改名已做完:"
+                            "%s %s → %s", scope, old_id, new_id)
+        return out
 
     def _rename_member_locked(self, scope: str, old_id: str,
-                              new_id: str) -> int:
+                              new_id: str, *, resume: bool = False) -> int:
         """`rename_member` 的本體。★呼叫端必須持有 `write_barrier`★"""
         old_id = str(old_id)
         new_id = str(new_id).strip()
@@ -2681,9 +2865,22 @@ class RosterService:
         cfg = self.storage.load_config()
         members = cfg.get(f"{scope}_members") or []
         ids = [str(m.get("id")) for m in members]
-        if old_id not in ids:
+        if resume and old_id in ids and new_id in ids:
+            # ★兩個都在＝這不是我們的半套改名★(外審 Codex RS-23 P1-02):
+            #   config 是第一個被寫的檔,而它是整份原子寫入 —— 我們自己的
+            #   交易只會留下「只剩 new_id」。兩個都在表示 new_id 是【另一位
+            #   合法成員】(他機新增/別的改名),續作會把 old 的餘額、切片
+            #   計數、請假鍵覆蓋到他身上,而那是救不回來的。
+            raise ValueError(
+                f"{scope.upper()} 名單同時有 {old_id} 與 {new_id} —— "
+                f"這不是未完成的改名留下的狀態,拒絕自動續作。"
+                f"請人工確認 pending_rename.json。")
+        if old_id not in ids and not (resume and new_id in ids):
+            # ★續作時名單可能已經改完了★(外審 RS-23 P2-04):config 是第一個
+            #   寫的檔 —— 「名單只剩 new_id、其餘檔還停在 old_id」正是被砍之後
+            #   的預期中間狀態,不可以在這裡中止,否則那次改名永遠做不完。
             raise ValueError(f"{scope.upper()} 名單中找不到代號 {old_id}")
-        if new_id in ids:
+        if new_id in ids and not resume:
             raise ValueError(f"代號 {new_id} 已存在於 {scope.upper()} 名單，不可重複")
         # ★改名要把這些檔整份寫回去 → 來源一律用嚴格快照★(外審次輪 P2-01):
         #   壞檔的寬鬆載入回空,改名「成功」之後帳本/切片計數就只剩這一次
@@ -2706,6 +2903,7 @@ class RosterService:
         _was_fresh = {ym: (_duty_digest(m, scope)
                            if m is not None else "")
                       for ym, m in months.items()}
+        _stale_before: list = []       # 改名前就已經對不上的月份(見下)
 
         # [codex] new_id 必須是「全新」代號：不可已出現在任何歷史資料——無論當【鍵】(帳本/切片
         # 計數/請假指定，覆蓋會蓋掉離職者紀錄) 或當【值】(值班/國定假日/last_weekend/週六切片/切片
@@ -2737,10 +2935,35 @@ class RosterService:
                 for cell in (m.get("saturday_biopsy") or {}).values():
                     if cell.get("person") == new_id:
                         clashes.add("週六切片")
-        if clashes:
+                # ★這一欄改名時會被改寫,撞名掃描就必須看它★(外審 Codex
+                #   第 3 輪 P1):否則 new_id 已是某離職者的手動切片指定時,
+                #   改名會把兩人的指定混為一人。
+                if new_id in (m.get("biopsy_override") or {}).values():
+                    clashes.add("切片指定")
+        # ★續作時 new_id 一定已經出現在半套資料裡★(外審 RS-23 P2-04):
+        #   那是【我們上一次自己寫進去的】,不是別人的歷史紀錄 —— 這幾道
+        #   撞名守衛在收斂時要跳過,否則那次改名永遠做不完。
+        if clashes and not resume:
             raise ValueError(
                 f"代號 {new_id} 已出現在歷史資料（{'、'.join(sorted(clashes))}），"
                 f"為免與離職者紀錄混同，請改用全新代號")
+
+        if resume:
+            _both = _files_with_both_ids(scope, old_id, new_id, ledger,
+                                        holiday, biopsy, months)
+            if _both:
+                # ★逐檔的不變量★(外審 Codex RS-23 第 2 輪 P1):本交易對每一個
+                #   檔都是「整份把 old 換成 new」的原子寫入 —— 所以合法的中間
+                #   狀態裡,每一個檔要麼【全舊】、要麼【全新】。同一個檔同時
+                #   出現兩者,就證明那個 new 的資料不是我們寫的(他機獨立新增
+                #   的成員、或 merge 把舊的 old 帶回來),續作會把兩個人的歷史
+                #   混成一個人 —— 而那救不回來。
+                #   ★不可以只看名單★:名單的形狀(只剩 new)是必要條件,不是
+                #   充分條件。
+                raise ValueError(
+                    f"{'、'.join(_both)} 同時有 {old_id} 與 {new_id} 的資料 ——"
+                    f"這不是未完成的改名留下的狀態,拒絕自動續作。"
+                    f"請人工確認 pending_rename.json 與這些檔案。")
 
         # 回滾用原內容（deepcopy 必須在改動【之前】拍下）
         snap = {"config": copy.deepcopy(cfg), "ledger": copy.deepcopy(ledger),
@@ -2838,13 +3061,24 @@ class RosterService:
                 e["duty_digest"] = _duty_digest(months[_hym], scope)
             else:
                 # ★本來就對不上 → 絕不洗成 fresh★(外審 RS-22 P2-01)。
-                #   也不留舊識別:改名之後它永遠不可能再相符,那會變成一個
-                #   沒有出口的封鎖(定案月連「重算帳本」都做不到)——
-                #   退回「無從查證」,由使用者到那個月按重算帳本。
+                # ★也不可以降級成「無從查證」★(外審 RS-23 P2-01):那一級
+                #   只會出警告、不擋求解 —— 而系統在改名【之前】已經證明過
+                #   這筆結算與班表不一致,改名並沒有提供任何新證據說它突然
+                #   安全了。「已知是錯的」不可以變成「不知道,但繼續」。
+                #   證據改成一筆 durable 的義務(閘門照樣擋、收斂端也修得掉),
+                #   而不是留一顆永遠不可能相符的識別(那會沒有出口:定案月
+                #   連「重算帳本」都做不到)。
                 logging.warning(
                     "[roster.service] %s 的帳本結算在改名之前就與班表對不上"
-                    " → 退回「無從查證」(請到該月按「重算帳本」)", _hym)
+                    " → 轉成待收斂的帳本義務(開程式會自動重算)", _hym)
                 e.pop("duty_digest", None)
+                _stale_before.append(_hym)
+
+        # ★證據要先落地★:這些月份的帳本在改名【之前】就與班表對不上,
+        #   那是與這次改名無關的事實 —— 先記下義務,改名就算整批回滾也不會
+        #   把證據弄丟(義務本身是冪等的)。
+        for _hym in sorted(set(_stale_before)):
+            self.storage.mark_pending_settle(scope, _hym, kind="ledger")
 
         # ── Phase 3：逐檔寫入；任一失敗即回滾已寫的檔（不留半套改名）──────────────────
         # 每一筆:(標籤, 新資料, 舊資料, 寫入函式, ★還原函式★)。
@@ -2852,6 +3086,7 @@ class RosterService:
         #   拿原始 revision 去比一定不符 —— 那會讓回滾自己失敗、留下半套改名。
         _cfg = lambda d: self.storage.save_config(d)          # noqa: E731
         _led = lambda d: self.storage.save_ledger(d)          # noqa: E731
+
         writes = [("config", cfg, snap["config"], _cfg, _cfg),
                   ("ledger", ledger, snap["ledger"], _led, _led)]
         if holiday_changed:
@@ -2869,6 +3104,17 @@ class RosterService:
                         ym, month_revs.get(ym, "")),
                 (lambda y: lambda d: self.storage.save_month(
                     y, d, force=True))(ym)))
+        # ★寫第一個檔之前先記意圖★(外審 RS-23 P2-04):回滾只存在記憶體
+        #   裡 —— 斷電/被砍/BaseException 時盤上會留下「一半舊、一半新」,
+        #   而改名連【已定案的月份】都會 force 改,影響範圍很大。有這一筆,
+        #   下次開程式就知道要把它做完(`reconcile_pending_renames`)。
+        #   ★連交易開始前的 config revision 一起記★(外審 Codex RS-23
+        #   P1-02):config 是下面第一個被寫的檔 —— 收斂端看到它沒變就能
+        #   【證明】這次交易一個檔都沒動,不必靠推理。
+        _mine_rename = self.storage.mark_pending_rename(
+            scope, old_id, new_id,
+            config_rev=self.storage.canonical_snapshot("config.json")[1],
+            config_digest=_config_intent_digest(cfg))
         done = []
         try:
             for _label, new_data, old_data, save_fn, restore_fn in writes:
@@ -2876,14 +3122,27 @@ class RosterService:
                 done.append((old_data, restore_fn))
         except Exception:
             logging.exception("[roster.service] 改名寫入失敗，回滾已寫的 %d 檔", len(done))
+            _rolled = True
             for old_data, save_fn in reversed(done):
                 try:
                     save_fn(old_data)
                 except Exception:
+                    _rolled = False
                     logging.exception("[roster.service] 改名回滾失敗，資料可能半套，"
                                       "請從 .bak 快照人工還原")
+            # ★回滾成功＝盤上是完整的舊狀態 → 那筆意圖是誤報,撤掉★;
+            #   回滾自己失敗就留著(半套改名正需要下次開程式做完)。
+            if _rolled and _mine_rename:
+                self.storage.clear_pending_rename(scope, old_id, new_id)
             raise
 
+        # ★全部寫完了 → 交易結束,不論那筆意圖是誰記的★:續作(resume)時
+        #   `mark_` 會回 False(意圖是【上一次被砍的自己】記的),用「是不是
+        #   我記的」當清除條件的話,收斂永遠清不掉它 —— 下次開程式又收斂一次,
+        #   義務沒有出口。跑完整整一輪就代表盤上已經是完整的新狀態。
+        #   (回滾那條路仍然只清自己記的:那裡盤上是舊狀態,別人的半套改名
+        #   還需要那筆意圖。)
+        self.storage.clear_pending_rename(scope, old_id, new_id)
         logging.info("[roster.service] 代號連動改名 %s/%s → %s（%d 處）",
                      scope, old_id, new_id, changed)
         return changed
@@ -3151,7 +3410,11 @@ class RosterService:
             ym = str(item.get("ym") or "")
             kind = self.storage.pending_kind(item)
             if not scope or not ym:
-                self.storage.clear_pending_settle(scope, ym, kind)
+                # ★看不懂就保留★(外審 RS-23 P2-02):嚴格讀取現在會更早擋下,
+                #   這裡是最後一道 —— 絕不把「認不得」變成「沒有義務」。
+                logging.warning(
+                    "[roster.service] ★看不懂的結算意圖(%r)★ 保留,"
+                    "請人工確認 pending_settle.json", item)
                 continue
             try:
                 # ★整段在臨界區內★(外審排班 RS-4 第 1 輪 P2):`resettle_from_duty`
@@ -3215,8 +3478,12 @@ class RosterService:
                 old_start = date.fromisoformat(str(rec.get("old_start")))
                 new_start = date.fromisoformat(str(rec.get("new_start")))
             except (ValueError, TypeError):
-                logging.warning("[roster.service] 壞掉的平移意圖(%r)→ 清掉", rec)
-                self.storage.clear_pending_grid_shift(bid)
+                # ★看不懂就保留,不可以清掉★(外審 RS-23 P2-02):
+                #   「認不得的義務」不等於「沒有義務」——(嚴格讀取現在會在
+                #   更早的地方擋下這種記錄,這裡是最後一道)。
+                logging.warning(
+                    "[roster.service] ★看不懂的平移意圖(%r)★ 保留,"
+                    "請人工確認 pending_grid_shift.json", rec)
                 continue
             try:
                 with self.storage.write_barrier():
@@ -3510,8 +3777,21 @@ class RosterService:
         ★呼叫端必須持有 `write_barrier`★
         """
         month, _rev = self.storage.load_month_snapshot(ym)
+        # ★定案月不可以自動重算★(外審 Codex RS-23 P1-03):這裡雖然只寫帳本、
+        #   不碰月檔,但它是用【現在】的名單/點數規則/國定假日重算的 ——
+        #   `fair_share` 的分母是目前的成員數,定案之後才到職的人會被算進那個
+        #   月的公平分母(還沒到職就先背一筆負債),點數規則改過的話差額也會
+        #   被改寫,而餘額是之後每個月公平目標的基準。★班表凍結不等於結算
+        #   語意凍結★。
+        #   ——但也不可以像以前那樣「靜默 return」:收斂端會把那筆意圖清掉,
+        #   等於替一份已知對不上的帳本宣稱一致。改成拋出,意圖留著、閘門照
+        #   擋、訊息說得出下一步(與週六切片那條路同一個形狀)。
         if month.get("finalized"):
-            return                # 定案月的結算在定案時已驗過,不必也不能動
+            raise FinalizedMonthError(
+                f"{ym} 已定案,而它的帳本結算與班表對不上。"
+                f"自動重算會用【現在】的名單與點數規則改寫那個月的歷史"
+                f"(定案後才到職的人也會被算進公平分母),所以不做。"
+                f"請先解除該月定案,程式會在下次啟動時自動收斂,再重新定案。")
         src = self._sources(ym, SRC_RVS)
         ctx = self.build_context(scope, ym, month=month, src=src)
         points = self._points_from_duty(month, scope, ctx, ym)
