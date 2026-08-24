@@ -774,6 +774,9 @@ class RosterService:
         return DaySolveInput(
             ym=ym, grid=grid, pgy_roster=list(pgy_roster),
             clerk_batches=covering, biopsy_open=biopsy_open, leaves=leaves,
+            # [RS-24] 整梯配額的分子要濾掉假日(切片格網含跨月日期,而那些
+            #   日子在該月的 `month_grid` 裡可能根本不存在)。
+            holidays=set(holidays),
             capacity=RosterParams.from_config(cfg).room_capacity, locked=locked,
             prior_sessions=prior_sessions, prior_pgy=prior_pgy,
             apply_pref={str(c) for c in (month.get("pgy_apply_pref") or [])})

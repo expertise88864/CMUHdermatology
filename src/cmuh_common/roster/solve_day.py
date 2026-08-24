@@ -7,8 +7,9 @@
                   最少者，週三下午另計 photo_wed_pm 公平）
   2 治療室Step   ← 1 位 PGY（**週三下午休診不排**；其餘時段皆排；治療室總次數最少者；
                   [RS-15] 兩位 PGY 月的二早/四下/五早也不排 → 該位改優先跟診）
-  3 切片室Step   ← 1 位 Clerk（僅切片室開；[2026-07-24 修訂] 開放就排好排滿，
-                  本梯切片次數最少者優先＝每人至少一次、次數差 ≤1、同日早午不連切）
+  3 切片室Step   ← 1 位 Clerk（僅切片室開；[RS-24] ★配額平均★：整梯的開放
+                  時段數 ÷ 人數（取整數）＝每人該切幾次，誰去則由「目前跟診
+                  次數最多者」決定；同日早午不連切）
   3.5 TwoPgySeat [RS-15] 兩位 PGY 月:照光/治療室之外仍空著的 PGY 先入座
                   （優先權>Clerk;非兩位 PGY 月為 no-op）
   4 ClerkSeed    每個開診診間各放 1 位 Clerk（房序=決定性洗牌、就座公平輪轉）
@@ -18,7 +19,31 @@
   「跟過這間診的次數」(少者先)與「上次就是這間」懲罰(反連排)；診間處理順序改
   決定性抖動洗牌(原固定房號升冪→人少於房時永遠只填低房號,學生從跟不到 103/105)
   ——被填的房與 1C+1P 配對組合逐日變化,一起跟診的人自然錯開。
-  7 RestStep     還沒位子 → 放假（★純殘量，不做平均；理由見下★）
+  7 RestStep     還沒位子 → 放假（★純殘量,不做平均;理由見下★）
+
+★[RS-24 使用者 2026-08-24] 切片室＝整梯配額平均;誰去則由跟診次數決定★
+  同學反應:切片室次數一樣,跟診次數卻有人多有人少。
+  ★根因★:舊版切片室的輪選【只看本梯切片次數】,而「那一個時段的座位夠不夠
+  坐所有人」是浮動的 —— 座位多於人時,被抽去切片的人淨損失一次跟診;座位少於
+  人時他本來就會放假(淨損失 0)。所以「切片次數一樣」完全不保證「跟診次數
+  一樣」,差別在你是在寬鬆的時段還是擠的時段被抽走,而那筆帳沒有人記。
+  (不是跨月份:RF-09 早就把同一梯次上個月的既存班表回放進公平計數,
+   `replay_counters` 連跟診座位都回放。)
+  使用者定案的規則:
+    1. ★配額★:先算這一梯的切片開放時段數,除以梯次人數取整數 = 每人該切
+       幾次(例:16 個時段 5 個人 → 每人 3 次)。多出來的時段留空 ——
+       ★寧可空著也不讓某個人比別人多切★。
+       (開放時段數少於人數時配額會是 0 → 改取 1,讓排得到的人先輪到,
+        輪不到的由月底警告點名 —— 設計文件 C4 本來就是這個語意。)
+    2. ★誰去★:配額還沒用完的人裡面,挑【目前跟診次數最多】的那一位。
+       這就是把「被抽去切片」的成本記到帳上:誰跟診多,誰去切片,
+       兩邊的次數一起被拉平。
+    3. 其餘的人照舊進跟診座位(就座輪選的公平鍵仍是跟診次數),
+       都排不進去的才放假(★放假純殘量,不做平均;理由見下★)。
+  ★請假會讓配額排不完★:所以「還剩幾個時段、每個人還缺幾次、他哪幾天在」
+  要一起看 —— 判準是【放掉這一格之後,剩下的配額與剩下的時段還配得起來嗎】
+  (最大匹配;見 `_biopsy_forced_today`)。單看「剩餘時段數 ≥ 待補次數」或
+  「他自己還有沒有機會」都會漏掉兩個人共用同一個瓶頸時段的情況。
 
 ★放假次數【不】做平均，而且做不到★（2026-08-03 使用者實測提問後更正）
   本行原本寫「放假次數輪平均」—— 那是【錯的】：`fc.rest` / `fc.last_rest`
@@ -153,6 +178,11 @@ class SessionCtx:
     batch_key: str = ""               # 切片輪替以「梯次」為單位（代號跨梯會重用）
     apply_pref: frozenset = frozenset()   # Apply 本科 PGY（101 診週二/週五平手優先）
     two_pgy_mode: bool = False        # [RS-15] 該月 PGY 名單恰 2 位
+    # [RS-24] 切片室配額:{代號: 還缺幾次}。★None = 不設上限★(直接呼叫
+    #   `solve_session` 的呼叫端算不出配額 —— 它要看整梯的開放時段數與名單)。
+    biopsy_quota_left: "dict | None" = None
+    # 今天不補就補不完的人(請假造成的瓶頸;見 `_biopsy_forced_today`)。
+    biopsy_force: frozenset = frozenset()
 
     @property
     def wed_pm(self) -> bool:
@@ -225,35 +255,116 @@ class TreatmentStep(FillStep):
         log.append(f"{ctx.session} 治療室 ← PGY {pick}")
 
 
+def _max_pairs(people: list, slots: list, free) -> int:
+    """人 × 時段的最大匹配數(每人至多一個時段、每個時段至多一個人)。
+
+    ★用途★:切片室的「每人兩週至少一次」要判斷的是
+    【現在放掉這一格,剩下的人與剩下的時段還配得起來嗎】——
+    「剩餘時段數 ≥ 待補人數」與「他自己還有沒有機會」都只是這件事的
+    必要條件,兩者都成立仍可能漏人(兩個人共用同一個瓶頸時段)。
+    規模很小(十幾人 × 幾十個時段),簡單的增廣路徑就夠,而且是決定性的。
+    `free(person, slot)` = 那個人那天在不在。
+    """
+    match: dict = {}                    # 時段索引 → 已配到的人
+
+    def _same_day_taken(p, s) -> bool:
+        """★同一天只能切一次★:正式排班用 `last_biopsy` 擋(見 `_biopsy_cands`)
+        —— 判斷「還配不配得完」時若允許同一人吃掉同一天的早+午,就會高估可行性
+        而放掉今天該補的人(外審 Codex RS-24 配額版 P2)。
+        (`slots` 是日期字串,同一天的早/午是【同一個標籤】出現兩次。)"""
+        return any(q == p and slots[j] == s for j, q in match.items())
+
+    def _aug(p, seen: set) -> bool:
+        for i, s in enumerate(slots):
+            if i in seen or not free(p, s) or _same_day_taken(p, s):
+                continue
+            seen.add(i)
+            if i not in match or _aug(match[i], seen):
+                match[i] = p
+                return True
+        return False
+
+    return sum(1 for p in people if _aug(p, set()))
+
+
+def _biopsy_forced_today(todo: list, later: list, today_ok: list,
+                         free) -> frozenset:
+    """→ ★今天非補不可的人★(空集合 = 今天怎麼挑都還補得完)。
+
+    `todo`   ★還缺的次數★——每個人重複出現「他還缺幾次」次(配額制);
+    `later`  這一格【之後】還解得到的切片時段;
+    `today_ok` 今天在、今天排得到的人;`free(人, 時段)` 那天在不在。
+
+    判準:放掉這一格之後配不齊(`最大匹配 < 還缺的總次數`)→ 今天就得補。
+    要補誰:挑「補了他一次之後其餘的仍配得齊」的候選 —— 否則只是把補不到的
+    人換一個而已。全都配不齊(本來就排不完)→ 今天在的都算候選,至少補一個,
+    剩下的由月底「切片室輪不到/次數不均」點名。
+    """
+    if not todo or not today_ok:
+        return frozenset()
+    if _max_pairs(list(todo), list(later), free) >= len(todo):
+        return frozenset()              # 放掉這一格也還補得完
+    good = []
+    for c in today_ok:
+        rest = list(todo)
+        if c in rest:
+            rest.remove(c)              # ★只拿掉一次★(配額可能不只一次)
+        if _max_pairs(rest, list(later), free) >= len(todo) - 1:
+            good.append(c)
+    return frozenset(good or today_ok)
+
+
+def _biopsy_cands(ctx) -> list:
+    """今天還能進切片室的 Clerk(★同日早+午不得同一人★)。"""
+    return [c for c in ctx.clerk
+            if ctx.fc.last_biopsy.get((ctx.batch_key, c)) != ctx.d]
+
+
+def _take_biopsy(ctx, slots, log, pick, why: str) -> None:
+    fc = ctx.fc
+    ctx.clerk.remove(pick)
+    slots[BIOPSY] = [pick]
+    fc.biopsy_done[(ctx.batch_key, pick)] = (
+        fc.biopsy_done.get((ctx.batch_key, pick), 0) + 1)
+    fc.last_biopsy[(ctx.batch_key, pick)] = ctx.d
+    fc.worked_day[_clerk_ck(ctx, pick)] = ctx.d    # 反整天放假:今日已有工作
+    log.append(f"{ctx.session} 切片室 ← Clerk {pick}（{why}）")
+
+
 class BiopsyStep(FillStep):
+    """[RS-24] 切片室:★配額平均、由跟診次數最多者去★。
+
+    * 配額(`biopsy_quota_left`)由整月填充算:整梯的開放時段數 ÷ 人數(取整),
+      所以每個人切一樣多次;多出來的時段留空,★寧可空著也不讓誰多切★。
+    * 選人:配額還沒用完的人裡面挑【目前跟診次數最多】的 —— 那正是同學抱怨的
+      那筆帳:誰跟診多,誰去切片,兩邊一起拉平。舊版挑的是「切片次數最少者」,
+      它管得住切片、管不住跟診。
+    * 請假造成的瓶頸由 `biopsy_force` 覆蓋(見 `_biopsy_forced_today`):
+      「今天不補他就補不完了」的人優先,不然配額會排不完。
+    * 直接呼叫 `solve_session` 而沒帶配額的呼叫端 → ★不設上限★
+      (維持「切片室開著就有人」的舊行為,測試與工具腳本才不必知道配額)。
+    """
     def run(self, ctx, slots, log):
         # 週三下午切片室硬性關閉（C3 定案）→ 即使手動格網誤設為開，也不排。
         if not ctx.biopsy_open or ctx.wed_pm:
             return
         fc = ctx.fc
-        bk = ctx.batch_key
-        # [2026-07-24 使用者·修訂] 切片室開放就【排好排滿】：每人整梯至少一次、
-        # 不限一次（2、3 次都行），但同梯次數要一樣 → key 以「本梯切片次數最少者
-        # 優先」輪選（min-first 天生保證 spread ≤1，且所有人輪過一遍前不會有人
-        # 排到第二次＝at-least-once 自動達成）。舊版「每人一次就好、之後留空」
-        # 造成切片室大量空著、Clerk 卻在放假（使用者附圖）→ 廢除。
-        # 放假是最後一步（RestStep）：切片/診間都填完剩下的人才放假。
-        # 同日早+午不得同一人（次數平手時早上切過者仍可能中選）→ 明確排除。
-        cands = [c for c in ctx.clerk if fc.last_biopsy.get((bk, c)) != ctx.d]
+        quota = ctx.biopsy_quota_left
+        cands = [c for c in _biopsy_cands(ctx)
+                 if quota is None or quota.get(c, 0) > 0]
         if not cands:
             return
-        # 次數公平第一（整梯次數差 ≤1）；[2026-07-27] 平手時「今天還沒事做」者先，
-        # 助攻反整天放假（不動搖切片次數公平）。
+        # ★瓶頸優先★:今天不補他就補不完(請假把他的機會吃掉了)。
+        forced = [c for c in cands if c in ctx.biopsy_force]
+        if forced:
+            cands = forced
         pick = min(cands, key=lambda c: (
-            fc.biopsy_done.get((bk, c), 0),
+            -fc.seat.get(_clerk_ck(ctx, c), 0),      # ★跟診最多的人先去切片★
+            -(quota.get(c, 0) if quota else 0),      # 還缺得多的先補
             _idle_today(fc, _clerk_ck(ctx, c), ctx.d),
             _jitter(ctx.d, ctx.session, "biopsy", c), c))
-        ctx.clerk.remove(pick)
-        slots[BIOPSY] = [pick]
-        fc.biopsy_done[(bk, pick)] = fc.biopsy_done.get((bk, pick), 0) + 1
-        fc.last_biopsy[(bk, pick)] = ctx.d
-        fc.worked_day[_clerk_ck(ctx, pick)] = ctx.d    # 反整天放假：今日已有工作
-        log.append(f"{ctx.session} 切片室 ← Clerk {pick}")
+        _take_biopsy(ctx, slots, log, pick,
+                     "今天不排就補不完" if forced else "配額輪替")
 
 
 def _pgy_ck(ctx, p):
@@ -281,7 +392,11 @@ def _seat(ctx, pool, room, ck, prefer: frozenset = frozenset()):
     但整天閒著」這個真正要救的情形）。不會破壞長期公平：早上放假者當日至多補到 1
     個位子,仍少於整天有課者的 2 個,座位次數自我校正（實測 spread 仍 ≤1）。
     早上時段人人皆「今日尚無工作」→ 此鍵在上午不生效,上午行為與舊版相同。
-    次之總次數最少者優先（公平）；平手時 prefer 先上（Apply 本科 101 週二/五）；
+    次之跟診次數最少者優先（★公平＝使用者 2026-08-24 的主要要求★）；
+    ★這一鍵刻意【只看跟診】★:切片室的次數由配額保證一樣多(見
+    `BiopsyStep`),所以「跟診也一樣多」就等於「總量也一樣多」——
+    把總量混進來反而會讓剛切完片的人被擠出座位,越補越不平。
+    平手時 prefer 先上（Apply 本科 101 週二/五）；
     [2026-07-24] 再比「跟過這間診的次數」少者先、罰「上一次跟診就是這間」（反連排）；
     [2026-07-25 使用者] 再比「與本房已就座者共事過幾次」少者先——房多樣性只管
     「誰跟哪一間」,管不到「誰跟誰」,故仍可能固定同兩人成對（如 1、2 號總是一起）。
@@ -415,7 +530,9 @@ PIPELINE = [PhotoStep(), TreatmentStep(), BiopsyStep(), TwoPgySeatStep(),
 def solve_session(d: date, session: str, rooms: list, pgy_avail: list,
                   clerk_avail: list, biopsy_open: bool, fc: FairCounters,
                   capacity: int = 2, pipeline=None, batch_key: str = "",
-                  apply_pref=frozenset(), two_pgy_mode: bool = False) -> tuple:
+                  apply_pref=frozenset(), two_pgy_mode: bool = False,
+                  biopsy_quota_left=None,
+                  biopsy_force=frozenset()) -> tuple:
     """單一時段填充 → (slots, log)。slots: {房/治療室/切片室/放假: [代號,...]}。"""
     # ★同一個人不可以在池子裡出現兩次★(外審 2026-08-21 P1-01):每一步都是
     #   「選一個 → remove 一個 occurrence」,重複的代號因此可以在同一時段被
@@ -447,7 +564,10 @@ def solve_session(d: date, session: str, rooms: list, pgy_avail: list,
         clerk=sorted(_clerk),
         biopsy_open=biopsy_open, capacity=capacity, fc=fc,
         room_slots={r: [] for r in sorted(rooms)}, batch_key=batch_key,
-        apply_pref=frozenset(apply_pref), two_pgy_mode=two_pgy_mode)
+        apply_pref=frozenset(apply_pref), two_pgy_mode=two_pgy_mode,
+        biopsy_quota_left=(dict(biopsy_quota_left)
+                           if biopsy_quota_left is not None else None),
+        biopsy_force=frozenset(biopsy_force))
     slots: dict = {}
     log: list = list(_log_pre)             # 名單問題要進使用者看得到的警告
     for step in (pipeline or PIPELINE):
@@ -471,6 +591,10 @@ class DaySolveInput:
     # RF-09 跨月梯次延續：上月屬某跨月梯次的既存 day_slots（只餵切片/clerk 公平計數）
     prior_sessions: dict = field(default_factory=dict)  # {iso: {session: slots}}
     prior_pgy: set = field(default_factory=set)          # 上月 PGY 代號（從 replay 剔除）
+    # [RS-24] 年度國定假日(整梯配額的分子要濾掉那些日子 —— 切片格網的 UI
+    #   允許勾選所有平日,不會因為後來變成假日而自動取消;而那一天在該月的
+    #   `month_grid` 裡根本不存在,永遠排不到)。
+    holidays: set = field(default_factory=set)
     apply_pref: set = field(default_factory=set)  # Apply 本科 PGY（101 週二/五平手優先）
 
 
@@ -647,6 +771,115 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
                 replay_counters(fc, d, session, filtered, batch.id,
                                 pgy_set=set(), clerk_set=members)
 
+    # [RS-24] ★期限★:每一個「還解得到的」切片開放時段,在它自己的梯次裡
+    #   後面(含自己)還剩幾個。鎖定時段不算(它不重排,補不了配額)、週三下午
+    #   不算(恆關)。★勝者梯次的判準要與主迴圈一致★(RF-08 取原始順序第一個),
+    #   否則算的是另一梯的剩餘量。
+    #   ★跨月的梯次只看得到本月的格網★ → 剩餘量被低估,期限會提早觸發
+    #   (寧可早一點補到切片,也不要整梯有人沒輪到);下個月那半段會看到
+    #   回放進來的 `biopsy_done`,不會重複強制。
+    _bio_seq: list = []
+    for _d in sorted(inp.grid):
+        if is_weekend(_d):
+            continue
+        _iso = _d.isoformat()
+        _cov = [b for b in inp.clerk_batches if b.covers(_d)]
+        if not _cov:
+            continue
+        for _s in STUDENT_SESSIONS:
+            if (inp.locked.get(_iso) or {}).get(_s) is not None:
+                continue
+            if _d.weekday() == WED and _s == "下午":
+                continue
+            if not (inp.biopsy_open.get(_iso) or {}).get(_s):
+                continue
+            _bio_seq.append((_iso, _s, _cov[0].id))
+    _bio_pos: dict = {}
+    for _i, (_iso, _s, _bid) in enumerate(_bio_seq):
+        _bio_pos[(_iso, _s)] = _i
+    # ★配額的分母是【整梯】的開放時段數,不是本月看得到的那幾個★
+    #   (外審 Codex RS-24 配額版 P1):梯次跨月時,兩個月各看到 8 個時段、
+    #   5 個人 —— 各自算 `8//5=1` 的話整梯只有 2 次,而整梯的正解是
+    #   `16//5=3`,除法的餘數被吃掉了。`biopsy_open` 是【依梯次】載入的
+    #   (`build_day_input`),本來就含跨月日期,所以這裡算得出整梯的量。
+    #   ★用不重複的 (日期, 時段) 集合★:鎖定時段既在開放格網裡、又在鎖定
+    #   表裡的話不可以算兩次。
+    _bio_slots: dict = {}               # {梯次: {(日期, 時段)}}
+    _grid_days = {_d.isoformat() for _d in inp.grid}
+    _grid_last = max(inp.grid) if inp.grid else None
+    # ★這一梯【之後】還有沒有排得到的時段★(外審 Codex 配額版 R2):
+    #   跨月梯次到了第二個月一定看得到上個月的日期,若拿「有沒有格網外的
+    #   日期」當判準,最終那一次的差異就永遠不會被點名。要看的是【未來】。
+    _batch_more: dict = {}
+    for _iso, _sess in (inp.biopsy_open or {}).items():
+        try:
+            _bd = date.fromisoformat(_iso)
+        except (ValueError, TypeError):
+            continue
+        if is_weekend(_bd) or _bd in (inp.holidays or set()):
+            continue        # ★假日不會出現在任何月份的格網裡 → 不是可排的量★
+        _bcov = [b for b in inp.clerk_batches if b.covers(_bd)]
+        if not _bcov:
+            continue
+        for _s, _on in (_sess or {}).items():
+            if not _on or _s not in STUDENT_SESSIONS:
+                continue
+            if _bd.weekday() == WED and _s == "下午":
+                continue                # 週三下午恆關
+            _bio_slots.setdefault(_bcov[0].id, set()).add((_iso, _s))
+            if (_iso not in _grid_days and _grid_last is not None
+                    and _bd > _grid_last):
+                _batch_more[_bcov[0].id] = True
+    # ★鎖定時段已經指派的切片要算數★(外審 Codex RS-24 P2):它不在 `_bio_seq`
+    #   裡(鎖定時段不重排),但那個人【確實會】切到 —— 不排除的話,期限會把
+    #   一個已經有著落的人再補一次,還可能因此擠掉真正沒輪到的人。
+    #   (掃整份鎖定表就夠:落在過去的鎖定時段會由 `replay_counters` 計入
+    #    `biopsy_done`,兩條路都會把他當成已經輪過。)
+    #   ★鍵要含梯次★(外審 Codex 第 2 輪 P2):Clerk 代號是依梯次命名空間的
+    #   (`_clerk_ck`)—— 只存代號的話,別梯的同一個代號會讓這一梯的人被當成
+    #   「已經有著落」而永遠不補。勝者梯次的判準與主迴圈一致(RF-08)。
+    #   ★是「已經占掉一次配額」不是「整個豁免」★:配額制下鎖定時段那一次
+    #   也算他的次數,所以要從他的配額扣一次(而不是把人整個排除);分母也要
+    #   把這些時段算進去(它們確實有人切)。
+    _locked_bx: dict = {}               # {(梯次, 代號): [(順序, 日期)…]}
+    _locked_n: dict = {}                # {梯次: 鎖定時段的切片總數}
+    #   ★鎖定時段一律先從分母拿掉★(外審 Codex 配額版 R2):它不重排,所以
+    #   「本來標示開放」不代表排得到人 —— 只有那一格【確實指派給本梯成員】
+    #   時才把它加回去(那個人真的會切一次)。空的鎖定格、或指派給未知/
+    #   已換梯代號的鎖定格,都不是可分配的量。
+    _ord: dict = {}                     # (iso, 時段) → 全月的先後順序
+    for _i, _d in enumerate(sorted(inp.grid)):
+        for _j, _s in enumerate(STUDENT_SESSIONS):
+            _ord[(_d.isoformat(), _s)] = _i * 10 + _j
+    for _iso, _sessions in (inp.locked or {}).items():
+        try:
+            _ld = date.fromisoformat(_iso)
+        except (ValueError, TypeError):
+            continue
+        _lcov = [b for b in inp.clerk_batches if b.covers(_ld)]
+        if not _lcov:
+            continue
+        if _iso not in _grid_days:
+            # ★掉出格網的鎖定時段只原樣保留,不餵任何計數★(RF-02 的契約):
+            #   那一天在這個月根本沒有開診(假日/週末)—— 主迴圈永遠不會處理它,
+            #   算進配額分母就會把 cap 撐高成排不完的量。
+            continue
+        _lmembers = set(dedupe_codes(_lcov[0].members))
+        for _s, _slots in (_sessions or {}).items():
+            if _s not in STUDENT_SESSIONS:
+                continue
+            _bio_slots.setdefault(_lcov[0].id, set()).discard((_iso, _s))
+            for _c in ((_slots or {}).get(BIOPSY) or []):
+                if str(_c) not in _lmembers:
+                    # ★未知/已換梯的代號不得污染公平計數★(RF-10 的契約;
+                    #   `replay_counters` 也是這樣濾的)—— 算進分母會把配額
+                    #   撐大,自動排班就會多排,反而讓現役成員的次數不一致。
+                    continue
+                _locked_bx.setdefault((_lcov[0].id, str(_c)), []).append(
+                    _ord.get((_iso, _s), -1))
+                _locked_n[_lcov[0].id] = _locked_n.get(_lcov[0].id, 0) + 1
+                _bio_slots.setdefault(_lcov[0].id, set()).add((_iso, _s))
+
     solved_batch_ids: set = set()
     overlap_days: dict = {}               # {(勝者id, 敗者id): [最早重疊日, 最晚重疊日]}
     for d in sorted(inp.grid):
@@ -680,12 +913,53 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
             rooms = (inp.grid.get(d) or {}).get(session) or []
             # 週三下午跟診關閉但治療室照開 → 該時段仍需跑（rooms 為 []）
             biopsy = bool((inp.biopsy_open.get(iso) or {}).get(session))
+            # [RS-24] 配額:整梯開放時段數 ÷ 人數(取整)。★每個人切一樣多★,
+            #   多出來的時段留空。開放數少於人數時取 1(排得到的人先輪,
+            #   輪不到的由月底警告點名 —— 設計文件 C4 的語意)。
+            #   ★跨月的梯次★:本月只看得到自己這半段的格網 → 把上月已經回放
+            #   進 `biopsy_done` 的次數也算進總量,配額才不會被腰斬。
+            _members = dedupe_codes(clerk_members)
+            _quota: "dict | None" = None
+            _force: frozenset = frozenset()
+            _pos = _bio_pos.get((iso, session))
+            if _members and _pos is not None:
+                _cap = max(1, len(_bio_slots.get(batch_key, ()))
+                           // len(_members))
+                _now = _ord.get((iso, session), -1)
+                # ★還沒跑到的鎖定時段要先預留★:那一次已經指派給他了,
+                #   跑到那天 `replay_counters` 才會計入 —— 現在不先扣的話
+                #   會多補他一次(已經跑過的則已在 `biopsy_done` 裡,不重複扣)。
+                _quota = {
+                    c: max(0, _cap - fc.biopsy_done.get((batch_key, c), 0)
+                           - sum(1 for o in _locked_bx.get((batch_key, c), [])
+                                 if o > _now))
+                    for c in _members}
+                # ★還缺的次數★(每人重複出現他還缺的次數)——請假會讓某些人的
+                #   機會被吃掉,判準是「放掉這一格之後還配不配得完」。
+                _todo = [c for c in _members for _ in range(_quota.get(c, 0))]
+                _later = [i2 for i2, s2, b2 in _bio_seq[_pos + 1:]
+                          if b2 == batch_key]
+                _force = _biopsy_forced_today(
+                    _todo, _later,
+                    # ★今天排得到他嗎★要跟正式排班同一個條件
+                    #   (`_biopsy_cands`:同日早+午不得同一人)。
+                    # (誠實標註:這一條的突變不會讓任何測試變紅 —— `BiopsyStep`
+                    #  取的是 `_biopsy_cands ∩ biopsy_force`,已經濾掉今天切過
+                    #  的人。留著是為了讓「非補不可的人」這個集合本身是對的,
+                    #  不是為了防漏;不硬湊一個假的反例來讓它看起來被測到。)
+                    [c for c in _quota
+                     if _quota[c] > 0
+                     and d not in (clerk_leave.get(c) or set())
+                     and fc.last_biopsy.get((batch_key, c)) != d],
+                    lambda c, i2: (date.fromisoformat(i2)
+                                   not in (clerk_leave.get(c) or set())))
             slots, slog = solve_session(
                 d, session, rooms,
                 _avail(inp.pgy_roster, pgy_leave, d),
                 _avail(clerk_members, clerk_leave, d),
                 biopsy, fc, inp.capacity, batch_key=batch_key,
-                apply_pref=frozenset(inp.apply_pref), two_pgy_mode=two_pgy)
+                apply_pref=frozenset(inp.apply_pref), two_pgy_mode=two_pgy,
+                biopsy_quota_left=_quota, biopsy_force=_force)
             day_slots.setdefault(iso, {})[session] = slots
             log.append(f"{d.month}/{d.day}({'一二三四五六日'[d.weekday()]}) "
                        + "；".join(slog))
@@ -718,10 +992,14 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
         if missed:
             warnings.append(f"切片室輪不到（梯次 {b.id}，本梯內未排到）："
                             + "、".join(missed))
-        # [2026-07-24 使用者] 同梯切片次數要一樣：min-first 輪選天生 spread ≤1，
-        # 差距 >1 必是請假/鎖定/切片開放時段不足所致 → 點名讓使用者手動調整。
-        # （跨月梯次只解到半途時計數已含上月回放，不會誤報。）
-        elif counts and max(counts.values()) - min(counts.values()) > 1:
+        # [RS-24] ★配額制下「次數一樣」是要求 → 任何不一致都要點名★
+        #   (外審 Codex 配額版 P2:門檻還停在舊 min-first 容許的 >1)。
+        #   ★但「這一梯之後還排得到」時放寬★:跨月梯次在第一個月本來就只
+        #   排得到一半,那時的差異不是異常(下個月會補齊)——那種情況維持舊的
+        #   >1 門檻,免得每個月都跳一次噪音;到了最後一個月就要嚴格。
+        elif counts and (
+                max(counts.values()) - min(counts.values())
+                > (1 if _batch_more.get(b.id) else 0)):
             warnings.append(
                 f"切片室次數不均（梯次 {b.id}，同梯應盡量一致）："
                 + "、".join(f"{c}×{n}" for c, n in counts.items())

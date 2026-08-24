@@ -113,14 +113,16 @@ def _weekday_grid(start: date, end: date, rooms_am, rooms_pm):
 def test_month_allday_rest_only_on_closed_afternoons():
     """整月驗收：整天放假只會發生在【下午全院無診】的日子（週三）——其餘日子
     每個人每天至少有一個時段有事做。同時確認公平未被犧牲：
-    PGY 照光/治療室差 ≤1、Clerk 每梯切片差 ≤1。"""
+    PGY 照光/治療室差 ≤1、[RS-24] Clerk ★跟診差 ≤1★ 且切片次數一致。
+
+    ([RS-24] 切片室改成配額平均、由跟診最多者去 —— 兩邊的次數要一起平。)"""
     grid, bio = _weekday_grid(date(2026, 8, 3), date(2026, 8, 28),
                               ["101", "103"], ["101", "102", "105"])
     batch = ClerkBatch("b1", date(2026, 8, 3), ["1", "2", "3", "4", "5"])
     day_slots, _log, _w = month_solve_day(DaySolveInput(
         ym="2026-08", grid=grid, pgy_roster=["A", "B", "C", "D"],
         clerk_batches=[batch], biopsy_open=bio))
-    photo, tx, biopsy = {}, {}, {}
+    photo, tx, biopsy, seat = {}, {}, {}, {}
     for iso in sorted(day_slots):
         d = date.fromisoformat(iso)
         sessions = day_slots[iso]
@@ -137,6 +139,8 @@ def test_month_allday_rest_only_on_closed_afternoons():
                         tx[p] = tx.get(p, 0) + 1
                     elif slot == BIOPSY:
                         biopsy[p] = biopsy.get(p, 0) + 1
+                    elif slot != REST:          # 跟診房(照光/治療室/切片之外)
+                        seat[p] = seat.get(p, 0) + 1
         idle = people - worked
         if idle:
             assert d.weekday() == 2, \
@@ -147,4 +151,5 @@ def test_month_allday_rest_only_on_closed_afternoons():
         return max(vals) - min(vals)
     assert spread(photo, "ABCD") <= 1, f"PGY 照光不均: {photo}"
     assert spread(tx, "ABCD") <= 1, f"PGY 治療室不均: {tx}"
+    assert spread(seat, batch.members) <= 1, f"Clerk 跟診不均: {seat}"
     assert spread(biopsy, batch.members) <= 1, f"Clerk 切片不均: {biopsy}"

@@ -88,25 +88,28 @@ def test_fewer_clerks_than_rooms_pairs_first():
     assert slots[paired[0]] == ["1", "C"]                    # 配成 1C+1P(Clerk先)
 
 
-def test_biopsy_assign_and_prefer_undone():
+def test_biopsy_takes_the_one_with_the_most_clinic_so_far():
+    """[RS-24 使用者] ★誰去切片由跟診次數決定★：跟診最多的人去切片，
+    兩邊的次數才會一起被拉平。（舊版挑「切片次數最少者」，管不住跟診。）"""
     fc = FairCounters()
-    fc.biopsy_done[("", "2")] = 1                            # "2" 本梯已輪過
+    fc.seat[("clerk", "bx", "1")] = 4                        # 跟診最多
+    fc.seat[("clerk", "bx", "2")] = 1
     slots, _log = solve_session(
         date(2026, 8, 3), "上午", ["101"],
         pgy_avail=["A"], clerk_avail=["1", "2"],
-        biopsy_open=True, fc=fc)
+        biopsy_open=True, fc=fc, batch_key="bx")
     assert slots[PHOTO] == ["A"]                             # 照光先吃掉唯一 PGY
-    assert slots[BIOPSY] == ["1"]                            # 未輪過者優先（不受抖動影響）
+    assert slots[BIOPSY] == ["1"]
     assert slots["101"] == ["2"]
 
 
 def test_biopsy_fresh_pair_one_in_biopsy_one_in_room():
-    """兩位皆未輪過：切片取其一、另一位進診間（平手由決定性抖動決定，不釘死誰）。"""
+    """兩位條件相同：切片取其一、另一位進診間（平手由決定性抖動決定）。"""
     fc = FairCounters()
     slots, _log = solve_session(
         date(2026, 8, 3), "上午", ["101"],
         pgy_avail=["A"], clerk_avail=["1", "2"],
-        biopsy_open=True, fc=fc)
+        biopsy_open=True, fc=fc, batch_key="bx")
     assert len(slots[BIOPSY]) == 1 and len(slots["101"]) == 1
     assert sorted([*slots[BIOPSY], *slots["101"]]) == ["1", "2"]
 
@@ -122,30 +125,28 @@ def test_biopsy_open_but_no_clerk_stays_silent():
     assert not any("切片室" in ln for ln in log)
 
 
-def test_biopsy_keeps_filling_after_everyone_had_one():
-    """[2026-07-24 使用者·修訂] 全員都輪過一次後，切片室【照排不留空】（可 2、3 次），
-    次數最少者優先——舊版「一次就好」讓切片室空著、Clerk 卻在放假。"""
+def test_biopsy_stops_at_the_quota():
+    """[RS-24 使用者] ★配額用完就留空★：寧可讓切片室空著，也不讓某個人
+    比別人多切（「讓每個人切片室相同」）。"""
     fc = FairCounters()
-    fc.biopsy_done[("bx", "1")] = 1
-    fc.biopsy_done[("bx", "2")] = 1
     slots, log = solve_session(
         date(2026, 8, 3), "上午", ["101"],
         pgy_avail=["A", "B"], clerk_avail=["1", "2"],
-        biopsy_open=True, fc=fc, batch_key="bx")
-    assert len(slots[BIOPSY]) == 1, f"全員輪過就不排了: {slots}"
+        biopsy_open=True, fc=fc, batch_key="bx",
+        biopsy_quota_left={"1": 0, "2": 0})
+    assert BIOPSY not in slots, f"配額用完卻還在排: {slots}"
     assert not any("⚠" in ln for ln in log)
 
 
-def test_biopsy_picks_least_count_first():
-    """次數少者優先（壓過抖動）→ 同梯次數自然拉平，且所有人輪過前不會有人排第二次。"""
+def test_biopsy_prefers_whoever_still_owes_the_most():
+    """跟診一樣多時，配額還缺得多的人先補。"""
     fc = FairCounters()
-    fc.biopsy_done[("bx", "1")] = 2
-    fc.biopsy_done[("bx", "2")] = 1
     slots, _log = solve_session(
         date(2026, 8, 3), "上午", ["101"],
         pgy_avail=["A"], clerk_avail=["1", "2", "3"],
-        biopsy_open=True, fc=fc, batch_key="bx")
-    assert slots[BIOPSY] == ["3"], "應選次數 0 的 3"
+        biopsy_open=True, fc=fc, batch_key="bx",
+        biopsy_quota_left={"1": 1, "2": 1, "3": 2})
+    assert slots[BIOPSY] == ["3"], "還缺 2 次的 3 應優先"
 
 
 def test_biopsy_rest_only_after_biopsy_filled():
@@ -180,8 +181,13 @@ def test_biopsy_not_morning_and_afternoon_same_person_same_day():
 
 
 def test_biopsy_every_session_filled_and_counts_even():
-    """[2026-07-24 使用者·修訂] 整梯切片開好開滿 → 每個時段都排到人（不留空）、
-    每人至少一次、同梯次數差 ≤1（不限一次，可 2、3 次）。"""
+    """人比座位多的情境:每個時段都有一位坐不下 → 切片室每個時段都排到人、
+    每人至少一次。
+
+    [RS-24] 這裡★不是因為「開放就排好排滿」★(那條要求已由使用者
+    2026-08-24 撤除),而是 3 位 Clerk 對 1 房 ×2 個座位 —— 每個時段都恰好
+    有一個人坐不下,補位那步就會把他放進切片室(放假是最後一步)。
+    次數之所以仍然平均,是因為補位優先挑「還沒輪過/總工作次數最少」的人。"""
     fc = FairCounters()
     clerks = ["K1", "K2", "K3"]
     d = date(2026, 8, 3)
