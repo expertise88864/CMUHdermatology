@@ -253,6 +253,24 @@ class TestTheWholeBatchOutcome:
         assert _spread(seat, keys) <= 1, f"跟診不均: {seat}"
         assert _spread(bx, keys) == 0, f"切片不均: {bx}"
 
+    def test_clinic_counts_stay_level_even_when_seats_are_scarce(self):
+        """★[RS-25] 使用者:「跟診次數不能有人兩周跟了 7 次有人跟了 10 次」★
+
+        最擠的情境(3 個人搶 1 個座位 + 1 個切片室)最容易失衡:每個時段一定
+        有人放假,而「今天還沒事做的人優先」若排在次數前面,早上放假的人就會
+        壓過次數更少的人再拿一次 —— 實測會跑出 8/6/6(全距 2)。
+        次數優先之後收斂成全距 ≤1。
+        """
+        grid, bio = _grid(MON, 12, ["101"], ["101"])
+        day_slots, _log, _warns = month_solve_day(DaySolveInput(
+            ym="2026-08", grid=grid, pgy_roster=["P1"],
+            clerk_batches=[ClerkBatch("b1", MON, ["C1", "C2", "C3"])],
+            biopsy_open=bio, capacity=1))
+        seat, bx, _rest = _counts(day_slots)
+        keys = ("C1", "C2", "C3")
+        assert _spread(seat, keys) <= 1, f"跟診不均: {seat}"
+        assert _spread(bx, keys) == 0, f"切片不均: {bx}"
+
     def test_the_totals_are_level_too(self):
         day_slots, _warns = self._solve(
             ["101", "103"], ["101", "102", "105"],

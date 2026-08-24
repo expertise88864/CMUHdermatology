@@ -2,9 +2,11 @@
 """[2026-07-27 使用者] 反「整天放假」：若非放假不可，也盡量讓每人每天至少有半天
 有事做（跟診/照光/治療/切片皆算），而不是早上放假下午又放假。
 
-作法：座位輪選首鍵＝「今天還沒有任何工作者優先」。放在最前面才有效——放在座位
-次數之後幾乎等於沒做：早上放假的人座位次數本來就較低、原本就會被選中，真正需要
-救的正是「次數偏高但整天閒著」這一種。
+★[RS-25 2026-08-24 使用者] 這一條降為【平手時的決勝】★——使用者的新要求是
+「跟診次數不能有人兩週跟了 7 次、有人跟了 10 次」。原本把「今天還沒事做」放在
+座位次數【前面】,會讓跟診次數偏高但今天閒著的人再拿一個位子(本檔原本的例子
+就是 9 次 vs 3 次)—— 那正是 7 vs 10 的來源。
+現在:次數少者永遠先,次數一樣時才輪到「今天還沒事做的人優先」。
 """
 import os
 import sys
@@ -21,21 +23,40 @@ from cmuh_common.roster.solve_day import (  # noqa: E402
 _SPECIAL = (PHOTO, TREATMENT, BIOPSY, REST)
 
 
-def test_idle_person_beats_lower_seat_count_in_afternoon():
-    """核心情形：早上放假者座位次數【較高】時，下午仍優先給他位子。
-    （舊行為只看次數 → 次數低的人再拿一次，早上放假者整天閒著。）"""
+def test_seat_count_beats_idleness_when_they_conflict():
+    """★[RS-25] 兩者衝突時,跟診次數優先★:H 已經跟了 9 次、L 只有 3 次 ——
+    就算 H 今天整天還沒事做,這個位子仍然要給 L。
+
+    (2026-07-27 那一版的行為相反:H 會再拿一次 → 12 次 vs 3 次。
+     使用者 2026-08-24:「跟診次數不能有人兩周跟了 7 次有人跟了 10 次」。)
+    """
     fc = FairCounters()
     d = date(2026, 8, 3)
     ck_hi, ck_lo = ("clerk", "bx", "H"), ("clerk", "bx", "L")
     fc.seat[ck_hi] = 9                        # H 跟診較多
     fc.seat[ck_lo] = 3                        # L 跟診較少
-    fc.worked_day[ck_lo] = d                  # L 今天早上有工作
-    # H 今天完全沒工作（worked_day 沒有今天）→ 下午應優先給 H
+    fc.worked_day[ck_lo] = d                  # L 今天早上有工作、H 沒有
     slots, _log = solve_session(
         d, "下午", ["101"], pgy_avail=[], clerk_avail=["H", "L"],
         biopsy_open=False, fc=fc, capacity=1, batch_key="bx")
-    assert slots["101"] == ["H"], f"整天閒著的人沒被優先補位: {slots}"
-    assert slots[REST] == ["L"]
+    assert slots["101"] == ["L"], f"跟診次數多的人又拿了一次: {slots}"
+    assert slots[REST] == ["H"]
+
+
+def test_idle_person_still_wins_a_tie():
+    """★反整天放假仍然有效,只是降為平手決勝★:次數一樣時,今天還沒事做的人
+    先補位(絕大多數時段都是這個情形)。"""
+    fc = FairCounters()
+    d = date(2026, 8, 3)
+    fc.seat[("clerk", "bx", "H")] = 5
+    fc.seat[("clerk", "bx", "L")] = 5
+    fc.worked_day[("clerk", "bx", "H")] = d   # H 今天早上有工作、L 整天還閒著
+    slots, _log = solve_session(
+        d, "下午", ["101"], pgy_avail=[], clerk_avail=["H", "L"],
+        biopsy_open=False, fc=fc, capacity=1, batch_key="bx")
+    # ★反例要靠這一鍵分勝負★:這一天的決定性抖動偏好 H(見 `_jitter`),
+    #   所以「今天還沒事做的人先」若不生效,選中的會是 H。
+    assert slots["101"] == ["L"], f"平手時沒有優先給整天閒著的人: {slots}"
 
 
 def test_morning_unaffected_everyone_idle():
