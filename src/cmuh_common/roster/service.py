@@ -39,7 +39,7 @@ from cmuh_common.roster.model import (
     dedupe_codes, duplicated_codes, roc,
 )
 from cmuh_common.roster.solve_day import (
-    day_input_fingerprint,
+    arbitration_order, day_input_fingerprint, day_owner_batch,
     BIOPSY, PHOTO, REST, TREATMENT, DaySolveInput, month_solve_day,
     person_course_stats,
 )
@@ -81,6 +81,18 @@ SRC_SETTLE = tuple(sorted(set(SRC_RVS) | set(SRC_BIOPSY)))
 #: 匯出:R/VS 與日排班必須來自【同一份】快照(否則正式文件是拼裝品)。
 SRC_EXPORT = tuple(sorted(set(SRC_RVS) | set(SRC_DAY)))
 
+class DayStructureError(RuntimeError):
+    """日排班有★結構性錯誤★ → 拒絕定案(使用者 2026-08-25 定案)。
+
+    ★只有定案會擋,手動編輯照樣存得下去★:編輯中的班表本來就會經過不完整的
+    中間狀態(先把人搬走再搬回來),擋在那裡只會逼使用者繞路。而定案是
+    【單向】的 —— 它重算帳本並讓月檔唯讀,帶著「切片室 3 個人」定案下去,
+    只能靠解除定案才救得回來。
+    """
+
+
+#: 定案被擋時訊息裡最多列幾筆(其餘請看警告面板)。
+_BAD_SHOWN = 20
 _SCOPE_LABEL = {"r": "R 排班", "vs": "VS 排班"}
 _SPECIAL_SLOTS = frozenset((PHOTO, TREATMENT, BIOPSY, REST))   # 非跟診房的特殊格
 
@@ -983,21 +995,133 @@ class RosterService:
             return 0
         return self.update_month(ym, _mut)
 
+    def validate_day_structure(self, ym: str, *, day_slots=None,
+                               inp=None) -> list:
+        """★結構性錯誤★ —— 這張日排班在【規則上不可能成立】的地方。回訊息清單。
+
+        與 `quick_validate_day` 的其他檢查刻意分開,因為兩者的處置不同
+        (使用者 2026-08-25 定案):
+          * 手動編輯:兩類都★只警告、不擋存檔★(設計 §16.4 的一貫作風);
+          * 定案:★只擋這一類★。定案會重算帳本並讓月檔唯讀 —— 帶著
+            「切片室 3 個人」定案下去,只能靠解除定案才救得回來。
+            而「當日請假卻被排」「輪不到切片室」那些是【要知道但可能正確】
+            的現況,擋了會讓月結卡死。
+
+        檢的是四件事(每一條都出自設計文件,不是這裡發明的):
+          1. 照光 = 0~1 位★本月 PGY★(P2:每時段恰 1 位 PGY,含週三下午);
+          2. 治療室 = 0~1 位★本月 PGY★(P2;週三下午休診 → 0 位也合法,
+             RS-15 兩位 PGY 月的二早/四下/五早同樣是 0 位);
+          3. 切片室 = 0~1 位★當天勝者梯次的 Clerk★(C2 一個時段一個人;
+             C3 有開才排 → 0 位合法。勝者判準與求解器共用
+             `solve_day.day_owner_batch`);
+          4. 同一個人同一時段只能有一個工作(放假也算矛盾),
+             跟診房不得超過房容量。
+
+        ★「幾位」與「誰」都要查★:只查人數的話,「照光排一位 Clerk」照樣過關
+        —— 那一格的規則是「一位 PGY」,身分本來就是規則的一半。
+
+        `day_slots` / `inp` 可由呼叫端帶入,讓定案能驗【它正要定案的那一份
+        月檔快照】,而不是另外再讀一次(外審 RS-6 的同一個理由:兩次讀取
+        之間的差異會讓「驗過的」與「存下去的」不是同一份)。
+        """
+        if day_slots is None:
+            day_slots = self.storage.load_month(ym).get("day_slots") or {}
+        if not day_slots:
+            # ★沒有日排班就沒有結構可言 —— 而且不可以為了「檢查」去讀一份
+            #   這條路本來不需要的權威輸入★:定案原本不碰門診模板/梯次/切片
+            #   格網,多讀一次就是多一條與定案無關的失敗路徑(只有 R/VS 值班
+            #   的月份會因為那些檔案的問題而定不了案)。
+            return []
+        inp = self.build_day_input(ym) if inp is None else inp
+        out: list = []
+        cap = inp.capacity
+        pgy_set = {str(c) for c in inp.pgy_roster}
+        order = arbitration_order(inp)
+        _y, _m = int(ym[:4]), int(ym[5:7])
+        for iso in sorted(day_slots or {}):
+            try:
+                d = date.fromisoformat(iso)
+            except (ValueError, TypeError):
+                continue
+            if (d.year, d.month) != (_y, _m):
+                # ★他月的殘留鍵不歸這個月管★(外審 RS-27 R1 P1):
+                #   `set_day_slot` 不強制 `d ∈ ym`,月檔因此可能殘留他月的鍵
+                #   (舊檔、手改 JSON、跨機合併)——報告、匯出、週期統計三處
+                #   都各自把非本月鍵濾掉,這裡是同一道過濾。
+                #   ★而且這裡是【閘門】★:本月的 UI 只列得出本月的日期,
+                #   拿他月的殘留擋住定案,使用者在程式裡沒有任何辦法修好它
+                #   —— 那就是一道沒有出口的閘門(只能手改 JSON)。
+                #   它自己那個月份的驗證會看到它。
+                continue
+            owner = day_owner_batch(order, d)
+            owner_members = {str(c) for c in (owner.members if owner else [])}
+            for session, slots in sorted((day_slots.get(iso) or {}).items()):
+                # ── 同一個人同一時段只能做一件事 ──────────────────────
+                _where: dict = {}
+                for slot, members in (slots or {}).items():
+                    for c in (members or []):
+                        _where.setdefault(str(c), []).append(str(slot))
+                for c, places in sorted(_where.items()):
+                    if len(places) > 1:
+                        out.append(f"{iso} {session}:{c} 同時被排在 "
+                                   f"{'、'.join(places)} —— 同一個人同一時段"
+                                   f"只能做一件事,請確認名單是否有重複代號")
+                for slot, members in sorted((slots or {}).items()):
+                    members = [str(c) for c in (members or [])]
+                    # ★空格不必特別短路★:下面每一條對空清單本來就是「沒問題」
+                    #   (`> 1` 不成立、沒有 outsider、沒有超容量)。加一個
+                    #   `if not members: continue` 量不出任何差別 —— 那種
+                    #   守衛只會讓人以為「空格是在這裡被放行的」。
+                    if slot in (PHOTO, TREATMENT):
+                        if len(members) > 1:
+                            out.append(
+                                f"{iso} {session}:{slot} 排了 {len(members)} 位"
+                                f"({'、'.join(members)})—— 每個時段只能有 1 位")
+                        outsiders = [c for c in members if c not in pgy_set]
+                        if outsiders:
+                            out.append(
+                                f"{iso} {session}:{slot} 排了 "
+                                f"{'、'.join(outsiders)} —— 這一格只能排本月 PGY")
+                    elif slot == BIOPSY:
+                        if len(members) > 1:
+                            out.append(
+                                f"{iso} {session}:切片室排了 {len(members)} 位"
+                                f"({'、'.join(members)})—— 一個切片時段一個人")
+                        outsiders = [c for c in members
+                                     if c not in owner_members]
+                        if outsiders:
+                            _who = (f"當天的梯次是「{owner.id}」"
+                                    if owner else "當天沒有任何 Clerk 梯次")
+                            out.append(
+                                f"{iso} {session}:切片室排了 "
+                                f"{'、'.join(outsiders)} —— {_who},"
+                                f"切片室只能排該梯次的 Clerk")
+                    elif slot not in _SPECIAL_SLOTS and len(members) > cap:
+                        out.append(f"{iso} {session} {slot} 診:{len(members)} 人"
+                                   f"超過容量 {cap}")
+        return out
+
     def quick_validate_day(self, ym: str) -> list:
         """[RS-07] PGY/Clerk 日排班快速檢查（warn 不擋存，符合設計 §16.4）。回傳訊息清單：
         (a)請假者被排、(b)代號不在當日名單/梯次、(c)週三下午治療室/切片有人、
-        (d)房容量超標、(e)停診房仍有人（兜 RS-03/05 殘留）、
-        (f)★合併後才成立的名單身分衝突★(外審 2026-08-22 P2-03:兩台各改
+        (d)停診房仍有人(兜 RS-03/05 殘留)、
+        (e)★合併後才成立的名單身分衝突★(外審 2026-08-22 P2-03:兩台各改
         一個檔,git 乾淨合併但結果違規)—— 它不屬於某一天,卻會讓每一天都
-        少一個人,放在同一個警告面板使用者才有機會修。"""
+        少一個人,放在同一個警告面板使用者才有機會修。
+
+        ★結構性錯誤(特別格的人數/身分、一人多工、房容量)在
+        `validate_day_structure()`★(RS-27):同一份實作也給定案當閘門用
+        —— 面板上看到的與擋定案的必須是同一套判準,不然使用者會遇到
+        「面板沒說什麼,定案卻不讓過」。"""
         out: list = list(self.validate_roster_identity_invariants())
         month = self.storage.load_month(ym)
         day_slots = month.get("day_slots") or {}
         if not day_slots:
             return out
         inp = self.build_day_input(ym)
-        cap = inp.capacity
         pgy_set = {str(c) for c in inp.pgy_roster}
+        out.extend(self.validate_day_structure(ym, day_slots=day_slots,
+                                               inp=inp))
         closures = self.clinic_closures(ym)
         for iso in sorted(day_slots):
             try:
@@ -1012,20 +1136,6 @@ class RosterService:
             leavers |= {mid for mid, ds in (inp.leaves.get("clerk") or {}).items()
                         if d in ds}
             for session, slots in (day_slots.get(iso) or {}).items():
-                # ★同一個人同一時段只能有一個工作★(外審 2026-08-21 P1-01):
-                #   名單重複、手改 JSON、手動編輯時段都可能造出「照光又在
-                #   治療室」這種物理上做不到的班表 —— 而請假/名單/容量三道
-                #   檢查全部合法,不點名的話它會一路通到定案與匯出。
-                #   放假格不算工作,但「又放假又有工作」同樣是矛盾 → 一起看。
-                _where: dict = {}
-                for slot, members in (slots or {}).items():
-                    for c in (members or []):
-                        _where.setdefault(str(c), []).append(str(slot))
-                for c, places in sorted(_where.items()):
-                    if len(places) > 1:
-                        out.append(f"{iso} {session}:{c} 同時被排在 "
-                                   f"{'、'.join(places)} —— 同一個人同一時段"
-                                   f"只能做一件事,請確認名單是否有重複代號")
                 # 房號型別由 `clinic_closures` 統一正規化(規則只有一份)
                 closed = set((closures.get(iso) or {}).get(session) or [])
                 for slot, members in (slots or {}).items():
@@ -1034,9 +1144,6 @@ class RosterService:
                             and slot in (TREATMENT, BIOPSY) and members):
                         out.append(f"{iso} {session}：{slot} 週三下午應休診，"
                                    f"卻排了 {'、'.join(members)}")
-                    if slot not in _SPECIAL_SLOTS and len(members) > cap:
-                        out.append(f"{iso} {session} {slot} 診：{len(members)} 人"
-                                   f"超過容量 {cap}")
                     if slot in closed and members:
                         out.append(f"{iso} {session}：{slot} 已停診，"
                                    f"卻仍排了 {'、'.join(members)}")
@@ -3921,6 +4028,23 @@ class RosterService:
             self.storage.preflight_required_backup(
                 str(self.storage._month_path(ym)))
             m0, _m0_rev = self.storage.load_month_snapshot(ym)
+            # ★結構錯誤在【動任何東西之前】擋下來★(RS-27,全審 P1-02):
+            #   定案是單向的(重算帳本 + 月檔唯讀),而手動編輯刻意不擋 ——
+            #   所以「切片室 3 個人」「照光排了 Clerk」這種規則上不可能成立的
+            #   班表,唯一還來得及攔的地方就是這裡。
+            #   ★驗的是 `m0` —— 正要被定案的那一份★,不是另外再讀一次
+            #   (兩次讀取之間的差異會讓「驗過的」與「定案的」不是同一份)。
+            _bad = self.validate_day_structure(
+                ym, day_slots=(m0.get("day_slots") or {}))
+            if _bad:
+                _more = (
+                    f"\n…(還有 {len(_bad) - _BAD_SHOWN} 筆,見 PGY/Clerk 分頁右側的警告面板)"
+                    if len(_bad) > _BAD_SHOWN else "")
+                raise DayStructureError(
+                    "日排班有結構性錯誤,先修好才能定案(手動編輯不擋,"
+                    "但定案之後月檔唯讀、帳本也已重算):\n\n"
+                    + "\n".join(f"• {m}" for m in _bad[:_BAD_SHOWN])
+                    + _more)
             # ★這個判斷會決定「要不要回滾本月舊分錄」→ 也算寫入路徑★
             #   (外審次輪 P2-01):壞帳本的寬鬆載入回空 → settled 是空集合 →
             #   已結算但本月沒排班的 scope 不會被重算,舊分錄就永遠留著。

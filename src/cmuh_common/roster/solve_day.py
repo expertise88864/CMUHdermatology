@@ -724,6 +724,33 @@ def _warn_locked_content(warnings: list, d: date, session: str, locked_slots: di
                                 f"當日已請假，仍照鎖定排入——請確認或解鎖重排")
 
 
+def arbitration_order(inp: DaySolveInput) -> list:
+    """仲裁用的梯次順序(原始順序)。
+
+    優先用 `batch_order` —— 它含【只供仲裁的鄰居梯次】(RS-26:上個月某一天的
+    勝者可能是一個本月開始前就結束的梯次)。沒有就退回 `clerk_batches`
+    (直接呼叫求解器的測試/工具)。
+    """
+    return list(inp.batch_order or inp.clerk_batches)
+
+
+def batches_on_day(order, d) -> list:
+    """涵蓋這一天的梯次,★維持原始順序★(勝者判準就是靠這個順序)。"""
+    return [b for b in order if b.covers(d)]
+
+
+def day_owner_batch(order, d):
+    """RF-08:這一天由哪一梯做主 → 該梯次(沒有涵蓋這一天的就 None)。
+
+    ★判準只留一份★:求解器的每一個仲裁點、以及 service 的日排班結構驗證,
+    都問這同一個函式。同日可能被多個梯次涵蓋(設定允許同週一多梯、或起始日
+    打錯而部分重疊),勝者＝原始順序第一個 —— 這是刻意的決定性規則,
+    其餘梯次的成員該日不排。
+    """
+    covering = batches_on_day(order, d)
+    return covering[0] if covering else None
+
+
 def month_solve_day(inp: DaySolveInput) -> tuple:
     """整月逐（工作日×早/午）填充 → (day_slots, log, warnings)。
 
@@ -752,7 +779,9 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
     #   免得「哪些梯次參與仲裁」在不同地方各有一套。
     #   ☆這裡刻意不寫「共 N 個地方」☆:數字會隨程式演進而錯,性質不會
     #   (外審 RS-26 R4 就是漏掉了第五個)。
-    _order = list(inp.batch_order or inp.clerk_batches)
+    #   ★勝者判準本身在 `day_owner_batch()`★(RS-27):service 的結構驗證要問
+    #   同一個問題(切片室那一格該是誰),兩邊共用一份實作。
+    _order = arbitration_order(inp)
     fc = FairCounters()
     day_slots: dict = {}
     log: list = []
@@ -776,7 +805,7 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
         #   把屬於 b0/C1 的既存切片記進 b1/C1 的話,本月會多扣他一次配額
         #   (公平計數刻意用 `(梯次, 代號)` 隔開,選錯梯次等於繞過那道隔離)。
         #   勝者是鄰居時就用【它自己】的命名空間回放:本月不排它,計數互不干擾。
-        batch = next((b for b in _order if b.covers(d)), None)
+        batch = day_owner_batch(_order, d)
         if batch is None:
             continue
         members = set(batch.members)
@@ -809,7 +838,7 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
         if is_weekend(_d):
             continue
         _iso = _d.isoformat()
-        _cov = [b for b in _order if b.covers(_d)]
+        _cov = batches_on_day(_order, _d)
         if not _cov:
             continue
         for _s in STUDENT_SESSIONS:
@@ -852,8 +881,8 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
             # ★分母也要套 RF-08 的勝者判準★(外審 RS-26 R1 P2):重疊日只有
             #   原始順序第一個梯次排得到人 —— 敗者在那些日子的開放是它
             #   【永遠排不到】的量,算進它自己的分母會把配額撐大。
-            _wins = [b for b in _order if b.covers(_bd)]
-            if not _wins or _wins[0].id != _bid:
+            _own = day_owner_batch(_order, _bd)
+            if _own is None or _own.id != _bid:
                 continue
             if is_weekend(_bd) or _bd in (inp.holidays or set()):
                 continue    # ★假日不會出現在任何月份的格網裡 → 不是可排的量★
@@ -902,7 +931,7 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
             _ld = date.fromisoformat(_iso)
         except (ValueError, TypeError):
             continue
-        _lcov = [b for b in _order if b.covers(_ld)]
+        _lcov = batches_on_day(_order, _ld)
         if not _lcov:
             continue
         if _iso not in _grid_days:
@@ -936,8 +965,8 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
         # RF-08：同日可能被多個梯次涵蓋（設定允許同週一多梯、或起始日打錯部分重疊）。
         # 維持與原 next() 相同的決定性勝者＝原始順序第一個；其餘梯次成員該日不排，
         # 累積重疊區間於迴圈後一次示警（點名被忽略的梯次與實際重疊日期）。
-        covering_today = [b for b in _order if b.covers(d)]
-        batch = covering_today[0] if covering_today else None
+        covering_today = batches_on_day(_order, d)
+        batch = day_owner_batch(_order, d)
         for loser in covering_today[1:]:
             rng = overlap_days.setdefault((batch.id, loser.id), [d, d])
             rng[0], rng[1] = min(rng[0], d), max(rng[1], d)
