@@ -129,19 +129,28 @@ def test_settings_ui_save_keeps_three_minutes():
 
 
 def test_cold_start_checks_cooldown_before_spawning():
-    """冷卻檢查必須在 CreateProcess 之前——冷卻中連 HIS 都不該碰。"""
+    """冷卻檢查必須在 CreateProcess 之前——冷卻中連 HIS 都不該碰。
+
+    [CQ-BA 2026-08-24] 閘門抽成 `_login_cooldown_gate()` 給兩條登入路徑共用
+    (SW_HIDE 後備模式原本完全沒有冷卻)。性質沒變:★送帳密之前先查★。
+    """
     import inspect
     src = inspect.getsource(cq._cold_start_session_impl)
-    assert src.index("login_cooldown_remaining") < src.index("CreateProcess")
+    assert src.index("_login_cooldown_gate()") < src.index("CreateProcess")
+    gate = inspect.getsource(cq._login_cooldown_gate)
+    assert "login_cooldown_remaining" in gate
 
 
 def test_cold_start_sets_cooldown_on_login_failure():
     import inspect
-    src = inspect.getsource(cq._cold_start_session_impl)
+    src = inspect.getsource(cq._note_login_failure_cooldown)
     i_login = src.index("isinstance(e, LoginNotCompleted)")
     assert "LOGIN_COOLDOWN_SECONDS" in src[i_login:i_login + 700]
     i_bde = src.index("isinstance(e, HISStartupBlocked)")
     assert "BDE_COOLDOWN_SECONDS" in src[i_bde:i_bde + 300]
+    # ★分類要真的被用到★:沒有呼叫端的話上面那些性質是假的
+    assert "_note_login_failure_cooldown(e, creds_sent)" in inspect.getsource(
+        cq._cold_start_session_impl)
 
 
 def test_any_failure_after_creds_sent_triggers_cooldown():
@@ -152,7 +161,8 @@ def test_any_failure_after_creds_sent_triggers_cooldown():
     assert "creds_sent = False" in src
     i_click = src.index("click_button(confirm)")
     assert "creds_sent = True" in src[i_click:i_click + 120]
-    assert "or creds_sent" in src, "冷卻條件要涵蓋「帳密已送出」的任何失敗"
+    assert "or creds_sent" in inspect.getsource(
+        cq._note_login_failure_cooldown), "冷卻條件要涵蓋「帳密已送出」的任何失敗"
 
 
 def test_recovery_is_kill_restart_relogin_once():

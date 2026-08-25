@@ -31,6 +31,12 @@ class _Sess:
         self.main_pid = pid
         self.main_class = cq.MAIN_CLASS
         self.our_pids = {pid}
+        # [CQ-BA 2026-08-24] `_acquire_session` 換日判斷會問這兩個 ——
+        #   生產的 session 一律由 `_PersistentSession.__init__` 建立,
+        #   所以這裡補上而不是在生產程式加 `getattr` 預設值
+        #   (那會把「少了身分」這個真正的契約破洞藏起來)。
+        self.is_backup = False
+        self.account_day = ""
 
 
 def _clear_ledger():

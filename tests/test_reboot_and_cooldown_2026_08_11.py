@@ -80,12 +80,34 @@ class TestTheLoginCooldownSurvivesARestart:
         assert cq._login_cooldown_until == 0.0
 
     def test_every_cooldown_write_goes_through_the_setter(self):
-        """★直接指派全域變數的話那一次就不會落地★（守衛比紀律可靠）。"""
-        for fn in ("_cold_start_session_impl", "_note_job_success"):
-            body = _strip_comments(_fn_src(fn))
-            assert "_login_cooldown_until =" not in body, (
-                f"{fn} 直接指派了全域變數,那次冷卻不會落地")
-            assert "_set_login_cooldown_until(" in body, fn
+        """★直接指派全域變數的話那一次就不會落地★（守衛比紀律可靠）。
+
+        [CQ-BA 2026-08-24] 原本只掃兩個寫死的函式名 —— 而設冷卻的程式碼這一批
+        就搬了家(抽成 `_note_login_failure_cooldown` 給兩條登入路徑共用)。
+        ★只掃單一檔/單一函式的守衛,程式碼一搬家就靜默失效★:改成掃【整個模組】
+        的每一個指派,唯一允許的地方是那個 setter 自己。
+        """
+        import ast
+        import inspect
+        tree = ast.parse(inspect.getsource(cq))
+        owners = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for n in ast.walk(node):
+                tgts = []
+                if isinstance(n, ast.Assign):
+                    tgts = n.targets
+                elif isinstance(n, (ast.AugAssign, ast.AnnAssign)):
+                    tgts = [n.target]
+                if any(isinstance(t, ast.Name)
+                       and t.id == "_login_cooldown_until" for t in tgts):
+                    owners.append(node.name)
+        assert owners, "找不到任何寫入點 —— 守衛的空集合不算通過"
+        assert set(owners) == {"_set_login_cooldown_until"}, (
+            f"這些函式直接指派了全域變數,那幾次冷卻不會落地: {sorted(set(owners))}")
+        assert "_set_login_cooldown_until(" in _strip_comments(
+            _fn_src("_note_job_success"))
 
     def test_an_old_state_file_without_the_key_is_still_usable(self, tmp_path):
         """舊版寫的檔沒有這個鍵 —— 不可以因此整份忽略(那會連 streak 都丟)。"""

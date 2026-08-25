@@ -525,8 +525,12 @@ def test_extracted_text_appended_to_mail_body(monkeypatch):
     h = _JobHarness(monkeypatch, _base_cfg(body_template="本文"),
                     extracted_text="【病人 1】\n[內容1]\n蜂窩性組織炎")
     cq._do_full_job("17:00")
-    assert h.bodies[0].startswith("本文")
-    assert "蜂窩性組織炎" in h.bodies[0]
+    # [CQ-BA 2026-08-24] 純文字版信首多了一行「目前使用哪一組帳號登入」——
+    #   這條測的是【順序】:註記 → template → 擷取文字。
+    assert "目前使用主帳號登入" in h.bodies[0]
+    _tpl = h.bodies[0].index("本文")
+    assert h.bodies[0].index("目前使用主帳號登入") < _tpl
+    assert h.bodies[0].index("蜂窩性組織炎") > _tpl
 
     # ★第二次要用【另一個排程時段】★(批次AE-8):同一天同一個時段是
     #   【同一次寄送機會】,重跑它會被事件所有權擋下(那正是交棒重複寄的
@@ -534,7 +538,8 @@ def test_extracted_text_appended_to_mail_body(monkeypatch):
     h2 = _JobHarness(monkeypatch, _base_cfg(body_template="本文"),
                      extracted_text="")
     cq._do_full_job("20:00")
-    assert h2.bodies[0] == "本文"
+    assert h2.bodies[0].endswith("本文")
+    assert h2.bodies[0].count("本文") == 1
 
 
 # ─── CQ-01/02/03:會診 poll 通道(解析失敗 fail-open、signature 只看清單) ────

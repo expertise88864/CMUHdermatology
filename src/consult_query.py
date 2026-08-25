@@ -143,6 +143,10 @@ DEFAULT_CONFIG = {
     # 視窗填寫(見 main());既有部署 config 已存在、不受影響。
     "username": "",
     "password": "",
+    # [CQ-BA 2026-08-24 使用者] 備用 HIS 帳號:★只有在主帳號「帳密無法登入」
+    #   時才會用到★(連續三次 `LoginNotCompleted`)。空著就是沒有備用。
+    "backup_username": "",
+    "backup_password": "",
     # 一般排程（每日 12:30 / 17:00）收件人
     "recipients": [
         "expertise88864@gmail.com",
@@ -1948,7 +1952,7 @@ def _fmt_mail_datetime(date_str, time_str) -> str:
 
 
 def _build_consult_email_html(date_str: str, time_str: str, intro: str,
-                              content_html: str) -> str:
+                              content_html: str, account_note: str = "") -> str:
     """組整封 HTML 信(信箋式 + 響應式手機版)。content_html 可空(擷取失敗仍是
     乾淨的標題+前言+頁尾)。
 
@@ -1985,7 +1989,9 @@ def _build_consult_email_html(date_str: str, time_str: str, intro: str,
         f'<div style="font-size:21px;font-weight:600;color:{_MAIL_INK};'
         'margin-top:7px;">會診通知單</div>'
         f'<div style="font-size:13px;color:{_MAIL_MUTED};margin-top:5px;">'
-        f'{_esc(dt)}　·　系統自動擷取</div></div>'
+        f'{_esc(dt)}　·　系統自動擷取'
+        + (f'　·　{_esc(account_note)}' if account_note else "")
+        + '</div></div>'
         f'<div class="cq-hr" style="height:1px;background:{_MAIL_HAIR};'
         'margin:22px 34px;"></div>'
         '<div class="cq-pad" style="padding:0 34px;font-size:13px;'
@@ -2797,7 +2803,8 @@ def run_consult_flow(trigger_label: str = "") -> tuple:
 
 
 def _wait_main_window_after_login(our_pids: set, *, visible_only: bool,
-                                  timeout_sec: float = 120.0) -> int:
+                                  timeout_sec: float = 120.0,
+                                  cfg: dict | None = None) -> int:
     """等住院醫囑主畫面出現;期間把擋在前面的「訊息通知」按掉。回傳 main hwnd。
 
     ★[2026-07-29 實機故障] 原本的迴圈條件是 `if mains and not notice`★
@@ -2860,6 +2867,12 @@ def _wait_main_window_after_login(our_pids: set, *, visible_only: bool,
                 if clicks:
                     logging.info("主畫面已可操作(期間關掉 %d 次訊息通知,"
                                  "不同視窗 %d 個)", clicks, len(distinct_notices))
+                # ★成功登入是「這組帳密可以用」的直接證據★(CQ-BA):使用者說的
+                #   是【連續】三次,中間成功一次就把連續打斷了。少了這一步的話,
+                #   HIS 偶發不穩(早上失敗、中午成功、下午再失敗兩次)會被算成
+                #   「帳密不能用」而誤切備用 —— 而「當天累計三次」只是
+                #   「這組帳密登不進去」的一個方便判準,不是那件事本身。
+                _note_his_login_succeeded()
                 return mains[0]
         # ★[2026-08-05 實機] 先處理【真正擋住輸入】的那個對話框★
         #   診斷傾印顯示:TFMShowMessage 自己也是 disabled 的(en=0),壓在它上面
@@ -2925,6 +2938,11 @@ def _wait_main_window_after_login(our_pids: set, *, visible_only: bool,
         raise _bde_blocked(bde, our_pids, clicks, last_notice_hwnd,
                            distinct_notices)
     if find_windows(LOGIN_CLASS, pids=our_pids, visible_only=True):
+        # ★計數只放這一個地方★(CQ-BA):兩條登入路徑都會走到這裡,而這裡正是
+        #   「帳密送出去了、登入沒完成」唯一被判定出來的地方 —— 使用者定案的
+        #   換帳號條件就是這一種失敗(BDE 起不來/資源耗盡/被接管都不算)。
+        #   放在上層的 handler 反而會漏掉另一條路,或同一次失敗算好幾遍。
+        _note_his_login_rejected(cfg)
         raise LoginNotCompleted(
             "登入沒有完成(登入視窗仍在畫面上)—— 請確認帳號密碼是否被院方改過/"
             "停用,以及 HIS 是否連得上。★本次不再重試登入★(避免同一組帳密被"
@@ -3240,7 +3258,8 @@ def _describe_windows_for_diag(our_pids: set, clicks: int, last_notice,
 class _PersistentSession:
     """一個活著的 systemftp(隱藏桌面)+ 已登入停在主畫面。"""
 
-    def __init__(self, hproc, hthread, pid, our_pids, main_hwnd=None):
+    def __init__(self, hproc, hthread, pid, our_pids, main_hwnd=None,
+                 is_backup=False, account_day=""):
         self.hproc = hproc            # CreateProcess 的行程 handle(殺人執照)
         self.hthread = hthread
         self.pid = pid
@@ -3271,6 +3290,13 @@ class _PersistentSession:
         # 讀不到就是 None,之後一律不採用這個訊號,不會因此判定「換人了」。
         self.main_proc_started = _process_started_at(self.main_pid)
         self.started_at = time.time() # 供 6 小時定期重啟判斷
+        # ★[CQ-BA 外審第 1 輪 P2] 這個 session 是用哪一組帳號、哪一天登入的★
+        #   換日只在「要重新登入」時判斷,而健康的常駐 session 會被直接重用 ——
+        #   昨天用備用帳號登入的 session 過了 00:00 還在服務,使用者定案的出口
+        #   (隔天回主帳號)就被延後到它自己結束為止。把身分記在 session 上,
+        #   取用時才判斷得出來。
+        self.is_backup = bool(is_backup)
+        self.account_day = str(account_day or "")
         # [codex P1 R12] 租約:正在被某個 worker 使用中。run_consult_flow 的 240 秒
         # join 逾時會【棄置】worker(daemon 緒仍在跑),下一輪絕不可跟它共用同一個
         # session(兩個 worker 對同一組 HIS 視窗送命令=截圖錯亂/互相關窗)。
@@ -3280,6 +3306,171 @@ class _PersistentSession:
 _session_lock = threading.Lock()      # 只保護 _psession 參照的取放
 _psession = None
 _login_cooldown_until = 0.0           # 登入失敗冷卻(見 _cold_start_session)
+
+# ── [CQ-BA] 主/備用帳號的當日狀態 ────────────────────────────────────────
+#   ★狀態屬於「哪一天」★:使用者定案的出口就是【隔天自動切回主帳號】——
+#   把日期存進去,判斷時比對今天,跨日就整組歸零。不需要另一個排程/計時器,
+#   也不會兩邊都卡死(主帳號當天再失敗三次才又切過去)。
+_HIS_MAX_PRIMARY_FAILS = 3
+_his_account_day = ""                 # "YYYY-MM-DD";空 = 還沒有狀態
+_his_primary_fails = 0                # ★當天★主帳號「帳密送出但登入沒完成」次數
+_his_using_backup = False
+#   這一次【真的送出帳密】的是哪一組(給信件標頭用)。★是觀測到的事實,
+#   不是從狀態推導的★:狀態可能在寄信之前又變了,而信要說的是「這封信的
+#   資料是用哪一組帳號查出來的」。
+_his_last_login_account = None        # (username, is_backup) 或 None
+#   ★「送出帳密」與「被拒」是兩件事,要能對得起來★:同一次失敗會被好幾層看到
+#   (冷啟動的分類器、`_automation_on_hidden`、job 迴圈),而使用者要數的是
+#   ★帳密被拒幾次★,不是「幾個 handler 看到它」。所以每送出一次帳密就發一個
+#   遞增的序號,計數時只認【比上次計過的還新】的那一次 —— 至多一次。
+#   同一個機制也擋住「這一輪根本沒送帳密」的失敗(序號沒動 → 不算)。
+_his_login_attempt = 0                # 送出過幾次帳密(單調遞增)
+_his_counted_attempt = 0              # 已經算進失敗次數的最新序號
+
+
+def _his_today() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _his_account_roll_day(today: str) -> bool:
+    """跨日就把主帳號的失敗次數與「正在用備用」整組歸零。→ 有沒有歸零。
+
+    ★出口不可以依賴會壞的東西★:不是排程、不是計時器,而是「狀態自己帶著
+    它屬於哪一天」—— 任何一次要用帳密的時候順手比一下就好。
+    """
+    global _his_account_day, _his_primary_fails, _his_using_backup
+    if _his_account_day == today:
+        return False
+    if _his_using_backup or _his_primary_fails:
+        logging.info("[HIS帳號] 換日(%s → %s)→ 切回主帳號、失敗次數歸零",
+                     _his_account_day or "(無)", today)
+    _his_account_day = today
+    _his_primary_fails = 0
+    _his_using_backup = False
+    return True
+
+
+def _has_backup_credentials(cfg: dict) -> bool:
+    return bool(str(cfg.get("backup_username") or "").strip()
+                and str(cfg.get("backup_password") or "").strip())
+
+
+def _current_his_account(cfg: dict) -> tuple:
+    """這一次該用哪一組 → (username, password, 是不是備用, 這個決定屬於哪一天)。
+
+    ★備用帳號沒填就永遠是主帳號★:半套設定(只填代號沒填密碼)不算數 ——
+    那會用一組空密碼去登入,反而多一次失敗。
+
+    ★日期跟帳號是同一個答案★(外審 CQ-BA 第 2 輪 P2):登入要等主畫面,最久
+    120 秒 —— 23:59 決定用備用帳號、00:00 主畫面才出現的話,事後再問一次
+    `_his_today()` 會把這個 session 蓋成「今天的備用 session」,換日判斷就再也
+    收不掉它,備用帳號會一路用滿隔天。所以日期在【選帳號的當下】就跟著回傳,
+    而且回傳的是狀態自己的 `_his_account_day`(剛剛才由 roll 對齊),不是第二次
+    讀時鐘。
+    """
+    changed = _his_account_roll_day(_his_today())
+    if changed:
+        _save_job_fail_state()
+    day = _his_account_day
+    if _his_using_backup and _has_backup_credentials(cfg):
+        return (str(cfg.get("backup_username") or "").strip(),
+                str(cfg.get("backup_password") or ""), True, day)
+    return (str(cfg.get("username") or "").strip(),
+            str(cfg.get("password") or ""), False, day)
+
+
+def _note_his_credentials_sent(username: str, is_backup: bool) -> None:
+    """帳密真的送出去的那一刻(按下「確認」之後)。
+
+    ★記的是【觀測到的事實】★:這一輪用的是哪一組。信件標頭與失敗計數都讀它,
+    不從「目前狀態」回推 —— 狀態可能在這之後又變了。
+    """
+    global _his_login_attempt, _his_last_login_account
+    _his_login_attempt += 1
+    _his_last_login_account = (str(username or "").strip(), bool(is_backup))
+
+
+def _note_his_login_succeeded() -> None:
+    """登入成功 → 主帳號的【連續】失敗次數歸零。
+
+    ★只對「這一次真的送出去的那一組」算數★,而且與失敗共用同一個序號:
+    同一次帳密送出只會被判定一次(成功或失敗),不會兩邊都算。
+    已經切到備用的話不改回主帳號 —— 出口是隔天(使用者定案)。
+    """
+    global _his_primary_fails, _his_counted_attempt
+    if _his_login_attempt <= _his_counted_attempt:
+        return
+    _his_counted_attempt = _his_login_attempt
+    _, is_backup = _his_last_login_account or ("", False)
+    if is_backup or not _his_primary_fails:
+        return
+    logging.info("[HIS帳號] 主帳號登入成功 → 連續失敗次數歸零(原本 %d 次)",
+                 _his_primary_fails)
+    _his_primary_fails = 0
+    _save_job_fail_state()
+
+
+def _note_his_login_rejected(cfg: dict | None = None) -> None:
+    """★只有「帳密送出去了、登入沒完成」才呼叫這裡★(LoginNotCompleted)。
+
+    BDE 起不來、資源耗盡、被別的 worker 接管都不是帳密問題 —— 那些算進來
+    的話,一台環境壞掉的電腦會在三輪之內把備用帳號也一起送進註定失敗的流程,
+    而使用者要的是「只有主帳號的帳密不能登入時才用備用」。
+
+    ★不碰登入冷卻★:切換帳號不是繞過冷卻的旁路。冷卻的用意是「同一段時間內
+    不要對院方密集送帳密」,換一組帳號送並不會讓那件事變得安全 ——
+    備用帳號要等這一輪冷卻結束後才上場。
+    """
+    global _his_primary_fails, _his_using_backup, _his_counted_attempt
+    if _his_login_attempt <= _his_counted_attempt:
+        # 這次失敗沒有送出【新的一次】帳密(或同一次已經算過)→ 不是新的證據。
+        return
+    _his_counted_attempt = _his_login_attempt
+    _, is_backup = _his_last_login_account or ("", False)
+    # ★這是錯誤路徑,不可以再去讀設定檔★:讀檔失敗會把一個已經分類好的
+    #   `LoginNotCompleted` 換成別的例外 —— 那樣登入冷卻就不會被設,
+    #   3 分鐘節奏又會再送一次帳密,正好是冷卻要防的那件事。
+    #   兩個呼叫端(冷啟動、SW_HIDE 後備)手上都有 cfg,直接帶進來。
+    cfg = cfg or {}
+    _his_account_roll_day(_his_today())
+    if is_backup:
+        # 備用也被拒:不再往回切(出口是隔天),只留下可查的紀錄。
+        logging.error("[HIS帳號] ★備用帳號也登入不成功★ —— 今天不再切換,"
+                      "明天會自動回主帳號;請確認兩組帳密是否都被院方改過")
+        _save_job_fail_state()
+        return
+    _his_primary_fails += 1
+    logging.warning("[HIS帳號] 主帳號登入被拒(今天第 %d 次)",
+                    _his_primary_fails)
+    if (_his_primary_fails >= _HIS_MAX_PRIMARY_FAILS
+            and not _his_using_backup):
+        if _has_backup_credentials(cfg):
+            _his_using_backup = True
+            logging.error("[HIS帳號] ★主帳號今天已連續 %d 次登入不成功 → 改用"
+                          "備用帳號★(下一次冷卻結束後生效;明天自動切回主帳號)",
+                          _his_primary_fails)
+        else:
+            logging.error("[HIS帳號] 主帳號今天已連續 %d 次登入不成功,"
+                          "但★沒有設定備用帳號★ —— 請至設定填寫,或確認主帳號"
+                          "帳密是否被院方改過", _his_primary_fails)
+    _save_job_fail_state()
+
+
+def _his_account_note(cfg: dict) -> str:
+    """信件標頭那一句:「目前使用主帳號登入(101358)」。
+
+    ★用「這一次真的送出去的那一組」★:狀態可能在查詢與寄信之間又變了,
+    而信要說的是這封信的資料是用哪一組帳號查出來的。真的沒有觀測值(理論上
+    不會發生:寄信一定在一次登入之後)才退回目前狀態。
+    ★只顯示代號,不顯示密碼★
+    """
+    if _his_last_login_account:
+        user, is_backup = _his_last_login_account
+    else:
+        user, _pw, is_backup, _day = _current_his_account(cfg)
+    label = "備用帳號" if is_backup else "主帳號"
+    user = str(user or "").strip()
+    return f"目前使用{label}登入（{user}）" if user else f"目前使用{label}登入"
 
 
 def _set_login_cooldown_until(ts: float, *, persist: bool = True) -> None:
@@ -3911,6 +4102,40 @@ def _cold_start_session(cfg: dict):
                 _cold_start_owner = None
 
 
+def _login_cooldown_gate() -> None:
+    """送出帳密之前的冷卻閘門。冷卻中 → raise,這一輪不登入。
+
+    ★兩條登入路徑共用同一份判準★(外審 CQ-BA 第 1 輪 P1):原本只有常駐冷啟動
+    查冷卻,SW_HIDE 後備模式(隱藏桌面建不起來時走的那條)完全不查也不設 ——
+    於是「切換帳號不重置冷卻、備用帳號等下一次冷卻結束才上場」在那條路上
+    等於不存在,第三次失敗切換後的下一個觸發會立刻把【第二組】帳密也送出去。
+    """
+    remaining = _keepalive.login_cooldown_remaining(_login_cooldown_until,
+                                                    time.time())
+    if remaining > 0:
+        raise RuntimeError(
+            f"登入冷卻中(前次登入失敗,剩 {remaining / 60.0:.0f} 分)——"
+            f"不重複送出帳密以免逼近鎖定門檻")
+
+
+def _note_login_failure_cooldown(e: BaseException, creds_sent: bool) -> None:
+    """登入類失敗 → 設對應的冷卻。★分類只留一份★,兩條登入路徑共用。
+
+    * `HISStartupBlocked`(BDE 起不來)→ BDE 冷卻:與帳密無關,重試沒有意義。
+    * `LoginNotCompleted` 或【帳密已送出】之後的任何失敗 → 登入冷卻:
+      不然 3 分鐘節奏會每 3 分鐘再送一次帳密,鎖定防護只剩一種等於沒防
+      (2026-08 codex P1 R6 的既有結論)。
+    """
+    if isinstance(e, HISStartupBlocked):
+        _set_login_cooldown_until(time.time() + _keepalive.BDE_COOLDOWN_SECONDS)
+    elif isinstance(e, LoginNotCompleted) or creds_sent:
+        _set_login_cooldown_until(
+            time.time() + _keepalive.LOGIN_COOLDOWN_SECONDS)
+        logging.error("[session] 登入未完成(帳密已送出) → 進入 %d 分鐘"
+                      "登入冷卻(不重複送出帳密)",
+                      _keepalive.LOGIN_COOLDOWN_SECONDS // 60)
+
+
 def _cold_start_session_impl(cfg: dict, owner_token=None):
     """啟動 systemftp + 登入 + 等主畫面 → 存成常駐 session(呼叫緒須在隱藏桌面)。
 
@@ -3919,14 +4144,10 @@ def _cold_start_session_impl(cfg: dict, owner_token=None):
     15 分鐘(=舊輪詢節奏),登入壓力不高於改版前;BDE 取 30 分鐘(等重開機/人工)。
     """
     global _psession
-    remaining = _keepalive.login_cooldown_remaining(_login_cooldown_until,
-                                                    time.time())
-    if remaining > 0:
-        raise RuntimeError(
-            f"登入冷卻中(前次登入失敗,剩 {remaining / 60.0:.0f} 分)——"
-            f"不重複送出帳密以免逼近鎖定門檻")
-    username = cfg["username"]
-    password = cfg["password"]
+    _login_cooldown_gate()
+    # [CQ-BA] ★不直接讀 cfg["username"]★:主帳號當天連續三次「帳密送出但
+    #   登入沒完成」之後要換備用帳號,而換日會自動切回主帳號。
+    username, password, _is_backup, _login_day = _current_his_account(cfg)
     before = _systemftp_pids()
     si = win32process.STARTUPINFO()
     si.dwFlags = win32con.STARTF_USESHOWWINDOW
@@ -4000,14 +4221,20 @@ def _cold_start_session_impl(cfg: dict, owner_token=None):
             raise RuntimeError("找不到「確認」鈕")
         click_button(confirm)
         creds_sent = True
-        logging.info("已送出登入")
+        _note_his_credentials_sent(username, _is_backup)
+        logging.info("已送出登入(%s)", "備用帳號" if _is_backup else "主帳號")
 
         # ★接住回傳的 hwnd★ 以前這行把它丟掉,於是收尾只能靠 PID 差集猜哪個視窗
         #   是自己的 —— 那個集合會混進醫師的行程。見 `_PersistentSession.main_hwnd`。
-        _main_hwnd = _wait_main_window_after_login(our_pids, visible_only=True)
+        _main_hwnd = _wait_main_window_after_login(our_pids, visible_only=True,
+                                                  cfg=cfg)
         logging.info("已進入主畫面")
         sess = _PersistentSession(_hproc, _hthread, _spawned_pid, our_pids,
-                                  main_hwnd=_main_hwnd)
+                                  main_hwnd=_main_hwnd,
+                                  is_backup=_is_backup,
+                                  # ★用【選帳號當下】那個日期★,不可以在這裡
+                                  #   再讀一次時鐘(登入可能已經跨過午夜)。
+                                  account_day=_login_day)
         sess.in_use = True                       # 建立者即持有租約
         # [codex P1 R16] 發布前在鎖內驗「預約還是不是我的」——冷啟動拖過
         # _COLD_START_STALE_SECONDS 被搶走後,本 worker 若仍走到這裡,無條件發布
@@ -4027,18 +4254,7 @@ def _cold_start_session_impl(cfg: dict, owner_token=None):
                      "之後每輪只按查詢再退回", _spawned_pid)
         return sess
     except BaseException as e:
-        if isinstance(e, HISStartupBlocked):
-            _set_login_cooldown_until(
-                time.time() + _keepalive.BDE_COOLDOWN_SECONDS)
-        elif isinstance(e, LoginNotCompleted) or creds_sent:
-            # [codex P1 R6] 帳密【已送出】後的任何啟動失敗(例:登入視窗消失但
-            # 主畫面沒出現的通用 RuntimeError)都要進冷卻——不然 3 分鐘節奏會
-            # 每 3 分鐘再送一次帳密,鎖定防護只剩 LoginNotCompleted 一種等於沒防。
-            _set_login_cooldown_until(
-                time.time() + _keepalive.LOGIN_COOLDOWN_SECONDS)
-            logging.error("[session] 登入未完成(帳密已送出) → 進入 %d 分鐘"
-                          "登入冷卻(不重複送出帳密)",
-                          _keepalive.LOGIN_COOLDOWN_SECONDS // 60)
+        _note_login_failure_cooldown(e, creds_sent)
         _terminate_session_process(
             _PersistentSession(_hproc, _hthread, _spawned_pid, our_pids))
         raise
@@ -4048,8 +4264,21 @@ def _retire_session_if_no_keepalive(sess, cfg: dict) -> None:
     """[codex P2 R21] 休息時段(00-06)的 email/手動觸發:查完【不留】session。
 
     休息時段沒有輪詢 keepalive,留著 5 分鐘就被院方登出,已登出的 systemftp
-    呆掛到 06:00 才被下一輪收掉——查完直接收,06:00 後首輪照常冷啟動。"""
+    呆掛到 06:00 才被下一輪收掉——查完直接收,06:00 後首輪照常冷啟動。
+
+    ★[CQ-BA 外審第 3 輪] 登入期間跨了午夜的備用 session,這一輪用完就收★
+    登入要等主畫面(最久 120 秒):23:59 選了備用、00:00 主畫面才出現的話,
+    這個 session 屬於【昨天】。原本只靠「下一次 `_acquire_session` 會收掉它」
+    —— 那要有下一輪才算數。改成這一輪用完就收,切回主帳號不再依賴別人。
+    ★不在登入成功的當下立刻改登主帳號★:那等於在同一分鐘內對院方連送兩組
+    不同的帳密,正是使用者定案「切換帳號不重置冷卻」要避免的事(方向相反而已)。
+    這一輪的資料是午夜前開始查的,信件標頭也誠實寫著備用帳號。
+    """
     try:
+        if sess.is_backup and sess.account_day != _his_today():
+            _session_close_if_current(
+                sess, "登入期間跨了午夜 → 這一輪用完就收,下一輪回主帳號")
+            return
         if _in_quiet_hours(datetime.now(), load_config()):
             _session_close_if_current(
                 sess, "休息時段觸發的查詢:查完即收(無 keepalive 可維持)")
@@ -4083,6 +4312,15 @@ def _acquire_session(cfg: dict):
         logging.warning("[session] 前一輪逾時的 worker 仍握著 session(pid=%s) → "
                         "終結後冷啟動,絕不共用", stale.pid)
         _terminate_session_process(stale)
+    if sess is not None and sess.is_backup and sess.account_day != _his_today():
+        # ★出口是隔天★(使用者定案):換日就回主帳號。既有的 session 是用備用
+        #   帳號登入的,重用它等於今天還在用備用 —— 收掉它,下面會冷啟動重登。
+        #   ★只對備用動手★:主帳號的 session 本來就是今天想要的那一組,
+        #   為了換日把它關掉只會多一次登入(而每一次登入都逼近院方的鎖定門檻)。
+        logging.info("[HIS帳號] 常駐 session 是 %s 用備用帳號登入的 → 換日收掉,"
+                     "改用主帳號重新登入", sess.account_day or "(不明)")
+        _session_close_if_current(sess, "換日 → 不再沿用昨天的備用帳號 session")
+        sess = None
     if sess is not None:
         death = _session_death_reason(sess)
         if death:
@@ -5163,8 +5401,14 @@ def _bde_reboot_watch_loop(my_gen: int) -> None:
 def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tuple:
     """後備模式：使用者桌面上跑，配合 SW_HIDE 隱形執行緒（可能有短暫閃爍）。
     回傳 (截圖路徑, 擷取文字)。"""
-    username = cfg["username"]
-    password = cfg["password"]
+    # ★冷卻要在【開 systemftp 之前】查★(外審 CQ-BA 第 1 輪 P1):冷卻中還去
+    #   spawn 一個 systemftp,等於白白多開一個要收尾的行程,而且它會撞上院方
+    #   「最多兩個」的上限。
+    _login_cooldown_gate()
+    # [CQ-BA] 後備模式也走同一個存取器 —— 兩條路都送同一組帳密,
+    #   不然「已經換成備用了」只有一半的路徑算數。
+    username, password, _is_backup, _login_day = _current_his_account(cfg)
+    creds_sent = False
 
     before = _systemftp_pids()
     startup = subprocess.STARTUPINFO()
@@ -5314,12 +5558,15 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
         if not confirm:
             raise RuntimeError("登入視窗找不到「確認」鈕")
         click_button(confirm)  # PostMessage BM_CLICK，非阻塞
-        logging.info("已送出登入")
+        creds_sent = True
+        _note_his_credentials_sent(username, _is_backup)
+        logging.info("已送出登入(%s)", "備用帳號" if _is_backup else "主帳號")
 
         # 等主視窗；期間若跳「訊息通知主畫面」就按確認。
         # visible_only=False:本路徑會把視窗 SW_HIDE(見 2026-05-15 註解),
         # 可見性在這裡不是有效訊號。
-        main_hwnd = _wait_main_window_after_login(our_pids, visible_only=False)
+        main_hwnd = _wait_main_window_after_login(our_pids, visible_only=False,
+                                                 cfg=cfg)
         logging.info("已進入主畫面")
 
         # 送選單命令：我的會診清單（背景 PostMessage，不點滑鼠、解析度無關）
@@ -5358,6 +5605,13 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
             consult, cfg, roster_label, settled=_snap)
         return img, extracted, extracted_html, roster_texts
 
+    except BaseException as e:
+        # ★這條路也要設冷卻★(外審 CQ-BA 第 1 輪 P1):原本只有常駐冷啟動會設。
+        #   隱藏桌面建不起來的機器上,登入失敗後下一個觸發會立刻再送一次帳密
+        #   —— 鎖定防護與「備用帳號等冷卻結束才上場」在這條路上都不存在。
+        #   分類與冷啟動共用同一個函式,不另寫一份判準。
+        _note_login_failure_cooldown(e, creds_sent)
+        raise
     finally:
         # 收尾：停掉隱形執行緒、關閉我們這份 systemftp、把前景還給使用者。
         # [review C2 fix] 借用使用者既有實例時，排除啟動前就存在的 pid 不關。
@@ -7174,6 +7428,10 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                 text_parts = []
                 if _poll_extract_note:                     # [CQ-01] 解析失敗 fail-open 註記置信首
                     text_parts.append(_poll_extract_note)
+                # [CQ-BA] 這封信的資料是用哪一組帳號查出來的。★純文字版要跟
+                #   HTML 版一致★:不支援 HTML 的客戶端看到的是這一份。
+                _account_note = _his_account_note(cfg)
+                text_parts.append(_account_note)
                 text_parts.append(body)
                 if punch_text:
                     text_parts.append(punch_text)
@@ -7185,7 +7443,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                 final_html = _build_consult_email_html(
                     date_str, time_str,
                     (_poll_extract_note + "\n" + body) if _poll_extract_note else body,
-                    punch_html + extracted_html)
+                    punch_html + extracted_html, _account_note)
                 # ★[2026-07-30 外審 P2-01] 寄信前先確認「我還是現役嗎」★
                 #   這段流程可能跑很久（HIS 慢/凍結/登入重試）。超過 gate 的
                 #   stale_after_sec（45 分）之後，新的一輪已經接手在做同一件事；
@@ -9174,6 +9432,15 @@ def _load_job_fail_state() -> None:
     #   磁碟上的狀態要在兩個方向都算數,不然「已解除」這件事就落不了地。
     if isinstance(cooldown, (int, float)) and cooldown >= 0:
         _set_login_cooldown_until(float(cooldown), persist=False)
+    # [CQ-BA] 帳號狀態:★三個鍵是一組★ —— 只讀到一半(例如有 using_backup
+    #   卻沒有 day)會變成「一個沒有歸屬日期的備用狀態」,那就永遠不會換日了。
+    global _his_account_day, _his_primary_fails, _his_using_backup
+    _day = data.get("his_account_day")
+    _fails = data.get("his_primary_fails")
+    if isinstance(_day, str) and _day and isinstance(_fails, int) and _fails >= 0:
+        _his_account_day = _day
+        _his_primary_fails = _fails
+        _his_using_backup = bool(data.get("his_using_backup"))
     _forget_future_alert_ts(time.time())
 
 
@@ -9209,7 +9476,15 @@ def _save_job_fail_state() -> None:
                            # [批次SH] 登入冷卻:跨重啟仍然有效(見載入處說明)。
                            #   多一個鍵不必動 schema —— 舊版讀到會忽略它,
                            #   新版讀到舊檔則因為缺這個鍵而維持 0,兩邊都安全。
-                           "login_cooldown_until": _login_cooldown_until})
+                           "login_cooldown_until": _login_cooldown_until,
+                           # [CQ-BA] 主/備用帳號的當日狀態:重啟不該讓「今天
+                           #   主帳號已經失敗兩次」歸零 —— 那正是自動更新/
+                           #   watchdog 重啟最沒防備的地方(同 login_cooldown)。
+                           #   多幾個鍵不必動 schema(舊版忽略、新版讀舊檔時
+                           #   因為缺鍵而維持初值),與上一行同一個前例。
+                           "his_account_day": _his_account_day,
+                           "his_primary_fails": _his_primary_fails,
+                           "his_using_backup": _his_using_backup})
     except Exception:
         logging.debug("[health] 告警節流狀態寫不下去(略過)", exc_info=True)
 
@@ -10000,6 +10275,33 @@ class ConfigApp(tk.Tk):
                         command=lambda: self.pass_entry.config(
                             show="" if self.show_pw.get() else "●")
                         ).grid(row=1, column=2, sticky="w", **pad)
+        # ── [CQ-BA 2026-08-24] 備用帳號 ────────────────────────────────
+        ttk.Separator(cred, orient="horizontal").grid(
+            row=2, column=0, columnspan=3, sticky="ew", pady=(8, 4))
+        ttk.Label(
+            cred,
+            text=("備用帳號(選填):主帳號當天連續 %d 次「帳密送出但登入沒完成」"
+                  "才會改用它;隔天自動切回主帳號。" % _HIS_MAX_PRIMARY_FAILS),
+            foreground="#666", wraplength=420, justify="left").grid(
+                row=3, column=0, columnspan=3, sticky="w", padx=6, pady=4)
+        ttk.Label(cred, text="備用代碼:").grid(row=4, column=0, sticky="w",
+                                            padx=6, pady=4)
+        self.bak_user_var = tk.StringVar(value=self.cfg.get("backup_username", ""))
+        ttk.Entry(cred, textvariable=self.bak_user_var, width=24,
+                  font=("Consolas", 11)).grid(row=4, column=1, sticky="w",
+                                              padx=6, pady=4)
+        ttk.Label(cred, text="備用密碼:").grid(row=5, column=0, sticky="w",
+                                            padx=6, pady=4)
+        self.bak_pass_var = tk.StringVar(value=self.cfg.get("backup_password", ""))
+        self.bak_pass_entry = ttk.Entry(
+            cred, textvariable=self.bak_pass_var, show="●", width=24,
+            font=("Consolas", 11))
+        self.bak_pass_entry.grid(row=5, column=1, sticky="w", padx=6, pady=4)
+        self.show_bak_pw = tk.BooleanVar()
+        ttk.Checkbutton(cred, text="顯示", variable=self.show_bak_pw,
+                        command=lambda: self.bak_pass_entry.config(
+                            show="" if self.show_bak_pw.get() else "●")
+                        ).grid(row=5, column=2, sticky="w", padx=6, pady=4)
 
         rcp = ttk.LabelFrame(
             root, text=f"收件人（可隨時新增/刪除，最多 {_MAX_RECIPIENTS} 位）",
@@ -10095,6 +10397,8 @@ class ConfigApp(tk.Tk):
         cfg = dict(self.cfg)
         cfg["username"] = self.user_var.get().strip()
         cfg["password"] = self.pass_var.get()
+        cfg["backup_username"] = self.bak_user_var.get().strip()
+        cfg["backup_password"] = self.bak_pass_var.get()
         cfg["recipients"] = list(self.rcp_list.get(0, tk.END))
         # [2026-06-25] 改存輪詢間隔 / 半夜休息時段(取代舊的 12:40/17:10 固定排程)。壞值退回預設。
         try:

@@ -52,11 +52,39 @@ def test_uses_is_window_enabled_not_notice_absence():
 
 def test_visible_only_is_a_parameter_not_hardcoded():
     """兩條路徑的可見性語意不同(隱藏桌面 vs SW_HIDE),不可寫死。"""
-    body = _helper()
-    assert "visible_only=visible_only" in body
-    code = _code_only(_src())
-    assert "_wait_main_window_after_login(our_pids, visible_only=True)" in code
-    assert "_wait_main_window_after_login(our_pids, visible_only=False)" in code
+    # ★逐字比對 "visible_only=visible_only" 抓不到這條規則★(CQ-BA 2026-08-24):
+    #   helper 裡有兩處這樣寫,把【主畫面查詢】那一處改寫死,字串照樣在,
+    #   測試照樣綠 —— 而那正是這條測要守的地方。改成指名道姓地看
+    #   `find_windows(MAIN_CLASS, ...)` 的那一個呼叫。
+    import ast
+    main_calls = []
+    for node in ast.walk(ast.parse(_src())):
+        if (isinstance(node, ast.FunctionDef)
+                and node.name == "_wait_main_window_after_login"):
+            for n in ast.walk(node):
+                if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                        and n.func.id == "find_windows" and n.args
+                        and isinstance(n.args[0], ast.Name)
+                        and n.args[0].id == "MAIN_CLASS"):
+                    main_calls.append(n)
+    assert len(main_calls) == 1, "主畫面查詢不只一處(判準會分裂)"
+    kw = {k.arg: k.value for k in main_calls[0].keywords}
+    assert isinstance(kw.get("visible_only"), ast.Name), (
+        "主畫面查詢的可見性寫死了 —— SW_HIDE 那條路上可見性不是有效訊號")
+    assert kw["visible_only"].id == "visible_only"
+    # ★用 AST 而不是逐字比對整行★(CQ-BA 2026-08-24):呼叫端後來多了 `cfg=`
+    #   參數而換行,寫死的那一行就再也對不上 —— 但這條測要證明的性質
+    #   (兩個呼叫端各自明確傳入不同的 visible_only)完全沒有改變。
+    import ast
+    seen = set()
+    for node in ast.walk(ast.parse(_src())):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_wait_main_window_after_login"):
+            for kw in node.keywords:
+                if kw.arg == "visible_only":
+                    assert isinstance(kw.value, ast.Constant), "寫死以外的值"
+                    seen.add(kw.value.value)
+    assert seen == {True, False}, f"兩條路徑的可見性語意不再分開: {seen}"
 
 
 def test_click_log_is_throttled_and_carries_identity():
