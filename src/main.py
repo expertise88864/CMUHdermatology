@@ -17243,6 +17243,19 @@ if __name__ == "__main__":
     DOCTORS = app.doctors_list
     DOCTOR_NAMES = [d["name"] for d in DOCTORS]
 
+    # [Phase 0 2026-08-26 使用者定案] 資源自我量測:跑主程式時自動量,不另開視窗。
+    #   量整個家族(主程式/會診查詢/打卡/watchdog+子孫行程樹)與整機情境,
+    #   每 5 分鐘一筆 → settings 目錄的 resource_meter_YYYYMM.csv。
+    #   ★fail-open★:量測掛了絕不影響本業(啟動失敗只留 debug log)。
+    try:
+        from cmuh_common.resource_meter import ResourceMeter
+        _resource_meter = ResourceMeter(
+            os.path.dirname(get_conf_path("resource_meter_anchor")),
+            "主程式", CURRENT_VERSION)
+        _resource_meter.start()
+    except Exception:
+        logging.debug("資源量測啟動失敗(不影響本業)", exc_info=True)
+
     # [穩定性] health monitor — RAM/時鐘/硬碟 + 記憶體 leak 自動重啟 (A/E/F)
     # 主程式 + Chrome (status driver) 正常 ~200-400MB；warn 500、crit 900
     # 注意：主程式是有 GUI 的，os._exit 會把 UI 直接殺掉 → 但這是 RAM > 900MB
