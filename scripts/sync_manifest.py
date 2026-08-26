@@ -93,6 +93,9 @@ def collect_entries(version: str) -> list:
         # 急救入口。★沒放 extras 的話診間電腦拿到新的 his_contract 載入器,
         # 卻拿不到會寫 override 檔的 probe —— 急救流程等於不存在★(codex R1 P1)。
         "scripts/test_yiling_menu_id.py",
+        # 上面那支的雙擊入口(自我提權;probe 沒 admin 時 UIPI 會讓按鈕看起來
+        # 沒反應)。使用者急救動線:雙擊 → 實測 id → 寫入快速修正 → 重啟主程式。
+        "修正HIS熱鍵ID.cmd",
         # 手動更新腳本本身也要納入線上更新 —— 否則卡在舊版/壞掉的 pull_update.bat
         # 的電腦永遠收不到修正(catch-22),手動 git pull 也一直失敗。純文字 .bat,
         # updater 走 text 路徑可處理(同 安裝Python.bat / installer.bat)。
