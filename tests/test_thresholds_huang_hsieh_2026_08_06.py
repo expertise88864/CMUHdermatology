@@ -22,10 +22,12 @@ from cmuh_common.threshold_policy import (  # noqa: E402
 
 
 def test_default_thresholds_have_the_new_slots():
+    # [2026-08-26 使用者] 謝佳陵四診次(含新增的週六早)預設一律 70(原 75 作廢)。
     assert DEFAULT_THRESHOLDS["huang_wed_morning"] == 60
-    assert DEFAULT_THRESHOLDS["hsieh_thu_morning"] == 75
-    assert DEFAULT_THRESHOLDS["hsieh_thu_night"] == 75
-    assert DEFAULT_THRESHOLDS["hsieh_fri_afternoon"] == 75
+    assert DEFAULT_THRESHOLDS["hsieh_thu_morning"] == 70
+    assert DEFAULT_THRESHOLDS["hsieh_thu_night"] == 70
+    assert DEFAULT_THRESHOLDS["hsieh_fri_afternoon"] == 70
+    assert DEFAULT_THRESHOLDS["hsieh_sat_morning"] == 70
 
 
 def test_huang_map_is_wednesday_morning_only():
@@ -33,18 +35,19 @@ def test_huang_map_is_wednesday_morning_only():
     assert m == {(2, "上午"): 60}, m           # weekday 2 = 週三
 
 
-def test_hsieh_map_covers_the_three_slots():
+def test_hsieh_map_covers_the_four_slots():
     m = build_doctor_threshold_map("謝佳陵", {})
-    assert m == {(3, "上午"): 75,              # 週四早
-                 (3, "晚上"): 75,              # 週四晚
-                 (4, "下午"): 75}, m           # 週五午
+    assert m == {(3, "上午"): 70,              # 週四早
+                 (3, "晚上"): 70,              # 週四晚
+                 (4, "下午"): 70,              # 週五午
+                 (5, "上午"): 70}, m           # 週六早(2026-08-26 新增)
 
 
 def test_user_override_beats_the_default():
     """設定頁改過的值要壓過原廠預設（與沈/陳同機制）。"""
     m = build_doctor_threshold_map("謝佳陵", {"hsieh_thu_night": 90})
     assert m[(3, "晚上")] == 90
-    assert m[(3, "上午")] == 75                # 沒改的維持預設
+    assert m[(3, "上午")] == 70                # 沒改的維持預設
 
 
 def test_alert_flags_default_off():
@@ -103,6 +106,7 @@ def test_main_wires_both_doctors_end_to_end():
     assert "'hsieh_thu_morning': '四早:'" in src
     assert "'hsieh_thu_night': '四晚:'" in src
     assert "'hsieh_fri_afternoon': '五午:'" in src
+    assert "'hsieh_sat_morning': '六早:'" in src   # [2026-08-26] 週六早
     # 還原預設對照
     assert "('alert_huang_enabled', 'alert_huang_enabled', False)" in src
     assert "('alert_hsieh_enabled', 'alert_hsieh_enabled', False)" in src
@@ -229,3 +233,46 @@ def test_registry_covers_every_doctor_with_thresholds(monkeypatch):
         assert len(mails) == 1, (
             f"{doctor} {target}({session}) 達門檻 {threshold} 卻沒寄 → "
             "該醫師沒被接進遠期背景掃描（P1-01 事故重演）")
+
+
+# ══ [2026-08-26 使用者] 謝佳陵 75 → 70 的一次性遷移 ══════════════════════
+class TestHsiehDefaultMigration:
+    """★只改原廠預設救不到已部署機器★:設定檔把 75 存成了明確值。
+    遷移判準:檔案裡★還沒有新鍵 hsieh_sat_morning★(= 本功能之前存的檔)
+    且存值恰等於舊預設 75。使用者存檔一次後檔案就有新鍵 → 遷移自然過期。"""
+
+    @staticmethod
+    def _load(tmp_path, stored: dict) -> dict:
+        import json
+        from cmuh_common.app_settings import load_threshold_settings
+        # ★path 參數是【檔案完整路徑】不是目錄★(與 test_settings_defaults
+        #   的既有呼叫形狀一致)—— 傳目錄的話讀檔失敗會靜默走預設,而新預設
+        #   恰好是期望值,測試就巧合地綠(tests-must-use-the-production-call-shape)。
+        p = tmp_path / "threshold_settings.json"
+        p.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
+        return load_threshold_settings(str(p))
+
+    def test_an_old_file_with_the_old_default_is_migrated(self, tmp_path):
+        data = self._load(tmp_path, {"hsieh_thu_morning": 75,
+                                     "hsieh_thu_night": 75,
+                                     "hsieh_fri_afternoon": 75})
+        assert (data["hsieh_thu_morning"], data["hsieh_thu_night"],
+                data["hsieh_fri_afternoon"]) == (70, 70, 70)
+
+    def test_a_deliberate_75_after_this_feature_is_respected(self, tmp_path):
+        """★反例只靠「檔案有沒有新鍵」分勝負★:同樣存 75,檔案裡已有
+        hsieh_sat_morning(= 本功能之後存過檔)→ 那個 75 是刻意的。"""
+        data = self._load(tmp_path, {"hsieh_thu_morning": 75,
+                                     "hsieh_sat_morning": 70})
+        assert data["hsieh_thu_morning"] == 75
+
+    def test_a_customized_value_is_never_touched(self, tmp_path):
+        """★只遷移「與舊預設不可分辨」的值★:自訂 88 動它就是靜默改設定。"""
+        data = self._load(tmp_path, {"hsieh_thu_morning": 88})
+        assert data["hsieh_thu_morning"] == 88
+
+    def test_an_absent_key_falls_to_the_new_default(self, tmp_path):
+        """檔案裡根本沒有這幾個鍵(從沒動過設定頁)→ 走新原廠預設 70。"""
+        data = self._load(tmp_path, {})
+        assert data.get("hsieh_thu_morning", 70) in ("", 70) or \
+            data["hsieh_thu_morning"] == 70

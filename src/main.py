@@ -14395,7 +14395,8 @@ class AutomationApp:
             self.threshold_entries[key] = var
             self.threshold_labels[key] = f"[陳駿升] {label.rstrip(':')}"
 
-        # [2026-08-06 使用者] 黃建仁:三早預設 60;謝佳陵:四早/四晚/五午預設 75。
+        # [2026-08-06 使用者] 黃建仁:三早預設 60。
+        # [2026-08-26 使用者] 謝佳陵:四早/四晚/五午/六早,預設一律 70(原 75 作廢)。
         # 開關預設關(多台同跑會重複寄信),要提醒的那台自己勾開。
         ttk.Separator(threshold_main_frame, orient='horizontal').pack(fill='x', pady=8)
         huang_frame = ttk.Frame(threshold_main_frame); huang_frame.pack(fill=tk.X, pady=5)
@@ -14411,7 +14412,7 @@ class AutomationApp:
         ttk.Separator(threshold_main_frame, orient='horizontal').pack(fill='x', pady=8)
         hsieh_frame = ttk.Frame(threshold_main_frame); hsieh_frame.pack(fill=tk.X, pady=5)
         ttk.Checkbutton(hsieh_frame, text="啟用 [謝佳陵]    ", variable=self.alert_hsieh_enabled, command=on_doctor_alert_change).pack(side=tk.LEFT, padx=(0, 10))
-        hsieh_labels = {'hsieh_thu_morning': '四早:', 'hsieh_thu_night': '四晚:', 'hsieh_fri_afternoon': '五午:'}
+        hsieh_labels = {'hsieh_thu_morning': '四早:', 'hsieh_thu_night': '四晚:', 'hsieh_fri_afternoon': '五午:', 'hsieh_sat_morning': '六早:'}
         for key, label in hsieh_labels.items():
             ttk.Label(hsieh_frame, text=label).pack(side=tk.LEFT, padx=(5, 2))
             var = tk.StringVar(value=self.threshold_settings.get(key, DEFAULT_THRESHOLDS.get(key, '')))

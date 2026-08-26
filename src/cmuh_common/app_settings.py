@@ -229,6 +229,21 @@ def load_threshold_settings(
             logging.info("[設定] 這台有在做止掛提醒(陳駿升),但沒有啟用過"
                          "張廖年峰 → 沈冠宇提醒【預設不開】;"
                          "需要的話請到設定頁勾選")
+    # ★[2026-08-26 使用者] 謝佳陵預設 75 → 70,並新增週六早★
+    #   已部署機器的設定檔把 75 存成了明確值 —— 只改原廠預設的話,那幾台
+    #   永遠停在 75。遷移判準(與上面沈冠宇那條同一個哲學):
+    #   ★只在檔案裡還沒有新鍵 hsieh_sat_morning 時★(= 本功能之前存的檔)
+    #   把「存值恰等於舊預設 75」的診次改成 70 —— 那個 75 與原廠預設
+    #   不可分辨,而定 75 與定 70 的是同一位使用者。使用者存檔一次之後
+    #   檔案就有新鍵(設定頁會把每一格都存),這條遷移自然過期;
+    #   之後刻意設回 75 會被尊重。
+    if "hsieh_sat_morning" not in data:
+        for _k in ("hsieh_thu_morning", "hsieh_thu_night",
+                   "hsieh_fri_afternoon"):
+            if data.get(_k) == 75:
+                data[_k] = 70
+                logging.info("[設定] 謝佳陵 %s 沿用舊原廠預設 75 → 依 "
+                             "2026-08-26 定案改 70(設定頁可自行調整)", _k)
     if "ui_font_scale" not in data:
         data["ui_font_scale"] = 1.0
     if "notify_dnd_start_hour" not in data:

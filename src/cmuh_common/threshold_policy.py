@@ -19,12 +19,15 @@ DEFAULT_THRESHOLDS = {
     "chen_thu_morning": 54,
     "chen_thu_afternoon": 69,
     "shen_wed_night": 100,
-    # [2026-08-06 使用者] 黃建仁:週三早 60;謝佳陵:週四早/週四晚/週五午都 75。
+    # [2026-08-06 使用者] 黃建仁:週三早 60。
+    # [2026-08-26 使用者] 謝佳陵:新增週六早,且四個診次預設一律 70
+    #   (原 2026-08-06 定的 75 作廢;舊檔存 75 的遷移見 app_settings)。
     # 兩位的提醒開關預設皆關(alert_huang/hsieh_enabled,見 settings_defaults)。
     "huang_wed_morning": 60,
-    "hsieh_thu_morning": 75,
-    "hsieh_thu_night": 75,
-    "hsieh_fri_afternoon": 75,
+    "hsieh_thu_morning": 70,
+    "hsieh_thu_night": 70,
+    "hsieh_fri_afternoon": 70,
+    "hsieh_sat_morning": 70,
 }
 
 # ★止掛提醒對象的沿革(功能契約,寫在程式碼旁邊)★
@@ -35,6 +38,7 @@ DEFAULT_THRESHOLDS = {
 #     2026-08-05  使用者:移除張廖年峰、新增沈冠宇(整套止掛邏輯保留)。
 #                 沈冠宇一早/一午/三午【刻意不給預設值】,只有三晚預設 100。
 #     2026-08-06  使用者(在另一台機器上,commit 624fb39):新增黃建仁、謝佳陵。
+#     2026-08-26  使用者:謝佳陵補【週六早】診次;四診次預設 75 → 70。
 #
 #   ★目前對象:陳駿升、沈冠宇、黃建仁、謝佳陵 四位。★
 #   要增減請改這裡與 `main.py` 的 `ALERT_DOCTORS` 註冊表(唯一來源),
@@ -56,9 +60,10 @@ _DOCTOR_THRESHOLD_KEYS = {
         ((2, "上午"), "huang_wed_morning"),     # 三早：預設 60
     ),
     "謝佳陵": (
-        ((3, "上午"), "hsieh_thu_morning"),     # 四早：預設 75
-        ((3, "晚上"), "hsieh_thu_night"),       # 四晚：預設 75
-        ((4, "下午"), "hsieh_fri_afternoon"),   # 五午：預設 75
+        ((3, "上午"), "hsieh_thu_morning"),     # 四早：預設 70
+        ((3, "晚上"), "hsieh_thu_night"),       # 四晚：預設 70
+        ((4, "下午"), "hsieh_fri_afternoon"),   # 五午：預設 70
+        ((5, "上午"), "hsieh_sat_morning"),     # 六早：預設 70(2026-08-26 新增)
     ),
 }
 
