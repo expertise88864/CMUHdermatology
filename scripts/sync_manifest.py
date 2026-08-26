@@ -89,6 +89,10 @@ def collect_entries(version: str) -> list:
         "安裝Python.bat",
         "第一次執行先點我.bat",  # [2026-06-30] 原 deploy/installer.bat,改名移到根目錄
         "scripts/verify_dependencies.py",
+        # [2026-08-26] HIS 選單 id 探測+本機快速修正工具:院方改版位移 id 時的
+        # 急救入口。★沒放 extras 的話診間電腦拿到新的 his_contract 載入器,
+        # 卻拿不到會寫 override 檔的 probe —— 急救流程等於不存在★(codex R1 P1)。
+        "scripts/test_yiling_menu_id.py",
         # 手動更新腳本本身也要納入線上更新 —— 否則卡在舊版/壞掉的 pull_update.bat
         # 的電腦永遠收不到修正(catch-22),手動 git pull 也一直失敗。純文字 .bat,
         # updater 走 text 路徑可處理(同 安裝Python.bat / installer.bat)。

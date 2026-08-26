@@ -21,6 +21,9 @@ probe 已知：
 from __future__ import annotations
 
 import ctypes
+import datetime
+import json
+import os
 import sys
 import tkinter as tk
 from ctypes import wintypes
@@ -31,6 +34,73 @@ user32 = ctypes.windll.user32
 WM_COMMAND = 0x0111
 TARGET_CLASS = "TFopdmain"
 TARGET_TITLE_KW = "西醫門診醫師作業"
+
+# === 本機快速修正(settings/his_menu_override.json)===
+# 找到正確 id 之後不必等推版:寫進 override 檔、重啟主程式就生效
+# (載入端與驗證規則見 src/cmuh_common/his_contract.py 的「本機快速修正檔」段)。
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.environ.setdefault("CMUH_APP_DIR", ROOT)   # 讓 cmuh_common.paths 錨對根目錄
+
+
+def _load_running_contract():
+    """載入【正在跑的那一棵 src】的 his_contract(部署機由 current.txt 指版)。
+    回 (module, err)。失敗回 (None, 原因) —— 快速修正按鈕會停用,探測照常。"""
+    try:
+        src_dir = os.path.join(ROOT, "src")
+        vp_path = os.path.join(ROOT, "version_pointer.py")
+        if os.path.isfile(vp_path):
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("_vp", vp_path)
+            vp = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(vp)
+            src_dir = vp.resolve_src(ROOT, "menu_id_probe").src_dir
+        sys.path.insert(0, src_dir)
+        import cmuh_common.his_contract as hc
+        if not hasattr(hc, "override_marker"):
+            # 正在跑的打包副本比快速修正功能舊 → 寫了檔它也不會讀。
+            return None, (f"目前執行中的版本({src_dir})還沒有快速修正功能,"
+                          "請先重啟主程式讓它自動更新到 v2026.08.26.2 以上再用")
+        return hc, ""
+    except Exception as e:                       # noqa: BLE001
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _override_file_path() -> str:
+    return os.path.join(ROOT, "settings", "his_menu_override.json")
+
+
+def _write_override(hc, key: str, cmd_id: int) -> str:
+    """把 key=cmd_id 併入 override 檔(帶 for_calibrated_version 戳記)→ 狀態字串。"""
+    path = _override_file_path()
+    data = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            loaded = json.load(f)
+        # ★只有戳記還是現任的才保留舊內容★(codex R2 P1):過期檔裡的其他鍵
+        #   是【上一個校正時代】的 id,合併後蓋上新戳記等於把過期值復活 ——
+        #   熱鍵打到別的功能。戳記不符就整檔重來,只寫這次實測的鍵。
+        if (isinstance(loaded, dict)
+                and loaded.get("for_calibration") == hc.override_marker()):
+            data = loaded
+    except Exception:                            # noqa: BLE001 — 沒有/壞掉都從頭寫
+        pass
+    data[key] = cmd_id
+    data["for_calibration"] = hc.override_marker()
+    data["note"] = (f"probe 實測 {datetime.date.today().isoformat()}")
+    updates, err = hc.parse_override(data, hc.override_marker())
+    if err:                                      # 寫之前先用正式驗證器驗一次
+        return f"❌ 沒寫入:{err}"
+    # ★原子寫入★(codex R3 P1):寫到一半被中斷/磁碟滿,不可以把原本還有效的
+    #   急救檔換成半截 JSON(那會讓下次啟動退回已知錯誤的 id)。tmp+replace,
+    #   失敗時原檔完好。
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        from cmuh_common.atomic_io import atomic_write_json  # noqa: PLC0415
+        atomic_write_json(path, data, ensure_ascii=False, indent=2)
+    except Exception as e:                       # noqa: BLE001
+        return f"❌ 寫入失敗(原檔未動):{type(e).__name__}: {e}"
+    return (f"✔ 已寫入 {key}={cmd_id} → settings/his_menu_override.json,"
+            "重啟主程式生效(正式校正推版後此檔自動失效)")
 
 EnumWindowsProc = ctypes.WINFUNCTYPE(
     wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -123,11 +193,62 @@ def main() -> int:
               font=("Consolas", 12, "bold"),
               foreground="darkgreen").pack(pady=6)
 
+    last_sent = [0]                                 # 最後送出的 id(0=還沒送過)
+
     def make_handler(cid: int):
         def _click():
             send_menu_command(target, cid)
+            last_sent[0] = cid
             result_var.set(f"剛送出 id={cid} → 請看主程式畫面反應")
         return _click
+
+    # ── 本機快速修正:找到對的 id 之後,一鍵寫檔、重啟主程式就生效 ──
+    hc, hc_err = _load_running_contract()
+    apply_var = tk.StringVar(value=(
+        f"⚠ 快速修正停用(讀不到 his_contract:{hc_err})" if hc is None else
+        f"快速修正就緒(程式內建校正 {hc._LITERAL_CALIBRATED_VERSION}:"
+        f"代碼輸入={hc.MENU_ID_代碼輸入}、同意書={hc.MENU_ID_同意書})"))
+
+    def make_apply(key: str):
+        def _apply():
+            cid = last_sent[0]
+            if not cid:
+                messagebox.showwarning("還沒送出任何 id",
+                                       "先按上面的 id 按鈕、確認主程式反應正確,再寫入。")
+                return
+            if not messagebox.askyesno(
+                    "寫入本機快速修正",
+                    f"把 {key} = {cid} 寫入 settings/his_menu_override.json?\n\n"
+                    "⚠ 寫錯 id = 熱鍵打到別的選單功能(誤寫病歷風險),\n"
+                    "請確定剛才主程式開出的就是這個功能的視窗。"):
+                return
+            apply_var.set(_write_override(hc, key, cid))
+        return _apply
+
+    def clear_override():
+        try:
+            os.remove(_override_file_path())
+            apply_var.set("✔ 已刪除本機快速修正檔(重啟主程式後回到程式內建校正值)")
+        except FileNotFoundError:
+            apply_var.set("(本來就沒有本機快速修正檔)")
+        except OSError as e:
+            apply_var.set(f"❌ 刪不掉:{e}")
+
+    apply_frame = ttk.Frame(root)
+    apply_frame.pack(pady=(2, 0))
+    ttk.Button(apply_frame, text="✔ 剛送的 id 就是【代碼輸入】→ 寫入快速修正",
+               command=make_apply("MENU_ID_代碼輸入"),
+               state=("disabled" if hc is None else "normal")).pack(
+                   side="left", padx=4)
+    ttk.Button(apply_frame, text="✔ 剛送的 id 就是【同意書】→ 寫入快速修正",
+               command=make_apply("MENU_ID_同意書"),
+               state=("disabled" if hc is None else "normal")).pack(
+                   side="left", padx=4)
+    ttk.Button(apply_frame, text="清除快速修正",
+               command=clear_override).pack(side="left", padx=4)
+    ttk.Label(root, textvariable=apply_var, wraplength=700,
+              font=("Microsoft JhengHei UI", 9),
+              foreground="#004080").pack(pady=(2, 0))
 
     # 依今天 probe 的新選單結構分區;只放「開對話框」的安全範圍,刻意不含「完成」選單。
     groups = [
@@ -161,6 +282,9 @@ def main() -> int:
         try:
             cid = int(custom_entry.get().strip())
             send_menu_command(target, cid)
+            # ★自訂送出也要更新 last_sent★(codex R1 P1):不然「寫入快速修正」
+            #   會把上一顆按鈕的 id 寫進檔 —— 正是這工具要防的「寫錯 id」。
+            last_sent[0] = cid
             result_var.set(f"目前最後送出的 id：{cid}    請看主程式畫面")
         except ValueError:
             messagebox.showerror("錯誤", "id 必須是整數")

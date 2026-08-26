@@ -1525,6 +1525,12 @@ _HOSPITAL_WIN_TITLE_KW = "西醫門診醫師作業"
 # ★下次院方改版只改那一支★:換 CALIBRATED_VERSION、必要時改 MENU_ID_*,
 #   並在 CALIBRATION_HISTORY 補上憑據。本處保留同名別名,呼叫端不受影響。
 _HIS_CALIBRATED_VERSION = _HIS_CONTRACT.CALIBRATED_VERSION
+# [2026-08-26] 本機快速修正檔(settings/his_menu_override.json)生效/拒用都要在
+# log 大聲說 —— 不允許「安靜地跑著本機特例」。(此處在 basicConfig 之後。)
+if _HIS_CONTRACT.OVERRIDE_NOTE:
+    logging.warning("[his-contract] ★%s★", _HIS_CONTRACT.OVERRIDE_NOTE)
+if _HIS_CONTRACT.OVERRIDE_ERROR:
+    logging.error("[his-contract] ★%s★", _HIS_CONTRACT.OVERRIDE_ERROR)
 _HIS_VERSION_RE = re.compile(r"[Vv]\.?\s*(\d{6,8})")
 # [金絲雀 2026-07-17] 另抓含尾碼的完整版本(V.1150629.01 → 1150629.01)。主版本相同但尾碼
 # 不同(.01→.02)也可能是改版;但尾碼比對【只在基線本身帶尾碼時】才生效(見 sample_his_current_fp)

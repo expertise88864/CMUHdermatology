@@ -89,10 +89,19 @@ def current_calibration() -> Calibration:
 
     找不到 → 表示有人改了版本卻沒補歷史,那正是本模組要防的事,所以直接丟例外
     (啟動時就會炸,不會拖到改版當下才發現沒有憑據)。
+    ★本機快速修正檔可覆蓋 CALIBRATED_VERSION(見下)★:被覆蓋的版本當然沒有
+    歷史紀錄,此時回「字面值版本」那一筆 —— override 是急救貼布,不是校正。
     """
     for c in CALIBRATION_HISTORY:
         if c.version == CALIBRATED_VERSION:
             return c
+    # ★只有【override 真的改了版本】才回退字面值★ 不能看「版本對不上」就回退,
+    # 否則「開發者改了 CALIBRATED_VERSION 卻沒補歷史」這條防線就被吞掉了
+    # (test_missing_history_entry_fails_loudly 釘住)。
+    if _VERSION_OVERRIDDEN:
+        for c in CALIBRATION_HISTORY:
+            if c.version == _LITERAL_CALIBRATED_VERSION:
+                return c
     raise AssertionError(
         f"CALIBRATED_VERSION={CALIBRATED_VERSION} 在 CALIBRATION_HISTORY 裡沒有紀錄 —— "
         "改校正版本時必須同時補上憑據(見本模組開頭的擴充規約)")
@@ -101,4 +110,129 @@ def current_calibration() -> Calibration:
 def describe() -> str:
     """一行人話,給設定頁/log/告警信用。"""
     c = current_calibration()
-    return (f"HIS 選單 id 校正版本 {c.version}(校正日 {c.date};{c.changes})")
+    base = (f"HIS 選單 id 校正版本 {c.version}(校正日 {c.date};{c.changes})")
+    if OVERRIDE_NOTE:
+        base += f";★{OVERRIDE_NOTE}★"
+    if OVERRIDE_ERROR:
+        base += f";★{OVERRIDE_ERROR}★"
+    return base
+
+
+# ── 本機快速修正檔(2026-08-26,急救通道) ────────────────────────────────────
+# 院方改版位移選單 id 時,正式流程(改本檔→過閘→推版→各機更新)最快也要幾十分鐘;
+# 門診當下需要「馬上能用」。settings/ 錨在 app 根目錄、不隨版本切換(見 paths
+# 的 pinned_app_dir),所以把修正寫進 settings 的 JSON、重啟程式就生效,與推版
+# 完全脫鉤。scripts/test_yiling_menu_id.py 的「寫入本機快速修正」按鈕會產生它。
+#
+# ★風險與對應★ 選單 id 錯 = 熱鍵打到別的功能 = 誤寫病歷,所以:
+#   1. 白名單鍵 + 型別/範圍驗證,【任何】一項不對 → 整檔拒用(寧可沒有急救,
+#      不可用到一半對一半的急救)。
+#   2. 檔內必須帶 for_calibration = 它要修補的「校正標記」(override_marker():
+#      字面值版本 + 校正歷史筆數)。任何正式校正都會插一列歷史 → 標記改變 →
+#      override 自動過期失效,不會反過來把更新的正式值蓋回舊值(急救貼布不可以
+#      貼過下一次正式治療)。★不能只比版本★:主版本不變、只動尾碼的重校正
+#      (歷史上沒發生過,但 codex R1 指出可能)也會插歷史列,標記照樣改變。
+#   3. 生效/拒用都寫進 OVERRIDE_NOTE/OVERRIDE_ERROR,describe() 帶出、
+#      main 啟動時記 WARNING —— 不允許「安靜地跑著本機特例」。
+OVERRIDE_FILENAME = "his_menu_override.json"
+_OVERRIDABLE_MENU_IDS = ("MENU_ID_代碼輸入", "MENU_ID_同意書",
+                         "MENU_ID_FINISH_NO_PRINT")
+_LITERAL_CALIBRATED_VERSION = CALIBRATED_VERSION
+OVERRIDE_NOTE = ""      # 非空 = override 生效中(內容=改了什麼)
+OVERRIDE_ERROR = ""     # 非空 = 有 override 檔但整檔被拒用(原因)
+_VERSION_OVERRIDDEN = False   # override 有沒有改到 CALIBRATED_VERSION(供 current_calibration 回退判斷)
+
+
+def override_path() -> str:
+    """本機快速修正檔的完整路徑(settings 目錄,不隨版本切換)。"""
+    from cmuh_common.paths import get_conf_path  # noqa: PLC0415 — 避免載入期硬相依
+    return get_conf_path(OVERRIDE_FILENAME)
+
+
+def override_marker() -> str:
+    """override 的過期戳記:字面值版本 + 校正歷史筆數。
+
+    任何正式校正(含只動尾碼/只 rebaseline 的)都會在 CALIBRATION_HISTORY 插一列
+    → 筆數必然遞增 → 舊 override 必然過期。probe 寫檔時呼叫本函式取當下標記。
+    """
+    return f"{_LITERAL_CALIBRATED_VERSION}#{len(CALIBRATION_HISTORY)}"
+
+
+def parse_override(data, marker: str):
+    """驗證 override 內容 → (updates dict, error str)。純函式,錯誤先於更新。
+
+    回傳 updates 只含「真的要改」的鍵值;error 非空時 updates 必為空
+    (整檔拒用,不做部分套用)。
+    """
+    if not isinstance(data, dict):
+        return {}, "override 內容不是 JSON 物件"
+    allowed = set(_OVERRIDABLE_MENU_IDS) | {
+        "for_calibration", "CALIBRATED_VERSION", "note"}
+    unknown = sorted(set(map(str, data)) - allowed)
+    if unknown:
+        return {}, f"override 含未知鍵 {unknown} → 整檔拒用"
+    got = data.get("for_calibration")
+    if not isinstance(got, str) or got != marker:
+        return {}, (f"override 是給校正 {got!r} 用的,目前程式是 {marker} → "
+                    "已過期/不符,整檔拒用(正式校正已推上去的話請直接刪掉此檔)")
+    note = data.get("note", "")
+    if not isinstance(note, str) or len(note) > 200:
+        return {}, "override 的 note 必須是 ≤200 字的字串"
+    updates = {}
+    for key in _OVERRIDABLE_MENU_IDS:
+        if key not in data:
+            continue
+        v = data[key]
+        if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 65535:
+            return {}, f"override 的 {key}={v!r} 不是 1..65535 的整數 → 整檔拒用"
+        updates[key] = v
+    if "CALIBRATED_VERSION" in data:
+        v = data["CALIBRATED_VERSION"]
+        if not isinstance(v, str) or not v.isdigit() or not 6 <= len(v) <= 8:
+            return {}, (f"override 的 CALIBRATED_VERSION={v!r} 不是 6-8 位數字"
+                        "字串 → 整檔拒用")
+        updates["CALIBRATED_VERSION"] = v
+    if not updates:
+        return {}, "override 沒有任何要修正的鍵 → 檔案無意義,拒用"
+    return updates, ""
+
+
+def _apply_local_override() -> None:
+    """載入期套用本機快速修正(有就套、沒有就安靜)。**絕不丟例外**——
+    六支程式共用本模組,一個壞掉的 settings 不可以讓它們一起起不來。"""
+    global OVERRIDE_NOTE, OVERRIDE_ERROR, _VERSION_OVERRIDDEN
+    import json  # noqa: PLC0415
+    try:
+        try:
+            import io as _io  # noqa: PLC0415
+            with _io.open(override_path(), encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception as e:                      # noqa: BLE001 — JSON 壞/讀不到
+            OVERRIDE_ERROR = f"本機快速修正檔讀取失敗({type(e).__name__}) → 未套用"
+            return
+        updates, err = parse_override(data, override_marker())
+        if err:
+            OVERRIDE_ERROR = f"本機快速修正檔:{err}"
+            return
+        changed = []
+        for key, v in updates.items():
+            old = globals()[key]
+            if old != v:
+                globals()[key] = v
+                changed.append(f"{key} {old}→{v}")
+                if key == "CALIBRATED_VERSION":
+                    _VERSION_OVERRIDDEN = True
+        if changed:
+            OVERRIDE_NOTE = ("本機快速修正生效:" + "、".join(changed)
+                             + f"(settings/{OVERRIDE_FILENAME};正式校正推版後"
+                               "會自動失效)")
+        else:
+            OVERRIDE_NOTE = (f"本機快速修正檔存在但與正式值相同(可刪除 "
+                             f"settings/{OVERRIDE_FILENAME})")
+    except Exception:                               # noqa: BLE001 — 最後保險
+        OVERRIDE_ERROR = "本機快速修正套用時發生未預期錯誤 → 未套用"
+
+
+_apply_local_override()
