@@ -240,7 +240,11 @@ class DayScheduleTab(ttk.Frame):
         self._stats_clerk.tag_configure("hdr", background="#E8E8E8")
         self._stats_clerk.tag_configure("miss", background="#FFD2D2")
         self._stats_clerk.pack(fill="x", padx=6)
-        ttk.Label(side, text="每梯（跨月合併計）至少跟過一次切片室；紅底＝尚未排到",
+        # ★[RS-28 2026-08-25] 這段字原本寫「至少跟過一次切片室」★ —— 那是
+        #   RS-24(2026-08-24 使用者定案「配額平均」)之前的規則。現在的要求是
+        #   同梯次數一致(配額用完就留空),不是「有排到就好」。
+        ttk.Label(side, text="每梯（跨月合併計）切片次數應一致；"
+                            "紅底＝未排到或少於同梯其他人",
                   foreground="gray", wraplength=250,
                   justify="left").pack(anchor="w", padx=6, pady=(2, 0))
         ttk.Label(side, text="警告", font=(_OVR_FONT, 10, "bold")
@@ -290,8 +294,20 @@ class DayScheduleTab(ttk.Frame):
             logging.debug("[roster.ui] 月曆總覽重繪失敗", exc_info=True)
 
     def _refresh_stats(self) -> None:
-        """[2026-07-23] 側欄週期次數統計（PGY+Clerk 皆刷；吃存檔 day_slots）。"""
+        """[2026-07-23] 側欄週期次數統計（PGY+Clerk 皆刷；吃存檔 day_slots）。
+
+        ★紅底的判準與警告面板同一份★(RS-28):原本寫死「切片次數 == 0」,
+        那是 RS-24 之前的規則 —— 配額平均之下,「有排到但比同梯少」一樣是
+        要修的事,而「這一梯之後還排得到」時又不該一直跳紅。判準統一由
+        `service.validate_course_quota()` 給。
+        """
         data = self.service.day_course_stats(self.app.ym)
+        try:
+            _flagged = self.service.validate_course_quota(self.app.ym)[1]
+        except Exception:
+            logging.debug("[roster.ui] 切片配額判定失敗 → 這次不標紅",
+                          exc_info=True)
+            _flagged = set()
         t = self._stats_pgy
         t.delete(*t.get_children())
         stats, roster = data["pgy"]["stats"], data["pgy"]["roster"]
@@ -307,7 +323,8 @@ class DayScheduleTab(ttk.Frame):
             for c in sorted({*b["members"], *b["stats"]}):
                 st = b["stats"].get(c) or dict.fromkeys(STAT_KEYS, 0)
                 t2.insert("", "end",
-                          tags=(("miss",) if st["biopsy"] == 0 else ()),
+                          tags=(("miss",) if (b["id"], str(c)) in _flagged
+                                else ()),
                           values=(c, st["biopsy"], st["follow"], st["rest"]))
 
     def _refresh_warnings(self, warnings) -> None:

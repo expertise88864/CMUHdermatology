@@ -751,6 +751,187 @@ def day_owner_batch(order, d):
     return covering[0] if covering else None
 
 
+def batch_biopsy_slots(inp: DaySolveInput, order=None) -> tuple:
+    """整梯【真的排得到】的切片時段 → ({梯次: {(iso, 時段)}}, 之後還有的梯次 id)。
+
+    ★這是配額的分母,也是「這一梯排完了沒」的依據★(RS-28):求解器拿它算
+    每人該切幾次;service 的現況檢查拿第二個回傳值決定要用哪一種門檻。
+    ★判準只留一份★ —— 兩邊不可以各自數一次「開放了幾個時段」。
+
+    盤點時逐條套用的排除規則(每一條都有它自己的外審來歷):
+      * 只算【這一梯自己涵蓋】的日期;
+      * ★分母也要套 RF-08 的勝者判準★(外審 RS-26 R1 P2):重疊日只有原始
+        順序第一個梯次排得到人 —— 敗者在那些日子的開放是它【永遠排不到】的量,
+        算進它自己的分母會把配額撐大;
+      * 週末/國定假日不在任何月份的格網裡,不是可排的量;
+      * ★「那一天到底開不開診」要用該月的格網★(外審 2026-08-24 P1-01):
+        切片格網的 UI 允許勾選所有平日,而下個月那一天可能整天停診;
+        `course_days` 是整梯真正開診的日子(呼叫端沒算就退回舊行為);
+      * 週三下午恆關;
+      * ★用不重複的 (日期, 時段) 集合★:既在開放格網又在鎖定表裡不可算兩次。
+
+    第二個回傳值是★這一梯【之後】還有沒有排得到的時段★(外審 Codex 配額版 R2):
+    跨月梯次到了第二個月一定看得到上個月的日期,若拿「有沒有格網外的日期」
+    當判準,最終那一次的差異就永遠不會被點名 —— 要看的是【未來】。
+    """
+    order = arbitration_order(inp) if order is None else order
+    slots: dict = {}
+    more: set = set()
+    grid_days = {d.isoformat() for d in inp.grid}
+    grid_last = max(inp.grid) if inp.grid else None
+    for bid, days in (inp.biopsy_open or {}).items():
+        bat = next((b for b in inp.clerk_batches if b.id == bid), None)
+        if bat is None:
+            continue
+        for iso, sess in (days or {}).items():
+            try:
+                bd = date.fromisoformat(iso)
+            except (ValueError, TypeError):
+                continue
+            if not bat.covers(bd):
+                continue
+            own = day_owner_batch(order, bd)
+            if own is None or own.id != bid:
+                continue
+            if is_weekend(bd) or bd in (inp.holidays or set()):
+                continue
+            if inp.course_days and iso not in inp.course_days:
+                continue
+            for s, on in (sess or {}).items():
+                if not on or s not in STUDENT_SESSIONS:
+                    continue
+                if bd.weekday() == WED and s == "下午":
+                    continue
+                slots.setdefault(bid, set()).add((iso, s))
+                if (iso not in grid_days and grid_last is not None
+                        and bd > grid_last):
+                    more.add(bid)
+    return slots, more
+
+
+def apply_locked_biopsy_adjustment(inp: DaySolveInput, order,
+                                   bio_slots: dict) -> tuple:
+    """鎖定時段對切片分母的調整(就地修改 bio_slots)→
+    (locked_keys, locked_bx, locked_n, ord_map)。
+
+    ★solver 與 service 的現況檢查共用這一份★(外審 RS-28 R2 P2):cap 的分母
+    在求解器裡會被這裡調整(鎖定格先拿掉、有效鎖定切片加回、未知代號不加回),
+    service 若用原始盤點算 cap,求解器合法排出的平均結果會被誤報「超過配額」,
+    反向(鎖定成空白的開放格)也會漏掉等量的超額 —— 兩邊必須用同一個
+    「有效時段集合」。service 只需要調整後的 `bio_slots`,其餘三個回傳值是
+    求解器要的(鎖定預扣/順序)。
+
+    (內文自求解器逐字搬移;開頭別名只是接參數,勿「整理」成改名 ——
+     ★byte-identical 的搬移之外不該有第二種變更★。)
+    """
+    _order, _bio_slots = order, bio_slots
+    _grid_days = {_d.isoformat() for _d in inp.grid}
+    # ★鎖定時段已經指派的切片要算數★(外審 Codex RS-24 P2):它不在 `_bio_seq`
+    #   裡(鎖定時段不重排),但那個人【確實會】切到 —— 不排除的話,期限會把
+    #   一個已經有著落的人再補一次,還可能因此擠掉真正沒輪到的人。
+    #   (掃整份鎖定表就夠:落在過去的鎖定時段會由 `replay_counters` 計入
+    #    `biopsy_done`,兩條路都會把他當成已經輪過。)
+    #   ★鍵要含梯次★(外審 Codex 第 2 輪 P2):Clerk 代號是依梯次命名空間的
+    #   (`_clerk_ck`)—— 只存代號的話,別梯的同一個代號會讓這一梯的人被當成
+    #   「已經有著落」而永遠不補。勝者梯次的判準與主迴圈一致(RF-08)。
+    #   ★是「已經占掉一次配額」不是「整個豁免」★:配額制下鎖定時段那一次
+    #   也算他的次數,所以要從他的配額扣一次(而不是把人整個排除);分母也要
+    #   把這些時段算進去(它們確實有人切)。
+    _locked_bx: dict = {}               # {(梯次, 代號): [(順序, 日期)…]}
+    _locked_n: dict = {}                # {梯次: 鎖定時段的切片總數}
+    #   ★鎖定時段【不是】還能分給別人的容量★(外審 RS-26 R1 P2):它算進配額
+    #   分母(那一格確實有人切),但可行性匹配若把它當成「之後還排得到」的
+    #   機會,就會虛構出一個不存在的未來 → 今天挑錯人。
+    _locked_keys: dict = {}             # {梯次: {(日期, 時段)}}
+    #   ★鎖定時段一律先從分母拿掉★(外審 Codex 配額版 R2):它不重排,所以
+    #   「本來標示開放」不代表排得到人 —— 只有那一格【確實指派給本梯成員】
+    #   時才把它加回去(那個人真的會切一次)。空的鎖定格、或指派給未知/
+    #   已換梯代號的鎖定格,都不是可分配的量。
+    _ord: dict = {}                     # (iso, 時段) → 全月的先後順序
+    for _i, _d in enumerate(sorted(inp.grid)):
+        for _j, _s in enumerate(STUDENT_SESSIONS):
+            _ord[(_d.isoformat(), _s)] = _i * 10 + _j
+    for _iso, _sessions in (inp.locked or {}).items():
+        try:
+            _ld = date.fromisoformat(_iso)
+        except (ValueError, TypeError):
+            continue
+        _lcov = batches_on_day(_order, _ld)
+        if not _lcov:
+            continue
+        if _iso not in _grid_days:
+            # ★掉出格網的鎖定時段只原樣保留,不餵任何計數★(RF-02 的契約):
+            #   那一天在這個月根本沒有開診(假日/週末)—— 主迴圈永遠不會處理它,
+            #   算進配額分母就會把 cap 撐高成排不完的量。
+            continue
+        _lmembers = set(dedupe_codes(_lcov[0].members))
+        for _s, _slots in (_sessions or {}).items():
+            if _s not in STUDENT_SESSIONS:
+                continue
+            _locked_keys.setdefault(_lcov[0].id, set()).add((_iso, _s))
+            _bio_slots.setdefault(_lcov[0].id, set()).discard((_iso, _s))
+            for _c in ((_slots or {}).get(BIOPSY) or []):
+                if str(_c) not in _lmembers:
+                    # ★未知/已換梯的代號不得污染公平計數★(RF-10 的契約;
+                    #   `replay_counters` 也是這樣濾的)—— 算進分母會把配額
+                    #   撐大,自動排班就會多排,反而讓現役成員的次數不一致。
+                    continue
+                _locked_bx.setdefault((_lcov[0].id, str(_c)), []).append(
+                    _ord.get((_iso, _s), -1))
+                _locked_n[_lcov[0].id] = _locked_n.get(_lcov[0].id, 0) + 1
+                _bio_slots.setdefault(_lcov[0].id, set()).add((_iso, _s))
+    return _locked_keys, _locked_bx, _locked_n, _ord
+
+
+def biopsy_quota_warnings(batches, counts, *, batch_more=(),
+                          only_ids=None, caps=None) -> tuple:
+    """切片室配額的點名 → (人話警告清單, 該被標紅的 {(梯次, 代號)})。
+
+    `counts` = {(梯次 id, 代號): 次數}。求解器餵它自己的公平計數;
+    service 餵【現況】(存檔的 day_slots,含手動改過的格)——
+    ★同一份判準★,不然「排出來當下說平均、手改之後沒人再說話」。
+
+    * ★超過配額★:`caps` 給了這一梯的每人上限就檢查它 —— ★「次數相同」
+      不足以證明沒有超過★(外審 RS-28 R1 P2):手動編輯視窗固定提供切片欄位,
+      寫入端也不要求該時段在 `biopsy_open` 裡,兩人各自在非開放時段多排一次
+      就是 2/2、全距 0、全部靜默,而 RS-24 明定配額用完要留空。
+      (求解器本來就不會超額,所以它傳不傳 `caps` 都一樣。)
+    * 一個人都沒輪到 → 點名(設計文件 C4);
+    * 否則★配額制下「次數一樣」是要求,任何不一致都要點名★(RS-24)——
+      但這一梯之後還排得到時放寬成 >1,免得跨月梯次的第一個月每次都跳噪音。
+    """
+    out: list = []
+    flagged: set = set()
+    for b in batches:
+        if only_ids is not None and b.id not in only_ids:
+            continue
+        c2 = {c: int(counts.get((b.id, c), 0)) for c in sorted(b.members)}
+        if not c2:
+            continue
+        _cap = (caps or {}).get(b.id)
+        if _cap is not None:
+            over = [(c, n) for c, n in c2.items() if n > _cap]
+            if over:
+                out.append(
+                    f"切片室超過配額（梯次 {b.id}，每人上限 {_cap} 次）："
+                    + "、".join(f"{c}×{n}" for c, n in over)
+                    + " —— 配額用完的時段應留空，請於月曆改回")
+        missed = [c for c, n in c2.items() if n == 0]
+        if missed:
+            out.append(f"切片室輪不到（梯次 {b.id}，本梯內未排到）："
+                       + "、".join(missed))
+            flagged |= {(b.id, c) for c in missed}
+        elif (max(c2.values()) - min(c2.values())
+                > (1 if b.id in batch_more else 0)):
+            out.append(
+                f"切片室次數不均（梯次 {b.id}，同梯應盡量一致）："
+                + "、".join(f"{c}×{n}" for c, n in c2.items())
+                + " —— 多因請假/鎖定時段所致，可手動於月曆調整")
+            _top = max(c2.values())
+            flagged |= {(b.id, c) for c, n in c2.items() if n < _top}
+    return out, flagged
+
+
 def month_solve_day(inp: DaySolveInput) -> tuple:
     """整月逐（工作日×早/午）填充 → (day_slots, log, warnings)。
 
@@ -860,101 +1041,10 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
     #   (`build_day_input`),本來就含跨月日期,所以這裡算得出整梯的量。
     #   ★用不重複的 (日期, 時段) 集合★:鎖定時段既在開放格網裡、又在鎖定
     #   表裡的話不可以算兩次。
-    _bio_slots: dict = {}               # {梯次: {(日期, 時段)}}
+    _bio_slots, _batch_more = batch_biopsy_slots(inp, _order)
     _grid_days = {_d.isoformat() for _d in inp.grid}
-    _grid_last = max(inp.grid) if inp.grid else None
-    # ★這一梯【之後】還有沒有排得到的時段★(外審 Codex 配額版 R2):
-    #   跨月梯次到了第二個月一定看得到上個月的日期,若拿「有沒有格網外的
-    #   日期」當判準,最終那一次的差異就永遠不會被點名。要看的是【未來】。
-    _batch_more: dict = {}
-    for _bid, _days in (inp.biopsy_open or {}).items():
-        _bat = next((b for b in inp.clerk_batches if b.id == _bid), None)
-        if _bat is None:
-            continue
-        for _iso, _sess in (_days or {}).items():
-            try:
-                _bd = date.fromisoformat(_iso)
-            except (ValueError, TypeError):
-                continue
-            if not _bat.covers(_bd):
-                continue
-            # ★分母也要套 RF-08 的勝者判準★(外審 RS-26 R1 P2):重疊日只有
-            #   原始順序第一個梯次排得到人 —— 敗者在那些日子的開放是它
-            #   【永遠排不到】的量,算進它自己的分母會把配額撐大。
-            _own = day_owner_batch(_order, _bd)
-            if _own is None or _own.id != _bid:
-                continue
-            if is_weekend(_bd) or _bd in (inp.holidays or set()):
-                continue    # ★假日不會出現在任何月份的格網裡 → 不是可排的量★
-            # ★「那一天到底開不開診」要用該月的格網★(外審 2026-08-24 P1-01):
-            #   切片格網的 UI 允許勾選所有平日,而下個月那一天可能整天停診 ——
-            #   算進分母就撐出一個補不完的配額。`course_days` 是本月 + 下個月
-            #   真正開診的日子;呼叫端沒算(空集合)時退回舊行為。
-            if inp.course_days and _iso not in inp.course_days:
-                continue
-            for _s, _on in (_sess or {}).items():
-                if not _on or _s not in STUDENT_SESSIONS:
-                    continue
-                if _bd.weekday() == WED and _s == "下午":
-                    continue            # 週三下午恆關
-                _bio_slots.setdefault(_bid, set()).add((_iso, _s))
-                if (_iso not in _grid_days and _grid_last is not None
-                        and _bd > _grid_last):
-                    _batch_more[_bid] = True
-    # ★鎖定時段已經指派的切片要算數★(外審 Codex RS-24 P2):它不在 `_bio_seq`
-    #   裡(鎖定時段不重排),但那個人【確實會】切到 —— 不排除的話,期限會把
-    #   一個已經有著落的人再補一次,還可能因此擠掉真正沒輪到的人。
-    #   (掃整份鎖定表就夠:落在過去的鎖定時段會由 `replay_counters` 計入
-    #    `biopsy_done`,兩條路都會把他當成已經輪過。)
-    #   ★鍵要含梯次★(外審 Codex 第 2 輪 P2):Clerk 代號是依梯次命名空間的
-    #   (`_clerk_ck`)—— 只存代號的話,別梯的同一個代號會讓這一梯的人被當成
-    #   「已經有著落」而永遠不補。勝者梯次的判準與主迴圈一致(RF-08)。
-    #   ★是「已經占掉一次配額」不是「整個豁免」★:配額制下鎖定時段那一次
-    #   也算他的次數,所以要從他的配額扣一次(而不是把人整個排除);分母也要
-    #   把這些時段算進去(它們確實有人切)。
-    _locked_bx: dict = {}               # {(梯次, 代號): [(順序, 日期)…]}
-    _locked_n: dict = {}                # {梯次: 鎖定時段的切片總數}
-    #   ★鎖定時段【不是】還能分給別人的容量★(外審 RS-26 R1 P2):它算進配額
-    #   分母(那一格確實有人切),但可行性匹配若把它當成「之後還排得到」的
-    #   機會,就會虛構出一個不存在的未來 → 今天挑錯人。
-    _locked_keys: dict = {}             # {梯次: {(日期, 時段)}}
-    #   ★鎖定時段一律先從分母拿掉★(外審 Codex 配額版 R2):它不重排,所以
-    #   「本來標示開放」不代表排得到人 —— 只有那一格【確實指派給本梯成員】
-    #   時才把它加回去(那個人真的會切一次)。空的鎖定格、或指派給未知/
-    #   已換梯代號的鎖定格,都不是可分配的量。
-    _ord: dict = {}                     # (iso, 時段) → 全月的先後順序
-    for _i, _d in enumerate(sorted(inp.grid)):
-        for _j, _s in enumerate(STUDENT_SESSIONS):
-            _ord[(_d.isoformat(), _s)] = _i * 10 + _j
-    for _iso, _sessions in (inp.locked or {}).items():
-        try:
-            _ld = date.fromisoformat(_iso)
-        except (ValueError, TypeError):
-            continue
-        _lcov = batches_on_day(_order, _ld)
-        if not _lcov:
-            continue
-        if _iso not in _grid_days:
-            # ★掉出格網的鎖定時段只原樣保留,不餵任何計數★(RF-02 的契約):
-            #   那一天在這個月根本沒有開診(假日/週末)—— 主迴圈永遠不會處理它,
-            #   算進配額分母就會把 cap 撐高成排不完的量。
-            continue
-        _lmembers = set(dedupe_codes(_lcov[0].members))
-        for _s, _slots in (_sessions or {}).items():
-            if _s not in STUDENT_SESSIONS:
-                continue
-            _locked_keys.setdefault(_lcov[0].id, set()).add((_iso, _s))
-            _bio_slots.setdefault(_lcov[0].id, set()).discard((_iso, _s))
-            for _c in ((_slots or {}).get(BIOPSY) or []):
-                if str(_c) not in _lmembers:
-                    # ★未知/已換梯的代號不得污染公平計數★(RF-10 的契約;
-                    #   `replay_counters` 也是這樣濾的)—— 算進分母會把配額
-                    #   撐大,自動排班就會多排,反而讓現役成員的次數不一致。
-                    continue
-                _locked_bx.setdefault((_lcov[0].id, str(_c)), []).append(
-                    _ord.get((_iso, _s), -1))
-                _locked_n[_lcov[0].id] = _locked_n.get(_lcov[0].id, 0) + 1
-                _bio_slots.setdefault(_lcov[0].id, set()).add((_iso, _s))
+    (_locked_keys, _locked_bx, _locked_n,
+     _ord) = apply_locked_biopsy_adjustment(inp, _order, _bio_slots)
 
     solved_batch_ids: set = set()
     overlap_days: dict = {}               # {(勝者id, 敗者id): [最早重疊日, 最晚重疊日]}
@@ -1072,27 +1162,12 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
             f"梯次重疊：{d1.isoformat()}～{d2.isoformat()} 由梯次 {win} 與 {lose} "
             f"同時涵蓋，重疊日只採 {win}，{lose} 成員該期間不會被排班——請修正梯次起始日")
 
-    # 切片室輪不到：只對「本月確有工作日被排」的梯次示警（否則邊界梯次會誤報）
-    for b in inp.clerk_batches:
-        if b.id not in solved_batch_ids:
-            continue
-        counts = {c: fc.biopsy_done.get((b.id, c), 0) for c in sorted(b.members)}
-        missed = [c for c, n in counts.items() if n == 0]
-        if missed:
-            warnings.append(f"切片室輪不到（梯次 {b.id}，本梯內未排到）："
-                            + "、".join(missed))
-        # [RS-24] ★配額制下「次數一樣」是要求 → 任何不一致都要點名★
-        #   (外審 Codex 配額版 P2:門檻還停在舊 min-first 容許的 >1)。
-        #   ★但「這一梯之後還排得到」時放寬★:跨月梯次在第一個月本來就只
-        #   排得到一半,那時的差異不是異常(下個月會補齊)——那種情況維持舊的
-        #   >1 門檻,免得每個月都跳一次噪音;到了最後一個月就要嚴格。
-        elif counts and (
-                max(counts.values()) - min(counts.values())
-                > (1 if _batch_more.get(b.id) else 0)):
-            warnings.append(
-                f"切片室次數不均（梯次 {b.id}，同梯應盡量一致）："
-                + "、".join(f"{c}×{n}" for c, n in counts.items())
-                + " —— 多因請假/鎖定時段所致，可手動於月曆調整")
+    # 切片室配額點名:只對「本月確有工作日被排」的梯次示警(否則邊界梯次會誤報)。
+    # ★判準與 service 的現況檢查共用★(RS-28)—— 見 `biopsy_quota_warnings`。
+    _bw, _ = biopsy_quota_warnings(
+        inp.clerk_batches, fc.biopsy_done, batch_more=_batch_more,
+        only_ids=solved_batch_ids)
+    warnings.extend(_bw)
     return day_slots, log, warnings, fc
 
 

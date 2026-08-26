@@ -39,7 +39,9 @@ from cmuh_common.roster.model import (
     dedupe_codes, duplicated_codes, roc,
 )
 from cmuh_common.roster.solve_day import (
-    arbitration_order, day_input_fingerprint, day_owner_batch,
+    apply_locked_biopsy_adjustment,
+    arbitration_order, batch_biopsy_slots, biopsy_quota_warnings,
+    day_input_fingerprint, day_owner_batch,
     BIOPSY, PHOTO, REST, TREATMENT, DaySolveInput, month_solve_day,
     person_course_stats,
 )
@@ -995,6 +997,97 @@ class RosterService:
             return 0
         return self.update_month(ym, _mut)
 
+    def validate_course_quota(self, ym: str, *, inp=None,
+                              day_slots=None) -> tuple:
+        """Clerk 切片配額的【現況】點名 → (警告清單, 該標紅的 {(梯次, 代號)})。
+
+        ★求解當下說過的話,手改之後要有人再說一次★(RS-28,全審 P2-03):
+        「切片室輪不到 / 次數不均」原本只在求解器裡算,而且只算【那一次求解的
+        結果】。使用者手動於月曆調整之後(RS-24 的配額平均正是靠這些格),
+        沒有任何地方再檢查一次 —— 報告是求解當下那一份,側欄的紅底又用著
+        RS-24 之前的舊規則。判準與求解器共用 `biopsy_quota_warnings`。
+
+        ★只點名「本月真的排到東西」的梯次★:邊界梯次(這個月一天都還沒排)
+        本來就是 0 次,點名它只是噪音 —— 求解器用 `solved_batch_ids`
+        表達同一件事,這裡的等價物是「本月的 day_slots 裡有它做主的日子」。
+        """
+        inp = self.build_day_input(ym) if inp is None else inp
+        if day_slots is None:
+            day_slots = self.storage.load_month(ym).get("day_slots") or {}
+        order = arbitration_order(inp)
+        _y, _m = int(ym[:4]), int(ym[5:7])
+        active: set = set()
+        for iso in day_slots or {}:
+            try:
+                d = date.fromisoformat(iso)
+            except (ValueError, TypeError):
+                continue
+            if d not in inp.grid:
+                # ★不在本月開診格網裡的鍵不算「本月排到了東西」★(外審 RS-28
+                #   R1 P2):鎖定日事後變成假日/整日停診時,RF-02 會★原樣保留★
+                #   那一格 —— 它在本月的鍵裡,卻不在格網裡。求解器的
+                #   `solved_batch_ids` 是在迭代 `inp.grid` 時才加入梯次的,
+                #   拿年月當等價物會把整梯點亮成「排過了」而誤報輪不到。
+                #   ★這一個條件同時就是月份過濾★:`inp.grid` 只含本月日期,
+                #   他月殘留鍵必然不在裡面。之前另外寫的 `(d.year, d.month)`
+                #   檢查已被它完全涵蓋 —— 突變驗證抓到那行是死碼(反例被這裡
+                #   先擋住),★量不到的守衛是死碼★,故刪除而不是留著誤導。
+                continue
+            owner = day_owner_batch(order, d)
+            if owner is not None:
+                active.add(owner.id)
+        # ★不加「active 是空的就早退」★:`only_ids=active` 本來就把它們全部
+        #   濾掉了,那個早退量不出任何差別 —— 量不到的守衛是死碼,留著只會
+        #   讓人以為「不點名」是在那裡決定的(同 RS-27 拿掉的那一個)。
+        counts = self._course_biopsy_counts(ym, order, inp.course_days)
+        slots, more = batch_biopsy_slots(inp, order)
+        # ★cap 的分母要先套鎖定調整★(外審 RS-28 R2 P2):與求解器同一份實作
+        #   (鎖定格先拿掉、有效鎖定切片加回)—— 否則求解器合法排出的平均結果
+        #   會被這裡誤報「超過配額」,反向也會漏掉等量的超額。
+        apply_locked_biopsy_adjustment(inp, order, slots)
+        caps = {b.id: max(1, len(slots.get(b.id, ())) // len(b.members))
+                for b in inp.clerk_batches if b.members}
+        return biopsy_quota_warnings(inp.clerk_batches, counts,
+                                     batch_more=more, only_ids=active,
+                                     caps=caps)
+
+    def _course_biopsy_counts(self, ym: str, order, course_days=()) -> dict:
+        """整梯的切片次數,★逐日以勝者梯次歸屬★ → {(梯次 id, 代號): 次數}。
+
+        ★不可以拿 `day_course_stats` 的代號統計當梯次命名空間★
+        (外審 RS-28 R1 P1):它只用「梯次日期範圍 + 代號」篩選,而 Clerk 代號
+        ★跨梯會重用★ —— RS-26 就是為了這件事才把求解器的公平計數鍵改成
+        `(梯次, 代號)`。兩梯部分重疊時,前一梯 C1 在重疊日的切片會被算進後一梯
+        的 C1,於是後一梯明明全員都沒切,驗證器卻可能只標另一人、甚至不出聲。
+        在 service 這一側再算一次代號統計,等於繞過那道隔離。
+
+        ★各月檔只採本月鍵★:與報告/匯出/週期統計同一道過濾(見 RS-27)。
+        """
+        counts: dict = {}
+        for m in (prev_ym(ym), ym, next_ym(ym)):
+            _my, _mm = int(m[:4]), int(m[5:7])
+            for iso, sessions in (self.storage.load_month(m)
+                                  .get("day_slots") or {}).items():
+                try:
+                    d = date.fromisoformat(iso)
+                except (ValueError, TypeError):
+                    continue
+                if (d.year, d.month) != (_my, _mm):
+                    continue
+                if course_days and iso not in course_days:
+                    # ★掉出開診格網的內容不算數★(外審 RS-28 R1 P2):RF-02 會
+                    #   原樣保留鎖定日事後變成假日/停診的那一格 —— 它不是這一梯
+                    #   排得到的量,算進次數會讓配額判斷失真。
+                    continue
+                owner = day_owner_batch(order, d)
+                if owner is None:
+                    continue
+                for _s, slots in (sessions or {}).items():
+                    for c in ((slots or {}).get(BIOPSY) or []):
+                        key = (owner.id, str(c))
+                        counts[key] = counts.get(key, 0) + 1
+        return counts
+
     def validate_day_structure(self, ym: str, *, day_slots=None,
                                inp=None) -> list:
         """★結構性錯誤★ —— 這張日排班在【規則上不可能成立】的地方。回訊息清單。
@@ -1122,6 +1215,9 @@ class RosterService:
         pgy_set = {str(c) for c in inp.pgy_roster}
         out.extend(self.validate_day_structure(ym, day_slots=day_slots,
                                                inp=inp))
+        # [RS-28] 切片配額的現況點名(輪不到 / 次數不均)——手改過的格也算數。
+        out.extend(self.validate_course_quota(ym, inp=inp,
+                                              day_slots=day_slots)[0])
         closures = self.clinic_closures(ym)
         for iso in sorted(day_slots):
             try:
