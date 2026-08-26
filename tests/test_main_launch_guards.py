@@ -808,17 +808,18 @@ def test_f9_f10_consent_menu_post_is_checked():
 
 
 def test_his_menu_id_calibration_2026_07_20():
-    """[2026-07-28 V.1150722.01 校正] 使用者實測【所有熱鍵功能皆正常】→ 選單 id 未位移。
-    (前版 2026-07-20 V.1150720.01 改版時 同意書 669→670、代碼輸入 219 仍正常。)
+    """[2026-08-26 V.1150825.01 校正] 使用者實測 F9/F10(670)開成【診斷書】、
+    probe 按 671 開出同意書 → 同意書 670→671;代碼輸入 219 未動。
+    (沿革:2026-07-20 同意書 669→670;2026-07-28/08-07 未位移。)
     釘住校正值,防日後誤改回舊值(選單 id 打錯 = 打到別的選單功能 → 誤寫病歷)。"""
     import sys
     sys.path.insert(0, str(ROOT / "src"))
     import main
-    assert main.MENU_ID_同意書 == 670, "F9/F10 同意書選單 id(1150722 實測仍為 670)"
+    assert main.MENU_ID_同意書 == 671, "F9/F10 同意書選單 id(1150825 實測為 671)"
     # ★數值用字面值釘死★ 這是「打到別的選單 = 寫錯病歷」的防線,
     #   不可改成讀 his_contract —— 那會退化成 assert X == X。
-    assert main.MENU_ID_代碼輸入 == 219, "F1~F5 代碼輸入選單 id(1150722 仍 219)"
-    assert main._HIS_CALIBRATED_VERSION == "1150805", "版本守門基線應同步到 1150722"
+    assert main.MENU_ID_代碼輸入 == 219, "F1~F5 代碼輸入選單 id(1150825 仍 219)"
+    assert main._HIS_CALIBRATED_VERSION == "1150825", "版本守門基線應同步到 1150825"
 
 
 def test_hotkey_waits_are_interruptible():

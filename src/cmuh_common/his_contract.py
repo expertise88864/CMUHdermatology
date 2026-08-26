@@ -28,7 +28,7 @@ from dataclasses import dataclass
 # ── 目前校正對應的 HIS 版本 ────────────────────────────────────────────────
 # 只取主版本(6-8 位數字),不含尾碼 .01 —— 隱性基線刻意不比對尾碼,免得一開機就把
 # F 鍵全判成改版(見 main.sample_his_current_fp 的說明)。
-CALIBRATED_VERSION = "1150805"
+CALIBRATED_VERSION = "1150825"
 
 # ── 選單 command id ────────────────────────────────────────────────────────
 # 醫令 子選單(F1~F5 都走「代碼輸入」)
@@ -39,7 +39,7 @@ MENU_ID_名稱輸入 = 220       # 未使用,同上
 # 完成 > 完成不印(F11 照光療程 2/3 用,避免印繳費單)
 MENU_ID_FINISH_NO_PRINT = 277
 # 手術及治療 > 開立電子同意書(F9/F10)
-MENU_ID_同意書 = 670
+MENU_ID_同意書 = 671
 
 
 @dataclass(frozen=True)
@@ -53,6 +53,13 @@ class Calibration:
 
 # 由新到舊。下次改版在最前面插一列。
 CALIBRATION_HISTORY: tuple = (
+    Calibration(
+        version="1150825", date="2026-08-26",
+        evidence="使用者實測:F9/F10(送 670)開成【診斷書】;probe(test_yiling_menu_id)"
+                 "按 id=671 開出同意書。版本讀自本機 TFopdmain 標題 V.1150825.01;"
+                 "唯讀選單列舉確認 668-671 連號(前方插入一項→後段 +1),"
+                 "醫令段 219 結構未動且使用者未回報 F1~F5 異常",
+        changes="MENU_ID_同意書 670→671;其餘維持"),
     Calibration(
         version="1150805", date="2026-08-07",
         evidence="使用者實機回報「現在主程式版本 v.1150805.01」+「我已經驗證熱鍵沒問題」",

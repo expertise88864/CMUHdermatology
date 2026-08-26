@@ -3143,11 +3143,18 @@ def _login_dialog_shot_for_alert():
 
     ★夠新鮮才附★:mtime 在未來(被校時過)或太舊的一律不附 ——
     附一張舊事故的圖比不附更糟,它會把人帶去查一個已經不存在的原因。
+
+    ★[2026-08-26 gate 實測] 「未來」要給小容差★:Windows 的 time.time() 走
+    粗粒度系統時鐘(~15.6ms tick),NTFS 檔案時間戳走精細時鐘 —— 剛寫完的檔
+    mtime 可以「超前」time.time() 十幾毫秒,age 輕微為負。截圖與告警在次秒內
+    接連發生時(登入對話框攔到後任務隨即失敗)會被 0 <= age 誤判成「被校時過」
+    而不附圖。校時事故的位移是分鐘~小時級,2 秒容差擋不掉它要擋的,卻消掉時鐘
+    源不一致的假陽性。
     """
     try:
         path = _login_dialog_shot_path()
         age = time.time() - os.path.getmtime(path)
-        if 0 <= age <= _LOGIN_DIALOG_SHOT_MAX_AGE_SEC:
+        if -2.0 <= age <= _LOGIN_DIALOG_SHOT_MAX_AGE_SEC:
             return path
     except OSError:
         pass

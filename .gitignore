@@ -43,3 +43,9 @@ cov.json
 junit.xml
 .coverage
 .pyright_type_debt.json
+
+# [2026-08-26] 版本化安裝目錄的機器本地生成物(version_pointer.py 讀的執行期狀態,
+# 每台機器各自產生;絕不可提交,否則會把「某台機器當下裝到哪一版」倒進 repo)
+/current.txt
+/versions/
+/version_pointer.log

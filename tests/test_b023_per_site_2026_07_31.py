@@ -140,6 +140,14 @@ def _b023_noqa_lines() -> list:
         if any(part in root for part in
                (".git", ".claude", "__pycache__", "python_embed", ".venv")):
             continue
+        # ★[2026-08-26] `versions/` 也要排除★
+        #   部署機的版本化安裝目錄(current.txt 指標切換用,見 version_pointer.py)
+        #   是 repo src 的【打包副本】,一台機器會同時留好幾版 —— 掃進去會把每一
+        #   版副本裡的 noqa 都算成「新增」,gate 在部署機上跑必誤紅(開發機沒有
+        #   這個目錄所以以前沒炸)。.gitignore 蓋到它,但 os.walk 不看 .gitignore。
+        rel_first = os.path.relpath(root, REPO_ROOT).split(os.sep)[0]
+        if rel_first == "versions":
+            continue
         for name in files:
             if not name.endswith(".py"):
                 continue
