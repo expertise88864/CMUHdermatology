@@ -580,3 +580,109 @@ def test_canary_status_text_now_reflects_live_sample(monkeypatch):
     monkeypatch.setattr(main, "_his_write_baseline_fp",
                         lambda: {"title_version": "1150713"})
     assert "改版" in main.AutomationApp._canary_status_text_now(app)
+
+
+# ══ [2026-08-27 使用者定案] 程式碼的校正比機器那次校正更晚 → 以程式碼為準 ══
+class TestTheCodeCalibrationSupersedesAnOlderMachineBaseline:
+    """★每台機器各按一次按鈕才算數,是這個機制的實際成本★:每次院方改版,
+    所有曾按過「重新校正」的機器都會用自己那份舊基線蓋掉程式碼的新校正,
+    於是團隊已實測、寫進 `CALIBRATION_HISTORY`(帶憑據)的校正對它們不算數。
+
+    ★判準是【哪一次驗證比較新】,不是版本號大小★ —— 見
+    `_code_calibration_supersedes` 的說明(版本號比較會讓「重新校正」在
+    HIS 落後的機器上變成謊報成功的空操作)。
+    """
+
+    @staticmethod
+    def _resolve(monkeypatch, *, code_day, machine_at, fp,
+                 code_ver="1150825"):
+        monkeypatch.setattr(main, "_HIS_CALIBRATED_VERSION", code_ver)
+
+        class _Cal:
+            date = code_day
+
+        class _Contract:
+            CALIBRATION_HISTORY = (_Cal(),)
+        monkeypatch.setattr(main, "_HIS_CONTRACT", _Contract())
+
+        class _B:
+            def info(self, _surface):
+                if fp is None:
+                    return None
+                return {"fingerprint": fp, "calibrated_at": machine_at}
+        monkeypatch.setattr(main, "_contract_baseline", lambda: _B())
+        return main._his_write_baseline_fp()
+
+    def test_a_later_code_calibration_takes_over(self, monkeypatch):
+        """信裡那台:機器 2026-07-13 校正在 1150713.02,程式碼 08-26 校正到 1150825。"""
+        got = self._resolve(
+            monkeypatch, code_day="2026-08-26",
+            machine_at="2026-07-13T09:12:00",
+            fp={"title_version": "1150713",
+                "title_version_full": "1150713.02"})
+        assert got == {"title_version": "1150825"}
+
+    def test_a_later_machine_calibration_is_kept(self, monkeypatch):
+        """★「重新校正」按鈕必須真的有效★:使用者今天在該機實測後校正,
+        即使那台的 HIS 版本比程式碼的校正版本【舊】,也要以機器為準 ——
+        否則按鈕顯示「已記錄為新基線」卻立刻又報改版。
+        ★反例只靠時間先後分勝負★(與上一條只差 calibrated_at)。"""
+        fp = {"title_version": "1150701", "title_version_full": "1150701.01"}
+        assert self._resolve(monkeypatch, code_day="2026-08-26",
+                             machine_at="2026-08-27T10:00:00",
+                             fp=dict(fp)) == fp
+
+    def test_the_same_day_keeps_the_machine_baseline(self, monkeypatch):
+        """同一天:保留機器那份 —— 它多帶了 `title_version_full`,是使用者
+        刻意校正出來的尾碼敏感度,接手會把它降級成不比對尾碼。"""
+        fp = {"title_version": "1150825", "title_version_full": "1150825.01"}
+        assert self._resolve(monkeypatch, code_day="2026-08-26",
+                             machine_at="2026-08-26T08:00:00",
+                             fp=dict(fp)) == fp
+
+    def test_an_unparseable_timestamp_is_never_overridden(self, monkeypatch):
+        """★比不出來就保留機器基線★:缺 `calibrated_at`(舊 schema 寫的檔)
+        或格式怪,都不可以讓使用者親手按過的校正被無聲蓋掉。"""
+        fp = {"title_version": "1150713"}
+        # ★含一個「長度剛好 10 卻不是日期」的值★(外審 2026-08-27):
+        #   只看長度的話 `0000-00-00` 會通過形狀檢查,而字典序又必然小於任何
+        #   真日期 → 程式碼反而無條件接手,正好與 fail-safe 方向相反。
+        #   ★反例只靠「有沒有真的解析」分勝負★:其餘壞值都被長度擋掉,
+        #   量不到這條規則。
+        for bad in (None, "", "壞掉的值", "26/07/13", "0000-00-00",
+                    "2026-13-45", "2026-08-3X"):
+            assert self._resolve(monkeypatch, code_day="2026-08-26",
+                                 machine_at=bad, fp=dict(fp)) == fp
+
+    def test_a_broken_calibration_history_keeps_the_machine_baseline(
+            self, monkeypatch):
+        """★會拋的那條路也要保留機器基線★:`CALIBRATION_HISTORY` 被清空/改壞
+        時 `[0].date` 會 IndexError —— 那時候絕不可以接手,使用者親手按過的
+        校正不能因為程式碼這邊壞掉而失效。
+        (★反例要真的走到 except★:上一條的壞字串都被長度檢查先擋下,
+        量不到這個分支 —— 突變驗證抓到過。)"""
+        fp = {"title_version": "1150713"}
+        monkeypatch.setattr(main, "_HIS_CALIBRATED_VERSION", "1150825")
+
+        class _Empty:
+            CALIBRATION_HISTORY = ()
+        monkeypatch.setattr(main, "_HIS_CONTRACT", _Empty())
+
+        class _B:
+            def info(self, _surface):
+                return {"fingerprint": fp, "calibrated_at": "2026-07-13T09:00:00"}
+        monkeypatch.setattr(main, "_contract_baseline", lambda: _B())
+        assert main._his_write_baseline_fp() == fp
+
+    def test_no_baseline_file_still_falls_back_to_code(self, monkeypatch):
+        assert self._resolve(monkeypatch, code_day="2026-08-26",
+                             machine_at=None, fp=None) == {
+            "title_version": "1150825"}
+
+    def test_the_stale_machine_now_gets_warned(self, monkeypatch):
+        """★落後的機器【應該】被通知★:選單 id 只有一組(對應程式碼的校正)。
+        HIS 仍停在舊版的那台,原本因為「基線=現況」而靜悄悄地拿新版 id 去按
+        舊版選單;接手之後它會被判為改版 —— 這是修正,不是誤報。"""
+        v = _verdict(monkeypatch, "西醫門診醫師作業 V.1150713.02",
+                     baseline_fp={"title_version": "1150825"})
+        assert v.status == cc.STATUS_DRIFT

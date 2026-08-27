@@ -102,9 +102,15 @@ def test_index_records_every_mismatch_not_just_the_first(tmp_path):
     """★這是使用者痛點的核心★ 告警信同功能同日只寄一次,所以第二個病人
     只能靠索引查得到。索引不可有任何去重。"""
     p = str(tmp_path / "idx.jsonl")
+    # ★`now` 要釘住★(2026-08-27):原本寫死 2026-07-28 的 ts 卻讓 `append_index`
+    #   去讀真實時鐘 —— 保留期一到(30 天),前兩筆在後續 append 時被修剪掉,
+    #   這條測試就在 2026-08-27 當天無預警轉紅。它要驗的是「索引不去重」,
+    #   與今天幾號無關;隔壁的 `test_index_prunes_old_rows` 本來就有傳 `now=`。
+    now = datetime(2026, 7, 28, 9, 30, 0)
     for seq in ("113", "114", "115"):
         pl.append_index(p, ts="2026-07-28T09:15:00", action="F1 UVB 劑量",
-                        detail="d", locator={"room": "103", "seq": seq})
+                        detail="d", locator={"room": "103", "seq": seq},
+                        now=now)
     rows = [json.loads(x) for x in open(p, encoding="utf-8") if x.strip()]
     assert [r["seq"] for r in rows] == ["113", "114", "115"]
 

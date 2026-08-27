@@ -2194,10 +2194,54 @@ def _his_title_version_full(title: str):
     return m.group(1) if m else None
 
 
+def _code_calibration_supersedes(machine_calibrated_at) -> bool:
+    """程式碼的校正是不是比這台機器上那一次「重新校正」**更晚做的**。
+
+    ★判準是「哪一次驗證比較新」,不是「哪個 HIS 版本號比較大」★
+    版本號大小是代理指標,而且會答錯最重要的那一題:一台 HIS 仍停在舊版的機器,
+    使用者今天在該機實測完按下「重新校正」—— 版本號比較會判程式碼勝出,
+    於是按鈕顯示「已記錄為新基線」卻立刻又報改版,★變成謊報成功的空操作★。
+    兩邊記的其實都是【一次人做的驗證】:機器基線檔有 `calibrated_at`,
+    程式碼的 `CALIBRATION_HISTORY[0].date` 是那次實測的日期。比時間才對得上。
+
+    ★比不出來一律回 False(保留機器基線)★:格式怪、缺欄位、檔被改壞時,
+    使用者親手按過的那次校正不可以被無聲蓋掉。
+    ★而「比不比得出來」要真的去解析,不可以只看長度★(外審 2026-08-27):
+    `0000-00-00` 長度剛好 10 卻不是日期,字典序又必然小於任何真日期 ——
+    只檢查形狀的話,一個壞掉的時間戳反而會讓程式碼無條件接手,
+    正好違反這裡宣告的 fail-safe 方向。
+    """
+    try:
+        code_day = date.fromisoformat(
+            str(_HIS_CONTRACT.CALIBRATION_HISTORY[0].date).strip())
+        machine_day = date.fromisoformat(
+            str(machine_calibrated_at or "").strip()[:10])
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return False
+    return code_day > machine_day
+
+
 def _his_write_baseline_fp() -> dict:
-    """HIS 寫入契約基線指紋:優先使用者校正過的基線檔;無則以硬編碼校正版本為隱性基線。"""
-    fp = _contract_baseline().get(_CANARY_HIS_SURFACE)
+    """HIS 寫入契約基線指紋:優先使用者校正過的基線檔;無則以硬編碼校正版本為隱性基線。
+
+    ★[2026-08-27 使用者定案] 程式碼的校正比機器那次校正【更晚】時,以程式碼為準★
+    每次院方改版,每一台【曾經按過「重新校正」】的機器都會各自留一份基線檔,
+    而那份檔會蓋掉程式碼的校正版本 —— 於是團隊已經實測、寫進
+    `CALIBRATION_HISTORY`(帶憑據)的新校正,對那些機器完全不算數:每台都要
+    有人再按一次按鈕,不按就一直收改版通知。`CALIBRATION_HISTORY` 是團隊級的
+    驗證紀錄,比某台機器七月按下的那一次晚,就該接手。
+
+    ★這不會讓落後的機器變得比較安全,而是相反★:選單 id 只有一組(對應
+    `CALIBRATED_VERSION`)。一台 HIS 仍停在舊版的機器,原本因為「基線=現況」
+    而靜悄悄地用新版 id 去按舊版選單;接手之後那台會被判為改版而通知 ——
+    這正是它本來就該收到的警告。而使用者若在該機實測後按「重新校正」,
+    那次校正比程式碼晚 → 立刻蓋回機器的基線,按鈕仍然真的有效。
+    """
+    rec = _contract_baseline().info(_CANARY_HIS_SURFACE)
+    fp = (rec or {}).get("fingerprint")
     if isinstance(fp, dict) and fp.get("title_version"):
+        if _code_calibration_supersedes((rec or {}).get("calibrated_at")):
+            return {"title_version": _HIS_CALIBRATED_VERSION}
         return fp
     return {"title_version": _HIS_CALIBRATED_VERSION}
 
