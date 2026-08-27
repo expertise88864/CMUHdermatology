@@ -821,6 +821,30 @@ class RosterService:
                 if on and slots is not None:
                     locked.setdefault(iso, {})[session] = slots
 
+        # ★[RS-29] 相鄰月份【已經定下來、這次求解改不動】的時段★
+        #   (全審 2026-08-24 P1-01)。RS-26 已讓配額的分母看得到整梯,但
+        #   「那一格是不是已經有人」仍只看本月 —— 下個月已鎖定/已定案的切片
+        #   會被當成還能自由分配的未來機會,於是本月挑錯人(存在可行解卻錯過)。
+        #   兩種來源:
+        #     ① 明確鎖定的時段(與本月 `locked` 同一個判準:鎖了而且有內容);
+        #     ② ★已定案月份的【全部】day_slots★ —— 定案之後月檔唯讀,那些格
+        #        本來就不可能被這次求解改動,語意上與鎖定完全相同。
+        #   只放【相鄰月份】:本月是 `locked` 的地盤,兩邊都放會重複計數。
+        course_fixed: dict = {}
+        for _om in (prev_ym(ym), _nxt):
+            _m = st.load_month(_om)
+            _ds = _m.get("day_slots") or {}
+            _final = bool(_m.get("finalized"))
+            for _iso, _sess in _ds.items():
+                if not isinstance(_sess, dict):
+                    continue
+                _locks = ((_m.get("day_locks") or {}).get(_iso) or {})
+                for _s, _slots in _sess.items():
+                    if _slots is None:
+                        continue
+                    if _final or _locks.get(_s):
+                        course_fixed.setdefault(_iso, {})[_s] = _slots
+
         # RF-09：跨月梯次公平計數延續——對每個「起始日早於本月 1 號」的 covering 梯次，
         # 讀上月檔 day_slots 中該梯 covers 的時段，供 month_solve_day 先回放進 fc。
         prior_sessions: dict = {}
@@ -846,6 +870,9 @@ class RosterService:
             ym=ym, grid=grid, pgy_roster=list(pgy_roster),
             clerk_batches=covering, batch_order=batch_order,
             biopsy_open=biopsy_open, leaves=leaves,
+            # [RS-29] 相鄰月份的既定時段(鎖定/已定案)——只餵計數與可行性,
+            #   不會被寫進本月結果(那是 `locked` 的語意)。
+            course_fixed=course_fixed,
             # [RS-24] 整梯配額的分子要濾掉假日(切片格網含跨月日期,而那些
             #   日子在該月的 `month_grid` 裡可能根本不存在)。
             holidays=set(holidays),

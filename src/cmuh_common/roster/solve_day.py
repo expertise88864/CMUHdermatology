@@ -86,6 +86,11 @@ PHOTO = "照光"        # 每時段必排 1 PGY（含週三下午），最優先
 TREATMENT = "治療室"  # 每時段 1 PGY，但週三下午休診不排
 BIOPSY = "切片室"
 REST = "放假"
+
+#: [RS-29] 相鄰月份既定時段的時序位置 —— 比本月任何一格都晚。
+#:   本月的位置是 `列序*10 + 時段序`,一個月最多 31*10+1;取一個遠大於它的
+#:   常數即可,不必也不該去算「本月有幾天」(那會隨月份長度變動)。
+_FUTURE_POS = 10 ** 9
 WED = 2
 
 # [2026-07-23 使用者] 「Apply 本科」PGY 優先偏好：勾選的 PGY（至多 2 位）在
@@ -610,6 +615,18 @@ class DaySolveInput:
     # [RS-26] 整梯真正開診的日子(本月 + 下個月的格網;`build_day_input` 算)。
     #   空集合 = 呼叫端沒算 → 退回「只用假日/週末過濾」的舊行為。
     course_days: set = field(default_factory=set)
+    # ★[RS-29] 相鄰月份【已經定下來、這次求解改不動】的時段★
+    #   (全審 2026-08-24 P1-01)。形狀同 `locked`:{iso: {session: {格: [代號]}}}。
+    #   RS-26 讓配額的分母看得到整梯(下個月的開放時段也算),但「那一格是不是
+    #   已經有人」仍只看本月 —— 於是下個月已鎖定/已定案的切片會被當成
+    #   【還能自由分配的未來機會】:兩人各該切一次、9/01 早已鎖給 C1 時,
+    #   求解器以為 9/01 還能給 C2,8/31 就掉到抖動決勝而挑了 C1 → C1 切兩次、
+    #   C2 掛零,而 1/1 的可行解明明存在。
+    #   ★與 `locked` 分開兩個欄位★:`locked` 的語意是「本月原樣輸出」,
+    #   把鄰月的東西混進去會讓那些時段被寫進本月的結果。這裡只餵計數與可行性。
+    #   進了 dataclass 就自動進指紋 → 預覽期間有人改動下個月的鎖定/定案,
+    #   套用時會被判過期(全審點名的第二個缺口)。
+    course_fixed: dict = field(default_factory=dict)
     apply_pref: set = field(default_factory=set)  # Apply 本科 PGY（101 週二/五平手優先）
 
 
@@ -851,35 +868,61 @@ def apply_locked_biopsy_adjustment(inp: DaySolveInput, order,
     for _i, _d in enumerate(sorted(inp.grid)):
         for _j, _s in enumerate(STUDENT_SESSIONS):
             _ord[(_d.isoformat(), _s)] = _i * 10 + _j
-    for _iso, _sessions in (inp.locked or {}).items():
-        try:
-            _ld = date.fromisoformat(_iso)
-        except (ValueError, TypeError):
-            continue
-        _lcov = batches_on_day(_order, _ld)
-        if not _lcov:
-            continue
-        if _iso not in _grid_days:
-            # ★掉出格網的鎖定時段只原樣保留,不餵任何計數★(RF-02 的契約):
-            #   那一天在這個月根本沒有開診(假日/週末)—— 主迴圈永遠不會處理它,
-            #   算進配額分母就會把 cap 撐高成排不完的量。
-            continue
-        _lmembers = set(dedupe_codes(_lcov[0].members))
-        for _s, _slots in (_sessions or {}).items():
-            if _s not in STUDENT_SESSIONS:
+    def _absorb(table, open_days, pos_of):
+        """把一張「已經定下來」的表吸收進分母/預扣/佔位。
+
+        `open_days` = 那些日期裡【真的有開診】的集合;`pos_of` 給這一格在
+        時序上的位置(本月用 `_ord`,相鄰月份一律排在本月之後)。
+        本月與相鄰月份的規則完全一樣,所以只留一份實作。
+        """
+        for _iso, _sessions in (table or {}).items():
+            try:
+                _ld = date.fromisoformat(_iso)
+            except (ValueError, TypeError):
                 continue
-            _locked_keys.setdefault(_lcov[0].id, set()).add((_iso, _s))
-            _bio_slots.setdefault(_lcov[0].id, set()).discard((_iso, _s))
-            for _c in ((_slots or {}).get(BIOPSY) or []):
-                if str(_c) not in _lmembers:
-                    # ★未知/已換梯的代號不得污染公平計數★(RF-10 的契約;
-                    #   `replay_counters` 也是這樣濾的)—— 算進分母會把配額
-                    #   撐大,自動排班就會多排,反而讓現役成員的次數不一致。
+            _lcov = batches_on_day(_order, _ld)
+            if not _lcov:
+                continue
+            if _iso not in open_days:
+                # ★掉出格網的鎖定時段只原樣保留,不餵任何計數★(RF-02 的契約):
+                #   那一天在這個月根本沒有開診(假日/週末)—— 主迴圈永遠不會處理它,
+                #   算進配額分母就會把 cap 撐高成排不完的量。
+                continue
+            _lmembers = set(dedupe_codes(_lcov[0].members))
+            for _s, _slots in (_sessions or {}).items():
+                if _s not in STUDENT_SESSIONS:
                     continue
-                _locked_bx.setdefault((_lcov[0].id, str(_c)), []).append(
-                    _ord.get((_iso, _s), -1))
-                _locked_n[_lcov[0].id] = _locked_n.get(_lcov[0].id, 0) + 1
-                _bio_slots.setdefault(_lcov[0].id, set()).add((_iso, _s))
+                _locked_keys.setdefault(_lcov[0].id, set()).add((_iso, _s))
+                _bio_slots.setdefault(_lcov[0].id, set()).discard((_iso, _s))
+                for _c in ((_slots or {}).get(BIOPSY) or []):
+                    if str(_c) not in _lmembers:
+                        # ★未知/已換梯的代號不得污染公平計數★(RF-10 的契約;
+                        #   `replay_counters` 也是這樣濾的)—— 算進分母會把配額
+                        #   撐大,自動排班就會多排,反而讓現役成員的次數不一致。
+                        continue
+                    _locked_bx.setdefault((_lcov[0].id, str(_c)), []).append(
+                        pos_of(_iso, _s))
+                    _locked_n[_lcov[0].id] = _locked_n.get(_lcov[0].id, 0) + 1
+                    _bio_slots.setdefault(_lcov[0].id, set()).add((_iso, _s))
+
+    _absorb(inp.locked, _grid_days, lambda i, s: _ord.get((i, s), -1))
+    # ★[RS-29] 相鄰月份的既定時段★:規則與本月相同,只有兩處不一樣 ——
+    #   ① 開診與否要看整梯的 `course_days`(本月的格網當然不含下個月的日子);
+    #   ② 時序位置一律排在本月所有時段【之後】。位置是拿來判斷
+    #      「這一次鎖定還沒跑到 → 要先預留他的配額」的(見主迴圈的 `o > _now`),
+    #      下個月的時段永遠在未來 —— 沿用 `_ord.get(..., -1)` 的話會被當成
+    #      「早就跑過了」而不預扣,C1 的配額就白白多出一次。
+    #   ★本月的日期不走這裡★:那是 `locked` 的地盤,兩邊都吸收會重複計數。
+    #   ★上個月的既定時段位置要算「過去」★(外審 RS-29 R1 P1):跨月梯次的
+    #   上月時段已經由 `prior_sessions` 回放進 `fc.biopsy_done`(RF-09),
+    #   而配額是 `cap - biopsy_done - 未來的鎖定預留` —— 把上月也標成未來,
+    #   同一次切片會被【扣兩次】(既算已完成、又算預留),那個人本月的配額
+    #   憑空少一次。`o > _now` 這個判準本來就是為了不重複扣才存在的。
+    _month_start = f"{inp.ym}-01"
+    _absorb({i: s for i, s in (inp.course_fixed or {}).items()
+             if i not in _grid_days},
+            set(inp.course_days or ()),
+            lambda i, s: (-1 if i < _month_start else _FUTURE_POS))
     return _locked_keys, _locked_bx, _locked_n, _ord
 
 
