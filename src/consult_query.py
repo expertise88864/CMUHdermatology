@@ -2804,7 +2804,8 @@ def run_consult_flow(trigger_label: str = "") -> tuple:
 
 def _wait_main_window_after_login(our_pids: set, *, visible_only: bool,
                                   timeout_sec: float = 120.0,
-                                  cfg: dict | None = None) -> int:
+                                  cfg: dict | None = None,
+                                  login_token: dict | None = None) -> int:
     """等住院醫囑主畫面出現;期間把擋在前面的「訊息通知」按掉。回傳 main hwnd。
 
     ★[2026-07-29 實機故障] 原本的迴圈條件是 `if mains and not notice`★
@@ -2872,7 +2873,7 @@ def _wait_main_window_after_login(our_pids: set, *, visible_only: bool,
                 #   HIS 偶發不穩(早上失敗、中午成功、下午再失敗兩次)會被算成
                 #   「帳密不能用」而誤切備用 —— 而「當天累計三次」只是
                 #   「這組帳密登不進去」的一個方便判準,不是那件事本身。
-                _note_his_login_succeeded()
+                _note_his_login_succeeded(login_token)
                 return mains[0]
         # ★[2026-08-05 實機] 先處理【真正擋住輸入】的那個對話框★
         #   診斷傾印顯示:TFMShowMessage 自己也是 disabled 的(en=0),壓在它上面
@@ -2942,7 +2943,7 @@ def _wait_main_window_after_login(our_pids: set, *, visible_only: bool,
         #   「帳密送出去了、登入沒完成」唯一被判定出來的地方 —— 使用者定案的
         #   換帳號條件就是這一種失敗(BDE 起不來/資源耗盡/被接管都不算)。
         #   放在上層的 handler 反而會漏掉另一條路,或同一次失敗算好幾遍。
-        _note_his_login_rejected(cfg)
+        _note_his_login_rejected(cfg, login_token)
         raise LoginNotCompleted(
             "登入沒有完成(登入視窗仍在畫面上)—— 請確認帳號密碼是否被院方改過/"
             "停用,以及 HIS 是否連得上。★本次不再重試登入★(避免同一組帳密被"
@@ -3304,6 +3305,8 @@ class _PersistentSession:
         #   取用時才判斷得出來。
         self.is_backup = bool(is_backup)
         self.account_day = str(account_day or "")
+        # [CQ-TK] 建立這個 session 的那一次登入 token(查詢結果帶它回去組信)。
+        self.login_token: "dict | None" = None
         # [codex P1 R12] 租約:正在被某個 worker 使用中。run_consult_flow 的 240 秒
         # join 逾時會【棄置】worker(daemon 緒仍在跑),下一輪絕不可跟它共用同一個
         # session(兩個 worker 對同一組 HIS 視窗送命令=截圖錯亂/互相關窗)。
@@ -3331,8 +3334,13 @@ _his_last_login_account = None        # (username, is_backup) 或 None
 #   ★帳密被拒幾次★,不是「幾個 handler 看到它」。所以每送出一次帳密就發一個
 #   遞增的序號,計數時只認【比上次計過的還新】的那一次 —— 至多一次。
 #   同一個機制也擋住「這一輪根本沒送帳密」的失敗(序號沒動 → 不算)。
-_his_login_attempt = 0                # 送出過幾次帳密(單調遞增)
-_his_counted_attempt = 0              # 已經算進失敗次數的最新序號
+_his_login_attempt = 0                # 送出過幾次帳密(token 的序號來源)
+#: ★RLock:發放/消費 + 完整的成功/失敗狀態轉移都在它底下★(外審 2026-08-27
+#:   R1):只鎖 `consumed` 的話,A 的失敗消費完 token、還沒 += 就被切走,
+#:   B 的成功看到 fails==0 直接返回,A 醒來再 += → 「失敗後成功」卻留下 1 次
+#:   連續失敗。鎖住整段轉移,拿鎖的順序就是事件順序。(RLock 因為轉移內
+#:   會再進 `_consume_attempt`。)
+_his_attempt_lock = threading.RLock()
 
 
 def _his_today() -> str:
@@ -3386,38 +3394,74 @@ def _current_his_account(cfg: dict) -> tuple:
             str(cfg.get("password") or ""), False, day)
 
 
-def _note_his_credentials_sent(username: str, is_backup: bool) -> None:
-    """帳密真的送出去的那一刻(按下「確認」之後)。
+def _note_his_credentials_sent(username: str, is_backup: bool) -> dict:
+    """帳密真的送出去的那一刻(按下「確認」之後)→ 這一次嘗試的 token。
 
     ★記的是【觀測到的事實】★:這一輪用的是哪一組。信件標頭與失敗計數都讀它,
     不從「目前狀態」回推 —— 狀態可能在這之後又變了。
+
+    ★回傳 token,結果只能消費自己那一顆★(外審 2026-08-27 P2-05):
+    session 架構允許 stale-worker 接管(>360 秒)—— A 送帳密後卡死、B 搶走
+    預約再送一次、A 才醒來回報失敗。用「全域最新序號」對帳的話,A 的失敗會
+    消費掉【B 的】那一次,B 的成功反而被當成已處理 —— 連續失敗多記一次,
+    反向排序則少記。token 把「哪一次嘗試」跟「它的結果」綁在一起,
+    誰先醒來都對不錯帳。(token 純記憶體、不落地:重啟後沒有懸而未決的嘗試。)
     """
     global _his_login_attempt, _his_last_login_account
-    _his_login_attempt += 1
-    _his_last_login_account = (str(username or "").strip(), bool(is_backup))
+    with _his_attempt_lock:
+        _his_login_attempt += 1
+        token = {"seq": _his_login_attempt,
+                 "user": str(username or "").strip(),
+                 "backup": bool(is_backup), "consumed": False}
+        # 全域「最後一次送出」只剩一個用途:SW_HIDE 後備路徑的信件標頭
+        # (那條路沒有常駐 session 可掛 token;見 `_his_account_note`)。
+        _his_last_login_account = (token["user"], token["backup"])
+        return token
 
 
-def _note_his_login_succeeded() -> None:
+def _consume_attempt(token) -> bool:
+    """對這一次嘗試對帳(每顆 token 至多一次)。→ 這是不是新的證據。
+
+    ★持鎖★:同一顆 token 可能被多層 handler 看到(冷啟動分類器、上層
+    handler、job 迴圈),消費要原子;不同 token 之間互不干擾。
+    """
+    if not isinstance(token, dict):
+        return False
+    with _his_attempt_lock:
+        if token.get("consumed"):
+            return False
+        token["consumed"] = True
+        return True
+
+
+def _note_his_login_succeeded(token=None) -> None:
     """登入成功 → 主帳號的【連續】失敗次數歸零。
 
-    ★只對「這一次真的送出去的那一組」算數★,而且與失敗共用同一個序號:
-    同一次帳密送出只會被判定一次(成功或失敗),不會兩邊都算。
+    ★只對「這一次真的送出去的那一組」算數★:同一顆 token 只會被判定一次
+    (成功或失敗),不會兩邊都算 —— 而且只消費【自己】的 token,別的 worker
+    的嘗試各自對帳(stale-worker 接管時誰先醒來都不會對錯)。
     已經切到備用的話不改回主帳號 —— 出口是隔天(使用者定案)。
     """
-    global _his_primary_fails, _his_counted_attempt
-    if _his_login_attempt <= _his_counted_attempt:
-        return
-    _his_counted_attempt = _his_login_attempt
-    _, is_backup = _his_last_login_account or ("", False)
-    if is_backup or not _his_primary_fails:
-        return
+    global _his_primary_fails
+    with _his_attempt_lock:
+        if not isinstance(token, dict) or not _consume_attempt(token):
+            # 沒送出帳密(token=None)或這一次已經對過帳 → 不是新的證據。
+            return
+        if token["backup"] or not _his_primary_fails:
+            return
+        _note_his_login_succeeded_locked()
+
+
+def _note_his_login_succeeded_locked() -> None:
+    """成功的狀態轉移本體(呼叫端已持 `_his_attempt_lock`)。"""
+    global _his_primary_fails
     logging.info("[HIS帳號] 主帳號登入成功 → 連續失敗次數歸零(原本 %d 次)",
                  _his_primary_fails)
     _his_primary_fails = 0
     _save_job_fail_state()
 
 
-def _note_his_login_rejected(cfg: dict | None = None) -> None:
+def _note_his_login_rejected(cfg: dict | None = None, token=None) -> None:
     """★只有「帳密送出去了、登入沒完成」才呼叫這裡★(LoginNotCompleted)。
 
     BDE 起不來、資源耗盡、被別的 worker 接管都不是帳密問題 —— 那些算進來
@@ -3428,12 +3472,17 @@ def _note_his_login_rejected(cfg: dict | None = None) -> None:
     不要對院方密集送帳密」,換一組帳號送並不會讓那件事變得安全 ——
     備用帳號要等這一輪冷卻結束後才上場。
     """
-    global _his_primary_fails, _his_using_backup, _his_counted_attempt
-    if _his_login_attempt <= _his_counted_attempt:
-        # 這次失敗沒有送出【新的一次】帳密(或同一次已經算過)→ 不是新的證據。
-        return
-    _his_counted_attempt = _his_login_attempt
-    _, is_backup = _his_last_login_account or ("", False)
+    with _his_attempt_lock:
+        if not _consume_attempt(token):
+            # 沒送出帳密(token=None)或這一次已經對過帳 → 不是新的證據。
+            return
+        _note_his_login_rejected_locked(cfg, token)
+
+
+def _note_his_login_rejected_locked(cfg, token) -> None:
+    """失敗的狀態轉移本體(呼叫端已持 `_his_attempt_lock`)。"""
+    global _his_primary_fails, _his_using_backup
+    is_backup = token["backup"]
     # ★這是錯誤路徑,不可以再去讀設定檔★:讀檔失敗會把一個已經分類好的
     #   `LoginNotCompleted` 換成別的例外 —— 那樣登入冷卻就不會被設,
     #   3 分鐘節奏又會再送一次帳密,正好是冷卻要防的那件事。
@@ -3463,7 +3512,7 @@ def _note_his_login_rejected(cfg: dict | None = None) -> None:
     _save_job_fail_state()
 
 
-def _his_account_note(cfg: dict) -> str:
+def _his_account_note(cfg: dict, token: "dict | None" = None) -> str:
     """信件標頭那一句:「目前使用主帳號登入(101358)」。
 
     ★用「這一次真的送出去的那一組」★:狀態可能在查詢與寄信之間又變了,
@@ -3471,7 +3520,14 @@ def _his_account_note(cfg: dict) -> str:
     不會發生:寄信一定在一次登入之後)才退回目前狀態。
     ★只顯示代號,不顯示密碼★
     """
-    if _his_last_login_account:
+    # ★讀【明確傳入】的 token —— 查詢結果自己帶回來的★(外審 2026-08-27):
+    #   從組信當下的全域(_psession)推測來源會說錯:SW_HIDE 後備跑完後,
+    #   舊常駐 session 可能還掛著,標頭就變成舊 session 的帳號。
+    #   全域「最後一次送出」只當沒有 token 時的後備(理論上不會走到:
+    #   兩條查詢路徑的成功出口都會附上 token)。
+    if isinstance(token, dict) and token.get("user"):
+        user, is_backup = token["user"], bool(token.get("backup"))
+    elif _his_last_login_account:
         user, is_backup = _his_last_login_account
     else:
         user, _pw, is_backup, _day = _current_his_account(cfg)
@@ -4228,13 +4284,14 @@ def _cold_start_session_impl(cfg: dict, owner_token=None):
             raise RuntimeError("找不到「確認」鈕")
         click_button(confirm)
         creds_sent = True
-        _note_his_credentials_sent(username, _is_backup)
+        _login_token = _note_his_credentials_sent(username, _is_backup)
         logging.info("已送出登入(%s)", "備用帳號" if _is_backup else "主帳號")
 
         # ★接住回傳的 hwnd★ 以前這行把它丟掉,於是收尾只能靠 PID 差集猜哪個視窗
         #   是自己的 —— 那個集合會混進醫師的行程。見 `_PersistentSession.main_hwnd`。
         _main_hwnd = _wait_main_window_after_login(our_pids, visible_only=True,
-                                                  cfg=cfg)
+                                                  cfg=cfg,
+                                                  login_token=_login_token)
         logging.info("已進入主畫面")
         sess = _PersistentSession(_hproc, _hthread, _spawned_pid, our_pids,
                                   main_hwnd=_main_hwnd,
@@ -4242,6 +4299,11 @@ def _cold_start_session_impl(cfg: dict, owner_token=None):
                                   # ★用【選帳號當下】那個日期★,不可以在這裡
                                   #   再讀一次時鐘(登入可能已經跨過午夜)。
                                   account_day=_login_day)
+        # ★session 帶著建立它的那一次登入 token★(外審 P2-05):信件標頭要說
+        #   「這封信的資料是用哪一組帳號查出來的」——常駐模式下就是【服務這次
+        #   查詢的 session】登入用的那一組,不是全域「最後一次送出」(別的
+        #   worker 可能在查詢與寄信之間又送過一次帳密)。
+        sess.login_token = _login_token
         sess.in_use = True                       # 建立者即持有租約
         # [codex P1 R16] 發布前在鎖內驗「預約還是不是我的」——冷啟動拖過
         # _COLD_START_STALE_SECONDS 被搶走後,本 worker 若仍走到這裡,無條件發布
@@ -4849,7 +4911,11 @@ def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -
         result = _query_cycle(sess, cfg, roster_label)
         _session_release(sess)
         _retire_session_if_no_keepalive(sess, cfg)
-        return result
+        # ★查詢結果自己帶著服務它的登入 token★(外審 2026-08-27 R1):
+        #   組信時從全域(_psession)推測來源會拿到錯的 —— SW_HIDE 後備跑完後
+        #   舊常駐 session 可能還掛著,標頭就說成舊 session 的帳號。
+        #   資料是誰查的,只有【這裡】說得準。
+        return (*result, getattr(sess, "login_token", None))
     except (LoginNotCompleted, HISStartupBlocked, JobSuperseded):
         _session_close_if_current(sess, "登入類/接管失敗")
         raise
@@ -4871,7 +4937,7 @@ def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -
             result = _query_cycle(sess, cfg, roster_label)
             _session_release(sess)
             _retire_session_if_no_keepalive(sess, cfg)
-            return result
+            return (*result, getattr(sess, "login_token", None))
         except BaseException:
             _session_close_if_current(sess,
                                       "重啟重登後查詢仍失敗 → 放棄(交給告警機制)")
@@ -5566,14 +5632,15 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
             raise RuntimeError("登入視窗找不到「確認」鈕")
         click_button(confirm)  # PostMessage BM_CLICK，非阻塞
         creds_sent = True
-        _note_his_credentials_sent(username, _is_backup)
+        _login_token = _note_his_credentials_sent(username, _is_backup)
         logging.info("已送出登入(%s)", "備用帳號" if _is_backup else "主帳號")
 
         # 等主視窗；期間若跳「訊息通知主畫面」就按確認。
         # visible_only=False:本路徑會把視窗 SW_HIDE(見 2026-05-15 註解),
         # 可見性在這裡不是有效訊號。
         main_hwnd = _wait_main_window_after_login(our_pids, visible_only=False,
-                                                 cfg=cfg)
+                                                 cfg=cfg,
+                                                 login_token=_login_token)
         logging.info("已進入主畫面")
 
         # 送選單命令：我的會診清單（背景 PostMessage，不點滑鼠、解析度無關）
@@ -5610,7 +5677,7 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
         img, _snap = _capture_with_settled_roster(consult)
         extracted, extracted_html, roster_texts = _extract_consult_text(
             consult, cfg, roster_label, settled=_snap)
-        return img, extracted, extracted_html, roster_texts
+        return img, extracted, extracted_html, roster_texts, _login_token
 
     except BaseException as e:
         # ★這條路也要設冷卻★(外審 CQ-BA 第 1 輪 P1):原本只有常駐冷啟動會設。
@@ -7311,7 +7378,8 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     his_stage_done = True   # 這裡之後的失敗都不是 HIS 的問題
                 else:
                     logging.info("沿用上一次 attempt 已查到的會診結果(HIS 不重查)")
-                shot, extracted_text, extracted_html, roster_texts = his_result
+                (shot, extracted_text, extracted_html, roster_texts,
+                 _flow_token) = his_result
                 # [2026-06-25] 輪詢 poll:只在「出現新病歷號」時才寄;否則靜默結束
                 # (不寄、不更新基準 → 下一輪仍會再比對)。email/手動觸發不受此限,照常無條件寄。
                 _poll_extract_note = ""
@@ -7437,7 +7505,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     text_parts.append(_poll_extract_note)
                 # [CQ-BA] 這封信的資料是用哪一組帳號查出來的。★純文字版要跟
                 #   HTML 版一致★:不支援 HTML 的客戶端看到的是這一份。
-                _account_note = _his_account_note(cfg)
+                _account_note = _his_account_note(cfg, token=_flow_token)
                 text_parts.append(_account_note)
                 text_parts.append(body)
                 if punch_text:

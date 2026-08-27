@@ -63,13 +63,17 @@ class _JobHarness:
             self.flow_runs += 1
             if self.flow_runs <= self._fail_times:
                 raise RuntimeError(f"simulated failure #{self.flow_runs}")
-            # [CQ-01] run_consult_flow 回傳 (截圖, 擷取純文字, 擷取HTML, roster_texts)
+            # [CQ-01] run_consult_flow 回傳 (截圖, 擷取純文字, 擷取HTML,
+            #   roster_texts, 登入 token)。★第五欄是 CQ-TK 加的★:查詢結果
+            #   自己帶著服務它的 attempt token(信件標頭讀它)。
             roster = self.roster_texts
             if roster is _DERIVE:
                 # 未明指 → 由當前 extracted_text 動態導出(truthy→單列、空→[]);
                 # 讓多輪測試改 h.extracted_text 後 signature 也跟著更新。
                 roster = [self.extracted_text] if self.extracted_text else []
-            return (Path("C:/fake/shot.png"), self.extracted_text, "", roster)
+            return (Path("C:/fake/shot.png"), self.extracted_text, "", roster,
+                    {"seq": 1, "user": "101358", "backup": False,
+                     "consumed": True})
         monkeypatch.setattr(cq, "run_consult_flow", _flow)
         monkeypatch.setattr(
             cq, "send_via_smtp",

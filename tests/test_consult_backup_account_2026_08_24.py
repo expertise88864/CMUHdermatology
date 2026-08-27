@@ -35,7 +35,6 @@ def _clean_account_state(monkeypatch, tmp_path):
     monkeypatch.setattr(cq, "_his_using_backup", False, raising=False)
     monkeypatch.setattr(cq, "_his_last_login_account", None, raising=False)
     monkeypatch.setattr(cq, "_his_login_attempt", 0, raising=False)
-    monkeypatch.setattr(cq, "_his_counted_attempt", 0, raising=False)
     monkeypatch.setattr(cq, "_job_fail_state_path",
                         lambda: str(tmp_path / "state.json"))
     def _boom():
@@ -46,9 +45,9 @@ def _clean_account_state(monkeypatch, tmp_path):
 
 
 def _reject_once(cfg=None, *, user="101358", backup=False):
-    """模擬「送出一次帳密 → 被拒」。"""
-    cq._note_his_credentials_sent(user, backup)
-    cq._note_his_login_rejected(cfg)
+    """模擬「送出一次帳密 → 被拒」(token 化:結果只消費自己那一顆)。"""
+    tok = cq._note_his_credentials_sent(user, backup)
+    cq._note_his_login_rejected(cfg, tok)
 
 
 # ══ 1. 只有 LoginNotCompleted 才算 ═══════════════════════════════════════
@@ -57,14 +56,15 @@ class TestOnlyARejectedPasswordCounts:
     `_wait_main_window_after_login`,不是另外寫一個假的分類器。"""
 
     @staticmethod
-    def _wait_ok(monkeypatch):
+    def _wait_ok(monkeypatch, token=None):
         """走真正的成功出口(主畫面出現且 enabled)。"""
         monkeypatch.setattr(cq, "find_windows",
                             lambda *a, **k: [777])
         monkeypatch.setattr(cq.win32gui, "IsWindowEnabled", lambda h: True)
         return cq._wait_main_window_after_login(set(), visible_only=True,
                                                 timeout_sec=5.0,
-                                                cfg=dict(BOTH))
+                                                cfg=dict(BOTH),
+                                                login_token=token)
 
     @staticmethod
     def _wait(monkeypatch, *, bde, login_still_there):
@@ -78,10 +78,11 @@ class TestOnlyARejectedPasswordCounts:
         monkeypatch.setattr(
             cq, "find_windows",
             lambda *a, **k: [123] if login_still_there else [])
-        cq._note_his_credentials_sent("101358", False)
+        tok = cq._note_his_credentials_sent("101358", False)
         with pytest.raises(Exception) as ei:
             cq._wait_main_window_after_login(set(), visible_only=True,
-                                             timeout_sec=0.0, cfg=dict(BOTH))
+                                             timeout_sec=0.0, cfg=dict(BOTH),
+                                             login_token=tok)
         return ei.value
 
     def test_login_not_completed_counts(self, monkeypatch):
@@ -117,8 +118,9 @@ class TestASuccessBreaksTheStreak:
         for _ in range(2):
             _reject_once(BOTH)
         assert cq._his_primary_fails == 2
-        cq._note_his_credentials_sent("101358", False)
-        assert TestOnlyARejectedPasswordCounts._wait_ok(monkeypatch) == 777
+        tok = cq._note_his_credentials_sent("101358", False)
+        assert TestOnlyARejectedPasswordCounts._wait_ok(monkeypatch,
+                                                        tok) == 777
         assert cq._his_primary_fails == 0
         # 打斷之後要重新數三次
         for _ in range(2):
@@ -131,8 +133,8 @@ class TestASuccessBreaksTheStreak:
         """出口是隔天,不是「備用成功了就切回去」(使用者定案)。"""
         for _ in range(3):
             _reject_once(BOTH)
-        cq._note_his_credentials_sent("999999", True)
-        cq._note_his_login_succeeded()
+        tok = cq._note_his_credentials_sent("999999", True)
+        cq._note_his_login_succeeded(tok)
         assert cq._his_using_backup is True
         assert cq._his_primary_fails == 3
 
@@ -175,9 +177,9 @@ class TestTheSwitchToTheBackupAccount:
         ★反例只靠這條規則分勝負★:帳密確實送出去了一次(所以不是「沒送帳密
         不算」那條),而且是 LoginNotCompleted(所以不是失敗種類那條)。
         """
-        cq._note_his_credentials_sent("101358", False)
+        tok = cq._note_his_credentials_sent("101358", False)
         for _ in range(3):
-            cq._note_his_login_rejected(BOTH)
+            cq._note_his_login_rejected(BOTH, tok)
         assert cq._his_primary_fails == 1
         assert cq._his_using_backup is False
 
@@ -194,8 +196,8 @@ class TestTheSwitchToTheBackupAccount:
         節奏又會再送一次帳密,正好是冷卻要防的那件事(fixture 裡的
         `load_config` 一被呼叫就會爆炸)。
         """
-        cq._note_his_credentials_sent("101358", False)
-        cq._note_his_login_rejected()          # 沒有 cfg 也不可以去讀檔
+        tok = cq._note_his_credentials_sent("101358", False)
+        cq._note_his_login_rejected(token=tok)   # 沒有 cfg 也不可以去讀檔
         assert cq._his_primary_fails == 1
 
     def test_the_backup_being_rejected_does_not_switch_back(self):
@@ -378,8 +380,15 @@ class TestItIsActuallyWiredUp:
     def test_the_plain_text_body_carries_it_too(self):
         """不支援 HTML 的客戶端看到的是純文字版 —— 兩份要一致。"""
         src = inspect.getsource(cq._do_full_job)
-        assert "_account_note = _his_account_note(cfg)" in src
+        assert "_account_note = _his_account_note(cfg, token=_flow_token)" in src, (
+            "信件標頭沒有吃查詢結果帶回來的 token")
         assert "text_parts.append(_account_note)" in src
+
+    def test_the_session_carries_its_login_token(self):
+        """★session 要真的掛上 token★:標頭測試用的是假 session,量不到
+        冷啟動真的有沒有掛 —— 來源層釘住 `sess.login_token = _login_token`。"""
+        src = inspect.getsource(cq._cold_start_session_impl)
+        assert "sess.login_token = _login_token" in src
 
     def test_the_rejection_counter_sits_at_the_login_check(self):
         """★計數只有一個地方★:兩條登入路徑都收斂到這個判準,而且它就是
@@ -387,7 +396,7 @@ class TestItIsActuallyWiredUp:
         node = _fn("_wait_main_window_after_login")
         assert "_note_his_login_rejected" in _calls(node)
         src = inspect.getsource(cq)
-        assert src.count("_note_his_login_rejected(cfg)") == 1, (
+        assert src.count("_note_his_login_rejected(cfg, login_token)") == 1, (
             "計數點不只一個 → 同一次失敗可能被算好幾遍")
 
 
@@ -640,3 +649,117 @@ class TestACrossMidnightBackupSessionIsRetiredAfterTheRound:
         assert i_q < i_r, "收尾被搬到查詢之前 → 這一輪會被整個放棄"
         assert "_cold_start_session(cfg)" not in src[i_q:i_r], (
             "查詢與收尾之間多了一次登入")
+
+
+# ══ 外審 2026-08-27 P2-05:嘗試 token 化(stale-worker 交錯不可對錯帳)═════
+class TestAttemptTokensSurviveWorkerInterleaving:
+    """★全域最新序號會對錯帳★:session 架構允許 stale-worker 接管(>360 秒)
+    —— A 送帳密後卡死、B 搶走預約再送、A 才醒來回報。舊的「全域最新序號」
+    讓 A 的失敗消費掉【B 的】那一次,B 的成功被當成已處理。
+    token 把嘗試與結果綁在一起,誰先醒來都對不錯。
+    """
+
+    def test_a_stale_workers_late_failure_does_not_eat_the_new_success(self):
+        """外審的原始情境:A 送(主)→ B 送(主)→ A 才回報失敗 → B 成功。
+        正確帳:A 失敗 1 次、B 成功把連續打斷 → 最終 fails == 0。
+        ★舊實作在這裡會是 fails == 1★(A 消費了 B 的序號,B 的成功被忽略)。
+        """
+        tok_a = cq._note_his_credentials_sent("101358", False)
+        tok_b = cq._note_his_credentials_sent("101358", False)
+        cq._note_his_login_rejected(BOTH, tok_a)     # A 晚到的失敗
+        assert cq._his_primary_fails == 1
+        cq._note_his_login_succeeded(tok_b)          # B 的成功
+        assert cq._his_primary_fails == 0, "B 的成功被 A 的舊失敗吃掉了"
+
+    def test_the_reverse_order_still_counts_the_failure(self):
+        """★反向排序也要對★:B 先成功、A 的失敗才到 —— A 那一次確實失敗過,
+        照算(之後的成功不追溯塗銷更早嘗試的事實;數字只進不刪,
+        連續與否由事件順序決定)。"""
+        tok_a = cq._note_his_credentials_sent("101358", False)
+        tok_b = cq._note_his_credentials_sent("101358", False)
+        cq._note_his_login_succeeded(tok_b)
+        cq._note_his_login_rejected(BOTH, tok_a)
+        assert cq._his_primary_fails == 1
+
+    def test_a_failure_is_attributed_to_its_own_account(self):
+        """★失敗要記在 token 上那一組帳號頭上★:A 送出【主帳號】後卡死,
+        B 已切到備用並送出【備用帳號】(全域「最後送出」= 備用);
+        A 的失敗才到 —— 那是主帳號的失敗,必須累計主帳號次數。
+        ★反例要讓 token 與全域不同值★(同值時讀哪邊都對,量不到)。"""
+        tok_a = cq._note_his_credentials_sent("101358", False)
+        cq._note_his_credentials_sent("999999", True)    # 全域最後送出=備用
+        cq._note_his_login_rejected(BOTH, tok_a)
+        assert cq._his_primary_fails == 1, "主帳號的失敗被記到備用頭上"
+
+    def test_each_token_is_consumed_independently(self):
+        """兩顆 token 各自對帳:A、B 都失敗 → 記兩次(舊實作只記得到一次,
+        因為第二個 handler 看到的序號已被第一個消費)。"""
+        tok_a = cq._note_his_credentials_sent("101358", False)
+        tok_b = cq._note_his_credentials_sent("101358", False)
+        cq._note_his_login_rejected(BOTH, tok_a)
+        cq._note_his_login_rejected(BOTH, tok_b)
+        assert cq._his_primary_fails == 2
+
+
+class TestTheHeaderReadsTheServingSession:
+    def test_an_explicit_token_wins_over_the_global_last_sent(self):
+        """★標頭讀【查詢結果帶回來的】token★(外審 2026-08-27 兩輪):
+        從組信當下的全域推測來源會說錯 —— 查詢與寄信之間別的 worker 可能
+        又送過帳密;SW_HIDE 後備跑完後舊常駐 session 也可能還掛著。
+        ★反例只靠來源分勝負★:token 說主帳號,全域最後送出是備用帳號。"""
+        tok = cq._note_his_credentials_sent("101358", False)
+        cq._note_his_credentials_sent("999999", True)     # 別的 worker
+        note = cq._his_account_note(BOTH, token=tok)
+        assert "主帳號" in note and "101358" in note, note
+
+    def test_no_token_falls_back_to_the_global(self):
+        cq._note_his_credentials_sent("999999", True)
+        note = cq._his_account_note(BOTH)
+        assert "備用帳號" in note and "999999" in note, note
+
+    def test_both_query_paths_return_their_token(self):
+        """★查詢結果要真的帶著 token 回來★:兩條路的成功出口都附上 ——
+        少一條的話,那條路的信就退回全域推測(正是要移除的東西)。"""
+        src_hidden = inspect.getsource(cq._automation_on_hidden)
+        assert src_hidden.count(
+            '(*result, getattr(sess, "login_token", None))') == 2, (
+            "hidden 路徑(含掉線恢復那條)沒有把 session 的 token 附上")
+        src_sw = inspect.getsource(cq._run_with_sw_hide)
+        assert "roster_texts, _login_token" in src_sw, (
+            "SW_HIDE 後備沒有把自己的 token 附上")
+
+
+
+class TestConsumeAndTransitionAreOneCriticalSection:
+    def test_a_success_cannot_slip_in_between_consume_and_increment(
+            self, monkeypatch):
+        """★消費與狀態轉移要在同一個臨界區★(外審 2026-08-27 R1):
+        只鎖 `consumed` 的話 —— A 的失敗消費完 token、還沒 `+= 1` 就被切走,
+        B 的成功看到 fails==0 直接返回,A 醒來再 += → 「失敗後成功」卻留下
+        1 次連續失敗。鎖住整段,拿鎖的順序就是事件順序。
+
+        佈局:A 執行緒進 rejected,在臨界區內(消費之後、+= 之前)的
+        `_his_today` 掛鉤處發訊號並停留 0.3s;主執行緒此時發動 B 的成功。
+        ★修好的版本★:B 拿不到鎖,等 A 做完(fails=1)才進去 → 歸零 → 0。
+        ★壞版本★:B 立刻跑完(看到 0,不歸零),A 再 += → 1。
+        """
+        import threading as th
+        import time as _t
+        in_critical = th.Event()
+        real_today = cq._his_today
+
+        def _hook():
+            if not in_critical.is_set():
+                in_critical.set()
+                _t.sleep(0.3)          # 停在臨界區內,給 B 插隊的機會
+            return real_today()
+        monkeypatch.setattr(cq, "_his_today", _hook)
+        tok_a = cq._note_his_credentials_sent("101358", False)
+        tok_b = cq._note_his_credentials_sent("101358", False)
+        t = th.Thread(target=lambda: cq._note_his_login_rejected(BOTH, tok_a))
+        t.start()
+        assert in_critical.wait(5), "A 沒進到臨界區"
+        cq._note_his_login_succeeded(tok_b)      # B 的成功試圖插隊
+        t.join(5)
+        assert cq._his_primary_fails == 0, (
+            "B 的成功插進 A 的消費與 += 之間 → 失敗後成功仍留下連續失敗")
