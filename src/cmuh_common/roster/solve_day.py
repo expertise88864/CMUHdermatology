@@ -130,6 +130,14 @@ def _idle_today(fc: "FairCounters", k, d: date) -> int:
     return 0 if fc.worked_day.get(k) != d else 1
 
 
+def _follow_week_key(d: date, code) -> tuple:
+    """[RS-31] 週別跟診計數的鍵:(ISO年, ISO週, 代號)。二早/四下/五早都在
+    週一～週五內,ISO 週(一～日)剛好把「同一週」框住。跨月交界週與 PGY 其他
+    公平計數同一個邊界 —— 只看本月(RF-09 刻意不回放上月 PGY)。"""
+    wk = d.isocalendar()
+    return (wk[0], wk[1], code)
+
+
 def _pick(ctx: "SessionCtx", cands: list, count_map: dict, purpose: str):
     """公平輪選：次數最少 → 決定性抖動 → 代號字典序（決定性；見 _jitter）。"""
     return min(cands, key=lambda p: (count_map.get(p, 0),
@@ -155,6 +163,13 @@ class FairCounters:
     # （照光/治療室/切片室/跟診皆算）。下午輪選時「今天還沒有任何工作」者優先，
     # 讓每人每天盡量至少有半天有事做,而不是早上放假下午又放假。
     worked_day: dict = field(default_factory=dict)   # {ck: 最近有工作的日期}
+    # [RS-31 2026-08-27 使用者] 兩位 PGY 月:二早/四下/五早跟診的【週別】計數
+    # {(ISO年, ISO週, 代號): 次數}。PGY 反映這三個時段會「這週全是 A、下週全是
+    # B」—— 照光挑人只看 photo_total,週內落點是奇偶性的副作用。仿週三下午
+    # photo_wed_pm 的既有模式:這些時段的照光輪選先看「這週誰跟診多」,多者去
+    # 照光、跟診輪給另一位 → 同一週內兩人都跟得到診。★只在兩位 PGY 月讀取★;
+    # 回放(鎖定時段)不分模式一律記錄,非兩位 PGY 月寫了也沒有人讀。
+    two_pgy_follow_week: dict = field(default_factory=dict)
     # last_*：最近一次輪到日期。[2026-07-23] 輪選 key 已改用 _jitter 平手決勝（LRU 會
     # 鎖死固定配對），這些欄位保留作紀錄/回放資料，不再參與輪選。
     last_photo: dict = field(default_factory=dict)
@@ -223,6 +238,16 @@ class PhotoStep(FillStep):
         if ctx.wed_pm:                          # 週三下午：先比 photo_wed_pm 再比總次數
             pick = min(ctx.pgy, key=lambda p: (
                 fc.photo_wed_pm.get(p, 0), fc.photo_total.get(p, 0),
+                _jitter(ctx.d, ctx.session, "photo", p), p))
+        elif ctx.two_pgy_photo_only:
+            # [RS-31 2026-08-27 使用者] 二早/四下/五早的跟診要【同一週內】輪替
+            # (不能這週全是 A、下週全是 B):這週已跟診多的先去照光,跟診讓給
+            # 另一位。photo_total 降為第二鍵 —— 與週三下午 photo_wed_pm 同一個
+            # 模式;偏差由其後時段的 min-first 自行收斂(兩人月每時段照光必有
+            # 一人,差距至多暫時 +1 就被拉回)。
+            pick = min(ctx.pgy, key=lambda p: (
+                -fc.two_pgy_follow_week.get(_follow_week_key(ctx.d, p), 0),
+                fc.photo_total.get(p, 0),
                 _jitter(ctx.d, ctx.session, "photo", p), p))
         else:
             pick = _pick(ctx, ctx.pgy, fc.photo_total, "photo")
@@ -473,7 +498,13 @@ class TwoPgySeatStep(FillStep):
             if not ctx.pgy:
                 return
             if len(ctx.room_slots[r]) < ctx.capacity:
-                _seat(ctx, ctx.pgy, r, _pgy_ck, prefer=ctx.room_pref(r))
+                pick = _seat(ctx, ctx.pgy, r, _pgy_ck, prefer=ctx.room_pref(r))
+                # [RS-31] 週別跟診計數:只記【真的坐進去】的那一次,而且只記
+                # 二早/四下/五早(週三下午治療室休診釋出的入座不在輪替規則內)。
+                if ctx.two_pgy_photo_only:
+                    k = _follow_week_key(ctx.d, pick)
+                    ctx.fc.two_pgy_follow_week[k] = \
+                        ctx.fc.two_pgy_follow_week.get(k, 0) + 1
 
 
 class ClerkSeedStep(FillStep):
@@ -696,6 +727,11 @@ def replay_counters(fc: FairCounters, d: date, session: str, slots: dict,
                 rk = str(slot).strip()
                 fc.seat_room[(k, rk)] = fc.seat_room.get((k, rk), 0) + 1
                 fc.last_seat_room[k] = rk
+                # [RS-31] `two_pgy_follow_week` ★刻意不在這裡記★:本月鎖定
+                # 時段的跟診已在主迴圈【之前】整月預掃入帳(未來的鎖定要能
+                # 影響更早的自動時段 —— 外審 R1 P2),在這裡再記就是重複;
+                # RF-09 上月回放則刻意不入帳(PGY 公平是月度的)。在這裡
+                # 補記會把鎖定跟診算兩次、平手決勝權被偷走 —— 有測試釘著。
     # [2026-07-25] 同伴計數同樣回放：鎖定/跨月既存格若不算共事次數,後續未鎖時段
     # 會以為這兩人沒配過而繼續把他們湊在一起。同房內兩兩各記一次。
     # （獨立一圈跑,不可併進上面的 for——併進去會逐房重跑而重複計數。）
@@ -1015,6 +1051,31 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
     # [RS-15] 判準=該月 PGY 名單恰 2 位(去重;不看當日可用人數 —— 請假造成
     # 的臨時 2 人不算,名單就是 2 人的月份整月一致啟用,行為可預期)。
     two_pgy = len({str(p) for p in inp.pgy_roster}) == 2
+
+    # ★[RS-31 外審 R1 P2] 本月鎖定時段的三時段跟診要【先】入帳★:主迴圈是
+    # 時序的,鎖定時段走到那天才回放 —— 週四/週五鎖了 P1 跟診、週二自動排班
+    # 時看不到的話,照光仍會抽走 P2、P1 連跟三場。與切片室「還沒跑到的鎖定
+    # 時段要先預留」(`_locked_bx`)同一個道理。★這裡是鎖定跟診的唯一寫入點★
+    # (`replay_counters` 刻意不記,否則重複);RF-02 掉出格網的鎖定本來就
+    # 不餵計數 → 只掃格網內的日子,邊界一致。不分兩位 PGY 模式一律預掃
+    # (讀取端只在兩位 PGY 月看)。
+    _pgy_codes = set(inp.pgy_roster)
+    for _d3 in sorted(inp.grid):
+        if is_weekend(_d3):
+            continue
+        _iso3 = _d3.isoformat()
+        for _s3 in STUDENT_SESSIONS:
+            _ls3 = (inp.locked.get(_iso3) or {}).get(_s3)
+            if _ls3 is None or (_d3.weekday(), _s3) not in TWO_PGY_PHOTO_ONLY:
+                continue
+            for _slot3, _ppl3 in _ls3.items():
+                if _slot3 in (PHOTO, TREATMENT, BIOPSY, REST):
+                    continue
+                for _p3 in (_ppl3 or []):
+                    if _p3 in _pgy_codes:
+                        _wk3 = _follow_week_key(_d3, _p3)
+                        fc.two_pgy_follow_week[_wk3] = \
+                            fc.two_pgy_follow_week.get(_wk3, 0) + 1
 
     # RF-09：先把上月跨月梯次的既存班表餵進 fc（只餵切片室與 clerk 座位/放假；跳過
     # 治療室與上月 PGY，避免污染本月 PGY 月度公平），讓「本梯未輪過切片」的判定與月底
