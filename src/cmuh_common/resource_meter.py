@@ -28,6 +28,11 @@ CSV 欄位(固定;報告腳本靠它,加欄位往後 append、不重排):
   sys_idle_s,sys_kernel_s,sys_user_s,mem_load_pct
 scope:self(宿主自己)/ proc(家族根行程)/ child(某根的子孫,逐 exe 彙總)
      / system(整機情境)。
+★host = 這台機器的電腦名稱★(外審 2026-08-27 P2-05):原本這一欄寫的是
+  宿主程式名,而量測器只由主程式啟動 → 每一列、每一台都是常數「主程式」,
+  既沒有資訊、又與欄位名宣稱的事不符。治療室共用電腦與診間機器的資料要
+  放在一起比較(工單就是為了比較它們),沒有機器身分就分不開;宿主程式
+  的身分本來就在 label(self 列)裡,沒有損失。
 """
 from __future__ import annotations
 
@@ -65,6 +70,21 @@ _CSV_HEADER = ("ts,host,version,label,scope,exe,pid,n_procs,"
                "py_threads,sys_idle_s,sys_kernel_s,sys_user_s,"
                "mem_load_pct\n")
 _FILE_RE = re.compile(r"^resource_meter_(\d{6})\.csv$")
+
+
+def _csv_safe(value) -> str:
+    """把值變成單一 CSV 欄位能容納的樣子(逗號/換行 → 空白)。"""
+    return re.sub(r"[,\r\n]+", " ", str(value or "")).strip()
+
+
+def _hostname() -> str:
+    """這台機器的電腦名;取不到就空字串(★量測絕不可以傷本業★)。"""
+    try:
+        import socket  # noqa: PLC0415 - 只有這裡要,不讓匯入成本進到每次啟動
+        return socket.gethostname()
+    except Exception:                       # pragma: no cover - 防禦性
+        logging.debug("取電腦名失敗(host 欄留空)", exc_info=True)
+        return ""
 
 
 class _PMC(ctypes.Structure):
@@ -221,9 +241,15 @@ class ResourceMeter:
 
     def __init__(self, out_dir, program: str, version: str,
                  interval_sec: float = SAMPLE_INTERVAL_SECONDS,
-                 proc_table=None, pid_sampler=None):
+                 proc_table=None, pid_sampler=None, host=None):
         self._dir = str(out_dir)
         self._program = program
+        # ★host 欄是【這台機器】★(外審 P2-05):`host=` 只給測試注入,
+        #   生產不傳 → 取一次電腦名(取不到就留空,fail-open;空字串在
+        #   報告裡是「不知道哪一台」,比寫一個假的機器名誠實)。
+        #   ★逗號/換行會把欄位切歪★(這個寫檔器是手工拼 CSV 的)——
+        #   Windows 電腦名不可能有這些字元,但外來值不預設它一定乾淨。
+        self._host = _csv_safe(_hostname() if host is None else host)
         self._version = version
         self._interval = max(5.0, float(interval_sec))
         self._proc_table = proc_table or _default_proc_table
@@ -279,7 +305,7 @@ class ResourceMeter:
         """取樣一輪 → 寫入的列數。逐段 fail-open:系統列/自己/家族互不拖累。"""
         rows = 0
         ts = (now or datetime.now()).isoformat(timespec="seconds")
-        base = f"{ts},{self._program},{self._version}"
+        base = f"{ts},{self._host},{self._version}"
         # ① 整機情境列
         try:
             k32 = ctypes.windll.kernel32

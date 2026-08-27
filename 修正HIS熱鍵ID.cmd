@@ -23,7 +23,12 @@ if "%~1"=="/elevated" (
     echo [ERROR] Could not obtain administrator rights.
     goto :hold
 )
-powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '/elevated' -Verb RunAs"
+REM The path goes through an environment variable, NOT interpolated into the
+REM PowerShell source: a path containing an apostrophe (C:\Users\O'Connor\...)
+REM would otherwise terminate the single-quoted string early and the emergency
+REM repair tool could no longer elevate at all. Env var = data, not source.
+set "CMUH_ELEVATE_TARGET=%~f0"
+powershell -NoProfile -Command "Start-Process -FilePath $env:CMUH_ELEVATE_TARGET -ArgumentList '/elevated' -Verb RunAs"
 exit /b 0
 
 :elevated

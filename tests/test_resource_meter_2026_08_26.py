@@ -285,3 +285,89 @@ class TestTheRoundOneFindings:
         chrome = [r for r in _rows(tmp_path)
                   if r[4] == "child" and r[5] == "chrome.exe"]
         assert len(chrome) == 1 and chrome[0][10] == "", chrome
+
+
+# ══ 8. [外審 2026-08-27 P2-05] host 欄要是【這台機器】 ═══════════════════
+class TestTheHostColumnIsTheMachine:
+    """schema 宣告的第二欄叫 `host`,寫進去的卻是宿主【程式】名 ——
+    而量測器只由主程式啟動(`ResourceMeter(..., "主程式", ...)`),
+    所以每一列、每一台都是同一個常數:既沒有資訊,又與欄位名宣稱的事不符。
+    工單的目的正是把治療室共用電腦與診間機器放在一起比 —— 沒有機器身分
+    就分不開。宿主程式的身分本來就在 label(self 列)裡,沒有損失。
+    """
+
+    def _meter_on(self, tmp_path, host, monkeypatch):
+        m = ResourceMeter(str(tmp_path), "主程式", "test", host=host,
+                          proc_table=lambda: TABLE, pid_sampler=_fake_sampler)
+        monkeypatch.setattr(os, "getpid", lambda: 99)
+        return m
+
+    def test_every_row_kind_carries_the_machine_name(self, tmp_path,
+                                                     monkeypatch):
+        """★四種 scope 都要有★:system / self / proc / child ——
+        少一種,那一類資料在多機彙整時就成了孤兒。"""
+        self._meter_on(tmp_path, "CLINIC-PC-01", monkeypatch).sample_once()
+        rows = _rows(tmp_path)
+        assert {r[4] for r in rows} == {"system", "self", "proc", "child"}
+        assert {r[1] for r in rows} == {"CLINIC-PC-01"}, rows
+
+    def test_two_machines_stay_separable_and_the_program_is_not_lost(
+            self, tmp_path, monkeypatch):
+        """★反例只靠 host 欄分勝負★:同一份資料由兩台寫出(程式、家族、
+        版本全都一樣)—— 唯一分得開它們的就是這一欄。
+        同時證明【沒有損失】:label 仍然說得出是哪一個程式家族。"""
+        for h in ("TREATMENT-PC", "CLINIC-PC-01"):
+            self._meter_on(tmp_path, h, monkeypatch).sample_once()
+        rows = _rows(tmp_path)
+        by_host: dict = {}
+        for r in rows:
+            by_host.setdefault(r[1], []).append(r)
+        assert set(by_host) == {"TREATMENT-PC", "CLINIC-PC-01"}, by_host
+        assert len(by_host["TREATMENT-PC"]) == len(by_host["CLINIC-PC-01"])
+        assert {r[3] for r in rows if r[4] == "self"} == {"主程式"}
+        assert "會診查詢" in {r[3] for r in rows if r[4] == "proc"}
+
+    def test_the_production_shape_takes_the_real_machine_name(self, tmp_path,
+                                                             monkeypatch):
+        """★生產的呼叫形狀不傳 host★(`main.py` 只給 out_dir/程式/版本)——
+        那條路要自己去問作業系統,而且★不可以是程式名★。"""
+        import socket
+        m = ResourceMeter(str(tmp_path), "主程式", "test",
+                          proc_table=lambda: TABLE, pid_sampler=_fake_sampler)
+        monkeypatch.setattr(os, "getpid", lambda: 99)
+        m.sample_once()
+        hosts = {r[1] for r in _rows(tmp_path)}
+        assert hosts == {socket.gethostname()}, hosts
+        assert "主程式" not in hosts
+
+    def test_a_machine_name_with_a_comma_does_not_shift_the_columns(
+            self, tmp_path, monkeypatch):
+        """★這個寫檔器是手工拼 CSV 的★:值裡有逗號就會把後面每一欄推移
+        一格(scope 變成別的字串,整份資料靜靜錯位)。Windows 電腦名不會
+        長這樣,但外來值不預設它一定乾淨。"""
+        self._meter_on(tmp_path, "PC,01", monkeypatch).sample_once()
+        rows = _rows(tmp_path)
+        assert all(len(r) == 19 for r in rows), rows
+        assert {r[1] for r in rows} == {"PC 01"}
+        assert {r[4] for r in rows} == {"system", "self", "proc", "child"}
+
+    def test_an_unknown_machine_name_is_blank_not_a_fake_one(self, tmp_path,
+                                                             monkeypatch):
+        """取不到電腦名時★留空★(誠實)而且★照樣寫★(fail-open):
+        量測絕不可以因為問不到機器名就整輪不寫。
+
+        ★用生產的失敗形狀★:第一版我把整個 `_hostname` 換掉 —— 那量的是
+        一個生產不會發生的情境(它自己就有守衛),而且測試因此紅在建構子。
+        真正會失敗的是作業系統那一次呼叫。"""
+        import socket
+
+        def _boom():
+            raise OSError("no hostname")
+        monkeypatch.setattr(socket, "gethostname", _boom)
+        m = ResourceMeter(str(tmp_path), "主程式", "test",
+                          proc_table=lambda: TABLE, pid_sampler=_fake_sampler)
+        monkeypatch.setattr(os, "getpid", lambda: 99)
+        m.sample_once()
+        rows = _rows(tmp_path)
+        assert rows and {r[1] for r in rows} == {""}, rows
+        assert all(len(r) == 19 for r in rows)
