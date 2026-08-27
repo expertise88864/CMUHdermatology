@@ -19,7 +19,8 @@ from tkinter import filedialog, messagebox, ttk
 from cmuh_common.deps_runtime import ensure_dependencies
 from cmuh_common.roster.model import ClerkBatch, batches_covering, month_dates
 from cmuh_common.roster.solve_day import (
-    BIOPSY, PHOTO, REST, STAT_KEYS, TREATMENT, format_course_stats,
+    BIOPSY, PHOTO, REST, STAT_KEYS, TREATMENT, arbitration_order,
+    day_owner_batch, format_course_stats,
 )
 from cmuh_common.roster.ui.common import (
     CARD_BORDER, CARD_CANVAS_BG, CARD_HDR_HOLIDAY, CARD_HDR_NORMAL,
@@ -1012,13 +1013,17 @@ class _DayEditDialog(tk.Toplevel):
             logging.debug("[roster.ui] 編輯視窗候選名單讀取失敗", exc_info=True)
             return [], {}
         codes = list(inp.pgy_roster or [])
-        for b in (inp.clerk_batches or []):
-            try:
-                if b.covers(self.d):
-                    codes.extend(b.members or [])
-            except Exception:            # 壞梯次資料只跳過該梯,不炸整個編輯視窗
-                logging.debug("[roster.ui] 梯次 covers 判定失敗（略過該梯）",
-                              exc_info=True)
+        # ★候選人要套 RF-08 的勝者判準★(全審 2026-08-24 P2-03):同一天被多梯
+        #   涵蓋時,自動排班只排【原始順序第一個】那一梯,敗者梯次的成員那天
+        #   根本不上班 —— 把他們列進「＋選人」等於邀請使用者排一個自動排班
+        #   絕不會排、而且結構驗證(切片室)會擋下來的人。判準與求解器共用
+        #   `day_owner_batch`,不再對 covering 梯次做聯集。
+        try:
+            _owner = day_owner_batch(arbitration_order(inp), self.d)
+            codes.extend((_owner.members or []) if _owner else [])
+        except Exception:                # 壞梯次資料只跳過,不炸整個編輯視窗
+            logging.debug("[roster.ui] 當日梯次判定失敗（略過 Clerk 候選）",
+                          exc_info=True)
         leaves: dict = {}
         for scope in ("pgy", "clerk"):
             for c, days in ((inp.leaves or {}).get(scope) or {}).items():

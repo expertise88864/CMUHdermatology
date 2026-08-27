@@ -39,7 +39,7 @@ from cmuh_common.roster.model import (
     dedupe_codes, duplicated_codes, roc,
 )
 from cmuh_common.roster.solve_day import (
-    apply_locked_biopsy_adjustment,
+    TWO_PGY_PHOTO_ONLY, apply_locked_biopsy_adjustment,
     arbitration_order, batch_biopsy_slots, biopsy_quota_warnings,
     day_input_fingerprint, day_owner_batch,
     BIOPSY, PHOTO, REST, TREATMENT, DaySolveInput, month_solve_day,
@@ -1024,6 +1024,24 @@ class RosterService:
             return 0
         return self.update_month(ym, _mut)
 
+    @staticmethod
+    def _biopsy_is_open(open_slots, order, d, session) -> bool:
+        """這一天這個時段的切片室,對【當天做主的梯次】而言開不開放。
+
+        ★向勝者梯次拿★(RF-08 / RS-26 P2-01):敗者梯次的開放設定不算數。
+        沒有梯次做主 → 不開放(那天沒有 Clerk 上班,自然不會有切片)。
+
+        ★吃的是「真的排得到的時段」而不是原始格網★(外審 RS-30 R1 P2):
+        切片格網的 UI 允許勾選所有平日,而那一天可能是國定假日、週末、整日
+        停診、或週三下午 —— 求解器早就用 `batch_biopsy_slots()` 把這些濾掉了,
+        這裡若只看格網的勾選,手動與自動又會各說各話(而這一批的整個立論
+        就是「手動路徑要知道自動排班知道的事」)。判準只留一份。
+        """
+        owner = day_owner_batch(order, d)
+        if owner is None:
+            return False
+        return (d.isoformat(), session) in (open_slots.get(owner.id) or set())
+
     def validate_course_quota(self, ym: str, *, inp=None,
                               day_slots=None) -> tuple:
         """Clerk 切片配額的【現況】點名 → (警告清單, 該標紅的 {(梯次, 代號)})。
@@ -1240,6 +1258,11 @@ class RosterService:
             return out
         inp = self.build_day_input(ym)
         pgy_set = {str(c) for c in inp.pgy_roster}
+        _order = arbitration_order(inp)
+        # [RS-30] RS-15 的判準與求解器同一條:該月 PGY 名單恰 2 位。
+        _two_pgy = len({str(c) for c in inp.pgy_roster}) == 2
+        # ★整梯真正排得到的切片時段★:算一次就好(逐格重算是 O(n²))。
+        _open_slots, _ = batch_biopsy_slots(inp, _order)
         out.extend(self.validate_day_structure(ym, day_slots=day_slots,
                                                inp=inp))
         # [RS-28] 切片配額的現況點名(輪不到 / 次數不均)——手改過的格也算數。
@@ -1251,8 +1274,14 @@ class RosterService:
                 d = date.fromisoformat(iso)
             except (ValueError, TypeError):
                 continue
-            clerk_today = {str(c) for b in inp.clerk_batches
-                           if b.covers(d) for c in b.members}
+            # ★名單檢查也要套勝者判準★(全審 2026-08-24 P2-03):同一天被多梯
+            #   涵蓋時只有勝者梯次排得到人(RF-08),敗者梯次的成員那天不上班
+            #   —— 拿聯集當「合法名單」,手動把敗者梯次的 Clerk 排進跟診診間
+            #   完全不會被點名(結構驗證只管特別格與容量)。判準與求解器、
+            #   與「＋選人」候選清單共用同一個 `day_owner_batch`。
+            _owner = day_owner_batch(_order, d)
+            clerk_today = {str(c) for c in ((_owner.members or [])
+                                            if _owner else ())}
             valid = pgy_set | clerk_today
             leavers = {mid for mid, ds in (inp.leaves.get("pgy") or {}).items()
                        if d in ds}
@@ -1270,6 +1299,24 @@ class RosterService:
                     if slot in closed and members:
                         out.append(f"{iso} {session}：{slot} 已停診，"
                                    f"卻仍排了 {'、'.join(members)}")
+                    # ★[RS-30 / 全審 P2-04] 手動路徑也要知道「這一格今天開不開」★
+                    #   結構驗證刻意只管【幾位、什麼身分】(RS-27 的定義),
+                    #   而自動排班還知道另外兩件事,手動編輯卻完全不知道:
+                    #   ①切片室那一格今天有沒有開放(C3:開放格網是手動維護的);
+                    #   ②RS-15 兩位 PGY 月的二早/四下/五早治療室不排。
+                    #   依使用者 2026-08-25 的定案,這兩條★只警告、不擋存也不擋
+                    #   定案★(它們是排班規則,不是「規則上不可能成立」的結構)。
+                    if (slot == BIOPSY and members
+                            and not self._biopsy_is_open(
+                                _open_slots, _order, d, session)):
+                        out.append(f"{iso} {session}：切片室今天沒有開放，"
+                                   f"卻排了 {'、'.join(members)}"
+                                   f"——請確認開放格網或改回")
+                    if (slot == TREATMENT and members and _two_pgy
+                            and (d.weekday(), session) in TWO_PGY_PHOTO_ONLY):
+                        out.append(f"{iso} {session}：兩位 PGY 的月份這個時段"
+                                   f"不排治療室（只排照光），卻排了 "
+                                   f"{'、'.join(members)}")
                     for c in members:
                         if c in leavers:
                             out.append(f"{iso} {session} {slot}：{c} 當日請假卻被排")
