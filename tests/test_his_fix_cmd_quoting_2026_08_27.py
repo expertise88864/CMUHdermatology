@@ -65,23 +65,37 @@ class TestThePathIsDataNotSource:
 
 @pytest.mark.skipif(sys.platform != "win32" or not shutil.which("powershell"),
                     reason="需要 Windows PowerShell(CI 為 windows-latest)")
-def test_powershell_receives_every_nasty_path_intact():
+def test_powershell_receives_every_nasty_path_intact(tmp_path):
     """★真的量給 PowerShell 看★:靜態檢查證明不了「這樣寫解析得動」——
     用 `.cmd` 裡★同一串★命令,把三個合法安裝路徑逐一餵進去,
     Start-Process 換成回報用的樁,看 -FilePath 收到的是不是原字串。
 
-    (三個路徑在同一次 PowerShell 啟動裡跑完:一次 spawn ≈ 1 秒,
-     三次就是三秒 —— 測試套件的時間也是成本。)
+    ★結果走檔案,不走主控台★(外審 P3-03;CI 就是紅在這裡):第一版讀
+    stdout —— 於是這條測試量到的其實是【編碼】而不是【引號】。PowerShell
+    的輸出編碼跟著主控台 code page 走:CI runner(與本機 `chcp 437` 重現)
+    把中文檔名寫成 `?`,而 Windows 上 `text=True` 更會讓 stdout 直接變
+    None(我自己記過的教訓,又踩了一次)。
+    ★路徑本身就是中文的★(生產檔名就叫「修正HIS熱鍵ID.cmd」),所以正解
+    不是把中文從反例裡拿掉 —— 那會讓反例失去它要涵蓋的情境 —— 而是
+    ★讓主控台完全不參與★:PowerShell 用 .NET 以 UTF-8(無 BOM)寫檔,
+    Python 明寫 encoding 讀回來。
+
+    (三個路徑在同一次 PowerShell 啟動裡跑完:一次 spawn 就夠。)
     """
     invoke = _elevate_line().split("-Command", 1)[1].strip().strip('"')
-    script = (
-        "function Start-Process { param($FilePath, $ArgumentList, $Verb) "
-        "Write-Output \"GOT=$FilePath\" }\n"
-        + "\n".join(
-            f"$env:CMUH_ELEVATE_TARGET = @'\n{p}\n'@\n{invoke}"
-            for p in NASTY_PATHS))
-    r = subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                       capture_output=True, text=True, timeout=120)
-    got = [ln[4:] for ln in r.stdout.splitlines() if ln.startswith("GOT=")]
+    out = tmp_path / "got.txt"
+    lines = ["$got = New-Object System.Collections.ArrayList",
+             "function Start-Process { param($FilePath, $ArgumentList, $Verb)"
+             " $null = $got.Add($FilePath) }"]
+    for p in NASTY_PATHS:
+        lines += ["$env:CMUH_ELEVATE_TARGET = @'", p, "'@", invoke]
+    lines += ["[IO.File]::WriteAllLines(@'", str(out), "'@, $got,"
+              " (New-Object Text.UTF8Encoding $false))"]
+    r = subprocess.run(["powershell", "-NoProfile", "-Command",
+                        "\n".join(lines)],
+                       capture_output=True, encoding="utf-8",
+                       errors="replace", timeout=120)
     assert r.returncode == 0, r.stderr
+    assert out.exists(), f"PowerShell 沒有寫出結果檔:{r.stderr}"
+    got = out.read_text(encoding="utf-8").splitlines()
     assert got == list(NASTY_PATHS), (got, r.stderr)
