@@ -88,6 +88,9 @@ REASONS = {
     # ★這是「疑似定位漂移」最早的訊號★ —— 臨床行為不變（照舊按全部完成），
     # 但要留下紀錄與通知。原值一律不記，只帶 length。
     "course_unreadable": "療程欄讀不到或內容不像療程值,疑似定位漂移",
+    # [外審 R2-P1-01] 帳本自身的 durability 缺口:anchor 記到的 seq 比檔案末筆新
+    # → 有已發生的動作沒有落盤(斷電)。numbers 帶 anchor_last_seq/tail_seq/missing。
+    "durability_gap": "帳本有已 durable 的 anchor 指向沒落盤的紀錄(疑斷電遺失)",
 }
 
 _VIOLATION = "violation"
