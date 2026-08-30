@@ -226,8 +226,7 @@ from cmuh_common.http_session_registry import (
 )
 from cmuh_common.reg52_fetch import (
     _get_thread_local_reg52_session,
-    is_plaintext_source,
-    UNVERIFIED_TRANSPORT_NOTE,
+    transport_note,
     AUH_DOCTOR_DOCNO_MAP,
     REG52_AUH_TTL_SECONDS,
     REG52_EXTERNAL_BACKOFF_BASE_SECONDS,
@@ -15157,8 +15156,11 @@ class AutomationApp:
                                                             #   我上一版只標註了遠期那條(_dispatch_future_stop_alert_inner)，
                                                             #   本週行事曆這條原封不動 —— 同一個偽造的數字換條路
                                                             #   就又變回「看起來已驗證」。兩條都要標。
-                                                            if is_plaintext_source(ext_branch):
-                                                                msg += "\n\n" + UNVERIFIED_TRANSPORT_NOTE
+                                                            # [外審 R3-P2-02] 明文 HTTP 與「未驗證憑證的 HTTPS」都要標,
+                                                            #   兩者的實際保證不同,句子也不同(見 transport_note)。
+                                                            _note = transport_note(ext_branch)
+                                                            if _note:
+                                                                msg += "\n\n" + _note
                                                             # DND 邏輯改動 (2026-05-18)：
                                                             # 原本 DND 時直接 continue → toast 跟 email 都被擋掉，導致使用者
                                                             # 醒來完全不知道半夜門檻爆掉。改成：DND 只抑制 toast (避免半夜
@@ -15962,8 +15964,11 @@ class AutomationApp:
         #   （把某診改成 130 人就能寄出一封與真的完全一樣的止掛提醒）。
         #   ★標註而不是抑制★ 抑制等於讓分院的止掛提醒安靜消失(fail-closed)；
         #   照樣寄，但不要讓它看起來和已驗證的來源一樣可信。
-        if is_plaintext_source(ext_branch):
-            msg += "\n\n" + UNVERIFIED_TRANSPORT_NOTE
+        # [外審 R3-P2-02] 明文 HTTP 與「未驗證憑證的 HTTPS」都要標,
+        #   兩者的實際保證不同,句子也不同(見 transport_note)。
+        _note = transport_note(ext_branch)
+        if _note:
+            msg += "\n\n" + _note
 
         def _worker():
             # 寄送權已由呼叫端 _claim_alert_email 取得 → 這裡直接寄,寄成功才永久記號。

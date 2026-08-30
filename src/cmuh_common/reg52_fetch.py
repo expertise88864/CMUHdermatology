@@ -62,7 +62,8 @@ _reg52_external_tls = threading.local()
 # 東區與惠盛走 `http://61.66.117.10`：**沒有 TLS，也沒有主機名可驗證**。
 # 在院內網路上任何位於路徑上的裝置（交換器、Wi-Fi AP、被入侵的同網段機器、
 # 被投毒的 ARP/DNS）都可以【無聲地改寫】回應內容，而我們完全看不出來。
-# 惠和與亞大走 https，不在此列。
+# 惠和與亞大走 https。★但「走 https」不等於「驗證過對方是誰」★——見下面
+# R3-P2-02 的說明:惠和的主機在 INTERNAL_HOSTS 裡,實際是 verify=False。
 #
 # ★威脅模型（誠實地界定，不誇大）★
 #   * 這些頁面【不會】被執行、不會進 webview、不會餵給 shell/SQL/檔案路徑。
@@ -76,13 +77,107 @@ _reg52_external_tls = threading.local()
 # ★為什麼不直接改成 https★ 沒有辦法在這裡驗證院方那台主機有沒有開 443、
 # 憑證是否對得上（它用的是 IP，憑證幾乎不可能匹配）。沒實測過就改，等於把
 # 「資料可能被竄改」換成「整個來源直接不通」。要改需要在院內實測後再動。
+#
+# ★[外審第三輪 R3-P2-02] 「走 https」不等於「驗證過對方是誰」★
+# 上面那段原本寫著「惠和與亞大走 https,不在此列」—— 那句話不準確。
+# 惠和的主機 `appointment.cmuh.org.tw` 在 `http_client.INTERNAL_HOSTS` 裡,
+# 而那份清單正是用來★關掉 SSL 憑證驗證★的(院內憑證驗不過)。所以惠和實際是
+# 「有加密、但沒有驗證對方身分」:路徑上的裝置只要能 MITM,出一張任意憑證
+# 就會被接受。傷害模型與明文那條相同(顯示與通知內容被操縱),
+# 只是它看起來像正常 HTTPS —— 反而更容易讓人以為已驗證。
+# ★使用者 2026-08-30 定案:院內 CA 拿不到 → 先做 provenance 標示★
+# (拿得到 CA 的話正解是 `verify=<ca bundle>`,那時這裡的標示會自動消失。)
+#
+# ★判準要從【生產實際用來決定 verify= 的那個述詞】推導★
+# 不可以再手維護第二份「未驗證分院」清單:兩份遲早漂移,而漂移的方向是
+# 「安全宣稱還在、實際保護沒了」。所以下面用 URL + `http_client.is_internal()`
+# 現算 —— 日後有人把某台主機加進 INTERNAL_HOSTS(等於關掉它的驗證),
+# 對應分院的標示會自動出現(有測試釘住這個性質)。
 PLAINTEXT_REG52_SOURCES = ("east", "huisheng")
+
+#: 傳輸信任等級。plaintext=完全沒有 TLS;unverified_tls=有加密但沒驗身分;
+#: verified=正常 HTTPS(憑證有驗);unknown=這個代碼不是我們認得的分院。
+TRUST_PLAINTEXT = "plaintext"
+TRUST_UNVERIFIED_TLS = "unverified_tls"
+TRUST_VERIFIED = "verified"
+TRUST_UNKNOWN = "unknown"
 
 # 給通知/顯示層用的一句話。★內容要說得跟實際知道的一樣★：我們不是「懷疑這筆
 # 被改過」，而是「這條線路上我們無從分辨有沒有被改過」。
+UNVERIFIED_TLS_NOTE = (
+    "※ 此筆來自院內主機的加密連線,但★憑證未經驗證★(院內憑證無法驗證,"
+    "程式對這些主機停用了 TLS 憑證檢查)—— 內容有加密,但無法確認對方"
+    "就是該主機;止掛前請以 HIS 或分院端再確認一次。")
+
 UNVERIFIED_TRANSPORT_NOTE = (
     "※ 此筆來自未加密連線（明文 HTTP）的分院掛號頁，內容在院內網路上"
     "無法驗證是否被改動過；止掛前請以 HIS 或分院端再確認一次。")
+
+
+def verify_policy(url: str) -> bool:
+    """這個 URL 的請求★要不要驗憑證★ —— fetch 與 provenance 分類共用這一支。
+
+    ★[外審 R3-P2-02 第 1 輪] 「由實際行為推導」必須是真的★
+    我第一版讓分類讀 `is_internal()`,而四支 fetch 裡有三支把 `verify=True`
+    ★寫死★:只要有人把那些主機加進 INTERNAL_HOSTS,分類就會說「程式停用了
+    TLS 憑證檢查」,而 fetch 其實仍在驗 —— 給使用者一個★錯誤的保證★,
+    也推翻了我自己寫在註解裡的核心契約。判準與行為要一致,唯一可靠的做法是
+    ★同一個函式★:分類問它,送出請求的人也問它。
+    (今天的行為逐位元不變:內網只有惠和那台,其餘回 True。)
+    """
+    return not _is_internal(url)
+
+
+def branch_url(ext_branch) -> str:
+    """分院代碼 → 它實際打的 URL(沒有查詢字串的基底)。認不得回 ""。
+
+    ★這份對應是 provenance 判準的唯一輸入★:URL 決定 scheme(有沒有 TLS)
+    與主機(要不要驗憑證),兩件事都不再另外抄一份。
+    """
+    return {
+        "east": EAST_DISTRICT_REG52_URL,
+        "huihe": HUIHE_REG52_URL,
+        "huisheng": HUISHENG_REG52_URL,
+        "auh": AUH_REG52_BASE_URL,
+    }.get(str(ext_branch or ""), "")
+
+
+def transport_trust(ext_branch) -> str:
+    """這個分院的資料是循什麼樣的傳輸信任拿到的(見 TRUST_* 常數)。
+
+    ★由 URL 與生產的 `is_internal()` 現算★(外審 R3-P2-02):
+    `is_internal()` 就是 `reg52_fetch` 各支 fetch 用來決定 `verify=` 的那一支,
+    所以這裡回報的「有沒有驗身分」與實際行為★必然一致★ ——
+    不是另一份會腐爛的清單。
+    """
+    url = branch_url(ext_branch)
+    if not url:
+        return TRUST_UNKNOWN
+    if not url.lower().startswith("https://"):
+        return TRUST_PLAINTEXT
+    try:
+        # ★問的是【送出請求的人問的同一個問題】★(見 verify_policy)。
+        return TRUST_VERIFIED if verify_policy(url) else TRUST_UNVERIFIED_TLS
+    except Exception:
+        # 判不出來時★不可以說成 verified★:那是把「不知道」講成「已驗證」。
+        logging.debug("[reg52] 傳輸信任判定失敗:%s", ext_branch, exc_info=True)
+        return TRUST_UNKNOWN
+
+
+def transport_note(ext_branch) -> str:
+    """要附在通知/顯示上的 provenance 句子;沒有需要標註的就回 ""。
+
+    ★兩種情況的實際保證不同,不可以共用同一句★:
+      * 明文 HTTP:連內容都可能被改寫(而且我們看不出來);
+      * 未驗證 TLS:內容有加密,但★無法確認對方就是那台主機★。
+    講得比實際知道的多或少都不行(整個 repo 的一貫要求)。
+    """
+    t = transport_trust(ext_branch)
+    if t == TRUST_PLAINTEXT:
+        return UNVERIFIED_TRANSPORT_NOTE
+    if t == TRUST_UNVERIFIED_TLS:
+        return UNVERIFIED_TLS_NOTE
+    return ""
 
 
 def is_plaintext_source(ext_branch) -> bool:
@@ -98,7 +193,7 @@ def is_plaintext_source(ext_branch) -> bool:
     臨床通知的 fail-closed 變更；使用者對金絲雀已經定案過同一件事的方向
     （不擋、寄信通知）。所以照樣寄，但信裡說清楚這個數字的來源無法驗證。
     """
-    return str(ext_branch or "") in PLAINTEXT_REG52_SOURCES
+    return transport_trust(ext_branch) == TRUST_PLAINTEXT
 
 # 東區分院掛號（與主院 appointment.cmuh.org.tw 不同主機）
 # ★明文 HTTP★ 見上面 PLAINTEXT_REG52_SOURCES
@@ -195,7 +290,8 @@ def _fetch_east_district_reg52_html(session, doc_no: str, doctor_name: str):
             continue
         seen_urls.add(url)
         try:
-            r = session.get(url, timeout=REG52_BRANCH_TIMEOUT, verify=True)
+            r = session.get(url, timeout=REG52_BRANCH_TIMEOUT,
+                             verify=verify_policy(url))
             r.raise_for_status()
             r.encoding = "big5"
             # ★[2026-08-02 外審 P1] HTTP 200 ≠ 這是掛號表★
@@ -276,7 +372,8 @@ def _fetch_huihe_reg52_html(session, doc_no: str, doctor_name: str):
             continue
         seen_urls.add(url)
         try:
-            r = session.get(url, timeout=REG52_BRANCH_TIMEOUT, verify=not _is_internal(url))
+            r = session.get(url, timeout=REG52_BRANCH_TIMEOUT,
+                             verify=verify_policy(url))
             r.raise_for_status()
             r.encoding = "big5"
             # ★[2026-08-02 外審 P1] HTTP 200 ≠ 這是掛號表★
@@ -354,7 +451,8 @@ def _fetch_huisheng_reg52_html(session, doc_no: str, doctor_name: str):
             continue
         seen_urls.add(url)
         try:
-            r = session.get(url, timeout=REG52_BRANCH_TIMEOUT, verify=True)
+            r = session.get(url, timeout=REG52_BRANCH_TIMEOUT,
+                             verify=verify_policy(url))
             r.raise_for_status()
             r.encoding = "big5"
             # ★[2026-08-02 外審 P1] HTTP 200 ≠ 這是掛號表★
@@ -427,7 +525,8 @@ def _fetch_auh_reg52_html(session, doctor_name):
         return ""
     try:
         session = session or _get_thread_local_reg52_external_session()
-        r = session.get(url, timeout=REG52_AUH_TIMEOUT, verify=True)
+        r = session.get(url, timeout=REG52_AUH_TIMEOUT,
+                         verify=verify_policy(url))
         r.raise_for_status()
         r.encoding = "big5"
         # ★[2026-08-02 外審 P1] 這裡原本是最嚴重的一處★

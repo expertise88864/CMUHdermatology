@@ -337,8 +337,16 @@ class TestUntrustedPlaintextSources:
         只有註解與這份測試在引用。那是「宣稱要對得上實作」的反例。
         """
         import main
-        assert "is_plaintext_source" in inspect.getsource(
-            main.AutomationApp._dispatch_future_stop_alert_inner), (
+        # ★[外審第三輪 R3-P2-02] 判準改名了,守衛要跟著走★
+        #   入口從 `is_plaintext_source`(只問「有沒有 TLS」)換成
+        #   `transport_note`(明文 HTTP + 未驗證憑證的 HTTPS 都問)。
+        #   ★守衛要盯的是「有沒有問過來源信任」這個性質★,不是某個名字 ——
+        #   所以這裡列舉【目前合法的入口】,改名時會紅(這次就是),
+        #   而不是靜默失效。
+        _entries = ("transport_note", "is_plaintext_source")
+        _src = inspect.getsource(
+            main.AutomationApp._dispatch_future_stop_alert_inner)
+        assert any(e in _src for e in _entries), (
             "止掛提醒沒有用到來源信任分類")
 
     def test_every_stop_alert_message_marks_untrusted_sources(self):
@@ -383,7 +391,8 @@ class TestUntrustedPlaintextSources:
         missing = sorted({
             f"{fn.name}:{fn.lineno}" for fn in finder.hits
             if not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                       and n.func.id == "is_plaintext_source"
+                       and n.func.id in ("transport_note",
+                                         "is_plaintext_source")
                        for n in ast.walk(fn))})
         assert missing == [], (
             f"這些地方建了止掛提醒訊息卻沒有標註不可信來源：{missing}")
