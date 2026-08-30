@@ -590,15 +590,45 @@ class GitSyncStorage(RosterStorage):
             "本次變更未同步）：%s", (r.stderr or r.stdout).strip())
         return False
 
-    def _outgoing_non_canonical(self, remote: str, branch: str) -> list:
+    def _outgoing_non_canonical(self, remote: str, branch: str) -> tuple:
         """本次 push 會【新發佈出去】的路徑裡，有哪些不是白名單認可的正典資料檔。
+
+        回 `(status, paths)`；status ∈ {"clean", "dirty", "unknown"}。
 
         只看 `<remote>/<branch>..HEAD` 這個範圍：遠端既有歷史裡的髒東西不由本層
         自動處理（那需要人工 `git rm --cached`，見模組 docstring），但也不能因此
         把同步整個鎖死 —— 只擋「這一次會由我們推出去」的部分。
         遠端分支還不存在（首推）→ 拿 HEAD 的整棵樹比對。
-        判定失敗（git 出錯）一律回空：這是縱深防禦，不該因為它自己壞掉而擋住同步。
+
+        ★[外審第二輪 R2-P2-04] 判定失敗必須 fail-closed★
+        原本「git 出錯一律回空」,而呼叫端寫的是 `if stray:` —— 空清單與
+        「檢查不出來」被壓成同一格,於是★檢查自己壞掉時反而放行 push★。
+        這道守衛保護的是【一旦 push 就永遠留在 git 歷史裡】的資料:
+        暫時不能同步的成本是「晚一點再推」,誤推的成本是外洩(之後刪工作樹
+        也沒用,要改寫歷史)。兩邊不對稱,所以這裡沒有 availability-first 的理由。
+        ★回 tuple 而不是「None 代表未知」★:呼叫端原本就是用真假值判斷的,
+        回 None 只會讓同一個陷阱換一種寫法再犯一次(falsy = 放行)。
         """
+        # ★「還沒有任何 commit」要【正面】判定★(外審 R1-1;這是我這一批自己
+        #   新開的洞):`_rev_parse()` 把「unborn repo」與「git 執行失敗/回非 0」
+        #   都映射成 None —— 拿它當「沒有 commit」等於在剛建立的 fail-closed
+        #   契約上開一個後門:rev-parse 失敗 → 判 clean → 夾帶 PHI 的未推 commit
+        #   照樣被發佈出去。★又是「便利的判斷式不等於那個狀態」★。
+        #   `rev-list -n 1 --all` 在空 repo 是【returncode 0 且輸出為空】——
+        #   那是一個正面訊號;壞掉的 repo 則會回非 0 → unknown。
+        try:
+            _rl = self._git("rev-list", "-n", "1", "--all")
+        except (OSError, subprocess.SubprocessError):
+            logging.warning("[roster.gitsync] 無法確認 repo 是否有 commit → "
+                            "不推(fail-closed)", exc_info=True)
+            return ("unknown", [])
+        if _rl.returncode != 0:
+            logging.warning("[roster.gitsync] 無法確認 repo 是否有 commit"
+                            "(rev-list 非 0)→ 不推(fail-closed):%s",
+                            (_rl.stderr or "").strip()[:200])
+            return ("unknown", [])
+        if not (_rl.stdout or "").strip():
+            return ("clean", [])            # 正面確認:整個 repo 一個 commit 都沒有
         try:
             # ★用 log 逐 commit 掃,不是 diff 兩端★(外審第 12 輪)
             #   淨差會漏掉「某個未推 commit 加了檔、後面另一個未推 commit 又刪掉」:
@@ -614,12 +644,18 @@ class GitSyncStorage(RosterStorage):
                 r = self._git("log", "--format=", "--name-only",
                               "--diff-filter=ACMR", "HEAD")
                 if r.returncode != 0:
-                    return []
-            return sorted({ln.strip() for ln in (r.stdout or "").splitlines()
-                           if ln.strip() and not self._is_canonical_path(ln.strip())})
+                    logging.warning(
+                        "[roster.gitsync] 待推路徑檢查失敗（git log 非 0）→ "
+                        "不推(fail-closed):%s", (r.stderr or "").strip()[:200])
+                    return ("unknown", [])
+            stray = sorted({ln.strip() for ln in (r.stdout or "").splitlines()
+                            if ln.strip()
+                            and not self._is_canonical_path(ln.strip())})
+            return (("dirty" if stray else "clean"), stray)
         except (OSError, subprocess.SubprocessError):
-            logging.debug("[roster.gitsync] 待推路徑檢查失敗（略過）", exc_info=True)
-            return []
+            logging.warning("[roster.gitsync] 待推路徑檢查失敗 → 不推(fail-closed)",
+                            exc_info=True)
+            return ("unknown", [])
 
     def _remote_name(self) -> "str | None":
         try:
@@ -730,7 +766,18 @@ class GitSyncStorage(RosterStorage):
                         return False
                 after = self._rev_parse("HEAD")
                 changed = bool(before and after and before != after)
-            stray = self._outgoing_non_canonical(remote, branch)
+            _audit, stray = self._outgoing_non_canonical(remote, branch)
+            if _audit == "unknown":
+                # ★檢查不出來 = 不推★(外審 R2-P2-04):見該函式的長註解。
+                #   ★出口★:這不是永久狀態 —— 下次存檔(或關閉時的 flush)會再試,
+                #   git 恢復正常就自動繼續同步;訊息也說得出可以怎麼自救。
+                self._set_state(
+                    "error",
+                    "無法檢查「這次要推出去的 commit 有沒有夾帶不該同步的檔案」"
+                    "（git 指令失敗）。為避免把資料永久寫進 git 歷史,這次不推 —— "
+                    "資料已存在本機,下次存檔會自動重試。若持續發生,請在 "
+                    "settings/roster 執行 git status / git log 確認 repo 狀態。")
+                return changed
             if stray:
                 # ★[外審第 7 輪] 白名單只管【新的】commit★
                 #   升級前若本機躺著舊版 `add -A` 造出、還沒推出去的 commit

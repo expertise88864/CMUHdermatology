@@ -10918,6 +10918,20 @@ def main() -> None:
         #   必須在 _setup_logging 之後(讀失敗的警告要進得了 log)。
         _load_job_fail_state()
 
+        # ★[外審第二輪 R2-P2-02] 保留期由【產生資料的程式】自己執行★
+        #   會診截圖含整份病人清單(7 天)。原本的 TTL 清掃只在「存新截圖」那一刻
+        #   跑 —— 沒有新會診就再也不跑,而主程式(全域清掃)在治療室共用電腦上
+        #   可能整天沒開。啟動時掃一次 + 每 12 小時掃一次。
+        try:
+            from cmuh_common.retention import (  # noqa: PLC0415
+                consult_shot_rule, start_background_sweeper,
+            )
+            start_background_sweeper([consult_shot_rule(str(SHOTS_DIR))],
+                                     label="會診截圖")
+        except Exception:
+            logging.debug("[retention] 自我清掃啟動失敗(不影響會診查詢)",
+                          exc_info=True)
+
         # [穩定性] health monitor — RAM/網路/時鐘/硬碟 + 記憶體 leak 自動重啟 (A/E/F)
         try:
             from cmuh_common.health import start_health_monitor

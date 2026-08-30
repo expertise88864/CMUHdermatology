@@ -15,8 +15,17 @@
   * `paths.sweep_old_restart_err_files()` 有 TTL，但要有人叫它。
 
 宣告了保留期卻不主動執行，等於沒有保留期 —— 而這些檔案裡有病歷號、帳號、
-完整畫面。故集中成一支「不依賴任何事件發生」的清掃器，由主程式在
-**啟動時**與**每日固定時間**各跑一次。
+完整畫面。故集中成一支「不依賴任何事件發生」的清掃器。
+
+★[外審第二輪 R2-P2-02] 誰產生敏感資料,誰就要自己執行保留期★
+原本只有主程式在啟動時與每日固定時間各跑一次全域清掃,而★產生★這些檔的是
+另外兩支獨立程式:會診查詢(consult_shots,7 天)與打卡(debug_dumps,3 天)。
+watchdog 允許「這台只跑會診+打卡、主程式很少開」的合法部署(治療室共用電腦
+正是這樣),於是宣告的保留期就不再是保證。
+而兩支程式原本的 TTL 清掃★只在產生新資料時★被呼叫(存新截圖/存除錯檔那一刻)
+—— 事件一停,清掃就再也不會發生,含 PHI 的檔可以無限期留著。
+故:兩支程式各自在★啟動時★與★固定週期★清自己那一份
+(`start_background_sweeper`);主程式的全域清掃保留為冗餘。
 
 設計取捨：
 - **一律以 mtime 判齡**，不解析檔名。各處的時間戳格式不一致，解析失敗就會靜默
@@ -32,6 +41,8 @@ from __future__ import annotations
 import glob
 import logging
 import os
+import stat as stat_module
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -72,10 +83,20 @@ class SweepResult:
     deleted: dict = field(default_factory=dict)     # {label: 刪掉幾個}
     failed: dict = field(default_factory=dict)      # {label: 刪不掉幾個}
     oldest: "tuple | None" = None                   # (label, mtime datetime)
+    # ★[外審第二輪 R2-P2-03] 連年齡都讀不到的檔★:ACL、防毒、暫時性 IO 錯誤。
+    #   原本 `except OSError: continue` —— 不進 failed、不進 oldest、不進摘要,
+    #   於是「磁碟上還躺著一個含 PHI 的檔」與「沒有過期檔案」長得一模一樣。
+    #   ★無法確認檔案年齡 ≠ 檔案在保留期內★:隱私控制要顯示 degraded,不是 clean。
+    stat_failed: dict = field(default_factory=dict)  # {label: 讀不到年齡幾個}
 
     @property
     def total_deleted(self) -> int:
         return sum(self.deleted.values())
+
+    @property
+    def clean(self) -> bool:
+        """這一輪有沒有★完全確認★保留期成立(刪不掉/讀不到年齡都不算)。"""
+        return not self.failed and not self.stat_failed
 
     def summary(self) -> str:
         parts = [f"{k}×{v}" for k, v in sorted(self.deleted.items()) if v]
@@ -83,6 +104,9 @@ class SweepResult:
         if self.failed:
             out += "；刪不掉:" + "、".join(
                 f"{k}×{v}" for k, v in sorted(self.failed.items()) if v)
+        if self.stat_failed:
+            out += "；★年齡讀不到(無法確認保留期)★:" + "、".join(
+                f"{k}×{v}" for k, v in sorted(self.stat_failed.items()) if v)
         if self.oldest:
             out += f"；最舊敏感檔:{self.oldest[0]} {self.oldest[1]:%Y-%m-%d}"
         return out
@@ -94,10 +118,13 @@ def _older(cur, cand: float) -> float:
 
 
 def _iter_matches(rule: RetentionRule):
+    """列出符合樣式的路徑。★不在這裡過濾「是不是檔案」★(外審 R1-2):
+    `os.path.isfile()` 自己會做一次 stat,並把 OSError 吞成 False —— 於是
+    ACL/防毒讓 stat 失敗的檔在這裡就被靜默丟掉,連後面的 `stat_failed`
+    都還沒輪到。那正是這一批要消滅的形狀,只是往上游搬了一格。
+    判斷交給 `sweep()` 的★單一次明確 stat★。"""
     for pat in rule.patterns:
-        for p in glob.glob(os.path.join(rule.directory, pat)):
-            if os.path.isfile(p):
-                yield p
+        yield from glob.glob(os.path.join(rule.directory, pat))
 
 
 def sweep(rules, extra_tasks=(), *, now: "float | None" = None) -> SweepResult:
@@ -113,13 +140,24 @@ def sweep(rules, extra_tasks=(), *, now: "float | None" = None) -> SweepResult:
         if not os.path.isdir(rule.directory):
             continue
         cutoff = now - rule.retain_days * 86400.0
-        gone = bad = 0
+        gone = bad = unknown_age = 0
         newest_kept: "float | None" = None
         for path in _iter_matches(rule):
+            # ★整條路徑只做【一次】明確的 stat★(外審 R1-2):是不是普通檔、
+            #   幾歲,都由這一次的結果回答 —— 中間任何一個「順手判斷」都可能
+            #   把 OSError 吞成「不是檔案」而靜默跳過。
             try:
-                mtime = os.path.getmtime(path)
+                st = os.stat(path)
             except OSError:
+                # ★讀不到年齡的檔【還在磁碟上】★(外審 R2-P2-03):靜默跳過會讓
+                #   摘要說「沒有過期檔案」,而那個檔可能早就超過保留期。
+                unknown_age += 1
+                logging.warning("[retention] 讀不到檔案狀態(無法確認保留期):%s",
+                                path, exc_info=True)
                 continue
+            if not stat_module.S_ISREG(st.st_mode):
+                continue                    # 目錄/其他:本來就不歸保留期管
+            mtime = st.st_mtime
             if mtime >= cutoff:
                 if rule.sensitive:      # 掃完之後【還在磁碟上】的之中最舊的那個
                     newest_kept = _older(newest_kept, mtime)
@@ -141,6 +179,8 @@ def sweep(rules, extra_tasks=(), *, now: "float | None" = None) -> SweepResult:
             res.deleted[rule.label] = gone
         if bad:
             res.failed[rule.label] = bad
+        if unknown_age:
+            res.stat_failed[rule.label] = unknown_age
         if newest_kept is not None:
             cand = (rule.label, datetime.fromtimestamp(newest_kept))
             if res.oldest is None or cand[1] < res.oldest[1]:
@@ -185,3 +225,49 @@ def default_rules(settings_dir: str) -> list:
         consult_shot_rule(os.path.join(settings_dir, "consult_shots")),
         settings_backup_rule(settings_dir),
     ]
+
+
+# ─── 產生者自己的週期清掃 ─────────────────────────────────────────────────
+#: 產生敏感資料的程式自己跑清掃的間隔(秒)。12 小時:診間電腦常常整天開著,
+#: 一天跑兩次足以讓「保留期」是保證而不是巧合;成本是一條睡著的 daemon 緒。
+SELF_SWEEP_INTERVAL_SEC = 12 * 3600
+
+
+def start_background_sweeper(rules, *, interval_sec: float =
+                             SELF_SWEEP_INTERVAL_SEC,
+                             extra_tasks=(), label: str = "self",
+                             _sleep=None) -> "threading.Thread | None":
+    """★誰產生敏感資料,誰就自己執行保留期★(外審 R2-P2-02)。
+
+    立刻掃一次(啟動時),之後每 `interval_sec` 再掃一次。daemon 緒,絕不拋例外
+    —— 清理失敗不可以影響臨床流程。回傳執行緒(測試可 join;失敗回 None)。
+
+    ★不依賴任何事件發生★:兩支常駐程式原本的 TTL 清掃只在「存新截圖/存新除錯檔」
+    那一刻被呼叫,事件停了就再也不跑 —— 那正是這個模組要消滅的形狀。
+    """
+    def _once():
+        try:
+            res = sweep(rules, extra_tasks)
+            if not res.clean:
+                logging.error("[retention] ★%s 清掃未能完全確認保留期★ %s",
+                              label, res.summary())
+            elif res.total_deleted:
+                logging.info("[retention] %s %s", label, res.summary())
+        except Exception:
+            logging.debug("[retention] %s 清掃失敗(不影響任何流程)", label,
+                          exc_info=True)
+
+    def _loop():
+        while True:
+            _once()
+            (_sleep or time.sleep)(interval_sec)
+
+    try:
+        t = threading.Thread(target=_loop, name=f"retention-{label}",
+                             daemon=True)
+        t.start()
+        return t
+    except Exception:
+        logging.debug("[retention] %s 清掃緒啟動失敗(不影響任何流程)", label,
+                      exc_info=True)
+        return None

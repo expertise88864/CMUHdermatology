@@ -172,6 +172,15 @@ def _atomic_write_rows(path: str, rows: list) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             for r in rows:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            # ★原子 ≠ durable★(外審第二輪 R2-P2-06):`os.replace` 保證的是
+            #   「檔名切換不會被看到中間狀態」,不是「內容已經在磁碟上」。
+            #   這份索引正是【同一天第二位 mismatch 因信件去重而不會再寄信】時,
+            #   唯一查得出「是哪一位病人」的線索 —— 斷電後那筆 forensic 紀錄
+            #   不保證還在。本 repo 其他寫入路徑(updater / multiwrite /
+            #   delivery ledger / action ledger)都已經是「回傳成功 = 已落盤」,
+            #   這裡要一致。(Windows 沒有目錄 fsync,故只保證【內容】落盤。)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
         try:

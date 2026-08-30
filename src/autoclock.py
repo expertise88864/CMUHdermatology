@@ -2572,6 +2572,20 @@ def main() -> None:
         except Exception:
             logging.debug("[pidfile] 自報 PID 失敗（不影響打卡）", exc_info=True)
 
+        # ★[外審第二輪 R2-P2-02] 保留期由【產生資料的程式】自己執行★
+        #   除錯檔含帳號與完整畫面(3 天)。原本的 TTL 清掃只在「打卡失敗、剛存了
+        #   新的除錯檔」那一刻跑 —— 失敗事件一停就再也不跑,而主程式(全域清掃)
+        #   在治療室共用電腦上可能整天沒開。啟動時掃一次 + 每 12 小時掃一次。
+        try:
+            from cmuh_common.retention import (  # noqa: PLC0415
+                debug_dump_rule, start_background_sweeper,
+            )
+            start_background_sweeper([debug_dump_rule(str(DEBUG_DUMPS_DIR))],
+                                     label="打卡除錯檔")
+        except Exception:
+            logging.debug("[retention] 自我清掃啟動失敗(不影響打卡)",
+                          exc_info=True)
+
         # [穩定性] health monitor — RAM/時鐘/硬碟 + 記憶體 leak 自動重啟 (A/E/F)
         try:
             from cmuh_common.health import start_health_monitor

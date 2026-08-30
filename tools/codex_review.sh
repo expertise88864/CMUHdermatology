@@ -144,7 +144,12 @@ REQUEST_CHANGES.
 RP
   echo "[codex-review] resume session=$SID effort=$RESUME_EFFORT (pass $THIS_PASS)"
   : > "$LAST_MSG"
-  ( cd "$REPO_ROOT" && codex exec resume "$SID" "${FLAGS[@]}" "$RESUME_PROMPT" ) 2>&1 | tee "$RAW_LOG"
+  # ★stdin 一律導自 /dev/null★(2026-08-30 實測):codex CLI 在 stdin 不是
+  #   TTY 時會印 "Reading additional input from stdin..." 並【等】額外輸入。
+  #   背景執行(自動化)時那個 stdin 永遠不會 EOF —— 實際發生過一次卡死
+  #   10 小時零輸出、一次被限流守衛判成「無結論」而 exit 4。prompt 本來就
+  #   是用參數傳的,stdin 沒有任何用途。
+  ( cd "$REPO_ROOT" && codex exec resume "$SID" "${FLAGS[@]}" "$RESUME_PROMPT" ) </dev/null 2>&1 | tee "$RAW_LOG"
   CODEX_RC=${PIPESTATUS[0]}
   if [ "$CODEX_RC" -ne 0 ] && [ ! -s "$LAST_MSG" ]; then
     die "codex exec resume 啟動失敗(exit=$CODEX_RC),未產生 review;本輪不計。"
@@ -284,7 +289,12 @@ sed -i -e "/{{VERIFICATION_RESULTS}}/r $TMP/ver.txt" -e "/{{VERIFICATION_RESULTS
 build_flags "$EFFORT"
 echo "[codex-review] mode=$MODE effort=$EFFORT range=$BASE..$TIP model=$MODEL (pass 1/2, read-only)"
 : > "$LAST_MSG"
-codex exec "${FLAGS[@]}" "$(cat "$TMP/prompt.txt")" 2>&1 | tee "$RAW_LOG"
+# ★stdin 一律導自 /dev/null★(2026-08-30 實測):codex CLI 在 stdin 不是
+#   TTY 時會印 "Reading additional input from stdin..." 並【等】額外輸入。
+#   背景執行(自動化)時那個 stdin 永遠不會 EOF —— 實際發生過一次卡死
+#   10 小時零輸出、一次被限流守衛判成「無結論」而 exit 4。prompt 本來就
+#   是用參數傳的,stdin 沒有任何用途。
+codex exec "${FLAGS[@]}" "$(cat "$TMP/prompt.txt")" </dev/null 2>&1 | tee "$RAW_LOG"
 CODEX_RC=${PIPESTATUS[0]}
 if [ "$CODEX_RC" -ne 0 ] && [ ! -s "$LAST_MSG" ]; then
   die "codex exec 啟動失敗(exit=$CODEX_RC),未產生 review。請檢查 CLI 版本與旗標。"
