@@ -22,6 +22,12 @@ HUIHE_DOCTOR_NAMES = frozenset({"蔡李澄"})
 # 目前與惠和同醫師名單；若需不同請改為獨立 frozenset
 HUISHENG_DOCTOR_NAMES = HUIHE_DOCTOR_NAMES
 
+# 老人醫院（臺中市立老人復健綜合醫院）tcmc/reg52 的醫師名單。
+# ★[2026-09-01 使用者] 張廖年峰醫師的門診已移到老人醫院,本院不再有他的門診★
+#   —— 所以這裡沒有「主院頁面提到就跟著抓」的動態那條路可走(主院頁面對他
+#   什麼都不會寫)。這份名單是他能不能出現在總覽表上的★唯一★依據。
+TCMC_DOCTOR_NAMES = frozenset({"張廖年峰"})
+
 
 def _main_html_has_east_branch_clinic(html_text):
     """主院 reg52 回應若提及東區分院門診，改向東區主機抓取人數／休診。"""
@@ -38,3 +44,7 @@ def _should_fetch_huihe_reg52(doctor_name):
 
 def _should_fetch_huisheng_reg52(doctor_name):
     return doctor_name in HUISHENG_DOCTOR_NAMES
+
+
+def _should_fetch_tcmc_reg52(doctor_name):
+    return doctor_name in TCMC_DOCTOR_NAMES

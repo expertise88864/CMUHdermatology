@@ -138,6 +138,7 @@ def branch_url(ext_branch) -> str:
         "east": EAST_DISTRICT_REG52_URL,
         "huihe": HUIHE_REG52_URL,
         "huisheng": HUISHENG_REG52_URL,
+        "tcmc": TCMC_REG52_URL,
         "auh": AUH_REG52_BASE_URL,
     }.get(str(ext_branch or ""), "")
 
@@ -205,6 +206,14 @@ HUIHE_REG52_URL = "https://appointment.cmuh.org.tw/cgi-bin/wh1/reg52.cgi"
 # 惠盛醫院掛號（與東區同主機 61.66.117.10，路徑為 hs1/reg52.cgi）
 # ★明文 HTTP★ 見上面 PLAINTEXT_REG52_SOURCES
 HUISHENG_REG52_URL = "http://61.66.117.10/cgi-bin/hs1/reg52.cgi"
+
+# 臺中市立老人復健綜合醫院（老人醫院）掛號
+# ★與主院、惠和同網域(appointment.cmuh.org.tw)，路徑為 tcmc/reg52.cgi★
+#   來源:老人醫院官網 tmgrgh.org.tw 的掛號頁就是嵌這支 CGI(iframe src)。
+#   同網域 → 與惠和同樣落在 `http_client.INTERNAL_HOSTS` → 實際是
+#   ★有加密但不驗憑證★;provenance 由 `transport_trust()` 現算,
+#   不必也不可以在這裡另抄一份清單(見上面 R3-P2-02 的說明)。
+TCMC_REG52_URL = "https://appointment.cmuh.org.tw/cgi-bin/tcmc/reg52.cgi"
 
 AUH_REG52_BASE_URL = "https://appointment.auh.org.tw/cgi-bin/as/reg52.cgi"
 
@@ -411,6 +420,90 @@ def _fetch_huihe_reg52_html(session, doc_no: str, doctor_name: str):
         logging.error("[本機] 惠和掛號表無法判定:%s —— ★這是本機環境的問題★,"
                       "不記遠端 backoff/熔斷", local_fault.describe())
     logging.warning(f"無法自惠和取得掛號表: {doctor_name} ({dparam})")
+    return None
+
+
+def _fetch_tcmc_reg52_html(session, doc_no: str, doctor_name: str):
+    """老人醫院 tcmc/reg52.cgi（與主院、惠和同網域）；Docname 先試 Big5 再試 UTF-8。
+
+    ★[2026-09-01 使用者] 為什麼會有這一支★
+    張廖年峰醫師的門診移到臺中市立老人復健綜合醫院,★本院已無該醫師門診★ ——
+    主院 reg52 對他回不出任何診次,總覽表上他會整個消失。老人醫院的掛號頁
+    (官網 iframe)嵌的就是同一套 reg52 CGI,只換 `tcmc/` 這個路徑,
+    所以沿用既有分院管線把它接進來。
+
+    ★誠實揭露:版型未經實機驗證★
+    寫這支時本機連不到院方主機(appointment.cmuh.org.tw → 61.66.117.10,
+    院外不可達),無法先抓一份真的 HTML 對版。判斷依據是「同主機、同一支
+    CGI 家族、只差分院路徑」——東區 fh1 / 惠和 wh1 / 惠盛 hs1 三者都是
+    `_parse_fh_like_weekly_schedule` 那個版型。★失敗方向是安全的★:版型
+    不合時 `classify_branch_html` 會判 SEMANTIC_INVALID、這支回 None,
+    總覽只是沒有這一列(不會顯示錯的人數);解析得到 0 筆時
+    `check_appointment_count` 會記一行 warning 供診斷。
+    """
+    # ★延遲載入★ 見模組 docstring：module 層 import 會讓相依壞掉時
+    #   連自動安裝器都跑不到（main.py 第 190 行 import 本模組，
+    #   而 _ensure_deps_runtime 在第 285 行）。
+    import requests
+    from urllib.parse import quote, quote_from_bytes
+
+    dparam = _reg52_docno_for_dayoff_table(doc_no)
+    variants = []
+    try:
+        variants.append(quote_from_bytes(doctor_name.encode("big5")))
+    except UnicodeEncodeError:
+        pass
+    variants.append(quote(doctor_name, safe=""))
+    seen_urls = set()
+    source_key = f"tcmc:{doc_no}"
+    ok, remain = _source_backoff_allow(source_key)
+    if not ok:
+        logging.info(f"[BACKOFF] skip tcmc fetch {doctor_name} {doc_no}, remaining={remain:.1f}s")
+        return None
+    # ★只有沒帶 session 時才取 thread-local★（與其他分院同一理由，見 huihe）
+    session = session or _get_thread_local_reg52_external_session()
+    last_error = None
+    last_semantic = None
+    local_fault = None
+    for docname_q in variants:
+        url = f"{TCMC_REG52_URL}?DocNo={dparam}&Docname={docname_q}"
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        try:
+            r = session.get(url, timeout=REG52_BRANCH_TIMEOUT,
+                            verify=verify_policy(url))
+            r.raise_for_status()
+            r.encoding = "big5"
+            # ★HTTP 200 ≠ 這是掛號表★（維護頁／登入頁／空殼頁都是 200）
+            outcome = _classify_branch_html(r.text)
+            if outcome.ok:
+                logging.info(f"已自老人醫院 tcmc 取得掛號表: {doctor_name} ({dparam})")
+                _source_backoff_success(source_key)
+                return outcome.usable_html
+            # ★只有該算在遠端頭上的才進 last_semantic★（LOCAL_ERROR 不記 backoff）
+            if outcome.blames_remote:
+                last_semantic = outcome
+            else:
+                local_fault = outcome
+            logging.info("老人醫院回應不是掛號表: %s %s → %s",
+                         doctor_name, dparam, outcome.describe())
+        except requests.exceptions.RequestException as e:
+            logging.debug(f"老人醫院 reg52 請求失敗 ({url[:64]}…): {e}")
+            last_error = e
+            continue
+    # ★語意失敗也是失敗★ 只認 RequestException 會讓維護頁永遠不進退避
+    if last_error or last_semantic:
+        delay, cnt = _source_backoff_fail(
+            source_key,
+            REG52_EXTERNAL_BACKOFF_BASE_SECONDS,
+            REG52_EXTERNAL_BACKOFF_MAX_SECONDS,
+        )
+        logging.warning(f"[BACKOFF] tcmc fetch fail {doctor_name} {doc_no}, fail={cnt}, delay={delay:.1f}s")
+    if local_fault is not None and last_semantic is None and last_error is None:
+        logging.error("[本機] 老人醫院掛號表無法判定:%s —— ★這是本機環境的問題★,"
+                      "不記遠端 backoff/熔斷", local_fault.describe())
+    logging.warning(f"無法自老人醫院取得掛號表: {doctor_name} ({dparam})")
     return None
 
 

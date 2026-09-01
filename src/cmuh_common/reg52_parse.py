@@ -215,7 +215,7 @@ def parse_main_hospital_schedule(soup):
     return appointments_by_date
 
 
-def parse_doctor_info_dayoff(soup, assume_east_branch=False, assume_huihe_branch=False, assume_huisheng_branch=False):
+def parse_doctor_info_dayoff(soup, assume_east_branch=False, assume_huihe_branch=False, assume_huisheng_branch=False, assume_tcmc_branch=False):
     """解析 reg52.cgi（宜使用 DocNo=D…）內之休診表：主院常用 table#dayoff；東區 fh1 常為 width=300 三欄小表。"""
     dayoff_table = soup.select_one("table#dayoff")
     if not dayoff_table:
@@ -255,6 +255,8 @@ def parse_doctor_info_dayoff(soup, assume_east_branch=False, assume_huihe_branch
             ext_branch = "huihe"
         elif assume_huisheng_branch:
             ext_branch = "huisheng"
+        elif assume_tcmc_branch:
+            ext_branch = "tcmc"
         else:
             ext_branch = "east" if ("東區" in row_joined or "東區分院" in row_joined) else None
 
@@ -351,6 +353,16 @@ def parse_huihe_schedule(soup):
 def parse_huisheng_schedule(soup):
     """惠盛 61.66.117.10 hs1/reg52 週表。"""
     return _parse_fh_like_weekly_schedule(soup, "huisheng")
+
+
+def parse_tcmc_schedule(soup):
+    """老人醫院 appointment.cmuh.org.tw tcmc/reg52 週表。
+
+    ★版型未經實機驗證★(見 `reg52_fetch._fetch_tcmc_reg52_html` 的說明):
+    同主機同一支 CGI 家族,東區/惠和/惠盛三個分院路徑都是這個版型。
+    版型不合時這裡回空 dict —— 不會產生錯的人數。
+    """
+    return _parse_fh_like_weekly_schedule(soup, "tcmc")
 
 
 def parse_branch_schedule(soup):
@@ -493,7 +505,8 @@ def parse_appt_item_for_alert(appt_item):
             if p.startswith("Ext:"):
                 val = p.split(":", 1)[1]
                 ext_branch = {"1": "east", "east": "east", "auh": "auh",
-                              "huihe": "huihe", "huisheng": "huisheng"}.get(val)
+                              "huihe": "huihe", "huisheng": "huisheng",
+                              "tcmc": "tcmc"}.get(val)
             elif p.startswith("Rm:"):
                 room = p.split(":", 1)[1]
             elif p.startswith("Stop:"):

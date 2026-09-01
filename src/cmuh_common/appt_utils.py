@@ -27,12 +27,12 @@ def appointment_data_count(data) -> int:
 
 
 def _appt_dict_ext_branch(item) -> Optional[str]:
-    """掛號 dict 的院區：None=主院, 'east'=東區, 'auh'=亞大, 'huihe'=惠和, 'huisheng'=惠盛
-    （僅 is_ext 之舊資料視為東區）。"""
+    """掛號 dict 的院區：None=主院, 'east'=東區, 'auh'=亞大, 'huihe'=惠和,
+    'huisheng'=惠盛, 'tcmc'=老人醫院（僅 is_ext 之舊資料視為東區）。"""
     if not isinstance(item, dict):
         return None
     eb = item.get("ext_branch")
-    if eb in ("east", "auh", "huihe", "huisheng"):
+    if eb in ("east", "auh", "huihe", "huisheng", "tcmc"):
         return eb
     if item.get("is_ext"):
         return "east"
@@ -40,10 +40,11 @@ def _appt_dict_ext_branch(item) -> Optional[str]:
 
 
 def _calendar_branch_sort_rank(ext_branch) -> int:
-    """總覽同一時段內分院列順序：東區→亞大→惠和→惠盛→其他分院。"""
+    """總覽同一時段內分院列順序：東區→亞大→惠和→惠盛→老人醫院→其他分院。"""
     if not ext_branch:
         return 0
-    return {"east": 0, "auh": 1, "huihe": 2, "huisheng": 3}.get(ext_branch, 4)
+    return {"east": 0, "auh": 1, "huihe": 2, "huisheng": 3,
+            "tcmc": 4}.get(ext_branch, 5)
 
 
 def _strip_ext_appointments(appointments_by_date: dict) -> None:

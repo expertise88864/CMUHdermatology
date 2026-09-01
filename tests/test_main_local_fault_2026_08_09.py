@@ -92,7 +92,7 @@ def harness(monkeypatch):
     #   逾時長短、DNS、代理都會變成測試結果的一部分。
     #   這裡把四個入口一律關掉：本批要測的是「失敗歸因」，不是分院抓取。
     for pred in ("_should_fetch_east_district_reg52", "_should_fetch_huihe_reg52",
-                 "_should_fetch_huisheng_reg52"):
+                 "_should_fetch_huisheng_reg52", "_should_fetch_tcmc_reg52"):
         monkeypatch.setattr(main, pred, lambda *a, **k: False)
     monkeypatch.setattr(main, "AUH_DOCTOR_DOCNO_MAP", {})
     monkeypatch.setattr(main, "put_ui_message",
@@ -453,7 +453,9 @@ def test_the_harness_leaves_no_way_out_to_the_network(harness, monkeypatch):
             gates.add(n.func.id)
     assert gates == {"_should_fetch_east_district_reg52",
                      "_should_fetch_huihe_reg52",
-                     "_should_fetch_huisheng_reg52"}, (
+                     "_should_fetch_huisheng_reg52",
+                     # [2026-09-01] 老人醫院(張廖年峰醫師的門診移過去了)
+                     "_should_fetch_tcmc_reg52"}, (
         f"對外抓取的入口變了，fixture 要同步關掉：{sorted(gates)}")
     # 亞大沒有述詞，是看醫師在不在名單裡 —— fixture 把名單清空
     assert main.AUH_DOCTOR_DOCNO_MAP == {}, "亞大那條路沒有被關掉"

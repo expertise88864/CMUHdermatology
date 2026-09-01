@@ -202,6 +202,7 @@ from cmuh_common.reg52_parse import (
     parse_east_fh1_schedule as _parse_east_fh1_schedule,
     parse_huihe_schedule as _parse_huihe_schedule,
     parse_huisheng_schedule as _parse_huisheng_schedule,
+    parse_tcmc_schedule as _parse_tcmc_schedule,
     parse_branch_schedule as _parse_branch_schedule,
     parse_auh_reg52_schedule as _parse_auh_reg52_schedule,
     parse_appt_item_for_alert as _parse_appt_item_for_alert,
@@ -238,6 +239,7 @@ from cmuh_common.reg52_fetch import (
     _fetch_east_district_reg52_html,
     _fetch_huihe_reg52_html,
     _fetch_huisheng_reg52_html,
+    _fetch_tcmc_reg52_html,
 )
 # [P2-06 第四刀(c) 2026-08-01] 主院 session getter 併進 reg52_fetch；
 # 「該不該去分院抓」的政策獨立成 reg52_branch_policy。只搬家、不改呼叫端。
@@ -245,6 +247,7 @@ from cmuh_common.reg52_branch_policy import (
     _should_fetch_east_district_reg52,
     _should_fetch_huihe_reg52,
     _should_fetch_huisheng_reg52,
+    _should_fetch_tcmc_reg52,
 )
 from cmuh_common.action_ledger import (
     LEDGER_FILENAME as _LEDGER_FILENAME,
@@ -7400,6 +7403,9 @@ _EXT_BRANCH_DISPLAY_SUFFIX = {
     "auh": "(亞大)",
     "huihe": "(惠和醫院)",
     "huisheng": "(惠盛醫院)",
+    # [2026-09-01 使用者] 臺中市立老人復健綜合醫院 —— 張廖年峰醫師的門診
+    #   已移到這裡,本院不再有他的門診;總覽表以「(老人醫院)」標示為外院。
+    "tcmc": "(老人醫院)",
 }
 
 
@@ -7476,6 +7482,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
             html_east = ""
             html_huihe = ""
             html_huisheng = ""
+            html_tcmc = ""
             html_auh = ""
             cache_main_key = ("main_html", doc_no)
             dayoff_url = (
@@ -7887,6 +7894,15 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                     f"huisheng:{doc_no}",
                 )
 
+            if _should_fetch_tcmc_reg52(doctor_name):
+                html_tcmc = _queue_external_html(
+                    "tcmc",
+                    ("tcmc_html", doc_no),
+                    REG52_BRANCH_TTL_SECONDS,
+                    lambda: _fetch_tcmc_reg52_html(None, doc_no, doctor_name),
+                    f"tcmc:{doc_no}",
+                )
+
             if doctor_name in AUH_DOCTOR_DOCNO_MAP:
                 html_auh = _queue_external_html(
                     "auh",
@@ -7928,6 +7944,8 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                         html_huihe = html
                     elif label == "huisheng":
                         html_huisheng = html
+                    elif label == "tcmc":
+                        html_tcmc = html
                     elif label == "auh":
                         html_auh = html
 
@@ -7971,6 +7989,29 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                 parsed_huisheng = _parse_huisheng_schedule(soup_huisheng)
                 if parsed_huisheng:
                     _merge_appointments_by_date(appointments_by_date, parsed_huisheng)
+
+            tcmc_ok = False
+            soup_tcmc = None
+            if html_tcmc:
+                soup_tcmc = BeautifulSoup(html_tcmc, "lxml")
+                if soup_tcmc.select_one("div.visitDate") or soup_tcmc.select_one("table#dayoff"):
+                    tcmc_ok = True
+                else:
+                    # ★這一列是【新來源】,版型沒有實機驗證過★(見
+                    #   `_fetch_tcmc_reg52_html`)。抓得到頁面卻不是掛號表版型時
+                    #   若一聲不吭,總覽只是少一列 —— 使用者看到的是「醫師不見了」,
+                    #   而查的人沒有任何線索。這一行就是那個線索。
+                    logging.warning("老人醫院頁面取得了,但不是預期的掛號表版型:"
+                                    "%s —— 總覽不會有這一列", doctor_name)
+            if tcmc_ok:
+                parsed_tcmc = _parse_tcmc_schedule(soup_tcmc)
+                if parsed_tcmc:
+                    _merge_appointments_by_date(appointments_by_date, parsed_tcmc)
+                    logging.info("老人醫院 tcmc 併入 %d 天門診 (%s)",
+                                 len(parsed_tcmc), doctor_name)
+                else:
+                    logging.warning("老人醫院掛號表解析後無可用門診資料: %s",
+                                    doctor_name)
             if html_auh:
                 soup_auh = BeautifulSoup(html_auh, "lxml")
                 parsed_auh = _parse_cache_get("auh", html_auh)
@@ -7986,7 +8027,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                     logging.warning(f"亞大附醫解析後無可用門診資料: {doctor_name}")
                 logging.info(f"AUH merged slots = {auh_merged_slots} ({doctor_name})")
 
-            if html_east or html_huihe or html_huisheng or html_auh:
+            if html_east or html_huihe or html_huisheng or html_tcmc or html_auh:
                 # [MG-01] 這是「先送一版讓 UI 有東西」的預備送出,但緊接著下面 _merge_dayoff_overrides
                 # 會【原地】改寫同一個 appointments_by_date;若原樣把活 dict 交給 UI,UI 緒存進
                 # all_doctors_data、主緒 _update_grid_data 無鎖迭代時 worker 正在原地合併 → 偶發
@@ -8010,6 +8051,11 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
                 huisheng_dayoff = _parse_doctor_info_dayoff(soup_huisheng, assume_huisheng_branch=True)
                 if huisheng_dayoff:
                     _merge_dayoff_overrides(appointments_by_date, huisheng_dayoff)
+
+            if tcmc_ok:
+                tcmc_dayoff = _parse_doctor_info_dayoff(soup_tcmc, assume_tcmc_branch=True)
+                if tcmc_dayoff:
+                    _merge_dayoff_overrides(appointments_by_date, tcmc_dayoff)
 
             data_count = sum(len(v) for v in appointments_by_date.values())
             if data_count == 0:
@@ -15005,6 +15051,8 @@ class AutomationApp:
                     ext_branch = "huihe"
                 elif val == "huisheng":
                     ext_branch = "huisheng"
+                elif val == "tcmc":
+                    ext_branch = "tcmc"
         return session_name, ext_branch
 
     def _doctor_has_other_ext_on_weekday(self, doc_no, doc_name, weekday_idx, session_name, exclude_date):
@@ -15121,6 +15169,8 @@ class AutomationApp:
                                             ext_branch = "huihe"
                                         elif val == "huisheng":
                                             ext_branch = "huisheng"
+                                        elif val == "tcmc":
+                                            ext_branch = "tcmc"
                                     if p.startswith("Rm:"):   room = p.split(":")[1]
                                     if p.startswith("Stop:"): is_stopped_signup = (p.split(":")[1] == "1")
                                 session_name = status_part.split(':')[0]
