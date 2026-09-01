@@ -126,7 +126,21 @@ def _build_and_solve(ctx: SolveContext, scope: str, level: int):
          for d in ctx.days for m in ctx.members}
     mc = _ModelCtx(model, x)
 
-    for d in ctx.days:  # 每日恰一人（核心，不屬任何可放寬規則）
+    _cut = ctx.past_cutoff
+    for d in ctx.days:
+        # ★[RS-32 2026-08-30 使用者] 今天(含)以前是【事實】不是排班對象★
+        #   釘成 past_duty 的內容:有人就是那個人、空的就是空的(不套
+        #   「每日恰一人」—— 過去沒排到就是沒排到,不能回頭補)。
+        #   與「每日恰一人」同層(核心,不屬任何可放寬層級):就算放寬到 L3,
+        #   求解器也不可以改寫歷史。人選已不在名單的過去日 → 全 0
+        #   (歷史由 solve_duty 的輸出合併原樣保留,見該處註解)。
+        if _cut is not None and d <= _cut:
+            _mid = ctx.past_duty.get(d)
+            for m in ctx.members:
+                model.Add(  # pyright: ignore[reportAttributeAccessIssue]
+                    x[(d, m.id)] == (1 if m.id == _mid else 0))
+            continue
+        # 每日恰一人（核心，不屬任何可放寬規則）
         model.AddExactlyOne(x[(d, m.id)] for m in ctx.members)
 
     objective = []
@@ -151,6 +165,14 @@ def _build_and_solve(ctx: SolveContext, scope: str, level: int):
                 if solver.Value(x[(d, m.id)]):
                     out[d] = m.id
                     break
+        # ★[RS-32] 過去的實況原樣併回輸出★:accept 是拿 assignments 整份重建
+        #   `{scope}_duty` 的 —— 不在 assignments 裡的日子會被【刪掉】。
+        #   人選已不在名單的過去日(離職/改代號)沒有變數可釘,在這裡補回,
+        #   歷史才不會因為按了一次自動排班而消失。
+        if _cut is not None:
+            for d, mid in ctx.past_duty.items():
+                if d in set(ctx.days) and d <= _cut and mid:
+                    out[d] = mid
         return name, out
     return name, None
 
@@ -170,6 +192,9 @@ def _reasons_for(ctx: SolveContext, scope: str, assignments: dict) -> dict:
     in_block = {d: b for b in ctx.blocks for d in b.days}
     out = {}
     for d, mid in assignments.items():
+        if ctx.past_cutoff is not None and d <= ctx.past_cutoff:
+            out[d] = "今天以前(保留)"
+            continue
         if d in directives:
             out[d] = directives[d][1]
         elif scope == "r" and fixed_days.get(d) == mid:

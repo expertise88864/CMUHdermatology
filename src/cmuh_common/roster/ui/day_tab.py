@@ -364,7 +364,11 @@ class DayScheduleTab(ttk.Frame):
         if self._finalized:
             return
         try:
-            res = self.service.run_day_solve(self.app.ym)
+            # [RS-32 2026-08-30 使用者] 自動排班只排【明天起】:今天(含)以前
+            #   以現況自動保留(求解器層,不寫 day_locks,UI 仍可手動編輯)。
+            #   ★真時鐘只在這裡進入★ —— service/測試一律注入固定日期。
+            res = self.service.run_day_solve(self.app.ym,
+                                             today=date.today())
         except Exception as e:  # noqa: BLE001
             logging.exception("[roster.ui] 日排班失敗")
             messagebox.showerror("排班失敗", f"排班時發生錯誤：\n{e}")
@@ -411,8 +415,10 @@ class DayScheduleTab(ttk.Frame):
         def apply():
             try:
                 # 落地時一併存下當下報告，供「報告」鈕顯示（與畫面/存檔一致）
+                # [RS-32] 套用當下的 today:跨日才按套用 → 指紋不符 → 重排。
                 self.service.accept_day_solution(
-                    self.app.ym, day_slots, report, expect=res)
+                    self.app.ym, day_slots, report, expect=res,
+                    today=date.today())
             except Exception as e:  # noqa: BLE001
                 messagebox.showerror("套用失敗", str(e), parent=win)
                 return

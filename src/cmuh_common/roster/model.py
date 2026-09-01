@@ -332,6 +332,15 @@ class SolveContext:
     # 錯的人(獎勵週六值班者,而真正切片的是被指定的另一位)。
     # 它同時是 solver 的輸入 → 自動進 `input_fingerprint`(走 dataclass 欄位)。
     biopsy_override: dict = field(default_factory=dict)
+    # ★[RS-32 2026-08-30 使用者] 自動排班只排【明天起】★
+    #   past_cutoff 給定時:d ≤ cutoff 的日子是【事實】不是排班對象 ——
+    #   `_build_and_solve` 把它們釘成 past_duty 的內容(空的就是空的,
+    #   不套「每日恰一人」),點數/連值/週末上限等軟規則因此看得到過去;
+    #   指定類(collect_directives)與請假/固定週幾等硬規則跳過過去
+    #   (事實可能違反規則,不能拿約束去改寫歷史)。
+    #   兩個欄位都是 dataclass 欄位 → 自動進指紋:跨日之後舊預覽會過期。
+    past_cutoff: "Optional[date]" = None
+    past_duty: dict = field(default_factory=dict)   # {date: member_id}(僅 ≤ cutoff)
     params: RosterParams = field(default_factory=RosterParams)
 
     # 建構後由 prepare() 填入
@@ -356,7 +365,25 @@ class SolveContext:
         return d in (self.leaves.get(mid) or set())
 
     def total_points(self) -> int:
-        return sum(day_point(d, self.holidays, self.params) for d in self.days)
+        """本次排班要分配的總點數。
+
+        ★[RS-32 外審 R1-2] cutoff 模式下要用【有效】總點數★:過去空著的日子
+        被釘成全 0(不回頭補),它們的點數誰都拿不到 —— 仍算進總數的話,
+        公平目標被灌高到人人都達不到,每人的 |points - target| 變成
+        (target - points),總和 = n×target - 可達總點 = ★常數★:最高優先的
+        點數公平項對未來的分配完全失去鑑別力,實際由較低優先的規則決定。
+        報告的「新帳本」也用它,而真正結算用實際點數 —— 畫面與磁碟會不一致。
+        有效總點 = 未來全部可排日 + 過去【確實排給現役成員】的日子。
+        past_cutoff=None → 公式逐位元不變。
+        """
+        if self.past_cutoff is None:
+            return sum(day_point(d, self.holidays, self.params)
+                       for d in self.days)
+        mids = set(self.member_ids())
+        return sum(day_point(d, self.holidays, self.params)
+                   for d in self.days
+                   if d > self.past_cutoff
+                   or self.past_duty.get(d) in mids)
 
     def color_of_block(self, b: DutyBlock) -> Optional[str]:
         """區塊週色；未設定回 None（呼叫端保守視為同色 + 警告）。"""

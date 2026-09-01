@@ -42,7 +42,8 @@ from cmuh_common.roster.solve_day import (
     TWO_PGY_PHOTO_ONLY, apply_locked_biopsy_adjustment,
     arbitration_order, batch_biopsy_slots, biopsy_quota_warnings,
     day_input_fingerprint, day_owner_batch,
-    BIOPSY, PHOTO, REST, TREATMENT, DaySolveInput, month_solve_day,
+    BIOPSY, PHOTO, REST, STUDENT_SESSIONS, TREATMENT, DaySolveInput,
+    month_solve_day,
     person_course_stats,
 )
 from cmuh_common.roster.report import (
@@ -538,7 +539,8 @@ class RosterService:
     def build_context(self, scope: str, ym: str, *,
                       month: "dict | None" = None,
                       for_solve: bool = False,
-                      src: "StrictSources | None" = None) -> SolveContext:
+                      src: "StrictSources | None" = None,
+                      today: "date | None" = None) -> SolveContext:
         """讀 config/ledger/holiday_duty/week_colors/month 檔 → 已 prepare 且已套
         跨月銜接（boundary_fix）的 SolveContext。
 
@@ -615,11 +617,27 @@ class RosterService:
             logging.exception("[roster.service] 上月值班尾端有壞資料（略過，"
                               "連續值班限制只看本月）")
 
+        # ★[RS-32 2026-08-30 使用者] 自動排班只排【明天起】★
+        #   today 給定時,d ≤ today 的實況(含未鎖定的)進 past_duty ——
+        #   求解器釘成事實、點數/連值/色塊都看得到過去;今天以前空著的
+        #   日子維持空(不回頭補)。★不寫 locked 旗標★:UI 仍可手動編輯。
+        #   兩個欄位都進指紋 → 跨日之後舊預覽會被 stale 閘門擋下。
+        past_duty: dict = {}
+        if today is not None:
+            for _iso4, _cell4 in (month.get(f"{scope}_duty") or {}).items():
+                try:
+                    _d4 = date.fromisoformat(_iso4)
+                except (ValueError, TypeError):
+                    continue
+                _p4 = str((_cell4 or {}).get("person") or "")
+                if _p4 and _d4 <= today:
+                    past_duty[_d4] = _p4
         ctx = SolveContext(
             scope=scope, year=y, month=m, members=members, holidays=holidays,
             leaves=leaves, must_duty=must, annual_holiday=annual, locks=locks,
             ledger=ledger, week_colors=week_colors, prev_last_weekend=prev,
             prev_tail=prev_tail, biopsy_override=biopsy_override,
+            past_cutoff=today, past_duty=past_duty,
             params=RosterParams.from_config(cfg))
         ctx.prepare()
         apply_boundary_from_prev(ctx)
@@ -713,7 +731,8 @@ class RosterService:
 
     # ── PGY/Clerk 日排班（Phase 3）──────────────────────────────────────
     def build_day_input(self, ym: str, *,
-                        src: "StrictSources | None" = None) -> DaySolveInput:
+                        src: "StrictSources | None" = None,
+                        today: "date | None" = None) -> DaySolveInput:
         """組裝 PGY/Clerk 日填充器輸入（開診格網 + 名單 + 切片開放 + 請假）。
 
         `src`＝權威輸入(見 `SRC_DAY`)。★會寫回去的路徑一律要帶★:門診模板
@@ -721,6 +740,16 @@ class RosterService:
         照樣算得完一份「合法」的班表,匯出的正式文件就少人少班。
         預覽(`run_day_solve`)刻意維持寬鬆 —— 它不寫任何檔,而套用時
         `_accept_day_locked` 會用權威輸入擋下來。
+
+        ★[RS-32 2026-08-30 使用者] `today` = 自動排班只排【明天起】★
+        給了 today 時,格網內 d ≤ today 的每個時段都以【目前 day_slots 內容】
+        併入 `locked`(含空時段)—— 求解器因此:①原樣保留、不重排;
+        ②把既有內容回放進公平計數(照光/跟診/切片/RS-31 週別跟診都看得到
+        過去);③切片配額把過去沒排到的開放時段從分母拿掉(過去的機會已經
+        不是機會)。★這是求解器層的保留,不寫 `day_locks`★ —— 使用者沒按
+        畫面上的鎖定,那些天在 UI 仍可手動編輯。
+        `today=None`(預設)= 行為不變;只有自動排班的 UI 路徑帶入真時鐘
+        (測試一律注入固定日期 —— 時鐘進了輸入就進了指紋,見 stale 閘門)。
         """
         st = src if src is not None else self.storage
         cfg = st.load_config()
@@ -820,6 +849,27 @@ class RosterService:
                 slots = (day_slots.get(iso) or {}).get(session)
                 if on and slots is not None:
                     locked.setdefault(iso, {})[session] = slots
+        # [RS-32] 今天(含)以前 → 以目前內容自動併入 locked(見 docstring)。
+        #   ★空時段也要鎖★(鎖成 {}):過去沒排到的就是沒排到,不能讓求解器
+        #   回頭補;配額分母也因此正確縮小(locked-empty 的既有語意)。
+        if today is not None:
+            _past_n = 0
+            for _pd in sorted(grid):
+                if _pd > today:
+                    continue
+                _piso = _pd.isoformat()
+                for _ps in STUDENT_SESSIONS:
+                    # setdefault:使用者已鎖的不再寫 —— 兩邊的值本來就都取自
+                    # day_slots(鎖定值=目前內容),誰先寫結果相同;這裡只是
+                    # 不重複計數,★不是★一個有行為差異的優先權(誠實註記,
+                    # 突變驗證證明覆寫與否不可區分)。
+                    locked.setdefault(_piso, {}).setdefault(
+                        _ps, dict((day_slots.get(_piso) or {}).get(_ps) or {}))
+                    _past_n += 1
+            if _past_n:
+                logging.info("[roster.service] %s:今天(%s)以前共 %d 個時段"
+                             "自動保留(只排明天起)", ym, today.isoformat(),
+                             _past_n)
 
         # ★[RS-29] 相鄰月份【已經定下來、這次求解改不動】的時段★
         #   (全審 2026-08-24 P1-01)。RS-26 已讓配額的分母看得到整梯,但
@@ -883,7 +933,8 @@ class RosterService:
             prior_sessions=prior_sessions, prior_pgy=prior_pgy,
             apply_pref={str(c) for c in (month.get("pgy_apply_pref") or [])})
 
-    def run_day_solve(self, ym: str) -> "DaySolveResult":
+    def run_day_solve(self, ym: str, *,
+                      today: "date | None" = None) -> "DaySolveResult":
         """build_day_input → month_solve_day。不落地。
 
         回傳除了結果本身,還帶著★這次求解吃到的輸入的識別★(見
@@ -897,7 +948,7 @@ class RosterService:
         讀給人看的寬鬆、要寫回去的嚴格)。
         """
         _m, rev = self.storage.load_month_with_revision(ym)
-        inp = self.build_day_input(ym)
+        inp = self.build_day_input(ym, today=today)
         day_slots, log, warnings = month_solve_day(inp)
         return DaySolveResult(day_slots, log, warnings,
                               day_input_fingerprint(inp), rev)
@@ -922,7 +973,8 @@ class RosterService:
 
     def accept_day_solution(self, ym: str, day_slots: dict,
                             report: "str | None" = None, *,
-                            expect: "DaySolveResult | None" = None) -> None:
+                            expect: "DaySolveResult | None" = None,
+                            today: "date | None" = None) -> None:
         """★這條路徑【不重試】★(外審排班第 1 輪 P1-01):`day_slots` 是先前
         求解算出來的整批結果,盤上若已被他機換過,重讀後把同一批舊結果再套一次
         只是把對方的修改蓋掉 —— 語意上該做的是拒絕、請使用者重排。"""
@@ -930,10 +982,11 @@ class RosterService:
         #   背景 pull 合併月檔【以外】的檔案(名單/模板/梯次/假日),指紋比的是
         #   合併前的資料、月檔 revision 又沒變 —— 兩道關卡都通過,舊解照樣落地。
         with self.storage.write_barrier():
-            self._accept_day_locked(ym, day_slots, report, expect)
+            self._accept_day_locked(ym, day_slots, report, expect, today)
 
     def _accept_day_locked(self, ym: str, day_slots: dict,
-                           report: "str | None", expect) -> None:
+                           report: "str | None", expect,
+                           today: "date | None" = None) -> None:
         """`accept_day_solution` 的本體。★呼叫端必須持有 `write_barrier`★"""
         # ★驗證用的輸入也要是權威的★(外審 2026-08-22 P1-01):門診模板/梯次/
         #   名單任一讀不到時,寬鬆載入會回空 —— 求解那次若讀到同一個空狀態,
@@ -953,8 +1006,11 @@ class RosterService:
             if expect.month_revision != rev:
                 raise ValueError(
                     "排班結果已過期（月檔已被其他電腦更新），請重新排班")
+            # [RS-32] 重建時帶同一個 today:預覽開到跨日才按套用的話,
+            #   「今天以前」的集合已經不一樣 → 指紋不符 → 請使用者重排
+            #   (舊預覽裡「今天」還是可排的,套下去會蓋掉今天的實況)。
             if expect.fingerprint != day_input_fingerprint(
-                    self.build_day_input(ym, src=src)):
+                    self.build_day_input(ym, src=src, today=today)):
                 raise ValueError(
                     "排班結果已過期（名單／請假／Clerk 梯次／停診／門診模板等"
                     "輸入已變動），請重新排班")
@@ -2338,7 +2394,8 @@ class RosterService:
 
     # ── 求解與落地 ──────────────────────────────────────────────────────
     def run_solve(self, scope: str, ym: str,
-                  allow_disable_color: bool = False) -> SolveResult:
+                  allow_disable_color: bool = False, *,
+                  today: "date | None" = None) -> SolveResult:
         """build_context → solve_duty。不落地（UI 先預覽，接受後才 accept）。"""
         # ★求解與套用時的重建必須是【同一種】context★:指紋比對只在兩邊
         #   看到同一份輸入時才有意義(見 `solver_ledger`)。
@@ -2357,7 +2414,7 @@ class RosterService:
             src = self._sources(ym, SRC_RVS)
             month, month_rev = src.month_snapshot(ym)
             ctx = self.build_context(scope, ym, month=month, for_solve=True,
-                                     src=src)
+                                     src=src, today=today)
             # ★結轉進來的帳本要與它所描述的那些月份一致★(外審 RS-20 P1-02)
             _stale, _unknown = self.stale_settlements(scope, ym, src=src)
             if _stale:
@@ -2588,7 +2645,8 @@ class RosterService:
                 logging.exception("[roster.service] 週六切片預覽段生成失敗（略過）")
         return base
 
-    def accept_solution(self, scope: str, ym: str, result: SolveResult) -> None:
+    def accept_solution(self, scope: str, ym: str, result: SolveResult, *,
+                        today: "date | None" = None) -> None:
         """使用者接受排班結果 → 落地（順序固定）：
         1. month[scope_duty] = {iso: {person, locked, source}}（鎖定格不覆蓋）
         2. month["last_weekend"][scope] = result.last_weekend
@@ -2606,10 +2664,11 @@ class RosterService:
         #   寫入之間被背景 pull 換掉的話,`_result_stale_reason` 驗的是舊資料
         #   而月檔 CAS 又看不到那些檔 —— 兩道關卡一起失效。
         with self.storage.write_barrier():
-            self._accept_solution_locked(scope, ym, result)
+            self._accept_solution_locked(scope, ym, result, today)
 
     def _accept_solution_locked(self, scope: str, ym: str,
-                                result: SolveResult) -> None:
+                                result: SolveResult,
+                                today: "date | None" = None) -> None:
         """`accept_solution` 的本體。★呼叫端必須持有 `write_barrier`★"""
         # ★這條路徑【不重試】★(外審排班第 1 輪 P1-01):result 是照【當時的】
         #   名單/請假/指定/鎖定算出來的整批結果,還會連動結算計數帳本 ——
@@ -2630,7 +2689,7 @@ class RosterService:
         # 任一改動，舊 result 可能把請假者排上或違反新 directive，settle 出的帳本/
         # 報告就與實況脫節。以重建的 ctx 驗證，不符即拒絕、要求重排（寫入前）。
         ctx = self.build_context(scope, ym, for_solve=True,   # 與求解同一種
-                                 src=src)
+                                 src=src, today=today)
         # ★判準是【整份輸入的指紋】,不是一張手工白名單★(外審排班第 2 輪
         #   P1-04):`_result_stale_reason` 逐項列舉的那六七件事會腐爛 ——
         #   `fixed_weekday`(固定星期)與 `week_colors`(色塊連週)都是 CP-SAT 的
@@ -2678,6 +2737,11 @@ class RosterService:
             old = existing.get(iso)
             if old and old.get("locked"):
                 new_duty[iso] = old            # 鎖定格保留原 person/locked/source
+            elif today is not None and d <= today and old:
+                # [RS-32] 今天(含)以前:人選必然相同(求解器釘成事實),
+                # 連 source/locked 等 metadata 也原樣保留 —— 手動排的過去
+                # 不該因為按了一次自動排班而被改標成 "auto"。
+                new_duty[iso] = old
             else:
                 new_duty[iso] = {"person": result.assignments[d],
                                  "locked": False, "source": "auto"}
@@ -4472,7 +4536,13 @@ class RosterService:
     def _result_stale_reason(self, ctx: SolveContext,
                              result: SolveResult) -> "str | None":
         """result 是否已與 ctx（當前輸入）脫節；脫節回原因字串，否則 None。"""
-        if set(result.assignments) != set(ctx.days):
+        _need = set(ctx.days)
+        if ctx.past_cutoff is not None:
+            # [RS-32] 今天(含)以前空著的日子本來就不在結果裡(過去不回頭補);
+            # 要全覆蓋的是【明天起】+ 過去有實況的那些日子。
+            _need = ({d for d in _need if d > ctx.past_cutoff}
+                     | (set(ctx.past_duty) & set(ctx.days)))
+        if set(result.assignments) != _need:
             return "涵蓋日期與當月不符"
         mids = set(ctx.member_ids())
         # RF-03：鎖定格人選已不在名單時，accept 會保留舊鎖定人（service 寫入時無條件保留
@@ -4489,6 +4559,8 @@ class RosterService:
         if set(result.points_by_person) != mids:
             return "成員名單已變動（新增/移除）"
         for d, mid in result.assignments.items():
+            if ctx.past_cutoff is not None and d <= ctx.past_cutoff:
+                continue          # [RS-32] 過去是事實:離職者/事後補請假都不算過期
             if mid not in mids:
                 return f"{d.month}/{d.day} 指派 {mid} 已不在名單"
             if ctx.on_leave(mid, d):
@@ -4506,6 +4578,12 @@ class RosterService:
             for run in split_block_runs(
                     b.days,
                     {d: directives[d][0] for d in b.days if d in directives}):
+                if ctx.past_cutoff is not None:
+                    # [RS-32] 只檢查未來那半:過去可能是空的/換過人(事實),
+                    # 全在過去的段整個跳過(與 WeekendBlockRule.apply 同一政策)。
+                    run = [x for x in run if x > ctx.past_cutoff]
+                    if len(run) <= 1:
+                        continue
                 persons = {result.assignments.get(x) for x in run}
                 if len(persons) > 1:
                     return (f"連休段 {run[0].month}/{run[0].day} 起"
@@ -4514,6 +4592,8 @@ class RosterService:
         # 出錯誤帳本（報告/targets 也過期）。以當前 ctx 重算，不一致即拒絕、要求重排。
         recomputed = {m.id: 0 for m in ctx.members}
         for d, mid in result.assignments.items():
+            if mid not in recomputed:
+                continue          # [RS-32] 過去日的離職者:兩邊都不算他的點數
             recomputed[mid] += day_point(d, ctx.holidays, ctx.params)
         if recomputed != dict(result.points_by_person):
             return "點數/假日設定已變動（點數與指派不一致）"

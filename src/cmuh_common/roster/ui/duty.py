@@ -858,8 +858,10 @@ class CalendarDutyTab(ttk.Frame):
 
         def work():
             try:
+                # [RS-32] 自動排班只排【明天起】:真時鐘只在 UI 進入。
                 res = self.service.run_solve(
-                    scope, ym, allow_disable_color=allow_disable_color)
+                    scope, ym, allow_disable_color=allow_disable_color,
+                    today=date.today())
                 self.after(0, lambda: self._on_solved(res, ym, scope))
             except Exception as e:  # noqa: BLE001
                 logging.exception("[roster.ui] 求解例外")
@@ -907,7 +909,9 @@ class CalendarDutyTab(ttk.Frame):
 
         def apply():
             try:
-                self.service.accept_solution(scope, ym, res)
+                # [RS-32] 套用當下的 today:跨日才按套用 → 指紋不符 → 重排。
+                self.service.accept_solution(scope, ym, res,
+                                             today=date.today())
             except ValueError as e:
                 messagebox.showwarning("結果已過期", str(e), parent=win)
                 win.destroy()

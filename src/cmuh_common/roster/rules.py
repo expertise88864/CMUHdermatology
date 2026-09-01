@@ -100,6 +100,11 @@ def collect_directives(ctx: SolveContext) -> tuple:
         out[d] = (mid, source)
 
     day_set = set(ctx.days)
+    # ★[RS-32] 過去不是指定的對象★:d ≤ past_cutoff 的日子由 past_duty 釘成
+    #   事實(見 solve_rvs),指定類一律跳過 —— 否則過去的鎖定/指定與請假的
+    #   衝突會變成 error 把整個未來擋掉,而過去根本改不了。
+    if ctx.past_cutoff is not None:
+        day_set = {d for d in day_set if d > ctx.past_cutoff}
     for d, mid in sorted(ctx.locks.items()):
         if d in day_set:
             put(d, mid, "鎖定")
@@ -132,6 +137,10 @@ class LeaveRule(Rule):
     def apply(self, mc, ctx):
         for m in ctx.members:
             for d in ctx.days:
+                # [RS-32] 過去是事實:實際值了班的人可能事後補了請假紀錄,
+                # x==0 會與 past 釘選(x==1)直接矛盾 → 整月無解。
+                if ctx.past_cutoff is not None and d <= ctx.past_cutoff:
+                    continue
                 if ctx.on_leave(m.id, d):
                     mc.model.Add(mc.x[(d, m.id)] == 0)
 
@@ -213,6 +222,11 @@ class WeekendBlockRule(Rule):
             runs = split_block_runs(
                 b.days, {d: directives[d][0] for d in b.days if d in directives})
             for run in runs:
+                # [RS-32] 全在過去的段不檢查(事實);跨過今天的段只看未來那幾天
+                if ctx.past_cutoff is not None:
+                    run = [d for d in run if d > ctx.past_cutoff]
+                    if not run:
+                        continue
                 ok = [m.id for m in ctx.members
                       if all(not ctx.on_leave(m.id, d) for d in run)]
                 if not ok:
@@ -230,12 +244,31 @@ class WeekendBlockRule(Rule):
 
     def apply(self, mc, ctx):
         directives, _ = collect_directives(ctx)
+        cut = ctx.past_cutoff
         for b in ctx.blocks:
             # [2026-07-27] 依使用者指定拆段：同段內仍綁同一人，跨段不再強制相等
             # （無指定/指定同一人時 runs 只有一段 → 與舊行為完全相同）。
             runs = split_block_runs(
                 b.days, {d: directives[d][0] for d in b.days if d in directives})
             for run in runs:
+                # ★[RS-32] 連休段跨過今天★:過去那半是事實(可能是空的、可能
+                # 換過人),拿等式綁住會把「過去=空」傳染成「未來=無人」而與
+                # 每日恰一人矛盾 → 整月無解。政策:
+                #   * 全在過去 → 不加任何約束(事實不受規則管);
+                #   * 跨過今天 → 過去的人選【一致、仍在名單、未來那幾天沒請假】
+                #     時把未來釘給同一人(=「指定週六自動帶週日」的接續);
+                #     否則未來獨立指派(precheck 會警告)。
+                if cut is not None and any(d <= cut for d in run):
+                    future = [d for d in run if d > cut]
+                    if not future:
+                        continue
+                    who = {ctx.past_duty.get(d) for d in run if d <= cut}
+                    a = next(iter(who)) if len(who) == 1 else None
+                    if (a and a in ctx.member_ids()
+                            and all(not ctx.on_leave(a, d) for d in future)):
+                        for d in future:
+                            mc.model.Add(mc.x[(d, a)] == 1)
+                    continue
                 first = run[0]
                 for d in run[1:]:
                     for m in ctx.members:
@@ -249,6 +282,8 @@ class FixedWeekdayRule(Rule):
     描述 = "R 固定值班週幾（預設 R1=三 R2=四 R3=二；可設定）"
 
     def _applicable(self, ctx, m, d, directives) -> bool:
+        if ctx.past_cutoff is not None and d <= ctx.past_cutoff:
+            return False                       # [RS-32] 過去不強制固定週幾
         return (m.fixed_weekday is not None
                 and d.weekday() == m.fixed_weekday
                 and d.weekday() < 5                # 固定週幾僅適用平日
@@ -357,6 +392,15 @@ class ColorRule(Rule):
         for prev_p, a, b, same, _unknown in self._pairs(ctx):
             if not same:
                 continue
+            # ★[RS-32] 兩端都在過去 → 不約束★:同色連值若已經發生,那是事實
+            # (手動排的),1+1≤1 會讓整月無解。一端在過去、一端在未來的配對
+            # ★刻意保留★:過去的釘選(x=1)會正確地把同一人擋出下一個同色週末
+            # —— 過去約束未來,正是「參考今天以前的資料」。
+            cut = ctx.past_cutoff
+            if cut is not None:
+                _anchors = [x2.color_anchor() for x2 in (a, b) if x2 is not None]
+                if _anchors and all(d <= cut for d in _anchors):
+                    continue
             if a is None:  # 跨月：上月人選不得值本月第一週末
                 if prev_p in ctx.member_ids():
                     mc.model.Add(mc.x[(b.color_anchor(), prev_p)] == 0)
@@ -673,13 +717,18 @@ class DutyCountBalanceRule(Rule):
 def core_feasibility_precheck(ctx: SolveContext) -> list:
     """逐日檢查：扣掉請假後至少一人可值。（區塊級檢查在 WeekendBlockRule）"""
     checks = []
-    for d in ctx.days:
+    future = [d for d in ctx.days
+              if ctx.past_cutoff is None or d > ctx.past_cutoff]
+    for d in future:
+        # [RS-32 外審 R1-1] 過去是事實不是排班對象:歷史上某天全員請假
+        # (或事後補登)不可以把【明天以後】的自動排班整個擋掉。
         ok = [m.id for m in ctx.members if not ctx.on_leave(m.id, d)]
         if not ok:
             checks.append(Precheck(
                 "error", "core",
                 f"{d.month}/{d.day} 所有人皆請假，無人可值"))
-    if not ctx.members:
+    if not ctx.members and future:
+        # 整月都在過去時(future 空)= 歷史 no-op,名單空也無妨。
         checks.append(Precheck("error", "core", "成員名單為空"))
     return checks
 
