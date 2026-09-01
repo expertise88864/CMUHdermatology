@@ -61,6 +61,7 @@ from typing import Optional
 
 from cmuh_common.atomic_io import safe_load_json_ex
 from cmuh_common.paths import get_settings_dir
+from cmuh_common import dpapi_seal as _dpapi
 
 LEDGER_FILENAME = "delivery_ledger.json"        # 舊格式(只讀,匯入用)
 DB_FILENAME = "delivery_ledger.sqlite3"
@@ -150,6 +151,24 @@ _BUSY_TIMEOUT_MS = 5000       # 交易互斥的等待上限;超過 → LedgerUna
 
 def _now() -> float:
     return time.time()
+
+
+def _seal_body_or_drop(text: str) -> str:
+    """落地前把內文封進 DPAPI;封不進就★不落地★(回空字串)+ error log。
+
+    空字串直通(空/非空是狀態訊號,不可變)。失敗方向的取捨寫在
+    `_new_rec` 的呼叫點與 dpapi_seal 模組。
+    """
+    if not text:
+        return ""
+    try:
+        return _dpapi.seal_text(text)
+    except Exception:
+        logging.error(
+            "[delivery] 內文 DPAPI 加密失敗 → 本筆不落地內文"
+            "(信照寄;若日後查無,自動補寄會退化為告警請人工轉寄)",
+            exc_info=True)
+        return ""
 
 
 def new_delivery_id() -> str:
@@ -1043,8 +1062,15 @@ class DeliveryLedger:
             #   P2-4):payload 的權威在親紀錄上,補寄從不讀子紀錄的 body ——
             #   佇列補寄傳進來的內文只是親紀錄的重複 PHI 副本,卻會依
             #   保留規則活到 3 天 scrub。在資料層強制,所有建立者一起管住。
+            # ★[外審第二輪 R2-P2-05] 內文=PHI,落地前 DPAPI 封存★
+            #   (machine 範圍;格式與失敗方向見 dpapi_seal 模組)。
+            #   封不進 → ★不落地★:信照寄(帳本壞掉不停臨床通知的既有
+            #   定案),只是查無後的自動補寄退化成「沒得補 → 告警請人工
+            #   轉寄」(reconcile 的既有路徑)。絕不靜默退回明文 ——
+            #   那會讓這層防護恰好在出事時消失,而且沒有人知道。
             "body_text": ("" if parent_id
-                          else str(body_text or "")[:_BODY_TEXT_MAX]),
+                          else _seal_body_or_drop(
+                              str(body_text or "")[:_BODY_TEXT_MAX])),
             # ""=初次寄送或佇列補寄;KIND_AUTO_RESEND=回查驅動的自動補寄
             #   (次數上限只數這一種 —— 佇列自己有退避與用盡告警)。
             "kind": str(kind or ""),
@@ -1105,6 +1131,8 @@ class DeliveryLedger:
         #   那封信就永久消失。只有【全數送達】(CONFIRMED)或
         #   【明確放棄】(clear_body=True,呼叫端已告警)才清;
         #   隱私天花板是 3 天的 scrub(獨立於狀態)。
+        # ★rec 來自 _get_row_locked(原始列)★:body 是 DPAPI 密文,
+        #   原樣往返 —— 不解、不重封(在這裡解密會把明文洗回磁碟)。
         keep_body = ("" if (clear_body or new_state == CONFIRMED)
                      else rec.get("body_text") or "")
         conn.execute(
@@ -1368,6 +1396,25 @@ class DeliveryLedger:
             return True
 
     # ── 查詢 ───────────────────────────────────────────────────────────────
+    @staticmethod
+    def _unseal_rec(rec: dict) -> dict:
+        """★公開讀取邊界★:把 body_text 還原成明文再交出去。
+
+        [外審第二輪 R2-P2-05] 帳上存的是 DPAPI 密文(`dpapi1:` 前綴;
+        加密上線前的舊列是明文,原樣通過)。解不開 → `body_text=""` 並
+        標 `body_unreadable=True`:★「讀不出來」不是「本來就是空的」★,
+        消費端(reconcile)必須把它當獨立狀態處理 —— 直接當空會把一封
+        欠著的臨床通知靜默結案。
+        ★內部寫回不走這裡★:`_mutate_states_in_txn` 用 `_get_row_locked`
+        的原始列讓密文原樣往返 —— 在這裡解密會讓寫回把明文洗回磁碟。
+        """
+        if rec:
+            body, ok = _dpapi.unseal_text(str(rec.get("body_text") or ""))
+            rec["body_text"] = body
+            if not ok:
+                rec["body_unreadable"] = True
+        return rec
+
     def get(self, delivery_id: str) -> dict:
         try:
             with self._lock:
@@ -1375,17 +1422,22 @@ class DeliveryLedger:
                 rec = self._get_row_locked(conn, delivery_id)
         except (LedgerUnavailable, sqlite3.Error):
             return {}
-        return rec or {}
+        return self._unseal_rec(rec) if rec else {}
 
     def _select(self, where: str, params: tuple) -> list:
-        """SELECT 一批 → [dict],舊的排前面。讀不到 → LedgerUnavailable。"""
+        """SELECT 一批 → [dict],舊的排前面。讀不到 → LedgerUnavailable。
+
+        只有公開的列舉方法用它(內部寫回走 `_get_row_locked` 的原始列),
+        所以出去前一律 `_unseal_rec`。
+        """
         try:
             with self._lock:
                 conn = self._ensure_conn_locked()
                 cur = conn.execute(
                     "SELECT %s FROM deliveries WHERE %s ORDER BY created_at"
                     % (",".join(_COLUMNS), where), params)
-                return [self._to_rec(r) for r in cur.fetchall()]
+                return [self._unseal_rec(self._to_rec(r))
+                        for r in cur.fetchall()]
         except sqlite3.Error as e:
             raise LedgerUnavailable("這一刻讀不到寄送帳本") from e
 

@@ -651,8 +651,16 @@ class Reconciler:
                 logging.warning("[%s] 回寫 %s 的收件人結論失敗",
                                 self._tag, did, exc_info=True)
         rec = led.get(did) or {}
+        # ★[外審第二輪 R2-P2-05] 落地內文解不開★(settings/ 被離機複製、
+        #   DPAPI 金鑰換了、密文毀損)。「讀不出來」≠「鏈已關」:直接當
+        #   空字串會把一封欠著的臨床通知★靜默★結案。但也★不可以在這裡
+        #   就放棄★(deep R1 P1):較新同 key 紀錄可能已把信送到、或有
+        #   子紀錄正在 in-flight —— 先放棄+告警會誘導人工重寄=重複的
+        #   臨床通知。旗標帶著走,穿過下面既有的接手/互斥守衛,最後併入
+        #   額度用盡共用的「明確放棄」漏斗(判準與出口只留一份)。
+        unreadable = bool(rec.get("body_unreadable"))
         body = str(rec.get("body_text") or "")
-        if not body or str(rec.get("state") or "") == CONFIRMED:
+        if (not body and not unreadable)                 or str(rec.get("state") or "") == CONFIRMED:
             return ""                   # 鏈已關(全數送達或 payload 已清)
         targets = recipients_needing_retry(rec.get("recipients") or {})
         if not targets:
@@ -757,6 +765,10 @@ class Reconciler:
         elif len(autos) >= RESEND_MAX_CLAIMS:
             why = ("自動補寄 claim 已達 %d 次硬背擋 —— 反覆在 claim 與"
                    " send 之間中斷,這台機器需要人工檢查" % RESEND_MAX_CLAIMS)
+        elif unreadable:
+            # 走到這裡=沒有較新紀錄可接手、也沒有子紀錄在飛 —— 這條鏈
+            # 只剩解不開的密文,沒有內容可補。唯一誠實的出口。
+            why = "落地內文無法解密(DPAPI),自動補寄沒有內容可用"
         if why:
             subject = str(rec.get("subject") or "")
             try:
