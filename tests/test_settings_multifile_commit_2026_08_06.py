@@ -255,8 +255,10 @@ def test_an_interrupted_commit_is_recovered_on_startup(tmp_path):
         # ★manifest 也要記「交易前存不存在」★(生產的形狀)
         json.dump({"targets": [a, b], "existed": [a, b]}, f)
 
-    n = atomic_io.recover_interrupted_multiwrite(str(tmp_path))
-    assert n == 2, f"還原了 {n} 個檔"
+    # ★[外審 R2-P2-01] 回傳改成 RecoveryResult★:「還原了幾個」回答不了
+    #   「有沒有完整完成」——那正是這次改動的重點。斷言跟著契約走。
+    r = atomic_io.recover_interrupted_multiwrite(str(tmp_path))
+    assert r.complete and r.restored == 2, r
     assert safe_load_json(a, None) == {"v": "old-a"}, "半套沒有被還原"
     assert not os.path.exists(
         os.path.join(str(tmp_path), atomic_io._MANIFEST_NAME))
@@ -267,7 +269,8 @@ def test_a_completed_commit_leaves_nothing_to_recover(tmp_path):
     """★反方向★ 正常完成的交易不可以在下次開機被「還原」掉。"""
     a, b, _c = _paths(tmp_path)
     atomic_write_json_multi([(a, {"v": 1}), (b, {"v": 2})])
-    assert atomic_io.recover_interrupted_multiwrite(str(tmp_path)) == 0
+    _r0 = atomic_io.recover_interrupted_multiwrite(str(tmp_path))
+    assert _r0.complete and _r0.restored == 0, _r0
     assert safe_load_json(a, None) == {"v": 1}
 
 
@@ -316,7 +319,8 @@ def test_a_hard_kill_mid_commit_is_recovered_through_the_real_path(tmp_path):
         "★沒有寫交易 manifest★ 行程被砍就沒有任何線索可以還原")
     assert safe_load_json(a, None) == {"v": "new-a"}, "前提:第一個檔已經換掉了"
 
-    assert atomic_io.recover_interrupted_multiwrite(str(tmp_path)) >= 1
+    assert atomic_io.recover_interrupted_multiwrite(
+        str(tmp_path)).restored >= 1
     assert safe_load_json(a, None) == {"v": "old-a"}, "半套沒有被還原"
 
 
@@ -375,7 +379,8 @@ def test_a_failed_restore_keeps_the_manifest_and_backups(tmp_path,
         os.path.join(str(tmp_path), atomic_io._MANIFEST_NAME)), (
         "★還原失敗卻把交易紀錄刪掉了★ 下次開機不會再試")
     # 下一次(檔案鎖解除後)要能真的救回來
-    assert atomic_io.recover_interrupted_multiwrite(str(tmp_path)) == 1
+    _r1 = atomic_io.recover_interrupted_multiwrite(str(tmp_path))
+    assert _r1.complete and _r1.restored == 1, _r1
     assert safe_load_json(a, None) == {"v": "old-a"}
 
 

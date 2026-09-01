@@ -6,6 +6,7 @@ import logging
 import os
 import time
 from datetime import date
+from typing import TYPE_CHECKING
 
 from cmuh_common.atomic_io import atomic_write_json
 from cmuh_common.config_io import (
@@ -116,7 +117,123 @@ DEFAULT_NOTIFY_DND_END_HOUR = 8
 
 
 def _path(path: str | None, filename: str) -> str:
-    return path if path is not None else get_conf_path(filename)
+    if path is not None:
+        return path
+    return _consistent_snapshot_path(get_conf_path(filename))
+
+
+def _consistent_snapshot_path(target: str) -> str:
+    """未撤銷的多檔交易還在時,改讀★交易前的一致快照★(`.rollback.bak`)。
+
+    ★[外審 deep R2] 只擋寫入是不夠的★:磁碟上那三個檔可能是半舊半新
+    (A 已還原、B 還是新的),而它們讀得到、也讀得懂 —— 載入端沒有任何訊號,
+    整個執行期就用著一份不一致的組合做臨床判斷(門檻/醫師清單/R 醫師)。
+    ★而「最後一致的快照」其實還在★:未撤銷的交易會把 `.rollback.bak` 留著
+    (復原是複製、備份留到整筆成功才清),那正是交易前的內容。
+    所以這裡不是「猜一個安全值」,是讀那份確實存在、確實一致的舊資料。
+    復原一旦完成,備份被清掉、這個轉向自動消失(出口)。
+
+    ★我第一版改的是別的東西,而且沒有作用★:原本把 stuck 的檔丟進
+    `_LOAD_FAILED_FILES`,但那個集合的語意是「這次讀不到」——
+    下一次成功讀取就會 `discard` 掉它(見 `_note_load_status`),
+    標記自我消滅。那是把宣稱寫在一個會被沖掉的地方。
+    """
+    try:
+        if settings_recovery_incomplete() is None:
+            return target
+        bak = str(target) + ".rollback.bak"
+        if os.path.exists(bak):
+            logging.warning(
+                "[設定] 上次的設定交易尚未撤銷乾淨 → %s 改讀交易前的備份"
+                "(避免用到半舊半新的組合);還原完成後自動恢復",
+                os.path.basename(target))
+            return bak
+        # ★沒有備份分兩種,不可以一律退回 live 檔★(外審 deep R3):
+        #   契約上「交易前不存在」的目標本來就沒有備份(全新安裝第一次存檔),
+        #   那時★交易前的一致狀態就是「這個檔不存在」★ —— 退回 live 檔等於
+        #   載入一份【沒有 commit 成功】的新值,而同批其他檔用預設值,
+        #   還是一組混合快照。回一個不存在的路徑,讓載入端照既有規則用預設值。
+        _tx = _pending_tx_info()
+        if _tx and str(target) in _tx["targets"]:
+            if str(target) not in _tx["existed"]:
+                logging.warning(
+                    "[設定] %s 是上次未完成交易【新建】的檔 → 視為不存在"
+                    "(交易前的一致狀態就是沒有這個檔);還原完成後自動恢復",
+                    os.path.basename(target))
+                return str(target) + ".pre-transaction-absent"
+            # 交易前存在、備份卻不見了 → ★無法證明 live 檔是哪一版★。
+            #   仍然讀它(把設定整個換成預設會直接毀掉使用者的門檻/收件人),
+            #   但要明講:這一份無法證明,而寫入端的閘門仍然關著。
+            logging.error(
+                "[設定] %s 的交易前備份不見了 → 無法證明目前這一份是交易前還是"
+                "未提交的新值;暫時照讀,但存檔仍被擋住(請重啟讓復原再試一次)",
+                os.path.basename(target))
+    except Exception:
+        logging.debug("[設定] 一致快照判定失敗(改用原路徑)", exc_info=True)
+    return target
+
+
+def unprovable_settings() -> tuple:
+    """★無法證明版本★的設定檔名(basename)。空 tuple = 沒有這種檔。
+
+    ★[R2-P2-01 使用者定案 2026-08-31:B 案]★
+    「交易前存在、備份卻遺失」的檔,live 內容無法證明是交易前的舊值還是
+    未提交的新值(防毒隔離/人工清掉備份才會發生,極罕見)。
+    使用者定案:這個狀態下★停用止掛提醒★(其餘功能照常)——
+    錯的通知會被當成對的,比暫時沒有通知更危險;金絲雀的 notify-only 是
+    針對「擋 HIS 自動寫入」的可用性代價,這裡的代價小得多。
+    消費端在 main.py 的 `_stop_alerts_suspended_reason()`(單一可見宣告)。
+    ★出口★:復原完成(manifest 清掉)或備份回來 → 自動回空 → 提醒自動恢復。
+    """
+    try:
+        _recover_interrupted_settings_write()
+        tx = _pending_tx_info()
+        if not tx:
+            return ()
+        out = []
+        for t in tx["targets"]:
+            if (t in tx["existed"]
+                    and not os.path.exists(str(t) + ".rollback.bak")
+                    and os.path.exists(t)):
+                out.append(os.path.basename(str(t)))
+        return tuple(sorted(out))
+    except Exception:
+        logging.debug("[設定] 無法證明清單查詢失敗", exc_info=True)
+        # ★查不出來不可以說成「沒有」★ —— 但也不可能列出名字;
+        #   回一個明確的哨兵讓消費端當作「有」處理。
+        return ("<查詢失敗>",)
+
+
+def _pending_tx_info() -> "dict | None":
+    """未撤銷交易的 manifest 內容({"targets": [...], "existed": {...}})。
+
+    ★`existed` 是判斷「交易前這個檔在不在」的唯一事實★:不可以從有沒有
+    `.rollback.bak` 去推 —— 備份失敗時也沒有 bak,而那兩種情況的正解相反。
+    """
+    # ★[外審 R5-2] 讀不出來要【拋】,不可回 None★:None 的語意是「確定沒有
+    #   pending 交易」;把「manifest 壞掉/暫時讀不到」也壓成 None 的話,
+    #   `unprovable_settings()` 會回空、B 案閘門照樣放行 —— 而復原端明明把
+    #   同一種狀態判成未完成。呼叫端各自接:`unprovable_settings` 的 except
+    #   轉成 fail-closed 哨兵;`_consistent_snapshot_path` 退回原路徑。
+    from cmuh_common.atomic_io import _MANIFEST_NAME  # noqa: PLC0415
+    from cmuh_common.paths import get_settings_dir  # noqa: PLC0415
+    mf = os.path.join(get_settings_dir(), _MANIFEST_NAME)
+    if not os.path.exists(mf):
+        return None
+    import json  # noqa: PLC0415
+    with open(mf, encoding="utf-8") as f:
+        m = json.load(f) or {}
+    if m.get("committed") or m.get("rolled_back"):
+        # ★[外審 R5-3] commit 成功的殘留 manifest 不是 pending 交易★:
+        #   成功路徑先刪備份再刪 manifest,刪 manifest 被擋(但讀得到)時,
+        #   備份不在是【合法】的 —— 不分辨 committed 的話,B 案會把每一個
+        #   目標都判成無法證明,止掛提醒被無限期停掉。與復原端的
+        #   `_has_anything_to_undo`(committed 具權威)同一個分類。
+        return None
+    if "existed" not in m:
+        return None            # 舊格式:不知道交易前存不存在 → 不做推斷
+    return {"targets": [str(t) for t in (m.get("targets") or ())],
+            "existed": {str(t) for t in (m.get("existed") or ())}}
 
 
 def _legacy_hour_to_hhmm(value: object, fallback_hour: int) -> str:
@@ -161,23 +278,86 @@ def stamp_r_doctor_revision(mapping: dict) -> dict:
 
 
 
+if TYPE_CHECKING:                       # 只給型別檢查,執行期不匯入
+    from cmuh_common.atomic_io import RecoveryResult
+
+
 def _recover_interrupted_settings_write() -> None:
-    """把上次中途被中止的多檔設定交易還原(只做一次,失敗不影響載入)。"""
-    global _settings_recovery_done
-    if _settings_recovery_done:
+    """把上次中途被中止的多檔設定交易還原。
+
+    ★[外審第二輪 R2-P2-01] 兩個問題★
+    1. `_settings_recovery_done = True` 設在★嘗試之前★ —— 這個行程從此不再重試,
+       就算什麼都沒還原成功。
+    2. 呼叫端拿到的只是「還原了幾個」,分不出「全部還原」與「兩個還原、一個
+       被防毒鎖住」。後者代表設定★半舊半新★,而程式會就這樣繼續載入下去 ——
+       正是 `atomic_write_json_multi` 花那麼多程式碼要避免的狀態。
+    現在:只有★完整完成★才記為已處理(沒完成的話下次載入會再試一次,
+    那就是出口);未完成時把狀態記下來,讓依賴這組設定的寫入路徑可以拒絕。
+    """
+    global _settings_recovery_done, _settings_recovery_state
+    # ★[外審 deep R1-2] 不可以永久快取「沒有交易」★
+    #   乾淨啟動時記成已處理之後,★同一個行程裡★後來的多檔寫入若 commit 失敗
+    #   而 rollback 不完整,會留下新的 manifest 與備份 —— 舊快取讓載入與閘門
+    #   直接沿用「沒事」的結論,只能靠重開程式處理,與「每次載入都重試」的
+    #   契約不符。改成:每次都先看一眼 manifest 在不在(一次 stat,成本可忽略),
+    #   有新的交易紀錄就重跑一次復原。
+    try:
+        from cmuh_common.atomic_io import (  # noqa: PLC0415
+            _MANIFEST_NAME as _MF,
+        )
+        from cmuh_common.paths import get_settings_dir as _gsd  # noqa: PLC0415
+        _pending_now = os.path.exists(os.path.join(_gsd(), _MF))
+    except Exception:
+        _pending_now = True          # 看不出來 → 當作要再試(不可假設沒事)
+    if _settings_recovery_done and not _pending_now:
         return
-    _settings_recovery_done = True
     try:
         from cmuh_common.atomic_io import (  # noqa: PLC0415
             recover_interrupted_multiwrite,
         )
         from cmuh_common.paths import get_settings_dir  # noqa: PLC0415
-        recover_interrupted_multiwrite(get_settings_dir())
+        res = recover_interrupted_multiwrite(get_settings_dir())
+        _settings_recovery_state = res
+        _settings_recovery_done = bool(res)
+        if not res:
+            logging.error(
+                "[設定] ★上次的設定存檔沒有完整撤銷★:%s。"
+                "設定可能是半舊半新;在還原成功之前不會接受新的設定存檔"
+                "(下次啟動會自動再試一次)。", res.describe())
+            # ★不在這裡標 `_LOAD_FAILED_FILES`★(外審 deep R2 抓到):
+            #   那個集合的語意是「這次讀不到」,下一次成功讀取就會 discard 掉
+            #   —— 標記自我消滅,等於沒做。真正的處置在 `_consistent_snapshot_path`
+            #   (載入改讀交易前的備份)與存檔閘門(`settings_recovery_incomplete`)。
     except Exception:
-        logging.debug("[設定] 還原未完成的設定交易失敗(略過)", exc_info=True)
+        # ★連跑都跑不起來也不可以當作沒事★(測試抓到:原本只記 log,於是
+        #   `_settings_recovery_state` 停在先前那次「乾淨」的結果,閘門照樣放行
+        #   —— 又是「不知道」被當成「沒問題」)。明確記成★未完成★,
+        #   並解除已處理旗標;★出口★:下一次呼叫會再試,成功就自動清掉。
+        logging.warning("[設定] 還原未完成的設定交易失敗 → 下次再試",
+                        exc_info=True)
+        try:
+            from cmuh_common.atomic_io import RecoveryResult  # noqa: PLC0415
+            _settings_recovery_state = RecoveryResult(False, pending=True)
+        except Exception:
+            logging.debug("[設定] 無法標記復原狀態", exc_info=True)
+        _settings_recovery_done = False
 
 
 _settings_recovery_done = False
+_settings_recovery_state: "RecoveryResult | None" = None
+
+
+def settings_recovery_incomplete() -> "RecoveryResult | None":
+    """上次的設定交易有沒有★還沒撤銷乾淨★;沒問題回 None。
+
+    ★給寫入路徑當閘門用★:在半舊半新的狀態上再寫一次新設定,會把下次重試
+    需要的備份與交易紀錄永久覆蓋掉 —— 那是把「還救得回來」變成「救不回來」。
+    ★出口★:這不是永久狀態 —— 每次載入設定都會再試一次還原,
+    檔案不再被鎖住就自動恢復;訊息也說得出可以怎麼自救。
+    """
+    _recover_interrupted_settings_write()
+    st = _settings_recovery_state
+    return None if st is None or bool(st) else st
 
 
 def load_threshold_settings(

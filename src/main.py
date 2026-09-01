@@ -31,6 +31,8 @@ from cmuh_common.atomic_io import (  # noqa: E402
 from cmuh_common.atomic_io import safe_load_json_ex as _safe_load_json_ex
 from cmuh_common.config_io import load_json_dict, load_json_list
 from cmuh_common.app_settings import (
+    settings_recovery_incomplete as _settings_recovery_incomplete,
+    unprovable_settings as _settings_unprovable,
     load_doctors_settings as _load_doctors_settings,
     clear_load_failed as _clear_settings_load_failed,
     settings_load_failed as _settings_load_failed,
@@ -1546,6 +1548,39 @@ _HIS_VERSION_FULL_RE = re.compile(r"[Vv]\.?\s*(\d{6,8}(?:\.\d{1,3})*)")
 # _sample_his_write_contract 對 ACTION_BLOCK 加擋下路徑 —— 不要在別處偷接 gate。★
 _CANARY_HIS_SURFACE = "his_menu"
 _HIS_CANARY_POLICY = _CANARY_POLICY_NOTIFY_ONLY
+
+# ── 設定不可證明時的止掛政策(單一可見宣告,與金絲雀同一個模式)────────────
+# ★[R2-P2-01 使用者定案 2026-08-31:B 案]★ 設定交易被中止【且】某個交易前
+# 存在的檔備份也遺失時,那份 live 設定無法證明是舊值還是未提交的新值 ——
+# 用它算出來的止掛提醒可能是錯的,而★錯的通知會被當成對的★,比暫時沒有
+# 通知更危險。定案:該狀態下【停用止掛提醒】(查詢/畫面等其餘功能照常),
+# 復原完成(或備份回來)自動恢復,毋須人工開關。
+# ★未來若要改回照發:把這個常數改成 False,不要在別處偷接判斷。★
+_SUSPEND_STOP_ALERTS_ON_UNPROVABLE_SETTINGS = True
+_unprovable_alert_logged = False        # 只記一次 log(避免每輪掃描洗版)
+
+
+def _stop_alerts_suspended_reason() -> "str | None":
+    """止掛提醒現在該不該停;該停回人話原因,否則 None。★兩條止掛路徑都問它★。"""
+    global _unprovable_alert_logged
+    if not _SUSPEND_STOP_ALERTS_ON_UNPROVABLE_SETTINGS:
+        return None
+    try:
+        bad = _settings_unprovable()
+    except Exception:
+        logging.debug("[設定] 止掛暫停判定失敗(當作不暫停)", exc_info=True)
+        return None
+    if not bad:
+        _unprovable_alert_logged = False   # 狀態解除 → 下次再發生要重新記
+        return None
+    reason = ("止掛提醒暫停:設定檔 " + "、".join(bad)
+              + " 的上次存檔交易未完成且備份遺失,目前內容無法證明是哪一版 ——"
+              "用它發提醒可能發錯。請重新啟動主程式讓還原再試一次;"
+              "還原完成後提醒自動恢復(其餘功能不受影響)。")
+    if not _unprovable_alert_logged:
+        logging.error("[ALERT] %s", reason)
+        _unprovable_alert_logged = True
+    return reason
 # [codex] 不再保留「最近裁決/現況指紋」的可變全域——安全關鍵路徑(寫入 gate、重新校正)
 # 與設定頁顯示都【自足即時採樣】(用當下 hwnd 的 title 現算),徹底免除跨緒覆寫/清空競態。
 _his_canary_warned = False      # 疑似改版警告只記一次 log(避免洗版),非競態敏感
@@ -10676,6 +10711,26 @@ class AutomationApp:
         #   失敗時要【講清楚】哪些生效了,不可以只丟一個例外讓使用者以為全存了。
         #   記憶體與磁碟的同步(self.doctors_list / DOCTORS)與所有副作用都排在
         #   commit 成功【之後】,避免「畫面已套用、磁碟沒存到」。
+        # ★[外審第二輪 R2-P2-01] 上次的交易還沒撤銷乾淨就不可以再寫★
+        #   在半舊半新的狀態上寫新設定,會把下次重試需要的備份與交易紀錄
+        #   永久覆蓋掉 —— 把「還救得回來」變成「救不回來」。
+        #   ★出口★:每次載入設定都會再試一次還原,檔案不再被鎖住就自動恢復;
+        #   訊息說得出使用者可以怎麼做(而不是只丟一個紅字)。
+        _rec = _settings_recovery_incomplete()
+        if _rec is not None:
+            logging.error("[設定] 拒絕存檔:上次的設定交易尚未撤銷乾淨(%s)",
+                          _rec.describe())
+            messagebox.showerror(
+                "設定未儲存",
+                "上次的設定存檔被中止,而且【還沒有還原乾淨】:\n\n"
+                f"{_rec.describe()}\n\n"
+                "現在存檔會蓋掉還原所需要的備份,所以這次【沒有存】"
+                "(畫面上的修改還在,原本的設定也還在)。\n"
+                "常見原因:設定檔被防毒/備份軟體鎖住。\n"
+                "請關閉可能佔用檔案的程式,然後【重新啟動本程式】"
+                "(啟動時會自動再還原一次);若仍持續,請看 log 的 [atomic_io] 訊息。",
+                parent=self.root)
+            return
         try:
             _atomic_write_json_multi(_pending_writes)
         except MultiWriteError as e:
@@ -14655,6 +14710,25 @@ class AutomationApp:
 
     def _restore_settings_defaults(self, keys):
         """執行還原 → 重載記憶體 → 更新畫面。失敗只回報,不讓例外炸掉 UI。"""
+        # ★[外審 deep R1-3] 還原預設也會寫到同一批交易目標★
+        #   它是單檔寫入,原本完全繞過存檔閘門:未撤銷的交易還在時去覆蓋那些檔,
+        #   之後的復原會把剛寫進去的預設值再撤銷掉,而 UI 已經回報「已還原」——
+        #   一個假的成功。所以在★寫任何檔案之前★問同一道閘門。
+        _rec = _settings_recovery_incomplete()
+        if _rec is not None:
+            logging.error("[設定] 拒絕還原預設:上次的設定交易尚未撤銷乾淨(%s)",
+                          _rec.describe())
+            messagebox.showerror(
+                "沒有還原",
+                "上次的設定存檔被中止,而且【還沒有還原乾淨】:\n\n"
+                f"{_rec.describe()}\n\n"
+                "現在寫入設定檔會蓋掉還原所需要的備份,而且稍後的自動還原會把"
+                "剛寫進去的預設值再撤銷掉(等於一個假的成功),所以這次"
+                "【什麼都沒有做】。\n"
+                "請關閉可能佔用檔案的程式,然後【重新啟動本程式】"
+                "(啟動時會自動再還原一次)。",
+                parent=self.root)
+            return
         report = _restore_settings_defaults(keys, conf_path=get_conf_path)
         for key, _fn in report.restored:
             # 成功寫入之後才解除「本次執行讀不到 → 拒絕存檔」的保護:使用者是明確
@@ -15108,7 +15182,11 @@ class AutomationApp:
                                                     tag = 'alert'
 
                                                 if tag == 'full' and not is_future and not is_stopped_signup:
-                                                    if full_threshold is not None:
+                                                    # [R2-P2-01 B案] 設定無法證明版本 → 暫停止掛提醒
+                                                    #   (在 claim 之前擋:不佔提醒次數,復原完成自動恢復)。
+                                                    if _stop_alerts_suspended_reason():
+                                                        pass
+                                                    elif full_threshold is not None:
                                                         notify_key = f"{current_date}_{session_name}_{doc_name}_{ext_branch or 'main'}"
                                                         should_notify = False
                                                         notify_level = 0
@@ -15924,6 +16002,12 @@ class AutomationApp:
         原本 try 只包住 Thread 啟動,組主旨/讀 snapshot 等前置若拋例外會被外層掃描的
         catch 吞掉,claim 永久卡在 in-flight → 該診次本次執行再也不寄、也沒有任何提示。
         故整段包起來:寄送權「移交給 worker」成功前,任何例外都在這裡釋放。"""
+        # [R2-P2-01 B案] 設定無法證明版本 → 暫停止掛提醒。
+        #   ★要釋放寄送權★:nk 的 claim 在呼叫端已取得,靜靜 return 會讓
+        #   該診次卡在 in-flight,狀態解除後也寄不出來(沒有出口)。
+        if _stop_alerts_suspended_reason():
+            self._release_alert_email_claim(nk)
+            return
         try:
             self._dispatch_future_stop_alert_inner(
                 nk, doc_name, cur, session_name, count, full_threshold,

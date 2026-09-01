@@ -11,6 +11,7 @@ import os
 import shutil
 import tempfile
 import time
+from dataclasses import dataclass
 
 
 _FILE_OP_RETRY_DELAYS_SEC = (0.05, 0.15, 0.35)
@@ -265,11 +266,22 @@ def atomic_write_json_multi(items, **kwargs) -> None:
             # ★[第 3 回] 還原失敗時【留著】manifest 與沒還原成功的備份★
             #   上一版不管成敗都清掉 —— 一個短暫的檔案鎖就讓設定停在不一致,
             #   而下次重試需要的舊資料已經被自己刪光了,永遠回不去。
-            #   `_rollback_written` 成功還原的那幾個會自己從 backups 移除,
-            #   所以這裡剩下的正是「還沒還原成功」的。
+            #   [外審 R6] 還原改成複製式後,備份全數留在 backups 裡,
+            #   統一在終態落地之後才由 `_drop_backups` 帶走。
             if not stuck:
-                _drop_backups(backups)
-                _remove_manifest(manifest_path)
+                # ★[外審 R6] 終態先落地,備份最後刪★:舊順序(先刪備份、再
+                # best-effort 刪 manifest)在 manifest 被鎖住時,留下與『備份
+                # 被外力拿走』無法區分的形狀 → 被 R5-1 的守衛永久判 stuck。
+                #   manifest 刪得掉 → 刪備份(乾淨落幕);
+                #   刪不掉 → 先寫 durable 的「已回滾」終態,寫成才刪備份;
+                #   連終態都寫不成 → ★整套留著★(復原會冪等地再還原一次)。
+                if (_remove_manifest(manifest_path)
+                        or _mark_manifest_rolled_back(manifest_path)):
+                    _drop_backups(backups)
+                else:
+                    logging.error(
+                        "[atomic_io] 回滾完成但 manifest 清不掉、終態也寫不進 →"
+                        " 保留備份與交易紀錄(下次啟動冪等重試)")
             else:
                 logging.error(
                     "[atomic_io] 有 %d 個檔還原失敗 → 保留交易紀錄與備份,"
@@ -308,8 +320,17 @@ def atomic_write_json_multi(items, **kwargs) -> None:
                 "設定目前可能不一致。請關閉可能佔用設定檔的程式後重新啟動,"
                 "程式會再試一次復原。",
                 phase="commit", written=stuck, pending=[])
-        _drop_backups(backups)
-        _remove_manifest(manifest_path)
+        # ★[外審 R6] 這裡也一樣:終態先落地,備份最後刪★
+        #   會走到這裡代表 `_remove_manifest` 剛剛才失敗過 —— 先刪備份的話,
+        #   磁碟上留下的「未 committed + existed 備份全不見」正是 R5-1 守衛
+        #   要攔的隔離形狀,一筆已完整回滾的交易從此永久 stuck。
+        if (_remove_manifest(manifest_path)
+                or _mark_manifest_rolled_back(manifest_path)):
+            _drop_backups(backups)
+        else:
+            logging.error(
+                "[atomic_io] 回滾完成但 manifest 清不掉、終態也寫不進 →"
+                " 保留備份與交易紀錄(下次啟動冪等重試)")
         logging.error("[atomic_io] 清不掉交易紀錄也標記不了完成(檔案被鎖住?)"
                       "→ 已回滾,本次【沒有變更任何設定檔】")
         raise MultiWriteError(
@@ -395,12 +416,22 @@ def _manifest_is_recoverable(path: str) -> bool:
         targets = list(_m.get("targets") or [])
         legacy = "existed" not in _m
         existed = set(_m.get("existed") or ())
-        committed = bool(_m.get("committed"))
+        committed = bool(_m.get("committed")) or bool(_m.get("rolled_back"))
     except Exception:
         # 讀不到就當它是可還原的(保守):寧可擋一次存檔,也不要蓋掉可能存在的備份。
         logging.warning("[atomic_io] 交易紀錄讀不到 → 保守視為未完成", exc_info=True)
         return True
     if _has_anything_to_undo(targets, existed, legacy, committed):
+        return True
+    # ★[外審 R5-1 的第二道門]★:未終結的交易、existed 目標的備份全不見 ——
+    # 那是『備份被外力拿走』的隔離形狀,不是「上次其實已完成」。在這裡清掉
+    # manifest 等於把 B 案閘門的證據從寫入路徑刪掉,然後放行覆寫。
+    if (not legacy and not committed
+            and any(str(t) in existed
+                    and not os.path.exists(str(t) + ".rollback.bak")
+                    for t in targets)):
+        logging.error("[atomic_io] 未完成交易的備份不見了 → 保留交易紀錄並"
+                      "拒絕新的存檔(內容無法證明是哪一版)")
         return True
     logging.warning("[atomic_io] 發現沒有任何備份的殘留交易紀錄(上次其實已完成)"
                     " → 清除後繼續")
@@ -442,6 +473,26 @@ def _mark_manifest_committed(path: str) -> bool:
         return False
 
 
+def _mark_manifest_rolled_back(path: str) -> bool:
+    """把 manifest 改寫成 durable 的「已回滾」終態。回是否成功。
+
+    ★[外審 R6] rollback 成功但 manifest 刪不掉時的終態★:不落地任何終態就
+    刪備份,磁碟上會留下「未 committed + existed 備份全不見」——與『備份被
+    外力拿走』一模一樣的形狀,復原端只能永久判 stuck(R5-1 的守衛正是在防
+    後者)。原子改寫寫得成,復原端就認得這筆已了結;寫不成(通常刪不掉的鎖
+    也擋 replace)→ 呼叫端保留備份,復原冪等重試。
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            m = json.load(f) or {}
+        m["rolled_back"] = True
+        atomic_write_json(path, m)
+        return True
+    except Exception:
+        logging.debug("[atomic_io] 寫入已回滾終態失敗", exc_info=True)
+        return False
+
+
 def _remove_manifest(path: str) -> bool:
     try:
         if os.path.exists(path):
@@ -452,8 +503,41 @@ def _remove_manifest(path: str) -> bool:
         return False
 
 
-def recover_interrupted_multiwrite(directory: str) -> int:
-    """開機時把上次沒做完的多檔交易還原。回傳還原了幾個檔。
+@dataclass(frozen=True)
+class RecoveryResult:
+    """一次復原的結果。
+
+    ★[外審第二輪 R2-P2-01] 「還原了幾個」回答不了呼叫端要問的問題★
+    原本回 `int`,於是「三個檔全部還原」與「兩個還原、一個卡住」對呼叫端
+    長得一模一樣 —— 而後者代表設定★半舊半新★,正是 `atomic_write_json_multi`
+    花那麼多程式碼要避免的狀態。呼叫端還因此把「已處理」旗標設在嘗試之前,
+    這個行程之後不再重試。
+
+    complete   這次交易的撤銷有沒有★完整完成★(沒有完成就不可以當作沒事)
+    restored   還原/刪除成功的檔數
+    stuck      還原不了的目標(檔案被鎖住、備份不見…)
+    pending    交易紀錄還留著(＝下次啟動會再試一次)
+    """
+    complete: bool
+    restored: int = 0
+    stuck: tuple = ()
+    pending: bool = False
+
+    def __bool__(self) -> bool:
+        """★刻意不讓它退化成「還原了幾個」的真假值★:舊呼叫端若寫
+        `if recover(...)` 會拿到「有沒有完整完成」,那才是安全的預設語意。"""
+        return self.complete
+
+    def describe(self) -> str:
+        if self.complete:
+            return (f"已還原 {self.restored} 個檔" if self.restored
+                    else "沒有需要還原的東西")
+        return (f"還原了 {self.restored} 個,但有 {len(self.stuck)} 個還原不了:"
+                + "、".join(os.path.basename(str(t)) for t in self.stuck))
+
+
+def recover_interrupted_multiwrite(directory: str) -> "RecoveryResult":
+    """開機時把上次沒做完的多檔交易還原。回傳 `RecoveryResult`。
 
     ★manifest 還在 = 上次的 commit 沒跑完★(它在最後一個 replace 成功之後
     才被刪掉)。這時 `.rollback.bak` 就是那幾個檔的舊內容,原樣換回去。
@@ -461,7 +545,7 @@ def recover_interrupted_multiwrite(directory: str) -> int:
     """
     path = os.path.join(directory, _MANIFEST_NAME)
     if not os.path.exists(path):
-        return 0
+        return RecoveryResult(True)
     try:
         with open(path, encoding="utf-8") as f:
             _m = json.load(f) or {}
@@ -471,20 +555,41 @@ def recover_interrupted_multiwrite(directory: str) -> int:
         #   復原會【刪掉每一個目標】—— 三個設定檔一起消失。
         legacy = "existed" not in _m
         existed = set(_m.get("existed") or ())
-        committed = bool(_m.get("committed"))
+        # [外審 R6] rolled_back 終態視同 committed:撤銷已完成、沒有東西可撤。
+        # (若還殘留 .rollback.bak,其內容=已還原後的 live,由下一筆交易覆寫。)
+        committed = (bool(_m.get("committed")) or bool(_m.get("rolled_back")))
     except Exception:
         logging.error("[atomic_io] 交易 manifest 讀不到 → 無法自動還原",
                       exc_info=True)
-        return 0
+        # ★讀不到 = 不知道要撤銷什麼,不是「沒事」★
+        return RecoveryResult(False, pending=True)
     # ★這一段必須在還原迴圈【之前】★(第一版放在後面 —— 而還原是用
     #   `os.replace(bak, target)` 把備份【移走】的,跑完就沒有 .bak 了,
     #   於是剛剛成功的還原會被自己判成「上次已完成」而回報 0。)
     #   沒有任何備份 = 上次其實已經完成,只是 manifest 沒刪掉。
     if not _has_anything_to_undo(targets, existed, legacy, committed):
+        # ★[外審 R5-1]「找不到任何備份」有兩種,不可一律判成已完成★
+        #   未 commit 的新格式交易裡,existed 目標的備份【應該】存在(還原是
+        #   複製、備份留到整筆成功、而且 manifest 先刪備份後刪)——它們全部
+        #   不見只可能是被外力拿走(防毒隔離/人工清除)。判成「上次已完成」
+        #   會刪掉 manifest:B 案的閘門從此查不到「哪些檔無法證明」,寫入
+        #   閘門也開了,程式就用著半舊半新的設定發止掛提醒。
+        #   ★出口★:備份回來(隔離解除)→ 下次還原成功 → 正常清理;
+        #   或使用者明確重存設定(寫入閘門的訊息有指引)。
+        if not legacy and not committed:
+            _lost = tuple(t for t in targets
+                          if str(t) in existed
+                          and not os.path.exists(str(t) + ".rollback.bak"))
+            if _lost:
+                logging.error(
+                    "[atomic_io] ★未完成交易的備份不見了★(%s)→ 保留交易"
+                    "紀錄;這些檔目前的內容無法證明是哪一版",
+                    "、".join(os.path.basename(str(t)) for t in _lost))
+                return RecoveryResult(False, stuck=_lost, pending=True)
         logging.info("[atomic_io] 殘留的交易紀錄已經沒有東西可撤銷"
                      "(上次已完成)→ 清除")
         _remove_manifest(path)
-        return 0
+        return RecoveryResult(True)
     n = 0
     stuck = []
     for target in targets:
@@ -497,7 +602,7 @@ def recover_interrupted_multiwrite(directory: str) -> int:
                                 target)
                 continue
             try:
-                _replace_with_retry(bak, target)
+                _restore_from_backup(bak, target)
                 n += 1
             except Exception:
                 logging.error("[atomic_io] 還原 %s 失敗", target, exc_info=True)
@@ -521,7 +626,7 @@ def recover_interrupted_multiwrite(directory: str) -> int:
             stuck.append(target)
             continue
         try:
-            _replace_with_retry(bak, target)
+            _restore_from_backup(bak, target)
             n += 1
         except Exception:
             logging.error("[atomic_io] 還原 %s 失敗", target, exc_info=True)
@@ -535,7 +640,8 @@ def recover_interrupted_multiwrite(directory: str) -> int:
     if stuck:
         logging.error("[atomic_io] 仍有 %d 個檔還原不了 → 保留交易紀錄與備份,"
                       "下次啟動再試:%s", len(stuck), stuck)
-        return n
+        return RecoveryResult(False, restored=n, stuck=tuple(stuck),
+                              pending=True)
     _remove_manifest(path)
     for target in targets:
         bak = str(target) + ".rollback.bak"
@@ -544,7 +650,41 @@ def recover_interrupted_multiwrite(directory: str) -> int:
                 _remove_with_retry(bak)
         except Exception:
             logging.debug("[atomic_io] 清除備份失敗", exc_info=True)
-    return n
+    return RecoveryResult(True, restored=n)
+
+
+def _restore_from_backup(bak: str, target: str) -> None:
+    """把備份還原到目標 —— ★原子且冪等★(備份留著,不移走)。
+
+    ★[外審 R2-P2-01 自查] 移走備份會造出一道沒有出口的閘門★
+    原本用 `_replace_with_retry(bak, target)`,那是把 `.rollback.bak`
+    ★移動★到目標。於是「部分復原」之後:已經還原成功的檔沒有備份了,
+    下一輪重試時它會被判成「原本存在但找不到備份 → 無法還原」→ 永遠 stuck
+    → 交易永遠完不成 → 依賴它的存檔閘門永遠打不開。
+    (這是寫測試時才發現的:我加的閘門本身沒有出口。)
+    改成:複製到同目錄的暫存檔 → fsync → 原子 replace;★備份留著★,
+    直到整筆交易都還原成功才在最後一起清掉。重試因此是冪等的。
+    """
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(target) + ".restore-",
+                               dir=os.path.dirname(target) or ".")
+    # ★[外審 deep R1-4] fd 要先交給會關閉它的物件★
+    #   原本寫成 `with open(bak) as src, os.fdopen(fd) as dst:` —— 兩個 context
+    #   是【由左至右】建立的,`open(bak)` 若因 ACL/共用鎖/暫時 IO 失敗而拋錯,
+    #   `os.fdopen(fd)` 根本還沒執行 → ★fd 永遠不會被關★;Windows 上那個仍被
+    #   開著的暫存檔通常也刪不掉。反覆重試會累積 handle 與 `.restore-*` 殘檔。
+    try:
+        with os.fdopen(fd, "wb") as dst:      # ← fd 從這一刻起一定會被關
+            with open(bak, "rb") as src:
+                shutil.copyfileobj(src, dst)
+            dst.flush()
+            os.fsync(dst.fileno())
+        _replace_with_retry(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _rollback_written(written: list, backups: dict, existed: set) -> list:
@@ -569,8 +709,13 @@ def _rollback_written(written: list, backups: dict, existed: set) -> list:
                               target_path)
                 stuck.append(target_path)
             else:
-                _replace_with_retry(bak, target_path)
-                backups.pop(target_path, None)
+                # ★[外審 R6] 複製式還原,備份【留在原地】★(與開機復原同一支)。
+                # 舊版用 os.replace 把備份搬走 —— 於是「回滾成功但 manifest
+                # 清不掉、終態也寫不進」的 fallback 留下的是【不完整】的備份組:
+                # 下次啟動的復原看到 existed 目標沒有備份,只能誤判 stuck,
+                # 一個已經完整回滾的檔從此永久卡住寫入閘門。備份統一由
+                # 終態落地後的 `_drop_backups` 帶走。
+                _restore_from_backup(bak, target_path)
         except Exception:
             logging.error("[atomic_io] 還原 %s 失敗 → 設定仍是半新半舊",
                           target_path, exc_info=True)
