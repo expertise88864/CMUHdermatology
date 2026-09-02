@@ -733,11 +733,20 @@ IPV4_ONLY_HOSTS = {
     "www.cmuh.cmu.edu.tw",           # 院方主站（master schedule）
 }
 
+#: [R3-P2-03] 這些 host 最多試幾個 IP。
+#: ★原本只試 1 個 → 沒有備援★:第一個 A 記錄不通、其它還活著時,整台就被判成
+#: 不通(院方主站與掛號系統都是多 A 的)。而當初改成 1 個是為了避免
+#: 「N 個 IP × 逾時」累積成 21-42 秒。兩者要一起顧,所以取★有上限的多個★:
+#: 最壞是 2 × 單次逾時(約 4 秒),仍遠低於原本的 21-42 秒,而備援回來了。
+#: (不寫成「全部」是刻意的:CDN 可以回 5-10 個,那正是當初的病灶。)
+IPV4_MAX_ADDRS = 2
+
 _orig_create_connection = _urllib3_conn.create_connection
 _orig_getaddrinfo = _socket.getaddrinfo
 
 def _ipv4_first_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-    """[O35 關鍵修正] 對 IPV4_ONLY_HOSTS 的 host 限制 DNS 結果為「IPv4 + 只 1 個 IP」。
+    """[O35 關鍵修正] 對 IPV4_ONLY_HOSTS 的 host 限制 DNS 結果為
+    「IPv4 + 最多 `IPV4_MAX_ADDRS` 個 IP」。
 
     為何要 patch socket.getaddrinfo（而非只 patch urllib3）：
       urllib3.connection.HTTPConnection 在 module load 時就 import 了
@@ -746,15 +755,15 @@ def _ipv4_first_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0)
 
     效果：當 host 在 IPV4_ONLY_HOSTS：
       - 只回 IPv4 結果（跳過 IPv6 嘗試）
-      - 只回第 1 個 IP（避免 N IP × timeout 累積）
-      → AUH/east 不通時 2 秒 fail，不再 21-42s
+      - ★最多回前 `IPV4_MAX_ADDRS` 個 IP★（避免 N IP × timeout 累積，
+        但保留備援 —— 只回 1 個等於「第一個 IP 掛了就整台不通」，
+        外審 R3-P2-03）
+      → AUH/east 不通時最壞約 4 秒 fail，不再 21-42s
     """
     try:
         if isinstance(host, str) and host in IPV4_ONLY_HOSTS:
             results = _orig_getaddrinfo(host, port, _socket.AF_INET, type, proto, flags)
-            if results:
-                return [results[0]]
-            return results
+            return results[:IPV4_MAX_ADDRS]
     except Exception:
         pass
     return _orig_getaddrinfo(host, port, family, type, proto, flags)
@@ -772,45 +781,22 @@ def _ipv4_aware_create_connection(address, *args, **kwargs):
 
 
 def _create_ipv4_connection(address, *args, **kwargs):
-    """socket 連線 wrapper：強制 AF_INET（IPv4 only）+ **只試前 1 個 IP**。
+    """socket 連線 wrapper：強制 AF_INET（IPv4 only）+ ★最多試前
+    `IPV4_MAX_ADDRS` 個 IP★。
 
     【關鍵修正】DNS 解析常回傳多個 IP（CDN 5-10 個）。原版逐個試 IP，
-    每個 timeout 2s × 10 個 = 20-40s 才失敗。改為只試前 1 個。
+    每個 timeout 2s × 10 個 = 20-40s 才失敗。
+    ★但只試 1 個等於沒有備援★（外審 R3-P2-03）：第一個 A 不通、其它還活著時
+    整台被判成不通。改成試前幾個 —— 最壞 2×逾時,備援回來了。
     """
     host, port = address
     addrs = _socket.getaddrinfo(host, port, _socket.AF_INET, _socket.SOCK_STREAM)
     if not addrs:
         raise OSError("getaddrinfo returns an empty list")
-    # 只試第一個 IP（避免 N×timeout 累積）
-    af, socktype, proto, _canonname, sa = addrs[0]
-    sock = _socket.socket(af, socktype, proto)
-    try:
-        timeout = kwargs.get("timeout", _socket._GLOBAL_DEFAULT_TIMEOUT)
-        if timeout is not _socket._GLOBAL_DEFAULT_TIMEOUT:
-            sock.settimeout(timeout)
-        source_addr = kwargs.get("source_address")
-        if source_addr:
-            sock.bind(source_addr)
-        sock.connect(sa)
-        return sock
-    except OSError:
-        try:
-            sock.close()
-        except OSError:
-            pass
-        raise
-
-
-def _create_ipv4_connection_OLD(address, *args, **kwargs):
-    """[棄用] 舊版逐個試 IP，留作 reference。"""
-    host, port = address
     err = None
-    for af, socktype, proto, _canonname, sa in _socket.getaddrinfo(
-        host, port, _socket.AF_INET, _socket.SOCK_STREAM
-    ):
-        sock = None
+    for af, socktype, proto, _canonname, sa in addrs[:IPV4_MAX_ADDRS]:
+        sock = _socket.socket(af, socktype, proto)
         try:
-            sock = _socket.socket(af, socktype, proto)
             timeout = kwargs.get("timeout", _socket._GLOBAL_DEFAULT_TIMEOUT)
             if timeout is not _socket._GLOBAL_DEFAULT_TIMEOUT:
                 sock.settimeout(timeout)
@@ -821,15 +807,18 @@ def _create_ipv4_connection_OLD(address, *args, **kwargs):
             return sock
         except OSError as e:
             err = e
-            if sock is not None:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-    if err is not None:
-        raise err
-    raise OSError("getaddrinfo returns an empty list")
+            try:
+                sock.close()
+            except OSError:
+                pass
+    raise err if err is not None else OSError("no address to connect")
 
+
+# ★[R3-P2-03] 刪掉了 `_create_ipv4_connection_OLD`★
+#   它是「逐個試【所有】IP」的舊版,留著當 reference。現在正版已經是
+#   「試前 `IPV4_MAX_ADDRS` 個」—— 那段死碼展示的正好是我們刻意設上限要避免
+#   的行為(N×逾時累積 21-42 秒),留著只會讓下一個人以為那才是對的。
+#   (它沒有任何呼叫端,git 歷史裡查得到。)
 
 # [O35] 主要 patch：socket.getaddrinfo（所有 DNS 都走這個，最可靠）
 _socket.getaddrinfo = _ipv4_first_only_getaddrinfo

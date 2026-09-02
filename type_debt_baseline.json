@@ -156,8 +156,6 @@
     "src/main.py|AutomationApp._update_clinic_lights_loop_body.run_update|Cannot assign to attribute \"_clinic_reg64_auto_segment\" for class \"AutomationApp*\" Attribute \"_clinic_reg64_auto_segment\" is unknown|self._clinic_reg64_auto_segment = tc_auto": 1,
     "src/main.py|AutomationApp._update_clinic_lights_loop_body.run_update|Cannot assign to attribute \"_reg64_abnormal_log_ts\" for class \"AutomationApp*\" Attribute \"_reg64_abnormal_log_ts\" is unknown|self._reg64_abnormal_log_ts = now_ts": 1,
     "src/main.py|AutomationApp.fetch_clinic_light_status|Cannot access attribute \"upper\" for class \"AttributeValueList\" Attribute \"upper\" is unknown|bg_color = cells[1].get('bgcolor', '').upper()": 1,
-    "src/main.py|_create_ipv4_connection_OLD|\"_GLOBAL_DEFAULT_TIMEOUT\" is not a known attribute of module \"socket\"|if timeout is not _socket._GLOBAL_DEFAULT_TIMEOUT:": 1,
-    "src/main.py|_create_ipv4_connection_OLD|\"_GLOBAL_DEFAULT_TIMEOUT\" is not a known attribute of module \"socket\"|timeout = kwargs.get(\"timeout\", _socket._GLOBAL_DEFAULT_TIMEOUT)": 1,
     "src/main.py|_create_ipv4_connection|\"_GLOBAL_DEFAULT_TIMEOUT\" is not a known attribute of module \"socket\"|if timeout is not _socket._GLOBAL_DEFAULT_TIMEOUT:": 1,
     "src/main.py|_create_ipv4_connection|\"_GLOBAL_DEFAULT_TIMEOUT\" is not a known attribute of module \"socket\"|timeout = kwargs.get(\"timeout\", _socket._GLOBAL_DEFAULT_TIMEOUT)": 1,
     "src/main.py|_ensure_network_imports|\"urllib3\" is not a known attribute of module \"..packages\"|_requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)": 1,

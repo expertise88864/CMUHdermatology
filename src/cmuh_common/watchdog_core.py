@@ -931,17 +931,46 @@ def start_program(pyw_path: Path, pythonw: str) -> int:
         return 0
 
 
-def is_log_stale(log_path: Path, max_stale_sec: int) -> tuple:
-    """(stale?, age_sec) — max_stale_sec <= 0 表示跳過。"""
+#: `log_status()` 的三態(R3-P3-01)。
+LOG_OK = "ok"                 # 讀得到 mtime
+LOG_ABSENT = "absent"         # 檔案不在
+LOG_UNREADABLE = "unreadable"  # 在,但 stat 失敗(權限/被鎖/磁碟)
+
+
+def log_status(log_path: Path, max_stale_sec: int) -> tuple:
+    """(stale?, age_sec, status) — max_stale_sec <= 0 表示跳過。
+
+    ★「不在」「讀不到」與「還很新」是三件事★(外審 R3-P3-01):舊版把前兩者
+    都壓成 `stale=False` —— 也就是「這支程式很健康」。而「行程在跑、log 檔卻
+    根本不存在」正是 logging 壞掉的樣子(見 `logging_setup` 那條:設定之前
+    有人 module-level `logging.warning`,檔案 handler 就永遠裝不上)。
+    壓成一格之後,watchdog ★永遠不會察覺★。
+
+    ★這一批只把三態分出來、據實記一筆,【不改重啟行為】★:
+    因為「log 不在就重啟」會在 log 路徑設錯/剛啟動還沒建檔時變成重啟迴圈,
+    而那個狀況★不會自己解除★(2026-08-05 事故的教訓:fail-closed 前要先
+    證明狀況會解除)。要不要升級成重啟,由使用者看過實機的紀錄再決定。
+    """
     if max_stale_sec <= 0:
-        return False, 0.0
+        return False, 0.0, LOG_OK
     if not log_path.exists():
-        return False, 0.0
+        return False, 0.0, LOG_ABSENT
     try:
         age = time.time() - log_path.stat().st_mtime
-        return age > max_stale_sec, age
+        return age > max_stale_sec, age, LOG_OK
     except Exception:
-        return False, 0.0
+        return False, 0.0, LOG_UNREADABLE
+
+
+def is_log_stale(log_path: Path, max_stale_sec: int) -> tuple:
+    """(stale?, age_sec) —— `log_status()` 的相容包裝。
+
+    ★舊介面刻意保留原本的回傳形狀★:在意「不知道」的呼叫端改用
+    `log_status()`(與 `ensure_single_instance` / `acquire_single_instance`
+    同一個作風)。
+    """
+    stale, age, _status = log_status(log_path, max_stale_sec)
+    return stale, age
 
 
 # ─── Action lock：避免 B+C 同時 kill+restart 同一個程式 ─────────────────
@@ -1126,10 +1155,20 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
 
         # mutex 持有 + log 新鮮 → 真的健在
         if mutex_held:
-            if log_path is not None and max_stale > 0 and log_path.exists():
+            # ★這條分支也要走三態★(外審 R3 剩餘批 P1):原本用
+            #   `exists()/stat()` 自己判,於是「log 檔不在」直接掉到下面的
+            #   「mutex 確認健在」—— 那正是這一批要修的靜音失敗。
+            _m_stale, _m_age, _m_state = log_status(log_path, max_stale)                 if log_path is not None else (False, 0.0, LOG_OK)
+            if log_path is not None and max_stale > 0 and _m_state != LOG_OK:
+                logging.warning(
+                    "[watchdog] %s 的 log %s(%s)→ ★無從判斷新鮮度★,"
+                    "本輪仍視為健在(mutex 持有);若持續出現代表該程式的"
+                    " logging 壞了", name,
+                    "不存在" if _m_state == LOG_ABSENT else "讀不到", log_path)
+            if log_path is not None and max_stale > 0 and _m_state == LOG_OK:
                 try:
-                    age = time.time() - log_path.stat().st_mtime
-                    if age < max_stale:
+                    age = _m_age
+                    if not _m_stale:
                         # [v16 2026-05-25] 文案改友善 — Windows WMI 對含中文路徑的
                         # cmdline 有 codepage bug (測試確認 WMI BSTR→string 階段就
                         # 已亂碼，PowerShell 也救不回)。每次 fallback 不是錯，
@@ -1201,8 +1240,19 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
         return f"✗ {name}: 沒在跑且啟動失敗 [{mode}]"
 
     # Case 2: 在跑 → 看 log 新鮮度
+    _c2_state, _c2_age = LOG_OK, 0.0
     if log_path is not None and max_stale > 0:
-        stale, age = is_log_stale(log_path, max_stale)
+        stale, age, log_state = log_status(log_path, max_stale)
+        _c2_state, _c2_age = log_state, age
+        if log_state != LOG_OK:
+            # ★據實記一筆★:行程在跑、log 檔卻不在/讀不到 —— 那是 logging
+            #   壞掉的樣子,而不是「這支程式很健康」。這一批不改重啟行為
+            #   (理由見 `log_status` 的說明),但不可以繼續是靜音的。
+            logging.warning(
+                "[watchdog] %s 的 log %s(%s)→ ★無從判斷新鮮度★,"
+                "本輪不當成陳舊;若持續出現代表該程式的 logging 壞了",
+                name, "不存在" if log_state == LOG_ABSENT else "讀不到",
+                log_path)
         if stale:
             if not claim_action_lock(name, action_lock_sec):
                 return (f"⏭ {name}: log {age:.0f}s 沒更新但 lock 還新，"
@@ -1227,9 +1277,16 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
             return (f"⟳ {name}: log {age:.0f}s 沒更新 (>{max_stale}s)，"
                     f"killed PID {killed} → 重啟 PID {new_pid} [{mode}]")
 
-    if max_stale > 0 and log_path is not None and log_path.exists():
-        age = time.time() - log_path.stat().st_mtime
-        return f"✓ {name}: PID {pids}, log {age:.0f}s 前更新 [{mode}]"
+    # ★不可以再 stat 一次★(外審 R3 剩餘批 P3):上面已經取過一次,
+    #   而 `LOG_UNREADABLE` 正是「stat 會拋」的那個狀態 —— 再呼叫一次會讓
+    #   整個 `ensure_program` 拋出去,`run_one_tick` 只看得到「tick 例外」,
+    #   三態就傳不出來了。沿用上面那一次的結果。
+    if max_stale > 0 and log_path is not None and _c2_state == LOG_OK:
+        return f"✓ {name}: PID {pids}, log {_c2_age:.0f}s 前更新 [{mode}]"
+    if max_stale > 0 and log_path is not None:
+        return (f"✓ {name}: PID {pids}(log "
+                f"{'不存在' if _c2_state == LOG_ABSENT else '讀不到'},"
+                f"新鮮度未知)[{mode}]")
     return f"✓ {name}: PID {pids} [{mode}]"
 
 
