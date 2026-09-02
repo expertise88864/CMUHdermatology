@@ -40,11 +40,17 @@ def _appt_dict_ext_branch(item) -> Optional[str]:
 
 
 def _calendar_branch_sort_rank(ext_branch) -> int:
-    """總覽同一時段內分院列順序：東區→亞大→惠和→惠盛→老人醫院→其他分院。"""
+    """總覽同一時段內分院列順序：東區→亞大→惠和→惠盛→其他分院→老人醫院。
+
+    ★[2026-09-02 使用者] 老人醫院固定排在【所有外院的最後一個】★
+    它與其他分院不同:那位醫師本院已經沒有門診了,這一列純粹是「他在外院」
+    的補充資訊,不需要跟其他分院競爭順序。給它一個比「未知分院」還後面的
+    名次,新增任何分院都不會把它擠到中間。
+    """
     if not ext_branch:
         return 0
     return {"east": 0, "auh": 1, "huihe": 2, "huisheng": 3,
-            "tcmc": 4}.get(ext_branch, 5)
+            "tcmc": 5}.get(ext_branch, 4)
 
 
 def _strip_ext_appointments(appointments_by_date: dict) -> None:

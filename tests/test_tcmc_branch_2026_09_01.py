@@ -198,12 +198,17 @@ class TestTheOverviewRowLooksRight:
                    if not main._EXT_BRANCH_DISPLAY_SUFFIX.get(b)]
         assert missing == [], "這些分院沒有顯示後綴:" + str(missing)
 
-    def test_it_sorts_after_the_existing_branches_but_before_unknown(self):
+    def test_it_sorts_after_every_other_branch(self):
+        """★[2026-09-02 使用者] 改成排在所有外院的最後一個★
+
+        原本它排在「未知分院」之前;使用者要求它固定墊底 —— 日後新增分院
+        (會落在未知那一格)也不可以把它擠到中間。
+        """
         order = [_calendar_branch_sort_rank(b)
                  for b in ("east", "auh", "huihe", "huisheng", "tcmc")]
         assert order == sorted(order) and len(set(order)) == 5, order
         assert _calendar_branch_sort_rank("tcmc") \
-            < _calendar_branch_sort_rank("something_new")
+            > _calendar_branch_sort_rank("something_new")
 
 
 # ── ★接上去了嗎★:走生產的那條主路徑 ────────────────────────────────────

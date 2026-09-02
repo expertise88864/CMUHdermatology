@@ -259,10 +259,25 @@ class UvbLineInfo:
 #   dose/to)。新 branch4:關鍵字後 ≤40 字「非數字、非逗號」的描述 + 冒號 + 劑量。因排除數字,描述段
 #   不會跨過任何數字(會停在第一個數字),故抓到的是【冒號後的第一個數字=本次劑量】、不會誤抓後面的
 #   max(如 fixed at 1000);且描述在冒號【前】,故「UVB: 已打折 1000」(中文在冒號後)不會被這支誤吃。
+# [2026-09-02 使用者實機 case] 也接受「keyword, start <N> mj」的★開始療程★寫法:
+#   「(2026/8/29) Start phototherapy, start 400mj, add 100 each time,
+#     upper limit: 1200mj」
+#   —— 關鍵字與劑量之間夾著逗號【與一個起始詞】,四個舊分支都比不到:
+#   branch1 要求數字緊跟(中間只能有空白/冒號/逗號);branch2/3 要求 dose/to;
+#   branch4 的描述段不可跨逗號。這是「第一次開始照光」的醫囑,所以沒有次數
+#   (count 本來就是 Optional,v20.7),date 寫在最前面(v20.15 已支援)。
+# ★安全設計★:這個分支與 branch3(「to」)用同一招 —— 要求數字後面★緊跟 mj★
+#   (zero-width lookahead)。少了它,「phototherapy, start 3 times per week」
+#   會把 3 當成劑量。起始詞與劑量之間只允許空白/冒號,不允許任何其他文字:
+#   範圍剛好涵蓋實機寫法而不多吃。
 _UVB_DOSE_RE = re.compile(
     r"(UVB|Phototherapy|UV)(?:\s*[:：,，]?\s*"
     r"|\s+[^\r\n,，]{0,40}?\bdose\s*[:：]?\s*"
     r"|\s+[^\r\n,，]{0,40}?\bto\s+(?=\d+\s*mj)"
+    r"|[\s,，:：]*(?:re[-\s]?)?"
+    r"(?:start(?:s|ing|ed)?|begin(?:s|ning)?|initial(?:ly)?|from"
+    r"|起始|初始|開始|從)"
+    r"\s*[:：]?\s*(?=\d+\s*m\s*j)"
     r"|[^\r\n\d,，]{0,40}?[:：]\s*)(\d+)",
     re.IGNORECASE)
 # [v20.11] 接受帶 paren 跟不帶 paren 兩種:

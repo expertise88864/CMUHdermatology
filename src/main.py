@@ -7412,6 +7412,24 @@ def create_master_schedule_from_web():
         return {}
 
 # _appt_dict_ext_branch / _calendar_branch_sort_rank: 抽到 cmuh_common.appt_utils
+def _doctor_code_sort_key(doc_no) -> tuple:
+    """醫師代號的排序鍵:★數字由小到大★(2026-09-02 使用者)。
+
+    代號有兩種寫法:帶前綴的 `D15728` 與純數字的 `101823`。
+    直接用字串排序的話 `D6175` 會排在 `D15645` 後面(字元比大小),
+    而使用者要的是「代號由小到大」—— 那指的是數字。
+    故取出數字部分當主鍵;取不出數字的(空白/純文字)一律排到最後,
+    再以原字串當次鍵讓順序穩定(同數字時不會每次重整就跳動)。
+    """
+    text = str(doc_no or "").strip()
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if not digits:
+        # ★沒有數字的排最後,而不是被當成 0 排到最前面★:那會讓一筆
+        #   打錯的代號(或空白)跳到清單頂端,看起來像最小的代號。
+        return (1, 0, text.lower())
+    return (0, int(digits), text.lower())
+
+
 _EXT_BRANCH_DISPLAY_SUFFIX = {
     "east": "(東區分院)",
     "auh": "(亞大)",
@@ -14922,7 +14940,26 @@ class AutomationApp:
     def refresh_doctors_treeview(self):
         for i in self.doctors_tree.get_children(): self.doctors_tree.delete(i)
         # [修改] 配合欄位順序: values=(doc_no, name)
-        for doctor in self.doctors_list: self.doctors_tree.insert('', 'end', values=(doctor['doc_no'], doctor['name']))
+        # [2026-09-02 使用者] 依醫師代號【由小到大】排序
+        for doctor in sorted(self.doctors_list,
+                             key=lambda d: _doctor_code_sort_key(d.get('doc_no'))):
+            self.doctors_tree.insert('', 'end', values=(doctor['doc_no'], doctor['name']))
+
+    def _sort_doctors_treeview(self):
+        """把目前 Treeview 裡的列依代號重排(不碰磁碟,存檔時才落地)。
+
+        ★新增之後也要排★:`_add_doctor` 一律插在最後,不重排的話新加的醫師
+        會停在清單尾巴 —— 使用者看到的順序就不是他要求的那個。
+        """
+        # `item(..., 'values')` 的型別是 `tuple | str` —— 明確收斂成 tuple,
+        # 否則單欄列會被當成字串傳回 `insert(values=...)`。
+        rows = [tuple(self.doctors_tree.item(i, 'values') or ())
+                for i in self.doctors_tree.get_children()]
+        rows.sort(key=lambda v: _doctor_code_sort_key(v[0] if v else ""))
+        for i in self.doctors_tree.get_children():
+            self.doctors_tree.delete(i)
+        for values in rows:
+            self.doctors_tree.insert('', 'end', values=values)
 
     def _add_doctor(self):
         name = self.new_doctor_name_var.get().strip()
@@ -14930,6 +14967,7 @@ class AutomationApp:
         if name and doc_no:
             # [修改] 配合欄位順序: values=(doc_no, name)
             self.doctors_tree.insert('', 'end', values=(doc_no, name))
+            self._sort_doctors_treeview()
             self.new_doctor_name_var.set("")
             self.new_doctor_code_var.set("")
         else:
@@ -15451,7 +15489,7 @@ class AutomationApp:
                                 if is_self_paid: display_name += "*"
                                 
                                 # 排序：(1) 非休診列優先，休診／無門診列一律置底
-                                # (2) A101→A102→A103→本院其他→分院；分院內：東區→亞大→惠和→惠盛→其他 (3) 醫師清單順序
+                                # (2) A101→A102→A103→本院其他→分院；分院內：東區→亞大→惠和→惠盛→其他→老人醫院 (3) 醫師清單順序
                                 is_dayoff_row = (
                                     tag in ("dayoff", "no_clinic")
                                     or ("休診" in status_text)
