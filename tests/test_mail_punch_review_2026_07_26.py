@@ -173,14 +173,26 @@ def test_missing_table_must_not_be_treated_as_portal_change():
     assert 'querySelectorAll("#Gv_attppre tbody tr")' in raw,         "維持直接掃列:表格不在 → 0 列 → 正常顯示未打卡"
 
 
-def test_system_date_fallback_is_always_logged():
-    """★外審★ `lb_systime` 存在卻是空字串/ISO 日期/改版成不含「年」的格式時【不會拋例外】,
-    舊寫法 `except` 記不到 → 靜默沿用本機日期,時鐘一偏差就挑錯今日列而誤報未打卡。"""
+def test_system_date_unverified_is_not_answered_from_the_local_clock():
+    """★外審第四輪 R4-P2-02:宣稱要升級★
+
+    這條原本只要求「降級一定要看得見(記 log)」—— 但看得見不等於沒有作答:
+    舊版記完 warning 之後★仍然沿用本機日期繼續查,而且 error=None★,
+    對呼叫端是一個「查詢成功」的權威答案。本機時鐘差一天(或 portal 改了
+    日期格式)就會挑不到今日的列 → 對有排班的人判成 PUNCH_FAIL →
+    醫師收到一封說他沒打卡的信。
+    ★現在的不變式★:日期無法確認 → 直接回報查詢失敗(顯示端有既有的
+    「⚠️ 查詢失敗」語意),而且是 ★不可重試★ 的種類 —— 重登一次不會讓
+    版面變得解析得出來,只會吃掉整批的時間預算。
+    """
     code = _code_only(inspect.getsource(ps.read_today_swipes))
     assert "_sys_date_parsed" in code, "要有明確的解析成功旗標"
-    assert "if not _sys_date_parsed:" in code, "沒解析成功就要記錄(不只例外時)"
-    i_flag = code.index("if not _sys_date_parsed:")
-    assert "logging.warning" in code[i_flag:i_flag + 400], "降級一定要看得見"
+    assert "if not _sys_date_parsed:" in code, "沒解析成功就要有處置(不只例外時)"
+    tail = code[code.index("if not _sys_date_parsed:"):][:900]
+    assert "logging.error" in tail, "★無法確認日期是失敗,不是降級★ 要記 error"
+    assert "return [], PunchError(" in tail, (
+        "★記了 log 卻仍用本機日期作答★ —— 那個答案會變成假的『未打卡』")
+    assert "PUNCH_ERR_TERMINAL" in tail, "重登不會讓日期解析得出來 → 不可重試"
 
 
 def test_send_mail_declares_dict_return_type():

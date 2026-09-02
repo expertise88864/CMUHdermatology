@@ -1723,9 +1723,14 @@ def run_retention_sweep() -> None:
                 # 早夭 stderr 檔本來就有 TTL,只是原本沒人定期叫它。
                 ("重啟錯誤檔", _sweep_restart_err_files),
             ])
-        if res.failed:
+        if not res.clean:
             # ★[2026-08-02 外審 P2-04] 保留期沒跑完不可以只是 info★
             #   這是個資留存的控制：默默失敗＝病歷號超期留在磁碟上而沒人知道。
+            # ★[外審第四輪 自查] 判準要問【權威的那一支】★:原本只看
+            #   `res.failed`(刪不掉),於是 R2-P2-03 加的「年齡讀不到」與
+            #   R4-P2-01 加的「目錄問不到/列舉不了」對主程式★完全隱形★ ——
+            #   同一份結果,背景清掃緒(用 `res.clean`)記 error、主程式記 info。
+            #   「有沒有完全確認保留期」只能有一份判準。
             logging.error("[retention] ★有項目沒有清掃成功★ %s", res.summary())
         else:
             logging.info("[retention] %s", res.summary())

@@ -37,6 +37,13 @@ from cmuh_common.version import CURRENT_VERSION, parse_version
 # === GitHub repo 設定 ===
 GITHUB_OWNER = "expertise88864"
 GITHUB_REPO = "CMUHdermatology"
+# ★★使用者定案(2026-09-02):不做 release 分支 / 分支保護,勿再提議★★
+#   外審連續四輪把「更新來源追的是一條未受保護的 main」排在 backlog 最前面
+#   (建議 `release`/`stable` + branch protection + manifest 簽章)。
+#   使用者評估後決定★維持現狀★ —— 那是 GitHub 設定與發佈政策的取捨,
+#   不是程式缺陷。現行的補償控制:push 一律走 `scripts/push_helper.py`
+#   (preflight 四道閘門 + manifest SHA256 逐檔核對 + 反還原檢查),
+#   而更新端會逐檔驗 manifest 的 SHA256。日後審查再點到這裡,請引用這一行。
 GITHUB_BRANCH = "main"
 RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{GITHUB_BRANCH}"
 MANIFEST_URL = f"{RAW_BASE}/manifest.json"

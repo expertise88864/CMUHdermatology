@@ -38,7 +38,7 @@ watchdog 允許「這台只跑會診+打卡、主程式很少開」的合法部�
 """
 from __future__ import annotations
 
-import glob
+import fnmatch
 import logging
 import os
 import stat as stat_module
@@ -88,6 +88,15 @@ class SweepResult:
     #   於是「磁碟上還躺著一個含 PHI 的檔」與「沒有過期檔案」長得一模一樣。
     #   ★無法確認檔案年齡 ≠ 檔案在保留期內★:隱私控制要顯示 degraded,不是 clean。
     stat_failed: dict = field(default_factory=dict)  # {label: 讀不到年齡幾個}
+    # ★[外審第四輪 R4-P2-01] 連「這個目錄裡有什麼」都問不到★
+    #   上一輪修的是「有檔案、但 stat 不到年齡」。再上游一格還有兩種:
+    #     * 目錄本身 stat 不到(ACL/防毒)→ 連它存不存在都不知道;
+    #     * 目錄在、但列舉不了 → `glob.glob()` 會把 OSError 吞成空清單。
+    #   兩者原本都長得跟「這裡沒有過期檔」一模一樣,摘要照樣說「沒有過期檔案」。
+    #   ★enumeration failure ≠ directory empty★ —— 與 R2-P2-03 的
+    #   「stat failure ≠ file is young」是同一條不變式。
+    directory_failed: dict = field(default_factory=dict)    # {label: 1}
+    enumeration_failed: dict = field(default_factory=dict)  # {label: 1}
 
     @property
     def total_deleted(self) -> int:
@@ -95,8 +104,13 @@ class SweepResult:
 
     @property
     def clean(self) -> bool:
-        """這一輪有沒有★完全確認★保留期成立(刪不掉/讀不到年齡都不算)。"""
-        return not self.failed and not self.stat_failed
+        """這一輪有沒有★完全確認★保留期成立。
+
+        ★四種都不算★:刪不掉、讀不到年齡、目錄問不到、目錄列舉不了。
+        任何一種成立時,磁碟上都可能還躺著超過保留期的個資,而我們無從證明。
+        """
+        return not (self.failed or self.stat_failed
+                    or self.directory_failed or self.enumeration_failed)
 
     def summary(self) -> str:
         parts = [f"{k}×{v}" for k, v in sorted(self.deleted.items()) if v]
@@ -107,6 +121,14 @@ class SweepResult:
         if self.stat_failed:
             out += "；★年齡讀不到(無法確認保留期)★:" + "、".join(
                 f"{k}×{v}" for k, v in sorted(self.stat_failed.items()) if v)
+        # ★兩種「問不到」要分開講★:處置一樣(都要人去看),但要查的東西不同 ——
+        #   一個是目錄本身的權限/存在性,一個是目錄內容的列舉。
+        if self.directory_failed:
+            out += "；★目錄狀態問不到(無法確認保留期)★:" + "、".join(
+                sorted(self.directory_failed))
+        if self.enumeration_failed:
+            out += "；★目錄列舉不了(無法確認保留期)★:" + "、".join(
+                sorted(self.enumeration_failed))
         if self.oldest:
             out += f"；最舊敏感檔:{self.oldest[0]} {self.oldest[1]:%Y-%m-%d}"
         return out
@@ -117,14 +139,52 @@ def _older(cur, cand: float) -> float:
     return cand if cur is None or cand < cur else cur
 
 
-def _iter_matches(rule: RetentionRule):
-    """列出符合樣式的路徑。★不在這裡過濾「是不是檔案」★(外審 R1-2):
-    `os.path.isfile()` 自己會做一次 stat,並把 OSError 吞成 False —— 於是
-    ACL/防毒讓 stat 失敗的檔在這裡就被靜默丟掉,連後面的 `stat_failed`
-    都還沒輪到。那正是這一批要消滅的形狀,只是往上游搬了一格。
-    判斷交給 `sweep()` 的★單一次明確 stat★。"""
-    for pat in rule.patterns:
-        yield from glob.glob(os.path.join(rule.directory, pat))
+def _name_matches(name: str, patterns) -> bool:
+    """檔名符合任一樣式嗎。★行為要與原本的 `glob` 逐位元一致★
+
+    * `fnmatch.fnmatch` 在 Windows 會 normcase(不分大小寫)—— glob 也是;
+    * glob 的隱藏檔慣例:`*` 不匹配開頭是 `.` 的名字,除非樣式自己以 `.` 開頭。
+      漏掉這一條的話,`*.before-reset-*` 會開始吃到 dotfile —— 那是★多刪★,
+      比原本的問題更糟(一個修正必須連同它新開的可能性一起判斷)。
+    ★樣式一律是「單層檔名」★:含路徑分隔字元的樣式在這裡永遠比不中
+    (有測試釘住本模組出貨的規則都是單層),要遞迴請另外設計,
+    不要以為寫 `sub/*.png` 會生效 —— 那會是一個安靜的保留期漏洞。
+    """
+    for pat in patterns:
+        if name.startswith(".") and not str(pat).startswith("."):
+            continue
+        if fnmatch.fnmatch(name, str(pat)):
+            return True
+    return False
+
+
+def _list_dir_names(directory: str):
+    """列出目錄裡的名字。→ `(names, status)`,status ∈
+    ok / absent / dir_unreadable / list_failed。
+
+    ★[外審第四輪 R4-P2-01] 為什麼不能再用 `glob.glob()`★
+    它在目錄無法列舉時(ACL、防毒鎖、暫時性 IO、網路碟斷線)★把 OSError
+    吞掉並回空清單★ —— 呼叫端於是分不出「裡面沒有過期檔」與「裡面有什麼
+    我根本沒看到」。而 `os.path.isdir()` 同樣把 OSError 吞成 False,
+    跟「這個目錄不存在」(契約上要靜默跳過的那種)混在一起。
+    這一支把三件事分開,讓 `sweep()` 可以誠實回報。
+    """
+    try:
+        st = os.stat(directory)
+    except (FileNotFoundError, NotADirectoryError):
+        return (), "absent"          # 契約:目錄不存在的規則靜默跳過
+    except OSError:
+        return (), "dir_unreadable"  # 存不存在都不知道 —— 不可以當成沒有
+    if not stat_module.S_ISDIR(st.st_mode):
+        return (), "absent"
+    try:
+        # ★整段列舉包在 try 裡★:Windows 的 FindNextFile 可能在【迭代中途】
+        #   失敗,只包 `os.scandir()` 那一行擋不到 —— 而半份清單不能證明
+        #   任何事,所以失敗就整批作廢,不採用部分結果。
+        with os.scandir(directory) as it:
+            return tuple(entry.name for entry in it), "ok"
+    except OSError:
+        return (), "list_failed"
 
 
 def sweep(rules, extra_tasks=(), *, now: "float | None" = None) -> SweepResult:
@@ -137,12 +197,27 @@ def sweep(rules, extra_tasks=(), *, now: "float | None" = None) -> SweepResult:
     res = SweepResult()
     now = time.time() if now is None else now
     for rule in rules:
-        if not os.path.isdir(rule.directory):
+        names, dstatus = _list_dir_names(rule.directory)
+        if dstatus == "absent":
+            continue                    # 目錄不存在 —— 契約上的靜默跳過
+        if dstatus != "ok":
+            # ★問不到就要說★(R4-P2-01):這兩種狀態下,目錄裡可能正躺著
+            #   超過保留期的截圖/病歷號,而我們連看都沒看到。
+            bucket = (res.directory_failed if dstatus == "dir_unreadable"
+                      else res.enumeration_failed)
+            bucket[rule.label] = bucket.get(rule.label, 0) + 1
+            logging.warning("[retention] %s(%s):%s —— 無法確認保留期",
+                            rule.label,
+                            "目錄狀態問不到" if dstatus == "dir_unreadable"
+                            else "目錄列舉不了", rule.directory)
             continue
         cutoff = now - rule.retain_days * 86400.0
         gone = bad = unknown_age = 0
         newest_kept: "float | None" = None
-        for path in _iter_matches(rule):
+        for _name in names:
+            if not _name_matches(_name, rule.patterns):
+                continue
+            path = os.path.join(rule.directory, _name)
             # ★整條路徑只做【一次】明確的 stat★(外審 R1-2):是不是普通檔、
             #   幾歲,都由這一次的結果回答 —— 中間任何一個「順手判斷」都可能
             #   把 OSError 吞成「不是檔案」而靜默跳過。

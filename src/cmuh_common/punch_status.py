@@ -18,6 +18,34 @@ import time as _time
 from datetime import date as _date, datetime, time as dt_time
 from typing import Optional
 
+# ─── 錯誤的「種類」:重試政策要看資料,不要看人話 ──────────────────────────
+# ★[外審第四輪 R4-P3-01] 為什麼要有這個★
+# 原本 `_is_retryable_punch_error()` 是拿中文字去比對(「密碼錯誤」「selenium
+# 不可用」)。院方哪天把登入 Alert 改成「帳號已停用」「登入驗證失敗」,判準就會
+# 自動變成「可重試」→ 對一個已經終局失敗的帳號★再送一次帳密★(徒增鎖定次數),
+# 而且整批的時間預算被吃掉一半。
+# ★邊界畫在這裡★:【我們自己產生】的錯誤一律帶 kind(資料);
+#   portal 自己吐出來的 Alert 文字沒有辦法變成資料 —— 那是外部人話,
+#   維持既有的字串判準,並在 `_is_retryable_punch_error` 明寫它是殘餘風險。
+PUNCH_ERR_TERMINAL = "terminal"    # 再試一次也一樣(帳密錯、環境缺、契約變了)
+PUNCH_ERR_TRANSIENT = "transient"  # 值得清 session 再試一次
+
+
+class PunchError(str):
+    """帶 `kind` 的錯誤訊息。
+
+    ★刻意是 `str` 的子類★:顯示端(會診信件的「⚠️ 查詢失敗（…）」)拿它去
+    格式化與 escape,行為必須★逐位元不變★;新增的只有機器讀得懂的 `kind`。
+    這樣「怎麼顯示」與「要不要重試」就不再共用同一個人話字串。
+    """
+    __slots__ = ("kind",)
+
+    def __new__(cls, text, kind: str = PUNCH_ERR_TRANSIENT):
+        obj = super().__new__(cls, str(text))
+        obj.kind = kind
+        return obj
+
+
 PUNCH_HOST = "10.20.8.47"
 PUNCH_LOGIN_URL = f"http://{PUNCH_HOST}/peoplesystem/electron_card/login.aspx"
 
@@ -132,7 +160,7 @@ def read_today_swipes(driver, username: str, password: str, *,
         from selenium.webdriver.common.keys import Keys
         import time as _time
     except Exception as e:  # noqa: BLE001
-        return [], f"selenium 不可用:{e}"
+        return [], PunchError(f"selenium 不可用:{e}", PUNCH_ERR_TERMINAL)
 
     wait = WebDriverWait(driver, wait_sec)
     try:
@@ -191,7 +219,7 @@ def read_today_swipes(driver, username: str, password: str, *,
                 except Exception:
                     break
         if not login_ok:
-            return [], "登入逾時/失敗"
+            return [], PunchError("登入逾時/失敗", PUNCH_ERR_TRANSIENT)
 
         # 系統日期(ROC) → 用來只挑今日的列;失敗退回本機日期
         sys_date = _date.today()
@@ -208,15 +236,26 @@ def read_today_swipes(driver, username: str, password: str, *,
         except Exception:
             logging.debug("[punch] 讀/解析網站系統日期例外", exc_info=True)
         if not _sys_date_parsed:
-            # [2026-07-26 審查 + 外審] 這是「改用本機日期猜」的降級。
-            # 舊版只在【拋例外】時記 debug —— 但 lb_systime 存在卻是空字串、ISO 日期、
-            # 或改版成不含「年」的格式時【不會拋例外】,`if "年" in txt` 直接不成立,
-            # 於是靜默沿用本機日期:本機時鐘/時區一偏差就挑不到今日的列 → 誤報沒打卡。
-            # 用明確的 parsed 旗標,任何沒解析成功的情況都要看得見。
-            logging.warning(
-                "[punch] 解析網站系統日期失敗(原文=%r),改用本機日期 %s —— "
-                "本機時鐘若有偏差可能挑錯今日列而誤報未打卡",
+            # ★[外審第四輪 R4-P2-02] 「猜不到今天是哪天」不是「今天沒打卡」★
+            # 上一版記了 warning 之後★仍然沿用本機日期繼續查,而且 error=None★
+            # —— 對呼叫端而言那是一個「查詢成功」的權威答案。於是:
+            #     portal 今天 = 09/02、本機時鐘 = 09/01(或 portal 改了日期格式)
+            #   → 挑不到今日的列 → swipes=[] → error=None
+            #   → `evaluate_account` 對今天有排班的人判 PUNCH_FAIL
+            #   → 醫師收到一封說他★沒打卡★的信,而他其實打了。
+            # 那句 warning 自己就寫著這個風險(「可能挑錯今日列而誤報未打卡」)
+            # —— 宣稱與行為要一致:證明不了就不要回答。
+            # ★方向★:顯示端對 error 有既有的「⚠️ 查詢失敗(…)」語意,
+            #   全體帳號一起變成查詢失敗是誠實的,而且會逼人來修版面;
+            #   分散的假「未打卡」不會。
+            # ★不可重試★:清 session 再登一次不會讓日期變得解析得出來,
+            #   只會把整批時間預算吃掉一半(後面的帳號變成「查詢逾時(略過)」)。
+            logging.error(
+                "[punch] ★無法確認打卡系統日期★(lb_systime 原文=%r)—— "
+                "不採用本機日期 %s 作答,本次回報查詢失敗(避免誤報未打卡)",
                 (_sys_date_raw or "")[:40], sys_date)
+            return [], PunchError("無法確認打卡系統日期(portal 版面可能改版)",
+                                  PUNCH_ERR_TERMINAL)
 
         # [2026-07-16 已定案,勿再改] **不可**把「#Gv_attppre 表格不存在」當成 portal 改版:
         # 空的 ASP.NET GridView(當日尚無刷卡紀錄)本來就【完全不渲染 <table>】,
@@ -252,15 +291,31 @@ def read_today_swipes(driver, username: str, password: str, *,
         return swipes, None
     except Exception as e:  # noqa: BLE001
         logging.debug("[punch] 讀打卡紀錄失敗", exc_info=True)
-        return [], str(e)[:40]
+        return [], PunchError(str(e)[:40], PUNCH_ERR_TRANSIENT)
 
 
 def _is_retryable_punch_error(err) -> bool:
     """單帳號登入失敗,是否值得「清 session 後重試一次」。純函式。
     逾時/連線/一般例外 → 可重試(多半是 portal 當下慢或 session 殘留);
-    明確帳密錯誤 / selenium 環境不可用 → 不重試(重試也一樣,只會浪費整批時間預算)。"""
+    明確帳密錯誤 / selenium 環境不可用 / 契約變了 → 不重試
+    (重試也一樣,只會浪費整批時間預算)。
+
+    ★[外審第四輪 R4-P3-01] 判準的優先序★
+    ① 我們自己產生的錯誤帶 `kind` → ★看資料★,不看字面;
+    ② 只有 portal 自己吐的 Alert 文字沒有 kind → 才退回字串比對。
+    ★殘餘風險(誠實揭露)★:院方若把登入 Alert 改成不含「密碼錯誤」的說法
+    (「帳號已停用」「登入驗證失敗」…),②會把終局失敗判成可重試 → 那個帳號
+    每輪多送一次帳密。目前沒有證據說院方已經改;真要根治得由 portal 端給出
+    可判別的訊號(狀態碼/欄位),不是在這裡多抄幾個中文詞 ——
+    多抄一個詞只是把賭注換一個地方下。
+    """
     if not err:
         return False
+    kind = getattr(err, "kind", None)
+    if kind == PUNCH_ERR_TERMINAL:
+        return False
+    if kind == PUNCH_ERR_TRANSIENT:
+        return True
     e = str(err)
     return not ("密碼錯誤" in e or "selenium 不可用" in e)
 

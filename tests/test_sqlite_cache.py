@@ -121,18 +121,31 @@ def test_load_returns_empty_without_query_when_initialize_fails(monkeypatch):
 # === [stability r4] 執行期(非啟動時)損壞復原 ===
 
 def test_is_corruption_error_classifies_lock_vs_malformed():
+    """★[外審第四輪 R4-P2-03] 這條測試自己也要更正★
+
+    原本它斷言 `disk I/O error` → 損壞 —— 那是把缺陷釘成正確答案:
+    「設備這一刻用不了」被說成「檔案內容已經腐化」,而後者是唯一一條
+    會把整份歷史快取隔離/刪除的路。判準改成★正面表列★之後,
+    只有 SQLite 親口說 image 壞了才算數。
+    """
     # 暫時鎖競爭 → 不是損壞，不應觸發重建
     assert sc._is_corruption_error(
         sqlite3.OperationalError("database is locked")) is False
     assert sc._is_corruption_error(
         sqlite3.OperationalError("database table is busy")) is False
-    # 真正的損壞 / 磁碟錯誤 → 視為損壞，應觸發重建
+    # 真正的損壞 → 視為損壞，應觸發重建
     assert sc._is_corruption_error(
         sqlite3.DatabaseError("database disk image is malformed")) is True
     assert sc._is_corruption_error(
-        sqlite3.OperationalError("disk I/O error")) is True
-    assert sc._is_corruption_error(
         sqlite3.DatabaseError("file is not a database")) is True
+    # ★設備/權限/容量問題 ≠ 內容腐化★:這些都是可逆的,不可以毀資料
+    for msg in ("disk I/O error", "database or disk is full",
+                "attempt to write a readonly database",
+                "unable to open database file"):
+        assert sc._is_corruption_error(sqlite3.OperationalError(msg)) is False, msg
+    # ★我們自己的 SQL 寫錯也不可以毀掉使用者的 30 天歷史★
+    assert sc._is_corruption_error(
+        sqlite3.ProgrammingError("no such column: nope")) is False
     # 非 sqlite 例外 → 不重建
     assert sc._is_corruption_error(ValueError("nope")) is False
 

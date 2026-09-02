@@ -233,19 +233,47 @@ def _ensure_initialized() -> bool:
             return False
 
 
-def _is_corruption_error(exc: BaseException) -> bool:
-    """[stability r4] 判斷例外是否為『DB 檔損壞』(需隔離重建)，而非暫時性鎖競爭。
+#: SQLite 自己說「這個檔的內容壞了」時用的訊息。★正面表列★ ——
+#: 只有引擎親口確認 image 壞掉,才允許走那條會毀掉整份歷史快取的路。
+_CORRUPTION_MARKERS = (
+    "database disk image is malformed",   # SQLITE_CORRUPT
+    "file is not a database",             # SQLITE_NOTADB
+    "file is encrypted or is not a database",
+    "malformed database schema",
+    "database corruption",
+)
 
-    sqlite3.OperationalError 是 DatabaseError 子類；'database is locked'/'busy' 屬
-    暫時鎖競爭，不應觸發重建(否則一次偶發鎖等待就拆連線、浪費)。其餘 DatabaseError
-    (malformed / not a database / disk I/O error 等)視為損壞。"""
+
+def _is_corruption_error(exc: BaseException) -> bool:
+    """這個例外是否★證明★ DB 檔的內容壞了(才可以隔離重建)。
+
+    ★[外審第四輪 R4-P2-03] 原本是【反面表列】,範圍太寬★
+    舊判準是「只要是 DatabaseError,訊息裡沒有 lock/busy 就算損壞」。
+    但 `sqlite3.OperationalError` 還涵蓋一整類【設備/權限/我們自己的錯】:
+
+        database or disk is full
+        attempt to write a readonly database
+        disk I/O error
+        unable to open database file
+
+    以及非 Operational 的 `ProgrammingError` / `IntegrityError`
+    (那是★我們自己的 SQL 寫錯★)。它們全都會被判成「損壞」,
+    然後走進唯一會毀資料的那條路:改名隔離 → 改名失敗就 `os.remove` 刪掉。
+    也就是說,磁碟暫時出問題(或我們自己改壞一句 SQL)可以把一份★完全健康★、
+    存著 30 天門診人數的 DB 直接刪除。
+    ★「無法使用」不等於「內容已腐化」★ —— 與這個 repo 一貫的
+    「unknown ≠ false」是同一條不變式。
+
+    改成正面表列:引擎親口說 image 壞了才算數;其餘一律當「這次用不了」,
+    由呼叫端停用本次快取、下次啟動自然重試(可逆、不毀資料)。
+    ★誠實邊界★:訊息比對仍然是字串判斷,但這裡問的是 SQLite★自己★的
+    錯誤字串(穩定的公開文案),不是別人的 UI 人話;而且判錯的方向是
+    ★保守★的 —— 認不出來就不刪。
+    """
     if not isinstance(exc, sqlite3.DatabaseError):
         return False
-    if isinstance(exc, sqlite3.OperationalError):
-        msg = str(exc).lower()
-        if "lock" in msg or "busy" in msg:
-            return False
-    return True
+    msg = str(exc).lower()
+    return any(m in msg for m in _CORRUPTION_MARKERS)
 
 
 def _reset_for_corruption(where: str, exc: BaseException) -> None:
@@ -329,6 +357,11 @@ def save_clinic_counts(all_doctors_data: dict,
         str(only_doctor_no) if only_doctor_no is not None else None
     )
     selected_doctor_has_valid_data = False
+    # ★[外審第四輪 R4-P3-03] 「寫不進去」不可以被讀成「確定沒有」★
+    #   只要有任何一筆該寫的東西沒能變成 row(payload 序列化失敗、日期鍵
+    #   解析不出來),這一次就★不是★一份完整的查詢結果 —— 拿它去
+    #   DELETE 舊 row 等於用「我不知道」覆蓋掉「上次確實知道的」。
+    selected_doctor_dropped = 0
     for doc_no, doc_data in all_doctors_data.items():
         normalized_doc_no = str(doc_no)
         if selected_doctor_no is not None and normalized_doc_no != selected_doctor_no:
@@ -340,17 +373,33 @@ def save_clinic_counts(all_doctors_data: dict,
         for k, payload in doc_data.items():
             date_iso = _normalize_date_key(k)
             if date_iso is None:
+                if selected_doctor_no is not None:
+                    selected_doctor_dropped += 1
                 continue
             try:
                 payload_str = json.dumps(payload, ensure_ascii=False, default=_json_default)
             except Exception:
                 logging.debug("[O22] 跳過無法序列化的 payload", exc_info=True)
+                if selected_doctor_no is not None:
+                    selected_doctor_dropped += 1
                 continue
             rows.append((normalized_doc_no, str(date_iso), payload_str, now))
 
+    # ★只有【確定完整】的結果才有資格整組取代★(R4-P3-03)
+    #   `only_doctor_no` 的契約是「用這次的查詢結果整組換掉這位醫師的 row」,
+    #   而 DELETE 是不可逆的。掉了任何一筆時退回★只 UPSERT 不 DELETE★:
+    #   寫得進去的更新、寫不進去的那幾天沿用舊值。
+    #   失效方向因此是「留著一列可能過期的快取」,而不是
+    #   「把一位醫師的整段歷史清成空的」—— 前者看得出來,後者無聲。
     should_clear_selected_doctor = (
         selected_doctor_no is not None and selected_doctor_has_valid_data
+        and not selected_doctor_dropped
     )
+    if selected_doctor_dropped:
+        logging.warning(
+            "[O22] %s 這次有 %d 筆寫不進快取(序列化/日期鍵)→ ★不清舊 row★"
+            "(避免把『寫不進去』記成『查到沒有』)",
+            selected_doctor_no, selected_doctor_dropped)
     if not rows and not should_clear_selected_doctor:
         return
     try:
