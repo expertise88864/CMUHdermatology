@@ -49,8 +49,10 @@ except Exception:
     CURRENT_VERSION = "?.?.?.?"
 
 from cmuh_common.single_instance import (  # noqa: E402
-    ensure_single_instance,
+    INSTANCE_ALREADY_RUNNING,
+    INSTANCE_UNKNOWN,
     release_single_instance,
+    startup_instance_state,
 )
 
 # ─── Logging ─────────────────────────────────────────────────────────────
@@ -162,6 +164,27 @@ def _run_once_via_core() -> int:
         return 1
 
 
+def single_instance_gate() -> str:
+    """開機單例判定 → 三態,並把「查不出來」記成一筆看得出來的 ERROR。
+
+    ★[R3-P2-04] 「查不出來」不是「拿到了」★。守護程式沒有自報 PID
+    (`write_pid_file` 只有打卡/會診在用),所以這裡沒有第二條路可走 ——
+    ★仍然照常啟動(fail-open)★:守護程式的存在理由就是「別的程式死了要有人
+    救」,因為 mutex API 壞掉就整個不啟動,等於在最需要它的那台機器上把安全網
+    拿掉,而這個狀態不會自己解除(2026-07-27 就發生過半死的程式整早沒人救)。
+    多一份守護程式的後果是可能重複重啟一次;沒有守護程式的後果是整天沒人救。
+
+    (這支的 logging 在 mutex 之前就設好了,所以可以直接記。)
+    """
+    state = startup_instance_state(WATCHDOG_DAEMON_MUTEX_NAME)
+    if state == INSTANCE_UNKNOWN:
+        logging.error(
+            "[單例] 無法確認是否已有另一個守護程式在執行(mutex 機制異常)"
+            "—— 仍照常啟動(沒有守護程式的代價更大)。若看到同一個程式被"
+            "重複重啟,請關掉所有守護程式視窗後重開機")
+    return state
+
+
 def main() -> int:
     """daemon loop — 每 30s 呼叫 watchdog_core.run_one_tick('outer')."""
     if "--once" in sys.argv:
@@ -180,7 +203,8 @@ def main() -> int:
                 "完整守護請用開機自動啟動(schtasks /RL HIGHEST)或以管理員身分啟動")
     except Exception:
         pass
-    if not ensure_single_instance(WATCHDOG_DAEMON_MUTEX_NAME):
+    _inst_state = single_instance_gate()
+    if _inst_state == INSTANCE_ALREADY_RUNNING:
         logging.info("watchdog daemon already running; exit this duplicate")
         return 0
 

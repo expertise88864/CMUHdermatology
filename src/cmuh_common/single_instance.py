@@ -40,6 +40,15 @@ def _configure_create_mutex(kernel32) -> None:
 #: 舊介面一律回 True(= 拿到了),呼叫端因此把「查不出來」當成「安全」。
 #: 排班程式尤其在意:它是整批 whole-file writer + 一個 git working tree,
 #: 兩個 instance 同時跑比一般 UI app 危險。
+#: ★一定要用模組 logger,不可以用 module-level `logging.warning(...)`★
+#: (外審 R3-P2-04 R1 P1-2):後者在 root 還沒有 handler 時會★隱式呼叫
+#: `basicConfig()`★裝一個 stderr handler —— 而各程式的 `setup_logging()`
+#: 又是靠 `basicConfig` 裝檔案 handler 的,「已經有 handler 就整個不做事」。
+#: 結果:單例判定發生在 logging 設定之前 → 檔案 handler 永遠裝不上 →
+#: log 檔一行都不會寫 → watchdog 把健康的行程判成 log stale 反覆重啟。
+#: `logging.getLogger(__name__)` 不會碰 basicConfig。
+_log = logging.getLogger(__name__)
+
 INSTANCE_ACQUIRED = "acquired"
 INSTANCE_ALREADY_RUNNING = "already_running"
 INSTANCE_UNKNOWN = "unknown"
@@ -56,6 +65,35 @@ def acquire_single_instance(mutex_name: str, retry_sec: float = 1.5) -> str:
     if ok and state["value"] == INSTANCE_UNKNOWN:
         return INSTANCE_UNKNOWN
     return INSTANCE_ACQUIRED if ok else INSTANCE_ALREADY_RUNNING
+
+
+def startup_instance_state(mutex_name: str, app_id: str = "") -> str:
+    """開機單例判定:三態,而且 UNKNOWN 時★再走一條不依賴 mutex API 的路★。
+
+    (外審 R3-P2-04 R1 P1-1)`CreateMutexW` 壞掉時,原本只能回「不知道」而各程式
+    一律照常執行。但打卡/會診都會★自報 PID★(`pidfile.write_pid_file`),而那份
+    紀錄的驗證(行程還在、是 python 系、建立時間相符 → 沒有 PID 重用)
+    ★完全不經過 mutex API★ —— 查得到活著的第二份,就是確定「已在執行中」。
+
+    ★這不是「完全擋得住」★:pidfile 可能是舊格式、psutil 不可用、或對方還沒寫
+    到那一步 —— 那時仍然回 UNKNOWN,由呼叫端依自己的處置決定。誠實標註,
+    因為打卡那條路的重複代價很高(repo 內有「清理重複打卡程式.ps1」這種
+    現場工具就是證據),不可以宣稱一個做不到的保證。
+    """
+    state = acquire_single_instance(mutex_name)
+    if state != INSTANCE_UNKNOWN or not app_id:
+        return state
+    try:
+        from cmuh_common.pidfile import read_verified_pid  # noqa: PLC0415
+        other = read_verified_pid(app_id)
+    except Exception:
+        _log.warning("[單例] mutex 查不出來,pidfile 這條路也失敗", exc_info=True)
+        return INSTANCE_UNKNOWN
+    if other is not None:
+        _log.error("[單例] mutex 機制異常,但 pidfile 查到另一個 %s 還活著"
+                   "（PID=%s）→ 視為已在執行中", app_id, other)
+        return INSTANCE_ALREADY_RUNNING
+    return INSTANCE_UNKNOWN
 
 
 def ensure_single_instance(mutex_name: str, retry_sec: float = 1.5,
@@ -109,20 +147,22 @@ def ensure_single_instance(mutex_name: str, retry_sec: float = 1.5,
                 if not handle:
                     # ★這裡【不知道】有沒有別人拿著★:回 True 是舊介面的
                     #   fail-open 相容行為,狀態要如實標成 UNKNOWN。
-                    logging.warning("CreateMutexW failed for %s (err=%s)", mutex_name, last_err)
+                    _log.warning("CreateMutexW failed for %s (err=%s)",
+                                 mutex_name, last_err)
                     _mark(INSTANCE_UNKNOWN)
                     return True
 
                 _instance_mutex_handles[mutex_name] = handle
                 _mark(INSTANCE_ACQUIRED)
                 if attempt:
-                    logging.info(
+                    _log.info(
                         "ensure_single_instance: 取得 mutex %s（重試 %d 次後）",
                         mutex_name, attempt)
                 return True
             except Exception as exc:
                 # 同上:mutex 機制本身壞了 → 不知道,不是「安全」。
-                logging.warning("ensure_single_instance failed for %s: %s", mutex_name, exc)
+                _log.warning("ensure_single_instance failed for %s: %s",
+                             mutex_name, exc)
                 _mark(INSTANCE_UNKNOWN)
                 return True
 
@@ -161,5 +201,6 @@ def is_instance_running(mutex_name: str) -> bool:
                 pass
         return last_err in (_ERROR_ALREADY_EXISTS, _ERROR_ACCESS_DENIED)
     except Exception:
-        logging.debug("is_instance_running failed for %s", mutex_name, exc_info=True)
+        _log.debug("is_instance_running failed for %s", mutex_name,
+                   exc_info=True)
         return False

@@ -64,9 +64,13 @@ from cmuh_common.logging_setup import (  # noqa: E402
 from cmuh_common.paths import (
     SPAWN_CHILD_EXITED_ORDERLY as _SPAWN_CHILD_EXITED_ORDERLY,
 )  # noqa: E402
+from cmuh_common.cross_process_claim import exclusive_claim  # noqa: E402
 from cmuh_common.paths import get_app_dir, get_settings_dir, restart_self  # noqa: E402
 from cmuh_common.platform_win import set_dpi_awareness  # noqa: E402
-from cmuh_common.single_instance import ensure_single_instance, release_single_instance  # noqa: E402
+from cmuh_common.single_instance import (  # noqa: E402
+    INSTANCE_ALREADY_RUNNING, INSTANCE_UNKNOWN,
+    release_single_instance, startup_instance_state,
+)
 from cmuh_common.task_gate import (  # noqa: E402
     ActiveTaskGate, current_worker_superseded, worker_lease_scope,
 )
@@ -1323,6 +1327,38 @@ def _verify_clock_recorded(driver, get_loc, act_name: str,
 def perform_clock_action(driver, wait, acc, is_in: bool,
                         check_start: dt_time, check_end: dt_time,
                         dry_run: bool = False, task_label: str = "") -> None:
+    """★整段包在跨行程宣告裡★(外審 R3-P2-04 R2 P1)。
+
+    「先查刷卡表、沒紀錄才打」是 check-then-act:查完到點下去之間還有 1~5 秒
+    的隨機延遲與數次頁面操作,而★重讀刷卡表擋不住★(讀的是自己這個瀏覽器的
+    DOM,別的行程打的卡不會出現在裡面)。所以要序列化的是【查+打】整段,
+    不是只有點擊那一下 —— 宣告因此包住整個函式,而不是包在延遲之後。
+
+    宣告的鍵含★帳號 + 上/下班 + 打卡窗★:不同帳號、不同窗本來就該平行跑,
+    擋掉它們只會讓打卡變慢。dry_run 不宣告(它不會真的送出)。
+    """
+    if dry_run:
+        return _perform_clock_action_locked(
+            driver, wait, acc, is_in, check_start, check_end, dry_run,
+            task_label)
+    key = (f"autoclock|{acc.get('username', '?')}|{'in' if is_in else 'out'}"
+           f"|{check_start}-{check_end}|{date.today().isoformat()}")
+    with exclusive_claim(key) as owned:
+        if not owned:
+            logging.warning(
+                "[單例] 另一個 autoclock 正在為 %s 執行 %s 的打卡 → 本次略過"
+                "(避免重複打卡;對方若當掉,下一輪會接手)",
+                acc.get("username", "?"), "上班" if is_in else "下班")
+            return
+        return _perform_clock_action_locked(
+            driver, wait, acc, is_in, check_start, check_end, dry_run,
+            task_label)
+
+
+def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
+                                 check_start: dt_time, check_end: dt_time,
+                                 dry_run: bool = False,
+                                 task_label: str = "") -> None:
     def get_loc(key):
         return (getattr(By, LOCATORS[key][0].upper()), LOCATORS[key][1])
 
@@ -2555,14 +2591,53 @@ def _run_test_ui() -> None:
 # =============================================================================
 # 主入口
 # =============================================================================
+def single_instance_gate() -> str:
+    """開機單例判定 → 三態(呼叫端據此決定要不要繼續)。
+
+    ★[R3-P2-04] 「查不出來」不是「拿到了」★:舊介面在 mutex API 壞掉時一律
+    回 True。改用三態,而且 UNKNOWN 時★再走 pidfile 這條不依賴 mutex API 的
+    路★(`startup_instance_state`)—— 打卡程式本來就會自報 PID。
+
+    ★兩條都查不出來時仍然繼續(fail-open)★,但理由要說對:
+    * 刷卡表的檢查★不是原子的去重★ —— 檢查完到真的點下去之間還有 1~5 秒的
+      隨機延遲,兩份同時跑仍可能都讀到「尚無紀錄」而各打一次
+      (外審 R3-P2-04 R1 P1-1 指出的 check-then-act;repo 內的
+       「清理重複打卡程式.ps1」就是這個現象留下的現場工具)。所以它★降低★
+      風險,不能宣稱擋得住;
+    * 反過來 fail-closed 的代價是★整天不打卡而且沒有補卡提醒★
+      (提醒本身也在這支程式裡),而 mutex 壞掉這個狀態不會自己解除
+      —— 與 2026-08-05 事故的教訓一致:fail-closed 前要先證明狀況會解除。
+    所以:照常跑,但把「不知道」留成一筆看得出來的紀錄。
+    """
+    return startup_instance_state(AUTOCLOCK_MUTEX_NAME, "autoclock")
+
+
+def report_single_instance_state(state: str) -> None:
+    """把「查不出來」記成一筆看得出來的 ERROR。
+
+    ★一定要在 `_setup_clock_logging()` 之後才呼叫★:單例判定發生在 logging
+    設定之前,那時候記的東西進不了 autoclock.log(只會掉到 stderr,而 .pyw
+    根本沒有 console)。
+    """
+    if state != INSTANCE_UNKNOWN:
+        return
+    logging.error(
+        "[單例] 無法確認是否已有另一個 autoclock 在執行(mutex 機制異常,"
+        "pidfile 也查不出來)—— 仍照常執行。刷卡表檢查會降低重複打卡的機會"
+        "但★不保證★(檢查到點下去之間還有幾秒):若右下角出現重複的打卡"
+        "通知,請關掉所有 autoclock 視窗後重開機")
+
+
 def main() -> None:
-    if not ensure_single_instance(AUTOCLOCK_MUTEX_NAME):
+    _inst_state = single_instance_gate()
+    if _inst_state == INSTANCE_ALREADY_RUNNING:
         return
     # DPI 感知：設定視窗在高 DPI/縮放螢幕上才不會模糊，並與其他程式一致
     set_dpi_awareness()
     try:
         _setup_clock_logging()
         logging.info("=== autoclock v%s 啟動 ===", CURRENT_VERSION)
+        report_single_instance_state(_inst_state)
         # [2026-08-04] 自報 PID 給 watchdog 的半死救援用。實機曾因 cmdline 比對
         # 三重失效(WMIC 已移除/CIM 對提權行程回傳空 CommandLine/cmdline 不含
         # 啟動器檔名)而連續兩小時救不了半死的自己(見 cmuh_common/pidfile)。

@@ -7,6 +7,9 @@ import types
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import watchdog_runner  # noqa: E402
+from cmuh_common.single_instance import (  # noqa: E402
+    INSTANCE_ACQUIRED, INSTANCE_ALREADY_RUNNING,
+)
 
 
 def test_once_mode_bypasses_daemon_mutex(monkeypatch):
@@ -15,8 +18,12 @@ def test_once_mode_bypasses_daemon_mutex(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["watchdog_runner.py", "--once"])
     monkeypatch.setattr(watchdog_runner, "_run_once_via_core",
                         lambda: calls.append("once") or 0)
-    monkeypatch.setattr(watchdog_runner, "ensure_single_instance",
-                        lambda name: calls.append(("ensure", name)) or True)
+    # [R3-P2-04] 入口改用三態 `startup_instance_state`(舊介面把「查不出來」
+    #   當成「拿到了」)。這條測試的意圖不變:--once 不搶常駐單例。
+    monkeypatch.setattr(
+        watchdog_runner, "startup_instance_state",
+        lambda name, app_id="": calls.append(("acquire", name))
+        or INSTANCE_ACQUIRED)
 
     assert watchdog_runner.main() == 0
     assert calls == ["once"]
@@ -28,13 +35,15 @@ def test_daemon_duplicate_exits_without_loop(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["watchdog_runner.py"])
     monkeypatch.setattr(watchdog_runner, "_setup_logging",
                         lambda: calls.append("logging"))
-    monkeypatch.setattr(watchdog_runner, "ensure_single_instance",
-                        lambda name: calls.append(("ensure", name)) or False)
+    monkeypatch.setattr(
+        watchdog_runner, "startup_instance_state",
+        lambda name, app_id="": calls.append(("acquire", name))
+        or INSTANCE_ALREADY_RUNNING)
 
     assert watchdog_runner.main() == 0
     assert calls == [
         "logging",
-        ("ensure", watchdog_runner.WATCHDOG_DAEMON_MUTEX_NAME),
+        ("acquire", watchdog_runner.WATCHDOG_DAEMON_MUTEX_NAME),
     ]
 
 
@@ -58,8 +67,10 @@ def test_daemon_releases_mutex_when_loop_exits(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["watchdog_runner.py"])
     monkeypatch.setattr(watchdog_runner, "_setup_logging",
                         lambda: calls.append("logging"))
-    monkeypatch.setattr(watchdog_runner, "ensure_single_instance",
-                        lambda name: calls.append(("ensure", name)) or True)
+    monkeypatch.setattr(
+        watchdog_runner, "startup_instance_state",
+        lambda name, app_id="": calls.append(("acquire", name))
+        or INSTANCE_ACQUIRED)
     monkeypatch.setattr(watchdog_runner, "release_single_instance",
                         lambda: calls.append("release"))
     monkeypatch.setattr(watchdog_runner.time, "sleep", stop_loop)
@@ -72,7 +83,7 @@ def test_daemon_releases_mutex_when_loop_exits(monkeypatch):
 
     assert calls == [
         "logging",
-        ("ensure", watchdog_runner.WATCHDOG_DAEMON_MUTEX_NAME),
+        ("acquire", watchdog_runner.WATCHDOG_DAEMON_MUTEX_NAME),
         ("tick", "outer"),
         "release",
     ]

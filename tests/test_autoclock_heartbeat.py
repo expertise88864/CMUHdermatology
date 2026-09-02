@@ -538,7 +538,13 @@ def test_process_clock_task_rebuilds_dead_session_behavior(monkeypatch):
 
 
 def test_perform_clock_action_marks_done_on_success_and_record():
-    """原始碼守門：打卡成功 與 已有紀錄 兩條路徑都標記本窗完成，避免 re-fire 重登入。"""
+    """原始碼守門：打卡成功 與 已有紀錄 兩條路徑都標記本窗完成，避免 re-fire 重登入。
+
+    ★判準要涵蓋抽出去的那一支★:[R3-P2-04 R2] 打卡本體被抽成
+    `_perform_clock_action_locked`(外層只負責跨行程宣告),★這條守衛原本盯著
+    `perform_clock_action` 的原始碼,一次抽函式就靜默失效了★ —— 意圖沒變,
+    改成兩支合起來看(這個 repo 第三次踩到同一個形狀)。"""
     import inspect
-    src = inspect.getsource(autoclock.perform_clock_action)
+    src = (inspect.getsource(autoclock.perform_clock_action)
+           + inspect.getsource(autoclock._perform_clock_action_locked))
     assert src.count("_mark_clock_done(task_label") >= 2

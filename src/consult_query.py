@@ -99,7 +99,8 @@ from cmuh_common.platform_win import is_admin, run_as_admin  # noqa: E402
 from cmuh_common.process_launch import launch_python_script  # noqa: E402
 from cmuh_common.win32_safe import call_with_timeout  # noqa: E402
 from cmuh_common.single_instance import (  # noqa: E402
-    ensure_single_instance, release_single_instance,
+    INSTANCE_ACQUIRED, INSTANCE_ALREADY_RUNNING, INSTANCE_UNKNOWN,
+    ensure_single_instance, release_single_instance, startup_instance_state,
 )
 from cmuh_common.task_gate import (  # noqa: E402
     ActiveTaskGate, current_worker_superseded, worker_lease_scope,
@@ -10875,6 +10876,31 @@ def _check_update_in_background() -> None:
 # =============================================================================
 # 主入口
 # =============================================================================
+def single_instance_gate() -> str:
+    """開機單例判定 → 三態(呼叫端據此決定要不要繼續)。
+
+    ★[R3-P2-04] 「查不出來」不是「拿到了」★:舊介面在 mutex API 壞掉時一律
+    回 True。改用三態,而且 UNKNOWN 時★再走 pidfile 這條不依賴 mutex API 的
+    路★ —— 這支程式本來就會自報 PID(`write_pid_file("consult_query")`)。
+
+    ★這裡刻意不寫任何 log★:被擋退的行程要完全沉默,否則 log 的 mtime 會污染
+    watchdog 的「陳舊」判斷(見 `main()` 裡那段既有說明)。「不知道」那一筆
+    由 `report_single_instance_state()` 在 `_setup_logging()` 之後補記。
+    """
+    return startup_instance_state(MUTEX_NAME, "consult_query")
+
+
+def report_single_instance_state(state: str) -> None:
+    """把「查不出來」記成一筆看得出來的 ERROR(★要在 logging 設好之後★)。"""
+    if state != INSTANCE_UNKNOWN:
+        return
+    logging.error(
+        "[單例] 無法確認是否已有另一個會診查詢在執行(mutex 機制異常,"
+        "pidfile 也查不出來)—— 仍照常執行:這支沒有人在前面按確定,擋下來"
+        "等於整天不跑,而這個狀態不會自己解除。若看到重複的會診通知,"
+        "請關掉所有會診查詢視窗後重開機")
+
+
 def main() -> None:
     try:
         # 強制以系統管理員身份執行：systemftp.exe manifest 標記 requireAdministrator，
@@ -10895,11 +10921,13 @@ def main() -> None:
         # 修法：mutex check 放在 _setup_logging 之前。被擋退的 process 完全沉默
         # exit (沒 file handler 被建立 → log mtime 不會被新 process 污染)。
         # --configure 例外 (設定模式不搶 mutex，要寫 log 可)。
+        # --configure 不搶常駐單例 → 那條路沒有「不知道」可談。
+        _inst_state = INSTANCE_ACQUIRED
         if "--configure" not in args:
             # 先做 mutex 試探 — 不是 first_instance 就靜默退出
-            # ensure_single_instance 內部只用 winapi，不依賴 logging
-            first_instance = ensure_single_instance(MUTEX_NAME)
-            if not first_instance:
+            # acquire_single_instance 內部只用 winapi，不依賴 logging
+            _inst_state = single_instance_gate()
+            if _inst_state == INSTANCE_ALREADY_RUNNING:
                 # --run-now 仍要寫 RUNNOW_FLAG 給常駐實例
                 if "--run-now" in args:
                     try:
@@ -10912,6 +10940,7 @@ def main() -> None:
 
         # ↓ 以下只有 first_instance 才會跑 ↓
         _setup_logging()
+        report_single_instance_state(_inst_state)
 
         # ★把告警節流狀態讀回來★ 這支程式會被 watchdog 重啟(log 停更 180 秒),
         #   狀態只放記憶體的話,每重啟一次冷卻就歸零 → 同一波故障重複洗信箱。

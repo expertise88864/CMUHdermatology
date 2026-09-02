@@ -57,8 +57,11 @@ def test_task_skips_accounts_blocked_by_auth_failure():
 
 
 def test_auth_error_handler_marks_the_block():
+    # ★判準要涵蓋抽出去的那一支★(同上):打卡本體現在在
+    #   `_perform_clock_action_locked`,外層只負責跨行程宣告。
     import inspect
-    src = inspect.getsource(ac.perform_clock_action)
+    src = (inspect.getsource(ac.perform_clock_action)
+           + inspect.getsource(ac._perform_clock_action_locked))
     i_exc = src.index("except ClockAuthError")
     assert "_mark_auth_failed(" in src[i_exc:], \
         "ClockAuthError 必須記下當窗封鎖,否則每分鐘 re-fire 會重登到帳號被鎖"

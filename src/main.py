@@ -270,7 +270,8 @@ from cmuh_common.ui_messages import (
 )
 from cmuh_common.deps_runtime import ensure_dependencies as _ensure_deps_runtime
 from cmuh_common.single_instance import (
-    ensure_single_instance, release_single_instance,
+    INSTANCE_ALREADY_RUNNING, INSTANCE_UNKNOWN,
+    acquire_single_instance, release_single_instance,
 )
 from cmuh_common import program_launcher as _pl
 from cmuh_common.program_launcher import (
@@ -17559,6 +17560,38 @@ class AutomationApp:
                 put_ui_message(self.ui_queue, UiAlertErrorMessage(
                     title="更新錯誤", msg=f"檢查更新時發生錯誤: {e}"))
 
+def single_instance_gate() -> str:
+    """開機單例判定 → 三態;不確定時★問使用者★,取消就離開。
+
+    ★[R3-P2-04] 「拿到了」與「查不出來」不是同一件事★:舊的
+    `ensure_single_instance` 在 mutex API 壞掉時一律回 True,呼叫端因此把
+    「不知道」當成「安全」—— 而雙開的後果是兩份 keyboard hook 搶同一組熱鍵、
+    兩個 Chrome、log rotate 撞檔。
+
+    處置沿用排班程式(`scheduler.py`)的作風:★不 fail-closed★
+    (診間開不了程式的代價比雙開更大),而是明確告訴使用者現在無法確認,
+    由人決定要不要繼續。主程式沒有自報 PID,所以沒有第二條路可查。
+    """
+    state = acquire_single_instance(
+        "Local\\CMUH_Skin_Main_SingleInstance_v1")
+    if state == INSTANCE_ALREADY_RUNNING:
+        ctypes.windll.user32.MessageBoxW(
+            0, "主程式已在執行中。", "中國醫皮膚科主程式", 0x40 | 0x1000)
+        sys.exit(0)
+    if state == INSTANCE_UNKNOWN:
+        logging.error("[單例] 無法確認是否已有另一個主程式在執行"
+                      "（mutex 機制異常）")
+        if ctypes.windll.user32.MessageBoxW(
+                0,
+                "無法確認是否已經有另一個主程式在執行（系統的單例機制異常）。"
+                "\n\n若你確定沒有另一個視窗開著，可以按「確定」繼續；"
+                "\n不確定的話請按「取消」，先關掉所有主程式視窗、重開機後再試。"
+                "\n\n（兩份同時執行會搶同一組熱鍵，按鍵可能跑到錯的視窗。）",
+                "中國醫皮膚科主程式", 0x30 | 0x1 | 0x1000) != 1:   # 1 = IDOK
+            sys.exit(0)
+    return state
+
+
 # --- 主程式執行區 ---
 if __name__ == "__main__":
     # [修正 1] 強制執行記憶體回收，清除 DependencyInstaller 留下的 Tkinter 變數
@@ -17571,10 +17604,7 @@ if __name__ == "__main__":
     _set_windows_app_user_model_id()
 
     # 【穩定性 2026.05.20】Mutex 單例 — 防雙開搶 keyboard hook / 兩個 Chrome / log rotate 撞檔
-    if not ensure_single_instance("Local\\CMUH_Skin_Main_SingleInstance_v1"):
-        ctypes.windll.user32.MessageBoxW(
-            0, "主程式已在執行中。", "中國醫皮膚科主程式", 0x40 | 0x1000)
-        sys.exit(0)
+    single_instance_gate()
     import atexit as _atexit_mtx
     _atexit_mtx.register(release_single_instance)
 

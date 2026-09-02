@@ -6,6 +6,7 @@
 - setup_logging：RotatingFileHandler，上限 5MB × 3 份備份
 """
 import logging
+import os
 import sys
 from logging.handlers import RotatingFileHandler
 from queue import Empty, Full, Queue
@@ -53,15 +54,32 @@ def setup_logging(
 ) -> RotatingFileHandler:
     """設定主 logger（RotatingFileHandler）。回傳 handler 以便外部需追加 handler 時使用。
 
-    注意：本函式只 basicConfig 一次；多次呼叫第二次會被忽略。
+    同一個 log 檔重複呼叫 → 回原本那個 handler（不會裝兩份、不會寫兩行）。
     .pyw 無 console，因此不附加 StreamHandler。
+
+    ★不可以靠 `basicConfig` 裝檔案 handler★(外審 R3-P2-04 R1 P1-2 / R3-P2-01):
+    `basicConfig` 的語意是「root 已經有 handler 就整個不做事」,而★任何在這之前
+    發生的 module-level `logging.warning(...)` 都會讓 Python 隱式裝一個 stderr
+    handler★(例如單例判定 —— 它必然發生在 logging 設定之前)。那之後檔案
+    handler 就再也裝不上:log 檔一行都不會寫,而 watchdog 是靠 log 的 mtime 判
+    「陳舊」的 → 健康的行程被反覆殺掉重啟。改成★明確把 handler 掛上去★,
+    不管 root 現在有沒有別人。
     """
     # 【清理 2026-05-21】delay 參數自 Python 3.9 已存在（README 要 Py 3.10+），TypeError fallback 死分支
+    root = logging.getLogger()
+    want = os.path.abspath(log_file)
+    for h in list(root.handlers):
+        if (isinstance(h, RotatingFileHandler)
+                and os.path.abspath(getattr(h, "baseFilename", "")) == want):
+            root.setLevel(level)
+            return h                   # 同一個檔已經設過 → 維持原本的語意
     handler = RotatingFileHandler(
         log_file, maxBytes=max_bytes, backupCount=backup_count,
         encoding='utf-8', delay=True,
     )
-    logging.basicConfig(level=level, format=fmt, handlers=[handler])
+    handler.setFormatter(logging.Formatter(fmt))
+    root.addHandler(handler)
+    root.setLevel(level)
     return handler
 
 
