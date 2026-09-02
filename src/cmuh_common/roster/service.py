@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import time
+from calendar import monthrange
 from datetime import date, timedelta
 from typing import NamedTuple
 
@@ -39,9 +40,11 @@ from cmuh_common.roster.model import (
     dedupe_codes, duplicated_codes, roc,
 )
 from cmuh_common.roster.solve_day import (
-    TWO_PGY_PHOTO_ONLY, apply_locked_biopsy_adjustment,
+    TWO_PGY_PHOTO_ONLY, apply_locked_adjustments,
     arbitration_order, batch_biopsy_slots, biopsy_quota_warnings,
+    clerk_batches_ended_by, clerk_seat_band_warnings,
     day_input_fingerprint, day_owner_batch,
+    is_follow_slot,
     BIOPSY, PHOTO, REST, STUDENT_SESSIONS, TREATMENT, DaySolveInput,
     month_solve_day,
     person_course_stats,
@@ -1116,7 +1119,35 @@ class RosterService:
         if day_slots is None:
             day_slots = self.storage.load_month(ym).get("day_slots") or {}
         order = arbitration_order(inp)
-        _y, _m = int(ym[:4]), int(ym[5:7])
+        active = self._active_batch_ids(inp, order, day_slots)
+        counts = self._course_biopsy_counts(ym, order, inp.course_days)
+        slots, more = batch_biopsy_slots(inp, order)
+        # ★cap 的分母要先套鎖定調整★(外審 RS-28 R2 P2):與求解器同一份實作
+        #   (鎖定格先拿掉、有效鎖定切片加回)—— 否則求解器合法排出的平均結果
+        #   會被這裡誤報「超過配額」,反向也會漏掉等量的超額。
+        apply_locked_adjustments(inp, order, slots)
+        caps = {b.id: max(1, len(slots.get(b.id, ())) // len(b.members))
+                for b in inp.clerk_batches if b.members}
+        return biopsy_quota_warnings(inp.clerk_batches, counts,
+                                     batch_more=more, only_ids=active,
+                                     caps=caps)
+
+    def _active_batch_ids(self, inp, order, day_slots) -> set:
+        """★本月真的排到東西的梯次★ → {梯次 id}(求解器 `solved_batch_ids`
+        在 service 這一側的等價物)。
+
+        邊界梯次(這個月一天都還沒排)本來就是 0 次,點名它只是噪音。
+        ★不在本月開診格網裡的鍵不算數★(外審 RS-28 R1 P2):鎖定日事後變成
+        假日/整日停診時,RF-02 會★原樣保留★那一格 —— 它在本月的鍵裡,卻不在
+        格網裡。求解器是在迭代 `inp.grid` 時才把梯次加進去的,拿年月當等價物
+        會把整梯點亮成「排過了」而誤報。★這一個條件同時就是月份過濾★:
+        `inp.grid` 只含本月日期,他月殘留鍵必然不在裡面。之前另外寫的
+        `(d.year, d.month)` 檢查已被它完全涵蓋 —— 突變驗證抓到那行是死碼
+        (反例被這裡先擋住),★量不到的守衛是死碼★,故刪除而不是留著誤導。
+
+        ★只有一份★(RS-33):切片配額與跟診區間兩個現況點名共用 —— 兩邊各算
+        一次的話,只會有一邊跟著求解器的判準走。
+        """
         active: set = set()
         for iso in day_slots or {}:
             try:
@@ -1124,15 +1155,6 @@ class RosterService:
             except (ValueError, TypeError):
                 continue
             if d not in inp.grid:
-                # ★不在本月開診格網裡的鍵不算「本月排到了東西」★(外審 RS-28
-                #   R1 P2):鎖定日事後變成假日/整日停診時,RF-02 會★原樣保留★
-                #   那一格 —— 它在本月的鍵裡,卻不在格網裡。求解器的
-                #   `solved_batch_ids` 是在迭代 `inp.grid` 時才加入梯次的,
-                #   拿年月當等價物會把整梯點亮成「排過了」而誤報輪不到。
-                #   ★這一個條件同時就是月份過濾★:`inp.grid` 只含本月日期,
-                #   他月殘留鍵必然不在裡面。之前另外寫的 `(d.year, d.month)`
-                #   檢查已被它完全涵蓋 —— 突變驗證抓到那行是死碼(反例被這裡
-                #   先擋住),★量不到的守衛是死碼★,故刪除而不是留著誤導。
                 continue
             owner = day_owner_batch(order, d)
             if owner is not None:
@@ -1140,17 +1162,72 @@ class RosterService:
         # ★不加「active 是空的就早退」★:`only_ids=active` 本來就把它們全部
         #   濾掉了,那個早退量不出任何差別 —— 量不到的守衛是死碼,留著只會
         #   讓人以為「不點名」是在那裡決定的(同 RS-27 拿掉的那一個)。
-        counts = self._course_biopsy_counts(ym, order, inp.course_days)
-        slots, more = batch_biopsy_slots(inp, order)
-        # ★cap 的分母要先套鎖定調整★(外審 RS-28 R2 P2):與求解器同一份實作
-        #   (鎖定格先拿掉、有效鎖定切片加回)—— 否則求解器合法排出的平均結果
-        #   會被這裡誤報「超過配額」,反向也會漏掉等量的超額。
-        apply_locked_biopsy_adjustment(inp, order, slots)
-        caps = {b.id: max(1, len(slots.get(b.id, ())) // len(b.members))
-                for b in inp.clerk_batches if b.members}
-        return biopsy_quota_warnings(inp.clerk_batches, counts,
-                                     batch_more=more, only_ids=active,
-                                     caps=caps)
+        return active
+
+    def validate_course_seat_band(self, ym: str, *, inp=None,
+                                  day_slots=None) -> list:
+        """[RS-33] Clerk 整梯跟診次數的【現況】點名 → 警告清單。
+
+        ★求解當下說過的話,手改之後要有人再說一次★(與 RS-28 的切片配額同一個
+        理由,判準也共用同一支 `clerk_seat_band_warnings`)。而且★上限那一半
+        只有在這裡才量得到★:自動排班到上限就把座位留空,永遠排不出超額
+        —— 超過上限必然來自月曆上的手動調整,求解器那一側看不到。
+        """
+        inp = self.build_day_input(ym) if inp is None else inp
+        if day_slots is None:
+            day_slots = self.storage.load_month(ym).get("day_slots") or {}
+        order = arbitration_order(inp)
+        _y, _m = int(ym[:4]), int(ym[5:7])
+        return clerk_seat_band_warnings(
+            inp.clerk_batches,
+            self._course_seat_counts(ym, order, inp.course_days),
+            only_ids=self._active_batch_ids(inp, order, day_slots),
+            # 與求解器同一個判準:整梯走完才談「偏少」(跨月梯次排完第一個月
+            # 時必然不足,那是還沒排到、不是事實)。
+            ended_ids=clerk_batches_ended_by(
+                inp.clerk_batches, date(_y, _m, monthrange(_y, _m)[1])))
+
+    def _course_seat_counts(self, ym: str, order, course_days=()) -> dict:
+        """整梯的【跟診】次數,逐日以勝者梯次歸屬 → {(梯次 id, 代號): 次數}。
+
+        與 `_course_biopsy_counts` 走同一條路(三個月都掃、只採各月的本月鍵、
+        掉出開診格網的不算、逐日以勝者梯次歸屬)——★理由完全相同★:Clerk 代號
+        跨梯重用,拿代號統計當梯次命名空間會把前一梯的次數算進後一梯。
+        差別只在數的是哪一種格 → `is_follow_slot`(與週期統計★共用同一份定義★)。
+
+        ★這裡刻意【不】濾梯次成員★:跟診房裡 PGY 與 Clerk 坐在一起,直覺上
+        該把 PGY 濾掉 —— 但 `clerk_seat_band_warnings` 本來就★只讀
+        `b.members`★,非成員的鍵永遠沒有人去看它;而唯一會讓兩者撞在一起的
+        狀態(同一個代號同時是 PGY 與該梯 Clerk,見
+        `validate_roster_identity_invariants`)裡,那個代號本來就在
+        `members` 內 —— 濾了也照樣算進去。也就是說那道判準在★每一個可達
+        狀態★下都分不出勝負。★量不到的守衛是死碼★(同 RS-28 拿掉的
+        `(d.year, d.month)`),留著只會讓人以為「不算 PGY」是在這裡決定的。
+        """
+        counts: dict = {}
+        for m in (prev_ym(ym), ym, next_ym(ym)):
+            _my, _mm = int(m[:4]), int(m[5:7])
+            for iso, sessions in (self.storage.load_month(m)
+                                  .get("day_slots") or {}).items():
+                try:
+                    d = date.fromisoformat(iso)
+                except (ValueError, TypeError):
+                    continue
+                if (d.year, d.month) != (_my, _mm):
+                    continue
+                if course_days and iso not in course_days:
+                    continue
+                owner = day_owner_batch(order, d)
+                if owner is None:
+                    continue
+                for _s, slots in (sessions or {}).items():
+                    for slot, people in (slots or {}).items():
+                        if not is_follow_slot(slot):
+                            continue
+                        for c in (people or []):
+                            key = (owner.id, str(c))
+                            counts[key] = counts.get(key, 0) + 1
+        return counts
 
     def _course_biopsy_counts(self, ym: str, order, course_days=()) -> dict:
         """整梯的切片次數,★逐日以勝者梯次歸屬★ → {(梯次 id, 代號): 次數}。
@@ -1324,6 +1401,9 @@ class RosterService:
         # [RS-28] 切片配額的現況點名(輪不到 / 次數不均)——手改過的格也算數。
         out.extend(self.validate_course_quota(ym, inp=inp,
                                               day_slots=day_slots)[0])
+        # [RS-33] 跟診時段落在 7-11 之外的現況點名(★超過上限只有手改得出來★)。
+        out.extend(self.validate_course_seat_band(ym, inp=inp,
+                                                  day_slots=day_slots))
         closures = self.clinic_closures(ym)
         for iso in sorted(day_slots):
             try:

@@ -75,17 +75,28 @@
 from __future__ import annotations
 
 import zlib
+from calendar import monthrange
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 
 from cmuh_common.roster.model import (
-    STUDENT_SESSIONS, dedupe_codes, is_weekend,
+    CLERK_COURSE_DAYS, STUDENT_SESSIONS, dedupe_codes, is_weekend,
 )
 
 PHOTO = "照光"        # 每時段必排 1 PGY（含週三下午），最優先
 TREATMENT = "治療室"  # 每時段 1 PGY，但週三下午休診不排
 BIOPSY = "切片室"
 REST = "放假"
+
+
+def is_follow_slot(slot) -> bool:
+    """這一格算不算「跟診」——★特別格以外的一律是★（房號可為任意字串）。
+
+    ★只留一份定義★：週期統計（`person_course_stats`）與 service 的整梯跟診
+    次數（RS-33）都走它。兩邊各寫一次 `not in (...)` 的話，日後新增一種特別格
+    （例如把「會議」獨立出來）只會改到其中一邊，而那種漂移沒有任何東西會叫。
+    """
+    return slot not in (PHOTO, TREATMENT, BIOPSY, REST)
 
 #: [RS-29] 相鄰月份既定時段的時序位置 —— 比本月任何一格都晚。
 #:   本月的位置是 `列序*10 + 時段序`,一個月最多 31*10+1;取一個遠大於它的
@@ -108,6 +119,31 @@ APPLY_PREF_WEEKDAYS = (1, 4)          # 週二、週五（早午時段皆適用�
 # 3 位以上月本來就輪得開 —— 判準是【該月 PGY 名單】,不是當日可用人數
 # (請假造成的臨時 2 人不算)。
 TWO_PGY_PHOTO_ONLY = ((1, "上午"), (3, "下午"), (4, "上午"))  # 二早/四下/五早
+
+# ── [RS-33 2026-09-02 使用者] Clerk 整梯跟診時段的目標區間 ──────────────────
+# 使用者原話:「兩週 Course 內總計週一至週五早上下午共 10 個時段、2 週共 20 個,
+#   其中 2 個時段是開會(週三下午),切片室每人只需要 1-3 個時段,因此讓跟診時段
+#   控制在每個人總共 7-11 個左右(盡量滿足,若無法也沒關係,例如遇到假日/連假可能
+#   無法滿足;先滿足其他 Clerk 排班規定之後,讓控制跟診時段的條件順位在後方一點)」
+#
+# ★兩端的性質完全不同,實作方式也不同★
+#   上限(11):★可執行★ —— 座位可以【留空】。到達上限的 Clerk 不再進入候選,
+#     那一格就空著(他去放假)。這是這條規則唯一會改變排班結果的地方。
+#   下限(7):★不可執行★ —— 座位本來就是能填就填(`_seat` 是 min-first,
+#     次數少的人永遠先坐)。填不到 7 只可能是「整梯根本沒有那麼多可坐的時段」
+#     (假日/連假/診間少/請假),那不是排班演算法能生出來的東西。
+#     所以下限做成★月底點名★:講出「誰只跟到幾次」,不假裝排得出來。
+#
+# ★為什麼上限用「留空」而不是排序鍵★:`_seat` 的第一鍵已經是跟診次數
+#   (RS-25,min-first),所以把「超過上限」放進排序鍵永遠不會生效 ——
+#   次數最多的人本來就排在最後,只有在【其他人都一樣多】時才會被選到,
+#   而那正是要擋下來的情況。要讓總量停在 11,唯一的辦法是那一格不坐人。
+#
+# ★「順位在後方」怎麼落實★:這個上限★只影響就座★,而且是在照光/治療室/
+#   切片室(含配額與期限)全部排完之後才輪到的步驟。換句話說,其他 Clerk 規則
+#   要用到的人力一個都不會被它擋掉;它只決定「剩下的座位要不要再塞人」。
+CLERK_SEAT_TARGET_MIN = 7
+CLERK_SEAT_TARGET_MAX = 11
 
 
 def _jitter(d: date, session: str, purpose: str, code: str) -> int:
@@ -203,6 +239,10 @@ class SessionCtx:
     biopsy_quota_left: "dict | None" = None
     # 今天不補就補不完的人(請假造成的瓶頸;見 `_biopsy_forced_today`)。
     biopsy_force: frozenset = frozenset()
+    # [RS-33] {代號: 這一格【之後】還有幾次鎖定的跟診}。跟診上限要連它一起算
+    #   —— 那幾次已經指派給他了,只是主迴圈還沒走到。★None = 沒有預留★
+    #   (直接呼叫 `solve_session` 的呼叫端看不到整月的鎖定表)。
+    seat_reserved: "dict | None" = None
 
     @property
     def wed_pm(self) -> bool:
@@ -411,7 +451,27 @@ def _pair_key(a, b) -> tuple:
     return (sa, sb) if sa <= sb else (sb, sa)
 
 
-def _seat(ctx, pool, room, ck, prefer: frozenset = frozenset()):
+def _clerk_seat_eligible(ctx, pool):
+    """還沒到跟診上限的 Clerk(RS-33)。全部到頂 → 回空清單 = 這一格留空。
+
+    ★只用在 Clerk 的就座步驟★:PGY 不受此限(他們的公平是月度、而且照光/
+    治療室本來就吃掉大半時段)。判準讀的是 `fc.seat`,那份計數以
+    `("clerk", 梯次, 代號)` 為鍵、且跨月回放(見 `_clerk_ck` 與
+    `replay_counters`)—— 也就是★整梯的累計★,正是使用者要控制的那個數。
+
+    ★已完成 + 尚未走到的鎖定★(外審 RS-33 R1 P2):較晚日期鎖定的跟診要走到
+    那天才由 `replay_counters` 入帳 —— 只看 `fc.seat` 的話,較早的日子會把他
+    排到上限,鎖定那一次再加上去就是 12 次。`ctx.seat_reserved` 是那些「已經
+    指派給他、只是還沒跑到」的次數(含相鄰月份的既定時段)。
+    """
+    cap = CLERK_SEAT_TARGET_MAX
+    res = ctx.seat_reserved or {}
+    return [c for c in pool
+            if ctx.fc.seat.get(_clerk_ck(ctx, c), 0) + res.get(c, 0) < cap]
+
+
+def _seat(ctx, pool, room, ck, prefer: frozenset = frozenset(),
+          eligible=None):
     """依 ck(人)命名空間的座位公平計數輪選並就座。
 
     key＝(★座位次數★, 今日尚無工作, 非偏好者, 該房次數, 連排懲罰, 同伴次數,
@@ -434,7 +494,11 @@ def _seat(ctx, pool, room, ck, prefer: frozenset = frozenset()):
     [2026-07-24] 再比「跟過這間診的次數」少者先、罰「上一次跟診就是這間」（反連排）；
     [2026-07-25 使用者] 再比「與本房已就座者共事過幾次」少者先——房多樣性只管
     「誰跟哪一間」,管不到「誰跟誰」,故仍可能固定同兩人成對（如 1、2 號總是一起）。
-    最後決定性抖動打散。"""
+    最後決定性抖動打散。
+
+    `eligible`:限定只能從這些人裡挑(RS-33 的跟診上限用它把「已到頂」的人
+    排除)。★一個都不剩就回 None 且【不動 pool】★ —— 呼叫端據此讓那一格
+    留空;回傳值必須被檢查,否則 `while` 迴圈會空轉。"""
     rk = str(room).strip()
     fc = ctx.fc
     seated = ctx.seat_ck.setdefault(room, [])   # [codex R1] 房內既有者的真實 ck
@@ -449,7 +513,10 @@ def _seat(ctx, pool, room, ck, prefer: frozenset = frozenset()):
                 1 if fc.last_seat_room.get(k) == rk else 0,
                 pair_cost,
                 _jitter(ctx.d, ctx.session, "seat", p), p)
-    pick = min(pool, key=_key)
+    candidates = pool if eligible is None else [p for p in pool if p in eligible]
+    if not candidates:
+        return None                        # RS-33:沒有人還能坐 → 這一格留空
+    pick = min(candidates, key=_key)
     pool.remove(pick)
     k = ck(ctx, pick)
     for q in seated:                       # 與本房已就座者各記一次共事
@@ -509,6 +576,8 @@ class TwoPgySeatStep(FillStep):
 
 class ClerkSeedStep(FillStep):
     def run(self, ctx, slots, log):
+        # [RS-33] 到達整梯跟診上限的人不再入座 → 那一格留空(他去放假)。
+        #   ★每一格重算★:同一時段內前面幾間坐掉之後,有人可能剛好到頂。
         for r in _room_order(ctx):
             if not ctx.clerk:
                 break
@@ -516,7 +585,8 @@ class ClerkSeedStep(FillStep):
             # 假設自己是第一個入座者(房必空),盲塞會把容量 1 的房坐成 2 人。
             # 非兩位 PGY 月時房仍為空,此檢查恆真、行為不變。
             if len(ctx.room_slots[r]) < ctx.capacity:
-                _seat(ctx, ctx.clerk, r, _clerk_ck)
+                _seat(ctx, ctx.clerk, r, _clerk_ck,
+                      eligible=_clerk_seat_eligible(ctx, ctx.clerk))
 
 
 class PgyMixStep(FillStep):
@@ -543,7 +613,12 @@ class ClerkOverflowStep(FillStep):
     def run(self, ctx, slots, log):
         for r in _room_order(ctx):
             while len(ctx.room_slots[r]) < ctx.capacity and ctx.clerk:
-                _seat(ctx, ctx.clerk, r, _clerk_ck)
+                # [RS-33] ★回傳 None 一定要 break★:`_seat` 沒挑到人時
+                #   刻意不動 pool(那一格留空),不 break 的話這個 while
+                #   會空轉到掛。
+                if _seat(ctx, ctx.clerk, r, _clerk_ck,
+                         eligible=_clerk_seat_eligible(ctx, ctx.clerk)) is None:
+                    break
 
 
 class RestStep(FillStep):
@@ -572,7 +647,7 @@ def solve_session(d: date, session: str, rooms: list, pgy_avail: list,
                   capacity: int = 2, pipeline=None, batch_key: str = "",
                   apply_pref=frozenset(), two_pgy_mode: bool = False,
                   biopsy_quota_left=None,
-                  biopsy_force=frozenset()) -> tuple:
+                  biopsy_force=frozenset(), seat_reserved=None) -> tuple:
     """單一時段填充 → (slots, log)。slots: {房/治療室/切片室/放假: [代號,...]}。"""
     # ★同一個人不可以在池子裡出現兩次★(外審 2026-08-21 P1-01):每一步都是
     #   「選一個 → remove 一個 occurrence」,重複的代號因此可以在同一時段被
@@ -607,7 +682,9 @@ def solve_session(d: date, session: str, rooms: list, pgy_avail: list,
         apply_pref=frozenset(apply_pref), two_pgy_mode=two_pgy_mode,
         biopsy_quota_left=(dict(biopsy_quota_left)
                            if biopsy_quota_left is not None else None),
-        biopsy_force=frozenset(biopsy_force))
+        biopsy_force=frozenset(biopsy_force),
+        seat_reserved=(dict(seat_reserved)
+                       if seat_reserved is not None else None))
     slots: dict = {}
     log: list = list(_log_pre)             # 名單問題要進使用者看得到的警告
     for step in (pipeline or PIPELINE):
@@ -862,10 +939,15 @@ def batch_biopsy_slots(inp: DaySolveInput, order=None) -> tuple:
     return slots, more
 
 
-def apply_locked_biopsy_adjustment(inp: DaySolveInput, order,
-                                   bio_slots: dict) -> tuple:
-    """鎖定時段對切片分母的調整(就地修改 bio_slots)→
-    (locked_keys, locked_bx, locked_n, ord_map)。
+def apply_locked_adjustments(inp: DaySolveInput, order,
+                             bio_slots: dict) -> tuple:
+    """鎖定/既定時段的吸收(就地修改 bio_slots)→
+    (locked_keys, locked_bx, locked_n, ord_map, locked_seat)。
+
+    ★改名(RS-33)★:這一趟不只調整切片分母了 —— 它同時盤點【鎖定的跟診】
+    位置給跟診上限預留用。兩者的規則(格網邊界、勝者梯次、RF-10 未知代號、
+    相鄰月份的時序位置)★逐條相同★,所以走同一趟吸收;各自寫一份的話,
+    日後只會有一邊跟著邊界規則走。
 
     ★solver 與 service 的現況檢查共用這一份★(外審 RS-28 R2 P2):cap 的分母
     在求解器裡會被這裡調整(鎖定格先拿掉、有效鎖定切片加回、未知代號不加回),
@@ -900,6 +982,12 @@ def apply_locked_biopsy_adjustment(inp: DaySolveInput, order,
     #   「本來標示開放」不代表排得到人 —— 只有那一格【確實指派給本梯成員】
     #   時才把它加回去(那個人真的會切一次)。空的鎖定格、或指派給未知/
     #   已換梯代號的鎖定格,都不是可分配的量。
+    #   ★[RS-33] 鎖定的跟診位置★:與 `_locked_bx` 同一個道理 —— 主迴圈是
+    #   時序的,較晚日期鎖定的跟診要走到那天才由 `replay_counters` 計入
+    #   `fc.seat`。不先預留的話,較早的日子會把他自動排到上限,鎖定那一次再
+    #   加上去 = 整梯 12 次:★自動排班自己突破了它宣稱的上限★,而事後的
+    #   點名還會把它歸因成「手動調整」(外審 RS-33 R1 P2)。
+    _locked_seat: dict = {}             # {(梯次, 代號): [位置…]}
     _ord: dict = {}                     # (iso, 時段) → 全月的先後順序
     for _i, _d in enumerate(sorted(inp.grid)):
         for _j, _s in enumerate(STUDENT_SESSIONS):
@@ -940,6 +1028,19 @@ def apply_locked_biopsy_adjustment(inp: DaySolveInput, order,
                         pos_of(_iso, _s))
                     _locked_n[_lcov[0].id] = _locked_n.get(_lcov[0].id, 0) + 1
                     _bio_slots.setdefault(_lcov[0].id, set()).add((_iso, _s))
+                for _slot, _people in (_slots or {}).items():
+                    if not is_follow_slot(_slot):
+                        continue          # 照光/治療室/切片/放假不是跟診
+                    for _c in (_people or []):
+                        # ★這裡刻意不濾梯次成員★(不同於上面的切片):切片的
+                        #   盤點還餵分母 `_locked_n`/`_bio_slots`,未知代號會
+                        #   把配額撐大;跟診的盤點只餵【逐位成員】的預留表
+                        #   (主迴圈是 `for c in _members` 建的),非成員的鍵
+                        #   永遠沒有人去讀它。★量不到的守衛是死碼★
+                        #   (同 RS-28 拿掉的 `(d.year, d.month)`)。
+                        _locked_seat.setdefault(
+                            (_lcov[0].id, str(_c)), []).append(
+                                pos_of(_iso, _s))
 
     _absorb(inp.locked, _grid_days, lambda i, s: _ord.get((i, s), -1))
     # ★[RS-29] 相鄰月份的既定時段★:規則與本月相同,只有兩處不一樣 ——
@@ -959,7 +1060,76 @@ def apply_locked_biopsy_adjustment(inp: DaySolveInput, order,
              if i not in _grid_days},
             set(inp.course_days or ()),
             lambda i, s: (-1 if i < _month_start else _FUTURE_POS))
-    return _locked_keys, _locked_bx, _locked_n, _ord
+    return _locked_keys, _locked_bx, _locked_n, _ord, _locked_seat
+
+
+def clerk_batches_ended_by(batches, cutoff: date) -> set:
+    """整梯【已經走完】(最後一天不晚於 `cutoff`)的梯次 id。
+
+    給跟診區間點名的「偏少」那一半當閘門用 —— 梯次跨月時,排完第一個月
+    ★必然★只有半數時段,那時候喊「跟診偏少」是100% 的誤報,而會固定誤報的
+    警告使用者只會學會無視它。
+    """
+    out = set()
+    for b in batches:
+        try:
+            end = b.start_monday + timedelta(days=CLERK_COURSE_DAYS - 1)
+        except (TypeError, AttributeError):   # 壞資料:不擋,只是不點名
+            continue
+        if end <= cutoff:
+            out.add(b.id)
+    return out
+
+
+def clerk_seat_band_warnings(batches, counts, *, only_ids=None,
+                             ended_ids=None) -> list:
+    """[RS-33] Clerk 整梯跟診次數落在目標區間外的點名 → 人話警告清單。
+
+    `counts` = {(梯次 id, 代號): 跟診次數}。與 `biopsy_quota_warnings` 同一個
+    形狀,而且要餵★同一種來源★:求解器餵自己的公平計數、service 餵存檔的現況
+    —— 不然「排出來當下沒說話,手改之後也沒人說話」。
+
+    ★只點名、不強求★(使用者 2026-09-02 定案):
+    * ★低於下限★:整梯可坐的時段本來就可能不夠(假日/連假/診間少/請假),
+      那不是排班演算法生得出來的東西 —— 所以這裡★只講事實★
+      「他整梯只跟到 N 次」,不寫「應該要有 7 次」那種做不到的話。
+    * ★高於上限★:求解器不會排出來(到頂就留空),所以它一旦出現,
+      代表是【手動改的】—— 講清楚是哪幾位,由使用者決定要不要改回。
+
+    `ended_ids`:整梯已經走完的梯次(見 `clerk_batches_ended_by`)。
+    ★只擋「偏少」那一半★ —— 兩邊的性質不同:
+      * 次數只會往上加,所以「已經超過上限」在梯次中途就已經是定局,
+        提早講反而更有用(還來得及手動改回去);
+      * 「不足下限」在梯次還沒走完時★必然★成立(跨月梯次排完第一個月時
+        更是保證不足),那不是事實而是還沒排到 —— 會固定誤報的警告,
+        使用者只會學會無視它。
+    ★已知限度★:判準是「梯次最後一天不晚於這個月底」,不是「那些日子真的都
+    存過檔」。上個月的班表從來沒排過的話,回放/掃描都取不到那半個梯次的次數,
+    這裡仍會說偏少 —— 一個月一個月排下來不會遇到,但值得知道。
+    """
+    out: list = []
+    for b in batches:
+        if only_ids is not None and b.id not in only_ids:
+            continue
+        c2 = {c: int(counts.get((b.id, c), 0)) for c in sorted(b.members)}
+        if not c2:
+            continue
+        low = ([(c, n) for c, n in c2.items() if n < CLERK_SEAT_TARGET_MIN]
+               if ended_ids is None or b.id in ended_ids else [])
+        if low:
+            out.append(
+                f"跟診時段偏少（梯次 {b.id}，目標每人 {CLERK_SEAT_TARGET_MIN}"
+                f"-{CLERK_SEAT_TARGET_MAX} 個時段）："
+                + "、".join(f"{c}×{n}" for c, n in low)
+                + " —— 多因假日/連假、診間或人力不足所致，排班無法自行補足")
+        high = [(c, n) for c, n in c2.items() if n > CLERK_SEAT_TARGET_MAX]
+        if high:
+            out.append(
+                f"跟診時段偏多（梯次 {b.id}，目標每人上限"
+                f" {CLERK_SEAT_TARGET_MAX} 個時段）："
+                + "、".join(f"{c}×{n}" for c, n in high)
+                + " —— 自動排班到上限就會留空，超出多為手動調整，請確認")
+    return out
 
 
 def biopsy_quota_warnings(batches, counts, *, batch_more=(),
@@ -1148,7 +1318,8 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
     _bio_slots, _batch_more = batch_biopsy_slots(inp, _order)
     _grid_days = {_d.isoformat() for _d in inp.grid}
     (_locked_keys, _locked_bx, _locked_n,
-     _ord) = apply_locked_biopsy_adjustment(inp, _order, _bio_slots)
+     _ord, _locked_seat) = apply_locked_adjustments(
+        inp, _order, _bio_slots)
 
     solved_batch_ids: set = set()
     overlap_days: dict = {}               # {(勝者id, 敗者id): [最早重疊日, 最晚重疊日]}
@@ -1191,6 +1362,14 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
             #   ★跨月的梯次★:本月只看得到自己這半段的格網 → 把上月已經回放
             #   進 `biopsy_done` 的次數也算進總量,配額才不會被腰斬。
             _members = dedupe_codes(clerk_members)
+            # [RS-33] ★這一格【之後】還有幾次鎖定的跟診★ —— 與切片配額的
+            #   `o > _now` 完全同一個判準(上/本月已跑過的那些已經在
+            #   `fc.seat` 裡,再預留一次就會扣兩次)。
+            _seat_now = _ord.get((iso, session), -1)
+            _seat_res = {
+                c: sum(1 for o in _locked_seat.get((batch_key, c), [])
+                       if o > _seat_now)
+                for c in _members} if _members else None
             _quota: "dict | None" = None
             _force: frozenset = frozenset()
             _pos = _bio_pos.get((iso, session))
@@ -1242,7 +1421,8 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
                 _avail(clerk_members, clerk_leave, d),
                 biopsy, fc, inp.capacity, batch_key=batch_key,
                 apply_pref=frozenset(inp.apply_pref), two_pgy_mode=two_pgy,
-                biopsy_quota_left=_quota, biopsy_force=_force)
+                biopsy_quota_left=_quota, biopsy_force=_force,
+                seat_reserved=_seat_res)
             day_slots.setdefault(iso, {})[session] = slots
             log.append(f"{d.month}/{d.day}({'一二三四五六日'[d.weekday()]}) "
                        + "；".join(slog))
@@ -1272,6 +1452,22 @@ def _solve_month_once(inp: DaySolveInput) -> tuple:
         inp.clerk_batches, fc.biopsy_done, batch_more=_batch_more,
         only_ids=solved_batch_ids)
     warnings.extend(_bw)
+
+    # [RS-33] 跟診時段落在目標區間外的點名(下限只講事實、不假裝補得出來)。
+    #   `fc.seat` 的鍵是 `("clerk"|"pgy", …)`,只取 Clerk 那一半並攤平成
+    #   `(梯次, 代號)` —— 與 `biopsy_quota_warnings` 同一個 counts 形狀。
+    _y, _m = int(inp.ym[:4]), int(inp.ym[5:7])
+    warnings.extend(clerk_seat_band_warnings(
+        inp.clerk_batches,
+        {(b, c): n for k, n in fc.seat.items()
+         if isinstance(k, tuple) and len(k) == 3 and k[0] == "clerk"
+         for _ns, b, c in (k,)},
+        only_ids=solved_batch_ids,
+        # ★「偏少」只在整梯走完之後才成立★:`fc.seat` 這時含上個月回放進來的
+        #   同梯次次數(RF-09),所以梯次結束於本月 = 手上就是整梯的總數。
+        ended_ids=clerk_batches_ended_by(
+            inp.clerk_batches,
+            date(_y, _m, monthrange(_y, _m)[1]))))
     return day_slots, log, warnings, fc
 
 
@@ -1322,7 +1518,7 @@ def person_course_stats(sessions_by_iso: dict, include=None,
                         bump(p, "biopsy")
                     elif slot == REST:
                         bump(p, "rest")
-                    else:
+                    elif is_follow_slot(slot):   # ★與 service 共用同一份定義★
                         bump(p, "follow")
     return out
 

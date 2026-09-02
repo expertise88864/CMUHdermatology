@@ -84,6 +84,11 @@ def dedupe_codes(codes) -> list:
     return out
 
 
+#: Clerk 一梯次的長度（天）——★只有這一份定義★：`covers()` 與「整梯已走完」
+#:   的判準（`solve_day.clerk_batches_ended_by`，RS-33）都讀它。
+CLERK_COURSE_DAYS = 14
+
+
 @dataclass
 class ClerkBatch:
     """Clerk 兩週一梯次（起始必為週一，不綁月份，可跨月）。"""
@@ -92,7 +97,8 @@ class ClerkBatch:
     members: list = field(default_factory=list)   # clerk 代號
 
     def covers(self, d: date) -> bool:
-        return self.start_monday <= d < self.start_monday + timedelta(days=14)
+        return (self.start_monday <= d
+                < self.start_monday + timedelta(days=CLERK_COURSE_DAYS))
 
     @staticmethod
     def from_dict(dd: dict) -> "ClerkBatch | None":

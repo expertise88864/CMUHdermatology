@@ -110,9 +110,18 @@ def _run_child(code: str):
     ★這才是外審要的測試★ 之前只檢查原始碼字串與分支順序,完全沒發現
     「正常啟動 log 會讓 orderly 永遠不成立」——因為那要真的看到子行程的輸出。
     """
+    import os
     import subprocess
+    # ★兩邊都要明寫 utf-8★:`text=True` 不指定編碼時用的是 host codec
+    #   (這台是 cp950/gbk)。子行程印的是中文 —— 編碼一不一致靠的是執行環境
+    #   有沒有 PYTHONIOENCODING,而解碼失敗是發生在 subprocess 的讀取執行緒裡:
+    #   例外變成一個 warning,`stdout` ★靜靜變成空字串★。
+    #   於是「有沒有輸出」這個判準會憑環境變數決定勝負,而且失敗方向是
+    #   ★假裝子行程什麼都沒印★ —— 正是這個檔要防的那種假綠燈。
     cp = subprocess.run([sys.executable, "-c", code],
-                        capture_output=True, text=True)
+                        capture_output=True, encoding="utf-8",
+                        errors="replace",
+                        env={**os.environ, "PYTHONIOENCODING": "utf-8"})
     return cp.returncode, (cp.stdout or "") + (cp.stderr or "")
 
 
