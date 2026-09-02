@@ -520,11 +520,17 @@ def _read_python_process_csv_via_powershell() -> str:
     return (r.stdout or "") if r.returncode == 0 else ""
 
 
-def _read_wmic_python_process_csv() -> str:
+def _read_wmic_python_process_csv(*, force: bool = False) -> str:
+    """列舉 python 系行程的 (CommandLine, ProcessId)。
+
+    `force=True`:★略過快取★。動手前的身分重驗必須看【此刻】的事實 ——
+    吃到「查詢當下那一份」的話,重驗就只是把同一個觀測再讀一次,
+    競態原封不動(外審第五輪 R5-P3-01)。
+    """
     global _wmic_cache_until, _wmic_cache_stdout, _wmic_cache_run
     now = time.monotonic()
     run_fn = subprocess.run
-    if now < _wmic_cache_until and _wmic_cache_run is run_fn:
+    if not force and now < _wmic_cache_until and _wmic_cache_run is run_fn:
         return _wmic_cache_stdout
 
     # [v16 2026-05-25] CREATE_NO_WINDOW — admin watchdog tick 每 60s 走 WMIC fallback
@@ -551,6 +557,134 @@ def _read_wmic_python_process_csv() -> str:
     if not stdout.strip():
         stdout = _read_python_process_csv_via_powershell()
     return _remember_wmic_process_csv(stdout, run_fn, now)
+
+
+def _cmdline_is_target(cmdline: str, process_keyword: str) -> bool:
+    """這條命令列★確實是在跑那支程式★嗎(而不是剛好提到它的名字)。
+
+    ★[外審第五輪 R5-P3-01] 發現用寬鬆的、動手前用嚴格的★
+    `_wmic_find_pids()` 的比對是 `keyword in cmdline`(沒有邊界的子字串)。
+    那只證明「命令列的某個位置出現這串字」,沒有證明「實際執行的就是那支
+    程式」—— 例如 `python 修檔工具.py 中國醫皮膚科主程式的備份.txt` 也會命中,
+    而下游是 `taskkill /F /T`(連子行程一起殺)。
+    這一支要求 keyword 是某個★引數的檔名本體★:引數的 basename 去掉副檔名
+    之後要等於 keyword。
+    ★刻意寬容的地方★:引號、大小寫、有沒有副檔名 —— 那些是 Windows 命令列
+    的表面差異,不是身分差異。★刻意不寬容的地方★:它必須是【那個引數本身】,
+    不能只是某個更長字串的一部分。
+    """
+    return _tokens_are_target(_split_cmdline_tokens(cmdline or ""),
+                              process_keyword)
+
+
+def _tokens_are_target(tokens, process_keyword: str) -> bool:
+    """★判準的本體:吃【已經切好的引數】★
+
+    [外審第五輪 R5-P3-01 第 1 輪 P1] 上一版把這裡寫成只吃字串,於是
+    `_cmdline_of_pid_now()` 拿到 psutil 的★引數清單★之後用空白 join 起來、
+    再由這裡重新切一次 —— ★引數邊界就這樣被毀掉★:
+    一個【單一引數】`C:(路徑)中國醫皮膚科主程式 backup.txt`
+    會被切成兩段,第一段的 basename 剛好等於 keyword → 驗證通過 →
+    一支毫不相干的程式連同它的子行程被 `taskkill /F /T`。
+    那正是這一批要消滅的東西(子字串誤判),被我自己的 join 又放回來一次。
+    ★有邊界資訊就不可以丟掉它★:psutil 已經切好了,直接比對它的每一個引數。
+    """
+    kw = (process_keyword or "").strip().strip(chr(34)).lower()
+    if not kw:
+        return False
+    for token in (tokens or ()):
+        t = str(token).strip().strip(chr(34))
+        base = os.path.basename(t.replace(chr(92), "/")).lower()
+        if base == kw or os.path.splitext(base)[0] == kw:
+            return True
+    return False
+
+
+def _split_cmdline_tokens(cmdline: str) -> list:
+    """把 Windows 命令列切成引數。引號內的空白不切(路徑常有空白)。
+
+    ★不用 shlex★:它是 POSIX 語意,會把反斜線當跳脫字元 —— 而 Windows 路徑
+    的分隔符號正是反斜線,那樣會把我們要比對的東西吃掉。
+    """
+    out, buf, in_q = [], [], False
+    for ch in str(cmdline or ""):
+        if ch == chr(34):
+            in_q = not in_q
+            continue
+        if ch.isspace() and not in_q:
+            if buf:
+                out.append("".join(buf))
+                buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
+def _cmdline_tokens_of_pid_now(pid: int):
+    """這個 PID ★此刻★ 的命令列引數(list)。查不出來回 None(≠ 空清單)。
+
+    ★回傳的是【引數清單】不是字串★(外審第 1 輪 P1):psutil 給的本來就是
+    切好的 argv,把它 join 成字串再重新切,會把「一個含空白的引數」拆成兩段
+    —— 而我們正是拿每一段的 basename 去比對身分。有邊界資訊就不可以丟掉。
+    只有 WMIC 那條回的是原始字串,才需要自己切。
+
+    psutil 便宜但對 admin 行程常拿不到 cmdline —— 那正是 WMIC 後備存在的
+    理由,所以拿不到就走 WMIC(★強制略過快取★:重驗要看此刻的事實)。
+    ★「查不出來」要能與「查到了但不是目標」分開★:呼叫端一律當
+    「不能證明」處理(不殺)。
+    """
+    try:
+        import psutil  # noqa: PLC0415
+        cl = psutil.Process(int(pid)).cmdline()
+        if cl:
+            return [str(x) for x in cl]      # ★原樣帶走,不 join★
+    except Exception:
+        logging.debug("[watchdog] psutil 取不到 PID %s 的命令列", pid,
+                      exc_info=True)
+    try:
+        stdout = _read_wmic_python_process_csv(force=True)
+        for parts in csv.reader((stdout or "").splitlines()):
+            if len(parts) < 3 or parts[0].strip().lower() == "node":
+                continue
+            pid_str = parts[-1].strip()
+            if pid_str.isdigit() and int(pid_str) == int(pid):
+                # WMIC 只給得出原始字串 —— 這裡才需要自己切。
+                return _split_cmdline_tokens(",".join(parts[1:-1]).strip())
+    except Exception:
+        logging.debug("[watchdog] WMIC 取不到 PID %s 的命令列", pid,
+                      exc_info=True)
+    return None
+
+
+def _pid_is_still_the_target(pid: int, process_keyword: str) -> bool:
+    """釘住之後再問一次:這個 PID ★現在★ 還是那支程式嗎。
+
+    三個條件都要成立才算數:還活著且是 python 系、命令列查得出來、
+    而且那條命令列★確實在跑那支程式★(精確判準,不是子字串)。
+    查不出來一律回 False —— ★不能證明就不動手★。
+    """
+    try:
+        from cmuh_common.pidfile import pid_looks_like_python  # noqa: PLC0415
+        if not pid_looks_like_python(int(pid)):
+            logging.warning("[watchdog] PID %s 已不是 python 系行程 → 不殺", pid)
+            return False
+    except Exception:
+        logging.warning("[watchdog] 無法確認 PID %s 是否為 python 行程 → 不殺",
+                        pid, exc_info=True)
+        return False
+    tokens = _cmdline_tokens_of_pid_now(pid)
+    if tokens is None:
+        logging.warning("[watchdog] 查不出 PID %s 此刻的命令列 → 不殺"
+                        "(無法證明身分)", pid)
+        return False
+    if not _tokens_are_target(tokens, process_keyword):
+        logging.warning("[watchdog] PID %s 此刻的命令列已不是 %s → 不殺"
+                        "(可能已結束、PID 被回收給別的程式)",
+                        pid, process_keyword)
+        return False
+    return True
 
 
 def _wmic_find_pids(process_keyword: str, *, log_on_empty: bool = True) -> list:
@@ -635,7 +769,8 @@ def _find_pids_holding_mutex(process_keyword: str, mutex_name: str = "",
 _PID_FROM_PIDFILE: dict = {}
 
 
-def kill_pids_verified(pids: list, pid_name: str = "") -> list:
+def kill_pids_verified(pids: list, pid_name: str = "",
+                       process_keyword: str = "") -> list:
     """殺掉這幾個 PID;若它們是從 PID 檔驗來的,期間把身分【釘住】。
 
     ★[2026-08-08 外審]★ `read_verified_pid()` 回的是裸 PID。從驗證到這裡
@@ -651,11 +786,21 @@ def kill_pids_verified(pids: list, pid_name: str = "") -> list:
     半死救援在那條路上整個停擺。修一個競態卻關掉一整條救援路徑,比原本的問題嚴重。
     現在先問「這個 PID 是不是驗得出來的那一個」:
       * 是 → 走釘住的路(釘不住就【不殺】,fail-closed);
-      * 不是(PID 檔不可用 → 這是 cmdline 後備來的)→ 維持既有行為直接殺。
-        那條路本來就沒有可驗證的身分,不是這次要修的東西,也不該被順手廢掉。
+      * 不是(PID 檔不可用 → 這是 cmdline 後備來的)→ 見下。
+
+    ★[外審第五輪 R5-P3-01] 後備那條路的「維持既有行為直接殺」已經改掉★
+    上一版的理由是「那條路本來就沒有可驗證的身分」。那句話只對【PID 檔的
+    身分】成立 —— 它其實還有另一種可驗證的身分:★命令列★。
+    於是把兩件事拆開(審查的原話:fallback discovery ≠ authorization to kill):
+      * ★發現★仍然用寬鬆的 cmdline 子字串(能力不變,不廢掉半死救援);
+      * ★動手★先開 handle 釘住 PID(釘住期間 Windows 不會把它配給別人),
+        再用★精確判準★重問一次「它此刻還是那支程式嗎」,驗不出來就不殺。
+    沒有 keyword 可驗時(呼叫端沒傳)才退回既有行為,並記一行 warning ——
+    那是唯一還沒有身分可驗的情況,不可以靜悄悄。
     """
     if not pid_name:
-        return [pid for pid in pids if kill_pid(pid)]
+        return [pid for pid in pids
+                if _kill_unverified_source(pid, process_keyword)]
     try:
         from cmuh_common.pidfile import (  # noqa: PLC0415
             pinned_verified_pid,
@@ -676,8 +821,8 @@ def kill_pids_verified(pids: list, pid_name: str = "") -> list:
     killed = []
     for pid in pids:
         if verified != pid:
-            # 這個 PID 不是從 PID 檔驗來的(cmdline 後備)→ 維持既有行為。
-            if kill_pid(pid):
+            # 這個 PID 不是從 PID 檔驗來的(cmdline 後備)→ 釘住並重驗身分。
+            if _kill_unverified_source(pid, process_keyword):
                 killed.append(pid)
             continue
         with pinned_verified_pid(pid_name) as pinned:
@@ -688,6 +833,37 @@ def kill_pids_verified(pids: list, pid_name: str = "") -> list:
             if kill_pid(pid):
                 killed.append(pid)
     return killed
+
+
+def _kill_unverified_source(pid: int, process_keyword: str) -> bool:
+    """cmdline 後備找到的 PID:★釘住 → 重驗 → 才殺★(外審第五輪 R5-P3-01)。
+
+    競態長這樣:
+        T0 列舉,PID 1234 的 cmdline 命中 keyword
+        T1 目標自己結束
+        T2 Windows 把 1234 配給另一支程式
+        T3 我們 `taskkill /F /T 1234` —— 殺到 T2 那一支,連它的子行程一起。
+    釘住(OpenProcess)之後 Windows 不會回收該 PID,重驗因此問得到的是
+    「我們釘住的那個行程」,不是另一次觀測。
+    """
+    if not process_keyword:
+        # ★唯一還沒有身分可驗的情況★:呼叫端沒給 keyword。維持既有行為,
+        #   但要說出來 —— 這是一次「在無法驗證身分下的 /F /T」。
+        logging.warning("[watchdog] PID %s 沒有可驗證的身分(未提供 keyword)"
+                        "→ 維持既有行為直接 kill", pid)
+        return kill_pid(pid)
+    try:
+        from cmuh_common.pidfile import pinned_matching_pid  # noqa: PLC0415
+    except Exception:
+        # ★安全機制載入不了 → 不要退回不安全的路★(與 pinned_verified_pid 同)
+        logging.error("[watchdog] 載入 pinned_matching_pid 失敗 → 本輪不 kill"
+                      "(避免在無法驗證身分的情況下 /F /T)", exc_info=True)
+        return False
+    with pinned_matching_pid(
+            pid, lambda p: _pid_is_still_the_target(p, process_keyword)) as ok:
+        if ok is None:
+            return False
+        return kill_pid(ok)
 
 
 def kill_pid(pid: int) -> bool:
@@ -981,7 +1157,8 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
                             return (f"⛔ {name}: 半死且 crash loop，暫停 {remain // 60} "
                                     f"分鐘（保留現有 process、不 kill）[{mode}]")
                         killed = kill_pids_verified(
-                            half_dead_pids, prog.get("pid_name", ""))
+                            half_dead_pids, prog.get("pid_name", ""),
+                            prog.get("process_match", ""))
                         if not killed:
                             return (f"⚠ {name}: 半死狀態 PID {half_dead_pids} "
                                     f"kill 失敗，未啟動新 instance 以避免重複 [{mode}]")
@@ -1037,7 +1214,8 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
                 remain = max(0, int(until - time.time()))
                 return (f"⛔ {name}: stale 且 crash loop 中，暫停 {remain // 60} "
                         f"分鐘（保留現有 process、不 kill）[{mode}]")
-            killed = kill_pids_verified(pids, prog.get("pid_name", ""))
+            killed = kill_pids_verified(pids, prog.get("pid_name", ""),
+                                        prog.get("process_match", ""))
             if not killed:
                 return (f"⚠ {name}: log {age:.0f}s 沒更新但 PID {pids} "
                         f"kill 失敗，未啟動新 instance 以避免重複 [{mode}]")

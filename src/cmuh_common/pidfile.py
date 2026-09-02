@@ -265,6 +265,69 @@ def _identity_matches(pid: int, rec: dict) -> bool:
     return True
 
 
+def _open_process_pin(pid: int):
+    """開一個 handle 把 PID 釘住(Windows 不會把它配給別人)。拿不到回 None。
+
+    ★抽出來給兩種釘住共用★:PID 檔那條(`pinned_verified_pid`)與 cmdline
+    後備那條(`pinned_matching_pid`)。釘住的機制只有一份,兩邊差的只是
+    「釘住之後拿什麼來驗身分」。
+    """
+    try:
+        import ctypes  # noqa: PLC0415
+        # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION —— 只要能持有,
+        # 不需要 PROCESS_TERMINATE(真正動手的是 taskkill)。
+        return ctypes.windll.kernel32.OpenProcess(
+            0x00100000 | 0x00001000, False, int(pid))
+    except Exception:
+        logging.debug("[pidfile] OpenProcess 失敗 pid=%s", pid, exc_info=True)
+        return None
+
+
+@contextmanager
+def pinned_matching_pid(pid: int, verify):
+    """★沒有 PID 檔可用時的釘住★:先開 handle,再用 `verify(pid)` 驗身分。
+
+    ★[外審第五輪 R5-P3-01] 找得到 ≠ 有權殺★
+    watchdog 在 PID 檔不存在/舊格式/驗不過時,會退回「列舉 python 行程、比對
+    cmdline」找 PID —— 而那條路以前是【拿到裸 PID 就 `taskkill /F /T`】。
+    從列舉到動手之間,目標可能已經結束、PID 被作業系統配給另一支程式:
+    我們就會連同它的子行程一起強殺。這正是 PID 檔那條路花了很多力氣解掉的
+    check-then-act 競態,在後備路徑又重新出現一次。
+
+    ★不可以因此把後備整條關掉★(外審第 3 回已定案:PID 檔壞掉時完全不做
+    recovery 會降低可用性)。所以把兩件事拆開:
+      * ★發現★仍然用 cmdline(能力不變);
+      * ★動手★必須在 handle 還握著的時候重新驗一次身分,驗不出來就不殺。
+    驗不過時 yield None —— 少殺一次的代價是這一輪不重啟(下一輪會再來);
+    誤殺的代價是砍掉一支無關的臨床程式連同它的子行程。
+    """
+    handle = _open_process_pin(pid)
+    if not handle:
+        logging.info("[pidfile] 取不到 PID %s 的 handle → 無法保證期間不被回收,"
+                     "本次不採用", pid)
+        yield None
+        return
+    try:
+        # ★handle 開好【之後】才驗★ —— 先驗再開的話,中間那一瞬間仍可能被換掉。
+        try:
+            ok = bool(verify(pid))
+        except Exception:
+            logging.warning("[pidfile] PID %s 的身分驗證拋例外 → 不採用", pid,
+                            exc_info=True)
+            ok = False
+        if not ok:
+            logging.warning("[pidfile] 釘住 PID %s 之後身分驗不過 → 不殺", pid)
+            yield None
+            return
+        yield pid
+    finally:
+        try:
+            import ctypes  # noqa: PLC0415
+            ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            logging.debug("[pidfile] 關閉 handle 失敗", exc_info=True)
+
+
 @contextmanager
 def pinned_verified_pid(name: str):
     """驗過身分、而且在 `with` 區塊期間【PID 不會被回收給別人】的 PID。
@@ -297,14 +360,7 @@ def pinned_verified_pid(name: str):
         return
     handle = None
     try:
-        try:
-            import ctypes  # noqa: PLC0415
-            # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION —— 只要能持有,
-            # 不需要 PROCESS_TERMINATE(真正動手的是 taskkill)。
-            handle = ctypes.windll.kernel32.OpenProcess(
-                0x00100000 | 0x00001000, False, int(pid))
-        except Exception:
-            handle = None
+        handle = _open_process_pin(pid)
         if not handle:
             logging.info("[pidfile] 取不到 PID %s 的 handle → 無法保證期間不被"
                          "回收,本次不採用", pid)

@@ -421,6 +421,21 @@ def test_ensure_program_does_not_kill_when_log_fresh(tmp_path, monkeypatch):
     assert "✓" in msg or "log" in msg, f"應該回報健在，實際: {msg!r}"
 
 
+
+def _stub_kill_identity(monkeypatch):
+    """★這兩條測的是 `ensure_program` 的流程,不是身分驗證★
+
+    [外審第五輪 R5-P3-01] cmdline 後備找到的 PID 現在要先開 handle 釘住、
+    再重驗「它此刻還是那支程式嗎」才准 kill。測試用的是合成 PID(1234),
+    當然釘不住也驗不過 —— 那不是這兩條要量的東西。
+    在★釘住/重驗這兩個接縫★上樁,生產的 `_kill_unverified_source`
+    本體(含「沒 keyword 才退回舊行為」那條分支)照樣執行。
+    身分驗證本身的測試在 test_watchdog_kill_identity_2026_09_02.py。
+    """
+    from cmuh_common import pidfile as _pf
+    monkeypatch.setattr(_pf, "_open_process_pin", lambda pid: 1)
+    monkeypatch.setattr(wc, "_pid_is_still_the_target", lambda pid, kw: True)
+
 def test_ensure_program_kills_when_log_stale_beyond_threshold(tmp_path, monkeypatch):
     """PID 存活 + log 超過 max_stale_sec → 必須 kill+restart (真的卡死的情境)。"""
     pyw = tmp_path / "target.pyw"
@@ -438,6 +453,7 @@ def test_ensure_program_kills_when_log_stale_beyond_threshold(tmp_path, monkeypa
                          lambda pid: killed.append(pid) or True)
     monkeypatch.setattr(wc, "start_program",
                          lambda *args, **kwargs: started.append(args) or 7777)
+    _stub_kill_identity(monkeypatch)
 
     msg = wc.ensure_program(
         {
@@ -471,6 +487,7 @@ def test_ensure_program_reports_restart_failure_after_stale_kill(tmp_path, monke
     monkeypatch.setattr(wc, "claim_action_lock", lambda *args, **kwargs: True)
     monkeypatch.setattr(wc, "kill_pid", lambda _pid: True)
     monkeypatch.setattr(wc, "start_program", lambda *_args, **_kwargs: 0)
+    _stub_kill_identity(monkeypatch)
 
     msg = wc.ensure_program(
         {

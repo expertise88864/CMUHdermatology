@@ -466,12 +466,18 @@ class TestTheVerifyToKillRaceIsClosed:
         open_line = verify_lines = None
         verifies = []
         for n in ast.walk(tree):
-            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                    and n.func.attr == "OpenProcess"):
-                open_line = n.lineno
-            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                    and n.func.id == "read_verified_pid"):
-                verifies.append(n.lineno)
+            # ★釘住這個動作可能是直接 OpenProcess,也可能是抽出去的 helper★
+            #   (2026-09-02:cmdline 後備那條也要釘住,所以抽成
+            #   `_open_process_pin` 兩邊共用)。這條守衛問的是【順序】,
+            #   不是「那一行長什麼樣子」—— 判準要跟著涵蓋的性質走,
+            #   不要被一次抽函式弄成靜默失效。
+            if isinstance(n, ast.Call):
+                nm = (n.func.attr if isinstance(n.func, ast.Attribute)
+                      else getattr(n.func, "id", ""))
+                if nm in ("OpenProcess", "_open_process_pin"):
+                    open_line = n.lineno
+                if nm == "read_verified_pid":
+                    verifies.append(n.lineno)
         assert open_line and len(verifies) >= 2, (
             f"open={open_line} verifies={verifies}")
         verify_lines = [ln for ln in verifies if ln > open_line]
