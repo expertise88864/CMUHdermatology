@@ -144,6 +144,7 @@ def test_month_allday_rest_only_on_closed_afternoons():
         ym="2026-08", grid=grid, pgy_roster=["A", "B", "C", "D"],
         clerk_batches=[batch], biopsy_open={batch.id: bio}))
     photo, tx, biopsy, seat = {}, {}, {}, {}
+    idle_days: list = []
     for iso in sorted(day_slots):
         d = date.fromisoformat(iso)
         sessions = day_slots[iso]
@@ -163,14 +164,24 @@ def test_month_allday_rest_only_on_closed_afternoons():
                     elif slot != REST:          # 跟診房(照光/治療室/切片之外)
                         seat[p] = seat.get(p, 0) + 1
         idle = people - worked
-        if idle:
-            assert d.weekday() == 2, \
-                f"{iso}(週{'一二三四五六日'[d.weekday()]}) 有人整天放假: {sorted(idle)}"
+        if idle and d.weekday() != 2:
+            idle_days.append((iso, sorted(idle)))
 
     def spread(counts, keys):
         vals = [counts.get(k, 0) for k in keys]
         return max(vals) - min(vals)
     assert spread(photo, "ABCD") <= 1, f"PGY 照光不均: {photo}"
     assert spread(tx, "ABCD") <= 1, f"PGY 治療室不均: {tx}"
-    assert spread(seat, batch.members) <= 1, f"Clerk 跟診不均: {seat}"
+    assert spread(seat, batch.members) == 0, \
+        f"[RS-34] Clerk 跟診次數要完全一致: {seat}"
+    # ★整天放假唯一的合法理由★:那個人已經跟滿整梯的配額,座位因此留空。
+    _target = seat[batch.members[0]]
+    for iso, idle in idle_days:
+        wd = '一二三四五六日'[date.fromisoformat(iso).weekday()]
+        others = [p for p in idle if p not in batch.members]
+        assert not others, f"{iso}(週{wd}) ★非 Clerk 整天放假★: {others}"
+        short = [p for p in idle if seat.get(p, 0) != _target]
+        assert not short, (
+            f"{iso}(週{wd}) ★還沒跟滿就整天放假★: "
+            f"{[(p, seat.get(p, 0)) for p in short]}(配額 {_target})")
     assert spread(biopsy, batch.members) <= 1, f"Clerk 切片不均: {biopsy}"

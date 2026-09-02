@@ -43,6 +43,7 @@ from cmuh_common.roster.solve_day import (
     TWO_PGY_PHOTO_ONLY, apply_locked_adjustments,
     arbitration_order, batch_biopsy_slots, biopsy_quota_warnings,
     clerk_batches_ended_by, clerk_seat_band_warnings,
+    clerk_seat_uneven_warnings,
     day_input_fingerprint, day_owner_batch,
     is_follow_slot,
     BIOPSY, PHOTO, REST, STUDENT_SESSIONS, TREATMENT, DaySolveInput,
@@ -839,11 +840,19 @@ class RosterService:
         #   也可以【延到下個月】—— 只放本月+下月的話,求解 9 月時 8/31 起的
         #   那一梯會被腰斬成只剩 9 月,配額算出來遠低於整梯的正解。
         course_days: set = {d.isoformat() for d in grid}
+        # [RS-34] ★「在格網裡」不等於「有診可跟」★(外審 RS-34 R2 P1):
+        #   `month_grid` 對每個非假日平日都會寫入鍵,即使兩個時段的診間清單
+        #   都是空的(全日停診)。跟診那一側要看的是後者,所以另外算一份;
+        #   ★不收窄 `course_days`★ —— 它是切片配額的分母,而切片室與跟診
+        #   診間是分開的兩件事。
+        course_clinic_days: set = {d.isoformat() for d, sess in grid.items()
+                                   if any((sess or {}).values())}
         for _om in (prev_ym(ym), _nxt):
-            course_days |= {
-                d.isoformat() for d in month_grid(
-                    _om, template, holidays,
-                    st.load_month(_om).get("grid_overrides") or {})}
+            _og = month_grid(_om, template, holidays,
+                             st.load_month(_om).get("grid_overrides") or {})
+            course_days |= {d.isoformat() for d in _og}
+            course_clinic_days |= {d.isoformat() for d, sess in _og.items()
+                                   if any((sess or {}).values())}
         # 鎖定時段：以「目前 day_slots 內容」為鎖定值（自動排班時保留、只重排其餘）
         day_slots = month.get("day_slots") or {}
         locked: dict = {}
@@ -932,6 +941,7 @@ class RosterService:
             # [RS-26] 整梯真正開診的日子(本月 + 下個月的格網)——配額的分母與
             #   「之後還補不補得完」都用它,不再只憑切片格網的勾選。
             course_days=course_days,
+            course_clinic_days=course_clinic_days,
             capacity=RosterParams.from_config(cfg).room_capacity, locked=locked,
             prior_sessions=prior_sessions, prior_pgy=prior_pgy,
             apply_pref={str(c) for c in (month.get("pgy_apply_pref") or [])})
@@ -1178,14 +1188,19 @@ class RosterService:
             day_slots = self.storage.load_month(ym).get("day_slots") or {}
         order = arbitration_order(inp)
         _y, _m = int(ym[:4]), int(ym[5:7])
+        counts = self._course_seat_counts(ym, order, inp.course_days)
+        active = self._active_batch_ids(inp, order, day_slots)
+        ended = clerk_batches_ended_by(
+            inp.clerk_batches, date(_y, _m, monthrange(_y, _m)[1]))
         return clerk_seat_band_warnings(
-            inp.clerk_batches,
-            self._course_seat_counts(ym, order, inp.course_days),
-            only_ids=self._active_batch_ids(inp, order, day_slots),
+            inp.clerk_batches, counts, only_ids=active,
             # 與求解器同一個判準:整梯走完才談「偏少」(跨月梯次排完第一個月
             # 時必然不足,那是還沒排到、不是事實)。
-            ended_ids=clerk_batches_ended_by(
-                inp.clerk_batches, date(_y, _m, monthrange(_y, _m)[1])))
+            ended_ids=ended) + clerk_seat_uneven_warnings(
+            # [RS-34] ★求解當下說過的話,手改之後要有人再說一次★:自動排班
+            #   會把跟診次數拉成完全一致,使用者在月曆上挪一格就破功 ——
+            #   而那一格是他自己挪的,沒有人會再算一次。判準與求解器共用。
+            inp.clerk_batches, counts, only_ids=active & ended)
 
     def _course_seat_counts(self, ym: str, order, course_days=()) -> dict:
         """整梯的【跟診】次數,逐日以勝者梯次歸屬 → {(梯次 id, 代號): 次數}。
