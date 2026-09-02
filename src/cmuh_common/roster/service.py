@@ -88,6 +88,21 @@ SRC_SETTLE = tuple(sorted(set(SRC_RVS) | set(SRC_BIOPSY)))
 #: 匯出:R/VS 與日排班必須來自【同一份】快照(否則正式文件是拼裝品)。
 SRC_EXPORT = tuple(sorted(set(SRC_RVS) | set(SRC_DAY)))
 
+class PendingGridShiftError(RuntimeError):
+    """切片格網的平移意圖★還沒收斂★ → 拒絕定案(外審第六輪 R6-P2-01)。
+
+    梯次起始日改過、切片格網卻還停在舊的那一週時,那些格子會落在梯次涵蓋
+    範圍外而被直接忽略 —— ★切片室整梯看起來沒開,而畫面上完全看不出來★。
+    開程式時會自動收斂(`reconcile_pending_grid_shifts`),但它是「不擋開啟」
+    的:讀不到檔、或格網被人手工編過而對不上新舊任何一邊時,意圖會留著,
+    而求解/接受/匯出/定案全都照跑。
+
+    ★只擋定案、面板照樣提醒★:與 `DayStructureError` 同一個作風(RS-27)。
+    定案是單向的(重算帳本 + 月檔唯讀),帶著一份「切片室整梯沒開」的班表
+    定案下去,只能靠解除定案才救得回來。
+    """
+
+
 class DayStructureError(RuntimeError):
     """日排班有★結構性錯誤★ → 拒絕定案(使用者 2026-08-25 定案)。
 
@@ -1402,6 +1417,13 @@ class RosterService:
         out: list = list(self.validate_roster_identity_invariants())
         month = self.storage.load_month(ym)
         day_slots = month.get("day_slots") or {}
+        # [R6-P2-01] ★這一項要排在「本月還沒排班就早退」【之前】★
+        #   (外審 R1 P2):平移沒收斂時定案會被擋,而使用者最常是在【還沒排班】
+        #   的時候才發現定不了案 —— 面板卻是空的,正好還原了這道閘門本來要修的
+        #   那個「畫面上完全看不出來」。
+        #   ★不必先建 `inp`★:沒有待辦時它連建都不建(見該方法),所以放在這裡
+        #   不會讓每個月都多付一次 `build_day_input`。
+        out.extend(self.require_grid_shifts_reconciled(ym))
         if not day_slots:
             return out
         inp = self.build_day_input(ym)
@@ -3962,6 +3984,53 @@ class RosterService:
                 f"請先解除該月定案,程式會在下次啟動時自動收斂。")
         self.recompute_saturday_biopsy(ym)
 
+    def pending_grid_shift_blockers(self, ym: str, *, inp=None) -> list:
+        """★本月會被影響到的、還沒收斂的切片格網平移意圖★ → 人話清單。
+
+        空 = 放行。★不做收斂★(純檢查)—— 呼叫端可能已經持著臨界區。
+
+        ★讀不到就不放行★:`pending_grid_shift.json` 壞掉/讀不到時,我們
+        【證明不了】沒有待辦的平移 —— 而這道閘門要擋的正是「切片室整梯沒開
+        卻看不出來」。把未知當成沒事,等於這道閘門在最需要它的時候自己消失。
+        """
+        try:
+            pend = self.storage.load_pending_grid_shifts_strict()
+        except Exception as e:                        # noqa: BLE001
+            return [f"無法確認切片格網的平移狀態（pending_grid_shift.json "
+                    f"讀不到或格式壞了：{e}）—— 在確認之前不放行，"
+                    f"請檢查設定目錄下的該檔案"]
+        if not pend:
+            return []
+        inp = self.build_day_input(ym) if inp is None else inp
+        mine = {str(b.id) for b in (inp.clerk_batches or ())}
+        out: list = []
+        for rec in pend:
+            bid = str((rec or {}).get("batch_id") or "")
+            if bid not in mine:
+                continue                  # 別的月份的梯次,與這個月無關
+            out.append(
+                f"梯次 {bid} 的切片格網還停在改起始日之前的那一週"
+                f"（{(rec or {}).get('old_start')} → "
+                f"{(rec or {}).get('new_start')}），自動收斂沒能完成 ——"
+                f"★那些格子會落在梯次範圍外而被忽略，切片室整梯等於沒開★。"
+                f"請到設定頁確認該梯次的起始日，或到切片格網把開放的那幾格"
+                f"改到正確的一週；改完不必重開程式")
+        return out
+
+    def require_grid_shifts_reconciled(self, ym: str, *, inp=None) -> list:
+        """同上,但★先自己收斂一次★ → 使用者修好之後不必重開程式就能過關。
+
+        (那正是這道閘門的★出口★:開程式時的收斂是一次性的,沒有這一步的話
+         「修好了卻還是被擋」只能靠重開程式解決 —— 這個 repo 造過一次沒有
+         出口的閘門了,不要再造第二次。)
+        """
+        try:
+            self.reconcile_pending_grid_shifts()
+        except Exception:
+            logging.exception(
+                "[roster.service] 閘門前的平移收斂失敗(不影響下面的判定)")
+        return self.pending_grid_shift_blockers(ym, inp=inp)
+
     def reconcile_pending_grid_shifts(self) -> list:
         """開程式時收斂「梯次已移動、切片格網還沒跟著平移」(外審次輪 P2-05)。
 
@@ -4343,6 +4412,14 @@ class RosterService:
         唯讀的,只能靠解除定案才救得回來。臨界區擋住背景同步,標定案之前再
         用 duty 的識別回頭確認一次(★守衛不能只靠推理★)。
         """
+        if on:
+            # ★先在臨界區【外面】收斂一次★(R6-P2-01):`reconcile_…` 自己要
+            #   拿臨界區,而且這一步是閘門的出口 —— 使用者剛修好起始日/格網,
+            #   不必重開程式就能定案。
+            try:
+                self.reconcile_pending_grid_shifts()
+            except Exception:
+                logging.exception("[roster.service] 定案前的平移收斂失敗")
         with self.storage.write_barrier():
             return self._finalize_locked(ym, on)
 
@@ -4363,6 +4440,14 @@ class RosterService:
             #   班表,唯一還來得及攔的地方就是這裡。
             #   ★驗的是 `m0` —— 正要被定案的那一份★,不是另外再讀一次
             #   (兩次讀取之間的差異會讓「驗過的」與「定案的」不是同一份)。
+            # [R6-P2-01] ★切片格網的平移沒收斂就不准定案★:那一梯的切片室
+            #   等於整梯沒開,而定案是單向的(帳本重算 + 月檔唯讀)。
+            #   純檢查,不在這裡收斂 —— 收斂在 `finalize()` 進臨界區之前做過了。
+            _pend = self.pending_grid_shift_blockers(ym)
+            if _pend:
+                raise PendingGridShiftError(
+                    "切片格網的平移還沒收斂,先處理好才能定案:\n\n"
+                    + "\n".join(f"• {m}" for m in _pend))
             _bad = self.validate_day_structure(
                 ym, day_slots=(m0.get("day_slots") or {}))
             if _bad:
