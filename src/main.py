@@ -9465,6 +9465,11 @@ class AutomationApp:
         # 以「診間號」為 key(非 index)→ 不受診間重排影響;且輪詢時【無論視窗開沒開
         # 都更新】,使用者一開視窗就有最新資料,不會卡在 60-90 秒前的 "?"。
         self._floating_status_by_room = {}             # room_code -> floating_clinic.RoomStatus
+        # ★[2026-09-02 使用者] 拖班診間「目前這一節」的額外卡★
+        #   room_code -> RoomStatus。與上面那份是【不同時段】的同一個診間:
+        #   上面那份被 `_overrun_effective_tc` 釘在更早那一節(例:101 下午),
+        #   這一份是它此刻的那一節(101 晚上)。見 `_poll_overrun_current_sessions`。
+        self._floating_extra_status_by_room = {}
         # room_code -> 連續「錯誤/逾時且無今日快取」次數。達門檻才視為「今天真的沒這個診」
         # 而以 error 旗標餵浮動視窗隱藏;單次/前幾次連線異常(冷啟動、換節、院方瞬斷)只是暫時
         # 性,不馬上藏掉「其實有診」的診間(成功/有快取的那輪會在 _capture_floating_status 歸零)。
@@ -11935,6 +11940,7 @@ class AutomationApp:
             specs = []
             seen_spec_keys = set()
             duplicate_specs = set()
+            overrun_rooms = []      # [(診間, 此刻的時段)] —— 見下方額外輪詢
             for i, (room_code, configured_mode) in enumerate(rooms):
                 if not room_code:
                     continue
@@ -11944,7 +11950,14 @@ class AutomationApp:
                 tc_effective = resolve_clinic_reg64_time_code(mode, now)
                 # [2026-06-19] 早診拖班:時段雖已前進,但前一節今天看過診且尚未關診 → 繼續輪前一節
                 # (同一診間同時只有一節在看診 → 不增加負載),直到它真的關診才前進。
+                tc_requested = tc_effective
                 tc_effective = self._overrun_effective_tc(room_code, tc_effective)
+                # ★[2026-09-02 使用者] 被拉回更早那一節的診間,目前這一節也要看得到★
+                #   拉回之後這一格就只輪那一節,該診間【此刻】那一節於是永遠沒人查
+                #   (101 晚上看不到;102 若下午也在拖,連 102 晚上都整個消失)。
+                #   記下來,主迴圈跑完之後多輪一次,結果只多一張浮動卡。
+                if str(tc_effective) != str(tc_requested):
+                    overrun_rooms.append((room_code, str(tc_requested)))
                 spec_key = (str(room_code), str(tc_effective))
                 if spec_key in seen_spec_keys:
                     duplicate_specs.add(spec_key)
@@ -12423,6 +12436,14 @@ class AutomationApp:
 
                 self.root.after(0, update_ui)
 
+            # ★[2026-09-02 使用者;外審第 1 輪 P2-1] 拖班診間「目前這一節」的額外查詢★
+            #   ★必須排在主結果【處理並派送】完之後★,不是只排在抓取之後 ——
+            #   我第一版放在 `packed_rows` 抓完、處理迴圈之前,於是一次慢的
+            #   額外請求(最壞是 10 秒 HTTP 逾時 + 0.4 秒間隔)會讓★已經抓回來的
+            #   五格主資料整整晚那麼久才上畫面★,正好違反我自己寫的
+            #   「主資料優先、附加價值不可拖慢正事」。
+            self._poll_overrun_current_sessions(overrun_rooms)
+
             # 門診動態快取更新後一併重繪總覽／未來週次月曆（逾時列、reg64 人數），與 _schedule_refresh 節流一致
             def _after_clinic_fetch_schedule_calendar():
                 if getattr(self, "_shutting_down", False):
@@ -12822,6 +12843,8 @@ class AutomationApp:
         (含早診拖班 → 持續顯示早診直到關診)。已關診的診間由 should_show_room 隱藏。"""
         from cmuh_common import floating_clinic
         rooms = []
+        seen = set()      # (診間, 時段) —— 同一格診間設兩次時不要畫出兩張一樣的卡
+        extras = dict(getattr(self, "_floating_extra_status_by_room", {}) or {})
         for i in range(CLINIC_ROOM_COUNT):
             try:
                 code = self.clinic_room_vars[i].get().strip()
@@ -12832,7 +12855,19 @@ class AutomationApp:
             rs = self._floating_status_by_room.get(code)
             if rs is None:
                 rs = floating_clinic.RoomStatus(room=code, light="")  # 還沒輪到 → pending
-            rooms.append(rs)
+            key = (str(rs.room), str(rs.slot or ""))
+            if key not in seen:
+                seen.add(key)
+                rooms.append(rs)
+            # ★[2026-09-02 使用者] 拖班診間【目前這一節】緊接在它自己後面★
+            #   (例:101 下午拖班 → 「101 下午」之後接一張「101 晚上」)。
+            #   它不佔五格中的任何一格,所以 102/105 都不會被擠掉。
+            ex = extras.get(code)
+            if ex is not None:
+                ex_key = (str(ex.room), str(ex.slot or ""))
+                if ex_key not in seen:
+                    seen.add(ex_key)
+                    rooms.append(ex)
         return rooms
 
     def _floating_network_seems_up(self, exclude_room):
@@ -12857,6 +12892,25 @@ class AutomationApp:
                     if index < len(self.clinic_room_vars) else "")
             if not room:
                 return
+            rs = self._build_floating_status(room, result, tracker,
+                                             reset_error_streak=True)
+            if rs is not None:
+                self._floating_status_by_room[room] = rs
+        except Exception:
+            logging.debug("[浮動門診] 擷取狀態失敗", exc_info=True)
+
+    def _build_floating_status(self, room, result, tracker,
+                               *, reset_error_streak: bool = False):
+        """把一次 reg64 結果組成浮動視窗要的 `RoomStatus`。組不出來回 None。
+
+        ★[2026-09-02] 抽出來的理由★:拖班時要多輪一次「該診間目前這一節」,
+        那一筆★沒有表格列、也沒有 tracker★(見 `_poll_overrun_current_sessions`),
+        所以不能沿用「用 slot index 反查診間號」的舊入口。組裝邏輯只有一份。
+        """
+        try:
+            room = str(room or "").strip()
+            if not room:
+                return None
             slot = reg64_slot_cn(result.get("reg64_time_code", "")) or ""
             doctor = result.get("doc_name") or tracker.get("doc_name", "")
             status_txt = result.get("status", "") or ""
@@ -12871,10 +12925,16 @@ class AutomationApp:
             light = str(result.get("light", "") or "")
             # 這一輪有成功/有快取(非 error)→ 連續錯誤計數歸零:有診的診間遇到暫時性瞬斷後
             # 恢復,就不會被先前累積的錯誤次數誤判成「沒診」而隱藏。
-            if not error:
+            # ★[外審第 1 輪 P2-2] 只有【主路徑】可以歸零★
+            #   那個計數是【以診間為單位】的,而拖班時同一個診間有兩筆查詢
+            #   (被釘住的那一節 + 此刻這一節)。額外那一筆若也歸零,就會變成:
+            #   主路徑那一節每輪錯一次 → 計數加到 1 → 額外那一筆成功 → 歸零 →
+            #   ★永遠到不了隱藏門檻★,一張過期/無效的卡就這樣一直留在畫面上。
+            #   額外那一筆的連線健康不代表被釘住那一節的健康。
+            if not error and reset_error_streak:
                 self._floating_error_streak[room] = 0
             from cmuh_common import floating_clinic
-            self._floating_status_by_room[room] = floating_clinic.RoomStatus(
+            return floating_clinic.RoomStatus(
                 room=room,
                 slot=slot,
                 doctor=doctor,
@@ -12890,7 +12950,42 @@ class AutomationApp:
                 stale=bool(result.get("from_cache")),
             )
         except Exception:
-            logging.debug("[浮動門診] 擷取狀態失敗", exc_info=True)
+            logging.debug("[浮動門診] 組裝狀態失敗", exc_info=True)
+            return None
+
+    def _poll_overrun_current_sessions(self, overrun_rooms):
+        """★[2026-09-02 使用者] 拖班時,該診間【目前這一節】也要看得到★
+
+        `_overrun_effective_tc()` 會把一個「更早時段今天看過診、還沒判定關診」
+        的診間整格拉回那一節 —— 於是它★目前這一節永遠不會被輪詢★:
+          * 101 下午還沒看完 → 101 那格顯示下午,101 晚上看不到;
+          * 102 若下午也有診而沒被判定關診 → 102 那格也被拉回下午,
+            下午沒東西 → 卡片被隱藏 → ★完全看不到 102 診晚上★(使用者實機)。
+
+        使用者定案(2026-09-02):★兩節都要★。做法是為拖班的診間多輪一次目前
+        這一節,結果只餵浮動視窗(多一張卡),★不佔表格的五格、不寫 tracker★:
+          * 不佔格 → 不會把 105 之類的診間擠掉(使用者原本提議「從後方取代」,
+            而不佔格比取代更好:誰都不必被犧牲);
+          * 不寫 tracker → 關診偵測的狀態機只由主路徑那一節維護,
+            不會被這筆額外查詢污染(卡片自己的 `closed` 直接讀 reg64 的結果)。
+        成本:每個拖班中的診間每輪多一次 reg64(實務上同時只有一兩間在拖)。
+        `overrun_rooms`: [(room_code, tc_now)]。絕不拋例外。
+        """
+        extras = {}
+        for room_code, tc_now in (overrun_rooms or ()):
+            try:
+                time.sleep(0.4)          # 與主路徑同樣的序向間隔,別打爆院方
+                data = self.fetch_clinic_light_status(room_code,
+                                                      time_code=tc_now)
+                rs = self._build_floating_status(room_code, data or {}, {})
+                if rs is not None:
+                    extras[str(room_code)] = rs
+            except Exception:
+                logging.debug("[浮動門診] 拖班診間目前時段查詢失敗:%s",
+                              room_code, exc_info=True)
+        # ★整批換掉★:不再拖班的診間,它的額外卡要跟著消失(留著就是一張
+        #   永遠不會更新的殭屍卡)。這一輪查不到的也不留舊值。
+        self._floating_extra_status_by_room = extras
 
     def _get_last_closing_time(self, doc_name, weekday_int, session_str):
         with self._history_lock:

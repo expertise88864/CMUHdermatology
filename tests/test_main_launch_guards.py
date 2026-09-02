@@ -527,7 +527,14 @@ def test_clinic_error_path_hides_no_clinic_room_only_when_network_proven_up():
     assert (loop.index("self._reg64_room_reachable[_room_pk]")
             < loop.index("update_single_clinic_ui_error"))
     # 成功/有快取那輪(非 error)把連續錯誤計數歸零
-    cap = _function_source(ROOT / "src/main.py", "_capture_floating_status")
+    # ★[2026-09-02] 判準要跟著涵蓋的性質走,不要盯著單一函式★
+    #   那一行原本在 `_capture_floating_status` 裡;拖班要多一張浮動卡之後,
+    #   組裝邏輯抽成 `_build_floating_status`(那一筆沒有 slot index),
+    #   歸零也跟著搬過去。只看舊函式的話,這道守衛會被一次抽函式弄成靜默失效
+    #   —— 而它要保證的性質(成功那輪必須歸零)一點都沒變。
+    cap = "".join(
+        _function_source(ROOT / "src/main.py", fn)
+        for fn in ("_capture_floating_status", "_build_floating_status"))
     assert "self._floating_error_streak[room] = 0" in cap
     # 門檻常數:連續次數 >= 2(留緩衝給暫時性連線異常)
     main_src = (ROOT / "src/main.py").read_text(encoding="utf-8")
