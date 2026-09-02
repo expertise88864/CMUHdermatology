@@ -774,13 +774,42 @@ class TestEveryForcedExitFlushes:
         assert any(id(e) not in guarded for e in exits), (
             "★os._exit 被縮進『有回呼才做』的分支裡★ 沒帶回呼的行程不會重啟了")
 
-    def test_both_programs_pass_a_pre_exit_callback(self):
-        import re
-        for path in ("src/consult_query.py", "src/main.py"):
-            txt = open(path, encoding="utf-8").read()
-            m = re.search(r"start_health_monitor\((.{0,200})", txt, re.S)
-            assert m and "pre_exit_callback" in m.group(1), (
-                f"{path} 的 health monitor 沒有帶結束前補寫")
+    def test_no_health_monitor_can_exit_without_flushing(self):
+        """★[外審第五輪 R5-P2-01 之後判準要更精確]★
+
+        這條原本要求【兩支程式都】傳 `pre_exit_callback`。那個判準是在
+        「health 會自己 os._exit」的前提下寫的 —— 而 health 的 `os._exit(1)`
+        ★只在沒有 `restart_callback` 的分支★(會診/打卡:有外層 watchdog 接手)。
+        主程式改成把 RAM 重啟交給熱鍵閒置閘門之後,health 對它永遠走不到
+        `os._exit`,收尾改由重啟匯流點 `_restart_app()` 做【完整的三件】——
+        半套的 `pre_exit_callback` 反而變成每個 tick 白做一次不完整的 flush。
+
+        ★真正的不變式★(這條測試現在問的):
+          * 沒有 `restart_callback` → health 會強制結束 → 必須有
+            `pre_exit_callback`;
+          * 有 `restart_callback` → 它★不可以是「直接結束 process」★,
+            必須是會先讓 HIS 操作結束、再走完整收尾的那條路。
+        """
+        for path, expect_gate in (("src/consult_query.py", False),
+                                  ("src/main.py", True)):
+            tree = ast.parse(open(path, encoding="utf-8").read())
+            call = next(
+                (n for n in ast.walk(tree)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                 and n.func.id == "start_health_monitor"), None)
+            assert call is not None, f"{path} 找不到 health monitor 啟動點"
+            kw = {k.arg: k.value for k in call.keywords}
+            if "restart_callback" not in kw:
+                assert "pre_exit_callback" in kw, (
+                    f"★{path} 的 health 會直接 os._exit 卻沒有結束前補寫★")
+                continue
+            cb = ast.unparse(kw["restart_callback"])
+            assert "restart_self" not in cb and "_exit" not in cb, (
+                f"★{path} 的 restart_callback 直接結束 process —— "
+                f"可能腰斬 HIS 寫入,且跳過完整收尾★:{cb}")
+            if expect_gate:
+                assert "_restart_when_hotkey_idle" in cb, (
+                    f"★{path} 沒有走熱鍵閒置閘門★:{cb}")
 
     def test_mains_normal_close_flushes_the_delivery_ledger(self):
         """★這與 health monitor 的回呼是【兩條不同的路】★

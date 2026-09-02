@@ -1497,7 +1497,16 @@ def _mark_hotkey_action_time() -> None:
 # watchdog 兜底清除,不讓自動更新永不生效)。
 _UPDATE_RESTART_IDLE_GAP_SEC = 8.0        # 距最後一次熱鍵動作至少閒置這麼久才敢重啟
 _UPDATE_RESTART_RECHECK_MS = 5000         # 忙碌時每 5 秒重查一次
-_UPDATE_RESTART_MAX_DEFER_ATTEMPTS = 180  # ~15 分上限(180×5s);到頂仍未閒置就重啟
+# ~15 分(180×5s)。★[外審第五輪 R5-P2-02] 到頂【不再】強制重啟★
+# 舊版到頂就 `_restart_app()`,理由寫著「旗標卡死另有熱鍵 watchdog 兜底」——
+# ★那句話只對『worker thread 已死』成立★:`_hotkey_watchdog_action` 對
+# 「卡住但 thread 還活著」回的是 `keep_stuck`,而它明寫【絕不解鎖】,理由正是
+# 「worker 可能正卡在 HIS 半寫入狀態」。於是同一支程式裡兩個安全決定互相矛盾:
+# watchdog 認定危險到連第二支熱鍵都不准進來,自動更新卻在 15 分鐘後把那個
+# worker 連 process 一起殺掉。
+# ★使用者定案(2026-09-02):絕不腰斬,改由人工決定★ —— 到頂之後只是持續等待
+# 並把狀態講給使用者聽(他確認過 HIS 畫面後自己關掉重開,更新即生效)。
+_UPDATE_RESTART_MAX_DEFER_ATTEMPTS = 180
 
 
 # =============================================================================
@@ -9602,51 +9611,105 @@ class AutomationApp:
         # 不打斷使用者當下操作。此方法是所有 app 端重啟（自動更新 / 閒置熱鍵恢復）的匯流點。
         restart_self(["--background"], on_confirmed=_teardown_for_handover)
 
-    def _restart_when_hotkey_idle(self, attempts: int = 0,
-                                  force_after_max: bool = True):
+    def _restart_when_hotkey_idle(self, attempts: int = 0):
         """[MG-02] 自動更新需重啟時的閘門:熱鍵自動化進行中【不可】重啟(見 _UPDATE_RESTART_* 常數旁
         說明)。等『無 subsystem 在跑且距最後一次熱鍵動作 ≥N 秒』才 _restart_app;忙碌則每隔幾秒重查。
         到延後上限仍未閒置就重啟(旗標卡死由熱鍵 watchdog 兜底,不讓更新永不生效)。只在主緒操作。
 
-        ★[外審 SB 第5輪] `force_after_max` 是兩種呼叫端的分界★
-        自動更新(True):15 分鐘後強制重啟 —— 不重啟的代價是更新永不生效,
-        且旗標卡死另有熱鍵 watchdog 兜底。
-        reg52 容量升級(False):【絕不強制】。強制重啟可能腰斬進行中的 HIS
-        寫入(殘單、同意書半開 —— 見 _UPDATE_RESTART_* 常數旁的事故註)。
-        容量耗盡的代價只是掛號數走快取,遠小於寫壞病歷;熱鍵一閒置就會重啟,
-        持續忙碌就無限期等(attempts 不再往上數,免得 log 溢位)。
+        ★[外審第五輪 R5-P2-01/02] 這是【所有自動重啟】的唯一閘門,而且永不強制★
+        以前有一個 `force_after_max` 參數,自動更新用 True(15 分鐘後照殺)、
+        reg52 升級用 False。RAM 爆表那條更是連這個閘門都沒經過,由 health
+        監看緒直接 `restart_self()` —— 也就是可以在 HIS 寫入中途腰斬 process,
+        而且少做了正常重啟會做的收尾。
+        現在三條路(自動更新 / reg52 升級 / RAM 爆表)全部走這裡,語意只有一個:
+        ★只要可能有未完成的 HIS 操作,自動機制就沒有權力終止這個 process★。
+        到延後上限之後不再強制,改成持續等待 + 把狀態講給使用者聽 ——
+        人工的出口是他確認過 HIS 畫面後自己關掉重開(與熱鍵卡住時的既有指引
+        「請按 F12,無效則重新啟動程式」同一個做法)。
+
+        ★為什麼不順便「停止接受新熱鍵」★(審查建議的 draining):
+        走到上限代表【連續 15 分鐘找不到 8 秒的空檔】(`_UPDATE_RESTART_IDLE_GAP_SEC`),
+        實務上只發生在旗標卡死 —— 而那時新熱鍵早就被派送端既有的
+        `if self._subsystem_running:` 擋住了。再加一道只會多一個沒有出口的閘門,
+        對真正會發生的情況一點差別也沒有。
         """
         if threading.current_thread() is not threading.main_thread():
-            self.root.after(0, lambda: self._restart_when_hotkey_idle(
-                attempts, force_after_max))
+            self.root.after(0, lambda: self._restart_when_hotkey_idle(attempts))
             return
+        # ★冪等★ RAM 爆表那條是【每個 tick 都會再要求一次】(health 對「callback
+        #   回來了」的解讀是「重啟沒成功,下一輪再試」)。不擋的話每 5 分鐘就多疊
+        #   一條 after 重查鏈,log 與排程無限膨脹。
+        if attempts == 0 and getattr(self, "_restart_gate_active", False):
+            logging.debug("[restart] 重啟閘門已在等待中 → 本次請求併入")
+            return
+        self._restart_gate_active = True
         busy = bool(getattr(self, "_subsystem_running", False))
         idle_gap = time.time() - getattr(_runner_1280, "last_action_time", 0.0)
         if attempts >= _UPDATE_RESTART_MAX_DEFER_ATTEMPTS:
-            if force_after_max:
-                logging.warning("[更新] 熱鍵仍忙但已達重啟延後上限(%d),仍執行重啟(busy=%s, idle_gap=%.1fs)",
-                                attempts, busy, idle_gap)
-                self._restart_app()
-                return
-            # ★不強制★ 停在上限值繼續等閒置。提醒用時間戳節流
+            # ★絕不強制★ 停在上限值繼續等閒置。提醒用時間戳節流
             #   (attempts 已凍結,拿它取模的話提醒只會出現一次)。
             _last = getattr(self, "_reg52_restart_wait_last_log", 0.0)
             if time.monotonic() - _last > 600.0:
                 self._reg52_restart_wait_last_log = time.monotonic()
                 logging.warning(
-                    "[refresh] 重啟升級持續等待熱鍵閒置(busy=%s, idle_gap=%.1fs)"
+                    "[restart] 自動重啟持續等待熱鍵閒置(busy=%s, idle_gap=%.1fs)"
                     " —— 不強制重啟,避免腰斬 HIS 寫入", busy, idle_gap)
+                # ★等待要看得見★:只寫 log 的話,使用者不知道有一個更新/釋放
+                #   記憶體的重啟一直沒發生,也不知道人工出口是什麼。
+                self._notify_restart_waiting(busy, idle_gap)
         if not busy and idle_gap >= _UPDATE_RESTART_IDLE_GAP_SEC:
-            self._restart_app()
-            return
+            # ★[外審第五輪 R1] 讀到「不忙」與真正結束 process 之間有一段窗★
+            #   `_restart_app()` → `restart_self()` 會先 spawn、等約 0.6 秒確認
+            #   新行程活著,★之後★才在 `_teardown_for_handover` 裡解除熱鍵。
+            #   那 0.6 秒熱鍵仍然活著:醫師按下 F9,`run_subsystem_in_thread`
+            #   在鎖內把 `_subsystem_running` 設成 True、開始寫 HIS,然後舊行程
+            #   就退出了 —— 正是這一批要消滅的「腰斬進行中的 HIS 寫入」,
+            #   只是換成一個更窄的窗。閘門的「讀 busy」與派送端的「接納新熱鍵」
+            #   之間必須有共同的鎖。
+            #   ★這才是 draining 真正該存在的位置★:不是在「等閒置」的那 15 分鐘
+            #   (那時 busy 守衛本來就擋著),而是在【已經決定要重啟】之後的交棒窗。
+            with self._subsystem_lock:
+                if getattr(self, "_subsystem_running", False):
+                    busy = True          # 剛剛才有人進來 → 這一輪不重啟
+                else:
+                    self._restart_committing = True
+            if not busy:
+                self._restart_gate_active = False
+                try:
+                    self._restart_app()
+                finally:
+                    # ★走到這裡代表 restart_self 返回 = 接手【沒有成功】★
+                    #   (成功的話這個行程已經不在了)。旗標必須收回,
+                    #   否則熱鍵從此被一道「永遠不會結束的重啟」擋死。
+                    self._restart_committing = False
+                # 接手失敗:重新排一次重查,不要靜靜停在這裡
+                self.root.after(_UPDATE_RESTART_RECHECK_MS,
+                                lambda: self._restart_when_hotkey_idle(attempts))
+                return
+            logging.info("[restart] 交棒前重查發現熱鍵剛開始 → 本輪不重啟")
         if attempts < _UPDATE_RESTART_MAX_DEFER_ATTEMPTS:
-            logging.info("[更新] 熱鍵自動化進行中,延後重啟(busy=%s, idle_gap=%.1fs, 第 %d 次重查)",
+            logging.info("[restart] 熱鍵自動化進行中,延後重啟(busy=%s, idle_gap=%.1fs, 第 %d 次重查)",
                          busy, idle_gap, attempts + 1)
-        # 非強制模式:attempts 凍結在上限(維持「已到頂」的分支,不無限成長)
-        next_attempts = attempts + 1 if force_after_max else             min(attempts + 1, _UPDATE_RESTART_MAX_DEFER_ATTEMPTS)
+        # attempts 凍結在上限(維持「已到頂」的分支,不無限成長)
+        next_attempts = min(attempts + 1, _UPDATE_RESTART_MAX_DEFER_ATTEMPTS)
         self.root.after(_UPDATE_RESTART_RECHECK_MS,
-                        lambda: self._restart_when_hotkey_idle(
-                            next_attempts, force_after_max))
+                        lambda: self._restart_when_hotkey_idle(next_attempts))
+
+    def _notify_restart_waiting(self, busy: bool, idle_gap: float) -> None:
+        """告訴使用者「有一個自動重啟正在等 HIS 操作結束」。絕不拋。
+
+        ★人工出口就在這句話裡★:程式自己不會腰斬 HIS 寫入,所以如果它一直等
+        (旗標卡死),要由看得到 HIS 畫面的人決定 —— 確認畫面沒有半開的單/同意書
+        之後,自己關掉程式再開,重啟就完成了。
+        """
+        try:
+            show_windows_notification_async(
+                "重新啟動等待中",
+                "有一項自動重啟(更新或釋放記憶體)正在等 HIS 熱鍵操作結束,"
+                "程式不會中途強制重啟。若您確認 HIS 畫面沒有未完成的操作,"
+                "可以自行關閉本程式再開啟以完成重啟。")
+        except Exception:
+            logging.debug("[restart] 等待通知失敗(不影響)", exc_info=True)
 
     def shutdown_app(self):
         """關閉時不可在主執行緒上 executor.shutdown(wait=True)，否則會卡到背景 HTTP／排程結束。
@@ -13246,9 +13309,8 @@ class AutomationApp:
                         "[refresh] reg52 容量耗盡且換代到頂 → 排入閒置時重啟"
                         "(native-wedged thread 只有重啟能終結)")
                     try:
-                        # ★force_after_max=False:絕不腰斬進行中的 HIS 寫入★
-                        self.root.after(0, lambda: self._restart_when_hotkey_idle(
-                            force_after_max=False))
+                        # ★絕不腰斬進行中的 HIS 寫入★(閘門本身已保證,見其 docstring)
+                        self.root.after(0, self._restart_when_hotkey_idle)
                     except Exception:
                         logging.exception("[refresh] 重啟升級排程失敗")
                 # ★[2026-08-10 批次SB #3] 上一輪 worker 疑似卡死 → 接管★
@@ -16159,12 +16221,28 @@ class AutomationApp:
     def run_subsystem_in_thread(self, func, hotkey_name, preempt_same=False):
         is_busy = False
         show_busy_notice = False
+        # ★訊息要分得開★:「前一個流程還沒完成」與「正在交棒重啟」對使用者
+        #   的處置不同 —— 前者等一下再按,後者是程式馬上要換新版/釋放記憶體。
+        busy_reason_restart = False
         # 僅在 else 分支(非忙碌)會被覆寫；忙碌時提前 return 不會用到。
         # 預先綁定以消除靜態分析的 possibly-unbound 雜訊（行為不變）。
         subsystem_token = 0
         is_preempt = False  # 本次是否為「同熱鍵搶占」(F11 執行中又按 F11)
         with self._subsystem_lock:
-            if self._subsystem_running:
+            # ★[外審第五輪 R1] 重啟已經進入交棒★:新行程正在起來,本行程隨時
+            #   會退出 —— 這時放一支熱鍵進來開始寫 HIS,就是被腰斬的那一筆。
+            #   與 `_restart_when_hotkey_idle` 的「重查 busy」共用這把鎖,
+            #   兩件事因此是原子的(旗標由該處在鎖內設,接手失敗時收回)。
+            if getattr(self, "_restart_committing", False):
+                is_busy = True
+                busy_reason_restart = True
+                now = time.monotonic()
+                if should_show_busy_notice(
+                    now, getattr(self, '_last_hotkey_busy_notice_at', 0.0),
+                ):
+                    self._last_hotkey_busy_notice_at = now
+                    show_busy_notice = True
+            elif self._subsystem_running:
                 if preempt_same and self._subsystem_current_hotkey == hotkey_name:
                     # [2026-06-15] 同一支熱鍵(F11)執行中又被按下 → 終止前一次、改從這次
                     # 重新開始(其餘熱鍵維持「忙碌略過」)。等同對舊流程做一次 F12:把舊
@@ -16209,9 +16287,19 @@ class AutomationApp:
                 self._subsystem_current_hotkey = hotkey_name
 
         if is_busy:
-            put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 前一個熱鍵流程尚未完成'))
-            if show_busy_notice:
-                self._show_notice("熱鍵忙碌中", f"{hotkey_name} 已略過，請等待目前自動化完成。", level="warn", auto_close_ms=2500)
+            if busy_reason_restart:
+                put_ui_message(self.ui_queue, UiStatusMessage(
+                    text=f'狀態: {hotkey_name} - 程式正在重新啟動,請稍候再按'))
+                if show_busy_notice:
+                    self._show_notice(
+                        "正在重新啟動",
+                        f"{hotkey_name} 已略過:程式正在交棒給新版本(或釋放記憶體),"
+                        "幾秒後會自動回來,屆時再按一次。",
+                        level="warn", auto_close_ms=2500)
+            else:
+                put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: {hotkey_name} - 前一個熱鍵流程尚未完成'))
+                if show_busy_notice:
+                    self._show_notice("熱鍵忙碌中", f"{hotkey_name} 已略過，請等待目前自動化完成。", level="warn", auto_close_ms=2500)
             return
 
         if is_preempt:
@@ -17453,10 +17541,22 @@ if __name__ == "__main__":
     try:
         from cmuh_common.health import start_health_monitor
         # 主程式沒有外層 watchdog 會接手，所以給 restart_callback：RAM 連續爆表時
-        # 先 spawn 一個新 instance 再 os._exit 本 process（單例 mutex 重啟競態由
-        # ensure_single_instance 的重試處理），而不是只 os._exit 後就再也不回來。
-        # hard_exit_code=1：health 監看跑在 daemon thread，sys.exit 殺不掉 process，
-        # 必須 os._exit。
+        # 要自己重啟,而不是只 os._exit 後就再也不回來。
+        # ★[外審第五輪 R5-P2-01] 這條路以前【繞過】了重啟匯流點★
+        #   舊寫法是 `restart_self(["--background"], hard_exit_code=1)`,
+        #   於是 health 的監看緒可以在任何時刻直接結束 process —— 少了三件
+        #   `_restart_app()` 會做的事:
+        #     ① 熱鍵閒置閘門(可能腰斬進行中的 HIS 寫入 → 殘單/同意書半開,
+        #        而且本地 state machine 還沒把結果分類完 = submitted-but-unverified);
+        #     ② 完整收尾(舊版的 pre_exit_callback 只 flush 寄送帳本,
+        #        ★漏了 `_flush_ledger_before_exit()`(HIS 稽核帳本)與
+        #        `_retry_alert_pending_save()`★ → 剛入列的 HIS 動作紀錄隨 process
+        #        消失,也就是「外部副作用可能已發生,本地補償證據卻不見了」);
+        #     ③ 「新行程確認接手之後才拆解舊行程」的可用性保護。
+        #   改成走同一個閘門:RAM 再高也不是腰斬 HIS 寫入的理由;熱鍵一閒置
+        #   (只要 8 秒)就會重啟,收尾也由 `_restart_app` 統一做。
+        #   pre_exit_callback 因此拿掉 —— 留著只會在每個 tick 做一次不完整的
+        #   flush(而且此刻根本還沒要退出)。
         # [2026-06-16 觀測] warn_callback:自動重啟前一個 tick(~5 分鐘前)先跳通知,
         # 讓使用者有機會先存檔,不再無預警重啟消失。daemon 緒呼叫,只做輕量通知。
         def _ram_restart_warn(rss_mb, crit_mb, eta_min):
@@ -17471,12 +17571,11 @@ if __name__ == "__main__":
             except Exception:
                 logging.debug("RAM 重啟前通知失敗", exc_info=True)
         start_health_monitor("main",
-                             pre_exit_callback=_flush_delivery_ledger_before_exit,
                              ram_warn_mb=500, ram_crit_mb=900,
                               interval_sec=300, network_check=False,
                               auto_restart_on_crit=True,
                               crit_persistence_ticks=6,
-                              restart_callback=lambda: restart_self(["--background"], hard_exit_code=1),
+                              restart_callback=app._restart_when_hotkey_idle,
                               warn_callback=_ram_restart_warn)
     except Exception:
         logging.debug("health monitor 啟動失敗", exc_info=True)

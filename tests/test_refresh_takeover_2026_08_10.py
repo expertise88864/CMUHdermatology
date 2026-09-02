@@ -548,9 +548,15 @@ class TestEpochCapAndEscalation:
 
 
 class TestEscalationNeverForcesMidWorkflow:
-    """★外審 SB 第 5 輪★ 更新的閘門 15 分鐘後【強制】重啟 ——
-    對 reg52 升級來說會腰斬進行中的 HIS 寫入（殘單、同意書半開）。
-    升級路徑必須用 force_after_max=False：熱鍵活著就無限期等。"""
+    """★外審 SB 第 5 輪 → 外審第五輪 R5-P2-02 擴大到【所有】自動重啟★
+
+    原本只有 reg52 升級走 `force_after_max=False`,自動更新到頂仍強制重啟,
+    理由是「旗標卡死另有熱鍵 watchdog 兜底」—— ★那句話只對 worker thread
+    已死成立★:`_hotkey_watchdog_action` 對「卡住但 thread 還活著」回
+    `keep_stuck` 並明寫【絕不解鎖】(worker 可能正卡在 HIS 半寫入)。
+    使用者 2026-09-02 定案:自動機制一律不腰斬,改由人工決定。
+    參數因此整個拿掉 —— 沒有參數就沒有人能再把它打開。
+    """
 
     @staticmethod
     def _host(busy=True):
@@ -566,11 +572,19 @@ class TestEscalationNeverForcesMidWorkflow:
 
         class _Host:
             _subsystem_running = busy
+            _subsystem_lock = __import__("threading").RLock()
+            _restart_committing = False
             root = _Root()
             restarted = []
+            notified = []
 
             def _restart_app(self):
                 self.restarted.append(1)
+
+            def _notify_restart_waiting(self, busy_, gap):
+                # ★樁★:真的那支會叫 Windows 通知,測試不可以彈東西出來。
+                #   記下來就好 —— 「等待要看得見」由下面的斷言驗。
+                self.notified.append((busy_, gap))
 
         _Host._restart_when_hotkey_idle = m.AutomationApp.__dict__[
             "_restart_when_hotkey_idle"]
@@ -579,23 +593,29 @@ class TestEscalationNeverForcesMidWorkflow:
         m._runner_1280.last_action_time = _t.time()
         return h
 
-    def test_forced_mode_restarts_at_the_cap(self, monkeypatch):
-        """反方向：更新那條路(force=True)到頂要強制(不重啟=更新永不生效)。"""
-        monkeypatch.setattr(
-            "threading.current_thread", __import__("threading").main_thread)
-        h = self._host(busy=True)
-        h._restart_when_hotkey_idle(m._UPDATE_RESTART_MAX_DEFER_ATTEMPTS,
-                                    force_after_max=True)
-        assert h.restarted, "更新模式到頂沒有強制重啟"
+    def test_no_automatic_path_can_force_any_more(self):
+        """★這條測試自己也更正了★ 它原本斷言「更新那條到頂要強制重啟」——
+        那正是 R5-P2-02 指出的缺陷,被釘成了正確答案。
+        現在的不變式:閘門★沒有★強制模式可用,連參數都不存在。"""
+        import inspect
+        sig = inspect.signature(m.AutomationApp._restart_when_hotkey_idle)
+        assert "force_after_max" not in sig.parameters, (
+            "★強制模式還在★ 只要參數存在,就有人會在某條路上把它打開")
+        code = NL.join(
+            ln.split("#")[0]
+            for ln in inspect.getsource(
+                m.AutomationApp._restart_when_hotkey_idle).splitlines())
+        # 到頂那個分支不可以再有「直接重啟」的出口
+        assert code.count("self._restart_app()") == 1, (
+            "★到頂的分支又長出一條強制重啟★:" + str(code.count("_restart_app()")))
 
     def test_nonforced_mode_waits_forever_while_busy(self, monkeypatch):
         """★核心★ 升級模式(force=False)到頂 + 熱鍵忙 → 不重啟、繼續等。"""
         monkeypatch.setattr(
             "threading.current_thread", __import__("threading").main_thread)
         h = self._host(busy=True)
-        h._restart_when_hotkey_idle(m._UPDATE_RESTART_MAX_DEFER_ATTEMPTS,
-                                    force_after_max=False)
-        assert not h.restarted, "★升級模式到頂仍強制重啟 → 腰斬 HIS 寫入★"
+        h._restart_when_hotkey_idle(m._UPDATE_RESTART_MAX_DEFER_ATTEMPTS)
+        assert not h.restarted, "★到頂仍強制重啟 → 腰斬 HIS 寫入★"
         assert h.root.scheduled, "沒有繼續排下一次重查(變成永不重啟)"
 
     def test_nonforced_mode_restarts_once_idle(self, monkeypatch):
@@ -605,16 +625,19 @@ class TestEscalationNeverForcesMidWorkflow:
         h = self._host(busy=False)
         m._runner_1280.last_action_time = (
             _t.time() - m._UPDATE_RESTART_IDLE_GAP_SEC - 1)
-        h._restart_when_hotkey_idle(m._UPDATE_RESTART_MAX_DEFER_ATTEMPTS,
-                                    force_after_max=False)
+        h._restart_when_hotkey_idle(m._UPDATE_RESTART_MAX_DEFER_ATTEMPTS)
         assert h.restarted, "閒下來了卻不重啟(升級永不生效)"
 
-    def test_the_escalation_call_site_does_not_force(self):
+    def test_the_escalation_call_site_goes_through_the_gate(self):
+        """升級呼叫端要走閘門(而不是自己 `_restart_app()`)。
+        ★不再檢查 force_after_max★:那個參數已經不存在,
+        「絕不強制」現在是閘門自己的性質(上面那條測試釘住)。"""
         text, fn = _src_of("_trigger_refresh")
         seg = ast.get_source_segment(text, fn) or ""
         i = seg.index("_reg52_restart_requested = True")
         j = i + 600
-        # ★剝掉註解★ 說明「為什麼要 False」的註解裡就有那個字面(今天第四次)。
         code_only = NL.join(ln.split("#")[0] for ln in seg[i:j].splitlines())
-        assert "force_after_max=False" in code_only, (
-            "★升級呼叫端沒帶 force_after_max=False → 15 分鐘後腰斬 HIS 寫入★")
+        assert "_restart_when_hotkey_idle" in code_only, (
+            "★升級呼叫端沒走閘門★")
+        assert "_restart_app()" not in code_only, (
+            "★繞過閘門直接重啟 → 可能腰斬 HIS 寫入★")
