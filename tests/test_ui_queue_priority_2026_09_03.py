@@ -12,9 +12,9 @@ from queue import Queue
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from cmuh_common.ui_messages import (  # noqa: E402
-    UiAlertErrorMessage, UiAlertInfoMessage, UiClockStatusMessage,
-    UiRefreshTickMessage, UiStatusMessage, is_expendable_ui_message,
-    put_ui_message,
+    UiAlertErrorMessage, UiAlertInfoMessage, UiClinicDataMessage,
+    UiClockStatusMessage, UiRefreshTickMessage, UiStatusMessage,
+    is_expendable_ui_message, put_ui_message,
 )
 
 
@@ -158,3 +158,46 @@ def test_a_queue_without_a_mutex_still_works():
     q.put_nowait(_err("b"))
     put_ui_message(q, _err("c"))
     assert [m.msg for m in q.items] == ["b", "c"]
+
+
+class TestLiveFinalClinicDataIsNotExpendable:
+    """★[外審第七輪 P3-high] 可丟與否是【看值】不是只看型別★
+
+    `UiClinicDataMessage` 整個 class 原本都算可丟。但同一個 class 裡的
+    `is_live_final=True` ★是那位醫師「最後那筆完整成功的即時資料」★,
+    而遠期止掛提醒的掃描★只能由它解鎖★(錯誤/半套/快取都不算)。
+    佇列滿的時候把它跟一般的定時更新一起丟,就可能把★該寄的提醒的唯一憑據★
+    丟掉 —— 那不是「畫面少更新一次」。
+    """
+
+    def _clinic(self, name, *, final):
+        return UiClinicDataMessage(doctor_name=name, data={},
+                                   is_live_final=final)
+
+    def test_a_live_final_message_is_not_expendable(self):
+        assert not is_expendable_ui_message(self._clinic("A", final=True))
+
+    def test_a_non_final_one_still_is(self):
+        """★對照組★:一般的定時更新仍然可丟(否則佇列會被門診資料塞爆)。"""
+        assert is_expendable_ui_message(self._clinic("A", final=False))
+
+    def test_it_survives_a_full_queue(self):
+        """★核心★:佇列滿了要犧牲一般更新,不是那筆 live_final。"""
+        q = Queue(maxsize=3)
+        q.put_nowait(self._clinic("A", final=True))
+        q.put_nowait(self._clinic("B", final=False))
+        q.put_nowait(UiStatusMessage(text="tick"))
+        put_ui_message(q, _err("要看的錯誤"))
+        got = _drain(q)
+        assert any(isinstance(m, UiClinicDataMessage) and m.is_live_final
+                   for m in got), \
+            f"★live_final 被丟掉了★:{[type(m).__name__ for m in got]}"
+        assert any(isinstance(m, UiAlertErrorMessage) for m in got), got
+
+    def test_a_periodic_update_yields_to_it(self):
+        """佇列裡全是 live_final 時,新來的一般更新要讓路(它下輪還會來)。"""
+        q = Queue(maxsize=2)
+        q.put_nowait(self._clinic("A", final=True))
+        q.put_nowait(self._clinic("B", final=True))
+        put_ui_message(q, self._clinic("C", final=False))
+        assert [m.doctor_name for m in _drain(q)] == ["A", "B"]

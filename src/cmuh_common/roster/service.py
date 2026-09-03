@@ -678,17 +678,27 @@ class RosterService:
         在同一個 `write_barrier()` 內讀完就沒有這個縫(同時也擋住自己人:
         匯出期間別的執行緒的存檔會排在後面)。
         """
+        # [外審第七輪 P2] ★匯出的是要發出去的正式文件★:一份「切片室整梯
+        #   沒開」的班表印出去之後就收不回來了,所以它和定案一樣要擋。
+        self._guard_grid_shifts(ym, "匯出班表")
         with self.storage.write_barrier():
             return self._build_export_locked(ym)
 
     def _build_export_locked(self, ym: str) -> dict:
         """`build_export` 的本體。★呼叫端必須持有 `write_barrier`★
 
+        ★臨界區裡面要再驗一次★(外審第七輪 R1 P2):鎖外那一次是【出口】
+        (順便收斂),但它與取得 barrier 之間是 check-then-act —— 背景 pull 或
+        另一支執行緒可以在那個縫裡寫進一筆未收斂的平移意圖,而 pending 的寫入
+        用的正是同一把 barrier。定案那條路早就這樣做了(純檢查、不收斂,
+        因為這裡已經持鎖)。
+
         ★正式文件寧可匯不出來,也不可以少一半還說成功★(外審 2026-08-22
         P1-02):月檔/名單/假日/模板任一暫時讀不到時,寬鬆載入回空 —— xlsx/docx
         writer 相信 service 給的 payload,於是使用者拿到一份【格式正常、
         少班少姓名少日排班】的正式班表,而且看不出哪裡不對。
         """
+        self._guard_grid_shifts_locked(ym, "匯出班表")
         # ★匯出也會走 `build_day_input`(要開診格網)→ 它現在需要下個月★
         #   (RS-26:Clerk 梯次是兩週、可以跨月;宣告不足會當場拋,不會靜默
         #    退回寬鬆讀取 —— 那正是 `StrictSources` 的用意)。
@@ -976,10 +986,15 @@ class RosterService:
         在預覽階段就丟例外只會讓使用者連畫面都打不開(2026-07-25 的分界:
         讀給人看的寬鬆、要寫回去的嚴格)。
         """
+        # [外審第七輪 P2] ★預覽不擋、但要把原因講出來★:求解本身沒有副作用,
+        #   在這裡 fail-closed 只會讓使用者連畫面都打不開;但按下套用時會被擋,
+        #   所以預覽的警告裡就要說清楚為什麼 —— 否則使用者會遇到
+        #   「排得出來卻套不下去」而不知道去修什麼。
+        _pend = self.require_grid_shifts_reconciled(ym)
         _m, rev = self.storage.load_month_with_revision(ym)
         inp = self.build_day_input(ym, today=today)
         day_slots, log, warnings = month_solve_day(inp)
-        return DaySolveResult(day_slots, log, warnings,
+        return DaySolveResult(day_slots, log, list(warnings) + _pend,
                               day_input_fingerprint(inp), rev)
 
     @staticmethod
@@ -1010,13 +1025,22 @@ class RosterService:
         # ★整段在同一個臨界區內★(外審 RS-2 第 1 輪 P1):驗證與寫入之間若讓
         #   背景 pull 合併月檔【以外】的檔案(名單/模板/梯次/假日),指紋比的是
         #   合併前的資料、月檔 revision 又沒變 —— 兩道關卡都通過,舊解照樣落地。
+        # [外審第七輪 P2] ★套用會寫進 canonical 月檔 = 越過權威邊界★
+        #   —— 定案不是唯一該擋的地方。在臨界區外面先收斂+檢查(見
+        #   `_guard_grid_shifts`)。
+        self._guard_grid_shifts(ym, "套用排班結果")
         with self.storage.write_barrier():
             self._accept_day_locked(ym, day_slots, report, expect, today)
 
     def _accept_day_locked(self, ym: str, day_slots: dict,
                            report: "str | None", expect,
                            today: "date | None" = None) -> None:
-        """`accept_day_solution` 的本體。★呼叫端必須持有 `write_barrier`★"""
+        """`accept_day_solution` 的本體。★呼叫端必須持有 `write_barrier`★
+
+        ★臨界區裡面要再驗一次★(外審第七輪 R1 P2):理由同
+        `_build_export_locked` —— 鎖外那一次是出口,這一次才是閘門。
+        (`expect=None` 的呼叫端連 revision 都不比,更是只剩這一道。)"""
+        self._guard_grid_shifts_locked(ym, "套用排班結果")
         # ★驗證用的輸入也要是權威的★(外審 2026-08-22 P1-01):門診模板/梯次/
         #   名單任一讀不到時,寬鬆載入會回空 —— 求解那次若讀到同一個空狀態,
         #   兩邊指紋相等就放行,而那份班表少了整批診間或整批 Clerk。
@@ -4023,6 +4047,39 @@ class RosterService:
                 f"請到設定頁確認該梯次的起始日，或到切片格網把開放的那幾格"
                 f"改到正確的一週；改完不必重開程式")
         return out
+
+    def _guard_grid_shifts(self, ym: str, what: str) -> None:
+        """★權威性動作之前的硬閘門★(外審第七輪 P2)。
+
+        原本只有【定案】擋得住,而 `accept_day_solution` 會把班表寫進 canonical
+        月檔、`build_export` 會產出★要發出去的正式 Word/Excel★ —— 兩者都已經
+        越過權威邊界。切片格網停在改起始日之前的那一週時,那一梯的切片格子
+        落在梯次涵蓋範圍外而被忽略(切片室整梯等於沒開),而畫面上看不出來。
+        「有未收斂的持久義務」≠「可以產生權威結果」。
+
+        ★出口與定案那條一樣★:先自己收斂一次,使用者修好起始日/格網之後
+        不必重開程式。★這一步要在臨界區【外面】做★(`reconcile_…` 自己要拿
+        臨界區),所以這個方法只給還沒進臨界區的公開入口用。
+        """
+        self._raise_grid_shifts(self.require_grid_shifts_reconciled(ym), what)
+
+    def _guard_grid_shifts_locked(self, ym: str, what: str) -> None:
+        """★臨界區【裡面】的那一道★(外審第七輪 R1 P2)。
+
+        鎖外那一道是【出口】(它順便收斂),但它與取得 `write_barrier` 之間是
+        check-then-act —— 背景 pull 或另一支執行緒可以在那個縫裡寫進一筆未收斂
+        的平移意圖,而 pending 的寫入用的正是同一把 barrier。
+        ★這裡只做純檢查、不收斂★:呼叫端已經持鎖,而 `reconcile_…` 自己也要拿。
+        (定案那條路早就是這個形狀,這一批把 accept/export 補齊。)
+        """
+        self._raise_grid_shifts(self.pending_grid_shift_blockers(ym), what)
+
+    @staticmethod
+    def _raise_grid_shifts(pend: list, what: str) -> None:
+        if pend:
+            raise PendingGridShiftError(
+                f"切片格網的平移還沒收斂,先處理好才能{what}:\n\n"
+                + "\n".join(f"• {m}" for m in pend))
 
     def require_grid_shifts_reconciled(self, ym: str, *, inp=None) -> list:
         """同上,但★先自己收斂一次★ → 使用者修好之後不必重開程式就能過關。

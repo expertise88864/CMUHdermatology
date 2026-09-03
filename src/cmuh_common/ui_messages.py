@@ -118,7 +118,17 @@ _EXPENDABLE_UI_MESSAGES = (
 
 
 def is_expendable_ui_message(msg) -> bool:
-    """這一筆訊息丟掉之後還會再來嗎?"""
+    """這一筆訊息丟掉之後還會再來嗎?
+
+    ★可丟與否是【看值】不是只看型別★(外審第七輪 P3-high):
+    `UiClinicDataMessage` 整個 class 原本都算可丟 —— 但同一個 class 裡的
+    `is_live_final=True` ★是那位醫師「最後那筆完整成功的即時資料」★,
+    而遠期止掛提醒的掃描★只能由它解鎖★(錯誤/半套/快取都不算,見
+    `main.py` 那段說明)。把它跟一般的定時更新一起當成「丟了還會再來」,
+    佇列滿的時候就可能★把該寄的提醒的唯一憑據丟掉★。
+    """
+    if isinstance(msg, UiClinicDataMessage):
+        return not getattr(msg, "is_live_final", False)
     return isinstance(msg, _EXPENDABLE_UI_MESSAGES)
 
 

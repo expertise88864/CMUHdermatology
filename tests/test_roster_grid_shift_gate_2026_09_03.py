@@ -209,3 +209,162 @@ class TestItIsWiredUp:
                                     "pre_digest": ""}]}, fh)
         svc.finalize(YM, False)              # 不可以拋
         assert svc.storage.load_month(YM).get("finalized") is not True
+
+
+# ══ 權威邊界不只定案(外審第七輪 P2)══════════════════════════════════════
+class TestTheAuthoritativeBoundary:
+    """★「有未收斂的持久義務」≠「可以產生權威結果」★
+
+    第一版只擋了定案。但 `accept_day_solution` 會把班表寫進 canonical 月檔、
+    `build_export` 會產出★要發出去的正式 Word/Excel★ —— 兩者都已經越過權威
+    邊界。切片格網停在改起始日之前的那一週時,那一梯的切片格子落在梯次涵蓋
+    範圍外而被忽略(切片室整梯等於沒開),而畫面上看不出來。
+    """
+
+    def _stuck(self, tmp_path):
+        """格網對不上新舊任何一邊 → 收斂會拒絕搬動、意圖留著。"""
+        svc = _svc(tmp_path, grid_days=[date(2026, 9, 21)])
+        svc.storage.save_month(YM, {"day_slots": {
+            MON.isoformat(): {"上午": {"101": ["C1"]}}}})
+        return svc
+
+    def test_accept_is_blocked(self, tmpdir_path):
+        """★套用會寫進 canonical 月檔★ —— 定案不是唯一該擋的地方。"""
+        svc = self._stuck(tmpdir_path)
+        before = svc.storage.load_month(YM).get("day_slots")
+        with pytest.raises(PendingGridShiftError) as e:
+            svc.accept_day_solution(YM, {"2026-09-08": {
+                "上午": {"101": ["C2"]}}})
+        assert "b1" in str(e.value)
+        assert svc.storage.load_month(YM).get("day_slots") == before, \
+            "★被擋下來卻已經寫進去了★"
+
+    def test_export_is_blocked(self, tmpdir_path):
+        """★匯出的是要發出去的正式文件★:印出去就收不回來了。"""
+        svc = self._stuck(tmpdir_path)
+        with pytest.raises(PendingGridShiftError):
+            svc.build_export(YM)
+
+    def test_preview_is_not_blocked_but_says_why(self, tmpdir_path):
+        """★預覽不擋★(它沒有副作用,擋了只會讓人連畫面都打不開)——
+        但★要把原因講在警告裡★,否則使用者會遇到「排得出來卻套不下去」
+        而不知道去修什麼。"""
+        svc = self._stuck(tmpdir_path)
+        res = svc.run_day_solve(YM)
+        assert res.day_slots is not None, "預覽不該被擋"
+        assert any("切片格網" in w for w in res.warnings), res.warnings
+
+    def test_they_pass_once_it_is_reconcilable(self, tmpdir_path):
+        """★出口在這三條路上都要通★:格網還在舊窗 → 進臨界區之前的收斂會
+        把它搬好 → 套用/匯出都做得下去(不必重開程式)。"""
+        svc = _svc(tmpdir_path, grid_days=[OLD])
+        svc.storage.save_month(YM, {"day_slots": {
+            MON.isoformat(): {"上午": {"101": ["C1"]}}}})
+        svc.accept_day_solution(YM, {MON.isoformat(): {
+            "上午": {"101": ["C2"]}}})
+        assert svc.build_export(YM) is not None
+        assert svc.storage.load_pending_grid_shifts() == []
+
+    def test_the_gate_runs_outside_the_write_barrier(self, tmpdir_path):
+        """★收斂要在臨界區【外面】做★:`reconcile_…` 自己要拿臨界區,
+        在裡面呼叫就是巢狀(基底層是 RLock 會過,GitSync 那層不保證)。
+        判準:閘門的呼叫要排在 `write_barrier()` 之前。"""
+        import ast
+        import inspect
+        import textwrap
+        for fn in (RosterService.accept_day_solution,
+                   RosterService.build_export):
+            src = textwrap.dedent(inspect.getsource(fn))
+            names = [n.func.attr for n in ast.walk(ast.parse(src))
+                     if isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Attribute)
+                     and n.func.attr in ("_guard_grid_shifts",
+                                         "write_barrier")]
+            assert names[:2] == ["_guard_grid_shifts", "write_barrier"], \
+                f"{fn.__name__}: {names}"
+
+
+class TestTheRaceBetweenTheGateAndTheBarrier:
+    """★閘門在鎖外、動作在鎖內 = check-then-act★(外審第七輪 R1 P2)。
+
+    背景 pull 或另一支執行緒可以在那個縫裡寫進一筆未收斂的平移意圖 ——
+    而 pending 的寫入用的正是同一把 barrier,所以那是真的會發生的交錯。
+    定案那條路早就在臨界區裡面再驗一次;這一批把 accept/export 補齊。
+
+    反例的做法:把 `write_barrier` 換成一個★進入時才寫進 pending★的替身
+    (那正是「鎖外檢查通過之後、鎖內動作之前」那一刻)。
+    """
+
+    def _svc_ok(self, tmp_path):
+        """一開始是乾淨的(鎖外那一道會放行)。"""
+        svc = _svc(tmp_path, pending=False, grid_days=[MON])
+        svc.storage.save_month(YM, {"day_slots": {
+            MON.isoformat(): {"上午": {"101": ["C1"]}}}})
+        return svc
+
+    def _inject_on_enter(self, svc, monkeypatch):
+        from contextlib import contextmanager
+        real = svc.storage.write_barrier
+        path = os.path.join(svc.storage.base_dir, "pending_grid_shift.json")
+
+        @contextmanager
+        def _barrier():
+            with real():
+                # ★就在這一刻★:鎖外的檢查已經過了,鎖內的動作還沒開始。
+                svc.storage.save_biopsy_grid(
+                    {"b1": {"2026-09-21": {"上午": True}}})
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump({"pending": [{
+                        "batch_id": "b1", "old_start": OLD.isoformat(),
+                        "new_start": MON.isoformat(), "pre_digest": ""}]}, fh)
+                yield
+        monkeypatch.setattr(svc.storage, "write_barrier", _barrier)
+
+    def test_accept_still_refuses(self, tmpdir_path, monkeypatch):
+        svc = self._svc_ok(tmpdir_path)
+        before = svc.storage.load_month(YM).get("day_slots")
+        self._inject_on_enter(svc, monkeypatch)
+        with pytest.raises(PendingGridShiftError):
+            svc.accept_day_solution(YM, {"2026-09-08": {
+                "上午": {"101": ["C2"]}}})
+        assert svc.storage.load_month(YM).get("day_slots") == before, \
+            "★縫裡插進來的 pending 沒擋住,班表已經寫下去了★"
+
+    def test_export_still_refuses(self, tmpdir_path, monkeypatch):
+        svc = self._svc_ok(tmpdir_path)
+        self._inject_on_enter(svc, monkeypatch)
+        with pytest.raises(PendingGridShiftError):
+            svc.build_export(YM)
+
+    def test_the_inner_check_does_not_reconcile(self, tmpdir_path):
+        """★鎖內那一道只能純檢查★:呼叫端已經持鎖,而收斂自己也要拿。"""
+        import ast
+        import inspect
+        import textwrap
+        src = textwrap.dedent(inspect.getsource(
+            RosterService._guard_grid_shifts_locked))
+        called = {n.func.attr for n in ast.walk(ast.parse(src))
+                  if isinstance(n, ast.Call)
+                  and isinstance(n.func, ast.Attribute)}
+        assert "pending_grid_shift_blockers" in called, called
+        assert "require_grid_shifts_reconciled" not in called, \
+            "★鎖內不可以呼叫會拿鎖的收斂★"
+
+    def test_both_layers_are_wired(self):
+        """★兩道都要在★:鎖外那一道是【出口】(順便收斂),鎖內那一道才是
+        擋得住競態的閘門 —— 少任何一道都是這一輪 finding 的形狀。"""
+        import ast
+        import inspect
+        import textwrap
+        pairs = ((RosterService.build_export,
+                  RosterService._build_export_locked),
+                 (RosterService.accept_day_solution,
+                  RosterService._accept_day_locked))
+        for outer, inner in pairs:
+            for fn, want in ((outer, "_guard_grid_shifts"),
+                             (inner, "_guard_grid_shifts_locked")):
+                src = textwrap.dedent(inspect.getsource(fn))
+                called = {n.func.attr for n in ast.walk(ast.parse(src))
+                          if isinstance(n, ast.Call)
+                          and isinstance(n.func, ast.Attribute)}
+                assert want in called, f"{fn.__name__} 少了 {want}"
