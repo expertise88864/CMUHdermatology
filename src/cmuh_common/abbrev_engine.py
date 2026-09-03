@@ -31,7 +31,7 @@ import time
 from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from cmuh_common.atomic_io import atomic_write_json, safe_load_json_ex
 
@@ -639,8 +639,62 @@ def _ensure_imm_configured() -> None:
         logging.debug("[abbrev] IMM signatures 設定失敗", exc_info=True)
 
 
+# [AB-09] 「因為輸入法而不展開」的原因分類。★兩者的處置不同,所以不可以壓成同一個
+# 布林★:
+#   IME_SKIP_COMPOSING —— 使用者正打到一半(注音/拼音組字中)。打完就好,不必做事。
+#   IME_SKIP_NATIVE    —— 那個視窗的輸入法停在中文模式。★不切成英數就永遠不會展開★。
+# 這個判斷是★逐視窗★的(Windows 逐視窗記住轉換模式),所以「HIS 展得開」完全不代表
+# 「瀏覽器/記事本展得開」—— 而舊版跳過時只寫 debug log(而 log level 是 INFO),畫面
+# 也沒有任何回饋,於是「安靜地不展開」在使用者眼中就變成「這個功能只有 HIS 能用」。
+IME_SKIP_COMPOSING = "composing"
+IME_SKIP_NATIVE = "native"
+
+
+def _composition_in_progress(imm32: Any, hwnd: int) -> bool:
+    """目標視窗是不是正在組字(注音/拼音打到一半)。Best-effort,讀不到就回 False。
+
+    [AB-09 外審 r1 P2] ★WM_IME_CONTROL 答得出「中/英模式」,卻答不出「是不是正在
+    組字」★。而現代 TSF 輸入法 WM 查詢幾乎一定成功 → 組字中同時也是
+    open+NATIVE → 若只看模式就會全部歸成 IME_SKIP_NATIVE,`IME_SKIP_COMPOSING`
+    實際上永遠到不了,使用者打到一半會被叫去「按 Shift 切英數」(錯的指示)。
+    故在把 WM 的中文模式定案之前,補探一次 composition string。
+    """
+    himc = 0
+    try:
+        himc = imm32.ImmGetContext(hwnd)
+        if not himc:
+            # [外審 r2 P2] 有些舊控制項★只在前景最上層視窗★開 IMM context ——
+            # 下面的 legacy 路徑本來就這樣處理。這裡不跟著做的話,聚焦子視窗查
+            # 不到就會被當成「沒在組字」→ 又退回錯的「按 Shift 切英數」指示。
+            foreground = ctypes.windll.user32.GetForegroundWindow()
+            if foreground and int(foreground) != hwnd:
+                hwnd = int(foreground)
+                himc = imm32.ImmGetContext(hwnd)
+        if not himc:
+            return False
+        size = imm32.ImmGetCompositionStringW(himc, _GCS_COMPSTR, None, 0)
+        return isinstance(size, int) and size > 0
+    except Exception:
+        return False                      # 讀不到就當作沒在組字(維持舊的分類)
+    finally:
+        if himc:
+            try:
+                imm32.ImmReleaseContext(hwnd, himc)
+            except Exception:
+                pass
+
+
 def should_skip_for_input_method() -> bool:
     """前景視窗正在「中文輸入」→ 回 True (跳過展開)。Best-effort。
+
+    只回「要不要跳過」。要知道★是哪一種原因★(處置不同)請用
+    `input_method_skip_reason()` —— 本函式是它的薄包裝。
+    """
+    return input_method_skip_reason() is not None
+
+
+def input_method_skip_reason() -> Optional[str]:
+    """回 IME_SKIP_COMPOSING / IME_SKIP_NATIVE;不需跳過則回 None。Best-effort。
 
     [v6 2026-05-28] 重點修正「英文模式被誤擋」bug：
       注音/微軟 IME 即使切到英文模式，ImmGetOpenStatus 仍回 True (IME 仍開啟)。
@@ -658,7 +712,7 @@ def should_skip_for_input_method() -> bool:
         imm32 = ctypes.windll.imm32
         hwnd = _get_focused_window_handle()
         if not hwnd:
-            return False
+            return None
 
         # [v7 2026-06-15] 先用「跨行程可靠」的 WM_IME_CONTROL 查目標執行緒 IME 視窗:
         # 在 HIS/Word 等其他程式打字時,舊的 ImmGetContext 路徑讀不到中文模式 → 縮寫
@@ -676,8 +730,14 @@ def should_skip_for_input_method() -> bool:
                     int(ime_wnd), _WM_IME_CONTROL, _IMC_GETOPENSTATUS, 0,
                     timeout_ms=120)
                 if ok_conv and ok_open:
-                    return bool(open_status) and bool(
-                        conv_mode & _IME_CMODE_NATIVE)
+                    if open_status and (conv_mode & _IME_CMODE_NATIVE):
+                        # 中文模式底下★還要再分一層★:正在組字的處置是「打完就好」,
+                        # 停在中文模式的處置是「切英數」—— 給錯指示比不給更糟。
+                        if _composition_in_progress(imm32, hwnd):
+                            return IME_SKIP_COMPOSING
+                        return IME_SKIP_NATIVE
+                    # 英文模式 / IME 關閉 → 放行,不必也不該去探組字狀態。
+                    return None
         except Exception:
             logging.debug("[abbrev] WM_IME_CONTROL 查詢失敗,改用舊路徑",
                           exc_info=True)
@@ -692,14 +752,14 @@ def should_skip_for_input_method() -> bool:
                 hwnd = int(foreground)
                 himc = imm32.ImmGetContext(hwnd)
         if not himc:
-            return False
+            return None
         try:
             # 1. 正在組字 → 一定跳過 (打到一半的注音/拼音)
             try:
                 size = imm32.ImmGetCompositionStringW(
                     himc, _GCS_COMPSTR, None, 0)
                 if isinstance(size, int) and size > 0:
-                    return True
+                    return IME_SKIP_COMPOSING
             except Exception:
                 pass
             # 2. conversion mode：用 NATIVE flag 判斷中/英 (authoritative)
@@ -713,21 +773,23 @@ def should_skip_for_input_method() -> bool:
                 )
                 if ok:
                     # 中文模式 → 跳過；英文模式 (NATIVE off) → 允許展開
-                    return bool(conversion.value & _IME_CMODE_NATIVE)
+                    if conversion.value & _IME_CMODE_NATIVE:
+                        return IME_SKIP_NATIVE
+                    return None
             except Exception:
                 pass
             # 3. conversion 不可讀 → fallback OpenStatus (舊 IMM IME)
             try:
                 if imm32.ImmGetOpenStatus(himc):
-                    return True
+                    return IME_SKIP_NATIVE
             except Exception:
                 pass
         finally:
             imm32.ImmReleaseContext(hwnd, himc)
-        return False
+        return None
     except Exception:
         logging.debug("[abbrev] IME 偵測失敗", exc_info=True)
-        return False
+        return None
 
 
 # -----------------------------------------------------------------------------
@@ -1468,6 +1530,9 @@ class AbbrevEngine:
     SUPPRESS_SELFHEAL_MARGIN_SEC = 2.0
     # [AB-08] buffer 閒置多久（s）自動清空：避免很久前打的殘字與現在打的拼成假縮寫。
     BUFFER_IDLE_CLEAR_SEC = 10.0
+    # [AB-09] 「因輸入法而跳過展開」的通報限流（s）：同一個原因最多每 N 秒講一次。
+    # 醫師連打好幾組縮寫時,若每次都寫 log / 推 UI 會洗版,反而把訊息埋掉。
+    IME_SKIP_NOTICE_INTERVAL_SEC = 60.0
 
     def __init__(self, kb_module: Any) -> None:
         """kb_module = `keyboard` PyPI 套件物件（已 import 完成）。"""
@@ -1506,8 +1571,52 @@ class AbbrevEngine:
         # [2026-06-08] 本次 install 實際強制關閉了哪些外部展開程式（供 UI 跳提示用）。
         # 每次 install 重置；非空代表這次真的關掉了東西、main.py 應主動跳提示告知使用者。
         self._closed_expanders: list = []
+        # [AB-09] 「因輸入法而跳過展開」的對外通報 callback 與限流時間戳（per reason）。
+        self._ime_skip_notifier: Optional[Callable[[str, str], None]] = None
+        self._ime_skip_last_notice: dict[str, float] = {}
 
     # ------------------------------------------------------------------ 公開 API
+    def set_ime_skip_notifier(
+        self, cb: Optional[Callable[[str, str], None]]
+    ) -> None:
+        """設定「因輸入法而跳過展開」的通報 callback(傳 None 解除)。
+
+        callback 收到 (reason, abbrev),reason 是 IME_SKIP_* 之一。
+        ★它在 keyboard hook 執行緒被呼叫,不可以直接碰 Tk★ —— main.py 走
+        put_ui_message(佇列)把訊息交回 UI 緒。限流在引擎這一端做,呼叫端不必再擋。
+        """
+        self._ime_skip_notifier = cb
+
+    def _note_ime_skip(self, reason: str, abbrev: str) -> None:
+        """把「安靜地沒展開」變成看得見的事:限流的 INFO log + 通報 UI。
+
+        ★訊息要能分開兩個原因★:組字中是「打完就好」,中文模式是「不切英數就永遠
+        不會展開」—— 對使用者而言處置完全不同。
+        """
+        now = time.monotonic()
+        last = self._ime_skip_last_notice.get(reason)
+        if last is not None and now - last < self.IME_SKIP_NOTICE_INTERVAL_SEC:
+            logging.debug("[abbrev] 輸入法(%s)跳過 '%s'(限流中,不重複通報)",
+                          reason, abbrev)
+            return
+        self._ime_skip_last_notice[reason] = now
+        if reason == IME_SKIP_NATIVE:
+            logging.info(
+                "[abbrev] 目前這個視窗的輸入法在中文模式 → 跳過展開 '%s'。"
+                "按 Shift 切成英數即可展開。此判斷是逐視窗的,所以在 HIS 展得開"
+                "不代表瀏覽器/記事本也展得開。", abbrev)
+        else:
+            logging.info(
+                "[abbrev] 輸入法組字中 → 跳過展開 '%s'(把這個字打完就會恢復)。",
+                abbrev)
+        cb = self._ime_skip_notifier
+        if cb is None:
+            return
+        try:
+            cb(reason, abbrev)
+        except Exception:
+            logging.debug("[abbrev] IME 跳過通報 callback 失敗", exc_info=True)
+
     def install(self, cfg: AbbrevConfig) -> None:
         """套用設定並掛上 keyboard hook。重複呼叫會先 uninstall 再裝。
 
@@ -1781,10 +1890,15 @@ class AbbrevEngine:
 
         # IME 中文模式或組字中 → 跳過（best-effort；新 TSF IME 上 IMM API 可能無效，
         # 偵測不到時就照常展開 — 寧可展開也不要整個功能卡死）
-        if self._cfg.skip_when_ime_active and should_skip_for_input_method():
-            logging.debug("[abbrev] IME 中文模式或組字中，跳過 '%s'", matched_key)
-            self._ime_skipped = True     # [AB-08] 通知觸發端清空 buffer(非保留)
-            return False
+        if self._cfg.skip_when_ime_active:
+            ime_reason = input_method_skip_reason()
+            if ime_reason is not None:
+                self._ime_skipped = True  # [AB-08] 通知觸發端清空 buffer(非保留)
+                # [AB-09] 這條★是本函式唯一「依當前聚焦視窗而不同」的閘門★,也就是
+                # 「HIS 展得開、瀏覽器展不開」唯一可能的來源。舊版只寫 debug log
+                # (log level=INFO)且畫面無回饋 → 使用者只看得到「沒反應」。
+                self._note_ime_skip(ime_reason, matched_key)
+                return False
 
         raw_expansion = self._lookup[matched_key]
         try:

@@ -459,7 +459,7 @@ def test_suppressing_blocks_within_cooldown(monkeypatch):
 
 def test_abbrev_triggers_only_on_whole_word(monkeypatch):
     monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
-    monkeypatch.setattr(ae, "should_skip_for_input_method", lambda: False)
+    monkeypatch.setattr(ae, "input_method_skip_reason", lambda: None)  # [AB-09] _try_expand 改用「原因」版;patch 舊名字等於沒 patch
     eng = _make_engine()
     eng.install(AbbrevConfig(enabled=True, items=[
         {"abbrev": "st", "expansion": "keep stable"}]))
@@ -485,7 +485,7 @@ def test_da_abbrev_boundary_english_and_chinese(monkeypatch):
     """user 回報案例：'da' 日期縮寫只能在「空白/標點/字首」後觸發。
     英文字母在前 (clida) 或中文字在前 (病灶da) 都是黏在別的字裡 → 不展開。"""
     monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
-    monkeypatch.setattr(ae, "should_skip_for_input_method", lambda: False)
+    monkeypatch.setattr(ae, "input_method_skip_reason", lambda: None)  # [AB-09] _try_expand 改用「原因」版;patch 舊名字等於沒 patch
     eng = _make_engine()
     eng.install(AbbrevConfig(enabled=True, items=[
         {"abbrev": "da", "expansion": "da"}]))
@@ -507,7 +507,7 @@ def test_da_abbrev_boundary_english_and_chinese(monkeypatch):
 def test_handle_event_typing_word_then_space_does_not_misfire(monkeypatch):
     """整合：逐字打 'persist' 再按空白，不應觸發展開（_suppressing 保持 False）。"""
     monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
-    monkeypatch.setattr(ae, "should_skip_for_input_method", lambda: False)
+    monkeypatch.setattr(ae, "input_method_skip_reason", lambda: None)  # [AB-09] _try_expand 改用「原因」版;patch 舊名字等於沒 patch
     eng = _make_engine()
     eng.install(AbbrevConfig(enabled=True, items=[
         {"abbrev": "st", "expansion": "keep stable"}]))
@@ -579,7 +579,7 @@ def _feed_and_capture_do_replace(monkeypatch, expansion, *, abbrev="bx",
                                  preserve_trailing=True):
     """安裝含 expansion 的縮寫、打 abbrev+空白,回傳 _do_replace 收到的 args。"""
     monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
-    monkeypatch.setattr(ae, "should_skip_for_input_method", lambda: False)
+    monkeypatch.setattr(ae, "input_method_skip_reason", lambda: None)  # [AB-09] _try_expand 改用「原因」版;patch 舊名字等於沒 patch
     eng = _make_engine()
     eng.install(AbbrevConfig(enabled=True, preserve_trailing_space=preserve_trailing,
                              items=[{"abbrev": abbrev, "expansion": expansion}]))
@@ -622,7 +622,7 @@ def test_cursor_marker_at_end_offset_zero(monkeypatch):
 def test_handle_event_backspace_correction_still_triggers(monkeypatch):
     """打錯字→backspace 修正→重打，仍應觸發展開（user 回報：cery→⌫→t→空白 = cert）。"""
     monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
-    monkeypatch.setattr(ae, "should_skip_for_input_method", lambda: False)
+    monkeypatch.setattr(ae, "input_method_skip_reason", lambda: None)  # [AB-09] _try_expand 改用「原因」版;patch 舊名字等於沒 patch
     eng = _make_engine()
     eng.install(AbbrevConfig(enabled=True, items=[
         {"abbrev": "cert", "expansion": "patient cert"}]))
@@ -694,7 +694,7 @@ class _SyncThread:
 
 def _make_event_engine(monkeypatch, items):
     monkeypatch.setattr(ae, "_list_process_names", lambda: {"notepad.exe"})
-    monkeypatch.setattr(ae, "should_skip_for_input_method", lambda: False)
+    monkeypatch.setattr(ae, "input_method_skip_reason", lambda: None)  # [AB-09] _try_expand 改用「原因」版;patch 舊名字等於沒 patch
     monkeypatch.setattr(ae.threading, "Thread", _SyncThread)
     # 焦點控制項 HWND 固定回 focus_ref["h"](預設 100、穩定 → 不會誤清 buffer);
     # 焦點測試可改 focus_ref["h"] 模擬「滑鼠點到別的欄位」。
@@ -846,7 +846,7 @@ def test_ab08_idle_clears_before_trigger_space(monkeypatch):
     eng._cfg = AbbrevConfig(enabled=True, skip_when_ime_active=False)
     expanded = []
     monkeypatch.setattr(eng, "_do_replace", lambda *a, **k: expanded.append(a))
-    monkeypatch.setattr(ae, "should_skip_for_input_method", lambda: False)
+    monkeypatch.setattr(ae, "input_method_skip_reason", lambda: None)  # [AB-09] _try_expand 改用「原因」版;patch 舊名字等於沒 patch
     eng._handle_event(_K("d"))
     eng._handle_event(_K("f"))
     assert eng._buffer == "df"
@@ -860,7 +860,9 @@ def test_ab08_ime_skip_clears_buffer(monkeypatch):
     eng = _engine_with_lookup({"df": "dermatofibroma"})
     eng._cfg = AbbrevConfig(enabled=True, skip_when_ime_active=True)
     monkeypatch.setattr(eng, "_do_replace", lambda *a, **k: None)
-    monkeypatch.setattr(ae, "should_skip_for_input_method", lambda: True)
+    # [AB-09] _try_expand 改用「原因」版:patch 舊名字等於沒 patch。
+    monkeypatch.setattr(ae, "input_method_skip_reason",
+                        lambda: ae.IME_SKIP_NATIVE)
     eng._handle_event(_K("d"))
     eng._handle_event(_K("f"))
     assert eng._buffer == "df"

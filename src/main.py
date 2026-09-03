@@ -290,6 +290,7 @@ from cmuh_common.abbrev_engine import (
     AbbrevEngine,
     AbbrevConfig,
     DEFAULT_ITEMS as ABBREV_DEFAULT_ITEMS,
+    IME_SKIP_NATIVE,
     MAX_ABBREV_LENGTH,
     ensure_config_file as ensure_abbrev_config_file,
     load_config as load_abbrev_config,
@@ -13781,6 +13782,12 @@ class AutomationApp:
         if eng is None:
             eng = AbbrevEngine(hotkey_modules.keyboard)
             self.abbrev_engine = eng
+            # [AB-09] 「因輸入法而跳過展開」要說出來:那是唯一會依當前視窗不同的
+            # 閘門(HIS 展得開、瀏覽器展不開的來源),舊版完全沒有回饋。
+            try:
+                eng.set_ime_skip_notifier(self._on_abbrev_ime_skip)
+            except Exception:
+                logging.debug("[abbrev] 掛 IME 跳過通報失敗", exc_info=True)
             # [v6] 啟動週期監看：外部文字展開程式 (PhraseExpress 等) 出現/消失
             # 時自動暫停/恢復本程式縮寫
             if not getattr(self, '_abbrev_monitor_started', False):
@@ -13791,6 +13798,22 @@ class AutomationApp:
                     logging.debug("[abbrev] 啟動 external monitor 失敗",
                                   exc_info=True)
         return eng
+
+    def _on_abbrev_ime_skip(self, reason: str, abbrev: str) -> None:
+        """縮寫因輸入法被跳過時的通報(★由 keyboard hook 執行緒呼叫★)。
+
+        所以這裡★只能走 put_ui_message 佇列★,不可以直接碰 Tk 元件。
+        引擎端已限流(同一原因每 60s 一次),這裡不再擋。
+        """
+        try:
+            if reason == IME_SKIP_NATIVE:
+                text = (f"狀態: 縮寫「{abbrev}」未展開 —— 這個視窗的輸入法在中文模式,"
+                        "按 Shift 切成英數即可(輸入法模式是逐視窗記憶的)")
+            else:
+                text = f"狀態: 縮寫「{abbrev}」未展開 —— 輸入法組字中,打完這個字即可"
+            put_ui_message(self.ui_queue, UiStatusMessage(text=text))
+        except Exception:
+            logging.debug("[abbrev] IME 跳過通報推送失敗", exc_info=True)
 
     def _maybe_warn_abbrev_external_conflict(self, ext: str | None) -> None:
         """縮寫啟用且偵測到其他展開器時，單次提示使用者目前本程式會暫停縮寫。"""
@@ -14307,6 +14330,17 @@ class AutomationApp:
 
         # [2026-07-13 使用者] 三項行為（中文組字中暫停、保留結尾空白、自動關閉其他縮寫
         # 軟體）啟用縮寫速寫後一律自動開啟；不再顯示勾選，也不顯示說明文字。
+        # [AB-09 2026-09-03] 但「適用範圍」要講:縮寫掛的是全域鍵盤 hook,HIS 以外
+        # (瀏覽器、記事本、Word…)本來就會展開。使用者回報「只有 HIS 有效」,實際是
+        # 上面那個「中文組字中暫停」——它★依當前視窗的輸入法模式★判斷,而 Windows
+        # 是逐視窗記住中/英模式的。這一行是回答那個困惑,不是把設定選項加回來。
+        ttk.Label(
+            ctrl_frame,
+            text=("適用於所有程式（瀏覽器、記事本、Word 等），不限 HIS。"
+                  "若某個視窗打了縮寫沒反應，多半是該視窗的輸入法在中文模式——"
+                  "按 Shift 切成英數即可（中/英模式是逐視窗記憶的）。"),
+            foreground="#607D8B", wraplength=560, justify="left",
+        ).pack(anchor='w', padx=10, pady=(0, 6))
 
         # 縮寫列表
         list_frame = ttk.LabelFrame(_body, text="縮寫清單（雙擊可編輯）")
@@ -16787,6 +16821,15 @@ class AutomationApp:
                 logging.exception("[abbrev] setup_hotkeys 結尾 install 失敗")
         except Exception as e:
             logging.error(f"Failed to register hotkeys: {e}", exc_info=True)
+            # [AB-09] ★縮寫速寫獨立於熱鍵,失敗路徑也一定要重掛★:本函式開頭已經
+            # safe_unhook_all_hotkeys() 把 abbrev 的全域 hook 一起拔掉,而重掛只寫在
+            # 成功路徑的結尾。熱鍵註冊一旦拋例外 → 縮寫在★所有程式(含 HIS)★一起
+            # 失效,而且 retry 五次用完就再也不會重掛,只能重啟主程式。
+            # 其餘每一條 unhook 路徑(院外模式、解析度不符)都有重掛,只有這裡漏了。
+            try:
+                self._install_abbrev_listeners()
+            except Exception:
+                logging.exception("[abbrev] 熱鍵註冊失敗路徑 install 失敗")
             put_ui_message(self.ui_queue, UiStatusMessage(text='狀態: 熱鍵註冊失敗! 請檢查權限'))
             self.hotkey_text_label.config(text="熱鍵註冊失敗!")
             es = str(e)
