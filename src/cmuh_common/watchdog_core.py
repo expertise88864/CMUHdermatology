@@ -27,7 +27,7 @@ from pathlib import Path
 
 from cmuh_common.atomic_io import (atomic_write_json, safe_load_json,
                                    safe_load_json_ex)
-from cmuh_common.paths import pinned_app_dir
+from cmuh_common.paths import get_settings_dir, pinned_app_dir
 from cmuh_common.process_launch import launch_python_script
 from cmuh_common.update_policy import suspend_auto_updates
 
@@ -931,10 +931,181 @@ def start_program(pyw_path: Path, pythonw: str) -> int:
         return 0
 
 
-#: `log_status()` 的三態(R3-P3-01)。
+#: `log_status()` 的狀態(R3-P3-01 三態 + 第九輪 §5 第四態)。
 LOG_OK = "ok"                 # 讀得到 mtime
 LOG_ABSENT = "absent"         # 檔案不在
 LOG_UNREADABLE = "unreadable"  # 在,但 stat 失敗(權限/被鎖/磁碟)
+LOG_CLOCK_JUMP = "clock_jump"  # 本 tick 牆上時鐘剛跳動 / 系統剛睡過 → 新鮮度無從判斷
+
+
+# ─── 時間基準與喚醒守衛(第九輪 §5)────────────────────────────────────────
+# 舊的陳舊判定是 `time.time() - st_mtime > max_stale`。牆上時鐘會做兩件 log 本身
+# 沒做的事:★系統睡眠★(診間電腦午休/隔夜)與★被調整★(NTP/人工)。
+#   * 睡 N 分鐘醒來:每支程式的 mtime 都停在睡前,age 一律 ≥ N ≥ max_stale;而被監看
+#     程式的 heartbeat 是 sleep/wait 驅動、醒來才補寫,watchdog 醒來卻立刻 tick ——
+#     誰先醒是擲硬幣,watchdog 先醒就 ★kill 一支完全健康的程式★。
+#   * 時鐘往回:age 變小/負,卡死的程式看起來很新(第八輪指出的方向)。
+# 修法分兩層,缺一不可:
+#   1. 喚醒/跳動守衛:每 tick 比較「牆上時鐘走了多少」與「系統醒著的時間走了多少」
+#      (Windows `QueryUnbiasedInterruptTime`,★文件明定不含睡眠★;取不到退回
+#      monotonic)。差值超過容忍 → 本 tick 隔離:所有 log 新鮮度回 LOG_CLOCK_JUMP、
+#      不以它動手,並把進展基準重設為現在。這一條同時涵蓋往回跳(差值為負)。
+#   2. 進展觀察:年齡改成「最後一次觀察到 mtime/size 變化,距今★醒著★多久」,而不是
+#      「mtime 與現在牆上時鐘差幾秒」。只有守衛沒有這一層的話,隔離只保護第一個 tick,
+#      第二個 tick 又拿睡前的 mtime 算年齡 → 照樣 kill。
+# `--once`(schtasks 每 2 分鐘起一個新行程)沒有行程內的上一 tick,所以 (wall, awake)
+# 與各 log 的基準會落盤到 settings/CLOCK_STATE_FILENAME;讀不到就當第一次(退回牆上時鐘年齡、
+# 不隔離)。多寫者(inner 執行緒 + outer)的 lost update 無害:最壞是基準重設晚一輪。
+# ★誠實的邊界★:保護力靠「awake 時鐘不含睡眠」這個性質。Windows 的
+# `QueryUnbiasedInterruptTime` 文件明定如此;退回 `time.monotonic()` 時(非 Windows /
+# API 失敗)它是否含睡眠沒有實測(fetch_resilience 的 docstring 說了同一件事)——若含,
+# Δwall−Δawake 為 0 → 不隔離、年齡也含睡眠 → ★退回今天的行為(醒來可能誤殺)★,
+# 但永遠不會因此誤隔離或誤放。所以這個守衛的失效模式是「沒幫上忙」,不是「幫倒忙」。
+# 在診間機器實測一次 monotonic 跨睡眠的行為,是使用者要做的量測(不進 CI)。
+CLOCK_JUMP_TOLERANCE_SEC = 60.0
+CLOCK_STATE_FILENAME = ".watchdog_clock.json"
+
+_CLOCK_LOCK = threading.Lock()
+_CLOCK: dict = {
+    "prev_wall": None,      # 本行程上一 tick 的牆上時鐘
+    "prev_awake": None,     # 本行程上一 tick 的醒著時間
+    "quarantined": False,   # 本 tick 是否隔離
+    "jump": 0.0,            # 本 tick 觀測到的跳動秒數(Δwall − Δawake)
+    "logs": {},             # normcase(path) → {"mtime","size","seen_awake"}
+}
+
+
+def _wall_now() -> float:
+    return time.time()
+
+
+def _awake_now() -> float:
+    """系統「醒著」的秒數(不含睡眠/休眠)。
+
+    Windows:`QueryUnbiasedInterruptTime`(kernel32,Win7+),100ns 單位,文件明定
+    ★不包含★系統睡眠/休眠期間。取不到(非 Windows / API 失敗)退回 `time.monotonic()`。
+    """
+    if os.name == "nt":
+        try:
+            import ctypes
+            t = ctypes.c_ulonglong(0)
+            if ctypes.windll.kernel32.QueryUnbiasedInterruptTime(ctypes.byref(t)):
+                return t.value / 1e7
+        except Exception:
+            pass
+    return time.monotonic()
+
+
+def _clock_state_path() -> str:
+    """狀態檔位置:呼叫時透過 `get_settings_dir()` 取,不是 import 期算死的常數。
+
+    生產上 `get_settings_dir()` 與 `SETTINGS_DIR` 是同一個目錄(兩者都以啟動器釘住的
+    app 根為準);差別在★測試★:conftest 只會把 `get_app_dir()` 系的路徑導向每個
+    測試的 tmp,`_ROOT` 系的常數不會 —— 第一版用常數,結果每個跑到 `run_one_tick`
+    的測試都把狀態檔寫進真的 settings/,而且跨測試互相看到對方的假時鐘。
+    """
+    return os.path.join(get_settings_dir(), CLOCK_STATE_FILENAME)
+
+
+def _reset_clock_state() -> None:
+    """測試用:清掉行程內的時間基準狀態(生產路徑不呼叫)。"""
+    with _CLOCK_LOCK:
+        _CLOCK.update(prev_wall=None, prev_awake=None, quarantined=False,
+                      jump=0.0, logs={})
+
+
+def _load_clock_state() -> tuple:
+    """回 (prev_wall, prev_awake, logs) —— 讀不到/壞掉一律 (None, None, {})。"""
+    try:
+        data = safe_load_json(_clock_state_path(), {}) or {}
+        pw, pa = data.get("wall"), data.get("awake")
+        if not isinstance(pw, (int, float)) or not isinstance(pa, (int, float)):
+            return None, None, {}
+        logs = {}
+        raw = data.get("logs")
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if (isinstance(v, dict)
+                        and all(isinstance(v.get(f), (int, float))
+                                for f in ("mtime", "size", "seen_awake"))):
+                    logs[str(k)] = {"mtime": float(v["mtime"]),
+                                    "size": int(v["size"]),
+                                    "seen_awake": float(v["seen_awake"])}
+        return float(pw), float(pa), logs
+    except Exception:
+        return None, None, {}
+
+
+def _save_clock_state(wall: float, awake: float) -> None:
+    try:
+        atomic_write_json(_clock_state_path(),
+                          {"wall": wall, "awake": awake, "logs": _CLOCK["logs"]})
+    except Exception:
+        logging.debug("[watchdog] 寫入時間基準狀態失敗", exc_info=True)
+
+
+def _flush_clock_state() -> None:
+    """tick ★結束★時落盤:`_note_tick` 在 tick 開頭存的是「上一輪」的基準,本輪
+    `log_status` 新建/更新的基準只在記憶體裡。長命行程下一輪開頭會補存,但
+    `--once` 跑完就結束 —— 不在這裡 flush,新行程永遠拿不到任何基準,每次都是
+    「第一次觀測」→ 牆上時鐘年齡 → 喚醒守衛在 --once 上等於沒裝。"""
+    with _CLOCK_LOCK:
+        if _CLOCK["prev_wall"] is None:
+            return                              # 這個行程還沒 tick 過,沒東西可存
+        _save_clock_state(_CLOCK["prev_wall"], _CLOCK["prev_awake"])
+
+
+def _note_tick() -> float:
+    """每個 tick 開頭呼叫一次。回本 tick 觀測到的時鐘跳動秒數(Δwall − Δawake)。
+
+    |跳動| > CLOCK_JUMP_TOLERANCE_SEC → 本 tick 隔離(`log_status` 一律回
+    LOG_CLOCK_JUMP、呼叫端不以新鮮度動手),並把所有 log 的進展基準重設為「現在」——
+    下一個 tick 起年齡從 0 用醒著的時間重新累積。★隔離只持續這一個 tick★:下一 tick
+    差值回到 0 就恢復正常判定;程式真的卡死,仍會在 max_stale 醒著的秒數後被抓到
+    (抑制要有出口)。
+    """
+    wall, awake = _wall_now(), _awake_now()
+    with _CLOCK_LOCK:
+        pw, pa = _CLOCK["prev_wall"], _CLOCK["prev_awake"]
+        if pw is None:
+            # 本行程第一個 tick(含 --once):拿落盤的上一 tick 與各 log 基準來比。
+            pw, pa, logs = _load_clock_state()
+            if not _CLOCK["logs"] and logs:
+                _CLOCK["logs"] = logs
+        jump = 0.0 if pw is None else (wall - pw) - (awake - pa)
+        quarantined = abs(jump) > CLOCK_JUMP_TOLERANCE_SEC
+        _CLOCK.update(prev_wall=wall, prev_awake=awake,
+                      quarantined=quarantined, jump=jump)
+        if quarantined:
+            for rec in _CLOCK["logs"].values():
+                rec["seen_awake"] = awake          # 進展基準重設:從現在開始觀察
+            logging.warning(
+                "[watchdog] 牆上時鐘與醒著時間差了 %+.0fs → 系統剛睡過或時鐘被調;"
+                "本輪不以 log 新鮮度動手(不 kill、不啟動),進展基準重設", jump)
+        _save_clock_state(wall, awake)
+    return jump
+
+
+def _observe_progress(log_path: Path, mtime: float, size: int) -> float:
+    """回這個 log「最後一次觀察到變化」距今★醒著★的秒數。
+
+    第一次觀測沒有進展歷史 → 只能用牆上時鐘的 mtime 年齡(誠實的退路);但★本 tick
+    若已隔離,連這個退路都不能用★(牆上時鐘剛跳過,mtime 年齡正是不可信的那個數),
+    改從現在開始觀察 —— 否則隔離結束後的第一個 tick 會拿灌水的年齡去 kill。
+    """
+    key = os.path.normcase(os.path.abspath(str(log_path)))
+    now_awake = _awake_now()
+    with _CLOCK_LOCK:
+        rec = _CLOCK["logs"].get(key)
+        if rec is None:
+            age = 0.0 if _CLOCK["quarantined"] else max(0.0, _wall_now() - mtime)
+            _CLOCK["logs"][key] = {"mtime": float(mtime), "size": int(size),
+                                   "seen_awake": now_awake - age}
+            return age
+        if (float(mtime), int(size)) != (rec["mtime"], rec["size"]):
+            rec.update(mtime=float(mtime), size=int(size), seen_awake=now_awake)
+            return 0.0
+        return max(0.0, now_awake - rec["seen_awake"])
 
 
 def log_status(log_path: Path, max_stale_sec: int) -> tuple:
@@ -956,10 +1127,15 @@ def log_status(log_path: Path, max_stale_sec: int) -> tuple:
     if not log_path.exists():
         return False, 0.0, LOG_ABSENT
     try:
-        age = time.time() - log_path.stat().st_mtime
-        return age > max_stale_sec, age, LOG_OK
+        st = log_path.stat()
     except Exception:
         return False, 0.0, LOG_UNREADABLE
+    # [第九輪 §5] 年齡 = 最後一次觀察到變化距今★醒著★多久,不是「mtime 與牆上時鐘差幾秒」。
+    age = _observe_progress(log_path, st.st_mtime, st.st_size)
+    if _CLOCK["quarantined"]:
+        # 本 tick 牆上時鐘剛跳動/系統剛睡過:新鮮度無從判斷 → 第四態,呼叫端不動手。
+        return False, age, LOG_CLOCK_JUMP
+    return age > max_stale_sec, age, LOG_OK
 
 
 def is_log_stale(log_path: Path, max_stale_sec: int) -> tuple:
@@ -1159,6 +1335,11 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
             #   `exists()/stat()` 自己判,於是「log 檔不在」直接掉到下面的
             #   「mutex 確認健在」—— 那正是這一批要修的靜音失敗。
             _m_stale, _m_age, _m_state = log_status(log_path, max_stale)                 if log_path is not None else (False, 0.0, LOG_OK)
+            if _m_state == LOG_CLOCK_JUMP:
+                # [第九輪 §5] mutex 持有 + 時鐘剛跳動:「log 沒更新」是睡眠/調時造成的
+                # 假象,不可以走下面的半死 kill 路徑。本輪只觀察。
+                return (f"⏭ {name}: mutex 持有，但時鐘剛跳動/系統剛喚醒，"
+                        f"log 新鮮度本輪無從判斷，不動手 [{mode}]")
             if log_path is not None and max_stale > 0 and _m_state != LOG_OK:
                 logging.warning(
                     "[watchdog] %s 的 log %s(%s)→ ★無從判斷新鮮度★,"
@@ -1220,13 +1401,17 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
         # [Fallback 2] log 還新鮮 → 程式幾乎肯定健在，psutil 找不到只是
         # cmdline access 失敗。(mutex 沒持有 → 不會誤判)
         if log_path is not None and max_stale > 0 and log_path.exists():
-            try:
-                age = time.time() - log_path.stat().st_mtime
-                if age < max_stale:
-                    # [v16] 文案改友善
-                    return (f"✓ {name}: log {age:.0f}s 前更新，視為健在 [{mode}]")
-            except Exception:
-                pass
+            # [第九輪 §5] 與其他兩處同一個時間基準(進展觀察 + 喚醒守衛)。
+            _fb_stale, _fb_age, _fb_state = log_status(log_path, max_stale)
+            if _fb_state == LOG_OK and not _fb_stale:
+                # [v16] 文案改友善
+                return (f"✓ {name}: log {_fb_age:.0f}s 前更新，視為健在 [{mode}]")
+            if _fb_state == LOG_CLOCK_JUMP:
+                # 找不到 PID 也沒 mutex,但時鐘剛跳過:「log 很舊」不可信 → 本輪不啟動
+                # 新 instance(啟動了頂多撞單例退出,但沒必要賭),下一輪再判。
+                return (f"⏭ {name}: 時鐘剛跳動/系統剛喚醒，log 新鮮度本輪無從判斷，"
+                        f"不啟動新 instance [{mode}]")
+            # LOG_UNREADABLE(stat 失敗)維持舊行為:往下走啟動流程。
         if not claim_action_lock(name, action_lock_sec):
             return f"⏭ {name}: 沒在跑，但 lock 還新（別人剛動過手），這輪先跳過"
         # [D] Crash loop 偵測 — 短時間內反覆啟動 → 暫停
@@ -1244,6 +1429,12 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
     if log_path is not None and max_stale > 0:
         stale, age, log_state = log_status(log_path, max_stale)
         _c2_state, _c2_age = log_state, age
+        if log_state == LOG_CLOCK_JUMP:
+            # [第九輪 §5] 在跑 + 時鐘剛跳動:這正是「喚醒後殺健康程式」的那一格。
+            # 本輪不 kill、不重啟,只觀察;程式真的卡死,下一輪起用醒著的時間累積年齡,
+            # max_stale 秒後照樣抓到。
+            return (f"⏭ {name}: PID {pids} 在跑，但時鐘剛跳動/系統剛喚醒，"
+                    f"log 新鮮度本輪無從判斷，不動手 [{mode}]")
         if log_state != LOG_OK:
             # ★據實記一筆★:行程在跑、log 檔卻不在/讀不到 —— 那是 logging
             #   壞掉的樣子,而不是「這支程式很健康」。這一批不改重啟行為
@@ -1296,7 +1487,21 @@ def run_one_tick(mode: str, log_fn=None) -> list:
 
     log_fn: 用來決定哪些訊息要寫入 log 的回呼。預設只寫 action/warning，不寫 ✓。
     回傳：[msg, msg, ...]
+
+    [第九輪 §5] 本函式是薄包裝:不論內層從哪一個 early-return 出去,tick 結束一定
+    `_flush_clock_state()` —— `--once` 行程跑完就結束,基準不在這裡落盤就永遠丟了。
     """
+    try:
+        return _run_one_tick_unflushed(mode, log_fn)
+    finally:
+        _flush_clock_state()
+
+
+def _run_one_tick_unflushed(mode: str, log_fn=None) -> list:
+    # [第九輪 §5] 先記錄時鐘:牆上時鐘與醒著時間的差值決定本 tick 是否隔離。
+    # 排在所有 early-return 之前,設定檔讀不到的那一輪也要記,否則下一輪拿到的
+    # 「上一 tick」會是更早的,跳動量被放大/縮小。
+    _note_tick()
     cfg = load_config()
     # [2026-07-26 審查] 設定檔只是【暫時】讀不到(防毒/備份鎖檔)時,拿到的是記憶體預設值:
     # master_enabled 預設 False 會讓 watchdog 這輪什麼都不做(還好),但若預設是 True,

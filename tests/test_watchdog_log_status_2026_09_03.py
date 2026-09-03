@@ -45,11 +45,21 @@ def test_an_unreadable_log_is_its_own_state(tmp_path, monkeypatch):
     p = tmp_path / "a.log"
     p.write_text("x", encoding="utf-8")
     import cmuh_common.watchdog_core as wc
+    # [第九輪 §5 修正] 「讀不到」= ★stat 失敗★。第一版用 `time.time()` 拋例外來冒充,
+    # 那不是生產會發生的失敗形狀;年齡改用進展觀察後它也不再落在 stat 的 try 裡。
+    real_stat = Path.stat
+
+    def _stat_denied(self, *a, **k):
+        if self == p:
+            raise PermissionError("no")
+        return real_stat(self, *a, **k)
+    monkeypatch.setattr(Path, "stat", _stat_denied)
+    # `Path.exists()` 會把 stat 的 OSError 吞成 False → 那會變成「不存在」。生產上
+    # 「在、但 stat 被拒」的形狀是 exists 為真而 stat 拋;這裡把 exists 釘成真。
     real_exists = Path.exists
-    monkeypatch.setattr(Path, "exists", real_exists)
-    monkeypatch.setattr(
-        wc.time, "time",
-        lambda: (_ for _ in ()).throw(PermissionError("no")))
+    monkeypatch.setattr(Path, "exists",
+                        lambda self, *a, **k: True if self == p else real_exists(self, *a, **k))
+    assert wc is not None
     stale, _age, status = log_status(p, 180)
     assert status == LOG_UNREADABLE and stale is False
 
