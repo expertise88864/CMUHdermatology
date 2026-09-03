@@ -136,7 +136,17 @@ def test_month_allday_rest_only_on_closed_afternoons():
     每個人每天至少有一個時段有事做。同時確認公平未被犧牲：
     PGY 照光/治療室差 ≤1、[RS-24] Clerk ★跟診差 ≤1★ 且切片次數一致。
 
-    ([RS-24] 切片室改成配額平均、由跟診最多者去 —— 兩邊的次數要一起平。)"""
+    ([RS-24] 切片室改成配額平均、由跟診最多者去 —— 兩邊的次數要一起平。)
+
+    ★[RS-35 使用者 2026-09-03] 這一條沒有例外,而且優先權在跟診一致之上★
+    使用者中途要求過「每人跟診次數★完全一致★」(RS-34)。實測那要把多出來的
+    座位留空,而留空必然有人放假 —— 貪婪求解又會把留空丟在整梯的最後幾格,
+    於是這個配置從「10/11/10/11/10 且★無人整天放假★」變成
+    「全員 10 但★一人整天放假★」。使用者權衡之後改回來:
+    「盡量不要整天放假沒錯,但是不要求每人跟診次數完全一致(可以正負一,
+      例如有人七次有人八次可以接受)」。
+    所以:跟診全距 ≤1 就夠(`CLERK_SEAT_MAX_SPREAD`),
+    ★整天放假仍然只允許發生在下午全院無診的日子★。"""
     grid, bio = _weekday_grid(date(2026, 8, 3), date(2026, 8, 28),
                               ["101", "103"], ["101", "102", "105"])
     batch = ClerkBatch("b1", date(2026, 8, 3), ["1", "2", "3", "4", "5"])
@@ -172,16 +182,10 @@ def test_month_allday_rest_only_on_closed_afternoons():
         return max(vals) - min(vals)
     assert spread(photo, "ABCD") <= 1, f"PGY 照光不均: {photo}"
     assert spread(tx, "ABCD") <= 1, f"PGY 治療室不均: {tx}"
-    assert spread(seat, batch.members) == 0, \
-        f"[RS-34] Clerk 跟診次數要完全一致: {seat}"
-    # ★整天放假唯一的合法理由★:那個人已經跟滿整梯的配額,座位因此留空。
-    _target = seat[batch.members[0]]
+    assert spread(seat, batch.members) <= 1, \
+        f"[RS-35] Clerk 跟診次數全距要 ≤1: {seat}"
+    # ★整天放假沒有例外★(RS-35:它的優先權在跟診一致之上)。
     for iso, idle in idle_days:
         wd = '一二三四五六日'[date.fromisoformat(iso).weekday()]
-        others = [p for p in idle if p not in batch.members]
-        assert not others, f"{iso}(週{wd}) ★非 Clerk 整天放假★: {others}"
-        short = [p for p in idle if seat.get(p, 0) != _target]
-        assert not short, (
-            f"{iso}(週{wd}) ★還沒跟滿就整天放假★: "
-            f"{[(p, seat.get(p, 0)) for p in short]}(配額 {_target})")
+        assert not idle, f"{iso}(週{wd}) ★有人整天放假★: {idle}"
     assert spread(biopsy, batch.members) <= 1, f"Clerk 切片不均: {biopsy}"

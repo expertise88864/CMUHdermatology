@@ -42,7 +42,8 @@ from cmuh_common.roster.model import (
 from cmuh_common.roster.solve_day import (
     TWO_PGY_PHOTO_ONLY, apply_locked_adjustments,
     arbitration_order, batch_biopsy_slots, biopsy_quota_warnings,
-    clerk_batches_ended_by, clerk_seat_band_warnings,
+    clerk_batches_ended_by, clerk_full_attendance,
+    clerk_seat_band_warnings,
     clerk_seat_uneven_warnings,
     day_input_fingerprint, day_owner_batch,
     is_follow_slot,
@@ -1212,10 +1213,16 @@ class RosterService:
             # 與求解器同一個判準:整梯走完才談「偏少」(跨月梯次排完第一個月
             # 時必然不足,那是還沒排到、不是事實)。
             ended_ids=ended) + clerk_seat_uneven_warnings(
-            # [RS-34] ★求解當下說過的話,手改之後要有人再說一次★:自動排班
-            #   會把跟診次數拉成完全一致,使用者在月曆上挪一格就破功 ——
-            #   而那一格是他自己挪的,沒有人會再算一次。判準與求解器共用。
-            inp.clerk_batches, counts, only_ids=active & ended)
+            # [RS-34/RS-35] ★求解當下說過的話,手改之後要有人再說一次★:
+            #   自動排班會把跟診次數收進 ±1,使用者在月曆上挪一格就可能破功
+            #   —— 而那一格是他自己挪的,沒有人會再算一次。
+            #   ★判準與求解器共用★(容許範圍、以及「請假者比較少不算」):
+            #   否則求解器合法排出的 9/9/10 會在這裡被點名,變成
+            #   「系統要求你去修一個它自己認為正確的班表」。
+            inp.clerk_batches, counts, only_ids=active & ended,
+            base_ids={(b.id, c) for b in inp.clerk_batches
+                      for c in clerk_full_attendance(
+                          inp, b, (inp.leaves.get("clerk") or {}))})
 
     def _course_seat_counts(self, ym: str, order, course_days=()) -> dict:
         """整梯的【跟診】次數,逐日以勝者梯次歸屬 → {(梯次 id, 代號): 次數}。

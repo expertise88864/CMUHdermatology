@@ -1132,8 +1132,18 @@ def clerk_full_attendance(inp, b, clerk_leave) -> list:
             if not ((clerk_leave.get(c) or set()) & days)]
 
 
-def clerk_seat_uneven_warnings(batches, counts, *, only_ids=None) -> list:
-    """[RS-34] 整梯跟診次數★沒能拉成一致★的點名 → 人話警告清單。
+def clerk_seat_uneven_warnings(batches, counts, *, only_ids=None,
+                               base_ids=None) -> list:
+    """[RS-34/RS-35] 整梯跟診次數★超出容許範圍★的點名 → 人話警告清單。
+
+    ★判準與求解器共用同一個容許範圍★(`CLERK_SEAT_MAX_SPREAD`,外審 RS-35
+    R1 P2-2):使用者定案「可以正負一」,而求解器合法排出的 9/9/10 若在這裡
+    被點名「不一致」,就是★自動排班與現況檢查互相打架★ —— 使用者會被要求去
+    手動修一個系統自己認為正確的班表。
+
+    `base_ids` = 整梯全勤的成員 `{(梯次, 代號)}`。有給的話,★請假者比全勤者
+    少多少都不點名★(那是他自己請假、補不回來,RS-33 的「偏少」另外點);
+    只有【比全勤者的水準高出容許範圍】才算。沒給就退回「全體一起比」。
 
     `counts` = {(梯次 id, 代號): 跟診次數}(與 `clerk_seat_band_warnings`
     同一個形狀,求解器餵公平計數、service 餵存檔的現況)。
@@ -1148,10 +1158,15 @@ def clerk_seat_uneven_warnings(batches, counts, *, only_ids=None) -> list:
         if only_ids is not None and b.id not in only_ids:
             continue
         c2 = {c: int(counts.get((b.id, c), 0)) for c in sorted(b.members)}
-        if not c2 or max(c2.values()) == min(c2.values()):
+        if not c2:
+            continue
+        _base = [n for c, n in c2.items()
+                 if base_ids is None or (b.id, c) in base_ids] or list(
+                     c2.values())
+        if max(c2.values()) - min(_base) <= CLERK_SEAT_MAX_SPREAD:
             continue
         out.append(
-            f"跟診次數不一致（梯次 {b.id}）："
+            f"跟診次數相差超過 {CLERK_SEAT_MAX_SPREAD} 次（梯次 {b.id}）："
             + "、".join(f"{c}×{n}" for c, n in c2.items())
             + " —— 自動排班已排到它做得到的最平，剩下的差距來自鎖定時段、"
               "上個月已排好的班或手動調整，請自行於月曆調整")
@@ -1312,7 +1327,7 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
     #   —— 不必用 `best is None` 這種型別上證不出來的寫法。
     caps: dict = {}
     day_slots, log, warnings, fc = _solve_month_once(inp)
-    best_cost = _clerk_equal_cost(inp, fc)
+    best_cost = _clerk_equal_cost(inp, fc, day_slots)
     best_out = (day_slots, log, warnings, fc)
     for _pass in range(1, CLERK_EQUALIZE_MAX_PASSES):
         nxt = _clerk_equal_seat_caps(inp, fc, caps)
@@ -1326,7 +1341,7 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
             break
         caps = nxt
         day_slots, log, warnings, fc = _solve_month_once(inp, seat_cap=caps)
-        cost = _clerk_equal_cost(inp, fc)
+        cost = _clerk_equal_cost(inp, fc, day_slots)
         if cost < best_cost:
             best_cost, best_out = cost, (day_slots, log, warnings, fc)
     # ★收斂不了就交出最好的那一趟★:硬要再壓只會愈壓愈少,而排班本身仍然
@@ -1336,40 +1351,89 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
     #    而且更早的一趟若已經一致,上面那個 `return` 早就走掉了。)
     _ds, _log, _warn, _fc = best_out
     _y, _m = int(inp.ym[:4]), int(inp.ym[5:7])
+    _leave = (inp.leaves.get("clerk") or {})
     return _ds, _log, list(_warn) + clerk_seat_uneven_warnings(
         inp.clerk_batches,
         {(b, c): n for k, n in _fc.seat.items()
          if isinstance(k, tuple) and len(k) == 3 and k[0] == "clerk"
          for _ns, b, c in (k,)},
         only_ids=clerk_batches_ended_by(
-            inp.clerk_batches, date(_y, _m, monthrange(_y, _m)[1])))
+            inp.clerk_batches, date(_y, _m, monthrange(_y, _m)[1])),
+        base_ids={(b.id, c) for b in inp.clerk_batches
+                  for c in clerk_full_attendance(inp, b, _leave)})
 
 
 #: [RS-34] 求解最多跑幾趟(第一趟量、其餘收斂)。每趟約 2ms,上限只是止損。
 CLERK_EQUALIZE_MAX_PASSES = 6
 
 
-def _clerk_equal_cost(inp: DaySolveInput, fc: FairCounters) -> tuple:
-    """這一趟的好壞 →(★不一致的總量★, 少排的座位數)。越小越好。
+#: [RS-35 使用者 2026-09-03] Clerk 跟診次數可以差幾次。
+#: 使用者原話:「不要求每人跟診次數完全一致(可以正負一,例如有人七次有人
+#: 八次可以接受,有人十次有人九次可以接受)」,而且★「盡量不要整天放假」
+#: 要排在前面★。
+#: ★為什麼「完全一致」要退回來★:要做到全距 0 就得把多出來的座位留空,
+#: 而留空必然有人放假 —— 貪婪求解又會把留空丟在整梯的最後幾格,於是最早
+#: 跟滿的那個人在最後一天整天沒事做(RS-34 實測:10/11/10/11/10 且無人整天
+#: 放假 → 全員 10 但一人整天放假)。使用者權衡之後選了前者。
+CLERK_SEAT_MAX_SPREAD = 1
 
-    第一鍵是使用者要的東西(全距);第二鍵讓「一樣一致」的兩趟裡,
-    ★留空比較少★的那一趟勝出 —— 一致不該用浪費跟診機會去換更多。
+
+def _whole_day_rests(day_slots: dict) -> int:
+    """整天沒事做的人次(★週三不算★ —— 下午全院無診是設計如此)。
+
+    [2026-07-27 使用者]「若非放假不可,也盡量讓每人每天至少有半天有事做」。
+    RS-35 把它★排在跟診一致之上★,所以求解器挑趟數時要看得到這個數。
     """
-    spread = seats = 0
+    out = 0
+    for iso, sessions in (day_slots or {}).items():
+        try:
+            d = date.fromisoformat(iso)
+        except (ValueError, TypeError):
+            continue
+        if d.weekday() == WED:
+            continue
+        people: set = set()
+        worked: set = set()
+        for _s, slots in (sessions or {}).items():
+            for slot, ppl in (slots or {}).items():
+                people |= set(ppl or [])
+                if slot != REST:
+                    worked |= set(ppl or [])
+        out += len(people - worked)
+    return out
+
+
+def _clerk_equal_cost(inp: DaySolveInput, fc: FairCounters,
+                      day_slots: dict) -> tuple:
+    """這一趟的好壞 →(★超出容許範圍的量★, ★整天放假人次★, 少排的座位數)。
+
+    ★鍵的順序就是使用者的優先序★(RS-35,2026-09-03 定案):
+    ① 跟診全距★超過 ±1 的部分★ —— 全距 0 與全距 1 ★一樣好★,
+       所以不會為了把 1 壓成 0 而多留空;
+    ② ★整天放假人次★ —— 一樣好的兩趟裡,選沒有人整天閒著的那一趟。
+       (使用者先要過「完全一致」,實測那會把留空全丟在整梯最後幾格 →
+        最早跟滿的人整天沒事做;權衡之後他把這一條放回前面。)
+    ③ 少排的座位數 —— 前兩項都一樣時,留空比較少的勝出。
+    """
+    excess = seats = 0
     for b in inp.clerk_batches:
         members = dedupe_codes(b.members)
         if not members:
             continue
         ns = [fc.seat.get(("clerk", b.id, c), 0) for c in members]
-        spread += max(ns) - min(ns)
+        excess += max(0, (max(ns) - min(ns)) - CLERK_SEAT_MAX_SPREAD)
         seats -= sum(ns)
-    return (spread, seats)
+    return (excess, _whole_day_rests(day_slots), seats)
 
 
 def _clerk_equal_seat_caps(inp: DaySolveInput, fc: FairCounters,
                            caps: dict) -> "dict | None":
-    """[RS-34] 這一趟的結果 → 下一趟的 {(梯次, 代號): 該跟幾次}。
-    ★回 None = 已經一致,不必再排★。
+    """[RS-34/RS-35] 這一趟的結果 → 下一趟的 {(梯次, 代號): 該跟幾次}。
+    ★回 None = 已經落在容許範圍內,不必再排★。
+
+    ★容許範圍是 ±1,不是完全一致★(使用者 2026-09-03 定案,見
+    `CLERK_SEAT_MAX_SPREAD`):要壓到全距 0 就得多留空,而留空必然有人放假
+    —— 使用者權衡之後,把「盡量不要整天放假」放在前面。
 
     ★只管【已經走完】的梯次★(`clerk_batches_ended_by`):跨月梯次在第一個
     月只排得到一半,那時候的總數不是整梯的總數,拿它算配額會把人壓到一半。
@@ -1380,10 +1444,9 @@ def _clerk_equal_seat_caps(inp: DaySolveInput, fc: FairCounters,
     由全勤者的平均決定,請假者★不會被拉高也不會拉低別人★(他本來就落後,
     上限對他不生效),差額由月底的點名說明。全員都請過假 → 退回全員平均。
 
-    ★第一趟用平均、之後用最小值★:平均是「理論上該有幾次」,但貪婪求解不
-    保證每個人都搆得到(實測 1 間診 3 個人:平均 10,排出來是 9/10/10)。
-    搆不到就往下收斂到「大家都真的做得到」的那一階 —— 而且★每一趟至少要
-    降 1★,否則同一個數字會反覆重排而不收斂。
+    ★目標是「最少的人 + 1」★:那正好是容許範圍的上緣 —— 壓到那裡就夠了,
+    再往下壓只是白白留空。搆不到就往下收斂一階,而且★每一趟至少要降 1★,
+    否則同一個數字會反覆重排而不收斂。
 
     ★已經套上的上限要留著★:某一梯這一趟拉齊了,下一趟不能把它的上限拿掉
     —— 一拿掉就退回原樣,永遠收斂不了。
@@ -1393,7 +1456,7 @@ def _clerk_equal_seat_caps(inp: DaySolveInput, fc: FairCounters,
         inp.clerk_batches, date(_y, _m, monthrange(_y, _m)[1]))
     clerk_leave = (inp.leaves.get("clerk") or {})
     out: dict = dict(caps)
-    changed = False
+    unresolved = False
     for b in inp.clerk_batches:
         if b.id not in ended:
             continue
@@ -1404,31 +1467,37 @@ def _clerk_equal_seat_caps(inp: DaySolveInput, fc: FairCounters,
         base = clerk_full_attendance(inp, b, clerk_leave) or members
         base_ns = [counts[c] for c in base]
         level = min(base_ns)
-        if max(base_ns) == level and max(counts.values()) <= level:
-            continue                  # 真的一致了(請假者落後不算)
+        # ★落在 ±1 之內就收工★(RS-35):請假者比全勤者★少★多少都不算
+        #   (那是他自己請假,補不回來);但請假者比全勤者★多★超過容許範圍
+        #   仍然要處理(鎖定格/跨月回放做得到,見 RS-34 R1 P1-2)。
+        if max(counts.values()) - level <= CLERK_SEAT_MAX_SPREAD:
+            continue
+        unresolved = True
         prev = out.get((b.id, base[0]))
         # ★每一趟至少降 1★(`prev - 1`),所以這個迴圈一定會停:同一個數字
         #   反覆重排只會得到同一個結果。
         #   (原本這裡還多寫了一個「target >= prev 就強制降」的保險 ——
         #    突變驗證抓到它★永遠不會成立★:`min(…, prev - 1)` 已經保證了。
         #    ★量不到的守衛是死碼★,刪掉而不是留著誤導。)
-        if max(base_ns) == level:
-            # ★全勤者已經一致,是【請假者反而比較多】★(外審 RS-34 R1 P1-2):
-            #   鎖定格與跨月回放都會把次數加進 `fc.seat`,所以這是可達狀態。
-            #   目標就是全勤者這個水準 —— ★不可以再往下壓全勤者★
-            #   (那是拿他們的跟診機會去追一個可能追不到的數)。
-            #   下一趟若還是同一組上限,`month_solve_day` 會判定「再排也不會變」
-            #   而停手並點名 —— 既有的鎖定/上個月的班表這一次求解改不動。
-            target = level
-        elif prev is None:
-            target = sum(base_ns) // len(base_ns)
-        else:
-            target = min(min(base_ns), prev - 1)
+        # ★目標 = 最少的人 + 容許範圍★(容許範圍的上緣,壓到這裡就夠)。
+        target = level + CLERK_SEAT_MAX_SPREAD
+        # ★只有【全勤者自己還超出範圍】時才繼續往下收斂★
+        #   (外審 RS-35 R1 P2-1):全勤者已經在範圍內、只是請假者因為鎖定格
+        #   或跨月回放而超出時,`prev - 1` 會★逐趟把全勤者一起壓低★ ——
+        #   那是拿他們的跟診機會去追一個這一次求解改不動的數,而且會製造
+        #   不必要的整天放假,正好違反 RS-35 的優先序。
+        #   這時維持 `level + 容許範圍`:下一趟算出同一組上限 →
+        #   `month_solve_day` 判定「再排也不會變」而停手,交出最好的那一趟並點名。
+        if prev is not None and (max(base_ns) - level) > CLERK_SEAT_MAX_SPREAD:
+            target = min(target, prev - 1)     # ★每一趟至少降 1★,保證會停
         if target < 0:
-            continue
+            continue                           # 不再降(上面的 unresolved 會讓
+            #                                     呼叫端看到「同一組上限」而停手)
         out.update({(b.id, c): target for c in members})
-        changed = True
-    return out if changed else None
+    # ★回 None 只代表「全部落在容許範圍內」★(外審 RS-35 R1 P2-1):
+    #   還有超出、但這一次求解改不動時要回 `out`(可能與 `caps` 一模一樣)
+    #   —— 呼叫端據此停手並交出【最好的那一趟】,而不是把最後一趟誤當成收斂。
+    return out if unresolved else None
 
 
 def _solve_month_once(inp: DaySolveInput, seat_cap=None) -> tuple:

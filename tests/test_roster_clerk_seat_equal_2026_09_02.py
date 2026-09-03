@@ -1,9 +1,20 @@
 # -*- coding: utf-8 -*-
-"""[RS-34 使用者 2026-09-02] Clerk 跟診次數要★完全一致★。
+"""[RS-34 → RS-35] Clerk 跟診次數的容許範圍。
 
-使用者原話:
-> Clerk 排班雖然限制 7-11 班,但是★每個人都要平均一致★,
-> 例如全部人都是 9 班、全部人都是 8 班等等。
+★使用者改過一次定案,兩句話都要記下來★:
+* 2026-09-02(RS-34):「雖然限制 7-11 班,但是★每個人都要平均一致★,
+  例如全部人都是 9 班、全部人都是 8 班等等」;
+* 2026-09-03(RS-35,★現行★):「重新改回 盡量不要整天放假沒錯,但是
+  ★不要求每人跟診次數完全一致(可以正負一★,例如有人七次有人八次可以接受,
+  有人十次有人九次可以接受)」。
+
+★為什麼會改回來★:要做到全距 0 就得把多出來的座位留空,而留空必然有人
+放假 —— 貪婪求解又會把留空丟在整梯的最後幾格,於是最早跟滿的那個人在最後
+一天整天沒事做。實測那個配置:「10/11/10/11/10 且★無人整天放假★」變成
+「全員 10 但★一人整天放假★」。使用者權衡之後把「不要整天放假」放回前面。
+
+實測帳(480 種配置):第二趟把★全距>1 的 8 種全部收掉★,
+代價是整天放假從 2392 增為 2398 人次(嚴格一致時是 2570)。
 
 ★為什麼 RS-25 的「次數最少者先坐」不夠★
 它只保證全距 ≤1,而且切片室配額用完之後,「今天誰還能坐診」就不再由跟診
@@ -26,7 +37,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import cmuh_common.roster.solve_day as sd  # noqa: E402
 from cmuh_common.roster.model import ClerkBatch  # noqa: E402
 from cmuh_common.roster.solve_day import (  # noqa: E402
-    BIOPSY, CLERK_EQUALIZE_MAX_PASSES, CLERK_SEAT_TARGET_MAX, REST,
+    BIOPSY, CLERK_EQUALIZE_MAX_PASSES, CLERK_SEAT_MAX_SPREAD,
+    CLERK_SEAT_TARGET_MAX, REST,
     DaySolveInput, FairCounters, _clerk_equal_cost, _clerk_equal_seat_caps,
     is_follow_slot, month_solve_day, solve_session,
 )
@@ -85,22 +97,36 @@ def _solve(nam, npm, n, *, npgy=2, bopen=True, leaves=None, start=MON,
 # ══ 使用者要的那件事 ═══════════════════════════════════════════════════════
 class TestEveryoneGetsTheSameNumber:
     def test_the_case_that_used_to_be_uneven(self):
-        """★使用者抱怨的形狀★:1 間診 3 個人,舊行為是 9/10/11(全距 2)。"""
+        """★使用者抱怨的形狀★:1 間診 3 個人,舊行為是 9/10/11(★全距 2★)。
+        現在要收進 ±1 —— 但★不必壓到 0★(RS-35)。"""
         ds, _w, mem = _solve(1, 1, 3)
         c = _counts(ds, mem)
-        assert len(set(c.values())) == 1, f"跟診次數不一致:{c}"
+        assert max(c.values()) - min(c.values()) <= CLERK_SEAT_MAX_SPREAD, c
 
-    def test_a_range_of_shapes_are_all_level(self):
-        """★不是只修好那一個例子★:診間數/人數/PGY 人數的組合都要一致。"""
+    def test_a_range_of_shapes_are_all_within_the_band(self):
+        """★不是只修好那一個例子★:診間數/人數/PGY 人數的組合都要在 ±1 內。"""
         bad = {}
         for nam, npm, n, npgy in ((1, 1, 3, 2), (1, 2, 4, 2), (2, 1, 5, 3),
                                   (2, 3, 5, 2), (3, 3, 4, 4), (5, 5, 6, 2),
                                   (1, 3, 2, 1), (3, 1, 6, 3)):
             ds, _w, mem = _solve(nam, npm, n, npgy=npgy)
             c = _counts(ds, mem)
-            if len(set(c.values())) != 1:
+            if max(c.values()) - min(c.values()) > CLERK_SEAT_MAX_SPREAD:
                 bad[(nam, npm, n, npgy)] = c
-        assert not bad, f"這些配置跟診不一致:{bad}"
+        assert not bad, f"這些配置跟診全距 >1:{bad}"
+
+    def test_a_spread_of_one_is_left_alone(self):
+        """★全距 1 不可以再被壓★(RS-35 的核心):壓它要多留空,
+        而留空必然有人放假 —— 使用者把「不要整天放假」放在前面。
+        判準:餵一份【全勤者已經差 1】的公平計數,不可以再產生上限。"""
+        fc = FairCounters()
+        for c, n in (("C1", 9), ("C2", 10), ("C3", 10)):
+            fc.seat[("clerk", "b1", c)] = n
+        inp = DaySolveInput(
+            ym="2026-09", grid=_grid(3, 3), pgy_roster=["P1", "P2"],
+            clerk_batches=[ClerkBatch("b1", MON, ["C1", "C2", "C3"])],
+            biopsy_open={}, leaves={}, locked={})
+        assert _clerk_equal_seat_caps(inp, fc, {}) is None
 
     def test_the_biopsy_counts_stay_level_too(self):
         """★不可以拿切片的公平去換跟診的公平★(RS-24 是使用者另一條定案)。"""
@@ -149,35 +175,33 @@ class TestHowTheTargetIsComputed:
             self._inp(), self._fc(C1=9, C2=9, C3=9), {})
         assert caps is None
 
-    def test_the_first_target_is_the_average(self):
-        """9+10+11 = 30 → 每人 10(不是最小值 9,那會白白浪費 3 個座位)。"""
+    def test_the_target_is_the_lowest_plus_the_tolerance(self):
+        """★目標 = 最少的人 + 容許範圍★(9/10/11 → 上限 10):那正好是容許
+        範圍的上緣,壓到那裡就夠 —— 再往下壓只是白白留空(RS-35)。"""
         caps = _clerk_equal_seat_caps(
             self._inp(), self._fc(C1=9, C2=10, C3=11), {})
         assert caps == {("b1", c): 10 for c in ("C1", "C2", "C3")}, caps
 
-    def test_it_converges_downwards_when_the_average_is_unreachable(self):
-        """★平均搆不到就往下收斂★:貪婪求解不保證每個人都排得到平均值
-        (實測 1 間診 3 個人:平均 10,排出來是 9/10/10)。"""
-        prev = {("b1", c): 10 for c in ("C1", "C2", "C3")}
-        caps = _clerk_equal_seat_caps(
-            self._inp(), self._fc(C1=9, C2=10, C3=10), prev)
-        assert caps == {("b1", c): 9 for c in ("C1", "C2", "C3")}, caps
+    def test_a_spread_within_the_tolerance_needs_no_pass(self):
+        """★9/10/10 已經在 ±1 內 → 不再重排★(RS-34 時代會再壓成 9/9/9)。"""
+        assert _clerk_equal_seat_caps(
+            self._inp(), self._fc(C1=9, C2=10, C3=10), {}) is None
 
     def test_each_pass_lowers_the_target_by_at_least_one(self):
         """★不降就不會停★:同一個數字反覆重排會一直得到同一個結果。
-        這裡最小值仍是 9(＝上一趟的上限),所以下一階必須是 8。"""
-        prev = {("b1", c): 9 for c in ("C1", "C2", "C3")}
+        這裡「最少的人 + 1」仍是 10(＝上一趟的上限),所以下一階必須是 9。"""
+        prev = {("b1", c): 10 for c in ("C1", "C2", "C3")}
         caps = _clerk_equal_seat_caps(
             self._inp(), self._fc(C1=9, C2=9, C3=11), prev)
-        assert caps == {("b1", c): 8 for c in ("C1", "C2", "C3")}, caps
+        assert caps == {("b1", c): 9 for c in ("C1", "C2", "C3")}, caps
 
     def test_a_leaver_does_not_lower_the_target(self):
         """★分母只算整梯全勤的人★:C3 請假只拿到 3 次,不可以把 C1/C2
-        的配額從 10 拉到 (10+10+3)//3 = 7。"""
+        的上限從「最少的全勤者 + 1」拉下來。"""
         lv = {"C3": {MON + timedelta(days=1)}}
         caps = _clerk_equal_seat_caps(
-            self._inp(leaves=lv), self._fc(C1=10, C2=11, C3=3), {})
-        assert caps[("b1", "C1")] == 10, caps
+            self._inp(leaves=lv), self._fc(C1=10, C2=12, C3=3), {})
+        assert caps[("b1", "C1")] == 11, caps
 
     def test_everyone_on_leave_falls_back_to_the_whole_batch(self):
         lv = {c: {MON + timedelta(days=1)} for c in ("C1", "C2", "C3")}
@@ -204,23 +228,53 @@ class TestHowTheTargetIsComputed:
 
 # ══ 收斂迴圈本身 ═══════════════════════════════════════════════════════════
 class TestTheConvergenceLoop:
-    def test_the_cost_prefers_level_then_fuller(self):
-        """代價的第一鍵是使用者要的東西(不一致的總量);一樣一致時,
-        ★留空比較少★的那一趟勝出 —— 一致不該用浪費跟診機會去換。"""
-        inp = DaySolveInput(
+    def _inp2(self):
+        return DaySolveInput(
             ym="2026-09", grid={}, pgy_roster=[],
             clerk_batches=[ClerkBatch("b1", MON, ["C1", "C2"])],
             biopsy_open={}, leaves={}, locked={})
 
-        def fc(a, b):
-            f = FairCounters()
-            f.seat[("clerk", "b1", "C1")] = a
-            f.seat[("clerk", "b1", "C2")] = b
-            return f
-        assert _clerk_equal_cost(inp, fc(9, 9)) < _clerk_equal_cost(
-            inp, fc(9, 10)), "不一致的那一趟不可以勝出"
-        assert _clerk_equal_cost(inp, fc(9, 9)) < _clerk_equal_cost(
-            inp, fc(8, 8)), "一樣一致時,座位多的勝出"
+    def _fc2(self, a, b):
+        f = FairCounters()
+        f.seat[("clerk", "b1", "C1")] = a
+        f.seat[("clerk", "b1", "C2")] = b
+        return f
+
+    def test_a_spread_of_one_costs_the_same_as_zero(self):
+        """★RS-35 的核心★:全距 0 與全距 1 一樣好 —— 不可以為了把 1 壓成 0
+        而多留一個空位(那會多一個人整天沒事做)。"""
+        inp = self._inp2()
+        assert (_clerk_equal_cost(inp, self._fc2(9, 10), {})[0]
+                == _clerk_equal_cost(inp, self._fc2(9, 9), {})[0])
+
+    def test_a_spread_of_two_costs_more(self):
+        """★對照組★:超過 ±1 就要被扣分(否則這一整套等於關掉)。"""
+        inp = self._inp2()
+        assert (_clerk_equal_cost(inp, self._fc2(9, 11), {})[0]
+                > _clerk_equal_cost(inp, self._fc2(9, 10), {})[0])
+
+    def test_fewer_whole_day_rests_wins(self):
+        """★第二鍵是整天放假人次★(使用者把它排在跟診一致之上)。"""
+        inp = self._inp2()
+        busy = {"2026-09-07": {"上午": {"101": ["C1"]},
+                               "下午": {"101": ["C1"]}}}
+        idle = {"2026-09-07": {"上午": {REST: ["C1"]},
+                               "下午": {REST: ["C1"]}}}
+        assert (_clerk_equal_cost(inp, self._fc2(9, 9), busy)
+                < _clerk_equal_cost(inp, self._fc2(9, 9), idle))
+
+    def test_wednesday_all_day_rest_does_not_count(self):
+        """★週三不算★:下午全院無診是設計如此,不是排班偷懶。"""
+        inp = self._inp2()
+        wed = {"2026-09-09": {"上午": {REST: ["C1"]},
+                              "下午": {REST: ["C1"]}}}
+        assert _clerk_equal_cost(inp, self._fc2(9, 9), wed)[1] == 0
+
+    def test_fuller_wins_when_the_rest_is_equal(self):
+        """兩鍵都一樣時,★留空比較少★的那一趟勝出。"""
+        inp = self._inp2()
+        assert (_clerk_equal_cost(inp, self._fc2(9, 9), {})
+                < _clerk_equal_cost(inp, self._fc2(8, 8), {}))
 
     def test_it_keeps_the_best_pass_not_the_last(self, monkeypatch):
         """★收斂不了就交出最好的那一趟★ —— 最後一趟不保證比先前好
@@ -233,7 +287,7 @@ class TestTheConvergenceLoop:
         monkeypatch.setattr(sd, "CLERK_EQUALIZE_MAX_PASSES", 3)
         n = [0]
 
-        def _cost(_inp, _fc):
+        def _cost(_inp, _fc, _ds):
             n[0] += 1
             return (n[0],)                      # 第一趟最小 = 最好
 
@@ -427,20 +481,55 @@ class TestALeaverWithMoreThanTheOthers:
         return fc
 
     def test_it_is_not_treated_as_converged(self):
+        """★超出容許範圍才算★:請假者多 1 是可以接受的(RS-35),
+        多 2 才要處理。"""
         lv = {"C3": {MON + timedelta(days=1)}}
+        assert _clerk_equal_seat_caps(
+            self._inp(lv), self._fc(C1=9, C2=9, C3=10), {}) is None,             "多 1 在容許範圍內,不該重排"
         caps = _clerk_equal_seat_caps(
-            self._inp(lv), self._fc(C1=9, C2=9, C3=10), {})
-        assert caps is not None, "★請假者比較多卻被當成已收斂★"
-        assert caps[("b1", "C3")] == 9, caps
+            self._inp(lv), self._fc(C1=9, C2=9, C3=11), {})
+        assert caps is not None, "★請假者多 2 卻被當成已收斂★"
+        assert caps[("b1", "C3")] == 10, caps
+
+    def test_repeated_passes_do_not_keep_lowering_the_full_attenders(self):
+        """★外審 RS-35 R1 P2-1★:全勤者已經在容許範圍內、只有請假者因為
+        鎖定格/跨月回放而超出時,★不可以逐趟把全勤者一起壓低★ ——
+        那是拿他們的跟診機會去追一個這一次求解改不動的數,而且會製造不必要的
+        整天放假(正好違反 RS-35 的優先序)。
+
+        判準:同一個狀態連餵三趟,上限必須★停在同一個數★(停手的訊號)。
+        """
+        lv = {"C3": {MON + timedelta(days=1)}}
+        inp, fc = self._inp(lv), self._fc(C1=9, C2=9, C3=11)
+        caps: dict = {}
+        seen = []
+        for _ in range(3):
+            nxt = _clerk_equal_seat_caps(inp, fc, caps)
+            assert nxt is not None, "★還超出卻回 None(會被誤當成收斂)★"
+            seen.append(nxt[("b1", "C1")])
+            if nxt == caps:
+                break
+            caps = nxt
+        assert len(set(seen)) == 1, f"★全勤者被逐趟壓低★:{seen}"
+
+    def test_an_unresolvable_batch_is_not_reported_as_converged(self):
+        """★回 None 只代表「全部落在容許範圍內」★(外審 R1 P2-1):
+        還超出、但改不動時要回同一組上限,呼叫端才會停手並交出【最好的那一趟】
+        —— 回 None 的話 `month_solve_day` 會把★最後一趟★誤當成收斂交出去。"""
+        lv = {"C3": {MON + timedelta(days=1)}}
+        inp, fc = self._inp(lv), self._fc(C1=9, C2=9, C3=11)
+        caps = {("b1", c): 10 for c in ("C1", "C2", "C3")}
+        nxt = _clerk_equal_seat_caps(inp, fc, caps)
+        assert nxt == caps, f"★改不動時要回同一組上限★:{nxt}"
 
     def test_it_does_not_drag_the_full_attenders_down(self):
-        """★目標是全勤者那個水準,不是再往下壓★ —— 壓下去也追不上
+        """★目標是「最少的全勤者 + 1」,不是再往下壓★ —— 壓下去也追不上
         (多出來的次數來自這一次求解改不動的東西)。"""
         lv = {"C3": {MON + timedelta(days=1)}}
-        prev = {("b1", c): 9 for c in ("C1", "C2", "C3")}
+        prev = {("b1", c): 11 for c in ("C1", "C2", "C3")}
         caps = _clerk_equal_seat_caps(
-            self._inp(lv), self._fc(C1=9, C2=9, C3=10), prev)
-        assert caps[("b1", "C1")] == 9, f"全勤者被拉低了:{caps}"
+            self._inp(lv), self._fc(C1=9, C2=9, C3=11), prev)
+        assert caps[("b1", "C1")] == 10, f"全勤者被拉低了:{caps}"
 
     def test_the_loop_stops_instead_of_spinning(self, monkeypatch):
         """★同一組上限就停手★:再排一趟也不會變,繼續壓只是白跑。"""
@@ -463,14 +552,38 @@ class TestALeaverWithMoreThanTheOthers:
         訊息要講清楚差距來自哪裡。"""
         out = sd.clerk_seat_uneven_warnings(
             [ClerkBatch("b1", MON, ["C1", "C2", "C3"])],
-            {("b1", "C1"): 9, ("b1", "C2"): 9, ("b1", "C3"): 10})
-        assert out and "跟診次數不一致" in out[0], out
+            {("b1", "C1"): 9, ("b1", "C2"): 9, ("b1", "C3"): 11})
+        assert out and "跟診次數相差超過" in out[0], out
         assert "鎖定" in out[0] and "手動" in out[0], out[0]
 
     def test_a_level_batch_says_nothing(self):
         assert sd.clerk_seat_uneven_warnings(
             [ClerkBatch("b1", MON, ["C1", "C2"])],
             {("b1", "C1"): 9, ("b1", "C2"): 9}) == []
+
+    def test_a_spread_of_one_says_nothing(self):
+        """★求解器合法排得出 9/10★(RS-35 容許 ±1)—— 在這裡點名等於
+        「系統要求你去修一個它自己認為正確的班表」。"""
+        assert sd.clerk_seat_uneven_warnings(
+            [ClerkBatch("b1", MON, ["C1", "C2"])],
+            {("b1", "C1"): 9, ("b1", "C2"): 10}) == []
+
+    def test_a_leaver_who_is_behind_says_nothing(self):
+        """★請假者比全勤者少多少都不點名★(那是他自己請假、補不回來;
+        RS-33 的「偏少」另外點)。"""
+        assert sd.clerk_seat_uneven_warnings(
+            [ClerkBatch("b1", MON, ["C1", "C2", "C3"])],
+            {("b1", "C1"): 2, ("b1", "C2"): 10, ("b1", "C3"): 10},
+            base_ids={("b1", "C2"), ("b1", "C3")}) == []
+
+    def test_a_leaver_who_is_ahead_still_says_so(self):
+        """★對照組★:請假者反而【高出】容許範圍仍要點名
+        (鎖定格/跨月回放做得到)。"""
+        out = sd.clerk_seat_uneven_warnings(
+            [ClerkBatch("b1", MON, ["C1", "C2", "C3"])],
+            {("b1", "C1"): 12, ("b1", "C2"): 10, ("b1", "C3"): 10},
+            base_ids={("b1", "C2"), ("b1", "C3")})
+        assert out and "C1×12" in out[0], out
 
     def test_only_ids_limits_the_scope(self):
         assert sd.clerk_seat_uneven_warnings(
@@ -489,7 +602,7 @@ class TestALeaverWithMoreThanTheOthers:
         monkeypatch.setattr(sd, "CLERK_EQUALIZE_MAX_PASSES", 2)
         n = [10]
 
-        def _cost(_inp, _fc):
+        def _cost(_inp, _fc, _ds):
             n[0] -= 1
             return (n[0],)                      # 後面的比較好
 
@@ -501,7 +614,7 @@ class TestALeaverWithMoreThanTheOthers:
         ds, _log, warns = month_solve_day(self._inp())
         c = _counts(ds, ["C1", "C2", "C3"])
         assert len(set(c.values())) > 1, f"前提:交出來的那一趟要是不平的:{c}"
-        assert any("跟診次數不一致" in w for w in warns), (warns, c)
+        assert any("跟診次數相差超過" in w for w in warns), (warns, c)
 
 
 class TestTheServiceComputesTheClinicDays:
