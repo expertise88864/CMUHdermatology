@@ -417,12 +417,20 @@ def _retention_rules() -> list:
     """
     return _retention_default_rules(get_settings_dir())
 
-def safe_unhook_all_hotkeys():
+def safe_unhook_all_hotkeys() -> bool:
+    """拔掉所有全域 hook。回 True=確實拔掉;False=`unhook_all()` 自己拋了例外。
+
+    [R8-P2 外審 r1] 舊版只回 None、把例外吞成 warning —— 對「關程式」的呼叫端無所謂,
+    但對「註冊交易 rollback」而言,★rollback 靜默失敗 = 半套熱鍵留在 registry 裡★,
+    正是那一批要消滅的狀態。所以要回報;呼叫端決定要不要在乎。
+    """
     try:
         if hotkey_modules.keyboard is not None:
             hotkey_modules.keyboard.unhook_all()
+        return True
     except Exception as e:
         logging.warning(f"Failed to unhook hotkeys cleanly: {e}")
+        return False
 
 # 總覽門診表「本科主診間」:A101→A102→A103→A104→A105(自家固定診間)。語意:
 #   1) 醫師列不另標這五間的診間號(免冗餘);其餘診間(他科借診/特殊)才顯示「(診間)」。
@@ -16771,7 +16779,29 @@ class AutomationApp:
                     callback()
                 return _gated
 
-            safe_unhook_all_hotkeys()
+            # [R8-P2 外審 r1] ★交易閘門★:rollback 靠 `keyboard.unhook_all()`,而它可能
+            # 失敗(add_hotkey 會失敗的時候,正是 hook 機制不健康的時候 —— 兩者相關聯)。
+            # 不變量「未完整提交的熱鍵不可執行」★不可以依賴 unhook 成功★:每個 callback
+            # 外面包一層閘門,只有「本交易已提交」時才放行。交易開始就把 committed 清成
+            # None → 上一筆交易殘留的 callback(若開頭 unhook 也失敗)同樣變成 inert。
+            self._hotkey_txn = getattr(self, '_hotkey_txn', 0) + 1
+            _txn = self._hotkey_txn
+            self._hotkey_txn_committed = None
+
+            def _txn_gate(callback, key_name, txn=_txn):
+                def _gated():
+                    if getattr(self, '_hotkey_txn_committed', None) != txn:
+                        logging.warning(
+                            "[hotkey] %s 屬於未完整提交的註冊交易(txn=%s)→ 不執行",
+                            key_name, txn)
+                        return
+                    callback()
+                return _gated
+
+            if not safe_unhook_all_hotkeys():
+                logging.error(
+                    "[hotkey] 交易開頭 unhook_all 失敗 —— 上一筆交易的熱鍵可能仍掛著,"
+                    "已由交易閘門封鎖(committed=None),本次註冊繼續")
             for key, (func, name) in hotkeys_to_register.items():
                 f_use = func
                 # F11(快速完成)執行中再按 F11 → 終止前一次、改從這次重新開始;
@@ -16785,6 +16815,7 @@ class AutomationApp:
                     strict = key in STRICT_HOTKEYS
                     callback = _hotkey_guard(action, key, strict)
                 callback = _blackout_gate(callback, key)
+                callback = _txn_gate(callback, key)   # 最外層:未提交一律不執行
                 hotkey_modules.keyboard.add_hotkey(
                     key,
                     callback,
@@ -16805,10 +16836,12 @@ class AutomationApp:
 
             hotkey_modules.keyboard.add_hotkey(
                 'F12',
-                _f12_callback,
+                _txn_gate(_f12_callback, 'F12'),
                 suppress=False,
             )
-            
+            # ★提交★:F12 也掛上了,整組才算存在;在這之前任何一鍵都不會執行。
+            self._hotkey_txn_committed = _txn
+
             self.hotkey_text_label.config(text=hotkey_info_text)
             put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: 熱鍵註冊成功 ({profile})，等待指令...'))
             logging.info(f"Hotkeys registered successfully for {profile}.")
@@ -16820,11 +16853,27 @@ class AutomationApp:
             except Exception:
                 logging.exception("[abbrev] setup_hotkeys 結尾 install 失敗")
         except Exception as e:
+            # [外審 r2] ★進來第一件事:撤銷提交★。提交點在 F12 掛上之後,但後面的
+            # label/UI 佇列/log 仍可能拋例外 —— 那時 committed 已經等於本交易,若 rollback
+            # 的 unhook_all 又失敗,整組 callback 會在「畫面說註冊失敗」的狀態下照樣執行。
+            # 不論例外發生在哪一步,離開本函式時 committed 一律不等於任何存活的交易。
+            self._hotkey_txn_committed = None
             logging.error(f"Failed to register hotkeys: {e}", exc_info=True)
-            # [AB-09] ★縮寫速寫獨立於熱鍵,失敗路徑也一定要重掛★:本函式開頭已經
-            # safe_unhook_all_hotkeys() 把 abbrev 的全域 hook 一起拔掉,而重掛只寫在
-            # 成功路徑的結尾。熱鍵註冊一旦拋例外 → 縮寫在★所有程式(含 HIS)★一起
-            # 失效,而且 retry 五次用完就再也不會重掛,只能重啟主程式。
+            # [R8-P2 2026-09-03] ★註冊是一筆交易:中途任何一鍵失敗 → 全部 rollback★。
+            # F1~F11 是逐一 add_hotkey、F12(中止=救援鍵)排在最後。第 k 鍵拋例外時,
+            # 前 k-1 鍵已經掛上而且★仍然有效★:畫面說「熱鍵註冊失敗」,實際上會對
+            # HIS 寫劑量/計費的 F1~F5 還按得動,而中止鍵可能剛好不存在。30 秒後 retry
+            # 才會再 unhook_all;第 5 次仍失敗就放棄 → 半套熱鍵一直留到手動重啟。
+            # 本函式結束時只允許兩種狀態:★完整成功,或 clinical hotkeys = 0★。
+            # [外審 r1] rollback 本身也可能失敗 —— 那時 registry 裡仍有半套,但它們
+            # 全部包著交易閘門而 committed 仍是 None → ★一顆都不會執行★。這裡據實
+            # 記 ERROR,不可以假裝拔乾淨了。
+            if not safe_unhook_all_hotkeys():
+                logging.error(
+                    "[hotkey] 註冊失敗後 rollback(unhook_all)也失敗 —— 半套熱鍵仍在"
+                    " registry,但已由交易閘門封鎖(committed=None),不會執行")
+            # [AB-09] ★縮寫速寫獨立於熱鍵,失敗路徑也一定要重掛★,而且★要排在
+            # rollback 之後★(反過來會把剛掛好的 abbrev hook 又拔掉)。
             # 其餘每一條 unhook 路徑(院外模式、解析度不符)都有重掛,只有這裡漏了。
             try:
                 self._install_abbrev_listeners()
