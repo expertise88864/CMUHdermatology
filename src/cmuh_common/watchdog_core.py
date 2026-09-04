@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import errno as _errno
 import json
 import locale
 import logging
@@ -176,12 +177,19 @@ def _restart_history_path() -> str:
     return str(RESTART_HISTORY_PATH)
 
 
+#: [外審 r5 P2] 歷史檔的★世代序號★:每次成功落盤 +1,寫在檔案內容裡(不是 mtime)。
+#: 在歷史鎖內 load → +1 → save,所以跨行程單調;與牆上時鐘無關,時鐘回撥不會讓它「在未來」。
+_HISTORY_GENERATION = [0]
+
+
 def _load_restart_history() -> None:
     """[AC-07] 從檔載入啟動歷史/暫停狀態（讓 --once 也能累積 crash-loop 計數）。"""
     try:
         data = safe_load_json(_restart_history_path(), {}) or {}
     except Exception:
         return
+    gen = data.get("generation") if isinstance(data, dict) else None
+    _HISTORY_GENERATION[0] = int(gen) if isinstance(gen, int) and gen >= 0 else 0
     hist = data.get("history")
     if isinstance(hist, dict):
         _RESTART_HISTORY.clear()
@@ -197,22 +205,56 @@ def _load_restart_history() -> None:
                 _SUSPENDED_UNTIL[str(name)] = float(until)
 
 
-def _save_restart_history() -> None:
-    """[AC-07] 落盤啟動歷史/暫停狀態。"""
+def _save_restart_history() -> Exception | None:
+    """[AC-07] 落盤啟動歷史/暫停狀態。回 None=寫成功;回例外物件=寫失敗(已記 log)。
+
+    [R9-§6 外審 r1 P2-2] 舊版回 None 且把例外吞成 debug:寫失敗 = 這次啟動★沒被記下★,
+    `--once` 結束記憶體就沒了、daemon 下一輪也可能從舊檔重載蓋掉 → 反覆重啟永遠累積不到
+    crash-loop 門檻。呼叫端要看得到失敗,★而且要看得到是哪一種失敗★(權限/磁碟滿是持續
+    狀況,sharing violation 是暫時的 —— 處置不同)。
+    """
+    gen = _HISTORY_GENERATION[0] + 1
     try:
         atomic_write_json(_restart_history_path(),
                           {"history": _RESTART_HISTORY,
-                           "suspended_until": _SUSPENDED_UNTIL})
-    except Exception:
-        logging.debug("[watchdog] 寫入啟動歷史失敗", exc_info=True)
+                           "suspended_until": _SUSPENDED_UNTIL,
+                           "generation": gen})
+        _HISTORY_GENERATION[0] = gen         # 成功落盤才算新世代
+        return None
+    except Exception as e:
+        logging.warning("[watchdog] 寫入啟動歷史失敗(%s): %s", _restart_history_path(), e)
+        return e
+
+
+class _RestartHistoryLockBusy(Exception):
+    """啟動歷史鎖在 timeout 內拿不到(另一個 watchdog 正在寫)。"""
+
+
+class _RestartHistoryUnsaved(Exception):
+    """這次啟動記錄寫不進磁碟(磁碟滿/ACL/超過重試期的檔案鎖)。"""
+
+
+#: 啟動歷史鎖的等待上限(s)。測試會把它調小。
+RESTART_HISTORY_LOCK_TIMEOUT_SEC = 3.0
+_LOCK_DEGRADED_WARNED = [False]   # 鎖檔根本建不出來 → 只警告一次(每行程)
 
 
 @contextlib.contextmanager
-def _restart_history_lock(timeout_sec: float = 3.0):
+def _restart_history_lock(timeout_sec: float | None = None):
     """[codex P2] 跨行程互斥檔案鎖，序列化 crash-loop 歷史的 read-modify-write，避免
     daemon 與 --once 同時 load-modify-save 造成 lost update（掉某程式的啟動記錄、破壞
-    crash-loop 偵測）。O_CREAT|O_EXCL 建鎖檔；拿不到就短暫等；逾時 fail-open（寧可極
-    罕見的 lost update 也不要卡住整個 watchdog tick）；離開刪鎖檔。與歷史檔同目錄。"""
+    crash-loop 偵測）。O_CREAT|O_EXCL 建鎖檔；拿不到就短暫等；離開刪鎖檔。與歷史檔同目錄。
+
+    [第九輪 §6] ★逾時不再 fail-open★:拿不到鎖就 `raise _RestartHistoryLockBusy`,由
+    `_authorize_restart()` 轉成「本 tick 不授權重啟」。理由:少重啟一輪的代價很低
+    (下一 tick 再試),而不持鎖的 read-modify-write 會讓 daemon 與 --once 互相蓋掉啟動
+    記錄 → crash-loop 計數被低估 → 保護失效。
+    ★但「鎖檔根本建不出來」(目錄不可寫等★持續★狀況)仍 fail-open★:那不會自己解除,
+    fail-closed 會讓 watchdog 永遠不重啟任何程式(2026-08-05 教訓:fail-closed 前先證明
+    狀況會解除);改成據實警告一次,退回舊的不持鎖行為。
+    """
+    if timeout_sec is None:
+        timeout_sec = RESTART_HISTORY_LOCK_TIMEOUT_SEC
     lock_path = _restart_history_path() + ".lock"
     deadline = time.monotonic() + timeout_sec
     fd = -1
@@ -234,9 +276,28 @@ def _restart_history_lock(timeout_sec: float = 3.0):
             except OSError:
                 pass
             if time.monotonic() >= deadline:
-                break                         # 逾時 → fail-open，不持鎖也繼續
+                # 逾時 → 本 tick 不授權(FileExistsError 是觸發條件,不是處理錯誤 → from None)
+                raise _RestartHistoryLockBusy(lock_path) from None
             time.sleep(0.02)
-        except Exception:
+        except OSError as e:
+            # [外審 r1 P2-3] 其他 OSError 可能是★暫時性★的(防毒短暫攔截、Windows sharing
+            # violation —— atomic_io 對同類錯誤就是重試)。先重試到 deadline。
+            if time.monotonic() < deadline:
+                time.sleep(0.02)
+                continue
+            # [外審 r2 P2-2] 到了 deadline ★依錯誤類型分流★:
+            #   * 可確認的持續狀況(權限/路徑/唯讀/磁碟滿)→ fail-open 但不靜音(不會自己解除,
+            #     fail-closed 會讓 watchdog 永遠不重啟任何程式);
+            #   * sharing/lock violation 與★不認得的★錯誤 → 當「忙」:本 tick 不授權,下輪再試
+            #     (不持鎖讀改寫會重現 lost update;少動手一輪的代價低於猜錯持續狀況)。
+            if not _persistent_os_error(e):
+                raise _RestartHistoryLockBusy(lock_path) from e
+            if not _LOCK_DEGRADED_WARNED[0]:
+                _LOCK_DEGRADED_WARNED[0] = True
+                logging.warning(
+                    "[watchdog] 啟動歷史鎖檔在 %.1fs 內都建不出來(%s: %s)→ 視為持續狀況,"
+                    "退回不持鎖的讀改寫;daemon 與 --once 同時寫時 crash-loop 計數可能被低估",
+                    timeout_sec, lock_path, e)
             break
     try:
         yield
@@ -252,9 +313,188 @@ def _restart_history_lock(timeout_sec: float = 3.0):
                 pass
 
 
+#: `_authorize_restart()` 的三個結論。★「鎖忙」與「crash loop」處置不同★:前者是
+#: 「這一輪不知道能不能重啟,下一輪再問」,後者是「知道不能,暫停一段時間」。
+RESTART_AUTH_OK = "ok"
+RESTART_AUTH_CRASH_LOOP = "crash_loop"
+RESTART_AUTH_LOCK_BUSY = "lock_busy"
+RESTART_AUTH_HISTORY_UNSAVED = "history_unsaved"   # 這次啟動記不下來 → 本輪不動手
+
+#: 啟動歷史★持續★寫不進去多久之後降級(授權但 WARNING):寫不進去是持續狀況時,
+#: fail-closed 會讓 watchdog 永遠不重啟任何程式(2026-08-05 教訓);抑制要有出口。
+#: [外審 r2 P2-1] 以「第一次寫失敗的時間」為準而不是行程內的連敗計數 —— `--once` 每兩分鐘
+#: 都是全新行程,行程內計數永遠到不了門檻。時間戳落盤到 sidecar(歷史檔本身寫不進去,
+#: 不能記在同一個檔);sidecar 也寫不進去就退到 %TEMP%;兩邊都寫不進去 = 機器狀態已壞
+#: → 視為持續狀況立即降級。
+HISTORY_UNSAVED_DEGRADE_AFTER_SEC = 180.0
+#: [外審 r3 P2] ★每個程式一個檔★(檔名帶 name 的 hex):共用一個 JSON 的 read-modify-write
+#: 在歷史鎖之外進行,daemon 與 --once 為不同程式寫時會互相蓋掉時間戳。獨立檔 → 寫入是
+#: 單次原子寫、清除是刪檔,沒有共用狀態,不需要鎖。
+HISTORY_UNSAVED_SIDECAR_PREFIX = ".watchdog_history_unsaved."
+
+#: 可確認為★持續★狀況的 OSError(權限 / 路徑不存在 / 唯讀 / 磁碟滿):不必等,直接當持續。
+_PERSISTENT_ERRNOS = frozenset({
+    _errno.EACCES, _errno.EPERM, _errno.ENOENT, _errno.ENOTDIR,
+    _errno.EROFS, _errno.ENOSPC,
+})
+#: 已知的★暫時性★ Windows 錯誤碼(sharing violation / lock violation):重試,逾時當「忙」。
+_TRANSIENT_WINERRORS = frozenset({32, 33})
+
+
+def _persistent_os_error(exc: BaseException | None) -> bool:
+    """這個錯誤是不是「不會自己解除」的那一種。只認得出來的才回 True;不認得回 False
+    (不認得 → 當暫時性處理:少動手一輪的代價低於把持續狀況猜錯)。"""
+    if not isinstance(exc, OSError):
+        return False
+    # ★先看 winerror★:Windows 的 sharing violation(32)會被 Python 對應成 errno EACCES,
+    # 也就是自動建成 PermissionError 子類 —— 先看子類會把暫時性錯誤誤判成持續狀況。
+    if getattr(exc, "winerror", None) in _TRANSIENT_WINERRORS:
+        return False
+    if isinstance(exc, PermissionError | FileNotFoundError | NotADirectoryError):
+        return True
+    return exc.errno in _PERSISTENT_ERRNOS
+
+
+def _unsaved_sidecar_paths(name: str) -> list:
+    """`name` 專屬的時間戳檔候選位置:settings/ 優先;它寫不進去就退到 %TEMP%
+    (不同的 ACL/磁碟輪廓)。★每個程式一個檔★,沒有共用的讀改寫。"""
+    import tempfile
+    fname = HISTORY_UNSAVED_SIDECAR_PREFIX + name.encode("utf-8").hex() + ".json"
+    return [os.path.join(get_settings_dir(), fname),
+            os.path.join(tempfile.gettempdir(), "cmuh_" + fname)]
+
+
+def _unsaved_since_get(name: str) -> float | None:
+    """回 `name` 第一次寫失敗的牆上時間;任何一個候選位置讀得到就算。
+    檔內的 name 要對得上 —— 這是「不同程式不可以共用一個檔」的自我檢查。"""
+    for p in _unsaved_sidecar_paths(name):
+        try:
+            data = safe_load_json(p, {}) or {}
+            if isinstance(data, dict) and data.get("name") == name:
+                v = data.get("since")
+                if isinstance(v, int | float):
+                    return float(v)
+        except Exception:
+            continue
+    return None
+
+
+def _unsaved_generation_get(name: str) -> int | None:
+    """回 sidecar 記的「失敗當時的歷史檔世代」;沒有/壞掉 → None。"""
+    for p in _unsaved_sidecar_paths(name):
+        try:
+            data = safe_load_json(p, {}) or {}
+            if isinstance(data, dict) and data.get("name") == name:
+                g = data.get("generation")
+                if isinstance(g, int):
+                    return g
+        except Exception:
+            continue
+    return None
+
+
+def _unsaved_since_set(name: str, ts: float, generation: int) -> bool:
+    """記下第一次寫失敗的時間與★當時的歷史檔世代★(單次原子寫,無讀改寫)。
+    回 True=至少一個位置寫成功;False=★兩邊都寫不進去★。"""
+    for p in _unsaved_sidecar_paths(name):
+        try:
+            atomic_write_json(p, {"name": name, "since": ts, "generation": int(generation)})
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _unsaved_since_clear(name: str) -> None:
+    """清掉 `name` 的時間戳 = 刪檔(冪等,兩個位置都刪)。
+
+    [外審 r4 P2] 刪檔可能被防毒/sharing violation 短暫擋住:留下的舊時間戳會讓日後第一次
+    暫時性寫失敗直接讀到「早已超過窗口」→ 立即降級成未記錄的授權。所以:★重試★;仍失敗
+    就★寫入「已清除」標記★(since=None,寫入通常比刪除更容易成功);連標記都寫不進去才
+    WARNING —— 而讀取端另有歷史檔 mtime 的世代檢查兜底(見 `_authorize_restart`)。
+    """
+    for p in _unsaved_sidecar_paths(name):
+        removed = False
+        for _attempt in range(3):
+            try:
+                os.remove(p)
+                removed = True
+                break
+            except FileNotFoundError:
+                removed = True
+                break
+            except OSError:
+                time.sleep(0.02)
+        if removed:
+            continue
+        try:
+            atomic_write_json(p, {"name": name, "since": None, "cleared": True})
+        except Exception:
+            logging.warning("[watchdog] 清不掉 %s 的寫失敗時間戳(%s)—— 殘留的舊窗口由歷史檔"
+                            " mtime 世代檢查擋住", name, p)
+
+
+def _authorize_restart(name: str) -> str:
+    """要不要授權這一輪對 `name` 動手(kill / 啟動)。回 RESTART_AUTH_*。
+
+    [第九輪 §6] 三個動手的地方(半死 kill、沒在跑→啟動、log 陳舊 kill)都改問這一支。
+    * 鎖忙(另一個 watchdog 正在寫啟動歷史)→ LOCK_BUSY:★本 tick 不動手★,不做不持鎖的
+      讀改寫;下一 tick 再問。
+    * [外審 r1 P2-2 / r2 P2-1] 歷史寫不下去 → HISTORY_UNSAVED:本 tick 不動手(沒記下的重啟
+      永遠累積不到 crash-loop 門檻)。★出口★(三條,任一成立就降級成 OK + WARNING,明講
+      crash-loop 保護已降級):(a) 錯誤本身是可確認的持續狀況(權限/路徑/唯讀/磁碟滿);
+      (b) 第一次失敗至今 ≥ HISTORY_UNSAVED_DEGRADE_AFTER_SEC —— 時間戳落盤,跨 `--once`
+      行程有效;(c) 連時間戳都沒地方寫(settings/ 與 %TEMP% 都失敗)。寫成功就清掉時間戳。
+    """
+    try:
+        ok = _record_restart_and_check_crash_loop(name)
+    except _RestartHistoryLockBusy:
+        logging.info("[watchdog] %s: 啟動歷史鎖忙(另一個 watchdog 正在寫)→ 本輪不授權重啟",
+                     name)
+        return RESTART_AUTH_LOCK_BUSY
+    except _RestartHistoryUnsaved as e:
+        cause = e.__cause__
+        now = _wall_now()
+        # 失敗當下觀察到的世代 = 鎖內 _load_restart_history 讀到的(這次沒寫成功,檔沒變)。
+        gen_now = _HISTORY_GENERATION[0]
+        since = _unsaved_since_get(name)
+        # [外審 r4/r5 P2] ★世代檢查★:sidecar 記的是失敗當時的世代;現在的世代不同 = 那次失敗
+        # 之後已經成功落盤過、只是 sidecar 沒清乾淨 → 殘留,不可沿用(否則第一次暫時性失敗
+        # 就拿舊窗口立即降級)。用檔案內容裡的序號,★不用 mtime★:mtime 是牆上時鐘,時鐘回撥
+        # 後會「在未來」,每一輪都把有效的失敗起點當殘骸重設,180 秒出口永遠到不了。
+        if since is not None and _unsaved_generation_get(name) != gen_now:
+            logging.info("[watchdog] %s: 殘留的寫失敗時間戳(世代 %s ≠ 現在 %s)→ 不沿用",
+                         name, _unsaved_generation_get(name), gen_now)
+            since = None
+        if since is None:
+            since = now
+            recorded = _unsaved_since_set(name, since, gen_now)
+        else:
+            recorded = True
+        reason = None
+        if _persistent_os_error(cause):
+            reason = f"錯誤為持續狀況({type(cause).__name__})"
+        elif not recorded:
+            reason = "連失敗時間戳都沒地方寫(settings/ 與 %TEMP% 都失敗)"
+        elif now - since >= HISTORY_UNSAVED_DEGRADE_AFTER_SEC:
+            reason = f"已持續 {now - since:.0f}s"
+        if reason is None:
+            logging.warning("[watchdog] %s: 啟動歷史寫入失敗(自 %.0fs 前起)→ 本輪不授權重啟",
+                            name, now - since)
+            return RESTART_AUTH_HISTORY_UNSAVED
+        logging.warning(
+            "[watchdog] %s: 啟動歷史寫不進去,%s → 視為持續狀況,★降級★授權重啟;"
+            "crash-loop 保護在寫入恢復前無法累積", name, reason)
+        return RESTART_AUTH_OK
+    _unsaved_since_clear(name)
+    return RESTART_AUTH_OK if ok else RESTART_AUTH_CRASH_LOOP
+
+
 def _record_restart_and_check_crash_loop(name: str) -> bool:
     """紀錄一次啟動。回傳 True = 沒進入 crash loop, 可以繼續啟動。
-    回傳 False = 已經 crash loop 中，呼叫端應跳過啟動。"""
+    回傳 False = 已經 crash loop 中，呼叫端應跳過啟動。
+    ★鎖在 timeout 內拿不到 → raise `_RestartHistoryLockBusy`★(第九輪 §6;
+    生產呼叫端一律經由 `_authorize_restart()`,它會把例外轉成「本 tick 不授權」)。"""
     now = time.time()
     # [codex P2] _CRASH_LOOP_LOCK 只擋同行程;_restart_history_lock 擋跨行程,一起把整段
     # load-modify-save 序列化,避免 daemon 與 --once 併發 lost update。
@@ -297,7 +537,11 @@ def _record_restart_and_check_crash_loop(name: str) -> bool:
             hist.clear()
             _save_restart_history()      # [AC-07] 落盤(suspend + 清空後的歷史)
             return False
-        _save_restart_history()          # [AC-07] 落盤本次啟動記錄
+        err = _save_restart_history()    # [AC-07] 落盤本次啟動記錄
+        if err is not None:
+            # [外審 r1 P2-2] 沒記下就不能說「授權成功」:那會讓反覆重啟永遠累積不到門檻。
+            hist.pop()                   # 記憶體也撤回這一筆,與磁碟一致
+            raise _RestartHistoryUnsaved(_restart_history_path()) from err
         return True
 
 
@@ -1194,6 +1438,30 @@ def _lock_path_for(prog_name: str) -> Path:
     return LOCK_DIR / f"{safe}.lock"
 
 
+def release_action_lock(prog_name: str) -> bool:
+    """撤回★本行程自己剛建立★的動作鎖(只在「這一輪最後沒動手」時用)。
+
+    [R9-§6 外審 r1 P2-1] 三個動手點都是先 `claim_action_lock`(留 90s 檔)再問授權;
+    鎖忙/寫入失敗而不動手時,那個檔會讓下一 tick 又被「lock 還新」擋掉 —— 「下輪再判」
+    就變成兩輪後。★只撤自己的★:鎖檔 payload 是 `<pid> <ts>`,pid 不是自己就不動
+    (那是別的 watchdog 剛動過手,節流仍然要成立)。回 True=確實撤了。
+    """
+    try:
+        lock = _lock_path_for(prog_name)
+        try:
+            owner = lock.read_bytes().split(b" ", 1)[0].decode("ascii", "replace")
+        except FileNotFoundError:
+            return False
+        if owner != str(os.getpid()):
+            logging.debug("[watchdog] 動作鎖不是本行程的(owner=%s)→ 不撤", owner)
+            return False
+        lock.unlink()
+        return True
+    except Exception:
+        logging.debug("[watchdog] 撤回動作鎖失敗 (%s)", prog_name, exc_info=True)
+        return False
+
+
 def claim_action_lock(prog_name: str, max_age_sec: int) -> bool:
     """嘗試取得「我要對 prog_name 動手」的 lock。
     若 lock 檔存在且 < max_age_sec 內被改過 → 別人剛動過手，回 False。
@@ -1371,7 +1639,17 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
                         # 就不要 kill。否則「殺了又拒絕重啟」會讓半死 process 被
                         # 殺死、整段暫停期都沒程式在跑；保留現有(半死)process 至少
                         # 還在，暫停結束後的下一輪才 kill+重啟。
-                        if not _record_restart_and_check_crash_loop(name):
+                        _auth = _authorize_restart(name)
+                        if _auth in (RESTART_AUTH_LOCK_BUSY, RESTART_AUTH_HISTORY_UNSAVED):
+                            # [外審 r1 P2-1] 本輪沒動手 → 撤回剛建立的 90s 動作鎖,
+                            # 否則下一 tick 會被「lock 還新」擋掉,「下輪再判」變成空話。
+                            release_action_lock(name)
+                            why = ("啟動歷史鎖忙（另一個 watchdog 正在寫）"
+                                   if _auth == RESTART_AUTH_LOCK_BUSY
+                                   else "啟動歷史寫入失敗")
+                            return (f"⏭ {name}: 半死但{why}，本輪不授權 kill，"
+                                    f"下輪再判 [{mode}]")
+                        if _auth != RESTART_AUTH_OK:
                             until = _SUSPENDED_UNTIL.get(name, 0.0)
                             remain = max(0, int(until - time.time()))
                             return (f"⛔ {name}: 半死且 crash loop，暫停 {remain // 60} "
@@ -1415,7 +1693,13 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
         if not claim_action_lock(name, action_lock_sec):
             return f"⏭ {name}: 沒在跑，但 lock 還新（別人剛動過手），這輪先跳過"
         # [D] Crash loop 偵測 — 短時間內反覆啟動 → 暫停
-        if not _record_restart_and_check_crash_loop(name):
+        _auth = _authorize_restart(name)
+        if _auth in (RESTART_AUTH_LOCK_BUSY, RESTART_AUTH_HISTORY_UNSAVED):
+            release_action_lock(name)        # [外審 r1 P2-1] 沒動手就撤回動作鎖
+            why = ("啟動歷史鎖忙（另一個 watchdog 正在寫）"
+                   if _auth == RESTART_AUTH_LOCK_BUSY else "啟動歷史寫入失敗")
+            return (f"⏭ {name}: 沒在跑，但{why}，本輪不授權啟動，下輪再判 [{mode}]")
+        if _auth != RESTART_AUTH_OK:
             until = _SUSPENDED_UNTIL.get(name, 0.0)
             remain = max(0, int(until - time.time()))
             return f"⛔ {name}: crash loop 中，暫停 {remain // 60} 分鐘 [{mode}]"
@@ -1450,7 +1734,13 @@ def ensure_program(prog: dict, pythonw: str, procs: list,
                         f"這輪先跳過 [{mode}]")
             # [stability] crash-loop 檢查移到 kill 之前（理由同半死路徑）：暫停期
             # 不 kill，避免殺了又不重啟、留下空窗。
-            if not _record_restart_and_check_crash_loop(name):
+            _auth = _authorize_restart(name)
+            if _auth in (RESTART_AUTH_LOCK_BUSY, RESTART_AUTH_HISTORY_UNSAVED):
+                release_action_lock(name)    # [外審 r1 P2-1] 沒動手就撤回動作鎖
+                why = ("啟動歷史鎖忙（另一個 watchdog 正在寫）"
+                       if _auth == RESTART_AUTH_LOCK_BUSY else "啟動歷史寫入失敗")
+                return (f"⏭ {name}: log 陳舊但{why}，本輪不授權 kill，下輪再判 [{mode}]")
+            if _auth != RESTART_AUTH_OK:
                 until = _SUSPENDED_UNTIL.get(name, 0.0)
                 remain = max(0, int(until - time.time()))
                 return (f"⛔ {name}: stale 且 crash loop 中，暫停 {remain // 60} "
