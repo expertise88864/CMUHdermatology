@@ -143,6 +143,163 @@ _CRASH_MARKERS = ("Traceback (most recent call last)", "SyntaxError",
                   "ImportError", "ModuleNotFoundError", "Fatal Python error")
 
 
+# ─── [第九輪 §4] restart 兩階段 READY 交握 ────────────────────────────────────
+# 子行程要「完整就緒」必須先拿到單例 mutex,mutex 在父行程手上 —— 父行程若等子行程 READY
+# 才放 mutex 就死鎖。今天的作法(0.6 秒還活著就放 mutex、子行程重試 1.5 秒)避開了死鎖,
+# 代價是「活著 ≠ 就緒」:子行程 0.8 秒後死在 config/UI 初始化,父行程已拆光 → 零個可用
+# instance。改成兩階段:
+#   PRE-READY(子行程 import/設定都過、★即將★搶 mutex)→ 父行程拔熱鍵、放 mutex;
+#   READY(子行程拿到 mutex + 核心初始化完成)→ 父行程做慢的拆解並退出;
+#   子行程在兩者之間死掉 → 父行程★復原★(重取 mutex、重掛熱鍵),不再零 instance。
+# ★降版也要能重啟★:舊版子行程永遠不寫交握檔 → PRE-READY 的觸發是 min(檔案出現, 0.6s 還
+# 活著);之後從未看到檔案且活著 → 寬限 3s 後視為舊版子行程、照今天的行為確認退出。
+# 傳輸:父行程 Popen(env=CMUH_RESTART_HANDSHAKE=<tmp 檔>);子行程原子寫入階段字串;父行程
+# 每 0.1s 讀。單一寫者,不需要鎖;冷啟動沒有 env → signal 是 no-op。
+RESTART_HANDSHAKE_ENV = "CMUH_RESTART_HANDSHAKE"
+HANDSHAKE_WAITING_MUTEX = "waiting_mutex"
+HANDSHAKE_READY = "ready"
+HANDSHAKE_LEGACY_GRACE_SEC = 3.0      # 從未看到交握檔 → 視為舊版子行程的寬限
+HANDSHAKE_READY_TIMEOUT_SEC = 30.0    # 看過交握檔但遲遲不 READY 的上限(它已持有 mutex,是存活者)
+HANDSHAKE_MUTEX_RETRY_SEC = 10.0      # 交握存在時子行程搶 mutex 的重試窗(父行程是反應式放 mutex)
+HANDOVER_CONFIRMED = "handover_confirmed"
+SPAWN_CHILD_DIED_AFTER_HANDOVER = "child_died_after_handover"   # 放了 mutex 之後才死;已復原
+SPAWN_RECOVERY_FAILED = "recovery_failed"    # 交棒後早夭且★復原失敗★(拿不回 mutex);呼叫端已安全退場
+
+# [外審 r1 P1-1] ★交握路徑只屬於直接子行程★:latch 進模組變數後立刻從 os.environ 拿掉,
+# 免得子行程再起的孫行程(例如主程式的 inner watchdog 拉起打卡)繼承同一個路徑、冒充 READY。
+# 訊號也綁 PID(`<state> <pid>`),父行程只認直接子行程的 PID —— 兩層防護,前者減少洩漏,
+# 後者是硬保證。
+_HANDSHAKE_PATH: list = [None]      # [path or ""]:None = 還沒 latch
+
+
+def _latch_handshake_path() -> str:
+    import os as _os
+    if _HANDSHAKE_PATH[0] is None:
+        _HANDSHAKE_PATH[0] = _os.environ.pop(RESTART_HANDSHAKE_ENV, "").strip()
+    return _HANDSHAKE_PATH[0]
+
+
+def restart_handshake_active() -> bool:
+    """本行程是不是由 `restart_self` 帶交握起來的子行程(啟動時 env 有交握檔路徑)。"""
+    return bool(_latch_handshake_path())
+
+
+def mutex_retry_sec() -> float:
+    """子行程搶單例 mutex 的重試窗:交握存在時放大(父行程看到 PRE-READY 才放 mutex,
+    不再靠常數對齊);冷啟動維持 1.5s(雙開情境最多多等 1.5s 才提示)。"""
+    return HANDSHAKE_MUTEX_RETRY_SEC if restart_handshake_active() else 1.5
+
+
+def restart_handshake_signal(state: str) -> bool:
+    """子行程向父行程回報階段(HANDSHAKE_WAITING_MUTEX / HANDSHAKE_READY)。
+    沒有交握(冷啟動)→ no-op 回 False。原子寫入(tmp + replace),父行程不會讀到半截。
+    內容是 `<state> <pid>`:父行程只認直接子行程的 PID(孫行程冒充不了)。"""
+    import os as _os
+    path = _latch_handshake_path()
+    if not path:
+        return False
+    try:
+        tmp = f"{path}.{_os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(f"{state} {_os.getpid()}")
+        _os.replace(tmp, path)
+        return True
+    except OSError:
+        import logging as _logging
+        _logging.debug("[restart_handshake] 寫入 %s 失敗", state, exc_info=True)
+        return False
+
+
+def read_handshake(path: str, expect_pid=None):
+    """父行程讀交握檔;不存在/讀不到/內容不認得/★PID 不是直接子行程★ → None。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            s = f.read().strip()
+    except OSError:
+        return None
+    parts = s.split()
+    if not parts or parts[0] not in (HANDSHAKE_WAITING_MUTEX, HANDSHAKE_READY):
+        return None
+    if expect_pid is not None:
+        if len(parts) < 2 or not parts[1].isdigit() or int(parts[1]) != int(expect_pid):
+            return None
+    return parts[0]
+
+
+def wait_for_handover(proc, handshake_path: str, *, on_preready=None, on_confirmed=None,
+                      on_recover=None, stderr_tail=lambda: "", now=None, sleep=None,
+                      poll_interval: float = _SPAWN_ALIVE_INTERVAL_SEC) -> str:
+    """父行程的交棒判定(純函式,可測)。回:
+      HANDOVER_CONFIRMED              → 呼叫端退出本行程
+      SPAWN_CHILD_CRASHED / SPAWN_CHILD_EXITED_ORDERLY → 早夭(PRE-READY 之前),本行程原封不動
+      SPAWN_CHILD_DIED_AFTER_HANDOVER → 放了 mutex 之後才死;on_recover 已呼叫,本行程繼續
+    只傳 on_confirmed(舊呼叫端)→ 在 PRE-READY 時刻呼叫一次 on_confirmed 並立即確認,
+    之後不再呼叫(與今天的時序相同)。"""
+    import logging as _logging
+    import time as _time
+    now = now or _time.monotonic
+    sleep = sleep or _time.sleep
+    legacy_caller = on_preready is None
+    t0 = now()
+    alive_grace = _SPAWN_ALIVE_POLLS * _SPAWN_ALIVE_INTERVAL_SEC      # 0.6s(今天的存活確認)
+    preready_done = False
+    saw_file = False
+    expect_pid = getattr(proc, "pid", None)          # ★只認直接子行程的 PID★
+    while True:
+        sleep(poll_interval)
+        rc = proc.poll()
+        state = read_handshake(handshake_path, expect_pid)
+        if state is not None:
+            saw_file = True
+        elapsed = now() - t0
+        if rc is not None:
+            if not preready_done:
+                return classify_child_exit(rc, stderr_tail())
+            _logging.error(
+                "[restart_self] 新行程在交棒後才結束 (exit=%s) → 本行程嘗試復原(重取 mutex、"
+                "重掛熱鍵)\n--- 新行程 stderr ---\n%s\n--- stderr 結束 ---",
+                rc, stderr_tail())
+            # [外審 r1 P1-2] 復原是否成立要★明講★:on_recover 回 True 才算拿回單例所有權;
+            # 回 False / 拋例外 = 拿不回(別人搶到了 / mutex API 壞了)→ 呼叫端的 callback
+            # 已自行安全退場(不可以繼續當一個沒守衛的 instance),這裡回 RECOVERY_FAILED。
+            recovered = False
+            if on_recover is not None:
+                try:
+                    recovered = bool(on_recover())
+                except Exception:
+                    _logging.exception("[restart_self] on_recover 復原失敗")
+            return SPAWN_CHILD_DIED_AFTER_HANDOVER if recovered else SPAWN_RECOVERY_FAILED
+        if not preready_done and (state is not None or elapsed >= alive_grace):
+            preready_done = True
+            cb = on_confirmed if legacy_caller else on_preready
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:
+                    _logging.exception("[restart_self] on_preready 收尾失敗（仍照常繼續）")
+            if legacy_caller:
+                return HANDOVER_CONFIRMED          # 舊呼叫端:與今天相同,確認即退出
+        if preready_done:
+            confirm = False
+            if state == HANDSHAKE_READY:
+                confirm = True
+            elif not saw_file and elapsed >= alive_grace + HANDSHAKE_LEGACY_GRACE_SEC:
+                _logging.info("[restart_self] 新行程沒有交握(舊版?)但存活 %.1fs → 照舊確認接手",
+                              elapsed)
+                confirm = True
+            elif saw_file and elapsed >= HANDSHAKE_READY_TIMEOUT_SEC:
+                _logging.warning("[restart_self] 新行程 %.0fs 仍未 READY 但存活且已持有 mutex"
+                                 " → 視為接手成功", elapsed)
+                confirm = True
+            if confirm:
+                if on_confirmed is not None:
+                    try:
+                        on_confirmed()
+                    except Exception:
+                        _logging.exception("[restart_self] on_confirmed 收尾失敗（仍照常退出）")
+                return HANDOVER_CONFIRMED
+
+
 def classify_child_exit(rc, stderr_tail: str) -> str:
     """把「子行程早夭」分類成 orderly / crashed。純函式,好測。
 
@@ -278,8 +435,16 @@ def build_restart_command(extra_args=None) -> list:
 
 
 def restart_self(extra_args=None, hard_exit_code=None,
-                 on_confirmed=None) -> None:
+                 on_confirmed=None, on_preready=None, on_recover=None) -> None:
     """雙軌重啟。
+
+    [第九輪 §4] 兩階段交握(見 wait_for_handover):
+      on_preready  — 子行程回報 PRE-READY(即將搶 mutex)或 0.6s 仍活著時呼叫:做「快而
+                     關鍵」的拆解(拔熱鍵、放 mutex)。
+      on_confirmed — 子行程 READY(或舊版子行程寬限到期)時呼叫:慢的拆解,之後退出。
+      on_recover   — 子行程在 PRE-READY 之後、READY 之前死掉時呼叫:重取 mutex、重掛熱鍵,
+                     本行程繼續服務(回 SPAWN_CHILD_DIED_AFTER_HANDOVER)。
+    只傳 on_confirmed 的舊呼叫端維持今天的時序(0.6s 存活 → on_confirmed → 退出)。
 
     hard_exit_code：None（預設）→ 成功 spawn 後以 sys.exit(0) 結束（給 main thread
     用，能跑 atexit/finally）。給整數 → 改用 os._exit(code)。供「非 main thread」
@@ -337,6 +502,17 @@ def restart_self(extra_args=None, hard_exit_code=None,
     except OSError:
         _err_path = ""
 
+    # [第九輪 §4] 交握檔:子行程用它回報 PRE-READY / READY;父行程每 0.1s 讀。
+    _hs_path = os.path.join(
+        _tmpdir,
+        f"cmuh_restart_{os.path.basename(str(sys.argv[0])) or 'app'}_{os.getpid()}.hs")
+    try:
+        os.remove(_hs_path)                 # 上一次殘留(同 pid 重啟過)
+    except OSError:
+        pass
+    _child_env = dict(os.environ)
+    _child_env[RESTART_HANDSHAKE_ENV] = _hs_path
+
     def _child_stderr_tail() -> str:
         """讀子行程留下的 stderr 尾巴(讀不到就誠實說讀不到,不假裝沒事)。"""
         if not _err_path:
@@ -353,7 +529,7 @@ def restart_self(extra_args=None, hard_exit_code=None,
 
     try:
         proc = subprocess.Popen(cmd, creationflags=creationflags, close_fds=True,
-                                cwd=get_app_dir(),
+                                cwd=get_app_dir(), env=_child_env,
                                 stdout=_errf, stderr=subprocess.STDOUT)
         logging.info("[restart_self] spawned new process pid=%s: %s", proc.pid, cmd)
         # [stability] 確認新行程沒有「起來就馬上死」再退出舊行程。主程式沒有外層
@@ -361,61 +537,60 @@ def restart_self(extra_args=None, hard_exit_code=None,
         # 程式消失、要人工重開。短暫輪詢確認存活；早夭就保留舊行程不退出，至少
         # 還有一個能用。（單例 mutex 重啟競態已由 ensure_single_instance 重試處理，
         # 故正常情況新行程會穩定存活。）
-        import time as _time
-        for _ in range(_SPAWN_ALIVE_POLLS):        # 最多約 0.6 秒
-            _time.sleep(_SPAWN_ALIVE_INTERVAL_SEC)
-            rc = proc.poll()
-            if rc is not None:
-                tail = _child_stderr_tail()
-                # ★[2026-08-02] 分辨「崩潰」與「照設計自行結束」★
-                #   exit=0 且沒有任何 stderr → 新行程是【自己決定】結束的,例如
-                #   這台機器沒有該程式的設定檔、或單例已被別人持有。那不是
-                #   「新版本無法啟動」—— 對使用者宣稱後者,就是在陳述程式並不
-                #   確知的事(使用者回報:沒在跑打卡的電腦一直跳這個通知)。
-                outcome = classify_child_exit(rc, tail)
-                orderly = outcome == SPAWN_CHILD_EXITED_ORDERLY
-                if orderly:
-                    logging.info(
-                        "[restart_self] 新行程自行正常結束 (exit=0、無 stderr)"
-                        " → 多半是本機未設定該程式或單例已在執行;保留舊行程不退出")
-                else:
-                    logging.error(
-                        "[restart_self] 新行程啟動後立即結束 (exit=%s)，保留舊行程不退出。"
-                        "\n--- 新行程 stderr ---\n%s\n--- stderr 結束 ---",
-                        rc, tail)
-                try:
-                    if _errf is not None:
-                        _errf.close()
-                    if _err_path:
-                        os.remove(_err_path)
-                except OSError:
-                    pass
-                return outcome
+        # [第九輪 §4] 兩階段交握(邏輯全在 wait_for_handover,純函式可測):
+        #   早夭(PRE-READY 之前)→ 分辨「崩潰」與「照設計自行結束」(2026-08-02:exit=0 且無
+        #   stderr = 子行程自己決定結束,例如本機沒有該程式的設定檔;不是「新版本無法啟動」),
+        #   保留舊行程不退出;PRE-READY → on_preready(拔熱鍵、放 mutex);READY → on_confirmed
+        #   (慢的拆解)後退出;交棒後才死 → on_recover(重取 mutex、重掛熱鍵)保留舊行程。
+        # 舊呼叫端(只傳 on_confirmed)維持今天的時序。
+        outcome = wait_for_handover(
+            proc, _hs_path, on_preready=on_preready, on_confirmed=on_confirmed,
+            on_recover=on_recover, stderr_tail=_child_stderr_tail)
+        if outcome != HANDOVER_CONFIRMED:
+            if outcome == SPAWN_CHILD_EXITED_ORDERLY:
+                logging.info(
+                    "[restart_self] 新行程自行正常結束 (exit=0、無 stderr)"
+                    " → 多半是本機未設定該程式或單例已在執行;保留舊行程不退出")
+            elif outcome == SPAWN_CHILD_CRASHED:
+                logging.error(
+                    "[restart_self] 新行程啟動後立即結束，保留舊行程不退出。"
+                    "\n--- 新行程 stderr ---\n%s\n--- stderr 結束 ---", _child_stderr_tail())
+            # 子行程已結束 → 沒人持有這兩個檔,直接清掉。
+            try:
+                if _errf is not None:
+                    _errf.close()
+                if _err_path:
+                    os.remove(_err_path)
+            except OSError:
+                pass
+            try:
+                os.remove(_hs_path)
+            except OSError:
+                pass
+            return outcome
         try:
             if _errf is not None:
                 _errf.close()       # 父行程放掉自己的 handle;子行程仍持有
         except OSError:
             pass
-        # 註:這個檔【不能】在這裡刪 —— 子行程還開著它。改由下次 spawn 時的
-        #     _sweep_old_restart_err_files 清掉(超過一天且已無人開啟者)。
-        # [2026-07-25 審查/codex] 確認新行程存活【之後】才做破壞性拆解。
-        # 背景：呼叫端(如 autoclock.restart_program)原本必須在 spawn 前就 running.clear()
-        # + 停 tray + 釋放 mutex,於是上面「保留舊行程」的保護 return 回去時,舊行程其實
-        # 已經被拆光 → 排程/看門狗迴圈與 tray 都停了、main() 隨即返回 → 打卡程式整個消失,
-        # 正是這道保護想避免的事。改由呼叫端把拆解包成 on_confirmed 交進來,只有確定
-        # 新行程活著才執行;子行程搶 mutex 失敗會自行重試(~1.5s > 這裡的 0.6s),故仍安全。
-        if on_confirmed is not None:
-            try:
-                on_confirmed()
-            except Exception:
-                logging.exception("[restart_self] on_confirmed 收尾失敗（仍照常退出）")
+        # 註:stderr 暫存檔【不能】在這裡刪 —— 子行程還開著它。改由下次 spawn 時的
+        #     _sweep_old_restart_err_files 清掉(超過一天且已無人開啟者)。交握檔子行程
+        #     已寫完、不再開著 → 可以刪。
+        try:
+            os.remove(_hs_path)
+        except OSError:
+            pass
     except Exception as e:
-        # Popen 失敗 → 子行程根本沒起來,沒人持有這個檔 → 這裡就能直接刪掉。
+        # Popen 失敗 → 子行程根本沒起來,沒人持有這兩個檔 → 這裡就能直接刪掉。
         try:
             if _errf is not None:
                 _errf.close()
             if _err_path:
                 os.remove(_err_path)
+        except OSError:
+            pass
+        try:
+            os.remove(_hs_path)
         except OSError:
             pass
         # [2026-07-26 外審] os.execv 是「取代本行程」——【無法確認新行程真的活著】,

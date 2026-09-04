@@ -417,7 +417,12 @@ def test_every_unhook_path_either_exits_or_reinstalls():
     """涵蓋★性質所及的所有函式★,不是只釘一個檔案位置:任何拔掉全域 hook 的
     函式,不是退出流程就必須重掛 abbrev —— 否則縮寫會在所有程式一起靜默失效。"""
     tree = ast.parse(io.open(_MAIN_PY, encoding="utf-8").read())
-    exit_paths = {"_cleanup_for_exit", "_restart_app", "_teardown_for_handover"}
+    # [第九輪 §4] `_preready_for_handover` 是交棒的「拔熱鍵+放 mutex」一步:子行程 READY 後
+    # 本行程退出;若子行程早夭,`_recover_after_failed_handover` 走 setup_hotkeys 重掛
+    # (含 abbrev)—— 所以它屬於退出/交棒路徑,不在這條守衛的範圍。
+    # (`_teardown_for_handover` 不再拔熱鍵 —— 那一步移到 `_preready_for_handover`;
+    #  白名單只能列「真的會 unhook」的函式,否則這條守衛的自我檢查會紅。)
+    exit_paths = {"_cleanup_for_exit", "_restart_app", "_preready_for_handover"}
     found, offenders = set(), []
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef):

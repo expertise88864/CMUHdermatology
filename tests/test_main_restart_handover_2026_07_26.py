@@ -53,13 +53,23 @@ def test_mutex_released_before_slow_teardown_steps():
     `_flush_ledger_before_exit` 上限就有 2.0s、`_cleanup_for_exit` 還要收 Chrome/executor
     —— 釋放 mutex 若排在它們後面必定超時:新行程跳「已在執行中」而退出,舊行程隨後也
     照樣拆掉退出 → 一個主程式都不剩。故快而關鍵的兩件事(拔熱鍵、放 mutex)必須排最前面。"""
-    code = _code_only(inspect.getsource(main.AutomationApp._restart_app))
-    i_unhook = code.index("safe_unhook_all_hotkeys()")
-    i_release = code.index("release_single_instance()")
-    i_flush = code.index("_flush_ledger_before_exit()")
-    i_cleanup = code.index("_cleanup_for_exit()")
-    assert i_unhook < i_release < i_flush, "拔熱鍵、放 mutex 必須排在排空佇列之前"
-    assert i_release < i_cleanup, "放 mutex 必須排在收 Chrome/executor 之前"
+    # [第九輪 §4] 順序現在由兩個階段保證:`_preready_for_handover`(子行程回報「即將搶
+    # mutex」時)只做拔熱鍵 + 放 mutex;`_teardown_for_handover`(子行程 READY 後)才做
+    # 排空佇列 / 收 Chrome。wait_for_handover 保證 preready 先於 confirmed。
+    import ast as _ast
+    tree = _ast.parse(inspect.getsource(main.AutomationApp._restart_app).lstrip())
+    fns = {n.name: n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef)}
+    pre = _ast.dump(fns["_preready_for_handover"])
+    slow = _ast.dump(fns["_teardown_for_handover"])
+    assert "safe_unhook_all_hotkeys" in pre and "release_single_instance" in pre
+    assert "_flush_ledger_before_exit" not in pre and "_cleanup_for_exit" not in pre, \
+        "慢的拆解不可以在 PRE-READY 做"
+    assert "_flush_ledger_before_exit" in slow and "_cleanup_for_exit" in slow
+    assert "release_single_instance" not in slow, "mutex 只在 PRE-READY 放一次"
+    # 快的一步在原始碼裡的順序:先拔熱鍵、再放 mutex(拔熱鍵順帶消除新舊行程同時吃熱鍵的空窗)
+    i_unhook = pre.index("safe_unhook_all_hotkeys")
+    i_release = pre.index("release_single_instance")
+    assert i_unhook < i_release
     from main import _LEDGER_FLUSH_TIMEOUT_SEC
     retry_sec = inspect.signature(
         single_instance.ensure_single_instance).parameters["retry_sec"].default

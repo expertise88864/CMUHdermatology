@@ -182,7 +182,7 @@ class TestTheUnattendedGates:
         seen = {}
         monkeypatch.setattr(
             m, "startup_instance_state",
-            lambda mutex, app_id="": seen.update(app_id=app_id)
+            lambda mutex, app_id="", retry_sec=1.5: seen.update(app_id=app_id)
             or INSTANCE_ACQUIRED)
         m.single_instance_gate()
         assert seen["app_id"] == mod_name

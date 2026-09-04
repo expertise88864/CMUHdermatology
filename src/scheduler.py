@@ -30,12 +30,15 @@ from tkinter import ttk
 
 # --- cmuh_common 共用基礎建設（stdlib/ctypes 基底，可於 ensure_dependencies 前先 import）---
 from cmuh_common.version import CURRENT_VERSION
-from cmuh_common.paths import get_app_dir, get_settings_dir, restart_self
+from cmuh_common.paths import (
+    HANDSHAKE_READY, HANDSHAKE_WAITING_MUTEX, get_app_dir, get_settings_dir,
+    mutex_retry_sec, restart_handshake_signal, restart_self,
+)
 from cmuh_common.platform_win import set_dpi_awareness, set_app_user_model_id
 from cmuh_common.window_icon import apply_tk_window_icon
 from cmuh_common.logging_setup import setup_logging
 from cmuh_common.single_instance import (
-    INSTANCE_ALREADY_RUNNING, INSTANCE_UNKNOWN,
+    INSTANCE_ACQUIRED, INSTANCE_ALREADY_RUNNING, INSTANCE_UNKNOWN,
     acquire_single_instance, release_single_instance,
 )
 from cmuh_common.deps_runtime import ensure_dependencies
@@ -114,11 +117,39 @@ def _handover_and_restart(app: "ScheduleApp") -> None:
     except Exception:
         logging.debug("交棒前本機 git 收斂失敗", exc_info=True)
 
-    def _on_confirmed() -> None:
-        globals()["_HANDING_OVER"] = True    # ★只有確認接班成功才算交棒★
-        release_single_instance()            # ②★最前面★
+    def _on_preready() -> None:
+        release_single_instance()            # ②★最前面★(子行程回報「即將搶 mutex」時)
 
-    restart_self(on_confirmed=_on_confirmed)
+    def _on_confirmed() -> None:
+        globals()["_HANDING_OVER"] = True    # ★只有子行程 READY 才算交棒★
+
+    def _on_recover() -> bool:
+        """[第九輪 §4] 子行程在放了 mutex 之後、READY 之前死掉 → 嘗試重取 mutex。
+
+        [外審 r1 P1-2] 只有 INSTANCE_ACQUIRED 才算復原(_HANDING_OVER 維持 False,下面會把
+        背景同步收回來);拿不到(別人搶到 / UNKNOWN / 拋例外)→ 本行程沒有單例所有權,
+        ★不可以★恢復同步(兩個 writer 同時動 repo)→ 記成交棒、關掉視窗安全退場。
+        回 True=已復原;False=已退場。
+        """
+        st = None
+        try:
+            st = acquire_single_instance(SINGLE_INSTANCE_MUTEX)
+        except Exception:
+            logging.exception("[update] 復原時重取 mutex 失敗")
+        if st == INSTANCE_ACQUIRED:
+            logging.warning("[update] 新行程交棒後早夭 → 本行程已重取 mutex,繼續運作")
+            return True
+        logging.critical("[update] 新行程交棒後早夭,而本行程拿不回單例(state=%s)→ "
+                         "不當沒守衛的 writer,安全退場", st)
+        globals()["_HANDING_OVER"] = True    # 不要 resume_sync;收尾當作交棒
+        try:
+            app.root.after(0, app.root.destroy)
+        except Exception:
+            logging.exception("[update] 退場排程失敗")
+        return False
+
+    restart_self(on_preready=_on_preready, on_confirmed=_on_confirmed,
+                 on_recover=_on_recover)
     # 走到這裡代表【沒有】重啟(Popen 失敗或新行程早夭,restart_self 保留舊行程)
     if quiesced and not _HANDING_OVER:
         logging.warning("[update] 重啟未成立 → 把背景同步收回來(本機仍可用)")
@@ -362,7 +393,10 @@ def main() -> None:
     #   更大,而「同時兩個 instance 各自整份覆寫」那條路已由 RS-1 的 CAS 擋住
     #   (寫回時會發現盤上不是自己讀到的那一份 → 重讀重套 / 拒絕)。
     #   所以:明確告訴使用者現在無法確認、附上復原指引,由人決定要不要繼續。
-    _state = acquire_single_instance(SINGLE_INSTANCE_MUTEX)
+    # [第九輪 §4] 由 restart_self 帶起來的子行程:先回報「即將搶 mutex」(PRE-READY),父行程
+    # 看到才放 mutex;重試窗放大(冷啟動仍 1.5s)。冷啟動沒有交握 → signal 是 no-op。
+    restart_handshake_signal(HANDSHAKE_WAITING_MUTEX)
+    _state = acquire_single_instance(SINGLE_INSTANCE_MUTEX, retry_sec=mutex_retry_sec())
     if _state == INSTANCE_ALREADY_RUNNING:
         ctypes.windll.user32.MessageBoxW(
             0, "排班程式已在執行中。", WINDOW_TITLE, 0x40 | 0x1000)
@@ -410,6 +444,8 @@ def main() -> None:
 
     try:
         app = ScheduleApp(root)
+        # [第九輪 §4] mutex 已取得、主視窗建好 → 向父行程回報 READY(冷啟動時 no-op)。
+        restart_handshake_signal(HANDSHAKE_READY)
     except Exception:
         # [EH-03] 建構失敗原本只進 log(sys.excepthook)、視窗閃一下就消失,使用者一頭霧水(以為當機)。
         # 比照主程式 AutomationApp 建構的處理:記完整 traceback + 跳可見錯誤框提示看 log,再乾淨退出。

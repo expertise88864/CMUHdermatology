@@ -58,8 +58,11 @@ def test_restart_self_reports_an_orderly_exit_distinctly():
     body = _src('cmuh_common/paths.py')
     i = body.index("def restart_self(")
     seg = body[i:i + 7000]
-    assert "outcome = classify_child_exit(rc, tail)" in seg
+    # [第九輪 §4] 交棒判定抽成 wait_for_handover;早夭分支在那裡呼叫 classify_child_exit。
+    assert "outcome = wait_for_handover(" in seg
     assert "return outcome" in seg
+    j = body.index("def wait_for_handover(")
+    assert "return classify_child_exit(rc, stderr_tail())" in body[j:j + 6000]
     # 判定邏輯本身抽成純函式才測得到真的行為(見下方的子行程測試);
     # 早夭分支只負責呼叫它。
     assert "_NO_STDERR_MARKERS" not in seg,         "★不可再用『stderr 是空的』當判準★ 正常啟動 log 會讓它永遠不成立"

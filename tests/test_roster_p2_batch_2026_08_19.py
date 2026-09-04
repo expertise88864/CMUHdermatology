@@ -168,8 +168,11 @@ class TestTheRestartHandsOverTheRepoCleanly:
         class _App:
             storage = _St()
 
-        def _fake_restart(on_confirmed=None, **kw):
+        def _fake_restart(on_confirmed=None, on_preready=None, on_recover=None, **kw):
+            # [第九輪 §4] 新契約:PRE-READY(子行程即將搶 mutex)→ 放 mutex;READY → 交棒成立。
             order.append("spawn")
+            if on_preready:
+                on_preready()
             if on_confirmed:
                 on_confirmed()
             return None
@@ -188,7 +191,7 @@ class TestTheRestartHandsOverTheRepoCleanly:
             handed = scheduler._HANDING_OVER
             scheduler._HANDING_OVER = False
         assert order[0] == "quiesce", f"quiesce 要在 spawn 之前 {order}"
-        assert order.index("release") == order.index("spawn") + 1,             f"★釋放 mutex 必須是 on_confirmed 的第一件事★ {order}"
+        assert order.index("release") == order.index("spawn") + 1,             f"★釋放 mutex 必須是 PRE-READY(on_preready)的第一件事★ {order}"
         assert "resume" not in order, "接班成立就不該把同步收回來"
         assert handed, "接班成立要記下交棒(收尾才不會再去碰 repo)"
 

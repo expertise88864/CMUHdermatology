@@ -131,8 +131,11 @@ def test_restart_program_releases_mutex_before_respawn(monkeypatch):
     monkeypatch.setattr(
         autoclock,
         "restart_self",
-        lambda extra, hard_exit_code=None, on_confirmed=None: (
+        # [第九輪 §4] 新契約:PRE-READY(放 mutex)→ READY(慢的拆解)。樁模擬兩階段都成功。
+        lambda extra, hard_exit_code=None, on_confirmed=None, on_preready=None,
+        on_recover=None: (
             calls.append(("restart", extra, hard_exit_code)),
+            on_preready() if on_preready else None,
             on_confirmed() if on_confirmed else None),
     )
     monkeypatch.setattr(sys, "argv", ["autoclock.py", "--configure"])
@@ -162,8 +165,11 @@ def test_restart_program_passes_hard_exit_code_for_background_restart(monkeypatc
     monkeypatch.setattr(
         autoclock,
         "restart_self",
-        lambda extra, hard_exit_code=None, on_confirmed=None: (
+        # [第九輪 §4] 新契約:PRE-READY(放 mutex)→ READY(慢的拆解)。樁模擬兩階段都成功。
+        lambda extra, hard_exit_code=None, on_confirmed=None, on_preready=None,
+        on_recover=None: (
             calls.append(("restart", extra, hard_exit_code)),
+            on_preready() if on_preready else None,
             on_confirmed() if on_confirmed else None),
     )
     monkeypatch.setattr(sys, "argv", ["autoclock.py"])
@@ -191,8 +197,8 @@ def test_restart_failure_leaves_process_fully_intact(monkeypatch):
     # 樁不呼叫 on_confirmed＝模擬「新行程早夭、保留舊行程」
     monkeypatch.setattr(
         autoclock, "restart_self",
-        lambda extra, hard_exit_code=None, on_confirmed=None:
-            calls.append("restart"))
+        lambda extra, hard_exit_code=None, on_confirmed=None, on_preready=None,
+        on_recover=None: calls.append("restart"))
     monkeypatch.setattr(sys, "argv", ["autoclock.py"])
     autoclock.running.set()
 
@@ -200,6 +206,32 @@ def test_restart_failure_leaves_process_fully_intact(monkeypatch):
 
     assert calls == ["restart", "notify"], f"不得有任何拆解動作：{calls}"
     assert autoclock.running.is_set(), "排程必須繼續跑"
+
+
+def test_recovery_failure_is_not_reported_as_uninterrupted_service(monkeypatch):
+    """[第九輪 §4 外審 r2] 新行程交棒後早夭、本行程拿不回 mutex → on_recover 已自行收尾退場,
+    自動打卡此刻是★停止★的。restart_program 不可以沿用「已繼續使用目前版本、打卡未中斷」
+    的通知(假保證),要用據實的「已停止,請重新開啟」。"""
+    from cmuh_common import paths
+    calls = []
+    monkeypatch.setattr(autoclock, "tray_icon_object", None)
+    monkeypatch.setattr(autoclock, "_notify_restart_failed",
+                        lambda: calls.append("notify_uninterrupted"))
+    monkeypatch.setattr(autoclock, "_notify_clock_stopped_after_failed_recovery",
+                        lambda: calls.append("notify_stopped"))
+    # 樁模擬:交棒後早夭 → on_recover 回 False(拿不回 mutex)→ restart_self 回 RECOVERY_FAILED
+    monkeypatch.setattr(
+        autoclock, "restart_self",
+        lambda extra, hard_exit_code=None, on_confirmed=None, on_preready=None,
+        on_recover=None: (calls.append("restart"), paths.SPAWN_RECOVERY_FAILED)[1])
+    monkeypatch.setattr(sys, "argv", ["autoclock.py"])
+    monkeypatch.setattr(autoclock, "_machine_has_clock_accounts", lambda: True)
+    autoclock.running.set()
+
+    autoclock.restart_program()
+
+    assert calls == ["restart", "notify_stopped"], calls
+    assert "notify_uninterrupted" not in calls, "復原失敗不可以說「打卡未中斷」"
 
 
 def test_run_immediate_test_skips_duplicate_until_worker_finishes(monkeypatch):

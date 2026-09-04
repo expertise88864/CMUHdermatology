@@ -63,12 +63,16 @@ from cmuh_common.logging_setup import (  # noqa: E402
 )
 from cmuh_common.paths import (
     SPAWN_CHILD_EXITED_ORDERLY as _SPAWN_CHILD_EXITED_ORDERLY,
+    SPAWN_RECOVERY_FAILED as _SPAWN_RECOVERY_FAILED,
 )  # noqa: E402
 from cmuh_common.cross_process_claim import exclusive_claim  # noqa: E402
-from cmuh_common.paths import get_app_dir, get_settings_dir, restart_self  # noqa: E402
+from cmuh_common.paths import (  # noqa: E402
+    HANDSHAKE_READY, HANDSHAKE_WAITING_MUTEX, get_app_dir, get_settings_dir,
+    mutex_retry_sec, restart_handshake_signal, restart_self,
+)
 from cmuh_common.platform_win import set_dpi_awareness  # noqa: E402
 from cmuh_common.single_instance import (  # noqa: E402
-    INSTANCE_ALREADY_RUNNING, INSTANCE_UNKNOWN,
+    INSTANCE_ACQUIRED, INSTANCE_ALREADY_RUNNING, INSTANCE_UNKNOWN,
     release_single_instance, startup_instance_state,
 )
 from cmuh_common.task_gate import (  # noqa: E402
@@ -2365,6 +2369,33 @@ def _machine_has_clock_accounts() -> bool:
                for a in data)
 
 
+def _notify_clock_stopped_after_failed_recovery() -> None:
+    """[第九輪 §4 外審 r2] 新行程交棒後早夭、本行程又拿不回單例 → 本行程已自行收尾退場,
+    ★自動打卡此刻是停止的★。不可以沿用「已繼續使用目前版本、打卡未中斷」那句(那是假保證,
+    會讓人以為不用管);要據實說「已停止,請重新開啟打卡程式或確認是否有另一份在跑」。
+    沒有打卡帳號的機器同樣只記 log(這台不做打卡)。"""
+    if not _machine_has_clock_accounts():
+        logging.info("[autoclock restart] 本機沒有打卡帳號 → 復原失敗不打擾使用者")
+        return
+    try:
+        notify_clock_failure(
+            "自動打卡已停止",
+            ["更新後的新版本啟動失敗，且舊版本無法確認自己仍是唯一的打卡程式，",
+             "已安全停止。請重新開啟打卡程式（或確認是否已有另一份在執行）。"])
+    except Exception:
+        logging.debug("[autoclock restart] toast 通知失敗", exc_info=True)
+    if not (WINOTIFY_AVAILABLE and WinotifyNotification is not None):
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                0, "自動打卡：更新後的新版本啟動失敗，\n"
+                   "而舊版本無法確認自己仍是唯一的打卡程式，已安全停止。\n"
+                   "請重新開啟打卡程式，或確認是否已有另一份在執行。",
+                "自動打卡", 0x10)          # MB_ICONERROR:這不是「未中斷」
+        except Exception:
+            logging.debug("[autoclock restart] MessageBox 後備通知失敗",
+                          exc_info=True)
+
+
 def _notify_restart_failed() -> None:
     """重啟失敗的告知。[codex] notify_clock_failure 在沒安裝 winotify 時會靜默 return,
     故再加一層 MessageBox 後備——這種事必須讓使用者確實知道。
@@ -2414,18 +2445,22 @@ def restart_program(args_add=None, hard_exit_code=None) -> None:
     mutex 仍然安全。spawn 失敗時本行程【完全沒被動過】，排程照常繼續跑。"""
     global tray_icon_object
 
+    def _preready_for_handover() -> None:
+        """[第九輪 §4] 子行程回報「即將搶 mutex」(或 0.6s 仍活著)→ 只做★放 mutex★這一件
+        快而關鍵的事;排程迴圈、tray、driver 都還留著,子行程若在 READY 之前死掉可以直接復原。"""
+        try:
+            release_single_instance()
+            logging.info("[autoclock restart] mutex released (child pre-ready)")
+        except Exception:
+            logging.debug("[autoclock restart] release_single_instance failed",
+                          exc_info=True)
+
     def _teardown_for_handover() -> None:
-        """確認新行程活著之後才做的收尾（本函式只會在即將退出時被呼叫一次）。"""
+        """子行程 READY 之後才做的收尾（本函式只會在即將退出時被呼叫一次）。"""
         global tray_icon_object
         running.clear()
         if tray_icon_object:
             tray_icon_object.stop()
-        try:
-            release_single_instance()
-            logging.info("[autoclock restart] mutex released (handover confirmed)")
-        except Exception:
-            logging.debug("[autoclock restart] release_single_instance failed",
-                          exc_info=True)
         # [stability] 收掉本 process 的常駐 chromedriver/Chrome：否則重啟後新 instance
         # 會再開一份，舊的若沒退乾淨，chromedriver/Chrome 進程會累積。
         try:
@@ -2433,6 +2468,26 @@ def restart_program(args_add=None, hard_exit_code=None) -> None:
         except Exception:
             logging.debug("[autoclock restart] release persistent driver failed",
                           exc_info=True)
+
+    def _recover_after_failed_handover() -> bool:
+        """[第九輪 §4] 子行程在放了 mutex 之後、READY 之前死掉 → 嘗試重取 mutex。
+
+        [外審 r1 P1-2] 只有 INSTANCE_ACQUIRED 才算復原(排程照常);拿不到(別人搶到 / UNKNOWN /
+        拋例外)→ 本行程沒有單例所有權,★不可以★繼續打卡(會重複打卡)→ 走收尾安全退場。
+        回 True=已復原;False=已退場。
+        """
+        st = None
+        try:
+            st = startup_instance_state(AUTOCLOCK_MUTEX_NAME, "autoclock")
+        except Exception:
+            logging.exception("[autoclock restart] 復原時重取 mutex 失敗")
+        if st == INSTANCE_ACQUIRED:
+            logging.warning("[autoclock restart] 新行程交棒後早夭 → 本行程已重取 mutex,排程繼續")
+            return True
+        logging.critical("[autoclock restart] 新行程交棒後早夭,而本行程拿不回單例(state=%s)→ "
+                         "不當沒守衛的 instance,安全退場", st)
+        _teardown_for_handover()
+        return False
 
     extra: list = []
     for a in sys.argv[1:]:
@@ -2457,7 +2512,9 @@ def restart_program(args_add=None, hard_exit_code=None) -> None:
             and _machine_has_clock_accounts()):
         extra.append(CONFIGURE_IF_EMPTY_FLAG)
     outcome = restart_self(extra, hard_exit_code=hard_exit_code,
-                           on_confirmed=_teardown_for_handover)
+                           on_preready=_preready_for_handover,
+                           on_confirmed=_teardown_for_handover,
+                           on_recover=_recover_after_failed_handover)
     # 走到這裡＝新行程早夭、restart_self 刻意保留本行程；因為拆解在 on_confirmed 裡，
     # 本行程的排程/看門狗/tray/mutex 都【原封不動】→ 自動打卡繼續運作。
     # ★[2026-08-02 使用者回報] 只有真的像崩潰才示警★
@@ -2468,6 +2525,14 @@ def restart_program(args_add=None, hard_exit_code=None) -> None:
     if outcome == _SPAWN_CHILD_EXITED_ORDERLY:
         logging.info("[autoclock restart] 新行程自行正常結束(本機多半未設定打卡)"
                      " → 不視為失敗,不打擾使用者")
+        return
+    if outcome == _SPAWN_RECOVERY_FAILED:
+        # [第九輪 §4 外審 r2] ★這條不是「本行程續跑」★:新行程交棒後早夭,本行程重取 mutex 失敗
+        # → _recover_after_failed_handover 已經 running.clear()/停 tray/收 driver 安全退場。
+        # 此刻自動打卡是停止的,不可以沿用下面那句「打卡未中斷」。
+        logging.critical("[autoclock restart] 新行程交棒後早夭且本行程拿不回單例 → "
+                         "已安全停止自動打卡;需人工重新開啟或確認另一份是否在跑")
+        _notify_clock_stopped_after_failed_recovery()
         return
     logging.error("[autoclock restart] 新行程未能存活 → 本行程續跑（未拆解），"
                   "自動打卡不中斷；請檢查更新是否損毀")
@@ -2609,7 +2674,11 @@ def single_instance_gate() -> str:
       —— 與 2026-08-05 事故的教訓一致:fail-closed 前要先證明狀況會解除。
     所以:照常跑,但把「不知道」留成一筆看得出來的紀錄。
     """
-    return startup_instance_state(AUTOCLOCK_MUTEX_NAME, "autoclock")
+    # [第九輪 §4] 由 restart_self 帶起來的子行程:先回報「即將搶 mutex」(PRE-READY),父行程
+    # 看到才放 mutex;重試窗放大(冷啟動仍 1.5s)。冷啟動沒有交握 → signal 是 no-op。
+    restart_handshake_signal(HANDSHAKE_WAITING_MUTEX)
+    return startup_instance_state(AUTOCLOCK_MUTEX_NAME, "autoclock",
+                                  retry_sec=mutex_retry_sec())
 
 
 def report_single_instance_state(state: str) -> None:
@@ -2779,6 +2848,8 @@ def main() -> None:
         global _scheduler_thread_ref
         _scheduler_thread_ref = background_thread
         background_thread.start()
+        # [第九輪 §4] mutex 已取得、排程迴圈已起 → 向父行程回報 READY(冷啟動時 no-op)。
+        restart_handshake_signal(HANDSHAKE_READY)
 
         try:
             from PIL import Image

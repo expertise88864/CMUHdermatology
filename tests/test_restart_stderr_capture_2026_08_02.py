@@ -21,7 +21,7 @@ def _src():
 def _restart_self_body() -> str:
     s = _src()
     i = s.index("def restart_self(")
-    return s[i:i + 6000]
+    return s[i:i + 9000]          # [第九輪 §4] 多了交握路徑與 waiter 呼叫,函式變長
 
 
 def test_child_stderr_is_captured():
@@ -37,9 +37,11 @@ def test_early_death_logs_the_stderr_tail():
     自行結束),故改為斷言「早夭分支內確實取了 stderr 並寫進 error log」。
     """
     body = _restart_self_body()
-    i = body.index("rc is not None:")
+    # [第九輪 §4] 早夭判定移到 wait_for_handover;restart_self 在「沒確認接手」的分支把 stderr
+    # 尾巴記進 error log(交棒後才死的那條,則由 wait_for_handover 自己記)。
+    i = body.index("outcome != HANDOVER_CONFIRMED")
     seg = body[i:i + 1200]
-    assert "tail = _child_stderr_tail()" in seg
+    assert "_child_stderr_tail()" in seg
     assert "新行程啟動後立即結束" in seg
     assert "--- 新行程 stderr ---" in seg
 
@@ -68,7 +70,9 @@ def test_parent_releases_handle_after_confirming_alive():
     # (我第一版就抓到 docstring 那一個,順序判斷整個顛倒)。改用只出現在程式碼的字串。
     i_close = body.index("_errf.close()       # 父行程放掉自己的 handle")
     i_death = body.index("新行程啟動後立即結束")
-    i_teardown = body.index("on_confirmed()")
+    # [第九輪 §4] 破壞性拆解由 wait_for_handover 在 READY 時呼叫 on_confirmed;restart_self
+    # 本體裡「確認接手之後」的下一步是退出 → 放 handle 要排在早夭處理之後、退出之前。
+    i_teardown = body.index("if hard_exit_code is not None:")
     assert i_death < i_close < i_teardown,         "放掉 handle 要在「早夭處理之後、破壞性拆解之前」"
 
 

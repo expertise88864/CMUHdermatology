@@ -67,7 +67,8 @@ def acquire_single_instance(mutex_name: str, retry_sec: float = 1.5) -> str:
     return INSTANCE_ACQUIRED if ok else INSTANCE_ALREADY_RUNNING
 
 
-def startup_instance_state(mutex_name: str, app_id: str = "") -> str:
+def startup_instance_state(mutex_name: str, app_id: str = "",
+                           retry_sec: float = 1.5) -> str:
     """開機單例判定:三態,而且 UNKNOWN 時★再走一條不依賴 mutex API 的路★。
 
     (外審 R3-P2-04 R1 P1-1)`CreateMutexW` 壞掉時,原本只能回「不知道」而各程式
@@ -80,7 +81,7 @@ def startup_instance_state(mutex_name: str, app_id: str = "") -> str:
     因為打卡那條路的重複代價很高(repo 內有「清理重複打卡程式.ps1」這種
     現場工具就是證據),不可以宣稱一個做不到的保證。
     """
-    state = acquire_single_instance(mutex_name)
+    state = acquire_single_instance(mutex_name, retry_sec)
     if state != INSTANCE_UNKNOWN or not app_id:
         return state
     try:
