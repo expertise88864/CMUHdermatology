@@ -11025,7 +11025,10 @@ class AutomationApp:
         logging.error(f"Hotkey module initialization failed: {error}")
         # [第九輪 §4] 「試過了、失敗也已處理」同樣算關鍵初始化完成:本行程會繼續以無熱鍵
         # 模式服務(門診面板/會診仍在),父行程可以退出;不回報的話父行程會等到逾時。
-        restart_handshake_signal(HANDSHAKE_READY)
+        # [外審 r10-4] ★每一個 READY 發送點都要檢查送達結果★(這條降級路徑原本漏了):
+        # 送不到 = 父行程會判定本行程卡死並收回單例,留 CRITICAL 才查得出真正的原因。
+        if restart_handshake_active() and not restart_handshake_signal(HANDSHAKE_READY):
+            logging.critical('[交握] READY 送不到父行程 —— 本行程其實已就緒(無熱鍵降級模式)')
 
     def _start_hotkey_module_loading(self):
         if self._heavy_modules_ready:

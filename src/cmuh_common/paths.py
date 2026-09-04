@@ -156,6 +156,16 @@ _CRASH_MARKERS = ("Traceback (most recent call last)", "SyntaxError",
 # 傳輸:父行程 Popen(env=CMUH_RESTART_HANDSHAKE=<tmp 檔>);子行程原子寫入階段字串;父行程
 # 每 0.1s 讀。單一寫者,不需要鎖;冷啟動沒有 env → signal 是 no-op。
 RESTART_HANDSHAKE_ENV = "CMUH_RESTART_HANDSHAKE"
+# [外審 r10-4 P3-high] ★READY 的傳輸要與「就緒的權威」分開★。舊版 READY 只走檔案,於是
+# 「子行程健康但檔案寫不進去(ACL/防毒/暫時 I/O)」與「子行程拿了單例之後卡死」在父行程眼中
+# ★長得一模一樣★(都是 OWNER_OTHER + 沒有 READY)—— protocol information insufficiency。
+# 改用 Windows ★具名事件★當主通道:核心物件,不碰檔案系統,沒有 rename/ACL/防毒掃描那些
+# 失敗模式;檔案保留為備援(兩條同時失效才會誤判)。有了可靠通道,「持有單例卻始終不 READY」
+# 才真的是卡死的證據,父行程才有立場收回單例 —— 見 `wait_for_handover` 的 wedge 處置。
+RESTART_READY_EVENT_ENV = "CMUH_RESTART_READY_EVENT"
+_EVENT_MODIFY_STATE = 0x0002
+_WAIT_OBJECT_0 = 0
+_READY_EVENT_NAME: list = [None]     # 子行程端 latch(與交握檔同樣不外洩給孫行程)
 HANDSHAKE_WAITING_MUTEX = "waiting_mutex"
 HANDSHAKE_READY = "ready"
 HANDSHAKE_LEGACY_GRACE_SEC = 3.0      # 從未看到交握檔 → 視為舊版子行程的寬限
@@ -175,12 +185,13 @@ SPAWN_CHILD_NEVER_READY = "child_never_ready"   # 子行程活著卻沒接手(�
 #   OWNER_OTHER  → 有別人(就是子行程)持有 → 所有權真的轉移了 → 確認交棒、安靜退出;
 #   OWNER_SELF   → 我又拿回來了 → 子行程沒接手(卡在取得單例之前)→ 復原、繼續服務;
 #   OWNER_UNKNOWN→ mutex API 壞了,誰也不知道 → 不可以假裝知道 → 走安全退場那條路。
-# ★[外審 r10-2/r10-3] 「持有單例卻不 READY」不可以被推論成「卡死」★:同樣的外觀也可能是
-# READY ★寫不進去★(ACL/防毒)而子行程其實健康 —— 缺席的訊號不是失敗的證據,要終止一個
-# 持有單例的行程必須有★正面的★失效證據。所以 OWNER_OTHER 一律當交棒成立。
-# 真的卡死時誰來救,各程式不同、都不是靜默的:打卡有 watchdog(enabled=True/300s);
-# 主程式與排班是 GUI —— watchdog 對主程式刻意停用的理由就寫在 watchdog_core 的設定裡:
-# 「主程式有 GUI,崩潰使用者立刻看到(熱鍵失效)」。
+# ★[外審 r10-2/r10-3] 「持有單例卻不 READY」能不能推論成「卡死」,★取決於通道可不可靠★:
+#   * 只有檔案通道時 → 不可以。同樣的外觀也可能是 READY 寫不進去(ACL/防毒)而子行程其實
+#     健康;缺席的訊號不是失敗的證據 → OWNER_OTHER 一律當交棒成立。
+#   * [r10-4] 具名事件在場時 → 可以。事件是核心物件,沒有檔案系統那些失敗模式;子行程
+#     送過交握卻始終沒 SetEvent,就是卡在單例之後 —— 而且★這時退出的後果特別重★:
+#     卡死的子行程持有單例,使用者連手動重開都會被「已在執行中」擋掉,只能去工作管理員
+#     砍行程。所以父行程收回單例。
 OWNER_SELF = "owner_self"
 OWNER_OTHER = "owner_other"
 OWNER_UNKNOWN = "owner_unknown"
@@ -197,6 +208,83 @@ def _latch_handshake_path() -> str:
     if _HANDSHAKE_PATH[0] is None:
         _HANDSHAKE_PATH[0] = _os.environ.pop(RESTART_HANDSHAKE_ENV, "").strip()
     return _HANDSHAKE_PATH[0]
+
+
+def _latch_ready_event_name() -> str:
+    """子行程端:latch READY 事件名並從環境移除(理由同交握檔 —— 孫行程不可以繼承)。"""
+    import os as _os
+    if _READY_EVENT_NAME[0] is None:
+        _READY_EVENT_NAME[0] = _os.environ.pop(RESTART_READY_EVENT_ENV, "").strip()
+    return _READY_EVENT_NAME[0]
+
+
+def create_ready_event(name: str):
+    """父行程端:建立 manual-reset 具名事件。回 handle(int);建不出來回 None
+    (非 Windows / API 失敗)—— 呼叫端據此知道★這次沒有可靠通道★。"""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes as _ct
+        from ctypes import wintypes as _wt
+        k32 = _ct.WinDLL("kernel32", use_last_error=True)
+        k32.CreateEventW.argtypes = [_wt.LPVOID, _wt.BOOL, _wt.BOOL, _wt.LPCWSTR]
+        k32.CreateEventW.restype = _wt.HANDLE
+        h = k32.CreateEventW(None, True, False, name)     # manual-reset, 初始未設定
+        return int(h) if h else None
+    except Exception:
+        import logging as _logging
+        _logging.debug("[restart_handshake] 建立 READY 事件失敗", exc_info=True)
+        return None
+
+
+def signal_ready_event() -> bool:
+    """子行程端:把 READY 事件設起來。沒有事件名/開不起來 → False(呼叫端退回檔案通道)。"""
+    name = _latch_ready_event_name()
+    if not name or os.name != "nt":
+        return False
+    try:
+        import ctypes as _ct
+        from ctypes import wintypes as _wt
+        k32 = _ct.WinDLL("kernel32", use_last_error=True)
+        k32.OpenEventW.argtypes = [_wt.DWORD, _wt.BOOL, _wt.LPCWSTR]
+        k32.OpenEventW.restype = _wt.HANDLE
+        h = k32.OpenEventW(_EVENT_MODIFY_STATE, False, name)
+        if not h:
+            return False
+        try:
+            return bool(k32.SetEvent(_wt.HANDLE(h)))
+        finally:
+            k32.CloseHandle(_wt.HANDLE(h))
+    except Exception:
+        import logging as _logging
+        _logging.debug("[restart_handshake] 設定 READY 事件失敗", exc_info=True)
+        return False
+
+
+def ready_event_is_set(handle) -> bool:
+    """父行程端:事件是否已被子行程設起來(不阻塞)。"""
+    if not handle or os.name != "nt":
+        return False
+    try:
+        import ctypes as _ct
+        from ctypes import wintypes as _wt
+        k32 = _ct.WinDLL("kernel32", use_last_error=True)
+        k32.WaitForSingleObject.argtypes = [_wt.HANDLE, _wt.DWORD]
+        k32.WaitForSingleObject.restype = _wt.DWORD
+        return k32.WaitForSingleObject(_wt.HANDLE(handle), 0) == _WAIT_OBJECT_0
+    except Exception:
+        return False
+
+
+def close_handle(handle) -> None:
+    if not handle or os.name != "nt":
+        return
+    try:
+        import ctypes as _ct
+        from ctypes import wintypes as _wt
+        _ct.WinDLL("kernel32", use_last_error=True).CloseHandle(_wt.HANDLE(handle))
+    except Exception:
+        pass
 
 
 def restart_handshake_active() -> bool:
@@ -229,18 +317,26 @@ def restart_handshake_signal(state: str) -> bool:
     path = _latch_handshake_path()
     if not path:
         return False
+    # [外審 r10-4] READY 先走★具名事件★(核心物件,不碰檔案系統);檔案照樣寫,兩條都試,
+    # 任一條成功就算送到 —— 「健康但訊號遺失」要兩條同時失效才會發生。
+    event_ok = signal_ready_event() if state == HANDSHAKE_READY else False
     last_err = None
     for attempt in range(HANDSHAKE_SIGNAL_RETRIES):
         try:
             tmp = f"{path}.{_os.getpid()}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                f.write(f"{state} {_os.getpid()}")
+                f.write(f"{state} {_os.getpid()}{_caps_suffix()}")
             _os.replace(tmp, path)
             return True
         except OSError as e:
             last_err = e
             if attempt + 1 < HANDSHAKE_SIGNAL_RETRIES:
                 _time.sleep(HANDSHAKE_SIGNAL_RETRY_SEC)
+    if event_ok:
+        _logging.warning("[restart_handshake] %s 的檔案通道連 %d 次寫失敗(%s),"
+                         "但★具名事件已送達★ → 父行程仍收得到",
+                         state, HANDSHAKE_SIGNAL_RETRIES, last_err)
+        return True
     _logging.warning("[restart_handshake] 寫入 %s 連 %d 次失敗(%s):父行程收不到這個階段",
                      state, HANDSHAKE_SIGNAL_RETRIES, last_err)
     return False
@@ -248,12 +344,24 @@ def restart_handshake_signal(state: str) -> bool:
 
 def read_handshake(path: str, expect_pid=None):
     """父行程讀交握檔;不存在/讀不到/內容不認得/★PID 不是直接子行程★ → None。"""
-    state, _present = read_handshake_ex(path, expect_pid)
+    state, _present, _caps = read_handshake_ex(path, expect_pid)
     return state
 
 
+#: [外審 r10-5] 子行程在交握 payload 裡★正面宣告★自己會設 READY 具名事件。
+#: ★父行程建得出事件★證明不了★子行程會設它★——中間版本(懂檔案交握、不懂事件,例如
+#: v2026.09.04.3)降版回來時,父行程若把「事件沒被設」當成卡死,就會終止一個健康的子行程,
+#: 而且正好在「READY 檔寫失敗」那條路上重現原本的訊號遺失問題。能力必須由子行程自己說。
+HANDSHAKE_CAP_EVENT = "ev"
+
+
+def _caps_suffix() -> str:
+    """本行程能提供的交握能力(附在 payload 後面;舊版讀不到也不會壞:多餘欄位會被忽略)。"""
+    return f" {HANDSHAKE_CAP_EVENT}" if _latch_ready_event_name() else ""
+
+
 def read_handshake_ex(path: str, expect_pid=None):
-    """回 (state, file_present)。
+    """回 (state, file_present, caps)。`caps` 是子行程宣告的能力集合(舊 payload → 空集合)。
 
     [外審 r10] ★「檔案存在但內容無效」不等於「沒有交握」★:錯 PID(孫行程冒充)或壞掉的
     內容,舊版會讓 `saw_file` 維持 False → 靜默降級成「大概是舊版子行程」的短寬限。
@@ -264,18 +372,19 @@ def read_handshake_ex(path: str, expect_pid=None):
         with open(path, "r", encoding="utf-8") as f:
             s = f.read().strip()
     except OSError:
-        return None, False
+        return None, False, frozenset()
     parts = s.split()
     if not parts or parts[0] not in (HANDSHAKE_WAITING_MUTEX, HANDSHAKE_READY):
-        return None, True
+        return None, True, frozenset()
     if expect_pid is not None:
         if len(parts) < 2 or not parts[1].isdigit() or int(parts[1]) != int(expect_pid):
-            return None, True
-    return parts[0], True
+            return None, True, frozenset()
+    return parts[0], True, frozenset(parts[2:])
 
 
 def wait_for_handover(proc, handshake_path: str, *, on_preready=None, on_confirmed=None,
                       on_recover=None, stderr_tail=lambda: "", now=None, sleep=None,
+                      ready_event=None, ready_event_probe=None,
                       poll_interval: float = _SPAWN_ALIVE_INTERVAL_SEC) -> str:
     """父行程的交棒判定(純函式,可測)。回:
       HANDOVER_CONFIRMED              → 所有權已轉移,呼叫端退出本行程
@@ -298,6 +407,15 @@ def wait_for_handover(proc, handshake_path: str, *, on_preready=None, on_confirm
     saw_file = False          # 交握檔存在過(內容有效與否都算)
     warned_invalid = False
     expect_pid = getattr(proc, "pid", None)          # ★只認直接子行程的 PID★
+    # [外審 r10-4] ★有沒有可靠的 READY 通道★決定「沒有 READY」能不能當成證據:
+    # 具名事件在 → 缺席就是卡死的證據,父行程有立場收回單例;事件建不出來(非 Windows /
+    # API 失敗)→ 退回舊行為(缺席不算證據,OWNER_OTHER 一律當交棒成立)。
+    _event_probe = ready_event_probe or ready_event_is_set
+    reliable_ready = ready_event is not None
+    child_declared_event = False     # ★由子行程自己宣告★,不是父行程推測
+
+    def _event_set() -> bool:
+        return bool(ready_event is not None and _event_probe(ready_event))
 
     def _terminate_child(why: str) -> None:
         """[外審 r10-2] 終止★直接子行程★:走到這裡它已經不可能是合法接手者了。
@@ -335,7 +453,12 @@ def wait_for_handover(proc, handshake_path: str, *, on_preready=None, on_confirm
     while True:
         sleep(poll_interval)
         rc = proc.poll()
-        state, present = read_handshake_ex(handshake_path, expect_pid)
+        state, present, caps = read_handshake_ex(handshake_path, expect_pid)
+        if state != HANDSHAKE_READY and _event_set():
+            state = HANDSHAKE_READY          # 具名事件是 READY 的主通道(不碰檔案系統)
+        if state is not None:
+            if HANDSHAKE_CAP_EVENT in caps:
+                child_declared_event = True    # 它明說了「我會設 READY 事件」
         if present:
             saw_file = True                # ★檔案在就算★:無效內容不可以被當成「舊版子行程」
             if state is None and not warned_invalid:
@@ -404,8 +527,24 @@ def wait_for_handover(proc, handshake_path: str, *, on_preready=None, on_confirm
                     "[restart_self] 新行程 %.0fs 未回報 READY,而且★查不出誰持有單例★ → "
                     "不假裝接手成功,交由呼叫端安全退場", elapsed)
                 return SPAWN_RECOVERY_FAILED
+            if owner == OWNER_OTHER and reliable_ready and child_declared_event:
+                # [外審 r10-4] ★有可靠通道時,缺席的 READY 就是證據★:子行程送過交握
+                # (capable),而 READY 走的是具名事件(核心物件,不碰檔案系統)—— 它拿了
+                # 單例卻始終沒 SetEvent,那不是「訊號遺失」,是卡在單例之後。
+                # 這時★不可以退出★:卡死的子行程持有單例,使用者連手動重開都會被
+                # 「已在執行中」擋掉,只能去工作管理員砍行程。父行程收回單例才是出路。
+                _logging.error(
+                    "[restart_self] 新行程持有單例,且在可靠通道上 %.0fs 未回報 READY → "
+                    "判定卡在初始化;終止它並收回單例(本次不重啟)", elapsed)
+                _terminate_child("持有單例但在可靠通道上始終未回報 READY")
+                owner = _probe_owner("after terminating a wedged child")
+                if owner == OWNER_SELF:
+                    return SPAWN_CHILD_NEVER_READY
+                _logging.critical("[restart_self] 終止卡死的新行程後仍拿不回單例(owner=%s)"
+                                  " → 交由呼叫端安全退場", owner)
+                return SPAWN_RECOVERY_FAILED
             if owner == OWNER_OTHER:
-                # ★所有權確實轉移 = 交棒成立★。
+                # ★所有權確實轉移 = 交棒成立★(沒有可靠通道,或子行程從未送過交握)。
                 # [外審 r10-2 第三回] 我上一版在這裡加了「送過交握的子行程若不 READY,90 秒後
                 # 終止它並收回單例」。★撤掉了★,理由是外審對的、我的反駁站不住:
                 #   * 「沒有 READY」證明不了卡死 —— 也可能是 READY ★寫不進去★(ACL/防毒),
@@ -649,6 +788,16 @@ def restart_self(extra_args=None, hard_exit_code=None,
         pass
     _child_env = dict(os.environ)
     _child_env[RESTART_HANDSHAKE_ENV] = _hs_path
+    # [外審 r10-4] READY 的主通道:具名事件(核心物件)。建不出來就只剩檔案通道,
+    # `wait_for_handover` 會據此退回保守行為(缺席的 READY 不當證據)。
+    import uuid as _uuid
+    _ready_event_name = f"Local\\CMUH_RESTART_READY_{os.getpid()}_{_uuid.uuid4().hex}"
+    _ready_event = create_ready_event(_ready_event_name)
+    if _ready_event:
+        _child_env[RESTART_READY_EVENT_ENV] = _ready_event_name
+    else:
+        logging.warning("[restart_self] 建不出 READY 具名事件 → 只用檔案通道,"
+                        "「持有單例卻不 READY」將維持保守處置(不收回單例)")
 
     def _child_stderr_tail() -> str:
         """讀子行程留下的 stderr 尾巴(讀不到就誠實說讀不到,不假裝沒事)。"""
@@ -682,7 +831,8 @@ def restart_self(extra_args=None, hard_exit_code=None,
         # 舊呼叫端(只傳 on_confirmed)維持今天的時序。
         outcome = wait_for_handover(
             proc, _hs_path, on_preready=on_preready, on_confirmed=on_confirmed,
-            on_recover=on_recover, stderr_tail=_child_stderr_tail)
+            on_recover=on_recover, stderr_tail=_child_stderr_tail,
+            ready_event=_ready_event)
         if outcome != HANDOVER_CONFIRMED:
             if outcome == SPAWN_CHILD_EXITED_ORDERLY:
                 logging.info(
@@ -704,6 +854,7 @@ def restart_self(extra_args=None, hard_exit_code=None,
                 os.remove(_hs_path)
             except OSError:
                 pass
+            close_handle(_ready_event)
             return outcome
         try:
             if _errf is not None:
@@ -717,6 +868,7 @@ def restart_self(extra_args=None, hard_exit_code=None,
             os.remove(_hs_path)
         except OSError:
             pass
+        close_handle(_ready_event)
     except Exception as e:
         # Popen 失敗 → 子行程根本沒起來,沒人持有這兩個檔 → 這裡就能直接刪掉。
         try:
@@ -730,6 +882,7 @@ def restart_self(extra_args=None, hard_exit_code=None,
             os.remove(_hs_path)
         except OSError:
             pass
+        close_handle(_ready_event)
         # [2026-07-26 外審] os.execv 是「取代本行程」——【無法確認新行程真的活著】,
         # 而且成功時永不返回 → on_confirmed 一定不會被呼叫。呼叫端傳 on_confirmed 就是
         # 明確要求「確認接手後才拆解」;此時走這條 fallback 會讓稽核排空/mutex 釋放/

@@ -45,7 +45,9 @@ class _Sim:
 
     pid = 4242
 
-    def __init__(self, path, *, exits_at=None, rc=0, writes=None):
+    def __init__(self, path, *, exits_at=None, rc=0, writes=None, legacy_payload=False):
+        # legacy_payload=True → payload 不宣告事件能力(模擬懂檔案交握、不懂事件的中間版本)
+        self.legacy_payload = legacy_payload
         self.path, self.t = path, 0.0
         self.exits_at, self.rc = exits_at, rc
         self.writes = dict(writes or {})
@@ -60,8 +62,9 @@ class _Sim:
             if at <= self.t:
                 item = self.writes.pop(at)
                 state, pid = item if isinstance(item, tuple) else (item, self.pid)
+                caps = "" if self.legacy_payload else f" {paths.HANDSHAKE_CAP_EVENT}"
                 with open(self.path, "w", encoding="utf-8") as f:
-                    f.write(f"{state} {pid}")
+                    f.write(f"{state} {pid}{caps}")
 
     def poll(self):
         return self.rc if (self.exits_at is not None and self.t >= self.exits_at) else None
@@ -143,6 +146,101 @@ def test_alive_without_ready_is_never_enough_to_confirm(tmp_path):
     assert "confirmed" not in names, "沒有 READY、單例又還在自己手上,不可以退出"
     assert sim.calls[1][1] >= 30.0
     assert paths.HANDSHAKE_READY_TIMEOUT_SEC == 30.0     # 上面的 30 是固定數,釘住常數
+
+
+def _event_run(sim, owner, *, event_set=False, **kw):
+    """帶★可靠通道★(具名事件)的 waiter:`event_set` 決定子行程有沒有 SetEvent。"""
+    kw.setdefault("on_preready", sim.cb("preready"))
+    kw.setdefault("on_confirmed", sim.cb("confirmed"))
+    kw.setdefault("on_recover", sim.cb("recover", ret=owner))
+    return wait_for_handover(sim, sim.path, now=sim.now, sleep=sim.sleep,
+                             stderr_tail=lambda: "", ready_event=1234,
+                             ready_event_probe=lambda _h: event_set, **kw)
+
+
+def test_the_event_channel_distinguishes_a_lost_signal_from_a_hang(tmp_path):
+    """★外審 r10-4 P3-high:protocol information insufficiency★。
+    Case 1「健康、檔案通道的 READY 遺失」與 Case 2「拿了單例之後卡死」原本在父行程眼中
+    長得一模一樣(OWNER_OTHER + 沒有 READY)。加了具名事件之後兩者★必須分得開★。"""
+    # Case 1:檔案的 READY 永遠寫不進去,但事件有 SetEvent → 交棒成立、不可以動它
+    sim1 = _Sim(str(tmp_path / "hs1"), writes={0.2: HANDSHAKE_WAITING_MUTEX})
+    assert _event_run(sim1, paths.OWNER_OTHER, event_set=True) == HANDOVER_CONFIRMED
+    names1 = [c[0] for c in sim1.calls]
+    assert names1 == ["preready", "confirmed"], sim1.calls
+    assert "terminate" not in names1
+
+    # Case 2:事件也沒 SetEvent = 真的卡死 → 收回單例(★不可以退出把單例留給它★)
+    sim2 = _Sim(str(tmp_path / "hs2"), writes={0.2: HANDSHAKE_WAITING_MUTEX})
+    out = _event_run(sim2, None, event_set=False,
+                     on_recover=sim2.cb("recover", ret=[paths.OWNER_OTHER, paths.OWNER_SELF]))
+    assert out == paths.SPAWN_CHILD_NEVER_READY
+    names2 = [c[0] for c in sim2.calls]
+    assert names2 == ["preready", "recover", "terminate", "recover"], sim2.calls
+    assert "confirmed" not in names2
+
+
+def test_an_intermediate_version_child_is_never_wedge_terminated(tmp_path):
+    """★外審 r10-5 P2★:★父行程建得出事件★證明不了★子行程會設它★。
+    存在一個真實的版本區間 —— v2026.09.04.3 懂檔案交握、★不懂具名事件★。降版回它、
+    再碰上 READY 檔寫失敗(ACL/防毒),舊版判準會把一個健康的子行程當成卡死而終止,
+    降版永遠裝不起來,而且正好重現原本的訊號遺失問題。
+    所以能力要由子行程★正面宣告★(payload 的 `ev`);沒宣告就不許終止。"""
+    sim = _Sim(str(tmp_path / "hs"), writes={0.2: HANDSHAKE_WAITING_MUTEX},
+               legacy_payload=True)          # 有 WAITING、但不宣告事件能力
+    assert _event_run(sim, paths.OWNER_OTHER, event_set=False) == HANDOVER_CONFIRMED
+    assert "terminate" not in [c[0] for c in sim.calls], "中間版本的健康子行程被殺了"
+
+
+def test_the_capability_is_declared_in_the_payload(monkeypatch, tmp_path):
+    """宣告要真的寫進 payload,而且只在本行程確實拿得到事件名時才宣告。"""
+    p = tmp_path / "hs"
+    monkeypatch.setattr(paths, "_HANDSHAKE_PATH", [None])
+    monkeypatch.setattr(paths, "_READY_EVENT_NAME", [None])
+    monkeypatch.setenv(paths.RESTART_HANDSHAKE_ENV, str(p))
+    monkeypatch.setenv(paths.RESTART_READY_EVENT_ENV, "Local\\x")
+    assert restart_handshake_signal(HANDSHAKE_WAITING_MUTEX) is True
+    _st, _present, caps = paths.read_handshake_ex(str(p), os.getpid())
+    assert paths.HANDSHAKE_CAP_EVENT in caps
+
+    # 沒有事件名(父行程沒給)→ 不可以宣告自己會設事件
+    monkeypatch.setattr(paths, "_HANDSHAKE_PATH", [None])
+    monkeypatch.setattr(paths, "_READY_EVENT_NAME", [None])
+    monkeypatch.setenv(paths.RESTART_HANDSHAKE_ENV, str(p))
+    monkeypatch.delenv(paths.RESTART_READY_EVENT_ENV, raising=False)
+    assert restart_handshake_signal(HANDSHAKE_WAITING_MUTEX) is True
+    _st2, _pr2, caps2 = paths.read_handshake_ex(str(p), os.getpid())
+    assert paths.HANDSHAKE_CAP_EVENT not in caps2
+
+
+def test_an_old_two_field_payload_still_parses(tmp_path):
+    """向後相容:舊 payload(只有 state + pid)要照樣解析,能力集合為空。"""
+    p = tmp_path / "hs"
+    p.write_text(f"{HANDSHAKE_WAITING_MUTEX} 4242", encoding="utf-8")
+    state, present, caps = paths.read_handshake_ex(str(p), 4242)
+    assert (state, present, caps) == (HANDSHAKE_WAITING_MUTEX, True, frozenset())
+
+
+def test_without_a_reliable_channel_absence_is_still_not_evidence(tmp_path):
+    """★退回保守★:事件建不出來(非 Windows / API 失敗)時,「沒有 READY」仍然不算證據 ——
+    OWNER_OTHER 一律當交棒成立,不可以殺持有單例的接手者。"""
+    sim = _Sim(str(tmp_path / "hs"), writes={0.2: HANDSHAKE_WAITING_MUTEX})
+    assert _run(sim, owner=paths.OWNER_OTHER) == HANDOVER_CONFIRMED   # ready_event=None
+    assert "terminate" not in [c[0] for c in sim.calls]
+
+
+def test_a_legacy_child_is_never_wedge_terminated_even_with_the_event_channel(tmp_path):
+    """降版保護:從未送過交握的子行程(舊版本)不算 capable → 即使有可靠通道也不對它
+    要求 READY,拿到單例就是交棒成立。"""
+    sim = _Sim(str(tmp_path / "hs"))                    # 永遠不寫檔、不 SetEvent
+    assert _event_run(sim, paths.OWNER_OTHER, event_set=False) == HANDOVER_CONFIRMED
+    assert "terminate" not in [c[0] for c in sim.calls]
+
+
+def test_the_event_alone_is_enough_to_confirm(tmp_path):
+    """事件是 READY 的★主★通道:檔案完全沒寫過 ready,只要事件設起來就確認。"""
+    sim = _Sim(str(tmp_path / "hs"), writes={0.2: HANDSHAKE_WAITING_MUTEX})
+    assert _event_run(sim, paths.OWNER_SELF, event_set=True) == HANDOVER_CONFIRMED
+    assert [c[0] for c in sim.calls] == ["preready", "confirmed"]
 
 
 def test_a_capable_child_that_owns_the_mutex_is_a_real_handover(tmp_path):
@@ -288,6 +386,74 @@ def test_every_program_reports_a_failed_ready_signal(rel, fn):
             and isinstance(n.func, ast.Attribute) and n.func.attr == "critical"
             and any(isinstance(a, ast.Constant) and "READY" in str(a.value) for a in n.args)]
     assert crit, f"{rel}:{fn} 沒有在 READY 送不到時留 CRITICAL"
+
+
+def test_ready_goes_through_the_event_channel_even_when_the_file_fails(monkeypatch, tmp_path):
+    """★r10-4 的核心★:READY 要★先走事件★,檔案只是備援。所以「檔案完全寫不進去、
+    但事件送達」必須回 True —— 呼叫端才不會誤報自己未就緒,父行程也收得到。"""
+    monkeypatch.setenv(paths.RESTART_HANDSHAKE_ENV, str(tmp_path / "hs"))
+    monkeypatch.setattr(paths, "HANDSHAKE_SIGNAL_RETRY_SEC", 0.0)
+    sent = []
+    monkeypatch.setattr(paths, "signal_ready_event", lambda: sent.append(True) or True)
+
+    def _denied(path, *a, **k):
+        raise OSError(errno.EACCES, "denied")
+    monkeypatch.setattr("builtins.open", _denied)
+
+    assert restart_handshake_signal(HANDSHAKE_READY) is True
+    assert sent == [True], "READY 沒有走事件通道"
+    # 反例只靠這條規則分勝負:事件也失敗時才可以回 False
+    sent.clear()
+    monkeypatch.setattr(paths, "signal_ready_event", lambda: False)
+    assert restart_handshake_signal(HANDSHAKE_READY) is False
+
+
+def test_waiting_mutex_does_not_use_the_ready_event(monkeypatch, tmp_path):
+    """事件只代表 READY;PRE-READY 不可以誤設它(否則父行程會提早確認)。"""
+    monkeypatch.setenv(paths.RESTART_HANDSHAKE_ENV, str(tmp_path / "hs"))
+    calls = []
+    monkeypatch.setattr(paths, "signal_ready_event", lambda: calls.append(True) or True)
+    assert restart_handshake_signal(HANDSHAKE_WAITING_MUTEX) is True
+    assert calls == [], "WAITING_MUTEX 不該碰 READY 事件"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="具名事件是 Windows 核心物件")
+def test_the_named_event_really_round_trips_between_processes(tmp_path, monkeypatch):
+    """★真的核心物件往返★:父行程建事件 → 子行程(另一個 process)SetEvent → 父行程看到。
+    不碰檔案系統,所以 ACL/防毒/rename 那些失敗模式都不適用 —— 這正是它取代檔案當
+    READY 主通道的理由。"""
+    import uuid
+    name = f"Local\\CMUH_TEST_READY_{os.getpid()}_{uuid.uuid4().hex}"
+    h = paths.create_ready_event(name)
+    assert h, "父行程要建得出事件"
+    try:
+        assert paths.ready_event_is_set(h) is False
+        child = ("import sys; sys.path.insert(0, sys.argv[1]);"
+                 "from cmuh_common import paths as p;"
+                 "import os; os.environ[p.RESTART_READY_EVENT_ENV] = sys.argv[2];"
+                 "raise SystemExit(0 if p.signal_ready_event() else 3)")
+        r = subprocess.run([sys.executable, "-c", child, os.path.abspath(_SRC), name],
+                           capture_output=True, timeout=60)
+        assert r.returncode == 0, r.stderr[-400:]
+        assert paths.ready_event_is_set(h) is True, "子行程 SetEvent 之後父行程要看得到"
+    finally:
+        paths.close_handle(h)
+
+
+def test_signalling_without_an_event_name_is_a_noop(monkeypatch):
+    monkeypatch.setattr(paths, "_READY_EVENT_NAME", [None])
+    monkeypatch.delenv(paths.RESTART_READY_EVENT_ENV, raising=False)
+    assert paths.signal_ready_event() is False
+    assert paths.ready_event_is_set(None) is False
+
+
+def test_the_event_name_is_latched_and_removed_from_the_environment(monkeypatch):
+    """事件名與交握檔同樣★不可以外洩給孫行程★。"""
+    monkeypatch.setattr(paths, "_READY_EVENT_NAME", [None])
+    monkeypatch.setenv(paths.RESTART_READY_EVENT_ENV, "Local\\whatever")
+    assert paths._latch_ready_event_name() == "Local\\whatever"
+    assert paths.RESTART_READY_EVENT_ENV not in os.environ
+    assert paths._latch_ready_event_name() == "Local\\whatever", "latch 住的值仍可用"
 
 
 def test_real_child_process_transport(tmp_path):
@@ -549,8 +715,14 @@ def test_restart_self_wires_the_handshake_env_and_waiter():
     r = _func(tree, "restart_self")
     src = ast.dump(r)
     assert "wait_for_handover" in _calls(r)
-    assert "RESTART_HANDSHAKE_ENV" in src and "env" in {k.arg for c in ast.walk(r)
-                                                        if isinstance(c, ast.Call) for k in c.keywords}
+    kwargs = {k.arg for c in ast.walk(r) if isinstance(c, ast.Call) for k in c.keywords}
+    assert "RESTART_HANDSHAKE_ENV" in src and "env" in kwargs
+    # [r10-4] READY 事件也要真的建立、交給子行程、傳給 waiter
+    names = {n.id for n in ast.walk(r) if isinstance(n, ast.Name)}
+    assert "create_ready_event" in _calls(r), "沒有建立 READY 具名事件"
+    assert "RESTART_READY_EVENT_ENV" in names, "沒有把事件名交給子行程"
+    assert "ready_event" in kwargs, "沒有把事件 handle 傳給 waiter"
+    assert "close_handle" in _calls(r), "事件 handle 沒有收尾關閉"
 
 
 def test_startup_instance_state_threads_the_retry_window():
