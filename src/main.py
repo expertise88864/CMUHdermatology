@@ -22,8 +22,9 @@ if _HERE not in sys.path:
 from cmuh_common.version import CURRENT_VERSION
 from cmuh_common.paths import (
     HANDSHAKE_READY, HANDSHAKE_WAITING_MUTEX,
+    OWNER_OTHER, OWNER_SELF, OWNER_UNKNOWN, SPAWN_RECOVERY_FAILED,
     get_app_dir, get_settings_dir, get_conf_path, mutex_retry_sec,
-    restart_handshake_signal, restart_self,
+    restart_handshake_active, restart_handshake_signal, restart_self,
 )
 from cmuh_common.win32_safe import call_with_timeout, WIN_ENUM_TIMEOUT_SEC
 from cmuh_common.atomic_io import atomic_write_json as _atomic_write_json
@@ -9637,40 +9638,49 @@ class AutomationApp:
                 logging.debug("release_single_instance during restart failed.",
                               exc_info=True)
 
-        def _recover_after_failed_handover() -> bool:
-            """[第九輪 §4] 子行程在放了 mutex 之後、READY 之前死掉 → 嘗試把自己復原。
+        def _recover_after_failed_handover() -> str:
+            """[第九輪 §4 / 外審 r10] ★所有權探針★:此刻誰持有單例?
 
-            [外審 r1 P1-2] ★復原要明講成不成立★:只有重取 mutex 回 INSTANCE_ACQUIRED 才
-            重掛熱鍵、繼續服務。拿不到(別的 instance 搶到了 / mutex API 壞了回 UNKNOWN /
-            拋例外)→ 本行程已經沒有單例所有權,★不可以★再掛全域熱鍵當一個沒守衛的
-            instance(兩份 keyboard hook 搶同一組熱鍵)→ 走慢的拆解安全退場,由存活的那份
-            /啟動器/watchdog 接手。回 True=已復原;False=已退場。
+            交棒沒有走到 READY 時(子行程死了、或活著卻遲遲不就緒),父行程唯一可靠的判準
+            就是這個 —— 不是「子行程還活著」。
+            * 重取成功(INSTANCE_ACQUIRED)→ OWNER_SELF:子行程沒接手,本行程重掛熱鍵
+              (setup_hotkeys 會一併重掛 abbrev)繼續服務;
+            * INSTANCE_ALREADY_RUNNING → OWNER_OTHER:接手者(通常就是子行程,可能是不懂
+              交握的舊版本、或訊號寫失敗的新版本)真的拿到了單例 → 本行程安靜退出;
+            * 其餘(UNKNOWN / 拋例外)→ OWNER_UNKNOWN:★不可以★再掛全域熱鍵當一個沒守衛的
+              instance(兩份 keyboard hook 搶同一組熱鍵),由呼叫端安全退場。
             """
             st = None
             try:
                 st = acquire_single_instance("Local\\CMUH_Skin_Main_SingleInstance_v1")
             except Exception:
-                logging.exception("[restart] 復原時重取 mutex 失敗")
+                logging.exception("[restart] 查詢單例所有權失敗")
             if st == INSTANCE_ACQUIRED:
-                logging.warning("[restart] 新行程交棒後早夭 → 本行程已重取 mutex,重掛熱鍵繼續服務")
+                logging.warning("[restart] 單例已回到本行程 → 重掛熱鍵繼續服務")
                 try:
                     self.root.after(0, self.setup_hotkeys)
                 except Exception:
                     logging.exception("[restart] 復原時重掛熱鍵失敗")
-                return True
-            logging.critical("[restart] 新行程交棒後早夭,而本行程拿不回單例(state=%s)→ "
-                             "不當沒守衛的 instance,安全退場", st)
+                return OWNER_SELF
+            if st == INSTANCE_ALREADY_RUNNING:
+                logging.info("[restart] 單例已由接手者持有 → 本行程安靜退出")
+                return OWNER_OTHER
+            logging.critical("[restart] 查不出誰持有單例(state=%s)→ 不當沒守衛的 instance", st)
+            return OWNER_UNKNOWN
+
+        # 帶 --background：重啟後的新行程靜默啟動（不開 splash、最小化進工作列），
+        # 不打斷使用者當下操作。此方法是所有 app 端重啟（自動更新 / 閒置熱鍵恢復）的匯流點。
+        outcome = restart_self(["--background"], on_preready=_preready_for_handover,
+                               on_confirmed=_teardown_for_handover,
+                               on_recover=_recover_after_failed_handover)
+        # [外審 r10] 走到這裡＝沒有交棒。查不出誰持有單例時本行程沒有守衛,不可以繼續
+        # 掛全域熱鍵 → 安全退場(探針已據實記 CRITICAL)。其餘情況本行程仍是單例擁有者,
+        # 照常服務;自動更新下次再試。
+        if outcome == SPAWN_RECOVERY_FAILED:
             try:
                 self.root.after(0, _teardown_for_handover)
             except Exception:
                 logging.exception("[restart] 退場排程失敗")
-            return False
-
-        # 帶 --background：重啟後的新行程靜默啟動（不開 splash、最小化進工作列），
-        # 不打斷使用者當下操作。此方法是所有 app 端重啟（自動更新 / 閒置熱鍵恢復）的匯流點。
-        restart_self(["--background"], on_preready=_preready_for_handover,
-                     on_confirmed=_teardown_for_handover,
-                     on_recover=_recover_after_failed_handover)
 
     def _restart_when_hotkey_idle(self, attempts: int = 0):
         """[MG-02] 自動更新需重啟時的閘門:熱鍵自動化進行中【不可】重啟(見 _UPDATE_RESTART_* 常數旁
@@ -11000,7 +11010,11 @@ class AutomationApp:
         self.setup_hotkeys()
         # [第九輪 §4] 關鍵初始化(mutex 已取得、heavy modules 已載、熱鍵已註冊或已依模式
         # 停用)到此完成 → 向父行程回報 READY,它才做慢的拆解並退出。冷啟動時是 no-op。
-        restart_handshake_signal(HANDSHAKE_READY)
+        # [外審 r10-2] ★送不到要讓它看得見★:父行程收不到 READY 會在寬限後終止本行程
+        # (它分不出「卡死」與「訊號寫不進去」)。留 CRITICAL 才查得出真正的原因。
+        if restart_handshake_active() and not restart_handshake_signal(HANDSHAKE_READY):
+            logging.critical('[交握] READY 送不到父行程 —— 本行程其實已就緒;'
+                             '父行程可能在寬限後終止本行程並收回單例')
 
     def _handle_hotkey_setup_failure(self, error):
         self._heavy_modules_loading = False
@@ -17704,6 +17718,13 @@ def single_instance_gate() -> str:
     state = acquire_single_instance(
         "Local\\CMUH_Skin_Main_SingleInstance_v1", retry_sec=mutex_retry_sec())
     if state == INSTANCE_ALREADY_RUNNING:
+        # [外審 r10-2] ★交握起來的子行程要靜默退出★:它是重啟的接手候選,搶不到單例代表
+        # 舊行程已經把服務收回去了(交棒沒成立)。跳一個要人工按掉的對話框只會讓使用者
+        # 在診間收到莫名其妙的視窗,而且重啟會重試 → 對話框累積。使用者自己雙擊開的
+        # (冷啟動、沒有交握)才需要被告知「已經開著了」。
+        if restart_handshake_active():
+            logging.info("[單例] 交棒未成立(舊行程已收回單例)→ 本行程靜默結束")
+            sys.exit(0)
         ctypes.windll.user32.MessageBoxW(
             0, "主程式已在執行中。", "中國醫皮膚科主程式", 0x40 | 0x1000)
         sys.exit(0)

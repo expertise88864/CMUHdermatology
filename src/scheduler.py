@@ -31,8 +31,10 @@ from tkinter import ttk
 # --- cmuh_common 共用基礎建設（stdlib/ctypes 基底，可於 ensure_dependencies 前先 import）---
 from cmuh_common.version import CURRENT_VERSION
 from cmuh_common.paths import (
-    HANDSHAKE_READY, HANDSHAKE_WAITING_MUTEX, get_app_dir, get_settings_dir,
-    mutex_retry_sec, restart_handshake_signal, restart_self,
+    HANDSHAKE_READY, HANDSHAKE_WAITING_MUTEX, OWNER_OTHER, OWNER_SELF,
+    OWNER_UNKNOWN, SPAWN_RECOVERY_FAILED, get_app_dir, get_settings_dir,
+    mutex_retry_sec, restart_handshake_active, restart_handshake_signal,
+    restart_self,
 )
 from cmuh_common.platform_win import set_dpi_awareness, set_app_user_model_id
 from cmuh_common.window_icon import apply_tk_window_icon
@@ -123,33 +125,37 @@ def _handover_and_restart(app: "ScheduleApp") -> None:
     def _on_confirmed() -> None:
         globals()["_HANDING_OVER"] = True    # ★只有子行程 READY 才算交棒★
 
-    def _on_recover() -> bool:
-        """[第九輪 §4] 子行程在放了 mutex 之後、READY 之前死掉 → 嘗試重取 mutex。
+    def _on_recover() -> str:
+        """[第九輪 §4 / 外審 r10] ★所有權探針★:此刻誰持有單例?
 
-        [外審 r1 P1-2] 只有 INSTANCE_ACQUIRED 才算復原(_HANDING_OVER 維持 False,下面會把
-        背景同步收回來);拿不到(別人搶到 / UNKNOWN / 拋例外)→ 本行程沒有單例所有權,
-        ★不可以★恢復同步(兩個 writer 同時動 repo)→ 記成交棒、關掉視窗安全退場。
-        回 True=已復原;False=已退場。
+        * INSTANCE_ACQUIRED → OWNER_SELF:接班沒成立,本行程繼續(下面會把背景同步收回來);
+        * INSTANCE_ALREADY_RUNNING → OWNER_OTHER:接班者真的拿到了單例 → 交棒成立;
+        * 其餘 → OWNER_UNKNOWN:★不可以★恢復同步(兩個 writer 同時動 repo),由呼叫端退場。
         """
         st = None
         try:
             st = acquire_single_instance(SINGLE_INSTANCE_MUTEX)
         except Exception:
-            logging.exception("[update] 復原時重取 mutex 失敗")
+            logging.exception("[update] 查詢單例所有權失敗")
         if st == INSTANCE_ACQUIRED:
-            logging.warning("[update] 新行程交棒後早夭 → 本行程已重取 mutex,繼續運作")
-            return True
-        logging.critical("[update] 新行程交棒後早夭,而本行程拿不回單例(state=%s)→ "
-                         "不當沒守衛的 writer,安全退場", st)
-        globals()["_HANDING_OVER"] = True    # 不要 resume_sync;收尾當作交棒
+            logging.warning("[update] 單例已回到本行程 → 繼續運作")
+            return OWNER_SELF
+        if st == INSTANCE_ALREADY_RUNNING:
+            logging.info("[update] 單例已由接班者持有 → 交棒成立")
+            return OWNER_OTHER
+        logging.critical("[update] 查不出誰持有單例(state=%s)→ 不當沒守衛的 writer", st)
+        return OWNER_UNKNOWN
+
+    outcome = restart_self(on_preready=_on_preready, on_confirmed=_on_confirmed,
+                           on_recover=_on_recover)
+    # [外審 r10] 查不出擁有者 → 不恢復同步、也不留著當第二個 writer:記成交棒後關窗退場。
+    if outcome == SPAWN_RECOVERY_FAILED:
+        globals()["_HANDING_OVER"] = True
         try:
             app.root.after(0, app.root.destroy)
         except Exception:
             logging.exception("[update] 退場排程失敗")
-        return False
-
-    restart_self(on_preready=_on_preready, on_confirmed=_on_confirmed,
-                 on_recover=_on_recover)
+        return
     # 走到這裡代表【沒有】重啟(Popen 失敗或新行程早夭,restart_self 保留舊行程)
     if quiesced and not _HANDING_OVER:
         logging.warning("[update] 重啟未成立 → 把背景同步收回來(本機仍可用)")
@@ -398,6 +404,11 @@ def main() -> None:
     restart_handshake_signal(HANDSHAKE_WAITING_MUTEX)
     _state = acquire_single_instance(SINGLE_INSTANCE_MUTEX, retry_sec=mutex_retry_sec())
     if _state == INSTANCE_ALREADY_RUNNING:
+        # [外審 r10-2] 交握起來的子行程要靜默退出(理由同主程式:對話框要人工按掉,
+        # 而重啟會重試 → 累積)。使用者自己開的(冷啟動)才需要被告知。
+        if restart_handshake_active():
+            logging.info("[單例] 交棒未成立(舊行程已收回單例)→ 本行程靜默結束")
+            sys.exit(0)
         ctypes.windll.user32.MessageBoxW(
             0, "排班程式已在執行中。", WINDOW_TITLE, 0x40 | 0x1000)
         sys.exit(0)
@@ -445,7 +456,9 @@ def main() -> None:
     try:
         app = ScheduleApp(root)
         # [第九輪 §4] mutex 已取得、主視窗建好 → 向父行程回報 READY(冷啟動時 no-op)。
-        restart_handshake_signal(HANDSHAKE_READY)
+        # [外審 r10-2] 送不到要留 CRITICAL(理由同主程式)。
+        if restart_handshake_active() and not restart_handshake_signal(HANDSHAKE_READY):
+            logging.critical('[交握] READY 送不到父行程 —— 本行程其實已就緒')
     except Exception:
         # [EH-03] 建構失敗原本只進 log(sys.excepthook)、視窗閃一下就消失,使用者一頭霧水(以為當機)。
         # 比照主程式 AutomationApp 建構的處理:記完整 traceback + 跳可見錯誤框提示看 log,再乾淨退出。

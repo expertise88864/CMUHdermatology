@@ -159,11 +159,31 @@ RESTART_HANDSHAKE_ENV = "CMUH_RESTART_HANDSHAKE"
 HANDSHAKE_WAITING_MUTEX = "waiting_mutex"
 HANDSHAKE_READY = "ready"
 HANDSHAKE_LEGACY_GRACE_SEC = 3.0      # 從未看到交握檔 → 視為舊版子行程的寬限
-HANDSHAKE_READY_TIMEOUT_SEC = 30.0    # 看過交握檔但遲遲不 READY 的上限(它已持有 mutex,是存活者)
+HANDSHAKE_READY_TIMEOUT_SEC = 30.0    # 第一個決策點:到這裡還沒 READY 就去問所有權
+HANDSHAKE_TERMINATE_WAIT_SEC = 5.0    # terminate → kill 之間的有界等待
 HANDSHAKE_MUTEX_RETRY_SEC = 10.0      # 交握存在時子行程搶 mutex 的重試窗(父行程是反應式放 mutex)
 HANDOVER_CONFIRMED = "handover_confirmed"
 SPAWN_CHILD_DIED_AFTER_HANDOVER = "child_died_after_handover"   # 放了 mutex 之後才死;已復原
 SPAWN_RECOVERY_FAILED = "recovery_failed"    # 交棒後早夭且★復原失敗★(拿不回 mutex);呼叫端已安全退場
+SPAWN_CHILD_NEVER_READY = "child_never_ready"   # 子行程活著卻沒接手(單例仍是我的);已復原
+
+# [外審 r10 P3-high] ★退出的判準是「所有權已經轉移」,不是「子行程還活著」★。
+# 舊版有兩個 escape hatch:沒看到交握檔 3.6 秒、或看過交握檔但 30 秒沒 READY,只要子行程
+# 還活著就當接手成功 —— 那正是這批要消滅的「alive ⇒ ready」。可是父行程也不能光憑
+# 「沒有 READY」就認定失敗:降版到不懂交握的舊版本、或新版本的訊號寫失敗(ACL/防毒),
+# 子行程其實好好地接手了。兩者的差別★不必用版本去猜★,問單例 mutex 就知道:
+#   OWNER_OTHER  → 有別人(就是子行程)持有 → 所有權真的轉移了 → 確認交棒、安靜退出;
+#   OWNER_SELF   → 我又拿回來了 → 子行程沒接手(卡在取得單例之前)→ 復原、繼續服務;
+#   OWNER_UNKNOWN→ mutex API 壞了,誰也不知道 → 不可以假裝知道 → 走安全退場那條路。
+# ★[外審 r10-2/r10-3] 「持有單例卻不 READY」不可以被推論成「卡死」★:同樣的外觀也可能是
+# READY ★寫不進去★(ACL/防毒)而子行程其實健康 —— 缺席的訊號不是失敗的證據,要終止一個
+# 持有單例的行程必須有★正面的★失效證據。所以 OWNER_OTHER 一律當交棒成立。
+# 真的卡死時誰來救,各程式不同、都不是靜默的:打卡有 watchdog(enabled=True/300s);
+# 主程式與排班是 GUI —— watchdog 對主程式刻意停用的理由就寫在 watchdog_core 的設定裡:
+# 「主程式有 GUI,崩潰使用者立刻看到(熱鍵失效)」。
+OWNER_SELF = "owner_self"
+OWNER_OTHER = "owner_other"
+OWNER_UNKNOWN = "owner_unknown"
 
 # [外審 r1 P1-1] ★交握路徑只屬於直接子行程★:latch 進模組變數後立刻從 os.environ 拿掉,
 # 免得子行程再起的孫行程(例如主程式的 inner watchdog 拉起打卡)繼承同一個路徑、冒充 READY。
@@ -190,49 +210,81 @@ def mutex_retry_sec() -> float:
     return HANDSHAKE_MUTEX_RETRY_SEC if restart_handshake_active() else 1.5
 
 
+#: [外審 r10-2 第二回] 訊號寫入的重試次數/間隔。★這條訊息漏掉的代價很高★:READY 沒送到,
+#: 父行程分不出「卡死」與「只是訊號寫失敗」,90 秒後會終止一個其實健康的接手者。防毒掃到
+#: 暫存檔、短暫的 sharing violation 都是暫時性的 —— 重試幾次幾乎都能成功
+#: (同一條路徑上的 WAITING_MUTEX 幾秒前才剛寫成功過)。
+HANDSHAKE_SIGNAL_RETRIES = 3
+HANDSHAKE_SIGNAL_RETRY_SEC = 0.3
+
+
 def restart_handshake_signal(state: str) -> bool:
     """子行程向父行程回報階段(HANDSHAKE_WAITING_MUTEX / HANDSHAKE_READY)。
     沒有交握(冷啟動)→ no-op 回 False。原子寫入(tmp + replace),父行程不會讀到半截。
-    內容是 `<state> <pid>`:父行程只認直接子行程的 PID(孫行程冒充不了)。"""
+    內容是 `<state> <pid>`:父行程只認直接子行程的 PID(孫行程冒充不了)。
+    ★暫時性寫入失敗會重試★;全部失敗回 False 並記 WARNING —— 呼叫端要據此讓失敗看得見。"""
+    import logging as _logging
     import os as _os
+    import time as _time
     path = _latch_handshake_path()
     if not path:
         return False
-    try:
-        tmp = f"{path}.{_os.getpid()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(f"{state} {_os.getpid()}")
-        _os.replace(tmp, path)
-        return True
-    except OSError:
-        import logging as _logging
-        _logging.debug("[restart_handshake] 寫入 %s 失敗", state, exc_info=True)
-        return False
+    last_err = None
+    for attempt in range(HANDSHAKE_SIGNAL_RETRIES):
+        try:
+            tmp = f"{path}.{_os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(f"{state} {_os.getpid()}")
+            _os.replace(tmp, path)
+            return True
+        except OSError as e:
+            last_err = e
+            if attempt + 1 < HANDSHAKE_SIGNAL_RETRIES:
+                _time.sleep(HANDSHAKE_SIGNAL_RETRY_SEC)
+    _logging.warning("[restart_handshake] 寫入 %s 連 %d 次失敗(%s):父行程收不到這個階段",
+                     state, HANDSHAKE_SIGNAL_RETRIES, last_err)
+    return False
 
 
 def read_handshake(path: str, expect_pid=None):
     """父行程讀交握檔;不存在/讀不到/內容不認得/★PID 不是直接子行程★ → None。"""
+    state, _present = read_handshake_ex(path, expect_pid)
+    return state
+
+
+def read_handshake_ex(path: str, expect_pid=None):
+    """回 (state, file_present)。
+
+    [外審 r10] ★「檔案存在但內容無效」不等於「沒有交握」★:錯 PID(孫行程冒充)或壞掉的
+    內容,舊版會讓 `saw_file` 維持 False → 靜默降級成「大概是舊版子行程」的短寬限。
+    交握檔存在本身就代表這條機制在場,所以另外回報 file_present,由呼叫端據實處理
+    (記 WARNING、改用較長的窗口),不可以當成舊版。
+    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             s = f.read().strip()
     except OSError:
-        return None
+        return None, False
     parts = s.split()
     if not parts or parts[0] not in (HANDSHAKE_WAITING_MUTEX, HANDSHAKE_READY):
-        return None
+        return None, True
     if expect_pid is not None:
         if len(parts) < 2 or not parts[1].isdigit() or int(parts[1]) != int(expect_pid):
-            return None
-    return parts[0]
+            return None, True
+    return parts[0], True
 
 
 def wait_for_handover(proc, handshake_path: str, *, on_preready=None, on_confirmed=None,
                       on_recover=None, stderr_tail=lambda: "", now=None, sleep=None,
                       poll_interval: float = _SPAWN_ALIVE_INTERVAL_SEC) -> str:
     """父行程的交棒判定(純函式,可測)。回:
-      HANDOVER_CONFIRMED              → 呼叫端退出本行程
+      HANDOVER_CONFIRMED              → 所有權已轉移,呼叫端退出本行程
       SPAWN_CHILD_CRASHED / SPAWN_CHILD_EXITED_ORDERLY → 早夭(PRE-READY 之前),本行程原封不動
-      SPAWN_CHILD_DIED_AFTER_HANDOVER → 放了 mutex 之後才死;on_recover 已呼叫,本行程繼續
+      SPAWN_CHILD_DIED_AFTER_HANDOVER → 交棒後才死,單例已拿回來,本行程繼續
+      SPAWN_CHILD_NEVER_READY         → 子行程活著卻沒接手(單例仍是我的),本行程繼續、本次不重啟
+      SPAWN_RECOVERY_FAILED           → 查不出誰持有單例 → 呼叫端安全退場
+    `on_recover` 是★所有權探針★:回 OWNER_SELF / OWNER_OTHER / OWNER_UNKNOWN
+    (相容舊的 bool:True→OWNER_SELF、False→OWNER_UNKNOWN)。
     只傳 on_confirmed(舊呼叫端)→ 在 PRE-READY 時刻呼叫一次 on_confirmed 並立即確認,
     之後不再呼叫(與今天的時序相同)。"""
     import logging as _logging
@@ -243,14 +295,55 @@ def wait_for_handover(proc, handshake_path: str, *, on_preready=None, on_confirm
     t0 = now()
     alive_grace = _SPAWN_ALIVE_POLLS * _SPAWN_ALIVE_INTERVAL_SEC      # 0.6s(今天的存活確認)
     preready_done = False
-    saw_file = False
+    saw_file = False          # 交握檔存在過(內容有效與否都算)
+    warned_invalid = False
     expect_pid = getattr(proc, "pid", None)          # ★只認直接子行程的 PID★
+
+    def _terminate_child(why: str) -> None:
+        """[外審 r10-2] 終止★直接子行程★:走到這裡它已經不可能是合法接手者了。
+        留著它會變成 detached orphan,而且它稍後撞到單例閘門還會跳一個要人工關掉的
+        對話框(主程式/排班),重啟又重排 → 對話框與孤兒行程一起累積。
+        terminate → 有界等待 → 還在就 kill。"""
+        _logging.warning("[restart_self] 終止未能接手的新行程 pid=%s(%s)",
+                         getattr(proc, "pid", "?"), why)
+        for step in ("terminate", "kill"):
+            try:
+                getattr(proc, step)()
+            except Exception:
+                _logging.debug("[restart_self] %s 子行程失敗", step, exc_info=True)
+            try:
+                proc.wait(timeout=HANDSHAKE_TERMINATE_WAIT_SEC)
+                return
+            except Exception:
+                continue
+        _logging.error("[restart_self] 子行程 pid=%s 終止不掉", getattr(proc, "pid", "?"))
+
+    def _probe_owner(why: str):
+        """問「★此刻★誰持有單例」。回 OWNER_*;沒有 probe 可用時回 OWNER_UNKNOWN。"""
+        if on_recover is None:
+            return OWNER_UNKNOWN
+        try:
+            verdict = on_recover()
+        except Exception:
+            _logging.exception("[restart_self] 查詢單例所有權失敗(%s)", why)
+            return OWNER_UNKNOWN
+        if verdict in (OWNER_SELF, OWNER_OTHER, OWNER_UNKNOWN):
+            return verdict
+        # 舊契約(bool):True=拿回來了、False=拿不回但分不出是誰
+        return OWNER_SELF if verdict else OWNER_UNKNOWN
+
     while True:
         sleep(poll_interval)
         rc = proc.poll()
-        state = read_handshake(handshake_path, expect_pid)
-        if state is not None:
-            saw_file = True
+        state, present = read_handshake_ex(handshake_path, expect_pid)
+        if present:
+            saw_file = True                # ★檔案在就算★:無效內容不可以被當成「舊版子行程」
+            if state is None and not warned_invalid:
+                warned_invalid = True
+                _logging.warning(
+                    "[restart_self] 交握檔存在但內容無效(壞掉,或不是直接子行程 pid=%s 寫的)"
+                    " → ★不當成舊版子行程★,改用完整的 READY 窗口並以單例所有權判定",
+                    expect_pid)
         elapsed = now() - t0
         if rc is not None:
             if not preready_done:
@@ -259,16 +352,23 @@ def wait_for_handover(proc, handshake_path: str, *, on_preready=None, on_confirm
                 "[restart_self] 新行程在交棒後才結束 (exit=%s) → 本行程嘗試復原(重取 mutex、"
                 "重掛熱鍵)\n--- 新行程 stderr ---\n%s\n--- stderr 結束 ---",
                 rc, stderr_tail())
-            # [外審 r1 P1-2] 復原是否成立要★明講★:on_recover 回 True 才算拿回單例所有權;
-            # 回 False / 拋例外 = 拿不回(別人搶到了 / mutex API 壞了)→ 呼叫端的 callback
-            # 已自行安全退場(不可以繼續當一個沒守衛的 instance),這裡回 RECOVERY_FAILED。
-            recovered = False
-            if on_recover is not None:
-                try:
-                    recovered = bool(on_recover())
-                except Exception:
-                    _logging.exception("[restart_self] on_recover 復原失敗")
-            return SPAWN_CHILD_DIED_AFTER_HANDOVER if recovered else SPAWN_RECOVERY_FAILED
+            # [外審 r1 P1-2 / r10] 復原是否成立要★明講★,而且要分得出「拿不回」的兩種:
+            #   OWNER_SELF  → 拿回來了,本行程繼續服務;
+            #   OWNER_OTHER → 別人持有(第三方 instance)→ 這裡不是沒人服務,安靜交出去;
+            #   OWNER_UNKNOWN → 誰在服務答不出來 → 不可以繼續當沒守衛的 instance,安全退場。
+            owner = _probe_owner("child died after handover")
+            if owner == OWNER_SELF:
+                return SPAWN_CHILD_DIED_AFTER_HANDOVER
+            if owner == OWNER_OTHER:
+                _logging.warning("[restart_self] 新行程交棒後早夭,但單例已由★別人★持有 → "
+                                 "本行程安靜退出,不搶回")
+                if on_confirmed is not None:
+                    try:
+                        on_confirmed()
+                    except Exception:
+                        _logging.exception("[restart_self] on_confirmed 收尾失敗（仍照常退出）")
+                return HANDOVER_CONFIRMED
+            return SPAWN_RECOVERY_FAILED
         if not preready_done and (state is not None or elapsed >= alive_grace):
             preready_done = True
             cb = on_confirmed if legacy_caller else on_preready
@@ -280,24 +380,61 @@ def wait_for_handover(proc, handshake_path: str, *, on_preready=None, on_confirm
             if legacy_caller:
                 return HANDOVER_CONFIRMED          # 舊呼叫端:與今天相同,確認即退出
         if preready_done:
-            confirm = False
             if state == HANDSHAKE_READY:
-                confirm = True
-            elif not saw_file and elapsed >= alive_grace + HANDSHAKE_LEGACY_GRACE_SEC:
-                _logging.info("[restart_self] 新行程沒有交握(舊版?)但存活 %.1fs → 照舊確認接手",
-                              elapsed)
-                confirm = True
-            elif saw_file and elapsed >= HANDSHAKE_READY_TIMEOUT_SEC:
-                _logging.warning("[restart_self] 新行程 %.0fs 仍未 READY 但存活且已持有 mutex"
-                                 " → 視為接手成功", elapsed)
-                confirm = True
-            if confirm:
+                # 唯一的快路徑:子行程明說自己就緒了。
                 if on_confirmed is not None:
                     try:
                         on_confirmed()
                     except Exception:
                         _logging.exception("[restart_self] on_confirmed 收尾失敗（仍照常退出）")
                 return HANDOVER_CONFIRMED
+            # [外審 r10 P3-high] ★沒有 READY 就不可以只憑「還活著」退出★。窗口到了就去問
+            # 「此刻誰持有單例」:沒看過有效訊號 → 可能是不懂交握的舊版,用短寬限;
+            # 看過交握檔(含無效內容)→ 這條機制在場,用完整的 READY 窗口。
+            # ★探針有副作用(它會嘗試取得單例),只在決策點問★:窗口到期問一次;
+            # 判定「持有單例卻卡死」之後,等到放棄期限再問第二次(其間每個 tick 仍在
+            # 看 READY —— 子行程在寬限內就緒的話就走上面的快路徑)。
+            deadline = (HANDSHAKE_READY_TIMEOUT_SEC if saw_file
+                        else alive_grace + HANDSHAKE_LEGACY_GRACE_SEC)
+            if elapsed < deadline:
+                continue
+            owner = _probe_owner("child alive but never READY")
+            if owner == OWNER_UNKNOWN:
+                _logging.critical(
+                    "[restart_self] 新行程 %.0fs 未回報 READY,而且★查不出誰持有單例★ → "
+                    "不假裝接手成功,交由呼叫端安全退場", elapsed)
+                return SPAWN_RECOVERY_FAILED
+            if owner == OWNER_OTHER:
+                # ★所有權確實轉移 = 交棒成立★。
+                # [外審 r10-2 第三回] 我上一版在這裡加了「送過交握的子行程若不 READY,90 秒後
+                # 終止它並收回單例」。★撤掉了★,理由是外審對的、我的反駁站不住:
+                #   * 「沒有 READY」證明不了卡死 —— 也可能是 READY ★寫不進去★(ACL/防毒),
+                #     那時被殺掉的是一個★健康、正在服務的新版本★,而且每次自動更新都會重演;
+                #   * 我當初的正當理由是「沒有人會來救」,但那是★誇大的宣稱★:打卡有 watchdog
+                #     監看(enabled=True/max_stale_sec=300);主程式與排班是 GUI 程式,而
+                #     watchdog 對主程式刻意停用的理由就寫在設定裡 ——
+                #     「主程式有 GUI,崩潰使用者立刻看到(熱鍵失效)」。卡死是★看得見★的,
+                #     不是靜默失效。
+                # 缺席的訊號不能拿來當「失敗的證據」;要終止一個持有單例的行程,得有
+                # ★正面的★失效證據,而這裡沒有。
+                _logging.warning(
+                    "[restart_self] 新行程 %.0fs 未回報 READY,但單例已由它持有 → "
+                    "所有權確實轉移,確認接手(它若卡死:打卡由 watchdog 重啟;"
+                    "主程式/排班是 GUI,使用者看得到)", elapsed)
+                if on_confirmed is not None:
+                    try:
+                        on_confirmed()
+                    except Exception:
+                        _logging.exception("[restart_self] on_confirmed 收尾失敗（仍照常退出）")
+                return HANDOVER_CONFIRMED
+            # OWNER_SELF:子行程活著,卻連單例都還沒拿到(卡在初始化)。★這就是舊版兩個
+            # escape hatch 放走的那一格★。單例已回到本行程 → 恢復服務;而子行程已經不可能
+            # 是合法接手者,一併終止(否則變成孤兒,稍後撞單例還會跳要人工關掉的對話框)。
+            _logging.error(
+                "[restart_self] 新行程 %.0fs 未回報 READY,而單例又回到本行程手上 → "
+                "它沒有接手成功;本行程恢復服務,本次不重啟", elapsed)
+            _terminate_child("未取得單例即失去接手資格")
+            return SPAWN_CHILD_NEVER_READY
 
 
 def classify_child_exit(rc, stderr_tail: str) -> str:

@@ -9,6 +9,7 @@ mutex、mutex 在父行程手上,所以不能只等一個 READY(死鎖)—— �
 ★降版也要能重啟★:舊版子行程永遠不寫交握檔 → 照今天的時序運作。
 """
 import ast
+import errno
 import io
 import os
 import subprocess
@@ -65,18 +66,39 @@ class _Sim:
     def poll(self):
         return self.rc if (self.exits_at is not None and self.t >= self.exits_at) else None
 
+    # 父行程終止子行程:記錄下來,並讓之後的 poll() 回傳結束碼(真的死了)。
+    def terminate(self):
+        self.calls.append(("terminate", round(self.t, 1)))
+        self.exits_at, self.rc = self.t, -15
+
+    def kill(self):
+        self.calls.append(("kill", round(self.t, 1)))
+        self.exits_at, self.rc = self.t, -9
+
+    def wait(self, timeout=None):
+        if self.exits_at is None or self.t < self.exits_at:
+            raise TimeoutError("still alive")
+        return self.rc
+
     def cb(self, name, ret=True):
-        """回呼預設回 True(復原成立);on_recover 用 ret=False 模擬拿不回 mutex。"""
+        """回呼預設回 True(復原成立);on_recover 用 ret=... 模擬所有權答案。
+        `ret` 可以是 list:依序回答(模擬終止子行程之後單例才回到自己手上)。"""
+        answers = list(ret) if isinstance(ret, list) else None
+
         def _f():
             self.calls.append((name, round(self.t, 1)))
+            if answers:
+                return answers.pop(0) if len(answers) > 1 else answers[0]
             return ret
         return _f
 
 
-def _run(sim, **kw):
+def _run(sim, owner=None, **kw):
+    """`owner`:所有權探針的回答(OWNER_SELF / OWNER_OTHER / OWNER_UNKNOWN)。
+    預設 OWNER_SELF —— 子行程沒接手、單例回到本行程。"""
     kw.setdefault("on_preready", sim.cb("preready"))
     kw.setdefault("on_confirmed", sim.cb("confirmed"))
-    kw.setdefault("on_recover", sim.cb("recover"))
+    kw.setdefault("on_recover", sim.cb("recover", ret=owner or paths.OWNER_SELF))
     return wait_for_handover(sim, sim.path, now=sim.now, sleep=sim.sleep,
                              stderr_tail=lambda: "", **kw)
 
@@ -109,25 +131,70 @@ def test_early_death_is_classified_and_touches_nothing(tmp_path):
     assert sim2.calls == []
 
 
-def test_slow_ready_but_alive_is_eventually_confirmed(tmp_path):
-    """看過交握檔、拿了 mutex、卻遲遲不 READY 且活著 → 它是存活者,不可以留兩個 instance。"""
+def test_alive_without_ready_is_never_enough_to_confirm(tmp_path):
+    """★外審 r10 P3-high(本檔上一版把 bug 釘成正確答案)★:子行程回報過 WAITING_MUTEX、
+    之後永遠不 READY 卻活著 —— 舊版等 30 秒就「視為接手成功」退出,那正是這批要消滅的
+    「alive ⇒ ready」。判準改成★此刻誰持有單例★:探針說單例回到本行程 = 子行程根本沒接手
+    → 不可以確認交棒,要恢復服務、本次不重啟。"""
     sim = _Sim(str(tmp_path / "hs"), writes={0.2: HANDSHAKE_WAITING_MUTEX})
-    assert _run(sim) == HANDOVER_CONFIRMED
+    assert _run(sim, owner=paths.OWNER_SELF) == paths.SPAWN_CHILD_NEVER_READY
     names = [c[0] for c in sim.calls]
-    assert names == ["preready", "confirmed"]
+    assert names == ["preready", "recover", "terminate"], sim.calls
+    assert "confirmed" not in names, "沒有 READY、單例又還在自己手上,不可以退出"
     assert sim.calls[1][1] >= 30.0
     assert paths.HANDSHAKE_READY_TIMEOUT_SEC == 30.0     # 上面的 30 是固定數,釘住常數
 
 
-# ─── 2. 舊版子行程(降版):與今天完全相同的時序 ───────────────────────────────
-def test_legacy_child_without_handshake_keeps_todays_timing(tmp_path):
-    sim = _Sim(str(tmp_path / "hs"))                       # 永遠不寫檔、活著
-    assert _run(sim) == HANDOVER_CONFIRMED
+def test_a_capable_child_that_owns_the_mutex_is_a_real_handover(tmp_path):
+    """★外審 r10-3(我上一版加的「殺掉卡死的接手者」已撤回)★:子行程送過交握、拿了單例、
+    卻沒回報 READY —— ★缺席的訊號不是失敗的證據★:同樣的外觀也可能是 READY 寫不進去
+    (ACL/防毒)而它其實健康、正在服務。要終止一個持有單例的行程必須有正面的失效證據,
+    這裡沒有 → 一律當交棒成立。真的卡死時:打卡有 watchdog;主程式/排班是 GUI,
+    使用者看得到(那正是 watchdog 對主程式刻意停用的理由)。"""
+    sim = _Sim(str(tmp_path / "hs"), writes={0.2: HANDSHAKE_WAITING_MUTEX})
+    assert _run(sim, owner=paths.OWNER_OTHER) == HANDOVER_CONFIRMED
     names = [c[0] for c in sim.calls]
-    assert names == ["preready", "confirmed"]
+    assert names == ["preready", "recover", "confirmed"], sim.calls
+    assert "terminate" not in names, "沒有正面失效證據就不可以殺持有單例的接手者"
+
+
+def test_a_healthy_child_whose_ready_never_arrived_is_not_killed(tmp_path):
+    """★外審 r10-2 第二/三回指出的具體情境★:子行程健康、持有單例、只是 READY 連重試都
+    寫不進去。它★不可以★被終止(否則每次自動更新都會殺掉一個正在服務的新版本)。"""
+    sim = _Sim(str(tmp_path / "hs"), writes={0.2: HANDSHAKE_WAITING_MUTEX})
+    assert _run(sim, owner=paths.OWNER_OTHER) == HANDOVER_CONFIRMED
+    assert "terminate" not in [c[0] for c in sim.calls]
+
+
+def test_an_unknown_owner_never_pretends_the_handover_worked(tmp_path):
+    """查不出誰持有單例 → 不可以假裝接手成功,也不可以繼續當沒守衛的 instance。"""
+    sim = _Sim(str(tmp_path / "hs"), writes={0.2: HANDSHAKE_WAITING_MUTEX})
+    assert _run(sim, owner=paths.OWNER_UNKNOWN) == paths.SPAWN_RECOVERY_FAILED
+    assert "confirmed" not in [c[0] for c in sim.calls]
+
+
+# ─── 2. 舊版子行程(降版):與今天完全相同的時序 ───────────────────────────────
+def test_a_legacy_child_that_took_over_is_confirmed_on_the_short_grace(tmp_path):
+    """降版到不懂交握的舊版本:永遠不寫交握檔。短寬限(0.6+3s)到期就問所有權 —— 它拿到了
+    單例 → 確認交棒。時序與今天相同,降版仍能重啟。"""
+    sim = _Sim(str(tmp_path / "hs"))                       # 永遠不寫檔、活著
+    assert _run(sim, owner=paths.OWNER_OTHER) == HANDOVER_CONFIRMED
+    names = [c[0] for c in sim.calls]
+    assert names == ["preready", "recover", "confirmed"], sim.calls
     assert abs(sim.calls[0][1] - 0.6) < 0.15, "舊版子行程:0.6 秒還活著就放 mutex(今天的時序)"
-    assert sim.calls[1][1] >= 3.5 and sim.calls[1][1] < 4.0   # 0.6 + 3s 寬限
+    assert sim.calls[2][1] >= 3.5 and sim.calls[2][1] < 4.0   # 0.6 + 3s 寬限
     assert paths.HANDSHAKE_LEGACY_GRACE_SEC == 3.0
+
+
+def test_a_silent_child_that_did_not_take_over_is_not_guessed_to_be_legacy(tmp_path):
+    """★外審 r10★:「沒看到交握檔」不等於「舊版子行程」—— 也可能是新版本卡在取得單例
+    之前、或訊號寫失敗。舊版直接猜成舊版並退出;現在要問所有權:單例還在自己手上 →
+    它沒接手,恢復服務、本次不重啟。"""
+    sim = _Sim(str(tmp_path / "hs"))
+    assert _run(sim, owner=paths.OWNER_SELF) == paths.SPAWN_CHILD_NEVER_READY
+    names = [c[0] for c in sim.calls]
+    assert "confirmed" not in names
+    assert "terminate" in names, "已失去接手資格的子行程要被終止,不可以留成孤兒"
 
 
 def test_legacy_caller_with_only_on_confirmed_is_called_exactly_once(tmp_path):
@@ -169,6 +236,60 @@ def test_signal_writes_atomically_and_reader_ignores_garbage(monkeypatch, tmp_pa
     assert mutex_retry_sec() == paths.HANDSHAKE_MUTEX_RETRY_SEC > 1.5, "交握存在 → 重試窗放大"
 
 
+def test_a_transient_write_failure_is_retried(monkeypatch, tmp_path):
+    """★外審 r10-2 第二回★:READY 漏掉的代價很高(父行程分不出「卡死」與「訊號寫不進去」,
+    會終止一個其實健康的接手者)。暫時性失敗要重試 —— 同一條路徑幾秒前才剛寫成功過。"""
+    p = tmp_path / "hs"
+    monkeypatch.setenv(paths.RESTART_HANDSHAKE_ENV, str(p))
+    monkeypatch.setattr(paths, "HANDSHAKE_SIGNAL_RETRY_SEC", 0.0)
+    real_open = open
+    calls = {"n": 0}
+
+    def _flaky(path, *a, **k):
+        if str(path).endswith(".tmp"):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError(errno.EACCES, "sharing violation", None, 32)
+        return real_open(path, *a, **k)
+    monkeypatch.setattr("builtins.open", _flaky)
+
+    assert restart_handshake_signal(HANDSHAKE_READY) is True
+    assert calls["n"] >= 2, "第一次失敗要重試"
+    monkeypatch.setattr("builtins.open", real_open)
+    assert read_handshake(str(p), os.getpid()) == HANDSHAKE_READY
+
+
+def test_a_persistent_write_failure_is_reported_not_swallowed(monkeypatch, tmp_path, caplog):
+    """全部重試都失敗 → 回 False 並記 WARNING(呼叫端才有辦法留下 CRITICAL 說明自己其實
+    已就緒);舊版是靜默吞掉 debug。"""
+    import logging
+    monkeypatch.setenv(paths.RESTART_HANDSHAKE_ENV, str(tmp_path / "hs"))
+    monkeypatch.setattr(paths, "HANDSHAKE_SIGNAL_RETRY_SEC", 0.0)
+
+    def _denied(path, *a, **k):
+        raise OSError(errno.EACCES, "denied")
+    monkeypatch.setattr("builtins.open", _denied)
+    with caplog.at_level(logging.WARNING):
+        assert restart_handshake_signal(HANDSHAKE_READY) is False
+    assert any("連 3 次失敗" in r.getMessage() or "次失敗" in r.getMessage()
+               for r in caplog.records)
+
+
+@pytest.mark.parametrize("rel,fn", [
+    ("main.py", "_finalize_hotkey_setup"),
+    ("autoclock.py", "main"),
+    ("scheduler.py", "main"),
+])
+def test_every_program_reports_a_failed_ready_signal(rel, fn):
+    """★外審 r10-2★:三支程式原本都忽略 READY 的回傳值 —— 送不到就靜默,
+    之後被父行程終止時完全查不出原因。現在要留 CRITICAL。"""
+    f = _func(_tree(rel), fn)
+    crit = [n for n in ast.walk(f) if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute) and n.func.attr == "critical"
+            and any(isinstance(a, ast.Constant) and "READY" in str(a.value) for a in n.args)]
+    assert crit, f"{rel}:{fn} 沒有在 READY 送不到時留 CRITICAL"
+
+
 def test_real_child_process_transport(tmp_path):
     """真的 subprocess:子行程照協定寫兩個階段;父行程用真時鐘等到 READY。"""
     hs = tmp_path / "hs"
@@ -194,14 +315,32 @@ def test_real_child_process_transport(tmp_path):
 
 # ─── 3b. 外審 r1 P1-1:訊號綁直接子行程的 PID;孫行程冒充不了 ─────────────────
 def test_signals_from_another_pid_are_ignored(tmp_path):
-    """孫行程(例如新主程式的 watchdog 拉起的打卡)若寫進同一個交握檔,父行程不可以認。"""
+    """孫行程(例如新主程式的 watchdog 拉起的打卡)若寫進同一個交握檔,父行程不可以認。
+
+    [外審 r10 §11] 而且★不可以因此降級成「大概是舊版子行程」★:檔案存在就代表交握機制
+    在場 → 用完整的 READY 窗口,並以所有權判定(這裡:接手者持有單例 → 確認)。"""
     sim = _Sim(str(tmp_path / "hs"),
                writes={0.2: (HANDSHAKE_WAITING_MUTEX, 9999), 1.0: (HANDSHAKE_READY, 9999)})
-    assert _run(sim) == HANDOVER_CONFIRMED
+    assert _run(sim, owner=paths.OWNER_OTHER) == HANDOVER_CONFIRMED
     names = [c[0] for c in sim.calls]
-    assert names == ["preready", "confirmed"]
-    # 冒充的訊號被忽略 → 走「舊版子行程」時序:0.6s 放 mutex、寬限 3s 後才確認
-    assert abs(sim.calls[0][1] - 0.6) < 0.15 and sim.calls[1][1] >= 3.5
+    assert names == ["preready", "recover", "confirmed"], sim.calls
+    # 冒充的訊號被忽略 → 0.6s 才放 mutex(不是 0.2s),而且要等到完整的 READY 窗口
+    assert abs(sim.calls[0][1] - 0.6) < 0.15
+    assert sim.calls[1][1] >= paths.HANDSHAKE_READY_TIMEOUT_SEC, \
+        "無效訊號被當成『沒有交握』→ 走短寬限,等於默許冒充者縮短窗口"
+
+
+def test_an_invalid_handshake_file_is_not_treated_as_a_legacy_child(tmp_path, caplog):
+    """壞掉的交握內容同理:要 WARNING 並用完整窗口,不可以靜默當舊版。"""
+    import logging
+    p = tmp_path / "hs"
+    p.write_text("garbage", encoding="utf-8")
+    sim = _Sim(str(p))
+    with caplog.at_level(logging.WARNING):
+        assert _run(sim, owner=paths.OWNER_SELF) == paths.SPAWN_CHILD_NEVER_READY
+    assert any("內容無效" in r.getMessage() for r in caplog.records)
+    probe = [c[1] for c in sim.calls if c[0] == "recover"][0]
+    assert probe >= paths.HANDSHAKE_READY_TIMEOUT_SEC
 
 
 def test_read_handshake_binds_the_pid(tmp_path):
@@ -261,8 +400,24 @@ def test_a_grandchild_cannot_impersonate_the_child(tmp_path):
 # ─── 3c. 外審 r1 P1-2:復原要明講成不成立 ─────────────────────────────────────
 def test_recovery_that_cannot_reacquire_the_mutex_is_reported(tmp_path):
     sim = _Sim(str(tmp_path / "hs"), writes={0.2: HANDSHAKE_WAITING_MUTEX}, exits_at=1.5, rc=1)
-    assert _run(sim, on_recover=sim.cb("recover", ret=False)) == paths.SPAWN_RECOVERY_FAILED
+    assert _run(sim, owner=paths.OWNER_UNKNOWN) == paths.SPAWN_RECOVERY_FAILED
     assert [c[0] for c in sim.calls] == ["preready", "recover"]
+
+
+def test_a_dead_child_whose_mutex_someone_else_took_hands_over_quietly(tmp_path):
+    """子行程交棒後死了,但單例已被★第三方★拿走:這裡不是「沒人服務」,不可以搶回來,
+    安靜走完拆解退出。"""
+    sim = _Sim(str(tmp_path / "hs"), writes={0.2: HANDSHAKE_WAITING_MUTEX}, exits_at=1.5, rc=1)
+    assert _run(sim, owner=paths.OWNER_OTHER) == HANDOVER_CONFIRMED
+    assert [c[0] for c in sim.calls] == ["preready", "recover", "confirmed"]
+
+
+def test_the_old_bool_recover_contract_still_works(tmp_path):
+    """相容:舊契約回 True/False 的 on_recover 仍要能用(True→自己持有;False→不知道)。"""
+    sim = _Sim(str(tmp_path / "hs"), writes={0.2: HANDSHAKE_WAITING_MUTEX}, exits_at=1.5, rc=1)
+    assert _run(sim, on_recover=lambda: True) == paths.SPAWN_CHILD_DIED_AFTER_HANDOVER
+    sim2 = _Sim(str(tmp_path / "hs2"), writes={0.2: HANDSHAKE_WAITING_MUTEX}, exits_at=1.5, rc=1)
+    assert _run(sim2, on_recover=lambda: False) == paths.SPAWN_RECOVERY_FAILED
 
 
 def test_recovery_that_raises_is_reported_as_failed(tmp_path):
@@ -355,12 +510,38 @@ def test_recovery_only_resumes_service_after_the_mutex_is_reacquired(rel, outer,
                 and any(isinstance(c, ast.Name) and c.id == "INSTANCE_ACQUIRED"
                         for c in n.comparators)]
     assert compares, f"{rel}:{inner} 沒有拿重取結果與 INSTANCE_ACQUIRED 比較"
-    idents = {n.id for n in ast.walk(rec) if isinstance(n, ast.Name)} | \
-             {n.attr for n in ast.walk(rec) if isinstance(n, ast.Attribute)}
-    assert exit_marker in idents, f"{rel}:{inner} 拿不回 mutex 時沒有安全退場"
-    # 回傳值要明講:兩條路都要有 return(True / False)
+    # [外審 r10] 探針要分得出★三態★:自己拿回 / 別人持有 / 查不出來 —— 把後兩者壓成一格,
+    # 「接手者拿到了」就會被當成「查不出來」而誤發停止警報(降版就會中招)。
+    names = {n.id for n in ast.walk(rec) if isinstance(n, ast.Name)}
+    assert {"OWNER_SELF", "OWNER_OTHER", "OWNER_UNKNOWN"} <= names, \
+        f"{rel}:{inner} 沒有回報三態所有權"
+    assert any(isinstance(c, ast.Name) and c.id == "INSTANCE_ALREADY_RUNNING"
+               for n in ast.walk(rec) if isinstance(n, ast.Compare)
+               for c in n.comparators), f"{rel}:{inner} 沒有分辨「別人持有」"
+    # 探針★只回報、不做破壞性動作★:退場由呼叫端在拿到 outcome 之後做。
+    assert exit_marker not in names, \
+        f"{rel}:{inner} 是探針,不該自己做退場動作({exit_marker})"
     returns = [n for n in ast.walk(rec) if isinstance(n, ast.Return)]
-    assert len(returns) >= 2
+    assert len(returns) >= 3
+
+
+@pytest.mark.parametrize("rel,fn,exit_marker", [
+    ("main.py", "_restart_app", "_teardown_for_handover"),
+    ("autoclock.py", "restart_program", "_teardown_for_handover"),
+    ("scheduler.py", "_handover_and_restart", "destroy"),
+])
+def test_an_unknown_owner_makes_the_caller_leave_safely(rel, fn, exit_marker):
+    """[外審 r10] 三支程式在 SPAWN_RECOVERY_FAILED 時都要安全退場(不繼續當沒守衛的
+    instance);退場動作在★呼叫端★,探針只負責回報。"""
+    outer = _func(_tree(rel), fn)
+    compares = [n for n in ast.walk(outer) if isinstance(n, ast.Compare)
+                and any(isinstance(c, ast.Name)
+                        and c.id in ("SPAWN_RECOVERY_FAILED", "_SPAWN_RECOVERY_FAILED")
+                        for c in n.comparators)]
+    assert compares, f"{rel}:{fn} 沒有處理 SPAWN_RECOVERY_FAILED"
+    names = {n.id for n in ast.walk(outer) if isinstance(n, ast.Name)} | \
+            {n.attr for n in ast.walk(outer) if isinstance(n, ast.Attribute)}
+    assert exit_marker in names, f"{rel}:{fn} 查不出擁有者時沒有安全退場"
 
 
 def test_restart_self_wires_the_handshake_env_and_waiter():

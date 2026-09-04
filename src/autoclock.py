@@ -62,13 +62,16 @@ from cmuh_common.logging_setup import (  # noqa: E402
     setup_logging,
 )
 from cmuh_common.paths import (
+    OWNER_OTHER, OWNER_SELF, OWNER_UNKNOWN,
     SPAWN_CHILD_EXITED_ORDERLY as _SPAWN_CHILD_EXITED_ORDERLY,
+    SPAWN_CHILD_NEVER_READY as _SPAWN_CHILD_NEVER_READY,
     SPAWN_RECOVERY_FAILED as _SPAWN_RECOVERY_FAILED,
 )  # noqa: E402
 from cmuh_common.cross_process_claim import exclusive_claim  # noqa: E402
 from cmuh_common.paths import (  # noqa: E402
     HANDSHAKE_READY, HANDSHAKE_WAITING_MUTEX, get_app_dir, get_settings_dir,
-    mutex_retry_sec, restart_handshake_signal, restart_self,
+    mutex_retry_sec, restart_handshake_active, restart_handshake_signal,
+    restart_self,
 )
 from cmuh_common.platform_win import set_dpi_awareness  # noqa: E402
 from cmuh_common.single_instance import (  # noqa: E402
@@ -2469,25 +2472,27 @@ def restart_program(args_add=None, hard_exit_code=None) -> None:
             logging.debug("[autoclock restart] release persistent driver failed",
                           exc_info=True)
 
-    def _recover_after_failed_handover() -> bool:
-        """[第九輪 §4] 子行程在放了 mutex 之後、READY 之前死掉 → 嘗試重取 mutex。
+    def _recover_after_failed_handover() -> str:
+        """[第九輪 §4 / 外審 r10] ★所有權探針★:此刻誰持有單例?
 
-        [外審 r1 P1-2] 只有 INSTANCE_ACQUIRED 才算復原(排程照常);拿不到(別人搶到 / UNKNOWN /
-        拋例外)→ 本行程沒有單例所有權,★不可以★繼續打卡(會重複打卡)→ 走收尾安全退場。
-        回 True=已復原;False=已退場。
+        * INSTANCE_ACQUIRED → OWNER_SELF:子行程沒接手,本行程排程照常;
+        * INSTANCE_ALREADY_RUNNING → OWNER_OTHER:接手者(可能是不懂交握的舊版本、或訊號寫
+          失敗的新版本)真的拿到了單例 → 本行程安靜退出,★不是打卡中斷★;
+        * 其餘 → OWNER_UNKNOWN:★不可以★繼續打卡(兩份會重複打卡),由呼叫端安全退場。
         """
         st = None
         try:
             st = startup_instance_state(AUTOCLOCK_MUTEX_NAME, "autoclock")
         except Exception:
-            logging.exception("[autoclock restart] 復原時重取 mutex 失敗")
+            logging.exception("[autoclock restart] 查詢單例所有權失敗")
         if st == INSTANCE_ACQUIRED:
-            logging.warning("[autoclock restart] 新行程交棒後早夭 → 本行程已重取 mutex,排程繼續")
-            return True
-        logging.critical("[autoclock restart] 新行程交棒後早夭,而本行程拿不回單例(state=%s)→ "
-                         "不當沒守衛的 instance,安全退場", st)
-        _teardown_for_handover()
-        return False
+            logging.warning("[autoclock restart] 單例已回到本行程 → 排程繼續")
+            return OWNER_SELF
+        if st == INSTANCE_ALREADY_RUNNING:
+            logging.info("[autoclock restart] 單例已由接手者持有 → 本行程安靜退出")
+            return OWNER_OTHER
+        logging.critical("[autoclock restart] 查不出誰持有單例(state=%s)→ 不當沒守衛的 instance", st)
+        return OWNER_UNKNOWN
 
     extra: list = []
     for a in sys.argv[1:]:
@@ -2527,12 +2532,18 @@ def restart_program(args_add=None, hard_exit_code=None) -> None:
                      " → 不視為失敗,不打擾使用者")
         return
     if outcome == _SPAWN_RECOVERY_FAILED:
-        # [第九輪 §4 外審 r2] ★這條不是「本行程續跑」★:新行程交棒後早夭,本行程重取 mutex 失敗
-        # → _recover_after_failed_handover 已經 running.clear()/停 tray/收 driver 安全退場。
-        # 此刻自動打卡是停止的,不可以沿用下面那句「打卡未中斷」。
-        logging.critical("[autoclock restart] 新行程交棒後早夭且本行程拿不回單例 → "
-                         "已安全停止自動打卡;需人工重新開啟或確認另一份是否在跑")
+        # [第九輪 §4 外審 r2 / r10] ★這條不是「本行程續跑」★:交棒沒成立,而且★查不出誰持有
+        # 單例★ → 不可以繼續打卡(可能與另一份重複打卡)。在這裡才做收尾(探針只負責回報,
+        # 不做破壞性動作),然後據實告知「已停止」,不可以沿用下面那句「打卡未中斷」。
+        logging.critical("[autoclock restart] 交棒未成立且查不出單例擁有者 → "
+                         "安全停止自動打卡;需人工重新開啟或確認另一份是否在跑")
+        _teardown_for_handover()
         _notify_clock_stopped_after_failed_recovery()
+        return
+    if outcome == _SPAWN_CHILD_NEVER_READY:
+        # 子行程活著卻沒拿到單例 → 它會自行結束;本行程仍是擁有者,打卡真的沒中斷。
+        logging.error("[autoclock restart] 新行程未接手(單例仍在本行程)→ 續跑,本次不重啟")
+        _notify_restart_failed()
         return
     logging.error("[autoclock restart] 新行程未能存活 → 本行程續跑（未拆解），"
                   "自動打卡不中斷；請檢查更新是否損毀")
@@ -2849,7 +2860,9 @@ def main() -> None:
         _scheduler_thread_ref = background_thread
         background_thread.start()
         # [第九輪 §4] mutex 已取得、排程迴圈已起 → 向父行程回報 READY(冷啟動時 no-op)。
-        restart_handshake_signal(HANDSHAKE_READY)
+        # [外審 r10-2] 送不到要留 CRITICAL(理由同主程式)。
+        if restart_handshake_active() and not restart_handshake_signal(HANDSHAKE_READY):
+            logging.critical('[交握] READY 送不到父行程 —— 本行程其實已就緒')
 
         try:
             from PIL import Image
