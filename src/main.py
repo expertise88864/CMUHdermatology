@@ -1090,9 +1090,13 @@ def _get_or_create_status_driver():
     """
     import time as _t
     pool = _status_driver_pool
+    with pool["lock"]:
+        caller_epoch = pool["epoch"]
     while True:
         old_driver_to_quit = None
         with pool["lock"]:
+            if pool["epoch"] != caller_epoch:
+                return None
             driver = pool["driver"]
             now = _t.time()
             if (driver is not None
@@ -1101,7 +1105,9 @@ def _get_or_create_status_driver():
                 pool["driver"] = None
                 pool["last_used"] = 0.0
                 pool["epoch"] += 1
+                caller_epoch = pool["epoch"]
                 driver = None
+            init_lock = pool["init_lock"]
 
         if old_driver_to_quit is not None:
             _discard_status_driver(old_driver_to_quit)
@@ -1113,18 +1119,28 @@ def _get_or_create_status_driver():
                 _ = driver.window_handles
             except Exception:
                 logging.info("既有 status driver 已死，重建")
+                with pool["lock"]:
+                    # 晚到的失敗不能讓失效 caller 重試後借走接管者的新 session。
+                    if pool["epoch"] != caller_epoch or pool["driver"] is not driver:
+                        return None
+                    pool["driver"] = None
+                    pool["last_used"] = 0.0
+                    pool["epoch"] += 1
+                    caller_epoch = pool["epoch"]
                 _discard_status_driver(driver)
                 continue
             with pool["lock"]:
                 # 健康檢查期間可能已被超齡接管切離；舊 driver 不可再交給 caller。
-                if pool["driver"] is driver:
+                if pool["epoch"] == caller_epoch and pool["driver"] is driver:
                     pool["last_used"] = _t.time()
                     return driver
             return None
 
-        # initialize 走網路，不能持 pool lock；init_lock 防多個 caller 各開一個 Chrome。
-        with pool["init_lock"]:
+        # 同世代共用 init_lock；接管會換鎖，不讓卡死的舊 initializer 阻塞新世代。
+        with init_lock:
             with pool["lock"]:
+                if pool["epoch"] != caller_epoch:
+                    return None
                 if pool["driver"] is not None:
                     continue
                 init_epoch = pool["epoch"]
@@ -1166,6 +1182,7 @@ def _discard_status_driver(failed_driver=None) -> None:
             pool["driver"] = None
             pool["last_used"] = 0.0
             pool["epoch"] += 1
+            pool["init_lock"] = threading.Lock()
             to_quit = cur if cur is not None else failed_driver
         else:
             to_quit = failed_driver   # 池中已是新 driver → 不動池,只收失敗的那份

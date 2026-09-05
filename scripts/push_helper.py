@@ -27,6 +27,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -494,15 +495,11 @@ def step5_commit(commit_msg: str, new_version: str,
     # 用 UTF-8 暫存檔 + `git commit -F`：Windows 上 subprocess 會以系統 ANSI(cp936/gbk)
     # 編碼參數，commit message 含 emoji/特殊符號(例 U+232B 退格符)時會 UnicodeEncodeError
     # 而中斷整個推送。改寫成 UTF-8 檔讓 git 自行讀取，與系統 codepage 無關，穩定不踩雷。
-    msg_path = REPO_ROOT / ".git" / "PUSH_COMMIT_MSG.txt"
-    msg_path.write_text(commit_msg, encoding="utf-8")
-    try:
+    # Linked worktree 的 .git 是檔案；獨立暫存目錄也避免多工作樹共用訊息檔。
+    with tempfile.TemporaryDirectory(prefix="cmuh_push_commit_") as message_dir:
+        msg_path = Path(message_dir) / "message.txt"
+        msg_path.write_text(commit_msg, encoding="utf-8")
         cp = run(["git", "commit", "-F", str(msg_path)], check=False)
-    finally:
-        try:
-            msg_path.unlink()
-        except OSError:
-            pass
     if cp.returncode != 0:
         fail("git commit 失敗（可能無實際變更或 hook 阻擋）")
 

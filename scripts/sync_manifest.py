@@ -103,6 +103,7 @@ def collect_entries(version: str) -> list:
         # 設定/資源檔
         "hotkey_overrides.json",
         "requirements.txt",
+        "requirements-lazy.txt",  # deps_manifest 的第二份 runtime 版本規格也要下發
         # 注意：settings/watchdog_config.json 不放這（settings/ 被 gitignore，
         # GitHub 沒檔；watchdog_runner.py 第一次啟動會自動寫 default）
     ]
