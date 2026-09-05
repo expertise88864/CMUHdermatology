@@ -98,6 +98,7 @@ class GitSyncStorage(RosterStorage):
         self._local = threading.local()
         self._push_timer: "threading.Timer | None" = None
         self._stop_evt = threading.Event()
+        self._sync_epoch = 0  # stop/resume 不可讓已啟動但尚在等鎖的舊工作復活
         self._pull_thread: "threading.Thread | None" = None
         if self._git_ok and self._remote_sync:
             # 先 pull：若 clone 的 repo 已含（他機提交過的）.gitignore，_ensure_gitignore
@@ -112,7 +113,8 @@ class GitSyncStorage(RosterStorage):
             self._schedule_push()
             if self._pull_interval and self._pull_interval > 0:
                 self._pull_thread = threading.Thread(
-                    target=self._pull_loop, name="roster-git-pull", daemon=True)
+                    target=self._pull_loop, args=(self._sync_epoch,),
+                    name="roster-git-pull", daemon=True)
                 self._pull_thread.start()
 
     # ── git 基礎 ─────────────────────────────────────────────────────────
@@ -331,17 +333,25 @@ class GitSyncStorage(RosterStorage):
                 self._set_state("ok")
 
     # ── 週期性 pull（抓另一台的變更）────────────────────────────────────
-    def _pull_loop(self) -> None:
-        while not self._stop_evt.wait(self._pull_interval):
+    def _sync_epoch_current(self, epoch: "int | None") -> bool:
+        # None 是明確的同步呼叫（例如 flush），不屬於已取消的背景世代。
+        return epoch is None or (epoch == self._sync_epoch and not self._stop_evt.is_set())
+
+    def _pull_loop(self, epoch: "int | None" = None) -> None:
+        if epoch is None:
+            epoch = self._sync_epoch
+        while self._sync_epoch_current(epoch) and not self._stop_evt.wait(self._pull_interval):
             try:
-                self._periodic_pull()
+                self._periodic_pull(_epoch=epoch)
             except Exception:
                 logging.debug("[roster.gitsync] 週期 pull 失敗", exc_info=True)
 
-    def _periodic_pull(self) -> None:
+    def _periodic_pull(self, *, _epoch: "int | None" = None) -> None:
         """背景 fetch + ff-only；HEAD 有變 → 通知 on_remote_change。"""
         changed = False
         with self._git_lock:
+            if not self._sync_epoch_current(_epoch):
+                return
             remote = self._remote_name()
             branch = self._current_branch()
             if not remote or not branch:
@@ -358,7 +368,8 @@ class GitSyncStorage(RosterStorage):
                 after = self._rev_parse("HEAD")
                 changed = bool(before and after and before != after)
             # ff-only 失敗＝本機領先或分歧 → 留給 push 路徑處理，不在此升級狀態
-        if changed and self._on_remote_change is not None:
+        if (changed and self._sync_epoch_current(_epoch)
+                and self._on_remote_change is not None):
             try:
                 self._on_remote_change()
             except Exception:
@@ -667,13 +678,17 @@ class GitSyncStorage(RosterStorage):
 
     def _schedule_push(self) -> None:
         with self._push_lock:
+            if self._stop_evt.is_set():
+                return
             if self._push_timer is not None:
                 self._push_timer.cancel()
-            self._push_timer = threading.Timer(self._debounce, self._push)
+            self._push_timer = threading.Timer(
+                self._debounce, self._push, kwargs={"_epoch": self._sync_epoch})
             self._push_timer.daemon = True
             self._push_timer.start()
 
-    def _push(self, *, notify_remote_change: bool = True) -> None:
+    def _push(self, *, notify_remote_change: bool = True,
+              _epoch: "int | None" = None) -> None:
         """推前先同步（fetch + ff-only；分歧試 rebase）再 push。全程持 _git_lock。
 
         ★[2026-08-02 review] 推前同步若真的拉進他機的變更,必須通知 UI★
@@ -691,7 +706,10 @@ class GitSyncStorage(RosterStorage):
         """
         changed = False
         try:
-            changed = self._push_locked_body()
+            if _epoch is None:
+                changed = self._push_locked_body()
+            else:
+                changed = self._push_locked_body(_epoch=_epoch)
         finally:
             # ★[2026-08-02 補審] 通知必須無條件送出★
             #   合併成功但接著 push 失敗(離線)時,早退的 return 會跳過通知 ——
@@ -702,7 +720,7 @@ class GitSyncStorage(RosterStorage):
             #   去抖 timer 與 flush() 可能同時跑(RF-06 就是這件事);
             #   _git_lock 在讀旗標之前就已釋放,第二個 push 會把旗標覆寫掉,
             #   第一個的通知就此消失 —— 又回到那個「永遠看不到」的缺陷。
-            if (changed and notify_remote_change
+            if (changed and notify_remote_change and self._sync_epoch_current(_epoch)
                     and self._on_remote_change is not None):
                 logging.info("[roster.gitsync] 推前同步拉進他機變更 → 通知 UI 重繪")
                 try:
@@ -711,20 +729,21 @@ class GitSyncStorage(RosterStorage):
                     logging.debug("[roster.gitsync] on_remote_change callback 失敗",
                                   exc_info=True)
 
-    def _push_locked_body(self) -> bool:
+    def _push_locked_body(self, *, _epoch: "int | None" = None) -> bool:
         """_push 的實作本體(持鎖)。回傳「推前同步是否拉進了他機的變更」。
 
         抽出來有兩個理由:讓通知能放在 _push 的 finally 裡(不必在每一個 return 前
         重複一次),以及讓那個旗標是【每次呼叫各自的區域值】而不是實例狀態。"""
         changed = False
-        if not self._gitignore_ready():
-            # ★[外審第 6 輪] fail-closed 不能只擋 commit★
-            #   `_push_locked_body` 原本無視 `_commit()` 的失敗照樣 push —— 而本機
-            #   可能還躺著【舊版 `git add -A` 時期】收進來的未推 commit（裡面就有
-            #   救援副本、快照、定案 PDF）。沒有忽略規則時連推都不該推。
-            self._set_state("error", ".gitignore 未就緒，暫停同步（本機變更留在本機）")
-            return False
         with self._git_lock:
+            # cancel() 無法收回已開始的 Timer；必須拿到鎖後再次確認世代。
+            # quiesce 等這把鎖完成交棒，舊工作不能在交棒後再操作工作樹。
+            if not self._sync_epoch_current(_epoch):
+                return False
+            if not self._gitignore_ready():
+                # 忽略規則的修復也會寫盤，必須在鎖內且通過世代檢查後才做。
+                self._set_state("error", ".gitignore 未就緒，暫停同步（本機變更留在本機）")
+                return False
             # 先補收：_save 因鎖逾時略過 commit 時只排了 push，這裡（鎖已空出）把那筆
             # 已寫盤但未 commit 的變更補 commit 進來，避免「存檔成功卻遲遲沒推、他機看到
             # 舊資料」直到下次存檔或關程式才補上。乾淨樹＝nothing-to-commit（no-op）。
@@ -751,19 +770,36 @@ class GitSyncStorage(RosterStorage):
                 if f.returncode != 0:
                     self._set_state("offline", (f.stderr or f.stdout).strip())
                     return False
+                failure_state = None
                 with self._tree_lock:           # 換工作樹內容 → 與存檔互斥
                     m = self._git("merge", "--ff-only", "FETCH_HEAD")
                     if m.returncode != 0:
                         # 分歧：先試 rebase（兩台改不同檔可自動復原）
-                        rb = self._git("pull", "--rebase", remote, branch)
-                    else:
-                        rb = None
-                if m.returncode != 0:
-                    if rb is not None and rb.returncode != 0:
-                        with self._tree_lock:
-                            self._git("rebase", "--abort")   # 同檔衝突 → 交人工
-                        self._set_state("diverged", (rb.stderr or rb.stdout).strip())
-                        return False
+                        try:
+                            rb = self._git("pull", "--rebase", remote, branch)
+                            failed = rb.returncode != 0
+                            detail = (rb.stderr or rb.stdout).strip()
+                        except (OSError, subprocess.SubprocessError) as exc:
+                            failed, detail = True, str(exc)
+                        if failed:
+                            # 逾時也可能已進入 rebase。回復完成前不可放開樹鎖，
+                            # 否則 UI 在空檔存檔會被接下來的 abort 覆蓋。
+                            try:
+                                aborted = self._git("rebase", "--abort")
+                            except (OSError, subprocess.SubprocessError) as exc:
+                                failure_state = (
+                                    "error", f"rebase 回復失敗，請人工檢查：{exc}")
+                            else:
+                                if aborted.returncode != 0:
+                                    failure_state = (
+                                        "error", "rebase 回復未確認，請人工檢查："
+                                        + (aborted.stderr or aborted.stdout).strip())
+                                else:
+                                    failure_state = ("diverged", detail)
+                if failure_state is not None:
+                    # 狀態 callback 不可持樹鎖；UI 可能正在等鎖存檔。
+                    self._set_state(*failure_state)
+                    return False
                 after = self._rev_parse("HEAD")
                 changed = bool(before and after and before != after)
             _audit, stray = self._outgoing_non_canonical(remote, branch)
@@ -810,6 +846,15 @@ class GitSyncStorage(RosterStorage):
                 return changed
             self._set_state("ok")
             return changed
+
+    def _stop_background_sync(self) -> None:
+        with self._push_lock:
+            self._stop_evt.set()
+            self._sync_epoch += 1
+            if self._push_timer is not None:
+                self._push_timer.cancel()
+                self._push_timer = None
+
     def quiesce_local(self) -> None:
         """停掉背景同步並把本機變更 commit 完 —— ★完全不碰網路★。
 
@@ -822,11 +867,7 @@ class GitSyncStorage(RosterStorage):
         """
         if not self._git_ok:
             return
-        self._stop_evt.set()                     # 收掉週期 pull 執行緒
-        with self._push_lock:
-            if self._push_timer is not None:
-                self._push_timer.cancel()
-                self._push_timer = None
+        self._stop_background_sync()
         t = self._pull_thread
         if t is not None and t.is_alive():
             t.join(timeout=5.0)                  # 等它跑完手上那一輪再動 git
@@ -843,11 +884,13 @@ class GitSyncStorage(RosterStorage):
         """
         if not (self._git_ok and self._remote_sync):
             return
-        if not self._stop_evt.is_set():
-            return                               # 沒有停過 → 不重複起執行緒
-        self._stop_evt.clear()
+        with self._push_lock:
+            if not self._stop_evt.is_set():
+                return                           # 沒有停過 → 不重複起執行緒
+            self._stop_evt.clear()
+            epoch = self._sync_epoch
         if self._pull_interval and self._pull_interval > 0:
-            t = threading.Thread(target=self._pull_loop, daemon=True,
+            t = threading.Thread(target=self._pull_loop, args=(epoch,), daemon=True,
                                  name="roster-git-pull")
             self._pull_thread = t
             t.start()
@@ -860,11 +903,7 @@ class GitSyncStorage(RosterStorage):
         """
         if not (self._git_ok and self._remote_sync):
             return
-        self._stop_evt.set()                     # 收掉週期 pull 執行緒
-        with self._push_lock:
-            if self._push_timer is not None:
-                self._push_timer.cancel()
-                self._push_timer = None
+        self._stop_background_sync()
         with self._git_lock:
             self._commit("關閉前同步")           # 補收未 commit 的變更
             self._push(notify_remote_change=False)   # mainloop 即將結束,通知無意義

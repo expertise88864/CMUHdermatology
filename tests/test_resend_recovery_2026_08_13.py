@@ -15,6 +15,7 @@
   6. 補寄送達 → 鏈關 → body 才 GC。
   7. PARTIAL(暫時被拒)重啟後也走同一條 durable 路(P1-03)。
 """
+from contextlib import closing
 import importlib
 import io
 import os
@@ -416,13 +417,13 @@ class TestForwardSchemaGuard:
     def test_a_newer_db_is_refused_and_not_downgraded(self, tmp_path, clock):
         led = _led(tmp_path)
         led._close_quietly()
-        with sqlite3.connect(led.path) as c:
+        with closing(sqlite3.connect(led.path)) as c, c:
             c.execute("UPDATE meta SET value='99' WHERE key='schema_version'")
         fresh = dl.DeliveryLedger(path=led.path)    # 開不起來→lazy 重試
         with pytest.raises(dl.LedgerUnavailable):
             fresh.begin(business_key="bk", category="t",
                         recipients=["a@x.tw"])
-        with sqlite3.connect(led.path) as c:
+        with closing(sqlite3.connect(led.path)) as c, c:
             v = c.execute("SELECT value FROM meta WHERE"
                           " key='schema_version'").fetchone()[0]
         assert v == "99", (
@@ -528,8 +529,9 @@ class TestCloseoutDefersToTheDurablePath:
         cq = importlib.import_module("consult_query")
         assert cq._RECONCILER._missed_alert is not None, (
             "★放棄補寄只寫 log★ 使用者不翻 log,等於沒說")
-        src = io.open(os.path.join(REPO_ROOT, "src", "consult_query.py"),
-                      encoding="utf-8").read()
+        with io.open(os.path.join(REPO_ROOT, "src", "consult_query.py"),
+                     encoding="utf-8") as f:
+            src = f.read()
         assert "missed_alert=lambda who, subject, why:" in src, (
             "告警管道要晚綁定(直接綁函式物件會讓測試 seam 靜默失效)")
 

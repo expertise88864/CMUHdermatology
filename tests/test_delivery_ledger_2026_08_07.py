@@ -8,6 +8,7 @@
 而且重啟後記憶體去重全消失。本模組把 UNKNOWN 誠實記成第三態，之後用
 Message-ID 回查收斂；並且每位收件人各自有狀態（部分拒收不再永久漏收）。
 """
+from contextlib import closing
 import os
 import sys
 
@@ -187,7 +188,8 @@ def test_unreadable_ledger_never_overwrites_disk(tmp_path):
     path = str(tmp_path / "delivery_ledger.sqlite3")
     with open(path, "wb") as f:
         f.write(b"this is not a database " * 40)
-    before = open(path, "rb").read()
+    with open(path, "rb") as f:
+        before = f.read()
 
     hurt = dl.DeliveryLedger(path)
     with pytest.raises(dl.LedgerUnavailable):
@@ -196,7 +198,9 @@ def test_unreadable_ledger_never_overwrites_disk(tmp_path):
     with pytest.raises(dl.LedgerUnavailable):
         hurt.has_live_delivery("bk2")
     assert hurt.state_of("whatever") == "", "state_of 讀不到=空字串(不知道)"
-    assert open(path, "rb").read() == before, \
+    with open(path, "rb") as f:
+        after = f.read()
+    assert after == before, \
         "★讀不到卻把檔案覆寫掉★ 磁碟上的已寄紀錄被抹掉 → 大量重寄"
 
 
@@ -213,7 +217,7 @@ def test_prune_keeps_unresolved_forever(tmp_path):
     # 把兩筆都推到「很久以前」，再觸發一次 prune
     # [SQLite 版] 沒有記憶體快照可改 —— 直接改資料庫(模擬時間流逝)
     import sqlite3
-    with sqlite3.connect(led.path) as _c:
+    with closing(sqlite3.connect(led.path)) as _c, _c:
         _c.execute("UPDATE deliveries SET updated_at=0.0")
     led.begin(business_key="trigger-prune", category="clinical",
               recipients=["c@x.tw"])

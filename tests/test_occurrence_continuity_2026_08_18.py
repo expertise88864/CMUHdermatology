@@ -12,6 +12,7 @@ AE-8 把所有權移到 `delivery_occurrences`,但那張表是新的:
 
 兩者都是「所有權在某個轉換點斷掉」。本檔把兩個轉換點釘住。
 """
+from contextlib import closing
 import importlib
 import os
 import sqlite3
@@ -38,7 +39,7 @@ def led(tmp_path):
 
 def _unmap(led, did):
     """把某一筆的機會鑰匙拿掉 —— ★模擬 v4 舊紀錄★(它們沒有 mapping)。"""
-    with sqlite3.connect(led.path) as c:
+    with closing(sqlite3.connect(led.path)) as c, c:
         c.execute("DELETE FROM delivery_occurrences WHERE delivery_id=?",
                   (did,))
 
@@ -122,7 +123,7 @@ class TestTheTwoFixesDoNotCancelEachOther:
             subject="會診", body_text="內文", occurrence_keys=(O2,))
         _unmap(led, p1)
         assert led.supersede(p0, by=p1, note="較新的紀錄接手")
-        with sqlite3.connect(led.path) as c:
+        with closing(sqlite3.connect(led.path)) as c, c:
             got = {(r[0], r[1]) for r in c.execute(
                 "SELECT occurrence_key, inherited FROM delivery_occurrences"
                 " WHERE delivery_id=?", (p1,))}
@@ -202,7 +203,7 @@ class TestSupersedeTransfersOccurrenceOwnership:
             business_key=KEY, category="consult", recipients=["a@x.tw"],
             subject="會診", body_text="內文", occurrence_keys=(O2,))
         led.supersede(p0, by=p1, note="測試交棒")
-        with sqlite3.connect(led.path) as c:
+        with closing(sqlite3.connect(led.path)) as c, c:
             owners = {r[0] for r in c.execute(
                 "SELECT delivery_id FROM delivery_occurrences"
                 " WHERE occurrence_key=?", (O1,))}

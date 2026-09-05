@@ -18,6 +18,7 @@
 兩條路 settle，連不上／認證失敗／5xx 直接往上拋 → 那一筆永遠停在 SUBMITTING，
 而 prune 不清 SUBMITTING。三次 attempt 留下兩筆假的「可能送到一半」。
 """
+from contextlib import closing
 import ast
 import inspect
 import multiprocessing as mp
@@ -47,7 +48,7 @@ class TestCrossProcessSafety:
     @staticmethod
     def _keys(tmp_path) -> set:
         import sqlite3
-        with sqlite3.connect(str(tmp_path / "ledger.sqlite3")) as c:
+        with closing(sqlite3.connect(str(tmp_path / "ledger.sqlite3"))) as c, c:
             return {r[0] for r in
                     c.execute("SELECT business_key FROM deliveries")}
 

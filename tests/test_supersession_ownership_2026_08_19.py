@@ -14,6 +14,7 @@
   但沒有鑰匙 —— 而接手者是【兄弟】不是子紀錄,兩個既有判準都看不到它。
   讀取端必須沿 `superseded_by` 走鏈。
 """
+from contextlib import closing
 import ast
 import importlib
 import inspect
@@ -42,7 +43,7 @@ def led(tmp_path):
 
 
 def _sql(led, stmt, args=()):
-    with sqlite3.connect(led.path) as c:
+    with closing(sqlite3.connect(led.path)) as c, c:
         return c.execute(stmt, args).fetchall()
 
 

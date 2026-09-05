@@ -11,6 +11,7 @@ in-flight、自動補寄最多 RESEND_MAX_AUTO 次(批次AE-1 改版,跨重啟
 也算得出來 —— 子紀錄與 kind 都在資料庫裡);登記不了就不寄。
 crash 恢復與欠補寄掃描的測試在 test_resend_recovery_2026_08_13.py。
 """
+from contextlib import closing
 import importlib
 import io
 import os
@@ -35,7 +36,7 @@ def _aged_unknown(tmp_path, *, body="會診清單:3F 王O明 皮膚科照會",
                     recipients=list(recipients), subject="皮膚科會診通知",
                     message_id=msgid, body_text=body)
     led.settle(did, unknown=True)
-    with sqlite3.connect(led.path) as c:
+    with closing(sqlite3.connect(led.path)) as c, c:
         c.execute("UPDATE deliveries SET created_at=? WHERE delivery_id=?",
                   (time.time() - 7200, did))
     return led, did
@@ -74,7 +75,7 @@ class TestSentMissTriggersATextOnlyResend:
         led, did = _aged_unknown(tmp_path)
         _capture_send(monkeypatch)
         dr.Reconciler(lambda: led).run_once(finder=lambda m: False)
-        with sqlite3.connect(led.path) as c:
+        with closing(sqlite3.connect(led.path)) as c, c:
             kids = c.execute(
                 "SELECT delivery_id, state, message_id FROM deliveries"
                 " WHERE parent_id=?", (did,)).fetchall()
@@ -104,7 +105,7 @@ class TestSentMissTriggersATextOnlyResend:
         led.resolve_unknown(did, delivered=False)   # 查無 → FAILED(暫時被拒)
         kid = dr.Reconciler(lambda: led)._resend_from_body_text(led, rec)
         assert led.state_of(kid) == dl.UNKNOWN
-        with sqlite3.connect(led.path) as c:        # 讓補寄那筆到達回查年齡
+        with closing(sqlite3.connect(led.path)) as c, c:        # 讓補寄那筆到達回查年齡
             c.execute("UPDATE deliveries SET created_at=? WHERE delivery_id=?",
                       (time.time() - 7200, kid))
         n = dr.Reconciler(lambda: led).run_once(finder=lambda m: True)
@@ -119,7 +120,7 @@ class TestSentMissTriggersATextOnlyResend:
         led, did = _aged_unknown(tmp_path,
                                  recipients=("ok@x.tw", "miss@x.tw"))
         led.confirm_recipients(did, ["ok@x.tw"])    # 這位已確認送達
-        with sqlite3.connect(led.path) as c:        # 確認後仍要是可回查的老紀錄
+        with closing(sqlite3.connect(led.path)) as c, c:        # 確認後仍要是可回查的老紀錄
             c.execute("UPDATE deliveries SET state=? WHERE delivery_id=?",
                       (dl.UNKNOWN, did))
         sent = _capture_send(monkeypatch)
@@ -252,7 +253,7 @@ class TestTheBodyHasItsOwnRetention:
                         recipients=["a@x.tw"], message_id="<keep@x>",
                         body_text="臨床內文")
         led.settle(did, unknown=True)
-        with sqlite3.connect(led.path) as c:
+        with closing(sqlite3.connect(led.path)) as c, c:
             c.execute("UPDATE deliveries SET created_at=? WHERE delivery_id=?",
                       (time.time() - dl.BODY_RETAIN_SEC - 60, did))
         # 回查這一輪甚至查不出結果(IMAP 不可用)—— 掃除仍要發生
@@ -273,7 +274,7 @@ class TestTheBodyHasItsOwnRetention:
         did = led.begin(business_key="bk", category="t",
                         recipients=["a@x.tw"], body_text="臨床內文")
         led.settle(did, unknown=True)
-        with sqlite3.connect(led.path) as c:
+        with closing(sqlite3.connect(led.path)) as c, c:
             c.execute("UPDATE deliveries SET created_at=? WHERE delivery_id=?",
                       (time.time() - dl.BODY_RETAIN_SEC - 60, did))
         led._close_quietly()
@@ -287,7 +288,7 @@ class TestSchemaV2Migration:
     def test_a_v1_database_gains_the_body_column(self, tmp_path):
         """既有的 v1 資料庫(沒有 body_text 欄)開起來要自動升級。"""
         db = str(tmp_path / "ledger.sqlite3")
-        with sqlite3.connect(db) as c:
+        with closing(sqlite3.connect(db)) as c, c:
             c.execute("CREATE TABLE deliveries ("
                       " delivery_id TEXT PRIMARY KEY,"
                       " business_key TEXT NOT NULL DEFAULT '',"
@@ -314,7 +315,7 @@ class TestSchemaV2Migration:
         assert led.get(did)["body_text"] == "新格式的內容"
         assert led.get("old1")["body_text"] == "", "舊列的預設要是空字串"
         assert led.get("old1")["kind"] == "", "v3 的 kind 欄也要補上"
-        with sqlite3.connect(db) as c:
+        with closing(sqlite3.connect(db)) as c, c:
             v = c.execute("SELECT value FROM meta WHERE"
                           " key='schema_version'").fetchone()[0]
         assert v == str(dl._SCHEMA_VERSION), "schema_version 要跟著升(人維護的帳)"
@@ -325,8 +326,9 @@ class TestTheCallersActuallyStoreTheBody:
     doesn't exist)。"""
 
     def test_consult_passes_its_text_body(self):
-        src = io.open(os.path.join(REPO_ROOT, "src", "consult_query.py"),
-                      encoding="utf-8").read()
+        with io.open(os.path.join(REPO_ROOT, "src", "consult_query.py"),
+                     encoding="utf-8") as f:
+            src = f.read()
         i = src.index("def _delivery_begin(")
         block = src[i:src.index("def ", i + 10)]
         assert "body_text=delivery.text_body" in block, (
@@ -335,8 +337,9 @@ class TestTheCallersActuallyStoreTheBody:
     def test_the_alert_sender_gates_the_body_on_optin(self):
         """★共用 helper 預設不落地★(外審 AD-3 第 1 輪 P1-3):讀回稽核不符
         等呼叫端的內文含病歷號 —— 只有止掛那兩條臨床路徑 opt-in。"""
-        src = io.open(os.path.join(REPO_ROOT, "src", "main.py"),
-                      encoding="utf-8").read()
+        with io.open(os.path.join(REPO_ROOT, "src", "main.py"),
+                     encoding="utf-8") as f:
+            src = f.read()
         i = src.index("def _send_alert_email_via_smtp(")
         block = src[i:i + 7000]
         assert 'if durable_body else ""' in block, (

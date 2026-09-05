@@ -34,9 +34,11 @@ def manual_push_timers(monkeypatch):
     timers = []
 
     class ManualTimer:
-        def __init__(self, interval, function):
+        def __init__(self, interval, function, args=None, kwargs=None):
             self.interval = interval
             self.function = function
+            self.args = args or ()
+            self.kwargs = kwargs or {}
             self.daemon = False
             self.started = False
             self.cancelled = False
@@ -52,7 +54,7 @@ def manual_push_timers(monkeypatch):
         def fire(self):
             if self.started and not self.cancelled and not self.fired:
                 self.fired = True
-                self.function()
+                self.function(*self.args, **self.kwargs)
 
     monkeypatch.setattr(threading, "Timer", ManualTimer)
     yield timers

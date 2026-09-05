@@ -16,6 +16,7 @@ settings/ 的 SQLite 裡最長 3 天。本批:
 * 封不進 → ★不落地內文★+error(信照寄;絕不靜默退回明文 ——
   防護不可以恰好在出事時無聲消失)。
 """
+from contextlib import closing
 import importlib
 import os
 import sqlite3
@@ -37,7 +38,7 @@ def _ledger(tmp_path):
 
 
 def _raw_body(led, did: str) -> str:
-    with sqlite3.connect(led.path) as c:
+    with closing(sqlite3.connect(led.path)) as c, c:
         row = c.execute("SELECT body_text FROM deliveries WHERE delivery_id=?",
                         (did,)).fetchone()
     return "" if row is None else str(row[0])
@@ -72,7 +73,7 @@ class TestTheBodyAtRestIsSealed:
         did = led.begin(business_key="bk", category="consult",
                         recipients=["a@x.tw"], subject="s",
                         message_id="<m@x>", body_text=_BODY)
-        with sqlite3.connect(led.path) as c:
+        with closing(sqlite3.connect(led.path)) as c, c:
             c.execute("UPDATE deliveries SET body_text=? WHERE delivery_id=?",
                       (_BODY, did))
         rec = led.get(did)
@@ -140,7 +141,7 @@ class TestUnreadableBodyIsAStateNotAnEmpty:
                         message_id="<m@x>", body_text=_BODY)
         led.settle(did, refused={"a@x.tw": (421, "busy")})   # → FAILED 欠補寄
         # 生產失敗形狀:密文在、解不開(離機複製/金鑰換了/毀損)
-        with sqlite3.connect(led.path) as c:
+        with closing(sqlite3.connect(led.path)) as c, c:
             c.execute("UPDATE deliveries SET body_text=?, updated_at=?"
                       " WHERE delivery_id=?",
                       ("dpapi1:QUFBQQ==", time.time() - 7200, did))
@@ -203,7 +204,7 @@ class TestUnreadableBodyIsAStateNotAnEmpty:
         (回寫已送達+supersede 結鏈),不可先放棄+告警 —— 那封信
         已經送達,告警反而誘導人工重寄。"""
         led, did = self._failed_with_corrupt_body(tmp_path)
-        with sqlite3.connect(led.path) as c:      # 讓親紀錄確定比較舊
+        with closing(sqlite3.connect(led.path)) as c, c:      # 讓親紀錄確定比較舊
             c.execute("UPDATE deliveries SET created_at=? WHERE delivery_id=?",
                       (time.time() - 7200, did))
         newer = led.begin(business_key="bk", category="consult",

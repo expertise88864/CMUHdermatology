@@ -8,6 +8,7 @@
   * P1-08 `has_live_delivery()` + `begin()` 是兩個操作 → 接成閘門就是 TOCTOU。
 SQLite 交易(BEGIN IMMEDIATE)+ synchronous=FULL 讓三條變成結構性質。
 """
+from contextlib import closing
 import importlib
 import os
 import sqlite3
@@ -253,7 +254,7 @@ class TestAFailureInsideATransactionReleasesTheLock:
 class TestSchemaVersionIsARealLedger:
     def test_the_version_is_written_by_hand_not_derived(self, tmp_path):
         led = _led(tmp_path)
-        with sqlite3.connect(led.path) as c:
+        with closing(sqlite3.connect(led.path)) as c, c:
             v = c.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()
