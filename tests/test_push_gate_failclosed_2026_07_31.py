@@ -14,8 +14,7 @@
     那一刻退回「不檢查」,等於這把鎖只在不需要它的時候有效
     （跟 P1-06 更新鎖犯過的錯完全一樣）。
 
-修法:缺工具 → 中止;真的緊急走 `--emergency "理由"`,要寫理由、會大字印出來、
-而且寫進 commit 訊息永久可查。
+最新定案:缺工具 → 中止；--emergency 不再提供任何豁免。
 """
 import ast
 import importlib.util
@@ -170,7 +169,7 @@ def test_the_gate_cleans_up_its_own_artifacts(ph, monkeypatch, tmp_path):
         assert not (tmp_path / name).exists(), f"{name} 沒有被清掉"
 
 
-# ─── 緊急旁路：可以繞，但要留痕 ───────────────────────────────────────────
+# ─── 最新定案：緊急理由也不可繞過 ─────────────────────────────────────────
 def test_parse_args_reads_the_commit_message(ph):
     assert ph.parse_args(["prog", "hello", "world"]) == ("hello world", "")
 
@@ -183,29 +182,25 @@ def test_emergency_requires_a_reason(ph):
         ph.parse_args(["prog", "msg", "--emergency", "   "])
 
 
-def test_emergency_reason_is_not_swallowed_into_the_commit_message(ph):
-    msg, reason = ph.parse_args(["prog", "hotfix", "--emergency", "診間全掛"])
-    assert msg == "hotfix"
-    assert reason == "診間全掛"
+def test_emergency_reason_cannot_enable_a_bypass(ph):
+    with pytest.raises(SystemExit):
+        ph.parse_args(["prog", "hotfix", "--emergency", "診間全掛"])
 
 
-def test_emergency_skips_the_checks_but_says_so_loudly(ph, monkeypatch, capsys):
+def test_emergency_is_rejected_even_when_tools_are_missing(ph, monkeypatch, capsys):
     monkeypatch.setattr(ph.importlib.util, "find_spec", lambda _n: None)
     ran = []
     monkeypatch.setattr(ph.subprocess, "run",
                         lambda cmd, **k: ran.append(cmd) or _rc(0))
-    ph.step_quality_gate("診間全掛，先推修正")     # 缺工具也不中止
+    with pytest.raises(SystemExit):
+        ph.step_quality_gate("診間全掛，先推修正")
     out = capsys.readouterr().out
     assert ran == []
-    assert "緊急模式" in out
-    assert "診間全掛，先推修正" in out
+    assert "已停用" in out
 
 
-def test_the_emergency_reason_is_recorded_in_the_commit(ph, monkeypatch,
-                                                       tmp_path):
-    """★只在終端印一行，關掉視窗就沒了★
-    寫進 commit 訊息後，`git log --grep` 一查就知道哪幾版是未經本機關卡的。
-    """
+def test_emergency_commit_is_rejected_before_writing(ph, monkeypatch, tmp_path):
+    """The old direct-call bypass must reject before creating any commit message."""
     written = {}
     monkeypatch.setattr(ph, "REPO_ROOT", tmp_path)
     (tmp_path / ".git").mkdir()
@@ -218,11 +213,9 @@ def test_the_emergency_reason_is_recorded_in_the_commit(ph, monkeypatch,
 
     monkeypatch.setattr(ph.Path, "write_text", _spy)
     monkeypatch.setattr(ph, "run", lambda *a, **k: _rc(0))
-    ph.step5_commit("hotfix", "2026.07.31.1", "診間全掛，pytest 環境同時壞掉")
-
-    assert "hotfix" in written["msg"]
-    assert "緊急推送" in written["msg"]
-    assert "診間全掛，pytest 環境同時壞掉" in written["msg"]
+    with pytest.raises(SystemExit):
+        ph.step5_commit("hotfix", "2026.07.31.1", "診間全掛，pytest 環境同時壞掉")
+    assert written == {}
 
 
 def test_a_normal_commit_has_no_emergency_marker(ph, monkeypatch, tmp_path):
@@ -242,9 +235,9 @@ def test_a_normal_commit_has_no_emergency_marker(ph, monkeypatch, tmp_path):
 
 
 # ─── 接線：main() 真的把旗標傳下去 ────────────────────────────────────────
-def test_main_threads_the_emergency_flag_through():
-    """★寫了旗標但沒接上＝旁路永遠不生效／或關卡永遠被繞★"""
-    src = io.open(PUSH_HELPER, encoding="utf-8").read()
+def test_main_retains_explicit_rejection_for_legacy_argument():
+    with io.open(PUSH_HELPER, encoding="utf-8") as source:
+        src = source.read()
     tree = ast.parse(src)
     main_fn = next(n for n in tree.body
                    if isinstance(n, ast.FunctionDef) and n.name == "main")
@@ -261,7 +254,8 @@ def test_the_gate_no_longer_contains_the_silent_skip():
     解釋為什麼不能那樣做，直接對原始碼比對會被自己的說明騙過去
     （這個坑本輪已經踩過幾次）。
     """
-    tree = ast.parse(io.open(PUSH_HELPER, encoding="utf-8").read())
+    with io.open(PUSH_HELPER, encoding="utf-8") as source:
+        tree = ast.parse(source.read())
     fn = next(n for n in tree.body
               if isinstance(n, ast.FunctionDef) and n.name == "step_quality_gate")
     body = list(fn.body)
@@ -274,12 +268,14 @@ def test_the_gate_no_longer_contains_the_silent_skip():
     assert "CI 仍會把關" not in code
 
 
-def test_type_debt_is_documented_as_ci_only():
-    """型別債棘輪刻意不進本機關卡（要跑 11 次 pyright，本機約 10 分鐘）——
-    但那個取捨要寫下來，否則下一個人會以為是漏掉了。"""
-    src = io.open(PUSH_HELPER, encoding="utf-8").read()
-    assert "型別債棘輪" in src
-    assert "只在 CI 跑" in src
+def test_full_type_debt_runs_locally_not_just_fast_mode(ph, monkeypatch):
+    monkeypatch.setattr(ph.importlib.util, "find_spec", lambda _n: object())
+    ran = []
+    monkeypatch.setattr(ph.subprocess, "run",
+                        lambda cmd, **k: ran.append(cmd) or _rc(0))
+    ph.step_quality_gate()
+    debt = [cmd for cmd in ran if "scripts/type_debt.py" in cmd]
+    assert debt == [[ph.sys.executable, "scripts/type_debt.py"]]
 
 
 def test_the_install_hint_targets_this_interpreter(ph, monkeypatch, capsys):

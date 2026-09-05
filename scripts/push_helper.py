@@ -4,15 +4,14 @@
 流程：
   1. sanity check：settings/ 不可被追蹤、.gitignore 完整、version.py 可讀
   2. 確認有 git 變更
-  3. 品質關卡：ruff + pyright + pytest + skip 守衛 + 覆蓋率門檻
-     紅燈或【工具沒裝】就中止（壞 build 推不出去；尚未 bump/commit）
-  4. bump 版本（YYYY.MM.DD.serial）
-  5. 同步 manifest.json（含 SHA256）
-  6. git add -A → commit → push
+  3. bump 版本、同步 manifest.json、核對 index 後建立本機 commit
+  4. 對最終 commit 跑完整本機 CI；紅燈／缺工具就保留本機成果、不 push
+  5. 再確認 SHA 與整個工作樹未變動，正常 push
+  6. 印出 SHA；GitHub CI 必須另外核對全綠才算交付完成
 
 用法：
   python scripts/push_helper.py "commit 訊息"
-  python scripts/push_helper.py "commit 訊息" --emergency "為什麼非繞過不可"
+  --emergency 已停用；任何分支都不能豁免本機 CI。
 
 ★[2026-07-30 第二輪外審 P2-08] 這個關卡是【最後一道】，不是第一道★
 push 是直推 main，而診間電腦約 5 分鐘內就會自動拉新版 —— GitHub CI 是推上去
@@ -132,7 +131,7 @@ def _clean_gate_artifacts() -> None:
 
 
 def step_quality_gate(emergency_reason: str = "") -> None:
-    """本機品質關卡。任一紅燈即中止推送（此時尚未 bump 版本、未 commit）。
+    """本機品質關卡。任一紅燈即中止推送，保留已建立的本機 commit。
 
     ★[2026-07-30 第二輪外審 P2-08] 工具沒裝 →【中止】，不是略過★
     舊版的寫法是：`find_spec(module) is None` 就印一行「已略過，CI 仍會把關」
@@ -144,18 +143,12 @@ def step_quality_gate(emergency_reason: str = "") -> None:
         關卡的時候。那一刻退回「不檢查」，等於這把鎖只在不需要它的時候有效
         （跟 P1-06 更新鎖犯過的錯完全一樣）。
 
-    真的遇到緊急狀況（診間壞掉、本機環境壞掉）用
-    `--emergency "理由"` —— 要寫理由、會大字印出來、而且會寫進 commit
-    訊息裡永久可查。有意識的繞過可以；默默地繞過不行。
+    依 2026-09-05 最新定案，緊急理由與 Opus pending 均不豁免 CI。
+    保留舊參數只為明確拒絕舊呼叫，不提供任何旁路。
     """
     print("\n=== [3/7] 品質關卡（ruff + pyright + pytest + 棘輪）===")
     if emergency_reason:
-        print("  " + "!" * 56)
-        print("  !! 緊急模式：本次【跳過所有本機品質關卡】")
-        print(f"  !! 理由：{emergency_reason}")
-        print("  !! 這個理由會寫進 commit 訊息。推完請盡快回頭補跑關卡。")
-        print("  " + "!" * 56)
-        return
+        fail("--emergency 已停用：所有分支 push 前均須完整本機 CI 全綠。")
 
     # ★工具齊全性先檢★：缺任何一個都直接中止，不進入部分檢查
     needed = {"ruff": "ruff", "pyright": "pyright", "pytest": "pytest",
@@ -176,8 +169,7 @@ def step_quality_gate(emergency_reason: str = "") -> None:
              "  ★不能因為「CI 會把關」就放行★：push 是直推 main，CI 是推上去之後\n"
              "  才跑的，而診間電腦約 5 分鐘內就會自動拉新版 —— CI 紅燈時壞版本\n"
              "  已經在診間了。\n"
-             '  真的緊急：python scripts/push_helper.py "訊息" '
-             '--emergency "為什麼不能先裝工具"')
+             "  --emergency 已停用；請先修復環境，不得略過檢查。")
 
     _clean_gate_artifacts()
     failed = []
@@ -193,6 +185,9 @@ def step_quality_gate(emergency_reason: str = "") -> None:
     _step("ruff", [sys.executable, "-m", "ruff", "check", "src", "scripts", "tests"])
     # pyright 以前只在 CI 跑 —— 型別錯誤因此都是【推上去之後】才發現。
     _step("pyright", [sys.executable, "-m", "pyright"])
+    _step("相依一致性", [sys.executable, "-m", "pip", "check"])
+    _step("lazy 相依匯入", [sys.executable, "-c",
+                              "import ortools, openpyxl, docx, reportlab"])
     # 一次 pytest 同時產出 junit.xml 與 cov.json，下面兩道棘輪直接吃（不多跑一次）
     pytest_ok = _step("pytest", [
         sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
@@ -207,21 +202,12 @@ def step_quality_gate(emergency_reason: str = "") -> None:
         # pytest 紅燈時報告不完整，拿不完整的報告去判只會誤導
         print("  [略過] skip 守衛與覆蓋率門檻（pytest 已紅燈，報告不完整）")
 
-    # ★[2026-08-08] 型別債棘輪改成本機也跑（--fast）★
-    #   舊註解寫「逐條跑 11 次 pyright、本機約 10 分鐘，太久所以只在 CI 跑」。
-    #   代價是實測到的：2026-08-08 連兩版（v.4/v.5）推上去才發現棘輪紅燈 ——
-    #   本機四道關卡全綠，唯一沒跑的那道就是紅的那道。
-    #   `--fast` 把 11 條規則一次打開、只跑一趟 pyright：本機實測 6.3 秒
-    #   （逐條是 70.5 秒，也遠不到 10 分鐘），而且 11 條規則的指紋計數與逐條
-    #   逐一比對【完全一致】。
-    #   ※ CI 仍然走逐條那條路（權威判定）：一次打開理論上有「規則互相遮蔽」
-    #     的風險，那會讓診斷變少 —— 而變少在這道關卡只是警告，會安靜地變弱。
-    _step("型別債棘輪(--fast)",
-          [sys.executable, "scripts/type_debt.py", "--fast"])
+    # 與 GitHub CI 同樣逐條執行；--fast 不代替最終交付的完整檢查。
+    _step("型別債棘輪(full)", [sys.executable, "scripts/type_debt.py"])
     _clean_gate_artifacts()
     if failed:
         fail("品質關卡未通過（" + ", ".join(failed) + " 紅燈），已中止推送。\n"
-             "  尚未 bump 版本、未 commit；請修正上面紅燈後再 push。")
+             "  本機 commit 保留；請修正紅燈並對最終版本重新驗證後再 push。")
 
 
 VERSION_REL = "src/cmuh_common/version.py"
@@ -484,14 +470,7 @@ def step5_commit(commit_msg: str, new_version: str,
     if not commit_msg or commit_msg.strip() in ("", "1"):
         commit_msg = f"Update v{new_version}"
     if emergency_reason:
-        # ★繞過關卡要留下永久紀錄★ —— 只在終端印一行，關掉視窗就沒了。
-        # 寫進 commit 訊息後，`git log --grep` 一查就知道哪幾版是未經本機關卡的。
-        commit_msg = "\n".join([
-            commit_msg,
-            "",
-            "[緊急推送] 本次跳過本機品質關卡（ruff/pyright/pytest/棘輪）",
-            f"理由：{emergency_reason}",
-        ])
+        fail("--emergency 已停用：不能建立豁免 CI 的交付 commit。")
     # 用 UTF-8 暫存檔 + `git commit -F`：Windows 上 subprocess 會以系統 ANSI(cp936/gbk)
     # 編碼參數，commit message 含 emoji/特殊符號(例 U+232B 退格符)時會 UnicodeEncodeError
     # 而中斷整個推送。改寫成 UTF-8 檔讓 git 自行讀取，與系統 codepage 無關，穩定不踩雷。
@@ -504,13 +483,22 @@ def step5_commit(commit_msg: str, new_version: str,
         fail("git commit 失敗（可能無實際變更或 hook 阻擋）")
 
 
-def step6_push() -> None:
+def step6_push(expected_sha: str = "") -> None:
     print("\n=== [9/9] Push ===")
     # 取當前分支
     cp = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], check=False, capture=True)
     branch = cp.stdout.strip() or "main"
+    if expected_sha:
+        if not re.fullmatch(r"[0-9a-f]{40}", expected_sha):
+            fail("待推 SHA 格式無效，已中止推送。")
+        if _git_bytes(["rev-parse", "HEAD"]).decode("ascii").strip() != expected_sha:
+            fail("待推 SHA 已改變，已中止推送。")
+        if branch == "HEAD":
+            fail("detached HEAD 沒有明確的交付分支，已中止推送。")
     print(f"  推送至 origin/{branch} ...")
-    cp = run(["git", "push", "origin", branch], check=False)
+    # 固定來源 SHA，避免最後檢查後分支被移動而把未驗證的新 commit 推出去。
+    source = f"{expected_sha}:refs/heads/{branch}" if expected_sha else branch
+    cp = run(["git", "push", "origin", source], check=False)
     if cp.returncode != 0:
         # 可能還沒設 remote 或第一次推
         print("\n[提示] git push 失敗。可能原因：")
@@ -520,26 +508,19 @@ def step6_push() -> None:
 
 
 def parse_args(argv: list) -> tuple:
-    """→ (commit_msg, emergency_reason)。
-
-    ★[2026-07-30 外審 P2-08] `--emergency` 一定要帶理由★
-    一個不用寫理由的旁路開關，用起來跟「預設就跳過」沒兩樣 —— 幾次之後就變成
-    習慣動作。要求打字寫理由，而且理由會進 commit 訊息，讓每一次繞過都留下
-    可以被回頭質問的紀錄。
-    """
+    """→ (commit_msg, empty legacy argument). Emergency bypass is forbidden."""
     args = list(argv[1:])
-    emergency = ""
-    if "--emergency" in args:
-        idx = args.index("--emergency")
-        rest = args[idx + 1:]
-        reason = rest[0].strip() if rest else ""
-        if not reason or reason.startswith("--"):
-            fail('--emergency 一定要接理由，例如：\n'
-                 '  python scripts/push_helper.py "hotfix" '
-                 '--emergency "診間全掛，pytest 環境同時壞掉，先推修正"')
-        emergency = reason
-        args = args[:idx] + rest[1:]
-    return " ".join(args), emergency
+    if any(arg == "--emergency" or arg.startswith("--emergency=") for arg in args):
+        fail("--emergency 已停用：所有分支 push 前均須完整本機 CI 全綠。")
+    return " ".join(args), ""
+
+
+def verify_clean_revision(expected_sha: str) -> None:
+    """CI applies only to this unchanged commit, including docs/config/index."""
+    actual_sha = _git_bytes(["rev-parse", "HEAD"]).decode("ascii").strip()
+    dirty = _git_bytes(["status", "--porcelain", "--untracked-files=all"])
+    if actual_sha != expected_sha or dirty.strip():
+        fail("最終 SHA／工作樹在驗證期間變動，已中止推送；請重新驗證實際待推版本。")
 
 
 def main(argv: list) -> int:
@@ -556,12 +537,9 @@ def main(argv: list) -> int:
     step1_sanity()
     if not step2_check_changes():
         return 0
-    # [2026-08-02 補審 P1] 指紋要在【品質關卡之前】取。原本在關卡返回【之後】才取,
-    # 若 OneDrive 剛好在那個瞬間還原,舊版就成為合法基準、檢查必過 —— 基準本身被
-    # 污染,後面驗什麼都沒用。關卡(ruff/pytest)不會改動 src/scripts/tests,提前取樣安全。
+    # 先保存使用者欲交付的來源，再生成版本/manifest 與核對 index。
+    # 完整 CI 在 commit 之後執行，不能沿用 bump 之前的測試結果。
     fingerprint = snapshot_tracked_sources()
-    step_quality_gate(emergency_reason)
-    verify_unchanged_since_tests(fingerprint)
     new_ver = step3_bump_version()
     step4_sync_manifest(new_ver)
     # bump/sync_manifest 合法改寫 version.py 與 manifest.json → 取它們【當下】的內容
@@ -576,10 +554,18 @@ def main(argv: list) -> int:
     verify_staged_version_consistency(new_ver)
     verify_staged_manifest_hashes()
     step5_commit(commit_msg, new_ver, emergency_reason)
-    step6_push()
+    final_sha = _git_bytes(["rev-parse", "HEAD"]).decode("ascii").strip()
+    verify_clean_revision(final_sha)
+    step_quality_gate(emergency_reason)
+    verify_index_matches(expected)
+    verify_staged_version_consistency(new_ver)
+    verify_staged_manifest_hashes()
+    verify_clean_revision(final_sha)
+    step6_push(final_sha)
 
     print("\n" + "=" * 60)
-    print(f"  推送完成！v{new_ver}")
+    print(f"  已推送 v{new_ver}，SHA {final_sha}；尚待 GitHub CI 全綠核對。")
+    print("  本機通過不等於 GitHub CI 成功；請追蹤此完整 SHA 的所有適用檢查。")
     print("  其他電腦下次啟動時會自動拉新版（CDN 快取約 5 分鐘）")
     print("=" * 60)
     return 0

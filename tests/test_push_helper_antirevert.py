@@ -71,8 +71,8 @@ def test_guard_runs_before_commit_in_main():
       (1) 關卡返回 → 取指紋之間被還原 → 舊版直接成為【合法基準】,檢查必過。
       (2) 驗完 → git add 之間被還原 → 被還原的內容照樣進 commit。
     兩者都正是本防護聲稱要消除的事故類型。新順序:
-      取指紋 → 關卡 → 驗(抓關卡期間的還原) → bump/manifest → git add
-      → 驗 index(抓 add 之前的任何還原) → commit(提交的就是這個 index)。
+      取指紋 → bump/manifest → git add → 驗 index → commit
+      → 最終完整關卡 → 再驗 index 與 SHA/工作樹 → push。
     """
     import inspect
 
@@ -82,13 +82,14 @@ def test_guard_runs_before_commit_in_main():
     # [2026-07-30 外審 P2-08] 關卡多了 emergency 參數 → 用「呼叫的開頭」定位而不是
     # 逐字比對。這條測試守的是【順序】，不是那一行長什麼樣子。
     i_gate = src.index("step_quality_gate(")
-    i_verify = src.index("verify_unchanged_since_tests(")
+    i_verify = src.rindex("verify_clean_revision(")
     i_stage = src.index("step5_stage()")
     i_index = src.index("verify_index_matches(")
     i_commit = src.index("step5_commit(")
+    i_push = src.index("step6_push(")
     assert i_snap < i_gate, "指紋必須在品質關卡【之前】取,否則基準本身可能已被污染"
-    assert i_gate < i_verify < i_stage < i_index < i_commit, \
-        "驗證 → stage → 驗 index → commit,順序不可調換"
+    assert i_snap < i_stage < i_index < i_commit < i_gate < i_verify < i_push, \
+        "生成/提交最終版本後才跑 CI，並在 push 前確認版本沒有漂移"
 
 
 def test_index_check_catches_content_swapped_after_add(tmp_path, monkeypatch):
