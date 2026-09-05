@@ -12,6 +12,20 @@ from cmuh_common.roster.export_common import (
 from cmuh_common.roster.model import is_weekend, week_matrix
 
 
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _set_excel_safe_text(cell, value) -> None:
+    """Write external text without turning a leading formula marker into code."""
+    cell.value = value
+    if isinstance(value, str) and value.startswith(_FORMULA_PREFIXES):
+        # Assigning a leading '=' makes openpyxl infer a formula. Override the
+        # XLSX cell type and use Excel's quote-prefix style without changing
+        # the stored/displayed value (a literal apostrophe would corrupt it).
+        cell.data_type = "s"
+        cell.quotePrefix = True
+
+
 def export(path: str, data: dict) -> None:
     from openpyxl import Workbook  # noqa: PLC0415 (lazy 重依賴)
     from openpyxl.styles import Alignment
@@ -91,8 +105,9 @@ def _sheet_summary(ws, data: dict) -> None:
             else:
                 name = f"{name}(已離)"
                 bal_cell = "—"        # 帳本已作廢，印 0.0 會被誤讀成「餘額歸零」
-            ws.append([scope.upper(), name,
+            ws.append([scope.upper(), None,
                        t["wd"], t["we"], t["wd"] + t["we"], t["pt"], bal_cell])
+            _set_excel_safe_text(ws.cell(row=row, column=2), name)
             row += 1
     for c, w in zip("ABCDEFG", (6, 10, 6, 6, 6, 6, 8), strict=True):
         ws.column_dimensions[c].width = w
@@ -121,7 +136,7 @@ def _sheet_day_schedule(ws, data: dict) -> None:
         for sess, cells in blk["sessions"]:
             ws.cell(row=row, column=1, value=sess).font = Font(bold=True)
             for c, val in enumerate(cells, start=2):
-                ws.cell(row=row, column=c, value=val)
+                _set_excel_safe_text(ws.cell(row=row, column=c), val)
             ws.row_dimensions[row].height = 40
             row += 1
         row += 1                                   # 週之間留空列

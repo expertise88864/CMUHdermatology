@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""探測「醫師上次」清單(TStringAlignGrid)能不能用 UI Automation(UIA)讀到格子文字。
+r"""探測「醫師上次」清單(TStringAlignGrid)能不能用 UI Automation(UIA)讀到格子文字。
 
 Win32 讀不到這種 Delphi 畫上去的格子;UIA 是另一套 API,有機會讀得到。本工具只「讀」、
 不點任何按鈕、不改任何資料,安全。

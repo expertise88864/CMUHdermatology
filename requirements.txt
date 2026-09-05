@@ -14,6 +14,7 @@
 # 0.x and date-based packages get no upper bound (semver does not apply).
 
 # ===== main app + roster =====
+packaging>=23.2,<27
 requests>=2.31.0,<3
 beautifulsoup4>=4.12.0,<5
 lxml>=5.0.0,<7

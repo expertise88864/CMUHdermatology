@@ -165,7 +165,17 @@ RESTART_HANDSHAKE_ENV = "CMUH_RESTART_HANDSHAKE"
 RESTART_READY_EVENT_ENV = "CMUH_RESTART_READY_EVENT"
 _EVENT_MODIFY_STATE = 0x0002
 _WAIT_OBJECT_0 = 0
+_WAIT_TIMEOUT = 0x102
 _READY_EVENT_NAME: list = [None]     # 子行程端 latch(與交握檔同樣不外洩給孫行程)
+#: [外審 r11] 子行程端★在宣告 ev 能力之前就開好★的 event handle。
+#: None=還沒試過;0=試過但開不起來(於是不宣告);int=已持有,READY 時直接 SetEvent。
+_READY_EVENT_HANDLE: list = [None]
+#: [外審 r11] 父行程的事件探針要★三態★。舊版把「沒設」與「證不出來」(WAIT_FAILED、
+#: 例外、handle 無效)壓成同一個 False,而那個 False 會被當成「子行程卡死」的正面證據
+#: 去終止一個 process —— 這跟本 repo 對資料早就成立的 UNKNOWN 原則自相矛盾。
+READY_EVENT_SET = "ready_event_set"
+READY_EVENT_NOT_SET = "ready_event_not_set"
+READY_EVENT_UNKNOWN = "ready_event_unknown"
 HANDSHAKE_WAITING_MUTEX = "waiting_mutex"
 HANDSHAKE_READY = "ready"
 HANDSHAKE_LEGACY_GRACE_SEC = 3.0      # 從未看到交握檔 → 視為舊版子行程的寬限
@@ -237,43 +247,81 @@ def create_ready_event(name: str):
         return None
 
 
+def open_ready_event():
+    """子行程端:★在宣告能力之前★就把 READY 事件開起來,並把 handle 留到行程結束。
+    回 handle(int)或 None;只嘗試一次(結果 latch 住)。
+
+    [外審 r11] 這是「宣告 ev」的★證明★。舊版只看環境變數裡有沒有事件名就宣告
+    capable,而真正的 OpenEventW 要等 READY 那一刻才第一次做 —— 於是「拿到名字但
+    其實開不起來」的子行程會宣告 capable,健康卻在 READY 時兩條通道都失敗,被父行程
+    當成卡死而終止。先開先證明,capability 才有意義。
+    """
+    if _READY_EVENT_HANDLE[0] is None:
+        _READY_EVENT_HANDLE[0] = 0            # 先記「已嘗試」,失敗就停在 0
+        name = _latch_ready_event_name()
+        if name and os.name == "nt":
+            try:
+                import ctypes as _ct
+                from ctypes import wintypes as _wt
+                k32 = _ct.WinDLL("kernel32", use_last_error=True)
+                k32.OpenEventW.argtypes = [_wt.DWORD, _wt.BOOL, _wt.LPCWSTR]
+                k32.OpenEventW.restype = _wt.HANDLE
+                h = k32.OpenEventW(_EVENT_MODIFY_STATE, False, name)
+                _READY_EVENT_HANDLE[0] = int(h) if h else 0
+            except Exception:
+                import logging as _logging
+                _logging.debug("[restart_handshake] 開啟 READY 事件失敗", exc_info=True)
+    return _READY_EVENT_HANDLE[0] or None
+
+
 def signal_ready_event() -> bool:
-    """子行程端:把 READY 事件設起來。沒有事件名/開不起來 → False(呼叫端退回檔案通道)。"""
-    name = _latch_ready_event_name()
-    if not name or os.name != "nt":
+    """子行程端:把 READY 事件設起來(用 PRE-READY 時就開好、留住的 handle)。
+    沒開成 → False(呼叫端退回檔案通道,而且這種子行程一開始就沒宣告 ev)。"""
+    h = open_ready_event()
+    if not h:
         return False
     try:
         import ctypes as _ct
         from ctypes import wintypes as _wt
         k32 = _ct.WinDLL("kernel32", use_last_error=True)
-        k32.OpenEventW.argtypes = [_wt.DWORD, _wt.BOOL, _wt.LPCWSTR]
-        k32.OpenEventW.restype = _wt.HANDLE
-        h = k32.OpenEventW(_EVENT_MODIFY_STATE, False, name)
-        if not h:
-            return False
-        try:
-            return bool(k32.SetEvent(_wt.HANDLE(h)))
-        finally:
-            k32.CloseHandle(_wt.HANDLE(h))
+        return bool(k32.SetEvent(_wt.HANDLE(h)))
     except Exception:
         import logging as _logging
         _logging.debug("[restart_handshake] 設定 READY 事件失敗", exc_info=True)
         return False
 
 
-def ready_event_is_set(handle) -> bool:
-    """父行程端:事件是否已被子行程設起來(不阻塞)。"""
+def ready_event_state(handle) -> str:
+    """父行程端★三態★探針:READY_EVENT_SET / NOT_SET / UNKNOWN(不阻塞)。
+
+    只有 NOT_SET 才是「子行程真的還沒就緒」的證據;WAIT_FAILED、例外、handle 無效
+    一律 UNKNOWN —— 證不出來的事不可以拿去當終止一個 process 的理由。
+    """
     if not handle or os.name != "nt":
-        return False
+        return READY_EVENT_UNKNOWN
     try:
         import ctypes as _ct
         from ctypes import wintypes as _wt
         k32 = _ct.WinDLL("kernel32", use_last_error=True)
         k32.WaitForSingleObject.argtypes = [_wt.HANDLE, _wt.DWORD]
         k32.WaitForSingleObject.restype = _wt.DWORD
-        return k32.WaitForSingleObject(_wt.HANDLE(handle), 0) == _WAIT_OBJECT_0
+        rc = k32.WaitForSingleObject(_wt.HANDLE(handle), 0)
     except Exception:
-        return False
+        import logging as _logging
+        _logging.debug("[restart_handshake] 查詢 READY 事件失敗", exc_info=True)
+        return READY_EVENT_UNKNOWN
+    return classify_wait_result(rc)
+
+
+def classify_wait_result(rc) -> str:
+    """`WaitForSingleObject` 的回傳碼 → 三態(純函式,好測)。
+    ★只有 WAIT_TIMEOUT 才是「確定還沒設」★;WAIT_FAILED(0xFFFFFFFF)、WAIT_ABANDONED
+    與任何不認得的碼都是 UNKNOWN —— 把它們算成 NOT_SET 等於拿 API 失敗當卡死的證據。"""
+    if rc == _WAIT_OBJECT_0:
+        return READY_EVENT_SET
+    if rc == _WAIT_TIMEOUT:
+        return READY_EVENT_NOT_SET
+    return READY_EVENT_UNKNOWN
 
 
 def close_handle(handle) -> None:
@@ -357,7 +405,7 @@ HANDSHAKE_CAP_EVENT = "ev"
 
 def _caps_suffix() -> str:
     """本行程能提供的交握能力(附在 payload 後面;舊版讀不到也不會壞:多餘欄位會被忽略)。"""
-    return f" {HANDSHAKE_CAP_EVENT}" if _latch_ready_event_name() else ""
+    return f" {HANDSHAKE_CAP_EVENT}" if open_ready_event() else ""
 
 
 def read_handshake_ex(path: str, expect_pid=None):
@@ -406,16 +454,29 @@ def wait_for_handover(proc, handshake_path: str, *, on_preready=None, on_confirm
     preready_done = False
     saw_file = False          # 交握檔存在過(內容有效與否都算)
     warned_invalid = False
+    warned_event_unknown = False
     expect_pid = getattr(proc, "pid", None)          # ★只認直接子行程的 PID★
     # [外審 r10-4] ★有沒有可靠的 READY 通道★決定「沒有 READY」能不能當成證據:
     # 具名事件在 → 缺席就是卡死的證據,父行程有立場收回單例;事件建不出來(非 Windows /
     # API 失敗)→ 退回舊行為(缺席不算證據,OWNER_OTHER 一律當交棒成立)。
-    _event_probe = ready_event_probe or ready_event_is_set
-    reliable_ready = ready_event is not None
+    _event_probe = ready_event_probe or ready_event_state
     child_declared_event = False     # ★由子行程自己宣告★,不是父行程推測
 
-    def _event_set() -> bool:
-        return bool(ready_event is not None and _event_probe(ready_event))
+    def _event_state() -> str:
+        """READY 事件的三態。沒有事件(非 Windows / 建不出來)也是 UNKNOWN ——
+        「證不出來」永遠不可以被當成「子行程沒就緒」的證據。"""
+        nonlocal warned_event_unknown
+        if ready_event is None:
+            return READY_EVENT_UNKNOWN
+        state = _event_probe(ready_event)
+        if state == READY_EVENT_UNKNOWN and not warned_event_unknown:
+            warned_event_unknown = True
+            _logging.warning(
+                "[restart_self] READY 事件探針無法判定(handle=%s); "
+                "本輪不會把缺少 READY 當成終止子行程的證據",
+                ready_event,
+            )
+        return state
 
     def _terminate_child(why: str) -> None:
         """[外審 r10-2] 終止★直接子行程★:走到這裡它已經不可能是合法接手者了。
@@ -454,7 +515,7 @@ def wait_for_handover(proc, handshake_path: str, *, on_preready=None, on_confirm
         sleep(poll_interval)
         rc = proc.poll()
         state, present, caps = read_handshake_ex(handshake_path, expect_pid)
-        if state != HANDSHAKE_READY and _event_set():
+        if state != HANDSHAKE_READY and _event_state() == READY_EVENT_SET:
             state = HANDSHAKE_READY          # 具名事件是 READY 的主通道(不碰檔案系統)
         if state is not None:
             if HANDSHAKE_CAP_EVENT in caps:
@@ -527,10 +588,14 @@ def wait_for_handover(proc, handshake_path: str, *, on_preready=None, on_confirm
                     "[restart_self] 新行程 %.0fs 未回報 READY,而且★查不出誰持有單例★ → "
                     "不假裝接手成功,交由呼叫端安全退場", elapsed)
                 return SPAWN_RECOVERY_FAILED
-            if owner == OWNER_OTHER and reliable_ready and child_declared_event:
+            if (owner == OWNER_OTHER and child_declared_event
+                    and _event_state() == READY_EVENT_NOT_SET):
                 # [外審 r10-4] ★有可靠通道時,缺席的 READY 就是證據★:子行程送過交握
                 # (capable),而 READY 走的是具名事件(核心物件,不碰檔案系統)—— 它拿了
                 # 單例卻始終沒 SetEvent,那不是「訊號遺失」,是卡在單例之後。
+                # ★[外審 r11] 必須是 NOT_SET,不能是 UNKNOWN★(沒有事件通道時也是
+                # UNKNOWN,所以「有沒有可靠通道」不必再另外判一次):探針自己壞掉(WAIT_FAILED /
+                # 例外)時我們證不出子行程有沒有就緒,那時終止它就是拿「查不到」當證據。
                 # 這時★不可以退出★:卡死的子行程持有單例,使用者連手動重開都會被
                 # 「已在執行中」擋掉,只能去工作管理員砍行程。父行程收回單例才是出路。
                 _logging.error(

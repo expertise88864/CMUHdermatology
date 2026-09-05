@@ -117,7 +117,7 @@ def main_uncertain_block():
 
 # ── 外審補強 ────────────────────────────────────────────────────────────────
 def test_no_control_characters_in_dose_regexes():
-    """★踩過的坑★ 在腳本裡寫 regex 時 `\b` 少一層跳脫會變成真正的 U+0008 backspace
+    r"""★踩過的坑★ 在腳本裡寫 regex 時 `\b` 少一層跳脫會變成真正的 U+0008 backspace
     控制字元 —— regex 看起來像 `\bup\s+to`,實際是「backspace + up」,永遠不會命中,
     而且肉眼與一般編輯器都看不出來。整個模組掃一次。"""
     import io

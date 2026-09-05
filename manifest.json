@@ -219,14 +219,21 @@
       "remote_path": "src/cmuh_common/deps_installer.py",
       "local_filename": "src/cmuh_common/deps_installer.py",
       "version": "2026.09.04.4",
-      "sha256": "570702647e0db8518b93c237e0eb86a17c0f68793cb9b46f1f3799ad905e3377"
+      "sha256": "056af3cdf0d3b95fdf1a8df81f61a2b8cb7f656a56db9509fecc6af2323127a9"
+    },
+    {
+      "key": "cmuh_common.deps_manifest",
+      "remote_path": "src/cmuh_common/deps_manifest.py",
+      "local_filename": "src/cmuh_common/deps_manifest.py",
+      "version": "2026.09.04.4",
+      "sha256": "a137fc72a5c8c12ca76188f81035feb85268d335fb6602ff49947192fd7a3b07"
     },
     {
       "key": "cmuh_common.deps_runtime",
       "remote_path": "src/cmuh_common/deps_runtime.py",
       "local_filename": "src/cmuh_common/deps_runtime.py",
       "version": "2026.09.04.4",
-      "sha256": "27094807c069a7a84f9658da09315c1ef88bcd3519e7cf3adb2e2c01ff80bea5"
+      "sha256": "b53fc613a4bbb0ed46531e64adb907e6fd538d491ae8a4bfa9b61d42e68c7244"
     },
     {
       "key": "cmuh_common.ditto_card_ocr",
@@ -366,7 +373,7 @@
       "remote_path": "src/cmuh_common/paths.py",
       "local_filename": "src/cmuh_common/paths.py",
       "version": "2026.09.04.4",
-      "sha256": "1ecc014e4c3eefffbebcbcd0c8964edf569e4aa2b01eebfa40c12a162eea3e53"
+      "sha256": "7513582bef1886b0fb6a0911b081935bb7b8b858e01cf2341999c759ada199ce"
     },
     {
       "key": "cmuh_common.patient_locator",
@@ -520,7 +527,7 @@
       "remote_path": "src/cmuh_common/roster/export_xlsx.py",
       "local_filename": "src/cmuh_common/roster/export_xlsx.py",
       "version": "2026.09.04.4",
-      "sha256": "4426a281922abb121144b2c061669fc46ac6e9628d7a979ca6927009ea473eec"
+      "sha256": "35b332c79b8ffcf1b7106329a07308e6adc0c66c21ecb60334d10957e686403b"
     },
     {
       "key": "cmuh_common.roster.fingerprint",
@@ -807,7 +814,7 @@
       "remote_path": "src/main.py",
       "local_filename": "src/main.py",
       "version": "2026.09.04.4",
-      "sha256": "5b2eb964f5eb0a9ae3d273eba8295a544bac0458205abffd08c67987e33118a7"
+      "sha256": "2195dc8f839f0175855356aa64b732a81fa01c04b9521beae15b83ad62d14cd7"
     },
     {
       "key": "scheduler",
@@ -989,7 +996,7 @@
       "remote_path": "requirements.txt",
       "local_filename": "requirements.txt",
       "version": "2026.09.04.4",
-      "sha256": "0d9bcf74c8cd6bc8189eef31e8634cfc4212267e2732a65f4d6c50b6ef448722"
+      "sha256": "05c58d6e1bb2807cee74aee8b59a4a9d6d3cb2031c2ba07cc168728f0e90ffcb"
     }
   ]
 }

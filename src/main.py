@@ -1041,6 +1041,8 @@ def _initialize_status_driver():
 _status_driver_pool = {
     "driver": None,
     "last_used": 0.0,
+    # 每次切離 driver 都遞增；讓仍在健康檢查／初始化的舊 caller 知道自己已失效。
+    "epoch": 0,
     "lock": threading.Lock(),
     "init_lock": threading.Lock(),
 }
@@ -1088,55 +1090,54 @@ def _get_or_create_status_driver():
     """
     import time as _t
     pool = _status_driver_pool
-    old_driver_to_quit = None
-    need_init = False
+    while True:
+        old_driver_to_quit = None
+        with pool["lock"]:
+            driver = pool["driver"]
+            now = _t.time()
+            if (driver is not None
+                    and (now - pool["last_used"]) > _STATUS_DRIVER_IDLE_TIMEOUT):
+                old_driver_to_quit = driver
+                pool["driver"] = None
+                pool["last_used"] = 0.0
+                pool["epoch"] += 1
+                driver = None
 
-    with pool["lock"]:
-        driver = pool["driver"]
-        now = _t.time()
-        # 若 idle 超時，先標記重建
-        if driver is not None and (now - pool["last_used"]) > _STATUS_DRIVER_IDLE_TIMEOUT:
-            old_driver_to_quit = driver
-            driver = None
-            pool["driver"] = None
-        # 健康檢查（驗證 driver 仍可用）
+        if old_driver_to_quit is not None:
+            _discard_status_driver(old_driver_to_quit)
+
         if driver is not None:
+            # WebDriver RPC 可能永久卡住，絕不可持 pool lock 呼叫。否則 180 秒
+            # 接管想 detach 舊 driver 時會連 UI thread 一起卡在這把鎖上。
             try:
-                _ = driver.window_handles  # 觸發一次 RPC 確認 driver 還活著
+                _ = driver.window_handles
             except Exception:
                 logging.info("既有 status driver 已死，重建")
-                old_driver_to_quit = driver
-                driver = None
-                pool["driver"] = None
-        if driver is None:
-            need_init = True
-
-    # 鎖外 quit 舊 driver
-    if old_driver_to_quit is not None:
-        try:
-            old_driver_to_quit.quit()
-        except Exception:
-            logging.debug("status driver quit 失敗", exc_info=True)
-
-    if need_init:
-        # initialize 走網路，不能持 pool lock；但要防止多個 refresh 同時
-        # 看到 None 而各自開一個 Chrome，造成被覆蓋的 driver 殘留。
-        with pool["init_lock"]:
+                _discard_status_driver(driver)
+                continue
             with pool["lock"]:
-                driver = pool["driver"]
-                if driver is not None:
+                # 健康檢查期間可能已被超齡接管切離；舊 driver 不可再交給 caller。
+                if pool["driver"] is driver:
                     pool["last_used"] = _t.time()
                     return driver
+            return None
 
-            driver = _initialize_status_driver()
+        # initialize 走網路，不能持 pool lock；init_lock 防多個 caller 各開一個 Chrome。
+        with pool["init_lock"]:
             with pool["lock"]:
-                pool["driver"] = driver
-                pool["last_used"] = _t.time()
-        return driver
-
-    with pool["lock"]:
-        pool["last_used"] = _t.time()
-    return driver
+                if pool["driver"] is not None:
+                    continue
+                init_epoch = pool["epoch"]
+            candidate = _initialize_status_driver()
+            with pool["lock"]:
+                if pool["driver"] is None and pool["epoch"] == init_epoch:
+                    pool["driver"] = candidate
+                    pool["last_used"] = _t.time()
+                    return candidate
+            # 初始化期間已被超齡接管切離；這個舊 caller 不可重試後拿到新 session。
+            if candidate is not None:
+                _discard_status_driver(candidate)
+            return None
 
 
 # 丟棄 driver 時 graceful quit 的寬限秒數;逾時依該 driver 的 chromedriver PID 砍行程樹
@@ -1163,6 +1164,8 @@ def _discard_status_driver(failed_driver=None) -> None:
         cur = pool["driver"]
         if failed_driver is None or cur is failed_driver:
             pool["driver"] = None
+            pool["last_used"] = 0.0
+            pool["epoch"] += 1
             to_quit = cur if cur is not None else failed_driver
         else:
             to_quit = failed_driver   # 池中已是新 driver → 不動池,只收失敗的那份
@@ -1509,6 +1512,18 @@ _UPDATE_RESTART_RECHECK_MS = 5000         # 忙碌時每 5 秒重查一次
 # ★使用者定案(2026-09-02):絕不腰斬,改由人工決定★ —— 到頂之後只是持續等待
 # 並把狀態講給使用者聽(他確認過 HIS 畫面後自己關掉重開,更新即生效)。
 _UPDATE_RESTART_MAX_DEFER_ATTEMPTS = 180
+#: 到頂之後「還在等」的提醒節流間隔。
+#: ★[外審 r11] 哨兵是 None 不是 0.0★:`time.monotonic()` 是★開機以來★的秒數,
+#: 拿 0.0 當「從未通知過」等於宣稱「上次通知發生在開機那一刻」—— 開機未滿本間隔時
+#: 這個式子會把★第一次★的提醒吞掉。目前 attempts 要 180×5 秒=15 分鐘才會到頂,
+#: 所以生產上還碰不到;但那是靠另一個常數擋著,不是這個判斷式自己成立
+#: (重查間隔一旦調快就會踩到),而測試已經因此變成看 runner 開機多久的擲骰子。
+_RESTART_WAIT_NOTICE_INTERVAL_SEC = 600.0
+
+
+def _restart_monotonic() -> float:
+    """Clock seam for restart-notice throttling and deterministic tests."""
+    return time.monotonic()
 
 
 # =============================================================================
@@ -9537,6 +9552,8 @@ class AutomationApp:
             pool = _status_driver_pool
             with pool["lock"]:
                 pool["driver"] = None
+                pool["last_used"] = 0.0
+                pool["epoch"] += 1
         except Exception:
             logging.debug("status driver pool reset 失敗", exc_info=True)
 
@@ -9719,9 +9736,10 @@ class AutomationApp:
         if attempts >= _UPDATE_RESTART_MAX_DEFER_ATTEMPTS:
             # ★絕不強制★ 停在上限值繼續等閒置。提醒用時間戳節流
             #   (attempts 已凍結,拿它取模的話提醒只會出現一次)。
-            _last = getattr(self, "_reg52_restart_wait_last_log", 0.0)
-            if time.monotonic() - _last > 600.0:
-                self._reg52_restart_wait_last_log = time.monotonic()
+            _now = _restart_monotonic()
+            _last = getattr(self, "_reg52_restart_wait_last_log", None)
+            if _last is None or _now - _last > _RESTART_WAIT_NOTICE_INTERVAL_SEC:
+                self._reg52_restart_wait_last_log = _now
                 logging.warning(
                     "[restart] 自動重啟持續等待熱鍵閒置(busy=%s, idle_gap=%.1fs)"
                     " —— 不強制重啟,避免腰斬 HIS 寫入", busy, idle_gap)
@@ -16038,6 +16056,9 @@ class AutomationApp:
                 return
             logging.warning(
                 "打卡狀態上一輪查詢疑似卡住(>%d秒)，強制開新一輪", _CLOCK_WORKER_MAX_AGE_SEC)
+            # 先把舊 session 從 pool 原子切離，再提交新 worker。否則新 worker 會拿到
+            # 與卡死舊 worker 同一個 Selenium driver，所謂「接管」只會一起卡住。
+            _discard_status_driver()
 
         # [GPT-5.6 P1 pass1] 世代序號在【發布 querying 之前】就遞增,並讓後續 worker 結果
         # 一律帶 gen 由主緒消費端閘控 → 晚到的舊世代結果一定排在新 querying 之後也會被拒。

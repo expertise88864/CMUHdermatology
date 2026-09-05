@@ -22,6 +22,15 @@ def test_dependency_fingerprint_changes_with_interpreter(monkeypatch):
     assert "exe:" in first
 
 
+def test_dependency_fingerprint_changes_with_manifest_spec(monkeypatch):
+    specs = {"demo": "demo>=1"}
+    monkeypatch.setattr(dr, "_resolve_requirement_spec", lambda pkg: specs[pkg])
+    first = dr._build_fingerprint([("demo", "json")])
+    specs["demo"] = "demo>=2"
+    second = dr._build_fingerprint([("demo", "json")])
+    assert first != second
+
+
 def test_find_missing_libs_reports_transitive_import_failure(monkeypatch):
     def fake_import(name):
         if name == "pyautogui":
@@ -29,11 +38,36 @@ def test_find_missing_libs_reports_transitive_import_failure(monkeypatch):
         return object()
 
     monkeypatch.setattr(dr.importlib, "import_module", fake_import)
+    monkeypatch.setattr(dr, "_distribution_satisfies", lambda _pkg: True)
 
     assert dr._find_missing_libs([
         ("psutil", "psutil"),
         ("pyautogui", "pyautogui"),
     ]) == [("pyautogui", "pyautogui")]
+
+
+def test_find_missing_libs_reports_importable_version_mismatch(monkeypatch):
+    real_import = dr.importlib.import_module
+    monkeypatch.setattr(
+        dr.importlib, "import_module",
+        lambda name: object() if name == "json" else real_import(name),
+    )
+    monkeypatch.setattr(dr, "_resolve_requirement_spec", lambda _pkg: "demo>=2")
+    monkeypatch.setattr(dr.importlib.metadata, "version", lambda _name: "1.0")
+    assert dr._find_missing_libs([("demo", "json")]) == [("demo", "json")]
+
+
+def test_distribution_ignores_an_inactive_environment_marker(monkeypatch):
+    monkeypatch.setattr(
+        dr, "_resolve_requirement_spec",
+        lambda _pkg: "demo>=2; python_version < '1'",
+    )
+
+    def unexpected_version_lookup(_name):
+        raise AssertionError("inactive dependency must not be looked up")
+
+    monkeypatch.setattr(dr.importlib.metadata, "version", unexpected_version_lookup)
+    assert dr._distribution_satisfies("demo") is True
 
 
 def test_all_modules_discoverable_detects_removed_cached_dependency(monkeypatch):
@@ -51,8 +85,22 @@ def test_all_modules_discoverable_detects_removed_cached_dependency(monkeypatch)
 
 def test_all_modules_discoverable_accepts_present_dependencies(monkeypatch):
     monkeypatch.setattr(dr.importlib.util, "find_spec", lambda _name: object())
+    monkeypatch.setattr(dr, "_distribution_satisfies", lambda _pkg: True)
 
     assert dr._all_modules_discoverable([("psutil", "psutil")]) is True
+
+
+def test_cached_dependency_rejects_version_mismatch(monkeypatch):
+    monkeypatch.setattr(dr.importlib.util, "find_spec", lambda _name: object())
+    monkeypatch.setattr(dr, "_distribution_satisfies", lambda _pkg: False)
+    assert dr._all_modules_discoverable([("demo>=2", "json")]) is False
+
+
+def test_packaging_bootstrap_dependency_is_added_once():
+    assert dr._with_packaging_dependency([("requests", "requests")])[0] == (
+        "packaging", "packaging")
+    libs = [("packaging>=23", "packaging"), ("requests", "requests")]
+    assert dr._with_packaging_dependency(libs) == libs
 
 
 def test_dependency_installer_window_is_destroyed_when_mainloop_fails(

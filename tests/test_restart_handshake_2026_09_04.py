@@ -35,6 +35,8 @@ _SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 def _fresh_latch(monkeypatch):
     """交握路徑是行程內 latch 一次的;每個測試都要從「還沒 latch」開始。"""
     monkeypatch.setattr(paths, "_HANDSHAKE_PATH", [None])
+    monkeypatch.setattr(paths, "_READY_EVENT_NAME", [None])
+    monkeypatch.setattr(paths, "_READY_EVENT_HANDLE", [None])
     yield
 
 
@@ -148,14 +150,17 @@ def test_alive_without_ready_is_never_enough_to_confirm(tmp_path):
     assert paths.HANDSHAKE_READY_TIMEOUT_SEC == 30.0     # 上面的 30 是固定數,釘住常數
 
 
-def _event_run(sim, owner, *, event_set=False, **kw):
-    """帶★可靠通道★(具名事件)的 waiter:`event_set` 決定子行程有沒有 SetEvent。"""
+def _event_run(sim, owner, *, event_set=False, event_state=None, **kw):
+    """帶★可靠通道★(具名事件)的 waiter。
+    `event_set` 是方便寫法(True→SET、False→NOT_SET);要測 UNKNOWN 就直接給
+    `event_state=paths.READY_EVENT_UNKNOWN`。"""
+    st = event_state or (paths.READY_EVENT_SET if event_set else paths.READY_EVENT_NOT_SET)
     kw.setdefault("on_preready", sim.cb("preready"))
     kw.setdefault("on_confirmed", sim.cb("confirmed"))
     kw.setdefault("on_recover", sim.cb("recover", ret=owner))
     return wait_for_handover(sim, sim.path, now=sim.now, sleep=sim.sleep,
                              stderr_tail=lambda: "", ready_event=1234,
-                             ready_event_probe=lambda _h: event_set, **kw)
+                             ready_event_probe=lambda _h: st, **kw)
 
 
 def test_the_event_channel_distinguishes_a_lost_signal_from_a_hang(tmp_path):
@@ -191,25 +196,114 @@ def test_an_intermediate_version_child_is_never_wedge_terminated(tmp_path):
     assert "terminate" not in [c[0] for c in sim.calls], "中間版本的健康子行程被殺了"
 
 
-def test_the_capability_is_declared_in_the_payload(monkeypatch, tmp_path):
-    """宣告要真的寫進 payload,而且只在本行程確實拿得到事件名時才宣告。"""
+@pytest.mark.skipif(os.name != "nt", reason="具名事件是 Windows 核心物件")
+def test_the_capability_is_declared_only_after_the_event_really_opens(monkeypatch, tmp_path):
+    """★外審 r11 P3-medium★:宣告 `ev` 的意思是「之後我一定送得出 READY」,
+    所以它必須是★已經成功 OpenEvent★的證明,不能只是「環境變數裡有名字」。
+    父行程拿這個宣告去決定「缺席的 READY 算不算卡死的證據」,而那個判定會★終止一個
+    process★ —— 宣告不實 = 健康的子行程在 READY 兩條通道都失敗時被殺掉。"""
+    import uuid
     p = tmp_path / "hs"
-    monkeypatch.setattr(paths, "_HANDSHAKE_PATH", [None])
-    monkeypatch.setattr(paths, "_READY_EVENT_NAME", [None])
-    monkeypatch.setenv(paths.RESTART_HANDSHAKE_ENV, str(p))
-    monkeypatch.setenv(paths.RESTART_READY_EVENT_ENV, "Local\\x")
-    assert restart_handshake_signal(HANDSHAKE_WAITING_MUTEX) is True
-    _st, _present, caps = paths.read_handshake_ex(str(p), os.getpid())
-    assert paths.HANDSHAKE_CAP_EVENT in caps
+    name = f"Local\\CMUH_TEST_CAP_{os.getpid()}_{uuid.uuid4().hex}"
+    parent = paths.create_ready_event(name)          # 父行程真的建了 → 子行程開得起來
+    assert parent
+    try:
+        monkeypatch.setenv(paths.RESTART_HANDSHAKE_ENV, str(p))
+        monkeypatch.setenv(paths.RESTART_READY_EVENT_ENV, name)
+        assert restart_handshake_signal(HANDSHAKE_WAITING_MUTEX) is True
+        _st, _present, caps = paths.read_handshake_ex(str(p), os.getpid())
+        assert paths.HANDSHAKE_CAP_EVENT in caps
+    finally:
+        paths.close_handle(parent)
 
-    # 沒有事件名(父行程沒給)→ 不可以宣告自己會設事件
-    monkeypatch.setattr(paths, "_HANDSHAKE_PATH", [None])
-    monkeypatch.setattr(paths, "_READY_EVENT_NAME", [None])
+
+@pytest.mark.skipif(os.name != "nt", reason="具名事件是 Windows 核心物件")
+def test_a_name_that_cannot_be_opened_must_not_declare_the_capability(monkeypatch, tmp_path):
+    """★外審 r11 建議的 regression 1★:事件名在、但 OpenEvent 失敗(名字根本不存在
+    /ACL 擋住)→ payload ★不可以★宣告 ev,否則父行程會拿一個空頭支票當終止的依據。"""
+    p = tmp_path / "hs"
+    monkeypatch.setenv(paths.RESTART_HANDSHAKE_ENV, str(p))
+    monkeypatch.setenv(paths.RESTART_READY_EVENT_ENV,
+                       "Local\\CMUH_TEST_NO_SUCH_EVENT_%d" % os.getpid())
+    assert paths.open_ready_event() is None, "前提:這個名字開不起來"
+    assert restart_handshake_signal(HANDSHAKE_WAITING_MUTEX) is True   # 檔案通道仍要送
+    _st, _present, caps = paths.read_handshake_ex(str(p), os.getpid())
+    assert paths.HANDSHAKE_CAP_EVENT not in caps, "開不起來卻宣告了 ev"
+
+
+def test_no_event_name_means_no_capability(monkeypatch, tmp_path):
+    """父行程沒給事件名(非 Windows / 建不出來)→ 一樣不可以宣告。"""
+    p = tmp_path / "hs"
     monkeypatch.setenv(paths.RESTART_HANDSHAKE_ENV, str(p))
     monkeypatch.delenv(paths.RESTART_READY_EVENT_ENV, raising=False)
     assert restart_handshake_signal(HANDSHAKE_WAITING_MUTEX) is True
-    _st2, _pr2, caps2 = paths.read_handshake_ex(str(p), os.getpid())
-    assert paths.HANDSHAKE_CAP_EVENT not in caps2
+    _st, _present, caps = paths.read_handshake_ex(str(p), os.getpid())
+    assert paths.HANDSHAKE_CAP_EVENT not in caps
+
+
+@pytest.mark.skipif(os.name != "nt", reason="具名事件是 Windows 核心物件")
+def test_ready_uses_the_retained_handle_not_the_name(monkeypatch, tmp_path):
+    """★留住 handle 的意義★:READY 那一刻不可以再去「重新解析名字 + 重開」——
+    那正是外審指出的破口(宣告時能開、送出時未必)。這裡把名字拿掉,SetEvent 仍要成功。"""
+    import uuid
+    name = f"Local\\CMUH_TEST_HOLD_{os.getpid()}_{uuid.uuid4().hex}"
+    parent = paths.create_ready_event(name)
+    assert parent
+    try:
+        monkeypatch.setenv(paths.RESTART_READY_EVENT_ENV, name)
+        assert paths.open_ready_event(), "PRE-READY 時要開好"
+        monkeypatch.setattr(paths, "_READY_EVENT_NAME", [""])   # 名字沒了,handle 還在
+        assert paths.signal_ready_event() is True
+        assert paths.ready_event_state(parent) == paths.READY_EVENT_SET
+    finally:
+        paths.close_handle(parent)
+
+
+def test_wait_failed_is_unknown_not_not_set():
+    """★這條才量得到分類本身★(上面那條走的是 probe 樁,碰不到 rc→state 的對應)。
+    WAIT_FAILED / WAIT_ABANDONED / 不認得的碼都是 UNKNOWN;只有 WAIT_TIMEOUT 是
+    「確定還沒設」。把 API 失敗算成 NOT_SET = 拿 API 壞掉當子行程卡死的證據。"""
+    c = paths.classify_wait_result
+    assert c(0) == paths.READY_EVENT_SET                      # WAIT_OBJECT_0
+    assert c(0x102) == paths.READY_EVENT_NOT_SET              # WAIT_TIMEOUT
+    assert c(0xFFFFFFFF) == paths.READY_EVENT_UNKNOWN         # WAIT_FAILED
+    assert c(0x80) == paths.READY_EVENT_UNKNOWN               # WAIT_ABANDONED
+    assert c(12345) == paths.READY_EVENT_UNKNOWN              # 不認得
+
+
+def test_an_unprovable_event_state_is_not_evidence_of_a_hang(tmp_path, caplog):
+    """★外審 r11 建議的 regression 3★:探針回 UNKNOWN(WAIT_FAILED / 例外 / handle 壞掉)
+    ★不可以★被解讀成「子行程沒 READY」。證不出來就不是證據 —— 不終止、當交棒成立。"""
+    sim = _Sim(str(tmp_path / "hs"), writes={0.2: HANDSHAKE_WAITING_MUTEX})
+    with caplog.at_level("WARNING"):
+        out = _event_run(sim, paths.OWNER_OTHER, event_state=paths.READY_EVENT_UNKNOWN)
+    assert out == HANDOVER_CONFIRMED
+    assert "terminate" not in [c[0] for c in sim.calls], "拿『查不到』當證據殺了子行程"
+    assert caplog.text.count("READY 事件探針無法判定") == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="具名事件是 Windows 核心物件")
+def test_a_retained_handle_sets_the_event_even_if_the_file_channel_is_dead(monkeypatch, tmp_path):
+    """★外審 r11 建議的 regression 2★:子行程已持有 handle + 檔案通道永遠失敗
+    → SetEvent 仍成功 → READY 送得到(回 True),父行程看得到 SET。"""
+    import uuid
+    name = f"Local\\CMUH_TEST_RETAIN_{os.getpid()}_{uuid.uuid4().hex}"
+    parent = paths.create_ready_event(name)
+    assert parent
+    try:
+        monkeypatch.setenv(paths.RESTART_HANDSHAKE_ENV, str(tmp_path / "hs"))
+        monkeypatch.setenv(paths.RESTART_READY_EVENT_ENV, name)
+        monkeypatch.setattr(paths, "HANDSHAKE_SIGNAL_RETRY_SEC", 0.0)
+        assert paths.open_ready_event(), "PRE-READY 時就要開好並留住 handle"
+
+        def _denied(path, *a, **k):
+            raise OSError(errno.EACCES, "denied")
+        monkeypatch.setattr("builtins.open", _denied)
+        assert restart_handshake_signal(HANDSHAKE_READY) is True
+        monkeypatch.undo()
+        assert paths.ready_event_state(parent) == paths.READY_EVENT_SET
+    finally:
+        paths.close_handle(parent)
 
 
 def test_an_old_two_field_payload_still_parses(tmp_path):
@@ -427,7 +521,7 @@ def test_the_named_event_really_round_trips_between_processes(tmp_path, monkeypa
     h = paths.create_ready_event(name)
     assert h, "父行程要建得出事件"
     try:
-        assert paths.ready_event_is_set(h) is False
+        assert paths.ready_event_state(h) == paths.READY_EVENT_NOT_SET
         child = ("import sys; sys.path.insert(0, sys.argv[1]);"
                  "from cmuh_common import paths as p;"
                  "import os; os.environ[p.RESTART_READY_EVENT_ENV] = sys.argv[2];"
@@ -435,7 +529,8 @@ def test_the_named_event_really_round_trips_between_processes(tmp_path, monkeypa
         r = subprocess.run([sys.executable, "-c", child, os.path.abspath(_SRC), name],
                            capture_output=True, timeout=60)
         assert r.returncode == 0, r.stderr[-400:]
-        assert paths.ready_event_is_set(h) is True, "子行程 SetEvent 之後父行程要看得到"
+        assert (paths.ready_event_state(h) == paths.READY_EVENT_SET), (
+            "子行程 SetEvent 之後父行程要看得到")
     finally:
         paths.close_handle(h)
 
@@ -444,7 +539,7 @@ def test_signalling_without_an_event_name_is_a_noop(monkeypatch):
     monkeypatch.setattr(paths, "_READY_EVENT_NAME", [None])
     monkeypatch.delenv(paths.RESTART_READY_EVENT_ENV, raising=False)
     assert paths.signal_ready_event() is False
-    assert paths.ready_event_is_set(None) is False
+    assert paths.ready_event_state(None) == paths.READY_EVENT_UNKNOWN
 
 
 def test_the_event_name_is_latched_and_removed_from_the_environment(monkeypatch):

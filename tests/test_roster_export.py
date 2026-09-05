@@ -181,6 +181,43 @@ def test_export_xlsx_roundtrip(tmp_path):
     assert a_row[3] == 1 and a_row[5] == 2            # 假日欄=1、點數=2
 
 
+@pytest.mark.parametrize(
+    "dangerous",
+    ["=1+1", "+1+1", "-1+1", "@SUM(A1:A2)", "\tcommand", "\rcommand"],
+)
+def test_export_xlsx_neutralizes_formula_names(tmp_path, dangerous):
+    pytest.importorskip("openpyxl")
+    from openpyxl import load_workbook
+
+    from cmuh_common.roster import export_xlsx
+    svc = _svc(tmp_path)
+    cfg = svc.storage.load_config()
+    cfg["r_members"][0]["name"] = dangerous
+    svc.storage.save_config(cfg)
+    out = tmp_path / "formula-safe.xlsx"
+    export_xlsx.export(str(out), svc.build_export(YM))
+
+    wb = load_workbook(str(out), data_only=False)
+    cells = [c for row in wb["結算"].iter_rows(min_row=2) for c in row]
+    protected = [c for c in cells if c.value == dangerous]
+    assert protected and protected[0].data_type == "s"
+    assert protected[0].quotePrefix is True
+
+
+def test_excel_safe_text_preserves_blank_and_non_text_values():
+    pytest.importorskip("openpyxl")
+    from openpyxl import Workbook
+
+    from cmuh_common.roster.export_xlsx import _set_excel_safe_text
+
+    ws = Workbook().active
+    _set_excel_safe_text(ws["A1"], None)
+    _set_excel_safe_text(ws["A2"], 42)
+    assert ws["A1"].value is None
+    assert ws["A2"].value == 42
+    assert ws["A2"].data_type == "n"
+
+
 # ─── Word 產檔讀回 ─────────────────────────────────────────────────────────
 def test_export_docx_roundtrip(tmp_path):
     pytest.importorskip("docx")

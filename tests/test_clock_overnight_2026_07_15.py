@@ -34,6 +34,75 @@ class _FakeDriver:
         self.quit_event.set()
 
 
+def test_driver_health_rpc_does_not_hold_pool_lock():
+    """window_handles 若卡住，接管仍必須拿得到 pool lock 去切離舊 driver。"""
+    entered = _threading.Event()
+    release = _threading.Event()
+
+    class _SlowHealthDriver:
+        @property
+        def window_handles(self):
+            entered.set()
+            release.wait(2)
+            return ["tab"]
+
+    pool = main._status_driver_pool
+    with pool["lock"]:
+        saved = (pool["driver"], pool["last_used"], pool["epoch"])
+        pool["driver"] = _SlowHealthDriver()
+        pool["last_used"] = _time.time()
+    worker = _threading.Thread(target=main._get_or_create_status_driver, daemon=True)
+    try:
+        worker.start()
+        assert entered.wait(1), "測試前提：worker 已進入 WebDriver 健康 RPC"
+        acquired = pool["lock"].acquire(timeout=0.3)
+        assert acquired, "WebDriver RPC 卡住時不可持有 pool lock"
+        if acquired:
+            pool["lock"].release()
+    finally:
+        release.set()
+        worker.join(2)
+        with pool["lock"]:
+            pool["driver"], pool["last_used"], pool["epoch"] = saved
+
+
+def test_takeover_invalidates_an_inflight_driver_initialization(monkeypatch):
+    """pool 尚為空時接管也要讓舊 initializer 失效，不能稍後把舊 session 塞回池。"""
+    entered = _threading.Event()
+    release = _threading.Event()
+    candidate = _FakeDriver()
+
+    def slow_initialize():
+        entered.set()
+        release.wait(2)
+        return candidate
+
+    monkeypatch.setattr(main, "_initialize_status_driver", slow_initialize)
+    pool = main._status_driver_pool
+    with pool["lock"]:
+        saved = (pool["driver"], pool["last_used"], pool["epoch"])
+        pool["driver"] = None
+        pool["last_used"] = 0.0
+    result = []
+    worker = _threading.Thread(
+        target=lambda: result.append(main._get_or_create_status_driver()), daemon=True)
+    try:
+        worker.start()
+        assert entered.wait(1), "測試前提：舊 caller 正在初始化 driver"
+        main._discard_status_driver()  # 超齡接管：pool 空也要遞增 epoch
+        release.set()
+        worker.join(2)
+        assert result == [None], "已被接管的舊 initializer 不得回頭取得新 session"
+        with pool["lock"]:
+            assert pool["driver"] is None
+        assert candidate.quit_event.wait(2), "失效 initializer 建出的候選 driver 要回收"
+    finally:
+        release.set()
+        worker.join(2)
+        with pool["lock"]:
+            pool["driver"], pool["last_used"], pool["epoch"] = saved
+
+
 def test_discard_status_driver_empties_pool_and_quits():
     pool = main._status_driver_pool
     with pool["lock"]:

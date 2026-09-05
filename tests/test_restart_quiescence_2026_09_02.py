@@ -162,12 +162,50 @@ class TestNoAutomaticPathMayForce:
 
     def test_the_wait_is_visible_to_the_user(self):
         """★人工出口要有人知道★:程式自己不會腰斬,那麼「一直沒重啟」這件事
-        必須講給看得到 HIS 畫面的人聽,否則就是一道沒有出口的閘門。"""
+        必須講給看得到 HIS 畫面的人聽,否則就是一道沒有出口的閘門。
+
+        ★[外審 r11] 用生產的形狀:第一次到頂★。舊版先塞
+        `_reg52_restart_wait_last_log = 0.0`「讓節流放行」—— 但 `time.monotonic()`
+        是開機以來的秒數,0.0 的意思是「上次通知發生在開機那一刻」,於是這條測試
+        變成看 CI runner 開機多久的擲骰子(開機未滿 600 秒就紅)。
+        """
         h = _Host(busy=True)
         _busy_now()
-        h._reg52_restart_wait_last_log = 0.0     # 讓節流放行
         h._restart_when_hotkey_idle(m._UPDATE_RESTART_MAX_DEFER_ATTEMPTS)
         assert h.notified, "★到頂了卻沒有任何人被告知★"
+
+    def test_the_first_notice_survives_a_freshly_booted_machine(self, monkeypatch):
+        """★這條才量得到哨兵的語義★:機器剛開機(monotonic 還很小),第一次到頂的
+        提醒★不可以★被節流吞掉 —— 「從未通知過」是 None,不是 0.0。"""
+        monkeypatch.setattr(m, "_restart_monotonic", lambda: 5.0)   # 開機 5 秒
+        h = _Host(busy=True)
+        _busy_now()
+        h._restart_when_hotkey_idle(m._UPDATE_RESTART_MAX_DEFER_ATTEMPTS)
+        assert h.notified, "★剛開機時第一次的提醒被節流吞掉★"
+
+    def test_the_notice_is_throttled_after_the_first_one(self, monkeypatch):
+        """節流本身要還在:到頂之後每 5 秒回來一次,不可以每次都彈。
+        ★時間用固定值、另外釘住常數★(推進量不從被測常數算出來,否則常數一改
+        目標跟著移動、突變永遠不紅)。"""
+        assert m._RESTART_WAIT_NOTICE_INTERVAL_SEC == 600.0
+        now = [1000.0]
+        monkeypatch.setattr(m, "_restart_monotonic", lambda: now[0])
+        h = _Host(busy=True)
+        _busy_now()
+        h._restart_when_hotkey_idle(m._UPDATE_RESTART_MAX_DEFER_ATTEMPTS)
+        assert len(h.notified) == 1
+
+        now[0] += 599.0                       # 還在窗口內
+        h._restart_gate_active = False
+        _busy_now()
+        h._restart_when_hotkey_idle(m._UPDATE_RESTART_MAX_DEFER_ATTEMPTS)
+        assert len(h.notified) == 1, "節流失效 → 到頂後每 5 秒彈一次"
+
+        now[0] += 2.0                         # 超過 600 秒
+        h._restart_gate_active = False
+        _busy_now()
+        h._restart_when_hotkey_idle(m._UPDATE_RESTART_MAX_DEFER_ATTEMPTS)
+        assert len(h.notified) == 2, "窗口過了卻不再提醒 → 等待又變成沒有出口"
 
     def test_it_restarts_as_soon_as_the_hotkeys_go_idle(self):
         """★不強制 ≠ 永不重啟★:一閒置(8 秒)就走匯流點重啟。"""

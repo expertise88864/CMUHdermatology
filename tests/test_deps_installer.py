@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""deps_installer 的版本 spec 解析測試（不啟動 Tk UI）。
+"""依賴 manifest 與 installer 純邏輯測試（不啟動 Tk UI）。
 
 只測純函式：_normalize_pkg / _load_requirement_specs / _resolve_pip_spec。
 這些保證 runtime fallback 安裝也吃 requirements.txt 的版本上限 pin。
@@ -14,11 +14,12 @@ if _SRC not in sys.path:
     sys.path.insert(0, os.path.abspath(_SRC))
 
 import cmuh_common.deps_installer as di
+import cmuh_common.deps_manifest as dm
 
 
 @pytest.fixture
 def fake_requirements(tmp_path, monkeypatch):
-    """寫一個臨時 requirements.txt 並讓 deps_installer 讀它。"""
+    """寫臨時 runtime manifests 並讓 GUI-free parser 讀取。"""
     req = tmp_path / "requirements.txt"
     req.write_text(
         "# comment line\n"
@@ -31,51 +32,71 @@ def fake_requirements(tmp_path, monkeypatch):
         "\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(di, "get_app_dir", lambda: str(tmp_path))
+    (tmp_path / "requirements-lazy.txt").write_text(
+        "ortools==9.15.6755\nopenpyxl>=3.1,<4\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dm, "get_app_dir", lambda: str(tmp_path))
     # 清快取，逼它重讀臨時檔
-    monkeypatch.setattr(di, "_REQ_SPECS_CACHE", None, raising=False)
+    monkeypatch.setattr(dm, "_REQ_SPECS_CACHE", None)
     return tmp_path
 
 
 def test_normalize_pkg():
-    assert di._normalize_pkg("Pillow") == "pillow"
-    assert di._normalize_pkg("sv-ttk") == "sv-ttk"
-    assert di._normalize_pkg("sv_ttk") == "sv-ttk"
-    assert di._normalize_pkg("  beautifulsoup4 ") == "beautifulsoup4"
+    assert dm._normalize_pkg("Pillow") == "pillow"
+    assert dm._normalize_pkg("sv-ttk") == "sv-ttk"
+    assert dm._normalize_pkg("sv_ttk") == "sv-ttk"
+    assert dm._normalize_pkg("  beautifulsoup4 ") == "beautifulsoup4"
 
 
 def test_load_requirement_specs_parses_lines(fake_requirements):
-    specs = di._load_requirement_specs()
+    specs = dm._load_requirement_specs()
     assert specs["requests"] == "requests>=2.31.0,<3"
     assert specs["beautifulsoup4"] == "beautifulsoup4>=4.12.0,<5"
     assert specs["pillow"] == "Pillow>=10.0.0,<12"
     # 行內註解要被去掉
     assert specs["sv-ttk"] == "sv-ttk>=2.6.0,<3"
     assert specs["keyboard"] == "keyboard>=0.13.5"
+    assert specs["ortools"] == "ortools==9.15.6755"
+    assert specs["openpyxl"] == "openpyxl>=3.1,<4"
     # 純註解行 / 空行不該進來
     assert "comment" not in specs
 
 
 def test_resolve_pip_spec_uses_pinned_spec(fake_requirements):
-    assert di._resolve_pip_spec("beautifulsoup4") == "beautifulsoup4>=4.12.0,<5"
-    assert di._resolve_pip_spec("Pillow") == "Pillow>=10.0.0,<12"
-    assert di._resolve_pip_spec("pywin32") == "pywin32>=306"
+    assert dm._resolve_pip_spec("beautifulsoup4") == "beautifulsoup4>=4.12.0,<5"
+    assert dm._resolve_pip_spec("Pillow") == "Pillow>=10.0.0,<12"
+    assert dm._resolve_pip_spec("pywin32") == "pywin32>=306"
     # 連字號/底線視為相同
-    assert di._resolve_pip_spec("sv_ttk") == "sv-ttk>=2.6.0,<3"
+    assert dm._resolve_pip_spec("sv_ttk") == "sv-ttk>=2.6.0,<3"
+    assert dm._resolve_pip_spec("openpyxl") == "openpyxl>=3.1,<4"
 
 
 def test_resolve_pip_spec_fallback_bare_name(fake_requirements):
     # requirements.txt 沒列的套件 → 回裸名
-    assert di._resolve_pip_spec("somethingelse") == "somethingelse"
+    assert dm._resolve_pip_spec("somethingelse") == "somethingelse"
 
 
 def test_load_requirement_specs_missing_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(di, "get_app_dir", lambda: str(tmp_path / "nonexistent"))
-    monkeypatch.setattr(di, "_REQ_SPECS_CACHE", None, raising=False)
-    specs = di._load_requirement_specs()
+    monkeypatch.setattr(dm, "get_app_dir", lambda: str(tmp_path / "nonexistent"))
+    monkeypatch.setattr(dm, "_REQ_SPECS_CACHE", None)
+    specs = dm._load_requirement_specs()
     assert specs == {}
     # 缺檔時仍回裸套件名，不爆
-    assert di._resolve_pip_spec("requests") == "requests"
+    assert dm._resolve_pip_spec("requests") == "requests"
+
+
+def test_conflicting_manifests_warn_and_keep_primary(tmp_path, monkeypatch, caplog):
+    (tmp_path / "requirements.txt").write_text("demo>=1,<2\n", encoding="utf-8")
+    (tmp_path / "requirements-lazy.txt").write_text("demo>=2,<3\n", encoding="utf-8")
+    monkeypatch.setattr(dm, "get_app_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(dm, "_REQ_SPECS_CACHE", None)
+
+    with caplog.at_level("WARNING"):
+        specs = dm._load_requirement_specs()
+
+    assert specs["demo"] == "demo>=1,<2"
+    assert "conflicting requirements for demo" in caplog.text
 
 
 def test_pip_python_executable_prefers_console_sibling_for_pythonw(tmp_path):
@@ -112,6 +133,29 @@ def test_rotate_dependency_install_log_moves_large_log(tmp_path):
     assert (tmp_path / "dependency_install.log.bak").read_text(
         encoding="utf-8"
     ) == "long log content"
+
+
+def test_version_mismatch_forces_pip_even_when_import_succeeds(tmp_path, monkeypatch):
+    installer = object.__new__(di.DependencyInstaller)
+    installer.libs = [("demo>=2", "json")]
+    installer.total_libs = 1
+    installer.is_finished = False
+    installer.failed_libs = []
+    installer._repair_libs = {("demo>=2", "json")}
+    installer._closing = False
+    installer.update_ui = lambda *_args: None
+    installer._run_on_ui_thread = lambda _callback: True
+
+    calls = []
+    monkeypatch.setattr(di, "_resolve_pip_spec", lambda pkg: pkg)
+    monkeypatch.setattr(di, "_pip_python_executable", lambda *_args: sys.executable)
+    monkeypatch.setattr(
+        di, "_dependency_install_log_path", lambda: str(tmp_path / "deps.log"))
+    monkeypatch.setattr(di, "_rotate_dependency_install_log", lambda *_args: False)
+    monkeypatch.setattr(di.subprocess, "run", lambda cmd, **_kw: calls.append(cmd))
+
+    installer.run_installation()
+    assert calls and calls[0][3:5] == ["install", "demo>=2"]
 
 
 def test_run_on_ui_thread_ignores_callback_after_close(monkeypatch):

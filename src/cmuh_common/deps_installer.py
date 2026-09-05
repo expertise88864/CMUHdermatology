@@ -11,7 +11,6 @@
 import importlib
 import logging
 import os
-import re
 import subprocess
 import sys
 import threading
@@ -19,52 +18,11 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from cmuh_common.paths import get_app_dir, get_settings_dir
+from cmuh_common.deps_manifest import _resolve_pip_spec
+from cmuh_common.paths import get_settings_dir
 
 
-# requirements.txt 解析快取（每進程讀一次）
-_REQ_SPECS_CACHE: dict | None = None
 _DEPENDENCY_INSTALL_LOG_MAX_BYTES = 2 * 1024 * 1024
-
-
-def _normalize_pkg(name: str) -> str:
-    """pip 套件名正規化：小寫 + 底線/連字號統一（PEP 503 風格）。"""
-    return re.sub(r"[-_.]+", "-", str(name).strip().lower())
-
-
-def _load_requirement_specs() -> dict:
-    """讀 requirements.txt → {normalized_pkg_name: full_spec_line}。
-
-    full_spec_line 例如 'selenium>=4.15.0,<5'（已去除行內註解與多餘空白）。
-    讀不到檔就回空 dict（fallback 用裸套件名安裝）。
-    """
-    global _REQ_SPECS_CACHE
-    if _REQ_SPECS_CACHE is not None:
-        return _REQ_SPECS_CACHE
-    specs: dict = {}
-    try:
-        req_path = os.path.join(get_app_dir(), "requirements.txt")
-        if os.path.exists(req_path):
-            with open(req_path, "r", encoding="utf-8") as f:
-                for raw in f:
-                    line = raw.split("#", 1)[0].strip()  # 去行內註解
-                    if not line:
-                        continue
-                    m = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)", line)
-                    if not m:
-                        continue
-                    specs[_normalize_pkg(m.group(1))] = line
-    except Exception:
-        logging.debug("[deps] 讀 requirements.txt 失敗", exc_info=True)
-    _REQ_SPECS_CACHE = specs
-    return specs
-
-
-def _resolve_pip_spec(pkg_name: str) -> str:
-    """回傳 pip install 用的目標字串：優先 requirements.txt 的完整 spec
-    （含版本上限 pin），找不到就回裸套件名。"""
-    specs = _load_requirement_specs()
-    return specs.get(_normalize_pkg(pkg_name), pkg_name)
 
 
 def _pip_python_executable(executable: str | None = None) -> str:
@@ -109,6 +67,9 @@ class DependencyInstaller(tk.Tk):
         self.total_libs = len(self.libs) or 1
         self.is_finished = False
         self.failed_libs: list = []  # 安裝失敗的套件 pip 名稱
+        # 包含 import 失敗與已安裝版本不符合 spec；後者即使 import 成功也必須
+        # 強制進 pip --upgrade，不能被 run_installation 的 import 快速路徑跳過。
+        self._repair_libs = {tuple(item) for item in missing_libs}
         self._closing = False
 
         is_first_run = len(missing_libs) > 0
@@ -181,6 +142,8 @@ class DependencyInstaller(tk.Tk):
                 return
             self.update_ui(current_progress, f"檢查元件: {pkg_name}...")
             try:
+                if (pkg_name, import_name) in self._repair_libs:
+                    raise ImportError("dependency repair requested")
                 importlib.import_module(import_name)
             except Exception:
                 self.update_ui(current_progress, f"正在下載並安裝: {pkg_name}...")

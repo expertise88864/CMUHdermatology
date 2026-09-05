@@ -8,25 +8,93 @@ Python 升級或 .pyw 關聯切換到另一套 Python 後，快取都會自動�
 """
 import gc
 import importlib
+import importlib.metadata
 import importlib.util
 import logging
 import os
+import re
 import sys
 from typing import Iterable
 
 from cmuh_common.atomic_io import atomic_write_text
+from cmuh_common.deps_manifest import _resolve_pip_spec
 from cmuh_common.paths import get_app_dir, is_frozen
+
+
+_PACKAGING_REQUIREMENT = None
+
+
+def _requirement_class():
+    """Return packaging.Requirement, falling back to pip's vendored copy.
+
+    Dependency verification runs before the app's normal dependencies are
+    repaired, so a fresh Python installation may not have the standalone
+    ``packaging`` distribution yet. pip must exist for the repair path to
+    work, and its vendored parser is sufficient to bootstrap that first run.
+    """
+    global _PACKAGING_REQUIREMENT
+    if _PACKAGING_REQUIREMENT is not None:
+        return _PACKAGING_REQUIREMENT
+    try:
+        module = importlib.import_module("packaging.requirements")
+    except ImportError:
+        module = importlib.import_module("pip._vendor.packaging.requirements")
+    _PACKAGING_REQUIREMENT = module.Requirement
+    return _PACKAGING_REQUIREMENT
+
+
+def _resolve_requirement_spec(pkg_name: str) -> str:
+    """Resolve a bare runtime package name to its manifest version spec."""
+    return _resolve_pip_spec(pkg_name)
+
+
+def _distribution_satisfies(pkg_name: str) -> bool:
+    """Whether the installed distribution satisfies the effective PEP 440 spec."""
+    spec = _resolve_requirement_spec(pkg_name)
+    try:
+        requirement = _requirement_class()(spec)
+    except Exception:
+        logging.warning("無法解析依賴版本規格: %s", spec, exc_info=True)
+        return False
+    if requirement.marker is not None and not requirement.marker.evaluate():
+        return True
+    try:
+        installed = importlib.metadata.version(requirement.name)
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    except Exception:
+        logging.warning("無法讀取依賴版本: %s", requirement.name, exc_info=True)
+        return False
+    if requirement.specifier and not requirement.specifier.contains(
+            installed, prereleases=True):
+        logging.warning(
+            "依賴版本不符: %s 已安裝=%s 需求=%s",
+            requirement.name, installed, requirement.specifier)
+        return False
+    return True
+
+
+def _with_packaging_dependency(required_libs: Iterable[tuple]) -> list[tuple]:
+    """Ensure the version parser itself is maintained as a runtime dependency."""
+    libs = list(required_libs)
+    for pkg, _imp in libs:
+        if re.match(r"^packaging(?:\s|[<>=!~;\[]|$)", str(pkg), re.IGNORECASE):
+            return libs
+    return [("packaging", "packaging"), *libs]
 
 
 def _build_fingerprint(required_libs: Iterable[tuple]) -> str:
     py_ver = f"py{sys.version_info[0]}.{sys.version_info[1]}"
     py_exe = os.path.normcase(os.path.abspath(sys.executable))
-    libs = "|".join(f"{a}:{b}" for a, b in required_libs)
+    # Include resolved manifest specs, not only callers' usually-bare package
+    # names. A requirements floor/pin change must invalidate an old cache.
+    libs = "|".join(f"{_resolve_requirement_spec(a)}:{b}"
+                    for a, b in required_libs)
     return f"{py_ver}|exe:{py_exe}|{libs}"
 
 
 def _find_missing_libs(required_libs: Iterable[tuple]) -> list[tuple]:
-    """回傳無法 import 的套件，包含套件本身與其 transitive import 錯誤。"""
+    """回傳無法 import 或實際版本不符的套件。"""
     missing_libs = []
     for pkg, imp in required_libs:
         try:
@@ -35,16 +103,21 @@ def _find_missing_libs(required_libs: Iterable[tuple]) -> list[tuple]:
             logging.warning("依賴 import 失敗: pip=%s import=%s", pkg, imp,
                             exc_info=True)
             missing_libs.append((pkg, imp))
+            continue
+        if not _distribution_satisfies(pkg):
+            missing_libs.append((pkg, imp))
     return missing_libs
 
 
 def _all_modules_discoverable(required_libs: Iterable[tuple]) -> bool:
-    """Cheap cache guard: detect removed packages without importing heavy modules."""
-    for _pkg, imp in required_libs:
+    """Cheap cache guard: check module presence and version without heavy imports."""
+    for pkg, imp in required_libs:
         try:
             if importlib.util.find_spec(imp) is None:
                 return False
         except Exception:
+            return False
+        if not _distribution_satisfies(pkg):
             return False
     return True
 
@@ -63,6 +136,7 @@ def ensure_dependencies(
     if is_frozen():
         return
 
+    required_libs = _with_packaging_dependency(required_libs)
     fingerprint = _build_fingerprint(required_libs)
     deps_cache_file = os.path.join(get_app_dir(), deps_cache_filename)
 

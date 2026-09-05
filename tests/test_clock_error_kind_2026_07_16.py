@@ -2,8 +2,8 @@
 """打卡查詢錯誤分類 + 世代序號(GPT-5.6 架構審查 P1，2026-07-16)。
 
 1. 錯誤分類:帳密錯(auth)絕不自動重試(防鎖帳號);只有 transient 才重試。
-2. 世代序號:180s age 保險允許卡死舊 worker 尚未結束就開新一輪,兩者共用 driver;
-   舊 worker 晚完成時不得清新一輪的旗標、不得覆寫新結果。
+2. 世代序號:180s age 保險允許卡死舊 worker 尚未結束就開新一輪；接管先切離舊 driver，
+   兩輪不可共用 session；舊 worker 晚完成時不得清新一輪的旗標、不得覆寫新結果。
 """
 import inspect
 import os
@@ -83,6 +83,13 @@ def test_generation_advanced_before_querying():
     assert "generation=gen)" in src, "worker 結果須帶 generation 供主緒閘控"
     assert "self._clock_status_worker_running = False" not in src, \
         "旗標清除已移到主緒消費端(worker 不再跨緒清旗標)"
+
+
+def test_stale_worker_driver_is_detached_before_new_worker_submit():
+    src = inspect.getsource(main.AutomationApp.update_clock_status_from_web)
+    takeover = src[src.index("if self._clock_status_worker_running:"):]
+    assert takeover.index("_discard_status_driver()") < takeover.index("self.bg_executor.submit"), (
+        "超齡接管必須先切離舊 Selenium session，才可提交新 worker")
 
 
 def test_consumer_is_atomic_generation_gate():
