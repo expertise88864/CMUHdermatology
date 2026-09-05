@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -20,6 +21,43 @@ def _has_git() -> bool:
 
 
 pytestmark = pytest.mark.skipif(not _has_git(), reason="git 未安裝")
+
+
+@pytest.fixture(autouse=True)
+def manual_push_timers(monkeypatch):
+    """本檔手動驅動同步；不要讓建構時的 3 秒 timer 搶先改掉測試前提。
+
+    pull_interval_sec=0 只停週期 pull，不停 startup/debounce push。
+    真實背景 timer 的整合覆蓋另在 test_roster_p2_batch_2026_08_19.py
+    與 test_roster_gitsync_uncommitted_2026_08_22.py，這裡不改其行為。
+    """
+    timers = []
+
+    class ManualTimer:
+        def __init__(self, interval, function):
+            self.interval = interval
+            self.function = function
+            self.daemon = False
+            self.started = False
+            self.cancelled = False
+            self.fired = False
+            timers.append(self)
+
+        def start(self):
+            self.started = True
+
+        def cancel(self):
+            self.cancelled = True
+
+        def fire(self):
+            if self.started and not self.cancelled and not self.fired:
+                self.fired = True
+                self.function()
+
+    monkeypatch.setattr(threading, "Timer", ManualTimer)
+    yield timers
+    for timer in timers:
+        timer.cancel()
 
 
 def _git(d, *args):
@@ -361,7 +399,7 @@ def test_push_without_remote_change_does_not_notify(tmp_path):
 
 
 def test_flush_does_not_notify(tmp_path):
-    """關閉前的 flush 不通知 —— mainloop 即將結束,通知只會撞 TclError。"""
+    """只驗 flush：背景 timer 由夾具控制，不可在 flush 前先合法通知。"""
     _remote, a, b = _two_clones(tmp_path)
     st_a = GitSyncStorage(str(a), pull_interval_sec=0)
     notified = []
@@ -374,6 +412,25 @@ def test_flush_does_not_notify(tmp_path):
     assert notified == [], "flush 路徑不通知"
     assert st_b.load_month("2026-08")["r_duty"] == {"2026-08-01": {"person": "A"}}, \
         "但資料仍要正確合併進來"
+
+
+def test_startup_push_before_flush_keeps_its_notification(tmp_path, manual_push_timers):
+    """慢 CI 的實際交錯：B startup push 先於 B.flush，通知本來就應存在。"""
+    _remote, a, b = _two_clones(tmp_path)
+    st_a = GitSyncStorage(str(a), pull_interval_sec=0)
+    notified = []
+    st_b = GitSyncStorage(str(b), pull_interval_sec=0,
+                          on_remote_change=lambda: notified.append(1))
+    startup = manual_push_timers[-1]
+    assert startup.function.__self__ is st_b
+    st_a.save_month("2026-08", {"r_duty": {"2026-08-01": {"person": "A"}}})
+    st_a.flush()
+    startup.fire()  # 模擬 A 的操作耗時超過 B 的 debounce，不靠 sleep 猜時序
+    assert notified == [1], "flush 之前的正常背景通知不可被禁止"
+    st_b.save_config({"r_members": [{"id": "B"}]})
+    st_b.flush()
+    assert notified == [1], "flush 不增加通知，也不撤回先前的合法通知"
+    assert st_b.load_month("2026-08")["r_duty"] == {"2026-08-01": {"person": "A"}}
 
 
 def test_notification_happens_outside_the_git_lock():
