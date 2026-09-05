@@ -19,6 +19,7 @@ import errno as _errno
 import json
 import locale
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -182,13 +183,29 @@ def _restart_history_path() -> str:
 _HISTORY_GENERATION = [0]
 
 
+def _history_timestamp(value) -> float | None:
+    """Only finite JSON numbers represent restart/suspension timestamps."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        stamp = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return stamp if math.isfinite(stamp) else None
+
+
 def _load_restart_history() -> None:
     """[AC-07] 從檔載入啟動歷史/暫停狀態（讓 --once 也能累積 crash-loop 計數）。"""
     try:
-        data = safe_load_json(_restart_history_path(), {}) or {}
+        data = safe_load_json(_restart_history_path(), {})
     except Exception:
         return
-    gen = data.get("generation") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        # 有效 JSON 不一定是歷史物件；保留已知的暫停/計數/世代，不讓 .get
+        # 例外中斷整個 tick。後續仍走原本的持鎖記錄與落盤授權流程。
+        logging.warning("[watchdog] 啟動歷史格式不是物件 → 保留已知歷史與暫停狀態")
+        return
+    gen = data.get("generation")
     _HISTORY_GENERATION[0] = int(gen) if isinstance(gen, int) and gen >= 0 else 0
     hist = data.get("history")
     if isinstance(hist, dict):
@@ -196,13 +213,14 @@ def _load_restart_history() -> None:
         for name, ts in hist.items():
             if isinstance(ts, list):
                 _RESTART_HISTORY[str(name)] = [
-                    float(t) for t in ts if isinstance(t, (int, float))]
+                    stamp for t in ts if (stamp := _history_timestamp(t)) is not None]
     susp = data.get("suspended_until")
     if isinstance(susp, dict):
         _SUSPENDED_UNTIL.clear()
         for name, until in susp.items():
-            if isinstance(until, (int, float)):
-                _SUSPENDED_UNTIL[str(name)] = float(until)
+            stamp = _history_timestamp(until)
+            if stamp is not None:
+                _SUSPENDED_UNTIL[str(name)] = stamp
 
 
 def _save_restart_history() -> Exception | None:
@@ -811,8 +829,7 @@ def _cmdline_is_target(cmdline: str, process_keyword: str) -> bool:
     那只證明「命令列的某個位置出現這串字」,沒有證明「實際執行的就是那支
     程式」—— 例如 `python 修檔工具.py 中國醫皮膚科主程式的備份.txt` 也會命中,
     而下游是 `taskkill /F /T`(連子行程一起殺)。
-    這一支要求 keyword 是某個★引數的檔名本體★:引數的 basename 去掉副檔名
-    之後要等於 keyword。
+    這一支要求 keyword 是★實際 script 引數的檔名本體★，而非後續資料引數。
     ★刻意寬容的地方★:引號、大小寫、有沒有副檔名 —— 那些是 Windows 命令列
     的表面差異,不是身分差異。★刻意不寬容的地方★:它必須是【那個引數本身】,
     不能只是某個更長字串的一部分。
@@ -821,27 +838,61 @@ def _cmdline_is_target(cmdline: str, process_keyword: str) -> bool:
                               process_keyword)
 
 
-def _tokens_are_target(tokens, process_keyword: str) -> bool:
-    """★判準的本體:吃【已經切好的引數】★
+def _python_script_argument(tokens) -> str | None:
+    """Find the script operand without treating script data or option values as code.
 
-    [外審第五輪 R5-P3-01 第 1 輪 P1] 上一版把這裡寫成只吃字串,於是
-    `_cmdline_of_pid_now()` 拿到 psutil 的★引數清單★之後用空白 join 起來、
-    再由這裡重新切一次 —— ★引數邊界就這樣被毀掉★:
-    一個【單一引數】`C:(路徑)中國醫皮膚科主程式 backup.txt`
-    會被切成兩段,第一段的 basename 剛好等於 keyword → 驗證通過 →
-    一支毫不相干的程式連同它的子行程被 `taskkill /F /T`。
-    那正是這一批要消滅的東西(子字串誤判),被我自己的 join 又放回來一次。
-    ★有邊界資訊就不可以丟掉它★:psutil 已經切好了,直接比對它的每一個引數。
+    Preserve argv boundaries. Recognize our Python launchers and known CPython
+    flags; unknown modes are not sufficient evidence for a destructive action.
+    Script-only observations remain supported for legacy callers.
     """
+    if not tokens or isinstance(tokens, (str, bytes)):
+        return None
+    argv = [str(token).strip().strip(chr(34)) for token in tokens]
+    exe = os.path.basename(argv[0].replace(chr(92), "/")).lower()
+    if exe not in ("python.exe", "pythonw.exe", "python", "pythonw"):
+        return argv[0] if not argv[0].startswith("-") else None
+    i = 1
+    while i < len(argv):
+        token = argv[i]
+        if token == "--":
+            return argv[i + 1] if i + 1 < len(argv) else None
+        if token == "-":
+            return None                  # stdin, not a script path
+        if not token.startswith("-"):
+            return token
+        if token == "--check-hash-based-pycs":
+            if i + 1 >= len(argv) or argv[i + 1] not in ("default", "always", "never"):
+                return None
+            i += 2
+            continue
+        if token.startswith("--"):
+            return None
+        # Short options may be grouped (-IB); W/X consume the remainder or
+        # the next argument. c/m switch execution mode and must never match.
+        for offset, option in enumerate(token[1:], 1):
+            if option in "WX":
+                if offset == len(token) - 1:
+                    i += 1
+                    if i >= len(argv):
+                        return None
+                break
+            if option not in "bBdEhiIOPqRsSuvx" or option == "h":
+                return None
+        i += 1
+    return None
+
+
+def _tokens_are_target(tokens, process_keyword: str) -> bool:
+    """Verify the actual script operand; never scan subsequent data arguments."""
     kw = (process_keyword or "").strip().strip(chr(34)).lower()
     if not kw:
         return False
-    for token in (tokens or ()):
-        t = str(token).strip().strip(chr(34))
-        base = os.path.basename(t.replace(chr(92), "/")).lower()
-        if base == kw or os.path.splitext(base)[0] == kw:
-            return True
-    return False
+    script = _python_script_argument(tokens)
+    if not script:
+        return False
+    base = os.path.basename(script.replace(chr(92), "/")).lower()
+    stem, extension = os.path.splitext(base)
+    return extension in ("", ".py", ".pyw") and (base == kw or stem == kw)
 
 
 def _split_cmdline_tokens(cmdline: str) -> list:
