@@ -34,6 +34,8 @@ import re
 import smtplib
 import socket
 import ssl
+import sys
+from contextlib import contextmanager
 from email.mime.application import MIMEApplication
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
@@ -317,6 +319,30 @@ def recipients_refused_map(exc) -> dict:
     return {}
 
 
+@contextmanager
+def _smtp_session_preserving_outcome(connection):
+    """QUIT/close 只負責收尾，不得改寫 DATA 的成功或原始失敗階段。
+
+    smtplib.__exit__ 也可能逾時／拋 SMTPResponseException；若覆蓋原始結果，
+    已收到 250 的信會被重寄，已提交但結果不明的例外也會失去階段標記。
+    """
+    server = connection.__enter__()
+    try:
+        yield server
+    except BaseException:
+        original = sys.exc_info()
+        try:
+            connection.__exit__(*original)
+        except Exception:
+            logging.warning("[mail] SMTP 收尾失敗，保留原始寄送例外", exc_info=True)
+        raise
+    else:
+        try:
+            connection.__exit__(None, None, None)
+        except Exception:
+            logging.warning("[mail] SMTP 收尾失敗，但 DATA 已獲確認，不重寄", exc_info=True)
+
+
 def _send_once(cred: dict, msg, timeout: float, on_rcpt_result=None,
                require_durable_rcpt: bool = False) -> dict:
     """單次 SMTP 寄送嘗試 — 失敗會 raise 給 caller 判斷是否重試。
@@ -453,13 +479,14 @@ def _send_once(cred: dict, msg, timeout: float, on_rcpt_result=None,
     if port == 465:
         # 純 SSL（少數人用）
         context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(host, port, timeout=timeout,
-                               context=context) as server:
+        with _smtp_session_preserving_outcome(smtplib.SMTP_SSL(
+                host, port, timeout=timeout, context=context)) as server:
             server.login(cred["username"], cred["password"])
             return _submit(server)
     else:
         # 587 STARTTLS（Gmail 推薦）或 25 明文（不建議）
-        with smtplib.SMTP(host, port, timeout=timeout) as server:
+        with _smtp_session_preserving_outcome(
+                smtplib.SMTP(host, port, timeout=timeout)) as server:
             server.ehlo()
             if use_tls:
                 server.starttls(context=ssl.create_default_context())

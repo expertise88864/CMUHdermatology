@@ -50,6 +50,8 @@ machine-readable modelUsage 證據。本批尚未取得修正後完整 diff 的�
 是否可能誤刪；claim context manager 對呼叫端例外是否會二次 yield 而掩蓋原始錯誤。
 須補確定性的重現與呼叫路徑確認，才列入下一批修正。
 
+以上三個候選已在同日續輪完成重現，修正與驗證記於下節；其餘未完成範圍不變。
+
 ## 驗證與外審紀錄
 
 交付前跑既有完整品質關卡（ruff、pyright、pytest + coverage、skip 守衛、type debt），
@@ -73,3 +75,58 @@ audit commit 記錄每筆被審查的完整 SHA；若發現缺陷則驗證、修
 本輪實際外審嘗試 session `1a4e06cf-5147-4dcc-b585-314bb8dde495`：
 `api_error_status=429`、`modelUsage={}`，回報 Asia/Taipei 00:50 重置。
 因此未取得外審通過；已更新既有排程於 9/6 00:55 處理全部 pending，而非只處理單筆。
+
+## 同日續輪：例外邊界與更新救援檔
+
+基準 `5fdbe52d8c0c9037720b528ba986d90eca9a5e9d`；仍在隔離工作樹修改，
+原工作區既有 5 個未提交檔案不納入。依使用者指示不等待 Opus 額度，提交保持 pending。
+
+| 優先級 | 確認問題 | 最小修正 |
+| --- | --- | --- |
+| P1 | `cache_cleanup.py` 無更新鎖、無 journal 檢查就刪舊 `.bak`／`.tmp`。updater 的 `copy2` 保留來源 mtime，所以剛建立、仍供回滾使用的備份也會立即符合 TTL；崩潰後的待恢復備份亦可能被刪。 | 使用 bootstrap recovery 的相同 OS 位元組鎖；journal、failed marker 尚在，或狀態讀不到、鎖拿不到時保留 bak/tmp。一般 log/pyc 清理照常。 |
+| P2 | `update_policy.py` 對損壞旗標讀後刪除，會誤刪讀取之後另一行程原子寫入的新 suspend。 | 與過期旗標一致：損壞內容仍回 0，但不刪檔，後續 suspend 可覆寫；不改既有有效旗標或 IO 錯誤政策。 |
+| P2 | `cross_process_claim.py` 在涵蓋 yield 的 except 內再次 yield，會把呼叫端 `ValueError` 等改成 `RuntimeError: generator didn't stop after throw()`；timeout 路徑亦有同因。 | 取鎖／claim 的錯誤處理不涵蓋交給呼叫端的 yield；保留原始例外與清鎖行為，不更改原 fail-open／timeout 略過政策。 |
+| P1 | `smtp_mail.py` 的 smtplib context exit 在 QUIT 逾時／異常回覆時，覆蓋 DATA 已確認成功或原始例外；已寄出的信會被重送，UNKNOWN 的階段標記與認證失敗也會遺失。 | 兩種 SMTP transport 共用 outcome-preserving session wrapper；保留成功時逐位拒收 dict，失敗時保留原始例外身分／階段，QUIT 僅盡力收尾，不改寄送結果。 |
+
+新增 `test_claim_policy_cleanup_review_2026_09_05.py`：初版 8 個案例在修正前
+**7 failed、1 passed**，修正後再擴充為 **11 passed**。涵蓋正常／busy 鎖的例外身分、
+timeout 本地鎖釋放、claim 寫入失敗 fallback、旗標讀寫交錯、pending／failed journal、
+鎖不可用、journal stat 權限錯誤、與真正 updater 鎖的互斥、解除鎖後正常清理。
+原有兩個「損壞旗標必須刪除」測試改成保留，以反映新確認的 TOCTOU。
+與既有 claim、update policy、updater safety、cache cleanup 測試整合執行：**54 passed**。
+
+SMTP 新增 `test_smtp_cleanup_review_2026_09_05.py`：使用真的標準庫
+`SMTP.__exit__` 配合假的 server、完全不連網。修正前 4 個案例皆失敗，
+其中已確認 DATA 的成功信被重送到 3 次後誤報「確定沒有寄出」。修正後與既有
+delivery phases／unknown 測試整合 **80 passed**；再擴充新檔到 8 個案例，涵蓋
+587／465、QUIT timeout／421／正常 221、部分拒收、UNKNOWN 與認證例外。
+擴充後整合測試為 **84 passed**。前次仍執行中的完整關卡已中止，不當成通過；
+加入 SMTP 修正後重新啟動全套驗證。
+
+另以 `-X tracemalloc=5` 定向執行 `test_delivery_body_sealed_2026_09_01.py`（11 passed），
+定位到該檔 40、75、143、206 行使用 `with sqlite3.connect(...)` 的連線未關閉。
+SQLite connection context manager 只收束交易，不會 close；這部分警告確定來自測試輔助
+連線，而非警告觸發 GC 當下的正式程式行。尚未據此推論全部 113 個警告同源，亦未在
+這個並行安全修正批次修改相關測試；後續需修正其生命週期並再次核對完整警告清單。
+
+本輪另檢視寄送帳本的 schema 初始化／交易 rollback／關閉註冊、排班 ledger 的月結／
+rollback／人員異動、排班 storage 的 revision／嚴格讀取邊界；未宣告其整個子系統完成。
+亦逐段讀取 GitSyncStorage、fetch_resilience、reg52_contract、punch_status、
+consult_keepalive、通知、process_launch／program_launcher、pidfile、health 與
+resource_meter；這些閱讀不等於已逐一追完所有呼叫路徑。未執行院內登入、寄信、
+打卡或重開機等真實外部操作。
+
+下一輪優先重現：GitSyncStorage 停機後，已啟動但尚在等待 git lock 的 timer callback
+是否仍能操作工作樹；rebase 子程序逾時時是否可靠清除中間態。這兩項目前是待驗證
+候選，未列入本批已修正項目，也未宣稱相關同步生命週期已全部完成審查。
+
+對 `src/` 118 個 Python 檔案進行 AST 結構檢查，修正後未再找到「同一 try 的 body
+與 exception handler 皆含 yield」形狀；這是特定缺陷模式的掃描，不是全專案人工審完
+或所有 context manager 都正確的證明。另 compileall、pip check、diff whitespace 通過。
+
+續輪完整關卡實際結果：ruff 通過；pyright **0 errors、0 warnings**；pytest
+**6577 passed、2 skipped、113 warnings**（833.33 秒）。兩項 skipped 是未提交
+工作樹下的 clean-index 條件檢查，skip 守衛通過，提交後另補跑。Coverage：入口
+39.0%（門檻 22.9%）、共用模組 80.8%（73.8%）、總計 63.7%（51.0%）；
+type-debt 守衛通過、無新增債務。驗證範圍是上述隔離基準加本批修正，不包含原工作區
+5 個既有修改。113 個警告尚未全部消除，不能將完整測試通過解讀為全專案審查完成。

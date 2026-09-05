@@ -149,25 +149,26 @@ def _os_file_lock(path: str, *, deadline_sec: float = 5.0):
     fd = None
     locked = False
     try:
-        fd = os.open(path, os.O_CREAT | os.O_RDWR)
-        deadline = time.monotonic() + max(0.0, deadline_sec)
-        while True:
-            try:
-                _lock_fd(fd)
-                locked = True
-                break
-            except OSError:
-                if time.monotonic() >= deadline:
-                    _log.error("[claim] 取鎖逾時(%s)→ 本輪略過", path)
-                    yield False
-                    return
-                time.sleep(0.05)
-        yield True
-    except Exception:
-        # 拿不到鎖檔本身(權限/磁碟)→ 少一道防線,但不可以讓打卡停擺。
-        _log.warning("[claim] 鎖檔無法使用 → 照常執行(少一道防線)",
-                     exc_info=True)
-        yield True
+        allowed = True
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR)
+            deadline = time.monotonic() + max(0.0, deadline_sec)
+            while True:
+                try:
+                    _lock_fd(fd)
+                    locked = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        _log.error("[claim] 取鎖逾時(%s)→ 本輪略過", path)
+                        allowed = False
+                        break
+                    time.sleep(0.05)
+        except Exception:
+            # 只處理取鎖失敗，不捕捉 yield 注入的呼叫端例外。
+            _log.warning("[claim] 鎖檔無法使用 → 照常執行(少一道防線)",
+                         exc_info=True)
+        yield allowed
     finally:
         if fd is not None:
             try:
@@ -252,10 +253,8 @@ def exclusive_claim(key: str, *, ttl_sec: float = DEFAULT_TTL_SEC):
     try:
         try:
             with _os_file_lock(_lock_path(path)) as got_lock:
-                if not got_lock:
-                    yield False
-                    return
-                mine = _acquire(path, rec, ttl_sec)
+                if got_lock:
+                    mine = _acquire(path, rec, ttl_sec)
         except Exception:
             _log.warning("[claim] %s 取得失敗 → 照常執行(少一道防線)", key,
                          exc_info=True)

@@ -5,8 +5,7 @@
 - automation_ui.log.1 / .2 / .3 等備份檔超過 30 天 → 刪除
 - settings/debug_dumps/ 已由打卡程式 prune_debug_dumps（上限 40）控管
 - settings/cache_*.json 不刪除（仍在使用），只在啟動時偵測損壞並重置
-- 所有 *.bak 超過 7 天 → 刪除
-- *.tmp 超過 1 天 → 刪除（殘留 tmp 通常是寫入失敗）
+- *.bak 超過 7 天、*.tmp 超過 1 天：取得更新寫入鎖且無未解決交易才刪除
 - __pycache__ 內超過 30 天的 .pyc → 刪除
 """
 from __future__ import annotations
@@ -14,7 +13,10 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
+
+import bootstrap_recovery
 
 from cmuh_common.paths import get_app_dir, get_settings_dir
 
@@ -54,6 +56,25 @@ def _scan_and_clean(directory: Path, *, predicate, label: str) -> int:
     return removed
 
 
+@contextmanager
+def _update_artifact_cleanup_allowed(app_dir: Path):
+    """清理與更新／復原共用鎖；仍有交易或判不清楚就保留救援檔。"""
+    with bootstrap_recovery._write_lock(str(app_dir), timeout_sec=0.25) as acquired:
+        allowed = bool(acquired)
+        if allowed:
+            for suffix in ("", bootstrap_recovery.FAILED_JOURNAL_SUFFIX):
+                marker = app_dir / (bootstrap_recovery.JOURNAL_FILENAME + suffix)
+                try:
+                    marker.stat()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    logging.debug("[cleanup] 無法確認更新交易狀態，保留備份", exc_info=True)
+                allowed = False
+                break
+        yield allowed
+
+
 def cleanup_old_files() -> dict:
     """執行所有清理規則，回傳 {label: count} 統計。"""
     app_dir = Path(get_app_dir())
@@ -85,11 +106,7 @@ def cleanup_old_files() -> dict:
             return (now - p.stat().st_mtime) > 7 * DAY
         except OSError:
             return False
-    # 掃 root + src/* 一層
     stats['bak_files'] = 0
-    for d in (app_dir, app_dir / 'src', app_dir / 'src' / 'cmuh_common',
-              app_dir / 'src' / 'clock'):
-        stats['bak_files'] += _scan_and_clean(d, predicate=is_old_bak, label='bak_files')
 
     # 3. *.tmp 超過 1 天
     def is_old_tmp(p: Path) -> bool:
@@ -102,9 +119,16 @@ def cleanup_old_files() -> dict:
     # [IE-08 2026-07-12] tmp 掃描擴到 src 子目錄:updater Phase1 的 .upd.tmp 建在 src/cmuh_common,
     # 原本只掃 app_dir/settings_dir 掃不到,會無人值守緩慢堆積。
     stats['tmp_files'] = 0
-    for d in (app_dir, app_dir / 'src', app_dir / 'src' / 'cmuh_common',
-              app_dir / 'src' / 'clock', settings_dir):
-        stats['tmp_files'] += _scan_and_clean(d, predicate=is_old_tmp, label='tmp_files')
+    # copy2 保留舊 mtime，新建立的 .bak/.bak.tmp 也可能立即符合 TTL。
+    # 不能只看年齡或只在鎖外檢查 journal，否則會刪到正在使用的回滾來源。
+    with _update_artifact_cleanup_allowed(app_dir) as allowed:
+        if allowed:
+            for d in (app_dir, app_dir / 'src', app_dir / 'src' / 'cmuh_common',
+                      app_dir / 'src' / 'clock'):
+                stats['bak_files'] += _scan_and_clean(d, predicate=is_old_bak, label='bak_files')
+            for d in (app_dir, app_dir / 'src', app_dir / 'src' / 'cmuh_common',
+                      app_dir / 'src' / 'clock', settings_dir):
+                stats['tmp_files'] += _scan_and_clean(d, predicate=is_old_tmp, label='tmp_files')
 
     # [IE-08 2026-07-12] .corrupt-<ts> 救援副本(atomic_io/sqlite_cache 損壞時產生)>30 天清理,
     # 保留 30 天搶救窗後移除,免堆積。

@@ -34,7 +34,7 @@ def test_ie01_download_one_raises_during_backoff():
         updater._sha_mismatch_until.pop("fake_ie01_key", None)
 
 
-# ══ IE-03：暫時鎖檔不誤刪、過期不刪、只有真損壞才刪 ═══════════════════════════════
+# ══ IE-03：暫時鎖檔不誤刪；過期／損壞均不刪，避免誤刪併發新旗標 ═══════════════
 def test_ie03_expired_flag_not_deleted(tmp_path, monkeypatch):
     p = tmp_path / ".auto_update_suspended_until"
     monkeypatch.setattr(update_policy, "get_auto_update_suspend_path", lambda: str(p))
@@ -43,12 +43,12 @@ def test_ie03_expired_flag_not_deleted(tmp_path, monkeypatch):
     assert p.exists(), "IE-03: 過期旗標不可刪(避免 TOCTOU 誤刪新旗標)"
 
 
-def test_ie03_corrupt_flag_deleted(tmp_path, monkeypatch):
+def test_ie03_corrupt_flag_kept(tmp_path, monkeypatch):
     p = tmp_path / ".auto_update_suspended_until"
     monkeypatch.setattr(update_policy, "get_auto_update_suspend_path", lambda: str(p))
     p.write_text("garbage-not-a-number", encoding="utf-8")
     assert update_policy.get_auto_update_suspend_until() == 0.0
-    assert not p.exists(), "IE-03: 內容真損壞才可刪"
+    assert p.exists(), "損壞旗標也不能讀後刪除，避免 TOCTOU"
 
 
 def test_ie03_read_lock_conservative_no_delete(tmp_path, monkeypatch):
