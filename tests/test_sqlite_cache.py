@@ -1,23 +1,35 @@
 # -*- coding: utf-8 -*-
 """sqlite_cache migration tests."""
+from contextlib import ExitStack, closing
 import os
 import sqlite3
 import sys
 import tempfile
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from cmuh_common import sqlite_cache as sc  # noqa: E402
 
 
-def test_migrate_legacy_json_backs_up_corrupt_file(monkeypatch):
+@pytest.fixture
+def memory_connection():
+    """Close every test connection even when an assertion fails."""
+    with ExitStack() as resources:
+        def connect(**kwargs):
+            return resources.enter_context(closing(sqlite3.connect(":memory:", **kwargs)))
+        yield connect
+
+
+def test_migrate_legacy_json_backs_up_corrupt_file(monkeypatch, memory_connection):
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setattr(sc, "get_settings_dir", lambda: tmp)
         legacy = os.path.join(tmp, sc.LEGACY_JSON_NAME)
         with open(legacy, "w", encoding="utf-8") as f:
             f.write("{broken")
 
-        conn = sqlite3.connect(":memory:")
+        conn = memory_connection()
         sc._ensure_schema(conn)
 
         assert sc._migrate_legacy_json_if_present(conn) is False
@@ -27,14 +39,14 @@ def test_migrate_legacy_json_backs_up_corrupt_file(monkeypatch):
         assert len(backups) == 1
 
 
-def test_migrate_legacy_json_imports_rows_and_renames_backup(monkeypatch):
+def test_migrate_legacy_json_imports_rows_and_renames_backup(monkeypatch, memory_connection):
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setattr(sc, "get_settings_dir", lambda: tmp)
         legacy = os.path.join(tmp, sc.LEGACY_JSON_NAME)
         with open(legacy, "w", encoding="utf-8") as f:
             f.write('{"D123": {"2026-05-24": [1, 2, 3]}}')
 
-        conn = sqlite3.connect(":memory:")
+        conn = memory_connection()
         sc._ensure_schema(conn)
 
         assert sc._migrate_legacy_json_if_present(conn) is True
@@ -46,8 +58,8 @@ def test_migrate_legacy_json_imports_rows_and_renames_backup(monkeypatch):
         assert os.path.exists(legacy + ".migrated.bak")
 
 
-def test_save_selected_doctor_empty_result_removes_stale_rows(monkeypatch):
-    conn = sqlite3.connect(":memory:", isolation_level=None)
+def test_save_selected_doctor_empty_result_removes_stale_rows(monkeypatch, memory_connection):
+    conn = memory_connection(isolation_level=None)
     sc._ensure_schema(conn)
     conn.execute(
         "INSERT INTO clinic_counts(doc_no, date_iso, payload, updated_at) "
@@ -69,8 +81,8 @@ def test_save_selected_doctor_empty_result_removes_stale_rows(monkeypatch):
     ).fetchall() == [("D456",)]
 
 
-def test_save_selected_doctor_error_preserves_stale_rows(monkeypatch):
-    conn = sqlite3.connect(":memory:", isolation_level=None)
+def test_save_selected_doctor_error_preserves_stale_rows(monkeypatch, memory_connection):
+    conn = memory_connection(isolation_level=None)
     sc._ensure_schema(conn)
     conn.execute(
         "INSERT INTO clinic_counts(doc_no, date_iso, payload, updated_at) "

@@ -22,6 +22,7 @@ MAIL/RCPT 階段的逾時（伺服器確定還沒收到內容）被當成「結�
 【P2-05/06/08】帳本:查詢只看啟動當下的記憶體快照、寫回失敗就沒有下文、
 陳舊 PREPARED 沒有任何 API 看得到。
 """
+from contextlib import closing
 import os
 import socket
 import sys
@@ -299,7 +300,7 @@ class TestStalePreparedHasAnExit:
         led = dl.DeliveryLedger(path=path)
         did = led.begin(business_key="k1", category="t", recipients=["x@y.tw"])
         import sqlite3 as _sq
-        with _sq.connect(led.path) as _c:    # 手動塞一筆舊格式的 PREPARED
+        with closing(_sq.connect(led.path)) as _c, _c:    # 手動塞一筆舊格式的 PREPARED
             _c.execute("UPDATE deliveries SET state=?, updated_at=?"
                        " WHERE delivery_id=?",
                        (dl.PREPARED, dl._now() - 3600, did))
@@ -315,7 +316,7 @@ class TestStalePreparedHasAnExit:
         did = led.begin(business_key="k1", category="t", recipients=["x@y.tw"])
         led.mark_submitting(did)
         import sqlite3 as _sq
-        with _sq.connect(led.path) as _c:
+        with closing(_sq.connect(led.path)) as _c, _c:
             _c.execute("UPDATE deliveries SET updated_at=? WHERE delivery_id=?",
                        (dl._now() - 86400, did))
         assert led.converge_stale_prepared() == 0
@@ -452,7 +453,8 @@ class TestAFailedScreenshotLeavesNothingBehind:
         monkeypatch.setattr(cq, "_prune_old_shots", lambda: None)
         out = cq._materialize_shot(Image.new("RGB", (4, 4), (1, 2, 3)))
         assert out.exists() and out.suffix == ".png", out
-        assert Image.open(out).size == (4, 4)
+        with Image.open(out) as saved_image:
+            assert saved_image.size == (4, 4)
         assert not list(tmp_path.glob("*.part")), "暫存檔沒有被改名掉"
 
 
@@ -594,7 +596,7 @@ class TestRecoveryIsWiredNotJustAvailable:
         a = dl.DeliveryLedger(path=path)
         did = a.begin(business_key="k1", category="t", recipients=["a@x.tw"])
         import sqlite3 as _sq
-        with _sq.connect(a.path) as _c:      # 舊格式:磁碟上是 PREPARED
+        with closing(_sq.connect(a.path)) as _c, _c:      # 舊格式:磁碟上是 PREPARED
             _c.execute("UPDATE deliveries SET state=?, updated_at=?"
                        " WHERE delivery_id=?",
                        (dl.PREPARED, dl._now() - 3600, did))
@@ -740,7 +742,7 @@ class TestStalePreparedIsNotDeclaredFailed:
         led = dl.DeliveryLedger(path=str(tmp_path / "l.json"))
         did = led.begin(business_key="k", category="t", recipients=["a@x.tw"])
         import sqlite3 as _sq
-        with _sq.connect(led.path) as _c:    # 手動塞一筆舊格式的 PREPARED
+        with closing(_sq.connect(led.path)) as _c, _c:    # 手動塞一筆舊格式的 PREPARED
             _c.execute("UPDATE deliveries SET state=?, updated_at=?"
                        " WHERE delivery_id=?",
                        (dl.PREPARED, dl._now() - 3600, did))
@@ -792,7 +794,8 @@ class TestEveryForcedExitFlushes:
         """
         for path, expect_gate in (("src/consult_query.py", False),
                                   ("src/main.py", True)):
-            tree = ast.parse(open(path, encoding="utf-8").read())
+            with open(path, encoding="utf-8") as source:
+                tree = ast.parse(source.read())
             call = next(
                 (n for n in ast.walk(tree)
                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
@@ -817,7 +820,8 @@ class TestEveryForcedExitFlushes:
         那裡原本只排空【動作稽核】帳本,寄送帳本完全沒被收尾。
         (突變驗證抓到的:只檢查 health monitor 的那個測試照樣綠。)
         """
-        tree = ast.parse(open("src/main.py", encoding="utf-8").read())
+        with open("src/main.py", encoding="utf-8") as source:
+            tree = ast.parse(source.read())
         found = []
         for fn in ast.walk(tree):
             if not isinstance(fn, ast.FunctionDef):
@@ -856,7 +860,7 @@ class TestAMissedRecipientSurvivesARestart:
         #   `needs_recipient_retry()` 讀的是資料庫（帳本跨 process 共用）。
         #   [SQLite 版] 沒有記憶體快照可改 —— 直接改資料庫。
         import sqlite3 as _sq
-        with _sq.connect(led.path) as _c:
+        with closing(_sq.connect(led.path)) as _c, _c:
             _c.execute("UPDATE deliveries SET created_at=? WHERE delivery_id=?",
                        (dl._now() - age_sec, did))
         monkeypatch.setattr(cq, "_get_ledger", lambda: led)
@@ -974,7 +978,7 @@ class TestASuccessfulRetryClosesTheOriginalRecord:
         cq._resend_transient_refusals(
             _Art(), {"bad@x.tw": (452, b"full")}, "poll", origin_did=origin)
         import sqlite3 as _sq
-        with _sq.connect(led.path) as _c:
+        with closing(_sq.connect(led.path)) as _c, _c:
             kids = _c.execute("SELECT delivery_id FROM deliveries"
                               " WHERE parent_id=?", (origin,)).fetchall()
         assert kids, "補寄那一筆沒有指回初次紀錄"
