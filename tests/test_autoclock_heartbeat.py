@@ -133,7 +133,7 @@ def test_restart_program_releases_mutex_before_respawn(monkeypatch):
         "restart_self",
         # [第九輪 §4] 新契約:PRE-READY(放 mutex)→ READY(慢的拆解)。樁模擬兩階段都成功。
         lambda extra, hard_exit_code=None, on_confirmed=None, on_preready=None,
-        on_recover=None: (
+        on_recover=None, on_repair_complete=None: (
             calls.append(("restart", extra, hard_exit_code)),
             on_preready() if on_preready else None,
             on_confirmed() if on_confirmed else None),
@@ -167,7 +167,7 @@ def test_restart_program_passes_hard_exit_code_for_background_restart(monkeypatc
         "restart_self",
         # [第九輪 §4] 新契約:PRE-READY(放 mutex)→ READY(慢的拆解)。樁模擬兩階段都成功。
         lambda extra, hard_exit_code=None, on_confirmed=None, on_preready=None,
-        on_recover=None: (
+        on_recover=None, on_repair_complete=None: (
             calls.append(("restart", extra, hard_exit_code)),
             on_preready() if on_preready else None,
             on_confirmed() if on_confirmed else None),
@@ -198,7 +198,7 @@ def test_restart_failure_leaves_process_fully_intact(monkeypatch):
     monkeypatch.setattr(
         autoclock, "restart_self",
         lambda extra, hard_exit_code=None, on_confirmed=None, on_preready=None,
-        on_recover=None: calls.append("restart"))
+        on_recover=None, on_repair_complete=None: calls.append("restart"))
     monkeypatch.setattr(sys, "argv", ["autoclock.py"])
     autoclock.running.set()
 
@@ -223,7 +223,8 @@ def test_recovery_failure_is_not_reported_as_uninterrupted_service(monkeypatch):
     monkeypatch.setattr(
         autoclock, "restart_self",
         lambda extra, hard_exit_code=None, on_confirmed=None, on_preready=None,
-        on_recover=None: (calls.append("restart"), paths.SPAWN_RECOVERY_FAILED)[1])
+        on_recover=None, on_repair_complete=None: (
+            calls.append("restart"), paths.SPAWN_RECOVERY_FAILED)[1])
     monkeypatch.setattr(sys, "argv", ["autoclock.py"])
     monkeypatch.setattr(autoclock, "_machine_has_clock_accounts", lambda: True)
     autoclock.running.set()

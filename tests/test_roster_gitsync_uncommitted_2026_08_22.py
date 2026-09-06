@@ -6,6 +6,7 @@
 而背景 push 仍會把【舊的 HEAD】推成功 —— 舊寫法接著把狀態設成 ok,底部狀態列
 顯示「已同步」,他機卻永遠收不到這次修改。
 """
+import json
 import os
 import subprocess
 import sys
@@ -56,10 +57,30 @@ def _break_commits(work) -> None:
     _git(work, "config", "user.name", "")
 
 
+class _ManualPushStorage(GitSyncStorage):
+    """狀態斷言前不讓 timer 搶先 commit；補推仍執行真正的 Git 路徑。
+
+    這些測試檢查存檔／量測的狀態，不測 timer 的計時。10ms debounce
+    會讓啟動補推先拿走 git lock，慢 runner 上存檔可合法地延後 commit。
+    """
+
+    def __init__(self, work):
+        self.push_pending = False
+        super().__init__(str(work), pull_interval_sec=0)
+
+    def _schedule_push(self):
+        self.push_pending = True
+
+    def run_pending_push(self):
+        assert self.push_pending, "延後存檔必須排入補推"
+        self.push_pending = False
+        self._push()
+
+
 def test_a_failed_commit_is_not_reported_as_synced(tmp_path):
     """★反例本體★:資料只在工作樹,push 推的是舊 HEAD —— 不可以說已同步。"""
     _remote, work = _repo(tmp_path)
-    st = GitSyncStorage(str(work), push_debounce_sec=0.01)
+    st = _ManualPushStorage(work)
     _break_commits(work)
     st.save_config({"r_members": [{"id": "A"}]})
     assert "roster sync" not in _git(work, "log", "--oneline").stdout, \
@@ -72,7 +93,7 @@ def test_a_failed_commit_is_not_reported_as_synced(tmp_path):
 def test_a_healthy_save_is_still_synced(tmp_path):
     """守衛不得讓正常路徑一直亮紅燈。"""
     _remote, work = _repo(tmp_path)
-    st = GitSyncStorage(str(work), push_debounce_sec=0.01)
+    st = _ManualPushStorage(work)
     st.save_config({"r_members": [{"id": "A"}]})
     assert st._uncommitted == ""
     st.flush()
@@ -83,7 +104,7 @@ def test_the_state_recovers_once_the_commit_goes_through(tmp_path):
     """★出口★:設好 identity 之後,下一次存檔要能把狀態帶回 ok ——
     否則這個守衛就變成一個永遠關不掉的紅燈。"""
     _remote, work = _repo(tmp_path)
-    st = GitSyncStorage(str(work), push_debounce_sec=0.01)
+    st = _ManualPushStorage(work)
     _break_commits(work)
     st.save_config({"r_members": [{"id": "A"}]})
     assert st._uncommitted
@@ -102,7 +123,7 @@ def test_the_state_comes_from_the_measurement_not_the_return_value(
     commit 失敗時才分岔,但要證明狀態真的來自量測,得讓量測說「髒」而 commit
     說「成功」。"""
     _remote, work = _repo(tmp_path)
-    st = GitSyncStorage(str(work), push_debounce_sec=0.01)
+    st = _ManualPushStorage(work)
     monkeypatch.setattr(st, "_canonical_dirt", lambda _paths: "量到的髒東西")
     st.save_config({"r_members": [{"id": "A"}]})       # commit 會成功
     assert st._uncommitted == "量到的髒東西",         "★狀態是從 commit 的回傳值推出來的,不是量出來的★"
@@ -112,7 +133,7 @@ def test_the_dirt_is_measured_not_inferred(tmp_path):
     """★量,不要推理★:靠「commit 回傳 True」推斷已同步,會漏掉那些
     根本沒進到這次 commit 的路徑。"""
     _remote, work = _repo(tmp_path)
-    st = GitSyncStorage(str(work), push_debounce_sec=0.01)
+    st = _ManualPushStorage(work)
     st.save_config({"r_members": [{"id": "A"}]})
     assert st._canonical_dirt(["config.json"]) == ""
     (work / "config.json").write_text('{"r_members": []}', encoding="utf-8")
@@ -129,7 +150,7 @@ def test_a_failed_commit_is_published_without_waiting_for_a_push(tmp_path):
     第一版的測試就是靠 flush() 才綠的(量到的是另一條路)。
     """
     _remote, work = _repo(tmp_path)
-    st = GitSyncStorage(str(work), push_debounce_sec=30.0, pull_interval_sec=0)
+    st = _ManualPushStorage(work)
     st.save_config({"r_members": [{"id": "A"}]})
     st.flush()
     assert st.sync_state == "ok", "前提不成立:一開始就不是 ok,量不到降級"
@@ -144,7 +165,7 @@ def test_a_barrier_write_that_cannot_commit_is_published_too(tmp_path):
     「已同步」。這裡讓別的執行緒佔住 git 鎖,重現「拿不到鎖 → 延後 commit」。
     """
     _remote, work = _repo(tmp_path)
-    st = GitSyncStorage(str(work), push_debounce_sec=30.0, pull_interval_sec=0)
+    st = _ManualPushStorage(work)
     st.save_config({"r_members": [{"id": "A"}]})
     st.flush()
     assert st.sync_state == "ok", "前提不成立:一開始就不是 ok,量不到降級"
@@ -176,7 +197,7 @@ def test_a_month_file_created_after_the_pathspec_is_still_measured(tmp_path):
     「已同步」,而新月檔只在工作樹裡。
     """
     _remote, work = _repo(tmp_path)
-    st = GitSyncStorage(str(work), push_debounce_sec=30.0, pull_interval_sec=0)
+    st = _ManualPushStorage(work)
     st.save_config({"r_members": [{"id": "A"}]})
     st._last_pathspec = ["config.json"]        # commit 開始時列出來的那一份
     (work / "months").mkdir(exist_ok=True)
@@ -190,7 +211,7 @@ def test_the_commit_measures_the_current_tree_not_the_old_pathspec(
     """★接上去了才存在★:量測範圍算對了,`_commit` 卻仍拿舊 pathspec 去量的話,
     這條規則等於沒有(外審 RS-20 P2-02)。"""
     _remote, work = _repo(tmp_path)
-    st = GitSyncStorage(str(work), push_debounce_sec=30.0, pull_interval_sec=0)
+    st = _ManualPushStorage(work)
     st.save_config({"r_members": [{"id": "A"}]})
 
     def _body(_label):                 # commit 進行中,UI 建立了新月檔
@@ -209,7 +230,7 @@ def test_an_unknown_pathspec_is_never_reported_as_clean(tmp_path):
     時,盤上現存的檔列得出來,【已追蹤但被刪掉】的那些卻列不出來 —— 回傳
     現存清單會讓「刪掉一個月份」量成乾淨。"""
     _remote, work = _repo(tmp_path)
-    st = GitSyncStorage(str(work), push_debounce_sec=30.0, pull_interval_sec=0)
+    st = _ManualPushStorage(work)
     st.save_config({"r_members": [{"id": "A"}]})
     st._last_pathspec = None                  # ls-files 失敗的樣子
     assert st._measure_paths() is None
@@ -225,7 +246,7 @@ def test_the_measurement_sees_one_working_tree_snapshot(tmp_path):
     (鎖序是 `_git_lock → _tree_lock`,`_commit` 本來就持著前者。)
     """
     _remote, work = _repo(tmp_path)
-    st = GitSyncStorage(str(work), push_debounce_sec=30.0, pull_interval_sec=0)
+    st = _ManualPushStorage(work)
     st.save_config({"r_members": [{"id": "A"}]})
     done, held, release = threading.Event(), threading.Event(), threading.Event()
 
@@ -249,3 +270,37 @@ def test_the_measurement_sees_one_working_tree_snapshot(tmp_path):
     assert done.wait(10)
     t.join(timeout=5)
     c.join(timeout=5)
+
+
+def test_busy_save_is_pending_then_background_push_commits_and_syncs(tmp_path):
+    """重現 CI 的持鎖路徑；未 commit 不假綠，解除鎖後不用再次存檔便補推。"""
+    remote, work = _repo(tmp_path)
+    st = _ManualPushStorage(work)
+    st.run_pending_push()  # 清掉啟動補推，以下必須由這次存檔另排一次。
+    held, release = threading.Event(), threading.Event()
+
+    def hold_git():
+        with st._git_lock:
+            held.set()
+            assert release.wait(20), "主測試未釋放 git lock"
+
+    worker = threading.Thread(target=hold_git, daemon=True)
+    worker.start()
+    data = {"r_members": [{"id": "A"}], "schema_version": 1}
+    try:
+        assert held.wait(5)
+        st.save_config(data)
+        assert json.loads((work / "config.json").read_text(encoding="utf-8")) == data
+        assert st._uncommitted == "config.json（尚未 commit）"
+        assert st.sync_state != "ok"
+        assert st.push_pending
+        assert _git(work, "status", "--porcelain", "--", "config.json").stdout
+    finally:
+        release.set()
+        worker.join(timeout=10)
+    assert not worker.is_alive()
+
+    st.run_pending_push()
+    assert st._uncommitted == ""
+    assert st.sync_state == "ok"
+    assert json.loads(_git(remote, "show", "HEAD:config.json").stdout) == data
