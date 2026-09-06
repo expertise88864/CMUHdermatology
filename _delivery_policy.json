@@ -1,0 +1,77 @@
+{
+  "repository": "expertise88864/CMUHdermatology",
+  "require_pr": false,
+  "workflows": [
+    {
+      "path": ".github/workflows/ci.yml",
+      "jobs": [
+        "test"
+      ],
+      "steps": {
+        "test": {
+          "required": [
+            "Checkout",
+            "Setup Python",
+            "Install dependencies",
+            "Ruff (真 bug 類 lint — F/E9/B，規則見 ruff.toml)",
+            "Pyright (型別檢查 — 設定見 pyrightconfig.json)",
+            "Pytest (全測試 + 覆蓋率)",
+            "skip 數量守衛",
+            "分層覆蓋率門檻 (coverage_floors.json)",
+            "型別債棘輪 (type_debt_baseline.json)"
+          ],
+          "conditional": [
+            "pytest 失敗細節（轉成 annotation）"
+          ]
+        }
+      }
+    },
+    {
+      "path": ".github/workflows/security.yml",
+      "jobs": [
+        "秘密掃描 (gitleaks)",
+        "相依套件弱點 (pip-audit)",
+        "靜態安全分析 (CodeQL)"
+      ],
+      "steps": {
+        "秘密掃描 (gitleaks)": {
+          "required": [
+            "gitleaks"
+          ],
+          "conditional": []
+        },
+        "相依套件弱點 (pip-audit)": {
+          "required": [
+            "安裝相依",
+            "掃描（例外清單見 security/pip_audit_allowlist.json）"
+          ],
+          "conditional": []
+        },
+        "靜態安全分析 (CodeQL)": {
+          "required": [
+            "Initialize CodeQL",
+            "Analyze CodeQL"
+          ],
+          "conditional": []
+        }
+      }
+    },
+    {
+      "path": ".github/workflows/delivery.yml",
+      "jobs": [
+        "Delivery contract"
+      ],
+      "candidate_skips": [],
+      "main_skips": [],
+      "steps": {
+        "Delivery contract": {
+          "required": [
+            "Delivery Python regression tests",
+            "Verify committed version and manifest"
+          ],
+          "conditional": []
+        }
+      }
+    }
+  ]
+}

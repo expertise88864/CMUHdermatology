@@ -243,7 +243,7 @@ def test_main_retains_explicit_rejection_for_legacy_argument():
                    if isinstance(n, ast.FunctionDef) and n.name == "main")
     body = ast.unparse(main_fn)
     assert "parse_args(argv)" in body
-    assert "step_quality_gate(emergency_reason)" in body
+    assert "step_candidate_gate(emergency_reason)" in body
     assert "emergency_reason)" in body.split("step5_commit")[1][:60]
 
 

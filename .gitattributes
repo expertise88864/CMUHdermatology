@@ -32,3 +32,7 @@
 *.dll   binary
 *.zip   binary
 *.gz    binary
+# Tracked hooks must remain executable POSIX text on Windows and Linux.
+.githooks/* text eol=lf
+scripts/pre-push text eol=lf
+scripts/*.sh text eol=lf

@@ -10,7 +10,7 @@ name: Security
 #   * Security 反映「這個 repo 現在的安全狀態」，每週固定跑一次，紅了要處理但不擋急修。
 on:
   push:
-    branches: [main]
+    branches: [main, 'codex/**']
   pull_request:
   schedule:
     # 每週一 02:00 UTC（台灣時間週一 10:00）—— 新 CVE 不會等人來 push 才出現
@@ -67,10 +67,12 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: github/codeql-action/init@v3
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
         with:
           languages: python
           # security-extended 比預設多一些查詢；這個 repo 處理帳密與外部網頁輸入，
           # 多花幾分鐘值得。
           queries: security-extended
-      - uses: github/codeql-action/analyze@v3
+      - name: Analyze CodeQL
+        uses: github/codeql-action/analyze@v3

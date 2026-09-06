@@ -1,0 +1,15 @@
+#!/bin/sh
+# Exact candidate CI before production. No override or full-local-CI requirement.
+set -eu
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+if [ -x .venv/Scripts/python.exe ]; then
+  PYTHON=.venv/Scripts/python.exe
+elif [ -x .venv/bin/python ]; then
+  PYTHON=.venv/bin/python
+elif command -v python >/dev/null 2>&1; then
+  PYTHON=python
+else
+  PYTHON=python3
+fi
+exec "$PYTHON" _delivery.py pre-push --remote "${1:-origin}"

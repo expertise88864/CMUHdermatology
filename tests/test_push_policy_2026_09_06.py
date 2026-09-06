@@ -1,4 +1,4 @@
-"""Latest user policy: validate the final commit, never bypass local CI."""
+"""Remote-first policy: cheap candidate checks, exact-SHA remote promotion."""
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -55,13 +55,15 @@ def pipeline(ph, monkeypatch, tmp_path):
     monkeypatch.setattr(ph, "step4_sync_manifest", lambda v: events.append("manifest"))
     monkeypatch.setattr(ph, "step5_stage", lambda: events.append("stage"))
     monkeypatch.setattr(ph, "step5_commit", lambda *args: events.append("commit"))
-    monkeypatch.setattr(ph, "step_quality_gate", lambda *args: events.append("gate"))
+    monkeypatch.setattr(ph, "step_candidate_gate", lambda *args: events.append("gate"))
     def push(sha):
         assert sha == "a" * 40
         events.append("push")
     monkeypatch.setattr(ph, "step6_push", push)
 
     def git_bytes(args, stdin=b""):
+        if args == ["branch", "--show-current"]:
+            return b"codex/test\n"
         if args[:2] == ["rev-parse", "HEAD"]:
             return state["sha"].encode("ascii") + b"\n"
         if args[0] == "status":
@@ -84,7 +86,7 @@ def test_failed_final_gate_keeps_local_commit_and_never_pushes(ph, pipeline, mon
     def fail_gate(*args):
         assert "commit" in pipeline["events"]
         raise SystemExit(1)
-    monkeypatch.setattr(ph, "step_quality_gate", fail_gate)
+    monkeypatch.setattr(ph, "step_candidate_gate", fail_gate)
     with pytest.raises(SystemExit):
         ph.main(["push", "message"])
     assert "push" not in pipeline["events"]
@@ -100,13 +102,13 @@ def test_revision_drift_after_ci_blocks_push(ph, pipeline, monkeypatch, drift):
                 "tracked": b" M docs/policy.md\n", "untracked": b"?? new-config.json\n",
                 "staged": b"M  .github/workflows/ci.yml\n",
             }[drift]
-    monkeypatch.setattr(ph, "step_quality_gate", gate)
+    monkeypatch.setattr(ph, "step_candidate_gate", gate)
     with pytest.raises(SystemExit):
         ph.main(["push", "message"])
     assert "push" not in pipeline["events"]
 
 
-@pytest.mark.parametrize("branch", ["main", "codex/review"])
+@pytest.mark.parametrize("branch", ["codex/review", "codex/fix"])
 def test_push_uses_exact_validated_sha_not_a_movable_branch(ph, monkeypatch, branch):
     sha = "a" * 40
     commands = []
@@ -123,8 +125,17 @@ def test_push_uses_exact_validated_sha_not_a_movable_branch(ph, monkeypatch, bra
 def test_last_moment_head_change_is_not_pushed(ph, monkeypatch):
     commands = []
     monkeypatch.setattr(ph, "run", lambda cmd, **kwargs:
-                        commands.append(cmd) or SimpleNamespace(returncode=0, stdout="main\n"))
+                        commands.append(cmd) or SimpleNamespace(returncode=0, stdout="codex/test\n"))
     monkeypatch.setattr(ph, "_git_bytes", lambda args: b"b" * 40)
+    with pytest.raises(SystemExit):
+        ph.step6_push("a" * 40)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in commands)
+
+
+def test_release_helper_refuses_direct_main_even_if_sha_is_valid(ph, monkeypatch):
+    commands = []
+    monkeypatch.setattr(ph, "run", lambda cmd, **kw:
+                        commands.append(cmd) or SimpleNamespace(returncode=0, stdout="main\n"))
     with pytest.raises(SystemExit):
         ph.step6_push("a" * 40)
     assert not any(cmd[:2] == ["git", "push"] for cmd in commands)

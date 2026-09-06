@@ -9,7 +9,7 @@ name: CI
 # 理由見該檔開頭(那些是「時間到了自己會紅」的東西,不該擋臨床急修)。
 on:
   push:
-    branches: [main]
+    branches: [main, 'codex/**']
   pull_request:
   workflow_dispatch:
 

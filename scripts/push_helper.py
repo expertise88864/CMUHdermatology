@@ -488,6 +488,8 @@ def step6_push(expected_sha: str = "") -> None:
     # 取當前分支
     cp = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], check=False, capture=True)
     branch = cp.stdout.strip() or "main"
+    if not branch.startswith("codex/"):
+        fail("請在 codex/* 候選分支建立版本；遠端完整 CI 通過後才可發佈同一 SHA 至 main。")
     if expected_sha:
         if not re.fullmatch(r"[0-9a-f]{40}", expected_sha):
             fail("待推 SHA 格式無效，已中止推送。")
@@ -503,7 +505,7 @@ def step6_push(expected_sha: str = "") -> None:
         # 可能還沒設 remote 或第一次推
         print("\n[提示] git push 失敗。可能原因：")
         print("  - 還沒設定 remote：git remote add origin https://github.com/expertise88864/CMUHdermatology.git")
-        print("  - 第一次推送：git push -u origin main")
+        print("  - 第一次推送：請確認 codex/* 候選分支與 origin 權限")
         sys.exit(1)
 
 
@@ -523,8 +525,19 @@ def verify_clean_revision(expected_sha: str) -> None:
         fail("最終 SHA／工作樹在驗證期間變動，已中止推送；請重新驗證實際待推版本。")
 
 
+def step_candidate_gate(emergency_reason: str = "") -> None:
+    """Cheap local checks; complete verification runs on the remote candidate."""
+    if emergency_reason:
+        fail("緊急參數不能繞過候選驗證。")
+    run([sys.executable, "-m", "ruff", "check", "src", "scripts", "tests"])
+    run([sys.executable, "-m", "unittest", "_test_delivery"])
+
+
 def main(argv: list) -> int:
     commit_msg, emergency_reason = parse_args(argv)
+    branch = _git_bytes(["branch", "--show-current"]).decode("utf-8").strip()
+    if not branch.startswith("codex/"):
+        fail("遠端 CI 流程：請先建立 codex/* 候選分支，不直接修改／推送 main。")
 
     print("=" * 60)
     print("  CMUHdermatology 一鍵推送")
@@ -556,7 +569,8 @@ def main(argv: list) -> int:
     step5_commit(commit_msg, new_ver, emergency_reason)
     final_sha = _git_bytes(["rev-parse", "HEAD"]).decode("ascii").strip()
     verify_clean_revision(final_sha)
-    step_quality_gate(emergency_reason)
+    # Full CI now runs on the candidate in GitHub. Keep cheap local bug checks.
+    step_candidate_gate(emergency_reason)
     verify_index_matches(expected)
     verify_staged_version_consistency(new_ver)
     verify_staged_manifest_hashes()
@@ -566,7 +580,7 @@ def main(argv: list) -> int:
     print("\n" + "=" * 60)
     print(f"  已推送 v{new_ver}，SHA {final_sha}；尚待 GitHub CI 全綠核對。")
     print("  本機通過不等於 GitHub CI 成功；請追蹤此完整 SHA 的所有適用檢查。")
-    print("  其他電腦下次啟動時會自動拉新版（CDN 快取約 5 分鐘）")
+    print("  候選分支不供使用端更新；請以 _delivery.py 核對後再發佈同一 SHA 至 main。")
     print("=" * 60)
     return 0
 

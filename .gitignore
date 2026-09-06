@@ -49,3 +49,6 @@ junit.xml
 /current.txt
 /versions/
 /version_pointer.log
+
+# Local independent review evidence is not published to the website/repository.
+.claude-review/
