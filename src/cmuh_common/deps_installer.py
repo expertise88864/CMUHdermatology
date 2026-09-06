@@ -19,7 +19,11 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from cmuh_common.deps_manifest import _resolve_pip_spec
-from cmuh_common.paths import get_settings_dir
+from cmuh_common.deps_lock import child_lease
+from cmuh_common.paths import (
+    HANDSHAKE_BOOTSTRAPPING, get_settings_dir,
+    parent_supports_repair_only, parent_understands_bootstrapping, restart_handshake_signal,
+)
 
 
 _DEPENDENCY_INSTALL_LOG_MAX_BYTES = 2 * 1024 * 1024
@@ -61,7 +65,7 @@ def _rotate_dependency_install_log(
 class DependencyInstaller(tk.Tk):
     """[修正] missing_libs 用以判斷顯示「首次執行」或「例行驗證」文案。"""
 
-    def __init__(self, required_libs: list, missing_libs: list):
+    def __init__(self, required_libs: list, missing_libs: list, *, repair_lock_fd: int | None = None):
         super().__init__()
         self.libs = required_libs
         self.total_libs = len(self.libs) or 1
@@ -71,6 +75,7 @@ class DependencyInstaller(tk.Tk):
         # 強制進 pip --upgrade，不能被 run_installation 的 import 快速路徑跳過。
         self._repair_libs = {tuple(item) for item in missing_libs}
         self._closing = False
+        self._repair_lock_fd = repair_lock_fd
 
         is_first_run = len(missing_libs) > 0
 
@@ -140,19 +145,20 @@ class DependencyInstaller(tk.Tk):
         for pkg_name, import_name in self.libs:
             if self._closing:
                 return
+            # ★[外審 r11 P1] 每個套件都回報一次進展★:父行程的修復窗口是看「有沒有
+            # 進展」而不是總時間 —— 單一套件就可能吃掉 483 秒(240 逾時 × retry),
+            # 任何固定的總預算都會誤殺一個正在裝第三、第四個套件的修復。
+            if parent_understands_bootstrapping() and not parent_supports_repair_only():
+                restart_handshake_signal(HANDSHAKE_BOOTSTRAPPING)
             self.update_ui(current_progress, f"檢查元件: {pkg_name}...")
             try:
                 if (pkg_name, import_name) in self._repair_libs:
                     raise ImportError("dependency repair requested")
-                importlib.import_module(import_name)
+                # No imports until all requested pip upgrades have completed.
             except Exception:
                 self.update_ui(current_progress, f"正在下載並安裝: {pkg_name}...")
                 self._run_on_ui_thread(lambda: self.detail_var.set("這可能需要一些時間，請勿關閉視窗..."))
                 try:
-                    startupinfo = None
-                    if os.name == 'nt':
-                        startupinfo = subprocess.STARTUPINFO()
-                        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                     # 【守門 2026.05.20】.exe 模式絕不跑 pip：sys.executable 是 app exe，
                     # 會無限 spawn 自己 → fork bomb。deps_runtime 已 early-return，這是第二道防線。
                     if getattr(sys, 'frozen', False):
@@ -190,12 +196,12 @@ class DependencyInstaller(tk.Tk):
                                     f"python={pip_python}\n"
                                 )
                                 log_file.flush()
-                                subprocess.run(
-                                    cmd, check=True, timeout=240,
-                                    startupinfo=startupinfo,
-                                    stdout=log_file,
-                                    stderr=subprocess.STDOUT,
-                                )
+                                with child_lease(self._repair_lock_fd) as lease:
+                                    subprocess.run(
+                                        cmd, check=True, timeout=240,
+                                        stdout=log_file, stderr=subprocess.STDOUT,
+                                        **lease,
+                                    )
                             last_err = None
                             break
                         except subprocess.TimeoutExpired as e:
@@ -216,14 +222,6 @@ class DependencyInstaller(tk.Tk):
                         raise last_err
                     if self._closing:
                         return
-                    importlib.invalidate_caches()
-                    try:
-                        importlib.import_module(import_name)
-                    except Exception as e:
-                        raise RuntimeError(
-                            f"pip install {pkg_name} 完成，但 import {import_name} "
-                            f"仍失敗；詳見 {install_log_path}"
-                        ) from e
                 except Exception as e:
                     self.failed_libs.append(pkg_name)
                     self._run_on_ui_thread(
@@ -233,6 +231,19 @@ class DependencyInstaller(tk.Tk):
 
             current_progress += step_value
             self.update_ui(current_progress, f"驗證完成: {pkg_name}")
+
+        if self._closing:
+            return
+        if not self.failed_libs:
+            importlib.invalidate_caches()
+            for pkg_name, import_name in self.libs:
+                if self._closing:
+                    return
+                try:
+                    importlib.import_module(import_name)
+                except Exception:
+                    self.failed_libs.append(pkg_name)
+                    logging.exception("[deps] 安裝後 import 失敗: %s", import_name)
 
         # [2026-05-29] 有任何套件安裝失敗 → 明確報錯，不靜默繼續導致 import 崩潰。
         # is_finished 維持 False，deps_runtime 收到後會 sys.exit(1) 乾淨退出。

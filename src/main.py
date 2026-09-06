@@ -9706,7 +9706,8 @@ class AutomationApp:
         # 不打斷使用者當下操作。此方法是所有 app 端重啟（自動更新 / 閒置熱鍵恢復）的匯流點。
         outcome = restart_self(["--background"], on_preready=_preready_for_handover,
                                on_confirmed=_teardown_for_handover,
-                               on_recover=_recover_after_failed_handover)
+                               on_recover=_recover_after_failed_handover,
+                               allow_repair_only=True)
         # [外審 r10] 走到這裡＝沒有交棒。查不出誰持有單例時本行程沒有守衛,不可以繼續
         # 掛全域熱鍵 → 安全退場(探針已據實記 CRITICAL)。其餘情況本行程仍是單例擁有者,
         # 照常服務;自動更新下次再試。

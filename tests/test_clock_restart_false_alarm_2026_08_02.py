@@ -89,7 +89,7 @@ def test_autoclock_only_warns_on_a_real_crash():
     """★核心★ 照設計自行結束 → 只記 log,不跳通知。"""
     code = _code_only(_src('autoclock.py'))
     i = code.index("def restart_program(")
-    body = code[i:i + 3000]
+    body = code[i:].split("\ndef ", 1)[0]
     i_ok = body.index("_SPAWN_CHILD_EXITED_ORDERLY")
     i_notify = body.index("_notify_restart_failed()")
     assert i_ok < i_notify, "先判斷是否為正常結束"
@@ -101,7 +101,7 @@ def test_real_crash_still_notifies():
     """不可矯枉過正:真的崩潰仍要跳通知(那是使用者需要知道的)。"""
     code = _code_only(_src('autoclock.py'))
     i = code.index("def restart_program(")
-    body = code[i:i + 3000]
+    body = code[i:].split("\ndef ", 1)[0]
     assert "_notify_restart_failed()" in body
     assert "新行程未能存活" in _src('autoclock.py')
 

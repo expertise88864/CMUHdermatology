@@ -147,7 +147,9 @@ def _handover_and_restart(app: "ScheduleApp") -> None:
         return OWNER_UNKNOWN
 
     outcome = restart_self(on_preready=_on_preready, on_confirmed=_on_confirmed,
-                           on_recover=_on_recover)
+                           on_recover=_on_recover,
+                           on_repair_complete=lambda: app.root.after(
+                               5000, lambda: _handover_and_restart(app)))
     # [外審 r10] 查不出擁有者 → 不恢復同步、也不留著當第二個 writer:記成交棒後關窗退場。
     if outcome == SPAWN_RECOVERY_FAILED:
         globals()["_HANDING_OVER"] = True

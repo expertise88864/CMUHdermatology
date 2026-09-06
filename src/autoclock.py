@@ -64,6 +64,7 @@ from cmuh_common.logging_setup import (  # noqa: E402
 from cmuh_common.paths import (
     OWNER_OTHER, OWNER_SELF, OWNER_UNKNOWN,
     SPAWN_CHILD_EXITED_ORDERLY as _SPAWN_CHILD_EXITED_ORDERLY,
+    SPAWN_CHILD_REPAIRING as _SPAWN_CHILD_REPAIRING,
     SPAWN_CHILD_NEVER_READY as _SPAWN_CHILD_NEVER_READY,
     SPAWN_RECOVERY_FAILED as _SPAWN_RECOVERY_FAILED,
 )  # noqa: E402
@@ -2434,6 +2435,24 @@ def _notify_restart_failed() -> None:
                           exc_info=True)
 
 
+def _retry_after_dependency_repair(args_add, hard_exit_code) -> None:
+    """Retry independently of has_update, without interrupting an active punch."""
+    if not _sleep_while_running(5):
+        return
+    while running.is_set():
+        if clock_lock.acquire(blocking=False):
+            try:
+                if running.is_set():
+                    # Runs on the reaper thread: success must exit the process,
+                    # not merely raise SystemExit in this background thread.
+                    restart_program(args_add, hard_exit_code=0)
+                return
+            finally:
+                clock_lock.release()
+        if not _sleep_while_running(5):
+            return
+
+
 def restart_program(args_add=None, hard_exit_code=None) -> None:
     """[修正] 改用 cmuh_common.paths.restart_self 雙軌相容。
 
@@ -2519,7 +2538,13 @@ def restart_program(args_add=None, hard_exit_code=None) -> None:
     outcome = restart_self(extra, hard_exit_code=hard_exit_code,
                            on_preready=_preready_for_handover,
                            on_confirmed=_teardown_for_handover,
-                           on_recover=_recover_after_failed_handover)
+                           on_recover=_recover_after_failed_handover,
+                           # A configuration-window parent can exit as soon as
+                           # this function returns; only background mode defers.
+                           on_repair_complete=(
+                               (lambda: _retry_after_dependency_repair(args_add, hard_exit_code))
+                               if _scheduler_thread_ref is not None
+                               and _scheduler_thread_ref.is_alive() else None))
     # 走到這裡＝新行程早夭、restart_self 刻意保留本行程；因為拆解在 on_confirmed 裡，
     # 本行程的排程/看門狗/tray/mutex 都【原封不動】→ 自動打卡繼續運作。
     # ★[2026-08-02 使用者回報] 只有真的像崩潰才示警★
@@ -2527,6 +2552,9 @@ def restart_program(args_add=None, hard_exit_code=None) -> None:
     #   在那些機器上新行程是【照設計】自行結束的(沒有打卡設定檔 → main() 直接
     #   返回,exit=0、無 stderr),把它說成「無法啟動」是在陳述程式並不確知的事,
     #   而且對一台根本不跑打卡的電腦來說完全是噪音。
+    if outcome == _SPAWN_CHILD_REPAIRING:
+        logging.info("[autoclock restart] 依賴修復中，保留目前打卡程式；稍後再重啟")
+        return
     if outcome == _SPAWN_CHILD_EXITED_ORDERLY:
         logging.info("[autoclock restart] 新行程自行正常結束(本機多半未設定打卡)"
                      " → 不視為失敗,不打擾使用者")

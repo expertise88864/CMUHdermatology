@@ -8,6 +8,7 @@ import os
 import sys
 
 import pytest
+from cmuh_common import deps_lock
 
 _SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 if _SRC not in sys.path:
@@ -154,7 +155,11 @@ def test_version_mismatch_forces_pip_even_when_import_succeeds(tmp_path, monkeyp
     monkeypatch.setattr(di, "_rotate_dependency_install_log", lambda *_args: False)
     monkeypatch.setattr(di.subprocess, "run", lambda cmd, **_kw: calls.append(cmd))
 
-    installer.run_installation()
+    installer._repair_lock_fd = deps_lock.acquire(str(tmp_path / "repair.lock"))
+    try:
+        installer.run_installation()
+    finally:
+        os.close(installer._repair_lock_fd)
     assert calls and calls[0][3:5] == ["install", "demo>=2"]
 
 

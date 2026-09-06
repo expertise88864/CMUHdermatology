@@ -178,6 +178,32 @@ READY_EVENT_NOT_SET = "ready_event_not_set"
 READY_EVENT_UNKNOWN = "ready_event_unknown"
 HANDSHAKE_WAITING_MUTEX = "waiting_mutex"
 HANDSHAKE_READY = "ready"
+# [外審 r11 P1] ★啟動前的長時間修復要先講一聲★。依賴檢查(`ensure_dependencies`)跑在
+# 三支程式的 import 期間,遠早於 PRE-READY;它一旦判定版本不符就會跳修復 UI 跑 pip
+# (單次 240 秒、retry 一次)。父行程原本的規則是「0.6 秒還沒看到交握就先放 mutex、拔熱鍵,
+# 再過 3 秒仍沉默就終止它」—— 於是正在裝依賴的健康子行程會被殺掉,而且★診間在那 3.6 秒
+# 之後就沒有熱鍵★,自動更新還會每 5 秒再試一次、每次都殺一個裝到一半的 pip。
+# 所以子行程要在開始修復之前送這個階段:父行程收到就★完全不動★(不放 mutex、不拔熱鍵、
+# 不做時間 fallback),窗口放大到涵蓋 installer 的預算;真的超時才終止它並繼續服務。
+HANDSHAKE_BOOTSTRAPPING = "bootstrapping"
+HANDSHAKE_REPAIR_ONLY = "repair_only"
+SPAWN_CHILD_REPAIRING = "child_repairing"
+#: ★[外審 r11 P1(第二回)] 這是新增的協定階段,而★已經部署在診間的父行程不認得它★:
+#: 對它們來說交握檔的內容無效 → 0.6 秒照樣放 mutex/拔熱鍵、窗口一到就終止子行程。
+#: 所以不可以「新版子行程一律送」—— 要由★父行程自己宣告懂不懂★(env),子行程據此決定。
+#: 舊父行程不會設這個變數 → 新子行程不送 → 行為與升級前完全一致,升級這一版零風險;
+#: 等所有機器的父行程都是新版之後,這條路徑自動生效,不必有人記得「下一版打開開關」。
+#: (同一個原則在 r10-5 用過,只是方向相反:那次是子行程宣告 `ev`。)
+RESTART_PARENT_CAPS_ENV = "CMUH_RESTART_PARENT_CAPS"
+PARENT_CAP_BOOTSTRAPPING = "boot"
+PARENT_CAP_REPAIR_ONLY = "repair-only"
+_PARENT_CAPS: list = [None]       # 子行程端 latch(同樣不外洩給孫行程)
+#: ★停滯★多久才判定修復卡住(不是總時間):installer 是逐套件跑的,單一套件就可能吃掉
+#: 240+3+240=483 秒,要裝好幾個時任何固定的總預算都會誤殺一個正在進行的修復。改成看
+#: 「有沒有進展」——子行程每處理一個套件就重送一次交握訊號,父行程看檔案 mtime 有沒有動。
+#: 總時間不設限是安全的:installer 的套件清單有限,跑完(或失敗)就會結束行程,
+#: 那時父行程從 `proc.poll()` 就看得到。
+HANDSHAKE_BOOTSTRAP_STALL_SEC = 600.0
 HANDSHAKE_LEGACY_GRACE_SEC = 3.0      # 從未看到交握檔 → 視為舊版子行程的寬限
 HANDSHAKE_READY_TIMEOUT_SEC = 30.0    # 第一個決策點:到這裡還沒 READY 就去問所有權
 HANDSHAKE_TERMINATE_WAIT_SEC = 5.0    # terminate → kill 之間的有界等待
@@ -335,9 +361,27 @@ def close_handle(handle) -> None:
         pass
 
 
+def parent_understands_bootstrapping() -> bool:
+    """父行程有沒有宣告它認得 `bootstrapping` 階段(latch 後從環境移除)。
+
+    沒宣告 = 已經部署在診間的舊版父行程 —— 對它送這個階段只會被當成無效內容,
+    毫無好處(它照樣 0.6 秒放 mutex、窗口一到就終止),所以子行程要安靜地不送。
+    """
+    import os as _os
+    if _PARENT_CAPS[0] is None:
+        _PARENT_CAPS[0] = _os.environ.pop(RESTART_PARENT_CAPS_ENV, "").strip()
+    return PARENT_CAP_BOOTSTRAPPING in _PARENT_CAPS[0].split()
+
+
 def restart_handshake_active() -> bool:
     """本行程是不是由 `restart_self` 帶交握起來的子行程(啟動時 env 有交握檔路徑)。"""
     return bool(_latch_handshake_path())
+
+
+def parent_supports_repair_only() -> bool:
+    """A slow bootstrap child may repair, then exit without acquiring the app mutex."""
+    parent_understands_bootstrapping()  # latch and remove capabilities from env
+    return PARENT_CAP_REPAIR_ONLY in _PARENT_CAPS[0].split()
 
 
 def mutex_retry_sec() -> float:
@@ -422,7 +466,8 @@ def read_handshake_ex(path: str, expect_pid=None):
     except OSError:
         return None, False, frozenset()
     parts = s.split()
-    if not parts or parts[0] not in (HANDSHAKE_WAITING_MUTEX, HANDSHAKE_READY):
+    if not parts or parts[0] not in (HANDSHAKE_WAITING_MUTEX, HANDSHAKE_READY,
+                                    HANDSHAKE_BOOTSTRAPPING, HANDSHAKE_REPAIR_ONLY):
         return None, True, frozenset()
     if expect_pid is not None:
         if len(parts) < 2 or not parts[1].isdigit() or int(parts[1]) != int(expect_pid):
@@ -453,6 +498,10 @@ def wait_for_handover(proc, handshake_path: str, *, on_preready=None, on_confirm
     alive_grace = _SPAWN_ALIVE_POLLS * _SPAWN_ALIVE_INTERVAL_SEC      # 0.6s(今天的存活確認)
     preready_done = False
     saw_file = False          # 交握檔存在過(內容有效與否都算)
+    bootstrapping = False     # 子行程說它正在做啟動前的長時間修復(裝依賴)
+    boot_mtime = None         # 交握檔上次的 mtime;有變 = 修復還在往前走
+    boot_progress_at = None   # 上次看到進展的時刻(停滯判定的基準)
+    preready_at = None        # PRE-READY 發生的時刻(READY 窗口從這裡起算,不是從 spawn)
     warned_invalid = False
     warned_event_unknown = False
     expect_pid = getattr(proc, "pid", None)          # ★只認直接子行程的 PID★
@@ -477,6 +526,14 @@ def wait_for_handover(proc, handshake_path: str, *, on_preready=None, on_confirm
                 ready_event,
             )
         return state
+
+    def _handshake_mtime():
+        """交握檔的 mtime;讀不到 → None。★只用來比對「有沒有變」★,不拿來算年齡,
+        所以時鐘被調不影響(那個教訓在 R9-§6 記過)。"""
+        try:
+            return os.path.getmtime(handshake_path)
+        except OSError:
+            return None
 
     def _terminate_child(why: str) -> None:
         """[外審 r10-2] 終止★直接子行程★:走到這裡它已經不可能是合法接手者了。
@@ -553,8 +610,66 @@ def wait_for_handover(proc, handshake_path: str, *, on_preready=None, on_confirm
                         _logging.exception("[restart_self] on_confirmed 收尾失敗（仍照常退出）")
                 return HANDOVER_CONFIRMED
             return SPAWN_RECOVERY_FAILED
+        if state == HANDSHAKE_REPAIR_ONLY:
+            # This child promises to exit after bootstrap, never taking the app
+            # mutex. Return to Tk immediately; callers clear restart-committing
+            # and resume roster sync. A later update retry uses the warm cache.
+            if preready_done and _probe_owner("repair-only child") != OWNER_SELF:
+                return SPAWN_RECOVERY_FAILED
+            _logging.info("[restart_self] 依賴在背景修復，本行程繼續服務；稍後再重試交棒")
+            return SPAWN_CHILD_REPAIRING
+        if state == HANDSHAKE_BOOTSTRAPPING and not bootstrapping:
+            bootstrapping = True
+            if not preready_done:
+                _logging.warning(
+                    "[restart_self] 新行程回報「啟動前修復中」(裝依賴)→ 本行程★完全不動★"
+                    "(不放 mutex、不拔熱鍵);只要它持續有進展就一直等,停滯超過 %.0f 秒"
+                    "才判定卡住", HANDSHAKE_BOOTSTRAP_STALL_SEC)
+            else:
+                # ★訊號晚到★:依賴檢查本身要 import 一輪重套件,可能慢過 0.6 秒的時間
+                # fallback —— 那時 mutex 與熱鍵已經放掉了,而子行程明說它還要好幾分鐘。
+                # ★[外審 r11 P1] 收回所有權之後不可以「繼續在這裡等」★:呼叫端是在
+                # ★主執行緒★呼叫本函式的,而恢復熱鍵走的是 `root.after(0, ...)` ——
+                # 只要這個迴圈還沒 return,Tk 的事件迴圈就跑不到那個工作,熱鍵要等到
+                # 我們等完(可能好幾分鐘)才會真的回來。那時「已收回服務」只收回了
+                # mutex,是一句假的宣稱。所以:收回所有權、終止子行程、★立刻 return★,
+                # 讓呼叫端回到事件迴圈把服務真的接回去;更新下次再試(那時依賴多半已
+                # 由這次跑掉一半的 pip 裝好,或由下一輪從頭做完)。
+                _terminate_child("交棒開始後才回報啟動前修復")
+                owner = _probe_owner("child terminated after late bootstrapping")
+                if owner == OWNER_SELF:
+                    _logging.error(
+                        "[restart_self] 新行程在交棒開始後才回報「啟動前修復中」→ 已收回"
+                        "單例並終止它;本行程恢復服務(熱鍵在回到事件迴圈後接回),"
+                        "本次不重啟")
+                    return SPAWN_CHILD_NEVER_READY
+                _logging.critical(
+                    "[restart_self] 新行程回報「啟動前修復中」,但單例已不在本行程"
+                    "(owner=%s)→ 交由呼叫端安全退場", owner)
+                return SPAWN_RECOVERY_FAILED
+        if not preready_done and bootstrapping and state not in (HANDSHAKE_WAITING_MUTEX, HANDSHAKE_READY):
+            # ★修復期間父行程一步都不讓★:診間的熱鍵/單例照常在本行程手上,直到子行程
+            # 真的說「我要搶 mutex 了」。它做太久就終止它 —— 本行程從沒拆解過任何東西,
+            # 所以那是「這次更新沒裝成」而不是「服務中斷」。
+            # ★看進展,不看總時間★:installer 逐套件跑,單一套件就可能吃掉 483 秒,
+            # 任何固定的總預算都會誤殺一個正在進行的多套件修復。子行程每處理一個套件
+            # 就重送一次訊號 → 交握檔 mtime 前進;只有★停滯★才算卡死。
+            _m = _handshake_mtime()
+            if _m != boot_mtime:
+                boot_mtime = _m
+                boot_progress_at = now()
+            if now() - (boot_progress_at if boot_progress_at is not None
+                        else t0) >= HANDSHAKE_BOOTSTRAP_STALL_SEC:
+                _logging.error(
+                    "[restart_self] 新行程的啟動前修復停滯超過 %.0f 秒(沒有任何進展)→ "
+                    "終止它;本行程未曾拆解,服務照常,本次不重啟",
+                    HANDSHAKE_BOOTSTRAP_STALL_SEC)
+                _terminate_child("啟動前修復停滯")
+                return SPAWN_CHILD_NEVER_READY
+            continue
         if not preready_done and (state is not None or elapsed >= alive_grace):
             preready_done = True
+            preready_at = now()
             cb = on_confirmed if legacy_caller else on_preready
             if cb is not None:
                 try:
@@ -578,9 +693,13 @@ def wait_for_handover(proc, handshake_path: str, *, on_preready=None, on_confirm
             # ★探針有副作用(它會嘗試取得單例),只在決策點問★:窗口到期問一次;
             # 判定「持有單例卻卡死」之後,等到放棄期限再問第二次(其間每個 tick 仍在
             # 看 READY —— 子行程在寬限內就緒的話就走上面的快路徑)。
+            # ★[外審 r11 P1] 窗口從 PRE-READY 起算,不是從 spawn★:啟動前修復會把
+            # PRE-READY 推到好幾分鐘之後,用 spawn 起算的話窗口早就過期 —— 子行程一送
+            # WAITING_MUTEX 就立刻被判定「卡死」而終止。
+            since_preready = now() - (preready_at if preready_at is not None else t0)
             deadline = (HANDSHAKE_READY_TIMEOUT_SEC if saw_file
-                        else alive_grace + HANDSHAKE_LEGACY_GRACE_SEC)
-            if elapsed < deadline:
+                        else HANDSHAKE_LEGACY_GRACE_SEC)
+            if since_preready < deadline:
                 continue
             owner = _probe_owner("child alive but never READY")
             if owner == OWNER_UNKNOWN:
@@ -775,9 +894,38 @@ def build_restart_command(extra_args=None) -> list:
     return [sys.executable, self_entry_path()] + args
 
 
+def _retain_repair_child(proc, stderr_path: str, handshake_path: str, on_complete=None) -> None:
+    """Reap a repair-only child asynchronously; retain its diagnostic file."""
+    import logging
+    import threading
+
+    def reap():
+        try:
+            code = proc.wait()
+            if code:
+                logging.error("[restart_self] 背景修復失敗 exit=%s，診斷檔: %s", code, stderr_path)
+            else:
+                logging.info("[restart_self] 背景依賴檢查完成，診斷檔: %s", stderr_path)
+                if on_complete is not None:
+                    on_complete()
+        except Exception:
+            logging.exception("[restart_self] 等待背景修復行程失敗，診斷檔: %s", stderr_path)
+        finally:
+            try:
+                os.remove(handshake_path)
+            except OSError:
+                pass
+
+    threading.Thread(target=reap, name="RepairChildReaper", daemon=True).start()
+
+
 def restart_self(extra_args=None, hard_exit_code=None,
-                 on_confirmed=None, on_preready=None, on_recover=None) -> None:
+                 on_confirmed=None, on_preready=None, on_recover=None,
+                 on_repair_complete=None, allow_repair_only: bool = False) -> str | None:
     """雙軌重啟。
+
+    repair-only is opt-in: the caller must stay alive and retry, either through
+    on_repair_complete (called on the reaper thread) or its existing retry loop.
 
     [第九輪 §4] 兩階段交握(見 wait_for_handover):
       on_preready  — 子行程回報 PRE-READY(即將搶 mutex)或 0.6s 仍活著時呼叫:做「快而
@@ -828,6 +976,8 @@ def restart_self(extra_args=None, hard_exit_code=None,
     # 「新版本無法啟動」這句話,沒有任何線索可查(使用者 2026-08-02 回報)。
     # 存活確認通過就不再需要它(正常運作時 stderr 是空的);早夭時把尾巴記進 log。
     import tempfile
+    import uuid as _uuid
+    attempt_id = _uuid.uuid4().hex
 
     _tmpdir = tempfile.gettempdir()
     try:
@@ -836,7 +986,7 @@ def restart_self(extra_args=None, hard_exit_code=None,
         logging.debug("[restart_self] 清理舊 stderr 暫存檔失敗(忽略)", exc_info=True)
     _err_path = os.path.join(
         _tmpdir,
-        f"cmuh_restart_{os.path.basename(str(sys.argv[0])) or 'app'}_{os.getpid()}.err")
+        f"cmuh_restart_{os.path.basename(str(sys.argv[0])) or 'app'}_{os.getpid()}_{attempt_id}.err")
     _errf = None
     try:
         _errf = open(_err_path, "wb")
@@ -846,7 +996,7 @@ def restart_self(extra_args=None, hard_exit_code=None,
     # [第九輪 §4] 交握檔:子行程用它回報 PRE-READY / READY;父行程每 0.1s 讀。
     _hs_path = os.path.join(
         _tmpdir,
-        f"cmuh_restart_{os.path.basename(str(sys.argv[0])) or 'app'}_{os.getpid()}.hs")
+        f"cmuh_restart_{os.path.basename(str(sys.argv[0])) or 'app'}_{os.getpid()}_{attempt_id}.hs")
     try:
         os.remove(_hs_path)                 # 上一次殘留(同 pid 重啟過)
     except OSError:
@@ -855,9 +1005,11 @@ def restart_self(extra_args=None, hard_exit_code=None,
     _child_env[RESTART_HANDSHAKE_ENV] = _hs_path
     # [外審 r10-4] READY 的主通道:具名事件(核心物件)。建不出來就只剩檔案通道,
     # `wait_for_handover` 會據此退回保守行為(缺席的 READY 不當證據)。
-    import uuid as _uuid
     _ready_event_name = f"Local\\CMUH_RESTART_READY_{os.getpid()}_{_uuid.uuid4().hex}"
     _ready_event = create_ready_event(_ready_event_name)
+    _child_env[RESTART_PARENT_CAPS_ENV] = PARENT_CAP_BOOTSTRAPPING
+    if allow_repair_only or on_repair_complete is not None:
+        _child_env[RESTART_PARENT_CAPS_ENV] += f" {PARENT_CAP_REPAIR_ONLY}"
     if _ready_event:
         _child_env[RESTART_READY_EVENT_ENV] = _ready_event_name
     else:
@@ -899,6 +1051,12 @@ def restart_self(extra_args=None, hard_exit_code=None,
             on_recover=on_recover, stderr_tail=_child_stderr_tail,
             ready_event=_ready_event)
         if outcome != HANDOVER_CONFIRMED:
+            if outcome == SPAWN_CHILD_REPAIRING:
+                if _errf is not None:
+                    _errf.close()
+                close_handle(_ready_event)
+                _retain_repair_child(proc, _err_path, _hs_path, on_repair_complete)
+                return outcome
             if outcome == SPAWN_CHILD_EXITED_ORDERLY:
                 logging.info(
                     "[restart_self] 新行程自行正常結束 (exit=0、無 stderr)"

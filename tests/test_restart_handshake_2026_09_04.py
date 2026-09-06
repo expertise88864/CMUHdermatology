@@ -47,26 +47,48 @@ class _Sim:
 
     pid = 4242
 
-    def __init__(self, path, *, exits_at=None, rc=0, writes=None, legacy_payload=False):
+    def __init__(self, path, *, exits_at=None, rc=0, writes=None, legacy_payload=False,
+                 heartbeat_every=None, heartbeat_until=None):
         # legacy_payload=True → payload 不宣告事件能力(模擬懂檔案交握、不懂事件的中間版本)
+        # heartbeat_every:每隔這麼多模擬秒重送一次最後一個階段(= installer 每處理完一個
+        #   套件就回報一次進展);heartbeat_until 之後就停(模擬修復卡住)。
         self.legacy_payload = legacy_payload
+        self.heartbeat_every = heartbeat_every
+        self.heartbeat_until = heartbeat_until
+        self._last_state = None
+        self._next_beat = None
         self.path, self.t = path, 0.0
         self.exits_at, self.rc = exits_at, rc
         self.writes = dict(writes or {})
         self.calls = []
+
+    def _write(self, state, pid):
+        caps = "" if self.legacy_payload else f" {paths.HANDSHAKE_CAP_EVENT}"
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write(f"{state} {pid}{caps}")
+        # ★mtime 跟著模擬時鐘走★:真實寫入間隔是微秒級,mtime 可能相同,父行程的
+        # 「有沒有進展」就量不到了。
+        os.utime(self.path, (self.t, self.t))
+        self._last_state = state
 
     def now(self):
         return self.t
 
     def sleep(self, sec):
         self.t += sec
+        wrote = False
         for at in sorted(self.writes):
             if at <= self.t:
                 item = self.writes.pop(at)
                 state, pid = item if isinstance(item, tuple) else (item, self.pid)
-                caps = "" if self.legacy_payload else f" {paths.HANDSHAKE_CAP_EVENT}"
-                with open(self.path, "w", encoding="utf-8") as f:
-                    f.write(f"{state} {pid}{caps}")
+                self._write(state, pid)
+                wrote = True
+                self._next_beat = (self.t + self.heartbeat_every
+                                   if self.heartbeat_every else None)
+        if (not wrote and self._next_beat is not None and self.t >= self._next_beat
+                and (self.heartbeat_until is None or self.t <= self.heartbeat_until)):
+            self._write(self._last_state, self.pid)
+            self._next_beat = self.t + self.heartbeat_every
 
     def poll(self):
         return self.rc if (self.exits_at is not None and self.t >= self.exits_at) else None
@@ -148,6 +170,149 @@ def test_alive_without_ready_is_never_enough_to_confirm(tmp_path):
     assert "confirmed" not in names, "沒有 READY、單例又還在自己手上,不可以退出"
     assert sim.calls[1][1] >= 30.0
     assert paths.HANDSHAKE_READY_TIMEOUT_SEC == 30.0     # 上面的 30 是固定數,釘住常數
+
+
+# ─── 1b. [外審 r11 P1] 啟動前的長時間修復(裝依賴)─────────────────────────────
+BOOT = "bootstrapping"
+
+
+def test_bootstrapping_freezes_the_parent_completely(tmp_path):
+    """★核心★:子行程說它在做啟動前修復 → 父行程★一步都不讓★。
+    依賴檢查跑在 import 期間,完整檢查會把每個套件真的 import 一遍(數秒),接著 pip
+    單次 240 秒、retry 一次。父行程原本 0.6 秒就放 mutex、拔熱鍵,3.6 秒沉默就終止 ——
+    於是健康的子行程被殺,而且★診間在那之後就沒有熱鍵★。收到這個階段就不可以動。
+    這裡的子行程送完就再也沒有進展(卡住)→ 停滯窗口到期才被終止。"""
+    sim = _Sim(str(tmp_path / "hs"), writes={0.2: BOOT})
+    out = _run(sim, owner=paths.OWNER_SELF, poll_interval=1.0)
+    assert out == paths.SPAWN_CHILD_NEVER_READY
+    names = [c[0] for c in sim.calls]
+    assert "preready" not in names, "★修復期間放掉了 mutex/熱鍵 → 診間會斷★"
+    assert "confirmed" not in names
+    assert names[-1] == "terminate", sim.calls
+    t_term = [c[1] for c in sim.calls if c[0] == "terminate"][0]
+    assert t_term >= 600.0, "沒等滿停滯窗口就殺掉"
+    assert paths.HANDSHAKE_BOOTSTRAP_STALL_SEC == 600.0   # 上面是固定數,釘住常數
+
+
+def test_a_repair_that_keeps_making_progress_is_never_terminated(tmp_path):
+    """★外審 r11 P1(第二回)★:固定的總預算會誤殺多套件修復 —— installer 是逐套件跑的,
+    ★單一★套件就可能吃掉 240+3+240=483 秒。判準要是「有沒有進展」:子行程每處理一個
+    套件就重送一次訊號,只要還在動就一直等。這裡持續心跳 3000 秒(遠超任何固定預算)。"""
+    sim = _Sim(str(tmp_path / "hs"), writes={0.2: BOOT},
+               heartbeat_every=400.0, heartbeat_until=3000.0,
+               exits_at=3200.0, rc=0)
+    out = _run(sim, owner=paths.OWNER_SELF, poll_interval=1.0)
+    # 3000 秒之後心跳停,再過 600 秒的停滯窗口才會被判卡住;但子行程在 3200 秒自己結束了
+    assert out == SPAWN_CHILD_EXITED_ORDERLY, sim.calls
+    assert [c[0] for c in sim.calls] == [], "★一直有進展卻被動了★"
+
+
+def test_a_repair_that_stalls_after_progress_is_terminated(tmp_path):
+    """反例只靠這條規則分勝負:同樣是長時間修復,★停止進展★之後才可以終止。"""
+    sim = _Sim(str(tmp_path / "hs"), writes={0.2: BOOT},
+               heartbeat_every=100.0, heartbeat_until=1000.0)
+    out = _run(sim, owner=paths.OWNER_SELF, poll_interval=1.0)
+    assert out == paths.SPAWN_CHILD_NEVER_READY
+    t_term = [c[1] for c in sim.calls if c[0] == "terminate"][0]
+    assert 1500.0 <= t_term <= 1800.0, f"不是從「最後一次進展」起算:{t_term}"
+
+
+def test_bootstrapping_then_a_normal_two_phase_handover(tmp_path):
+    """修復做完 → 照常送 WAITING_MUTEX/READY,兩階段完全照舊(只是晚了幾分鐘)。"""
+    sim = _Sim(str(tmp_path / "hs"),
+               writes={0.2: BOOT, 300.0: HANDSHAKE_WAITING_MUTEX, 305.0: HANDSHAKE_READY})
+    assert _run(sim, poll_interval=1.0) == HANDOVER_CONFIRMED
+    names = [c[0] for c in sim.calls]
+    assert names == ["preready", "confirmed"], sim.calls
+    assert sim.calls[0][1] >= 300.0, "★PRE-READY 不可以早於子行程說它要搶 mutex★"
+    assert sim.calls[1][1] < 310.0
+
+
+def test_a_late_bootstrapping_signal_returns_instead_of_waiting(tmp_path):
+    """★訊號晚到是常態,不是罕見競態★:依賴檢查本身要 import 一輪重套件,可能慢過
+    0.6 秒的時間 fallback —— 那時 mutex/熱鍵已經放了。
+
+    ★[外審 r11 P1] 這時不可以「收回 mutex 之後繼續在這裡等」★:呼叫端是在主執行緒
+    呼叫 waiter 的,恢復熱鍵走 `root.after(0, ...)`,只要 waiter 還沒 return,Tk 的事件
+    迴圈就跑不到那個工作 —— 熱鍵要等到我們等完(可能好幾分鐘)才會回來,「已恢復服務」
+    只恢復了 mutex。所以要收回所有權、終止子行程、★立刻 return★。
+    """
+    sim = _Sim(str(tmp_path / "hs"), writes={2.0: BOOT})
+    out = _run(sim, owner=paths.OWNER_SELF)
+    assert out == paths.SPAWN_CHILD_NEVER_READY
+    names = [c[0] for c in sim.calls]
+    assert names == ["preready", "terminate", "recover"], sim.calls
+    assert abs(sim.calls[0][1] - 0.6) < 0.15
+    # ★立刻★:收到訊號後就結束,不可以拖到修復預算或 READY 窗口到期
+    assert sim.calls[-1][1] < 5.0, f"收回服務後還繼續阻塞:{sim.calls}"
+
+
+def test_a_late_bootstrapping_signal_that_cannot_reclaim_exits_safely(tmp_path):
+    """晚到、而且單例已經不在本行程 → 不假裝復原,交呼叫端安全退場。"""
+    sim = _Sim(str(tmp_path / "hs"), writes={2.0: BOOT})
+    assert _run(sim, owner=paths.OWNER_UNKNOWN) == paths.SPAWN_RECOVERY_FAILED
+    assert "terminate" in [c[0] for c in sim.calls]
+
+
+def test_a_child_that_dies_while_bootstrapping_leaves_the_parent_intact(tmp_path):
+    """修復中途死掉(pip 失敗/使用者關掉視窗)→ 照早夭分類,父行程原封不動。"""
+    sim = _Sim(str(tmp_path / "hs"), writes={0.2: BOOT}, exits_at=50.0, rc=1)
+    assert _run(sim, poll_interval=1.0) == SPAWN_CHILD_CRASHED
+    assert sim.calls == [], "父行程從沒動過任何東西"
+
+
+def test_ensure_dependencies_signals_before_the_full_check(tmp_path):
+    """★接線★:訊號要在★完整檢查之前★送 —— 等到發現有東西缺才送就已經超時了
+    (完整檢查本身會 import 每個套件)。快速路徑(快取命中)則不可以送。"""
+    src = io.open(os.path.join(_SRC, "cmuh_common", "deps_runtime.py"),
+                  encoding="utf-8").read()
+    tree = ast.parse(src)
+    body = ast.dump(_func(tree, "ensure_dependencies"))
+    i_sig = body.index("restart_handshake_signal")
+    # 完整檢查已抽進 `_ensure_dependencies_locked`(鎖內);訊號必須排在★呼叫它之前★,
+    # 否則「檢查那幾秒」還是會被父行程當成沉默子行程。
+    i_check = body.index("_ensure_dependencies_locked")
+    assert i_sig < i_check, "★訊號排在完整檢查之後 = 檢查那幾秒還是會被誤判★"
+    assert "_find_missing_libs" in ast.dump(_func(tree, "_ensure_dependencies_locked"))
+    # 快速路徑的 return 要排在訊號之前(快取命中就不該打擾父行程)
+    assert body.index("_all_modules_discoverable") < i_sig
+    # ★而且要有父行程能力的閘門★
+    assert body.index("parent_supports_repair_only") < i_sig
+
+
+def test_a_parent_that_does_not_understand_bootstrapping_is_never_sent_it(monkeypatch):
+    """★外審 r11 P1(第二回)★:這是新增的協定階段,而★已經部署在診間的父行程不認得它★
+    —— 對它們來說交握檔內容無效,照樣 0.6 秒放 mutex、窗口一到就終止子行程。
+    所以能力要由★父行程自己宣告★;沒宣告(= 舊版)就安靜地不送,升級這一版零風險。"""
+    monkeypatch.setattr(paths, "_PARENT_CAPS", [None])
+    monkeypatch.delenv(paths.RESTART_PARENT_CAPS_ENV, raising=False)
+    assert paths.parent_understands_bootstrapping() is False
+
+    monkeypatch.setattr(paths, "_PARENT_CAPS", [None])
+    monkeypatch.setenv(paths.RESTART_PARENT_CAPS_ENV, paths.PARENT_CAP_BOOTSTRAPPING)
+    assert paths.parent_understands_bootstrapping() is True
+    assert paths.RESTART_PARENT_CAPS_ENV not in os.environ, "latch 後要從環境拿掉"
+
+
+def test_restart_self_declares_that_it_understands_bootstrapping():
+    """新父行程要宣告能力,子行程才敢送(否則這條路徑永遠不會啟用)。"""
+    r = _func(_tree("cmuh_common/paths.py"), "restart_self")
+    names = {n.id for n in ast.walk(r) if isinstance(n, ast.Name)}
+    assert "RESTART_PARENT_CAPS_ENV" in names
+    assert "PARENT_CAP_BOOTSTRAPPING" in names
+
+
+def test_the_installer_reports_progress_per_package():
+    """★接線★:父行程的修復窗口看「有沒有進展」,所以 installer 每處理一個套件都要
+    回報一次 —— 不然多套件修復會在停滯窗口到期時被誤殺。"""
+    src = io.open(os.path.join(_SRC, "cmuh_common", "deps_installer.py"),
+                  encoding="utf-8").read()
+    fn = _func(ast.parse(src), "run_installation")
+    loops = [n for n in ast.walk(fn) if isinstance(n, ast.For)]
+    assert loops, "找不到逐套件迴圈"
+    inside = ast.dump(loops[0])
+    assert "restart_handshake_signal" in inside, "★心跳不在逐套件迴圈裡★"
+    assert "parent_understands_bootstrapping" in inside
 
 
 def _event_run(sim, owner, *, event_set=False, event_state=None, **kw):
