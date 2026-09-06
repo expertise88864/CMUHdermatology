@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 from cmuh_common.atomic_io import (atomic_write_json, safe_load_json,
@@ -1489,6 +1490,50 @@ def _lock_path_for(prog_name: str) -> Path:
     return LOCK_DIR / f"{safe}.lock"
 
 
+_ACTION_GUARDS_LOCK = threading.Lock()
+_ACTION_GUARDS: dict[str, threading.Lock] = {}
+
+
+@contextlib.contextmanager
+def _action_claim_guard(lock: Path) -> Iterator[bool]:
+    """Serialize observation + replacement/release, not the cooldown period.
+
+    The sidecar is never unlinked: all cooperating watchdogs lock the same
+    byte even while the expiring action record is replaced. Windows releases
+    the byte lock if its owner exits. Contention/IO failure skips this tick.
+    """
+    import msvcrt
+
+    key = os.path.normcase(os.path.abspath(str(lock)))
+    with _ACTION_GUARDS_LOCK:
+        local = _ACTION_GUARDS.setdefault(key, threading.Lock())
+    if not local.acquire(blocking=False):
+        yield False
+        return
+    fd = None
+    acquired = False
+    try:
+        try:
+            fd = os.open(str(lock) + ".guard", os.O_CREAT | os.O_RDWR)
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            acquired = True
+        except OSError:
+            logging.debug("[watchdog] 動作鎖 guard 忙或不可用 → 本輪略過", exc_info=True)
+        yield acquired
+    finally:
+        try:
+            if fd is not None:
+                try:
+                    if acquired:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                finally:
+                    os.close(fd)
+        finally:
+            local.release()
+
+
 def release_action_lock(prog_name: str) -> bool:
     """撤回★本行程自己剛建立★的動作鎖(只在「這一輪最後沒動手」時用)。
 
@@ -1499,15 +1544,18 @@ def release_action_lock(prog_name: str) -> bool:
     """
     try:
         lock = _lock_path_for(prog_name)
-        try:
-            owner = lock.read_bytes().split(b" ", 1)[0].decode("ascii", "replace")
-        except FileNotFoundError:
-            return False
-        if owner != str(os.getpid()):
-            logging.debug("[watchdog] 動作鎖不是本行程的(owner=%s)→ 不撤", owner)
-            return False
-        lock.unlink()
-        return True
+        with _action_claim_guard(lock) as acquired:
+            if not acquired:
+                return False
+            try:
+                owner = lock.read_bytes().split(b" ", 1)[0].decode("ascii", "replace")
+            except FileNotFoundError:
+                return False
+            if owner != str(os.getpid()):
+                logging.debug("[watchdog] 動作鎖不是本行程的(owner=%s)→ 不撤", owner)
+                return False
+            lock.unlink()
+            return True
     except Exception:
         logging.debug("[watchdog] 撤回動作鎖失敗 (%s)", prog_name, exc_info=True)
         return False
@@ -1523,32 +1571,35 @@ def claim_action_lock(prog_name: str, max_age_sec: int) -> bool:
         lock = _lock_path_for(prog_name)
         payload = f"{os.getpid()} {time.time():.0f}".encode("utf-8")
 
-        for _ in range(3):
-            try:
-                fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
+        with _action_claim_guard(lock) as acquired:
+            if not acquired:
+                return False
+            for _ in range(3):
                 try:
-                    age = time.time() - lock.stat().st_mtime
-                except FileNotFoundError:
+                    fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                except FileExistsError:
+                    try:
+                        age = time.time() - lock.stat().st_mtime
+                    except FileNotFoundError:
+                        continue
+                    if age < max_age_sec:
+                        return False
+                    try:
+                        lock.unlink()
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        logging.warning(
+                            "[watchdog] stale lock 移除失敗，跳過本輪動作 (%s)",
+                            prog_name,
+                            exc_info=True,
+                        )
+                        return False
                     continue
-                if age < max_age_sec:
-                    return False
-                try:
-                    lock.unlink()
-                except FileNotFoundError:
-                    continue
-                except OSError:
-                    logging.warning(
-                        "[watchdog] stale lock 移除失敗，跳過本輪動作 (%s)",
-                        prog_name,
-                        exc_info=True,
-                    )
-                    return False
-                continue
-            else:
-                with os.fdopen(fd, "wb") as f:
-                    f.write(payload)
-                return True
+                else:
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(payload)
+                    return True
         return False
     except Exception:
         logging.exception("[watchdog] lock 操作失敗 (%s)", prog_name)
