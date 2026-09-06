@@ -219,8 +219,10 @@ def test_push_helper_actually_runs_the_ratchet():
         if any("type_debt.py" in p for p in parts):
             found.append(parts)
     assert found, "push_helper 沒有把型別債棘輪納入推送前的關卡"
-    assert any("--fast" in p for p in found), (
-        f"跑了棘輪但沒用 --fast（逐條 70 秒 vs 一次 6 秒）：{found}")
+    # 2026-09-05 使用者定案：發佈須與 CI 一樣跑逐規則 full 路徑。
+    # --fast 仍供診斷使用，但不能替代最終待推版本的完整檢查。
+    assert all("--fast" not in p for p in found), (
+        f"發佈關卡不可用 --fast 代替 GitHub 同等的完整型別債檢查：{found}")
 
 
 def test_push_helper_counts_the_ratchet_as_a_blocking_gate():

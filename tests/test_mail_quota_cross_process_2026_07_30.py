@@ -86,11 +86,13 @@ print(got)
 
 def _child(app_dir, want, category=CLINICAL, account=ACC, script=None,
            wait=True):
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
     proc = subprocess.Popen(
         [sys.executable, str(script), os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "src")),
          str(app_dir), str(want), category, account],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        encoding="utf-8", env=env)
     if not wait:
         return proc
     out, err = proc.communicate(timeout=120)
@@ -108,6 +110,19 @@ def child_script(tmp_path):
 def _app_dir() -> str:
     from cmuh_common.paths import get_app_dir
     return get_app_dir()
+
+
+@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
+def test_child_diagnostics_decode_utf8_independently_of_parent_locale(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
+    script = tmp_path / "diagnostic_child.py"
+    script.write_text("import sys\nprint('→ 額度已滿', file=sys.stderr)\nprint(7)\n",
+                      encoding="utf-8")
+    proc = _child(tmp_path, 0, script=script, wait=False)
+    out, err = proc.communicate(timeout=15)
+    assert proc.returncode == 0
+    assert out.strip() == "7"
+    assert "→ 額度已滿" in err
 
 
 def test_a_second_real_process_shares_the_same_budget(child_script):
