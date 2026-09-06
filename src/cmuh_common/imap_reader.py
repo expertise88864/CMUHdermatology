@@ -294,6 +294,59 @@ def _parse_trigger_headers(header_raw: bytes) -> tuple:
         return "", "", ""
 
 
+def _auth_result_sections(text: str) -> list[str]:
+    """Split RFC 8601 results, ignoring comments but preserving quoted values.
+
+    A semicolon in a comment/reason is not another authentication result.
+    Unbalanced syntax is not usable evidence; never return a partial prefix.
+    """
+    sections, buf = [], []
+    depth, quoted, escaped = 0, False, False
+    for char in text:
+        if depth:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            continue
+        if quoted:
+            buf.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+            continue
+        if char == "(":
+            depth = 1
+            buf.append(" ")
+        elif char == ")":
+            return []
+        elif char == '"':
+            quoted = True
+            buf.append(char)
+        elif char == ";":
+            sections.append("".join(buf))
+            buf = []
+        else:
+            buf.append(char)
+    if depth or quoted:
+        return []
+    sections.append("".join(buf))
+    return sections
+
+
+_AUTH_PASS_RE = re.compile(r"^\s*(dmarc|dkim|spf)(?:\s*/\s*1)?\s*=\s*pass(?=\s|$)")
+_AUTH_PROPERTY_RE = re.compile(
+    r'\s+([a-z][a-z0-9_-]*(?:\s*\.\s*[a-z][a-z0-9_-]*)?)\s*=\s*'
+    r'("(?:\\.|[^"\\])*"(?:@[^\s";]+)?|[^\s";]+)')
+
+
 def _from_is_authenticated(auth_results: str, from_addr: str) -> bool:
     """Authentication-Results 是否證明這封信的 From 通過驗證。
 
@@ -332,22 +385,42 @@ def _from_is_authenticated(auth_results: str, from_addr: str) -> bool:
     #   塞進信裡的。攻擊者只要用自己完全控制、能通過 DMARC 的網域寄信,得到
     #   `dmarc=pass header.from=attacker.example`,再把 From 偽造成白名單醫師,
     #   舊版就直接放行。現在 dmarc 與 dkim/spf 走同一套 header.from 對齊檢查。
-    for mech, keys in (("dmarc", ("header.from=",)),
-                       ("dkim", ("header.d=", "header.i=")),
-                       ("spf", ("smtp.mailfrom=", "envelope-from="))):
-        idx = text.find(f"{mech}=pass")
-        if idx < 0:
+    keys_by_method = {
+        "dmarc": ("header.from",),
+        "dkim": ("header.d", "header.i"),
+        "spf": ("smtp.mailfrom", "envelope-from"),
+    }
+    # First section is authserv-id (trusted by _parse_trigger_headers).
+    # Each later section owns its result and properties: a pass from one
+    # section cannot borrow an aligned identity from a later failed result.
+    for section in _auth_result_sections(text)[1:]:
+        match = _AUTH_PASS_RE.match(section)
+        if match is None:
             continue
-        seg = text[idx:idx + 300]
-        for key in keys:
-            k = seg.find(key)
-            if k < 0:
-                continue
-            # 取該 key 之後、到下一個分隔字元為止的值
-            raw = seg[k + len(key):]
-            value = re.split(r"[;\s,()]", raw, maxsplit=1)[0]
-            if _aligned(value):
-                return True
+        pos = match.end()
+        properties = {}
+        valid = True
+        while pos < len(section):
+            prop = _AUTH_PROPERTY_RE.match(section, pos)
+            if prop is None:
+                valid = not section[pos:].strip()
+                break
+            key = re.sub(r"\s+", "", prop.group(1))
+            if key in properties:
+                valid = False           # ambiguous duplicate property
+                break
+            value = prop.group(2)
+            if value.startswith('"'):
+                quoted_value = re.fullmatch(r'"((?:\\.|[^"\\])*)"(.*)', value)
+                if quoted_value is None:
+                    valid = False
+                    break
+                value = re.sub(r"\\(.)", r"\1", quoted_value.group(1)) + quoted_value.group(2)
+            properties[key] = value
+            pos = prop.end()
+        if valid and any(_aligned(properties.get(key, ""))
+                         for key in keys_by_method[match.group(1)]):
+            return True
     return False
 
 
