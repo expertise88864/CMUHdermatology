@@ -67,13 +67,18 @@ class DeliveryTests(unittest.TestCase):
 
     def test_git_really_invokes_the_tracked_hook_and_blocks_unexpected_destination(self):
         # Entire remote is a new temporary bare repo: never contacts GitHub.
+        # Git hooks export GIT_DIR etc. Those MUST NOT reach a foreign repo,
+        # or even `git init <temp>` can reconfigure the calling repository.
+        local_vars = subprocess.check_output(["git", "rev-parse", "--local-env-vars"],
+                                             text=True, encoding="utf-8").splitlines()
+        foreign_env = {key: value for key, value in os.environ.items() if key not in local_vars}
         with tempfile.TemporaryDirectory(prefix="delivery-hook-") as directory:
             root = Path(directory)
             work = root / "work"
             remote = root / "remote.git"
             def run(*args):
                 return subprocess.run(["git", *args], cwd=work if work.exists() else root,
-                                      capture_output=True, text=True, encoding="utf-8", check=True)
+                                      capture_output=True, text=True, encoding="utf-8", check=True, env=foreign_env)
             run("init", "--bare", str(remote))
             run("init", str(work))
             run("config", "user.name", "Delivery test")
