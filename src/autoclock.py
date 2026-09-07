@@ -2445,7 +2445,8 @@ def _retry_after_dependency_repair(args_add, hard_exit_code) -> None:
                 if running.is_set():
                     # Runs on the reaper thread: success must exit the process,
                     # not merely raise SystemExit in this background thread.
-                    restart_program(args_add, hard_exit_code=0)
+                    restart_program(args_add, hard_exit_code=(
+                        0 if hard_exit_code is None else hard_exit_code))
                 return
             finally:
                 clock_lock.release()

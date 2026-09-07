@@ -116,17 +116,19 @@ def test_sweep_removes_only_old_files_of_our_own_naming(tmp_path):
     from cmuh_common.paths import sweep_old_restart_err_files
     now = _time.time()
     old_f = tmp_path / "cmuh_restart_autoclock_123.err"
+    old_hs = tmp_path / "cmuh_restart_autoclock_123.hs"
     new_f = tmp_path / "cmuh_restart_autoclock_456.err"
+    new_hs = tmp_path / "cmuh_restart_autoclock_456.hs"
     other = tmp_path / "別人的檔.err"
     other2 = tmp_path / "cmuh_restart_不是err.txt"
-    for f in (old_f, new_f, other, other2):
+    for f in (old_f, old_hs, new_f, new_hs, other, other2):
         f.write_bytes(b"x")
-    for f in (old_f, other, other2):
+    for f in (old_f, old_hs, other, other2):
         _os.utime(f, (0, now - 200000))
     removed = sweep_old_restart_err_files(str(tmp_path), now=now)
-    assert removed == 1
-    assert not old_f.exists(), "舊的自家檔要被清掉"
-    assert new_f.exists(), "新的不動"
+    assert removed == 2
+    assert not old_f.exists() and not old_hs.exists(), "舊的自家檔要被清掉"
+    assert new_f.exists() and new_hs.exists(), "新的不動"
     assert other.exists() and other2.exists(), "★不可波及別人的檔★"
 
 

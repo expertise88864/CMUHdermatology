@@ -37,6 +37,7 @@ def test_installer_finishes_all_declared_upgrades_before_any_import(tmp_path, mo
     installer.libs = [('good', 'good'), ('bad_a', 'bad_a'), ('bad_b', 'bad_b')]
     installer.total_libs = 3
     installer._repair_libs = {('bad_a', 'bad_a'), ('bad_b', 'bad_b')}
+    installer._bootstrap = False
     installer.failed_libs = []
     installer._closing = False
     installer.is_finished = False
@@ -61,6 +62,31 @@ def test_installer_finishes_all_declared_upgrades_before_any_import(tmp_path, mo
         os.close(installer._repair_lock_fd)
     assert installed == {'bad_a', 'bad_b'}
     assert early_imports == [], 'a good module can transitively import a not-yet-upgraded dependency'
+
+
+def test_lazy_dependency_install_does_not_recreate_restart_handshake(tmp_path, monkeypatch):
+    installer = object.__new__(di.DependencyInstaller)
+    installer.libs = [('good', 'json')]
+    installer.total_libs = 1
+    installer._repair_libs = set()
+    installer._bootstrap = False
+    installer.failed_libs = []
+    installer._closing = False
+    installer.is_finished = False
+    installer.update_ui = lambda *_args: None
+    installer._run_on_ui_thread = lambda _callback: True
+    installer._repair_lock_fd = deps_lock.acquire(str(tmp_path / 'repair.lock'))
+    signals = []
+    monkeypatch.setattr(di, 'parent_understands_bootstrapping', lambda: True)
+    monkeypatch.setattr(di, 'parent_supports_repair_only', lambda: False)
+    monkeypatch.setattr(di, 'restart_handshake_signal', signals.append)
+    monkeypatch.setattr(di, '_dependency_install_log_path', lambda: str(tmp_path / 'pip.log'))
+    monkeypatch.setattr(di, '_rotate_dependency_install_log', lambda *_args: False)
+    try:
+        installer.run_installation()
+    finally:
+        os.close(installer._repair_lock_fd)
+    assert signals == []
 
 
 def test_inherited_lease_survives_parent_handle_close(tmp_path):
@@ -108,7 +134,9 @@ def test_repair_only_child_exits_before_application_can_start(tmp_path, monkeypa
     monkeypatch.setattr(dr, 'restart_handshake_active', lambda: True)
     signals, repaired = [], []
     monkeypatch.setattr(dr, 'restart_handshake_signal', signals.append)
-    monkeypatch.setattr(dr, '_ensure_dependencies_locked', lambda *args: repaired.append(args))
+    monkeypatch.setattr(
+        dr, '_ensure_dependencies_locked',
+        lambda *args, **kwargs: repaired.append((args, kwargs)))
     with pytest.raises(SystemExit) as exc:
         dr.ensure_dependencies([], bootstrap=True)
     assert exc.value.code == 0
@@ -209,7 +237,9 @@ def test_clock_repair_completion_waits_for_punch_lock_then_retries(original_exit
     _functions_from_source('autoclock.py', ['_retry_after_dependency_repair'], ns)
     ns['_retry_after_dependency_repair']('--background', original_exit_code)
     assert calls == [('sleep', 5), ('sleep', 5),
-                     ('restart', '--background', {'hard_exit_code': 0}), 'release']
+                     ('restart', '--background', {
+                         'hard_exit_code': 0 if original_exit_code is None
+                         else original_exit_code}), 'release']
 
 
 @pytest.mark.parametrize('scheduler_alive', [False, True])

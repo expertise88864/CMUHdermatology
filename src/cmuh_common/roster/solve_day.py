@@ -1572,15 +1572,17 @@ def _solve_month_once(inp: DaySolveInput, seat_cap=None) -> tuple:
             continue
         members = set(batch.members)
         sessions = inp.prior_sessions[iso]
+        if not isinstance(sessions, dict):
+            continue
         for session in STUDENT_SESSIONS:
             slots = sessions.get(session)
-            if not slots:
+            if not isinstance(slots, dict) or not slots:
                 continue
             filtered = {}
             for slot_name, people in slots.items():
                 if slot_name in (PHOTO, TREATMENT):   # 照光/治療室屬 PGY 月度公平→不跨月餵
                     continue
-                keep = [p for p in people
+                keep = [p for p in (people or [])
                         if p in members and p not in inp.prior_pgy]
                 if keep:
                     filtered[slot_name] = keep

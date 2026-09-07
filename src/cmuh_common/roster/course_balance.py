@@ -53,17 +53,23 @@ def external_quota_warnings(inp, slots):
     out = []
     for p in external_roster(inp):
         for days in _weeks(inp).values():
-            count = sum(p in people for d in days
-                        for cells in slots.get(d.isoformat(), {}).values()
-                        for room, people in cells.items() if is_follow_slot(room))
+            count = sum(p in (people or []) for d in days
+                        for cells in ((slots.get(d.isoformat()) or {}).values()
+                                      if isinstance(slots.get(d.isoformat()) or {}, dict)
+                                      else ())
+                        for room, people in (cells.items()
+                                             if isinstance(cells, dict) else ())
+                        if is_follow_slot(room))
             low, high = ceil(len(days) * 4 / 5), len(days)
             if not low <= count <= high:
                 out.append(f"外訓 {p} {days[0]:%m/%d}～{days[-1]:%m/%d} 跟診 {count} 次"
                            f"（目標 {low}–{high}；請確認請假、鎖定與診間容量）")
         for half in (0, 1):
-            count = sum(p in cells.get(BIOPSY, []) for iso, sessions in slots.items()
+            count = sum(p in (cells.get(BIOPSY) or []) for iso, sessions in slots.items()
                         if _in_month_half(iso, inp.ym, half)
-                        for cells in sessions.values())
+                        for cells in (sessions.values()
+                                      if isinstance(sessions, dict) else ())
+                        if isinstance(cells, dict))
             if count != 1:
                 out.append(f"外訓 {p} {'1–14 日' if half == 0 else '15 日至月底'}"
                            f" 切片室 {count} 次（目標 1 次）")
@@ -189,14 +195,18 @@ def balance_rooms(inp, slots):
             continue
         if iso[:7] == inp.ym and (d not in inp.grid or d.weekday() >= 5):
             continue  # RF-02: retain grid-external locks, but never count them.
+        if not isinstance(sessions, dict):
+            continue
         for session, cells in sessions.items():
             if session not in STUDENT_SESSIONS:
+                continue
+            if not isinstance(cells, dict):
                 continue
             for r, ps in cells.items():
                 if is_follow_slot(r):
                     if iso[:7] == inp.ym and r not in inp.grid[d].get(session, []):
                         continue
-                    for p in ps:
+                    for p in (ps or []):
                         k = key(d, p)
                         if k and (iso[:7] == inp.ym or k[0] == "clerk"):
                             counts[k, r] += 1

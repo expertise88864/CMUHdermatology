@@ -205,8 +205,9 @@ def test_dependency_installer_window_is_destroyed_when_mainloop_fails(
     class FakeInstaller:
         destroyed = False
 
-        def __init__(self, _required_libs, _missing_libs, *, repair_lock_fd):
+        def __init__(self, _required_libs, _missing_libs, *, repair_lock_fd, bootstrap):
             self.is_finished = False
+            assert bootstrap is False
 
         def mainloop(self):
             raise RuntimeError("tk failed")
@@ -233,8 +234,9 @@ def test_dependency_installer_cancel_exits_nonzero(tmp_path, monkeypatch):
     from cmuh_common import deps_installer
 
     class FakeInstaller:
-        def __init__(self, _required_libs, _missing_libs, *, repair_lock_fd):
+        def __init__(self, _required_libs, _missing_libs, *, repair_lock_fd, bootstrap):
             self.is_finished = False
+            assert bootstrap is False
 
         def mainloop(self):
             return None
@@ -266,7 +268,7 @@ def _lock_env(monkeypatch, tmp_path, *, is_child):
     monkeypatch.setattr(dr, "_build_fingerprint", lambda _libs: "fp")
     ran = []
     monkeypatch.setattr(dr, "_ensure_dependencies_locked",
-                        lambda *a: ran.append(1))
+                        lambda *a, **kw: ran.append(1))
     return lock, ran
 
 
@@ -336,7 +338,7 @@ def test_an_unowned_marker_is_immediately_reusable(monkeypatch, tmp_path):
 
 def test_the_lock_is_released_even_when_the_repair_raises(monkeypatch, tmp_path):
     lock, _ran = _lock_env(monkeypatch, tmp_path, is_child=False)
-    def _boom(*_a):
+    def _boom(*_a, **_kw):
         raise SystemExit(1)
     monkeypatch.setattr(dr, "_ensure_dependencies_locked", _boom)
     with pytest.raises(SystemExit):
@@ -352,8 +354,9 @@ def test_dependency_still_missing_after_install_exits_nonzero(
     from cmuh_common import deps_installer
 
     class FakeInstaller:
-        def __init__(self, _required_libs, _missing_libs, *, repair_lock_fd):
+        def __init__(self, _required_libs, _missing_libs, *, repair_lock_fd, bootstrap):
             self.is_finished = True
+            assert bootstrap is False
 
         def mainloop(self):
             return None
