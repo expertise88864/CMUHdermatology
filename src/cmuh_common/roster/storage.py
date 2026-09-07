@@ -451,6 +451,38 @@ def external_month_codes(raw: dict) -> list:
     return list(codes)
 
 
+def family_month_codes(raw: dict) -> list:
+    codes = raw.get("family_month_roster", [])
+    if not isinstance(codes, list) or len(codes) > 2 or any(
+            not isinstance(c, str) or not c.strip() for c in codes):
+        raise ValueError("family_month_roster 家醫科名單須為 0–2 位非空白代號")
+    if len(set(codes)) != len(codes):
+        raise ValueError("family_month_roster 家醫科代號不可重複")
+    return list(codes)
+
+
+def family_follow_slots(ym: str, raw: dict) -> dict:
+    """Decode monthly per-person date/session requirements; never coerce bad JSON."""
+    block = raw.get("family_follow", {})
+    if not isinstance(block, dict):
+        raise ValueError("family_follow 家醫科指定跟診必須是物件")
+    result = {}
+    for code, keys in block.items():
+        if not isinstance(code, str) or not code.strip() or not isinstance(keys, list):
+            raise ValueError("family_follow 家醫科指定跟診須為代號對時段清單")
+        slots = set()
+        for key in keys:
+            if not isinstance(key, str) or "|" not in key:
+                raise ValueError("family_follow 跟診時段須為 YYYY-MM-DD|上午或下午")
+            iso, session = key.split("|", 1)
+            d = _iso_or_none(iso)
+            if d is None or d.isoformat() != iso or iso[:7] != ym or session not in ("上午", "下午"):
+                raise ValueError("family_follow 指定跟診須為本月日期及上午／下午")
+            slots.add((d, session))
+        result[code] = slots
+    return result
+
+
 def validate_authoritative_month(ym: str, raw: dict) -> None:
     """月檔的【內容】檢查 —— 會被靜靜濾掉的那些形狀(外審 RS-21 P2-03)。
 
@@ -468,6 +500,8 @@ def validate_authoritative_month(ym: str, raw: dict) -> None:
                          f"請修正該月檔之後再試（顯示不受影響）。")
 
     external_month_codes(raw)
+    family_month_codes(raw)
+    family_follow_slots(ym, raw)
     for scope in ("r", "vs"):
         duty = raw.get(f"{scope}_duty")
         if duty is not None and not isinstance(duty, dict):

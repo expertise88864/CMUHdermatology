@@ -240,8 +240,7 @@ def test_wed_pm_biopsy_forced_closed():
 
 
 def test_capacity3_clerk_overflow_before_third_pgy():
-    """容量 3：照光+治療室各 1 PGY 後，診間第 3 位留給 Clerk overflow（非第 2 個 PGY）。
-    [2026-07-23] 不釘死是哪位 PGY，驗結構：房內 = Clerk、PGY、Clerk（C-P-C）。"""
+    """2026-09-07：Clerk 先入座，剩餘容量由 PGY 補滿。"""
     fc = FairCounters()
     slots, _log = solve_session(
         date(2026, 8, 3), "上午", ["101"],
@@ -252,9 +251,9 @@ def test_capacity3_clerk_overflow_before_third_pgy():
     assert len(slots[TREATMENT]) == 1 and slots[TREATMENT][0] in pgys
     room = slots["101"]
     assert len(room) == 3
-    assert room[0] in ("1", "2") and room[2] in ("1", "2")   # 1、3 位是 Clerk
-    assert room[1] in pgys                                    # 第 2 位是剩下的 PGY
-    assert sorted([slots[PHOTO][0], slots[TREATMENT][0], room[1]]) \
+    assert room[0] in ("1", "2") and room[1] in ("1", "2")   # 1、3 位是 Clerk
+    assert room[2] in pgys                                    # 第 2 位是剩下的 PGY
+    assert sorted([slots[PHOTO][0], slots[TREATMENT][0], room[2]]) \
         == sorted(pgys)                                       # 三位 PGY 全上、不重複
     assert REST not in slots
 

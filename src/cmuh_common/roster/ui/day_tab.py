@@ -32,7 +32,7 @@ from cmuh_common.roster.ui.common import (
 from cmuh_common.roster.ui.duty import LeaveEditor
 
 _WD = "一二三四五六日"
-_TITLE = "PGY / Clerk / 外訓 排班"
+_TITLE = "PGY / Clerk / 外訓 / 家醫科 排班"
 # [2026-07-24 UI] 閒置時狀態列＝操作提示（月曆格點擊選單原本無處可發現）。
 _IDLE_HINT = ("就緒｜月曆格：點擊＝編輯/鎖定選單；滾輪捲動（Shift+滾輪＝水平）"
               "｜列表檢視：雙擊列＝編輯、選取後可按🔒")
@@ -144,6 +144,17 @@ class DayScheduleTab(ttk.Frame):
             b.pack(side="left", padx=4)
             self._edit_btns.append(b)
         ttk.Label(bar2, text="（Clerk 梯次/切片室開放於「設定」分頁管理）",
+                  foreground="gray").pack(side="left", padx=8)
+
+        bar3 = ttk.Frame(self, padding=(6, 3))
+        bar3.pack(fill="x")
+        for text, cmd in (("當月家醫科人員…", self._edit_family_roster),
+                          ("家醫科請假…", lambda: self._on_leave("family")),
+                          ("家醫科指定跟診…", self._edit_family_follow)):
+            b = ttk.Button(bar3, text=text, command=cmd)
+            b.pack(side="left", padx=4)
+            self._edit_btns.append(b)
+        ttk.Label(bar3, text="跟診優先：家醫科 ＞ Clerk＝外訓 ＞ PGY；鎖定沿用班表",
                   foreground="gray").pack(side="left", padx=8)
 
     def _build_grid(self, parent) -> None:
@@ -337,6 +348,13 @@ class DayScheduleTab(ttk.Frame):
                 st = external["stats"].get(c) or dict.fromkeys(STAT_KEYS, 0)
                 t2.insert("", "end", values=(c, st["biopsy"], st["follow"], st["rest"]))
 
+        family = data.get("family", {})
+        if family.get("roster"):
+            t2.insert("", "end", tags=("hdr",), values=("家醫科（本月）", "", "", ""))
+            for c in family["roster"]:
+                st = family["stats"].get(c) or dict.fromkeys(STAT_KEYS, 0)
+                t2.insert("", "end", values=(c, st["biopsy"], st["follow"], st["rest"]))
+
     def _refresh_warnings(self, warnings) -> None:
         self._warns.delete(0, tk.END)
         for w in warnings:
@@ -348,9 +366,9 @@ class DayScheduleTab(ttk.Frame):
     def _roster_members(self, scope: str) -> list:
         """側邊/請假用的成員清單 [{id,name}]（scope="pgy"/"clerk"）。"""
         ym = self.app.ym
-        if scope in ("pgy", "external"):
+        if scope in ("pgy", "external", "family"):
             inp = self.service.build_day_input(ym)
-            codes = inp.pgy_roster if scope == "pgy" else inp.external_roster
+            codes = getattr(inp, f"{scope}_roster")
             return [{"id": c, "name": ""} for c in codes]
         y, m = int(ym[:4]), int(ym[5:7])
         batches = [b for b in (ClerkBatch.from_dict(x)
@@ -374,7 +392,8 @@ class DayScheduleTab(ttk.Frame):
         if self._finalized or getattr(self, "_day_solving", False):
             return
         try:
-            if self.service.build_day_input(self.app.ym).external_roster:
+            inp = self.service.build_day_input(self.app.ym)
+            if inp.external_roster or inp.family_roster:
                 self._solve_external_async()
                 return
             # [RS-32 2026-08-30 使用者] 自動排班只排【明天起】:今天(含)以前
@@ -432,6 +451,12 @@ class DayScheduleTab(ttk.Frame):
                 for c in external["roster"]:
                     st = external["stats"].get(c) or dict.fromkeys(STAT_KEYS, 0)
                     base += f"\n{c}：跟診 {st['follow']}；切片室 {st['biopsy']}；空班 {st['rest']}"
+            family = data.get("family", {})
+            if family.get("roster"):
+                base += "\n\n【家醫科（本月；依手動指定時段）】"
+                for c in family["roster"]:
+                    st = family["stats"].get(c) or dict.fromkeys(STAT_KEYS, 0)
+                    base += f"\n{c}：跟診 {st['follow']}"
         except Exception:
             logging.debug("[roster.ui] 報告統計段生成失敗（略過）", exc_info=True)
         return base
@@ -563,6 +588,28 @@ class DayScheduleTab(ttk.Frame):
             messagebox.showinfo("本月停診", "門診週模板尚無診間（先於「設定」分頁建立）")
             return
         dlg = _ClinicClosureDialog(self, self.service, self.app.ym)
+        self.wait_window(dlg)
+        self.refresh()
+
+    def _edit_family_roster(self) -> None:
+        if self._finalized:
+            return
+        cur = self.service.build_day_input(self.app.ym).family_roster
+        val = _prompt_codes(self, "當月家醫科人員（0–2 人；例：家醫1、家醫2；空白＝0 人）", "、".join(cur))
+        if val is None:
+            return
+        guard_write(lambda: self.service.set_family_month_roster(
+            self.app.ym, _split_codes(val), baseline=list(cur)),
+            title="當月家醫科人員", parent=self)
+        self.refresh()
+
+    def _edit_family_follow(self) -> None:
+        if self._finalized:
+            return
+        if not self.service.build_day_input(self.app.ym).family_roster:
+            messagebox.showinfo("家醫科指定跟診", "請先設定當月家醫科人員（最多 2 人）", parent=self)
+            return
+        dlg = _FamilyFollowDialog(self, self.service, self.app.ym)
         self.wait_window(dlg)
         self.refresh()
 
@@ -1078,7 +1125,10 @@ class _DayEditDialog(tk.Toplevel):
         except Exception:
             logging.debug("[roster.ui] 編輯視窗候選名單讀取失敗", exc_info=True)
             return [], {}
+        self._family_cands = set(inp.family_roster)
         codes = list(inp.pgy_roster or []) + list(inp.external_roster or [])
+        codes += [p for p in inp.family_roster
+                  if (self.d, self.session) in inp.family_follow.get(p, set())]
         # ★候選人要套 RF-08 的勝者判準★(全審 2026-08-24 P2-03):同一天被多梯
         #   涵蓋時,自動排班只排【原始順序第一個】那一梯,敗者梯次的成員那天
         #   根本不上班 —— 把他們列進「＋選人」等於邀請使用者排一個自動排班
@@ -1091,7 +1141,7 @@ class _DayEditDialog(tk.Toplevel):
             logging.debug("[roster.ui] 當日梯次判定失敗（略過 Clerk 候選）",
                           exc_info=True)
         leaves: dict = {}
-        for scope in ("pgy", "clerk", "external"):
+        for scope in ("pgy", "clerk", "external", "family"):
             for c, days in ((inp.leaves or {}).get(scope) or {}).items():
                 leaves.setdefault(c, set()).update(days or ())
         seen, out = set(), []
@@ -1115,6 +1165,8 @@ class _DayEditDialog(tk.Toplevel):
             m.add_command(label="（本月無 PGY / 當日無 Clerk 梯次名單）",
                           state="disabled")
         for c in self._cands:
+            if c in getattr(self, "_family_cands", set()) and slot in _SPECIAL_SLOTS and c not in here:
+                continue
             other = [s for s, v in cur.items() if s != slot and c in v]
             mark = ""
             if self.d in (self._leaves.get(c) or ()):
@@ -1160,3 +1212,54 @@ class _DayEditDialog(tk.Toplevel):
             return
         self.destroy()
         self.on_done()
+
+
+class _FamilyFollowDialog(tk.Toplevel):
+    """Person-specific monthly AM/PM requirements; one atomic delta save."""
+    def __init__(self, parent, service, ym):
+        super().__init__(parent)
+        self.title(f"{ym} 家醫科指定跟診")
+        self.service, self.ym = service, ym
+        inp = service.build_day_input(ym)
+        self.baseline = {p: set(inp.family_follow.get(p, set())) for p in inp.family_roster}
+        self.variables = {}
+        ttk.Label(self, text="勾選該員必須皮膚科跟診的時段；每月分別設定。\n"
+                  "未勾選時段不自動排班；請假、停診或鎖定衝突會列出警告。",
+                  padding=10).pack(fill="x")
+        tabs = ttk.Notebook(self)
+        tabs.pack(fill="both", expand=True, padx=10)
+        import calendar
+        y, m = map(int, ym.split("-"))
+        for p in inp.family_roster:
+            page = ttk.Frame(tabs, padding=5)
+            tabs.add(page, text=p)
+            self.variables[p] = {}
+            for col, wd in enumerate(_WD):
+                ttk.Label(page, text=f"週{wd}", anchor="center").grid(row=0, column=col)
+                page.columnconfigure(col, weight=1)
+            for row, week in enumerate(calendar.monthcalendar(y, m), 1):
+                for col, n in enumerate(week):
+                    if not n:
+                        continue
+                    d = date(y, m, n)
+                    box = ttk.LabelFrame(page, text=str(n), padding=4)
+                    box.grid(row=row, column=col, sticky="nsew", padx=2, pady=2)
+                    for session in ("上午", "下午"):
+                        var = tk.BooleanVar(self, value=(d, session) in self.baseline[p])
+                        self.variables[p][d, session] = var
+                        closed = not inp.grid.get(d, {}).get(session)
+                        ttk.Checkbutton(box, text=session + ("（無診）" if closed else ""),
+                                        variable=var).pack(anchor="w")
+        bar = ttk.Frame(self, padding=10)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="儲存指定時段", command=self._save).pack(side="right")
+        ttk.Button(bar, text="取消", command=self.destroy).pack(side="right", padx=6)
+        self.transient(parent)
+
+    def _save(self):
+        specified = {p: {slot for slot, var in variables.items() if var.get()}
+                     for p, variables in self.variables.items()}
+        if guard_write(lambda: self.service.set_family_follow(
+                self.ym, specified, baseline=self.baseline),
+                title="家醫科指定跟診", parent=self):
+            self.destroy()

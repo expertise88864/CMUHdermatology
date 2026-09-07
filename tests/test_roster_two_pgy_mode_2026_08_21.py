@@ -62,17 +62,15 @@ class TestThePhotoOnlySessions:
         assert all("P1" not in ps for r, ps in slots.items() if r != PHOTO)
 
 
-class TestThePgyBeatsTheClerkForSeats:
-    def test_the_pgy_takes_the_scarce_seat(self):
-        """容量 1×單房:座位只有一個 —— 使用者定案 PGY 優先權>Clerk。
-        (TwoPgySeatStep 在 ClerkSeedStep 之前;放在之後的話 Clerk 先坐滿,
-        PGY 只能放假 —— 那正是這批要修掉的形狀。)"""
+class TestClerkPriorityOverPgy:
+    def test_clerk_takes_the_scarce_seat(self):
+        """2026-09-07 新定案：Clerk 跟診優先於 PGY；保留照光站別。"""
         d, session = TUE_AM
         slots, _ = _session(d, session, pgy=["P1", "P2"], clerk=["C1", "C2"],
                             rooms=("101",), capacity=1)
         other = ({"P1", "P2"} - set(slots[PHOTO])).pop()
-        assert slots["101"] == [other], slots
-        assert set(slots[REST]) == {"C1", "C2"}
+        assert len(slots["101"]) == 1 and slots["101"][0] in {"C1", "C2"}
+        assert set(slots[REST]) == {other} | ({"C1", "C2"} - set(slots["101"]))
 
     def test_three_pgy_months_keep_the_clerk_seed_order(self):
         """非兩位 PGY 月不動:同樣稀缺座位,照舊 ClerkSeed 先(1C+1P 混搭)。"""

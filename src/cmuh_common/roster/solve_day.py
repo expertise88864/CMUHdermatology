@@ -563,15 +563,7 @@ def _room_order(ctx, pref_first: bool = False) -> list:
 
 
 class TwoPgySeatStep(FillStep):
-    """[RS-15] 兩位 PGY 月:照光/治療室之外仍空著的 PGY 先入座(優先權>Clerk)。
-
-    必須放在 ClerkSeedStep ★之前★才成立:座位=房數×容量,容量 1 或房少時
-    Clerk 先坐滿,PgyMixStep 就沒有位子可補 —— 使用者定案 PGY 跟診優先權
-    >Clerk。非兩位 PGY 月完全不動(既有 1C+1P 混搭順序照舊);兩位 PGY 月的
-    其他時段照光+治療室已把兩人占滿 → 此步自然無事可做,實際只在「只排照光」
-    時段(二早/四下/五早)與治療室本就休診的時段釋出人力時生效。
-    座位輪選走同一個 `_seat`(公平/房多樣性/同伴多樣性/Apply 偏好全沿用)。
-    """
+    """兩位 PGY 月：Clerk 入座後，剩餘診位沿用 PGY 週別公平輪選。"""
 
     def run(self, ctx, slots, log):
         if not ctx.two_pgy_mode:
@@ -616,7 +608,7 @@ class PgyMixStep(FillStep):
                 _seat(ctx, ctx.pgy, r, _pgy_ck, prefer=ctx.room_pref(r))
         # (b) 再填空診間的第 1、2 位（PGY 只優先到第 2 位；第 3 位起留給 Clerk
         #     overflow — 見 §3.6 步驟 4/5）。無 Clerk 月即由此直填診間。
-        for slot in range(min(ctx.capacity, 2)):
+        for slot in range(ctx.capacity):
             for r in rooms:
                 if not ctx.pgy:
                     return
@@ -653,8 +645,8 @@ class RestStep(FillStep):
         log.append(f"{ctx.session} 放假：{'、'.join(rest_people)}")
 
 
-PIPELINE = [PhotoStep(), TreatmentStep(), BiopsyStep(), TwoPgySeatStep(),
-            ClerkSeedStep(), PgyMixStep(), ClerkOverflowStep(), RestStep()]
+PIPELINE = [PhotoStep(), TreatmentStep(), BiopsyStep(), ClerkSeedStep(),
+            ClerkOverflowStep(), TwoPgySeatStep(), PgyMixStep(), RestStep()]
 
 
 def solve_session(d: date, session: str, rooms: list, pgy_avail: list,
@@ -759,6 +751,8 @@ class DaySolveInput:
     #   進了 dataclass 就自動進指紋 → 預覽期間有人改動下個月的鎖定/定案,
     #   套用時會被判過期(全審點名的第二個缺口)。
     course_fixed: dict = field(default_factory=dict)
+    family_roster: list = field(default_factory=list)
+    family_follow: dict = field(default_factory=dict)  # {code: {(date, session)}}
     external_roster: list = field(default_factory=list)  # monthly external trainees
     apply_pref: set = field(default_factory=set)  # Apply 本科 PGY（101 週二/五平手優先）
 
@@ -1298,6 +1292,13 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
 
 
 def _month_solve_attendance(inp: DaySolveInput) -> tuple:
+    from .follow_priority import spread_clerk_days
+    slots, log, warnings = _month_solve_attendance_raw(inp)
+    spread_clerk_days(inp, slots)
+    return slots, log, warnings
+
+
+def _month_solve_attendance_raw(inp: DaySolveInput) -> tuple:
     """整月逐（工作日×早/午）填充 → (day_slots, log, warnings)。
 
     day_slots: {iso: {session: {slot: [代號]}}}；warnings: 人話警告清單。
@@ -1652,8 +1653,9 @@ def _solve_month_once(inp: DaySolveInput, seat_cap=None) -> tuple:
             if locked_slots is not None:          # 鎖定時段：保留原樣、只餵進計數
                 day_slots.setdefault(iso, {})[session] = locked_slots
                 _warn_locked_content(warnings, d, session, locked_slots,
-                                     pgy_set, clerk_set | set(inp.external_roster), pgy_leave,
-                                     {**clerk_leave, **(inp.leaves.get("external") or {})})
+                                     pgy_set, clerk_set | set(inp.external_roster) | set(inp.family_roster), pgy_leave,
+                                     {**clerk_leave, **(inp.leaves.get("external") or {}),
+                                      **(inp.leaves.get("family") or {})})
                 replay_counters(fc, d, session, locked_slots, batch_key,
                                 pgy_set, clerk_set)
                 log.append(f"{d.month}/{d.day}({'一二三四五六日'[d.weekday()]}) "

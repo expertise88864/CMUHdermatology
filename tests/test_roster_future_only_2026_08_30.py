@@ -155,6 +155,8 @@ class TestTheSolverKeepsThePastAndSchedulesTheFuture:
         照光必是 P1、跟診輪給 P2(預掃讀的就是 locked,自動接上)。"""
         svc = _svc(tmp_path, day_slots={
             TUE.isoformat(): {"上午": {PHOTO: ["P2"], "101": ["P1"]}}})
+        # 新優先序先給兩位 Clerk；保留一個診位驗證 PGY 過去週別回放。
+        svc.update_config(lambda cfg: cfg.update(room_capacity=3))
         ds, _l, _w = month_solve_day(svc.build_day_input(YM, today=WED))
         thu_pm = ds[THU.isoformat()]["下午"]
         assert thu_pm[PHOTO] == ["P1"], thu_pm

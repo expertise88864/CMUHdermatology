@@ -224,6 +224,8 @@ _WRITER_PREFIXES = ("set_", "update_", "save_", "accept_", "clear_",
 _CLASSIFIED = {
     "set_leaves": "delta", "set_must": "delta", "set_day_session": "delta",
     "set_external_month_roster": "delta",
+    "set_family_month_roster": "delta",
+    "set_family_follow": "delta",
     "set_pgy_month_roster": "delta", "set_pgy_apply_pref": "delta",
     "set_biopsy_cells": "delta", "set_pgy_default_members": "delta",
     "update_clerk_batch_fields": "delta-fields",

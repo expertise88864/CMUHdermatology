@@ -68,7 +68,7 @@ from cmuh_common.roster.storage import (
     RosterStorage,
     StaleRosterDataError,
     StrictSources,
-    external_month_codes,
+    external_month_codes, family_month_codes, family_follow_slots,
     next_ym,
     prev_ym,
 )
@@ -854,6 +854,7 @@ class RosterService:
         #   (`load_month` 對不存在的月份回一份預設月檔,刻意如此。)
         _nxt_month = st.load_month(_nxt)
         leaves = {
+            "family": _parse_date_map((month.get("leaves") or {}).get("family") or {}),
             "external": _parse_date_map((month.get("leaves") or {}).get("external") or {}),
             "pgy": _parse_date_map((month.get("leaves") or {}).get("pgy") or {}),
             "clerk": _parse_date_map((month.get("leaves") or {}).get("clerk") or {}),
@@ -959,6 +960,8 @@ class RosterService:
         return DaySolveInput(
             ym=ym, grid=grid, pgy_roster=list(pgy_roster),
             external_roster=external_month_codes(month),
+            family_roster=family_month_codes(month),
+            family_follow=family_follow_slots(ym, month),
             clerk_batches=covering, batch_order=batch_order,
             biopsy_open=biopsy_open, leaves=leaves,
             # [RS-29] 相鄰月份的既定時段(鎖定/已定案)——只餵計數與可行性,
@@ -1458,6 +1461,9 @@ class RosterService:
         #   ★不必先建 `inp`★:沒有待辦時它連建都不建(見該方法),所以放在這裡
         #   不會讓每個月都多付一次 `build_day_input`。
         out.extend(self.require_grid_shifts_reconciled(ym))
+        if month.get("family_month_roster") or month.get("family_follow"):
+            from .follow_priority import family_requirement_warnings
+            out.extend(family_requirement_warnings(self.build_day_input(ym), day_slots))
         if not day_slots:
             return out
         inp = self.build_day_input(ym)
@@ -1494,11 +1500,12 @@ class RosterService:
             _owner = day_owner_batch(_order, d)
             clerk_today = {str(c) for c in ((_owner.members or [])
                                             if _owner else ())}
-            valid = pgy_set | clerk_today | set(inp.external_roster)
+            valid = pgy_set | clerk_today | set(inp.external_roster) | set(inp.family_roster)
             leavers = {mid for mid, ds in (inp.leaves.get("pgy") or {}).items()
                        if d in ds}
             leavers |= {mid for mid, ds in (inp.leaves.get("clerk") or {}).items()
                         if d in ds}
+            leavers |= {mid for mid, ds in (inp.leaves.get("family") or {}).items() if d in ds}
             leavers |= {mid for mid, ds in (inp.leaves.get("external") or {}).items() if d in ds}
             for session, slots in (day_slots.get(iso) or {}).items():
                 # 房號型別由 `clinic_closures` 統一正規化(規則只有一份)
@@ -1586,6 +1593,10 @@ class RosterService:
                              "stats": person_course_stats(
                                  {i: v for i, v in cur_slots.items() if i[:7] == ym},
                                  include=set(inp.external_roster))},
+                "family": {"roster": list(inp.family_roster),
+                           "stats": person_course_stats(
+                               {i: v for i, v in cur_slots.items() if i[:7] == ym},
+                               include=set(inp.family_roster))},
                 "batches": batches_out}
 
     def update_month(self, ym: str, mutator, *, retries: int = 4):
@@ -1839,6 +1850,7 @@ class RosterService:
             for ym in self.storage.iter_month_yms():
                 month = self.storage.load_month(ym)
                 if month.get("pgy_month_roster") is None:
+                    assert_no_cross_roster(merged, family_month_codes(month), "PGY 預設代號", f"{ym} 家醫科")
                     assert_no_cross_roster(merged, month.get("external_month_roster") or [],
                                            "PGY 預設代號", f"{ym} 外訓")
             cfg["pgy_members"] = [by_id.get(c, {"id": c}) for c in merged]
@@ -1983,6 +1995,13 @@ class RosterService:
                 month = self.storage.load_month(ym)
                 cur = month.get("pgy_month_roster")
                 try:
+                    family = family_month_codes(month)
+                    family_follow_slots(ym, month)
+                    clash = set(family) & (set(self._effective_pgy_codes(ym))
+                                          | set(self._clerk_codes_in_month(ym))
+                                          | set(external_month_codes(month)))
+                    if clash:
+                        out.append(f"{ym} 家醫科代號與其他名單重複：{'、'.join(sorted(clash))}")
                     external = external_month_codes(month)
                     overlap = set(external) & (set(self._effective_pgy_codes(ym))
                                                | set(self._clerk_codes_in_month(ym)))
@@ -2089,7 +2108,10 @@ class RosterService:
             result = mutator(batches)
             for batch in batches:
                 for ym in self._months_of_batch(batch.get("start_monday")):
-                    external = self.storage.load_month(ym).get("external_month_roster") or []
+                    month = self.storage.load_month(ym)
+                    assert_no_cross_roster(batch.get("members") or [], family_month_codes(month),
+                                           "Clerk 梯次", f"{ym} 家醫科")
+                    external = month.get("external_month_roster") or []
                     assert_no_cross_roster(batch.get("members") or [], external,
                                            "Clerk 梯次", f"{ym} 外訓")
             return result
@@ -2315,6 +2337,37 @@ class RosterService:
                 d, expected_revision=rev),
             mutator, retries=retries)
 
+    def set_family_month_roster(self, ym: str, codes, *, baseline) -> None:
+        edited = assert_unique_codes(codes, "當月家醫科人員")
+        family_month_codes({"family_month_roster": edited})
+        def mutate(month):
+            merged = sorted(merge_set_edit(family_month_codes(month), baseline or [], edited))
+            family_month_codes({"family_month_roster": merged})
+            assert_no_cross_roster(merged, self._effective_pgy_codes(ym), "家醫科", "PGY")
+            assert_no_cross_roster(merged, self._clerk_codes_in_month(ym), "家醫科", "Clerk")
+            assert_no_cross_roster(merged, external_month_codes(month), "家醫科", "外訓")
+            month["family_month_roster"] = merged
+            for p in set(baseline or []) - set(edited):
+                month.get("family_follow", {}).pop(p, None)
+        with self.storage.write_barrier():
+            self.update_month(ym, mutate)
+
+    def set_family_follow(self, ym: str, specified: dict, *, baseline) -> None:
+        def mutate(month):
+            roster = family_month_codes(month)
+            current = family_follow_slots(ym, month)
+            for p, slots in specified.items():
+                if p not in roster:
+                    raise ValueError(f"家醫科 {p} 已不在當月名單，請重新開啟設定")
+                current[p] = merge_set_edit(current.get(p, set()),
+                                            (baseline or {}).get(p, set()), slots)
+            block = {p: sorted(f"{d.isoformat()}|{session}" for d, session in slots)
+                     for p, slots in current.items()}
+            family_follow_slots(ym, {"family_follow": block})
+            month["family_follow"] = block
+        with self.storage.write_barrier():
+            self.update_month(ym, mutate)
+
     def set_external_month_roster(self, ym: str, codes, *, baseline) -> None:
         edited = assert_unique_codes(codes, "當月外訓人員")
         def mutate(month):
@@ -2322,6 +2375,7 @@ class RosterService:
             merged = sorted(merge_set_edit(current, baseline or [], edited))
             assert_no_cross_roster(merged, self._effective_pgy_codes(ym), "外訓", "PGY")
             assert_no_cross_roster(merged, self._clerk_codes_in_month(ym), "外訓", "Clerk")
+            assert_no_cross_roster(merged, family_month_codes(month), "外訓", "家醫科")
             month["external_month_roster"] = merged
         with self.storage.write_barrier():
             self.update_month(ym, mutate)
@@ -2350,6 +2404,7 @@ class RosterService:
                        if str(c) in keep and str(c) not in merged]
             assert_no_cross_roster(merged, month.get("external_month_roster") or [],
                                    "當月 PGY", "當月外訓")
+            assert_no_cross_roster(merged, family_month_codes(month), "當月 PGY", "家醫科")
             month["pgy_month_roster"] = merged
         # ★config 與月檔的讀寫要在同一個臨界區★:兩者之間背景同步換掉 config
         #   的話,合併用的「目前名單」與寫進去的月檔不是同一個盤面。
