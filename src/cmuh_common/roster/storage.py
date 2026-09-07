@@ -438,6 +438,19 @@ def validate_authoritative_shape(name: str, raw: dict) -> None:
                             f"（{type(on).__name__}）")
 
 
+def external_month_codes(raw: dict) -> list:
+    """Validate the optional monthly external roster without coercing bad data."""
+    codes = raw.get("external_month_roster")
+    if codes is None:
+        return []
+    if not isinstance(codes, list) or any(
+            not isinstance(c, str) or not c.strip() for c in codes):
+        raise ValueError("external_month_roster 外訓名單必須是非空白代號字串的清單")
+    if len(codes) != len(set(codes)):
+        raise ValueError("external_month_roster 外訓名單有重複代號")
+    return list(codes)
+
+
 def validate_authoritative_month(ym: str, raw: dict) -> None:
     """月檔的【內容】檢查 —— 會被靜靜濾掉的那些形狀(外審 RS-21 P2-03)。
 
@@ -454,6 +467,7 @@ def validate_authoritative_month(ym: str, raw: dict) -> None:
         raise ValueError(f"{ym}.json 的內容不適合用來排班/結算：{why}。"
                          f"請修正該月檔之後再試（顯示不受影響）。")
 
+    external_month_codes(raw)
     for scope in ("r", "vs"):
         duty = raw.get(f"{scope}_duty")
         if duty is not None and not isinstance(duty, dict):

@@ -217,6 +217,14 @@ class TestTheMergedConflictIsVisible:
         之間把他機的 Clerk 拉進來 —— 寫出一份當場違反不變量的月檔。"""
         import inspect
         src = inspect.getsource(RosterService.set_pgy_month_roster)
-        i = src.index("write_barrier()")
-        j = src.index("assert_no_cross_roster(")
+        import ast
+        import textwrap
+        fn = ast.parse(textwrap.dedent(src)).body[0]
+        # Ignore the definition of the CAS callback: it runs inside update_month,
+        # not at its source position. Check the actual outer precheck ordering.
+        fn.body = [node for node in fn.body if not isinstance(node, ast.FunctionDef)]
+        outer = ast.unparse(fn)
+        i = outer.index("write_barrier()")
+        j = outer.index("assert_no_cross_roster(")
         assert i < j, "★跨池檢查在臨界區之外★"
+        assert i < outer.index("self.update_month(")

@@ -68,6 +68,7 @@ from cmuh_common.roster.storage import (
     RosterStorage,
     StaleRosterDataError,
     StrictSources,
+    external_month_codes,
     next_ym,
     prev_ym,
 )
@@ -853,6 +854,7 @@ class RosterService:
         #   (`load_month` 對不存在的月份回一份預設月檔,刻意如此。)
         _nxt_month = st.load_month(_nxt)
         leaves = {
+            "external": _parse_date_map((month.get("leaves") or {}).get("external") or {}),
             "pgy": _parse_date_map((month.get("leaves") or {}).get("pgy") or {}),
             "clerk": _parse_date_map((month.get("leaves") or {}).get("clerk") or {}),
         }
@@ -956,6 +958,7 @@ class RosterService:
 
         return DaySolveInput(
             ym=ym, grid=grid, pgy_roster=list(pgy_roster),
+            external_roster=external_month_codes(month),
             clerk_batches=covering, batch_order=batch_order,
             biopsy_open=biopsy_open, leaves=leaves,
             # [RS-29] 相鄰月份的既定時段(鎖定/已定案)——只餵計數與可行性,
@@ -1420,14 +1423,14 @@ class RosterService:
                                 f"{iso} {session}:切片室排了 {len(members)} 位"
                                 f"({'、'.join(members)})—— 一個切片時段一個人")
                         outsiders = [c for c in members
-                                     if c not in owner_members]
+                                     if c not in owner_members and c not in inp.external_roster]
                         if outsiders:
                             _who = (f"當天的梯次是「{owner.id}」"
                                     if owner else "當天沒有任何 Clerk 梯次")
                             out.append(
                                 f"{iso} {session}:切片室排了 "
                                 f"{'、'.join(outsiders)} —— {_who},"
-                                f"切片室只能排該梯次的 Clerk")
+                                f"切片室只能排該梯次的 Clerk 或當月外訓")
                     elif slot not in _SPECIAL_SLOTS and len(members) > cap:
                         out.append(f"{iso} {session} {slot} 診:{len(members)} 人"
                                    f"超過容量 {cap}")
@@ -1458,6 +1461,11 @@ class RosterService:
         if not day_slots:
             return out
         inp = self.build_day_input(ym)
+        from .course_balance import external_biopsy_open, external_quota_warnings, external_roster
+        conflicts = set(inp.external_roster) - set(external_roster(inp))
+        if conflicts:
+            out.append(f"外訓代號與 PGY/Clerk 重複：{'、'.join(sorted(conflicts))}")
+        out.extend(external_quota_warnings(inp, day_slots))
         pgy_set = {str(c) for c in inp.pgy_roster}
         _order = arbitration_order(inp)
         # [RS-30] RS-15 的判準與求解器同一條:該月 PGY 名單恰 2 位。
@@ -1486,11 +1494,12 @@ class RosterService:
             _owner = day_owner_batch(_order, d)
             clerk_today = {str(c) for c in ((_owner.members or [])
                                             if _owner else ())}
-            valid = pgy_set | clerk_today
+            valid = pgy_set | clerk_today | set(inp.external_roster)
             leavers = {mid for mid, ds in (inp.leaves.get("pgy") or {}).items()
                        if d in ds}
             leavers |= {mid for mid, ds in (inp.leaves.get("clerk") or {}).items()
                         if d in ds}
+            leavers |= {mid for mid, ds in (inp.leaves.get("external") or {}).items() if d in ds}
             for session, slots in (day_slots.get(iso) or {}).items():
                 # 房號型別由 `clinic_closures` 統一正規化(規則只有一份)
                 closed = set((closures.get(iso) or {}).get(session) or [])
@@ -1511,6 +1520,8 @@ class RosterService:
                     #   依使用者 2026-08-25 的定案,這兩條★只警告、不擋存也不擋
                     #   定案★(它們是排班規則,不是「規則上不可能成立」的結構)。
                     if (slot == BIOPSY and members
+                            and not (all(c in inp.external_roster for c in members)
+                                     and external_biopsy_open(inp, d, session))
                             and not self._biopsy_is_open(
                                 _open_slots, _order, d, session)):
                         out.append(f"{iso} {session}：切片室今天沒有開放，"
@@ -1571,6 +1582,10 @@ class RosterService:
                     merged, include={str(c) for c in b.members},
                     start=b.start_monday, end=b_end)})
         return {"pgy": {"roster": list(inp.pgy_roster), "stats": pgy_stats},
+                "external": {"roster": list(inp.external_roster),
+                             "stats": person_course_stats(
+                                 {i: v for i, v in cur_slots.items() if i[:7] == ym},
+                                 include=set(inp.external_roster))},
                 "batches": batches_out}
 
     def update_month(self, ym: str, mutator, *, retries: int = 4):
@@ -1821,6 +1836,11 @@ class RosterService:
                 adds = [c for c in codes if c not in base]
                 merged = [c for c in cur if c not in removes]
                 merged += [c for c in adds if c not in merged]
+            for ym in self.storage.iter_month_yms():
+                month = self.storage.load_month(ym)
+                if month.get("pgy_month_roster") is None:
+                    assert_no_cross_roster(merged, month.get("external_month_roster") or [],
+                                           "PGY 預設代號", f"{ym} 外訓")
             cfg["pgy_members"] = [by_id.get(c, {"id": c}) for c in merged]
             out["merged"] = merged
         with self.storage.write_barrier():     # 見 set_pgy_month_roster 的說明
@@ -1960,7 +1980,16 @@ class RosterService:
                     f"該期間的 PGY —— 排班時只會當 PGY 排,請修正其中一邊")
         for ym in self.storage.iter_month_yms():
             try:
-                cur = self.storage.load_month(ym).get("pgy_month_roster")
+                month = self.storage.load_month(ym)
+                cur = month.get("pgy_month_roster")
+                try:
+                    external = external_month_codes(month)
+                    overlap = set(external) & (set(self._effective_pgy_codes(ym))
+                                               | set(self._clerk_codes_in_month(ym)))
+                    if overlap:
+                        out.append(f"{ym} 外訓代號與 PGY/Clerk 重複：{'、'.join(sorted(overlap))}")
+                except ValueError as e:
+                    out.append(f"{ym} {e}")
             except Exception:                  # 壞月檔另有守衛,不在這裡吵
                 continue
             dup = duplicated_codes([str(c) for c in (cur or [])])
@@ -2056,11 +2085,20 @@ class RosterService:
             self.update_clerk_batches(lambda bs: bs.append(dict(batch)))
 
     def update_clerk_batches(self, mutator, *, retries: int = 4):
-        return self._update_canonical(
-            "clerk_batches.json",
-            lambda d, rev: self.storage.save_clerk_batches(
-                d, expected_revision=rev),
-            mutator, retries=retries)
+        def checked_mutator(batches):
+            result = mutator(batches)
+            for batch in batches:
+                for ym in self._months_of_batch(batch.get("start_monday")):
+                    external = self.storage.load_month(ym).get("external_month_roster") or []
+                    assert_no_cross_roster(batch.get("members") or [], external,
+                                           "Clerk 梯次", f"{ym} 外訓")
+            return result
+        with self.storage.write_barrier():
+            return self._update_canonical(
+                "clerk_batches.json",
+                lambda d, rev: self.storage.save_clerk_batches(
+                    d, expected_revision=rev),
+                checked_mutator, retries=retries)
 
     @staticmethod
     def clinic_template_identity(entry: dict) -> tuple:
@@ -2277,6 +2315,17 @@ class RosterService:
                 d, expected_revision=rev),
             mutator, retries=retries)
 
+    def set_external_month_roster(self, ym: str, codes, *, baseline) -> None:
+        edited = assert_unique_codes(codes, "當月外訓人員")
+        def mutate(month):
+            current = month.get("external_month_roster") or []
+            merged = sorted(merge_set_edit(current, baseline or [], edited))
+            assert_no_cross_roster(merged, self._effective_pgy_codes(ym), "外訓", "PGY")
+            assert_no_cross_roster(merged, self._clerk_codes_in_month(ym), "外訓", "Clerk")
+            month["external_month_roster"] = merged
+        with self.storage.write_barrier():
+            self.update_month(ym, mutate)
+
     def set_pgy_month_roster(self, ym: str, codes, *, baseline) -> None:
         """`baseline`＝開窗時畫面上的那一份(必填)。★整份覆蓋會吃掉他機剛加
         的人★:那個人明天就不會出現在日排班的候選名單裡,而畫面上看不出來。"""
@@ -2299,6 +2348,8 @@ class RosterService:
             merged = [c for c in edited if c in keep]
             merged += [str(c) for c in cur
                        if str(c) in keep and str(c) not in merged]
+            assert_no_cross_roster(merged, month.get("external_month_roster") or [],
+                                   "當月 PGY", "當月外訓")
             month["pgy_month_roster"] = merged
         # ★config 與月檔的讀寫要在同一個臨界區★:兩者之間背景同步換掉 config
         #   的話,合併用的「目前名單」與寫進去的月檔不是同一個盤面。

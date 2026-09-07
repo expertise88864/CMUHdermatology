@@ -263,7 +263,7 @@ class ScheduleApp:
         specs = [
             ("設定", self._build_settings),
             ("值班排班 R/VS", self._build_duty),
-            ("PGY / Clerk 排班", self._build_day),
+            ("PGY / Clerk / 外訓 排班", self._build_day),
         ]
         for name, builder in specs:
             cont = ttk.Frame(nb)

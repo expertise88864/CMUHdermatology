@@ -759,6 +759,7 @@ class DaySolveInput:
     #   進了 dataclass 就自動進指紋 → 預覽期間有人改動下個月的鎖定/定案,
     #   套用時會被判過期(全審點名的第二個缺口)。
     course_fixed: dict = field(default_factory=dict)
+    external_roster: list = field(default_factory=list)  # monthly external trainees
     apply_pref: set = field(default_factory=set)  # Apply 本科 PGY（101 週二/五平手優先）
 
 
@@ -1292,6 +1293,11 @@ def biopsy_quota_warnings(batches, counts, *, batch_more=(),
 
 
 def month_solve_day(inp: DaySolveInput) -> tuple:
+    from .course_balance import finish_courses
+    return finish_courses(inp, *_month_solve_attendance(inp))
+
+
+def _month_solve_attendance(inp: DaySolveInput) -> tuple:
     """整月逐（工作日×早/午）填充 → (day_slots, log, warnings)。
 
     day_slots: {iso: {session: {slot: [代號]}}}；warnings: 人話警告清單。
@@ -1646,7 +1652,8 @@ def _solve_month_once(inp: DaySolveInput, seat_cap=None) -> tuple:
             if locked_slots is not None:          # 鎖定時段：保留原樣、只餵進計數
                 day_slots.setdefault(iso, {})[session] = locked_slots
                 _warn_locked_content(warnings, d, session, locked_slots,
-                                     pgy_set, clerk_set, pgy_leave, clerk_leave)
+                                     pgy_set, clerk_set | set(inp.external_roster), pgy_leave,
+                                     {**clerk_leave, **(inp.leaves.get("external") or {})})
                 replay_counters(fc, d, session, locked_slots, batch_key,
                                 pgy_set, clerk_set)
                 log.append(f"{d.month}/{d.day}({'一二三四五六日'[d.weekday()]}) "

@@ -4,7 +4,7 @@
 PGY 與 Clerk 共用同一份 day_slots（同時段一起填），故兩個分頁看的是同一張表；
 差別只在側邊管理面板（PGY＝當月人員；Clerk＝梯次於設定頁管理）與請假 scope。
 
-自動排班走 solve_day（純 Python，無 ortools）→ 即時；預覽警告後才落地。
+外訓使用釘版 OR-Tools，於背景安裝／求解；預覽警告後才落地。
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ from cmuh_common.roster.ui.common import (
 from cmuh_common.roster.ui.duty import LeaveEditor
 
 _WD = "一二三四五六日"
-_TITLE = "PGY / Clerk 排班"
+_TITLE = "PGY / Clerk / 外訓 排班"
 # [2026-07-24 UI] 閒置時狀態列＝操作提示（月曆格點擊選單原本無處可發現）。
 _IDLE_HINT = ("就緒｜月曆格：點擊＝編輯/鎖定選單；滾輪捲動（Shift+滾輪＝水平）"
               "｜列表檢視：雙擊列＝編輯、選取後可按🔒")
@@ -135,6 +135,8 @@ class DayScheduleTab(ttk.Frame):
         for text, cmd in (
                 ("PGY 請假…", lambda: self._on_leave("pgy")),
                 ("Clerk 請假…", lambda: self._on_leave("clerk")),
+                ("外訓請假…", lambda: self._on_leave("external")),
+                ("當月外訓人員…", self._edit_external_roster),
                 ("本月停診…", self._on_clinic_closure),
                 ("當月 PGY 人員…", self._edit_pgy_roster),
                 ("Apply本科…", self._edit_apply_pref)):
@@ -328,6 +330,13 @@ class DayScheduleTab(ttk.Frame):
                                 else ()),
                           values=(c, st["biopsy"], st["follow"], st["rest"]))
 
+        external = data.get("external", {})
+        if external.get("roster"):
+            t2.insert("", "end", tags=("hdr",), values=("外訓（本月）", "", "", ""))
+            for c in external["roster"]:
+                st = external["stats"].get(c) or dict.fromkeys(STAT_KEYS, 0)
+                t2.insert("", "end", values=(c, st["biopsy"], st["follow"], st["rest"]))
+
     def _refresh_warnings(self, warnings) -> None:
         self._warns.delete(0, tk.END)
         for w in warnings:
@@ -339,9 +348,10 @@ class DayScheduleTab(ttk.Frame):
     def _roster_members(self, scope: str) -> list:
         """側邊/請假用的成員清單 [{id,name}]（scope="pgy"/"clerk"）。"""
         ym = self.app.ym
-        if scope == "pgy":
+        if scope in ("pgy", "external"):
             inp = self.service.build_day_input(ym)
-            return [{"id": c, "name": ""} for c in inp.pgy_roster]
+            codes = inp.pgy_roster if scope == "pgy" else inp.external_roster
+            return [{"id": c, "name": ""} for c in codes]
         y, m = int(ym[:4]), int(ym[5:7])
         batches = [b for b in (ClerkBatch.from_dict(x)
                                for x in self.service.storage.load_clerk_batches())
@@ -361,9 +371,12 @@ class DayScheduleTab(ttk.Frame):
         self.refresh()
 
     def _on_auto(self) -> None:
-        if self._finalized:
+        if self._finalized or getattr(self, "_day_solving", False):
             return
         try:
+            if self.service.build_day_input(self.app.ym).external_roster:
+                self._solve_external_async()
+                return
             # [RS-32 2026-08-30 使用者] 自動排班只排【明天起】:今天(含)以前
             #   以現況自動保留(求解器層,不寫 day_locks,UI 仍可手動編輯)。
             #   ★真時鐘只在這裡進入★ —— service/測試一律注入固定日期。
@@ -375,6 +388,35 @@ class DayScheduleTab(ttk.Frame):
             return
         self._preview_and_accept(res)
 
+    def _solve_external_async(self) -> None:
+        from cmuh_common.roster import ORTOOLS_PINNED_VERSION
+        ym = self.app.ym
+        self._day_solving = True
+        self._auto_btn.config(state="disabled")
+        result = {}
+        def work():
+            try:
+                ensure_dependencies([(f"ortools=={ORTOOLS_PINNED_VERSION}", "ortools")])
+                result["res"] = self.service.run_day_solve(ym, today=date.today())
+            except (Exception, SystemExit) as e:
+                logging.exception("[roster.ui] 外訓排班失敗")
+                result["error"] = str(e) or "排班引擎安裝已取消或失敗"
+        worker = threading.Thread(target=work, name="roster-external", daemon=True)
+        worker.start()
+        def poll():
+            if worker.is_alive():
+                self.after(100, poll)
+                return
+            self._day_solving = False
+            self._auto_btn.config(state="disabled" if self._finalized else "normal")
+            if "error" in result:
+                messagebox.showerror("排班失敗", result["error"], parent=self)
+            elif ym != self.app.ym:
+                messagebox.showinfo("月份已切換", "排班期間月份已切換，請重新排班。", parent=self)
+            else:
+                self._preview_and_accept(result["res"])
+        self.after(100, poll)
+
     def _format_report(self, log, warnings, day_slots=None) -> str:
         base = ("【警告】\n" + ("\n".join(f"  ⚠ {w}" for w in warnings) or "  （無）")
                 + "\n\n【逐日過程】\n" + "\n".join(log))
@@ -384,6 +426,12 @@ class DayScheduleTab(ttk.Frame):
                 self.app.ym, day_slots_override=day_slots)
             base += "\n\n" + format_course_stats(
                 data["pgy"]["stats"], data["pgy"]["roster"], data["batches"])
+            external = data.get("external", {})
+            if external.get("roster"):
+                base += "\n\n【外訓（本月）】"
+                for c in external["roster"]:
+                    st = external["stats"].get(c) or dict.fromkeys(STAT_KEYS, 0)
+                    base += f"\n{c}：跟診 {st['follow']}；切片室 {st['biopsy']}；空班 {st['rest']}"
         except Exception:
             logging.debug("[roster.ui] 報告統計段生成失敗（略過）", exc_info=True)
         return base
@@ -516,6 +564,18 @@ class DayScheduleTab(ttk.Frame):
             return
         dlg = _ClinicClosureDialog(self, self.service, self.app.ym)
         self.wait_window(dlg)
+        self.refresh()
+
+    def _edit_external_roster(self) -> None:
+        if self._finalized:
+            return
+        cur = self.service.storage.load_month(self.app.ym).get("external_month_roster") or []
+        val = _prompt_codes(self, "當月外訓人員（例：外訓1、外訓2；空白表示無人）", "、".join(cur))
+        if val is None:
+            return
+        guard_write(lambda: self.service.set_external_month_roster(
+            self.app.ym, _split_codes(val), baseline=list(cur)),
+            title="當月外訓人員", parent=self)
         self.refresh()
 
     def _edit_pgy_roster(self) -> None:
@@ -1018,7 +1078,7 @@ class _DayEditDialog(tk.Toplevel):
         except Exception:
             logging.debug("[roster.ui] 編輯視窗候選名單讀取失敗", exc_info=True)
             return [], {}
-        codes = list(inp.pgy_roster or [])
+        codes = list(inp.pgy_roster or []) + list(inp.external_roster or [])
         # ★候選人要套 RF-08 的勝者判準★(全審 2026-08-24 P2-03):同一天被多梯
         #   涵蓋時,自動排班只排【原始順序第一個】那一梯,敗者梯次的成員那天
         #   根本不上班 —— 把他們列進「＋選人」等於邀請使用者排一個自動排班
@@ -1031,7 +1091,7 @@ class _DayEditDialog(tk.Toplevel):
             logging.debug("[roster.ui] 當日梯次判定失敗（略過 Clerk 候選）",
                           exc_info=True)
         leaves: dict = {}
-        for scope in ("pgy", "clerk"):
+        for scope in ("pgy", "clerk", "external"):
             for c, days in ((inp.leaves or {}).get(scope) or {}).items():
                 leaves.setdefault(c, set()).update(days or ())
         seen, out = set(), []
