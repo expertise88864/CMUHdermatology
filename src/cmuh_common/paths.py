@@ -776,13 +776,14 @@ def classify_child_exit(rc, stderr_tail: str) -> str:
     return SPAWN_CHILD_EXITED_ORDERLY if code == 0 else SPAWN_CHILD_CRASHED
 
 RESTART_ERR_GLOB = "cmuh_restart_*.err"
+RESTART_HANDSHAKE_GLOB = "cmuh_restart_*.hs"
 RESTART_ERR_KEEP_SEC = 86400        # 保留一天,足夠事後查一次早夭原因
 
 
 def sweep_old_restart_err_files(tmpdir: str,
                                 keep_sec: int = RESTART_ERR_KEEP_SEC,
                                 now: float | None = None) -> int:
-    """清掉上次重啟留下的子行程 stderr 暫存檔。回傳刪除數。絕不拋。
+    """清掉上次重啟留下的 stderr／交握暫存檔。回傳刪除數。絕不拋。
 
     ★[2026-08-02 補審] 為什麼清理只能在「下次 spawn」做★
     成功重啟時,子行程會【持有那個 handle 直到它自己結束】,父行程刪不掉
@@ -797,7 +798,9 @@ def sweep_old_restart_err_files(tmpdir: str,
     removed = 0
     cutoff = (now if now is not None else _t.time()) - keep_sec
     try:
-        candidates = glob.glob(os.path.join(tmpdir, RESTART_ERR_GLOB))
+        candidates = []
+        for pattern in (RESTART_ERR_GLOB, RESTART_HANDSHAKE_GLOB):
+            candidates.extend(glob.glob(os.path.join(tmpdir, pattern)))
     except Exception:
         return 0
     for old in candidates:

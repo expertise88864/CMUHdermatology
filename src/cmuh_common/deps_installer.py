@@ -65,7 +65,8 @@ def _rotate_dependency_install_log(
 class DependencyInstaller(tk.Tk):
     """[修正] missing_libs 用以判斷顯示「首次執行」或「例行驗證」文案。"""
 
-    def __init__(self, required_libs: list, missing_libs: list, *, repair_lock_fd: int | None = None):
+    def __init__(self, required_libs: list, missing_libs: list, *,
+                 repair_lock_fd: int | None = None, bootstrap: bool = False):
         super().__init__()
         self.libs = required_libs
         self.total_libs = len(self.libs) or 1
@@ -76,6 +77,7 @@ class DependencyInstaller(tk.Tk):
         self._repair_libs = {tuple(item) for item in missing_libs}
         self._closing = False
         self._repair_lock_fd = repair_lock_fd
+        self._bootstrap = bootstrap
 
         is_first_run = len(missing_libs) > 0
 
@@ -148,7 +150,8 @@ class DependencyInstaller(tk.Tk):
             # ★[外審 r11 P1] 每個套件都回報一次進展★:父行程的修復窗口是看「有沒有
             # 進展」而不是總時間 —— 單一套件就可能吃掉 483 秒(240 逾時 × retry),
             # 任何固定的總預算都會誤殺一個正在裝第三、第四個套件的修復。
-            if parent_understands_bootstrapping() and not parent_supports_repair_only():
+            if (self._bootstrap and parent_understands_bootstrapping()
+                    and not parent_supports_repair_only()):
                 restart_handshake_signal(HANDSHAKE_BOOTSTRAPPING)
             self.update_ui(current_progress, f"檢查元件: {pkg_name}...")
             try:

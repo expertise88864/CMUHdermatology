@@ -886,6 +886,8 @@ class RosterService:
         day_slots = month.get("day_slots") or {}
         locked: dict = {}
         for iso, sessions in (month.get("day_locks") or {}).items():
+            if not isinstance(sessions, dict):
+                continue
             for session, on in sessions.items():
                 slots = (day_slots.get(iso) or {}).get(session)
                 if on and slots is not None:
@@ -951,7 +953,8 @@ class RosterService:
                 except (ValueError, TypeError):
                     continue
                 if any(b.covers(dd) for b in cross):
-                    prior_sessions.setdefault(iso, {}).update(sessions)
+                    if isinstance(sessions, dict):
+                        prior_sessions.setdefault(iso, {}).update(sessions)
             prev_pgy = prev.get("pgy_month_roster")
             if prev_pgy is None:
                 prev_pgy = [str(mm.get("id")) for mm in (cfg.get("pgy_members") or [])]
@@ -1835,6 +1838,7 @@ class RosterService:
         codes = assert_unique_codes(codes, "PGY 預設代號")
         base = [str(c) for c in (baseline or [])]
         out: dict = {}
+        external_when_default: list[tuple[str, list, list]] = []
 
         def _mut(cfg):
             cur = [str(m.get("id")) for m in (cfg.get("pgy_members") or [])]
@@ -1847,15 +1851,17 @@ class RosterService:
                 adds = [c for c in codes if c not in base]
                 merged = [c for c in cur if c not in removes]
                 merged += [c for c in adds if c not in merged]
-            for ym in self.storage.iter_month_yms():
-                month = self.storage.load_month(ym)
-                if month.get("pgy_month_roster") is None:
-                    assert_no_cross_roster(merged, family_month_codes(month), "PGY 預設代號", f"{ym} 家醫科")
-                    assert_no_cross_roster(merged, month.get("external_month_roster") or [],
-                                           "PGY 預設代號", f"{ym} 外訓")
+            for ym, external, family in external_when_default:
+                assert_no_cross_roster(merged, external, "PGY 預設代號", f"{ym} 外訓")
+                assert_no_cross_roster(merged, family, "PGY 預設代號", f"{ym} 家醫科")
             cfg["pgy_members"] = [by_id.get(c, {"id": c}) for c in merged]
             out["merged"] = merged
         with self.storage.write_barrier():     # 見 set_pgy_month_roster 的說明
+            for ym in self.storage.iter_month_yms():
+                month, _rev = self.storage.load_month_snapshot(ym)
+                if month.get("pgy_month_roster") is None:
+                    external_when_default.append(
+                        (ym, external_month_codes(month), family_month_codes(month)))
             assert_no_cross_roster(
                 codes, self._clerk_codes_where_default_applies(),
                 "PGY 預設代號", "會用到這份預設名單的 Clerk 梯次成員")
@@ -2105,14 +2111,28 @@ class RosterService:
 
     def update_clerk_batches(self, mutator, *, retries: int = 4):
         def checked_mutator(batches):
+            before = [copy.deepcopy(batch) for batch in batches]
             result = mutator(batches)
+            unchanged = [(
+                clerk_batch_key(batch),
+                str((batch or {}).get("start_monday") or ""),
+                tuple(str(c) for c in ((batch or {}).get("members") or [])),
+            ) for batch in before]
             for batch in batches:
-                for ym in self._months_of_batch(batch.get("start_monday")):
-                    month = self.storage.load_month(ym)
-                    assert_no_cross_roster(batch.get("members") or [], family_month_codes(month),
+                signature = (
+                    clerk_batch_key(batch),
+                    str((batch or {}).get("start_monday") or ""),
+                    tuple(str(c) for c in ((batch or {}).get("members") or [])),
+                )
+                if signature in unchanged:
+                    unchanged.remove(signature)
+                    continue
+                for ym in self._months_of_batch((batch or {}).get("start_monday")):
+                    month, _rev = self.storage.load_month_snapshot(ym)
+                    assert_no_cross_roster((batch or {}).get("members") or [], family_month_codes(month),
                                            "Clerk 梯次", f"{ym} 家醫科")
-                    external = month.get("external_month_roster") or []
-                    assert_no_cross_roster(batch.get("members") or [], external,
+                    external = external_month_codes(month)
+                    assert_no_cross_roster((batch or {}).get("members") or [], external,
                                            "Clerk 梯次", f"{ym} 外訓")
             return result
         with self.storage.write_barrier():

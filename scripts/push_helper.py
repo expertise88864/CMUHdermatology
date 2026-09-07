@@ -5,18 +5,16 @@
   1. sanity check：settings/ 不可被追蹤、.gitignore 完整、version.py 可讀
   2. 確認有 git 變更
   3. bump 版本、同步 manifest.json、核對 index 後建立本機 commit
-  4. 對最終 commit 跑完整本機 CI；紅燈／缺工具就保留本機成果、不 push
-  5. 再確認 SHA 與整個工作樹未變動，正常 push
-  6. 印出 SHA；GitHub CI 必須另外核對全綠才算交付完成
+  4. 對最終 commit 跑 Ruff 與 delivery contract 快速回歸
+  5. 再確認 SHA 與整個工作樹未變動，正常推送 codex/* 候選分支
+  6. 完整 CI 在候選分支遠端執行；exact-SHA 全綠後才可快轉 main
 
 用法：
   python scripts/push_helper.py "commit 訊息"
-  --emergency 已停用；任何分支都不能豁免本機 CI。
+  --emergency 已停用；不可豁免候選與正式 exact-SHA 遠端 CI。
 
-★[2026-07-30 第二輪外審 P2-08] 這個關卡是【最後一道】，不是第一道★
-push 是直推 main，而診間電腦約 5 分鐘內就會自動拉新版 —— GitHub CI 是推上去
-之後才跑的，它紅燈的時候壞版本已經在診間了。所以本機關卡缺工具時必須中止，
-不能像舊版那樣印一句「CI 仍會把關」就放行。
+`step_quality_gate` 保留為人工診斷／舊測試可直接呼叫的完整本機檢查，正式
+remote-first 發佈流程不呼叫它；權威流程見 REMOTE_CI_DELIVERY.md。
 """
 from __future__ import annotations
 
@@ -131,24 +129,18 @@ def _clean_gate_artifacts() -> None:
 
 
 def step_quality_gate(emergency_reason: str = "") -> None:
-    """本機品質關卡。任一紅燈即中止推送，保留已建立的本機 commit。
+    """可選的完整本機診斷；remote-first 候選推送流程不會呼叫。
 
-    ★[2026-07-30 第二輪外審 P2-08] 工具沒裝 →【中止】，不是略過★
-    舊版的寫法是：`find_spec(module) is None` 就印一行「已略過，CI 仍會把關」
-    然後繼續推。那句話在這個專案是錯的：
+    工具沒裝仍然【中止】，不是略過；這個函式若被人工或測試呼叫，就必須
+    完整執行其宣告的本機診斷。正式 remote-first 流程則由下方快速關卡建立
+    codex/* 候選，再以 exact-SHA 遠端 CI 作為 main 發佈依據。
 
-      * push 是【直推 main】，CI 是推上去之後才跑的；而診間電腦的自動更新
-        大約 5 分鐘內就把新版拉下去。CI 紅燈的時候，壞版本已經在診間了。
-      * 而【工具沒裝】正是最可能發生在新機器／重灌後的情境 —— 也就是最需要
-        關卡的時候。那一刻退回「不檢查」，等於這把鎖只在不需要它的時候有效
-        （跟 P1-06 更新鎖犯過的錯完全一樣）。
-
-    依 2026-09-05 最新定案，緊急理由與 Opus pending 均不豁免 CI。
-    保留舊參數只為明確拒絕舊呼叫，不提供任何旁路。
+    緊急理由與 Opus pending 均不豁免候選／正式 CI。保留舊參數只為明確
+    拒絕舊呼叫，不提供任何旁路。
     """
     print("\n=== [3/7] 品質關卡（ruff + pyright + pytest + 棘輪）===")
     if emergency_reason:
-        fail("--emergency 已停用：所有分支 push 前均須完整本機 CI 全綠。")
+        fail("--emergency 已停用：不得繞過候選／正式 exact-SHA 遠端 CI。")
 
     # ★工具齊全性先檢★：缺任何一個都直接中止，不進入部分檢查
     needed = {"ruff": "ruff", "pyright": "pyright", "pytest": "pytest",
@@ -166,10 +158,8 @@ def step_quality_gate(emergency_reason: str = "") -> None:
              + " ".join(missing) + "\n"
              "  （要用這個解釋器的 pip：本機可能裝了好幾個 Python，裸的 `pip` 很可能\n"
              "    屬於另一個 —— 裝完這裡依舊查不到，推不出去且不知道為什麼）\n"
-             "  ★不能因為「CI 會把關」就放行★：push 是直推 main，CI 是推上去之後\n"
-             "  才跑的，而診間電腦約 5 分鐘內就會自動拉新版 —— CI 紅燈時壞版本\n"
-             "  已經在診間了。\n"
-             "  --emergency 已停用；請先修復環境，不得略過檢查。")
+             "  這次人工完整診斷不可標成通過；請先修復環境。正式發佈仍須走\n"
+             "  codex/* 候選與候選／正式 exact-SHA 遠端 CI，不得略過。")
 
     _clean_gate_artifacts()
     failed = []
@@ -513,7 +503,7 @@ def parse_args(argv: list) -> tuple:
     """→ (commit_msg, empty legacy argument). Emergency bypass is forbidden."""
     args = list(argv[1:])
     if any(arg == "--emergency" or arg.startswith("--emergency=") for arg in args):
-        fail("--emergency 已停用：所有分支 push 前均須完整本機 CI 全綠。")
+        fail("--emergency 已停用：不得繞過候選／正式 exact-SHA 遠端 CI。")
     return " ".join(args), ""
 
 

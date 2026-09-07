@@ -32,13 +32,17 @@ def refresh_clerk_warnings(inp, slots, warnings):
         if iso[:7] == inp.ym and d not in inp.grid:
             continue
         excluded = inp.pgy_roster if iso[:7] == inp.ym else inp.prior_pgy
+        if not isinstance(sessions, dict):
+            continue
         for s, cells in sessions.items():
+            if not isinstance(cells, dict):
+                continue
             if s not in STUDENT_SESSIONS:
                 continue
             for r, people in cells.items():
                 if not is_follow_slot(r) or (iso[:7] == inp.ym and r not in inp.grid[d].get(s, [])):
                     continue
-                for p in people:
+                for p in (people or []):
                     if p in b.members and p not in excluded:
                         counts[b.id, p] += 1
     y, m = map(int, inp.ym.split("-"))
@@ -58,19 +62,25 @@ def family_requirement_warnings(inp, slots):
             d = date.fromisoformat(iso)
         except (TypeError, ValueError):
             continue
+        if not isinstance(sessions, dict):
+            continue
         for s, cells in sessions.items():
-            for p in set(inp.family_roster) & {p for ps in cells.values() for p in ps}:
+            if not isinstance(cells, dict):
+                continue
+            for p in set(inp.family_roster) & {p for ps in cells.values() for p in (ps or [])}:
                 if (d, s) not in inp.family_follow.get(p, set()):
                     out.append(f"家醫科 {p} {d:%m/%d} {s} 未指定此時段，卻有排班；請確認指定跟診設定")
     for p in inp.family_roster:
         for d, s in sorted(inp.family_follow.get(p, set())):
-            cells = slots.get(d.isoformat(), {}).get(s, {})
+            sessions = slots.get(d.isoformat())
+            cells = sessions.get(s) if isinstance(sessions, dict) else None
+            cells = cells if isinstance(cells, dict) else {}
             rooms = inp.grid.get(d, {}).get(s, [])
             if d in inp.leaves.get("family", {}).get(p, set()):
                 reason = "與請假衝突"
             elif d.weekday() >= 5 or not rooms:
                 reason = "無開放診間"
-            elif any(p in cells.get(r, []) for r in rooms):
+            elif any(p in (cells.get(r) or []) for r in rooms):
                 continue
             elif s in inp.locked.get(d.isoformat(), {}):
                 reason = "鎖定內容未安排跟診"
@@ -122,12 +132,13 @@ def prepare_priority(inp, slots):
 
 
 def restore_pgy_and_rest(inp, slots, originals):
-    counts = Counter(p for ss in slots.values() for cells in ss.values()
-                     for r, ps in cells.items() if is_follow_slot(r) for p in ps)
+    counts = Counter(p for ss in slots.values() if isinstance(ss, dict)
+                     for cells in ss.values() if isinstance(cells, dict)
+                     for r, ps in cells.items() if is_follow_slot(r) for p in (ps or []))
     order = arbitration_order(inp)
     for (d, s), before in sorted(originals.items()):
         cells = slots[d.isoformat()][s]
-        assigned = {p for ps in cells.values() for p in ps}
+        assigned = {p for ps in cells.values() for p in (ps or [])}
         available = [p for p in inp.pgy_roster if p not in assigned
                      and d not in inp.leaves.get("pgy", {}).get(p, set())]
         original_follow = {p for r, ps in before.items() if is_follow_slot(r) for p in ps}
@@ -142,7 +153,7 @@ def restore_pgy_and_rest(inp, slots, originals):
         owner = day_owner_batch(order, d)
         scopes = [("pgy", inp.pgy_roster), ("external", inp.external_roster),
                   ("clerk", owner.members if owner else [])]
-        assigned = {p for ps in cells.values() for p in ps}
+        assigned = {p for ps in cells.values() for p in (ps or [])}
         for scope, people in scopes:
             for p in people:
                 if p not in assigned and d not in inp.leaves.get(scope, {}).get(p, set()):

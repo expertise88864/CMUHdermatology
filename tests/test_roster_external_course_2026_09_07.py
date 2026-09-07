@@ -190,6 +190,126 @@ def test_malformed_day_key_does_not_hide_other_warnings(tmp_path):
     assert any("UNKNOWN" in warning for warning in warnings)
 
 
+def test_null_day_or_session_does_not_hide_other_warnings(tmp_path):
+    service = RosterService(RosterStorage(str(tmp_path)))
+    service.set_external_month_roster("2026-09", ["X"], baseline=[])
+    month = service.storage.load_month("2026-09")
+    month["day_slots"] = {
+        "2026-09-01": None,
+        "2026-09-02": {"上午": None},
+        "2026-09-03": {"上午": {"101": None, "102": ["UNKNOWN"]}},
+    }
+    service.storage.save_month("2026-09", month)
+
+    warnings = service.quick_validate_day("2026-09")
+
+    assert any("外訓 X" in warning for warning in warnings)
+    assert any("UNKNOWN" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize("bad_sessions", [None, []])
+def test_room_balance_ignores_tolerated_null_or_non_mapping_history(bad_sessions):
+    pytest.importorskip("ortools")
+    inp = make_input(())
+    inp.clerk_batches = [ClerkBatch("B", date(2026, 8, 31), ["C"])]
+    inp.prior_sessions = {
+        "2026-08-31": bad_sessions,
+        "2026-09-01": {"上午": None, "下午": {"101": None}},
+    }
+
+    slots, _, warnings = month_solve_day(inp)
+
+    assert slots
+    assert isinstance(warnings, list)
+
+
+@pytest.mark.parametrize("bad_sessions", [None, []])
+def test_service_ignores_tolerated_non_mapping_prior_sessions(tmp_path, bad_sessions):
+    service = RosterService(RosterStorage(str(tmp_path)))
+    service.storage.save_clerk_batches([
+        {"id": "B", "start_monday": "2026-08-31", "members": ["C"]},
+    ])
+    previous = service.storage.load_month("2026-08")
+    previous["day_slots"] = {"2026-08-31": bad_sessions}
+    service.storage.save_month("2026-08", previous)
+
+    inp = service.build_day_input("2026-09")
+
+    assert inp.prior_sessions == {}
+
+
+def test_service_ignores_tolerated_null_day_lock(tmp_path):
+    service = RosterService(RosterStorage(str(tmp_path)))
+    month = service.storage.load_month("2026-09")
+    month["day_locks"] = {"2026-09-01": None}
+    service.storage.save_month("2026-09", month)
+
+    inp = service.build_day_input("2026-09")
+
+    assert inp.locked == {}
+
+
+def test_unrelated_clerk_overlap_does_not_block_another_batch_edit(tmp_path):
+    service = RosterService(RosterStorage(str(tmp_path)))
+    month = service.storage.load_month("2026-09")
+    month["external_month_roster"] = ["X"]
+    service.storage.save_month("2026-09", month)
+    service.storage.save_clerk_batches([
+        {"id": "A", "start_monday": "2026-09-07", "members": ["X"]},
+        {"id": "B", "start_monday": "2026-09-21", "members": ["B1"]},
+    ])
+
+    service.update_clerk_batches(
+        lambda batches: batches[1].update(members=["B2"]))
+
+    batches = service.storage.load_clerk_batches()
+    assert batches[0]["members"] == ["X"]
+    assert batches[1]["members"] == ["B2"]
+
+
+def test_unreadable_relevant_month_blocks_identity_edits(tmp_path, monkeypatch):
+    service = RosterService(RosterStorage(str(tmp_path)))
+    service.storage.save_clerk_batches([
+        {"id": "B", "start_monday": "2026-09-07", "members": ["B1"]},
+    ])
+    service.storage.save_month(
+        "2026-09", service.storage.load_month("2026-09"))
+    original_load_month_snapshot = service.storage.load_month_snapshot
+
+    def unreadable(ym, *, validate=False):
+        if ym == "2026-09":
+            raise OSError("temporarily unreadable")
+        return original_load_month_snapshot(ym, validate=validate)
+
+    monkeypatch.setattr(service.storage, "load_month_snapshot", unreadable)
+
+    with pytest.raises(OSError, match="temporarily unreadable"):
+        service.update_clerk_batches(
+            lambda batches: batches[0].update(members=["B2"]))
+    assert service.storage.load_clerk_batches()[0]["members"] == ["B1"]
+    with pytest.raises(OSError, match="temporarily unreadable"):
+        service.set_pgy_default_members(["P"], baseline=[])
+    assert not service.storage.load_config().get("pgy_members")
+
+
+def test_unrelated_month_damage_does_not_hide_external_identity_collision(tmp_path):
+    service = RosterService(RosterStorage(str(tmp_path)))
+    month = service.storage.load_month("2026-09")
+    month["external_month_roster"] = ["X"]
+    month["day_slots"] = []
+    service.storage.save_month("2026-09", month)
+
+    with pytest.raises(ValueError, match="X"):
+        service.set_pgy_default_members(["X"], baseline=[])
+
+    service.storage.save_clerk_batches([
+        {"id": "B", "start_monday": "2026-09-07", "members": ["B1"]},
+    ])
+    with pytest.raises(ValueError, match="X"):
+        service.update_clerk_batches(
+            lambda batches: batches[0].update(members=["X"]))
+
+
 def test_malformed_locked_day_key_does_not_break_external_solver():
     pytest.importorskip("ortools")
     inp = make_input(("外訓1",))

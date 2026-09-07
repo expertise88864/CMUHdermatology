@@ -174,8 +174,19 @@ class DeliveryTests(unittest.TestCase):
 
     def test_morning_dry_run_routing(self):
         self.assertFalse(d.needs_morning_preview(["AGENTS.md", "_delivery.py", "tests/test_email.py"]))
-        for path in ("morning_report.py", "news_rules.py", "requirements.lock", ".github/workflows/morning-report-b.yml"):
+        for path in ("morning_report.py", "news_rules.py", "requirements.lock",
+                     ".github/workflows/morning-report-b.yml", "_delivery_policy.json"):
             self.assertTrue(d.needs_morning_preview([path]))
+        self.assertFalse(d.requires_morning_preview(
+            {"morning_dry_run": False}, ["_delivery_policy.json"]))
+        self.assertTrue(d.requires_morning_preview(
+            {"morning_dry_run": False}, ["_delivery_policy.json"],
+            {"morning_dry_run": True}))
+        self.assertTrue(d.requires_morning_preview(
+            {"morning_dry_run": True}, ["_delivery_policy.json"],
+            {"morning_dry_run": False}))
+        self.assertFalse(d.requires_morning_preview(
+            {"morning_dry_run": False}, ["morning_report.py"]))
 
 
 if __name__ == "__main__":

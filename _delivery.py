@@ -184,10 +184,14 @@ def verify(sha: str, phase: str, cfg: dict, api: API) -> list:
                    and p.get("base", {}).get("ref") == "main"
                    and p.get("head", {}).get("repo", {}).get("full_name") == cfg["repository"] for p in prs):
             raise Blocked("An open, same-repository PR for this exact candidate is required")
-    if phase == "candidate" and cfg.get("morning_dry_run"):
+    if phase == "candidate":
         base = check_sha(api.get("/git/ref/heads/main")["object"]["sha"])
         changed = git("diff", "--name-only", base, sha).splitlines()
-        if needs_morning_preview(changed):
+        try:
+            base_cfg = json.loads(git("show", f"{base}:_delivery_policy.json"))
+        except (json.JSONDecodeError, subprocess.SubprocessError) as exc:
+            raise Blocked(f"Cannot read base delivery policy: {exc}") from exc
+        if requires_morning_preview(cfg, changed, base_cfg):
             candidates = [r for r in runs if r.get("head_sha") == sha
                           and r.get("path") == ".github/workflows/ci.yml"
                           and r.get("event") == "workflow_dispatch"
@@ -207,6 +211,8 @@ def verify(sha: str, phase: str, cfg: dict, api: API) -> list:
 def needs_morning_preview(paths: list[str]) -> bool:
     """Conservative production-change routing; docs/tests/gate-only need no paid LLM run."""
     for path in paths:
+        if path == "_delivery_policy.json":
+            return True
         if path.startswith(("tests/", "docs/", ".githooks/")) or path in ("_delivery.py", "_test_delivery.py"):
             continue
         if path.startswith("tools/claude_"):
@@ -216,6 +222,14 @@ def needs_morning_preview(paths: list[str]) -> bool:
         if path.startswith(".github/workflows/") and path != ".github/workflows/delivery.yml":
             return True
     return False
+
+
+def requires_morning_preview(cfg: dict, paths: list[str], base_cfg: dict | None = None) -> bool:
+    """A candidate cannot disable a base policy's required morning preview."""
+    supports_preview = bool(cfg.get("morning_dry_run"))
+    if base_cfg is not None:
+        supports_preview = supports_preview or bool(base_cfg.get("morning_dry_run"))
+    return supports_preview and needs_morning_preview(paths)
 
 
 def deployment_url(api: API, sha: str, environment: str = "preview") -> str:

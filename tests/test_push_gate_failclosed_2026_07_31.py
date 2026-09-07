@@ -53,16 +53,16 @@ def test_a_missing_tool_aborts_the_push(ph, monkeypatch, capsys):
     assert "pyright" in out
 
 
-def test_the_abort_message_explains_why_ci_is_not_enough(ph, monkeypatch,
-                                                         capsys):
-    """訊息要講清楚【為什麼】不能靠 CI —— 否則下一個人只會想辦法把這道關卡拿掉。"""
+def test_the_abort_message_points_to_candidate_first_delivery(ph, monkeypatch,
+                                                              capsys):
+    """診斷失敗要指向現行候選流程，不可再宣稱直接推 main。"""
     monkeypatch.setattr(ph.importlib.util, "find_spec", lambda _n: None)
     with pytest.raises(SystemExit):
         ph.step_quality_gate()
     out = capsys.readouterr().out
-    assert "直推 main" in out
-    assert "5 分鐘" in out
-    assert "--emergency" in out
+    assert "codex/*" in out
+    assert "exact-SHA" in out
+    assert "直推 main" not in out
 
 
 def test_every_missing_tool_is_listed_at_once(ph, monkeypatch, capsys):

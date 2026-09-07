@@ -180,3 +180,25 @@ def test_joint_solver_spreads_clerk_days_with_same_tier_external():
         assert len(worked) == 2 and len(set(worked)) == 2
     assert sum("E1" in ps for ss in slots.values() for cells in ss.values()
                for r, ps in cells.items() if is_follow_slot(r)) == 4
+
+
+@pytest.mark.parametrize("history", [None, [], {"上午": None, "下午": {"101": None}}])
+def test_family_preserves_main_null_history_compatibility(history):
+    inp = make_input()
+    inp.clerk_batches = [ClerkBatch("B", date(2026, 8, 31), ["C1"])]
+    inp.prior_sessions = {"2026-08-31": history}
+    slots, _, _ = month_solve_day(inp)
+    assert not family_requirement_warnings(inp, slots)
+    warnings = family_requirement_warnings(inp, {"2026-09-01": history})
+    assert any("09/01" in w for w in warnings)
+
+
+def test_family_conflict_in_unchanged_batch_does_not_block_other_edit(svc):
+    svc.set_family_month_roster("2026-09", ["X"], baseline=[])
+    svc.storage.save_clerk_batches([
+        {"id": "A", "start_monday": "2026-09-07", "members": ["X"]},
+        {"id": "B", "start_monday": "2026-09-21", "members": ["B1"]},
+    ])
+    svc.update_clerk_batches(lambda bs: bs[1].update(members=["B2"]))
+    assert svc.storage.load_clerk_batches()[1]["members"] == ["B2"]
+    assert any("家醫科代號與其他名單重複" in w for w in svc.validate_roster_identity_invariants())

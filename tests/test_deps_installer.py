@@ -143,6 +143,7 @@ def test_version_mismatch_forces_pip_even_when_import_succeeds(tmp_path, monkeyp
     installer.is_finished = False
     installer.failed_libs = []
     installer._repair_libs = {("demo>=2", "json")}
+    installer._bootstrap = False
     installer._closing = False
     installer.update_ui = lambda *_args: None
     installer._run_on_ui_thread = lambda _callback: True

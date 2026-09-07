@@ -252,7 +252,9 @@ def ensure_dependencies(
             _lock_fd = _acquire_repair_lock(_lock_path)
 
     try:
-        _ensure_dependencies_locked(required_libs, fingerprint, deps_cache_file, _lock_fd)
+        _ensure_dependencies_locked(
+            required_libs, fingerprint, deps_cache_file, _lock_fd,
+            bootstrap=bootstrap)
     finally:
         _release_repair_lock(_lock_fd, _lock_path)
     if repair_only:
@@ -261,7 +263,8 @@ def ensure_dependencies(
         sys.exit(0)
 
 
-def _ensure_dependencies_locked(required_libs, fingerprint, deps_cache_file, lock_fd) -> None:
+def _ensure_dependencies_locked(required_libs, fingerprint, deps_cache_file, lock_fd,
+                                *, bootstrap: bool = False) -> None:
     """完整檢查 + 安裝 + 寫快取。★呼叫端已持有修復鎖★。"""
     # 完整檢查：哪些缺
     missing_libs = _find_missing_libs(required_libs)
@@ -271,7 +274,8 @@ def _ensure_dependencies_locked(required_libs, fingerprint, deps_cache_file, loc
         logging.warning("[deps] 需要修復 %d 個依賴,開始安裝(重啟交握已通知父行程等待)",
                         len(missing_libs))
         from cmuh_common.deps_installer import DependencyInstaller
-        app = DependencyInstaller(required_libs, missing_libs, repair_lock_fd=lock_fd)
+        app = DependencyInstaller(required_libs, missing_libs,
+                                  repair_lock_fd=lock_fd, bootstrap=bootstrap)
         is_finished = False
         try:
             app.mainloop()
