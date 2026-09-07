@@ -110,7 +110,7 @@ def test_repair_only_child_exits_before_application_can_start(tmp_path, monkeypa
     monkeypatch.setattr(dr, 'restart_handshake_signal', signals.append)
     monkeypatch.setattr(dr, '_ensure_dependencies_locked', lambda *args: repaired.append(args))
     with pytest.raises(SystemExit) as exc:
-        dr.ensure_dependencies([])
+        dr.ensure_dependencies([], bootstrap=True)
     assert exc.value.code == 0
     assert signals == [paths.HANDSHAKE_REPAIR_ONLY]
     assert len(repaired) == 1

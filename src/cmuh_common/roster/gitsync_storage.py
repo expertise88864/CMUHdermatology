@@ -138,6 +138,22 @@ class GitSyncStorage(RosterStorage):
             timeout=timeout, check=False, env=env,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
+    def _rebase_in_progress(self) -> bool:
+        """Return conservatively when Git may have left rebase state behind."""
+        for marker in ("rebase-merge", "rebase-apply"):
+            try:
+                result = self._git("rev-parse", "--git-path", marker)
+            except (OSError, subprocess.SubprocessError):
+                return True
+            path = (result.stdout or "").strip()
+            if result.returncode != 0 or not path:
+                return True
+            if not os.path.isabs(path):
+                path = os.path.join(self.base_dir, path)
+            if os.path.exists(path):
+                return True
+        return False
+
     # 需被 git 忽略的檔類：
     # *.bak-*：storage 月檔快照；*.corrupt-*：壞檔備份（防禦性）；
     # *.tmp：atomic_io 暫存檔（*.{name}.XXXX.tmp 亦被 * 涵蓋）；
@@ -782,20 +798,23 @@ class GitSyncStorage(RosterStorage):
                         except (OSError, subprocess.SubprocessError) as exc:
                             failed, detail = True, str(exc)
                         if failed:
-                            # 逾時也可能已進入 rebase。回復完成前不可放開樹鎖，
-                            # 否則 UI 在空檔存檔會被接下來的 abort 覆蓋。
-                            try:
-                                aborted = self._git("rebase", "--abort")
-                            except (OSError, subprocess.SubprocessError) as exc:
-                                failure_state = (
-                                    "error", f"rebase 回復失敗，請人工檢查：{exc}")
+                            if not self._rebase_in_progress():
+                                failure_state = ("diverged", detail)
                             else:
-                                if aborted.returncode != 0:
+                                # 逾時也可能已進入 rebase。回復完成前不可放開樹鎖，
+                                # 否則 UI 在空檔存檔會被接下來的 abort 覆蓋。
+                                try:
+                                    aborted = self._git("rebase", "--abort")
+                                except (OSError, subprocess.SubprocessError) as exc:
                                     failure_state = (
-                                        "error", "rebase 回復未確認，請人工檢查："
-                                        + (aborted.stderr or aborted.stdout).strip())
+                                        "error", f"rebase 回復失敗，請人工檢查：{exc}")
                                 else:
-                                    failure_state = ("diverged", detail)
+                                    if aborted.returncode != 0:
+                                        failure_state = (
+                                            "error", "rebase 回復未確認，請人工檢查："
+                                            + (aborted.stderr or aborted.stdout).strip())
+                                    else:
+                                        failure_state = ("diverged", detail)
                 if failure_state is not None:
                     # 狀態 callback 不可持樹鎖；UI 可能正在等鎖存檔。
                     self._set_state(*failure_state)

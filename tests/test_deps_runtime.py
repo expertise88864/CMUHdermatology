@@ -276,12 +276,43 @@ def test_a_restart_child_exits_cleanly_when_another_process_is_repairing(
     holder = dr._acquire_repair_lock(str(lock))
     try:
         with pytest.raises(SystemExit) as excinfo:
-            dr.ensure_dependencies([("demo", "json")], deps_cache_filename=".no-such-cache")
+            dr.ensure_dependencies(
+                [("demo", "json")],
+                deps_cache_filename=".no-such-cache",
+                bootstrap=True,
+            )
         assert excinfo.value.code == 0
         assert ran == []
         assert dr._acquire_repair_lock(str(lock)) is None
     finally:
         dr._release_repair_lock(holder, str(lock))
+
+
+def test_runtime_dependency_check_does_not_reuse_bootstrap_exit(
+        monkeypatch, tmp_path):
+    lock, ran = _lock_env(monkeypatch, tmp_path, is_child=True)
+    monkeypatch.setattr(dr, "parent_supports_repair_only", lambda: True)
+    signals = []
+    monkeypatch.setattr(dr, "restart_handshake_signal", signals.append)
+
+    dr.ensure_dependencies(
+        [("demo", "json")], deps_cache_filename=".no-such-cache")
+
+    assert ran == [1]
+    assert signals == []
+
+
+def test_runtime_dependency_check_waits_for_repair_lock_despite_handshake(
+        monkeypatch, tmp_path):
+    lock, ran = _lock_env(monkeypatch, tmp_path, is_child=True)
+    holder = dr._acquire_repair_lock(str(lock))
+    monkeypatch.setattr(
+        dr.time, "sleep", lambda _seconds: dr._release_repair_lock(holder, str(lock)))
+
+    dr.ensure_dependencies(
+        [("demo", "json")], deps_cache_filename=".no-such-cache")
+
+    assert ran == [1]
 
 
 def test_a_cold_start_waits_instead_of_exiting(monkeypatch, tmp_path):

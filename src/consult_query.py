@@ -44,7 +44,7 @@ REQUIRED_LIBS = [
     # [2026-06-15] 信件併入打卡狀態需用 selenium 查打卡 portal(headless Chrome)。
     ("selenium", "selenium"),
 ]
-ensure_dependencies(REQUIRED_LIBS)
+ensure_dependencies(REQUIRED_LIBS, bootstrap=True)
 
 # === 主要 import（依賴已就緒）===
 import ctypes  # noqa: E402

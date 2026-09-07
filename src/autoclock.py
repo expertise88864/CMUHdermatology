@@ -29,7 +29,7 @@ REQUIRED_LIBS = [
     ("winotify", "winotify"),
     ("pywin32", "win32gui"),
 ]
-ensure_dependencies(REQUIRED_LIBS)
+ensure_dependencies(REQUIRED_LIBS, bootstrap=True)
 
 # === 主要 import ===
 import ctypes  # noqa: E402

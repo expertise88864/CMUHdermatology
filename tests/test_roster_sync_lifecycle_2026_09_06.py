@@ -164,6 +164,7 @@ def test_rebase_failure_aborts_before_releasing_tree_lock(
         calls.append(("notify", bool(depth)))
 
     storage._on_sync_state = on_state
+    monkeypatch.setattr(storage, "_rebase_in_progress", lambda: True)
 
     def git(*args, **kwargs):
         calls.append(args)
@@ -187,3 +188,35 @@ def test_rebase_failure_aborts_before_releasing_tree_lock(
     assert ("notify", False) in calls
     assert ("notify", True) not in calls
     assert storage.sync_state == ("diverged" if abort_result == "success" else "error")
+
+
+def test_pull_failure_without_rebase_does_not_report_failed_rollback(
+        tmp_path, monkeypatch):
+    storage = GitSyncStorage(str(tmp_path), remote_sync=False, pull_interval_sec=0)
+    monkeypatch.setattr(storage, "_commit", lambda label: True)
+    monkeypatch.setattr(storage, "_remote_name", lambda: "origin")
+    monkeypatch.setattr(storage, "_current_branch", lambda: "main")
+    monkeypatch.setattr(storage, "_rev_parse", lambda ref: "old")
+    monkeypatch.setattr(storage, "_rebase_in_progress", lambda: False)
+    calls = []
+    states = []
+    storage._on_sync_state = lambda state, detail: states.append((state, detail))
+
+    def git(*args, **kwargs):
+        calls.append(args)
+        if args[0] == "ls-remote":
+            return subprocess.CompletedProcess(
+                args, 0, "abc refs/heads/main\n", "")
+        if args[0] == "merge":
+            return subprocess.CompletedProcess(args, 1, "", "diverged")
+        if args[:2] == ("pull", "--rebase"):
+            return subprocess.CompletedProcess(args, 1, "", "network unavailable")
+        if args == ("rebase", "--abort"):
+            pytest.fail("abort must not run when Git never started a rebase")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(storage, "_git", git)
+    assert storage._push_locked_body() is False
+    assert ("rebase", "--abort") not in calls
+    assert storage.sync_state == "diverged"
+    assert states == [("diverged", "network unavailable")]

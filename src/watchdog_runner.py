@@ -39,7 +39,7 @@ if str(_HERE) not in sys.path:
 # 依賴自動安裝（核心需要 psutil）
 try:
     from cmuh_common.deps_runtime import ensure_dependencies
-    ensure_dependencies([("psutil", "psutil")])
+    ensure_dependencies([("psutil", "psutil")], bootstrap=True)
 except Exception:
     pass
 

@@ -41,6 +41,14 @@ def _weeks(inp):
     return weeks
 
 
+def _in_month_half(iso, ym, half):
+    try:
+        d = date.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return False
+    return d.isoformat() == iso and iso[:7] == ym and (d.day > 14) == bool(half)
+
+
 def external_quota_warnings(inp, slots):
     out = []
     for p in external_roster(inp):
@@ -54,7 +62,7 @@ def external_quota_warnings(inp, slots):
                            f"（目標 {low}–{high}；請確認請假、鎖定與診間容量）")
         for half in (0, 1):
             count = sum(p in cells.get(BIOPSY, []) for iso, sessions in slots.items()
-                        if iso[:7] == inp.ym and (int(iso[8:]) > 14) == bool(half)
+                        if _in_month_half(iso, inp.ym, half)
                         for cells in sessions.values())
             if count != 1:
                 out.append(f"外訓 {p} {'1–14 日' if half == 0 else '15 日至月底'}"
@@ -115,7 +123,7 @@ def add_external(inp, slots, log, warnings):
         for half in (0, 1):
             fixed = sum(p in cells.get(BIOPSY, [])
                         for iso, sessions in inp.locked.items()
-                        if iso[:7] == inp.ym and (int(iso[8:]) > 14) == bool(half)
+                        if _in_month_half(iso, inp.ym, half)
                         for cells in sessions.values())
             new = sum(v for (d, _, pp, k), v in choices.items()
                       if pp == p and k == "biopsy" and (d.day > 14) == bool(half))

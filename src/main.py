@@ -342,7 +342,7 @@ REQUIRED_LIBS = [
     ("pywin32", "win32gui"),
     ("sv-ttk", "sv_ttk"),  # [UI 美化] Sun Valley 主題：原生 Win11 風格
 ]
-_ensure_deps_runtime(REQUIRED_LIBS)
+_ensure_deps_runtime(REQUIRED_LIBS, bootstrap=True)
 
 # === BASE_DIR / SETTINGS_DIR 沿用原語意 ===
 BASE_DIR = get_app_dir()

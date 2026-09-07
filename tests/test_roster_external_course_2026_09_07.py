@@ -174,6 +174,33 @@ def test_clean_remote_merge_conflict_is_visible_before_first_schedule(tmp_path):
     assert any("外訓" in w and "X" in w for w in service.validate_roster_identity_invariants())
 
 
+def test_malformed_day_key_does_not_hide_other_warnings(tmp_path):
+    service = RosterService(RosterStorage(str(tmp_path)))
+    service.set_external_month_roster("2026-09", ["X"], baseline=[])
+    month = service.storage.load_month("2026-09")
+    month["day_slots"] = {
+        "2026-09": {"上午": {"101": ["X"]}},
+        "2026-09-01": {"上午": {"101": ["UNKNOWN"]}},
+    }
+    service.storage.save_month("2026-09", month)
+
+    warnings = service.quick_validate_day("2026-09")
+
+    assert any("外訓 X" in warning for warning in warnings)
+    assert any("UNKNOWN" in warning for warning in warnings)
+
+
+def test_malformed_locked_day_key_does_not_break_external_solver():
+    pytest.importorskip("ortools")
+    inp = make_input(("外訓1",))
+    inp.locked["2026-09"] = {"上午": {BIOPSY: ["外訓1"]}}
+
+    slots, _, warnings = month_solve_day(inp)
+
+    assert slots
+    assert isinstance(warnings, list)
+
+
 def test_grid_external_locks_do_not_influence_room_fairness():
     inp = make_input(())
     baseline = {"2026-09-07": {"上午": {"101": ["P1"]}},

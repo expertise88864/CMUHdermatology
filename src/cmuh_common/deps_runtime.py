@@ -177,6 +177,8 @@ def _all_modules_discoverable(required_libs: Iterable[tuple]) -> bool:
 def ensure_dependencies(
     required_libs: list,
     deps_cache_filename: str = '.deps_cache',
+    *,
+    bootstrap: bool = False,
 ) -> None:
     """檢查並（必要時）安裝 required_libs。
 
@@ -222,10 +224,14 @@ def ensure_dependencies(
     # ★只在父行程宣告它認得這個階段時才送★:已經部署在診間的舊版父行程看不懂,
     # 對它送等於送一個「內容無效」的交握檔,毫無好處。它們不會設那個環境變數,
     # 所以升級到這一版時行為與升級前完全一致;等所有機器都是新版就自動生效。
-    repair_only = parent_supports_repair_only() and restart_handshake_active()
+    repair_only = (
+        bootstrap
+        and parent_supports_repair_only()
+        and restart_handshake_active()
+    )
     if repair_only:
         restart_handshake_signal(HANDSHAKE_REPAIR_ONLY)
-    elif parent_understands_bootstrapping():
+    elif bootstrap and parent_understands_bootstrapping():
         restart_handshake_signal(HANDSHAKE_BOOTSTRAPPING)
 
     # ★同一台機器只能有一個行程在修★(見 _REPAIR_LOCK_FILENAME 的說明)。
@@ -236,7 +242,7 @@ def ensure_dependencies(
     _lock_path = _repair_lock_path()
     _lock_fd = _acquire_repair_lock(_lock_path)
     if _lock_fd is None:
-        if restart_handshake_active():
+        if bootstrap and restart_handshake_active():
             logging.warning("[deps] 另一個行程正在修復依賴 → 本行程(重啟候選人)乾淨退出,"
                             "不重複開 pip;更新下一輪再接手")
             sys.exit(0)

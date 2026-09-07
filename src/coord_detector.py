@@ -31,7 +31,7 @@ REQUIRED_LIBS = [
     ("pyautogui", "pyautogui"),
     ("Pillow", "PIL"),
 ]
-ensure_dependencies(REQUIRED_LIBS)
+ensure_dependencies(REQUIRED_LIBS, bootstrap=True)
 
 # === 主要 import（依賴已就緒）===
 import logging  # noqa: E402

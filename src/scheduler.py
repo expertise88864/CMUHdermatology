@@ -52,7 +52,7 @@ REQUIRED_LIBS = [
     ("Pillow", "PIL"),
     ("pywin32", "win32gui"),
 ]
-ensure_dependencies(REQUIRED_LIBS)
+ensure_dependencies(REQUIRED_LIBS, bootstrap=True)
 
 # 需要第三方套件（requests）的模組，於 ensure_dependencies 之後才 import。
 from cmuh_common import updater as _updater_mod  # noqa: E402
