@@ -6,7 +6,6 @@ trainee priorities; room balancing only moves attendance between open rooms.
 from collections import Counter, defaultdict
 from copy import deepcopy
 from datetime import date
-from calendar import monthrange
 from math import ceil
 
 from .solve_day import (
@@ -32,11 +31,9 @@ def external_roster(inp):
 
 
 def _weeks(inp):
-    y, m = map(int, inp.ym.split("-"))
     weeks = defaultdict(list)
-    for n in range(1, monthrange(y, m)[1] + 1):
-        d = date(y, m, n)
-        if d.weekday() < 5:
+    for d in sorted(inp.grid):
+        if d.isoformat()[:7] == inp.ym and d.weekday() < 5 and d not in inp.holidays:
             weeks[d.isocalendar()[:2]].append(d)
     return weeks
 
@@ -52,6 +49,7 @@ def _in_month_half(iso, ym, half):
 def external_quota_warnings(inp, slots):
     out = []
     for p in external_roster(inp):
+        month_count = 0
         for days in _weeks(inp).values():
             count = sum(p in (people or []) for d in days
                         for cells in ((slots.get(d.isoformat()) or {}).values()
@@ -60,10 +58,14 @@ def external_quota_warnings(inp, slots):
                         for room, people in (cells.items()
                                              if isinstance(cells, dict) else ())
                         if is_follow_slot(room))
-            low, high = ceil(len(days) * 4 / 5), len(days)
+            month_count += count
+            low, high = ceil(len(days) * 4 / 5), ceil(len(days) * 6 / 5)
             if not low <= count <= high:
                 out.append(f"外訓 {p} {days[0]:%m/%d}～{days[-1]:%m/%d} 跟診 {count} 次"
                            f"（目標 {low}–{high}；請確認請假、鎖定與診間容量）")
+        target = sum(map(len, _weeks(inp).values()))
+        if abs(month_count - target) > 1:
+            out.append(f"外訓 {p} 全月跟診 {month_count} 次（目標約 {target} 次，工作時段的一半）")
         for half in (0, 1):
             count = sum(p in (cells.get(BIOPSY) or []) for iso, sessions in slots.items()
                         if _in_month_half(iso, inp.ym, half)
@@ -89,17 +91,18 @@ def add_external(inp, slots, log, warnings):
 
     model = cp_model.CpModel()
     choices = {}
-    objective = []
+    clerk_objective, external_objective, spread_objective = [], [], []
+    external_shortfall = model.new_int_var(0, 1000, "external_shortfall")
     leaves = {**inp.leaves.get("external", {}), **inp.leaves.get("clerk", {})}
-    max_shortfall = model.new_int_var(0, 1000, "equal_tier_shortfall")
-    objective.append(100000 * max_shortfall)
+    max_shortfall = model.new_int_var(0, 1000, "clerk_shortfall")
+    clerk_objective.append(100000 * max_shortfall)
     def shortage(new, target):
         if target <= 0:
             return
         deficit = model.new_int_var(0, target, "shortfall")
         model.add(deficit >= target - new)
         model.add(1000 * deficit <= max_shortfall * target)
-        objective.append(1000 * deficit)
+        clerk_objective.append(1000 * deficit)
     for d in sorted(inp.grid):
         if d.isoformat()[:7] != inp.ym or d.weekday() >= 5:
             continue
@@ -130,16 +133,32 @@ def add_external(inp, slots, log, warnings):
                           if dd == d and ss == s and k == "follow") <= spare)
             model.add(sum(v for (dd, ss, _, k), v in choices.items()
                           if dd == d and ss == s and k == "biopsy") <= 1)
+    def deviation(expression, bound, name):
+        value = model.new_int_var(0, bound, name)
+        model.add_abs_equality(value, expression)
+        return value
+
     for p in people:
+        monthly = []
         for days in _weeks(inp).values():
             fixed = sum(p in ps for d in days
                         for cells in inp.locked.get(d.isoformat(), {}).values()
                         for r, ps in cells.items() if is_follow_slot(r))
             new = sum(v for (d, _, pp, k), v in choices.items()
                       if pp == p and k == "follow" and d in days)
-            model.add(new <= max(0, len(days) - fixed))
-            shortage(new, max(0, ceil(len(days) * 4 / 5) - fixed))
-            objective.append(-new)
+            model.add(new <= max(0, ceil(len(days) * 6 / 5) - fixed))
+            monthly.append(new + fixed)
+            spread_objective.append(20 * deviation(new + fixed - len(days), 100, f"week/{p}/{days[0]}"))
+        target = sum(map(len, _weeks(inp).values()))
+        if target:
+            deficit = model.new_int_var(0, target, f"external_deficit/{p}")
+            model.add(deficit >= target - sum(monthly))
+            # All external trainees have the same monthly working-day target,
+            # so minimizing the maximum deficit also equalizes its ratio.
+            model.add(deficit <= external_shortfall)
+        # One half of the month's weekday AM/PM working periods, not a reward
+        # for filling every permitted weekly maximum.
+        external_objective.append(100 * deviation(sum(monthly) - target, 1000, f"month/{p}"))
         for half in (0, 1):
             fixed = sum(p in cells.get(BIOPSY, [])
                         for iso, sessions in inp.locked.items()
@@ -148,7 +167,13 @@ def add_external(inp, slots, log, warnings):
             new = sum(v for (d, _, pp, k), v in choices.items()
                       if pp == p and k == "biopsy" and (d.day > 14) == bool(half))
             model.add(new <= max(0, 1 - fixed))
-            objective.append(-10000 * new)
+            external_objective.append(-100 * new)
+            half_days = [d for ds in _weeks(inp).values() for d in ds if (d.day > 14) == bool(half)]
+            if half_days:
+                center = (half_days[0].toordinal() + half_days[-1].toordinal())
+                spread_objective.extend(abs(2 * d.toordinal() - center) * v
+                                        for (d, _, pp, k), v in choices.items()
+                                        if pp == p and k == "biopsy" and d in half_days)
     for (bid, p), target in targets.items():
         new = sum(v for (d, _, pp, k), v in choices.items()
                   if pp == p and k == "follow"
@@ -156,12 +181,12 @@ def add_external(inp, slots, log, warnings):
                   and owner.id == bid)
         model.add(new <= target)
         shortage(new, target)
-        objective.append(-new)
+        clerk_objective.append(-new)
     idle_days = []
     for d in sorted(inp.grid):
         owner = day_owner_batch(arbitration_order(inp), d)
         if (not owner or d.isoformat()[:7] != inp.ym or d.weekday() >= 5
-                or not inp.grid[d].get("下午")):
+                or not any(inp.grid[d].get(s) for s in STUDENT_SESSIONS)):
             continue
         for p in owner.members:
             if p in inp.pgy_roster or d in leaves.get(p, set()):
@@ -176,15 +201,40 @@ def add_external(inp, slots, log, warnings):
             idle = model.new_bool_var(f"idle/{d}/{p}")
             model.add(attendance + idle >= 1)
             idle_days.append(idle)
-    # Strictly subordinate daily spreading to the existing tier/quota objective.
-    model.minimize(sum(objective) * (len(idle_days) + 1) + sum(idle_days))
+    spread_objective.extend(100 * idle for idle in idle_days)
+    # Prefix balance distributes each person's actual total along their available
+    # days, even when leave or scarce rooms prevent reaching the nominal quota.
+    groups = [(p, [d for ds in _weeks(inp).values() for d in ds]) for p in people]
+    groups += [(p, [d for d in sorted(inp.grid) if d.isoformat()[:7] == inp.ym
+                     and (b := day_owner_batch(arbitration_order(inp), d)) and b.id == bid])
+               for bid, p in targets]
+    for p, days in groups:
+        days = [d for d in days if d.weekday() < 5 and d not in leaves.get(p, set())
+                and any(inp.grid[d].get(s) for s in STUDENT_SESSIONS)]
+        daily = [sum(v for (dd, _, pp, k), v in choices.items()
+                     if dd == d and pp == p and k == "follow")
+                 + sum(p in ps for cells in slots.get(d.isoformat(), {}).values()
+                       for r, ps in cells.items() if is_follow_slot(r)) for d in days]
+        for i in range(1, len(days)):
+            spread_objective.append(deviation(
+                len(days) * sum(daily[:i]) - i * sum(daily), 10000, f"prefix/{p}/{days[i]}"))
     solver = cp_model.CpSolver()
     solver.parameters.num_search_workers = 1
     solver.parameters.random_seed = 42
-    solver.parameters.max_deterministic_time = 2
-    status = solver.solve(model)
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise RuntimeError("家醫科／Clerk／外訓排班未取得可行解；原班表未變更")
+    solver.parameters.linearization_level = 2
+    solver.parameters.max_deterministic_time = 10
+    # Freeze each achieved priority objective before considering the next tier.
+    # External attendance can never buy a reduction in Clerk attendance.
+    phases = (clerk_objective, [external_shortfall], external_objective, spread_objective)
+    for index, objective in enumerate(phases):
+        expression = sum(objective)
+        model.minimize(expression)
+        status = solver.solve(model)
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            raise RuntimeError("家醫科／Clerk／外訓排班未取得可行解；原班表未變更")
+        if index < len(phases) - 1 and status != cp_model.OPTIMAL:
+            raise RuntimeError("排班逾時，尚未確認跟診優先順序與配額的最佳解；原班表未變更")
+        model.add(expression == solver.value(expression))
     for (d, s, p, kind), v in choices.items():
         if not solver.value(v):
             continue
@@ -201,11 +251,11 @@ def add_external(inp, slots, log, warnings):
                      if (owner := day_owner_batch(arbitration_order(inp), d)) and owner.id == bid
                      for r, ps in slots[d.isoformat()][ss].items() if is_follow_slot(r))
         if actual < target:
-            warnings.append(f"Clerk {p}（{bid}）可調整跟診 {actual}/{target} 次；家醫科優先，Clerk 與外訓同級分配")
+            warnings.append(f"Clerk {p}（{bid}）可調整跟診 {actual}/{target} 次；家醫科優先，其次 Clerk、外訓、PGY")
     from .follow_priority import refresh_clerk_warnings
     refresh_clerk_warnings(inp, slots, warnings)
     warnings.extend(external_quota_warnings(inp, slots))
-    log.append("外訓：每週 4–5 跟診（月界按比例）；1–14 日、15 日至月底各一次切片室")
+    log.append("跟診優先：家醫科 ＞ Clerk ＞ 外訓 ＞ PGY；外訓全月約一半工作時段跟診，每週約 4–6 次；每半月一次切片室")
 
 
 def balance_rooms(inp, slots):

@@ -128,7 +128,7 @@ def test_leave_closed_and_locked_conflicts_preserve_slots():
         assert any(phrase in w for w in warnings)
 
 
-def test_equal_tier_shares_scarcity_and_preserves_clerk_course_cap():
+def test_clerk_precedes_external_with_scarcity_and_preserves_course_cap():
     inp = make_input()
     inp.family_roster, inp.family_follow = [], {}
     inp.capacity = 1
@@ -140,7 +140,8 @@ def test_equal_tier_shares_scarcity_and_preserves_clerk_course_cap():
                      for cells in ss.values() for r, ps in cells.items() if is_follow_slot(r))
               for p in ("C1", "C2", "E1")}
     assert 0 < counts["C1"] <= 11 and 0 < counts["C2"] <= 11
-    assert counts["E1"] > 0
+    assert counts["C1"] == counts["C2"] == 9
+    assert counts["E1"] == 0  # All 18 course seats are needed by higher-priority Clerks.
     assert abs(counts["C1"] - counts["C2"]) <= 1
 
 

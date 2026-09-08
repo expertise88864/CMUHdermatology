@@ -234,15 +234,14 @@ class TestTheWholeBatchOutcome:
         return day_slots, warns
 
     def test_the_users_own_example(self):
-        """★使用者的例子★:16 個切片時段、5 個人 → 每人 3 次(16//5),
-        多出來的 1 個時段留空。"""
+        """2026-09-08：即使開放充足，每個 course 仍最多切片 2 次。"""
         day_slots, warns = self._solve(
             ["101", "102", "103"], ["101", "102", "103"],
             ["C1", "C2", "C3", "C4", "C5"], open_cap=16)
         _seat, bx, _rest = _counts(day_slots)
         assert [bx.get(c, 0) for c in ("C1", "C2", "C3", "C4", "C5")] == \
-            [3, 3, 3, 3, 3], f"每人應各 3 次: {bx}"
-        assert sum(bx.values()) == 15, "多出來的那一個時段應留空"
+            [2, 2, 2, 2, 2], f"每人應各 2 次: {bx}"
+        assert sum(bx.values()) == 10, "超過每人 2 次的時段應留空"
         assert not any("不均" in w or "輪不到" in w for w in warns), warns
 
     def test_the_clinic_counts_are_level_too(self):
@@ -334,9 +333,9 @@ class TestTheWholeBatchOutcome:
             clerk_batches=[ClerkBatch("b1", MON, ["C1", "C2"])],
             biopsy_open=bio, locked=locked))
         _seat, bx, _rest = _counts(day_slots)
-        assert (bx.get("C1", 0), bx.get("C2", 0)) == (3, 3), (
+        assert (bx.get("C1", 0), bx.get("C2", 0)) == (2, 2), (
             f"配額沒有把鎖定算進去: {bx}")
-        assert sum(bx.values()) == 6, f"開放的時段沒有用完: {bx}"
+        assert sum(bx.values()) == 4, f"鎖定也須列入每人 2 次上限: {bx}"
 
     def test_two_batches_reusing_a_code_do_not_cover_each_other(self):
         """★鎖定覆蓋的鍵要含梯次★:Clerk 代號是依梯次命名空間的 ——
@@ -392,7 +391,10 @@ class TestTheWholeBatchOutcome:
                       in grid for _s, on in ss.items() if on)
         assert (opened, in_grid) == (16, 9), (opened, in_grid)
         members = ["C1", "C2", "C3", "C4", "C5"]
-        day_slots, _log, _warns = month_solve_day(DaySolveInput(
+        # Test the underlying course budget before the optional second-biopsy
+        # tradeoff used by the public solver to reach the ninth follow.
+        from cmuh_common.roster.solve_day import _month_solve_attendance_raw
+        day_slots, _log, _warns = _month_solve_attendance_raw(DaySolveInput(
             ym="2026-08", grid=grid, pgy_roster=["P1"],
             clerk_batches=[ClerkBatch("b1", MON, members)], biopsy_open=bio))
         _seat, bx, _rest = _counts(day_slots)
@@ -529,7 +531,8 @@ class TestTheWholeBatchOutcome:
         for d in days:
             flat[d.isoformat()] = {"上午": True}
         bio = {"b1": flat}
-        day_slots, _log, warns = month_solve_day(DaySolveInput(
+        from cmuh_common.roster.solve_day import _month_solve_attendance_raw
+        day_slots, _log, warns = _month_solve_attendance_raw(DaySolveInput(
             ym="2026-08", grid=grid, pgy_roster=["P1"],
             clerk_batches=[ClerkBatch("b1", start, ["C1", "C2"])],
             biopsy_open=bio, leaves={"clerk": {"C2": set(days[:2])}}))

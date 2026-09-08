@@ -154,7 +154,7 @@ class DayScheduleTab(ttk.Frame):
             b = ttk.Button(bar3, text=text, command=cmd)
             b.pack(side="left", padx=4)
             self._edit_btns.append(b)
-        ttk.Label(bar3, text="跟診優先：家醫科 ＞ Clerk＝外訓 ＞ PGY；鎖定沿用班表",
+        ttk.Label(bar3, text="跟診優先：家醫科 ＞ Clerk ＞ 外訓 ＞ PGY；Clerk 9–11 診、1–2 切片",
                   foreground="gray").pack(side="left", padx=8)
 
     def _build_grid(self, parent) -> None:

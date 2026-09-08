@@ -1,10 +1,38 @@
-"""Monthly mandatory family sessions and equal-tier Clerk/external allocation."""
+"""Monthly mandatory family sessions and ordered trainee allocation."""
 from collections import Counter
 from copy import deepcopy
 from calendar import monthrange
-from datetime import date
+from datetime import date, timedelta
 
 from .solve_day import REST, STUDENT_SESSIONS, arbitration_order, day_owner_batch, is_follow_slot
+
+
+def clerk_month_caps(inp, batch):
+    """Reserve a proportional share of a cross-month course for its later days.
+
+    Include future fixed attendance in the cap because the greedy solver also
+    includes those seats in its running level. Holidays and known leave are not
+    future opportunities. Ended courses retain the ordinary 11-session ceiling.
+    """
+    from .model import CLERK_COURSE_DAYS
+    from .solve_day import CLERK_SEAT_TARGET_MAX
+    out = {}
+    for p in batch.members:
+        days = [batch.start_monday + timedelta(days=i) for i in range(CLERK_COURSE_DAYS)]
+        days = [d for d in days if d.weekday() < 5 and d not in inp.holidays
+                and d not in inp.leaves.get("clerk", {}).get(p, set())
+                and (not inp.course_clinic_days or d.isoformat() in inp.course_clinic_days)
+                and day_owner_batch(arbitration_order(inp), d) == batch]
+        future = [d for d in days if d.isoformat()[:7] > inp.ym]
+        if not future:
+            continue
+        fixed = sum(p in (ps or []) for d in future
+                    for cells in (inp.course_fixed.get(d.isoformat()) or {}).values()
+                    if isinstance(cells, dict) for r, ps in cells.items() if is_follow_slot(r))
+        elapsed = len(days) - len(future)
+        out[p] = min(CLERK_SEAT_TARGET_MAX,
+                     (CLERK_SEAT_TARGET_MAX * elapsed + len(days) // 2) // len(days) + fixed)
+    return out
 
 
 def refresh_clerk_warnings(inp, slots, warnings):
@@ -94,8 +122,8 @@ def prepare_priority(inp, slots):
     """Reserve family first; remove movable follow/rest for joint allocation.
 
     Existing Clerk attendance is the course budget. This retains the original
-    cross-month quota calculation while allowing an equal-tier external person
-    to compete for the same seats. Special duties and entire locks are immutable.
+    cross-month quota calculation. External trainees use the remaining seats
+    after Clerk goals. Special duties and entire locks are immutable.
     """
     occupied = set(inp.pgy_roster) | set(inp.external_roster)
     occupied.update(p for b in inp.clerk_batches for p in b.members)
@@ -173,9 +201,9 @@ def spread_clerk_days(inp, slots):
     def works(d, p):
         return sum(p in ps for s, cells in slots.get(d.isoformat(), {}).items()
                    if s in STUDENT_SESSIONS for r, ps in cells.items() if r != REST)
-    for d in days:
+    for d in sorted(days, key=lambda d: (not inp.grid[d].get("下午"), d)):
         owner = day_owner_batch(order, d)
-        if not owner or not inp.grid[d].get("下午"):
+        if not owner or not any(inp.grid[d].get(s) for s in STUDENT_SESSIONS):
             continue
         for p in sorted(set(owner.members) - set(inp.pgy_roster)):
             if works(d, p) or d in inp.leaves.get("clerk", {}).get(p, set()):
@@ -195,7 +223,8 @@ def spread_clerk_days(inp, slots):
                 for r in inp.grid[d].get(s, []):
                     displaced = None
                     if len(cells.get(r, [])) >= inp.capacity:
-                        displaced = next((q for q in cells.get(r, []) if q in inp.pgy_roster), None)
+                        candidates = [q for q in cells.get(r, []) if q in inp.pgy_roster]
+                        displaced = max(candidates, key=lambda q: works(d, q), default=None)
                         if displaced is None:
                             continue
                     dd, ss, rr = donors[0]

@@ -256,10 +256,8 @@ class TestLockedSlotsAdjustTheCap:
         svc.storage.save_month(YM, m)
         return svc
 
-    def test_a_valid_locked_biopsy_slot_raises_the_cap(self, tmp_path):
-        """4 個開放格 + 2 個有效鎖定切片 → 分母 6、cap 3;兩人各 3 次是
-        ★求解器自己就會排出來★的平均結果,不得誤報。
-        (用原始盤點的話 cap=4//2=2 → 兩人都被誤報超過配額。)"""
+    def test_valid_locked_biopsies_do_not_raise_cap_above_two(self, tmp_path):
+        """2026-09-08：鎖定仍保留，但整梯超过 2 次須顯示警告。"""
         d5, d6 = "2026-08-10", "2026-08-11"          # 週一/週二,b1 涵蓋
         svc = self._locked_svc(
             tmp_path,
@@ -268,7 +266,8 @@ class TestLockedSlotsAdjustTheCap:
                 **{d5: {"上午": {BIOPSY: ["C1"]}},
                    d6: {"上午": {BIOPSY: ["C1"]}}}),
             day_locks={d5: {"上午": True}, d6: {"上午": True}})
-        assert svc.validate_course_quota(YM) == ([], set())
+        warnings, _ = svc.validate_course_quota(YM)
+        assert any("上限 2" in w and "C1×3" in w and "C2×3" in w for w in warnings)
 
     def test_a_locked_empty_session_shrinks_the_cap(self, tmp_path):
         """反向:原本開放的格被鎖成【沒有切片】→ 它不是可分配的量,分母 3、

@@ -142,7 +142,7 @@ TWO_PGY_PHOTO_ONLY = ((1, "上午"), (3, "下午"), (4, "上午"))  # 二早/四
 # ★「順位在後方」怎麼落實★:這個上限★只影響就座★,而且是在照光/治療室/
 #   切片室(含配額與期限)全部排完之後才輪到的步驟。換句話說,其他 Clerk 規則
 #   要用到的人力一個都不會被它擋掉;它只決定「剩下的座位要不要再塞人」。
-CLERK_SEAT_TARGET_MIN = 7
+CLERK_SEAT_TARGET_MIN = 9
 CLERK_SEAT_TARGET_MAX = 11
 
 
@@ -1293,12 +1293,67 @@ def month_solve_day(inp: DaySolveInput) -> tuple:
 
 def _month_solve_attendance(inp: DaySolveInput) -> tuple:
     from .follow_priority import spread_clerk_days
-    slots, log, warnings = _month_solve_attendance_raw(inp)
+    y, m = map(int, inp.ym.split("-"))
+    ended = clerk_batches_ended_by(inp.clerk_batches, date(y, m, monthrange(y, m)[1]))
+    # Defer the optional second biopsy until a cross-month course's last month.
+    # Otherwise it becomes immutable history before later follow opportunities
+    # are known, and can irreversibly consume the course's ninth follow.
+    prospective = {(b.id, p): 1 for b in inp.clerk_batches if b.id not in ended for p in b.members}
+    slots, log, warnings = (_month_solve_attendance_raw(inp, biopsy_caps=prospective)
+                            if prospective else _month_solve_attendance_raw(inp))
+    # A second automatic biopsy is optional: try one when two have crowded out
+    # the course's ninth follow. Fixed/prior attendance is still immutable.
+    counts = {}
+    sources = {iso: ss for iso, ss in inp.prior_sessions.items() if iso[:7] < inp.ym}
+    sources.update(slots)
+    sources.update({iso: ss for iso, ss in inp.course_fixed.items() if iso[:7] > inp.ym})
+    for iso, sessions in sources.items():
+        try:
+            d = date.fromisoformat(iso)
+        except (ValueError, TypeError):
+            continue
+        batch = day_owner_batch(arbitration_order(inp), d)
+        if not batch or not isinstance(sessions, dict) or d.weekday() >= 5:
+            continue
+        if iso[:7] == inp.ym and d not in inp.grid:
+            continue
+        excluded = inp.prior_pgy if iso[:7] < inp.ym else inp.pgy_roster
+        for s, cells in sessions.items():
+            if s not in STUDENT_SESSIONS or not isinstance(cells, dict):
+                continue
+            for r, people in cells.items():
+                if r != BIOPSY and not is_follow_slot(r):
+                    continue
+                if is_follow_slot(r) and iso[:7] == inp.ym and r not in inp.grid[d].get(s, []):
+                    continue
+                for p in (people or []):
+                    if p in batch.members and p not in excluded:
+                        key = batch.id, p
+                        values = counts.setdefault(key, [0, 0])
+                        values[r == BIOPSY] += 1
+    caps = {key: 1 for key, (follow, biopsy) in counts.items()
+            if key[0] in ended and follow < CLERK_SEAT_TARGET_MIN and biopsy >= 2}
+    if caps:
+        caps.update(prospective)
+        trial = _month_solve_attendance_raw(inp, biopsy_caps=caps)
+        def current_follow(schedule, key):
+            return sum(key[1] in people for d in inp.grid if d.isoformat()[:7] == inp.ym
+                       and (b := day_owner_batch(arbitration_order(inp), d)) and b.id == key[0]
+                       for s, cells in schedule.get(d.isoformat(), {}).items()
+                       if s in STUDENT_SESSIONS for r, people in cells.items()
+                       if is_follow_slot(r) and r in inp.grid[d].get(s, []))
+        effective = {key: 1 for key in caps if key not in prospective
+                     if counts[key][0] + current_follow(trial[0], key) - current_follow(slots, key)
+                     >= CLERK_SEAT_TARGET_MIN}
+        if effective:
+            effective.update(prospective)
+            slots, log, warnings = (trial if effective == caps else
+                                    _month_solve_attendance_raw(inp, biopsy_caps=effective))
     spread_clerk_days(inp, slots)
     return slots, log, warnings
 
 
-def _month_solve_attendance_raw(inp: DaySolveInput) -> tuple:
+def _month_solve_attendance_raw(inp: DaySolveInput, *, biopsy_caps=None) -> tuple:
     """整月逐（工作日×早/午）填充 → (day_slots, log, warnings)。
 
     day_slots: {iso: {session: {slot: [代號]}}}；warnings: 人話警告清單。
@@ -1333,7 +1388,8 @@ def _month_solve_attendance_raw(inp: DaySolveInput) -> tuple:
     # ★第一趟在迴圈外★:它一定會跑,所以「最好的那一趟」從第一趟起就有值
     #   —— 不必用 `best is None` 這種型別上證不出來的寫法。
     caps: dict = {}
-    day_slots, log, warnings, fc = _solve_month_once(inp)
+    options = {"biopsy_caps": biopsy_caps} if biopsy_caps else {}
+    day_slots, log, warnings, fc = _solve_month_once(inp, **options)
     best_cost = _clerk_equal_cost(inp, fc, day_slots)
     best_out = (day_slots, log, warnings, fc)
     for _pass in range(1, CLERK_EQUALIZE_MAX_PASSES):
@@ -1347,7 +1403,7 @@ def _month_solve_attendance_raw(inp: DaySolveInput) -> tuple:
             #   由下面的點名據實說明。
             break
         caps = nxt
-        day_slots, log, warnings, fc = _solve_month_once(inp, seat_cap=caps)
+        day_slots, log, warnings, fc = _solve_month_once(inp, seat_cap=caps, **options)
         cost = _clerk_equal_cost(inp, fc, day_slots)
         if cost < best_cost:
             best_cost, best_out = cost, (day_slots, log, warnings, fc)
@@ -1507,7 +1563,7 @@ def _clerk_equal_seat_caps(inp: DaySolveInput, fc: FairCounters,
     return out if unresolved else None
 
 
-def _solve_month_once(inp: DaySolveInput, seat_cap=None) -> tuple:
+def _solve_month_once(inp: DaySolveInput, seat_cap=None, *, biopsy_caps=None) -> tuple:
     """單趟整月填充 → (day_slots, log, warnings, fc)。fc 供測試檢視公平計數。
 
     `seat_cap` = {(梯次, 代號): 該跟幾次}(RS-34 第二趟才有;None = 只受
@@ -1686,18 +1742,25 @@ def _solve_month_once(inp: DaySolveInput, seat_cap=None) -> tuple:
             _seat_cap_now = ({c: seat_cap[(batch_key, c)] for c in _members
                               if (batch_key, c) in seat_cap}
                              if seat_cap else None)
+            if batch:
+                from .follow_priority import clerk_month_caps
+                for c, cap in clerk_month_caps(inp, batch).items():
+                    if _seat_cap_now is None:
+                        _seat_cap_now = {}
+                    _seat_cap_now[c] = min(_seat_cap_now.get(c, CLERK_SEAT_TARGET_MAX), cap)
             _quota: "dict | None" = None
             _force: frozenset = frozenset()
             _pos = _bio_pos.get((iso, session))
             if _members and _pos is not None:
-                _cap = max(1, len(_bio_slots.get(batch_key, ()))
-                           // len(_members))
+                _cap = min(2, max(1, len(_bio_slots.get(batch_key, ()))
+                           // len(_members)))
                 _now = _ord.get((iso, session), -1)
                 # ★還沒跑到的鎖定時段要先預留★:那一次已經指派給他了,
                 #   跑到那天 `replay_counters` 才會計入 —— 現在不先扣的話
                 #   會多補他一次(已經跑過的則已在 `biopsy_done` 裡,不重複扣)。
                 _quota = {
-                    c: max(0, _cap - fc.biopsy_done.get((batch_key, c), 0)
+                    c: max(0, min(_cap, (biopsy_caps or {}).get((batch_key, c), _cap))
+                           - fc.biopsy_done.get((batch_key, c), 0)
                            - sum(1 for o in _locked_bx.get((batch_key, c), [])
                                  if o > _now))
                     for c in _members}

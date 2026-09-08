@@ -376,7 +376,7 @@ def test_the_follow_slot_rule_has_one_definition():
 
 def test_the_target_band_matches_what_the_user_asked_for():
     """使用者定的是 7-11。改這兩個數字是政策變更,要有人明確決定。"""
-    assert (CLERK_SEAT_TARGET_MIN, CLERK_SEAT_TARGET_MAX) == (7, 11)
+    assert (CLERK_SEAT_TARGET_MIN, CLERK_SEAT_TARGET_MAX) == (9, 11)
 
 
 # ══ 未來的鎖定跟診要先預留(外審 RS-33 R1 P2)═══════════════════════════════

@@ -1185,7 +1185,7 @@ class RosterService:
         #   (鎖定格先拿掉、有效鎖定切片加回)—— 否則求解器合法排出的平均結果
         #   會被這裡誤報「超過配額」,反向也會漏掉等量的超額。
         apply_locked_adjustments(inp, order, slots)
-        caps = {b.id: max(1, len(slots.get(b.id, ())) // len(b.members))
+        caps = {b.id: min(2, max(1, len(slots.get(b.id, ())) // len(b.members)))
                 for b in inp.clerk_batches if b.members}
         return biopsy_quota_warnings(inp.clerk_batches, counts,
                                      batch_more=more, only_ids=active,

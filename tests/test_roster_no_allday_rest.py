@@ -184,8 +184,9 @@ def test_month_allday_rest_only_on_closed_afternoons():
     assert spread(tx, "ABCD") <= 1, f"PGY 治療室不均: {tx}"
     assert spread(seat, batch.members) <= 1, \
         f"[RS-35] Clerk 跟診次數全距要 ≤1: {seat}"
-    # ★整天放假沒有例外★(RS-35:它的優先權在跟診一致之上)。
+    # Clerk 的 course 仍須分散；2026-09-08 Clerk 優先，PGY 使用剩餘診位。
     for iso, idle in idle_days:
+        idle = sorted(set(idle) & set(batch.members))
         wd = '一二三四五六日'[date.fromisoformat(iso).weekday()]
         assert not idle, f"{iso}(週{wd}) ★有人整天放假★: {idle}"
     assert spread(biopsy, batch.members) <= 1, f"Clerk 切片不均: {biopsy}"

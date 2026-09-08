@@ -138,12 +138,13 @@ class TestFixedSlotsThatAreNotAssignable:
         我第一版用「2 格 vs 1 格」,兩邊 `max(1, n//2)` 都是 1,量不到(突變假綠燈)。
         """
         got = _solve_five_slot_batch(tmp_path, fixed={BIOPSY: ["ZZ"]})
-        assert got == 4, f"未知代號那一格被算進分母了(填了 {got} 格)"
+        # Cross-month courses defer the optional second biopsy; unknown fixed
+        # identities must not consume either Clerk's first-biopsy allowance.
+        assert got == 2, f"未知代號占用了本梯切片配額(填了 {got} 格)"
 
     def test_a_fixed_slot_for_a_member_does_count(self, tmp_path):
-        """★對照組★:同一格改成本梯的 C1 → 它算數(分母 6、配額 3)。
-        與上一條只差代號在不在名單裡。"""
-        assert _solve_five_slot_batch(tmp_path, fixed={BIOPSY: ["C1"]}) == 5
+        """跨月先排每人 1 次；有效未來鎖定預扣 C1，本月只剩 C2 的 1 次。"""
+        assert _solve_five_slot_batch(tmp_path, fixed={BIOPSY: ["C1"]}) == 1
 
     def test_a_valid_fixed_code_pre_deducts_that_person(self, tmp_path):
         """★對照組★:同一格改成本梯的 C1 → 它算數,C1 被預扣 → 8/31 給 C2。

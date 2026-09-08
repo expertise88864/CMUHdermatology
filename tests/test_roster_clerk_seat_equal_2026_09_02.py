@@ -304,7 +304,7 @@ class TestTheConvergenceLoop:
                 biopsy_open={"b1": _bio()}, leaves={}, locked={})
 
         first = sd._solve_month_once(_mk())[0]
-        assert month_solve_day(_mk())[0] == first, \
+        assert sd._month_solve_attendance_raw(_mk())[0] == first, \
             "★交出來的不是代價最小的第一趟★"
 
     def test_the_pass_budget_is_bounded(self):
