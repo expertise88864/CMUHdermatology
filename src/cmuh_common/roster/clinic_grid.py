@@ -67,3 +67,27 @@ def month_grid(ym: str, template: dict, holidays: set,
 def is_session_open(grid: dict, d: date, session: str) -> bool:
     """該日該時段是否有跟診診間開診。"""
     return bool((grid.get(d) or {}).get(session))
+
+
+def grid_doctors(grid: dict, template: dict) -> dict:
+    """Resolve each open room to one unambiguous doctor in the weekly template.
+
+    Blank/conflicting names and added rooms without a template physician remain
+    unknown. They must never be counted as an extra doctor for diversity.
+    """
+    result = {}
+    for d, sessions in grid.items():
+        for session, rooms in sessions.items():
+            names: dict = {}
+            for entry in (template.get(str(d.weekday())) or {}).get(session) or []:
+                if entry.get("is_self_paid"):
+                    continue
+                room = str(entry.get("room") or "")
+                if room in rooms:
+                    doctor = entry.get("doctor")
+                    names.setdefault(room, set()).add(doctor.strip() if isinstance(doctor, str) else "")
+            resolved = {room: next(iter(doctors)) for room, doctors in names.items()
+                        if len(doctors) == 1 and "" not in doctors}
+            if resolved:
+                result.setdefault(d, {})[session] = resolved
+    return result

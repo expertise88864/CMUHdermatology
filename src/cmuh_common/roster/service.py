@@ -31,7 +31,7 @@ from datetime import date, timedelta
 from typing import NamedTuple
 
 from cmuh_common.roster.calendar_colors import week_colors_for_year
-from cmuh_common.roster.clinic_grid import month_grid
+from cmuh_common.roster.clinic_grid import month_grid, grid_doctors
 from cmuh_common.roster.ledger import (
     can_rollback, rollback_month, settle_month, sync_members,
 )
@@ -791,6 +791,7 @@ class RosterService:
 
         grid = month_grid(ym, template, holidays,
                           month.get("grid_overrides") or {})
+        clinic_doctors = grid_doctors(grid, template)
 
         pgy_roster = month.get("pgy_month_roster")
         if pgy_roster is None:                     # 未指定當月人員 → 用 config 預設代號
@@ -879,6 +880,7 @@ class RosterService:
         for _om in (prev_ym(ym), _nxt):
             _og = month_grid(_om, template, holidays,
                              st.load_month(_om).get("grid_overrides") or {})
+            clinic_doctors.update(grid_doctors(_og, template))
             course_days |= {d.isoformat() for d in _og}
             course_clinic_days |= {d.isoformat() for d, sess in _og.items()
                                    if any((sess or {}).values())}
@@ -961,7 +963,7 @@ class RosterService:
             prior_pgy = {str(x) for x in prev_pgy}
 
         return DaySolveInput(
-            ym=ym, grid=grid, pgy_roster=list(pgy_roster),
+            ym=ym, grid=grid, pgy_roster=list(pgy_roster), clinic_doctors=clinic_doctors,
             external_roster=external_month_codes(month),
             family_roster=family_month_codes(month),
             family_follow=family_follow_slots(ym, month),

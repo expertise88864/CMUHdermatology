@@ -755,6 +755,7 @@ class DaySolveInput:
     family_follow: dict = field(default_factory=dict)  # {code: {(date, session)}}
     external_roster: list = field(default_factory=list)  # monthly external trainees
     apply_pref: set = field(default_factory=set)  # Apply 本科 PGY（101 週二/五平手優先）
+    clinic_doctors: dict = field(default_factory=dict)  # {date: {session: {room: doctor}}}
 
 
 def day_input_fingerprint(inp: "DaySolveInput") -> str:
