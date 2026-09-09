@@ -87,6 +87,11 @@ class UiAlertErrorMessage:
     msg: str
 
 
+@dataclass(frozen=True, slots=True)
+class UiToggleFloatingClinicMessage:
+    """One F7 release requests one toggle on the Tk main thread."""
+
+
 UiMessage: TypeAlias = Union[
     UiStatusMessage,
     UiRefreshTickMessage,
@@ -99,6 +104,7 @@ UiMessage: TypeAlias = Union[
     UiClockStatusMessage,
     UiAlertInfoMessage,
     UiAlertErrorMessage,
+    UiToggleFloatingClinicMessage,
 ]
 
 

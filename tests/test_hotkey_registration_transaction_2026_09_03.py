@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import main  # noqa: E402
 
-_ALL_KEYS = ["F1", "F2", "F3", "F4", "F5", "F8", "F9", "F10", "F11", "F12"]
+_ALL_KEYS = ["F1", "F2", "F3", "F4", "F5", "F7", "F8", "F9", "F10", "F11", "F12"]
 
 
 class _FakeKeyboard:
@@ -38,15 +38,17 @@ class _FakeKeyboard:
 
     def __init__(self, fail_at=None, unhook_all_raises=False, events=None):
         self.registry = {}
+        self.release_flags = {}
         self.fail_at = fail_at
         self.unhook_all_raises = unhook_all_raises
         self.events = events if events is not None else []
 
-    def add_hotkey(self, key, callback, suppress=False):
+    def add_hotkey(self, key, callback, suppress=False, trigger_on_release=False):
         if key == self.fail_at:
             self.events.append(("raise", key))
             raise RuntimeError(f"hook registry busy at {key}")
         self.registry[key] = callback
+        self.release_flags[key] = trigger_on_release
         self.events.append(("add", key))
 
     def unhook_all(self):
@@ -209,8 +211,8 @@ def test_a_previously_committed_set_goes_inert_when_a_new_transaction_fails(monk
     pressed_during = []
     orig_add = kb.add_hotkey
 
-    def _add_and_press_old(key, callback, suppress=False):
-        orig_add(key, callback, suppress)
+    def _add_and_press_old(key, callback, suppress=False, trigger_on_release=False):
+        orig_add(key, callback, suppress, trigger_on_release)
         if key == "F3":                      # 新交易走到一半
             old_f8()
             pressed_during.append(list(actions))
@@ -335,3 +337,50 @@ def test_safe_unhook_reports_its_own_failure(monkeypatch):
     assert main.safe_unhook_all_hotkeys() is False
     monkeypatch.setattr(main.hotkey_modules, "keyboard", _FakeKeyboard())
     assert main.safe_unhook_all_hotkeys() is True
+
+
+def test_f7_toggles_on_ui_thread_and_f8_keeps_quick_text(monkeypatch):
+    from queue import Queue
+    kb = _FakeKeyboard()
+    app, actions = _app(monkeypatch, kb)
+    app.ui_queue = Queue()
+    app.log_queue = Queue()
+    app._log_backlog = []
+    app.clinic_widget_mode = _Var('off')
+    opened = []
+    app._open_floating_clinic = lambda: opened.append('open')
+    app._close_floating_clinic = lambda: opened.append('close')
+    app._save_floating_clinic_settings = lambda: None
+    app._subsystem_running = True
+    monkeypatch.setattr(main, '_coord_detector_window_open', lambda: False)
+    app.setup_hotkeys()
+    assert kb.release_flags['F7'] is True
+    assert kb.release_flags['F8'] is False
+    _press(kb, 'F7')
+    assert opened == []
+    assert actions == []
+    app.process_ui_queue()
+    assert opened == ['open']
+    assert app.clinic_widget_mode.get() == 'floating'
+    _press(kb, 'F7')
+    app.process_ui_queue()
+    assert opened == ['open', 'close']
+    assert app.clinic_widget_mode.get() == 'off'
+    _press(kb, 'F8')
+    assert actions == ['F8: 快速輸入文字 (設定頁可改)']
+
+
+@pytest.mark.parametrize('shutdown', [False, True])
+def test_f7_never_enumerates_windows_and_ignores_shutdown(monkeypatch, shutdown):
+    from queue import Queue
+    kb = _FakeKeyboard()
+    app, _ = _app(monkeypatch, kb)
+    app.ui_queue = Queue()
+    app._shutting_down = shutdown
+
+    def forbidden_window_scan():
+        raise AssertionError('F7 must not scan windows from keyboard thread')
+
+    monkeypatch.setattr(main, '_coord_detector_window_open', forbidden_window_scan)
+    app._request_floating_clinic_toggle()
+    assert app.ui_queue.empty() is shutdown

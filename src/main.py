@@ -270,6 +270,7 @@ from cmuh_common.ui_messages import (
     UiStatusMessage, UiRefreshTickMessage, UiClinicDataMessage, UiMasterScheduleMessage,
     UiDutyDoctorMessage, UiSaturdayDutyDoctorMessage, UiTodayVsMessage, UiSaturdayVsMessage,
     UiClockStatusMessage, UiAlertInfoMessage, UiAlertErrorMessage, UiMessage, put_ui_message,
+    UiToggleFloatingClinicMessage,
 )
 from cmuh_common.deps_runtime import ensure_dependencies as _ensure_deps_runtime
 from cmuh_common.single_instance import (
@@ -3792,6 +3793,10 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
                 f"(次數/日期維持原樣),請於 {label} 完成後手動檢查並自行更新。")
 
     # UPDATED: 寫回 TMemo
+    if not isinstance(final_text, str):
+        _show_uvb_warning(main_hwnd, "UVB 更新內容缺失",
+                          f"{label} 未取得可寫回的處置文字，已停止。{_placed_note}")
+        return False
     # [UD-04 2026-07-10] 寫回處置欄是全鏈唯一直接改病歷的動作,卻是唯一沒有取消閘門的步驟:從
     # wrapper 的 check_stop 到此要經過『找主視窗+列舉控件+逐一 gettext(各 2.5s 上限)+parse』,
     # HIS 慢時達數秒,期間按 F12 原本完全不被理會、memo 照樣被覆寫。補上最終 check_stop(近零成本)。
@@ -12861,6 +12866,19 @@ class AutomationApp:
             except Exception:
                 pass
 
+    def _request_floating_clinic_toggle(self):
+        """Keyboard callback: enqueue only; never touch Tk from its worker thread."""
+        if not getattr(self, '_shutting_down', False):
+            put_ui_message(self.ui_queue, UiToggleFloatingClinicMessage())
+
+    def _toggle_floating_clinic(self):
+        """Toggle the same setting used by the checkbox and window close button."""
+        if getattr(self, '_shutting_down', False):
+            return
+        mode = self._normalize_widget_mode(self.clinic_widget_mode.get())
+        self.clinic_widget_mode.set("off" if mode == "floating" else "floating")
+        self._apply_clinic_widget_mode()
+
     def _apply_clinic_widget_mode(self):
         """依目前選的顯示方式(off/floating)開關浮動視窗。"""
         if getattr(self, "_shutting_down", False):
@@ -15907,6 +15925,8 @@ class AutomationApp:
                     break
                 had_work = True
                 match msg:
+                    case UiToggleFloatingClinicMessage():
+                        self._toggle_floating_clinic()
                     case UiStatusMessage(text=t):
                         self.status_text.set(t)
                     case UiRefreshTickMessage(doctor_name=doc_name):
@@ -16801,13 +16821,14 @@ class AutomationApp:
                 'F3':  (script_F3_adaptive,  "F3: 照光(3) — 51019+療程3"),
                 'F4':  (script_F4_adaptive,  "F4: 冷凍 — 51017"),
                 'F5':  (script_F5_adaptive,  "F5: KOH — 13017"),
+                'F7':  (self._request_floating_clinic_toggle, "F7: 浮動門診動態 顯示/隱藏"),
                 'F8':  (script_F8_quick_text, "F8: 快速輸入文字 (設定頁可改)"),
                 'F9':  (script_F9_adaptive,  "F9: 腫瘤同意書"),
                 'F10': (script_F10_adaptive, "F10: 切片同意書"),
                 'F11': (script_F11_adaptive, "F11: 快速完成 (全部完成→疼痛→預約)"),
             }
             hotkey_info_text = ("F1:照光(1) F2:照光(2) F3:照光(3) F4:冷凍 F5:KOH\n"
-                                "F8:快速輸入 F9:腫瘤 F10:切片 F11:快速完成 F12:中止")
+                                "F7:門診動態開關 F8:快速輸入 F9:腫瘤 F10:切片 F11:快速完成 F12:中止")
             if profile in ('1920x1080', '1280x1024', '1024x768'):
                 hotkeys_to_register = dict(_adaptive_descs)
 
@@ -16817,7 +16838,7 @@ class AutomationApp:
             #   2. F1-F5 在 TfrmOpdCS (排檢) 不能執行 → 必須嚴格 (only TFopdmain)
             #   3. F11/F9/F10/F12 在醫院子視窗 (popup/同意書/警告 dialog) 點要
             #      還能觸發 → 寬鬆，允許所有已知醫院 class
-            #   4. F8 (快速輸入文字) 要在「任何 app」都能觸發 (含瀏覽器登入欄位)
+            #   4. F7 浮動門診動態 / F8 快速輸入可在任何 app 觸發
             #      → 完全不檢查 class
             HOTKEY_STRICT_CLASSES = {"TFopdmain"}
             HOTKEY_LENIENT_CLASSES = {
@@ -16836,7 +16857,7 @@ class AutomationApp:
                 "TFrmAllergyM01",  # 過敏記錄維護-醫師端
             }
             STRICT_HOTKEYS = {'F1', 'F2', 'F3', 'F4', 'F5'}
-            NO_GUARD_HOTKEYS = {'F8'}  # 跳過 class 檢查，任何 app 都能觸發
+            NO_GUARD_HOTKEYS = {'F7', 'F8'}  # 跳過 class 檢查，任何 app 都能觸發
 
             def _hotkey_guard(action_fn, key_name, strict):
                 allow = HOTKEY_STRICT_CLASSES if strict else HOTKEY_LENIENT_CLASSES
@@ -16916,6 +16937,8 @@ class AutomationApp:
                 # 其餘熱鍵維持「忙碌中略過」。
                 _preempt = (key == 'F11')
                 action = lambda f=f_use, n=name, p=_preempt: self.run_subsystem_in_thread(f, n, preempt_same=p)
+                if key == 'F7':
+                    action = self._request_floating_clinic_toggle
                 if key in NO_GUARD_HOTKEYS:
                     # 完全跳過 class guard — 任何 app 都觸發 (e.g. F8 在瀏覽器)
                     callback = action
@@ -16928,6 +16951,7 @@ class AutomationApp:
                     key,
                     callback,
                     suppress=False,
+                    trigger_on_release=(key == 'F7'),
                 )
             # F12 (中止) 是救援鍵：自動化執行中不做前景限制；平常仍用寬鬆 guard。
             f12_guarded = _hotkey_guard(
