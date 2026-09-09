@@ -51,6 +51,9 @@ class _FakeKeyboard:
         self.release_flags[key] = trigger_on_release
         self.events.append(("add", key))
 
+    def on_release_key(self, key, callback, suppress=False):
+        return self.add_hotkey(key, lambda: callback(None), suppress, trigger_on_release=True)
+
     def unhook_all(self):
         self.events.append(("unhook_all",))
         if self.unhook_all_raises:
@@ -384,3 +387,151 @@ def test_f7_never_enumerates_windows_and_ignores_shutdown(monkeypatch, shutdown)
     monkeypatch.setattr(main, '_coord_detector_window_open', forbidden_window_scan)
     app._request_floating_clinic_toggle()
     assert app.ui_queue.empty() is shutdown
+
+@pytest.mark.parametrize('outside,profile', [(True, '1920x1080'), (False, None), (False, 'unsupported')])
+def test_f7_available_when_his_hotkeys_disabled(monkeypatch, outside, profile):
+    kb = _FakeKeyboard()
+    app, actions = _app(monkeypatch, kb)
+    app.out_of_hospital_var = _Var(outside)
+    app.hotkey_profile = profile
+    app._request_floating_clinic_toggle = lambda: actions.append('F7')
+    app.setup_hotkeys()
+    assert set(kb.registry) == {'F7'}
+    assert kb.release_flags['F7'] is True
+    _press(kb, 'F7')
+    assert actions == ['F7']
+    assert ('install_abbrev',) in kb.events
+
+
+def test_switching_modes_preserves_f7_and_invalidates_old_clinical_callbacks(monkeypatch):
+    kb = _FakeKeyboard()
+    app, actions = _app(monkeypatch, kb)
+    app.out_of_hospital_var = _Var(False)
+    app._request_floating_clinic_toggle = lambda: actions.append('F7')
+    app.setup_hotkeys()
+    old_f8 = kb.registry['F8']
+    kb.unhook_all_raises = True
+    app.out_of_hospital_var.set(True)
+    app.setup_hotkeys()
+    old_f8()
+    assert actions == []
+    _press(kb, 'F7')
+    assert actions == ['F7']
+    kb.unhook_all_raises = False
+    app.out_of_hospital_var.set(False)
+    app.setup_hotkeys()
+    assert set(kb.registry) == set(_ALL_KEYS)
+    _press(kb, 'F8')
+    assert actions[-1] == 'F8: 快速輸入文字 (設定頁可改)'
+
+
+def test_f7_registration_failure_in_outside_mode_retries(monkeypatch):
+    kb = _FakeKeyboard(fail_at='F7')
+    app, _ = _app(monkeypatch, kb)
+    app.out_of_hospital_var = _Var(True)
+    app.setup_hotkeys()
+    assert kb.registry == {}
+    assert not app._floating_hotkey_registered
+    assert app._hotkey_register_retry_count == 1
+    assert any(delay == 30000 for delay, _ in app.root.scheduled)
+
+
+def test_guardian_monitors_f7_without_his_profile_or_abbreviations(monkeypatch):
+    kb = _FakeKeyboard()
+    app, _ = _app(monkeypatch, kb)
+    app.hotkey_profile = None
+    app._abbrev_config_cache = None
+    app._floating_hotkey_registered = True
+    probed = []
+    app._probe_hotkey_hook_alive = lambda: probed.append(True) or True
+    monkeypatch.setattr(main, 'should_probe_hook_health', lambda _: True)
+    app._hotkey_health_tick()
+    assert probed == [True]
+    app._floating_hotkey_registered = False
+    app._hotkey_health_tick()
+    assert probed == [True]
+
+@pytest.mark.parametrize('outside', [False, True])
+def test_real_keyboard_dispatch_f7_release_even_after_pressed_table_is_cleared(monkeypatch, outside):
+    import keyboard as kb
+    monkeypatch.setattr(kb._os_keyboard, 'init', lambda: None)
+    listener = kb._KeyboardListener()
+    listener.init()
+    monkeypatch.setattr(listener, 'start_if_necessary', lambda: None)
+    monkeypatch.setattr(kb, '_listener', listener)
+    monkeypatch.setattr(kb, '_pressed_events', {})
+    monkeypatch.setattr(kb, '_logically_pressed_keys', {})
+    monkeypatch.setattr(kb, '_hotkeys', {})
+    monkeypatch.setattr(kb, '_hooks', {})
+    monkeypatch.setattr(kb, 'events', [], raising=False)
+    monkeypatch.setattr(kb, 'key_to_scan_codes', lambda key: (int(str(key).lower().removeprefix('f')) + 58,))
+    monkeypatch.setattr(kb, 'is_modifier', lambda _: False)
+    app, actions = _app(monkeypatch, kb)
+    app.out_of_hospital_var = _Var(outside)
+    app._request_floating_clinic_toggle = lambda: actions.append('F7')
+    app.setup_hotkeys()
+    # OS dispatch queues all events before the nonblocking processing thread runs.
+    # Include auto-repeat downs: one physical release must yield exactly one toggle.
+    for _ in range(2):
+        events = [kb.KeyboardEvent(kind, 65, 'f7')
+                  for kind in (kb.KEY_DOWN, kb.KEY_DOWN, kb.KEY_UP)]
+        for event in events:
+            listener.direct_callback(event)
+        assert 65 not in kb._pressed_events
+        for event in events:
+            listener.pre_process_event(event)
+    assert actions == ['F7', 'F7']
+
+
+def test_old_callback_disabled_before_mode_ui_work(monkeypatch):
+    kb = _FakeKeyboard()
+    app, actions = _app(monkeypatch, kb)
+    app.setup_hotkeys()
+    old_f8 = kb.registry['F8']
+    app.hotkey_display_note.set = lambda _: old_f8()
+    app.out_of_hospital_var = _Var(True)
+    app.setup_hotkeys()
+    assert actions == []
+
+
+def test_mode_flip_after_transaction_check_prevents_clinical_dispatch(monkeypatch):
+    kb = _FakeKeyboard()
+    app, actions = _app(monkeypatch, kb)
+    app.val_out_of_hospital = False
+    app.setup_hotkeys()
+
+    def flip_after_transaction_gate():
+        app.val_out_of_hospital = True
+        return False
+
+    monkeypatch.setattr(main, 'screen_blackout_should_eat_this_hotkey', flip_after_transaction_gate)
+    _press(kb, 'F8')
+    assert actions == []
+
+
+def test_queued_clinical_worker_rechecks_mode_before_running(monkeypatch):
+    kb = _FakeKeyboard()
+    app, actions = _app(monkeypatch, kb)
+    queued = []
+    app.val_out_of_hospital = False
+    app.run_subsystem_in_thread = lambda f, n, **kw: queued.append(f)
+    monkeypatch.setattr(main, 'script_F8_quick_text', lambda: actions.append('injected'))
+    app.setup_hotkeys()
+    _press(kb, 'F8')
+    assert len(queued) == 1
+    app.val_out_of_hospital = True
+    queued[0]()
+    assert actions == []
+
+@pytest.mark.parametrize('result', [False, True, None])
+def test_clinical_worker_guard_preserves_results(monkeypatch, result):
+    kb = _FakeKeyboard()
+    app, _ = _app(monkeypatch, kb)
+    queued = []
+    app.run_subsystem_in_thread = lambda f, n, **kw: queued.append(f)
+    monkeypatch.setattr(main, 'script_F8_quick_text', lambda: result)
+    app.setup_hotkeys()
+    _press(kb, 'F8')
+    assert queued[0]() is result
+    app.val_out_of_hospital = True
+    assert queued[0]() is False

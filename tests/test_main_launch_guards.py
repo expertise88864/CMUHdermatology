@@ -1117,7 +1117,7 @@ def test_hotkey_guardian_covers_abbrev_only_mode():
     source_path = ROOT / "src" / "main.py"
     src = _function_source(source_path, "_hotkey_health_tick")
     assert "abbrev_active" in src
-    assert "if not has_profile and not abbrev_active:" in src
+    assert "if not has_profile and not abbrev_active and not getattr(self, '_floating_hotkey_registered', False):" in src
 
 
 def test_abbrev_export_import_buttons_exist():

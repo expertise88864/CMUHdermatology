@@ -14753,13 +14753,8 @@ class AutomationApp:
 
             if self.out_of_hospital_var.get():
                 logging.info("切換至 [醫院外模式]")
-                safe_unhook_all_hotkeys()
-                # 縮寫速寫獨立於 HIS 模式：unhook_all 後重掛
-                try:
-                    self._install_abbrev_listeners()
-                except Exception:
-                    logging.exception("[abbrev] 院外模式切換後 install 失敗")
-                self.status_text.set("狀態: 院外模式 (功能已停用)")
+                self.setup_hotkeys()
+                self.status_text.set("狀態: 院外模式 (HIS 熱鍵停用，F7 門診動態可用)")
                 # 打卡燈號設為灰色表示停用（disabled → 不觸發自動重試）
                 put_ui_message(self.ui_queue, UiClockStatusMessage(
                     status_data=_clock_error("院外模式停用", CLOCK_ERR_DISABLED)))
@@ -16772,44 +16767,25 @@ class AutomationApp:
             if not getattr(self, '_shutting_down', False):
                 self.root.after(0, self.setup_hotkeys)
             return
+        self._hotkey_txn = getattr(self, '_hotkey_txn', 0) + 1
+        _txn = self._hotkey_txn
+        self._hotkey_txn_committed = None
+        self._floating_hotkey_registered = False
         if not self._heavy_modules_ready or hotkey_modules.keyboard is None:
             self.hotkey_text_label.config(text="熱鍵模組載入中...")
             self.status_text.set("狀態: 熱鍵模組尚未就緒")
             return
-        # [新增] 院外模式檢查
-        if hasattr(self, 'out_of_hospital_var') and self.out_of_hospital_var.get():
-            logging.info("院外模式啟用中，跳過熱鍵註冊。")
-            safe_unhook_all_hotkeys()
-            # 縮寫速寫獨立於 HIS 模式：unhook_all 後重掛
-            try:
-                self._install_abbrev_listeners()
-            except Exception:
-                logging.exception("[abbrev] 院外模式 setup 路徑 install 失敗")
-            configure_hotkey_scaling(False, None, None)
-            self.hotkey_text_label.config(text="熱鍵已停用 (院外模式)")
-            self.hotkey_display_note.set("")
-            return
         profile = getattr(self, 'hotkey_profile', None) or self.hotkey_version
-        if profile is None:
-            message = f"螢幕解析度 ({self.screen_width}x{self.screen_height}) 無法對應熱鍵腳本，已停用熱鍵功能"
-            logging.warning(message)
-            self.hotkey_display_note.set(
-                f"熱鍵停用 · 解析度 {self.screen_width}×{self.screen_height} 無對應腳本"
-            )
-            safe_unhook_all_hotkeys()
-            # 縮寫速寫獨立於熱鍵解析度：unhook_all 後重掛
-            try:
-                self._install_abbrev_listeners()
-            except Exception:
-                logging.exception("[abbrev] 解析度不符路徑 install 失敗")
+        his_disabled_reason = ""
+        if hasattr(self, 'out_of_hospital_var') and self.out_of_hospital_var.get():
+            his_disabled_reason = "院外模式"
+        elif profile not in ('1920x1080', '1280x1024', '1024x768'):
+            his_disabled_reason = "解析度不符"
+        if his_disabled_reason:
             configure_hotkey_scaling(False, None, None)
-            put_ui_message(self.ui_queue, UiStatusMessage(text='狀態: 解析度不符，熱鍵已停用'))
-            self.hotkey_text_label.config(text="熱鍵已停用 (解析度不符)")
-            return
-
-        # [清理 2026-05-19] 移除 configure_hotkey_scaling 呼叫 — F1-F11 已全
-        # adaptive (Win32 訊息，跨解析度 hwnd-based)，座標縮放邏輯已死。
-        self.hotkey_display_note.set("")
+            logging.info("%s：停用 HIS 熱鍵，保留 F7 浮動門診。", his_disabled_reason)
+        self.hotkey_display_note.set(
+            f"HIS 熱鍵停用 ({his_disabled_reason}) · F7 門診動態可用" if his_disabled_reason else "")
 
         try:
             hotkeys_to_register = {}
@@ -16829,7 +16805,10 @@ class AutomationApp:
             }
             hotkey_info_text = ("F1:照光(1) F2:照光(2) F3:照光(3) F4:冷凍 F5:KOH\n"
                                 "F7:門診動態開關 F8:快速輸入 F9:腫瘤 F10:切片 F11:快速完成 F12:中止")
-            if profile in ('1920x1080', '1280x1024', '1024x768'):
+            if his_disabled_reason:
+                hotkeys_to_register = {'F7': _adaptive_descs['F7']}
+                hotkey_info_text = f"F7:門診動態開關 · HIS 熱鍵已停用 ({his_disabled_reason})"
+            else:
                 hotkeys_to_register = dict(_adaptive_descs)
 
             # ─── 熱鍵守門：F1-F5 嚴格 (僅 TFopdmain)；F9-F12 寬鬆 (含醫院子視窗) ────
@@ -16913,9 +16892,6 @@ class AutomationApp:
             # 不變量「未完整提交的熱鍵不可執行」★不可以依賴 unhook 成功★:每個 callback
             # 外面包一層閘門,只有「本交易已提交」時才放行。交易開始就把 committed 清成
             # None → 上一筆交易殘留的 callback(若開頭 unhook 也失敗)同樣變成 inert。
-            self._hotkey_txn = getattr(self, '_hotkey_txn', 0) + 1
-            _txn = self._hotkey_txn
-            self._hotkey_txn_committed = None
 
             def _txn_gate(callback, key_name, txn=_txn):
                 def _gated():
@@ -16936,7 +16912,18 @@ class AutomationApp:
                 # F11(快速完成)執行中再按 F11 → 終止前一次、改從這次重新開始;
                 # 其餘熱鍵維持「忙碌中略過」。
                 _preempt = (key == 'F11')
-                action = lambda f=f_use, n=name, p=_preempt: self.run_subsystem_in_thread(f, n, preempt_same=p)
+                def action(f=f_use, n=name, p=_preempt, txn=_txn):
+                    if (getattr(self, 'val_out_of_hospital', False)
+                            or getattr(self, '_hotkey_txn_committed', None) != txn):
+                        return
+
+                    def run_if_still_enabled():
+                        if (not getattr(self, 'val_out_of_hospital', False)
+                                and getattr(self, '_hotkey_txn_committed', None) == txn):
+                            return f()
+                        return False
+
+                    self.run_subsystem_in_thread(run_if_still_enabled, n, preempt_same=p)
                 if key == 'F7':
                     action = self._request_floating_clinic_toggle
                 if key in NO_GUARD_HOTKEYS:
@@ -16947,32 +16934,35 @@ class AutomationApp:
                     callback = _hotkey_guard(action, key, strict)
                 callback = _blackout_gate(callback, key)
                 callback = _txn_gate(callback, key)   # 最外層:未提交一律不執行
+                if key == 'F7':
+                    # Non-suppressing add_hotkey release callbacks lose the released
+                    # key from the library's pressed-key table before dispatch.
+                    hotkey_modules.keyboard.on_release_key(
+                        key, lambda _event, action=callback: action(), suppress=False)
+                else:
+                    hotkey_modules.keyboard.add_hotkey(key, callback, suppress=False)
+            if not his_disabled_reason:
+                # F12 (中止) 是救援鍵：自動化執行中不做前景限制；平常仍用寬鬆 guard。
+                f12_guarded = _hotkey_guard(
+                    self.interrupt_automation, 'F12', strict=False)
+
+                def _f12_callback():
+                    if should_bypass_foreground_guard(
+                        'F12',
+                        subsystem_running=getattr(self, '_subsystem_running', False),
+                    ):
+                        self.interrupt_automation()
+                        return
+                    f12_guarded()
+
                 hotkey_modules.keyboard.add_hotkey(
-                    key,
-                    callback,
-                    suppress=False,
-                    trigger_on_release=(key == 'F7'),
-                )
-            # F12 (中止) 是救援鍵：自動化執行中不做前景限制；平常仍用寬鬆 guard。
-            f12_guarded = _hotkey_guard(
-                self.interrupt_automation, 'F12', strict=False)
-
-            def _f12_callback():
-                if should_bypass_foreground_guard(
                     'F12',
-                    subsystem_running=getattr(self, '_subsystem_running', False),
-                ):
-                    self.interrupt_automation()
-                    return
-                f12_guarded()
-
-            hotkey_modules.keyboard.add_hotkey(
-                'F12',
-                _txn_gate(_f12_callback, 'F12'),
-                suppress=False,
-            )
-            # ★提交★:F12 也掛上了,整組才算存在;在這之前任何一鍵都不會執行。
+                    _txn_gate(_f12_callback, 'F12'),
+                    suppress=False,
+                )
+            # 全部適用熱鍵註冊成功才提交（院外／解析度不符僅 F7）。
             self._hotkey_txn_committed = _txn
+            self._floating_hotkey_registered = True
 
             self.hotkey_text_label.config(text=hotkey_info_text)
             put_ui_message(self.ui_queue, UiStatusMessage(text=f'狀態: 熱鍵註冊成功 ({profile})，等待指令...'))
@@ -16990,6 +16980,7 @@ class AutomationApp:
             # 的 unhook_all 又失敗,整組 callback 會在「畫面說註冊失敗」的狀態下照樣執行。
             # 不論例外發生在哪一步,離開本函式時 committed 一律不等於任何存活的交易。
             self._hotkey_txn_committed = None
+            self._floating_hotkey_registered = False
             logging.error(f"Failed to register hotkeys: {e}", exc_info=True)
             # [R8-P2 2026-09-03] ★註冊是一筆交易:中途任何一鍵失敗 → 全部 rollback★。
             # F1~F11 是逐一 add_hotkey、F12(中止=救援鍵)排在最後。第 k 鍵拋例外時,
@@ -17104,7 +17095,7 @@ class AutomationApp:
         _abbrev_cfg = getattr(self, '_abbrev_config_cache', None)
         abbrev_active = bool(_abbrev_cfg is not None
                              and getattr(_abbrev_cfg, 'enabled', False))
-        if not has_profile and not abbrev_active:
+        if not has_profile and not abbrev_active and not getattr(self, '_floating_hotkey_registered', False):
             return  # 沒 F 鍵熱鍵也沒啟用縮寫：無 hook 可監看
 
         now = time.monotonic()
