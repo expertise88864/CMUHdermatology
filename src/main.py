@@ -380,7 +380,7 @@ from copy import deepcopy
 from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import date, datetime, timedelta, time as dt_time
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, NotRequired, Optional, TypedDict
 
 class DoctorConfig(TypedDict):
     name: str
@@ -16912,7 +16912,7 @@ class AutomationApp:
                 # F11(快速完成)執行中再按 F11 → 終止前一次、改從這次重新開始;
                 # 其餘熱鍵維持「忙碌中略過」。
                 _preempt = (key == 'F11')
-                def action(f=f_use, n=name, p=_preempt, txn=_txn):
+                def _clinical_action(f=f_use, n=name, p=_preempt, txn=_txn):
                     if (getattr(self, 'val_out_of_hospital', False)
                             or getattr(self, '_hotkey_txn_committed', None) != txn):
                         return
@@ -16924,8 +16924,8 @@ class AutomationApp:
                         return False
 
                     self.run_subsystem_in_thread(run_if_still_enabled, n, preempt_same=p)
-                if key == 'F7':
-                    action = self._request_floating_clinic_toggle
+                action: Callable[[], None] = (self._request_floating_clinic_toggle
+                                               if key == 'F7' else _clinical_action)
                 if key in NO_GUARD_HOTKEYS:
                     # 完全跳過 class guard — 任何 app 都觸發 (e.g. F8 在瀏覽器)
                     callback = action
