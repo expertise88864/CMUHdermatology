@@ -7,6 +7,7 @@ F2/F3 熱鍵觸發時：
   3. parse: dose / count / last_date / increase / max
   4. 依「今天 vs last_date」天數差套用劑量調整規則
   5. 覆蓋寫回該行 (count+1, date→today, dose 依規則)
+  第一行無日期時仍繼續處理後續 UVB 行，各行使用自己的日期與劑量規則。
 
 【規則】依「今天 − last_date」天數差：
     0-1 天 → 太密集，跳警告終止 (F2/F3 不繼續跑 51019)
@@ -1425,6 +1426,8 @@ class UvbUpdateResult:
     # 時,放該段的原文片段。caller 必須把它顯示給醫師 —— 否則醫師會以為劑量都自動處理好了,
     # 沿用未減量的原劑量。UPDATED 時代表「其他段有更新、這段沒有」,仍要提示。
     decrease_note: Optional[str] = None
+    # Physical line index -> expected updated line, for multi-line read-back verification.
+    updated_uvb_lines: Optional[dict[int, str]] = None
 
 
 # [codex P1] 續行延續的【否決】關鍵字:明確提到「過去/之前/上次/病史/N 天前」的行,即使結構
@@ -1828,7 +1831,8 @@ def _count_uvb_lines(text: str) -> int:
 
 def _detect_uncertain_triplets(text: str, today: date,
                                 max_days_ago: int = 365,
-                                driver_max_dose: int = 0) -> list:
+                                driver_max_dose: int = 0, *,
+                                require_dose_association: bool = False) -> list:
     """[v20.13] 偵測 text 中「看起來像 UVB/excimer 但日期不同於今天」的 triplet。
 
     使用情境：update_uvb_in_text 第一行 UVB 已更新，同日期 triplet 也更新後，
@@ -1874,6 +1878,9 @@ def _detect_uncertain_triplets(text: str, today: date,
         line_text = text[line_start:line_end]
         if not _UVB_MARKER_RE.search(line_text):
             continue
+        if require_dose_association and not re.search(
+                r"\d+\s*mj(?:/cm2?)?\s*$", text[line_start:m.start()], re.IGNORECASE):
+            continue  # A line-wide UVB mention cannot make medication triplets phototherapy.
         try:
             old_count = int(m.group(1))
         except ValueError:
@@ -2187,9 +2194,92 @@ def uvb_written_back_ok(text: str, expected_dose, expected_count,
                 and pp.dose == expected_dose and pp.count == expected_count)
 
 
+def uvb_updated_lines_written_back_ok(text: str, expected: dict[int, str]) -> bool:
+    """Verify every independently updated UVB line, not just the first dose/count."""
+    lines = text.splitlines()
+    for index, expected_line in expected.items():
+        if index >= len(lines):
+            return False
+        if (re.sub(r"\s+", "", lines[index]).casefold()
+                != re.sub(r"\s+", "", expected_line).casefold()):
+            return False  # Also verify continuation/excimer edits and preserve medication text.
+        want = parse_uvb_line(expected_line) or parse_uvb_partial(expected_line)
+        got = parse_uvb_line(lines[index]) or parse_uvb_partial(lines[index])
+        if want is None or got is None:
+            return False
+        if got.last_date is None and (_has_unparsed_date_shape(got.full_match)
+                                      or _UVB_DATE_RE.search(got.full_match)):
+            return False
+        if any(getattr(want, field) != getattr(got, field)
+               for field in ("dose", "count", "last_date", "increase", "max_dose")):
+            return False
+    return True
+
+
+def _finish_undated_uvb_lines(text: str, result: UvbUpdateResult, today: date,
+                             skip_dose_sanity: bool, skip_stale_check: bool) -> UvbUpdateResult:
+    """Continue after the undated driver, using each later UVB line's own rules.
+
+    Compute everything before the caller writes. Any required confirmation or
+    unsafe active line cancels the proposed combined write. Old dated history
+    stays unchanged when an undated current treatment is already present.
+    """
+    assert result.new_text is not None and result.parsed is not None
+    original = text.splitlines(keepends=True)
+    working = result.new_text.splitlines(keepends=True)
+    first_index = text[:result.parsed.span[0]].count("\n")
+    expected = {first_index: working[first_index]}
+    confirmations = []
+    uncertain = []
+    offset = sum(len(line) for line in working[:first_index + 1])
+    for index in range(first_index + 1, len(original)):
+        line = original[index]
+        if (_UVB_DOSE_RE.search(line)
+                or (_PT_UVB_SPECIFIC_RE.search(line)
+                    and (_PT_DOSE_RE.search(line) or ":" in line or "：" in line))
+                or re.search(r"Phototherapy\s*[:：]", line, re.IGNORECASE)):
+            parsed = parse_uvb_line(line) or parse_uvb_partial(line)
+            if (parsed is not None and parsed.last_date is None
+                    and _UVB_DATE_RE.search(parsed.full_match)):
+                return UvbUpdateResult(action=UvbAction.PARSE_FAIL)
+            if (parsed is not None and parsed.last_date is not None
+                    and parsed.last_date < _months_before(today, MODIFY_STALE_MONTHS)):
+                offset += len(working[index])
+                continue
+            extra = update_uvb_in_text(line, today, skip_dose_sanity, skip_stale_check,
+                                       _isolated_uvb=True)
+            if extra.action == UvbAction.CONFIRM_NEEDED:
+                confirmations.append(extra)
+                offset += len(working[index])
+                continue
+            if extra.action != UvbAction.UPDATED or extra.new_text is None:
+                if extra.action in (UvbAction.NO_UVB_LINE, UvbAction.SILENT_SKIP):
+                    extra.action = UvbAction.PARSE_FAIL
+                return extra
+            working[index] = extra.new_text
+            expected[index] = extra.new_text
+            result.additional_lines_updated += 1 + extra.additional_lines_updated
+            result.additional_triplets_updated += extra.additional_triplets_updated
+            if extra.decrease_note:
+                result.decrease_note = extra.decrease_note
+            for item in extra.uncertain_other_triplets or []:
+                uncertain.append({**item, "span": tuple(offset + n for n in item["span"])})
+        offset += len(working[index])
+    if confirmations:
+        confirmation = confirmations[0]
+        confirmation.confirm_reason = "\n".join(item.confirm_reason or "" for item in confirmations)
+        return confirmation
+    result.new_text = "".join(working)
+    if len(expected) > 1:
+        result.updated_uvb_lines = expected
+    result.uncertain_other_triplets = uncertain or None
+    return result
+
+
 def update_uvb_in_text(text: str, today: Optional[date] = None,
                        skip_dose_sanity: bool = False,
-                       skip_stale_check: bool = False) -> UvbUpdateResult:
+                       skip_stale_check: bool = False, *,
+                       _isolated_uvb: bool = False) -> UvbUpdateResult:
     """主入口：給整段「處置」text，回更新後 text + 動作類型。
 
     today=None 用今天日期；測試時傳 fixed date 方便 reproducible。
@@ -2329,7 +2419,10 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
                         + result.new_text
                         + text[partial.span[1]:])
             result.new_text = full_new
-            return result
+            if _isolated_uvb:
+                return result
+            return _finish_undated_uvb_lines(text, result, today,
+                                             skip_dose_sanity, skip_stale_check)
         # partial 有 date 但少 increase 之類 — fall through to PARSE_FAIL
         # (theoretically 應該被 strict parse_uvb_line 抓到才對)
         return UvbUpdateResult(action=UvbAction.PARSE_FAIL,
@@ -2593,6 +2686,8 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         dose_prefix = working[max(line_start, m.start() - 32):m.start()]
         continuation_m = re.search(
             r"(\d+)\s*mj(?:/cm2)?\s*$", dose_prefix, re.IGNORECASE)
+        if _isolated_uvb and continuation_m is None:
+            continue  # Never infer medication count/date ownership from a distant UVB marker.
         if seg_date != parsed.last_date:
             # Cross-date continuation updates are safe without recalculating
             # dose only when that segment is already capped at this line's MAX.
@@ -2704,7 +2799,8 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
     # Step A 處理 line 2 (UVB)，Step C 因日期不同沒動 line 1。
     # 但醫師可能希望 line 1 也一起更新 — 跳 Yes/No 給醫師決定。
     uncertain_others = _detect_uncertain_triplets(
-        new_text, today, driver_max_dose=parsed.max_dose)
+        new_text, today, driver_max_dose=parsed.max_dose,
+        require_dose_association=_isolated_uvb)
 
     return UvbUpdateResult(
         action=UvbAction.UPDATED,

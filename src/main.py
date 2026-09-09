@@ -3715,6 +3715,8 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
     final_text = result.new_text
     _uncertain_applied = 0   # [UD-11] 實際套用的 uncertain 行數(供 W7 對帳記錄)
     if uncertain:
+        _driver_date_text = (result.last_date.strftime('%Y/%m/%d')
+                             if result.last_date is not None else "未填日期")
         lines_show = "\n".join(
             f"  • [{u['date'].strftime('%m/%d')} ({u['days_ago']}天前) "
             f"次數 {u['count']}]"
@@ -3730,11 +3732,12 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
         update_summary = (
             f"  • UVB: {result.parsed.dose}→{result.new_dose} mj/cm2\n"
             f"  • 次數: {result.parsed.count}→{result.new_count}\n"
-            f"  • 日期: {result.last_date.strftime('%Y/%m/%d')}→今天"
+            f"  • 日期: {_driver_date_text}"
+            + ("→今天" if result.last_date is not None else " (維持未填)")
         )
         msg = (
             f"處置內偵測到 {len(uncertain)} 行 (count) ... (日期) 看起來像光療"
-            f"紀錄，\n但日期不同於第一行 UVB ({result.last_date.strftime('%Y/%m/%d')})\n\n"
+            f"紀錄，\n但日期不同於第一行 UVB ({_driver_date_text})\n\n"
             f"=== 不確定的行 ===\n{lines_show}\n\n"
             f"=== 程式預計更新 (確定) ===\n{update_summary}\n\n"
             f"是 = 套用上述更新 + 上面不確定的行也 count+1, 日期→今天，"
@@ -3827,7 +3830,8 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
         return False
     if actual_text:
         from cmuh_common.uvb_dose import (
-            parse_uvb_line, parse_uvb_partial, uvb_written_back_ok)
+            parse_uvb_line, parse_uvb_partial, uvb_written_back_ok,
+            uvb_updated_lines_written_back_ok)
         # [2026-06-04] 處置「無日期」時 parse_uvb_line 會回 None(它要求 on (日期))，
         # 但 update_uvb_in_text 是用 parse_uvb_partial 處理無日期 → 寫回後也無日期。
         # verify 必須同樣容忍無日期(partial fallback)，否則「劑量其實已改」卻被誤判
@@ -3835,8 +3839,10 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
         # [2026-06-24] 改用 uvb_written_back_ok 掃【所有】UVB 行比對 —— driver 重選
         # (舊行在上、改下面近期行)後,更新的驅動行未必是第一條;只看第一行會把已正確
         # 寫回的 stale-above-fresh 情境誤判失敗。verify 變數仍保留供失敗時的 log/提示顯示。
-        if not uvb_written_back_ok(actual_text, result.new_dose,
-                                   result.new_count):
+        if (not uvb_written_back_ok(actual_text, result.new_dose, result.new_count)
+                or not uvb_updated_lines_written_back_ok(
+                    actual_text, {index: final_text.splitlines()[index]
+                                  for index in (getattr(result, 'updated_uvb_lines', None) or {})})):
             verify = parse_uvb_line(actual_text) or parse_uvb_partial(actual_text)
             logging.warning(
                 "[%s][UVB] 寫回後實機 verify 失敗 — 預期 dose=%s count=%s, "
@@ -3845,6 +3851,7 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
             _show_uvb_warning(
                 main_hwnd, "UVB 寫回驗證失敗",
                 f"寫回處置欄後驗證不通過\n\n"
+                f"請逐行核對 UVB，包含其他部位的劑量、次數與日期。\n"
                 f"預期: dose={result.new_dose} count={result.new_count}\n"
                 f"實際讀回: dose={getattr(verify, 'dose', '?')} "
                 f"count={getattr(verify, 'count', '?')}\n\n"
@@ -3895,7 +3902,7 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
 
     if result.additional_lines_updated > 0:
         logging.info(
-            "[%s][UVB] 同日期 UVB 行共 %d 筆都已更新 (第一行 + %d 行)",
+            "[%s][UVB] UVB 行共 %d 筆都已更新 (第一行 + %d 行)",
             label, 1 + result.additional_lines_updated,
             result.additional_lines_updated)
     elif result.uvb_line_count >= 2:
@@ -3917,7 +3924,7 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
     # last_date is None，避免在這個收尾 log 把整個流程帶崩。
     if result.last_date is None:
         logging.info(
-            "[%s][UVB] (第一次照光/處置無日期) 劑量 %s→%s, 次數 →%s, 已加上今天日期",
+            "[%s][UVB] (處置首行無日期) 劑量 %s→%s, 次數 →%s, 首行維持未填日期",
             label, result.parsed.dose, result.new_dose, result.new_count)
     elif result.new_count is None:
         logging.info(
