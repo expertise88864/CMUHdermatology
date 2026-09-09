@@ -9218,7 +9218,7 @@ class AutomationApp:
         # 填入模組全域供後續抓網函式使用。必須在任何網路呼叫之前(放 __init__ 最前)。
         _ensure_network_imports()
         self.root = root
-        self.root.title("中國醫皮膚科常用程式")
+        self.root.title(f"中國醫皮膚科主程式 by 陳翊嘉 v{CURRENT_VERSION}")
         place_tk_window_on_preferred_monitor(self.root)
         _apply_tk_window_icon(self.root)
         
