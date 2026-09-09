@@ -7,10 +7,12 @@
 使用座標偵測器的時機正好是「HIS 開著、要量 F11 的像素座標」,
 於是按 F8 記座標會同時把身分證字號打進當下有焦點的欄位(可能是 HIS 的醫令/病歷欄)。
 """
+import ast
 import inspect
 import os
 import re
 import sys
+import textwrap
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -26,8 +28,13 @@ def _code_only(src: str) -> str:
 def test_both_programs_really_use_f8():
     """釘住衝突前提:任一邊改了熱鍵,這個例外就該重新檢視(測試會轉紅提醒)。"""
     assert cd.CoordinateDetectorApp.HOTKEY == "F8"
-    src = (open(main.__file__, encoding="utf-8").read())
-    assert "NO_GUARD_HOTKEYS = {'F8'}" in src, "主程式 F8 仍跳過視窗檢查"
+    tree = ast.parse(textwrap.dedent(inspect.getsource(main.AutomationApp.setup_hotkeys)))
+    assignments = [node for node in ast.walk(tree)
+                   if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "NO_GUARD_HOTKEYS"
+                           for target in node.targets)]
+    assert len(assignments) == 1
+    assert "F8" in ast.literal_eval(assignments[0].value), "主程式 F8 仍跳過視窗檢查"
 
 
 def test_f8_skips_injection_while_detector_is_open_even_if_his_is_foreground(
