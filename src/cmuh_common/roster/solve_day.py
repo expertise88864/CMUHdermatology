@@ -751,6 +751,7 @@ class DaySolveInput:
     #   進了 dataclass 就自動進指紋 → 預覽期間有人改動下個月的鎖定/定案,
     #   套用時會被判過期(全審點名的第二個缺口)。
     course_fixed: dict = field(default_factory=dict)
+    session_leaves: dict = field(default_factory=dict)  # {scope: {code: {(date, session)}}}
     family_roster: list = field(default_factory=list)
     family_follow: dict = field(default_factory=dict)  # {code: {(date, session)}}
     external_roster: list = field(default_factory=list)  # monthly external trainees

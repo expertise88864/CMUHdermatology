@@ -133,13 +133,11 @@ class DayScheduleTab(ttk.Frame):
         bar2.pack(fill="x")
         self._edit_btns = []                             # 定案時一併停用的編輯鈕
         for text, cmd in (
-                ("PGY 請假…", lambda: self._on_leave("pgy")),
-                ("Clerk 請假…", lambda: self._on_leave("clerk")),
-                ("外訓請假…", lambda: self._on_leave("external")),
-                ("當月外訓人員…", self._edit_external_roster),
-                ("本月停診…", self._on_clinic_closure),
-                ("當月 PGY 人員…", self._edit_pgy_roster),
-                ("Apply本科…", self._edit_apply_pref)):
+                ("本月門診停診…", self._on_clinic_closure),
+                ("當月PGY人員…", self._edit_pgy_roster),
+                ("PGY apply本科…", self._edit_apply_pref),
+                ("PGY請假…", lambda: self._on_leave("pgy")),
+                ("Clerk請假…", lambda: self._on_leave("clerk"))):
             b = ttk.Button(bar2, text=text, command=cmd)
             b.pack(side="left", padx=4)
             self._edit_btns.append(b)
@@ -148,13 +146,15 @@ class DayScheduleTab(ttk.Frame):
 
         bar3 = ttk.Frame(self, padding=(6, 3))
         bar3.pack(fill="x")
-        for text, cmd in (("當月家醫科人員…", self._edit_family_roster),
+        for text, cmd in (("當月外訓人員…", self._edit_external_roster),
+                          ("外訓請假…", lambda: self._on_leave("external")),
+                          ("當月家醫科人員…", self._edit_family_roster),
                           ("家醫科請假…", lambda: self._on_leave("family")),
                           ("家醫科指定跟診…", self._edit_family_follow)):
             b = ttk.Button(bar3, text=text, command=cmd)
             b.pack(side="left", padx=4)
             self._edit_btns.append(b)
-        ttk.Label(bar3, text="跟診優先：家醫科 ＞ Clerk ＞ 外訓 ＞ PGY；Clerk 9–11 診、1–2 切片",
+        ttk.Label(bar3, text="跟診優先：Clerk ＞ 家醫科 ＞ 外訓 ＞ PGY；Clerk 9–11 診、1–2 切片",
                   foreground="gray").pack(side="left", padx=8)
 
     def _build_grid(self, parent) -> None:
@@ -576,7 +576,9 @@ class DayScheduleTab(ttk.Frame):
         if not members:
             messagebox.showinfo("請假", "本月沒有可請假的人員（先設定 PGY 人員 / Clerk 梯次）")
             return
-        ed = LeaveEditor(self, self.service, scope, self.app.ym, "leave",
+        from .session_leave import SessionLeaveEditor
+        editor = SessionLeaveEditor if scope in ("external", "family") else LeaveEditor
+        ed = editor(self, self.service, scope, self.app.ym, "leave",
                          members=members)
         self.wait_window(ed)
         self.refresh()
@@ -1144,6 +1146,10 @@ class _DayEditDialog(tk.Toplevel):
         for scope in ("pgy", "clerk", "external", "family"):
             for c, days in ((inp.leaves or {}).get(scope) or {}).items():
                 leaves.setdefault(c, set()).update(days or ())
+        for scope in ("external", "family"):
+            for c, slots in inp.session_leaves.get(scope, {}).items():
+                if (self.d, self.session) in slots:
+                    leaves.setdefault(c, set()).add(self.d)
         seen, out = set(), []
         for c in codes:                  # 去重且保留順序（PGY 在前、Clerk 在後）
             if c and c not in seen:

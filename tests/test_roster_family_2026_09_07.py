@@ -103,7 +103,7 @@ def test_exact_required_slots_and_monthly_room_balance():
     assert rooms == {"101", "102", "103"}
 
 
-def test_family_priority_with_scarce_seats():
+def test_clerk_then_family_priority_with_scarce_seats():
     inp = make_input()
     inp.grid = {d: {s: ["101"] for s in ss} for d, ss in inp.grid.items()}
     inp.capacity = 1
@@ -111,10 +111,13 @@ def test_family_priority_with_scarce_seats():
     inp.family_follow = {"F1": {(d, s) for d, ss in inp.grid.items() for s in ss}}
     inp.clerk_batches = [ClerkBatch("B", date(2026, 8, 31), ["C1", "C2"])]
     slots, _, warnings = month_solve_day(inp)
-    assert not family_requirement_warnings(inp, slots)
-    assert all(cells.get("101") == ["F1"] for ss in slots.values() for cells in ss.values())
+    counts = {p: sum(p in cells.get("101", []) for ss in slots.values() for cells in ss.values())
+              for p in ("C1", "C2", "F1", "E1", "P1", "P2")}
+    assert counts["C1"] == counts["C2"] == 9
+    assert counts["F1"] == 26
+    assert counts["E1"] == counts["P1"] == counts["P2"] == 0
+    assert family_requirement_warnings(inp, slots)
     assert any("外訓" in w for w in warnings)
-    assert any("跟診時段偏少" in w and "C1×0" in w and "C2×0" in w for w in warnings)
 
 
 def test_leave_closed_and_locked_conflicts_preserve_slots():

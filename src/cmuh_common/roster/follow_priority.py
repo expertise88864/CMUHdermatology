@@ -4,6 +4,7 @@ from copy import deepcopy
 from calendar import monthrange
 from datetime import date, timedelta
 
+from .session_leave import on_leave
 from .solve_day import REST, STUDENT_SESSIONS, arbitration_order, day_owner_batch, is_follow_slot
 
 
@@ -104,7 +105,7 @@ def family_requirement_warnings(inp, slots):
             cells = sessions.get(s) if isinstance(sessions, dict) else None
             cells = cells if isinstance(cells, dict) else {}
             rooms = inp.grid.get(d, {}).get(s, [])
-            if d in inp.leaves.get("family", {}).get(p, set()):
+            if on_leave(inp, "family", p, d, s):
                 reason = "與請假衝突"
             elif d.weekday() >= 5 or not rooms:
                 reason = "無開放診間"
@@ -119,7 +120,7 @@ def family_requirement_warnings(inp, slots):
 
 
 def prepare_priority(inp, slots):
-    """Reserve family first; remove movable follow/rest for joint allocation.
+    """Remove movable follow/rest for Clerk-first joint allocation.
 
     Existing Clerk attendance is the course budget. This retains the original
     cross-month quota calculation. External trainees use the remaining seats
@@ -148,14 +149,6 @@ def prepare_priority(inp, slots):
                             if p in owner.members and p not in inp.pgy_roster:
                                 targets[owner.id, p] += 1
                     del cells[r]
-            for p in inp.family_roster:
-                if ((d, s) not in inp.family_follow.get(p, set())
-                        or d in inp.leaves.get("family", {}).get(p, set())):
-                    continue
-                room = next((r for r in inp.grid[d].get(s, [])
-                             if len(cells.get(r, [])) < inp.capacity), None)
-                if room is not None:
-                    cells.setdefault(room, []).append(p)
     return targets, originals
 
 
@@ -184,7 +177,7 @@ def restore_pgy_and_rest(inp, slots, originals):
         assigned = {p for ps in cells.values() for p in (ps or [])}
         for scope, people in scopes:
             for p in people:
-                if p not in assigned and d not in inp.leaves.get(scope, {}).get(p, set()):
+                if p not in assigned and not on_leave(inp, scope, p, d, s):
                     cells.setdefault(REST, []).append(p)
                     assigned.add(p)
 

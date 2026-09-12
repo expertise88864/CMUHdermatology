@@ -854,6 +854,7 @@ class RosterService:
         #   與年度假日決定 —— 讀不到就當「沒有 override」,不是「整月沒診」。
         #   (`load_month` 對不存在的月份回一份預設月檔,刻意如此。)
         _nxt_month = st.load_month(_nxt)
+        from .session_leave import parse_session_leaves
         leaves = {
             "family": _parse_date_map((month.get("leaves") or {}).get("family") or {}),
             "external": _parse_date_map((month.get("leaves") or {}).get("external") or {}),
@@ -969,6 +970,7 @@ class RosterService:
             family_follow=family_follow_slots(ym, month),
             clerk_batches=covering, batch_order=batch_order,
             biopsy_open=biopsy_open, leaves=leaves,
+            session_leaves=parse_session_leaves(ym, month),
             # [RS-29] 相鄰月份的既定時段(鎖定/已定案)——只餵計數與可行性,
             #   不會被寫進本月結果(那是 `locked` 的語意)。
             course_fixed=course_fixed,
@@ -1513,6 +1515,10 @@ class RosterService:
             leavers |= {mid for mid, ds in (inp.leaves.get("family") or {}).items() if d in ds}
             leavers |= {mid for mid, ds in (inp.leaves.get("external") or {}).items() if d in ds}
             for session, slots in (day_slots.get(iso) or {}).items():
+                from .session_leave import on_leave
+                session_leavers = leavers | {p for scope in ("external", "family")
+                    for p in inp.session_leaves.get(scope, {})
+                    if on_leave(inp, scope, p, d, session)}
                 # 房號型別由 `clinic_closures` 統一正規化(規則只有一份)
                 closed = set((closures.get(iso) or {}).get(session) or [])
                 for slot, members in (slots or {}).items():
@@ -1545,7 +1551,7 @@ class RosterService:
                                    f"不排治療室（只排照光），卻排了 "
                                    f"{'、'.join(members)}")
                     for c in members:
-                        if c in leavers:
+                        if c in session_leavers:
                             out.append(f"{iso} {session} {slot}：{c} 當日請假卻被排")
                         elif c not in valid:
                             out.append(f"{iso} {session} {slot}："
@@ -3381,6 +3387,34 @@ class RosterService:
         if _holder.get("noop"):                # 已經是想要的狀態 → 不寫檔
             return want
         return self.update_month(ym, _mut)
+
+    def get_trainee_leave_slots(self, scope, ym, member_id):
+        from .session_leave import monthly_person_slots
+        return monthly_person_slots(ym, self.storage.load_month(ym), scope, member_id)
+
+    def set_trainee_leave_slots(self, scope, ym, member_id, slots, *, baseline):
+        """Atomically merge half-day edits, keeping legacy whole-day leave readable."""
+        from .session_leave import SCOPES, SESSIONS, monthly_person_slots, parse_session_leaves
+        if scope not in SCOPES:
+            raise ValueError("僅外訓及家醫科支援時段請假")
+        edited, base = set(slots), set(baseline)
+        for values in (edited, base):
+            parse_session_leaves(ym, {"session_leaves": {scope: {member_id: [
+                f"{d.isoformat()}|{s}" for d, s in values]}}})
+
+        def mutate(month):
+            current = monthly_person_slots(ym, month, scope, member_id)
+            merged = merge_set_edit(current, base, edited)
+            full = {d for d, _ in merged if all((d, s) in merged for s in SESSIONS)}
+            month["leaves"] = month.get("leaves") or {}
+            month["leaves"][scope] = month["leaves"].get(scope) or {}
+            month["leaves"][scope][member_id] = sorted(
+                d.isoformat() for d in full)
+            month.setdefault("session_leaves", {}).setdefault(scope, {})[member_id] = sorted(
+                f"{d.isoformat()}|{s}" for d, s in merged if d not in full)
+            self._audit(month, scope, f"session_leaves:{member_id}", None,
+                        sorted(f"{d.isoformat()}|{s}" for d, s in merged), "session_leaves")
+        self.update_month(ym, mutate)
 
     def set_leaves(self, scope: str, ym: str, member_id: str, dates, *,
                    baseline) -> None:

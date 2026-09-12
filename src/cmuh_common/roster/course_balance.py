@@ -8,6 +8,7 @@ from copy import deepcopy
 from datetime import date
 from math import ceil
 
+from .session_leave import on_leave
 from .solve_day import (
     BIOPSY, REST, STUDENT_SESSIONS, arbitration_order, day_owner_batch,
     is_follow_slot,
@@ -86,12 +87,27 @@ def add_external(inp, slots, log, warnings):
     if not people and not inp.family_roster:
         return
     from .follow_priority import prepare_priority, restore_pgy_and_rest, family_requirement_warnings
+    for iso, sessions in inp.locked.items():
+        try:
+            d = date.fromisoformat(iso)
+        except (TypeError, ValueError):
+            continue
+        if iso[:7] != inp.ym or not isinstance(sessions, dict):
+            continue
+        for s, cells in sessions.items():
+            if not isinstance(cells, dict):
+                continue
+            for scope, roster in (("external", people), ("family", inp.family_roster)):
+                for p in roster:
+                    if on_leave(inp, scope, p, d, s) and any(p in (ps or []) for ps in cells.values()):
+                        warnings.append(f"{p} {iso} {s} 請假與既有保留排班衝突；原紀錄未更動，請手動確認該時段")
     targets, originals = prepare_priority(inp, slots)
     from ortools.sat.python import cp_model
 
     model = cp_model.CpModel()
     choices = {}
     clerk_objective, external_objective, spread_objective = [], [], []
+    family_objective = []
     external_shortfall = model.new_int_var(0, 1000, "external_shortfall")
     leaves = {**inp.leaves.get("external", {}), **inp.leaves.get("clerk", {})}
     max_shortfall = model.new_int_var(0, 1000, "clerk_shortfall")
@@ -117,8 +133,10 @@ def add_external(inp, slots, log, warnings):
             clerks = [p for p in (owner.members if owner else [])
                       if owner is not None and (owner.id, p) in targets and p not in inp.pgy_roster]
             assigned = {p for ps in cells.values() for p in ps}
-            for p in sorted(set(people + clerks)):
-                if p in assigned or d in leaves.get(p, set()):
+            family = [p for p in inp.family_roster if (d, s) in inp.family_follow.get(p, set())]
+            for p in sorted(set(people + clerks + family)):
+                scope = "family" if p in family else "external" if p in people else "clerk"
+                if p in assigned or on_leave(inp, scope, p, d, s):
                     continue
                 pair = []
                 for kind, available in (("follow", spare > 0),
@@ -127,6 +145,8 @@ def add_external(inp, slots, log, warnings):
                     if available:
                         v = model.new_bool_var(f"{iso}/{s}/{p}/{kind}")
                         choices[d, s, p, kind] = v
+                        if p in family:
+                            family_objective.append(-v)
                         pair.append(v)
                 model.add(sum(pair) <= 1)
             model.add(sum(v for (dd, ss, _, k), v in choices.items()
@@ -225,7 +245,7 @@ def add_external(inp, slots, log, warnings):
     solver.parameters.max_deterministic_time = 10
     # Freeze each achieved priority objective before considering the next tier.
     # External attendance can never buy a reduction in Clerk attendance.
-    phases = (clerk_objective, [external_shortfall], external_objective, spread_objective)
+    phases = (clerk_objective, family_objective, [external_shortfall], external_objective, spread_objective)
     for index, objective in enumerate(phases):
         expression = sum(objective)
         model.minimize(expression)
@@ -251,11 +271,11 @@ def add_external(inp, slots, log, warnings):
                      if (owner := day_owner_batch(arbitration_order(inp), d)) and owner.id == bid
                      for r, ps in slots[d.isoformat()][ss].items() if is_follow_slot(r))
         if actual < target:
-            warnings.append(f"Clerk {p}（{bid}）可調整跟診 {actual}/{target} 次；家醫科優先，其次 Clerk、外訓、PGY")
+            warnings.append(f"Clerk {p}（{bid}）可調整跟診 {actual}/{target} 次；Clerk 優先，其次家醫科、外訓、PGY")
     from .follow_priority import refresh_clerk_warnings
     refresh_clerk_warnings(inp, slots, warnings)
     warnings.extend(external_quota_warnings(inp, slots))
-    log.append("跟診優先：家醫科 ＞ Clerk ＞ 外訓 ＞ PGY；外訓全月約一半工作時段跟診，每週約 4–6 次；每半月一次切片室")
+    log.append("跟診優先：Clerk ＞ 家醫科 ＞ 外訓 ＞ PGY；外訓全月約一半工作時段跟診，每週約 4–6 次；每半月一次切片室")
 
 
 def balance_rooms(inp, slots):

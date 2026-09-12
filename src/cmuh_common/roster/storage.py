@@ -499,6 +499,8 @@ def validate_authoritative_month(ym: str, raw: dict) -> None:
         raise ValueError(f"{ym}.json 的內容不適合用來排班/結算：{why}。"
                          f"請修正該月檔之後再試（顯示不受影響）。")
 
+    from .session_leave import parse_session_leaves
+    parse_session_leaves(ym, raw)
     external_month_codes(raw)
     family_month_codes(raw)
     family_follow_slots(ym, raw)
