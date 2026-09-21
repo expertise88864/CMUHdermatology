@@ -72,8 +72,31 @@ def balance_clinics(inp, slots):
     def delta(counter, changes):
         return sum(2 * counter[k] * n + n * n for k, n in changes.items())
 
+    def streak(sequence):
+        total, length, previous = 0, 0, None
+        for _, _, room in sequence:
+            if room == previous:
+                length += 1
+            else:
+                total += length * length
+                previous, length = room, 1
+        return total + length * length
+
     while True:
-        best, best_score = None, (0, 0, 0)
+        sequences = {}
+        for iso, ss in sorted(slots.items()):
+            try:
+                dd = date.fromisoformat(iso)
+            except (ValueError, TypeError):
+                continue
+            if dd not in inp.grid or dd.weekday() >= 5 or iso[:7] != inp.ym:
+                continue
+            for session in STUDENT_SESSIONS:
+                for room, members in ss.get(session, {}).items():
+                    if is_follow_slot(room) and room in inp.grid[dd].get(session, []):
+                        for person in members:
+                            sequences.setdefault(key(dd, person), []).append((dd, session, room))
+        best, best_score = None, (0, 0, 0, 0)
         for d in sorted(inp.grid):
             iso = d.isoformat()
             if iso[:7] != inp.ym or d.weekday() >= 5:
@@ -130,6 +153,15 @@ def balance_clinics(inp, slots):
                                     score = (-sum(unique.values()), delta(doctors_count, dc), delta(rooms_count, rc))
                                     if cross and score[:2] >= (0, 0):
                                         continue
+                                    temporal = 0
+                                    if score == (0, 0, 0) and not cross:
+                                        for k, room in ((kp, target), (kq, r)):
+                                            if k is not None:
+                                                seq = sequences.get(k, [])
+                                                changed = [(dd, ss, room if (dd, ss) == (d, s) else rr)
+                                                           for dd, ss, rr in seq]
+                                                temporal += streak(changed) - streak(seq)
+                                    score = (*score, temporal)
                                     if score < best_score:
                                         best_score = score
                                         best = source, dest, r, target, p, q, cross, rc, dc

@@ -170,8 +170,8 @@ def test_full_solver_keeps_daily_quantities_and_special_assignments():
                 r: ps for r, ps in baseline[iso][s].items() if r != REST and not is_follow_slot(r)}
             assert all(len(ps) <= inp.capacity for r, ps in cells.items() if is_follow_slot(r))
             assert sum(map(len, cells.values())) == len({p for ps in cells.values() for p in ps})
-            assert (any("F1" in ps for ps in cells.values()) ==
-                    ((date.fromisoformat(iso), s) in inp.family_follow["F1"]))
+            if any("F1" in ps for ps in cells.values()):
+                assert (date.fromisoformat(iso), s) in inp.family_follow["F1"]
     assert slots["2026-09-15"]["上午"] == inp.locked["2026-09-15"]["上午"]
 
 

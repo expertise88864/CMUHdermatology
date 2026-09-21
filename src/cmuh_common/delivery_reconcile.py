@@ -817,6 +817,12 @@ class Reconciler:
         body = str(rec.get("body_text") or "")
         if not body:
             return ""                    # 沒有落地文字 → 沒得補(或鏈已關)
+        if rec.get("category") == "consult":
+            from cmuh_common.consult_privacy import PRIVACY_MARKER
+            if not body.startswith(PRIVACY_MARKER):
+                # Legacy payloads lack a reliable patient-identity inventory.
+                # Do not leak them through automatic retries after this update.
+                body = PRIVACY_MARKER + "\n舊版會診通知未包含去識別標記；請至 HIS 查看，或重新執行會診查詢。"
         # ★只補給【暫時性被拒】的人★ 已送達的再寄一次是重複的臨床通知;
         #   永久被拒(5xx)重寄也不會變好(要人工改設定,告警已在);
         #   UNKNOWN 的要先回查,不可盲寄。

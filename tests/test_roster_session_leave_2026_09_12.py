@@ -74,9 +74,9 @@ def test_solver_excludes_all_work_but_keeps_other_half():
                 assert all(p not in ps for ps in slots[d.isoformat()]["上午"].values())
             if d.day == 4:
                 assert all(p not in ps for cells in slots[d.isoformat()].values() for ps in cells.values())
-        if d.weekday() == 3:
-            assert any("F" in ps for ps in slots[d.isoformat()]["下午"].values())
-    assert any("請假衝突" in w for w in warnings)
+    assert any("F" in ps for d in inp.grid if d.weekday() == 3
+               for ps in slots[d.isoformat()]["下午"].values())
+    assert not any("當日請假卻被排" in w for w in warnings)
     assert sum("E" in cells.get("切片室", []) for ss in slots.values() for cells in ss.values()) == 2
 
 

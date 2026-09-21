@@ -92,13 +92,15 @@ class TestTheMailIsBuiltOnce:
         node = _guard_of("_DeliveryArtifact", "delivery")
         assert node is not None, "★每個 attempt 都重組一封新的信★"
 
-    def test_the_screenshot_is_materialised_inside_that_guard(self):
-        """★截圖只落地一次★ 三次 attempt 不可以生出三張病人畫面。"""
+    def test_unredacted_screenshot_is_not_attached(self):
+        """Patient identities in HIS screenshots must not bypass text redaction."""
         node = _guard_of("_DeliveryArtifact", "delivery")
-        assert _calls_to("_materialize_shot", node), (
-            "截圖落地不在 delivery 守衛內 → 每個 attempt 都會多一張")
-        # 而且整個函式裡只有那一處
-        assert len(_calls_to("_materialize_shot")) == 1
+        assert not _calls_to("_materialize_shot")
+        artifacts = _calls_to("_DeliveryArtifact", node)
+        assert artifacts
+        for call in artifacts:
+            attachment = next(k.value for k in call.keywords if k.arg == "attachment")
+            assert isinstance(attachment, ast.Constant) and attachment.value is None
 
     def test_the_send_uses_the_artifact_fields(self):
         """寄送必須用 artifact 的欄位，不可以用當輪重算的區域變數。"""

@@ -202,7 +202,7 @@ DEFAULT_CONFIG = {
     "quiet_start_hour": 0,
     "quiet_end_hour": 6,
     "subject_template": "{date} {time} 皮膚科會診通知單",
-    "body_template": "附件為 {date} {time} 皮膚科會診通知單截圖，由系統自動擷取寄送。",
+    "body_template": "以下為 {date} {time} 皮膚科會診通知，姓名與病歷號已隱藏；完整資料請至 HIS 查看。",
     # [2026-06-15] 信件併入「今日打卡狀態」(autoclock 各帳號 上/下班)。關掉就不查不附。
     "punch_status_in_email": True,
     "enabled": True,
@@ -1737,7 +1737,8 @@ def _format_patient_roster(texts: list, label: str = "今日會診病人") -> st
         return ""
     lines = [f"{label}({len(items)} 位):"]
     for i, t in enumerate(items, 1):
-        lines.append(f"{i}. {t}")
+        name, meta = _patient_head(t)
+        lines.append(f"{i}. {name} {meta}".strip())
     return "\n".join(lines)
 
 
@@ -1816,13 +1817,9 @@ def _roster_when(p: dict) -> str:
 
 
 def _patient_head(raw: str) -> tuple:
-    """從病人列原文取 (姓名, meta);meta = '病房·床 病歷號 日期時間'(存在才放,
-    全形空白分隔)。解析不出結構 → (顯示簡名, '')。純函式,給逐病人內文標題用。"""
-    p = _parse_roster_row(raw)
-    if not p:
-        return _patient_display_name(raw), ""
-    parts = [x for x in (p["ward_bed"], p["chart"], _roster_when(p)) if x]
-    return p["name"], "　".join(parts)
+    """Email heading: bed, attending and time; unknown rows never expose raw text."""
+    from cmuh_common.consult_privacy import safe_head
+    return safe_head(raw, _parse_roster_row)
 
 
 def _esc(s) -> str:
@@ -1846,29 +1843,17 @@ def _format_patient_roster_html(texts: list, label: str) -> str:
           f"letter-spacing:.8px;color:{_MAIL_FAINT};text-transform:uppercase;"
           "text-align:left;")
     th_r = th + "text-align:right;"
-    rows = [
-        f'<tr><td style="{th}">姓名</td><td style="{th}">病房 / 床</td>'
-        f'<td style="{th}">病歷號</td><td style="{th}">主治</td>'
-        f'<td style="{th_r}">時間</td></tr>']
-    last = len(items)
-    for i, t in enumerate(items, 1):
-        line = "" if i == last else f"border-bottom:1px solid {_MAIL_ROW};"
-        td = f"padding:11px 0;{line}font-size:13px;color:{_MAIL_SUB};"
-        td_num = td + "font-variant-numeric:tabular-nums;"
-        td_r = td_num + "text-align:right;"
+    rows = [f'<tr><td style="{th}">床位</td><td style="{th}">主治</td>'
+            f'<td style="{th_r}">時間</td></tr>']
+    for t in items:
         p = _parse_roster_row(t)
         if p:
-            rows.append(
-                f'<tr><td style="{td}color:{_MAIL_INK};font-weight:500;">'
-                f'{_esc(p["name"])}</td>'
-                f'<td style="{td}">{_esc(p["ward_bed"])}</td>'
-                f'<td style="{td_num}">{_esc(p["chart"])}</td>'
-                f'<td style="{td}">{_esc(p["vs"])}</td>'
-                f'<td style="{td_r}">{_esc(_roster_when(p))}</td></tr>')
+            rows.append(f'<tr><td style="{th}">{_esc(p["ward_bed"])}</td>'
+                        f'<td style="{th}">{_esc(p["vs"])}</td>'
+                        f'<td style="{th_r}">{_esc(_roster_when(p))}</td></tr>')
         else:
-            rows.append(
-                f'<tr><td style="{td}color:{_MAIL_INK};" colspan="5">'
-                f'{_esc(t)}</td></tr>')
+            from cmuh_common.consult_privacy import UNPARSED
+            rows.append(f'<tr><td colspan="3">{_esc(UNPARSED)}</td></tr>')
     return (
         _section_label(f"{label}　·　{len(items)} 位")
         + '<table class="cq-tbl" style="width:100%;border-collapse:collapse;">'
@@ -1893,6 +1878,8 @@ def _consult_band(label: str, para: str, *, bg: str, border: str,
 def _format_extracted_entries_html(entries: list, labels: list | None = None) -> str:
     """逐病人擷取內容 → 文件式區塊:姓名(細直線)+ 會診原因(綠橫幅)+ 病情摘要
     (靛橫幅),病人間以髮絲線分隔。空回空字串。"""
+    from cmuh_common.consult_privacy import safe_entries
+    entries = safe_entries(entries, labels, _parse_roster_row)
     rich = [(i, panes) for i, panes in enumerate(entries, 1)
             if any((txt or "").strip() for _l, txt in panes)]
     blocks = []
@@ -2172,6 +2159,8 @@ def _format_extracted_entries(entries: list, labels: list | None = None) -> str:
     """把逐病人擷取結果組成信件附文。entries=[ [(label, text), ...], ... ]。
     labels(可選)為各病人的標題(對齊 entries 索引),用於以姓名標示;未提供時
     退回「病人 N」。純函式以便測試;全空回空字串(信件就不附這段)。"""
+    from cmuh_common.consult_privacy import safe_entries
+    entries = safe_entries(entries, labels, _parse_roster_row)
     blocks = []
     for i, panes in enumerate(entries, 1):
         texts = [(label, (text or "").strip()) for label, text in panes]
@@ -2189,7 +2178,7 @@ def _format_extracted_entries(entries: list, labels: list | None = None) -> str:
         blocks.append("\n".join(lines))
     if not blocks:
         return ""
-    return ("── 以下為自動擷取的會診文字內容(輔助閱讀，請以截圖為準) ──\n\n"
+    return ("── 以下為去識別會診文字內容（輔助閱讀，請以 HIS 為準） ──\n\n"
             + "\n\n".join(blocks))
 
 
@@ -7336,7 +7325,10 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
             return
 
         subject = cfg["subject_template"].format(date=date_str, time=time_str)
-        body = cfg["body_template"].format(date=date_str, time=time_str)
+        body_template = cfg["body_template"]
+        if body_template == "附件為 {date} {time} 皮膚科會診通知單截圖，由系統自動擷取寄送。":
+            body_template = DEFAULT_CONFIG["body_template"]
+        body = body_template.format(date=date_str, time=time_str)
 
         last_err = None  # 最後一次的失敗例外，用於三次都失敗的 log
         # [W6 2026-07-03] 任務開始前的 systemftp 快照:重試清理只殺「這之後才出現」的
@@ -7391,9 +7383,9 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                         # 集合」當成基準,下輪擷取恢復後所有未回覆會診都變「新」→ 對團隊重複
                         # 寄整份清單。此路徑會落到下方正常寄信(2395 因 roster is None 而不更新基準)。
                         logging.warning(
-                            "[poll] 會診清單解析失敗/停用 → fail-open 照常寄信(以截圖為準)")
+                            "[poll] 會診清單解析失敗/停用 → 寄送 HIS 核對通知，不附病人截圖")
                         _poll_extract_note = (
-                            "⚠ 會診清單自動解析失敗,本信以截圖為準,請人工核對是否有新會診。")
+                            "⚠ 會診清單自動解析失敗，請至 HIS 核對是否有新會診；本信不附病人截圖。")
                     else:
                         _poll_sig = _consult_signature_from_roster(roster_texts)
                         _lost = ""
@@ -7513,13 +7505,17 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     text_parts.append(punch_text)
                 if extracted_text:
                     text_parts.append(extracted_text)
-                final_body = "\n\n".join(text_parts)
+                from cmuh_common.consult_privacy import PRIVACY_MARKER, scrub
+                final_body = PRIVACY_MARKER + "\n\n" + "\n\n".join(text_parts)
                 # [美化 2026-06-15] HTML 版排版(multipart/alternative;純文字為
-                # fallback)。打卡狀態置於會診內容之前。截圖附件照常夾帶。
+                # fallback)。打卡狀態置於會診內容之前；不附未去識別截圖。
                 final_html = _build_consult_email_html(
                     date_str, time_str,
                     (_poll_extract_note + "\n" + body) if _poll_extract_note else body,
                     punch_html + extracted_html, _account_note)
+                identities = [p for raw in (roster_texts or []) if (p := _parse_roster_row(raw))]
+                final_body = scrub(final_body, identities)
+                final_html = scrub(final_html, identities)
                 # ★[2026-07-30 外審 P2-01] 寄信前先確認「我還是現役嗎」★
                 #   這段流程可能跑很久（HIS 慢/凍結/登入重試）。超過 gate 的
                 #   stale_after_sec（45 分）之後，新的一輪已經接手在做同一件事；
@@ -7533,18 +7529,14 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                 # ★[2026-08-05 外審第 5 輪 P1-04] payload 只組一次★
                 #   組好之後就固定:同一份主旨/內文/附件/Message-ID。重試 = 重送
                 #   同一封信,而不是「再查一次、再組一封新的」。
-                #   截圖也只落地一次 —— 舊寫法每個 attempt 都 `_materialize_shot`,
-                #   三次 attempt 就是三張病人畫面躺在磁碟上。
+                #   病人截圖不落地、不夾帶；僅保留去識別後的信件內容。
                 if delivery is None:
-                    # ★[2026-08-04 外審 P1-08] 到這裡才把截圖落地★
-                    #   走到這一行代表「這一輪真的要寄信」。沒有新會診的輪次在
-                    #   上面就 return 了,磁碟上不會多出任何病人畫面。
                     delivery = _DeliveryArtifact(
                         recipients=tuple(recipients),
                         subject=subject,
                         text_body=final_body,
                         html_body=final_html,
-                        attachment=_materialize_shot(shot),
+                        attachment=None,
                         message_id=_new_message_id(),
                         business_key=_consult_business_key(
                             roster_texts, recipients, subject),

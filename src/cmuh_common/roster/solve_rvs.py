@@ -159,10 +159,12 @@ def _build_and_solve(ctx: SolveContext, scope: str, level: int):
     status = solver.Solve(model)
     name = solver.StatusName(status)
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        from .vs_preferences import refine_vs
+        refined = refine_vs(model, solver, cp_model, status, objective, x, ctx)
         out = {}
         for d in ctx.days:
             for m in ctx.members:
-                if solver.Value(x[(d, m.id)]):
+                if (refined[(d, m.id)] if refined is not None else solver.Value(x[(d, m.id)])):
                     out[d] = m.id
                     break
         # ★[RS-32] 過去的實況原樣併回輸出★:accept 是拿 assignments 整份重建

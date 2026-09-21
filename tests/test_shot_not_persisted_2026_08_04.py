@@ -90,8 +90,8 @@ class TestTheCaptureSitesNoLongerSaveDirectly:
         assert "save" not in methods, "★SW_HIDE 後備仍然直接存檔★"
         assert "SHOTS_DIR" not in names
 
-    def test_the_send_path_materializes(self):
-        """寄信前要落地，而且必須在寄信【之前】。"""
+    def test_the_send_path_does_not_materialize_patient_screenshots(self):
+        """去識別通知不可夾帶原始病人截圖。"""
         import ast
         import inspect
         import textwrap
@@ -101,8 +101,5 @@ class TestTheCaptureSitesNoLongerSaveDirectly:
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 lines.setdefault(node.func.id, node.lineno)
-        assert "_materialize_shot" in lines, (
-            "寄信前沒有把記憶體影像落地 → 附件會壞掉")
+        assert "_materialize_shot" not in lines
         assert "send_via_smtp" in lines, "找不到寄信呼叫（測試失效了）"
-        assert lines["_materialize_shot"] < lines["send_via_smtp"], (
-            "落地必須發生在寄信之前")

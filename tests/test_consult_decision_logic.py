@@ -716,9 +716,9 @@ def test_format_extracted_entries():
         [("內容1", "會診事項 A"), ("內容2", "病情摘要 A")],
         [("內容1", "  "), ("內容2", "")],            # 全空白 → 跳過
         [("內容1", "會診事項 B"), ("內容2", "")],     # 空面板略過、非空保留
-    ])
-    assert "【病人 1】" in out and "會診事項 A" in out and "病情摘要 A" in out
-    assert "【病人 3】" in out and "會診事項 B" in out
+    ], labels=["測試甲A1(101)9876543210", "測試乙A1(102)9876543211", "測試丙A1(103)9876543212"])
+    assert "【A1 · 101】" in out and "會診事項 A" in out and "病情摘要 A" in out
+    assert "【A1 · 103】" in out and "會診事項 B" in out
     assert "【病人 2】" not in out
     assert cq._format_extracted_entries([]) == ""
     assert cq._format_extracted_entries([[("內容1", "")]]) == ""
@@ -787,8 +787,8 @@ def test_format_patient_roster():
     out = cq._format_patient_roster(
         ["莊振銘B7(163)002958", "  ", "王小明A3(101)001234"])
     assert "今日會診病人(2 位):" in out
-    assert "1. 莊振銘B7(163)002958" in out
-    assert "2. 王小明A3(101)001234" in out
+    assert "1. B7 · 163" in out and "莊振銘" not in out and "002958" not in out
+    assert "2. A3 · 101" in out and "王小明" not in out and "001234" not in out
     assert cq._format_patient_roster([]) == ""
     assert cq._format_patient_roster(["   ", ""]) == ""
 
@@ -850,8 +850,8 @@ def test_parse_roster_row_letter_only_ward():
     assert p["time"] == "11:27"
     # 逐病人標題也要帶回病房/床位
     name, meta = cq._patient_head("賴義恩BURN(10B)0000416350(蔡李澄)06/18(11:27)")
-    assert name == "賴義恩"
-    assert "BURN · 10B" in meta and "0000416350" in meta and "06/18 11:27" in meta
+    assert name == "BURN · 10B"
+    assert "蔡李澄" in meta and "0000416350" not in meta and "06/18 11:27" in meta
 
 
 def test_parse_roster_row_garbled_name():
@@ -869,10 +869,10 @@ def test_parse_roster_row_garbled_name():
 def test_patient_head_name_plus_meta():
     """逐病人標題:姓名 + 床位/病歷號/日期時間。解析不出結構 → 僅顯示簡名。"""
     name, meta = cq._patient_head("簡志仲I8(18A)0042107068(謝佳陵)06/17(11:23)")
-    assert name == "簡志仲"
-    assert "I8 · 18A" in meta and "0042107068" in meta and "06/17 11:23" in meta
+    assert name == "I8 · 18A"
+    assert "謝佳陵" in meta and "0042107068" not in meta and "06/17 11:23" in meta
     # 純姓名(無結構)→ 回 (姓名, "")
-    assert cq._patient_head("王小明") == ("王小明", "")
+    assert "王小明" not in str(cq._patient_head("王小明"))
 
 
 def test_extracted_entries_head_has_bed_chart_time():
@@ -880,9 +880,9 @@ def test_extracted_entries_head_has_bed_chart_time():
     entries = [[("內容1", "癢")]]
     labels = ["簡志仲I8(18A)0042107068(謝佳陵)06/17(11:23)"]
     txt = cq._format_extracted_entries(entries, labels=labels)
-    assert "簡志仲" in txt and "0042107068" in txt and "06/17 11:23" in txt
+    assert "簡志仲" not in txt and "0042107068" not in txt and "06/17 11:23" in txt
     html = cq._format_extracted_entries_html(entries, labels=labels)
-    assert "簡志仲" in html and "0042107068" in html and "18A" in html
+    assert "簡志仲" not in html and "0042107068" not in html and "18A" in html
 
 
 def test_parse_roster_row_fallback():
@@ -897,7 +897,7 @@ def test_parse_roster_row_fallback():
     # 該整列原字串會在 HTML 走 raw fallback、完整保留
     out = cq._format_patient_roster_html(
         ["莊振銘B7(163)0029588049(沈冠宇)06/15(08:20)備註XYZ"], "下午會診清單")
-    assert "備註XYZ" in out
+    assert "備註XYZ" not in out and "HIS" in out
 
 
 def test_format_patient_roster_html():
@@ -905,23 +905,23 @@ def test_format_patient_roster_html():
         ["莊振銘B7(163)0029588049(沈冠宇)06/15(08:20)", "JOHN 0099"],
         "昨晚今早會診清單")
     assert "昨晚今早會診清單" in out and "2 位" in out
-    assert "莊振銘" in out and "0029588049" in out
-    assert "JOHN 0099" in out          # 無法解析 → 原字串(colspan)保留
+    assert "莊振銘" not in out and "0029588049" not in out
+    assert "JOHN 0099" not in out and "HIS" in out
     assert "<table" in out
     assert cq._format_patient_roster_html([], "x") == ""
 
 
 def test_format_extracted_entries_html():
     entries = [[("內容1", "For biopsy"), ("內容2", "line1\nline2")]]
-    out = cq._format_extracted_entries_html(entries, labels=["莊振銘"])
-    assert "莊振銘" in out
+    out = cq._format_extracted_entries_html(entries, labels=["測試甲A1(101)9876543210"])
+    assert "測試甲" not in out and "9876543210" not in out
     assert "會診原因" in out and "For biopsy" in out
     assert "病情摘要" in out and "line1<br>line2" in out   # 換行 → <br>
     assert "會診內容" in out
 
 
 def test_format_extracted_entries_html_escapes_and_empty():
-    out = cq._format_extracted_entries_html([[("內容2", "a<b>&c")]], labels=["X"])
+    out = cq._format_extracted_entries_html([[("內容2", "a<b>&c")]], labels=["測試甲A1(101)9876543210"])
     assert "&lt;b&gt;" in out and "&amp;c" in out and "<b>" not in out
     assert cq._format_extracted_entries_html([]) == ""
     assert cq._format_extracted_entries_html([[("內容1", "")]]) == ""
@@ -960,10 +960,10 @@ def test_format_extracted_entries_with_named_labels():
             [("內容1", "")],              # 空 → 跳過
             [("內容1", "帶狀疱疹")],
         ],
-        labels=["莊振銘", "王小明", "李大華"])
-    assert "【莊振銘】" in out and "蜂窩性組織炎" in out
-    assert "【李大華】" in out and "帶狀疱疹" in out
-    assert "【王小明】" not in out      # 內容空 → 整段跳過
+        labels=["測試甲A1(101)9876543210", "測試乙A1(102)9876543211", "測試丙A1(103)9876543212"])
+    assert "【A1 · 101】" in out and "蜂窩性組織炎" in out
+    assert "【A1 · 103】" in out and "帶狀疱疹" in out
+    assert "【A1 · 102】" not in out      # 內容空 → 整段跳過
     assert "【病人" not in out          # 有 label 就不用預設編號
 
 

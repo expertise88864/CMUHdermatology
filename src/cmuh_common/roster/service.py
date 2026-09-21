@@ -628,6 +628,17 @@ class RosterService:
         #   吞掉它就等於「連續值班限制安靜地只看本月」—— 正是這一批要消滅的
         #   fail-open。下面的 try 只負責容忍【內容裡的壞日期】。
         prev_duty = (st.load_month(prev_ym(ym)).get(f"{scope}_duty") or {})
+        prev_weekend_counts: dict = {}
+        if scope == "vs":
+            for iso, cell in prev_duty.items():
+                try:
+                    dd = date.fromisoformat(iso)
+                except (TypeError, ValueError):
+                    continue
+                if dd.isoformat()[:7] == prev_ym(ym) and dd.weekday() == 5:
+                    person = (cell or {}).get("person")
+                    if person:
+                        prev_weekend_counts[person] = prev_weekend_counts.get(person, 0) + 1
         try:
             for k in range(1, 5):
                 dd = first - timedelta(days=k)
@@ -658,6 +669,7 @@ class RosterService:
             leaves=leaves, must_duty=must, annual_holiday=annual, locks=locks,
             ledger=ledger, week_colors=week_colors, prev_last_weekend=prev,
             prev_tail=prev_tail, biopsy_override=biopsy_override,
+            prev_weekend_counts=prev_weekend_counts,
             past_cutoff=today, past_duty=past_duty,
             params=RosterParams.from_config(cfg))
         ctx.prepare()
@@ -983,7 +995,8 @@ class RosterService:
             course_clinic_days=course_clinic_days,
             capacity=RosterParams.from_config(cfg).room_capacity, locked=locked,
             prior_sessions=prior_sessions, prior_pgy=prior_pgy,
-            apply_pref={str(c) for c in (month.get("pgy_apply_pref") or [])})
+            apply_pref={str(c) for c in (month.get("pgy_apply_pref") or [])},
+            pgy_photo_offsets=dict(month.get("pgy_photo_offsets") or {}))
 
     def run_day_solve(self, ym: str, *,
                       today: "date | None" = None) -> "DaySolveResult":
@@ -1433,7 +1446,7 @@ class RosterService:
                                 f"{iso} {session}:切片室排了 {len(members)} 位"
                                 f"({'、'.join(members)})—— 一個切片時段一個人")
                         outsiders = [c for c in members
-                                     if c not in owner_members and c not in inp.external_roster]
+                                     if c not in owner_members and c not in inp.external_roster and c not in inp.family_roster]
                         if outsiders:
                             _who = (f"當天的梯次是「{owner.id}」"
                                     if owner else "當天沒有任何 Clerk 梯次")
@@ -1474,11 +1487,12 @@ class RosterService:
         if not day_slots:
             return out
         inp = self.build_day_input(ym)
-        from .course_balance import external_biopsy_open, external_quota_warnings, external_roster
+        from .course_balance import external_biopsy_open, external_roster
+        from .training_bands import training_warnings
         conflicts = set(inp.external_roster) - set(external_roster(inp))
         if conflicts:
             out.append(f"外訓代號與 PGY/Clerk 重複：{'、'.join(sorted(conflicts))}")
-        out.extend(external_quota_warnings(inp, day_slots))
+        out.extend(training_warnings(inp, day_slots))
         pgy_set = {str(c) for c in inp.pgy_roster}
         _order = arbitration_order(inp)
         # [RS-30] RS-15 的判準與求解器同一條:該月 PGY 名單恰 2 位。
@@ -1538,7 +1552,7 @@ class RosterService:
                     #   依使用者 2026-08-25 的定案,這兩條★只警告、不擋存也不擋
                     #   定案★(它們是排班規則,不是「規則上不可能成立」的結構)。
                     if (slot == BIOPSY and members
-                            and not (all(c in inp.external_roster for c in members)
+                            and not (all(c in inp.external_roster + inp.family_roster for c in members)
                                      and external_biopsy_open(inp, d, session))
                             and not self._biopsy_is_open(
                                 _open_slots, _order, d, session)):
@@ -2444,6 +2458,29 @@ class RosterService:
                 edited, self._clerk_codes_in_month(ym),
                 "當月 PGY 人員", f"涵蓋 {ym} 的 Clerk 梯次成員")
             self.update_month(ym, _mut)
+
+    def set_pgy_photo_offsets(self, ym: str, values: dict, *, baseline: dict) -> None:
+        """Merge only edited offsets; reject conflicting edits from another client."""
+        if any(type(v) is not int or not -99 <= v <= 99 for v in values.values()):
+            raise ValueError("照光調整須為 -99 至 99 的整數")
+        def mutate(month):
+            current = dict(month.get("pgy_photo_offsets") or {})
+            if month.get("finalized"):
+                raise FinalizedMonthError(f"{ym} 已定案（唯讀）")
+            roster = set(self._effective_pgy_codes(ym))
+            for p, value in values.items():
+                if value == baseline.get(p, 0):
+                    continue
+                if p not in roster:
+                    raise ValueError(f"PGY {p} 已不在當月名單，請重新開啟設定")
+                if current.get(p, 0) not in (baseline.get(p, 0), value):
+                    raise ValueError(f"PGY {p} 的照光調整已由其他電腦變更，請重新整理")
+                current[p] = value
+            old = month.get("pgy_photo_offsets")
+            month["pgy_photo_offsets"] = current
+            self._audit(month, "pgy", f"{ym} photo_offsets", old, current, "manual")
+        with self.storage.write_barrier():
+            self.update_month(ym, mutate)
 
     def set_pgy_apply_pref(self, ym: str, codes, *, baseline) -> None:
         """[2026-07-23 使用者] 設定本月「Apply 本科」PGY（至多 2 位）：自動排班時，

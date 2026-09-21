@@ -69,10 +69,15 @@ def test_leave_locks_future_reservation_and_fingerprint():
 def test_impossible_quotas_warn_and_do_not_overfill():
     pytest.importorskip("ortools")
     inp = make_input(("外訓1",))
-    inp.grid = {d: {s: [] for s in ss} for d, ss in inp.grid.items()}
+    # Clinics are open but every seat is locked: a real attendance shortfall.
+    # Fully closed half-days no longer belong to the quota denominator.
+    inp.capacity = 1
+    inp.grid = {d: {s: ["101"] for s in ss} for d, ss in inp.grid.items()}
+    inp.locked = {d.isoformat(): {s: {"101": ["P1"]} for s in ss}
+                  for d, ss in inp.grid.items()}
     slots, _, warnings = month_solve_day(inp)
     assert any("外訓" in w and "跟診 0" in w for w in warnings)
-    assert not any(is_follow_slot(r) for ss in slots.values() for cells in ss.values() for r in cells)
+    assert slots == inp.locked
 
 
 def test_room_balance_keeps_attendance_duties_and_clerk_course_boundaries():
@@ -82,7 +87,8 @@ def test_room_balance_keeps_attendance_duties_and_clerk_course_boundaries():
     inp.prior_sessions = {"2026-08-31": {"上午": {"101": ["C1"]},
                                          "下午": {"101": ["C1"]}}}
     before = _month_solve_attendance(inp)[0]
-    after = month_solve_day(inp)[0]
+    after = deepcopy(before)
+    balance_rooms(inp, after)
     for iso, ss in before.items():
         for s, cells in ss.items():
             new = after[iso][s]

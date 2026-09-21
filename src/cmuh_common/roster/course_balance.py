@@ -6,7 +6,6 @@ trainee priorities; room balancing only moves attendance between open rooms.
 from collections import defaultdict
 from copy import deepcopy
 from datetime import date
-from math import ceil
 
 from .session_leave import on_leave
 from .solve_day import (
@@ -48,35 +47,8 @@ def _in_month_half(iso, ym, half):
 
 
 def external_quota_warnings(inp, slots):
-    out = []
-    for p in external_roster(inp):
-        month_count = 0
-        for days in _weeks(inp).values():
-            count = sum(p in (people or []) for d in days
-                        for cells in ((slots.get(d.isoformat()) or {}).values()
-                                      if isinstance(slots.get(d.isoformat()) or {}, dict)
-                                      else ())
-                        for room, people in (cells.items()
-                                             if isinstance(cells, dict) else ())
-                        if is_follow_slot(room))
-            month_count += count
-            low, high = ceil(len(days) * 4 / 5), ceil(len(days) * 6 / 5)
-            if not low <= count <= high:
-                out.append(f"外訓 {p} {days[0]:%m/%d}～{days[-1]:%m/%d} 跟診 {count} 次"
-                           f"（目標 {low}–{high}；請確認請假、鎖定與診間容量）")
-        target = sum(map(len, _weeks(inp).values()))
-        if abs(month_count - target) > 1:
-            out.append(f"外訓 {p} 全月跟診 {month_count} 次（目標約 {target} 次，工作時段的一半）")
-        for half in (0, 1):
-            count = sum(p in (cells.get(BIOPSY) or []) for iso, sessions in slots.items()
-                        if _in_month_half(iso, inp.ym, half)
-                        for cells in (sessions.values()
-                                      if isinstance(sessions, dict) else ())
-                        if isinstance(cells, dict))
-            if count != 1:
-                out.append(f"外訓 {p} {'1–14 日' if half == 0 else '15 日至月底'}"
-                           f" 切片室 {count} 次（目標 1 次）")
-    return out
+    from .training_bands import training_warnings
+    return training_warnings(inp, slots, scopes=("external",))
 
 
 def add_external(inp, slots, log, warnings):
@@ -84,8 +56,6 @@ def add_external(inp, slots, log, warnings):
     conflicts = sorted(set(inp.external_roster) - set(people))
     if conflicts:
         warnings.append(f"外訓代號與 PGY/Clerk 重複：{'、'.join(conflicts)}；未重複排班")
-    if not people and not inp.family_roster:
-        return
     from .follow_priority import prepare_priority, restore_pgy_and_rest, family_requirement_warnings
     for iso, sessions in inp.locked.items():
         try:
@@ -106,9 +76,7 @@ def add_external(inp, slots, log, warnings):
 
     model = cp_model.CpModel()
     choices = {}
-    clerk_objective, external_objective, spread_objective = [], [], []
-    family_objective = []
-    external_shortfall = model.new_int_var(0, 1000, "external_shortfall")
+    clerk_objective, spread_objective = [], []
     leaves = {**inp.leaves.get("external", {}), **inp.leaves.get("clerk", {})}
     max_shortfall = model.new_int_var(0, 1000, "clerk_shortfall")
     clerk_objective.append(100000 * max_shortfall)
@@ -134,19 +102,17 @@ def add_external(inp, slots, log, warnings):
                       if owner is not None and (owner.id, p) in targets and p not in inp.pgy_roster]
             assigned = {p for ps in cells.values() for p in ps}
             family = [p for p in inp.family_roster if (d, s) in inp.family_follow.get(p, set())]
-            for p in sorted(set(people + clerks + family)):
-                scope = "family" if p in family else "external" if p in people else "clerk"
+            for p in sorted(set(people + clerks + family + inp.pgy_roster)):
+                scope = "family" if p in family else "external" if p in people else "pgy" if p in inp.pgy_roster else "clerk"
                 if p in assigned or on_leave(inp, scope, p, d, s):
                     continue
                 pair = []
                 for kind, available in (("follow", spare > 0),
-                                        ("biopsy", p in people and external_biopsy_open(inp, d, s)
+                                        ("biopsy", p in people + family and external_biopsy_open(inp, d, s)
                                          and not cells.get(BIOPSY))):
                     if available:
                         v = model.new_bool_var(f"{iso}/{s}/{p}/{kind}")
                         choices[d, s, p, kind] = v
-                        if p in family:
-                            family_objective.append(-v)
                         pair.append(v)
                 model.add(sum(pair) <= 1)
             model.add(sum(v for (dd, ss, _, k), v in choices.items()
@@ -158,42 +124,9 @@ def add_external(inp, slots, log, warnings):
         model.add_abs_equality(value, expression)
         return value
 
-    for p in people:
-        monthly = []
-        for days in _weeks(inp).values():
-            fixed = sum(p in ps for d in days
-                        for cells in inp.locked.get(d.isoformat(), {}).values()
-                        for r, ps in cells.items() if is_follow_slot(r))
-            new = sum(v for (d, _, pp, k), v in choices.items()
-                      if pp == p and k == "follow" and d in days)
-            model.add(new <= max(0, ceil(len(days) * 6 / 5) - fixed))
-            monthly.append(new + fixed)
-            spread_objective.append(20 * deviation(new + fixed - len(days), 100, f"week/{p}/{days[0]}"))
-        target = sum(map(len, _weeks(inp).values()))
-        if target:
-            deficit = model.new_int_var(0, target, f"external_deficit/{p}")
-            model.add(deficit >= target - sum(monthly))
-            # All external trainees have the same monthly working-day target,
-            # so minimizing the maximum deficit also equalizes its ratio.
-            model.add(deficit <= external_shortfall)
-        # One half of the month's weekday AM/PM working periods, not a reward
-        # for filling every permitted weekly maximum.
-        external_objective.append(100 * deviation(sum(monthly) - target, 1000, f"month/{p}"))
-        for half in (0, 1):
-            fixed = sum(p in cells.get(BIOPSY, [])
-                        for iso, sessions in inp.locked.items()
-                        if _in_month_half(iso, inp.ym, half)
-                        for cells in sessions.values())
-            new = sum(v for (d, _, pp, k), v in choices.items()
-                      if pp == p and k == "biopsy" and (d.day > 14) == bool(half))
-            model.add(new <= max(0, 1 - fixed))
-            external_objective.append(-100 * new)
-            half_days = [d for ds in _weeks(inp).values() for d in ds if (d.day > 14) == bool(half)]
-            if half_days:
-                center = (half_days[0].toordinal() + half_days[-1].toordinal())
-                spread_objective.extend(abs(2 * d.toordinal() - center) * v
-                                        for (d, _, pp, k), v in choices.items()
-                                        if pp == p and k == "biopsy" and d in half_days)
+    from .training_bands import add_training_objectives
+    training_phases, training_spread = add_training_objectives(inp, model, choices, deviation, people)
+    spread_objective.extend(training_spread)
     for (bid, p), target in targets.items():
         new = sum(v for (d, _, pp, k), v in choices.items()
                   if pp == p and k == "follow"
@@ -245,7 +178,7 @@ def add_external(inp, slots, log, warnings):
     solver.parameters.max_deterministic_time = 10
     # Freeze each achieved priority objective before considering the next tier.
     # External attendance can never buy a reduction in Clerk attendance.
-    phases = (clerk_objective, family_objective, [external_shortfall], external_objective, spread_objective)
+    phases = (clerk_objective, *training_phases, spread_objective)
     for index, objective in enumerate(phases):
         expression = sum(objective)
         model.minimize(expression)
@@ -274,8 +207,9 @@ def add_external(inp, slots, log, warnings):
             warnings.append(f"Clerk {p}（{bid}）可調整跟診 {actual}/{target} 次；Clerk 優先，其次家醫科、外訓、PGY")
     from .follow_priority import refresh_clerk_warnings
     refresh_clerk_warnings(inp, slots, warnings)
-    warnings.extend(external_quota_warnings(inp, slots))
-    log.append("跟診優先：Clerk ＞ 家醫科 ＞ 外訓 ＞ PGY；外訓全月約一半工作時段跟診，每週約 4–6 次；每半月一次切片室")
+    from .training_bands import training_warnings
+    warnings.extend(training_warnings(inp, slots, scopes=("external", "family")))
+    log.append("基本需求先保障；額外跟診依 Clerk ＞ 家醫科 ＞ 外訓 ＞ PGY；家醫／外訓跟診最低 30%、目標 50%、上限 70%；PGY 每週最低 1、目標 2 診；家醫／外訓每半月一次切片室")
 
 
 def balance_rooms(inp, slots):
@@ -286,6 +220,10 @@ def balance_rooms(inp, slots):
 def finish_courses(inp, slots, log, warnings):
     slots, log, warnings = deepcopy(slots), list(log), list(warnings)
     add_external(inp, slots, log, warnings)
+    from .pgy_balance import balance_pgy
+    balance_pgy(inp, slots, log, warnings)
     balance_rooms(inp, slots)
-    log.append("依 course 優先平衡實際跟診醫師，再平衡診間；保留每日跟診次數、特殊工作、家醫指定與鎖定內容")
+    from .training_bands import training_warnings
+    warnings.extend(training_warnings(inp, slots, scopes=("pgy",)))
+    log.append("依 course 優先平衡實際跟診醫師，再平衡診間；保留各人跟診次數、特殊工作、家醫可參與時段與鎖定內容")
     return slots, log, warnings

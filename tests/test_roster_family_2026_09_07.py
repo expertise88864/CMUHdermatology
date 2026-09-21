@@ -53,7 +53,7 @@ def test_specified_delta_and_fingerprint(svc):
     inp = svc.build_day_input("2026-09")
     assert inp.family_follow["F1"] == {a, b}
     assert day_input_fingerprint(inp) != before
-    assert any("家醫科" in w for w in svc.quick_validate_day("2026-09"))
+    assert not svc.quick_validate_day("2026-09")  # Availability is not mandatory attendance.
     svc.set_family_month_roster("2026-09", [], baseline=["F1"])
     with pytest.raises(ValueError, match="已不在"):
         svc.set_family_follow("2026-09", {"F1": {a}}, baseline={})
@@ -95,12 +95,13 @@ def test_exact_required_slots_and_monthly_room_balance():
     for p in inp.family_roster:
         actual = {(date.fromisoformat(iso), s) for iso, ss in slots.items()
                   for s, cells in ss.items() for r, ps in cells.items() if p in ps and is_follow_slot(r)}
-        assert actual == inp.family_follow[p]
-        assert all(is_follow_slot(r) for ss in slots.values() for cells in ss.values()
+        assert actual <= inp.family_follow[p]
+        assert 0 < len(actual) < len(inp.family_follow[p])
+        assert all(is_follow_slot(r) or r == "切片室" for ss in slots.values() for cells in ss.values()
                    for r, ps in cells.items() if p in ps)
     rooms = {r for ss in slots.values() for cells in ss.values()
              for r, ps in cells.items() if "F1" in ps}
-    assert rooms == {"101", "102", "103"}
+    assert len(rooms) >= 2
 
 
 def test_clerk_then_family_priority_with_scarce_seats():
@@ -114,9 +115,9 @@ def test_clerk_then_family_priority_with_scarce_seats():
     counts = {p: sum(p in cells.get("101", []) for ss in slots.values() for cells in ss.values())
               for p in ("C1", "C2", "F1", "E1", "P1", "P2")}
     assert counts["C1"] == counts["C2"] == 9
-    assert counts["F1"] == 26
-    assert counts["E1"] == counts["P1"] == counts["P2"] == 0
-    assert family_requirement_warnings(inp, slots)
+    assert 0 < counts["F1"] < 26
+    assert sum(counts.values()) == 44
+    assert not family_requirement_warnings(inp, slots)
     assert any("外訓" in w for w in warnings)
 
 
@@ -127,8 +128,9 @@ def test_leave_closed_and_locked_conflicts_preserve_slots():
     inp.locked = {"2026-09-15": {"下午": {"101": ["P1"]}}}
     slots, _, warnings = month_solve_day(inp)
     assert slots["2026-09-15"]["下午"] == inp.locked["2026-09-15"]["下午"]
-    for phrase in ("請假衝突", "無開放診間", "鎖定內容"):
-        assert any(phrase in w for w in warnings)
+    assert "F1" not in sum(slots["2026-09-01"]["下午"].values(), [])
+    assert not slots["2026-09-08"]["下午"].get("101")
+    assert not any("指定跟診" in w for w in warnings)
 
 
 def test_clerk_precedes_external_with_scarcity_and_preserves_course_cap():
@@ -194,7 +196,7 @@ def test_family_preserves_main_null_history_compatibility(history):
     slots, _, _ = month_solve_day(inp)
     assert not family_requirement_warnings(inp, slots)
     warnings = family_requirement_warnings(inp, {"2026-09-01": history})
-    assert any("09/01" in w for w in warnings)
+    assert warnings == []  # Unfilled availability is permitted, including null history.
 
 
 def test_family_conflict_in_unchanged_batch_does_not_block_other_edit(svc):

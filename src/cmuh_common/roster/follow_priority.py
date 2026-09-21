@@ -84,7 +84,7 @@ def refresh_clerk_warnings(inp, slots, warnings):
 
 
 def family_requirement_warnings(inp, slots):
-    out = [f"家醫科 {p} 已不在當月名單，仍有指定跟診設定，請確認名單"
+    out = [f"家醫科 {p} 已不在當月名單，仍有可跟診時段設定，請確認名單"
            for p, required in inp.family_follow.items() if required and p not in inp.family_roster]
     for iso, sessions in slots.items():
         try:
@@ -98,24 +98,7 @@ def family_requirement_warnings(inp, slots):
                 continue
             for p in set(inp.family_roster) & {p for ps in cells.values() for p in (ps or [])}:
                 if (d, s) not in inp.family_follow.get(p, set()):
-                    out.append(f"家醫科 {p} {d:%m/%d} {s} 未指定此時段，卻有排班；請確認指定跟診設定")
-    for p in inp.family_roster:
-        for d, s in sorted(inp.family_follow.get(p, set())):
-            sessions = slots.get(d.isoformat())
-            cells = sessions.get(s) if isinstance(sessions, dict) else None
-            cells = cells if isinstance(cells, dict) else {}
-            rooms = inp.grid.get(d, {}).get(s, [])
-            if on_leave(inp, "family", p, d, s):
-                reason = "與請假衝突"
-            elif d.weekday() >= 5 or not rooms:
-                reason = "無開放診間"
-            elif any(p in (cells.get(r) or []) for r in rooms):
-                continue
-            elif s in inp.locked.get(d.isoformat(), {}):
-                reason = "鎖定內容未安排跟診"
-            else:
-                reason = "未排到跟診（請檢查診間容量）"
-            out.append(f"家醫科 {p} {d:%m/%d} {s} 指定跟診：{reason}")
+                    out.append(f"家醫科 {p} {d:%m/%d} {s} 未指定此時段為可參與，卻有排班；請確認可跟診時段設定")
     return out
 
 

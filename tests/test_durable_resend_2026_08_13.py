@@ -28,7 +28,7 @@ dl = importlib.import_module("cmuh_common.delivery_ledger")
 dr = importlib.import_module("cmuh_common.delivery_reconcile")
 
 
-def _aged_unknown(tmp_path, *, body="會診清單:3F 王O明 皮膚科照會",
+def _aged_unknown(tmp_path, *, body="[會診通知：姓名與病歷號已隱藏]\n會診清單:3F 去識別摘要",
                   recipients=("a@x.tw",), msgid="<m1@x>"):
     """一筆【夠老、有 Message-ID、UNKNOWN】的紀錄 —— 回查會挑到它。"""
     led = dl.DeliveryLedger(path=str(tmp_path / "ledger.json"))
@@ -57,6 +57,14 @@ def _capture_send(monkeypatch, result=None, exc=None):
 
 
 class TestSentMissTriggersATextOnlyResend:
+    def test_legacy_unredacted_payload_is_not_resent(self, tmp_path, monkeypatch):
+        led, _ = _aged_unknown(tmp_path, body="測試甲 病歷號 9876543210 皮疹")
+        sent = _capture_send(monkeypatch)
+        dr.Reconciler(lambda: led).run_once(finder=lambda m: False)
+        assert len(sent) == 1
+        assert "測試甲" not in sent[0]["body"] and "9876543210" not in sent[0]["body"]
+        assert "HIS" in sent[0]["body"]
+
     def test_the_resend_actually_goes_out(self, tmp_path, monkeypatch):
         led, did = _aged_unknown(tmp_path)
         sent = _capture_send(monkeypatch)
@@ -65,7 +73,7 @@ class TestSentMissTriggersATextOnlyResend:
         assert len(sent) == 1, "★查無之後沒有補寄★ 那封臨床通知就這樣消失了"
         kw = sent[0]
         assert kw["recipients"] == ["a@x.tw"]
-        assert "會診清單:3F 王O明" in kw["body"], "補寄要用【落地的】原文"
+        assert "會診清單:3F 去識別摘要" in kw["body"], "補寄要用落地的去識別內容"
         assert "自動補寄" in kw["body"]
         assert "附件依隱私政策未保留" in kw["body"], (
             "★沒講清楚為什麼沒有附件★ 醫師會以為信壞掉了")

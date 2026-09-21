@@ -136,6 +136,7 @@ class DayScheduleTab(ttk.Frame):
                 ("本月門診停診…", self._on_clinic_closure),
                 ("當月PGY人員…", self._edit_pgy_roster),
                 ("PGY apply本科…", self._edit_apply_pref),
+                ("PGY照光調整…", self._edit_photo_offsets),
                 ("PGY請假…", lambda: self._on_leave("pgy")),
                 ("Clerk請假…", lambda: self._on_leave("clerk"))):
             b = ttk.Button(bar2, text=text, command=cmd)
@@ -150,7 +151,7 @@ class DayScheduleTab(ttk.Frame):
                           ("外訓請假…", lambda: self._on_leave("external")),
                           ("當月家醫科人員…", self._edit_family_roster),
                           ("家醫科請假…", lambda: self._on_leave("family")),
-                          ("家醫科指定跟診…", self._edit_family_follow)):
+                          ("家醫科可跟診時段…", self._edit_family_follow)):
             b = ttk.Button(bar3, text=text, command=cmd)
             b.pack(side="left", padx=4)
             self._edit_btns.append(b)
@@ -453,7 +454,7 @@ class DayScheduleTab(ttk.Frame):
                     base += f"\n{c}：跟診 {st['follow']}；切片室 {st['biopsy']}；空班 {st['rest']}"
             family = data.get("family", {})
             if family.get("roster"):
-                base += "\n\n【家醫科（本月；依手動指定時段）】"
+                base += "\n\n【家醫科（本月；依可參與時段排班，不必排滿）】"
                 for c in family["roster"]:
                     st = family["stats"].get(c) or dict.fromkeys(STAT_KEYS, 0)
                     base += f"\n{c}：跟診 {st['follow']}"
@@ -609,7 +610,7 @@ class DayScheduleTab(ttk.Frame):
         if self._finalized:
             return
         if not self.service.build_day_input(self.app.ym).family_roster:
-            messagebox.showinfo("家醫科指定跟診", "請先設定當月家醫科人員（最多 2 人）", parent=self)
+            messagebox.showinfo("家醫科可跟診時段", "請先設定當月家醫科人員（最多 2 人）", parent=self)
             return
         dlg = _FamilyFollowDialog(self, self.service, self.app.ym)
         self.wait_window(dlg)
@@ -645,6 +646,40 @@ class DayScheduleTab(ttk.Frame):
             self.app.ym, _split_codes(val), baseline=list(cur)),
             title="當月 PGY 人員", parent=self)
         self.refresh()
+
+    def _edit_photo_offsets(self) -> None:
+        if self._finalized:
+            return
+        roster = [m["id"] for m in self._roster_members("pgy")]
+        if not roster:
+            messagebox.showinfo("照光調整", "請先設定當月 PGY 人員", parent=self)
+            return
+        baseline = dict(self.service.storage.load_month(self.app.ym).get("pgy_photo_offsets") or {})
+        dlg = tk.Toplevel(self)
+        dlg.title(f"PGY 照光次數調整 · {self.app.ym}")
+        dlg.transient(self.winfo_toplevel())
+        ttk.Label(dlg, text="0：大家相同；−1：比基準少一次；+1：多一次。\n"
+                  "含週三下午照光。優先平衡照光與治療室，\n"
+                  "再平衡跟診與週三下午；請假、鎖定優先。", padding=10).pack()
+        entries = {}
+        for p in roster:
+            row = ttk.Frame(dlg)
+            row.pack(fill="x", padx=12, pady=3)
+            ttk.Label(row, text=p, width=16).pack(side="left")
+            var = tk.StringVar(value=str(baseline.get(p, 0)))
+            ttk.Spinbox(row, from_=-99, to=99, textvariable=var, width=8).pack(side="left")
+            entries[p] = var
+        def save():
+            try:
+                values = {p: int(v.get()) for p, v in entries.items()}
+                self.service.set_pgy_photo_offsets(self.app.ym, values, baseline=baseline)
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("儲存失敗", str(exc), parent=dlg)
+                return
+            dlg.destroy()
+            self.refresh()
+        ttk.Button(dlg, text="儲存（下次自動排班生效）", command=save).pack(pady=10)
+        dlg.grab_set()
 
     def _edit_apply_pref(self) -> None:
         """[2026-07-23 使用者] 勾選本月「Apply 本科」PGY（至多 2 位）：自動排班時
@@ -1171,7 +1206,7 @@ class _DayEditDialog(tk.Toplevel):
             m.add_command(label="（本月無 PGY / 當日無 Clerk 梯次名單）",
                           state="disabled")
         for c in self._cands:
-            if c in getattr(self, "_family_cands", set()) and slot in _SPECIAL_SLOTS and c not in here:
+            if c in getattr(self, "_family_cands", set()) and slot in (PHOTO, TREATMENT, REST) and c not in here:
                 continue
             other = [s for s, v in cur.items() if s != slot and c in v]
             mark = ""
@@ -1224,13 +1259,13 @@ class _FamilyFollowDialog(tk.Toplevel):
     """Person-specific monthly AM/PM requirements; one atomic delta save."""
     def __init__(self, parent, service, ym):
         super().__init__(parent)
-        self.title(f"{ym} 家醫科指定跟診")
+        self.title(f"{ym} 家醫科可跟診時段")
         self.service, self.ym = service, ym
         inp = service.build_day_input(ym)
         self.baseline = {p: set(inp.family_follow.get(p, set())) for p in inp.family_roster}
         self.variables = {}
-        ttk.Label(self, text="勾選該員必須皮膚科跟診的時段；每月分別設定。\n"
-                  "未勾選時段不自動排班；請假、停診或鎖定衝突會列出警告。",
+        ttk.Label(self, text="勾選該員可參與皮膚科跟診或切片觀摩的時段，不必排滿。\n"
+                  "扣除請假後，跟診最低 30%、目標 50%、上限 70%；未勾選時段不排班。",
                   padding=10).pack(fill="x")
         tabs = ttk.Notebook(self)
         tabs.pack(fill="both", expand=True, padx=10)
@@ -1258,7 +1293,7 @@ class _FamilyFollowDialog(tk.Toplevel):
                                         variable=var).pack(anchor="w")
         bar = ttk.Frame(self, padding=10)
         bar.pack(fill="x")
-        ttk.Button(bar, text="儲存指定時段", command=self._save).pack(side="right")
+        ttk.Button(bar, text="儲存可參與時段", command=self._save).pack(side="right")
         ttk.Button(bar, text="取消", command=self.destroy).pack(side="right", padx=6)
         self.transient(parent)
 
@@ -1267,5 +1302,5 @@ class _FamilyFollowDialog(tk.Toplevel):
                      for p, variables in self.variables.items()}
         if guard_write(lambda: self.service.set_family_follow(
                 self.ym, specified, baseline=self.baseline),
-                title="家醫科指定跟診", parent=self):
+                title="家醫科可跟診時段", parent=self):
             self.destroy()

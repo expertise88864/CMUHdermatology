@@ -55,7 +55,11 @@ def test_family_has_no_implicit_attendance_and_leave_locks_are_preserved():
     inp.leaves = {"external": {"E1": {date(2026, 9, 8)}}}
     inp.locked = {"2026-09-14": {"上午": {"101": ["E1"]}}}
     slots, _, _ = month_solve_day(inp)
-    assert sum(counts(slots, "F1").values()) == 1
+    # One available half-day cannot hold a clinic without exceeding the 70% cap.
+    assert sum(counts(slots, "F1").values()) == 0
+    assert all((date.fromisoformat(iso), s) in inp.family_follow["F1"]
+               for iso, ss in slots.items() for s, cells in ss.items()
+               if any("F1" in ps for ps in cells.values()))
     assert not any("F2" in ps for ss in slots.values() for cells in ss.values() for ps in cells.values())
     assert not any("E1" in ps for cells in slots["2026-09-08"].values() for ps in cells.values())
     assert slots["2026-09-14"]["上午"] == inp.locked["2026-09-14"]["上午"]

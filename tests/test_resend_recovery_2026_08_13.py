@@ -85,7 +85,7 @@ def _capture_send(monkeypatch, result=None, exc=None):
 
 
 def _failed_parent(led, clock, *, recipients=("a@x.tw",), bk="bk",
-                   body="會診清單:3F 王O明 皮膚科照會", msgid="<m1@x>"):
+                   body="[會診通知：姓名與病歷號已隱藏]\n會診清單:3F 去識別摘要", msgid="<m1@x>"):
     """一筆已被否證(Sent 查無)的親紀錄 —— 欠一次補寄的起點。"""
     did = led.begin(business_key=bk, category="consult",
                     recipients=list(recipients), subject="皮膚科會診通知",
@@ -141,7 +141,7 @@ class TestCrashRecoveryIsDbDriven:
             "★resolve 之後 crash,這封信就永久消失★ —— 「欠補寄」必須由"
             "資料庫回答,不能靠 call-stack 的順序")
         assert sent[0]["recipients"] == ["a@x.tw"]
-        assert "王O明" in sent[0]["body"], "要用【落地的】原文補"
+        assert "去識別摘要" in sent[0]["body"], "要用落地的去識別內容補寄"
         # crash point 6:補寄送達 → 回寫 → 鏈關 → body 才 GC
         assert led.state_of(did) == dl.CONFIRMED
         assert led.get(did)["body_text"] == ""
@@ -161,7 +161,7 @@ class TestCrashRecoveryIsDbDriven:
                  "category": "consult"}
         dr.Reconciler(lambda: led)._resend_from_body_text(led, stale)
         assert sent, "補寄本身要發生"
-        assert "王O明" in sent[0]["body"] and "快照" not in sent[0]["body"], (
+        assert "去識別摘要" in sent[0]["body"] and "快照" not in sent[0]["body"], (
             "★吃了快照★ crash 之後重來只剩資料庫 —— 平時也必須走同一條路")
         assert sent[0]["recipients"] == ["a@x.tw"]
 

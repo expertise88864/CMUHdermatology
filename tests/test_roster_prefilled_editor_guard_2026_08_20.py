@@ -227,6 +227,7 @@ _CLASSIFIED = {
     "set_family_month_roster": "delta",
     "set_family_follow": "delta",
     "set_pgy_month_roster": "delta", "set_pgy_apply_pref": "delta",
+    "set_pgy_photo_offsets": "delta",  # changed keys only; conflicting same-key edits rejected
     "set_biopsy_cells": "delta", "set_pgy_default_members": "delta",
     "update_clerk_batch_fields": "delta-fields",
     # [外審次輪 P2-04] 門診模板改用穩定身分:新增由服務層配 id、刪除以
