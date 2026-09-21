@@ -6,7 +6,10 @@ import pytest
 
 from cmuh_common.roster.pgy_balance import balance_pgy
 from cmuh_common.roster.service import RosterService
-from cmuh_common.roster.solve_day import DaySolveInput, PHOTO, TREATMENT, day_input_fingerprint
+from cmuh_common.roster.solve_day import (
+    DaySolveInput, PHOTO, TREATMENT, TWO_PGY_PHOTO_ONLY, day_input_fingerprint,
+    is_follow_slot, month_solve_day,
+)
 from cmuh_common.roster.storage import RosterStorage
 
 
@@ -128,3 +131,21 @@ def test_uniform_offsets_have_no_relative_effect():
     inp.pgy_photo_offsets = {p: -1 for p in inp.pgy_roster}
     balance_pgy(inp, slots, [], [])
     assert slots == baseline
+
+
+def test_photo_offset_preserves_two_pgy_weekly_rotation():
+    grid = {date(2026, 10, n): {"上午": ["101", "102"],
+            "下午": [] if date(2026, 10, n).weekday() == 2 else ["101", "102"]}
+            for n in range(1, 32) if date(2026, 10, n).weekday() < 5}
+    inp = DaySolveInput("2026-10", grid, ["A", "B"])
+    before, _, _ = month_solve_day(inp)
+    inp.pgy_photo_offsets = {"A": -1}
+    after, _, _ = month_solve_day(inp)
+    for d, sessions in grid.items():
+        for session in sessions:
+            if (d.weekday(), session) not in TWO_PGY_PHOTO_ONLY:
+                continue
+            old, new = before[d.isoformat()][session], after[d.isoformat()][session]
+            assert new[PHOTO] == old[PHOTO]
+            assert sorted(p for r, ps in new.items() if is_follow_slot(r) for p in ps) == sorted(
+                p for r, ps in old.items() if is_follow_slot(r) for p in ps)

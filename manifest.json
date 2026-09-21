@@ -597,7 +597,7 @@
       "remote_path": "src/cmuh_common/roster/pgy_balance.py",
       "local_filename": "src/cmuh_common/roster/pgy_balance.py",
       "version": "2026.09.21.1",
-      "sha256": "1fb0e27b9dae633e752f3763f4c9fc7313376e1ff6ba43982e5b76bde088863c"
+      "sha256": "63479c91018ba6b508cd30064a80428c59db11a0b5959b1a676b7cc6aa2697c3"
     },
     {
       "key": "cmuh_common.roster.report",

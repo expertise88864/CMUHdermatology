@@ -4,7 +4,7 @@ from datetime import date
 from itertools import combinations
 
 from .session_leave import on_leave
-from .solve_day import PHOTO, REST, TREATMENT, is_follow_slot
+from .solve_day import PHOTO, REST, TREATMENT, TWO_PGY_PHOTO_ONLY, is_follow_slot
 
 
 def balance_pgy(inp, slots, log, warnings):
@@ -33,6 +33,9 @@ def balance_pgy(inp, slots, log, warnings):
             movable = [(r, i, p) for r, i, p in positions
                        if (r in (PHOTO, TREATMENT, REST) or is_follow_slot(r))
                        and not on_leave(inp, "pgy", p, d, s)
+                       # The existing two-PGY weekly rotation outranks monthly
+                       # fairness and requested photo offsets.
+                       and not (len(people) == 2 and (d.weekday(), s) in TWO_PGY_PHOTO_ONLY)
                        and s not in inp.locked.get(iso, {}) and d in inp.grid]
             candidates = [p for _, _, p in movable]
             assignments = defaultdict(list)
