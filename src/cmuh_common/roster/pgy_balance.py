@@ -86,7 +86,17 @@ def balance_pgy(inp, slots, log, warnings):
     if original_scores == lower_bounds and not request_pairs:
         return  # Already reaches the integer lower bound for all four duties.
     for key, count in previous.items():
-        model.add(sum(weekly[key]) >= min(2, count))
+        model.add(sum(weekly[key]) >= min(1, count))
+    # Protect each achieved weekly minimum and the week's total target credit.
+    # A second clinic can move between PGYs to spread monthly shortages fairly;
+    # pinning every person's second clinic stranded one person at 8 vs 10/10/10.
+    for week in {w for w, _ in previous}:
+        credit = []
+        for p in people:
+            achieved = model.new_int_var(0, 2, f"weekly_target_credit/{week}/{p}")
+            model.add_min_equality(achieved, [sum(weekly[week, p]), 2])
+            credit.append(achieved)
+        model.add(sum(credit) >= sum(min(2, previous[week, p]) for p in people))
     bound = len(choices) + 198
     objectives = defaultdict(list)
     for kind in ("photo", "tx", "follow", "wed"):
@@ -149,7 +159,7 @@ def balance_pgy(inp, slots, log, warnings):
     for (cells, room, index, p, _), selected in zip(choices, saved, strict=True):
         if selected:
             cells[room][index] = p
-    log.append("PGY 次數平衡：照光（扣除個人調整）與治療室優先，再平衡跟診與週三下午；保留每週已達成的跟診最低／目標及鎖定工作")
+    log.append("PGY 次數平衡：照光（扣除個人調整）與治療室優先，再平衡跟診與週三下午；保留個人每週最低跟診、每週整體目標達成次數及鎖定工作")
     for kind, title in (("photo", "照光（扣除個人調整）"), ("tx", "治療室"),
                         ("follow", "跟診"), ("wed", "週三下午")):
         # The last solve may time out; count from the retained feasible solution.

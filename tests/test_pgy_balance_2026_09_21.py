@@ -48,7 +48,11 @@ def test_locks_and_achieved_weekly_clinic_minimum_are_preserved():
     balance_pgy(inp, slots, [], [])
     assert slots["2026-09-01"] == before["2026-09-01"]
     actual = clinics(slots)
-    assert all(actual[key] >= min(2, value) for key, value in clinics(before).items())
+    original = clinics(before)
+    assert all(actual[key] >= min(1, value) for key, value in original.items())
+    for week in {w for w, _ in original}:
+        assert sum(min(2, actual[week, p]) for p in inp.pgy_roster) >= sum(
+            min(2, original[week, p]) for p in inp.pgy_roster)
 
 
 def test_monthly_offsets_merge_and_fingerprint(tmp_path):

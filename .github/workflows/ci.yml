@@ -16,7 +16,9 @@ on:
 jobs:
   test:
     runs-on: windows-latest
-    timeout-minutes: 30      # 加了覆蓋率與型別債棘輪之後比原本久
+    # Full Windows tests with coverage take ~25 min; type-debt adds ~4 min.
+    # Include dependency setup and runner variance while retaining every gate.
+    timeout-minutes: 45
 
     steps:
       - name: Checkout

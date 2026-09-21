@@ -1,6 +1,8 @@
 from collections import Counter
 from datetime import date
 
+import pytest
+
 from cmuh_common.roster.solve_day import DaySolveInput, month_solve_day, BIOPSY, is_follow_slot
 from cmuh_common.roster.training_bands import available_slots, band
 from cmuh_common.roster.model import ClerkBatch
@@ -87,3 +89,40 @@ def test_clerk_extra_clinics_never_displace_feasible_pgy_minimums():
                     weekly.update((date.fromisoformat(iso).isocalendar().week, p) for p in people)
     assert sorted(totals[p] for p in ("C1", "C2", "C3")) == [9, 9, 10]
     assert all(weekly[week, p] >= 1 for week in (37, 38) for p in inp.pgy_roster)
+
+
+@pytest.mark.parametrize("size", [4, 5])
+def test_october_two_clerk_batches_share_two_double_capacity_clinics(size):
+    inp = october()
+    inp.capacity = 2
+    inp.clerk_batches = [ClerkBatch(f"B{i}", date(2026, 10, start),
+                        [f"C{i}{n}" for n in range(1, size + 1)])
+                        for i, start in ((1, 5), (2, 19))]
+    inp.biopsy_open = {b.id: {d.isoformat(): {s: bool(rooms) for s, rooms in ss.items()}
+                              for d, ss in inp.grid.items() if b.covers(d)} for b in inp.clerk_batches}
+    slots, _, _ = month_solve_day(inp)
+    clinics, biopsies, weekly = Counter(), Counter(), Counter()
+    for iso, ss in slots.items():
+        d = date.fromisoformat(iso)
+        for cells in ss.values():
+            people = [p for members in cells.values() for p in members]
+            assert len(people) == len(set(people))
+            for room, members in cells.items():
+                if room == BIOPSY:
+                    assert len(members) <= 1
+                    biopsies.update(members)
+                elif is_follow_slot(room):
+                    assert len(members) <= 2
+                    clinics.update(members)
+                    weekly.update((d.isocalendar().week, p) for p in members)
+    for b in inp.clerk_batches:
+        for p in b.members:
+            assert 9 <= clinics[p] <= 11
+            assert 1 <= biopsies[p] <= 2
+    for scope, p in (("family", "F"), ("external", "E")):
+        low, _, high = band(len(available_slots(inp, scope, p)))
+        assert low <= clinics[p] <= high
+        assert biopsies[p] == 2
+    assert all(weekly[w, p] >= 1 for w in range(40, 45) for p in inp.pgy_roster)
+    counts = [clinics[p] for p in inp.pgy_roster]
+    assert max(counts) - min(counts) <= 1
