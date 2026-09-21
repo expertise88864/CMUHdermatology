@@ -87,3 +87,40 @@ def test_unknown_solver_result_preserves_known_schedule(monkeypatch):
     balance_pgy(inp, slots, [], warnings)
     assert slots == before
     assert any("已知最佳" in text for text in warnings)
+
+
+def four_people(offsets):
+    days = [date(2026, 9, n) for n in (1, 3, 4, 7, 8, 10)]
+    people = ["A", "B", "C", "D"]
+    inp = DaySolveInput("2026-09", {d: {s: ["101", "102"] for s in ("上午", "下午")} for d in days},
+                        people, pgy_photo_offsets=offsets)
+    slots = {}
+    for i, (d, s) in enumerate((d, s) for d in days for s in ("上午", "下午")):
+        slots.setdefault(d.isoformat(), {})[s] = {
+            PHOTO: [people[i % 4]], TREATMENT: [people[(i + 1) % 4]],
+            "101": [people[(i + 2) % 4]], "102": [people[(i + 3) % 4]]}
+    return inp, slots
+
+
+@pytest.mark.parametrize("offset,expected", [(-1, 2), (1, 4)])
+def test_adjustment_is_effective_when_total_is_divisible(offset, expected):
+    inp, slots = four_people({"A": offset})
+    assert sum("A" in cells[PHOTO] for ss in slots.values() for cells in ss.values()) == 3
+    balance_pgy(inp, slots, [], [])
+    assert sum("A" in cells[PHOTO] for ss in slots.values() for cells in ss.values()) == expected
+
+
+def test_adjusting_multiple_people_preserves_relative_direction():
+    inp, slots = four_people({p: 1 for p in ("B", "C", "D")})
+    balance_pgy(inp, slots, [], [])
+    counts = Counter(p for ss in slots.values() for cells in ss.values() for p in cells[PHOTO])
+    assert all(counts[p] > counts["A"] for p in ("B", "C", "D"))
+
+
+def test_uniform_offsets_have_no_relative_effect():
+    inp, slots = example()
+    baseline = deepcopy(slots)
+    balance_pgy(inp, baseline, [], [])
+    inp.pgy_photo_offsets = {p: -1 for p in inp.pgy_roster}
+    balance_pgy(inp, slots, [], [])
+    assert slots == baseline

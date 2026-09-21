@@ -74,7 +74,16 @@ def balance_pgy(inp, slots, log, warnings):
         original_scores[kind] = sum((a - b) ** 2 for a, b in combinations(values, 2))
         remainder = sum(values) % len(people)
         lower_bounds[kind] = remainder * (len(people) - remainder)
-    if original_scores == lower_bounds:
+    offset_values = [offsets.get(p, 0) for p in people]
+    center = 0 if 0 in offset_values else sorted(offset_values)[len(people) // 2]
+    total_photo = sum(original_counts[p, "photo"] for p in people)
+    # Integer apportionment has tied solutions. Prefer the requested person's
+    # ideal share and the direction of relative offsets, instead of returning
+    # an unchanged equal-count roster merely because normalized spread is 1.
+    request_targets = {p: total_photo - sum(offset_values) + len(people) * offsets.get(p, 0)
+                       for p in people if offsets.get(p, 0) != center}
+    request_pairs = [(a, b) for a in people for b in people if offsets.get(a, 0) < offsets.get(b, 0)]
+    if original_scores == lower_bounds and not request_pairs:
         return  # Already reaches the integer lower bound for all four duties.
     for key, count in previous.items():
         model.add(sum(weekly[key]) >= min(2, count))
@@ -88,6 +97,15 @@ def balance_pgy(inp, slots, log, warnings):
             squared = model.new_int_var(0, bound * bound, f"square/{kind}/{a}/{b}")
             model.add_multiplication_equality(squared, [diff, diff])
             objectives[kind].append(squared)
+    requests = []
+    for p, target in request_targets.items():
+        gap = model.new_int_var(0, bound * len(people), f"photo_request/{p}")
+        model.add_abs_equality(gap, len(people) * sum(totals[p, "photo"]) - target)
+        requests.append(gap)
+    for a, b in request_pairs:
+        gap = model.new_int_var(0, bound, f"photo_direction/{a}/{b}")
+        model.add_max_equality(gap, [0, sum(totals[a, "photo"]) + 1 - sum(totals[b, "photo"])])
+        requests.append(gap)
     solver = cp_model.CpSolver()
     solver.parameters.num_search_workers = 1
     solver.parameters.random_seed = 42
@@ -96,13 +114,18 @@ def balance_pgy(inp, slots, log, warnings):
     primary = sum(objectives["photo"] + objectives["tx"])
     secondary = sum(objectives["follow"] + objectives["wed"])
     original_score = (original_scores["photo"] + original_scores["tx"],
-                      original_scores["follow"] + original_scores["wed"])
+                      sum(abs(len(people) * original_counts[p, "photo"] - target)
+                          for p, target in request_targets.items())
+                      + sum(max(0, original_counts[a, "photo"] + 1 - original_counts[b, "photo"])
+                            for a, b in request_pairs),
+                      original_scores["follow"] + original_scores["wed"], 0)
     model.add(primary <= original_score[0])
     primary_floor = lower_bounds["photo"] + lower_bounds["tx"]
     model.add(primary >= primary_floor)
     model.add(secondary >= lower_bounds["follow"] + lower_bounds["wed"])
-    best_score = (*original_score, 0)
-    phases = [(1, objectives["follow"] + objectives["wed"]), (2, changes)]
+    best_score = original_score
+    phases = ([(1, requests)] if requests else []) + [
+        (2, objectives["follow"] + objectives["wed"]), (3, changes)]
     if original_score[0] != primary_floor:
         phases.insert(0, (0, objectives["photo"] + objectives["tx"]))
     status = cp_model.UNKNOWN
@@ -113,7 +136,8 @@ def balance_pgy(inp, slots, log, warnings):
         status = solver.solve(model)
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             break
-        score = (solver.value(primary), solver.value(secondary), solver.value(sum(changes)))
+        score = (solver.value(primary), solver.value(sum(requests)),
+                 solver.value(secondary), solver.value(sum(changes)))
         if score <= best_score:
             best_score = score
             saved = [solver.value(v) for _, _, _, _, v in choices]
@@ -145,6 +169,10 @@ def balance_pgy(inp, slots, log, warnings):
                     if matches:
                         counts.update(members)
         values = {p: counts[p] - (offsets.get(p, 0) if kind == "photo" else 0) for p in people}
+        if kind == "photo":
+            for a, b in request_pairs:
+                if counts[a] >= counts[b]:
+                    warnings.append(f"PGY 照光相對調整未完全達成：{a} 應少於 {b}，實排 {counts[a]}／{counts[b]} 次（請假、鎖定與必要工作優先）")
         if max(values.values()) - min(values.values()) > 1:
             warnings.append(f"PGY {title}次數仍有差異（請假、鎖定與每週跟診需求優先）："
                             + "、".join(f"{p} {n}" for p, n in values.items()))

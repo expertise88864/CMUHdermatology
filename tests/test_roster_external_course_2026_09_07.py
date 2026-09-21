@@ -70,7 +70,7 @@ def test_impossible_quotas_warn_and_do_not_overfill():
     pytest.importorskip("ortools")
     inp = make_input(("外訓1",))
     # Clinics are open but every seat is locked: a real attendance shortfall.
-    # Fully closed half-days no longer belong to the quota denominator.
+    # An open but occupied clinic must not cause any locked seat to be overwritten.
     inp.capacity = 1
     inp.grid = {d: {s: ["101"] for s in ss} for d, ss in inp.grid.items()}
     inp.locked = {d.isoformat(): {s: {"101": ["P1"]} for s in ss}

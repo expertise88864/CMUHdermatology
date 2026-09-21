@@ -527,7 +527,7 @@
       "remote_path": "src/cmuh_common/roster/course_balance.py",
       "local_filename": "src/cmuh_common/roster/course_balance.py",
       "version": "2026.09.21.1",
-      "sha256": "c24003b83acd805ee111343f216bc4755610a428c30bff4dcb819daa85e2d8e9"
+      "sha256": "26a1151c2ebbda0d1fa9023491be4e1aeab30e59b60ff562d28ff9fc9384a1aa"
     },
     {
       "key": "cmuh_common.roster.export_common",
@@ -597,7 +597,7 @@
       "remote_path": "src/cmuh_common/roster/pgy_balance.py",
       "local_filename": "src/cmuh_common/roster/pgy_balance.py",
       "version": "2026.09.21.1",
-      "sha256": "a0fc6741944ca888e75282487831c068057f36252fd5acf3cc68d6540741c018"
+      "sha256": "2e9b35b596cec87ba67646341084d0e26865f0f1284ae9fe311d7b76d7675f2a"
     },
     {
       "key": "cmuh_common.roster.report",
@@ -660,7 +660,7 @@
       "remote_path": "src/cmuh_common/roster/training_bands.py",
       "local_filename": "src/cmuh_common/roster/training_bands.py",
       "version": "2026.09.21.1",
-      "sha256": "42bebea60789dd533bcfaddc73e1fe2b07e6de7909c391902483822a38252750"
+      "sha256": "6c5f6df8f0cb17eebd5a1d5b4a77192648e3665b33a201462222ab03205ee227"
     },
     {
       "key": "cmuh_common.roster.ui.__init__",

@@ -16,9 +16,8 @@ def available_training_slots(inp, scope, person):
 
 
 def available_slots(inp, scope, person):
-    """Clinic quota denominator excludes half-days with no open clinics."""
-    return {(d, s) for d, s in available_training_slots(inp, scope, person)
-            if inp.grid[d].get(s)}
+    """User-confirmed denominator: work availability, including clinic closures."""
+    return available_training_slots(inp, scope, person)
 
 
 def band(n):
@@ -45,7 +44,7 @@ def fixed_count(inp, p, kind, within=None):
                if (r == BIOPSY if kind == "biopsy" else is_follow_slot(r)))
 
 
-def add_training_objectives(inp, model, choices, deviation, external):
+def add_training_objectives(inp, model, choices, deviation, external, clerk_minima=()):
     """Protect minimums jointly, then family/external targets, then PGY targets."""
     basics, family, other, pgy, spread = [], [], [], [], []
     worst = model.new_int_var(0, 1000, "training_minimum_shortfall")
@@ -63,6 +62,9 @@ def add_training_objectives(inp, model, choices, deviation, external):
         model.add(deficit >= required - actual)
         model.add(1000 * deficit <= required * worst)
         basics.append(1000 * deficit)
+
+    for bid, person, actual, required in clerk_minima:
+        minimum(actual, required, f"clerk_min/{bid}/{person}")
 
     for scope, people, objective in (("family", inp.family_roster, family),
                                       ("external", external, other)):

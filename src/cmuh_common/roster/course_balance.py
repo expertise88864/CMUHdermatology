@@ -51,6 +51,35 @@ def external_quota_warnings(inp, slots):
     return training_warnings(inp, slots, scopes=("external",))
 
 
+def _fixed_clerk_follows(inp, slots):
+    """Course credit outside the movable monthly clinic budget."""
+    counts = defaultdict(int)
+    sources = {iso: ss for iso, ss in inp.prior_sessions.items() if iso[:7] < inp.ym}
+    sources.update({iso: ss for iso, ss in inp.course_fixed.items() if iso[:7] > inp.ym})
+    sources.update(slots)
+    order = arbitration_order(inp)
+    for iso, sessions in sources.items():
+        try:
+            d = date.fromisoformat(iso)
+        except (TypeError, ValueError):
+            continue
+        owner = day_owner_batch(order, d)
+        if not owner or d.weekday() >= 5 or not isinstance(sessions, dict):
+            continue
+        if iso[:7] == inp.ym and d not in inp.grid:
+            continue
+        excluded = inp.prior_pgy if iso[:7] < inp.ym else inp.pgy_roster
+        for s, cells in sessions.items():
+            if s not in STUDENT_SESSIONS or not isinstance(cells, dict):
+                continue
+            for room, members in cells.items():
+                if is_follow_slot(room) and (iso[:7] != inp.ym or room in inp.grid[d].get(s, [])):
+                    for p in members or []:
+                        if p in owner.members and p not in excluded:
+                            counts[owner.id, p] += 1
+    return counts
+
+
 def add_external(inp, slots, log, warnings):
     people = external_roster(inp)
     conflicts = sorted(set(inp.external_roster) - set(people))
@@ -124,17 +153,22 @@ def add_external(inp, slots, log, warnings):
         model.add_abs_equality(value, expression)
         return value
 
-    from .training_bands import add_training_objectives
-    training_phases, training_spread = add_training_objectives(inp, model, choices, deviation, people)
-    spread_objective.extend(training_spread)
+    fixed_clerk = _fixed_clerk_follows(inp, slots)
+    clerk_minima, clerk_extra = [], []
     for (bid, p), target in targets.items():
         new = sum(v for (d, _, pp, k), v in choices.items()
                   if pp == p and k == "follow"
                   and (owner := day_owner_batch(arbitration_order(inp), d)) is not None
                   and owner.id == bid)
         model.add(new <= target)
-        shortage(new, target)
-        clerk_objective.append(-new)
+        fixed = fixed_clerk[bid, p]
+        clerk_minima.append((bid, p, new, min(target, max(0, 9 - fixed))))
+        shortage(new, min(target, max(0, 10 - fixed)))
+        clerk_extra.append(-new)
+    from .training_bands import add_training_objectives
+    training_phases, training_spread = add_training_objectives(
+        inp, model, choices, deviation, people, clerk_minima)
+    spread_objective.extend(training_spread)
     idle_days = []
     for d in sorted(inp.grid):
         owner = day_owner_batch(arbitration_order(inp), d)
@@ -177,8 +211,10 @@ def add_external(inp, slots, log, warnings):
     solver.parameters.linearization_level = 2
     solver.parameters.max_deterministic_time = 10
     # Freeze each achieved priority objective before considering the next tier.
-    # External attendance can never buy a reduction in Clerk attendance.
-    phases = (clerk_objective, *training_phases, spread_objective)
+    # Joint minimums first, then ordered targets. Clerk's optional 11th clinic
+    # uses capacity left after everyone's targets, never a PGY's weekly minimum.
+    phases = (*training_phases[:2], clerk_objective, *training_phases[2:],
+              clerk_extra, spread_objective)
     for index, objective in enumerate(phases):
         expression = sum(objective)
         model.minimize(expression)
@@ -203,8 +239,9 @@ def add_external(inp, slots, log, warnings):
         actual = sum(p in ps for (d, ss) in originals
                      if (owner := day_owner_batch(arbitration_order(inp), d)) and owner.id == bid
                      for r, ps in slots[d.isoformat()][ss].items() if is_follow_slot(r))
-        if actual < target:
-            warnings.append(f"Clerk {p}（{bid}）可調整跟診 {actual}/{target} 次；Clerk 優先，其次家醫科、外訓、PGY")
+        desired = min(target, max(0, 10 - fixed_clerk[bid, p]))
+        if actual < desired:
+            warnings.append(f"Clerk {p}（{bid}）可調整跟診 {actual}/{desired} 次；先保障所有人的最低需求，再依 Clerk、家醫科、外訓、PGY 安排目標")
     from .follow_priority import refresh_clerk_warnings
     refresh_clerk_warnings(inp, slots, warnings)
     from .training_bands import training_warnings
