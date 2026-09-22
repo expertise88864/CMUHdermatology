@@ -658,9 +658,10 @@ class DayScheduleTab(ttk.Frame):
         dlg = tk.Toplevel(self)
         dlg.title(f"PGY 照光次數調整 · {self.app.ym}")
         dlg.transient(self.winfo_toplevel())
-        ttk.Label(dlg, text="0：大家相同；−1：比基準少一次；+1：多一次。\n"
-                  "含週三下午照光。優先平衡照光與治療室，\n"
-                  "再平衡跟診與週三下午；請假、鎖定優先。", padding=10).pack()
+        ttk.Label(dlg, text="0：依可工作時段比例分配；−1／−2：照光及總工作量減少 1／2 次。\n"
+                  "含週三下午照光，不以治療室或跟診補回減量；+1 則增加目標。\n"
+                  "先平衡必要工作合計，再平衡各類工作及總工作量。\n"
+                  "請假、鎖定、必要人力與每週最低跟診優先；無法達成時顯示提醒。", padding=10).pack()
         entries = {}
         for p in roster:
             row = ttk.Frame(dlg)
