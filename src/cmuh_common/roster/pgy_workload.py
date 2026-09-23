@@ -1,4 +1,4 @@
-"""Equalize PGY duties before availability-weighted total work."""
+"""Equalize PGY duties and actual total work after manual reductions."""
 from math import gcd
 from functools import reduce
 import heapq
@@ -35,16 +35,15 @@ def workload_goals(model, people, totals, original, weights, offsets):
 
     Required coverage fixes the total number of seats. Photo and treatment
     counts are shared equally among PGYs, apart from manual photo offsets.
-    Availability affects only the final total-work goal. Wednesday photo is
-    already included in photo and necessary work, so it is never counted twice.
+    Leave and availability constrain which seats can move, but do not increase
+    a more available PGY's target workload. Wednesday photo is already included
+    in photo and necessary work, so it is never counted twice.
     """
-    if not any(weights.values()):
-        weights = dict.fromkeys(people, 1)
+    shares = dict.fromkeys(people, 1)
+    scale = len(people)
     terms, scores, floors = {}, {}, {}
     request_terms, request_scores = {}, {}
     for kind in ("necessary", "photo", "tx", "wed", "all", "follow"):
-        shares = weights if kind == "all" else dict.fromkeys(people, 1)
-        scale = sum(shares.values())
         adjusted = kind in ("necessary", "photo", "all")
         shifts = {p: offsets.get(p, 0) if adjusted else 0 for p in people}
         total = sum(original[p, kind] for p in people)
@@ -72,11 +71,13 @@ def workload_goals(model, people, totals, original, weights, offsets):
                 request_scores[kind] += abs(scale * original[p, kind] - requested)
     # Fix individual photo and treatment targets first. Follow assignments
     # then absorb unavoidable differences while balancing the total number of
-    # worked sessions according to each person's actual availability.
-    groups = [(["photo"], True), (["photo"], False),
+    # worked sessions, with manual photo reductions also reducing total work.
+    # Relative fairness is primary. The absolute request breaks ties, so a
+    # rounded request cannot force an avoidable gap between other PGYs.
+    groups = [(["photo"], False), (["photo"], True),
               (["tx"], False), (["wed"], False),
-              (["necessary"], True), (["necessary"], False),
-              (["all"], True), (["all"], False), (["follow"], False)]
+              (["necessary"], False), (["necessary"], True),
+              (["all"], False), (["all"], True), (["follow"], False)]
     objectives, incumbent, bounds = [], [], []
     for kinds, request in groups:
         source, values = (request_terms, request_scores) if request else (terms, scores)

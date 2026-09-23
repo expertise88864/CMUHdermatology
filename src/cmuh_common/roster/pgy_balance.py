@@ -126,7 +126,7 @@ def balance_pgy(inp, slots, log, warnings):
         if selected:
             cells[room][index] = p
     log.append("PGY 次數平衡：先平衡照光（個人減量除外）、治療室及週三下午，"
-               "再由跟診調整總工作量；總工作量依可工作時段比例計算。"
+               "再由跟診調整總工作量；各人總次數盡量一致，個人減量除外。"
                "週三下午照光已包含在照光次數，照光個人調整同步調整總工作量。"
                "保留請假、鎖定、必要人力、個人每週最低跟診及每週整體目標達成次數")
     actual = Counter()
@@ -152,9 +152,10 @@ def balance_pgy(inp, slots, log, warnings):
                     elif room == TREATMENT:
                         actual[p, "tx"] += 1
     offset_values = [offsets.get(p, 0) for p in people]
+    uniform_adjustment = len(set(offset_values)) == 1 and bool(offset_values[0])
     for kind, title in (("photo", "照光"), ("tx", "治療室"), ("wed", "週三下午"),
                         ("necessary", "必要工作"), ("all", "總工作量")):
-        shares = weights if kind == "all" and any(weights.values()) else dict.fromkeys(people, 1)
+        shares = dict.fromkeys(people, 1)
         scale = sum(shares.values())
         shifts = {p: offsets.get(p, 0) if kind in ("photo", "necessary", "all") else 0
                   for p in people}
@@ -163,7 +164,7 @@ def balance_pgy(inp, slots, log, warnings):
         spread = (max(actual[p, kind] - shifts[p] for p in people)
                   - min(actual[p, kind] - shifts[p] for p in people))
         if (any(abs(actual[p, kind] - targets[p]) > 1 for p in people)
-                or (kind != "all" and spread > 1)):
+                or spread > 1):
             warnings.append(f"PGY {title}未完全平衡（請假、鎖定、必要人力與每週跟診優先）："
                             + "、".join(f"{p} {actual[p, kind]} 次／目標 {targets[p]:.1f}" for p in people))
         if kind not in ("photo", "necessary", "all"):
@@ -171,8 +172,17 @@ def balance_pgy(inp, slots, log, warnings):
         for p in people:
             requested = (round(sum(actual[q, kind] for q in people) * shares[p] / scale)
                          + offsets.get(p, 0))
+            if not uniform_adjustment and len(people) > 1:
+                # An absolute rounded request only breaks fairness ties. A
+                # peer far below the shared target (e.g. long leave) cannot
+                # define whether this person's reduction succeeded.
+                fair_floor = pool // scale
+                comparable = [actual[q, kind] - shifts[q] for q in people
+                              if q != p and actual[q, kind] - shifts[q] >= fair_floor]
+                requested = min(comparable, default=fair_floor) + shifts[p]
+            requested = max(0, requested)
             if offsets.get(p, 0) < 0 and actual[p, kind] > requested:
                 warnings.append(f"PGY {p} {title}減量目標未達：實排 {actual[p, kind]} 次，"
-                                f"調整後目標 {max(0, requested)} 次；必要人力、鎖定與每週最低跟診優先")
-    if len(set(offset_values)) == 1 and offset_values[0]:
-        warnings.append("PGY 全員設定相同照光調整：必要工作總人力固定，無法讓全員同時增減；仍依可工作時段比例分配")
+                                f"調整後目標 {requested} 次；必要人力、鎖定與每週最低跟診優先")
+    if uniform_adjustment:
+        warnings.append("PGY 全員設定相同照光調整：必要工作總人力固定，無法讓全員同時增減；仍盡量平均分配")

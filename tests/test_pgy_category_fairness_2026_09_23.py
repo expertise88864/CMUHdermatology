@@ -2,6 +2,7 @@
 from collections import Counter, defaultdict
 from datetime import date
 
+import pytest
 from ortools.sat.python import cp_model
 
 from cmuh_common.roster.pgy_workload import workload_goals
@@ -53,10 +54,13 @@ def test_october_duty_counts_are_equalized_before_clinic_compensation():
     photo = {p: solver.value(selected[p]["photo"]) for p in people}
     tx = {p: solver.value(selected[p]["tx"]) for p in people}
     follow = {p: solver.value(selected[p]["follow"]) for p in people}
+    work = {p: photo[p] + tx[p] + follow[p] for p in people}
     assert photo["A"] == 8
     assert max(photo[p] for p in "BCD") - min(photo[p] for p in "BCD") <= 1
     assert list(tx.values()) == [9, 9, 9, 9]
-    assert follow["C"] > reported["C"][3]
+    assert max(work[p] - (-2 if p == "A" else 0) for p in people) - min(
+        work[p] - (-2 if p == "A" else 0) for p in people) <= 1
+    assert work["C"] < sum(reported["C"][i] for i in (0, 1, 3))
 
 
 def test_report_total_does_not_count_wednesday_twice():
@@ -68,7 +72,110 @@ def test_report_total_does_not_count_wednesday_twice():
     assert "週三下午照光已包含在照光次數內" in report
 
 
-def test_availability_weighted_total_is_not_reported_as_unbalanced():
+@pytest.mark.parametrize(("people", "total", "original_counts", "expected", "kind"), [
+    ("ABCD", 42, (8, 11, 11, 12), (9, 11, 11, 11), "photo"),
+    ("AB", 40, (18, 22), (19, 21), "photo"),
+    ("ABCD", 98, (22, 25, 25, 26), (23, 25, 25, 25), "all"),
+])
+def test_manual_offset_uses_shifted_pool(people, total, original_counts, expected, kind):
+    model = cp_model.CpModel()
+    assignments = {p: model.new_int_var(0, total, p) for p in people}
+    model.add(sum(assignments.values()) == total)
+    totals = defaultdict(list)
+    original = Counter()
+    for p, n in zip(people, original_counts, strict=True):
+        for duty in (("photo", "necessary", "all") if kind == "photo" else ("all",)):
+            totals[p, duty] = [assignments[p]]
+            original[p, duty] = n
+    phases, _, _ = workload_goals(model, list(people), totals, original,
+                                  dict.fromkeys(people, 1), {"A": -2})
+    solver = cp_model.CpSolver()
+    for terms in phases:
+        expression = sum(terms)
+        model.minimize(expression)
+        assert solver.solve(model) == cp_model.OPTIMAL
+        model.add(expression == solver.value(expression))
+    assert tuple(solver.value(assignments[p]) for p in people) == expected
+
+
+def test_relative_fair_offset_does_not_warn_of_absolute_rounding_shortfall():
+    from cmuh_common.roster.pgy_balance import balance_pgy
+
+    days = [date(2026, 10, n) for n in range(1, 31) if date(2026, 10, n).weekday() < 5][:21]
+    grid = {d: {s: ["101"] for s in ("上午", "下午")} for d in days}
+    members = list("A" * 9 + "B" * 11 + "C" * 11 + "D" * 11)
+    slots = {d.isoformat(): {s: {PHOTO: [members[2 * i + j]]}
+                                for j, s in enumerate(("上午", "下午"))}
+             for i, d in enumerate(days)}
+    inp = DaySolveInput("2026-10", grid, list("ABCD"), pgy_photo_offsets={"A": -2},
+                        locked={iso: ss for iso, ss in slots.items()})
+    warnings = []
+    balance_pgy(inp, slots, [], warnings)
+    assert not any("A 照光減量目標未達" in warning for warning in warnings)
+
+
+def test_relative_reduction_shortfall_still_warns():
+    from cmuh_common.roster.pgy_balance import balance_pgy
+
+    day = date(2026, 10, 1)
+    members = list("A" * 10 + "B" * 10 + "C" * 10 + "D" * 11)
+    slots = {day.isoformat(): {"上午": {PHOTO: members}}}
+    inp = DaySolveInput("2026-10", {day: {"上午": ["101"]}}, list("ABCD"),
+                        pgy_photo_offsets={"A": -1}, locked={day.isoformat(): slots[day.isoformat()]})
+    warnings = []
+    balance_pgy(inp, slots, [], warnings)
+    assert any("A 照光減量目標未達" in warning for warning in warnings)
+
+
+def test_peer_with_long_leave_does_not_define_reduction_target():
+    from cmuh_common.roster.pgy_balance import balance_pgy
+
+    days = [date(2026, 10, n) for n in range(1, 31) if date(2026, 10, n).weekday() < 5][:20]
+    grid = {d: {s: ["101"] for s in ("上午", "下午")} for d in days}
+    members = list("A" * 10 + "B" * 5 + "C" * 12 + "D" * 13)
+    slots = {d.isoformat(): {s: {PHOTO: [members[2 * i + j]]}
+                                for j, s in enumerate(("上午", "下午"))}
+             for i, d in enumerate(days)}
+    inp = DaySolveInput("2026-10", grid, list("ABCD"), pgy_photo_offsets={"A": -2},
+                        locked={iso: ss for iso, ss in slots.items()})
+    inp.leaves = {"pgy": {"B": set(days[8:])}}
+    warnings = []
+    balance_pgy(inp, slots, [], warnings)
+    assert any("照光未完全平衡" in warning for warning in warnings)
+    assert not any("A 照光減量目標未達" in warning for warning in warnings)
+
+
+def test_zero_assignments_do_not_report_an_impossible_negative_target():
+    from cmuh_common.roster.pgy_balance import balance_pgy
+
+    inp = DaySolveInput("2026-10", {}, list("AB"), pgy_photo_offsets={"A": -2})
+    warnings = []
+    balance_pgy(inp, {}, [], warnings)
+    assert not any("減量目標未達" in warning for warning in warnings)
+
+
+def test_unlocked_42_photo_assignments_rebalance_end_to_end():
+    from cmuh_common.roster.pgy_balance import balance_pgy
+
+    days = [date(2026, 10, n) for n in range(1, 31) if date(2026, 10, n).weekday() < 5][:21]
+    grid = {d: {s: ["101", "102"] for s in ("上午", "下午")} for d in days}
+    owners = list("A" * 8 + "B" * 11 + "C" * 11 + "D" * 12)
+    slots = {}
+    for i, d in enumerate(days):
+        for j, s in enumerate(("上午", "下午")):
+            p = owners[2 * i + j]
+            rotated = list("ABCD")
+            rotated.remove(p)
+            slots.setdefault(d.isoformat(), {})[s] = {
+                PHOTO: [p], TREATMENT: [rotated[0]],
+                "101": [rotated[1]], "102": [rotated[2]]}
+    inp = DaySolveInput("2026-10", grid, list("ABCD"), pgy_photo_offsets={"A": -2})
+    balance_pgy(inp, slots, [], [])
+    photo = Counter(p for ss in slots.values() for cells in ss.values() for p in cells[PHOTO])
+    assert tuple(photo[p] for p in "ABCD") == (9, 11, 11, 11)
+
+
+def test_unequal_total_with_leave_is_reported_as_unbalanced():
     from cmuh_common.roster.pgy_balance import balance_pgy
 
     first, second = date(2026, 9, 1), date(2026, 9, 2)
@@ -80,7 +187,7 @@ def test_availability_weighted_total_is_not_reported_as_unbalanced():
              second.isoformat(): {s: {PHOTO: ["B"]} for s in ("上午", "下午")}}
     warnings = []
     balance_pgy(inp, slots, [], warnings)
-    assert not any("總工作量未完全平衡" in warning for warning in warnings)
+    assert any("總工作量未完全平衡" in warning for warning in warnings)
 
 
 def test_zero_availability_does_not_crash_workload_report():
@@ -121,7 +228,12 @@ def test_october_with_leave_and_two_clerk_courses_keeps_duties_even():
     assert stats["A"]["photo"] == 8
     assert max(stats[p]["photo"] for p in "BCD") - min(stats[p]["photo"] for p in "BCD") <= 1
     assert {stats[p]["tx"] for p in "ABCD"} == {9}
+    assert max(stats[p]["photo_wed_pm"] for p in "ABCD") - min(
+        stats[p]["photo_wed_pm"] for p in "ABCD") <= 1
     assert stats["A"]["photo"] < min(stats[p]["photo"] for p in "BCD")
+    work = {p: stats[p]["photo"] + stats[p]["tx"] + stats[p]["follow"] for p in "ABCD"}
+    adjusted = {p: work[p] + (2 if p == "A" else 0) for p in "ABCD"}
+    assert max(adjusted.values()) - min(adjusted.values()) <= 1, work
     assert all(len(cells.get(PHOTO, [])) == 1 for ss in slots.values() for cells in ss.values())
     assert all(len(cells.get(TREATMENT, [])) == (d.weekday() != 2 or s != "下午")
                for iso, ss in slots.items() for s, cells in ss.items()

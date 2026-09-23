@@ -597,14 +597,14 @@
       "remote_path": "src/cmuh_common/roster/pgy_balance.py",
       "local_filename": "src/cmuh_common/roster/pgy_balance.py",
       "version": "2026.09.23.1",
-      "sha256": "f99d9ac86b027e85eadbe400aec94b85dc4130204ffce9d293eafa0e8e47e8fc"
+      "sha256": "ceac8730e12af6b58cb453235f435134b700b9d62b90ef5ab2315c3d9e407760"
     },
     {
       "key": "cmuh_common.roster.pgy_workload",
       "remote_path": "src/cmuh_common/roster/pgy_workload.py",
       "local_filename": "src/cmuh_common/roster/pgy_workload.py",
       "version": "2026.09.23.1",
-      "sha256": "9cfc825c2e7e8d648f9d230d030a7495dece6c7a108d089b0518a2b6985565e2"
+      "sha256": "ada3108aa3226b23bb7162ff1bf16d08b7b95838b02b8bd0f34e557026d4ff1e"
     },
     {
       "key": "cmuh_common.roster.report",
