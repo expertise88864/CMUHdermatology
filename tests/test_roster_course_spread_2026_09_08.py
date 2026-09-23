@@ -276,6 +276,35 @@ def test_same_week_spread_tries_an_alternate_replacement_pgy():
     assert [weekly[p] for p in ("P1", "P2", "P3")] == [1, 2, 1]
 
 
+def test_clerk_spread_never_displaces_a_pgys_only_daily_assignment():
+    donor, target = date(2026, 9, 14), date(2026, 9, 15)
+    inp = DaySolveInput(
+        "2026-09",
+        {
+            donor: {"上午": ["101"], "下午": ["101"]},
+            target: {"上午": ["101"], "下午": ["101"]},
+        },
+        ["P1"],
+        capacity=1,
+        clerk_batches=[ClerkBatch("B", donor, ["C1"])],
+    )
+    slots = {
+        donor.isoformat(): {
+            "上午": {"101": ["C1"], REST: ["P1"]},
+            "下午": {"101": ["C1"], REST: ["P1"]},
+        },
+        target.isoformat(): {
+            "上午": {"101": ["P1"], REST: ["C1"]},
+            "下午": {REST: ["P1", "C1"]},
+        },
+    }
+
+    spread_clerk_days(inp, slots)
+
+    assert slots[target.isoformat()]["上午"]["101"] == ["P1"]
+    assert "C1" not in slots[target.isoformat()]["上午"]["101"]
+
+
 def test_sequential_spreads_update_weekly_counts_without_replacements():
     donor, target = date(2026, 9, 11), date(2026, 9, 14)
     extra = [date(2026, 9, 15), date(2026, 9, 16)]

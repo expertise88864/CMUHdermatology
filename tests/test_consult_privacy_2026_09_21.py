@@ -26,3 +26,31 @@ def test_cross_patient_mentions_are_redacted_without_mutating_input():
     result = safe_entries(entries, ["a", "b"], identities.get)
     assert "測試" not in result[0][0][1] and "9876543211" not in result[0][0][1]
     assert entries[0][0][1] == "測試甲與測試乙 9876543211"
+
+
+def test_unparseable_roster_row_fail_closes_every_note_body():
+    entries = [[("原因", "測試甲與未知病人 9876543212")]]
+    result = safe_entries(
+        entries,
+        ["測試甲A1(101)9876543210"],
+        lambda _raw: {"name": "測試甲", "chart": "9876543210"},
+        identities=[{"name": "測試甲", "chart": "9876543210"}],
+        roster_complete=False,
+    )
+    assert result == [[("會診內容", UNPARSED)]]
+
+
+def test_html_scrubs_cross_patient_identity_before_line_break_rendering():
+    import consult_query as cq
+
+    html = cq._format_extracted_entries_html(
+        [[("摘要", "曾與王\n小明共同就醫")]],
+        labels=["測試甲A1(101)9876543210"],
+        privacy_identities=[
+            {"name": "測試甲", "chart": "9876543210"},
+            {"name": "王小明", "chart": "9876543211"},
+        ],
+    )
+    assert "王小明" not in html
+    assert "王<br>小明" not in html
+    assert "已隱藏" in html

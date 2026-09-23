@@ -138,10 +138,13 @@ class TestTheUnstableRosterGoesDownTheFailOpenChannel:
             lambda *a, **k: cq._RosterSnapshot(["甲1111111"], False, [], []))
         monkeypatch.setattr(cq, "_find_text_panes", lambda _c: [])
 
-        _t, _h, roster_texts = cq._extract_consult_text(1, {})
+        _t, _h, roster_texts, identities, complete = cq._extract_consult_text(1, {})
 
         assert roster_texts is None, (
             "★不穩定卻回報成有效清單★ 基準會被一份還在變的資料更新")
+        assert identities == [{"name": "甲", "ward_bed": "", "chart": "1111111",
+                               "vs": "", "date": "", "time": ""}]
+        assert complete is True
 
     def test_extract_returns_the_list_when_stable(self, monkeypatch):
         """★反方向:穩定時要正常回報★ 否則基準永遠不更新、每輪都重寄。"""
@@ -150,7 +153,7 @@ class TestTheUnstableRosterGoesDownTheFailOpenChannel:
             lambda *a, **k: cq._RosterSnapshot(["甲1111111"], True, [], []))
         monkeypatch.setattr(cq, "_find_text_panes", lambda _c: [])
 
-        _t, _h, roster_texts = cq._extract_consult_text(1, {})
+        _t, _h, roster_texts, _identities, _complete = cq._extract_consult_text(1, {})
 
         assert roster_texts == ["甲1111111"]
 
@@ -323,7 +326,7 @@ class TestOneSnapshot:
             return []
         monkeypatch.setattr(cq, "_find_text_panes", _panes)
 
-        _t, _h, roster = cq._extract_consult_text(1, {})
+        _t, _h, roster, _identities, _complete = cq._extract_consult_text(1, {})
 
         assert roster == settled_texts
         assert seen["n"] == len(snap_children), (

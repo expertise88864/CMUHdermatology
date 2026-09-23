@@ -1875,11 +1875,15 @@ def _consult_band(label: str, para: str, *, bg: str, border: str,
         f'line-height:{line_height};">{para}</div></div>')
 
 
-def _format_extracted_entries_html(entries: list, labels: list | None = None) -> str:
+def _format_extracted_entries_html(entries: list, labels: list | None = None, *,
+                                   privacy_identities=None,
+                                   roster_complete: bool = True) -> str:
     """逐病人擷取內容 → 文件式區塊:姓名(細直線)+ 會診原因(綠橫幅)+ 病情摘要
     (靛橫幅),病人間以髮絲線分隔。空回空字串。"""
     from cmuh_common.consult_privacy import safe_entries
-    entries = safe_entries(entries, labels, _parse_roster_row)
+    entries = safe_entries(
+        entries, labels, _parse_roster_row,
+        identities=privacy_identities, roster_complete=roster_complete)
     rich = [(i, panes) for i, panes in enumerate(entries, 1)
             if any((txt or "").strip() for _l, txt in panes)]
     blocks = []
@@ -2155,12 +2159,16 @@ def _is_email_trigger(trigger_label: str) -> bool:
     return trigger_label == "email"
 
 
-def _format_extracted_entries(entries: list, labels: list | None = None) -> str:
+def _format_extracted_entries(entries: list, labels: list | None = None, *,
+                              privacy_identities=None,
+                              roster_complete: bool = True) -> str:
     """把逐病人擷取結果組成信件附文。entries=[ [(label, text), ...], ... ]。
     labels(可選)為各病人的標題(對齊 entries 索引),用於以姓名標示;未提供時
     退回「病人 N」。純函式以便測試;全空回空字串(信件就不附這段)。"""
     from cmuh_common.consult_privacy import safe_entries
-    entries = safe_entries(entries, labels, _parse_roster_row)
+    entries = safe_entries(
+        entries, labels, _parse_roster_row,
+        identities=privacy_identities, roster_complete=roster_complete)
     blocks = []
     for i, panes in enumerate(entries, 1):
         texts = [(label, (text or "").strip()) for label, text in panes]
@@ -2266,14 +2274,17 @@ def _read_panes_after_change(panes: list, baseline_sig, timeout: float = 2.5,
 def _extract_consult_text(consult_hwnd: int, cfg: dict,
                           roster_label: str = "今日會診病人",
                           settled: _RosterSnapshot | None = None) -> tuple:
-    """主入口:從會診視窗擷取逐病人文字。回 (純文字版, HTML內容片段, roster_texts)。
+    """主入口:從會診視窗擷取逐病人文字。
+
+    回 (純文字版, HTML內容片段, roster_texts, privacy_identities,
+    privacy_roster_complete)。
 
     roster_texts(第三個回傳,CQ-01/02):病人清單「列字串」清單 —— None=擷取失敗/停用
     (無法判斷有沒有新會診 → 呼叫端 fail-open);[]=擷取成功但真的沒病人;[...]=清單列。
     text/html 仍為 best-effort(任何失敗回 ""),但 roster 通道讓 poll 能區分「沒新會診」
     與「解析失敗」,不再把解析失敗誤當「沒新會診」而靜默不寄。"""
     if not cfg.get("extract_text_enabled", True):
-        return "", "", None
+        return "", "", None, [], False
     try:
         # ★[2026-08-05 外審第 4 輪 P1-08/P1-09] 清單、radio、截圖是同一份快照★
         #   `settled` 由呼叫端在【截圖之前】等到穩定並傳進來(見
@@ -2305,6 +2316,17 @@ def _extract_consult_text(consult_hwnd: int, cfg: dict,
         # 不會誤把其他分頁的隱藏 radio 當成今日病人。
         roster = _format_patient_roster(roster_texts, label=roster_label)
         roster_html = _format_patient_roster_html(roster_texts, roster_label)
+        # Keep a separate immutable privacy view before an unstable roster is
+        # converted to None for poll/baseline semantics. Later extracted notes
+        # may mention a patient whose row was not reached before extraction
+        # stopped, and that identity still must be scrubbed.
+        parsed_roster = [_parse_roster_row(raw) for raw in roster_texts]
+        privacy_identities = [p for p in parsed_roster if p]
+        privacy_roster_complete = (
+            len(parsed_roster) == len(roster_texts)
+            and all(p and p.get("name") and p.get("chart")
+                    for p in parsed_roster)
+        )
         if not _roster_stable:
             # ★顯示用與判斷用要分開★ 看到什麼照樣附在信裡(上面兩行已經用過了)，
             #   但「有沒有新會診」這個判斷不能拿一份還在變的清單去做。
@@ -2316,7 +2338,8 @@ def _extract_consult_text(consult_hwnd: int, cfg: dict,
             # 抓不到文字面板:逐病人內文擷取不了,但準確的病人清單仍可寄出。
             logging.info("[consult-extract] 找不到文字面板(Memo/RichEdit)，"
                          "本次只附病人清單+截圖;請把上行控制項樹回報以便調整")
-            return roster, roster_html, roster_texts
+            return (roster, roster_html, roster_texts, privacy_identities,
+                    privacy_roster_complete)
 
         entries: list = []
         labels: list = []
@@ -2409,16 +2432,42 @@ def _extract_consult_text(consult_hwnd: int, cfg: dict,
             if entries:
                 roster_texts = None
 
-        body = _format_extracted_entries(entries, labels=labels or None)
+        body = _format_extracted_entries(
+            entries, labels=labels or None,
+            privacy_identities=privacy_identities,
+            roster_complete=privacy_roster_complete)
         text = "\n\n".join(part for part in (roster, body) if part)
-        body_html = _format_extracted_entries_html(entries, labels=labels or None)
+        body_html = _format_extracted_entries_html(
+            entries, labels=labels or None,
+            privacy_identities=privacy_identities,
+            roster_complete=privacy_roster_complete)
         html_inner = roster_html + body_html
         logging.info("[consult-extract] 擷取完成:清單 %d 位、內文區塊 %d 字",
                      len(radios) or len(entries), len(text))
-        return text, html_inner, roster_texts
+        return (text, html_inner, roster_texts, privacy_identities,
+                privacy_roster_complete)
     except Exception:
         logging.warning("[consult-extract] 擷取失敗(照常只寄截圖)", exc_info=True)
-        return "", "", None
+        return "", "", None, [], False
+
+
+def _normalize_consult_extraction(result: tuple) -> tuple:
+    """Accept the historical 3-tuple while carrying privacy identities forward."""
+    if len(result) == 5:
+        return result
+    if len(result) == 4:
+        text, html, roster_texts, identities = result
+        complete = (roster_texts is not None
+                    and len(identities) == len(roster_texts or []))
+        return text, html, roster_texts, identities, complete
+    if len(result) == 3:
+        text, html, roster_texts = result
+        identities = [p for raw in (roster_texts or [])
+                      if (p := _parse_roster_row(raw))]
+        complete = (roster_texts is not None
+                    and len(identities) == len(roster_texts or []))
+        return text, html, roster_texts, identities, complete
+    raise ValueError("unexpected consultation extraction result")
 
 
 def _validated_systemftp_pids(pids: set) -> set:
@@ -4881,10 +4930,13 @@ def _query_cycle(sess, cfg: dict, roster_label: str) -> tuple:
     #   → 信裡的清單是 Tn 的、附圖是 T0+1.8s 的,醫師拿到兩份互相矛盾的證據。
     #   固定睡的那 1.8 秒也一併拿掉(穩定判定本身就已經在等)。
     img, _snap = _capture_with_settled_roster(consult)
-    extracted, extracted_html, roster_texts = _extract_consult_text(
-        consult, cfg, roster_label, settled=_snap)
+    (extracted, extracted_html, roster_texts, privacy_identities,
+     privacy_roster_complete) = (
+        _normalize_consult_extraction(
+            _extract_consult_text(consult, cfg, roster_label, settled=_snap)))
     _return_to_main(sess, consult)
-    return img, extracted, extracted_html, roster_texts
+    return (img, extracted, extracted_html, roster_texts, privacy_identities,
+            privacy_roster_complete)
 
 
 def _automation_on_hidden(cfg: dict, roster_label: str = "今日會診病人") -> tuple:
@@ -5665,9 +5717,12 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
         #   固定的 `time.sleep(1.8)` 由穩定判定取代。
         # [新功能 2026-06-13] 先擷取原始畫面,再逐列點選擷取文字(fail-open)
         img, _snap = _capture_with_settled_roster(consult)
-        extracted, extracted_html, roster_texts = _extract_consult_text(
-            consult, cfg, roster_label, settled=_snap)
-        return img, extracted, extracted_html, roster_texts, _login_token
+        (extracted, extracted_html, roster_texts, privacy_identities,
+         privacy_roster_complete) = (
+            _normalize_consult_extraction(
+                _extract_consult_text(consult, cfg, roster_label, settled=_snap)))
+        return (img, extracted, extracted_html, roster_texts,
+                privacy_identities, privacy_roster_complete, _login_token)
 
     except BaseException as e:
         # ★這條路也要設冷卻★(外審 CQ-BA 第 1 輪 P1):原本只有常駐冷啟動會設。
@@ -7372,6 +7427,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                 else:
                     logging.info("沿用上一次 attempt 已查到的會診結果(HIS 不重查)")
                 (shot, extracted_text, extracted_html, roster_texts,
+                 privacy_identities, privacy_roster_complete,
                  _flow_token) = his_result
                 # [2026-06-25] 輪詢 poll:只在「出現新病歷號」時才寄;否則靜默結束
                 # (不寄、不更新基準 → 下一輪仍會再比對)。email/手動觸發不受此限,照常無條件寄。
@@ -7513,9 +7569,8 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     date_str, time_str,
                     (_poll_extract_note + "\n" + body) if _poll_extract_note else body,
                     punch_html + extracted_html, _account_note)
-                identities = [p for raw in (roster_texts or []) if (p := _parse_roster_row(raw))]
-                final_body = scrub(final_body, identities)
-                final_html = scrub(final_html, identities)
+                final_body = scrub(final_body, privacy_identities)
+                final_html = scrub(final_html, privacy_identities)
                 # ★[2026-07-30 外審 P2-01] 寄信前先確認「我還是現役嗎」★
                 #   這段流程可能跑很久（HIS 慢/凍結/登入重試）。超過 gate 的
                 #   stale_after_sec（45 分）之後，新的一輪已經接手在做同一件事；

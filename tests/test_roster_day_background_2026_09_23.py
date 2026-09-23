@@ -13,8 +13,8 @@ from cmuh_common.roster.ui import day_tab
 
 
 def test_day_dependency_preflight_rejects_wrong_version(monkeypatch):
-    monkeypatch.setattr(day_tab.importlib, "import_module",
-                        lambda _name: SimpleNamespace(__version__="0.0.0"))
+    monkeypatch.setattr(day_tab.importlib.util, "find_spec", lambda _name: object())
+    monkeypatch.setattr(day_tab.importlib.metadata, "version", lambda _name: "0.0.0")
     with pytest.raises(RuntimeError, match="版本不符"):
         day_tab._verify_day_solver_dependency()
 
@@ -58,7 +58,7 @@ def test_optional_solver_install_failure_keeps_manual_tab_open(tab, monkeypatch)
                         lambda: (_ for _ in ()).throw(RuntimeError("未安裝")))
     monkeypatch.setattr(day_tab.messagebox, "askyesno", lambda *_a, **_k: True)
     monkeypatch.setattr(day_tab, "ensure_dependencies",
-                        lambda _deps: (_ for _ in ()).throw(SystemExit(1)))
+                        lambda _deps, **_kwargs: (_ for _ in ()).throw(SystemExit(1)))
     monkeypatch.setattr(tab, "_solve_day_async", lambda: attempts.append("solve"))
 
     tab._on_auto()
@@ -67,6 +67,7 @@ def test_optional_solver_install_failure_keeps_manual_tab_open(tab, monkeypatch)
 
 
 def test_optional_solver_install_runs_on_tk_thread(tab, monkeypatch):
+    monkeypatch.delitem(day_tab.sys.modules, "ortools", raising=False)
     ready = [False]
     installed_by = []
 
@@ -74,7 +75,8 @@ def test_optional_solver_install_runs_on_tk_thread(tab, monkeypatch):
         if not ready[0]:
             raise RuntimeError("未安裝")
 
-    def install(_deps):
+    def install(_deps, **kwargs):
+        assert kwargs == {"wait_for_lock": False}
         installed_by.append(threading.get_ident())
         ready[0] = True
 
@@ -85,6 +87,27 @@ def test_optional_solver_install_runs_on_tk_thread(tab, monkeypatch):
 
     tab._on_auto()
     assert installed_by == [threading.get_ident(), "solve"]
+
+
+def test_loaded_wrong_solver_requires_restart_after_update(tab, monkeypatch):
+    calls = []
+    monkeypatch.setitem(day_tab.sys.modules, "ortools", SimpleNamespace(__version__="old"))
+    monkeypatch.setattr(
+        day_tab, "_verify_day_solver_dependency",
+        lambda: (_ for _ in ()).throw(RuntimeError("版本不符")),
+    )
+    monkeypatch.setattr(day_tab.messagebox, "askyesno", lambda *_a, **_k: True)
+    monkeypatch.setattr(day_tab, "ensure_dependencies",
+                        lambda _deps, **_kwargs: calls.append("installed"))
+    errors = []
+    monkeypatch.setattr(day_tab.messagebox, "showerror",
+                        lambda *args, **_kwargs: errors.append(args))
+    monkeypatch.setattr(tab, "_solve_day_async", lambda: calls.append("solve"))
+
+    tab._on_auto()
+
+    assert calls == ["installed"]
+    assert errors and "請重新啟動排班程式" in str(errors[0])
 
 
 def test_pgy_only_solve_keeps_tk_responsive_and_cancel_discards_result(tab, monkeypatch):
@@ -167,16 +190,31 @@ def test_solver_error_reports_and_reenables_button(tab, monkeypatch):
 
 
 def test_missing_dependency_reports_and_reenables_button(tab, monkeypatch):
+    monkeypatch.delitem(day_tab.sys.modules, "ortools", raising=False)
     errors = []
     monkeypatch.setattr(day_tab, "_verify_day_solver_dependency",
                         lambda: (_ for _ in ()).throw(RuntimeError("請重新啟動排班程式")))
     monkeypatch.setattr(day_tab.messagebox, "askyesno", lambda *_a, **_k: True)
-    monkeypatch.setattr(day_tab, "ensure_dependencies", lambda _deps: None)
+    monkeypatch.setattr(day_tab, "ensure_dependencies", lambda _deps, **_kwargs: None)
     monkeypatch.setattr(day_tab.messagebox, "showerror", lambda *a, **_k: errors.append(a))
     tab._on_auto()
     assert _pump(tab, lambda: not tab._day_solving)
     assert errors and "請重新啟動排班程式" in str(errors[0])
     assert str(tab._auto_btn["state"]) == "normal"
+
+
+def test_preflight_rejects_a_stale_loaded_solver_even_when_metadata_is_current(
+        monkeypatch):
+    monkeypatch.setattr(day_tab.importlib.util, "find_spec", lambda _name: object())
+    monkeypatch.setattr(
+        day_tab.importlib.metadata, "version",
+        lambda _name: day_tab.ORTOOLS_PINNED_VERSION,
+    )
+    monkeypatch.setitem(
+        day_tab.sys.modules, "ortools", SimpleNamespace(__version__="0.0.0"))
+
+    with pytest.raises(day_tab._DaySolverRestartRequired, match="重新啟動"):
+        day_tab._verify_day_solver_dependency()
 
 
 def test_closing_tab_while_solving_stops_worker_callback(tab, monkeypatch):

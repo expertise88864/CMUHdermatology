@@ -725,7 +725,7 @@ class TestTheHeaderReadsTheServingSession:
             '(*result, getattr(sess, "login_token", None))') == 2, (
             "hidden 路徑(含掉線恢復那條)沒有把 session 的 token 附上")
         src_sw = inspect.getsource(cq._run_with_sw_hide)
-        assert "roster_texts, _login_token" in src_sw, (
+        assert "privacy_roster_complete, _login_token" in src_sw, (
             "SW_HIDE 後備沒有把自己的 token 附上")
 
 

@@ -2,7 +2,9 @@
 
 from copy import deepcopy
 
-from scripts.benchmark_day_roster import _hard_checks, make_case, run_once
+from scripts.benchmark_day_roster import (
+    _activity_loss_issues, _hard_checks, make_case, run_once,
+)
 
 from cmuh_common.roster.solve_day import REST, month_solve_day
 
@@ -47,3 +49,15 @@ def test_hard_checks_reject_family_outside_selected_half_day():
     resting = deepcopy(slots)
     resting.setdefault("2026-10-01", {}).setdefault("上午", {}).setdefault(REST, []).append("F1")
     assert "2026-10-01/上午/F1:family-unavailable" not in _hard_checks(inp, resting)
+
+
+def test_activity_detector_reports_a_created_full_day_rest():
+    issues = _activity_loss_issues(
+        "pgy_balance",
+        {("2026-10-05", "P1"), ("2026-10-05", "P2")},
+        {("2026-10-05", "P2")},
+    )
+
+    assert issues == [
+        "2026-10-05/P1:pgy-full-day-rest-created-by-pgy_balance"
+    ]

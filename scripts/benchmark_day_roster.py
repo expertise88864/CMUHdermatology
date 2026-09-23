@@ -108,7 +108,26 @@ def make_case(name: str):
                             if any(grid[d].values())})
 
 
-def _hard_checks(inp, slots):
+def _active_pgy_days(inp, slots):
+    from cmuh_common.roster.solve_day import REST
+
+    return {
+        (iso, person)
+        for iso, sessions in slots.items()
+        for person in inp.pgy_roster
+        if any(person in people for cells in sessions.values()
+               for room, people in cells.items() if room != REST)
+    }
+
+
+def _activity_loss_issues(stage, active_before, active_after):
+    return [
+        f"{iso}/{person}:pgy-full-day-rest-created-by-{stage}"
+        for iso, person in sorted(set(active_before) - set(active_after))
+    ]
+
+
+def _hard_checks(inp, slots, activity_issues=()):
     from cmuh_common.roster.solve_day import (
         PHOTO, TREATMENT, REST, TWO_PGY_PHOTO_ONLY, is_follow_slot)
     from cmuh_common.roster.session_leave import on_leave
@@ -151,10 +170,11 @@ def _hard_checks(inp, slots):
                 issues.append(f"{iso}/{session}:lock-changed")
             if d.weekday() == 2 and session == "下午" and cells.get(TREATMENT):
                 issues.append(f"{iso}/{session}:unexpected-treatment")
+    issues.extend(activity_issues)
     return issues
 
 
-def _quality(inp, slots):
+def _quality(inp, slots, activity_issues=()):
     from cmuh_common.roster.solve_day import person_course_stats
     from cmuh_common.roster.training_bands import training_warnings
 
@@ -167,7 +187,7 @@ def _quality(inp, slots):
     per_person = {p: {k: all_counts.get(p, {}).get(k, 0)
                       for k in ("photo", "tx", "follow", "biopsy")}
                   for p in sorted(participants)}
-    return {"hard_issues": _hard_checks(inp, slots),
+    return {"hard_issues": _hard_checks(inp, slots, activity_issues),
             "pgy_workload": totals,
             "pgy_workload_range": max(totals.values()) - min(totals.values()) if totals else 0,
              "sample_month_person_counts": per_person,
@@ -176,7 +196,7 @@ def _quality(inp, slots):
 
 def run_once(inp):
     from ortools.sat.python import cp_model
-    from cmuh_common.roster import course_balance, pgy_balance, solve_day
+    from cmuh_common.roster import course_balance, follow_priority, pgy_balance, solve_day
 
     phase_times = Counter()
     statuses = []
@@ -196,15 +216,26 @@ def run_once(inp):
                                         if proved_or_feasible else None)})
         return result
 
+    activity_issues = []
+
     def timed(module, name, label, stack):
         original = getattr(module, name)
 
         def wrapped(*args, **kwargs):
             started = time.perf_counter()
             stage_stack.append(label)
+            active_before = (
+                _active_pgy_days(args[0], args[1])
+                if label in {"clerk_spread", "pgy_balance"} and len(args) >= 2
+                else set()
+            )
             try:
                 return original(*args, **kwargs)
             finally:
+                if active_before:
+                    active_after = _active_pgy_days(args[0], args[1])
+                    activity_issues.extend(_activity_loss_issues(
+                        label, active_before, active_after))
                 stage_stack.pop()
                 phase_times[label] += time.perf_counter() - started
 
@@ -218,6 +249,7 @@ def run_once(inp):
         stack.enter_context(patch.object(cp_model.CpSolver, "solve", tracked_solve))
         timed(solve_day, "_month_solve_attendance", "attendance", stack)
         timed(course_balance, "add_external", "training", stack)
+        timed(follow_priority, "spread_clerk_days", "clerk_spread", stack)
         timed(pgy_balance, "balance_pgy", "pgy_balance", stack)
         timed(course_balance, "balance_rooms", "doctor_diversity", stack)
         try:
@@ -228,7 +260,8 @@ def run_once(inp):
     return {"seconds": round(elapsed, 4),
             "stages": {k: round(v, 4) for k, v in phase_times.items()},
             "solver_statuses": statuses,
-            "quality": _quality(inp, slots) if slots is not None else None,
+            "quality": (_quality(inp, slots, activity_issues)
+                        if slots is not None else None),
             "warning_count": len(warnings) if slots is not None else None,
             "error": error}
 

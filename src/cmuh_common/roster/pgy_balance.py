@@ -21,8 +21,9 @@ def balance_pgy(inp, slots, log, warnings, *, control=None):
         raise ValueError("PGY 照光調整須為 -99 至 99 的整數")
     model = cp_model.CpModel()
     totals, weekly, previous = defaultdict(list), defaultdict(list), Counter()
+    daily_work = defaultdict(list)
     choices, changes = [], []
-    original_counts = Counter()
+    original_counts, original_daily_work = Counter(), Counter()
     for iso, ss in sorted(slots.items()):
         try:
             d = date.fromisoformat(iso)
@@ -43,6 +44,8 @@ def balance_pgy(inp, slots, log, warnings, *, control=None):
             candidates = [p for _, _, p in movable]
             assignments = defaultdict(list)
             for room, index, original in positions:
+                if room != REST:
+                    original_daily_work[d, original] += 1
                 if room == PHOTO:
                     kinds = ["photo", "necessary", "all"]
                     if d.weekday() == 2 and s == "下午":
@@ -55,6 +58,8 @@ def balance_pgy(inp, slots, log, warnings, *, control=None):
                     previous[week, original] += 1
                 original_counts.update((original, kind) for kind in kinds)
                 if (room, index, original) not in movable:
+                    if room != REST:
+                        daily_work[d, original].append(1)
                     for kind in kinds:
                         totals[original, kind].append(1)
                     if "follow" in kinds:
@@ -69,6 +74,8 @@ def balance_pgy(inp, slots, log, warnings, *, control=None):
                     choices.append((cells, room, index, p, var))
                     if p != original:
                         changes.append(var)
+                    if room != REST:
+                        daily_work[d, p].append(var)
                     for kind in kinds:
                         totals[p, kind].append(var)
                     if "follow" in kinds:
@@ -78,6 +85,12 @@ def balance_pgy(inp, slots, log, warnings, *, control=None):
                 model.add(sum(variables) == 1)
     for key, count in previous.items():
         model.add(sum(weekly[key]) >= min(1, count))
+    # Fairness may exchange work and rest seats within a half-day, but it must
+    # not turn somebody who originally worked that day into a full-day rest.
+    # Existing leave/lock-driven full-day rests remain untouched.
+    for key, count in original_daily_work.items():
+        if count:
+            model.add(sum(daily_work[key]) >= 1)
     # Protect each achieved weekly minimum and the week's total target credit.
     # A second clinic can move between PGYs to spread monthly shortages fairly;
     # pinning every person's second clinic stranded one person at 8 vs 10/10/10.

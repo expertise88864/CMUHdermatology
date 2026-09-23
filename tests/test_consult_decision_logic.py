@@ -41,13 +41,16 @@ class _JobHarness:
     """monkeypatch _do_full_job 的全部重依賴,記錄決策結果。"""
 
     def __init__(self, monkeypatch, cfg, fail_times=0, extracted_text="",
-                 roster_texts=_DERIVE):
+                 roster_texts=_DERIVE, privacy_identities=None,
+                 privacy_roster_complete=True):
         self.sent = []          # [(recipients, subject)]
         self.bodies = []        # 寄出的純文字內文
         self.html_bodies = []   # 寄出的 HTML 內文
         self.attachments = []   # 不可附未去識別的 HIS 截圖
         self.extracted_text = extracted_text
         self.roster_texts = roster_texts   # None=解析失敗/停用、[]=無病人、[...]=清單列
+        self.privacy_identities = list(privacy_identities or [])
+        self.privacy_roster_complete = privacy_roster_complete
         self.flow_runs = 0
         self.kills = 0
         self.sleeps = []
@@ -72,7 +75,10 @@ class _JobHarness:
                 # 未明指 → 由當前 extracted_text 動態導出(truthy→單列、空→[]);
                 # 讓多輪測試改 h.extracted_text 後 signature 也跟著更新。
                 roster = [self.extracted_text] if self.extracted_text else []
+            identities = self.privacy_identities or [
+                p for raw in (roster or []) if (p := cq._parse_roster_row(raw))]
             return (Path("C:/fake/shot.png"), self.extracted_text, "", roster,
+                    identities, self.privacy_roster_complete,
                     {"seq": 1, "user": "101358", "backup": False,
                      "consumed": True})
         monkeypatch.setattr(cq, "run_consult_flow", _flow)
@@ -138,6 +144,21 @@ def test_route_scheduled_uses_general_recipients(monkeypatch):
     h = _JobHarness(monkeypatch, _base_cfg())
     cq._do_full_job("17:00")
     assert h.sent[0][0] == ["sched_a@x.tw", "sched_b@x.tw"]
+
+
+def test_unstable_roster_still_scrubs_all_observed_patient_identities(monkeypatch):
+    h = _JobHarness(
+        monkeypatch, _base_cfg(),
+        extracted_text="前一位紀錄提到王小明，病歷號 00123456",
+        roster_texts=None,
+        privacy_identities=[{"name": "王小明", "chart": "00123456"}],
+    )
+
+    cq._do_full_job("email", override_recipients=["doctor@example.test"])
+
+    assert "王小明" not in h.bodies[0]
+    assert "00123456" not in h.bodies[0]
+    assert "[已隱藏]" in h.bodies[0]
 
 
 def test_subject_time_uses_trigger_label_when_clock_format(monkeypatch):
@@ -701,11 +722,13 @@ def test_grid_fallback_none_only_when_entries_found(monkeypatch):
     monkeypatch.setattr(cq, "_find_text_panes", lambda ch: ["pane"])  # 有面板 → 不早退
     # (a) 面板有病人內容 → entries 非空 → roster None(fail-open)
     monkeypatch.setattr(cq, "_read_panes_snapshot", lambda panes: [("內容1", "病人甲內容")])
-    _t, _h, roster = cq._extract_consult_text(123, {"extract_text_enabled": True})
+    _t, _h, roster, _identities, _complete = cq._extract_consult_text(
+        123, {"extract_text_enabled": True})
     assert roster is None
     # (b) 面板空(今天沒病人)→ entries 空 → roster 維持 []
     monkeypatch.setattr(cq, "_read_panes_snapshot", lambda panes: [("內容1", "")])
-    _t2, _h2, roster2 = cq._extract_consult_text(123, {"extract_text_enabled": True})
+    _t2, _h2, roster2, _identities2, _complete2 = cq._extract_consult_text(
+        123, {"extract_text_enabled": True})
     assert roster2 == []
 
 

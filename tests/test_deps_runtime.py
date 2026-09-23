@@ -328,6 +328,21 @@ def test_a_cold_start_waits_instead_of_exiting(monkeypatch, tmp_path):
     dr._release_repair_lock(reacquired, str(lock))
 
 
+def test_ui_runtime_check_does_not_wait_for_repair_lock(monkeypatch, tmp_path):
+    lock, ran = _lock_env(monkeypatch, tmp_path, is_child=False)
+    holder = dr._acquire_repair_lock(str(lock))
+    try:
+        with pytest.raises(RuntimeError, match="稍後再試"):
+            dr.ensure_dependencies(
+                [("demo", "json")],
+                deps_cache_filename=".no-such-cache",
+                wait_for_lock=False,
+            )
+        assert ran == []
+    finally:
+        dr._release_repair_lock(holder, str(lock))
+
+
 def test_an_unowned_marker_is_immediately_reusable(monkeypatch, tmp_path):
     # File age says nothing about ownership; even a fresh orphan is reusable.
     lock, ran = _lock_env(monkeypatch, tmp_path, is_child=True)

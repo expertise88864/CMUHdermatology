@@ -9,10 +9,12 @@ PGY 與 Clerk 共用同一份 day_slots（同時段一起填），故兩個分�
 """
 from __future__ import annotations
 
-import importlib
+import importlib.metadata
+import importlib.util
 import logging
 import os
 import re
+import sys
 import threading
 import time
 import tkinter as tk
@@ -45,17 +47,27 @@ _IDLE_HINT = ("就緒｜月曆格：點擊＝編輯/鎖定選單；滾輪捲動�
               "｜列表檢視：雙擊列＝編輯、選取後可按🔒")
 
 
+class _DaySolverRestartRequired(RuntimeError):
+    """A stale in-memory solver cannot be repaired safely without restart."""
+
+
 def _verify_day_solver_dependency() -> None:
     """Fail quickly if the installed solver package is absent or not pinned."""
     try:
-        installed = importlib.import_module("ortools")
-    except ImportError as exc:
+        if importlib.util.find_spec("ortools") is None:
+            raise importlib.metadata.PackageNotFoundError("ortools")
+        version = importlib.metadata.version("ortools")
+    except importlib.metadata.PackageNotFoundError as exc:
         raise RuntimeError("排班引擎未安裝") from exc
-    version = getattr(installed, "__version__", None)
     if version != ORTOOLS_PINNED_VERSION:
         raise RuntimeError(
             f"排班引擎版本不符（目前 {version or '未知'}，需要 "
             f"{ORTOOLS_PINNED_VERSION}）")
+    loaded = sys.modules.get("ortools")
+    loaded_version = getattr(loaded, "__version__", None) if loaded is not None else None
+    if loaded is not None and loaded_version != ORTOOLS_PINNED_VERSION:
+        raise _DaySolverRestartRequired(
+            "排班引擎已在本次執行中載入舊版本，請重新啟動排班程式")
 
 
 def _split_codes(text: str) -> list:
@@ -454,6 +466,10 @@ class DayScheduleTab(ttk.Frame):
             return
         try:
             _verify_day_solver_dependency()
+        except _DaySolverRestartRequired as stale:
+            messagebox.showerror("排班引擎需要重啟", str(stale), parent=self)
+            self._status.set("排班引擎已更新；請重新啟動排班程式")
+            return
         except RuntimeError as missing:
             if not messagebox.askyesno(
                     "需要排班引擎",
@@ -463,7 +479,10 @@ class DayScheduleTab(ttk.Frame):
             self._status.set("安裝排班引擎中；可在安裝視窗取消")
             try:
                 # 安裝器會開 Tk 視窗；必須從 Tk 主執行緒呼叫。
-                ensure_dependencies(_ORTOOLS_DEP)
+                solver_was_loaded = "ortools" in sys.modules
+                ensure_dependencies(_ORTOOLS_DEP, wait_for_lock=False)
+                if solver_was_loaded:
+                    raise RuntimeError("排班引擎已更新，請重新啟動排班程式")
                 _verify_day_solver_dependency()
             except (Exception, SystemExit) as exc:  # noqa: BLE001
                 logging.exception("[roster.ui] 安裝或驗證排班引擎失敗")

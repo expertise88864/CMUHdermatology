@@ -637,7 +637,9 @@ class RosterService:
                 except (TypeError, ValueError):
                     continue
                 if dd.isoformat()[:7] == prev_ym(ym) and dd.weekday() == 5:
-                    person = (cell or {}).get("person")
+                    if not isinstance(cell, dict):
+                        continue
+                    person = str(cell.get("person") or "")
                     if person:
                         prev_weekend_counts[person] = prev_weekend_counts.get(person, 0) + 1
         try:

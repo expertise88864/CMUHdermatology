@@ -54,6 +54,29 @@ def test_manual_reduction_reduces_photo_and_actual_total(offset):
             assert sorted(p for ps in cells.values() for p in ps) == list("ABCD")
 
 
+def test_monthly_fairness_does_not_create_a_whole_day_rest():
+    d = date(2026, 9, 7)
+    inp = DaySolveInput(
+        "2026-09",
+        {d: {"上午": [], "下午": []}},
+        ["A", "B"],
+        pgy_photo_offsets={"A": -2},
+    )
+    slots = {
+        d.isoformat(): {
+            "上午": {PHOTO: ["A"], REST: ["B"]},
+            "下午": {PHOTO: ["A"], REST: ["B"]},
+        }
+    }
+
+    balance_pgy(inp, slots, [], [])
+
+    # Without the daily guard, satisfying A:-2 moves both photo seats to B and
+    # turns A's originally active day into a whole-day rest. One move is the
+    # best admissible compromise while preserving daily participation.
+    assert sum("A" in cells.get(PHOTO, []) for cells in slots[d.isoformat()].values()) == 1
+
+
 def test_availability_counts_closed_sessions_but_not_leave_or_holidays():
     inp, _ = example()
     days = sorted(inp.grid)

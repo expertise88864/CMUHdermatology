@@ -179,6 +179,7 @@ def ensure_dependencies(
     deps_cache_filename: str = '.deps_cache',
     *,
     bootstrap: bool = False,
+    wait_for_lock: bool = True,
 ) -> None:
     """檢查並（必要時）安裝 required_libs。
 
@@ -246,6 +247,8 @@ def ensure_dependencies(
             logging.warning("[deps] 另一個行程正在修復依賴 → 本行程(重啟候選人)乾淨退出,"
                             "不重複開 pip;更新下一輪再接手")
             sys.exit(0)
+        if not wait_for_lock:
+            raise RuntimeError("另一個程式正在安裝或修復依賴，請稍後再試")
         logging.warning("[deps] 另一個行程正在修復依賴 → 等它完成")
         while _lock_fd is None:
             time.sleep(2.0)

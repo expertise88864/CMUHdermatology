@@ -236,7 +236,8 @@ def spread_clerk_days(inp, slots, *, control=None):
                     if len(cells.get(r, [])) >= inp.capacity:
                         choices = []
                         candidates = sorted(
-                            (q for q in cells.get(r, []) if q in inp.pgy_roster),
+                            (q for q in cells.get(r, [])
+                             if q in inp.pgy_roster and works(d, q) > 1),
                             key=lambda q: (-works(d, q), q),
                         )
                         for donor in donors:

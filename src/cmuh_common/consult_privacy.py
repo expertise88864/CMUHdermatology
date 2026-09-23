@@ -23,11 +23,18 @@ def scrub(text, identities):
     return text
 
 
-def safe_entries(entries, labels, parser):
+def safe_entries(entries, labels, parser, *, identities=None,
+                 roster_complete=True):
     parsed = [parser(raw) for raw in (labels or [])]
-    reliable = (len(parsed) >= len(entries)
+    reliable = (roster_complete
+                and len(parsed) >= len(entries)
                 and all(p and p.get("name") and p.get("chart") for p in parsed))
-    identities = [p for p in parsed if p]
+    privacy_identities = [p for p in parsed if p]
+    for identity in identities or ():
+        if identity and identity not in privacy_identities:
+            privacy_identities.append(identity)
+    reliable = reliable and all(
+        p.get("name") and p.get("chart") for p in privacy_identities)
     out = []
     for panes in entries:
         if not any(str(text or "").strip() for _, text in panes):
@@ -35,7 +42,9 @@ def safe_entries(entries, labels, parser):
         elif not reliable:
             out.append([("會診內容", UNPARSED)])
         else:
-            out.append([(scrub(label, identities), scrub(text, identities)) for label, text in panes])
+            out.append([(scrub(label, privacy_identities),
+                         scrub(text, privacy_identities))
+                        for label, text in panes])
     return out
 
 
