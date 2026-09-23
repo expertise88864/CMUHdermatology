@@ -233,14 +233,16 @@ class DayScheduleTab(ttk.Frame):
                   font=(_OVR_FONT, 10, "bold")).pack(anchor="w", padx=6,
                                                      pady=(6, 0))
         self._stats_pgy = ttk.Treeview(side, columns=("c", "p", "w", "t", "f",
-                                                      "r"),
+                                                      "total", "r"),
                                        show="headings", height=5)
         for c, t, w in (("c", "代號", 52), ("p", "照光", 40), ("w", "週三午", 50),
-                        ("t", "治療", 40), ("f", "跟診", 40), ("r", "放假", 40)):
+                        ("t", "治療", 40), ("f", "跟診", 40), ("total", "總量", 40),
+                        ("r", "放假", 40)):
             self._stats_pgy.heading(c, text=t)
             self._stats_pgy.column(c, width=w, anchor="center")
         self._stats_pgy.pack(fill="x", padx=6)
-        ttk.Label(side, text="照光/治療室整月盡量一致；週三下午照光另獨立輪平均",
+        ttk.Label(side, text="總量＝照光＋治療＋跟診；週三午已包含在照光。"
+                  "先平衡照光與治療，再由跟診調整總量。",
                   foreground="gray", wraplength=250,
                   justify="left").pack(anchor="w", padx=6, pady=(2, 0))
         ttk.Label(side, text="Clerk 週期統計（整梯兩週）",
@@ -329,7 +331,9 @@ class DayScheduleTab(ttk.Frame):
         for c in sorted({*roster, *stats}):
             st = stats.get(c) or dict.fromkeys(STAT_KEYS, 0)
             t.insert("", "end", values=(c, st["photo"], st["photo_wed_pm"],
-                                        st["tx"], st["follow"], st["rest"]))
+                                        st["tx"], st["follow"],
+                                        st["photo"] + st["tx"] + st["follow"],
+                                        st["rest"]))
         t2 = self._stats_clerk
         t2.delete(*t2.get_children())
         for b in data["batches"]:
@@ -658,9 +662,9 @@ class DayScheduleTab(ttk.Frame):
         dlg = tk.Toplevel(self)
         dlg.title(f"PGY 照光次數調整 · {self.app.ym}")
         dlg.transient(self.winfo_toplevel())
-        ttk.Label(dlg, text="0：依可工作時段比例分配；−1／−2：照光及總工作量減少 1／2 次。\n"
+        ttk.Label(dlg, text="0：照光與治療室盡量等次；−1／−2：照光及總工作量減少 1／2 次。\n"
                   "含週三下午照光，不以治療室或跟診補回減量；+1 則增加目標。\n"
-                  "先平衡必要工作合計，再平衡各類工作及總工作量。\n"
+                  "先平衡照光、治療室與週三下午，再由跟診平衡總工作量。\n"
                   "請假、鎖定、必要人力與每週最低跟診優先；無法達成時顯示提醒。", padding=10).pack()
         entries = {}
         for p in roster:

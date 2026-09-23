@@ -1,4 +1,4 @@
-"""Availability-weighted PGY workload goals; Wednesday photo is counted once."""
+"""Equalize PGY duties before availability-weighted total work."""
 from math import gcd
 from functools import reduce
 import heapq
@@ -33,23 +33,25 @@ def availability_weights(inp, people):
 def workload_goals(model, people, totals, original, weights, offsets):
     """Return lexicographic objectives and their incumbent values.
 
-    Required coverage fixes the total number of seats. Offsets shift a person's
-    share of that total, for photo, necessary work AND overall work. They are
-    never compensated by giving that person extra treatment or clinics.
+    Required coverage fixes the total number of seats. Photo and treatment
+    counts are shared equally among PGYs, apart from manual photo offsets.
+    Availability affects only the final total-work goal. Wednesday photo is
+    already included in photo and necessary work, so it is never counted twice.
     """
-    scale = sum(weights.values()) or len(people)
     if not any(weights.values()):
         weights = dict.fromkeys(people, 1)
     terms, scores, floors = {}, {}, {}
     request_terms, request_scores = {}, {}
-    for kind in ("necessary", "photo", "regular", "tx", "wed", "all", "follow"):
-        adjusted = kind in ("necessary", "photo", "regular", "all")
+    for kind in ("necessary", "photo", "tx", "wed", "all", "follow"):
+        shares = weights if kind == "all" else dict.fromkeys(people, 1)
+        scale = sum(shares.values())
+        adjusted = kind in ("necessary", "photo", "all")
         shifts = {p: offsets.get(p, 0) if adjusted else 0 for p in people}
         total = sum(original[p, kind] for p in people)
         pool = total - sum(shifts.values())
-        targets = {p: pool * weights[p] + scale * shifts[p] for p in people}
+        targets = {p: pool * shares[p] + scale * shifts[p] for p in people}
         floors[kind] = square_floor(total, scale, targets)
-        requested_targets = {p: scale * (round(total * weights[p] / scale) + shifts[p])
+        requested_targets = {p: scale * (round(total * shares[p] / scale) + shifts[p])
                              for p in people if shifts[p]}
         bound = max([abs(t) for t in (*targets.values(), *requested_targets.values())] + [0]) + scale * total + 1
         terms[kind], scores[kind] = [], 0
@@ -68,12 +70,12 @@ def workload_goals(model, people, totals, original, weights, offsets):
                 model.add_abs_equality(gap, scale * sum(totals[p, kind]) - requested)
                 request_terms[kind].append(gap)
                 request_scores[kind] += abs(scale * original[p, kind] - requested)
-    # First share necessary work, then its component duties. Overall workload
-    # compensates unavoidable necessary-work differences through clinics only
-    # after those higher-priority goals have been fixed.
-    groups = [(["necessary"], True), (["necessary"], False),
-              (["photo"], True), (["photo"], False),
-              (["regular", "tx", "wed"], False),
+    # Fix individual photo and treatment targets first. Follow assignments
+    # then absorb unavoidable differences while balancing the total number of
+    # worked sessions according to each person's actual availability.
+    groups = [(["photo"], True), (["photo"], False),
+              (["tx"], False), (["wed"], False),
+              (["necessary"], True), (["necessary"], False),
               (["all"], True), (["all"], False), (["follow"], False)]
     objectives, incumbent, bounds = [], [], []
     for kinds, request in groups:

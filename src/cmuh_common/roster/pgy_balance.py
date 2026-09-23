@@ -41,8 +41,9 @@ def balance_pgy(inp, slots, log, warnings):
             assignments = defaultdict(list)
             for room, index, original in positions:
                 if room == PHOTO:
-                    kinds = ["photo", "necessary", "all",
-                             "wed" if d.weekday() == 2 and s == "下午" else "regular"]
+                    kinds = ["photo", "necessary", "all"]
+                    if d.weekday() == 2 and s == "下午":
+                        kinds.append("wed")
                 elif room == TREATMENT:
                     kinds = ["tx", "necessary", "all"]
                 else:
@@ -124,14 +125,19 @@ def balance_pgy(inp, slots, log, warnings):
     for (cells, room, index, p, _), selected in zip(choices, saved, strict=True):
         if selected:
             cells[room][index] = p
-    log.append("PGY 次數平衡：依可工作時段比例，先平衡必要工作合計（照光含週三下午只計一次），"
-               "再平衡各類工作，最後用跟診平衡總工作量；照光個人調整同步調整總工作量。"
+    log.append("PGY 次數平衡：先平衡照光（個人減量除外）、治療室及週三下午，"
+               "再由跟診調整總工作量；總工作量依可工作時段比例計算。"
+               "週三下午照光已包含在照光次數，照光個人調整同步調整總工作量。"
                "保留請假、鎖定、必要人力、個人每週最低跟診及每週整體目標達成次數")
     actual = Counter()
     for iso, ss in slots.items():
         if iso[:7] != inp.ym:
             continue
-        for cells in ss.values():
+        try:
+            d = date.fromisoformat(iso)
+        except (ValueError, TypeError):
+            continue
+        for s, cells in ss.items():
             for room, members in cells.items():
                 for p in members:
                     if room in (PHOTO, TREATMENT):
@@ -141,16 +147,29 @@ def balance_pgy(inp, slots, log, warnings):
                         actual[p, "all"] += 1
                     if room == PHOTO:
                         actual[p, "photo"] += 1
-    scale = sum(weights.values()) or len(people)
+                        if d.weekday() == 2 and s == "下午":
+                            actual[p, "wed"] += 1
+                    elif room == TREATMENT:
+                        actual[p, "tx"] += 1
     offset_values = [offsets.get(p, 0) for p in people]
-    for kind, title in (("necessary", "必要工作"), ("all", "總工作量"), ("photo", "照光")):
-        pool = sum(actual[p, kind] - offsets.get(p, 0) for p in people)
-        targets = {p: pool * weights[p] / scale + offsets.get(p, 0) for p in people}
-        if any(abs(actual[p, kind] - targets[p]) > 1 for p in people):
+    for kind, title in (("photo", "照光"), ("tx", "治療室"), ("wed", "週三下午"),
+                        ("necessary", "必要工作"), ("all", "總工作量")):
+        shares = weights if kind == "all" and any(weights.values()) else dict.fromkeys(people, 1)
+        scale = sum(shares.values())
+        shifts = {p: offsets.get(p, 0) if kind in ("photo", "necessary", "all") else 0
+                  for p in people}
+        pool = sum(actual[p, kind] - shifts[p] for p in people)
+        targets = {p: pool * shares[p] / scale + shifts[p] for p in people}
+        spread = (max(actual[p, kind] - shifts[p] for p in people)
+                  - min(actual[p, kind] - shifts[p] for p in people))
+        if (any(abs(actual[p, kind] - targets[p]) > 1 for p in people)
+                or (kind != "all" and spread > 1)):
             warnings.append(f"PGY {title}未完全平衡（請假、鎖定、必要人力與每週跟診優先）："
                             + "、".join(f"{p} {actual[p, kind]} 次／目標 {targets[p]:.1f}" for p in people))
+        if kind not in ("photo", "necessary", "all"):
+            continue
         for p in people:
-            requested = (round(sum(actual[q, kind] for q in people) * weights[p] / scale)
+            requested = (round(sum(actual[q, kind] for q in people) * shares[p] / scale)
                          + offsets.get(p, 0))
             if offsets.get(p, 0) < 0 and actual[p, kind] > requested:
                 warnings.append(f"PGY {p} {title}減量目標未達：實排 {actual[p, kind]} 次，"

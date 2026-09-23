@@ -1913,11 +1913,13 @@ def format_course_stats(pgy_stats: dict, pgy_roster: list,
     batch_stats: [{"id","start","end","members","stats"}]（每梯一筆，跨月已合併）。
     """
     lines = ["【週期次數統計】",
-             "  PGY（本月）：  照光  週三午照  治療室  跟診  放假"]
+             "  PGY（本月）：  照光  週三午照  治療室  跟診  總量  放假",
+             "  總量＝照光＋治療室＋跟診；週三下午照光已包含在照光次數內。"]
     for c in sorted({*pgy_roster, *pgy_stats}):
         st = pgy_stats.get(c) or dict.fromkeys(STAT_KEYS, 0)
         lines.append(f"    {c:<8s}  {st['photo']:>3d}  {st['photo_wed_pm']:>6d}"
-                     f"  {st['tx']:>5d}  {st['follow']:>3d}  {st['rest']:>3d}")
+                     f"  {st['tx']:>5d}  {st['follow']:>3d}"
+                     f"  {st['photo'] + st['tx'] + st['follow']:>3d}  {st['rest']:>3d}")
     for b in batch_stats:
         lines.append(f"  Clerk 梯次 {b['id']}（{b['start']}～{b['end']}）："
                      f"切片  跟診  放假")
