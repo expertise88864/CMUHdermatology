@@ -136,15 +136,16 @@ def _hard_checks(inp, slots):
                     issues.append(f"{iso}/{session}/{room}:closed-room")
                 if is_follow_slot(room) and len(people) > inp.capacity:
                     issues.append(f"{iso}/{session}/{room}:capacity")
-                if room == REST:
-                    continue
                 for p in people:
                     scope = next((scope for scope in ("pgy", "clerk", "external", "family")
                                   if p in (inp.pgy_roster if scope == "pgy" else
                                            inp.external_roster if scope == "external" else
                                            inp.family_roster if scope == "family" else
                                            [c for b in inp.clerk_batches for c in b.members])), None)
-                    if scope and on_leave(inp, scope, p, d, session):
+                    if (room != REST and scope == "family"
+                            and (d, session) not in inp.family_follow.get(p, set())):
+                        issues.append(f"{iso}/{session}/{p}:family-unavailable")
+                    if room != REST and scope and on_leave(inp, scope, p, d, session):
                         issues.append(f"{iso}/{session}/{p}:on-leave")
             if session in inp.locked.get(iso, {}) and cells != inp.locked[iso][session]:
                 issues.append(f"{iso}/{session}:lock-changed")

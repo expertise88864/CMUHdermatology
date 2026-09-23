@@ -4,7 +4,7 @@ from copy import deepcopy
 
 from scripts.benchmark_day_roster import _hard_checks, make_case, run_once
 
-from cmuh_common.roster.solve_day import month_solve_day
+from cmuh_common.roster.solve_day import REST, month_solve_day
 
 
 def test_two_pgy_photo_only_sessions_pass_hard_checks():
@@ -35,3 +35,15 @@ def test_hard_checks_reject_follow_in_a_closed_room():
     bad.setdefault(first, {}).setdefault("上午", {})["999"] = ["CLOSED"]
     assert any(issue.endswith("/999:closed-room")
                for issue in _hard_checks(inp, bad))
+
+
+def test_hard_checks_reject_family_outside_selected_half_day():
+    inp = make_case("pgy4_mix2")
+    slots, _log, _warnings = month_solve_day(inp)
+    bad = deepcopy(slots)
+    bad.setdefault("2026-10-01", {}).setdefault("上午", {}).setdefault("101", []).append("F1")
+    assert "2026-10-01/上午/F1:family-unavailable" in _hard_checks(inp, bad)
+
+    resting = deepcopy(slots)
+    resting.setdefault("2026-10-01", {}).setdefault("上午", {}).setdefault(REST, []).append("F1")
+    assert "2026-10-01/上午/F1:family-unavailable" not in _hard_checks(inp, resting)
