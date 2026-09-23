@@ -16895,6 +16895,8 @@ class AutomationApp:
 
             def _txn_gate(callback, key_name, txn=_txn):
                 def _gated():
+                    if getattr(self, '_shutting_down', False) or stop_event_main.is_set():
+                        return
                     if getattr(self, '_hotkey_txn_committed', None) != txn:
                         logging.warning(
                             "[hotkey] %s 屬於未完整提交的註冊交易(txn=%s)→ 不執行",

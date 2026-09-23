@@ -50,6 +50,11 @@ def export(path: str, data: dict) -> None:
         doc.add_paragraph("")            # 週表格之間留白
 
     _add_day_schedule(doc, data)         # [RS-01] PGY/Clerk 日排班
+    explanation = data.get("day_explanation") or ""
+    if explanation:
+        doc.add_heading("實際班表統計與公平性", level=2)
+        for line in explanation.splitlines()[1:]:
+            doc.add_paragraph(line)
     doc.save(path)
 
 

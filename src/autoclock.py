@@ -1055,6 +1055,7 @@ def get_current_swipe_info(driver, wait, get_loc):
 # key=(schedule_key, username)，value=date_str；以日期判定自動跨日重置、且大小有界(覆寫同 key)。
 _clock_done_lock = threading.Lock()
 _clock_done: dict = {}
+_clock_click_pending: dict = {}
 
 
 def _mark_clock_done(schedule_key, username) -> None:
@@ -1062,6 +1063,7 @@ def _mark_clock_done(schedule_key, username) -> None:
         return
     with _clock_done_lock:
         _clock_done[(schedule_key, username)] = date.today().isoformat()
+        _clock_click_pending.pop((schedule_key, username), None)
     _save_clock_state()
 
 
@@ -1070,6 +1072,35 @@ def _is_clock_done(schedule_key, username) -> bool:
         return False
     with _clock_done_lock:
         return _clock_done.get((schedule_key, username)) == date.today().isoformat()
+
+
+def _mark_clock_click_pending(schedule_key, username) -> bool:
+    """點擊前先留下當窗意圖；正式背景模式寫盤失敗時不可冒險點擊。"""
+    if not schedule_key or not username or not _clock_state_persistence_enabled:
+        return False
+    today = date.today().isoformat()
+    with _clock_done_lock:
+        _clock_click_pending[(schedule_key, username)] = today
+    if _save_clock_state():
+        return True
+    # 這次根本沒點擊；寫盤失敗不可留下「已送出」記憶體旗標，
+    # 否則下一分鐘連重試保存狀態的機會都沒有。
+    with _clock_done_lock:
+        if _clock_click_pending.get((schedule_key, username)) == today:
+            _clock_click_pending.pop((schedule_key, username), None)
+    return False
+
+
+def _is_clock_click_pending(schedule_key, username) -> bool:
+    with _clock_done_lock:
+        return (_clock_click_pending.get((schedule_key, username))
+                == date.today().isoformat())
+
+
+def _clear_clock_click_pending(schedule_key, username) -> None:
+    with _clock_done_lock:
+        _clock_click_pending.pop((schedule_key, username), None)
+    _save_clock_state()
 
 
 # [2026-07-25 審查] 帳密錯誤的「當窗記憶」。AC-09 只讓 ClockAuthError 在【單次
@@ -1167,15 +1198,17 @@ _clock_state_persistence_enabled = False
 _clock_state_save_lock = threading.Lock()
 
 
-def _save_clock_state() -> None:
-    """把今日的 _clock_done / _missed_warned 落盤(原子寫)。未啟用或失敗 → 靜默降級。
+def _save_clock_state() -> bool:
+    """把今日的打卡狀態落盤(原子寫)；回傳是否可安全繼續。
     存檔鎖序列化整個「快照→寫檔」,避免並發後寫覆蓋。"""
     if not _clock_state_persistence_enabled:
-        return
+        return True
     today = date.today().isoformat()
     with _clock_state_save_lock:
         with _clock_done_lock:
             done = [[k, u] for (k, u), v in _clock_done.items() if v == today]
+            pending = [[k, u] for (k, u), v in _clock_click_pending.items()
+                       if v == today]
             # [2026-07-25] 帳密錯誤封鎖也要跨重啟保留,否則 watchdog 一重啟就又試 29 次
             auth = [[k, u] for (k, u), v in _auth_failed.items() if v == today]
         with _missed_warned_lock:
@@ -1183,9 +1216,12 @@ def _save_clock_state() -> None:
         try:
             atomic_write_json(str(CLOCK_STATE_FILE),
                               {"date": today, "clock_done": done,
-                               "missed_warned": warned, "auth_failed": auth})
+                               "missed_warned": warned, "auth_failed": auth,
+                               "click_pending": pending})
+            return True
         except Exception:
-            logging.debug("[clock-state] 寫盤失敗(降級純記憶體)", exc_info=True)
+            logging.exception("[clock-state] 寫盤失敗；未確認的點擊不得送出")
+            return False
 
 
 def _load_clock_state() -> None:
@@ -1200,10 +1236,13 @@ def _load_clock_state() -> None:
             return
         done_n = 0
         done_items = raw.get("clock_done") or []
+        pending_items = raw.get("click_pending") or []
         warned_items = raw.get("missed_warned") or []
         auth_items = raw.get("auth_failed") or []
         if not isinstance(done_items, list):
             done_items = []
+        if not isinstance(pending_items, list):
+            pending_items = []
         if not isinstance(warned_items, list):
             warned_items = []
         if not isinstance(auth_items, list):
@@ -1213,6 +1252,11 @@ def _load_clock_state() -> None:
                 if isinstance(item, (list, tuple)) and len(item) == 2:
                     _clock_done[(str(item[0]), str(item[1]))] = today
                     done_n += 1
+            for item in pending_items:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    key = str(item[0]), str(item[1])
+                    if key not in _clock_done:
+                        _clock_click_pending[key] = today
             for item in auth_items:
                 if isinstance(item, (list, tuple)) and len(item) == 2:
                     _auth_failed[(str(item[0]), str(item[1]))] = today
@@ -1367,6 +1411,9 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                                  check_start: dt_time, check_end: dt_time,
                                  dry_run: bool = False,
                                  task_label: str = "") -> None:
+    pending_key = task_label or (
+        f"manual:{'in' if is_in else 'out'}:{check_start}-{check_end}")
+
     def get_loc(key):
         return (getattr(By, LOCATORS[key][0].upper()), LOCATORS[key][1])
 
@@ -1394,6 +1441,13 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                     acc["username"], check_start, check_end, act_name)
                 # [fix] 已有紀錄=本窗確認完成 → 標記，後續 re-fire 直接略過不再登入
                 _mark_clock_done(task_label, acc["username"])
+                if pending_key != task_label:
+                    _clear_clock_click_pending(pending_key, acc["username"])
+                return
+            if not dry_run and _is_clock_click_pending(pending_key, acc["username"]):
+                logging.warning(
+                    "%s 本窗已送出打卡但官方紀錄仍未確認；本次只回讀、不重複點擊。"
+                    "請確認電子刷卡系統，必要時人工處理。", acc["username"])
                 return
             if not dry_run:
                 logging.info(
@@ -1434,6 +1488,12 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                     "避免遲到紀錄,交補卡提醒。", acc.get("username", "?"), act_name, check_end)
                 return
 
+            # 點擊可能已送達但回應遺失；先持久記錄，再送出一次。
+            # 若狀態檔寫不下去，重啟後無法防重，故這次不點。
+            if not _mark_clock_click_pending(pending_key, acc["username"]):
+                logging.error("%s 無法保存待確認打卡狀態，本次不點擊；請人工確認",
+                              acc["username"])
+                return
             driver.execute_script("arguments[0].click();", exec_btn)
 
             try:
@@ -1450,10 +1510,12 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                 logging.info("%s %s 打卡成功(已重讀刷卡表確認紀錄)！",
                              acc["username"], act_name)
                 _mark_clock_done(task_label, acc["username"])
+                if pending_key != task_label:
+                    _clear_clock_click_pending(pending_key, acc["username"])
             else:
                 logging.warning(
                     "%s %s 打卡已送出,但重讀刷卡表未能確認到紀錄 — 不標記完成,"
-                    "下次 re-fire 會重讀確認(避免假成功漏打卡)。",
+                    "下次 re-fire 只會重讀，不會重複點擊；必要時人工處理。",
                     acc["username"], act_name)
             return
 

@@ -1289,12 +1289,17 @@ def biopsy_quota_warnings(batches, counts, *, batch_more=(),
     return out, flagged
 
 
-def month_solve_day(inp: DaySolveInput) -> tuple:
+def month_solve_day(inp: DaySolveInput, *, control=None) -> tuple:
     from .course_balance import finish_courses
-    return finish_courses(inp, *_month_solve_attendance(inp))
+    if control is not None:
+        control.checkpoint("安排基本人力與請假")
+    attendance = _month_solve_attendance(inp, control=control)
+    if control is not None:
+        control.checkpoint("基本人力安排完成")
+    return finish_courses(inp, *attendance, control=control)
 
 
-def _month_solve_attendance(inp: DaySolveInput) -> tuple:
+def _month_solve_attendance(inp: DaySolveInput, *, control=None) -> tuple:
     from .follow_priority import spread_clerk_days
     y, m = map(int, inp.ym.split("-"))
     ended = clerk_batches_ended_by(inp.clerk_batches, date(y, m, monthrange(y, m)[1]))
@@ -1302,8 +1307,9 @@ def _month_solve_attendance(inp: DaySolveInput) -> tuple:
     # Otherwise it becomes immutable history before later follow opportunities
     # are known, and can irreversibly consume the course's ninth follow.
     prospective = {(b.id, p): 1 for b in inp.clerk_batches if b.id not in ended for p in b.members}
-    slots, log, warnings = (_month_solve_attendance_raw(inp, biopsy_caps=prospective)
-                            if prospective else _month_solve_attendance_raw(inp))
+    slots, log, warnings = (_month_solve_attendance_raw(
+        inp, biopsy_caps=prospective, control=control)
+        if prospective else _month_solve_attendance_raw(inp, control=control))
     # A second automatic biopsy is optional: try one when two have crowded out
     # the course's ninth follow. Fixed/prior attendance is still immutable.
     counts = {}
@@ -1338,7 +1344,10 @@ def _month_solve_attendance(inp: DaySolveInput) -> tuple:
             if key[0] in ended and follow < CLERK_SEAT_TARGET_MIN and biopsy >= 2}
     if caps:
         caps.update(prospective)
-        trial = _month_solve_attendance_raw(inp, biopsy_caps=caps)
+        if control is not None:
+            control.checkpoint("檢查 Clerk 切片與跟診配額")
+        trial = _month_solve_attendance_raw(inp, biopsy_caps=caps,
+                                            control=control)
         def current_follow(schedule, key):
             return sum(key[1] in people for d in inp.grid if d.isoformat()[:7] == inp.ym
                        and (b := day_owner_batch(arbitration_order(inp), d)) and b.id == key[0]
@@ -1351,12 +1360,15 @@ def _month_solve_attendance(inp: DaySolveInput) -> tuple:
         if effective:
             effective.update(prospective)
             slots, log, warnings = (trial if effective == caps else
-                                    _month_solve_attendance_raw(inp, biopsy_caps=effective))
-    spread_clerk_days(inp, slots)
+                                    _month_solve_attendance_raw(
+                                        inp, biopsy_caps=effective,
+                                        control=control))
+    spread_clerk_days(inp, slots, control=control)
     return slots, log, warnings
 
 
-def _month_solve_attendance_raw(inp: DaySolveInput, *, biopsy_caps=None) -> tuple:
+def _month_solve_attendance_raw(inp: DaySolveInput, *, biopsy_caps=None,
+                                control=None) -> tuple:
     """整月逐（工作日×早/午）填充 → (day_slots, log, warnings)。
 
     day_slots: {iso: {session: {slot: [代號]}}}；warnings: 人話警告清單。
@@ -1392,10 +1404,13 @@ def _month_solve_attendance_raw(inp: DaySolveInput, *, biopsy_caps=None) -> tupl
     #   —— 不必用 `best is None` 這種型別上證不出來的寫法。
     caps: dict = {}
     options = {"biopsy_caps": biopsy_caps} if biopsy_caps else {}
-    day_slots, log, warnings, fc = _solve_month_once(inp, **options)
+    day_slots, log, warnings, fc = _solve_month_once(
+        inp, control=control, **options)
     best_cost = _clerk_equal_cost(inp, fc, day_slots)
     best_out = (day_slots, log, warnings, fc)
     for _pass in range(1, CLERK_EQUALIZE_MAX_PASSES):
+        if control is not None:
+            control.checkpoint("平均 Clerk 跟診次數")
         nxt = _clerk_equal_seat_caps(inp, fc, caps)
         if nxt is None:               # 已經一致 → 收工
             return day_slots, log, warnings
@@ -1406,7 +1421,8 @@ def _month_solve_attendance_raw(inp: DaySolveInput, *, biopsy_caps=None) -> tupl
             #   由下面的點名據實說明。
             break
         caps = nxt
-        day_slots, log, warnings, fc = _solve_month_once(inp, seat_cap=caps, **options)
+        day_slots, log, warnings, fc = _solve_month_once(
+            inp, seat_cap=caps, control=control, **options)
         cost = _clerk_equal_cost(inp, fc, day_slots)
         if cost < best_cost:
             best_cost, best_out = cost, (day_slots, log, warnings, fc)
@@ -1566,7 +1582,8 @@ def _clerk_equal_seat_caps(inp: DaySolveInput, fc: FairCounters,
     return out if unresolved else None
 
 
-def _solve_month_once(inp: DaySolveInput, seat_cap=None, *, biopsy_caps=None) -> tuple:
+def _solve_month_once(inp: DaySolveInput, seat_cap=None, *, biopsy_caps=None,
+                      control=None) -> tuple:
     """單趟整月填充 → (day_slots, log, warnings, fc)。fc 供測試檢視公平計數。
 
     `seat_cap` = {(梯次, 代號): 該跟幾次}(RS-34 第二趟才有;None = 只受
@@ -1693,6 +1710,8 @@ def _solve_month_once(inp: DaySolveInput, seat_cap=None, *, biopsy_caps=None) ->
     solved_batch_ids: set = set()
     overlap_days: dict = {}               # {(勝者id, 敗者id): [最早重疊日, 最晚重疊日]}
     for d in sorted(inp.grid):
+        if control is not None:
+            control.checkpoint("安排每日必要工作")
         if is_weekend(d):
             continue
         iso = d.isoformat()

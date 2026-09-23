@@ -88,8 +88,14 @@ class _Root:
 
 
 class _Queue:
+    def __init__(self):
+        self.items = []
+
     def put_nowait(self, msg):
-        pass
+        self.items.append(msg)
+
+    def empty(self):
+        return not self.items
 
 
 def _app(monkeypatch, kb):
@@ -127,6 +133,20 @@ def _press(kb, key):
     (NO_GUARD),所以拿它當 probe 才只由交易閘門分勝負;其他鍵會先被前景
     class 守衛擋掉,量不到閘門。"""
     kb.registry[key]()
+
+
+def test_registered_f7_f8_f12_callbacks_are_inert_during_shutdown(monkeypatch):
+    """OS may deliver a queued callback after closing has begun."""
+    kb = _FakeKeyboard()
+    app, actions = _app(monkeypatch, kb)
+    app.setup_hotkeys()
+    queued = {key: kb.registry[key] for key in ("F7", "F8", "F12")}
+    queued_ui_before_close = list(app.ui_queue.items)
+    app._shutting_down = True
+    for callback in queued.values():
+        callback()
+    assert actions == []
+    assert app.ui_queue.items == queued_ui_before_close
 
 
 # ─── 1. 交易性:任一鍵失敗 → clinical hotkeys 歸零 ──────────────────────────

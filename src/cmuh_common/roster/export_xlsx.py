@@ -34,6 +34,7 @@ def export(path: str, data: dict) -> None:
     _sheet_calendar(wb.active, data)
     _sheet_summary(wb.create_sheet("結算"), data)
     _sheet_day_schedule(wb.create_sheet("PGY-Clerk"), data)   # [RS-01]
+    _sheet_day_explanation(wb.create_sheet("排班統計"), data)
     # 通用樣式：所有格自動換行、置中
     for ws in wb.worksheets:
         for row in ws.iter_rows():
@@ -41,6 +42,18 @@ def export(path: str, data: dict) -> None:
                 cell.alignment = Alignment(
                     horizontal="center", vertical="center", wrap_text=True)
     wb.save(path)
+
+
+def _sheet_day_explanation(ws, data: dict) -> None:
+    """Current, recomputed course accounting; never copy saved day_report."""
+    from openpyxl.styles import Font
+
+    ws.column_dimensions["A"].width = 112
+    for row, line in enumerate((data.get("day_explanation") or "").splitlines(), 1):
+        cell = ws.cell(row=row, column=1)
+        _set_excel_safe_text(cell, line)
+        if row == 1:
+            cell.font = Font(bold=True, size=12)
 
 
 def _sheet_calendar(ws, data: dict) -> None:
