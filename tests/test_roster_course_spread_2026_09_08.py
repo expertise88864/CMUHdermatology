@@ -1,10 +1,13 @@
 from collections import Counter
+from copy import deepcopy
 from datetime import date
 
 import pytest
 
 from cmuh_common.roster.model import ClerkBatch
-from cmuh_common.roster.solve_day import BIOPSY, DaySolveInput, is_follow_slot, month_solve_day
+from cmuh_common.roster.course_balance import add_external
+from cmuh_common.roster.follow_priority import spread_clerk_days
+from cmuh_common.roster.solve_day import BIOPSY, REST, DaySolveInput, is_follow_slot, month_solve_day
 
 
 def make_input(ym="2026-09"):
@@ -113,15 +116,214 @@ def test_optional_second_biopsy_does_not_displace_ninth_follow():
     assert sum(counts(slots, "C1", lambda r: r == BIOPSY).values()) == 1
 
 
-def test_unproven_priority_phase_does_not_return_schedule(monkeypatch):
-    from copy import deepcopy
+def solve_with_interruption(monkeypatch, status, interrupt_call):
+    from ortools.sat.python import cp_model
+    real_solve = cp_model.CpSolver.solve
+    real_value = cp_model.CpSolver.value
+    calls = 0
+
+    def interrupted(self, model):
+        nonlocal calls
+        calls += 1
+        if calls != interrupt_call:
+            return real_solve(self, model)
+        if status == cp_model.FEASIBLE:
+            assert real_solve(self, model) == cp_model.OPTIMAL
+        else:
+            self._test_forbid_value = True
+        return status
+
+    def guarded_value(self, expression):
+        if getattr(self, "_test_forbid_value", False):
+            raise AssertionError("solver.value() read after a non-solution status")
+        return real_value(self, expression)
+
+    monkeypatch.setattr(cp_model.CpSolver, "solve", interrupted)
+    monkeypatch.setattr(cp_model.CpSolver, "value", guarded_value)
+    return month_solve_day(make_input())
+
+
+def trainee_follows(slots):
+    return Counter(
+        p for sessions in slots.values() for cells in sessions.values()
+        for room, people in cells.items() if is_follow_slot(room)
+        for p in people if p.startswith(("C", "E"))
+    )
+
+
+def test_unproven_first_phase_keeps_its_feasible_assignment_and_warns(monkeypatch):
+    from ortools.sat.python import cp_model
+    slots, _, warnings = solve_with_interruption(monkeypatch, cp_model.FEASIBLE, 1)
+    assert sum(trainee_follows(slots).values()) > 0
+    assert any("尚未證明最優" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize("status_name", ["UNKNOWN", "INFEASIBLE"])
+def test_failed_first_phase_restores_original_schedule(monkeypatch, status_name):
     from ortools.sat.python import cp_model
     inp = make_input()
-    original = deepcopy(inp)
-    monkeypatch.setattr(cp_model.CpSolver, "solve", lambda *args, **kwargs: cp_model.FEASIBLE)
-    with pytest.raises(RuntimeError, match="尚未確認跟診優先順序"):
-        month_solve_day(inp)
-    assert inp == original
+    slots = {
+        min(inp.grid).isoformat(): {"上午": {REST: list(inp.pgy_roster)}}
+    }
+    original = deepcopy(slots)
+    monkeypatch.setattr(
+        cp_model.CpSolver, "solve",
+        lambda *_args, **_kwargs: getattr(cp_model, status_name),
+    )
+    warnings = []
+    add_external(inp, slots, [], warnings)
+    assert slots == original
+    assert any("尚未證明最優" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize("status_name", ["UNKNOWN", "INFEASIBLE"])
+def test_failed_later_phase_keeps_last_feasible_assignment(monkeypatch, status_name):
+    from ortools.sat.python import cp_model
+    with monkeypatch.context() as reference_patch:
+        reference, _, _ = solve_with_interruption(reference_patch, cp_model.FEASIBLE, 1)
+    with monkeypatch.context() as interrupted_patch:
+        slots, _, warnings = solve_with_interruption(
+            interrupted_patch, getattr(cp_model, status_name), 2)
+    assert slots == reference
+    assert sum(trainee_follows(slots).values()) > 0
+    assert any("尚未證明最優" in warning for warning in warnings)
+
+
+def test_later_feasible_phase_replaces_the_previous_snapshot(monkeypatch):
+    from ortools.sat.python import cp_model
+    with monkeypatch.context() as first_patch:
+        first, _, _ = solve_with_interruption(first_patch, cp_model.FEASIBLE, 1)
+    with monkeypatch.context() as later_patch:
+        later, _, warnings = solve_with_interruption(later_patch, cp_model.FEASIBLE, 2)
+    assert later != first
+    assert sum(trainee_follows(later).values()) > 0
+    assert any("尚未證明最優" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize("protected_count", [1, 2])
+def test_clerk_day_spread_preserves_pgy_weekly_minimum_and_credit(protected_count):
+    donor = date(2026, 9, 11)
+    targets = [date(2026, 9, 14), date(2026, 9, 15)][:protected_count]
+    grid = {donor: {"上午": ["101"], "下午": ["101"]}}
+    grid.update({d: {"上午": ["101"], "下午": []} for d in targets})
+    inp = DaySolveInput(
+        "2026-09", grid, ["P1", "P2"], capacity=1,
+        clerk_batches=[ClerkBatch("B", date(2026, 9, 7), ["C1"])],
+    )
+    slots = {
+        donor.isoformat(): {
+            "上午": {"101": ["C1"], REST: ["P1", "P2"]},
+            "下午": {"101": ["C1"], REST: ["P1", "P2"]},
+        },
+        **{
+            d.isoformat(): {
+                "上午": {"101": ["P1"], REST: ["C1", "P2"]},
+                "下午": {REST: ["C1", "P1", "P2"]},
+            }
+            for d in targets
+        },
+    }
+
+    spread_clerk_days(inp, slots)
+
+    target_week = targets[0].isocalendar()[:2]
+    assert sum(
+        "P1" in people
+        for iso, sessions in slots.items()
+        if date.fromisoformat(iso).isocalendar()[:2] == target_week
+        for cells in sessions.values()
+        for room, people in cells.items()
+        if is_follow_slot(room)
+    ) == protected_count
+    assert all(
+        "C1" not in people
+        for d in targets
+        for cells in slots[d.isoformat()].values()
+        for room, people in cells.items()
+        if is_follow_slot(room)
+    )
+
+
+def test_same_week_spread_tries_an_alternate_replacement_pgy():
+    donor, target = date(2026, 9, 14), date(2026, 9, 15)
+    grid = {
+        donor: {"上午": ["101"], "下午": ["101"]},
+        target: {"上午": ["101", "102"], "下午": ["101", "102"]},
+    }
+    inp = DaySolveInput(
+        "2026-09", grid, ["P1", "P2", "P3"], capacity=1,
+        clerk_batches=[ClerkBatch("B", donor, ["C1"])],
+    )
+    slots = {
+        donor.isoformat(): {
+            "上午": {"101": ["C1"], REST: ["P2", "P3"]},
+            "下午": {"101": ["C1"], REST: ["P2", "P3"]},
+        },
+        target.isoformat(): {
+            "上午": {"101": ["P1"], "102": ["P2"], REST: ["C1", "P3"]},
+            "下午": {"101": ["P1"], "102": ["P2"], REST: ["C1", "P3"]},
+        },
+    }
+
+    spread_clerk_days(inp, slots)
+
+    assert "C1" in slots[target.isoformat()]["上午"]["101"]
+    assert "P3" in slots[donor.isoformat()]["上午"]["101"]
+    weekly = Counter(
+        p for sessions in slots.values() for cells in sessions.values()
+        for room, people in cells.items() if is_follow_slot(room) for p in people
+    )
+    assert [weekly[p] for p in ("P1", "P2", "P3")] == [1, 2, 1]
+
+
+def test_sequential_spreads_update_weekly_counts_without_replacements():
+    donor, target = date(2026, 9, 11), date(2026, 9, 14)
+    extra = [date(2026, 9, 15), date(2026, 9, 16)]
+    grid = {
+        donor: {"上午": ["101", "102"], "下午": ["101", "102"]},
+        target: {"上午": ["101"], "下午": ["101"]},
+    }
+    inp = DaySolveInput(
+        "2026-09", grid, ["P1", "P2"], capacity=1,
+        clerk_batches=[ClerkBatch("B", date(2026, 9, 7), ["C1", "C2"])],
+    )
+    slots = {
+        donor.isoformat(): {
+            "上午": {"101": ["C1"], "102": ["C2"]},
+            "下午": {"101": ["C1"], "102": ["C2"]},
+        },
+        target.isoformat(): {
+            "上午": {"101": ["P1"], REST: ["C1", "C2", "P2"]},
+            "下午": {"101": ["P1"], REST: ["C1", "C2", "P2"]},
+        },
+        **{
+            d.isoformat(): {
+                "上午": ({"101": ["P1"], REST: ["P2"]}
+                           if d == extra[0] else {REST: ["P1", "P2"]}),
+                "下午": {REST: ["P1", "P2"]},
+            }
+            for d in extra
+        },
+    }
+
+    spread_clerk_days(inp, slots)
+
+    assert slots[target.isoformat()]["上午"]["101"] == ["C1"]
+    assert slots[target.isoformat()]["下午"]["101"] == ["P1"]
+    assert all(
+        "C2" not in people
+        for cells in slots[target.isoformat()].values()
+        for room, people in cells.items()
+        if is_follow_slot(room)
+    )
+    target_week = target.isocalendar()[:2]
+    weekly = Counter(
+        p for iso, sessions in slots.items()
+        if date.fromisoformat(iso).isocalendar()[:2] == target_week
+        for cells in sessions.values() for room, people in cells.items()
+        if is_follow_slot(room) for p in people
+    )
+    assert weekly["P1"] == 2
 
 
 def test_cross_month_defers_optional_biopsy_until_follow_budget_is_safe():

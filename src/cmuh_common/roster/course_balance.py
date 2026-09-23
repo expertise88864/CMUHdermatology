@@ -81,6 +81,7 @@ def _fixed_clerk_follows(inp, slots):
 
 
 def add_external(inp, slots, log, warnings):
+    original_slots = deepcopy(slots)
     people = external_roster(inp)
     conflicts = sorted(set(inp.external_roster) - set(people))
     if conflicts:
@@ -215,25 +216,37 @@ def add_external(inp, slots, log, warnings):
     # uses capacity left after everyone's targets, never a PGY's weekly minimum.
     phases = (*training_phases[:2], clerk_objective, *training_phases[2:],
               clerk_extra, spread_objective)
-    for index, objective in enumerate(phases):
+    saved = None
+    all_optimal = True
+    for objective in phases:
         expression = sum(objective)
         model.minimize(expression)
         status = solver.solve(model)
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            raise RuntimeError("家醫科／Clerk／外訓排班未取得可行解；原班表未變更")
-        if index < len(phases) - 1 and status != cp_model.OPTIMAL:
-            raise RuntimeError("排班逾時，尚未確認跟診優先順序與配額的最佳解；原班表未變更")
+            all_optimal = False
+            break
+        saved = {key: solver.value(variable) for key, variable in choices.items()}
+        if status != cp_model.OPTIMAL:
+            all_optimal = False
+            break
         model.add(expression == solver.value(expression))
-    for (d, s, p, kind), v in choices.items():
-        if not solver.value(v):
-            continue
-        cells = slots[d.isoformat()][s]
-        room = BIOPSY if kind == "biopsy" else next(
-            r for r in inp.grid[d][s] if len(cells.get(r, [])) < inp.capacity)
-        cells.setdefault(room, []).append(p)
-    restore_pgy_and_rest(inp, slots, originals)
-    from .follow_priority import spread_clerk_days
-    spread_clerk_days(inp, slots)
+    if not all_optimal:
+        warnings.append("學員門診最佳化尚未證明最優，保留已知最佳可行班表")
+    if saved is None:
+        slots.clear()
+        slots.update(original_slots)
+        return
+    else:
+        for (d, s, p, kind), selected in saved.items():
+            if not selected:
+                continue
+            cells = slots[d.isoformat()][s]
+            room = BIOPSY if kind == "biopsy" else next(
+                r for r in inp.grid[d][s] if len(cells.get(r, [])) < inp.capacity)
+            cells.setdefault(room, []).append(p)
+        restore_pgy_and_rest(inp, slots, originals)
+        from .follow_priority import spread_clerk_days
+        spread_clerk_days(inp, slots)
     warnings.extend(family_requirement_warnings(inp, slots))
     for (bid, p), target in targets.items():
         actual = sum(p in ps for (d, ss) in originals

@@ -174,6 +174,39 @@ def spread_clerk_days(inp, slots):
     """
     order = arbitration_order(inp)
     days = [d for d in sorted(inp.grid) if d.isoformat()[:7] == inp.ym and d.weekday() < 5]
+    weekly = Counter(
+        (date.fromisoformat(iso).isocalendar()[:2], p)
+        for iso, sessions in slots.items()
+        if iso[:7] == inp.ym
+        for cells in sessions.values()
+        for room, people in cells.items()
+        if is_follow_slot(room)
+        for p in people
+        if p in inp.pgy_roster
+    )
+    protected = weekly.copy()
+    protected_credit = {
+        week: sum(min(2, protected[week, p]) for p in inp.pgy_roster)
+        for week, _ in protected
+    }
+
+    def preserves_pgy_weeks(displaced, replacement, target_day, donor_day):
+        if displaced is None:
+            return True
+        after = weekly.copy()
+        after[target_day.isocalendar()[:2], displaced] -= 1
+        if replacement is not None:
+            after[donor_day.isocalendar()[:2], replacement] += 1
+        affected = {target_day.isocalendar()[:2], donor_day.isocalendar()[:2]}
+        return all(
+            after[week, p] >= min(1, protected[week, p])
+            for week in affected for p in inp.pgy_roster
+        ) and all(
+            sum(min(2, after[week, p]) for p in inp.pgy_roster)
+            >= protected_credit.get(week, 0)
+            for week in affected
+        )
+
     def works(d, p):
         return sum(p in ps for s, cells in slots.get(d.isoformat(), {}).items()
                    if s in STUDENT_SESSIONS for r, ps in cells.items() if r != REST)
@@ -197,13 +230,35 @@ def spread_clerk_days(inp, slots):
                     continue
                 cells = slots.get(d.isoformat(), {}).get(s, {})
                 for r in inp.grid[d].get(s, []):
-                    displaced = None
+                    choices = [(None, donors[0], None)]
                     if len(cells.get(r, [])) >= inp.capacity:
-                        candidates = [q for q in cells.get(r, []) if q in inp.pgy_roster]
-                        displaced = max(candidates, key=lambda q: works(d, q), default=None)
-                        if displaced is None:
-                            continue
-                    dd, ss, rr = donors[0]
+                        choices = []
+                        candidates = sorted(
+                            (q for q in cells.get(r, []) if q in inp.pgy_roster),
+                            key=lambda q: (-works(d, q), q),
+                        )
+                        for donor in donors:
+                            dd, ss, _ = donor
+                            source = slots[dd.isoformat()][ss]
+                            available = [q for q in source.get(REST, [])
+                                         if q in inp.pgy_roster
+                                         and dd not in inp.leaves.get("pgy", {}).get(q, set())]
+                            for displaced in candidates:
+                                replacements = sorted(
+                                    available,
+                                    key=lambda q: (q != displaced, weekly[dd.isocalendar()[:2], q], q),
+                                ) or [None]
+                                for replacement in replacements:
+                                    if preserves_pgy_weeks(displaced, replacement, d, dd):
+                                        choices.append((displaced, donor, replacement))
+                                        break
+                                if choices:
+                                    break
+                            if choices:
+                                break
+                    if not choices:
+                        continue
+                    displaced, (dd, ss, rr), replacement = choices[0]
                     source = slots[dd.isoformat()][ss]
                     source[rr].remove(p)
                     if not source[rr]:
@@ -220,10 +275,15 @@ def spread_clerk_days(inp, slots):
                     # Fill the released seat using an available PGY only.
                     candidates = [q for q in source.get(REST, []) if q in inp.pgy_roster
                                   and dd not in inp.leaves.get("pgy", {}).get(q, set())]
+                    refilled = None
                     if candidates:
-                        q = displaced if displaced in candidates else candidates[0]
-                        source[REST].remove(q)
-                        source.setdefault(rr, []).append(q)
+                        refilled = replacement if replacement is not None else candidates[0]
+                        source[REST].remove(refilled)
+                        source.setdefault(rr, []).append(refilled)
+                    if displaced:
+                        weekly[d.isocalendar()[:2], displaced] -= 1
+                    if refilled is not None:
+                        weekly[dd.isocalendar()[:2], refilled] += 1
                     placed = True
                     break
                 if placed:
