@@ -170,6 +170,8 @@ def test_missing_dependency_reports_and_reenables_button(tab, monkeypatch):
     errors = []
     monkeypatch.setattr(day_tab, "_verify_day_solver_dependency",
                         lambda: (_ for _ in ()).throw(RuntimeError("請重新啟動排班程式")))
+    monkeypatch.setattr(day_tab.messagebox, "askyesno", lambda *_a, **_k: True)
+    monkeypatch.setattr(day_tab, "ensure_dependencies", lambda _deps: None)
     monkeypatch.setattr(day_tab.messagebox, "showerror", lambda *a, **_k: errors.append(a))
     tab._on_auto()
     assert _pump(tab, lambda: not tab._day_solving)

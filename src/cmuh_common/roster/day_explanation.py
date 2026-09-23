@@ -169,7 +169,7 @@ def explain_day_courses(inp: DaySolveInput, data: dict[str, Any],
             row = TrainingCourseRow(
                 scope, course, p, complete, len(available[p]), low, target, high,
                 st.get("follow", 0), st.get("biopsy", 0), weeks, doctors, unknown,
-                st.get("rest", 0), tuple(biopsy_by_half))
+                st.get("rest", 0), (biopsy_by_half[0], biopsy_by_half[1]))
             training.append(row)
             if row.follow < low and complete:
                 gaps.append(f"{scope} {p} 跟診 {row.follow}/{low}，低於最低需求")

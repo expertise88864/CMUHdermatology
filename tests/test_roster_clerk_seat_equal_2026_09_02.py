@@ -536,9 +536,9 @@ class TestALeaverWithMoreThanTheOthers:
         seen = []
         real = sd._solve_month_once
 
-        def _spy(inp, seat_cap=None):
+        def _spy(inp, seat_cap=None, **kwargs):
             seen.append(seat_cap)
-            return real(inp, seat_cap=seat_cap)
+            return real(inp, seat_cap=seat_cap, **kwargs)
 
         monkeypatch.setattr(sd, "_solve_month_once", _spy)
         monkeypatch.setattr(
