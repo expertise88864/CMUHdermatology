@@ -165,7 +165,7 @@ def restore_pgy_and_rest(inp, slots, originals):
                     assigned.add(p)
 
 
-def spread_clerk_days(inp, slots):
+def spread_clerk_days(inp, slots, *, control=None):
     """Move a second daily follow to an idle day in the same course.
 
     Earlier Clerk priority must not consume an entire course budget in its first
@@ -211,6 +211,8 @@ def spread_clerk_days(inp, slots):
         return sum(p in ps for s, cells in slots.get(d.isoformat(), {}).items()
                    if s in STUDENT_SESSIONS for r, ps in cells.items() if r != REST)
     for d in sorted(days, key=lambda d: (not inp.grid[d].get("下午"), d)):
+        if control is not None:
+            control.checkpoint("平均 Clerk 每週跟診")
         owner = day_owner_batch(order, d)
         if not owner or not any(inp.grid[d].get(s) for s in STUDENT_SESSIONS):
             continue

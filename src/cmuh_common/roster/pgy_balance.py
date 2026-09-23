@@ -7,8 +7,11 @@ from .session_leave import on_leave
 from .solve_day import PHOTO, REST, TREATMENT, TWO_PGY_PHOTO_ONLY, is_follow_slot
 
 
-def balance_pgy(inp, slots, log, warnings):
+def balance_pgy(inp, slots, log, warnings, *, control=None):
     from ortools.sat.python import cp_model
+
+    if control is not None:
+        control.checkpoint("平衡 PGY 工作量")
 
     people = sorted(set(inp.pgy_roster))
     if not people:
@@ -100,13 +103,15 @@ def balance_pgy(inp, slots, log, warnings):
     status = cp_model.OPTIMAL
     all_optimal = True
     for tier, terms in enumerate(phases):
+        if control is not None:
+            control.checkpoint(f"平衡 PGY 工作量 {tier + 1}/{len(phases)}")
         expression = sum(terms)
         model.add(expression <= best_score[tier])
         model.add(expression >= lower_bounds[tier])
         if best_score[tier] == lower_bounds[tier]:
             continue
         model.minimize(expression)
-        status = solver.solve(model)
+        status = control.solve(solver, model) if control is not None else solver.solve(model)
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             all_optimal = False
             break

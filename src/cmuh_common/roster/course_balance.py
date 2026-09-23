@@ -80,7 +80,9 @@ def _fixed_clerk_follows(inp, slots):
     return counts
 
 
-def add_external(inp, slots, log, warnings):
+def add_external(inp, slots, log, warnings, *, control=None):
+    if control is not None:
+        control.checkpoint("安排 Clerk／家醫科／外訓")
     original_slots = deepcopy(slots)
     people = external_roster(inp)
     conflicts = sorted(set(inp.external_roster) - set(people))
@@ -218,10 +220,12 @@ def add_external(inp, slots, log, warnings):
               clerk_extra, spread_objective)
     saved = None
     all_optimal = True
-    for objective in phases:
+    for index, objective in enumerate(phases):
+        if control is not None:
+            control.checkpoint(f"安排跟診與切片 {index + 1}/{len(phases)}")
         expression = sum(objective)
         model.minimize(expression)
-        status = solver.solve(model)
+        status = control.solve(solver, model) if control is not None else solver.solve(model)
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             all_optimal = False
             break
@@ -246,7 +250,7 @@ def add_external(inp, slots, log, warnings):
             cells.setdefault(room, []).append(p)
         restore_pgy_and_rest(inp, slots, originals)
         from .follow_priority import spread_clerk_days
-        spread_clerk_days(inp, slots)
+        spread_clerk_days(inp, slots, control=control)
     warnings.extend(family_requirement_warnings(inp, slots))
     for (bid, p), target in targets.items():
         actual = sum(p in ps for (d, ss) in originals
@@ -262,17 +266,21 @@ def add_external(inp, slots, log, warnings):
     log.append("基本需求先保障；額外跟診依 Clerk ＞ 家醫科 ＞ 外訓 ＞ PGY；家醫／外訓跟診最低 30%、目標 50%、上限 70%；PGY 每週最低 1、目標 2 診；家醫／外訓每半月一次切片室")
 
 
-def balance_rooms(inp, slots):
+def balance_rooms(inp, slots, *, control=None):
     from .clinic_diversity import balance_clinics
-    balance_clinics(inp, slots)
+    balance_clinics(inp, slots, control=control)
 
 
-def finish_courses(inp, slots, log, warnings):
+def finish_courses(inp, slots, log, warnings, *, control=None):
     slots, log, warnings = deepcopy(slots), list(log), list(warnings)
-    add_external(inp, slots, log, warnings)
+    add_external(inp, slots, log, warnings, control=control)
     from .pgy_balance import balance_pgy
-    balance_pgy(inp, slots, log, warnings)
-    balance_rooms(inp, slots)
+    balance_pgy(inp, slots, log, warnings, control=control)
+    if control is not None:
+        control.checkpoint("平均分配診間")
+    balance_rooms(inp, slots, control=control)
+    if control is not None:
+        control.checkpoint("核對課程結果")
     from .training_bands import training_warnings
     warnings.extend(training_warnings(inp, slots, scopes=("pgy",)))
     log.append("依 course 優先平衡實際跟診醫師，再平衡診間；保留各人跟診次數、特殊工作、家醫可參與時段與鎖定內容")

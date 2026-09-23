@@ -45,8 +45,7 @@ from cmuh_common.single_instance import (
 )
 from cmuh_common.deps_runtime import ensure_dependencies
 
-# 骨架的最小依賴：requests（線上更新）、Pillow（視窗圖示）、pywin32（win32/圖示）。
-# 日後做真排班若需要別的套件，往這裡加即可（「下載即跑」會自動補裝）。
+# 開啟排班視窗不要求 OR-Tools；首次按自動排班時才由對應分頁修復。
 REQUIRED_LIBS = [
     ("requests", "requests"),
     ("Pillow", "PIL"),

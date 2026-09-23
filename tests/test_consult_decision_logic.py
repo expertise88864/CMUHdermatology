@@ -45,6 +45,7 @@ class _JobHarness:
         self.sent = []          # [(recipients, subject)]
         self.bodies = []        # 寄出的純文字內文
         self.html_bodies = []   # 寄出的 HTML 內文
+        self.attachments = []   # 不可附未去識別的 HIS 截圖
         self.extracted_text = extracted_text
         self.roster_texts = roster_texts   # None=解析失敗/停用、[]=無病人、[...]=清單列
         self.flow_runs = 0
@@ -79,13 +80,15 @@ class _JobHarness:
             cq, "send_via_smtp",
             lambda shot, subject, body, recipients, html_body="",
             message_id="", **kw:
-                self.sent.append((list(recipients), subject))
+                self.attachments.append(shot)
+                or self.sent.append((list(recipients), subject))
                 or self.bodies.append(body)
                 or self.html_bodies.append(html_body))
         monkeypatch.setattr(
             cq, "send_via_outlook",
             lambda shot, subject, body, recipients, sender_account="",
-            html_body="": self.sent.append((list(recipients), subject)))
+            html_body="": self.attachments.append(shot)
+            or self.sent.append((list(recipients), subject)))
         monkeypatch.setattr(
             cq, "_kill_systemftp",
             lambda *a, **k: setattr(self, "kills", self.kills + 1))
@@ -355,6 +358,14 @@ def test_send_failure_also_retries(monkeypatch):
     cq._do_full_job("17:00")
     assert calls["n"] == 2
     assert len(h.sent) == 1
+    assert h.flow_runs == 1, "已完成的 HIS 查詢不得因 SMTP 重試而重跑"
+
+
+def test_clinical_email_never_attaches_raw_his_screenshot(monkeypatch):
+    h = _JobHarness(monkeypatch, _base_cfg())
+    cq._do_full_job("17:00")
+    assert h.flow_runs == 1
+    assert h.attachments == [None]
 
 
 # ─── load_config 正規化(觸發安全相關欄位) ──────────────────────────────

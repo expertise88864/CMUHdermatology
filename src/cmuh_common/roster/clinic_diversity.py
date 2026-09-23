@@ -8,7 +8,7 @@ from .solve_day import (
 )
 
 
-def balance_clinics(inp, slots):
+def balance_clinics(inp, slots, *, control=None):
     """Improve distinct doctors, then repeated-doctor balance, then room balance.
 
     Same-session moves/swaps preserve attendance exactly. A morning/afternoon
@@ -83,6 +83,8 @@ def balance_clinics(inp, slots):
         return total + length * length
 
     while True:
+        if control is not None:
+            control.checkpoint("平均跟診醫師")
         sequences = {}
         for iso, ss in sorted(slots.items()):
             try:
@@ -98,6 +100,8 @@ def balance_clinics(inp, slots):
                             sequences.setdefault(key(dd, person), []).append((dd, session, room))
         best, best_score = None, (0, 0, 0, 0)
         for d in sorted(inp.grid):
+            if control is not None:
+                control.checkpoint("平均跟診醫師")
             iso = d.isoformat()
             if iso[:7] != inp.ym or d.weekday() >= 5:
                 continue

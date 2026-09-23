@@ -32,6 +32,7 @@ from typing import NamedTuple
 
 from cmuh_common.roster.calendar_colors import week_colors_for_year
 from cmuh_common.roster.clinic_grid import month_grid, grid_doctors
+from cmuh_common.roster.day_explanation import DayCourseExplanation
 from cmuh_common.roster.ledger import (
     can_rollback, rollback_month, settle_month, sync_members,
 )
@@ -748,7 +749,8 @@ class RosterService:
         # ★這裡原本把失敗吞掉照樣匯出★(外審 2026-08-22 P1-02):門診模板讀不到
         #   時 day_grid={} —— 匯出的月曆整片空白,而「真的沒有開診」與「剛好
         #   讀失敗」在文件上長得一模一樣。正式文件不接受這種 partial success。
-        day_grid = self.build_day_input(ym, src=src).grid
+        day_input = self.build_day_input(ym, src=src)
+        day_grid = day_input.grid
         # [週六切片] 匯出月曆的週六格附註（人名用 r names 對照）
         sat_biopsy: dict = {}
         for iso, cell in (month.get("saturday_biopsy") or {}).items():
@@ -762,6 +764,10 @@ class RosterService:
             if (dt.year, dt.month) == (y, m):
                 sat_biopsy[dt] = str(p)
 
+        from .day_explanation import format_day_explanation
+        current_stats = self.day_course_stats(
+            ym, day_slots_override=month.get("day_slots") or {},
+            inp=day_input, src=src)
         return {
             "ym": ym, "year": y, "month": m,
             "holidays": holidays,
@@ -770,6 +776,7 @@ class RosterService:
             "saturday_biopsy": sat_biopsy,
             "day_slots": month.get("day_slots") or {},
             "day_grid": day_grid,
+            "day_explanation": format_day_explanation(current_stats["explanation"]),
         }
 
     # ── PGY/Clerk 日排班（Phase 3）──────────────────────────────────────
@@ -999,7 +1006,8 @@ class RosterService:
             pgy_photo_offsets=dict(month.get("pgy_photo_offsets") or {}))
 
     def run_day_solve(self, ym: str, *,
-                      today: "date | None" = None) -> "DaySolveResult":
+                      today: "date | None" = None,
+                      control=None) -> "DaySolveResult":
         """build_day_input → month_solve_day。不落地。
 
         回傳除了結果本身,還帶著★這次求解吃到的輸入的識別★(見
@@ -1016,12 +1024,29 @@ class RosterService:
         #   在這裡 fail-closed 只會讓使用者連畫面都打不開;但按下套用時會被擋,
         #   所以預覽的警告裡就要說清楚為什麼 —— 否則使用者會遇到
         #   「排得出來卻套不下去」而不知道去修什麼。
+        if control is not None:
+            control.checkpoint("核對門診與值班資料")
         _pend = self.require_grid_shifts_reconciled(ym)
         _m, rev = self.storage.load_month_with_revision(ym)
         inp = self.build_day_input(ym, today=today)
-        day_slots, log, warnings = month_solve_day(inp)
+        if control is not None:
+            control.checkpoint("開始安排日班")
+        day_slots, log, warnings = month_solve_day(inp, control=control)
+        if control is not None:
+            control.checkpoint("完成排班，核對輸入版本")
         return DaySolveResult(day_slots, log, list(warnings) + _pend,
                               day_input_fingerprint(inp), rev)
+
+    def day_solution_is_current(self, ym: str, result: "DaySolveResult", *,
+                                today: "date | None" = None) -> bool:
+        """Check before preview; accept_day_solution repeats this under its write lock."""
+        with self.storage.write_barrier():
+            src = self._sources(ym, SRC_DAY, months=(next_ym(ym),))
+            month, rev = src.month_snapshot(ym)
+            return (not month.get("finalized")
+                    and rev == result.month_revision
+                    and result.fingerprint == day_input_fingerprint(
+                        self.build_day_input(ym, src=src, today=today)))
 
     @staticmethod
     def _overlay_locked_sessions(month: dict, day_slots: dict) -> dict:
@@ -1040,6 +1065,29 @@ class RosterService:
     def day_slots_with_locks(self, ym: str, day_slots: dict) -> dict:
         """預覽統計用：回傳與 accept_day_solution 相同「鎖定合併」後的 day_slots。"""
         return self._overlay_locked_sessions(self.storage.load_month(ym), day_slots)
+
+    def day_preview_explanation(self, ym: str, day_slots: dict, *,
+                                expect: "DaySolveResult | None" = None,
+                                today: "date | None" = None) -> DayCourseExplanation:
+        """從同一份嚴格快照重算預覽；跨月來源壞掉時不可顯示不完整統計。"""
+        with self.storage.write_barrier():
+            src = self._sources(ym, SRC_DAY, months=(next_ym(ym),))
+            month, rev = src.month_snapshot(ym)
+            inp = self.build_day_input(ym, src=src, today=today)
+            if expect is not None and (rev != expect.month_revision
+                                       or day_input_fingerprint(inp) != expect.fingerprint):
+                raise ValueError("排班資料已變動，請重新排班")
+            effective = self._overlay_locked_sessions(month, day_slots)
+            return self.day_course_stats(
+                ym, day_slots_override=effective, inp=inp,
+                src=src)["explanation"]
+
+    def day_current_course_stats(self, ym: str) -> dict:
+        """側欄與公平性彈窗的現況數字；鄰月來源損壞時不可當成空班表。"""
+        with self.storage.write_barrier():
+            src = self._sources(ym, SRC_DAY, months=(next_ym(ym),))
+            inp = self.build_day_input(ym, src=src)
+            return self.day_course_stats(ym, inp=inp, src=src)
 
     def accept_day_solution(self, ym: str, day_slots: dict,
                             report: "str | None" = None, *,
@@ -1573,7 +1621,9 @@ class RosterService:
         return out
 
     def day_course_stats(self, ym: str,
-                         day_slots_override: "dict | None" = None) -> dict:
+                         day_slots_override: "dict | None" = None, *,
+                         inp: "DaySolveInput | None" = None,
+                         src: "StrictSources | None" = None) -> dict:
         """[2026-07-23 使用者] 週期次數統計：PGY=本月、Clerk=整個兩週梯次（跨月自動把
         另一半月份的存檔 day_slots 合併進來，以梯次起訖裁切）。統計吃「排出來的結果」
         （含手動改過/鎖定的格），不是 solver 內部計數。
@@ -1583,9 +1633,10 @@ class RosterService:
           {"pgy": {"roster": [...], "stats": {code: {photo,photo_wed_pm,tx,biopsy,follow,rest}}},
            "batches": [{"id","start","end","members","stats"}]}
         """
-        inp = self.build_day_input(ym)
+        source = src if src is not None else self.storage
+        inp = inp or self.build_day_input(ym, src=src)
         cur_slots = (day_slots_override if day_slots_override is not None
-                     else (self.storage.load_month(ym).get("day_slots") or {}))
+                     else (source.load_month(ym).get("day_slots") or {}))
         # [codex P2] PGY=本月 → 以月份起訖裁切:set_day_slot 不強制 d∈ym,月檔可能殘留
         # 跨月 iso 鍵(如鎖定殘留),不裁切會灌進 PGY 月統計。
         y, m = int(ym[:4]), int(ym[5:7])
@@ -1596,24 +1647,40 @@ class RosterService:
             cur_slots, include={str(c) for c in inp.pgy_roster},
             start=m_first, end=m_last)
         batches_out = []
+        from .session_leave import monthly_person_slots
         for b in inp.clerk_batches:
             b_end = b.start_monday + timedelta(days=13)
             merged: dict = {}
-            for ymm in sorted({f"{d.year:04d}-{d.month:02d}"
-                               for d in (b.start_monday, b_end)}):
+            course_months = sorted({f"{d.year:04d}-{d.month:02d}"
+                                    for d in (b.start_monday, b_end)})
+            month_data = {ymm: source.load_month(ymm)
+                          for ymm in course_months}
+            for ymm in course_months:
                 slots = (cur_slots if ymm == ym
-                         else (self.storage.load_month(ymm).get("day_slots") or {}))
+                         else (month_data[ymm].get("day_slots") or {}))
                 # [codex P2] 各月檔只採「屬於該月」的 iso 鍵:月檔可能殘留跨月鍵
                 # (set_day_slot 不強制 d∈ym),不過濾會蓋掉另一個月檔的權威內容。
                 merged.update({iso: v for iso, v in slots.items()
                                if iso[:7] == ymm})
+            available_by_person = {}
+            for p in b.members:
+                leave = set().union(*(monthly_person_slots(ymm, month_data[ymm],
+                                                          "clerk", p)
+                                     for ymm in course_months))
+                available_by_person[p] = {
+                    (d, session) for i in range(14)
+                    if (d := b.start_monday + timedelta(days=i)).isoformat()
+                    in inp.course_days
+                    for session in STUDENT_SESSIONS
+                    if (d, session) not in leave}
             batches_out.append({
                 "id": b.id, "start": b.start_monday.isoformat(),
                 "end": b_end.isoformat(), "members": list(b.members),
+                "slots": merged, "available_slots": available_by_person,
                 "stats": person_course_stats(
                     merged, include={str(c) for c in b.members},
                     start=b.start_monday, end=b_end)})
-        return {"pgy": {"roster": list(inp.pgy_roster), "stats": pgy_stats},
+        data = {"pgy": {"roster": list(inp.pgy_roster), "stats": pgy_stats},
                 "external": {"roster": list(inp.external_roster),
                              "stats": person_course_stats(
                                  {i: v for i, v in cur_slots.items() if i[:7] == ym},
@@ -1623,6 +1690,9 @@ class RosterService:
                                {i: v for i, v in cur_slots.items() if i[:7] == ym},
                                include=set(inp.family_roster))},
                 "batches": batches_out}
+        from .day_explanation import explain_day_courses
+        data["explanation"] = explain_day_courses(inp, data, cur_slots)
+        return data
 
     def update_month(self, ym: str, mutator, *, retries: int = 4):
         """讀最新月檔 → 套上【這一個窄改動】→ CAS 寫回;被搶先就重讀重套。
@@ -4867,8 +4937,34 @@ class RosterService:
         (外審 2026-08-22 P1-03)使用者看報告是為了知道「現在這個月是怎麼排的」,
         而 Auto Accept 之後手動換過班的話,這份文字講的是舊班表 —— 不講清楚
         的話,畫面上的月曆與報告內容互相矛盾,而且看不出誰才是對的。
-        顯示路徑刻意用寬鬆載入(讀不到就顯示空,不該讓視窗開不起來)。
+        值班歷史報告沿用寬鬆載入；日排班的「現況統計」使用一致的嚴格快照，
+        來源讀取失敗時由 UI 顯示錯誤，不能把空資料當作實際班表。
         """
+        if scope == "day":
+            from .day_explanation import DAY_EXPLANATION_HEADING, format_day_explanation
+            with self.storage.write_barrier():
+                src = self._sources(ym, SRC_DAY, months=(next_ym(ym),))
+                month = src.load_month(ym)
+                current = format_day_explanation(self.day_course_stats(
+                    ym, inp=self.build_day_input(ym, src=src), src=src)["explanation"])
+            text = month.get(report_key(scope)) or ""
+            if not text:
+                return current
+            # 舊求解報告可能已含一份當時的統計；只保留其診斷過程，
+            # 讓畫面上恰有一份由目前班表重算的統計。
+            # 2026-07 版的舊報告以「週期次數統計」開頭；不能只切掉新版
+            # heading，否則手改班表後會同時顯示新舊兩份互相矛盾的數字。
+            headings = (DAY_EXPLANATION_HEADING, "【週期次數統計】")
+            cut = min((text.index(h) for h in headings if h in text),
+                      default=len(text))
+            historical = text[:cut].rstrip()
+            if not historical:
+                return current
+            note = report_notice(month, scope)
+            label = ("【歷史求解紀錄：與目前班表不同】" if note
+                     else "【本次求解過程紀錄】")
+            return current + "\n\n" + label + "\n" + (
+                note + "\n" if note else "") + historical
         month = self.storage.load_month(ym)
         text = month.get(report_key(scope)) or ""
         if not text:

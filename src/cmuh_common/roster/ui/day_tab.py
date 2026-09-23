@@ -4,23 +4,29 @@
 PGY 與 Clerk 共用同一份 day_slots（同時段一起填），故兩個分頁看的是同一張表；
 差別只在側邊管理面板（PGY＝當月人員；Clerk＝梯次於設定頁管理）與請假 scope。
 
-外訓使用釘版 OR-Tools，於背景安裝／求解；預覽警告後才落地。
+日排班使用釘版 OR-Tools，首次自動排班才在 Tk 主執行緒修復依賴；
+求解在背景進行，預覽警告後才落地。
 """
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 import re
 import threading
+import time
 import tkinter as tk
 from datetime import date
 from tkinter import filedialog, messagebox, ttk
 
 from cmuh_common.deps_runtime import ensure_dependencies
+from cmuh_common.roster import ORTOOLS_PINNED_VERSION
+from cmuh_common.roster.day_explanation import format_day_explanation
 from cmuh_common.roster.model import ClerkBatch, batches_covering, month_dates
+from cmuh_common.roster.solve_control import DaySolveControl, DaySolveStopped
 from cmuh_common.roster.solve_day import (
-    BIOPSY, PHOTO, REST, STAT_KEYS, TREATMENT, arbitration_order,
-    day_owner_batch, format_course_stats,
+    BIOPSY, PHOTO, REST, TREATMENT, arbitration_order,
+    day_owner_batch,
 )
 from cmuh_common.roster.ui.common import (
     CARD_BORDER, CARD_CANVAS_BG, CARD_HDR_HOLIDAY, CARD_HDR_NORMAL,
@@ -33,9 +39,23 @@ from cmuh_common.roster.ui.duty import LeaveEditor
 
 _WD = "一二三四五六日"
 _TITLE = "PGY / Clerk / 外訓 / 家醫科 排班"
+_ORTOOLS_DEP = [(f"ortools=={ORTOOLS_PINNED_VERSION}", "ortools")]
 # [2026-07-24 UI] 閒置時狀態列＝操作提示（月曆格點擊選單原本無處可發現）。
 _IDLE_HINT = ("就緒｜月曆格：點擊＝編輯/鎖定選單；滾輪捲動（Shift+滾輪＝水平）"
               "｜列表檢視：雙擊列＝編輯、選取後可按🔒")
+
+
+def _verify_day_solver_dependency() -> None:
+    """Fail quickly if the installed solver package is absent or not pinned."""
+    try:
+        installed = importlib.import_module("ortools")
+    except ImportError as exc:
+        raise RuntimeError("排班引擎未安裝") from exc
+    version = getattr(installed, "__version__", None)
+    if version != ORTOOLS_PINNED_VERSION:
+        raise RuntimeError(
+            f"排班引擎版本不符（目前 {version or '未知'}，需要 "
+            f"{ORTOOLS_PINNED_VERSION}）")
 
 
 def _split_codes(text: str) -> list:
@@ -93,6 +113,9 @@ class DayScheduleTab(ttk.Frame):
         self.service = service
         self.app = app
         self._finalized = False
+        self._day_solving = False
+        self._day_control = None
+        self._day_poll_id = None
 
         self._build_toolbar()
         body = ttk.Frame(self)
@@ -112,6 +135,9 @@ class DayScheduleTab(ttk.Frame):
         self._selector.pack(side="left")
         self._auto_btn = ttk.Button(bar, text="自動排班", command=self._on_auto)
         self._auto_btn.pack(side="left", padx=(12, 4))
+        self._cancel_btn = ttk.Button(bar, text="取消排班", command=self._cancel_day_solve,
+                                      state="disabled")
+        self._cancel_btn.pack(side="left", padx=4)
         self._lock_btn = ttk.Button(bar, text="🔒鎖定/解鎖選取",
                                     command=self._on_toggle_lock)
         self._lock_btn.pack(side="left", padx=4)
@@ -233,10 +259,14 @@ class DayScheduleTab(ttk.Frame):
                   font=(_OVR_FONT, 10, "bold")).pack(anchor="w", padx=6,
                                                      pady=(6, 0))
         self._stats_pgy = ttk.Treeview(side, columns=("c", "p", "w", "t", "f",
-                                                      "total", "r"),
+                                                      "necessary", "total", "off",
+                                                      "gap", "doctor", "r"),
                                        show="headings", height=5)
         for c, t, w in (("c", "代號", 52), ("p", "照光", 40), ("w", "週三午", 50),
-                        ("t", "治療", 40), ("f", "跟診", 40), ("total", "總量", 40),
+                        ("t", "治療", 40), ("f", "跟診", 40),
+                        ("necessary", "必要", 40), ("total", "總量", 40),
+                        ("off", "減量", 40), ("gap", "差異", 45),
+                        ("doctor", "醫師數", 50),
                         ("r", "放假", 40)):
             self._stats_pgy.heading(c, text=t)
             self._stats_pgy.column(c, width=w, anchor="center")
@@ -248,15 +278,21 @@ class DayScheduleTab(ttk.Frame):
         ttk.Label(side, text="Clerk 週期統計（整梯兩週）",
                   font=(_OVR_FONT, 10, "bold")).pack(anchor="w", padx=6,
                                                      pady=(8, 0))
-        self._stats_clerk = ttk.Treeview(side, columns=("c", "b", "f", "r"),
+        self._stats_clerk = ttk.Treeview(side, columns=("c", "available", "band",
+                                                        "b", "f", "weekly", "doctor", "r"),
                                          show="headings", height=5)
-        for c, t, w in (("c", "代號", 70), ("b", "切片", 46), ("f", "跟診", 46),
+        for c, t, w in (("c", "代號", 70), ("available", "可參與", 52),
+                        ("band", "低/目/高", 73), ("b", "切片", 46),
+                        ("f", "跟診", 46), ("weekly", "每週", 65),
+                        ("doctor", "醫師數", 50),
                         ("r", "放假", 46)):
             self._stats_clerk.heading(c, text=t)
             self._stats_clerk.column(c, width=w, anchor="center")
         self._stats_clerk.tag_configure("hdr", background="#E8E8E8")
         self._stats_clerk.tag_configure("miss", background="#FFD2D2")
         self._stats_clerk.pack(fill="x", padx=6)
+        ttk.Button(side, text="查看完整公平性與缺口說明",
+                   command=self._on_explanation).pack(anchor="w", padx=6, pady=(4, 0))
         # ★[RS-28 2026-08-25] 這段字原本寫「至少跟過一次切片室」★ —— 那是
         #   RS-24(2026-08-24 使用者定案「配額平均」)之前的規則。現在的要求是
         #   同梯次數一致(配額用完就留空),不是「有排到就好」。
@@ -318,47 +354,63 @@ class DayScheduleTab(ttk.Frame):
         要修的事,而「這一梯之後還排得到」時又不該一直跳紅。判準統一由
         `service.validate_course_quota()` 給。
         """
-        data = self.service.day_course_stats(self.app.ym)
+        t, t2 = self._stats_pgy, self._stats_clerk
+        try:
+            data = self.service.day_current_course_stats(self.app.ym)
+        except Exception:  # noqa: BLE001
+            logging.exception("[roster.ui] 現況統計來源讀取失敗")
+            for table in (t, t2):
+                table.delete(*table.get_children())
+                table.insert("", "end", values=("統計讀取失敗",))
+            return
         try:
             _flagged = self.service.validate_course_quota(self.app.ym)[1]
         except Exception:
             logging.debug("[roster.ui] 切片配額判定失敗 → 這次不標紅",
                           exc_info=True)
             _flagged = set()
-        t = self._stats_pgy
         t.delete(*t.get_children())
-        stats, roster = data["pgy"]["stats"], data["pgy"]["roster"]
-        for c in sorted({*roster, *stats}):
-            st = stats.get(c) or dict.fromkeys(STAT_KEYS, 0)
-            t.insert("", "end", values=(c, st["photo"], st["photo_wed_pm"],
-                                        st["tx"], st["follow"],
-                                        st["photo"] + st["tx"] + st["follow"],
-                                        st["rest"]))
-        t2 = self._stats_clerk
+        explanation = data["explanation"]
+        for r in explanation.pgy:
+            t.insert("", "end", values=(
+                r.code, r.photo, r.wednesday_photo, r.treatment, r.follow,
+                r.necessary, r.total, r.manual_reduction,
+                f"{float(r.difference):+.2f}", len(r.known_doctors), r.rest))
         t2.delete(*t2.get_children())
-        for b in data["batches"]:
-            t2.insert("", "end", tags=("hdr",),
-                      values=(f"梯 {b['start'][5:]}~{b['end'][5:]}", "", "", ""))
-            for c in sorted({*b["members"], *b["stats"]}):
-                st = b["stats"].get(c) or dict.fromkeys(STAT_KEYS, 0)
-                t2.insert("", "end",
-                          tags=(("miss",) if (b["id"], str(c)) in _flagged
-                                else ()),
-                          values=(c, st["biopsy"], st["follow"], st["rest"]))
+        labels = {b["id"]: f"梯 {b['start'][5:]}~{b['end'][5:]}"
+                  for b in data["batches"]}
+        last_group = None
+        for r in explanation.training:
+            group = (r.scope, r.course)
+            if group != last_group:
+                title = labels.get(r.course, f"{r.scope}（本月）")
+                t2.insert("", "end", tags=("hdr",),
+                          values=(title, "", "", "", "", "", "", ""))
+                last_group = group
+            weekly = "/".join(str(n) for _, n in r.weekly_follows) or "—"
+            t2.insert("", "end",
+                      tags=(("miss",) if r.complete and
+                            ((r.course, r.code) in _flagged or
+                             r.follow < r.minimum) else ()),
+                      values=(r.code, r.available_half_days,
+                              f"{r.minimum}/{r.target}/{r.maximum}",
+                              r.biopsy, r.follow, weekly,
+                              len(r.known_doctors), r.rest))
 
-        external = data.get("external", {})
-        if external.get("roster"):
-            t2.insert("", "end", tags=("hdr",), values=("外訓（本月）", "", "", ""))
-            for c in external["roster"]:
-                st = external["stats"].get(c) or dict.fromkeys(STAT_KEYS, 0)
-                t2.insert("", "end", values=(c, st["biopsy"], st["follow"], st["rest"]))
-
-        family = data.get("family", {})
-        if family.get("roster"):
-            t2.insert("", "end", tags=("hdr",), values=("家醫科（本月）", "", "", ""))
-            for c in family["roster"]:
-                st = family["stats"].get(c) or dict.fromkeys(STAT_KEYS, 0)
-                t2.insert("", "end", values=(c, st["biopsy"], st["follow"], st["rest"]))
+    def _on_explanation(self) -> None:
+        try:
+            explanation = self.service.day_current_course_stats(
+                self.app.ym)["explanation"]
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("統計失敗", str(exc), parent=self)
+            return
+        win = tk.Toplevel(self)
+        win.title(f"實際班表公平性 · {self.app.ym}")
+        display = tk.Text(win, wrap="word", width=96, height=30)
+        display.insert("1.0", format_day_explanation(explanation))
+        display.config(state="disabled")
+        display.pack(fill="both", expand=True, padx=8, pady=8)
+        ttk.Button(win, text="關閉", command=win.destroy).pack(pady=(0, 6))
 
     def _refresh_warnings(self, warnings) -> None:
         self._warns.delete(0, tk.END)
@@ -385,101 +437,139 @@ class DayScheduleTab(ttk.Frame):
 
     # ── 互動 ─────────────────────────────────────────────────────────────
     def _on_month_change(self, ym) -> None:
+        if ym != self.app.ym:
+            self._cancel_day_solve("月份已切換")
         self.app.ym = ym
         self.refresh()
 
     def on_shown(self) -> None:
+        if self._day_solving and self._solve_ym != self.app.ym:
+            self._cancel_day_solve("月份已切換")
         if self._selector.ym != self.app.ym:
             self._selector.set_ym(self.app.ym)
         self.refresh()
 
     def _on_auto(self) -> None:
-        if self._finalized or getattr(self, "_day_solving", False):
+        if self._finalized or self._day_solving:
             return
         try:
-            inp = self.service.build_day_input(self.app.ym)
-            if inp.external_roster or inp.family_roster:
-                self._solve_external_async()
+            _verify_day_solver_dependency()
+        except RuntimeError as missing:
+            if not messagebox.askyesno(
+                    "需要排班引擎",
+                    f"{missing}。首次使用自動排班需要安裝釘版 OR-Tools。現在安裝？",
+                    parent=self):
                 return
-            # [RS-32 2026-08-30 使用者] 自動排班只排【明天起】:今天(含)以前
-            #   以現況自動保留(求解器層,不寫 day_locks,UI 仍可手動編輯)。
-            #   ★真時鐘只在這裡進入★ —— service/測試一律注入固定日期。
-            res = self.service.run_day_solve(self.app.ym,
-                                             today=date.today())
-        except Exception as e:  # noqa: BLE001
-            logging.exception("[roster.ui] 日排班失敗")
-            messagebox.showerror("排班失敗", f"排班時發生錯誤：\n{e}")
-            return
-        self._preview_and_accept(res)
+            self._status.set("安裝排班引擎中；可在安裝視窗取消")
+            try:
+                # 安裝器會開 Tk 視窗；必須從 Tk 主執行緒呼叫。
+                ensure_dependencies(_ORTOOLS_DEP)
+                _verify_day_solver_dependency()
+            except (Exception, SystemExit) as exc:  # noqa: BLE001
+                logging.exception("[roster.ui] 安裝或驗證排班引擎失敗")
+                messagebox.showerror("排班引擎無法使用",
+                                     str(exc) or "已取消或安裝失敗", parent=self)
+                self._status.set("排班引擎未就緒；手動班表仍可使用")
+                return
+        self._solve_day_async()
 
-    def _solve_external_async(self) -> None:
-        from cmuh_common.roster import ORTOOLS_PINNED_VERSION
+    def _cancel_day_solve(self, reason: str = "已取消") -> None:
+        if self._day_solving and self._day_control is not None:
+            self._day_control.cancel(reason)
+            self._cancel_btn.config(state="disabled")
+            self._status.set(f"正在停止排班：{reason}")
+
+    def _solve_day_async(self) -> None:
         ym = self.app.ym
+        solve_today = date.today()
+        control = DaySolveControl()
+        self._solve_ym = ym
+        self._day_control = control
         self._day_solving = True
         self._auto_btn.config(state="disabled")
+        self._cancel_btn.config(state="normal")
+        self._status.set("排班準備中；可按「取消排班」")
         result = {}
+
         def work():
             try:
-                ensure_dependencies([(f"ortools=={ORTOOLS_PINNED_VERSION}", "ortools")])
-                result["res"] = self.service.run_day_solve(ym, today=date.today())
+                control.checkpoint("檢查排班引擎")
+                _verify_day_solver_dependency()
+                control.checkpoint("載入並求解排班")
+                solved = self.service.run_day_solve(
+                    ym, today=solve_today, control=control)
+                control.checkpoint("檢查結果是否仍是目前資料")
+                result["current"] = (
+                    solve_today == date.today()
+                    and self.service.day_solution_is_current(
+                        ym, solved, today=solve_today))
+                result["res"] = solved
+            except DaySolveStopped as e:
+                result["stopped"] = str(e)
             except (Exception, SystemExit) as e:
-                logging.exception("[roster.ui] 外訓排班失敗")
+                logging.exception("[roster.ui] 日排班失敗")
                 result["error"] = str(e) or "排班引擎安裝已取消或失敗"
-        worker = threading.Thread(target=work, name="roster-external", daemon=True)
+
+        worker = threading.Thread(target=work, name="roster-day-solve", daemon=True)
         worker.start()
+
         def poll():
-            if worker.is_alive():
-                self.after(100, poll)
+            if not self.winfo_exists():
                 return
+            if time.monotonic() >= control.deadline and not control.cancelled:
+                self._cancel_day_solve("排班超過時間上限")
+            if worker.is_alive():
+                if not control.cancelled:
+                    self._status.set(f"排班中：{control.stage}；可按「取消排班」")
+                self._day_poll_id = self.after(100, poll)
+                return
+            self._day_poll_id = None
             self._day_solving = False
+            self._day_control = None
             self._auto_btn.config(state="disabled" if self._finalized else "normal")
+            self._cancel_btn.config(state="disabled")
+            if control.cancelled or "stopped" in result:
+                self._status.set(f"排班已停止：{control.reason or result.get('stopped', '')}")
+                return
             if "error" in result:
                 messagebox.showerror("排班失敗", result["error"], parent=self)
-            elif ym != self.app.ym:
-                messagebox.showinfo("月份已切換", "排班期間月份已切換，請重新排班。", parent=self)
-            else:
-                self._preview_and_accept(result["res"])
-        self.after(100, poll)
+                self._status.set("排班失敗，請查看錯誤訊息")
+                return
+            if ym != self.app.ym or self._finalized or not result.get("current", False):
+                self._status.set("排班資料已變動，請重新排班")
+                return
+            self._status.set("排班完成，請確認預覽")
+            self._preview_and_accept(result["res"])
 
-    def _format_report(self, log, warnings, day_slots=None) -> str:
+        self._day_poll_id = self.after(100, poll)
+
+    def destroy(self) -> None:
+        if self._day_control is not None:
+            self._day_control.cancel("畫面已關閉")
+        if self._day_poll_id is not None:
+            self.after_cancel(self._day_poll_id)
+            self._day_poll_id = None
+        super().destroy()
+
+    def _format_report(self, log, warnings, explanation) -> str:
         base = ("【警告】\n" + ("\n".join(f"  ⚠ {w}" for w in warnings) or "  （無）")
                 + "\n\n【逐日過程】\n" + "\n".join(log))
-        # [2026-07-23] 附週期次數統計（preview 的 day_slots 蓋掉本月、其他月讀存檔）
-        try:
-            data = self.service.day_course_stats(
-                self.app.ym, day_slots_override=day_slots)
-            base += "\n\n" + format_course_stats(
-                data["pgy"]["stats"], data["pgy"]["roster"], data["batches"])
-            external = data.get("external", {})
-            if external.get("roster"):
-                base += "\n\n【外訓（本月）】"
-                for c in external["roster"]:
-                    st = external["stats"].get(c) or dict.fromkeys(STAT_KEYS, 0)
-                    base += f"\n{c}：跟診 {st['follow']}；切片室 {st['biopsy']}；空班 {st['rest']}"
-            family = data.get("family", {})
-            if family.get("roster"):
-                base += "\n\n【家醫科（本月；依可參與時段排班，不必排滿）】"
-                for c in family["roster"]:
-                    st = family["stats"].get(c) or dict.fromkeys(STAT_KEYS, 0)
-                    base += f"\n{c}：跟診 {st['follow']}"
-        except Exception:
-            logging.debug("[roster.ui] 報告統計段生成失敗（略過）", exc_info=True)
-        return base
+        return base + "\n\n" + format_day_explanation(explanation)
 
     def _preview_and_accept(self, res) -> None:
         # ★整個 res 都要帶進來(不是只帶 day_slots)★:套用時要用它問
         #   一句「這份結果還配得上現在的資料嗎」—— 預覽視窗可以開很久,
         #   期間他機的請假/梯次/停診/名單都可能已經同步進來(外審 P1-02)。
         day_slots, log, warnings = res.day_slots, res.log, res.warnings
-        # [codex P2] 統計用「鎖定合併後」的內容——與 accept_day_solution 落地的完全一致
-        # (鎖定日掉出開診格網時 solver 輸出可能缺該時段,accept 會補回)。
+        # 嚴格快照同時核對跨月來源、輸入指紋及鎖定格位；讀不到時不展示不完整統計。
         try:
-            eff_slots = self.service.day_slots_with_locks(self.app.ym, day_slots)
-        except Exception:
-            logging.debug("[roster.ui] 預覽鎖定合併失敗,統計改用原始 preview",
-                          exc_info=True)
-            eff_slots = day_slots
-        report = self._format_report(log, warnings, eff_slots)
+            explanation = self.service.day_preview_explanation(
+                self.app.ym, day_slots, expect=res, today=date.today())
+            report = self._format_report(log, warnings, explanation)
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("[roster.ui] 無法重算排班預覽與統計")
+            messagebox.showerror("預覽失敗", f"無法核對鎖定時段與統計：\n{exc}", parent=self)
+            return
         win = tk.Toplevel(self)
         win.title(f"日排班預覽 · {_TITLE} · {self.app.ym}")
         win.transient(self)
@@ -747,8 +837,11 @@ class DayScheduleTab(ttk.Frame):
         # 顯示「已落地/存檔」的日排班報告（非重新求解），與畫面一致。
         # ★套用之後手改過格子的話,報告講的是舊的★ → 由服務層在文字最前面
         #   標明它與現況的關係(外審 2026-08-22 P1-03)。
-        text = (self.service.report_for_display("day", self.app.ym)
-                or "（本月尚未套用日排班，無報告）")
+        try:
+            text = self.service.report_for_display("day", self.app.ym)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("報告失敗", f"無法核對目前班表：\n{exc}", parent=self)
+            return
         win = tk.Toplevel(self)
         win.title(f"{_TITLE} 報告/警告 · {self.app.ym}")
         t = tk.Text(win, wrap="none", width=70, height=30, font=("Consolas", 10))
@@ -940,6 +1033,8 @@ class DayScheduleTab(ttk.Frame):
             messagebox.showinfo("匯出完成", f"已匯出：\n{path}")
 
     def _on_finalize(self) -> None:
+        if self._final_var.get():
+            self._cancel_day_solve("月份已定案")
         on = bool(self._final_var.get())
         try:
             # ★留底內容在定案的同一個臨界區裡取★(外審 RS-19 R1-2):交給背景
@@ -959,6 +1054,8 @@ class DayScheduleTab(ttk.Frame):
         state = "disabled" if self._finalized else "normal"
         for w in (self._auto_btn, self._clear_btn, self._lock_btn, *self._edit_btns):
             w.config(state=state)
+        if self._day_solving:
+            self._auto_btn.config(state="disabled")
 
 
 def _prompt_codes(parent, title, initial) -> "str | None":
