@@ -53,6 +53,10 @@ from selenium.webdriver.support import expected_conditions as EC  # noqa: E402
 from selenium.webdriver.support.ui import WebDriverWait  # noqa: E402
 
 from clock.webdriver_setup import initialize_driver  # noqa: E402
+from clock.action_state import (  # noqa: E402
+    ClockActionState, classify_clock_observation,
+)
+from clock.portal_port import ClockPortalPort  # noqa: E402
 from cmuh_common.atomic_io import (  # noqa: E402
     atomic_write_json, safe_load_json, safe_load_json_ex,
 )
@@ -512,10 +516,18 @@ class ClockAuthError(Exception):
     """[AC-09] 帳號/密碼錯誤——不可重試(重試也一樣,只會反覆登入失敗、有帳號鎖定風險)。"""
 
 
+def _clock_now() -> datetime:
+    return datetime.now()
+
+
+def _clock_today() -> date:
+    return date.today()
+
+
 def _clock_window_passed(check_end: dt_time, grace_sec: int = 0) -> bool:
     """[AC-01] 當下是否已超過打卡窗尾(可加緩衝秒)。打卡窗皆日間、不跨午夜。"""
     from datetime import timedelta
-    now = datetime.now()
+    now = _clock_now()
     deadline = datetime.combine(now.date(), check_end) + timedelta(seconds=grace_sec)
     return now > deadline
 
@@ -1062,7 +1074,7 @@ def _mark_clock_done(schedule_key, username) -> None:
     if not schedule_key or not username:
         return
     with _clock_done_lock:
-        _clock_done[(schedule_key, username)] = date.today().isoformat()
+        _clock_done[(schedule_key, username)] = _clock_today().isoformat()
         _clock_click_pending.pop((schedule_key, username), None)
     _save_clock_state()
 
@@ -1071,14 +1083,14 @@ def _is_clock_done(schedule_key, username) -> bool:
     if not schedule_key or not username:
         return False
     with _clock_done_lock:
-        return _clock_done.get((schedule_key, username)) == date.today().isoformat()
+        return _clock_done.get((schedule_key, username)) == _clock_today().isoformat()
 
 
 def _mark_clock_click_pending(schedule_key, username) -> bool:
     """點擊前先留下當窗意圖；正式背景模式寫盤失敗時不可冒險點擊。"""
     if not schedule_key or not username or not _clock_state_persistence_enabled:
         return False
-    today = date.today().isoformat()
+    today = _clock_today().isoformat()
     with _clock_done_lock:
         _clock_click_pending[(schedule_key, username)] = today
     if _save_clock_state():
@@ -1094,7 +1106,7 @@ def _mark_clock_click_pending(schedule_key, username) -> bool:
 def _is_clock_click_pending(schedule_key, username) -> bool:
     with _clock_done_lock:
         return (_clock_click_pending.get((schedule_key, username))
-                == date.today().isoformat())
+                == _clock_today().isoformat())
 
 
 def _clear_clock_click_pending(schedule_key, username) -> None:
@@ -1119,7 +1131,7 @@ def _mark_auth_failed(schedule_key, username) -> None:
     if not schedule_key or not username:
         return
     with _clock_done_lock:                 # 與 _clock_done 共用鎖(同一份狀態檔)
-        _auth_failed[(schedule_key, username)] = date.today().isoformat()
+        _auth_failed[(schedule_key, username)] = _clock_today().isoformat()
     _save_clock_state()
 
 
@@ -1127,7 +1139,7 @@ def _is_auth_failed(schedule_key, username) -> bool:
     if not schedule_key or not username:
         return False
     with _clock_done_lock:
-        return _auth_failed.get((schedule_key, username)) == date.today().isoformat()
+        return _auth_failed.get((schedule_key, username)) == _clock_today().isoformat()
 
 
 def _clear_auth_failed() -> None:
@@ -1170,12 +1182,12 @@ _MISSED_GRACE_END_MIN = 15
 
 def _was_missed_warned_today(schedule_key: str) -> bool:
     with _missed_warned_lock:
-        return _missed_warned.get(schedule_key) == date.today().isoformat()
+        return _missed_warned.get(schedule_key) == _clock_today().isoformat()
 
 
 def _mark_missed_warned(schedule_key: str) -> None:
     with _missed_warned_lock:
-        _missed_warned[schedule_key] = date.today().isoformat()
+        _missed_warned[schedule_key] = _clock_today().isoformat()
     _save_clock_state()
 
 
@@ -1203,7 +1215,7 @@ def _save_clock_state() -> bool:
     存檔鎖序列化整個「快照→寫檔」,避免並發後寫覆蓋。"""
     if not _clock_state_persistence_enabled:
         return True
-    today = date.today().isoformat()
+    today = _clock_today().isoformat()
     with _clock_state_save_lock:
         with _clock_done_lock:
             done = [[k, u] for (k, u), v in _clock_done.items() if v == today]
@@ -1231,7 +1243,7 @@ def _load_clock_state() -> None:
     (如 clock_done=null)不可拋例外殺掉 scheduler 啟動(載入在註冊排程之前)。"""
     try:
         raw = safe_load_json(str(CLOCK_STATE_FILE), default={})
-        today = date.today().isoformat()
+        today = _clock_today().isoformat()
         if not isinstance(raw, dict) or raw.get("date") != today:
             return
         done_n = 0
@@ -1376,9 +1388,46 @@ def _verify_clock_recorded(driver, get_loc, act_name: str,
         time_module.sleep(poll_sec)
 
 
+class _SeleniumClockPortal:
+    """Existing Selenium calls behind the same interface used by fake portals."""
+
+    def login(self, driver, wait, username, password):
+        login(driver, wait, username, password)
+
+    def read_swipes(self, driver, wait, get_loc):
+        return get_current_swipe_info(driver, wait, get_loc)
+
+    def select_action(self, driver, wait, locator):
+        radio_btn = wait.until(EC.presence_of_element_located(locator))
+        driver.execute_script("arguments[0].click();", radio_btn)
+
+    def handle_health(self, driver, wait, get_loc):
+        handle_health_declaration(driver, wait, WebDriverWait(driver, 5), get_loc)
+
+    def execute_button(self, wait, locator):
+        return wait.until(EC.presence_of_element_located(locator))
+
+    def highlight(self, driver, button):
+        driver.execute_script("arguments[0].style.border='5px solid red'", button)
+
+    def submit(self, driver, button):
+        driver.execute_script("arguments[0].click();", button)
+
+    def accept_alert(self, driver):
+        try:
+            WebDriverWait(driver, 5).until(EC.alert_is_present()).accept()
+        except TimeoutException:
+            pass
+
+    def verify(self, driver, get_loc, act_name, check_start, check_end, username):
+        return _verify_clock_recorded(
+            driver, get_loc, act_name, check_start, check_end, username)
+
+
 def perform_clock_action(driver, wait, acc, is_in: bool,
                         check_start: dt_time, check_end: dt_time,
-                        dry_run: bool = False, task_label: str = "") -> None:
+                        dry_run: bool = False, task_label: str = "",
+                        portal: ClockPortalPort | None = None) -> None:
     """★整段包在跨行程宣告裡★(外審 R3-P2-04 R2 P1)。
 
     「先查刷卡表、沒紀錄才打」是 check-then-act:查完到點下去之間還有 1~5 秒
@@ -1392,9 +1441,9 @@ def perform_clock_action(driver, wait, acc, is_in: bool,
     if dry_run:
         return _perform_clock_action_locked(
             driver, wait, acc, is_in, check_start, check_end, dry_run,
-            task_label)
+            task_label, portal=portal)
     key = (f"autoclock|{acc.get('username', '?')}|{'in' if is_in else 'out'}"
-           f"|{check_start}-{check_end}|{date.today().isoformat()}")
+           f"|{check_start}-{check_end}|{_clock_today().isoformat()}")
     with exclusive_claim(key) as owned:
         if not owned:
             logging.warning(
@@ -1404,15 +1453,17 @@ def perform_clock_action(driver, wait, acc, is_in: bool,
             return
         return _perform_clock_action_locked(
             driver, wait, acc, is_in, check_start, check_end, dry_run,
-            task_label)
+            task_label, portal=portal)
 
 
 def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                                  check_start: dt_time, check_end: dt_time,
                                  dry_run: bool = False,
-                                 task_label: str = "") -> None:
+                                 task_label: str = "",
+                                 portal: ClockPortalPort | None = None) -> None:
     pending_key = task_label or (
         f"manual:{'in' if is_in else 'out'}:{check_start}-{check_end}")
+    portal = portal if portal is not None else _SeleniumClockPortal()
 
     def get_loc(key):
         return (getattr(By, LOCATORS[key][0].upper()), LOCATORS[key][1])
@@ -1421,21 +1472,29 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
     last_exc = None
     for attempt in range(retries):
         try:
-            login(driver, wait, acc["username"], acc["password"])
+            portal.login(driver, wait, acc["username"], acc["password"])
 
-            _sys_date, swipes, _last, swipes_read_ok = get_current_swipe_info(
+            _sys_date, swipes, _last, swipes_read_ok = portal.read_swipes(
                 driver, wait, get_loc)
             act_name = "上班" if is_in else "下班"
 
+            has_record_in_window = (
+                _check_swipes(act_name, check_start, check_end, swipes)
+                if swipes_read_ok or dry_run else False)
+            observation = classify_clock_observation(
+                read_ok=swipes_read_ok,
+                has_record=has_record_in_window,
+                click_pending=_is_clock_click_pending(
+                    pending_key, acc["username"]),
+            )
+
             # [W4 2026-07-03] 讀刷卡表失敗 → 無法判斷是否已打卡 → 絕不打卡(避免重複打卡),
             # 拋出交給重試/下一分鐘 re-fire 重讀。dry_run 例外(僅驗流程)。
-            if not dry_run and not swipes_read_ok:
+            if not dry_run and observation is ClockActionState.READ_UNKNOWN:
                 raise WebDriverException(
                     "讀取刷卡表失敗,略過本次打卡以免重複打卡(將重試/下次 re-fire 重讀)")
 
-            has_record_in_window = _check_swipes(act_name, check_start, check_end, swipes)
-
-            if not dry_run and has_record_in_window:
+            if not dry_run and observation is ClockActionState.OFFICIAL_CONFIRMED:
                 logging.info(
                     "%s 在區間 %s-%s 內已有 %s 紀錄，跳過。",
                     acc["username"], check_start, check_end, act_name)
@@ -1444,7 +1503,7 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                 if pending_key != task_label:
                     _clear_clock_click_pending(pending_key, acc["username"])
                 return
-            if not dry_run and _is_clock_click_pending(pending_key, acc["username"]):
+            if not dry_run and observation is ClockActionState.CLICK_PENDING:
                 logging.warning(
                     "%s 本窗已送出打卡但官方紀錄仍未確認；本次只回讀、不重複點擊。"
                     "請確認電子刷卡系統，必要時人工處理。", acc["username"])
@@ -1459,16 +1518,15 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
             time_module.sleep(delay)
 
             rid_locator = get_loc("work_on_radio") if is_in else get_loc("work_off_radio")
-            radio_btn = wait.until(EC.presence_of_element_located(rid_locator))
-            driver.execute_script("arguments[0].click();", radio_btn)
+            portal.select_action(driver, wait, rid_locator)
 
             if is_in:
-                handle_health_declaration(driver, wait, WebDriverWait(driver, 5), get_loc)
+                portal.handle_health(driver, wait, get_loc)
 
-            exec_btn = wait.until(EC.presence_of_element_located(get_loc("execute_button")))
+            exec_btn = portal.execute_button(wait, get_loc("execute_button"))
 
             if dry_run:
-                driver.execute_script("arguments[0].style.border='5px solid red'", exec_btn)
+                portal.highlight(driver, exec_btn)
                 logging.info("[測試模式] %s %s 流程驗證成功！(未點擊執行)", acc["username"], act_name)
                 messagebox.showinfo(
                     "測試成功",
@@ -1494,19 +1552,15 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                 logging.error("%s 無法保存待確認打卡狀態，本次不點擊；請人工確認",
                               acc["username"])
                 return
-            driver.execute_script("arguments[0].click();", exec_btn)
-
-            try:
-                WebDriverWait(driver, 5).until(EC.alert_is_present()).accept()
-            except TimeoutException:
-                pass
+            portal.submit(driver, exec_btn)
+            portal.accept_alert(driver)
 
             # [W3 2026-07-03] 不再「點擊即標記完成」——那會在點擊後 portal/網路失敗時
             # 造成假成功(本窗 re-fire 全跳過→漏打卡)。改為重讀刷卡表確認新紀錄真的
             # 寫入才標記。確認不到就不標記(記警告),交下一分鐘 re-fire 重讀:紀錄真在
             # 會走 has_record 路徑補標記;真沒進去則重打。任何情況都不會重複打卡。
-            if _verify_clock_recorded(driver, get_loc, act_name,
-                                      check_start, check_end, acc["username"]):
+            if portal.verify(driver, get_loc, act_name,
+                             check_start, check_end, acc["username"]):
                 logging.info("%s %s 打卡成功(已重讀刷卡表確認紀錄)！",
                              acc["username"], act_name)
                 _mark_clock_done(task_label, acc["username"])
