@@ -63,6 +63,9 @@ import time  # noqa: E402
 import traceback  # noqa: E402
 import tkinter as tk  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
+from cmuh_common.consult_result import (  # noqa: E402
+    ConsultQueryStatus, capture_consult_query,
+)
 from datetime import datetime, time as dt_time  # noqa: E402
 from pathlib import Path  # noqa: E402
 from tkinter import messagebox, scrolledtext, ttk  # noqa: E402
@@ -5784,6 +5787,25 @@ class _DeliveryArtifact:
     occurrence_keys: tuple = ()
 
 
+def _seal_consult_delivery(*, recipients, subject, text_body, html_body,
+                           privacy_identities, message_id, business_key,
+                           occurrence_keys) -> _DeliveryArtifact:
+    """Freeze the redacted mail content before either transport can see it."""
+    from cmuh_common.consult_privacy import scrub  # noqa: PLC0415
+
+    identities = tuple(privacy_identities or ())
+    return _DeliveryArtifact(
+        recipients=tuple(recipients),
+        subject=scrub(subject, identities),
+        text_body=scrub(text_body, identities),
+        html_body=scrub(html_body, identities),
+        attachment=None,
+        message_id=message_id,
+        business_key=business_key,
+        occurrence_keys=tuple(occurrence_keys),
+    )
+
+
 def _new_message_id() -> str:
     """產生一個 Message-ID,整份 delivery 共用(重試也用同一個)。"""
     from email.utils import make_msgid  # noqa: PLC0415
@@ -7422,18 +7444,25 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                 #   會用新的 Message-ID 再寄一封 → 收件人收到兩封不一樣的清單。
                 #   查詢成功之後就把結果釘住,之後的 attempt 只重試寄送。
                 if his_result is None:
-                    his_result = run_consult_flow(trigger_label)
+                    query_result = capture_consult_query(
+                        run_consult_flow, trigger_label)
+                    if query_result.status is ConsultQueryStatus.READ_FAILED:
+                        assert query_result.error is not None
+                        raise query_result.error
+                    his_result = query_result
                     his_stage_done = True   # 這裡之後的失敗都不是 HIS 的問題
                 else:
                     logging.info("沿用上一次 attempt 已查到的會診結果(HIS 不重查)")
-                (shot, extracted_text, extracted_html, roster_texts,
-                 privacy_identities, privacy_roster_complete,
-                 _flow_token) = his_result
+                extracted_text = his_result.extracted_text
+                extracted_html = his_result.extracted_html
+                roster_texts = his_result.roster_texts
+                privacy_identities = his_result.privacy_identities
+                _flow_token = his_result.login_token
                 # [2026-06-25] 輪詢 poll:只在「出現新病歷號」時才寄;否則靜默結束
                 # (不寄、不更新基準 → 下一輪仍會再比對)。email/手動觸發不受此限,照常無條件寄。
                 _poll_extract_note = ""
                 if trigger_label == "poll":
-                    if roster_texts is None:
+                    if his_result.status is ConsultQueryStatus.ROSTER_UNKNOWN:
                         # [CQ-01] 清單解析失敗/停用 → 無法判斷有沒有新會診。fail-open 照常
                         # 寄信(信首註明以截圖為準),且【不更新基準】——避免把「解析失敗=空
                         # 集合」當成基準,下輪擷取恢復後所有未回覆會診都變「新」→ 對團隊重複
@@ -7561,7 +7590,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     text_parts.append(punch_text)
                 if extracted_text:
                     text_parts.append(extracted_text)
-                from cmuh_common.consult_privacy import PRIVACY_MARKER, scrub
+                from cmuh_common.consult_privacy import PRIVACY_MARKER
                 final_body = PRIVACY_MARKER + "\n\n" + "\n\n".join(text_parts)
                 # [美化 2026-06-15] HTML 版排版(multipart/alternative;純文字為
                 # fallback)。打卡狀態置於會診內容之前；不附未去識別截圖。
@@ -7569,8 +7598,6 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     date_str, time_str,
                     (_poll_extract_note + "\n" + body) if _poll_extract_note else body,
                     punch_html + extracted_html, _account_note)
-                final_body = scrub(final_body, privacy_identities)
-                final_html = scrub(final_html, privacy_identities)
                 # ★[2026-07-30 外審 P2-01] 寄信前先確認「我還是現役嗎」★
                 #   這段流程可能跑很久（HIS 慢/凍結/登入重試）。超過 gate 的
                 #   stale_after_sec（45 分）之後，新的一輪已經接手在做同一件事；
@@ -7586,12 +7613,12 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                 #   同一封信,而不是「再查一次、再組一封新的」。
                 #   病人截圖不落地、不夾帶；僅保留去識別後的信件內容。
                 if delivery is None:
-                    delivery = _DeliveryArtifact(
+                    delivery = _seal_consult_delivery(
                         recipients=tuple(recipients),
                         subject=subject,
                         text_body=final_body,
                         html_body=final_html,
-                        attachment=None,
+                        privacy_identities=privacy_identities,
                         message_id=_new_message_id(),
                         business_key=_consult_business_key(
                             roster_texts, recipients, subject),

@@ -54,19 +54,19 @@ class TestTheHisQueryHappensOnce:
 
         沒有守衛 = 每個 attempt 都重查一次 HIS。
         """
-        node = _guard_of("run_consult_flow", "his_result")
+        node = _guard_of("capture_consult_query", "his_result")
         assert node is not None, (
             "★每次 attempt 都會重跑 run_consult_flow★ 寄信失敗會害 HIS 被重複操作")
 
     def test_the_guard_runs_the_query_only_when_there_is_no_result(self):
         """求值而不是比對形狀（`if X is None` 與 `if X is not None` 的教訓）。"""
-        node = _guard_of("run_consult_flow", "his_result")
+        node = _guard_of("capture_consult_query", "his_result")
         for has_result, should_query in ((None, True), ("已經查到了", False)):
             taken = eval(  # noqa: S307 - 受控:只求值本檔案自己的守衛條件
                 compile(ast.Expression(body=node.test), "<guard>", "eval"),
                 {"__builtins__": {}}, {"his_result": has_result})
             branch = node.body if taken else node.orelse
-            ran = bool(_calls_to("run_consult_flow",
+            ran = bool(_calls_to("capture_consult_query",
                                  ast.Module(body=branch, type_ignores=[])))
             assert ran is should_query, (
                 f"his_result={has_result!r} 時 {'應該' if should_query else '不應'}查詢")
@@ -89,14 +89,17 @@ class TestTheHisQueryHappensOnce:
 class TestTheMailIsBuiltOnce:
 
     def test_the_artifact_is_guarded(self):
-        node = _guard_of("_DeliveryArtifact", "delivery")
+        node = _guard_of("_seal_consult_delivery", "delivery")
         assert node is not None, "★每個 attempt 都重組一封新的信★"
 
     def test_unredacted_screenshot_is_not_attached(self):
         """Patient identities in HIS screenshots must not bypass text redaction."""
-        node = _guard_of("_DeliveryArtifact", "delivery")
+        node = _guard_of("_seal_consult_delivery", "delivery")
+        assert node is not None
         assert not _calls_to("_materialize_shot")
-        artifacts = _calls_to("_DeliveryArtifact", node)
+        seal_tree = ast.parse(textwrap.dedent(
+            inspect.getsource(cq._seal_consult_delivery)))
+        artifacts = _calls_to("_DeliveryArtifact", seal_tree)
         assert artifacts
         for call in artifacts:
             attachment = next(k.value for k in call.keywords if k.arg == "attachment")
