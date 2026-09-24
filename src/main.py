@@ -13672,7 +13672,7 @@ class AutomationApp:
                               exc_info=True)
             try:
                 batches = partition_doctors_for_refresh_batches(doctors_to_check)
-                appointment_fetcher = getattr(
+                appointment_fetcher: Callable[..., Any] = getattr(
                     self, "_appointment_fetcher", check_appointment_count)
                 for bi, batch in enumerate(batches):
                     futures = []
