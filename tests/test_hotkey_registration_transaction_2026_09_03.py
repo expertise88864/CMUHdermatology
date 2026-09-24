@@ -135,6 +135,52 @@ def _press(kb, key):
     kb.registry[key]()
 
 
+def test_injected_keyboard_backend_owns_registration_and_rollback(monkeypatch):
+    global_backend = _FakeKeyboard()
+    injected = _FakeKeyboard()
+    app, actions = _app(monkeypatch, global_backend)
+    app._hotkey_backend = injected
+
+    app.setup_hotkeys()
+    assert global_backend.registry == {}
+    assert set(injected.registry) == set(_ALL_KEYS)
+    _press(injected, "F8")
+    assert actions == ["F8: 快速輸入文字 (設定頁可改)"]
+
+    old_callback = injected.registry["F8"]
+    injected.fail_at = "F12"
+    injected.unhook_all_raises = True
+    app.setup_hotkeys()
+    old_callback()
+    assert actions == ["F8: 快速輸入文字 (設定頁可改)"]
+    assert global_backend.registry == {}
+
+
+def test_injected_his_window_reader_keeps_foreign_dialog_out(monkeypatch):
+    kb = _FakeKeyboard()
+    app, actions = _app(monkeypatch, kb)
+    app._hotkey_foreground_reader = lambda: (17, "#32770")
+    app._hotkey_his_window_finder = lambda: 29
+    pids = {17: 100, 29: 200}
+    app._hotkey_window_pid_reader = pids.__getitem__
+    app.setup_hotkeys()
+
+    _press(kb, "F9")
+    assert actions == []
+    pids[17] = 200
+    _press(kb, "F9")
+    assert actions == ["F9: 腫瘤同意書"]
+
+
+def test_injected_foreground_reader_fails_closed(monkeypatch):
+    kb = _FakeKeyboard()
+    app, actions = _app(monkeypatch, kb)
+    app._hotkey_foreground_reader = lambda: None
+    app.setup_hotkeys()
+    _press(kb, "F1")
+    assert actions == []
+
+
 def test_registered_f7_f8_f12_callbacks_are_inert_during_shutdown(monkeypatch):
     """OS may deliver a queued callback after closing has begun."""
     kb = _FakeKeyboard()

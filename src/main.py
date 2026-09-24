@@ -20,6 +20,7 @@ if _HERE not in sys.path:
 
 # === cmuh_common 共用基底 ===
 from cmuh_common.version import CURRENT_VERSION
+from cmuh_common.his_memo_port import HisMemoPort
 from cmuh_common.paths import (
     HANDSHAKE_READY, HANDSHAKE_WAITING_MUTEX,
     OWNER_OTHER, OWNER_SELF, OWNER_UNKNOWN, SPAWN_RECOVERY_FAILED,
@@ -421,7 +422,7 @@ def _retention_rules() -> list:
     """
     return _retention_default_rules(get_settings_dir())
 
-def safe_unhook_all_hotkeys() -> bool:
+def safe_unhook_all_hotkeys(keyboard_backend=None) -> bool:
     """拔掉所有全域 hook。回 True=確實拔掉;False=`unhook_all()` 自己拋了例外。
 
     [R8-P2 外審 r1] 舊版只回 None、把例外吞成 warning —— 對「關程式」的呼叫端無所謂,
@@ -429,12 +430,23 @@ def safe_unhook_all_hotkeys() -> bool:
     正是那一批要消滅的狀態。所以要回報;呼叫端決定要不要在乎。
     """
     try:
-        if hotkey_modules.keyboard is not None:
-            hotkey_modules.keyboard.unhook_all()
+        backend = keyboard_backend if keyboard_backend is not None else hotkey_modules.keyboard
+        if backend is not None:
+            backend.unhook_all()
         return True
     except Exception as e:
         logging.warning(f"Failed to unhook hotkeys cleanly: {e}")
         return False
+
+
+def _read_hotkey_foreground_window() -> tuple[int, str] | None:
+    """Read only the foreground identity needed by the clinical hotkey guard."""
+    hwnd = ctypes.windll.user32.GetForegroundWindow()
+    if not hwnd:
+        return None
+    cls_buf = ctypes.create_unicode_buffer(64)
+    ctypes.windll.user32.GetClassNameW(hwnd, cls_buf, 64)
+    return hwnd, cls_buf.value
 
 # 總覽門診表「本科主診間」:A101→A102→A103→A104→A105(自家固定診間)。語意:
 #   1) 醫師列不另標這五間的診間號(免冗餘);其餘診間(他科借診/特殊)才顯示「(診間)」。
@@ -3500,7 +3512,8 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
 
 
 def _update_uvb_dose_core(label: str, *, strict: bool,
-                          codes_already_placed: str = ""):
+                          codes_already_placed: str = "",
+                          memo_port: HisMemoPort | None = None):
     """[v20.9 2026-05-26] F1 / F2/F3 共用核心邏輯。
 
     [UD-09 2026-07-12] codes_already_placed:非空=呼叫端在本函式【之前】已輸入完成的
@@ -3529,7 +3542,8 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
         f"\n\n注意:{codes_already_placed} 已在本次 {label} 先行輸入完成。\n"
         f"若醫師因此決定今天不照光,請記得手動刪除該醫令與療程設定。"
     ) if codes_already_placed else ""
-    main_hwnd = _find_hospital_main_window()
+    main_hwnd = (memo_port.find_main_window() if memo_port is not None
+                 else _find_hospital_main_window())
     if not main_hwnd:
         if strict:
             logging.warning("[%s][UVB] 找不到主程式視窗 → 終止", label)
@@ -3541,7 +3555,9 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
         return True
 
     # [2026-06-01/06-18] 找照光處置 memo + 分類(見 _resolve_phototherapy_disposition)。
-    memo_hwnd, photo_kind = _resolve_phototherapy_disposition(main_hwnd)
+    memo_hwnd, photo_kind = (
+        memo_port.locate_phototherapy(main_hwnd) if memo_port is not None
+        else _resolve_phototherapy_disposition(main_hwnd))
     # [2026-06-18] UVB 與 excimer 分屬不同控件 → 無法自動判斷本次是健保 UVB 還是自費
     # Excimer → 一律警告並中止,交醫師手動(billing 風險方向都很糟,寧可不自動動作)。
     if photo_kind == "ambiguous":
@@ -3569,7 +3585,8 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
         logging.info("[%s][UVB] 處置內無 UVB 行 — 跳過 (新病人正常情況)", label)
         return True
 
-    text = _read_tmemo_text(memo_hwnd)
+    text = (memo_port.read_memo(memo_hwnd) if memo_port is not None
+            else _read_tmemo_text(memo_hwnd))
     if not text:
         if strict:
             logging.warning("[%s][UVB] TMemo hwnd=%s 讀文字為空 → 終止",
@@ -3594,7 +3611,9 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
         logging.info(
             "[%s][Excimer] 純自費 Excimer(無 UVB)→ 更新 excimer 劑量 + 身份設 01,"
             "不 key 51019/療程", label)
-        return _f23_pure_excimer_update(main_hwnd, memo_hwnd, text, label)
+        return (memo_port.update_excimer(main_hwnd, memo_hwnd, text, label)
+                if memo_port is not None
+                else _f23_pure_excimer_update(main_hwnd, memo_hwnd, text, label))
 
     try:
         from cmuh_common.uvb_dose import update_uvb_in_text, UvbAction
@@ -3801,7 +3820,8 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
     # wrapper 的 check_stop 到此要經過『找主視窗+列舉控件+逐一 gettext(各 2.5s 上限)+parse』,
     # HIS 慢時達數秒,期間按 F12 原本完全不被理會、memo 照樣被覆寫。補上最終 check_stop(近零成本)。
     check_stop()
-    if not _write_tmemo_text(memo_hwnd, final_text):
+    if not (memo_port.write_memo(memo_hwnd, final_text) if memo_port is not None
+            else _write_tmemo_text(memo_hwnd, final_text)):
         logging.warning("[%s][UVB] WM_SETTEXT 寫回處置失敗 → 終止", label)
         _show_uvb_warning(
             main_hwnd, "UVB 寫回失敗",
@@ -3816,7 +3836,8 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
         return False
 
     # 寫回後實機 read 驗證 — Delphi onChange 可能 reformat 過
-    actual_text = _read_tmemo_text(memo_hwnd)
+    actual_text = (memo_port.read_memo(memo_hwnd) if memo_port is not None
+                   else _read_tmemo_text(memo_hwnd))
     if not actual_text:
         # [UD-08 2026-07-12] read-back 讀回空字串(HIS 卡頓/WM_GETTEXT 逾時)→ 無法驗證寫回是否
         # 成功。保守中止(strict):避免「寫回其實失敗但 51019 照下」的反向不一致無人把關;已跳警告
@@ -9555,7 +9576,7 @@ class AutomationApp:
             stop_event_automation.set()
         except Exception:
             logging.debug("stop_event_automation.set 失敗", exc_info=True)
-        safe_unhook_all_hotkeys()
+        safe_unhook_all_hotkeys(getattr(self, "_hotkey_backend", None))
         try:
             self._cancel_pending_refresh_tick_ui()
         except Exception:
@@ -9671,7 +9692,7 @@ class AutomationApp:
         def _preready_for_handover():
             """[第九輪 §4] 子行程回報「即將搶 mutex」(或 0.6s 仍活著)時做的★快而關鍵★兩件事。"""
             try:
-                safe_unhook_all_hotkeys()
+                safe_unhook_all_hotkeys(getattr(self, "_hotkey_backend", None))
             except Exception:
                 logging.debug("unhook hotkeys during restart failed.", exc_info=True)
             # [2026-05-22 v29] mutex 一定要釋放,否則新 process 的 ensure_single_instance
@@ -13651,6 +13672,8 @@ class AutomationApp:
                               exc_info=True)
             try:
                 batches = partition_doctors_for_refresh_batches(doctors_to_check)
+                appointment_fetcher = getattr(
+                    self, "_appointment_fetcher", check_appointment_count)
                 for bi, batch in enumerate(batches):
                     futures = []
                     batch_workers = max(1, min(len(batch), 6))
@@ -13669,7 +13692,8 @@ class AutomationApp:
                             worker_config["_is_manual_refresh"] = bool(is_manual)
                             # [外審 SB #2] 世代戳:殭屍的過期資料不得覆蓋新資料
                             worker_config["_refresh_gen"] = _my_refresh_gen
-                            future = refresh_pool.submit(check_appointment_count, self.ui_queue, worker_config)
+                            future = refresh_pool.submit(
+                                appointment_fetcher, self.ui_queue, worker_config)
                             futures.append(future)
                         wait(futures, return_when=ALL_COMPLETED)
                     for fut in futures:
@@ -16771,7 +16795,10 @@ class AutomationApp:
         _txn = self._hotkey_txn
         self._hotkey_txn_committed = None
         self._floating_hotkey_registered = False
-        if not self._heavy_modules_ready or hotkey_modules.keyboard is None:
+        keyboard_backend = getattr(self, "_hotkey_backend", None)
+        if keyboard_backend is None:
+            keyboard_backend = hotkey_modules.keyboard
+        if not self._heavy_modules_ready or keyboard_backend is None:
             self.hotkey_text_label.config(text="熱鍵模組載入中...")
             self.status_text.set("狀態: 熱鍵模組尚未就緒")
             return
@@ -16843,24 +16870,29 @@ class AutomationApp:
                 tag = "(嚴格)" if strict else "(寬鬆)"
                 def _wrapped():
                     try:
-                        fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
-                        if not fg_hwnd:
+                        foreground_reader = getattr(
+                            self, "_hotkey_foreground_reader", _read_hotkey_foreground_window)
+                        foreground = foreground_reader()
+                        if foreground is None:
                             return
-                        cls_buf = ctypes.create_unicode_buffer(64)
-                        ctypes.windll.user32.GetClassNameW(fg_hwnd, cls_buf, 64)
-                        if cls_buf.value not in allow:
+                        fg_hwnd, class_name = foreground
+                        if class_name not in allow:
                             logging.debug(
                                 "[hotkey] %s 觸發但前景=%r 不在 allow list %s → skip",
-                                key_name, cls_buf.value, tag)
+                                key_name, class_name, tag)
                             return
                         # [L5 2026-07-09] #32770 是【任何程式】共用的 Windows 標準對話框 class;
                         # 只憑 class 放行會讓別的程式的對話框在前景時也能觸發 F9-F12(對 HIS 背景
                         # 亂動)。額外要求該 #32770 確實屬於 HIS 行程,否則 skip。其餘 class 都是 HIS
                         # 專屬,不需此檢查。找不到 HIS/取不到 PID → 保守 skip。
-                        if cls_buf.value == "#32770":
-                            his_hwnd = _find_hospital_main_window()
-                            his_pid = _get_window_pid(his_hwnd) if his_hwnd else 0
-                            if not his_pid or _get_window_pid(fg_hwnd) != his_pid:
+                        if class_name == "#32770":
+                            find_his_window = getattr(
+                                self, "_hotkey_his_window_finder", _find_hospital_main_window)
+                            get_window_pid = getattr(
+                                self, "_hotkey_window_pid_reader", _get_window_pid)
+                            his_hwnd = find_his_window()
+                            his_pid = get_window_pid(his_hwnd) if his_hwnd else 0
+                            if not his_pid or get_window_pid(fg_hwnd) != his_pid:
                                 logging.debug(
                                     "[hotkey] %s 前景 #32770 不屬 HIS 行程 → skip",
                                     key_name)
@@ -16905,7 +16937,7 @@ class AutomationApp:
                     callback()
                 return _gated
 
-            if not safe_unhook_all_hotkeys():
+            if not safe_unhook_all_hotkeys(keyboard_backend):
                 logging.error(
                     "[hotkey] 交易開頭 unhook_all 失敗 —— 上一筆交易的熱鍵可能仍掛著,"
                     "已由交易閘門封鎖(committed=None),本次註冊繼續")
@@ -16939,10 +16971,10 @@ class AutomationApp:
                 if key == 'F7':
                     # Non-suppressing add_hotkey release callbacks lose the released
                     # key from the library's pressed-key table before dispatch.
-                    hotkey_modules.keyboard.on_release_key(
+                    keyboard_backend.on_release_key(
                         key, lambda _event, action=callback: action(), suppress=False)
                 else:
-                    hotkey_modules.keyboard.add_hotkey(key, callback, suppress=False)
+                    keyboard_backend.add_hotkey(key, callback, suppress=False)
             if not his_disabled_reason:
                 # F12 (中止) 是救援鍵：自動化執行中不做前景限制；平常仍用寬鬆 guard。
                 f12_guarded = _hotkey_guard(
@@ -16957,7 +16989,7 @@ class AutomationApp:
                         return
                     f12_guarded()
 
-                hotkey_modules.keyboard.add_hotkey(
+                keyboard_backend.add_hotkey(
                     'F12',
                     _txn_gate(_f12_callback, 'F12'),
                     suppress=False,
@@ -16993,7 +17025,7 @@ class AutomationApp:
             # [外審 r1] rollback 本身也可能失敗 —— 那時 registry 裡仍有半套,但它們
             # 全部包著交易閘門而 committed 仍是 None → ★一顆都不會執行★。這裡據實
             # 記 ERROR,不可以假裝拔乾淨了。
-            if not safe_unhook_all_hotkeys():
+            if not safe_unhook_all_hotkeys(keyboard_backend):
                 logging.error(
                     "[hotkey] 註冊失敗後 rollback(unhook_all)也失敗 —— 半套熱鍵仍在"
                     " registry,但已由交易閘門封鎖(committed=None),不會執行")
