@@ -16,7 +16,7 @@ import statistics
 import subprocess
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import ExitStack
 from datetime import date, timedelta
 from pathlib import Path
@@ -50,11 +50,13 @@ def make_case(name: str):
         "pgy4_clerk4_cross": (4, 4, 0, 0, True),
         "pgy4_clerk5_mix1": (4, 5, 1, 1, True),
         "pgy4_mix2": (4, 0, 2, 2, True),
+        "pgy4_offset": (4, 0, 0, 0, True),
     }
     pgy_n, clerk_n, external_n, family_n, constrained = profiles[name]
     month = "2026-10"
     days = [date(2026, 10, n) for n in range(1, 32)
-            if date(2026, 10, n).weekday() < 5]
+            if date(2026, 10, n).weekday() < 5
+            and not (name == "pgy4_offset" and n == 9)]
     grid = {}
     doctors = {}
     for d in days:
@@ -98,12 +100,30 @@ def make_case(name: str):
     locked = ({"2026-10-06": {"上午": {
         PHOTO: ["P1"], TREATMENT: ["P2"], "101": [batches[0].members[0]]}}}
               if constrained and batches else {})
+    prior_sessions = {}
+    if name == "pgy4_clerk4_cross":
+        prior_sessions = {
+            "2026-09-28": {"上午": {"101": ["C1_1"], "102": ["C1_2"]},
+                           "下午": {"101": ["C1_3"], "102": ["C1_4"]}},
+            "2026-09-29": {"上午": {"101": ["C1_1"], "102": ["C1_2"]},
+                           "下午": {"切片室": ["C1_3"]}},
+            "2026-09-30": {"上午": {"101": ["C1_3"], "102": ["C1_4"]}},
+        }
+        for day_number in (28, 29, 30):
+            prior_day = date(2026, 9, day_number)
+            doctors[prior_day] = {
+                session: {room: f"D{(day_number + int(room)) % 5 + 1}"
+                          for room in ("101", "102")}
+                for session in ("上午", "下午")}
     return DaySolveInput(
         month, grid, [f"P{i + 1}" for i in range(pgy_n)],
         clerk_batches=batches, batch_order=batches, biopsy_open=biopsy_open,
         external_roster=external, family_roster=family,
         family_follow=family_follow, clinic_doctors=doctors,
         leaves=leave, session_leaves=session_leave, locked=locked,
+        prior_sessions=prior_sessions,
+        holidays=({date(2026, 10, 9)} if name == "pgy4_offset" else set()),
+        pgy_photo_offsets=({"P1": -1} if name == "pgy4_offset" else {}),
         capacity=2, course_days=course_days,
         course_clinic_days={d.isoformat() for d in days
                             if any(grid[d].values())})
@@ -134,19 +154,32 @@ def _hard_checks(inp, slots, activity_issues=()):
     from cmuh_common.roster.session_leave import on_leave
 
     issues = []
+    grid_dates = {d.isoformat() for d in inp.grid}
+    for iso, sessions in slots.items():
+        if (iso not in grid_dates and
+                any(people for cells in sessions.values()
+                    for room, people in cells.items() if room != REST)):
+            issues.append(f"{iso}:out-of-grid-assignment")
     for d in inp.grid:
         iso = d.isoformat()
         if d.weekday() >= 5 or d in inp.holidays:
+            if any(people for cells in slots.get(iso, {}).values()
+                   for room, people in cells.items() if room != REST):
+                issues.append(f"{iso}:closed-day-assignment")
             continue
         for session in ("上午", "下午"):
             cells = slots.get(iso, {}).get(session, {})
-            if not cells.get(PHOTO):
-                issues.append(f"{iso}/{session}:photo-missing")
+            if len(cells.get(PHOTO, [])) != 1:
+                issues.append(f"{iso}/{session}:photo-staffing")
+            if any(p not in inp.pgy_roster for p in cells.get(PHOTO, [])):
+                issues.append(f"{iso}/{session}:photo-non-pgy")
             photo_only = (d.weekday() == 2 and session == "下午") or (
                 len(set(inp.pgy_roster)) == 2
                 and (d.weekday(), session) in TWO_PGY_PHOTO_ONLY)
-            if not photo_only and not cells.get(TREATMENT):
-                issues.append(f"{iso}/{session}:treatment-missing")
+            if not photo_only and len(cells.get(TREATMENT, [])) != 1:
+                issues.append(f"{iso}/{session}:treatment-staffing")
+            if any(p not in inp.pgy_roster for p in cells.get(TREATMENT, [])):
+                issues.append(f"{iso}/{session}:treatment-non-pgy")
             assigned = [p for people in cells.values() for p in people]
             if len(assigned) != len(set(assigned)):
                 issues.append(f"{iso}/{session}:double-booked")
@@ -169,15 +202,19 @@ def _hard_checks(inp, slots, activity_issues=()):
                         issues.append(f"{iso}/{session}/{p}:on-leave")
             if session in inp.locked.get(iso, {}) and cells != inp.locked[iso][session]:
                 issues.append(f"{iso}/{session}:lock-changed")
-            if d.weekday() == 2 and session == "下午" and cells.get(TREATMENT):
+            if photo_only and cells.get(TREATMENT):
                 issues.append(f"{iso}/{session}:unexpected-treatment")
     issues.extend(activity_issues)
     return issues
 
 
 def _quality(inp, slots, activity_issues=()):
-    from cmuh_common.roster.solve_day import person_course_stats
-    from cmuh_common.roster.training_bands import training_warnings
+    from cmuh_common.roster.solve_day import (
+        BIOPSY, STUDENT_SESSIONS, is_follow_slot, person_course_stats,
+    )
+    from cmuh_common.roster.training_bands import (
+        available_slots, band, training_warnings,
+    )
 
     pgy = person_course_stats(slots, include=set(inp.pgy_roster))
     totals = {p: sum(pgy.get(p, {}).get(k, 0) for k in ("photo", "tx", "follow"))
@@ -186,12 +223,112 @@ def _quality(inp, slots, activity_issues=()):
     participants.update(c for b in inp.clerk_batches for c in b.members)
     all_counts = person_course_stats(slots, include=participants)
     per_person = {p: {k: all_counts.get(p, {}).get(k, 0)
-                      for k in ("photo", "tx", "follow", "biopsy")}
+                      for k in ("photo", "photo_wed_pm", "tx", "follow", "biopsy")}
                   for p in sorted(participants)}
+    for p in inp.pgy_roster:
+        row = per_person[p]
+        row["necessary"] = row["photo"] + row["tx"]
+        row["total"] = row["necessary"] + row["follow"]
+        row["photo_offset"] = inp.pgy_photo_offsets.get(p, 0)
+        row["offset_adjusted_total"] = row["total"] - row["photo_offset"]
+
+    # Include the actual adjacent-month course segments. A month-only count can
+    # make a cross-month Clerk course appear to miss its quota or biopsy target.
+    sources = {iso: sessions for iso, sessions in inp.prior_sessions.items()
+               if iso[:7] < inp.ym}
+    sources.update({iso: sessions for iso, sessions in inp.course_fixed.items()
+                    if iso[:7] > inp.ym})
+    sources.update({iso: sessions for iso, sessions in slots.items()
+                    if iso[:7] == inp.ym})
+    weeks = defaultdict(Counter)
+    clerk_course_weeks = defaultdict(Counter)
+    daily = defaultdict(Counter)
+    biopsies = defaultdict(Counter)
+    clerk_biopsy_weeks = defaultdict(Counter)
+    doctors = defaultdict(Counter)
+    unknown_doctors = Counter()
+    for iso, sessions in sources.items():
+        d = date.fromisoformat(iso)
+        for session, cells in sessions.items():
+            if session not in STUDENT_SESSIONS:
+                continue
+            for room, people in cells.items():
+                for person in people:
+                    if person not in participants:
+                        continue
+                    if room == BIOPSY:
+                        if iso[:7] == inp.ym:
+                            biopsies[person]["first" if d.day <= 14 else "second"] += 1
+                        for batch in inp.clerk_batches:
+                            if person in batch.members and batch.covers(d):
+                                course_week = 1 + (d - batch.start_monday).days // 7
+                                clerk_biopsy_weeks[batch.id, person][str(course_week)] += 1
+                    if not is_follow_slot(room):
+                        continue
+                    if iso[:7] != inp.ym and person not in {
+                        p for b in inp.clerk_batches if b.covers(d) for p in b.members
+                    }:
+                        continue
+                    week_year, week, _ = d.isocalendar()
+                    weeks[person][f"{week_year}-W{week:02d}"] += 1
+                    for batch in inp.clerk_batches:
+                        if person in batch.members and batch.covers(d):
+                            clerk_course_weeks[batch.id, person][
+                                f"{week_year}-W{week:02d}"] += 1
+                    daily[person][iso] += 1
+                    doctor = inp.clinic_doctors.get(d, {}).get(session, {}).get(room)
+                    if doctor:
+                        doctors[person][doctor] += 1
+                    else:
+                        unknown_doctors[person] += 1
+
+    clerk_courses = {}
+    for batch in inp.clerk_batches:
+        end = batch.start_monday + timedelta(days=13)
+        stats = person_course_stats(sources, include=set(batch.members),
+                                    start=batch.start_monday, end=end)
+        clerk_courses[batch.id] = {
+            "start": batch.start_monday.isoformat(), "end": end.isoformat(),
+            "complete": end.strftime("%Y-%m") <= inp.ym,
+            "members": {p: {"follow": stats.get(p, {}).get("follow", 0),
+                            "biopsy": stats.get(p, {}).get("biopsy", 0),
+                            "biopsy_by_course_week": dict(sorted(
+                                clerk_biopsy_weeks[batch.id, p].items())),
+                            "weekly_follows": dict(sorted(
+                                clerk_course_weeks[batch.id, p].items()))}
+                        for p in batch.members},
+        }
+    training = {}
+    for scope, people in (("family", inp.family_roster),
+                          ("external", inp.external_roster)):
+        for person in people:
+            available = available_slots(inp, scope, person)
+            low, target, high = band(len(available))
+            training[person] = {
+                "scope": scope, "available_half_days": len(available),
+                "minimum": low, "target": target, "maximum": high,
+                "follow": per_person[person]["follow"],
+                "follow_ratio": (round(per_person[person]["follow"] / len(available), 4)
+                                 if available else None),
+                "biopsy_by_half": dict(sorted(biopsies[person].items())),
+            }
+    diversity = {
+        p: {"known_doctors": dict(sorted(doctors[p].items())),
+            "distinct_doctors": len(doctors[p]),
+            "unknown_doctor_follows": unknown_doctors[p]}
+        for p in sorted(participants)
+    }
     return {"hard_issues": _hard_checks(inp, slots, activity_issues),
             "pgy_workload": totals,
             "pgy_workload_range": max(totals.values()) - min(totals.values()) if totals else 0,
-             "sample_month_person_counts": per_person,
+            "sample_month_person_counts": per_person,
+            "weekly_follows": {p: dict(sorted(weeks[p].items()))
+                               for p in sorted(participants)},
+            "daily_follows": {p: dict(sorted(daily[p].items()))
+                              for p in sorted(participants)},
+            "clerk_courses": clerk_courses,
+            "training": training,
+            "doctor_diversity": diversity,
             "training_warnings": training_warnings(inp, slots)}
 
 
@@ -290,6 +427,7 @@ def run_once(inp):
             "solver_statuses": statuses,
             "quality": (_quality(inp, slots, activity_issues)
                         if slots is not None else None),
+            "warnings": list(warnings) if slots is not None else None,
             "warning_count": len(warnings) if slots is not None else None,
             "error": error}
 
@@ -306,9 +444,14 @@ def main():
     from cmuh_common.roster.solve_day import day_input_fingerprint
 
     names = args.cases or ("pgy2", "pgy4_clerk4_cross", "pgy4_clerk5_mix1",
-                           "pgy4_mix2")
+                           "pgy4_mix2", "pgy4_offset")
     git_status = subprocess.run(
         ["git", "-C", str(source.parent), "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True, text=True, check=False)
+    relevant_status = subprocess.run(
+        ["git", "-C", str(source.parent), "status", "--porcelain",
+         "--untracked-files=all", "--", "src/cmuh_common/roster",
+         "scripts/benchmark_day_roster.py", "scripts/compare_day_roster.py"],
         capture_output=True, text=True, check=False)
     result = {"environment": {
         "python": sys.version.split()[0], "platform": platform.platform(),
@@ -318,6 +461,8 @@ def main():
         "revision": subprocess.run(["git", "-C", str(source.parent), "rev-parse", "HEAD"],
                                    capture_output=True, text=True, check=False).stdout.strip(),
         "source_dirty": bool(git_status.stdout.strip()) if git_status.returncode == 0 else None,
+        "relevant_source_dirty": (bool(relevant_status.stdout.strip())
+                                  if relevant_status.returncode == 0 else None),
         "samples": args.samples, "warmups": args.warmups,
     }, "cases": {}}
     for name in names:

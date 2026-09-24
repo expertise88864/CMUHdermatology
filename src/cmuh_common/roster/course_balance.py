@@ -30,6 +30,24 @@ def external_roster(inp):
     return sorted(set(inp.external_roster) - occupied)
 
 
+def _has_adjacent_clerk_work(inp, clerk_members):
+    for source in (inp.prior_sessions, inp.course_fixed):
+        if not isinstance(source, dict):
+            continue
+        for sessions in source.values():
+            if not isinstance(sessions, dict):
+                continue
+            for cells in sessions.values():
+                if not isinstance(cells, dict):
+                    continue
+                for room, members in cells.items():
+                    if room == REST or not isinstance(members, (list, tuple, set)):
+                        continue
+                    if any(p in clerk_members for p in members):
+                        return True
+    return False
+
+
 def _weeks(inp):
     weeks = defaultdict(list)
     for d in sorted(inp.grid):
@@ -218,6 +236,12 @@ def add_external(inp, slots, log, warnings, *, control=None):
     # uses capacity left after everyone's targets, never a PGY's weekly minimum.
     phases = (*training_phases[:2], clerk_objective, *training_phases[2:],
               clerk_extra, spread_objective)
+    clerk_members = {p for batch in inp.clerk_batches for p in batch.members}
+    adjacent_clerk_work = _has_adjacent_clerk_work(inp, clerk_members)
+    # A measured cross-month fixture with prior Clerk credit regressed when
+    # hinted, so keep the original search for courses with adjacent-month work.
+    use_priority_hints = (not adjacent_clerk_work and
+                          any(len(batch.members) >= 4 for batch in inp.clerk_batches))
     saved = None
     all_optimal = True
     for index, objective in enumerate(phases):
@@ -234,6 +258,13 @@ def add_external(inp, slots, log, warnings, *, control=None):
             all_optimal = False
             break
         model.add(expression == solver.value(expression))
+        # The just-proved assignment remains feasible after the priority is
+        # frozen. Offer it as a search hint to the next objective; hints do not
+        # change the feasible set or the lexicographic priority constraints.
+        if use_priority_hints:
+            model.clear_hints()
+            for variable in choices.values():
+                model.add_hint(variable, solver.value(variable))
     if not all_optimal:
         warnings.append("學員門診最佳化尚未證明最優，保留已知最佳可行班表")
     if saved is None:
