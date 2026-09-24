@@ -202,18 +202,39 @@ def run_once(inp):
     statuses = []
     stage_stack = []
     original_solve = cp_model.CpSolver.solve
+    original_model_init = cp_model.CpModel.__init__
+    model_born = {}
+    last_solve_end = {}
+    model_phase_count = Counter()
+
+    def tracked_model_init(model, *args, **kwargs):
+        original_model_init(model, *args, **kwargs)
+        model_born[model] = time.perf_counter()
 
     def tracked_solve(solver, model, *args, **kwargs):
         started = time.perf_counter()
+        model_phase_count[model] += 1
+        phase_index = model_phase_count[model]
+        setup_start = (model_born.get(model) if phase_index == 1
+                       else last_solve_end.get(model))
+        setup_seconds = (round(started - setup_start, 4)
+                         if setup_start is not None else None)
+        model_variables = len(model.proto.variables)
+        model_constraints = len(model.proto.constraints)
         result = original_solve(solver, model, *args, **kwargs)
+        finished = time.perf_counter()
+        last_solve_end[model] = finished
         proved_or_feasible = result in (cp_model.OPTIMAL, cp_model.FEASIBLE)
         statuses.append({"stage": stage_stack[-1] if stage_stack else "other",
+                         "phase_index": phase_index,
                          "status": solver.status_name(result),
-                         "seconds": round(time.perf_counter() - started, 4),
+                         "seconds": round(finished - started, 4),
+                         "setup_seconds": setup_seconds,
+                         "model_variables": model_variables,
+                         "model_constraints": model_constraints,
                          "objective": (round(solver.objective_value, 4)
                                        if proved_or_feasible else None),
-                         "best_bound": (round(solver.best_objective_bound, 4)
-                                        if proved_or_feasible else None)})
+                         "best_bound": round(solver.best_objective_bound, 4)})
         return result
 
     activity_issues = []
@@ -246,6 +267,7 @@ def run_once(inp):
     warnings = []
     error = None
     with ExitStack() as stack:
+        stack.enter_context(patch.object(cp_model.CpModel, "__init__", tracked_model_init))
         stack.enter_context(patch.object(cp_model.CpSolver, "solve", tracked_solve))
         timed(solve_day, "_month_solve_attendance", "attendance", stack)
         timed(course_balance, "add_external", "training", stack)
@@ -301,13 +323,39 @@ def main():
                     [sample["stages"].get(stage, 0) for sample in samples]),
                           "range": [min(sample["stages"].get(stage, 0) for sample in samples),
                                     max(sample["stages"].get(stage, 0) for sample in samples)]}
-                  for stage in ("attendance", "training", "pgy_balance", "doctor_diversity")}
+                  for stage in ("attendance", "training", "clerk_spread",
+                                "pgy_balance", "doctor_diversity")}
+        layer_keys = sorted({(status["stage"], status["phase_index"])
+                             for sample in samples
+                             for status in sample["solver_statuses"]})
+        layer_summaries = []
+        for stage, phase_index in layer_keys:
+            observed = [status for sample in samples
+                        for status in sample["solver_statuses"]
+                        if status["stage"] == stage
+                        and status["phase_index"] == phase_index]
+            seconds = [status["seconds"] for status in observed]
+            setups = [status["setup_seconds"] for status in observed
+                      if status["setup_seconds"] is not None]
+            layer_summaries.append({
+                "stage": stage, "phase_index": phase_index,
+                "observations": len(observed),
+                "statuses": dict(Counter(s["status"] for s in observed)),
+                "median_seconds": statistics.median(seconds),
+                "range_seconds": [min(seconds), max(seconds)],
+                "median_setup_seconds": statistics.median(setups) if setups else None,
+                "model_variables": [min(s["model_variables"] for s in observed),
+                                    max(s["model_variables"] for s in observed)],
+                "model_constraints": [min(s["model_constraints"] for s in observed),
+                                      max(s["model_constraints"] for s in observed)],
+            })
         result["cases"][name] = {
             "input_fingerprint": day_input_fingerprint(inp),
             "warmup_seconds": [s["seconds"] for s in warmups],
             "median_seconds": statistics.median(values),
             "range_seconds": [min(values), max(values)],
-            "stages": stages, "samples": samples,
+            "stages": stages, "solver_layers": layer_summaries,
+            "samples": samples,
         }
         print(f"{name}: median {statistics.median(values):.2f}s; "
               f"range {min(values):.2f}–{max(values):.2f}s", flush=True)

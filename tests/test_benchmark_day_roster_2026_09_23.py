@@ -17,6 +17,10 @@ def test_two_pgy_photo_only_sessions_pass_hard_checks():
     assert sample["error"] is None
     assert sample["quality"]["hard_issues"] == []
     assert all(s["stage"] and s["status"] for s in sample["solver_statuses"])
+    assert all(s["phase_index"] >= 1 and s["model_variables"] >= 0
+               and s["model_constraints"] >= 0
+               and s["setup_seconds"] is not None
+               for s in sample["solver_statuses"])
 
 
 def test_fixture_profiles_cover_requested_stress_counts():
