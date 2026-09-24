@@ -408,7 +408,9 @@ def test_refresh_batches_use_local_executor_instead_of_bg_queue():
         src = _function_source(ROOT / rel_path, "_trigger_refresh")
 
         assert 'thread_name_prefix="RefreshBatch"' in src
-        assert "refresh_pool.submit(check_appointment_count" in src
+        assert '"_appointment_fetcher", check_appointment_count' in src
+        assert "refresh_pool.submit(" in src
+        assert "appointment_fetcher, self.ui_queue, worker_config" in src
         assert "self.bg_executor.submit(check_appointment_count" not in src
 
 

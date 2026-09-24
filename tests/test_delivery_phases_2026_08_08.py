@@ -481,21 +481,26 @@ class TestTheConsultEventKeyIsStableAndCarriesNoPHI:
 
 
     def test_the_send_path_computes_the_key(self):
-        """★接線★ helper 算得再對,建 artifact 時沒傳進去也是白搭
-        (突變驗證抓到的:把建構處改成 `business_key=""`,只測 helper 的
-         那三個測試照樣全綠)。"""
+        """寄送路徑把計算出的事件識別交給封存函式，再存入 artifact。"""
         src = textwrap.dedent(inspect.getsource(cq._do_full_job))
         for n in ast.walk(ast.parse(src)):
             if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-                    and n.func.id == "_DeliveryArtifact"):
+                    and n.func.id == "_seal_consult_delivery"):
                 kw = {k.arg: k.value for k in n.keywords}
                 val = kw.get("business_key")
                 assert (isinstance(val, ast.Call)
                         and isinstance(val.func, ast.Name)
                         and val.func.id == "_consult_business_key"), (
-                    "★建 artifact 時沒有算事件識別★ 帳本會退回用主旨當 key")
+                    "★封存 delivery 時沒有算事件識別★ 帳本會退回用主旨當 key")
+                sealed = cq._seal_consult_delivery(
+                    recipients=["doctor@example.test"], subject="synthetic",
+                    text_body="synthetic", html_body="<p>synthetic</p>",
+                    privacy_identities=[], message_id="<synthetic@example.test>",
+                    business_key="synthetic-key", occurrence_keys=[],
+                )
+                assert sealed.business_key == "synthetic-key"
                 return
-        pytest.fail("找不到 _DeliveryArtifact 的建構處")
+        pytest.fail("找不到 _seal_consult_delivery 的呼叫")
 
 
 # ===========================================================================

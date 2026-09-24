@@ -59,7 +59,8 @@ def test_ud08_empty_readback_aborts():
     src = _main_src()
     lines = src.splitlines()
     idx = next((i for i, ln in enumerate(lines)
-                if "actual_text = _read_tmemo_text(memo_hwnd)" in ln), None)
+                if "actual_text = (memo_port.read_memo(memo_hwnd)" in ln
+                and "_read_tmemo_text(memo_hwnd)" in lines[i + 1]), None)
     assert idx is not None, "找不到 read-back 段"
     # [2026-07-17] 視窗 12→20 行:稽核帳本(_record_his_action)插入後 return False 被推出
     # 原視窗,但保守中止行為未變。此測本就只守「空回讀→不繼續」,不該綁死行距。

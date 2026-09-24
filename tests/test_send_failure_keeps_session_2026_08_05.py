@@ -56,24 +56,34 @@ def test_the_his_stage_is_marked_done_when_the_query_already_succeeded():
 
 
 def test_the_flag_is_set_right_after_a_successful_query():
-    """查成功的下一行就要標記 —— 之後的失敗都不是 HIS 的問題。"""
-    found = False
-    for node in ast.walk(_TREE):
-        if not isinstance(node, ast.If):
-            continue
-        stmts = node.body
-        for i, st in enumerate(stmts):
-            calls = {n.func.id for n in ast.walk(st)
-                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-            if "run_consult_flow" not in calls:
-                continue
-            nxt = stmts[i + 1] if i + 1 < len(stmts) else None
-            msg = "查成功之後沒有立刻標記 HIS 這段已完成"
-            assert isinstance(nxt, ast.Assign), msg
-            assert nxt.targets[0].id == "his_stage_done", msg
-            assert nxt.value.value is True, msg
-            found = True
-    assert found, "找不到 run_consult_flow 的呼叫"
+    """封裝查詢成功後才標記；READ_FAILED 拋出時仍屬 HIS 階段。"""
+    query_branch = next(
+        node for node in ast.walk(_TREE)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "his_result is None"
+        and any(isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id == "capture_consult_query"
+                for n in ast.walk(node))
+    )
+    statements = query_branch.body
+    assert isinstance(statements[0], ast.Assign)
+    call = statements[0].value
+    assert isinstance(call, ast.Call)
+    assert isinstance(call.func, ast.Name)
+    assert call.func.id == "capture_consult_query"
+    assert isinstance(call.args[0], ast.Name)
+    assert call.args[0].id == "run_consult_flow"
+    failed_guard = statements[1]
+    assert isinstance(failed_guard, ast.If)
+    assert "ConsultQueryStatus.READ_FAILED" in ast.unparse(failed_guard.test)
+    assert any(isinstance(n, ast.Raise) for n in ast.walk(failed_guard))
+    assert isinstance(statements[2], ast.Assign)
+    assert statements[2].targets[0].id == "his_result"
+    marked = statements[3]
+    assert isinstance(marked, ast.Assign)
+    assert marked.targets[0].id == "his_stage_done"
+    assert isinstance(marked.value, ast.Constant) and marked.value.value is True
 
 
 def _kill_runs_when(flag_value: bool) -> bool:

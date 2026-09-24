@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import statistics
@@ -227,6 +228,7 @@ def run_once(inp):
         proved_or_feasible = result in (cp_model.OPTIMAL, cp_model.FEASIBLE)
         has_bound = result in (cp_model.OPTIMAL, cp_model.FEASIBLE,
                                cp_model.UNKNOWN)
+        raw_bound = solver.best_objective_bound if has_bound else None
         statuses.append({"stage": stage_stack[-1] if stage_stack else "other",
                          "phase_index": phase_index,
                          "status": solver.status_name(result),
@@ -236,8 +238,9 @@ def run_once(inp):
                          "model_constraints": model_constraints,
                          "objective": (round(solver.objective_value, 4)
                                        if proved_or_feasible else None),
-                         "best_bound": (round(solver.best_objective_bound, 4)
-                                        if has_bound else None)})
+                         "best_bound": (round(raw_bound, 4)
+                                        if raw_bound is not None
+                                        and math.isfinite(raw_bound) else None)})
         return result
 
     activity_issues = []
@@ -362,7 +365,7 @@ def main():
         }
         print(f"{name}: median {statistics.median(values):.2f}s; "
               f"range {min(values):.2f}–{max(values):.2f}s", flush=True)
-    encoded = json.dumps(result, ensure_ascii=False, indent=2)
+    encoded = json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(encoded + "\n", encoding="utf-8")
