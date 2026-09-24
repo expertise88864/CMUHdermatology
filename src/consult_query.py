@@ -7447,8 +7447,8 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     query_result = capture_consult_query(
                         run_consult_flow, trigger_label)
                     if query_result.status is ConsultQueryStatus.READ_FAILED:
-                        assert query_result.error is not None
-                        raise query_result.error
+                        raise query_result.error or RuntimeError(
+                            "會診 HIS 查詢失敗，未提供錯誤原因")
                     his_result = query_result
                     his_stage_done = True   # 這裡之後的失敗都不是 HIS 的問題
                 else:

@@ -382,6 +382,36 @@ def test_send_failure_also_retries(monkeypatch):
     assert h.flow_runs == 1, "已完成的 HIS 查詢不得因 SMTP 重試而重跑"
 
 
+def test_smtp_retry_reuses_one_sealed_deidentified_delivery(monkeypatch):
+    h = _JobHarness(
+        monkeypatch, _base_cfg(retry_count=2),
+        extracted_text="床位 A1；主治 醫師乙；測試甲 9876543210；原因：皮疹",
+        roster_texts=["測試甲9876543210"],
+        privacy_identities=[{"name": "測試甲", "chart": "9876543210"}],
+    )
+    payloads = []
+
+    def send(shot, subject, body, recipients, html_body="",
+             message_id="", **_kwargs):
+        payloads.append((shot, subject, body, tuple(recipients),
+                         html_body, message_id))
+        if len(payloads) == 1:
+            raise RuntimeError("synthetic SMTP failure")
+
+    monkeypatch.setattr(cq, "send_via_smtp", send)
+    cq._do_full_job("17:00")
+
+    assert h.flow_runs == 1
+    assert len(payloads) == 2
+    assert payloads[0] == payloads[1]
+    assert payloads[0][0] is None
+    assert payloads[0][-1]
+    for field in (payloads[0][1], payloads[0][2], payloads[0][4]):
+        assert "測試甲" not in field
+        assert "9876543210" not in field
+    assert "原因：皮疹" in payloads[0][2]
+
+
 def test_clinical_email_never_attaches_raw_his_screenshot(monkeypatch):
     h = _JobHarness(monkeypatch, _base_cfg())
     cq._do_full_job("17:00")

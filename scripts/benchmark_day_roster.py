@@ -225,6 +225,8 @@ def run_once(inp):
         finished = time.perf_counter()
         last_solve_end[model] = finished
         proved_or_feasible = result in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        has_bound = result in (cp_model.OPTIMAL, cp_model.FEASIBLE,
+                               cp_model.UNKNOWN)
         statuses.append({"stage": stage_stack[-1] if stage_stack else "other",
                          "phase_index": phase_index,
                          "status": solver.status_name(result),
@@ -234,7 +236,8 @@ def run_once(inp):
                          "model_constraints": model_constraints,
                          "objective": (round(solver.objective_value, 4)
                                        if proved_or_feasible else None),
-                         "best_bound": round(solver.best_objective_bound, 4)})
+                         "best_bound": (round(solver.best_objective_bound, 4)
+                                        if has_bound else None)})
         return result
 
     activity_issues = []

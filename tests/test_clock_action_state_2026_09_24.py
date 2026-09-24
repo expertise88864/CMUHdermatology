@@ -99,3 +99,25 @@ def test_fake_portal_persists_uncertain_click_then_confirms_without_resubmit(
     assert portal.submits == 1
     assert clock._is_clock_done("am_in", "synthetic")
     assert not clock._is_clock_click_pending("am_in", "synthetic")
+
+
+def test_unreadable_fake_portal_never_submits_or_marks_done(monkeypatch):
+    portal = _FakePortal()
+    portal.read_swipes = lambda *_args: (None, [], None, False)
+    failures = []
+    monkeypatch.setattr(clock, "_clock_today", lambda: date(2026, 10, 5))
+    monkeypatch.setattr(clock, "_clock_done", {})
+    monkeypatch.setattr(clock, "_clock_click_pending", {})
+    monkeypatch.setattr(clock, "exponential_backoff_sleep",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(clock, "_handle_clock_failure",
+                        lambda *_args: failures.append(True))
+
+    clock._perform_clock_action_locked(
+        None, None, {"username": "synthetic", "password": "synthetic"},
+        True, time(7, 30), time(8, 0), task_label="am_in", portal=portal)
+
+    assert portal.submits == 0
+    assert not clock._is_clock_done("am_in", "synthetic")
+    assert not clock._is_clock_click_pending("am_in", "synthetic")
+    assert failures == [True]
