@@ -5,15 +5,18 @@ from datetime import date
 import json
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from scripts.benchmark_day_roster import _hard_checks, _quality, make_case, run_once
 from scripts.compare_day_roster import (
-    _run_once, _safe_manual_reduction, compare_reports, main, run_paired,
+    PairedRunError, _run_once, _safe_manual_reduction, compare_reports, main,
+    run_paired,
 )
 from cmuh_common.roster.course_balance import _use_priority_hints
 from cmuh_common.roster.model import ClerkBatch
+from cmuh_common.roster import pgy_balance
 from cmuh_common.roster.solve_day import month_solve_day
 
 
@@ -67,7 +70,7 @@ def test_paired_measurement_rejects_revision_change(tmp_path, monkeypatch):
                                  "warmup_seconds": []}}}
 
     monkeypatch.setattr(compare_day_roster, "_run_once", fake_run)
-    with pytest.raises(ValueError, match="revision changed"):
+    with pytest.raises(PairedRunError, match="revision changed"):
         run_paired(tmp_path, tmp_path, samples=2, cases=("pgy2",))
 
 
@@ -321,6 +324,33 @@ def test_failed_pair_writes_incomplete_partial_report(tmp_path, monkeypatch):
     assert saved["candidate"]["cases"] == {}
 
 
+def test_changed_environment_writes_incomplete_partial_report(tmp_path, monkeypatch):
+    from scripts import compare_day_roster
+
+    sample = run_once(make_case("pgy2"))
+    calls = 0
+
+    def fake_run(_script, _root, _name, _warmup, _out):
+        nonlocal calls
+        calls += 1
+        return {"environment": {"python": "changed" if calls == 3 else "same"},
+                "cases": {"pgy2": {"input_fingerprint": "same",
+                                    "samples": [sample], "warmup_seconds": []}}}
+
+    monkeypatch.setattr(compare_day_roster, "_run_once", fake_run)
+    out = tmp_path / "partial.json"
+    monkeypatch.setattr(sys, "argv", [
+        "compare_day_roster.py", "--baseline-root", str(tmp_path),
+        "--candidate-root", str(tmp_path), "--samples", "2",
+        "--case", "pgy2", "--output", str(out),
+    ])
+    assert main() == 1
+    saved = json.loads(out.read_text(encoding="utf-8"))
+    assert saved["status"] == "incomplete"
+    assert "environment or revision changed" in saved["error"]
+    assert len(saved["baseline"]["cases"]["pgy2"]["samples"]) == 1
+
+
 def test_manual_photo_reduction_reduces_actual_monthly_pgy_work():
     results = {}
     for offset in (0, -1, -2):
@@ -356,6 +386,88 @@ def test_manual_pgy_reduction_preserves_higher_priority_trainees():
     assert reduced["total"] == zero["total"] - 1
 
 
+def test_manual_reduction_keeps_apply_seat_and_distinct_doctors(monkeypatch):
+    monday, tuesday = date(2026, 10, 5), date(2026, 10, 6)
+    inp = SimpleNamespace(
+        ym="2026-10", pgy_photo_offsets={"P1": -1},
+        grid={monday, tuesday}, locked={}, leaves={}, session_leaves={},
+        apply_pref={"P1"},
+        clinic_doctors={
+            monday: {"上午": {"102": "D2"}, "下午": {"103": "D2"}},
+            tuesday: {"上午": {"101": "D1"}, "下午": {"104": "D1"}},
+        },
+    )
+    slots = {
+        monday.isoformat(): {
+            "上午": {"102": ["P1"]}, "下午": {"103": ["P1"]}},
+        tuesday.isoformat(): {
+            "上午": {"101": ["P1"]}, "下午": {"104": ["P1"]}},
+    }
+    monkeypatch.setattr(
+        pgy_balance, "_manual_target",
+        lambda _counts, _people, _offsets, _person, kind:
+        0 if kind == "photo" else 3,
+    )
+    log = []
+    pgy_balance._reduce_manual_pgy_follow(inp, slots, ["P1", "P2"], log)
+    assert len(log) == 1
+    assert slots[tuesday.isoformat()]["上午"]["101"] == ["P1"]
+    assert sum("P1" in members for sessions in slots.values()
+               for cells in sessions.values() for room, members in cells.items()
+               if room != pgy_balance.REST) == 3
+
+    # If every clinic is with a different known doctor, no removal may erase
+    # a doctor's only visit merely to improve the manual-workload target.
+    inp.clinic_doctors[monday]["下午"]["103"] = "D3"
+    inp.clinic_doctors[tuesday]["下午"]["104"] = "D4"
+    fresh = {
+        monday.isoformat(): {
+            "上午": {"102": ["P1"]}, "下午": {"103": ["P1"]}},
+        tuesday.isoformat(): {
+            "上午": {"101": ["P1"]}, "下午": {"104": ["P1"]}},
+    }
+    log = []
+    pgy_balance._reduce_manual_pgy_follow(inp, fresh, ["P1", "P2"], log)
+    assert not log
+    assert all(["P1"] == fresh[iso][session][room]
+               for iso, sessions in fresh.items()
+               for session, cells in sessions.items()
+               for room in cells)
+
+
+def test_manual_reduction_keeps_locked_leave_and_weekly_minimum(monkeypatch):
+    monday, tuesday = date(2026, 10, 5), date(2026, 10, 6)
+    inp = SimpleNamespace(
+        ym="2026-10", pgy_photo_offsets={"P1": -1},
+        grid={monday, tuesday},
+        locked={monday.isoformat(): {"上午": True, "下午": True}},
+        leaves={"pgy": {}}, session_leaves={}, apply_pref=set(),
+        clinic_doctors={
+            monday: {"上午": {"101": "D1"}, "下午": {"102": "D1"}},
+            tuesday: {"上午": {"103": "D1"}},
+        },
+    )
+    slots = {
+        monday.isoformat(): {
+            "上午": {"101": ["P1"]}, "下午": {"102": ["P1"]}},
+        tuesday.isoformat(): {"上午": {"103": ["P1"]}},
+    }
+    monkeypatch.setattr(pgy_balance, "_manual_target",
+                        lambda *_args: 0)
+    log = []
+    pgy_balance._reduce_manual_pgy_follow(inp, slots, ["P1", "P2"], log)
+    assert not log  # Only the locked or sole daily seat could be removed.
+    inp.locked = {}
+    pgy_balance._reduce_manual_pgy_follow(inp, slots, ["P1", "P2"], log)
+    assert len(log) == 1
+    assert sum("P1" in members for sessions in slots.values()
+               for cells in sessions.values()
+               for room, members in cells.items()
+               if room != pgy_balance.REST) == 2
+    pgy_balance._reduce_manual_pgy_follow(inp, slots, ["P1", "P2"], log)
+    assert len(log) == 1  # A further cut would breach the weekly two-clinic floor.
+
+
 def test_comparator_accepts_only_proven_manual_pgy_reduction():
     inp = make_case("pgy4_offset")
     after = _quality(inp, month_solve_day(inp)[0])
@@ -380,3 +492,19 @@ def test_comparator_accepts_only_proven_manual_pgy_reduction():
     poorer["clerk_courses"]["invented"] = {"members": {}}
     assert not _safe_manual_reduction(before, poorer, [warning], [])
     assert not _safe_manual_reduction(before, after, [warning], ["new warning"])
+    no_offset_before, no_offset_after = deepcopy(before), deepcopy(after)
+    for report in (no_offset_before, no_offset_after):
+        report["sample_month_person_counts"][person]["photo_offset"] = 0
+    assert not _safe_manual_reduction(
+        no_offset_before, no_offset_after, [warning], [])
+    too_large = deepcopy(before)
+    for field in ("follow", "total", "offset_adjusted_total"):
+        too_large["sample_month_person_counts"][person][field] += 1
+    assert not _safe_manual_reduction(too_large, after, [warning], [])
+    lost_week = deepcopy(after)
+    week = next(iter(lost_week["weekly_follows"][person]))
+    lost_week["weekly_follows"][person][week] = 0
+    assert not _safe_manual_reduction(before, lost_week, [warning], [])
+    new_day = deepcopy(after)
+    new_day["daily_follows"][person]["2026-11-01"] = 1
+    assert not _safe_manual_reduction(before, new_day, [warning], [])

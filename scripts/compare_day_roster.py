@@ -417,29 +417,30 @@ def run_paired(baseline_root: Path, candidate_root: Path, *,
                     try:
                         report = _run_once(script, roots[side], name,
                                            round_index == 0, out)
+                        result = reports[side]
+                        observed_env = {key: value for key, value in
+                                        report["environment"].items() if key != "warmups"}
+                        if result["environment"]:
+                            prior_env = {key: value for key, value in
+                                         result["environment"].items() if key != "warmups"}
+                            if observed_env != prior_env:
+                                raise ValueError(
+                                    f"{name}/{side}: environment or revision changed during measurement")
+                        else:
+                            result["environment"] = report["environment"]
+                        entry = result["cases"].setdefault(name, {
+                            "input_fingerprint": report["cases"][name]["input_fingerprint"],
+                            "samples": [], "warmup_seconds": [],
+                        })
+                        sample = report["cases"][name]
+                        if entry["input_fingerprint"] != sample["input_fingerprint"]:
+                            raise ValueError(f"{name}/{side}: input changed during measurement")
+                        entry["samples"].extend(sample["samples"])
+                        entry["warmup_seconds"].extend(sample["warmup_seconds"])
                     except Exception as exc:
                         raise PairedRunError(
                             f"{name}/{side}/pair {round_index + 1}: {exc}",
                             reports) from exc
-                    result = reports[side]
-                    observed_env = {key: value for key, value in
-                                    report["environment"].items() if key != "warmups"}
-                    if result["environment"]:
-                        prior_env = {key: value for key, value in
-                                     result["environment"].items() if key != "warmups"}
-                        if observed_env != prior_env:
-                            raise ValueError(f"{name}/{side}: environment or revision changed during measurement")
-                    else:
-                        result["environment"] = report["environment"]
-                    entry = result["cases"].setdefault(name, {
-                        "input_fingerprint": report["cases"][name]["input_fingerprint"],
-                        "samples": [], "warmup_seconds": [],
-                    })
-                    sample = report["cases"][name]
-                    if entry["input_fingerprint"] != sample["input_fingerprint"]:
-                        raise ValueError(f"{name}/{side}: input changed during measurement")
-                    entry["samples"].extend(sample["samples"])
-                    entry["warmup_seconds"].extend(sample["warmup_seconds"])
                 print(f"{name}: paired {round_index + 1}/{samples}", flush=True)
     return reports["baseline"], reports["candidate"]
 

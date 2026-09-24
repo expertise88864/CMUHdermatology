@@ -72,12 +72,16 @@ def _reduce_manual_pgy_follow(inp, slots, people, log):
             eligible = [(d, session, cells, room, doctor)
                         for d, session, cells, room, doctor in candidates
                         if weekly[d.isocalendar()[:2], p] >= 3
-                        and daily[d, p] >= 2]
+                        and daily[d, p] >= 2
+                        # Keep every distinct known doctor represented.
+                        and (not doctor or doctors[p, doctor] >= 2)]
             if not eligible:
                 break
             d, session, cells, room, doctor = max(
                 eligible,
                 key=lambda item: (
+                    not (p in inp.apply_pref and item[3] == "101"
+                         and item[0].weekday() in (1, 4)),
                     weekly[item[0].isocalendar()[:2], p],
                     -dropped_weeks[item[0].isocalendar()[:2], p],
                     doctors[p, item[4]] if item[4] else 0,
