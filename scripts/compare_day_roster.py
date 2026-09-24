@@ -274,6 +274,7 @@ def compare_reports(baseline: dict, candidate: dict, *,
                         or extra.get("objective") is None):
                     issues.append(f"{prefix}/{key}: added layer has no feasible objective")
             priority_improved = False
+            training_prefix_equal = True
             for old_layer in old_sequence:
                 key = old_layer["stage"], old_layer["phase_index"]
                 if key not in new_layers:
@@ -297,11 +298,19 @@ def compare_reports(baseline: dict, candidate: dict, *,
                     issues.append(f"{prefix}/{key}: candidate objective missing")
                 if old_obj is not None and new_obj is not None and new_obj > old_obj + 1e-6:
                     issues.append(f"{prefix}/{key}: objective {old_obj} -> {new_obj}")
-                if old_obj is not None and new_obj is not None and new_obj < old_obj - 1e-6:
-                    priority_improved = True
-                if (old_status == "UNKNOWN" and new_status in ("FEASIBLE", "OPTIMAL")
-                        and new_obj is not None):
-                    priority_improved = True
+                # Only the first changed training objective can justify a
+                # different schedule. Later balance stages use different input
+                # slots and may even skip tiers, so their solve indices are not
+                # comparable evidence of a higher-priority gain.
+                if key[0] == "training" and training_prefix_equal:
+                    improved = (old_obj is not None and new_obj is not None
+                                and new_obj < old_obj - 1e-6)
+                    improved |= (old_status == "UNKNOWN"
+                                 and new_status in ("FEASIBLE", "OPTIMAL")
+                                 and new_obj is not None)
+                    priority_improved = improved
+                    training_prefix_equal = (
+                        old_status == new_status and old_obj == new_obj)
                 old_bound, new_bound = old.get("best_bound"), new.get("best_bound")
                 if old_bound != new_bound:
                     proof_changes.append({"case": name, "pair": index,

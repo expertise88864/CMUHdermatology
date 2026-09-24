@@ -46,7 +46,8 @@ def _reduce_manual_pgy_follow(inp, slots, people, log):
                         for person in members:
                             if person not in people or room == REST:
                                 continue
-                            counts[person, "all"] += 1
+                            if room in (PHOTO, TREATMENT) or is_follow_slot(room):
+                                counts[person, "all"] += 1
                             daily[d, person] += 1
                             if room == PHOTO:
                                 counts[person, "photo"] += 1

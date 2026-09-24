@@ -212,6 +212,22 @@ def test_better_priority_can_change_schedule_but_not_lose_minimum():
     assert any("minimum worsened" in issue for issue in result["issues"])
 
 
+def test_downstream_balance_gain_cannot_hide_schedule_changes():
+    before, after = _paired_reports()
+    baseline = before["cases"]["pgy2"]["samples"][0]
+    candidate = after["cases"]["pgy2"]["samples"][0]
+    old_balance = next(s for s in baseline["solver_statuses"]
+                       if s["stage"] == "pgy_balance" and s["objective"] > 0)
+    new_balance = next(s for s in candidate["solver_statuses"]
+                       if s["stage"] == "pgy_balance"
+                       and s["phase_index"] == old_balance["phase_index"])
+    new_balance["objective"] = old_balance["objective"] - 1
+    candidate["quality"]["daily_follows"]["P1"] = {"2026-10-01": 1}
+    result = compare_reports(before, after, min_samples=1)
+    assert not result["quality_gate_passed"]
+    assert not result["schedule_changes"][0]["priority_improved"]
+    assert any("daily_follows.P1" in issue for issue in result["issues"])
+
 def test_cross_month_clerk_credit_does_not_inflate_monthly_external_biopsy():
     inp = make_case("pgy4_clerk4_cross")
     inp.external_roster = ["E1"]
@@ -387,21 +403,21 @@ def test_manual_pgy_reduction_preserves_higher_priority_trainees():
 
 
 def test_manual_reduction_keeps_apply_seat_and_distinct_doctors(monkeypatch):
-    monday, tuesday = date(2026, 10, 5), date(2026, 10, 6)
+    wednesday, tuesday = date(2026, 10, 7), date(2026, 10, 6)
     inp = SimpleNamespace(
         ym="2026-10", pgy_photo_offsets={"P1": -1},
-        grid={monday, tuesday}, locked={}, leaves={}, session_leaves={},
+        grid={wednesday, tuesday}, locked={}, leaves={}, session_leaves={},
         apply_pref={"P1"},
         clinic_doctors={
-            monday: {"上午": {"102": "D2"}, "下午": {"103": "D2"}},
-            tuesday: {"上午": {"101": "D1"}, "下午": {"104": "D1"}},
+            wednesday: {"上午": {"102": "D2"}, "下午": {"103": "D2"}},
+            tuesday: {"上午": {"104": "D1"}, "下午": {"101": "D1"}},
         },
     )
     slots = {
-        monday.isoformat(): {
+        wednesday.isoformat(): {
             "上午": {"102": ["P1"]}, "下午": {"103": ["P1"]}},
         tuesday.isoformat(): {
-            "上午": {"101": ["P1"]}, "下午": {"104": ["P1"]}},
+            "上午": {"104": ["P1"]}, "下午": {"101": ["P1"]}},
     }
     monkeypatch.setattr(
         pgy_balance, "_manual_target",
@@ -409,25 +425,40 @@ def test_manual_reduction_keeps_apply_seat_and_distinct_doctors(monkeypatch):
         0 if kind == "photo" else 3,
     )
     log = []
-    pgy_balance._reduce_manual_pgy_follow(inp, slots, ["P1", "P2"], log)
+    pgy_balance._reduce_manual_pgy_follow(inp, slots, ["P1", "P2", "P3"], log)
     assert len(log) == 1
-    assert slots[tuesday.isoformat()]["上午"]["101"] == ["P1"]
+    assert slots[tuesday.isoformat()]["下午"]["101"] == ["P1"]
+    assert slots[tuesday.isoformat()]["上午"]["104"] == []
     assert sum("P1" in members for sessions in slots.values()
                for cells in sessions.values() for room, members in cells.items()
                if room != pgy_balance.REST) == 3
 
-    # If every clinic is with a different known doctor, no removal may erase
-    # a doctor's only visit merely to improve the manual-workload target.
-    inp.clinic_doctors[monday]["下午"]["103"] = "D3"
-    inp.clinic_doctors[tuesday]["下午"]["104"] = "D4"
-    fresh = {
-        monday.isoformat(): {
+    # Without the preference, the ordinary tie-break removes the earlier
+    # Tuesday afternoon 101 seat, so this fixture exercises the preference.
+    inp.apply_pref = set()
+    no_pref = {
+        wednesday.isoformat(): {
             "上午": {"102": ["P1"]}, "下午": {"103": ["P1"]}},
         tuesday.isoformat(): {
-            "上午": {"101": ["P1"]}, "下午": {"104": ["P1"]}},
+            "上午": {"104": ["P1"]}, "下午": {"101": ["P1"]}},
+    }
+    pgy_balance._reduce_manual_pgy_follow(
+        inp, no_pref, ["P1", "P2", "P3"], [])
+    assert no_pref[tuesday.isoformat()]["下午"]["101"] == []
+    inp.apply_pref = {"P1"}
+
+    # If every clinic is with a different known doctor, no removal may erase
+    # a doctor's only visit merely to improve the manual-workload target.
+    inp.clinic_doctors[wednesday]["下午"]["103"] = "D3"
+    inp.clinic_doctors[tuesday]["下午"]["101"] = "D4"
+    fresh = {
+        wednesday.isoformat(): {
+            "上午": {"102": ["P1"]}, "下午": {"103": ["P1"]}},
+        tuesday.isoformat(): {
+            "上午": {"104": ["P1"]}, "下午": {"101": ["P1"]}},
     }
     log = []
-    pgy_balance._reduce_manual_pgy_follow(inp, fresh, ["P1", "P2"], log)
+    pgy_balance._reduce_manual_pgy_follow(inp, fresh, ["P1", "P2", "P3"], log)
     assert not log
     assert all(["P1"] == fresh[iso][session][room]
                for iso, sessions in fresh.items()
@@ -466,6 +497,33 @@ def test_manual_reduction_keeps_locked_leave_and_weekly_minimum(monkeypatch):
                if room != pgy_balance.REST) == 2
     pgy_balance._reduce_manual_pgy_follow(inp, slots, ["P1", "P2"], log)
     assert len(log) == 1  # A further cut would breach the weekly two-clinic floor.
+
+
+def test_manual_reduction_excludes_biopsy_from_total_target(monkeypatch):
+    tuesday, wednesday, thursday = (date(2026, 10, day) for day in (6, 7, 8))
+    inp = SimpleNamespace(
+        ym="2026-10", pgy_photo_offsets={"P1": -1},
+        grid={tuesday, wednesday, thursday}, locked={}, leaves={},
+        session_leaves={}, apply_pref=set(), clinic_doctors={},
+    )
+    slots = {
+        tuesday.isoformat(): {
+            "上午": {"101": ["P1"]}, "下午": {"102": ["P1"]}},
+        wednesday.isoformat(): {
+            "上午": {"103": ["P1"]}, "下午": {"104": ["P1"]}},
+        thursday.isoformat(): {"上午": {"切片室": ["P1"]}},
+    }
+    monkeypatch.setattr(
+        pgy_balance, "_manual_target",
+        lambda _counts, _people, _offsets, _person, kind:
+        0 if kind == "photo" else 3,
+    )
+    log = []
+    pgy_balance._reduce_manual_pgy_follow(inp, slots, ["P1", "P2"], log)
+    assert len(log) == 1
+    assert sum("P1" in members for sessions in slots.values()
+               for cells in sessions.values() for room, members in cells.items()
+               if room not in (pgy_balance.REST, "切片室")) == 3
 
 
 def test_comparator_accepts_only_proven_manual_pgy_reduction():
