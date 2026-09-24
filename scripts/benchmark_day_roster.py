@@ -285,11 +285,14 @@ def _quality(inp, slots, activity_issues=()):
     clerk_courses = {}
     for batch in inp.clerk_batches:
         end = batch.start_monday + timedelta(days=13)
+        # A Clerk course has Monday-Friday duties for two weeks. Its trailing
+        # weekend may be in the next month even when every duty is complete.
+        last_workday = end - timedelta(days=2)
         stats = person_course_stats(sources, include=set(batch.members),
                                     start=batch.start_monday, end=end)
         clerk_courses[batch.id] = {
             "start": batch.start_monday.isoformat(), "end": end.isoformat(),
-            "complete": end.strftime("%Y-%m") <= inp.ym,
+            "complete": last_workday.strftime("%Y-%m") <= inp.ym,
             "members": {p: {"follow": stats.get(p, {}).get("follow", 0),
                             "biopsy": stats.get(p, {}).get("biopsy", 0),
                             "biopsy_by_course_week": dict(sorted(

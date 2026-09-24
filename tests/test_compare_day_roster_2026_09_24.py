@@ -1,13 +1,19 @@
 """The benchmark gate must report actual quality loss, not just elapsed time."""
 
 from copy import deepcopy
+from datetime import date
 import json
+import subprocess
 import sys
 
 import pytest
 
 from scripts.benchmark_day_roster import _hard_checks, _quality, make_case, run_once
-from scripts.compare_day_roster import compare_reports, main, run_paired
+from scripts.compare_day_roster import (
+    _run_once, _safe_manual_reduction, compare_reports, main, run_paired,
+)
+from cmuh_common.roster.course_balance import _use_priority_hints
+from cmuh_common.roster.model import ClerkBatch
 from cmuh_common.roster.solve_day import month_solve_day
 
 
@@ -223,3 +229,154 @@ def test_cross_month_benchmark_includes_prior_course_work():
     quality = _quality(inp, {})
     assert quality["clerk_courses"]["B1"]["members"]["C1_1"]["follow"] == 2
     assert quality["clerk_courses"]["B1"]["members"]["C1_3"]["biopsy"] == 1
+
+
+def test_course_completion_uses_last_workday_not_trailing_sunday():
+    inp = make_case("pgy4_clerk5_mix1")
+    course = _quality(inp, {})["clerk_courses"]["B2"]
+    assert course["end"] == "2026-11-01"
+    assert course["complete"]  # Its last working day is 2026-10-30.
+
+    inp.clerk_batches = [ClerkBatch("B3", date(2026, 10, 26), ["C3"])]
+    assert not _quality(inp, {})["clerk_courses"]["B3"]["complete"]
+
+
+def test_completed_course_minimum_cannot_hide_in_unchanged_combined_gap():
+    before, after = _paired_reports()
+    baseline = before["cases"]["pgy2"]["samples"][0]
+    candidate = after["cases"]["pgy2"]["samples"][0]
+    baseline["solver_statuses"][0]["objective"] = 1.0
+    candidate["solver_statuses"][0]["objective"] = 0.0
+    baseline["quality"]["clerk_courses"] = {
+        "B2": {"complete": True, "members": {
+            "C2_1": {"follow": 9, "biopsy": 1},
+            "C2_2": {"follow": 9, "biopsy": 1},
+        }},
+    }
+    candidate["quality"]["clerk_courses"] = deepcopy(
+        baseline["quality"]["clerk_courses"])
+    candidate["quality"]["clerk_courses"]["B2"]["members"]["C2_1"]["follow"] = 8
+    candidate["quality"]["clerk_courses"]["B2"]["members"]["C2_2"]["follow"] = 10
+    result = compare_reports(before, after, min_samples=1)
+    assert not result["quality_gate_passed"]
+    assert any("B2.C2_1.follow: minimum worsened" in issue
+               for issue in result["issues"])
+    assert not any("combined target gap worsened" in issue
+                   for issue in result["issues"])
+
+
+def test_priority_hints_only_for_large_clerk_course_without_adjacent_work():
+    inp = make_case("pgy4_clerk5_mix1")
+    assert _use_priority_hints(inp)
+    inp.prior_sessions = {"2026-09-30": {"上午": {"101": ["unrelated"]}}}
+    assert _use_priority_hints(inp)
+    inp.prior_sessions["2026-09-30"]["上午"]["101"] = ["C2_1"]
+    assert not _use_priority_hints(inp)
+    inp.prior_sessions = {}
+    inp.course_fixed = {"2026-11-30": {"上午": {"101": ["C2_1"]}}}
+    assert not _use_priority_hints(inp)  # Conservatively exclude code reuse.
+    inp.course_fixed = {}
+    for batch in inp.clerk_batches:
+        batch.members = batch.members[:3]
+    assert not _use_priority_hints(inp)
+    assert not _use_priority_hints(make_case("pgy4_mix2"))
+
+
+def test_child_benchmark_error_exposes_stderr(tmp_path, monkeypatch):
+    def fail(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(7, "benchmark", stderr="synthetic failure")
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    with pytest.raises(RuntimeError, match="synthetic failure"):
+        _run_once(tmp_path / "bench.py", tmp_path, "pgy2", False,
+                  tmp_path / "out.json")
+
+
+def test_failed_pair_writes_incomplete_partial_report(tmp_path, monkeypatch):
+    from scripts import compare_day_roster
+
+    report, _ = _paired_reports()
+    report["cases"]["pgy2"]["warmup_seconds"] = []
+    calls = 0
+
+    def fake_run(_script, _root, _name, _warmup, _out):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("synthetic child failure")
+        return report
+
+    monkeypatch.setattr(compare_day_roster, "_run_once", fake_run)
+    out = tmp_path / "partial.json"
+    monkeypatch.setattr(sys, "argv", [
+        "compare_day_roster.py", "--baseline-root", str(tmp_path),
+        "--candidate-root", str(tmp_path), "--samples", "1",
+        "--case", "pgy2", "--output", str(out),
+    ])
+    assert main() == 1
+    saved = json.loads(out.read_text(encoding="utf-8"))
+    assert saved["status"] == "incomplete"
+    assert "synthetic child failure" in saved["error"]
+    assert len(saved["baseline"]["cases"]["pgy2"]["samples"]) == 1
+    assert saved["candidate"]["cases"] == {}
+
+
+def test_manual_photo_reduction_reduces_actual_monthly_pgy_work():
+    results = {}
+    for offset in (0, -1, -2):
+        inp = make_case("pgy4_offset")
+        inp.pgy_photo_offsets = {"P1": offset} if offset else {}
+        slots, _log, warnings = month_solve_day(inp)
+        assert not _hard_checks(inp, slots)
+        quality = _quality(inp, slots)
+        counts = quality["sample_month_person_counts"]["P1"]
+        assert all(n >= 1 for n in quality["weekly_follows"]["P1"].values())
+        assert not any("P1 總工作量減量目標未達" in w for w in warnings)
+        results[offset] = counts
+
+    assert [results[offset]["total"] for offset in (0, -1, -2)] == [38, 37, 36]
+    assert [results[offset]["photo"] for offset in (0, -1, -2)] == [10, 9, 9]
+    assert [results[offset]["tx"] for offset in (0, -1, -2)] == [10, 10, 9]
+
+
+def test_manual_pgy_reduction_preserves_higher_priority_trainees():
+    qualities = {}
+    for offset in (0, -1):
+        inp = make_case("pgy4_clerk5_mix1")
+        inp.pgy_photo_offsets = {"P1": offset} if offset else {}
+        slots, _log, _warnings = month_solve_day(inp)
+        assert not _hard_checks(inp, slots)
+        qualities[offset] = _quality(inp, slots)
+
+    assert qualities[-1]["clerk_courses"] == qualities[0]["clerk_courses"]
+    assert qualities[-1]["training"] == qualities[0]["training"]
+    zero = qualities[0]["sample_month_person_counts"]["P1"]
+    reduced = qualities[-1]["sample_month_person_counts"]["P1"]
+    assert reduced["photo"] == zero["photo"] - 1
+    assert reduced["total"] == zero["total"] - 1
+
+
+def test_comparator_accepts_only_proven_manual_pgy_reduction():
+    inp = make_case("pgy4_offset")
+    after = _quality(inp, month_solve_day(inp)[0])
+    before = deepcopy(after)
+    person = "P1"
+    for field in ("follow", "total", "offset_adjusted_total"):
+        before["sample_month_person_counts"][person][field] += 1
+    before["pgy_workload"][person] += 1
+    values = before["pgy_workload"].values()
+    before["pgy_workload_range"] = max(values) - min(values)
+    before["weekly_follows"][person]["2026-W43"] += 1
+    before["daily_follows"][person]["2026-10-20"] = (
+        before["daily_follows"][person].get("2026-10-20", 0) + 1)
+    before["doctor_diversity"][person]["known_doctors"]["D1"] += 1
+    warning = "PGY P1 總工作量減量目標未達：實排 38 次，調整後目標 37 次"
+
+    assert _safe_manual_reduction(before, after, [warning], [])
+    poorer = deepcopy(after)
+    poorer["doctor_diversity"][person]["distinct_doctors"] -= 1
+    assert not _safe_manual_reduction(before, poorer, [warning], [])
+    poorer = deepcopy(after)
+    poorer["clerk_courses"]["invented"] = {"members": {}}
+    assert not _safe_manual_reduction(before, poorer, [warning], [])
+    assert not _safe_manual_reduction(before, after, [warning], ["new warning"])

@@ -11,6 +11,7 @@ execution order on alternating rounds to reduce warm-machine order bias.
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 import math
 import statistics
@@ -24,6 +25,12 @@ CASES = ("pgy2", "pgy4_clerk4_cross", "pgy4_clerk5_mix1", "pgy4_mix2",
          "pgy4_offset")
 STRESS_CASES = ("pgy4_clerk4_cross", "pgy4_clerk5_mix1")
 STATUS_RANK = {"UNKNOWN": 0, "FEASIBLE": 1, "OPTIMAL": 2}
+
+
+class PairedRunError(RuntimeError):
+    def __init__(self, message: str, partial: dict):
+        super().__init__(message)
+        self.partial = partial
 
 
 def _differences(before, after, path="quality"):
@@ -105,6 +112,82 @@ def _protected_outcome_regressions(before: dict, after: dict):
         new = after["doctor_diversity"].get(person)
         if new is None or new["distinct_doctors"] < old["distinct_doctors"]:
             yield f"doctor_diversity.{person}: distinct doctors lost"
+
+
+def _safe_manual_reduction(before: dict, after: dict,
+                           old_warnings: list, new_warnings: list) -> bool:
+    """Recognize an actual manual PGY reduction without hiding other changes."""
+    old_rows = before["sample_month_person_counts"]
+    new_rows = after["sample_month_person_counts"]
+    if old_rows.keys() != new_rows.keys():
+        return False
+    reduced = {}
+    for person, old in old_rows.items():
+        new = new_rows[person]
+        if new == old:
+            continue
+        offset = old.get("photo_offset", 0)
+        drop = old["total"] - new["total"]
+        if (offset >= 0 or not 1 <= drop <= -offset
+                or any(old[field] != new[field] for field in
+                       ("photo", "photo_wed_pm", "tx", "biopsy",
+                        "necessary", "photo_offset"))
+                or any(old[field] - new[field] != drop for field in
+                       ("follow", "total", "offset_adjusted_total"))):
+            return False
+        old_weeks = before["weekly_follows"].get(person, {})
+        new_weeks = after["weekly_follows"].get(person, {})
+        if (sum(old_weeks.values()) - sum(new_weeks.values()) != drop
+                or any(new_weeks.get(week, 0) > count or
+                       new_weeks.get(week, 0) < min(2, count)
+                       for week, count in old_weeks.items())
+                or set(new_weeks) - set(old_weeks)):
+            return False
+        old_daily = before["daily_follows"].get(person, {})
+        new_daily = after["daily_follows"].get(person, {})
+        if (sum(old_daily.values()) - sum(new_daily.values()) != drop
+                or any(new_daily.get(day, 0) > count
+                       for day, count in old_daily.items())
+                or set(new_daily) - set(old_daily)):
+            return False
+        old_doctors = before["doctor_diversity"][person]
+        new_doctors = after["doctor_diversity"][person]
+        if (new_doctors["distinct_doctors"] < old_doctors["distinct_doctors"]
+                or new_doctors["unknown_doctor_follows"] >
+                old_doctors["unknown_doctor_follows"]
+                or max(new_doctors["known_doctors"].values(), default=0) >
+                max(old_doctors["known_doctors"].values(), default=0)
+                or sum(new_doctors["known_doctors"].values()) +
+                new_doctors["unknown_doctor_follows"] !=
+                sum(old_doctors["known_doctors"].values()) +
+                old_doctors["unknown_doctor_follows"] - drop):
+            return False
+        if (before["pgy_workload"].get(person) != old["total"]
+                or after["pgy_workload"].get(person) != new["total"]):
+            return False
+        reduced[person] = drop
+    if not reduced:
+        return False
+    removed = set(old_warnings) - set(new_warnings)
+    if (set(new_warnings) - set(old_warnings)
+            or not removed
+            or any(not any(f"PGY {person} 總工作量減量目標未達" in warning
+                           for person in reduced) for warning in removed)):
+        return False
+    for quality in (before, after):
+        workloads = quality["pgy_workload"].values()
+        if quality["pgy_workload_range"] != max(workloads) - min(workloads):
+            return False
+    old_rest, new_rest = deepcopy(before), deepcopy(after)
+    for field in ("sample_month_person_counts", "weekly_follows",
+                  "daily_follows", "doctor_diversity", "pgy_workload"):
+        for person in reduced:
+            old_rest[field].pop(person, None)
+            new_rest[field].pop(person, None)
+    old_rest.pop("pgy_workload_range")
+    new_rest.pop("pgy_workload_range")
+    return old_rest == new_rest and not list(
+        _protected_outcome_regressions(before, after))
 
 
 def compare_reports(baseline: dict, candidate: dict, *,
@@ -229,8 +312,13 @@ def compare_reports(baseline: dict, candidate: dict, *,
                     and left.get("warnings") is not None
                     and right.get("warnings") is not None):
                 changed = list(_differences(left["quality"], right["quality"]))
+                manual_reduction = (not priority_improved and
+                                    _safe_manual_reduction(
+                                        left["quality"], right["quality"],
+                                        left["warnings"], right["warnings"]))
                 schedule_changes.append({"case": name, "pair": index,
                                          "priority_improved": priority_improved,
+                                         "manual_reduction_improved": manual_reduction,
                                          "quality_fields_changed": changed,
                                          "warnings_removed": sorted(set(left["warnings"])
                                                                     - set(right["warnings"])),
@@ -240,7 +328,7 @@ def compare_reports(baseline: dict, candidate: dict, *,
                     issues.extend(f"{prefix}/{path}" for path in
                                   _protected_outcome_regressions(
                                       left["quality"], right["quality"]))
-                else:
+                elif not manual_reduction:
                     issues.extend(f"{prefix}/{path}: changed without higher-priority gain"
                                   for path in changed)
                     if left.get("warnings") != right.get("warnings"):
@@ -290,12 +378,25 @@ def compare_reports(baseline: dict, candidate: dict, *,
 
 
 def _run_once(script: Path, root: Path, name: str, warmup: bool, out: Path) -> dict:
-    subprocess.run(
-        [sys.executable, str(script), "--source-root", str(root / "src"),
-         "--case", name, "--samples", "1", "--warmups", str(int(warmup)),
-         "--output", str(out)],
-        check=True, capture_output=True, text=True, timeout=360,
-    )
+    try:
+        subprocess.run(
+            [sys.executable, str(script), "--source-root", str(root / "src"),
+             "--case", name, "--samples", "1", "--warmups", str(int(warmup)),
+             "--output", str(out)],
+            check=True, capture_output=True, text=True, timeout=360,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        def decoded(value):
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="replace")
+            return value or ""
+
+        details = [str(exc)]
+        for stream in ("stdout", "stderr"):
+            content = decoded(getattr(exc, stream, None)).strip()
+            if content:
+                details.append(f"{stream}: {content[-4000:]}")
+        raise RuntimeError("; ".join(details)) from exc
     return json.loads(out.read_text(encoding="utf-8"))
 
 
@@ -313,8 +414,13 @@ def run_paired(baseline_root: Path, candidate_root: Path, *,
                 order = (("baseline", "candidate") if round_index % 2 == 0
                          else ("candidate", "baseline"))
                 for side in order:
-                    report = _run_once(script, roots[side], name,
-                                       round_index == 0, out)
+                    try:
+                        report = _run_once(script, roots[side], name,
+                                           round_index == 0, out)
+                    except Exception as exc:
+                        raise PairedRunError(
+                            f"{name}/{side}/pair {round_index + 1}: {exc}",
+                            reports) from exc
                     result = reports[side]
                     observed_env = {key: value for key, value in
                                     report["environment"].items() if key != "warmups"}
@@ -354,9 +460,20 @@ def main() -> int:
     if bool(live) == bool(offline) or args.samples < 1:
         parser.error("provide either both source roots or both report JSON files")
     if live:
-        baseline, candidate = run_paired(
-            args.baseline_root, args.candidate_root,
-            samples=args.samples, cases=tuple(args.case or CASES))
+        try:
+            baseline, candidate = run_paired(
+                args.baseline_root, args.candidate_root,
+                samples=args.samples, cases=tuple(args.case or CASES))
+        except PairedRunError as exc:
+            result = {"status": "incomplete", "error": str(exc),
+                      **exc.partial}
+            encoded = json.dumps(result, ensure_ascii=False, indent=2,
+                                 allow_nan=False)
+            if args.output:
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                args.output.write_text(encoded + "\n", encoding="utf-8")
+            print(str(exc), file=sys.stderr, flush=True)
+            return 1
     else:
         baseline = json.loads(args.baseline_json.read_text(encoding="utf-8"))
         candidate = json.loads(args.candidate_json.read_text(encoding="utf-8"))

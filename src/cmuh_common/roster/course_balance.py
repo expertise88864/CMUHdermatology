@@ -31,6 +31,9 @@ def external_roster(inp):
 
 
 def _has_adjacent_clerk_work(inp, clerk_members):
+    # Conservatively exclude any adjacent-month work under a current Clerk
+    # code, even if the fixed work is outside that Clerk's present course.
+    # Codes can be reused; this only disables an optional search hint.
     for source in (inp.prior_sessions, inp.course_fixed):
         if not isinstance(source, dict):
             continue
@@ -46,6 +49,12 @@ def _has_adjacent_clerk_work(inp, clerk_members):
                     if any(p in clerk_members for p in members):
                         return True
     return False
+
+
+def _use_priority_hints(inp):
+    clerk_members = {p for batch in inp.clerk_batches for p in batch.members}
+    return (any(len(batch.members) >= 4 for batch in inp.clerk_batches)
+            and not _has_adjacent_clerk_work(inp, clerk_members))
 
 
 def _weeks(inp):
@@ -236,12 +245,9 @@ def add_external(inp, slots, log, warnings, *, control=None):
     # uses capacity left after everyone's targets, never a PGY's weekly minimum.
     phases = (*training_phases[:2], clerk_objective, *training_phases[2:],
               clerk_extra, spread_objective)
-    clerk_members = {p for batch in inp.clerk_batches for p in batch.members}
-    adjacent_clerk_work = _has_adjacent_clerk_work(inp, clerk_members)
     # A measured cross-month fixture with prior Clerk credit regressed when
     # hinted, so keep the original search for courses with adjacent-month work.
-    use_priority_hints = (not adjacent_clerk_work and
-                          any(len(batch.members) >= 4 for batch in inp.clerk_batches))
+    use_priority_hints = _use_priority_hints(inp)
     saved = None
     all_optimal = True
     for index, objective in enumerate(phases):
