@@ -63,7 +63,7 @@ def test_injected_his_memo_port_requires_successful_read_back(monkeypatch):
     port = _FakeMemoPort()
 
     assert main._update_uvb_dose_core("F2", strict=True, memo_port=port) is True
-    assert port.reads == 2
+    assert port.reads == 3  # initial, pre-write freshness, post-write proof
     assert len(port.writes) == 1
     assert "850 mj/cm2 (36)" in port.writes[0]
     assert warnings == []
@@ -71,6 +71,6 @@ def test_injected_his_memo_port_requires_successful_read_back(monkeypatch):
     mismatched = _FakeMemoPort(read_back=False)
     assert main._update_uvb_dose_core(
         "F2", strict=True, memo_port=mismatched) is False
-    assert mismatched.reads == 2
+    assert mismatched.reads == 3
     assert len(mismatched.writes) == 1
     assert "UVB 寫回驗證失敗" in warnings

@@ -40,7 +40,7 @@ def test_ud07_repeated_same_kind_aborts():
         "UD-07: 同種 confirm 重複出現須有防無限跳窗守衛"
     seg = src[src.index("if kind in _confirmed_kinds:"):]
     seg = seg[:seg.index("logging.info")]
-    assert "return False if strict else True" in seg, \
+    assert "return False" in seg, \
         "UD-07: 重複同種 confirm 應保守中止"
 
 
@@ -103,7 +103,7 @@ def test_ud14_f1_route_core_divergence_warns():
 def test_ud14_f1_also_warns_on_aborted_pure_excimer():
     # [codex P2] 更新中止(TOO_CLOSE)時分流一樣是純 excimer、矛盾一樣存在 → 也要警告
     src = _func_source("_f1_update_uvb_dose_if_present")
-    assert "res == _F23_PURE_EXCIMER_ABORTED" in src, \
+    assert "_F23_PURE_EXCIMER_ABORTED):" in src, \
         "UD-14: F1 對「純 excimer 但更新中止」也應跳矛盾警告"
 
 

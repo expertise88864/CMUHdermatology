@@ -66,11 +66,10 @@ def test_ud03_51019_stage_shows_w7_on_exception():
 # ── UD-04：兩個寫回處置欄的 call site 之前都要有 check_stop ─────────────────────
 def test_ud04_writeback_has_check_stop_gate():
     core = inspect.getsource(main._update_uvb_dose_core)
-    assert "check_stop()" in core
-    assert core.index("check_stop()", core.rindex("check_stop()") - 1) \
-        < core.index("_write_tmemo_text(memo_hwnd, final_text)"), \
+    write_idx = core.index("_write_tmemo_text(memo_hwnd, final_text)")
+    assert core.rfind("check_stop()", 0, write_idx) > core.index(
+        "if not isinstance(final_text, str)"), \
         "UD-04: core 寫回 final_text 前應有 check_stop"
-    exc = inspect.getsource(main._f23_pure_excimer_update)
-    # 無確認窗的 UPDATED 寫回前也要 check_stop
+    exc = inspect.getsource(main._write_excimer_memo_checked)
     w_idx = exc.index("_write_tmemo_text(memo_hwnd, result.new_text)")
-    assert "check_stop()" in exc[:w_idx], "UD-04: excimer 無確認窗寫回前應有 check_stop"
+    assert "check_stop()" in exc[:w_idx], "UD-04: excimer 寫回前應有 check_stop"

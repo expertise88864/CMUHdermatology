@@ -16,7 +16,6 @@ P0-2 excimer 把遞減當成遞增:
 """
 import inspect
 import os
-import re
 import sys
 from datetime import date
 
@@ -284,10 +283,13 @@ def test_every_excimer_writeback_path_surfaces_skipped_segment():
     第二條原本是另一份重複的處理碼,漏接了 F3 的兩個提示 —— 醫師寫回成功後完全
     不知道有一段沒被自動處理。兩條都必須呼叫同一個 helper。"""
     src = _main_src("_f23_pure_excimer_update")
-    writes = [m.start() for m in re.finditer(r"_write_tmemo_text\(memo_hwnd", src)]
-    assert len(writes) == 2, f"寫回路徑數量變了({len(writes)}),請同步檢查提示是否都接上"
-    assert src.count("_warn_excimer_segment_skipped(") == 2, \
-        "每一條寫回成功路徑都要提示「有段落未自動更新」"
+    checked = _main_src("_write_excimer_memo_checked")
+    assert src.count("_write_excimer_memo_checked(") == 2, \
+        "直接更新與確認後更新都必須走同一個寫回驗證 helper"
+    assert checked.count("_write_tmemo_text(memo_hwnd") == 1
+    assert checked.index("memo_written_back_intact(") < checked.index(
+        "_warn_excimer_segment_skipped("), \
+        "只有完整回讀確認後才可宣稱有段落未更新"
     # 沒有更新任何一段的收尾(含確認後重算的 else)也不可只寫 log。
     assert src.count("_warn_excimer_not_updated(") == 2, \
         "「沒更新任何一段」的兩個收尾都要走 helper(SANITY_FAIL 要跳警告窗)"

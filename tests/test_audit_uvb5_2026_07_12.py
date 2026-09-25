@@ -62,8 +62,8 @@ def test_ud08_empty_readback_aborts():
                 if "actual_text = (memo_port.read_memo(memo_hwnd)" in ln
                 and "_read_tmemo_text(memo_hwnd)" in lines[i + 1]), None)
     assert idx is not None, "找不到 read-back 段"
-    # [2026-07-17] 視窗 12→20 行:稽核帳本(_record_his_action)插入後 return False 被推出
-    # 原視窗,但保守中止行為未變。此測本就只守「空回讀→不繼續」,不該綁死行距。
-    window = "\n".join(lines[idx:idx + 20])
-    assert "if not actual_text:" in window and "return False" in window, \
+    # 寫後 F12 閘門與帳本會增減行數；只檢查空回讀分支本身會中止。
+    tail = "\n".join(lines[idx:])
+    branch = tail.split("if not actual_text:", 1)[1].split("if actual_text:", 1)[0]
+    assert "return False" in branch, \
         "UD-08 read-back 空字串未保守中止"
