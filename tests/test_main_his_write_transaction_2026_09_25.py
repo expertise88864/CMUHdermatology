@@ -1,9 +1,12 @@
 """Anonymous HIS memo races and read-back failures for F1–F3."""
 
 import ctypes
+import threading
+from contextlib import nullcontext
 from datetime import date, timedelta
 from queue import Queue
 from types import SimpleNamespace
+import sys
 
 import pytest
 
@@ -246,7 +249,7 @@ def test_f1_reclassified_excimer_f12_warns_about_already_placed_51019(
             memo_port=port)
     assert len(port.writes) == 1
     assert any("51019" in msg and "刪除" in msg for _, msg in fake_his)
-    assert not any("刪除 51019／療程 1" in msg for _, msg in fake_his)
+    assert not any("刪除 51019/療程 1" in msg for _, msg in fake_his)
     assert any("確認" in msg and "療程 1" in msg and "Excimer" in msg
                for _, msg in fake_his)
 
@@ -585,6 +588,49 @@ def test_edited_line_whitespace_must_not_split_dose_or_count_tokens():
     assert not main.memo_written_back_intact(original, proposed, corrupted)
 
 
+def test_edited_line_readback_does_not_split_decimal_tokens():
+    original = "UVB: 1.0 mj/cm2\nPathology report: synthetic"
+    proposed = "UVB: 1.5 mj/cm2\nPathology report: synthetic"
+    actual = "UVB: 1 . 5 mj/cm2\nPathology report: synthetic"
+    assert not main.memo_written_back_intact(original, proposed, actual)
+
+
+@pytest.mark.parametrize("owner_valid,fail_owned_call,expected_owners", [
+    (False, False, [0]),
+    (True, True, [10, 0]),
+    (True, False, [10]),
+])
+def test_warning_survives_destroyed_owner_or_owner_race(
+        monkeypatch, owner_valid, fail_owned_call, expected_owners):
+    owners = []
+
+    class FakeUser32:
+        def IsWindow(self, hwnd):
+            assert hwnd == 10
+            return owner_valid
+
+        def FlashWindowEx(self, _info):
+            return True
+
+        def MessageBoxW(self, hwnd, _msg, _title, _flags):
+            owners.append(hwnd)
+            return int(hwnd == 0 or not fail_owned_call)
+
+    fake_ctypes = SimpleNamespace(
+        Structure=ctypes.Structure,
+        c_uint=ctypes.c_uint,
+        sizeof=ctypes.sizeof,
+        byref=ctypes.byref,
+        windll=SimpleNamespace(user32=FakeUser32()),
+    )
+    monkeypatch.setattr(main, "ctypes", fake_ctypes)
+    monkeypatch.setattr(main, "_hotkey_awaiting_user_scope", nullcontext)
+    monkeypatch.setitem(sys.modules, "winsound",
+                        SimpleNamespace(MessageBeep=lambda _flags: None))
+    main._show_uvb_warning(10, "合成警告", "請人工核對")
+    assert owners == expected_owners
+
+
 def test_excimer_split_digit_readback_is_not_reported_verified(
         monkeypatch, fake_his):
     port = FakeMemoPort(_memo(kind="Excimer"))
@@ -758,6 +804,89 @@ def test_excimer_unverified_status_still_sets_identity_but_not_completed(
     result = getattr(main, f"script_{hotkey}_adaptive")()
     assert result is False
     assert identity_calls == [("01", hotkey)]
+
+
+@pytest.mark.parametrize("hotkey", ["F2", "F3"])
+def test_excimer_unparseable_dose_sets_identity_but_reports_incomplete(
+        monkeypatch, fake_his, hotkey):
+    port = FakeMemoPort("Excimer: synthetic malformed treatment line")
+    port.kind = "pure_excimer"
+    identity_calls = []
+    monkeypatch.setattr(
+        main, "_f23_update_uvb_dose",
+        lambda **_k: main._f23_pure_excimer_update(
+            10, 20, port.text, label=hotkey, memo_port=port))
+    monkeypatch.setattr(
+        main, "_set_身份_自費",
+        lambda value, *, label: identity_calls.append((value, label)) or True)
+    monkeypatch.setattr(
+        main, "_script_code_input_adaptive",
+        lambda *_a, **_k: pytest.fail("51019 must not be placed"))
+    assert getattr(main, f"script_{hotkey}_adaptive")() is False
+    assert port.writes == []
+    assert identity_calls == [("01", hotkey)]
+    assert any("未自動更新" in title + msg for title, msg in fake_his)
+
+
+@pytest.mark.parametrize("hotkey", ["F2", "F3"])
+def test_excimer_verified_dose_and_identity_reports_complete(
+        monkeypatch, fake_his, hotkey):
+    port = FakeMemoPort(_memo(kind="Excimer"))
+    port.kind = "pure_excimer"
+    identity_calls = []
+    monkeypatch.setattr(
+        main, "_f23_update_uvb_dose",
+        lambda **_k: main._f23_pure_excimer_update(
+            10, 20, port.text, label=hotkey, memo_port=port))
+    monkeypatch.setattr(
+        main, "_set_身份_自費",
+        lambda value, *, label: identity_calls.append((value, label)) or True)
+    monkeypatch.setattr(
+        main, "_script_code_input_adaptive",
+        lambda *_a, **_k: pytest.fail("51019 must not be placed"))
+    assert getattr(main, f"script_{hotkey}_adaptive")() is True
+    assert len(port.writes) == 1
+    assert identity_calls == [("01", hotkey)]
+
+
+@pytest.mark.parametrize("hotkey", ["F2", "F3"])
+def test_excimer_declined_dose_confirmation_reports_incomplete(
+        monkeypatch, fake_his, hotkey):
+    prior = date.today() - timedelta(days=40)
+    port = FakeMemoPort(_memo(kind="Excimer").replace(
+        (date.today() - timedelta(days=3)).strftime("%Y/%m/%d"),
+        prior.strftime("%Y/%m/%d")))
+    port.kind = "pure_excimer"
+    identity_calls = []
+    monkeypatch.setattr(main, "_photo_confirm_yesno", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        main, "_f23_update_uvb_dose",
+        lambda **_k: main._f23_pure_excimer_update(
+            10, 20, port.text, label=hotkey, memo_port=port))
+    monkeypatch.setattr(
+        main, "_set_身份_自費",
+        lambda value, *, label: identity_calls.append((value, label)) or True)
+    assert getattr(main, f"script_{hotkey}_adaptive")() is False
+    assert port.writes == []
+    assert identity_calls == [("01", hotkey)]
+
+
+@pytest.mark.parametrize("hotkey", ["F2", "F3"])
+def test_repeated_phototherapy_hotkey_while_busy_does_not_start_second_write(
+        hotkey):
+    app = main.AutomationApp.__new__(main.AutomationApp)
+    app._subsystem_lock = threading.RLock()
+    app._subsystem_running = True
+    app._subsystem_current_hotkey = hotkey
+    app._restart_committing = False
+    app._last_hotkey_busy_notice_at = 0.0
+    app.ui_queue = Queue()
+    app._show_notice = lambda *_a, **_k: None
+    writes = []
+    app.run_subsystem_in_thread(lambda: writes.append("second write"), hotkey,
+                                preempt_same=False)
+    assert writes == []
+    assert "前一個熱鍵流程尚未完成" in app.ui_queue.get_nowait().text
 
 
 @pytest.mark.parametrize("hotkey", ["F2", "F3"])

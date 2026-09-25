@@ -24,7 +24,8 @@ def memo_written_back_intact(original: str, proposed: str, actual: str) -> bool:
     to ``8 50``. Unedited history lines must match exactly.
     """
     def tokens(line: str) -> list[str]:
-        return re.findall(r"\d+|[^\W\d_]+|_+|[^\w\s]", line.casefold())
+        return re.findall(r"\d+(?:[.,]\d+)*|[^\W\d_]+|_+|[^\w\s]",
+                          line.casefold())
 
     before = original.splitlines()
     intended = proposed.splitlines()

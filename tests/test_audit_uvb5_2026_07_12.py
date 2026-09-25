@@ -50,7 +50,7 @@ def test_ud13_warning_uses_awaiting_scope():
     body = _func(_main_src(), "def _show_uvb_warning")
     assert "_hotkey_awaiting_user_scope()" in body and "MessageBoxW" in body, \
         "UD-13 警告框未納 awaiting scope"
-    assert body.index("_hotkey_awaiting_user_scope()") < body.index("MessageBoxW(main_hwnd"), \
+    assert body.index("_hotkey_awaiting_user_scope()") < body.index("MessageBoxW(owner"), \
         "UD-13 scope 未包住 MessageBoxW"
 
 

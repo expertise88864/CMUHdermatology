@@ -3126,10 +3126,18 @@ def _show_uvb_warning(main_hwnd: int, title: str, msg: str) -> None:
     try:
         # MB_ICONWARNING(0x30) | MB_TOPMOST(0x40000) | MB_SETFOREGROUND(0x10000)
         flags = 0x30 | 0x40000 | 0x10000
+        # HIS may have closed between the failed write/read and this warning.
+        # An invalid owner makes MessageBoxW fail without displaying the alert.
+        owner = (main_hwnd if main_hwnd and ctypes.windll.user32.IsWindow(main_hwnd)
+                 else 0)
         # [UD-13 2026-07-12] 阻塞對話框期間標記「等待使用者」,watchdog 不誤報 keep_stuck
         # (比照 _photo_confirm_yesno)。
         with _hotkey_awaiting_user_scope():
-            ctypes.windll.user32.MessageBoxW(main_hwnd, msg, title, flags)
+            shown = ctypes.windll.user32.MessageBoxW(owner, msg, title, flags)
+            if not shown and owner:
+                shown = ctypes.windll.user32.MessageBoxW(0, msg, title, flags)
+            if not shown:
+                logging.warning("UVB warning dialog could not be shown: %s", title)
     except Exception:
         logging.debug("MessageBox 例外", exc_info=True)
 
@@ -3172,7 +3180,11 @@ def _warn_excimer_not_updated(main_hwnd: int, label: str, result) -> None:
             f"劑量【沒有】自動更新；{_excimer_identity_note(label)}\n"
             "請醫師確認處置後手動調整。")
         return
-    logging.info("[%s][Excimer] 劑量未自動更新(action=%s)", label, result.action)
+    logging.warning("[%s][Excimer] 劑量未自動更新(action=%s)", label, result.action)
+    _show_uvb_warning(
+        main_hwnd, "Excimer 劑量未自動更新",
+        "未取得可安全更新的 Excimer 劑量與次數，處置【沒有】自動更新。\n\n"
+        + _excimer_identity_note(label) + "\n請醫師確認處置後手動調整。")
 
 
 def _photo_confirm_yesno(main_hwnd: int, title: str, intro: str, reason: str,
@@ -3431,6 +3443,7 @@ def _f1_phototherapy_route(label: str = "") -> str:
 # 仍回 True(正常)/False(中止),不需大改。
 _F23_PURE_EXCIMER = "pure_excimer"
 _F23_PURE_EXCIMER_UNVERIFIED = "pure_excimer_unverified"
+_F23_PURE_EXCIMER_NOT_UPDATED = "pure_excimer_not_updated"
 
 
 class _PureExcimerAbortedType(str):
@@ -3599,8 +3612,7 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
     decay/加量並 cap 在 MAX,跟 UVB 一樣)後,回 _F23_PURE_EXCIMER(caller 設身份=01、
     跳過 51019/療程)。
 
-    劑量更新是 best-effort:寫回失敗或非單純 UPDATED(上限/格式)只記錄/警示,
-    【不影響身份=01】—— 這次就是自費 excimer visit,身份本來就該設 01。
+    劑量未更新或結果不明仍依既有計費規則嘗試身份=01，但 caller 不得回報完成。
     例外:TOO_CLOSE(間隔太短)回 falsy 的 _F23_PURE_EXCIMER_ABORTED —— 中止、
     不設身份(同一般 UVB),但保留「分流=純 excimer」結論供 F1 矛盾警告([UD-14])。"""
     try:
@@ -3657,13 +3669,16 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
                         return _F23_PURE_EXCIMER_UNVERIFIED
                 else:
                     _warn_excimer_not_updated(main_hwnd, label, result)
+                    return _F23_PURE_EXCIMER_NOT_UPDATED
             else:
                 logging.info(
                     "[%s][Excimer] 使用者按否 → 劑量未更新(身份仍設 01)", label)
+                return _F23_PURE_EXCIMER_NOT_UPDATED
         else:
             # [2026-07-25 外審 F3 ★病人安全★] 舊版所有非 UPDATED 的 action 一律只寫 log 就
             # 往下設身份 01 —— 醫師完全看不到「劑量沒被自動更新」。改由共用 helper 處理。
             _warn_excimer_not_updated(main_hwnd, label, result)
+            return _F23_PURE_EXCIMER_NOT_UPDATED
     except SubsystemInterrupted:
         # [H4 2026-07-09] F12 取消【必須】往上傳,不可被下面的 except Exception 吞掉
         # (否則舊 worker 會照樣寫回處置欄+設身份,違背 F12 取消語意)。
@@ -4257,6 +4272,7 @@ def _f1_update_uvb_dose_if_present(label: str = "F1") -> bool:
     # 一樣是純 excimer、矛盾一樣存在 → 兩種結局都要警告,僅文案區分行有沒有被更新。
     # (route 正常判到 pure_excimer 的 F1 走 _f1_pure_excimer,不會進到這裡。)
     if res in (_F23_PURE_EXCIMER, _F23_PURE_EXCIMER_UNVERIFIED,
+               _F23_PURE_EXCIMER_NOT_UPDATED,
                _F23_PURE_EXCIMER_ABORTED):
         _exc_state = (
             "excimer 行更新結果不明，需回讀核對"
@@ -4371,7 +4387,8 @@ def script_F2_adaptive():
     if not res:
         logging.info("F2: UVB 前置檢查/更新未完成，已終止 (跳過 51019)")
         return False
-    if res in (_F23_PURE_EXCIMER, _F23_PURE_EXCIMER_UNVERIFIED):
+    if res in (_F23_PURE_EXCIMER, _F23_PURE_EXCIMER_UNVERIFIED,
+               _F23_PURE_EXCIMER_NOT_UPDATED):
         # 純自費 Excimer:不 key 51019/療程,把身份改成 01
         # [audit 2026-07-12] 寫身份(計費欄)前的最終 F12 閘門:pure-excimer 內部 check_stop 通過
         # 後,劑量寫回(可阻塞 SendMessage)期間醫師若按 F12,此處 check_stop 會 raise → 不改身份。
@@ -4417,7 +4434,8 @@ def script_F3_adaptive():
     if not res:
         logging.info("F3: UVB 前置檢查/更新未完成，已終止 (跳過 51019)")
         return False
-    if res in (_F23_PURE_EXCIMER, _F23_PURE_EXCIMER_UNVERIFIED):
+    if res in (_F23_PURE_EXCIMER, _F23_PURE_EXCIMER_UNVERIFIED,
+               _F23_PURE_EXCIMER_NOT_UPDATED):
         # 純自費 Excimer:不 key 51019/療程,把身份改成 01
         # [audit 2026-07-12] 同 F2:寫身份(計費欄)前的最終 F12 閘門(見 script_F2_adaptive 說明)。
         check_stop()
