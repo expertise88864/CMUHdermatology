@@ -18,11 +18,14 @@ class HisMemoPort(Protocol):
     def write_memo(self, memo_hwnd: int, text: str) -> bool: ...
 
 def memo_written_back_intact(original: str, proposed: str, actual: str) -> bool:
-    """Verify every line while allowing HIS whitespace changes on edited lines.
+    """Verify every line while allowing spacing around edited-line tokens.
 
-    Existing phototherapy read-back checks validate clinical fields. This also
-    protects unrelated history from disappearing after a whole-memo write.
+    Numeric and word tokens must remain intact: ``850`` must not compare equal
+    to ``8 50``. Unedited history lines must match exactly.
     """
+    def tokens(line: str) -> list[str]:
+        return re.findall(r"\d+|[^\W\d_]+|_+|[^\w\s]", line.casefold())
+
     before = original.splitlines()
     intended = proposed.splitlines()
     observed = actual.splitlines()
@@ -32,7 +35,6 @@ def memo_written_back_intact(original: str, proposed: str, actual: str) -> bool:
         if old == want:
             if got != want:
                 return False
-        elif re.sub(r"\s+", "", got).casefold() != re.sub(
-                r"\s+", "", want).casefold():
+        elif tokens(got) != tokens(want):
             return False
     return True

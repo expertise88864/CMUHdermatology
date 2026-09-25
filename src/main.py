@@ -3151,6 +3151,12 @@ def _warn_excimer_segment_skipped(main_hwnd: int, label: str,
         f"請醫師確認該段後手動調整。")
 
 
+def _excimer_identity_note(label: str) -> str:
+    if label == "F1":
+        return "F1 不自動設定身份 01；若已輸入醫令或療程，請醫師一併核對。"
+    return "身份仍依原規則設為自費(01)；請醫師核對處置，勿直接重按熱鍵。"
+
+
 def _warn_excimer_not_updated(main_hwnd: int, label: str, result) -> None:
     """[外審 F3/R5] 純 excimer 的「沒有更新任何一段」收尾:SANITY_FAIL 代表程式解析出的值
     不可信(或整段不是加量醫囑)→ 必須讓醫師看到並手動處理,不可只寫 log 就去設身份 01。
@@ -3158,16 +3164,15 @@ def _warn_excimer_not_updated(main_hwnd: int, label: str, result) -> None:
     身份仍設 01(這次就是自費 excimer visit,身份本來就該設),與「寫回失敗」分支的既有取捨一致。"""
     from cmuh_common.uvb_dose import UvbAction
     if result.action == UvbAction.SANITY_FAIL:
-        logging.warning("[%s][Excimer] sanity check 失敗: %s → 劑量未更新(身份仍設 01)",
+        logging.warning("[%s][Excimer] sanity check 失敗: %s → 劑量未更新",
                         label, result.sanity_reason)
         _show_uvb_warning(
             main_hwnd, "Excimer 劑量未自動更新",
             f"{result.sanity_reason}\n\n"
-            f"身份仍會設為自費(01),但劑量【沒有】自動更新,\n"
-            f"請醫師確認處置後手動調整。")
+            f"劑量【沒有】自動更新；{_excimer_identity_note(label)}\n"
+            "請醫師確認處置後手動調整。")
         return
-    logging.info("[%s][Excimer] 劑量未自動更新(action=%s),身份仍設 01",
-                 label, result.action)
+    logging.info("[%s][Excimer] 劑量未自動更新(action=%s)", label, result.action)
 
 
 def _photo_confirm_yesno(main_hwnd: int, title: str, intro: str, reason: str,
@@ -3317,8 +3322,13 @@ def _collect_phototherapy_memos(main_hwnd: int) -> tuple[list, bool]:
     def cb(child, lparam):
         try:
             cls_buf = ctypes.create_unicode_buffer(64)
-            ctypes.windll.user32.GetClassNameW(child, cls_buf, 64)
+            if not ctypes.windll.user32.GetClassNameW(child, cls_buf, 64):
+                read_uncertain[0] = True
+                return True
             cls_lower = (cls_buf.value or "").lower()
+            if not cls_lower:
+                read_uncertain[0] = True
+                return True
             if not any(s in cls_lower for s in ("memo", "edit", "rich")):
                 return True
             text, ok = _wm_gettext_timeout_ex(child)
@@ -3335,7 +3345,8 @@ def _collect_phototherapy_memos(main_hwnd: int) -> tuple[list, bool]:
         return True
 
     try:
-        ctypes.windll.user32.EnumChildWindows(main_hwnd, cb, 0)
+        if not ctypes.windll.user32.EnumChildWindows(main_hwnd, cb, 0):
+            read_uncertain[0] = True
     except Exception:
         logging.debug("[Excimer] 列舉照光 memo 例外", exc_info=True)
         read_uncertain[0] = True
@@ -3389,22 +3400,29 @@ def _resolve_phototherapy_disposition(main_hwnd: int):
 
 def _f1_phototherapy_route(label: str = "") -> str:
     """只讀:給 F1 在 key 51019 前判斷本次照光走向。回 "pure_excimer" / "ambiguous" /
-    "normal"(uvb 或無照光處置都當 normal:F1 照常 51019,UVB 在 51019 後 best-effort
-    更新)。找不到主視窗/例外一律 "normal"(安全方向:照常 51019,不誤跳健保)。"""
+    "unknown" / "normal"。只有已確認為 UVB 或無照光處置才走 normal；讀取不明
+    不能先下可能與純自費 Excimer 衝突的健保醫令。"""
     try:
         main_hwnd = _find_hospital_main_window()
         if not main_hwnd:
-            return "normal"
+            return "unknown"
         _memo, kind = _resolve_phototherapy_disposition(main_hwnd)
+        if kind == "unknown":
+            return "unknown"
         if kind == "ambiguous":
             return "ambiguous"
         if kind == "pure_excimer":
             return "pure_excimer"
-        return "normal"
+        if kind in ("uvb", "none"):
+            return "normal"
+        logging.warning("[%s][Excimer] F1 照光分流回傳未知類型 %r", label, kind)
+        return "unknown"
+    except SubsystemInterrupted:
+        raise
     except Exception:
         logging.exception(
-            "[%s][Excimer] F1 照光分流偵測例外 → 當作 normal", label)
-        return "normal"
+            "[%s][Excimer] F1 照光分流偵測例外 → 結果不明", label)
+        return "unknown"
 
 
 # [2026-06-18] 純自費 Excimer 哨符:_update_uvb_dose_core 偵測到「只有 Excimer、
@@ -3474,9 +3492,29 @@ def _write_excimer_memo_checked(main_hwnd: int, memo_hwnd: int, original: str,
                                 memo_port: HisMemoPort | None = None
                                 ) -> bool | None:
     """Return verified / unverified / stale-target; billing remains caller policy."""
+    def audit(outcome: str, reason: str = "") -> None:
+        # 純 Excimer 更新結果沒有 parsed 原值；只記確知的新劑量／次數，
+        # 避免把空的 before 值偽裝成已知的原值→新值轉換。
+        _record_his_action(
+            _LEDGER_HIS_FIELD, f"{label} Excimer 劑量",
+            main_hwnd=main_hwnd, target="field:處置memo",
+            value=_EvMeasure(dose=result.new_dose, count=result.new_count),
+            outcome=outcome, detail=_EvReason(reason) if reason else "")
+
+    identity_note = _excimer_identity_note(label)
+    stale_note = (
+        "\nF1 不自動設定身份 01；若已輸入醫令或療程，請醫師一併核對。"
+        if label == "F1" else
+        "\n身份(自費 01)尚未自動設定；請醫師核對。")
+    unverified_skip_note = (
+        f"\n原處置中的「{result.decrease_note}」被判定為非加量醫囑，"
+        "程式原本不會調整該段；目前寫回結果未確認，請醫師核對。"
+        if result.decrease_note else "")
+
     if not _photo_memo_snapshot_current(
             main_hwnd, memo_hwnd, "pure_excimer", original, label,
-            memo_port=memo_port):
+            memo_port=memo_port,
+            placed_note=stale_note):
         return None
     check_stop()
     try:
@@ -3484,6 +3522,11 @@ def _write_excimer_memo_checked(main_hwnd: int, memo_hwnd: int, original: str,
                  if memo_port is not None
                  else _write_tmemo_text(memo_hwnd, result.new_text))
     except SubsystemInterrupted:
+        audit(_LEDGER_SUBMITTED, "f12_during_write")
+        _show_uvb_warning(
+            main_hwnd, "Excimer 寫入中 F12 中止",
+            "處置可能已寫入但尚未回讀確認；身份與後續醫令不會自動處理。"
+            "請醫師核對，勿直接重按熱鍵。" + unverified_skip_note)
         raise
     except Exception:
         logging.exception("[%s][Excimer] 寫回處置發生例外", label)
@@ -3491,25 +3534,29 @@ def _write_excimer_memo_checked(main_hwnd: int, memo_hwnd: int, original: str,
     try:
         check_stop()
     except SubsystemInterrupted:
+        audit(_LEDGER_SUBMITTED, "f12_after_write")
         _show_uvb_warning(
             main_hwnd, "Excimer 寫入後 F12 中止",
             "寫入期間已取消，處置可能已更新但尚未回讀確認；"
-            "身份與後續醫令不會自動處理。請醫師逐行核對，勿直接重按熱鍵。")
+            "身份與後續醫令不會自動處理。請醫師逐行核對，勿直接重按熱鍵。"
+            + unverified_skip_note)
         raise
     if not wrote:
+        audit(_LEDGER_SUBMITTED, "settext_unconfirmed")
         _show_uvb_warning(
             main_hwnd, "Excimer 劑量寫回結果不明",
             "自費 Excimer 處置寫回未獲確認，不能判定是否已更新。\n"
-            "身份仍依原規則設為自費(01)；請醫師核對處置，勿直接重按熱鍵。")
+            + identity_note + unverified_skip_note)
         return False
     try:
         actual = (memo_port.read_memo(memo_hwnd) if memo_port is not None
                   else _read_tmemo_text(memo_hwnd))
     except SubsystemInterrupted:
+        audit(_LEDGER_SUBMITTED, "f12_during_readback")
         _show_uvb_warning(
             main_hwnd, "Excimer 回讀中 F12 中止",
             "處置可能已寫入但尚未確認；身份與後續醫令不會自動處理。"
-            "請醫師逐行核對，勿直接重按熱鍵。")
+            "請醫師逐行核對，勿直接重按熱鍵。" + unverified_skip_note)
         raise
     except Exception:
         logging.exception("[%s][Excimer] 寫後回讀處置發生例外", label)
@@ -3517,25 +3564,30 @@ def _write_excimer_memo_checked(main_hwnd: int, memo_hwnd: int, original: str,
     try:
         check_stop()
     except SubsystemInterrupted:
+        audit(_LEDGER_SUBMITTED, "f12_after_readback")
         _show_uvb_warning(
             main_hwnd, "Excimer 回讀後 F12 中止",
             "處置寫入後已取消；身份與後續醫令不會自動處理。"
-            "請醫師核對目前處置與身份，勿直接重按熱鍵。")
+            "請醫師核對目前處置與身份，勿直接重按熱鍵。"
+            + unverified_skip_note)
         raise
     if not actual:
+        audit(_LEDGER_SUBMITTED, "readback_empty")
         _show_uvb_warning(
             main_hwnd, "Excimer 劑量寫回無法驗證",
             "寫入後讀不到處置全文，不能確認劑量是否更新。\n"
-            "身份仍依原規則設為自費(01)；請醫師核對處置，勿直接重按熱鍵。")
+            + identity_note + unverified_skip_note)
         return False
     if not memo_written_back_intact(original, result.new_text, actual):
+        audit(_LEDGER_MISMATCH, "readback_mismatch")
         _show_uvb_warning(
             main_hwnd, "Excimer 劑量寫回驗證失敗",
             "寫入後的處置與預計內容不一致，可能有其他病史行遺失或劑量未更新。\n"
-            "身份仍依原規則設為自費(01)；請醫師逐行核對處置。")
+            + identity_note + unverified_skip_note)
         return False
     logging.info("[%s][Excimer] 劑量已回讀確認(次數→%s、劑量→%s)",
                  label, result.new_count, result.new_dose)
+    audit(_LEDGER_OK)
     _warn_excimer_segment_skipped(main_hwnd, label, result.decrease_note)
     return True
 
@@ -3617,11 +3669,11 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
         # (否則舊 worker 會照樣寫回處置欄+設身份,違背 F12 取消語意)。
         raise
     except Exception:
-        logging.exception("[%s][Excimer] 劑量更新例外(身份仍設 01)", label)
+        logging.exception("[%s][Excimer] 劑量更新例外", label)
         _show_uvb_warning(
             main_hwnd, "Excimer 劑量更新無法確認",
             "自費 Excimer 劑量處理發生例外，無法確認處置是否更新。"
-            "身份仍依原規則設為自費(01)；請醫師核對處置，勿直接重按熱鍵。")
+            + _excimer_identity_note(label))
         return _F23_PURE_EXCIMER_UNVERIFIED
     return _F23_PURE_EXCIMER
 
@@ -3739,10 +3791,20 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
     # verify),見 _f23_pure_excimer_update。
     if photo_kind == "pure_excimer":
         logging.info(
-            "[%s][Excimer] 純自費 Excimer(無 UVB)→ 更新 excimer 劑量 + 身份設 01,"
-            "不 key 51019/療程", label)
-        return _f23_pure_excimer_update(
-            main_hwnd, memo_hwnd, text, label, memo_port=memo_port)
+            "[%s][Excimer] 純自費 Excimer(無 UVB)→ 更新 excimer 劑量；"
+            "身份與醫令由上層決定", label)
+        try:
+            return _f23_pure_excimer_update(
+                main_hwnd, memo_hwnd, text, label, memo_port=memo_port)
+        except SubsystemInterrupted:
+            if label == "F1":
+                _show_uvb_warning(
+                    main_hwnd, "F1 照光分流矛盾且已中止",
+                    "F1 前段已輸入 51019 醫令與療程 1，後段卻偵測為純自費 "
+                    "Excimer 並因 F12 中止；處置可能已有部分寫入。\n"
+                    "若本次為自費 Excimer，請醫師核對並手動刪除不相容的 51019 醫令，"
+                    "確認正確的 Excimer 醫令、療程 1、身份與處置。")
+            raise
 
     try:
         from cmuh_common.uvb_dose import update_uvb_in_text, UvbAction
@@ -3961,6 +4023,12 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
         wrote = (memo_port.write_memo(memo_hwnd, final_text) if memo_port is not None
                  else _write_tmemo_text(memo_hwnd, final_text))
     except SubsystemInterrupted:
+        _record_his_action(
+            _LEDGER_HIS_FIELD, f"{label} UVB 劑量", main_hwnd=main_hwnd,
+            target="field:處置memo",
+            value=_EvMeasure(dose=result.new_dose, count=result.new_count),
+            outcome=_LEDGER_SUBMITTED,
+            detail=_EvReason("f12_during_write"))
         _show_uvb_warning(
             main_hwnd, "UVB 寫入中 F12 中止",
             f"{label} 寫入要求可能已生效，但尚未回讀確認。"
@@ -3972,6 +4040,12 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
     try:
         check_stop()
     except SubsystemInterrupted:
+        _record_his_action(
+            _LEDGER_HIS_FIELD, f"{label} UVB 劑量", main_hwnd=main_hwnd,
+            target="field:處置memo",
+            value=_EvMeasure(dose=result.new_dose, count=result.new_count),
+            outcome=_LEDGER_SUBMITTED,
+            detail=_EvReason("f12_after_write"))
         _show_uvb_warning(
             main_hwnd, "UVB 寫入後 F12 中止",
             f"{label} 寫入處置期間已取消；寫入要求可能已生效，但尚未回讀確認，"
@@ -3996,6 +4070,12 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
         actual_text = (memo_port.read_memo(memo_hwnd) if memo_port is not None
                        else _read_tmemo_text(memo_hwnd))
     except SubsystemInterrupted:
+        _record_his_action(
+            _LEDGER_HIS_FIELD, f"{label} UVB 劑量", main_hwnd=main_hwnd,
+            target="field:處置memo",
+            value=_EvMeasure(dose=result.new_dose, count=result.new_count),
+            outcome=_LEDGER_SUBMITTED,
+            detail=_EvReason("f12_during_readback"))
         _show_uvb_warning(
             main_hwnd, "UVB 回讀中 F12 中止",
             f"{label} 寫入可能已生效，但尚未確認完整處置。"
@@ -4007,6 +4087,12 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
     try:
         check_stop()
     except SubsystemInterrupted:
+        _record_his_action(
+            _LEDGER_HIS_FIELD, f"{label} UVB 劑量", main_hwnd=main_hwnd,
+            target="field:處置memo",
+            value=_EvMeasure(dose=result.new_dose, count=result.new_count),
+            outcome=_LEDGER_SUBMITTED,
+            detail=_EvReason("f12_after_readback"))
         _show_uvb_warning(
             main_hwnd, "UVB 回讀後 F12 中止",
             f"{label} 處置寫入後已取消，後續醫令不會執行。\n"
@@ -4187,7 +4273,7 @@ def _f1_update_uvb_dose_if_present(label: str = "F1") -> bool:
             f"F1 前段已輸入 51019 醫令+療程 1(當時判定走健保 UVB),\n"
             f"但處置更新階段偵測為【純自費 Excimer】({_exc_state})。\n\n"
             f"健保醫令與自費處置並存,請人工核對本次實際照光種類:\n"
-            f"  • 若為自費 Excimer:請刪除 51019/療程 1,並確認身份別與 excimer 行;\n"
+            f"  • 若為自費 Excimer:請刪除不相容的 51019 醫令,並確認正確的 Excimer 醫令、療程 1、身份別與 excimer 行;\n"
             f"  • 若為健保 UVB:請檢查 excimer 行是否被誤更新並改回。")
         return False
     return res is True
@@ -4243,8 +4329,16 @@ def script_F1_adaptive():
     """
     logging.info("--- Executing F1 (照光 1) ---")
     # F1 是「先 51019 後 UVB」,所以要在 key 51019 【之前】先判斷照光走向。
-    # 偵測失敗一律當 normal(照常 51019,不誤跳健保)。
+    # 分流讀取不明時不可先下 51019，以免純自費 Excimer 被誤作健保 UVB。
     f1_route = _f1_phototherapy_route(label="F1")
+    if f1_route == "unknown":
+        logging.warning("F1: 照光分流讀取不明 → 醫令與療程皆未輸入")
+        _show_uvb_warning(
+            0, "照光分流讀取不明",
+            "HIS 視窗或照光處置欄無法完整讀取，不能確認本次是健保 UVB "
+            "或純自費 Excimer。\n\n"
+            "F1 未輸入醫令或療程，也未更新劑量；請醫師核對後手動處理。")
+        return False
     if f1_route == "ambiguous":
         logging.warning("F1: UVB 與 Excimer 分屬不同欄位 → 中止,交醫師手動")
         _show_uvb_warning(
