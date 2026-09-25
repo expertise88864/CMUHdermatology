@@ -24,6 +24,7 @@ from tkinter import filedialog, messagebox, ttk
 from cmuh_common.deps_runtime import ensure_dependencies
 from cmuh_common.roster import ORTOOLS_PINNED_VERSION
 from cmuh_common.roster.day_explanation import format_day_explanation
+from cmuh_common.roster.day_diagnostics import format_day_feasibility
 from cmuh_common.roster.model import ClerkBatch, batches_covering, month_dates
 from cmuh_common.roster.solve_control import DaySolveControl, DaySolveStopped
 from cmuh_common.roster.solve_day import (
@@ -303,7 +304,7 @@ class DayScheduleTab(ttk.Frame):
         self._stats_clerk.tag_configure("hdr", background="#E8E8E8")
         self._stats_clerk.tag_configure("miss", background="#FFD2D2")
         self._stats_clerk.pack(fill="x", padx=6)
-        ttk.Button(side, text="查看完整公平性與缺口說明",
+        ttk.Button(side, text="排班前／後需求與席位診斷",
                    command=self._on_explanation).pack(anchor="w", padx=6, pady=(4, 0))
         # ★[RS-28 2026-08-25] 這段字原本寫「至少跟過一次切片室」★ —— 那是
         #   RS-24(2026-08-24 使用者定案「配額平均」)之前的規則。現在的要求是
@@ -411,15 +412,16 @@ class DayScheduleTab(ttk.Frame):
 
     def _on_explanation(self) -> None:
         try:
-            explanation = self.service.day_current_course_stats(
-                self.app.ym)["explanation"]
+            analysis = self.service.day_current_course_stats(
+                self.app.ym, today=date.today())
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("統計失敗", str(exc), parent=self)
             return
         win = tk.Toplevel(self)
-        win.title(f"實際班表公平性 · {self.app.ym}")
+        win.title(f"需求與席位診斷 · {self.app.ym}")
         display = tk.Text(win, wrap="word", width=96, height=30)
-        display.insert("1.0", format_day_explanation(explanation))
+        display.insert("1.0", format_day_explanation(analysis["explanation"])
+                       + "\n\n" + format_day_feasibility(analysis["diagnostics"]))
         display.config(state="disabled")
         display.pack(fill="both", expand=True, padx=8, pady=8)
         ttk.Button(win, text="關閉", command=win.destroy).pack(pady=(0, 6))
@@ -570,10 +572,13 @@ class DayScheduleTab(ttk.Frame):
             self._day_poll_id = None
         super().destroy()
 
-    def _format_report(self, log, warnings, explanation) -> str:
+    def _format_report(self, log, warnings, explanation, diagnostics=None) -> str:
         base = ("【警告】\n" + ("\n".join(f"  ⚠ {w}" for w in warnings) or "  （無）")
                 + "\n\n【逐日過程】\n" + "\n".join(log))
-        return base + "\n\n" + format_day_explanation(explanation)
+        report = base + "\n\n" + format_day_explanation(explanation)
+        if diagnostics is not None:
+            report += "\n\n" + format_day_feasibility(diagnostics)
+        return report
 
     def _preview_and_accept(self, res) -> None:
         # ★整個 res 都要帶進來(不是只帶 day_slots)★:套用時要用它問
@@ -582,9 +587,10 @@ class DayScheduleTab(ttk.Frame):
         day_slots, log, warnings = res.day_slots, res.log, res.warnings
         # 嚴格快照同時核對跨月來源、輸入指紋及鎖定格位；讀不到時不展示不完整統計。
         try:
-            explanation = self.service.day_preview_explanation(
+            analysis = self.service.day_preview_analysis(
                 self.app.ym, day_slots, expect=res, today=date.today())
-            report = self._format_report(log, warnings, explanation)
+            report = self._format_report(
+                log, warnings, analysis["explanation"], analysis["diagnostics"])
         except Exception as exc:  # noqa: BLE001
             logging.exception("[roster.ui] 無法重算排班預覽與統計")
             messagebox.showerror("預覽失敗", f"無法核對鎖定時段與統計：\n{exc}", parent=self)
@@ -771,10 +777,30 @@ class DayScheduleTab(ttk.Frame):
         dlg = tk.Toplevel(self)
         dlg.title(f"PGY 照光次數調整 · {self.app.ym}")
         dlg.transient(self.winfo_toplevel())
-        ttk.Label(dlg, text="0：照光與治療室盡量等次；−1／−2：照光及總工作量減少 1／2 次。\n"
+        ttk.Label(dlg, text="0：以同儕共同基準為目標；−1／−2：相對同儕的照光與總工作量目標各少 1／2 次。\n"
                   "含週三下午照光，不以治療室或跟診補回減量；+1 則增加目標。\n"
                   "先平衡照光、治療室與週三下午，再由跟診平衡總工作量。\n"
-                  "請假、鎖定、必要人力與每週最低跟診優先；無法達成時顯示提醒。", padding=10).pack()
+                  "實排可能與目標不同；請假、鎖定、必要人力與每週最低跟診優先。", padding=10).pack()
+        try:
+            current_rows = self.service.day_current_course_stats(
+                self.app.ym, today=date.today())["explanation"].pgy
+        except Exception as exc:  # noqa: BLE001
+            ttk.Label(dlg, text=f"現有班表統計無法讀取：{exc}",
+                      foreground="red", padding=(10, 0)).pack(anchor="w")
+            current_rows = ()
+        if current_rows:
+            ttk.Label(dlg, text="現有班表實排（相對其他 PGY 平均；尚非 0 設定試排結果）：",
+                      padding=(10, 2)).pack(anchor="w")
+            for current in current_rows:
+                peers = [p for p in current_rows if p.code != current.code]
+                if peers:
+                    photo_gap = current.photo - sum(p.photo for p in peers) / len(peers)
+                    total_gap = current.total - sum(p.total for p in peers) / len(peers)
+                    detail = (f"{current.code}：照光 {current.photo}（差 {photo_gap:+.2f}）、"
+                              f"總工作 {current.total}（差 {total_gap:+.2f}）")
+                else:
+                    detail = f"{current.code}：照光 {current.photo}、總工作 {current.total}（無其他 PGY）"
+                ttk.Label(dlg, text=detail, padding=(16, 0)).pack(anchor="w")
         entries = {}
         for p in roster:
             row = ttk.Frame(dlg)
@@ -783,6 +809,102 @@ class DayScheduleTab(ttk.Frame):
             var = tk.StringVar(value=str(baseline.get(p, 0)))
             ttk.Spinbox(row, from_=-99, to=99, textvariable=var, width=8).pack(side="left")
             entries[p] = var
+
+        comparison = tk.StringVar(value="選擇已儲存的非 0 調整，可唯讀試排本人改成 0 的結果。")
+        ttk.Label(dlg, textvariable=comparison, justify="left",
+                  wraplength=620, padding=(10, 4)).pack(anchor="w")
+        controls = []
+        stop_comparison = threading.Event()
+
+        def compare_zero():
+            if self._day_solving:
+                messagebox.showinfo("試排比較", "請先等目前的自動排班結束", parent=dlg)
+                return
+            code = selected.get()
+            if not code:
+                return
+            if baseline.get(code, 0) == 0:
+                messagebox.showinfo("試排比較", "此人目前已儲存的調整是 0", parent=dlg)
+                return
+            try:
+                _verify_day_solver_dependency()
+            except RuntimeError as exc:
+                messagebox.showerror("試排比較", str(exc), parent=dlg)
+                return
+            compare_btn.config(state="disabled")
+            comparison.set("兩份班表背景試排中；僅供診斷，不會套用或存檔。")
+            result = {}
+            solve_today = date.today()
+
+            def make_control():
+                control = DaySolveControl()
+                controls.append(control)
+                if stop_comparison.is_set():
+                    control.cancel("比較視窗已關閉")
+                return control
+
+            def work():
+                try:
+                    result["value"] = self.service.compare_pgy_zero_offset(
+                        self.app.ym, code, today=solve_today,
+                        control_factory=make_control,
+                        expected_offset=baseline.get(code, 0))
+                except (Exception, SystemExit) as exc:  # noqa: BLE001
+                    result["error"] = str(exc)
+
+            worker = threading.Thread(target=work, name="roster-photo-zero-compare",
+                                      daemon=True)
+            worker.start()
+
+            def poll():
+                if not dlg.winfo_exists():
+                    return
+                if worker.is_alive():
+                    stage = controls[-1].stage if controls else "讀取輸入"
+                    comparison.set(f"背景試排中：{stage}；關閉視窗可取消。")
+                    dlg.after(250, poll)
+                    return
+                compare_btn.config(state="normal")
+                if "error" in result:
+                    comparison.set(f"試排比較未完成：{result['error']}")
+                    return
+                if solve_today != date.today() or self.app.ym != ym_for_compare:
+                    comparison.set("比較期間已跨日或切換月份，請重新試排。")
+                    return
+                value = result["value"]
+                current = value["variants"]["目前設定"]
+                zero = value["variants"]["本人設為 0"]
+                delta_photo = current["photo"] - zero["photo"]
+                delta_total = current["total"] - zero["total"]
+                warnings = "；".join(current["warnings"][:3]) or "無指定 PGY 減量警告"
+                zero_warnings = "；".join(zero["warnings"][:2]) or "無指定 PGY 警告"
+                comparison.set(
+                    f"{code} 已儲存調整 {value['offset']:+}：照光 {current['photo']}、"
+                    f"總工作 {current['total']}；同一輸入只將本人改 0："
+                    f"照光 {zero['photo']}、總工作 {zero['total']}。\n"
+                    f"實際差值（目前－0）照光 {delta_photo:+}、總工作 {delta_total:+}。\n"
+                    f"目前設定試排提醒：{warnings}。\n"
+                    f"本人 0 設定試排提醒：{zero_warnings}。此比較未寫入班表。")
+
+            dlg.after(250, poll)
+
+        ym_for_compare = self.app.ym
+        selected = tk.StringVar(value=roster[0])
+        compare_row = ttk.Frame(dlg)
+        compare_row.pack(fill="x", padx=10, pady=(4, 0))
+        ttk.Label(compare_row, text="0 設定診斷比較：").pack(side="left")
+        ttk.Combobox(compare_row, values=roster, textvariable=selected,
+                     state="readonly", width=12).pack(side="left")
+        compare_btn = ttk.Button(compare_row, text="背景試排比較", command=compare_zero)
+        compare_btn.pack(side="left", padx=6)
+
+        def close():
+            stop_comparison.set()
+            for control in controls:
+                control.cancel("比較視窗已關閉")
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", close)
         def save():
             try:
                 values = {p: int(v.get()) for p, v in entries.items()}
@@ -790,7 +912,7 @@ class DayScheduleTab(ttk.Frame):
             except Exception as exc:  # noqa: BLE001
                 messagebox.showerror("儲存失敗", str(exc), parent=dlg)
                 return
-            dlg.destroy()
+            close()
             self.refresh()
         ttk.Button(dlg, text="儲存（下次自動排班生效）", command=save).pack(pady=10)
         dlg.grab_set()

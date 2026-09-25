@@ -1050,6 +1050,54 @@ class RosterService:
                     and result.fingerprint == day_input_fingerprint(
                         self.build_day_input(ym, src=src, today=today)))
 
+    def compare_pgy_zero_offset(self, ym: str, code: str, *,
+                                today: "date | None" = None,
+                                control_factory=None,
+                                expected_offset: "int | None" = None) -> dict:
+        """Solve current and same-person-zero offsets without writing either roster.
+
+        Each scenario receives its own full solve budget.  The source revision
+        and fingerprint are checked again after both solves; stale comparisons
+        are not shown as current advice.
+        """
+        with self.storage.write_barrier():
+            src = self._sources(ym, SRC_DAY, months=(next_ym(ym),))
+            _month, revision = src.month_snapshot(ym)
+            inp = self.build_day_input(ym, src=src, today=today)
+        if code not in inp.pgy_roster:
+            raise ValueError(f"PGY {code} 不在當月名單")
+        offset = int(inp.pgy_photo_offsets.get(code, 0))
+        if expected_offset is not None and offset != expected_offset:
+            raise ValueError("PGY 照光設定已變動，請重新開啟設定視窗")
+        if offset == 0:
+            raise ValueError(f"PGY {code} 已是 0，無需比較")
+        fingerprint = day_input_fingerprint(inp)
+        variants = {}
+        for label in ("目前設定", "本人設為 0"):
+            variant = copy.deepcopy(inp)
+            if label == "本人設為 0":
+                variant.pgy_photo_offsets[code] = 0
+            control = control_factory() if control_factory is not None else None
+            slots, _log, warnings = month_solve_day(variant, control=control)
+            stat = person_course_stats(slots, include={code}).get(code, {})
+            variants[label] = {
+                "photo": stat.get("photo", 0),
+                "treatment": stat.get("tx", 0),
+                "follow": stat.get("follow", 0),
+                "total": (stat.get("photo", 0) + stat.get("tx", 0)
+                          + stat.get("follow", 0)),
+                "warnings": tuple(w for w in warnings if code in w or "尚未證明" in w),
+            }
+        with self.storage.write_barrier():
+            src = self._sources(ym, SRC_DAY, months=(next_ym(ym),))
+            _month, current_revision = src.month_snapshot(ym)
+            current = self.build_day_input(ym, src=src, today=today)
+            if (current_revision != revision
+                    or day_input_fingerprint(current) != fingerprint):
+                raise ValueError("比較期間排班資料已變動，請重新試排")
+        return {"code": code, "offset": offset, "variants": variants,
+                "fingerprint": fingerprint}
+
     @staticmethod
     def _overlay_locked_sessions(month: dict, day_slots: dict) -> dict:
         """RF-04：把月檔中「鎖定且有內容」的時段強制蓋回 day_slots（淺拷貝，不改輸入）。
@@ -1072,6 +1120,13 @@ class RosterService:
                                 expect: "DaySolveResult | None" = None,
                                 today: "date | None" = None) -> DayCourseExplanation:
         """從同一份嚴格快照重算預覽；跨月來源壞掉時不可顯示不完整統計。"""
+        return self.day_preview_analysis(
+            ym, day_slots, expect=expect, today=today)["explanation"]
+
+    def day_preview_analysis(self, ym: str, day_slots: dict, *,
+                             expect: "DaySolveResult | None" = None,
+                             today: "date | None" = None) -> dict:
+        """預覽統計和容量診斷共用一次嚴格快照與求解指紋檢查。"""
         with self.storage.write_barrier():
             src = self._sources(ym, SRC_DAY, months=(next_ym(ym),))
             month, rev = src.month_snapshot(ym)
@@ -1082,13 +1137,14 @@ class RosterService:
             effective = self._overlay_locked_sessions(month, day_slots)
             return self.day_course_stats(
                 ym, day_slots_override=effective, inp=inp,
-                src=src)["explanation"]
+                src=src)
 
-    def day_current_course_stats(self, ym: str) -> dict:
+    def day_current_course_stats(self, ym: str, *,
+                                 today: "date | None" = None) -> dict:
         """側欄與公平性彈窗的現況數字；鄰月來源損壞時不可當成空班表。"""
         with self.storage.write_barrier():
             src = self._sources(ym, SRC_DAY, months=(next_ym(ym),))
-            inp = self.build_day_input(ym, src=src)
+            inp = self.build_day_input(ym, src=src, today=today)
             return self.day_course_stats(ym, inp=inp, src=src)
 
     def accept_day_solution(self, ym: str, day_slots: dict,
@@ -1649,12 +1705,14 @@ class RosterService:
             cur_slots, include={str(c) for c in inp.pgy_roster},
             start=m_first, end=m_last)
         batches_out = []
+        adjacent_months: set[str] = set()
         from .session_leave import monthly_person_slots
         for b in inp.clerk_batches:
             b_end = b.start_monday + timedelta(days=13)
             merged: dict = {}
             course_months = sorted({f"{d.year:04d}-{d.month:02d}"
                                     for d in (b.start_monday, b_end)})
+            adjacent_months.update(ymm for ymm in course_months if ymm != ym)
             month_data = {ymm: source.load_month(ymm)
                           for ymm in course_months}
             for ymm in course_months:
@@ -1694,6 +1752,17 @@ class RosterService:
                 "batches": batches_out}
         from .day_explanation import explain_day_courses
         data["explanation"] = explain_day_courses(inp, data, cur_slots)
+        from .day_diagnostics import diagnose_day
+        adjacent_grid = {}
+        if adjacent_months:
+            template = source.load_clinic_template().get("template") or {}
+            holidays = source.holidays_set()
+            for ymm in sorted(adjacent_months):
+                month = source.load_month(ymm)
+                adjacent_grid.update(month_grid(
+                    ymm, template, holidays, month.get("grid_overrides") or {}))
+        data["diagnostics"] = diagnose_day(inp, data["explanation"], data,
+                                            cur_slots, adjacent_grid)
         return data
 
     def update_month(self, ym: str, mutator, *, retries: int = 4):
@@ -4944,11 +5013,15 @@ class RosterService:
         """
         if scope == "day":
             from .day_explanation import DAY_EXPLANATION_HEADING, format_day_explanation
+            from .day_diagnostics import DAY_FEASIBILITY_HEADING, format_day_feasibility
             with self.storage.write_barrier():
                 src = self._sources(ym, SRC_DAY, months=(next_ym(ym),))
                 month = src.load_month(ym)
-                current = format_day_explanation(self.day_course_stats(
-                    ym, inp=self.build_day_input(ym, src=src), src=src)["explanation"])
+                stats = self.day_course_stats(
+                    ym, inp=self.build_day_input(ym, src=src, today=date.today()),
+                    src=src)
+                current = (format_day_explanation(stats["explanation"])
+                           + "\n\n" + format_day_feasibility(stats["diagnostics"]))
             text = month.get(report_key(scope)) or ""
             if not text:
                 return current
@@ -4956,7 +5029,8 @@ class RosterService:
             # 讓畫面上恰有一份由目前班表重算的統計。
             # 2026-07 版的舊報告以「週期次數統計」開頭；不能只切掉新版
             # heading，否則手改班表後會同時顯示新舊兩份互相矛盾的數字。
-            headings = (DAY_EXPLANATION_HEADING, "【週期次數統計】")
+            headings = (DAY_EXPLANATION_HEADING, DAY_FEASIBILITY_HEADING,
+                        "【週期次數統計】")
             cut = min((text.index(h) for h in headings if h in text),
                       default=len(text))
             historical = text[:cut].rstrip()

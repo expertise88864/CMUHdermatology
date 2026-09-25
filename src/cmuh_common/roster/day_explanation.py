@@ -200,6 +200,7 @@ def explain_day_courses(inp: DaySolveInput, data: dict[str, Any],
 def format_day_explanation(explanation: DayCourseExplanation) -> str:
     lines = [DAY_EXPLANATION_HEADING,
              "PGY：週三下午照光包含於照光及必要工作，不重複計入總量。",
+             "照光調整 0 是同儕共同基準；−1／−2 是相對同儕的目標偏移，實排差值另列，並非保證值。",
              "代號 照光 週三午 治療室 跟診 必要工作 實際總量 手動減量 公平目標 差異"]
     for r in explanation.pgy:
         lines.append(f"{r.code} {r.photo} {r.wednesday_photo} {r.treatment} "
@@ -208,6 +209,18 @@ def format_day_explanation(explanation: DayCourseExplanation) -> str:
         weekly = "、".join(f"{w}:{n}" for w, n in r.weekly_follows) or "無"
         doctors = "、".join(f"{name}:{n}" for name, n in r.known_doctors) or "無已知醫師"
         lines.append(f"  每週跟診 {weekly}；醫師 {doctors}；醫師未標示 {r.unknown_doctor_follows}")
+        peers = [other for other in explanation.pgy if other.code != r.code]
+        if peers:
+            mean_photo = Fraction(sum(other.photo for other in peers), len(peers))
+            mean_total = Fraction(sum(other.total for other in peers), len(peers))
+            photo_gap = Fraction(r.photo) - mean_photo
+            total_gap = Fraction(r.total) - mean_total
+            lines.append(f"  相對其他 PGY 實排平均：照光 {float(photo_gap):+.2f} 次、"
+                         f"總工作量 {float(total_gap):+.2f} 次"
+                         f"（同儕平均照光 {float(mean_photo):.2f}、"
+                         f"總量 {float(mean_total):.2f}）")
+        else:
+            lines.append("  僅一位 PGY，沒有同儕可比較實排差值")
     for r in explanation.training:
         weekly = "、".join(f"{w}:{n}" for w, n in r.weekly_follows) or "無"
         doctors = "、".join(f"{name}:{n}" for name, n in r.known_doctors) or "無已知醫師"
