@@ -1086,7 +1086,9 @@ class RosterService:
                 "follow": stat.get("follow", 0),
                 "total": (stat.get("photo", 0) + stat.get("tx", 0)
                           + stat.get("follow", 0)),
-                "warnings": tuple(w for w in warnings if code in w or "尚未證明" in w),
+                "warnings": tuple(w for w in warnings
+                                  if w.startswith(f"PGY {code} ")
+                                  or "尚未證明" in w),
             }
         with self.storage.write_barrier():
             src = self._sources(ym, SRC_DAY, months=(next_ym(ym),))

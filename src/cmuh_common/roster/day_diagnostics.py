@@ -54,15 +54,6 @@ def _clinic_capacity(inp: DaySolveInput, code: str, slots: set,
     blockers = []
     for d, session in sorted(slots):
         iso = d.isoformat()
-        grid = inp.grid.get(d)
-        if grid is None:
-            grid = (adjacent_grid or {}).get(d)
-        if grid is None:
-            # Direct solver callers may not provide the adjacent-month grid.
-            # Never turn that partial view into a proof of shortage.
-            unknown += 1
-            continue
-        rooms = [r for r in grid.get(session, ()) if is_follow_slot(r)]
         if iso[:7] < inp.ym:
             # This month's solve cannot add a seat to the previous month.
             locked = (inp.prior_sessions.get(iso) or {}).get(session) or {}
@@ -74,11 +65,21 @@ def _clinic_capacity(inp: DaySolveInput, code: str, slots: set,
             locked = (inp.locked.get(iso) or {}).get(session)
             fixed_reason = "已鎖定"
         if locked is not None:
-            personal = int(any(code in (locked.get(r) or ()) for r in rooms))
-            seats = personal
+            personal = int(any(code in (people or ()) for r, people in locked.items()
+                               if is_follow_slot(r)))
+            seats = sum(len(people or ()) for r, people in locked.items()
+                        if is_follow_slot(r))
             if not personal:
                 blockers.append(f"{iso} {session} {fixed_reason}")
         else:
+            grid = inp.grid.get(d)
+            if grid is None:
+                grid = (adjacent_grid or {}).get(d)
+            if grid is None:
+                # A free neighboring session needs the adjacent clinic grid.
+                unknown += 1
+                continue
+            rooms = [r for r in grid.get(session, ()) if is_follow_slot(r)]
             seats = len(rooms) * inp.capacity
             personal = int(seats > 0)
             if not personal:
@@ -126,13 +127,6 @@ def _clerk_shared_follow_capacity(inp: DaySolveInput, batch: dict,
         owner = day_owner_batch(order, d)
         if owner is None or owner.id != batch["id"]:
             continue
-        grid = inp.grid.get(d)
-        if grid is None:
-            grid = (adjacent_grid or {}).get(d)
-        if grid is None:
-            unknown += 1
-            continue
-        rooms = [r for r in grid.get(session, ()) if is_follow_slot(r)]
         iso = d.isoformat()
         if iso[:7] < inp.ym:
             fixed = (inp.prior_sessions.get(iso) or {}).get(session) or {}
@@ -142,8 +136,16 @@ def _clerk_shared_follow_capacity(inp: DaySolveInput, batch: dict,
             fixed = (inp.locked.get(iso) or {}).get(session)
         if fixed is not None:
             total += sum(person in available_by_person
-                         for room in rooms for person in (fixed.get(room) or ()))
+                         for room, people in fixed.items() if is_follow_slot(room)
+                         for person in (people or ()))
         else:
+            grid = inp.grid.get(d)
+            if grid is None:
+                grid = (adjacent_grid or {}).get(d)
+            if grid is None:
+                unknown += 1
+                continue
+            rooms = [r for r in grid.get(session, ()) if is_follow_slot(r)]
             present = sum((d, session) in slots
                           for slots in available_by_person.values())
             total += min(present, len(rooms) * inp.capacity)
@@ -199,6 +201,34 @@ def _saved_follow_outside_availability(
                    if is_follow_slot(room)) and (d, session) not in available:
                 conflicts.append((iso, session))
     return tuple(sorted(set(conflicts)))
+
+
+def _clerk_biopsy_coverage(inp: DaySolveInput, batch: dict, seats: set) -> int:
+    """Only immutable saved work consumes a seat; current unlocked work can move."""
+    members = set(batch["members"])
+    start, end = batch["start"], batch["end"]
+    done = set()
+    occupied = set()
+    for iso, sessions in (batch.get("slots") or {}).items():
+        if not start <= iso <= end or not isinstance(sessions, dict):
+            continue
+        for session, cells in sessions.items():
+            if not isinstance(cells, dict):
+                continue
+            fixed = (iso[:7] < inp.ym
+                     or (iso[:7] == inp.ym
+                         and session in (inp.locked.get(iso) or {}))
+                     or (iso[:7] > inp.ym
+                         and session in (inp.course_fixed.get(iso) or {})))
+            if not fixed:
+                continue
+            assigned = {str(person) for person in (cells.get(BIOPSY) or ())
+                        if str(person) in members}
+            if assigned:
+                done.update(assigned)
+                if (iso, session) in seats:
+                    occupied.add((iso, session))
+    return len(seats - occupied) + len(done)
 
 
 def diagnose_day(inp: DaySolveInput, explanation: DayCourseExplanation,
@@ -323,6 +353,11 @@ def diagnose_day(inp: DaySolveInput, explanation: DayCourseExplanation,
 
     for b in data["batches"]:
         members = sorted(set(b["members"]))
+        personal_caps = {
+            r.code: r.possible_sessions for r in rows
+            if r.scope == "Clerk" and r.course == b["id"] and r.kind == "跟診"}
+        shared_minimum = sum(min(9, personal_caps.get(person, 9))
+                             for person in members)
         follow_seats, unknown_follow = _clerk_shared_follow_capacity(
             inp, b, adjacent_grid)
         conflicts = retained_conflicts[b["id"]]
@@ -334,18 +369,20 @@ def diagnose_day(inp: DaySolveInput, explanation: DayCourseExplanation,
                     for iso, session, person in conflicts[:5])
                 + (f"，另 {len(conflicts) - 5} 個" if len(conflicts) > 5 else ""))
         if (members and not unknown_follow and not conflicts
-                and follow_seats < 9 * len(members)):
+                and follow_seats < shared_minimum):
             shortages.append(
-                f"Clerk {b['id']} 全梯跟診總席位不足：{len(members)} 人各達最低 9 診"
-                f"共需 {9 * len(members)} 席，樂觀上界只有 {follow_seats} 席，"
-                f"至少缺 {9 * len(members) - follow_seats} 席；"
+                f"Clerk {b['id']} 全梯跟診總席位不足：扣除個人本來就無法達到的"
+                f"診數後仍需 {shared_minimum} 席，樂觀上界只有 {follow_seats} 席，"
+                f"至少缺 {shared_minimum - follow_seats} 席；"
                 "可檢查門診停診、梯次重疊、請假及鎖定格")
         seats = biopsy_slots.get(b["id"], set())
-        if members and len(seats) < len(members):
+        coverage = _clerk_biopsy_coverage(inp, b, seats)
+        if members and coverage < len(members):
             dates = "、".join(f"{iso} {session}" for iso, session in sorted(seats)) or "無"
             shortages.append(
                 f"Clerk {b['id']} 切片席位容量不足：{len(members)} 人各需至少 1 席，"
-                f"有效單人席位只有 {len(seats)} 個，至少缺 {len(members) - len(seats)} 席。"
+                f"已實排成員與其餘可用單人席位最多涵蓋 {coverage} 人，"
+                f"至少缺 {len(members) - coverage} 席。"
                 f"目前席位：{dates}；可增加整梯有效開放時段或調整梯次人數")
 
     for row in explanation.pgy:
@@ -387,6 +424,8 @@ def diagnose_day(inp: DaySolveInput, explanation: DayCourseExplanation,
                     "這是相對目標，需以本人設 0 的獨立試排核對實際影響")
             protected = []
             for iso, sessions in (current_slots or {}).items():
+                if not isinstance(sessions, dict):
+                    continue
                 if iso[:7] != inp.ym:
                     continue
                 try:

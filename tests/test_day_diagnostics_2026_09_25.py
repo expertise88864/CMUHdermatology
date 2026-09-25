@@ -49,7 +49,7 @@ def test_five_clerks_four_single_person_biopsy_seats_proves_one_missing():
     report = _batch_case()
     text = format_day_feasibility(report)
     assert "5 人各需至少 1 席" in text
-    assert "只有 4 個" in text
+    assert "最多涵蓋 4 人" in text
     assert "至少缺 1 席" in text
     assert "2026-10-05 上午" in text
 
@@ -63,14 +63,14 @@ def test_fifth_biopsy_slot_removes_the_aggregate_capacity_shortage():
 def test_locked_empty_biopsy_slot_is_not_counted_as_available():
     report = _batch_case(
         locked={"2026-10-05": {"上午": {}}})
-    assert any("只有 3 個" in issue and "至少缺 2 席" in issue
+    assert any("最多涵蓋 3 人" in issue and "至少缺 2 席" in issue
                for issue in report.proven_shortages)
 
 
 def test_locked_assigned_biopsy_remains_one_seat_not_two():
     report = _batch_case(
         locked={"2026-10-05": {"上午": {BIOPSY: ["C1"]}}})
-    assert any("只有 4 個" in issue and "至少缺 1 席" in issue
+    assert any("最多涵蓋 4 人" in issue and "至少缺 1 席" in issue
                for issue in report.proven_shortages)
     c1 = next(r for r in report.rows if r.code == "C1" and r.kind == "切片")
     assert c1.possible_sessions == 4
@@ -109,6 +109,105 @@ def test_previous_month_biopsy_opening_counts_only_when_already_assigned(
     assert seats.possible_sessions == expected
     assert any("切片席位容量不足" in issue for issue in report.proven_shortages) \
         is (prior_person is None)
+
+
+@pytest.mark.parametrize("prior_people", [["C5"], ["C4", "C5"]])
+def test_previous_month_saved_biopsy_outside_open_grid_counts_as_done(
+        prior_people):
+    start = date(2026, 9, 28)
+    members = [f"C{i}" for i in range(1, 6)]
+    earlier = date(2026, 9, 29)
+    current = [date(2026, 10, n) for n in (1, 2, 5, 6)]
+    saved = {earlier.isoformat(): {"上午": {BIOPSY: prior_people}}}
+    inp = DaySolveInput(
+        "2026-10", {d: {"上午": ["101"]} for d in current},
+        ["P1", "P2", "P3", "P4"],
+        clerk_batches=[ClerkBatch("B1", start, members)],
+        biopsy_open={"B1": {d.isoformat(): {"上午": True} for d in current}},
+        course_days={earlier.isoformat(), *(d.isoformat() for d in current)},
+        course_clinic_days={earlier.isoformat(), *(d.isoformat() for d in current)},
+        prior_sessions=saved)
+    available = {(d, "上午") for d in [earlier, *current]}
+    data = {
+        "pgy": {"roster": inp.pgy_roster, "stats": {}},
+        "family": {"roster": [], "stats": {}},
+        "external": {"roster": [], "stats": {}},
+        "batches": [{"id": "B1", "start": start.isoformat(),
+                     "end": (start + timedelta(days=13)).isoformat(),
+                     "members": members,
+                     "stats": person_course_stats(saved, include=set(members)),
+                     "slots": saved,
+                     "available_slots": {c: available for c in members}}],
+    }
+    report = diagnose_day(inp, explain_day_courses(inp, data, saved), data,
+                          adjacent_grid={earlier: {"上午": ["101"]}})
+    assert not any("切片席位容量不足" in issue
+                   for issue in report.proven_shortages)
+
+
+@pytest.mark.parametrize("lock_duplicate, shortage", [(False, False),
+                                                     (True, True)])
+def test_current_month_unlocked_duplicate_biopsy_can_be_reassigned(
+        lock_duplicate, shortage):
+    start = date(2026, 10, 5)
+    days = [start + timedelta(days=i) for i in range(5)]
+    members = [f"C{i}" for i in range(1, 6)]
+    assignments = ["C1", "C1", "C2", "C3", "C4"]
+    saved = {d.isoformat(): {"上午": {BIOPSY: [person]}}
+             for d, person in zip(days, assignments, strict=True)}
+    locked = ({d.isoformat(): saved[d.isoformat()] for d in days[:2]}
+              if lock_duplicate else {})
+    inp = DaySolveInput(
+        "2026-10", {d: {"上午": ["101"]} for d in days},
+        ["P1", "P2", "P3", "P4"],
+        clerk_batches=[ClerkBatch("B1", start, members)],
+        biopsy_open={"B1": {d.isoformat(): {"上午": True} for d in days}},
+        course_days={d.isoformat() for d in days},
+        course_clinic_days={d.isoformat() for d in days},
+        locked=locked)
+    available = {(d, "上午") for d in days}
+    data = {
+        "pgy": {"roster": inp.pgy_roster, "stats": {}},
+        "family": {"roster": [], "stats": {}},
+        "external": {"roster": [], "stats": {}},
+        "batches": [{"id": "B1", "start": start.isoformat(),
+                     "end": (start + timedelta(days=13)).isoformat(),
+                     "members": members,
+                     "stats": person_course_stats(saved, include=set(members)),
+                     "slots": saved,
+                     "available_slots": {c: available for c in members}}],
+    }
+    report = diagnose_day(inp, explain_day_courses(inp, data, saved), data,
+                          saved)
+    assert any("切片席位容量不足" in issue for issue in report.proven_shortages) \
+        is shortage
+
+
+def test_clerk_leave_shortage_is_personal_not_shared_room_shortage():
+    start = date(2026, 10, 5)
+    days = [start + timedelta(days=i) for i in range(14)
+            if (start + timedelta(days=i)).weekday() < 5]
+    grid = {d: {"上午": ["101"]} for d in days}
+    inp = DaySolveInput(
+        "2026-10", grid, ["P1", "P2", "P3", "P4"],
+        clerk_batches=[ClerkBatch("B1", start, ["C1"])],
+        course_days={d.isoformat() for d in days},
+        course_clinic_days={d.isoformat() for d in days},
+        session_leaves={"clerk": {"C1": {(d, "上午") for d in days[4:]}}})
+    available = {(d, "上午") for d in days[:4]}
+    data = {
+        "pgy": {"roster": inp.pgy_roster, "stats": {}},
+        "family": {"roster": [], "stats": {}},
+        "external": {"roster": [], "stats": {}},
+        "batches": [{"id": "B1", "start": start.isoformat(),
+                     "end": (start + timedelta(days=13)).isoformat(),
+                     "members": ["C1"], "stats": {}, "slots": {},
+                     "available_slots": {"C1": available}}],
+    }
+    report = diagnose_day(inp, explain_day_courses(inp, data, {}), data)
+    assert any("C1 跟診：最低 9" in issue for issue in report.proven_shortages)
+    assert not any("全梯跟診總席位不足" in issue
+                   for issue in report.proven_shortages)
 
 
 def test_retained_clerk_follow_after_leave_does_not_prove_aggregate_shortage():
@@ -293,24 +392,87 @@ def test_manual_cut_explains_locked_mandatory_duties_and_leave():
 
 def test_cross_month_unknown_room_counts_do_not_prove_clerk_follow_shortage():
     inp = DaySolveInput(
-        "2026-10", {date(2026, 10, 1): {"上午": ["101"], "下午": []}},
+        "2026-10", {date(2026, 10, 26): {"上午": ["101"], "下午": []}},
         ["P1", "P2"],
-        clerk_batches=[ClerkBatch("B1", date(2026, 9, 28), ["C1"])],
-        course_days={"2026-09-28", "2026-10-01"},
-        course_clinic_days={"2026-09-28", "2026-10-01"},
+        clerk_batches=[ClerkBatch("B1", date(2026, 10, 26), ["C1"])],
+        course_days={"2026-10-26", "2026-11-02"},
+        course_clinic_days={"2026-10-26", "2026-11-02"},
     )
-    available = {(date(2026, 9, 28), "上午"),
-                 (date(2026, 10, 1), "上午")}
+    available = {(date(2026, 10, 26), "上午"),
+                 (date(2026, 11, 2), "上午")}
     data = {"pgy": {"roster": inp.pgy_roster, "stats": {}},
             "family": {"roster": [], "stats": {}},
             "external": {"roster": [], "stats": {}},
-            "batches": [{"id": "B1", "start": "2026-09-28", "end": "2026-10-11",
+            "batches": [{"id": "B1", "start": "2026-10-26", "end": "2026-11-08",
                          "members": ["C1"], "stats": {}, "slots": {},
                          "available_slots": {"C1": available}}]}
     report = diagnose_day(inp, explain_day_courses(inp, data, {}), data)
     follow = next(r for r in report.rows if r.code == "C1" and r.kind == "跟診")
     assert follow.unquantified_sessions == 1
     assert not any("C1 跟診" in issue for issue in report.proven_shortages)
+
+
+def test_fixed_prior_follow_counts_even_if_room_was_removed_from_template():
+    start = date(2026, 9, 28)
+    prior_days = [start, start + timedelta(days=1)]
+    current_days = [date(2026, 10, n) for n in (1, 2, 5)]
+    prior = {d.isoformat(): {"上午": {"101": ["C1"]},
+                             "下午": {"102": ["C1"]}}
+             for d in prior_days}
+    grid = {d: {"上午": ["101"], "下午": ["101"]} for d in current_days}
+    inp = DaySolveInput(
+        "2026-10", grid, ["P1", "P2", "P3", "P4"],
+        clerk_batches=[ClerkBatch("B1", start, ["C1"])],
+        prior_sessions=prior,
+        course_days={d.isoformat() for d in [*prior_days, *current_days]},
+        course_clinic_days={d.isoformat() for d in [*prior_days, *current_days]})
+    available = {(d, s) for d in [*prior_days, *current_days]
+                 for s in ("上午", "下午")}
+    data = {
+        "pgy": {"roster": inp.pgy_roster, "stats": {}},
+        "family": {"roster": [], "stats": {}},
+        "external": {"roster": [], "stats": {}},
+        "batches": [{"id": "B1", "start": start.isoformat(),
+                     "end": (start + timedelta(days=13)).isoformat(),
+                     "members": ["C1"],
+                     "stats": person_course_stats(prior, include={"C1"}),
+                     "slots": prior,
+                     "available_slots": {"C1": available}}],
+    }
+    # The current template no longer contains September's 102 room.
+    adjacent = {d: {"上午": ["101"], "下午": []} for d in prior_days}
+    report = diagnose_day(inp, explain_day_courses(inp, data, prior), data,
+                          adjacent_grid=adjacent)
+    follow = next(r for r in report.rows if r.code == "C1" and r.kind == "跟診")
+    assert follow.actual == 4
+    assert follow.possible_sessions == 10
+    assert not any("C1 跟診" in issue or "全梯跟診總席位不足" in issue
+                   for issue in report.proven_shortages)
+
+
+def test_locked_follow_counts_after_current_room_is_removed():
+    d = date(2026, 10, 5)
+    saved = {d.isoformat(): {"上午": {"102": ["C1"]}}}
+    inp = DaySolveInput(
+        "2026-10", {d: {"上午": []}}, ["P1", "P2", "P3", "P4"],
+        clerk_batches=[ClerkBatch("B1", d, ["C1"])],
+        locked=saved, course_days={d.isoformat()},
+        course_clinic_days={d.isoformat()})
+    data = {
+        "pgy": {"roster": inp.pgy_roster, "stats": {}},
+        "family": {"roster": [], "stats": {}},
+        "external": {"roster": [], "stats": {}},
+        "batches": [{"id": "B1", "start": d.isoformat(),
+                     "end": (d + timedelta(days=13)).isoformat(),
+                     "members": ["C1"],
+                     "stats": person_course_stats(saved, include={"C1"}),
+                     "slots": saved,
+                     "available_slots": {"C1": {(d, "上午")}}}],
+    }
+    report = diagnose_day(inp, explain_day_courses(inp, data, saved), data,
+                          saved)
+    follow = next(r for r in report.rows if r.code == "C1" and r.kind == "跟診")
+    assert follow.possible_sessions == follow.actual == 1
 
 
 def test_losing_overlapping_clerk_batch_has_no_personal_follow_seat():
@@ -358,6 +520,35 @@ def test_zero_offset_comparison_uses_two_read_only_solves(tmp_path, monkeypatch)
     assert result["variants"]["本人設為 0"]["photo"] == 1
     assert storage.load_month("2026-10")["pgy_photo_offsets"] == {"P1": -1}
     assert storage.load_month("2026-10").get("day_slots") == {}
+
+
+def test_zero_offset_warning_filter_does_not_mix_prefix_codes(tmp_path,
+                                                              monkeypatch):
+    storage = RosterStorage(str(tmp_path / "roster"))
+    storage.save_config({"pgy_members": [{"id": "P1"}, {"id": "P10"},
+                                         {"id": "XP1"}, {"id": "1"}]})
+    storage.save_month("2026-10", {"pgy_photo_offsets": {"P1": -1, "1": -1}})
+    service = RosterService(storage)
+
+    def fake_solve(_inp, *, control=None):
+        return {}, [], ["PGY P10 照光減量目標未達",
+                        "PGY XP1 照光減量目標未達",
+                        "PGY 1 照光減量目標未達",
+                        "PGY P1 照光減量目標未達",
+                        "PGY 總工作量未完全平衡：P10 10 次",
+                        "學員門診最佳化尚未證明最優"]
+
+    monkeypatch.setattr(service_module, "month_solve_day", fake_solve)
+    warnings = service.compare_pgy_zero_offset(
+        "2026-10", "P1")["variants"]["目前設定"]["warnings"]
+    assert "PGY P1 照光減量目標未達" in warnings
+    assert "學員門診最佳化尚未證明最優" in warnings
+    assert all(other not in item for item in warnings
+               for other in ("PGY P10 ", "PGY XP1 ", "PGY 1 "))
+    numeric = service.compare_pgy_zero_offset(
+        "2026-10", "1")["variants"]["目前設定"]["warnings"]
+    assert "PGY 1 照光減量目標未達" in numeric
+    assert all("PGY P1 " not in item for item in numeric)
 
 
 def test_zero_offset_comparison_rejects_changed_source(tmp_path, monkeypatch):
