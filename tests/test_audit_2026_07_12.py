@@ -117,13 +117,14 @@ def test_u4_identity_write_has_stop_gate_f3():
 
 def test_u5_confirmed_branch_write_has_stop_gate():
     src = _main_src()
-    # 「確認後」分支的 _write_tmemo_text 前須有 check_stop;用其專屬 log 字串定位該寫回區塊
-    lines = src.splitlines()
-    idx = next((i for i, ln in enumerate(lines)
-                if "(確認後)劑量已更新" in ln), None)
-    assert idx is not None, "找不到『確認後』寫回區塊"
-    # 該 log 在 _write_tmemo_text 成功分支內;往上 8 行內須見 check_stop()
-    assert any("check_stop()" in lines[j] for j in range(max(0, idx - 8), idx)), \
+    # 確認後路徑與直接更新路徑共用寫入 helper；實際寫入前須有 F12 閘門。
+    confirmed = _func_body(src, "def _f23_pure_excimer_update")
+    confirmed = confirmed[confirmed.index("if _confirmed:"):]
+    assert "_write_excimer_memo_checked(" in confirmed, \
+        "確認後分支未走共用的寫入驗證路徑(U5)"
+    writer = _func_body(src, "def _write_excimer_memo_checked")
+    write_at = writer.index("wrote =")
+    assert "check_stop()" in writer[:write_at], \
         "確認後分支寫回前缺 check_stop 閘門(U5)"
 
 
