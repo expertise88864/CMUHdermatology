@@ -182,6 +182,39 @@ def test_old_worker_finishing_after_takeover_cannot_overwrite_or_clear_new_run(m
     assert app.refresh_button.state == "normal"
 
 
+def test_takeover_after_message_check_cannot_write_old_clinic_data(monkeypatch):
+    app, clock = _app(monkeypatch)
+    app._trigger_refresh(False, [_doctor("OLD")])
+    old_generation = app._refresh_lifecycle.generation
+    put_ui_message(app.ui_queue, UiClinicDataMessage(
+        "OLD", {"value": "old"}, is_live_final=True,
+        refresh_gen=old_generation))
+
+    original_accepts = app._refresh_lifecycle.accepts_message
+    took_over = []
+
+    def check_then_take_over(generation):
+        accepted = original_accepts(generation)
+        if generation == old_generation and accepted and not took_over:
+            clock[0] += 901
+            worker = threading.Thread(
+                target=lambda: app._trigger_refresh(True, [_doctor("NEW")]))
+            worker.start()
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+            took_over.append(True)
+        return accepted
+
+    monkeypatch.setattr(app._refresh_lifecycle, "accepts_message", check_then_take_over)
+    app.process_ui_queue()
+
+    assert took_over
+    assert app._refresh_lifecycle.generation == old_generation + 1
+    assert "OLD" not in app.all_doctors_data
+    assert "OLD" not in app._live_clinic_data_keys
+    assert app.refresh_button.state == "disabled"
+
+
 def test_old_progress_callback_cannot_update_new_generation_before_ui_poll(monkeypatch):
     app, clock = _app(monkeypatch)
     app._trigger_refresh(False, [_doctor("A")])

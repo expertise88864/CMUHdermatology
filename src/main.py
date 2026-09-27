@@ -16372,7 +16372,15 @@ class AutomationApp:
                                 _mgen, lifecycle.generation, doctor_name)
                             continue
                         if doctor_name and appointment_data is not None:
-                            with self._doctor_data_lock:
+                            # A background request may take over after the fast
+                            # generation check above. Hold the lifecycle lock
+                            # through the clinic and alert-state writes.
+                            guard = (lifecycle.message_guard(_mgen) if lifecycle is not None
+                                     else contextlib.nullcontext(True))
+                            with guard as accepted, self._doctor_data_lock:
+                                if not accepted:
+                                    logging.info("[refresh] stale clinic data rejected during UI write: gen=%s", _mgen)
+                                    continue
                                 if (
                                     isinstance(appointment_data, dict)
                                     and "error" in appointment_data

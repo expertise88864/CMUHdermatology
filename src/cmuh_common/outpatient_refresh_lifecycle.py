@@ -8,6 +8,7 @@ only then does the UI acknowledge completion and start the next queued request.
 from __future__ import annotations
 
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import islice
 import threading
@@ -205,6 +206,16 @@ class OutpatientRefreshLifecycle:
     def accepts_message(self, generation: int | None) -> bool:
         with self._lock:
             return not self._stopped and (generation is None or generation == self._generation)
+
+    @contextmanager
+    def message_guard(self, generation: int | None):
+        """Keep generation validation and a short UI data write atomic.
+
+        Keep the guarded work brief and do not call back into this lifecycle.
+        ``None`` retains the existing non-refresh message path.
+        """
+        with self._lock:
+            yield not self._stopped and (generation is None or generation == self._generation)
 
     def mark_finished(self, generation: int, *, rejected: bool = False) -> bool:
         """Worker thread records completion without touching Tk or dispatching work."""
