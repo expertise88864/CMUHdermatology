@@ -405,11 +405,12 @@ def test_main_and_scheduler_background_executors_are_bounded():
 
 def test_refresh_batches_use_local_executor_instead_of_bg_queue():
     for rel_path in ("src/main.py",):
-        src = _function_source(ROOT / rel_path, "_trigger_refresh")
+        src = _function_source(ROOT / rel_path, "_start_claimed_refresh")
 
         assert 'thread_name_prefix="RefreshBatch"' in src
         assert '"_appointment_fetcher", check_appointment_count' in src
-        assert "refresh_pool.submit(" in src
+        assert "lifecycle.submit_if_current(" in src
+        assert "refresh_pool.submit," in src
         assert "appointment_fetcher, self.ui_queue, worker_config" in src
         assert "self.bg_executor.submit(check_appointment_count" not in src
 
@@ -452,14 +453,16 @@ def test_duty_queries_report_success_for_daily_cache_decision():
 
 def test_refresh_submit_rejection_restores_ui_state():
     for rel_path in ("src/main.py",):
-        src = _function_source(ROOT / rel_path, "_trigger_refresh")
+        src = _function_source(ROOT / rel_path, "_start_claimed_refresh")
+        settle = _function_source(ROOT / rel_path, "_drain_refresh_lifecycle_ui")
 
         assert "RejectedExecutionError" in src
-        assert "refresh_future = self.bg_executor.submit(run_parallel_checks)" in src
-        assert "refresh_future.add_done_callback(_handle_refresh_submit_rejected)" in src
-        assert "self._active_refresh_signature = None" in src
-        assert 'self.status_text.set("狀態: 背景佇列忙碌，刷新稍後重試")' in src
-        assert 'self.refresh_button.config(state="normal")' in src
+        assert "refresh_future = lifecycle.submit_if_current(" in src
+        assert "generation, self.bg_executor.submit, run_parallel_checks" in src
+        assert "refresh_future.add_done_callback(on_submit_done)" in src
+        assert "lifecycle.mark_finished(generation, rejected=True)" in src
+        assert 'self.status_text.set("狀態: 背景佇列忙碌，刷新稍後重試")' in settle
+        assert 'self.refresh_button.config(state="normal")' in settle
 
 
 def test_clinic_worker_submit_rejection_clears_running_flag():
@@ -549,9 +552,10 @@ def test_refresh_entrypoint_reroutes_to_tk_thread():
     for rel_path in ("src/main.py",):
         src = _function_source(ROOT / rel_path, "_trigger_refresh")
 
-        assert "threading.current_thread() is not threading.main_thread()" in src
-        assert "queued_doctors = list(specific_doctors) if specific_doctors is not None else None" in src
-        assert "self.root.after(0, lambda: self._trigger_refresh(" in src
+        assert "self._refresh_lifecycle.request(is_manual, specific_doctors)" in src
+        assert "threading.current_thread() is threading.main_thread()" in src
+        assert "self._start_claimed_refresh()" in src
+        assert "self.root.after(" not in src
 
 
 def test_clinic_polling_snapshots_tk_modes_before_background_work():
@@ -737,7 +741,7 @@ def test_startup_refresh_avoids_unnecessary_executor_hop():
 
 def test_chained_startup_refresh_avoids_unnecessary_executor_hop():
     for rel_path in ("src/main.py",):
-        src = _function_source(ROOT / rel_path, "_trigger_refresh")
+        src = _function_source(ROOT / rel_path, "_drain_refresh_lifecycle_ui")
 
         assert "self._trigger_refresh(False)" in src
         assert "self.bg_executor.submit(self._trigger_refresh, False)" not in src
@@ -1009,15 +1013,15 @@ def test_uvb_messagebox_marks_awaiting_user_for_hotkey_watchdog():
 
 
 def test_refresh_single_flight_flag_set_on_main_thread():
-    """單飛旗標必須在 main thread 同步設(submit 前、同一鎖區塊內)，不能只在 worker 內
-    非同步才設，否則 submit↔worker 啟動空窗會讓下一個 trigger 重複 submit 同一刷新。"""
-    source_path = ROOT / "src" / "main.py"
-    full = source_path.read_text(encoding="utf-8")
-    idx_sig = full.find("self._active_refresh_signature = req_signature")
-    assert idx_sig != -1
-    # 緊接著(同鎖區塊內)就同步設旗標
-    snippet = full[idx_sig:idx_sig + 500]
-    assert "self._refresh_worker_running = True" in snippet
+    """A second request before executor start must not submit duplicate work."""
+    from cmuh_common.outpatient_refresh_lifecycle import OutpatientRefreshLifecycle
+
+    lifecycle = OutpatientRefreshLifecycle(max_age_seconds=900)
+    first = lifecycle.request(False)
+    assert first.kind == "started"
+    assert lifecycle.request(False).kind == "duplicate"
+    assert lifecycle.take_start() == first.run
+    assert lifecycle.take_start() is None
 
 
 def test_reg64_calendar_cache_guarded_by_lock():

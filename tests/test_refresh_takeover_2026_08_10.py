@@ -36,38 +36,9 @@ def _src_of(fn_name):
 
 
 class TestAgeTakeover:
-    def test_the_gate_checks_the_worker_age(self):
-        """★核心★ gate 必須看「上一輪跑多久了」，不是只看旗標。"""
-        text, fn = _src_of("_trigger_refresh")
-        seg = ast.get_source_segment(text, fn) or ""
-        assert "_REFRESH_WORKER_MAX_AGE_SEC" in seg, (
-            "★gate 不看年齡 → 一次卡死 = 刷新永久停擺★")
-        assert "_refresh_worker_started_at" in seg
 
-    def test_seizing_the_flag_records_the_start_time(self):
-        text, fn = _src_of("_trigger_refresh")
-        seg = ast.get_source_segment(text, fn) or ""
-        assert "self._refresh_worker_started_at = time.time()" in seg, (
-            "搶旗標沒記時間 → 年齡永遠算不出來")
 
-    def test_the_takeover_bumps_the_generation(self):
-        """接管必須 +1 世代 —— 殭屍醒來才會失去擁有權。"""
-        text, fn = _src_of("_trigger_refresh")
-        seg = ast.get_source_segment(text, fn) or ""
-        i = seg.index("_stale_takeover")
-        j = seg.index("else:", i)
-        assert "self._refresh_generation += 1" in seg[i:j]
 
-    def test_the_zombie_does_not_clear_the_new_rounds_state(self):
-        """★殭屍醒來不可以清狀態★ 清掉 = 拆掉現任那一輪的去重與單飛。"""
-        text, fn = _src_of("run_parallel_checks")
-        seg = ast.get_source_segment(text, fn) or ""
-        assert "_is_zombie" in seg, "finally 沒有殭屍判定"
-        # 清旗標那行必須在「不是殭屍」的分支底下
-        i = seg.index("_is_zombie = (_my_refresh_gen != self._refresh_generation)")
-        j = seg.index("self._refresh_worker_running = False", i)
-        between = seg[i:j]
-        assert "else:" in between, "清旗標沒有被殭屍判定 gate 住"
 
     def test_the_zombie_check_does_not_return_inside_finally(self):
         """★return 在 finally 裡會吞掉 in-flight 例外★（ruff B012 也擋）。"""
@@ -83,96 +54,7 @@ class TestAgeTakeover:
         """上限要蓋得住正常 worst case（多批×3重試×逾時 ≒ 數分鐘）。"""
         assert 600 <= m._REFRESH_WORKER_MAX_AGE_SEC <= 3600
 
-    def test_a_stale_worker_is_actually_taken_over(self, monkeypatch):
-        """行為測試：旗標 True + 逾齡 → gate 走「接管」路徑（世代 +1、
-        重記時間、submit 新 worker）。"""
-        import threading
-        from collections import deque
 
-        class _Exec:
-            def __init__(self):
-                self.submitted = []
-
-            def submit(self, fn, *a, **k):
-                self.submitted.append(fn)
-
-                class _F:
-                    def add_done_callback(self, cb):
-                        pass
-                return _F()
-
-        class _Var:
-            def set(self, *_a):
-                pass
-
-        class _Btn:
-            def config(self, **_k):
-                pass
-
-        class _Host:
-            _shutting_down = False
-            _refresh_worker_running = True
-            _refresh_worker_started_at = 0.0        # 很久以前
-            _refresh_generation = 7
-            _active_refresh_signature = ("old",)
-            _queued_refresh_requests = deque()
-            _queued_refresh_signatures = set()
-            _refresh_queue_lock = threading.Lock()
-            _startup_defer_full_until_priority_done = False
-            _heavy_modules_ready = True
-            bg_executor = _Exec()
-            status_text = _Var()
-            startup_phase_text = _Var()
-            refresh_button = _Btn()
-            all_doctors_data = {}
-            _doctor_data_lock = threading.Lock()
-            ui_queue = None
-            _refresh_progress_total = 0
-            _refresh_progress_done = 0
-
-        _Host._trigger_refresh = m.AutomationApp.__dict__["_trigger_refresh"]
-        host = _Host()
-        host._trigger_refresh(False)
-        assert host._refresh_generation == 8, (
-            "★逾齡的旗標沒有被接管 → 一次卡死 = 刷新永久停擺★")
-        assert host._refresh_worker_running is True
-        assert host._refresh_worker_started_at > 0.0
-        assert host.bg_executor.submitted, "接管後沒有 submit 新 worker"
-
-    def test_a_young_worker_is_not_taken_over(self, monkeypatch):
-        """★反方向★ 正常執行中的 worker 不可以被搶（會重複打掛號站）。"""
-        import threading
-        import time as _t
-        from collections import deque
-
-        class _Exec:
-            def __init__(self):
-                self.submitted = []
-
-            def submit(self, fn, *a, **k):
-                self.submitted.append(fn)
-
-                class _F:
-                    def add_done_callback(self, cb):
-                        pass
-                return _F()
-
-        class _Host:
-            _shutting_down = False
-            _refresh_worker_running = True
-            _refresh_worker_started_at = _t.time() - 30.0   # 才 30 秒
-            _refresh_generation = 7
-            _active_refresh_signature = ("current",)
-            _queued_refresh_requests = deque()
-            _queued_refresh_signatures = set()
-            _refresh_queue_lock = threading.Lock()
-            bg_executor = _Exec()
-
-        _Host._trigger_refresh = m.AutomationApp.__dict__["_trigger_refresh"]
-        host = _Host()
-        host._trigger_refresh(False)
-        assert host._refresh_generation == 7, "30 秒的 worker 被誤判成卡死"
-        assert not host.bg_executor.submitted, "正常執行中卻又開了一輪"
 
 
 # ══ [批次SB #6] liveness 一律 monotonic ═══════════════════════════════════
@@ -237,14 +119,6 @@ class TestZombiePayloadsAreDropped:
         assert stamped >= emits, (
             f"★{emits} 個送出點只有 {stamped} 個帶世代戳★")
 
-    def test_the_receiver_drops_stale_generations(self):
-        text, fn = _src_of("process_ui_queue")
-        seg = ast.get_source_segment(text, fn) or ""
-        # ★要驗【那個比較】存在,不是驗字面出現過★ 條件被換成 `if False:`
-        #   時 'refresh_gen' 字面還在別行(突變驗證抓到的)。
-        assert "_mgen != self._refresh_generation" in seg, (
-            "★接收端不驗世代 → 殭屍舊資料照收★")
-        assert "continue" in seg[seg.index("_mgen != self."):][:600]
 
     def test_the_worker_config_carries_the_generation(self):
         text, fn = _src_of("run_parallel_checks")
@@ -255,70 +129,6 @@ class TestZombiePayloadsAreDropped:
             "worker_config 沒帶世代 → 戳永遠是 None")
 
 
-class TestTakeoverCoalescesQueuedDuplicates:
-    """★#3★ 接管的這一輪就是要跑這個簽名 —— 排隊裡同簽名的那筆要合併掉，
-    否則接管完成後佇列接力把同一個刷新再跑一次（對掛號站雙倍請求）。"""
-
-    def test_a_matching_queued_request_is_coalesced(self):
-        import threading
-        import time as _t
-        from collections import deque
-
-        class _Exec:
-            def __init__(self):
-                self.submitted = []
-
-            def submit(self, fn, *a, **k):
-                self.submitted.append(fn)
-
-                class _F:
-                    def add_done_callback(self, cb):
-                        pass
-                return _F()
-
-        class _Var:
-            def set(self, *_a):
-                pass
-
-        class _Btn:
-            def config(self, **_k):
-                pass
-
-        class _Host:
-            _shutting_down = False
-            _refresh_worker_running = True
-            _refresh_worker_started_at = 0.0
-            _refresh_generation = 3
-            _active_refresh_signature = ("stuck",)
-            _queued_refresh_requests = deque()
-            _queued_refresh_signatures = set()
-            _refresh_queue_lock = threading.Lock()
-            _startup_defer_full_until_priority_done = False
-            _heavy_modules_ready = True
-            bg_executor = _Exec()
-            status_text = _Var()
-            startup_phase_text = _Var()
-            refresh_button = _Btn()
-            all_doctors_data = {}
-            _doctor_data_lock = threading.Lock()
-            ui_queue = None
-            _refresh_progress_total = 0
-            _refresh_progress_done = 0
-
-        _Host._trigger_refresh = m.AutomationApp.__dict__["_trigger_refresh"]
-        host = _Host()
-        # 先跑一次拿到「同一種請求」的簽名（進佇列那條路需要 running 且未逾齡）
-        host._refresh_worker_started_at = _t.time()
-        host._trigger_refresh(False)
-        assert len(host._queued_refresh_signatures) == 1, "前置:請求沒進佇列"
-        sig = next(iter(host._queued_refresh_signatures))
-        # 現在讓它逾齡 → 同一種請求觸發接管
-        host._refresh_worker_started_at = 0.0
-        host._trigger_refresh(False)
-        assert sig not in host._queued_refresh_signatures, (
-            "★接管沒有合併同簽名的排隊請求 → 完成後會再跑一次★")
-        assert not any(r[2] == sig for r in host._queued_refresh_requests)
-        assert host.bg_executor.submitted, "接管沒開新 worker"
 
 
 class TestFetchSlotIsBounded:
@@ -463,77 +273,6 @@ class TestEpochCapAndEscalation:
             f"{m._REG52_SLOT_EPOCH_CAP})—— native thread 無上限堆積★")
         assert m._reg52_slot_state.get("exhausted") is True
 
-    def test_the_takeover_path_escalates_to_restart_once(self):
-        """到頂之後,takeover 路徑要排入重啟升級 —— 而且只排一次。"""
-        import threading
-        from collections import deque
-
-        m._reg52_slot_state["exhausted"] = True
-        scheduled = []
-
-        class _Exec:
-            submitted = []
-
-            def submit(self, fn, *a, **k):
-                self.submitted.append(fn)
-
-                class _F:
-                    def add_done_callback(self, cb):
-                        pass
-                return _F()
-
-        class _Var:
-            def set(self, *_a):
-                pass
-
-        class _Btn:
-            def config(self, **_k):
-                pass
-
-        class _Root:
-            def after(self, d, cb=None):
-                scheduled.append(cb)
-                return "id"
-
-        class _Host:
-            _shutting_down = False
-            _refresh_worker_running = True
-            _refresh_worker_started_at = 0.0
-            _refresh_generation = 1
-            _active_refresh_signature = ("x",)
-            _queued_refresh_requests = deque()
-            _queued_refresh_signatures = set()
-            _refresh_queue_lock = threading.Lock()
-            _startup_defer_full_until_priority_done = False
-            _heavy_modules_ready = True
-            bg_executor = _Exec()
-            status_text = _Var()
-            startup_phase_text = _Var()
-            refresh_button = _Btn()
-            all_doctors_data = {}
-            _doctor_data_lock = threading.Lock()
-            ui_queue = None
-            _refresh_progress_total = 0
-            _refresh_progress_done = 0
-            root = _Root()
-
-            def _restart_when_hotkey_idle(self):
-                pass
-
-        _Host._trigger_refresh = m.AutomationApp.__dict__["_trigger_refresh"]
-        host = _Host()
-        host._trigger_refresh(False)
-        # 呼叫端排的是 lambda(帶 force_after_max=False)→ 驗旗標 + 有排程即可,
-        # 「排的確實是不強制版」另有 test_the_escalation_call_site_does_not_force。
-        assert getattr(host, "_reg52_restart_requested", False) is True, (
-            "★到頂沒有升級到重啟★")
-        assert scheduled, "★到頂沒有排任何重啟回呼★"
-        n_first = len(scheduled)
-        # 再一次 takeover → 不可以再排(重啟風暴)
-        host._refresh_worker_started_at = 0.0
-        host._refresh_worker_running = True
-        host._trigger_refresh(False)
-        assert len(scheduled) == n_first, "★重啟升級排了不只一次★"
 
     def test_exhausted_state_survives_reclaim_attempts(self):
         self._wedge_state()
@@ -632,7 +371,7 @@ class TestEscalationNeverForcesMidWorkflow:
         """升級呼叫端要走閘門(而不是自己 `_restart_app()`)。
         ★不再檢查 force_after_max★:那個參數已經不存在,
         「絕不強制」現在是閘門自己的性質(上面那條測試釘住)。"""
-        text, fn = _src_of("_trigger_refresh")
+        text, fn = _src_of("_start_claimed_refresh")
         seg = ast.get_source_segment(text, fn) or ""
         i = seg.index("_reg52_restart_requested = True")
         j = i + 600

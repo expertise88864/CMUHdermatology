@@ -266,6 +266,7 @@ from cmuh_common.action_ledger import (
 )
 from cmuh_common.logging_setup import attach_queue_handler
 from cmuh_common.bounded_executor import BoundedThreadPoolExecutor, RejectedExecutionError
+from cmuh_common.outpatient_refresh_lifecycle import OutpatientRefreshLifecycle, RefreshRun
 from cmuh_common.http_client import is_internal as _is_internal
 from cmuh_common.ui_messages import (
     UiStatusMessage, UiRefreshTickMessage, UiClinicDataMessage, UiMasterScheduleMessage,
@@ -1070,10 +1071,8 @@ _STATUS_DRIVER_PAGELOAD_TIMEOUT = 30
 _CLOCK_WORKER_MAX_AGE_SEC = 180
 
 # ★[2026-08-10 批次SB #3] refresh worker 的年齡上限★
-#   `_refresh_worker_running` 只在 worker 的 finally 清 —— worker 若卡在
-#   requests timeout 管不到的地方(原生 DNS 解析、防毒掛鉤),旗標永遠是
-#   True → 之後所有刷新永久被去重跳過:掛號數/門檻掃描/止掛提醒全部
-#   停在舊資料,而 Tk 與 heartbeat 都活著,watchdog 不會自癒。
+#   worker 若卡在 requests timeout 管不到的地方(原生 DNS 解析、防毒掛鉤),
+#   生命週期擁有權可能一直不釋放；逾齡時換代，舊結果不得覆蓋新資料。
 #   與 `_CLOCK_WORKER_MAX_AGE_SEC` 同一套解法(那裡已經修過同形狀的坑)。
 #   上限取激進刷新輪次worst case(多批×3次重試×逾時)的 3 倍以上。
 _REFRESH_WORKER_MAX_AGE_SEC = 900
@@ -8027,7 +8026,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
         logging.warning(
             f"[CACHE_FALLBACK] {doctor_name} ({doc_no}) 使用已載入門診人數快取，原因: {reason}; slots={cached_count}"
         )
-        put_ui_message(ui_queue, UiRefreshTickMessage(doctor_name=doctor_name))
+        put_ui_message(ui_queue, UiRefreshTickMessage(doctor_name=doctor_name, refresh_gen=_rgen))
         put_ui_message(ui_queue, UiClinicDataMessage(doctor_name=doc_no, data=deepcopy(cached_appointments), refresh_gen=_rgen))
         return True
 
@@ -8627,7 +8626,7 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
             if source_timing:
                 logging.info(f"[SOURCE_TIMING] {doctor_name}: {source_timing}")
             logging.info(f"Check for {doctor_name} ({doc_no}) successful. Found {data_count} slots.")
-            put_ui_message(ui_queue, UiRefreshTickMessage(doctor_name=doctor_name))
+            put_ui_message(ui_queue, UiRefreshTickMessage(doctor_name=doctor_name, refresh_gen=_rgen))
             # [codex] 這裡才是「完整成功的即時資料」(已併休診覆蓋)→ 唯一可以解鎖遠期止掛
             # 提醒掃描的來源。其他 emit(磁碟快取 fallback / 漸進式部分結果 / 快照重播 /
             # 錯誤)一律維持 is_live_final=False,不得讓掃描拿它們去寄信。
@@ -8670,7 +8669,8 @@ def check_appointment_count(ui_queue: "Queue[UiMessage]", doctor_config: DoctorC
     if _emit_cached_appointments(f"all attempts failed ({error_type})"):
         return
     logging.error(f"All 3 attempts to check for {doctor_name} failed.")
-    put_ui_message(ui_queue, UiRefreshTickMessage(doctor_name=doctor_name))
+    put_ui_message(ui_queue, UiRefreshTickMessage(
+        doctor_name=doctor_name, refresh_gen=doctor_config.get("_refresh_gen")))
     put_ui_message(
         ui_queue,
         UiClinicDataMessage(doctor_name=doc_no, data={"error": f"查詢失敗 ({error_type})"},
@@ -9757,16 +9757,8 @@ class AutomationApp:
         self._save_cache_pending = {}
         self._save_cache_latest = {}
         self._avg_history_cache = {}  # [優化] 快取歷史平均，避免每次重算
-        self._refresh_worker_running = False
-        self._refresh_worker_started_at = 0.0
-        # [2026-07-26 外審] refresh 世代:worker 完成後的 UI 收尾(root.after 排到
-        # main thread 才跑)必須確認「我還是最新的那一輪」,否則舊 worker 的 callback
-        # 會在新 worker 執行中把 UI 顯示成『閒置』並重新啟用按鈕。
-        self._refresh_generation = 0
-        self._queued_refresh_requests = deque()
-        self._queued_refresh_signatures = set()
-        self._active_refresh_signature = None
-        self._refresh_queue_lock = threading.Lock()
+        self._refresh_lifecycle = OutpatientRefreshLifecycle(
+            max_age_seconds=_REFRESH_WORKER_MAX_AGE_SEC)
         self._refresh_progress_total = 0
         self._refresh_progress_done = 0
         self._heavy_modules_ready = False
@@ -9827,10 +9819,10 @@ class AutomationApp:
         # [2026-06-16 韌性] 鎖使用守則(避免 ABBA 死鎖):這些 app 狀態鎖各自保護一份
         # 資料,「原則上一次只持有一把、且只圈住純記憶體操作、不在持鎖時做網路/磁碟
         # /子行程 I/O」。若真的需要巢狀,固定以下取得順序(由外而內):
-        #   _subsystem_lock → _refresh_queue_lock → _tracker_lock → _doctor_data_lock
+        #   _subsystem_lock → _tracker_lock → _doctor_data_lock
         #   → _clinic_dynamic_state_lock → _history_lock → _alert_state_lock
         # 跨物件鎖(模組級)如 status_driver_pool 的 init_lock→lock 為獨立子系統,不與
-        # 上列交叉持有。新增鎖請接在此清單末端並沿用「先外後內」原則。
+        # 上列交叉持有。門診刷新生命週期的私有鎖只圈住內部狀態，不與其他鎖巢狀。
         self._tracker_lock = threading.Lock()
         self._history_lock = threading.Lock()
         self._doctor_data_lock = threading.Lock()
@@ -9854,6 +9846,7 @@ class AutomationApp:
         self._background_tasks_started = False
         # 啟動時優先批次完成後再跑全體刷新，避免與固定延遲重疊造成「Refresh already running; queued」
         self._startup_defer_full_until_priority_done = False
+        self._startup_priority_phase_b_pending = False
 
         self.threshold_settings = self.load_threshold_settings()
         # [2026-06-29] 載入可選的 UVB 劑量規則覆寫(settings/uvb_rules.json):沒檔→寫出預設模板供編輯,
@@ -10027,6 +10020,9 @@ class AutomationApp:
             return
         self._exit_cleanup_done = True
         self._shutting_down = True
+        lifecycle = getattr(self, "_refresh_lifecycle", None)
+        if lifecycle is not None:
+            lifecycle.stop()
         logging.info("Shutdown signal received.")
         # 門診動態小工具:關閉前存好設定並銷毀浮動視窗(fail-open)
         try:
@@ -11192,7 +11188,11 @@ class AutomationApp:
         pending = getattr(self, '_pending_refresh_tick_ui', None)
         if not pending:
             return
-        done, total, doc_name = pending
+        self._pending_refresh_tick_ui = None
+        done, total, doc_name, generation = pending
+        lifecycle = getattr(self, '_refresh_lifecycle', None)
+        if lifecycle is not None and not lifecycle.accepts_message(generation):
+            return
         if total > 0:
             self.status_text.set(f"狀態: 整理人數 {done}/{total} ({doc_name})")
 
@@ -13983,162 +13983,90 @@ class AutomationApp:
             self.root.after(0, lambda: self.shorten_btn.config(state="normal"))
         
     def _trigger_refresh(self, is_manual=False, specific_doctors=None):
+        """Request a refresh; only the lifecycle owns its queue and generation."""
+        if getattr(self, "_shutting_down", False):
+            return
+        decision = self._refresh_lifecycle.request(is_manual, specific_doctors)
+        if decision.kind == "duplicate":
+            logging.info("Duplicate refresh request skipped")
+        elif decision.kind == "merged":
+            logging.info("Merged partial refresh request. queue_size=%d", decision.queue_size)
+        elif decision.kind == "queued":
+            logging.info("Refresh already running; queued request. queue_size=%d", decision.queue_size)
+        elif decision.kind == "too_many_doctors":
+            logging.error("Refresh partial request exceeds %d doctors", self._refresh_lifecycle.MAX_PARTIAL_DOCTORS)
+            put_ui_message(self.ui_queue, UiStatusMessage("局部刷新醫師數超過安全上限，請檢查設定"))
+        # Background callers never use root.after or any other Tk method. The
+        # existing UI queue poll takes the claimed start on its next pass.
+        if decision.kind == "started" and threading.current_thread() is threading.main_thread():
+            self._start_claimed_refresh()
+
+    def _start_claimed_refresh(self):
+        """Tk thread submits a run already claimed by the lifecycle."""
         if threading.current_thread() is not threading.main_thread():
-            if getattr(self, "_shutting_down", False):
-                return
-            queued_doctors = list(specific_doctors) if specific_doctors is not None else None
-            self.root.after(0, lambda: self._trigger_refresh(is_manual=is_manual, specific_doctors=queued_doctors))
             return
-
-        def _build_refresh_signature(manual, doctors):
-            if doctors is None:
-                return ("all", bool(manual), None)
-            names = []
-            for d in doctors:
-                if isinstance(d, dict):
-                    names.append(str(d.get("name", "")))
-                else:
-                    names.append(str(d))
-            return ("partial", bool(manual), tuple(sorted(n for n in names if n)))
-
-        status_msg = "狀態: 手動整理中..." if is_manual else "狀態: 自動更新中..."
-        logging.info(f"--- Triggering refresh (manual={is_manual}) ---")
-        req_signature = _build_refresh_signature(is_manual, specific_doctors)
-
-        # [2026-07-26 外審 R4] 檢查、入列、搶旗標必須在【同一個臨界區】內。
-        # worker 現在是在鎖內清旗標並抽乾佇列的,所以「鎖外檢查」有真實空窗:
-        # 呼叫端讀到 True → 還沒拿到鎖 → worker 清完旗標並把佇列抽乾 →
-        # 呼叫端才拿到鎖並把請求 append 進去 → 那筆請求【永遠不會有人接手】,
-        # 刷新就這樣靜默消失。
-        _queued_size = None
-        _my_refresh_gen = 0      # 只有搶到旗標的那條路徑會用到(見下方 return)
-        with self._refresh_queue_lock:
-            _stale_takeover = (
-                self._refresh_worker_running
-                and (time.time() - self._refresh_worker_started_at)
-                > _REFRESH_WORKER_MAX_AGE_SEC)
-            if _stale_takeover:
-                # ★[外審 SB 第4輪] 容量換代到頂 → 升級到重啟★
-                #   重啟是唯一能終結 native-wedged thread 的手段。走既有的
-                #   `_restart_when_hotkey_idle`(熱鍵忙碌時延後,與自動更新
-                #   同一條路);每次執行只升級一次,重啟後從乾淨狀態重來。
-                if (_reg52_slot_state.get("exhausted")
-                        and not getattr(self, "_reg52_restart_requested", False)):
-                    self._reg52_restart_requested = True
-                    logging.critical(
-                        "[refresh] reg52 容量耗盡且換代到頂 → 排入閒置時重啟"
-                        "(native-wedged thread 只有重啟能終結)")
-                    try:
-                        # ★絕不腰斬進行中的 HIS 寫入★(閘門本身已保證,見其 docstring)
-                        self.root.after(0, self._restart_when_hotkey_idle)
-                    except Exception:
-                        logging.exception("[refresh] 重啟升級排程失敗")
-                # ★[2026-08-10 批次SB #3] 上一輪 worker 疑似卡死 → 接管★
-                #   不接管的話,一次卡死 = 掛號/止掛提醒永久停在舊資料,
-                #   而程式看起來活得好好的(Tk 與 heartbeat 都在動)。
-                #   generation +1 讓殭屍 worker 之後醒來時失去擁有權:
-                #   它的 finally 與完成 callback 都驗 gen,不會動到新一輪的狀態。
-                logging.error(
-                    "[refresh] 上一輪刷新 worker 已卡住 >%d 秒 → 接管並開新一輪"
-                    "(殭屍 worker 醒來後會因 generation 不符而放棄清理)",
-                    _REFRESH_WORKER_MAX_AGE_SEC)
-            if not self._refresh_worker_running or _stale_takeover:
-                if _stale_takeover and req_signature in self._queued_refresh_signatures:
-                    # ★[外審 SB #2輪 #3] 接管的這一輪就是要跑這個簽名 ——
-                    #   排隊裡同簽名的那筆要合併掉,否則接管完成後佇列接力
-                    #   會把同一個刷新再跑一次(對掛號站送雙倍請求)。
-                    self._queued_refresh_signatures.discard(req_signature)
-                    self._queued_refresh_requests = deque(
-                        r for r in self._queued_refresh_requests
-                        if r[2] != req_signature)
-                self._active_refresh_signature = req_signature
-                # [stability r4] 同步搶下單飛旗標(原本只在 worker 內才設)。否則 submit 後、
-                # worker 設旗標前的空窗內,下一個 _trigger_refresh 讀到 False→跳過去重→
-                # 重複 submit 同一刷新,對掛號站送雙倍請求、惡化 backoff。
-                self._refresh_worker_running = True
-                self._refresh_worker_started_at = time.time()
-                self._refresh_generation += 1
-                _my_refresh_gen = self._refresh_generation
-            else:
-                if req_signature == self._active_refresh_signature or req_signature in self._queued_refresh_signatures:
-                    logging.info(f"Duplicate refresh request skipped. signature={req_signature}")
-                    return
-                # 合併同來源 partial 批次：避免佇列堆疊大量小刷新
-                if specific_doctors is not None:
-                    merged = False
-                    incoming_names = set()
-                    for d in specific_doctors:
-                        incoming_names.add(str(d.get("name", "")) if isinstance(d, dict) else str(d))
-                    for idx, (qm, qdocs, qsig) in enumerate(self._queued_refresh_requests):
-                        if qdocs is None or qm != is_manual:
-                            continue
-                        qnames = set()
-                        for d in qdocs:
-                            qnames.add(str(d.get("name", "")) if isinstance(d, dict) else str(d))
-                        union = qnames | incoming_names
-                        if union != qnames:
-                            by_name = {}
-                            for d in list(qdocs) + list(specific_doctors):
-                                nm = str(d.get("name", "")) if isinstance(d, dict) else str(d)
-                                if nm and nm not in by_name:
-                                    by_name[nm] = d
-                            merged_docs = list(by_name.values())
-                            new_sig = _build_refresh_signature(is_manual, merged_docs)
-                            self._queued_refresh_signatures.discard(qsig)
-                            self._queued_refresh_requests[idx] = (is_manual, merged_docs, new_sig)
-                            self._queued_refresh_signatures.add(new_sig)
-                            merged = True
-                            logging.info(f"Merged partial refresh request. size={len(merged_docs)}")
-                            break
-                    if merged:
-                        return
-                self._queued_refresh_requests.append((is_manual, specific_doctors, req_signature))
-                self._queued_refresh_signatures.add(req_signature)
-                _queued_size = len(self._queued_refresh_requests)
-        if _queued_size is not None:
-            logging.info(
-                f"Refresh already running; queued request. queue_size={_queued_size}")
+        lifecycle = getattr(self, "_refresh_lifecycle", None)
+        if lifecycle is None or getattr(self, "_shutting_down", False):
             return
+        run: RefreshRun | None = lifecycle.take_start()
+        if run is None:
+            return
+        is_manual = run.request.manual
+        specific_doctors = run.request.doctors
+        generation = run.generation
+        # A full run already queued after the priority batches fulfils the
+        # startup handoff; do not schedule another full run on a later partial.
+        if specific_doctors is None:
+            self._startup_defer_full_until_priority_done = False
+        if run.took_over:
+            self._cancel_pending_refresh_tick_ui()
+            logging.error(
+                "[refresh] previous worker exceeded %d seconds; generation %d takes over",
+                _REFRESH_WORKER_MAX_AGE_SEC, generation)
+            if (_reg52_slot_state.get("exhausted")
+                    and not getattr(self, "_reg52_restart_requested", False)):
+                self._reg52_restart_requested = True
+                logging.critical("[refresh] reg52 capacity exhausted; schedule idle restart")
+                try:
+                    self.root.after(0, self._restart_when_hotkey_idle)
+                except Exception:
+                    logging.exception("[refresh] restart escalation scheduling failed")
 
         if specific_doctors is None:
-            now_ts = time.time()
             snap = getattr(self, "_last_full_refresh_snapshot", None)
             snap_ts = getattr(self, "_last_full_refresh_ts", 0.0)
-            if snap and (now_ts - snap_ts) <= GLOBAL_REFRESH_SNAPSHOT_TTL_SECONDS:
-                for k, v in snap.items():
-                    put_ui_message(self.ui_queue, UiClinicDataMessage(doctor_name=k, data=v))
-                logging.info(f"[SNAPSHOT] replayed full refresh cache, doctors={len(snap)}")
-        
-        self.status_text.set(status_msg)
+            if snap and time.time() - snap_ts <= GLOBAL_REFRESH_SNAPSHOT_TTL_SECONDS:
+                for key, value in snap.items():
+                    put_ui_message(self.ui_queue, UiClinicDataMessage(
+                        doctor_name=key, data=value, refresh_gen=generation))
+                logging.info("[SNAPSHOT] replayed full refresh cache, doctors=%d", len(snap))
+
+        self.status_text.set("狀態: 手動整理中..." if is_manual else "狀態: 自動更新中...")
         self.startup_phase_text.set("更新資料")
         self.refresh_button.config(state="disabled")
-        
         doctors_to_check = specific_doctors if specific_doctors is not None else DOCTORS
         self._refresh_progress_total = len(doctors_to_check)
         self._refresh_progress_done = 0
-        
+
         def run_parallel_checks():
-            chain_startup_full = (
-                getattr(self, "_startup_defer_full_until_priority_done", False)
-                and specific_doctors is not None
-            )
-            self._refresh_worker_running = True  # 冪等：旗標已在 main thread 同步設過(見上)
-            # ★[2026-08-09 外審 P1-04] 止掛信帳本的回查在這裡驅動★
-            #   這是主程式唯一固定會跑的背景輪次。自帶跨 process 節流
-            #   （10 分鐘一次），所以放在這裡不會變成每次刷新都開 IMAP。
-            # ★[外審第 2 輪 #3] 只是【點火】，不等它★
-            #   回查會開 IMAP 連線（每筆 12 秒 timeout、一輪最多 5 筆）。
-            #   同步等它 = IMAP 掛掉時，掛號資料在送出第一個查詢前先卡 60 秒。
             try:
-                _kick_off_alert_reconcile(after=self._sweep_alert_pending)
-            except Exception:
-                logging.debug("[delivery] 止掛信回查點火失敗(不影響刷新)",
-                              exc_info=True)
-            try:
+                if not lifecycle.can_dispatch_batch(generation):
+                    return
+                try:
+                    def sweep_if_current():
+                        if lifecycle.owns(generation) and not getattr(self, "_shutting_down", False):
+                            self._sweep_alert_pending()
+
+                    lifecycle.submit_if_current(
+                        generation, _kick_off_alert_reconcile, sweep_if_current)
+                except Exception:
+                    logging.debug("[delivery] alert reconcile kickoff failed", exc_info=True)
                 batches = partition_doctors_for_refresh_batches(doctors_to_check)
                 appointment_fetcher: Callable[..., Any] = getattr(
                     self, "_appointment_fetcher", check_appointment_count)
-                for bi, batch in enumerate(batches):
+                for batch_index, batch in enumerate(batches):
+                    if not lifecycle.can_dispatch_batch(generation):
+                        break
                     futures = []
                     batch_workers = max(1, min(len(batch), 6))
                     with ThreadPoolExecutor(
@@ -14146,6 +14074,8 @@ class AutomationApp:
                         thread_name_prefix="RefreshBatch",
                     ) as refresh_pool:
                         for doctor_config in batch:
+                            if not lifecycle.can_dispatch_batch(generation):
+                                break
                             worker_config = dict(doctor_config)
                             doc_no = str(worker_config.get("doc_no", ""))
                             doc_name = str(worker_config.get("name", ""))
@@ -14154,120 +14084,93 @@ class AutomationApp:
                                 if _appointments_data_count(cached_data) > 0:
                                     worker_config["_cached_appointments"] = deepcopy(cached_data)
                             worker_config["_is_manual_refresh"] = bool(is_manual)
-                            # [外審 SB #2] 世代戳:殭屍的過期資料不得覆蓋新資料
-                            worker_config["_refresh_gen"] = _my_refresh_gen
-                            future = refresh_pool.submit(
+                            worker_config["_refresh_gen"] = generation
+                            future = lifecycle.submit_if_current(
+                                generation, refresh_pool.submit,
                                 appointment_fetcher, self.ui_queue, worker_config)
+                            if future is None:
+                                break
                             futures.append(future)
                         wait(futures, return_when=ALL_COMPLETED)
-                    for fut in futures:
+                    for future in futures:
                         try:
-                            fut.result()
+                            future.result()
                         except Exception:
                             logging.exception("掛號資料擷取背景工作失敗（單一醫師工作緒）")
-                    if bi < len(batches) - 1:
+                    if batch_index < len(batches) - 1 and lifecycle.can_dispatch_batch(generation):
                         time.sleep(0.18)
             finally:
-                # [2026-07-26 外審] 清除端要與設定端在【同一個臨界區】內,而且順序是
-                # 「先清 signature、取出佇列,最後才把 running 設 False」。
-                # 舊版先在鎖外把 running 設 False:那一瞬間 main thread 若觸發新的
-                # refresh B,B 會看到 False 而啟動並寫入自己的 active signature,
-                # 接著本 worker 才進鎖把【B 的】signature 清成 None →
-                # B 執行期間的同款請求無法去重(重複打掛號站)、本 worker 的完成 callback
-                # 還會把仍在刷新中的 UI 顯示成「閒置」並重新啟用按鈕。
-                _is_zombie = False
-                with self._refresh_queue_lock:
-                    # ★[2026-08-10 批次SB #3] 只有【擁有者】才可以清狀態★
-                    #   被接管過的殭屍 worker 醒來走到這裡時,running 旗標與
-                    #   signature 已經屬於新一輪 —— 清掉等於把正在跑的那一輪
-                    #   的去重與單飛整個拆掉(重複打掛號站+假閒置)。
-                    #   ★不可以在 finally 裡 return★(會吞掉 in-flight 例外),
-                    #   用旗標把後面的收尾整段跳掉。
-                    _is_zombie = (_my_refresh_gen != self._refresh_generation)
-                    if _is_zombie:
-                        logging.warning(
-                            "[refresh] 殭屍 worker(gen=%d)醒來,現任 gen=%d →"
-                            " 不清狀態、不接力佇列", _my_refresh_gen,
-                            self._refresh_generation)
-                        queued_request = None
-                    else:
-                        self._active_refresh_signature = None
-                        queued_request = self._queued_refresh_requests.popleft() if self._queued_refresh_requests else None
-                        if queued_request is not None:
-                            self._queued_refresh_signatures.discard(queued_request[2])
-                        self._refresh_worker_running = False
-                refresh_time = datetime.now().strftime('%H:%M:%S')
+                if not lifecycle.mark_finished(generation):
+                    logging.warning("[refresh] stale worker gen=%d released no newer state", generation)
 
-                def _on_refresh_worker_done(rt=refresh_time, qr=queued_request,
-                                            gen=_my_refresh_gen):
-                    # [外審] 歸屬驗證:排隊期間若已有新一輪 refresh 啟動,這個 callback
-                    # 就不是「目前狀態」的擁有者 —— 只處理佇列接力,不可把 UI 改成閒置
-                    # 或重新啟用按鈕(那會在新一輪執行中謊報已完成)。
-                    _owns_ui = (gen == self._refresh_generation)
-                    if not _owns_ui:
-                        logging.debug(
-                            "[refresh] 完成 callback 世代 %s != 目前 %s → 不動 UI 狀態,"
-                            "但完成記帳與佇列接力照做", gen, self._refresh_generation)
-                    else:
-                        self._cancel_pending_refresh_tick_ui()
-                        self.refresh_button.config(state="normal")
-                        self.last_refresh_text.set(f"更新: {rt}")
-                        if self._heavy_modules_ready:
-                            self.startup_phase_text.set("完成")
-                        self.status_text.set(f"狀態: 閒置（最新更新: {rt}）")
-                    # [外審 R6] 非 UI 的完成記帳【不可】因為世代不符而被丟掉 ——
-                    # 這一輪 full refresh 確實完成了,快照/時間戳是後續「要不要重抓」
-                    # 的依據;漏記會讓下一次判斷以為資料很舊而重複整批抓。
-                    if specific_doctors is None:
-                        with self._doctor_data_lock:
-                            self._last_full_refresh_snapshot = deepcopy(self.all_doctors_data)
-                        self._last_full_refresh_ts = time.time()
-                    if qr is not None:
-                        self._trigger_refresh(qr[0], qr[1])
-                    elif chain_startup_full:
-                        self._startup_defer_full_until_priority_done = False
-                        self._trigger_refresh(False)
-
-                if not _is_zombie:
-                    self.root.after(0, _on_refresh_worker_done)
-
-        def _handle_refresh_submit_rejected(fut):
-            if fut.cancelled():
+        def on_submit_done(future):
+            if future.cancelled():
                 rejected = True
             else:
                 try:
-                    rejected = isinstance(fut.exception(), RejectedExecutionError)
+                    rejected = isinstance(future.exception(), RejectedExecutionError)
                 except Exception:
                     rejected = False
-            if not rejected:
-                return
-            logging.warning("掛號刷新背景工作未啟動：背景佇列已滿")
+            if rejected:
+                logging.warning("掛號刷新背景工作未啟動：背景佇列已滿")
+                lifecycle.mark_finished(generation, rejected=True)
 
-            def _reset_rejected_refresh():
-                # [2026-07-26 外審] 同上:running 旗標要在鎖內、且【最後】才清,
-                # 否則會清掉下一個 refresh 剛寫入的 signature。
-                with self._refresh_queue_lock:
-                    # [2026-08-10 批次SB #3] 擁有權驗證(理由見 worker 的 finally)
-                    if _my_refresh_gen != self._refresh_generation:
-                        return
-                    self._active_refresh_signature = None
-                    queued_request = self._queued_refresh_requests.popleft() if self._queued_refresh_requests else None
-                    if queued_request is not None:
-                        self._queued_refresh_signatures.discard(queued_request[2])
-                    self._refresh_worker_running = False
-                self._cancel_pending_refresh_tick_ui()
+        try:
+            refresh_future = lifecycle.submit_if_current(
+                generation, self.bg_executor.submit, run_parallel_checks)
+        except RuntimeError:
+            logging.warning("掛號刷新背景工作未啟動：executor 已關閉")
+            lifecycle.mark_finished(generation, rejected=True)
+        else:
+            if refresh_future is not None:
+                refresh_future.add_done_callback(on_submit_done)
+
+    def _drain_refresh_lifecycle_ui(self):
+        """After data messages, settle one run and hand off queued work on Tk."""
+        lifecycle = getattr(self, "_refresh_lifecycle", None)
+        if lifecycle is None or getattr(self, "_shutting_down", False):
+            return
+        # A background caller may have claimed a fresh run while unrelated UI
+        # messages keep arriving; starting it must not wait for that backlog.
+        self._start_claimed_refresh()
+        # The fetcher enqueues its final data before mark_finished. Keep that
+        # generation current until its data/ticks are consumed; unrelated UI
+        # traffic must not starve the next queued refresh indefinitely.
+        completed_gen = lifecycle.pending_completion_generation
+        if completed_gen is not None:
+            with self.ui_queue.mutex:
+                if any(
+                    isinstance(item, (UiClinicDataMessage, UiRefreshTickMessage))
+                    and getattr(item, "refresh_gen", None) == completed_gen
+                    for item in self.ui_queue.queue
+                ):
+                    return
+        completed = lifecycle.finish_on_ui()
+        if completed is not None:
+            run = completed.run
+            refresh_time = datetime.now().strftime("%H:%M:%S")
+            if not completed.rejected and run.request.doctors is None:
+                with self._doctor_data_lock:
+                    self._last_full_refresh_snapshot = deepcopy(self.all_doctors_data)
+                self._last_full_refresh_ts = time.time()
+            self._cancel_pending_refresh_tick_ui()
+            if completed.next_run is None:
                 self.refresh_button.config(state="normal")
-                self.status_text.set("狀態: 背景佇列忙碌，刷新稍後重試")
-                if queued_request is not None:
-                    self._trigger_refresh(queued_request[0], queued_request[1])
-
-            if threading.current_thread() is threading.main_thread():
-                _reset_rejected_refresh()
-            elif not getattr(self, "_shutting_down", False):
-                self.root.after(0, _reset_rejected_refresh)
-
-        refresh_future = self.bg_executor.submit(run_parallel_checks)
-        refresh_future.add_done_callback(_handle_refresh_submit_rejected)
+                if not completed.rejected:
+                    self.last_refresh_text.set(f"更新: {refresh_time}")
+                    if self._heavy_modules_ready:
+                        self.startup_phase_text.set("完成")
+                    self.status_text.set(f"狀態: 閒置（最新更新: {refresh_time}）")
+                else:
+                    self.status_text.set("狀態: 背景佇列忙碌，刷新稍後重試")
+                if (getattr(self, "_startup_defer_full_until_priority_done", False)
+                        and run.request.doctors is not None
+                        and not getattr(self, "_startup_priority_phase_b_pending", False)):
+                    self._startup_defer_full_until_priority_done = False
+                    self._trigger_refresh(False)
+            elif not completed.rejected:
+                self.last_refresh_text.set(f"更新: {refresh_time}")
+        self._start_claimed_refresh()
 
     def _on_watchdog_toggle(self):
         """切換 watchdog master_enabled 並寫回 settings/watchdog_config.json。"""
@@ -16413,9 +16316,15 @@ class AutomationApp:
                     case UiStatusMessage(text=t):
                         self.status_text.set(t)
                     case UiRefreshTickMessage(doctor_name=doc_name):
+                        tick_generation = getattr(msg, "refresh_gen", None)
+                        lifecycle = getattr(self, "_refresh_lifecycle", None)
+                        if (lifecycle is not None
+                                and not lifecycle.accepts_message(tick_generation)):
+                            continue
                         self._refresh_progress_done = getattr(self, '_refresh_progress_done', 0) + 1
                         total = getattr(self, '_refresh_progress_total', 0)
-                        self._pending_refresh_tick_ui = (self._refresh_progress_done, total, doc_name)
+                        self._pending_refresh_tick_ui = (
+                            self._refresh_progress_done, total, doc_name, tick_generation)
                         if getattr(self, '_refresh_tick_after_id', None):
                             try:
                                 self.root.after_cancel(self._refresh_tick_after_id)
@@ -16436,10 +16345,12 @@ class AutomationApp:
                         #   被 age takeover 接管的那一輪醒來後仍會把舊掛號數丟進
                         #   佇列;世代不符就整筆丟棄(None=非 refresh 來源,照收)。
                         _mgen = getattr(msg, "refresh_gen", None)
-                        if _mgen is not None and _mgen != self._refresh_generation:
+                        lifecycle = getattr(self, "_refresh_lifecycle", None)
+                        if (lifecycle is not None
+                                and not lifecycle.accepts_message(_mgen)):
                             logging.info(
                                 "[refresh] 丟棄過期世代的資料(gen=%s,現任=%s,%s)",
-                                _mgen, self._refresh_generation, doctor_name)
+                                _mgen, lifecycle.generation, doctor_name)
                             continue
                         if doctor_name and appointment_data is not None:
                             with self._doctor_data_lock:
@@ -16556,6 +16467,7 @@ class AutomationApp:
 
         if getattr(self, '_shutting_down', False):
             return
+        self._drain_refresh_lifecycle_ui()
         next_delay = 80 if had_work else 320
         self._ui_queue_poll_id = self.root.after(next_delay, self.process_ui_queue)
         
@@ -17948,15 +17860,18 @@ class AutomationApp:
             batch_1 = [by_name[n] for n in REFRESH_QUERY_BATCH_1 if n in by_name]
             batch_2 = [by_name[n] for n in REFRESH_QUERY_BATCH_2 if n in by_name]
 
+            self._startup_defer_full_until_priority_done = bool(batch_1 or batch_2)
+            self._startup_priority_phase_b_pending = bool(batch_2)
+
             if batch_1:
                 logging.info(f"[STARTUP] phase A refresh doctors={len(batch_1)} (主院優先)")
-                self._startup_defer_full_until_priority_done = True
                 self._trigger_refresh(False, batch_1)
 
             if batch_2:
                 # 1.5 秒後跑第二波（含院外，timeout 已縮短為 2s 不會卡太久）
                 def _phase_b():
                     logging.info(f"[STARTUP] phase B refresh doctors={len(batch_2)} (含院外)")
+                    self._startup_priority_phase_b_pending = False
                     self._trigger_refresh(False, batch_2)
                 self.root.after(1500, _phase_b)
 

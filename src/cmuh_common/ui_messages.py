@@ -18,6 +18,7 @@ class UiStatusMessage:
 @dataclass(frozen=True, slots=True)
 class UiRefreshTickMessage:
     doctor_name: str
+    refresh_gen: Any = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -163,64 +163,60 @@ def test_pain_radio_click_is_read_back():
 
 
 def test_refresh_flag_cleared_inside_lock_and_last():
-    """★外審★ 清除端若先在鎖外把 running 設 False,那一瞬間 main thread 觸發的新 refresh
-    會看到 False 而啟動並寫入自己的 active signature,接著舊 worker 才進鎖把【新的】
-    signature 清成 None → 新 refresh 期間的同款請求無法去重(重複打掛號站),
-    舊 worker 的完成 callback 還會把仍在刷新中的 UI 顯示成「閒置」。"""
-    import main
-    code = _code_only(inspect.getsource(main.AutomationApp._trigger_refresh))
-    # 每一處清除 running 旗標都必須在鎖區塊內,且排在清 signature 之後
-    for m in re.finditer(r"self\._refresh_worker_running = False", code):
-        head = code[:m.start()]
-        i_lock = head.rindex("with self._refresh_queue_lock:")
-        seg = head[i_lock:]
-        assert "self._active_refresh_signature = None" in seg, \
-            "running 旗標要在同一個臨界區內、且排在清 signature 之後"
-        # 鎖區塊之後不可再有把旗標清成 False 的落單語句
-        assert "\n                self._refresh_worker_running = False" not in code, \
-            "不可在鎖外清 running 旗標"
+    """Completion stays owned until UI acknowledgement; no duplicate can enter."""
+    from cmuh_common.outpatient_refresh_lifecycle import OutpatientRefreshLifecycle
+
+    lifecycle = OutpatientRefreshLifecycle(max_age_seconds=900)
+    first = lifecycle.request(False).run
+    lifecycle.take_start()
+    assert lifecycle.mark_finished(first.generation)
+    assert lifecycle.request(False).kind == "duplicate"
+    assert lifecycle.finish_on_ui().run == first
+    assert lifecycle.request(False).kind == "started"
 
 
 def test_refresh_completion_callback_validates_ownership():
-    """★外審 R2★ worker A 的 UI 收尾是 root.after 排到 main thread 才跑;那時 B 可能
-    已經在跑。沒有歸屬驗證的話,A 的 callback 會把 UI 顯示成「閒置」並重新啟用按鈕,
-    而實際上 B 還在刷新 —— 又是一次「故障看起來跟正常一樣」。"""
-    import main
-    code = _code_only(inspect.getsource(main.AutomationApp._trigger_refresh))
-    assert "self._refresh_generation += 1" in code, "啟動時要遞增世代"
-    i_gen = code.index("self._refresh_generation += 1")
-    i_lock = code[:i_gen].rindex("with self._refresh_queue_lock:")
-    assert "self._refresh_worker_running = True" in code[i_lock:i_gen], \
-        "世代遞增要與搶旗標在同一個臨界區"
-    assert "gen=_my_refresh_gen" in code, "callback 要綁定自己的世代"
-    i_cb = code.index("def _on_refresh_worker_done")
-    seg = code[i_cb:i_cb + 2500]
-    assert "_owns_ui = (gen == self._refresh_generation)" in seg
-    i_guard = seg.index("_owns_ui = (gen == self._refresh_generation)")
-    i_ui = seg.index('self.status_text.set(f"狀態: 閒置')
-    assert i_guard < i_ui, "歸屬驗證要在動 UI 之前"
-    # UI 變更全部包在 _owns_ui 分支內
-    assert "if not _owns_ui:" in seg[i_guard:i_ui]
-    # ★外審 R6★ 非 UI 的完成記帳與佇列接力【不可】因為世代不符而被丟掉
-    i_snap = seg.index("self._last_full_refresh_snapshot = deepcopy")
-    assert i_snap > i_ui, "快照記帳要在 UI 分支之外(不論擁不擁有都要做)"
-    assert "self._trigger_refresh(qr[0], qr[1])" in seg[i_snap:],         "佇列接力也要照做"
+    """A taken-over worker cannot finish or clear its successor."""
+    from cmuh_common.outpatient_refresh_lifecycle import OutpatientRefreshLifecycle
+
+    now = [0.0]
+    lifecycle = OutpatientRefreshLifecycle(max_age_seconds=900, clock=lambda: now[0])
+    old = lifecycle.request(False).run
+    lifecycle.take_start()
+    now[0] = 901.0
+    current = lifecycle.request(True).run
+    assert not lifecycle.mark_finished(old.generation)
+    assert lifecycle.owns(current.generation)
+    assert lifecycle.mark_finished(current.generation)
+    assert lifecycle.finish_on_ui().run == current
 
 
 def test_refresh_check_enqueue_and_claim_share_one_critical_section():
-    """★外審 R4★ worker 現在是在鎖內清旗標【並抽乾佇列】的,所以「鎖外檢查」有真實空窗:
-    呼叫端讀到 True → 還沒拿到鎖 → worker 清完旗標並抽乾佇列 → 呼叫端才拿到鎖並 append
-    → 那筆請求永遠不會有人接手,刷新靜默消失。檢查、入列、搶旗標必須同一個臨界區。"""
-    import main
-    code = _code_only(inspect.getsource(main.AutomationApp._trigger_refresh))
-    i_lock = code.index("with self._refresh_queue_lock:")
-    # [2026-08-10 批次SB #3] gate 加了 age takeover,條件變成
-    # `if not ... or _stale_takeover:` —— 錨點跟著更新,性質不變。
-    i_check = code.index("if not self._refresh_worker_running or _stale_takeover:")
-    i_append = code.index("self._queued_refresh_requests.append(")
-    i_claim = code.index("self._refresh_worker_running = True")
-    assert i_lock < i_check < i_claim, "檢查與搶旗標都要在鎖內"
-    assert i_lock < i_append, "入列也要在同一個鎖內"
-    # 鎖外不可再有「先檢查旗標再決定要不要入列」的舊路徑
-    head = code[:i_lock]
-    assert "if self._refresh_worker_running:" not in head, "不可在鎖外先檢查旗標"
+    """A request racing completion is either queued or claimed, never orphaned."""
+    from cmuh_common.outpatient_refresh_lifecycle import OutpatientRefreshLifecycle
+    import threading
+
+    for _ in range(50):
+        lifecycle = OutpatientRefreshLifecycle(max_age_seconds=900)
+        first = lifecycle.request(False).run
+        lifecycle.take_start()
+        lifecycle.mark_finished(first.generation)
+        barrier = threading.Barrier(2)
+        decisions = []
+
+        def request(barrier=barrier, decisions=decisions, lifecycle=lifecycle):
+            barrier.wait()
+            decisions.append(lifecycle.request(True))
+
+        worker = threading.Thread(target=request)
+        worker.start()
+        barrier.wait()
+        completion = lifecycle.finish_on_ui()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        decision = decisions[0]
+        if decision.kind == "queued":
+            assert completion.next_run is not None
+        else:
+            assert decision.kind == "started"
+            assert lifecycle.take_start() == decision.run
