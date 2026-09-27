@@ -43,7 +43,7 @@ _REASONS = frozenset({
 })
 
 
-def _safe_code(value: str, allowed: frozenset[str], fallback: str) -> str:
+def _safe_code(value: object, allowed: frozenset[str], fallback: str) -> str:
     return value if isinstance(value, str) and value in allowed else fallback
 
 

@@ -136,7 +136,8 @@ SETTINGS_DIR = Path(get_settings_dir())
 CONFIG_FILE = SETTINGS_DIR / "consult_query_config.json"
 LOG_FILE = SETTINGS_DIR / "consult_query.log"
 DIAGNOSTICS = DiagnosticStore(SETTINGS_DIR / "consult_diagnostics.sqlite3", "consult")
-_CURRENT_DIAGNOSTIC_RUN = contextvars.ContextVar("consult_diagnostic_run", default=None)
+_CURRENT_DIAGNOSTIC_RUN: contextvars.ContextVar[DiagnosticRun | None] = (
+    contextvars.ContextVar("consult_diagnostic_run", default=None))
 SHOTS_DIR = SETTINGS_DIR / "consult_shots"
 RUNNOW_FLAG = SETTINGS_DIR / "consult_query_runnow.flag"
 RELOAD_FLAG = SETTINGS_DIR / "consult_query_reload.flag"

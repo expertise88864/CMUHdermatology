@@ -9,7 +9,7 @@
       "remote_path": "src/autoclock.py",
       "local_filename": "src/autoclock.py",
       "version": "2026.09.28.1",
-      "sha256": "04d218536adbf5ac14741fd5a44748f980350db9a64e1147ccfa1941dc938da7"
+      "sha256": "5207b38ad8fa744641091c021ba7d049d315662b5bd308edd4223a2215275346"
     },
     {
       "key": "bootstrap_recovery",
@@ -779,14 +779,14 @@
       "remote_path": "src/cmuh_common/runtime_diagnostics.py",
       "local_filename": "src/cmuh_common/runtime_diagnostics.py",
       "version": "2026.09.28.1",
-      "sha256": "865edc40df8c1be4ee5f69279e852b27b81176ce5e13611bf141e33ff3210a91"
+      "sha256": "fa6d0da2aa852750f084b5005a6b6dbf82019eacd05563bd322257c512a4c06e"
     },
     {
       "key": "cmuh_common.runtime_summary",
       "remote_path": "src/cmuh_common/runtime_summary.py",
       "local_filename": "src/cmuh_common/runtime_summary.py",
       "version": "2026.09.28.1",
-      "sha256": "f4ac552644922eb9b2b1caa9ca2afb2f0256b1cd4a9a2cff08b2b08d84c93f09"
+      "sha256": "3c0ea480a143f556b333940456a72de8acf7efe247cacbe2749722b7bafb8325"
     },
     {
       "key": "cmuh_common.screen_blackout",
@@ -947,7 +947,7 @@
       "remote_path": "src/consult_query.py",
       "local_filename": "src/consult_query.py",
       "version": "2026.09.28.1",
-      "sha256": "b9a87154c83218a00e5eb40ca5979161bbba36c5f93501b0042be4b95377d17a"
+      "sha256": "608ef80a6037706da739ff1fd1f5bf8e716789d8b1e69d4b341cbc7b3f83eac4"
     },
     {
       "key": "coord",

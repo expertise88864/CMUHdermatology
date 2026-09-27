@@ -137,7 +137,7 @@ except Exception:
 CONFIG_FILE = SETTINGS_DIR / "autoclock_config.json"
 LOG_FILE = SETTINGS_DIR / "autoclock.log"
 DIAGNOSTICS = DiagnosticStore(SETTINGS_DIR / "autoclock_diagnostics.sqlite3", "clock")
-_CURRENT_CLOCK_DIAGNOSTIC_RUN = contextvars.ContextVar(
+_CURRENT_CLOCK_DIAGNOSTIC_RUN: contextvars.ContextVar[DiagnosticRun | None] = contextvars.ContextVar(
     "clock_diagnostic_run", default=None)
 ICON_FILE = BASE_DIR / "assets" / "AutoClockIcon.png"
 if not ICON_FILE.exists():  # 兼容舊路徑

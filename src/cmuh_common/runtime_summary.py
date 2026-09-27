@@ -220,7 +220,7 @@ def consult_summary(events: list[dict], delivery: dict | None, *,
                   reason + "；" + _REASON_LABELS["verify_his"])
     if query_state == "名單未知" and error == "無":
         error = "解析"
-    if (event and outcome == _OUTCOME_LABELS["started"]
+    if (event and observed is not None and outcome == _OUTCOME_LABELS["started"]
             and instant - observed > 20 * 60):
         outcome = "上次進行中紀錄已過期，執行結果不明"
     return (f"階段：{stage}｜狀態：{outcome}｜查詢結果：{query_state}\n"
@@ -264,7 +264,7 @@ def clock_summary(events: list[dict], state: dict | None, *,
         if action not in reason:
             reason = action if reason == "無" else reason + "；" + action
     success = last_success(events, domain="clock")
-    if (event and outcome == _OUTCOME_LABELS["started"]
+    if (event and observed is not None and outcome == _OUTCOME_LABELS["started"]
             and instant - observed > 5 * 60):
         outcome = "上次進行中紀錄已過期，執行結果不明"
     return (f"階段：{stage}｜最近觀察：{outcome}\n"
