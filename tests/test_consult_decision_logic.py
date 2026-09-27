@@ -15,6 +15,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import consult_query as cq  # noqa: E402
 import cmuh_common.smtp_mail as smtp_mail  # noqa: E402
+from cmuh_common.runtime_diagnostics import DiagnosticStore  # noqa: E402
+from cmuh_common.runtime_summary import consult_summary  # noqa: E402
 
 
 # ─── 共用 harness ────────────────────────────────────────────────────────
@@ -116,6 +118,111 @@ class _JobHarness:
 
 
 # ─── _do_full_job 收件人路由 ─────────────────────────────────────────────
+
+def test_diagnostics_fake_his_smtp_and_outlook_are_read_only_and_redacted(
+        monkeypatch, tmp_path):
+    store = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", store)
+    private = "王小明1234567"
+    h = _JobHarness(monkeypatch, _base_cfg(), extracted_text=private)
+    cq._do_full_job("email")
+    before = (h.flow_runs, len(h.sent))
+    text = consult_summary(store.read(), None)
+    assert "寄送端接受" in text
+    assert (h.flow_runs, len(h.sent)) == before  # viewing did not query/send
+    assert private.encode("utf-8") not in store.path.read_bytes()
+    assert all(e["duration_ms"] >= 0 for e in store.read())
+
+    outlook = _JobHarness(monkeypatch, _base_cfg(mail_method="outlook"),
+                          extracted_text=private)
+    monkeypatch.setattr(cq, "_outlook_available", lambda timeout=5.0: True)
+    cq._do_full_job("email")
+    assert len(outlook.sent) == 1
+    assert any(e["stage"] == "send" and e["outcome"] == "accepted"
+               for e in store.read())
+
+
+def test_diagnostics_fake_his_failure_smtp_unknown_and_partial_refusal(
+        monkeypatch, tmp_path):
+    store = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", store)
+    _JobHarness(monkeypatch, _base_cfg(retry_count=1), fail_times=1)
+    cq._do_full_job("email")
+    assert "查詢失敗" in consult_summary(store.read(), None)
+
+    _JobHarness(monkeypatch, _base_cfg(retry_count=1),
+                extracted_text="synthetic consult")
+    monkeypatch.setattr(cq, "send_via_smtp", lambda *_a, **_k:
+                        (_ for _ in ()).throw(cq.DeliveryOutcomeUnknown(
+                            "synthetic timeout")))
+    cq._do_full_job("email")
+    assert any(e["stage"] == "send" and e["outcome"] == "pending"
+               for e in store.read())
+
+    _JobHarness(monkeypatch, _base_cfg(retry_count=1),
+                extracted_text="another synthetic consult")
+    monkeypatch.setattr(cq, "send_via_smtp",
+                        lambda *_a, **_k: {"sched_b@x.tw": (550, "refused")})
+    cq._do_full_job("17:00")
+    assert any(e["stage"] == "send" and e["outcome"] == "refused"
+               for e in store.read())
+
+
+def test_diagnostics_keeps_unknown_roster_visible_after_send_acceptance(
+        monkeypatch, tmp_path):
+    store = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", store)
+    _JobHarness(monkeypatch, _base_cfg(retry_count=1), roster_texts=None)
+    cq._do_full_job("email")
+    text = consult_summary(store.read(), None)
+    assert "寄送端接受" in text
+    assert "查詢結果：名單未知" in text
+    assert "請人工核對 HIS" in text
+
+
+def test_unverified_first_poll_never_claims_definite_empty_roster(
+        monkeypatch, tmp_path):
+    diagnostics = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", diagnostics)
+    h, _ = _poll_harness(
+        monkeypatch, _base_cfg(quiet_start_hour=0, quiet_end_hour=6), "",
+        notified=set(), now=_DT(2026, 6, 25, 9, 0), initialized=False)
+    monkeypatch.setattr(cq, "_may_update_baseline", lambda _roster: False)
+    cq._do_full_job("poll")
+    assert not h.sent
+    events = diagnostics.read()
+    assert any(e["stage"] == "done" and e["outcome"] == "skipped" and
+               e["reason"] == "verify_his" for e in events)
+    assert not any(e["stage"] == "done" and e["outcome"] == "empty_roster"
+                   for e in events)
+    text = consult_summary(events, None)
+    assert "查詢結果：名單未知" in text
+    assert "最後成功：無紀錄" in text
+
+
+def test_outlook_diagnostics_separates_definite_failure_from_uncertainty(
+        monkeypatch, tmp_path):
+    diagnostics = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", diagnostics)
+    monkeypatch.setattr(cq, "_outlook_available", lambda timeout=5.0: True)
+    cfg = _base_cfg(mail_method="outlook", retry_count=1)
+    _JobHarness(monkeypatch, cfg, extracted_text="synthetic consult")
+
+    def fail_send(*_a, **_k):
+        raise RuntimeError("not submitted")
+
+    monkeypatch.setattr(cq, "send_via_outlook", fail_send)
+    cq._do_full_job("email")
+    assert any(e["stage"] == "send" and e["outcome"] == "failed"
+               for e in diagnostics.read())
+
+    def unknown_send(*_a, **_k):
+        raise cq.DeliveryOutcomeUnknown("uncertain")
+
+    monkeypatch.setattr(cq, "send_via_outlook", unknown_send)
+    cq._do_full_job("email")
+    assert any(e["stage"] == "send" and e["outcome"] == "pending"
+               for e in diagnostics.read())
 
 def test_route_email_trigger_sends_to_trigger_sender(monkeypatch):
     """IMAP 觸發(override_recipients=觸發者) → 結果回寄給「觸發者本人」。"""

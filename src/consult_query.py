@@ -48,6 +48,7 @@ ensure_dependencies(REQUIRED_LIBS, bootstrap=True)
 
 # === 主要 import（依賴已就緒）===
 import ctypes  # noqa: E402
+import contextvars  # noqa: E402
 from ctypes import wintypes  # noqa: E402
 import html as _html  # noqa: E402
 import json  # noqa: E402
@@ -65,6 +66,12 @@ import tkinter as tk  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from cmuh_common.consult_result import (  # noqa: E402
     ConsultQueryStatus, capture_consult_query,
+)
+from cmuh_common.runtime_diagnostics import (  # noqa: E402
+    DiagnosticRun, DiagnosticStore, render_safe_events,
+)
+from cmuh_common.runtime_summary import (  # noqa: E402
+    consult_summary, read_consult_delivery,
 )
 from datetime import datetime, time as dt_time  # noqa: E402
 from pathlib import Path  # noqa: E402
@@ -128,6 +135,8 @@ BASE_DIR = Path(get_app_dir())
 SETTINGS_DIR = Path(get_settings_dir())
 CONFIG_FILE = SETTINGS_DIR / "consult_query_config.json"
 LOG_FILE = SETTINGS_DIR / "consult_query.log"
+DIAGNOSTICS = DiagnosticStore(SETTINGS_DIR / "consult_diagnostics.sqlite3", "consult")
+_CURRENT_DIAGNOSTIC_RUN = contextvars.ContextVar("consult_diagnostic_run", default=None)
 SHOTS_DIR = SETTINGS_DIR / "consult_shots"
 RUNNOW_FLAG = SETTINGS_DIR / "consult_query_runnow.flag"
 RELOAD_FLAG = SETTINGS_DIR / "consult_query_reload.flag"
@@ -2473,6 +2482,31 @@ def _normalize_consult_extraction(result: tuple) -> tuple:
     raise ValueError("unexpected consultation extraction result")
 
 
+def _extract_with_diagnostics(consult, cfg, roster_label, settled):
+    """Time actual HIS extraction on either desktop path."""
+    diagnostic = _CURRENT_DIAGNOSTIC_RUN.get()
+    started = diagnostic.start() if diagnostic else None
+    if diagnostic:
+        diagnostic.emit("parse", "started")
+    try:
+        result = _normalize_consult_extraction(
+            _extract_consult_text(consult, cfg, roster_label, settled=settled))
+    except Exception:
+        if diagnostic:
+            diagnostic.emit("parse", "failed", since=started,
+                            error="parse", reason="verify_his")
+        raise
+    if diagnostic:
+        roster = result[2]
+        verified = _may_update_baseline(roster)
+        diagnostic.emit("parse", "roster_unknown" if not verified
+                        else "empty_roster" if not roster else "ok",
+                        since=started,
+                        error="parse" if not verified else "none",
+                        reason="verify_his" if not verified else "none")
+    return result
+
+
 def _validated_systemftp_pids(pids: set) -> set:
     """[2026-07-25 審查/codex] 從候選 PID 篩出「確實是本 session 的 systemftp」。
 
@@ -2820,7 +2854,9 @@ def run_consult_flow(trigger_label: str = "") -> tuple:
                 except Exception:
                     logging.debug("CloseDesktop 失敗", exc_info=True)
 
-        t = threading.Thread(target=worker, name="ConsultAutomationHidden",
+        diagnostic_context = contextvars.copy_context()
+        t = threading.Thread(target=lambda: diagnostic_context.run(worker),
+                             name="ConsultAutomationHidden",
                               daemon=True)
         _last_hidden_worker = t
         t.start()
@@ -4934,9 +4970,8 @@ def _query_cycle(sess, cfg: dict, roster_label: str) -> tuple:
     #   固定睡的那 1.8 秒也一併拿掉(穩定判定本身就已經在等)。
     img, _snap = _capture_with_settled_roster(consult)
     (extracted, extracted_html, roster_texts, privacy_identities,
-     privacy_roster_complete) = (
-        _normalize_consult_extraction(
-            _extract_consult_text(consult, cfg, roster_label, settled=_snap)))
+     privacy_roster_complete) = _extract_with_diagnostics(
+         consult, cfg, roster_label, _snap)
     _return_to_main(sess, consult)
     return (img, extracted, extracted_html, roster_texts, privacy_identities,
             privacy_roster_complete)
@@ -5721,9 +5756,8 @@ def _run_with_sw_hide(cfg: dict, roster_label: str = "今日會診病人") -> tu
         # [新功能 2026-06-13] 先擷取原始畫面,再逐列點選擷取文字(fail-open)
         img, _snap = _capture_with_settled_roster(consult)
         (extracted, extracted_html, roster_texts, privacy_identities,
-         privacy_roster_complete) = (
-            _normalize_consult_extraction(
-                _extract_consult_text(consult, cfg, roster_label, settled=_snap)))
+         privacy_roster_complete) = _extract_with_diagnostics(
+             consult, cfg, roster_label, _snap)
         return (img, extracted, extracted_html, roster_texts,
                 privacy_identities, privacy_roster_complete, _login_token)
 
@@ -7261,9 +7295,12 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
       - 其他（排程／手動）→ 用 recipients（一般四人名單）"""
     #: poll 這一輪【新出現】的病歷號(給寄送機會識別用;非 poll 路徑留空)
     _occ_new_ids: set = set()
+    diagnostic = DiagnosticRun(DIAGNOSTICS)
     # ★到期的「補寄給被暫時拒收的收件人」先做★(外審第 10 輪第 3 回 P1-1)
     #   放在拿 `_flow_lock` 之前:補寄不碰 HIS,不需要那把鎖,而且被鎖擋下的
     #   輪次也應該讓補寄有機會發生(它跟這一輪查不查得到會診無關)。
+    reconcile_started = diagnostic.start()
+    diagnostic.emit("reconcile", "started")
     try:
         _drain_pending_refusal_retries()
         # 帳上的 UNKNOWN 先拿 Message-ID 去寄件備份回查(自帶節流)——
@@ -7271,10 +7308,15 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
         _reconcile_unknown_deliveries()
         # 帳上掛太久的(多半是跨越了程式重啟,記憶體佇列已消失)→ 明確結案 + 告警
         _close_out_stale_recipient_retries()
+        diagnostic.emit("reconcile", "ok", since=reconcile_started)
     except Exception:
+        diagnostic.emit("reconcile", "failed", since=reconcile_started,
+                        error="ledger",
+                        reason="verify_delivery")
         logging.warning("[delivery] 處理待補寄時出錯(不影響本輪查詢)",
                         exc_info=True)
     if not _flow_lock.acquire(blocking=False):
+        diagnostic.emit("done", "skipped")
         _note_flow_lock_skipped(trigger_label)
         # ★[2026-07-30 外審第 1 輪] email 觸發的要排隊補跑,不可直接丟掉★
         #   `trigger_job_async` 只在【gate 擋下】時排隊；gate 放行但 `_flow_lock`
@@ -7316,6 +7358,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
     _flow_lock_held_since[0] = time.monotonic()
     pythoncom = None
     com_initialized = False
+    diagnostic_token = _CURRENT_DIAGNOSTIC_RUN.set(diagnostic)
     try:
         import pythoncom       # noqa: PLC0415
         pythoncom.CoInitialize()
@@ -7347,6 +7390,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
             # [2026-08-03 常駐] 休息時段把常駐 session 收掉:不查詢就沒有 keepalive,
             # 5 分鐘後會被院方強制登出,留著只是殭屍行程掛整夜;06:00 後首輪冷啟動。
             _session_close("休息時段(00-06 不輪詢),收掉常駐 session")
+            diagnostic.emit("done", "skipped")
             return
         mail_method = str(cfg.get("mail_method", "smtp")).lower()
         # SMTP 模式：檢查 password 是否已填，沒填則靜默跳過（多機部署：只有有
@@ -7356,11 +7400,13 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
             if not _smtp_ready():
                 logging.info("SMTP 尚未設定（settings/smtp_credentials.json 缺 "
                               "password），本次（%s）整個流程靜默跳過", trigger_label)
+                diagnostic.emit("done", "skipped")
                 return
         elif mail_method == "outlook":
             if not _outlook_available():
                 logging.info("本機無可用 Outlook，本次（%s）整個流程靜默跳過",
                               trigger_label)
+                diagnostic.emit("done", "skipped")
                 return
         now = datetime.now()
         date_str = f"{now.year}/{now.month}/{now.day}"
@@ -7392,6 +7438,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
             logging.error(
                 "[會診] 尚未設定 HIS 帳號/密碼,本次(%s)不執行流程;請至設定填寫。",
                 trigger_label)
+            diagnostic.emit("done", "skipped", error="auth")
             return
         # [CQ-07] 收件人被清空 → 不跑完整 HIS 自動化(免每輪白開 systemftp、登入、擷取 3 次
         # 才在寄信步驟失敗),直接記 error 返回。
@@ -7399,6 +7446,8 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
             logging.error(
                 "[會診] 收件人清單為空(%s),本次(%s)不執行流程/不寄信;請至設定填寫收件人。",
                 recipients_label, trigger_label)
+            diagnostic.emit("done", "skipped", error="refusal",
+                            reason="fix_recipient")
             return
 
         subject = cfg["subject_template"].format(date=date_str, time=time_str)
@@ -7443,14 +7492,26 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                 #   而且 SMTP 可能【已經收下第一封】只是回應逾時,第二次 attempt
                 #   會用新的 Message-ID 再寄一封 → 收件人收到兩封不一樣的清單。
                 #   查詢成功之後就把結果釘住,之後的 attempt 只重試寄送。
+                query_started = diagnostic.start()
+                if his_result is None:
+                    diagnostic.emit("query", "started")
                 if his_result is None:
                     query_result = capture_consult_query(
                         run_consult_flow, trigger_label)
                     if query_result.status is ConsultQueryStatus.READ_FAILED:
+                        diagnostic.emit("query", "read_failed", since=query_started,
+                                        error="read", reason="verify_his")
                         raise query_result.error or RuntimeError(
                             "會診 HIS 查詢失敗，未提供錯誤原因")
                     his_result = query_result
                     his_stage_done = True   # 這裡之後的失敗都不是 HIS 的問題
+                    diagnostic.emit("query", "ok", since=query_started)
+                    if (query_result.status is ConsultQueryStatus.ROSTER_UNKNOWN or
+                            not _may_update_baseline(query_result.roster_texts)):
+                        diagnostic.emit("parse", "roster_unknown", error="parse",
+                                        reason="verify_his")
+                    elif not query_result.roster_texts:
+                        diagnostic.emit("parse", "empty_roster")
                 else:
                     logging.info("沿用上一次 attempt 已查到的會診結果(HIS 不重查)")
                 extracted_text = his_result.extracted_text
@@ -7501,6 +7562,8 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                                     logging.warning(
                                         "[poll] 首輪清單未經回讀確認 → 這一輪不建"
                                         "基準也不留標記(下一輪重新比對)")
+                                    diagnostic.emit("done", "skipped", error="parse",
+                                                    reason="verify_his")
                                     _note_job_success()
                                     return
                                 if not _mark_baseline_established():
@@ -7515,9 +7578,13 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                                     logging.info(
                                         "[poll] 首次建立會診基準(%d 筆),本輪不寄信",
                                         len(_poll_sig))
+                                    diagnostic.emit("done", "empty_roster" if not roster_texts
+                                                    else "no_new")
                                     _note_job_success()
                                     return
                                 else:
+                                    diagnostic.emit("done", "failed", error="storage",
+                                                    reason="check_storage")
                                     _note_job_success()
                                     return
                             # ★[2026-08-04 外審 P1-05] 基準遺失/損毀不可以靜默吞掉★
@@ -7566,6 +7633,12 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                             # [codex] 「跑成功但沒有新會診」是【健康】的一輪,必須清零
                             # 連續失敗計數——否則零星失敗會被累加成假的「連續故障」,
                             # 恢復後也永遠清不掉,冷卻期一過又誤報一次。
+                            if _may_update_baseline(roster_texts):
+                                diagnostic.emit("done", "empty_roster" if not roster_texts
+                                                else "no_new")
+                            else:
+                                diagnostic.emit("done", "skipped", error="parse",
+                                                reason="verify_his")
                             _note_job_success()
                             return
                         logging.info("[poll] 偵測到 %d 筆新會診 → 寄出目前全部未回覆清單",
@@ -7613,24 +7686,39 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                 #   同一封信,而不是「再查一次、再組一封新的」。
                 #   病人截圖不落地、不夾帶；僅保留去識別後的信件內容。
                 if delivery is None:
-                    delivery = _seal_consult_delivery(
-                        recipients=tuple(recipients),
-                        subject=subject,
-                        text_body=final_body,
-                        html_body=final_html,
-                        privacy_identities=privacy_identities,
-                        message_id=_new_message_id(),
-                        business_key=_consult_business_key(
-                            roster_texts, recipients, subject),
-                        occurrence_keys=_consult_occurrence_keys(
-                            trigger_label, trigger_uids, _occ_new_ids),
-                    )
+                    redact_started = diagnostic.start()
+                    diagnostic.emit("redact", "started")
+                    try:
+                        delivery = _seal_consult_delivery(
+                            recipients=tuple(recipients),
+                            subject=subject,
+                            text_body=final_body,
+                            html_body=final_html,
+                            privacy_identities=privacy_identities,
+                            message_id=_new_message_id(),
+                            business_key=_consult_business_key(
+                                roster_texts, recipients, subject),
+                            occurrence_keys=_consult_occurrence_keys(
+                                trigger_label, trigger_uids, _occ_new_ids),
+                        )
+                    except Exception:
+                        diagnostic.emit("redact", "failed", since=redact_started,
+                                        error="privacy")
+                        raise
+                    diagnostic.emit("redact", "ok", since=redact_started)
                 if mail_method == "smtp":
                     # ★[2026-08-07 外審 AT/AW] 每一次寄送都進帳本★
                     #   begin 在【送出之前】——這樣即使送出當下斷電,重啟後看到的
                     #   是一筆 SUBMITTING(待查),而不是「什麼都沒發生」。
+                    prepare_started = diagnostic.start()
+                    diagnostic.emit("prepare", "started")
                     _did = _delivery_begin(delivery, trigger_label,
                                            claim_event=True)
+                    diagnostic.emit("prepare", "skipped" if _did == _CLAIM_TAKEN
+                                    else "ok" if _did else "failed",
+                                    since=prepare_started,
+                                    error="ledger" if not _did else "none",
+                                    reason="check_storage" if not _did else "none")
                     if _did == _CLAIM_TAKEN:
                         # ★同一事件已有 sender 在負責 → 這一輪不寄★
                         #   (外審 2026-08-18 P1-01)最典型的是自動更新
@@ -7680,6 +7768,8 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     #   現在還無害(帳本純寫入、沒有當閘門),但等 has_live_delivery
                     #   接上寄送決策,這些假 SUBMITTING 會永久擋住該筆會診。
                     #   ★不變式:begin 之後,每一條出口都必須 settle★
+                    send_started = diagnostic.start()
+                    diagnostic.emit("send", "started")
                     try:
                         _refused = send_via_smtp(
                             delivery.attachment, delivery.subject,
@@ -7697,11 +7787,15 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                             on_rcpt_result=_initial_rcpt_recorder(_did),
                             require_durable_rcpt=False)
                     except DeliveryOutcomeUnknown:
+                        diagnostic.emit("send", "pending", since=send_started,
+                                        error="timeout", reason="verify_delivery")
                         # 可能已送達 → 待查(留給 Message-ID 回查收斂)
                         _delivery_settle(_did, unknown=True)
                         _did = ""              # 已結案,終局分支不要再 settle 一次
                         raise
                     except Exception:
+                        diagnostic.emit("send", "failed", since=send_started,
+                                        error="transport")
                         # 確定沒送出去(連不上/認證/5xx/未設定)→ FAILED,不是待查。
                         # 若哪天 SMTP 層把「DATA 之後斷線」也改判成結果不明,
                         # 它會走上面那條,不會被誤記成 FAILED。
@@ -7715,6 +7809,12 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     #   已知的事實要先寫下來,不能被後面的不確定性吃掉。
                     _origin_did = _did
                     _delivery_settle(_did, refused=_refused)
+                    diagnostic.emit("send", "refused" if _refused else "accepted",
+                                    since=send_started,
+                                    error="refusal" if _refused else
+                                    "ledger" if not _origin_did else "none",
+                                    reason="fix_recipient" if _refused else
+                                    "check_storage" if not _origin_did else "none")
                     _did = ""
                     # ★[2026-08-08 外審第 10 輪 P1-01] 暫時性拒收要真的補寄★
                     #   舊寫法把 refused 記進帳本就繼續往下走:更新已通知基準、
@@ -7735,11 +7835,23 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                         _schedule_refusal_retry(delivery, _refused,
                                                 trigger_label, _origin_did)
                 else:
-                    send_via_outlook(delivery.attachment, delivery.subject,
-                                     delivery.text_body,
-                                     list(delivery.recipients),
-                                     sender_account=sender,
-                                     html_body=delivery.html_body)
+                    send_started = diagnostic.start()
+                    diagnostic.emit("send", "started")
+                    try:
+                        send_via_outlook(delivery.attachment, delivery.subject,
+                                         delivery.text_body,
+                                         list(delivery.recipients),
+                                         sender_account=sender,
+                                         html_body=delivery.html_body)
+                    except DeliveryOutcomeUnknown:
+                        diagnostic.emit("send", "pending", since=send_started,
+                                        error="transport", reason="verify_delivery")
+                        raise
+                    except Exception:
+                        diagnostic.emit("send", "failed", since=send_started,
+                                        error="transport")
+                        raise
+                    diagnostic.emit("send", "accepted", since=send_started)
                 # [2026-06-25] 寄出成功 → 更新「已通知病歷號」基準,下一輪 poll 不再重複寄同一批。
                 # 【只在寄給一般收件人時更新】(poll / 手動):email 觸發是寄給「觸發醫師本人」、
                 # 不是團隊一般名單,若也更新基準會害下一輪 poll 看不到這筆新會診而漏寄給團隊
@@ -7913,6 +8025,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     #   帳密,而且把失敗通知再寄一遍。我上一版正是這樣。
                     break
     finally:
+        _CURRENT_DIAGNOSTIC_RUN.reset(diagnostic_token)
         if com_initialized:            # 只有 CoInitialize 真的成功過才配對 Uninitialize
             try:
                 pythoncom.CoUninitialize()
@@ -10396,6 +10509,8 @@ class ConfigApp(tk.Tk):
         except Exception:
             logging.debug("Tk callback exception hook 失敗", exc_info=True)
         self.cfg = load_config()
+        self._summary_queue = queue.Queue(maxsize=1)
+        self._summary_busy = False
         try:
             from cmuh_common.window_icon import apply_tk_window_icon
             apply_tk_window_icon(self)
@@ -10403,6 +10518,7 @@ class ConfigApp(tk.Tk):
             pass
         self._build_ui()
         self.after(150, self._poll_log)
+        self.after(500, self._refresh_runtime_summary)
 
     def _build_ui(self) -> None:
         pad = {"padx": 6, "pady": 4}
@@ -10520,6 +10636,14 @@ class ConfigApp(tk.Tk):
                    command=self._test_run).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="關閉", command=self.destroy).pack(side=tk.RIGHT)
 
+        summary_frame = ttk.LabelFrame(root, text="執行摘要（唯讀）", padding=6)
+        summary_frame.pack(fill=tk.X, pady=(5, 0))
+        self.runtime_summary_var = tk.StringVar(value="正在讀取本機紀錄…")
+        ttk.Label(summary_frame, textvariable=self.runtime_summary_var,
+                  justify="left", wraplength=700).pack(anchor="w")
+        ttk.Button(summary_frame, text="匯出安全診斷摘要…",
+                   command=self._export_runtime_summary).pack(anchor="e")
+
         logf = ttk.LabelFrame(root, text="執行紀錄", padding=4)
         logf.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
         self.log_text = scrolledtext.ScrolledText(
@@ -10610,6 +10734,61 @@ class ConfigApp(tk.Tk):
         except Exception:  # noqa: BLE001  幫浦壞掉也不可以殺掉重排
             logging.debug("[UI] log 幫浦失敗", exc_info=True)
         self.after(150, self._poll_log)
+
+    def _refresh_runtime_summary(self) -> None:
+        try:
+            while True:
+                self.runtime_summary_var.set(self._summary_queue.get_nowait())
+        except queue.Empty:
+            pass
+        if not self._summary_busy:
+            self._summary_busy = True
+
+            def read_only_worker() -> None:
+                try:
+                    from cmuh_common.delivery_ledger import DB_FILENAME
+                    value = consult_summary(
+                        DIAGNOSTICS.read(),
+                        read_consult_delivery(SETTINGS_DIR / DB_FILENAME))
+                except Exception:
+                    value = "摘要暫時無法讀取；請稍後重試。"
+                try:
+                    if self._summary_queue.full():
+                        self._summary_queue.get_nowait()
+                    self._summary_queue.put_nowait(value)
+                except (OSError, ValueError, queue.Empty, queue.Full):
+                    pass
+                finally:
+                    self._summary_busy = False
+
+            threading.Thread(target=read_only_worker,
+                             name="ConsultSummaryReader", daemon=True).start()
+        self.after(3000, self._refresh_runtime_summary)
+
+    def _export_runtime_summary(self) -> None:
+        """Export only code-only diagnostics via the existing safe exporter."""
+        from tkinter import filedialog
+        from cmuh_common.debug_privacy import build_safe_diag_bundle
+
+        dest = filedialog.asksaveasfilename(
+            parent=self, title="儲存安全診斷摘要", defaultextension=".zip",
+            filetypes=[("Zip", "*.zip")],
+            initialfile=f"consult_diag_{datetime.now():%Y%m%d_%H%M%S}.zip")
+        if not dest:
+            return
+        try:
+            from tempfile import TemporaryDirectory
+            with TemporaryDirectory(prefix="cmuh_consult_diag_") as temp_dir:
+                meta = Path(temp_dir)
+                (meta / "runtime_diagnostics.txt").write_text(
+                    render_safe_events(DIAGNOSTICS.read()), encoding="utf-8")
+                added, note = build_safe_diag_bundle(dest, meta_dir=str(meta))
+        except OSError:
+            added, note = 0, "安全診斷摘要建立失敗"
+        if added:
+            messagebox.showinfo("安全診斷摘要", f"{note}\n已存到：{dest}")
+        else:
+            messagebox.showwarning("安全診斷摘要", note)
 
 
 # =============================================================================

@@ -33,6 +33,7 @@ ensure_dependencies(REQUIRED_LIBS, bootstrap=True)
 
 # === 主要 import ===
 import ctypes  # noqa: E402
+import contextvars  # noqa: E402
 import logging  # noqa: E402
 import queue  # noqa: E402
 import random  # noqa: E402
@@ -59,6 +60,12 @@ from clock.action_state import (  # noqa: E402
 from clock.portal_port import ClockPortalPort  # noqa: E402
 from cmuh_common.atomic_io import (  # noqa: E402
     atomic_write_json, safe_load_json, safe_load_json_ex,
+)
+from cmuh_common.runtime_diagnostics import (  # noqa: E402
+    DiagnosticRun, DiagnosticStore, render_safe_events,
+)
+from cmuh_common.runtime_summary import (  # noqa: E402
+    clock_summary, read_clock_state,
 )
 from cmuh_common.logging_setup import (  # noqa: E402
     attach_queue_handler,
@@ -129,6 +136,9 @@ except Exception:
 
 CONFIG_FILE = SETTINGS_DIR / "autoclock_config.json"
 LOG_FILE = SETTINGS_DIR / "autoclock.log"
+DIAGNOSTICS = DiagnosticStore(SETTINGS_DIR / "autoclock_diagnostics.sqlite3", "clock")
+_CURRENT_CLOCK_DIAGNOSTIC_RUN = contextvars.ContextVar(
+    "clock_diagnostic_run", default=None)
 ICON_FILE = BASE_DIR / "assets" / "AutoClockIcon.png"
 if not ICON_FILE.exists():  # 兼容舊路徑
     legacy = BASE_DIR / "AutoClockIcon.png"
@@ -865,7 +875,19 @@ def login(driver, wait, username: str, password: str) -> None:
     max_retries = 5
     for attempt in range(max_retries):
         try:
-            driver.get(LOGIN_URL)
+            diagnostic = _CURRENT_CLOCK_DIAGNOSTIC_RUN.get()
+            website_started = diagnostic.start() if diagnostic else None
+            if diagnostic:
+                diagnostic.emit("website", "started")
+            try:
+                driver.get(LOGIN_URL)
+            except Exception:
+                if diagnostic:
+                    diagnostic.emit("website", "failed", since=website_started,
+                                    error="portal", reason="check_portal")
+                raise
+            if diagnostic:
+                diagnostic.emit("website", "ok", since=website_started)
 
             user_elem = wait.until(EC.visibility_of_element_located(get_loc("username")))
             user_elem.clear()
@@ -1427,7 +1449,8 @@ class _SeleniumClockPortal:
 def perform_clock_action(driver, wait, acc, is_in: bool,
                         check_start: dt_time, check_end: dt_time,
                         dry_run: bool = False, task_label: str = "",
-                        portal: ClockPortalPort | None = None) -> None:
+                        portal: ClockPortalPort | None = None,
+                        diagnostic_run: DiagnosticRun | None = None) -> None:
     """★整段包在跨行程宣告裡★(外審 R3-P2-04 R2 P1)。
 
     「先查刷卡表、沒紀錄才打」是 check-then-act:查完到點下去之間還有 1~5 秒
@@ -1441,7 +1464,7 @@ def perform_clock_action(driver, wait, acc, is_in: bool,
     if dry_run:
         return _perform_clock_action_locked(
             driver, wait, acc, is_in, check_start, check_end, dry_run,
-            task_label, portal=portal)
+            task_label, portal=portal, diagnostic_run=diagnostic_run)
     key = (f"autoclock|{acc.get('username', '?')}|{'in' if is_in else 'out'}"
            f"|{check_start}-{check_end}|{_clock_today().isoformat()}")
     with exclusive_claim(key) as owned:
@@ -1453,14 +1476,16 @@ def perform_clock_action(driver, wait, acc, is_in: bool,
             return
         return _perform_clock_action_locked(
             driver, wait, acc, is_in, check_start, check_end, dry_run,
-            task_label, portal=portal)
+            task_label, portal=portal, diagnostic_run=diagnostic_run)
 
 
 def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                                  check_start: dt_time, check_end: dt_time,
                                  dry_run: bool = False,
                                  task_label: str = "",
-                                 portal: ClockPortalPort | None = None) -> None:
+                                 portal: ClockPortalPort | None = None,
+                                 diagnostic_run: DiagnosticRun | None = None) -> None:
+    diag = diagnostic_run or DiagnosticRun(DIAGNOSTICS)
     pending_key = task_label or (
         f"manual:{'in' if is_in else 'out'}:{check_start}-{check_end}")
     portal = portal if portal is not None else _SeleniumClockPortal()
@@ -1471,9 +1496,20 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
     retries = 5
     last_exc = None
     for attempt in range(retries):
+        phase = "login"
         try:
-            portal.login(driver, wait, acc["username"], acc["password"])
+            started = diag.start()
+            diag.emit("login", "started")
+            diagnostic_token = _CURRENT_CLOCK_DIAGNOSTIC_RUN.set(diag)
+            try:
+                portal.login(driver, wait, acc["username"], acc["password"])
+            finally:
+                _CURRENT_CLOCK_DIAGNOSTIC_RUN.reset(diagnostic_token)
+            diag.emit("login", "ok", since=started)
 
+            phase = "read"
+            started = diag.start()
+            diag.emit("read", "started")
             _sys_date, swipes, _last, swipes_read_ok = portal.read_swipes(
                 driver, wait, get_loc)
             act_name = "上班" if is_in else "下班"
@@ -1487,6 +1523,11 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                 click_pending=_is_clock_click_pending(
                     pending_key, acc["username"]),
             )
+            diag.emit("read", observation.value, since=started,
+                      error="read" if observation is ClockActionState.READ_UNKNOWN
+                      else "none",
+                      reason="check_portal" if observation is ClockActionState.READ_UNKNOWN
+                      else "none")
 
             # [W4 2026-07-03] 讀刷卡表失敗 → 無法判斷是否已打卡 → 絕不打卡(避免重複打卡),
             # 拋出交給重試/下一分鐘 re-fire 重讀。dry_run 例外(僅驗流程)。
@@ -1500,10 +1541,12 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                     acc["username"], check_start, check_end, act_name)
                 # [fix] 已有紀錄=本窗確認完成 → 標記，後續 re-fire 直接略過不再登入
                 _mark_clock_done(task_label, acc["username"])
+                diag.emit("done", "official_confirmed")
                 if pending_key != task_label:
                     _clear_clock_click_pending(pending_key, acc["username"])
                 return
             if not dry_run and observation is ClockActionState.CLICK_PENDING:
+                diag.emit("done", "click_pending", reason="verify_clock")
                 logging.warning(
                     "%s 本窗已送出打卡但官方紀錄仍未確認；本次只回讀、不重複點擊。"
                     "請確認電子刷卡系統，必要時人工處理。", acc["username"])
@@ -1513,6 +1556,7 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                     "%s 區間 %s-%s 無有效紀錄，準備執行打卡 (目前紀錄: %s)",
                     acc["username"], check_start, check_end, swipes)
 
+            phase = "prepare"
             delay = random.randint(1, 5)
             logging.info("%s 準備打卡，隨機延遲 %s 秒...", acc["username"], delay)
             time_module.sleep(delay)
@@ -1526,6 +1570,7 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
             exec_btn = portal.execute_button(wait, get_loc("execute_button"))
 
             if dry_run:
+                diag.emit("done", "dry_run")
                 portal.highlight(driver, exec_btn)
                 logging.info("[測試模式] %s %s 流程驗證成功！(未點擊執行)", acc["username"], act_name)
                 messagebox.showinfo(
@@ -1549,24 +1594,37 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
             # 點擊可能已送達但回應遺失；先持久記錄，再送出一次。
             # 若狀態檔寫不下去，重啟後無法防重，故這次不點。
             if not _mark_clock_click_pending(pending_key, acc["username"]):
+                diag.emit("submit", "failed", error="storage",
+                          reason="check_storage")
                 logging.error("%s 無法保存待確認打卡狀態，本次不點擊；請人工確認",
                               acc["username"])
                 return
+            started = diag.start()
+            diag.emit("submit", "started")
+            phase = "submit"
             portal.submit(driver, exec_btn)
             portal.accept_alert(driver)
+            diag.emit("submit", "click_pending", since=started,
+                      reason="verify_clock")
 
             # [W3 2026-07-03] 不再「點擊即標記完成」——那會在點擊後 portal/網路失敗時
             # 造成假成功(本窗 re-fire 全跳過→漏打卡)。改為重讀刷卡表確認新紀錄真的
             # 寫入才標記。確認不到就不標記(記警告),交下一分鐘 re-fire 重讀:紀錄真在
             # 會走 has_record 路徑補標記;真沒進去則重打。任何情況都不會重複打卡。
+            started = diag.start()
+            diag.emit("confirm", "started")
+            phase = "confirm"
             if portal.verify(driver, get_loc, act_name,
                              check_start, check_end, acc["username"]):
+                diag.emit("confirm", "official_confirmed", since=started)
                 logging.info("%s %s 打卡成功(已重讀刷卡表確認紀錄)！",
                              acc["username"], act_name)
                 _mark_clock_done(task_label, acc["username"])
                 if pending_key != task_label:
                     _clear_clock_click_pending(pending_key, acc["username"])
             else:
+                diag.emit("confirm", "click_pending", since=started,
+                          reason="verify_clock")
                 logging.warning(
                     "%s %s 打卡已送出,但重讀刷卡表未能確認到紀錄 — 不標記完成,"
                     "下次 re-fire 只會重讀，不會重複點擊；必要時人工處理。",
@@ -1574,6 +1632,8 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
             return
 
         except ClockAuthError as e:
+            diag.emit("login", "auth_failed", error="auth",
+                      reason="fix_credentials")
             # [AC-09] 帳密錯誤:當窗不再重試,單次醒目通知(避免反覆登入 + 帳號鎖定風險)。
             logging.error("%s 帳號/密碼錯誤,當窗不再重試: %s", acc.get("username", "?"), e)
             if dry_run:
@@ -1587,6 +1647,15 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                                       task_label, e, dry_run)
             return
         except (StaleElementReferenceException, WebDriverException) as e:
+            if phase == "read":
+                diag.emit("read", "read_unknown", error="read",
+                          reason="check_portal")
+            elif phase in ("submit", "confirm"):
+                diag.emit("confirm", "click_pending", error="portal",
+                          reason="verify_clock")
+            else:
+                diag.emit("done", "failed", error="portal",
+                          reason="check_portal")
             last_exc = e
             logging.warning(
                 "%s 操作遇到 %s，重試中 (%s/%s)...",
@@ -1596,6 +1665,15 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
             else:
                 logging.error("%s WebDriver 錯誤，重試用盡: %s", acc.get("username", "?"), e)
         except Exception as e:
+            if phase == "read":
+                diag.emit("read", "read_unknown", error="read",
+                          reason="check_portal")
+            elif phase in ("submit", "confirm"):
+                diag.emit("confirm", "click_pending", error="portal",
+                          reason="verify_clock")
+            else:
+                diag.emit("done", "failed", error="unknown",
+                          reason="check_portal")
             last_exc = e
             logging.error("%s 操作失敗: %s", acc.get("username", "?"), e)
             if dry_run:
@@ -1692,7 +1770,18 @@ def process_clock_task(schedule_key: str | None) -> None:
             schedule_key, check_start, check_end, len(accs))
 
         # [autoclock 常駐 Chrome] 不再每次任務開新 driver；用常駐池
-        driver = _get_or_create_clock_driver()
+        diag = DiagnosticRun(DIAGNOSTICS)
+        started = diag.start()
+        diag.emit("browser", "started")
+        try:
+            driver = _get_or_create_clock_driver()
+        except Exception:
+            diag.emit("browser", "failed", since=started,
+                      error="portal", reason="check_portal")
+            raise
+        diag.emit("browser", "ok" if driver else "failed", since=started,
+                  error="none" if driver else "portal",
+                  reason="none" if driver else "check_portal")
         if not driver:
             notify_clock_failure(
                 "瀏覽器啟動失敗",
@@ -1741,6 +1830,7 @@ def process_clock_task(schedule_key: str | None) -> None:
                 perform_clock_action(
                     driver, wait, acc, is_in, check_start, check_end,
                     dry_run=False, task_label=schedule_key,
+                    diagnostic_run=diag,
                 )
                 # 每處理完一個帳號就刷新 last_used，讓任務結束後 idle 倒數從「最後一個
                 # 帳號完成」起算（in_use 旗標負責任務進行中的保護，此處負責任務後計時）。
@@ -2103,10 +2193,13 @@ class ClockApp(tk.Tk):
         except Exception:
             logging.debug("Tk callback exception hook 失敗", exc_info=True)
         self.accounts = loaded_data
+        self._summary_queue = queue.Queue(maxsize=1)
+        self._summary_busy = False
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.setup_styles()
         self.setup_ui()
         self.after(100, self.poll_log_queue)
+        self.after(500, self._refresh_runtime_summary)
 
     def setup_styles(self):
         style = ttk.Style(self)
@@ -2187,6 +2280,11 @@ class ClockApp(tk.Tk):
         ttk.Button(btn_frame, text="儲存並重啟(背景)", command=self.save_and_bg,
                    style="Action.TButton").pack(side=tk.RIGHT)
         self._build_debug_privacy_panel(right_panel)
+        summary_frame = ttk.LabelFrame(right_panel, text="執行摘要（唯讀）", padding="5")
+        summary_frame.pack(fill=tk.X, pady=(6, 0))
+        self.runtime_summary_var = tk.StringVar(value="正在讀取本機紀錄…")
+        ttk.Label(summary_frame, textvariable=self.runtime_summary_var,
+                  justify="left", wraplength=600).pack(anchor="w")
         log_frame = ttk.LabelFrame(main_container, text="執行紀錄 (Live Log)", padding="5")
         log_frame.pack(fill=tk.BOTH, expand=True)
         self.log_text = scrolledtext.ScrolledText(
@@ -2264,6 +2362,14 @@ class ClockApp(tk.Tk):
             initialfile=f"autoclock_diag_{datetime.now():%Y%m%d_%H%M%S}.zip")
         if not dest:
             return
+        # Only enumerated codes/durations are written; the existing exporter
+        # continues to sanitize logs and exclude screenshots/page source.
+        try:
+            DEBUG_DUMPS_DIR.mkdir(parents=True, exist_ok=True)
+            (DEBUG_DUMPS_DIR / "runtime_diagnostics.txt").write_text(
+                render_safe_events(DIAGNOSTICS.read()), encoding="utf-8")
+        except OSError:
+            logging.debug("寫入安全執行診斷摘要失敗", exc_info=True)
         secrets = [str(a.get("username", "")) for a in (self.accounts or [])
                    if isinstance(a, dict)]
         added, note = build_safe_diag_bundle(
@@ -2290,6 +2396,34 @@ class ClockApp(tk.Tk):
         except Exception:  # noqa: BLE001  幫浦壞掉也不可以殺掉重排
             logging.debug("[UI] log 幫浦失敗", exc_info=True)
         self.after(100, self.poll_log_queue)
+
+    def _refresh_runtime_summary(self) -> None:
+        try:
+            while True:
+                self.runtime_summary_var.set(self._summary_queue.get_nowait())
+        except queue.Empty:
+            pass
+        if not self._summary_busy:
+            self._summary_busy = True
+
+            def read_only_worker() -> None:
+                try:
+                    value = clock_summary(
+                        DIAGNOSTICS.read(), read_clock_state(CLOCK_STATE_FILE))
+                except Exception:
+                    value = "摘要暫時無法讀取；請稍後重試。"
+                try:
+                    if self._summary_queue.full():
+                        self._summary_queue.get_nowait()
+                    self._summary_queue.put_nowait(value)
+                except (OSError, ValueError, queue.Empty, queue.Full):
+                    pass
+                finally:
+                    self._summary_busy = False
+
+            threading.Thread(target=read_only_worker,
+                             name="ClockSummaryReader", daemon=True).start()
+        self.after(3000, self._refresh_runtime_summary)
 
     def populate_listbox(self):
         self.listbox.delete(0, tk.END)

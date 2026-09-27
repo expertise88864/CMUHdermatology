@@ -6,6 +6,7 @@ import pytest
 
 import autoclock as clock
 from clock.action_state import ClockActionState, classify_clock_observation
+from cmuh_common.runtime_diagnostics import DiagnosticStore
 
 
 @pytest.mark.parametrize(
@@ -64,6 +65,8 @@ class _FakePortal:
 
 def test_fake_portal_persists_uncertain_click_then_confirms_without_resubmit(
         monkeypatch, tmp_path):
+    diagnostics = DiagnosticStore(tmp_path / "clock_diag.sqlite3", "clock")
+    monkeypatch.setattr(clock, "DIAGNOSTICS", diagnostics)
     def forbidden(*_args):
         raise AssertionError("real portal called")
 
@@ -99,9 +102,16 @@ def test_fake_portal_persists_uncertain_click_then_confirms_without_resubmit(
     assert portal.submits == 1
     assert clock._is_clock_done("am_in", "synthetic")
     assert not clock._is_clock_click_pending("am_in", "synthetic")
+    outcomes = [e["outcome"] for e in diagnostics.read()]
+    assert "no_record" in outcomes
+    assert "click_pending" in outcomes
+    assert "official_confirmed" in outcomes
+    assert b"synthetic" not in diagnostics.path.read_bytes()
 
 
-def test_unreadable_fake_portal_never_submits_or_marks_done(monkeypatch):
+def test_unreadable_fake_portal_never_submits_or_marks_done(monkeypatch, tmp_path):
+    diagnostics = DiagnosticStore(tmp_path / "clock_diag.sqlite3", "clock")
+    monkeypatch.setattr(clock, "DIAGNOSTICS", diagnostics)
     portal = _FakePortal()
     portal.read_swipes = lambda *_args: (None, [], None, False)
     failures = []
@@ -121,3 +131,31 @@ def test_unreadable_fake_portal_never_submits_or_marks_done(monkeypatch):
     assert not clock._is_clock_done("am_in", "synthetic")
     assert not clock._is_clock_click_pending("am_in", "synthetic")
     assert failures == [True]
+    assert diagnostics.read()[0]["outcome"] == "read_unknown"
+
+
+def test_fake_website_load_failure_has_bounded_private_free_timing(
+        monkeypatch, tmp_path):
+    from cmuh_common.runtime_diagnostics import DiagnosticRun
+    diagnostics = DiagnosticStore(tmp_path / "clock_diag.sqlite3", "clock")
+    run = DiagnosticRun(diagnostics)
+    token = clock._CURRENT_CLOCK_DIAGNOSTIC_RUN.set(run)
+
+    class FakeDriver:
+        def get(self, _url):
+            raise clock.WebDriverException("private password 9876543210")
+
+        def refresh(self):
+            pass
+
+    monkeypatch.setattr(clock, "exponential_backoff_sleep",
+                        lambda *_a, **_k: None)
+    try:
+        with pytest.raises(RuntimeError):
+            clock.login(FakeDriver(), None, "synthetic", "private password")
+    finally:
+        clock._CURRENT_CLOCK_DIAGNOSTIC_RUN.reset(token)
+    events = diagnostics.read()
+    assert len([e for e in events if e["stage"] == "website"
+                and e["outcome"] == "failed"]) == 5
+    assert b"private password" not in diagnostics.path.read_bytes()
