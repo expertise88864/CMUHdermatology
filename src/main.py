@@ -9816,13 +9816,15 @@ class AutomationApp:
             thread_name_prefix="AppBgTask",
             reject_message="main background task backlog is full",
         )
-        # [2026-06-16 韌性] 鎖使用守則(避免 ABBA 死鎖):這些 app 狀態鎖各自保護一份
-        # 資料,「原則上一次只持有一把、且只圈住純記憶體操作、不在持鎖時做網路/磁碟
-        # /子行程 I/O」。若真的需要巢狀,固定以下取得順序(由外而內):
-        #   _subsystem_lock → _tracker_lock → _doctor_data_lock
-        #   → _clinic_dynamic_state_lock → _history_lock → _alert_state_lock
-        # 跨物件鎖(模組級)如 status_driver_pool 的 init_lock→lock 為獨立子系統,不與
-        # 上列交叉持有。門診刷新生命週期的私有鎖只圈住內部狀態，不與其他鎖巢狀。
+        # [2026-06-16 韌性] 鎖使用守則(避免 ABBA 死鎖):原則上一次只持有一把鎖，
+        # 且不在持鎖時做網路/磁碟/子行程 I/O。需要巢狀時，固定由外而內取得：
+        #   _refresh_lifecycle._lock → _subsystem_lock → _tracker_lock
+        #   → _doctor_data_lock → _clinic_dynamic_state_lock → _history_lock
+        #   → _alert_state_lock
+        # 門診資料寫入會在生命週期鎖內取得 _doctor_data_lock 和 _alert_state_lock；
+        # 因此持有後兩者時不得呼叫生命週期方法。submit_if_current 所收的函式
+        # 在生命週期鎖內執行，只能做短暫的本機提交，不得阻塞或回呼生命週期。
+        # status_driver_pool 的 init_lock→lock 為獨立子系統，不與上列交叉持有。
         self._tracker_lock = threading.Lock()
         self._history_lock = threading.Lock()
         self._doctor_data_lock = threading.Lock()

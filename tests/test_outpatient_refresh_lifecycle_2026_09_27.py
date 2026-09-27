@@ -119,6 +119,25 @@ def test_same_request_after_worker_completion_is_not_silently_dropped():
     assert second.request.signature == first.request.signature
 
 
+def test_completed_run_cannot_be_taken_over_before_ui_acknowledges_it():
+    lifecycle, clock = _lifecycle()
+    first = lifecycle.request(False, [_doctor("A")]).run
+    assert first is not None
+    lifecycle.take_start()
+    assert lifecycle.mark_finished(first.generation)
+
+    clock[0] += 901
+    decision = lifecycle.request(True, [_doctor("B")])
+    assert decision.kind == "queued"
+    assert lifecycle.generation == first.generation
+    assert lifecycle.accepts_message(first.generation)
+
+    completion = lifecycle.finish_on_ui()
+    assert completion is not None and completion.run == first
+    assert completion.next_run is not None
+    assert completion.next_run.request.doctors == (_doctor("B"),)
+
+
 def test_takeover_subtracts_overlap_from_merged_partial_queue():
     lifecycle, clock = _lifecycle()
     old = lifecycle.request(False, [_doctor("A")]).run

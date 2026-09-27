@@ -182,6 +182,36 @@ def test_old_worker_finishing_after_takeover_cannot_overwrite_or_clear_new_run(m
     assert app.refresh_button.state == "normal"
 
 
+def test_taken_over_worker_does_not_fetch_remaining_doctor_batch(monkeypatch):
+    app, clock = _app(monkeypatch)
+    monkeypatch.setattr(main, "partition_doctors_for_refresh_batches",
+                        lambda doctors: [[doctor] for doctor in doctors])
+    entered = threading.Event()
+    release = threading.Event()
+    fetched = []
+
+    def source(_queue, config):
+        fetched.append(config["name"])
+        if config["name"] == "OLD-A":
+            entered.set()
+            assert release.wait(5)
+
+    app._appointment_fetcher = source
+    app._trigger_refresh(False, [_doctor("OLD-A"), _doctor("OLD-B")])
+    old_worker = app.bg_executor.run(0)
+    try:
+        assert entered.wait(5)
+        clock[0] += 901
+        app._trigger_refresh(True, [_doctor("NEW")])
+        assert app._refresh_lifecycle.generation == 2
+    finally:
+        release.set()
+        old_worker.join(timeout=5)
+
+    assert not old_worker.is_alive()
+    assert fetched == ["OLD-A"]
+
+
 def test_takeover_after_message_check_cannot_write_old_clinic_data(monkeypatch):
     app, clock = _app(monkeypatch)
     app._trigger_refresh(False, [_doctor("OLD")])
