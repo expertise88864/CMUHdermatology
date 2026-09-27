@@ -89,6 +89,8 @@ REASONS = {
     "f12_after_write": "F12 在處置寫入後、回讀前中止,寫入結果不明",
     "f12_during_readback": "F12 在處置回讀期間中止,寫入結果不明",
     "f12_after_readback": "F12 在處置回讀後、驗證前中止,寫入結果不明",
+    "patient_or_target_unverified": "純 Excimer 原病人或處置目標無法確認,身份結果未核實",
+    "f12_after_identity_write": "F12 在身份寫入後中止,身份結果未核實",
     # [2026-08-01 外部 review P1-03] F11 療程欄讀不到／讀到不像療程值的東西。
     # ★這是「疑似定位漂移」最早的訊號★ —— 臨床行為不變（照舊按全部完成），
     # 但要留下紀錄與通知。原值一律不記，只帶 length。

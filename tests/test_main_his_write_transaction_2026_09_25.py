@@ -799,6 +799,13 @@ def test_excimer_readback_empty_keeps_billing_policy_but_warns(
     assert any("無法驗證" in title + msg for title, msg in fake_his)
 
 
+def test_excimer_early_warning_does_not_promise_identity_before_patient_check():
+    note = main._excimer_identity_note("F2")
+    assert "確認仍為原病人與原處置欄後" in note
+    assert "才會嘗試設定自費身份 01" in note
+    assert "身份仍依原規則設為" not in note
+
+
 @pytest.mark.parametrize("hotkey", ["F2", "F3"])
 def test_excimer_unverified_status_still_sets_identity_but_not_completed(
         monkeypatch, fake_his, confirmed_excimer_patient, hotkey):
@@ -929,6 +936,8 @@ def test_excimer_identity_guard_blocks_write_and_does_not_log_chart(
                for _, msg in fake_his)
     assert audit[-1]["outcome"] == main._LEDGER_SKIPPED
     assert audit[-1]["detail"].code == "patient_or_target_unverified"
+    assert audit[-1]["detail"].to_payload() == {
+        "t": "reason", "code": "patient_or_target_unverified"}
     assert "12345678" not in caplog.text
 
 
@@ -1009,6 +1018,8 @@ def test_excimer_f12_after_identity_write_warns_and_audits_uncertainty(
     assert state["value"] == "01"
     assert audit[-1]["outcome"] == main._LEDGER_SUBMITTED
     assert audit[-1]["detail"].code == "f12_after_identity_write"
+    assert audit[-1]["detail"].to_payload() == {
+        "t": "reason", "code": "f12_after_identity_write"}
     assert any("可能已生效" in msg for _, msg in fake_his)
 
 
@@ -1095,6 +1106,57 @@ def test_excimer_switch_during_disposition_lookup_blocks_dose_and_identity(
     assert getattr(main, f"script_{hotkey}_adaptive")() is False
     assert port.writes == []
     assert any("未更新劑量" in msg for _, msg in fake_his)
+
+
+def test_excimer_memo_edit_during_patient_scan_is_not_overwritten(
+        monkeypatch, fake_his):
+    class EditDuringSecondLocate(FakeMemoPort):
+        def __init__(self, text):
+            super().__init__(text)
+            self.locates = 0
+
+        def locate_phototherapy(self, main_hwnd):
+            self.locates += 1
+            if self.locates == 2:
+                self.text += "\nAnother synthetic HIS edit"
+            return super().locate_phototherapy(main_hwnd)
+
+    original = _memo(kind="Excimer")
+    port = EditDuringSecondLocate(original)
+    port.kind = "pure_excimer"
+    anchor = main._excimer_identity_anchor(10, 20)
+    result = SimpleNamespace(
+        new_text=original.replace("800 mj", "850 mj"),
+        new_dose=850, new_count=36, decrease_note="")
+    assert main._write_excimer_memo_checked(
+        10, 20, original, result, "F2", memo_port=port,
+        identity_anchor=anchor) is None
+    assert port.writes == []
+    assert "Another synthetic HIS edit" in port.text
+    assert any("未送出處置寫入" in msg for _, msg in fake_his)
+
+
+def test_excimer_f12_during_initial_patient_scan_stops_before_disposition(
+        monkeypatch, fake_his):
+    port = FakeMemoPort(_memo(kind="Excimer"))
+    port.kind = "pure_excimer"
+    state = {"cancelled": False}
+
+    def sample(_hwnd):
+        state["cancelled"] = True
+        return None
+
+    def check_stop():
+        if state["cancelled"]:
+            raise main.SubsystemInterrupted("F12")
+
+    monkeypatch.setattr(main, "_sample_patient_locator", sample)
+    monkeypatch.setattr(main, "check_stop", check_stop)
+    monkeypatch.setattr(port, "locate_phototherapy",
+                        lambda _hwnd: pytest.fail("F12 must stop before lookup"))
+    with pytest.raises(main.SubsystemInterrupted):
+        main._update_uvb_dose_core("F2", strict=True, memo_port=port)
+    assert port.writes == []
 
 
 @pytest.mark.parametrize("hotkey", ["F2", "F3"])
