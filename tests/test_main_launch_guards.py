@@ -283,7 +283,7 @@ def test_f2_f3_pure_excimer_still_set_identity_01():
     for name in ("script_F2_adaptive", "script_F3_adaptive"):
         func = _function_node(source_path, name)
         assert "_set_身份_自費" in _called_names(func)
-        assert '_set_身份_自費("01"' in _function_source(source_path, name)
+        assert f'"01", label="{name[7:9]}",' in _function_source(source_path, name)
 
 
 def test_f1_pure_excimer_code_filled_1850159():

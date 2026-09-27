@@ -25,6 +25,9 @@ def _worker(root: Path) -> None:
     main._show_uvb_warning = lambda *_args, **_kwargs: None
     main._record_his_action = lambda *_args, **_kwargs: None
     main._record_uvb_write = lambda *_args, **_kwargs: None
+    # The new patient guard reads a banner before disposition lookup. Keep this
+    # anonymous fake constant; real Win32 banner scanning is outside this bench.
+    main._sample_patient_locator = lambda _hwnd: {"chart_no": "12345678"}
     main._autofill_卡號_from_醫師上次 = lambda **_kwargs: None
     main._script_code_input_adaptive = lambda *_args, **_kwargs: True
 
@@ -76,7 +79,7 @@ def _worker(root: Path) -> None:
     for _ in sys.stdin:
         stages.clear()
         port = FakePort()
-        main._f23_update_uvb_dose = lambda label="F2", active_port=port: (
+        main._f23_update_uvb_dose = lambda label="F2", active_port=port, **_kwargs: (
             main._update_uvb_dose_core(label, strict=True, memo_port=active_port))
         start = time.perf_counter_ns()
         ok = main.script_F2_adaptive()

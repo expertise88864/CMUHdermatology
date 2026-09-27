@@ -105,13 +105,13 @@ def _check_stop_before(src, needle, window=12):
 
 def test_u4_identity_write_has_stop_gate_f2():
     src = _main_src()
-    assert _check_stop_before(src, '_set_身份_自費("01", label="F2")'), \
+    assert _check_stop_before(src, '"01", label="F2",'), \
         "script_F2 寫身份前缺 check_stop 閘門(U4)"
 
 
 def test_u4_identity_write_has_stop_gate_f3():
     src = _main_src()
-    assert _check_stop_before(src, '_set_身份_自費("01", label="F3")'), \
+    assert _check_stop_before(src, '"01", label="F3",'), \
         "script_F3 寫身份前缺 check_stop 閘門(U4)"
 
 
