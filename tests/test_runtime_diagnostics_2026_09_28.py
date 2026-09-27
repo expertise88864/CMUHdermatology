@@ -50,6 +50,45 @@ def test_store_is_bounded_allowlisted_and_read_does_not_create(tmp_path):
     assert store.read(now=1_000_000 + MAX_EVENTS + RETENTION_SECONDS + 20) == []
 
 
+@pytest.mark.parametrize("domain,success_stage,success_outcome", [
+    ("consult", "send", "accepted"),
+    ("clock", "done", "official_confirmed"),
+])
+def test_recent_success_survives_noisy_event_cap(
+        tmp_path, domain, success_stage, success_outcome):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", domain)
+    run_id = "d" * 32
+    store.record(run_id=run_id, run_started_at=1_000_000,
+                 observed_at=1_000_001, stage=success_stage,
+                 outcome=success_outcome)
+    for index in range(MAX_EVENTS + 20):
+        store.record(run_id=run_id, run_started_at=1_000_000,
+                     observed_at=1_000_002 + index,
+                     stage="query" if domain == "consult" else "read",
+                     outcome="started")
+    events = store.read(now=1_000_050 + MAX_EVENTS)
+    assert len(events) <= MAX_EVENTS
+    assert last_success(events, domain=domain) == 1_000_001
+
+
+def test_clock_failure_survives_noisy_following_account(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "clock")
+    run_id = "e" * 32
+    store.record(run_id=run_id, run_started_at=1_000_000,
+                 observed_at=1_000_001, stage="done", outcome="read_unknown",
+                 error="read", reason="check_portal")
+    for index in range(MAX_EVENTS + 20):
+        store.record(run_id=run_id, run_started_at=1_000_000,
+                     observed_at=1_000_002 + index,
+                     stage="read", outcome="started")
+    store.record(run_id=run_id, run_started_at=1_000_000,
+                 observed_at=1_000_023 + MAX_EVENTS,
+                 stage="done", outcome="official_confirmed")
+    events = store.read(now=1_000_024 + MAX_EVENTS)
+    assert len(events) <= MAX_EVENTS
+    assert any(event["outcome"] == "read_unknown" for event in events)
+
+
 def test_read_only_store_uri_escapes_fragment_characters(tmp_path):
     path = tmp_path / "clinic#1" / "events.sqlite3"
     store = DiagnosticStore(path, "consult")
@@ -129,6 +168,33 @@ def test_late_hidden_parse_cannot_hide_query_failure_or_settled_send():
     assert "狀態：查詢失敗" not in text
 
 
+def test_previous_attempt_parse_cannot_override_new_query_start_or_result():
+    run = "f" * 32
+    first_failed = _event(run, 100, 101, "query", "read_failed",
+                          error="read", reason="verify_his")
+    retry_started = _event(run, 100, 102, "query", "started")
+    late_parse = _event(run, 100, 103, "parse", "roster_unknown",
+                        error="parse", reason="verify_his")
+    text = consult_summary([first_failed, retry_started, late_parse],
+                           None, now=104)
+    assert "狀態：進行中" in text
+    assert "查詢結果：讀取中" in text
+    retry_ok = _event(run, 100, 105, "query", "ok")
+    still_late = _event(run, 100, 106, "parse", "roster_unknown",
+                        error="parse", reason="verify_his")
+    text = consult_summary([first_failed, retry_started, late_parse,
+                            retry_ok, still_late], None, now=107)
+    assert "狀態：完成" in text
+    assert "查詢結果：名單已讀取" in text
+    verified_unknown = _event(run, 100, 108, "roster", "roster_unknown",
+                              error="parse", reason="verify_his")
+    last_old_parse = _event(run, 100, 109, "parse", "ok")
+    text = consult_summary([first_failed, retry_started, late_parse,
+                            retry_ok, still_late, verified_unknown,
+                            last_old_parse], None, now=110)
+    assert "查詢結果：名單未知" in text
+
+
 def test_late_ledger_reconciliation_does_not_replace_new_query_failure():
     current = _event("d" * 32, 200, 210, "query", "read_failed",
                      error="read", reason="verify_his")
@@ -189,6 +255,17 @@ def test_ledger_projection_distinguishes_pending_partial_and_accepted(tmp_path):
     assert path.stat().st_mtime_ns != before  # only the fake writer changed it
 
 
+def test_newer_skipped_poll_keeps_older_unknown_delivery_actionable():
+    delivery = {"state": "unknown", "created_at": 100.0,
+                "observed_at": 105.0,
+                "counts": {"confirmed": 0, "transient_refused": 0,
+                           "permanent_refused": 0, "unknown": 1}}
+    skipped = _event("a" * 32, 200, 201, "prepare", "skipped")
+    text = consult_summary([skipped], delivery, now=205)
+    assert "另有寄送待確認" in text
+    assert "人工處理：請核對寄件備份，勿直接重寄" in text
+
+
 def test_late_old_delivery_update_cannot_replace_newer_send(tmp_path):
     path = tmp_path / "ledger.sqlite3"
     with sqlite3.connect(path) as conn:
@@ -228,6 +305,26 @@ def test_latest_consult_delivery_uses_parent_chain_not_successful_retry(tmp_path
     assert "部分收件人確認拒收" in text
     assert "永久拒收 1" in text
     assert "請檢查收件設定" in text
+
+
+def test_consult_ledger_read_only_projection_handles_live_wal(tmp_path):
+    path = tmp_path / "ledger.sqlite3"
+    with sqlite3.connect(path) as writer:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("CREATE TABLE deliveries (state TEXT, updated_at REAL, "
+                       "recipients TEXT, category TEXT, created_at REAL, "
+                       "parent_id TEXT)")
+        writer.execute("INSERT INTO deliveries VALUES (?,?,?,?,?,?)", (
+            "unknown", 150.0,
+            json.dumps({"recipient@example.test": "unknown"}),
+            "consult", 100.0, ""))
+        writer.commit()
+        assert (tmp_path / "ledger.sqlite3-wal").exists()
+        snapshot = read_consult_delivery(path)
+        assert snapshot is not None
+        assert snapshot["state"] == "unknown"
+        assert snapshot["counts"]["unknown"] == 1
+    assert read_consult_delivery(path)["state"] == "unknown"
 
 
 def test_clock_state_cross_day_and_pending_restart_projection(tmp_path):
@@ -287,6 +384,29 @@ def test_clock_event_states_do_not_turn_pending_click_into_success():
                          today=date(2026, 10, 5), now=now)
     assert "官方已確認" in text
     assert "最後官方確認：無紀錄" not in text
+
+
+def test_latest_clock_account_success_does_not_hide_earlier_final_failure():
+    now = time.time()
+    run = "b" * 32
+    failed = _event(run, now - 10, now - 5, "done", "read_unknown",
+                    error="read", reason="check_portal")
+    success = _event(run, now - 10, now - 1, "done", "official_confirmed")
+    text = clock_summary([success, failed], None,
+                         today=datetime.fromtimestamp(now).date(), now=now)
+    assert "最近觀察：部分帳號未確認" in text
+    assert "人工處理：請檢查打卡網站狀態" in text
+    assert "最後官方確認：無紀錄" not in text
+
+
+def test_legacy_clock_dry_run_does_not_hide_real_failure_or_claim_success():
+    scheduled = _event("1" * 32, 100, 101, "done", "read_unknown",
+                       error="read", reason="check_portal")
+    tested_read = _event("2" * 32, 200, 201, "read", "official_confirmed")
+    tested_done = _event("2" * 32, 200, 202, "done", "dry_run")
+    events = [scheduled, tested_read, tested_done]
+    assert latest_run(events, now=300) == scheduled
+    assert last_success(events, domain="clock") is None
 
 
 @pytest.mark.parametrize("program", ["clock", "consult"])

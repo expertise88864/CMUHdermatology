@@ -440,6 +440,24 @@ def test_the_diag_bundle_excludes_screenshots_and_page_source(tmp_path,
     assert "png" in note and "html" in note, f"要說明少了什麼：{note}"
 
 
+def test_diag_bundle_excludes_stale_runtime_file_but_keeps_other_debug_text(
+        tmp_path):
+    import zipfile
+    meta = tmp_path / "dumps"
+    meta.mkdir()
+    (meta / "runtime_diagnostics.txt").write_text(
+        "stale result", encoding="utf-8")
+    (meta / "other_debug.txt").write_text(
+        "safe existing diagnostic", encoding="utf-8")
+    dest = tmp_path / "diag.zip"
+    added, _note = dp.build_safe_diag_bundle(
+        dest, meta_dir=str(meta),
+        exclude_meta_names=("runtime_diagnostics.txt",))
+    assert added == 1
+    with zipfile.ZipFile(dest) as zf:
+        assert zf.namelist() == ["debug_meta/other_debug.txt"]
+
+
 def test_the_diag_bundle_truncates_huge_logs(tmp_path, monkeypatch):
     from datetime import datetime as _dt
     monkeypatch.setattr(dp, "sanitized_logging_since",

@@ -1485,7 +1485,8 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                                  task_label: str = "",
                                  portal: ClockPortalPort | None = None,
                                  diagnostic_run: DiagnosticRun | None = None) -> None:
-    diag = diagnostic_run or DiagnosticRun(DIAGNOSTICS)
+    diag = (DiagnosticRun(DIAGNOSTICS, enabled=False) if dry_run else
+            diagnostic_run or DiagnosticRun(DIAGNOSTICS))
     pending_key = task_label or (
         f"manual:{'in' if is_in else 'out'}:{check_start}-{check_end}")
     portal = portal if portal is not None else _SeleniumClockPortal()
@@ -1495,6 +1496,7 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
 
     retries = 5
     last_exc = None
+    phase = "login"
     for attempt in range(retries):
         phase = "login"
         try:
@@ -1586,6 +1588,8 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
             # (加 60s 緩衝吸收「點擊→刷卡表登錄」延遲)。超窗放棄點擊,避免打出遲到紀錄;
             # 未標記完成 → 由 _missed_clock_check 於窗結束後發補卡提醒接手。
             if _clock_window_passed(check_end, grace_sec=60):
+                diag.emit("done", "failed", error="unknown",
+                          reason="verify_clock")
                 logging.warning(
                     "[窗尾防線] %s %s 準備點擊時已超過打卡窗尾 %s(+60s 緩衝),放棄點擊"
                     "避免遲到紀錄,交補卡提醒。", acc.get("username", "?"), act_name, check_end)
@@ -1595,6 +1599,8 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
             # 若狀態檔寫不下去，重啟後無法防重，故這次不點。
             if not _mark_clock_click_pending(pending_key, acc["username"]):
                 diag.emit("submit", "failed", error="storage",
+                          reason="check_storage")
+                diag.emit("done", "failed", error="storage",
                           reason="check_storage")
                 logging.error("%s 無法保存待確認打卡狀態，本次不點擊；請人工確認",
                               acc["username"])
@@ -1620,11 +1626,13 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                 logging.info("%s %s 打卡成功(已重讀刷卡表確認紀錄)！",
                              acc["username"], act_name)
                 _mark_clock_done(task_label, acc["username"])
+                diag.emit("done", "official_confirmed")
                 if pending_key != task_label:
                     _clear_clock_click_pending(pending_key, acc["username"])
             else:
                 diag.emit("confirm", "click_pending", since=started,
                           reason="verify_clock")
+                diag.emit("done", "click_pending", reason="verify_clock")
                 logging.warning(
                     "%s %s 打卡已送出,但重讀刷卡表未能確認到紀錄 — 不標記完成,"
                     "下次 re-fire 只會重讀，不會重複點擊；必要時人工處理。",
@@ -1633,6 +1641,8 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
 
         except ClockAuthError as e:
             diag.emit("login", "auth_failed", error="auth",
+                      reason="fix_credentials")
+            diag.emit("done", "auth_failed", error="auth",
                       reason="fix_credentials")
             # [AC-09] 帳密錯誤:當窗不再重試,單次醒目通知(避免反覆登入 + 帳號鎖定風險)。
             logging.error("%s 帳號/密碼錯誤,當窗不再重試: %s", acc.get("username", "?"), e)
@@ -1654,7 +1664,8 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                 diag.emit("confirm", "click_pending", error="portal",
                           reason="verify_clock")
             else:
-                diag.emit("done", "failed", error="portal",
+                diag.emit("login" if phase == "login" else "submit",
+                          "failed", error="portal",
                           reason="check_portal")
             last_exc = e
             logging.warning(
@@ -1672,7 +1683,8 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                 diag.emit("confirm", "click_pending", error="portal",
                           reason="verify_clock")
             else:
-                diag.emit("done", "failed", error="unknown",
+                diag.emit("login" if phase == "login" else "submit",
+                          "failed", error="unknown",
                           reason="check_portal")
             last_exc = e
             logging.error("%s 操作失敗: %s", acc.get("username", "?"), e)
@@ -1680,6 +1692,15 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                 messagebox.showerror("測試失敗", str(e))
             break
 
+    if phase == "read":
+        diag.emit("done", "read_unknown", error="read",
+                  reason="check_portal")
+    elif phase in ("submit", "confirm"):
+        diag.emit("done", "click_pending", error="portal",
+                  reason="verify_clock")
+    else:
+        diag.emit("done", "failed", error="portal",
+                  reason="check_portal")
     _handle_clock_failure(driver, acc.get("username", "?"), task_label, last_exc, dry_run)
 
 
@@ -1783,6 +1804,8 @@ def process_clock_task(schedule_key: str | None) -> None:
                   error="none" if driver else "portal",
                   reason="none" if driver else "check_portal")
         if not driver:
+            diag.emit("done", "failed", error="portal",
+                      reason="check_portal")
             notify_clock_failure(
                 "瀏覽器啟動失敗",
                 ["無法建立 Chrome / WebDriver",
@@ -1812,6 +1835,8 @@ def process_clock_task(schedule_key: str | None) -> None:
                 # [AC-01] 窗尾防線:任務在窗尾起跑 + portal 慢時,已排隊到窗外的帳號不再
                 # 打卡(避免遲到紀錄),交補卡提醒接手。perform_clock_action 內另有一道點擊前檢查。
                 if _clock_window_passed(check_end):
+                    diag.emit("done", "failed", error="unknown",
+                              reason="verify_clock")
                     logging.warning(
                         "[窗尾防線] 任務 %s 執行到 %s 已超過打卡窗尾 %s,剩餘帳號不再打卡"
                         "(避免遲到紀錄),交補卡提醒。", schedule_key,
@@ -1824,6 +1849,8 @@ def process_clock_task(schedule_key: str | None) -> None:
                     driver = _get_or_create_clock_driver()
                     _rebuilds += 1
                     if not driver:
+                        diag.emit("done", "failed", error="portal",
+                                  reason="check_portal")
                         logging.error("[autoclock] 重建 driver 失敗，中止本任務剩餘帳號")
                         break
                     wait = WebDriverWait(driver, 20)
@@ -1837,6 +1864,8 @@ def process_clock_task(schedule_key: str | None) -> None:
                 with _persistent_driver_pool["lock"]:
                     _persistent_driver_pool["last_used"] = time_module.time()
         except Exception as e:
+            diag.emit("done", "failed", error="portal",
+                      reason="check_portal")
             logging.error("任務 %s 執行期間發生錯誤: %s", schedule_key, e)
             try:
                 _handle_clock_failure(driver, "system", schedule_key, e, dry_run=False)
@@ -2364,17 +2393,21 @@ class ClockApp(tk.Tk):
             return
         # Only enumerated codes/durations are written; the existing exporter
         # continues to sanitize logs and exclude screenshots/page source.
+        diagnostics_written = False
         try:
             DEBUG_DUMPS_DIR.mkdir(parents=True, exist_ok=True)
             (DEBUG_DUMPS_DIR / "runtime_diagnostics.txt").write_text(
                 render_safe_events(DIAGNOSTICS.read()), encoding="utf-8")
+            diagnostics_written = True
         except OSError:
             logging.debug("寫入安全執行診斷摘要失敗", exc_info=True)
         secrets = [str(a.get("username", "")) for a in (self.accounts or [])
                    if isinstance(a, dict)]
         added, note = build_safe_diag_bundle(
-            dest, log_files=[str(LOG_FILE)], meta_dir=str(DEBUG_DUMPS_DIR),
-            secrets=secrets)
+            dest, log_files=[str(LOG_FILE)],
+            meta_dir=str(DEBUG_DUMPS_DIR), secrets=secrets,
+            exclude_meta_names=("runtime_diagnostics.txt",)
+            if not diagnostics_written else ())
         if not added:
             messagebox.showwarning("安全診斷包", note)
             return

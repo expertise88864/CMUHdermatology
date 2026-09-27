@@ -365,7 +365,8 @@ def log_lines_after(text: str, since):
 
 
 def build_safe_diag_bundle(dest_zip, log_files=(), meta_dir=None,
-                           secrets=(), max_log_bytes=2_000_000) -> tuple:
+                           secrets=(), max_log_bytes=2_000_000,
+                           exclude_meta_names=()) -> tuple:
     """打包一份【可以安全寄給開發者】的診斷包。回 (放進去幾個檔, 說明字串)。
 
     ★為什麼需要這個★
@@ -410,6 +411,8 @@ def build_safe_diag_bundle(dest_zip, log_files=(), meta_dir=None,
                     logging.debug("[診斷包] 讀不到 %s（略過）", lf, exc_info=True)
             if meta_dir and os.path.isdir(meta_dir):
                 for name in sorted(os.listdir(meta_dir)):
+                    if name in exclude_meta_names:
+                        continue
                     full = os.path.join(meta_dir, name)
                     if not os.path.isfile(full):
                         continue

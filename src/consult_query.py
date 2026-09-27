@@ -7317,7 +7317,12 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
         logging.warning("[delivery] 處理待補寄時出錯(不影響本輪查詢)",
                         exc_info=True)
     if not _flow_lock.acquire(blocking=False):
-        diagnostic.emit("done", "skipped")
+        held_since = _flow_lock_held_since[0]
+        held_too_long = bool(held_since and
+                             time.monotonic() - held_since > 20 * 60)
+        diagnostic.emit("done", "skipped",
+                        error="unknown" if held_too_long else "none",
+                        reason="check_job" if held_too_long else "none")
         _note_flow_lock_skipped(trigger_label)
         # ★[2026-07-30 外審第 1 輪] email 觸發的要排隊補跑,不可直接丟掉★
         #   `trigger_job_async` 只在【gate 擋下】時排隊；gate 放行但 `_flow_lock`
@@ -7439,7 +7444,8 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
             logging.error(
                 "[會診] 尚未設定 HIS 帳號/密碼,本次(%s)不執行流程;請至設定填寫。",
                 trigger_label)
-            diagnostic.emit("done", "skipped", error="auth")
+            diagnostic.emit("done", "skipped", error="auth",
+                            reason="fix_credentials")
             return
         # [CQ-07] 收件人被清空 → 不跑完整 HIS 自動化(免每輪白開 systemftp、登入、擷取 3 次
         # 才在寄信步驟失敗),直接記 error 返回。
@@ -7481,6 +7487,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
             # [2026-08-07 外審 AT] 本次 attempt 的寄送帳本 id（每輪重設,
             # 免得上一輪的 id 被這一輪的失敗收尾誤用）。
             _did = ""
+            diagnostic_failure_recorded = False
             try:
                 logging.info("會診查詢任務 第 %d/%d 次嘗試（trigger=%s, 收件人組=%s, mail=%s）",
                              attempt, retry_count, trigger_label,
@@ -7502,6 +7509,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     if query_result.status is ConsultQueryStatus.READ_FAILED:
                         diagnostic.emit("query", "read_failed", since=query_started,
                                         error="read", reason="verify_his")
+                        diagnostic_failure_recorded = True
                         raise query_result.error or RuntimeError(
                             "會診 HIS 查詢失敗，未提供錯誤原因")
                     his_result = query_result
@@ -7509,10 +7517,12 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     diagnostic.emit("query", "ok", since=query_started)
                     if (query_result.status is ConsultQueryStatus.ROSTER_UNKNOWN or
                             not _may_update_baseline(query_result.roster_texts)):
-                        diagnostic.emit("parse", "roster_unknown", error="parse",
+                        diagnostic.emit("roster", "roster_unknown", error="parse",
                                         reason="verify_his")
                     elif not query_result.roster_texts:
-                        diagnostic.emit("parse", "empty_roster")
+                        diagnostic.emit("roster", "empty_roster")
+                    else:
+                        diagnostic.emit("roster", "ok")
                 else:
                     logging.info("沿用上一次 attempt 已查到的會診結果(HIS 不重查)")
                 extracted_text = his_result.extracted_text
@@ -7705,6 +7715,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     except Exception:
                         diagnostic.emit("redact", "failed", since=redact_started,
                                         error="privacy")
+                        diagnostic_failure_recorded = True
                         raise
                     diagnostic.emit("redact", "ok", since=redact_started)
                 if mail_method == "smtp":
@@ -7790,6 +7801,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     except DeliveryOutcomeUnknown:
                         diagnostic.emit("send", "pending", since=send_started,
                                         error="timeout", reason="verify_delivery")
+                        diagnostic_failure_recorded = True
                         # 可能已送達 → 待查(留給 Message-ID 回查收斂)
                         _delivery_settle(_did, unknown=True)
                         _did = ""              # 已結案,終局分支不要再 settle 一次
@@ -7797,6 +7809,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     except Exception:
                         diagnostic.emit("send", "failed", since=send_started,
                                         error="transport")
+                        diagnostic_failure_recorded = True
                         # 確定沒送出去(連不上/認證/5xx/未設定)→ FAILED,不是待查。
                         # 若哪天 SMTP 層把「DATA 之後斷線」也改判成結果不明,
                         # 它會走上面那條,不會被誤記成 FAILED。
@@ -7847,10 +7860,12 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     except DeliveryOutcomeUnknown:
                         diagnostic.emit("send", "pending", since=send_started,
                                         error="transport", reason="verify_delivery")
+                        diagnostic_failure_recorded = True
                         raise
                     except Exception:
                         diagnostic.emit("send", "failed", since=send_started,
                                         error="transport")
+                        diagnostic_failure_recorded = True
                         raise
                     diagnostic.emit("send", "accepted", since=send_started)
                 # [2026-06-25] 寄出成功 → 更新「已通知病歷號」基準,下一輪 poll 不再重複寄同一批。
@@ -7993,6 +8008,10 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                             logging.debug("結果不明告警處理失敗（略過）",
                                           exc_info=True)
                         break
+                    if not diagnostic_failure_recorded:
+                        diagnostic.emit("done", "failed",
+                                        error="read" if not his_stage_done else "unknown",
+                                        reason="verify_his" if not his_stage_done else "check_job")
                     _discard_undelivered_shot(delivery)
                     try:
                         _note_job_failure(_developer_alert_recipients(),

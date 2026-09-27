@@ -215,6 +215,7 @@ def test_outlook_diagnostics_separates_definite_failure_from_uncertainty(
     cq._do_full_job("email")
     assert any(e["stage"] == "send" and e["outcome"] == "failed"
                for e in diagnostics.read())
+    assert diagnostics.read()[0]["stage"] == "send"
 
     def unknown_send(*_a, **_k):
         raise cq.DeliveryOutcomeUnknown("uncertain")
@@ -223,6 +224,45 @@ def test_outlook_diagnostics_separates_definite_failure_from_uncertainty(
     cq._do_full_job("email")
     assert any(e["stage"] == "send" and e["outcome"] == "pending"
                for e in diagnostics.read())
+
+
+def test_non_send_final_failure_has_terminal_diagnostic(monkeypatch, tmp_path):
+    diagnostics = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", diagnostics)
+    _JobHarness(monkeypatch, _base_cfg(retry_count=1),
+                extracted_text="synthetic consult")
+    monkeypatch.setattr(cq, "_build_consult_email_html",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                            RuntimeError("synthetic formatting failure")))
+    cq._do_full_job("email")
+    latest = diagnostics.read()[0]
+    assert latest["stage"] == "done"
+    assert latest["outcome"] == "failed"
+    assert latest["reason"] == "check_job"
+
+
+def test_stale_flow_lock_skip_requires_manual_job_check(monkeypatch, tmp_path):
+    import threading
+    diagnostics = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", diagnostics)
+    for name in ("_drain_pending_refusal_retries",
+                 "_reconcile_unknown_deliveries",
+                 "_close_out_stale_recipient_retries"):
+        monkeypatch.setattr(cq, name, lambda: None)
+    lock = threading.Lock()
+    lock.acquire()
+    monkeypatch.setattr(cq, "_flow_lock", lock)
+    monkeypatch.setattr(cq, "_flow_lock_held_since",
+                        [time.monotonic() - 25 * 60])
+    try:
+        cq._do_full_job("poll")
+    finally:
+        lock.release()
+    latest = diagnostics.read()[0]
+    assert latest["stage"] == "done"
+    assert latest["outcome"] == "skipped"
+    assert latest["reason"] == "check_job"
+    assert "請檢查執行紀錄" in consult_summary(diagnostics.read(), None)
 
 def test_route_email_trigger_sends_to_trigger_sender(monkeypatch):
     """IMAP 觸發(override_recipients=觸發者) → 結果回寄給「觸發者本人」。"""

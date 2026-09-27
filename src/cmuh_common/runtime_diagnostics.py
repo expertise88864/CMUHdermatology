@@ -21,7 +21,7 @@ MAX_DURATION_MS = 30 * 60 * 1000
 
 _STAGES = {
     "consult": frozenset({
-        "query", "parse", "redact", "prepare", "send", "reconcile", "done",
+        "query", "parse", "roster", "redact", "prepare", "send", "reconcile", "done",
     }),
     "clock": frozenset({
         "browser", "website", "login", "read", "submit", "confirm", "done",
@@ -39,7 +39,7 @@ _ERRORS = frozenset({
 })
 _REASONS = frozenset({
     "none", "verify_his", "verify_delivery", "fix_recipient", "check_portal",
-    "verify_clock", "fix_credentials", "check_storage",
+    "verify_clock", "fix_credentials", "check_storage", "check_job",
 })
 
 
@@ -93,9 +93,38 @@ class DiagnosticStore:
                         (run_id, started, now, stage, outcome, elapsed, error, reason))
                     conn.execute("DELETE FROM events WHERE observed_at < ?",
                                  (now - RETENTION_SECONDS,))
-                    conn.execute("DELETE FROM events WHERE seq NOT IN "
-                                 "(SELECT seq FROM events ORDER BY seq DESC LIMIT ?)",
-                                 (MAX_EVENTS,))
+                    count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                    if count > MAX_EVENTS:
+                        success_filter = (
+                            "(stage='send' AND outcome='accepted') OR "
+                            "(stage='done' AND outcome IN ('empty_roster','no_new'))"
+                            if self.domain == "consult" else
+                            "outcome='official_confirmed' AND "
+                            "stage IN ('confirm','done')")
+                        failure_filter = (
+                            "(stage='query' AND outcome='read_failed') OR "
+                            "(stage='send' AND outcome IN ('pending','refused','failed')) OR "
+                            "(stage='done' AND outcome='failed' AND reason!='none')"
+                            if self.domain == "consult" else
+                            "stage='done' AND outcome IN "
+                            "('read_unknown','failed','click_pending','auth_failed') "
+                            "AND reason!='none'")
+                        priority_seqs = set()
+                        for predicate in (success_filter, failure_filter):
+                            priority_seq = conn.execute(
+                                f"SELECT MAX(seq) FROM events WHERE {predicate}"
+                            ).fetchone()[0]
+                            if priority_seq is not None:
+                                priority_seqs.add(priority_seq)
+                        keep_recent = MAX_EVENTS - len(priority_seqs)
+                        placeholders = ",".join("?" for _ in priority_seqs)
+                        preserve = (f" AND seq NOT IN ({placeholders})"
+                                    if priority_seqs else "")
+                        conn.execute(
+                            "DELETE FROM events WHERE seq NOT IN "
+                            "(SELECT seq FROM events ORDER BY seq DESC LIMIT ?)"
+                            + preserve,
+                            (keep_recent, *priority_seqs))
         except (OSError, sqlite3.Error, TypeError, ValueError, OverflowError):
             pass
 
@@ -146,8 +175,9 @@ class DiagnosticRun:
     """Carries one process-local observation identity across retries."""
 
     def __init__(self, store: DiagnosticStore, *, wall_clock=time.time,
-                 monotonic=time.monotonic):
+                 monotonic=time.monotonic, enabled: bool = True):
         self.store = store
+        self.enabled = enabled
         self.run_id = uuid.uuid4().hex
         self.started_at = wall_clock()
         self._wall_clock = wall_clock
@@ -158,6 +188,8 @@ class DiagnosticRun:
 
     def emit(self, stage: str, outcome: str, *, since: float | None = None,
              error: str = "none", reason: str = "none") -> None:
+        if not self.enabled:
+            return
         duration = (self._monotonic() - since) * 1000 if since is not None else 0
         self.store.record(
             run_id=self.run_id, run_started_at=self.started_at,
@@ -168,8 +200,10 @@ class DiagnosticRun:
 def latest_run(events: list[dict], *, now: float | None = None) -> dict | None:
     """Choose by run start, so a late event from an older run cannot take over."""
     instant = time.time() if now is None else now
+    dry_run_ids = {e["run_id"] for e in events if e["outcome"] == "dry_run"}
     eligible = [e for e in events if 0 < e["run_started_at"] <= instant + 60
-                and e["observed_at"] <= instant + 60]
+                and e["observed_at"] <= instant + 60
+                and e["run_id"] not in dry_run_ids]
     if not eligible:
         return None
     newest = max(eligible, key=lambda e: (e["run_started_at"], e["observed_at"]))
@@ -183,11 +217,12 @@ def last_success(events: list[dict], *, domain: str) -> float | None:
     completed = {"consult": {("send", "accepted"),
                               ("done", "empty_roster"),
                               ("done", "no_new")},
-                 "clock": {("read", "official_confirmed"),
-                           ("confirm", "official_confirmed"),
+                 "clock": {("confirm", "official_confirmed"),
                            ("done", "official_confirmed")}}[domain]
+    dry_run_ids = {e["run_id"] for e in events if e["outcome"] == "dry_run"}
     found = [e["observed_at"] for e in events
-             if (e["stage"], e["outcome"]) in completed]
+             if e["run_id"] not in dry_run_ids and
+             (e["stage"], e["outcome"]) in completed]
     return max(found) if found else None
 
 

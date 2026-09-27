@@ -14,7 +14,7 @@ from cmuh_common.runtime_diagnostics import last_success, latest_run
 
 
 _STAGE_LABELS = {
-    "query": "HIS 查詢", "parse": "清單解析", "redact": "去識別",
+    "query": "HIS 查詢", "parse": "清單解析", "roster": "名單判定", "redact": "去識別",
     "prepare": "寄送準備", "send": "寄送", "reconcile": "寄送核對",
     "browser": "瀏覽器準備", "website": "網站載入",
     "login": "登入", "read": "讀取紀錄",
@@ -44,6 +44,7 @@ _REASON_LABELS = {
     "verify_clock": "請至官方系統確認，勿重複點擊",
     "fix_credentials": "請檢查帳號密碼",
     "check_storage": "請檢查本機儲存空間或權限",
+    "check_job": "請檢查執行紀錄並人工核對結果",
 }
 _LEDGER_STATES = {"prepared", "submitting", "unknown", "confirmed",
                   "partial", "failed"}
@@ -142,23 +143,33 @@ def consult_summary(events: list[dict], delivery: dict | None, *,
         # The hidden HIS worker may finish parsing after its caller has timed
         # out or even after another attempt has settled. An intermediate parse
         # observation cannot supersede a completed result from the same run.
-        query_ok_at = max(
+        query_boundary = max(
             (item["observed_at"] for item in events
              if item["run_id"] == event["run_id"] and
-             item["stage"] == "query" and item["outcome"] == "ok" and
+             item["stage"] == "query" and
+             item["outcome"] in {"started", "ok"} and
              item["observed_at"] <= event["observed_at"]), default=0)
         terminal = [item for item in events
                     if item["run_id"] == event["run_id"] and
                     item["observed_at"] <= event["observed_at"] and (
                         (item["stage"] == "query" and
-                         item["outcome"] == "read_failed" and
-                         item["observed_at"] >= query_ok_at) or
+                         item["outcome"] in {"ok", "read_failed"} and
+                         item["observed_at"] >= query_boundary) or
                         (item["stage"] == "send" and item["outcome"] in {
                             "accepted", "refused", "pending", "failed"}) or
+                        (item["stage"] == "roster" and item["outcome"] in {
+                            "ok", "roster_unknown", "empty_roster"}) or
                         (item["stage"] == "done" and item["outcome"] in {
-                            "empty_roster", "no_new", "skipped"}))]
+                            "empty_roster", "no_new", "skipped", "failed"}))]
         if terminal:
             event = max(terminal, key=lambda item: item["observed_at"])
+        elif query_boundary:
+            event = max(
+                (item for item in events
+                 if item["run_id"] == event["run_id"] and
+                 item["stage"] == "query" and item["outcome"] == "started" and
+                 item["observed_at"] == query_boundary),
+                key=lambda item: item["observed_at"], default=event)
     observed = event["observed_at"] if event else None
     stage = _STAGE_LABELS.get(event["stage"], "尚未執行") if event else "尚未執行"
     outcome = _OUTCOME_LABELS.get(event["outcome"], "未知") if event else "無紀錄"
@@ -166,23 +177,32 @@ def consult_summary(events: list[dict], delivery: dict | None, *,
     reason = _REASON_LABELS.get(event["reason"], "無") if event else "無"
     query_state = "無紀錄"
     if event:
-        current = [item for item in events if item["run_id"] == event["run_id"]]
+        current = [item for item in events
+                   if item["run_id"] == event["run_id"] and
+                   item["observed_at"] <= event["observed_at"]]
         query_events = [item for item in current if item["stage"] == "query"
                         and item["outcome"] != "started"]
-        parse_events = [item for item in current if item["stage"] == "parse"
-                        and item["outcome"] in {"ok", "roster_unknown",
-                                                "empty_roster"}]
+        query_start_at = max(
+            (item["observed_at"] for item in current
+             if item["stage"] == "query" and item["outcome"] == "started"),
+            default=0)
+        roster_events = [item for item in current if item["stage"] == "roster"
+                         and item["observed_at"] >= query_start_at and
+                         item["outcome"] in {"ok", "roster_unknown",
+                                                 "empty_roster"}]
         latest_query = max(query_events, key=lambda item: item["observed_at"],
                            default=None)
-        latest_parse = max(parse_events, key=lambda item: item["observed_at"],
-                           default=None)
+        latest_roster = max(roster_events, key=lambda item: item["observed_at"],
+                            default=None)
         if latest_query and latest_query["outcome"] == "read_failed":
             query_state = "查詢失敗"
-        elif latest_parse:
+        elif latest_roster:
             query_state = {"ok": "名單已讀取", "roster_unknown": "名單未知",
-                           "empty_roster": "確定空名單"}[latest_parse["outcome"]]
+                           "empty_roster": "確定空名單"}[latest_roster["outcome"]]
         elif latest_query:
             query_state = "名單已讀取"
+        if event["stage"] == "query" and event["outcome"] == "started":
+            query_state = "讀取中"
     ledger_line = "尚無寄送帳本紀錄"
     if delivery:
         state = delivery["state"]
@@ -212,6 +232,15 @@ def consult_summary(events: list[dict], delivery: dict | None, *,
                     and event["stage"] == "send" and event["error"] != "none"):
                 error = _ERROR_LABELS.get(event["error"], "未分類")
             reason = ledger_reason
+        elif state != "confirmed":
+            # A later poll can be skipped while the earlier ledger entry still
+            # needs reconciliation. Keep that actionable state visible without
+            # replacing a newer query failure or other observation.
+            if ledger_state not in outcome:
+                outcome += "；另有" + ledger_state
+            if ledger_reason not in reason:
+                reason = (ledger_reason if reason == "無" else
+                          reason + "；" + ledger_reason)
     success = last_success(events, domain="consult")
     if delivery and delivery["state"] == "confirmed":
         success = max(success or 0, delivery["observed_at"])
@@ -241,6 +270,20 @@ def clock_summary(events: list[dict], state: dict | None, *,
     outcome = _OUTCOME_LABELS.get(event["outcome"], "未知") if event else "無紀錄"
     error = _ERROR_LABELS.get(event["error"], "未分類") if event else "無"
     reason = _REASON_LABELS.get(event["reason"], "無") if event else "無"
+    if event:
+        # One scheduled run may process several accounts. An official result
+        # for the last account must not hide an earlier account's final failure.
+        unresolved = [item for item in events
+                      if item["run_id"] == event["run_id"] and
+                      item["observed_at"] <= event["observed_at"] and
+                      datetime.fromtimestamp(item["observed_at"]).date().isoformat() == day and
+                      item["stage"] == "done" and item["outcome"] in {
+                          "read_unknown", "failed", "click_pending", "auth_failed"}]
+        if unresolved and event["outcome"] == "official_confirmed":
+            last_unresolved = max(unresolved, key=lambda item: item["observed_at"])
+            stage, outcome = "執行彙總", "部分帳號未確認"
+            error = _ERROR_LABELS.get(last_unresolved["error"], "未分類")
+            reason = _REASON_LABELS.get(last_unresolved["reason"], "無")
     counts = {"clock_done": 0, "click_pending": 0, "auth_failed": 0}
     state_time = None
     if state and state["date"] == day:

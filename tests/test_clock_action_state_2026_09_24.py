@@ -6,7 +6,8 @@ import pytest
 
 import autoclock as clock
 from clock.action_state import ClockActionState, classify_clock_observation
-from cmuh_common.runtime_diagnostics import DiagnosticStore
+from cmuh_common.runtime_diagnostics import DiagnosticRun, DiagnosticStore
+from cmuh_common.runtime_summary import clock_summary
 
 
 @pytest.mark.parametrize(
@@ -132,6 +133,95 @@ def test_unreadable_fake_portal_never_submits_or_marks_done(monkeypatch, tmp_pat
     assert not clock._is_clock_click_pending("am_in", "synthetic")
     assert failures == [True]
     assert diagnostics.read()[0]["outcome"] == "read_unknown"
+
+
+def test_two_fake_accounts_report_partial_confirmation(monkeypatch, tmp_path):
+    diagnostics = DiagnosticStore(tmp_path / "clock_diag.sqlite3", "clock")
+    run = DiagnosticRun(diagnostics)
+    monkeypatch.setattr(clock, "DIAGNOSTICS", diagnostics)
+    monkeypatch.setattr(clock, "CLOCK_STATE_FILE", tmp_path / "clock_state.json")
+    monkeypatch.setattr(clock, "_clock_state_persistence_enabled", True)
+    monkeypatch.setattr(clock, "_clock_done", {})
+    monkeypatch.setattr(clock, "_clock_click_pending", {})
+    monkeypatch.setattr(clock, "_auth_failed", {})
+    monkeypatch.setattr(clock, "_clock_today", lambda: date(2026, 10, 5))
+    monkeypatch.setattr(clock, "exponential_backoff_sleep",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(clock, "_handle_clock_failure", lambda *_args: None)
+
+    unreadable = _FakePortal()
+    unreadable.read_swipes = lambda *_args: (None, [], None, False)
+    confirmed = _FakePortal()
+    confirmed.read_swipes = lambda *_args: (
+        None, [("0735", "上班")], None, True)
+
+    for username, portal in (("synthetic-a", unreadable),
+                             ("synthetic-b", confirmed)):
+        clock._perform_clock_action_locked(
+            None, None, {"username": username, "password": "synthetic"},
+            True, time(7, 30), time(8, 0), task_label="am_in",
+            portal=portal, diagnostic_run=run)
+
+    text = clock_summary(diagnostics.read(), None)
+    assert "最近觀察：部分帳號未確認" in text
+    assert "人工處理：請檢查打卡網站狀態" in text
+    assert unreadable.submits == confirmed.submits == 0
+    assert b"synthetic-a" not in diagnostics.path.read_bytes()
+    assert b"synthetic-b" not in diagnostics.path.read_bytes()
+
+
+def test_transient_prepare_timeout_then_official_record_is_not_partial(
+        monkeypatch, tmp_path):
+    diagnostics = DiagnosticStore(tmp_path / "clock_diag.sqlite3", "clock")
+    monkeypatch.setattr(clock, "DIAGNOSTICS", diagnostics)
+    monkeypatch.setattr(clock, "CLOCK_STATE_FILE", tmp_path / "clock_state.json")
+    monkeypatch.setattr(clock, "_clock_state_persistence_enabled", True)
+    monkeypatch.setattr(clock, "_clock_done", {})
+    monkeypatch.setattr(clock, "_clock_click_pending", {})
+    monkeypatch.setattr(clock, "_auth_failed", {})
+    monkeypatch.setattr(clock, "_clock_today", lambda: date(2026, 10, 5))
+    monkeypatch.setattr(clock.time_module, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(clock, "exponential_backoff_sleep",
+                        lambda *_args, **_kwargs: None)
+
+    class FlakyPortal(_FakePortal):
+        def __init__(self):
+            super().__init__()
+            self.reads = iter([[], [("0735", "上班")]])
+            self.attempts = 0
+
+        def select_action(self, *_args):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise clock.TimeoutException("synthetic timeout")
+
+    portal = FlakyPortal()
+    clock._perform_clock_action_locked(
+        None, None, {"username": "synthetic", "password": "synthetic"},
+        True, time(7, 30), time(8, 0), task_label="am_in", portal=portal)
+    text = clock_summary(diagnostics.read(), None)
+    assert portal.attempts == 1
+    assert portal.submits == 0
+    assert "最近觀察：官方已確認" in text
+    assert "部分帳號未確認" not in text
+    assert not any(event["stage"] == "done" and event["outcome"] == "failed"
+                   for event in diagnostics.read())
+
+
+def test_dry_run_does_not_replace_scheduled_diagnostics(monkeypatch, tmp_path):
+    diagnostics = DiagnosticStore(tmp_path / "clock_diag.sqlite3", "clock")
+    monkeypatch.setattr(clock, "DIAGNOSTICS", diagnostics)
+    monkeypatch.setattr(clock.time_module, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(clock.messagebox, "showinfo", lambda *_args: None)
+    portal = _FakePortal()
+    portal.reads = iter([[]])
+    clock._perform_clock_action_locked(
+        None, None, {"username": "synthetic", "password": "synthetic"},
+        True, time(0, 0), time(23, 59), dry_run=True,
+        task_label="test", portal=portal)
+    assert portal.submits == 0
+    assert diagnostics.read() == []
+    assert not diagnostics.path.exists()
 
 
 def test_fake_website_load_failure_has_bounded_private_free_timing(
