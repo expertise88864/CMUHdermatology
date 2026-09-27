@@ -932,6 +932,24 @@ def test_excimer_identity_guard_blocks_write_and_does_not_log_chart(
     assert "12345678" not in caplog.text
 
 
+@pytest.mark.parametrize("case", ["wrong_field", "readback_mismatch"])
+def test_excimer_identity_field_text_never_reaches_general_log(
+        monkeypatch, fake_his, caplog, case):
+    sensitive = "測試姓名 12345678"
+    monkeypatch.setattr(main, "_find_hospital_main_window", lambda: 10)
+    monkeypatch.setattr(main, "_find_身份_edit_hwnd", lambda _hwnd: 30)
+    reads = [sensitive] if case == "wrong_field" else ["40", sensitive, sensitive]
+    monkeypatch.setattr(main, "_read_tmemo_text",
+                        lambda _hwnd: reads.pop(0) if reads else sensitive)
+    monkeypatch.setattr(main, "_wm_settext_timeout", lambda *_a: True)
+    monkeypatch.setattr(main, "_replace_edit_text", lambda *_a, **_k: True)
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+    assert main._set_身份_自費(
+        "01", label="F2", prewrite_check=lambda: True) is False
+    assert sensitive not in caplog.text
+    assert "12345678" not in caplog.text
+
+
 def test_excimer_identity_switch_during_write_is_not_reported_complete(
         monkeypatch, fake_his):
     monkeypatch.setattr(main, "_find_hospital_main_window", lambda: 10)

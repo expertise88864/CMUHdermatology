@@ -6158,8 +6158,8 @@ def _set_身份_自費(value: str = "01", label: str = "", *,
         # (工作流審查抓到的中心風險)。
         if before and not re.fullmatch(r"\d{1,3}", before):
             logging.warning(
-                "[%s][身份] 定位到的欄位原值 %r 不像身份代碼(非空且非 1-3 位數字)"
-                " → 疑似定位錯欄位,不寫入", label, before)
+                "[%s][身份] 定位到的欄位原值長度=%d 不像身份代碼"
+                " → 疑似定位錯欄位,不寫入", label, len(before))
             _show_uvb_warning(
                 main_hwnd, "身份未自動設定",
                 f"自動定位到的身份欄內容看起來不對(原值:{before!r})。\n\n"
@@ -6230,8 +6230,8 @@ def _set_身份_自費(value: str = "01", label: str = "", *,
                                                    _EvCode("身份", value)),
                                outcome=_LEDGER_OK)
             return True
-        logging.warning("[%s][身份] 設身份失敗 期望=%r 實際=%r → 警告醫師",
-                        label, value, after)
+        logging.warning("[%s][身份] 設身份失敗 期望=%r 實際長度=%d → 警告醫師",
+                        label, value, len(after))
         _show_uvb_warning(
             main_hwnd, "身份設定驗證失敗",
             f"自動把身份改成 {value} 後讀回驗證不符(實際:{after!r})。\n\n"
