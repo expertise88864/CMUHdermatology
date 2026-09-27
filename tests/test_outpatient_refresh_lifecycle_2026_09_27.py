@@ -1,5 +1,7 @@
 """Lifecycle behavior with a fake clock and no Tk or hospital data source."""
 
+import threading
+
 from cmuh_common.outpatient_refresh_lifecycle import OutpatientRefreshLifecycle
 
 
@@ -54,6 +56,47 @@ def test_stale_takeover_revokes_old_results_and_old_completion():
     assert lifecycle.owns(new.generation)
     assert lifecycle.mark_finished(new.generation)
     assert lifecycle.finish_on_ui().run == new
+
+
+def test_message_guard_keeps_write_before_concurrent_takeover():
+    lifecycle, clock = _lifecycle()
+    old = lifecycle.request(False, [_doctor("OLD")]).run
+    assert old is not None
+    lifecycle.take_start()
+    entered = threading.Event()
+    attempted = threading.Event()
+    release = threading.Event()
+    takeover_done = threading.Event()
+    order = []
+
+    def write_data():
+        with lifecycle.message_guard(old.generation) as accepted:
+            assert accepted
+            entered.set()
+            assert release.wait(5)
+            order.append("write")
+
+    def take_over():
+        clock[0] += 901
+        attempted.set()
+        decision = lifecycle.request(True, [_doctor("NEW")])
+        assert decision.kind == "started" and decision.run.took_over
+        order.append("takeover")
+        takeover_done.set()
+
+    writer = threading.Thread(target=write_data)
+    taker = threading.Thread(target=take_over)
+    writer.start()
+    assert entered.wait(5)
+    taker.start()
+    assert attempted.wait(5)
+    finished_inside_guard = takeover_done.wait(0.05)
+    release.set()
+    writer.join(timeout=5)
+    taker.join(timeout=5)
+    assert not writer.is_alive() and not taker.is_alive()
+    assert not finished_inside_guard
+    assert order == ["write", "takeover"]
 
 
 def test_a_young_worker_queues_instead_of_being_taken_over():

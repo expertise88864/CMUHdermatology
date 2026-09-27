@@ -16377,29 +16377,36 @@ class AutomationApp:
                             # through the clinic and alert-state writes.
                             guard = (lifecycle.message_guard(_mgen) if lifecycle is not None
                                      else contextlib.nullcontext(True))
+                            stale_at_write = False
+                            cache_protected = False
                             with guard as accepted, self._doctor_data_lock:
                                 if not accepted:
-                                    logging.info("[refresh] stale clinic data rejected during UI write: gen=%s", _mgen)
-                                    continue
-                                if (
+                                    stale_at_write = True
+                                elif (
                                     isinstance(appointment_data, dict)
                                     and "error" in appointment_data
                                     and _appointments_data_count(self.all_doctors_data.get(doctor_name)) > 0
                                 ):
-                                    logging.warning(f"[CACHE_PROTECT] 保留 {doctor_name} 既有門診人數快取，略過錯誤覆蓋。")
-                                    continue
-                                self.all_doctors_data[doctor_name] = appointment_data
-                                # [codex 2026-07-17] 遠期止掛掃描的資格【綁在目前存著的這筆
-                                # 資料】,不是「這位醫師曾經拿過即時資料」:因為每一筆 payload
-                                # 都會覆蓋 all_doctors_data,若資格是黏著的,之後來一筆漸進式
-                                # 部分結果(還沒併休診覆蓋)或磁碟快取 fallback 覆蓋上去,掃描
-                                # 仍會拿那筆非最終資料去寄信。故:最終即時資料→解鎖;任何
-                                # 非最終資料覆蓋→立刻取消資格,等下一筆最終資料再解鎖。
-                                with self._alert_state_lock:
-                                    if is_live_final:
-                                        self._live_clinic_data_keys.add(doctor_name)
-                                    else:
-                                        self._live_clinic_data_keys.discard(doctor_name)
+                                    cache_protected = True
+                                else:
+                                    self.all_doctors_data[doctor_name] = appointment_data
+                                    # [codex 2026-07-17] 遠期止掛掃描的資格【綁在目前存著的這筆
+                                    # 資料】,不是「這位醫師曾經拿過即時資料」:因為每一筆 payload
+                                    # 都會覆蓋 all_doctors_data,若資格是黏著的,之後來一筆漸進式
+                                    # 部分結果(還沒併休診覆蓋)或磁碟快取 fallback 覆蓋上去,掃描
+                                    # 仍會拿那筆非最終資料去寄信。故:最終即時資料→解鎖;任何
+                                    # 非最終資料覆蓋→立刻取消資格,等下一筆最終資料再解鎖。
+                                    with self._alert_state_lock:
+                                        if is_live_final:
+                                            self._live_clinic_data_keys.add(doctor_name)
+                                        else:
+                                            self._live_clinic_data_keys.discard(doctor_name)
+                            if stale_at_write:
+                                logging.info("[refresh] stale clinic data rejected during UI write: gen=%s", _mgen)
+                                continue
+                            if cache_protected:
+                                logging.warning(f"[CACHE_PROTECT] 保留 {doctor_name} 既有門診人數快取，略過錯誤覆蓋。")
+                                continue
                             self._schedule_refresh()
                             # [效能] 傳 bound method(thunk)而非預先 deepcopy：deepcopy 延到寫檔時做一次
                             self._schedule_save_cache('cache_clinic_counts.json', self._get_all_doctors_data_snapshot)
