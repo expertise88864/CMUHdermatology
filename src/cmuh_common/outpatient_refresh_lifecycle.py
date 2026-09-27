@@ -149,8 +149,9 @@ class OutpatientRefreshLifecycle:
                     self._queued = remaining
                 run = self._claim(incoming, took_over=stale)
                 return RefreshDecision("started", len(self._queued), run)
-            if (signature == self._active.request.signature
-                    or any(item.signature == signature for item in self._queued)):
+            if (signature == self._active.request.signature and self._completion is None):
+                return RefreshDecision("duplicate", len(self._queued))
+            if any(item.signature == signature for item in self._queued):
                 return RefreshDecision("duplicate", len(self._queued))
             if incoming.doctors is not None:
                 for index, item in enumerate(self._queued):
@@ -191,13 +192,15 @@ class OutpatientRefreshLifecycle:
             return (not self._stopped and self._active is not None
                     and self._completion is None and generation == self._generation)
 
-    def submit_if_current(self, generation: int, submit: Callable[..., Any], *args: Any) -> Any | None:
+    def submit_if_current(
+            self, generation: int, submit: Callable[..., Any],
+            *args: Any, **kwargs: Any) -> Any | None:
         """Serialize a short local executor submission with stop/takeover."""
         with self._lock:
             if (self._stopped or self._active is None or self._completion is not None
                     or generation != self._generation):
                 return None
-            return submit(*args)
+            return submit(*args, **kwargs)
 
     def accepts_message(self, generation: int | None) -> bool:
         with self._lock:

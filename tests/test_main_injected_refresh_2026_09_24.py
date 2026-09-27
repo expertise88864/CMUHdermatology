@@ -23,7 +23,7 @@ def test_refresh_uses_injected_fetcher_and_stamps_its_generation(monkeypatch):
         main, "check_appointment_count",
         lambda *_args: (_ for _ in ()).throw(AssertionError("real HIS fetch invoked")),
     )
-    monkeypatch.setattr(main, "_kick_off_alert_reconcile", lambda **_kwargs: None)
+    monkeypatch.setattr(main, "_kick_off_alert_reconcile", lambda after=None: None)
     fetched = []
     app = main.AutomationApp.__new__(main.AutomationApp)
     app._shutting_down = False

@@ -405,7 +405,7 @@ def test_main_and_scheduler_background_executors_are_bounded():
 
 def test_refresh_batches_use_local_executor_instead_of_bg_queue():
     for rel_path in ("src/main.py",):
-        src = _function_source(ROOT / rel_path, "_start_claimed_refresh")
+        src = _function_source(ROOT / rel_path, "_start_claimed_refresh_run")
 
         assert 'thread_name_prefix="RefreshBatch"' in src
         assert '"_appointment_fetcher", check_appointment_count' in src
@@ -453,7 +453,7 @@ def test_duty_queries_report_success_for_daily_cache_decision():
 
 def test_refresh_submit_rejection_restores_ui_state():
     for rel_path in ("src/main.py",):
-        src = _function_source(ROOT / rel_path, "_start_claimed_refresh")
+        src = _function_source(ROOT / rel_path, "_start_claimed_refresh_run")
         settle = _function_source(ROOT / rel_path, "_drain_refresh_lifecycle_ui")
 
         assert "RejectedExecutionError" in src
@@ -461,7 +461,7 @@ def test_refresh_submit_rejection_restores_ui_state():
         assert "generation, self.bg_executor.submit, run_parallel_checks" in src
         assert "refresh_future.add_done_callback(on_submit_done)" in src
         assert "lifecycle.mark_finished(generation, rejected=True)" in src
-        assert 'self.status_text.set("狀態: 背景佇列忙碌，刷新稍後重試")' in settle
+        assert 'self.status_text.set("狀態: 門診刷新未啟動，稍後重試")' in settle
         assert 'self.refresh_button.config(state="normal")' in settle
 
 

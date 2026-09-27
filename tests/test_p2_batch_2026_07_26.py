@@ -170,9 +170,11 @@ def test_refresh_flag_cleared_inside_lock_and_last():
     first = lifecycle.request(False).run
     lifecycle.take_start()
     assert lifecycle.mark_finished(first.generation)
+    assert lifecycle.request(False).kind == "queued"
     assert lifecycle.request(False).kind == "duplicate"
-    assert lifecycle.finish_on_ui().run == first
-    assert lifecycle.request(False).kind == "started"
+    handoff = lifecycle.finish_on_ui()
+    assert handoff.run == first
+    assert handoff.next_run.request.signature == first.request.signature
 
 
 def test_refresh_completion_callback_validates_ownership():

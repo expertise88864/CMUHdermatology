@@ -112,12 +112,15 @@ class TestZombiePayloadsAreDropped:
         """★check_appointment_count 的每一個送出點都要帶戳★ 漏一個,
         那條路的舊資料就照樣蓋新資料。"""
         text, fn = _src_of("check_appointment_count")
-        seg = ast.get_source_segment(text, fn) or ""
-        emits = seg.count("UiClinicDataMessage(")
-        stamped = seg.count("refresh_gen=")
-        assert emits >= 5, f"送出點只剩 {emits} 個(守衛自己失效了?)"
-        assert stamped >= emits, (
-            f"★{emits} 個送出點只有 {stamped} 個帶世代戳★")
+        emits = [
+            call for call in ast.walk(fn)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "UiClinicDataMessage"
+        ]
+        assert len(emits) >= 5, f"送出點只剩 {len(emits)} 個(守衛自己失效了?)"
+        assert all(any(kw.arg == "refresh_gen" for kw in call.keywords)
+                   for call in emits), "★每個資料送出點都必須帶世代戳★"
 
 
     def test_the_worker_config_carries_the_generation(self):
@@ -371,7 +374,7 @@ class TestEscalationNeverForcesMidWorkflow:
         """升級呼叫端要走閘門(而不是自己 `_restart_app()`)。
         ★不再檢查 force_after_max★:那個參數已經不存在,
         「絕不強制」現在是閘門自己的性質(上面那條測試釘住)。"""
-        text, fn = _src_of("_start_claimed_refresh")
+        text, fn = _src_of("_start_claimed_refresh_run")
         seg = ast.get_source_segment(text, fn) or ""
         i = seg.index("_reg52_restart_requested = True")
         j = i + 600

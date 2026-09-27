@@ -82,7 +82,7 @@ class _Executor:
 
 
 def _app(monkeypatch, *, clock=None, reject=False):
-    monkeypatch.setattr(main, "_kick_off_alert_reconcile", lambda **_kwargs: None)
+    monkeypatch.setattr(main, "_kick_off_alert_reconcile", lambda after=None: None)
     monkeypatch.setattr(main, "check_appointment_count", lambda *_a: (
         _ for _ in ()).throw(AssertionError("real appointment source invoked")))
     app = main.AutomationApp.__new__(main.AutomationApp)
@@ -253,6 +253,42 @@ def test_completion_waits_until_all_batched_ui_messages_are_applied(monkeypatch)
     assert len(app.bg_executor.submitted) == 2
 
 
+def test_completion_after_observation_does_not_drop_final_clinic_data(monkeypatch):
+    app, _ = _app(monkeypatch)
+    app.ui_queue = Queue(maxsize=1000)
+    app._trigger_refresh(False, [_doctor("A")])
+    app._trigger_refresh(True, [_doctor("B")])
+    generation = app._refresh_lifecycle.generation
+    for index in range(250):
+        app.ui_queue.put(UiStatusMessage(f"unrelated {index}"))
+    put_ui_message(app.ui_queue, UiClinicDataMessage(
+        "A", {"value": "FINAL"}, is_live_final=True, refresh_gen=generation))
+
+    lifecycle = app._refresh_lifecycle
+    original = OutpatientRefreshLifecycle.pending_completion_generation.fget
+    observed = [False]
+
+    def finish_after_unfinished_read(current):
+        pending = original(current)
+        if current is lifecycle and not observed[0]:
+            observed[0] = True
+            assert pending is None
+            assert current.mark_finished(generation)
+            return None
+        return pending
+
+    monkeypatch.setattr(OutpatientRefreshLifecycle, "pending_completion_generation",
+                        property(finish_after_unfinished_read))
+    app.process_ui_queue()
+    assert app._refresh_lifecycle.generation == generation
+    assert "A" not in app.all_doctors_data
+
+    app.process_ui_queue()
+    assert app.all_doctors_data["A"] == {"value": "FINAL"}
+    assert "A" in app._live_clinic_data_keys
+    assert app._refresh_lifecycle.generation == generation + 1
+
+
 def test_unrelated_ui_backlog_does_not_starve_queued_refresh(monkeypatch):
     app, _ = _app(monkeypatch)
     app.ui_queue = Queue(maxsize=1000)
@@ -284,7 +320,7 @@ def test_network_failure_and_executor_rejection_release_ui(monkeypatch):
     assert rejected.refresh_button.state == "disabled"
     rejected.process_ui_queue()
     assert rejected.refresh_button.state == "normal"
-    assert "佇列忙碌" in rejected.status_text.value
+    assert "未啟動" in rejected.status_text.value
     assert rejected._refresh_lifecycle.pending_callback_count == 0
 
 
@@ -475,6 +511,86 @@ def test_alert_reconcile_finishing_after_close_skips_app_callback(monkeypatch):
     app._refresh_lifecycle.stop()
     after_callbacks[0]()
     assert swept == []
+
+
+def test_alert_cleanup_runs_after_owning_refresh_has_finished(monkeypatch):
+    app, _ = _app(monkeypatch)
+    after_callbacks = []
+    swept = []
+    monkeypatch.setattr(main, "_kick_off_alert_reconcile", lambda after=None: after_callbacks.append(after))
+    app._sweep_alert_pending = lambda: swept.append(True)
+    app._appointment_fetcher = lambda queue, config: _emit(queue, config, "OK")
+    app._trigger_refresh(False, [_doctor("A")])
+    worker = app.bg_executor.run(0)
+    worker.join(timeout=5)
+    app.process_ui_queue()
+    assert len(after_callbacks) == 1
+    assert not app._refresh_lifecycle.owns(1)
+    after_callbacks[0]()
+    assert swept == [True]
+
+
+def test_alert_cleanup_from_taken_over_run_still_sweeps_global_pending_state(monkeypatch):
+    app, clock = _app(monkeypatch)
+    after_callbacks = []
+    swept = []
+    entered = threading.Event()
+    release = threading.Event()
+    monkeypatch.setattr(main, "_kick_off_alert_reconcile", lambda after=None: after_callbacks.append(after))
+    app._sweep_alert_pending = lambda: swept.append(True)
+
+    def source(_queue, config):
+        if config["name"] == "OLD":
+            entered.set()
+            assert release.wait(5)
+
+    app._appointment_fetcher = source
+    app._trigger_refresh(False, [_doctor("OLD")])
+    old_worker = app.bg_executor.run(0)
+    assert entered.wait(5)
+    clock[0] += 901
+    app._trigger_refresh(False, [_doctor("NEW")])
+    assert app._refresh_lifecycle.generation == 2
+    after_callbacks[0]()
+    assert swept == [True]
+    release.set()
+    old_worker.join(timeout=5)
+    assert not old_worker.is_alive()
+
+
+def test_claimed_setup_failure_releases_ownership(monkeypatch):
+    app, _ = _app(monkeypatch)
+    original_set = app.status_text.set
+    app.status_text.set = lambda _value: (
+        _ for _ in ()).throw(RuntimeError("synthetic Tk setup failure"))
+    app._trigger_refresh(False, [_doctor("A")])
+    assert app.bg_executor.submitted == []
+    assert app._refresh_lifecycle.pending_callback_count == 1
+    app.status_text.set = original_set
+    app.process_ui_queue()
+    assert app._refresh_lifecycle.pending_callback_count == 0
+    assert app.refresh_button.state == "normal"
+
+
+def test_drain_exception_does_not_stop_ui_polling(monkeypatch):
+    app, _ = _app(monkeypatch)
+    app._drain_refresh_lifecycle_ui = lambda: (
+        _ for _ in ()).throw(RuntimeError("synthetic drain failure"))
+    app.process_ui_queue()
+    assert app.root.scheduled[-1] == app.process_ui_queue
+
+
+def test_uncopyable_full_snapshot_does_not_leave_refresh_button_disabled(monkeypatch):
+    app, _ = _app(monkeypatch)
+    monkeypatch.setattr(main, "DOCTORS", [_doctor("A")])
+    app.all_doctors_data = {"uncopyable": threading.Lock()}
+    app._appointment_fetcher = lambda _queue, _config: None
+    app._trigger_refresh(False)
+    worker = app.bg_executor.run(0)
+    worker.join(timeout=5)
+    app.process_ui_queue()
+    assert app.refresh_button.state == "normal"
+    assert app._refresh_lifecycle.pending_callback_count == 0
 
 
 def test_window_close_cleanup_stops_refresh_before_executor_shutdown(monkeypatch):

@@ -898,7 +898,16 @@ class TestReconcileIsOffTheClinicalPath:
         assert worker is not None, "找不到刷新 worker（測試自己失效了）"
         called = {c.func.id for c in ast.walk(worker)
                   if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
-        assert "_kick_off_alert_reconcile" in called, "刷新路徑沒有點火回查"
+        kickoff = [
+            c for c in ast.walk(worker)
+            if isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Attribute)
+            and c.func.attr == "submit_if_current"
+            and len(c.args) >= 2
+            and isinstance(c.args[1], ast.Name)
+            and c.args[1].id == "_kick_off_alert_reconcile"
+        ]
+        assert kickoff, "刷新路徑沒有點火回查"
         assert "_reconcile_alert_deliveries" not in called, (
             "★同步呼叫回查 → IMAP 掛掉時掛號資料要等它★")
 

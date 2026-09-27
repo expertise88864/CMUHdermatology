@@ -64,6 +64,18 @@ def test_a_young_worker_queues_instead_of_being_taken_over():
     assert lifecycle.generation == first.generation
 
 
+def test_same_request_after_worker_completion_is_not_silently_dropped():
+    lifecycle, _ = _lifecycle()
+    first = lifecycle.request(False).run
+    lifecycle.take_start()
+    assert lifecycle.mark_finished(first.generation)
+    assert lifecycle.request(False).kind == "queued"
+    assert lifecycle.request(False).kind == "duplicate"
+    second = lifecycle.finish_on_ui().next_run
+    assert second is not None and second.generation == first.generation + 1
+    assert second.request.signature == first.request.signature
+
+
 def test_takeover_subtracts_overlap_from_merged_partial_queue():
     lifecycle, clock = _lifecycle()
     old = lifecycle.request(False, [_doctor("A")]).run

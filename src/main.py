@@ -14011,6 +14011,14 @@ class AutomationApp:
         run: RefreshRun | None = lifecycle.take_start()
         if run is None:
             return
+        try:
+            self._start_claimed_refresh_run(lifecycle, run)
+        except Exception:
+            logging.exception("門診刷新啟動失敗；釋放本輪擁有權")
+            lifecycle.mark_finished(run.generation, rejected=True)
+
+    def _start_claimed_refresh_run(self, lifecycle: OutpatientRefreshLifecycle, run: RefreshRun):
+        """Set up the claimed run; the caller records any setup failure."""
         is_manual = run.request.manual
         specific_doctors = run.request.doctors
         generation = run.generation
@@ -14053,12 +14061,15 @@ class AutomationApp:
                 if not lifecycle.can_dispatch_batch(generation):
                     return
                 try:
-                    def sweep_if_current():
-                        if lifecycle.owns(generation) and not getattr(self, "_shutting_down", False):
+                    def sweep_if_open():
+                        # Suppression state is global, not refresh-generation data.
+                        # A slow IMAP check must release expired suppression even
+                        # if another refresh took over in the meantime.
+                        if not lifecycle.stopped and not getattr(self, "_shutting_down", False):
                             self._sweep_alert_pending()
 
                     lifecycle.submit_if_current(
-                        generation, _kick_off_alert_reconcile, sweep_if_current)
+                        generation, _kick_off_alert_reconcile, after=sweep_if_open)
                 except Exception:
                     logging.debug("[delivery] alert reconcile kickoff failed", exc_info=True)
                 batches = partition_doctors_for_refresh_batches(doctors_to_check)
@@ -14137,22 +14148,30 @@ class AutomationApp:
         # generation current until its data/ticks are consumed; unrelated UI
         # traffic must not starve the next queued refresh indefinitely.
         completed_gen = lifecycle.pending_completion_generation
-        if completed_gen is not None:
-            with self.ui_queue.mutex:
-                if any(
-                    isinstance(item, (UiClinicDataMessage, UiRefreshTickMessage))
-                    and getattr(item, "refresh_gen", None) == completed_gen
-                    for item in self.ui_queue.queue
-                ):
-                    return
+        if completed_gen is None:
+            # mark_finished can race this read. Never acknowledge a completion
+            # we did not observe before checking the remaining UI messages.
+            return
+        with self.ui_queue.mutex:
+            if any(
+                isinstance(item, (UiClinicDataMessage, UiRefreshTickMessage))
+                and getattr(item, "refresh_gen", None) == completed_gen
+                for item in self.ui_queue.queue
+            ):
+                return
         completed = lifecycle.finish_on_ui()
         if completed is not None:
             run = completed.run
             refresh_time = datetime.now().strftime("%H:%M:%S")
             if not completed.rejected and run.request.doctors is None:
-                with self._doctor_data_lock:
-                    self._last_full_refresh_snapshot = deepcopy(self.all_doctors_data)
-                self._last_full_refresh_ts = time.time()
+                try:
+                    with self._doctor_data_lock:
+                        snapshot = deepcopy(self.all_doctors_data)
+                except Exception:
+                    logging.exception("門診刷新快照建立失敗；仍完成 UI 收尾")
+                else:
+                    self._last_full_refresh_snapshot = snapshot
+                    self._last_full_refresh_ts = time.time()
             self._cancel_pending_refresh_tick_ui()
             if completed.next_run is None:
                 self.refresh_button.config(state="normal")
@@ -14162,7 +14181,7 @@ class AutomationApp:
                         self.startup_phase_text.set("完成")
                     self.status_text.set(f"狀態: 閒置（最新更新: {refresh_time}）")
                 else:
-                    self.status_text.set("狀態: 背景佇列忙碌，刷新稍後重試")
+                    self.status_text.set("狀態: 門診刷新未啟動，稍後重試")
                 if (getattr(self, "_startup_defer_full_until_priority_done", False)
                         and run.request.doctors is not None
                         and not getattr(self, "_startup_priority_phase_b_pending", False)):
@@ -16467,9 +16486,14 @@ class AutomationApp:
 
         if getattr(self, '_shutting_down', False):
             return
-        self._drain_refresh_lifecycle_ui()
-        next_delay = 80 if had_work else 320
-        self._ui_queue_poll_id = self.root.after(next_delay, self.process_ui_queue)
+        try:
+            self._drain_refresh_lifecycle_ui()
+        except Exception:
+            logging.exception("門診刷新 UI 收尾失敗；保留訊息輪詢")
+        finally:
+            if not getattr(self, '_shutting_down', False):
+                next_delay = 80 if had_work else 320
+                self._ui_queue_poll_id = self.root.after(next_delay, self.process_ui_queue)
         
     def update_clock_status_from_web(self, from_retry=False):
         if threading.current_thread() is not threading.main_thread():

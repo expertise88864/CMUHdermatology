@@ -351,10 +351,31 @@ class TestItIsActuallyWired:
 
     def test_the_sweep_has_a_caller(self):
         """★[wired-up-or-it-does-not-exist]★ 沒有呼叫端＝那個 docstring 是假的。"""
+        import ast as _ast
         text = io.open(os.path.join(REPO_ROOT, "src", "main.py"),
                        encoding="utf-8").read()
-        assert "after=self._sweep_alert_pending" in text, (
-            "★掃描沒有被接上任何輪次 → 抑制永遠不會解除★")
+        tree = _ast.parse(text)
+        kickoff = [
+            call for call in _ast.walk(tree)
+            if isinstance(call, _ast.Call)
+            and isinstance(call.func, _ast.Attribute)
+            and call.func.attr == "submit_if_current"
+            and len(call.args) >= 2
+            and isinstance(call.args[1], _ast.Name)
+            and call.args[1].id == "_kick_off_alert_reconcile"
+            and any(kw.arg == "after" and isinstance(kw.value, _ast.Name)
+                    and kw.value.id == "sweep_if_open" for kw in call.keywords)
+        ]
+        assert kickoff, "★掃描沒有接上背景回查 → 抑制永遠不會解除★"
+        callbacks = [node for node in _ast.walk(tree)
+                     if isinstance(node, _ast.FunctionDef)
+                     and node.name == "sweep_if_open"]
+        assert any(
+            isinstance(call, _ast.Call)
+            and isinstance(call.func, _ast.Attribute)
+            and call.func.attr == "_sweep_alert_pending"
+            for callback in callbacks for call in _ast.walk(callback)
+        ), "★背景回查完成後沒有執行抑制清理★"
 
     def test_the_sweep_runs_after_the_reconcile(self):
         """掃描要用的是收斂【之後】的帳本狀態。"""
