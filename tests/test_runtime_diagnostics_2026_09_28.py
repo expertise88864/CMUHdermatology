@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from cmuh_common.delivery_ledger import DeliveryLedger
 from cmuh_common.runtime_diagnostics import (
     DiagnosticEvents, DiagnosticRun, DiagnosticStore, MAX_EVENTS, RETENTION_SECONDS,
     last_success, latest_run, read_only_sqlite_uri, render_safe_events,
@@ -1708,6 +1709,93 @@ def test_many_older_confirmed_parents_do_not_create_storage_warning(tmp_path):
     assert "請檢查本機儲存空間或權限" not in text
 
 
+def test_many_closed_partial_parents_do_not_exhaust_actionable_scan(tmp_path):
+    path = tmp_path / "ledger.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE deliveries (state TEXT, updated_at REAL, "
+                     "recipients TEXT, category TEXT, created_at REAL, "
+                     "parent_id TEXT, superseded_by TEXT, body_text TEXT)")
+        conn.executemany("INSERT INTO deliveries VALUES (?,?,?,?,?,?,?,?)", [
+            ("partial", float(index + 110),
+             json.dumps({"synthetic@example.test": "permanent_refused"}),
+             "consult", float(index + 100), "", "", "")
+            for index in range(300)])
+        conn.execute("INSERT INTO deliveries VALUES (?,?,?,?,?,?,?,?)", (
+            "confirmed", 500.0, "{}", "consult", 490.0, "", "", ""))
+    snapshot = read_consult_delivery(path)
+    assert snapshot["state"] == "confirmed"
+    assert not snapshot.get("other_attention", {}).get("scan_limited")
+    assert "摘要僅檢查最近 256 筆" not in consult_summary([], snapshot, now=510)
+
+
+def test_consult_summary_reads_real_delivery_ledger_schema(tmp_path):
+    ledger = DeliveryLedger(str(tmp_path / "ledger.sqlite3"))
+    try:
+        rejected = ledger.begin(business_key="synthetic-1", category="consult",
+                                recipients=["synthetic@example.test"])
+        assert ledger.settle(rejected, refused={
+            "synthetic@example.test": (550, "synthetic refusal")}) == "failed"
+        accepted = ledger.begin(business_key="synthetic-2", category="consult",
+                                recipients=["synthetic@example.test"])
+        assert ledger.settle(accepted, refused={}) == "confirmed"
+        snapshot = read_consult_delivery(ledger.path)
+        assert snapshot["state"] == "confirmed"
+        assert not snapshot.get("other_attention", {}).get("scan_limited")
+    finally:
+        if ledger._conn is not None:
+            ledger._conn.close()
+            ledger._conn = None
+
+
+def test_old_actionable_parent_survives_many_closed_partial_rows(tmp_path):
+    path = tmp_path / "ledger.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE deliveries (state TEXT, updated_at REAL, "
+                     "recipients TEXT, category TEXT, created_at REAL, "
+                     "parent_id TEXT, superseded_by TEXT, body_text TEXT)")
+        conn.execute("INSERT INTO deliveries VALUES (?,?,?,?,?,?,?,?)", (
+            "unknown", 101.0, "{}", "consult", 100.0, "", "", ""))
+        conn.executemany("INSERT INTO deliveries VALUES (?,?,?,?,?,?,?,?)", [
+            ("partial", float(index + 110),
+             json.dumps({"synthetic@example.test": "permanent_refused"}),
+             "consult", float(index + 100), "", "", "")
+            for index in range(300)])
+        conn.execute("INSERT INTO deliveries VALUES (?,?,?,?,?,?,?,?)", (
+            "confirmed", 500.0, "{}", "consult", 490.0, "", "", ""))
+    snapshot = read_consult_delivery(path)
+    assert snapshot["other_attention"]["pending"]
+    assert not snapshot["other_attention"].get("scan_limited")
+
+
+def test_malformed_partial_parent_remains_visible_after_closed_rows(tmp_path):
+    path = tmp_path / "ledger.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE deliveries (state TEXT, updated_at REAL, "
+                     "recipients TEXT, category TEXT, created_at REAL, "
+                     "parent_id TEXT, superseded_by TEXT, body_text TEXT)")
+        conn.execute("INSERT INTO deliveries VALUES (?,?,?,?,?,?,?,?)", (
+            "partial", 101.0, "{malformed}", "consult", 100.0, "", "", ""))
+        conn.executemany("INSERT INTO deliveries VALUES (?,?,?,?,?,?,?,?)", [
+            ("partial", float(index + 110),
+             json.dumps({"synthetic@example.test": "permanent_refused"}),
+             "consult", float(index + 100), "", "", "")
+            for index in range(300)])
+        conn.execute("INSERT INTO deliveries VALUES (?,?,?,?,?,?,?,?)", (
+            "confirmed", 500.0, "{}", "consult", 490.0, "", "", ""))
+    snapshot = read_consult_delivery(path)
+    assert snapshot["other_attention"]["unknown_state"]
+    assert not snapshot["other_attention"].get("scan_limited")
+
+
+def test_diagnostic_exception_cannot_replace_clinical_flow(tmp_path, monkeypatch):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    run = DiagnosticRun(store, wall_clock=lambda: 100.0)
+    monkeypatch.setattr(store, "record", lambda **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("synthetic diagnostic write failure")))
+    run.emit("query", "started")
+    assert run._write_lost and run._write_lost_storage
+
+
 def test_many_older_confirmed_parents_do_not_create_permanent_manual_prompt(
         tmp_path):
     path = tmp_path / "ledger.sqlite3"
@@ -2474,7 +2562,11 @@ def test_clock_batch_stopped_after_first_account_reports_incomplete(
 
     monkeypatch.setattr(clock, "_perform_clock_action_locked", finish_first)
     clock.process_clock_task(schedule_key)
-    text = clock_summary(store.read(), None, today=datetime.now().date())
+    events = store.read()
+    observed = max(event["observed_at"] for event in events)
+    text = clock_summary(events, None,
+                         today=datetime.fromtimestamp(observed).date(),
+                         now=observed)
     assert "最近觀察：官方已確認" not in text
     assert "請至官方系統確認" in text
 
@@ -2489,7 +2581,7 @@ def test_unreadable_diagnostics_are_not_empty_history(tmp_path):
     assert consult_events.unavailable and clock_events.unavailable
     assert "診斷紀錄無法讀取" in consult_summary(consult_events, None)
     assert "診斷紀錄無法讀取" in clock_summary(
-        clock_events, None, today=datetime.now().date())
+        clock_events, None, today=date(2026, 10, 5))
     assert "diagnostics_read_unavailable" in render_safe_events(consult_events)
 
 
@@ -2587,7 +2679,11 @@ def test_clock_action_order_follows_claim_acquisition(monkeypatch, tmp_path):
         clock.perform_clock_action(None, None, {"username": "synthetic"},
                                    True, dt_time(8), dt_time(9),
                                    diagnostic_run=diag)
-    text = clock_summary(store.read(), None, today=datetime.now().date())
+    events = store.read()
+    observed = max(event["observed_at"] for event in events)
+    text = clock_summary(events, None,
+                         today=datetime.fromtimestamp(observed).date(),
+                         now=observed)
     assert "最近觀察：官方已確認" in text
 
 
@@ -2639,8 +2735,10 @@ def test_partial_contention_then_window_expiry_keeps_batch_failure(
     assert latest["stage"] == "done" and latest["outcome"] == "failed"
     assert not any(item["run_id"] == latest["run_id"] and
                    item["reason"] == "flow_busy" for item in events)
+    observed = max(event["observed_at"] for event in events)
     assert "請至官方系統確認" in clock_summary(
-        events, None, today=datetime.now().date())
+        events, None, today=datetime.fromtimestamp(observed).date(),
+        now=observed)
 
 
 def test_legacy_clock_dry_run_does_not_hide_real_failure_or_claim_success():

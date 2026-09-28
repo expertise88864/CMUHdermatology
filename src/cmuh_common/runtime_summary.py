@@ -124,11 +124,38 @@ def read_consult_delivery(path: str | Path) -> dict | None:
                 "LIMIT 1").fetchone()
             body_flag = ("CASE WHEN body_text IS NULL OR body_text='' "
                          "THEN 0 ELSE 1 END" if "body_text" in columns else "1")
+            # Filter only *definitely* closed partial/failed parents before
+            # applying the 256-row attention limit. A malformed recipient map
+            # remains visible for the conservative unknown-state warning.
+            try:
+                conn.execute("SELECT json_valid(?)", ("{}",)).fetchone()
+                conn.execute("SELECT value FROM json_each(?)", ("{}",)).fetchone()
+                has_json = True
+            except sqlite3.OperationalError as error:
+                if not ("no such function" in str(error).lower() or
+                        "no such table: json_each" in str(error).lower()):
+                    raise
+                has_json = False
+            closed_filter = ""
+            if has_json:
+                safe_json = ("CASE WHEN json_valid(recipients) THEN "
+                             "recipients ELSE '{}' END")
+                closed_filter = (
+                    " AND (state IS NULL OR state NOT IN ('partial','failed') "
+                    "OR NOT (" + body_flag + "=0 AND "
+                    "COALESCE(json_valid(recipients),0)=1 AND "
+                    "CASE WHEN json_valid(recipients) THEN "
+                    "json_type(recipients) ELSE '' END='object' AND "
+                    "EXISTS (SELECT 1 FROM json_each(" + safe_json + ")) AND "
+                    "NOT EXISTS (SELECT 1 FROM json_each(" + safe_json +
+                    ") AS recipient WHERE recipient.type!='text' OR "
+                    "recipient.value NOT IN "
+                    "('confirmed','permanent_refused'))))")
             older_attention = (conn.execute(
                 "SELECT state,updated_at,recipients,created_at," + body_flag +
                 " FROM deliveries WHERE category='consult' AND parent_id='' "
                 "AND rowid<? AND (state IS NULL OR state!='confirmed')" +
-                active + " ORDER BY rowid DESC LIMIT 257",
+                active + closed_filter + " ORDER BY rowid DESC LIMIT 257",
                 (row[0],)).fetchall() if row else [])
             older_confirmed = (conn.execute(
                 "SELECT rowid,state,updated_at,recipients,created_at FROM deliveries "

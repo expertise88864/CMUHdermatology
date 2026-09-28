@@ -725,12 +725,17 @@ class DiagnosticRun:
             reason = "order_uncertain"
             if self._write_lost_storage and error == "none":
                 error = "storage"
-        written = self.store.record(
-            run_id=self.run_id,
-            run_started_at=(self.action_started_at if self.action_started_at is not None
-                            else self.started_at),
-            stage=stage, outcome=outcome, duration_ms=duration,
-            error=error, reason=reason, observed_at=self._wall_clock())
+        try:
+            written = self.store.record(
+                run_id=self.run_id,
+                run_started_at=(self.action_started_at if self.action_started_at is not None
+                                else self.started_at),
+                stage=stage, outcome=outcome, duration_ms=duration,
+                error=error, reason=reason, observed_at=self._wall_clock())
+        except Exception:
+            # Diagnostics are best-effort. Never replace an uncertain-send
+            # exception or prevent clock authentication state from persisting.
+            written = False
         if written is not True:
             self._write_lost = True
             if written is False:

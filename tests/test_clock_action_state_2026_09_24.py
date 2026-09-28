@@ -188,7 +188,10 @@ def test_two_fake_accounts_report_partial_confirmation(monkeypatch, tmp_path):
             True, time(7, 30), time(8, 0), task_label="am_in",
             portal=portal, diagnostic_run=run)
 
-    text = clock_summary(diagnostics.read(), None)
+    events = diagnostics.read()
+    observed = max(event["observed_at"] for event in events)
+    text = clock_summary(events, None, today=datetime.fromtimestamp(observed).date(),
+                         now=observed)
     assert "最近觀察：部分帳號未確認" in text
     assert "人工處理：請檢查打卡網站狀態" in text
     assert unreadable.submits == confirmed.submits == 0
@@ -225,7 +228,10 @@ def test_transient_prepare_timeout_then_official_record_is_not_partial(
     clock._perform_clock_action_locked(
         None, None, {"username": "synthetic", "password": "synthetic"},
         True, time(7, 30), time(8, 0), task_label="am_in", portal=portal)
-    text = clock_summary(diagnostics.read(), None)
+    events = diagnostics.read()
+    observed = max(event["observed_at"] for event in events)
+    text = clock_summary(events, None, today=datetime.fromtimestamp(observed).date(),
+                         now=observed)
     assert portal.attempts == 1
     assert portal.submits == 0
     assert "最近觀察：官方已確認" in text
