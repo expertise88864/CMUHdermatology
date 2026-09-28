@@ -2295,7 +2295,9 @@ def test_claim_contended_clock_run_cannot_hide_holders_read_failure(
                  observed_at=instant - 2, stage="done",
                  outcome="read_unknown", error="read", reason="check_portal")
     clock.process_clock_task(schedule_key)
-    events = store.read()
+    # Keep retention and run ordering on the scenario clock, independent of
+    # the runner's time zone and the day on which CI executes this test.
+    events = store.read(now=instant)
     assert any(item["stage"] == "done" and item["outcome"] == "skipped"
                and item["reason"] == "flow_busy" for item in events)
     text = clock_summary(events, None, today=date(2026, 10, 5), now=instant)
@@ -2316,7 +2318,7 @@ def test_claim_contended_clock_run_cannot_hide_holders_read_failure(
         lambda *_args, **kwargs: kwargs["diagnostic_run"].emit(
             "done", "official_confirmed"))
     clock.process_clock_task(schedule_key)
-    events = store.read()
+    events = store.read(now=instant)
     latest = latest_run(events)
     assert latest["outcome"] == "official_confirmed"
     assert not any(item["run_id"] == latest["run_id"] and
