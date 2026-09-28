@@ -7322,7 +7322,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                              time.monotonic() - held_since > 20 * 60)
         diagnostic.emit("done", "skipped",
                         error="unknown" if held_too_long else "none",
-                        reason="check_job" if held_too_long else "none")
+                        reason="check_job" if held_too_long else "flow_busy")
         _note_flow_lock_skipped(trigger_label)
         # ★[2026-07-30 外審第 1 輪] email 觸發的要排隊補跑,不可直接丟掉★
         #   `trigger_job_async` 只在【gate 擋下】時排隊；gate 放行但 `_flow_lock`
@@ -7351,6 +7351,9 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                 requeued_out.extend(trigger_uids)
             logging.info("[re-trigger] 已排隊，等目前任務結束後補跑這筆 email 觸發")
         return
+    # Reconciliation runs before the HIS lock and can finish in a different
+    # order from the clinical flow. Order HIS observations from the moment this
+    # invocation actually owns the lock, not from preflight entry.
     # [2026-07-25 審查] import/CoInitialize 必須在 try 內：舊版放在 acquire 與 try 之間,
     # 這兩行只要拋一次例外(自動更新正在改寫 pywin32 檔案、CoInitialize 回
     # RPC_E_CHANGED_MODE 等),鎖就【永久洩漏】——之後每次輪詢都只印 INFO「已有任務
@@ -7364,8 +7367,14 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
     _flow_lock_held_since[0] = time.monotonic()
     pythoncom = None
     com_initialized = False
-    diagnostic_token = _CURRENT_DIAGNOSTIC_RUN.set(diagnostic)
+    diagnostic_token = None
+    attempts_entered = False
     try:
+        diagnostic = DiagnosticRun(DIAGNOSTICS)
+        diagnostic_token = _CURRENT_DIAGNOSTIC_RUN.set(diagnostic)
+        # The lock holder must be observable before COM initialization can
+        # block; otherwise a later stale-lock skip looks like an old success.
+        diagnostic.emit("query", "started")
         import pythoncom       # noqa: PLC0415
         pythoncom.CoInitialize()
         com_initialized = True
@@ -7479,6 +7488,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
         #   寄信重試 = 重送【同一份】payload、同一個 Message-ID、同一張附件。
         his_result = None
         delivery = None
+        attempts_entered = True
         for attempt in range(1, retry_count + 1):
             # ★[2026-08-05 外審第 4 輪 P1-10]★ 這一輪的 HIS 那一段做完了沒有。
             #   做完之後才失敗的(組信、附截圖、SMTP/Outlook)都與 HIS 無關 ——
@@ -7488,6 +7498,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
             # 免得上一輪的 id 被這一輪的失敗收尾誤用）。
             _did = ""
             diagnostic_failure_recorded = False
+            ledger_missing = False
             try:
                 logging.info("會診查詢任務 第 %d/%d 次嘗試（trigger=%s, 收件人組=%s, mail=%s）",
                              attempt, retry_count, trigger_label,
@@ -7726,6 +7737,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     diagnostic.emit("prepare", "started")
                     _did = _delivery_begin(delivery, trigger_label,
                                            claim_event=True)
+                    ledger_missing = not bool(_did)
                     diagnostic.emit("prepare", "skipped" if _did == _CLAIM_TAKEN
                                     else "ok" if _did else "failed",
                                     since=prepare_started,
@@ -7800,7 +7812,9 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                             require_durable_rcpt=False)
                     except DeliveryOutcomeUnknown:
                         diagnostic.emit("send", "pending", since=send_started,
-                                        error="timeout", reason="verify_delivery")
+                                        error="ledger" if not _did else "timeout",
+                                        reason="check_storage" if not _did else
+                                        "verify_delivery")
                         diagnostic_failure_recorded = True
                         # 可能已送達 → 待查(留給 Message-ID 回查收斂)
                         _delivery_settle(_did, unknown=True)
@@ -7808,7 +7822,9 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                         raise
                     except Exception:
                         diagnostic.emit("send", "failed", since=send_started,
-                                        error="transport")
+                                        error="ledger" if not _did else "transport",
+                                        reason="check_storage" if not _did else
+                                        "none")
                         diagnostic_failure_recorded = True
                         # 確定沒送出去(連不上/認證/5xx/未設定)→ FAILED,不是待查。
                         # 若哪天 SMTP 層把「DATA 之後斷線」也改判成結果不明,
@@ -7825,19 +7841,28 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     _delivery_settle(_did, refused=_refused)
                     diagnostic.emit("send", "refused" if _refused else "accepted",
                                     since=send_started,
-                                    error="refusal" if _refused else
-                                    "ledger" if not _origin_did else "none",
-                                    reason="fix_recipient" if _refused else
-                                    "check_storage" if not _origin_did else "none")
+                                    error="ledger" if not _origin_did else
+                                    "refusal" if _refused else "none",
+                                    reason="check_storage" if not _origin_did else
+                                    "fix_recipient" if _refused else "none")
                     _did = ""
                     # ★[2026-08-08 外審第 10 輪 P1-01] 暫時性拒收要真的補寄★
                     #   舊寫法把 refused 記進帳本就繼續往下走:更新已通知基準、
                     #   任務記成功。那幾位收件人不但這一輪沒收到,下一輪也不會
                     #   再寄(基準已經前進)——一則臨床通知就這樣永久消失,
                     #   而 log 上是一次成功的寄送。
+                    initial_refused = dict(_refused or {})
                     _refused = _resend_transient_refusals(
                         delivery, _refused, trigger_label,
                         origin_did=_origin_did)
+                    if (_refused or {}) != initial_refused:
+                        diagnostic.emit(
+                            "send", "refused" if _refused else "accepted",
+                            since=send_started,
+                            error="ledger" if not _origin_did else
+                            "refusal" if _refused else "none",
+                            reason="check_storage" if not _origin_did else
+                            "fix_recipient" if _refused else "none")
                     # ★同一輪補不完的,不可以就這樣走人★(第 3 回 P1-1)
                     #   下面馬上要更新「已通知基準」,一旦推進,這批會診就再也
                     #   不會被寄給任何人了 —— 那幾位等於永久收不到。
@@ -8010,8 +8035,12 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                         break
                     if not diagnostic_failure_recorded:
                         diagnostic.emit("done", "failed",
-                                        error="read" if not his_stage_done else "unknown",
-                                        reason="verify_his" if not his_stage_done else "check_job")
+                                        error=("ledger" if ledger_missing else
+                                               "read" if not his_stage_done else
+                                               "unknown"),
+                                        reason=("check_storage" if ledger_missing else
+                                                "verify_his" if not his_stage_done else
+                                                "check_job"))
                     _discard_undelivered_shot(delivery)
                     try:
                         _note_job_failure(_developer_alert_recipients(),
@@ -8044,8 +8073,14 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                     #   fatal 讓它可能在第 1 次就進來 —— 沒 break 就會回頭再送一次
                     #   帳密,而且把失敗通知再寄一遍。我上一版正是這樣。
                     break
+    except Exception:
+        if not attempts_entered and diagnostic_token is not None:
+            diagnostic.emit("done", "failed", error="unknown",
+                            reason="check_job")
+        raise
     finally:
-        _CURRENT_DIAGNOSTIC_RUN.reset(diagnostic_token)
+        if diagnostic_token is not None:
+            _CURRENT_DIAGNOSTIC_RUN.reset(diagnostic_token)
         if com_initialized:            # 只有 CoInitialize 真的成功過才配對 Uninitialize
             try:
                 pythoncom.CoUninitialize()

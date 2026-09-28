@@ -11,11 +11,15 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import consult_query as cq  # noqa: E402
 import cmuh_common.smtp_mail as smtp_mail  # noqa: E402
-from cmuh_common.runtime_diagnostics import DiagnosticStore  # noqa: E402
+from cmuh_common.runtime_diagnostics import (  # noqa: E402
+    DiagnosticStore, MAX_EVENTS,
+)
 from cmuh_common.runtime_summary import consult_summary  # noqa: E402
 
 
@@ -168,6 +172,165 @@ def test_diagnostics_fake_his_failure_smtp_unknown_and_partial_refusal(
                for e in store.read())
 
 
+@pytest.mark.parametrize("ledger_id", ["synthetic-did", ""])
+def test_successful_immediate_refusal_retry_updates_diagnostic_outcome(
+        monkeypatch, tmp_path, ledger_id):
+    store = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", store)
+    _JobHarness(monkeypatch, _base_cfg(retry_count=1),
+                extracted_text="synthetic consult")
+    monkeypatch.setattr(cq, "_delivery_begin", lambda *_a, **_k: ledger_id)
+    monkeypatch.setattr(cq, "_delivery_settle", lambda *_a, **_k: None)
+    monkeypatch.setattr(cq, "send_via_smtp", lambda *_a, **_k:
+                        {"sched_b@x.tw": (450, "temporary")})
+    monkeypatch.setattr(cq, "_resend_transient_refusals",
+                        lambda _delivery, _refused, *_a, **_k: {})
+    cq._do_full_job("17:00")
+    text = consult_summary(store.read(), None)
+    assert "寄送端接受" in text
+    assert "請檢查收件設定與拒收原因" not in text
+    assert "另有無帳本確認拒收" not in text
+    if not ledger_id:
+        assert "請檢查本機儲存空間或權限" in text
+
+
+def test_refusal_does_not_hide_missing_delivery_ledger(monkeypatch, tmp_path):
+    store = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", store)
+    _JobHarness(monkeypatch, _base_cfg(retry_count=1),
+                extracted_text="synthetic consult")
+    monkeypatch.setattr(cq, "_delivery_begin", lambda *_a, **_k: "")
+    monkeypatch.setattr(cq, "_delivery_settle", lambda *_a, **_k: None)
+    monkeypatch.setattr(cq, "_resend_transient_refusals",
+                        lambda _delivery, refused, *_a, **_k: refused)
+    monkeypatch.setattr(cq, "send_via_smtp", lambda *_a, **_k:
+                        {"sched_b@x.tw": (550, "refused")})
+    cq._do_full_job("17:00")
+    old_delivery = {"state": "confirmed", "created_at": 1.0,
+                    "observed_at": 2.0,
+                    "counts": {"confirmed": 1, "transient_refused": 0,
+                               "permanent_refused": 0, "unknown": 0}}
+    text = consult_summary(store.read(), old_delivery)
+    assert "請檢查本機儲存空間或權限" in text
+    assert "請檢查收件設定與拒收原因" in text
+    current = time.time()
+    store.record(run_id="f" * 32, run_started_at=current + 1,
+                 observed_at=current + 1, stage="send", outcome="accepted")
+    for index in range(MAX_EVENTS + 12):
+        store.record(run_id=f"{index:032x}",
+                     run_started_at=current + 2 + index * 0.01,
+                     observed_at=current + 2 + index * 0.01,
+                     stage="done", outcome="skipped", reason="flow_busy")
+    text = consult_summary(store.read(now=current + 6), old_delivery,
+                           now=current + 6)
+    assert "另有無帳本確認拒收" in text
+    assert "請檢查收件設定與拒收原因" in text
+    assert "請檢查本機儲存空間或權限" in text
+
+
+@pytest.mark.parametrize("uncertain", [True, False])
+def test_send_exception_keeps_missing_delivery_ledger_warning(
+        monkeypatch, tmp_path, uncertain):
+    store = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", store)
+    _JobHarness(monkeypatch, _base_cfg(retry_count=1),
+                extracted_text="synthetic consult")
+    monkeypatch.setattr(cq, "_delivery_begin", lambda *_a, **_k: "")
+    monkeypatch.setattr(cq, "_delivery_settle", lambda *_a, **_k: None)
+    exception = (cq.DeliveryOutcomeUnknown("synthetic uncertainty")
+                 if uncertain else RuntimeError("synthetic transport failure"))
+
+    def fail_send(*_args, **_kwargs):
+        raise exception
+
+    monkeypatch.setattr(cq, "send_via_smtp", fail_send)
+    cq._do_full_job("17:00")
+    old_delivery = {"state": "confirmed", "created_at": 1.0,
+                    "observed_at": 2.0,
+                    "counts": {"confirmed": 1, "transient_refused": 0,
+                               "permanent_refused": 0, "unknown": 0}}
+    text = consult_summary(store.read(), old_delivery)
+    assert "請檢查本機儲存空間或權限" in text
+    if uncertain:
+        assert "請核對寄件備份，勿直接重寄" in text
+        current = time.time()
+        store.record(run_id="f" * 32, run_started_at=current + 1,
+                     observed_at=current + 1, stage="send", outcome="accepted")
+        text = consult_summary(store.read(now=current + 2), old_delivery,
+                               now=current + 2)
+        assert "另有無帳本寄送待確認" in text
+        assert "請核對寄件備份，勿直接重寄" in text
+        assert "請檢查本機儲存空間或權限" in text
+        for index in range(MAX_EVENTS + 12):
+            store.record(run_id=f"{index:032x}",
+                         run_started_at=current + 2 + index * 0.01,
+                         observed_at=current + 2 + index * 0.01,
+                         stage="done", outcome="skipped",
+                         reason="flow_busy")
+        text = consult_summary(store.read(now=current + 6), old_delivery,
+                               now=current + 6)
+        assert "另有無帳本寄送待確認" in text
+        assert "請核對寄件備份，勿直接重寄" in text
+    else:
+        assert "錯誤分類：寄送帳本；寄送" in text
+
+
+@pytest.mark.parametrize("refused", [False, True])
+def test_post_send_failure_keeps_missing_ledger_warning(
+        monkeypatch, tmp_path, refused):
+    store = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", store)
+    _JobHarness(monkeypatch, _base_cfg(retry_count=1),
+                extracted_text="synthetic consult")
+    monkeypatch.setattr(cq, "_delivery_begin", lambda *_a, **_k: "")
+    monkeypatch.setattr(cq, "_delivery_settle", lambda *_a, **_k: None)
+    monkeypatch.setattr(cq, "send_via_smtp", lambda *_a, **_k:
+                        {"sched_b@x.tw": (550, "refused")} if refused else {})
+
+    def fail_after_send(*_args, **_kwargs):
+        raise RuntimeError("synthetic post-send failure")
+
+    monkeypatch.setattr(cq, "_resend_transient_refusals", fail_after_send)
+    cq._do_full_job("17:00")
+    old_delivery = {"state": "confirmed", "created_at": 1.0,
+                    "observed_at": 2.0,
+                    "counts": {"confirmed": 1, "transient_refused": 0,
+                               "permanent_refused": 0, "unknown": 0}}
+    text = consult_summary(store.read(), old_delivery)
+    assert "階段：完成｜狀態：失敗" in text
+    assert "請檢查本機儲存空間或權限" in text
+    assert "請檢查執行紀錄" in text
+    if refused:
+        assert "請檢查收件設定與拒收原因" in text
+        current = time.time()
+        for index in range(MAX_EVENTS + 12):
+            store.record(run_id=f"{index:032x}",
+                         run_started_at=current + index * 0.01,
+                         observed_at=current + index * 0.01,
+                         stage="query", outcome="read_failed",
+                         error="read", reason="verify_his")
+        assert any(item["stage"] == "send" and item["outcome"] == "refused"
+                   for item in store.read(now=current + 5))
+
+
+def test_reconciliation_failure_remains_visible_after_his_success(
+        monkeypatch, tmp_path):
+    store = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", store)
+    _JobHarness(monkeypatch, _base_cfg(retry_count=1),
+                extracted_text="synthetic consult")
+
+    def fail_reconcile():
+        raise RuntimeError("synthetic ledger reconciliation failure")
+
+    monkeypatch.setattr(cq, "_drain_pending_refusal_retries", fail_reconcile)
+    cq._do_full_job("17:00")
+    text = consult_summary(store.read(), None)
+    assert "寄送端接受" in text
+    assert "另有寄送核對失敗" in text
+    assert "請核對寄件備份，勿直接重寄" in text
+
+
 def test_diagnostics_keeps_unknown_roster_visible_after_send_acceptance(
         monkeypatch, tmp_path):
     store = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
@@ -241,7 +404,11 @@ def test_non_send_final_failure_has_terminal_diagnostic(monkeypatch, tmp_path):
     assert latest["reason"] == "check_job"
 
 
-def test_stale_flow_lock_skip_requires_manual_job_check(monkeypatch, tmp_path):
+@pytest.mark.parametrize("held_minutes,reason", [
+    (1, "flow_busy"), (25, "check_job"),
+])
+def test_flow_lock_skip_reason_matches_holder_age(
+        monkeypatch, tmp_path, held_minutes, reason):
     import threading
     diagnostics = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
     monkeypatch.setattr(cq, "DIAGNOSTICS", diagnostics)
@@ -253,7 +420,7 @@ def test_stale_flow_lock_skip_requires_manual_job_check(monkeypatch, tmp_path):
     lock.acquire()
     monkeypatch.setattr(cq, "_flow_lock", lock)
     monkeypatch.setattr(cq, "_flow_lock_held_since",
-                        [time.monotonic() - 25 * 60])
+                        [time.monotonic() - held_minutes * 60])
     try:
         cq._do_full_job("poll")
     finally:
@@ -261,8 +428,132 @@ def test_stale_flow_lock_skip_requires_manual_job_check(monkeypatch, tmp_path):
     latest = diagnostics.read()[0]
     assert latest["stage"] == "done"
     assert latest["outcome"] == "skipped"
-    assert latest["reason"] == "check_job"
-    assert "請檢查執行紀錄" in consult_summary(diagnostics.read(), None)
+    assert latest["reason"] == reason
+    if reason == "check_job":
+        assert "請檢查執行紀錄" in consult_summary(diagnostics.read(), None)
+
+
+def test_his_execution_order_follows_flow_lock_acquisition(
+        monkeypatch, tmp_path):
+    import threading
+
+    diagnostics = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", diagnostics)
+    monkeypatch.setattr(cq, "_flow_lock", threading.Lock())
+    monkeypatch.setattr(cq, "_flow_lock_held_since", [0.0])
+    harness = _JobHarness(monkeypatch, _base_cfg(retry_count=1),
+                          extracted_text="synthetic consult")
+    entered = threading.Event()
+    release = threading.Event()
+    errors = []
+
+    def drain():
+        if threading.current_thread().name == "older-trigger":
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("preflight was not released")
+
+    monkeypatch.setattr(cq, "_drain_pending_refusal_retries", drain)
+    monkeypatch.setattr(cq, "_reconcile_unknown_deliveries", lambda: None)
+    monkeypatch.setattr(cq, "_close_out_stale_recipient_retries", lambda: None)
+    original_flow = cq.run_consult_flow
+
+    def flow(*args, **kwargs):
+        if threading.current_thread().name == "older-trigger":
+            raise RuntimeError("synthetic HIS failure")
+        return original_flow(*args, **kwargs)
+
+    monkeypatch.setattr(cq, "run_consult_flow", flow)
+
+    def older_trigger():
+        try:
+            cq._do_full_job("email")
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=older_trigger, name="older-trigger")
+    worker.start()
+    try:
+        assert entered.wait(5)
+        cq._do_full_job("email")
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive() and not errors
+    assert harness.sent
+    events = diagnostics.read()
+    assert any(item["stage"] == "send" and item["outcome"] == "accepted"
+               for item in events)
+    assert any(item["stage"] == "query" and item["outcome"] == "read_failed"
+               for item in events)
+    assert "查詢失敗" in consult_summary(events, None)
+
+
+def test_com_initialization_failure_replaces_previous_consult_success(
+        monkeypatch, tmp_path):
+    import pythoncom
+
+    diagnostics = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", diagnostics)
+    _JobHarness(monkeypatch, _base_cfg(retry_count=1),
+                extracted_text="synthetic consult")
+    cq._do_full_job("email")
+    assert "寄送端接受" in consult_summary(diagnostics.read(), None)
+
+    def fail_com():
+        raise RuntimeError("synthetic COM initialization failure")
+
+    monkeypatch.setattr(pythoncom, "CoInitialize", fail_com)
+    with pytest.raises(RuntimeError, match="synthetic COM"):
+        cq._do_full_job("email")
+    text = consult_summary(diagnostics.read(), None)
+    assert "階段：完成｜狀態：失敗" in text
+    assert "請檢查執行紀錄" in text
+
+
+def test_stalled_prequery_holder_keeps_stale_lock_warning(
+        monkeypatch, tmp_path):
+    import threading
+    import pythoncom
+
+    diagnostics = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", diagnostics)
+    monkeypatch.setattr(cq, "_flow_lock", threading.Lock())
+    monkeypatch.setattr(cq, "_flow_lock_held_since", [0.0])
+    _JobHarness(monkeypatch, _base_cfg(retry_count=1),
+                extracted_text="synthetic consult")
+    cq._do_full_job("email")
+    entered, release = threading.Event(), threading.Event()
+    original_initialize = pythoncom.CoInitialize
+    errors = []
+
+    def blocked_initialize():
+        if threading.current_thread().name == "blocked-holder":
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("synthetic prequery wait timed out")
+        return original_initialize()
+
+    monkeypatch.setattr(pythoncom, "CoInitialize", blocked_initialize)
+
+    def holder_job():
+        try:
+            cq._do_full_job("email")
+        except Exception as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=holder_job, name="blocked-holder")
+    worker.start()
+    try:
+        assert entered.wait(5)
+        cq._flow_lock_held_since[0] = time.monotonic() - 25 * 60
+        cq._do_full_job("poll")
+        text = consult_summary(diagnostics.read(), None)
+        assert "請檢查執行紀錄並人工核對結果" in text
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive() and not errors
 
 def test_route_email_trigger_sends_to_trigger_sender(monkeypatch):
     """IMAP 觸發(override_recipients=觸發者) → 結果回寄給「觸發者本人」。"""

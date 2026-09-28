@@ -1450,7 +1450,7 @@ def perform_clock_action(driver, wait, acc, is_in: bool,
                         check_start: dt_time, check_end: dt_time,
                         dry_run: bool = False, task_label: str = "",
                         portal: ClockPortalPort | None = None,
-                        diagnostic_run: DiagnosticRun | None = None) -> None:
+                        diagnostic_run: DiagnosticRun | None = None) -> bool | None:
     """★整段包在跨行程宣告裡★(外審 R3-P2-04 R2 P1)。
 
     「先查刷卡表、沒紀錄才打」是 check-then-act:查完到點下去之間還有 1~5 秒
@@ -1469,11 +1469,15 @@ def perform_clock_action(driver, wait, acc, is_in: bool,
            f"|{check_start}-{check_end}|{_clock_today().isoformat()}")
     with exclusive_claim(key) as owned:
         if not owned:
+            if diagnostic_run is not None:
+                diagnostic_run.emit("done", "skipped", reason="verify_clock")
             logging.warning(
                 "[單例] 另一個 autoclock 正在為 %s 執行 %s 的打卡 → 本次略過"
                 "(避免重複打卡;對方若當掉,下一輪會接手)",
                 acc.get("username", "?"), "上班" if is_in else "下班")
-            return
+            return False
+        if diagnostic_run is not None:
+            diagnostic_run.mark_action_started()
         return _perform_clock_action_locked(
             driver, wait, acc, is_in, check_start, check_end, dry_run,
             task_label, portal=portal, diagnostic_run=diagnostic_run)
@@ -1799,6 +1803,8 @@ def process_clock_task(schedule_key: str | None) -> None:
         except Exception:
             diag.emit("browser", "failed", since=started,
                       error="portal", reason="check_portal")
+            diag.emit("done", "failed", error="portal",
+                      reason="check_portal")
             raise
         diag.emit("browser", "ok" if driver else "failed", since=started,
                   error="none" if driver else "portal",
@@ -1829,8 +1835,11 @@ def process_clock_task(schedule_key: str | None) -> None:
             # Chrome 反覆死掉時無限重建耗光窗口)。
             _rebuilds = 0
             _MAX_REBUILDS = 2
+            attempted_claims = 0
+            owned_any_claim = False
             for acc in accs:
                 if not running.is_set():
+                    diag.emit("done", "skipped", reason="verify_clock")
                     break
                 # [AC-01] 窗尾防線:任務在窗尾起跑 + portal 慢時,已排隊到窗外的帳號不再
                 # 打卡(避免遲到紀錄),交補卡提醒接手。perform_clock_action 內另有一道點擊前檢查。
@@ -1854,15 +1863,20 @@ def process_clock_task(schedule_key: str | None) -> None:
                         logging.error("[autoclock] 重建 driver 失敗，中止本任務剩餘帳號")
                         break
                     wait = WebDriverWait(driver, 20)
-                perform_clock_action(
+                claim_result = perform_clock_action(
                     driver, wait, acc, is_in, check_start, check_end,
                     dry_run=False, task_label=schedule_key,
                     diagnostic_run=diag,
                 )
+                attempted_claims += 1
+                if claim_result is not False:
+                    owned_any_claim = True
                 # 每處理完一個帳號就刷新 last_used，讓任務結束後 idle 倒數從「最後一個
                 # 帳號完成」起算（in_use 旗標負責任務進行中的保護，此處負責任務後計時）。
                 with _persistent_driver_pool["lock"]:
                     _persistent_driver_pool["last_used"] = time_module.time()
+            if attempted_claims == len(accs) and not owned_any_claim:
+                diag.emit("done", "skipped", reason="flow_busy")
         except Exception as e:
             diag.emit("done", "failed", error="portal",
                       reason="check_portal")
