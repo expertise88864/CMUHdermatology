@@ -1,5 +1,6 @@
 """An uncertain portal response never authorizes a duplicate click or success."""
 
+import time as time_module
 from datetime import date, datetime, time
 
 import pytest
@@ -163,7 +164,8 @@ def test_unreadable_fake_portal_never_submits_or_marks_done(monkeypatch, tmp_pat
 
 def test_two_fake_accounts_report_partial_confirmation(monkeypatch, tmp_path):
     diagnostics = DiagnosticStore(tmp_path / "clock_diag.sqlite3", "clock")
-    run = DiagnosticRun(diagnostics)
+    observed_at = time_module.time()
+    run = DiagnosticRun(diagnostics, wall_clock=lambda: observed_at)
     monkeypatch.setattr(clock, "DIAGNOSTICS", diagnostics)
     monkeypatch.setattr(clock, "CLOCK_STATE_FILE", tmp_path / "clock_state.json")
     monkeypatch.setattr(clock, "_clock_state_persistence_enabled", True)
@@ -188,10 +190,10 @@ def test_two_fake_accounts_report_partial_confirmation(monkeypatch, tmp_path):
             True, time(7, 30), time(8, 0), task_label="am_in",
             portal=portal, diagnostic_run=run)
 
-    events = diagnostics.read()
-    observed = max(event["observed_at"] for event in events)
-    text = clock_summary(events, None, today=datetime.fromtimestamp(observed).date(),
-                         now=observed)
+    events = diagnostics.read(now=observed_at)
+    text = clock_summary(events, None,
+                         today=datetime.fromtimestamp(observed_at).date(),
+                         now=observed_at)
     assert "最近觀察：部分帳號未確認" in text
     assert "人工處理：請檢查打卡網站狀態" in text
     assert unreadable.submits == confirmed.submits == 0
