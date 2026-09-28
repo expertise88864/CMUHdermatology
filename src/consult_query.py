@@ -7728,7 +7728,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                         )
                     except Exception:
                         diagnostic.emit("redact", "failed", since=redact_started,
-                                        error="privacy")
+                                        error="privacy", reason="check_job")
                         diagnostic_failure_recorded = True
                         raise
                     diagnostic.emit("redact", "ok", since=redact_started)
@@ -7747,6 +7747,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                                     error="ledger" if not _did else "none",
                                     reason="check_storage" if not _did else "none")
                     if _did == _CLAIM_TAKEN:
+                        diagnostic.emit("done", "skipped")
                         # ★同一事件已有 sender 在負責 → 這一輪不寄★
                         #   (外審 2026-08-18 P1-01)最典型的是自動更新
                         #   交棒:舊 generation 的 SMTP 還在飛、去重檔還
@@ -7892,7 +7893,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                         raise
                     except Exception:
                         diagnostic.emit("send", "failed", since=send_started,
-                                        error="transport")
+                                        error="transport", reason="check_job")
                         diagnostic_failure_recorded = True
                         raise
                     diagnostic.emit("send", "accepted", since=send_started)

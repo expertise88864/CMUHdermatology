@@ -1501,6 +1501,7 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
     retries = 5
     last_exc = None
     phase = "login"
+    click_may_have_been_sent = False
     for attempt in range(retries):
         phase = "login"
         try:
@@ -1609,6 +1610,7 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                 logging.error("%s 無法保存待確認打卡狀態，本次不點擊；請人工確認",
                               acc["username"])
                 return
+            click_may_have_been_sent = True
             started = diag.start()
             diag.emit("submit", "started")
             phase = "submit"
@@ -1696,12 +1698,12 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                 messagebox.showerror("測試失敗", str(e))
             break
 
-    if phase == "read":
-        diag.emit("done", "read_unknown", error="read",
-                  reason="check_portal")
-    elif phase in ("submit", "confirm"):
+    if click_may_have_been_sent:
         diag.emit("done", "click_pending", error="portal",
                   reason="verify_clock")
+    elif phase == "read":
+        diag.emit("done", "read_unknown", error="read",
+                  reason="check_portal")
     else:
         diag.emit("done", "failed", error="portal",
                   reason="check_portal")

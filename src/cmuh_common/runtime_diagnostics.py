@@ -51,6 +51,14 @@ def _safe_code(value: object, allowed: frozenset[str], fallback: str) -> str:
     return value if isinstance(value, str) and value in allowed else fallback
 
 
+def read_only_sqlite_uri(path: Path) -> str:
+    """Keep mapped drives local and omit URI authority for UNC shares."""
+    uri = path.absolute().as_uri()
+    if uri.startswith("file://") and not uri.startswith("file:///"):
+        uri = "file:////" + uri[len("file://"):]
+    return uri + "?mode=ro"
+
+
 def _is_executed_observation(stage: str, outcome: str, reason: str) -> bool:
     return (stage not in {"parse", "reconcile"} and outcome != "dry_run"
             and not (stage == "done" and outcome == "skipped" and
@@ -503,7 +511,7 @@ class DiagnosticStore:
         if not stat.S_ISREG(metadata.st_mode):
             return DiagnosticEvents(unavailable=True)
         try:
-            uri = self.path.resolve().as_uri() + "?mode=ro"
+            uri = read_only_sqlite_uri(self.path)
             with closing(sqlite3.connect(uri, uri=True, timeout=0.1)) as conn:
                 conn.execute("PRAGMA query_only=ON")
                 # Schema, run-order markers and observations must come from

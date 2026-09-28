@@ -399,6 +399,8 @@ def test_outlook_diagnostics_separates_definite_failure_from_uncertainty(
     assert any(e["stage"] == "send" and e["outcome"] == "failed"
                for e in diagnostics.read())
     assert diagnostics.read()[0]["stage"] == "send"
+    assert "人工處理：請檢查執行紀錄" in consult_summary(
+        diagnostics.read(), None)
 
     def unknown_send(*_a, **_k):
         raise cq.DeliveryOutcomeUnknown("uncertain")
@@ -407,6 +409,44 @@ def test_outlook_diagnostics_separates_definite_failure_from_uncertainty(
     cq._do_full_job("email")
     assert any(e["stage"] == "send" and e["outcome"] == "pending"
                for e in diagnostics.read())
+
+
+def test_redaction_failure_requests_manual_job_check(monkeypatch, tmp_path):
+    diagnostics = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", diagnostics)
+    _JobHarness(monkeypatch, _base_cfg(retry_count=1),
+                extracted_text="synthetic consult")
+
+    def fail_redaction(**_kwargs):
+        raise RuntimeError("synthetic redaction failure")
+
+    monkeypatch.setattr(cq, "_seal_consult_delivery", fail_redaction)
+    cq._do_full_job("email")
+    events = diagnostics.read()
+    assert events[0]["stage"] == "redact"
+    assert events[0]["outcome"] == "failed"
+    assert "人工處理：請檢查執行紀錄" in consult_summary(events, None)
+
+
+def test_claim_taken_finishes_diagnostic_without_false_stale_lock_warning(
+        monkeypatch, tmp_path):
+    diagnostics = DiagnosticStore(tmp_path / "consult_diag.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", diagnostics)
+    harness = _JobHarness(monkeypatch, _base_cfg(retry_count=1),
+                          extracted_text="synthetic consult")
+    monkeypatch.setattr(cq, "_delivery_begin",
+                        lambda *_args, **_kwargs: cq._CLAIM_TAKEN)
+    cq._do_full_job("email")
+    assert not harness.sent
+    events = diagnostics.read()
+    assert events[0]["stage"] == "done"
+    assert events[0]["outcome"] == "skipped"
+    assert events[0]["reason"] == "none"
+    later_skip = dict(events[0], run_id="f" * 32,
+                      run_started_at=events[0]["run_started_at"] + 1,
+                      observed_at=events[0]["observed_at"] + 2,
+                      reason="check_job")
+    assert latest_run([*events, later_skip]) != later_skip
 
 
 def test_non_send_final_failure_has_terminal_diagnostic(monkeypatch, tmp_path):

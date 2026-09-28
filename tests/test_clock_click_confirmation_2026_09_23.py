@@ -4,6 +4,7 @@ from datetime import datetime, time
 from types import SimpleNamespace
 
 import autoclock as clock
+from cmuh_common.runtime_diagnostics import DiagnosticStore
 
 
 def test_click_unknown_then_official_record_confirms_without_second_click(
@@ -42,6 +43,54 @@ def test_click_unknown_then_official_record_confirms_without_second_click(
     clock._perform_clock_action_locked(*args, task_label="am_in")
     assert len(clicked) == first_clicks, "之後讀到官方紀錄，不得再次點擊"
     assert marked == [("am_in", "synthetic")]
+
+
+def test_failed_logins_after_uncertain_submit_keep_pending_diagnostic(
+        monkeypatch, tmp_path):
+    store = DiagnosticStore(tmp_path / "clock_diag.sqlite3", "clock")
+    monkeypatch.setattr(clock, "DIAGNOSTICS", store)
+    monkeypatch.setattr(clock, "_clock_window_passed", lambda *_a, **_k: False)
+    monkeypatch.setattr(clock, "_check_swipes", lambda *_a: False)
+    monkeypatch.setattr(clock, "_mark_clock_click_pending", lambda *_a: True)
+    monkeypatch.setattr(clock.time_module, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(clock.random, "randint", lambda *_a: 1)
+    monkeypatch.setattr(clock, "exponential_backoff_sleep", lambda *_a, **_k: None)
+    monkeypatch.setattr(clock, "_handle_clock_failure", lambda *_a, **_k: None)
+
+    class FakePortal:
+        logins = 0
+        submits = 0
+
+        def login(self, *_args):
+            self.logins += 1
+            if self.logins > 1:
+                raise clock.WebDriverException("synthetic login failure")
+
+        def read_swipes(self, *_args):
+            return None, [], None, True
+
+        def select_action(self, *_args):
+            pass
+
+        def handle_health(self, *_args):
+            pass
+
+        def execute_button(self, *_args):
+            return object()
+
+        def submit(self, *_args):
+            self.submits += 1
+            raise clock.WebDriverException("synthetic uncertain submit")
+
+    portal = FakePortal()
+    clock._perform_clock_action_locked(
+        object(), object(), {"username": "synthetic", "password": "synthetic"},
+        True, time(7, 30), time(8, 0), task_label="am_in", portal=portal)
+    assert portal.submits == 1
+    assert portal.logins == 5
+    latest = store.read()[0]
+    assert (latest["stage"], latest["outcome"], latest["reason"]) == (
+        "done", "click_pending", "verify_clock")
 
 
 def test_click_pending_survives_restart_and_clears_on_official_record(

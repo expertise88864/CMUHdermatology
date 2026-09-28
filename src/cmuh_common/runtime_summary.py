@@ -13,7 +13,7 @@ from pathlib import Path
 
 from cmuh_common.runtime_diagnostics import (
     event_not_after, event_order, last_success, latest_run,
-    sqlite_temporarily_busy,
+    read_only_sqlite_uri, sqlite_temporarily_busy,
 )
 
 
@@ -108,7 +108,7 @@ def read_consult_delivery(path: str | Path) -> dict | None:
     if not stat.S_ISREG(metadata.st_mode):
         return {"unreadable": True}
     try:
-        uri = path.resolve().as_uri() + "?mode=ro"
+        uri = read_only_sqlite_uri(path)
         with closing(sqlite3.connect(uri, uri=True, timeout=0.1)) as conn:
             conn.execute("PRAGMA query_only=ON")
             columns = {column[1] for column in conn.execute(
@@ -515,6 +515,8 @@ def consult_summary(events: list[dict], delivery: dict | None, *,
         for item in events:
             if item["run_id"] == event["run_id"] or item["stage"] != "query":
                 continue
+            if item["observed_at"] < event["run_started_at"]:
+                continue
             previous = other_queries.get(item["run_id"])
             if previous is None or event_order(item) > event_order(previous):
                 other_queries[item["run_id"]] = item
@@ -640,6 +642,7 @@ def clock_summary(events: list[dict], state: dict | None, *,
         if event["reason"] == "order_uncertain":
             other_failures = [item for item in today_events
                               if item["stage"] == "done" and
+                              item["observed_at"] >= event["run_started_at"] and
                               item["outcome"] in {
                                   "read_unknown", "failed", "click_pending",
                                   "auth_failed"}]

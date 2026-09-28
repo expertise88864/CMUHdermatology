@@ -133,6 +133,8 @@ def _redirect_cached_consts(monkeypatch, app_dir: str) -> None:
     （get_app_dir 這個『函式』本身用穩定 holder 處理，見檔頭 §1/§2；此處只處理『值』常數。）
     泛化掃描（非硬列名單）→ CONFIG_FILE / LOG_FILE / *_FLAG / SHOTS_DIR / _NOTIFIED_FILE /
     DEBUG_DUMPS_DIR / SETTINGS_DIR / BASE_DIR … 全被涵蓋，避免漏列導致跨測試共用狀態。"""
+    from cmuh_common.runtime_diagnostics import DiagnosticStore
+
     for mod in list(sys.modules.values()):
         f = getattr(mod, "__file__", None)
         # abspath 正規化：模組可能經由帶 ".." 的 sys.path 進入（各測試檔用
@@ -140,6 +142,13 @@ def _redirect_cached_consts(monkeypatch, app_dir: str) -> None:
         if not f or not os.path.normcase(os.path.abspath(f)).startswith(_SRC_NORM):
             continue
         for attr, val in list(vars(mod).items()):
+            if isinstance(val, DiagnosticStore):
+                rebased_path = _rebased(val.path, app_dir)
+                if rebased_path is not None:
+                    monkeypatch.setattr(mod, attr,
+                                        DiagnosticStore(rebased_path, val.domain),
+                                        raising=False)
+                continue
             new = _rebased(val, app_dir)
             if new is not None:
                 monkeypatch.setattr(mod, attr, new, raising=False)

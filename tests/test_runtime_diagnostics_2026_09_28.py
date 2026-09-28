@@ -9,13 +9,14 @@ import threading
 import time
 import zipfile
 from datetime import date, datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from cmuh_common.runtime_diagnostics import (
     DiagnosticEvents, DiagnosticRun, DiagnosticStore, MAX_EVENTS, RETENTION_SECONDS,
-    last_success, latest_run, render_safe_events,
+    last_success, latest_run, read_only_sqlite_uri, render_safe_events,
 )
 from cmuh_common.runtime_summary import (
     clock_summary, consult_summary, read_clock_state, read_consult_delivery,
@@ -27,6 +28,40 @@ def _event(run_id, started, observed, stage, outcome, *, error="none",
     return {"run_id": run_id, "run_started_at": started,
             "observed_at": observed, "stage": stage, "outcome": outcome,
             "duration_ms": 10, "error": error, "reason": reason}
+
+
+def test_read_only_uri_keeps_windows_mapped_and_unc_paths_readable():
+    mapped = read_only_sqlite_uri(Path(r"Z:\settings\diagnostics.sqlite3"))
+    unc = read_only_sqlite_uri(Path(r"\\server\share\diagnostics.sqlite3"))
+    assert mapped == "file:///Z:/settings/diagnostics.sqlite3?mode=ro"
+    assert unc == "file:////server/share/diagnostics.sqlite3?mode=ro"
+
+
+def test_uncertain_order_does_not_resurrect_older_resolved_failures():
+    old_consult_failure = _event("a" * 32, 100, 101, "query", "read_failed",
+                                 error="read", reason="verify_his")
+    consult_success = _event("b" * 32, 200, 201, "send", "accepted",
+                             reason="order_uncertain")
+    consult_text = consult_summary([old_consult_failure, consult_success],
+                                   None, now=202)
+    assert "另有查詢失敗" not in consult_text
+
+    old_clock_failure = _event("c" * 32, 100, 101, "done", "read_unknown",
+                               error="read", reason="check_portal")
+    clock_success = _event("d" * 32, 200, 201, "done", "official_confirmed",
+                           reason="order_uncertain")
+    clock_text = clock_summary([old_clock_failure, clock_success], None,
+                               today=datetime.fromtimestamp(201).date(), now=202)
+    assert "部分帳號未確認" not in clock_text
+
+
+def test_module_diagnostic_stores_follow_per_test_settings(tmp_path):
+    import autoclock as clock
+    import consult_query as consult
+
+    expected = tmp_path / "_cmuh_app" / "settings"
+    assert clock.DIAGNOSTICS.path.parent == expected
+    assert consult.DIAGNOSTICS.path.parent == expected
 
 
 def test_store_is_bounded_allowlisted_and_read_does_not_create(tmp_path):
