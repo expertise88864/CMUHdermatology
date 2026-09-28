@@ -7391,6 +7391,9 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
             if not override_recipients:
                 logging.info(
                     "[re-trigger] 補跑的收件人在等鎖期間都已經收到結果了 → 不重複寄送")
+                # This invocation never queried HIS or sent mail. Close the
+                # initial observation without displacing the prior result.
+                diagnostic.emit("done", "skipped", reason="check_job")
                 return
         cfg = load_config()
         # [2026-06-25] 輪詢 poll:00:00-06:00 休息時段 → 直接不開 systemftp、不寄

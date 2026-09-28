@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import consult_query as cq  # noqa: E402
 import cmuh_common.smtp_mail as smtp_mail  # noqa: E402
 from cmuh_common.runtime_diagnostics import (  # noqa: E402
-    DiagnosticStore, MAX_EVENTS,
+    DiagnosticStore, MAX_EVENTS, latest_run,
 )
 from cmuh_common.runtime_summary import consult_summary  # noqa: E402
 
@@ -119,6 +119,26 @@ class _JobHarness:
             self.punch_calls += 1
             return self.punch_text, self.punch_html
         monkeypatch.setattr(cq, "_build_punch_status_sections", _stub_punch)
+
+
+def test_fully_served_email_retrigger_finishes_without_phantom_his_query(
+        monkeypatch, tmp_path):
+    harness = _JobHarness(monkeypatch, _base_cfg())
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", store)
+    monkeypatch.setattr(cq, "_unserved_recipients", lambda _recipients: [])
+    now = time.time()
+    assert store.record(run_id="a" * 32, run_started_at=now - 11,
+                        observed_at=now - 10, stage="send", outcome="accepted")
+    cq._do_full_job("email", override_recipients=["served@example.test"],
+                    from_retrigger=True)
+    events = store.read(now=now + 1)
+    assert harness.flow_runs == 0 and not harness.sent
+    assert any(item["stage"] == "done" and item["outcome"] == "skipped"
+               and item["reason"] == "check_job" for item in events)
+    assert not any(item["stage"] == "query" and
+                   item["outcome"] == "started" for item in events)
+    assert latest_run(events, now=now + 1)["run_id"] == "a" * 32
 
 
 # ─── _do_full_job 收件人路由 ─────────────────────────────────────────────

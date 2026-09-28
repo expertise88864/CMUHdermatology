@@ -452,11 +452,20 @@ def test_corrupt_or_untrusted_event_content_never_enters_export(tmp_path):
     assert "private patient name" not in text
 
 
+def test_safe_export_omits_absolute_event_times():
+    event = _event("a" * 32, 1_790_550_000, 1_790_550_001,
+                   "query", "ok")
+    text = render_safe_events([event])
+    assert "1790550001" not in text
+    assert "query ok 10ms none none" in text
+
+
 def test_locked_diagnostic_database_requests_retry_without_storage_repair(tmp_path):
     store = DiagnosticStore(tmp_path / "events.sqlite3", "clock")
     store.record(run_id="a" * 32, run_started_at=100,
                  observed_at=101, stage="read", outcome="no_record")
     with sqlite3.connect(store.path) as blocker:
+        blocker.execute("PRAGMA locking_mode=EXCLUSIVE")
         blocker.execute("BEGIN EXCLUSIVE")
         events = store.read(now=110)
     assert events == []
@@ -559,6 +568,466 @@ def test_backward_clock_between_runs_keeps_new_failure_over_old_success(
     events = store.read(now=1003)
     assert latest_run(events, now=1003)["run_id"] == new_run
     assert "查詢結果：查詢失敗" in consult_summary(events, None, now=1003)
+
+
+def test_backward_clock_new_failure_does_not_expire_before_old_success(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    old_run, new_run = "a" * 32, "b" * 32
+    store.record(run_id=old_run, run_started_at=1000,
+                 observed_at=1001, stage="send", outcome="accepted")
+    store.record(run_id=new_run, run_started_at=990,
+                 observed_at=991, stage="query", outcome="read_failed",
+                 error="read", reason="verify_his")
+    now = RETENTION_SECONDS + 992
+    events = store.read(now=now)
+    assert latest_run(events, now=now)["run_id"] == new_run
+    assert latest_run(events, now=now)["outcome"] == "read_failed"
+    # A subsequent append also prunes old database rows; the failed run must
+    # remain until the preceding accepted result expires.
+    store.record(run_id="c" * 32, run_started_at=now,
+                 observed_at=now, stage="done", outcome="skipped",
+                 reason="flow_busy")
+    events = store.read(now=now)
+    assert latest_run(events, now=now)["run_id"] == new_run
+    assert latest_run(events, now=now)["outcome"] == "read_failed"
+
+
+def test_late_older_run_success_does_not_revive_after_new_failure(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    old_run, new_run = "a" * 32, "b" * 32
+    store.record(run_id=old_run, run_started_at=800,
+                 observed_at=801, stage="query", outcome="started")
+    store.record(run_id=new_run, run_started_at=890,
+                 observed_at=891, stage="query", outcome="read_failed",
+                 error="read", reason="verify_his")
+    # The older run finishes after the newer run was acquired.
+    store.record(run_id=old_run, run_started_at=800,
+                 observed_at=1001, stage="send", outcome="accepted")
+    now = RETENTION_SECONDS + 892
+    events = store.read(now=now)
+    assert latest_run(events, now=now) is None
+    assert events.ordering_uncertain
+    assert "執行順序不明" in consult_summary(events, None, now=now)
+    # Read-only access to a pre-migration database uses first-event order.
+    with sqlite3.connect(store.path) as conn:
+        conn.execute("DROP TABLE runs")
+    events = store.read(now=now)
+    assert latest_run(events, now=now) is None
+    store.record(run_id="c" * 32, run_started_at=now,
+                 observed_at=now, stage="done", outcome="skipped",
+                 reason="flow_busy")
+    events = store.read(now=now)
+    assert latest_run(events, now=now)["run_id"] == "c" * 32
+    assert any(e["run_id"] == old_run for e in events)
+
+
+def test_newer_failed_run_expiry_uses_observation_not_start(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    store.record(run_id="a" * 32, run_started_at=800,
+                 observed_at=801, stage="query", outcome="started")
+    store.record(run_id="b" * 32, run_started_at=1000,
+                 observed_at=991, stage="query", outcome="read_failed",
+                 error="read", reason="verify_his")
+    store.record(run_id="a" * 32, run_started_at=800,
+                 observed_at=1001, stage="send", outcome="accepted")
+    now = RETENTION_SECONDS + 992
+    events = store.read(now=now)
+    assert latest_run(events, now=now) is None
+    assert events.ordering_uncertain
+
+
+def test_existing_run_order_table_backfills_expiry_marker(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    store.record(run_id="a" * 32, run_started_at=800,
+                 observed_at=801, stage="query", outcome="started")
+    store.record(run_id="b" * 32, run_started_at=1000,
+                 observed_at=991, stage="query", outcome="read_failed",
+                 error="read", reason="verify_his")
+    with sqlite3.connect(store.path) as conn:
+        conn.execute("ALTER TABLE runs DROP COLUMN max_retention_at")
+        conn.execute("ALTER TABLE runs DROP COLUMN executed")
+        conn.execute("ALTER TABLE runs DROP COLUMN expired_barrier")
+        conn.execute("ALTER TABLE events DROP COLUMN retention_at")
+    store.record(run_id="a" * 32, run_started_at=800,
+                 observed_at=1001, stage="send", outcome="accepted")
+    now = RETENTION_SECONDS + 992
+    events = store.read(now=now)
+    assert latest_run(events, now=now) is None
+    assert events.ordering_uncertain
+    with sqlite3.connect(store.path) as conn:
+        marker = conn.execute(
+            "SELECT max_retention_at,executed FROM runs WHERE run_id=?",
+            ("b" * 32,)).fetchone()
+    assert marker == (991, 1)
+
+
+def test_expired_newer_run_keeps_older_unresolved_delivery_warning(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    old_run = "a" * 32
+    store.record(run_id=old_run, run_started_at=800,
+                 observed_at=801, stage="query", outcome="started")
+    store.record(run_id="b" * 32, run_started_at=890,
+                 observed_at=891, stage="query", outcome="read_failed",
+                 error="read", reason="verify_his")
+    store.record(run_id=old_run, run_started_at=800,
+                 observed_at=1001, stage="send", outcome="pending",
+                 error="ledger", reason="verify_delivery")
+    now = RETENTION_SECONDS + 892
+    events = store.read(now=now)
+    assert latest_run(events, now=now) is None
+    assert any(e["run_id"] == old_run and e["outcome"] == "pending"
+               for e in events)
+    text = consult_summary(events, None, now=now)
+    assert "勿直接重寄" in text
+    assert "請檢查本機儲存空間或權限" in text
+
+
+def test_expired_new_run_does_not_reappear_after_old_parse_arrives(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    old_run, new_run = "a" * 32, "b" * 32
+    store.record(run_id=old_run, run_started_at=1000,
+                 observed_at=1000, stage="query", outcome="started")
+    store.record(run_id=new_run, run_started_at=1001,
+                 observed_at=1001, stage="send", outcome="pending",
+                 reason="verify_delivery")
+    now = RETENTION_SECONDS + 1002
+    assert store.read(now=now) == []
+    store.record(run_id=old_run, run_started_at=1000,
+                 observed_at=now, stage="parse", outcome="ok")
+    events = store.read(now=now)
+    assert not any(e["run_id"] == new_run for e in events)
+    assert latest_run(events, now=now) is None
+    assert events.ordering_uncertain
+
+
+def test_newer_failed_run_parser_cannot_revive_older_success(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    store.record(run_id="a" * 32, run_started_at=800,
+                 observed_at=801, stage="query", outcome="started")
+    store.record(run_id="b" * 32, run_started_at=890,
+                 observed_at=891, stage="query", outcome="read_failed",
+                 error="read", reason="verify_his")
+    store.record(run_id="a" * 32, run_started_at=800,
+                 observed_at=1001, stage="send", outcome="accepted")
+    store.record(run_id="b" * 32, run_started_at=890,
+                 observed_at=1002, stage="parse", outcome="ok")
+    now = RETENTION_SECONDS + 892
+    events = store.read(now=now)
+    assert any(e["run_id"] == "b" * 32 and e["stage"] == "parse"
+               for e in events)
+    assert latest_run(events, now=now) is None
+    assert events.ordering_uncertain
+
+
+def test_run_cap_keeps_expired_execution_order_barrier(tmp_path, monkeypatch):
+    import cmuh_common.runtime_diagnostics as diagnostics
+
+    monkeypatch.setattr(diagnostics, "MAX_RUNS", 8)
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    store.record(run_id="a" * 32, run_started_at=800,
+                 observed_at=801, stage="query", outcome="started")
+    store.record(run_id="b" * 32, run_started_at=890,
+                 observed_at=891, stage="query", outcome="read_failed",
+                 error="read", reason="verify_his")
+    store.record(run_id="a" * 32, run_started_at=800,
+                 observed_at=1001, stage="send", outcome="accepted")
+    now = RETENTION_SECONDS + 892
+    for index in range(20):
+        store.record(run_id=f"{index + 2:032x}",
+                     run_started_at=now + index,
+                     observed_at=now + index, stage="done",
+                     outcome="skipped", reason="flow_busy")
+    events = store.read(now=now + 20)
+    assert latest_run(events, now=now + 20)["run_id"] != "a" * 32
+    assert events.ordering_uncertain
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute(
+            "SELECT executed,max_retention_at FROM runs WHERE run_id=?",
+            ("b" * 32,)).fetchone() == (1, 891)
+
+
+def test_rollback_after_age_pruning_keeps_order_barrier(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    store.record(run_id="a" * 32, run_started_at=800,
+                 observed_at=801, stage="query", outcome="started")
+    store.record(run_id="b" * 32, run_started_at=890,
+                 observed_at=891, stage="query", outcome="read_failed",
+                 error="read", reason="verify_his")
+    store.record(run_id="a" * 32, run_started_at=800,
+                 observed_at=1001, stage="send", outcome="accepted")
+    now = RETENTION_SECONDS + 892
+    store.record(run_id="c" * 32, run_started_at=now,
+                 observed_at=now, stage="done", outcome="skipped",
+                 reason="flow_busy")
+    events = store.read(now=now - 2)
+    assert latest_run(events, now=now - 2)["run_id"] != "a" * 32
+    assert events.ordering_uncertain
+
+
+def test_backward_clock_across_runs_marks_anomaly(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    store.record(run_id="a" * 32, run_started_at=1000,
+                 observed_at=1001, stage="send", outcome="accepted")
+    store.record(run_id="b" * 32, run_started_at=900,
+                 observed_at=901, stage="query", outcome="read_failed",
+                 error="read", reason="verify_his")
+    events = store.read(now=1002)
+    assert events.clock_anomaly
+    assert "系統時間異常" in consult_summary(events, None, now=1002)
+
+
+def test_backward_clock_terminal_result_does_not_expire_before_start(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    run_id = "a" * 32
+    store.record(run_id=run_id, run_started_at=1000,
+                 observed_at=1001, stage="query", outcome="started")
+    store.record(run_id=run_id, run_started_at=1000,
+                 observed_at=991, stage="query", outcome="read_failed",
+                 error="read", reason="verify_his")
+    now = RETENTION_SECONDS + 992
+    events = store.read(now=now)
+    assert latest_run(events, now=now)["outcome"] == "read_failed"
+    assert store.read(now=RETENTION_SECONDS + 1002) == []
+
+
+def test_backward_clock_official_confirmation_does_not_expire_early(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "clock")
+    run_id = "a" * 32
+    store.record(run_id=run_id, run_started_at=1000,
+                 observed_at=1001, stage="read", outcome="no_record")
+    store.record(run_id=run_id, run_started_at=1000,
+                 observed_at=991, stage="done", outcome="official_confirmed")
+    now = RETENTION_SECONDS + 992
+    events = store.read(now=now)
+    assert latest_run(events, now=now)["outcome"] == "official_confirmed"
+    store.record(run_id="b" * 32, run_started_at=now,
+                 observed_at=now, stage="done", outcome="skipped",
+                 reason="flow_busy")
+    events = store.read(now=now)
+    assert latest_run(events, now=now)["outcome"] == "official_confirmed"
+
+
+def test_event_cap_cannot_remove_rollback_retention_anchor(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    old_run, new_run = "a" * 32, "b" * 32
+    store.record(run_id=old_run, run_started_at=800,
+                 observed_at=801, stage="query", outcome="started")
+    store.record(run_id=new_run, run_started_at=1100,
+                 observed_at=1100, stage="query", outcome="started")
+    store.record(run_id=new_run, run_started_at=1100,
+                 observed_at=990, stage="query", outcome="read_failed",
+                 error="read", reason="verify_his")
+    store.record(run_id=old_run, run_started_at=800,
+                 observed_at=1050, stage="send", outcome="accepted")
+    for index in range(MAX_EVENTS + 20):
+        store.record(run_id=f"{index + 2:032x}",
+                     run_started_at=1101 + index,
+                     observed_at=1101 + index, stage="done",
+                     outcome="skipped", reason="flow_busy")
+    now = RETENTION_SECONDS + 1000
+    events = store.read(now=now)
+    assert latest_run(events, now=now)["run_id"] == new_run
+    assert latest_run(events, now=now)["outcome"] == "read_failed"
+
+
+def test_corrected_far_future_clock_does_not_poison_retention(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    now = 1_000_000
+    far_future = now + 365 * 86400
+    store.record(run_id="a" * 32, run_started_at=far_future - 1,
+                 observed_at=far_future, stage="send", outcome="accepted")
+    before = store.read(now=now)
+    assert before.clock_anomaly
+    assert latest_run(before, now=now) is None
+    store.record(run_id="b" * 32, run_started_at=now - 1,
+                 observed_at=now, stage="query", outcome="read_failed",
+                 error="read", reason="verify_his")
+    events = store.read(now=now)
+    assert latest_run(events, now=now)["outcome"] == "read_failed"
+    assert not any(e["run_id"] == "a" * 32 for e in events)
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute(
+            "SELECT retention_at FROM events WHERE run_id=?",
+            ("b" * 32,)).fetchone()[0] <= (
+                now + RETENTION_SECONDS)
+        assert conn.execute("SELECT COUNT(*) FROM events WHERE run_id=?",
+                            ("a" * 32,)).fetchone()[0] == 1
+
+
+def test_backward_clock_correction_preserves_ledgerless_send_warning(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    correct_time = 10_000_000.0
+    backward_time = correct_time - 8 * 86400
+    store.record(run_id="a" * 32, run_started_at=correct_time - 1,
+                 observed_at=correct_time, stage="send", outcome="pending",
+                 error="ledger", reason="verify_delivery")
+    store.record(run_id="b" * 32, run_started_at=backward_time - 1,
+                 observed_at=backward_time, stage="query",
+                 outcome="read_failed", error="read", reason="verify_his")
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM events WHERE run_id=?",
+            ("a" * 32,)).fetchone()[0] == 1
+    restored = store.read(now=correct_time + 1)
+    assert any(item["run_id"] == "a" * 32 and
+               item["outcome"] == "pending" for item in restored)
+    text = consult_summary(restored, None, now=correct_time + 1)
+    assert "另有無帳本寄送待確認" in text
+    assert "請核對寄件備份，勿直接重寄" in text
+
+
+def test_hidden_future_executed_run_blocks_older_current_success(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    now = 10_000_000.0
+    store.record(run_id="a" * 32, run_started_at=now - 2,
+                 observed_at=now - 1, stage="send", outcome="accepted")
+    store.record(run_id="b" * 32,
+                 run_started_at=now + 365 * 86400 - 1,
+                 observed_at=now + 365 * 86400,
+                 stage="query", outcome="read_failed",
+                 error="read", reason="verify_his")
+    # The current writer age-prunes the old row; a retained row from an older
+    # writer or interrupted cleanup must still not become the current result.
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            "INSERT INTO events(run_id,run_started_at,observed_at,retention_at,"
+            "stage,outcome,duration_ms,error,reason) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            ("a" * 32, now - 2, now - 1, now - 1, "send", "accepted", 0,
+             "none", "none"))
+    events = store.read(now=now)
+    assert events.clock_anomaly and events.ordering_uncertain
+    assert latest_run(events, now=now) is None
+
+
+def test_older_writer_nullable_retention_remains_readable_and_expires(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    assert store.record(run_id="a" * 32, run_started_at=1000,
+                        observed_at=1001, stage="query", outcome="ok")
+    with sqlite3.connect(store.path) as conn:
+        conn.execute("ALTER TABLE events DROP COLUMN retention_at")
+    assert store.record(run_id="a" * 32, run_started_at=1000,
+                        observed_at=1002, stage="query", outcome="ok")
+    with sqlite3.connect(store.path) as conn:
+        conn.execute("INSERT INTO runs(run_id,run_started_at) VALUES (?,?)",
+                     ("b" * 32, 1100))
+        conn.execute(
+            "INSERT INTO events(run_id,run_started_at,observed_at,stage,"
+            "outcome,duration_ms,error,reason) VALUES (?,?,?,?,?,?,?,?)",
+            ("b" * 32, 1100, 1101, "send", "pending", 0, "ledger",
+             "verify_delivery"))
+    read = store.read(now=1102)
+    assert not read.unavailable
+    assert any(item["run_id"] == "b" * 32 for item in read)
+    assert store.record(run_id="c" * 32,
+                        run_started_at=1101 + RETENTION_SECONDS + 2,
+                        observed_at=1101 + RETENTION_SECONDS + 3,
+                        stage="query", outcome="ok")
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM events WHERE run_id=?",
+            ("b" * 32,)).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT executed,max_retention_at,expired_barrier FROM runs "
+            "WHERE run_id=?", ("b" * 32,)).fetchone() == (1, 1101, 1)
+
+
+def test_diagnostic_append_survives_concurrent_summary_snapshot(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    assert store.record(run_id="a" * 32, run_started_at=1000,
+                        observed_at=1001, stage="query", outcome="ok")
+    with sqlite3.connect(store.path) as reader:
+        assert reader.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        reader.execute("BEGIN")
+        assert reader.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+        # Hold a read snapshot longer than the writer's 20 ms busy timeout.
+        assert store.record(run_id="b" * 32, run_started_at=1002,
+                            observed_at=1003, stage="send", outcome="accepted")
+        assert reader.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+    assert latest_run(store.read(now=1004), now=1004)["outcome"] == "accepted"
+
+
+def test_busy_diagnostic_writer_marks_order_without_storage_repair(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    assert store.record(run_id="a" * 32, run_started_at=900,
+                        observed_at=901, stage="send", outcome="accepted")
+    run = DiagnosticRun(store, wall_clock=lambda: 1000.0)
+    with sqlite3.connect(store.path) as blocker:
+        blocker.execute("BEGIN IMMEDIATE")
+        run.emit("query", "started")
+    run.emit("send", "accepted")
+    events = store.read(now=1001)
+    latest = latest_run(events, now=1001)
+    assert latest["reason"] == "order_uncertain"
+    assert latest["error"] == "none"
+    text = consult_summary(events, None, now=1001)
+    assert "診斷順序不明" in text
+    assert "請檢查本機儲存空間或權限" not in text
+
+
+def test_legacy_migration_does_not_spread_future_time_to_pending_send(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    now = 10_000_000.0
+    future = now + 365 * 86400
+    assert store.record(run_id="a" * 32, run_started_at=future - 1,
+                        observed_at=future, stage="send", outcome="accepted")
+    with sqlite3.connect(store.path) as conn:
+        conn.execute("ALTER TABLE events DROP COLUMN retention_at")
+        conn.execute("INSERT INTO runs(run_id,run_started_at) VALUES (?,?)",
+                     ("b" * 32, now - 1))
+        conn.execute(
+            "INSERT INTO events(run_id,run_started_at,observed_at,stage,"
+            "outcome,duration_ms,error,reason) VALUES (?,?,?,?,?,?,?,?)",
+            ("b" * 32, now - 1, now, "send", "pending", 0, "ledger",
+             "verify_delivery"))
+    assert store.record(run_id="c" * 32, run_started_at=now,
+                        observed_at=now + 1,
+                        stage="query", outcome="read_failed",
+                        error="read", reason="verify_his")
+    events = store.read(now=now + 2)
+    assert any(item["run_id"] == "b" * 32 and
+               item["outcome"] == "pending" for item in events)
+    assert "另有無帳本寄送待確認" in consult_summary(
+        events, None, now=now + 2)
+
+
+@pytest.mark.parametrize("stage,outcome,reason", [
+    ("done", "skipped", "flow_busy"),
+    ("reconcile", "ok", "none"),
+])
+def test_expired_nonexecution_does_not_hide_holder_failure(
+        tmp_path, stage, outcome, reason):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    holder = "a" * 32
+    store.record(run_id=holder, run_started_at=800,
+                 observed_at=801, stage="query", outcome="started")
+    store.record(run_id="b" * 32, run_started_at=890,
+                 observed_at=891, stage=stage, outcome=outcome,
+                 reason=reason)
+    store.record(run_id=holder, run_started_at=800,
+                 observed_at=1001, stage="query", outcome="read_failed",
+                 error="read", reason="verify_his")
+    now = RETENTION_SECONDS + 892
+    events = store.read(now=now)
+    assert latest_run(events, now=now)["run_id"] == holder
+    assert latest_run(events, now=now)["outcome"] == "read_failed"
+
+
+def test_clock_expired_newer_run_cannot_make_old_confirmation_current(tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "clock")
+    store.record(run_id="a" * 32, run_started_at=800,
+                 observed_at=801, stage="read", outcome="no_record")
+    store.record(run_id="b" * 32, run_started_at=890,
+                 observed_at=891, stage="done", outcome="read_unknown",
+                 error="read", reason="check_portal")
+    store.record(run_id="a" * 32, run_started_at=800,
+                 observed_at=1001, stage="done", outcome="official_confirmed")
+    now = RETENTION_SECONDS + 892
+    events = store.read(now=now)
+    assert latest_run(events, now=now) is None
+    assert events.ordering_uncertain
+    assert "執行順序不明" in clock_summary(
+        events, None, today=datetime.fromtimestamp(now).date(), now=now)
 
 
 def test_rollback_new_query_survives_contended_event_retention(tmp_path):
@@ -1172,7 +1641,8 @@ def test_many_older_confirmed_parents_do_not_create_storage_warning(tmp_path):
     assert "請檢查本機儲存空間或權限" not in text
 
 
-def test_many_older_confirmed_parents_report_incomplete_scan(tmp_path):
+def test_many_older_confirmed_parents_do_not_create_permanent_manual_prompt(
+        tmp_path):
     path = tmp_path / "ledger.sqlite3"
     with sqlite3.connect(path) as conn:
         conn.execute("CREATE TABLE deliveries (state TEXT, updated_at REAL, "
@@ -1184,10 +1654,30 @@ def test_many_older_confirmed_parents_report_incomplete_scan(tmp_path):
              float(index + 90), "", "") for index in range(258)])
     snapshot = read_consult_delivery(path)
     assert snapshot["state"] == "confirmed"
-    assert snapshot["other_attention"]["scan_limited"]
+    assert not snapshot.get("other_attention", {}).get("scan_limited")
+    assert not snapshot.get("confirmed_order_uncertain")
     text = consult_summary([], snapshot, now=450)
-    assert "摘要僅檢查最近 256 筆" in text
+    assert "摘要僅檢查最近 256 筆" not in text
     assert "帳本狀態無法判讀" not in text
+    assert "請檢查執行紀錄並人工核對結果" not in text
+    expected = datetime.fromtimestamp(357).strftime("%m/%d %H:%M:%S")
+    assert f"最後成功：{expected}" in text
+
+
+def test_deep_confirmed_history_with_late_completion_keeps_order_warning(
+        tmp_path):
+    path = tmp_path / "ledger.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE deliveries (state TEXT, updated_at REAL, "
+                     "recipients TEXT, category TEXT, created_at REAL, "
+                     "parent_id TEXT)")
+        conn.executemany("INSERT INTO deliveries VALUES (?,?,?,?,?,?)", [
+            ("confirmed", 10_000.0 if index == 0 else float(index + 100),
+             "{}", "consult", float(index + 90), "")
+            for index in range(301)])
+    snapshot = read_consult_delivery(path)
+    assert snapshot["confirmed_order_uncertain"]
+    assert not snapshot.get("other_attention", {}).get("scan_limited")
 
 
 def test_closed_partial_parent_does_not_claim_outstanding_followup(tmp_path):
@@ -1410,6 +1900,121 @@ def test_late_old_delivery_update_cannot_replace_newer_send(tmp_path):
     assert latest is not None
     assert latest["created_at"] == 200.0
     assert latest["state"] == "unknown"
+    assert latest["last_confirmed_at"] == 300.0
+    text = consult_summary([], latest, now=310)
+    expected = datetime.fromtimestamp(300).strftime("%m/%d %H:%M:%S")
+    assert f"最後成功：{expected}" in text
+
+
+def test_multiple_confirmed_ledger_parents_do_not_guess_success_order(tmp_path):
+    path = tmp_path / "ledger.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE deliveries (state TEXT, updated_at REAL, "
+                     "recipients TEXT, category TEXT, created_at REAL, "
+                     "parent_id TEXT)")
+        for state, updated, created in (
+                ("confirmed", 1000.0, 100.0),
+                ("confirmed", 900.0, 200.0),
+                ("unknown", 800.0, 300.0)):
+            conn.execute("INSERT INTO deliveries VALUES (?,?,?,?,?,?)", (
+                state, updated, "{}", "consult", created, ""))
+    snapshot = read_consult_delivery(path)
+    assert snapshot["confirmed_order_uncertain"]
+    text = consult_summary([], snapshot, now=1100)
+    assert "最後成功：已確認寄送，但先後不明" in text
+
+
+def test_normal_confirmed_delivery_sequence_keeps_last_success_time(tmp_path):
+    path = tmp_path / "ledger.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE deliveries (state TEXT, updated_at REAL, "
+                     "recipients TEXT, category TEXT, created_at REAL, "
+                     "parent_id TEXT)")
+        conn.executemany("INSERT INTO deliveries VALUES (?,?,?,?,?,?)", [
+            ("confirmed", 1000.0, "{}", "consult", 100.0, ""),
+            ("confirmed", 1100.0, "{}", "consult", 200.0, ""),
+        ])
+    snapshot = read_consult_delivery(path)
+    assert not snapshot.get("confirmed_order_uncertain")
+    text = consult_summary([], snapshot, now=1200)
+    expected = datetime.fromtimestamp(1100).strftime("%m/%d %H:%M:%S")
+    assert f"最後成功：{expected}" in text
+
+
+def test_new_parent_inserted_during_ledger_read_is_not_called_older(
+        monkeypatch, tmp_path):
+    import cmuh_common.runtime_summary as summaries
+
+    path = tmp_path / "ledger.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE deliveries (state TEXT, updated_at REAL, "
+                     "recipients TEXT, category TEXT, created_at REAL, "
+                     "parent_id TEXT)")
+        conn.execute("INSERT INTO deliveries VALUES (?,?,?,?,?,?)", (
+            "confirmed", 1000.0, "{}", "consult", 900.0, ""))
+    real_connect = sqlite3.connect
+    inserted = False
+
+    class FirstRow:
+        def __init__(self, cursor):
+            self.cursor = cursor
+
+        def fetchone(self):
+            nonlocal inserted
+            row = self.cursor.fetchone()
+            if not inserted:
+                inserted = True
+                writer = real_connect(path)
+                try:
+                    with writer:
+                        writer.execute(
+                            "INSERT INTO deliveries VALUES (?,?,?,?,?,?)",
+                            ("unknown", 1001.0, "{}", "consult", 901.0, ""))
+                finally:
+                    writer.close()
+            return row
+
+    class Connection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args):
+            cursor = self.inner.execute(sql, *args)
+            return FirstRow(cursor) if sql.startswith(
+                "SELECT rowid,state,updated_at") and sql.endswith(
+                "LIMIT 1") else cursor
+
+        def close(self):
+            self.inner.close()
+
+    def connect(*args, **kwargs):
+        inner = real_connect(*args, **kwargs)
+        return Connection(inner) if kwargs.get("uri") else inner
+
+    monkeypatch.setattr(summaries.sqlite3, "connect", connect)
+    snapshot = read_consult_delivery(path)
+    assert inserted
+    assert snapshot["state"] == "confirmed"
+    assert not snapshot.get("other_attention", {}).get("pending")
+    assert not snapshot.get("confirmed_order_uncertain")
+
+
+def test_confirmed_order_anomaly_keeps_independent_diagnostic_success(tmp_path):
+    path = tmp_path / "ledger.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE deliveries (state TEXT, updated_at REAL, "
+                     "recipients TEXT, category TEXT, created_at REAL, "
+                     "parent_id TEXT)")
+        conn.executemany("INSERT INTO deliveries VALUES (?,?,?,?,?,?)", [
+            ("confirmed", 1100.0, "{}", "consult", 100.0, ""),
+            ("confirmed", 1000.0, "{}", "consult", 200.0, ""),
+        ])
+    snapshot = read_consult_delivery(path)
+    assert snapshot["confirmed_order_uncertain"]
+    event = _event("a" * 32, 1200, 1201, "send", "accepted")
+    text = consult_summary([event], snapshot, now=1210)
+    expected = datetime.fromtimestamp(1201).strftime("%m/%d %H:%M:%S")
+    assert f"最後成功：{expected}" in text
 
 
 def test_latest_consult_delivery_uses_parent_chain_not_successful_retry(tmp_path):

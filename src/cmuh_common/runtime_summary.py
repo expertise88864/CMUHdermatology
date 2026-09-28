@@ -125,15 +125,23 @@ def read_consult_delivery(path: str | Path) -> dict | None:
             older_attention = (conn.execute(
                 "SELECT state,updated_at,recipients,created_at," + body_flag +
                 " FROM deliveries WHERE category='consult' AND parent_id='' "
-                "AND rowid!=? AND (state IS NULL OR state!='confirmed')" +
+                "AND rowid<? AND (state IS NULL OR state!='confirmed')" +
                 active + " ORDER BY rowid DESC LIMIT 257",
                 (row[0],)).fetchall() if row else [])
             older_confirmed = (conn.execute(
-                "SELECT state,updated_at,recipients,created_at FROM deliveries "
-                "WHERE category='consult' AND parent_id='' AND rowid!=? "
+                "SELECT rowid,state,updated_at,recipients,created_at FROM deliveries "
+                "WHERE category='consult' AND parent_id='' AND rowid<? "
                 "AND state='confirmed'" + active +
-                " ORDER BY rowid DESC LIMIT 257",
+                " ORDER BY rowid DESC LIMIT 256",
                 (row[0],)).fetchall() if row else [])
+            # Confirmed history is not actionable. Aggregate its timestamp
+            # without loading every recipient map on long-lived ledgers.
+            older_confirmed_max = (conn.execute(
+                "SELECT MAX(updated_at) FROM deliveries WHERE "
+                "category='consult' AND parent_id='' AND rowid<? "
+                "AND state='confirmed' AND typeof(updated_at) IN "
+                "('integer','real')" + active,
+                (row[0],)).fetchone()[0] if row else None)
     except sqlite3.Error as error:
         if sqlite_temporarily_busy(error):
             return {"retry_later": True}
@@ -146,7 +154,7 @@ def read_consult_delivery(path: str | Path) -> dict | None:
     if snapshot is None:
         return {"unreadable": True}
     other_attention = {"pending": False, "partial": False, "failed": False}
-    if len(older_attention) > 256 or len(older_confirmed) > 256:
+    if len(older_attention) > 256:
         other_attention["scan_limited"] = True
     for state, updated, recipients, created, has_body in older_attention[:256]:
         parsed = _parse_consult_parent(state, updated, recipients, created)
@@ -160,12 +168,45 @@ def read_consult_delivery(path: str | Path) -> dict | None:
         elif state in {"partial", "failed"} and (
                 has_body or parsed["counts"]["transient_refused"]):
             other_attention[state] = True
-    for state, updated, recipients, created in older_confirmed[:256]:
+    last_confirmed_at: float | None = None
+    confirmed_order_uncertain = False
+    newer_confirmed_at = (snapshot["observed_at"] if
+                          snapshot["state"] == "confirmed" else None)
+    newest_confirmed_at = newer_confirmed_at
+    for _rowid, state, updated, recipients, created in older_confirmed:
         parsed = _parse_consult_parent(state, updated, recipients, created)
         if parsed is None:
             other_attention["unknown_state"] = True
-        elif parsed.get("clock_anomaly"):
+            confirmed_order_uncertain = True
+            continue
+        if parsed.get("clock_anomaly"):
             other_attention["clock_anomaly"] = True
+        # Rowids identify parent creation order. An older parent that finished
+        # later can be legitimate reconciliation; it makes the ledger's
+        # completion order unknowable, but ordinary consecutive confirmations
+        # must continue to show their last-success time.
+        if (newer_confirmed_at is not None and
+                parsed["observed_at"] > newer_confirmed_at):
+            confirmed_order_uncertain = True
+        if newest_confirmed_at is None:
+            newest_confirmed_at = parsed["observed_at"]
+        newer_confirmed_at = parsed["observed_at"]
+        last_confirmed_at = max(last_confirmed_at or 0,
+                                parsed["observed_at"])
+    if older_confirmed_max is not None:
+        try:
+            historical_max = float(older_confirmed_max)
+        except (TypeError, ValueError, OverflowError):
+            historical_max = float("nan")
+        if math.isfinite(historical_max) and historical_max > 0:
+            if (newest_confirmed_at is not None and
+                    historical_max > newest_confirmed_at):
+                confirmed_order_uncertain = True
+            last_confirmed_at = max(last_confirmed_at or 0, historical_max)
+    if confirmed_order_uncertain:
+        snapshot["confirmed_order_uncertain"] = True
+    elif last_confirmed_at is not None:
+        snapshot["last_confirmed_at"] = last_confirmed_at
     if any(other_attention.values()):
         snapshot["other_attention"] = other_attention
     return snapshot
@@ -447,9 +488,18 @@ def consult_summary(events: list[dict], delivery: dict | None, *,
                        _REASON_LABELS["verify_his"]):
             if action not in reason:
                 reason = action if reason == "無" else reason + "；" + action
-    success = last_success(events, domain="consult")
+    diagnostic_success = last_success(events, domain="consult")
+    success = diagnostic_success
     if delivery and delivery.get("state") == "confirmed":
         success = max(success or 0, delivery["observed_at"])
+    if delivery and delivery.get("last_confirmed_at"):
+        success = max(success or 0, delivery["last_confirmed_at"])
+    if delivery and delivery.get("confirmed_order_uncertain"):
+        success_label = (_when(diagnostic_success) if
+                         diagnostic_success is not None else
+                         "已確認寄送，但先後不明")
+    else:
+        success_label = _when(success)
     if query_state == "名單未知" and _REASON_LABELS["verify_his"] not in reason:
         reason = (_REASON_LABELS["verify_his"] if reason == "無" else
                   reason + "；" + _REASON_LABELS["verify_his"])
@@ -521,6 +571,11 @@ def consult_summary(events: list[dict], delivery: dict | None, *,
             reason = action if reason == "無" else reason + "；" + action
     if getattr(events, "retry_later", False):
         outcome += "；診斷紀錄暫時忙碌，請稍後重試"
+    if getattr(events, "ordering_uncertain", False):
+        outcome += "；執行順序不明"
+        action = "請核對目前 HIS 查詢與寄送狀態"
+        if action not in reason:
+            reason = action if reason == "無" else reason + "；" + action
     if getattr(events, "clock_anomaly", False):
         outcome += "；系統時間異常"
         action = "請核對系統時鐘"
@@ -528,7 +583,7 @@ def consult_summary(events: list[dict], delivery: dict | None, *,
             reason = action if reason == "無" else reason + "；" + action
     return (f"階段：{stage}｜狀態：{outcome}｜查詢結果：{query_state}\n"
             f"狀態時間：{_when(observed)}｜資料：{_freshness(observed, instant, 20 * 60)}\n"
-            f"最後成功：{_when(success)}｜錯誤分類：{error}\n"
+            f"最後成功：{success_label}｜錯誤分類：{error}\n"
             f"人工處理：{reason}\n{ledger_line}")
 
 
@@ -546,7 +601,8 @@ def clock_summary(events: list[dict], state: dict | None, *,
                     if datetime.fromtimestamp(item["observed_at"]).date().isoformat()
                     == day]
     event = latest_run(today_events, now=instant,
-                       show_contended_after_success=True)
+                       show_contended_after_success=True,
+                       min_run_order=getattr(events, "current_run_floor", 0))
     observed = event["observed_at"] if event else None
     stage = _STAGE_LABELS.get(event["stage"], "尚未執行") if event else "尚未執行"
     outcome = _OUTCOME_LABELS.get(event["outcome"], "未知") if event else "無紀錄"
@@ -666,6 +722,11 @@ def clock_summary(events: list[dict], state: dict | None, *,
             reason = action if reason == "無" else reason + "；" + action
     if getattr(events, "retry_later", False):
         outcome += "；診斷紀錄暫時忙碌，請稍後重試"
+    if getattr(events, "ordering_uncertain", False):
+        outcome += "；執行順序不明"
+        action = "請核對官方打卡紀錄"
+        if action not in reason:
+            reason = action if reason == "無" else reason + "；" + action
     if (event and event["stage"] == "done" and event["outcome"] == "skipped"
             and event["reason"] == "flow_busy"):
         action = _REASON_LABELS["verify_clock"]

@@ -51,15 +51,25 @@ def _safe_code(value: object, allowed: frozenset[str], fallback: str) -> str:
     return value if isinstance(value, str) and value in allowed else fallback
 
 
+def _is_executed_observation(stage: str, outcome: str, reason: str) -> bool:
+    return (stage not in {"parse", "reconcile"} and outcome != "dry_run"
+            and not (stage == "done" and outcome == "skipped" and
+                     reason in {"flow_busy", "check_job"}))
+
+
 class DiagnosticEvents(list[dict]):
     """List-compatible read result that distinguishes absence from read failure."""
 
     def __init__(self, events=(), *, unavailable: bool = False,
-                 clock_anomaly: bool = False, retry_later: bool = False):
+                 clock_anomaly: bool = False, retry_later: bool = False,
+                 ordering_uncertain: bool = False,
+                 current_run_floor: int = 0):
         super().__init__(events)
         self.unavailable = unavailable
         self.clock_anomaly = clock_anomaly
         self.retry_later = retry_later
+        self.ordering_uncertain = ordering_uncertain
+        self.current_run_floor = current_run_floor
 
 
 def sqlite_temporarily_busy(error: sqlite3.Error) -> bool:
@@ -81,8 +91,9 @@ class DiagnosticStore:
 
     def record(self, *, run_id: str, run_started_at: float, stage: str,
                outcome: str, duration_ms: float = 0, error: str = "none",
-               reason: str = "none", observed_at: float | None = None) -> bool:
-        """Best-effort append; never changes the caller's send/click outcome."""
+               reason: str = "none", observed_at: float | None = None
+               ) -> bool | None:
+        """Best-effort append; None means transient SQLite contention."""
         if not isinstance(run_id, str) or len(run_id) != 32 or not all(
                 c in "0123456789abcdef" for c in run_id):
             return False
@@ -103,6 +114,11 @@ class DiagnosticStore:
             with closing(sqlite3.connect(str(self.path), timeout=0.02)) as conn:
                 with conn:
                     conn.execute("PRAGMA busy_timeout=20")
+                    # The settings window reads a multi-statement snapshot.
+                    # WAL lets that reader coexist with this short append;
+                    # rollback journals can block COMMIT beyond 20 ms and
+                    # falsely mark a healthy clinical run as write-lost.
+                    conn.execute("PRAGMA journal_mode=WAL")
                     # SQLite DDL may autocommit without an explicit BEGIN.
                     # Creation, legacy backfill and the new event must be one
                     # transaction so a crash cannot leave an empty runs table.
@@ -111,14 +127,61 @@ class DiagnosticStore:
                         "CREATE TABLE IF NOT EXISTS events ("
                         "seq INTEGER PRIMARY KEY, run_id TEXT NOT NULL, "
                         "run_started_at REAL NOT NULL, observed_at REAL NOT NULL, "
+                        "retention_at REAL NOT NULL, "
                         "stage TEXT NOT NULL, outcome TEXT NOT NULL, "
                         "duration_ms INTEGER NOT NULL, error TEXT NOT NULL, "
                         "reason TEXT NOT NULL)")
+                    event_columns = {row[1] for row in conn.execute(
+                        "PRAGMA table_info(events)")}
+                    if "retention_at" not in event_columns:
+                        conn.execute(
+                            "ALTER TABLE events ADD COLUMN retention_at REAL")
+                        conn.execute(
+                            "WITH held AS (SELECT seq, MAX(CASE WHEN "
+                            "observed_at<=? THEN observed_at END) OVER "
+                            "(ORDER BY seq ROWS UNBOUNDED PRECEDING) AS "
+                            "retention_at FROM events) UPDATE events SET "
+                            "retention_at=(SELECT held.retention_at FROM held "
+                            "WHERE held.seq=events.seq)",
+                            (now + RETENTION_SECONDS,))
+                    # A still-running older process can append to the migrated
+                    # table without this nullable column. Keep those rows
+                    # readable and eligible for ordinary age pruning, and
+                    # repair the run-order marker before the row is evicted.
+                    legacy_executed = conn.execute(
+                        "SELECT run_id,run_started_at,MAX(observed_at) "
+                        "FROM events WHERE retention_at IS NULL AND "
+                        "stage NOT IN ('parse','reconcile') AND "
+                        "outcome!='dry_run' AND NOT (stage='done' AND "
+                        "outcome='skipped' AND reason IN "
+                        "('flow_busy','check_job')) "
+                        "GROUP BY run_id,run_started_at").fetchall()
+                    conn.execute(
+                        "UPDATE events SET retention_at=observed_at "
+                        "WHERE retention_at IS NULL")
                     conn.execute(
                         "CREATE TABLE IF NOT EXISTS runs ("
                         "run_order INTEGER PRIMARY KEY AUTOINCREMENT, "
                         "run_id TEXT NOT NULL, run_started_at REAL NOT NULL, "
+                        "max_retention_at REAL, executed INTEGER NOT NULL "
+                        "DEFAULT 0, expired_barrier INTEGER NOT NULL DEFAULT 0, "
                         "UNIQUE(run_id,run_started_at))")
+                    run_columns = {row[1] for row in conn.execute(
+                        "PRAGMA table_info(runs)")}
+                    needs_retention_backfill = "max_retention_at" not in run_columns
+                    needs_executed_backfill = "executed" not in run_columns
+                    needs_barrier_backfill = "expired_barrier" not in run_columns
+                    if needs_retention_backfill:
+                        conn.execute(
+                            "ALTER TABLE runs ADD COLUMN max_retention_at REAL")
+                    if needs_executed_backfill:
+                        conn.execute(
+                            "ALTER TABLE runs ADD COLUMN executed INTEGER "
+                            "NOT NULL DEFAULT 0")
+                    if needs_barrier_backfill:
+                        conn.execute(
+                            "ALTER TABLE runs ADD COLUMN expired_barrier "
+                            "INTEGER NOT NULL DEFAULT 0")
                     # Also repair a pre-fix interrupted migration that left
                     # the runs table present but empty. Mixed mapped/orphan
                     # rows have ambiguous order and must not be guessed.
@@ -136,19 +199,74 @@ class DiagnosticStore:
                             "SELECT run_id,run_started_at FROM events "
                             "GROUP BY run_id,run_started_at "
                             "ORDER BY MIN(seq)")
+                    for legacy_id, legacy_started, legacy_retention in legacy_executed:
+                        conn.execute(
+                            "UPDATE runs SET executed=1,max_retention_at="
+                            "MAX(COALESCE(max_retention_at,?),?) "
+                            "WHERE run_id=? AND run_started_at=?",
+                            (legacy_retention, legacy_retention,
+                             legacy_id, legacy_started))
+                    if needs_retention_backfill or orphan:
+                        conn.execute(
+                            "UPDATE runs SET max_retention_at=("
+                            "SELECT MAX(e.retention_at) FROM events e "
+                            "WHERE e.run_id=runs.run_id AND "
+                            "e.run_started_at=runs.run_started_at "
+                            "AND e.stage NOT IN ('parse','reconcile') "
+                            "AND e.outcome!='dry_run' AND NOT ("
+                            "e.stage='done' AND e.outcome='skipped' AND "
+                            "e.reason IN ('flow_busy','check_job'))) "
+                            "WHERE max_retention_at IS NULL")
+                    if needs_executed_backfill or orphan:
+                        conn.execute(
+                            "UPDATE runs SET executed=CASE WHEN EXISTS ("
+                            "SELECT 1 FROM events e WHERE e.run_id=runs.run_id "
+                            "AND e.run_started_at=runs.run_started_at "
+                            "AND e.stage NOT IN ('parse','reconcile') "
+                            "AND e.outcome!='dry_run' AND NOT ("
+                            "e.stage='done' AND e.outcome='skipped' AND "
+                            "e.reason IN ('flow_busy','check_job'))) "
+                            "THEN 1 ELSE 0 END")
+                    if (needs_retention_backfill or needs_executed_backfill
+                            or needs_barrier_backfill):
+                        conn.execute(
+                            "UPDATE runs SET expired_barrier=1 WHERE "
+                            "executed=1 AND max_retention_at < ?",
+                            (now - RETENTION_SECONDS,))
                     existing_run = conn.execute(
                         "SELECT run_order FROM runs WHERE run_id=? "
                         "AND run_started_at=?", (run_id, started)).fetchone()
                     if not existing_run:
                         conn.execute("INSERT INTO runs(run_id,run_started_at) "
                                      "VALUES(?,?)", (run_id, started))
+                    # A clock corrected after a far-future setting must not
+                    # make the next observation inherit that future expiry.
+                    # Keep prior rows, including ledgerless pending sends:
+                    # they may be the only remaining manual-action evidence.
+                    conn.execute(
+                        "UPDATE runs SET expired_barrier=1 WHERE executed=1 "
+                        "AND max_retention_at > ?",
+                        (now + RETENTION_SECONDS,))
+                    previous_retention = conn.execute(
+                        "SELECT MAX(retention_at) FROM events WHERE "
+                        "retention_at <= ?",
+                        (now + RETENTION_SECONDS,)).fetchone()[0]
+                    retention_at = max(now, previous_retention or now)
                     inserted = conn.execute(
                         "INSERT INTO events(run_id,run_started_at,observed_at,"
-                        "stage,outcome,duration_ms,error,reason) VALUES(?,?,?,?,?,?,?,?)",
-                        (run_id, started, now, stage, outcome, elapsed, error, reason))
+                        "retention_at,stage,outcome,duration_ms,error,reason) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        (run_id, started, now, retention_at, stage, outcome,
+                         elapsed, error, reason))
                     inserted_seq = inserted.lastrowid
                     if inserted_seq is None:
                         raise sqlite3.DatabaseError("diagnostic insert had no sequence")
+                    if _is_executed_observation(stage, outcome, reason):
+                        conn.execute(
+                            "UPDATE runs SET max_retention_at="
+                            "MAX(COALESCE(max_retention_at,?),?), "
+                            "executed=1 WHERE run_id=? AND run_started_at=?",
+                            (retention_at, retention_at, run_id, started))
                     if self.domain == "consult" and (
                             (stage, outcome) in {
                                 ("query", "ok"), ("send", "accepted")}):
@@ -172,7 +290,40 @@ class DiagnosticStore:
                         conn.execute(
                             "DELETE FROM events WHERE run_id=? AND seq!=?",
                             (run_id, inserted_seq))
-                    conn.execute("DELETE FROM events WHERE observed_at < ?",
+                        conn.execute(
+                            "UPDATE runs SET executed=0 WHERE run_id=?",
+                            (run_id,))
+                    if (self.domain == "consult" and stage == "done" and
+                            outcome == "skipped" and reason == "check_job"):
+                        # A queued email re-trigger can discover that every
+                        # recipient was already served after it acquired the
+                        # lock. Its initial query/started marker must not
+                        # survive as a phantom unfinished HIS query.
+                        other_execution = conn.execute(
+                            "SELECT 1 FROM events WHERE run_id=? AND seq!=? "
+                            "AND stage NOT IN ('parse','reconcile') AND "
+                            "outcome!='dry_run' AND NOT (stage='query' "
+                            "AND outcome='started') AND NOT (stage='done' "
+                            "AND outcome='skipped' AND reason IN "
+                            "('flow_busy','check_job')) LIMIT 1",
+                            (run_id, inserted_seq)).fetchone()
+                        if not other_execution:
+                            conn.execute(
+                                "DELETE FROM events WHERE run_id=? AND "
+                                "stage='query' AND outcome='started' AND "
+                                "seq<?", (run_id, inserted_seq))
+                            conn.execute(
+                                "UPDATE runs SET executed=0 WHERE run_id=? "
+                                "AND run_started_at=?",
+                                (run_id, started))
+                    # Store the insertion-time high-water mark on each row:
+                    # cap eviction and late older runs cannot change expiry.
+                    conn.execute(
+                        "UPDATE runs SET expired_barrier=1 WHERE executed=1 "
+                        "AND max_retention_at < ?",
+                        (now - RETENTION_SECONDS,))
+                    conn.execute("DELETE FROM events WHERE "
+                                 "COALESCE(retention_at,observed_at) < ?",
                                  (now - RETENTION_SECONDS,))
                     count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
                     if count > MAX_EVENTS:
@@ -320,14 +471,23 @@ class DiagnosticStore:
                             (*priority, keep_recent, *priority))
                     run_count = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
                     if run_count > MAX_RUNS:
+                        # Keep one highest expired executed-run tombstone even
+                        # after its events disappear. It blocks an older,
+                        # still-retained success from becoming current.
                         conn.execute(
                             "DELETE FROM runs WHERE run_order NOT IN "
                             "(SELECT run_order FROM runs ORDER BY run_order DESC "
-                            "LIMIT ?) AND (run_id,run_started_at) NOT IN "
+                            "LIMIT ?) AND run_order NOT IN (SELECT run_order "
+                            "FROM runs WHERE executed=1 AND ("
+                            "expired_barrier=1 OR max_retention_at < ?) "
+                            "ORDER BY run_order DESC "
+                            "LIMIT 1) AND (run_id,run_started_at) NOT IN "
                             "(SELECT DISTINCT run_id,run_started_at FROM events)",
-                            (MAX_RUNS,))
+                            (MAX_RUNS, now - RETENTION_SECONDS))
             return True
-        except (OSError, sqlite3.Error, TypeError, ValueError, OverflowError):
+        except sqlite3.Error as exc:
+            return None if sqlite_temporarily_busy(exc) else False
+        except (OSError, TypeError, ValueError, OverflowError):
             return False
 
     def read(self, *, now: float | None = None) -> DiagnosticEvents:
@@ -346,6 +506,9 @@ class DiagnosticStore:
             uri = self.path.resolve().as_uri() + "?mode=ro"
             with closing(sqlite3.connect(uri, uri=True, timeout=0.1)) as conn:
                 conn.execute("PRAGMA query_only=ON")
+                # Schema, run-order markers and observations must come from
+                # one snapshot when a background writer appends concurrently.
+                conn.execute("BEGIN")
                 has_runs = conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' "
                     "AND name='runs'").fetchone()
@@ -354,10 +517,34 @@ class DiagnosticStore:
                 run_join = (" LEFT JOIN runs r ON r.run_id=e.run_id "
                             "AND r.run_started_at=e.run_started_at"
                             if has_runs else "")
+                run_columns = ({row[1] for row in conn.execute(
+                    "PRAGMA table_info(runs)")} if has_runs else set())
+                max_retention_column = (
+                    "max_retention_at" if "max_retention_at" in run_columns
+                    else "NULL AS max_retention_at")
+                executed_column = ("executed" if "executed" in run_columns
+                                   else "NULL AS executed")
+                barrier_column = (
+                    "expired_barrier" if "expired_barrier" in run_columns
+                    else "0 AS expired_barrier")
+                run_rows = (conn.execute(
+                    "SELECT run_order,run_id,run_started_at," +
+                    max_retention_column + "," + executed_column + "," +
+                    barrier_column + " FROM runs "
+                    "ORDER BY run_order").fetchall() if has_runs else [])
+                event_columns = {row[1] for row in conn.execute(
+                    "PRAGMA table_info(events)")}
+                retention_column = (
+                    "COALESCE(e.retention_at,e.observed_at)" if
+                    "retention_at" in event_columns else
+                    "MAX(e.observed_at) OVER (ORDER BY e.seq "
+                    "ROWS UNBOUNDED PRECEDING)")
                 rows = conn.execute(
                     "SELECT e.seq," + run_column +
                     ",e.run_id,e.run_started_at,e.observed_at,e.stage,e.outcome,"
-                    "e.duration_ms,e.error,e.reason FROM events e" + run_join +
+                    "e.duration_ms,e.error,e.reason," + retention_column +
+                    " AS retention_at "
+                    "FROM events e" + run_join +
                     " ORDER BY e.seq DESC LIMIT ?", (MAX_EVENTS,)).fetchall()
         except sqlite3.Error as error:
             if sqlite_temporarily_busy(error):
@@ -369,13 +556,24 @@ class DiagnosticStore:
         rejected = False
         clock_anomaly = False
         fallback_orders = {}
-        for seq, _order, run_id, started, *_rest in rows:
+        fallback_retention = {}
+        fallback_executed = {}
+        for (seq, _order, run_id, started, _observed, stage, outcome,
+             _duration, _error, reason, retention_at) in rows:
             if isinstance(seq, int) and isinstance(run_id, str):
                 key = (run_id, started)
                 fallback_orders[key] = min(seq, fallback_orders.get(key, seq))
+                executed = _is_executed_observation(stage, outcome, reason)
+                if (executed and isinstance(retention_at, (int, float)) and
+                        math.isfinite(retention_at)):
+                    fallback_retention[key] = max(
+                        retention_at,
+                        fallback_retention.get(key, retention_at))
+                if executed:
+                    fallback_executed[key] = True
         for row in rows:
             (seq, run_order, run_id, started, observed, stage, outcome,
-             duration, error, reason) = row
+             duration, error, reason, retention_at) = row
             if (not isinstance(run_id, str) or len(run_id) != 32 or
                     any(c not in "0123456789abcdef" for c in run_id) or
                     stage not in _STAGES[self.domain] or outcome not in _OUTCOMES or
@@ -393,12 +591,15 @@ class DiagnosticStore:
             try:
                 started = float(started)
                 observed = float(observed)
+                retention_at = float(retention_at)
                 duration = int(duration)
             except (TypeError, ValueError, OverflowError):
                 rejected = True
                 continue
             if (not math.isfinite(started) or not math.isfinite(observed)
+                    or not math.isfinite(retention_at)
                     or started <= 0 or observed <= 0
+                    or retention_at < observed
                     or duration < 0 or duration > MAX_DURATION_MS):
                 rejected = True
                 continue
@@ -408,7 +609,11 @@ class DiagnosticStore:
             except (OverflowError, OSError, ValueError):
                 rejected = True
                 continue
-            if observed < cutoff:
+            if retention_at < cutoff:
+                continue
+            if (observed > instant + RETENTION_SECONDS or
+                    retention_at > instant + RETENTION_SECONDS):
+                clock_anomaly = True
                 continue
             if started > observed + 60 or observed > instant + 60:
                 clock_anomaly = True
@@ -422,8 +627,50 @@ class DiagnosticStore:
                 "error": _safe_code(error, _ERRORS, "unknown"),
                 "reason": _safe_code(reason, _REASONS, "none"),
             })
+        visible_orders = {event["run_order"] for event in result
+                          if _is_executed_observation(
+                              event["stage"], event["outcome"],
+                              event["reason"])}
+        known_runs = (run_rows if has_runs else [
+            (order, run_id, started,
+             fallback_retention.get((run_id, started)),
+             fallback_executed.get((run_id, started), False), 0)
+            for (run_id, started), order
+            in fallback_orders.items()])
+        expired_missing = []
+        for (order, run_id, started, max_retention, executed,
+             expired_barrier) in known_runs:
+            if order in visible_orders or executed == 0:
+                continue
+            if executed is None and not fallback_executed.get(
+                    (run_id, started), False):
+                continue
+            if expired_barrier == 1 or max_retention is None:
+                expired_missing.append(order)
+            elif isinstance(max_retention, (int, float)) and math.isfinite(
+                    max_retention):
+                if (max_retention < cutoff or
+                        max_retention > instant + RETENTION_SECONDS):
+                    expired_missing.append(order)
+            else:
+                rejected = True
+                expired_missing.append(order)
+        missing_floor = max(expired_missing, default=0)
+        ordering_uncertain = bool(missing_floor and any(
+            event["run_order"] < missing_floor for event in result))
+        # Keep retained, unresolved warnings and historical successes in the
+        # projection; only current-run selection must obey the expired floor.
+        ordered_starts = sorted({event["run_order"]: event["run_started_at"]
+                                 for event in result}.items())
+        if any(previous > current + 60 for (_old_order, previous),
+               (_new_order, current) in zip(
+                   ordered_starts, ordered_starts[1:], strict=False)):
+            clock_anomaly = True
         return DiagnosticEvents(result, unavailable=rejected,
-                                clock_anomaly=clock_anomaly)
+                                clock_anomaly=clock_anomaly,
+                                ordering_uncertain=ordering_uncertain,
+                                current_run_floor=(missing_floor if
+                                                   ordering_uncertain else 0))
 
 
 class DiagnosticRun:
@@ -439,6 +686,7 @@ class DiagnosticRun:
         self._wall_clock = wall_clock
         self._monotonic = monotonic
         self._write_lost = False
+        self._write_lost_storage = False
 
     def start(self) -> float:
         return self._monotonic()
@@ -455,7 +703,7 @@ class DiagnosticRun:
         if (self._write_lost and outcome in {
                 "official_confirmed", "accepted", "empty_roster", "no_new"}):
             reason = "order_uncertain"
-            if error == "none":
+            if self._write_lost_storage and error == "none":
                 error = "storage"
         written = self.store.record(
             run_id=self.run_id,
@@ -463,8 +711,10 @@ class DiagnosticRun:
                             else self.started_at),
             stage=stage, outcome=outcome, duration_ms=duration,
             error=error, reason=reason, observed_at=self._wall_clock())
-        if not written:
+        if written is not True:
             self._write_lost = True
+            if written is False:
+                self._write_lost_storage = True
 
 
 def event_order(event: dict) -> float | int:
@@ -483,10 +733,13 @@ def _run_order(event: dict) -> float | int:
 
 
 def latest_run(events: list[dict], *, now: float | None = None,
-               show_contended_after_success: bool = False) -> dict | None:
+               show_contended_after_success: bool = False,
+               min_run_order: int = 0) -> dict | None:
     """Choose by persisted run acquisition order, then event insertion order."""
     dry_run_ids = {e["run_id"] for e in events if e["outcome"] == "dry_run"}
-    eligible = [e for e in events if e["run_started_at"] > 0
+    floor = max(min_run_order, getattr(events, "current_run_floor", 0))
+    eligible = [e for e in events if _run_order(e) >= floor
+                and e["run_started_at"] > 0
                 and e["observed_at"] > 0
                 and e["stage"] != "parse"
                 and e["run_id"] not in dry_run_ids]
@@ -585,6 +838,6 @@ def render_safe_events(events: list[dict]) -> str:
         outcome = _safe_code(event.get("outcome"), _OUTCOMES, "failed")
         error = _safe_code(event.get("error"), _ERRORS, "unknown")
         reason = _safe_code(event.get("reason"), _REASONS, "none")
-        lines.append(f"{observed:.0f} {stage} {outcome} {duration}ms "
+        lines.append(f"{stage} {outcome} {duration}ms "
                      f"{error} {reason}")
     return "\n".join(lines) + "\n"
