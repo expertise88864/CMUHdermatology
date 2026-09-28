@@ -43,7 +43,7 @@ _ERRORS = frozenset({
 _REASONS = frozenset({
     "none", "verify_his", "verify_delivery", "fix_recipient", "check_portal",
     "verify_clock", "fix_credentials", "check_storage", "check_job",
-    "flow_busy", "order_uncertain",
+    "flow_busy", "order_uncertain", "routine_skip", "check_mail_client",
 })
 
 
@@ -62,7 +62,7 @@ def read_only_sqlite_uri(path: Path) -> str:
 def _is_executed_observation(stage: str, outcome: str, reason: str) -> bool:
     return (stage not in {"parse", "reconcile"} and outcome != "dry_run"
             and not (stage == "done" and outcome == "skipped" and
-                     reason in {"flow_busy", "check_job"}))
+                     reason in {"flow_busy", "check_job", "routine_skip"}))
 
 
 class DiagnosticEvents(list[dict]):
@@ -83,9 +83,15 @@ class DiagnosticEvents(list[dict]):
 def sqlite_temporarily_busy(error: sqlite3.Error) -> bool:
     """A transient SQLite lock is different from corrupt or unreadable data."""
     code = getattr(error, "sqlite_errorcode", None)
-    return isinstance(code, int) and (code & 0xFF) in {
-        sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED,
-    }
+    if isinstance(code, int):
+        return (code & 0xFF) in {5, 6}  # SQLITE_BUSY / SQLITE_LOCKED
+    # Python 3.10 lacks sqlite_errorcode. Inspect only SQLite's known lock
+    # messages locally; exception text never enters the diagnostic store.
+    return isinstance(error, sqlite3.OperationalError) and str(error).lower().split(
+        ":", 1)[0] in {
+            "database is locked", "database table is locked",
+            "database schema is locked",
+        }
 
 
 class DiagnosticStore:
@@ -127,6 +133,9 @@ class DiagnosticStore:
                     # rollback journals can block COMMIT beyond 20 ms and
                     # falsely mark a healthy clinical run as write-lost.
                     conn.execute("PRAGMA journal_mode=WAL")
+                    # This is a best-effort observation store, never the send
+                    # or clock ledger. Avoid FULL-sync cost on each event.
+                    conn.execute("PRAGMA synchronous=NORMAL")
                     # SQLite DDL may autocommit without an explicit BEGIN.
                     # Creation, legacy backfill and the new event must be one
                     # transaction so a crash cannot leave an empty runs table.
@@ -162,7 +171,7 @@ class DiagnosticStore:
                         "stage NOT IN ('parse','reconcile') AND "
                         "outcome!='dry_run' AND NOT (stage='done' AND "
                         "outcome='skipped' AND reason IN "
-                        "('flow_busy','check_job')) "
+                        "('flow_busy','check_job','routine_skip')) "
                         "GROUP BY run_id,run_started_at").fetchall()
                     conn.execute(
                         "UPDATE events SET retention_at=observed_at "
@@ -223,7 +232,7 @@ class DiagnosticStore:
                             "AND e.stage NOT IN ('parse','reconcile') "
                             "AND e.outcome!='dry_run' AND NOT ("
                             "e.stage='done' AND e.outcome='skipped' AND "
-                            "e.reason IN ('flow_busy','check_job'))) "
+                            "e.reason IN ('flow_busy','check_job','routine_skip'))) "
                             "WHERE max_retention_at IS NULL")
                     if needs_executed_backfill or orphan:
                         conn.execute(
@@ -233,7 +242,7 @@ class DiagnosticStore:
                             "AND e.stage NOT IN ('parse','reconcile') "
                             "AND e.outcome!='dry_run' AND NOT ("
                             "e.stage='done' AND e.outcome='skipped' AND "
-                            "e.reason IN ('flow_busy','check_job'))) "
+                            "e.reason IN ('flow_busy','check_job','routine_skip'))) "
                             "THEN 1 ELSE 0 END")
                     if (needs_retention_backfill or needs_executed_backfill
                             or needs_barrier_backfill):
@@ -302,18 +311,18 @@ class DiagnosticStore:
                             "UPDATE runs SET executed=0 WHERE run_id=?",
                             (run_id,))
                     if (self.domain == "consult" and stage == "done" and
-                            outcome == "skipped" and reason == "check_job"):
-                        # A queued email re-trigger can discover that every
-                        # recipient was already served after it acquired the
-                        # lock. Its initial query/started marker must not
-                        # survive as a phantom unfinished HIS query.
+                            outcome == "skipped" and
+                            reason in {"check_job", "routine_skip"}):
+                        # An already-served retrigger or a routine preflight
+                        # skip never queried HIS. Its initial started marker
+                        # must not displace the last executed result.
                         other_execution = conn.execute(
                             "SELECT 1 FROM events WHERE run_id=? AND seq!=? "
                             "AND stage NOT IN ('parse','reconcile') AND "
                             "outcome!='dry_run' AND NOT (stage='query' "
                             "AND outcome='started') AND NOT (stage='done' "
                             "AND outcome='skipped' AND reason IN "
-                            "('flow_busy','check_job')) LIMIT 1",
+                            "('flow_busy','check_job','routine_skip')) LIMIT 1",
                             (run_id, inserted_seq)).fetchone()
                         if not other_execution:
                             conn.execute(
@@ -383,7 +392,7 @@ class DiagnosticStore:
                         nonbusy = (
                             "run_id NOT IN (SELECT run_id FROM events "
                             "WHERE stage='done' AND outcome='skipped' "
-                            "AND reason IN ('flow_busy','check_job'))")
+                            "AND reason IN ('flow_busy','check_job','routine_skip'))")
                         if self.domain == "consult":
                             for condition in (
                                     "stage='send' AND outcome='pending'",
@@ -668,11 +677,14 @@ class DiagnosticStore:
             event["run_order"] < missing_floor for event in result))
         # Keep retained, unresolved warnings and historical successes in the
         # projection; only current-run selection must obey the expired floor.
-        ordered_starts = sorted({event["run_order"]: event["run_started_at"]
-                                 for event in result}.items())
+        # A run's first append may have been lost to contention; its later
+        # successful append does not imply that the system clock rolled back.
+        # Compare event observations in insertion order, not run start times.
+        ordered_observations = sorted(
+            (event["seq"], event["observed_at"]) for event in result)
         if any(previous > current + 60 for (_old_order, previous),
                (_new_order, current) in zip(
-                   ordered_starts, ordered_starts[1:], strict=False)):
+                   ordered_observations, ordered_observations[1:], strict=False)):
             clock_anomaly = True
         return DiagnosticEvents(result, unavailable=rejected,
                                 clock_anomaly=clock_anomaly,
@@ -758,7 +770,7 @@ def latest_run(events: list[dict], *, now: float | None = None,
     # visible instead of letting the newer skipped run take over the panel.
     busy_ids = {e["run_id"] for e in eligible
                 if e["stage"] == "done" and e["outcome"] == "skipped"
-                and e["reason"] in {"flow_busy", "check_job"}}
+                and e["reason"] in {"flow_busy", "check_job", "routine_skip"}}
     executed_ids = {e["run_id"] for e in eligible
                     if e["stage"] != "reconcile" and e["run_id"] not in busy_ids}
     executed = [e for e in eligible if e["run_id"] in executed_ids]

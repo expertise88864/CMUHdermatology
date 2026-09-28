@@ -17,6 +17,7 @@ import pytest
 from cmuh_common.runtime_diagnostics import (
     DiagnosticEvents, DiagnosticRun, DiagnosticStore, MAX_EVENTS, RETENTION_SECONDS,
     last_success, latest_run, read_only_sqlite_uri, render_safe_events,
+    sqlite_temporarily_busy,
 )
 from cmuh_common.runtime_summary import (
     clock_summary, consult_summary, read_clock_state, read_consult_delivery,
@@ -28,6 +29,37 @@ def _event(run_id, started, observed, stage, outcome, *, error="none",
     return {"run_id": run_id, "run_started_at": started,
             "observed_at": observed, "stage": stage, "outcome": outcome,
             "duration_ms": 10, "error": error, "reason": reason}
+
+
+@pytest.mark.parametrize("message,expected", [
+    ("database is locked", True), ("database table is locked", True),
+    ("database schema is locked: main", True), ("disk I/O error", False),
+    ("unable to open database file", False),
+])
+def test_sqlite_busy_without_python311_errorcode(message, expected):
+    error = sqlite3.OperationalError(message)
+    assert not hasattr(error, "sqlite_errorcode")
+    assert sqlite_temporarily_busy(error) is expected
+    assert not sqlite_temporarily_busy(sqlite3.DatabaseError(message))
+
+
+def test_lost_first_write_does_not_report_clock_rollback(monkeypatch, tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    instant = [1000.0]
+    run = DiagnosticRun(store, wall_clock=lambda: instant[0])
+    original_record = store.record
+    monkeypatch.setattr(store, "record", lambda **_k: None)
+    run.emit("query", "started")
+    monkeypatch.setattr(store, "record", original_record)
+    assert store.record(run_id="b" * 32, run_started_at=1100,
+                        observed_at=1101, stage="done", outcome="skipped",
+                        reason="flow_busy")
+    instant[0] = 1102
+    run.emit("send", "accepted")
+    events = store.read(now=1103)
+    assert not events.clock_anomaly
+    assert latest_run(events)["reason"] == "order_uncertain"
+    assert "請核對系統時鐘" not in consult_summary(events, None, now=1103)
 
 
 def test_read_only_uri_keeps_windows_mapped_and_unc_paths_readable():

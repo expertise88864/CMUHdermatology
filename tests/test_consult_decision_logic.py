@@ -121,6 +121,38 @@ class _JobHarness:
         monkeypatch.setattr(cq, "_build_punch_status_sections", _stub_punch)
 
 
+@pytest.mark.parametrize("skip_kind", ["quiet", "smtp_unconfigured"])
+def test_routine_poll_skip_keeps_previous_his_failure(monkeypatch, tmp_path, skip_kind):
+    harness = _JobHarness(monkeypatch, _base_cfg())
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", store)
+    monkeypatch.setattr(cq, "_in_quiet_hours", lambda *_a: skip_kind == "quiet")
+    monkeypatch.setattr(cq, "_session_close", lambda *_a: None)
+    monkeypatch.setattr(smtp_mail, "is_configured",
+                        lambda: skip_kind != "smtp_unconfigured")
+    now = time.time()
+    assert store.record(run_id="a" * 32, run_started_at=now - 11,
+                        observed_at=now - 10, stage="query", outcome="read_failed",
+                        error="read", reason="verify_his")
+    cq._do_full_job("poll")
+    events = store.read(now=now + 1)
+    assert not harness.sent and harness.flow_runs == 0
+    assert latest_run(events)["run_id"] == "a" * 32
+    assert "查詢結果：查詢失敗" in consult_summary(events, None, now=now + 1)
+    assert not any(e["stage"] == "query" and e["outcome"] == "started"
+                   for e in events)
+
+
+def test_unavailable_outlook_has_actionable_diagnostic(monkeypatch, tmp_path):
+    harness = _JobHarness(monkeypatch, _base_cfg(mail_method="outlook"))
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", store)
+    monkeypatch.setattr(cq, "_outlook_available", lambda: False)
+    cq._do_full_job("email")
+    assert not harness.sent and harness.flow_runs == 0
+    assert "請確認本機 Outlook 可用" in consult_summary(store.read(), None)
+
+
 def test_fully_served_email_retrigger_finishes_without_phantom_his_query(
         monkeypatch, tmp_path):
     harness = _JobHarness(monkeypatch, _base_cfg())

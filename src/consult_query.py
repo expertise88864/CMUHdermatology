@@ -7408,7 +7408,7 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
             # [2026-08-03 常駐] 休息時段把常駐 session 收掉:不查詢就沒有 keepalive,
             # 5 分鐘後會被院方強制登出,留著只是殭屍行程掛整夜;06:00 後首輪冷啟動。
             _session_close("休息時段(00-06 不輪詢),收掉常駐 session")
-            diagnostic.emit("done", "skipped")
+            diagnostic.emit("done", "skipped", reason="routine_skip")
             return
         mail_method = str(cfg.get("mail_method", "smtp")).lower()
         # SMTP 模式：檢查 password 是否已填，沒填則靜默跳過（多機部署：只有有
@@ -7418,13 +7418,14 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
             if not _smtp_ready():
                 logging.info("SMTP 尚未設定（settings/smtp_credentials.json 缺 "
                               "password），本次（%s）整個流程靜默跳過", trigger_label)
-                diagnostic.emit("done", "skipped")
+                diagnostic.emit("done", "skipped", reason="routine_skip")
                 return
         elif mail_method == "outlook":
             if not _outlook_available():
                 logging.info("本機無可用 Outlook，本次（%s）整個流程靜默跳過",
                               trigger_label)
-                diagnostic.emit("done", "skipped")
+                diagnostic.emit("done", "failed", error="transport",
+                                reason="check_mail_client")
                 return
         now = datetime.now()
         date_str = f"{now.year}/{now.month}/{now.day}"

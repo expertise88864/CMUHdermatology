@@ -64,6 +64,32 @@ class _FakePortal:
         return False
 
 
+def test_slow_diagnostics_never_delay_click_after_final_window_check(monkeypatch):
+    elapsed = [0.0]
+    checked_at = []
+    clicked_at = []
+
+    class SlowStore:
+        def record(self, **_kwargs):
+            elapsed[0] += 0.25  # deterministic slow disk, no real wait
+            return True
+
+    diagnostics = DiagnosticRun(SlowStore(), monotonic=lambda: elapsed[0])
+    portal = _FakePortal()
+    portal.submit = lambda *_a: clicked_at.append(elapsed[0])
+    monkeypatch.setattr(clock, "_clock_window_passed",
+                        lambda *_a, **_k: checked_at.append(elapsed[0]) or False)
+    monkeypatch.setattr(clock, "_is_clock_click_pending", lambda *_a: False)
+    monkeypatch.setattr(clock, "_mark_clock_click_pending", lambda *_a: True)
+    monkeypatch.setattr(clock.time_module, "sleep", lambda _s: None)
+    clock._perform_clock_action_locked(
+        None, None, {"username": "synthetic", "password": "synthetic"},
+        True, time(7, 30), time(8, 0), task_label="am_in", portal=portal,
+        diagnostic_run=diagnostics)
+    assert len(clicked_at) == 1
+    assert clicked_at == checked_at
+
+
 def test_fake_portal_persists_uncertain_click_then_confirms_without_resubmit(
         monkeypatch, tmp_path):
     diagnostics = DiagnosticStore(tmp_path / "clock_diag.sqlite3", "clock")

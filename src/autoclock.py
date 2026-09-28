@@ -1589,6 +1589,9 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                 )
                 return
 
+            # Diagnostic disk I/O must finish before the final window check;
+            # its SQLite lock timeout does not bound filesystem latency.
+            diag.emit("submit", "started")
             # [AC-01] 窗尾防線:portal 緩慢/登入重試堆疊時,確認點擊當下仍未超過打卡窗尾
             # (加 60s 緩衝吸收「點擊→刷卡表登錄」延遲)。超窗放棄點擊,避免打出遲到紀錄;
             # 未標記完成 → 由 _missed_clock_check 於窗結束後發補卡提醒接手。
@@ -1612,7 +1615,6 @@ def _perform_clock_action_locked(driver, wait, acc, is_in: bool,
                 return
             click_may_have_been_sent = True
             started = diag.start()
-            diag.emit("submit", "started")
             phase = "submit"
             portal.submit(driver, exec_btn)
             portal.accept_alert(driver)
