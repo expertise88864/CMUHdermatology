@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import consult_query as cq  # noqa: E402
 import cmuh_common.smtp_mail as smtp_mail  # noqa: E402
 from cmuh_common.runtime_diagnostics import (  # noqa: E402
-    DiagnosticStore, MAX_EVENTS, latest_run,
+    DiagnosticStore, MAX_EVENTS, last_success, latest_run,
 )
 from cmuh_common.runtime_summary import consult_summary  # noqa: E402
 
@@ -167,10 +167,24 @@ def test_fully_served_email_retrigger_finishes_without_phantom_his_query(
     events = store.read(now=now + 1)
     assert harness.flow_runs == 0 and not harness.sent
     assert any(item["stage"] == "done" and item["outcome"] == "skipped"
-               and item["reason"] == "check_job" for item in events)
+               and item["reason"] == "routine_skip" for item in events)
     assert not any(item["stage"] == "query" and
                    item["outcome"] == "started" for item in events)
     assert latest_run(events, now=now + 1)["run_id"] == "a" * 32
+
+
+def test_fully_served_email_retrigger_without_prior_run_is_not_alarm(
+        monkeypatch, tmp_path):
+    harness = _JobHarness(monkeypatch, _base_cfg())
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", store)
+    monkeypatch.setattr(cq, "_unserved_recipients", lambda _recipients: [])
+    cq._do_full_job("email", override_recipients=["served@example.test"],
+                    from_retrigger=True)
+    events = store.read()
+    assert harness.flow_runs == 0 and not harness.sent
+    assert latest_run(events)["reason"] == "routine_skip"
+    assert "請檢查執行紀錄並人工核對結果" not in consult_summary(events, None)
 
 
 # ─── _do_full_job 收件人路由 ─────────────────────────────────────────────
@@ -1849,6 +1863,24 @@ def test_poll_first_startup_builds_baseline_silently(monkeypatch):
     h.extracted_text = txt + "\n3. 丙C16(3)3333333(王)06/25"
     cq._do_full_job("poll")
     assert len(h.sent) == 1
+
+
+def test_poll_first_baseline_with_existing_roster_is_not_reported_as_success(
+        monkeypatch, tmp_path):
+    store = DiagnosticStore(tmp_path / "events.sqlite3", "consult")
+    monkeypatch.setattr(cq, "DIAGNOSTICS", store)
+    cfg = _base_cfg(quiet_start_hour=0, quiet_end_hour=6)
+    h, baseline = _poll_harness(monkeypatch, cfg, _TXT_1, notified=set(),
+                                now=_DT(2026, 6, 25, 9, 0), initialized=False)
+    cq._do_full_job("poll")
+    events = store.read()
+    assert h.sent == [] and baseline["init"] is True
+    assert any(item["stage"] == "done" and item["outcome"] == "skipped"
+               and item["reason"] == "verify_his" for item in events)
+    assert last_success(events, domain="consult") is None
+    summary = consult_summary(events, None)
+    assert "沒有新會診" not in summary
+    assert "最後成功：無紀錄" in summary
 
 
 def test_poll_first_build_empty_list_then_new_consult_sends(monkeypatch):

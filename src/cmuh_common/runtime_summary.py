@@ -51,7 +51,7 @@ _REASON_LABELS = {
     "check_job": "請檢查執行紀錄並人工核對結果",
     "flow_busy": "已有任務執行中，請等候其結果",
     "order_uncertain": "診斷順序不明，請至官方系統核對",
-    "routine_skip": "本次依設定略過，保留上次執行結果",
+    "routine_skip": "本次略過，保留上次執行結果",
     "check_mail_client": "請確認本機 Outlook 可用",
 }
 _LEDGER_STATES = {"prepared", "submitting", "unknown", "confirmed",
