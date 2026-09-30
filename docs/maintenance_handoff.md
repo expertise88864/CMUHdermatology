@@ -79,17 +79,19 @@ python scripts/type_debt.py
 ```powershell
 $candidateSha = git rev-parse HEAD
 git push origin "${candidateSha}:refs/heads/codex/your-maintenance-batch"
-python _delivery.py verify $candidateSha --phase candidate --wait 1800
+python _delivery.py verify $candidateSha --phase candidate --wait 2700
 git fetch origin
 git merge-base --is-ancestor origin/main $candidateSha
 # 上一步 exit code 必須為 0；main 前進則先整合並驗證新的 SHA。
 git status --short
 # 工作樹須乾淨且 HEAD 仍是 candidateSha，才能執行下一步。
 git push origin "${candidateSha}:refs/heads/main"
-python _delivery.py verify $candidateSha --phase main --wait 1800
+python _delivery.py verify $candidateSha --phase main --wait 2700
 ```
 
 `_delivery.py` 核對 policy 的 workflows、jobs、steps；不能以一個綠勾替代。缺失、應跑卻跳過、取消、逾時、讀不到都不通過。main 驗證後跑適用假環境 smoke，附證據才宣告交付；等待可分次查看，不更改門檻。
+
+`--wait 2700` 是本機最多觀察 45 分鐘，不會修改 GitHub 工作流程的逾時限制。觀察期結束且回報 `in_progress` 時，該步仍未通過，停止後續發佈；先在 GitHub 核對原 run ID／完整 SHA 是否仍在執行，再對同一 SHA、同一 phase 重跑上面的 `verify` 命令繼續觀察。此命令只查證據，不會重啟 CI。不要只因本機等待結束就取消或重啟原工作流程。若 GitHub 已回報 failure、cancelled 或 timed_out，按真正失敗診斷；API 讀不到也不能推定仍在執行或已通過。
 
 pending 獲乾淨全範圍 review 後，用**新空 audit commit**列出每個精確 SHA，不重寫既有 pending。audit 也走候選／正式 CI：
 
