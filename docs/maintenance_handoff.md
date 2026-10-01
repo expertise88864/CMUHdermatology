@@ -155,3 +155,17 @@ python scripts/benchmark_day_roster.py --samples 3 --warmups 1 --case pgy4_clerk
 圖示修正從版本 `2026.10.01.1` 起：Tk 只套用版本符合的本機 `assets/cmuh_app.ico`；圖示遺失、過舊或不可讀時保留預設圖示，畫面不再等候下載，也不增加背景排程。恢復配套安裝包的圖示與版本檔後重開即可。Windows 只使用既有大小圖示的 `WM_SETICON` 與兩次延遲重套，移除重複的 Tk ICO 載入；大小圖示用途見 [Microsoft WM_SETICON](https://learn.microsoft.com/zh-tw/windows/win32/winmsg/wm-seticon)。非 Tk 明確產製入口仍保留原下載行為，因此這不是「全專案不會下載圖示」的承諾。
 
 本輪只採納測試成本與圖示兩項程式改善，量測工具／交接為第三批；不改排班求解、熱鍵、醫囑、寄送帳本、打卡 pending 或資料格式。具體數值、未採納方向及剩餘驗收見 [風險清單的 10 月補充](maintenance_risk_plan_2026-09-30.md#2026-10-01-後續穩定性與效能批次)。回退仍走上方整包流程，保留最新業務狀態；不能只取舊圖示程式碼覆蓋新 manifest。
+
+## 啟動器離線基準補充（2026-10-01）
+
+原有建構工具不能單獨證明根目錄啟動器的時間。第三批量測／交接補上 `scripts/benchmark_launcher_offline.py`：將啟動器、resolver、src、圖示複製到自建暫存目錄，實際執行復原、版本解析及 main 的 `__main__` 區段，直到真 Tk callback 能讀取 notebook。每筆是新的 Python process，依賴須已安裝；首筆無 `.deps_cache`，後兩筆保留同一隔離副本的快取及設定。
+
+```powershell
+python -X utf8 scripts/benchmark_launcher_offline.py --output "$env:TEMP/cmuh-launcher.json"
+```
+
+工具禁止網路、郵件、外部程序、熱鍵注入與程序終止；worker 必須是自建暫存副本。管理員提升、正式單例 mutex、監控／watchdog、螢幕配置及 deferred 業務啟動使用隔離替身，主視窗保持隱藏。`root_launcher_to_first_dispatch_seconds` 是啟動器入口至首輪有效 Tk callback；`worker_start_to_first_dispatch_seconds` 另含隔離 guard 匯入。這不是院內可見畫面、門診資料取得或熱鍵全部就緒的時間。`process_start_to_clean_exit_seconds` 包含收尾，不能當首屏時間。初次安裝依賴未量測、未混入基準；三筆樣本不報 p95，不用冷／暖差異宣稱本輪加速。成功須同時有 exit 0、`status: completed`、空錯誤清單與來源雜湊相符，不能沿用失敗前的舊 JSON。
+
+以 `5451009`／v2026.10.01.5 的隔離副本測得：首筆約 3.12 秒、保留依賴快取後兩個新 process 約 1.80／1.72 秒（啟動器入口計）。100 次真 Tk 重建最後 20 筆固定 RSS 96,141,312 bytes、handles 392、GDI 411、USER 147、Python thread 1、child process 0；100 次真 executor 情境含 50 次確實發生的 OLD 晚回傳，未蓋掉新狀態。這是版本時點的離線樣本，不是全天運作或院內驗收。本輪仍只有測試成本、圖示修正、量測／交接三類批次。
+
+HIS 基線、會診顯示與 maintain 降量是使用者後續另行指定的修正。較新的醫師定案移除照光病人 banner 自動識別，改由醫師確認病人；原視窗／處置欄／文字與 F12 檢查保留。不要用舊 goal 文字恢復已被取代的病人檢查。剩餘 pending 以精確 SHA／audit 核對，CI、離線量測與空 modelUsage 不代表 Opus 批准。
