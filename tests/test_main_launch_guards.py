@@ -865,7 +865,7 @@ def test_his_menu_id_calibration_2026_07_20():
     # ★數值用字面值釘死★ 這是「打到別的選單 = 寫錯病歷」的防線,
     #   不可改成讀 his_contract —— 那會退化成 assert X == X。
     assert main.MENU_ID_代碼輸入 == 219, "F1~F5 代碼輸入選單 id(1150825 仍 219)"
-    assert main._HIS_CALIBRATED_VERSION == "1150825", "版本守門基線應同步到 1150825"
+    assert main._HIS_CALIBRATED_VERSION == "1151001", "使用者已確認 1151001.01 全部熱鍵正常"
 
 
 def test_hotkey_waits_are_interruptible():

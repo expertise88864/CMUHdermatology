@@ -71,6 +71,25 @@ def test_verdict_uses_calibrated_baseline_from_file(monkeypatch):
     assert v.status == cc.STATUS_OK
 
 
+@pytest.mark.parametrize("title, expected", [
+    ("西醫門診醫師作業 V.1151001.01", cc.STATUS_OK),
+    ("西醫門診醫師作業 V.1151002.01", cc.STATUS_DRIFT),
+])
+def test_october_calibration_replaces_older_saved_baseline(monkeypatch, title, expected):
+    """正式校正接手舊機器基線；已確認版本不誤報，下一版仍需通知。"""
+    class _Baseline:
+        def info(self, _surface):
+            return {
+                "fingerprint": {"title_version": "1150825",
+                                "title_version_full": "1150825.01"},
+                "calibrated_at": "2026-08-26T09:00:00",
+            }
+
+    monkeypatch.setattr(main, "_contract_baseline", lambda: _Baseline())
+    assert main._his_write_baseline_fp() == {"title_version": "1151001"}
+    assert main._his_write_verdict_for(title).status == expected
+
+
 def test_no_mutable_verdict_globals():
     # [codex P2] 不再保留可變全域裁決/指紋(自足採樣,免競態)
     assert not hasattr(main, "_his_write_verdict")
