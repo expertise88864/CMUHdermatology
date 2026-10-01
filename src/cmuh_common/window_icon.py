@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Tk 視窗圖示套用。搬自原主程式 line 509-585。
 
-Tk 的 iconbitmap 在 Windows 常只套用 16x16，工作列/Alt+Tab 依 WM_SETICON 取大圖。
-本模組同時套用兩者，並延遲重送 WM_SETICON 處理 Tk 後續重繪覆寫的情況。
+Windows 以 WM_SETICON 套用大小圖示，並延遲重送處理 Tk 後續重繪。
+避免同時呼叫 Tk iconbitmap：Windows 的多層 ICO 反覆開關測試會累積 GUI 物件。
 """
 import ctypes
 import logging
@@ -112,14 +112,15 @@ def _apply_windows_wm_seticon_from_ico(root: tk.Misc, ico_path: str) -> None:
 
 
 def apply_tk_window_icon(root: tk.Misc) -> None:
-    """套用主視窗圖示。"""
-    path = ensure_cmuh_app_icon_path()
+    """套用本機圖示；缺少圖示時保留 Tk 預設圖示，不能卡住 UI 下載。"""
+    path = ensure_cmuh_app_icon_path(allow_download=False)
     if not path:
         return
-    try:
-        root.iconbitmap(path)  # type: ignore[attr-defined]
-    except Exception as e:
-        logging.debug("設定視窗圖示失敗: %s", e)
+    if os.name != "nt":
+        try:
+            root.iconbitmap(path)  # type: ignore[attr-defined]
+        except Exception as e:
+            logging.debug("設定視窗圖示失敗: %s", e)
     _apply_windows_wm_seticon_from_ico(root, path)
 
     def _redo():

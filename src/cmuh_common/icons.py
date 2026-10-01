@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """中國醫校徽圖示產製。搬自原主程式 line 400-506 的 _ensure_cmuh_app_icon_path。
 
-第一次啟動時會自維基共享資源下載校徽 PNG 並合成 ICO。
-之後讀本地 cache，除非 _CMUH_ICON_ASSET_VERSION 升版才重新產製。
+明確要求產製時可自維基共享資源下載校徽 PNG 並合成 ICO。
+Tk 視窗只讀本地 cache，不因非必要圖示阻塞畫面建立。
 """
 import logging
 import os
@@ -24,24 +24,28 @@ _WIKI_REQUEST_HEADERS = {
 }
 
 
-def ensure_cmuh_app_icon_path() -> str | None:
-    """回傳 assets/cmuh_app.ico；必要時自維基共享資源產製。"""
+def ensure_cmuh_app_icon_path(*, allow_download: bool = True) -> str | None:
+    """回傳有效本機圖示；allow_download=False 時不下載、產圖或寫檔。"""
     assets_dir = os.path.join(get_app_dir(), "assets")
     ico_path = os.path.join(assets_dir, "cmuh_app.ico")
     ver_path = os.path.join(assets_dir, "cmuh_icon_version.txt")
 
     need_build = True
-    if os.path.isfile(ico_path) and os.path.getsize(ico_path) >= 800:
-        try:
+    try:
+        if os.path.isfile(ico_path) and os.path.getsize(ico_path) >= 800:
             if os.path.isfile(ver_path):
                 with open(ver_path, "r", encoding="ascii", errors="ignore") as vf:
                     need_build = int(vf.read().strip()) < _CMUH_ICON_ASSET_VERSION
             else:
                 need_build = True
-        except Exception:
-            need_build = True
+    except (OSError, ValueError):
+        # Missing permissions or a concurrently removed cosmetic asset must
+        # not prevent the main window from opening.
+        need_build = True
     if not need_build:
         return ico_path
+    if not allow_download:
+        return None
 
     try:
         os.makedirs(assets_dir, exist_ok=True)
