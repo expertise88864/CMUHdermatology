@@ -215,7 +215,7 @@ DEFAULT_CONFIG = {
     "quiet_start_hour": 0,
     "quiet_end_hour": 6,
     "subject_template": "{date} {time} 皮膚科會診通知單",
-    "body_template": "以下為 {date} {time} 皮膚科會診通知，姓名與病歷號已隱藏；完整資料請至 HIS 查看。",
+    "body_template": "",
     # [2026-06-15] 信件併入「今日打卡狀態」(autoclock 各帳號 上/下班)。關掉就不查不附。
     "punch_status_in_email": True,
     "enabled": True,
@@ -3592,12 +3592,12 @@ def _note_his_login_rejected_locked(cfg, token) -> None:
 
 
 def _his_account_note(cfg: dict, token: "dict | None" = None) -> str:
-    """信件標頭那一句:「目前使用主帳號登入(101358)」。
+    """信件標頭只顯示「（主帳號）」或「（備用帳號）」。
 
     ★用「這一次真的送出去的那一組」★:狀態可能在查詢與寄信之間又變了,
     而信要說的是這封信的資料是用哪一組帳號查出來的。真的沒有觀測值(理論上
     不會發生:寄信一定在一次登入之後)才退回目前狀態。
-    ★只顯示代號,不顯示密碼★
+    不顯示實際帳號或密碼。
     """
     # ★讀【明確傳入】的 token —— 查詢結果自己帶回來的★(外審 2026-08-27):
     #   從組信當下的全域(_psession)推測來源會說錯:SW_HIDE 後備跑完後,
@@ -3605,14 +3605,13 @@ def _his_account_note(cfg: dict, token: "dict | None" = None) -> str:
     #   全域「最後一次送出」只當沒有 token 時的後備(理論上不會走到:
     #   兩條查詢路徑的成功出口都會附上 token)。
     if isinstance(token, dict) and token.get("user"):
-        user, is_backup = token["user"], bool(token.get("backup"))
+        is_backup = bool(token.get("backup"))
     elif _his_last_login_account:
-        user, is_backup = _his_last_login_account
+        _user, is_backup = _his_last_login_account
     else:
-        user, _pw, is_backup, _day = _current_his_account(cfg)
+        _user, _pw, is_backup, _day = _current_his_account(cfg)
     label = "備用帳號" if is_backup else "主帳號"
-    user = str(user or "").strip()
-    return f"目前使用{label}登入（{user}）" if user else f"目前使用{label}登入"
+    return f"（{label}）"
 
 
 def _set_login_cooldown_until(ts: float, *, persist: bool = True) -> None:
@@ -7472,7 +7471,11 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
 
         subject = cfg["subject_template"].format(date=date_str, time=time_str)
         body_template = cfg["body_template"]
-        if body_template == "附件為 {date} {time} 皮膚科會診通知單截圖，由系統自動擷取寄送。":
+        # 既有設定檔仍可能保存舊預設；只移除這兩代預設，自訂內文照常保留。
+        if body_template in (
+            "附件為 {date} {time} 皮膚科會診通知單截圖，由系統自動擷取寄送。",
+            "以下為 {date} {time} 皮膚科會診通知，姓名與病歷號已隱藏；完整資料請至 HIS 查看。",
+        ):
             body_template = DEFAULT_CONFIG["body_template"]
         body = body_template.format(date=date_str, time=time_str)
 
@@ -7689,7 +7692,8 @@ def _do_full_job(trigger_label: str, override_recipients=None, *,
                 #   HTML 版一致★:不支援 HTML 的客戶端看到的是這一份。
                 _account_note = _his_account_note(cfg, token=_flow_token)
                 text_parts.append(_account_note)
-                text_parts.append(body)
+                if body:
+                    text_parts.append(body)
                 if punch_text:
                     text_parts.append(punch_text)
                 if extracted_text:

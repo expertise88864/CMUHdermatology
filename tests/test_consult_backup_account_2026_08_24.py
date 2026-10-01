@@ -307,22 +307,23 @@ class TestTheMailHeaderNamesTheAccount:
         cq._note_his_credentials_sent("999999", True)
         assert cq._his_using_backup is False       # 狀態說主帳號
         note = cq._his_account_note(BOTH)
-        assert "備用帳號" in note and "999999" in note
+        assert note == "（備用帳號）"
 
     def test_it_falls_back_to_the_current_account(self):
         note = cq._his_account_note(BOTH)
-        assert "主帳號" in note and "101358" in note
+        assert note == "（主帳號）"
 
     def test_the_password_is_never_in_the_note(self):
         cq._note_his_credentials_sent("999999", True)
         note = cq._his_account_note(BOTH)
         assert "pw-backup" not in note and "pw-primary" not in note
+        assert "999999" not in note and "101358" not in note
 
     def test_the_html_header_carries_the_note(self):
-        note = "目前使用備用帳號登入（999999）"
+        note = "（備用帳號）"
         html = cq._build_consult_email_html("2026/8/24", "1523", "intro", "",
                                             note)
-        assert "系統自動擷取　·　目前使用備用帳號登入" in html
+        assert "系統自動擷取　·　（備用帳號）" in html
         i, j = html.index("系統自動擷取"), html.index("會診通知單")
         assert i > j, "帳號註記不在信首的標題區"
 
@@ -710,12 +711,12 @@ class TestTheHeaderReadsTheServingSession:
         tok = cq._note_his_credentials_sent("101358", False)
         cq._note_his_credentials_sent("999999", True)     # 別的 worker
         note = cq._his_account_note(BOTH, token=tok)
-        assert "主帳號" in note and "101358" in note, note
+        assert note == "（主帳號）", note
 
     def test_no_token_falls_back_to_the_global(self):
         cq._note_his_credentials_sent("999999", True)
         note = cq._his_account_note(BOTH)
-        assert "備用帳號" in note and "999999" in note, note
+        assert note == "（備用帳號）", note
 
     def test_both_query_paths_return_their_token(self):
         """★查詢結果要真的帶著 token 回來★:兩條路的成功出口都附上 ——

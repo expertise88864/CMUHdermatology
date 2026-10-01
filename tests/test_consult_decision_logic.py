@@ -1137,9 +1137,9 @@ def test_extracted_text_appended_to_mail_body(monkeypatch):
     cq._do_full_job("17:00")
     # [CQ-BA 2026-08-24] 純文字版信首多了一行「目前使用哪一組帳號登入」——
     #   這條測的是【順序】:註記 → template → 擷取文字。
-    assert "目前使用主帳號登入" in h.bodies[0]
+    assert "（主帳號）" in h.bodies[0]
     _tpl = h.bodies[0].index("本文")
-    assert h.bodies[0].index("目前使用主帳號登入") < _tpl
+    assert h.bodies[0].index("（主帳號）") < _tpl
     assert h.bodies[0].index("蜂窩性組織炎") > _tpl
 
     # ★第二次要用【另一個排程時段】★(批次AE-8):同一天同一個時段是
@@ -1150,6 +1150,31 @@ def test_extracted_text_appended_to_mail_body(monkeypatch):
     cq._do_full_job("20:00")
     assert h2.bodies[0].endswith("本文")
     assert h2.bodies[0].count("本文") == 1
+
+
+@pytest.mark.parametrize("template", [
+    None,
+    "以下為 {date} {time} 皮膚科會診通知，姓名與病歷號已隱藏；完整資料請至 HIS 查看。",
+    "附件為 {date} {time} 皮膚科會診通知單截圖，由系統自動擷取寄送。",
+    "自訂通知 {date} {time}",
+])
+def test_consult_mail_omits_retired_intro_and_account_number(monkeypatch, template):
+    cfg = _base_cfg()
+    if template is not None:
+        cfg["body_template"] = template
+    h = _JobHarness(monkeypatch, cfg, extracted_text="蜂窩性組織炎")
+    cq._do_full_job("17:00")
+    assert len(h.sent) == 1
+    for body in (h.bodies[0], h.html_bodies[0]):
+        assert "（主帳號）" in body
+        assert "101358" not in body
+        assert "目前使用主帳號登入" not in body
+        assert "以下為" not in body
+        assert "附件為" not in body
+        if template and template.startswith("自訂通知"):
+            assert "自訂通知" in body
+    assert "蜂窩性組織炎" in h.bodies[0]
+    assert h.attachments == [None]
 
 
 # ─── CQ-01/02/03:會診 poll 通道(解析失敗 fail-open、signature 只看清單) ────
