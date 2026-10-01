@@ -1,11 +1,29 @@
 # -*- coding: utf-8 -*-
 """Regression checks for guarded launches in desktop app entry points."""
 import ast
+from functools import lru_cache
 import re
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@lru_cache(maxsize=16)
+def _function_nodes(source: str) -> tuple[ast.FunctionDef, ...]:
+    # Key by actual contents so same-path edits cannot reuse a stale tree.
+    # Callers only inspect these nodes; keep the original ast.walk order.
+    return tuple(node for node in ast.walk(ast.parse(source))
+                 if isinstance(node, ast.FunctionDef))
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _release_source_cache():
+    _function_nodes.cache_clear()
+    yield
+    _function_nodes.cache_clear()
 
 
 def _candidate_paths(source_path: Path) -> list:
@@ -21,8 +39,7 @@ def _candidate_paths(source_path: Path) -> list:
 
 def _function_node(source_path: Path, name: str) -> ast.FunctionDef:
     for path in _candidate_paths(source_path):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
+        for node in _function_nodes(path.read_text(encoding="utf-8")):
             # 搬家時私有名（_foo）會變成模組的公開 API（foo），兩種都認
             if isinstance(node, ast.FunctionDef) and node.name in (
                     name, name.lstrip("_")):
@@ -34,13 +51,29 @@ def _function_node(source_path: Path, name: str) -> ast.FunctionDef:
 def _function_source(source_path: Path, name: str) -> str:
     for path in _candidate_paths(source_path):
         source = path.read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        for node in ast.walk(tree):
+        for node in _function_nodes(source):
             if isinstance(node, ast.FunctionDef) and node.name in (
                     name, name.lstrip("_")):
                 return ast.get_source_segment(source, node) or ""
     raise AssertionError(
         f"function not found in {source_path.name} nor cmuh_common/: {name}")
+
+
+def test_function_lookup_observes_same_path_source_changes(tmp_path, monkeypatch):
+    path = tmp_path / "source.py"
+    monkeypatch.setattr(__import__(__name__, fromlist=["_"]), "_candidate_paths",
+                        lambda _path: [path])
+    for value in (1, 2, 1):
+        source = f"def probe():\n    return {value}\n"
+        path.write_text(source, encoding="utf-8")
+        node = _function_node(path, "_probe")
+        assert ast.literal_eval(node.body[0].value) == value
+        assert _function_source(path, "_probe") == source.rstrip()
+    path.write_text("def other():\n    return 0\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="function not found"):
+        _function_node(path, "_probe")
+    with pytest.raises(AssertionError, match="function not found"):
+        _function_source(path, "_probe")
 
 
 def _first_call_line(func: ast.FunctionDef, dotted_name: str) -> int:

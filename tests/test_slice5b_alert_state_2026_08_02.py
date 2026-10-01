@@ -200,13 +200,13 @@ class TestTheAppIsWiredToTheGuard:
         """
         import ast as _ast
         import main
-        cls = _ast.parse(inspect.getsource(main.AutomationApp)).body[0]
+        source = inspect.getsource(main.AutomationApp)
+        cls = _ast.parse(source).body[0]
         writers = []
         for node in cls.body:
             if not isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
                 continue
-            body = _ast.get_source_segment(
-                inspect.getsource(main.AutomationApp), node) or ""
+            body = _ast.get_source_segment(source, node) or ""
             if "ALERT_EMAIL_SENT_FILENAME" in body and                     "_atomic_write_json" in body:
                 writers.append((node.name, body))
         assert writers, (

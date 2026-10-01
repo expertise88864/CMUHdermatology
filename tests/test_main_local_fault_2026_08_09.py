@@ -16,6 +16,7 @@
 """
 import importlib
 import logging
+from types import SimpleNamespace
 
 import pytest
 
@@ -52,6 +53,11 @@ class _Sess:
 def harness(monkeypatch):
     """把外部世界全部換掉，只留下「失敗歸因」這件事可觀測。"""
     seen = {"backoff": [], "ok_backoff": [], "circuit": [], "cache_set": []}
+    # These cases classify failures, not elapsed wall time. Record every retry
+    # delay without changing the shared time module or any other worker's clock.
+    seen["retry_delays"] = []
+    monkeypatch.setattr(main, "time", SimpleNamespace(
+        **{**vars(main.time), "sleep": seen["retry_delays"].append}))
     # ★`requests` 在測試環境是 None★（`_ensure_network_imports` 沒跑過），
     #   而 `check_appointment_count` 的 except 子句會取 `requests.exceptions`
     #   —— 不補上去的話每個測試都死在 AttributeError，量到的不是被測的東西。
@@ -143,6 +149,7 @@ def test_a_broken_parser_does_not_record_remote_backoff(harness, monkeypatch,
     _break_bs4(monkeypatch)
     with caplog.at_level(logging.ERROR):
         _run()
+    assert harness["retry_delays"] == [2, 4, 6]
     assert harness["backoff"] == [], (
         f"★本機解析器壞掉，卻把遠端記進退避★：{harness['backoff']}")
 
@@ -153,6 +160,7 @@ def test_a_broken_parser_says_it_is_a_local_problem(harness, monkeypatch,
     _break_bs4(monkeypatch)
     with caplog.at_level(logging.ERROR):
         _run()
+    assert harness["retry_delays"] == [2, 4, 6]
     assert any("本機" in r.getMessage() for r in caplog.records), (
         "解析器壞掉卻沒有任何一句話說是本機的問題 —— 查的人會往遠端查")
 
@@ -162,6 +170,7 @@ def test_a_broken_parser_does_not_cache_the_unverified_page(harness,
     """沒能判定就不可以寫快取（否則下一輪拿同一份沒驗過的東西重解析）。"""
     _break_bs4(monkeypatch)
     _run()
+    assert harness["retry_delays"] == [2, 4, 6]
     assert harness["cache_set"] == [], (
         f"★沒能判定卻把頁面寫進快取★：{harness['cache_set']}")
 
