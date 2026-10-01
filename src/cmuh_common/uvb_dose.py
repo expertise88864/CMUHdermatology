@@ -1596,7 +1596,7 @@ def _compute_excimer_segment_edit(
     if new_dose is None:
         return [], None, None, recognized, False
     if _seg_maintain():
-        new_dose = dose
+        new_dose = min(new_dose, dose)
     new_count = count + 1 if count is not None else None
 
     edits = [
@@ -1798,7 +1798,7 @@ def _update_excimer_lines(text: str, today: date,
         if new_dose is None:
             continue
         if _has_maintain_dose(line):
-            new_dose = dose
+            new_dose = min(new_dose, dose)
         new_count = count + 1 if count is not None else None
 
         edits = [
@@ -2539,10 +2539,9 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
     )
     assert new_dose is not None  # 已通過 too-close 檢查
 
-    # [v20.15] 處置含 "maintain" 字眼 → 醫師意圖維持原劑量，覆蓋 compute 結果
-    # 只動 count + date，dose 保持 parsed.dose 不增不減
+    # [2026-10-01 physician] maintain 只禁止加量；保留間隔衰減及 MAX 夾值。
     if _has_maintain_dose(parsed.full_match):
-        new_dose = parsed.dose
+        new_dose = min(new_dose, parsed.dose)
 
     # 新 dose sanity 再檢一次 (理論上 compute_new_dose 不會吐出怪值，這層保險)
     if new_dose < MIN_DOSE:
@@ -2623,11 +2622,9 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
         )
         if next_new_dose is None or next_new_dose < MIN_DOSE:
             break
-        # [2026-06-18] 與主行一致(見上方 v20.15 maintain 覆蓋):該行寫 maintain dose
-        # → 維持原劑量不加量。否則固定劑量行會被誤加,且本次劑量 ≤1500 卻誤算成 >1500
-        # 而跳確認。next_uvb.dose 已於上方通過 MIN 下限檢查。
+        # 與主行一致：maintain 禁止加量，但不能取消該行自己的間隔衰減。
         if _has_maintain_dose(next_uvb.full_match):
-            next_new_dose = next_uvb.dose
+            next_new_dose = min(next_new_dose, next_uvb.dose)
         max_applied_dose = max(max_applied_dose, next_new_dose)
         next_new_count = (next_uvb.count + 1
                           if next_uvb.count is not None else None)
