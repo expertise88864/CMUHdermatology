@@ -1876,7 +1876,7 @@ def _sample_patient_locator(main_hwnd: int = 0):
     哪個病人有錯誤」。主視窗**標題列只有版本號**,病人資訊在上方一條獨立橫幅:
         版本、時段、診間、序號與病人識別資料在獨立橫幅中。
 
-    F1–F3 開始定位照光處置前會先取原病人資訊；純 Excimer 寫入前再核對。
+    僅供稽核異常時定位；2026-10-01 使用者要求照光熱鍵不再辨識病人橫幅。
     列舉子視窗有成本，醫院電腦須量測。
     ★用內容過濾而非 class 名稱識別★ 與 `_find_disposition_memo` 同一套思路,改版時
       比較不會整組失效;而且我們只【讀】不寫,誤判最壞的後果是拿不到定位資訊。
@@ -3162,7 +3162,7 @@ def _warn_excimer_segment_skipped(main_hwnd: int, label: str,
 def _excimer_identity_note(label: str) -> str:
     if label == "F1":
         return "F1 不自動設定身份 01；若已輸入醫令或療程，請醫師一併核對。"
-    return ("確認仍為原病人與原處置欄後，才會嘗試設定自費身份 01；"
+    return ("確認仍為原 HIS 主視窗與原處置欄後，才會嘗試設定自費身份 01；"
             "若無法確認，請醫師人工核對，勿直接重按熱鍵。")
 
 
@@ -3170,7 +3170,7 @@ def _warn_excimer_not_updated(main_hwnd: int, label: str, result) -> None:
     """[外審 F3/R5] 純 excimer 的「沒有更新任何一段」收尾:SANITY_FAIL 代表程式解析出的值
     不可信(或整段不是加量醫囑)→ 必須讓醫師看到並手動處理,不可只寫 log 就去設身份 01。
 
-    同病人與同處置目標可確認時仍嘗試身份 01；無法確認時交醫師核對。"""
+    同 HIS 主視窗與處置目標可確認時仍嘗試身份 01；無法確認時交醫師核對。"""
     from cmuh_common.uvb_dose import UvbAction
     if result.action == UvbAction.SANITY_FAIL:
         logging.warning("[%s][Excimer] sanity check 失敗: %s → 劑量未更新",
@@ -3450,39 +3450,21 @@ _F23_PURE_EXCIMER_NOT_UPDATED = "pure_excimer_not_updated"
 class _ExcimerIdentityAnchor(TypedDict):
     main_hwnd: int
     memo_hwnd: int
-    patient_key: tuple[str, ...]
 
 
-def _excimer_patient_key(main_hwnd: int) -> tuple[str, ...] | None:
-    """Read only the banner's whitelisted identifiers; never log the chart number."""
-    try:
-        loc = _sample_patient_locator(main_hwnd)
-    except SubsystemInterrupted:
-        raise
-    except Exception:
-        logging.exception("[Excimer][身份] 病人資訊橫幅讀取失敗")
-        return None
-    if not isinstance(loc, dict) or not loc.get("chart_no"):
-        return None
-    return tuple(str(loc.get(field) or "") for field in
-                 ("chart_no", "visit_no", "date_roc", "session", "room", "seq"))
-
-
-def _excimer_identity_anchor(main_hwnd: int, memo_hwnd: int, *,
-                             patient_key: tuple[str, ...] | None = None
+def _excimer_identity_anchor(main_hwnd: int, memo_hwnd: int
                              ) -> _ExcimerIdentityAnchor | None:
-    key = patient_key if patient_key is not None else _excimer_patient_key(main_hwnd)
-    if key is None:
+    """2026-10-01 physician decision: retain target checks without banner identity."""
+    if not main_hwnd or not memo_hwnd:
         return None
-    return {"main_hwnd": main_hwnd, "memo_hwnd": memo_hwnd,
-            "patient_key": key}
+    return {"main_hwnd": main_hwnd, "memo_hwnd": memo_hwnd}
 
 
 def _excimer_identity_target_current(
         anchor: _ExcimerIdentityAnchor | None, *,
         memo_port: HisMemoPort | None = None,
         expected_memo_text: str | None = None) -> bool:
-    """Fail closed if the original patient or pure-Excimer target is unprovable."""
+    """Verify the original HIS window and pure-Excimer target, without patient scanning."""
     if anchor is None:
         return False
     try:
@@ -3496,13 +3478,9 @@ def _excimer_identity_target_current(
             else _resolve_phototherapy_disposition(main_hwnd))
         if memo_hwnd != anchor["memo_hwnd"] or kind != "pure_excimer":
             return False
-        key = _excimer_patient_key(main_hwnd)
         check_stop()
-        if key is None or key != anchor["patient_key"]:
-            return False
         if expected_memo_text is not None:
-            # The full-memo snapshot precedes the patient scan. Re-read the
-            # original field after that scan so an intervening HIS edit is not
+            # Re-read the original field after target resolution so an intervening HIS edit is not
             # overwritten by the pending dose write.
             current_text = (memo_port.read_memo(memo_hwnd) if memo_port is not None
                             else _read_tmemo_text(memo_hwnd))
@@ -3512,7 +3490,7 @@ def _excimer_identity_target_current(
     except SubsystemInterrupted:
         raise
     except Exception:
-        logging.exception("[Excimer][身份] 寫前病人或處置目標核對失敗")
+        logging.exception("[Excimer][身份] 寫前 HIS 視窗或處置目標核對失敗")
         return False
 
 
@@ -3605,8 +3583,8 @@ def _write_excimer_memo_checked(main_hwnd: int, memo_hwnd: int, original: str,
             identity_anchor, memo_port=memo_port,
             expected_memo_text=original):
         _show_uvb_warning(
-            main_hwnd, "Excimer 病人或處置目標已變動",
-            "無法確認目前 HIS 仍是計算劑量時的原病人與處置欄。\n"
+            main_hwnd, "Excimer 視窗或處置目標已變動",
+            "無法確認目前仍是計算劑量時的 HIS 主視窗與處置欄。\n"
             "本次未送出處置寫入，也未自動設定身份 01；"
             "請醫師核對目前病歷後手動處理。")
         return None
@@ -3823,10 +3801,7 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
             "無法確認 UVB 處置。請醫師核對醫令與處置。" + _placed_note)
         return False
 
-    # A patient switch can retain both HWNDs and identical memo text. Capture the
-    # banner before locating the disposition, then verify it again before any
-    # pure-Excimer dose or identity write. A missing banner does not change UVB.
-    initial_patient_key = _excimer_patient_key(main_hwnd)
+    # 2026-10-01 使用者要求刪除病人橫幅辨識；保留取消、目標與全文回讀檢查。
     check_stop()
     # [2026-06-01/06-18] 找照光處置 memo + 分類(見 _resolve_phototherapy_disposition)。
     memo_hwnd, photo_kind = (
@@ -3868,14 +3843,12 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
 
     identity_anchor: _ExcimerIdentityAnchor | None = None
     if photo_kind == "pure_excimer":
-        if initial_patient_key is not None:
-            identity_anchor = _excimer_identity_anchor(
-                main_hwnd, memo_hwnd, patient_key=initial_patient_key)
+        identity_anchor = _excimer_identity_anchor(main_hwnd, memo_hwnd)
         if not _excimer_identity_target_current(
                 identity_anchor, memo_port=memo_port):
             _show_uvb_warning(
-                main_hwnd, "Excimer 病人或處置目標無法確認",
-                "尋找照光處置欄期間，無法確認 HIS 仍是原病人與處置欄。\n"
+                main_hwnd, "Excimer 視窗或處置目標無法確認",
+                "尋找照光處置欄期間，無法確認仍是原 HIS 主視窗與處置欄。\n"
                 "本次未更新劑量，也未自動設定身份 01；"
                 "請醫師核對目前病歷後手動處理。")
             return _F23_PURE_EXCIMER_ABORTED
@@ -6141,7 +6114,7 @@ def _set_身份_自費(value: str = "01", label: str = "", *,
     比照療程/卡號:WM_SETTEXT(逾時版)→ 失敗 fallback click → 寫回後 read-verify。
     身份屬計費敏感欄位,任何一步失敗或驗證不符都【警告醫師手動確認】而不靜默放過。
     依使用者拍板:不管原值(空白/40/其他)一律寫成 value。
-    F2/F3 純 Excimer 傳入 prewrite_check，核對原病人及處置目標後才能寫。"""
+    F2/F3 純 Excimer 傳入 prewrite_check，核對原 HIS 主視窗及處置目標後才能寫。"""
     # [UD-02 2026-07-10] 身份=01 是計費敏感寫入。放在 try 之前 check_stop(不會被下方 except 吞掉):
     # 醫師若在前一步(確認框等)按 F12,到此已被取消 → 不可再寫身份欄。
     check_stop()
@@ -6199,10 +6172,10 @@ def _set_身份_自費(value: str = "01", label: str = "", *,
                 raise
             except Exception:
                 logging.exception("[%s][身份] 寫前病人／目標核對例外", label)
-            logging.warning("[%s][身份] 原病人或 Excimer 處置目標無法確認 → 不寫身份", label)
+            logging.warning("[%s][身份] 原 HIS 主視窗或 Excimer 處置目標無法確認 → 不寫身份", label)
             _show_uvb_warning(
                 main_hwnd, "身份未自動設定",
-                "無法確認目前 HIS 仍是本次純 Excimer 的原病人與處置欄。\n"
+                "無法確認目前仍是本次純 Excimer 的 HIS 主視窗與處置欄。\n"
                 + ("身份 01 的寫入已嘗試，結果無法確認；"
                    if write_attempted else "身份 01 未自動設定；")
                 + "劑量處置可能已有部分寫入。\n"

@@ -12,6 +12,7 @@ import pytest
 
 import main
 from main import _record_his_action as record_his_action_real
+from main import _excimer_identity_target_current as excimer_target_current_real
 
 
 def _memo(*, kind="UVB"):
@@ -62,7 +63,7 @@ def fake_his(monkeypatch):
 
 @pytest.fixture
 def confirmed_excimer_patient(monkeypatch):
-    # Billing-policy tests isolate dose outcomes; patient switching is tested below.
+    # Billing-policy tests isolate dose outcomes; target switching is tested below.
     monkeypatch.setattr(main, "_excimer_identity_target_current", lambda _anchor: True)
 
 
@@ -801,7 +802,7 @@ def test_excimer_readback_empty_keeps_billing_policy_but_warns(
 
 def test_excimer_early_warning_does_not_promise_identity_before_patient_check():
     note = main._excimer_identity_note("F2")
-    assert "確認仍為原病人與原處置欄後" in note
+    assert "確認仍為原 HIS 主視窗與原處置欄後" in note
     assert "才會嘗試設定自費身份 01" in note
     assert "身份仍依原規則設為" not in note
 
@@ -891,27 +892,21 @@ def test_excimer_declined_dose_confirmation_reports_incomplete(
     assert identity_calls == [("01", hotkey)]
 
 
-@pytest.mark.parametrize("change", ["patient", "missing_chart", "main", "memo", "kind"])
+@pytest.mark.parametrize("change", ["main", "memo", "kind"])
 def test_excimer_identity_guard_rejects_changed_or_unreadable_target(
         monkeypatch, fake_his, change):
-    current = {"patient": "12345678", "main": 10, "memo": 20,
+    current = {"main": 10, "memo": 20,
                "kind": "pure_excimer"}
     monkeypatch.setattr(
         main, "_sample_patient_locator",
-        lambda _hwnd: ({"chart_no": current["patient"], "visit_no": "A001",
-                        "room": "103", "seq": "12"}
-                       if current["patient"] else None))
+        lambda _hwnd: pytest.fail("banner must not be sampled"))
     monkeypatch.setattr(main, "_find_hospital_main_window",
                         lambda: current["main"])
     monkeypatch.setattr(main, "_resolve_phototherapy_disposition",
                         lambda _hwnd: (current["memo"], current["kind"]))
     anchor = main._excimer_identity_anchor(10, 20)
     assert main._excimer_identity_target_current(anchor) is True
-    if change == "patient":
-        current["patient"] = "87654321"
-    elif change == "missing_chart":
-        current["patient"] = ""
-    elif change == "main":
+    if change == "main":
         current["main"] = 11
     elif change == "memo":
         current["memo"] = 21
@@ -1024,22 +1019,22 @@ def test_excimer_f12_after_identity_write_warns_and_audits_uncertainty(
 
 
 @pytest.mark.parametrize("hotkey", ["F2", "F3"])
-def test_excimer_patient_switch_after_dose_blocks_identity(
+def test_excimer_target_switch_after_dose_blocks_identity(
         monkeypatch, fake_his, hotkey):
     port = FakeMemoPort(_memo(kind="Excimer"))
     port.kind = "pure_excimer"
-    current = {"chart": "12345678"}
+    current = {"memo": 20}
     monkeypatch.setattr(main, "_sample_patient_locator",
-                        lambda _hwnd: {"chart_no": current["chart"]})
+                        lambda _hwnd: pytest.fail("banner must not be sampled"))
     monkeypatch.setattr(main, "_find_hospital_main_window", lambda: 10)
     monkeypatch.setattr(main, "_resolve_phototherapy_disposition",
-                        lambda _hwnd: (20, "pure_excimer"))
+                        lambda _hwnd: (current["memo"], "pure_excimer"))
 
     def update(*, label, identity_anchor_out):
         result = main._update_uvb_dose_core(
             label, strict=True, memo_port=port,
             identity_anchor_out=identity_anchor_out)
-        current["chart"] = "87654321"  # doctor switched after dose readback
+        current["memo"] = 21  # disposition changed after dose readback
         return result
 
     monkeypatch.setattr(main, "_f23_update_uvb_dose", update)
@@ -1083,19 +1078,17 @@ def test_excimer_uncertain_dose_same_patient_keeps_identity_attempt(
 
 
 @pytest.mark.parametrize("hotkey", ["F2", "F3"])
-def test_excimer_switch_during_disposition_lookup_blocks_dose_and_identity(
+def test_excimer_target_switch_during_disposition_lookup_blocks_dose_and_identity(
         monkeypatch, fake_his, hotkey):
-    current = {"chart": "12345678"}
-
     class SwitchDuringLocate(FakeMemoPort):
         def locate_phototherapy(self, main_hwnd):
-            current["chart"] = "87654321"
+            self.main_hwnd = 11
             return super().locate_phototherapy(main_hwnd)
 
     port = SwitchDuringLocate(_memo(kind="Excimer"))
     port.kind = "pure_excimer"
     monkeypatch.setattr(main, "_sample_patient_locator",
-                        lambda _hwnd: {"chart_no": current["chart"]})
+                        lambda _hwnd: pytest.fail("banner must not be sampled"))
     monkeypatch.setattr(
         main, "_f23_update_uvb_dose",
         lambda *, label, identity_anchor_out: main._update_uvb_dose_core(
@@ -1108,7 +1101,7 @@ def test_excimer_switch_during_disposition_lookup_blocks_dose_and_identity(
     assert any("未更新劑量" in msg for _, msg in fake_his)
 
 
-def test_excimer_memo_edit_during_patient_scan_is_not_overwritten(
+def test_excimer_memo_edit_during_target_check_is_not_overwritten(
         monkeypatch, fake_his):
     class EditDuringSecondLocate(FakeMemoPort):
         def __init__(self, text):
@@ -1136,21 +1129,15 @@ def test_excimer_memo_edit_during_patient_scan_is_not_overwritten(
     assert any("未送出處置寫入" in msg for _, msg in fake_his)
 
 
-def test_excimer_f12_during_initial_patient_scan_stops_before_disposition(
+def test_excimer_f12_before_disposition_stops_without_patient_scan(
         monkeypatch, fake_his):
     port = FakeMemoPort(_memo(kind="Excimer"))
     port.kind = "pure_excimer"
-    state = {"cancelled": False}
-
-    def sample(_hwnd):
-        state["cancelled"] = True
-        return None
-
     def check_stop():
-        if state["cancelled"]:
-            raise main.SubsystemInterrupted("F12")
+        raise main.SubsystemInterrupted("F12")
 
-    monkeypatch.setattr(main, "_sample_patient_locator", sample)
+    monkeypatch.setattr(main, "_sample_patient_locator",
+                        lambda _hwnd: pytest.fail("banner must not be sampled"))
     monkeypatch.setattr(main, "check_stop", check_stop)
     monkeypatch.setattr(port, "locate_phototherapy",
                         lambda _hwnd: pytest.fail("F12 must stop before lookup"))
@@ -1167,12 +1154,11 @@ def test_excimer_switch_during_confirmation_blocks_dose_and_identity(
         (date.today() - timedelta(days=3)).strftime("%Y/%m/%d"),
         prior.strftime("%Y/%m/%d")))
     port.kind = "pure_excimer"
-    current = {"chart": "12345678"}
     monkeypatch.setattr(main, "_sample_patient_locator",
-                        lambda _hwnd: {"chart_no": current["chart"]})
+                        lambda _hwnd: pytest.fail("banner must not be sampled"))
 
     def confirm(*_args, **_kwargs):
-        current["chart"] = "87654321"  # same HWND and memo text after dialog
+        port.memo_hwnd = 21  # changed target after dialog
         return True
 
     monkeypatch.setattr(main, "_photo_confirm_yesno", confirm)
@@ -1185,7 +1171,45 @@ def test_excimer_switch_during_confirmation_blocks_dose_and_identity(
                         lambda *_a, **_k: pytest.fail("wrong patient cannot get 01"))
     assert getattr(main, f"script_{hotkey}_adaptive")() is False
     assert port.writes == []
-    assert any("未送出處置寫入" in msg for _, msg in fake_his)
+    assert any("本次未寫回處置" in msg for _, msg in fake_his)
+
+
+@pytest.mark.parametrize("hotkey", ["F2", "F3"])
+@pytest.mark.parametrize("sample", [
+    "Excimer light 900 (59) on  (2026/10/1) 1 shots, add 30 each time, fixed at 1000",
+    "Excimer light: 730 m j/cm2(121) on (2026/10/1) , 2shots, add 50 each time, maintain the dose, MAX: 850",
+])
+def test_excimer_hotkey_does_not_require_patient_banner(
+        monkeypatch, fake_his, hotkey, sample):
+    prior = date.today() - timedelta(days=3)
+    text = sample.replace("2026/10/1", prior.strftime("%Y/%m/%d"))
+    port = FakeMemoPort(text + "\nPathology report: synthetic note")
+    port.kind = "pure_excimer"
+    monkeypatch.setattr(main, "_sample_patient_locator",
+                        lambda _hwnd: pytest.fail("banner must not be sampled"))
+    monkeypatch.setattr(main, "_excimer_identity_target_current",
+                        excimer_target_current_real)
+    monkeypatch.setattr(main, "_find_hospital_main_window", lambda: 10)
+    monkeypatch.setattr(main, "_resolve_phototherapy_disposition",
+                        lambda _hwnd: (20, "pure_excimer"))
+    monkeypatch.setattr(
+        main, "_f23_update_uvb_dose",
+        lambda *, label, identity_anchor_out: main._update_uvb_dose_core(
+            label, strict=True, memo_port=port,
+            identity_anchor_out=identity_anchor_out))
+    identity_calls = []
+
+    def set_identity(value, *, label, prewrite_check):
+        if not prewrite_check():
+            return False
+        identity_calls.append((value, label))
+        return True
+
+    monkeypatch.setattr(main, "_set_身份_自費", set_identity)
+    assert getattr(main, f"script_{hotkey}_adaptive")() is True
+    assert len(port.writes) == 1
+    assert "Pathology report: synthetic note" in port.text
+    assert identity_calls == [("01", hotkey)]
 
 
 @pytest.mark.parametrize("hotkey", ["F2", "F3"])
