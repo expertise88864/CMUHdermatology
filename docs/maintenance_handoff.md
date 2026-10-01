@@ -130,3 +130,28 @@ Claude-Opus-5-Reviewed-Commit: <被補審的完整 SHA>
 | 摘要時間異常／資料庫鎖定、損壞 | 核對時鐘／儲存並保留資料；診斷不取代寄送帳本／官方紀錄。 |
 
 詳細定義見 [執行摘要](runtime_diagnostics_2026-09-28.md)。院內驗收由使用者安排；CI 不代替醫療或出勤確認。
+
+## 離線穩定性與效能量測（2026-10-01）
+
+這組工具供開發副本使用，須先安裝既有開發依賴；不要在院內正式程式資料夾執行。工具先隔離暫存設定，再匯入程式；禁止網路與外部程序，使用匿名資料，不啟動 HIS／寄信／打卡。結果 JSON 保留原始樣本及來源雜湊。工具失敗或遭到外部操作攔截時不能當通過；比較前先核對 `status: completed` 及空的錯誤清單。
+
+```powershell
+# 真 Tk 畫面建構、重開、Windows GUI 物件與合成設定／匯出操作
+python -X utf8 scripts/benchmark_runtime_offline.py --cycles 100 --operations --output "$env:TEMP/cmuh-runtime.json"
+# 圖示檔遺失：不得為開視窗發出 HTTP 請求
+python -X utf8 scripts/benchmark_runtime_offline.py --cycles 2 --missing-icon --output "$env:TEMP/cmuh-no-icon.json"
+# 真正受限 executor，既有假 UI／來源；每四輪各測一種故障／恢復
+python -X utf8 scripts/soak_outpatient_refresh.py --cycles 100 --output "$env:TEMP/cmuh-refresh-soak.json"
+# 沿用既有排班案例，保留品質、警告與硬限制資料
+python scripts/benchmark_day_roster.py --samples 3 --warmups 1 --case pgy4_clerk5_mix1 --case pgy2 --output "$env:TEMP/cmuh-roster.json"
+```
+
+兩支新工具皆可用 `--root <另一份完整開發 checkout>` 指向舊版；比較時使用相同工具、依賴、案例及電腦，交錯執行至少三組。新 process 的畫面時間須每組另啟動工具，不能拿同一 process 重建視窗冒充冷啟動。100 輪用來觀察趨勢，不代表連續運行一整天。資源先暖機，檢查最後數段是否仍上升；Python RSS 不必每輪精確歸零。GUI 物件須看 `gdi`／`user_objects`，一般 `handles` 與 RSS 平穩不能證明它們沒有累積；`null` 表示未知。
+
+`benchmark_runtime_offline.py` 的主視窗保持隱藏，停用 deferred 業務啟動、熱鍵掛鉤、螢幕配置與正式程序清理。`first_idle_s` 是建構至處理首輪 Tk 事件，`probe_process_to_first_idle_s` 另包含量測工具匯入與隔離成本；都不是正式啟動器、依賴首次安裝、OS 冷磁碟快取或院內完整啟動時間。圖示與本地設定讀取是實作路徑，匯出是既有匿名小案例，300 筆門診訊息使用假 widget，不含真表格重畫。
+
+程式關閉流程之後仍可能保留即將隨 process 結束的 timer。JSON 分開列出 `callbacks_after_app_cleanup_before_probe_cleanup` 與工具取消 timer／destroy 後的值，後者為零不代表程式本身取消了所有 timer。`soak_outpatient_refresh.py` 保留真正的外層 bounded executor 和內層 batch workers，但沿用假 root；假 root 的 callback 記錄數不能當成 Tk 洩漏量測。
+
+圖示修正從版本 `2026.10.01.1` 起：Tk 只套用版本符合的本機 `assets/cmuh_app.ico`；圖示遺失、過舊或不可讀時保留預設圖示，畫面不再等候下載，也不增加背景排程。恢復配套安裝包的圖示與版本檔後重開即可。Windows 只使用既有大小圖示的 `WM_SETICON` 與兩次延遲重套，移除重複的 Tk ICO 載入；大小圖示用途見 [Microsoft WM_SETICON](https://learn.microsoft.com/zh-tw/windows/win32/winmsg/wm-seticon)。非 Tk 明確產製入口仍保留原下載行為，因此這不是「全專案不會下載圖示」的承諾。
+
+本輪只採納測試成本與圖示兩項程式改善，量測工具／交接為第三批；不改排班求解、熱鍵、醫囑、寄送帳本、打卡 pending 或資料格式。具體數值、未採納方向及剩餘驗收見 [風險清單的 10 月補充](maintenance_risk_plan_2026-09-30.md#2026-10-01-後續穩定性與效能批次)。回退仍走上方整包流程，保留最新業務狀態；不能只取舊圖示程式碼覆蓋新 manifest。
