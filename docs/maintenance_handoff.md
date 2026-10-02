@@ -49,6 +49,7 @@ python scripts/sanity_check.py
 python -m unittest _test_delivery
 # 在已暫存的最終內容上核對；不沿用修改前的結果。
 $env:PYTHONPATH = 'src'
+$env:PYTHONIOENCODING = 'utf-8'
 python -c "from scripts import push_helper as p; from cmuh_common.version import CURRENT_VERSION; p.verify_staged_version_consistency(CURRENT_VERSION); p.verify_staged_manifest_hashes()"
 ```
 
@@ -62,7 +63,7 @@ python scripts/check_coverage.py cov.json
 python scripts/type_debt.py
 ```
 
-恰兩位 PGY 月維持既有特殊模式：週二上午、週四下午、週五上午不排治療室，並保留週別輪替；釋出的 PGY 在 Clerk 入座後有剩餘診位才跟診。判準是該月名單，不是請假後當日剩兩人。一般月仍先滿足照光＋治療室，週三下午僅照光。不要把特殊模式誤判為漏班，也不要沿用早期註解中的 PGY 優先於 Clerk；現行管線及回歸測試已採較新定案。
+恰兩位 PGY 月維持既有特殊模式：週二上午、週四下午、週五上午不排治療室，並保留週別輪替；逐時段初排由 Clerk 先入座，再用剩餘診位安排釋出的 PGY。完整月份還會執行 course 平衡：在必要工作、請假、鎖定與容量允許時，PGY 每週至少一次跟診與 Clerk／家醫／外訓最低需求共同受保護，之後才依 Clerk > 家醫 > 外訓 > PGY 追求目標次數。不能因 Clerk 尚未達目標就移除可行的 PGY 最低跟診；既有回歸為 `test_clerk_extra_clinics_never_displace_feasible_pgy_minimums`。判準是該月名單，不是請假後當日剩兩人。一般月仍先滿足照光＋治療室，週三下午僅照光。不要把特殊模式誤判為漏班，也不要沿用早期註解中的 PGY 優先於 Clerk；現行管線及回歸測試已採較新定案。
 
 保存平台、Python／依賴版本及 exit codes，不修改門檻製造全綠。性能改動先按 [第三期量測](第三期排班效能與品質守門_2026-09-24.md) 與 `scripts/compare_day_roster.py` 對照基準／候選；記錄 SHA、環境、樣本與品質。沒有可量化收益，或硬限制／品質退步，就不採用重構。
 
@@ -110,7 +111,7 @@ Claude-Opus-5-Reviewed-Commit: <被補審的完整 SHA>
 1. 維護者安排停機窗口，記錄版本及待確認寄送、打卡、HIS 操作；停止本專案六支程式、守護與其自動啟動／排程。確認已停止，勿終止其他專案的 Python／瀏覽器。
 2. 在院內受控位置備份當下完整資料夾，以及最新設定、排班、帳本、待確認狀態；私有備份不進 Git 或診斷回報。保留權限及原安裝路徑。
 3. 取得已驗證、資料格式相容的整包快照，包含程式、manifest、六支啟動器、版本解析器、版本目錄、指標與 extras。無配套快照／相容證據時，由維護者準備向前修正版，不臨時拼裝。
-4. 暫時阻止更新立即換回新版，再還原配套程式；**保留最新設定、帳本、排班與待確認狀態**，不由舊快照覆蓋。核對捷徑／排程路徑。現有更新抑制在 `cmuh_common/update_policy.py`，維護者先於隔離副本驗證，不任意刪狀態。
+4. 暫時阻止更新立即換回新版，再還原配套程式；**保留最新設定、帳本、排班與待確認狀態**，不由舊快照覆蓋。核對捷徑／排程路徑。現有更新抑制在 `cmuh_common/update_policy.py`，是 `settings/.auto_update_suspended_until` 保存的絕對到期時間，並非永久停用。watchdog 偵測 crash loop 會以當下加一小時覆寫此期限，可能縮短手動設定的較長暫停；過期後 updater 仍可能重新拉回 main 的較高問題版本，防降版不會阻止。維護者先於隔離副本驗證：修復版尚未在 main 驗證完成前，保持 watchdog 及其自動啟動／排程停止，或在受控維護期間持續核對並延長有效期限，確保涵蓋整個修復窗口；無法維持這項保護就不恢復會觸發更新的工作／排程。不可只設定一次旗標便假設回退會永久維持，也不任意刪狀態。
 5. 隔離副本跑相容性及上述回歸；院內以根目錄啟動器核對版本／畫面，依 [模板](hospital_acceptance_template.md) 驗收再恢復工作及排程。
 6. 由醫師／院方核對停機與「可能已執行」操作。回退不撤回醫囑、郵件、官方打卡，勿為測試恢復而重做；記錄處理者、恢復時間及待辦。
 

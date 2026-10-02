@@ -56,7 +56,7 @@ e219ea71b6c3d5a25321bcc8ca33461db67bea9d
 
 後續優先結清十九筆補審；若有缺陷另開最小批次，保存紅轉綠重現、review／pending、候選／正式 exact-SHA CI、fake smoke、版本／manifest、整包回退及實機待辦。不能因外部證據缺失而改守門。
 
-維持一般月 PGY 照光＋治療室（週三下午僅照光）先於跟診，跟診 Clerk > 家醫 > 外訓 > PGY。恰兩位 PGY 月保留二早／四下／五早不排治療室及週別輪替；釋出 PGY 在 Clerk 入座後有剩餘診位才跟診（solve_day.py 管線／two_pgy 回歸，較新定案取代早期優先註解）。家醫指定是可跟診時段；照光負調整真的降低總負荷。醫囑／Excimer 及待確認寄送／打卡處理維持定案。
+維持一般月 PGY 照光＋治療室（週三下午僅照光）先於跟診，完整月份先共同保護 Clerk／家醫／外訓最低需求與可行的 PGY 每週一次跟診，再按 Clerk > 家醫 > 外訓 > PGY 追求目標次數；Clerk 未達目標不表示應移除 PGY 最低跟診（`test_clerk_extra_clinics_never_displace_feasible_pgy_minimums`）。恰兩位 PGY 月保留二早／四下／五早不排治療室及週別輪替；逐時段初排先讓 Clerk 入座，再用剩餘診位安排釋出 PGY；後續 course 平衡仍遵守上述共同最低需求（solve_day.py 管線／two_pgy 回歸，較新定案取代早期優先註解）。家醫指定是可跟診時段；照光負調整真的降低總負荷。醫囑／Excimer 及待確認寄送／打卡處理維持定案。
 
 本輪尚未確認新的執行程式缺陷。院內驗收由使用者按模板完成；CI、fake smoke、文件整理不自動滿足此項。
 
