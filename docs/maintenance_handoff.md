@@ -136,6 +136,8 @@ Claude-Opus-5-Reviewed-Commit: <被補審的完整 SHA>
 
 這組工具供開發副本使用，須先安裝既有開發依賴；不要在院內正式程式資料夾執行。工具先隔離暫存設定，再匯入程式；禁止網路與外部程序，使用匿名資料，不啟動 HIS／寄信／打卡。結果 JSON 保留原始樣本及來源雜湊。工具失敗或遭到外部操作攔截時不能當通過；比較前先核對 `status: completed` 及空的錯誤清單。
 
+2026-10-02 補正量測工具的重啟隔離：三支工具均在任何應用程式匯入前，清除繼承的 `CMUH_RESTART_HANDSHAKE`、`CMUH_RESTART_READY_EVENT`、`CMUH_RESTART_PARENT_CAPS`。禁止網路／外部程序仍不足以阻止依賴檢查經環境指定路徑改寫交握檔或存取 READY event。既有 launcher 隔離回歸增加兩支工具實際入口與 `boot`／`repair-only` 能力組合，使用匿名暫存 sentinel 與替身 event；原版四案失敗、補正後通過。較早沒有這組繼承環境的量測，不代表已驗證此保護；重跑時核對工具本身的雜湊。此補正不改正式重啟流程、業務狀態或臨床規則。
+
 ```powershell
 # 真 Tk 畫面建構、重開、Windows GUI 物件與合成設定／匯出操作
 python -X utf8 scripts/benchmark_runtime_offline.py --cycles 100 --operations --output "$env:TEMP/cmuh-runtime.json"

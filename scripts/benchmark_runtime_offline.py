@@ -7,6 +7,13 @@ The deferred operational startup is stubbed; this is not launcher end-to-end.
 """
 import time
 PROCESS_STARTED = time.perf_counter()
+import os
+
+# Dependency checks can signal a parent's restart before application startup.
+# A developer probe must never inherit a live handshake file or READY event.
+for key in ('CMUH_RESTART_HANDSHAKE', 'CMUH_RESTART_READY_EVENT', 'CMUH_RESTART_PARENT_CAPS'):
+    os.environ.pop(key, None)
+
 from pathlib import Path
 import argparse
 import gc

@@ -4,6 +4,12 @@ Developer checkout only; dependencies and pytest must already be installed.
 python scripts/soak_outpatient_refresh.py --cycles 100 --output soak.json
 No real Tk or service is used. GUI resources are measured by benchmark_runtime_offline.py.
 """
+import os
+
+# Clear parent restart state before any application or dependency import.
+for key in ('CMUH_RESTART_HANDSHAKE', 'CMUH_RESTART_READY_EVENT', 'CMUH_RESTART_PARENT_CAPS'):
+    os.environ.pop(key, None)
+
 from pathlib import Path
 import argparse
 import gc
