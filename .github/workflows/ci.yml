@@ -45,6 +45,18 @@ jobs:
           # 防呆：任一重依賴裝失敗立即紅，避免對應測試退回靜默 skip 而無人察覺
           python -c "import ortools, openpyxl, docx, reportlab"
 
+      - name: Record runtime dependency baseline
+        run: python -X utf8 scripts/dependency_baseline.py --output "$env:RUNNER_TEMP/cmuh-environment.json" --constraints "$env:RUNNER_TEMP/cmuh-environment.txt"
+
+      - name: Preserve runtime dependency baseline
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-environment-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/cmuh-environment.json
+            ${{ runner.temp }}/cmuh-environment.txt
+          if-no-files-found: error
+
       - name: Ruff (真 bug 類 lint — F/E9/B，規則見 ruff.toml)
         run: python -m ruff check src scripts tests
 

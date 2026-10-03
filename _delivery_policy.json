@@ -13,6 +13,8 @@
             "Checkout",
             "Setup Python",
             "Install dependencies",
+            "Record runtime dependency baseline",
+            "Preserve runtime dependency baseline",
             "Ruff (真 bug 類 lint — F/E9/B，規則見 ruff.toml)",
             "Pyright (型別檢查 — 設定見 pyrightconfig.json)",
             "Pytest (全測試 + 覆蓋率)",

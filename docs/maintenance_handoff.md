@@ -111,7 +111,7 @@ Claude-Opus-5-Reviewed-Commit: <被補審的完整 SHA>
 1. 維護者安排停機窗口，記錄版本及待確認寄送、打卡、HIS 操作；停止本專案六支程式、守護與其自動啟動／排程。確認已停止，勿終止其他專案的 Python／瀏覽器。
 2. 在院內受控位置備份當下完整資料夾，以及最新設定、排班、帳本、待確認狀態；私有備份不進 Git 或診斷回報。保留權限及原安裝路徑。
 3. 取得已驗證、資料格式相容的整包快照，包含程式、manifest、六支啟動器、版本解析器、版本目錄、指標與 extras。無配套快照／相容證據時，由維護者準備向前修正版，不臨時拼裝。
-4. 暫時阻止更新立即換回新版，再還原配套程式；**保留最新設定、帳本、排班與待確認狀態**，不由舊快照覆蓋。核對捷徑／排程路徑。現有更新抑制在 `cmuh_common/update_policy.py`，是 `settings/.auto_update_suspended_until` 保存的絕對到期時間，並非永久停用。watchdog 偵測 crash loop 會以當下加一小時覆寫此期限，可能縮短手動設定的較長暫停；過期後 updater 仍可能重新拉回 main 的較高問題版本，防降版不會阻止。維護者先於隔離副本驗證：修復版尚未在 main 驗證完成前，保持 watchdog 及其自動啟動／排程停止，或在受控維護期間持續核對並延長有效期限，確保涵蓋整個修復窗口；無法維持這項保護就不恢復會觸發更新的工作／排程。不可只設定一次旗標便假設回退會永久維持，也不任意刪狀態。
+4. 暫時阻止更新立即換回新版，再還原配套程式；**保留最新設定、帳本、排班與待確認狀態**，不由舊快照覆蓋。核對捷徑／排程路徑。現有更新抑制在 `cmuh_common/update_policy.py`，是 `settings/.auto_update_suspended_until` 保存的絕對到期時間，並非永久停用。自 `2026.10.03.1` 起，透過 `suspend_auto_updates()` 寫入會取得獨立、最多等待兩秒的跨程序鎖，只延長有效期限；watchdog 的一小時請求不會縮短較長維護期限。讀不到既有旗標或拿不到鎖會回報失敗，不以較短期限覆蓋。直接手動改檔未參與此鎖；設定期限時須先停止所有寫入者並核對內容。過期後 updater 仍可能重新拉回 main 的較高問題版本，防降版不會阻止。維護者先於隔離副本驗證：修復版尚未在 main 驗證完成前，保持 watchdog 及其自動啟動／排程停止，或在受控維護期間持續核對並延長有效期限，確保涵蓋整個修復窗口；無法維持這項保護就不恢復會觸發更新的工作／排程。不可只設定一次旗標便假設回退會永久維持，也不任意刪狀態。
 5. 隔離副本跑相容性及上述回歸；院內以根目錄啟動器核對版本／畫面，依 [模板](hospital_acceptance_template.md) 驗收再恢復工作及排程。
 6. 由醫師／院方核對停機與「可能已執行」操作。回退不撤回醫囑、郵件、官方打卡，勿為測試恢復而重做；記錄處理者、恢復時間及待辦。
 
@@ -172,3 +172,48 @@ python -X utf8 scripts/benchmark_launcher_offline.py --output "$env:TEMP/cmuh-la
 以 `5451009`／v2026.10.01.5 的隔離副本測得：首筆約 3.12 秒、保留依賴快取後兩個新 process 約 1.80／1.72 秒（啟動器入口計）。100 次真 Tk 重建最後 20 筆固定 RSS 96,141,312 bytes、handles 392、GDI 411、USER 147、Python thread 1、child process 0；100 次真 executor 情境含 50 次確實發生的 OLD 晚回傳，未蓋掉新狀態。這是版本時點的離線樣本，不是全天運作或院內驗收。本輪仍只有測試成本、圖示修正、量測／交接三類批次。
 
 HIS 基線、會診顯示與 maintain 降量是使用者後續另行指定的修正。較新的醫師定案移除照光病人 banner 自動識別，改由醫師確認病人；原視窗／處置欄／文字與 F12 檢查保留。不要用舊 goal 文字恢復已被取代的病人檢查。剩餘 pending 以精確 SHA／audit 核對，CI、離線量測與空 modelUsage 不代表 Opus 批准。
+
+## 更新復原與環境重建（2026-10-03）
+
+本輪基準為 `74d58cde6be0293d9fded50ccc7f4e9574131e19`。只修更新抑制期限，另補流程證據及開發工具；正式依賴、更新來源、資料格式及臨床／排班規則不變。無限大、NaN 等旗標內容視為損壞，下一次寫入修成有限期限；不藉此永久停用更新。兩秒鎖等待只在要求寫入抑制旗標時發生，不增加背景輪詢。
+
+使用者已定案：復原未完成時保留**排班、點座標與守護程式**的非寫入工具例外。它們仍可啟動並記錄復原失敗，必要時 resolver 退回根目錄 `src`；這不代表版本一致或復原成功。臨床主程式、會診、打卡仍依各自既有守門，不放寬 HIS 寫入。先核對 `update_recovery.log`、`version_pointer.log`、實際啟動來源與版本；檔案占用解除後再以根目錄啟動器重試。不要為消除錯誤而刪 journal／備份，或直接執行版本樹源碼。
+
+停機備份／程式回退須區分：
+
+| 類型 | 保存及還原方式 |
+| --- | --- |
+| 配套程式 | 完整 `src`、`versions`、`current.txt`、manifest、啟動器、resolver 及 manifest 列出的 extras 配套還原；置換整棵程式樹，避免留下新版專有模組。舊樹先保留於院內受控位置，確認路徑後再操作。 |
+| 最新業務狀態 | 保留整個當下 `settings`，包含設定／校正、排班保存／定案、`clock_state.json`、會診 baseline／notified／trigger／receipts 等；不得拿快照中的舊狀態覆蓋。帳密與臨床資料留在院內。 |
+| SQLite | `delivery_ledger.sqlite3` 及診斷資料庫在 WAL 模式下可能另有 `-wal`、`-shm`；先停止所有 writer、關閉連線後備份完整狀態，不能在持續寫入時只複製主檔。無法確認停機一致性時先保留整組原檔，不自行拼接。 |
+| 稽核鏈 | `action_ledger.jsonl`、anchor 及輪替代檔成組保存；單獨留最新 JSONL 不能證明完整鏈。 |
+| 復原證據 | `.updater_commit.journal`、相應 `.bak`／交易備份、`.multiwrite.manifest.json` 與其備份一起保留，交由正式復原；不任意清除。 |
+| 可重建快取 | `.deps_cache`、Python bytecode 可重新建立；不是寄送／打卡去重紀錄。抑制旗標與鎖檔不是業務去重解鎖工具，不以刪檔作為恢復手段。 |
+
+新增整合回歸用同步 checkpoint 終止自建程序，透過新程序的真啟動器／resolver／復原及讀取端驗證四類情境：更新提交中斷、設定多檔交易中斷、程式回退保留較新狀態、真檔案鎖定後重試。省略更新 journal 或設定復原的負向案例會違反一致性斷言。回退比較配套程式雜湊，保留合成狀態全部位元組、真 SQLite 已寄／unknown 去重及 JSONL 鏈；打卡 pending、排班定案的測試資料只證明未被覆蓋，其業務語意沿用現有狀態機回歸。非寫入例外用替代入口驗證，不執行真正排班／HIS／寄信／打卡。這不是斷電、磁碟損壞或院內驗收。
+
+```powershell
+python -m pytest -q -p no:cacheprovider tests/test_update_policy.py tests/test_recovery_process_chain_2026_10_03.py tests/test_updater_safety_batch1.py tests/test_update_atomicity_2026_08_01.py tests/test_launcher_recovery_order_2026_08_12.py tests/test_settings_recovery_contract_2026_08_30.py tests/test_watchdog_restart_lock_2026_09_03.py
+```
+
+上述歷史測試檔名以目前 `tests` 為準；若命令回報不存在或非零，先修正清單／診斷，不把部分執行當通過。新六個流程案例預期通過，受鎖的臨床入口預期 exit 3，非寫入例外預期 exit 0 且失敗紀錄仍在；鎖解除後 journal 應由復原移除，啟動來源、版本、指標及 manifest 雜湊一致。
+
+開發環境基線 `docs/dependency_baseline_2026-10-03.txt` 是 Windows 11 `10.0.26200`／AMD64、CPython `3.13.1`、Tcl `8.6.15`／Tk ABI `8.6` 的 **54 個必要 runtime 套件**。已在乾淨 venv 重建相同組合，`pip check`、14 個必要匯入、三個新程序離線 launcher 樣本及 107 個相關匿名回歸通過；初次安裝另計，沒有宣稱加速或 p95。這不是院內環境或開發工具鏈的完整凍結：pip、pytest、Ruff、Pyright 不在 runtime constraints 內。
+
+```powershell
+# 完整開發 checkout，先選定與基線相同的 Python；不要在正式資料夾操作。
+python -m venv .pytest_cache/rebuild-venv
+$rebuildPython = '.pytest_cache/rebuild-venv/Scripts/python.exe'
+& $rebuildPython -m pip install -r requirements.txt -r requirements-lazy.txt -c docs/dependency_baseline_2026-10-03.txt
+& $rebuildPython -m pip check
+& $rebuildPython scripts/verify_dependencies.py
+& $rebuildPython -X utf8 scripts/dependency_baseline.py --output .pytest_cache/rebuilt-environment.json --constraints .pytest_cache/rebuilt-environment.txt
+& $rebuildPython -X utf8 scripts/benchmark_launcher_offline.py --output .pytest_cache/rebuilt-launcher.json
+# pytest 是驗證工具，另外安裝，不納入 runtime 套件基線。
+& $rebuildPython -m pip install pytest -c docs/dependency_baseline_2026-10-03.txt
+& $rebuildPython -m pytest -q -p no:cacheprovider tests/test_deps_runtime.py tests/test_deps_installer.py tests/test_bootstrap_scripts.py tests/test_bootstrap_delivery_2026_09_06.py tests/test_roster_export.py tests/test_update_policy.py tests/test_dependency_baseline_2026_10_03.py tests/test_recovery_process_chain_2026_10_03.py
+```
+
+每步核對 exit code，失敗停止，不沿用舊 JSON。環境紀錄只包含 source SHA／dirty 布林、兩份 requirements 雜湊、Python／OS／Tcl／Tk ABI 與必要套件名稱／版本；不讀取 pip 設定、帳號、環境變數值或私有下載來源。比較 baseline 與 rebuilt 的 `packages`、manifest 雜湊並核對來源；dirty 紀錄不是精確提交驗證。CI 使用原安裝宣告及完整既有門檻，另上傳同 SHA／attempt 的 `runtime-environment` artifact，供核對實際 Windows runner／Python patch 與套件；不能拿本機版本推定 CI 版本。
+
+本機 dry-run 的現行安裝宣告有 20 個套件版本不同，沒有確認相容性缺陷，不因差異更改 requirements 或正式延遲安裝。安全掃描仍依現行 CI；日後重建發生解析、wheel／Python ABI 或掃描失敗時保存匿名錯誤，按原流程修正並重新驗證，不放寬門檻或宣稱舊基線永久安全。院內仍需核對 Python／Windows／Tk、檔案權限、防毒鎖定、捷徑／排程、受控停機及人工待確認動作；不在本輪測試正式系統。

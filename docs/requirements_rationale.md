@@ -53,3 +53,9 @@ Pillow 11.x 帶著 20 幾個已知弱點（PYSEC-2026-2250 / 2253 / 2254 / 2255 
 
 * `ortools`（排班求解器，版本釘在 `roster/__init__.py` 的 `ORTOOLS_PINNED_VERSION`）
 * `openpyxl` / `python-docx` / `reportlab`（排班匯出）
+
+## 開發重建基線（2026-10-03）
+
+`docs/dependency_baseline_2026-10-03.txt` 保存一組已重建及離線驗證的必要 runtime 套件，包括兩份清單的必要間接依賴。只供開發副本用 `pip install -r requirements.txt -r requirements-lazy.txt -c ...` 重建；不替代正式宣告、不改延遲安裝，也不凍結 pytest／pip／lint／型別工具。環境、失敗處理及回歸命令見 [維護手冊](maintenance_handoff.md#更新復原與環境重建2026-10-03)。
+
+`scripts/dependency_baseline.py` 只輸出套件名稱／版本及系統版本資訊，拒絕直接 URL 依賴；不匯出全機 `pip freeze`、pip 設定、環境變數內容或憑證。CI 另保存實際驗證環境，但繼續按原 requirements 解析、完整測試與安全掃描。新套件差異先驗證影響，不因不同就判定缺陷或任意升級。

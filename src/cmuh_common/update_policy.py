@@ -2,11 +2,14 @@
 """Shared auto-update suspension policy for watchdog and updater."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 import logging
+import math
 import os
 import time
 
 from cmuh_common.atomic_io import atomic_write_text
+from cmuh_common.deps_lock import acquire
 from cmuh_common.paths import get_settings_dir
 
 AUTO_UPDATE_SUSPEND_FILENAME = ".auto_update_suspended_until"
@@ -20,15 +23,47 @@ def get_auto_update_suspend_path() -> str:
     return os.path.join(get_settings_dir(), AUTO_UPDATE_SUSPEND_FILENAME)
 
 
+@contextmanager
+def _suspension_write_lock(path: str):
+    """Serialize cooperating writers; keep the separate lease file permanently."""
+    deadline = time.monotonic() + 2.0
+    fd = acquire(path + ".lock")
+    while fd is None:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("auto-update suspension writer is busy")
+        time.sleep(0.05)
+        fd = acquire(path + ".lock")
+    try:
+        yield
+    finally:
+        os.close(fd)
+
+
 def suspend_auto_updates(reason: str, *, duration_sec: float = 3600,
                          now: float | None = None) -> str:
-    """Suspend file-writing updates until the timestamp stored in settings."""
+    """Extend a finite suspension without shortening an existing maintenance window.
+
+    An unreadable flag must not be overwritten with an unverified shorter one.
+    Expiry and deliberate operator removal remain the existing release paths.
+    """
     current = time.time() if now is None else float(now)
     suspend_until = int(current + max(0.0, float(duration_sec)))
     path = get_auto_update_suspend_path()
-    content = f"{suspend_until}\nreason: {reason}\n"
-    if not atomic_write_text(path, content, encoding="utf-8"):
-        raise OSError(f"failed to write auto-update suspension flag: {path}")
+    with _suspension_write_lock(path):
+        try:
+            with open(path, encoding="utf-8") as existing:
+                previous_until = float(existing.readline().strip())
+        except FileNotFoundError:
+            previous_until = 0.0
+        except ValueError:
+            previous_until = 0.0  # Existing corrupt-content repair behavior.
+        if not math.isfinite(previous_until):
+            previous_until = 0.0
+        if previous_until >= suspend_until:
+            return path  # Preserve the longer deadline and its maintenance reason.
+        content = f"{suspend_until}\nreason: {reason}\n"
+        if not atomic_write_text(path, content, encoding="utf-8"):
+            raise OSError(f"failed to write auto-update suspension flag: {path}")
     return path
 
 
@@ -66,6 +101,10 @@ def get_auto_update_suspend_until(*, now: float | None = None) -> float:
     except (TypeError, ValueError) as e:
         # 與過期旗標相同：讀後刪除不是 CAS，可能刪掉新的有效旗標。
         logging.warning("[update-policy] corrupt suspension flag %s: %s", path, e)
+        return 0.0
+
+    if not math.isfinite(suspend_until):
+        logging.warning("[update-policy] non-finite suspension timestamp; flag kept")
         return 0.0
 
     if suspend_until > current:

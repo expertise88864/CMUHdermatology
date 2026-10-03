@@ -539,7 +539,7 @@ def _record_restart_and_check_crash_loop(name: str) -> bool:
                 CRASH_LOOP_SUSPEND_SEC // 60,
                 time.strftime("%H:%M:%S",
                                 time.localtime(now + CRASH_LOOP_SUSPEND_SEC)))
-            # [H] 同時暫停 auto-update 1 小時 (避免又拉到同個爛版本)
+            # 至少抑制 auto-update 一小時；不縮短既有較長的維護期限。
             try:
                 suspend_path = suspend_auto_updates(
                     f"{name} crash loop at "
@@ -548,7 +548,7 @@ def _record_restart_and_check_crash_loop(name: str) -> bool:
                     now=now,
                 )
                 logging.critical(
-                    "[watchdog] 已寫 %s 暫停 auto-update 1 小時",
+                    "[watchdog] 已保留或延長 %s 的 auto-update 暫停期限（至少一小時）",
                     suspend_path)
             except Exception:
                 logging.exception("[watchdog] 寫 auto-update suspend flag 失敗")
