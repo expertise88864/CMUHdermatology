@@ -166,8 +166,15 @@ def _recover_incomplete_update():
         # ★[外審 P1-01] 走固定的 `<app>/src`，不走版本解析後的 sys.path★
         bootstrap_recovery = _load_bootstrap_recovery()
         bootstrap_recovery.recover_and_report(_HERE, "點座標偵測程式")
-    except Exception:  # noqa: BLE001  復原失敗不可以擋住本程式啟動
-        pass
+    except Exception as exc:  # noqa: BLE001  保留非寫入工具的啟動例外
+        # 復原模組本身不可用時，仍須留紀錄；只用標準庫且不跳阻塞視窗。
+        try:
+            with open(os.path.join(_HERE, "update_recovery.log"), "a", encoding="utf-8") as log:
+                log.write("\n===== %s %s 啟動前更新復原 =====\n狀態：unknown（復原未完成；%s）\n"
+                          % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                             _PROGRAM, type(exc).__name__))
+        except Exception:  # noqa: BLE001  紀錄寫入失敗也不阻止既定例外啟動
+            pass
 
 
 _recover_incomplete_update()

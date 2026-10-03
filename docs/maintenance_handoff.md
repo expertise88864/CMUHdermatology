@@ -175,7 +175,7 @@ HIS 基線、會診顯示與 maintain 降量是使用者後續另行指定的修
 
 ## 更新復原與環境重建（2026-10-03）
 
-本輪基準為 `74d58cde6be0293d9fded50ccc7f4e9574131e19`。只修更新抑制期限，另補流程證據及開發工具；正式依賴、更新來源、資料格式及臨床／排班規則不變。無限大、NaN 等旗標內容視為損壞，下一次寫入修成有限期限；不藉此永久停用更新。兩秒鎖等待只在要求寫入抑制旗標時發生，不增加背景輪詢。
+本輪基準為 `74d58cde6be0293d9fded50ccc7f4e9574131e19`。修正更新抑制期限及非寫入啟動器的復原失敗漏記，另補流程證據及開發工具；正式依賴、更新來源、資料格式及臨床／排班規則不變。無限大、NaN 等旗標內容視為損壞，下一次寫入修成有限期限；不藉此永久停用更新。兩秒鎖等待只在要求寫入抑制旗標時發生，不增加背景輪詢。
 
 使用者已定案：復原未完成時保留**排班、點座標與守護程式**的非寫入工具例外。它們仍可啟動並記錄復原失敗，必要時 resolver 退回根目錄 `src`；這不代表版本一致或復原成功。臨床主程式、會診、打卡仍依各自既有守門，不放寬 HIS 寫入。先核對 `update_recovery.log`、`version_pointer.log`、實際啟動來源與版本；檔案占用解除後再以根目錄啟動器重試。不要為消除錯誤而刪 journal／備份，或直接執行版本樹源碼。
 
@@ -196,7 +196,7 @@ HIS 基線、會診顯示與 maintain 降量是使用者後續另行指定的修
 python -m pytest -q -p no:cacheprovider tests/test_update_policy.py tests/test_recovery_process_chain_2026_10_03.py tests/test_updater_safety_batch1.py tests/test_update_atomicity_2026_08_01.py tests/test_launcher_recovery_order_2026_08_12.py tests/test_settings_recovery_contract_2026_08_30.py tests/test_watchdog_restart_lock_2026_09_03.py
 ```
 
-上述歷史測試檔名以目前 `tests` 為準；若命令回報不存在或非零，先修正清單／診斷，不把部分執行當通過。新六個流程案例預期通過，受鎖的臨床入口預期 exit 3，非寫入例外預期 exit 0 且失敗紀錄仍在；鎖解除後 journal 應由復原移除，啟動來源、版本、指標及 manifest 雜湊一致。
+上述歷史測試檔名以目前 `tests` 為準；若命令回報不存在或非零，先修正清單／診斷，不把部分執行當通過。新九個流程案例預期通過，受鎖的臨床入口預期 exit 3，非寫入例外預期 exit 0 且失敗紀錄仍在；鎖解除後 journal 應由復原移除，啟動來源、版本、指標及 manifest 雜湊一致。三支非寫入工具在根目錄復原模組缺失／載入失敗時，也以標準庫嘗試追加 `unknown（復原未完成）`、程式名稱及例外類型，保留 journal 並繼續啟動；紀錄檔也不可寫時不阻擋啟動，因此沒有紀錄不代表復原成功。
 
 開發環境基線 `docs/dependency_baseline_2026-10-03.txt` 是 Windows 11 `10.0.26200`／AMD64、CPython `3.13.1`、Tcl `8.6.15`／Tk ABI `8.6` 的 **54 個必要 runtime 套件**。已在乾淨 venv 重建相同組合，`pip check`、14 個必要匯入、三個新程序離線 launcher 樣本及 107 個相關匿名回歸通過；初次安裝另計，沒有宣稱加速或 p95。這不是院內環境或開發工具鏈的完整凍結：pip、pytest、Ruff、Pyright 不在 runtime constraints 內。
 

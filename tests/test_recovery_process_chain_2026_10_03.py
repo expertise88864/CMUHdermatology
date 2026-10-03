@@ -47,8 +47,9 @@ def installation(tmp_path):
     version_module.write_text(re.sub(r"(CURRENT_VERSION\s*=\s*['\"])[\d.]+",
                                      lambda match: match[1] + OLD,
                                      version_module.read_text(encoding="utf-8")), encoding="utf-8")
-    (app / "src" / "consult_query.py").write_text(_entry("legacy"), encoding="utf-8")
-    (app / "src" / "scheduler.py").write_text(_entry("legacy"), encoding="utf-8")
+    safe_entries = ("consult_query.py", "scheduler.py", "coord_detector.py", "watchdog_runner.py")
+    for entry in safe_entries:
+        (app / "src" / entry).write_text(_entry("legacy"), encoding="utf-8")
     for launcher in REPO.glob("*.pyw"):
         shutil.copyfile(launcher, app / launcher.name)
     shutil.copyfile(REPO / "version_pointer.py", app / "version_pointer.py")
@@ -65,8 +66,8 @@ def installation(tmp_path):
     (app / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     version = app / "versions" / OLD
     shutil.copytree(app / "src", version / "src")
-    (version / "src" / "consult_query.py").write_text(_entry(OLD), encoding="utf-8")
-    (version / "src" / "scheduler.py").write_text(_entry(OLD), encoding="utf-8")
+    for entry in safe_entries:
+        (version / "src" / entry).write_text(_entry(OLD), encoding="utf-8")
     (version / ".complete").write_text(OLD, encoding="utf-8")
     (app / "current.txt").write_text(OLD, encoding="utf-8")
     (app / "settings").mkdir()
@@ -223,6 +224,32 @@ def test_real_file_lock_prevents_clinical_launch_then_a_fresh_retry_recovers(ins
         os.close(descriptor)
     _assert_old_launch(app)
     assert not (app / ".updater_commit.journal").exists()
+
+
+@pytest.mark.parametrize("launcher, program", [
+    ("中國醫皮膚科排班程式.pyw", "排班程式"),
+    ("中國醫皮膚科點座標偵測程式.pyw", "點座標偵測程式"),
+    ("中國醫皮膚科守護程式.pyw", "守護程式"),
+])
+def test_missing_recovery_module_is_logged_without_blocking_nonwriting_tools(installation, launcher, program):
+    app = installation
+    (app / "src" / "bootstrap_recovery.py").unlink()
+    prior_log = b"earlier recovery evidence\n"
+    (app / "update_recovery.log").write_bytes(prior_log)
+    journal = b"unresolved synthetic journal\n"
+    (app / ".updater_commit.journal").write_bytes(journal)
+    result = subprocess.run([sys.executable, str(app / launcher)],
+                            env=_env(app), cwd=app, capture_output=True, timeout=30,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    assert result.returncode == 0, result.stderr
+    payload = json.loads((app / "entry.json").read_text(encoding="utf-8"))
+    assert payload["tag"] == OLD and payload["version"] == OLD
+    assert (app / ".updater_commit.journal").read_bytes() == journal
+    current_log = (app / "update_recovery.log").read_bytes()
+    assert current_log.startswith(prior_log)
+    new_log = current_log[len(prior_log):].decode("utf-8")
+    assert "unknown" in new_log and "復原未完成" in new_log
+    assert program in new_log and "FileNotFoundError" in new_log
 
 
 def _settings_writer():
