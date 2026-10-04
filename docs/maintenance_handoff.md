@@ -39,6 +39,15 @@ fixture 快取候選未採納：249 案例的 cProfile 指出共用 fixture 約 
 
 重跑此成本案例時保持 Python／套件、來源及案例不變，交錯 plain→diagnostic、diagnostic→plain、plain→diagnostic；每次用外層 monotonic 計時記錄完整新程序及退出碼，保存各次 JUnit 並比較 testcase 身分、結果及 skip，不能只比較總數。固定案例為 `test_config_io.py`、`test_paths.py`、`test_task_gate.py`、`test_config_loss_guards_2026_07_25.py`、`test_main_launch_guards.py`（皆在 `tests/`）。plain 用 `python -m pytest -q -p no:cacheprovider --junitxml=junit.xml` 加上述案例；diagnostic 使用前述 wrapper 加相同 pytest 參數與案例、每次新的 evidence 目錄。此量測刻意沒有 coverage，不執行要求完整 coverage 的 evidence 通過檢查，也不是完整 CI。fixture profiling 另以 `python -m cProfile -o .pytest_cache/ci-fixture.prof -m pytest` 執行，將上述第四檔換成 `tests/test_runtime_diagnostics_2026_09_28.py`；profile 時間不當成正常耗時。
 
+分開成本時，GitHub job step 的起迄時間提供依賴安裝及正式逐條型別債耗時；已驗證 artifact 的 `collection_finished.duration_s` 與終端 `phase_seconds` 分別提供收集、setup、call、teardown 時間。setup／teardown 包含 fixture 與 pytest hooks，不能直接稱為某一個 fixture 的時間，也不能把 report.duration 加總當成整個 job 耗時。coverage 的追蹤成本混在測試階段，報告成本另以原工具定位：
+
+```powershell
+python -X utf8 -m cProfile -o .pytest_cache/ci-coverage-report-cost.prof -m pytest -q -p no:cacheprovider tests/test_config_io.py tests/test_paths.py tests/test_task_gate.py tests/test_config_loss_guards_2026_07_25.py tests/test_main_launch_guards.py --junitxml=.pytest_cache/ci-coverage-profile.xml --cov=src --cov-report=json:.pytest_cache/ci-coverage-profile.json --cov-report=term:skip-covered
+python -X utf8 -c "import pstats; pstats.Stats('.pytest_cache/ci-coverage-report-cost.prof').strip_dirs().sort_stats('cumulative').print_stats('summary|finish|start')"
+```
+
+該本機 113 案例 profile 通過，總 profile 時間 31.94 秒；pytest-cov 的 coverage 啟動、finish、summary 累積時間各約 0.34、0.09、16.83 秒。這些是含 profiling 成本的函式定位資料，互有包含關係，不能直接相加，也不是純 coverage 額外成本、正常 CI 基準或加速成果。沒有據此改 coverage 設定、增加 skip 或降低正式門檻。
+
 回退本輪開發工具須配套還原 workflow、delivery policy、兩支 scripts 及相關測試／文件，再走正常候選／正式 CI；不能只還原 wrapper 留下不一致 workflow。正式執行程式僅變更版本中繼資料；若回退已發佈套件，仍遵守下方整包回退及保留最新業務狀態的方法。本輪沒有執行院內實機驗收，不宣稱診斷解決了歷史逾時或縮短了整輪 CI。
 
 ## 接手先核對
