@@ -71,7 +71,7 @@ jobs:
       #   ① 匯出重依賴沒裝（上面的 import 防呆擋的就是這個）
       #   ② 多加一個 Tk 測試檔就讓別檔 42 支全變 skip ← 只有數量守衛擋得住
       - name: Pytest (全測試 + 覆蓋率)
-        run: python -m pytest -q -p no:cacheprovider --junitxml=junit.xml --cov=src --cov-report=json:cov.json --cov-report=term:skip-covered
+        run: python -X utf8 scripts/run_ci_pytest.py --output "$env:RUNNER_TEMP/cmuh-pytest" -- -q -p no:cacheprovider --junitxml=junit.xml --cov=src --cov-report=json:cov.json --cov-report=term:skip-covered
 
       # ★[2026-08-09] 讓「哪一支測試壞了」讀得到★
       #   `check-runs/<id>/annotations` 匿名讀得到，`actions/jobs/<id>/logs` 是
@@ -81,6 +81,21 @@ jobs:
       - name: pytest 失敗細節（轉成 annotation）
         if: failure()
         run: python scripts/ci_pytest_annotations.py junit.xml
+
+      - name: Validate pytest evidence
+        if: always()
+        run: python -X utf8 scripts/run_ci_pytest.py --check --output "$env:RUNNER_TEMP/cmuh-pytest" --sha "$env:GITHUB_SHA"
+
+      # Hard runner termination may prevent this step. Phase-start lines are
+      # also flushed into the running job log; partial evidence is never green.
+      - name: Preserve pytest evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cmuh-pytest/
+          if-no-files-found: error
+          retention-days: 14
 
       - name: skip 數量守衛
         # always()：測試紅燈時更要知道是不是「一批測試被靜默關掉」造成的

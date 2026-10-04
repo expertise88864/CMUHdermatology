@@ -1,5 +1,16 @@
 # 維護風險與施工清單（2026-09-30）
 
+## 2026-10-04 CI 定位與成本批次
+
+本輪基準 main `6855a37bd2941e36a9efcef9d9305cc342d65fa5`，當時二十二筆精確 pending 未結清。舊 review／audit 沿原流程，新提交另計。Phase 4 已有精確 audit，前文歷史未結數字不可當目前狀態。
+
+| 批次 | 證據與採納 | 限制 |
+| --- | --- | --- |
+| A 失敗定位 | 歷史取消只有 73% 進度且報告缺失；新增 opt-in pytest 收集／setup／call／teardown 進度、原退出碼、完整性檢查及帶 SHA／run／attempt 的 artifact。原 pytest、coverage、skip、型別、安全及正式發佈守門保留，新增 evidence 檢查與保存為必要步驟。 | 硬終止可能來不及上傳；最後開始階段不能證明根因。匿名新程序驗證正常、三種失敗、collection error 及四種階段中止，不操作正式系統。 |
+| B 成本調查 | 沿用歷史完整 CI／attempt 證據，補一組 249 案例 profiling。絕對模組路徑快取候選經 113 原案例三組交錯，新舊 case fingerprint／結果一致，但一組僅快 0.014 秒，未充分超過波動，未採納。 | 保留原共用 fixture、真正 SQLite 交易及既有 AST 成果；不填滿兩個瓶頸、不全面平行化、不加重試或延長 timeout 製造成功。 |
+
+可重跑方法與完整性定義併入 [原手冊](maintenance_handoff.md#ci-階段定位與驗證成本2026-10-04)。本輪只涉及開發工具，正式來源／版本／manifest 無變更。新 SHA 的候選／正式 CI、匿名 smoke 與完整 diff review 尚須另核對；文件不是批准或院內驗收證明。
+
 這是盤點時點的證據，不是永久完成狀態。基準 origin/main：`853f1336568c84599eccaaa4cbdfee9eabea5960`，版本 `2026.09.29.3`。後續重新核對 main、pending audit 及 CI。
 
 範圍：剩餘約一年維護期，穩定既有六支程式、驗證與交接。不新增功能、不改臨床／排班規則、不全案重寫；無確認缺陷就停止改碼。

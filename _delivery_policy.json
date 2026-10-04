@@ -18,6 +18,8 @@
             "Ruff (真 bug 類 lint — F/E9/B，規則見 ruff.toml)",
             "Pyright (型別檢查 — 設定見 pyrightconfig.json)",
             "Pytest (全測試 + 覆蓋率)",
+            "Validate pytest evidence",
+            "Preserve pytest evidence",
             "skip 數量守衛",
             "分層覆蓋率門檻 (coverage_floors.json)",
             "型別債棘輪 (type_debt_baseline.json)"

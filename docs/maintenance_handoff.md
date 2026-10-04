@@ -2,6 +2,37 @@
 
 適用於既有六支 Windows 程式。功能以目前程式及使用者定案為準；本手冊不授權操作真實 HIS、寄信、打卡或變更臨床規則。基準見 [風險清單](maintenance_risk_plan_2026-09-30.md)。
 
+## CI 階段定位與驗證成本（2026-10-04）
+
+本輪基準為 `6855a37bd2941e36a9efcef9d9305cc342d65fa5`，只改開發驗證工具、CI 與相關測試／文件；正式 `src`、啟動器、requirements、版本及 manifest 保持不變。最新狀態仍須按精確 SHA 核對。舊 pending 沿原排程，不用本輪 review 代替舊完整範圍。
+
+`c5ed246` 的正式 CI attempt 1 曾在 73% 後逾時取消，當時只有百分比，JUnit／coverage 未產生；同 SHA attempt 2 完成。這是定位證據缺口，不能說已找到或修復卡住的根因。最新基準候選／正式 pytest 各為 1335／1462 秒，逐條型別債各為 153／203 秒；只是不同 runner 的單次樣本。
+
+CI 沿用同一組完整 pytest／coverage 參數，透過 `scripts/run_ci_pytest.py` 啟動一次新 pytest 子程序，明確載入 `ci_pytest_progress`；一般 `python -m pytest` 不載入這個工具。每個收集器與 setup／call／teardown 開始時，安全代號寫入逐行 flush 的 JSONL 及 job console；完成階段另記 outcome、耗時，終端紀錄有 selected／finished 及 pytest 退出碼。參數值與例外內容不進進度紀錄；絕對／上層路徑以代號代替。環境僅記 Python、OS、程式 SHA、dirty 與 run／attempt。
+
+wrapper 要求新的 evidence 目錄，拒絕重用；先移除隔離 checkout 的舊 `junit.xml`／`cov.json`。pytest 的失敗退出碼原樣保留；收尾診斷失敗不改成成功。`result.json` 的 `finished` 只表示 pytest 正常結束，**不表示通過**，仍須核對 exit code。子程序被終止、少了 sessionfinish、進度截斷或收尾未完成，都不是完整證據。`Validate pytest evidence` 另外核對完整 SHA、乾淨來源、run／attempt、終端與完成計數及報告雜湊；它不能取代 skip／coverage／型別／安全或 `_delivery.py`。
+
+`Preserve pytest evidence` 在正常或失敗後嘗試上傳，artifact 名稱包含 SHA、run ID、attempt，保留 14 天。GitHub 強制終止或 runner 消失可能來不及上傳；console 的最後開始階段提供有限線索，不能保證任何中止都會留下完整 artifact。`running` 狀態或單獨檔案不能證明程序仍活著，須查實際 handle／GitHub run。
+
+在**隔離開發 checkout**（必要依賴已安裝）重跑：
+
+```powershell
+$ciEvidenceDir = Join-Path $env:TEMP ("cmuh-pytest-" + [guid]::NewGuid().ToString("N"))
+$ciSourceSha = git rev-parse HEAD
+python -X utf8 scripts/run_ci_pytest.py --output $ciEvidenceDir -- -q -p no:cacheprovider --junitxml=junit.xml --cov=src --cov-report=json:cov.json --cov-report=term:skip-covered
+$ciPytestExit = $LASTEXITCODE
+python -X utf8 scripts/run_ci_pytest.py --check --output $ciEvidenceDir --sha $ciSourceSha
+# 只有 pytest 退出碼、evidence 檢查及原有所有守門都成功才算完整本機驗證。
+Get-Content -LiteralPath (Join-Path $ciEvidenceDir "result.json")
+Get-Content -LiteralPath (Join-Path $ciEvidenceDir "events.jsonl") -Tail 3
+# 匿名正常／斷言失敗／collection error／四階段中止及完整性負向案例
+python -m pytest -q -p no:cacheprovider tests/test_ci_progress_2026_10_04.py tests/test_ci_annotations_2026_08_09.py tests/test_ci_gates_2026_07_30.py tests/test_delivery_review_2026_09_05.py
+```
+
+fixture 快取候選未採納：249 案例的 cProfile 指出共用 fixture 約 4 秒累積時間，SQLite 實際交易／連線占較多；profiling 自身有成本。僅試快取絕對模組路徑正規化，保留每次模組／屬性／帳本掃描。113 原案例三組交錯新程序，基準 10.887／10.134／10.639 秒，候選 9.865／9.532／10.625 秒，全部案例與結果一致。雖達到預先設定的中位數門檻，第三組僅差 0.014 秒，候選波動大於中位数收益，因此恢復原 fixture。不修改 SQLite 測試以替身繞過真正保留／順序守門，也不以 `type_debt --fast` 代替逐條檢查。
+
+回退本輪開發工具須配套還原 workflow、delivery policy、兩支 scripts 及相關測試／文件，再走正常候選／正式 CI；不能只還原 wrapper 留下不一致 workflow。無正式程式改動，不涉及業務狀態回退。本輪沒有執行院內實機驗收，不宣稱診斷解決了歷史逾時或縮短了整輪 CI。
+
 ## 接手先核對
 
 1. 讀取最新使用者定案、`AGENTS.md`、`REMOTE_CI_DELIVERY.md`、`_delivery_policy.json`；較早文件作歷史證據。
