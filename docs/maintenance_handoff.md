@@ -4,7 +4,9 @@
 
 ## CI 階段定位與驗證成本（2026-10-04）
 
-本輪基準為 `6855a37bd2941e36a9efcef9d9305cc342d65fa5`，只改開發驗證工具、CI 與相關測試／文件；正式 `src`、啟動器、requirements、版本及 manifest 保持不變。最新狀態仍須按精確 SHA 核對。舊 pending 沿原排程，不用本輪 review 代替舊完整範圍。
+本輪基準為 `6855a37bd2941e36a9efcef9d9305cc342d65fa5`，修改開發驗證工具、CI 與相關測試／文件。啟動器、requirements 及臨床／排班來源保持不變；發佈 helper 已將版本中繼資料升為 `2026.10.04.1` 並同步 manifest，164 個配套檔案中只有 `src/cmuh_common/version.py` 的內容雜湊改變。最新狀態仍須按精確 SHA 核對。舊 pending 沿原排程，不用本輪 review 代替舊完整範圍。
+
+候選 `e2e6f5ad68f0e918b0b6684b4f5dc1e1b94c0b67` 因誤將不存在的 `--sanity-only` 當成檢查參數而由 helper 建立並推送，提交訊息缺少 review trailers；其完整 diff **仍為 pending，沒有審查批准**。保留已發佈歷史，由後續提交補記本項缺口；最終補審及 audit 必須另列這個完整 SHA，不能只掃既有 pending trailers 而漏掉。此紀錄不表示已推 main 或 CI 通過。helper 主入口會升版、暫存與推送，不可用猜測的參數作檢查；純 sanity 應使用既有 `python scripts/sanity_check.py`。CLI 防誤操作另列後續範圍，不在本輪擴大修正。
 
 `c5ed246` 的正式 CI attempt 1 曾在 73% 後逾時取消，當時只有百分比，JUnit／coverage 未產生；同 SHA attempt 2 完成。這是定位證據缺口，不能說已找到或修復卡住的根因。最新基準候選／正式 pytest 各為 1335／1462 秒，逐條型別債各為 153／203 秒；只是不同 runner 的單次樣本。
 
@@ -13,6 +15,8 @@ CI 沿用同一組完整 pytest／coverage 參數，透過 `scripts/run_ci_pytes
 wrapper 要求新的 evidence 目錄，拒絕重用；先移除隔離 checkout 的舊 `junit.xml`／`cov.json`。pytest 的失敗退出碼原樣保留；收尾診斷失敗不改成成功。`result.json` 的 `finished` 只表示 pytest 正常結束，**不表示通過**，仍須核對 exit code。子程序被終止、少了 sessionfinish、進度截斷或收尾未完成，都不是完整證據。`Validate pytest evidence` 另外核對完整 SHA、乾淨來源、run／attempt、終端與完成計數及報告雜湊；它不能取代 skip／coverage／型別／安全或 `_delivery.py`。
 
 `Preserve pytest evidence` 在正常或失敗後嘗試上傳，artifact 名稱包含 SHA、run ID、attempt，保留 14 天。GitHub 強制終止或 runner 消失可能來不及上傳；console 的最後開始階段提供有限線索，不能保證任何中止都會留下完整 artifact。`running` 狀態或單獨檔案不能證明程序仍活著，須查實際 handle／GitHub run。
+
+獨立審查找到中止測試的 PID checkpoint 競態：父程序可在 PID 檔建立後、寫完前讀到空內容，清理時只終止 wrapper 而留下 pytest 子程序。受控暫停該寫入後重現逾時及存活子程序；改成先完整寫暫存 PID 檔，再 `os.replace` 原子發布。相關回歸另重現 Windows checkpoint 短暫讀取拒絕。父程序在原有 15 秒期限內只重試 FileNotFoundError／PermissionError，損壞 PID 仍失敗；例外清理在結束 wrapper 前只終止其直接子程序中 cwd 為該匿名暫存目錄且 argv 為 pytest 的程序，避免遺留繼承的 pipe。新增一次讀取拒絕及損壞 PID 清理的匿名整合案例。這是測試同步與清理修正，沒有改正式程序的終止規則。
 
 在**隔離開發 checkout**（必要依賴已安裝）重跑：
 
@@ -31,7 +35,11 @@ python -m pytest -q -p no:cacheprovider tests/test_ci_progress_2026_10_04.py tes
 
 fixture 快取候選未採納：249 案例的 cProfile 指出共用 fixture 約 4 秒累積時間，SQLite 實際交易／連線占較多；profiling 自身有成本。僅試快取絕對模組路徑正規化，保留每次模組／屬性／帳本掃描。113 原案例三組交錯新程序，基準 10.887／10.134／10.639 秒，候選 9.865／9.532／10.625 秒，全部案例與結果一致。雖達到預先設定的中位數門檻，第三組僅差 0.014 秒，候選波動大於中位数收益，因此恢復原 fixture。不修改 SQLite 測試以替身繞過真正保留／順序守門，也不以 `type_debt --fast` 代替逐條檢查。
 
-回退本輪開發工具須配套還原 workflow、delivery policy、兩支 scripts 及相關測試／文件，再走正常候選／正式 CI；不能只還原 wrapper 留下不一致 workflow。無正式程式改動，不涉及業務狀態回退。本輪沒有執行院內實機驗收，不宣稱診斷解決了歷史逾時或縮短了整輪 CI。
+診斷工具本身也有成本。同一組 113 原案例、六個新程序、未開 coverage 的交錯量測，plain 為 11.206／10.160／10.172 秒，diagnostic 為 10.626／11.208／10.847 秒；兩邊中位數為 10.172／10.847 秒，差約 0.675 秒，全部案例及結果相同。樣本有明顯波動，只記錄本機小組的額外成本，不推算整輪 CI 或院內效能，不宣稱加速或 p95。
+
+重跑此成本案例時保持 Python／套件、來源及案例不變，交錯 plain→diagnostic、diagnostic→plain、plain→diagnostic；每次用外層 monotonic 計時記錄完整新程序及退出碼，保存各次 JUnit 並比較 testcase 身分、結果及 skip，不能只比較總數。固定案例為 `test_config_io.py`、`test_paths.py`、`test_task_gate.py`、`test_config_loss_guards_2026_07_25.py`、`test_main_launch_guards.py`（皆在 `tests/`）。plain 用 `python -m pytest -q -p no:cacheprovider --junitxml=junit.xml` 加上述案例；diagnostic 使用前述 wrapper 加相同 pytest 參數與案例、每次新的 evidence 目錄。此量測刻意沒有 coverage，不執行要求完整 coverage 的 evidence 通過檢查，也不是完整 CI。fixture profiling 另以 `python -m cProfile -o .pytest_cache/ci-fixture.prof -m pytest` 執行，將上述第四檔換成 `tests/test_runtime_diagnostics_2026_09_28.py`；profile 時間不當成正常耗時。
+
+回退本輪開發工具須配套還原 workflow、delivery policy、兩支 scripts 及相關測試／文件，再走正常候選／正式 CI；不能只還原 wrapper 留下不一致 workflow。正式執行程式僅變更版本中繼資料；若回退已發佈套件，仍遵守下方整包回退及保留最新業務狀態的方法。本輪沒有執行院內實機驗收，不宣稱診斷解決了歷史逾時或縮短了整輪 CI。
 
 ## 接手先核對
 

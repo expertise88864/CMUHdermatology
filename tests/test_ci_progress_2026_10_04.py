@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 
+import psutil
 import pytest
 
 
@@ -86,11 +87,27 @@ def test_collection_error_is_not_a_completed_passing_run(tmp_path):
     assert runner.check(output, "a" * 40) == 1
 
 
-@pytest.mark.parametrize("phase", ["collection", "setup", "call", "teardown"])
-def test_owned_child_terminated_mid_phase_keeps_last_phase_and_partial_state(tmp_path, phase):
+def _cleanup_owned_pytest_children(proc, tmp_path):
+    """A failed checkpoint read must not leave our child's inherited pipes open."""
+    try:
+        children = psutil.Process(proc.pid).children()
+    except psutil.NoSuchProcess:
+        return
+    for child in children:
+        try:
+            if Path(child.cwd()).resolve() != tmp_path.resolve() or "pytest" not in child.cmdline():
+                continue
+            child.kill()
+            child.wait(timeout=10)
+        except psutil.NoSuchProcess:
+            pass
+
+
+def _exercise_termination(tmp_path, phase):
     source = f'''import os, threading, pathlib, pytest
 def stop_here():
-    pathlib.Path("owned.pid").write_text(str(os.getpid()))
+    pathlib.Path("owned.pid.tmp").write_text(str(os.getpid()))
+    os.replace("owned.pid.tmp", "owned.pid")
     threading.Event().wait(60)
 if {phase!r} == "collection": stop_here()
 @pytest.fixture
@@ -110,8 +127,11 @@ def test_example(prepared):
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             marker = tmp_path / "owned.pid"
-            if marker.exists():
-                child_pid = int(marker.read_text())
+            try:
+                child_pid = int(marker.read_text(encoding="ascii"))
+            except (FileNotFoundError, PermissionError):
+                pass
+            else:
                 break
             assert proc.poll() is None, "wrapper exited before anonymous checkpoint"
             time.sleep(0.01)
@@ -135,14 +155,71 @@ def test_example(prepared):
         assert not (output / "junit.xml").exists()
         assert runner.check(output, "a" * 40) == 1
     finally:
-        if child_pid is not None:
-            try:
-                os.kill(child_pid, signal.SIGTERM)
-            except OSError:
-                pass
+        _cleanup_owned_pytest_children(proc, tmp_path)
         if proc.poll() is None:
             proc.kill()
             proc.communicate(timeout=10)
+
+
+@pytest.mark.parametrize("phase", ["collection", "setup", "call", "teardown"])
+def test_owned_child_terminated_mid_phase_keeps_last_phase_and_partial_state(tmp_path, phase):
+    _exercise_termination(tmp_path, phase)
+
+
+def test_checkpoint_read_denial_is_retried_within_original_deadline(tmp_path, monkeypatch):
+    read_text = Path.read_text
+    denied = False
+
+    def read_once_denied(path, *args, **kwargs):
+        nonlocal denied
+        if path == tmp_path / "owned.pid" and path.exists() and not denied:
+            denied = True
+            raise PermissionError("anonymous transient checkpoint sharing denial")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_once_denied)
+    _exercise_termination(tmp_path, "setup")
+    assert denied
+
+
+def test_corrupt_checkpoint_fails_and_stops_only_owned_children(tmp_path, monkeypatch):
+    read_text = Path.read_text
+    children = []
+    wrappers = []
+    popen = subprocess.Popen
+
+    def record_wrapper(*args, **kwargs):
+        proc = popen(*args, **kwargs)
+        wrappers.append(proc)
+        return proc
+
+    def corrupt_pid(path, *args, **kwargs):
+        if path == tmp_path / "owned.pid" and path.exists():
+            children.extend(psutil.Process(wrappers[0].pid).children())
+            return "invalid-anonymous-pid"
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", record_wrapper)
+    monkeypatch.setattr(Path, "read_text", corrupt_pid)
+    try:
+        with pytest.raises(ValueError, match="invalid-anonymous-pid"):
+            _exercise_termination(tmp_path, "setup")
+        assert len(wrappers) == 1 and wrappers[0].poll() is not None
+        assert children and all(not child.is_running() for child in children)
+    finally:
+        # Retain handles acquired from our live wrapper for cleanup if the assertion fails.
+        for child in children:
+            try:
+                if Path(child.cwd()).resolve() == tmp_path.resolve() and "pytest" in child.cmdline():
+                    child.kill()
+                    child.wait(timeout=10)
+            except psutil.NoSuchProcess:
+                pass
+        for proc in wrappers:
+            _cleanup_owned_pytest_children(proc, tmp_path)
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate(timeout=10)
 
 
 def test_stale_reports_are_removed_and_old_evidence_is_never_reused(tmp_path):
