@@ -726,11 +726,82 @@ def _real_dates_in(text: str) -> list:
     return out
 
 
+def _join_stale_excimer_date_continuations(text: str, cutoff: date) -> str:
+    """Join an explicitly linked old date for classification only, never for writing.
+
+    HIS can put ``on`` before or after a physical newline. Do not borrow dates
+    across blank lines or another treatment. An uncertain/recent continuation
+    leaves the original undated Excimer marker in place so routing stays guarded.
+    """
+    lines = text.splitlines(keepends=True)
+    for index in range(len(lines) - 1):
+        head, following = lines[index], lines[index + 1]
+        if not _PT_EXCIMER_RE.search(head) or _UVB_DATE_RE.search(head):
+            continue
+        tail = following.lstrip(" \t")
+        on = re.match(r"on\b[ \t]*", tail, re.IGNORECASE)
+        if on is None and not re.search(r"\bon[ \t]*$", head.rstrip("\r\n"), re.IGNORECASE):
+            continue
+        date_tail = tail[on.end():] if on else tail
+        date_match = _UVB_DATE_RE.match(date_tail)
+        if date_match is None or _PHOTO_ANY_RE.search(following):
+            continue
+
+        # A later restart may wrap again without repeating the Excimer name.
+        context = [following]
+        for extra in lines[index + 2:]:
+            if not extra.strip() or _PHOTO_ANY_RE.search(extra):
+                break
+            context.append(extra)
+        dates = _real_dates_in("".join(context))
+        if (not dates or any(d >= cutoff for d in dates)
+                or len(dates) != len(list(_UVB_DATE_RE.finditer("".join(context))))):
+            continue
+        # Match the WHOLE supported old-date suffix; a semicolon or an omitted
+        # arrow must not hide an undated order such as "continue 510" or "BIW".
+        unit = r"(?:\s*m\s*j(?:\s*/\s*cm(?:2|²)?)?)?"
+        clause = (r"(?:add\s+\d+" + unit + r"\s+each time"
+                  r"|fixed at\s+\d+" + unit + r"|MAX\s*:?\s*\d+" + unit + r")")
+        parts = re.split(r"->|→", date_tail[date_match.end():])
+        if len(parts) > 2 or (len(parts) == 2 and not re.fullmatch(
+                r"\s*(?:hold|stop(?:ped)?)[\s,.;]*", parts[1], re.IGNORECASE)):
+            continue
+        # Explicit delimiters give each clause one boundary and ensure progress,
+        # avoiding exponential regex backtracking on repeated malformed clauses.
+        if any(part.strip() and not re.fullmatch(clause, part.strip(), re.IGNORECASE)
+               for part in re.split(r"[,;]", parts[0].strip(" \t\r\n,;."))):
+            continue
+        # Only unmistakable non-phototherapy history can follow this old entry.
+        # Unknown lines (even a single dose/frequency) keep the original marker;
+        # enumerating all possible restart orders would silently miss variants.
+        omp_course = r"[WM]\d+(?:\.\d+)?\s+on\s+DATE"
+        non_photo = (
+            r"educate sun[- ]burn reaction and sun[- ]screen usage"
+            r"|OMP\s+" + omp_course + r"(?:\s*,\s*education side effects?)?"
+            r"(?:\s*(?:->|→)\s*(?:hold|re-OMP\s+" + omp_course + r"))*"
+            r"|nail clipping(?: from (?:left|right) (?:great )?(?:toenail|fingernail))?"
+            r" for (?:nail pathy|pathology)(?:\s*\(r/o tinea unguium\))?"
+            r"(?:\s*,\s*OMP since\s*,\s*education side effects)?"
+        )
+        if any(not re.fullmatch(r"\s*(?:" + non_photo + r")[\s,.;]*",
+                                _UVB_DATE_RE.sub("DATE", extra), re.IGNORECASE)
+               for extra in context[1:]):
+            continue
+        joined = head.rstrip("\r\n") + " " + tail
+        if _line_has_undated_active_photo(joined):
+            continue
+        lines[index], lines[index + 1] = joined, ""
+    return "".join(lines)
+
+
 def strip_stale_phototherapy_segments(text: str, today: date,
                                       months: int = STALE_PHOTO_MONTHS) -> str:
     """逐【行】判斷:一行【有照光關鍵字、有日期、且該行所有日期都早於 (today - months 個月)】→ 視為
     該段照光已暫停,分流偵測時忽略整行(只供分流,【不】改處置原文)。只要該行有任一【近期】日期、或
     【根本沒日期】(像初診/醫師沒寫)→ 保留;非照光行一律保留。
+
+    明確的 Excimer 日期續行先在分流副本接回；空行、其他治療或不確定的後續醫令不借用日期。
+    這不改原文、不改劑量更新範圍，也不把所有病歷換行攤平成一行。
 
     [為何用整行『所有日期都太舊』而不是更細的段落切割] 真實病歷一個治療寫一行(例:UVB 一行、
     excimer 一行),這條規則對使用者實機(圖二:近期 UVB 行 + 一年多前 excimer 行,各自一行)完全正確,
@@ -741,7 +812,7 @@ def strip_stale_phototherapy_segments(text: str, today: date,
         return text or ""
     cutoff = _months_before(today, months)
     kept = []
-    for line in re.split(r"[\r\n]+", text):
+    for line in re.split(r"[\r\n]+", _join_stale_excimer_date_continuations(text, cutoff)):
         if _PHOTO_ANY_RE.search(line):
             line_dates = _real_dates_in(line)
             # 整行照光、日期全部太舊、【且該行沒有「無日期卻有劑量」的 active 段】→ 已暫停 → 忽略。

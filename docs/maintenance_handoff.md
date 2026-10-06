@@ -265,3 +265,17 @@ $rebuildPython = '.pytest_cache/rebuild-venv/Scripts/python.exe'
 每步核對 exit code，失敗停止，不沿用舊 JSON。環境紀錄只包含 source SHA／dirty 布林、兩份 requirements 雜湊、Python／OS／Tcl／Tk ABI 與必要套件名稱／版本；不讀取 pip 設定、帳號、環境變數值或私有下載來源。比較 baseline 與 rebuilt 的 `packages`、manifest 雜湊並核對來源；dirty 紀錄不是精確提交驗證。CI 使用原安裝宣告及完整既有門檻，另上傳同 SHA／attempt 的 `runtime-environment` artifact，供核對實際 Windows runner／Python patch 與套件；不能拿本機版本推定 CI 版本。
 
 本機 dry-run 的現行安裝宣告有 20 個套件版本不同，沒有確認相容性缺陷，不因差異更改 requirements 或正式延遲安裝。安全掃描仍依現行 CI；日後重建發生解析、wheel／Python ABI 或掃描失敗時保存匿名錯誤，按原流程修正並重新驗證，不放寬門檻或宣稱舊基線永久安全。院內仍需核對 Python／Windows／Tk、檔案權限、防毒鎖定、捷徑／排程、受控停機及人工待確認動作；不在本輪測試正式系統。
+
+## Excimer 舊病史日期換行辨識（2026-10-06）
+
+近期 UVB 與過久的 Excimer 同時存在時，Excimer 的 `on` 與日期若被 HIS 實際換行分開，舊的逐行辨識會把它當成無日期的 Excimer，觸發跨欄位歧義。日期同行的原案例已能正確辨識；本次另修正日期續行，僅在分流副本接回明確相鄰的 `on`／日期，不改病歷的換行與內容。
+
+沿用既有「超過兩個日曆月」的舊照光分流條件；近期、未標日期、無效日期、空行、其他照光項目及不確定的後續治療仍保留原本保護。正常 UVB 劑量與次數更新規則不變，過久 Excimer 與其他病史保持原文。匿名回歸涵蓋日期同行／換行、LF／CRLF／CR、同欄／不同欄及 F1–F3 寫入核心；並驗證近期或未確認的 Excimer 不會被當成過久病史。這不是院內實機驗收。
+
+可重跑：
+
+```powershell
+python -m pytest -q tests/test_phototherapy_wrapped_history_2026_10_06.py tests/test_uvb_dose.py tests/test_uvb_golden.py tests/test_uvb_dose_safety_2026_07_25.py tests/test_uvb_excimer_multi.py tests/test_uvb_undated_multiline_2026_09_09.py tests/test_main_his_write_transaction_2026_09_25.py tests/test_main_his_memo_port_2026_09_24.py
+```
+
+院內仍須核對實際欄位內容、顯示版本及更新後劑量／次數；遇到真正同時有效的 UVB 與 Excimer，歧義保護仍適用。此修正的獨立 Opus 審查／精確 SHA 交付狀態以提交 trailer、後續 audit 與 CI 證據為準，不由本文宣稱審查結清。回退沿用本文件的整包回退流程，保留最新設定及操作帳本。
