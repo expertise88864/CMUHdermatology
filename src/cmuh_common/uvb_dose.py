@@ -733,7 +733,9 @@ def _join_stale_excimer_date_continuations(text: str, cutoff: date) -> str:
     across blank lines or another treatment. An uncertain/recent continuation
     leaves the original undated Excimer marker in place so routing stays guarded.
     """
-    lines = text.splitlines(keepends=True)
+    # Match the CR/LF boundaries used by the stale filter. Other control
+    # characters must remain inside a line, never hide an unknown order.
+    lines = re.findall(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+$", text)
     for index in range(len(lines) - 1):
         head, following = lines[index], lines[index + 1]
         if not _PT_EXCIMER_RE.search(head) or _UVB_DATE_RE.search(head):
@@ -750,12 +752,14 @@ def _join_stale_excimer_date_continuations(text: str, cutoff: date) -> str:
         # A later restart may wrap again without repeating the Excimer name.
         context = [following]
         for extra in lines[index + 2:]:
-            if not extra.strip() or _PHOTO_ANY_RE.search(extra):
+            if not extra.strip(" \t\r\n") or _PHOTO_ANY_RE.search(extra):
                 break
             context.append(extra)
-        dates = _real_dates_in("".join(context))
+        # Only the linked Excimer date determines its age. A fully recognized
+        # non-photo OMP/nail note below it can carry an unrelated recent date.
+        dates = _real_dates_in(following)
         if (not dates or any(d >= cutoff for d in dates)
-                or len(dates) != len(list(_UVB_DATE_RE.finditer("".join(context))))):
+                or len(dates) != len(list(_UVB_DATE_RE.finditer(following)))):
             continue
         # Match the WHOLE supported old-date suffix; a semicolon or an omitted
         # arrow must not hide an undated order such as "continue 510" or "BIW".

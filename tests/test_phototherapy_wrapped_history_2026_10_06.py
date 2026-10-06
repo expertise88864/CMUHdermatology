@@ -98,7 +98,20 @@ def test_blank_line_does_not_connect_an_undated_excimer_to_a_date():
 
 def test_another_phototherapy_line_does_not_supply_excimer_date():
     text = EXCIMER + " on\non (2024/12/09); UVB 500 mj/cm2"
-    assert u.detect_phototherapy_kind(text, TODAY) != "none"
+    assert u.detect_phototherapy_kind(text, TODAY) == "pure_excimer"
+
+
+def test_other_medication_on_old_date_line_is_not_borrowed():
+    text = EXCIMER + " on\n(2024/12/09) OMP W12 on (2024/12/09)"
+    assert u.detect_phototherapy_kind(text, TODAY) == "pure_excimer"
+
+
+@pytest.mark.parametrize("separator", ["\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"])
+@pytest.mark.parametrize("physical_lines", [False, True])
+def test_non_his_line_separator_cannot_hide_an_unknown_restart(separator, physical_lines):
+    gap = "\n" + separator * 2 + "\n" if physical_lines else separator * 2
+    text = EXCIMER + " on\n(2024/12/09), add 50 each time" + gap + "restart 500 mj/cm2 BIW"
+    assert u.detect_phototherapy_kind(text, TODAY) == "pure_excimer"
 
 
 def test_invalid_date_in_excimer_header_is_not_replaced_by_an_old_continuation():
@@ -128,7 +141,8 @@ def test_new_uvb_dose_update_preserves_old_history_and_other_notes(date_layout):
 @pytest.mark.parametrize("label", ["F1", "F2", "F3"])
 @pytest.mark.parametrize("date_layout", ["inline", "wrapped"])
 @pytest.mark.parametrize("fields", ["same", "separate"])
-def test_main_resolver_and_write_core_select_only_current_uvb(monkeypatch, label, date_layout, fields):
+@pytest.mark.parametrize("omp_date", ["2026/7/30", "2026/9/15"])
+def test_main_resolver_and_write_core_select_only_current_uvb(monkeypatch, label, date_layout, fields, omp_date):
     import main
 
     class FixedDate(date):
@@ -136,7 +150,7 @@ def test_main_resolver_and_write_core_select_only_current_uvb(monkeypatch, label
         def today(cls):
             return TODAY
 
-    old = _history(date_layout)
+    old = _history(date_layout).replace("2026/7/30", omp_date)
     memos = {20: UVB + "\r\n" + old} if fields == "same" else {20: UVB, 30: old}
     writes = []
     monkeypatch.setattr(main, "date", FixedDate)
@@ -145,6 +159,7 @@ def test_main_resolver_and_write_core_select_only_current_uvb(monkeypatch, label
     monkeypatch.setattr(main, "check_stop", lambda: None)
     monkeypatch.setattr(main, "_record_his_action", lambda *a, **k: None)
     monkeypatch.setattr(main, "_show_uvb_warning", lambda *a, **k: pytest.fail("valid UVB route must not warn"))
+    monkeypatch.setattr(main, "_find_hospital_main_window", lambda: 10)
 
     class MemoPort:
         def find_main_window(self):
@@ -162,6 +177,8 @@ def test_main_resolver_and_write_core_select_only_current_uvb(monkeypatch, label
             return True
 
     assert main._resolve_phototherapy_disposition(10) == (20, "uvb")
+    if label == "F1":
+        assert main._f1_phototherapy_route(label="F1") == "normal"
     assert main._update_uvb_dose_core(label, strict=label != "F1", memo_port=MemoPort()) is True
     assert len(writes) == 1 and writes[0][0] == 20
     assert "790 mj/cm2(36)" in memos[20]
