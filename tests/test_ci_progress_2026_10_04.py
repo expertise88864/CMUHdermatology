@@ -42,6 +42,35 @@ def _run(tmp_path, source):
     return cp, output, events
 
 
+def _stamp_provenance(output):
+    metadata = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
+    metadata.update(sha="a" * 40, dirty=False)
+    runner._write(output / "metadata.json", metadata)
+
+
+@pytest.mark.parametrize("utf8_mode", ["0", "1"])
+@pytest.mark.parametrize("python_path", [None, "existing-path"])
+def test_wrapper_preserves_plain_child_interpreter_mode(tmp_path, utf8_mode, python_path):
+    env = _env()
+    env["PYTHONUTF8"] = utf8_mode
+    if python_path is None:
+        env.pop("PYTHONPATH", None)
+    else:
+        env["PYTHONPATH"] = python_path
+    plain = subprocess.run([sys.executable, "-c", "import sys; print(sys.flags.utf8_mode)"],
+                           env=env, capture_output=True, encoding="ascii", check=True, timeout=20)
+    expected = int(plain.stdout.strip())
+    scripts = str(RUNNER.parent)
+    expected_path = scripts + (os.pathsep + python_path if python_path else "")
+    (tmp_path / "test_anonymous.py").write_text(
+        "import os, sys\ndef test_interpreter():\n"
+        f"    assert sys.flags.utf8_mode == {expected}\n"
+        f"    assert os.environ['PYTHONPATH'] == {expected_path!r}\n", encoding="utf-8")
+    cp = subprocess.run(_command(tmp_path / "evidence"), cwd=tmp_path, env=env,
+                        capture_output=True, encoding="utf-8", errors="replace", timeout=20)
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+
+
 def test_normal_phase_counts_and_no_parameter_or_environment_values(tmp_path, monkeypatch):
     monkeypatch.setenv("PRIVATE_TOKEN", "do-not-record-this")
     cp, output, events = _run(tmp_path, '''import pytest
@@ -76,6 +105,7 @@ def test_example(prepared):
     assert any(e.get("phase") == phase and e.get("outcome") == "failed" for e in events)
     result = json.loads((output / "result.json").read_text())
     assert result["exit_code"] == 1 and result["status"] == "finished"
+    _stamp_provenance(output)
     assert runner.check(output, "a" * 40) == 1
 
 
@@ -84,6 +114,7 @@ def test_collection_error_is_not_a_completed_passing_run(tmp_path):
     assert cp.returncode == 2
     assert any(e["event"] == "collection_started" for e in events)
     assert events[-1]["exit_code"] == 2
+    _stamp_provenance(output)
     assert runner.check(output, "a" * 40) == 1
 
 
@@ -153,6 +184,7 @@ def test_example(prepared):
         expected = "collect test_anonymous.py" if phase == "collection" else f"{phase} test_anonymous.py::test_example"
         assert f"[cmuh-pytest] {expected}" in stdout
         assert not (output / "junit.xml").exists()
+        _stamp_provenance(output)
         assert runner.check(output, "a" * 40) == 1
     finally:
         _cleanup_owned_pytest_children(proc, tmp_path)
@@ -235,13 +267,11 @@ def test_stale_reports_are_removed_and_old_evidence_is_never_reused(tmp_path):
     assert (output / "result.json").read_bytes() == original
 
 
-def test_checker_requires_fresh_sha_complete_counts_and_matching_reports(tmp_path):
+def _passing_checker_evidence(tmp_path):
     cp, output, events = _run(tmp_path, "def test_example(): assert True\n")
     assert cp.returncode == 0
     # Complete the synthetic provenance and second report for checker negatives.
-    metadata = json.loads((output / "metadata.json").read_text())
-    metadata.update(sha="a" * 40, dirty=False)
-    runner._write(output / "metadata.json", metadata)
+    _stamp_provenance(output)
     (tmp_path / "cov.json").write_text('{"synthetic": true}')
     monkey_start = time.perf_counter()
     old_cwd = Path.cwd()
@@ -251,6 +281,11 @@ def test_checker_requires_fresh_sha_complete_counts_and_matching_reports(tmp_pat
     finally:
         os.chdir(old_cwd)
     assert runner.check(output, "a" * 40) == 0
+    return output, events
+
+
+def test_checker_requires_fresh_sha_complete_counts_and_matching_reports(tmp_path):
+    output, events = _passing_checker_evidence(tmp_path)
     assert runner.check(output, "b" * 40) == 1
     assert runner.check(output, "a" * 40, run_id="98765") == 1
     assert runner.check(output, "a" * 40, attempt="99") == 1
@@ -262,9 +297,46 @@ def test_checker_requires_fresh_sha_complete_counts_and_matching_reports(tmp_pat
     (output / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
     assert runner.check(output, "a" * 40) == 1
     last["selected"] = last["finished"] = 1
+    (output / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+    runner._write(output / "result.json", {**json.loads((output / "result.json").read_text()),
+                                         "last_event": last})
+    assert runner.check(output, "a" * 40) == 0
     (output / "cov.json").write_text('{"changed": true}')
     assert runner.check(output, "a" * 40) == 1
     assert events[-1]["selected"] == 1
+
+
+@pytest.mark.parametrize("damage", [
+    "dirty", "status", "exit_code", "diagnostic_errors", "terminal_kind",
+    "terminal_errors", "zero_selected", "report_hash",
+])
+def test_each_checker_rejection_starts_from_valid_evidence(tmp_path, damage):
+    output, events = _passing_checker_evidence(tmp_path)
+    # No unrelated SHA, count or report failure can make these negatives pass.
+    assert runner.check(output, "a" * 40) == 0
+    result = json.loads((output / "result.json").read_text(encoding="utf-8"))
+    if damage == "dirty":
+        metadata = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
+        runner._write(output / "metadata.json", {**metadata, "dirty": True})
+    elif damage in ("status", "exit_code", "diagnostic_errors"):
+        result[damage] = {"status": "incomplete", "exit_code": 1,
+                          "diagnostic_errors": ["anonymous diagnostic failure"]}[damage]
+        runner._write(output / "result.json", result)
+    elif damage == "report_hash":
+        (output / "cov.json").write_text('{"changed": true}', encoding="utf-8")
+    else:
+        if damage == "terminal_kind":
+            events[-1]["event"] = "not_session_finished"
+        elif damage == "terminal_errors":
+            events[-1]["diagnostic_errors"] = ["anonymous diagnostic failure"]
+        else:
+            events = [e for e in events if e["event"] != "test_finished"]
+            for seq, event in enumerate(events, 1):
+                event["seq"] = seq
+            events[-1]["selected"] = events[-1]["finished"] = 0
+        (output / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+        runner._write(output / "result.json", {**result, "last_event": events[-1]})
+    assert runner.check(output, "a" * 40) == 1
 
 
 def test_absolute_and_parent_paths_are_not_disclosed():

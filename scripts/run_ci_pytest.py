@@ -77,9 +77,10 @@ def run(output: Path, args: list[str]) -> int:
         Path(name).unlink(missing_ok=True)
     env = os.environ.copy()
     scripts = str(Path(__file__).resolve().parent)
-    env["PYTHONPATH"] = scripts + os.pathsep + env.get("PYTHONPATH", "")
+    existing_path = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = scripts + (os.pathsep + existing_path if existing_path else "")
     env["CMUH_CI_PROGRESS_FILE"] = str((output / "events.jsonl").resolve())
-    cp = subprocess.run([sys.executable, "-u", "-X", "utf8", "-m", "pytest",
+    cp = subprocess.run([sys.executable, "-m", "pytest",
                          "-p", "ci_pytest_progress", *args], env=env, check=False)
     try:
         finish(output, cp.returncode, started)

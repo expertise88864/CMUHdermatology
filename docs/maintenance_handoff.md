@@ -12,6 +12,8 @@
 
 CI 沿用同一組完整 pytest／coverage 參數，透過 `scripts/run_ci_pytest.py` 啟動一次新 pytest 子程序，明確載入 `ci_pytest_progress`；一般 `python -m pytest` 不載入這個工具。每個收集器與 setup／call／teardown 開始時，安全代號寫入逐行 flush 的 JSONL 及 job console；完成階段另記 outcome、耗時，終端紀錄有 selected／finished 及 pytest 退出碼。參數值與例外內容不進進度紀錄；絕對／上層路徑以代號代替。環境僅記 Python、OS、程式 SHA、dirty 與 run／attempt。
 
+2026-10-06 補審重現 wrapper 強制 UTF-8 造成的測試環境差異，已改為保留同環境 plain Python 子程序的編碼模式，不傳入 `-X utf8` 或 `-u`；wrapper 自身的 UTF-8 輸出不影響子程序旗標。加入 progress plugin 所需的 scripts 路徑，但原 PYTHONPATH 為空時不再加空項目。證據負向案例先確認完整匿名基準可通過，再分別破壞 dirty、狀態、退出碼、診斷錯誤、終端事件、零案例及報告雜湊；報告雜湊案例先還原前項偽造計數，避免被其他檢查提前擋住。這是原驗證能力修正，沒有降低 CI 門檻或宣稱加速。
+
 wrapper 要求新的 evidence 目錄，拒絕重用；先移除隔離 checkout 的舊 `junit.xml`／`cov.json`。pytest 的失敗退出碼原樣保留；收尾診斷失敗不改成成功。`result.json` 的 `finished` 只表示 pytest 正常結束，**不表示通過**，仍須核對 exit code。子程序被終止、少了 sessionfinish、進度截斷或收尾未完成，都不是完整證據。`Validate pytest evidence` 另外核對完整 SHA、乾淨來源、run／attempt、終端與完成計數及報告雜湊；它不能取代 skip／coverage／型別／安全或 `_delivery.py`。
 
 `Preserve pytest evidence` 在正常或失敗後嘗試上傳，artifact 名稱包含 SHA、run ID、attempt，保留 14 天。GitHub 強制終止或 runner 消失可能來不及上傳；console 的最後開始階段提供有限線索，不能保證任何中止都會留下完整 artifact。`running` 狀態或單獨檔案不能證明程序仍活著，須查實際 handle／GitHub run。
