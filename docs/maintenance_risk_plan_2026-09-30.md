@@ -9,7 +9,7 @@
 | A 失敗定位 | 歷史取消只有 73% 進度且報告缺失；新增 opt-in pytest 收集／setup／call／teardown 進度、原退出碼、完整性檢查及帶 SHA／run／attempt 的 artifact。原 pytest、coverage、skip、型別、安全及正式發佈守門保留，新增 evidence 檢查與保存為必要步驟。 | 硬終止可能來不及上傳；最後開始階段不能證明根因。匿名新程序驗證正常、三種失敗、collection error 及四種階段中止，不操作正式系統。 |
 | B 成本調查 | 沿用歷史完整 CI／attempt 證據，補一組 249 案例 profiling。絕對模組路徑快取候選經 113 原案例三組交錯，新舊 case fingerprint／結果一致，但一組僅快 0.014 秒，未充分超過波動，未採納。 | 保留原共用 fixture、真正 SQLite 交易及既有 AST 成果；不填滿兩個瓶頸、不全面平行化、不加重試或延長 timeout 製造成功。 |
 
-可重跑方法與完整性定義併入 [原手冊](maintenance_handoff.md#ci-階段定位與驗證成本2026-10-04)。本輪臨床／排班、啟動器及 requirements 無變更；發佈 helper 已升版為 `2026.10.04.1` 並同步 manifest，唯一 runtime 內容雜湊變更是版本常數。新 SHA 的候選／正式 CI、匿名 smoke 與完整 diff review 尚須另核對；文件不是批准或院內驗收證明。
+可重跑方法與完整性定義併入 [原手冊](maintenance_handoff.md#歷史-ci-階段定位與驗證成本2026-10-04)。本輪臨床／排班、啟動器及 requirements 無變更；發佈 helper 已升版為 `2026.10.04.1` 並同步 manifest，唯一 runtime 內容雜湊變更是版本常數。新 SHA 的候選／正式 CI、匿名 smoke 與完整 diff review 尚須另核對；文件不是批准或院內驗收證明。
 
 已發佈候選 `e2e6f5ad68f0e918b0b6684b4f5dc1e1b94c0b67` 缺少 review trailers，原因為誤用 helper 不存在的檢查參數；完整 diff 仍為 **pending**。保留原提交，由後續紀錄補記，補審及 exact-SHA audit 另包含該 SHA；不能因其沒有 trailer 而當作已審。新補正提交依原規則帶 pending/high，舊二十二筆紀錄沿原範圍處理。發佈工具的參數防誤操作列為下一輪具體待辦，不新增本輪第三批。
 
