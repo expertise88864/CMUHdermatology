@@ -104,6 +104,31 @@ def test_readonly_and_invalid_modes_leave_actual_git_state_unchanged(ph, repo, a
     assert snapshot(repo) == before
 
 
+def test_check_accepts_runtime_staged_changes_without_generating_metadata(ph, repo, capsys):
+    dirty_source(repo)
+    before = snapshot(repo)
+    assert ph.main(["push", "check"]) == 0
+    assert snapshot(repo) == before
+    output = capsys.readouterr().out
+    assert "HEAD" in output and "src/選定 file.py" in output
+
+
+@pytest.mark.parametrize("damage", ["version", "hash"])
+def test_check_still_rejects_corrupt_committed_metadata(ph, repo, damage):
+    manifest = json.loads((repo / "manifest.json").read_text(encoding="utf-8"))
+    if damage == "version":
+        manifest["app_version"] = "wrong-version"
+    else:
+        manifest["files"][1]["sha256"] = "0" * 64
+    (repo / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    git(repo, "add", "manifest.json")
+    git(repo, "commit", "-m", "Anonymous corrupt baseline")
+    before = snapshot(repo)
+    with pytest.raises(SystemExit):
+        ph.main(["push", "check"])
+    assert snapshot(repo) == before
+
+
 def dirty_source(repo):
     selected = repo / "src/選定 file.py"
     selected.write_text("value = 2\n", encoding="utf-8")
@@ -123,6 +148,199 @@ def publish_args(tmp_path, mode="index"):
                        encoding="utf-8", newline="\n")
     return ["push", "publish", *selection, "--message-file", str(message),
             "--output", str(tmp_path / "candidate output")]
+
+
+@pytest.mark.parametrize("policy", ["fix", "strip", "error"])
+@pytest.mark.parametrize("mode", ["index", "worktree"])
+def test_candidate_preserves_selected_whitespace_under_global_git_policy(
+        ph, repo, tmp_path, monkeypatch, policy, mode):
+    config = tmp_path / "anonymous global git config"
+    config.write_text(f"[apply]\n\twhitespace = {policy}\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    content = 'value = """\nkeep two spaces  \n"""\n'
+    (repo / "src/選定 file.py").write_text(content, encoding="utf-8", newline="\n")
+    git(repo, "add", "src/選定 file.py")
+    before = snapshot(repo)
+    patch = ph._selection_patch(["src/選定 file.py"], mode)
+    options = ph.parse_args(publish_args(tmp_path, mode))
+    with ph._candidate_copy(options, "codex/test-safe-release") as (_, _, verify_source):
+        assert git(ph.REPO_ROOT, "show", ":src/選定 file.py") == content.encode("utf-8")
+        assert git(ph.REPO_ROOT, "diff", "--no-ext-diff", "--no-textconv", "--cached",
+                   "--binary", "--full-index", "--no-renames", "HEAD") == patch
+        verify_source()
+    assert snapshot(repo) == before
+    assert config.read_text(encoding="utf-8") == f"[apply]\n\twhitespace = {policy}\n"
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_candidate_preserves_effective_push_urls(ph, repo, tmp_path, count):
+    urls = [str(tmp_path / f"explicitly-disabled-push-{i}") for i in range(count)]
+    for url in urls:
+        git(repo, "remote", "set-url", "--add", "--push", "origin", url)
+    dirty_source(repo)
+    before = snapshot(repo)
+    expected = git(repo, "remote", "get-url", "--push", "--all", "origin")
+    fetch_url = git(repo, "remote", "get-url", "origin")
+    with ph._candidate_copy(ph.parse_args(publish_args(tmp_path)), "codex/test-safe-release"):
+        assert git(ph.REPO_ROOT, "remote", "get-url", "--push", "--all", "origin") == expected
+        assert git(ph.REPO_ROOT, "remote", "get-url", "origin") == fetch_url
+    assert snapshot(repo) == before
+
+
+@pytest.mark.parametrize("mode", ["index", "worktree"])
+@pytest.mark.parametrize("settings", [
+    {"diff.mnemonicPrefix": "true"},
+    {"diff.srcPrefix": "old/", "diff.dstPrefix": "new/"},
+    {"core.quotePath": "false"},
+    {"diff.context": "0", "diff.algorithm": "histogram"},
+    {"diff.noprefix": "true", "diff.suppressBlankEmpty": "true"},
+])
+def test_candidate_exact_patch_is_independent_of_local_diff_format(
+        ph, repo, tmp_path, mode, settings):
+    path = repo / "src/選定 file.py"
+    baseline = "before = 1\n\nvalue = 1\n\nafter = 1\n"
+    path.write_text(baseline, encoding="utf-8", newline="\n")
+    git(repo, "add", "src/選定 file.py")
+    git(repo, "commit", "-m", "Anonymous multiline baseline")
+    for key, value in settings.items():
+        git(repo, "config", key, value)
+    selected = baseline.replace("value = 1", "value = 2")
+    path.write_text(selected, encoding="utf-8", newline="\n")
+    git(repo, "add", "src/選定 file.py")
+    path.write_text(selected.replace("value = 2", "value = 3"), encoding="utf-8", newline="\n")
+    before = snapshot(repo)
+    config = git(repo, "config", "--local", "--list")
+    expected = selected if mode == "index" else selected.replace("value = 2", "value = 3")
+    with ph._candidate_copy(ph.parse_args(publish_args(tmp_path, mode)), "codex/test-safe-release"):
+        assert git(ph.REPO_ROOT, "show", ":src/選定 file.py") == expected.encode("utf-8")
+    assert snapshot(repo) == before
+    assert git(repo, "config", "--local", "--list") == config
+
+
+@pytest.mark.parametrize("rewrite", ["fetch", "push"])
+def test_candidate_rejects_effective_remote_url_rewrite_before_safety_gate(
+        ph, repo, tmp_path, monkeypatch, capsys, rewrite):
+    config = tmp_path / "anonymous global git config"
+    content = ('[url "https://mirror-one.invalid/"]\n'
+               '\tinsteadOf = https://origin.invalid/\n'
+               '[url "https://mirror-two.invalid/"]\n'
+               '\tinsteadOf = https://mirror-one.invalid/\n')
+    config.write_text(content, encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    if rewrite == "fetch":
+        git(repo, "remote", "set-url", "origin", "https://origin.invalid/PRIVATE_TEST")
+    else:
+        git(repo, "remote", "set-url", "--add", "--push", "origin", str(tmp_path / "disabled-push"))
+        git(repo, "remote", "set-url", "--add", "--push", "origin", "https://origin.invalid/PRIVATE_TEST")
+    dirty_source(repo)
+    before = snapshot(repo)
+    expected = b"https://mirror-one.invalid/PRIVATE_TEST\n"
+    if rewrite == "fetch":
+        assert git(repo, "remote", "get-url", "origin") == expected
+        assert git(repo, "remote", "get-url", "--push", "--all", "origin") == expected
+    else:
+        assert git(repo, "remote", "get-url", "--push", "--all", "origin").splitlines()[-1] == expected.strip()
+    monkeypatch.setattr(ph, "step1_sanity", lambda: pytest.fail("accepted rewritten candidate remote"))
+    with pytest.raises(SystemExit):
+        with ph._candidate_copy(ph.parse_args(publish_args(tmp_path)), "codex/test-safe-release"):
+            pytest.fail("accepted rewritten candidate remote")
+    assert snapshot(repo) == before
+    assert config.read_text(encoding="utf-8") == content
+    receipt = json.loads((tmp_path / "candidate output/release.json").read_text(encoding="utf-8"))
+    assert receipt["phase"] == "incomplete" and receipt["failed_at"] == "prepare"
+    assert "PRIVATE_TEST" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("mode", ["index", "worktree"])
+@pytest.mark.parametrize("driver", ["python", "custom"])
+def test_candidate_exact_index_matches_despite_local_diff_driver(
+        ph, repo, tmp_path, mode, driver):
+    attributes = repo / ".gitattributes"
+    attributes.write_text(f"* text=auto eol=lf\n*.py diff={driver}\n", encoding="utf-8", newline="\n")
+    path = repo / "src/選定 file.py"
+    baseline = "# Section special\ndef original():\n" + "    value = 1\n" * 35
+    path.write_text(baseline, encoding="utf-8", newline="\n")
+    git(repo, "add", ".gitattributes", "src/選定 file.py")
+    git(repo, "commit", "-m", "Anonymous Python diff driver baseline")
+    if driver == "python":
+        git(repo, "config", "diff.python.xfuncname", "^[[:space:]]*# Section.*")
+    else:
+        git(repo, "config", "diff.custom.binary", "true")
+    lines = baseline.splitlines(keepends=True)
+    lines[30] = "    value = 2\n"
+    selected = "".join(lines)
+    path.write_text(selected, encoding="utf-8", newline="\n")
+    git(repo, "add", "src/選定 file.py")
+    lines[30] = "    value = 3\n"
+    path.write_text("".join(lines), encoding="utf-8", newline="\n")
+    before = snapshot(repo)
+    config = git(repo, "config", "--local", "--list")
+    expected = selected if mode == "index" else "".join(lines)
+    with ph._candidate_copy(ph.parse_args(publish_args(tmp_path, mode)), "codex/test-safe-release"):
+        assert git(ph.REPO_ROOT, "show", ":src/選定 file.py") == expected.encode("utf-8")
+    assert snapshot(repo) == before
+    assert git(repo, "config", "--local", "--list") == config
+
+
+@pytest.mark.parametrize("drift", ["content", "extra_path", "mode"])
+def test_candidate_rejects_applied_content_drift_before_safety_gate(ph, repo, tmp_path, monkeypatch, drift):
+    dirty_source(repo)
+    before = snapshot(repo)
+    original_run = subprocess.run
+    def drift_after_apply(command, **kwargs):
+        result = original_run(command, **kwargs)
+        if command[:2] == ["git", "apply"]:
+            candidate = Path(kwargs["cwd"])
+            if drift == "mode":
+                change = ["git", "update-index", "--chmod=+x", "src/選定 file.py"]
+            else:
+                rel = "src/選定 file.py" if drift == "content" else "src/extra.dat"
+                (candidate / rel).write_text("value = 999\n", encoding="utf-8")
+                change = ["git", "add", rel]
+            original_run(change, cwd=candidate, check=True, capture_output=True)
+        return result
+    monkeypatch.setattr(ph.subprocess, "run", drift_after_apply)
+    monkeypatch.setattr(ph, "step1_sanity", lambda: pytest.fail("accepted a changed candidate patch"))
+    with pytest.raises(SystemExit):
+        with ph._candidate_copy(ph.parse_args(publish_args(tmp_path)), "codex/test-safe-release"):
+            pytest.fail("accepted a changed candidate patch")
+    assert snapshot(repo) == before
+    receipt = json.loads((tmp_path / "candidate output/release.json").read_text(encoding="utf-8"))
+    assert receipt["phase"] == "incomplete" and receipt["failed_at"] == "prepare"
+
+
+@pytest.mark.parametrize("mode", ["committed", "index"])
+def test_candidate_rejects_extra_gitlink_when_global_diff_hides_submodules(
+        ph, repo, tmp_path, monkeypatch, mode):
+    config = tmp_path / "anonymous global git config"
+    content = "[diff]\n\tignoreSubmodules = all\n"
+    config.write_text(content, encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    dirty_source(repo)
+    before = snapshot(repo)
+    original_run = subprocess.run
+    def inject_gitlink(command, **kwargs):
+        result = original_run(command, **kwargs)
+        if (mode == "committed" and command[:2] == ["git", "checkout"]
+                or mode == "index" and command[:2] == ["git", "apply"]):
+            candidate = Path(kwargs["cwd"])
+            head = original_run(["git", "rev-parse", "HEAD"], cwd=candidate,
+                                check=True, capture_output=True).stdout.decode().strip()
+            original_run(["git", "update-index", "--add", "--cacheinfo",
+                          f"160000,{head},src/extra.link"], cwd=candidate, check=True, capture_output=True)
+        return result
+    monkeypatch.setattr(ph.subprocess, "run", inject_gitlink)
+    monkeypatch.setattr(ph, "step1_sanity", lambda: pytest.fail("accepted unexpected gitlink before generation"))
+    with pytest.raises(SystemExit):
+        with ph._candidate_copy(ph.parse_args(publish_args(tmp_path, mode)), "codex/test-safe-release"):
+            pytest.fail("accepted unexpected gitlink before generation")
+    assert snapshot(repo) == before
+    assert config.read_text(encoding="utf-8") == content
+    receipt = json.loads((tmp_path / "candidate output/release.json").read_text(encoding="utf-8"))
+    assert receipt["phase"] == "incomplete" and receipt["failed_at"] == "prepare"
 
 
 @pytest.mark.parametrize("mode,expected", [("index", "value = 2\n"),
@@ -259,16 +477,18 @@ def test_candidate_checks_selected_gitignore_not_unstaged_source_version(ph, rep
     assert snapshot(repo) == before
 
 
-def test_remote_credentials_are_not_echoed_in_command_output(ph, repo, monkeypatch, capsys):
+@pytest.mark.parametrize("options", [[], ["--add", "--push"]])
+def test_remote_credentials_are_not_echoed_in_command_output(ph, repo, monkeypatch, capsys, options):
     monkeypatch.setattr(ph.subprocess, "run", lambda *args, **kwargs:
                         subprocess.CompletedProcess(args[0], 0))
-    ph.run(["git", "remote", "set-url", "origin", "https://anonymous:PRIVATE_TEST@example.invalid/repo"])
+    ph.run(["git", "remote", "set-url", *options, "origin", "https://anonymous:PRIVATE_TEST@example.invalid/repo"])
     assert "PRIVATE_TEST" not in capsys.readouterr().out
 
 
-def test_remote_failure_exception_also_hides_credentials(ph, repo, monkeypatch, capsys):
+@pytest.mark.parametrize("options", [[], ["--add", "--push"]])
+def test_remote_failure_exception_also_hides_credentials(ph, repo, monkeypatch, capsys, options):
     monkeypatch.setattr(ph.subprocess, "run", lambda *args, **kwargs:
                         subprocess.CompletedProcess(args[0], 1, "PRIVATE_TEST", "PRIVATE_TEST"))
     with pytest.raises(subprocess.CalledProcessError) as error:
-        ph.run(["git", "remote", "set-url", "origin", "https://anonymous:PRIVATE_TEST@example.invalid/repo"])
+        ph.run(["git", "remote", "set-url", *options, "origin", "https://anonymous:PRIVATE_TEST@example.invalid/repo"])
     assert "PRIVATE_TEST" not in str(error.value) + capsys.readouterr().out

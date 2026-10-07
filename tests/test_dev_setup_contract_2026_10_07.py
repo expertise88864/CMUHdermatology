@@ -123,6 +123,21 @@ def test_auth_status_reports_only_boolean_not_provider_contents(setup, monkeypat
     assert "PRIVATE" not in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("body", ['["PRIVATE"]', '"PRIVATE"', "null", "123", "true"])
+def test_auth_non_object_json_reports_failed_without_traceback_or_private_output(
+        setup, monkeypatch, capsys, body):
+    module, root, home = setup
+    existing_environment(module, root, monkeypatch)
+    monkeypatch.setattr(module, "run", lambda args, **kwargs: SimpleNamespace(
+        returncode=0, stdout=body if args[0] == "claude" else
+        ("Logged in using test account\n" if args[0] == "codex" else ".githooks\n"), stderr=""))
+    before = contents(root), contents(home)
+    assert module.main(["check", "--auth"]) == 1
+    assert (contents(root), contents(home)) == before
+    output = capsys.readouterr().out
+    assert "failed" in output and "PRIVATE" not in output
+
+
 @pytest.mark.parametrize("output,valid", [("Logged in using ChatGPT", True),
                                          ("Not logged in", False), ("unknown", False)])
 def test_codex_login_status_is_not_inferred_from_cli_presence(setup, monkeypatch, output, valid):

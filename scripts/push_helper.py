@@ -362,7 +362,7 @@ def verify_staged_manifest_hashes() -> None:
             "utf-8", "replace"))
 
 
-def _verify_staged_manifest_hashes(man_blob: str) -> None:
+def _verify_staged_manifest_hashes(man_blob: str, revision: str = "") -> None:
     """★[2026-08-05 補審 P1] manifest 裡的每個 SHA256 要對得上【index 內的】檔案★
 
     版本號一致還不夠。真正會傷到人的是「manifest 記的雜湊 ≠ 實際被 commit 的檔案」：
@@ -374,11 +374,12 @@ def _verify_staged_manifest_hashes(man_blob: str) -> None:
     這道檢查在【已經 staged、還沒 commit】時跑，所以中止的代價只是「這次沒推成」。
     """
     print("")
-    print("=== [7.6/9] manifest 雜湊 vs index 內的檔案 ===")
+    scope = f"commit {revision}" if revision else "index"
+    print(f"=== [7.6/9] manifest 雜湊 vs {scope} 內的檔案 ===")
     try:
         manifest = json.loads(man_blob)
     except ValueError as e:
-        fail(f"index 內的 manifest.json 解析不了：{e}")
+        fail(f"{scope} 內的 manifest.json 解析不了：{e}")
         return
     bad, checked = [], 0
     for entry in manifest.get("files", []):
@@ -390,11 +391,11 @@ def _verify_staged_manifest_hashes(man_blob: str) -> None:
             continue
         rel_git = rel.replace("\\", "/")
         try:
-            blob = _git_bytes(["cat-file", "blob", f":{rel_git}"])
+            blob = _git_bytes(["cat-file", "blob", f"{revision}:{rel_git}"])
         except SystemExit:
             raise
         except Exception as e:
-            bad.append(f"{rel_git}: 讀不到 index 內的內容（{e}）")
+            bad.append(f"{rel_git}: 讀不到 {scope} 內的內容（{e}）")
             continue
         got = hashlib.sha256(blob).hexdigest()
         checked += 1
@@ -404,7 +405,8 @@ def _verify_staged_manifest_hashes(man_blob: str) -> None:
         fail("manifest 裡沒有任何可檢查的檔案雜湊 —— "
              "★空集合不算通過★（欄位名改了的話這道檢查會靜默失效）")
     if bad:
-        fail("【manifest 雜湊與即將 commit 的檔案對不上】已中止推送："
+        target = f"commit {revision} 的檔案" if revision else "即將 commit 的檔案"
+        fail(f"【manifest 雜湊與{target}對不上】已中止推送："
              + "\n    " + "\n    ".join(bad[:10])
              + "\n  多半是 sync_manifest 沒跑到，或跑完之後檔案又被改動過。")
     print(f"  [OK] {checked} 個檔案的 SHA256 都對得上")
@@ -528,7 +530,7 @@ def parse_args(argv: list) -> argparse.Namespace:
         allow_abbrev=False,
         epilog="舊的裸提交訊息／--sanity-only 不支援；請使用 check 或 publish。")
     commands = parser.add_subparsers(dest="command")
-    commands.add_parser("check", help="唯讀核對安全、index 版本及 manifest 雜湊",
+    commands.add_parser("check", help="唯讀核對安全、HEAD 版本及 manifest 雜湊",
                         allow_abbrev=False)
     publish = commands.add_parser("publish", help="準備並推送隔離 codex/* 候選",
                                   allow_abbrev=False)
@@ -574,15 +576,40 @@ def _selection_paths(paths: list[str]) -> list[str]:
     return result
 
 
-def _selection_patch(paths: list[str], source: str) -> bytes:
-    """Export an exact snapshot without writing the user's index."""
+def _exact_patch_args(paths: list[str] | None = None) -> list[str]:
+    """Export an applicable patch with fixed path/context display settings."""
+    args = ["--literal-pathspecs", "-c", "core.quotePath=true",
+            "-c", "diff.mnemonicPrefix=false", "-c", "diff.noprefix=false",
+            "-c", "diff.suppressBlankEmpty=false", "diff", "--no-ext-diff", "--no-textconv",
+            "--cached", "--binary", "--full-index", "--no-renames", "--no-color", "--no-relative",
+            "--ignore-submodules=none",
+            "--src-prefix=a/", "--dst-prefix=b/", "--line-prefix=", "--unified=3",
+            "--inter-hunk-context=0", "--no-indent-heuristic", "--diff-algorithm=myers",
+            "-O", os.devnull, "HEAD"]
+    if paths is not None:
+        args.extend(["--", *paths])
+    return args
+
+
+def _index_delta_args(paths: list[str] | None = None) -> list[str]:
+    """Full paths/modes/blob IDs; independent of text/binary diff driver display."""
+    args = ["--literal-pathspecs", "diff", "--cached", "--raw", "-z", "--abbrev=64",
+            "--no-ext-diff", "--no-textconv", "--no-renames", "--no-color", "--no-relative",
+            "--ignore-submodules=none",
+            "-O", os.devnull, "HEAD"]
+    if paths is not None:
+        args.extend(["--", *paths])
+    return args
+
+
+def _selection_export(paths: list[str], source: str) -> tuple[bytes, bytes]:
+    """Export patch and exact index delta without writing the user's index."""
     if source == "index":
         staged = _git_bytes(["--literal-pathspecs", "ls-files", "--stage", "-z", "--", *paths])
         entries = [e.split(b"\t", 1)[0].split() for e in staged.split(b"\0") if e]
         if any(e[2] != b"0" or e[0] not in (b"100644", b"100755") for e in entries):
             fail("選定 index 有衝突或非一般檔案，已中止。")
-        return _git_bytes(["--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--cached", "--binary",
-                           "--full-index", "--no-renames", "HEAD", "--", *paths])
+        return _git_bytes(_exact_patch_args(paths)), _git_bytes(_index_delta_args(paths))
     # A separate index starts at HEAD, so unrelated staged changes never enter the patch.
     with tempfile.TemporaryDirectory(prefix="cmuh_selected_index_") as directory:
         env = {**os.environ, "GIT_INDEX_FILE": str(Path(directory) / "index"),
@@ -590,10 +617,15 @@ def _selection_patch(paths: list[str], source: str) -> bytes:
         for args in (["read-tree", "HEAD"], ["--literal-pathspecs", "add", "-A", "--", *paths]):
             subprocess.run(["git", *args], cwd=REPO_ROOT, env=env, check=True,
                            capture_output=True)
-        cp = subprocess.run(["git", "diff", "--no-ext-diff", "--no-textconv", "--cached", "--binary", "--full-index",
-                             "--no-renames", "HEAD"], cwd=REPO_ROOT, env=env,
+        cp = subprocess.run(["git", *_exact_patch_args()], cwd=REPO_ROOT, env=env,
                             check=True, capture_output=True)
-        return cp.stdout
+        delta = subprocess.run(["git", *_index_delta_args()], cwd=REPO_ROOT, env=env,
+                               check=True, capture_output=True)
+        return cp.stdout, delta.stdout
+
+
+def _selection_patch(paths: list[str], source: str) -> bytes:
+    return _selection_export(paths, source)[0]
 
 
 @contextmanager
@@ -604,10 +636,11 @@ def _candidate_copy(options, branch: str):
     head = _git_bytes(["rev-parse", "HEAD"]).decode("ascii").strip()
     paths = _selection_paths(options.path or [])
     source = options.source or "index"
-    patch = b"" if options.committed else _selection_patch(paths, source)
+    patch, expected_delta = (b"", b"") if options.committed else _selection_export(paths, source)
     if not options.committed and not patch:
         fail("選定範圍沒有相對 HEAD 的變更；index 模式須先暫存指定檔案。")
     remote = _git_bytes(["remote", "get-url", "origin"]).decode("utf-8").strip()
+    push_urls = _git_bytes(["remote", "get-url", "--push", "--all", "origin"]).decode("utf-8").splitlines()
     identity = {}
     for key in ("user.name", "user.email"):
         cp = run(["git", "config", "--get", key], check=False, capture=True)
@@ -625,7 +658,8 @@ def _candidate_copy(options, branch: str):
     candidate = receipt_dir / "candidate"
     state = {"branch": branch, "source_sha": head, "phase": "prepare",
              "source": "committed" if options.committed else source,
-             "paths": paths, "patch_sha256": hashlib.sha256(patch).hexdigest()}
+             "paths": paths, "patch_sha256": hashlib.sha256(patch).hexdigest(),
+             "selection_delta_sha256": hashlib.sha256(expected_delta).hexdigest()}
     print(f"[候選副本] {candidate}\n[復原紀錄] {receipt_dir / 'release.json'}")
     def record():
         (receipt_dir / "release.json").write_text(
@@ -637,12 +671,23 @@ def _candidate_copy(options, branch: str):
         REPO_ROOT = candidate
         run(["git", "checkout", "-B", branch, head])
         run(["git", "remote", "set-url", "origin", remote])
+        for url in push_urls:
+            run(["git", "remote", "set-url", "--add", "--push", "origin", url])
+        candidate_remote = _git_bytes(["remote", "get-url", "origin"]).decode("utf-8").strip()
+        candidate_push_urls = _git_bytes(["remote", "get-url", "--push", "--all", "origin"]).decode("utf-8").splitlines()
+        if candidate_remote != remote or candidate_push_urls != push_urls:
+            fail("候選有效 remote URL 與來源不一致；已中止，保留候選，請核對 Git URL 改寫設定。")
         run(["git", "config", "core.hooksPath", ".githooks"])
         for key, value in identity.items():
             run(["git", "config", key, value])
         if patch:
-            subprocess.run(["git", "apply", "--index", "--binary", "-"],
-                           input=patch, cwd=candidate, check=True, capture_output=True)
+            subprocess.run(["git", "apply", "--index", "--binary", "--whitespace=nowarn", "-"],
+                           input=patch, cwd=candidate, check=True, capture_output=True,
+                           env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+        # Compare actual content, modes and all changed paths. Driver-generated
+        # function hints or text/binary representation are not content invariants.
+        if _git_bytes(_index_delta_args()) != expected_delta:
+            fail("候選 index 路徑／模式／完整 blob 與選定來源不一致；已中止，保留候選供核對。")
         state["phase"] = "candidate_sanity"
         record()
         step1_sanity()
@@ -656,7 +701,7 @@ def _candidate_copy(options, branch: str):
                     fail("來源 HEAD 已改變；候選保留，請重新確認範圍後驗證。")
                 if _git_bytes(["branch", "--show-current"]).decode("utf-8").strip() != branch:
                     fail("來源分支已改變；候選保留，已中止推送。")
-                if not options.committed and _selection_patch(paths, source) != patch:
+                if not options.committed and _selection_export(paths, source)[1] != expected_delta:
                     fail("選定來源在驗證期間已改變；候選保留，已中止推送。")
             finally:
                 REPO_ROOT = candidate
@@ -674,13 +719,27 @@ def _candidate_copy(options, branch: str):
 
 def _check_metadata() -> None:
     step1_sanity()
-    ver_blob = _git_bytes(["cat-file", "blob", f":{VERSION_REL}"]).decode("utf-8")
+    # The selected runtime changes have not been generated/staged in a candidate
+    # yet. Check one immutable HEAD baseline, never require in-source generation.
+    head = _git_bytes(["rev-parse", "HEAD"]).decode("ascii").strip()
+    ver_blob = _git_bytes(["cat-file", "blob", f"{head}:{VERSION_REL}"]).decode("utf-8")
+    man_blob = _git_bytes(["cat-file", "blob", f"{head}:{MANIFEST_REL}"]).decode("utf-8")
     match = re.search(r'CURRENT_VERSION\s*=\s*["\']([^"\']+)["\']', ver_blob)
     if not match:
-        fail("index 版本不可讀")
-    verify_staged_version_consistency(match.group(1))
-    verify_staged_manifest_hashes()
-    print("[通過] 唯讀 metadata 檢查；不代表 review、本機完整 CI 或遠端 CI 通過。")
+        fail("HEAD 版本不可讀")
+    try:
+        manifest = json.loads(man_blob)
+    except ValueError:
+        fail("HEAD manifest 不可讀")
+        return
+    if not isinstance(manifest, dict) or manifest.get("app_version") != match.group(1):
+        fail("HEAD 版本與 manifest 不一致")
+    _verify_staged_manifest_hashes(man_blob, revision=head)
+    staged = _git_bytes(["diff", "--cached", "--name-only", "-z"]).decode("utf-8").strip("\0")
+    if staged:
+        print("[尚待候選驗證] 暫存路徑：" + json.dumps(staged.split("\0"), ensure_ascii=False))
+    print("[通過] 唯讀 HEAD metadata 檢查；暫存變更尚未驗證，版本／manifest 只在候選生成。")
+    print("不代表 review、本機完整 CI 或遠端 CI 通過；候選生成後仍逐檔核對 index。")
 
 
 def verify_clean_revision(expected_sha: str) -> None:

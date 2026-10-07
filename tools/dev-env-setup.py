@@ -84,7 +84,8 @@ def _auth_status(tool: str) -> bool:
     if cp.returncode:
         return False
     if tool == "claude":
-        return json.loads(cp.stdout).get("loggedIn") is True
+        data = json.loads(cp.stdout)
+        return isinstance(data, dict) and data.get("loggedIn") is True
     return re.search(r"(?im)^Logged in\b", cp.stdout + "\n" + cp.stderr) is not None
 
 

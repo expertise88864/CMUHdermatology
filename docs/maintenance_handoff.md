@@ -61,7 +61,7 @@ apply 沿用兩份 requirements 與既有 runtime constraints，開發工具另�
 `push.bat` 與 `scripts/push_helper.py` 共用契約：
 
 - 無參數／`--help`：顯示說明；不存取 Git、不生成版本。
-- `check`：唯讀核對安全、index 版本與 manifest 雜湊。它不是 lint、完整 CI 或 review。
+- `check`：唯讀核對安全及同一 HEAD 的版本／manifest 雜湊；列出尚待候選驗證的暫存變更。它不是 lint、完整 CI 或 review。
 - `publish`：必須指定提交訊息及精確來源範圍，才準備候選並推送 `codex/*`。
 - 未知參數、錯字、裸提交訊息、缺漏或互斥參數直接拒絕；舊 `--sanity-only` 不支援。
 
@@ -76,6 +76,10 @@ HEAD 已有的提交都在候選祖先範圍內，也必須納入任務與 revie
 分支與本機 refs 保留，無關 staged／unstaged／untracked 不會加入候選。
 候選套用選定內容後會再次核對 settings 與 `.gitignore`，來源通過不代表候選已通過。
 來源 HEAD／分支／指定內容在驗證期間改變會停止推送。
+套用 patch 保留選定內容的空白，並在生成前核對完整選定 index 的路徑、模式與 blob；
+任何額外路徑或內容漂移都停止，不以各副本的函式標題或文字／binary 顯示差異判斷內容。
+來源的 fetch URL 與全部有效 push URL 都沿用，不忽略另設的停用／不同推送位置；
+複製後重新核對有效 URL，若 Git URL 改寫使目的地不同即停止，保留候選供核對。
 工具會保留候選與 `release.json`（階段、SHA、選定路徑及 patch 雜湊）；
 失敗／中止不自動 reset 或清理原修改，依 failed_at 核對已完成的步驟。
 不可因發生錯誤就盲目重跑 publish：若已建立候選 commit，先在保留副本修正／重新驗證，
@@ -83,7 +87,8 @@ HEAD 已有的提交都在候選祖先範圍內，也必須納入任務與 revie
 
 ```powershell
 & $devPython -X utf8 scripts/push_helper.py check
-if ($LASTEXITCODE -ne 0) { throw 'index metadata 不一致；先確認實際交付內容' }
+if ($LASTEXITCODE -ne 0) { throw 'HEAD metadata 或安全檢查失敗；先確認基底' }
+# 暫存的 runtime 修改此時不用手動 sync_manifest；只在候選生成後核對 index 雜湊。
 # 先完成相關回歸、快速檢查與完整 review，message.txt 含實際 review trailers。
 # 下例只發佈明確暫存的 helper 與相關測試，檔案清單須換成本批實際範圍。
 $releaseDir = Join-Path $env:TEMP ('cmuh-release-' + [guid]::NewGuid().ToString('N'))
@@ -211,13 +216,12 @@ python -m pytest -q -p no:cacheprovider tests/test_runtime_diagnostics_2026_09_2
 python -m ruff check src scripts tests
 python scripts/sanity_check.py
 python -m unittest _test_delivery
-# 在已暫存的最終內容上核對；不沿用修改前的結果。
-$env:PYTHONPATH = 'src'
-$env:PYTHONIOENCODING = 'utf-8'
-python -c "from scripts import push_helper as p; from cmuh_common.version import CURRENT_VERSION; p.verify_staged_version_consistency(CURRENT_VERSION); p.verify_staged_manifest_hashes()"
+# 來源只核對 HEAD 基底；不能拿未生成的暫存 runtime 內容比對舊 manifest。
+python -X utf8 scripts/push_helper.py check
+# 最終 index 雜湊由 publish 在候選生成版本／manifest 後核對，不能省略。
 ```
 
-必要時完整本機檢查，以 `.github/workflows/ci.yml` 當前命令為準。先執行上方「CI 階段定位與驗證成本」的完整 wrapper 與 evidence 檢查命令（含 coverage），兩者退出碼皆須為 0，再執行下列原有守門；plain pytest 或只有部分報告不能代替完整 evidence 檢查：
+必要時完整本機檢查，以 `.github/workflows/ci.yml` 當前命令為準。先執行上方「歷史 CI 階段定位與驗證成本（2026-10-04）」的完整 wrapper 與 evidence 檢查命令（含 coverage），兩者退出碼皆須為 0，再執行下列原有守門；plain pytest 或只有部分報告不能代替完整 evidence 檢查：
 
 ```powershell
 python -m pyright
