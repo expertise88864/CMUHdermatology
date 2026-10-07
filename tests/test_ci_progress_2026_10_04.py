@@ -65,6 +65,7 @@ def test_wrapper_preserves_plain_child_interpreter_mode(tmp_path, utf8_mode, pyt
     (tmp_path / "test_anonymous.py").write_text(
         "import os, sys\ndef test_interpreter():\n"
         f"    assert sys.flags.utf8_mode == {expected}\n"
+        "    assert sys.orig_argv[1:5] == ['-m', 'pytest', '-p', 'ci_pytest_progress']\n"
         f"    assert os.environ['PYTHONPATH'] == {expected_path!r}\n", encoding="utf-8")
     cp = subprocess.run(_command(tmp_path / "evidence"), cwd=tmp_path, env=env,
                         capture_output=True, encoding="utf-8", errors="replace", timeout=20)
@@ -308,7 +309,8 @@ def test_checker_requires_fresh_sha_complete_counts_and_matching_reports(tmp_pat
 
 @pytest.mark.parametrize("damage", [
     "dirty", "status", "exit_code", "diagnostic_errors", "terminal_kind",
-    "terminal_errors", "zero_selected", "report_hash",
+    "terminal_errors", "zero_selected", "report_hash", "selected_finished_mismatch",
+    "terminal_exit_code", "last_event_mismatch",
 ])
 def test_each_checker_rejection_starts_from_valid_evidence(tmp_path, damage):
     output, events = _passing_checker_evidence(tmp_path)
@@ -324,11 +326,17 @@ def test_each_checker_rejection_starts_from_valid_evidence(tmp_path, damage):
         runner._write(output / "result.json", result)
     elif damage == "report_hash":
         (output / "cov.json").write_text('{"changed": true}', encoding="utf-8")
+    elif damage == "last_event_mismatch":
+        runner._write(output / "result.json", {**result, "last_event": {**events[-1], "selected": 2}})
     else:
         if damage == "terminal_kind":
             events[-1]["event"] = "not_session_finished"
         elif damage == "terminal_errors":
             events[-1]["diagnostic_errors"] = ["anonymous diagnostic failure"]
+        elif damage == "selected_finished_mismatch":
+            events[-1]["selected"] = 2
+        elif damage == "terminal_exit_code":
+            events[-1]["exit_code"] = 1
         else:
             events = [e for e in events if e["event"] != "test_finished"]
             for seq, event in enumerate(events, 1):

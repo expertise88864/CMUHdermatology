@@ -18,6 +18,8 @@ wrapper 要求新的 evidence 目錄，拒絕重用；先移除隔離 checkout �
 
 `Preserve pytest evidence` 在正常或失敗後嘗試上傳，artifact 名稱包含 SHA、run ID、attempt，保留 14 天。GitHub 強制終止或 runner 消失可能來不及上傳；console 的最後開始階段提供有限線索，不能保證任何中止都會留下完整 artifact。`running` 狀態或單獨檔案不能證明程序仍活著，須查實際 handle／GitHub run。
 
+artifact 同時保留原始 `junit.xml`（含失敗 traceback 及參數識別）與 `cov.json`；逐行 progress 的遮罩不會遮罩這些原始報告。測試與保存的 artifact 仍須遵守既有匿名資料規則，不得包含患者、帳密或正式設定。
+
 獨立審查找到中止測試的 PID checkpoint 競態：父程序可在 PID 檔建立後、寫完前讀到空內容，清理時只終止 wrapper 而留下 pytest 子程序。受控暫停該寫入後重現逾時及存活子程序；改成先完整寫暫存 PID 檔，再 `os.replace` 原子發布。相關回歸另重現 Windows checkpoint 短暫讀取拒絕。父程序在原有 15 秒期限內只重試 FileNotFoundError／PermissionError，損壞 PID 仍失敗；例外清理在結束 wrapper 前只終止其直接子程序中 cwd 為該匿名暫存目錄且 argv 為 pytest 的程序，避免遺留繼承的 pipe。新增一次讀取拒絕及損壞 PID 清理的匿名整合案例。這是測試同步與清理修正，沒有改正式程序的終止規則。
 
 在**隔離開發 checkout**（必要依賴已安裝）重跑：
@@ -103,11 +105,10 @@ $env:PYTHONIOENCODING = 'utf-8'
 python -c "from scripts import push_helper as p; from cmuh_common.version import CURRENT_VERSION; p.verify_staged_version_consistency(CURRENT_VERSION); p.verify_staged_manifest_hashes()"
 ```
 
-必要時完整本機檢查，以 `.github/workflows/ci.yml` 當前命令為準：
+必要時完整本機檢查，以 `.github/workflows/ci.yml` 當前命令為準。先執行上方「CI 階段定位與驗證成本」的完整 wrapper 與 evidence 檢查命令（含 coverage），兩者退出碼皆須為 0，再執行下列原有守門；plain pytest 或只有部分報告不能代替完整 evidence 檢查：
 
 ```powershell
 python -m pyright
-python -m pytest -q -p no:cacheprovider --junitxml=junit.xml --cov=src --cov-report=json:cov.json --cov-report=term:skip-covered
 python scripts/check_skips.py junit.xml
 python scripts/check_coverage.py cov.json
 python scripts/type_debt.py
