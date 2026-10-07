@@ -101,6 +101,8 @@ if ($LASTEXITCODE -ne 0) { throw '候選 CI 未通過；停止正式發佈' }
 新的工作副本，勿 force push 舊來源分支蓋掉遠端候選。候選推送成功不代表 main 已交付。
 副本保留 hook、版本／manifest／index／來源指紋及 final-SHA 守門，仍須正式 CI 與匿名 smoke。
 本輪只修改開發工具與文件，未修改 runtime／manifest 涵蓋檔案時可保留程式版本，記錄理由。
+manifest 子程序明確使用 UTF-8 輸出，避免英文 Windows 的 cp1252 在印中文時中斷生成。
+這項設定只套用該子程序，不改父程序、全域環境或 CI pytest 子程序的既有 Python 模式。
 
 相關回歸：
 

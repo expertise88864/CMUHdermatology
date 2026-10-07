@@ -128,8 +128,15 @@ def publish_args(tmp_path, mode="index"):
 @pytest.mark.parametrize("mode,expected", [("index", "value = 2\n"),
                                          ("worktree", "value = 3\n"),
                                          ("committed", "value = 1\n")])
+@pytest.mark.parametrize("stdio_encoding", [None, "cp1252:strict"])
 def test_publish_uses_exact_scope_and_preserves_all_source_changes(
-        ph, repo, tmp_path, monkeypatch, mode, expected):
+        ph, repo, tmp_path, monkeypatch, mode, expected, stdio_encoding):
+    # A Windows redirected child defaults to its ANSI encoding. Reproduce the
+    # hosted English runner without changing this machine's system locale.
+    if stdio_encoding:
+        monkeypatch.setenv("PYTHONIOENCODING", stdio_encoding)
+    else:
+        monkeypatch.delenv("PYTHONIOENCODING", raising=False)
     dirty_source(repo)
     before = snapshot(repo)
     pushed = []
@@ -151,6 +158,7 @@ def test_publish_uses_exact_scope_and_preserves_all_source_changes(
     candidate = tmp_path / "candidate output/candidate"
     message = git(candidate, "log", "-1", "--format=%B").decode("utf-8")
     assert "修正 🧪" in message and "Claude-Opus-5-Review: pending" in message
+    assert os.environ.get("PYTHONIOENCODING") == stdio_encoding
 
 
 @pytest.mark.parametrize("stage,expected_phase", [

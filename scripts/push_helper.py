@@ -36,8 +36,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def run(cmd: list, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
+def run(cmd: list, check: bool = True, capture: bool = False,
+        env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """執行子命令，輸出直接連到 console。"""
+    command_env = {**os.environ, **(env or {}), "GIT_OPTIONAL_LOCKS": "0"}
     private_remote = cmd[:3] == ["git", "remote", "set-url"]
     shown = [*cmd[:4], "<remote URL>"] if private_remote else cmd
     print(f"  $ {' '.join(shown)}")
@@ -45,17 +47,17 @@ def run(cmd: list, check: bool = True, capture: bool = False) -> subprocess.Comp
         # Git may include the URL in errors; neither arguments nor raw diagnostics
         # should expose credentials stored in the user's local remote config.
         cp = subprocess.run(cmd, cwd=REPO_ROOT, check=False, text=True,
-                            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+                            env=command_env,
                             capture_output=True, encoding='utf-8', errors='replace')
         if check and cp.returncode:
             raise subprocess.CalledProcessError(cp.returncode, shown)
         return cp
     if capture:
         return subprocess.run(cmd, cwd=REPO_ROOT, check=check, text=True,
-                              env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+                              env=command_env,
                               capture_output=True, encoding='utf-8', errors='replace')
     return subprocess.run(cmd, cwd=REPO_ROOT, check=check,
-                          env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+                          env=command_env)
 
 
 def fail(msg: str, code: int = 1) -> None:
@@ -456,9 +458,10 @@ def step3_bump_version() -> str:
 
 def step4_sync_manifest(new_version: str) -> None:
     print("\n=== [5/7] 同步 manifest.json（含 SHA256）===")
-    # 不 capture（避免 cp950 console 解碼 utf-8 中文輸出失敗）；讓子程序直接印
+    # 英文 Windows 的 redirected stdout 預設 cp1252，印中文會在寫完 manifest
+    # 後失敗。僅明確指定本子程序的 I/O 編碼；不改父程序或其他命令的環境。
     cp = run([sys.executable, str(REPO_ROOT / "scripts" / "sync_manifest.py"), new_version],
-             check=False)
+             check=False, env={"PYTHONIOENCODING": "utf-8"})
     if cp.returncode != 0:
         fail("sync_manifest.py 失敗")
 
