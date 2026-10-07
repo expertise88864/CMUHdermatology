@@ -343,6 +343,77 @@ def test_candidate_rejects_extra_gitlink_when_global_diff_hides_submodules(
     assert receipt["phase"] == "incomplete" and receipt["failed_at"] == "prepare"
 
 
+@pytest.mark.parametrize("kind", ["missing", "unstaged", "intent_to_add", "unchanged", "case_variant"])
+def test_index_selection_rejects_each_path_without_an_exact_staged_delta(
+        ph, repo, tmp_path, monkeypatch, kind):
+    extra = "docs/missing.md"
+    if kind in ("unstaged", "intent_to_add"):
+        extra = "docs/pending.md"
+        (repo / extra).write_text("not staged for publication\n", encoding="utf-8")
+        if kind == "intent_to_add":
+            git(repo, "add", "-N", extra)
+    elif kind == "unchanged":
+        extra = "scripts/sync_manifest.py"
+    elif kind == "case_variant":
+        (repo / "src/Case.py").write_text("baseline\n", encoding="utf-8")
+        git(repo, "add", "src/Case.py")
+        git(repo, "commit", "-m", "Anonymous case-sensitive baseline")
+        (repo / "src/Case.py").write_text("staged\n", encoding="utf-8")
+        git(repo, "add", "src/Case.py")
+        extra = "src/case.py"
+    dirty_source(repo)
+    before = snapshot(repo)
+    monkeypatch.setattr(ph, "step3_bump_version", lambda: pytest.fail("generated with a missing selected path"))
+    args = publish_args(tmp_path) + ["--path", extra]
+    with pytest.raises(SystemExit) as error:
+        ph.main(args)
+    assert error.value.code != 0
+    assert snapshot(repo) == before
+    assert not (tmp_path / "candidate output").exists()
+
+
+def test_worktree_missing_selection_fails_cleanly_before_creating_receipt(
+        ph, repo, tmp_path, monkeypatch):
+    dirty_source(repo)
+    before = snapshot(repo)
+    monkeypatch.setattr(ph, "step3_bump_version", lambda: pytest.fail("generated with a missing selected path"))
+    with pytest.raises(SystemExit) as error:
+        ph.main(publish_args(tmp_path, "worktree") + ["--path", "docs/missing.md"])
+    assert error.value.code != 0
+    assert snapshot(repo) == before
+    assert not (tmp_path / "candidate output").exists()
+
+
+@pytest.mark.parametrize("mode", ["index", "committed"])
+def test_generation_cannot_renormalize_an_unselected_head_blob(
+        ph, repo, tmp_path, monkeypatch, mode):
+    # A real legacy HEAD blob conflicts with text/eol normalization. Only its
+    # stat information changes after generation; the user selected no doc edit.
+    (repo / ".gitattributes").write_text("* text eol=lf\n", encoding="utf-8", newline="\n")
+    git(repo, "add", ".gitattributes")
+    blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=repo,
+                          input=b"original\r\n", check=True, capture_output=True).stdout.decode().strip()
+    git(repo, "update-index", "--cacheinfo", f"100644,{blob},docs/other.md")
+    git(repo, "commit", "-m", "Anonymous legacy non-normalized blob")
+    assert git(repo, "show", "HEAD:docs/other.md") == b"original\r\n"
+    dirty_source(repo)
+    before = snapshot(repo)
+    sync = ph.step4_sync_manifest
+    def sync_then_invalidate_stat(version):
+        sync(version)
+        os.utime(ph.REPO_ROOT / "docs/other.md", ns=(0, 0))
+    monkeypatch.setattr(ph, "step4_sync_manifest", sync_then_invalidate_stat)
+    monkeypatch.setattr(ph, "step_candidate_gate", lambda *args: None)
+    pushed = []
+    monkeypatch.setattr(ph, "step6_push", lambda sha: pushed.append(sha))
+    with pytest.raises(SystemExit) as error:
+        ph.main(publish_args(tmp_path, mode))
+    assert error.value.code != 0
+    assert not pushed and snapshot(repo) == before
+    receipt = json.loads((tmp_path / "candidate output/release.json").read_text(encoding="utf-8"))
+    assert receipt["phase"] == "incomplete" and receipt["failed_at"] == "verify_candidate_index"
+
+
 @pytest.mark.parametrize("mode,expected", [("index", "value = 2\n"),
                                          ("worktree", "value = 3\n"),
                                          ("committed", "value = 1\n")])

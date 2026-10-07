@@ -591,15 +591,43 @@ def _exact_patch_args(paths: list[str] | None = None) -> list[str]:
     return args
 
 
-def _index_delta_args(paths: list[str] | None = None) -> list[str]:
+def _index_delta_args(paths: list[str] | None = None, *, revision: str = "HEAD") -> list[str]:
     """Full paths/modes/blob IDs; independent of text/binary diff driver display."""
     args = ["--literal-pathspecs", "diff", "--cached", "--raw", "-z", "--abbrev=64",
             "--no-ext-diff", "--no-textconv", "--no-renames", "--no-color", "--no-relative",
             "--ignore-submodules=none",
-            "-O", os.devnull, "HEAD"]
+            "-O", os.devnull, revision]
     if paths is not None:
         args.extend(["--", *paths])
     return args
+
+
+def _delta_records(delta: bytes) -> list[tuple[bytes, bytes]]:
+    """Parse no-rename raw -z records without decoding or normalizing paths."""
+    if not delta:
+        return []
+    parts = delta.split(b"\0")
+    if parts[-1] or len(parts) % 2 != 1:
+        fail("Git index delta 格式不完整，已中止。")
+    records = list(zip(parts[:-1:2], parts[1:-1:2], strict=True))
+    if any(not meta.startswith(b":") or len(meta.split()) != 5 or not path
+           for meta, path in records):
+        fail("Git index delta 格式無效，已中止。")
+    return records
+
+
+def _require_selected_delta(paths: list[str], delta: bytes) -> None:
+    actual = {path for _, path in _delta_records(delta)}
+    missing = [path for path in paths if path.encode("utf-8", "surrogateescape") not in actual]
+    if missing:
+        fail("選定檔案沒有精確的來源變更（index 模式須先暫存），尚未準備候選："
+             + json.dumps(missing, ensure_ascii=False))
+
+
+def _delta_without_generated(delta: bytes) -> bytes:
+    generated = {VERSION_REL.encode("utf-8"), MANIFEST_REL.encode("utf-8")}
+    return b"".join(meta + b"\0" + path + b"\0" for meta, path in _delta_records(delta)
+                    if path not in generated)
 
 
 def _selection_export(paths: list[str], source: str) -> tuple[bytes, bytes]:
@@ -609,18 +637,24 @@ def _selection_export(paths: list[str], source: str) -> tuple[bytes, bytes]:
         entries = [e.split(b"\t", 1)[0].split() for e in staged.split(b"\0") if e]
         if any(e[2] != b"0" or e[0] not in (b"100644", b"100755") for e in entries):
             fail("選定 index 有衝突或非一般檔案，已中止。")
-        return _git_bytes(_exact_patch_args(paths)), _git_bytes(_index_delta_args(paths))
+        patch, delta = _git_bytes(_exact_patch_args(paths)), _git_bytes(_index_delta_args(paths))
+        _require_selected_delta(paths, delta)
+        return patch, delta
     # A separate index starts at HEAD, so unrelated staged changes never enter the patch.
     with tempfile.TemporaryDirectory(prefix="cmuh_selected_index_") as directory:
         env = {**os.environ, "GIT_INDEX_FILE": str(Path(directory) / "index"),
                "GIT_OPTIONAL_LOCKS": "0"}
-        for args in (["read-tree", "HEAD"], ["--literal-pathspecs", "add", "-A", "--", *paths]):
-            subprocess.run(["git", *args], cwd=REPO_ROOT, env=env, check=True,
-                           capture_output=True)
-        cp = subprocess.run(["git", *_exact_patch_args()], cwd=REPO_ROOT, env=env,
-                            check=True, capture_output=True)
-        delta = subprocess.run(["git", *_index_delta_args()], cwd=REPO_ROOT, env=env,
-                               check=True, capture_output=True)
+        try:
+            for args in (["read-tree", "HEAD"], ["--literal-pathspecs", "add", "-A", "--", *paths]):
+                subprocess.run(["git", *args], cwd=REPO_ROOT, env=env, check=True,
+                               capture_output=True)
+            cp = subprocess.run(["git", *_exact_patch_args()], cwd=REPO_ROOT, env=env,
+                                check=True, capture_output=True)
+            delta = subprocess.run(["git", *_index_delta_args()], cwd=REPO_ROOT, env=env,
+                                   check=True, capture_output=True)
+        except subprocess.CalledProcessError:
+            fail("無法取得選定 worktree 變更；請核對每個 --path 的精確檔名，尚未準備候選。")
+        _require_selected_delta(paths, delta.stdout)
         return cp.stdout, delta.stdout
 
 
@@ -695,6 +729,11 @@ def _candidate_copy(options, branch: str):
         record()
         def verify_source():
             global REPO_ROOT
+            # HEAD advances after commit. Compare against the immutable source
+            # revision both after generation/staging and immediately before push.
+            actual_delta = _git_bytes(_index_delta_args(revision=head))
+            if _delta_without_generated(actual_delta) != expected_delta:
+                fail("候選提交範圍與選定來源不一致（僅允許生成版本／manifest），已中止。")
             REPO_ROOT = original
             try:
                 if _git_bytes(["rev-parse", "HEAD"]).decode("ascii").strip() != head:
@@ -813,6 +852,7 @@ def main(argv: list) -> int:
         verify_index_matches(expected)
         verify_staged_version_consistency(new_ver)
         verify_staged_manifest_hashes()
+        verify_source()
         state["phase"] = "commit"
         record()
         step5_commit(commit_msg, new_ver, emergency_reason)
