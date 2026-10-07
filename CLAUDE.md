@@ -1,5 +1,30 @@
 # Project agreements
 
+## Claude Code 接手入口
+
+先讀 [AGENTS.md](AGENTS.md)、[交付規則](REMOTE_CI_DELIVERY.md) 與
+[維護手冊的開發入口](docs/maintenance_handoff.md#安全開發與候選發佈2026-10-07)。
+較早文件中的裸提交訊息、全域環境搬家腳本及直接推 main 指令是歷史流程，
+不能代替目前命令。未完成審查依完整 SHA 與後續 audit 核對，不以單一 passed 推定全部結清。
+
+使用新的隔離 `codex/*` 工作副本，先查看 `git status --short`、`git rev-parse HEAD`、
+`git rev-parse origin/main` 及 `git config --get core.hooksPath`；保留其他工作副本與使用者修改。
+開發測試使用匿名 fixtures，不複製正式 `settings/`，也不啟動六支正式程式作 smoke。
+開發環境工具預設只檢查；需建立環境時明確使用 `apply`，不修改全域模型／MCP／規則。
+
+| 修改方向 | 來源入口 | 相關驗證入口 |
+| --- | --- | --- |
+| HIS 熱鍵、門診刷新 | `src/main.py`、`src/cmuh_common/his_memo_port.py`、`uvb_dose.py` | 手冊 A 組與照光日期換行回歸 |
+| 排班 | `src/scheduler.py`、`src/cmuh_common/roster/` | 手冊 B 組與既有品質 benchmark |
+| 會診與郵件 | `src/consult_query.py`、`delivery_ledger.py` | 手冊 C 組 |
+| 打卡 | `src/autoclock.py`、`src/cmuh_common/action_ledger.py` | 手冊 D 組 |
+| 啟動／復原／守護 | 根目錄六支 `.pyw`、`version_pointer.py`、`src/bootstrap_recovery.py`、`watchdog_runner.py` | 手冊 E 組與新程序復原回歸 |
+| 開發交付 | `scripts/push_helper.py`、`tools/dev-env-setup.py`、`_delivery.py` | 手冊安全開發入口與 Delivery contract |
+
+詳細模組責任、已定案行為、整包回退及院內待驗收項目留在
+[維護與交接手冊](docs/maintenance_handoff.md)；新增功能可以另立明確範圍，
+臨床／排班規則的語意變更仍需使用者定案。
+
 ## 最新使用者定案：全域 diff review 模型（2026-09-23）
 
 - 新 diff review 與未完成補審固定使用完整模型 ID `claude-opus-5-5`、effort `high`、唯讀工具，核對實際 `modelUsage`；不得以 alias、舊 Opus 5 或其他模型代替。

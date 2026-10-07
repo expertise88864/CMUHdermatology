@@ -2,7 +2,117 @@
 
 適用於既有六支 Windows 程式。功能以目前程式及使用者定案為準；本手冊不授權操作真實 HIS、寄信、打卡或變更臨床規則。基準見 [風險清單](maintenance_risk_plan_2026-09-30.md)。
 
-## CI 階段定位與驗證成本（2026-10-04）
+## 安全開發與候選發佈（2026-10-07）
+
+本節是開發操作入口；下方日期章節保留歷史證據。每次接手重新 fetch、記錄完整 SHA、
+版本及工作樹，不把本文中的歷史 SHA 當永遠有效的最新版。審查／交付完成狀態以
+實際模型證據、精確 trailer／audit 與 exact-SHA CI 為準，本節不能替代批准。
+
+### 建立開發環境
+
+保留既有 Desktop 副本；新任務從最新 main 建立另一個完整副本，再切本批候選分支。
+下例不複製 settings，也不修改全域 Git 設定；分支名稱須換成本批唯一名稱：
+
+```powershell
+$devClone = Join-Path $env:TEMP ('cmuh-dev-' + [guid]::NewGuid().ToString('N'))
+git clone --branch main --single-branch https://github.com/expertise88864/CMUHdermatology.git $devClone
+if ($LASTEXITCODE -ne 0) { throw '無法取得新的開發副本' }
+Set-Location $devClone
+git switch -c codex/your-development-batch
+if ($LASTEXITCODE -ne 0) { throw '候選分支未建立' }
+git config --local core.hooksPath .githooks
+if ($LASTEXITCODE -ne 0) { throw '專案 hook 未設定' }
+git rev-parse HEAD
+if ($LASTEXITCODE -ne 0) { throw '無法確認來源 SHA' }
+git status --short
+if ($LASTEXITCODE -ne 0) { throw '無法確認來源狀態' }
+```
+
+在完整、隔離的 Windows 開發 checkout 使用 Python 3.13（與正式 CI 對照）。
+`tools/dev-env-setup.py` 無參數或 `check` 只讀取環境中繼資料、hook 與 CLI 是否存在，
+不匯入應用程式、不安裝、不修改全域設定。`--auth` 才額外查詢登入狀態，只輸出判定，
+不顯示帳戶、token 或供應商原始訊息。CLI 找到與模型額度可用是不同條件。
+`not_checked`／`manual` 不能當已驗證；任何 failed 都是非零退出碼。
+
+```powershell
+python -X utf8 tools/dev-env-setup.py check
+# 初次沒有 venv 預期非零；先查看缺口，再明確建立：
+python -X utf8 tools/dev-env-setup.py apply --venv .venv
+if ($LASTEXITCODE -ne 0) { throw '開發環境未完成；依列出的 failed 項目處理' }
+$devPython = (Resolve-Path '.venv/Scripts/python.exe').Path
+& $devPython -X utf8 tools/dev-env-setup.py check --auth
+if ($LASTEXITCODE -ne 0) { throw '開發環境或登入狀態尚未確認' }
+```
+
+apply 沿用兩份 requirements 與既有 runtime constraints，開發工具另裝，僅寫入新建立的
+`.venv` 或 `.venv-名稱`。現有環境只檢查，不原地修復；失敗保留未完成環境，
+使用新的 `.venv-rebuild` 等名稱重建，再把 `$devPython` 指向該環境。這讓舊環境可繼續使用。
+新目錄以互斥建立保留名稱；同名建立競爭會停止，不覆寫另一個程序的環境。
+唯讀套件查詢明確停用 bytecode 寫入，不靠會被隔離模式忽略的環境變數。
+不自動安裝全域 npm／pip、不改模型、effort、MCP、全域 CLAUDE.md 或帳戶設定。
+缺少 CLI／登入或 hook 時按當前官方工具與既有 hook 安裝流程處理，不能繞過檢查。
+不要用此工具搬遷院內正式環境；正式機器的狀態／設定搬遷另依下方整包回退與院內驗收程序。
+
+測試沿用 `tests/` 的匿名 fixtures，自建暫存 settings／SQLite／時鐘與假 HIS；
+不需要複製正式 settings，不開啟 `.pyw` 或直接執行六支來源入口作 smoke。
+
+### 發佈工具契約
+
+`push.bat` 與 `scripts/push_helper.py` 共用契約：
+
+- 無參數／`--help`：顯示說明；不存取 Git、不生成版本。
+- `check`：唯讀核對安全、index 版本與 manifest 雜湊。它不是 lint、完整 CI 或 review。
+- `publish`：必須指定提交訊息及精確來源範圍，才準備候選並推送 `codex/*`。
+- 未知參數、錯字、裸提交訊息、缺漏或互斥參數直接拒絕；舊 `--sanity-only` 不支援。
+
+publish 使用 HEAD 為基底，`--path` 可重複，每項是一般檔案的精確 repo 相對路徑，
+不接受目錄、glob、忽略檔、符號連結、路徑越界或手動指定的版本／manifest。
+預設 `--source index`，只取指定檔案已暫存的內容，包括部分暫存；
+明確指定 `--source worktree` 才取指定檔案的完整現況，包含指定的新檔／刪除。
+`--committed` 則只使用 HEAD，不能和 `--path`／`--source` 混用。
+HEAD 已有的提交都在候選祖先範圍內，也必須納入任務與 review 的核對。
+
+候選在 repo 外的新本機副本生成版本、manifest、提交並驗證；原工作樹的檔案、index、
+分支與本機 refs 保留，無關 staged／unstaged／untracked 不會加入候選。
+候選套用選定內容後會再次核對 settings 與 `.gitignore`，來源通過不代表候選已通過。
+來源 HEAD／分支／指定內容在驗證期間改變會停止推送。
+工具會保留候選與 `release.json`（階段、SHA、選定路徑及 patch 雜湊）；
+失敗／中止不自動 reset 或清理原修改，依 failed_at 核對已完成的步驟。
+不可因發生錯誤就盲目重跑 publish：若已建立候選 commit，先在保留副本修正／重新驗證，
+沿用下方分步交付規則；若推送回應不明，先核對遠端 exact SHA。
+
+```powershell
+& $devPython -X utf8 scripts/push_helper.py check
+if ($LASTEXITCODE -ne 0) { throw 'index metadata 不一致；先確認實際交付內容' }
+# 先完成相關回歸、快速檢查與完整 review，message.txt 含實際 review trailers。
+# 下例只發佈明確暫存的 helper 與相關測試，檔案清單須換成本批實際範圍。
+$releaseDir = Join-Path $env:TEMP ('cmuh-release-' + [guid]::NewGuid().ToString('N'))
+& $devPython -X utf8 scripts/push_helper.py publish --path scripts/push_helper.py --path tests/test_push_cli_contract_2026_10_07.py --message-file message.txt --output $releaseDir
+if ($LASTEXITCODE -ne 0) { throw '候選未完成；查看保留副本與 release.json' }
+$candidateReceipt = Get-Content -LiteralPath (Join-Path $releaseDir 'release.json') -Raw | ConvertFrom-Json
+$candidateSha = $candidateReceipt.sha
+Set-Location (Join-Path $releaseDir 'candidate')
+& $devPython _delivery.py verify $candidateSha --phase candidate --wait 2700
+if ($LASTEXITCODE -ne 0) { throw '候選 CI 未通過；停止正式發佈' }
+# 後續依本手冊「發佈與補審」：重新 fetch、核對祖先與乾淨狀態、同 SHA 快轉 main。
+```
+
+原來源分支仍指向原 HEAD；從保留候選副本完成本次交付，下一批用最新已驗證 main 建立
+新的工作副本，勿 force push 舊來源分支蓋掉遠端候選。候選推送成功不代表 main 已交付。
+副本保留 hook、版本／manifest／index／來源指紋及 final-SHA 守門，仍須正式 CI 與匿名 smoke。
+本輪只修改開發工具與文件，未修改 runtime／manifest 涵蓋檔案時可保留程式版本，記錄理由。
+
+相關回歸：
+
+```powershell
+& $devPython -m pytest -q -p no:cacheprovider tests/test_push_cli_contract_2026_10_07.py tests/test_dev_setup_contract_2026_10_07.py tests/test_push_policy_2026_09_06.py tests/test_push_helper_antirevert.py tests/test_push_gate_failclosed_2026_07_31.py tests/test_delivery_review_2026_09_05.py
+if ($LASTEXITCODE -ne 0) { throw '開發工具回歸失敗' }
+```
+
+回退開發工具需一起核對 helper、BAT／CMD、測試與交接說明，以新提交走相同候選／正式流程；
+不能把舊版危險的參數用法當作新的操作入口。院內實機驗收仍未由這組匿名測試證明。
+
+## 歷史 CI 階段定位與驗證成本（2026-10-04）
 
 本輪基準為 `6855a37bd2941e36a9efcef9d9305cc342d65fa5`，修改開發驗證工具、CI 與相關測試／文件。啟動器、requirements 及臨床／排班來源保持不變；發佈 helper 已將版本中繼資料升為 `2026.10.04.1` 並同步 manifest，164 個配套檔案中只有 `src/cmuh_common/version.py` 的內容雜湊改變。最新狀態仍須按精確 SHA 核對。舊 pending 沿原排程，不用本輪 review 代替舊完整範圍。
 
@@ -120,7 +230,8 @@ python scripts/type_debt.py
 
 ## 發佈與補審
 
-`scripts/push_helper.py` 會生成版本、manifest、暫存、commit 並 push，**不代替完整 review，且會暫存整個工作樹**；使用前確認只有本批修改。手動分步提交仍須相同生成及一致性守門，不繞 hook。
+`scripts/push_helper.py publish` 依上方明確範圍在隔離副本生成版本、manifest、commit 並推候選，
+不代替完整 review。手動分步提交仍須相同生成及一致性守門，不繞 hook。
 
 1. 相關回歸、Ruff、sanity、delivery unit tests 成功；程式改動生成版本與 manifest，再核對最終 index。純文件未改 manifest 涵蓋檔案可保持版本不變，但記錄理由。
 2. 獨立 Codex review；Claude Code 固定 `claude-opus-5-5`／`high`／唯讀 `Read,Glob,Grep`，覆蓋 committed、staged、unstaged、相關 untracked。保存 diff 雜湊及 machine `modelUsage`；修 findings 後是新 diff，要重審。
@@ -130,15 +241,25 @@ python scripts/type_debt.py
 
 ```powershell
 $candidateSha = git rev-parse HEAD
+if ($LASTEXITCODE -ne 0) { throw '無法取得完整候選 SHA' }
 git push origin "${candidateSha}:refs/heads/codex/your-maintenance-batch"
+if ($LASTEXITCODE -ne 0) { throw '候選推送未確認；先查遠端 SHA，勿盲目重推' }
 python _delivery.py verify $candidateSha --phase candidate --wait 2700
+if ($LASTEXITCODE -ne 0) { throw '候選尚未通過完整 CI；停止後續正式發佈' }
 git fetch origin
+if ($LASTEXITCODE -ne 0) { throw '無法取得最新 main' }
 git merge-base --is-ancestor origin/main $candidateSha
+if ($LASTEXITCODE -ne 0) { throw 'main 不在候選祖先範圍；先整合並驗證新 SHA' }
 # 上一步 exit code 必須為 0；main 前進則先整合並驗證新的 SHA。
-git status --short
+$candidateStatus = git status --porcelain
+if ($LASTEXITCODE -ne 0 -or $candidateStatus) { throw '候選工作樹不乾淨或狀態不可讀' }
+$actualHead = git rev-parse HEAD
+if ($LASTEXITCODE -ne 0 -or $actualHead -ne $candidateSha) { throw '候選 HEAD 已改變' }
 # 工作樹須乾淨且 HEAD 仍是 candidateSha，才能執行下一步。
 git push origin "${candidateSha}:refs/heads/main"
+if ($LASTEXITCODE -ne 0) { throw '正式推送未確認；先查遠端 SHA' }
 python _delivery.py verify $candidateSha --phase main --wait 2700
+if ($LASTEXITCODE -ne 0) { throw '正式 CI 尚未通過；不能宣告交付' }
 ```
 
 `_delivery.py` 核對 policy 的 workflows、jobs、steps；不能以一個綠勾替代。缺失、應跑卻跳過、取消、逾時、讀不到都不通過。main 驗證後跑適用假環境 smoke，附證據才宣告交付；等待可分次查看，不更改門檻。

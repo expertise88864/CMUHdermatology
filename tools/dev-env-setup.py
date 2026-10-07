@@ -1,225 +1,199 @@
-# -*- coding: utf-8 -*-
-"""換電腦時的開發環境搬家腳本(冪等,可重複執行)。
+"""Read-only development check; explicit setup creates a project-local venv.
 
-目的:讓新電腦的 Claude Code 在做完後,能呼叫 codex(GPT-5.5, reasoning=high)
-做 push 前 diff 審查。這些都是「本機」設定、不會隨 git 跟過去,所以才需要這支。
-
-它會自動處理:
-  1. codex CLI(npm i -g @openai/codex)
-  2. ~/.codex/config.toml:model=gpt-5.5 + model_reasoning_effort=high(頂層 → 所有專案)
-  3. Claude Code 註冊 codex MCP(user scope) → 讓 Claude 能叫 mcp__codex__codex
-  4. ~/.claude/CLAUDE.md:push 前先 codex 審查的規則
-  5. 開發工具:ruff / pytest / pyright
-
-執行後「還需你手動」:codex 登入、Claude Code 登入、複製舊機器的 settings/ 密碼。
-
-用法:雙擊同資料夾的 dev-env-setup.cmd,或直接 `python dev-env-setup.py`。
+No global model, effort, MCP, rules, package or production settings edits.
+Existing environments are checked, never repaired in place.
 """
+from __future__ import annotations
+
+import argparse
+import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-HOME = Path.home()
+ROOT = Path(__file__).resolve().parents[1]
+DEV_PACKAGES = ("ruff", "pytest", "pytest-cov", "pyright")
+BASELINE = "docs/dependency_baseline_2026-10-03.txt"
 
 
-def step(n: int, msg: str) -> None:
-    print(f"\n[{n}] {msg}")
+def run(args: list[str], *, timeout: int = 60) -> subprocess.CompletedProcess:
+    """Capture diagnostics without echoing credentials or provider messages."""
+    executable = shutil.which(args[0]) or args[0]
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PIP_")}
+    env.update(PYTHONDONTWRITEBYTECODE="1", GIT_OPTIONAL_LOCKS="0", PIP_CONFIG_FILE=os.devnull)
+    return subprocess.run([executable, *args[1:]], cwd=ROOT, capture_output=True,
+                          text=True, encoding="utf-8", errors="replace", timeout=timeout, env=env)
 
 
-def ok(msg: str) -> None:
-    print(f"  [OK] {msg}")
+def _venv_path(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        path = ROOT / path
+    path = path.resolve()
+    if path.parent != ROOT.resolve() or not re.fullmatch(r"\.venv(?:-[A-Za-z0-9_-]+)?", path.name):
+        raise ValueError("使用 repo 根目錄的 .venv 或 .venv-名稱；不得使用全域／正式環境。")
+    return path
 
 
-def warn(msg: str) -> None:
-    print(f"  [!] {msg}")
+def _python(path: Path) -> Path:
+    windows = path / "Scripts/python.exe"
+    return windows if windows.exists() else path / "bin/python"
 
 
-def have(cmd: str) -> bool:
-    return shutil.which(cmd) is not None
+def _row(name: str, status: str, detail: str) -> dict:
+    return {"name": name, "status": status, "detail": detail}
 
 
-def run(args: list) -> tuple:
-    """跑外部命令,回 (returncode, 合併輸出)。不丟例外。
-    [codex review] Windows 上 npm/claude/codex 是 .cmd shim,subprocess(shell=False)
-    不會套 PATHEXT → 用 bare 名稱會 WinError 2;先用 shutil.which 解析成完整路徑
-    (含 .cmd)再執行。傳完整路徑(如 sys.executable)時 which 原樣回傳。"""
-    exe = shutil.which(args[0]) or args[0]
+def _probe_dependencies(python: Path) -> dict:
+    # Metadata only: importing keyboard, pyautogui or launchers can touch the desktop.
+    code = (
+        "import importlib.metadata as m,json,sys; from packaging.requirements import Requirement; "
+        "packages={d.metadata['Name'].lower().replace('_','-'):d.version for d in m.distributions()}; "
+        "requirements=[Requirement(r) for r in json.loads(sys.argv[1])]; "
+        "missing=[r.name for r in requirements if r.name.lower().replace('_','-') not in packages "
+        "or not r.specifier.contains(packages[r.name.lower().replace('_','-')])]; "
+        "print(json.dumps({'python':list(sys.version_info[:2]), 'venv':sys.prefix != sys.base_prefix, "
+        "'missing':missing}))"
+    )
+    cp = run([str(python), "-I", "-B", "-c", code, json.dumps(_requirements())])
+    if cp.returncode:
+        raise ValueError("無法查詢開發 Python 的套件中繼資料")
+    data = json.loads(cp.stdout)
+    if not data.get("venv"):
+        raise ValueError("指定 Python 不是隔離 venv")
+    return data
+
+
+def _requirements() -> list[str]:
+    result = []
+    for filename in ("requirements.txt", "requirements-lazy.txt"):
+        for line in (ROOT / filename).read_text(encoding="ascii").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                result.append(line)
+    return result + list(DEV_PACKAGES)
+
+
+def _auth_status(tool: str) -> bool:
+    args = ([tool, "auth", "status", "--json"] if tool == "claude" else
+            [tool, "login", "status"])
+    cp = run(args)
+    if cp.returncode:
+        return False
+    if tool == "claude":
+        return json.loads(cp.stdout).get("loggedIn") is True
+    return re.search(r"(?im)^Logged in\b", cp.stdout + "\n" + cp.stderr) is not None
+
+
+def check(environment: Path, auth: bool = False) -> list[dict]:
+    rows = [_row("platform", "passed" if sys.platform == "win32" else "failed",
+                 "開發完整驗證使用 Windows；GitHub CI 使用 Python 3.13")]
+    interpreter = _python(environment)
+    if not interpreter.exists():
+        rows.append(_row("venv", "failed", "開發環境不存在；使用明確 apply 建立"))
+        rows.append(_row("dependencies", "not_checked", "尚無可查詢的開發環境"))
+    else:
+        try:
+            data = _probe_dependencies(interpreter)
+            missing = data["missing"]
+            rows.append(_row("venv", "passed" if data["python"] == [3, 13] else "failed",
+                             "以 Python 3.13 與正式 CI 對照；此限制僅適用開發流程"))
+            rows.append(_row("dependencies", "failed" if missing else "passed",
+                             "缺少或版本不符：" + ", ".join(missing) if missing else "必要 runtime、lazy 與開發工具齊全"))
+        except (OSError, ValueError, KeyError, ImportError, subprocess.SubprocessError):
+            rows.append(_row("dependencies", "failed", "環境中繼資料不可讀；未修改環境"))
     try:
-        p = subprocess.run([exe, *args[1:]], capture_output=True, text=True,
-                           encoding="utf-8", errors="replace")
-        return p.returncode, (p.stdout or "") + (p.stderr or "")
-    except Exception as exc:  # noqa: BLE001
-        return 1, str(exc)
-
-
-def ensure_codex_cli() -> None:
-    step(1, "確認 codex CLI")
-    if have("codex"):
-        _, out = run(["codex", "--version"])
-        ver = out.strip().splitlines()[0] if out.strip() else ""
-        ok(f"codex 已安裝 {ver}".rstrip())
-        return
-    if have("npm"):
-        warn("codex 未安裝,嘗試 npm i -g @openai/codex ...")
-        run(["npm", "i", "-g", "@openai/codex"])
-        if have("codex"):
-            ok("codex 安裝完成")
+        cp = run(["git", "config", "--get", "core.hooksPath"])
+        good = cp.returncode == 0 and cp.stdout.strip() == ".githooks" and (ROOT / ".githooks/pre-push").is_file()
+        rows.append(_row("git_hook", "passed" if good else "failed",
+                         "依既有交付流程核對 .githooks；本工具不修改 Git 設定"))
+    except (OSError, subprocess.SubprocessError):
+        rows.append(_row("git_hook", "failed", "無法核對 Git hook"))
+    for tool in ("claude", "codex"):
+        exists = shutil.which(tool) is not None
+        rows.append(_row(tool, "passed" if exists else "failed",
+                         "CLI 已找到" if exists else "需依官方方式手動安裝；本工具不做全域安裝"))
+        if auth and exists:
+            try:
+                logged_in = _auth_status(tool)
+                rows.append(_row(tool + "_auth", "passed" if logged_in else "failed",
+                                 "登入狀態已核對" if logged_in else "未登入或狀態無法確認，請手動登入"))
+            except (OSError, ValueError, subprocess.SubprocessError):
+                rows.append(_row(tool + "_auth", "failed", "狀態無法確認；未顯示原始供應商輸出"))
         else:
-            warn("codex 安裝失敗,請手動執行:npm i -g @openai/codex")
-    else:
-        warn("找不到 npm。請先裝 Node.js(https://nodejs.org),再執行:"
-             "npm i -g @openai/codex")
+            rows.append(_row(tool + "_auth", "not_checked", "需 --auth 唯讀核對；未檢查不代表已登入"))
+    rows.append(_row("production_settings", "manual" if (ROOT / "settings").exists() else "passed",
+                     "開發測試沿用匿名 pytest fixtures；不複製或讀取正式 settings"))
+    return rows
 
 
-def merge_codex_config(content: str) -> str:
-    """把 model=gpt-5.5 + model_reasoning_effort=high 放到頂層,保留其餘內容
-    (notify / [windows] / [projects.*] ...)。
-
-    只移除「第一個真正的 [section] 之前、且不在三引號多行字串內」的舊
-    model/effort 行,稍後把正確值放最前面。
-    [codex review] 追蹤 \"\"\" 與 ''' 多行字串狀態:避免刪到別的鍵的多行字串值
-    裡剛好長得像 model= 的行,也避免把多行字串內的 [ 誤判成 section 開頭。
-    section 內(如 [projects.*])若也有 model= 一律保留。
-    """
-    want = ['model = "gpt-5.5"', 'model_reasoning_effort = "high"']
-    kept: list = []
-    in_ml = False          # 是否在三引號多行字串內
-    delim = ""             # 目前多行字串的結束符
-    seen_section = False    # 是否已遇到第一個真正的 [section]
-    for ln in content.splitlines():
-        if in_ml:
-            kept.append(ln)
-            if delim in ln:
-                in_ml = False
-                delim = ""
-            continue
-        stripped = ln.lstrip()
-        if stripped.startswith("["):
-            seen_section = True
-        drop = (not seen_section) and bool(
-            re.match(r"\s*(model|model_reasoning_effort)\s*=", ln))
-        if not drop:
-            kept.append(ln)
-        # 這行是否開啟了一段尚未閉合的三引號字串(出現奇數個 delim)
-        for d in ('"""', "'''"):
-            if ln.count(d) % 2 == 1:
-                in_ml = True
-                delim = d
-                break
-    return "\n".join(want + kept).rstrip("\n") + "\n"
-
-
-def ensure_codex_config() -> None:
-    step(2, "設定 codex 全域:gpt-5.5 + reasoning_effort=high(頂層,套用所有專案)")
-    cfg = HOME / ".codex" / "config.toml"
-    cfg.parent.mkdir(parents=True, exist_ok=True)
-    if cfg.exists():
-        content = cfg.read_text(encoding="utf-8", errors="replace")
-        cfg.write_text(merge_codex_config(content), encoding="utf-8")
-        ok(f"已更新 {cfg}")
-    else:
-        cfg.write_text('model = "gpt-5.5"\nmodel_reasoning_effort = "high"\n',
-                       encoding="utf-8")
-        ok(f"已建立 {cfg}")
+def apply(environment: Path) -> bool:
+    if environment.exists():
+        print("[保留] 已有環境只檢查；需重建時指定新的 .venv-名稱。")
+        return True
+    if sys.platform != "win32" or sys.version_info[:2] != (3, 13):
+        print("[失敗] 請以 Windows Python 3.13 建立開發環境。")
+        return False
+    try:
+        # venv reuses existing directories. Reserve this name exclusively before
+        # invoking it, so a concurrent apply cannot overwrite another creator.
+        environment.mkdir()
+    except FileExistsError:
+        print("[未完成] 環境名稱剛被其他程序建立；未初始化該目錄，請重新檢查或使用新名稱。")
+        return False
+    except OSError:
+        print("[未完成] 無法建立新的環境目錄；未初始化或修改既有環境。")
+        return False
+    try:
+        (environment / ".cmuh-dev-setup.json").write_text(
+            json.dumps({"creator_pid": os.getpid(), "purpose": "CMUH local development"}), encoding="utf-8")
+    except OSError:
+        print("[未完成] 無法記錄新環境的建立者；保留新目錄，未開始初始化。")
+        return False
+    commands = [
+        [sys.executable, "-I", "-m", "venv", str(environment)],
+        [str(environment / "Scripts/python.exe"), "-I", "-m", "pip", "--isolated", "install", "--no-user",
+         "-r", "requirements.txt", "-r", "requirements-lazy.txt", "-c", BASELINE,
+         *DEV_PACKAGES],
+        [str(environment / "Scripts/python.exe"), "-I", "-m", "pip", "--isolated", "check"],
+    ]
+    for number, args in enumerate(commands, 1):
+        print(f"[套用 {number}/3] 僅操作 {environment.name}")
+        try:
+            cp = run(args, timeout=1200)
+            if cp.returncode:
+                print(f"[未完成] 步驟 {number} 失敗（exit {cp.returncode}）；保留未完成環境，請用新名稱重建。")
+                return False
+        except (OSError, subprocess.SubprocessError):
+            print(f"[未完成] 步驟 {number} 無法完成；未變更既有環境或全域設定。")
+            return False
+    return True
 
 
-def register_codex_mcp() -> None:
-    """用官方 `claude mcp add`(不手改 ~/.claude.json,避免破壞 JSON)。
-    不帶 -c:model/effort 由 config.toml 提供,避免跨 shell 引號地獄。"""
-    step(3, "在 Claude Code 註冊 codex MCP(user scope)")
-    manual = "  claude mcp add codex --scope user -- codex mcp-server"
-    if not have("claude"):
-        warn("找不到 claude CLI。Claude Code 裝好後,執行:")
-        warn(manual)
-        return
-    add_cmd = ["claude", "mcp", "add", "codex", "--scope", "user",
-               "--", "codex", "mcp-server"]
-    # [codex review] 永不 remove:既有的 codex 註冊本來就能用(它就是啟動
-    # `codex mcp-server`,讀 config.toml 拿 high),沒有覆蓋的必要。先 add,失敗
-    # 若是「已存在」就保留現狀;其他錯誤才提示手動 —— 任何情況都不會把使用者
-    # 原有的註冊弄不見。
-    rc, out = run(add_cmd)
-    if rc == 0:
-        ok("已註冊 codex MCP(model/effort 由 ~/.codex/config.toml 的 high 提供)")
-        return
-    low = out.lower()
-    if any(s in low for s in ("already exists", "already configured",
-                              "already registered")):
-        ok("codex MCP 已存在,保留現有註冊(現狀即可運作:啟動 codex mcp-server"
-           " 讀 config.toml 的 high)")
-        return
-    warn("自動註冊失敗(未更動任何既有設定)。請手動執行:")
-    warn(manual)
-    if out.strip():
-        warn("(claude 輸出:" + out.strip()[:150] + ")")
-
-
-_RULE = """
-## Codex (GPT-5.5) diff review before pushing — ALL projects
-Before `git push` in any project (a push may auto-deploy to production), first run a
-Codex GPT-5.5 review of exactly what will be pushed, and only push if it passes:
-1. Get the diff (unpushed commits and/or working changes).
-2. Review with Codex (model gpt-5.5): prefer the codex MCP tools if loaded, else CLI
-   `codex exec -c model="gpt-5.5" --skip-git-repo-check` (or `codex review`).
-3. Show findings; fix anything blocking; re-review.
-4. Only `git push` once the review returns no blocking issues.
-"""
-
-
-def ensure_claude_md_rule() -> None:
-    step(4, "寫入全域 CLAUDE.md 的 codex 審查規則")
-    claude_md = HOME / ".claude" / "CLAUDE.md"
-    marker = "Codex (GPT-5.5) diff review before pushing"
-    if claude_md.exists() and marker in claude_md.read_text(
-            encoding="utf-8", errors="replace"):
-        ok("規則已存在,略過")
-        return
-    claude_md.parent.mkdir(parents=True, exist_ok=True)
-    with claude_md.open("a", encoding="utf-8") as fh:
-        fh.write("\n" + _RULE.strip() + "\n")
-    ok(f"已寫入規則到 {claude_md}")
-
-
-def ensure_dev_tools() -> None:
-    step(5, "安裝開發工具(ruff / pytest / pyright)")
-    if not (have("python") or have("py")):
-        warn("找不到 python,請先安裝 Python 3.10+")
-        return
-    rc, out = run([sys.executable, "-m", "pip", "install", "-q",
-                   "ruff", "pytest", "pyright"])
-    if rc == 0:
-        ok("ruff / pytest / pyright 已安裝")
-    else:
-        warn("安裝失敗(可稍後手動 pip install ruff pytest pyright):"
-             + out.strip()[:200])
-
-
-def print_manual_steps() -> None:
-    step(6, "還需要你手動完成的(腳本不便代勞)")
-    print("  1. codex 登入:執行  codex  依指示用 ChatGPT 登入(或 codex login)")
-    print("  2. Claude Code 用同一個帳號登入")
-    print("  3. git clone 你的專案,並把舊電腦的 settings\\ 資料夾複製進去")
-    print("     (settings/ 含明文帳密、在 .gitignore 內,不會隨 git 過來)")
-    print("  4. 重開 Claude Code 讓 codex MCP 生效")
-    print("\n完成!之後 Claude Code 做完事就能呼叫 codex(GPT-5.5 high)做 diff 審查。")
-
-
-def main() -> int:
-    print("===== 開發環境搬家:Claude Code + Codex(GPT-5.5 high)diff 審查 =====")
-    ensure_codex_cli()
-    ensure_codex_config()
-    register_codex_mcp()
-    ensure_claude_md_rule()
-    ensure_dev_tools()
-    print_manual_steps()
-    return 0
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="開發環境檢查（預設唯讀）；apply 僅建立新的專案 venv。",
+                                     allow_abbrev=False)
+    parser.add_argument("action", nargs="?", choices=("check", "apply"), default="check")
+    parser.add_argument("--venv", default=".venv", help="repo 根目錄的 .venv 或 .venv-名稱")
+    parser.add_argument("--auth", action="store_true", help="唯讀查詢 Claude/Codex 登入狀態，不輸出憑證")
+    args = parser.parse_args(argv)
+    try:
+        environment = _venv_path(args.venv)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.action == "apply" and not apply(environment):
+        return 1
+    rows = check(environment, args.auth)
+    for row in rows:
+        print(f"[{row['status']}] {row['name']}: {row['detail']}")
+    failed = any(row["status"] == "failed" for row in rows)
+    print("[未完成] 請處理 failed 項目後重查。" if failed else
+          "[檢查通過] 僅代表已檢查項目；not_checked／manual、完整 CI 與院內驗收另行處理。")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except Exception as exc:  # noqa: BLE001
-        print(f"\n[錯誤] {exc}")
-        sys.exit(1)
+    raise SystemExit(main())

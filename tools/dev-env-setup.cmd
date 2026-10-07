@@ -1,5 +1,5 @@
 @echo off
-REM Dev-env migration launcher. Double-click on a new machine after syncing the repo.
+REM Default is read-only development check. Use apply explicitly for a project venv.
 REM Runs dev-env-setup.py under UTF-8 so the Chinese console output is not garbled.
 chcp 65001 >nul
 set PYTHONUTF8=1
@@ -11,10 +11,12 @@ if not defined PYEXE (
     python -c "import sys" >nul 2>nul && set "PYEXE=python"
 )
 if not defined PYEXE (
-    echo [ERROR] Python 3 not found. Install Python 3.10+ from https://python.org
+    echo [ERROR] Python not found. Install Python 3.13 for development from https://python.org
     echo         and tick "Add python.exe to PATH" during setup.
     pause
     exit /b 1
 )
 %PYEXE% "%~dp0dev-env-setup.py" %*
+set "RC=%ERRORLEVEL%"
 pause
+exit /b %RC%

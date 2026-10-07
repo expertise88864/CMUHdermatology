@@ -171,7 +171,10 @@ def test_the_gate_cleans_up_its_own_artifacts(ph, monkeypatch, tmp_path):
 
 # ─── 最新定案：緊急理由也不可繞過 ─────────────────────────────────────────
 def test_parse_args_reads_the_commit_message(ph):
-    assert ph.parse_args(["prog", "hello", "world"]) == ("hello world", "")
+    args = ph.parse_args(["prog", "publish", "--committed", "--message", "hello world"])
+    assert args.message == "hello world"
+    with pytest.raises(SystemExit):
+        ph.parse_args(["prog", "hello", "world"])
 
 
 def test_emergency_requires_a_reason(ph):

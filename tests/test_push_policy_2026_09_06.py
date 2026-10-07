@@ -1,5 +1,6 @@
 """Remote-first policy: cheap candidate checks, exact-SHA remote promotion."""
 import importlib.util
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -60,6 +61,10 @@ def pipeline(ph, monkeypatch, tmp_path):
         assert sha == "a" * 40
         events.append("push")
     monkeypatch.setattr(ph, "step6_push", push)
+    @contextmanager
+    def candidate_copy(options, branch):
+        yield {}, lambda: None, lambda: None
+    monkeypatch.setattr(ph, "_candidate_copy", candidate_copy)
 
     def git_bytes(args, stdin=b""):
         if args == ["branch", "--show-current"]:
@@ -75,7 +80,7 @@ def pipeline(ph, monkeypatch, tmp_path):
 
 
 def test_ci_runs_on_final_commit_before_push(ph, pipeline, capsys):
-    assert ph.main(["push", "message"]) == 0
+    assert ph.main(["push", "publish", "--path", "example.py", "--message", "message"]) == 0
     events = pipeline["events"]
     assert events.index("manifest") < events.index("commit") < events.index("gate")
     assert events.index("gate") < events.index("push")
@@ -88,7 +93,7 @@ def test_failed_final_gate_keeps_local_commit_and_never_pushes(ph, pipeline, mon
         raise SystemExit(1)
     monkeypatch.setattr(ph, "step_candidate_gate", fail_gate)
     with pytest.raises(SystemExit):
-        ph.main(["push", "message"])
+        ph.main(["push", "publish", "--path", "example.py", "--message", "message"])
     assert "push" not in pipeline["events"]
 
 
@@ -104,7 +109,7 @@ def test_revision_drift_after_ci_blocks_push(ph, pipeline, monkeypatch, drift):
             }[drift]
     monkeypatch.setattr(ph, "step_candidate_gate", gate)
     with pytest.raises(SystemExit):
-        ph.main(["push", "message"])
+        ph.main(["push", "publish", "--path", "example.py", "--message", "message"])
     assert "push" not in pipeline["events"]
 
 

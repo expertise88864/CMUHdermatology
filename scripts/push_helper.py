@@ -10,7 +10,9 @@
   6. 完整 CI 在候選分支遠端執行；exact-SHA 全綠後才可快轉 main
 
 用法：
-  python scripts/push_helper.py "commit 訊息"
+  python scripts/push_helper.py check
+  python scripts/push_helper.py publish --path scripts/example.py --message-file message.txt
+  發佈在隔離副本內進行，原工作樹、index 及分支不會被升版或提交。
   --emergency 已停用；不可豁免候選與正式 exact-SHA 遠端 CI。
 
 `step_quality_gate` 保留為人工診斷／舊測試可直接呼叫的完整本機檢查，正式
@@ -19,12 +21,15 @@ remote-first 發佈流程不呼叫它；權威流程見 REMOTE_CI_DELIVERY.md。
 from __future__ import annotations
 
 import hashlib
+import argparse
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -33,11 +38,24 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 def run(cmd: list, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
     """執行子命令，輸出直接連到 console。"""
-    print(f"  $ {' '.join(cmd)}")
+    private_remote = cmd[:3] == ["git", "remote", "set-url"]
+    shown = [*cmd[:4], "<remote URL>"] if private_remote else cmd
+    print(f"  $ {' '.join(shown)}")
+    if private_remote:
+        # Git may include the URL in errors; neither arguments nor raw diagnostics
+        # should expose credentials stored in the user's local remote config.
+        cp = subprocess.run(cmd, cwd=REPO_ROOT, check=False, text=True,
+                            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+                            capture_output=True, encoding='utf-8', errors='replace')
+        if check and cp.returncode:
+            raise subprocess.CalledProcessError(cp.returncode, shown)
+        return cp
     if capture:
         return subprocess.run(cmd, cwd=REPO_ROOT, check=check, text=True,
+                              env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
                               capture_output=True, encoding='utf-8', errors='replace')
-    return subprocess.run(cmd, cwd=REPO_ROOT, check=check)
+    return subprocess.run(cmd, cwd=REPO_ROOT, check=check,
+                          env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
 
 
 def fail(msg: str, code: int = 1) -> None:
@@ -203,12 +221,13 @@ def step_quality_gate(emergency_reason: str = "") -> None:
 VERSION_REL = "src/cmuh_common/version.py"
 MANIFEST_REL = "manifest.json"
 # git add -A 會收進來、且值得防還原的範圍
-SCAN_PATHS = ["src", "scripts", "tests", MANIFEST_REL]
+SCAN_PATHS = ["."]  # Include docs, launchers, policy and every explicit candidate file.
 
 
 def _git_bytes(args: list, stdin: bytes = b"") -> bytes:
     cp = subprocess.run(["git", *args], input=stdin, cwd=REPO_ROOT,
-                        capture_output=True, text=False)
+                        capture_output=True, text=False,
+                        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
     if cp.returncode != 0:
         fail(f"git {' '.join(args)} 失敗，為安全起見中止推送。\n"
              f"{cp.stderr.decode('utf-8', 'replace')[:400]}")
@@ -457,7 +476,7 @@ def step5_commit(commit_msg: str, new_version: str,
                  emergency_reason: str = "") -> None:
     print("")
     print("=== [8/9] Commit ===")
-    if not commit_msg or commit_msg.strip() in ("", "1"):
+    if not commit_msg or not commit_msg.strip():
         commit_msg = f"Update v{new_version}"
     if emergency_reason:
         fail("--emergency 已停用：不能建立豁免 CI 的交付 commit。")
@@ -499,12 +518,166 @@ def step6_push(expected_sha: str = "") -> None:
         sys.exit(1)
 
 
-def parse_args(argv: list) -> tuple:
-    """→ (commit_msg, empty legacy argument). Emergency bypass is forbidden."""
-    args = list(argv[1:])
-    if any(arg == "--emergency" or arg.startswith("--emergency=") for arg in args):
-        fail("--emergency 已停用：不得繞過候選／正式 exact-SHA 遠端 CI。")
-    return " ".join(args), ""
+def parse_args(argv: list) -> argparse.Namespace:
+    """Parse the complete contract before reading or changing a repository."""
+    parser = argparse.ArgumentParser(
+        description="安全候選發佈：check 唯讀；publish 使用明確範圍及隔離副本。",
+        allow_abbrev=False,
+        epilog="舊的裸提交訊息／--sanity-only 不支援；請使用 check 或 publish。")
+    commands = parser.add_subparsers(dest="command")
+    commands.add_parser("check", help="唯讀核對安全、index 版本及 manifest 雜湊",
+                        allow_abbrev=False)
+    publish = commands.add_parser("publish", help="準備並推送隔離 codex/* 候選",
+                                  allow_abbrev=False)
+    selection = publish.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--path", action="append", help="精確 repo 相對檔名，可重複")
+    selection.add_argument("--committed", action="store_true", help="只使用目前 HEAD 的內容")
+    publish.add_argument("--source", choices=("index", "worktree"),
+                         help="--path 的內容來源，預設 index；worktree 須明確指定")
+    publish.add_argument("--output", type=Path, help="repo 外部的新目錄，保留候選與復原紀錄")
+    message = publish.add_mutually_exclusive_group(required=True)
+    message.add_argument("--message", help="完整提交訊息（含必要 review trailers）")
+    message.add_argument("--message-file", type=Path, help="UTF-8 提交訊息檔")
+    parsed = parser.parse_args(argv[1:])
+    if parsed.command is None:
+        parser.print_help()
+    elif parsed.command == "publish":
+        if parsed.committed and parsed.source:
+            parser.error("--source 只能搭配 --path")
+        if parsed.message is not None and not parsed.message.strip():
+            parser.error("提交訊息不能為空")
+    return parsed
+
+
+def _selection_paths(paths: list[str]) -> list[str]:
+    """Only literal, individual files; never directories, ignored data or traversal."""
+    result = []
+    for value in paths:
+        rel = value.replace("\\", "/")
+        parts = rel.split("/")
+        if (not rel or Path(rel).is_absolute() or any(p in ("", ".", "..", ".git") for p in parts)
+                or any(c in rel for c in "\n\r\t:*?\0")
+                or rel in (VERSION_REL, MANIFEST_REL)):
+            fail(f"--path 必須是精確 repo 相對檔名，版本／manifest 由工具生成：{value}")
+        path = REPO_ROOT / rel
+        if not path.resolve().is_relative_to(REPO_ROOT.resolve()) or path.is_dir() or path.is_symlink():
+            fail(f"不能選擇目錄、符號連結或 repo 外部路徑：{value}")
+        ignored = run(["git", "check-ignore", "--no-index", "--", rel],
+                      check=False, capture=True)
+        if ignored.returncode != 1:
+            fail(f"不能選擇忽略檔案，或無法確認 ignore 規則：{value}")
+        if rel not in result:
+            result.append(rel)
+    return result
+
+
+def _selection_patch(paths: list[str], source: str) -> bytes:
+    """Export an exact snapshot without writing the user's index."""
+    if source == "index":
+        staged = _git_bytes(["--literal-pathspecs", "ls-files", "--stage", "-z", "--", *paths])
+        entries = [e.split(b"\t", 1)[0].split() for e in staged.split(b"\0") if e]
+        if any(e[2] != b"0" or e[0] not in (b"100644", b"100755") for e in entries):
+            fail("選定 index 有衝突或非一般檔案，已中止。")
+        return _git_bytes(["--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--cached", "--binary",
+                           "--full-index", "--no-renames", "HEAD", "--", *paths])
+    # A separate index starts at HEAD, so unrelated staged changes never enter the patch.
+    with tempfile.TemporaryDirectory(prefix="cmuh_selected_index_") as directory:
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(directory) / "index"),
+               "GIT_OPTIONAL_LOCKS": "0"}
+        for args in (["read-tree", "HEAD"], ["--literal-pathspecs", "add", "-A", "--", *paths]):
+            subprocess.run(["git", *args], cwd=REPO_ROOT, env=env, check=True,
+                           capture_output=True)
+        cp = subprocess.run(["git", "diff", "--no-ext-diff", "--no-textconv", "--cached", "--binary", "--full-index",
+                             "--no-renames", "HEAD"], cwd=REPO_ROOT, env=env,
+                            check=True, capture_output=True)
+        return cp.stdout
+
+
+@contextmanager
+def _candidate_copy(options, branch: str):
+    """Retain a recoverable local clone; never checkout/reset the source worktree."""
+    global REPO_ROOT
+    original = REPO_ROOT
+    head = _git_bytes(["rev-parse", "HEAD"]).decode("ascii").strip()
+    paths = _selection_paths(options.path or [])
+    source = options.source or "index"
+    patch = b"" if options.committed else _selection_patch(paths, source)
+    if not options.committed and not patch:
+        fail("選定範圍沒有相對 HEAD 的變更；index 模式須先暫存指定檔案。")
+    remote = _git_bytes(["remote", "get-url", "origin"]).decode("utf-8").strip()
+    identity = {}
+    for key in ("user.name", "user.email"):
+        cp = run(["git", "config", "--get", key], check=False, capture=True)
+        if cp.returncode == 0:
+            identity[key] = cp.stdout.strip()
+    if options.output:
+        receipt_dir = options.output.resolve()
+        if receipt_dir.is_relative_to(original.resolve()) or original.resolve().is_relative_to(receipt_dir):
+            fail("--output 必須是 repo 外部的新目錄，不能是 repo 的父目錄。")
+        if receipt_dir.exists():
+            fail("--output 已存在，請選擇新的候選目錄；不覆蓋既有內容。")
+        receipt_dir.mkdir(parents=True)
+    else:
+        receipt_dir = Path(tempfile.mkdtemp(prefix="cmuh_release_"))
+    candidate = receipt_dir / "candidate"
+    state = {"branch": branch, "source_sha": head, "phase": "prepare",
+             "source": "committed" if options.committed else source,
+             "paths": paths, "patch_sha256": hashlib.sha256(patch).hexdigest()}
+    print(f"[候選副本] {candidate}\n[復原紀錄] {receipt_dir / 'release.json'}")
+    def record():
+        (receipt_dir / "release.json").write_text(
+            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    record()
+    try:
+        run(["git", "clone", "--no-hardlinks", "--no-checkout", "--local",
+             str(original), str(candidate)])
+        REPO_ROOT = candidate
+        run(["git", "checkout", "-B", branch, head])
+        run(["git", "remote", "set-url", "origin", remote])
+        run(["git", "config", "core.hooksPath", ".githooks"])
+        for key, value in identity.items():
+            run(["git", "config", key, value])
+        if patch:
+            subprocess.run(["git", "apply", "--index", "--binary", "-"],
+                           input=patch, cwd=candidate, check=True, capture_output=True)
+        state["phase"] = "candidate_sanity"
+        record()
+        step1_sanity()
+        state["phase"] = "prepared"
+        record()
+        def verify_source():
+            global REPO_ROOT
+            REPO_ROOT = original
+            try:
+                if _git_bytes(["rev-parse", "HEAD"]).decode("ascii").strip() != head:
+                    fail("來源 HEAD 已改變；候選保留，請重新確認範圍後驗證。")
+                if _git_bytes(["branch", "--show-current"]).decode("utf-8").strip() != branch:
+                    fail("來源分支已改變；候選保留，已中止推送。")
+                if not options.committed and _selection_patch(paths, source) != patch:
+                    fail("選定來源在驗證期間已改變；候選保留，已中止推送。")
+            finally:
+                REPO_ROOT = candidate
+        yield state, record, verify_source
+        state["phase"] = "candidate_pushed_awaiting_remote_ci"
+    except BaseException:
+        state["failed_at"] = state["phase"]
+        state["phase"] = "incomplete"
+        print(f"[未完成] 候選及紀錄保留於 {receipt_dir}；原工作樹未被提交或還原。")
+        raise
+    finally:
+        REPO_ROOT = original
+        record()
+
+
+def _check_metadata() -> None:
+    step1_sanity()
+    ver_blob = _git_bytes(["cat-file", "blob", f":{VERSION_REL}"]).decode("utf-8")
+    match = re.search(r'CURRENT_VERSION\s*=\s*["\']([^"\']+)["\']', ver_blob)
+    if not match:
+        fail("index 版本不可讀")
+    verify_staged_version_consistency(match.group(1))
+    verify_staged_manifest_hashes()
+    print("[通過] 唯讀 metadata 檢查；不代表 review、本機完整 CI 或遠端 CI 通過。")
 
 
 def verify_clean_revision(expected_sha: str) -> None:
@@ -524,7 +697,23 @@ def step_candidate_gate(emergency_reason: str = "") -> None:
 
 
 def main(argv: list) -> int:
-    commit_msg, emergency_reason = parse_args(argv)
+    options = parse_args(argv)
+    if options.command is None:
+        return 0
+    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        if os.environ.get(key):
+            fail(f"偵測到 {key}，請在明確工作副本中執行，避免讀寫另一個 repository。")
+    if options.command == "check":
+        _check_metadata()
+        return 0
+    try:
+        commit_msg = (options.message_file.read_text(encoding="utf-8-sig")
+                      if options.message_file else options.message)
+    except (OSError, UnicodeError):
+        fail("提交訊息檔不可讀，須為 UTF-8；尚未準備候選。")
+    if not commit_msg or not commit_msg.strip() or "\0" in commit_msg:
+        fail("提交訊息不能為空或含 NUL；尚未準備候選。")
+    emergency_reason = ""
     branch = _git_bytes(["branch", "--show-current"]).decode("utf-8").strip()
     if not branch.startswith("codex/"):
         fail("遠端 CI 流程：請先建立 codex/* 候選分支，不直接修改／推送 main。")
@@ -538,34 +727,47 @@ def main(argv: list) -> int:
         fail(f"請在 repo 根目錄執行（目前: {REPO_ROOT}）")
 
     step1_sanity()
-    if not step2_check_changes():
-        return 0
+    with _candidate_copy(options, branch) as (state, record, verify_source):
+        # Every mutation below targets only the selected, retained candidate copy.
+        state["phase"] = "generate"
+        record()
     # 先保存使用者欲交付的來源，再生成版本/manifest 與核對 index。
     # 完整 CI 在 commit 之後執行，不能沿用 bump 之前的測試結果。
-    fingerprint = snapshot_tracked_sources()
-    new_ver = step3_bump_version()
-    step4_sync_manifest(new_ver)
+        fingerprint = snapshot_tracked_sources()
+        new_ver = step3_bump_version()
+        step4_sync_manifest(new_ver)
     # bump/sync_manifest 合法改寫 version.py 與 manifest.json → 取它們【當下】的內容
     # 當作預期值,一併納入 index 比對。★不可像原本那樣永久排除 version.py★:
     # 若 bump 後被還原,commit 進去的是舊 CURRENT_VERSION、manifest 卻記著新版本與
     # 新雜湊 → 所有機器下載後 SHA256 對不上、更新 fail-closed 全面停更。
-    expected = dict(fingerprint)
-    expected.update({k: v for k, v in worktree_blob_ids(include_version=True).items()
+        expected = dict(fingerprint)
+        expected.update({k: v for k, v in worktree_blob_ids(include_version=True).items()
                      if k in (VERSION_REL, MANIFEST_REL)})
-    step5_stage()
-    verify_index_matches(expected)
-    verify_staged_version_consistency(new_ver)
-    verify_staged_manifest_hashes()
-    step5_commit(commit_msg, new_ver, emergency_reason)
-    final_sha = _git_bytes(["rev-parse", "HEAD"]).decode("ascii").strip()
-    verify_clean_revision(final_sha)
+        state["phase"] = "stage_candidate"
+        record()
+        step5_stage()
+        state["phase"] = "verify_candidate_index"
+        record()
+        verify_index_matches(expected)
+        verify_staged_version_consistency(new_ver)
+        verify_staged_manifest_hashes()
+        state["phase"] = "commit"
+        record()
+        step5_commit(commit_msg, new_ver, emergency_reason)
+        final_sha = _git_bytes(["rev-parse", "HEAD"]).decode("ascii").strip()
+        state.update(sha=final_sha, version=new_ver, phase="local_candidate_checks")
+        record()
+        verify_clean_revision(final_sha)
     # Full CI now runs on the candidate in GitHub. Keep cheap local bug checks.
-    step_candidate_gate(emergency_reason)
-    verify_index_matches(expected)
-    verify_staged_version_consistency(new_ver)
-    verify_staged_manifest_hashes()
-    verify_clean_revision(final_sha)
-    step6_push(final_sha)
+        step_candidate_gate(emergency_reason)
+        verify_index_matches(expected)
+        verify_staged_version_consistency(new_ver)
+        verify_staged_manifest_hashes()
+        verify_clean_revision(final_sha)
+        verify_source()
+        state["phase"] = "push_candidate"
+        record()
+        step6_push(final_sha)
 
     print("\n" + "=" * 60)
     print(f"  已推送 v{new_ver}，SHA {final_sha}；尚待 GitHub CI 全綠核對。")

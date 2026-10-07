@@ -1,8 +1,9 @@
 @echo off
 REM =============================================================================
 REM push.bat - 一鍵推送（核心邏輯在 scripts\push_helper.py，避免 BAT 在 UTF-8 環境下解析雷）
-REM 用法：push.bat [commit message]
-REM 範例：push.bat "修正 F11 在 1280x1024 偶發失效"
+REM Usage: push.bat check
+REM Publish: push.bat publish --path scripts/example.py --message-file message.txt
+REM No arguments show help. Legacy positional commit messages are rejected.
 REM =============================================================================
 cd /d "%~dp0"
 

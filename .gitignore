@@ -10,6 +10,8 @@ __pycache__/
 *.log
 *.log.*
 .ruff_cache/
+.venv/
+.venv-*/
 .wdm/
 .pytest_cache/
 
