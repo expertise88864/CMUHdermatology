@@ -245,5 +245,5 @@ with tempfile.TemporaryDirectory(prefix='cmuh_offline_perf_') as temp_dir, ExitS
             logging.getLogger().removeHandler(handler)
             handler.close()
     assert not blocked and not thread_errors and not callback_errors
-    result['status'] = 'completed'
-    args.output.write_text(json.dumps(result, indent=2), encoding='utf-8')
+result['status'] = 'completed'
+args.output.write_text(json.dumps(result, indent=2), encoding='utf-8')

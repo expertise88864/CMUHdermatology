@@ -92,6 +92,67 @@ assert not any(key in os.environ for key in (
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize("failure", ["none", "body", "cleanup"])
+def test_runtime_probe_only_completes_after_cleanup(tmp_path, failure):
+    output = tmp_path / "runtime-result.json"
+    output.write_text('{"status":"completed"}', encoding="utf-8")
+    # Execute the real report/TemporaryDirectory boundary, substituting the UI
+    # work only. No application import, Tk window or actual HIS is needed.
+    driver = r'''
+import ast, sys, tempfile
+from pathlib import Path
+from unittest.mock import patch
+script, source, output, failure = sys.argv[1:]
+tree = ast.parse(Path(script).read_text(encoding="utf-8"))
+outer = next(node for node in tree.body if isinstance(node, ast.With))
+first_work = next(i for i, node in enumerate(outer.body)
+                  if isinstance(node, ast.ImportFrom) and node.module == "cmuh_common")
+last_check = max(i for i, node in enumerate(outer.body) if isinstance(node, ast.Assert))
+# Replace only application/UI work. Keep the actual report writes, their
+# indentation and both context managers, including real temporary cleanup.
+outer.body[first_work:last_check] = ast.parse("substitute_work()").body
+ast.fix_missing_locations(tree)
+entered, cleaned = [], []
+original = tempfile.TemporaryDirectory
+
+class ControlledDirectory(original):
+    def __exit__(self, *args):
+        result = super().__exit__(*args)
+        assert not Path(self.name).exists()
+        cleaned.append(True)
+        if failure == "cleanup":
+            raise PermissionError("synthetic cleanup failure")
+        return result
+
+def substitute_work():
+    entered.append(True)
+    if failure == "body":
+        raise RuntimeError("synthetic body failure")
+
+sys.argv = [script, "--root", source, "--cycles", "1", "--missing-icon", "--output", output]
+with patch.object(tempfile, "TemporaryDirectory", ControlledDirectory):
+    try:
+        exec(compile(tree, script, "exec"), {
+            "__file__": script, "__name__": "__main__", "substitute_work": substitute_work})
+    finally:
+        assert entered == [True] and cleaned == [True]
+'''
+    result = subprocess.run(
+        [sys.executable, "-X", "utf8", "-c", driver,
+         str(ROOT / "scripts" / "benchmark_runtime_offline.py"),
+         str(ROOT), str(output), failure],
+        capture_output=True, text=True, encoding="utf-8", timeout=15,
+    )
+    report = json.loads(output.read_text(encoding="utf-8"))
+    if failure == "none":
+        assert result.returncode == 0, result.stderr
+        assert report["status"] == "completed"
+    else:
+        assert result.returncode != 0
+        assert f"synthetic {failure} failure" in result.stderr
+        assert report["status"] == "running"
+
+
 @pytest.mark.parametrize("probe", ["benchmark_runtime_offline.py", "soak_outpatient_refresh.py"])
 @pytest.mark.parametrize("caps", [PARENT_CAP_BOOTSTRAPPING,
                                  f"{PARENT_CAP_BOOTSTRAPPING} {PARENT_CAP_REPAIR_ONLY}"])
