@@ -109,6 +109,8 @@ def test_concurrent_suspensions_keep_the_longest_deadline(tmp_path, monkeypatch)
 
 
 def test_busy_suspension_writer_does_not_touch_the_flag(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
     import pytest
 
     monkeypatch.setattr(update_policy, "get_settings_dir", lambda: str(tmp_path))
@@ -116,7 +118,9 @@ def test_busy_suspension_writer_does_not_touch_the_flag(tmp_path, monkeypatch):
     original = path.read_bytes()
     monkeypatch.setattr(update_policy, "acquire", lambda path: None)
     ticks = iter([0.0, 3.0])
-    monkeypatch.setattr(update_policy.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(update_policy, "time", SimpleNamespace(
+        monotonic=lambda: next(ticks), sleep=update_policy.time.sleep, time=update_policy.time.time,
+    ))
     with pytest.raises(TimeoutError):
         update_policy.suspend_auto_updates("watchdog", now=1001)
     assert path.read_bytes() == original
