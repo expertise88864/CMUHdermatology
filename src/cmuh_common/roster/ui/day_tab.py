@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import importlib.util
+import copy
 import logging
 import os
 import re
@@ -1085,6 +1086,14 @@ class DayScheduleTab(ttk.Frame):
             logging.debug("[roster.ui] holidays_set 讀取失敗（假日標記略過）",
                           exc_info=True)
             holidays = set()
+        # Locks and validation still refresh above; calendar menus read their
+        # current lock state when opened. Reuse only an identical visual state.
+        render_key = (ym, day_slots, frozenset(holidays), date.today(),
+                      self._finalized, float(self.tk.call("tk", "scaling")))
+        if getattr(self, "_calendar_render_key", None) == render_key:
+            return
+        # A failed partial rebuild must not reuse the last successful key.
+        self._calendar_render_key = None
         body = self._cal_body
         for w in body.winfo_children():
             w.destroy()
@@ -1118,6 +1127,8 @@ class DayScheduleTab(ttk.Frame):
         for c in range(7):
             # uniform＝七欄等寬（原本依內容伸縮,忙碌日把整欄撐寬、週末縮成細條）
             body.columnconfigure(c, weight=1, minsize=172, uniform="dcal")
+        # The caller may later mutate the same nested day_slots dictionary.
+        self._calendar_render_key = copy.deepcopy(render_key)
 
     def _on_export(self) -> None:
         """[RS-01] 匯出整月班表（R/VS 月曆 + PGY/Clerk 日排班）。副檔名決定 Excel/Word；
