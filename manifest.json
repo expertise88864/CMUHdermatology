@@ -758,7 +758,7 @@
       "remote_path": "src/cmuh_common/roster/ui/doctor_follow.py",
       "local_filename": "src/cmuh_common/roster/ui/doctor_follow.py",
       "version": "2026.10.11.1",
-      "sha256": "9aef428dbb071cc95ace229db62f951126353d493112e182bf1567f81309aad6"
+      "sha256": "f18066d4e5421890ac3bf5399d502652147cee914fab60e42fb12c41668c1238"
     },
     {
       "key": "cmuh_common.roster.ui.duty",

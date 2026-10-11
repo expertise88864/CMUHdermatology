@@ -17,8 +17,8 @@ class DoctorFollowStats(ttk.Frame):
         self.service, self.app = service, app
         self._rows = ()
         self._visible = {}
-        self._doctor_names = {}
-        self._courses = {"全部梯次／月份": None}
+        self._doctor_names: dict[str, str | None] = {}
+        self._courses: dict[str, tuple[str, str] | None] = {"全部梯次／月份": None}
         self._person = None
         self._ym = None
 

@@ -210,19 +210,23 @@ def test_statistics_viewport(tk_root, service, width, height):
         tab._show_doctor_stats()
         tk_root.update()
         page = tab._doctor_stats
-        assert page._summary.winfo_width() > width - 70
+        # Window managers can clamp the requested size to the CI desktop.
+        actual_width, actual_height = tk_root.winfo_width(), tk_root.winfo_height()
+        assert actual_width >= min(width, tk_root.winfo_screenwidth() - 32)
+        assert page._summary.winfo_width() > actual_width - 70
         assert page._ranks.winfo_width() >= 200
         assert page._visits.winfo_width() >= 300
         assert page._summary.winfo_height() >= 100
         assert page._visits.winfo_height() >= 80
         assert page._visits.winfo_rooty() > page._summary.winfo_rooty()
-        assert page._course_box.winfo_rootx() + page._course_box.winfo_width() < width
+        assert (page._course_box.winfo_rootx() + page._course_box.winfo_width()
+                < tk_root.winfo_rootx() + actual_width)
         if directory := os.environ.get("CMUH_TEST_SCREENSHOTS"):
             from PIL import ImageGrab
             target = Path(directory)
             target.mkdir(parents=True, exist_ok=True)
             x, y = tk_root.winfo_rootx(), tk_root.winfo_rooty()
-            ImageGrab.grab(bbox=(x, y, x + width, y + height)).save(
+            ImageGrab.grab(bbox=(x, y, x + actual_width, y + actual_height)).save(
                 target / f"doctor-follow-{width}.png")
     finally:
         tab.destroy()

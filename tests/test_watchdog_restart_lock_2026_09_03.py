@@ -20,6 +20,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -439,6 +440,15 @@ def test_history_unsaved_skips_this_tick_and_releases_the_action_lock(tmp_path, 
 def test_a_transient_lock_open_error_is_retried_not_failed_open(monkeypatch, caplog):
     real_open = os.open
     seen = {"n": 0}
+    clock = {"now": 100.0}
+
+    def advance(seconds):
+        clock["now"] += seconds
+
+    # This tests retry semantics, not whether a busy CI runner responds in 50ms.
+    monkeypatch.setattr(wc, "time", SimpleNamespace(
+        monotonic=lambda: clock["now"], sleep=advance, time=time.time,
+        strftime=time.strftime, localtime=time.localtime))
 
     def _flaky(path, *a, **k):
         if str(path).endswith(".lock"):
@@ -451,6 +461,7 @@ def test_a_transient_lock_open_error_is_retried_not_failed_open(monkeypatch, cap
     with caplog.at_level(logging.WARNING):
         assert _authorize_restart("x") == RESTART_AUTH_OK
     assert seen["n"] >= 2, "第一次失敗要重試,不是放棄"
+    assert clock["now"] == pytest.approx(100.02)
     assert wc._LOCK_DEGRADED_WARNED[0] is False, "暫時性錯誤不可以被當成持續狀況 fail-open"
     assert not any("建不出來" in r.getMessage() for r in caplog.records)
     assert not Path(wc._restart_history_path() + ".lock").exists()
