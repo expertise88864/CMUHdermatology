@@ -19,6 +19,14 @@ DAY_EXPLANATION_HEADING = "【實際班表統計與公平性】"
 
 
 @dataclass(frozen=True)
+class FollowVisit:
+    day: date
+    session: str
+    room: str
+    doctor: str
+
+
+@dataclass(frozen=True)
 class PGYCourseRow:
     code: str
     photo: int
@@ -34,6 +42,7 @@ class PGYCourseRow:
     weekly_follows: tuple[tuple[str, int], ...]
     known_doctors: tuple[tuple[str, int], ...]
     unknown_doctor_follows: int
+    visits: tuple[FollowVisit, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -53,6 +62,7 @@ class TrainingCourseRow:
     unknown_doctor_follows: int
     rest: int
     biopsy_by_half: tuple[int, int]
+    visits: tuple[FollowVisit, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -82,10 +92,12 @@ def _nonnegative_targets(totals: dict[str, int],
 
 def _follow_details(slots: dict[str, Any], code: str, *, start: date, end: date,
                     doctors: dict) -> tuple[tuple[tuple[str, int], ...],
-                                           tuple[tuple[str, int], ...], int]:
+                                           tuple[tuple[str, int], ...], int,
+                                           tuple[FollowVisit, ...]]:
     weeks: Counter = Counter()
     seen_doctors: Counter = Counter()
     unknown = 0
+    visits = []
     for iso, sessions in (slots or {}).items():
         try:
             d = date.fromisoformat(iso)
@@ -102,11 +114,14 @@ def _follow_details(slots: dict[str, Any], code: str, *, start: date, end: date,
                 year, week, _ = d.isocalendar()
                 weeks[f"{year}-W{week:02d}"] += 1
                 doctor = doctors.get(d, {}).get(session, {}).get(room, "")
+                visits.append(FollowVisit(d, session, room, doctor))
                 if doctor:
                     seen_doctors[doctor] += 1
                 else:
                     unknown += 1
-    return tuple(sorted(weeks.items())), tuple(sorted(seen_doctors.items())), unknown
+    visits.sort(key=lambda v: (v.day, STUDENT_SESSIONS.index(v.session), v.room))
+    return (tuple(sorted(weeks.items())), tuple(sorted(seen_doctors.items())),
+            unknown, tuple(visits))
 
 
 def explain_day_courses(inp: DaySolveInput, data: dict[str, Any],
@@ -129,12 +144,12 @@ def explain_day_courses(inp: DaySolveInput, data: dict[str, Any],
         photo, wed, tx, follow = (st.get(k, 0) for k in
                                   ("photo", "photo_wed_pm", "tx", "follow"))
         target = targets[p]
-        weeks, doctors, unknown = _follow_details(
+        weeks, doctors, unknown, visits = _follow_details(
             current_slots, p, start=first, end=last, doctors=inp.clinic_doctors)
         row = PGYCourseRow(p, photo, wed, tx, follow, photo + tx,
                            totals[p], offsets.get(p, 0), target,
                            Fraction(totals[p]) - target, st.get("rest", 0),
-                           weeks, doctors, unknown)
+                           weeks, doctors, unknown, visits)
         pgy_rows.append(row)
         if abs(row.difference) > 1:
             difference = f"+{row.difference}" if row.difference > 0 else str(row.difference)
@@ -153,7 +168,7 @@ def explain_day_courses(inp: DaySolveInput, data: dict[str, Any],
             st = stats.get(p, {})
             low, target, high = ((9, 10, 11) if scope == "Clerk"
                                  else band(len(available[p])))
-            weeks, doctors, unknown = _follow_details(
+            weeks, doctors, unknown, visits = _follow_details(
                 slots, p, start=start, end=end, doctors=inp.clinic_doctors)
             biopsy_by_half = [0, 0]
             for iso, sessions in (slots or {}).items():
@@ -169,7 +184,7 @@ def explain_day_courses(inp: DaySolveInput, data: dict[str, Any],
             row = TrainingCourseRow(
                 scope, course, p, complete, len(available[p]), low, target, high,
                 st.get("follow", 0), st.get("biopsy", 0), weeks, doctors, unknown,
-                st.get("rest", 0), (biopsy_by_half[0], biopsy_by_half[1]))
+                st.get("rest", 0), (biopsy_by_half[0], biopsy_by_half[1]), visits)
             training.append(row)
             if row.follow < low and complete:
                 gaps.append(f"{scope} {p} 跟診 {row.follow}/{low}，低於最低需求")

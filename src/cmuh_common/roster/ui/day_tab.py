@@ -40,6 +40,7 @@ from cmuh_common.roster.ui.common import (
     guard_write,
 )
 from cmuh_common.roster.ui.duty import LeaveEditor
+from cmuh_common.roster.ui.doctor_follow import DoctorFollowStats
 
 _WD = "一二三四五六日"
 _TITLE = "PGY / Clerk / 外訓 / 家醫科 排班"
@@ -134,6 +135,8 @@ class DayScheduleTab(ttk.Frame):
         self._build_toolbar()
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True)
+        self._schedule_body = body
+        self._doctor_stats = None
         self._build_grid(body)
         self._build_side(body)
         self._status = StatusBar(self)
@@ -197,6 +200,31 @@ class DayScheduleTab(ttk.Frame):
             self._edit_btns.append(b)
         ttk.Label(bar3, text="跟診優先：Clerk ＞ 家醫科 ＞ 外訓 ＞ PGY；Clerk 9–11 診、1–2 切片",
                   foreground="gray").pack(side="left", padx=8)
+
+        bar4 = ttk.Frame(self, padding=(6, 3))
+        bar4.pack(fill="x")
+        self._page_var = tk.StringVar(value="schedule")
+        self._doctor_tab = ttk.Radiobutton(
+            bar4, text="醫師跟診統計", variable=self._page_var, value="doctors",
+            style="Toolbutton", command=self._show_doctor_stats)
+        self._doctor_tab.pack(side="left", padx=4)
+
+    def _show_doctor_stats(self) -> None:
+        if self._doctor_stats is None:
+            self._doctor_stats = DoctorFollowStats(
+                self, self.service, self.app, on_back=self._show_schedule)
+        self._page_var.set("doctors")
+        self._schedule_body.pack_forget()
+        self._doctor_stats.pack(fill="both", expand=True, before=self._status)
+        self._apply_finalized_state()
+        self._doctor_stats.refresh()
+
+    def _show_schedule(self) -> None:
+        if self._doctor_stats is not None:
+            self._doctor_stats.pack_forget()
+        self._page_var.set("schedule")
+        self._schedule_body.pack(fill="both", expand=True, before=self._status)
+        self._apply_finalized_state()
 
     def _build_grid(self, parent) -> None:
         """中央區＝兩個可切換檢視：月曆總覽（預設；2026-07-23 使用者：比較少看列表）
@@ -263,6 +291,7 @@ class DayScheduleTab(ttk.Frame):
         self._view_mode = mode
 
     def _on_toggle_view(self) -> None:
+        self._show_schedule()
         self._show_view("list" if self._view_mode == "cal" else "cal")
 
     def _build_side(self, parent) -> None:
@@ -321,6 +350,9 @@ class DayScheduleTab(ttk.Frame):
 
     # ── 資料 → 畫面 ──────────────────────────────────────────────────────
     def refresh(self) -> None:
+        if self._page_var.get() == "doctors" and self._doctor_stats is not None:
+            # Invalidate visible statistics even if the subsequent calendar read fails.
+            self._doctor_stats.refresh()
         ym = self.app.ym
         month = self.service.storage.load_month(ym)
         self._finalized = bool(month.get("finalized"))
@@ -1208,6 +1240,8 @@ class DayScheduleTab(ttk.Frame):
             w.config(state=state)
         if self._day_solving:
             self._auto_btn.config(state="disabled")
+        if self._page_var.get() == "doctors":
+            self._lock_btn.config(state="disabled")
 
 
 def _prompt_codes(parent, title, initial) -> "str | None":
