@@ -9,10 +9,11 @@ from tkinter import ttk
 from tkinter import font as tkfont
 
 from ..doctor_follow import doctor_follow_rows
+from .common import MonthSelector
 
 
 class DoctorFollowStats(ttk.Frame):
-    def __init__(self, master, service, app, *, on_back):
+    def __init__(self, master, service, app, *, on_back, on_month_change=None):
         super().__init__(master)
         self.service, self.app = service, app
         self._rows = ()
@@ -21,6 +22,7 @@ class DoctorFollowStats(ttk.Frame):
         self._courses: dict[str, tuple[str, str] | None] = {"全部梯次／月份": None}
         self._person = None
         self._ym = None
+        self._on_month_change = on_month_change
 
         bar = ttk.Frame(self, padding=6)
         bar.pack(fill="x")
@@ -38,6 +40,11 @@ class DoctorFollowStats(ttk.Frame):
         self._course_box.pack(side="left", padx=4)
         self._course_box.bind("<<ComboboxSelected>>", self._render_summary)
         ttk.Button(bar, text="重新整理", command=self.refresh).pack(side="right")
+        month_bar = ttk.Frame(self, padding=(6, 2))
+        month_bar.pack(fill="x")
+        ttk.Label(month_bar, text="統計月份").pack(side="left", padx=(0, 8))
+        self._month_selector = MonthSelector(month_bar, self.app.ym, self._change_month)
+        self._month_selector.pack(side="left")
         self._status = ttk.Label(self, anchor="w", padding=(6, 2))
         self._status.pack(fill="x")
 
@@ -97,9 +104,17 @@ class DoctorFollowStats(ttk.Frame):
         if children:
             tree.delete(*children)
 
+    def _change_month(self, ym):
+        if self._on_month_change is not None:
+            self._on_month_change(ym)
+        else:
+            self.app.ym = ym
+            self.refresh()
+
     def refresh(self):
         previous = self._person.identity if self._person and self._ym == self.app.ym else None
         self._ym = self.app.ym
+        self._month_selector.set_ym(self.app.ym)
         try:
             data = self.service.day_current_course_stats(self.app.ym)
             self._rows = doctor_follow_rows(data, self.app.ym)

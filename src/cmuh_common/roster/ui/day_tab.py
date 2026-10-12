@@ -204,15 +204,18 @@ class DayScheduleTab(ttk.Frame):
         bar4 = ttk.Frame(self, padding=(6, 3))
         bar4.pack(fill="x")
         self._page_var = tk.StringVar(value="schedule")
-        self._doctor_tab = ttk.Radiobutton(
-            bar4, text="醫師跟診統計", variable=self._page_var, value="doctors",
-            style="Toolbutton", command=self._show_doctor_stats)
+        ttk.Style(self).configure(
+            "DoctorStats.TButton", font=(_OVR_FONT, 11, "bold"), padding=(12, 6))
+        self._doctor_tab = ttk.Button(
+            bar4, text="個人跟診醫師與次數",
+            style="DoctorStats.TButton", command=self._show_doctor_stats)
         self._doctor_tab.pack(side="left", padx=4)
 
     def _show_doctor_stats(self) -> None:
         if self._doctor_stats is None:
             self._doctor_stats = DoctorFollowStats(
-                self, self.service, self.app, on_back=self._show_schedule)
+                self, self.service, self.app, on_back=self._show_schedule,
+                on_month_change=self._on_month_change)
         self._page_var.set("doctors")
         self._schedule_body.pack_forget()
         self._doctor_stats.pack(fill="both", expand=True, before=self._status)
@@ -487,6 +490,7 @@ class DayScheduleTab(ttk.Frame):
         if ym != self.app.ym:
             self._cancel_day_solve("月份已切換")
         self.app.ym = ym
+        self._selector.set_ym(ym)
         self.refresh()
 
     def on_shown(self) -> None:

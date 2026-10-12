@@ -176,7 +176,9 @@ def test_day_toolbar_fourth_row_navigation_and_refresh(tk_root, service):
         toolbar = tab._doctor_tab.master
         assert tab.winfo_children().index(toolbar) == 3
         assert toolbar.winfo_children() == [tab._doctor_tab]
-        assert tab._doctor_tab.cget("text") == "醫師跟診統計"
+        assert tab._doctor_tab.cget("text") == "個人跟診醫師與次數"
+        assert tab._doctor_tab.winfo_class() == "TButton"
+        assert tab._doctor_tab.winfo_reqheight() >= tab._auto_btn.winfo_reqheight()
         assert tab._doctor_stats is None
         tab._doctor_tab.invoke()
         tk_root.update()
@@ -201,6 +203,64 @@ def test_day_toolbar_fourth_row_navigation_and_refresh(tk_root, service):
         tab.destroy()
 
 
+def test_statistics_month_navigation_stays_on_page_and_syncs_calendar(tk_root, service, monkeypatch):
+    app = SimpleNamespace(ym="2026-10")
+    tab = DayScheduleTab(tk_root, service, app)
+    tab.pack(fill="both", expand=True)
+    try:
+        tab._show_doctor_stats()
+        page = tab._doctor_stats
+        page._month_selector._prev_btn.invoke()
+        tk_root.update()
+        assert app.ym == tab._selector.ym == page._month_selector.ym == page._ym == "2026-09"
+        assert page.winfo_ismapped()
+        assert tab._page_var.get() == "doctors"
+        assert page._person.course == "B1"
+        assert page._person.follow == 5  # Includes the October half of the course.
+        page._month_selector._next_btn.invoke()
+        assert app.ym == "2026-10"
+        tab._on_month_change("2027-01")
+        page._month_selector._prev_btn.invoke()
+        assert app.ym == tab._selector.ym == "2026-12"
+        page._month_selector._next_btn.invoke()
+        assert app.ym == "2027-01"
+        tab._show_schedule()
+        assert tab._selector.ym == "2027-01"
+        tab._show_doctor_stats()
+        assert page._month_selector.ym == "2027-01"
+        cancelled = []
+        monkeypatch.setattr(tab, "_cancel_day_solve", lambda reason: cancelled.append(reason))
+        page._month_selector._prev_btn.invoke()
+        assert cancelled == ["月份已切換"]
+    finally:
+        tab.destroy()
+
+
+def test_statistics_month_controls_still_work_after_failed_read(tk_root, service, monkeypatch):
+    app = SimpleNamespace(ym="2026-10")
+    page = DoctorFollowStats(tk_root, service, app, on_back=lambda: None)
+    page.pack(fill="both", expand=True)
+    original = service.day_current_course_stats
+
+    def read(ym):
+        if ym == "2026-09":
+            raise ValueError("unreadable month")
+        return original(ym)
+
+    try:
+        page.refresh()
+        monkeypatch.setattr(service, "day_current_course_stats", read)
+        page._month_selector._prev_btn.invoke()
+        assert app.ym == page._month_selector.ym == page._ym == "2026-09"
+        assert not page._summary.get_children()
+        assert "讀取失敗" in page._status.cget("text")
+        page._month_selector._next_btn.invoke()
+        assert app.ym == "2026-10"
+        assert page._person.follow == 5
+    finally:
+        page.destroy()
+
+
 @pytest.mark.parametrize("width,height", [(1280, 850), (1000, 700)])
 def test_statistics_viewport(tk_root, service, width, height):
     tk_root.geometry(f"{width}x{height}+0+0")
@@ -212,6 +272,8 @@ def test_statistics_viewport(tk_root, service, width, height):
         page = tab._doctor_stats
         # Window managers can clamp the requested size to the CI desktop.
         actual_width, actual_height = tk_root.winfo_width(), tk_root.winfo_height()
+        assert tab._doctor_tab.winfo_width() == tab._doctor_tab.winfo_reqwidth()
+        assert tab._doctor_tab.winfo_height() >= tab._auto_btn.winfo_height()
         assert actual_width >= min(width, tk_root.winfo_screenwidth() - 32)
         assert page._summary.winfo_width() > actual_width - 70
         assert page._ranks.winfo_width() >= 200
