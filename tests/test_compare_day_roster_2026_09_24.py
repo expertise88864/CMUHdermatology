@@ -18,6 +18,7 @@ from cmuh_common.roster.course_balance import _use_priority_hints
 from cmuh_common.roster.model import ClerkBatch
 from cmuh_common.roster import pgy_balance
 from cmuh_common.roster.solve_day import month_solve_day
+from cmuh_common.roster.training_params import TrainingParams
 
 
 def _paired_reports():
@@ -376,11 +377,14 @@ def test_manual_photo_reduction_reduces_actual_monthly_pgy_work():
         assert not _hard_checks(inp, slots)
         quality = _quality(inp, slots)
         counts = quality["sample_month_person_counts"]["P1"]
-        assert all(n >= 1 for n in quality["weekly_follows"]["P1"].values())
+        assert all(inp.training.pgy_low <= n <= inp.training.pgy_high
+                   for n in quality["weekly_follows"]["P1"].values())
         assert not any("P1 總工作量減量目標未達" in w for w in warnings)
         results[offset] = counts
 
-    assert [results[offset]["total"] for offset in (0, -1, -2)] == [38, 37, 36]
+    # Five weeks capped at two follows, plus twenty necessary duties.
+    assert [results[offset]["follow"] for offset in (0, -1, -2)] == [10, 10, 10]
+    assert [results[offset]["total"] for offset in (0, -1, -2)] == [30, 29, 28]
     assert [results[offset]["photo"] for offset in (0, -1, -2)] == [10, 9, 9]
     assert [results[offset]["tx"] for offset in (0, -1, -2)] == [10, 10, 9]
 
@@ -405,6 +409,7 @@ def test_manual_pgy_reduction_preserves_higher_priority_trainees():
 def test_manual_reduction_keeps_apply_seat_and_distinct_doctors(monkeypatch):
     wednesday, tuesday = date(2026, 10, 7), date(2026, 10, 6)
     inp = SimpleNamespace(
+        training=TrainingParams(),
         ym="2026-10", pgy_photo_offsets={"P1": -1},
         grid={wednesday, tuesday}, locked={}, leaves={}, session_leaves={},
         apply_pref={"P1"},
@@ -469,6 +474,7 @@ def test_manual_reduction_keeps_apply_seat_and_distinct_doctors(monkeypatch):
 def test_manual_reduction_keeps_locked_leave_and_weekly_minimum(monkeypatch):
     monday, tuesday = date(2026, 10, 5), date(2026, 10, 6)
     inp = SimpleNamespace(
+        training=TrainingParams(),
         ym="2026-10", pgy_photo_offsets={"P1": -1},
         grid={monday, tuesday},
         locked={monday.isoformat(): {"上午": True, "下午": True}},
@@ -502,6 +508,7 @@ def test_manual_reduction_keeps_locked_leave_and_weekly_minimum(monkeypatch):
 def test_manual_reduction_excludes_biopsy_from_total_target(monkeypatch):
     tuesday, wednesday, thursday = (date(2026, 10, day) for day in (6, 7, 8))
     inp = SimpleNamespace(
+        training=TrainingParams(),
         ym="2026-10", pgy_photo_offsets={"P1": -1},
         grid={tuesday, wednesday, thursday}, locked={}, leaves={},
         session_leaves={}, apply_pref=set(), clinic_doctors={},

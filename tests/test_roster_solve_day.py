@@ -455,7 +455,8 @@ def test_rf09_cross_month_missed_warning_excludes_prior():
         prior_sessions={"2026-07-30": {"上午": {BIOPSY: ["1"]}}})
     _ds, _log, warnings = month_solve_day(inp)
     missed = [w for w in warnings if "切片室輪不到" in w]
-    assert missed and "2" in missed[0] and "1" not in missed[0]
+    assert len(missed) == 1
+    assert missed[0].rsplit("：", 1)[1].split("、") == ["2"]
 
 
 def test_rf10_replay_counters_skips_unknown_codes():
