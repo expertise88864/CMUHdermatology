@@ -8,7 +8,7 @@ change medical content, visual baselines, credentials, recipients or scoring.
 1. Fetch main. Preserve other work. Use an isolated codex/* branch based on current main.
 2. Make task-owned changes; run relevant local regression tests, syntax/lint and
    required generators. Commit the exact source and generated artifacts together.
-3. Complete existing independent Codex review and Claude Opus 5/high read-only review.
+3. Complete existing independent Codex review and Claude Opus 5.5/high read-only review.
    Only confirmed provider quota exhaustion permits pending trailers and scheduled retry.
 4. Install the tracked pre-push hook with the documented existing hook mechanism.
 5. Push the exact SHA to codex/* normally. The hook runs the offline delivery tests.
