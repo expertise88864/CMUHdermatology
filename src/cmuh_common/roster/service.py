@@ -2009,6 +2009,28 @@ class RosterService:
             return current
         return self.update_config(mutate)
 
+    def repair_training_params(self, values: dict, *, baseline) -> dict:
+        """Explicitly replace invalid rules, preserving and validating all other data."""
+        from .storage import validate_authoritative_shape
+        from .training_params import TrainingParams, TrainingParamsError
+        desired = TrainingParams.from_config({"training_params": values}).to_dict()
+        try:
+            TrainingParams.from_config({"training_params": baseline})
+        except TrainingParamsError:
+            pass
+        else:
+            raise ValueError("有效參數請使用一般儲存，不可走修復流程")
+        with self.storage.write_barrier():
+            # Config's loader preserves raw fields; only the invalid rules are replaced.
+            cfg, rev = self.storage.canonical_snapshot("config.json")
+            raw = cfg.get("training_params", {})
+            if json.dumps(raw, sort_keys=True) != json.dumps(baseline, sort_keys=True):
+                raise StaleRosterDataError("教學排班參數已變更，請重新載入後再修復")
+            cfg["training_params"] = {**(raw if isinstance(raw, dict) else {}), **desired}
+            validate_authoritative_shape("config.json", cfg)
+            self.storage.save_config(cfg, expected_revision=rev)
+        return desired
+
     def set_pgy_default_members(self, codes: list, *, baseline) -> list:
         """儲存設定頁的 PGY 預設代號 —— 只套【相對 baseline 的增刪】。→ 存後名單。
 

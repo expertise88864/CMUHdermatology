@@ -2,6 +2,10 @@
 from dataclasses import asdict, dataclass, fields
 
 
+class TrainingParamsError(ValueError):
+    """Invalid teaching settings; displays may recover, solvers must stop."""
+
+
 @dataclass(frozen=True)
 class TrainingParams:
     clerk_low: int = 9
@@ -28,19 +32,19 @@ class TrainingParams:
                      and "biopsy" not in f.name else
                      20 if f.name.startswith("clerk_") and "biopsy" not in f.name else 10)
             if type(value) is not int or not 0 <= value <= limit:
-                raise ValueError(f"{f.name} must be an integer from 0 to {limit}")
+                raise TrainingParamsError(f"{f.name} must be an integer from 0 to {limit}")
         for scope in ("clerk", "pgy", "external", "family"):
             low, target, high = self.follow_band(scope)
             if not low <= target <= high:
-                raise ValueError(f"{scope}: minimum <= target <= maximum is required")
+                raise TrainingParamsError(f"{scope}: minimum <= target <= maximum is required")
         if self.clerk_biopsy_low > self.clerk_biopsy_high:
-            raise ValueError("clerk biopsy: minimum must not exceed maximum")
+            raise TrainingParamsError("clerk biopsy: minimum must not exceed maximum")
 
     @classmethod
     def from_config(cls, cfg: dict) -> "TrainingParams":
         raw = cfg.get("training_params", {})
         if not isinstance(raw, dict):
-            raise ValueError("training_params must be an object")
+            raise TrainingParamsError("training_params must be an object")
         return cls(**{f.name: raw[f.name] for f in fields(cls) if f.name in raw})
 
     def to_dict(self) -> dict[str, int]:

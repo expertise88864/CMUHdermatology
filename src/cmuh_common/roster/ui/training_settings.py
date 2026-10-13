@@ -1,8 +1,9 @@
 """Explicit-save teaching quota editor; unfinished edits survive refreshes."""
+from copy import deepcopy
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from ..training_params import TrainingParams
+from ..training_params import TrainingParams, TrainingParamsError
 from .common import guard_write
 
 
@@ -12,7 +13,9 @@ class TrainingSettings(ttk.LabelFrame):
         self.service = service
         self.on_changed = on_changed
         self.variables: dict[str, tk.StringVar] = {}
-        self._loaded: dict[str, int] = {}
+        self._loaded: dict = {}
+        self._invalid = False
+        self._raw = None
         self._loading = False
         self._status = tk.StringVar(self)
         for col, label in enumerate(("人員", "單位", "低標", "正常目標", "高標上限")):
@@ -40,7 +43,8 @@ class TrainingSettings(ttk.LabelFrame):
         self.save_button.pack(side="left", padx=4)
         ttk.Button(buttons, text="恢復預設值", command=self.defaults).pack(side="left", padx=4)
         ttk.Button(buttons, text="重新載入", command=self.reload_from_disk).pack(side="left", padx=4)
-        ttk.Label(self, textvariable=self._status).grid(row=11, column=0, columnspan=5, sticky="w", padx=6)
+        ttk.Label(self, textvariable=self._status, wraplength=480).grid(
+            row=11, column=0, columnspan=5, sticky="w", padx=6)
         self.reload(cfg, force=True)
 
     def _spin(self, key, row, col, maximum):
@@ -68,10 +72,23 @@ class TrainingSettings(ttk.LabelFrame):
     def reload(self, cfg, *, force=False):
         if self.dirty() and not force:
             return
-        values = TrainingParams.from_config(cfg).to_dict()
+        self._raw = deepcopy(cfg.get("training_params", {}))
+        try:
+            values = TrainingParams.from_config(cfg).to_dict()
+        except TrainingParamsError as exc:
+            self._invalid = True
+            values = TrainingParams().to_dict()
+            if isinstance(self._raw, dict):
+                values.update({k: v for k, v in self._raw.items() if k in values})
+            else:
+                values = dict.fromkeys(values, "")
+            status = f"已存參數無效：{exc}。請修正或恢復預設值後按儲存；目前不能自動排班。"
+        else:
+            self._invalid = False
+            status = ""
         self._populate(values)
         self._loaded = values
-        self._status.set("")
+        self._status.set(status)
 
     def defaults(self):
         self._populate(TrainingParams().to_dict())
@@ -95,11 +112,14 @@ class TrainingSettings(ttk.LabelFrame):
                                  "請輸入範圍內的整數，且低標 ≤ 正常目標 ≤ 高標上限；"
                                  "Clerk 切片低標不可大於上限。", parent=self)
             return
-        if not self.dirty():
+        if not self.dirty() and not self._invalid:
             return
         saved = {}
         def write():
-            saved.update(self.service.set_training_params(values, baseline=self._loaded))
+            if self._invalid:
+                saved.update(self.service.repair_training_params(values, baseline=self._raw))
+            else:
+                saved.update(self.service.set_training_params(values, baseline=self._loaded))
         if not guard_write(write, title="教學排班參數", parent=self):
             self._status.set("儲存失敗；輸入保留")
             return

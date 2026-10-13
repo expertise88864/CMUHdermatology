@@ -28,6 +28,7 @@ from cmuh_common.roster.day_explanation import format_day_explanation
 from cmuh_common.roster.day_diagnostics import format_day_feasibility
 from cmuh_common.roster.model import ClerkBatch, batches_covering, month_dates
 from cmuh_common.roster.solve_control import DaySolveControl, DaySolveStopped
+from cmuh_common.roster.training_params import TrainingParamsError
 from cmuh_common.roster.solve_day import (
     BIOPSY, PHOTO, REST, TREATMENT, arbitration_order,
     day_owner_batch,
@@ -362,7 +363,19 @@ class DayScheduleTab(ttk.Frame):
         self._final_var.set(self._finalized)
         day_slots = month.get("day_slots") or {}
         day_locks = month.get("day_locks") or {}
-        grid = self.service.build_day_input(ym).grid
+        try:
+            grid = self.service.build_day_input(ym).grid
+        except TrainingParamsError as exc:
+            warning = f"教學排班參數無效，請到設定頁修正後儲存：{exc}"
+            for table in (self._tree, self._stats_pgy, self._stats_clerk):
+                table.delete(*table.get_children())
+            self._calendar_render_key = None
+            for child in self._cal_body.winfo_children():
+                child.destroy()
+            ttk.Label(self._cal_body, text=warning, wraplength=480).pack(padx=12, pady=12)
+            self._refresh_warnings([warning])
+            self._apply_finalized_state()
+            return
 
         self._tree.delete(*self._tree.get_children())
         for d in sorted(grid):
