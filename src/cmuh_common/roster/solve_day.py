@@ -142,8 +142,10 @@ TWO_PGY_PHOTO_ONLY = ((1, "上午"), (3, "下午"), (4, "上午"))  # 二早/四
 # ★「順位在後方」怎麼落實★:這個上限★只影響就座★,而且是在照光/治療室/
 #   切片室(含配額與期限)全部排完之後才輪到的步驟。換句話說,其他 Clerk 規則
 #   要用到的人力一個都不會被它擋掉;它只決定「剩下的座位要不要再塞人」。
-CLERK_SEAT_TARGET_MIN = 9
-CLERK_SEAT_TARGET_MAX = 11
+from .training_params import TrainingParams
+
+CLERK_SEAT_TARGET_MIN = TrainingParams().clerk_low
+CLERK_SEAT_TARGET_MAX = TrainingParams().clerk_high
 
 
 def _jitter(d: date, session: str, purpose: str, code: str) -> int:
@@ -246,6 +248,7 @@ class SessionCtx:
     # [RS-34] {代號: 這一梯每人該跟幾次}。★None = 只受 7-11 的上限管★
     #   (第一趟求解、以及尚未走完的梯次都是 None)。
     seat_cap: "dict | None" = None
+    clerk_high: int = CLERK_SEAT_TARGET_MAX
 
 
     @property
@@ -481,8 +484,8 @@ def _clerk_seat_eligible(ctx, pool):
     #   時就整個位子空掉,1 間診 3 個人從 10/10/10 掉到 ★8/8/8(浪費 10 個
     #   座位)★,而且整天放假照樣發生。留這段註解是為了下次不要再走一遍。
     return [c for c in pool
-            if _level(c) < min(CLERK_SEAT_TARGET_MAX,
-                               caps.get(c, CLERK_SEAT_TARGET_MAX))]
+            if _level(c) < min(ctx.clerk_high,
+                               caps.get(c, ctx.clerk_high))]
 
 
 def _seat(ctx, pool, room, ck, prefer: frozenset = frozenset(),
@@ -655,7 +658,7 @@ def solve_session(d: date, session: str, rooms: list, pgy_avail: list,
                   apply_pref=frozenset(), two_pgy_mode: bool = False,
                   biopsy_quota_left=None,
                   biopsy_force=frozenset(), seat_reserved=None,
-                  seat_cap=None) -> tuple:
+                  seat_cap=None, clerk_high=CLERK_SEAT_TARGET_MAX) -> tuple:
     """單一時段填充 → (slots, log)。slots: {房/治療室/切片室/放假: [代號,...]}。"""
     # ★同一個人不可以在池子裡出現兩次★(外審 2026-08-21 P1-01):每一步都是
     #   「選一個 → remove 一個 occurrence」,重複的代號因此可以在同一時段被
@@ -693,7 +696,8 @@ def solve_session(d: date, session: str, rooms: list, pgy_avail: list,
         biopsy_force=frozenset(biopsy_force),
         seat_reserved=(dict(seat_reserved)
                        if seat_reserved is not None else None),
-        seat_cap=dict(seat_cap) if seat_cap is not None else None)
+        seat_cap=dict(seat_cap) if seat_cap is not None else None,
+        clerk_high=clerk_high)
     slots: dict = {}
     log: list = list(_log_pre)             # 名單問題要進使用者看得到的警告
     for step in (pipeline or PIPELINE):
@@ -758,6 +762,7 @@ class DaySolveInput:
     apply_pref: set = field(default_factory=set)  # Apply 本科 PGY（101 週二/五平手優先）
     clinic_doctors: dict = field(default_factory=dict)  # {date: {session: {room: doctor}}}
     pgy_photo_offsets: dict = field(default_factory=dict)  # monthly relative photo targets
+    training: TrainingParams = field(default_factory=TrainingParams)
 
 
 def day_input_fingerprint(inp: "DaySolveInput") -> str:
@@ -1190,7 +1195,7 @@ def clerk_batches_ended_by(batches, cutoff: date) -> set:
 
 
 def clerk_seat_band_warnings(batches, counts, *, only_ids=None,
-                             ended_ids=None) -> list:
+                             ended_ids=None, training=None) -> list:
     """[RS-33] Clerk 整梯跟診次數落在目標區間外的點名 → 人話警告清單。
 
     `counts` = {(梯次 id, 代號): 跟診次數}。與 `biopsy_quota_warnings` 同一個
@@ -1215,6 +1220,7 @@ def clerk_seat_band_warnings(batches, counts, *, only_ids=None,
     存過檔」。上個月的班表從來沒排過的話,回放/掃描都取不到那半個梯次的次數,
     這裡仍會說偏少 —— 一個月一個月排下來不會遇到,但值得知道。
     """
+    params = training if training is not None else TrainingParams()
     out: list = []
     for b in batches:
         if only_ids is not None and b.id not in only_ids:
@@ -1222,26 +1228,26 @@ def clerk_seat_band_warnings(batches, counts, *, only_ids=None,
         c2 = {c: int(counts.get((b.id, c), 0)) for c in sorted(b.members)}
         if not c2:
             continue
-        low = ([(c, n) for c, n in c2.items() if n < CLERK_SEAT_TARGET_MIN]
+        low = ([(c, n) for c, n in c2.items() if n < params.clerk_low]
                if ended_ids is None or b.id in ended_ids else [])
         if low:
             out.append(
-                f"跟診時段偏少（梯次 {b.id}，目標每人 {CLERK_SEAT_TARGET_MIN}"
-                f"-{CLERK_SEAT_TARGET_MAX} 個時段）："
+                f"跟診時段偏少（梯次 {b.id}，目標每人 {params.clerk_low}"
+                f"-{params.clerk_high} 個時段）："
                 + "、".join(f"{c}×{n}" for c, n in low)
                 + " —— 多因假日/連假、診間或人力不足所致，排班無法自行補足")
-        high = [(c, n) for c, n in c2.items() if n > CLERK_SEAT_TARGET_MAX]
+        high = [(c, n) for c, n in c2.items() if n > params.clerk_high]
         if high:
             out.append(
                 f"跟診時段偏多（梯次 {b.id}，目標每人上限"
-                f" {CLERK_SEAT_TARGET_MAX} 個時段）："
+                f" {params.clerk_high} 個時段）："
                 + "、".join(f"{c}×{n}" for c, n in high)
                 + " —— 自動排班到上限就會留空，超出多為手動調整，請確認")
     return out
 
 
 def biopsy_quota_warnings(batches, counts, *, batch_more=(),
-                          only_ids=None, caps=None) -> tuple:
+                          only_ids=None, caps=None, minimum=1) -> tuple:
     """切片室配額的點名 → (人話警告清單, 該被標紅的 {(梯次, 代號)})。
 
     `counts` = {(梯次 id, 代號): 次數}。求解器餵它自己的公平計數;
@@ -1273,9 +1279,9 @@ def biopsy_quota_warnings(batches, counts, *, batch_more=(),
                     f"切片室超過配額（梯次 {b.id}，每人上限 {_cap} 次）："
                     + "、".join(f"{c}×{n}" for c, n in over)
                     + " —— 配額用完的時段應留空，請於月曆改回")
-        missed = [c for c, n in c2.items() if n == 0]
+        missed = [c for c, n in c2.items() if n < minimum]
         if missed:
-            out.append(f"切片室輪不到（梯次 {b.id}，本梯內未排到）："
+            out.append(f"切片室輪不到（梯次 {b.id}，未達每人最低 {minimum} 次）："
                        + "、".join(missed))
             flagged |= {(b.id, c) for c in missed}
         elif (max(c2.values()) - min(c2.values())
@@ -1306,7 +1312,8 @@ def _month_solve_attendance(inp: DaySolveInput, *, control=None) -> tuple:
     # Defer the optional second biopsy until a cross-month course's last month.
     # Otherwise it becomes immutable history before later follow opportunities
     # are known, and can irreversibly consume the course's ninth follow.
-    prospective = {(b.id, p): 1 for b in inp.clerk_batches if b.id not in ended for p in b.members}
+    biopsy_low = inp.training.clerk_biopsy_low
+    prospective = {(b.id, p): biopsy_low for b in inp.clerk_batches if b.id not in ended for p in b.members}
     slots, log, warnings = (_month_solve_attendance_raw(
         inp, biopsy_caps=prospective, control=control)
         if prospective else _month_solve_attendance_raw(inp, control=control))
@@ -1340,8 +1347,8 @@ def _month_solve_attendance(inp: DaySolveInput, *, control=None) -> tuple:
                         key = batch.id, p
                         values = counts.setdefault(key, [0, 0])
                         values[r == BIOPSY] += 1
-    caps = {key: 1 for key, (follow, biopsy) in counts.items()
-            if key[0] in ended and follow < CLERK_SEAT_TARGET_MIN and biopsy >= 2}
+    caps = {key: biopsy_low for key, (follow, biopsy) in counts.items()
+            if key[0] in ended and follow < inp.training.clerk_low and biopsy > biopsy_low}
     if caps:
         caps.update(prospective)
         if control is not None:
@@ -1354,9 +1361,9 @@ def _month_solve_attendance(inp: DaySolveInput, *, control=None) -> tuple:
                        for s, cells in schedule.get(d.isoformat(), {}).items()
                        if s in STUDENT_SESSIONS for r, people in cells.items()
                        if is_follow_slot(r) and r in inp.grid[d].get(s, []))
-        effective = {key: 1 for key in caps if key not in prospective
+        effective = {key: biopsy_low for key in caps if key not in prospective
                      if counts[key][0] + current_follow(trial[0], key) - current_follow(slots, key)
-                     >= CLERK_SEAT_TARGET_MIN}
+                     >= inp.training.clerk_low}
         if effective:
             effective.update(prospective)
             slots, log, warnings = (trial if effective == caps else
@@ -1769,13 +1776,13 @@ def _solve_month_once(inp: DaySolveInput, seat_cap=None, *, biopsy_caps=None,
                 for c, cap in clerk_month_caps(inp, batch).items():
                     if _seat_cap_now is None:
                         _seat_cap_now = {}
-                    _seat_cap_now[c] = min(_seat_cap_now.get(c, CLERK_SEAT_TARGET_MAX), cap)
+                    _seat_cap_now[c] = min(_seat_cap_now.get(c, inp.training.clerk_high), cap)
             _quota: "dict | None" = None
             _force: frozenset = frozenset()
             _pos = _bio_pos.get((iso, session))
             if _members and _pos is not None:
-                _cap = min(2, max(1, len(_bio_slots.get(batch_key, ()))
-                           // len(_members)))
+                _cap = inp.training.clerk_biopsy_quota(
+                    len(_bio_slots.get(batch_key, ())), len(_members))
                 _now = _ord.get((iso, session), -1)
                 # ★還沒跑到的鎖定時段要先預留★:那一次已經指派給他了,
                 #   跑到那天 `replay_counters` 才會計入 —— 現在不先扣的話
@@ -1823,7 +1830,8 @@ def _solve_month_once(inp: DaySolveInput, seat_cap=None, *, biopsy_caps=None,
                 biopsy, fc, inp.capacity, batch_key=batch_key,
                 apply_pref=frozenset(inp.apply_pref), two_pgy_mode=two_pgy,
                 biopsy_quota_left=_quota, biopsy_force=_force,
-                seat_reserved=_seat_res, seat_cap=_seat_cap_now)
+                seat_reserved=_seat_res, seat_cap=_seat_cap_now,
+                clerk_high=inp.training.clerk_high)
             day_slots.setdefault(iso, {})[session] = slots
             log.append(f"{d.month}/{d.day}({'一二三四五六日'[d.weekday()]}) "
                        + "；".join(slog))
@@ -1851,7 +1859,7 @@ def _solve_month_once(inp: DaySolveInput, seat_cap=None, *, biopsy_caps=None,
     # ★判準與 service 的現況檢查共用★(RS-28)—— 見 `biopsy_quota_warnings`。
     _bw, _ = biopsy_quota_warnings(
         inp.clerk_batches, fc.biopsy_done, batch_more=_batch_more,
-        only_ids=solved_batch_ids)
+        only_ids=solved_batch_ids, minimum=inp.training.clerk_biopsy_low)
     warnings.extend(_bw)
 
     # [RS-33] 跟診時段落在目標區間外的點名(下限只講事實、不假裝補得出來)。
@@ -1863,7 +1871,7 @@ def _solve_month_once(inp: DaySolveInput, seat_cap=None, *, biopsy_caps=None,
         {(b, c): n for k, n in fc.seat.items()
          if isinstance(k, tuple) and len(k) == 3 and k[0] == "clerk"
          for _ns, b, c in (k,)},
-        only_ids=solved_batch_ids,
+        only_ids=solved_batch_ids, training=inp.training,
         # ★「偏少」只在整梯走完之後才成立★:`fc.seat` 這時含上個月回放進來的
         #   同梯次次數(RF-09),所以梯次結束於本月 = 手上就是整梯的總數。
         ended_ids=clerk_batches_ended_by(

@@ -331,6 +331,11 @@ def validate_authoritative_shape(name: str, raw: dict) -> None:
                 bad(f"梯次 {b.get('id')} 的 members 不是清單"
                     f"（{type(b.get('members')).__name__}）")
     elif name == "config.json":
+        from .training_params import TrainingParams
+        try:
+            TrainingParams.from_config(raw)
+        except ValueError as exc:
+            bad(str(exc))
         for key in ("r_members", "vs_members", "pgy_members"):
             lst = raw.get(key)
             if lst is not None and not isinstance(lst, list):
@@ -920,6 +925,8 @@ class RosterStorage:
             self._parsed_or_read("config.json", _parsed), "config.json")
 
     def save_config(self, cfg: dict, *, expected_revision=_UNSET) -> None:
+        from .training_params import TrainingParams
+        TrainingParams.from_config(cfg)
         # [2026-07-25 審查] config.json 存的是全部成員名單，誤刪最痛（快照見 _save）。
         self._check_schema(_load_json(self._path("config.json")), "config.json",
                            for_write=True)

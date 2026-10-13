@@ -43,6 +43,7 @@ class PGYCourseRow:
     known_doctors: tuple[tuple[str, int], ...]
     unknown_doctor_follows: int
     visits: tuple[FollowVisit, ...] = ()
+    weekly_band: tuple[int, int, int] = (1, 2, 2)
 
 
 @dataclass(frozen=True)
@@ -149,16 +150,19 @@ def explain_day_courses(inp: DaySolveInput, data: dict[str, Any],
         row = PGYCourseRow(p, photo, wed, tx, follow, photo + tx,
                            totals[p], offsets.get(p, 0), target,
                            Fraction(totals[p]) - target, st.get("rest", 0),
-                           weeks, doctors, unknown, visits)
+                           weeks, doctors, unknown, visits, inp.training.follow_band("pgy"))
         pgy_rows.append(row)
         if abs(row.difference) > 1:
             difference = f"+{row.difference}" if row.difference > 0 else str(row.difference)
             gaps.append(f"PGY {p} 實際總量 {row.total}；相對公平目標差 {difference}")
         weekly_counts = dict(weeks)
-        for week, slots in week_slots(available_slots(inp, "pgy", p)).items():
-            label = f"{week[0]}-W{week[1]:02d}"
-            if slots and weekly_counts.get(label, 0) < 1:
-                gaps.append(f"PGY {p} {label} 跟診 0/1，低於每週最低需求")
+        available_weeks = {f"{w[0]}-W{w[1]:02d}" for w in week_slots(available_slots(inp, "pgy", p))}
+        for label in sorted(available_weeks | set(weekly_counts)):
+            actual = weekly_counts.get(label, 0)
+            if label in available_weeks and actual < inp.training.pgy_low:
+                gaps.append(f"PGY {p} {label} 跟診 {actual}/{inp.training.pgy_low}，低於每週最低需求")
+            if actual > inp.training.pgy_high:
+                gaps.append(f"PGY {p} {label} 跟診 {actual}/{inp.training.pgy_high}，超過每週上限")
 
     training = []
 
@@ -166,8 +170,9 @@ def explain_day_courses(inp: DaySolveInput, data: dict[str, Any],
             *, complete=True):
         for p in sorted(set(roster)):
             st = stats.get(p, {})
-            low, target, high = ((9, 10, 11) if scope == "Clerk"
-                                 else band(len(available[p])))
+            key = {"Clerk": "clerk", "家醫科": "family", "外訓": "external"}[scope]
+            low, target, high = (inp.training.follow_band("clerk") if scope == "Clerk"
+                                 else band(len(available[p]), inp.training.follow_band(key)))
             weeks, doctors, unknown, visits = _follow_details(
                 slots, p, start=start, end=end, doctors=inp.clinic_doctors)
             biopsy_by_half = [0, 0]
@@ -190,16 +195,17 @@ def explain_day_courses(inp: DaySolveInput, data: dict[str, Any],
                 gaps.append(f"{scope} {p} 跟診 {row.follow}/{low}，低於最低需求")
             if row.follow > high:
                 gaps.append(f"{scope} {p} 跟診 {row.follow}/{high}，超過上限")
-            if scope == "Clerk" and row.biopsy < 1 and complete:
-                gaps.append(f"Clerk {p} 切片 {row.biopsy}/1，低於最低需求")
-            if scope == "Clerk" and row.biopsy > 2:
-                gaps.append(f"Clerk {p} 切片 {row.biopsy}/2，超過上限")
+            if scope == "Clerk" and row.biopsy < inp.training.clerk_biopsy_low and complete:
+                gaps.append(f"Clerk {p} 切片 {row.biopsy}/{inp.training.clerk_biopsy_low}，低於最低需求")
+            if scope == "Clerk" and row.biopsy > inp.training.clerk_biopsy_high:
+                gaps.append(f"Clerk {p} 切片 {row.biopsy}/{inp.training.clerk_biopsy_high}，超過上限")
             if scope != "Clerk":
                 for half in (0, 1):
                     if (any((d.day > 14) == bool(half) for d, _ in available[p])
-                            and row.biopsy_by_half[half] < 1):
+                            and row.biopsy_by_half[half] < getattr(inp.training, f"{key}_biopsy")):
                         label = "1–14 日" if half == 0 else "15 日至月底"
-                        gaps.append(f"{scope} {p} {label} 切片 0/1，低於兩週目標")
+                        target = getattr(inp.training, f"{key}_biopsy")
+                        gaps.append(f"{scope} {p} {label} 切片 {row.biopsy_by_half[half]}/{target}，低於兩週目標")
 
     for b in data["batches"]:
         add("Clerk", b["id"], b["members"], b["stats"], b["slots"],
@@ -224,6 +230,8 @@ def format_day_explanation(explanation: DayCourseExplanation) -> str:
         weekly = "、".join(f"{w}:{n}" for w, n in r.weekly_follows) or "無"
         doctors = "、".join(f"{name}:{n}" for name, n in r.known_doctors) or "無已知醫師"
         lines.append(f"  每週跟診 {weekly}；醫師 {doctors}；醫師未標示 {r.unknown_doctor_follows}")
+        low, target, high = r.weekly_band
+        lines.append(f"  每週跟診最低 {low}／目標 {target}／上限 {high}")
         peers = [other for other in explanation.pgy if other.code != r.code]
         if peers:
             mean_photo = Fraction(sum(other.photo for other in peers), len(peers))

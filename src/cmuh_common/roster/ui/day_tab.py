@@ -198,7 +198,7 @@ class DayScheduleTab(ttk.Frame):
             b = ttk.Button(bar3, text=text, command=cmd)
             b.pack(side="left", padx=4)
             self._edit_btns.append(b)
-        ttk.Label(bar3, text="跟診優先：Clerk ＞ 家醫科 ＞ 外訓 ＞ PGY；Clerk 9–11 診、1–2 切片",
+        ttk.Label(bar3, text="跟診優先：Clerk ＞ 家醫科 ＞ 外訓 ＞ PGY",
                   foreground="gray").pack(side="left", padx=8)
 
         bar4 = ttk.Frame(self, padding=(6, 3))
@@ -1557,7 +1557,8 @@ class _FamilyFollowDialog(tk.Toplevel):
         self.baseline = {p: set(inp.family_follow.get(p, set())) for p in inp.family_roster}
         self.variables = {}
         ttk.Label(self, text="勾選該員可參與皮膚科跟診或切片觀摩的時段，不必排滿。\n"
-                  "扣除請假後，跟診最低 30%、目標 50%、上限 70%；未勾選時段不排班。",
+                  f"扣除請假後，跟診最低 {inp.training.family_low}%、"
+                  f"目標 {inp.training.family_target}%、上限 {inp.training.family_high}%；未勾選時段不排班。",
                   padding=10).pack(fill="x")
         tabs = ttk.Notebook(self)
         tabs.pack(fill="both", expand=True, padx=10)

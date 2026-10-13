@@ -192,8 +192,8 @@ def add_external(inp, slots, log, warnings, *, control=None):
                   and owner.id == bid)
         model.add(new <= target)
         fixed = fixed_clerk[bid, p]
-        clerk_minima.append((bid, p, new, min(target, max(0, 9 - fixed))))
-        shortage(new, min(target, max(0, 10 - fixed)))
+        clerk_minima.append((bid, p, new, min(target, max(0, inp.training.clerk_low - fixed))))
+        shortage(new, min(target, max(0, inp.training.clerk_target - fixed)))
         clerk_extra.append(-new)
     from .training_bands import add_training_objectives
     training_phases, training_spread = add_training_objectives(
@@ -293,14 +293,18 @@ def add_external(inp, slots, log, warnings, *, control=None):
         actual = sum(p in ps for (d, ss) in originals
                      if (owner := day_owner_batch(arbitration_order(inp), d)) and owner.id == bid
                      for r, ps in slots[d.isoformat()][ss].items() if is_follow_slot(r))
-        desired = min(target, max(0, 10 - fixed_clerk[bid, p]))
+        desired = min(target, max(0, inp.training.clerk_target - fixed_clerk[bid, p]))
         if actual < desired:
             warnings.append(f"Clerk {p}（{bid}）可調整跟診 {actual}/{desired} 次；先保障所有人的最低需求，再依 Clerk、家醫科、外訓、PGY 安排目標")
     from .follow_priority import refresh_clerk_warnings
     refresh_clerk_warnings(inp, slots, warnings)
     from .training_bands import training_warnings
     warnings.extend(training_warnings(inp, slots, scopes=("external", "family")))
-    log.append("基本需求先保障；額外跟診依 Clerk ＞ 家醫科 ＞ 外訓 ＞ PGY；家醫／外訓跟診最低 30%、目標 50%、上限 70%；PGY 每週最低 1、目標 2 診；家醫／外訓每半月一次切片室")
+    log.append("基本需求先保障；額外跟診依 Clerk ＞ 家醫科 ＞ 外訓 ＞ PGY")
+    for scope, label, unit in (("clerk", "Clerk", "次／梯次"), ("pgy", "PGY", "次／週"),
+                              ("family", "家醫科", "%"), ("external", "外訓", "%")):
+        low, target, high = inp.training.follow_band(scope)
+        log.append(f"{label} 跟診最低 {low}、目標 {target}、上限 {high}（{unit}）")
 
 
 def balance_rooms(inp, slots, *, control=None):
@@ -318,7 +322,8 @@ def finish_courses(inp, slots, log, warnings, *, control=None):
     balance_rooms(inp, slots, control=control)
     if control is not None:
         control.checkpoint("核對課程結果")
-    from .training_bands import training_warnings
+    from .training_bands import training_warnings, verify_pgy_caps
+    verify_pgy_caps(inp, slots)
     warnings.extend(training_warnings(inp, slots, scopes=("pgy",)))
     log.append("依 course 優先平衡實際跟診醫師，再平衡診間；保留各人跟診次數、特殊工作、家醫可參與時段與鎖定內容")
     return slots, log, warnings

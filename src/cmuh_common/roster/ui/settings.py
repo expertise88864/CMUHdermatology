@@ -16,6 +16,7 @@ from cmuh_common.roster.ledger import reset_member, sync_members
 from cmuh_common.roster.model import month_dates, week_key
 from cmuh_common.roster.storage import StaleRosterDataError
 from cmuh_common.roster.ui.common import guard_write
+from cmuh_common.roster.ui.training_settings import TrainingSettings
 
 _WD_CHOICES = ("無", "一", "二", "三", "四", "五", "六", "日")   # index-1 = weekday
 
@@ -133,6 +134,8 @@ class SettingsTab(ttk.Frame):
         self._build_members("vs", "VS 主治醫師名單", with_level=False, with_wd=False)
         self._build_holiday_table()
         self._build_params()
+        self._training = TrainingSettings(self._body, self.service, self._cfg, self._notify)
+        self._training.pack(fill="x", padx=10, pady=6)
         self._build_pgy_defaults()
         self._build_clinic_template()
         self._build_clerk_batches()
@@ -247,6 +250,8 @@ class SettingsTab(ttk.Frame):
             self._reload_members(scope)
         self._reload_param_widgets()
         self._reload_pgy_widget()
+        if hasattr(self, "_training"):
+            self._training.reload(self._cfg)
 
     def _reload_param_widgets(self) -> None:
         if not hasattr(self, "_p_cap"):

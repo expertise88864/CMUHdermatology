@@ -72,7 +72,7 @@ def _reduce_manual_pgy_follow(inp, slots, people, log):
                 break
             eligible = [(d, session, cells, room, doctor)
                         for d, session, cells, room, doctor in candidates
-                        if weekly[d.isocalendar()[:2], p] >= 3
+                        if weekly[d.isocalendar()[:2], p] > inp.training.pgy_target
                         and daily[d, p] >= 2
                         # Keep every distinct known doctor represented.
                         and (not doctor or doctors[p, doctor] >= 2)]
@@ -173,7 +173,7 @@ def balance_pgy(inp, slots, log, warnings, *, control=None):
             for variables in assignments.values():
                 model.add(sum(variables) == 1)
     for key, count in previous.items():
-        model.add(sum(weekly[key]) >= min(1, count))
+        model.add(sum(weekly[key]) >= min(inp.training.pgy_low, count))
     # Fairness may exchange work and rest seats within a half-day, but it must
     # not turn somebody who originally worked that day into a full-day rest.
     # Existing leave/lock-driven full-day rests remain untouched.
@@ -186,10 +186,12 @@ def balance_pgy(inp, slots, log, warnings, *, control=None):
     for week in {w for w, _ in previous}:
         credit = []
         for p in people:
-            achieved = model.new_int_var(0, 2, f"weekly_target_credit/{week}/{p}")
-            model.add_min_equality(achieved, [sum(weekly[week, p]), 2])
+            achieved = model.new_int_var(0, inp.training.pgy_target, f"weekly_target_credit/{week}/{p}")
+            model.add_min_equality(achieved, [sum(weekly[week, p]), inp.training.pgy_target])
             credit.append(achieved)
-        model.add(sum(credit) >= sum(min(2, previous[week, p]) for p in people))
+            # Preserve already-retained excess, but do not create more while balancing.
+            model.add(sum(weekly[week, p]) <= max(inp.training.pgy_high, previous[week, p]))
+        model.add(sum(credit) >= sum(min(inp.training.pgy_target, previous[week, p]) for p in people))
     weights = availability_weights(inp, people)
     phases, original_score, lower_bounds = workload_goals(
         model, people, totals, original_counts, weights, offsets)

@@ -1,7 +1,8 @@
 """Attendance bands use available half-days, not occupied clinic seats."""
 from collections import defaultdict
 from datetime import date
-from math import ceil, floor
+from math import gcd
+from collections import Counter
 
 from .session_leave import on_leave
 from .solve_day import BIOPSY, STUDENT_SESSIONS, is_follow_slot
@@ -20,11 +21,12 @@ def available_slots(inp, scope, person):
     return available_training_slots(inp, scope, person)
 
 
-def band(n):
-    """Nearest feasible integer target; tiny courses cannot exceed their 70% cap."""
-    high = floor(n * 7 / 10)
-    low = min(ceil(n * 3 / 10), high)
-    return low, min(high, max(low, (n + 1) // 2)), high
+def band(n, percentages=(30, 50, 70)):
+    """Round the target to nearest half-up, without exceeding the upper cap."""
+    minimum, target, maximum = percentages
+    high = n * maximum // 100
+    low = min((n * minimum + 99) // 100, high)
+    return low, min(high, max(low, (n * target + 50) // 100)), high
 
 
 def week_slots(slots):
@@ -42,6 +44,45 @@ def fixed_count(inp, p, kind, within=None):
                and (within is None or (iso, s) in within)
                for r, ps in cells.items()
                if (r == BIOPSY if kind == "biopsy" else is_follow_slot(r)))
+
+
+def fixed_week_slots(inp, week):
+    within = set()
+    for iso, sessions in inp.locked.items():
+        try:
+            d = date.fromisoformat(iso)
+        except (TypeError, ValueError):
+            continue
+        if d.isocalendar()[:2] == week and isinstance(sessions, dict):
+            within.update((iso, s) for s in sessions)
+    return within
+
+
+def pgy_week_counts(inp, slots):
+    counts = Counter()
+    for iso, sessions in slots.items():
+        try:
+            d = date.fromisoformat(iso)
+        except (TypeError, ValueError):
+            continue
+        if iso[:7] != inp.ym or not isinstance(sessions, dict):
+            continue
+        for s, cells in sessions.items():
+            if s not in STUDENT_SESSIONS or not isinstance(cells, dict):
+                continue
+            for r, people in cells.items():
+                if is_follow_slot(r):
+                    counts.update((d.isocalendar()[:2], p) for p in (people or []) if p in inp.pgy_roster)
+    return counts
+
+
+def verify_pgy_caps(inp, slots):
+    """A timed-out fallback must not silently bypass configured upper limits."""
+    fixed = pgy_week_counts(inp, inp.locked)
+    excess = [p for (week, p), count in pgy_week_counts(inp, slots).items()
+              if count > max(inp.training.pgy_high, fixed[week, p])]
+    if excess:
+        raise ValueError("無法產生符合 PGY 每週跟診上限的班表；原班表未變更，請調整條件後重試")
 
 
 def add_training_objectives(inp, model, choices, deviation, external, clerk_minima=()):
@@ -73,7 +114,7 @@ def add_training_objectives(inp, model, choices, deviation, external, clerk_mini
         for person in people:
             slots = available_slots(inp, scope, person)
             training_slots = available_training_slots(inp, scope, person)
-            low, target, high = band(len(slots))
+            low, target, high = band(len(slots), inp.training.follow_band(scope))
             # Count every retained clinic, even if a newly entered leave makes
             # its date unavailable. Never create further excess beyond the cap.
             fixed = fixed_count(inp, person, "follow")
@@ -84,7 +125,11 @@ def add_training_objectives(inp, model, choices, deviation, external, clerk_mini
             model.add(peer_gap >= gap)
             objective.append(gap)
             for week, ws in week_slots(slots).items():
-                spread.append(30 * deviation(2 * count(person, ws) - len(ws), 1000,
+                # Preserve the historical objective scale for the default 50%.
+                percent = inp.training.follow_band(scope)[1]
+                divisor = gcd(percent, 100)
+                spread.append(30 * deviation((100 // divisor) * count(person, ws)
+                                              - (percent // divisor) * len(ws), 10000,
                                               f"weekly/{person}/{week}"))
             for half in (0, 1):
                 half_slots = {(d, s) for d, s in training_slots if (d.day > 14) == bool(half)}
@@ -93,8 +138,10 @@ def add_training_objectives(inp, model, choices, deviation, external, clerk_mini
                     for s in STUDENT_SESSIONS})
                 new_half = sum(v for (d, _, p, k), v in choices.items()
                                if p == person and k == "biopsy" and (d.day > 14) == bool(half))
-                model.add(new_half <= max(0, 1 - fixed_half))
-                minimum(new_half + fixed_half, int(bool(half_slots)), f"biopsy/{person}/{half}")
+                biopsy_target = getattr(inp.training, f"{scope}_biopsy")
+                model.add(new_half <= max(0, biopsy_target - fixed_half))
+                minimum(new_half + fixed_half, biopsy_target if half_slots else 0,
+                        f"biopsy/{person}/{half}")
                 if half_slots:
                     center = min(d.toordinal() for d, _ in half_slots) + max(d.toordinal() for d, _ in half_slots)
                     spread.extend(abs(2 * d.toordinal() - center) * v
@@ -102,12 +149,13 @@ def add_training_objectives(inp, model, choices, deviation, external, clerk_mini
                                   if p == person and k == "biopsy" and (d.day > 14) == bool(half))
     for person in inp.pgy_roster:
         for week, ws in week_slots(available_slots(inp, "pgy", person)).items():
-            actual = count(person, ws)
-            fixed = fixed_count(inp, person, "follow", {(d.isoformat(), s) for d, s in ws})
-            model.add(actual <= max(2, fixed))
-            minimum(actual, 1, f"pgy_min/{person}/{week}")
-            missing = model.new_int_var(0, 2, f"pgy_target/{person}/{week}")
-            model.add(missing >= min(2, len(ws)) - actual)
+            fixed = fixed_count(inp, person, "follow", fixed_week_slots(inp, week))
+            actual = fixed + sum(v for (d, _, p, k), v in choices.items()
+                                 if p == person and k == "follow" and d.isocalendar()[:2] == week)
+            model.add(actual <= max(inp.training.pgy_high, fixed))
+            minimum(actual, inp.training.pgy_low, f"pgy_min/{person}/{week}")
+            missing = model.new_int_var(0, inp.training.pgy_target, f"pgy_target/{person}/{week}")
+            model.add(missing >= min(inp.training.pgy_target, len(ws)) - actual)
             pgy.append(missing)
     # A unit improvement in worst proportional deficit dominates all totals.
     return [[worst], basics, family, other, pgy], spread
@@ -140,18 +188,21 @@ def training_warnings(inp, slots, scopes=("external", "family", "pgy")):
                             elif r == BIOPSY:
                                 biopsy.append((d, s))
             if scope == "pgy":
-                for week, ws in week_slots(available).items():
-                    n = sum((d, s) in ws for d, s in follows)
-                    if n < 2:
-                        out.append(f"PGY {p} {week[0]}-W{week[1]:02d} 跟診 {n} 次（最低 1、目標 2；請確認診間、請假與保留排班）")
+                weeks = week_slots(available)
+                for week in sorted(set(weeks) | {d.isocalendar()[:2] for d, _ in follows}):
+                    n = sum(d.isocalendar()[:2] == week for d, _ in follows)
+                    low, target, high = inp.training.follow_band("pgy")
+                    if (weeks.get(week) and n < target) or n > high:
+                        out.append(f"PGY {p} {week[0]}-W{week[1]:02d} 跟診 {n} 次（最低 {low}、目標 {target}、上限 {high}；請確認診間、請假與保留排班）")
                 continue
-            low, target, high = band(len(available))
+            low, target, high = band(len(available), inp.training.follow_band(scope))
             n = len(follows)
             if n != target:
                 out.append(f"{label} {p} 全月跟診 {n} 次（可排 {len(available)} 時段；最低 {low}、目標 {target}、上限 {high}；請確認請假、容量與保留排班）")
             for half in (0, 1):
                 n = sum((d.day > 14) == bool(half) for d, _ in biopsy)
-                if n != 1 and any((d.day > 14) == bool(half)
+                target = getattr(inp.training, f"{scope}_biopsy")
+                if n != target and any((d.day > 14) == bool(half)
                                   for d, _ in available_training_slots(inp, scope, p)):
-                    out.append(f"{label} {p} {'1–14 日' if half == 0 else '15 日至月底'} 切片室 {n} 次（目標 1；請確認開放時段、請假與保留排班）")
+                    out.append(f"{label} {p} {'1–14 日' if half == 0 else '15 日至月底'} 切片室 {n} 次（目標 {target}；請確認開放時段、請假與保留排班）")
     return out

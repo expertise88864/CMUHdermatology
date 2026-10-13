@@ -16,7 +16,7 @@ def clerk_month_caps(inp, batch):
     future opportunities. Ended courses retain the ordinary 11-session ceiling.
     """
     from .model import CLERK_COURSE_DAYS
-    from .solve_day import CLERK_SEAT_TARGET_MAX
+    high = inp.training.clerk_high
     out = {}
     for p in batch.members:
         days = [batch.start_monday + timedelta(days=i) for i in range(CLERK_COURSE_DAYS)]
@@ -31,8 +31,7 @@ def clerk_month_caps(inp, batch):
                     for cells in (inp.course_fixed.get(d.isoformat()) or {}).values()
                     if isinstance(cells, dict) for r, ps in cells.items() if is_follow_slot(r))
         elapsed = len(days) - len(future)
-        out[p] = min(CLERK_SEAT_TARGET_MAX,
-                     (CLERK_SEAT_TARGET_MAX * elapsed + len(days) // 2) // len(days) + fixed)
+        out[p] = min(high, (high * elapsed + len(days) // 2) // len(days) + fixed)
     return out
 
 
@@ -76,7 +75,8 @@ def refresh_clerk_warnings(inp, slots, warnings):
                         counts[b.id, p] += 1
     y, m = map(int, inp.ym.split("-"))
     ended = clerk_batches_ended_by(inp.clerk_batches, date(y, m, monthrange(y, m)[1]))
-    warnings.extend(clerk_seat_band_warnings(inp.clerk_batches, counts, only_ids=solved, ended_ids=ended))
+    warnings.extend(clerk_seat_band_warnings(inp.clerk_batches, counts, only_ids=solved,
+                                           ended_ids=ended, training=inp.training))
     warnings.extend(clerk_seat_uneven_warnings(
         inp.clerk_batches, counts, only_ids=solved & ended,
         base_ids={(b.id, p) for b in inp.clerk_batches
@@ -136,6 +136,10 @@ def prepare_priority(inp, slots):
 
 
 def restore_pgy_and_rest(inp, slots, originals):
+    weekly = Counter((date.fromisoformat(iso).isocalendar()[:2], p)
+                     for iso, ss in slots.items() if iso[:7] == inp.ym
+                     for cells in ss.values() for r, ps in cells.items()
+                     if is_follow_slot(r) for p in ps if p in inp.pgy_roster)
     counts = Counter(p for ss in slots.values() if isinstance(ss, dict)
                      for cells in ss.values() if isinstance(cells, dict)
                      for r, ps in cells.items() if is_follow_slot(r) for p in (ps or []))
@@ -144,7 +148,8 @@ def restore_pgy_and_rest(inp, slots, originals):
         cells = slots[d.isoformat()][s]
         assigned = {p for ps in cells.values() for p in (ps or [])}
         available = [p for p in inp.pgy_roster if p not in assigned
-                     and d not in inp.leaves.get("pgy", {}).get(p, set())]
+                     and not on_leave(inp, "pgy", p, d, s)
+                     and weekly[d.isocalendar()[:2], p] < inp.training.pgy_high]
         original_follow = {p for r, ps in before.items() if is_follow_slot(r) for p in ps}
         for r in inp.grid[d].get(s, []):
             while available and len(cells.get(r, [])) < inp.capacity:
@@ -154,6 +159,7 @@ def restore_pgy_and_rest(inp, slots, originals):
                 cells.setdefault(r, []).append(p)
                 available.remove(p)
                 counts[p] += 1
+                weekly[d.isocalendar()[:2], p] += 1
         owner = day_owner_batch(order, d)
         scopes = [("pgy", inp.pgy_roster), ("external", inp.external_roster),
                   ("clerk", owner.members if owner else [])]
@@ -186,7 +192,7 @@ def spread_clerk_days(inp, slots, *, control=None):
     )
     protected = weekly.copy()
     protected_credit = {
-        week: sum(min(2, protected[week, p]) for p in inp.pgy_roster)
+        week: sum(min(inp.training.pgy_target, protected[week, p]) for p in inp.pgy_roster)
         for week, _ in protected
     }
 
@@ -199,10 +205,11 @@ def spread_clerk_days(inp, slots, *, control=None):
             after[donor_day.isocalendar()[:2], replacement] += 1
         affected = {target_day.isocalendar()[:2], donor_day.isocalendar()[:2]}
         return all(
-            after[week, p] >= min(1, protected[week, p])
+            after[week, p] >= min(inp.training.pgy_low, protected[week, p])
+            and after[week, p] <= max(inp.training.pgy_high, protected[week, p])
             for week in affected for p in inp.pgy_roster
         ) and all(
-            sum(min(2, after[week, p]) for p in inp.pgy_roster)
+            sum(min(inp.training.pgy_target, after[week, p]) for p in inp.pgy_roster)
             >= protected_credit.get(week, 0)
             for week in affected
         )
@@ -277,7 +284,8 @@ def spread_clerk_days(inp, slots, *, control=None):
                     cells.setdefault(r, []).append(p)
                     # Fill the released seat using an available PGY only.
                     candidates = [q for q in source.get(REST, []) if q in inp.pgy_roster
-                                  and dd not in inp.leaves.get("pgy", {}).get(q, set())]
+                                  and dd not in inp.leaves.get("pgy", {}).get(q, set())
+                                  and weekly[dd.isocalendar()[:2], q] < inp.training.pgy_high]
                     refilled = None
                     if candidates:
                         refilled = replacement if replacement is not None else candidates[0]

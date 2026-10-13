@@ -984,7 +984,9 @@ class RosterService:
                 prev_pgy = [str(mm.get("id")) for mm in (cfg.get("pgy_members") or [])]
             prior_pgy = {str(x) for x in prev_pgy}
 
+        from .training_params import TrainingParams
         return DaySolveInput(
+            training=TrainingParams.from_config(cfg),
             ym=ym, grid=grid, pgy_roster=list(pgy_roster), clinic_doctors=clinic_doctors,
             external_roster=external_month_codes(month),
             family_roster=family_month_codes(month),
@@ -1310,11 +1312,11 @@ class RosterService:
         #   (鎖定格先拿掉、有效鎖定切片加回)—— 否則求解器合法排出的平均結果
         #   會被這裡誤報「超過配額」,反向也會漏掉等量的超額。
         apply_locked_adjustments(inp, order, slots)
-        caps = {b.id: min(2, max(1, len(slots.get(b.id, ())) // len(b.members)))
+        caps = {b.id: inp.training.clerk_biopsy_quota(len(slots.get(b.id, ())), len(b.members))
                 for b in inp.clerk_batches if b.members}
         return biopsy_quota_warnings(inp.clerk_batches, counts,
                                      batch_more=more, only_ids=active,
-                                     caps=caps)
+                                     caps=caps, minimum=inp.training.clerk_biopsy_low)
 
     def _active_batch_ids(self, inp, order, day_slots) -> set:
         """★本月真的排到東西的梯次★ → {梯次 id}(求解器 `solved_batch_ids`
@@ -1370,7 +1372,7 @@ class RosterService:
             inp.clerk_batches, counts, only_ids=active,
             # 與求解器同一個判準:整梯走完才談「偏少」(跨月梯次排完第一個月
             # 時必然不足,那是還沒排到、不是事實)。
-            ended_ids=ended) + clerk_seat_uneven_warnings(
+            ended_ids=ended, training=inp.training) + clerk_seat_uneven_warnings(
             # [RS-34/RS-35] ★求解當下說過的話,手改之後要有人再說一次★:
             #   自動排班會把跟診次數收進 ±1,使用者在月曆上挪一格就可能破功
             #   —— 而那一格是他自己挪的,沒有人會再算一次。
@@ -1989,6 +1991,23 @@ class RosterService:
             "config.json",
             lambda d, rev: self.storage.save_config(d, expected_revision=rev),
             mutator, retries=retries)
+
+    def set_training_params(self, values: dict, *, baseline: dict) -> dict:
+        """Merge only edited fields; reject concurrent edits to the same field."""
+        from .training_params import TrainingParams
+        desired = TrainingParams.from_config({"training_params": values}).to_dict()
+        before = TrainingParams.from_config({"training_params": baseline}).to_dict()
+        changed = {key: value for key, value in desired.items() if value != before[key]}
+        def mutate(cfg):
+            current = TrainingParams.from_config(cfg).to_dict()
+            for key, value in changed.items():
+                if current[key] not in (before[key], value):
+                    raise StaleRosterDataError("教學排班參數已被其他電腦修改，請重新載入後再儲存")
+                current[key] = value
+            TrainingParams.from_config({"training_params": current})
+            cfg["training_params"] = {**cfg.get("training_params", {}), **current}
+            return current
+        return self.update_config(mutate)
 
     def set_pgy_default_members(self, codes: list, *, baseline) -> list:
         """儲存設定頁的 PGY 預設代號 —— 只套【相對 baseline 的增刪】。→ 存後名單。

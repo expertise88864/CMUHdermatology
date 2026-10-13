@@ -8,6 +8,7 @@ use it simultaneously after higher-priority duties have been assigned.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import Counter
 from datetime import date
 from fractions import Fraction
 
@@ -207,7 +208,7 @@ def _clerk_biopsy_coverage(inp: DaySolveInput, batch: dict, seats: set) -> int:
     """Only immutable saved work consumes a seat; current unlocked work can move."""
     members = set(batch["members"])
     start, end = batch["start"], batch["end"]
-    done = set()
+    done: Counter = Counter()
     occupied = set()
     for iso, sessions in (batch.get("slots") or {}).items():
         if not start <= iso <= end or not isinstance(sessions, dict):
@@ -228,7 +229,7 @@ def _clerk_biopsy_coverage(inp: DaySolveInput, batch: dict, seats: set) -> int:
                 done.update(assigned)
                 if (iso, session) in seats:
                     occupied.add((iso, session))
-    return len(seats - occupied) + len(done)
+    return len(seats - occupied) + sum(min(n, inp.training.clerk_biopsy_low) for n in done.values())
 
 
 def diagnose_day(inp: DaySolveInput, explanation: DayCourseExplanation,
@@ -317,15 +318,16 @@ def diagnose_day(inp: DaySolveInput, explanation: DayCourseExplanation,
             personal = fixed + sum((date.fromisoformat(iso), session) in available
                                    for iso, session in free)
             actual = row.biopsy
+            minimum = inp.training.clerk_biopsy_low
             rows.append(RequirementCapacity(
-                row.scope, row.course, row.code, "切片", 1, 1,
+                row.scope, row.course, row.code, "切片", minimum, minimum,
                 len(available), personal, len(all_bio), actual,
                 blockers=tuple(f"{iso} {session} 切片開放"
                                for iso, session in sorted(all_bio))))
-            if personal < 1 and actual < 1:
+            if personal < minimum and actual < minimum:
                 shortages.append(
-                    f"Clerk {row.course} {row.code} 切片：最低 1，"
-                    "沒有可用切片席位；可檢查請假、切片開放與鎖定格")
+                    f"Clerk {row.course} {row.code} 切片：最低 {minimum}，"
+                    f"可用切片席位 {personal}；可檢查請假、切片開放與鎖定格")
         else:
             for half in (0, 1):
                 half_available = {(d, s) for d, s in available
@@ -339,16 +341,17 @@ def diagnose_day(inp: DaySolveInput, explanation: DayCourseExplanation,
                     locked = (inp.locked.get(d.isoformat()) or {}).get(s)
                     if locked is None or row.code in (locked.get(BIOPSY) or ()):
                         open_slots.add((d, s))
+                target = getattr(inp.training, f"{'family' if row.scope == '家醫科' else 'external'}_biopsy")
                 rows.append(RequirementCapacity(
                     row.scope, row.course, row.code,
                     "切片 1–14 日" if half == 0 else "切片 15 日至月底",
-                    1, 1, len(half_available), len(open_slots),
+                    target, target, len(half_available), len(open_slots),
                     len(open_slots), row.biopsy_by_half[half]))
-                if not open_slots and row.biopsy_by_half[half] < 1:
+                if len(open_slots) < target and row.biopsy_by_half[half] < target:
                     label = "1–14 日" if half == 0 else "15 日至月底"
                     shortages.append(
-                        f"{row.scope} {row.code} {label} 切片：目標 1，"
-                        "在可參與時段中沒有開放且未鎖給他人的切片席位；"
+                        f"{row.scope} {row.code} {label} 切片：目標 {target}，"
+                        f"在可參與時段中開放且未鎖給他人的切片席位 {len(open_slots)}；"
                         "可檢查切片開放、請假及鎖定格")
 
     for b in data["batches"]:
@@ -356,7 +359,7 @@ def diagnose_day(inp: DaySolveInput, explanation: DayCourseExplanation,
         personal_caps = {
             r.code: r.possible_sessions for r in rows
             if r.scope == "Clerk" and r.course == b["id"] and r.kind == "跟診"}
-        shared_minimum = sum(min(9, personal_caps.get(person, 9))
+        shared_minimum = sum(min(inp.training.clerk_low, personal_caps.get(person, inp.training.clerk_low))
                              for person in members)
         follow_seats, unknown_follow = _clerk_shared_follow_capacity(
             inp, b, adjacent_grid)
@@ -377,12 +380,13 @@ def diagnose_day(inp: DaySolveInput, explanation: DayCourseExplanation,
                 "可檢查門診停診、梯次重疊、請假及鎖定格")
         seats = biopsy_slots.get(b["id"], set())
         coverage = _clerk_biopsy_coverage(inp, b, seats)
-        if members and coverage < len(members):
+        needed = len(members) * inp.training.clerk_biopsy_low
+        if members and coverage < needed:
             dates = "、".join(f"{iso} {session}" for iso, session in sorted(seats)) or "無"
             shortages.append(
-                f"Clerk {b['id']} 切片席位容量不足：{len(members)} 人各需至少 1 席，"
-                f"已實排成員與其餘可用單人席位最多涵蓋 {coverage} 人，"
-                f"至少缺 {len(members) - coverage} 席。"
+                f"Clerk {b['id']} 切片席位容量不足：{len(members)} 人各需至少 {inp.training.clerk_biopsy_low} 席，"
+                f"已實排成員與其餘可用單人席位最多涵蓋 {coverage} {'人' if inp.training.clerk_biopsy_low == 1 else '席'}，"
+                f"至少缺 {needed - coverage} 席。"
                 f"目前席位：{dates}；可增加整梯有效開放時段或調整梯次人數")
 
     for row in explanation.pgy:
@@ -401,14 +405,15 @@ def diagnose_day(inp: DaySolveInput, explanation: DayCourseExplanation,
             label = f"{week[0]}-W{week[1]:02d}"
             actual = dict(row.weekly_follows).get(label, 0)
             rows.append(RequirementCapacity(
-                "PGY", label, row.code, "跟診", 1, 2, len(ws),
+                "PGY", label, row.code, "跟診", inp.training.pgy_low, inp.training.pgy_target, len(ws),
                 possible, shared, actual, unknown,
                 blockers + tuple(b for b in leave_blockers
                                  if date.fromisoformat(b[:10]).isocalendar()[:2] == week)))
-            if possible < 1 and actual < 1 and not unknown:
+            if possible < inp.training.pgy_low and actual < inp.training.pgy_low and not unknown:
+                capacity_text = "沒有可用門診半日" if possible == 0 else f"可用門診半日 {possible}"
                 shortages.append(
-                    f"PGY {row.code} {label} 跟診：最低 1，"
-                    "沒有可用門診半日；先檢查停診、請假與鎖定格")
+                    f"PGY {row.code} {label} 跟診：最低 {inp.training.pgy_low}，"
+                    f"{capacity_text}；先檢查停診、請假與鎖定格")
 
         if row.manual_reduction:
             peers = [p for p in explanation.pgy if p.code != row.code]
@@ -458,10 +463,11 @@ def diagnose_day(inp: DaySolveInput, explanation: DayCourseExplanation,
             weekly_actual = dict(row.weekly_follows)
             one_follow = [f"{week[0]}-W{week[1]:02d}"
                           for week in week_slots(available)
-                          if weekly_actual.get(f"{week[0]}-W{week[1]:02d}", 0) == 1]
+                          if inp.training.pgy_low > 0
+                          and weekly_actual.get(f"{week[0]}-W{week[1]:02d}", 0) == inp.training.pgy_low]
             if one_follow:
                 manual_notes.append(
-                    f"PGY {row.code} 這些週次跟診已在最低 1 次，"
+                    f"PGY {row.code} 這些週次跟診已在最低 {inp.training.pgy_low} 次，"
                     "不可藉刪除跟診強行減量：" + "、".join(one_follow))
 
     return DayFeasibility(tuple(rows), tuple(shortages), tuple(manual_notes))
