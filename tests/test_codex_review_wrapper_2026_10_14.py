@@ -144,5 +144,40 @@ class CodexReviewWrapperTests(unittest.TestCase):
         self.assertEqual((rc, sid, passes), (4, SID, "1"), out)
 
 
+class ResolveCliUnicodePathTests(unittest.TestCase):
+    """Automatic CLI selection must return a non-ASCII path intact.
+
+    The wrapper tests pin CODEX_REVIEW_CLI and never run this branch. Here the
+    real resolve_cli runs against a stand-in `which` helper that prints a
+    Chinese path with Python's default (locale) encoding.
+    """
+    CLI = "C:/Users/\u9673\u7fca\u5609/AppData/Local/OpenAI/Codex/bin/x/codex.exe"
+
+    def test_resolve_cli_keeps_unicode_path(self):
+        source = (ROOT / "tools/codex_review.sh").read_text(encoding="utf-8")
+        start = source.index("resolve_cli() {")
+        end = source.index("\nVERIFIED_SID=", start)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "codex_review_identity.py").write_text(
+                "import sys\nassert sys.argv[1:] == ['which'], sys.argv\n"
+                f"print({self.CLI!r})\nprint('codex-cli 0.0.0')\n", encoding="utf-8")
+            out = root / "cli.txt"
+            script = root / "probe.sh"
+            python = sys.executable.replace("\\", "/")
+            script.write_text(
+                'die() { echo "$*" >&2; exit 64; }\n'
+                f'PYTHON="{python}"\nSCRIPT_DIR="{root.as_posix()}"\nREPO_ROOT=/fixture\n'
+                + source[start:end]
+                + f'\nresolve_cli >/dev/null\nprintf "%s" "$CODEX_CLI" > "{out.as_posix()}"\n',
+                encoding="utf-8", newline="\n")
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("PYTHONUTF8", "PYTHONIOENCODING", "CODEX_REVIEW_CLI", "BASH_ENV")}
+            result = subprocess.run([_bash(), "--noprofile", "--norc", str(script)], env=env,
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(out.read_bytes().decode("utf-8", "replace"), self.CLI)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -90,7 +90,8 @@ resolve_cli() {
   if [ -n "${CODEX_REVIEW_CLI:-}" ]; then
     CODEX_CLI="$CODEX_REVIEW_CLI"
   else
-    CODEX_CLI="$("$PYTHON" "$SCRIPT_DIR/codex_review_identity.py" which | head -1 | tr -d '\r')" ||
+    # -X utf8: Python writes the (possibly non-ASCII) path as UTF-8 even when piped.
+    CODEX_CLI="$("$PYTHON" -X utf8 "$SCRIPT_DIR/codex_review_identity.py" which | head -1 | tr -d '\r')" ||
       CODEX_CLI=""
   fi
   [ -n "$CODEX_CLI" ] || die "找不到可用的 Codex CLI;不降級到其他模型。"
