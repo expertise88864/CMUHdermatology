@@ -1,8 +1,8 @@
 # Project agreements
 
-## 最新使用者定案：diff review 一律 gpt-6.1-sol／high（2026-10-14）
+## 最新使用者定案：diff review 一律 gpt-6.1-sol／xhigh（2026-10-14）
 
-- 之後任何 diff review 一律由 `gpt-6.1-sol`、effort `high` 執行，經 `tools/codex_review.sh`（Codex CLI、唯讀、`--ignore-user-config`、無 web search／apps）；不得 fallback 到其他模型或較低 effort，wrapper 以 session 紀錄驗證實際模型，證明不了就不算一輪。
+- 之後任何 diff review 一律由 `gpt-6.1-sol`、effort `xhigh`（extrahigh）執行，經 `tools/codex_review.sh`（Codex CLI、唯讀、`--ignore-user-config`、無 web search／apps）；不得 fallback 到其他模型或較低 effort，wrapper 以 session 紀錄驗證實際模型，證明不了就不算一輪。
 - 額度不足時標記 pending、照常 commit + push，額度恢復後補審；pending 不是通過。遠端 CI 規則不變。
 - 切換前已帶 `Claude-Opus-5-Review: pending` 的 commit 仍以 `claude-opus-5-5`／high 補審；Opus 5 或任何 Claude 審過即算已審。下方 2026-09-23 節只適用於這類補審。
 

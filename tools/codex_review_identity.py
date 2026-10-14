@@ -15,10 +15,10 @@ import subprocess
 import sys
 
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.I)
-# User decision 2026-10-14: every diff review runs gpt-6.1-sol at high effort.
+# User decision 2026-10-14: every diff review runs gpt-6.1-sol at xhigh effort.
 # There is no fallback model or effort; a session that cannot prove both fails.
 MODEL = "gpt-6.1-sol"
-EFFORT = "high"
+EFFORT = "xhigh"
 _VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.]+))?")
 
 

@@ -1,4 +1,4 @@
-"""tools/codex_review.sh — gpt-6.1-sol / high review profile (user decision 2026-10-14).
+"""tools/codex_review.sh — gpt-6.1-sol / xhigh review profile (user decision 2026-10-14).
 
 Every run uses an isolated fixture CLI and fixture session log; nothing here
 reaches the real Codex installation or the network.
@@ -55,7 +55,7 @@ sys.exit(int(os.environ["FIXTURE_RC"]))
 
 class CodexReviewWrapperTests(unittest.TestCase):
     def run_wrapper(self, *, resume=False, recorded=None, count=0, returned=SID,
-                    model="gpt-6.1-sol", effort="high", sandbox="read-only", rc=0):
+                    model="gpt-6.1-sol", effort="xhigh", sandbox="read-only", rc=0):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "repo"
             root.mkdir()
@@ -109,7 +109,7 @@ class CodexReviewWrapperTests(unittest.TestCase):
     def assert_profile(self, called):
         args = called["args"]
         self.assertEqual(args[args.index("--model") + 1], "gpt-6.1-sol")
-        self.assertIn("model_reasoning_effort=high", args)
+        self.assertIn("model_reasoning_effort=xhigh", args)
         self.assertIn("--json", args)
         if os.name == "nt":
             self.assertIn("windows.sandbox=unelevated", args)
@@ -122,7 +122,7 @@ class CodexReviewWrapperTests(unittest.TestCase):
         self.assert_profile(called)
 
     def test_wrong_actual_profile_never_counts(self):
-        for kwargs in ({"model": "gpt-5.6-sol"}, {"effort": "medium"}, {"sandbox": "workspace-write"}):
+        for kwargs in ({"model": "gpt-5.6-sol"}, {"effort": "high"}, {"sandbox": "workspace-write"}):
             with self.subTest(**kwargs):
                 rc, called, sid, passes, out = self.run_wrapper(**kwargs)
                 self.assertEqual((rc, sid, passes), (4, None, "0"), out)
