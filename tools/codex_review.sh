@@ -8,9 +8,15 @@
 #   tools/codex_review.sh resume [session-id]
 #
 # mode:
-#   diff      低風險/局部(文案、註解、CSS、tests-only)     medium / 額外檔 3 / findings 3
-#   targeted  一般非 trivial 實作(預設)                     medium / 額外檔 12 / findings 5
+#   diff      低風險/局部(文案、註解、CSS、tests-only)     high / 額外檔 3 / findings 3
+#   targeted  一般非 trivial 實作(預設)                     high / 額外檔 12 / findings 5
 #   deep      醫療劑量、醫令自動化、資安、資料完整、併發、大重構 high / 額外檔 30 / findings 8
+#
+# 模型與 effort(使用者 2026-10-14 定案):任何 diff review 一律 gpt-6.1-sol / high,
+# 不 fallback 到其他模型或較低 effort。模式只差範圍。實際模型/effort/唯讀沙箱由
+# tools/codex_review_identity.py 對 session 紀錄驗證,證明不了就不算一輪(exit 4)。
+# CLI:CODEX_REVIEW_CLI 明示,否則 `codex_review_identity.py which` 挑本機版本最高者
+# (npm 0.155.1 不支援 gpt-6.1-sol,Codex 桌面版內附的 0.162 alpha 可以)。
 #   resume    後續輪(第 2、3、…;僅限 confirmed findings 修正後);沿用第一輪 session
 #
 # 設計原則(勿改):
@@ -22,7 +28,7 @@
 #   * 結果只讀「最後一則訊息」(-o),不掃整份輸出。
 set -uo pipefail
 
-MODEL="gpt-5.6-sol"
+MODEL="gpt-6.1-sol"
 HARDEN="${CODEX_REVIEW_HARDEN:-1}"
 STRICT="${CODEX_REVIEW_STRICT:-1}"
 TIP="${CODEX_REVIEW_TIP:-HEAD}"
@@ -33,6 +39,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)" \
   || die "必須在 git repository 內執行。"
 REPO_NAME="$(basename "$REPO_ROOT")"
+if [ -x "$REPO_ROOT/.venv/Scripts/python.exe" ]; then PYTHON="$REPO_ROOT/.venv/Scripts/python.exe"
+elif command -v python >/dev/null 2>&1; then PYTHON="python"
+elif command -v python3 >/dev/null 2>&1; then PYTHON="python3"
+else die "找不到 Python,無法驗證審查身分。"; fi
 STATE_DIR="$REPO_ROOT/.codex-review"
 mkdir -p "$STATE_DIR"
 USAGE_TSV="$STATE_DIR/usage.tsv"
@@ -47,15 +57,16 @@ MODE="${1:-}"
 [ -n "$MODE" ] || die "缺少 mode。用法: $0 <diff|targeted|deep> <base-ref> [ctx] | $0 resume [sid]"
 
 case "$MODE" in
-  diff)     EFFORT="medium"; EXTRA_FILE_LIMIT=3;  FINDING_LIMIT=3 ;;
-  targeted) EFFORT="medium"; EXTRA_FILE_LIMIT=12; FINDING_LIMIT=5 ;;
+  diff)     EFFORT="high";   EXTRA_FILE_LIMIT=3;  FINDING_LIMIT=3 ;;
+  targeted) EFFORT="high";   EXTRA_FILE_LIMIT=12; FINDING_LIMIT=5 ;;
   deep)     EFFORT="high";   EXTRA_FILE_LIMIT=30; FINDING_LIMIT=8 ;;
   resume)   EFFORT="";       EXTRA_FILE_LIMIT="";  FINDING_LIMIT="" ;;
   *) die "未知 mode '$MODE'(可用:diff | targeted | deep | resume)" ;;
 esac
 
 build_flags() {   # $1 = effort ; $2 = kind("exec" | "resume")
-  FLAGS=(--ignore-user-config --model "$MODEL" -c "model_reasoning_effort=$1" -o "$LAST_MSG")
+  # --json:session id 與 token 用量改由機器可讀事件 + session 紀錄驗證,不再掃文字。
+  FLAGS=(--ignore-user-config --json --model "$MODEL" -c "model_reasoning_effort=$1" -o "$LAST_MSG")
   if [ "${2:-exec}" = "resume" ]; then
     FLAGS+=(-c "sandbox_mode=read-only")
   else
@@ -65,12 +76,49 @@ build_flags() {   # $1 = effort ; $2 = kind("exec" | "resume")
   if [ "$HARDEN" = "1" ]; then
     FLAGS+=(-c "web_search=disabled" -c "features.apps=false")
   fi
+  # --ignore-user-config 也丟掉使用者的 [windows] sandbox 設定;少了它,Windows 的
+  # 唯讀沙箱會拒絕每一個指令(連 git diff 都不行),審查者什麼都讀不到。
+  case "${OS:-}$(uname -s 2>/dev/null)" in
+    *Windows_NT*|*MINGW*|*MSYS*|*CYGWIN*) FLAGS+=(-c "windows.sandbox=unelevated") ;;
+  esac
+}
+
+# 沙箱用受限權杖執行,repo 目錄擁有者是 BUILTIN\Administrators 時 git 會回
+# 「dubious ownership」而讀不到 diff。只對審查子行程、只把本 repo 標成 safe:
+# GIT_CONFIG_PARAMETERS 屬命令列層級,git 承認它的 safe.directory;不動全域設定。
+resolve_cli() {
+  if [ -n "${CODEX_REVIEW_CLI:-}" ]; then
+    CODEX_CLI="$CODEX_REVIEW_CLI"
+  else
+    CODEX_CLI="$("$PYTHON" "$SCRIPT_DIR/codex_review_identity.py" which | head -1 | tr -d '\r')" ||
+      CODEX_CLI=""
+  fi
+  [ -n "$CODEX_CLI" ] || die "找不到可用的 Codex CLI;不降級到其他模型。"
+  echo "[codex-review] cli=$CODEX_CLI"
+  local quoted
+  quoted="$(printf '%s' "$REPO_ROOT" | sed "s/'/'\\\\''/g")"
+  export GIT_CONFIG_PARAMETERS="${GIT_CONFIG_PARAMETERS:+$GIT_CONFIG_PARAMETERS }'safe.directory'='$quoted'"
+}
+
+VERIFIED_SID=""
+VERIFIED_TOKENS=""
+# 實際 session 必須是本輪、本 repo、gpt-6.1-sol/high/read-only;$1 = 續審時預期的 session。
+verify_actual_session() {
+  local identity
+  local a=("$SCRIPT_DIR/codex_review_identity.py" --raw-log "$RAW_LOG"
+           --repo "$REPO_ROOT" --started-at "$REVIEW_STARTED_AT"
+           --proof "$STATE_DIR/last_identity.json")
+  rm -f "$STATE_DIR/last_identity.json"
+  [ -z "${1:-}" ] || a+=(--expected-session "$1")
+  identity="$("$PYTHON" "${a[@]}")" || return 1
+  IFS=$'\t' read -r VERIFIED_SID VERIFIED_TOKENS <<< "$identity"
+  [ -n "$VERIFIED_SID" ] && [ -n "$VERIFIED_TOKENS" ]
 }
 
 # 舊版接受「任意 36 個 hex 或連字號」,那不是 UUID 形狀 —— 全連字號也會過,
 # 然後被寫進 last_session_id 成為之後每一輪都信任的壞紀錄。改為錨定 8-4-4-4-12。
-extract_session_id() { grep -oiE 'session id:[[:space:]]*[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' "$RAW_LOG" 2>/dev/null | head -1 | grep -oiE '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' || true; }
-extract_tokens() { awk 'tolower($0) ~ /tokens used/ {found=1; next} found && $0 ~ /[0-9]/ {gsub(/[^0-9]/,"",$0); if (length($0)) {print $0; exit}}' "$RAW_LOG" 2>/dev/null || true; }
+extract_session_id() { printf '%s' "$VERIFIED_SID"; }
+extract_tokens() { printf '%s' "$VERIFIED_TOKENS"; }
 extract_result() {
   [ -s "$LAST_MSG" ] || { echo "UNKNOWN"; return; }
   if grep -q 'REQUEST_CHANGES' "$LAST_MSG"; then echo "REQUEST_CHANGES"
@@ -132,7 +180,7 @@ resume 只能沿用同一 task 的 session。要重開一輪全新審查請跑�
   [ "$PREV_PASS" -ge 1 ] 2>/dev/null \
     || die "resume 只能在完成第一輪之後(目前 pass=$PREV_PASS)。請先跑第一輪。"
   THIS_PASS=$((PREV_PASS + 1))
-  RESUME_EFFORT="$(tail -1 "$USAGE_TSV" | cut -f5)"; [ -n "$RESUME_EFFORT" ] || RESUME_EFFORT="medium"
+  RESUME_EFFORT="high"   # 2026-10-14:一律 high,不沿用舊紀錄裡可能的 medium
   RESUME_BASE="$(tail -1 "$USAGE_TSV" | cut -f6)";   [ -n "$RESUME_BASE" ] || RESUME_BASE="unavailable"
   build_flags "$RESUME_EFFORT" resume
   read -r -d '' RESUME_PROMPT <<'RP' || true
@@ -149,10 +197,16 @@ RP
   #   背景執行(自動化)時那個 stdin 永遠不會 EOF —— 實際發生過一次卡死
   #   10 小時零輸出、一次被限流守衛判成「無結論」而 exit 4。prompt 本來就
   #   是用參數傳的,stdin 沒有任何用途。
-  ( cd "$REPO_ROOT" && codex exec resume "$SID" "${FLAGS[@]}" "$RESUME_PROMPT" ) </dev/null 2>&1 | tee "$RAW_LOG"
+  resolve_cli
+  REVIEW_STARTED_AT="$("$PYTHON" -c 'import time; print(time.time())')" || die "Python unavailable"
+  ( cd "$REPO_ROOT" && "$CODEX_CLI" exec resume "$SID" "${FLAGS[@]}" "$RESUME_PROMPT" ) </dev/null 2>&1 | tee "$RAW_LOG"
   CODEX_RC=${PIPESTATUS[0]}
   if [ "$CODEX_RC" -ne 0 ] && [ ! -s "$LAST_MSG" ]; then
     die "codex exec resume 啟動失敗(exit=$CODEX_RC),未產生 review;本輪不計。"
+  fi
+  if ! verify_actual_session "$SID"; then
+    echo "[codex-review] 實際 session 驗證失敗(模型/effort/沙箱/session 不符)—— 本輪不計,勿據此 push。" >&2
+    exit 4
   fi
   echo "$THIS_PASS" > "$PASS_FILE"
   RESULT="$(log_usage "resume" "$RESUME_EFFORT" "$RESUME_BASE" "$THIS_PASS")"
@@ -287,22 +341,32 @@ sed -i -e "/{{TASK_CONTEXT}}/r $TMP/ctx.txt" -e "/{{TASK_CONTEXT}}/d" "$TMP/prom
 sed -i -e "/{{VERIFICATION_RESULTS}}/r $TMP/ver.txt" -e "/{{VERIFICATION_RESULTS}}/d" "$TMP/prompt.txt"
 
 build_flags "$EFFORT"
-echo "[codex-review] mode=$MODE effort=$EFFORT range=$BASE..$TIP model=$MODEL (pass 1/2, read-only)"
+echo "[codex-review] mode=$MODE effort=$EFFORT range=$BASE..$TIP model=$MODEL (pass 1, read-only)"
+# 第一輪開始就清掉上一場的 pass 與 session 紀錄:本輪若驗證失敗,不可讓 resume
+# 接回上一場(那會把舊 session 的 APPROVE 當成這次的結論)。
+echo 0 > "$PASS_FILE"
+rm -f "$SESSION_FILE"
 : > "$LAST_MSG"
 # ★stdin 一律導自 /dev/null★(2026-08-30 實測):codex CLI 在 stdin 不是
 #   TTY 時會印 "Reading additional input from stdin..." 並【等】額外輸入。
 #   背景執行(自動化)時那個 stdin 永遠不會 EOF —— 實際發生過一次卡死
 #   10 小時零輸出、一次被限流守衛判成「無結論」而 exit 4。prompt 本來就
 #   是用參數傳的,stdin 沒有任何用途。
-codex exec "${FLAGS[@]}" "$(cat "$TMP/prompt.txt")" </dev/null 2>&1 | tee "$RAW_LOG"
+resolve_cli
+REVIEW_STARTED_AT="$("$PYTHON" -c 'import time; print(time.time())')" || die "Python unavailable"
+"$CODEX_CLI" exec "${FLAGS[@]}" "$(cat "$TMP/prompt.txt")" </dev/null 2>&1 | tee "$RAW_LOG"
 CODEX_RC=${PIPESTATUS[0]}
 if [ "$CODEX_RC" -ne 0 ] && [ ! -s "$LAST_MSG" ]; then
   die "codex exec 啟動失敗(exit=$CODEX_RC),未產生 review。請檢查 CLI 版本與旗標。"
 fi
+if ! verify_actual_session; then
+  echo "[codex-review] 實際 session 驗證失敗(模型/effort/沙箱/session 不符)—— 本輪不計,勿據此 push。" >&2
+  exit 4
+fi
 
 echo 1 > "$PASS_FILE"
 RESULT="$(log_usage "$MODE" "$EFFORT" "$BASE" 1)"
-echo; echo "[codex-review] result=$RESULT (pass 1/2)  usage → $USAGE_TSV"
+echo; echo "[codex-review] result=$RESULT (pass 1)  usage → $USAGE_TSV"
 # 限流僅在「未產生明確結論」時才視為不可信(避免 review 的 diff 內容含 'rate limit' 字面誤判)。
 if is_rate_limited && [ "$RESULT" = "UNKNOWN" ]; then
   echo "[codex-review] Codex 限流且無明確結論,結果不可信,勿據此修改。" >&2; exit 4; fi
