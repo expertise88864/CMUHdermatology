@@ -30,7 +30,7 @@
 
 以使用者最新定案、`AGENTS.md`、[REMOTE_CI_DELIVERY.md](REMOTE_CI_DELIVERY.md) 及 `_delivery_policy.json` 為準。隔離 `codex/*` 分支：相關本機回歸與快速檢查 → 完整 diff 的獨立 Codex／Claude review → 候選 exact-SHA 遠端 CI → **同一 SHA** 正常快轉進 main → 正式 exact-SHA CI 與適用假環境 smoke。文件與空 audit commit 也遵守此流程。
 
-新 diff review 一律 `gpt-6.1-sol`／`high`（2026-10-14 定案，經 `tools/codex_review.sh` 並驗證實際模型）；切換前帶 Claude pending 的補審仍用完整 ID `claude-opus-5-5`、effort `high`、唯讀工具，核對機器回傳 `modelUsage`。額度不足只代表 pending，不能當成核准或省略 CI；較早文件不取代最新使用者定案。
+新 diff review 一律 `gpt-6.1-sol`／`xhigh`（2026-10-14 定案，經 `tools/codex_review.sh` 並驗證實際模型）；切換前帶 Claude pending 的補審仍用完整 ID `claude-opus-5-5`、effort `high`、唯讀工具，核對機器回傳 `modelUsage`。額度不足只代表 pending，不能當成核准或省略 CI；較早文件不取代最新使用者定案。
 
 GitHub CI 包含 Windows／Python 3.13 完整 pytest、Ruff、Pyright、skip／coverage／type-debt、Security 及 Delivery contract。指令見手冊；測試數量以當次輸出為準。
 

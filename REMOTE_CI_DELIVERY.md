@@ -8,7 +8,7 @@ change medical content, visual baselines, credentials, recipients or scoring.
 1. Fetch main. Preserve other work. Use an isolated codex/* branch based on current main.
 2. Make task-owned changes; run relevant local regression tests, syntax/lint and
    required generators. Commit the exact source and generated artifacts together.
-3. Complete the independent diff review: gpt-6.1-sol/high read-only via tools/codex_review.sh
+3. Complete the independent diff review: gpt-6.1-sol/xhigh read-only via tools/codex_review.sh
    (user decision 2026-10-14). Claude Opus 5.5/high applies only to pre-switch pending backfill.
    Only confirmed provider quota exhaustion permits pending trailers and scheduled retry.
 4. Install the tracked pre-push hook with the documented existing hook mechanism.
