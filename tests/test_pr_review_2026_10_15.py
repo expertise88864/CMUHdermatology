@@ -269,3 +269,40 @@ class RebuttalTests(unittest.TestCase):
         assert 'REBUTTAL_FILE="${CODEX_REVIEW_REBUTTAL_FILE:-}"' in text
         assert "Never withdraw a finding on assertion alone" in text
         assert "rebuttal 檔看起來含 diff" in text
+
+
+DIFF_SAMPLES = ("diff --git a/x.py b/x.py", "    diff --git a/x.py b/x.py", "\t@@ -1,2 +1,2 @@",
+                "  index 1234abc..5678def 100644", "    --- a/x.py", "    +++ b/x.py")
+EVIDENCE_SAMPLES = ("Finding 1 is REJECTED: _delivery.py:40 already checks the owner.",
+                    "---", "See the delivery suite, test_y (line 12) -- it covers this path.")
+
+
+class RebuttalDiffMarkerTests(unittest.TestCase):
+    """Backport of the morning-report PR #18 fix (P2): indented diffs must not pass as rebuttal evidence."""
+
+    def test_python_check_rejects_indented_diffs_and_keeps_evidence(self):
+        for line in DIFF_SAMPLES:
+            with self.subTest(line=line):
+                self.assertTrue(pr.DIFF_MARKER.search(f"evidence\n{line}\nmore"))
+        for line in EVIDENCE_SAMPLES:
+            with self.subTest(line=line):
+                self.assertIsNone(pr.DIFF_MARKER.search(line))
+
+    def test_wrapper_check_rejects_indented_diffs_and_keeps_evidence(self):
+        import re
+        import shutil
+        import subprocess
+        import tempfile
+        grep = shutil.which("grep")
+        if not grep:
+            self.skipTest("grep not available")
+        text = (ROOT / "tools" / "codex_review.sh").read_text(encoding="utf-8")
+        block = text.split('REBUTTAL_FILE="${CODEX_REVIEW_REBUTTAL_FILE:-}"', 1)[1]
+        pattern = re.search(r"grep -qE '([^']+)' \"\$REBUTTAL_FILE\"", block).group(1)
+        with tempfile.TemporaryDirectory() as tmp:
+            sample = Path(tmp) / "rebuttal.txt"
+            for line, expected in [(x, 0) for x in DIFF_SAMPLES] + [(x, 1) for x in EVIDENCE_SAMPLES]:
+                sample.write_text(f"evidence\n{line}\n", encoding="utf-8")
+                with self.subTest(line=line):
+                    rc = subprocess.run([grep, "-qE", pattern, str(sample)]).returncode
+                    self.assertEqual(rc, expected)

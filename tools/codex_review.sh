@@ -214,7 +214,8 @@ Scope override: your previous verdict covered ${PREV_TIP}. Review EVERY change i
   REBUTTAL_FILE="${CODEX_REVIEW_REBUTTAL_FILE:-}"
   if [ -n "$REBUTTAL_FILE" ]; then
     [ -f "$REBUTTAL_FILE" ] || die "rebuttal 檔不存在:$REBUTTAL_FILE"
-    if grep -qE '^(diff --git |@@ |index [0-9a-f]+\.\.)' "$REBUTTAL_FILE"; then
+    # 縮排的 diff 也算(與 tools/pr_review.py 的 DIFF_MARKER 同一套標記)。
+    if grep -qE '^[[:blank:]]*(diff --git[[:blank:]]|@@|index [0-9a-f]+\.\.|(---|\+\+\+)[[:blank:]]+[^[:space:]])' "$REBUTTAL_FILE"; then
       die "rebuttal 檔看起來含 diff。只能放對 REJECTED finding 的證據說明。"
     fi
     RESUME_PROMPT="$RESUME_PROMPT

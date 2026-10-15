@@ -47,6 +47,9 @@ RETRYING = re.compile(r"retry|retrying|reconnect", re.I)
 # Wording of an exhausted plan, as opposed to a transient rate limit.
 EXHAUSTED = re.compile(r"usage limit|try again at|quota exceeded|insufficient_quota", re.I)
 MAX_COMMENT = 60000
+# Diff markers, indented or not (same pattern as the wrapper's rebuttal check): a rebuttal
+# is evidence text and must never smuggle a patch into the reviewer prompt.
+DIFF_MARKER = re.compile(r"^[ \t]*(diff --git[ \t]|@@|index [0-9a-f]+\.\.|(?:---|\+\+\+)[ \t]+\S)", re.M)
 
 
 class Blocked(RuntimeError):
@@ -405,8 +408,7 @@ def main() -> int:
                 raise Blocked("--rebuttal continues a session: use it with --resume")
             rebuttal = str(Path(args.rebuttal).resolve())
             text = Path(rebuttal).read_text(encoding="utf-8")
-            if not text.strip() or len(text) > 20000 \
-                    or re.search(r"^(diff --git |@@ |index [0-9a-f]+\.\.)", text, re.M):
+            if not text.strip() or len(text) > 20000 or DIFF_MARKER.search(text):
                 raise Blocked("The rebuttal must be non-empty evidence text (<= 20000 chars), never a diff")
         if args.resume:
             saved = json.loads(binding.read_text(encoding="utf-8")) if binding.is_file() else {}
