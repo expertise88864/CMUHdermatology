@@ -39,6 +39,7 @@ EFFORT = "xhigh"
 MARKER = "<!-- codex-pr-review -->"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 QUOTA = re.compile(r"usage limit|rate limit|try again at|quota", re.I)
+BASE_IN_STATUS = re.compile(r"base=([0-9a-f]{40})")
 MAX_COMMENT = 60000
 
 
@@ -139,11 +140,36 @@ def open_pr(api: API, branch: str, base: str, head: str) -> dict:
     return api.call("POST", "/pulls", {"title": title[:200], "head": branch, "base": "main", "body": body})
 
 
-def run_review(mode: str, base: str, head: str, ctx: str | None, resume: bool) -> tuple[str, str, str]:
+def provider_quota_error(raw: str) -> bool:
+    """Quota only from the CLI's own error events, never from reviewed content.
+
+    Agent messages and command output (for example a diff mentioning "quota")
+    arrive as other JSON events and must not turn a failure into quota-pending."""
+    for line in raw.splitlines():
+        text = line.strip()
+        if not text or text.startswith("[codex-review]"):
+            continue
+        try:
+            event = json.loads(text)
+        except ValueError:
+            event = None
+        if isinstance(event, dict):
+            if event.get("type") not in ("error", "turn.failed"):
+                continue
+            text = json.dumps(event.get("message") or event.get("error") or "", ensure_ascii=False)
+        elif not text.upper().startswith("ERROR"):
+            continue
+        if QUOTA.search(text):
+            return True
+    return False
+
+
+def run_review(mode: str, base: str, head: str, ctx: str | None,
+               resume_session: str | None) -> tuple[str, str, str]:
     """Return (verdict, session_id, last_message)."""
     env = {**os.environ, "CODEX_REVIEW_TIP": head, "CODEX_REVIEW_BASE": base}
     args = [bash(), wrapper()]
-    args += ["resume"] if resume else [mode, base] + ([ctx] if ctx else [])
+    args += ["resume", resume_session] if resume_session else [mode, base] + ([ctx] if ctx else [])
     rc = subprocess.run(args, cwd=ROOT, env=env, stdin=subprocess.DEVNULL).returncode
     state = ROOT / ".codex-review"
     message = (state / "last_message.txt").read_text(encoding="utf-8", errors="replace") \
@@ -156,7 +182,7 @@ def run_review(mode: str, base: str, head: str, ctx: str | None, resume: bool) -
         return "APPROVE", session, message
     if rc == 2:
         return "REQUEST_CHANGES", session, message
-    if not message.strip() and QUOTA.search(raw):
+    if not message.strip() and provider_quota_error(raw):
         return "QUOTA_PENDING", session, raw[-2000:]
     return "ERROR", session, message or raw[-2000:]
 
@@ -187,6 +213,19 @@ def record(api: API, pr: dict, verdict: str, base: str, head: str, session: str,
     api.call("POST", f"/issues/{pr['number']}/comments", {"body": body})
 
 
+def reviewed_base(api: API, sha: str) -> str:
+    """Base of the newest owner review status on this head (any verdict), or ''."""
+    owner = api.repo.split("/")[0].lower()
+    rows = [s for s in api.call("GET", f"/commits/{sha}/statuses?per_page=100") or []
+            if s.get("context") == CONTEXT
+            and str(s.get("creator", {}).get("login", "")).lower() == owner]
+    for status in sorted(rows, key=lambda s: s["id"], reverse=True):
+        match = BASE_IN_STATUS.search(str(status.get("description", "")))
+        if match:
+            return match.group(1)
+    return ""
+
+
 def latest_status(api: API, sha: str) -> dict | None:
     owner = api.repo.split("/")[0].lower()
     rows = api.call("GET", f"/commits/{sha}/statuses?per_page=100") or []
@@ -195,8 +234,18 @@ def latest_status(api: API, sha: str) -> dict | None:
     return max(mine, key=lambda s: s["id"]) if mine else None
 
 
+def all_prs(api: API) -> list:
+    rows = []
+    for page in range(1, 51):
+        batch = api.call("GET", f"/pulls?state=all&base=main&per_page=100&page={page}") or []
+        rows.extend(batch)
+        if len(batch) < 100:
+            return rows
+    raise Blocked("More than 5000 PRs; pending list would be incomplete")
+
+
 def list_pending(api: API) -> int:
-    rows = api.call("GET", "/pulls?state=all&base=main&per_page=50&sort=updated&direction=desc") or []
+    rows = all_prs(api)
     count = 0
     for pr in rows:
         head = pr["head"]["sha"]
@@ -241,6 +290,10 @@ def main() -> int:
                 raise Blocked("Push this exact head to origin first; the PR must show what was reviewed")
             pr = find_pr(api, branch, None)
         base = git("merge-base", git("rev-parse", "FETCH_HEAD"), head)
+        if base == head and args.pr:
+            # Backfill of a head already published to main: reuse the base the PR's
+            # recorded review covered, else the PR's own base.
+            base = reviewed_base(api, head) or git("merge-base", pr["base"]["sha"], head)
         if not SHA.fullmatch(base) or base == head:
             raise Blocked("Nothing to review: head has no commits beyond main")
         if pr is None:
@@ -250,13 +303,17 @@ def main() -> int:
         # The wrapper resumes the session recorded in this checkout; make sure that
         # session belongs to this PR, never to another PR reviewed here earlier.
         binding = ROOT / ".codex-review" / "pr_review.json"
+        resume_session = None
         if args.resume:
             saved = json.loads(binding.read_text(encoding="utf-8")) if binding.is_file() else {}
-            if saved.get("pr") != pr["number"] or saved.get("repo") != api.repo:
-                raise Blocked("The recorded review session is not for this PR; run a first round")
+            recorded = ROOT / ".codex-review" / "last_session_id"
+            current = recorded.read_text(encoding="utf-8").strip().lower() if recorded.is_file() else ""
+            resume_session = str(saved.get("session", "")).lower()
+            if saved.get("pr") != pr["number"] or saved.get("repo") != api.repo                     or not resume_session or resume_session != current:
+                raise Blocked("The recorded review session is not this PR's; run a first round")
         else:
             binding.unlink(missing_ok=True)
-        verdict, session, message = run_review(args.mode, base, head, args.ctx, args.resume)
+        verdict, session, message = run_review(args.mode, base, head, args.ctx, resume_session)
         if not args.resume and verdict in ("APPROVE", "REQUEST_CHANGES"):
             binding.write_text(json.dumps({"repo": api.repo, "pr": pr["number"], "session": session}),
                                encoding="utf-8")
