@@ -16,7 +16,9 @@ on:
 jobs:
   test:
     runs-on: windows-latest
-    # Full Windows tests with coverage take ~25 min; type-debt adds ~4 min.
+    # 2026-10-15 measured: successful jobs take ~40 min (p90 ~44); pytest with
+    # coverage is 23-44 min depending on the runner. The type-debt ratchet runs
+    # its 11 per-rule pyright checks concurrently (was ~4-5 min sequential).
     # Include dependency setup and runner variance while retaining every gate.
     timeout-minutes: 45
 
