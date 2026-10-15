@@ -15,6 +15,7 @@ Usage (clean checkout of the exact, already pushed codex/* head):
     python tools/pr_review.py --mode deep --ctx task.txt
     python tools/pr_review.py --pr 12               # backfill a PR (HEAD must equal its head)
     python tools/pr_review.py --pending             # list PRs whose head is not approved
+    python tools/pr_review.py --retry-record        # re-post a verdict GitHub did not accept
 
 Exit codes: 0 APPROVE, 2 REQUEST_CHANGES, 3 quota pending, 1 blocked/error.
 Quota pending is not approval; rerun when quota returns (same PR, same head).
@@ -40,6 +41,10 @@ MARKER = "<!-- codex-pr-review -->"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 QUOTA = re.compile(r"usage limit|rate limit|try again at|quota", re.I)
 BASE_IN_STATUS = re.compile(r"base=([0-9a-f]{40})")
+# A quota/usage message that still says it is retrying did not end the run.
+RETRYING = re.compile(r"retry|retrying|reconnect", re.I)
+# Wording of an exhausted plan, as opposed to a transient rate limit.
+EXHAUSTED = re.compile(r"usage limit|try again at|quota exceeded|insufficient_quota", re.I)
 MAX_COMMENT = 60000
 
 
@@ -148,7 +153,10 @@ def provider_quota_error(raw: str) -> bool:
     Quota-pending needs affirmative evidence that quota ended the run: the CLI's
     last output (wrapper lines aside) must itself be a quota error. A rate limit
     the CLI recovered from, followed by more activity, another error, a crash
-    line or silence, is an ERROR (fail closed), never publishable quota-pending."""
+    line or silence, is an ERROR (fail closed), never publishable quota-pending.
+    The last line must also be terminal: a `turn.failed` event naming quota, or an
+    error stating the plan is exhausted (usage limit / try again at); anything
+    still retrying, or a bare transient rate-limit error, is not."""
     lines = [line.strip() for line in raw.splitlines()]
     lines = [line for line in lines if line and not line.startswith("[codex-review]")]
     if not lines:
@@ -159,12 +167,18 @@ def provider_quota_error(raw: str) -> bool:
     except ValueError:
         event = None
     if isinstance(event, dict):
-        if event.get("type") not in ("error", "turn.failed"):
+        kind = event.get("type")
+        if kind not in ("error", "turn.failed"):
             return False
         text = json.dumps(event.get("message") or event.get("error") or "", ensure_ascii=False)
-    elif not text.upper().startswith("ERROR"):
+        failed_turn = kind == "turn.failed"
+    elif text.upper().startswith("ERROR"):
+        failed_turn = False
+    else:
         return False
-    return bool(QUOTA.search(text))
+    if RETRYING.search(text):
+        return False
+    return bool((QUOTA if failed_turn else EXHAUSTED).search(text))
 
 
 def run_review(mode: str, base: str, head: str, ctx: str | None,
@@ -283,6 +297,29 @@ def resume_base(saved: dict, head: str) -> str:
     return previous
 
 
+def finish(api: API, pr: dict, entry: dict, binding: Path, unrecorded: Path) -> int:
+    verdict, head = entry["verdict"], entry["head"]
+    record(api, pr, verdict, entry["base"], head, entry["session"], entry["message"], entry["resume"])
+    if verdict in ("APPROVE", "REQUEST_CHANGES"):
+        # Remember the head this session last judged, only once GitHub has the verdict;
+        # the next --resume reviews every commit after it (fixes and anything else).
+        binding.write_text(json.dumps({"repo": api.repo, "pr": pr["number"],
+                                       "session": entry["bound_session"], "head": head}),
+                           encoding="utf-8")
+    unrecorded.unlink(missing_ok=True)
+    print(f"[pr-review] {verdict} recorded on PR #{pr['number']} and status {CONTEXT}@{head[:12]}")
+    return {"APPROVE": 0, "REQUEST_CHANGES": 2, "QUOTA_PENDING": 3}.get(verdict, 1)
+
+
+def retry_record(api: API, pr: dict, head: str, binding: Path, unrecorded: Path) -> int:
+    if not unrecorded.is_file():
+        raise Blocked("No unrecorded verdict in this checkout")
+    entry = json.loads(unrecorded.read_text(encoding="utf-8"))
+    if entry.get("repo") != api.repo or entry.get("pr") != pr["number"] or entry.get("head") != head:
+        raise Blocked("The unrecorded verdict is for another PR or head")
+    return finish(api, pr, entry, binding, unrecorded)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--mode", choices=("diff", "targeted", "deep"), default="targeted")
@@ -290,6 +327,8 @@ def main() -> int:
     parser.add_argument("--resume", action="store_true", help="continue the recorded session")
     parser.add_argument("--pr", type=int, help="PR number (default: open PR of the current branch)")
     parser.add_argument("--pending", action="store_true", help="list PRs whose head lacks APPROVE")
+    parser.add_argument("--retry-record", action="store_true",
+                        help="re-post a verdict whose GitHub recording failed (no new review)")
     args = parser.parse_args()
     try:
         api = API(repository())
@@ -326,6 +365,11 @@ def main() -> int:
         # The wrapper resumes the session recorded in this checkout; make sure that
         # session belongs to this PR, never to another PR reviewed here earlier.
         binding = ROOT / ".codex-review" / "pr_review.json"
+        unrecorded = ROOT / ".codex-review" / "pr_review_unrecorded.json"
+        if args.retry_record:
+            return retry_record(api, pr, head, binding, unrecorded)
+        if unrecorded.is_file() and json.loads(unrecorded.read_text(encoding="utf-8")).get("head") == head:
+            raise Blocked("A verdict for this head was not recorded on GitHub; run --retry-record")
         resume_session = None
         previous_head = None
         if args.resume:
@@ -339,15 +383,13 @@ def main() -> int:
         else:
             binding.unlink(missing_ok=True)
         verdict, session, message = run_review(args.mode, base, head, args.ctx, resume_session, previous_head)
-        if verdict in ("APPROVE", "REQUEST_CHANGES"):
-            # Remember the head this session last judged; the next --resume reviews
-            # every commit after it (fixes and anything else pushed meanwhile).
-            binding.write_text(json.dumps({"repo": api.repo, "pr": pr["number"],
-                                           "session": resume_session or session, "head": head}),
-                               encoding="utf-8")
-        record(api, pr, verdict, base, head, session, message, args.resume)
-        print(f"[pr-review] {verdict} recorded on PR #{pr['number']} and status {CONTEXT}@{head[:12]}")
-        return {"APPROVE": 0, "REQUEST_CHANGES": 2, "QUOTA_PENDING": 3}.get(verdict, 1)
+        # Keep the verdict until GitHub has it: a failed POST is retried with
+        # --retry-record instead of being lost (or blocking the next --resume).
+        entry = {"repo": api.repo, "pr": pr["number"], "verdict": verdict, "base": base, "head": head,
+                 "session": session, "bound_session": resume_session or session,
+                 "message": message, "resume": args.resume}
+        unrecorded.write_text(json.dumps(entry), encoding="utf-8")
+        return finish(api, pr, entry, binding, unrecorded)
     except (Blocked, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         print(f"[pr-review] BLOCKED: {exc}", file=sys.stderr)
         return 1

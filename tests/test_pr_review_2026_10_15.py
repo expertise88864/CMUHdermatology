@@ -159,3 +159,50 @@ class ResumeScopeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetryingQuotaTests(unittest.TestCase):
+    """PR #1 round 4 (P1): an interrupted retry is not terminal quota exhaustion."""
+
+    def test_retrying_or_transient_rate_limit_last_is_not_quota(self):
+        for raw in (json.dumps({"type": "error", "message": "rate limit exceeded, retrying"}),
+                    json.dumps({"type": "error", "message": "rate limit exceeded"}),
+                    json.dumps({"type": "turn.failed", "error": {"message": "usage limit; retrying in 5s"}}),
+                    "ERROR: rate limit exceeded"):
+            with self.subTest(raw=raw):
+                self.assertFalse(pr.provider_quota_error(raw))
+
+
+class RecordRetryTests(unittest.TestCase):
+    """PR #1 round 4 (P2): a failed GitHub recording keeps the verdict for --retry-record."""
+
+    def test_failed_recording_keeps_verdict_and_old_binding_then_retry_records(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            binding = Path(tmp) / "pr_review.json"
+            unrecorded = Path(tmp) / "pr_review_unrecorded.json"
+            binding.write_text(json.dumps({"head": "b" * 40}), encoding="utf-8")
+            entry = {"repo": "owner/repo", "pr": 7, "verdict": "APPROVE", "base": "c" * 40, "head": SHA,
+                     "session": "s", "bound_session": "s", "message": "APPROVE", "resume": True}
+            unrecorded.write_text(json.dumps(entry), encoding="utf-8")
+            api, pull = FakeAPI(lambda path: None), {"number": 7}
+            with patch.object(pr, "record", side_effect=pr.Blocked("HTTP 502")), \
+                 self.assertRaises(pr.Blocked):
+                pr.finish(api, pull, entry, binding, unrecorded)
+            self.assertEqual(json.loads(binding.read_text(encoding="utf-8"))["head"], "b" * 40)
+            self.assertTrue(unrecorded.is_file())
+            with patch.object(pr, "record") as record:
+                self.assertEqual(pr.retry_record(api, pull, SHA, binding, unrecorded), 0)
+            record.assert_called_once()
+            self.assertEqual(json.loads(binding.read_text(encoding="utf-8"))["head"], SHA)
+            self.assertFalse(unrecorded.exists())
+
+    def test_retry_refuses_another_head_or_pr(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            unrecorded = Path(tmp) / "u.json"
+            unrecorded.write_text(json.dumps({"repo": "owner/repo", "pr": 7, "head": SHA}), encoding="utf-8")
+            for pull, head in (({"number": 8}, SHA), ({"number": 7}, "b" * 40)):
+                with self.subTest(pull=pull, head=head), self.assertRaises(pr.Blocked):
+                    pr.retry_record(FakeAPI(lambda path: None), pull, head, Path(tmp) / "b.json", unrecorded)
