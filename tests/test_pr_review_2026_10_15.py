@@ -46,6 +46,25 @@ class QuotaClassificationTests(unittest.TestCase):
         self.assertFalse(pr.provider_quota_error(json.dumps({"type": "error", "message": "stream disconnected"})))
 
 
+class StaleRoundTests(unittest.TestCase):
+    def test_wrapper_refusing_early_cannot_reuse_previous_quota_log(self):
+        import subprocess
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / ".codex-review"
+            state.mkdir()
+            (state / "last_raw.log").write_text(json.dumps({"type": "error", "message": "usage limit"}),
+                                                encoding="utf-8")
+            (state / "last_message.txt").write_text("", encoding="utf-8")
+            with patch.object(pr, "ROOT", Path(tmp)), patch.object(pr, "bash", return_value="bash"), \
+                 patch.object(pr, "wrapper", return_value="tools/codex_review.sh"), \
+                 patch.object(pr.subprocess, "run", return_value=subprocess.CompletedProcess([], 64)):
+                verdict, _, _ = pr.run_review("targeted", "b" * 40, SHA, None, None)
+            self.assertEqual(verdict, "ERROR")
+            self.assertFalse((state / "last_raw.log").exists())
+
+
 class PendingAndBackfillTests(unittest.TestCase):
     def test_pending_reads_every_page(self):
         pages = {1: [{"n": i} for i in range(100)], 2: [{"n": i} for i in range(100)], 3: [{"n": 0}]}
