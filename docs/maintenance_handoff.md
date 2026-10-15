@@ -244,8 +244,8 @@ python scripts/type_debt.py
 不代替完整 review。手動分步提交仍須相同生成及一致性守門，不繞 hook。
 
 1. 相關回歸、Ruff、sanity、delivery unit tests 成功；程式改動生成版本與 manifest，再核對最終 index。純文件未改 manifest 涵蓋檔案可保持版本不變，但記錄理由。
-2. 獨立 Codex review；Claude Code 固定 `claude-opus-5-5`／`high`／唯讀 `Read,Glob,Grep`，覆蓋 committed、staged、unstaged、相關 untracked。保存 diff 雜湊及 machine `modelUsage`；修 findings 後是新 diff，要重審。
-3. 只有確定的供應商額度限制可留 pending；每個未審 commit 加 pending／high trailers，安排回復後補審。其他審查失敗不能當額度豁免。
+2. （2026-10-15 起）不逐 commit review、不加 review trailer。候選推上後以 `python tools/pr_review.py` 對整個 PR（`merge-base(main, head)..head`）做一次 `gpt-6.1-sol`／`xhigh` 唯讀審查，結果寫在 PR comment 與 exact head 的 `codex-review/gpt-6.1-sol` status；修 CONFIRMED findings 後 push 再 `--resume`，直到 APPROVE。
+3. 只有確定的供應商額度限制可記 quota-pending；它可發佈但不是通過，額度恢復後以 `python tools/pr_review.py --pending` 補審，結果寫回同一 PR。其他審查失敗不能當額度豁免。
 4. `git config --get core.hooksPath` 應為本專案已追蹤 `.githooks`；使用既有安裝機制，不關閉 hook。
 5. 固定完整 SHA 推候選，完整候選 CI 成功才發佈同一 SHA。下列每一步失敗停止；分支示例需換成本批分支。
 
@@ -276,13 +276,7 @@ if ($LASTEXITCODE -ne 0) { throw '正式 CI 尚未通過；不能宣告交付' }
 
 `--wait 2700` 是本機最多觀察 45 分鐘，不會修改 GitHub 工作流程的逾時限制。觀察期結束且回報 `in_progress` 時，該步仍未通過，停止後續發佈；先在 GitHub 核對原 run ID／完整 SHA 是否仍在執行，再對同一 SHA、同一 phase 重跑上面的 `verify` 命令繼續觀察。此命令只查證據，不會重啟 CI。不要只因本機等待結束就取消或重啟原工作流程。若 GitHub 已回報 failure、cancelled 或 timed_out，按真正失敗診斷；API 讀不到也不能推定仍在執行或已通過。
 
-pending 獲乾淨全範圍 review 後，用**新空 audit commit**列出每個精確 SHA，不重寫既有 pending。audit 也走候選／正式 CI：
-
-```text
-Claude-Opus-5-Review: passed
-Claude-Opus-5-Review-Effort: high
-Claude-Opus-5-Reviewed-Commit: <被補審的完整 SHA>
-```
+2026-10-15 起不再產生 audit commit。切換前遺留的 `Claude-Opus-5-Review: pending` commit 補審後，把每個精確 SHA 與審查證據記在 PR comment 或 issue，不重寫既有歷史。
 
 每批保存：重現與風險、行為變化、SHA／版本、review／pending、本機結果、候選／正式 CI links、fake smoke、整包回退來源與實機待辦。合成測試不能寫成院內成功。
 

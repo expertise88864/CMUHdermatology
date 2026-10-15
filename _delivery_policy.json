@@ -1,6 +1,7 @@
 {
   "repository": "expertise88864/CMUHdermatology",
   "require_pr": false,
+  "pr_review": true,
   "workflows": [
     {
       "path": ".github/workflows/ci.yml",

@@ -172,6 +172,58 @@ class DeliveryTests(unittest.TestCase):
         with self.assertRaises(d.Blocked):
             d.preview_url(Fake(), SHA)
 
+    def _review_api(self, *statuses):
+        class Fake:
+            def pages(self, path):
+                assert path == f"/commits/{SHA}/statuses"
+                return list(statuses)
+        return Fake()
+
+    def _status(self, state="success", description=None, login="owner", context=None, ident=1):
+        return {"id": ident, "state": state, "context": context or d.REVIEW_CONTEXT,
+                "description": description or f"APPROVE base={'b'*40}",
+                "creator": {"login": login}, "target_url": "https://github.com/owner/repo/pull/1"}
+
+    def test_pr_review_approve_covering_main_passes(self):
+        cfg = {"repository": "owner/repo"}
+        with patch.object(d.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            result = d.pr_review(self._review_api(self._status()), cfg, SHA, "c"*40)
+        self.assertEqual(result["pr_review"], "APPROVE")
+        self.assertEqual(run.call_args.args[0][-2:], ["b"*40, "c"*40])
+
+    def test_pr_review_blocks_missing_failed_foreign_or_malformed(self):
+        cfg = {"repository": "owner/repo"}
+        cases = ([], [self._status("failure", f"REQUEST_CHANGES base={'b'*40}")],
+                 [self._status(login="someone-else")], [self._status(context="other")],
+                 [self._status("pending", f"APPROVE base={'b'*40}")],
+                 [self._status(description="APPROVE")],
+                 [self._status(ident=1), self._status("failure", f"REQUEST_CHANGES base={'b'*40}", ident=2)])
+        for statuses in cases:
+            with self.subTest(statuses=statuses), \
+                 patch.object(d.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)), \
+                 self.assertRaises(d.Blocked):
+                d.pr_review(self._review_api(*statuses), cfg, SHA, "c"*40)
+
+    def test_pr_review_range_must_cover_promoted_commits(self):
+        with patch.object(d.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)), \
+             self.assertRaises(d.Blocked):
+            d.pr_review(self._review_api(self._status()), {"repository": "owner/repo"}, SHA, "c"*40)
+
+    def test_pr_review_quota_pending_publishes_but_is_reported(self):
+        status = self._status("pending", f"quota-pending base={'b'*40}")
+        with patch.object(d.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)), \
+             patch.object(d.sys, "stderr", io.StringIO()) as err:
+            result = d.pr_review(self._review_api(status), {"repository": "owner/repo"}, SHA, "c"*40)
+        self.assertEqual(result["pr_review"], "quota-pending")
+        self.assertIn("not approved", err.getvalue())
+
+    def test_candidate_cannot_drop_base_pr_review(self):
+        self.assertTrue(d.requires_pr_review({"pr_review": False}, {"pr_review": True}))
+        self.assertTrue(d.requires_pr_review({"pr_review": True}, {}))
+        self.assertFalse(d.requires_pr_review({}, {}))
+        with self.assertRaises(d.Blocked):
+            d.validate_policy({**d.policy(), "pr_review": "yes"})
+
     def test_morning_dry_run_routing(self):
         self.assertFalse(d.needs_morning_preview(["AGENTS.md", "_delivery.py", "tests/test_email.py"]))
         for path in ("morning_report.py", "news_rules.py", "requirements.lock",

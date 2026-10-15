@@ -191,6 +191,12 @@ corrections introduced no concrete regression. Do not repeat the original full
 exploration. Remain strictly read-only. End with exactly APPROVE or
 REQUEST_CHANGES.
 RP
+  # PR flow: the head moved after the fixes; name the exact range under review.
+  if [ -n "${CODEX_REVIEW_BASE:-}" ] && [ "$TIP" != "HEAD" ]; then
+    RESUME_PROMPT="$RESUME_PROMPT
+
+The pull request range is now ${CODEX_REVIEW_BASE}..${TIP}; inspect the corrections with git diff/log inside that range."
+  fi
   echo "[codex-review] resume session=$SID effort=$RESUME_EFFORT (pass $THIS_PASS)"
   : > "$LAST_MSG"
   # ★stdin 一律導自 /dev/null★(2026-08-30 實測):codex CLI 在 stdin 不是
@@ -249,7 +255,7 @@ REVIEW MODE:
 {{MODE}}
 
 REVIEW RANGE:
-Committed range {{BASE}}..{{TIP}} (post-hoc audit of already-merged commits).
+Committed range {{BASE}}..{{TIP}} (one whole pull request: merge-base of main .. exact PR head).
 
 TASK CONTEXT:
 {{TASK_CONTEXT}}
