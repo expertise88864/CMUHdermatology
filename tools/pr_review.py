@@ -67,7 +67,7 @@ def token() -> str:
         text=True, capture_output=True, timeout=30,
         env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never"},
     )
-    found = dict(l.split("=", 1) for l in result.stdout.splitlines() if "=" in l).get("password", "")
+    found = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line).get("password", "")
     if result.returncode != 0 or not found:
         raise Blocked("No GitHub credential available (git credential helper or GH_TOKEN)")
     return found
@@ -141,33 +141,40 @@ def open_pr(api: API, branch: str, base: str, head: str) -> dict:
 
 
 def provider_quota_error(raw: str) -> bool:
-    """Quota only from the CLI's own error events, never from reviewed content.
+    """Quota only from the CLI's own terminal error, never from reviewed content.
 
     Agent messages and command output (for example a diff mentioning "quota")
-    arrive as other JSON events and must not turn a failure into quota-pending."""
-    for line in raw.splitlines():
-        text = line.strip()
-        if not text or text.startswith("[codex-review]"):
-            continue
-        try:
-            event = json.loads(text)
-        except ValueError:
-            event = None
-        if isinstance(event, dict):
-            if event.get("type") not in ("error", "turn.failed"):
-                continue
-            text = json.dumps(event.get("message") or event.get("error") or "", ensure_ascii=False)
-        elif not text.upper().startswith("ERROR"):
-            continue
-        if QUOTA.search(text):
-            return True
-    return False
+    arrive as other JSON events and must not turn a failure into quota-pending.
+    Quota-pending needs affirmative evidence that quota ended the run: the CLI's
+    last output (wrapper lines aside) must itself be a quota error. A rate limit
+    the CLI recovered from, followed by more activity, another error, a crash
+    line or silence, is an ERROR (fail closed), never publishable quota-pending."""
+    lines = [line.strip() for line in raw.splitlines()]
+    lines = [line for line in lines if line and not line.startswith("[codex-review]")]
+    if not lines:
+        return False
+    text = lines[-1]
+    try:
+        event = json.loads(text)
+    except ValueError:
+        event = None
+    if isinstance(event, dict):
+        if event.get("type") not in ("error", "turn.failed"):
+            return False
+        text = json.dumps(event.get("message") or event.get("error") or "", ensure_ascii=False)
+    elif not text.upper().startswith("ERROR"):
+        return False
+    return bool(QUOTA.search(text))
 
 
 def run_review(mode: str, base: str, head: str, ctx: str | None,
-               resume_session: str | None) -> tuple[str, str, str]:
+               resume_session: str | None, previous_head: str | None = None) -> tuple[str, str, str]:
     """Return (verdict, session_id, last_message)."""
     env = {**os.environ, "CODEX_REVIEW_TIP": head, "CODEX_REVIEW_BASE": base}
+    env.pop("CODEX_REVIEW_PREV_TIP", None)
+    if resume_session and previous_head:
+        # The wrapper must review every change since the last verdict, not only fixes.
+        env["CODEX_REVIEW_PREV_TIP"] = previous_head
     args = [bash(), wrapper()]
     args += ["resume", resume_session] if resume_session else [mode, base] + ([ctx] if ctx else [])
     state = ROOT / ".codex-review"
@@ -264,6 +271,18 @@ def list_pending(api: API) -> int:
     return 0
 
 
+def resume_base(saved: dict, head: str) -> str:
+    """The head of the last verdict in this session; a resume reviews saved..head."""
+    previous = str(saved.get("head", ""))
+    if not SHA.fullmatch(previous):
+        raise Blocked("The recorded review has no reviewed head; run a first round")
+    if previous == head:
+        raise Blocked("No new commits since the last verdict; push the fixes before --resume")
+    if subprocess.run(["git", "merge-base", "--is-ancestor", previous, head], cwd=ROOT).returncode != 0:
+        raise Blocked("The last reviewed head is not an ancestor of this head; run a first round")
+    return previous
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--mode", choices=("diff", "targeted", "deep"), default="targeted")
@@ -308,6 +327,7 @@ def main() -> int:
         # session belongs to this PR, never to another PR reviewed here earlier.
         binding = ROOT / ".codex-review" / "pr_review.json"
         resume_session = None
+        previous_head = None
         if args.resume:
             saved = json.loads(binding.read_text(encoding="utf-8")) if binding.is_file() else {}
             recorded = ROOT / ".codex-review" / "last_session_id"
@@ -315,11 +335,15 @@ def main() -> int:
             resume_session = str(saved.get("session", "")).lower()
             if saved.get("pr") != pr["number"] or saved.get("repo") != api.repo                     or not resume_session or resume_session != current:
                 raise Blocked("The recorded review session is not this PR's; run a first round")
+            previous_head = resume_base(saved, head)
         else:
             binding.unlink(missing_ok=True)
-        verdict, session, message = run_review(args.mode, base, head, args.ctx, resume_session)
-        if not args.resume and verdict in ("APPROVE", "REQUEST_CHANGES"):
-            binding.write_text(json.dumps({"repo": api.repo, "pr": pr["number"], "session": session}),
+        verdict, session, message = run_review(args.mode, base, head, args.ctx, resume_session, previous_head)
+        if verdict in ("APPROVE", "REQUEST_CHANGES"):
+            # Remember the head this session last judged; the next --resume reviews
+            # every commit after it (fixes and anything else pushed meanwhile).
+            binding.write_text(json.dumps({"repo": api.repo, "pr": pr["number"],
+                                           "session": resume_session or session, "head": head}),
                                encoding="utf-8")
         record(api, pr, verdict, base, head, session, message, args.resume)
         print(f"[pr-review] {verdict} recorded on PR #{pr['number']} and status {CONTEXT}@{head[:12]}")
