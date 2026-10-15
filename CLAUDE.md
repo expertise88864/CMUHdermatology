@@ -31,6 +31,7 @@
 - 不再逐 commit review，也不用 pre-commit／commit-msg hook 審查；commit 不需要 review trailer。
 - 分支推上 `codex/*` 後執行 `python tools/pr_review.py`：開（或找到）指向 main 的 PR，以 `gpt-6.1-sol`／`xhigh` 唯讀審查 `merge-base(main, head)..head` 整段 diff，結論與 findings 寫成 PR comment，並在 exact head SHA 設 `codex-review/gpt-6.1-sol` commit status。
 - findings 逐條驗證（CONFIRMED／REJECTED／UNCERTAIN），只修 CONFIRMED；修正後 push，再跑 `python tools/pr_review.py --resume`（同一 session）直到 APPROVE。head 一變，舊 APPROVE 即作廢。
+- 有 finding 經驗證為 REJECTED、程式不該改時：把證據寫成反駁檔（不可含 diff），執行 `python tools/pr_review.py --resume --rebuttal 反駁檔`，在同一 session 請審查者重新查證；同一 head 只能反駁一次，審查者不接受就維持 REQUEST_CHANGES（使用者定案 2026-10-15）。
 - 推 main 時 pre-push hook（`_delivery.py`）除候選 CI 外，還要求 exact head 有本人建立的 APPROVE status，且審查範圍涵蓋所有要進 main 的 commit。額度不足時 status 為 quota-pending：可照常發佈但不是通過；額度恢復後用 `python tools/pr_review.py --pending` 找出並補審，結果寫在同一 PR。
 - 不再產生 audit commit；「空 audit commit 也走候選流程」已刪除。純文件變更仍走候選分支、CI 與 PR review。
 - 切換前帶 `Claude-Opus-5-Review: pending` 的舊 commit 仍以 `claude-opus-5-5`／high 補審，結果記在 PR comment 或 issue，不再寫 audit commit。

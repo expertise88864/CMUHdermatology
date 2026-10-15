@@ -154,7 +154,7 @@ class ResumeScopeTests(unittest.TestCase):
         assert 'merge-base --is-ancestor "$PREV_TIP" "$TIP"' in text
         assert "Review EVERY change in ${PREV_TIP}..${TIP}" in text
         main_src = (ROOT / "tools" / "pr_review.py").read_text(encoding="utf-8")
-        assert '"head": head}' in main_src and "previous_head = resume_base(saved, head)" in main_src
+        assert '"head": head,' in main_src and "previous_head = resume_base(saved, head, bool(rebuttal))" in main_src
 
 
 if __name__ == "__main__":
@@ -206,3 +206,59 @@ class RecordRetryTests(unittest.TestCase):
             for pull, head in (({"number": 8}, SHA), ({"number": 7}, "b" * 40)):
                 with self.subTest(pull=pull, head=head), self.assertRaises(pr.Blocked):
                     pr.retry_record(FakeAPI(lambda path: None), pull, head, Path(tmp) / "b.json", unrecorded)
+
+
+class RebuttalTests(unittest.TestCase):
+    """User decision 2026-10-15: one evidence-based rebuttal per unchanged head."""
+
+    def test_same_head_needs_rebuttal_of_request_changes_once(self):
+        saved = {"head": SHA, "verdict": "REQUEST_CHANGES"}
+        with self.assertRaises(pr.Blocked):
+            pr.resume_base(saved, SHA)
+        self.assertIsNone(pr.resume_base(saved, SHA, rebuttal=True))
+        for bad in ({**saved, "verdict": "APPROVE"}, {**saved, "rebutted_head": SHA}, {"head": SHA}):
+            with self.subTest(saved=bad), self.assertRaises(pr.Blocked):
+                pr.resume_base(bad, SHA, rebuttal=True)
+
+    def test_rebuttal_reaches_the_wrapper_only_on_resume(self):
+        import os
+        import subprocess
+        import tempfile
+        from unittest.mock import patch
+        envs = []
+
+        def fake_run(args, **kwargs):
+            envs.append(kwargs["env"])
+            return subprocess.CompletedProcess(args, 64)
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.dict(os.environ, {"CODEX_REVIEW_REBUTTAL_FILE": "stale"}), \
+             patch.object(pr, "ROOT", Path(tmp)), patch.object(pr, "bash", return_value="bash"), \
+             patch.object(pr, "wrapper", return_value="tools/codex_review.sh"), \
+             patch.object(pr.subprocess, "run", side_effect=fake_run):
+            pr.run_review("targeted", "b" * 40, SHA, None, None, None, "r.txt")
+            pr.run_review("targeted", "b" * 40, SHA, None, "0" * 8 + "-0000-0000-0000-" + "0" * 12, None, "r.txt")
+        self.assertNotIn("CODEX_REVIEW_REBUTTAL_FILE", envs[0])
+        self.assertEqual(envs[1]["CODEX_REVIEW_REBUTTAL_FILE"], "r.txt")
+        self.assertNotIn("CODEX_REVIEW_PREV_TIP", envs[1])
+
+    def test_finish_marks_a_same_head_rebuttal_so_it_cannot_repeat(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            binding, unrecorded = Path(tmp) / "b.json", Path(tmp) / "u.json"
+            entry = {"repo": "owner/repo", "pr": 7, "verdict": "REQUEST_CHANGES", "base": "c" * 40, "head": SHA,
+                     "session": "s", "bound_session": "s", "message": "", "resume": True,
+                     "rebuttal": True, "same_head_rebuttal": True}
+            with patch.object(pr, "record") as record:
+                pr.finish(FakeAPI(lambda path: None), {"number": 7}, entry, binding, unrecorded)
+            self.assertTrue(record.call_args.args[-1])
+            saved = json.loads(binding.read_text(encoding="utf-8"))
+            self.assertEqual((saved["verdict"], saved["rebutted_head"]), ("REQUEST_CHANGES", SHA))
+            with self.assertRaises(pr.Blocked):
+                pr.resume_base(saved, SHA, rebuttal=True)
+
+    def test_wrapper_passes_the_rebuttal_and_rejects_diffs(self):
+        text = (ROOT / "tools" / "codex_review.sh").read_text(encoding="utf-8")
+        assert 'REBUTTAL_FILE="${CODEX_REVIEW_REBUTTAL_FILE:-}"' in text
+        assert "Never withdraw a finding on assertion alone" in text
+        assert "rebuttal 檔看起來含 diff" in text

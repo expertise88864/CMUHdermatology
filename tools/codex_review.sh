@@ -209,6 +209,19 @@ The pull request range is now ${CODEX_REVIEW_BASE}..${TIP}; inspect the correcti
 
 Scope override: your previous verdict covered ${PREV_TIP}. Review EVERY change in ${PREV_TIP}..${TIP} (git log/diff ${PREV_TIP}..${TIP}), not only corrections: any other commit pushed since then gets the same full review contract, severities and limits as the first pass. Also confirm the previous CONFIRMED findings are resolved."
   fi
+  # 反駁續審(使用者定案 2026-10-15):實作者以證據 REJECTED 的 finding,可在同一 session
+  # 請審查者重新查證一次;審查者必須自己在 repo 裡核實,不能只憑說法撤回。
+  REBUTTAL_FILE="${CODEX_REVIEW_REBUTTAL_FILE:-}"
+  if [ -n "$REBUTTAL_FILE" ]; then
+    [ -f "$REBUTTAL_FILE" ] || die "rebuttal 檔不存在:$REBUTTAL_FILE"
+    if grep -qE '^(diff --git |@@ |index [0-9a-f]+\.\.)' "$REBUTTAL_FILE"; then
+      die "rebuttal 檔看起來含 diff。只能放對 REJECTED finding 的證據說明。"
+    fi
+    RESUME_PROMPT="$RESUME_PROMPT
+
+Implementer rebuttal: the implementer validated your previous findings against the code and REJECTED the ones below with evidence; no code was changed for them. Re-examine each rejected finding in the repository yourself (read-only). Withdraw it only if the evidence holds; otherwise keep it and state the concrete reason. Never withdraw a finding on assertion alone. Rebuttal text:
+$(cat "$REBUTTAL_FILE")"
+  fi
   echo "[codex-review] resume session=$SID effort=$RESUME_EFFORT (pass $THIS_PASS)"
   : > "$LAST_MSG"
   # ★stdin 一律導自 /dev/null★(2026-08-30 實測):codex CLI 在 stdin 不是
