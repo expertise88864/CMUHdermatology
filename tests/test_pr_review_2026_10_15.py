@@ -220,6 +220,13 @@ class RebuttalTests(unittest.TestCase):
             with self.subTest(saved=bad), self.assertRaises(pr.Blocked):
                 pr.resume_base(bad, SHA, rebuttal=True)
 
+    def test_changed_head_cannot_be_rebutted_before_its_own_verdict(self):
+        """PR #2 round 1 (P2): a rebuttal on a new head would skip eligibility and the once-only limit."""
+        for saved in ({"head": "b" * 40, "verdict": "APPROVE"},
+                      {"head": "b" * 40, "verdict": "REQUEST_CHANGES"}):
+            with self.subTest(saved=saved), self.assertRaises(pr.Blocked):
+                pr.resume_base(saved, SHA, rebuttal=True)
+
     def test_rebuttal_reaches_the_wrapper_only_on_resume(self):
         import os
         import subprocess

@@ -300,6 +300,11 @@ def resume_base(saved: dict, head: str, rebuttal: bool = False) -> str | None:
     previous = str(saved.get("head", ""))
     if not SHA.fullmatch(previous):
         raise Blocked("The recorded review has no reviewed head; run a first round")
+    if rebuttal and previous != head:
+        # A rebuttal answers the verdict on this exact head; new commits get an ordinary
+        # --resume first, and its verdict is what may then be rebutted (once).
+        raise Blocked("--rebuttal only answers the last verdict on this unchanged head; "
+                      "run --resume for the new commits first")
     if previous == head:
         if not rebuttal:
             raise Blocked("No new commits since the last verdict; push the fixes, or pass "
