@@ -48,6 +48,7 @@ import json
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 def _make_stdout_robust() -> None:
     """★關卡不可死在「印不出自己的輸出」★
@@ -205,6 +206,17 @@ def _source_line(diag: dict) -> str:
     return ""
 
 
+def _rule_config_path(rule: str) -> str:
+    """每條規則各自一個暫存設定檔（同時跑時不可共用同一個檔名）。
+
+    ★仍然寫在 repo 根目錄★（理由見 `_rule_diagnostics`）；`.gitignore` 以
+    `.pyright_type_debt*.json` 涵蓋它們。規則名只含英數字，直接當檔名安全。
+    """
+    if not rule.isidentifier():
+        raise ValueError(f"[type-debt] 不合法的規則名稱：{rule!r}")
+    return os.path.join(REPO_ROOT, f".pyright_type_debt.{rule}.json")
+
+
 def _rule_diagnostics(rule: str) -> dict:
     """把單一規則打開，回傳 {指紋: 出現次數}。
 
@@ -214,7 +226,37 @@ def _rule_diagnostics(rule: str) -> dict:
     with open(MAIN_CONFIG, encoding="utf-8") as fh:
         cfg = json.load(fh)
     cfg[rule] = "error"
-    return _count_by_rule(_run_pyright(cfg, f"規則 {rule}"), [rule])[rule]
+    return _count_by_rule(_run_pyright(cfg, f"規則 {rule}", _rule_config_path(rule)),
+                          [rule])[rule]
+
+
+DEFAULT_JOBS = 4
+
+
+def _collect_rule_diagnostics(rules: list, jobs: int = DEFAULT_JOBS) -> dict:
+    """逐條（CI 的權威路徑）→ {規則: {指紋: 次數}}，最多 `jobs` 條同時跑。
+
+    ★[2026-10-16] 只改「何時跑」，不改「跑什麼」★
+    11 條規則循序要 4–5 分鐘（CI 實測 139–308 秒），讓整個 job 逼近 45 分鐘上限。
+    每條規則仍然【各自】用自己的設定檔跑【恰好一次】pyright，結果以規則名對回，
+    所以判定與循序版完全相同；輸出由 main() 依規則名排序印出，與完成順序無關。
+    任何一條失敗（pyright 輸出解析不了等）都會把例外原樣往上丟 → 關卡失敗；
+    其餘已啟動的那幾條會跑完並清掉各自的暫存設定檔。
+    第一條先單獨跑：pyright／node 若有一次性的環境準備，不會被多個行程同時觸發。
+    """
+    if jobs < 1:
+        raise ValueError(f"[type-debt] --jobs 必須 >= 1（收到 {jobs}）")
+    rules = list(rules)
+    if len(set(rules)) != len(rules):
+        raise ValueError("[type-debt] 規則清單有重複")
+    if jobs == 1 or len(rules) <= 1:
+        return {rule: _rule_diagnostics(rule) for rule in rules}
+    first, rest = rules[0], rules[1:]
+    results = {first: _rule_diagnostics(first)}
+    with ThreadPoolExecutor(max_workers=min(jobs, len(rest))) as pool:
+        for rule, counts in zip(rest, pool.map(_rule_diagnostics, rest), strict=True):
+            results[rule] = counts
+    return results
 
 
 def _count_by_rule(report: dict, rules) -> dict:
@@ -236,14 +278,14 @@ def _count_by_rule(report: dict, rules) -> dict:
     return out
 
 
-def _run_pyright(cfg: dict, what: str) -> dict:
+def _run_pyright(cfg: dict, what: str, config_path: str = TEMP_CONFIG) -> dict:
     """用 `cfg` 跑一趟 pyright,回傳解析好的報告(解析不了就丟例外)。"""
-    with open(TEMP_CONFIG, "w", encoding="utf-8") as fh:
+    with open(config_path, "w", encoding="utf-8") as fh:
         json.dump(cfg, fh)
     try:
         # ★[2026-07-30 外審第 2 輪] 必須明寫 encoding="utf-8"★（見 _rule_diagnostics）
         cp = subprocess.run(
-            [sys.executable, "-m", "pyright", "-p", TEMP_CONFIG, "--outputjson"],
+            [sys.executable, "-m", "pyright", "-p", config_path, "--outputjson"],
             cwd=REPO_ROOT, capture_output=True,
             encoding="utf-8", errors="replace", check=False)
         try:
@@ -256,7 +298,7 @@ def _run_pyright(cfg: dict, what: str) -> dict:
                 f"  stderr 前 500 字：{cp.stderr[:500]}") from e
     finally:
         try:
-            os.remove(TEMP_CONFIG)
+            os.remove(config_path)
         except OSError:
             pass
 
@@ -346,7 +388,12 @@ def main(argv: list) -> int:
                     help="把目前的診斷寫回基線（還完債之後用）")
     ap.add_argument("--fast", action="store_true",
                     help="所有規則一次跑完（本機早期警報用；CI 請用預設的逐條）")
+    ap.add_argument("--jobs", type=int, default=DEFAULT_JOBS,
+                    help=f"逐條模式最多同時跑幾條規則（預設 {DEFAULT_JOBS}；1 = 循序）")
     args = ap.parse_args(argv)
+    if args.jobs < 1:
+        print(f"[type-debt] --jobs 必須 >= 1（收到 {args.jobs}）")
+        return 2
 
     baseline = _load_baseline()
     rules = sorted(baseline)
@@ -358,7 +405,7 @@ def main(argv: list) -> int:
             return 2
         current = _all_rule_diagnostics(rules)
     else:
-        current = {rule: _rule_diagnostics(rule) for rule in rules}
+        current = _collect_rule_diagnostics(rules, args.jobs)
 
     print(_environment_note())
     any_added = any_gone = False
