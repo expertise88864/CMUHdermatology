@@ -12,7 +12,7 @@ import main
     ("2027.01.02.12", "2027.01.02.12"),
     ("2027.01.02.100", "2027.01.02.100"),
 ])
-def test_main_title_uses_current_version_and_author_without_by(monkeypatch, version, display):
+def test_main_title_is_program_name_and_version_only(monkeypatch, version, display):
     class TitleSet(Exception):
         pass
 
@@ -26,4 +26,4 @@ def test_main_title_uses_current_version_and_author_without_by(monkeypatch, vers
     monkeypatch.setattr(main, "place_tk_window_on_preferred_monitor", stop_after_title)
     with pytest.raises(TitleSet):
         main.AutomationApp(root, {})
-    assert titles == [f"中國醫皮膚科主程式 v{display} 陳翊嘉"]
+    assert titles == [f"中國醫皮膚科主程式 v{display}"]

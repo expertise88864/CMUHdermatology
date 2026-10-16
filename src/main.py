@@ -9689,7 +9689,7 @@ class AutomationApp:
         _ensure_network_imports()
         self.root = root
         version_date, version_build = CURRENT_VERSION.rsplit(".", 1)
-        self.root.title(f"中國醫皮膚科主程式 v{version_date}.{version_build.zfill(2)} 陳翊嘉")
+        self.root.title(f"中國醫皮膚科主程式 v{version_date}.{version_build.zfill(2)}")
         place_tk_window_on_preferred_monitor(self.root)
         _apply_tk_window_icon(self.root)
         
