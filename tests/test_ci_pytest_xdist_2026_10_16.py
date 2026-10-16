@@ -253,8 +253,11 @@ def test_serial_evidence_rejects_worker_streams_and_duplicates(tmp_path):
 
 def test_ci_runs_pytest_on_four_xdist_workers_with_the_pinned_plugin():
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    step = re.search(r"- name: Pytest[^\n]*\n(?:[ \t]+#[^\n]*\n)*[ \t]+run: ([^\n]+)",
-                     workflow).group(1)
+    match = re.search(r"- name: Pytest[^\n]*\n((?:[ \t]+(?!run:)[^\n]*\n)*)[ \t]+run: ([^\n]+)",
+                      workflow)
+    preamble, step = match.group(1), match.group(2)
+    # Temp files on the runner's temp volume, not the OS disk (see ci.yml).
+    assert "TEMP: ${{ runner.temp }}" in preamble and "TMP: ${{ runner.temp }}" in preamble
     assert "scripts/run_ci_pytest.py" in step
     assert " -n 4 " in step and " --dist loadfile " in step and "--cov=src" in step
     # A crashed worker already fails the run; a replacement worker can leave
