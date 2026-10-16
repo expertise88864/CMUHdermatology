@@ -141,19 +141,46 @@ def test_a_second_real_process_shares_the_same_budget(child_script):
         f"實際拿到 {mine} 個★")
 
 
-def test_three_real_processes_racing_cannot_over_allocate(child_script):
+# 競速測試的子行程：等鎖上限放寬到 120 秒，並回報自己有沒有降級。
+#   ★[2026-10-16] CI 改成 4 個 xdist worker 後★ 4 vCPU 的 runner 上這支測試的
+#   子行程慢了 5–15 倍，曾出現 31 > 30。多一筆正是降級路徑的形狀：子行程等鎖
+#   超過正式的 8 秒、或新檔案建表時撞上 SQLITE_BUSY，`_connect`／交易失敗就會
+#   依設計降級成單行程配額，之後再把那一筆補寫進 DB —— 那是降級的既定行為，
+#   不是這支測試要驗的序列化（舊版測試分不出這兩種情況）。
+#   這裡只把【環境造成的降級】排除：等鎖時間放寬、DB 先由父行程建好（等同
+#   正式環境第一次之後的常態）；斷言一字不改，另外要求三支都沒有降級，
+#   確定量到的真的是跨行程那一層。
+_RACE_CHILD = _CHILD.replace(
+    "from cmuh_common import mail_quota\n",
+    "from cmuh_common import mail_quota\n"
+    "mail_quota._BUSY_TIMEOUT_MS = 120000\n", 1) + (
+    "print('degraded' if mail_quota._degraded_logged else 'cross-process')\n")
+
+
+@pytest.fixture
+def race_child_script(tmp_path):
+    assert "_BUSY_TIMEOUT_MS = 120000" in _RACE_CHILD
+    p = tmp_path / "quota_race_child.py"
+    p.write_text(_RACE_CHILD, encoding="utf-8")
+    return p
+
+
+def test_three_real_processes_racing_cannot_over_allocate(race_child_script):
     """並行搶額度不可超發 —— BEGIN IMMEDIATE 真的序列化了「數封數→寫入」。
 
     三支子行程同時各要 20 個名額（總需求 60 > 上限 30）。若「清舊紀錄 → 數目前
     幾封 → 寫入」不是原子的，兩支會同時讀到同一個封數而各自寫入 → 超發。
     """
     app = _app_dir()
-    procs = [_child(app, 20, script=child_script, wait=False) for _ in range(3)]
+    mail_quota._connect(mail_quota.db_path()).close()      # 建表／WAL 先完成
+    procs = [_child(app, 20, script=race_child_script, wait=False) for _ in range(3)]
     granted = 0
     for p in procs:
-        out, err = p.communicate(timeout=180)
+        out, err = p.communicate(timeout=600)
         assert p.returncode == 0, f"子行程失敗：{err[:500]}"
-        granted += int(out.strip())
+        got, path = out.split()
+        assert path == "cross-process", f"子行程降級成單行程配額，沒有量到跨行程那層：{err[-800:]}"
+        granted += int(got)
     assert granted == mail_quota.TOTAL_MAX, (
         f"三支行程共拿到 {granted} 個名額，上限是 {mail_quota.TOTAL_MAX}")
     assert len(_rows()) == mail_quota.TOTAL_MAX

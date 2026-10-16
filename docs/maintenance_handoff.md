@@ -152,6 +152,19 @@ evidence 規則（`scripts/run_ci_pytest.py --check`）在序列與平行下同�
 （序列下把兩檔依此順序執行也能重現）。修法只在測試端：前者的 autouse fixture 每支測試給新的
 Event，後者那一支自行建立「沒有人取消」的前提；斷言與程式行為不變。
 
+第一輪平行 CI 另外紅了 `test_three_real_processes_racing_cannot_over_allocate`（31 > 30）。
+同一 runner 上這支測試的子行程慢了 5–15 倍；多出的一筆符合 `mail_quota` 既定的降級路徑
+（等鎖超過 8 秒或新檔建表時 `SQLITE_BUSY` → 單行程配額 → 事後補寫），舊測試分不出
+「序列化失效」與「子行程降級」。測試端改為：父行程先建好 DB、子行程等鎖上限放寬到
+120 秒，並新增斷言要求三支子行程都沒有降級；`== 30` 與資料列數斷言不變，`src/` 未改。
+新檔建表若真的遇到多支程式同時第一次啟動，仍會依設計降級一次——這是正式程式的既有
+行為，本輪不改，列為待使用者決定的觀察。
+
+平行時 SQLite／fsync 密集的測試（runtime diagnostics、consult decision、action ledger、
+mail quota）在 runner 上比序列慢 4–10 倍，因 4 個 worker 同時排隊寫 OS 磁碟（C:）。pytest
+step 因此把 `TEMP`／`TMP` 設成 `${{ runner.temp }}`（checkout 所在的 D: 暫存磁碟）；
+這只改暫存檔位置，不改任何測試或門檻。
+
 本機（12 核開發機，非 CI 基準）全套：4 workers 約 700 秒，各 worker 收集約 93 秒；6 workers
 重新分配檔案後全綠。正式耗時以 exact-SHA 候選／正式 CI 的 step 時間為準。
 

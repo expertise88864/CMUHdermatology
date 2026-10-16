@@ -82,6 +82,12 @@ jobs:
         # evidence holds one stream per process, all checked by the next steps.
         # --max-worker-restart 0: a crashed worker fails the run at once (as a crash
         # did serially); a replacement worker could leave loadfile scheduling hung.
+        # TEMP/TMP on the runner's temp volume (D:, where the checkout also lives)
+        # instead of the OS disk: the SQLite-heavy tests fsync constantly, and four
+        # workers queueing on C: made them 4-10x slower than serial (2026-10-16).
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         run: python -X utf8 scripts/run_ci_pytest.py --output "$env:RUNNER_TEMP/cmuh-pytest" -- -q -p no:cacheprovider -n 4 --dist loadfile --max-worker-restart 0 --junitxml=junit.xml --cov=src --cov-report=json:cov.json --cov-report=term:skip-covered
 
       # ★[2026-08-09] 讓「哪一支測試壞了」讀得到★
