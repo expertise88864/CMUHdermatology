@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DEV_PACKAGES = ("ruff", "pytest", "pytest-cov", "pyright")
+DEV_PACKAGES = ("ruff", "pytest", "pytest-cov", "pyright", "pytest-xdist==3.8.0")
 BASELINE = "docs/dependency_baseline_2026-10-03.txt"
 
 

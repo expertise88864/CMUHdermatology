@@ -123,6 +123,48 @@ if ($LASTEXITCODE -ne 0) { throw '開發工具回歸失敗' }
 回退開發工具需一起核對 helper、BAT／CMD、測試與交接說明，以新提交走相同候選／正式流程；
 不能把舊版危險的參數用法當作新的操作入口。院內實機驗收仍未由這組匿名測試證明。
 
+## CI pytest 四核平行（2026-10-16）
+
+CI 的 `Pytest (全測試 + 覆蓋率)` 改用 pytest-xdist（版本固定 `pytest-xdist==3.8.0`，與
+`tools/dev-env-setup.py` 的開發套件同一個 pin）：`-n 4 --dist loadfile --max-worker-restart 0`。
+其餘參數、`timeout-minutes`、skip 宣告、分層覆蓋率門檻與型別債棘輪都沒有改。
+
+- `loadfile`：同一個測試檔整檔交給同一個 worker，檔內順序與 module 級 fixture 不變；Tk root、
+  conftest 的設定目錄導向、`tmp_path` 都是每個 worker 行程各自一份。沒有需要另外綁在同一
+  worker 的序列測試群組（未使用 `xdist_group`）。
+- `--max-worker-restart 0`：worker 崩潰本來就讓整輪失敗（序列時整個 pytest 直接結束）；
+  xdist 3.8 在 loadfile 下補上替代 worker 後會一直等到 job 逾時，故改為立即結束並保留紅燈。
+- 覆蓋率：pytest-cov 合併各 worker 的資料後才產生 `cov.json`；`check_coverage.py` 照舊讀合併結果。
+  JUnit 由 controller 寫出，skip 守衛照舊讀它。
+
+evidence 規則（`scripts/run_ci_pytest.py --check`）在序列與平行下同樣嚴格，並比以前多驗身分：
+`selected == finished == test_finished 事件數`、每個完成的測試身分（nodeid 雜湊）只出現一次，
+且完成集合的摘要必須等於收集時選中集合的摘要。平行時 `events.jsonl` 是 controller 依 worker
+回傳的報告寫成的完成紀錄；每個 worker 另有 `events.<gwN>.jsonl`，記錄它實際的收集與各階段開始。
+原本「單一串流 seq 連續」改為「每個行程自己的串流 seq 連續」——跨行程本來就沒有全域順序可驗；
+另外要求 worker 串流一個不少、一個不多、各自正常結束（exit 0、無診斷錯誤、收集摘要與 controller
+相同），且各 worker 完成的測試互不重疊、合起來恰好等於 controller 的完成集合。worker 的 stdout
+不是 job log，console 的 `[cmuh-pytest] setup/call/teardown …` 改由 controller 依回傳報告印出。
+
+平行執行暴露一個測試隔離缺陷：`test_reboot_and_cooldown_2026_08_11.py` 清除最後一個重開原因時會
+設起 `consult_query` 模組層的 `_bde_reboot_cancel`，殘留到同一行程後面的
+`test_bde_reboot_countdown_cancel_2026_08_04.py`，使「仍閒置 → 立即重開」那一支依檔案順序失敗
+（序列下把兩檔依此順序執行也能重現）。修法只在測試端：前者的 autouse fixture 每支測試給新的
+Event，後者那一支自行建立「沒有人取消」的前提；斷言與程式行為不變。
+
+本機（12 核開發機，非 CI 基準）全套：4 workers 約 700 秒，各 worker 收集約 93 秒；6 workers
+重新分配檔案後全綠。正式耗時以 exact-SHA 候選／正式 CI 的 step 時間為準。
+
+```powershell
+python -X utf8 scripts/run_ci_pytest.py --output $ciEvidenceDir -- -q -p no:cacheprovider -n 4 --dist loadfile --max-worker-restart 0 --junitxml=junit.xml --cov=src --cov-report=json:cov.json --cov-report=term:skip-covered
+python -m pytest -q -p no:cacheprovider tests/test_ci_pytest_xdist_2026_10_16.py tests/test_ci_progress_2026_10_04.py
+```
+
+開發機路徑含非 ASCII 字元時，Git Bash 啟動 xdist worker 可能因 execnet 開機字串編碼失敗；
+請由 PowerShell 執行。本輪以 `--system-site-packages` venv 試跑時，pidfile、restart handshake、
+checkpoint 清理三類檢查行程身分／子行程的測試失敗（pidfile 記錄的是 venv 轉址器路徑、實際行程是
+基底 python.exe）；改用基底直譯器加上 xdist 後全數通過，與平行無關。
+
 ## 歷史 CI 階段定位與驗證成本（2026-10-04）
 
 本輪基準為 `6855a37bd2941e36a9efcef9d9305cc342d65fa5`，修改開發驗證工具、CI 與相關測試／文件。啟動器、requirements 及臨床／排班來源保持不變；發佈 helper 已將版本中繼資料升為 `2026.10.04.1` 並同步 manifest，164 個配套檔案中只有 `src/cmuh_common/version.py` 的內容雜湊改變。最新狀態仍須按精確 SHA 核對。舊 pending 沿原排程，不用本輪 review 代替舊完整範圍。

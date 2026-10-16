@@ -421,6 +421,9 @@ class TestThereIsNoUnwatchedWindow:
         cmds = []
         _rb = []
         monkeypatch.setattr(cq, "_user_idle_seconds_or_none", lambda: 99999.0)
+        # Own the precondition (nobody cancelled) instead of inheriting the
+        # module-wide Event from whichever test ran earlier in this process.
+        monkeypatch.setattr(cq, "_bde_reboot_cancel", cq.threading.Event())
         cq._finish_bde_reboot(
             "elapsed", rollback=_rb.append,
             run=lambda cmd: cmds.append(cmd) or type("R", (), {"returncode": 0})())
