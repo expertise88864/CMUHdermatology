@@ -37,6 +37,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install ruff pytest pytest-cov pyright
+          # pytest-xdist: pytest below runs on the runner's 4 vCPUs. Pinned (same
+          # pin as tools/dev-env-setup.py; tests/test_ci_pytest_xdist_2026_10_16.py).
+          pip install "pytest-xdist==3.8.0"
           # lazy 相依（ortools / openpyxl / python-docx / reportlab）—— 使用者機器是
           # 用到那個功能時才裝，所以不在 requirements.txt；但 CI 必須裝，否則
           # 對應測試會【靜默 skip＝等於沒測】。
@@ -73,7 +76,13 @@ jobs:
       #   ① 匯出重依賴沒裝（上面的 import 防呆擋的就是這個）
       #   ② 多加一個 Tk 測試檔就讓別檔 42 支全變 skip ← 只有數量守衛擋得住
       - name: Pytest (全測試 + 覆蓋率)
-        run: python -X utf8 scripts/run_ci_pytest.py --output "$env:RUNNER_TEMP/cmuh-pytest" -- -q -p no:cacheprovider --junitxml=junit.xml --cov=src --cov-report=json:cov.json --cov-report=term:skip-covered
+        # 4 xdist workers, one test file per worker at a time (loadfile keeps each
+        # file's order and module fixtures). pytest-cov combines the workers'
+        # coverage into cov.json; junit.xml is written by the controller. The
+        # evidence holds one stream per process, all checked by the next steps.
+        # --max-worker-restart 0: a crashed worker fails the run at once (as a crash
+        # did serially); a replacement worker could leave loadfile scheduling hung.
+        run: python -X utf8 scripts/run_ci_pytest.py --output "$env:RUNNER_TEMP/cmuh-pytest" -- -q -p no:cacheprovider -n 4 --dist loadfile --max-worker-restart 0 --junitxml=junit.xml --cov=src --cov-report=json:cov.json --cov-report=term:skip-covered
 
       # ★[2026-08-09] 讓「哪一支測試壞了」讀得到★
       #   `check-runs/<id>/annotations` 匿名讀得到，`actions/jobs/<id>/logs` 是

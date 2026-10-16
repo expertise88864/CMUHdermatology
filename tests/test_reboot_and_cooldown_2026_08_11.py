@@ -55,6 +55,10 @@ def _isolate(tmp_path, monkeypatch):
     cq._job_fail_last_alert = 0.0
     cq._hidden_desktop_state.update({"streak": 0, "ever_ok": False})
     cq._reboot_reasons.clear()
+    # [2026-10-16] Clearing the last reboot reason sets the module-wide cancel
+    # Event. Give every test its own Event so a set flag cannot leak into a later
+    # file (it made the BDE "still idle -> reboot" test order-dependent).
+    monkeypatch.setattr(cq, "_bde_reboot_cancel", cq.threading.Event())
     yield
     cq._login_cooldown_until = 0.0
     cq._hidden_desktop_state.update({"streak": 0, "ever_ok": False})

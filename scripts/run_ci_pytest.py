@@ -2,11 +2,17 @@
 
 Only for isolated development checkouts. Removes stale junit.xml and cov.json.
 The evidence checker is an additional delivery requirement, not a pytest verdict.
+
+Every selected test must finish exactly once: counts, unique opaque identities and a
+digest of the selected identities all have to agree. Under pytest-xdist each process
+numbers its own stream contiguously; the controller stream is the completion record,
+and every worker stream must be complete and account for a disjoint share of it.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 from pathlib import Path
@@ -19,6 +25,10 @@ import time
 
 
 REPORTS = ("junit.xml", "cov.json")
+TEST_TOOLS = ("pytest", "pytest-cov", "coverage", "pytest-xdist", "execnet")
+CASE = re.compile(r"[0-9a-f]{16}")
+WORKER = re.compile(r"gw[0-9]{1,4}")
+WORKER_STREAM = re.compile(r"events\.(.+)\.jsonl")
 
 
 def _git(*args) -> str | None:
@@ -38,7 +48,18 @@ def metadata() -> dict:
             "run_id": _digits(os.environ.get("GITHUB_RUN_ID", "")),
             "attempt": _digits(os.environ.get("GITHUB_RUN_ATTEMPT", "")),
             "python": platform.python_version(), "system": platform.system(),
-            "platform_version": platform.version()}
+            "platform_version": platform.version(), "test_tools": _tool_versions()}
+
+
+def _tool_versions() -> dict:
+    """Versions only (no paths): which pytest/xdist/coverage produced the evidence."""
+    versions = {}
+    for name in TEST_TOOLS:
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
 
 
 def _digits(value: str) -> str | None:
@@ -131,6 +152,10 @@ def check(output: Path, sha: str, run_id=None, attempt=None) -> int:
                 last.get("finished") != sum(e.get("event") == "test_finished" for e in events) or
                 result.get("last_event") != last):
             raise ValueError("incomplete")
+        finished = _finished_cases(events)
+        if _digest(finished) != last.get("selected_digest"):
+            raise ValueError("selection_mismatch")
+        _check_workers(output, last, finished)
         for name in REPORTS:
             raw = (output / name).read_bytes()
             if result["reports"][name] != {
@@ -141,6 +166,60 @@ def check(output: Path, sha: str, run_id=None, attempt=None) -> int:
         return 1
     print("pytest evidence: complete and matched to SHA", flush=True)
     return 0
+
+
+def _digest(cases) -> str:
+    # Same order-independent digest as ci_pytest_progress.cases_digest.
+    return hashlib.sha256("\n".join(sorted(cases)).encode("ascii")).hexdigest()
+
+
+def _finished_cases(events: list[dict]) -> set:
+    """Opaque identities of completed tests; each may complete only once."""
+    cases = [e.get("case") for e in events if e.get("event") == "test_finished"]
+    if not all(isinstance(c, str) and CASE.fullmatch(c) for c in cases):
+        raise ValueError("case_identity")
+    if len(set(cases)) != len(cases):
+        raise ValueError("duplicate_finish")
+    return set(cases)
+
+
+def _check_workers(output: Path, last: dict, finished: set):
+    """Serial evidence has no worker streams; xdist evidence needs every one of them."""
+    present = set()
+    for path in output.iterdir():
+        match = WORKER_STREAM.fullmatch(path.name)
+        if match:
+            present.add(match.group(1))
+    mode = last.get("mode")
+    if mode == "serial":
+        if present or "workers" in last:
+            raise ValueError("unexpected_worker_streams")
+        return
+    workers = last.get("workers")
+    if mode != "controller" or not isinstance(workers, list) or not workers:
+        raise ValueError("mode")
+    names = [w.get("worker") if isinstance(w, dict) else None for w in workers]
+    if (not all(isinstance(n, str) and WORKER.fullmatch(n) for n in names) or
+            len(set(names)) != len(names) or set(names) != present):
+        raise ValueError("worker_set")
+    accounted = set()
+    for summary, name in zip(workers, names, strict=True):
+        events, parsed = read_events(output / f"events.{name}.jsonl")
+        tail = events[-1] if events else {}
+        cases = _finished_cases(events)
+        if (not parsed or tail.get("event") != "session_finished" or
+                tail.get("mode") != "worker" or tail.get("worker") != name or
+                tail.get("exit_code") != 0 or tail.get("diagnostic_errors") or
+                tail.get("selected") != last["selected"] or
+                tail.get("selected_digest") != last["selected_digest"] or
+                tail.get("finished") != len(cases) or
+                tail.get("finished_digest") != _digest(cases) or
+                summary.get("events") != len(events) or
+                summary.get("finished") != len(cases) or accounted & cases):
+            raise ValueError("worker_stream")
+        accounted |= cases
+    if accounted != finished:
+        raise ValueError("worker_accounting")
 
 
 def main(argv=None) -> int:
