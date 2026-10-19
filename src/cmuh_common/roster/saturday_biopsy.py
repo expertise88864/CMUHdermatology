@@ -177,14 +177,6 @@ def _trim_history(book: dict, keep_months: int = HISTORY_KEEP_MONTHS) -> None:
     if len(months) <= keep_months:
         return
     keep = set(months[:keep_months])
-    # ★被丟掉的分錄要記下次數★(2026-10-19 年度週期,理由同 ledger._trim_history):
-    #   本週期次數＝累計次數 − 週期開始之前的分錄(cycle.biopsy_pre_cycle)。
-    trimmed = book.setdefault("trimmed", {})
-    for e in hist:
-        if e.get("month") in keep:
-            continue
-        for mid in (e.get("assign") or {}).values():
-            trimmed[mid] = int(trimmed.get(mid, 0)) + 1
     book["history"] = [e for e in hist if e.get("month") in keep]
 
 

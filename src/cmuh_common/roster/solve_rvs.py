@@ -198,7 +198,7 @@ def _share_weights(ctx: SolveContext) -> dict:
 
 def weekend_share_score(ctx: SolveContext, counts: dict) -> int:
     """年度週末偏差 Σ|100×(本週期之前+本月) − 100×目標|（越小越接近目標）。"""
-    blocks = counted_blocks(ctx.blocks, ctx.weekend_exempt)
+    blocks = counted_blocks(ctx.blocks, ctx.weekend_exempt, ctx.holidays)
     weights = _share_weights(ctx)
     targets = cumulative_targets(ctx.weekend_prior, weights, len(blocks))
     return sum(abs(100 * (int(ctx.weekend_prior.get(mid, 0)) + counts.get(mid, 0))
@@ -212,7 +212,7 @@ def _refine_weekend_share(model, solver, cp_model, objective, x, ctx):
     的排法之間挑「本週期累計週末次數最接近權重目標」的那一個。不犧牲任何既有
     規則或點數公平;沒有一樣好的替代排法時,結果與第一段完全相同。
     第二段沒有算出更好的結果(逾時等) → 沿用第一段的解。"""
-    blocks = counted_blocks(ctx.blocks, ctx.weekend_exempt)
+    blocks = counted_blocks(ctx.blocks, ctx.weekend_exempt, ctx.holidays)
     weights = _share_weights(ctx)
     if len(weights) < 2 or not blocks:
         return None

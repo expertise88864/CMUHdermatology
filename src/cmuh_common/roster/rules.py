@@ -465,7 +465,7 @@ class WeekendRangeRule(Rule):
 
     @staticmethod
     def _blocks(ctx) -> list:
-        return counted_blocks(ctx.blocks, ctx.weekend_exempt)
+        return counted_blocks(ctx.blocks, ctx.weekend_exempt, ctx.holidays)
 
     @staticmethod
     def _past_count(ctx, mid: str, blocks) -> int:
@@ -480,17 +480,18 @@ class WeekendRangeRule(Rule):
     def can_take(ctx, mid: str, b, directives) -> bool:
         """mid 這個月還有沒有可能值到週末塊 b（決定「至少 1 個」適不適用）。
 
-        週六已在過去 → 看事實；週六被指定給別人 → 不可能；否則看週六所在那一段
-        (使用者指定可把連休段拆開)未來的日子他有沒有請假。"""
+        週六已在過去 → 看事實；否則看週六所在那一段(使用者指定可把連休段拆開):
+        ★那一段裡任何一天被指定給別人都不行★ —— 同段綁同一人,鎖定的是週日
+        也一樣把週六帶走(外審 PR #9 第 1 輪);再看未來那幾天他有沒有請假。"""
         sat = b.saturday
         cut = ctx.past_cutoff
         if cut is not None and sat <= cut:
             return ctx.past_duty.get(sat) == mid
-        if sat in directives and directives[sat][0] != mid:
-            return False
         runs = split_block_runs(
             b.days, {d: directives[d][0] for d in b.days if d in directives})
         run = next(r for r in runs if sat in r)
+        if any(d in directives and directives[d][0] != mid for d in run):
+            return False
         return all(not ctx.on_leave(mid, d) for d in run
                    if cut is None or d > cut)
 
@@ -654,7 +655,7 @@ class WeekendCapRule(Rule):
         由跨月銜接固定給上月人選）→ 不計入本月週末數,否則會誤判超標。
         [2026-10-19] 標「不計入年度週末」的週末塊(春節)也不算 —— 與
         WeekendRangeRule 同一份計數(本規則是它被放寬之後的軟性退路)。"""
-        return counted_blocks(ctx.blocks, ctx.weekend_exempt)
+        return counted_blocks(ctx.blocks, ctx.weekend_exempt, ctx.holidays)
 
     def precheck(self, ctx):
         blocks = self._weekend_blocks(ctx)

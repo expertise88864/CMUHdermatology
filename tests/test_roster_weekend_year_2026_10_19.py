@@ -40,34 +40,64 @@ class TestCycle:
         assert full[0] == "2026-08" and full[-1] == "2027-07" and len(full) == 12
         assert cycle.cycle_label("2027-02") == "2026/8–2027/7"
 
-    def test_ledger_in_cycle_subtracts_the_previous_cycle(self):
+    def test_ledger_in_cycle_is_the_sum_of_this_cycles_entries(self):
         led: dict = {}
         settle_month(led, "r", "2026-07", {"A": 10, "B": 2})     # 上個週期
         settle_month(led, "r", "2026-08", {"A": 4, "B": 6})
-        assert led["r"] == {"A": 3.0, "B": -3.0}
+        assert led["r"] == {"A": 3.0, "B": -3.0}                 # 累計檔照舊
         assert cycle.ledger_in_cycle(led, "r", "2026-09") == {"A": -1.0, "B": 1.0}
-        # 7 月屬 2025-08 起的週期:沒有更早的分錄可扣 → 就是累計值
-        assert cycle.ledger_pre_cycle(led, "r", "2026-07") == {}
+        assert cycle.ledger_in_cycle(led, "r", "2026-07") == {"A": 4.0, "B": -4.0}
 
-    def test_trimmed_entries_are_still_subtracted(self, monkeypatch):
-        """修剪掉的舊分錄必須累加到 trimmed,否則它的值會回到本週期的餘額裡。"""
-        from cmuh_common.roster import ledger as L
-        led: dict = {}
-        months = [f"{2024 + (m - 1) // 12:04d}-{(m - 1) % 12 + 1:02d}"
-                  for m in range(1, 30)]                    # 2024-01 … 2026-05
-        for ym in months:
-            settle_month(led, "r", ym, {"A": 2, "B": 0})     # 每月 A +1
-        settle_month(led, "r", "2026-08", {"A": 0, "B": 2})  # 本週期 A -1
-        assert len({e["month"] for e in led["history"]}) == L.HISTORY_KEEP_MONTHS
-        assert led.get("trimmed", {}).get("r"), "被修剪的分錄要留下總和"
-        assert cycle.ledger_in_cycle(led, "r", "2026-09") == {"A": -1.0, "B": 1.0}
+    @staticmethod
+    def _full_history(last="2026-08", scope="r"):
+        """24 個月滿額的 history(=舊版可能已修剪過),最後一個月是 last。"""
+        y, m = int(last[:4]), int(last[5:7])
+        out = []
+        for _ in range(24):
+            out.append({"month": f"{y:04d}-{m:02d}", "scope": scope,
+                        "deltas": {"A": 0.0, "B": 0.0}})
+            m -= 1
+            if m == 0:
+                y, m = y - 1, 12
+        out[0]["deltas"] = {"A": 1.0, "B": -1.0}        # 2026-08 本週期
+        return out
+
+    def test_a_book_trimmed_by_the_old_version_still_resets(self):
+        """[外審 PR #9 P2-3] 舊版修剪 history 時沒留下被丟掉的總和:累計值裡有一塊
+        history 已經找不到的舊餘額。history 已滿 24 個月 → 被丟掉的必是最舊、必在
+        本週期之前 → 本週期只加總本週期的分錄,那塊不會帶進來。"""
+        led = {"r": {"A": 7.0, "B": -7.0},             # +6/-6 屬於早已被修剪的月份
+               "history": self._full_history()}
+        assert cycle.ledger_in_cycle(led, "r", "2026-09") == {"A": 1.0, "B": -1.0}
+
+    def test_a_manual_correction_in_a_short_history_is_kept(self):
+        """直接改 ledger.json 是文件記載的應急手段;history 不足 24 個月 = 不可能被
+        修剪過 → 史外餘額是使用者的修正,屬於本週期(不可以默默丟掉)。"""
+        led = {"r": {"A": 7.0, "B": -7.0},
+               "history": [{"month": "2026-08", "scope": "r",
+                            "deltas": {"A": 1.0, "B": -1.0}}]}
+        assert cycle.ledger_in_cycle(led, "r", "2026-09") == {"A": 7.0, "B": -7.0}
+
+    def test_the_trimmed_judgement_is_made_before_the_solver_rollback(self, tmp_path):
+        """回滾本月(與之後)的分錄會讓月數變少 —— 判定要在回滾之前做。"""
+        st = RosterStorage(str(tmp_path))
+        st.save_config({"r_members": [{"id": "A"}, {"id": "B"}], "vs_members": []})
+        st.save_ledger({"r": {"A": 7.0, "B": -7.0}, "history": self._full_history()})
+        svc = RosterService(st)
+        # 求解 8 月:回滾 8 月後只剩 23 個月,但檔案本身是滿額 → 仍視為可能修剪過
+        assert svc.build_context("r", "2026-08", for_solve=True).ledger == {}
 
     def test_biopsy_in_cycle(self):
         book: dict = {}
         settle_biopsy(book, "2026-07", {"2026-07-04": "C", "2026-07-11": "C"})
         settle_biopsy(book, "2026-08", {"2026-08-01": "K"})
         assert book["counts"] == {"C": 2, "K": 1}
-        assert cycle.biopsy_in_cycle(book["counts"], book, "2026-09") == {"C": 0, "K": 1}
+        assert cycle.biopsy_in_cycle(book, "2026-09") == {"C": 0, "K": 1}
+        hist = [{"month": f"{2024 + (i // 12):04d}-{i % 12 + 1:02d}", "assign": {}}
+                for i in range(7, 31)]                     # 2024-08 … 2026-07,共 24 個月
+        hist[-1] = {"month": "2026-08", "assign": {"2026-08-01": "K"}}
+        legacy = {"counts": {"C": 10, "K": 2}, "history": hist}   # 舊版修剪過的檔
+        assert cycle.biopsy_in_cycle(legacy, "2026-09") == {"C": 0, "K": 1}
 
 
 # ─── 週末次數 ─────────────────────────────────────────────────────────────
@@ -99,6 +129,25 @@ class TestWeekendUnits:
             for mid, n in ws.month_units(y, m, duty, hol, set()).items():
                 total[mid] = total.get(mid, 0) + n
         assert total == {"Z": 4, "C": 5, "K": 5}
+
+    def test_an_exemption_in_the_next_month_excludes_the_saturday_too(self):
+        """[外審 PR #9 P2-5] 10/31(六) 的塊被裁成只有它自己;11/1(日) 標「不計入」
+        時,那整個週末都不算 —— 不可以只看裁切後的 b.days。"""
+        blocks = build_duty_blocks(2026, 10, set())
+        exempt = {date(2026, 11, 1)}
+        counted = ws.counted_blocks(blocks, exempt, set())
+        assert all(b.saturday != date(2026, 10, 31) for b in counted)
+        assert len(counted) == 4
+        duty = {date(2026, 10, 31): "C"}
+        assert ws.month_units(2026, 10, duty, set(), exempt) == {}
+
+    def test_an_exemption_reached_through_a_chained_holiday(self):
+        hol = {date(2026, 11, 2)}                          # 11/2(一) 國定假日
+        blocks = build_duty_blocks(2026, 10, hol)
+        assert any(b.saturday == date(2026, 10, 31)
+                   for b in ws.counted_blocks(blocks, set(), hol))
+        assert not any(b.saturday == date(2026, 10, 31)
+                       for b in ws.counted_blocks(blocks, {date(2026, 11, 2)}, hol))
 
     def test_weights_and_targets(self):
         members = [Member("Z", "", "R1"), Member("C", "", "R2"),
@@ -166,6 +215,19 @@ class TestMonthlyWeekendRange:
         assert wk["K"] == 0 and wk["Z"] == 2 and wk["C"] == 2
         assert any(c.rule_id == "weekend_range" and "不套用" in c.msg
                    for c in res.prechecks)
+
+    def test_a_sunday_directive_for_someone_else_takes_the_whole_weekend(self):
+        """[外審 PR #9 P2-1] 週日鎖給別人 → 同段綁同一人,週六也跟著走。K 每個週末
+        都被週日的鎖定帶走 → K 沒有可值的週末 → 不套用「至少 1 個」。"""
+        locks = {date(2026, 11, 8): "Z", date(2026, 11, 15): "C",
+                 date(2026, 11, 22): "Z", date(2026, 11, 29): "C"}
+        ctx = _nov(locks=locks)
+        res = solve_duty(ctx, allow_relax=("duty_range",))
+        assert res.status == "ok", (res.status, res.diagnosis)
+        assert _weekends(ctx, res)["K"] == 0
+        assert any(c.rule_id == "weekend_range" and "陳" in c.msg and "不套用" in c.msg
+                   for c in res.prechecks)
+        assert "weekend_range" not in res.relaxed
 
     def test_an_exempt_spring_festival_block_is_not_counted(self):
         """春節週末塊由年度指定給 R1,不佔他「每月最多 2 個」的名額。"""
@@ -296,6 +358,37 @@ class TestServiceWiring:
         svc.update_month("2026-08", mut8)
         assert svc.build_context("vs", "2026-08").prev_weekend_counts == {}
         assert svc.build_context("vs", "2026-09").prev_weekend_counts == {"D": 1}
+
+    def test_biopsy_allocation_starts_each_cycle_from_zero(self, tmp_path):
+        """[外審 PR #9 P2-2/3] 排切片用的次數也只看本週期(上個週期的分錄不算)。"""
+        svc = _svc(tmp_path)
+        june = {f"2026-06-{d:02d}": "C" for d in (6, 7, 13, 14, 20, 27)}
+        june.update({"2026-06-21": "K", "2026-06-28": "K"})
+        svc.storage.save_biopsy({"counts": {"C": 10, "K": 2}, "history": [
+            {"month": "2026-07",
+             "assign": {f"2026-07-{d:02d}": "C" for d in (4, 11, 18, 25)}},
+            {"month": "2026-06", "assign": june}]})
+        _put_saturdays(svc, "2026-08", {1: "Z", 8: "Z", 15: "Z", 22: "Z", 29: "Z"})
+        _assign, _notes, _pair, after, _names = svc._biopsy_compute(
+            "2026-08", {d: p for d, p in
+                        ws.duty_map(svc.storage.load_month("2026-08"), "r").items()})
+        assert after["C"] + after["K"] == 5             # 只有本月 5 個週六
+        assert abs(after["C"] - after["K"]) <= 1, after
+
+    def test_renaming_keeps_the_in_cycle_balance(self, tmp_path):
+        """[外審 PR #9 P2-4] 改代號時累計值與 history 分錄一起搬 → 本週期餘額跟著人走
+        (上個週期的部分也一起搬、一起被扣掉)。"""
+        svc = _svc(tmp_path)
+        svc.storage.save_ledger({
+            "r": {"Z": 5.0, "C": -5.0},
+            "history": [
+                {"month": "2026-07", "scope": "r", "deltas": {"Z": 4.0, "C": -4.0}},
+                {"month": "2026-08", "scope": "r", "deltas": {"Z": 1.0, "C": -1.0}}]})
+        before = cycle.ledger_in_cycle(svc.storage.load_ledger(), "r", "2026-09")["Z"]
+        svc.rename_member("r", "Z", "Z2")
+        after = cycle.ledger_in_cycle(svc.storage.load_ledger(), "r", "2026-09")
+        assert before == after["Z2"] == 1.0
+        assert "Z" not in after
 
     def test_the_year_summary(self, tmp_path):
         svc = _svc(tmp_path)

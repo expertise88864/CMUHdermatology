@@ -59,12 +59,13 @@ from cmuh_common.roster.report import (
 from cmuh_common.roster.rules import (
     Precheck, collect_directives, run_prechecks, split_block_runs)
 from cmuh_common.roster.cycle import (
-    biopsy_in_cycle, cycle_months, is_cycle_start, ledger_in_cycle,
+    biopsy_in_cycle, cycle_months, is_cycle_start, ledger_in_cycle, possibly_trimmed,
 )
 from cmuh_common.roster.weekend_share import (
     duty_map as _weekend_duty_map, level_weights as _weekend_level_weights,
     member_weights as _weekend_member_weights, month_units as _weekend_month_units,
 )
+from cmuh_common.roster.saturday_biopsy import HISTORY_KEEP_MONTHS as BIOPSY_HISTORY_KEEP_MONTHS
 from cmuh_common.roster.saturday_biopsy import (
     assign_saturday_biopsy, biopsy_pair, can_rollback as biopsy_can_rollback,
     format_biopsy_section, last_assigned_before, settle_biopsy)
@@ -551,6 +552,8 @@ class RosterService:
         #   先手動編輯 12 月一格(現在會立刻結算),再回頭自動排 11 月 ——
         #   只回滾 11 月的話,12 月的差額會被當成 11 月的 carry-in,公平目標
         #   整個歪掉。帳本是累計的,而「未來」不可能是「之前」的一部分。
+        # 「可能被修剪過」要在回滾【之前】判定(回滾會讓月數變少,見 cycle 模組)。
+        _trimmed = possibly_trimmed(led_all.get("history"))
         _later = sorted({str(e.get("month") or "")
                          for e in (led_all.get("history") or [])
                          if e.get("scope") == scope
@@ -570,7 +573,8 @@ class RosterService:
         #   求解端一律 `ledger.get(mid, 0.0)`,所以這裡去掉 0 是等價的正規化。
         # ★只看本週期★(2026-10-19 使用者定案):每年 8 月起帳本重新計算 ——
         #   累計值扣掉週期開始之前的分錄(見 cycle.ledger_in_cycle)。
-        return {k: v for k, v in ledger_in_cycle(led_all, scope, ym).items()
+        return {k: v for k, v in ledger_in_cycle(led_all, scope, ym,
+                                                 trimmed=_trimmed).items()
                 if round(float(v or 0.0), 4) != 0.0}
 
     @staticmethod
@@ -3069,10 +3073,12 @@ class RosterService:
             book = st.load_biopsy()
         base = {"counts": dict(book.get("counts") or {}),
                 "history": [dict(e) for e in (book.get("history") or [])]}
+        _trimmed = possibly_trimmed(base["history"],      # 回滾之前判定
+                                    BIOPSY_HISTORY_KEEP_MONTHS)
         rollback_biopsy(base, ym)
         # ★次數平衡只看本週期★(2026-10-19 使用者定案):每年 8 月起切片次數
         #   重新計算。輪替決勝(上一次是誰)是銜接,不受週期影響。
-        base["counts"] = biopsy_in_cycle(base["counts"], base, ym)
+        base["counts"] = biopsy_in_cycle(base, ym, trimmed=_trimmed)
         assign, notes = assign_saturday_biopsy(
             year=y, month=m, members=members, duty=duty_by_date,
             leaves=leaves, counts=base["counts"],

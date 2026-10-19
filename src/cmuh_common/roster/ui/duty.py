@@ -313,8 +313,7 @@ class CalendarDutyTab(ttk.Frame):
         self._bx.delete(*self._bx.get_children())
         # [2026-10-19] 只顯示本週期(8 月起)的次數 —— 與排切片時用的同一個數。
         book = self.service.storage.load_biopsy()
-        counts = biopsy_in_cycle(book.get("counts") or {}, book,
-                                 f"{ctx.year:04d}-{ctx.month:02d}")
+        counts = biopsy_in_cycle(book, f"{ctx.year:04d}-{ctx.month:02d}")
         pair, _notes = biopsy_pair(ctx.members)
         if not pair:
             self._bx.insert("", "end", values=("（名單缺 R2/R3）", "—"))

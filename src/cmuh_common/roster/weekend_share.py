@@ -21,7 +21,7 @@
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 from cmuh_common.roster.model import build_duty_blocks
 
@@ -59,11 +59,34 @@ def member_weights(members, weights_by_level: dict) -> dict:
             for m in members}
 
 
-def counted_blocks(blocks, exempt) -> list:
-    """會計入年度週末的週末塊：含本月週六、且沒有任何一天被標「不計入」。"""
+def weekend_chain(saturday: date, holidays) -> list:
+    """週六所在的【完整】週末連休段(不受月份裁切):週六、週日,往後鏈入平日國定
+    假日、往前鏈入週六之前的平日國定假日。`build_duty_blocks` 只在本月內建塊,
+    所以 10/31(六) 的塊只有它自己 —— 而 11/1(日) 被標「不計入」時,那個週末整個
+    都不該算(外審 PR #9 第 1 輪)。"""
+    hol = set(holidays or ())
+    days = [saturday, saturday + timedelta(days=1)]
+    nxt = saturday + timedelta(days=2)
+    while nxt in hol and nxt.weekday() < 5:
+        days.append(nxt)
+        nxt += timedelta(days=1)
+    prv = saturday - timedelta(days=1)
+    while prv in hol and prv.weekday() < 5:
+        days.insert(0, prv)
+        prv -= timedelta(days=1)
+    return days
+
+
+def counted_blocks(blocks, exempt, holidays=()) -> list:
+    """會計入年度週末的週末塊：含本月週六、且整個週末連休段(含跨月的那一半)
+    沒有任何一天被標「不計入」。"""
     exempt = set(exempt or ())
+    if not exempt:
+        return [b for b in blocks if b.saturday is not None]
     return [b for b in blocks
-            if b.saturday is not None and not any(d in exempt for d in b.days)]
+            if b.saturday is not None
+            and not any(d in exempt for d in b.days)
+            and not any(d in exempt for d in weekend_chain(b.saturday, holidays))]
 
 
 def month_units(year: int, month: int, duty: dict, holidays, exempt) -> dict:
@@ -73,7 +96,7 @@ def month_units(year: int, month: int, duty: dict, holidays, exempt) -> dict:
     「值了這個週末」的人（與 WeekendCapRule、last_weekend 同一個判準）。"""
     out: dict = {}
     blocks = build_duty_blocks(year, month, set(holidays or ()))
-    for b in counted_blocks(blocks, exempt):
+    for b in counted_blocks(blocks, exempt, holidays):
         mid = duty.get(b.saturday)
         if mid:
             out[mid] = out.get(mid, 0) + 1
@@ -122,7 +145,7 @@ def cycle_year_units(cycle_yms, holidays, exempt) -> int:
     for ym in cycle_yms:
         y, m = int(ym[:4]), int(ym[5:7])
         total += len(counted_blocks(build_duty_blocks(y, m, set(holidays or ())),
-                                    exempt))
+                                    exempt, holidays))
     return total
 
 
@@ -138,7 +161,7 @@ def year_summary(ctx, duty_this_month: dict) -> list:
     weights = {mid: w for mid, w in weights.items() if w > 0}
     if not weights:
         return []
-    blocks = counted_blocks(ctx.blocks, ctx.weekend_exempt)
+    blocks = counted_blocks(ctx.blocks, ctx.weekend_exempt, ctx.holidays)
     this_month: dict = {}
     for b in blocks:
         mid = duty_this_month.get(b.saturday)
