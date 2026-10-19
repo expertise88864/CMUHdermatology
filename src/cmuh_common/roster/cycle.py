@@ -6,18 +6,15 @@
 ★銜接規則不重置★：上月最後週末的人接本月連休、月初連值、色塊連週，
 這些是安全與交接，7/31 → 8/1 照常接續。
 
-★本週期的值怎麼算★（帳本檔不改寫，純推導，不需要遷移）
-  累計值 = history 各月分錄的總和 + 「史外餘額」(history 解釋不了的部分)。
-  史外餘額有兩種來源，處理方式不同：
-    * 使用者直接改 ledger.json / biopsy.json（文件記載的應急手段）→ 屬於現在，
-      要算進本週期；
-    * 舊分錄被 `_trim_history` 修剪掉（舊版修剪時沒留下總和，外審 PR #9）→
-      只會發生在 history 已滿 HISTORY_KEEP_MONTHS（24）個月時，而被丟掉的必然是
-      最舊的月份 → 必在本週期之前，不可帶進新週期。
-  所以：history【不可能被修剪過】(不足 24 個月) → 本週期＝累計 − 週期之外的分錄；
-        【可能被修剪過】→ 本週期＝只加總落在本週期的分錄(24 個月必含整個週期)。
-  「可能被修剪過」要在求解端於記憶體回滾【之前】判定(回滾會讓月數變少)。
-  人員改代號/歸零/離開名單會同步改寫累計值與分錄，兩種算法都跟著正確。
+★本週期的值怎麼算★（帳本檔不改寫，純推導）
+  累計值 = history 各月分錄 + 被修剪掉的舊分錄 + 使用者直接改的修正。
+  本週期 = 累計 − 週期之外的分錄 − 被修剪掉的舊分錄（記在 `trimmed`）。
+    * 使用者直接改 ledger.json / biopsy.json（文件記載的應急手段）→ 保留，
+      屬於本週期 —— 不可以因為 history 剛好滿了就默默丟掉（外審 PR #9 第 2 輪）。
+    * `trimmed` 鍵存在 ＝ 從那時起每次修剪都記了總和（新版在 history 還不可能
+      被修剪過時就標上）。沒有這個鍵、history 卻已滿保留月數 ＝ 舊版程式修剪過，
+      被丟掉的總和無從得知 → 求解時【明講並停下】（不猜它屬於哪一期）。
+  人員改代號/歸零/離開名單會同步改寫累計值、分錄與 `trimmed`。
 """
 from __future__ import annotations
 
@@ -82,11 +79,28 @@ def possibly_trimmed(history, keep_months: int = _LEDGER_KEEP) -> bool:
     return len(months) >= keep_months
 
 
+class UntrackedTrimError(ValueError):
+    """舊版程式修剪過 history、被丟掉的總和無從得知 → 分不出舊餘額與修正。"""
+
+
+def _untracked(book: dict, trimmed) -> bool:
+    return bool(trimmed) and "trimmed" not in book
+
+
+_UNTRACKED_MSG = (
+    "{name} 的歷史已滿 {keep} 個月，且是舊版程式修剪的（沒有記下被修剪掉的總和），"
+    "無法分辨帳本裡 history 以外的餘額是「更早的舊值」還是「直接修改的修正」——"
+    "猜錯會讓新排班年度帶著上一年度的差額。請確認後在 {name} 加上 \"trimmed\": {{}}"
+    "（表示 history 以外的餘額都算本年度的修正），或把舊值直接改掉，再重新排班。")
+
+
 def ledger_in_cycle(ledger: dict, scope: str, ym: str, *,
-                    trimmed: "bool | None" = None) -> dict:
+                    trimmed: "bool | None" = None, strict: bool = False) -> dict:
     """本週期的帳本餘額 {person: 值}（見模組說明）。
 
-    trimmed: 呼叫端在回滾之前判定的「可能被修剪過」；None → 就地判定。"""
+    trimmed: 呼叫端在回滾之前判定的「可能被修剪過」；None → 就地判定。
+    strict: 遇到舊版修剪、無從分辨時拋 UntrackedTrimError(求解路徑);否則
+        (顯示)退回只加總本週期分錄。"""
     hist = ledger.get("history") or []
     if trimmed is None:
         trimmed = possibly_trimmed(hist)
@@ -99,13 +113,19 @@ def ledger_in_cycle(ledger: dict, scope: str, ym: str, *,
         target = inside if in_cycle(e.get("month"), ym) else outside
         for pid, delta in (e.get("deltas") or {}).items():
             target[pid] = target.get(pid, 0.0) + float(delta)
-    if trimmed:
+    if _untracked(ledger, trimmed):
+        if strict:
+            raise UntrackedTrimError(_UNTRACKED_MSG.format(
+                name="ledger.json", keep=_LEDGER_KEEP))
         return {pid: round(v, 4) for pid, v in inside.items()}
-    return {pid: round(float(v or 0.0) - outside.get(pid, 0.0), 4)
+    gone = (ledger.get("trimmed") or {}).get(scope) or {}
+    return {pid: round(float(v or 0.0) - outside.get(pid, 0.0)
+                       - float(gone.get(pid, 0.0)), 4)
             for pid, v in book.items()}
 
 
-def biopsy_in_cycle(book: dict, ym: str, *, trimmed: "bool | None" = None) -> dict:
+def biopsy_in_cycle(book: dict, ym: str, *, trimmed: "bool | None" = None,
+                    strict: bool = False) -> dict:
     """本週期的週六切片次數 {person: 次}（規則同 ledger_in_cycle，不低於 0）。"""
     hist = book.get("history") or []
     if trimmed is None:
@@ -117,6 +137,11 @@ def biopsy_in_cycle(book: dict, ym: str, *, trimmed: "bool | None" = None) -> di
         target = inside if in_cycle(e.get("month"), ym) else outside
         for mid in (e.get("assign") or {}).values():
             target[mid] = target.get(mid, 0) + 1
-    if trimmed:
+    if _untracked(book, trimmed):
+        if strict:
+            raise UntrackedTrimError(_UNTRACKED_MSG.format(
+                name="biopsy.json", keep=_BIOPSY_KEEP))
         return inside
-    return {mid: max(0, int(v or 0) - outside.get(mid, 0)) for mid, v in counts.items()}
+    gone = book.get("trimmed") or {}
+    return {mid: max(0, int(v or 0) - outside.get(mid, 0) - int(gone.get(mid, 0)))
+            for mid, v in counts.items()}

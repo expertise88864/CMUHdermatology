@@ -177,6 +177,13 @@ def _trim_history(book: dict, keep_months: int = HISTORY_KEEP_MONTHS) -> None:
     if len(months) <= keep_months:
         return
     keep = set(months[:keep_months])
+    # ★被丟掉的分錄要記下次數★(理由同 ledger._trim_history;見 cycle 模組)
+    trimmed = book.setdefault("trimmed", {})
+    for e in hist:
+        if e.get("month") in keep:
+            continue
+        for mid in (e.get("assign") or {}).values():
+            trimmed[mid] = int(trimmed.get(mid, 0)) + 1
     book["history"] = [e for e in hist if e.get("month") in keep]
 
 
@@ -212,6 +219,11 @@ def settle_biopsy(book: dict, ym: str, assign: dict) -> dict:
             f"{ym} 比切片帳本保留的最舊月份還早（上限 {HISTORY_KEEP_MONTHS} 個月），"
             f"無法確認它的舊分錄是否已被修剪掉——若已被修剪，重記會在已計入的次數上"
             f"再加一次。如確實需要調整該月，請直接修改 biopsy.json 的 counts。")
+    # ★開始追蹤修剪★(同 ledger.settle_month)
+    if "trimmed" not in book and len(
+            {e.get("month") for e in (book.get("history") or [])
+             if e.get("month")}) < HISTORY_KEEP_MONTHS:
+        book["trimmed"] = {}
     rollback_biopsy(book, ym)
     counts = book.setdefault("counts", {})
     iso_assign: dict = {}

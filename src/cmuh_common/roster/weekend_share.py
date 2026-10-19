@@ -60,21 +60,37 @@ def member_weights(members, weights_by_level: dict) -> dict:
 
 
 def weekend_chain(saturday: date, holidays) -> list:
-    """週六所在的【完整】週末連休段(不受月份裁切):週六、週日,往後鏈入平日國定
-    假日、往前鏈入週六之前的平日國定假日。`build_duty_blocks` 只在本月內建塊,
-    所以 10/31(六) 的塊只有它自己 —— 而 11/1(日) 被標「不計入」時,那個週末整個
-    都不該算(外審 PR #9 第 1 輪)。"""
+    """週六所在的【完整】週末連休段(不受月份裁切),★歸屬規則與月內建塊相同★。
+
+    `build_duty_blocks` 只在本月內建塊,所以 10/31(六) 的塊只有它自己 —— 而
+    11/1(日) 被標「不計入」時,那個週末整個都不該算(外審 PR #9 第 1 輪)。
+    但不可以單純往前後鏈假日:週一～週五連續假日已被【前一個週末】往後鏈走時,
+    後一個週末往前鏈不到它們(外審 PR #9 第 2 輪)。所以在週六前後三週的範圍內,
+    照 build_duty_blocks 的同一套順序(週六由早到晚、先往後鏈再往前鏈、不吃已
+    被佔用的日)重建,取包含這個週六的那一塊。"""
     hol = set(holidays or ())
-    days = [saturday, saturday + timedelta(days=1)]
-    nxt = saturday + timedelta(days=2)
-    while nxt in hol and nxt.weekday() < 5:
-        days.append(nxt)
-        nxt += timedelta(days=1)
-    prv = saturday - timedelta(days=1)
-    while prv in hol and prv.weekday() < 5:
-        days.insert(0, prv)
-        prv -= timedelta(days=1)
-    return days
+    start = saturday - timedelta(days=21)
+    end = saturday + timedelta(days=21)
+    span = {start + timedelta(days=i) for i in range((end - start).days + 1)}
+    claimed: set = set()
+    d = start + timedelta(days=(5 - start.weekday()) % 7)      # 範圍內第一個週六
+    while d <= end:
+        block = [d]
+        if d + timedelta(days=1) in span:
+            block.append(d + timedelta(days=1))
+        nxt = block[-1] + timedelta(days=1)
+        while nxt in span and nxt in hol and nxt.weekday() < 5 and nxt not in claimed:
+            block.append(nxt)
+            nxt += timedelta(days=1)
+        prv = d - timedelta(days=1)
+        while prv in span and prv in hol and prv.weekday() < 5 and prv not in claimed:
+            block.insert(0, prv)
+            prv -= timedelta(days=1)
+        claimed.update(block)
+        if d == saturday:
+            return block
+        d += timedelta(days=7)
+    return [saturday, saturday + timedelta(days=1)]
 
 
 def counted_blocks(blocks, exempt, holidays=()) -> list:

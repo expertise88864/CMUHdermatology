@@ -78,14 +78,40 @@ class TestCycle:
                             "deltas": {"A": 1.0, "B": -1.0}}]}
         assert cycle.ledger_in_cycle(led, "r", "2026-09") == {"A": 7.0, "B": -7.0}
 
-    def test_the_trimmed_judgement_is_made_before_the_solver_rollback(self, tmp_path):
-        """回滾本月(與之後)的分錄會讓月數變少 —— 判定要在回滾之前做。"""
+    def test_an_untracked_legacy_trim_stops_the_solve_instead_of_guessing(self, tmp_path):
+        """[外審 PR #9 第 2 輪] 舊版修剪過(history 滿、沒有 trimmed 記錄)→ 分不出舊值
+        與修正 → 求解路徑明講並停下。判定要在回滾之前做(回滾 8 月後只剩 23 個月)。"""
         st = RosterStorage(str(tmp_path))
         st.save_config({"r_members": [{"id": "A"}, {"id": "B"}], "vs_members": []})
         st.save_ledger({"r": {"A": 7.0, "B": -7.0}, "history": self._full_history()})
         svc = RosterService(st)
-        # 求解 8 月:回滾 8 月後只剩 23 個月,但檔案本身是滿額 → 仍視為可能修剪過
-        assert svc.build_context("r", "2026-08", for_solve=True).ledger == {}
+        with pytest.raises(cycle.UntrackedTrimError, match="trimmed"):
+            svc.build_context("r", "2026-08", for_solve=True)
+        # 顯示不擋(退回只加總本週期分錄)
+        assert svc.build_context("r", "2026-09").ledger == {"A": 1.0, "B": -1.0}
+
+    def test_a_manual_correction_survives_a_full_tracked_history(self):
+        """[外審 PR #9 第 2 輪] history 剛好滿 24 個月不代表修正要丟掉:有 trimmed
+        記錄(＝修剪都有記總和)時,史外餘額就是使用者的修正,保留。"""
+        led = {"r": {"A": 7.0, "B": -7.0}, "history": self._full_history(),
+               "trimmed": {}}
+        assert cycle.ledger_in_cycle(led, "r", "2026-09", strict=True) == {
+            "A": 7.0, "B": -7.0}
+
+    def test_new_trimming_records_totals_and_they_stay_out_of_the_cycle(self):
+        from cmuh_common.roster import ledger as L
+        led: dict = {}
+        months = [f"{2024 + (m - 1) // 12:04d}-{(m - 1) % 12 + 1:02d}"
+                  for m in range(1, 30)]                    # 2024-01 … 2026-05
+        for ym in months:
+            settle_month(led, "r", ym, {"A": 2, "B": 0})     # 每月 A +1
+        settle_month(led, "r", "2026-08", {"A": 0, "B": 2})  # 本週期 A -1
+        assert len({e["month"] for e in led["history"]}) == L.HISTORY_KEEP_MONTHS
+        assert led["trimmed"]["r"]["A"] > 0, "被修剪的分錄要留下總和"
+        assert cycle.ledger_in_cycle(led, "r", "2026-09", strict=True) == {
+            "A": -1.0, "B": 1.0}
+        led["r"]["A"] += 0.5                                 # 之後的手動修正 → 保留
+        assert cycle.ledger_in_cycle(led, "r", "2026-09", strict=True)["A"] == -0.5
 
     def test_biopsy_in_cycle(self):
         book: dict = {}
@@ -140,6 +166,17 @@ class TestWeekendUnits:
         assert len(counted) == 4
         duty = {date(2026, 10, 31): "C"}
         assert ws.month_units(2026, 10, duty, set(), exempt) == {}
+
+    def test_holidays_owned_by_the_earlier_weekend_do_not_exempt_the_next(self):
+        """[外審 PR #9 第 2 輪] 2/8–12 連續假日已被 2/6 那個週末往後鏈走;2/8 標
+        「不計入」只排除 2/6 那塊,2/13–14 是另一個週末,照常計入。"""
+        hol = {date(2027, 2, d) for d in range(8, 13)}
+        assert ws.weekend_chain(date(2027, 2, 13), hol) == [date(2027, 2, 13),
+                                                            date(2027, 2, 14)]
+        blocks = build_duty_blocks(2027, 2, hol)
+        counted = ws.counted_blocks(blocks, {date(2027, 2, 8)}, hol)
+        assert {b.saturday for b in counted} == {date(2027, 2, 13), date(2027, 2, 20),
+                                                  date(2027, 2, 27)}
 
     def test_an_exemption_reached_through_a_chained_holiday(self):
         hol = {date(2026, 11, 2)}                          # 11/2(一) 國定假日
@@ -374,6 +411,18 @@ class TestServiceWiring:
                         ws.duty_map(svc.storage.load_month("2026-08"), "r").items()})
         assert after["C"] + after["K"] == 5             # 只有本月 5 個週六
         assert abs(after["C"] - after["K"]) <= 1, after
+
+    def test_renaming_moves_the_trimmed_totals_too(self, tmp_path):
+        """[外審 PR #9 第 1 輪 P2-4] 被修剪的舊分錄總和要跟著代號一起搬。"""
+        svc = _svc(tmp_path)
+        svc.storage.save_ledger({
+            "r": {"Z": 6.0, "C": -6.0},
+            "history": [{"month": "2026-08", "scope": "r", "deltas": {"Z": 1.0, "C": -1.0}}],
+            "trimmed": {"r": {"Z": 5.0, "C": -5.0}}})
+        svc.rename_member("r", "Z", "Z2")
+        led = svc.storage.load_ledger()
+        assert led["trimmed"]["r"] == {"Z2": 5.0, "C": -5.0}
+        assert cycle.ledger_in_cycle(led, "r", "2026-09", strict=True)["Z2"] == 1.0
 
     def test_renaming_keeps_the_in_cycle_balance(self, tmp_path):
         """[外審 PR #9 P2-4] 改代號時累計值與 history 分錄一起搬 → 本週期餘額跟著人走

@@ -438,6 +438,8 @@ def _files_with_both_ids(scope: str, old_id: str, new_id: str, ledger: dict,
     def _led(who) -> bool:
         if who in (ledger.get(scope) or {}):
             return True
+        if who in ((ledger.get("trimmed") or {}).get(scope) or {}):
+            return True
         return any(e.get("scope") == scope and who in (e.get("deltas") or {})
                    for e in (ledger.get("history") or []))
 
@@ -446,7 +448,7 @@ def _files_with_both_ids(scope: str, old_id: str, new_id: str, ledger: dict,
 
     def _bio(who) -> bool:
         b = biopsy or {}
-        if who in (b.get("counts") or {}):
+        if who in (b.get("counts") or {}) or who in (b.get("trimmed") or {}):
             return True
         return any(who in (e.get("assign") or {}).values()
                    for e in (b.get("history") or []))
@@ -574,7 +576,8 @@ class RosterService:
         # ★只看本週期★(2026-10-19 使用者定案):每年 8 月起帳本重新計算 ——
         #   累計值扣掉週期開始之前的分錄(見 cycle.ledger_in_cycle)。
         return {k: v for k, v in ledger_in_cycle(led_all, scope, ym,
-                                                 trimmed=_trimmed).items()
+                                                 trimmed=_trimmed,
+                                                 strict=True).items()
                 if round(float(v or 0.0), 4) != 0.0}
 
     @staticmethod
@@ -3073,12 +3076,14 @@ class RosterService:
             book = st.load_biopsy()
         base = {"counts": dict(book.get("counts") or {}),
                 "history": [dict(e) for e in (book.get("history") or [])]}
+        if "trimmed" in book:                     # 本週期次數要扣掉被修剪的舊分錄
+            base["trimmed"] = dict(book.get("trimmed") or {})
         _trimmed = possibly_trimmed(base["history"],      # 回滾之前判定
                                     BIOPSY_HISTORY_KEEP_MONTHS)
         rollback_biopsy(base, ym)
         # ★次數平衡只看本週期★(2026-10-19 使用者定案):每年 8 月起切片次數
         #   重新計算。輪替決勝(上一次是誰)是銜接,不受週期影響。
-        base["counts"] = biopsy_in_cycle(base, ym, trimmed=_trimmed)
+        base["counts"] = biopsy_in_cycle(base, ym, trimmed=_trimmed, strict=True)
         assign, notes = assign_saturday_biopsy(
             year=y, month=m, members=members, duty=duty_by_date,
             leaves=leaves, counts=base["counts"],
@@ -3912,12 +3917,16 @@ class RosterService:
         clashes = set()
         if new_id in (ledger.get(scope) or {}):
             clashes.add("帳本餘額")
+        if new_id in ((ledger.get("trimmed") or {}).get(scope) or {}):
+            clashes.add("帳本修剪紀錄")
         for e in (ledger.get("history") or []):
             if e.get("scope") == scope and new_id in (e.get("deltas") or {}):
                 clashes.add("帳本分錄")
         if scope == "r":
             if new_id in ((biopsy or {}).get("counts") or {}):
                 clashes.add("切片計數")
+            if new_id in ((biopsy or {}).get("trimmed") or {}):
+                clashes.add("切片修剪紀錄")
             for e in ((biopsy or {}).get("history") or []):
                 if new_id in (e.get("assign") or {}).values():
                     clashes.add("切片分錄")
@@ -3988,6 +3997,10 @@ class RosterService:
                 if old_id in deltas:
                     deltas[new_id] = deltas.pop(old_id)
                     changed += 1
+        _gone = (ledger.get("trimmed") or {}).get(scope) or {}   # 被修剪的舊分錄總和
+        if old_id in _gone:
+            _gone[new_id] = _gone.pop(old_id)
+            changed += 1
         sub = holiday.get(scope) or {}                      # 5) holiday_duty[scope] 指定值
         holiday_changed = False
         for d, mid in list(sub.items()):
@@ -4000,6 +4013,11 @@ class RosterService:
             counts = biopsy.get("counts") or {}
             if old_id in counts:
                 counts[new_id] = counts.pop(old_id)
+                changed += 1
+                biopsy_changed = True
+            _bgone = (biopsy or {}).get("trimmed") or {}
+            if old_id in _bgone:
+                _bgone[new_id] = _bgone.pop(old_id)
                 changed += 1
                 biopsy_changed = True
             for e in (biopsy.get("history") or []):

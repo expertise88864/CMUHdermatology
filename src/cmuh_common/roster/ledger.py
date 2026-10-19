@@ -60,6 +60,17 @@ def _trim_history(ledger: dict, keep_months: int = HISTORY_KEEP_MONTHS) -> None:
     if len(months) <= keep_months:
         return
     keep = set(months[:keep_months])
+    # ★被丟掉的分錄要記下總和★(2026-10-19 年度週期,外審 PR #9):本週期餘額
+    #   ＝累計 − 週期之外的分錄 − 被修剪掉的分錄(見 cycle.ledger_in_cycle)。
+    #   「trimmed」鍵存在 = 從那時起每次修剪都有記錄;沒有它而 history 已滿
+    #   = 舊版程式修剪過、總和已無從得知(cycle 會在求解時明講,不猜)。
+    trimmed = ledger.setdefault("trimmed", {})
+    for e in hist:
+        if e.get("month") in keep:
+            continue
+        book = trimmed.setdefault(str(e.get("scope") or ""), {})
+        for pid, delta in (e.get("deltas") or {}).items():
+            book[pid] = round(book.get(pid, 0.0) + float(delta), 4)
     ledger["history"] = [e for e in hist if e.get("month") in keep]
 
 
@@ -92,6 +103,13 @@ def settle_month(ledger: dict, scope: str, month: str,
             f"無法確認它的舊分錄是否已被修剪掉——若已被修剪，重記會在已計入的舊值上"
             f"再加一次（靜默偏移，之後每個月的公平目標都會跟著錯）。"
             f"如確實需要調整該月，請直接修改 ledger.json 的餘額。")
+    # ★開始追蹤修剪★:history 還不可能被修剪過(未滿保留月數)時標記
+    #   trimmed={} —— 之後的修剪都會記總和,本週期餘額就分得出「被修剪的舊值」
+    #   與「使用者直接改的修正」(見 cycle 模組)。
+    if "trimmed" not in ledger and len(
+            {e.get("month") for e in (ledger.get("history") or [])
+             if e.get("month")}) < HISTORY_KEEP_MONTHS:
+        ledger["trimmed"] = {}
     rollback_month(ledger, scope, month)
     n = len(points_by_person)
     share = fair_share(sum(points_by_person.values()), n)
@@ -144,6 +162,8 @@ def reset_member(ledger: dict, scope: str, member_id: str) -> None:
     for e in (ledger.get("history") or []):
         if e.get("scope") == scope:
             (e.get("deltas") or {}).pop(member_id, None)
+    # 被修剪掉的舊分錄總和也屬於「過往貢獻」,一併作廢。
+    ((ledger.get("trimmed") or {}).get(scope) or {}).pop(member_id, None)
 
 
 def sync_members(ledger: dict, scope: str, member_ids: list) -> None:
@@ -162,3 +182,4 @@ def sync_members(ledger: dict, scope: str, member_ids: list) -> None:
             for e in (ledger.get("history") or []):
                 if e.get("scope") == scope:
                     (e.get("deltas") or {}).pop(mid, None)
+            ((ledger.get("trimmed") or {}).get(scope) or {}).pop(mid, None)
