@@ -40,7 +40,7 @@ def _ctx():
 
 def _solver_always(name, assignments=None):
     """把求解器換成「一律回這個狀態」。"""
-    def _fake(_ctx, _scope, _level):
+    def _fake(_ctx, _scope, _relaxed):
         return name, assignments
     return _fake
 
@@ -65,14 +65,15 @@ def test_timeout_diagnosis_names_the_levels_that_gave_up(monkeypatch):
 
     text = "\n".join(res.diagnosis)
     assert "還沒算完" in text
-    assert "L0" in text and "L3" in text, f"至少要點名首層與色塊那層:{text}"
+    assert "全部規則" in text and "色塊連週" in text, \
+        f"至少要點名「全部規則」與放寬色塊的那一組:{text}"
 
 
 def test_a_timeout_on_the_colour_level_alone_still_counts(monkeypatch):
     """前三層真的無解、但【色塊那一層逾時】→ 仍不可說「與色塊無關」,
     因為那條路根本沒跑完;使用者也還沒被問到要不要放寬色塊。"""
-    def _fake(_ctx, _scope, level):
-        if level == solve_rvs.L3_NO_COLOR:
+    def _fake(_ctx, _scope, relaxed):
+        if "weekend_color" in relaxed:
             return "UNKNOWN", None
         return "INFEASIBLE", None
 
@@ -102,8 +103,8 @@ def test_a_real_infeasible_is_still_infeasible(monkeypatch):
     res = solve_rvs.solve_duty(_ctx())
 
     assert res.status == "infeasible"
-    assert "自動放寬到底仍無解" in "\n".join(res.diagnosis)
-    assert "與色塊無關" in "\n".join(res.diagnosis), "真的測過才可以這樣說"
+    assert "放寬到底仍無解" in "\n".join(res.diagnosis)
+    assert "與這些規則無關" in "\n".join(res.diagnosis), "真的測過才可以這樣說"
 
 
 def test_a_successful_solve_is_unaffected(monkeypatch):
@@ -123,8 +124,8 @@ def test_need_confirm_color_path_is_unaffected(monkeypatch):
     ctx = _ctx()
     plan = {d: "A" for d in ctx.days}
 
-    def _fake(_c, _s, level):
-        if level == solve_rvs.L3_NO_COLOR:
+    def _fake(_c, _s, relaxed):
+        if relaxed == frozenset({"weekend_color"}):
             return "OPTIMAL", plan
         return "INFEASIBLE", None
 
@@ -145,18 +146,19 @@ def test_a_relaxed_solution_says_the_strict_level_merely_gave_up(monkeypatch):
     ctx = _ctx()
     plan = {d: "A" for d in ctx.days}
 
-    def _fake(_c, _s, level):
-        if level == solve_rvs.L0_FULL:
+    def _fake(_c, _s, relaxed):
+        if not relaxed:
             return "UNKNOWN", None
         return "OPTIMAL", plan
 
     monkeypatch.setattr(solve_rvs, "_build_and_solve", _fake)
-    res = solve_rvs.solve_duty(ctx)
+    # [2026-10-19] 放寬一律要使用者確認 → 這裡模擬他已按確認放寬 9–11 班。
+    res = solve_rvs.solve_duty(ctx, allow_relax=("duty_range",))
 
     assert res.status == "ok"
     text = build_report(ctx, res, "R 排班")
-    assert "未得出結論" in text, f"沒有說出 L0 只是沒算完:{text}"
-    assert "L0" in text
+    assert "未得出結論" in text, f"沒有說出全部規則只是沒算完:{text}"
+    assert "全部規則" in text
 
 
 def test_need_confirm_color_does_not_claim_infeasible_after_a_timeout(monkeypatch):
@@ -164,8 +166,8 @@ def test_need_confirm_color_does_not_claim_infeasible_after_a_timeout(monkeypatc
     ctx = _ctx()
     plan = {d: "A" for d in ctx.days}
 
-    def _fake(_c, _s, level):
-        if level == solve_rvs.L3_NO_COLOR:
+    def _fake(_c, _s, relaxed):
+        if relaxed == frozenset({"weekend_color"}):
             return "OPTIMAL", plan
         return "UNKNOWN", None
 
@@ -174,7 +176,7 @@ def test_need_confirm_color_does_not_claim_infeasible_after_a_timeout(monkeypatc
 
     assert res.status == "need_confirm_color"
     text = "\n".join(res.diagnosis)
-    assert "在不動色塊連週規則的前提下無解" not in text, text
+    assert "在不放寬規則的前提下無解" not in text, text
     assert "未得出結論" in text
 
 
@@ -209,8 +211,8 @@ def test_model_invalid_shows_its_diagnosis_in_the_report(monkeypatch):
 
 def test_timeout_and_model_invalid_are_reported_separately(monkeypatch):
     """一層逾時、一層模型異常 → 模型異常優先(重試沒用),但兩者都要被點名。"""
-    def _fake(_c, _s, level):
-        if level == solve_rvs.L0_FULL:
+    def _fake(_c, _s, relaxed):
+        if not relaxed:
             return "UNKNOWN", None
         return "MODEL_INVALID", None
 

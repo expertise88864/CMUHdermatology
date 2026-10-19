@@ -317,8 +317,8 @@ def test_storage_snapshot_pruned_to_keep(tmp_path):
 def _infeasible_counter(monkeypatch):
     calls: list = []
 
-    def fake(ctx, scope, level):
-        calls.append(level)
+    def fake(ctx, scope, relaxed):
+        calls.append(relaxed)
         return "INFEASIBLE", None
     monkeypatch.setattr(sr, "_build_and_solve", fake)
     return calls
@@ -329,23 +329,39 @@ def _prep(scope, members, **kw):
                         **kw).prepare()
 
 
-def test_solve_vs_skips_duplicate_levels(monkeypatch):
-    """[OPT-1] VS 無 duty_range → L0/L1/L2 規則集相同 → 只求 L0，再測 L3 一次。"""
+def test_solve_vs_only_tries_the_colour_relaxation(monkeypatch):
+    """VS 唯一可放寬的是色塊連週 → 全部規則一次、放寬色塊一次,不重複求解。"""
     calls = _infeasible_counter(monkeypatch)
     r = sr.solve_duty(_prep("vs", [Member("D", "D"), Member("J", "J")]))
     assert r.status == "infeasible"
-    assert calls == [sr.L0_FULL, sr.L3_NO_COLOR]     # L1/L2 跳過
+    assert calls == [frozenset(), frozenset({"weekend_color"})]
 
 
-def test_solve_r_scope_skips_only_L2(monkeypatch):
-    """[OPT-1] R 有 duty_range（L1 關）→ L0≠L1 都試、L2==L1 跳過；L3 只測一次。"""
+def test_solve_r_tries_each_relaxation_combination_once_smallest_first(monkeypatch):
+    """[2026-10-19] R 有三條可放寬(經確認)的規則 → 先全部規則,再由小到大試
+    每一種放寬組合各一次(找出「最少要放寬哪幾條」交給使用者確認)。"""
     calls = _infeasible_counter(monkeypatch)
     r = sr.solve_duty(_prep("r", [Member("a", "甲", fixed_weekday=2),
                                   Member("b", "乙")]))
     assert r.status == "infeasible"
-    assert sr.L0_FULL in calls and sr.L1_NO_RANGE in calls
-    assert sr.L2_RESERVED not in calls
-    assert calls.count(sr.L3_NO_COLOR) == 1
+    assert calls[0] == frozenset()
+    assert len(calls) == len(set(calls)) == 8          # 1 + 3 + 3 + 1
+    assert [len(c) for c in calls] == sorted(len(c) for c in calls)
+    assert calls[-1] == frozenset({"duty_range", "weekend_range", "weekend_color"})
+
+
+def test_an_authorised_relaxation_is_tried_right_after_the_strict_solve(monkeypatch):
+    """使用者已按確認 → 全部規則仍先試(說不定已經排得出來),接著試他同意的那組。"""
+    calls: list = []
+
+    def fake(ctx, scope, relaxed):
+        calls.append(relaxed)
+        return ("OPTIMAL", {d: "a" for d in ctx.days})             if relaxed == frozenset({"duty_range"}) else ("INFEASIBLE", None)
+    monkeypatch.setattr(sr, "_build_and_solve", fake)
+    r = sr.solve_duty(_prep("r", [Member("a", "甲"), Member("b", "乙")]),
+                      allow_relax=("duty_range", "not_a_rule"))
+    assert r.status == "ok" and r.relaxed == ["duty_range"]
+    assert calls == [frozenset(), frozenset({"duty_range"})]
 
 
 def test_diagnose_lists_single_eligible_days(monkeypatch):

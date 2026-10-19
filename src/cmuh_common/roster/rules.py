@@ -3,7 +3,7 @@
 
 擴充 SOP（使用者要求「隨時可能更改排班邏輯」）：
     新增規則 = 寫一個 Rule 子類 + @register_rule + 一個測試檔，不動 solver 主體。
-    停用/放寬 = 調 relax_level；參數 = 進 config 由 ctx.params 帶入。
+    可放寬 = relaxable=True（放寬一律經使用者確認）；參數 = 進 config 由 ctx.params 帶入。
 
 每條規則三件事：
     precheck(ctx)          排班前人話檢查 → [(severity, msg)]，severity ∈ {"error","warn","info"}
@@ -18,18 +18,26 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import date
-from typing import Optional
 
 from cmuh_common.roster.model import (
     SolveContext, day_point, week_key,
 )
 from cmuh_common.roster.saturday_biopsy import BIOPSY_LEVELS
+from cmuh_common.roster.weekend_share import counted_blocks
 
-# 放寬階梯層級（設計文件 §6）
-L0_FULL = 0          # 全部規則
-L1_NO_RANGE = 1      # 放寬 9-11 班數範圍（自動）
-L2_RESERVED = 2      # 保留級（目前 R/VS 無次要軟公平可放，同 L1）
-L3_NO_COLOR = 3      # 停用色塊連週（必須使用者確認）
+# ★放寬一律要使用者確認★（2026-10-19 使用者定案，取代設計文件 §6 的 L0–L3 階梯）
+#   舊版排不出來時會【自動】進 L1 拿掉 9–11 班；使用者要求 9–11 班與每月
+#   1–2 個週末都「排不出來時不自動放寬，直接顯示原因，我按確認才放行」。
+#   可放寬的規則各自標 relaxable；求解器找出「最少要放寬哪幾條才排得出來」
+#   交給使用者確認（見 solve_rvs.solve_duty）。
+#: 可放寬規則的提議順序（同樣大小的放寬組合，先提議排在前面的）。
+RELAX_ORDER = ("duty_range", "weekend_range", "weekend_color")
+#: 畫面/報告用的人話名稱。
+RELAX_NAMES = {
+    "duty_range": "每月 9–11 班",
+    "weekend_range": "每人每月 1–2 個週末",
+    "weekend_color": "色塊連週（同色須休一週）",
+}
 
 RULE_REGISTRY: list = []
 
@@ -57,11 +65,12 @@ class Rule:
     kind = "hard"           # "hard" / "soft"
     rule_id = ""
     描述 = ""
-    relax_level: Optional[int] = None   # 於該階梯層級(含)以上被停用；None=永不
-    needs_confirm = False               # 放寬需使用者確認（色塊）
+    relaxable = False                   # 可被(經使用者確認的)放寬停用
+    needs_confirm = False               # 放寬需使用者確認(可放寬者一律為 True)
 
-    def active_at(self, level: int) -> bool:
-        return self.relax_level is None or level < self.relax_level
+    def active(self, relaxed) -> bool:
+        """relaxed: 使用者已同意放寬的 rule_id 集合。"""
+        return not (self.relaxable and self.rule_id in relaxed)
 
     def precheck(self, ctx: SolveContext) -> list:
         return []
@@ -324,7 +333,7 @@ class FixedWeekdayRule(Rule):
 class ColorRule(Rule):
     rule_id = "weekend_color"
     描述 = "連續兩週末同一人僅當兩週色塊不同；同色須休一週（R/VS 皆適用）"
-    relax_level = L3_NO_COLOR
+    relaxable = True
     needs_confirm = True
 
     def _pairs(self, ctx):
@@ -414,8 +423,10 @@ class ColorRule(Rule):
 class DutyRangeRule(Rule):
     scope = "r"
     rule_id = "duty_range"
-    描述 = "每人每月班數範圍（預設 9-11；無解自動放寬 → 只求點數平衡）"
-    relax_level = L1_NO_RANGE
+    描述 = ("每人每月班數範圍（預設 9-11）。[2026-10-19 使用者] 排不出來時不再"
+          "自動放寬，須使用者確認；點數差額照常進帳本、之後再還")
+    relaxable = True
+    needs_confirm = True
 
     def precheck(self, ctx):
         n, days = len(ctx.members), len(ctx.days)
@@ -427,7 +438,7 @@ class DutyRangeRule(Rule):
             return [Precheck(
                 "warn", self.rule_id,
                 f"本月 {days} 天 ÷ {n} 人與範圍 {ctx.params.duty_min}-"
-                f"{ctx.params.duty_max} 班在算術上不相容 → 將自動放寬(L1)")]
+                f"{ctx.params.duty_max} 班在算術上不相容 → 需要你確認放寬才能排")]
         return []
 
     def apply(self, mc, ctx):
@@ -437,6 +448,93 @@ class DutyRangeRule(Rule):
             n = sum(mc.x[(d, m.id)] for d in ctx.days)
             mc.model.Add(n >= ctx.params.duty_min)
             mc.model.Add(n <= ctx.params.duty_max)
+
+
+@register_rule
+class WeekendRangeRule(Rule):
+    scope = "r"
+    rule_id = "weekend_range"
+    描述 = ("[2026-10-19 使用者] 每人每月 1–2 個週末（週六所在月份計；春節等標「不計入"
+          "年度週末」的週末塊不算）。整月沒有任何可值週末的人（請長假）不套用「至少 1 個」。"
+          "排不出來時須使用者確認才放寬")
+    relaxable = True
+    needs_confirm = True
+
+    WEEKEND_MIN = 1
+    WEEKEND_MAX = 2
+
+    @staticmethod
+    def _blocks(ctx) -> list:
+        return counted_blocks(ctx.blocks, ctx.weekend_exempt)
+
+    @staticmethod
+    def _past_count(ctx, mid: str, blocks) -> int:
+        """今天以前已經是事實的週末次數(釘死、不可改)。"""
+        cut = ctx.past_cutoff
+        if cut is None:
+            return 0
+        return sum(1 for b in blocks
+                   if b.saturday <= cut and ctx.past_duty.get(b.saturday) == mid)
+
+    @staticmethod
+    def can_take(ctx, mid: str, b, directives) -> bool:
+        """mid 這個月還有沒有可能值到週末塊 b（決定「至少 1 個」適不適用）。
+
+        週六已在過去 → 看事實；週六被指定給別人 → 不可能；否則看週六所在那一段
+        (使用者指定可把連休段拆開)未來的日子他有沒有請假。"""
+        sat = b.saturday
+        cut = ctx.past_cutoff
+        if cut is not None and sat <= cut:
+            return ctx.past_duty.get(sat) == mid
+        if sat in directives and directives[sat][0] != mid:
+            return False
+        runs = split_block_runs(
+            b.days, {d: directives[d][0] for d in b.days if d in directives})
+        run = next(r for r in runs if sat in r)
+        return all(not ctx.on_leave(mid, d) for d in run
+                   if cut is None or d > cut)
+
+    def precheck(self, ctx):
+        blocks = self._blocks(ctx)
+        n = len(ctx.members)
+        if n <= 1 or not blocks:
+            return []
+        checks = []
+        directives, _ = collect_directives(ctx)
+        no_weekend = [m for m in ctx.members
+                      if not any(self.can_take(ctx, m.id, b, directives)
+                                 for b in blocks)]
+        for m in no_weekend:
+            checks.append(Precheck(
+                "info", self.rule_id,
+                f"{m.name or m.id} 本月沒有任何可值的週末（請假/指定）→ "
+                f"不套用「每月至少 1 個週末」"))
+        need_min = n - len(no_weekend)
+        if len(blocks) > self.WEEKEND_MAX * n:
+            checks.append(Precheck(
+                "warn", self.rule_id,
+                f"本月計入的週末有 {len(blocks)} 個 ÷ {n} 人，每人最多 "
+                f"{self.WEEKEND_MAX} 個在算術上不可能 → 需要你確認放寬才能排"))
+        elif len(blocks) < need_min * self.WEEKEND_MIN:
+            checks.append(Precheck(
+                "warn", self.rule_id,
+                f"本月計入的週末只有 {len(blocks)} 個，不夠 {need_min} 人每人至少 "
+                f"{self.WEEKEND_MIN} 個 → 需要你確認放寬才能排"))
+        return checks
+
+    def apply(self, mc, ctx):
+        blocks = self._blocks(ctx)
+        if len(ctx.members) <= 1 or not blocks:
+            return
+        directives, _ = collect_directives(ctx)
+        for m in ctx.members:
+            cnt = sum(mc.x[(b.saturday, m.id)] for b in blocks)
+            past = self._past_count(ctx, m.id, blocks)
+            # 過去的事實若已超過上限(手動排的),不可拿約束去改寫歷史 →
+            # 上限放寬到「已發生的次數」,未來不再多給。
+            mc.model.Add(cnt <= max(self.WEEKEND_MAX, past))
+            if any(self.can_take(ctx, m.id, b, directives) for b in blocks):
+                mc.model.Add(cnt >= self.WEEKEND_MIN)
 
 
 # ─── 軟規則（目標函數）───────────────────────────────────────────────────
@@ -553,8 +651,10 @@ class WeekendCapRule(Rule):
     @staticmethod
     def _weekend_blocks(ctx) -> list:
         """只算「含本月週六」的區塊。月初孤兒週日屬上月那個週末（其週六在上月、
-        由跨月銜接固定給上月人選）→ 不計入本月週末數,否則會誤判超標。"""
-        return [b for b in ctx.blocks if b.saturday is not None]
+        由跨月銜接固定給上月人選）→ 不計入本月週末數,否則會誤判超標。
+        [2026-10-19] 標「不計入年度週末」的週末塊(春節)也不算 —— 與
+        WeekendRangeRule 同一份計數(本規則是它被放寬之後的軟性退路)。"""
+        return counted_blocks(ctx.blocks, ctx.weekend_exempt)
 
     def precheck(self, ctx):
         blocks = self._weekend_blocks(ctx)

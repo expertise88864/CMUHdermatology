@@ -288,6 +288,17 @@ class CalendarDutyTab(ttk.Frame):
         self._bx.heading("cnt", text="累計次數")
         self._bx.column("cnt", width=60, anchor="center")
         self._bx.pack(fill="x", padx=6)
+        # [2026-10-19 使用者] R 一線年度週末(8 月～隔年 7 月;春節不計)。
+        ttk.Label(parent, text="R 年度週末（本週期，春節不計）",
+                  font=(OVR_FONT, 10, "bold")
+                  ).pack(anchor="w", padx=6, pady=(8, 0))
+        self._wk = ttk.Treeview(parent, columns=("who", "done", "to", "yr"),
+                                show="headings", height=3)
+        for c, t, w in (("who", "住院醫師", 110), ("done", "已值", 40),
+                        ("to", "至本月目標", 66), ("yr", "全年目標", 58)):
+            self._wk.heading(c, text=t)
+            self._wk.column(c, width=w, anchor="w" if c == "who" else "center")
+        self._wk.pack(fill="x", padx=6)
         ttk.Label(parent, text="警告", font=(OVR_FONT, 10, "bold")
                   ).pack(anchor="w", padx=6, pady=(8, 0))
         self._warns = tk.Listbox(parent, height=8, width=34)
@@ -297,9 +308,13 @@ class CalendarDutyTab(ttk.Frame):
         """讀 biopsy.json 的累計次數，配 biopsy_pair（R 名單）認出 R2/R3 顯示。"""
         if not getattr(self, "_bx", None):
             return
+        from cmuh_common.roster.cycle import biopsy_in_cycle
         from cmuh_common.roster.saturday_biopsy import biopsy_pair
         self._bx.delete(*self._bx.get_children())
-        counts = (self.service.storage.load_biopsy().get("counts") or {})
+        # [2026-10-19] 只顯示本週期(8 月起)的次數 —— 與排切片時用的同一個數。
+        book = self.service.storage.load_biopsy()
+        counts = biopsy_in_cycle(book.get("counts") or {}, book,
+                                 f"{ctx.year:04d}-{ctx.month:02d}")
         pair, _notes = biopsy_pair(ctx.members)
         if not pair:
             self._bx.insert("", "end", values=("（名單缺 R2/R3）", "—"))
@@ -308,6 +323,23 @@ class CalendarDutyTab(ttk.Frame):
             who = (f"{m.id} {m.name}（{m.level}）" if m.name
                    else f"{m.id}（{m.level}）")
             self._bx.insert("", "end", values=(who, int(counts.get(m.id, 0))))
+
+    def _reload_weekend_year(self, ctx, month: dict) -> None:
+        """R 年度週末：已值／至本月目標／全年目標（service.weekend_year_summary）。"""
+        if not getattr(self, "_wk", None):
+            return
+        from cmuh_common.roster.weekend_share import duty_map
+        self._wk.delete(*self._wk.get_children())
+        try:
+            rows = self.service.weekend_year_summary(ctx, duty_map(month, "r"))
+        except Exception:  # noqa: BLE001 —— 顯示失敗不可擋住整個分頁
+            logging.exception("[roster.ui] 年度週末統計失敗（略過）")
+            rows = []
+        for r in rows:
+            who = (f"{r['id']} {r['name']}（{r['level']}）" if r["name"]
+                   else f"{r['id']}（{r['level']}）")
+            self._wk.insert("", "end", values=(who, r["done"], r["to_date"],
+                                               r["year"]))
 
     # ── 資料 → 畫面 ──────────────────────────────────────────────────────
     def _member_map(self, scope: str) -> dict:
@@ -393,6 +425,7 @@ class CalendarDutyTab(ttk.Frame):
         for s in ("r", "vs"):
             self._refresh_side(ctxs[s], members[s], self._sum[s], tallies[s])
         self._reload_biopsy_counts(ctx_r)
+        self._reload_weekend_year(ctx_r, month)
         self._refresh_warnings()
         self._apply_finalized_state()
 
@@ -852,7 +885,7 @@ class CalendarDutyTab(ttk.Frame):
         self._start_solve(ym=ym, scope=scope)
 
     def _start_solve(self, allow_disable_color=False, ym=None,
-                     scope: str = "r") -> None:
+                     scope: str = "r", allow_relax=()) -> None:
         self._busy(f"{_SCOPE_TITLE[scope]} 排班中…")
         ym = ym or self.app.ym                        # RF-05：一路帶著求解目標月
 
@@ -861,7 +894,7 @@ class CalendarDutyTab(ttk.Frame):
                 # [RS-32] 自動排班只排【明天起】:真時鐘只在 UI 進入。
                 res = self.service.run_solve(
                     scope, ym, allow_disable_color=allow_disable_color,
-                    today=date.today())
+                    today=date.today(), allow_relax=tuple(allow_relax))
                 self.after(0, lambda: self._on_solved(res, ym, scope))
             except Exception as e:  # noqa: BLE001
                 logging.exception("[roster.ui] 求解例外")
@@ -884,11 +917,14 @@ class CalendarDutyTab(ttk.Frame):
             return
         if res.status == "ok":
             self._preview_and_accept(res, ym, scope)
-        elif res.status == "need_confirm_color":
+        elif res.status in ("need_confirm_color", "need_confirm_relax"):
+            # ★[2026-10-19 使用者] 放寬一律要你按確認才放行★(9–11 班、每月
+            #   1–2 個週末、色塊連週)。按「否」就不排,班表維持原狀。
             if messagebox.askyesno(
-                    "需放寬色塊連週規則",
-                    "\n".join(res.diagnosis) + "\n\n是否放寬（將出現同色連週值班）？"):
-                self._start_solve(allow_disable_color=True, ym=ym, scope=scope)
+                    "需要放寬規則才能排出班表",
+                    "\n".join(res.diagnosis) + "\n\n是否同意放寬並重新排班？"):
+                self._start_solve(ym=ym, scope=scope,
+                                  allow_relax=tuple(res.relax_proposal))
         else:   # precheck_failed / infeasible / error
             self._show_report_text(
                 self.service.render_report(scope, ym, res),

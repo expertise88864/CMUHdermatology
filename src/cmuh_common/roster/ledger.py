@@ -60,6 +60,17 @@ def _trim_history(ledger: dict, keep_months: int = HISTORY_KEEP_MONTHS) -> None:
     if len(months) <= keep_months:
         return
     keep = set(months[:keep_months])
+    # ★被丟掉的分錄要記下它們的總和★(2026-10-19 年度週期):本週期餘額是
+    #   「累計值 − 週期開始之前的分錄」(見 cycle.ledger_pre_cycle)。分錄一被
+    #   修剪就扣不到了,它的值會悄悄回到本週期的餘額裡 —— 所以修剪時把它累加
+    #   到 trimmed[scope][person],扣除時一併算進去。
+    trimmed = ledger.setdefault("trimmed", {})
+    for e in hist:
+        if e.get("month") in keep:
+            continue
+        book = trimmed.setdefault(str(e.get("scope") or ""), {})
+        for pid, delta in (e.get("deltas") or {}).items():
+            book[pid] = round(book.get(pid, 0.0) + float(delta), 4)
     ledger["history"] = [e for e in hist if e.get("month") in keep]
 
 
@@ -144,6 +155,8 @@ def reset_member(ledger: dict, scope: str, member_id: str) -> None:
     for e in (ledger.get("history") or []):
         if e.get("scope") == scope:
             (e.get("deltas") or {}).pop(member_id, None)
+    # 被修剪的舊分錄累計(年度週期扣除用)也屬於「過往貢獻」,一併作廢。
+    ((ledger.get("trimmed") or {}).get(scope) or {}).pop(member_id, None)
 
 
 def sync_members(ledger: dict, scope: str, member_ids: list) -> None:
@@ -162,3 +175,4 @@ def sync_members(ledger: dict, scope: str, member_ids: list) -> None:
             for e in (ledger.get("history") or []):
                 if e.get("scope") == scope:
                     (e.get("deltas") or {}).pop(mid, None)
+            ((ledger.get("trimmed") or {}).get(scope) or {}).pop(mid, None)

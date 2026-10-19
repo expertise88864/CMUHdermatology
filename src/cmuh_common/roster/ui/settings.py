@@ -11,6 +11,10 @@ import tkinter as tk
 from datetime import date, datetime, timedelta
 from tkinter import messagebox, ttk
 
+from cmuh_common.roster.weekend_share import (
+    CONFIG_KEY as WEEKEND_CONFIG_KEY, DEFAULT_WEIGHTS as WEEKEND_DEFAULT_WEIGHTS,
+    level_weights as weekend_level_weights,
+)
 from cmuh_common.roster.calendar_colors import week_colors_for_year
 from cmuh_common.roster.ledger import reset_member, sync_members
 from cmuh_common.roster.model import month_dates, week_key
@@ -267,6 +271,9 @@ class SettingsTab(ttk.Frame):
             self._p_min.set(int(rng[0]))
             self._p_max.set(int(rng[1]))
             self._p_cap.set(int(self._cfg.get("room_capacity", 2)))
+            wts = weekend_level_weights(self._cfg)
+            for lvl, var in self._p_wk.items():
+                var.set(float(wts.get(lvl, WEEKEND_DEFAULT_WEIGHTS[lvl])))
         except (tk.TclError, ValueError, IndexError, TypeError):
             logging.debug("[roster.ui] 參數控制項重載失敗（維持現值）", exc_info=True)
         finally:
@@ -512,10 +519,10 @@ class SettingsTab(ttk.Frame):
             self._body, text="年度國定假日指定表（此表的日期＝當年度國定假日清單）",
             padding=8)
         lf.pack(fill="x", padx=10, pady=6)
-        cols = ("date", "r", "vs")
+        cols = ("date", "r", "vs", "ex")
         self._hol_tree = ttk.Treeview(lf, columns=cols, show="headings", height=4)
         for c, t, w in (("date", "日期", 110), ("r", "R 指定", 80),
-                        ("vs", "VS 指定", 80)):
+                        ("vs", "VS 指定", 80), ("ex", "不計入年度週末", 110)):
             self._hol_tree.heading(c, text=t)
             self._hol_tree.column(c, width=w, anchor="center")
         self._hol_tree.pack(fill="x")
@@ -532,6 +539,10 @@ class SettingsTab(ttk.Frame):
         ttk.Label(bar, text="VS").pack(side="left")
         self._hol_vs = ttk.Entry(bar, width=6)
         self._hol_vs.pack(side="left", padx=2)
+        # [2026-10-19 使用者] 春節：所在週末塊不計入 R 每月 1–2 個週末與年度比例。
+        self._hol_ex = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="不計入年度週末（春節）",
+                        variable=self._hol_ex).pack(side="left", padx=(6, 2))
         ttk.Button(bar, text="新增/更新", command=self._holiday_put
                    ).pack(side="left", padx=4)
         ttk.Button(bar, text="刪除選取", command=self._holiday_del
@@ -544,10 +555,12 @@ class SettingsTab(ttk.Frame):
         self._hol_tree.delete(*self._hol_tree.get_children())
         table = self._load_holiday_map()
         all_dates = sorted(set(table["r"]) | set(table["vs"]))
+        exempt = set(table.get("weekend_exempt") or ())
         for d in all_dates:
             iso = d.isoformat()
             self._hol_tree.insert("", "end", iid=iso, values=(
-                iso, table["r"].get(d, ""), table["vs"].get(d, "")))
+                iso, table["r"].get(d, ""), table["vs"].get(d, ""),
+                "✓" if d in exempt else ""))
 
     def _holiday_put(self) -> None:
         raw = self._hol_date.get().strip()
@@ -557,6 +570,7 @@ class SettingsTab(ttk.Frame):
             messagebox.showwarning("日期格式", "請輸入 YYYY-MM-DD")
             return
         r, vs = self._hol_r.get().strip(), self._hol_vs.get().strip()
+        ex = bool(self._hol_ex.get())
         # ★把這一天的指定當成窄改動送出去★(外審排班 RS-5 第 1 輪 P1-3):
         #   整份 table 寫回去會把他機剛加的其他假日一起抹掉。
         def _mut(tbl):
@@ -568,6 +582,13 @@ class SettingsTab(ttk.Frame):
                 tbl["vs"][d] = vs
             else:
                 tbl["vs"].pop(d, None)
+            exempt: set = set(tbl.get("weekend_exempt") or ())
+            # 不在國定假日表裡的日期不留著「不計入」(刪掉假日就一起拿掉)。
+            if ex and d in (set(tbl["r"]) | set(tbl["vs"])):
+                exempt.add(d)
+            else:
+                exempt.discard(d)
+            tbl["weekend_exempt"] = exempt
 
         if not guard_write(lambda: self.service.update_holiday_duty(_mut),
                            title="年度國定假日表", parent=self):
@@ -580,10 +601,13 @@ class SettingsTab(ttk.Frame):
         if not sel:
             return
         def _mut(tbl):                     # 同上:只移除選到的那幾天
+            exempt: set = set(tbl.get("weekend_exempt") or ())
             for iso in sel:
                 dd = date.fromisoformat(iso)
                 tbl["r"].pop(dd, None)
                 tbl["vs"].pop(dd, None)
+                exempt.discard(dd)
+            tbl["weekend_exempt"] = exempt
 
         if not guard_write(lambda: self.service.update_holiday_duty(_mut),
                            title="年度國定假日表", parent=self):
@@ -624,14 +648,33 @@ class SettingsTab(ttk.Frame):
         self._p_max = spin(rowb, 0, 31, rng[1])
         ttk.Label(rowb, text="診間容量").pack(side="left")
         self._p_cap = spin(rowb, 1, 9, self._cfg.get("room_capacity", 2))
+
+        # [2026-10-19 使用者] R 年度週末比例(8 月～隔年 7 月;R1 最多、R3 最少)。
+        rowc = ttk.Frame(lf); rowc.pack(fill="x", pady=2)
+        ttk.Label(rowc, text="R 年度週末比例").pack(side="left")
+        wts = weekend_level_weights(self._cfg)
+        self._p_wk = {}
+        for lvl in ("R1", "R2", "R3"):
+            ttk.Label(rowc, text=lvl).pack(side="left", padx=(6, 0))
+            var = tk.DoubleVar(value=float(wts.get(lvl, WEEKEND_DEFAULT_WEIGHTS[lvl])))
+            ttk.Spinbox(rowc, from_=0.1, to=10.0, increment=0.1, width=5,
+                        format="%.1f", textvariable=var
+                        ).pack(side="left", padx=(2, 4))
+            var.trace_add("write", lambda *_a: self._save_params())
+            self._p_wk[lvl] = var
+        ttk.Label(rowc, text="（預設 3.6 : 3.3 : 3.1；只在不影響其他規則與點數時調整）"
+                  ).pack(side="left", padx=(6, 0))
         # 「上次載入/存檔當下的值」——與現值比對即知使用者真的動了哪幾格
         self._params_loaded = self._param_snapshot()
 
     def _param_snapshot(self) -> dict:
-        return {"weekday": self._p_wd.get(), "weekend": self._p_we.get(),
+        snap: dict = {"weekday": self._p_wd.get(), "weekend": self._p_we.get(),
                 "national_holiday": self._p_hol.get(),
                 "min": self._p_min.get(), "max": self._p_max.get(),
                 "cap": self._p_cap.get()}
+        for lvl, var in getattr(self, "_p_wk", {}).items():
+            snap[f"wk_{lvl}"] = round(float(var.get()), 2)
+        return snap
 
     def _save_params(self) -> None:
         if self._suspend_param_save:       # 重讀磁碟時的 var.set，不是使用者的編輯
@@ -653,6 +696,9 @@ class SettingsTab(ttk.Frame):
                    ("weekday", "weekend", "national_holiday")}
             rng = [snap["min"], snap["max"]]
             cap = snap["cap"]
+            wk = {k[3:]: v for k, v in snap.items() if k.startswith("wk_")}
+            if any(v <= 0 for v in wk.values()):
+                return                               # 0 或負的權重不存(暫態)
         except (tk.TclError, ValueError):
             return                                   # 輸入中的暫態非數字
         # ★[2026-08-02 補審] 點數/班數範圍/診間容量與名單同住 config.json——
@@ -679,11 +725,15 @@ class SettingsTab(ttk.Frame):
         self._cfg["duty_range_soft"] = cur_rng
         if "room_capacity" not in self._cfg or cap != was.get("cap"):
             self._cfg["room_capacity"] = cap
+        # 年度週末比例:同樣只疊上使用者真的動過的級別。
+        cur_wk = dict(self._cfg.get(WEEKEND_CONFIG_KEY) or {})
+        for lvl, v in wk.items():
+            if lvl not in cur_wk or v != was.get(f"wk_{lvl}"):
+                cur_wk[lvl] = v
+        if cur_wk:
+            self._cfg[WEEKEND_CONFIG_KEY] = cur_wk
         if self._save_cfg():
-            self._params_loaded = {"weekday": pts["weekday"],
-                                   "weekend": pts["weekend"],
-                                   "national_holiday": pts["national_holiday"],
-                                   "min": rng[0], "max": rng[1], "cap": cap}
+            self._params_loaded = dict(snap)
 
     def _flush_params(self, event=None) -> None:
         """關窗前把去抖中尚未存的參數立即存檔（避免關窗前 800ms 內的修改遺失）。"""
@@ -1052,8 +1102,14 @@ class SettingsTab(ttk.Frame):
             return
         self._led_tree.delete(*self._led_tree.get_children())
         ledger = self.service.storage.load_ledger()
+        # [2026-10-19] 顯示【本週期】(8 月起)的餘額 —— 與排班時用的同一個數。
+        #   週期取「最近一個已結算的月份」所在週期(還沒結算過就用今天)。
+        from cmuh_common.roster.cycle import ledger_in_cycle
+        settled = [str(e.get("month") or "")
+                   for e in (ledger.get("history") or []) if e.get("month")]
+        ref = max(settled) if settled else date.today().strftime("%Y-%m")
         for scope in ("r", "vs"):
-            for mid, bal in sorted((ledger.get(scope) or {}).items()):
+            for mid, bal in sorted(ledger_in_cycle(ledger, scope, ref).items()):
                 self._led_tree.insert("", "end", iid=f"{scope}:{mid}", values=(
                     scope.upper(), mid, f"{float(bal):+.2f}"))
 

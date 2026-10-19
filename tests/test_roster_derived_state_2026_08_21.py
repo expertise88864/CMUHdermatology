@@ -26,6 +26,11 @@ from cmuh_common.roster.storage import (                       # noqa: E402
 
 YM = "2026-08"
 
+# [2026-10-19 使用者] 9–11 班與每月 1–2 個週末排不出來時【不再自動放寬】,
+#   由使用者在確認視窗按確認才放行。這裡的夾具只有 2 位 R(31 天 > 2×11 班、
+#   5 個週末 > 2×2 個),等同使用者已按確認 → 明確帶入放寬。
+_RELAX = ("duty_range", "weekend_range")
+
 
 @pytest.fixture()
 def svc(tmp_path):
@@ -58,7 +63,7 @@ class TestWriteIntentPathsUseAStrictSource:
     def test_a_corrupt_ledger_cannot_be_reset_by_accept(self, svc):
         """accept 的帳本來源同理:壞檔不得被「幾乎只剩本月」的新帳蓋掉。"""
         pytest.importorskip("ortools")
-        res = svc.run_solve("r", YM)
+        res = svc.run_solve("r", YM, allow_relax=_RELAX)
         assert res.status == "ok", res.diagnosis
         _corrupt(svc.storage, "ledger.json")
         with pytest.raises(ValueError):
@@ -77,7 +82,7 @@ class TestWriteIntentPathsUseAStrictSource:
         這裡讓快照回一個【對不上盤面】的 revision:唯有「寫回時比對」才擋得住。
         """
         pytest.importorskip("ortools")
-        res = svc.run_solve("r", YM)
+        res = svc.run_solve("r", YM, allow_relax=_RELAX)
         assert res.status == "ok", res.diagnosis
         real = svc.storage.canonical_snapshot
         monkeypatch.setattr(
@@ -223,7 +228,7 @@ class TestTheIntentMeansTheDerivedStateIsRebuilt:
         all 涵蓋你」而回 False,接著 clear 把 all 拿掉,義務整個消失。
         降級必須是【一次寫入】的原地改型。"""
         pytest.importorskip("ortools")
-        res = svc.run_solve("r", YM)
+        res = svc.run_solve("r", YM, allow_relax=_RELAX)
         assert res.status == "ok", res.diagnosis
         self._boom_recompute(svc, monkeypatch)
         svc.accept_solution("r", YM, res)                # 值班照常落地
@@ -242,7 +247,7 @@ class TestTheIntentMeansTheDerivedStateIsRebuilt:
 
     def test_a_successful_accept_leaves_nothing_behind(self, svc):
         pytest.importorskip("ortools")
-        svc.accept_solution("r", YM, svc.run_solve("r", YM))
+        svc.accept_solution("r", YM, svc.run_solve("r", YM, allow_relax=_RELAX))
         assert not svc.storage.load_pending_settles()
 
     def test_reconcile_rebuilds_only_what_is_owed(self, svc, monkeypatch):

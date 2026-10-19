@@ -25,6 +25,11 @@ YM = "2026-08"                     # 2026/8/1 = 週六
 WED = date(2026, 8, 26)            # 注入的「今天」
 THU = date(2026, 8, 27)
 
+# [2026-10-19 使用者] 9–11 班與每月 1–2 個週末排不出來時【不再自動放寬】,
+#   由使用者在確認視窗按確認才放行。這裡的夾具只有 2 位 R(31 天 > 2×11 班、
+#   5 個週末 > 2×2 個),等同使用者已按確認 → 明確帶入放寬。
+_RELAX = ("duty_range", "weekend_range")
+
 
 def _svc(tmp_path, r_members=("A", "B")):
     st = RosterStorage(str(tmp_path))
@@ -52,7 +57,7 @@ class TestThePastIsFactNotASchedulingTarget:
         """過去的實況(未鎖定!)原樣保留;明天起照排;今天以前空著的維持空。"""
         svc = _svc(tmp_path)
         _set_duty(svc, {"2026-08-03": "A", "2026-08-04": "B"})
-        res = svc.run_solve("r", YM, today=WED)
+        res = svc.run_solve("r", YM, allow_relax=_RELAX, today=WED)
         assert res.status == "ok", (res.status, res.diagnosis)
         assert res.assignments[date(2026, 8, 3)] == "A"
         assert res.assignments[date(2026, 8, 4)] == "B"
@@ -68,7 +73,7 @@ class TestThePastIsFactNotASchedulingTarget:
         svc = _svc(tmp_path / past_holder)
         _set_duty(svc, {f"2026-08-{d:02d}": past_holder
                         for d in range(3, 26)})
-        res = svc.run_solve("r", YM, today=WED)
+        res = svc.run_solve("r", YM, allow_relax=_RELAX, today=WED)
         assert res.status == "ok", (res.status, res.diagnosis)
         future = [p for d, p in res.assignments.items() if d > WED]
         assert future
@@ -96,7 +101,7 @@ class TestThePastIsFactNotASchedulingTarget:
             month.setdefault("leaves", {}).setdefault("r", {})["A"] = [
                 "2026-08-03"]
         svc.update_month(YM, _mut)
-        res = svc.run_solve("r", YM, today=WED)
+        res = svc.run_solve("r", YM, allow_relax=_RELAX, today=WED)
         assert res.status == "ok", (res.status, res.diagnosis)
         assert res.assignments[date(2026, 8, 3)] == "A"   # 事實保留
 
@@ -106,7 +111,7 @@ class TestThePastIsFactNotASchedulingTarget:
         自動排班而消失★。"""
         svc = _svc(tmp_path)
         _set_duty(svc, {"2026-08-03": "Z"})               # Z 不在名單
-        res = svc.run_solve("r", YM, today=WED)
+        res = svc.run_solve("r", YM, allow_relax=_RELAX, today=WED)
         assert res.status == "ok", (res.status, res.diagnosis)
         assert res.assignments[date(2026, 8, 3)] == "Z"
 
@@ -117,7 +122,7 @@ class TestThePastIsFactNotASchedulingTarget:
         2026-08-29(六)/30(日);today=8/29。"""
         svc = _svc(tmp_path)
         _set_duty(svc, {"2026-08-29": "A"})
-        res = svc.run_solve("r", YM, today=date(2026, 8, 29))
+        res = svc.run_solve("r", YM, allow_relax=_RELAX, today=date(2026, 8, 29))
         assert res.status == "ok", (res.status, res.diagnosis)
         assert res.assignments[date(2026, 8, 30)] == "A", res.assignments
 
@@ -126,7 +131,7 @@ class TestThePastIsFactNotASchedulingTarget:
         """★跨今連休段的過去那半是空的★:等式會把「空」傳染成「週日無人」
         而與每日恰一人矛盾 → 整月無解。正解:未來那半獨立指派。"""
         svc = _svc(tmp_path)                              # 8/29 沒排(空)
-        res = svc.run_solve("r", YM, today=date(2026, 8, 29))
+        res = svc.run_solve("r", YM, allow_relax=_RELAX, today=date(2026, 8, 29))
         assert res.status == "ok", (res.status, res.diagnosis)
         assert date(2026, 8, 29) not in res.assignments   # 過去維持空
         assert res.assignments.get(date(2026, 8, 30)) in ("A", "B")
@@ -142,7 +147,7 @@ class TestThePastIsFactNotASchedulingTarget:
             month.setdefault("leaves", {})["r"] = {
                 "A": ["2026-08-03"], "B": ["2026-08-03"]}
         svc.update_month(YM, _mut)
-        res = svc.run_solve("r", YM, today=WED)
+        res = svc.run_solve("r", YM, allow_relax=_RELAX, today=WED)
         assert res.status == "ok", (res.status, res.diagnosis)
         # 對照組:同樣全員請假的日子在【未來】→ 必須照樣擋(不可矯枉過正)
         svc2 = _svc(tmp_path / "future")
@@ -151,7 +156,7 @@ class TestThePastIsFactNotASchedulingTarget:
             month.setdefault("leaves", {})["r"] = {
                 "A": ["2026-08-28"], "B": ["2026-08-28"]}
         svc2.update_month(YM, _mut2)
-        res2 = svc2.run_solve("r", YM, today=WED)
+        res2 = svc2.run_solve("r", YM, allow_relax=_RELAX, today=WED)
         # ★斷言收斂到預檢自己的輸出★:只斷 status != ok 的話,拆掉預檢後
         # CP-SAT 自己也會 infeasible(縱深防禦),突變量不到。預檢的價值是
         # 【人話說出是哪一天、為什麼】,所以量它的訊息。
@@ -165,7 +170,7 @@ class TestThePastIsFactNotASchedulingTarget:
         svc = _svc(tmp_path / f"led-{debtor}")
         other = "B" if debtor == "A" else "A"
         svc.storage.save_ledger({"r": {other: 6.0, debtor: -6.0}, "vs": {}})
-        res = svc.run_solve("r", YM, today=WED)
+        res = svc.run_solve("r", YM, allow_relax=_RELAX, today=WED)
         assert res.status == "ok", (res.status, res.diagnosis)
         future = [p for d, p in res.assignments.items() if d > WED]
         return max(set(future), key=future.count)
@@ -204,7 +209,7 @@ class TestThePastIsFactNotASchedulingTarget:
         _set_duty(svc, {"2026-08-03": "A"})
         ctx = svc.build_context("r", YM)
         assert ctx.past_cutoff is None and ctx.past_duty == {}
-        res = solve_duty(ctx)
+        res = solve_duty(ctx, allow_relax=_RELAX)
         assert res.status == "ok"
         assert date(2026, 8, 10) in res.assignments        # 全月都排
 
@@ -212,7 +217,7 @@ class TestThePastIsFactNotASchedulingTarget:
 class TestTheApplyGateAndMetadata:
     def test_a_cross_day_apply_is_rejected(self, tmp_path):
         svc = _svc(tmp_path)
-        res = svc.run_solve("r", YM, today=WED)
+        res = svc.run_solve("r", YM, allow_relax=_RELAX, today=WED)
         assert res.status == "ok"
         with pytest.raises(ValueError):
             svc.accept_solution("r", YM, res, today=THU)
@@ -223,7 +228,7 @@ class TestTheApplyGateAndMetadata:
         ★不寫 locked★(UI 可編輯性不變)、未來格照常落地。"""
         svc = _svc(tmp_path)
         _set_duty(svc, {"2026-08-03": "A"})
-        res = svc.run_solve("r", YM, today=WED)
+        res = svc.run_solve("r", YM, allow_relax=_RELAX, today=WED)
         svc.accept_solution("r", YM, res, today=WED)
         duty = svc.storage.load_month(YM)["r_duty"]
         past = duty["2026-08-03"]

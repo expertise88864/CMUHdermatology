@@ -59,11 +59,15 @@ class TestTheSolverSeesThePreMonthBalance:
         assert ctx.ledger.get("B", 0.0) == 0.0
 
     def test_the_carry_in_from_earlier_months_is_kept(self, svc):
-        """跨月的欠點必須留著 —— 不可以連上個月的一起回滾掉。"""
-        _settle(svc, {"A": 3.0, "B": -3.0}, month="2026-07")
-        _settle(svc, {"A": 5.0, "B": -5.0})
+        """跨月的欠點必須留著 —— 不可以連上個月的一起回滾掉。
+
+        [2026-10-19] 年度週期(8 月～隔年 7 月)之後,carry-in 只在【同一個
+        週期內】成立 → 用 8 月結轉進 9 月(8 月是週期起點,7 月不帶進來,
+        見 TestTheYearlyCycleResetsTheLedger)。"""
+        _settle(svc, {"A": 3.0, "B": -3.0}, month="2026-08")
+        _settle(svc, {"A": 5.0, "B": -5.0}, month="2026-09")
         assert svc.storage.load_ledger()["r"] == {"A": 8.0, "B": -8.0}
-        ctx = svc.build_context("r", YM, for_solve=True)
+        ctx = svc.build_context("r", "2026-09", for_solve=True)
         assert ctx.ledger["A"] == 3.0, f"★應是 +3(不是 +8)★ {ctx.ledger}"
         assert ctx.ledger["B"] == -3.0
 
@@ -145,11 +149,45 @@ class TestTheFingerprintIsStableAcrossAnAccept:
             "★套用之後輸入其實沒變,指紋不該不同(否則重排會被誤判過期)★"
 
     def test_a_real_carry_in_change_still_shows_up(self, svc):
-        """★不可以矯枉過正★:別的月份的結算改變了 carry-in,那是真的變了。"""
+        """★不可以矯枉過正★:別的月份的結算改變了 carry-in,那是真的變了。
+        ([2026-10-19] 同一個週期內:8 月的結算改變 9 月的 carry-in。)"""
+        before = rvs_input_fingerprint(
+            svc.build_context("r", "2026-09", for_solve=True))
+        _settle(svc, {"A": 2.0, "B": -2.0}, month="2026-08")
+        assert rvs_input_fingerprint(
+            svc.build_context("r", "2026-09", for_solve=True)) != before
+
+    def test_a_previous_cycle_settlement_does_not_change_august(self, svc):
+        """[2026-10-19] 7 月屬上一個週期 → 8 月的輸入(與指紋)完全不受影響。"""
         _ctx, res = self._result(svc)
         _settle(svc, {"A": 2.0, "B": -2.0}, month="2026-07")
         assert rvs_input_fingerprint(svc.build_context("r", YM, for_solve=True)) \
-            != res.input_fingerprint
+            == res.input_fingerprint
+
+
+class TestTheYearlyCycleResetsTheLedger:
+    """[2026-10-19 使用者] 排班週期 8 月～隔年 7 月;8 月起帳本重新計算。"""
+
+    def test_july_balance_does_not_carry_into_august(self, svc):
+        _settle(svc, {"A": 4.0, "B": -4.0}, month="2026-07")
+        assert svc.build_context("r", "2026-08", for_solve=True).ledger == {}
+        # 顯示端同樣只看本週期
+        assert svc.build_context("r", "2026-08").ledger == {"A": 0.0, "B": 0.0}
+
+    def test_within_the_cycle_july_still_carries(self, svc):
+        """同一個週期的最後一個月(7 月)照樣看得到 8 月起的累計。"""
+        _settle(svc, {"A": 1.0, "B": -1.0}, month="2026-08")
+        _settle(svc, {"A": 2.0, "B": -2.0}, month="2027-06")
+        ctx = svc.build_context("r", "2027-07", for_solve=True)
+        assert ctx.ledger == {"A": 3.0, "B": -3.0}
+
+    def test_the_disk_ledger_keeps_the_running_total(self, svc):
+        """帳本檔本身不改寫(純推導):跨週期的累計值照舊,只是排班不看。"""
+        _settle(svc, {"A": 4.0, "B": -4.0}, month="2026-07")
+        _settle(svc, {"A": 1.0, "B": -1.0}, month="2026-08")
+        assert svc.storage.load_ledger()["r"] == {"A": 5.0, "B": -5.0}
+        assert svc.build_context("r", "2026-09", for_solve=True).ledger == {
+            "A": 1.0, "B": -1.0}
 
 
 class TestTheWholeRoundTrip:

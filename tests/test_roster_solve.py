@@ -233,16 +233,26 @@ def test_locked_cell_respected():
 
 
 # ─── 放寬階梯 ─────────────────────────────────────────────────────────────
-def test_range_auto_relax_L1_when_heavy_leave():
-    # r1 只有 4 個週三能值 → 9-11 硬範圍必無解 → 自動 L1
+def test_range_is_not_relaxed_without_the_users_confirmation():
+    """[2026-10-19 使用者] 9–11 班排不出來時【不自動放寬】,回 need_confirm_relax
+    並提議最少要放寬的規則;使用者按確認(allow_relax)才放行。
+
+    r1 只有 4 個週三能值(也沒有任何可值的週末 → 不套用「至少 1 個週末」)
+    → 9–11 班必無解。"""
     all_days = [date(2026, 8, d) for d in range(1, 32)]
     avail = {date(2026, 8, d) for d in (5, 12, 19, 26)}
-    ctx = make_ctx(leaves={R1: [d for d in all_days if d not in avail]})
-    r = solve_duty(ctx)
-    assert r.status == "ok"
-    assert r.level_used >= 1
-    assert r.duty_counts[R1] == 4                          # 只值他能值的
-    assert "放寬" in r.level_name
+    leaves = {R1: [d for d in all_days if d not in avail]}
+    r = solve_duty(make_ctx(leaves=leaves))
+    assert r.status == "need_confirm_relax", (r.status, r.diagnosis)
+    assert "duty_range" in r.relax_proposal
+    assert not r.assignments, "未經確認不可以給出放寬後的班表"
+    assert any("9–11" in s for s in r.diagnosis)
+
+    r2 = solve_duty(make_ctx(leaves=leaves), allow_relax=r.relax_proposal)
+    assert r2.status == "ok" and r2.level_used == 1
+    assert r2.duty_counts[R1] == 4                         # 只值他能值的
+    assert "放寬" in r2.level_name and "確認" in r2.level_name
+    assert r2.relaxed == r.relax_proposal
 
 
 def test_need_confirm_color_then_L3():
@@ -260,7 +270,8 @@ def test_need_confirm_color_then_L3():
                     colors=aug_colors(alternate=False),
                     leaves={"J": weekend_days})
     r2 = solve_duty(ctx2, allow_disable_color=True)
-    assert r2.status == "ok" and r2.level_used == 3
+    assert r2.status == "ok" and r2.level_used == 1
+    assert r2.relaxed == ["weekend_color"]
     for d in weekend_days:
         assert r2.assignments[d] == "D"
 
@@ -383,14 +394,20 @@ def test_weekend_cap_holds_even_when_ledger_pushes_points():
 
 
 def test_weekend_cap_precheck_warns_when_arithmetic_impossible():
-    """人數不足以讓每人 ≤2 個週末（5 週末 ÷ 2 人）→ 預檢提示,但仍求解不擋。"""
+    """人數不足以讓每人 ≤2 個週末（5 週末 ÷ 2 人）→ 預檢提示。
+    [2026-10-19] 每月 1–2 個週末改為硬規則 → 不放寬就排不出來,要使用者確認;
+    確認放寬後仍會盡量平均(軟上限 weekend_cap 照常運作)。"""
     two = [Member(R1, "甲", "R1"), Member(R2, "乙", "R2")]
-    ctx = make_ctx(members=two)
-    r = solve_duty(ctx)
-    assert r.status == "ok"
+    r = solve_duty(make_ctx(members=two))
+    assert r.status == "need_confirm_relax"
+    assert "weekend_range" in r.relax_proposal
     assert any(c.rule_id == "weekend_cap" and c.severity == "warn"
                for c in r.prechecks), \
         f"應提示週末數與人數在算術上不相容：{[c.msg for c in r.prechecks]}"
+    assert any(c.rule_id == "weekend_range" and c.severity == "warn"
+               for c in r.prechecks)
+    r2 = solve_duty(make_ctx(members=two), allow_relax=r.relax_proposal)
+    assert r2.status == "ok"
 
 
 def test_weekend_cap_ignores_orphan_sunday_block():

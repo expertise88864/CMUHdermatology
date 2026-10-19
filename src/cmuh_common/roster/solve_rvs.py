@@ -3,10 +3,13 @@
 
 流程：
     1. run_prechecks — 任何 error → 不求解，回 precheck_failed（人話清單）。
-    2. 放寬階梯 L0 → L1 → L2 逐級求解；仍無解且未獲授權停用色塊 →
-       快速測試「停用色塊是否可解」：可 → need_confirm_color（UI 跳窗確認後
-       以 allow_disable_color=True 重呼叫走 L3）；否 → infeasible + 診斷。
-    3. 成功 → 回 assignments / 點數結算 / 每格理由 / last_weekend（存檔供下月）。
+    2. 全部規則求解。無解時【不自動放寬】（2026-10-19 使用者定案）：
+       使用者已同意的放寬(allow_relax)先試；仍無解 → 找出「最少要放寬哪幾條
+       可放寬規則（9–11 班 / 每月 1–2 個週末 / 色塊連週）才排得出來」，回
+       need_confirm_relax（只有色塊時沿用 need_confirm_color）由 UI 跳窗確認，
+       使用者按確認後帶著 allow_relax 重呼叫。全部放寬仍無解 → infeasible + 診斷。
+    3. 成功 → R 再做「年度週末比例」第二段（固定第一段的目標值，只在一樣好的
+       排法之間挑）→ 回 assignments / 點數結算 / 每格理由 / last_weekend。
 
 決定性：random_seed 固定 + num_search_workers=1 + ortools 釘版
 （cmuh_common.roster.ORTOOLS_PINNED_VERSION）→ 同輸入同輸出。
@@ -17,6 +20,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from itertools import combinations
 from typing import Optional
 
 from datetime import timedelta
@@ -25,9 +29,9 @@ from cmuh_common.roster.model import (
     SolveContext, day_point, is_weekend,
 )
 from cmuh_common.roster.rules import (
-    L0_FULL, L1_NO_RANGE, L2_RESERVED, L3_NO_COLOR,
-    collect_directives, rules_for, run_prechecks,
+    RELAX_NAMES, RELAX_ORDER, collect_directives, rules_for, run_prechecks,
 )
+from cmuh_common.roster.weekend_share import counted_blocks, cumulative_targets
 
 
 def apply_boundary_from_prev(ctx: SolveContext) -> None:
@@ -58,12 +62,12 @@ def apply_boundary_from_prev(ctx: SolveContext) -> None:
             ctx.boundary_fix[cur] = prev_person
         cur += timedelta(days=1)
 
-_LEVEL_NAMES = {
-    L0_FULL: "L0 全部規則",
-    L1_NO_RANGE: "L1 放寬班數範圍",
-    L2_RESERVED: "L2 放寬次要公平",
-    L3_NO_COLOR: "L3 停用色塊連週(經確認)",
-}
+def relax_label(relaxed) -> str:
+    """放寬組合的人話名稱（診斷/報告用）。"""
+    if not relaxed:
+        return "全部規則"
+    names = [RELAX_NAMES.get(r, r) for r in RELAX_ORDER if r in relaxed]
+    return "放寬「" + "、".join(names) + "」"
 
 SOLVE_TIMEOUT_SEC = 20.0   # 問題極小(≤31天×≤10人)，正常 <1s；此為防呆上限
 _RANDOM_SEED = 20260702
@@ -79,10 +83,14 @@ class _ModelCtx:
 
 @dataclass
 class SolveResult:
-    status: str                       # ok / precheck_failed / need_confirm_color / infeasible / error
+    status: str                       # ok / precheck_failed / need_confirm_relax / need_confirm_color / infeasible / timeout / error
     scope: str = ""
+    #: 0＝全部規則；1＝有(經使用者確認的)放寬。舊版的 L1–L3 數字已不再使用。
     level_used: Optional[int] = None
     level_name: str = ""
+    #: 實際被放寬的規則（ok 時）；需要確認時是【提議】要放寬的規則。
+    relaxed: list = field(default_factory=list)
+    relax_proposal: list = field(default_factory=list)
     assignments: dict = field(default_factory=dict)   # {date: member_id}
     reasons: dict = field(default_factory=dict)       # {date: 標籤}
     points_by_person: dict = field(default_factory=dict)
@@ -118,8 +126,10 @@ def _lazy_cp_model():
             "未安裝 ortools（自動排班引擎）。請按 UI 提示安裝後重試。") from e
 
 
-def _build_and_solve(ctx: SolveContext, scope: str, level: int):
-    """在指定放寬層級建模求解 → (cp_status_name, assignments|None)。"""
+def _build_and_solve(ctx: SolveContext, scope: str, relaxed=frozenset()):
+    """在指定放寬組合下建模求解 → (cp_status_name, assignments|None)。
+
+    relaxed: 使用者同意放寬的 rule_id 集合（空＝全部規則）。"""
     cp_model = _lazy_cp_model()
     model = cp_model.CpModel()
     x = {(d, m.id): model.NewBoolVar(f"x_{d.isoformat()}_{m.id}")
@@ -145,7 +155,7 @@ def _build_and_solve(ctx: SolveContext, scope: str, level: int):
 
     objective = []
     for rule in rules_for(scope):
-        if not rule.active_at(level):
+        if not rule.active(relaxed):
             continue
         rule.apply(mc, ctx)
         objective.extend(rule.objective_terms(mc, ctx))
@@ -160,7 +170,9 @@ def _build_and_solve(ctx: SolveContext, scope: str, level: int):
     name = solver.StatusName(status)
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         from .vs_preferences import refine_vs
-        refined = refine_vs(model, solver, cp_model, status, objective, x, ctx)
+        refined = (refine_vs(model, solver, cp_model, status, objective, x, ctx)
+                   if scope == "vs" else
+                   _refine_weekend_share(model, solver, cp_model, objective, x, ctx))
         out = {}
         for d in ctx.days:
             for m in ctx.members:
@@ -177,6 +189,63 @@ def _build_and_solve(ctx: SolveContext, scope: str, level: int):
                     out[d] = mid
         return name, out
     return name, None
+
+
+def _share_weights(ctx: SolveContext) -> dict:
+    return {m.id: float(ctx.weekend_weights[m.id]) for m in ctx.members
+            if float(ctx.weekend_weights.get(m.id) or 0) > 0}
+
+
+def weekend_share_score(ctx: SolveContext, counts: dict) -> int:
+    """年度週末偏差 Σ|100×(本週期之前+本月) − 100×目標|（越小越接近目標）。"""
+    blocks = counted_blocks(ctx.blocks, ctx.weekend_exempt)
+    weights = _share_weights(ctx)
+    targets = cumulative_targets(ctx.weekend_prior, weights, len(blocks))
+    return sum(abs(100 * (int(ctx.weekend_prior.get(mid, 0)) + counts.get(mid, 0))
+                   - round(100 * targets[mid])) for mid in weights)
+
+
+def _refine_weekend_share(model, solver, cp_model, objective, x, ctx):
+    """[2026-10-19 使用者] R 年度週末比例 —— 嚴格版第二段。
+
+    第一段(全部規則＋點數＋其餘軟規則)的目標值固定成上限,只在【一樣好或更好】
+    的排法之間挑「本週期累計週末次數最接近權重目標」的那一個。不犧牲任何既有
+    規則或點數公平;沒有一樣好的替代排法時,結果與第一段完全相同。
+    第二段沒有算出更好的結果(逾時等) → 沿用第一段的解。"""
+    blocks = counted_blocks(ctx.blocks, ctx.weekend_exempt)
+    weights = _share_weights(ctx)
+    if len(weights) < 2 or not blocks:
+        return None
+    saved = {key: solver.Value(var) for key, var in x.items()}
+
+    def counts_of(assign) -> dict:
+        return {mid: sum(assign[(b.saturday, mid)] for b in blocks)
+                for mid in weights}
+
+    if objective:
+        primary = sum(var * w for var, w in objective)
+        model.Add(primary <= solver.Value(primary))
+    targets = cumulative_targets(ctx.weekend_prior, weights, len(blocks))
+    devs = []
+    for mid in weights:
+        prior = int(ctx.weekend_prior.get(mid, 0))
+        tgt = round(100 * targets[mid])
+        cnt = sum(x[(b.saturday, mid)] for b in blocks)
+        bound = 100 * (prior + len(blocks)) + abs(tgt) + 1
+        dev = model.NewIntVar(0, bound, f"wkshare_{mid}")
+        model.AddAbsEquality(dev, 100 * prior + 100 * cnt - tgt)
+        devs.append(dev)
+    model.Minimize(sum(devs))
+    for key, var in x.items():
+        model.AddHint(var, saved[key])
+    status = solver.Solve(model)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return saved
+    candidate = {key: solver.Value(var) for key, var in x.items()}
+    if (weekend_share_score(ctx, counts_of(candidate))
+            <= weekend_share_score(ctx, counts_of(saved))):
+        return candidate
+    return saved
 
 
 def _reasons_for(ctx: SolveContext, scope: str, assignments: dict) -> dict:
@@ -219,8 +288,20 @@ def rvs_input_fingerprint(ctx: SolveContext) -> str:
     return input_fingerprint(ctx)
 
 
-def solve_duty(ctx: SolveContext, allow_disable_color: bool = False) -> SolveResult:
-    """主入口。ctx 需已 prepare()；scope 取 ctx.scope（"r"/"vs"）。"""
+#: 確認視窗裡「放寬之後會怎樣」的說明。
+_RELAX_EFFECT = {
+    "weekend_color": "將出現同色連週值班",
+    "duty_range": "可能有人班數少於 9 或多於 11 班；點數差額照常進帳本、之後再還",
+    "weekend_range": "可能有人本月 0 個或 3 個以上週末",
+}
+
+
+def solve_duty(ctx: SolveContext, allow_disable_color: bool = False, *,
+               allow_relax=()) -> SolveResult:
+    """主入口。ctx 需已 prepare()；scope 取 ctx.scope（"r"/"vs"）。
+
+    allow_relax: 使用者【確認過】可以放寬的 rule_id（見 rules.RELAX_ORDER）。
+    allow_disable_color=True 等同 allow_relax 含 "weekend_color"（舊介面）。"""
     scope = ctx.scope
     res = SolveResult(status="error", scope=scope)
     try:
@@ -237,105 +318,116 @@ def solve_duty(ctx: SolveContext, allow_disable_color: bool = False) -> SolveRes
             res.status = "precheck_failed"
             return res
 
-        auto_levels = [L0_FULL, L1_NO_RANGE, L2_RESERVED]
         rules = rules_for(scope)
+        relaxable = [rid for rid in RELAX_ORDER
+                     if any(r.rule_id == rid and r.relaxable for r in rules)]
+        wanted: set = set(allow_relax or ())
+        if allow_disable_color:
+            wanted.add("weekend_color")
+        allowed = frozenset(r for r in wanted if r in relaxable)
 
-        chosen = None
-        prev_active = None
         # ★[2026-08-02 補審] 求解器「沒算完」不等於「無解」★
         #   CP-SAT 逾時回 UNKNOWN、模型異常回 MODEL_INVALID,兩者都不是 INFEASIBLE。
-        #   原本一律當成無解,診斷還會斷言「停用色塊連週 → 仍無解(與色塊無關)」——
-        #   那是程式沒有驗證過的推斷。使用者會照著去翻請假/指定找一個不存在的衝突,
-        #   而真正該做的只是重試。(措辭鐵律:只陳述程式確知的事;solve_day 已經
-        #   為同一件事被外審抓過兩輪。)
-        #   ★而 UNKNOWN 與 MODEL_INVALID 也不可混為一談★(第 2 輪外審):
+        #   (措辭鐵律:只陳述程式確知的事;solve_day 已經為同一件事被外審抓過兩輪。)
         #   逾時叫使用者「稍後重試」是對的,模型異常重試一百次也一樣 —— 那是程式的
-        #   臭蟲,要叫他回報、看 log。把兩者說成同一件事,又是一次「宣稱不確知的事」。
+        #   臭蟲,要叫他回報、看 log。
         timed_out: list = []      # UNKNOWN：沒算完
         broken: list = []         # MODEL_INVALID 等：模型/求解器本身有問題
-        for level in auto_levels:
-            # [OPT-1] 該層 active 規則集與前一層相同（如 VS 無 duty_range、或 L2
-            # 保留級）→ 必得同解，跳過避免重複求解。
-            active = frozenset(r.rule_id for r in rules if r.active_at(level))
-            if active == prev_active:
-                logging.info("[roster.solve] %s %04d-%02d 跳過 %s（規則集同前層）",
-                             scope, ctx.year, ctx.month, _LEVEL_NAMES[level])
-                continue
-            prev_active = active
-            name, assignments = _build_and_solve(ctx, scope, level)
+        tried: set = set()
+
+        def attempt(relaxed: frozenset):
+            tried.add(relaxed)
+            name, got = _build_and_solve(ctx, scope, relaxed)
             logging.info("[roster.solve] %s %04d-%02d %s → %s",
-                         scope, ctx.year, ctx.month, _LEVEL_NAMES[level], name)
-            if assignments is not None:
-                chosen = (level, assignments)
-                break
-            if name == "UNKNOWN":
-                timed_out.append(_LEVEL_NAMES[level])
-            elif name != "INFEASIBLE":
-                broken.append(f"{_LEVEL_NAMES[level]}（{name}）")
+                         scope, ctx.year, ctx.month, relax_label(relaxed), name)
+            if got is None:
+                if name == "UNKNOWN":
+                    timed_out.append(relax_label(relaxed))
+                elif name != "INFEASIBLE":
+                    broken.append(f"{relax_label(relaxed)}（{name}）")
+            return got
+
+        chosen = None
+        strict = attempt(frozenset())
+        if strict is not None:
+            chosen = (frozenset(), strict)
+        elif allowed:
+            # 使用者已確認過的放寬(上一輪跳窗按了確認)。
+            got = attempt(allowed)
+            if got is not None:
+                chosen = (allowed, got)
 
         if chosen is None:
-            # [OPT-3] 自動層級全無解 → 測「停用色塊連週」恰一次，結果同時決定
-            # need_confirm/採用/診斷（不再於 _diagnose 重測一次）。
-            l3_name, l3 = _build_and_solve(ctx, scope, L3_NO_COLOR)
-            if l3 is None and l3_name == "UNKNOWN":
-                timed_out.append(_LEVEL_NAMES[L3_NO_COLOR])
-            elif l3 is None and l3_name != "INFEASIBLE":
-                broken.append(f"{_LEVEL_NAMES[L3_NO_COLOR]}（{l3_name}）")
-            if l3 is not None and allow_disable_color:
-                chosen = (L3_NO_COLOR, l3)                # 已獲授權 → 直接採用
-            elif l3 is not None:
-                res.status = "need_confirm_color"
-                # ★不可宣稱「不動色塊就無解」★ 自動層級若只是沒算完,那句話就是
-                #   程式沒驗證過的推斷(外審第 1 輪抓到)。
+            # ★不自動放寬★:找出「最少要放寬哪幾條」才排得出來,交給使用者確認。
+            proposal = None
+            for size in range(1, len(relaxable) + 1):
+                for combo in combinations(relaxable, size):
+                    cs = frozenset(combo)
+                    if cs in tried:
+                        continue
+                    if attempt(cs) is not None:
+                        proposal = cs
+                        break
+                if proposal is not None:
+                    break
+            if proposal is not None:
+                res.relax_proposal = [r for r in RELAX_ORDER if r in proposal]
+                res.status = ("need_confirm_color" if proposal == {"weekend_color"}
+                              else "need_confirm_relax")
+                # ★不可宣稱「不放寬就無解」★:較嚴格的組合若只是沒算完,
+                #   那句話就是程式沒驗證過的推斷(外審第 1 輪抓到)。
                 unresolved = timed_out + broken
-                head = ("在不動色塊連週規則的前提下無解；停用色塊規則後可解。"
+                what = "、".join(RELAX_NAMES[r] for r in res.relax_proposal)
+                head = (f"在不放寬規則的前提下無解；放寬「{what}」後可解。"
                         if not unresolved else
-                        "自動層級中有層級未得出結論（"
+                        "較嚴格的組合中有未得出結論者（"
                         + "、".join(unresolved)
-                        + "），並【未】證明不動色塊就無解；停用色塊後可解。")
-                res.diagnosis = [head, "請確認是否放寬（將出現同色連週值班）。"]
+                        + f"），並【未】證明不放寬就無解；放寬「{what}」後可解。")
+                res.diagnosis = [head] + [
+                    f"  放寬「{RELAX_NAMES[r]}」：{_RELAX_EFFECT[r]}"
+                    for r in res.relax_proposal] + ["請確認是否放寬。"]
                 return res
-            elif broken:
+            if broken:
                 # 模型異常不是逾時,重試沒有用；這是程式的問題,要能被回報。
                 res.status = "error"
                 res.diagnosis = [
                     "求解器回報模型異常——這【不是】「無解」，也不是逾時。",
-                    "  異常層級：" + "、".join(broken),
+                    "  異常組合：" + "、".join(broken),
                     "  重試不會有幫助；請回報此訊息並附上 automation_ui.log。",
                     "★請勿據此去調整請假或指定★——程式並沒有判定它們有衝突。"]
                 return res
-            elif timed_out:
-                # 只要有任何一層是「沒算完」,就不可以說無解——連色塊那條路都還沒
-                # 排除,使用者甚至沒被問到要不要放寬色塊。
+            if timed_out:
+                # 只要有任何一個組合是「沒算完」,就不可以說無解。
                 res.status = "timeout"
                 res.diagnosis = [
                     "求解器在時限內沒有得出結論——這【不是】「無解」，是還沒算完。",
-                    "  未得出結論的層級：" + "、".join(timed_out),
+                    "  未得出結論的組合：" + "、".join(timed_out),
                     f"  時限 {SOLVE_TIMEOUT_SEC:.0f} 秒；本規模（≤31 天 × ≤10 人）"
                     f"正常應在 1 秒內完成，多半是機器當下負載過重。",
                     "  請稍後再按一次自動排班。",
                     "★請勿據此去調整請假或指定★——程式並沒有判定它們有衝突。"]
                 return res
-            else:
-                res.status = "infeasible"
-                res.diagnosis = _diagnose(ctx, scope, l3_solvable=False)
-                return res
+            res.status = "infeasible"
+            res.diagnosis = _diagnose(ctx, scope, relaxable)
+            return res
 
-        level, assignments = chosen
+        relaxed, assignments = chosen
         if timed_out or broken:
-            # ★較嚴格的層級只是沒算完,不代表它無解★ 報告會寫「有規則被放寬」,
-            #   讀起來像是「嚴格規則滿足不了」——那件事程式並沒有證明。
-            res.diagnosis = ["以下層級未得出結論（非「無解」）："
+            # ★較嚴格的組合只是沒算完,不代表它無解★
+            res.diagnosis = ["以下組合未得出結論（非「無解」）："
                              + "、".join(timed_out + broken)]
             if timed_out:
                 res.diagnosis.append(
-                    "  求解器沒算完；重按一次自動排班有機會拿到更嚴格層級的結果。")
+                    "  求解器沒算完；重按一次自動排班有機會拿到更嚴格的結果。")
             if broken:
                 res.diagnosis.append(
                     "  其中有模型異常，重試無用；請回報並附上 automation_ui.log。")
+        level = 1 if relaxed else 0
+        res.relaxed = [r for r in RELAX_ORDER if r in relaxed]
         res.status = "ok"
         res.level_used = level
-        res.level_name = _LEVEL_NAMES[level]
+        res.level_name = ((relax_label(relaxed) + "（經你確認）") if relaxed
+                          else "全部規則")
         res.assignments = assignments
         res.reasons = _reasons_for(ctx, scope, assignments)
 
@@ -374,24 +466,15 @@ def solve_duty(ctx: SolveContext, allow_disable_color: bool = False) -> SolveRes
         return res
 
 
-def _diagnose(ctx: SolveContext, scope: str, l3_solvable=None) -> list:
-    """最終無解時的人話診斷。
+def _diagnose(ctx: SolveContext, scope: str, relaxable=()) -> list:
+    """最終無解時的人話診斷。呼叫端已實際測過「放寬全部可放寬規則」仍無解。
 
-    l3_solvable: 呼叫端已測過「停用色塊連週」是否可解（True/False）→ 直接引用，
-    不重測；None（向後相容）→ 自行測一次。另列出「僅剩 1 人可值」的緊繃日，
-    幫使用者定位是哪些請假密集的日子卡住。
+    另列出「僅剩 1 人可值」的緊繃日，幫使用者定位是哪些請假密集的日子卡住。
     """
-    out = ["自動放寬到底仍無解。診斷："]
-    if l3_solvable is None:
-        try:
-            _n, test = _build_and_solve(ctx, scope, L3_NO_COLOR)
-            l3_solvable = test is not None
-        except Exception:
-            out.append("  停用「色塊連週」測試失敗")
-    if l3_solvable is True:
-        out.append("  停用「色塊連週」→ 可解（元凶多為色塊連週太緊）")
-    elif l3_solvable is False:
-        out.append("  停用「色塊連週」→ 仍無解（與色塊無關）")
+    out = ["放寬到底仍無解。診斷："]
+    if relaxable:
+        names = "、".join(RELAX_NAMES[r] for r in relaxable)
+        out.append(f"  放寬全部可放寬規則（{names}）→ 仍無解（與這些規則無關）")
 
     tight = [f"{d.month}/{d.day}→僅 {elig[0]}"
              for d in ctx.days

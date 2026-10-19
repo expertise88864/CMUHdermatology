@@ -15,6 +15,11 @@ from cmuh_common.roster.storage import RosterStorage
 
 YM = "2026-09"
 
+# [2026-10-19 使用者] 9–11 班與每月 1–2 個週末排不出來時【不再自動放寬】,
+#   由使用者在確認視窗按確認才放行。這裡的夾具只有 2 位 R(31 天 > 2×11 班、
+#   5 個週末 > 2×2 個),等同使用者已按確認 → 明確帶入放寬。
+_RELAX = ("duty_range", "weekend_range")
+
 
 @pytest.fixture()
 def svc(tmp_path):
@@ -30,7 +35,7 @@ def svc(tmp_path):
 def _result(svc):
     # ★生產的呼叫形狀★:run_solve 會蓋 month_revision(RS-13),直接呼叫
     # solve_duty 的結果 accept 會以「沒有月檔版本標記」拒絕。
-    out = svc.run_solve("r", YM)
+    out = svc.run_solve("r", YM, allow_relax=_RELAX)
     assert out.status == "ok", out.status
     return out
 

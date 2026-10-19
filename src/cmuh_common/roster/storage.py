@@ -303,6 +303,14 @@ def validate_authoritative_shape(name: str, raw: dict) -> None:
             for k in (raw.get(scope) or {}):
                 if _iso_or_none(k) is None:
                     bad(f"{scope} 有不是日期的鍵 {k!r}（整批國定假日會少掉它）")
+        # [2026-10-19] 「不計入年度週末」清單:壞掉的話春節會被算進每月週末
+        #   上下限與年度比例 —— 一樣不可以被寬鬆載入靜靜濾掉。
+        exempt = raw.get("weekend_exempt")
+        if exempt is not None and not isinstance(exempt, list):
+            bad(f"weekend_exempt 不是清單（{type(exempt).__name__}）")
+        for k in (exempt or []):
+            if _iso_or_none(k) is None:
+                bad(f"weekend_exempt 有不是日期的項目 {k!r}")
     elif name == "clerk_batches.json":
         _seen_ids: set = set()
         items = raw.get("batches")
@@ -1259,24 +1267,37 @@ class RosterStorage:
         raw = self._check_schema(
             self._parsed_or_read("holiday_duty.json", _parsed),
             "holiday_duty.json")
-        out = {"r": {}, "vs": {}}
+        out = {"r": {}, "vs": {}, "weekend_exempt": set()}
         for scope in ("r", "vs"):
             for k, v in (raw.get(scope) or {}).items():
                 try:
                     out[scope][date.fromisoformat(k)] = str(v)
                 except ValueError:
                     logging.warning("[roster.storage] holiday_duty 壞日期略過: %r", k)
+        # [2026-10-19 使用者] 勾「不計入年度週末」的日期(春節):所在週末塊不計入
+        #   R 每月 1–2 個週末與年度週末比例。
+        exempt = raw.get("weekend_exempt") or []
+        if isinstance(exempt, (list, tuple)):
+            for k in exempt:
+                try:
+                    out["weekend_exempt"].add(date.fromisoformat(str(k)))
+                except ValueError:
+                    logging.warning("[roster.storage] weekend_exempt 壞日期略過: %r", k)
         return out
 
     def save_holiday_duty(self, table: dict, *,
                           expected_revision=_UNSET) -> None:
         self._check_schema(_load_json(self._path("holiday_duty.json")),
                            "holiday_duty.json", for_write=True)       # [codex P2] 防降級毀損
-        raw = {"r": {}, "vs": {}}
+        raw: dict = {"r": {}, "vs": {}}
         for scope in ("r", "vs"):
             for d, mid in (table.get(scope) or {}).items():
                 key = d.isoformat() if isinstance(d, date) else str(d)
                 raw[scope][key] = str(mid)
+        exempt = sorted({(d.isoformat() if isinstance(d, date) else str(d))
+                         for d in (table.get("weekend_exempt") or ())})
+        if exempt:
+            raw["weekend_exempt"] = exempt
         # 這張表的鍵集合【就是】整年的國定假日清單，錯了之後點數與週末連休
         # 區塊全部跟著算錯 —— 失去備份就回不來。
         self._save(self._path("holiday_duty.json"), raw,

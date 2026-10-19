@@ -58,6 +58,13 @@ from cmuh_common.roster.report import (
 )
 from cmuh_common.roster.rules import (
     Precheck, collect_directives, run_prechecks, split_block_runs)
+from cmuh_common.roster.cycle import (
+    biopsy_in_cycle, cycle_months, is_cycle_start, ledger_in_cycle,
+)
+from cmuh_common.roster.weekend_share import (
+    duty_map as _weekend_duty_map, level_weights as _weekend_level_weights,
+    member_weights as _weekend_member_weights, month_units as _weekend_month_units,
+)
 from cmuh_common.roster.saturday_biopsy import (
     assign_saturday_biopsy, biopsy_pair, can_rollback as biopsy_can_rollback,
     format_biopsy_section, last_assigned_before, settle_biopsy)
@@ -512,6 +519,12 @@ class RosterService:
         # ★`months` 只給真的需要的路徑加★(外審 2026-08-24 P1-01):日排班的
         #   Clerk 梯次是兩週、可以跨月,所以它要多讀下個月;其他路徑不該因此
         #   多一個 fail-closed 的來源(下個月的月檔壞掉不該擋住本月結算)。
+        # ★R/VS 路徑另外讀【本週期到本月】的每個月檔★(2026-10-19 年度週末):
+        #   R 的年度週末次數是從這些月份的實際班表算出來的,而它是求解的輸入
+        #   (進指紋)—— 求解與套用時重建 context 必須讀到同一批,壞檔也要在
+        #   這裡就講出來,不可以安靜地少算幾個月。帳本在來源裡＝R/VS 路徑。
+        if "ledger.json" in names:
+            months = tuple(months) + tuple(cycle_months(ym))
         return self.storage.strict_sources(
             names, (prev_ym(ym), ym) + tuple(months))
 
@@ -555,8 +568,35 @@ class RosterService:
         #   一堆值為 0 的鍵,而原本那些鍵根本不存在 —— 兩者的求解結果完全
         #   相同,指紋卻不一樣(RS-7 的過期判準會因此誤報「輸入設定已變動」)。
         #   求解端一律 `ledger.get(mid, 0.0)`,所以這裡去掉 0 是等價的正規化。
-        return {k: v for k, v in (led_all.get(scope) or {}).items()
+        # ★只看本週期★(2026-10-19 使用者定案):每年 8 月起帳本重新計算 ——
+        #   累計值扣掉週期開始之前的分錄(見 cycle.ledger_in_cycle)。
+        return {k: v for k, v in ledger_in_cycle(led_all, scope, ym).items()
                 if round(float(v or 0.0), 4) != 0.0}
+
+    @staticmethod
+    def weekend_year_summary(ctx: SolveContext, duty_this_month: dict) -> list:
+        """R 年度週末統計（見 weekend_share.year_summary；畫面與報告同一份）。"""
+        from cmuh_common.roster.weekend_share import year_summary  # noqa: PLC0415
+        return year_summary(ctx, duty_this_month)
+
+    @staticmethod
+    def _weekend_prior(st, ym: str, members, holidays, exempt) -> dict:
+        """本週期【本月之前】名單上每人已值的 R 週末次數 {member_id: 次}。
+
+        從各月檔的實際 r_duty 算(使用者在程式裡改的班表就是正本),以週六所在
+        月份計、不計入標「不計入年度週末」的週末塊(見 weekend_share)。
+        離開名單的人不列(比例按當時在班的人重新分配)。"""
+        ids = {mm.id for mm in members}
+        out: dict = {}
+        for pym in cycle_months(ym)[:-1]:
+            doc = st.load_month(pym)
+            units = _weekend_month_units(int(pym[:4]), int(pym[5:7]),
+                                         _weekend_duty_map(doc, "r"),
+                                         holidays, exempt)
+            for mid, n in units.items():
+                if mid in ids:
+                    out[mid] = out.get(mid, 0) + n
+        return out
 
     def build_context(self, scope: str, ym: str, *,
                       month: "dict | None" = None,
@@ -611,7 +651,7 @@ class RosterService:
         biopsy_override = (self._biopsy_overrides(month) if scope == "r"
                            else {})
         ledger = (self.solver_ledger(scope, ym, src=src) if for_solve
-                  else dict(st.load_ledger().get(scope) or {}))
+                  else ledger_in_cycle(st.load_ledger(), scope, ym))
         # 週色：決定性自動套色（依 115 行事曆 4 週交替邏輯，涵蓋跨年邊界的
         # y-1/y/y+1）為基底 → 使用者於設定頁的手動覆蓋優先蓋上。
         week_colors: dict = {}
@@ -630,7 +670,8 @@ class RosterService:
         #   fail-open。下面的 try 只負責容忍【內容裡的壞日期】。
         prev_duty = (st.load_month(prev_ym(ym)).get(f"{scope}_duty") or {})
         prev_weekend_counts: dict = {}
-        if scope == "vs":
+        # 週末公平計數也是「公平性累計」→ 8 月(週期起點)不帶 7 月的次數進來。
+        if scope == "vs" and not is_cycle_start(ym):
             for iso, cell in prev_duty.items():
                 try:
                     dd = date.fromisoformat(iso)
@@ -667,6 +708,17 @@ class RosterService:
                 _p4 = str((_cell4 or {}).get("person") or "")
                 if _p4 and _d4 <= today:
                     past_duty[_d4] = _p4
+        # ★[2026-10-19 使用者] R 年度週末★:春節等標「不計入年度週末」的日期、
+        #   本週期本月之前每人已值的週末次數、依級別的權重。VS 不適用。
+        weekend_exempt: set = set()
+        weekend_prior: dict = {}
+        weekend_weights: dict = {}
+        if scope == "r":
+            weekend_exempt = set(holiday_table.get("weekend_exempt") or ())
+            weekend_prior = self._weekend_prior(st, ym, members, holidays,
+                                                weekend_exempt)
+            weekend_weights = _weekend_member_weights(
+                members, _weekend_level_weights(cfg))
         ctx = SolveContext(
             scope=scope, year=y, month=m, members=members, holidays=holidays,
             leaves=leaves, must_duty=must, annual_holiday=annual, locks=locks,
@@ -674,6 +726,8 @@ class RosterService:
             prev_tail=prev_tail, biopsy_override=biopsy_override,
             prev_weekend_counts=prev_weekend_counts,
             past_cutoff=today, past_duty=past_duty,
+            weekend_exempt=weekend_exempt, weekend_prior=weekend_prior,
+            weekend_weights=weekend_weights,
             params=RosterParams.from_config(cfg))
         ctx.prepare()
         apply_boundary_from_prev(ctx)
@@ -2898,7 +2952,8 @@ class RosterService:
     # ── 求解與落地 ──────────────────────────────────────────────────────
     def run_solve(self, scope: str, ym: str,
                   allow_disable_color: bool = False, *,
-                  today: "date | None" = None) -> SolveResult:
+                  today: "date | None" = None,
+                  allow_relax=()) -> SolveResult:
         """build_context → solve_duty。不落地（UI 先預覽，接受後才 accept）。"""
         # ★求解與套用時的重建必須是【同一種】context★:指紋比對只在兩邊
         #   看到同一份輸入時才有意義(見 `solver_ledger`)。
@@ -2929,7 +2984,8 @@ class RosterService:
                     f"開啟時會自動收斂），再回來排班。"
                     f"（若該月早於帳本保留期而無法重算，"
                     f"請直接調整 ledger.json 的餘額。）")
-        res = solve_duty(ctx, allow_disable_color=allow_disable_color)
+        res = solve_duty(ctx, allow_disable_color=allow_disable_color,
+                         allow_relax=allow_relax)
         if _unknown:
             # ★查不出來要講出來★:舊版程式記的分錄沒有識別,月檔被刪的也查不到。
             res.diagnosis = list(res.diagnosis) + [
@@ -3014,6 +3070,9 @@ class RosterService:
         base = {"counts": dict(book.get("counts") or {}),
                 "history": [dict(e) for e in (book.get("history") or [])]}
         rollback_biopsy(base, ym)
+        # ★次數平衡只看本週期★(2026-10-19 使用者定案):每年 8 月起切片次數
+        #   重新計算。輪替決勝(上一次是誰)是銜接,不受週期影響。
+        base["counts"] = biopsy_in_cycle(base["counts"], base, ym)
         assign, notes = assign_saturday_biopsy(
             year=y, month=m, members=members, duty=duty_by_date,
             leaves=leaves, counts=base["counts"],

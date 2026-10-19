@@ -11,6 +11,7 @@ from datetime import date
 from cmuh_common.roster.model import (SolveContext, day_point, is_weekend,
 )
 from cmuh_common.roster.ledger import fair_share
+from cmuh_common.roster.weekend_share import year_summary
 
 _WD = "一二三四五六日"
 _SEV_MARK = {"error": "✗", "warn": "⚠", "info": "・"}
@@ -67,7 +68,7 @@ def build_report(ctx: SolveContext, result, scope_label: str) -> str:
                          f" {pts}點  [{tag}]")
     elif result.status == "precheck_failed":
         lines.append("  ✗ 預檢有錯誤（見上），未進行求解。請先解決衝突。")
-    elif result.status == "need_confirm_color":
+    elif result.status in ("need_confirm_color", "need_confirm_relax"):
         lines.extend(f"  ⚠ {s}" for s in result.diagnosis)
     elif result.status in ("infeasible", "timeout"):
         # timeout 與 infeasible 都靠 diagnosis 說明；不可落到下面那句「求解器例外」，
@@ -99,6 +100,16 @@ def build_report(ctx: SolveContext, result, scope_label: str) -> str:
         if result.last_weekend:
             lines.append(f"  最後週末: {result.last_weekend['saturday']} → "
                          f"{result.last_weekend['person']}（供下月色塊/銜接）")
+        # [2026-10-19 使用者] R 年度週末(8 月～隔年 7 月;春節等不計入)
+        rows = year_summary(ctx, dict(result.assignments))
+        if rows:
+            from cmuh_common.roster.cycle import cycle_label  # noqa: PLC0415
+            lines.append(f"[年度週末]（{cycle_label(f'{ctx.year:04d}-{ctx.month:02d}')}；"
+                         f"週六所在月份計、春節等不計入）")
+            lines.append("  成員      已值  至本月目標  全年目標")
+            for r in rows:
+                lines.append(f"  {r['name'] or r['id']:<8}{r['done']:>4}"
+                             f"{r['to_date']:>11.1f}{r['year']:>10.1f}")
 
     # [警告] 摘要（error/warn 集中重列，方便掃視）
     bad = [c for c in result.prechecks if c.severity in ("error", "warn")]

@@ -30,6 +30,11 @@ from cmuh_common.roster.solve_rvs import (                          # noqa: E402
 from cmuh_common.roster.storage import RosterStorage                # noqa: E402
 
 YM = "2026-08"
+
+# [2026-10-19 使用者] 9–11 班與每月 1–2 個週末排不出來時【不再自動放寬】,
+#   由使用者在確認視窗按確認才放行。這裡的夾具只有 2 位 R(31 天 > 2×11 班、
+#   5 個週末 > 2×2 個),等同使用者已按確認 → 明確帶入放寬。
+_RELAX = ("duty_range", "weekend_range")
 D15 = date(2026, 8, 15)
 
 
@@ -127,7 +132,7 @@ class TestTheStampItself:
     def test_run_solve_stamps_the_solve_time_revision(self, svc):
         """生產路徑:`run_solve` 蓋章的是【求解當下】那一版。"""
         pytest.importorskip("ortools")
-        res = svc.run_solve("r", YM)
+        res = svc.run_solve("r", YM, allow_relax=_RELAX)
         assert res.status == "ok", res.diagnosis
         assert res.month_revision == svc.storage.load_month_snapshot(YM)[1]
 

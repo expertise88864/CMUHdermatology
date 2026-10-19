@@ -348,6 +348,15 @@ class SolveContext:
     #   兩個欄位都是 dataclass 欄位 → 自動進指紋:跨日之後舊預覽會過期。
     past_cutoff: "Optional[date]" = None
     past_duty: dict = field(default_factory=dict)   # {date: member_id}(僅 ≤ cutoff)
+    # ★[2026-10-19 使用者] 年度週末（R）★ 見 weekend_share 模組說明。
+    #   weekend_exempt: 年度假日表勾「不計入年度週末」的日期(春節)——所在週末塊
+    #     不計入每月 1–2 個週末,也不計入年度比例。
+    #   weekend_prior: 本週期【本月之前】每人已值的週末次數 {member_id: 次}。
+    #   weekend_weights: {member_id: 權重}(依級別;空＝不做年度比例)。
+    #   三者都是 solver 輸入 → 自動進指紋。
+    weekend_exempt: set = field(default_factory=set)
+    weekend_prior: dict = field(default_factory=dict)
+    weekend_weights: dict = field(default_factory=dict)
     params: RosterParams = field(default_factory=RosterParams)
 
     # 建構後由 prepare() 填入
