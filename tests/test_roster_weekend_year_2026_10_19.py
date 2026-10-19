@@ -90,6 +90,22 @@ class TestCycle:
         # 顯示不擋(退回只加總本週期分錄)
         assert svc.build_context("r", "2026-09").ledger == {"A": 1.0, "B": -1.0}
 
+    def test_settling_into_an_untracked_full_book_keeps_it_untracked(self, tmp_path):
+        """[外審 PR #9 第 3 輪] 舊版修剪過的帳本再結算一個新月份(→ 再修剪一次),
+        不可以因此被標成「已追蹤」—— 否則更早被丟掉的舊值會被當成本年度修正。"""
+        led = {"r": {"A": 7.0, "B": -7.0}, "history": self._full_history()}
+        settle_month(led, "r", "2026-09", {"A": 1, "B": 1})
+        assert "trimmed" not in led
+        with pytest.raises(cycle.UntrackedTrimError):
+            cycle.ledger_in_cycle(led, "r", "2026-10", strict=True)
+        book = {"counts": {"C": 10, "K": 2},
+                "history": [{"month": f"{2024 + (i // 12):04d}-{i % 12 + 1:02d}",
+                             "assign": {}} for i in range(7, 31)]}
+        settle_biopsy(book, "2026-09", {"2026-09-05": "K"})
+        assert "trimmed" not in book
+        with pytest.raises(cycle.UntrackedTrimError):
+            cycle.biopsy_in_cycle(book, "2026-10", strict=True)
+
     def test_a_manual_correction_survives_a_full_tracked_history(self):
         """[外審 PR #9 第 2 輪] history 剛好滿 24 個月不代表修正要丟掉:有 trimmed
         記錄(＝修剪都有記總和)時,史外餘額就是使用者的修正,保留。"""

@@ -178,9 +178,10 @@ def _trim_history(book: dict, keep_months: int = HISTORY_KEEP_MONTHS) -> None:
         return
     keep = set(months[:keep_months])
     # ★被丟掉的分錄要記下次數★(理由同 ledger._trim_history;見 cycle 模組)
-    trimmed = book.setdefault("trimmed", {})
+    # ★只對【已在追蹤】的計數帳本記錄★(同 ledger._trim_history,外審 PR #9 第 3 輪)
+    trimmed = book.get("trimmed")
     for e in hist:
-        if e.get("month") in keep:
+        if trimmed is None or e.get("month") in keep:
             continue
         for mid in (e.get("assign") or {}).values():
             trimmed[mid] = int(trimmed.get(mid, 0)) + 1

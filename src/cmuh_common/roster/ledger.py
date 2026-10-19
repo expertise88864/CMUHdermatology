@@ -64,9 +64,13 @@ def _trim_history(ledger: dict, keep_months: int = HISTORY_KEEP_MONTHS) -> None:
     #   ＝累計 − 週期之外的分錄 − 被修剪掉的分錄(見 cycle.ledger_in_cycle)。
     #   「trimmed」鍵存在 = 從那時起每次修剪都有記錄;沒有它而 history 已滿
     #   = 舊版程式修剪過、總和已無從得知(cycle 會在求解時明講,不猜)。
-    trimmed = ledger.setdefault("trimmed", {})
+    # ★只對【已在追蹤】的帳本記錄★(外審 PR #9 第 3 輪):舊版修剪過、沒有
+    #   trimmed 的帳本,這裡若新建 trimmed 只會記到【這一次】丟掉的分錄,更早被
+    #   丟掉的舊值仍混在餘額裡 —— 卻從此被當成「已追蹤」,舊差額悄悄回到公平
+    #   目標。維持「未追蹤」,讓求解端繼續明講,直到使用者確認處理。
+    trimmed = ledger.get("trimmed")
     for e in hist:
-        if e.get("month") in keep:
+        if trimmed is None or e.get("month") in keep:
             continue
         book = trimmed.setdefault(str(e.get("scope") or ""), {})
         for pid, delta in (e.get("deltas") or {}).items():
