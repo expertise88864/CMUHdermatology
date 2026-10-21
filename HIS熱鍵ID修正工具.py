@@ -63,19 +63,20 @@ def clamp_step(current: int, step: int, rng) -> int:
     return max(lo, min(hi, int(current) + step))
 
 
-def build_override(hc, existing, confirmed: dict, record_version: "str | None"):
+def build_override(hc, existing, confirmed: dict):
     """組本機快速修正檔內容 → (data, error)。
 
     existing: 磁碟上現有的檔(可能為 None/壞掉/過期);confirmed: {MENU_ID_*: id}。
     ★只有戳記仍是現任的舊內容才保留★:過期檔裡的其他鍵是上一個校正時代的 id,
-    合併後蓋上新戳記等於把過期值復活 —— 熱鍵打到別的功能。"""
+    合併後蓋上新戳記等於把過期值復活 —— 熱鍵打到別的功能。
+    ★本工具不寫 CALIBRATED_VERSION★(外審 PR #10 第 1 輪):按過「重新校正」的機器
+    以那份基線檔為準,override 的版本蓋不過它,勾了也照樣收改版通知(謊報成功)。
+    改版通知要消掉,一律走主程式「設定」分頁的「重新校正」(寫的是真正的基線)。"""
     marker = hc.override_marker()
     data = {}
     if isinstance(existing, dict) and existing.get("for_calibration") == marker:
         data = {k: v for k, v in existing.items()}
     data.update({k: int(v) for k, v in confirmed.items()})
-    if record_version:
-        data["CALIBRATED_VERSION"] = str(record_version)
     data["for_calibration"] = marker
     data["note"] = f"HIS熱鍵ID修正工具 實測 {datetime.date.today().isoformat()}"
     _updates, err = hc.parse_override(data, marker)
@@ -401,12 +402,9 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
     summary_var = tk.StringVar()
     ttk.Label(s4, textvariable=summary_var, font=(F, 11, "bold"),
               foreground="#8B0000").pack(anchor="w", padx=8, pady=4)
-    ver_var = tk.BooleanVar(value=False)
-    ver_chk = ttk.Checkbutton(
-        s4, variable=ver_var,
-        text="我已確認 F1～F11 全部熱鍵都正常 → 一併把目前 HIS 版本記為校正版本"
-             "（可省掉「偵測到 HIS 改版」的通知；不確定就不要勾）")
-    ver_chk.pack(anchor="w", padx=8)
+    label(s4, "提醒：重開主程式、確認 F1～F11 全部熱鍵都正常後，如果還會收到「偵測到 HIS 改版」"
+              "的通知，請到主程式的「設定」分頁 →「契約金絲雀（院方改版偵測）」→ 按「重新校正」。"
+              "（本工具只修正選單編號，不改改版偵測的基線。）")
     btns4 = ttk.Frame(s4)
     btns4.pack(anchor="w", padx=8, pady=6)
     apply_var = tk.StringVar()
@@ -420,20 +418,15 @@ def main() -> int:  # noqa: C901 —— 單一視窗的版面,拆開反而難讀
         if hc is None:
             messagebox.showerror("無法寫入", f"讀不到程式設定：{hc_err}")
             return
-        if not state["confirmed"] and not ver_var.get():
+        if not state["confirmed"]:
             messagebox.showwarning("沒有要寫的內容", "請先在步驟 3 確認至少一個功能的正確編號。")
             return
-        record = state["major"] if ver_var.get() else None
-        if ver_var.get() and not record:
-            messagebox.showwarning("讀不到 HIS 版本", "讀不到 HIS 版本，請取消勾選後再套用。")
-            return
-        data, err = build_override(hc, read_override(hc), state["confirmed"], record)
+        data, err = build_override(hc, read_override(hc), state["confirmed"])
         if err:
             apply_var.set(f"❌ 沒寫入：{err}")
             return
-        what = "、".join([f"{f['name']}＝{state['confirmed'][f['key']]}" for f in FUNCTIONS
-                         if f["key"] in state["confirmed"]]
-                        + ([f"校正版本＝{record}"] if record else []))
+        what = "、".join(f"{f['name']}＝{state['confirmed'][f['key']]}" for f in FUNCTIONS
+                        if f["key"] in state["confirmed"])
         if not messagebox.askyesno(
                 "確定要套用嗎？",
                 f"將寫入這台電腦的本機快速修正：\n\n{what}\n\n"
