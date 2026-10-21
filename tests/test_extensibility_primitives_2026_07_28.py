@@ -62,8 +62,8 @@ def test_menu_ids_are_declared_literally_in_one_place():
     src = open(os.path.join(os.path.dirname(__file__), '..', 'src',
                             'cmuh_common', 'his_contract.py'),
                encoding='utf-8').read()
-    for line in ("MENU_ID_代碼輸入 = 219", "MENU_ID_FINISH_NO_PRINT = 277",
-                 "MENU_ID_同意書 = 671", 'CALIBRATED_VERSION = "1151001"'):
+    for line in ("MENU_ID_代碼輸入 = 220", "MENU_ID_FINISH_NO_PRINT = 277",
+                 "MENU_ID_同意書 = 672", 'CALIBRATED_VERSION = "1151020"'):
         assert line in src, f"缺少字面宣告:{line}"
 
 

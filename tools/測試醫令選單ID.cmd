@@ -25,7 +25,9 @@ if errorlevel 1 (
 chcp 65001 >nul
 set PYTHONIOENCODING=utf-8
 
-python scripts\test_yiling_menu_id.py
+REM The tool lives in the app folder; its name is Chinese, so match it by an
+REM ASCII wildcard (HIS*ID*.py) instead of spelling it in the batch source.
+for %%F in ("HIS*ID*.py") do python "%%~fF"
 echo.
 echo Press any key to close...
 pause >nul

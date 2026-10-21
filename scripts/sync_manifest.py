@@ -91,8 +91,12 @@ def collect_entries(version: str) -> list:
         "scripts/verify_dependencies.py",
         # [2026-08-26] HIS 選單 id 探測+本機快速修正工具:院方改版位移 id 時的
         # 急救入口。★沒放 extras 的話診間電腦拿到新的 his_contract 載入器,
-        # 卻拿不到會寫 override 檔的 probe —— 急救流程等於不存在★(codex R1 P1)。
-        "scripts/test_yiling_menu_id.py",
+        # 卻拿不到會寫 override 檔的工具 —— 急救流程等於不存在★(codex R1 P1)。
+        # [2026-10-21] 由 scripts/test_yiling_menu_id.py 改寫成步驟式精靈並移到
+        # 程式資料夾(不會程式的人也找得到),附中文使用說明。
+        # ★根目錄刻意用 .py 不用 .pyw★:根目錄 *.pyw 會被當成六支啟動器檢查。
+        "HIS熱鍵ID修正工具.py",
+        "HIS熱鍵ID修正工具_使用說明.txt",
         # 上面那支的雙擊入口(自我提權;probe 沒 admin 時 UIPI 會讓按鈕看起來
         # 沒反應)。使用者急救動線:雙擊 → 實測 id → 寫入快速修正 → 重啟主程式。
         "修正HIS熱鍵ID.cmd",

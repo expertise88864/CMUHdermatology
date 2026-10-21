@@ -45,7 +45,7 @@ MARK = hc.override_marker()
 def test_no_override_file_keeps_the_literals():
     try:
         m = _reload()
-        assert m.MENU_ID_同意書 == 671 and m.MENU_ID_代碼輸入 == 219
+        assert m.MENU_ID_同意書 == 672 and m.MENU_ID_代碼輸入 == 220
         assert m.OVERRIDE_NOTE == "" and m.OVERRIDE_ERROR == ""
     finally:
         _clean_reload()
@@ -54,11 +54,11 @@ def test_no_override_file_keeps_the_literals():
 def test_valid_override_applies_and_says_so_loudly():
     """急救主路徑:合法檔 → 值改掉、OVERRIDE_NOTE 說了改什麼、describe 帶出。"""
     try:
-        _write({"for_calibration": MARK, "MENU_ID_同意書": 672})
+        _write({"for_calibration": MARK, "MENU_ID_同意書": 673})
         m = _reload()
-        assert m.MENU_ID_同意書 == 672
-        assert m.MENU_ID_代碼輸入 == 219, "沒列的鍵不可以動"
-        assert "MENU_ID_同意書 671→672" in m.OVERRIDE_NOTE
+        assert m.MENU_ID_同意書 == 673
+        assert m.MENU_ID_代碼輸入 == 220, "沒列的鍵不可以動"
+        assert "MENU_ID_同意書 672→673" in m.OVERRIDE_NOTE
         assert "本機快速修正" in m.describe(), "設定頁/log 必須看得到 override 生效"
     finally:
         _clean_reload()
@@ -70,7 +70,7 @@ def test_stale_override_expires_after_a_real_calibration():
     try:
         _write({"for_calibration": "1150805#5", "MENU_ID_同意書": 999})
         m = _reload()
-        assert m.MENU_ID_同意書 == 671, "過期 override 蓋掉了正式校正值"
+        assert m.MENU_ID_同意書 == 672, "過期 override 蓋掉了正式校正值"
         assert "過期" in m.OVERRIDE_ERROR or "不符" in m.OVERRIDE_ERROR
     finally:
         _clean_reload()
@@ -80,7 +80,7 @@ def test_missing_version_marker_rejects_the_whole_file():
     try:
         _write({"MENU_ID_同意書": 672})
         m = _reload()
-        assert m.MENU_ID_同意書 == 671 and m.OVERRIDE_ERROR
+        assert m.MENU_ID_同意書 == 672 and m.OVERRIDE_ERROR
     finally:
         _clean_reload()
 
@@ -92,7 +92,7 @@ def test_unknown_key_rejects_the_whole_file():
         _write({"for_calibration": MARK, "MENU_ID_同意書": 672,
                 "MENU_ID_打錯的鍵": 5})
         m = _reload()
-        assert m.MENU_ID_同意書 == 671, "含未知鍵仍部分套用了"
+        assert m.MENU_ID_同意書 == 672, "含未知鍵仍部分套用了"
         assert "未知鍵" in m.OVERRIDE_ERROR
     finally:
         _clean_reload()
@@ -103,7 +103,7 @@ def test_bad_id_values_reject_the_whole_file():
         try:
             _write({"for_calibration": MARK, "MENU_ID_同意書": bad})
             m = _reload()
-            assert m.MENU_ID_同意書 == 671, f"{bad!r} 被當成合法 id 套用了"
+            assert m.MENU_ID_同意書 == 672, f"{bad!r} 被當成合法 id 套用了"
             assert m.OVERRIDE_ERROR
         finally:
             _clean_reload()
@@ -114,7 +114,7 @@ def test_broken_json_is_rejected_not_fatal():
     try:
         _write("{ 這不是 JSON")
         m = _reload()
-        assert m.MENU_ID_同意書 == 671
+        assert m.MENU_ID_同意書 == 672
         assert "讀取失敗" in m.OVERRIDE_ERROR
     finally:
         _clean_reload()

@@ -6,10 +6,11 @@ REM  elevated HIS window, so an un-elevated probe looks like "buttons do
 REM  nothing".)
 REM
 REM 用途：HIS 改版讓熱鍵打到別的功能時(例:F9/F10 開成診斷書),雙擊本檔:
-REM   1. 開啟「HIS 選單 ID 探測」工具(主程式=西醫門診醫師作業 要開著+掛入患者)
-REM   2. 按各區 id 按鈕實測,直到正確的視窗跳出來
-REM   3. 按「寫入快速修正」→ 確認 → 寫入 settings\his_menu_override.json
+REM   1. 開啟「HIS熱鍵ID修正工具」(西醫門診醫師作業 要開著+掛入患者)
+REM   2. 照畫面步驟 1~4:選功能 → 送出測試 → 畫面正確就按「就是這個編號」
+REM   3. 按「套用修正」→ 確認 → 寫入 settings\his_menu_override.json
 REM   4. 重啟中國醫皮膚科主程式,下次啟動直接套用修正(不用等版本更新)
+REM 詳細步驟: HIS熱鍵ID修正工具_使用說明.txt (同資料夾)
 REM 之後正式校正版本推送上來時,快速修正檔會自動過期失效,不會互相蓋。
 REM ============================================================================
 
@@ -34,10 +35,14 @@ exit /b 0
 :elevated
 chcp 65001 >nul
 cd /d "%~dp0"
-set "SCRIPT=%~dp0scripts\test_yiling_menu_id.py"
+REM The tool's file name is Chinese (HIS熱鍵ID修正工具.py); command lines stay
+REM ASCII so the batch parser never depends on the console code page: the
+REM wildcard below matches it (it is the only HIS*ID*.py in the app folder).
+set "SCRIPT="
+for %%F in ("%~dp0HIS*ID*.py") do set "SCRIPT=%%~fF"
 
-if not exist "%SCRIPT%" (
-    echo [ERROR] scripts\test_yiling_menu_id.py not found. Update first:
+if not defined SCRIPT (
+    echo [ERROR] HIS hotkey ID fix tool HIS*ID*.py not found. Update first:
     echo   restart any CMUH program to auto-update, then run this again.
     goto :hold
 )
@@ -67,7 +72,7 @@ goto :hold
 set "RC=%errorlevel%"
 if "%RC%"=="0" exit /b 0
 echo.
-echo [ERROR] Probe exited with code %RC%.
+echo [ERROR] HIS hotkey ID fix tool exited with code %RC%.
 
 :hold
 echo.

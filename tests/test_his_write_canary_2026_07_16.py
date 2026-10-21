@@ -72,8 +72,8 @@ def test_verdict_uses_calibrated_baseline_from_file(monkeypatch):
 
 
 @pytest.mark.parametrize("title, expected", [
-    ("西醫門診醫師作業 V.1151001.01", cc.STATUS_OK),
-    ("西醫門診醫師作業 V.1151002.01", cc.STATUS_DRIFT),
+    ("西醫門診醫師作業 V.1151020.01", cc.STATUS_OK),
+    ("西醫門診醫師作業 V.1151021.01", cc.STATUS_DRIFT),
 ])
 def test_october_calibration_replaces_older_saved_baseline(monkeypatch, title, expected):
     """正式校正接手舊機器基線；已確認版本不誤報，下一版仍需通知。"""
@@ -86,7 +86,7 @@ def test_october_calibration_replaces_older_saved_baseline(monkeypatch, title, e
             }
 
     monkeypatch.setattr(main, "_contract_baseline", lambda: _Baseline())
-    assert main._his_write_baseline_fp() == {"title_version": "1151001"}
+    assert main._his_write_baseline_fp() == {"title_version": "1151020"}
     assert main._his_write_verdict_for(title).status == expected
 
 
