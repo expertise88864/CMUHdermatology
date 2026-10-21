@@ -6,6 +6,15 @@ import pytest
 
 import main
 
+# [2026-10-21] 4-vCPU xdist runner 上 worker 執行緒偶爾 1 秒內排不到(CI run
+# 39536945386 在第一個 entered 事件逾時,同 SHA 的另一個 run 全綠)。等待改成:
+#   SOON — 等「必定會發生」的事件/結束;事件一到就返回,拉長不放寬任何判定。
+#   HOLD — 樁卡住多久才自己放手。★必須遠大於 SOON★:否則「接管被舊 init lock
+#          擋住」的退化會因為樁先放手而被誤判通過。
+SOON = 10.0
+HOLD = 30.0
+assert HOLD > 2 * SOON
+
 
 class Driver:
     window_handles = ["tab"]
@@ -32,7 +41,7 @@ def test_late_health_failure_cannot_borrow_replacement(pool):
         @property
         def window_handles(self):
             entered.set()
-            assert release.wait(3)
+            assert release.wait(HOLD)
             raise RuntimeError("old session failed after takeover")
 
     old, replacement = OldDriver(), Driver()
@@ -42,18 +51,18 @@ def test_late_health_failure_cannot_borrow_replacement(pool):
         target=lambda: result.append(main._get_or_create_status_driver()), daemon=True)
     worker.start()
     try:
-        assert entered.wait(1)
+        assert entered.wait(SOON)
         main._discard_status_driver()
         with pool["lock"]:
             pool.update(driver=replacement, last_used=time.time())
         release.set()
-        worker.join(2)
+        worker.join(SOON)
         assert result == [None], "expired caller must never borrow the new session"
         assert pool["driver"] is replacement
         assert not replacement.closed.is_set()
     finally:
         release.set()
-        worker.join(3)
+        worker.join(HOLD)
 
 
 def test_takeover_initializes_without_waiting_for_hung_initializer(pool, monkeypatch):
@@ -63,7 +72,7 @@ def test_takeover_initializes_without_waiting_for_hung_initializer(pool, monkeyp
     def initialize():
         if threading.current_thread().name == "OldInitializer":
             entered.set()
-            assert release.wait(4)
+            assert release.wait(HOLD)
             return old
         replacement_ready.set()
         return replacement
@@ -76,22 +85,22 @@ def test_takeover_initializes_without_waiting_for_hung_initializer(pool, monkeyp
         target=lambda: new_result.append(main._get_or_create_status_driver()))
     old_worker.start()
     try:
-        assert entered.wait(1)
+        assert entered.wait(SOON)
         main._discard_status_driver()
         new_worker.start()
-        assert replacement_ready.wait(1), "takeover is blocked by the expired init lock"
-        new_worker.join(1)
+        assert replacement_ready.wait(SOON), "takeover is blocked by the expired init lock"
+        new_worker.join(SOON)
         assert new_result == [replacement]
         release.set()
-        old_worker.join(2)
+        old_worker.join(SOON)
         assert old_result == [None]
-        assert old.closed.wait(1)
+        assert old.closed.wait(SOON)
         assert pool["driver"] is replacement
     finally:
         release.set()
-        old_worker.join(3)
+        old_worker.join(HOLD)
         if new_worker.ident is not None:
-            new_worker.join(3)
+            new_worker.join(HOLD)
 
 
 def test_dead_current_driver_can_still_be_rebuilt(pool, monkeypatch):
@@ -104,7 +113,7 @@ def test_dead_current_driver_can_still_be_rebuilt(pool, monkeypatch):
     pool.update(driver=old, last_used=time.time())
     monkeypatch.setattr(main, "_initialize_status_driver", lambda: replacement)
     assert main._get_or_create_status_driver() is replacement
-    assert old.closed.wait(1)
+    assert old.closed.wait(SOON)
 
 
 def test_caller_queued_on_old_init_lock_cannot_borrow_replacement(pool):
@@ -127,13 +136,13 @@ def test_caller_queued_on_old_init_lock_cannot_borrow_replacement(pool):
         target=lambda: result.append(main._get_or_create_status_driver()))
     worker.start()
     try:
-        assert entered.wait(1)
+        assert entered.wait(SOON)
         main._discard_status_driver()
         with pool["lock"]:
             pool.update(driver=replacement, last_used=time.time())
     finally:
         gate.release()
-        worker.join(2)
+        worker.join(SOON)
     assert result == [None]
     assert pool["driver"] is replacement
 
@@ -143,4 +152,4 @@ def test_idle_driver_can_still_be_rebuilt(pool, monkeypatch):
     pool.update(driver=old, last_used=time.time() - main._STATUS_DRIVER_IDLE_TIMEOUT - 1)
     monkeypatch.setattr(main, "_initialize_status_driver", lambda: replacement)
     assert main._get_or_create_status_driver() is replacement
-    assert old.closed.wait(1)
+    assert old.closed.wait(SOON)
