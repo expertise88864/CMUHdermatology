@@ -23,6 +23,19 @@
 0.x 與 date-based 版號的套件（`keyboard` / `pyautogui` / `pystray` / `pywin32`）
 不 pin 上限 —— 語意化版號對它們不適用，pin 了只會擋住修正。
 
+## Pillow：下限 13.0.0、上限 `<14`（2026-10-21）
+
+10-19 之後公布的 8 個 Pillow 12.3.0 弱點（CVE-2026-112395 / 112397 / 112400 /
+112404 / 112895 / 112896 / 112897 / 112899）修正版是 **13.0.0**，`<13` 上限又把
+修正擋在外面（CI 的 pip-audit 因此轉紅）。照下面同一個原則：能升就升，不進允許清單。
+
+本專案用到的 API（`Image.open/new/resize/convert/save`、`Image.Resampling.LANCZOS`
+含 `reducing_gap`、`.ico` 的 `sizes`/`bitmap_format`、`ImageDraw.Draw`、
+`ImageGrab.grab(bbox, all_screens=True)` + `getpixel`、`ImageTk.PhotoImage`，以及
+pyautogui／pyscreeze 的匯入）已用 Pillow 13.0.0（cp313 win_amd64，隔離安裝）實際
+逐項執行，`DeprecationWarning` 當錯誤也全過；相關 50 個測試檔 1235 項通過。
+診間的 Python 3.12（安裝Python.bat）也有 13.0.0 的 win_amd64 wheel。
+
 ## Pillow：上限從 `<12` 提到 `<13`（2026-07-30，外審 P2-07）
 
 Pillow 11.x 帶著 20 幾個已知弱點（PYSEC-2026-2250 / 2253 / 2254 / 2255 / 2256 /

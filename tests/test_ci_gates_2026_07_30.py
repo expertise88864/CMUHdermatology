@@ -53,10 +53,11 @@ def test_requirements_is_ascii_only():
 
 
 def test_the_pillow_floor_is_past_its_own_fix():
-    """Pillow 11.x 有 20+ 個已知弱點，修正版是 12.3.0；舊的 `<12` 上限把修正擋在外面。"""
+    """Pillow 11.x 有 20+ 個已知弱點，修正版是 12.3.0；舊的 `<12` 上限把修正擋在外面。
+    [2026-10-21] 12.3.0 又出 8 個弱點，修正版 13.0.0 → 下限 13.0.0、上限 <14。"""
     text = io.open(os.path.join(REPO_ROOT, "requirements.txt"),
                    encoding="utf-8").read()
-    assert "Pillow>=12.3.0,<13" in text
+    assert "Pillow>=13.0.0,<14" in text
 
 
 # ─── 覆蓋率門檻 ────────────────────────────────────────────────────────────

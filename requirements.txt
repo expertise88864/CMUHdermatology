@@ -26,7 +26,10 @@ psutil>=5.9.0,<8
 # Pillow floor raised to 12.3.0 on 2026-07-30 (external review P2-07):
 # 11.x carries 20+ known advisories (PYSEC-2026-2250/2253/3493/...) whose fix is
 # 12.3.0 - the old `<12` cap kept the fix out of reach.
-Pillow>=12.3.0,<13
+# Raised again to 13.0.0 on 2026-10-21: 12.3.0 gained 8 advisories
+# (CVE-2026-112395/112397/112400/112404/112895/112896/112897/112899) whose fix
+# is 13.0.0; the `<13` cap blocked it the same way. API use re-verified on 13.0.0.
+Pillow>=13.0.0,<14
 pystray>=0.19.5
 pywin32>=306
 sv-ttk>=2.6.0,<3
