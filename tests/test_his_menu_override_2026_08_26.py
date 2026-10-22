@@ -42,6 +42,26 @@ def _clean_reload():
 MARK = hc.override_marker()
 
 
+def test_a_corrected_calibration_expires_overrides_written_before_the_correction():
+    """[外審 PR #11 第 1 輪] 1151020 的完成不印 277→278 是【更正既有一列】(同版本
+    只能一列),筆數不變。更正前寫下、帶舊標記的 override(含 277)必須失效,
+    不可以把更正蓋回去 —— 送 277 會打到會印繳費單的完成。"""
+    newest = hc.CALIBRATION_HISTORY[0]
+    assert MARK == f"{hc.CALIBRATED_VERSION}#{len(hc.CALIBRATION_HISTORY)}#{newest.date}"
+    before_fix = f"{hc.CALIBRATED_VERSION}#{len(hc.CALIBRATION_HISTORY)}"  # 舊格式標記
+    try:
+        _write({"for_calibration": before_fix, "MENU_ID_FINISH_NO_PRINT": 277})
+        m = _reload()
+        assert m.MENU_ID_FINISH_NO_PRINT == 278
+        assert m.OVERRIDE_ERROR and m.OVERRIDE_NOTE == ""
+        stale_day = f"{hc.CALIBRATED_VERSION}#{len(hc.CALIBRATION_HISTORY)}#2026-10-21"
+        _write({"for_calibration": stale_day, "MENU_ID_FINISH_NO_PRINT": 277})
+        m = _reload()
+        assert m.MENU_ID_FINISH_NO_PRINT == 278 and m.OVERRIDE_ERROR
+    finally:
+        _clean_reload()
+
+
 def test_no_override_file_keeps_the_literals():
     try:
         m = _reload()

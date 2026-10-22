@@ -148,7 +148,8 @@ def describe() -> str:
 #   1. 白名單鍵 + 型別/範圍驗證,【任何】一項不對 → 整檔拒用(寧可沒有急救,
 #      不可用到一半對一半的急救)。
 #   2. 檔內必須帶 for_calibration = 它要修補的「校正標記」(override_marker():
-#      字面值版本 + 校正歷史筆數)。任何正式校正都會插一列歷史 → 標記改變 →
+#      字面值版本 + 校正歷史筆數 + 最新一列的日期)。任何正式校正都會插一列歷史
+#      (或更正最新一列並改它的 date)→ 標記改變 →
 #      override 自動過期失效,不會反過來把更新的正式值蓋回舊值(急救貼布不可以
 #      貼過下一次正式治療)。★不能只比版本★:主版本不變、只動尾碼的重校正
 #      (歷史上沒發生過,但 codex R1 指出可能)也會插歷史列,標記照樣改變。
@@ -170,12 +171,18 @@ def override_path() -> str:
 
 
 def override_marker() -> str:
-    """override 的過期戳記:字面值版本 + 校正歷史筆數。
+    """override 的過期戳記:字面值版本 + 校正歷史筆數 + 最新一列的日期。
+
+    ★日期是為了「更正」★(外審 PR #11 第 1 輪):同一 HIS 版本只能有一列歷史
+    (測試釘住),所以更正既有校正(例:1151020 的完成不印 277→278)不會增加筆數
+    —— 只看「版本+筆數」的話,更正前寫下的 override 會繼續有效,把更正蓋回去。
+    更正最新一列時一律改它的 date,標記就跟著變。
 
     任何正式校正(含只動尾碼/只 rebaseline 的)都會在 CALIBRATION_HISTORY 插一列
     → 筆數必然遞增 → 舊 override 必然過期。probe 寫檔時呼叫本函式取當下標記。
     """
-    return f"{_LITERAL_CALIBRATED_VERSION}#{len(CALIBRATION_HISTORY)}"
+    newest = CALIBRATION_HISTORY[0].date if CALIBRATION_HISTORY else ""
+    return f"{_LITERAL_CALIBRATED_VERSION}#{len(CALIBRATION_HISTORY)}#{newest}"
 
 
 def parse_override(data, marker: str):
