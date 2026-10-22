@@ -5535,7 +5535,7 @@ def _dump_menu_tree(main_hwnd: int) -> None:
 
     [perf r5] HIS「完成不印」選單是 owner-draw，_find_menu_command_id_by_text 每次都比不到
     文字 → 每次 F11 route A(照光病人)都 dump 整棵選單樹(~200 行)，是 automation_ui.log
-    暴漲(4.4MB/session)的最大單一來源。fallback id(MENU_ID_FINISH_NO_PRINT,2026-06-29 起=277)
+    暴漲(4.4MB/session)的最大單一來源。fallback id(MENU_ID_FINISH_NO_PRINT,見 his_contract;1151020 起=278)
     已知且穩定，故每個 session 只 dump 一次供對照即可，之後跳過。若 HIS 改版選單結構變動,下次啟動
     的首次 F11 仍會重新 dump 一次。"""
     global _menu_tree_dumped_once
