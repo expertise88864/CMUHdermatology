@@ -1353,6 +1353,27 @@ def _is_native_edit_control(hwnd: int) -> bool:
     )
 
 
+def _line_break_is_one_position(hwnd: int) -> bool:
+    """這個控制項的 EM_GETSEL/EM_SETSEL 是不是把一個換行算成【1 個】位置。
+
+    [2026-10-28 記事本展不開] RichEdit 2.0 以後(RichEdit20W、RICHEDIT50W、
+    Windows 11 記事本的 RichEditD2DPT、Delphi TRichEdit…)內部段落結尾只有 `\\r`,
+    位置一個換行算 1;但 WM_GETTEXT 回的全文是 `\\r\\n`(算 2)。實測 Win11 記事本
+    三行文字:caret=33、全文長 35 → 從第二行起每多一個換行就錯開 1 格,suffix
+    永遠核對不到 → 輪詢到逾時 → ABORT(安靜地不展開)。第一行因為前面沒有換行
+    而正常,所以看起來像「記事本不能用」。
+    標準 Edit/TMemo(HIS 的欄位)兩邊都算 2,不受影響。RichEdit 1.0(class 恰為
+    "RichEdit")仍是 CRLF 算 2,所以排除。"""
+    class_name = _get_window_class_name(hwnd).casefold()
+    return "richedit" in class_name and class_name != "richedit"
+
+
+def _to_control_line_breaks(text: str, one_position: bool) -> str:
+    """把換行轉成控制項實際儲存/計位的寫法:RichEdit 2.0+ 用 `\\r`,其餘用 `\\r\\n`。"""
+    text = text.replace("\r\n", "\n")
+    return text.replace("\n", "\r" if one_position else "\r\n")
+
+
 def _read_window_text(hwnd: int) -> Optional[str]:
     ok, length = _send_message_timeout(hwnd, _WM_GETTEXTLENGTH)
     if not ok:
@@ -1399,25 +1420,31 @@ def _replace_native_edit_suffix(
     (start + len(replacement) - cursor_left)。原生控制項用 EM_SETSEL 比送
     LEFT 方向鍵更可靠。
     [AB-06] native 路徑把 \\n 正規化為 \\r\\n，原生 Edit 才不會把換行顯示成方框。
+    [2026-10-28] RichEdit 2.0+(Win11 記事本)換行算 1 格:全文與展開內容都換成 \\r,
+    caret 才對得上(見 _line_break_is_one_position)。
     """
     hwnd = _get_focused_window_handle()
     if not hwnd or not _is_native_edit_control(hwnd):
         return _NATIVE_NOT_APPLICABLE
 
+    one_position = _line_break_is_one_position(hwnd)
     orig_replacement = replacement
-    replacement = replacement.replace("\r\n", "\n").replace("\n", "\r\n")
-    # [AB-06/codex P2] \n→\r\n 使「游標之後」那段每個【裸 \n】多 1 個 code unit → cursor_left
-    # (以原文 code point 計)需補償,否則游標標記後有換行時 caret 會偏右。已是 \r\n 的不變長,
-    # 不可計入(否則反而偏左)——故只數裸 LF = 全部 \n 扣掉 \r\n 內的 \n。
+    replacement = _to_control_line_breaks(replacement, one_position)
+    # [AB-06/codex P2] 游標標記前那段【換算成控制項的換行寫法】後再量長度:Edit 的裸 \n
+    # 變 \r\n 多 1 格、RichEdit 的 \r\n 變 \r 少 1 格,已是目標寫法的不變長。
+    before_cursor = None
     if 0 < cursor_left <= len(orig_replacement):
-        tail = orig_replacement[len(orig_replacement) - cursor_left:]
-        cursor_left += tail.count("\n") - tail.count("\r\n")
+        before_cursor = _to_control_line_breaks(
+            orig_replacement[:len(orig_replacement) - cursor_left], one_position)
     deadline = time.monotonic() + max(0.0, timeout_sec)
     while True:
         selection = _get_edit_selection(hwnd)
         if selection and selection[0] == selection[1]:
             caret = selection[1]
             text = _read_window_text(hwnd)
+            if text is not None and one_position:
+                # WM_GETTEXT 的 \r\n 換回控制項位置的 1 格,caret 才對得上全文索引
+                text = text.replace("\r\n", "\r")
             if text is not None and caret >= len(expected_suffix):
                 suffix = text[caret - len(expected_suffix) : caret]
                 if suffix.casefold() == expected_suffix.casefold():
@@ -1444,11 +1471,10 @@ def _replace_native_edit_suffix(
                         # 逾時 → 收回選取(避免下個鍵覆寫整段),放棄本次展開,不落盲刪。
                         _send_message_timeout(hwnd, _EM_SETSEL, caret, caret)
                         return _NATIVE_ABORT
-                    if 0 < cursor_left <= len(replacement):
+                    if before_cursor is not None:
                         # EM_SETSEL 用 UTF-16 code-unit 位移,Python len() 是 code point；
                         # 標記前那段以 UTF-16 長度算偏移,非 BMP 字元(罕見)也正確。
                         # [codex review 2026-06-15]
-                        before_cursor = replacement[:len(replacement) - cursor_left]
                         final = start + len(
                             before_cursor.encode("utf-16-le")) // 2
                         if final >= start:
