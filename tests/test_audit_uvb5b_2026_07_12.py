@@ -26,8 +26,9 @@ def test_ud07_confirm_is_loop_with_per_kind_flag():
     src = _func_source("_update_uvb_dose_core")
     assert "while result.action == UvbAction.CONFIRM_NEEDED:" in src, \
         "UD-07: CONFIRM_NEEDED 應為迴圈(另一種 confirm 要再跳窗)"
+    # [2026-10-29] 重 call 另帶醫師在 UVB/Excimer 並存視窗的選擇(route),skip flag 規則不變
     assert "_skip_flags[skip_flag] = True" in src and \
-        "update_uvb_in_text(text, **_skip_flags)" in src, \
+        "update_uvb_in_text(text, route=_uvb_route, **_skip_flags)" in src, \
         "UD-07: 重 call 應只帶已確認那種的 skip flag"
     # 不得回退成「一次帶兩個 flag」的舊寫法
     assert "skip_dose_sanity=True, skip_stale_check=True" not in src, \

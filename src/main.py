@@ -3410,6 +3410,9 @@ def _ask_photo_route(label: str) -> str | None:
     except Exception:
         logging.exception("[%s][phototherapy] 分流詢問視窗失敗", label)
         return None
+    # [外審 PR #14 第 1 輪] F12 會在視窗還開著時就放掉熱鍵鎖、讓新的熱鍵開始;這個被取消的
+    # 流程之後才按下的答案【不可】寫進全域選擇(會蓋掉新流程的選擇)→ 先確認沒被取消再記。
+    check_stop()
     choice = {6: "excimer", 7: "uvb"}.get(ans)   # IDYES=6 / IDNO=7 / 其餘(取消/失敗)=None
     logging.info("[%s][phototherapy] UVB/Excimer 並存(%s)→ 醫師選擇:%s",
                  label, where, choice or "取消")
@@ -3434,7 +3437,8 @@ def _resolve_phototherapy_disposition(main_hwnd: int):
     字眼,也會被正確歸成 uvb 而參與歧義判斷,不會被別控件的舊 excimer 靜默搶走
     (Codex 審查連續抓到的誤分流類別)。"""
     from cmuh_common.uvb_dose import (
-        combine_phototherapy_kinds, detect_phototherapy_kind, needs_route_choice)
+        combine_phototherapy_kinds, detect_phototherapy_kind, mentions_treatment,
+        needs_route_choice)
     global _last_photo_ambiguity
     # [2026-06-23 user] 傳今天進去 → 日期早於 2 個月前的照光段落(極可能已暫停)分流時忽略,
     # 避免「本月 UVB + 一年多前舊 excimer」被誤判成 ambiguous 而卡住 F2(實機:圖二)。
@@ -3459,17 +3463,22 @@ def _resolve_phototherapy_disposition(main_hwnd: int):
             uvb_hwnd = hwnd   # 泛稱光療也記為 UVB 更新目標(只有泛稱時 combine 會收斂成 uvb)
         elif k == "pure_excimer" and not exc_hwnd:
             exc_hwnd = hwnd
+    choice = _photo_route_choice
+    if choice is not None and choice["main"] == main_hwnd:
+        # 醫師本次已在視窗裡選過 → 之後所有重新分流(寫前快照、身份目標核對)都照那個選擇。
+        # [外審 PR #14 第 1 輪] 不要求欄位【仍是並存】:選 Excimer 寫入後兩行日期可能變成同一天,
+        # 欄位就不再「需要選擇」,但身份 01 的目標核對仍要認得剛寫的那一欄。只要求選中的那一欄
+        # 還在、而且仍有該種治療字眼。
+        chosen_excimer = choice["choice"] == "excimer"
+        target = choice["exc"] if chosen_excimer else choice["uvb"]
+        texts = dict(candidates)
+        if target in texts and mentions_treatment(
+                texts[target], "excimer" if chosen_excimer else "uvb"):
+            return target, ("pure_excimer" if chosen_excimer else "uvb")
     combined = combine_phototherapy_kinds(kinds)
     if combined == "ambiguous":
         _last_photo_ambiguity = {"main": main_hwnd, "uvb": uvb_hwnd,
                                  "exc": exc_hwnd, "same_field": same_field}
-        choice = _photo_route_choice
-        if (choice is not None and choice["main"] == main_hwnd
-                and choice["uvb"] == uvb_hwnd and choice["exc"] == exc_hwnd):
-            # 醫師本次已在視窗裡選過 → 之後所有重新分流(寫前快照、身份目標核對)都照那個選擇
-            if choice["choice"] == "excimer":
-                return exc_hwnd, "pure_excimer"
-            return uvb_hwnd, "uvb"
         logging.warning(
             "[Excimer] 同時偵測到 UVB(hwnd=%s)與 Excimer(hwnd=%s)%s → ambiguous",
             uvb_hwnd, exc_hwnd, "於同一欄" if same_field else "於不同欄位")
@@ -4001,7 +4010,9 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
             + _placed_note)
         return False
 
-    result = update_uvb_in_text(text)
+    # 醫師在並存視窗選了 UVB → 只做 UVB(不順手改各自有日期的 excimer)
+    _uvb_route = "uvb" if photo_route_forced == "uvb" else None
+    result = update_uvb_in_text(text, route=_uvb_route)
 
     # [v20.12 2026-05-26] CONFIRM_NEEDED — dose / MAX 超過建議上限 (1500 mj/cm2)
     # 跳 Yes/No dialog，按 Yes 重 call 帶 skip_dose_sanity=True 跳過上限檢查。
@@ -4050,7 +4061,7 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
         _skip_flags[skip_flag] = True
         logging.info("[%s][UVB] CONFIRM_NEEDED (%s) user 按是 → 重 call 帶 %s",
                      label, kind, skip_flag)
-        result = update_uvb_in_text(text, **_skip_flags)
+        result = update_uvb_in_text(text, route=_uvb_route, **_skip_flags)
 
     # [v20.17] SILENT_SKIP — 處置有 UVB+dose 但缺 MAX/increase (e.g. 梁雯琳
     # "keep UVB 850 mj/cm2") → 不修改處置但繼續執行 51019+療程

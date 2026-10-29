@@ -975,6 +975,13 @@ def _routing_view(text: str, today: Optional[date],
     return t
 
 
+def mentions_treatment(text: str, kind: str) -> bool:
+    """處置文字裡還有沒有該種照光的字眼(kind="excimer" / "uvb")。給主程式核對醫師的選擇
+    是否仍對得上目標欄位(寫入後欄位不一定還是「並存」,但選的那種治療一定還在)。"""
+    pattern = _PT_EXCIMER_RE if kind == "excimer" else _PT_UVB_SPECIFIC_RE
+    return bool(pattern.search(text or ""))
+
+
 def needs_route_choice(text: str, today: Optional[date] = None,
                        stale_months: int = STALE_PHOTO_MONTHS) -> bool:
     """【同一欄】同時有本次 UVB 醫令與進行中的 excimer 醫令,而且 excimer 不是 UVB 的同日
@@ -995,16 +1002,25 @@ def needs_route_choice(text: str, today: Optional[date] = None,
     uvb_date = uvb.last_date if uvb is not None else None
     cutoff = _months_before(today, MODIFY_STALE_MONTHS)
     for line in re.split(r"[\r\n]+", t):
-        marker = _EXCIMER_MARKER_RE.search(line)
-        if (marker is None or _EXCIMER_HISTORY_HINT_RE.search(line)
-                or _find_excimer_dose(line, marker.end()) is None):
-            continue
-        dates = _real_dates_in(line)
-        if dates and all(d < cutoff for d in dates):
-            continue                      # 一個多月沒照的 excimer → 不算進行中
-        if uvb_date is not None and uvb_date in dates:
-            continue                      # 與 UVB 同日 → 同次兩種都照,沿用 UVB 流程
-        return True
+        for marker in _EXCIMER_MARKER_RE.finditer(line):
+            # [外審 PR #14 第 1 輪] 只看【這一段 excimer】自己的日期:同一行先寫 UVB 再寫 excimer
+            # 時,整行日期會含 UVB 的日期 → 誤判成同日搭配而不問。段 = 本 marker 到下一個照光字眼。
+            nxt = _PHOTO_ANY_RE.search(line, marker.end())
+            seg_end = nxt.start() if nxt else len(line)
+            seg = line[marker.start():seg_end]
+            # 病史字眼常寫在 excimer 前面('previous excimer 700 …')→ 從上一個照光字眼之後算起
+            prev_end = max((m.end() for m in _PHOTO_ANY_RE.finditer(line, 0, marker.start())),
+                           default=0)
+            dose = _find_excimer_dose(line, marker.end())
+            if (_EXCIMER_HISTORY_HINT_RE.search(line[prev_end:seg_end]) or dose is None
+                    or dose[0] >= seg_end):
+                continue
+            dates = _real_dates_in(seg)
+            if dates and all(d < cutoff for d in dates):
+                continue                  # 一個多月沒照的 excimer → 不算進行中
+            if uvb_date is not None and uvb_date in dates:
+                continue                  # 與 UVB 同日 → 同次兩種都照,沿用 UVB 流程
+            return True
     return False
 
 
@@ -2470,8 +2486,10 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
     先遮成等長空白再計算 —— 整行不動、也不參與分流/驅動行選擇;算完把原行原樣放回。
 
     route="excimer":醫師在「UVB 與 Excimer 並存」視窗選了 Excimer(見 needs_route_choice)→
-    只更新 excimer 行,UVB 行一律不動;找不到可更新的 excimer 也【不】退回 UVB 路徑。"""
-    if route not in (None, "excimer"):
+    只更新 excimer 行,UVB 行一律不動;找不到可更新的 excimer 也【不】退回 UVB 路徑。
+    route="uvb":醫師選了 UVB → 走 UVB 路徑但【不做 Step D】(不順手更新各自有日期的 excimer;
+    與 UVB 同日的搭配段仍照舊一起更新)。"""
+    if route not in (None, "excimer", "uvb"):
         raise ValueError(f"unknown route {route!r}")
     masked, held = _mask_held_photo_lines(text)
     result = _update_uvb_in_text_impl(
@@ -2965,8 +2983,29 @@ def _update_uvb_in_text_impl(text: str, today: Optional[date] = None,
         triplet_count += 1
 
     # ─── Step D: excimer / excimer light 各自依自己的欄位更新 ───────────
-    working, excimer_count, _, _, excimer_decrease = _update_excimer_lines(
+    # [外審 PR #14 第 1 輪] 醫師在並存視窗選了 UVB → 只保留【與 UVB 同一天】的 excimer 行更新
+    # (同次兩種都照),各自另有日期的 excimer 本次沒照,不可順手推進劑量/日期。
+    stepd_text, excimer_count, _, _, excimer_decrease = _update_excimer_lines(
         working, today)
+    if route == "uvb" and excimer_count:
+        before = working.splitlines(keepends=True)
+        after = stepd_text.splitlines(keepends=True)
+        if len(before) != len(after):
+            stepd_text, excimer_count, excimer_decrease = working, 0, None
+        else:
+            kept = 0
+            for i, (line_before, line_after) in enumerate(zip(before, after, strict=True)):
+                if line_before == line_after:
+                    continue
+                if parsed.last_date is not None and parsed.last_date in _real_dates_in(line_before):
+                    kept += 1
+                else:
+                    after[i] = line_before
+            stepd_text = "".join(after)
+            excimer_count = kept
+            if not kept:
+                excimer_decrease = None
+    working = stepd_text
     triplet_count += excimer_count
 
     new_text = working
