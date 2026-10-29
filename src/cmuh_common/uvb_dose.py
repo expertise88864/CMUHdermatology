@@ -525,10 +525,14 @@ _TRIPLET_RE = re.compile(
 # Triplet 周圍需要的 UVB-相關標記 (避免誤動其他內容如「(10) days for ...」)
 # 「\d\s*mj」要求數字接 mJ/mj (劑量單位)，比單純 "mj" 更安全
 _UVB_MARKER_RE = re.compile(
-    r"(?:uvb|excimer|\d\s*mj|phototherapy|photo\s*therapy)",
+    r"(?:uvb|excime|\d\s*mj|phototherapy|photo\s*therapy)",   # excime:含漏打 r
     re.IGNORECASE,
 )
-_EXCIMER_MARKER_RE = re.compile(r"\bexcimer(?:\s+light)?\b", re.IGNORECASE)
+# [2026-10-29 實機] 與分流的 _PT_EXCIMER_RE 同一套認法:漏打 r 的「excime」與中文「準分子」
+# 也是 excimer。舊版只認完整「excimer」→ 分流判成純 excimer,劑量更新卻找不到那一行
+# (四行 excimer 只有第一行 'excime 右側耳上方 …' 沒改到日期)。
+_EXCIMER_MARKER_RE = re.compile(
+    r"(?:\bexcimer?(?:\s+light)?\b|準分子(?:光療?)?)", re.IGNORECASE)
 _EXCIMER_DOSE_RE = re.compile(r"(\d+)\s*(mj(?:/cm2)?)", re.IGNORECASE)
 
 # [UC-08 2026-07-12] triplet 中段((count) 與配對 (日期) 之間)的「裸日期樣 token」
@@ -700,6 +704,44 @@ _PHOTO_ANY_RE = re.compile(
     r"(?:UVB|紫外線|\bUV\b|excime|準分子|photo\s*therapy|光療)", re.IGNORECASE)
 # 預設:照光段落日期早於「今天 - 此月數」→ 視為已暫停,分流時忽略該段落(使用者 2026-06-23)
 STALE_PHOTO_MONTHS = 2
+
+# [2026-10-29 使用者定案] 照光行的【最後一個箭頭子句】是 hold / stop(例
+# '脖子*1 excimer 1240 mj/cm2, add 10 each, MAX 1600 -> hold due to improved')= 該段已暫停:
+# F1/F2/F3 整行不動(劑量、次數、日期都不改),分流時也不算進行中的醫令。
+# 只看【最後一段】:'… -> hold -> 3# on (2026/6/29)' 是停過又恢復,不算暫停。
+_ARROW_RE = re.compile(r"->|→")
+_HELD_CLAUSE_RE = re.compile(r"\s*(?:hold|stop(?:ped)?)\b", re.IGNORECASE)
+
+
+def _is_held_photo_line(line: str) -> bool:
+    if not _PHOTO_ANY_RE.search(line):
+        return False
+    parts = _ARROW_RE.split(line)
+    if len(parts) < 2 or not _HELD_CLAUSE_RE.match(parts[-1]):
+        return False
+    # 同一行還寫了藥物劑量('…, MTX 3# -> hold')→ hold 可能指的是藥,不是照光 →
+    # 不當暫停(維持原本行為),免得把進行中的照光整行遮掉。
+    return not _DRUG_DOSING_RE.search(line)
+
+
+def _split_keep_line_ends(text: str) -> list:
+    """切行並保留各行的換行字元(\\r\\n / \\r / \\n);''.join 回去就是原文。"""
+    return re.findall(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+$", text)
+
+
+def _mask_held_photo_lines(text: str) -> tuple:
+    """暫停中的照光行換成【等長空白】(換行原樣保留)→ (遮罩後全文, 被遮的行號)。
+    等長是為了讓所有以 offset/span 計的結果(含 uncertain triplets)仍對得上原文。"""
+    if not text:
+        return text or "", []
+    lines = _split_keep_line_ends(text)
+    held = []
+    for i, line in enumerate(lines):
+        body = line.rstrip("\r\n")
+        if _is_held_photo_line(body):
+            held.append(i)
+            lines[i] = " " * len(body) + line[len(body):]
+    return ("".join(lines) if held else text), held
 
 
 def _months_before(d: date, months: int) -> date:
@@ -924,7 +966,7 @@ def detect_phototherapy_kind(text: str, today: Optional[date] = None,
     [2026-06-23] 傳入 today 時,先濾掉『日期早於 today - stale_months 個月』的照光行
     (見 strip_stale_phototherapy_segments)—— 那段照光極可能已暫停,不該拿來判斷本次身份別。
     """
-    t = text or ""
+    t, _held = _mask_held_photo_lines(text or "")   # 暫停中的照光行不算(見 _is_held_photo_line)
     if today is not None:
         t = strip_stale_phototherapy_segments(t, today, stale_months)
         # [2026-06-29 Codex r8] 近期 excimer 在場時,連 1-2 個月前的舊 UVB 也忽略(與 update 的
@@ -987,6 +1029,19 @@ def _date_text(dt: date, sep: str = "/") -> str:
 def _has_maintain_dose(text: str) -> bool:
     return bool(re.search(r"\bmaintain(?:\s+the)?\s+dose\b(?!\s+at\s*\d)", text,
                           re.IGNORECASE))
+
+
+def _replace_count_token(src: str, old_count: int, new_count: int) -> str:
+    """把第一個「(old_count)」換成「(new_count)」,★保留原本的補零寬度★。
+
+    [2026-10-29 實機] 'UVB: 500 mj/cm2 (02) on (…)' 的次數寫成補零 (02):parse 讀得到
+    count=2,但舊替換只找字面 '(2)' → 找不到、次數沒改 → round-trip verify 失敗 →
+    F2 只跳警告不更新。(02)→(03)、(09)→(10)、(2)→(3)。"""
+    return re.sub(
+        r"([\(（]\s*)(0*" + str(old_count) + r")(\s*[\)）])",
+        lambda mo: (f"{mo.group(1)}{str(new_count).zfill(len(mo.group(2)))}"
+                    f"{mo.group(3)}"),
+        src, count=1)
 
 
 def _replace_uvb_dose(src: str, old_dose: int, new_dose: int) -> str:
@@ -1438,12 +1493,7 @@ def format_uvb_line(original: UvbLineInfo, *, new_dose: int,
         _kw = original.keyword_text or "UVB"
         _kpos = src.lower().find(_kw.lower())
         _from = _kpos if _kpos >= 0 else 0
-        src = src[:_from] + re.sub(
-            r"([\(\uFF08]\s*)" + str(original.count) + r"(\s*[\)\uFF09])",
-            lambda mo: f"{mo.group(1)}{new_count}{mo.group(2)}",
-            src[_from:],
-            count=1,
-        )
+        src = src[:_from] + _replace_count_token(src[_from:], original.count, new_count)
 
     # 日期已於步驟 1 換完 → 完成
     if _date_done:
@@ -1679,7 +1729,8 @@ def _compute_excimer_segment_edit(
         (date_m.span(), _today_in_format(today, date_m.group(0))),
     ]
     if count_m is not None and new_count is not None:
-        edits.append((count_m.span(1), str(new_count)))
+        edits.append((count_m.span(1),
+                      str(new_count).zfill(len(count_m.group(1)))))
     return (edits,
             {"dose": new_dose, "count": new_count,
              "last_date": last_date, "days_diff": days_diff},
@@ -1881,7 +1932,8 @@ def _update_excimer_lines(text: str, today: date,
             (date_m.span(), _today_in_format(today, date_m.group(0))),
         ]
         if count_m is not None and new_count is not None:
-            edits.append((count_m.span(1), str(new_count)))
+            edits.append((count_m.span(1),
+                          str(new_count).zfill(len(count_m.group(1)))))
         new_line = line
         for (start, end), replacement in sorted(edits, reverse=True):
             new_line = new_line[:start] + replacement + new_line[end:]
@@ -2034,12 +2086,7 @@ def _detect_uncertain_triplets(text: str, today: date,
             continue
         # 構造 "Yes 時" 套用的新 segment: count+1, date→today
         rep = m.group(0)
-        rep = re.sub(
-            r"([\(\uFF08]\s*)" + str(old_count) + r"(\s*[\)\uFF09])",
-            lambda mo: f"{mo.group(1)}{old_count + 1}{mo.group(2)}",  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
-            rep,
-            count=1,
-        )
+        rep = _replace_count_token(rep, old_count, old_count + 1)
         rep = re.sub(
             rf"([\(\uFF08]\s*){seg_date.year}([/-])0?{seg_date.month}([/-])0?{seg_date.day}(\s*[\)\uFF09])",
             lambda mo: f"{mo.group(1)}{_date_text(today, mo.group(2))}{mo.group(4)}",
@@ -2154,11 +2201,7 @@ def _first_time_update(parsed: UvbLineInfo, today: date,
         _kw = parsed.keyword_text or "UVB"
         _kpos = src.lower().find(_kw.lower())
         _from = _kpos if _kpos >= 0 else 0
-        src = src[:_from] + re.sub(
-            r"([\(（]\s*)" + str(parsed.count) + r"(\s*[\)）])",
-            lambda mo: f"{mo.group(1)}{new_count}{mo.group(2)}",
-            src[_from:], count=1,
-        )
+        src = src[:_from] + _replace_count_token(src[_from:], parsed.count, new_count)
 
     return UvbUpdateResult(
         action=UvbAction.UPDATED,
@@ -2355,6 +2398,33 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
                        skip_dose_sanity: bool = False,
                        skip_stale_check: bool = False, *,
                        _isolated_uvb: bool = False) -> UvbUpdateResult:
+    """主入口(見 _update_uvb_in_text_impl)。暫停中的照光行(見 _is_held_photo_line)
+    先遮成等長空白再計算 —— 整行不動、也不參與分流/驅動行選擇;算完把原行原樣放回。"""
+    masked, held = _mask_held_photo_lines(text)
+    result = _update_uvb_in_text_impl(
+        masked, today, skip_dose_sanity, skip_stale_check,
+        _isolated_uvb=_isolated_uvb)
+    if not held or result.new_text is None:
+        return result
+    original_lines = _split_keep_line_ends(text)
+    new_lines = _split_keep_line_ends(result.new_text)
+    if len(new_lines) != len(original_lines) or any(
+            new_lines[i].rstrip("\r\n").strip() for i in held):
+        # 遮掉的行數對不上/被寫進東西 → 不可能安全放回,整次不寫(交醫師)
+        return UvbUpdateResult(
+            action=UvbAction.SANITY_FAIL, uvb_line_count=result.uvb_line_count,
+            sanity_reason="暫停中的照光行無法原樣保留 → 不自動更新,請手動調整")
+    for i in held:
+        body = original_lines[i].rstrip("\r\n")
+        new_lines[i] = body + new_lines[i][len(new_lines[i].rstrip("\r\n")):]
+    result.new_text = "".join(new_lines)
+    return result
+
+
+def _update_uvb_in_text_impl(text: str, today: Optional[date] = None,
+                             skip_dose_sanity: bool = False,
+                             skip_stale_check: bool = False, *,
+                             _isolated_uvb: bool = False) -> UvbUpdateResult:
     """主入口：給整段「處置」text，回更新後 text + 動作類型。
 
     today=None 用今天日期；測試時傳 fixed date 方便 reproducible。
@@ -2786,12 +2856,7 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
             continue
         # 構造該 triplet 替換內容: count→count+1, date→today
         seg_text = m.group(0)
-        seg_text = re.sub(
-            r"([\(\uFF08]\s*)" + str(old_count) + r"(\s*[\)\uFF09])",
-            lambda mo: f"{mo.group(1)}{old_count + 1}{mo.group(2)}",  # noqa: B023  closure 在同一輪內同步執行完，見 ruff.toml
-            seg_text,
-            count=1,
-        )
+        seg_text = _replace_count_token(seg_text, old_count, old_count + 1)
         seg_text = re.sub(
             rf"([\(\uFF08]\s*){seg_date.year}([/-])0?{seg_date.month}([/-])0?{seg_date.day}(\s*[\)\uFF09])",
             lambda mo: f"{mo.group(1)}{_date_text(today, mo.group(2))}{mo.group(4)}",

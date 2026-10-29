@@ -178,8 +178,9 @@ def test_the_noqa_sites_are_where_we_verified_them():
     不能靠這批既有的核對結果背書。
     """
     files = {p for p, _i, _line in _b023_noqa_lines()}
+    # [2026-10-29] uvb_dose.py 的兩處 re.sub closure 改成 _replace_count_token(不再需要
+    # noqa),已從清單移除;再出現就是新的 B023,要重新判斷。
     expected = {
-        os.path.join("src", "cmuh_common", "uvb_dose.py"),
         os.path.join("src", "main.py"),
         os.path.join("tests", "test_settings_overwrite_guard_2026_07_26.py"),
     }
@@ -195,7 +196,6 @@ def test_the_repo_is_clean_with_b023_enabled():
 
 
 @pytest.mark.parametrize("path", [
-    os.path.join("src", "cmuh_common", "uvb_dose.py"),
     os.path.join("src", "main.py"),
 ])
 def test_the_verified_sites_are_still_synchronous(path):
