@@ -714,7 +714,10 @@ _HELD_CLAUSE_RE = re.compile(r"\s*(?:hold|stop(?:ped)?)\b", re.IGNORECASE)
 
 
 def _is_held_photo_line(line: str) -> bool:
-    if not _PHOTO_ANY_RE.search(line):
+    # [外審 PR #13 第 1 輪] 多段 excimer 的續行不重寫 excimer 字眼('scalp 600mj/cm2 (20) on (…)
+    # add 30 each time, MAX 1000 -> hold'),但 _update_excimer_lines 會把它當同一筆醫令改 →
+    # 長得像 excimer 續行(劑量+加量+上限齊全)的行也要判暫停。
+    if not (_PHOTO_ANY_RE.search(line) or _looks_like_excimer_continuation(line)):
         return False
     parts = _ARROW_RE.split(line)
     if len(parts) < 2 or not _HELD_CLAUSE_RE.match(parts[-1]):

@@ -108,6 +108,18 @@ class TestHeldLines:
         held_uvb = "UVB 500 mj/cm2 (5) on (2026/10/20) add 30 each time, MAX 1000 -> hold"
         assert u.detect_phototherapy_kind(held_uvb + "\n" + self.ACTIVE, TODAY) == "pure_excimer"
 
+    def test_a_held_excimer_continuation_without_the_keyword_is_untouched(self):
+        """[外審 PR #13 第 1 輪] 續行沒寫 excimer 字眼也要認得出暫停。"""
+        memo = ("excime cheek 500mj/cm2 (10) on (2026/10/27) add 30 each time, MAX 1000\r\n"
+                "scalp 600mj/cm2 (20) on (2026/10/27) add 30 each time, MAX 1000 -> hold")
+        r = u.update_uvb_in_text(memo, TODAY)
+        assert r.action == u.UvbAction.UPDATED
+        changed = _changed(memo, r.new_text)
+        assert list(changed) == [0] and "530mj/cm2 (11) on (2026/10/29)" in changed[0]
+        # 恢復過的續行 / 帶藥物劑量的續行照舊當進行中
+        assert not u._is_held_photo_line(
+            "scalp 600mj/cm2 (20) on (2026/10/27) add 30 each time, MAX 1000 -> hold -> 600 on (2026/10/27)")
+
     def test_a_single_held_line_is_not_updated(self):
         r = u.update_uvb_in_text(self.HELD, TODAY)
         assert r.action != u.UvbAction.UPDATED and r.new_text is None
