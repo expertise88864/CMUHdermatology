@@ -39,6 +39,9 @@ class TestNeedsRouteChoice:
         # [外審 PR #14 第 1 輪] 同一行先 UVB 後 excimer:只看 excimer 那一段自己的日期
         (UVB_1026 + "; excimer 540 mj/cm2 on (2026/10/27) add 40 each, MAX 800", True),
         (UVB_1027 + "; excimer 540 mj/cm2 on (2026/10/27) add 40 each, MAX 800", False),
+        # [外審 PR #14 第 2 輪] 複合名稱 'excimer phototherapy' 不可被 phototherapy 切斷
+        (UVB_1026 + CRLF + "excimer phototherapy 540 mj/cm2 on (2026/10/27) add 40 each, MAX 800",
+         True),
     ])
     def test_cases(self, text, want):
         assert u.needs_route_choice(text, TODAY) is want
@@ -80,6 +83,26 @@ class TestForcedRoutes:
         assert "530 mj/cm2 (6) on (2026/10/29)" in new[0]
         assert new[1] == exc, "選 UVB 時 excimer 不可動"
         assert "580 mj/cm2" in u.update_uvb_in_text(text, TODAY).new_text   # 預設路徑維持既有行為
+
+    def test_uvb_route_filters_each_excimer_segment_by_its_own_date(self):
+        """[外審 PR #14 第 2 輪] 同一行另一段 excimer 剛好與 UVB 同日,不可替別段背書。"""
+        two = ("excimer 540 mj/cm2 on (2026/10/27) add 40 each, MAX 800, "
+               "excimer 700 mj/cm2 on (2026/10/26) add 30 each, MAX 900")
+        text = UVB_1026 + CRLF + two
+        assert u.needs_route_choice(text, TODAY)
+        r = u.update_uvb_in_text(text, TODAY, route="uvb")
+        assert r.new_text.split(CRLF)[1] == two
+
+    def test_uvb_route_reaches_later_lines_after_an_undated_driver(self):
+        """[外審 PR #14 第 2 輪] 無日期驅動行之後的多行處理也要帶著『只做 UVB』。"""
+        first = "UVB 局部臉 630mj/cm2, add 30 mj/cm2, MAX 1000"
+        second = (UVB_1026 + ", excimer 540 mj/cm2 on (2026/10/27) add 40 each, MAX 800")
+        text = first + CRLF + second
+        r = u.update_uvb_in_text(text, TODAY, route="uvb")
+        assert r.action == u.UvbAction.UPDATED
+        new_second = r.new_text.split(CRLF)[1]
+        assert "excimer 540 mj/cm2 on (2026/10/27)" in new_second, "excimer 段不可動"
+        assert "excimer 580" in u.update_uvb_in_text(text, TODAY).new_text   # 預設路徑維持既有行為
 
     def test_same_date_excimer_is_still_updated_with_uvb_route(self):
         """同日搭配(同次兩種都照)選 UVB 時仍照既有 Step D 一起更新;另有日期的不動。"""

@@ -975,6 +975,10 @@ def _routing_view(text: str, today: Optional[date],
     return t
 
 
+# 分段用的治療名稱(不含泛稱 phototherapy/光療:它常是 'excimer phototherapy' 這種複合名稱的一部分)
+_TREATMENT_NAME_RE = re.compile(r"(?:UVB|紫外線|\bUV\b|excime|準分子)", re.IGNORECASE)
+
+
 def mentions_treatment(text: str, kind: str) -> bool:
     """處置文字裡還有沒有該種照光的字眼(kind="excimer" / "uvb")。給主程式核對醫師的選擇
     是否仍對得上目標欄位(寫入後欄位不一定還是「並存」,但選的那種治療一定還在)。"""
@@ -1005,11 +1009,13 @@ def needs_route_choice(text: str, today: Optional[date] = None,
         for marker in _EXCIMER_MARKER_RE.finditer(line):
             # [外審 PR #14 第 1 輪] 只看【這一段 excimer】自己的日期:同一行先寫 UVB 再寫 excimer
             # 時,整行日期會含 UVB 的日期 → 誤判成同日搭配而不問。段 = 本 marker 到下一個照光字眼。
-            nxt = _PHOTO_ANY_RE.search(line, marker.end())
+            # [外審 PR #14 第 2 輪] 邊界只認【另一種治療的名稱】(UVB / excimer),不認泛稱
+            # 'phototherapy/光療' —— 'excimer phototherapy 540 mj/cm2 …' 是同一個醫令名稱。
+            nxt = _TREATMENT_NAME_RE.search(line, marker.end())
             seg_end = nxt.start() if nxt else len(line)
             seg = line[marker.start():seg_end]
-            # 病史字眼常寫在 excimer 前面('previous excimer 700 …')→ 從上一個照光字眼之後算起
-            prev_end = max((m.end() for m in _PHOTO_ANY_RE.finditer(line, 0, marker.start())),
+            # 病史字眼常寫在 excimer 前面('previous excimer 700 …')→ 從上一個治療名稱之後算起
+            prev_end = max((m.end() for m in _TREATMENT_NAME_RE.finditer(line, 0, marker.start())),
                            default=0)
             dose = _find_excimer_dose(line, marker.end())
             if (_EXCIMER_HISTORY_HINT_RE.search(line[prev_end:seg_end]) or dose is None
@@ -1821,7 +1827,9 @@ def _compute_excimer_segment_edit(
 def _update_excimer_lines(text: str, today: date,
                           allow_undated: bool = False,
                           skip_stale: bool = False,
-                          flexible_dose: bool = False
+                          flexible_dose: bool = False,
+                          companion_only: bool = False,
+                          companion_date: Optional[date] = None,
                           ) -> tuple[str, int, Optional[dict], Optional[int],
                                      Optional[str]]:
     """Update structured excimer lines independently from UVB lines.
@@ -1942,7 +1950,7 @@ def _update_excimer_lines(text: str, today: date,
         # 沒日期(像初診/醫師沒寫日期,例:"excimer 510 mj/cm2 increase 30 ... max 800")→
         # 同一般 UVB 的 first-time:只加劑量(cap MAX),【不補日期、不補次數】(2026-06-25 user)。
         if date_m is None:
-            if (not allow_undated or inc_m is None
+            if (companion_only or not allow_undated or inc_m is None
                     or dose_start > max_m.start()):
                 continue
             try:
@@ -1974,6 +1982,10 @@ def _update_excimer_lines(text: str, today: date,
             max_dose = int(max_m.group(1))
             increase = _inc_safe if _inc_safe is not None else 0
         except (TypeError, ValueError):
+            continue
+        # [外審 PR #14 第 2 輪] 醫師在並存視窗選了 UVB:只更新【這一段自己的日期】與 UVB 同一天的
+        # excimer(同次兩種都照);同一行別段的日期不算數,另有日期的本次沒照,一律不動。
+        if companion_only and last_date != companion_date:
             continue
 
         masked = (line[:date_m.start()]
@@ -2418,7 +2430,8 @@ def uvb_updated_lines_written_back_ok(text: str, expected: dict[int, str]) -> bo
 
 
 def _finish_undated_uvb_lines(text: str, result: UvbUpdateResult, today: date,
-                             skip_dose_sanity: bool, skip_stale_check: bool) -> UvbUpdateResult:
+                             skip_dose_sanity: bool, skip_stale_check: bool,
+                             route: Optional[str] = None) -> UvbUpdateResult:
     """Continue after the undated driver, using each later UVB line's own rules.
 
     Compute everything before the caller writes. Any required confirmation or
@@ -2447,7 +2460,7 @@ def _finish_undated_uvb_lines(text: str, result: UvbUpdateResult, today: date,
                     and parsed.last_date < _months_before(today, MODIFY_STALE_MONTHS)):
                 offset += len(working[index])
                 continue
-            extra = update_uvb_in_text(line, today, skip_dose_sanity, skip_stale_check,
+            extra = update_uvb_in_text(line, today, skip_dose_sanity, skip_stale_check, route=route,
                                        _isolated_uvb=True)
             if extra.action == UvbAction.CONFIRM_NEEDED:
                 confirmations.append(extra)
@@ -2665,7 +2678,8 @@ def _update_uvb_in_text_impl(text: str, today: Optional[date] = None,
             if _isolated_uvb:
                 return result
             return _finish_undated_uvb_lines(text, result, today,
-                                             skip_dose_sanity, skip_stale_check)
+                                             skip_dose_sanity, skip_stale_check,
+                                             route=route)
         # partial 有 date 但少 increase 之類 — fall through to PARSE_FAIL
         # (theoretically 應該被 strict parse_uvb_line 抓到才對)
         return UvbUpdateResult(action=UvbAction.PARSE_FAIL,
@@ -2983,29 +2997,11 @@ def _update_uvb_in_text_impl(text: str, today: Optional[date] = None,
         triplet_count += 1
 
     # ─── Step D: excimer / excimer light 各自依自己的欄位更新 ───────────
-    # [外審 PR #14 第 1 輪] 醫師在並存視窗選了 UVB → 只保留【與 UVB 同一天】的 excimer 行更新
-    # (同次兩種都照),各自另有日期的 excimer 本次沒照,不可順手推進劑量/日期。
-    stepd_text, excimer_count, _, _, excimer_decrease = _update_excimer_lines(
-        working, today)
-    if route == "uvb" and excimer_count:
-        before = working.splitlines(keepends=True)
-        after = stepd_text.splitlines(keepends=True)
-        if len(before) != len(after):
-            stepd_text, excimer_count, excimer_decrease = working, 0, None
-        else:
-            kept = 0
-            for i, (line_before, line_after) in enumerate(zip(before, after, strict=True)):
-                if line_before == line_after:
-                    continue
-                if parsed.last_date is not None and parsed.last_date in _real_dates_in(line_before):
-                    kept += 1
-                else:
-                    after[i] = line_before
-            stepd_text = "".join(after)
-            excimer_count = kept
-            if not kept:
-                excimer_decrease = None
-    working = stepd_text
+    # [外審 PR #14 第 1/2 輪] 醫師在並存視窗選了 UVB → 只更新與 UVB 同一天的 excimer 段
+    # (同次兩種都照;逐段比自己的日期,見 _update_excimer_lines 的 companion_only)。
+    working, excimer_count, _, _, excimer_decrease = _update_excimer_lines(
+        working, today, companion_only=(route == "uvb"),
+        companion_date=parsed.last_date)
     triplet_count += excimer_count
 
     new_text = working
