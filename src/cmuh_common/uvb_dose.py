@@ -962,6 +962,52 @@ def _strip_stale_uvb_when_recent_excimer(text: str, today: date) -> str:
     return "\n".join(kept)
 
 
+def _routing_view(text: str, today: Optional[date],
+                  stale_months: int = STALE_PHOTO_MONTHS) -> str:
+    """分流用的處置副本(不寫回):遮掉暫停中的照光行,有 today 時再濾掉太舊的照光行。"""
+    t, _held = _mask_held_photo_lines(text or "", keep_chain=False)   # 暫停中的照光行不算(見 _is_held_photo_line)
+    t = t.replace(_HELD_KEEP_CHAIN, " ")   # 更新路徑傳進來的副本可能已帶佔位 → 分流一律當空白
+    if today is not None:
+        t = strip_stale_phototherapy_segments(t, today, stale_months)
+        # [2026-06-29 Codex r8] 近期 excimer 在場時,連 1-2 個月前的舊 UVB 也忽略(與 update 的
+        # MODIFY_STALE_MONTHS 一致),避免舊 UVB 把近期 excimer 卡住或誤分流成健保 UVB。
+        t = _strip_stale_uvb_when_recent_excimer(t, today)
+    return t
+
+
+def needs_route_choice(text: str, today: Optional[date] = None,
+                       stale_months: int = STALE_PHOTO_MONTHS) -> bool:
+    """【同一欄】同時有本次 UVB 醫令與進行中的 excimer 醫令,而且 excimer 不是 UVB 的同日
+    搭配 → 程式無法判斷本次做哪一個,要問醫師(2026-10-29 使用者定案)。
+
+    detect_phototherapy_kind 對這種欄位一律回 "uvb"(不漏 key 健保);實機案例
+    '左眼皮內側*1 excimer 540 mj/cm2 on (2026/10/29) …' + 'start UVB 局部臉 …: 630mj/cm2 …'
+    因此被 F2 當 UVB 改了 630→660,而醫師要的是 excimer。
+    進行中的 excimer = 有 excimer 字眼且帶劑量、不是暫停行/病史行、沒寫日期或日期在
+    MODIFY_STALE_MONTHS 內。同日搭配(UVB 與 excimer 寫同一天,實機有「同次兩種都照」)
+    沿用既有 UVB 流程(同日 triplet 一併更新),不問。"""
+    if today is None:
+        today = date.today()
+    t = _routing_view(text, today, stale_months)
+    if not _has_dosed_uvb_specific(t):
+        return False
+    uvb = parse_uvb_line(t)
+    uvb_date = uvb.last_date if uvb is not None else None
+    cutoff = _months_before(today, MODIFY_STALE_MONTHS)
+    for line in re.split(r"[\r\n]+", t):
+        marker = _EXCIMER_MARKER_RE.search(line)
+        if (marker is None or _EXCIMER_HISTORY_HINT_RE.search(line)
+                or _find_excimer_dose(line, marker.end()) is None):
+            continue
+        dates = _real_dates_in(line)
+        if dates and all(d < cutoff for d in dates):
+            continue                      # 一個多月沒照的 excimer → 不算進行中
+        if uvb_date is not None and uvb_date in dates:
+            continue                      # 與 UVB 同日 → 同次兩種都照,沿用 UVB 流程
+        return True
+    return False
+
+
 def detect_phototherapy_kind(text: str, today: Optional[date] = None,
                              stale_months: int = STALE_PHOTO_MONTHS) -> str:
     """判斷【單一欄位】屬於哪種照光,給 F2/F3 分流用。回傳:
@@ -988,13 +1034,7 @@ def detect_phototherapy_kind(text: str, today: Optional[date] = None,
     [2026-06-23] 傳入 today 時,先濾掉『日期早於 today - stale_months 個月』的照光行
     (見 strip_stale_phototherapy_segments)—— 那段照光極可能已暫停,不該拿來判斷本次身份別。
     """
-    t, _held = _mask_held_photo_lines(text or "", keep_chain=False)   # 暫停中的照光行不算(見 _is_held_photo_line)
-    t = t.replace(_HELD_KEEP_CHAIN, " ")   # 更新路徑傳進來的副本可能已帶佔位 → 分流一律當空白
-    if today is not None:
-        t = strip_stale_phototherapy_segments(t, today, stale_months)
-        # [2026-06-29 Codex r8] 近期 excimer 在場時,連 1-2 個月前的舊 UVB 也忽略(與 update 的
-        # MODIFY_STALE_MONTHS 一致),避免舊 UVB 把近期 excimer 卡住或誤分流成健保 UVB。
-        t = _strip_stale_uvb_when_recent_excimer(t, today)
+    t = _routing_view(text, today, stale_months)
     # [2026-06-27] UVB-specific 也要【有劑量】才算「本次健保 UVB 醫令」(會與別欄位 excimer 形成歧義);
     # 只有 UVB 字眼【無任何劑量】= 病史/轉介語境(陳韻璇實機:病史 'Previous tx: UVB at singapore',
     # 處置只有 excimer)→ 不算本次 UVB,讓 excimer 涵蓋,不再誤判 ambiguous 卡住 F2。
@@ -1602,6 +1642,8 @@ def _looks_like_excimer_continuation(line: str) -> bool:
     否決,絕不改動歷史醫療文字(醫療安全紅線:不確定就不動)。此判斷只在 flexible_dose(純自費
     excimer)路徑、且緊接 excimer 段時才生效。"""
     if _EXCIMER_HISTORY_HINT_RE.search(line):   # 病史/過去療程行 → 絕不當延續改動
+        return False
+    if _PT_UVB_SPECIFIC_RE.search(line):        # UVB 醫令行不是 excimer 的延續(醫師選 excimer 時也不可動)
         return False
     if _find_excimer_dose(line, 0) is None:
         return False
@@ -2422,13 +2464,19 @@ def _finish_undated_uvb_lines(text: str, result: UvbUpdateResult, today: date,
 def update_uvb_in_text(text: str, today: Optional[date] = None,
                        skip_dose_sanity: bool = False,
                        skip_stale_check: bool = False, *,
-                       _isolated_uvb: bool = False) -> UvbUpdateResult:
+                       _isolated_uvb: bool = False,
+                       route: Optional[str] = None) -> UvbUpdateResult:
     """主入口(見 _update_uvb_in_text_impl)。暫停中的照光行(見 _is_held_photo_line)
-    先遮成等長空白再計算 —— 整行不動、也不參與分流/驅動行選擇;算完把原行原樣放回。"""
+    先遮成等長空白再計算 —— 整行不動、也不參與分流/驅動行選擇;算完把原行原樣放回。
+
+    route="excimer":醫師在「UVB 與 Excimer 並存」視窗選了 Excimer(見 needs_route_choice)→
+    只更新 excimer 行,UVB 行一律不動;找不到可更新的 excimer 也【不】退回 UVB 路徑。"""
+    if route not in (None, "excimer"):
+        raise ValueError(f"unknown route {route!r}")
     masked, held = _mask_held_photo_lines(text)
     result = _update_uvb_in_text_impl(
         masked, today, skip_dose_sanity, skip_stale_check,
-        _isolated_uvb=_isolated_uvb)
+        _isolated_uvb=_isolated_uvb, route=route)
     if not held or result.new_text is None:
         return result
     original_lines = _split_keep_line_ends(text)
@@ -2450,7 +2498,8 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
 def _update_uvb_in_text_impl(text: str, today: Optional[date] = None,
                              skip_dose_sanity: bool = False,
                              skip_stale_check: bool = False, *,
-                             _isolated_uvb: bool = False) -> UvbUpdateResult:
+                             _isolated_uvb: bool = False,
+                             route: Optional[str] = None) -> UvbUpdateResult:
     """主入口：給整段「處置」text，回更新後 text + 動作類型。
 
     today=None 用今天日期；測試時傳 fixed date 方便 reproducible。
@@ -2491,7 +2540,8 @@ def _update_uvb_in_text_impl(text: str, today: Optional[date] = None,
     # → 落到 UVB 路徑把舊 UVB(2024/11/12)當本次而誤跳「距今超過 1 個月」確認。故 detect 判 pure_excimer
     # 時,即使 parse 到舊 UVB 也把 parsed 歸 None、強制走 excimer 分支(更新近期 excimer、保留舊 UVB 行)。
     # 與主程式身份別分流一致、billing 安全:近期真有 UVB 時 detect 會是 uvb/ambiguous,不會誤判 pure_excimer。
-    _is_pure_excimer = detect_phototherapy_kind(text, today) == "pure_excimer"
+    _is_pure_excimer = (route == "excimer"
+                        or detect_phototherapy_kind(text, today) == "pure_excimer")
     if _is_pure_excimer:
         parsed = None
     if parsed is None:
@@ -2544,6 +2594,10 @@ def _update_uvb_in_text_impl(text: str, today: Optional[date] = None,
             # skip_stale_check=True 重 call → 上面 skip_stale=True 會照舊紀錄更新。
             if not skip_stale_check and _all_excimer_stale(text, today):
                 return _stale_confirm_result(text, today)
+        if route == "excimer":
+            # 醫師選了 Excimer:沒有可更新的 excimer 行就停在這裡,絕不退回去改 UVB 行。
+            return UvbUpdateResult(action=UvbAction.NO_UVB_LINE,
+                                   uvb_line_count=uvb_lines)
         # Strict parse 失敗 — 試 partial parse 看是不是「沒日期」case
         partial = parse_uvb_partial(text)
         if partial is None:

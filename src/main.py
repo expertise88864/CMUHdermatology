@@ -3366,6 +3366,59 @@ def _collect_phototherapy_memos(main_hwnd: int) -> tuple[list, bool]:
     return items, not read_uncertain[0]
 
 
+# [2026-10-29 使用者定案] UVB 與 Excimer 並存(同一欄、或分屬不同欄位)時不再一律中止,
+# 改跳視窗讓醫師選本次做哪一個。選擇只在【這一次熱鍵】有效:F1/F2/F3 開頭清掉,
+# 之後同一流程裡的重新分流(寫前快照、身份目標核對)都照醫師的選擇,不會再問、也不會變卦。
+_photo_route_choice: dict | None = None     # {"main", "uvb", "exc", "choice": "excimer"|"uvb"}
+_last_photo_ambiguity: dict | None = None   # 最近一次判 ambiguous 的位置(給詢問視窗用)
+
+
+def _reset_photo_route_choice() -> None:
+    global _photo_route_choice, _last_photo_ambiguity
+    _photo_route_choice = None
+    _last_photo_ambiguity = None
+
+
+def _ask_photo_route(label: str) -> str | None:
+    """問醫師本次是 Excimer 還是 UVB → "excimer" / "uvb" / None(取消、視窗失敗、沒有歧義資訊)。
+
+    MessageBoxW 只有是/否/取消三顆鈕,所以文案把每顆鈕的意思寫清楚;預設鈕是【取消】,
+    隨手 Enter 不會選到任何一種計費路線。"""
+    global _photo_route_choice
+    amb = _last_photo_ambiguity
+    if not amb:
+        return None
+    where = "同一欄" if amb.get("same_field") else "不同欄位"
+    excimer_effect = ("key 1850159＋療程 1，身份不動" if label == "F1"
+                      else "身份設 01，不 key 51019")
+    text = (f"這位病人的處置{where}同時有 UVB 與 Excimer 醫令，\n"
+            f"程式無法判斷本次要做哪一個。\n\n"
+            f"按「是」＝自費 Excimer（更新 Excimer 劑量；{excimer_effect}）\n"
+            f"按「否」＝健保 UVB（更新 UVB 劑量；key 51019＋療程）\n"
+            f"按「取消」＝停止，由醫師手動處理")
+    try:
+        import winsound
+        winsound.MessageBeep(0x30)
+    except Exception:
+        pass
+    # MB_ICONQUESTION(0x20)|MB_YESNOCANCEL(0x3)|MB_TOPMOST|MB_SETFOREGROUND|MB_DEFBUTTON3(0x200,預設取消)
+    flags = 0x20 | 0x3 | 0x40000 | 0x10000 | 0x200
+    try:
+        with _hotkey_awaiting_user_scope():
+            ans = ctypes.windll.user32.MessageBoxW(
+                amb.get("main") or 0, text, f"UVB 與 Excimer 同時存在 - {label}", flags)
+    except Exception:
+        logging.exception("[%s][phototherapy] 分流詢問視窗失敗", label)
+        return None
+    choice = {6: "excimer", 7: "uvb"}.get(ans)   # IDYES=6 / IDNO=7 / 其餘(取消/失敗)=None
+    logging.info("[%s][phototherapy] UVB/Excimer 並存(%s)→ 醫師選擇:%s",
+                 label, where, choice or "取消")
+    if choice is not None:
+        _photo_route_choice = {"main": amb.get("main"), "uvb": amb.get("uvb"),
+                               "exc": amb.get("exc"), "choice": choice}
+    return choice
+
+
 def _resolve_phototherapy_disposition(main_hwnd: int):
     """回 (memo_hwnd, kind),kind ∈ "uvb" / "pure_excimer" / "ambiguous" / "none"。
 
@@ -3381,11 +3434,13 @@ def _resolve_phototherapy_disposition(main_hwnd: int):
     字眼,也會被正確歸成 uvb 而參與歧義判斷,不會被別控件的舊 excimer 靜默搶走
     (Codex 審查連續抓到的誤分流類別)。"""
     from cmuh_common.uvb_dose import (
-        combine_phototherapy_kinds, detect_phototherapy_kind)
+        combine_phototherapy_kinds, detect_phototherapy_kind, needs_route_choice)
+    global _last_photo_ambiguity
     # [2026-06-23 user] 傳今天進去 → 日期早於 2 個月前的照光段落(極可能已暫停)分流時忽略,
     # 避免「本月 UVB + 一年多前舊 excimer」被誤判成 ambiguous 而卡住 F2(實機:圖二)。
     today = date.today()
     uvb_hwnd = exc_hwnd = 0
+    same_field = False
     kinds = []
     candidates, all_read = _collect_phototherapy_memos(main_hwnd)
     if not all_read:
@@ -3394,15 +3449,30 @@ def _resolve_phototherapy_disposition(main_hwnd: int):
     for hwnd, text in candidates:
         k = detect_phototherapy_kind(text, today)
         kinds.append(k)
-        if k in ("uvb", "uvb_generic") and not uvb_hwnd:
+        if k == "uvb" and needs_route_choice(text, today):
+            # [2026-10-29] 同一欄同時有本次 UVB 與進行中的 excimer(非同日搭配)→ 視同兩種並存
+            kinds.append("pure_excimer")
+            same_field = True
+            uvb_hwnd = uvb_hwnd or hwnd
+            exc_hwnd = exc_hwnd or hwnd
+        elif k in ("uvb", "uvb_generic") and not uvb_hwnd:
             uvb_hwnd = hwnd   # 泛稱光療也記為 UVB 更新目標(只有泛稱時 combine 會收斂成 uvb)
         elif k == "pure_excimer" and not exc_hwnd:
             exc_hwnd = hwnd
     combined = combine_phototherapy_kinds(kinds)
     if combined == "ambiguous":
+        _last_photo_ambiguity = {"main": main_hwnd, "uvb": uvb_hwnd,
+                                 "exc": exc_hwnd, "same_field": same_field}
+        choice = _photo_route_choice
+        if (choice is not None and choice["main"] == main_hwnd
+                and choice["uvb"] == uvb_hwnd and choice["exc"] == exc_hwnd):
+            # 醫師本次已在視窗裡選過 → 之後所有重新分流(寫前快照、身份目標核對)都照那個選擇
+            if choice["choice"] == "excimer":
+                return exc_hwnd, "pure_excimer"
+            return uvb_hwnd, "uvb"
         logging.warning(
-            "[Excimer] 同時偵測到 UVB(hwnd=%s)與 Excimer(hwnd=%s)於不同欄位 "
-            "→ ambiguous", uvb_hwnd, exc_hwnd)
+            "[Excimer] 同時偵測到 UVB(hwnd=%s)與 Excimer(hwnd=%s)%s → ambiguous",
+            uvb_hwnd, exc_hwnd, "於同一欄" if same_field else "於不同欄位")
         return uvb_hwnd, "ambiguous"
     if combined == "uvb":
         return uvb_hwnd, "uvb"
@@ -3667,7 +3737,8 @@ def _write_excimer_memo_checked(main_hwnd: int, memo_hwnd: int, original: str,
 def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
                             label: str = "F2", *,
                             memo_port: HisMemoPort | None = None,
-                            identity_anchor: _ExcimerIdentityAnchor | None = None):
+                            identity_anchor: _ExcimerIdentityAnchor | None = None,
+                            route: str | None = None):
     """[2026-06-19] 純自費 Excimer:把 excimer 劑量行更新(次數+1、日期→今天、劑量
     decay/加量並 cap 在 MAX,跟 UVB 一樣)後,回 _F23_PURE_EXCIMER(caller 設身份=01、
     跳過 51019/療程)。
@@ -3677,7 +3748,8 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
     不設身份(同一般 UVB),但保留「分流=純 excimer」結論供 F1 矛盾警告([UD-14])。"""
     try:
         from cmuh_common.uvb_dose import UvbAction, update_uvb_in_text
-        result = update_uvb_in_text(text)
+        # route="excimer":醫師在並存視窗選了 Excimer → 只動 excimer 行(同欄的 UVB 行不動)
+        result = update_uvb_in_text(text, route=route)
         if result.action == UvbAction.UPDATED and result.new_text:
             write_status = _write_excimer_memo_checked(
                 main_hwnd, memo_hwnd, text, result, label,
@@ -3718,7 +3790,7 @@ def _f23_pure_excimer_update(main_hwnd: int, memo_hwnd: int, text: str,
             check_stop()
             if _confirmed:
                 result = update_uvb_in_text(
-                    text, skip_dose_sanity=True, skip_stale_check=True)
+                    text, skip_dose_sanity=True, skip_stale_check=True, route=route)
                 if result.action == UvbAction.UPDATED and result.new_text:
                     write_status = _write_excimer_memo_checked(
                         main_hwnd, memo_hwnd, text, result, label,
@@ -3807,17 +3879,32 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
     memo_hwnd, photo_kind = (
         memo_port.locate_phototherapy(main_hwnd) if memo_port is not None
         else _resolve_phototherapy_disposition(main_hwnd))
-    # [2026-06-18] UVB 與 excimer 分屬不同控件 → 無法自動判斷本次是健保 UVB 還是自費
-    # Excimer → 一律警告並中止,交醫師手動(billing 風險方向都很糟,寧可不自動動作)。
+    # [2026-06-18] UVB 與 excimer 並存 → 無法自動判斷本次是健保 UVB 還是自費 Excimer。
+    # [2026-10-29 使用者定案] 不再一律中止:跳視窗讓醫師選(F1 在 key 醫令前已問過,
+    # 這裡的重新分流會直接照那個選擇,不會再問)。取消 → 停止,交醫師手動。
+    photo_route_forced = None
     if photo_kind == "ambiguous":
-        logging.warning(
-            "[%s][Excimer] UVB 與 Excimer 分屬不同欄位 → 無法自動分流,中止", label)
-        _show_uvb_warning(
-            main_hwnd, "照光分流無法判斷",
-            "處置/病歷同時偵測到 UVB 與 Excimer,且分屬不同欄位,\n"
-            "無法自動判斷本次是健保 UVB 還是自費 Excimer。\n\n"
-            f"{label} 已停止自動處理 — 請醫師手動下醫令並確認身份別。")
-        return False
+        choice = _ask_photo_route(label)
+        check_stop()
+        if choice is None:
+            logging.info("[%s][phototherapy] 醫師取消 UVB/Excimer 選擇 → 停止", label)
+            return False
+        memo_hwnd, photo_kind = (
+            memo_port.locate_phototherapy(main_hwnd) if memo_port is not None
+            else _resolve_phototherapy_disposition(main_hwnd))
+        if photo_kind == "ambiguous":
+            logging.warning("[%s][phototherapy] 已選 %s 但重新分流仍無法套用 → 停止",
+                            label, choice)
+            _show_uvb_warning(
+                main_hwnd, "照光分流無法判斷",
+                "處置同時有 UVB 與 Excimer，但無法套用剛才的選擇"
+                "(處置欄可能已變動)。\n\n"
+                f"{label} 已停止自動處理 — 請醫師手動下醫令並確認身份別。")
+            return False
+        photo_route_forced = choice
+    elif (_photo_route_choice is not None
+          and _photo_route_choice.get("main") == main_hwnd):
+        photo_route_forced = _photo_route_choice["choice"]   # F1 事先問過
     if photo_kind == "unknown":
         logging.warning("[%s][UVB] 照光欄位搜尋不完整，不能當作沒有 UVB", label)
         _show_uvb_warning(
@@ -3887,7 +3974,8 @@ def _update_uvb_dose_core(label: str, *, strict: bool,
         try:
             return _f23_pure_excimer_update(
                 main_hwnd, memo_hwnd, text, label, memo_port=memo_port,
-                identity_anchor=identity_anchor)
+                identity_anchor=identity_anchor,
+                route="excimer" if photo_route_forced == "excimer" else None)
         except SubsystemInterrupted:
             if label == "F1":
                 _show_uvb_warning(
@@ -4327,6 +4415,7 @@ def _f23_update_uvb_dose(
       _F23_PURE_EXCIMER → 純自費 Excimer:caller 應設身份=01、跳過 51019/療程。
       True             → 正常,caller 續跑 51019/療程。
     """
+    _reset_photo_route_choice()   # 醫師的 UVB/Excimer 選擇只在本次熱鍵有效
     return _update_uvb_dose_core(
         label, strict=True, identity_anchor_out=identity_anchor_out)
 
@@ -4424,9 +4513,19 @@ def script_F1_adaptive():
     (見 _f1_pure_excimer);未來會改 key 另一個醫令(待確認)。F2/F3 維持身份01。
     """
     logging.info("--- Executing F1 (照光 1) ---")
+    _reset_photo_route_choice()   # 醫師的 UVB/Excimer 選擇只在本次熱鍵有效
     # F1 是「先 51019 後 UVB」,所以要在 key 51019 【之前】先判斷照光走向。
     # 分流讀取不明時不可先下 51019，以免純自費 Excimer 被誤作健保 UVB。
     f1_route = _f1_phototherapy_route(label="F1")
+    if f1_route == "ambiguous":
+        # [2026-10-29 使用者定案] 並存 → 在 key 任何醫令【之前】問醫師;選了之後後段的
+        # 重新分流(_update_uvb_dose_core)會照這個選擇走,不會再問。
+        choice = _ask_photo_route("F1")
+        check_stop()
+        if choice is None:
+            logging.info("F1: 醫師取消 UVB/Excimer 選擇 → 醫令與療程皆未輸入")
+            return False
+        f1_route = "pure_excimer" if choice == "excimer" else "normal"
     if f1_route == "unknown":
         logging.warning("F1: 照光分流讀取不明 → 醫令與療程皆未輸入")
         _show_uvb_warning(
@@ -4434,14 +4533,6 @@ def script_F1_adaptive():
             "HIS 視窗或照光處置欄無法完整讀取，不能確認本次是健保 UVB "
             "或純自費 Excimer。\n\n"
             "F1 未輸入醫令或療程，也未更新劑量；請醫師核對後手動處理。")
-        return False
-    if f1_route == "ambiguous":
-        logging.warning("F1: UVB 與 Excimer 分屬不同欄位 → 中止,交醫師手動")
-        _show_uvb_warning(
-            0, "照光分流無法判斷",
-            "處置/病歷同時偵測到 UVB 與 Excimer,且分屬不同欄位,\n"
-            "無法自動判斷本次是健保 UVB 還是自費 Excimer。\n\n"
-            "F1 已停止 — 請醫師手動下醫令並確認身份別。")
         return False
     if f1_route == "pure_excimer":
         return _f1_pure_excimer(label="F1")
