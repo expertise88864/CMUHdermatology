@@ -148,3 +148,16 @@ class TestHeldLines:
     def test_a_single_held_line_is_not_updated(self):
         r = u.update_uvb_in_text(self.HELD, TODAY)
         assert r.action != u.UvbAction.UPDATED and r.new_text is None
+
+
+def test_a_held_line_after_wrapped_old_history_does_not_revive_it():
+    """[外審 PR #13 第 3 輪] 暫停行的佔位不可擋住「舊 excimer 日期續行」的接合。"""
+    t = ("excimer light 890 mj/cm2 for upper lip (24)\r\n"
+         "on (2024/12/09), add 50 each time, fixed at 950 -> hold\r\n"
+         "excimer neck 600 mj/cm2 on (2026/10/27) add 30 each time, MAX 1000 -> hold")
+    assert u.detect_phototherapy_kind(t, TODAY) == "none"
+    masked, _ = u._mask_held_photo_lines(t)          # 更新路徑的副本(帶佔位)也一樣
+    assert u.detect_phototherapy_kind(masked, TODAY) == "none"
+    uvb = "UVB 500 mj/cm2 (5) on (2026/10/27) add 30 each time, MAX 1000"
+    assert u.combine_phototherapy_kinds([u.detect_phototherapy_kind(uvb, TODAY),
+                                         u.detect_phototherapy_kind(t, TODAY)]) == "uvb"

@@ -744,10 +744,13 @@ def _is_held_chain_placeholder(line: str) -> bool:
     return bool(body) and not body.strip(_HELD_KEEP_CHAIN)
 
 
-def _mask_held_photo_lines(text: str) -> tuple:
+def _mask_held_photo_lines(text: str, keep_chain: bool = True) -> tuple:
     """暫停中的照光行換成【等長】遮罩(換行原樣保留)→ (遮罩後全文, 被遮的行號)。
     等長是為了讓所有以 offset/span 計的結果(含 uncertain triplets)仍對得上原文。
-    excimer 行/續行用 _HELD_KEEP_CHAIN(保留多段延續),其餘用空白。"""
+    excimer 行/續行用 _HELD_KEEP_CHAIN(保留多段延續),其餘用空白。
+    keep_chain=False(分流副本用):一律空白 —— [外審 PR #13 第 3 輪] 分流的舊日期續行接合
+    (_join_stale_excimer_date_continuations)會把非空白的佔位當成「不明的後續內容」而拒絕
+    接回舊日期,讓已停掉的舊 excimer 變成「無日期進行中」→ 誤判 pure_excimer/ambiguous。"""
     if not text:
         return text or "", []
     lines = _split_keep_line_ends(text)
@@ -758,7 +761,7 @@ def _mask_held_photo_lines(text: str) -> tuple:
             held.append(i)
             excimer_like = bool(_EXCIMER_MARKER_RE.search(body)
                                 or _looks_like_excimer_continuation(body))
-            fill = _HELD_KEEP_CHAIN if excimer_like else " "
+            fill = _HELD_KEEP_CHAIN if (keep_chain and excimer_like) else " "
             lines[i] = fill * len(body) + line[len(body):]
     return ("".join(lines) if held else text), held
 
@@ -985,7 +988,8 @@ def detect_phototherapy_kind(text: str, today: Optional[date] = None,
     [2026-06-23] 傳入 today 時,先濾掉『日期早於 today - stale_months 個月』的照光行
     (見 strip_stale_phototherapy_segments)—— 那段照光極可能已暫停,不該拿來判斷本次身份別。
     """
-    t, _held = _mask_held_photo_lines(text or "")   # 暫停中的照光行不算(見 _is_held_photo_line)
+    t, _held = _mask_held_photo_lines(text or "", keep_chain=False)   # 暫停中的照光行不算(見 _is_held_photo_line)
+    t = t.replace(_HELD_KEEP_CHAIN, " ")   # 更新路徑傳進來的副本可能已帶佔位 → 分流一律當空白
     if today is not None:
         t = strip_stale_phototherapy_segments(t, today, stale_months)
         # [2026-06-29 Codex r8] 近期 excimer 在場時,連 1-2 個月前的舊 UVB 也忽略(與 update 的
