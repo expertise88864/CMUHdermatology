@@ -975,6 +975,8 @@ def _routing_view(text: str, today: Optional[date],
     return t
 
 
+# 治療名稱(不含泛稱 phototherapy/光療):往前找病史字眼的起點只用它
+_TREATMENT_NAME_RE = re.compile(r"(?:UVB|紫外線|\bUV\b|excime|準分子)", re.IGNORECASE)
 _COMPOUND_NAME_GAP_RE = re.compile(r"[\s:：\-]*")
 
 
@@ -1024,8 +1026,10 @@ def needs_route_choice(text: str, today: Optional[date] = None,
             # 時,整行日期會含 UVB 的日期 → 誤判成同日搭配而不問。段 = 本 marker 到下一個照光字眼。
             seg_end = _excimer_segment_end(line, marker)
             seg = line[marker.start():seg_end]
-            # 病史字眼常寫在 excimer 前面('previous excimer 700 …')→ 從上一個照光字眼之後算起
-            prev_end = max((m.end() for m in _PHOTO_ANY_RE.finditer(line, 0, marker.start())),
+            # 病史字眼常寫在 excimer 前面('previous excimer 700 …'、'Previous phototherapy: excimer
+            # 700 …')→ 從上一個【治療名稱】(UVB/excimer)之後算起;泛稱 phototherapy 常是病史標題的
+            # 一部分,不可當起點(外審 PR #14 第 4 輪:會把 Previous 切掉)。
+            prev_end = max((m.end() for m in _TREATMENT_NAME_RE.finditer(line, 0, marker.start())),
                            default=0)
             dose = _find_excimer_dose(line, marker.end())
             if (_EXCIMER_HISTORY_HINT_RE.search(line[prev_end:seg_end]) or dose is None

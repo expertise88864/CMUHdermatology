@@ -33,6 +33,8 @@ class TestNeedsRouteChoice:
         (UVB_1027 + CRLF + "excimer 700 mj/cm2 on (2026/9/10) add 30 each, MAX 900", False),
         # 病史提到 excimer
         (UVB_1027 + CRLF + "previous excimer 700 mj/cm2 add 30 each, MAX 900", False),
+        # [外審 PR #14 第 4 輪] 病史標題中間夾泛稱 phototherapy
+        (UVB_1027 + CRLF + "Previous phototherapy: excimer 700 mj/cm2 add 30 each, MAX 900", False),
         (HELD + CRLF + UVB, False),            # 只有暫停中的 excimer
         (EXC, False),                          # 沒有 UVB
         (UVB, False),
