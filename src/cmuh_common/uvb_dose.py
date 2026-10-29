@@ -732,9 +732,22 @@ def _split_keep_line_ends(text: str) -> list:
     return re.findall(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+$", text)
 
 
+# [外審 PR #13 第 2 輪] 暫停的【excimer 行/續行】不能遮成空白:_update_excimer_lines 把空行
+# 當「這筆 excimer 醫令到此結束」,暫停行後面仍在做的續行('back 700mj/cm2 …')就會被漏掉
+# (甚至把原本該擋下的「距上次太近」變成照常寫回)。改填這個私用字元:多段 excimer 迴圈
+# 看到它就跳過該行、但保留延續關係;它不是 \w/\s/數字,其他規則都不會把它當內容。
+_HELD_KEEP_CHAIN = ""
+
+
+def _is_held_chain_placeholder(line: str) -> bool:
+    body = line.rstrip("\r\n")
+    return bool(body) and not body.strip(_HELD_KEEP_CHAIN)
+
+
 def _mask_held_photo_lines(text: str) -> tuple:
-    """暫停中的照光行換成【等長空白】(換行原樣保留)→ (遮罩後全文, 被遮的行號)。
-    等長是為了讓所有以 offset/span 計的結果(含 uncertain triplets)仍對得上原文。"""
+    """暫停中的照光行換成【等長】遮罩(換行原樣保留)→ (遮罩後全文, 被遮的行號)。
+    等長是為了讓所有以 offset/span 計的結果(含 uncertain triplets)仍對得上原文。
+    excimer 行/續行用 _HELD_KEEP_CHAIN(保留多段延續),其餘用空白。"""
     if not text:
         return text or "", []
     lines = _split_keep_line_ends(text)
@@ -743,7 +756,10 @@ def _mask_held_photo_lines(text: str) -> tuple:
         body = line.rstrip("\r\n")
         if _is_held_photo_line(body):
             held.append(i)
-            lines[i] = " " * len(body) + line[len(body):]
+            excimer_like = bool(_EXCIMER_MARKER_RE.search(body)
+                                or _looks_like_excimer_continuation(body))
+            fill = _HELD_KEEP_CHAIN if excimer_like else " "
+            lines[i] = fill * len(body) + line[len(body):]
     return ("".join(lines) if held else text), held
 
 
@@ -1778,6 +1794,8 @@ def _update_excimer_lines(text: str, today: date,
         # 可共用句尾);無 marker 但結構完整(dose+increase+MAX)且緊接 excimer 段的續行也視為延續。
         last_seg_was_excimer = False
         for index, line in enumerate(lines):
+            if _is_held_chain_placeholder(line):
+                continue   # 暫停中的 excimer 行:不改,但不中斷前後的延續(見 _HELD_KEEP_CHAIN)
             markers = list(_EXCIMER_MARKER_RE.finditer(line))
             if markers:
                 segments = [
@@ -2410,9 +2428,10 @@ def update_uvb_in_text(text: str, today: Optional[date] = None,
     if not held or result.new_text is None:
         return result
     original_lines = _split_keep_line_ends(text)
+    masked_lines = _split_keep_line_ends(masked)
     new_lines = _split_keep_line_ends(result.new_text)
     if len(new_lines) != len(original_lines) or any(
-            new_lines[i].rstrip("\r\n").strip() for i in held):
+            new_lines[i].rstrip("\r\n") != masked_lines[i].rstrip("\r\n") for i in held):
         # 遮掉的行數對不上/被寫進東西 → 不可能安全放回,整次不寫(交醫師)
         return UvbUpdateResult(
             action=UvbAction.SANITY_FAIL, uvb_line_count=result.uvb_line_count,

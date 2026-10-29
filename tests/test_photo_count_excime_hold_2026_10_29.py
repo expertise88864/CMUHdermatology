@@ -120,6 +120,31 @@ class TestHeldLines:
         assert not u._is_held_photo_line(
             "scalp 600mj/cm2 (20) on (2026/10/27) add 30 each time, MAX 1000 -> hold -> 600 on (2026/10/27)")
 
+    @pytest.mark.parametrize("back_date, expect", [
+        ("2026/10/27", "updated"),       # 暫停行後面仍在做的續行照常更新
+        ("2026/10/28", "too_close"),     # 昨天照過 → 整次仍要擋下(不可因暫停行而漏看)
+    ])
+    def test_active_continuations_after_a_held_one_keep_their_context(self, back_date, expect):
+        """[外審 PR #13 第 2 輪] 暫停行遮成空白會切斷多段 excimer 的延續。"""
+        memo = ("excime cheek 500mj/cm2 (10) on (2026/10/27) add 30 each time, MAX 1000\r\n"
+                "scalp 600mj/cm2 (20) on (2026/10/27) add 30 each time, MAX 1000 -> hold\r\n"
+                f"back 700mj/cm2 (30) on ({back_date}) add 30 each time, MAX 1000")
+        r = u.update_uvb_in_text(memo, TODAY)
+        if expect == "too_close":
+            assert r.action == u.UvbAction.TOO_CLOSE and r.new_text is None
+            return
+        assert r.action == u.UvbAction.UPDATED
+        changed = _changed(memo, r.new_text)
+        assert sorted(changed) == [0, 2]
+        assert "730mj/cm2 (31) on (2026/10/29)" in changed[2]
+        assert r.new_text.split("\r\n")[1] == memo.split("\r\n")[1]
+
+    def test_the_placeholder_never_reaches_the_written_text(self):
+        memo = ("excimer cheek 500mj/cm2 (10) on (2026/10/27) add 30 each time, MAX 1000\r\n"
+                + self.HELD)
+        r = u.update_uvb_in_text(memo, TODAY)
+        assert r.new_text is not None and u._HELD_KEEP_CHAIN not in r.new_text
+
     def test_a_single_held_line_is_not_updated(self):
         r = u.update_uvb_in_text(self.HELD, TODAY)
         assert r.action != u.UvbAction.UPDATED and r.new_text is None
