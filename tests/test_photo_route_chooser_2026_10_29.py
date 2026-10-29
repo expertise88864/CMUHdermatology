@@ -42,6 +42,9 @@ class TestNeedsRouteChoice:
         # [外審 PR #14 第 2 輪] 複合名稱 'excimer phototherapy' 不可被 phototherapy 切斷
         (UVB_1026 + CRLF + "excimer phototherapy 540 mj/cm2 on (2026/10/27) add 40 each, MAX 800",
          True),
+        # [外審 PR #14 第 3 輪] 但後面另起的 Phototherapy 醫令仍是另一段:它的日期不可算給 excimer
+        (UVB_1026 + CRLF + "excimer 540 mj/cm2 add 40 each, MAX 800; "
+         "Phototherapy 600 mj/cm2 (7) on (2026/10/26) add 30 each time, MAX 1000", True),
     ])
     def test_cases(self, text, want):
         assert u.needs_route_choice(text, TODAY) is want

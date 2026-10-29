@@ -975,8 +975,21 @@ def _routing_view(text: str, today: Optional[date],
     return t
 
 
-# 分段用的治療名稱(不含泛稱 phototherapy/光療:它常是 'excimer phototherapy' 這種複合名稱的一部分)
-_TREATMENT_NAME_RE = re.compile(r"(?:UVB|紫外線|\bUV\b|excime|準分子)", re.IGNORECASE)
+_COMPOUND_NAME_GAP_RE = re.compile(r"[\s:：\-]*")
+
+
+def _excimer_segment_end(line: str, marker) -> int:
+    """這一段 excimer 醫令到哪裡結束 = 下一個照光字眼(另一個醫令)的開頭。
+
+    [外審 PR #14 第 2/3 輪] 緊接在 excimer 名稱後面的泛稱('excimer phototherapy 540 …')是
+    同一個醫令名稱的一部分,不算邊界;但其他位置的 'Phototherapy 600 … (7) on (…)' 是另一個
+    獨立醫令(parse_uvb_line 也認它),仍是邊界 —— 否則它的日期會被算成 excimer 的日期。"""
+    for m in _PHOTO_ANY_RE.finditer(line, marker.end()):
+        if (_PT_GENERIC_RE.fullmatch(m.group(0))
+                and _COMPOUND_NAME_GAP_RE.fullmatch(line[marker.end():m.start()])):
+            continue          # 複合名稱的一部分
+        return m.start()
+    return len(line)
 
 
 def mentions_treatment(text: str, kind: str) -> bool:
@@ -1009,13 +1022,10 @@ def needs_route_choice(text: str, today: Optional[date] = None,
         for marker in _EXCIMER_MARKER_RE.finditer(line):
             # [外審 PR #14 第 1 輪] 只看【這一段 excimer】自己的日期:同一行先寫 UVB 再寫 excimer
             # 時,整行日期會含 UVB 的日期 → 誤判成同日搭配而不問。段 = 本 marker 到下一個照光字眼。
-            # [外審 PR #14 第 2 輪] 邊界只認【另一種治療的名稱】(UVB / excimer),不認泛稱
-            # 'phototherapy/光療' —— 'excimer phototherapy 540 mj/cm2 …' 是同一個醫令名稱。
-            nxt = _TREATMENT_NAME_RE.search(line, marker.end())
-            seg_end = nxt.start() if nxt else len(line)
+            seg_end = _excimer_segment_end(line, marker)
             seg = line[marker.start():seg_end]
-            # 病史字眼常寫在 excimer 前面('previous excimer 700 …')→ 從上一個治療名稱之後算起
-            prev_end = max((m.end() for m in _TREATMENT_NAME_RE.finditer(line, 0, marker.start())),
+            # 病史字眼常寫在 excimer 前面('previous excimer 700 …')→ 從上一個照光字眼之後算起
+            prev_end = max((m.end() for m in _PHOTO_ANY_RE.finditer(line, 0, marker.start())),
                            default=0)
             dose = _find_excimer_dose(line, marker.end())
             if (_EXCIMER_HISTORY_HINT_RE.search(line[prev_end:seg_end]) or dose is None
