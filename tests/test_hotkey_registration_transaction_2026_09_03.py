@@ -54,6 +54,9 @@ class _FakeKeyboard:
     def on_release_key(self, key, callback, suppress=False):
         return self.add_hotkey(key, lambda: callback(None), suppress, trigger_on_release=True)
 
+    def on_press_key(self, key, callback, suppress=False):
+        return self.add_hotkey(key, lambda: callback(None), suppress)
+
     def unhook_all(self):
         self.events.append(("unhook_all",))
         if self.unhook_all_raises:
@@ -115,6 +118,8 @@ def _app(monkeypatch, kb):
     app.root = _Root(events)
     app.interrupt_automation = lambda: actions.append("F12")
     app.run_subsystem_in_thread = lambda f, n, **k: actions.append(n)
+    # 修飾鍵狀態改由 OS 讀(GetAsyncKeyState);測試固定為「沒按」,不受跑測試的機器影響。
+    app._hotkey_modifier_reader = lambda: False
 
     def _fake_install():
         events.append(("install_abbrev",))
@@ -601,3 +606,135 @@ def test_clinical_worker_guard_preserves_results(monkeypatch, result):
     assert queued[0]() is result
     app.val_out_of_hospital = True
     assert queued[0]() is False
+
+
+# ─── [2026-11-03] 熱鍵「有時沒反應、要重啟才恢復」的三個成因 ───────────────────
+
+def _real_keyboard(monkeypatch):
+    """真的 keyboard 套件 listener(不掛 OS hook),F 鍵 scan code = 58 + 編號。"""
+    import keyboard as kb
+    monkeypatch.setattr(kb._os_keyboard, 'init', lambda: None)
+    listener = kb._KeyboardListener()
+    listener.init()
+    monkeypatch.setattr(listener, 'start_if_necessary', lambda: None)
+    monkeypatch.setattr(kb, '_listener', listener)
+    monkeypatch.setattr(kb, '_pressed_events', {})
+    monkeypatch.setattr(kb, '_logically_pressed_keys', {})
+    monkeypatch.setattr(kb, '_hotkeys', {})
+    monkeypatch.setattr(kb, '_hooks', {})
+    monkeypatch.setattr(kb, 'events', [], raising=False)
+    monkeypatch.setattr(kb, 'key_to_scan_codes', lambda key: (int(str(key).lower().removeprefix('f')) + 58,))
+    monkeypatch.setattr(kb, 'is_modifier', lambda _: False)
+    return kb, listener
+
+
+def _dispatch(kb, listener, scan_code, name):
+    events = [kb.KeyboardEvent(kind, scan_code, name) for kind in (kb.KEY_DOWN, kb.KEY_UP)]
+    for event in events:
+        listener.direct_callback(event)
+    for event in events:
+        listener.pre_process_event(event)
+
+
+def test_f1_still_fires_when_a_key_up_was_lost(monkeypatch):
+    """鎖定螢幕/UAC/遠端桌面切換時漏收某鍵(例:Win)的 KEY_UP → 該鍵永遠留在 keyboard
+    的按住表。舊的 add_hotkey 要「按住表整組 == (F1,)」,從此 F1 無聲失效到重啟。"""
+    kb, listener = _real_keyboard(monkeypatch)
+    app, actions = _app(monkeypatch, kb)
+    app.out_of_hospital_var = _Var(False)
+    app._hotkey_foreground_reader = lambda: (1, "TFopdmain")
+    app.setup_hotkeys()
+    kb._pressed_events[91] = kb.KeyboardEvent(kb.KEY_DOWN, 91, 'windows')  # 漏收的 KEY_UP
+    _dispatch(kb, listener, 59, 'f1')
+    _dispatch(kb, listener, 70, 'f12')
+    assert [a.split(':')[0] for a in actions] == ['F1', 'F12']
+
+
+def test_f1_ignored_while_a_modifier_is_really_held(monkeypatch):
+    """改用單鍵觸發後,Ctrl/Alt/Shift/Win+F1 仍不可執行(查 OS 實體狀態)。"""
+    kb = _FakeKeyboard()
+    app, actions = _app(monkeypatch, kb)
+    app._hotkey_foreground_reader = lambda: (1, "TFopdmain")
+    app.setup_hotkeys()
+    held = [True]
+    app._hotkey_modifier_reader = lambda: held[0]
+    _press(kb, 'F1')
+    assert actions == []
+    held[0] = False
+    _press(kb, 'F1')
+    assert len(actions) == 1 and actions[0].startswith('F1')
+
+
+def test_f12_abort_ignores_modifiers(monkeypatch):
+    kb = _FakeKeyboard()
+    app, actions = _app(monkeypatch, kb)
+    app._hotkey_foreground_reader = lambda: (1, "TFopdmain")
+    app.setup_hotkeys()
+    app._hotkey_modifier_reader = lambda: True
+    _press(kb, 'F12')
+    assert actions == ['F12']
+
+
+def test_a_callback_exception_never_reaches_the_keyboard_thread(monkeypatch, caplog):
+    """keyboard 的事件處理緒不攔例外:漏出去一次,所有熱鍵/縮寫/心跳一起死到重啟。"""
+    kb, listener = _real_keyboard(monkeypatch)
+    app, actions = _app(monkeypatch, kb)
+    app.out_of_hospital_var = _Var(False)
+    app._hotkey_foreground_reader = lambda: (1, "TFopdmain")
+
+    def _boom(f, n, **k):
+        raise RuntimeError("can't start new thread")
+    app.run_subsystem_in_thread = _boom
+    app.setup_hotkeys()
+    with caplog.at_level(logging.ERROR):
+        _dispatch(kb, listener, 66, 'f8')   # 不可拋出
+    assert "處理例外" in caplog.text
+    app.run_subsystem_in_thread = lambda f, n, **k: actions.append(n)
+    _dispatch(kb, listener, 66, 'f8')
+    assert len(actions) == 1 and actions[0].startswith('F8')
+
+
+def test_a_worker_that_cannot_start_releases_the_busy_flag(monkeypatch):
+    """running=True 已設、看門狗還沒起、wrapper 的 finally 不會跑 → 必須自己收回。"""
+    import queue
+    import threading
+    app = main.AutomationApp.__new__(main.AutomationApp)
+    app._subsystem_lock = threading.Lock()
+    app._subsystem_running = False
+    app._subsystem_token = 0
+    app._subsystem_current_hotkey = None
+    app._subsystem_thread_ident = None
+    app._subsystem_thread = None
+    app._restart_committing = False
+    app.ui_queue = queue.Queue()
+
+    class _NoThread:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(main.threading, "Thread", _NoThread)
+    app.run_subsystem_in_thread(lambda: True, "F1: 照光(1)")
+    assert app._subsystem_running is False
+    assert app._subsystem_current_hotkey is None
+
+
+def test_dead_hook_restart_uses_idle_measured_before_the_probe(monkeypatch):
+    """探針注入的 F24 會讓 Windows 閒置秒數歸零;探針之後才讀 → 永遠不會自動重啟。"""
+    kb = _FakeKeyboard()
+    app, _ = _app(monkeypatch, kb)
+    app._subsystem_running = False
+    app._hk_last_event_monotonic = 0.0
+    idle = {"sec": 120.0}
+
+    def _probe():
+        idle["sec"] = 0.5   # 注入的鍵算成使用者輸入
+        return False
+    app._probe_hotkey_hook_alive = _probe
+    monkeypatch.setattr(main, 'should_probe_hook_health', lambda _: True)
+    monkeypatch.setattr(main, 'is_hook_probe_failure_confirmed', lambda _: True)
+    monkeypatch.setattr(main, 'system_idle_seconds', lambda: idle["sec"])
+    app._restart_app = lambda: None
+    app._hotkey_health_tick()
+    assert (0, app._restart_app) in app.root.scheduled

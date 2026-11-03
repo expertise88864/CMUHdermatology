@@ -449,6 +449,35 @@ def _read_hotkey_foreground_window() -> tuple[int, str] | None:
     ctypes.windll.user32.GetClassNameW(hwnd, cls_buf, 64)
     return hwnd, cls_buf.value
 
+
+# [2026-11-03] F 鍵改以單鍵 scan code 觸發後,「只有單按才算」改查 OS 實體按鍵狀態:
+# Shift/Ctrl/Alt/左右 Win 任一按著就不是單按(與舊 add_hotkey 的組合鍵語意一致)。
+_HOTKEY_MODIFIER_VKS = (0x10, 0x11, 0x12, 0x5B, 0x5C)
+
+
+def _hotkey_modifier_held() -> bool:
+    """觸發當下是否實際按著 Ctrl/Alt/Shift/Win。讀不到 OS 狀態時視為沒按(不擋熱鍵)。"""
+    try:
+        get_state = ctypes.windll.user32.GetAsyncKeyState
+    except Exception:
+        return False
+    return any(get_state(vk) & 0x8000 for vk in _HOTKEY_MODIFIER_VKS)
+
+
+# 熱鍵被前景/修飾鍵守衛略過時的 INFO 紀錄節流(每鍵 30 秒一筆),讓「按了沒反應」在
+# 正式 log 看得到原因,又不會因連按洗版。
+_HOTKEY_SKIP_LOG_INTERVAL_SEC = 30.0
+_hotkey_skip_log_last: dict[str, float] = {}
+
+
+def _log_hotkey_skip(key_name: str, reason: str, *args: object) -> None:
+    now = time.monotonic()
+    if now - _hotkey_skip_log_last.get(key_name, float("-inf")) < _HOTKEY_SKIP_LOG_INTERVAL_SEC:
+        logging.debug("[hotkey] %s 未執行:" + reason, key_name, *args)
+        return
+    _hotkey_skip_log_last[key_name] = now
+    logging.info("[hotkey] %s 未執行:" + reason, key_name, *args)
+
 # 總覽門診表「本科主診間」:A101→A102→A103→A104→A105(自家固定診間)。語意:
 #   1) [2026-11-03 user] 醫師列一律在名字後標診間(例「沈冠宇(101診)」);這五間顯示時
 #      去掉 A 前綴(A101診→101診,與門診動態 101~105 一致),其餘診間照原字串顯示。
@@ -17183,7 +17212,21 @@ class AutomationApp:
         # 身分註冊改在 wrapper 內(其首個動作,token 守衛)完成 —— 見上,以消除
         # 「啟動→註冊」之間的搶占競態。此處只負責啟動。
         thread = threading.Thread(target=wrapper, name=f"{hotkey_name}_Thread", daemon=True)
-        thread.start()
+        try:
+            thread.start()
+        except Exception:
+            # [2026-11-03] running 已在上方設為 True,看門狗卻還沒啟動、wrapper 的 finally
+            # 也不會跑 → 不收回的話之後每支熱鍵都永遠「忙碌中」直到重啟。
+            with self._subsystem_lock:
+                if self._subsystem_token == subsystem_token:
+                    self._subsystem_running = False
+                    self._subsystem_thread = None
+                    self._subsystem_thread_ident = None
+                    self._subsystem_current_hotkey = None
+            logging.exception("[hotkey] %s 工作緒無法啟動,已收回忙碌旗標", hotkey_name)
+            put_ui_message(self.ui_queue, UiStatusMessage(
+                text=f'狀態: {hotkey_name} - 無法啟動，請再按一次'))
+            return
 
         # [stability][W1 2026-07-03] 硬上限看門狗：流程若卡住超過 HOTKEY_HARD_TIMEOUT_SEC，
         # wrapper 的 finally 跑不到 → _subsystem_running 永遠 True。
@@ -17376,12 +17419,13 @@ class AutomationApp:
                             self, "_hotkey_foreground_reader", _read_hotkey_foreground_window)
                         foreground = foreground_reader()
                         if foreground is None:
+                            _log_hotkey_skip(key_name, "讀不到前景視窗")
                             return
                         fg_hwnd, class_name = foreground
                         if class_name not in allow:
-                            logging.debug(
-                                "[hotkey] %s 觸發但前景=%r 不在 allow list %s → skip",
-                                key_name, class_name, tag)
+                            _log_hotkey_skip(
+                                key_name, "前景=%r 不在 allow list %s",
+                                class_name, tag)
                             return
                         # [L5 2026-07-09] #32770 是【任何程式】共用的 Windows 標準對話框 class;
                         # 只憑 class 放行會讓別的程式的對話框在前景時也能觸發 F9-F12(對 HIS 背景
@@ -17395,13 +17439,11 @@ class AutomationApp:
                             his_hwnd = find_his_window()
                             his_pid = get_window_pid(his_hwnd) if his_hwnd else 0
                             if not his_pid or get_window_pid(fg_hwnd) != his_pid:
-                                logging.debug(
-                                    "[hotkey] %s 前景 #32770 不屬 HIS 行程 → skip",
-                                    key_name)
+                                _log_hotkey_skip(key_name, "前景 #32770 不屬 HIS 行程")
                                 return
                     except Exception:
-                        logging.debug("[hotkey] 前景偵測失敗，保險 skip",
-                                       exc_info=True)
+                        _log_hotkey_skip(key_name, "前景偵測失敗(保險略過)")
+                        logging.debug("[hotkey] 前景偵測失敗細節", exc_info=True)
                         return
                     action_fn()
                 return _wrapped
@@ -17436,6 +17478,24 @@ class AutomationApp:
                             "[hotkey] %s 屬於未完整提交的註冊交易(txn=%s)→ 不執行",
                             key_name, txn)
                         return
+                    # [2026-11-03] keyboard 套件的事件處理緒不攔例外:任何 callback 拋出 →
+                    # 該緒結束,F1~F12、縮寫、心跳全部無聲失效到重啟。最外層一律攔下。
+                    try:
+                        callback()
+                    except Exception:
+                        logging.exception(
+                            "[hotkey] %s 處理例外(已攔下,其他熱鍵維持可用)", key_name)
+                return _gated
+
+            def _plain_key_gate(callback, key_name):
+                """F 鍵改用單鍵 scan code 觸發後,保留「只有單按才執行」:觸發當下 OS 回報
+                Ctrl/Alt/Shift/Win 有按著就略過(與舊 add_hotkey 的組合鍵語意一致)。"""
+                def _gated():
+                    modifier_reader = getattr(
+                        self, "_hotkey_modifier_reader", _hotkey_modifier_held)
+                    if modifier_reader():
+                        _log_hotkey_skip(key_name, "同時按著 Ctrl/Alt/Shift/Win")
+                        return
                     callback()
                 return _gated
 
@@ -17469,6 +17529,8 @@ class AutomationApp:
                     strict = key in STRICT_HOTKEYS
                     callback = _hotkey_guard(action, key, strict)
                 callback = _blackout_gate(callback, key)
+                if key != 'F7':
+                    callback = _plain_key_gate(callback, key)
                 callback = _txn_gate(callback, key)   # 最外層:未提交一律不執行
                 if key == 'F7':
                     # Non-suppressing add_hotkey release callbacks lose the released
@@ -17476,7 +17538,13 @@ class AutomationApp:
                     keyboard_backend.on_release_key(
                         key, lambda _event, action=callback: action(), suppress=False)
                 else:
-                    keyboard_backend.add_hotkey(key, callback, suppress=False)
+                    # [2026-11-03] 不用 add_hotkey:它要求「keyboard 記錄的按住鍵整組 ==
+                    # (F1,)」才觸發。鎖定螢幕/UAC/Ctrl+Alt+Del/遠端桌面切換常漏收某鍵的
+                    # KEY_UP,該鍵永遠留在套件的按住表 → 之後每次 F1 都被當成組合鍵,
+                    # 無聲失效到重啟。on_press_key 只比對本鍵 scan code;組合鍵由
+                    # _plain_key_gate 查 OS 實體狀態排除。
+                    keyboard_backend.on_press_key(
+                        key, lambda _event, action=callback: action(), suppress=False)
             if not his_disabled_reason:
                 # F12 (中止) 是救援鍵：自動化執行中不做前景限制；平常仍用寬鬆 guard。
                 f12_guarded = _hotkey_guard(
@@ -17491,11 +17559,10 @@ class AutomationApp:
                         return
                     f12_guarded()
 
-                keyboard_backend.add_hotkey(
-                    'F12',
-                    _txn_gate(_f12_callback, 'F12'),
-                    suppress=False,
-                )
+                # 中止鍵同樣不走 add_hotkey(理由同上);救援鍵不查修飾鍵,任何 F12 都可中止。
+                f12_action = _txn_gate(_f12_callback, 'F12')
+                keyboard_backend.on_press_key(
+                    'F12', lambda _event: f12_action(), suppress=False)
             # 全部適用熱鍵註冊成功才提交（院外／解析度不符僅 F7）。
             self._hotkey_txn_committed = _txn
             self._floating_hotkey_registered = True
@@ -17641,6 +17708,9 @@ class AutomationApp:
             self._hk_dead_strikes = 0
             return
 
+        # [2026-11-03] 閒置秒數必須在探針【之前】讀:探針以 SendInput 注入 F24,Windows
+        # 會把它算成使用者輸入、閒置歸零 → 之後讀永遠 < 30s,自動重啟條件永遠達不到。
+        idle = system_idle_seconds()
         # hook 安靜一段時間（可能只是沒人打字，也可能 hook 死了）→ 主動探針確認
         if self._probe_hotkey_hook_alive():
             self._hk_dead_strikes = 0
@@ -17651,7 +17721,6 @@ class AutomationApp:
         if not is_hook_probe_failure_confirmed(self._hk_dead_strikes):
             return  # 單次可能是暫態 race，等下一輪再確認
 
-        idle = system_idle_seconds()
         last_restart = getattr(self, '_hk_last_auto_restart_monotonic', 0.0)
         secs_since_restart = (now - last_restart) if last_restart else 1e9
         if should_auto_restart_for_dead_hook(
