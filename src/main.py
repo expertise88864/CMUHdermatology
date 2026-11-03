@@ -450,7 +450,9 @@ def _read_hotkey_foreground_window() -> tuple[int, str] | None:
     return hwnd, cls_buf.value
 
 # 總覽門診表「本科主診間」:A101→A102→A103→A104→A105(自家固定診間)。語意:
-#   1) 醫師列不另標這五間的診間號(免冗餘);其餘診間(他科借診/特殊)才顯示「(診間)」。
+#   1) [2026-11-03 user] 醫師列一律在名字後標診間(例「沈冠宇(101診)」);這五間顯示時
+#      去掉 A 前綴(A101診→101診,與門診動態 101~105 一致),其餘診間照原字串顯示。
+#      (取代 2026-06-19「本科主診間不標診間號」)
 #   2) 排序依此序在最前 → 本院其他診間 → 分院最後。
 # [2026-06-19] 院方診間改號(舊 181/182診 → A101/A102/A103診);此處只認門診表顯示用的實體診間字串。
 # [2026-06-29] 本科固定診擴為 5 間,加入 A104診、A105診 → 這兩診醫師不再被當他科借診誤標「(診間)」、
@@ -458,6 +460,13 @@ def _read_hotkey_foreground_window() -> tuple[int, str] | None:
 # 註:room 由 _RE_ROOM(ASCII 括號+英數)擷取,reg52 多年來都回半形(舊 \(\d+診\) 正常運作),
 #     故此處直接 exact match;若實機出現大小寫/全形變體再依實際字串調整(同 _RE_ROOM 維護點)。
 _OVERVIEW_PRIMARY_ROOMS = ("A101診", "A102診", "A103診", "A104診", "A105診")
+
+
+def _overview_room_label(room: str) -> str:
+    """總覽醫師列名字後的診間標示:本科主診間去 A 前綴,其餘照原字串。"""
+    if room in _OVERVIEW_PRIMARY_ROOMS:
+        return room[1:]
+    return room
 
 _RE_CLINIC_DOCTOR        = re.compile(r"醫師[：:]\s*(\S+)")
 _RE_CLINIC_CLOSED        = re.compile(r"\(已關診\)|（已關診）")
@@ -16217,8 +16226,8 @@ class AutomationApp:
                                 _suf = _EXT_BRANCH_DISPLAY_SUFFIX.get(ext_branch)
                                 if _suf:
                                     display_name += _suf
-                                elif room and room not in _OVERVIEW_PRIMARY_ROOMS:
-                                    display_name += f"({room})"
+                                elif room:
+                                    display_name += f"({_overview_room_label(room)})"
                                 if is_self_paid: display_name += "*"
                                 
                                 # 排序：(1) 非休診列優先，休診／無門診列一律置底

@@ -1238,8 +1238,8 @@ def test_re_room_matches_letter_prefixed_room():
 def test_overview_primary_rooms_a101_to_a105_and_no_legacy_181_182():
     """[2026-06-19 user] 總覽醫師門診表:本科主診間 A101→A102→A103診。
     [2026-06-29] 本科固定診擴為 5 間,加入 A104診、A105診。
-    這幾間自動隱藏診間號(自家診間免標)、排序排最前;其餘診間才顯示「(診間)」。
-    舊的 181診/182診 硬編碼(顯示隱藏 + 排序桶)必須移除,改用 _OVERVIEW_PRIMARY_ROOMS 常數。"""
+    這幾間排序排最前;舊的 181診/182診 硬編碼(排序桶)必須移除,改用 _OVERVIEW_PRIMARY_ROOMS 常數。
+    [2026-11-03 user] 醫師列一律標診間,本科主診間顯示去 A 前綴(見下一個測試)。"""
     source = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
     # 常數存在且正是 A101/A102/A103診(依序 → 決定排序桶)
     m = re.search(r"_OVERVIEW_PRIMARY_ROOMS\s*=\s*\(([^)]*)\)", source)
@@ -1249,9 +1249,25 @@ def test_overview_primary_rooms_a101_to_a105_and_no_legacy_181_182():
     # 舊的門診表硬編碼診間字串已不存在(避免回退到 181/182診)
     assert '"181診"' not in source
     assert '"182診"' not in source
-    # 顯示隱藏與排序都改用常數(不再硬編碼診間字串)
-    assert "room not in _OVERVIEW_PRIMARY_ROOMS" in source
+    # 排序改用常數(不再硬編碼診間字串)
     assert "room in _OVERVIEW_PRIMARY_ROOMS" in source
+
+
+def test_overview_doctor_row_always_shows_room():
+    """[2026-11-03 user] 總覽醫師列在名字後顯示診間,例「沈冠宇(101診)」:
+    本科主診間 A101~A105 顯示去 A 前綴(與門診動態 101~105 一致),其餘照原字串;
+    舊版「本科主診間不標診間號」的條件不得回來。"""
+    main_py = ROOT / "src" / "main.py"
+    source = main_py.read_text(encoding="utf-8")
+    ns = {"_OVERVIEW_PRIMARY_ROOMS": ("A101診", "A102診", "A103診", "A104診", "A105診")}
+    exec(_function_source(main_py, "_overview_room_label"), ns)
+    label = ns["_overview_room_label"]
+    assert [label(r) for r in ns["_OVERVIEW_PRIMARY_ROOMS"]] == [
+        "101診", "102診", "103診", "104診", "105診"]
+    assert label("G06診") == "G06診"
+    assert label("A108診") == "A108診"
+    assert "room not in _OVERVIEW_PRIMARY_ROOMS" not in source
+    assert 'display_name += f"({_overview_room_label(room)})"' in source
 
 
 def test_clinic_widget_mode_floating_only_no_appbar():
