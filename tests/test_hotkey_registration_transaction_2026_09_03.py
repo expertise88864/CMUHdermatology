@@ -57,6 +57,9 @@ class _FakeKeyboard:
     def on_press_key(self, key, callback, suppress=False):
         return self.add_hotkey(key, lambda: callback(None), suppress)
 
+    def hook_key(self, key, callback, suppress=False):
+        self.events.append(("hook_key", key, suppress))
+
     def unhook_all(self):
         self.events.append(("unhook_all",))
         if self.unhook_all_raises:
@@ -662,6 +665,37 @@ def test_f1_ignored_while_a_modifier_is_really_held(monkeypatch):
     assert actions == []
     held[0] = False
     _press(kb, 'F1')
+    assert len(actions) == 1 and actions[0].startswith('F1')
+
+
+def test_a_queued_ctrl_f1_is_judged_by_the_state_at_key_down(monkeypatch):
+    """[PR #16 審查 P1] 處理緒延遲時,Ctrl↓ F1↓ F1↑ Ctrl↑ 全部排進佇列後才處理:
+    那時 OS 已回報 Ctrl 放開 → 若在處理時才讀,會把 Ctrl+F1 誤當單按 F1 而寫 HIS。
+    修飾鍵狀態必須在 hook 執行緒(事件入佇列前)拍快照。"""
+    kb, listener = _real_keyboard(monkeypatch)
+    app, actions = _app(monkeypatch, kb)
+    app.out_of_hospital_var = _Var(False)
+    app._hotkey_foreground_reader = lambda: (1, "TFopdmain")
+    os_ctrl = {"down": False}
+    app._hotkey_modifier_reader = lambda: os_ctrl["down"]
+    app.setup_hotkeys()
+    queued = []
+
+    def _os_event(kind, scan_code, name):
+        event = kb.KeyboardEvent(kind, scan_code, name)
+        listener.direct_callback(event)   # hook 執行緒:只入佇列,不處理
+        queued.append(event)
+
+    os_ctrl["down"] = True
+    _os_event(kb.KEY_DOWN, 29, 'ctrl')
+    _os_event(kb.KEY_DOWN, 59, 'f1')
+    _os_event(kb.KEY_UP, 59, 'f1')
+    os_ctrl["down"] = False
+    _os_event(kb.KEY_UP, 29, 'ctrl')
+    for event in queued:                  # 處理緒延遲後才排空佇列
+        listener.pre_process_event(event)
+    assert actions == []
+    _dispatch(kb, listener, 59, 'f1')     # 之後單按 F1 照常執行
     assert len(actions) == 1 and actions[0].startswith('F1')
 
 

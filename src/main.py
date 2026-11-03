@@ -452,7 +452,9 @@ def _read_hotkey_foreground_window() -> tuple[int, str] | None:
 
 # [2026-11-03] F 鍵改以單鍵 scan code 觸發後,「只有單按才算」改查 OS 實體按鍵狀態:
 # Shift/Ctrl/Alt/左右 Win 任一按著就不是單按(與舊 add_hotkey 的組合鍵語意一致)。
+# 狀態在 hook 執行緒、事件入佇列前拍快照,存在事件物件的這個屬性上(見 setup_hotkeys)。
 _HOTKEY_MODIFIER_VKS = (0x10, 0x11, 0x12, 0x5B, 0x5C)
+_HOTKEY_MODIFIER_SNAPSHOT_ATTR = "cmuh_modifier_held"
 
 
 def _hotkey_modifier_held() -> bool:
@@ -17487,14 +17489,38 @@ class AutomationApp:
                             "[hotkey] %s 處理例外(已攔下,其他熱鍵維持可用)", key_name)
                 return _gated
 
+            def _read_modifier_held():
+                return bool(getattr(
+                    self, "_hotkey_modifier_reader", _hotkey_modifier_held)())
+
+            key_down = getattr(keyboard_backend, "KEY_DOWN", "down")
+
+            def _snapshot_modifiers(event):
+                """跑在 Windows LL hook 執行緒、事件入佇列之前(blocking_keys):記下按下
+                F 鍵那一刻的 OS 修飾鍵狀態。處理緒可能延遲(例:縮寫的 IME 查詢),到時候
+                才讀會把已經放開的 Ctrl+F1 誤當單按 F1。必須極快、一律回 True(不攔截按鍵)、
+                不可拋出。"""
+                if getattr(event, "event_type", None) == key_down:
+                    try:
+                        setattr(event, _HOTKEY_MODIFIER_SNAPSHOT_ATTR, _read_modifier_held())
+                    except Exception:
+                        pass
+                return True
+
             def _plain_key_gate(callback, key_name):
-                """F 鍵改用單鍵 scan code 觸發後,保留「只有單按才執行」:觸發當下 OS 回報
-                Ctrl/Alt/Shift/Win 有按著就略過(與舊 add_hotkey 的組合鍵語意一致)。"""
-                def _gated():
-                    modifier_reader = getattr(
-                        self, "_hotkey_modifier_reader", _hotkey_modifier_held)
-                    if modifier_reader():
-                        _log_hotkey_skip(key_name, "同時按著 Ctrl/Alt/Shift/Win")
+                """F 鍵改用單鍵 scan code 觸發後,保留「只有單按才執行」:按下那一刻
+                Ctrl/Alt/Shift/Win 有按著就略過(與舊 add_hotkey 的組合鍵語意一致)。
+                callback 已由 _txn_gate 包住、不會拋出;本層的判斷也自己攔例外。"""
+                def _gated(event=None):
+                    try:
+                        held = getattr(event, _HOTKEY_MODIFIER_SNAPSHOT_ATTR, None)
+                        if held is None:   # 沒有 hook 執行緒快照(不應發生)→ 退回現讀
+                            held = _read_modifier_held()
+                        if held:
+                            _log_hotkey_skip(key_name, "同時按著 Ctrl/Alt/Shift/Win")
+                            return
+                    except Exception:
+                        logging.exception("[hotkey] %s 修飾鍵判斷例外 → 本次不執行", key_name)
                         return
                     callback()
                 return _gated
@@ -17529,9 +17555,7 @@ class AutomationApp:
                     strict = key in STRICT_HOTKEYS
                     callback = _hotkey_guard(action, key, strict)
                 callback = _blackout_gate(callback, key)
-                if key != 'F7':
-                    callback = _plain_key_gate(callback, key)
-                callback = _txn_gate(callback, key)   # 最外層:未提交一律不執行
+                callback = _txn_gate(callback, key)   # 未提交一律不執行
                 if key == 'F7':
                     # Non-suppressing add_hotkey release callbacks lose the released
                     # key from the library's pressed-key table before dispatch.
@@ -17542,9 +17566,10 @@ class AutomationApp:
                     # (F1,)」才觸發。鎖定螢幕/UAC/Ctrl+Alt+Del/遠端桌面切換常漏收某鍵的
                     # KEY_UP,該鍵永遠留在套件的按住表 → 之後每次 F1 都被當成組合鍵,
                     # 無聲失效到重啟。on_press_key 只比對本鍵 scan code;組合鍵由
-                    # _plain_key_gate 查 OS 實體狀態排除。
+                    # _plain_key_gate 依 hook 執行緒拍下的 OS 修飾鍵快照排除。
+                    keyboard_backend.hook_key(key, _snapshot_modifiers, suppress=True)
                     keyboard_backend.on_press_key(
-                        key, lambda _event, action=callback: action(), suppress=False)
+                        key, _plain_key_gate(callback, key), suppress=False)
             if not his_disabled_reason:
                 # F12 (中止) 是救援鍵：自動化執行中不做前景限制；平常仍用寬鬆 guard。
                 f12_guarded = _hotkey_guard(
