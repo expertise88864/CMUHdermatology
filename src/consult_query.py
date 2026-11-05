@@ -9086,8 +9086,9 @@ def _claim_flag_file(path) -> bool:
     except OSError:
         key = str(path)
         now = time.monotonic()
-        last = _flag_claim_warned_at.get(key, 0.0)
-        if now - last >= _FLAG_CLAIM_WARN_INTERVAL_SEC:
+        # 預設不可用 0.0:monotonic 從開機起算,開機未滿節流間隔時第一筆會被吞掉。
+        last = _flag_claim_warned_at.get(key)
+        if last is None or now - last >= _FLAG_CLAIM_WARN_INTERVAL_SEC:
             _flag_claim_warned_at[key] = now
             logging.error(
                 "★旗標檔刪不掉,本次要求【不執行】★:%s —— 刪不掉卻照做的話,"

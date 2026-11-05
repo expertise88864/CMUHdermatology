@@ -26,6 +26,7 @@ import re
 import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -635,6 +636,31 @@ class TestFlagFilesAreClaimedNotObserved:
         for _ in range(20):
             cq._claim_flag_file(flag)
         assert len(seen) == 1, f"沒有節流(印了 {len(seen)} 次)"
+
+    @pytest.mark.parametrize("uptime", [1.0, 120.0, 299.0, 301.0, 86400.0])
+    def test_the_first_warning_is_not_lost_right_after_boot(
+            self, tmp_path, monkeypatch, uptime):
+        """monotonic 從開機起算:開機未滿節流間隔時,第一筆警告也要印出來。
+        之後仍依間隔節流,滿間隔才再印一次。"""
+        flag = tmp_path / "runnow.flag"
+        flag.write_text("x", encoding="utf-8")
+        monkeypatch.setattr(
+            cq.os, "unlink",
+            lambda _p: (_ for _ in ()).throw(PermissionError("x")))
+        seen = []
+        monkeypatch.setattr(cq.logging, "error",
+                            lambda *a, **k: seen.append(a))
+        clock = {"now": uptime}
+        monkeypatch.setattr(cq, "time", types.SimpleNamespace(
+            monotonic=lambda: clock["now"]))
+        cq._claim_flag_file(flag)
+        assert len(seen) == 1, f"開機 {uptime} 秒時第一筆警告被吞掉"
+        clock["now"] = uptime + cq._FLAG_CLAIM_WARN_INTERVAL_SEC - 1
+        cq._claim_flag_file(flag)
+        assert len(seen) == 1
+        clock["now"] = uptime + cq._FLAG_CLAIM_WARN_INTERVAL_SEC
+        cq._claim_flag_file(flag)
+        assert len(seen) == 2
 
     def test_the_scheduler_claims_both_flags(self):
         """★接線★ helper 沒有被呼叫的話,上面那些性質一件都不會發生。"""
