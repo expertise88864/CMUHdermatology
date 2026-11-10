@@ -40,6 +40,7 @@ from cmuh_common.roster.model import (
     ClerkBatch, Member, RosterParams, SolveContext, batches_covering, day_point,
     dedupe_codes, duplicated_codes, roc,
 )
+from cmuh_common.roster.session_leave import clerk_leave_days
 from cmuh_common.roster.solve_day import (
     TWO_PGY_PHOTO_ONLY, apply_locked_adjustments,
     arbitration_order, batch_biopsy_slots, biopsy_quota_warnings,
@@ -1470,7 +1471,7 @@ class RosterService:
             inp.clerk_batches, counts, only_ids=active & ended,
             base_ids={(b.id, c) for b in inp.clerk_batches
                       for c in clerk_full_attendance(
-                          inp, b, (inp.leaves.get("clerk") or {}))})
+                          inp, b, clerk_leave_days(inp))})
 
     def _course_seat_counts(self, ym: str, order, course_days=()) -> dict:
         """整梯的【跟診】次數,逐日以勝者梯次歸屬 → {(梯次 id, 代號): 次數}。
@@ -1728,7 +1729,7 @@ class RosterService:
             leavers |= {mid for mid, ds in (inp.leaves.get("external") or {}).items() if d in ds}
             for session, slots in (day_slots.get(iso) or {}).items():
                 from .session_leave import on_leave
-                session_leavers = leavers | {p for scope in ("external", "family")
+                session_leavers = leavers | {p for scope in ("clerk", "external", "family")
                     for p in inp.session_leaves.get(scope, {})
                     if on_leave(inp, scope, p, d, session)}
                 # 房號型別由 `clinic_closures` 統一正規化(規則只有一份)
@@ -2778,6 +2779,43 @@ class RosterService:
                         month["pgy_apply_pref"], "manual")
         self.update_month(ym, _mut)
 
+    def get_person_locks(self, ym: str) -> list:
+        """[2026-11-10 使用者] 「只排未鎖定人員」的勾選名單(存在該月份)。
+        只有按那個專用按鈕時才生效,一般「自動排班」不看它。"""
+        raw = self.storage.load_month(ym).get("person_locks") or []
+        return sorted({str(c) for c in raw if isinstance(c, str) and c.strip()})
+
+    def set_person_locks(self, ym: str, codes, *, baseline) -> list:
+        """存勾選名單;以開窗時的 `baseline` 三方合併(他機同時的修改不被蓋掉)。"""
+        edited = [str(c).strip() for c in (codes or []) if str(c).strip()]
+
+        def _mut(month):
+            if month.get("finalized"):
+                raise FinalizedMonthError(f"{ym} 已定案（唯讀）")
+            old = sorted({str(c) for c in (month.get("person_locks") or [])
+                          if isinstance(c, str)})
+            merged = sorted(merge_set_edit(old, baseline or [], edited))
+            month["person_locks"] = merged
+            self._audit(month, "day", f"{ym} person_locks", old, merged, "manual")
+            return merged
+        return self.update_month(ym, _mut)
+
+    def held_candidates(self, ym: str, *, today: "date | None" = None) -> dict:
+        """兩個固定按鈕的候選人(依身分分組)與「明天起有請假」的人。"""
+        from .held import _absent_at
+        inp = self.build_day_input(ym, today=today)
+        clerks = sorted({str(c) for b in inp.clerk_batches for c in b.members})
+        groups = [("PGY", sorted(str(c) for c in inp.pgy_roster)),
+                  ("Clerk", clerks),
+                  ("外訓", sorted(str(c) for c in inp.external_roster)),
+                  ("家醫科", sorted(str(c) for c in inp.family_roster))]
+        everyone = [c for _g, codes in groups for c in codes]
+        on_leave_later = sorted({
+            c for d in inp.grid if today is None or d > today
+            for s in ("上午", "下午") for c in everyone if _absent_at(inp, c, d, s)})
+        return {"groups": [(g, codes) for g, codes in groups if codes],
+                "on_leave": on_leave_later}
+
     def set_day_lock(self, ym: str, d: date, session: str, on: bool) -> bool:
         """把某(日,時段)設成鎖定/解鎖(鎖定後自動排班不重排該時段)。回傳新狀態。
 
@@ -3714,7 +3752,7 @@ class RosterService:
         """Atomically merge half-day edits, keeping legacy whole-day leave readable."""
         from .session_leave import SCOPES, SESSIONS, monthly_person_slots, parse_session_leaves
         if scope not in SCOPES:
-            raise ValueError("僅外訓及家醫科支援時段請假")
+            raise ValueError("僅 Clerk、外訓及家醫科支援時段請假")
         edited, base = set(slots), set(baseline)
         for values in (edited, base):
             parse_session_leaves(ym, {"session_leaves": {scope: {member_id: [

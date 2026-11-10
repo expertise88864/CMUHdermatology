@@ -5,7 +5,7 @@ from calendar import monthrange
 from datetime import date, timedelta
 
 from .held import held_codes, is_held
-from .session_leave import on_leave
+from .session_leave import clerk_leave_days, on_leave
 from .solve_day import REST, STUDENT_SESSIONS, arbitration_order, day_owner_batch, is_follow_slot
 
 
@@ -22,7 +22,7 @@ def clerk_month_caps(inp, batch):
     for p in batch.members:
         days = [batch.start_monday + timedelta(days=i) for i in range(CLERK_COURSE_DAYS)]
         days = [d for d in days if d.weekday() < 5 and d not in inp.holidays
-                and d not in inp.leaves.get("clerk", {}).get(p, set())
+                and d not in clerk_leave_days(inp).get(p, set())
                 and (not inp.course_clinic_days or d.isoformat() in inp.course_clinic_days)
                 and day_owner_batch(arbitration_order(inp), d) == batch]
         future = [d for d in days if d.isoformat()[:7] > inp.ym]
@@ -81,7 +81,7 @@ def refresh_clerk_warnings(inp, slots, warnings):
     warnings.extend(clerk_seat_uneven_warnings(
         inp.clerk_batches, counts, only_ids=solved & ended,
         base_ids={(b.id, p) for b in inp.clerk_batches
-                  for p in clerk_full_attendance(inp, b, inp.leaves.get("clerk", {}))}))
+                  for p in clerk_full_attendance(inp, b, clerk_leave_days(inp))}))
 
 
 def family_requirement_warnings(inp, slots):
@@ -247,6 +247,8 @@ def spread_clerk_days(inp, slots, *, control=None):
             placed = False
             for s in STUDENT_SESSIONS:
                 if s in inp.locked.get(d.isoformat(), {}):
+                    continue
+                if on_leave(inp, "clerk", p, d, s):       # 半天假
                     continue
                 held_here = held_codes(inp, d.isoformat(), s)
                 if p in held_here:

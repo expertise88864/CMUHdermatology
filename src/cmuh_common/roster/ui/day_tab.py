@@ -40,6 +40,8 @@ from cmuh_common.roster.ui.common import (
     bind_canvas_mousewheel, bind_hover_highlight, calendar_matrix, card_body_bg,
     guard_write,
 )
+from cmuh_common.roster.held import HELD_LOCAL, HELD_PEOPLE
+from cmuh_common.roster.service import HeldSpec
 from cmuh_common.roster.ui.duty import LeaveEditor
 from cmuh_common.roster.ui.doctor_follow import DoctorFollowStats
 
@@ -48,7 +50,7 @@ _TITLE = "PGY / Clerk / 外訓 / 家醫科 排班"
 _ORTOOLS_DEP = [(f"ortools=={ORTOOLS_PINNED_VERSION}", "ortools")]
 # [2026-07-24 UI] 閒置時狀態列＝操作提示（月曆格點擊選單原本無處可發現）。
 _IDLE_HINT = ("就緒｜月曆格：點擊＝編輯/鎖定選單；滾輪捲動（Shift+滾輪＝水平）"
-              "｜列表檢視：雙擊列＝編輯、選取後可按🔒")
+              "｜列表檢視：雙擊列＝編輯、選取後可按「鎖定/解鎖選取」")
 
 
 class _DaySolverRestartRequired(RuntimeError):
@@ -156,7 +158,14 @@ class DayScheduleTab(ttk.Frame):
         self._cancel_btn = ttk.Button(bar, text="取消排班", command=self._cancel_day_solve,
                                       state="disabled")
         self._cancel_btn.pack(side="left", padx=4)
-        self._lock_btn = ttk.Button(bar, text="🔒鎖定/解鎖選取",
+        # [2026-11-10 使用者] 人員固定的兩個按鈕(見 ui/held_dialog.py)
+        self._people_btn = ttk.Button(bar, text="只排未鎖定人員…",
+                                      command=self._on_held_people)
+        self._people_btn.pack(side="left", padx=4)
+        self._local_btn = ttk.Button(bar, text="局部重排（請假）…",
+                                     command=self._on_held_local)
+        self._local_btn.pack(side="left", padx=4)
+        self._lock_btn = ttk.Button(bar, text="鎖定/解鎖選取",
                                     command=self._on_toggle_lock)
         self._lock_btn.pack(side="left", padx=4)
         self._clear_btn = ttk.Button(bar, text="清除未鎖定", command=self._on_clear)
@@ -513,7 +522,74 @@ class DayScheduleTab(ttk.Frame):
             self._selector.set_ym(self.app.ym)
         self.refresh()
 
-    def _on_auto(self) -> None:
+    def _on_held_people(self) -> None:
+        """只排未鎖定人員:勾選要鎖定的人(存在該月份),儲存並排班才生效。"""
+        if self._finalized or self._day_solving:
+            return
+        from .held_dialog import HeldPickDialog
+        ym = self.app.ym
+        try:
+            cand = self.service.held_candidates(ym, today=date.today())
+            saved = self.service.get_person_locks(ym)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("只排未鎖定人員", str(exc), parent=self)
+            return
+        if not cand["groups"]:
+            messagebox.showinfo("只排未鎖定人員", "本月沒有排班人員", parent=self)
+            return
+        dlg = HeldPickDialog(
+            self, title=f"只排未鎖定人員 · {ym}",
+            hint=("勾選要鎖定的人：他們明天起的班完全不動，只重排沒有勾選的人。\n"
+                  "勾選會存在本月；只有按「儲存並排班」才會套用（一般自動排班不受影響）。\n"
+                  "排完會先跳預覽，列出變動與未滿足的條件，由你決定是否採用。"),
+            groups=cand["groups"], selected=saved,
+            actions=(("run", "儲存並排班"), ("save", "只儲存勾選")))
+        self.wait_window(dlg)
+        if dlg.result is None:
+            return
+        action, codes = dlg.result
+        if not guard_write(lambda: self.service.set_person_locks(
+                ym, codes, baseline=saved), title="人員鎖定未儲存", parent=self):
+            return
+        if action != "run":
+            self._status.set(f"已儲存鎖定人員：{'、'.join(codes) or '（無）'}")
+            return
+        if not codes:
+            messagebox.showinfo("只排未鎖定人員", "沒有勾選任何人；請改用「自動排班」", parent=self)
+            return
+        self._on_auto(held=HeldSpec(HELD_PEOPLE, tuple(codes)))
+
+    def _on_held_local(self) -> None:
+        """局部重排(請假):只重排請假者請假的半天,其餘人不動。"""
+        if self._finalized or self._day_solving:
+            return
+        from .held_dialog import HeldPickDialog
+        ym = self.app.ym
+        try:
+            cand = self.service.held_candidates(ym, today=date.today())
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("局部重排", str(exc), parent=self)
+            return
+        leavers = set(cand["on_leave"])
+        groups = [(g, [c for c in codes if c in leavers]) for g, codes in cand["groups"]]
+        groups = [(g, codes) for g, codes in groups if codes]
+        if not groups:
+            messagebox.showinfo(
+                "局部重排", "明天起沒有人登記請假。\n請先用「請假」登記（Clerk、外訓、"
+                "家醫科可請半天），再回來局部重排。", parent=self)
+            return
+        dlg = HeldPickDialog(
+            self, title=f"局部重排（請假） · {ym}",
+            hint=("勾選請假的人：只重排他們請假的那幾個半天（當天其他人可調動來補人力），"
+                  "請假者少掉的跟診／切片只補進其他日子的空位，不會擠掉別人；"
+                  "其餘所有人的班都不動。\n排完會先跳預覽，由你決定是否採用。"),
+            groups=groups, actions=(("run", "局部重排"),))
+        self.wait_window(dlg)
+        if dlg.result is None or not dlg.result[1]:
+            return
+        self._on_auto(held=HeldSpec(HELD_LOCAL, tuple(dlg.result[1])))
+
+    def _on_auto(self, held=None) -> None:
         if self._finalized or self._day_solving:
             return
         try:
@@ -542,7 +618,10 @@ class DayScheduleTab(ttk.Frame):
                                      str(exc) or "已取消或安裝失敗", parent=self)
                 self._status.set("排班引擎未就緒；手動班表仍可使用")
                 return
-        self._solve_day_async()
+        if held is None:
+            self._solve_day_async()
+        else:
+            self._solve_day_async(held)
 
     def _cancel_day_solve(self, reason: str = "已取消") -> None:
         if self._day_solving and self._day_control is not None:
@@ -550,7 +629,7 @@ class DayScheduleTab(ttk.Frame):
             self._cancel_btn.config(state="disabled")
             self._status.set(f"正在停止排班：{reason}")
 
-    def _solve_day_async(self) -> None:
+    def _solve_day_async(self, held=None) -> None:
         ym = self.app.ym
         solve_today = date.today()
         control = DaySolveControl()
@@ -558,6 +637,8 @@ class DayScheduleTab(ttk.Frame):
         self._day_control = control
         self._day_solving = True
         self._auto_btn.config(state="disabled")
+        self._people_btn.config(state="disabled")
+        self._local_btn.config(state="disabled")
         self._cancel_btn.config(state="normal")
         self._status.set("排班準備中；可按「取消排班」")
         result = {}
@@ -567,8 +648,10 @@ class DayScheduleTab(ttk.Frame):
                 control.checkpoint("檢查排班引擎")
                 _verify_day_solver_dependency()
                 control.checkpoint("載入並求解排班")
+                # 一般排班的呼叫方式不變;只有固定模式才帶 held。
                 solved = self.service.run_day_solve(
-                    ym, today=solve_today, control=control)
+                    ym, today=solve_today, control=control,
+                    **({"held": held} if held is not None else {}))
                 control.checkpoint("檢查結果是否仍是目前資料")
                 result["current"] = (
                     solve_today == date.today()
@@ -598,6 +681,8 @@ class DayScheduleTab(ttk.Frame):
             self._day_solving = False
             self._day_control = None
             self._auto_btn.config(state="disabled" if self._finalized else "normal")
+            for _b in (self._people_btn, self._local_btn):
+                _b.config(state="disabled" if self._finalized else "normal")
             self._cancel_btn.config(state="disabled")
             if control.cancelled or "stopped" in result:
                 self._status.set(f"排班已停止：{control.reason or result.get('stopped', '')}")
@@ -754,7 +839,8 @@ class DayScheduleTab(ttk.Frame):
             messagebox.showinfo("請假", "本月沒有可請假的人員（先設定 PGY 人員 / Clerk 梯次）")
             return
         from .session_leave import SessionLeaveEditor
-        editor = SessionLeaveEditor if scope in ("external", "family") else LeaveEditor
+        # [2026-11-10 使用者] Clerk 也可以請半天假
+        editor = SessionLeaveEditor if scope in ("clerk", "external", "family") else LeaveEditor
         ed = editor(self, self.service, scope, self.app.ym, "leave",
                          members=members)
         self.wait_window(ed)
@@ -1260,10 +1346,12 @@ class DayScheduleTab(ttk.Frame):
 
     def _apply_finalized_state(self) -> None:
         state = "disabled" if self._finalized else "normal"
-        for w in (self._auto_btn, self._clear_btn, self._lock_btn, *self._edit_btns):
+        for w in (self._auto_btn, self._people_btn, self._local_btn,
+                  self._clear_btn, self._lock_btn, *self._edit_btns):
             w.config(state=state)
         if self._day_solving:
-            self._auto_btn.config(state="disabled")
+            for w in (self._auto_btn, self._people_btn, self._local_btn):
+                w.config(state="disabled")
         if self._page_var.get() == "doctors":
             self._lock_btn.config(state="disabled")
 

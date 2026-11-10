@@ -227,6 +227,7 @@ _CLASSIFIED = {
     "set_family_month_roster": "delta",
     "set_family_follow": "delta",
     "set_pgy_month_roster": "delta", "set_pgy_apply_pref": "delta",
+    "set_person_locks": "delta",  # [2026-11-10] 人員鎖定勾選:三方合併
     "set_pgy_photo_offsets": "delta",  # changed keys only; conflicting same-key edits rejected
     "set_biopsy_cells": "delta", "set_pgy_default_members": "delta",
     "update_clerk_batch_fields": "delta-fields",

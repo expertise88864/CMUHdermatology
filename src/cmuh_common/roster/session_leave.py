@@ -1,8 +1,10 @@
-"""Monthly half-day leave for external and family trainees."""
+"""Monthly half-day leave for Clerk, external and family trainees.
+
+[2026-11-10 使用者] Clerk 也可以請半天假(原本只有整天)。"""
 from datetime import date
 
 SESSIONS = ("上午", "下午")
-SCOPES = ("external", "family")
+SCOPES = ("clerk", "external", "family")
 
 
 def parse_session_leaves(ym, month):
@@ -33,6 +35,17 @@ def parse_session_leaves(ym, month):
 def on_leave(inp, scope, person, d, session):
     return (d in inp.leaves.get(scope, {}).get(person, set())
             or (d, session) in inp.session_leaves.get(scope, {}).get(person, set()))
+
+
+def clerk_leave_days(inp) -> dict:
+    """Clerk 有請假(整天或半天)的日子 {代號: {日期}}。
+
+    ★只用在「全勤/可排天數」這類以【天】為單位的判斷★(半天假也算沒全勤,
+    偏保守);誰能排進某一格要用 `on_leave` 逐半天判斷。"""
+    out = {str(p): set(ds) for p, ds in (inp.leaves.get("clerk") or {}).items()}
+    for p, slots in (inp.session_leaves.get("clerk") or {}).items():
+        out.setdefault(str(p), set()).update(d for d, _s in slots)
+    return out
 
 
 def monthly_person_slots(ym, month, scope, person):

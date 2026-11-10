@@ -144,6 +144,7 @@ TWO_PGY_PHOTO_ONLY = ((1, "上午"), (3, "下午"), (4, "上午"))  # 二早/四
 #   要用到的人力一個都不會被它擋掉;它只決定「剩下的座位要不要再塞人」。
 from .training_params import TrainingParams
 from .held import held_cell, held_codes
+from .session_leave import clerk_leave_days, on_leave
 
 CLERK_SEAT_TARGET_MIN = TrainingParams().clerk_low
 CLERK_SEAT_TARGET_MAX = TrainingParams().clerk_high
@@ -1494,7 +1495,7 @@ def _month_solve_attendance_raw(inp: DaySolveInput, *, biopsy_caps=None,
     #    而且更早的一趟若已經一致,上面那個 `return` 早就走掉了。)
     _ds, _log, _warn, _fc = best_out
     _y, _m = int(inp.ym[:4]), int(inp.ym[5:7])
-    _leave = (inp.leaves.get("clerk") or {})
+    _leave = clerk_leave_days(inp)          # 半天假也算沒全勤
     return _ds, _log, list(_warn) + clerk_seat_uneven_warnings(
         inp.clerk_batches,
         {(b, c): n for k, n in _fc.seat.items()
@@ -1597,7 +1598,7 @@ def _clerk_equal_seat_caps(inp: DaySolveInput, fc: FairCounters,
     _y, _m = int(inp.ym[:4]), int(inp.ym[5:7])
     ended = clerk_batches_ended_by(
         inp.clerk_batches, date(_y, _m, monthrange(_y, _m)[1]))
-    clerk_leave = (inp.leaves.get("clerk") or {})
+    clerk_leave = clerk_leave_days(inp)     # 半天假也算沒全勤
     out: dict = dict(caps)
     unresolved = False
     for b in inp.clerk_batches:
@@ -1886,18 +1887,19 @@ def _solve_month_once(inp: DaySolveInput, seat_cap=None, *, biopsy_caps=None,
                     #  不是為了防漏;不硬湊一個假的反例來讓它看起來被測到。)
                     [c for c in _quota
                      if _quota[c] > 0
-                     and d not in (clerk_leave.get(c) or set())
+                     and not on_leave(inp, "clerk", c, d, session)
                      and c not in _held_out
                      and fc.last_biopsy.get((batch_key, c)) != d],
-                    lambda c, k: (date.fromisoformat(k[0])
-                                  not in (clerk_leave.get(c) or set())
+                    lambda c, k: (not on_leave(inp, "clerk", c,
+                                               date.fromisoformat(k[0]), k[1])
                                   and c not in held_codes(inp, k[0], k[1])))
             slots, slog = solve_session(
                 d, session, rooms,
                 [p for p in _avail(inp.pgy_roster, pgy_leave, d)
                  if p not in _held_out],
                 [c for c in _avail(clerk_members, clerk_leave, d)
-                 if c not in _held_out],
+                 if c not in _held_out
+                 and not on_leave(inp, "clerk", c, d, session)],
                 biopsy, fc, inp.capacity, batch_key=batch_key,
                 apply_pref=frozenset(inp.apply_pref), two_pgy_mode=two_pgy,
                 biopsy_quota_left=_quota, biopsy_force=_force,
