@@ -149,3 +149,22 @@ def test_the_attendance_stage_itself_skips_the_leave_half_day():
     for d in grid:
         if d.weekday() == 1:
             assert not any("C1" in ps for ps in slots[d.isoformat()]["上午"].values()), d
+
+
+def test_the_solver_uses_the_merged_lock_list():
+    """[PR #22 審查] 排班要用存檔後的合併結果,不是視窗裡的舊勾選。"""
+    src = _fn("_on_held_people")
+    assert 'merged.get("codes")' in src
+    assert src.index('merged.get("codes")') < src.index("HeldSpec(HELD_PEOPLE")
+
+
+def test_next_month_clerk_half_day_leave_reaches_the_solver(tmp_path):
+    """[PR #22 審查] 跨月梯次:下個月的 Clerk 半天假也要帶進輸入(切片前瞻要看得到)。"""
+    svc, st = _svc(tmp_path)
+    st.save_clerk_batches([{"id": "b9", "start_monday": "2026-08-24",
+                            "members": ["C7", "C8"]}])
+    nxt = date(2026, 9, 2)
+    st.save_month("2026-09", {"day_slots": {},
+                              "session_leaves": {"clerk": {"C7": [f"{nxt.isoformat()}|上午"]}}})
+    inp = svc.build_day_input(YM)
+    assert (nxt, "上午") in inp.session_leaves["clerk"]["C7"]

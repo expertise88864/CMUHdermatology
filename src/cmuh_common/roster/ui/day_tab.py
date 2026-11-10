@@ -548,9 +548,13 @@ class DayScheduleTab(ttk.Frame):
         if dlg.result is None:
             return
         action, codes = dlg.result
-        if not guard_write(lambda: self.service.set_person_locks(
-                ym, codes, baseline=saved), title="人員鎖定未儲存", parent=self):
+        # ★排班要用【存檔後的合併結果】★(PR #22 審查):視窗開著的期間他機
+        #   鎖定的人在合併後仍是鎖定的,用視窗裡的舊勾選排班會把他重排掉。
+        merged: dict = {}
+        if not guard_write(lambda: merged.setdefault("codes", self.service.set_person_locks(
+                ym, codes, baseline=saved)), title="人員鎖定未儲存", parent=self):
             return
+        codes = list(merged.get("codes") or [])
         if action != "run":
             self._status.set(f"已儲存鎖定人員：{'、'.join(codes) or '（無）'}")
             return

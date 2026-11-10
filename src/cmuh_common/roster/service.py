@@ -957,6 +957,11 @@ class RosterService:
         for _c, _ds in _parse_date_map(
                 (_nxt_month.get("leaves") or {}).get("clerk") or {}).items():
             leaves["clerk"].setdefault(_c, set()).update(_ds)
+        # [2026-11-10] Clerk 半天假同樣要帶入下個月的(跨月梯次的切片前瞻要看得到;
+        #   PR #22 審查)。其他身分的半天假只影響本月,維持只讀本月。
+        session_leaves = parse_session_leaves(ym, month)
+        for _c, _slots in parse_session_leaves(_nxt, _nxt_month).get("clerk", {}).items():
+            session_leaves.setdefault("clerk", {}).setdefault(_c, set()).update(_slots)
         # ★「那一天到底開不開診」也要看得到★:切片格網的 UI 允許勾選所有平日,
         #   而那一天可能是假日或整天停診 —— 那不是可分配的量,算進分母會撐出
         #   一個補不完的配額。
@@ -1065,7 +1070,7 @@ class RosterService:
             family_follow=family_follow_slots(ym, month),
             clerk_batches=covering, batch_order=batch_order,
             biopsy_open=biopsy_open, leaves=leaves,
-            session_leaves=parse_session_leaves(ym, month),
+            session_leaves=session_leaves,
             # [RS-29] 相鄰月份的既定時段(鎖定/已定案)——只餵計數與可行性,
             #   不會被寫進本月結果(那是 `locked` 的語意)。
             course_fixed=course_fixed,
