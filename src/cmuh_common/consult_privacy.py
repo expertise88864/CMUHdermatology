@@ -8,7 +8,12 @@ UNPARSED = "識別資料無法可靠解析，請至 HIS 查看此筆會診。"
 def scrub(text, identities):
     text = str(text or "")
     values = {str(p.get(k) or "") for p in identities for k in ("name", "chart")}
-    values.update(str(a) for p in identities for a in (p.get("aliases") or ()))
+    # 羅馬拼音姓名的每個字:以【完整單字】遮蔽(前後不是英文字母),內文寫成
+    #   「LI, WEI」或倒序也遮得到,又不會把 LIVER 之類的字遮掉。
+    words = {str(a) for p in identities for a in (p.get("aliases") or ()) if a}
+    for word in sorted(words, key=len, reverse=True):
+        text = re.sub(rf"(?<![A-Za-z]){re.escape(word)}(?![A-Za-z])", "[已隱藏]",
+                      text, flags=re.IGNORECASE)
     # Some HIS panes omit the roster's zero padding. Do not turn very short
     # numeric identifiers into a global substitution of doses or dates.
     values.update(chart.lstrip("0") for p in identities

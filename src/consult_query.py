@@ -1816,22 +1816,16 @@ _LATIN_ROW_RE = re.compile(
     rf"(?:\((?P<vs>[{_CJK_CHARS}·]+)\))?"
     rf"\s*(?P<date>\d{{1,2}}/\d{{1,2}})?"
     rf"\s*(?:\((?P<time>\d{{1,2}}:\d{{2}})\))?")
-# 全字母的病房代號(無數字)無法從羅馬拼音姓名後面可靠切開,只認這些已知代號。
-_LATIN_LETTER_WARDS = ("BURN", "RICU", "MICU", "SICU", "NICU", "PICU", "CCU", "ICU")
-
-
 def _split_latin_ward(head: str):
     """羅馬拼音姓名+病房 → (姓名, 病房);切不出來回 None(寧可遮蔽也不猜)。
-    病房結尾有數字 → 一個字母+數字(A6、C18、I8);否則只認已知的全字母病房。"""
+
+    只認「一個字母+數字」結尾的病房(A6、C18、I8)。★全字母病房(RICU、CCU、
+    BURN…)不支援★:姓名的最後幾個字母永遠可能是病房的開頭(OMAR 住 ICU 與
+    OMA 住 RICU 寫起來一模一樣,外審 PR #19),沒有可靠的界線 —— 維持遮蔽。"""
     m = re.search(r"[A-Z]\d+$", head)
-    if m:
-        name, ward = head[:m.start()], m.group(0)
-    else:
-        ward = next((w for w in _LATIN_LETTER_WARDS if head.endswith(w)), "")
-        if not ward:
-            return None
-        name = head[:-len(ward)]
-    name = name.strip()
+    if not m:
+        return None
+    name, ward = head[:m.start()].strip(), m.group(0)
     if len(re.sub(r"[^A-Z]", "", name)) < 2:
         return None
     return name, ward
@@ -1845,17 +1839,21 @@ def _parse_latin_row(text: str):
     if not split:
         return None
     name, ward = split
-    # 遮蔽用的別名:姓名可能被內文分開寫、或病房切分有一兩個字母的誤差 ——
-    #   4 個字母以上的單字各自也遮,寧可多遮。
-    aliases = [w for w in re.split(r"[ .'\-]+", name) if len(w) >= 4]
+    # 遮蔽用的別名:內文可能把姓名倒過來、用逗號隔開(「LI, WEI」)——
+    #   姓名中 2 個字母以上的每個字都以【完整單字】遮蔽(見 consult_privacy.scrub)。
+    aliases = [w for w in re.split(r"[ .'\-]+", name) if len(w) >= 2]
     return {"name": name, "ward_bed": " · ".join(p for p in (ward, m.group("bed")) if p),
             "chart": m.group("chart"), "vs": m.group("vs") or "",
             "date": m.group("date") or "", "time": m.group("time") or "",
             "aliases": aliases}
 
 
+_SHAPE_KEEP = set(" ()（）[]/:：.-·‧,，'")
+
+
 def _roster_row_shape(text: str) -> str:
-    """不含個資的格式形狀(給 log 判斷新格式用):中日韓字→字、英文→A/a、數字→9。"""
+    """不含個資的格式形狀(給 log 判斷新格式用):中日韓字→字、英文→A/a、數字→9,
+    只保留明列的結構符號,★其他任何字元一律→?★(外審 PR #19:韓文等姓名不可原樣進 log)。"""
     out = []
     for ch in str(text or ""):
         if re.match(f"[{_CJK_CHARS}]", ch):
@@ -1864,10 +1862,12 @@ def _roster_row_shape(text: str) -> str:
             out.append("A")
         elif "a" <= ch <= "z":
             out.append("a")
-        elif ch.isdigit():
+        elif "0" <= ch <= "9":
             out.append("9")
-        else:
+        elif ch in _SHAPE_KEEP:
             out.append(ch)
+        else:
+            out.append("?")
     return "".join(out)
 
 

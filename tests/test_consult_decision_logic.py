@@ -2088,11 +2088,11 @@ def test_parse_roster_row_latin_name_with_digit_ward():
     assert p2 is not None and p2["name"] == "JANE ROE" and p2["ward_bed"] == "C18 · 222"
 
 
-def test_parse_roster_row_latin_name_with_letter_ward():
-    p = cq._parse_roster_row("JANE ROERICU(05)0099887766(王大明)11/10(11:28)")
-    assert p is not None and p["name"] == "JANE ROE" and p["ward_bed"] == "RICU · 05"
-    # 未知的全字母病房切不開 → 維持遮蔽,不猜
-    assert cq._parse_roster_row("JANE ROEXYZ(05)0099887766(王大明)11/10(11:28)") is None
+def test_parse_roster_row_latin_name_with_letter_ward_stays_unparsed():
+    """全字母病房與英文姓名之間沒有可靠界線 → 不猜,維持遮蔽。"""
+    for row in ("JANE ROERICU(05)0099887766(王大明)11/10(11:28)",
+                "JANE ROEXYZ(05)0099887766(王大明)11/10(11:28)"):
+        assert cq._parse_roster_row(row) is None, row
 
 
 def test_latin_row_without_bed_or_chart_stays_unparsed():
@@ -2120,3 +2120,32 @@ def test_unparsed_row_logs_only_a_pii_free_shape(caplog):
         cq._format_patient_roster_html([row], "下午會診清單")
     assert "形狀=字字字AAA(9-9)9999999(字字字)" in caplog.text
     assert "王小明" not in caplog.text and "1234567" not in caplog.text
+
+
+def test_short_romanized_name_is_redacted_with_any_separator():
+    """[PR #19 審查 P1] 每個字都短於 4 個字母、內文用逗號倒寫 —— 仍要遮掉,
+    但不可以把 LIVER 這類字一起遮掉。"""
+    labels = ["LI WEIA6(112)0012345678(王大明)11/10(11:03)"]
+    entries = [[("內容1", "Patient: LI, WEI; wei li has liver disease")]]
+    html = cq._format_extracted_entries_html(entries, labels=labels)
+    assert "識別資料無法可靠解析" not in html
+    for secret in ("LI,", "WEI", "wei li", "0012345678"):
+        assert secret not in html, secret
+    assert "liver disease" in html
+
+
+def test_unparsed_row_shape_never_logs_unknown_scripts(caplog):
+    """[PR #19 審查 P1] 不在允許清單的字元(例:越南文帶聲調字母)一律 → ?,
+    不可原樣寫進 log。"""
+    import logging
+    row = "NGUYỄN VĂNA6(112)0012345678(王大明)11/10(11:03)"
+    assert cq._parse_roster_row(row) is None
+    with caplog.at_level(logging.WARNING):
+        cq._format_patient_roster_html([row], "下午會診清單")
+    assert "Ễ" not in caplog.text and "Ă" not in caplog.text
+    assert "AAAA?A A?AA9(999)9999999999(字字字)99/99(99:99)" in caplog.text
+
+
+def test_ambiguous_letter_ward_is_not_guessed():
+    """[PR #19 審查 P2] OMAR 住 ICU 與 OMA 住 RICU 寫起來相同 → 不猜,維持遮蔽。"""
+    assert cq._parse_roster_row("OMARICU(05)0012345678(王大明)11/10(11:03)") is None
