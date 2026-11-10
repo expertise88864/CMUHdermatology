@@ -2149,3 +2149,15 @@ def test_unparsed_row_shape_never_logs_unknown_scripts(caplog):
 def test_ambiguous_letter_ward_is_not_guessed():
     """[PR #19 審查 P2] OMAR 住 ICU 與 OMA 住 RICU 寫起來相同 → 不猜,維持遮蔽。"""
     assert cq._parse_roster_row("OMARICU(05)0012345678(王大明)11/10(11:03)") is None
+
+
+def test_romanized_name_split_by_spaces_or_line_breaks_is_redacted():
+    """[PR #19 第 2 輪] HIS 會在姓名字母間插入空白/換行;完整姓名要先遮,
+    逐字遮蔽也要容許字母間的空白。"""
+    labels = [_LATIN_ROW]
+    for note in ("Nur Test name rash", "Nur Testna\nme rash", "TEST NAME, NUR rash"):
+        html = cq._format_extracted_entries_html([[("內容1", note)]], labels=labels)
+        body = html.replace("<br>", "")
+        for secret in ("Test name", "Testna", "TEST NAME", "Nur", "NUR"):
+            assert secret not in body, (note, secret)
+        assert "rash" in html

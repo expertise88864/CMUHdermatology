@@ -8,12 +8,6 @@ UNPARSED = "識別資料無法可靠解析，請至 HIS 查看此筆會診。"
 def scrub(text, identities):
     text = str(text or "")
     values = {str(p.get(k) or "") for p in identities for k in ("name", "chart")}
-    # 羅馬拼音姓名的每個字:以【完整單字】遮蔽(前後不是英文字母),內文寫成
-    #   「LI, WEI」或倒序也遮得到,又不會把 LIVER 之類的字遮掉。
-    words = {str(a) for p in identities for a in (p.get("aliases") or ()) if a}
-    for word in sorted(words, key=len, reverse=True):
-        text = re.sub(rf"(?<![A-Za-z]){re.escape(word)}(?![A-Za-z])", "[已隱藏]",
-                      text, flags=re.IGNORECASE)
     # Some HIS panes omit the roster's zero padding. Do not turn very short
     # numeric identifiers into a global substitution of doses or dates.
     values.update(chart.lstrip("0") for p in identities
@@ -24,6 +18,15 @@ def scrub(text, identities):
         pattern = r"\s*".join(re.escape(c) for c in value if not c.isspace())
         if pattern:
             text = re.sub(pattern, "[已隱藏]", text, flags=re.IGNORECASE)
+    # 羅馬拼音姓名的每個字(在完整姓名之後才做,否則會把完整姓名拆散):以
+    #   【完整單字】遮蔽(前後不是英文字母)—— 「LI, WEI」或倒序也遮得到,又不會
+    #   把 LIVER 之類的字遮掉。字母之間同樣容許 HIS 插入的空白/換行。
+    words = {str(a) for p in identities for a in (p.get("aliases") or ()) if a}
+    for word in sorted(words, key=len, reverse=True):
+        body = r"\s*".join(re.escape(c) for c in word if not c.isspace())
+        if body:
+            text = re.sub(rf"(?<![A-Za-z]){body}(?![A-Za-z])", "[已隱藏]",
+                          text, flags=re.IGNORECASE)
     text = re.sub(r"((?:病人姓名|患者姓名|病歷號碼?|病歷編號|MRN|Chart\s*(?:No\.?|Number))\s*[:：=]\s*)[^\s，,；;\n]+",
                   r"\1[已隱藏]", text, flags=re.IGNORECASE)
     return text
