@@ -2,6 +2,7 @@
 from collections import Counter, defaultdict
 from datetime import date
 
+from .held import is_held
 from .pgy_workload import availability_weights, workload_goals
 from .session_leave import on_leave
 from .solve_day import PHOTO, REST, TREATMENT, TWO_PGY_PHOTO_ONLY, is_follow_slot
@@ -59,6 +60,7 @@ def _reduce_manual_pgy_follow(inp, slots, people, log):
                                     doctors[person, doctor] += 1
                                 if (person == p and d in inp.grid
                                         and session not in inp.locked.get(iso, {})
+                                        and not is_held(inp, iso, session, p)
                                         and not on_leave(inp, "pgy", p, d, session)
                                         and not (len(people) == 2 and
                                                  (d.weekday(), session)
@@ -129,7 +131,8 @@ def balance_pgy(inp, slots, log, warnings, *, control=None):
                        # The existing two-PGY weekly rotation outranks monthly
                        # fairness and requested photo offsets.
                        and not (len(people) == 2 and (d.weekday(), s) in TWO_PGY_PHOTO_ONLY)
-                       and s not in inp.locked.get(iso, {}) and d in inp.grid]
+                       and s not in inp.locked.get(iso, {}) and d in inp.grid
+                       and not is_held(inp, iso, s, p)]
             candidates = [p for _, _, p in movable]
             assignments = defaultdict(list)
             for room, index, original in positions:

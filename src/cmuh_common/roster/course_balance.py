@@ -7,6 +7,7 @@ from collections import defaultdict
 from copy import deepcopy
 from datetime import date
 
+from .held import enforce_held, held_codes, held_conflicts, held_keys
 from .session_leave import on_leave
 from .solve_day import (
     BIOPSY, REST, STUDENT_SESSIONS, arbitration_order, day_owner_batch,
@@ -159,7 +160,8 @@ def add_external(inp, slots, log, warnings, *, control=None):
             owner = day_owner_batch(arbitration_order(inp), d)
             clerks = [p for p in (owner.members if owner else [])
                       if owner is not None and (owner.id, p) in targets and p not in inp.pgy_roster]
-            assigned = {p for ps in cells.values() for p in ps}
+            # [2026-11-10] 固定人員(含那一格沒有位置的)不是候選人。
+            assigned = {p for ps in cells.values() for p in ps} | held_codes(inp, iso, s)
             family = [p for p in inp.family_roster if (d, s) in inp.family_follow.get(p, set())]
             for p in sorted(set(people + clerks + family + inp.pgy_roster)):
                 scope = "family" if p in family else "external" if p in people else "pgy" if p in inp.pgy_roster else "clerk"
@@ -323,7 +325,11 @@ def finish_courses(inp, slots, log, warnings, *, control=None):
     if control is not None:
         control.checkpoint("核對課程結果")
     from .training_bands import training_warnings, verify_pgy_caps
-    verify_pgy_caps(inp, slots)
+    # [2026-11-10] 有固定人員時,超出 PGY 每週上限改列為未滿足條件(使用者定案:
+    #   不論排不排得出來都出預覽,由使用者決定是否採用);一般排班維持原本的拒絕。
+    warnings.extend(verify_pgy_caps(inp, slots, report_only=bool(held_keys(inp))))
     warnings.extend(training_warnings(inp, slots, scopes=("pgy",)))
+    warnings.extend(held_conflicts(inp))
+    enforce_held(inp, slots)
     log.append("依 course 優先平衡實際跟診醫師，再平衡診間；保留各人跟診次數、特殊工作、家醫可參與時段與鎖定內容")
     return slots, log, warnings

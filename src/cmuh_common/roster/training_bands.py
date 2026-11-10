@@ -36,8 +36,18 @@ def week_slots(slots):
     return weeks
 
 
+def _fixed_table(inp):
+    """整格鎖定 + 人員固定:兩者都是「這次求解改不動」的位置(見 `held.py`)。"""
+    from .held import held_cell, held_keys
+    table = {iso: dict(ss) for iso, ss in (inp.locked or {}).items()
+             if isinstance(ss, dict)}
+    for iso, s in held_keys(inp):
+        table.setdefault(iso, {})[s] = held_cell(inp, iso, s)
+    return table
+
+
 def fixed_count(inp, p, kind, within=None):
-    return sum(p in (ps or []) for iso, ss in inp.locked.items()
+    return sum(p in (ps or []) for iso, ss in _fixed_table(inp).items()
                if isinstance(iso, str) and iso[:7] == inp.ym and isinstance(ss, dict)
                for s, cells in ss.items() if isinstance(cells, dict)
                and s in STUDENT_SESSIONS
@@ -48,7 +58,7 @@ def fixed_count(inp, p, kind, within=None):
 
 def fixed_week_slots(inp, week):
     within = set()
-    for iso, sessions in inp.locked.items():
+    for iso, sessions in _fixed_table(inp).items():
         try:
             d = date.fromisoformat(iso)
         except (TypeError, ValueError):
@@ -76,13 +86,17 @@ def pgy_week_counts(inp, slots):
     return counts
 
 
-def verify_pgy_caps(inp, slots):
-    """A timed-out fallback must not silently bypass configured upper limits."""
-    fixed = pgy_week_counts(inp, inp.locked)
-    excess = [p for (week, p), count in pgy_week_counts(inp, slots).items()
-              if count > max(inp.training.pgy_high, fixed[week, p])]
-    if excess:
+def verify_pgy_caps(inp, slots, *, report_only=False):
+    """A timed-out fallback must not silently bypass configured upper limits.
+
+    `report_only`(有固定人員時):不拒絕,改回傳未滿足條件讓預覽列出。"""
+    fixed = pgy_week_counts(inp, _fixed_table(inp))
+    excess = sorted((week, p, count) for (week, p), count in pgy_week_counts(inp, slots).items()
+                    if count > max(inp.training.pgy_high, fixed[week, p]))
+    if excess and not report_only:
         raise ValueError("無法產生符合 PGY 每週跟診上限的班表；原班表未變更，請調整條件後重試")
+    return [f"PGY {p} 第 {week[1]} 週跟診 {count} 次，超過上限 {inp.training.pgy_high} 次"
+            for week, p, count in excess]
 
 
 def add_training_objectives(inp, model, choices, deviation, external, clerk_minima=()):

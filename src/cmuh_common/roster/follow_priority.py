@@ -4,6 +4,7 @@ from copy import deepcopy
 from calendar import monthrange
 from datetime import date, timedelta
 
+from .held import held_codes, is_held
 from .session_leave import on_leave
 from .solve_day import REST, STUDENT_SESSIONS, arbitration_order, day_owner_batch, is_follow_slot
 
@@ -125,13 +126,20 @@ def prepare_priority(inp, slots):
             if s in inp.locked.get(d.isoformat(), {}):
                 continue
             originals[d, s] = deepcopy(cells)
+            # [2026-11-10] 固定人員的跟診/放假原位保留,不進可重新分配的預算。
+            keep = held_codes(inp, d.isoformat(), s)
             for r in list(cells):
                 if is_follow_slot(r) or r == REST:
+                    movable = [p for p in cells[r] if p not in keep]
                     if is_follow_slot(r) and owner:
-                        for p in cells[r]:
+                        for p in movable:
                             if p in owner.members and p not in inp.pgy_roster:
                                 targets[owner.id, p] += 1
-                    del cells[r]
+                    fixed = [p for p in cells[r] if p in keep]
+                    if fixed:
+                        cells[r] = fixed
+                    else:
+                        del cells[r]
     return targets, originals
 
 
@@ -146,7 +154,8 @@ def restore_pgy_and_rest(inp, slots, originals):
     order = arbitration_order(inp)
     for (d, s), before in sorted(originals.items()):
         cells = slots[d.isoformat()][s]
-        assigned = {p for ps in cells.values() for p in (ps or [])}
+        held = held_codes(inp, d.isoformat(), s)
+        assigned = {p for ps in cells.values() for p in (ps or [])} | held
         available = [p for p in inp.pgy_roster if p not in assigned
                      and not on_leave(inp, "pgy", p, d, s)
                      and weekly[d.isocalendar()[:2], p] < inp.training.pgy_high]
@@ -163,7 +172,7 @@ def restore_pgy_and_rest(inp, slots, originals):
         owner = day_owner_batch(order, d)
         scopes = [("pgy", inp.pgy_roster), ("external", inp.external_roster),
                   ("clerk", owner.members if owner else [])]
-        assigned = {p for ps in cells.values() for p in (ps or [])}
+        assigned = {p for ps in cells.values() for p in (ps or [])} | held
         for scope, people in scopes:
             for p in people:
                 if p not in assigned and not on_leave(inp, scope, p, d, s):
@@ -226,16 +235,21 @@ def spread_clerk_days(inp, slots, *, control=None):
         for p in sorted(set(owner.members) - set(inp.pgy_roster)):
             if works(d, p) or d in inp.leaves.get("clerk", {}).get(p, set()):
                 continue
+            # [2026-11-10] 固定人員的位置不移出、也不被擠掉或拿來補位。
             donors = [(dd, s, r) for dd in days
                       if day_owner_batch(order, dd) == owner and works(dd, p) > 1
                       for s, cells in slots.get(dd.isoformat(), {}).items()
                       if s in STUDENT_SESSIONS and s not in inp.locked.get(dd.isoformat(), {})
+                      and not held_codes(inp, dd.isoformat(), s) & {p}
                       for r, ps in cells.items() if is_follow_slot(r) and p in ps]
             if not donors:
                 continue
             placed = False
             for s in STUDENT_SESSIONS:
                 if s in inp.locked.get(d.isoformat(), {}):
+                    continue
+                held_here = held_codes(inp, d.isoformat(), s)
+                if p in held_here:
                     continue
                 cells = slots.get(d.isoformat(), {}).get(s, {})
                 for r in inp.grid[d].get(s, []):
@@ -244,7 +258,8 @@ def spread_clerk_days(inp, slots, *, control=None):
                         choices = []
                         candidates = sorted(
                             (q for q in cells.get(r, [])
-                             if q in inp.pgy_roster and works(d, q) > 1),
+                             if q in inp.pgy_roster and works(d, q) > 1
+                             and q not in held_here),
                             key=lambda q: (-works(d, q), q),
                         )
                         for donor in donors:
@@ -252,7 +267,8 @@ def spread_clerk_days(inp, slots, *, control=None):
                             source = slots[dd.isoformat()][ss]
                             available = [q for q in source.get(REST, [])
                                          if q in inp.pgy_roster
-                                         and dd not in inp.leaves.get("pgy", {}).get(q, set())]
+                                         and dd not in inp.leaves.get("pgy", {}).get(q, set())
+                                         and not is_held(inp, dd.isoformat(), ss, q)]
                             for displaced in candidates:
                                 replacements = sorted(
                                     available,
@@ -285,6 +301,7 @@ def spread_clerk_days(inp, slots, *, control=None):
                     # Fill the released seat using an available PGY only.
                     candidates = [q for q in source.get(REST, []) if q in inp.pgy_roster
                                   and dd not in inp.leaves.get("pgy", {}).get(q, set())
+                                  and not is_held(inp, dd.isoformat(), ss, q)
                                   and weekly[dd.isocalendar()[:2], q] < inp.training.pgy_high]
                     refilled = None
                     if candidates:

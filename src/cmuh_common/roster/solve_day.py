@@ -143,6 +143,7 @@ TWO_PGY_PHOTO_ONLY = ((1, "上午"), (3, "下午"), (4, "上午"))  # 二早/四
 #   切片室(含配額與期限)全部排完之後才輪到的步驟。換句話說,其他 Clerk 規則
 #   要用到的人力一個都不會被它擋掉;它只決定「剩下的座位要不要再塞人」。
 from .training_params import TrainingParams
+from .held import held_cell, held_codes
 
 CLERK_SEAT_TARGET_MIN = TrainingParams().clerk_low
 CLERK_SEAT_TARGET_MAX = TrainingParams().clerk_high
@@ -249,6 +250,8 @@ class SessionCtx:
     #   (第一趟求解、以及尚未走完的梯次都是 None)。
     seat_cap: "dict | None" = None
     clerk_high: int = CLERK_SEAT_TARGET_MAX
+    # [2026-11-10] 這一格被固定的位置(見 `solve_session` 與 `held.py`)。
+    preset: dict = field(default_factory=dict)
 
 
     @property
@@ -278,6 +281,8 @@ class PhotoStep(FillStep):
     """照光：每個時段（含週三下午）一律排 1 位 PGY，最優先。"""
 
     def run(self, ctx, slots, log):
+        if ctx.preset.get(PHOTO):               # 固定人員已在照光
+            return
         if not ctx.pgy:
             log.append(f"⚠ {ctx.session} 照光無 PGY 可排（全請假？）")
             return
@@ -318,6 +323,8 @@ class TreatmentStep(FillStep):
         if ctx.two_pgy_photo_only:              # [RS-15] 兩位 PGY 月:只排照光
             log.append(f"{ctx.session} 治療室不排（兩位 PGY 月，"
                        f"另一位優先跟診）")
+            return
+        if ctx.preset.get(TREATMENT):           # 固定人員已在治療室
             return
         if not ctx.pgy:
             log.append(f"⚠ {ctx.session} 治療室無 PGY 可排（全請假？）")
@@ -423,7 +430,7 @@ class BiopsyStep(FillStep):
     """
     def run(self, ctx, slots, log):
         # 週三下午切片室硬性關閉（C3 定案）→ 即使手動格網誤設為開，也不排。
-        if not ctx.biopsy_open or ctx.wed_pm:
+        if not ctx.biopsy_open or ctx.wed_pm or ctx.preset.get(BIOPSY):
             return
         fc = ctx.fc
         quota = ctx.biopsy_quota_left
@@ -658,8 +665,14 @@ def solve_session(d: date, session: str, rooms: list, pgy_avail: list,
                   apply_pref=frozenset(), two_pgy_mode: bool = False,
                   biopsy_quota_left=None,
                   biopsy_force=frozenset(), seat_reserved=None,
-                  seat_cap=None, clerk_high=CLERK_SEAT_TARGET_MAX) -> tuple:
-    """單一時段填充 → (slots, log)。slots: {房/治療室/切片室/放假: [代號,...]}。"""
+                  seat_cap=None, clerk_high=CLERK_SEAT_TARGET_MAX,
+                  preset=None, preset_ck=None) -> tuple:
+    """單一時段填充 → (slots, log)。slots: {房/治療室/切片室/放假: [代號,...]}。
+
+    `preset` = 這一格被固定的位置(人員固定,見 `held.py`):照光/治療室/切片室
+    已有人就不再排,診間名額先扣掉,輸出原樣併回。呼叫端負責把被固定的人
+    從 `pgy_avail`/`clerk_avail` 拿掉並回放他們的計數。`preset_ck` = 房內
+    固定者的公平計數鍵(同伴計數用)。"""
     # ★同一個人不可以在池子裡出現兩次★(外審 2026-08-21 P1-01):每一步都是
     #   「選一個 → remove 一個 occurrence」,重複的代號因此可以在同一時段被
     #   排進兩個工作(照光+治療室、切片+跟診)。寫入邊界與 build_day_input
@@ -689,7 +702,9 @@ def solve_session(d: date, session: str, rooms: list, pgy_avail: list,
         pgy=sorted(_pgy),
         clerk=sorted(_clerk),
         biopsy_open=biopsy_open, capacity=capacity, fc=fc,
-        room_slots={r: [] for r in sorted(rooms)}, batch_key=batch_key,
+        room_slots={r: list((preset or {}).get(r) or []) for r in sorted(rooms)},
+        seat_ck={r: list((preset_ck or {}).get(r) or []) for r in sorted(rooms)},
+        preset=dict(preset or {}), batch_key=batch_key,
         apply_pref=frozenset(apply_pref), two_pgy_mode=two_pgy_mode,
         biopsy_quota_left=(dict(biopsy_quota_left)
                            if biopsy_quota_left is not None else None),
@@ -705,6 +720,14 @@ def solve_session(d: date, session: str, rooms: list, pgy_avail: list,
     for r in ctx.rooms:                          # 房間格（含空房不輸出）
         if ctx.room_slots[r]:
             slots[r] = ctx.room_slots[r]
+    # 固定人員的其餘位置原樣併回(含不在本時段診間清單裡的房 —— 停診後的固定位置
+    #   保留不刪,由衝突檢查點名)。放假與自動放假的人合併。
+    for slot, people in (preset or {}).items():
+        if slot in ctx.rooms:
+            continue
+        merged = list(slots.get(slot) or [])
+        merged += [p for p in people if p not in merged]
+        slots[slot] = sorted(merged) if slot == REST else merged
     return slots, log
 
 
@@ -763,6 +786,10 @@ class DaySolveInput:
     clinic_doctors: dict = field(default_factory=dict)  # {date: {session: {room: doctor}}}
     pgy_photo_offsets: dict = field(default_factory=dict)  # monthly relative photo targets
     training: TrainingParams = field(default_factory=TrainingParams)
+    # [2026-11-10 使用者] 人員固定:{iso: {時段: {格: [代號]}}} 與 {iso: {時段: [代號]}}。
+    #   同一格其他人照常排;語意與所有判斷見 `held.py`。空 = 沒有人被固定(原行為)。
+    held: dict = field(default_factory=dict)
+    held_people: dict = field(default_factory=dict)
 
 
 def day_input_fingerprint(inp: "DaySolveInput") -> str:
@@ -847,6 +874,17 @@ def replay_counters(fc: FairCounters, d: date, session: str, slots: dict,
             for b in known[i + 1:]:
                 pk = _pair_key(_ck(a), _ck(b))
                 fc.pair[pk] = fc.pair.get(pk, 0) + 1
+
+
+def _held_ck(held: dict, batch_key: str, pgy_set: set, clerk_set: set) -> dict:
+    """房內固定者的公平計數鍵 —— 與 `replay_counters` 同一套命名空間(非 PGY/Clerk 不計)。"""
+    out: dict = {}
+    for slot, people in (held or {}).items():
+        if slot in (PHOTO, TREATMENT, BIOPSY, REST):
+            continue
+        out[slot] = [("pgy", p) if p in pgy_set else ("clerk", batch_key, p)
+                     for p in people if p in pgy_set or p in clerk_set]
+    return out
 
 
 def _warn_locked_content(warnings: list, d: date, session: str, locked_slots: dict,
@@ -1019,7 +1057,7 @@ def apply_locked_adjustments(inp: DaySolveInput, order,
     for _i, _d in enumerate(sorted(inp.grid)):
         for _j, _s in enumerate(STUDENT_SESSIONS):
             _ord[(_d.isoformat(), _s)] = _i * 10 + _j
-    def _absorb(table, open_days, pos_of):
+    def _absorb(table, open_days, pos_of, partial=False):
         """把一張「已經定下來」的表吸收進分母/預扣/佔位。
 
         `open_days` = 那些日期裡【真的有開診】的集合;`pos_of` 給這一格在
@@ -1043,8 +1081,12 @@ def apply_locked_adjustments(inp: DaySolveInput, order,
             for _s, _slots in (_sessions or {}).items():
                 if _s not in STUDENT_SESSIONS:
                     continue
-                _locked_keys.setdefault(_lcov[0].id, set()).add((_iso, _s))
-                _bio_slots.setdefault(_lcov[0].id, set()).discard((_iso, _s))
+                # [2026-11-10] 人員固定(`partial`)只占掉他們自己的位置:
+                #   切片室沒有被固定的人時,那一格仍是可分配的開放時段,
+                #   不從分母拿掉、也不算「已定下來」。
+                if not partial or (_slots or {}).get(BIOPSY):
+                    _locked_keys.setdefault(_lcov[0].id, set()).add((_iso, _s))
+                    _bio_slots.setdefault(_lcov[0].id, set()).discard((_iso, _s))
                 for _c in ((_slots or {}).get(BIOPSY) or []):
                     if str(_c) not in _lmembers:
                         # ★未知/已換梯的代號不得污染公平計數★(RF-10 的契約;
@@ -1070,6 +1112,12 @@ def apply_locked_adjustments(inp: DaySolveInput, order,
                                 pos_of(_iso, _s))
 
     _absorb(inp.locked, _grid_days, lambda i, s: _ord.get((i, s), -1))
+    # [2026-11-10] 固定人員:規則與鎖定格相同,只是以「他們自己的位置」為限。
+    #   ★整格鎖定的格不重複吸收★(`held_cell` 對鎖定格回空)。
+    _absorb({_i: {_s: held_cell(inp, _i, _s)
+                  for _s in STUDENT_SESSIONS if held_cell(inp, _i, _s)}
+             for _i in (inp.held or {})},
+            _grid_days, lambda i, s: _ord.get((i, s), -1), partial=True)
     # ★[RS-29] 相鄰月份的既定時段★:規則與本月相同,只有兩處不一樣 ——
     #   ① 開診與否要看整梯的 `course_days`(本月的格網當然不含下個月的日子);
     #   ② 時序位置一律排在本月所有時段【之後】。位置是拿來判斷
@@ -1627,6 +1675,8 @@ def _solve_month_once(inp: DaySolveInput, seat_cap=None, *, biopsy_caps=None,
         _iso3 = _d3.isoformat()
         for _s3 in STUDENT_SESSIONS:
             _ls3 = (inp.locked.get(_iso3) or {}).get(_s3)
+            if _ls3 is None:                    # 固定人員的跟診同樣先入帳
+                _ls3 = held_cell(inp, _iso3, _s3) or None
             if _ls3 is None or (_d3.weekday(), _s3) not in TWO_PGY_PHOTO_ONLY:
                 continue
             for _slot3, _ppl3 in _ls3.items():
@@ -1692,6 +1742,8 @@ def _solve_month_once(inp: DaySolveInput, seat_cap=None, *, biopsy_caps=None,
         for _s in STUDENT_SESSIONS:
             if (inp.locked.get(_iso) or {}).get(_s) is not None:
                 continue
+            if held_cell(inp, _iso, _s).get(BIOPSY):   # 固定人員已占切片室
+                continue
             if _d.weekday() == WED and _s == "下午":
                 continue
             if not ((inp.biopsy_open.get(_cov[0].id) or {}).get(_iso)
@@ -1749,6 +1801,13 @@ def _solve_month_once(inp: DaySolveInput, seat_cap=None, *, biopsy_caps=None,
                            f"{session} 🔒鎖定（不重排）")
                 continue
             rooms = (inp.grid.get(d) or {}).get(session) or []
+            # [2026-11-10] 固定人員:原位保留、照鎖定格的規則入帳,其餘的人
+            #   在扣掉他們占用的名額後照常排(見 `held.py`)。
+            _held = held_cell(inp, iso, session)
+            _held_out = held_codes(inp, iso, session)
+            if _held:
+                replay_counters(fc, d, session, _held, batch_key,
+                                pgy_set, clerk_set)
             # 週三下午跟診關閉但治療室照開 → 該時段仍需跑（rooms 為 []）
             # ★向勝者梯次拿它自己的切片開放★(外審 2026-08-24 P2-01)
             biopsy = bool(((inp.biopsy_open.get(batch_key) or {}).get(iso)
@@ -1825,13 +1884,16 @@ def _solve_month_once(inp: DaySolveInput, seat_cap=None, *, biopsy_caps=None,
                                    not in (clerk_leave.get(c) or set())))
             slots, slog = solve_session(
                 d, session, rooms,
-                _avail(inp.pgy_roster, pgy_leave, d),
-                _avail(clerk_members, clerk_leave, d),
+                [p for p in _avail(inp.pgy_roster, pgy_leave, d)
+                 if p not in _held_out],
+                [c for c in _avail(clerk_members, clerk_leave, d)
+                 if c not in _held_out],
                 biopsy, fc, inp.capacity, batch_key=batch_key,
                 apply_pref=frozenset(inp.apply_pref), two_pgy_mode=two_pgy,
                 biopsy_quota_left=_quota, biopsy_force=_force,
                 seat_reserved=_seat_res, seat_cap=_seat_cap_now,
-                clerk_high=inp.training.clerk_high)
+                clerk_high=inp.training.clerk_high, preset=_held,
+                preset_ck=_held_ck(_held, batch_key, pgy_set, clerk_set))
             day_slots.setdefault(iso, {})[session] = slots
             log.append(f"{d.month}/{d.day}({'一二三四五六日'[d.weekday()]}) "
                        + "；".join(slog))

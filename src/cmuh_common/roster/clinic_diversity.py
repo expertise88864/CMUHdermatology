@@ -2,6 +2,7 @@
 from collections import Counter
 from datetime import date
 
+from .held import is_held
 from .solve_day import (
     REST, STUDENT_SESSIONS, TWO_PGY_PHOTO_ONLY,
     arbitration_order, day_owner_batch, is_follow_slot,
@@ -112,10 +113,10 @@ def balance_clinics(inp, slots, *, control=None):
                 for r in sorted(set(inp.grid[d].get(s, []))):
                     for p in sorted(source.get(r, [])):
                         kp = key(d, p)
-                        if kp is None or pinned(d, r, p):
+                        if kp is None or pinned(d, r, p) or is_held(inp, iso, s, p):
                             continue
                         for t in (s,) + tuple(ss for ss in STUDENT_SESSIONS if ss != s):
-                            if t in inp.locked.get(iso, {}):
+                            if t in inp.locked.get(iso, {}) or is_held(inp, iso, t, p):
                                 continue
                             dest = slots.get(iso, {}).get(t, {})
                             cross = s != t
@@ -134,7 +135,9 @@ def balance_clinics(inp, slots, *, control=None):
                                     if q is not None and b and not a:
                                         continue  # A swap must not send the other person to an unknown doctor.
                                     kq = key(d, q) if q is not None else None
-                                    if q == p or (q is not None and (kq is None or pinned(d, target, q))):
+                                    if q == p or (q is not None and (kq is None or pinned(d, target, q)
+                                                                     or is_held(inp, iso, t, q)
+                                                                     or is_held(inp, iso, s, q))):
                                         continue
                                     if cross and q is not None and (not can_change_session(d, t, s, q) or q not in source.get(REST, [])):
                                         continue
