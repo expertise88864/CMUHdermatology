@@ -2161,3 +2161,20 @@ def test_romanized_name_split_by_spaces_or_line_breaks_is_redacted():
         for secret in ("Test name", "Testna", "TEST NAME", "Nur", "NUR"):
             assert secret not in body, (note, secret)
         assert "rash" in html
+
+
+def test_one_unparsed_patient_only_hides_that_consult():
+    """[2026-11-10 使用者定案] 七筆裡一筆解析不出 → 只遮那一筆,其餘照常(仍去識別)。"""
+    labels = ["莊振銘B7(163)0029588049(沈冠宇)06/15(08:20)",
+              "JANE ROERICU(05)0099887766(王大明)11/10(11:28)"]
+    entries = [[("內容1", "莊振銘 0029588049 癢三天")], [("內容1", "Jane Roe rash")]]
+    html = cq._format_extracted_entries_html(entries, labels=labels,
+                                             roster_complete=False)
+    assert "癢三天" in html
+    assert "莊振銘" not in html and "0029588049" not in html
+    # 解析不出的那一筆:標題與內容各顯示一次;另一筆完全不受影響。
+    assert html.count("識別資料無法可靠解析") == 2
+    assert "Jane Roe" not in html and "rash" not in html
+    txt = cq._format_extracted_entries(entries, labels=labels, roster_complete=False)
+    assert "癢三天" in txt and txt.count("識別資料無法可靠解析") == 2
+    assert "Jane Roe" not in txt

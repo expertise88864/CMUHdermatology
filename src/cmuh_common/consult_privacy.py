@@ -34,21 +34,27 @@ def scrub(text, identities):
 
 def safe_entries(entries, labels, parser, *, identities=None,
                  roster_complete=True):
+    """逐筆去識別化。
+
+    ★[2026-11-10 使用者定案] 只遮解析不出的那一筆★:每一筆只看【它自己的】
+    標題能不能解析出姓名與病歷號 —— 能 → 以所有已知身分遮蔽後照常顯示;
+    不能(或根本沒有標題)→ 只有那一筆顯示 UNPARSED。舊規則是「任何一列
+    解析不出就整封遮蔽」:一位外籍病人就讓七筆會診內容全部看不到。
+    已接受的殘餘風險(使用者知情):解析不出的那位病人若在【別筆】內文被提到,
+    他的姓名無從得知、遮不到。`roster_complete` 因此不再影響顯示,保留參數
+    只為呼叫端相容。"""
+    del roster_complete
     parsed = [parser(raw) for raw in (labels or [])]
-    reliable = (roster_complete
-                and len(parsed) >= len(entries)
-                and all(p and p.get("name") and p.get("chart") for p in parsed))
     privacy_identities = [p for p in parsed if p]
     for identity in identities or ():
         if identity and identity not in privacy_identities:
             privacy_identities.append(identity)
-    reliable = reliable and all(
-        p.get("name") and p.get("chart") for p in privacy_identities)
     out = []
-    for panes in entries:
+    for index, panes in enumerate(entries):
+        own = parsed[index] if index < len(parsed) else None
         if not any(str(text or "").strip() for _, text in panes):
             out.append([])
-        elif not reliable:
+        elif not (own and own.get("name") and own.get("chart")):
             out.append([("會診內容", UNPARSED)])
         else:
             out.append([(scrub(label, privacy_identities),

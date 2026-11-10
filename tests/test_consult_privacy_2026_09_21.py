@@ -28,16 +28,18 @@ def test_cross_patient_mentions_are_redacted_without_mutating_input():
     assert entries[0][0][1] == "測試甲與測試乙 9876543211"
 
 
-def test_unparseable_roster_row_fail_closes_every_note_body():
-    entries = [[("原因", "測試甲與未知病人 9876543212")]]
-    result = safe_entries(
-        entries,
-        ["測試甲A1(101)9876543210"],
-        lambda _raw: {"name": "測試甲", "chart": "9876543210"},
-        identities=[{"name": "測試甲", "chart": "9876543210"}],
-        roster_complete=False,
-    )
-    assert result == [[("會診內容", UNPARSED)]]
+def test_an_unparsed_row_only_hides_its_own_entry():
+    """[2026-11-10 使用者定案] 只遮解析不出的那一筆,其他照常顯示(仍去識別)。"""
+    identities = {"a": {"name": "測試甲", "chart": "9876543210"}}
+    entries = [[("原因", "測試甲 9876543210 皮疹")],
+               [("原因", "Unidentified Smith 9876543212")],
+               [("原因", "沒有標題的這一筆")]]
+    result = safe_entries(entries, ["a", "unknown"], identities.get,
+                          roster_complete=False)
+    assert result[1] == [("會診內容", UNPARSED)]
+    assert result[2] == [("會診內容", UNPARSED)]
+    shown = result[0][0][1]
+    assert "皮疹" in shown and "測試甲" not in shown and "9876543210" not in shown
 
 
 def test_html_scrubs_cross_patient_identity_before_line_break_rendering():
