@@ -339,6 +339,11 @@ class TreatmentStep(FillStep):
         log.append(f"{ctx.session} 治療室 ← PGY {pick}")
 
 
+def _slot_day(label):
+    """時段標籤的日期部分:標籤可以是日期字串,或 (日期, 時段)。"""
+    return label[0] if isinstance(label, tuple) else label
+
+
 def _max_pairs(people: list, slots: list, free) -> int:
     """人 × 時段的最大匹配數(每人至多一個時段、每個時段至多一個人)。
 
@@ -356,7 +361,8 @@ def _max_pairs(people: list, slots: list, free) -> int:
         —— 判斷「還配不配得完」時若允許同一人吃掉同一天的早+午,就會高估可行性
         而放掉今天該補的人(外審 Codex RS-24 配額版 P2)。
         (`slots` 是日期字串,同一天的早/午是【同一個標籤】出現兩次。)"""
-        return any(q == p and slots[j] == s for j, q in match.items())
+        return any(q == p and _slot_day(slots[j]) == _slot_day(s)
+                   for j, q in match.items())
 
     def _aug(p, seen: set) -> bool:
         for i, s in enumerate(slots):
@@ -1865,7 +1871,9 @@ def _solve_month_once(inp: DaySolveInput, seat_cap=None, *, biopsy_caps=None,
                 #   別人的機會 —— 當成未來容量會高估可行性、今天挑錯人。
                 _free_slots = (_bio_slots.get(batch_key, set())
                                - _locked_keys.get(batch_key, set()))
-                _later = [i2 for i2, s2 in sorted(_free_slots)
+                # ★保留時段★(2026-11-10 人員固定):同一天早/午可能一格被固定、
+                #   一格沒有,只看日期會把被固定的人當成那一格還排得到。
+                _later = [(i2, s2) for i2, s2 in sorted(_free_slots)
                           if (i2, STUDENT_SESSIONS.index(s2)
                               if s2 in STUDENT_SESSIONS else 0) > _now_key]
                 _force = _biopsy_forced_today(
@@ -1879,9 +1887,11 @@ def _solve_month_once(inp: DaySolveInput, seat_cap=None, *, biopsy_caps=None,
                     [c for c in _quota
                      if _quota[c] > 0
                      and d not in (clerk_leave.get(c) or set())
+                     and c not in _held_out
                      and fc.last_biopsy.get((batch_key, c)) != d],
-                    lambda c, i2: (date.fromisoformat(i2)
-                                   not in (clerk_leave.get(c) or set())))
+                    lambda c, k: (date.fromisoformat(k[0])
+                                  not in (clerk_leave.get(c) or set())
+                                  and c not in held_codes(inp, k[0], k[1])))
             slots, slog = solve_session(
                 d, session, rooms,
                 [p for p in _avail(inp.pgy_roster, pgy_leave, d)

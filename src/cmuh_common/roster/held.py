@@ -92,8 +92,11 @@ def held_violations(inp, slots: dict) -> list:
         cell = ((slots or {}).get(iso) or {}).get(s) or {}
         expected = held_cell(inp, iso, s)
         for code in sorted(held_codes(inp, iso, s)):
-            want = sorted(slot for slot, people in expected.items() if code in people)
-            got = sorted(slot for slot, people in cell.items() if code in (people or ()))
+            # 逐次比對(不是只看在不在):同一格出現兩次也算被改動。
+            want = sorted(slot for slot, people in expected.items()
+                          for p in people if p == code)
+            got = sorted(slot for slot, people in cell.items()
+                         for p in (people or ()) if p == code)
             if want != got:
                 problems.append(f"{iso} {s} {code}：應為 {want or '無'}，實際 {got or '無'}")
     return problems

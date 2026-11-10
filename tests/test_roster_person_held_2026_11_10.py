@@ -284,3 +284,30 @@ def test_a_held_seat_in_a_closed_room_is_kept_and_reported():
     s1, _log, warnings = month_solve_day(inp)
     assert s1[iso][s].get("105") == ["C1"]
     assert any("未開診" in w and "C1" in w for w in warnings)
+
+
+def test_biopsy_lookahead_knows_a_future_held_half_day():
+    """[PR #18 審查 P2] 只開兩個切片時段(週一早、週二早),兩人各 1 次;"1" 週二早
+    被固定在放假 —— 週一那一格若給了 "6",週二就沒有人能切(6 已用完、1 被固定)。
+    抖動偏好 "6",所以前瞻若把被固定的人當成還排得到,就會挑錯人。"""
+    from test_roster_clerk_biopsy_quota_2026_08_24 import MON, _counts
+    from test_roster_clerk_biopsy_quota_2026_08_24 import _grid as _bgrid
+    from datetime import timedelta
+    grid, _bio = _bgrid(MON, 12, ["101", "102"], ["101", "102"])
+    tue = (MON + timedelta(days=1)).isoformat()
+    bio = {"b1": {MON.isoformat(): {"上午": True}, tue: {"上午": True}}}
+    day_slots, _log, warns = month_solve_day(DaySolveInput(
+        ym="2026-08", grid=grid, pgy_roster=["P1"],
+        clerk_batches=[ClerkBatch("b1", MON, ["1", "6"])], biopsy_open=bio,
+        held={tue: {"上午": {REST: ["1"]}}}, held_people={tue: {"上午": ["1"]}}))
+    _seat, bx, _rest = _counts(day_slots)
+    assert (bx.get("1", 0), bx.get("6", 0)) == (1, 1), f"{bx} / {warns}"
+
+
+def test_the_final_check_catches_a_duplicated_held_person():
+    """[PR #18 審查 P2] 同一格出現兩次也是被改動,不可以只看「在不在」。"""
+    inp = _input(held={"2026-08-04": {"上午": {"101": ["C1"]}}},
+                 held_people={"2026-08-04": {"上午": ["C1"]}})
+    doubled = {"2026-08-04": {"上午": {"101": ["C1", "C1"]}}}
+    with pytest.raises(RuntimeError):
+        enforce_held(inp, doubled)
