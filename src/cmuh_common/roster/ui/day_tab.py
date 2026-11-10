@@ -641,6 +641,13 @@ class DayScheduleTab(ttk.Frame):
                 self.app.ym, day_slots, expect=res, today=date.today())
             report = self._format_report(
                 log, warnings, analysis["explanation"], analysis["diagnostics"])
+            if "changes" in analysis:
+                # [2026-11-10] 固定模式:先列「跟目前班表比改了什麼」,再列未滿足條件
+                #   (警告),由使用者決定是否採用。
+                changes = analysis["changes"]
+                body = "\n".join(f"  {c}" for c in changes) or "  （無變動）"
+                report = (f"【與目前班表相比的變動】共 {len(changes)} 項\n{body}\n\n"
+                          + report.replace("【警告】", "【未滿足條件／衝突】", 1))
         except Exception as exc:  # noqa: BLE001
             logging.exception("[roster.ui] 無法重算排班預覽與統計")
             messagebox.showerror("預覽失敗", f"無法核對鎖定時段與統計：\n{exc}", parent=self)

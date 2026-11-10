@@ -149,3 +149,91 @@ def held_conflicts(inp) -> list:
                                f"仍保留原班（{'、'.join(work)}）——請確認")
                     break
     return out
+
+
+# ─── 兩個按鈕 → 固定範圍(service 用;純函式) ─────────────────────────────
+#: 只排未鎖定人員:勾選的人在可排的每一格都固定。
+HELD_PEOPLE = "people"
+#: 局部重排(請假):請假者請假的那幾個半天全體可動;請假者本人其他日子可動
+#:   (只能補進空位 —— 其他人都固定,不會被擠掉);其餘全部固定。
+HELD_LOCAL = "local"
+
+
+def _roster_codes(inp) -> set:
+    codes = {str(p) for p in inp.pgy_roster}
+    codes |= {str(p) for b in (inp.clerk_batches or []) for p in b.members}
+    codes |= {str(p) for p in inp.external_roster}
+    codes |= {str(p) for p in inp.family_roster}
+    return codes
+
+
+def _absent_at(inp, code: str, d, session: str) -> bool:
+    from .session_leave import on_leave
+    return any(on_leave(inp, scope, code, d, session)
+               for scope in ("pgy", "clerk", "external", "family"))
+
+
+def held_from_spec(inp, day_slots: dict, mode: str, codes) -> tuple:
+    """(held, held_people):把按鈕的選擇換成求解器的固定範圍。
+
+    只處理【可排】的格(在格網裡、沒有整格鎖定 —— 今天以前已由 RS-32 併入
+    鎖定);固定的位置一律取自目前存檔的班表 `day_slots`。"""
+    codes = {str(c) for c in (codes or ())}
+    everyone = _roster_codes(inp)
+    unknown = sorted(codes - everyone)
+    if unknown:
+        raise ValueError(f"不在本月名單：{'、'.join(unknown)}")
+    if not codes:
+        raise ValueError("請至少選擇一位人員")
+    if mode not in (HELD_PEOPLE, HELD_LOCAL):
+        raise ValueError(f"未知的固定方式：{mode}")
+    held: dict = {}
+    people: dict = {}
+    for d in sorted(inp.grid):
+        iso = d.isoformat()
+        if iso[:7] != inp.ym or d.weekday() >= 5:
+            continue
+        for s in STUDENT_SESSIONS:
+            if _locked(inp, iso, s):
+                continue
+            if mode == HELD_PEOPLE:
+                fixed = set(codes)
+            elif any(_absent_at(inp, c, d, s) for c in codes):
+                continue                     # 請假的半天:全體可動
+            else:
+                fixed = everyone - codes     # 請假者本人可動,其他人固定
+            cell = ((day_slots or {}).get(iso) or {}).get(s) or {}
+            part = {str(slot): [str(p) for p in ps if str(p) in fixed]
+                    for slot, ps in cell.items() if isinstance(ps, list)}
+            part = {slot: ps for slot, ps in part.items() if ps}
+            if part:
+                held.setdefault(iso, {})[s] = part
+            people.setdefault(iso, {})[s] = sorted(fixed)
+    return held, people
+
+
+def describe_changes(before: dict, after: dict) -> list:
+    """逐人逐格的變動 → 人話清單(預覽用)。只列位置真的不同的人。"""
+    lines = []
+    keys = sorted({(iso, s) for table in (before or {}, after or {})
+                   for iso, ss in table.items() if isinstance(ss, dict)
+                   for s in ss if s in STUDENT_SESSIONS})
+    for iso, s in keys:
+        def where(table, iso=iso, s=s):
+            cell = ((table or {}).get(iso) or {}).get(s) or {}
+            out: dict = {}
+            for slot, ps in cell.items():
+                for p in (ps or []):
+                    out.setdefault(str(p), []).append(str(slot))
+            return out
+        b, a = where(before), where(after)
+        try:
+            d = _date.fromisoformat(iso)
+            label = f"{d.month}/{d.day}({'一二三四五六日'[d.weekday()]}) {s}"
+        except (TypeError, ValueError):
+            label = f"{iso} {s}"
+        for p in sorted(set(b) | set(a)):
+            if sorted(b.get(p, [])) != sorted(a.get(p, [])):
+                lines.append(f"{label} {p}：{'、'.join(sorted(b.get(p, []))) or '（無）'}"
+                             f" → {'、'.join(sorted(a.get(p, []))) or '（無）'}")
+    return lines

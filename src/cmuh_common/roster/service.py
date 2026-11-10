@@ -409,6 +409,15 @@ class DaySolveResult(NamedTuple):
     warnings: list
     fingerprint: str
     month_revision: str
+    # [2026-11-10] 人員固定的範圍(只排未鎖定人員/局部重排)。驗證與套用要用
+    #   同一份範圍重建輸入,指紋才比得起來;None = 一般排班。
+    held: "HeldSpec | None" = None
+
+
+class HeldSpec(NamedTuple):
+    """按鈕選擇的固定範圍(見 `held.held_from_spec`)。"""
+    mode: str
+    codes: tuple
 
 
 def _config_intent_digest(cfg: dict) -> str:
@@ -845,7 +854,8 @@ class RosterService:
     # ── PGY/Clerk 日排班（Phase 3）──────────────────────────────────────
     def build_day_input(self, ym: str, *,
                         src: "StrictSources | None" = None,
-                        today: "date | None" = None) -> DaySolveInput:
+                        today: "date | None" = None,
+                        held: "HeldSpec | None" = None) -> DaySolveInput:
         """組裝 PGY/Clerk 日填充器輸入（開診格網 + 名單 + 切片開放 + 請假）。
 
         `src`＝權威輸入(見 `SRC_DAY`)。★會寫回去的路徑一律要帶★:門診模板
@@ -1046,7 +1056,7 @@ class RosterService:
             prior_pgy = {str(x) for x in prev_pgy}
 
         from .training_params import TrainingParams
-        return DaySolveInput(
+        inp = DaySolveInput(
             training=TrainingParams.from_config(cfg),
             ym=ym, grid=grid, pgy_roster=list(pgy_roster), clinic_doctors=clinic_doctors,
             external_roster=external_month_codes(month),
@@ -1069,10 +1079,18 @@ class RosterService:
             prior_sessions=prior_sessions, prior_pgy=prior_pgy,
             apply_pref={str(c) for c in (month.get("pgy_apply_pref") or [])},
             pgy_photo_offsets=dict(month.get("pgy_photo_offsets") or {}))
+        if held is not None:
+            # [2026-11-10] 固定的位置取自目前存檔的班表 —— 它也進了指紋,預覽
+            #   期間有人改了班表,套用時就會被判過期。
+            from .held import held_from_spec
+            inp.held, inp.held_people = held_from_spec(
+                inp, day_slots, held.mode, held.codes)
+        return inp
 
     def run_day_solve(self, ym: str, *,
                       today: "date | None" = None,
-                      control=None) -> "DaySolveResult":
+                      control=None,
+                      held: "HeldSpec | None" = None) -> "DaySolveResult":
         """build_day_input → month_solve_day。不落地。
 
         回傳除了結果本身,還帶著★這次求解吃到的輸入的識別★(見
@@ -1093,14 +1111,14 @@ class RosterService:
             control.checkpoint("核對門診與值班資料")
         _pend = self.require_grid_shifts_reconciled(ym)
         _m, rev = self.storage.load_month_with_revision(ym)
-        inp = self.build_day_input(ym, today=today)
+        inp = self.build_day_input(ym, today=today, held=held)
         if control is not None:
             control.checkpoint("開始安排日班")
         day_slots, log, warnings = month_solve_day(inp, control=control)
         if control is not None:
             control.checkpoint("完成排班，核對輸入版本")
         return DaySolveResult(day_slots, log, list(warnings) + _pend,
-                              day_input_fingerprint(inp), rev)
+                              day_input_fingerprint(inp), rev, held)
 
     def day_solution_is_current(self, ym: str, result: "DaySolveResult", *,
                                 today: "date | None" = None) -> bool:
@@ -1111,7 +1129,8 @@ class RosterService:
             return (not month.get("finalized")
                     and rev == result.month_revision
                     and result.fingerprint == day_input_fingerprint(
-                        self.build_day_input(ym, src=src, today=today)))
+                        self.build_day_input(ym, src=src, today=today,
+                                             held=result.held)))
 
     def compare_pgy_zero_offset(self, ym: str, code: str, *,
                                 today: "date | None" = None,
@@ -1195,14 +1214,21 @@ class RosterService:
         with self.storage.write_barrier():
             src = self._sources(ym, SRC_DAY, months=(next_ym(ym),))
             month, rev = src.month_snapshot(ym)
-            inp = self.build_day_input(ym, src=src, today=today)
+            held = getattr(expect, "held", None)
+            inp = self.build_day_input(ym, src=src, today=today, held=held)
             if expect is not None and (rev != expect.month_revision
                                        or day_input_fingerprint(inp) != expect.fingerprint):
                 raise ValueError("排班資料已變動，請重新排班")
             effective = self._overlay_locked_sessions(month, day_slots)
-            return self.day_course_stats(
+            out = self.day_course_stats(
                 ym, day_slots_override=effective, inp=inp,
                 src=src)
+            if held is not None:
+                # [2026-11-10] 固定模式的預覽要逐人列出「跟目前班表比改了什麼」。
+                from .held import describe_changes
+                out["changes"] = describe_changes(
+                    month.get("day_slots") or {}, effective)
+            return out
 
     def day_current_course_stats(self, ym: str, *,
                                  today: "date | None" = None) -> dict:
@@ -1260,7 +1286,8 @@ class RosterService:
             #   「今天以前」的集合已經不一樣 → 指紋不符 → 請使用者重排
             #   (舊預覽裡「今天」還是可排的,套下去會蓋掉今天的實況)。
             if expect.fingerprint != day_input_fingerprint(
-                    self.build_day_input(ym, src=src, today=today)):
+                    self.build_day_input(ym, src=src, today=today,
+                                         held=getattr(expect, "held", None))):
                 raise ValueError(
                     "排班結果已過期（名單／請假／Clerk 梯次／停診／門診模板等"
                     "輸入已變動），請重新排班")
