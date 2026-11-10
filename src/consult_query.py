@@ -1806,13 +1806,78 @@ def _consult_slot_label(trigger_label: str, now: datetime) -> str:
     return "昨晚今早會診清單" if hour < 15 else "下午會診清單"
 
 
+# [2026-11-10 實機] 外籍病人:HIS 以大寫羅馬拼音(可含空格)顯示姓名,後面直接接
+#   病房代號,例「NUR XXXA6(112)0012345678(主治)11/10(11:03)」。姓名與病房黏在
+#   一起,只有在【床號與病歷號都在】的強結構下才拆,拆法見 `_split_latin_ward`。
+_LATIN_ROW_RE = re.compile(
+    rf"^(?P<head>[A-Z][A-Z0-9 .'\-]*[A-Z0-9])"
+    rf"\((?P<bed>[0-9A-Za-z]+)\)"
+    rf"(?P<chart>\d{{6,}})"
+    rf"(?:\((?P<vs>[{_CJK_CHARS}·]+)\))?"
+    rf"\s*(?P<date>\d{{1,2}}/\d{{1,2}})?"
+    rf"\s*(?:\((?P<time>\d{{1,2}}:\d{{2}})\))?")
+# 全字母的病房代號(無數字)無法從羅馬拼音姓名後面可靠切開,只認這些已知代號。
+_LATIN_LETTER_WARDS = ("BURN", "RICU", "MICU", "SICU", "NICU", "PICU", "CCU", "ICU")
+
+
+def _split_latin_ward(head: str):
+    """羅馬拼音姓名+病房 → (姓名, 病房);切不出來回 None(寧可遮蔽也不猜)。
+    病房結尾有數字 → 一個字母+數字(A6、C18、I8);否則只認已知的全字母病房。"""
+    m = re.search(r"[A-Z]\d+$", head)
+    if m:
+        name, ward = head[:m.start()], m.group(0)
+    else:
+        ward = next((w for w in _LATIN_LETTER_WARDS if head.endswith(w)), "")
+        if not ward:
+            return None
+        name = head[:-len(ward)]
+    name = name.strip()
+    if len(re.sub(r"[^A-Z]", "", name)) < 2:
+        return None
+    return name, ward
+
+
+def _parse_latin_row(text: str):
+    m = _LATIN_ROW_RE.fullmatch(text)
+    if not m:
+        return None
+    split = _split_latin_ward(m.group("head"))
+    if not split:
+        return None
+    name, ward = split
+    # 遮蔽用的別名:姓名可能被內文分開寫、或病房切分有一兩個字母的誤差 ——
+    #   4 個字母以上的單字各自也遮,寧可多遮。
+    aliases = [w for w in re.split(r"[ .'\-]+", name) if len(w) >= 4]
+    return {"name": name, "ward_bed": " · ".join(p for p in (ward, m.group("bed")) if p),
+            "chart": m.group("chart"), "vs": m.group("vs") or "",
+            "date": m.group("date") or "", "time": m.group("time") or "",
+            "aliases": aliases}
+
+
+def _roster_row_shape(text: str) -> str:
+    """不含個資的格式形狀(給 log 判斷新格式用):中日韓字→字、英文→A/a、數字→9。"""
+    out = []
+    for ch in str(text or ""):
+        if re.match(f"[{_CJK_CHARS}]", ch):
+            out.append("字")
+        elif "A" <= ch <= "Z":
+            out.append("A")
+        elif "a" <= ch <= "z":
+            out.append("a")
+        elif ch.isdigit():
+            out.append("9")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _parse_roster_row(text: str):
     """把一列病人文字解析成欄位 dict;結構太弱或非預期格式回 None(走 raw fallback)。
     [codex review] 用 fullmatch:整列都被解析掉才算結構化,否則(尾端有未預期文字)
     回 None 改顯示原字串 —— 避免 prefix match 把尾端資訊靜默丟掉。"""
     m = _ROSTER_ROW_RE.fullmatch((text or "").strip())
     if not m or not m.group("name"):
-        return None
+        return _parse_latin_row((text or "").strip())
     chart = m.group("chart") or ""
     bed = m.group("bed") or ""
     ward = m.group("ward") or ""
@@ -1866,6 +1931,7 @@ def _format_patient_roster_html(texts: list, label: str) -> str:
                         f'<td style="{th_r}">{_esc(_roster_when(p))}</td></tr>')
         else:
             from cmuh_common.consult_privacy import UNPARSED
+            logging.warning("[會診] 病人列格式無法解析(形狀=%s)", _roster_row_shape(t))
             rows.append(f'<tr><td colspan="3">{_esc(UNPARSED)}</td></tr>')
     return (
         _section_label(f"{label}　·　{len(items)} 位")

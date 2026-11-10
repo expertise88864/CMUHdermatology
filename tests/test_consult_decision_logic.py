@@ -2069,3 +2069,54 @@ def test_the_next_job_sends_once_the_first_is_known_to_have_failed(monkeypatch):
     h2 = _JobHarness(monkeypatch, _base_cfg(), extracted_text=txt)
     cq._do_full_job("17:00")
     assert len(h2.sent) == 1, "★前一次確定失敗卻不准寄★ 這則通知就漏掉了"
+
+
+# [2026-11-10 實機] 外籍病人:大寫羅馬拼音姓名(可含空格)後面直接接病房代號。
+#   一筆解析不出,整封信的會診內容都被遮蔽(fail-closed)。以下全為虛構資料。
+_LATIN_ROW = "NUR TESTNAMEA6(112)0012345678(王大明)11/10(11:03)"
+
+
+def test_parse_roster_row_latin_name_with_digit_ward():
+    p = cq._parse_roster_row(_LATIN_ROW)
+    assert p is not None
+    assert p["name"] == "NUR TESTNAME"
+    assert p["ward_bed"] == "A6 · 112"
+    assert p["chart"] == "0012345678"
+    assert p["vs"] == "王大明"
+    assert (p["date"], p["time"]) == ("11/10", "11:03")
+    p2 = cq._parse_roster_row("JANE ROEC18(222)0099887766(王大明)11/10(15:12)")
+    assert p2 is not None and p2["name"] == "JANE ROE" and p2["ward_bed"] == "C18 · 222"
+
+
+def test_parse_roster_row_latin_name_with_letter_ward():
+    p = cq._parse_roster_row("JANE ROERICU(05)0099887766(王大明)11/10(11:28)")
+    assert p is not None and p["name"] == "JANE ROE" and p["ward_bed"] == "RICU · 05"
+    # 未知的全字母病房切不開 → 維持遮蔽,不猜
+    assert cq._parse_roster_row("JANE ROEXYZ(05)0099887766(王大明)11/10(11:28)") is None
+
+
+def test_latin_row_without_bed_or_chart_stays_unparsed():
+    assert cq._parse_roster_row("JOHN SMITH 0012345678") is None
+    assert cq._parse_roster_row("NUR TESTNAMEA6(112)(王大明)11/10(11:03)") is None
+
+
+def test_one_foreign_patient_no_longer_hides_every_consult():
+    """實機情境:七筆裡一筆外籍,原本整封遮蔽;現在每筆都正常顯示且仍去識別。"""
+    labels = ["莊振銘B7(163)0029588049(沈冠宇)06/15(08:20)", _LATIN_ROW]
+    entries = [[("內容1", "癢")],
+               [("內容1", "Nur Testname rash for 1 day, chart 0012345678")]]
+    html = cq._format_extracted_entries_html(entries, labels=labels)
+    assert "識別資料無法可靠解析" not in html
+    assert "rash for 1 day" in html
+    for secret in ("TESTNAME", "Testname", "0012345678", "莊振銘", "0029588049"):
+        assert secret not in html, secret
+    assert "A6 · 112" in html
+
+
+def test_unparsed_row_logs_only_a_pii_free_shape(caplog):
+    import logging
+    row = "王小明XYZ(5-1)1234567(李醫師)"
+    with caplog.at_level(logging.WARNING):
+        cq._format_patient_roster_html([row], "下午會診清單")
+    assert "形狀=字字字AAA(9-9)9999999(字字字)" in caplog.text
+    assert "王小明" not in caplog.text and "1234567" not in caplog.text

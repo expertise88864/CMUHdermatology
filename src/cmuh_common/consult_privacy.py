@@ -8,6 +8,7 @@ UNPARSED = "識別資料無法可靠解析，請至 HIS 查看此筆會診。"
 def scrub(text, identities):
     text = str(text or "")
     values = {str(p.get(k) or "") for p in identities for k in ("name", "chart")}
+    values.update(str(a) for p in identities for a in (p.get("aliases") or ()))
     # Some HIS panes omit the roster's zero padding. Do not turn very short
     # numeric identifiers into a global substitution of doses or dates.
     values.update(chart.lstrip("0") for p in identities
