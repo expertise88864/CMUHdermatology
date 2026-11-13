@@ -170,6 +170,9 @@ class DayScheduleTab(ttk.Frame):
         self._lock_btn.pack(side="left", padx=4)
         self._clear_btn = ttk.Button(bar, text="清除未鎖定", command=self._on_clear)
         self._clear_btn.pack(side="left", padx=4)
+        # [2026-11-13 使用者] 排錯之後回到先前排好的版本(見 undo.py)
+        self._undo_btn = ttk.Button(bar, text="復原排班…", command=self._on_undo)
+        self._undo_btn.pack(side="left", padx=4)
         ttk.Button(bar, text="報告/警告", command=self._on_report
                    ).pack(side="left", padx=4)
         # [2026-07-23 使用者] 月曆總覽改為分頁內建預設檢視;此鈕切換 列表↔月曆
@@ -643,6 +646,7 @@ class DayScheduleTab(ttk.Frame):
         self._auto_btn.config(state="disabled")
         self._people_btn.config(state="disabled")
         self._local_btn.config(state="disabled")
+        self._undo_btn.config(state="disabled")
         self._cancel_btn.config(state="normal")
         self._status.set("排班準備中；可按「取消排班」")
         result = {}
@@ -685,7 +689,7 @@ class DayScheduleTab(ttk.Frame):
             self._day_solving = False
             self._day_control = None
             self._auto_btn.config(state="disabled" if self._finalized else "normal")
-            for _b in (self._people_btn, self._local_btn):
+            for _b in (self._people_btn, self._local_btn, self._undo_btn):
                 _b.config(state="disabled" if self._finalized else "normal")
             self._cancel_btn.config(state="disabled")
             if control.cancelled or "stopped" in result:
@@ -834,6 +838,20 @@ class DayScheduleTab(ttk.Frame):
         #   衝突)—— 這裡無條件清掉,使用者會在衝突還在時看到一片空白。
         #   清除未鎖定本來就不會產生新的求解警告,讓 refresh 的結果留著即可。
         self.refresh()
+
+    def _on_undo(self) -> None:
+        if self._finalized or self._day_solving:
+            return
+        from .undo_dialog import UndoDialog
+        try:
+            dlg = UndoDialog(self, self.service, "day", self.app.ym, title=_TITLE)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("復原排班", str(exc), parent=self)
+            return
+        self.wait_window(dlg)
+        if dlg.restored:
+            self.refresh()
+            self._status.set("已復原排班；復原前的班表已保留成還原點")
 
     def _on_leave(self, scope: str) -> None:
         if self._finalized:
@@ -1351,10 +1369,11 @@ class DayScheduleTab(ttk.Frame):
     def _apply_finalized_state(self) -> None:
         state = "disabled" if self._finalized else "normal"
         for w in (self._auto_btn, self._people_btn, self._local_btn,
-                  self._clear_btn, self._lock_btn, *self._edit_btns):
+                  self._clear_btn, self._undo_btn, self._lock_btn, *self._edit_btns):
             w.config(state=state)
         if self._day_solving:
-            for w in (self._auto_btn, self._people_btn, self._local_btn):
+            for w in (self._auto_btn, self._people_btn, self._local_btn,
+                      self._undo_btn):
                 w.config(state="disabled")
         if self._page_var.get() == "doctors":
             self._lock_btn.config(state="disabled")

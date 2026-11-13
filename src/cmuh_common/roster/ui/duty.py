@@ -223,6 +223,7 @@ class CalendarDutyTab(ttk.Frame):
         self._selector.pack(side="left")
         self._toolbar = []
         self._auto_btns, self._clear_btns = {}, {}
+        self._undo_btns = {}
         self._report_btns, self._resettle_btns = {}, {}
         # 每線一組操作鈕（自動排班/清除/報告/重算帳本），線別色籤區分
         for scope in ("r", "vs"):
@@ -236,6 +237,10 @@ class CalendarDutyTab(ttk.Frame):
             self._clear_btns[scope] = ttk.Button(
                 grp, text="清除未鎖", width=8,
                 command=lambda s=scope: self._on_clear_unlocked(s))
+            # [2026-11-13 使用者] 排錯之後回到先前排好的版本(見 undo.py)
+            self._undo_btns[scope] = ttk.Button(
+                grp, text="復原…", width=6,
+                command=lambda s=scope: self._on_undo(s))
             self._report_btns[scope] = ttk.Button(
                 grp, text="報告", width=5,
                 command=lambda s=scope: self._on_report(s))
@@ -243,6 +248,7 @@ class CalendarDutyTab(ttk.Frame):
                 grp, text="重算帳本", width=8,
                 command=lambda s=scope: self._on_resettle(s))
             for b in (self._auto_btns[scope], self._clear_btns[scope],
+                      self._undo_btns[scope],
                       self._report_btns[scope], self._resettle_btns[scope]):
                 b.pack(side="left", padx=1)
                 self._toolbar.append(b)
@@ -977,6 +983,20 @@ class CalendarDutyTab(ttk.Frame):
             return
         self.refresh()
 
+    def _on_undo(self, scope: str) -> None:
+        if self._finalized or self._busy_flag:       # 求解中不得復原
+            return
+        from .undo_dialog import UndoDialog
+        try:
+            dlg = UndoDialog(self, self.service, scope, self.app.ym,
+                             title=_SCOPE_TITLE[scope])
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("復原排班", str(e))
+            return
+        self.wait_window(dlg)
+        if dlg.restored:
+            self.refresh()
+
     def _on_export(self) -> None:
         """匯出整月班表（R+VS）。副檔名決定 Excel/Word；重依賴 lazy 安裝。"""
         from cmuh_common.roster.export_common import default_filename
@@ -1086,5 +1106,5 @@ class CalendarDutyTab(ttk.Frame):
         state = "disabled" if (self._finalized or self._busy_flag) else "normal"
         for scope in ("r", "vs"):
             for w in (self._auto_btns[scope], self._clear_btns[scope],
-                      self._resettle_btns[scope]):
+                      self._undo_btns[scope], self._resettle_btns[scope]):
                 w.config(state=state)

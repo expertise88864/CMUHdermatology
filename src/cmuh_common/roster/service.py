@@ -40,6 +40,7 @@ from cmuh_common.roster.model import (
     ClerkBatch, Member, RosterParams, SolveContext, batches_covering, day_point,
     dedupe_codes, duplicated_codes, roc,
 )
+from cmuh_common.roster import undo as roster_undo
 from cmuh_common.roster.session_leave import clerk_leave_days
 from cmuh_common.roster.solve_day import (
     TWO_PGY_PHOTO_ONLY, apply_locked_adjustments,
@@ -1297,6 +1298,11 @@ class RosterService:
                 raise ValueError(
                     "排班結果已過期（名單／請假／Clerk 梯次／停診／門診模板等"
                     "輸入已變動），請重新排班")
+        # [2026-11-13] 落地前留還原點(見 `undo.py`)
+        _held = getattr(expect, "held", None)
+        roster_undo.push(month, "day", {
+            "people": "只排未鎖定人員", "local": "局部重排（請假）",
+        }.get(getattr(_held, "mode", None), "自動排班"), _now())
         month["day_slots"] = self._overlay_locked_sessions(month, day_slots)
         month["day_report"] = report or ""      # 供「報告」鈕顯示落地當下的報告
         stamp_report_digest(month, "day")       # 見 accept_solution 的同一段
@@ -2858,6 +2864,7 @@ class RosterService:
                 for session, slots in sessions.items():
                     if (day_locks.get(iso) or {}).get(session):
                         kept.setdefault(iso, {})[session] = slots
+            roster_undo.push(month, "day", "清除未鎖定", _now())
             month["day_slots"] = kept
             month["day_report"] = ""   # 舊報告已與清除後不符 → 一併清掉，避免誤導
             month.pop(report_digest_key("day"), None)   # 識別跟著報告一起走
@@ -3388,6 +3395,7 @@ class RosterService:
             else:
                 new_duty[iso] = {"person": result.assignments[d],
                                  "locked": False, "source": "auto"}
+        roster_undo.push(month, scope, "自動排班", _now())   # 落地前留還原點
         month[f"{scope}_duty"] = new_duty
         # ★這一份只是【診斷用的快照】,不是任何人的輸入★(外審 RS-20 P1-01):
         #   下個月的跨月連休鏈改由上月 canonical duty 推導
@@ -3673,6 +3681,7 @@ class RosterService:
                     if c.get("locked") or not c.get("person")}
             if kept == duty:                   # 沒有未鎖已排格 → 不 save，免空 commit
                 return False
+            roster_undo.push(month, scope, "清除未鎖定", _now())
             month[f"{scope}_duty"] = kept
             month[f"report_{scope}"] = ""      # 舊報告已與清除後不符 → 一併清掉
             month.pop(report_digest_key(scope), None)   # 識別跟著報告一起走
@@ -3701,6 +3710,92 @@ class RosterService:
         #   ★而且兩個檔之間要留一筆意圖★(RS-10):臨界區擋不住行程被砍。
         # ★清除也是手動改動班表★:帳本要跟著實排走,而且意圖要包住月檔的
         #   寫入(見 set_cell 的同一段)。
+        with (self.storage.write_barrier(),
+              self.settle_intent(scope, ym, kind="ledger",
+                                 witness_ym=ym) as _led,
+              self._biopsy_intent(scope, ym, witness_ym=ym) as _intent):
+            self.update_month(ym, _mut)
+            if _holder.get("book") is not None:
+                self.storage.save_biopsy(
+                    _holder["book"], expected_revision=_holder.get("rev"))
+            if _holder.get("failed"):
+                _intent.keep(f"週六切片重排失敗:{_holder['failed']}")
+            self._converge_ledger_locked(scope, ym, _led)
+
+    # ── 還原點(類似 Ctrl+Z;見 `undo.py`)────────────────────────────────
+    def undo_list(self, key: str, ym: str) -> list:
+        """這個範圍的還原點,最新在前:[{"ts", "action"}]。key = day / r / vs。"""
+        roster_undo.snapshot({}, key)             # 驗證 key
+        return roster_undo.entries(self.storage.load_month(ym), key)
+
+    def undo_preview(self, key: str, ym: str, ts: str) -> list:
+        """復原到這個還原點會改掉什麼(逐格的人話清單;空 = 與目前相同)。"""
+        month = self.storage.load_month(ym)
+        data = roster_undo.find(month, key, ts)["data"]
+        if key == "day":
+            from .held import describe_changes
+            return describe_changes(month.get("day_slots") or {},
+                                    data.get("day_slots") or {})
+        return roster_undo.duty_changes(month.get(f"{key}_duty") or {},
+                                        data.get("duty") or {})
+
+    def undo_restore(self, key: str, ym: str, ts: str) -> None:
+        """把班表復原到這個還原點。復原前的班表也會留成還原點(可再復原回來)。
+        只動班表與它的報告;請假、名單、鎖定設定不變。"""
+        roster_undo.snapshot({}, key)             # 驗證 key
+        if key == "day":
+            self._undo_restore_day(ym, ts)
+        else:
+            self._undo_restore_duty(key, ym, ts)
+
+    def _undo_restore_day(self, ym: str, ts: str) -> None:
+        def _mut(month):
+            if month.get("finalized"):
+                raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能復原")
+            data = copy.deepcopy(roster_undo.find(month, "day", ts)["data"])
+            roster_undo.push(month, "day", "復原", _now())
+            month["day_slots"] = data.get("day_slots") or {}
+            month["day_report"] = data.get("day_report") or ""
+            if month["day_report"]:
+                stamp_report_digest(month, "day")
+            else:
+                month.pop(report_digest_key("day"), None)
+            self._audit(month, "day", "undo_restore", None, str(ts), "undo")
+        self.update_month(ym, _mut)
+
+    def _undo_restore_duty(self, scope: str, ym: str, ts: str) -> None:
+        """值班表復原。★連動與 `clear_unlocked` 完全相同★:R 的週六切片重排、
+        點數帳本重新結算、失敗時留下待收斂的義務 —— 復原只是換了一份值班內容。"""
+        _holder: dict = {}
+
+        def _mut(month) -> None:
+            _holder.clear()
+            if month.get("finalized"):
+                raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能復原")
+            data = copy.deepcopy(roster_undo.find(month, scope, ts)["data"])
+            roster_undo.push(month, scope, "復原", _now())
+            month[f"{scope}_duty"] = data.get("duty") or {}
+            if data.get("last_weekend") is None:
+                (month.get("last_weekend") or {}).pop(scope, None)
+            else:
+                month.setdefault("last_weekend", {})[scope] = data["last_weekend"]
+            month[f"report_{scope}"] = data.get("report") or ""
+            if month[f"report_{scope}"]:
+                stamp_report_digest(month, scope)
+            else:
+                month.pop(report_digest_key(scope), None)
+            self._audit(month, scope, "undo_restore", None, str(ts), "undo")
+            if scope == "r":
+                _holder["failed"] = ""
+                try:
+                    (_a, _n, _holder["book"],
+                     _holder["rev"]) = self.recompute_saturday_biopsy(ym, month)
+                except Exception as e:  # noqa: BLE001
+                    _holder["failed"] = str(e) or e.__class__.__name__
+                    logging.exception(
+                        "[roster.service] 復原值班後週六切片重排失敗"
+                        "（復原照常落地,切片留待收斂）")
+
         with (self.storage.write_barrier(),
               self.settle_intent(scope, ym, kind="ledger",
                                  witness_ym=ym) as _led,
