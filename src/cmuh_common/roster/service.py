@@ -3724,67 +3724,75 @@ class RosterService:
 
     # ── 還原點(類似 Ctrl+Z;見 `undo.py`)────────────────────────────────
     def undo_list(self, key: str, ym: str) -> list:
-        """這個範圍的還原點,最新在前:[{"ts", "action"}]。key = day / r / vs。"""
-        roster_undo.snapshot({}, key)             # 驗證 key
+        """這個範圍的還原點,最新在前:[{"id", "ts", "action"}]。key = day / r / vs。"""
         return roster_undo.entries(self.storage.load_month(ym), key)
 
-    def undo_preview(self, key: str, ym: str, ts: str) -> list:
-        """復原到這個還原點會改掉什麼(逐格的人話清單;空 = 與目前相同)。"""
+    def undo_preview(self, key: str, ym: str, entry_id: str) -> dict:
+        """復原到這個還原點會改掉什麼 → {"changes": [人話清單], "token": 識別}。
+
+        `token` 是預覽當下班表的識別,復原時要帶回來:預覽之後班表若被改過
+        (例:他機同步進來的修改),那份變動清單已經不準,必須重新預覽。"""
         month = self.storage.load_month(ym)
-        data = roster_undo.find(month, key, ts)["data"]
+        data = roster_undo.find(month, key, entry_id)["data"]
+        after = roster_undo.restored_content(month, key, data)
         if key == "day":
             from .held import describe_changes
-            return describe_changes(month.get("day_slots") or {},
-                                    data.get("day_slots") or {})
-        return roster_undo.duty_changes(month.get(f"{key}_duty") or {},
-                                        data.get("duty") or {})
-
-    def undo_restore(self, key: str, ym: str, ts: str) -> None:
-        """把班表復原到這個還原點。復原前的班表也會留成還原點(可再復原回來)。
-        只動班表與它的報告;請假、名單、鎖定設定不變。"""
-        roster_undo.snapshot({}, key)             # 驗證 key
-        if key == "day":
-            self._undo_restore_day(ym, ts)
+            changes = describe_changes(month.get("day_slots") or {}, after)
         else:
-            self._undo_restore_duty(key, ym, ts)
+            changes = roster_undo.duty_changes(month.get(f"{key}_duty") or {}, after)
+        return {"changes": changes, "token": roster_undo.content_token(month, key)}
 
-    def _undo_restore_day(self, ym: str, ts: str) -> None:
-        def _mut(month):
-            if month.get("finalized"):
-                raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能復原")
-            data = copy.deepcopy(roster_undo.find(month, "day", ts)["data"])
-            roster_undo.push(month, "day", "復原", _now())
-            month["day_slots"] = data.get("day_slots") or {}
-            month["day_report"] = data.get("day_report") or ""
-            if month["day_report"]:
-                stamp_report_digest(month, "day")
+    def undo_restore(self, key: str, ym: str, entry_id: str, *, token: str) -> None:
+        """把班表復原到這個還原點。復原前的班表也會留成還原點(可再復原回來)。
+        只動班表與它的報告;請假、名單不變,★目前鎖定的格子保持現狀★。"""
+        roster_undo.entries({}, key)              # 驗證 key
+        if key == "day":
+            self.update_month(
+                ym, lambda month: self._undo_apply(month, key, ym, entry_id, token))
+        else:
+            self._undo_restore_duty(key, ym, entry_id, token)
+
+    def _undo_apply(self, month: dict, key: str, ym: str, entry_id: str,
+                    token: str) -> None:
+        """復原的本體(mutator;CAS 重試時會對最新月檔重跑,每次都重新核對)。"""
+        if month.get("finalized"):
+            raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能復原")
+        if roster_undo.content_token(month, key) != token:
+            raise ValueError(
+                "班表在預覽之後已被修改（可能是其他電腦同步了變動），"
+                "請重新選擇還原點、確認變動清單後再復原")
+        data = copy.deepcopy(roster_undo.find(month, key, entry_id)["data"])
+        restored = roster_undo.restored_content(month, key, data)
+        # ★空班表也要留★:清除之後再復原,復原前那一份就是空的 —— 不留就回不去。
+        roster_undo.push(month, key, "復原", _now(), allow_empty=True)
+        report = data.get("report") or ""
+        if key == "day":
+            month["day_slots"] = restored
+            month["day_report"] = report
+        else:
+            month[f"{key}_duty"] = restored
+            month[f"report_{key}"] = report
+            if data.get("last_weekend") is None:
+                (month.get("last_weekend") or {}).pop(key, None)
             else:
-                month.pop(report_digest_key("day"), None)
-            self._audit(month, "day", "undo_restore", None, str(ts), "undo")
-        self.update_month(ym, _mut)
+                month.setdefault("last_weekend", {})[key] = data["last_weekend"]
+        # ★報告的識別原樣放回,不重新蓋章★:報告當時若已經與班表不符(之後手動
+        #   改過),復原後它仍然不符 —— 重新蓋章等於替舊報告背書。
+        if report and data.get("digest") is not None:
+            month[report_digest_key(key)] = data["digest"]
+        else:
+            month.pop(report_digest_key(key), None)
+        self._audit(month, key, "undo_restore", None, str(entry_id), "undo")
 
-    def _undo_restore_duty(self, scope: str, ym: str, ts: str) -> None:
+    def _undo_restore_duty(self, scope: str, ym: str, entry_id: str,
+                           token: str) -> None:
         """值班表復原。★連動與 `clear_unlocked` 完全相同★:R 的週六切片重排、
         點數帳本重新結算、失敗時留下待收斂的義務 —— 復原只是換了一份值班內容。"""
         _holder: dict = {}
 
         def _mut(month) -> None:
             _holder.clear()
-            if month.get("finalized"):
-                raise FinalizedMonthError(f"{ym} 已定案（唯讀）；解除定案後才能復原")
-            data = copy.deepcopy(roster_undo.find(month, scope, ts)["data"])
-            roster_undo.push(month, scope, "復原", _now())
-            month[f"{scope}_duty"] = data.get("duty") or {}
-            if data.get("last_weekend") is None:
-                (month.get("last_weekend") or {}).pop(scope, None)
-            else:
-                month.setdefault("last_weekend", {})[scope] = data["last_weekend"]
-            month[f"report_{scope}"] = data.get("report") or ""
-            if month[f"report_{scope}"]:
-                stamp_report_digest(month, scope)
-            else:
-                month.pop(report_digest_key(scope), None)
-            self._audit(month, scope, "undo_restore", None, str(ts), "undo")
+            self._undo_apply(month, scope, ym, entry_id, token)
             if scope == "r":
                 _holder["failed"] = ""
                 try:

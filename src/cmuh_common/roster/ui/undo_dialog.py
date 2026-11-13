@@ -17,13 +17,14 @@ class UndoDialog(tk.Toplevel):
         self.transient(parent)
         self.service, self.key, self.ym = service, key, ym
         self.restored = False
+        self._token = None
         self._entries = service.undo_list(key, ym)
         ttk.Label(
             self, padding=(10, 8), wraplength=620, justify="left",
             text=("每次自動排班、清除未鎖定或復原之前，系統會自動保留當時的班表"
                   "（最近 5 個）。\n選一個還原點可先看「復原後會改掉什麼」；"
-                  "只還原班表，請假、名單與鎖定設定不變。手動改過的格子若會被蓋掉，"
-                  "也會列在變動清單裡。")).pack(fill="x")
+                  "只還原班表，請假與名單不變，目前鎖定的格子也不會被改動。"
+                  "手動改過的格子若會被蓋掉，會列在變動清單裡。")).pack(fill="x")
         body = ttk.Frame(self, padding=(10, 0))
         body.pack(fill="both", expand=True)
         self._list = tk.Listbox(body, width=34, height=8, exportselection=False)
@@ -62,12 +63,14 @@ class UndoDialog(tk.Toplevel):
         if entry is None:
             return
         try:
-            changes = self.service.undo_preview(self.key, self.ym, entry["ts"])
+            preview = self.service.undo_preview(self.key, self.ym, entry["id"])
         except Exception as exc:  # noqa: BLE001
             self._set_text(f"無法讀取這個還原點：\n{exc}")
             return
+        changes, self._token = preview["changes"], preview["token"]
         if not changes:
-            self._set_text("這個還原點與目前的班表相同，不需要復原。")
+            self._set_text("這個還原點與目前的班表相同，不需要復原。\n"
+                           "（目前鎖定的格子不會被復原改動。）")
             return
         self._set_text(f"復原後的變動（目前 → 復原後）共 {len(changes)} 項\n"
                        + "\n".join(f"  {c}" for c in changes))
@@ -83,6 +86,9 @@ class UndoDialog(tk.Toplevel):
                 "目前的班表會保留成還原點，之後可以再復原回來。", parent=self):
             return
         if guard_write(lambda: self.service.undo_restore(
-                self.key, self.ym, entry["ts"]), title="復原失敗", parent=self):
+                self.key, self.ym, entry["id"], token=self._token),
+                title="復原失敗", parent=self):
             self.restored = True
             self.destroy()
+        else:
+            self._show()        # 班表可能已變動 → 重新預覽、取得新的識別
