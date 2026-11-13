@@ -80,9 +80,9 @@ def push(month: dict, key: str, action: str, ts: str, *,
 
 
 def _valid(entry) -> bool:
-    return (isinstance(entry, dict) and entry.get("id")
-            and isinstance(entry.get("data"), dict)
-            and isinstance(entry["data"].get("roster"), dict))
+    return bool(isinstance(entry, dict) and entry.get("id")
+                and isinstance(entry.get("data"), dict)
+                and isinstance(entry["data"].get("roster"), dict))
 
 
 def entries(month: dict, key: str) -> list:

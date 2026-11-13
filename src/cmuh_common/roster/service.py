@@ -1302,7 +1302,7 @@ class RosterService:
         _held = getattr(expect, "held", None)
         roster_undo.push(month, "day", {
             "people": "只排未鎖定人員", "local": "局部重排（請假）",
-        }.get(getattr(_held, "mode", None), "自動排班"), _now())
+        }.get(str(getattr(_held, "mode", "") or ""), "自動排班"), _now())
         month["day_slots"] = self._overlay_locked_sessions(month, day_slots)
         month["day_report"] = report or ""      # 供「報告」鈕顯示落地當下的報告
         stamp_report_digest(month, "day")       # 見 accept_solution 的同一段
