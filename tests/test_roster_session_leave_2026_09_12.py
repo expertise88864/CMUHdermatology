@@ -39,7 +39,8 @@ def test_weekday_batch_changes_only_selected_period():
     days = {date(2026, 9, n): None for n in range(1, 31)}
     editor = SimpleNamespace(_buttons=days, _selected={(date(2026, 9, 3), "下午")},
                              _weekday=SimpleNamespace(get=lambda: "四"),
-                             _periods=lambda: ("上午",), _refresh_buttons=lambda: None)
+                             _periods=lambda: ("上午",), _refresh_buttons=lambda: None,
+                             _allowed_days=lambda: None)   # 外訓/家醫科:整月可點
     SessionLeaveEditor._weekly(editor, True)
     assert editor._selected == {(date(2026, 9, n), "上午") for n in (3, 10, 17, 24)} | {
         (date(2026, 9, 3), "下午")}

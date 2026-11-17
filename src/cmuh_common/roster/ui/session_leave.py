@@ -26,7 +26,8 @@ class SessionLeaveEditor(LeaveEditor):
         self._grid = ttk.Frame(holder)
         self._grid.grid(row=1, column=0, columnspan=7)
         super()._build_grid()
-        ttk.Label(holder, text="橘色：整天　黃色：半天（早／午）；每週操作僅套用本月。"
+        ttk.Label(holder, text="橘色：整天　黃色：半天（早／午）；每週操作僅套用本月"
+                  "（Clerk 只套用在所選梯次的上課日；其他日子反灰不能點）。"
                   "\n自動排班會避開請假；既有保留排班衝突會提示手動確認。",
                   wraplength=520).grid(row=2, column=0, columnspan=7, pady=6)
 
@@ -34,6 +35,9 @@ class SessionLeaveEditor(LeaveEditor):
         return SESSIONS if self._period.get() == "整天" else (self._period.get(),)
 
     def _toggle(self, d):
+        allowed = self._allowed_days()
+        if allowed is not None and d not in allowed:
+            return
         values = {(d, s) for s in self._periods()}
         if values <= self._selected:
             self._selected.difference_update(values)
@@ -43,7 +47,10 @@ class SessionLeaveEditor(LeaveEditor):
 
     def _weekly(self, add):
         weekday = "一二三四五六日".index(self._weekday.get())
+        allowed = self._allowed_days()
+        # 每週批次只套用在可點的日子(Clerk:只在該梯次範圍內)
         values = {(d, s) for d in self._buttons if d.weekday() == weekday
+                  and (allowed is None or d in allowed)
                   for s in self._periods()}
         if add:
             self._selected.update(values)
@@ -55,12 +62,14 @@ class SessionLeaveEditor(LeaveEditor):
         for d, button in self._buttons.items():
             parts = [s for s in SESSIONS if (d, s) in self._selected]
             label = "整天" if len(parts) == 2 else "早" if parts == ["上午"] else "午" if parts else ""
+            self._apply_day_state(d, button)
             button.config(text=f"{d.day}\n{label}",
                           relief="sunken" if parts else "raised",
                           bg="#F58518" if len(parts) == 2 else "#FFD166" if parts else "SystemButtonFace")
 
     def _load_member(self):
         self._loaded_mid = self._member_id()
+        self._loaded_index = self._combo.current()
         self._selected = set(self.service.get_trainee_leave_slots(
             self.scope, self.ym, self._loaded_mid))
         self._loaded_baseline = set(self._selected)

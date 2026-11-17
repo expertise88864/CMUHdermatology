@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from datetime import date
+from datetime import date, timedelta
 from tkinter import filedialog, messagebox, ttk
 
 from cmuh_common.deps_runtime import ensure_dependencies
@@ -510,6 +510,33 @@ class DayScheduleTab(ttk.Frame):
                         for c in b.members})
         return [{"id": c, "name": ""} for c in codes]
 
+    def _clerk_leave_members(self) -> list:
+        """[2026-11-13 使用者] Clerk 請假要指定【哪一梯的哪一位】。
+
+        代號在梯次之間會重複(每梯都有 1~6 號),請假又是以「代號＋日期」記錄
+        —— 所以每個選項都帶著該梯次在本月的上課日,視窗只讓點那些日子,
+        「每週批次」也只套用在那個範圍。同一天只有一個梯次上課,因此記錄本身
+        不會混到別梯。"""
+        ym = self.app.ym
+        y, m = int(ym[:4]), int(ym[5:7])
+        batches = sorted((b for b in (ClerkBatch.from_dict(x)
+                                      for x in self.service.storage.load_clerk_batches())
+                          if b is not None),
+                         key=lambda b: (b.start_monday, str(b.id)))
+        month = set(month_dates(y, m))
+        out = []
+        for b in batches_covering(batches, y, m):
+            days = sorted(d for d in month if b.covers(d))
+            if not days:
+                continue
+            end = b.start_monday + timedelta(days=13)
+            span = (f"{b.start_monday.month}/{b.start_monday.day}–"
+                    f"{end.month}/{end.day} 梯")
+            for code in sorted({str(c) for c in b.members}):
+                out.append({"id": code, "name": "", "label": f"{span} · {code}",
+                            "days": frozenset(days)})
+        return out
+
     # ── 互動 ─────────────────────────────────────────────────────────────
     def _on_month_change(self, ym) -> None:
         if ym != self.app.ym:
@@ -856,7 +883,8 @@ class DayScheduleTab(ttk.Frame):
     def _on_leave(self, scope: str) -> None:
         if self._finalized:
             return
-        members = self._roster_members(scope)
+        members = (self._clerk_leave_members() if scope == "clerk"
+                   else self._roster_members(scope))
         if not members:
             messagebox.showinfo("請假", "本月沒有可請假的人員（先設定 PGY 人員 / Clerk 梯次）")
             return

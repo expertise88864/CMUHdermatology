@@ -54,6 +54,7 @@ class LeaveEditor(tk.Toplevel):
         self._selected: set = set()
         self._buttons: dict = {}
         self._loaded_mid = None              # [RP3-20] 目前載入 _selected 的成員 id
+        self._loaded_index = -1              # 載入的是下拉的第幾項(同代號可跨梯次重複)
         self._loaded_baseline: set = set()   # 載入當下的勾選(偵測切換時是否有變)
 
         top = ttk.Frame(self, padding=8)
@@ -62,7 +63,7 @@ class LeaveEditor(tk.Toplevel):
         self._mvar = tk.StringVar()
         self._combo = ttk.Combobox(
             top, width=18, state="readonly", textvariable=self._mvar,
-            values=[f"{m.get('id')} {m.get('name', '')}".strip()
+            values=[m.get("label") or f"{m.get('id')} {m.get('name', '')}".strip()
                     for m in self._members])
         self._combo.pack(side="left", padx=6)
         self._combo.bind("<<ComboboxSelected>>",
@@ -114,11 +115,27 @@ class LeaveEditor(tk.Toplevel):
         self._load_member()
 
     def _restore_combo(self) -> None:
-        """把成員下拉拉回【目前畫面實際載入的那一位】,恢復「看到的＝會被寫的」。"""
-        for i, m in enumerate(self._members):
-            if str(m.get("id")) == str(self._loaded_mid):
-                self._combo.current(i)
-                return
+        """把成員下拉拉回【目前畫面實際載入的那一位】,恢復「看到的＝會被寫的」。
+        ★用載入時的項次,不用代號★:Clerk 代號跨梯次重複(兩梯都有 3 號)。"""
+        if 0 <= self._loaded_index < len(self._members):
+            self._combo.current(self._loaded_index)
+
+    def _allowed_days(self):
+        """[2026-11-13 使用者] 目前成員可以點的日子;None = 整月都可以。
+        Clerk 依梯次:只有該梯次上課的日子可點(代號跨梯次重複,點別梯的日子
+        等於替別梯的同代號請假)。"""
+        i = self._combo.current()
+        if 0 <= i < len(self._members):
+            days = self._members[i].get("days")
+            return None if days is None else set(days)
+        return None
+
+    def _apply_day_state(self, d, button) -> bool:
+        """按鈕可不可以點(不在梯次範圍 → 停用)。回傳是否可點。"""
+        allowed = self._allowed_days()
+        ok = allowed is None or d in allowed
+        button.config(state="normal" if ok else "disabled")
+        return ok
 
     def _commit_current(self) -> bool:
         """把目前載入成員的勾選落檔（僅在相對載入基準確有變動時才寫）。
@@ -154,10 +171,14 @@ class LeaveEditor(tk.Toplevel):
             ctx = self.service.build_context(self.scope, self.ym)
             self._selected = set(ctx.must_duty.get(mid) or set())
         self._loaded_mid = mid                       # [RP3-20] 記住載入者與基準
+        self._loaded_index = self._combo.current()
         self._loaded_baseline = set(self._selected)
         self._refresh_buttons()
 
     def _toggle(self, d: date) -> None:
+        allowed = self._allowed_days()
+        if allowed is not None and d not in allowed:
+            return
         if d in self._selected:
             self._selected.discard(d)
         else:
@@ -167,6 +188,7 @@ class LeaveEditor(tk.Toplevel):
     def _refresh_buttons(self) -> None:
         for d, b in self._buttons.items():
             on = d in self._selected
+            self._apply_day_state(d, b)
             b.config(relief="sunken" if on else "raised",
                      bg="#F58518" if on else "SystemButtonFace")
 
