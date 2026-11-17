@@ -135,3 +135,18 @@ def test_a_failed_switch_returns_to_the_same_batch_entry(root, tmp_path, monkeyp
     assert ed._combo.get() == "8/17–8/30 梯 · 3"
     ed.destroy()
     tab.destroy()
+
+
+def test_overlapping_batches_only_offer_the_days_each_one_owns(root, tmp_path):
+    """[PR #24 審查] 梯次日期重疊(設定打錯)時,重疊日歸設定順序較前的梯次
+    (與排班程式相同);後一梯不可以點到那幾天。"""
+    svc = _svc(tmp_path)
+    svc.storage.save_clerk_batches([
+        {"id": "A", "start_monday": "2026-08-03", "members": ["3"]},
+        {"id": "B", "start_monday": "2026-08-10", "members": ["3"]}])
+    tab = DayScheduleTab(root, svc, types.SimpleNamespace(ym=YM))
+    members = {m["label"]: m["days"] for m in tab._clerk_leave_members()}
+    a, b = members["8/3–8/16 梯 · 3"], members["8/10–8/23 梯 · 3"]
+    assert date(2026, 8, 12) in a and date(2026, 8, 12) not in b
+    assert date(2026, 8, 19) in b and not (a & b)
+    tab.destroy()
