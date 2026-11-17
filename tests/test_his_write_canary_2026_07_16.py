@@ -349,9 +349,13 @@ def test_no_recipient_does_not_spawn_thread(monkeypatch):
 
 def test_seed_loads_persisted_notified(monkeypatch, tmp_path):
     # seed 把磁碟記錄載入記憶體集合(冪等)
+    # ★時間戳要用今天★:寫死日期的話,過了保留天數(HIS_DRIFT_NOTIFIED_RETAIN_DAYS)
+    #   這筆會被當成過期剪掉 —— 2026-07-19 + 120 天 = 2026-11-16,當天起測試就失敗。
     import json
+    from datetime import datetime
     (tmp_path / main.HIS_DRIFT_NOTIFIED_FILENAME).write_text(
-        json.dumps({"1150701@1150713": "2026-07-19T10:00:00"}), encoding="utf-8")
+        json.dumps({"1150701@1150713": datetime.now().isoformat(timespec="seconds")}),
+        encoding="utf-8")
     monkeypatch.setattr(main, "get_conf_path", lambda name: str(tmp_path / name))
     monkeypatch.setattr(main, "_his_drift_notified_versions", set())
     monkeypatch.setattr(main, "_his_drift_persist_loaded", False)
