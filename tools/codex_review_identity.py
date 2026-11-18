@@ -126,8 +126,20 @@ def native_override(path: str) -> str:
     .cmd/.bat/.ps1, and the identity check verifies the prompt that arrived)."""
     if os.name != "nt" or os.path.splitext(path)[1]:
         return path
-    natives = native_for_shim(path)
+    shim = path
+    if not os.path.dirname(path):
+        # A bare name is what Git Bash finds on PATH: resolve it the same way first.
+        hits = path_files(path)
+        if not hits:
+            return path
+        shim = hits[0]
+    natives = native_for_shim(shim)
     if not natives:
+        package = os.path.join(os.path.dirname(shim), "node_modules", "@openai", "codex")
+        if os.path.basename(os.path.dirname(shim)).lower() == ".bin":
+            package = os.path.join(os.path.dirname(os.path.dirname(shim)), "@openai", "codex")
+        if os.path.isdir(package):
+            raise ValueError(f"{shim} is the npm Codex shim but its native exe is missing")
         return path
     ranked = [(version_key(v), p) for p in natives if (v := cli_version(p))]
     if not ranked:

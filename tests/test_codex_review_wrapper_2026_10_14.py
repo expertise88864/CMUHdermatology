@@ -366,18 +366,29 @@ class NativeCliSelectionTests(unittest.TestCase):
         from unittest.mock import patch
         identity = self._identity()
         with tempfile.TemporaryDirectory() as tmp:
+            # Paths are built before os.name is mocked (pathlib consults it on POSIX).
             npm = self._layout(Path(tmp), True, "proj/node_modules/.bin")
+            shim, plain = str(npm / "codex"), str(Path(tmp) / "plain")
+            exes = list(Path(tmp).rglob("codex.exe"))
             with patch.object(identity.os, "name", "nt"), \
                  patch.object(identity, "cli_version", return_value="codex-cli 0.169.1"):
-                path = identity.native_override(str(npm / "codex"))
+                path = identity.native_override(shim)
                 self.assertTrue(path.lower().endswith("codex.exe"), path)
+                # A bare name resolves on PATH first, as Git Bash would.
+                with patch.dict(identity.os.environ, {"PATH": str(npm)}):
+                    self.assertEqual(identity.native_override("codex"), path)
                 # Not an npm shim: unchanged (the wrapper's own checks still apply).
-                self.assertEqual(identity.native_override(str(Path(tmp) / "plain")), str(Path(tmp) / "plain"))
+                self.assertEqual(identity.native_override(plain), plain)
                 self.assertEqual(identity.native_override("C:/x/codex.exe"), "C:/x/codex.exe")
             with patch.object(identity.os, "name", "nt"), \
                  patch.object(identity, "cli_version", return_value=""), \
                  self.assertRaises(ValueError):
-                identity.native_override(str(npm / "codex"))
+                identity.native_override(shim)
+            # An identified npm shim whose native exe is missing is refused, not launched.
+            for exe in exes:
+                exe.unlink()
+            with patch.object(identity.os, "name", "nt"), self.assertRaises(ValueError):
+                identity.native_override(shim)
         source = (ROOT / "tools" / "codex_review.sh").read_text(encoding="utf-8")
         self.assertIn("codex_review_identity.py\" native-override", source)
 
