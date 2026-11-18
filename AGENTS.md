@@ -7,6 +7,7 @@
 - 不得 fallback 到其他模型或其他 effort；wrapper 以 Codex session rollout 的 `turn_context` 驗證實際模型／effort／唯讀沙箱，證明不了就不算一輪。gpt-6.1-sol、xhigh 或 high 的 session 一律視為非指定審查者。
 - PR commit status 改為 `codex-review/gpt-6.2-astra`；推 main 的 pre-push hook 只承認這個 context，舊 `codex-review/gpt-6.1-sol` status 不再算核准。
 - CLI：wrapper 挑本機版本最高的可執行 Codex CLI（2026-11-18 實測 npm 全域 0.169.1 可跑 gpt-6.2-astra；Codex 桌面版內附 0.163 alpha 會拒絕）。不可用時先問使用者，不得默默降級。
+- CLI 只用原生 `codex.exe`：npm 的 `codex.cmd`／`.ps1` 等批次 shim 會把多行 prompt 截在第一行（PR #25 兩輪審查因此只收到第一行，已作廢並由完整審查取代），wrapper 一律換成同套件內的原生 exe、拒絕 shim，並由 `codex_review_identity.py` 比對 session 實際收到的 prompt 與送出的完全一致，不一致就不算一輪。
 
 ## 最新使用者定案：每個 PR review 一次（2026-10-15）
 

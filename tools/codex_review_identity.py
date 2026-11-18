@@ -45,16 +45,45 @@ def cli_version(path: str) -> str:
     return lines[0] if proc.returncode == 0 and lines else ""
 
 
+# Windows script shims (npm's codex.cmd / codex.ps1, any .bat). cmd.exe cuts a
+# multi-line argument at its first newline, so a review prompt passed through one
+# reaches the reviewer as a single line (PR #25, 2026-11-18: 75 of ~6000 chars).
+SCRIPT_SHIMS = (".cmd", ".bat", ".ps1")
+
+
+def is_script_shim(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in SCRIPT_SHIMS
+
+
+def native_for_shim(shim: str) -> list[str]:
+    """The native codex.exe shipped in the npm package behind a PATH shim
+    (`<npm>/node_modules/@openai/codex/.../vendor/<triple>/bin/codex.exe`)."""
+    package = os.path.join(os.path.dirname(shim), "node_modules", "@openai", "codex")
+    patterns = (
+        os.path.join(package, "node_modules", "@openai", "codex-win32-*", "vendor", "*", "bin", "codex.exe"),
+        os.path.join(package, "vendor", "*", "bin", "codex.exe"),
+    )
+    return sorted(hit for pattern in patterns for hit in glob.glob(pattern))
+
+
 def codex_candidates() -> list[str]:
-    """Codex CLIs on this machine: the desktop app's bundled builds, then PATH."""
+    """Native Codex CLIs on this machine: the desktop app's bundled builds, then
+    PATH. A PATH script shim is replaced by the native exe of its npm package and
+    is never itself a candidate (it would truncate the multi-line prompt)."""
     found = []
     local = os.environ.get("LOCALAPPDATA", "")
     if local:
         found.extend(sorted(glob.glob(os.path.join(local, "OpenAI", "Codex", "bin", "*", "codex.exe"))))
     for name in (("codex.cmd", "codex.exe", "codex") if os.name == "nt" else ("codex",)):
         hit = shutil.which(name)
-        if hit:
+        if not hit:
+            continue
+        if os.name == "nt" and (is_script_shim(hit) or not os.path.splitext(hit)[1]):
+            # Extensionless `codex` on Windows is npm's sh shim for the same package.
+            found.extend(native_for_shim(hit))
+        else:
             found.append(hit)
+    found = [path for path in found if not is_script_shim(path)]
     seen, unique = set(), []
     for path in found:
         key = os.path.normcase(os.path.abspath(path))
@@ -65,7 +94,7 @@ def codex_candidates() -> list[str]:
 
 
 def find_codex() -> tuple[str, str]:
-    """Highest-version runnable CLI. Builds differ in which models a ChatGPT
+    """Highest-version runnable native CLI. Builds differ in which models a ChatGPT
     account may use (2026-11-18: npm 0.169.1 runs gpt-6.2-astra while the desktop
     app's bundled 0.163 alpha rejects it), so neither a PATH-only nor a
     bundled-only lookup is safe; take the newest runnable build. The
@@ -103,8 +132,17 @@ def objects(path: Path, *, allow_diagnostics: bool = False) -> list[dict]:
     return result
 
 
+def _text(payload: dict) -> str:
+    return "".join(str(part.get("text", "")) for part in payload.get("content") or []
+                   if isinstance(part, dict))
+
+
+def _normal(text: str) -> str:
+    return text.replace("\r\n", "\n").strip()
+
+
 def verify(raw: Path, repo: Path, sessions: Path, started_at: float,
-           expected_session: str | None = None) -> dict:
+           expected_session: str | None = None, prompt: Path | None = None) -> dict:
     from datetime import datetime
 
     if not math.isfinite(started_at) or started_at < 0:
@@ -151,6 +189,19 @@ def verify(raw: Path, repo: Path, sessions: Path, started_at: float,
     # A resumed session must have been this reviewer from its first turn: a session
     # begun under a retired profile (e.g. gpt-6.1-sol / xhigh) and resumed now would
     # let an incremental resume claim the whole range for the configured reviewer.
+    if prompt is not None:
+        # The reviewer must have received the whole prompt the wrapper sent: the
+        # first user message after this invocation's turn context, verbatim.
+        last = max(i for i, x in enumerate(records) if x.get("type") == "turn_context")
+        after = records[last + 1:]
+        sent = [_text(x.get("payload", {})) for x in after if x.get("type") == "response_item"
+                and x.get("payload", {}).get("type") == "message"
+                and x.get("payload", {}).get("role") == "user"]
+        expected = _normal(prompt.read_text(encoding="utf-8"))
+        if not expected or not sent or _normal(sent[0]) != expected:
+            got = len(_normal(sent[0])) if sent else 0
+            raise ValueError(f"reviewer received a truncated or different prompt "
+                             f"({got} of {len(expected)} chars)")
     for earlier in contexts:
         payload = earlier.get("payload", {})
         if payload.get("model") != MODEL or payload.get("effort") != EFFORT \
@@ -160,6 +211,7 @@ def verify(raw: Path, repo: Path, sessions: Path, started_at: float,
     return {"sessionId": sid, "tokensUsed": sum(numbers), "actualModel": MODEL,
             "actualEffort": EFFORT, "readOnly": True,
             "turnId": context.get("turn_id"), "contextTimestamp": latest["timestamp"],
+            "promptVerified": prompt is not None,
             "sessionLogSHA256": hashlib.sha256(log.read_bytes()).hexdigest(),
             "eventsSHA256": hashlib.sha256(raw.read_bytes()).hexdigest()}
 
@@ -179,13 +231,15 @@ def main() -> int:
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--started-at", type=float, required=True)
     parser.add_argument("--expected-session")
+    parser.add_argument("--prompt-file", type=Path,
+                        help="exact prompt sent; the session must show it received in full")
     parser.add_argument("--proof", type=Path, required=True)
     parser.add_argument("--session-directory", type=Path,
                         default=Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "sessions")
     args = parser.parse_args()
     try:
         proof = verify(args.raw_log, args.repo, args.session_directory,
-                       args.started_at, args.expected_session)
+                       args.started_at, args.expected_session, args.prompt_file)
         args.proof.write_text(json.dumps(proof, indent=2) + "\n", encoding="utf-8")
     except (OSError, ValueError, TypeError, KeyError) as exc:
         print(f"[codex-review] actual session verification failed: {exc}", file=sys.stderr)

@@ -50,6 +50,14 @@ if os.environ.get("FIXTURE_PRIOR_MODEL"):
 rows += [{"type": "turn_context",
          "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
          "payload": context}]
+# What the reviewer actually received: the last argv entry is the prompt. A cmd.exe
+# shim delivers only its first line (FIXTURE_TRUNCATE reproduces that).
+received = args[-1]
+if os.environ.get("FIXTURE_TRUNCATE"):
+    received = received.splitlines()[0]
+rows.append({"type": "response_item", "payload": {
+    "type": "message", "role": "user",
+    "content": [{"type": "input_text", "text": received}]}})
 sessions = pathlib.Path(os.environ["CODEX_HOME"]) / "sessions"
 sessions.mkdir(parents=True, exist_ok=True)
 (sessions / ("rollout-" + sid + ".jsonl")).write_text("\n".join(map(json.dumps, rows)))
@@ -62,7 +70,7 @@ sys.exit(int(os.environ["FIXTURE_RC"]))
 class CodexReviewWrapperTests(unittest.TestCase):
     def run_wrapper(self, *, resume=False, recorded=None, count=0, returned=SID,
                     model="gpt-6.2-astra", effort="medium", sandbox="read-only", rc=0,
-                    prior=None):
+                    prior=None, truncate=False, cli="codex"):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "repo"
             root.mkdir()
@@ -92,7 +100,7 @@ class CodexReviewWrapperTests(unittest.TestCase):
                        PATH=str(fixture_bin) + os.pathsep + str(Path(sys.executable).parent)
                        + os.pathsep + os.environ.get("PATH", ""),
                        CODEX_HOME=str(Path(directory) / "codex-home"),
-                       CODEX_REVIEW_CLI="codex", FIXTURE_SID=returned, FIXTURE_MODEL=model,
+                       CODEX_REVIEW_CLI=cli, FIXTURE_TRUNCATE="1" if truncate else "", FIXTURE_SID=returned, FIXTURE_MODEL=model,
                        FIXTURE_EFFORT=effort, FIXTURE_SANDBOX=sandbox, FIXTURE_RC=str(rc),
                        FIXTURE_PRIOR_MODEL=(prior or ("", ""))[0],
                        FIXTURE_PRIOR_EFFORT=(prior or ("", ""))[1])
@@ -126,6 +134,35 @@ class CodexReviewWrapperTests(unittest.TestCase):
             self.assertIn("windows.sandbox=unelevated", args)
         # Only this repository is marked safe, only for the review child.
         self.assertEqual(called["git"], f"'safe.directory'='{called['top']}'")
+
+    def test_full_multiline_prompt_reaches_the_reviewer(self):
+        # PR #25 (2026-11-18): through npm's codex.cmd the reviewer got only the first
+        # prompt line. A native CLI receives every line, and the identity check proves it.
+        for resume in (False, True):
+            with self.subTest(resume=resume):
+                rc, called, sid, passes, out = self.run_wrapper(resume=resume, recorded=SID, count=1)
+                self.assertEqual((rc, sid), (0, SID), out)
+                prompt = called["args"][-1]
+                self.assertGreater(len(prompt.splitlines()), 3)
+                if not resume:
+                    for section in ("REVIEW RANGE:", "TASK CONTEXT:", "LOCAL VERIFICATION:"):
+                        self.assertIn(section, prompt)
+
+    def test_truncated_prompt_never_counts(self):
+        for resume in (False, True):
+            with self.subTest(resume=resume):
+                rc, called, sid, passes, out = self.run_wrapper(resume=resume, recorded=SID,
+                                                                count=1, truncate=True)
+                self.assertEqual(rc, 4, out)
+                self.assertEqual(passes, "1" if resume else "0", out)
+                self.assertIn("truncated or different prompt", out)
+
+    def test_batch_shim_cli_is_refused_before_running(self):
+        for cli in ("C:/npm/codex.cmd", "C:/npm/CODEX.CMD", "C:/x/codex.bat", "C:/npm/codex.ps1"):
+            with self.subTest(cli=cli):
+                rc, called, sid, passes, out = self.run_wrapper(cli=cli)
+                self.assertEqual(rc, 64, out)
+                self.assertIsNone(called)
 
     def test_first_pass_records_verified_session(self):
         rc, called, sid, passes, out = self.run_wrapper()
@@ -171,6 +208,63 @@ class CodexReviewWrapperTests(unittest.TestCase):
     def test_resume_returning_another_session_never_counts(self):
         rc, _, sid, passes, out = self.run_wrapper(resume=True, recorded=SID, count=1, returned=OTHER)
         self.assertEqual((rc, sid, passes), (4, SID, "1"), out)
+
+
+class NativeCliSelectionTests(unittest.TestCase):
+    """find_codex never returns a script shim; it swaps npm's shim for the package's exe."""
+
+    def _identity(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "codex_review_identity_t", ROOT / "tools" / "codex_review_identity.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _layout(self, root: Path, native: bool) -> Path:
+        npm = root / "npm"
+        npm.mkdir()
+        for name in ("codex.cmd", "codex.ps1", "codex"):
+            (npm / name).write_text("@ECHO off\n", encoding="utf-8")
+        if native:
+            exe = (npm / "node_modules/@openai/codex/node_modules/@openai/codex-win32-x64"
+                   / "vendor/x86_64-pc-windows-msvc/bin/codex.exe")
+            exe.parent.mkdir(parents=True)
+            exe.write_bytes(b"MZ")
+        return npm
+
+    def _select(self, identity, npm: Path, name_hit: str):
+        from unittest.mock import patch
+        hits = {name_hit: str(npm / name_hit)}
+        with patch.object(identity.os, "name", "nt"), \
+             patch.dict(identity.os.environ, {"LOCALAPPDATA": ""}), \
+             patch.object(identity.shutil, "which", side_effect=lambda n: hits.get(n)), \
+             patch.object(identity, "cli_version", return_value="codex-cli 0.169.1"):
+            return identity.find_codex()
+
+    def test_npm_shim_resolves_to_the_native_exe(self):
+        identity = self._identity()
+        for shim in ("codex.cmd", "codex"):
+            with self.subTest(shim=shim), tempfile.TemporaryDirectory() as tmp:
+                npm = self._layout(Path(tmp), native=True)
+                path, version = self._select(identity, npm, shim)
+                self.assertTrue(path.lower().endswith("codex.exe"), path)
+                self.assertFalse(identity.is_script_shim(path))
+                self.assertEqual(version, "codex-cli 0.169.1")
+
+    def test_shim_without_native_exe_is_never_selected(self):
+        identity = self._identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            npm = self._layout(Path(tmp), native=False)
+            with self.assertRaises(ValueError):
+                self._select(identity, npm, "codex.cmd")
+
+    def test_script_shim_detection(self):
+        identity = self._identity()
+        for path in ("a/codex.cmd", "a/CODEX.BAT", "a/codex.ps1"):
+            self.assertTrue(identity.is_script_shim(path))
+        for path in ("a/codex.exe", "a/codex"):
+            self.assertFalse(identity.is_script_shim(path))
 
 
 class ResolveCliUnicodePathTests(unittest.TestCase):

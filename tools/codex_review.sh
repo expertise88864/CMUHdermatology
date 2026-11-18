@@ -50,6 +50,7 @@ USAGE_TSV="$STATE_DIR/usage.tsv"
 SESSION_FILE="$STATE_DIR/last_session_id"
 PASS_FILE="$STATE_DIR/last_pass"
 LAST_MSG="$STATE_DIR/last_message.txt"
+PROMPT_SENT="$STATE_DIR/last_prompt.txt"   # 本輪實際送出的 prompt,供 identity 比對
 RAW_LOG="$STATE_DIR/last_raw.log"
 
 [ -s "$USAGE_TSV" ] || printf 'timestamp\trepository\tmode\tmodel\teffort\tbase_ref\ttip_ref\tsession_id\ttokens_used\tresult\tfindings\tpass\n' > "$USAGE_TSV"
@@ -96,6 +97,11 @@ resolve_cli() {
       CODEX_CLI=""
   fi
   [ -n "$CODEX_CLI" ] || die "找不到可用的 Codex CLI;不降級到其他模型。"
+  # cmd.exe 批次 shim(npm 的 codex.cmd 等)會把多行 prompt 截在第一行(PR #25 實際發生:
+  # 審查者只收到 75 字元)。只接受原生執行檔;identity 也會比對 session 收到的完整 prompt。
+  case "$(printf '%s' "$CODEX_CLI" | tr 'A-Z' 'a-z')" in
+    *.cmd|*.bat|*.ps1) die "Codex CLI 是批次/腳本 shim($CODEX_CLI),會截斷多行 prompt;請改用套件內原生 codex.exe。" ;;
+  esac
   echo "[codex-review] cli=$CODEX_CLI"
   local quoted
   quoted="$(printf '%s' "$REPO_ROOT" | sed "s/'/'\\\\''/g")"
@@ -109,7 +115,7 @@ verify_actual_session() {
   local identity
   local a=("$SCRIPT_DIR/codex_review_identity.py" --raw-log "$RAW_LOG"
            --repo "$REPO_ROOT" --started-at "$REVIEW_STARTED_AT"
-           --proof "$STATE_DIR/last_identity.json")
+           --proof "$STATE_DIR/last_identity.json" --prompt-file "$PROMPT_SENT")
   rm -f "$STATE_DIR/last_identity.json"
   [ -z "${1:-}" ] || a+=(--expected-session "$1")
   identity="$("$PYTHON" "${a[@]}")" || return 1
@@ -233,6 +239,7 @@ $(cat "$REBUTTAL_FILE")"
   #   是用參數傳的,stdin 沒有任何用途。
   resolve_cli
   REVIEW_STARTED_AT="$("$PYTHON" -c 'import time; print(time.time())')" || die "Python unavailable"
+  printf '%s' "$RESUME_PROMPT" > "$PROMPT_SENT"
   ( cd "$REPO_ROOT" && "$CODEX_CLI" exec resume "$SID" "${FLAGS[@]}" "$RESUME_PROMPT" ) </dev/null 2>&1 | tee "$RAW_LOG"
   CODEX_RC=${PIPESTATUS[0]}
   if [ "$CODEX_RC" -ne 0 ] && [ ! -s "$LAST_MSG" ]; then
@@ -388,7 +395,9 @@ rm -f "$SESSION_FILE"
 #   是用參數傳的,stdin 沒有任何用途。
 resolve_cli
 REVIEW_STARTED_AT="$("$PYTHON" -c 'import time; print(time.time())')" || die "Python unavailable"
-"$CODEX_CLI" exec "${FLAGS[@]}" "$(cat "$TMP/prompt.txt")" </dev/null 2>&1 | tee "$RAW_LOG"
+FIRST_PROMPT="$(cat "$TMP/prompt.txt")"
+printf '%s' "$FIRST_PROMPT" > "$PROMPT_SENT"
+"$CODEX_CLI" exec "${FLAGS[@]}" "$FIRST_PROMPT" </dev/null 2>&1 | tee "$RAW_LOG"
 CODEX_RC=${PIPESTATUS[0]}
 if [ "$CODEX_RC" -ne 0 ] && [ ! -s "$LAST_MSG" ]; then
   die "codex exec 啟動失敗(exit=$CODEX_RC),未產生 review。請檢查 CLI 版本與旗標。"
