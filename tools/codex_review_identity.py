@@ -119,6 +119,20 @@ def codex_candidates() -> list[str]:
     return unique
 
 
+def bash_path_lookup(name: str) -> str | None:
+    """Git Bash's PATH lookup of a bare Windows command: in each PATH directory the
+    exact name, then name.exe; the first directory with either wins."""
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        directory = directory.strip('"')
+        if not directory:
+            continue
+        for candidate in (name, name + ".exe"):
+            full = os.path.join(directory, candidate)
+            if os.path.isfile(full):
+                return full
+    return None
+
+
 def native_override(path: str) -> str:
     """An explicit CODEX_REVIEW_CLI that is npm's extensionless sh shim on Windows is
     replaced by the newest runnable native exe of its package, like automatic
@@ -128,11 +142,14 @@ def native_override(path: str) -> str:
         return path
     shim = path
     if not os.path.dirname(path):
-        # A bare name is what Git Bash finds on PATH: resolve it the same way first.
-        hits = path_files(path)
-        if not hits:
+        # A bare name is what Git Bash finds on PATH: per directory it tries the
+        # name, then name.exe, before moving on. Resolve it the same way first.
+        hit = bash_path_lookup(path)
+        if hit is None:
             return path
-        shim = hits[0]
+        if os.path.splitext(hit)[1].lower() == ".exe":
+            return hit
+        shim = hit
     natives = native_for_shim(shim)
     if not natives:
         package = os.path.join(os.path.dirname(shim), "node_modules", "@openai", "codex")

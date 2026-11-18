@@ -369,13 +369,22 @@ class NativeCliSelectionTests(unittest.TestCase):
             # Paths are built before os.name is mocked (pathlib consults it on POSIX).
             npm = self._layout(Path(tmp), True, "proj/node_modules/.bin")
             shim, plain = str(npm / "codex"), str(Path(tmp) / "plain")
-            exes = list(Path(tmp).rglob("codex.exe"))
+            (Path(tmp) / "native").mkdir()
+            (Path(tmp) / "native" / "codex.exe").write_bytes(b"MZ")
+            native_dir, native_exe = str(Path(tmp) / "native"), str(Path(tmp) / "native" / "codex.exe")
+            exes = list(npm.parent.rglob("codex.exe"))
             with patch.object(identity.os, "name", "nt"), \
                  patch.object(identity, "cli_version", return_value="codex-cli 0.169.1"):
                 path = identity.native_override(shim)
                 self.assertTrue(path.lower().endswith("codex.exe"), path)
                 # A bare name resolves on PATH first, as Git Bash would.
                 with patch.dict(identity.os.environ, {"PATH": str(npm)}):
+                    self.assertEqual(identity.native_override("codex"), path)
+                # An earlier PATH directory with codex.exe wins over a later npm shim.
+                with patch.dict(identity.os.environ, {"PATH": os.pathsep.join([native_dir, str(npm)])}):
+                    self.assertEqual(identity.native_override("codex"), native_exe)
+                # In one directory the exact name comes before name.exe (Git Bash order).
+                with patch.dict(identity.os.environ, {"PATH": os.pathsep.join([str(npm), native_dir])}):
                     self.assertEqual(identity.native_override("codex"), path)
                 # Not an npm shim: unchanged (the wrapper's own checks still apply).
                 self.assertEqual(identity.native_override(plain), plain)
