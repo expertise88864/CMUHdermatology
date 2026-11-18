@@ -8,15 +8,16 @@
 #   tools/codex_review.sh resume [session-id]
 #
 # mode:
-#   diff      低風險/局部(文案、註解、CSS、tests-only)     xhigh / 額外檔 3 / findings 3
-#   targeted  一般非 trivial 實作(預設)                     xhigh / 額外檔 12 / findings 5
-#   deep      醫療劑量、醫令自動化、資安、資料完整、併發、大重構 xhigh / 額外檔 30 / findings 8
+#   diff      低風險/局部(文案、註解、CSS、tests-only)     medium / 額外檔 3 / findings 3
+#   targeted  一般非 trivial 實作(預設)                     medium / 額外檔 12 / findings 5
+#   deep      醫療劑量、醫令自動化、資安、資料完整、併發、大重構 medium / 額外檔 30 / findings 8
 #
-# 模型與 effort(使用者 2026-10-14 定案):任何 diff review 一律 gpt-6.1-sol / xhigh,
-# 不 fallback 到其他模型或較低 effort。模式只差範圍。實際模型/effort/唯讀沙箱由
+# 模型與 effort(使用者 2026-11-18 定案,取代 2026-10-14 的 gpt-6.1-sol / xhigh):
+# 任何 code review(PR review、diff review、resume 續審、pending 補審)一律 gpt-6.2-astra / medium,
+# 不 fallback 到其他模型或其他 effort。模式只差範圍。實際模型/effort/唯讀沙箱由
 # tools/codex_review_identity.py 對 session 紀錄驗證,證明不了就不算一輪(exit 4)。
 # CLI:CODEX_REVIEW_CLI 明示,否則 `codex_review_identity.py which` 挑本機版本最高者
-# (npm 0.155.1 不支援 gpt-6.1-sol,Codex 桌面版內附的 0.162 alpha 可以)。
+# (2026-11-18 實測:npm 0.169.1 支援 gpt-6.2-astra;Codex 桌面版內附的 0.163 alpha 拒絕它)。
 #   resume    後續輪(第 2、3、…;僅限 confirmed findings 修正後);沿用第一輪 session
 #
 # 設計原則(勿改):
@@ -28,7 +29,7 @@
 #   * 結果只讀「最後一則訊息」(-o),不掃整份輸出。
 set -uo pipefail
 
-MODEL="gpt-6.1-sol"
+MODEL="gpt-6.2-astra"
 HARDEN="${CODEX_REVIEW_HARDEN:-1}"
 STRICT="${CODEX_REVIEW_STRICT:-1}"
 TIP="${CODEX_REVIEW_TIP:-HEAD}"
@@ -57,9 +58,9 @@ MODE="${1:-}"
 [ -n "$MODE" ] || die "缺少 mode。用法: $0 <diff|targeted|deep> <base-ref> [ctx] | $0 resume [sid]"
 
 case "$MODE" in
-  diff)     EFFORT="xhigh";  EXTRA_FILE_LIMIT=3;  FINDING_LIMIT=3 ;;
-  targeted) EFFORT="xhigh";  EXTRA_FILE_LIMIT=12; FINDING_LIMIT=5 ;;
-  deep)     EFFORT="xhigh";  EXTRA_FILE_LIMIT=30; FINDING_LIMIT=8 ;;
+  diff)     EFFORT="medium"; EXTRA_FILE_LIMIT=3;  FINDING_LIMIT=3 ;;
+  targeted) EFFORT="medium"; EXTRA_FILE_LIMIT=12; FINDING_LIMIT=5 ;;
+  deep)     EFFORT="medium"; EXTRA_FILE_LIMIT=30; FINDING_LIMIT=8 ;;
   resume)   EFFORT="";       EXTRA_FILE_LIMIT="";  FINDING_LIMIT="" ;;
   *) die "未知 mode '$MODE'(可用:diff | targeted | deep | resume)" ;;
 esac
@@ -103,7 +104,7 @@ resolve_cli() {
 
 VERIFIED_SID=""
 VERIFIED_TOKENS=""
-# 實際 session 必須是本輪、本 repo、gpt-6.1-sol/xhigh/read-only;$1 = 續審時預期的 session。
+# 實際 session 必須是本輪、本 repo、gpt-6.2-astra/medium/read-only;$1 = 續審時預期的 session。
 verify_actual_session() {
   local identity
   local a=("$SCRIPT_DIR/codex_review_identity.py" --raw-log "$RAW_LOG"
@@ -148,7 +149,7 @@ log_usage() {  # $1 mode $2 effort $3 base $4 pass
 }
 
 # ================= resume(後續輪:第 2、3、…直到 APPROVE) =================
-# [2026-07-13 使用者定案] 取消「每 task 最多兩輪」硬上限,改為「跑到 GPT-5.6 APPROVE
+# [2026-07-13 使用者定案] 取消「每 task 最多兩輪」硬上限,改為「跑到審查模型 APPROVE
 # 才能 push」。每一輪修正 confirmed findings 後 resume 同一 session 續審;pass 累加。
 if [ "$MODE" = "resume" ]; then
   # 續審必須沿用同一 session。這裡有三個獨立的失敗模式,少一個都會讓
@@ -181,7 +182,7 @@ resume 只能沿用同一 task 的 session。要重開一輪全新審查請跑�
   [ "$PREV_PASS" -ge 1 ] 2>/dev/null \
     || die "resume 只能在完成第一輪之後(目前 pass=$PREV_PASS)。請先跑第一輪。"
   THIS_PASS=$((PREV_PASS + 1))
-  RESUME_EFFORT="xhigh"  # 2026-10-14:一律 xhigh,不沿用舊紀錄裡的 effort
+  RESUME_EFFORT="medium"  # 2026-11-18:一律 medium,不沿用舊紀錄裡的 effort
   RESUME_BASE="$(tail -1 "$USAGE_TSV" | cut -f6)";   [ -n "$RESUME_BASE" ] || RESUME_BASE="unavailable"
   build_flags "$RESUME_EFFORT" resume
   read -r -d '' RESUME_PROMPT <<'RP' || true

@@ -1,4 +1,5 @@
-"""tools/codex_review.sh — gpt-6.1-sol / xhigh review profile (user decision 2026-10-14).
+"""tools/codex_review.sh — gpt-6.2-astra / medium review profile (user decision 2026-11-18,
+replacing the 2026-10-14 gpt-6.1-sol / xhigh profile).
 
 Every run uses an isolated fixture CLI and fixture session log; nothing here
 reaches the real Codex installation or the network.
@@ -55,7 +56,7 @@ sys.exit(int(os.environ["FIXTURE_RC"]))
 
 class CodexReviewWrapperTests(unittest.TestCase):
     def run_wrapper(self, *, resume=False, recorded=None, count=0, returned=SID,
-                    model="gpt-6.1-sol", effort="xhigh", sandbox="read-only", rc=0):
+                    model="gpt-6.2-astra", effort="medium", sandbox="read-only", rc=0):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "repo"
             root.mkdir()
@@ -108,8 +109,10 @@ class CodexReviewWrapperTests(unittest.TestCase):
 
     def assert_profile(self, called):
         args = called["args"]
-        self.assertEqual(args[args.index("--model") + 1], "gpt-6.1-sol")
-        self.assertIn("model_reasoning_effort=xhigh", args)
+        self.assertEqual(args[args.index("--model") + 1], "gpt-6.2-astra")
+        self.assertIn("model_reasoning_effort=medium", args)
+        self.assertFalse([a for a in args if a.startswith("model_reasoning_effort=")
+                          and a != "model_reasoning_effort=medium"])
         self.assertIn("--json", args)
         if os.name == "nt":
             self.assertIn("windows.sandbox=unelevated", args)
@@ -122,7 +125,10 @@ class CodexReviewWrapperTests(unittest.TestCase):
         self.assert_profile(called)
 
     def test_wrong_actual_profile_never_counts(self):
-        for kwargs in ({"model": "gpt-5.6-sol"}, {"effort": "high"}, {"sandbox": "workspace-write"}):
+        # The retired 2026-10-14 reviewer (gpt-6.1-sol / xhigh) is now a mismatch too.
+        for kwargs in ({"model": "gpt-5.6-sol"}, {"model": "gpt-6.1-sol"},
+                       {"model": "gpt-6.1-sol", "effort": "xhigh"}, {"effort": "xhigh"},
+                       {"effort": "high"}, {"effort": "low"}, {"sandbox": "workspace-write"}):
             with self.subTest(**kwargs):
                 rc, called, sid, passes, out = self.run_wrapper(**kwargs)
                 self.assertEqual((rc, sid, passes), (4, None, "0"), out)

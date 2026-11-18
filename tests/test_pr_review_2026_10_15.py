@@ -24,6 +24,26 @@ class FakeAPI:
         return self.routes(path)
 
 
+class ReviewerProfileTests(unittest.TestCase):
+    """User decision 2026-11-18: every review runs gpt-6.2-astra / medium."""
+
+    def test_pr_review_matches_the_wrapper_and_the_delivery_gate(self):
+        spec = importlib.util.spec_from_file_location(
+            "codex_review_identity", ROOT / "tools" / "codex_review_identity.py")
+        identity = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(identity)
+        spec = importlib.util.spec_from_file_location("_delivery_gate", ROOT / "_delivery.py")
+        delivery = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(delivery)
+        self.assertEqual((pr.MODEL, pr.EFFORT), ("gpt-6.2-astra", "medium"))
+        self.assertEqual((identity.MODEL, identity.EFFORT), (pr.MODEL, pr.EFFORT))
+        self.assertEqual(pr.CONTEXT, "codex-review/gpt-6.2-astra")
+        self.assertEqual(delivery.REVIEW_CONTEXT, pr.CONTEXT)
+        wrapper = (ROOT / "tools" / "codex_review.sh").read_text(encoding="utf-8")
+        self.assertIn('MODEL="gpt-6.2-astra"', wrapper)
+        self.assertNotIn('EFFORT="xhigh"', wrapper)
+
+
 class QuotaClassificationTests(unittest.TestCase):
     def test_reviewed_content_mentioning_quota_is_not_a_quota_error(self):
         raw = "\n".join([

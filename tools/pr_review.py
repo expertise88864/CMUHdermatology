@@ -2,11 +2,11 @@
 """One review per pull request (user decision 2026-10-15).
 
 Reviews the whole PR range merge-base(main, head)..head with the repository's
-read-only Codex wrapper (gpt-6.1-sol / xhigh, identity verified by the wrapper),
+read-only Codex wrapper (gpt-6.2-astra / medium since 2026-11-18, identity verified by the wrapper),
 then records the outcome on GitHub instead of in commits:
 
 * a PR comment with the verdict, exact base/head SHAs, session and findings;
-* a commit status ``codex-review/gpt-6.1-sol`` on the exact head SHA, which
+* a commit status ``codex-review/gpt-6.2-astra`` on the exact head SHA, which
   ``_delivery.py`` checks before promoting that SHA to main.
 
 Usage (clean checkout of the exact, already pushed codex/* head):
@@ -35,9 +35,9 @@ import urllib.error
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent.parent
-CONTEXT = "codex-review/gpt-6.1-sol"
-MODEL = "gpt-6.1-sol"
-EFFORT = "xhigh"
+CONTEXT = "codex-review/gpt-6.2-astra"
+MODEL = "gpt-6.2-astra"
+EFFORT = "medium"
 MARKER = "<!-- codex-pr-review -->"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 QUOTA = re.compile(r"usage limit|rate limit|try again at|quota", re.I)

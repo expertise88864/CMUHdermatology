@@ -318,7 +318,7 @@ python scripts/type_debt.py
 不代替完整 review。手動分步提交仍須相同生成及一致性守門，不繞 hook。
 
 1. 相關回歸、Ruff、sanity、delivery unit tests 成功；程式改動生成版本與 manifest，再核對最終 index。純文件未改 manifest 涵蓋檔案可保持版本不變，但記錄理由。
-2. （2026-10-15 起）不逐 commit review、不加 review trailer。候選推上後以 `python tools/pr_review.py` 對整個 PR（`merge-base(main, head)..head`）做一次 `gpt-6.1-sol`／`xhigh` 唯讀審查，結果寫在 PR comment 與 exact head 的 `codex-review/gpt-6.1-sol` status；修 CONFIRMED findings 後 push 再 `--resume`，直到 APPROVE。
+2. （2026-10-15 起）不逐 commit review、不加 review trailer。候選推上後以 `python tools/pr_review.py` 對整個 PR（`merge-base(main, head)..head`）做一次 `gpt-6.2-astra`／`medium`（2026-11-18 起，取代 `gpt-6.1-sol`／`xhigh`）唯讀審查，結果寫在 PR comment 與 exact head 的 `codex-review/gpt-6.2-astra` status；修 CONFIRMED findings 後 push 再 `--resume`，直到 APPROVE。
 3. 只有確定的供應商額度限制可記 quota-pending；它可發佈但不是通過，額度恢復後以 `python tools/pr_review.py --pending` 補審，結果寫回同一 PR。其他審查失敗不能當額度豁免。
 4. `git config --get core.hooksPath` 應為本專案已追蹤 `.githooks`；使用既有安裝機制，不關閉 hook。
 5. 固定完整 SHA 推候選，完整候選 CI 成功才發佈同一 SHA。下列每一步失敗停止；分支示例需換成本批分支。

@@ -210,7 +210,9 @@ def verify(sha: str, phase: str, cfg: dict, api: API) -> list:
     return evidence
 
 
-REVIEW_CONTEXT = "codex-review/gpt-6.1-sol"
+# User decision 2026-11-18: reviews run gpt-6.2-astra / medium. Statuses from the
+# retired reviewer context (codex-review/gpt-6.1-sol) no longer approve a promotion.
+REVIEW_CONTEXT = "codex-review/gpt-6.2-astra"
 REVIEW_DESCRIPTION = re.compile(r"(APPROVE|quota-pending) base=([0-9a-f]{40})")
 
 

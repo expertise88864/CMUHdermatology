@@ -195,6 +195,8 @@ class DeliveryTests(unittest.TestCase):
         cfg = {"repository": "owner/repo"}
         cases = ([], [self._status("failure", f"REQUEST_CHANGES base={'b'*40}")],
                  [self._status(login="someone-else")], [self._status(context="other")],
+                 # Retired reviewer (user decision 2026-11-18): its APPROVE no longer counts.
+                 [self._status(context="codex-review/gpt-6.1-sol")],
                  [self._status("pending", f"APPROVE base={'b'*40}")],
                  [self._status(description="APPROVE")],
                  [self._status(ident=1), self._status("failure", f"REQUEST_CHANGES base={'b'*40}", ident=2)])
