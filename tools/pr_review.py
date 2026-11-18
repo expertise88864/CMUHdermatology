@@ -29,6 +29,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,7 @@ LEGACY_CONTEXTS = ("codex-review/gpt-6.1-sol",)
 MODEL = "gpt-6.2-astra"
 EFFORT = "medium"
 MARKER = "<!-- codex-pr-review -->"
+LOCK_TOKEN = ""   # set while this process holds .codex-review/review.lock
 SHA = re.compile(r"^[0-9a-f]{40}$")
 QUOTA = re.compile(r"usage limit|rate limit|try again at|quota", re.I)
 BASE_IN_STATUS = re.compile(r"base=([0-9a-f]{40})")
@@ -195,6 +197,9 @@ def run_review(mode: str, base: str, head: str, ctx: str | None,
     """Return (verdict, session_id, last_message)."""
     env = {**os.environ, "CODEX_REVIEW_TIP": head, "CODEX_REVIEW_BASE": base}
     env.pop("CODEX_REVIEW_PREV_TIP", None)
+    env.pop("CODEX_REVIEW_LOCK_TOKEN", None)
+    if LOCK_TOKEN:
+        env["CODEX_REVIEW_LOCK_TOKEN"] = LOCK_TOKEN
     env.pop("CODEX_REVIEW_REBUTTAL_FILE", None)
     if resume_session and previous_head:
         # The wrapper must review every change since the last verdict, not only fixes.
@@ -469,19 +474,26 @@ def acquire_lock() -> Path:
     """One review per checkout at a time (2026-11-18): the wrapper's prompt, raw log,
     last message, identity proof and this driver's binding are shared files, and a
     concurrent run could verify or post another run's verdict. mkdir is atomic."""
+    global LOCK_TOKEN
     state = ROOT / ".codex-review"
     state.mkdir(exist_ok=True)
-    lock = state / "pr_review.lock"
+    # The same lock directory as tools/codex_review.sh: a standalone wrapper run
+    # and this driver exclude each other; the driver's own wrapper child is let in
+    # by the token (CODEX_REVIEW_LOCK_TOKEN) matching the owner file.
+    lock = state / "review.lock"
     try:
         lock.mkdir()
     except FileExistsError:
         raise Blocked(f"Another review is running in this checkout ({lock} exists); "
                       "remove it only if no review is running") from None
-    (lock / "owner").write_text(f"pid={os.getpid()}\n", encoding="utf-8")
+    LOCK_TOKEN = secrets.token_hex(16)
+    (lock / "owner").write_text(LOCK_TOKEN, encoding="utf-8")
     return lock
 
 
 def release_lock(lock: Path) -> None:
+    global LOCK_TOKEN
+    LOCK_TOKEN = ""
     (lock / "owner").unlink(missing_ok=True)
     lock.rmdir()
 

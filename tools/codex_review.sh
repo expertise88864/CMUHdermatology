@@ -48,10 +48,20 @@ STATE_DIR="$REPO_ROOT/.codex-review"
 mkdir -p "$STATE_DIR"
 # 同一 checkout 一次只跑一場審查:prompt/raw log/last message/identity 都是共用檔,
 # 兩場並行會讓一場驗證到另一場的 session 與裁決(2026-11-18)。mkdir 是原子操作。
-LOCK_DIR="$STATE_DIR/wrapper.lock"
-mkdir "$LOCK_DIR" 2>/dev/null \
-  || die "另一場審查正在使用 $STATE_DIR($LOCK_DIR 存在);確認沒有審查在跑後再刪除該目錄。"
-trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+# tools/pr_review.py 與本 wrapper 用同一把鎖:driver 先取鎖(含清理舊檔到記錄裁決),
+# 再以 CODEX_REVIEW_LOCK_TOKEN 告知子行程;token 對得上 owner 檔才沿用,否則拒絕。
+LOCK_DIR="$STATE_DIR/review.lock"
+OWN_LOCK=0
+if mkdir "$LOCK_DIR" 2>/dev/null; then
+  OWN_LOCK=1
+elif [ -n "${CODEX_REVIEW_LOCK_TOKEN:-}" ] \
+     && [ "$(cat "$LOCK_DIR/owner" 2>/dev/null)" = "$CODEX_REVIEW_LOCK_TOKEN" ]; then
+  :
+else
+  die "另一場審查正在使用 $STATE_DIR($LOCK_DIR 存在);確認沒有審查在跑後再刪除該目錄。"
+fi
+release_lock() { if [ "$OWN_LOCK" = "1" ]; then rmdir "$LOCK_DIR" 2>/dev/null; fi; return 0; }
+trap 'release_lock' EXIT
 USAGE_TSV="$STATE_DIR/usage.tsv"
 SESSION_FILE="$STATE_DIR/last_session_id"
 PASS_FILE="$STATE_DIR/last_pass"
@@ -100,6 +110,15 @@ build_flags() {   # $1 = effort ; $2 = kind("exec" | "resume")
 resolve_cli() {
   if [ -n "${CODEX_REVIEW_CLI:-}" ]; then
     CODEX_CLI="$CODEX_REVIEW_CLI"
+    # Windows 上無副檔名的 npm shim 也換成同套件的原生 exe(與自動選擇一致)。
+    case "${OS:-}$(uname -s 2>/dev/null)" in
+      *Windows_NT*|*MINGW*|*MSYS*|*CYGWIN*)
+        case "$(basename "$CODEX_CLI")" in
+          *.*) ;;
+          *) CODEX_CLI="$("$PYTHON" -X utf8 "$SCRIPT_DIR/codex_review_identity.py" native-override "$CODEX_CLI" | head -1 | tr -d '\r')" ||
+               CODEX_CLI="" ;;
+        esac ;;
+    esac
   else
     # -X utf8: Python writes the (possibly non-ASCII) path as UTF-8 even when piped.
     CODEX_CLI="$("$PYTHON" -X utf8 "$SCRIPT_DIR/codex_review_identity.py" which | head -1 | tr -d '\r')" ||
@@ -280,7 +299,7 @@ git -C "$REPO_ROOT" rev-parse --verify --quiet "${TIP}^{commit}" >/dev/null \
   || die "tip-ref '$TIP' 無法解析為 commit。"
 
 CTX_FILE="${3:-}"
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"; rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"; release_lock' EXIT
 if [ -n "$CTX_FILE" ]; then
   [ -f "$CTX_FILE" ] || die "task-context 檔不存在:$CTX_FILE"
   if grep -qE '^(diff --git |@@ |index [0-9a-f]+\.\.)' "$CTX_FILE"; then

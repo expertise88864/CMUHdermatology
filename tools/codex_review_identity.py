@@ -119,6 +119,22 @@ def codex_candidates() -> list[str]:
     return unique
 
 
+def native_override(path: str) -> str:
+    """An explicit CODEX_REVIEW_CLI that is npm's extensionless sh shim on Windows is
+    replaced by the newest runnable native exe of its package, like automatic
+    selection. Any other override is returned unchanged (the wrapper still refuses
+    .cmd/.bat/.ps1, and the identity check verifies the prompt that arrived)."""
+    if os.name != "nt" or os.path.splitext(path)[1]:
+        return path
+    natives = native_for_shim(path)
+    if not natives:
+        return path
+    ranked = [(version_key(v), p) for p in natives if (v := cli_version(p))]
+    if not ranked:
+        raise ValueError(f"no runnable native Codex CLI behind the npm shim {path}")
+    return max(ranked)[1]
+
+
 def find_codex() -> tuple[str, str]:
     """Highest-version runnable native CLI. Builds differ in which models a ChatGPT
     account may use (2026-11-18: npm 0.169.1 runs gpt-6.2-astra while the desktop
@@ -243,6 +259,13 @@ def verify(raw: Path, repo: Path, sessions: Path, started_at: float,
 
 
 def main() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] == "native-override":
+        try:
+            print(native_override(sys.argv[2]))
+        except ValueError as exc:
+            print(f"[codex-review] {exc}", file=sys.stderr)
+            return 4
+        return 0
     if sys.argv[1:] == ["which"]:
         try:
             path, version = find_codex()

@@ -217,11 +217,31 @@ class ReviewLockTests(unittest.TestCase):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp, patch.object(pr, "ROOT", Path(tmp)):
             lock = pr.acquire_lock()
+            self.assertEqual(lock.name, "review.lock")   # same lock as the wrapper
+            self.assertEqual((lock / "owner").read_text(encoding="utf-8"), pr.LOCK_TOKEN)
+            self.assertTrue(pr.LOCK_TOKEN)
             with self.assertRaises(pr.Blocked):
                 pr.acquire_lock()
             pr.release_lock(lock)
+            self.assertEqual(pr.LOCK_TOKEN, "")
             pr.release_lock(pr.acquire_lock())
             self.assertFalse(lock.exists())
+
+    def test_wrapper_child_receives_the_lock_token(self):
+        import subprocess
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp, patch.object(pr, "ROOT", Path(tmp)):
+            lock = pr.acquire_lock()
+            try:
+                with patch.object(pr, "bash", return_value="bash"), \
+                     patch.object(pr, "wrapper", return_value="tools/codex_review.sh"), \
+                     patch.object(pr.subprocess, "run",
+                                  return_value=subprocess.CompletedProcess([], 64)) as run:
+                    pr.run_review("targeted", "b" * 40, SHA, None, None)
+                self.assertEqual(run.call_args.kwargs["env"]["CODEX_REVIEW_LOCK_TOKEN"], pr.LOCK_TOKEN)
+            finally:
+                pr.release_lock(lock)
 
     def test_main_is_pinned_before_fetching_a_pr_head(self):
         source = (ROOT / "tools" / "pr_review.py").read_text(encoding="utf-8")

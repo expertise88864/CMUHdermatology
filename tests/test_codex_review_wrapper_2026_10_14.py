@@ -70,7 +70,8 @@ sys.exit(int(os.environ["FIXTURE_RC"]))
 class CodexReviewWrapperTests(unittest.TestCase):
     def run_wrapper(self, *, resume=False, recorded=None, count=0, returned=SID,
                     model="gpt-6.2-astra", effort="medium", sandbox="read-only", rc=0,
-                    prior=None, truncate=False, cli="codex", prompt_ok=True, locked=False):
+                    prior=None, truncate=False, cli="codex", prompt_ok=True, locked=False,
+                    lock_token=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "repo"
             root.mkdir()
@@ -85,8 +86,10 @@ class CodexReviewWrapperTests(unittest.TestCase):
             state = root / ".codex-review"
             state.mkdir()
             (state / "last_pass").write_text(str(count))
-            if locked:   # another review holds this checkout
-                (state / "wrapper.lock").mkdir()
+            if locked:   # another review (or the driver, with lock_token) holds this checkout
+                (state / "review.lock").mkdir()
+                if lock_token:
+                    (state / "review.lock" / "owner").write_text(lock_token)
             if recorded:
                 (state / "last_session_id").write_text(recorded)
                 if prompt_ok:   # its first round proved the full prompt arrived
@@ -109,6 +112,9 @@ class CodexReviewWrapperTests(unittest.TestCase):
                        FIXTURE_PRIOR_MODEL=(prior or ("", ""))[0],
                        FIXTURE_PRIOR_EFFORT=(prior or ("", ""))[1])
             env.pop("GIT_CONFIG_PARAMETERS", None)
+            env.pop("CODEX_REVIEW_LOCK_TOKEN", None)
+            if lock_token:
+                env["CODEX_REVIEW_LOCK_TOKEN"] = lock_token
             env.pop("BASH_ENV", None)
             args = ["tools/codex_review.sh"] + (["resume"] if resume else ["deep", "HEAD"])
             result = subprocess.run([_bash(), "--noprofile", "--norc", *args], cwd=root, env=env,
@@ -168,6 +174,13 @@ class CodexReviewWrapperTests(unittest.TestCase):
                                                                 count=1, locked=True)
                 self.assertEqual(rc, 64, out)
                 self.assertIsNone(called)
+
+    def test_driver_held_lock_admits_its_own_wrapper_only(self):
+        rc, called, sid, passes, out = self.run_wrapper(locked=True, lock_token="t0k")
+        self.assertEqual((rc, sid), (0, SID), out)
+        rc, called, sid, passes, out = self.run_wrapper(locked=True, lock_token="")
+        self.assertEqual(rc, 64, out)
+        self.assertIsNone(called)
 
     def test_batch_shim_cli_is_refused_before_running(self):
         for cli in ("C:/npm/codex.cmd", "C:/npm/CODEX.CMD", "C:/x/codex.bat", "C:/npm/codex.ps1"):
@@ -309,8 +322,8 @@ class NativeCliSelectionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self._select(identity, npm, "codex.cmd")
 
-    @unittest.skipIf(os.name == "nt", "POSIX executable-bit lookup")
     def test_posix_newer_install_later_on_path_is_not_shadowed(self):
+        # Runs on the Windows CI runner too: platform and executable bit are mocked.
         from unittest.mock import patch
         identity = self._identity()
         with tempfile.TemporaryDirectory() as tmp:
@@ -321,7 +334,9 @@ class NativeCliSelectionTests(unittest.TestCase):
                 (d / "codex").write_text("#!/bin/sh\n", encoding="utf-8")
                 (d / "codex").chmod(0o755)
                 dirs.append(str(d))
-            with patch.dict(identity.os.environ, {"PATH": os.pathsep.join(dirs)}), \
+            with patch.object(identity.os, "name", "posix"), \
+                 patch.object(identity.os, "access", return_value=True), \
+                 patch.dict(identity.os.environ, {"PATH": os.pathsep.join(dirs)}), \
                  patch.object(identity, "cli_version",
                               side_effect=lambda p: "codex-cli 0.169.1" if "new" in p else "codex-cli 0.150.0"):
                 path, _ = identity.find_codex()
@@ -346,6 +361,25 @@ class NativeCliSelectionTests(unittest.TestCase):
                 path, chosen = identity.find_codex()
             self.assertIn(str(Path(tmp) / "b"), path)
             self.assertEqual(chosen, "codex-cli 0.169.1")
+
+    def test_extensionless_npm_shim_override_resolves_to_native(self):
+        from unittest.mock import patch
+        identity = self._identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            npm = self._layout(Path(tmp), True, "proj/node_modules/.bin")
+            with patch.object(identity.os, "name", "nt"), \
+                 patch.object(identity, "cli_version", return_value="codex-cli 0.169.1"):
+                path = identity.native_override(str(npm / "codex"))
+                self.assertTrue(path.lower().endswith("codex.exe"), path)
+                # Not an npm shim: unchanged (the wrapper's own checks still apply).
+                self.assertEqual(identity.native_override(str(Path(tmp) / "plain")), str(Path(tmp) / "plain"))
+                self.assertEqual(identity.native_override("C:/x/codex.exe"), "C:/x/codex.exe")
+            with patch.object(identity.os, "name", "nt"), \
+                 patch.object(identity, "cli_version", return_value=""), \
+                 self.assertRaises(ValueError):
+                identity.native_override(str(npm / "codex"))
+        source = (ROOT / "tools" / "codex_review.sh").read_text(encoding="utf-8")
+        self.assertIn("codex_review_identity.py\" native-override", source)
 
     def test_script_shim_detection(self):
         identity = self._identity()
