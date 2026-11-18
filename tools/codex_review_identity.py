@@ -78,14 +78,16 @@ def native_for_shim(shim: str) -> list[str]:
     return sorted({hit for pattern in patterns for hit in glob.glob(pattern)})
 
 
-def path_file(name: str) -> str | None:
-    """First regular file called `name` on PATH. shutil.which filters by PATHEXT on
-    Windows, so a codex.ps1 shim is invisible to it when .PS1 is not listed."""
+def path_files(name: str) -> list[str]:
+    """Every regular file called `name` on PATH, in PATH order. shutil.which filters
+    by PATHEXT on Windows (hiding a codex.ps1 shim when .PS1 is not listed) and
+    stops at the first match, which would let an older install shadow a newer one."""
+    hits = []
     for directory in os.environ.get("PATH", "").split(os.pathsep):
-        candidate = os.path.join(directory.strip('"'), name) if directory else ""
+        candidate = os.path.join(directory.strip('"'), name) if directory.strip('"') else ""
         if candidate and os.path.isfile(candidate):
-            return candidate
-    return None
+            hits.append(candidate)
+    return hits
 
 
 def codex_candidates() -> list[str]:
@@ -97,16 +99,18 @@ def codex_candidates() -> list[str]:
     if local:
         found.extend(sorted(glob.glob(os.path.join(local, "OpenAI", "Codex", "bin", "*", "codex.exe"))))
     for name in (("codex.cmd", "codex.ps1", "codex.exe", "codex") if os.name == "nt" else ("codex",)):
-        # On Windows the npm shims are looked up as plain files: which() hides
-        # codex.ps1 (and the extensionless sh shim) unless PATHEXT lists them.
-        hit = path_file(name) if os.name == "nt" and name != "codex.exe" else shutil.which(name)
-        if not hit:
-            continue
-        if os.name == "nt" and (is_script_shim(hit) or not os.path.splitext(hit)[1]):
-            # Extensionless `codex` on Windows is npm's sh shim for the same package.
-            found.extend(native_for_shim(hit))
+        # On Windows every PATH directory is searched as plain files (see path_files);
+        # all installs then compete on version below.
+        if os.name == "nt":
+            hits = path_files(name)
         else:
-            found.append(hit)
+            hits = [hit] if (hit := shutil.which(name)) else []
+        for hit in hits:
+            if os.name == "nt" and (is_script_shim(hit) or not os.path.splitext(hit)[1]):
+                # Extensionless `codex` on Windows is npm's sh shim for the same package.
+                found.extend(native_for_shim(hit))
+            else:
+                found.append(hit)
     found = [path for path in found if not is_script_shim(path)]
     seen, unique = set(), []
     for path in found:

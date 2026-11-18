@@ -175,6 +175,42 @@ class HistoricalHeadAndBaseTests(unittest.TestCase):
                     pr.widened_base(shas[2], shas[1], shas[3])
 
 
+class ResumePlanTests(unittest.TestCase):
+    """--resume keeps the first round's base and needs its full-prompt proof (2026-11-18)."""
+
+    def _repo(self, tmp):
+        import subprocess
+        root = Path(tmp)
+        run = lambda *a: subprocess.run(["git", "-C", str(root), *a], check=True,  # noqa: E731
+                                        capture_output=True, text=True).stdout.strip()
+        run("init", "-q")
+        shas = []
+        for i in range(4):
+            run("-c", "user.name=F", "-c", "user.email=f@example.invalid",
+                "commit", "--allow-empty", "-qm", f"c{i}")
+            shas.append(run("rev-parse", "HEAD"))
+        return root, shas
+
+    def test_resume_plan(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root, (a, b, h1, h2) = self._repo(tmp)
+            saved = {"repo": "o/r", "pr": 26, "session": "s", "head": h1, "base": b,
+                     "verdict": "REQUEST_CHANGES", "prompt_verified": True}
+            with patch.object(pr, "ROOT", root):
+                self.assertEqual(pr.resume_plan(saved, 26, "o/r", "s", h2, False, None), ("s", h1, b))
+                self.assertEqual(pr.resume_plan(saved, 26, "o/r", "s", h2, False, b), ("s", h1, b))
+                bad = (({**saved, "prompt_verified": False}, None),   # first round unproven
+                       ({k: v for k, v in saved.items() if k != "prompt_verified"}, None),
+                       ({k: v for k, v in saved.items() if k != "base"}, None),
+                       (saved, a),                                     # widening on resume
+                       ({**saved, "pr": 25}, None))
+                for plan_saved, requested in bad:
+                    with self.subTest(saved=plan_saved, requested=requested), self.assertRaises(pr.Blocked):
+                        pr.resume_plan(plan_saved, 26, "o/r", "s", h2, False, requested)
+
+
 class TerminalQuotaTests(unittest.TestCase):
     """PR #17 review round 1 (P1): only the terminal provider error decides quota-pending."""
 
@@ -240,7 +276,7 @@ class ResumeScopeTests(unittest.TestCase):
         assert 'merge-base --is-ancestor "$PREV_TIP" "$TIP"' in text
         assert "Review EVERY change in ${PREV_TIP}..${TIP}" in text
         main_src = (ROOT / "tools" / "pr_review.py").read_text(encoding="utf-8")
-        assert '"head": head,' in main_src and "previous_head = resume_base(saved, head, bool(rebuttal))" in main_src
+        assert '"head": head,' in main_src and "return session, resume_base(saved, head, rebuttal), base" in main_src
 
 
 if __name__ == "__main__":
@@ -270,7 +306,8 @@ class RecordRetryTests(unittest.TestCase):
             unrecorded = Path(tmp) / "pr_review_unrecorded.json"
             binding.write_text(json.dumps({"head": "b" * 40}), encoding="utf-8")
             entry = {"repo": "owner/repo", "pr": 7, "verdict": "APPROVE", "base": "c" * 40, "head": SHA,
-                     "model": pr.MODEL, "effort": pr.EFFORT, "session": "s", "bound_session": "s", "message": "APPROVE", "resume": True}
+                     "model": pr.MODEL, "effort": pr.EFFORT, "prompt_verified": True,
+                     "session": "s", "bound_session": "s", "message": "APPROVE", "resume": True}
             unrecorded.write_text(json.dumps(entry), encoding="utf-8")
             api, pull = FakeAPI(lambda path: None), {"number": 7}
             with patch.object(pr, "record", side_effect=pr.Blocked("HTTP 502")), \
@@ -301,8 +338,12 @@ class RecordRetryTests(unittest.TestCase):
         from unittest.mock import patch
         base = {"repo": "owner/repo", "pr": 7, "verdict": "APPROVE", "base": "c" * 40, "head": SHA,
                 "session": "s", "bound_session": "s", "message": "APPROVE", "resume": False}
-        for profile in ({}, {"model": "gpt-6.1-sol", "effort": "xhigh"},
-                        {"model": pr.MODEL, "effort": "xhigh"}, {"model": "gpt-6.1-sol", "effort": pr.EFFORT}):
+        for profile in ({}, {"model": "gpt-6.1-sol", "effort": "xhigh", "prompt_verified": True},
+                        {"model": pr.MODEL, "effort": "xhigh", "prompt_verified": True},
+                        {"model": "gpt-6.1-sol", "effort": pr.EFFORT, "prompt_verified": True},
+                        # Saved by e1edffe (PR #25) before prompt proof existed: may be truncated.
+                        {"model": pr.MODEL, "effort": pr.EFFORT},
+                        {"model": pr.MODEL, "effort": pr.EFFORT, "prompt_verified": False}):
             with self.subTest(profile=profile), tempfile.TemporaryDirectory() as tmp:
                 unrecorded = Path(tmp) / "u.json"
                 unrecorded.write_text(json.dumps({**base, **profile}), encoding="utf-8")
@@ -311,7 +352,11 @@ class RecordRetryTests(unittest.TestCase):
                                     Path(tmp) / "b.json", unrecorded)
                 record.assert_not_called()
                 self.assertFalse(pr.current_profile({**base, **profile}))
-        self.assertTrue(pr.current_profile({"model": pr.MODEL, "effort": pr.EFFORT}))
+        self.assertTrue(pr.current_profile({"model": pr.MODEL, "effort": pr.EFFORT,
+                                            "verdict": "APPROVE", "prompt_verified": True}))
+        # Quota/error records have no review turn to prove; profile alone decides.
+        self.assertTrue(pr.current_profile({"model": pr.MODEL, "effort": pr.EFFORT,
+                                            "verdict": "QUOTA_PENDING"}))
 
 
 class RebuttalTests(unittest.TestCase):

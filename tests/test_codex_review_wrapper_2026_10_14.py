@@ -70,7 +70,7 @@ sys.exit(int(os.environ["FIXTURE_RC"]))
 class CodexReviewWrapperTests(unittest.TestCase):
     def run_wrapper(self, *, resume=False, recorded=None, count=0, returned=SID,
                     model="gpt-6.2-astra", effort="medium", sandbox="read-only", rc=0,
-                    prior=None, truncate=False, cli="codex"):
+                    prior=None, truncate=False, cli="codex", prompt_ok=True):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "repo"
             root.mkdir()
@@ -87,6 +87,8 @@ class CodexReviewWrapperTests(unittest.TestCase):
             (state / "last_pass").write_text(str(count))
             if recorded:
                 (state / "last_session_id").write_text(recorded)
+                if prompt_ok:   # its first round proved the full prompt arrived
+                    (state / "prompt_verified_session").write_text(recorded)
             fixture_bin = Path(directory) / "bin"
             fixture_bin.mkdir()
             emitter = Path(directory) / "emit.py"
@@ -205,6 +207,14 @@ class CodexReviewWrapperTests(unittest.TestCase):
                                                    prior=("gpt-6.2-astra", "medium"))
         self.assertEqual((rc, sid, passes), (0, SID, "2"), out)
 
+    def test_resume_without_full_prompt_proof_is_refused(self):
+        # A session whose first round predates prompt verification (e.g. PR #25's,
+        # truncated by codex.cmd) cannot be resumed into a whole-range verdict.
+        rc, called, sid, passes, out = self.run_wrapper(resume=True, recorded=SID, count=1,
+                                                        prompt_ok=False)
+        self.assertEqual((rc, passes), (64, "1"), out)
+        self.assertIsNone(called)
+
     def test_resume_returning_another_session_never_counts(self):
         rc, _, sid, passes, out = self.run_wrapper(resume=True, recorded=SID, count=1, returned=OTHER)
         self.assertEqual((rc, sid, passes), (4, SID, "1"), out)
@@ -244,13 +254,13 @@ class NativeCliSelectionTests(unittest.TestCase):
         hits = {name_hit: str(npm / name_hit)}
         with patch.object(identity.os, "name", "nt"), \
              patch.dict(identity.os.environ, {"LOCALAPPDATA": ""}), \
-             patch.object(identity, "path_file", side_effect=lambda n: hits.get(n)), \
+             patch.object(identity, "path_files", side_effect=lambda n: [hits[n]] if n in hits else []), \
              patch.object(identity.shutil, "which", side_effect=lambda n: hits.get(n)), \
              patch.object(identity, "cli_version", return_value="codex-cli 0.169.1"):
             return identity.find_codex()
 
     def test_ps1_shim_is_found_without_ps1_in_pathext(self):
-        # shutil.which hides codex.ps1 when PATHEXT lacks .PS1; path_file must not.
+        # shutil.which hides codex.ps1 when PATHEXT lacks .PS1; path_files must not.
         from unittest.mock import patch
         identity = self._identity()
         with tempfile.TemporaryDirectory() as tmp:
@@ -258,8 +268,8 @@ class NativeCliSelectionTests(unittest.TestCase):
             (npm / "codex.cmd").unlink()
             (npm / "codex").unlink()
             with patch.dict(identity.os.environ, {"PATH": str(npm), "PATHEXT": ".COM;.EXE;.BAT;.CMD"}):
-                self.assertEqual(identity.path_file("codex.ps1"), str(npm / "codex.ps1"))
-                self.assertIsNone(identity.path_file("codex.cmd"))
+                self.assertEqual(identity.path_files("codex.ps1"), [str(npm / "codex.ps1")])
+                self.assertEqual(identity.path_files("codex.cmd"), [])
                 if os.name == "nt":
                     self.assertIsNone(shutil.which("codex.ps1"))
                     with patch.dict(identity.os.environ, {"LOCALAPPDATA": ""}), \
@@ -289,6 +299,26 @@ class NativeCliSelectionTests(unittest.TestCase):
             npm = self._layout(Path(tmp), native=False)
             with self.assertRaises(ValueError):
                 self._select(identity, npm, "codex.cmd")
+
+    def test_newer_install_later_on_path_is_not_shadowed(self):
+        # An older project-local .bin ahead of a newer global prefix must not hide it.
+        from unittest.mock import patch
+        identity = self._identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self._layout(Path(tmp) / "a", True, "proj/node_modules/.bin")
+            new = self._layout(Path(tmp) / "b", True)
+            versions = {"a": "codex-cli 0.150.0", "b": "codex-cli 0.169.1"}
+
+            def version(path):
+                return versions["a" if str(Path(tmp) / "a") in path else "b"]
+            with patch.object(identity.os, "name", "nt"), \
+                 patch.dict(identity.os.environ, {"LOCALAPPDATA": "",
+                                                  "PATH": os.pathsep.join([str(old), str(new)])}), \
+                 patch.object(identity, "cli_version", side_effect=version):
+                self.assertEqual(len(identity.codex_candidates()), 2)
+                path, chosen = identity.find_codex()
+            self.assertIn(str(Path(tmp) / "b"), path)
+            self.assertEqual(chosen, "codex-cli 0.169.1")
 
     def test_script_shim_detection(self):
         identity = self._identity()

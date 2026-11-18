@@ -49,6 +49,9 @@ mkdir -p "$STATE_DIR"
 USAGE_TSV="$STATE_DIR/usage.tsv"
 SESSION_FILE="$STATE_DIR/last_session_id"
 PASS_FILE="$STATE_DIR/last_pass"
+# 第一輪通過「完整 prompt」驗證的 session(2026-11-18):沒有這個證據的 session(例如
+# PR #25 經 codex.cmd 截斷的那場)不可被續審成整段範圍的 APPROVE。
+PROMPT_OK_FILE="$STATE_DIR/prompt_verified_session"
 LAST_MSG="$STATE_DIR/last_message.txt"
 PROMPT_SENT="$STATE_DIR/last_prompt.txt"   # 本輪實際送出的 prompt,供 identity 比對
 RAW_LOG="$STATE_DIR/last_raw.log"
@@ -187,6 +190,9 @@ resume 只能沿用同一 task 的 session。要重開一輪全新審查請跑�
   PREV_PASS="$(cat "$PASS_FILE" 2>/dev/null || echo 0)"
   [ "$PREV_PASS" -ge 1 ] 2>/dev/null \
     || die "resume 只能在完成第一輪之後(目前 pass=$PREV_PASS)。請先跑第一輪。"
+  PROMPT_OK_SID="$(cat "$PROMPT_OK_FILE" 2>/dev/null | tr 'A-Z' 'a-z' || true)"
+  [ -n "$PROMPT_OK_SID" ] && [ "$PROMPT_OK_SID" = "$SID" ] \
+    || die "此 session 的第一輪沒有完整 prompt 送達的證據(可能是截斷 prompt 的舊 session);請重跑第一輪。"
   THIS_PASS=$((PREV_PASS + 1))
   RESUME_EFFORT="medium"  # 2026-11-18:一律 medium,不沿用舊紀錄裡的 effort
   RESUME_BASE="$(tail -1 "$USAGE_TSV" | cut -f6)";   [ -n "$RESUME_BASE" ] || RESUME_BASE="unavailable"
@@ -396,7 +402,7 @@ echo "[codex-review] mode=$MODE effort=$EFFORT range=$BASE..$TIP model=$MODEL (p
 # 第一輪開始就清掉上一場的 pass 與 session 紀錄:本輪若驗證失敗,不可讓 resume
 # 接回上一場(那會把舊 session 的 APPROVE 當成這次的結論)。
 echo 0 > "$PASS_FILE"
-rm -f "$SESSION_FILE"
+rm -f "$SESSION_FILE" "$PROMPT_OK_FILE"
 : > "$LAST_MSG"
 # ★stdin 一律導自 /dev/null★(2026-08-30 實測):codex CLI 在 stdin 不是
 #   TTY 時會印 "Reading additional input from stdin..." 並【等】額外輸入。
@@ -418,6 +424,7 @@ if ! verify_actual_session; then
 fi
 
 echo 1 > "$PASS_FILE"
+printf '%s' "$VERIFIED_SID" > "$PROMPT_OK_FILE"
 RESULT="$(log_usage "$MODE" "$EFFORT" "$BASE" 1)"
 echo; echo "[codex-review] result=$RESULT (pass 1)  usage → $USAGE_TSV"
 # 限流僅在「未產生明確結論」時才視為不可信(避免 review 的 diff 內容含 'rate limit' 字面誤判)。

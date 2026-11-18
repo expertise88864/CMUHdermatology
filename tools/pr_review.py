@@ -207,7 +207,7 @@ def run_review(mode: str, base: str, head: str, ctx: str | None,
     state = ROOT / ".codex-review"
     # A wrapper that refuses before calling the CLI leaves the previous round's
     # files behind; they must never be read as this head's verdict or quota error.
-    for stale in ("last_message.txt", "last_raw.log"):
+    for stale in ("last_message.txt", "last_raw.log", "last_identity.json"):
         (state / stale).unlink(missing_ok=True)
     rc = subprocess.run(args, cwd=ROOT, env=env, stdin=subprocess.DEVNULL).returncode
     message = (state / "last_message.txt").read_text(encoding="utf-8", errors="replace") \
@@ -346,6 +346,7 @@ def finish(api: API, pr: dict, entry: dict, binding: Path, unrecorded: Path) -> 
         binding.write_text(json.dumps({"repo": api.repo, "pr": pr["number"],
                                        "session": entry["bound_session"], "head": head,
                                        "base": entry["base"],
+                                       "prompt_verified": entry.get("prompt_verified") is True,
                                        "verdict": verdict,
                                        "rebutted_head": head if entry.get("same_head_rebuttal") else ""}),
                            encoding="utf-8")
@@ -357,8 +358,43 @@ def finish(api: API, pr: dict, entry: dict, binding: Path, unrecorded: Path) -> 
 def current_profile(entry: dict) -> bool:
     """A saved verdict was produced by the configured reviewer (user decision 2026-11-18).
     Verdicts saved without a profile, or by a retired one, must never be posted under
-    the current status context."""
-    return entry.get("model") == MODEL and entry.get("effort") == EFFORT
+    the current status context. A review verdict also needs proof that the reviewer
+    received the whole prompt (verdicts saved before that proof existed may come
+    from the truncating codex.cmd shim)."""
+    if entry.get("model") != MODEL or entry.get("effort") != EFFORT:
+        return False
+    return entry.get("verdict") not in ("APPROVE", "REQUEST_CHANGES") \
+        or entry.get("prompt_verified") is True
+
+
+def prompt_proof(session: str) -> bool:
+    """The wrapper's identity proof for this round shows the full prompt arrived."""
+    path = ROOT / ".codex-review" / "last_identity.json"
+    try:
+        proof = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return proof.get("promptVerified") is True \
+        and str(proof.get("sessionId", "")).lower() == str(session).lower()
+
+
+def resume_plan(saved: dict, pr_number: int, repo: str, current_session: str, head: str,
+                rebuttal: bool, requested_base: str | None) -> tuple[str, str | None, str]:
+    """(session, previous head, base) for --resume. The session must be this PR's,
+    prompt-verified from its first round, and keeps the base that round reviewed:
+    an incremental resume can never certify a wider range (widen = new first round)."""
+    session = str(saved.get("session", "")).lower()
+    if saved.get("pr") != pr_number or saved.get("repo") != repo \
+            or not session or session != current_session:
+        raise Blocked("The recorded review session is not this PR's; run a first round")
+    if saved.get("prompt_verified") is not True:
+        raise Blocked("The recorded session has no full-prompt proof; run a first round")
+    base = str(saved.get("base", ""))
+    if not SHA.fullmatch(base) or not strict_ancestor(base, head):
+        raise Blocked("The recorded session has no usable reviewed base; run a first round")
+    if requested_base and git("rev-parse", "--verify", f"{requested_base}^{{commit}}") != base:
+        raise Blocked("--base differs from the session's first round; widen with a fresh first round")
+    return session, resume_base(saved, head, rebuttal), base
 
 
 def retry_record(api: API, pr: dict, head: str, binding: Path, unrecorded: Path) -> int:
@@ -442,10 +478,12 @@ def main() -> int:
             # Backfill of a head already published to main: reuse the base the PR's
             # recorded review covered, else the PR's own base.
             base = reviewed_base(api, head) or git("merge-base", pr["base"]["sha"], head)
-        if not SHA.fullmatch(base) or base == head:
-            raise Blocked("Nothing to review: head has no commits beyond main")
-        if args.base:
+        if args.base and not args.resume:
+            # Before the empty-range check: a fast-forwarded historical PR has
+            # merge-base == head, and --base is how its real range is named.
             base = widened_base(args.base, base, head)
+        if not SHA.fullmatch(base) or (base == head and not args.resume):
+            raise Blocked("Nothing to review: head has no commits beyond main")
         if pr is None:
             pr = open_pr(api, branch, base, head)
             print(f"[pr-review] opened PR #{pr['number']}: {pr['html_url']}")
@@ -473,16 +511,8 @@ def main() -> int:
             saved = json.loads(binding.read_text(encoding="utf-8")) if binding.is_file() else {}
             recorded = ROOT / ".codex-review" / "last_session_id"
             current = recorded.read_text(encoding="utf-8").strip().lower() if recorded.is_file() else ""
-            resume_session = str(saved.get("session", "")).lower()
-            if saved.get("pr") != pr["number"] or saved.get("repo") != api.repo \
-                    or not resume_session or resume_session != current:
-                raise Blocked("The recorded review session is not this PR's; run a first round")
-            previous_head = resume_base(saved, head, bool(rebuttal))
-            # The session's range stays what its first round reviewed (e.g. --base).
-            saved_base = str(saved.get("base", ""))
-            if SHA.fullmatch(saved_base) and saved_base != base \
-                    and strict_ancestor(saved_base, base) and not args.base:
-                base = saved_base
+            resume_session, previous_head, base = resume_plan(
+                saved, pr["number"], api.repo, current, head, bool(rebuttal), args.base)
         else:
             binding.unlink(missing_ok=True)
         verdict, session, message = run_review(args.mode, base, head, args.ctx, resume_session,
@@ -490,7 +520,8 @@ def main() -> int:
         # Keep the verdict until GitHub has it: a failed POST is retried with
         # --retry-record instead of being lost (or blocking the next --resume).
         entry = {"repo": api.repo, "pr": pr["number"], "verdict": verdict, "base": base, "head": head,
-                 "model": MODEL, "effort": EFFORT, "session": session, "bound_session": resume_session or session,
+                 "model": MODEL, "effort": EFFORT, "prompt_verified": prompt_proof(session),
+                 "session": session, "bound_session": resume_session or session,
                  "message": message, "resume": args.resume, "rebuttal": bool(rebuttal),
                  "same_head_rebuttal": bool(rebuttal) and previous_head is None}
         unrecorded.write_text(json.dumps(entry), encoding="utf-8")
