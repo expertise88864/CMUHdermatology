@@ -380,6 +380,16 @@ sed -i -e "s|{{MODE}}|$MODE|g" -e "s|{{BASE}}|$BASE|g" -e "s|{{TIP}}|$TIP|g" \
        -e "s|{{EXTRA_FILE_LIMIT}}|$EXTRA_FILE_LIMIT|" -e "s|{{FINDING_LIMIT}}|$FINDING_LIMIT|" "$TMP/prompt.txt"
 sed -i -e "/{{TASK_CONTEXT}}/r $TMP/ctx.txt" -e "/{{TASK_CONTEXT}}/d" "$TMP/prompt.txt"
 sed -i -e "/{{VERIFICATION_RESULTS}}/r $TMP/ver.txt" -e "/{{VERIFICATION_RESULTS}}/d" "$TMP/prompt.txt"
+# 補審歷史 PR head(pr_review.py --pr):TIP 不是工作區所在 commit 時,工作區檔案不是被審版本。
+if [ "$(git -C "$REPO_ROOT" rev-parse "${TIP}^{commit}")" != "$(git -C "$REPO_ROOT" rev-parse HEAD)" ]; then
+  cat >> "$TMP/prompt.txt" <<HIST
+
+HISTORICAL HEAD:
+The working tree is checked out at a different commit than ${TIP}. Judge the code
+as of ${TIP}: read files with \`git show ${TIP}:<path>\` (and \`git grep <pattern> ${TIP}\`),
+not from the working tree, which may contain later changes.
+HIST
+fi
 
 build_flags "$EFFORT"
 echo "[codex-review] mode=$MODE effort=$EFFORT range=$BASE..$TIP model=$MODEL (pass 1, read-only)"

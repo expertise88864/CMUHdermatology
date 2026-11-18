@@ -108,6 +108,72 @@ class PendingAndBackfillTests(unittest.TestCase):
         self.assertEqual(pr.reviewed_base(FakeAPI(lambda path: statuses), SHA), "c" * 40)
         self.assertEqual(pr.reviewed_base(FakeAPI(lambda path: []), SHA), "")
 
+    def test_backfill_recovers_the_base_of_a_retired_reviewer_status(self):
+        # User decision 2026-11-18: a pre-switch quota-pending status lives only under
+        # codex-review/gpt-6.1-sol; its base still names the range to backfill.
+        import subprocess
+        from unittest.mock import patch
+        legacy = [{"id": 5, "context": "codex-review/gpt-6.1-sol", "creator": {"login": "owner"},
+                   "description": f"quota-pending base={'e' * 40}"},
+                  {"id": 6, "context": "codex-review/gpt-6.1-sol", "creator": {"login": "intruder"},
+                   "description": f"quota-pending base={'f' * 40}"}]
+        with patch.object(pr.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)):
+            self.assertEqual(pr.reviewed_base(FakeAPI(lambda path: legacy), SHA), "e" * 40)
+            current = legacy + [{"id": 1, "context": pr.CONTEXT, "creator": {"login": "owner"},
+                                 "description": f"REQUEST_CHANGES base={'b' * 40}"}]
+            self.assertEqual(pr.reviewed_base(FakeAPI(lambda path: current), SHA), "b" * 40)
+        # A legacy base that is not a strict ancestor of the head is ignored.
+        with patch.object(pr.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)):
+            self.assertEqual(pr.reviewed_base(FakeAPI(lambda path: legacy), SHA), "")
+        self.assertEqual(pr.reviewed_base(FakeAPI(lambda path: [dict(legacy[0], description=
+                         f"quota-pending base={SHA}")]), SHA), "")
+
+
+class HistoricalHeadAndBaseTests(unittest.TestCase):
+    """Backfill with current tooling; --base widens only (user decision 2026-11-18)."""
+
+    def _repo(self, tmp):
+        import subprocess
+        root = Path(tmp)
+        run = lambda *a: subprocess.run(["git", "-C", str(root), *a], check=True,  # noqa: E731
+                                        capture_output=True, text=True).stdout.strip()
+        run("init", "-q")
+        shas = []
+        for i in range(4):
+            run("-c", "user.name=F", "-c", "user.email=f@example.invalid",
+                "commit", "--allow-empty", "-qm", f"c{i}")
+            shas.append(run("rev-parse", "HEAD"))
+        return root, shas
+
+    def test_historical_head_is_reviewed_from_a_newer_checkout(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root, shas = self._repo(tmp)
+            with patch.object(pr, "ROOT", root):
+                self.assertEqual(pr.historical_head({"number": 25, "head": {"sha": shas[2]}}, shas[3]),
+                                 shas[2])
+                with patch.object(pr.subprocess, "run", wraps=pr.subprocess.run) as run, \
+                        self.assertRaises((pr.Blocked, pr.subprocess.CalledProcessError)):
+                    pr.historical_head({"number": 25, "head": {"sha": "9" * 40}}, shas[3])
+                self.assertTrue(any("pull/25/head" in c.args[0] for c in run.call_args_list))
+                with self.assertRaises(pr.Blocked):
+                    pr.historical_head({"number": 25, "head": {"sha": "nope"}}, shas[3])
+
+    def test_base_only_widens(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root, shas = self._repo(tmp)
+            with patch.object(pr, "ROOT", root):
+                self.assertEqual(pr.widened_base(shas[0], shas[2], shas[3]), shas[0])
+                self.assertEqual(pr.widened_base(shas[2], shas[2], shas[3]), shas[2])
+                for requested in (shas[3], "9" * 40):
+                    with self.subTest(requested=requested), self.assertRaises((pr.Blocked, pr.subprocess.CalledProcessError)):
+                        pr.widened_base(requested, shas[2], shas[3])
+                with self.assertRaises(pr.Blocked):   # newer than the merge-base: narrows
+                    pr.widened_base(shas[2], shas[1], shas[3])
+
 
 class TerminalQuotaTests(unittest.TestCase):
     """PR #17 review round 1 (P1): only the terminal provider error decides quota-pending."""

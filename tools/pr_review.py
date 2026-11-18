@@ -13,7 +13,8 @@ Usage (clean checkout of the exact, already pushed codex/* head):
     python tools/pr_review.py                       # first round; opens the PR if missing
     python tools/pr_review.py --resume              # after fixing CONFIRMED findings
     python tools/pr_review.py --mode deep --ctx task.txt
-    python tools/pr_review.py --pr 12               # backfill a PR (HEAD must equal its head)
+    python tools/pr_review.py --pr 12               # backfill a PR with THIS checkout's tooling
+    python tools/pr_review.py --base SHA            # widen the range to SHA..head (ancestor only)
     python tools/pr_review.py --pending             # list PRs whose head is not approved
     python tools/pr_review.py --retry-record        # re-post a verdict GitHub did not accept
     python tools/pr_review.py --resume --rebuttal r.txt  # once per head: evidence for REJECTED findings
@@ -36,6 +37,9 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parent.parent
 CONTEXT = "codex-review/gpt-6.2-astra"
+# Retired reviewer contexts: read only to recover the range a historical review
+# covered (backfill), never accepted as approval (_delivery.py ignores them).
+LEGACY_CONTEXTS = ("codex-review/gpt-6.1-sol",)
 MODEL = "gpt-6.2-astra"
 EFFORT = "medium"
 MARKER = "<!-- codex-pr-review -->"
@@ -247,16 +251,26 @@ def record(api: API, pr: dict, verdict: str, base: str, head: str, session: str,
     api.call("POST", f"/issues/{pr['number']}/comments", {"body": body})
 
 
+def strict_ancestor(base: str, head: str) -> bool:
+    return base != head and subprocess.run(
+        ["git", "merge-base", "--is-ancestor", base, head], cwd=ROOT).returncode == 0
+
+
 def reviewed_base(api: API, sha: str) -> str:
-    """Base of the newest owner review status on this head (any verdict), or ''."""
+    """Base of the newest owner review status on this head (any verdict), or ''.
+
+    Statuses of the current reviewer come first. A head reviewed (or left
+    quota-pending) before the 2026-11-18 switch only has a retired-context status;
+    its base still names the range to backfill, if it is a strict ancestor."""
     owner = api.repo.split("/")[0].lower()
     rows = [s for s in api.call("GET", f"/commits/{sha}/statuses?per_page=100") or []
-            if s.get("context") == CONTEXT
-            and str(s.get("creator", {}).get("login", "")).lower() == owner]
-    for status in sorted(rows, key=lambda s: s["id"], reverse=True):
-        match = BASE_IN_STATUS.search(str(status.get("description", "")))
-        if match:
-            return match.group(1)
+            if str(s.get("creator", {}).get("login", "")).lower() == owner]
+    for contexts, check in (((CONTEXT,), False), (LEGACY_CONTEXTS, True)):
+        mine = [s for s in rows if s.get("context") in contexts]
+        for status in sorted(mine, key=lambda s: s["id"], reverse=True):
+            match = BASE_IN_STATUS.search(str(status.get("description", "")))
+            if match and (not check or strict_ancestor(match.group(1), sha)):
+                return match.group(1)
     return ""
 
 
@@ -331,6 +345,7 @@ def finish(api: API, pr: dict, entry: dict, binding: Path, unrecorded: Path) -> 
         # the next --resume reviews every commit after it (fixes and anything else).
         binding.write_text(json.dumps({"repo": api.repo, "pr": pr["number"],
                                        "session": entry["bound_session"], "head": head,
+                                       "base": entry["base"],
                                        "verdict": verdict,
                                        "rebutted_head": head if entry.get("same_head_rebuttal") else ""}),
                            encoding="utf-8")
@@ -358,6 +373,35 @@ def retry_record(api: API, pr: dict, head: str, binding: Path, unrecorded: Path)
     return finish(api, pr, entry, binding, unrecorded)
 
 
+def historical_head(pr: dict, checkout: str) -> str:
+    """The PR head to review with this checkout's tooling.
+
+    A pending PR from before a reviewer switch still carries the retired wrapper
+    and driver at its own head, so it is reviewed from a current checkout: the
+    wrapper reviews base..PR head as committed history (CODEX_REVIEW_TIP)."""
+    head = str(pr["head"]["sha"])
+    if not SHA.fullmatch(head):
+        raise Blocked("The PR has no valid head SHA")
+    if head != checkout and subprocess.run(["git", "cat-file", "-e", f"{head}^{{commit}}"],
+                                           cwd=ROOT, capture_output=True).returncode != 0:
+        subprocess.run(["git", "fetch", "--no-tags", "-q", "origin", f"pull/{pr['number']}/head"],
+                       cwd=ROOT, check=True)
+        if subprocess.run(["git", "cat-file", "-e", f"{head}^{{commit}}"], cwd=ROOT,
+                          capture_output=True).returncode != 0:
+            raise Blocked(f"PR head {head} is not available locally")
+    return head
+
+
+def widened_base(requested: str, base: str, head: str) -> str:
+    """--base may only widen the reviewed range, never narrow or detach it."""
+    full = git("rev-parse", "--verify", f"{requested}^{{commit}}")
+    if full != base and not strict_ancestor(full, base):
+        raise Blocked("--base must be merge-base(main, head) or one of its ancestors")
+    if not strict_ancestor(full, head):
+        raise Blocked("--base must be a strict ancestor of the head")
+    return full
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--mode", choices=("diff", "targeted", "deep"), default="targeted")
@@ -365,7 +409,10 @@ def main() -> int:
     parser.add_argument("--resume", action="store_true", help="continue the recorded session")
     parser.add_argument("--rebuttal", help="with --resume: evidence for REJECTED findings (never a diff); "
                                            "allows one re-examination of an unchanged head")
-    parser.add_argument("--pr", type=int, help="PR number (default: open PR of the current branch)")
+    parser.add_argument("--pr", type=int, help="PR number (default: open PR of the current branch); "
+                                               "its head may differ from this checkout")
+    parser.add_argument("--base", help="widen the reviewed range to BASE..head; BASE must be an "
+                                       "ancestor of merge-base(main, head)")
     parser.add_argument("--pending", action="store_true", help="list PRs whose head lacks APPROVE")
     parser.add_argument("--retry-record", action="store_true",
                         help="re-post a verdict whose GitHub recording failed (no new review)")
@@ -380,8 +427,7 @@ def main() -> int:
         subprocess.run(["git", "fetch", "--no-tags", "-q", "origin", "main"], cwd=ROOT, check=True)
         if args.pr:
             pr = find_pr(api, "", args.pr)
-            if pr["head"]["sha"] != head:
-                raise Blocked(f"Check out the PR head first: git switch --detach {pr['head']['sha']}")
+            head = historical_head(pr, head)
         else:
             branch = git("branch", "--show-current")
             if not branch.startswith("codex/"):
@@ -398,6 +444,8 @@ def main() -> int:
             base = reviewed_base(api, head) or git("merge-base", pr["base"]["sha"], head)
         if not SHA.fullmatch(base) or base == head:
             raise Blocked("Nothing to review: head has no commits beyond main")
+        if args.base:
+            base = widened_base(args.base, base, head)
         if pr is None:
             pr = open_pr(api, branch, base, head)
             print(f"[pr-review] opened PR #{pr['number']}: {pr['html_url']}")
@@ -430,6 +478,11 @@ def main() -> int:
                     or not resume_session or resume_session != current:
                 raise Blocked("The recorded review session is not this PR's; run a first round")
             previous_head = resume_base(saved, head, bool(rebuttal))
+            # The session's range stays what its first round reviewed (e.g. --base).
+            saved_base = str(saved.get("base", ""))
+            if SHA.fullmatch(saved_base) and saved_base != base \
+                    and strict_ancestor(saved_base, base) and not args.base:
+                base = saved_base
         else:
             binding.unlink(missing_ok=True)
         verdict, session, message = run_review(args.mode, base, head, args.ctx, resume_session,

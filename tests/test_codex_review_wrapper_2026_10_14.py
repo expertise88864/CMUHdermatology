@@ -244,9 +244,28 @@ class NativeCliSelectionTests(unittest.TestCase):
         hits = {name_hit: str(npm / name_hit)}
         with patch.object(identity.os, "name", "nt"), \
              patch.dict(identity.os.environ, {"LOCALAPPDATA": ""}), \
+             patch.object(identity, "path_file", side_effect=lambda n: hits.get(n)), \
              patch.object(identity.shutil, "which", side_effect=lambda n: hits.get(n)), \
              patch.object(identity, "cli_version", return_value="codex-cli 0.169.1"):
             return identity.find_codex()
+
+    def test_ps1_shim_is_found_without_ps1_in_pathext(self):
+        # shutil.which hides codex.ps1 when PATHEXT lacks .PS1; path_file must not.
+        from unittest.mock import patch
+        identity = self._identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            npm = self._layout(Path(tmp), True)
+            (npm / "codex.cmd").unlink()
+            (npm / "codex").unlink()
+            with patch.dict(identity.os.environ, {"PATH": str(npm), "PATHEXT": ".COM;.EXE;.BAT;.CMD"}):
+                self.assertEqual(identity.path_file("codex.ps1"), str(npm / "codex.ps1"))
+                self.assertIsNone(identity.path_file("codex.cmd"))
+                if os.name == "nt":
+                    self.assertIsNone(shutil.which("codex.ps1"))
+                    with patch.dict(identity.os.environ, {"LOCALAPPDATA": ""}), \
+                         patch.object(identity, "cli_version", return_value="codex-cli 0.169.1"):
+                        path, _ = identity.find_codex()
+                    self.assertTrue(path.lower().endswith("codex.exe"), path)
 
     def test_npm_shim_resolves_to_the_native_exe(self):
         identity = self._identity()
